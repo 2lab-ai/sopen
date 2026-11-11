@@ -1,0 +1,41 @@
+class Sopen < Formula
+  desc "Opens a file or folder on another machine as if it were local"
+  homepage "https://github.com/2lab-ai/sopen"
+  version "@VERSION@"
+  license "MIT"
+
+  # `sopen cut` and the media window run ffmpeg/ffprobe at runtime.
+  depends_on "ffmpeg"
+
+  on_macos do
+    on_arm do
+      url "https://github.com/2lab-ai/sopen/releases/download/v@VERSION@/sopen-macos-aarch64"
+      sha256 "@SHA_MACOS_AARCH64@"
+    end
+    on_intel do
+      url "https://github.com/2lab-ai/sopen/releases/download/v@VERSION@/sopen-macos-x86_64"
+      sha256 "@SHA_MACOS_X86_64@"
+    end
+  end
+
+  on_linux do
+    on_arm do
+      url "https://github.com/2lab-ai/sopen/releases/download/v@VERSION@/sopen-linux-aarch64"
+      sha256 "@SHA_LINUX_AARCH64@"
+    end
+    on_intel do
+      url "https://github.com/2lab-ai/sopen/releases/download/v@VERSION@/sopen-linux-x86_64"
+      sha256 "@SHA_LINUX_X86_64@"
+    end
+  end
+
+  link_overwrite "bin/sopen"
+
+  def install
+    bin.install Dir["sopen-*"].first => "sopen"
+  end
+
+  test do
+    assert_match version.to_s, shell_output("#{bin}/sopen --version")
+  end
+end
