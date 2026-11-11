@@ -1,8 +1,10 @@
 name: Release
 
 # Stable release on tag v*. The tag must match Cargo.toml's version
-# (AGENTS.md §Distribution). Same asset shape as llmux, so the
-# tap's bump job renders Formula/sopen.rb with a name change only.
+# (AGENTS.md §Distribution). After the release is published, Formula/sopen.rb
+# is rendered from packaging/homebrew/sopen.rb.tmpl and pushed to the tap
+# (when TAP_DISPATCH_TOKEN is set; otherwise the job says so and the formula
+# is pushed by hand — AGENTS.md §Distribution).
 
 on:
   push:
@@ -13,6 +15,10 @@ permissions:
   contents: read
 
 jobs:
+  # The same gate as ci.yml: a red commit is never released, even when tagged.
+  gate:
+    uses: ./.github/workflows/ci.yml
+
   build:
     permissions:
       contents: read
@@ -26,12 +32,14 @@ jobs:
           - target: x86_64-apple-darwin
             os: macos-latest
             name: sopen-macos-x86_64
+          # Linux binaries link the runner's glibc: build on 22.04 (glibc 2.35) so they
+          # also run on older distributions than the newest runner image.
           - target: x86_64-unknown-linux-gnu
-            os: ubuntu-latest
+            os: ubuntu-22.04
             name: sopen-linux-x86_64
           # Native arm64 runner (free for public repos) — no cross/zigbuild needed.
           - target: aarch64-unknown-linux-gnu
-            os: ubuntu-24.04-arm
+            os: ubuntu-22.04-arm
             name: sopen-linux-aarch64
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
@@ -92,8 +100,22 @@ jobs:
             ${{ matrix.name }}
             ${{ matrix.name }}.sha256
 
+  # Hermetic regression test of the tap bump (mocked gh, local git remote).
+  tap-bump-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Regression-test the tap bump script
+        run: .github/scripts/tests/bump-tap.test.sh
+
   release:
-    needs: build
+    needs: [gate, build, tap-bump-test]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -130,3 +152,43 @@ jobs:
             release/sopen-linux-x86_64
             release/sopen-linux-aarch64
             release/SHA256SUMS
+
+  # The tap credential is used only in this job, and only by the bump step.
+  tap-bump:
+    needs: release
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    env:
+      # Presence only, at job level: a step's own `env` is not visible to its
+      # `if:`, and `secrets` cannot appear in `if:` at all.
+      HAS_TAP_TOKEN: ${{ secrets.TAP_DISPATCH_TOKEN != '' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      # The same build artifacts the release job attached, so the rendered
+      # sha256s are the ones brew will download.
+      - name: Download the released binaries
+        if: env.HAS_TAP_TOKEN == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          pattern: sopen-*
+          merge-multiple: true
+          path: release
+
+      - name: Tap bump skipped (no TAP_DISPATCH_TOKEN)
+        if: env.HAS_TAP_TOKEN == 'false'
+        run: echo "::notice::TAP_DISPATCH_TOKEN is not set; 2lab-ai/homebrew-tap Formula/sopen.rb was not bumped to ${{ github.ref_name }} — push the rendered formula by hand (AGENTS.md §Distribution)"
+
+      - name: Bump Homebrew tap to this release
+        if: env.HAS_TAP_TOKEN == 'true'
+        env:
+          # Consumed by `gh auth setup-git`, never placed in a remote URL.
+          GH_TOKEN: ${{ secrets.TAP_DISPATCH_TOKEN }}
+          FORMULA: sopen
+          TAG: ${{ github.ref_name }}
+          RELEASE_DIR: release
+        run: .github/scripts/bump-tap.sh

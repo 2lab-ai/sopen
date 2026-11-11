@@ -1,6 +1,8 @@
-//! Local paths: the fetch cache `<cache>/<host>/<abs path>`, image backups
-//! `<cache>/backup/<host>/<abs path>.<UTC stamp>` (spec §5), and the state dir (ssh control
-//! sockets, `usage.jsonl`). `SOPEN_CACHE_DIR` / `SOPEN_STATE_DIR` override both.
+//! Local paths: the fetch cache `<cache>/<host>/<abs path>` (each copy with a
+//! `.<name>.sopen-baseline` record of what it held when fetched or saved), edits kept aside as
+//! `<copy>.conflict-<UTC stamp>`, image backups `<cache>/backup/<host>/<abs path>.<UTC stamp>`
+//! (spec §5), and the state dir (ssh control sockets, `usage.jsonl`). `SOPEN_CACHE_DIR` /
+//! `SOPEN_STATE_DIR` override both.
 
 use anyhow::{Context, Result};
 use std::path::{Component, Path, PathBuf};
@@ -88,6 +90,71 @@ pub fn conflict_copy_path(edited: &Path, at: SystemTime) -> PathBuf {
     edited.with_file_name(name)
 }
 
+/// Moves `edited` to its conflict-copy path (`-N` added when that name is taken) and returns
+/// where it went. Used whenever an edit cannot be uploaded, so no later fetch can overwrite it.
+pub fn set_aside(edited: &Path) -> Result<PathBuf> {
+    let first = conflict_copy_path(edited, SystemTime::now());
+    for n in 0..1000u32 {
+        let keep = if n == 0 {
+            first.clone()
+        } else {
+            let mut name = first.file_name().unwrap_or_default().to_os_string();
+            name.push(format!("-{n}"));
+            first.with_file_name(name)
+        };
+        if keep.symlink_metadata().is_ok() {
+            continue;
+        }
+        std::fs::rename(edited, &keep).with_context(|| {
+            format!(
+                "cannot move {} aside to {}",
+                edited.display(),
+                keep.display()
+            )
+        })?;
+        return Ok(keep);
+    }
+    anyhow::bail!("no free conflict-copy name next to {}", edited.display())
+}
+
+/// `<dir>/.<name>.sopen-baseline` next to a fetched copy: the hex SHA-256 the copy held when
+/// sopen last fetched or saved it. A copy that no longer matches holds unsaved edits.
+pub fn baseline_record_path(local: &Path) -> PathBuf {
+    let mut name = std::ffi::OsString::from(".");
+    name.push(local.file_name().unwrap_or_default());
+    name.push(".sopen-baseline");
+    local.with_file_name(name)
+}
+
+pub fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Records `sha256` as what the fetched copy `local` holds.
+pub fn write_baseline(local: &Path, sha256: &[u8; 32]) -> Result<()> {
+    let record = baseline_record_path(local);
+    std::fs::write(&record, format!("{}\n", hex(sha256)))
+        .with_context(|| format!("cannot write {}", record.display()))
+}
+
+fn read_baseline(local: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(baseline_record_path(local)).ok()?;
+    Some(text.trim().to_string())
+}
+
+/// Before a fetch overwrites `local`: if it exists and differs from its recorded baseline (or
+/// has no record), it may hold unsaved edits — move it aside and return where it went.
+pub fn set_aside_unsaved(local: &Path) -> Result<Option<PathBuf>> {
+    if !local.is_file() {
+        return Ok(None);
+    }
+    let held = hex(&crate::app::file_hash(local)?);
+    if read_baseline(local).as_deref() == Some(held.as_str()) {
+        return Ok(None);
+    }
+    set_aside(local).map(Some)
+}
+
 /// Civil date from days since 1970-01-01 (H. Hinnant's algorithm).
 fn civil(days: i64) -> (i64, u32, u32) {
     let z = days + 719_468;
@@ -149,6 +216,46 @@ mod tests {
         assert_eq!(
             conflict_copy_path(Path::new("/c/box/a.txt"), at),
             PathBuf::from("/c/box/a.txt.conflict-20261111T092436Z")
+        );
+    }
+
+    #[test]
+    fn unsaved_copies_are_set_aside_not_overwritten() {
+        let tmp = tempfile::tempdir().unwrap();
+        let copy = tmp.path().join("a.txt");
+        assert_eq!(
+            set_aside_unsaved(&copy).unwrap(),
+            None,
+            "nothing cached yet"
+        );
+
+        std::fs::write(&copy, "fetched").unwrap();
+        write_baseline(&copy, &crate::app::file_hash(&copy).unwrap()).unwrap();
+        assert_eq!(set_aside_unsaved(&copy).unwrap(), None, "clean copy stays");
+        assert!(copy.exists());
+
+        std::fs::write(&copy, "my edit").unwrap();
+        let kept = set_aside_unsaved(&copy)
+            .unwrap()
+            .expect("edited copy moved");
+        assert!(!copy.exists());
+        assert_eq!(std::fs::read_to_string(&kept).unwrap(), "my edit");
+        let name = kept.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(name.starts_with("a.txt.conflict-"), "{name}");
+
+        // A copy with no record is treated as possibly edited; a second set-aside in the same
+        // second gets its own name instead of replacing the first.
+        std::fs::write(&copy, "second edit").unwrap();
+        std::fs::remove_file(baseline_record_path(&copy)).unwrap();
+        let again = set_aside_unsaved(&copy)
+            .unwrap()
+            .expect("unrecorded copy moved");
+        assert_ne!(again, kept);
+        assert_eq!(std::fs::read_to_string(&kept).unwrap(), "my edit");
+        assert_eq!(std::fs::read_to_string(&again).unwrap(), "second edit");
+        assert_eq!(
+            baseline_record_path(Path::new("/c/h/x.bin")),
+            PathBuf::from("/c/h/.x.bin.sopen-baseline")
         );
     }
 

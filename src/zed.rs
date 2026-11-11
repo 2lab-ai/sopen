@@ -66,6 +66,9 @@ fn is_executable(path: &Path) -> bool {
 }
 
 /// `ssh://[user@]host/abs/path` (IPv6 hosts bracketed). `abs_path` comes from SFTP realpath.
+/// Zed percent-decodes the path, so it is percent-encoded here: a literal `%41` would otherwise
+/// open `A`, `#` and `?` would start a fragment or query, and a URL parser drops trailing spaces
+/// and tabs.
 pub fn remote_url(user: Option<&str>, host: &str, abs_path: &str) -> String {
     let host = if host.contains(':') {
         format!("[{host}]")
@@ -78,7 +81,22 @@ pub fn remote_url(user: Option<&str>, host: &str, abs_path: &str) -> String {
     } else {
         format!("/{abs_path}")
     };
-    format!("ssh://{user}{host}{path}")
+    format!("ssh://{user}{host}{}", encode_path(&path))
+}
+
+/// RFC 3986 path characters stay (unreserved, sub-delims, `:`, `@`, `/`); every other byte of
+/// the UTF-8 path becomes `%XX`.
+fn encode_path(path: &str) -> String {
+    let mut out = String::with_capacity(path.len());
+    for &b in path.as_bytes() {
+        let keep = b.is_ascii_alphanumeric() || b"-._~!$&'()*+,;=:@/".contains(&b);
+        if keep {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
 }
 
 /// Spawns `zed <arg>` in its own process group with no stdio, so it outlives sopen and the
@@ -151,6 +169,25 @@ mod tests {
         );
         assert_eq!(remote_url(None, "::1", "/tmp/x"), "ssh://[::1]/tmp/x");
         assert_eq!(remote_url(None, "box", "rel"), "ssh://box/rel");
+    }
+
+    #[test]
+    fn url_paths_are_percent_encoded() {
+        let cases = [
+            ("/t/issue#12.md", "ssh://box/t/issue%2312.md"),
+            ("/t/a?.txt", "ssh://box/t/a%3F.txt"),
+            ("/t/100%41.txt", "ssh://box/t/100%2541.txt"),
+            ("/t/my notes .txt", "ssh://box/t/my%20notes%20.txt"),
+            ("/t/한글.md", "ssh://box/t/%ED%95%9C%EA%B8%80.md"),
+            ("/t/tab\there", "ssh://box/t/tab%09here"),
+            (
+                "/srv/a-b_c.d~e/(x)+y=z,@:'!$&*;",
+                "ssh://box/srv/a-b_c.d~e/(x)+y=z,@:'!$&*;",
+            ),
+        ];
+        for (path, want) in cases {
+            assert_eq!(remote_url(None, "box", path), want, "{path}");
+        }
     }
 
     #[test]

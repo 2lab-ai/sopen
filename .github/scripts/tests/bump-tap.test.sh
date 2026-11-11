@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Regression test for .github/scripts/bump-tap-preview.sh.
+# Regression test for .github/scripts/bump-tap.sh (preview and stable channels).
 #
 # Hermetic: `gh` is mocked (only `auth setup-git` is expected) and the tap is a
 # local bare repo, so the real clone/render/commit/push path runs with real git
@@ -8,10 +8,12 @@
 # What this pins (ported from llmux, where the publish step once skipped on a
 # missing credential and `exit 0`ed on a failed push): once the script runs,
 # every failure mode below must exit non-zero. Skipping when the repo has no
-# credential is the workflow's `if:`, never the script's.
+# credential is the workflow's `if:`, never the script's. And the formula is
+# rendered from this repo's templates: the tap holds none, and a bump pushes
+# exactly one rendered Formula/*.rb.
 set -euo pipefail
 
-SCRIPT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/bump-tap-preview.sh"
+SCRIPT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/bump-tap.sh"
 [ -f "$SCRIPT" ] || {
   echo "missing script under test: $SCRIPT" >&2
   exit 1
@@ -78,36 +80,44 @@ git config --global user.name "test"
 git config --global user.email "test@example.com"
 git config --global init.defaultBranch master
 
-FORMULA_TMPL="$ROOT/Formula.tmpl"
-cat > "$FORMULA_TMPL" << 'TMPL'
-class SopenPreview < Formula
-  desc "test fixture mirroring the tap template"
+# Fixture templates (the repo side). Each case gets its own copy, so a drift
+# case can change one without touching the others.
+FIXTURES="$ROOT/fixtures"
+mkdir -p "$FIXTURES"
+formula_fixture() {
+  local class="$1" url_tag="$2"
+  cat << TMPL
+class $class < Formula
+  desc "test fixture mirroring packaging/homebrew"
   homepage "https://github.com/2lab-ai/sopen"
   version "@VERSION@"
 
   on_macos do
     on_arm do
-      url "https://github.com/2lab-ai/sopen/releases/download/@TAG@/sopen-macos-aarch64"
+      url "https://github.com/2lab-ai/sopen/releases/download/$url_tag/sopen-macos-aarch64"
       sha256 "@SHA_MACOS_AARCH64@"
     end
     on_intel do
-      url "https://github.com/2lab-ai/sopen/releases/download/@TAG@/sopen-macos-x86_64"
+      url "https://github.com/2lab-ai/sopen/releases/download/$url_tag/sopen-macos-x86_64"
       sha256 "@SHA_MACOS_X86_64@"
     end
   end
 
   on_linux do
     on_arm do
-      url "https://github.com/2lab-ai/sopen/releases/download/@TAG@/sopen-linux-aarch64"
+      url "https://github.com/2lab-ai/sopen/releases/download/$url_tag/sopen-linux-aarch64"
       sha256 "@SHA_LINUX_AARCH64@"
     end
     on_intel do
-      url "https://github.com/2lab-ai/sopen/releases/download/@TAG@/sopen-linux-x86_64"
+      url "https://github.com/2lab-ai/sopen/releases/download/$url_tag/sopen-linux-x86_64"
       sha256 "@SHA_LINUX_X86_64@"
     end
   end
 end
 TMPL
+}
+formula_fixture SopenPreview "@TAG@" > "$FIXTURES/sopen-preview.rb.tmpl"
+formula_fixture Sopen "v@VERSION@" > "$FIXTURES/sopen.rb.tmpl"
 
 sha256_of() {
   if command -v sha256sum > /dev/null 2>&1; then
@@ -117,45 +127,51 @@ sha256_of() {
   fi
 }
 
-# seed_tap <bare-repo> [current-tag] — a tap whose rendered formula already
-# points at <current-tag> (omit for a tap with the template only).
+# seed_tap <bare-repo> <formula> [current-tag] — a tap holding a README and,
+# with a current tag, an already rendered Formula/<formula>.rb. Never templates.
 seed_tap() {
-  local origin="$1" current="${2:-}"
+  local origin="$1" formula="$2" current="${3:-}"
   local work="${origin%.git}-seed"
   git init --quiet --bare "$origin"
   git -C "$origin" symbolic-ref HEAD refs/heads/master
   git init --quiet "$work"
-  mkdir -p "$work/Formula"
-  cp "$FORMULA_TMPL" "$work/Formula/sopen-preview.rb.tmpl"
+  echo "tap" > "$work/README.md"
   if [ -n "$current" ]; then
+    mkdir -p "$work/Formula"
     local ver
-    ver="$(echo "${current#preview-}" | awk -F- '{print $1"."$2"."$3"."$4}')"
+    case "$current" in
+      preview-*) ver="$(echo "${current#preview-}" | awk -F- '{print $1"."$2"."$3"."$4}')" ;;
+      v*) ver="${current#v}" ;;
+    esac
     sed -e "s/@VERSION@/$ver/g" -e "s/@TAG@/$current/g" -e "s/@SHA[A-Z_0-9]*@/00seed/g" \
-      "$FORMULA_TMPL" > "$work/Formula/sopen-preview.rb"
+      "$FIXTURES/$formula.rb.tmpl" > "$work/Formula/$formula.rb"
   fi
   git -C "$work" add -A
   git -C "$work" commit --quiet -m "seed"
   git -C "$work" push --quiet "$origin" HEAD:master
 }
 
-# make_release <dir> — the four binaries this build published.
+# make_release <dir> <tag> — the four binaries this build published.
 make_release() {
-  local dir="$1"
+  local dir="$1" tag="$2"
   mkdir -p "$dir"
   local name
   for name in sopen-macos-aarch64 sopen-macos-x86_64 sopen-linux-aarch64 sopen-linux-x86_64; do
-    echo "$name binary for $TAG" > "$dir/$name"
+    echo "$name binary for $tag" > "$dir/$name"
   done
 }
 
-# new_case <name> [current-tag] — sets CASE_DIR/ORIGIN/WORK.
+# new_case <name> [current-tag] [formula] — sets CASE_DIR/ORIGIN/WORK/TEMPLATES/FORMULA.
 new_case() {
   CASE_DIR="$ROOT/case-$1"
+  FORMULA="${3:-sopen-preview}"
   ORIGIN="$CASE_DIR/tap.git"
   WORK="$CASE_DIR/work"
-  mkdir -p "$WORK"
-  seed_tap "$ORIGIN" "${2:-}"
-  make_release "$WORK/release"
+  TEMPLATES="$CASE_DIR/templates"
+  mkdir -p "$WORK" "$TEMPLATES"
+  cp "$FIXTURES"/*.rb.tmpl "$TEMPLATES/"
+  seed_tap "$ORIGIN" "$FORMULA" "${2:-}"
+  make_release "$WORK/release" "$1"
 }
 
 # run_bump [tag] [token] [build_id] — runs the script in WORK against ORIGIN;
@@ -169,14 +185,16 @@ run_bump() {
   RUN_N=$((RUN_N + 1))
   TAP_CLONE="${TAP_DIR_FORCE:-tap-bump-$RUN_N}"
   set +e
-  OUT="$(cd "$WORK" && TAG="$tag" BUILD_ID="$build" GH_TOKEN="$token" \
-    RELEASE_DIR=release TAP_REMOTE="$ORIGIN" TAP_BRANCH=master TAP_DIR="$TAP_CLONE" \
-    bash "$SCRIPT" 2>&1)"
+  OUT="$(cd "$WORK" && FORMULA="$FORMULA" TAG="$tag" BUILD_ID="$build" GH_TOKEN="$token" \
+    RELEASE_DIR=release TEMPLATE_DIR="$TEMPLATES" TAP_REMOTE="$ORIGIN" TAP_BRANCH=master \
+    TAP_DIR="$TAP_CLONE" bash "$SCRIPT" 2>&1)"
   RC=$?
   set -e
 }
 
-pushed_formula() { git -C "$ORIGIN" show "master:Formula/sopen-preview.rb"; }
+pushed_formula() { git -C "$ORIGIN" show "master:Formula/$FORMULA.rb"; }
+pushed_paths() { git -C "$ORIGIN" show --name-only --format= master; }
+tap_templates() { git -C "$ORIGIN" ls-tree -r --name-only master | grep -c '\.tmpl$' || true; }
 # sha_after_url <formula-text> <asset> — the sha256 on the line right after the
 # url line that downloads <asset> (empty when that line is not a sha256).
 sha_after_url() {
@@ -213,6 +231,14 @@ run_bump "$TAG" "$TOKEN" "2026-09-11-0500-abc123def456"
 expect_nonzero "a TAG that disagrees with BUILD_ID fails the step"
 expect_out "does not match" "tag/build mismatch is named in the error"
 
+new_case no-template
+rm -f "$TEMPLATES/sopen-preview.rb.tmpl"
+before="$(commit_count)"
+run_bump
+expect_nonzero "a missing repo template fails the step"
+expect_out "missing template" "missing-template error says what is missing"
+expect_true "the missing-template case pushes nothing" [ "$before" = "$(commit_count)" ]
+
 # --- case: the clone destination is never clobbered -----------------------
 # The script must refuse an occupied destination rather than delete a path it
 # was handed (TAP_DIR is caller-supplied).
@@ -246,6 +272,9 @@ for asset in sopen-macos-aarch64 sopen-macos-x86_64 sopen-linux-aarch64 sopen-li
 done
 expect_absent "no unrendered template token reaches the tap" \
   grep -q "@[A-Z0-9_]\+@" <<< "$formula"
+expect_true "the bump commit touches only Formula/sopen-preview.rb" \
+  [ "$(pushed_paths)" = "Formula/sopen-preview.rb" ]
+expect_true "the tap holds no template" [ "$(tap_templates)" = "0" ]
 expect_absent "the token never reaches the log" grep -qF "$TOKEN" <<< "$OUT"
 expect_absent "the token never reaches the clone" \
   grep -rqF "$TOKEN" "$WORK/$TAP_CLONE/.git"
@@ -257,10 +286,10 @@ expect_zero "rerunning the same build succeeds"
 expect_out "already current" "rerun detects the tap is already at this build"
 expect_true "rerun adds no commit" [ "$after_first" = "$(commit_count)" ]
 
-# --- case: first bump into a tap with the template only -----------------
+# --- case: first bump into a tap that has never had this formula ---------
 new_case first-bump
 run_bump
-expect_zero "a tap with no rendered formula yet is bumped"
+expect_zero "a tap without the formula (or any template) is bumped"
 expect_true "first bump pushes a formula pointing at this tag" \
   grep -q "download/$TAG/" <<< "$(pushed_formula)"
 
@@ -298,64 +327,74 @@ run_bump
 expect_zero "a lost push race is retried to success"
 expect_out "tap bumped to $TAG" "retry reaches the push"
 
-# --- case: template drift ------------------------------------------------
+# --- case: template drift (in the repo's template) -----------------------
 new_case drift
-seed_work="$CASE_DIR/tap-seed"
-printf '  sha256 "@SHA_UNEXPECTED@"\n' >> "$seed_work/Formula/sopen-preview.rb.tmpl"
-git -C "$seed_work" commit --quiet -am "drifted template"
-git -C "$seed_work" push --quiet "$ORIGIN" HEAD:master
+printf '  sha256 "@SHA_UNEXPECTED@"\n' >> "$TEMPLATES/sopen-preview.rb.tmpl"
 run_bump
 expect_nonzero "an unrendered template token fails the step"
 
 # Tokens carry digits (@SHA_MACOS_X86_64@), so the detector must too: a
 # digit-bearing leftover is valid ruby and slips past `ruby -c`.
 new_case drift-digits
-seed_work="$CASE_DIR/tap-seed"
-printf '  sha256 "@SHA_UNEXPECTED_X86_64@"\n' >> "$seed_work/Formula/sopen-preview.rb.tmpl"
-git -C "$seed_work" commit --quiet -am "drifted template (digit-bearing token)"
-git -C "$seed_work" push --quiet "$ORIGIN" HEAD:master
+printf '  sha256 "@SHA_UNEXPECTED_X86_64@"\n' >> "$TEMPLATES/sopen-preview.rb.tmpl"
 before="$(commit_count)"
 run_bump
 expect_nonzero "an unrendered digit-bearing template token fails the step"
 expect_true "the digit-bearing drift case pushes nothing" [ "$before" = "$(commit_count)" ]
 
-# --- case: this repo's own templates honour the @TOKEN@ contract -----------
-# The tap carries a copy of packaging/homebrew/*.rb.tmpl; render the repo's copy
-# through the real script so a drifted template fails here, not in brew.
+# --- stable channel (release.yml) ----------------------------------------
+new_case stable-happy "v0.1.0" sopen
+run_bump "v0.2.0"
+expect_zero "stable bump succeeds"
+expect_out "tap bumped to v0.2.0" "stable bump reports the push"
+formula="$(pushed_formula)"
+expect_true "stable formula carries version 0.2.0" grep -q 'version "0.2.0"' <<< "$formula"
+expect_true "stable formula downloads from the v0.2.0 tag" \
+  grep -q "releases/download/v0.2.0/sopen-linux-x86_64" <<< "$formula"
+for asset in sopen-macos-aarch64 sopen-macos-x86_64 sopen-linux-aarch64 sopen-linux-x86_64; do
+  expect_true "stable formula pairs the $asset url with its own sha256" \
+    [ "$(sha_after_url "$formula" "$asset")" = "$(sha256_of "$WORK/release/$asset")" ]
+done
+expect_true "the stable bump commit touches only Formula/sopen.rb" \
+  [ "$(pushed_paths)" = "Formula/sopen.rb" ]
+
+new_case stable-newer "v0.10.0" sopen
+before="$(commit_count)"
+run_bump "v0.9.1"
+expect_zero "a stable tap at a newer version (0.10.0 > 0.9.1) is left alone"
+expect_out "already at newer v0.10.0" "stable newer-tap skip is reported"
+expect_true "the newer stable tap is not rolled back" [ "$before" = "$(commit_count)" ]
+
+new_case stable-bad-tag "" sopen
+run_bump "v0.2"
+expect_nonzero "a release tag that is not v<X.Y.Z> fails the step"
+expect_out "unexpected release tag" "bad release tag is named in the error"
+
+new_case bad-formula "" sopen-nightly
+run_bump
+expect_nonzero "an unknown FORMULA fails the step"
+
+# --- case: this repo's own templates render through the real script -------
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
-REPO_TMPL="$REPO_ROOT/packaging/homebrew/sopen-preview.rb.tmpl"
-if [ -f "$REPO_TMPL" ]; then
-  FORMULA_TMPL="$REPO_TMPL"
-  new_case repo-template "preview-2026-09-10-1200-000000000000"
-  run_bump
-  expect_zero "the repo's sopen-preview template renders and pushes"
+REPO_TEMPLATES="$REPO_ROOT/packaging/homebrew"
+for f in sopen-preview sopen; do
+  if [ ! -f "$REPO_TEMPLATES/$f.rb.tmpl" ]; then
+    notok "missing $REPO_TEMPLATES/$f.rb.tmpl"
+    continue
+  fi
+  if [ "$f" = "sopen" ]; then tag="v0.1.0"; else tag="$TAG"; fi
+  new_case "repo-$f" "" "$f"
+  TEMPLATES="$REPO_TEMPLATES"
+  run_bump "$tag"
+  expect_zero "the repo's $f template renders and pushes"
   formula="$(pushed_formula)"
-  expect_true "rendered preview formula depends on ffmpeg" \
-    grep -q 'depends_on "ffmpeg"' <<< "$formula"
+  expect_true "rendered $f formula depends on ffmpeg" grep -q 'depends_on "ffmpeg"' <<< "$formula"
   for asset in sopen-macos-aarch64 sopen-macos-x86_64 sopen-linux-aarch64 sopen-linux-x86_64; do
-    expect_true "repo template pairs the $asset url with its own sha256" \
+    expect_true "repo $f template pairs the $asset url with its own sha256" \
       [ "$(sha_after_url "$formula" "$asset")" = "$(sha256_of "$WORK/release/$asset")" ]
   done
-  expect_absent "no unrendered token in the repo template's render" \
-    grep -q "@[A-Z0-9_]\+@" <<< "$formula"
-else
-  notok "missing $REPO_TMPL"
-fi
-
-STABLE_TMPL="$REPO_ROOT/packaging/homebrew/sopen.rb.tmpl"
-if [ -f "$STABLE_TMPL" ]; then
-  stable="$ROOT/sopen.rb"
-  sed -e "s/@VERSION@/0.1.0/g" -e "s/@SHA_MACOS_AARCH64@/a1/" -e "s/@SHA_MACOS_X86_64@/a2/" \
-    -e "s/@SHA_LINUX_AARCH64@/a3/" -e "s/@SHA_LINUX_X86_64@/a4/" "$STABLE_TMPL" > "$stable"
-  ruby_ok() { ruby -c "$1" > /dev/null; }
-  expect_true "the stable template renders to valid ruby" ruby_ok "$stable"
-  expect_absent "the stable template has no token beyond VERSION and the four SHAs" \
-    grep -q "@[A-Z0-9_]\+@" "$stable"
-  expect_true "the stable formula downloads from the v<version> tag" \
-    grep -q "releases/download/v0.1.0/sopen-linux-x86_64" "$stable"
-else
-  notok "missing $STABLE_TMPL"
-fi
+  expect_absent "no unrendered token in the repo $f render" grep -q "@[A-Z0-9_]\+@" <<< "$formula"
+done
 
 echo
 if [ "$FAILURES" -eq 0 ]; then

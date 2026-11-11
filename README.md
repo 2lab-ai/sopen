@@ -30,7 +30,8 @@ local cache and prints the path.
 ## Any other file: `--app`
 
 ```sh
-sopen myserver:/srv/data.bin --app ImHex
+sopen myserver:/srv/data.bin --app ImHex    # macOS: the app's name, as `open -a` takes it
+sopen myserver:/srv/data.bin --app imhex    # Linux: the command on PATH
 ```
 
 Fetches a copy, opens it in the named local app, and waits: Enter uploads your changes, `q`
@@ -49,10 +50,16 @@ H.264 + AAC; audio: the source's codec) and uploaded next to the original as
 
 ## Safety
 
-- Every write first re-checks the remote file's size and modification time. If it changed since
+- Every write first re-checks the remote file: still the same regular file (not a symlink), same
+  size and modification time, and — up to 256 MiB — the same content. If anything changed since
   sopen fetched it, nothing is written; your edited copy is kept and its path printed (exit 3).
-- Writes go to a temporary file in the same directory, are flushed, and are renamed over the
-  original atomically; the original's permission bits are kept.
+- Conflict detection is best-effort: sopen cannot lock the remote file, so a write that races the
+  final rename is not detected.
+- Writes go to a temporary file in the same directory, get the original's owner and permission
+  bits, are flushed, and are renamed over the original atomically. If the owner cannot be kept,
+  nothing is written.
+- A save that fails for any reason moves your edited copy aside (`<file>.conflict-<time>`) and
+  prints where. Opening the file again never overwrites an unsaved edit.
 - Exports never overwrite: if the name exists, sopen adds `-1`, `-2`, ….
 
 ## Status

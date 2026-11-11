@@ -23,6 +23,7 @@ fn export_args_table() {
             3.0,
             crop,
             MediaKind::Video,
+            None,
         )
         .unwrap(),
     );
@@ -39,6 +40,7 @@ fn export_args_table() {
             2.25,
             None,
             MediaKind::Video,
+            None,
         )
         .unwrap(),
     );
@@ -66,6 +68,7 @@ fn export_args_table() {
                 3.0,
                 None,
                 MediaKind::Audio,
+                None,
             )
             .unwrap(),
         );
@@ -75,17 +78,91 @@ fn export_args_table() {
             "{dst}"
         );
     }
-    assert!(export_args(src, Path::new("a.xyz"), 1.0, 3.0, None, MediaKind::Audio).is_err());
-    assert!(export_args(src, Path::new("a.mp3"), 1.0, 3.0, crop, MediaKind::Audio).is_err());
-    assert!(export_args(src, Path::new("a.mp4"), 3.0, 3.0, None, MediaKind::Video).is_err());
+    // MPEG-TS: coarse input seek 10 s early, exact trim after decoding.
+    let ts = Path::new("/c/rec.ts");
+    let late = strs(
+        &export_args(
+            ts,
+            Path::new("/o/r.ts"),
+            12.5,
+            15.5,
+            None,
+            MediaKind::Video,
+            None,
+        )
+        .unwrap(),
+    );
+    assert_eq!(
+        late[..10].join(" "),
+        "-ss 2.500 -i /c/rec.ts -ss 10.000 -to 13.000 -c:v libx264"
+    );
+    let early = strs(
+        &export_args(
+            ts,
+            Path::new("/o/r.ts"),
+            1.0,
+            3.0,
+            None,
+            MediaKind::Video,
+            None,
+        )
+        .unwrap(),
+    );
+    assert_eq!(
+        early[..8].join(" "),
+        "-i /c/rec.ts -ss 1.000 -to 3.000 -c:v libx264"
+    );
+
+    let audio = MediaKind::Audio;
+    assert!(export_args(src, Path::new("a.xyz"), 1.0, 3.0, None, audio, None).is_err());
+    assert!(export_args(src, Path::new("a.mp3"), 1.0, 3.0, crop, audio, None).is_err());
+    let video = MediaKind::Video;
+    assert!(export_args(src, Path::new("a.mp4"), 3.0, 3.0, None, video, None).is_err());
+
+    // The source codec decides the encoder (spec §7), whatever the container.
+    let by_codec = [
+        ("aac", "a.mp4", "-c:a aac -b:a 192k"),
+        ("opus", "a.webm", "-c:a libopus"),
+        ("vorbis", "a.ogg", "-c:a libvorbis"),
+        ("mp3", "a.mkv", "-c:a libmp3lame -q:a 2"),
+        ("flac", "a.flac", "-c:a flac"),
+        ("pcm_s24le", "a.wav", "-c:a pcm_s24le"),
+        ("pcm_f32le", "a.wav", "-c:a pcm_f32le"),
+        ("ac3", "a.mp4", "-c:a aac -b:a 192k"),
+    ];
+    for (codec, dst, want) in by_codec {
+        let got =
+            strs(&export_args(src, Path::new(dst), 1.0, 3.0, None, audio, Some(codec)).unwrap());
+        assert_eq!(
+            got.join(" "),
+            format!("-ss 1.000 -to 3.000 -i /c/talk.mp4 -vn {want} {dst}"),
+            "{codec}"
+        );
+    }
 }
 
 #[test]
 fn output_container() {
-    assert_eq!(output_ext("WEBM", MediaKind::Video), "mp4");
-    assert_eq!(output_ext("mkv", MediaKind::Video), "mkv");
-    assert_eq!(output_ext("webm", MediaKind::Audio), "webm");
-    assert_eq!(output_ext("MP3", MediaKind::Audio), "mp3");
+    let (video, audio) = (MediaKind::Video, MediaKind::Audio);
+    assert_eq!(output_ext("WEBM", video, None), "mp4");
+    assert_eq!(output_ext("mkv", video, Some("opus")), "mkv");
+    assert_eq!(output_ext("webm", audio, None), "webm");
+    assert_eq!(output_ext("MP3", audio, None), "mp3");
+    // Audio-only files in video containers keep the container when it carries the codec…
+    assert_eq!(output_ext("mp4", audio, Some("aac")), "mp4");
+    assert_eq!(output_ext("webm", audio, Some("opus")), "webm");
+    assert_eq!(output_ext("mkv", audio, Some("pcm_s24le")), "mkv");
+    assert_eq!(output_ext("wav", audio, Some("pcm_s24le")), "wav");
+    // …and move to the codec's own container when it does not.
+    assert_eq!(output_ext("avi", audio, Some("aac")), "m4a");
+    assert_eq!(output_ext("mov", audio, Some("opus")), "opus");
+    assert_eq!(output_ext("mp4", audio, Some("vorbis")), "ogg");
+    assert_eq!(output_ext("wav", audio, Some("mp3")), "mp3");
+    assert_eq!(output_ext("mp4", audio, Some("pcm_s16le")), "wav");
+    assert_eq!(output_ext("mp4", audio, Some("pcm_s16be")), "mkv");
+    // Unknown codec: the container's usual audio codec, or m4a.
+    assert_eq!(output_ext("mp4", audio, Some("ac3")), "mp4");
+    assert_eq!(output_ext("xyz", audio, None), "m4a");
 }
 
 #[test]
@@ -130,6 +207,7 @@ fn encoders() {
         2.0,
         None,
         MediaKind::Audio,
+        Some("vorbis"),
     )
     .unwrap();
     let adapted = strs(&adapt_to_encoders(args.clone(), &set).unwrap());
@@ -146,19 +224,53 @@ fn encoders() {
 fn probe_json() {
     let json = r#"{"streams":[
         {"codec_type":"video","width":640,"height":360,"disposition":{"attached_pic":0}},
-        {"codec_type":"audio"}],"format":{"duration":"4.000000"}}"#;
+        {"codec_type":"audio","codec_name":"aac"}],"format":{"duration":"4.000000"}}"#;
     assert_eq!(
         parse_probe(json).unwrap(),
         Probe {
             duration: Some(4.0),
             video: Some((640, 360)),
-            has_audio: true
+            rotation: 0,
+            display: Some((640, 360)),
+            has_audio: true,
+            audio_codec: Some("aac".to_string()),
         }
     );
-    let cover = r#"{"streams":[{"codec_type":"audio"},
+    let cover = r#"{"streams":[{"codec_type":"audio","codec_name":"mp3"},
         {"codec_type":"video","width":500,"height":500,"disposition":{"attached_pic":1}}],
         "format":{"duration":"2.5"}}"#;
-    assert_eq!(parse_probe(cover).unwrap().video, None);
+    let cover = parse_probe(cover).unwrap();
+    assert_eq!(cover.video, None);
+    assert_eq!(cover.display, None);
+    assert_eq!(cover.audio_codec.as_deref(), Some("mp3"));
+}
+
+#[test]
+fn probe_rotation() {
+    // Display matrix (what ffmpeg 9 writes and reports), either sign.
+    let matrix = |deg: &str| {
+        format!(
+            r#"{{"streams":[{{"codec_type":"video","width":640,"height":360,
+                "side_data_list":[{{"side_data_type":"Display Matrix","rotation":{deg}}}]}}]}}"#
+        )
+    };
+    for (deg, turns, display) in [
+        ("90", 90, (360, 640)),
+        ("-90", 270, (360, 640)),
+        ("180", 180, (640, 360)),
+        ("-180", 180, (640, 360)),
+        ("270", 270, (360, 640)),
+        ("0", 0, (640, 360)),
+    ] {
+        let probe = parse_probe(&matrix(deg)).unwrap();
+        assert_eq!(probe.rotation, turns, "{deg}");
+        assert_eq!(probe.video, Some((640, 360)), "{deg}: coded size stays");
+        assert_eq!(probe.display, Some(display), "{deg}");
+    }
+    // The legacy tag (older muxers / ffprobe).
+    let tagged = r#"{"streams":[{"codec_type":"video","width":1920,"height":1080,
+        "tags":{"rotate":"90"}}]}"#;
+    assert_eq!(parse_probe(tagged).unwrap().display, Some((1080, 1920)));
 }
 
 #[test]

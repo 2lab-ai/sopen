@@ -5,6 +5,8 @@ on:
     types: [opened, synchronize, reopened]
   push:
     branches: [main]
+  # preview.yml and release.yml run this same gate before they publish anything.
+  workflow_call:
 
 permissions:
   contents: read

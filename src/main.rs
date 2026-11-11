@@ -14,7 +14,7 @@ use sopen::{app, zed};
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::time::{Instant, SystemTime};
+use std::time::Instant;
 
 const EXIT_ERROR: u8 = 1;
 const EXIT_CONFLICT: u8 = 3;
@@ -279,21 +279,22 @@ fn run_open(arg: &str, app_name: Option<&str>, dirs: &Dirs, rec: &mut Record) ->
     match kind {
         Kind::Directory | Kind::Text => open_in_editor(&mut place, &abs, kind, dirs, rec),
         Kind::Image | Kind::Video | Kind::Audio => {
-            let (shown, kind) = match place {
-                Place::Local(_) => (format!("file at {abs}"), kind),
+            let (local, shown) = match place {
+                Place::Local(_) => (PathBuf::from(&abs), format!("file at {abs}")),
                 Place::Remote(..) => {
                     let (local, _) = fetch_to_cache(&mut place, &abs, dirs, rec)?;
-                    let kind = refine_kind(&local, kind);
-                    (format!("cached at {}", local.display()), kind)
+                    let shown = format!("cached at {}", local.display());
+                    (local, shown)
                 }
             };
+            let kind = refine_kind(&local, &abs, kind);
             rec.kind = Some(kind);
-            let what = if kind == Kind::Image {
-                "image"
-            } else {
-                "media"
-            };
-            println!("{what} window lands in the next release — {shown}");
+            match kind {
+                // A `.ts` ffprobe cannot read as media.
+                Kind::Other => println!("{}", local.display()),
+                Kind::Image => println!("image window lands in the next release — {shown}"),
+                _ => println!("media window lands in the next release — {shown}"),
+            }
             Ok(())
         }
         Kind::Other => {
@@ -309,18 +310,20 @@ fn run_open(arg: &str, app_name: Option<&str>, dirs: &Dirs, rec: &mut Record) ->
     }
 }
 
-/// Video by extension but no video stream (per ffprobe) is audio; without ffprobe, keep it.
-fn refine_kind(local: &Path, kind: Kind) -> Kind {
+/// Video by extension but no video stream (per ffprobe) is audio; without ffprobe, keep it
+/// (a `.ts` ffprobe cannot read is not media).
+fn refine_kind(local: &Path, name: &str, kind: Kind) -> Kind {
     if kind != Kind::Video {
         return kind;
     }
-    match ffmpeg::resolve().and_then(|t| ffmpeg::probe(&t, local)) {
-        Ok(probe) => kind::refine_with_probe(kind, probe.video.is_some()),
+    let probe = match ffmpeg::resolve().and_then(|t| ffmpeg::probe(&t, local)) {
+        Ok(probe) => Some((probe.video.is_some(), probe.has_audio)),
         Err(e) => {
             sopen::debug!("not probed: {e:#}");
-            kind
+            None
         }
-    }
+    };
+    kind::refine_after_fetch(name, kind, probe)
 }
 
 fn open_in_editor(
@@ -356,21 +359,21 @@ fn open_in_editor(
             Ok(())
         }
         Place::Remote(..) => {
+            let shown = place.display(abs);
             let (local, at) = fetch_to_cache(place, abs, dirs, rec)?;
-            let before = app::file_hash(&local)?;
             eprintln!(
                 "Zed not found; editing a copy with {}",
                 editor.to_string_lossy()
             );
             if let Err(e) = zed::run_terminal_editor(&local) {
-                bail!("{e:#}; not uploaded — the copy is at {}", local.display());
+                return Err(keep_edits(&local, &at, e.context("not uploaded")));
             }
-            if app::file_hash(&local)? == before {
-                println!("no changes; {} untouched", place.display(abs));
+            if !edited(&local, &at)? {
+                println!("no changes; {shown} untouched");
                 rec.action = Some("discard");
                 return Ok(());
             }
-            upload_back(place, &local, abs, at, rec)
+            upload_back(place.fs(), &shown, &local, abs, &at, rec)
         }
     }
 }
@@ -388,73 +391,103 @@ fn open_in_app(
         println!("opened {abs} in {app_name}");
         return Ok(());
     }
+    let shown = place.display(abs);
     let (local, at) = fetch_to_cache(place, abs, dirs, rec)?;
-    let before = app::file_hash(&local)?;
     app::open_with(app_name, &local)?;
     eprintln!(
-        "opened {} in {app_name} (local copy {})",
-        place.display(abs),
+        "opened {shown} in {app_name} (local copy {})",
         local.display()
     );
     let stdin = std::io::stdin();
-    let decision = app::prompt(&mut stdin.lock(), &mut std::io::stderr())?;
-    if decision == app::Decision::Discard {
-        println!("discarded; {} untouched", place.display(abs));
-        rec.action = Some("discard");
-        return Ok(());
-    }
-    if app::file_hash(&local)? == before {
-        println!("no changes; {} untouched", place.display(abs));
-        rec.action = Some("discard");
-        return Ok(());
-    }
-    upload_back(place, &local, abs, at, rec)
-}
-
-fn describe_change(at: &Stat, now: Option<&Stat>) -> String {
-    let Some(now) = now else {
-        return "it was deleted".to_string();
+    let decision = match app::prompt(&mut stdin.lock(), &mut std::io::stderr()) {
+        Ok(decision) => decision,
+        Err(e) => return Err(keep_edits(&local, &at, e.context("not uploaded"))),
     };
-    let secs = |t: SystemTime| cache::rfc3339(t);
-    let mut parts = Vec::new();
-    if now.size != at.size {
-        parts.push(format!("size {} → {}", at.size, now.size));
+    if !edited(&local, &at)? {
+        println!("no changes; {shown} untouched");
+        rec.action = Some("discard");
+        return Ok(());
     }
-    if now.mtime != at.mtime {
-        parts.push(format!("modified {} → {}", secs(at.mtime), secs(now.mtime)));
+    if decision == app::Decision::Discard {
+        // Out of the way of the next fetch, but not deleted.
+        let keep = cache::set_aside(&local)?;
+        println!(
+            "discarded; {shown} untouched (your edited copy is at {})",
+            keep.display()
+        );
+        rec.action = Some("discard");
+        return Ok(());
     }
-    parts.join(", ")
+    upload_back(place.fs(), &shown, &local, abs, &at, rec)
 }
 
-/// Conflict-safe upload of an edited copy (spec §5). On a conflict the edit is moved aside to
-/// `<copy>.conflict-<stamp>` (so the next fetch cannot overwrite it) and the run fails with exit 3.
+/// Does the fetched copy differ from what was fetched?
+fn edited(local: &Path, at: &Stat) -> Result<bool> {
+    Ok(Some(app::file_hash(local)?) != at.sha256)
+}
+
+/// A step after the fetch failed: an edited copy moves aside (no later fetch can overwrite it)
+/// and the error says where it is.
+fn keep_edits(local: &Path, at: &Stat, e: anyhow::Error) -> anyhow::Error {
+    match edited(local, at) {
+        Ok(true) => match cache::set_aside(local) {
+            Ok(keep) => anyhow::anyhow!("{e:#} — your edited copy is at {}", keep.display()),
+            Err(move_err) => e.context(format!("{move_err:#}")),
+        },
+        _ => e,
+    }
+}
+
+/// Conflict-safe upload of an edited copy (spec §5). Whenever it does not land — a conflict
+/// (exit 3) or any failure — the edit is moved aside to `<copy>.conflict-<stamp>` first, so the
+/// next fetch cannot overwrite it, and the error prints that path.
 fn upload_back(
-    place: &mut Place,
+    fs: &mut dyn RemoteFs,
+    shown: &str,
     local: &Path,
     abs: &str,
-    at: Stat,
+    at: &Stat,
     rec: &mut Record,
 ) -> Result<()> {
     // The run is a save attempt from here on, whether it lands, conflicts or fails.
     rec.action = Some("save");
-    match place.fs().write_atomic(local, abs, at.fingerprint())? {
-        WriteOutcome::Written { .. } => {
-            println!("saved {}", place.display(abs));
+    match fs.write_atomic(local, abs, at.fingerprint()) {
+        Ok(WriteOutcome::Written { notes, .. }) => {
+            println!("saved {shown}");
+            for note in notes {
+                eprintln!("sopen: {note}");
+            }
             Ok(())
         }
-        WriteOutcome::Conflict { now } => {
+        Ok(WriteOutcome::Conflict { reason, notes, .. }) => {
             rec.conflict = true;
-            let keep = cache::conflict_copy_path(local, SystemTime::now());
-            std::fs::rename(local, &keep)
-                .with_context(|| format!("cannot keep the edited copy at {}", keep.display()))?;
-            Err(Refused(format!(
-                "{} changed since it was fetched ({}); not uploaded — your copy is at {}",
-                place.display(abs),
-                describe_change(&at, now.as_ref()),
+            let keep = cache::set_aside(local)?;
+            let mut msg = format!(
+                "{shown} changed since it was fetched ({reason}); not uploaded — your copy is at {}",
                 keep.display()
-            ))
-            .into())
+            );
+            for note in notes {
+                msg.push_str(&format!("; {note}"));
+            }
+            Err(Refused(msg).into())
         }
+        Err(e) => {
+            let keep = cache::set_aside(local).with_context(|| format!("{e:#}"))?;
+            Err(anyhow::anyhow!(failed_upload(&e, &keep)))
+        }
+    }
+}
+
+/// The one line for a save that failed. A request that got no reply is "outcome unknown" —
+/// never "not uploaded".
+fn failed_upload(e: &anyhow::Error, keep: &Path) -> String {
+    if remote::is_outcome_unknown(e) {
+        format!(
+            "{e:#} — outcome unknown, check the remote; your copy is at {}",
+            keep.display()
+        )
+    } else {
+        format!("{e:#}; your copy is at {}", keep.display())
     }
 }
 
@@ -534,18 +567,121 @@ mod tests {
     }
 
     #[test]
-    fn change_description() {
-        let at = Stat {
-            is_dir: false,
-            size: 3,
-            mtime: SystemTime::UNIX_EPOCH,
-            mode: 0o644,
-        };
-        let now = Stat { size: 5, ..at };
-        assert_eq!(describe_change(&at, Some(&now)), "size 3 → 5");
-        assert_eq!(describe_change(&at, None), "it was deleted");
+    fn sizes() {
         assert_eq!(human(999), "999 B");
         assert_eq!(human(1_500_000), "1.5 MB");
+    }
+
+    /// A fetched copy of `body` at `<tmp>/cache/a.txt`, edited to `edit`.
+    fn edited_copy(tmp: &Path, body: &str, edit: &str) -> (PathBuf, PathBuf, Stat) {
+        let target = tmp.join("a.txt");
+        std::fs::write(&target, body).unwrap();
+        let local = tmp.join("cache/a.txt");
+        let at = LocalFs::new()
+            .fetch(target.to_str().unwrap(), &local, &mut |_, _| {})
+            .unwrap();
+        std::fs::write(&local, edit).unwrap();
+        (target, local, at)
+    }
+
+    fn conflict_copies(dir: &Path) -> Vec<PathBuf> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.to_string_lossy().contains(".conflict-"))
+            .collect()
+    }
+
+    #[test]
+    fn w8_a_conflict_keeps_the_edit_aside_and_exits_3() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (target, local, at) = edited_copy(tmp.path(), "v1", "my edit");
+        std::fs::write(&target, "v2, someone else").unwrap();
+        let mut rec = Record::default();
+        let err = upload_back(
+            &mut LocalFs::new(),
+            "box:/a.txt",
+            &local,
+            target.to_str().unwrap(),
+            &at,
+            &mut rec,
+        )
+        .unwrap_err();
+        assert!(err.chain().any(|c| c.is::<Refused>()));
+        assert!(rec.conflict);
+        let kept = conflict_copies(&tmp.path().join("cache"));
+        assert_eq!(kept.len(), 1);
+        assert_eq!(std::fs::read_to_string(&kept[0]).unwrap(), "my edit");
+        assert!(
+            err.to_string().contains(&kept[0].display().to_string()),
+            "{err}"
+        );
+        assert!(!local.exists(), "the next fetch has nothing to overwrite");
+    }
+
+    #[test]
+    fn w8_any_failed_upload_keeps_the_edit_aside() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (target, local, at) = edited_copy(tmp.path(), "v1", "my edit");
+        // The remote directory refuses new files (unless running as root, which ignores modes).
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        if std::fs::metadata(&local).unwrap().uid() == 0 {
+            eprintln!("skipping: root ignores directory permissions");
+            return;
+        }
+        std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
+        let mut rec = Record::default();
+        let result = upload_back(
+            &mut LocalFs::new(),
+            "box:/a.txt",
+            &local,
+            target.to_str().unwrap(),
+            &at,
+            &mut rec,
+        );
+        std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        let err = result.unwrap_err();
+        assert!(
+            !err.chain().any(|c| c.is::<Refused>()),
+            "a failure, not a conflict"
+        );
+        let msg = format!("{err:#}");
+        assert!(msg.contains("was not replaced"), "{msg}");
+        let kept = conflict_copies(&tmp.path().join("cache"));
+        assert_eq!(kept.len(), 1);
+        assert_eq!(std::fs::read_to_string(&kept[0]).unwrap(), "my edit");
+        assert!(msg.contains(&kept[0].display().to_string()), "{msg}");
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "v1");
+    }
+
+    #[test]
+    fn w8_failure_wording() {
+        let keep = Path::new("/c/a.txt.conflict-x");
+        let unknown = remote::unknown("rename a to b: no reply").context("saving /a.txt");
+        let line = failed_upload(&unknown, keep);
+        assert!(line.contains("outcome unknown, check the remote"), "{line}");
+        assert!(
+            line.ends_with("your copy is at /c/a.txt.conflict-x"),
+            "{line}"
+        );
+        let plain = failed_upload(&anyhow::anyhow!("disk full"), keep);
+        assert_eq!(plain, "disk full; your copy is at /c/a.txt.conflict-x");
+    }
+
+    #[test]
+    fn w8_editor_failure_keeps_an_edited_copy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (_, local, at) = edited_copy(tmp.path(), "v1", "half-done edit");
+        let err = keep_edits(&local, &at, anyhow::anyhow!("vi exited with 1"));
+        let kept = conflict_copies(&tmp.path().join("cache"));
+        assert_eq!(kept.len(), 1);
+        assert!(err.to_string().contains("your edited copy is at"), "{err}");
+
+        // An untouched copy stays where it is; there is nothing to keep.
+        let (_, local, at) = edited_copy(tmp.path(), "v1", "v1");
+        let err = keep_edits(&local, &at, anyhow::anyhow!("vi exited with 1"));
+        assert_eq!(err.to_string(), "vi exited with 1");
+        assert!(local.exists());
     }
 
     impl Cli {

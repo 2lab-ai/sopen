@@ -1,6 +1,7 @@
 //! ffmpeg/ffprobe as external programs (AGENTS.md: never link libav*). Resolution:
 //! `SOPEN_FFMPEG` / `SOPEN_FFPROBE`, then PATH. Exports re-encode so cuts are exact (spec §7):
-//! H.264 + AAC for video, the source codec family for audio.
+//! H.264 + AAC for video; for audio the source's codec (from ffprobe), in the source's container
+//! when it can hold that codec.
 
 use anyhow::{anyhow, bail, Context, Result};
 use std::collections::HashSet;
@@ -43,9 +44,18 @@ pub fn resolve() -> Result<Tools> {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Probe {
     pub duration: Option<f64>,
-    /// `(width, height)` of the first video stream that is not an attached picture (cover art).
+    /// `(width, height)` of the first video stream that is not an attached picture (cover art),
+    /// as coded.
     pub video: Option<(u32, u32)>,
+    /// That stream's display rotation (0, 90, 180 or 270 degrees, from the display matrix or
+    /// the legacy `rotate` tag).
+    pub rotation: u32,
+    /// `video` as shown: width and height swapped for 90/270. ffmpeg rotates frames before
+    /// filters run, so crop rectangles are in these pixels.
+    pub display: Option<(u32, u32)>,
     pub has_audio: bool,
+    /// ffprobe `codec_name` of the first audio stream (`aac`, `opus`, `pcm_s24le`, …).
+    pub audio_codec: Option<String>,
 }
 
 /// `ffprobe -v error -print_format json -show_format -show_streams <path>`.
@@ -82,6 +92,8 @@ pub fn parse_probe(json: &str) -> Result<Probe> {
     };
     let duration = num(&v["format"]["duration"]);
     let mut video = None;
+    let mut rotation = 0;
+    let mut audio_codec = None;
     let mut has_audio = false;
     for s in v["streams"].as_array().into_iter().flatten() {
         match s["codec_type"].as_str() {
@@ -90,17 +102,39 @@ pub fn parse_probe(json: &str) -> Result<Probe> {
                     let w = s["width"].as_u64().unwrap_or(0) as u32;
                     let h = s["height"].as_u64().unwrap_or(0) as u32;
                     video = Some((w, h));
+                    let matrix = s["side_data_list"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .find_map(|d| d["rotation"].as_f64());
+                    rotation = quarter_turns(matrix.or_else(|| num(&s["tags"]["rotate"])));
                 }
             }
-            Some("audio") => has_audio = true,
+            Some("audio") => {
+                if !has_audio {
+                    audio_codec = s["codec_name"].as_str().map(str::to_string);
+                }
+                has_audio = true;
+            }
             _ => {}
         }
     }
+    let display = video.map(|(w, h)| if rotation % 180 == 90 { (h, w) } else { (w, h) });
     Ok(Probe {
         duration,
         video,
+        rotation,
+        display,
         has_audio,
+        audio_codec,
     })
+}
+
+/// Degrees (either sign, any multiple) → 0, 90, 180 or 270.
+fn quarter_turns(degrees: Option<f64>) -> u32 {
+    let d = degrees.unwrap_or(0.0).round() as i64;
+    let nearest = (d.rem_euclid(360) + 45) / 90 * 90;
+    (nearest % 360) as u32
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -163,20 +197,100 @@ pub enum MediaKind {
     Audio,
 }
 
-/// Container of the export. H.264/AAC cannot go into WebM, so a WebM source exports as MP4.
-pub fn output_ext(src_ext: &str, kind: MediaKind) -> String {
-    let ext = src_ext.to_ascii_lowercase();
-    match (kind, ext.as_str()) {
-        (MediaKind::Video, "webm") => "mp4".to_string(),
-        _ => ext,
+/// Encoder arguments that re-create an audio codec (spec §7), by ffprobe `codec_name`.
+/// PCM keeps its exact sample format, so 24-bit and float WAV keep their depth.
+fn encoder_for_codec(codec: &str) -> Option<Vec<String>> {
+    let args: &[&str] = match codec {
+        "aac" => &["-c:a", "aac", "-b:a", "192k"],
+        "opus" => &["-c:a", "libopus"],
+        "vorbis" => &["-c:a", "libvorbis"],
+        "mp3" => &["-c:a", "libmp3lame", "-q:a", "2"],
+        "flac" => &["-c:a", "flac"],
+        "alac" => &["-c:a", "alac"],
+        pcm if pcm.starts_with("pcm_") => return Some(vec!["-c:a".into(), pcm.into()]),
+        _ => return None,
+    };
+    Some(args.iter().map(|a| a.to_string()).collect())
+}
+
+/// Audio encoder by container, for a source codec that is unknown or has no entry above.
+fn encoder_for_container(ext: &str) -> Option<&'static [&'static str]> {
+    Some(match ext {
+        "mp3" | "avi" => &["-c:a", "libmp3lame", "-q:a", "2"],
+        "wav" => &["-c:a", "pcm_s16le"],
+        "flac" | "mkv" => &["-c:a", "flac"],
+        "m4a" | "aac" | "mp4" | "m4v" | "mov" | "ts" => &["-c:a", "aac", "-b:a", "192k"],
+        "ogg" => &["-c:a", "libvorbis"],
+        "opus" | "webm" => &["-c:a", "libopus"],
+        _ => return None,
+    })
+}
+
+fn is_little_endian_pcm(codec: &str) -> bool {
+    codec.starts_with("pcm_") && (codec.ends_with("le") || codec == "pcm_u8")
+}
+
+/// Whether ffmpeg's muxer for container `ext` carries audio codec `codec` (conservatively).
+fn container_holds(ext: &str, codec: &str) -> bool {
+    let pcm = codec.starts_with("pcm_");
+    match ext {
+        "mp4" | "m4a" | "m4v" => matches!(codec, "aac" | "mp3" | "alac"),
+        "mov" => pcm || matches!(codec, "aac" | "mp3" | "alac"),
+        "mkv" => true,
+        "webm" => matches!(codec, "opus" | "vorbis"),
+        "ogg" => matches!(codec, "vorbis" | "opus" | "flac"),
+        "opus" => codec == "opus",
+        "mp3" => codec == "mp3",
+        "flac" => codec == "flac",
+        "aac" => codec == "aac",
+        "wav" => is_little_endian_pcm(codec),
+        "avi" => pcm || codec == "mp3",
+        "ts" => matches!(codec, "aac" | "mp3" | "opus"),
+        _ => false,
     }
 }
+
+/// The audio-only container a codec goes to when the source's cannot carry it.
+fn home_container(codec: &str) -> &'static str {
+    match codec {
+        "aac" | "alac" => "m4a",
+        "opus" => "opus",
+        "vorbis" => "ogg",
+        "mp3" => "mp3",
+        "flac" => "flac",
+        c if is_little_endian_pcm(c) => "wav",
+        _ => "mkv",
+    }
+}
+
+/// Container of the export. Video: H.264/AAC cannot go into WebM, so a WebM source exports as
+/// MP4. Audio (`audio_codec` = the source's, from ffprobe): the source container when it can
+/// carry that codec, else the codec's own (an AAC-only `.mp4` stays `.mp4`, Opus in `.mkv`
+/// stays, Opus elsewhere → `.opus`).
+pub fn output_ext(src_ext: &str, kind: MediaKind, audio_codec: Option<&str>) -> String {
+    let ext = src_ext.to_ascii_lowercase();
+    match kind {
+        MediaKind::Video if ext == "webm" => "mp4".to_string(),
+        MediaKind::Video => ext,
+        MediaKind::Audio => match audio_codec.filter(|c| encoder_for_codec(c).is_some()) {
+            Some(c) if container_holds(&ext, c) => ext,
+            Some(c) => home_container(c).to_string(),
+            None if encoder_for_container(&ext).is_some() => ext,
+            None => "m4a".to_string(),
+        },
+    }
+}
+
+/// How far before IN a transport stream is seeked on input; the rest is decoded and trimmed.
+const TS_PRESEEK_S: f64 = 10.0;
 
 fn secs_arg(s: f64) -> OsString {
     OsString::from(format!("{s:.3}"))
 }
 
 /// The ffmpeg arguments for one export (everything after the global flags). Pure.
+/// `audio_codec` is the source's audio codec (ffprobe `codec_name`); audio exports re-create it,
+/// falling back to the destination container's usual codec when it is unknown.
 pub fn export_args(
     src: &Path,
     dst: &Path,
@@ -184,6 +298,7 @@ pub fn export_args(
     out_s: f64,
     crop: Option<Rect>,
     kind: MediaKind,
+    audio_codec: Option<&str>,
 ) -> Result<Vec<OsString>> {
     if !(in_s >= 0.0 && out_s > in_s && out_s.is_finite()) {
         bail!("cut range {in_s}..{out_s} is empty or negative");
@@ -192,14 +307,37 @@ pub fn export_args(
         .extension()
         .map(|e| e.to_string_lossy().to_ascii_lowercase())
         .unwrap_or_default();
-    let mut args: Vec<OsString> = vec![
-        "-ss".into(),
-        secs_arg(in_s),
-        "-to".into(),
-        secs_arg(out_s),
-        "-i".into(),
-        src.as_os_str().to_owned(),
-    ];
+    let src_ext = src
+        .extension()
+        .map(|e| e.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+    let mut args: Vec<OsString> = if src_ext == "ts" {
+        // MPEG-TS has no index: a seek before `-i` lands mid-GOP and loses every frame up to the
+        // next keyframe (all of them, when there is none). Seek early, then trim after decoding.
+        let coarse = (in_s - TS_PRESEEK_S).max(0.0);
+        let mut args: Vec<OsString> = Vec::new();
+        if coarse > 0.0 {
+            args.extend(["-ss".into(), secs_arg(coarse)]);
+        }
+        args.extend([
+            "-i".into(),
+            src.as_os_str().to_owned(),
+            "-ss".into(),
+            secs_arg(in_s - coarse),
+            "-to".into(),
+            secs_arg(out_s - coarse),
+        ]);
+        args
+    } else {
+        vec![
+            "-ss".into(),
+            secs_arg(in_s),
+            "-to".into(),
+            secs_arg(out_s),
+            "-i".into(),
+            src.as_os_str().to_owned(),
+        ]
+    };
     let push = |args: &mut Vec<OsString>, list: &[&str]| {
         args.extend(list.iter().map(OsString::from));
     };
@@ -230,16 +368,13 @@ pub fn export_args(
             }
             // -vn: cover art is not part of a cut, and not every audio container can hold it.
             push(&mut args, &["-vn"]);
-            let codec: &[&str] = match ext.as_str() {
-                "mp3" => &["-c:a", "libmp3lame", "-q:a", "2"],
-                "wav" => &["-c:a", "pcm_s16le"],
-                "flac" => &["-c:a", "flac"],
-                "m4a" | "aac" => &["-c:a", "aac", "-b:a", "192k"],
-                "ogg" => &["-c:a", "libvorbis"],
-                "opus" => &["-c:a", "libopus"],
-                other => bail!("no audio export for .{other} files"),
-            };
-            push(&mut args, codec);
+            match audio_codec.and_then(encoder_for_codec) {
+                Some(codec) => args.extend(codec.into_iter().map(OsString::from)),
+                None => match encoder_for_container(&ext) {
+                    Some(codec) => push(&mut args, codec),
+                    None => bail!("no audio export for .{ext} files"),
+                },
+            }
         }
     }
     args.push(dst.as_os_str().to_owned());

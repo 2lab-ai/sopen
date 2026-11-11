@@ -42,7 +42,7 @@ anything not in the table below is out of scope until usage says otherwise (§10
 | directory | remote `stat` | Zed remote (`ssh://[user@]host[:port]/abs`) |
 | text | extension list, else first 8 KiB has no NUL and is valid UTF-8 | Zed remote |
 | image | `png jpg jpeg webp bmp gif tif tiff` | image window |
-| video | `mp4 mov m4v mkv webm avi` (and ffprobe says it has a video stream) | media window |
+| video | `mp4 mov m4v mkv webm avi` (and ffprobe says it has a video stream); `ts` only when it is not text and ffprobe sees a video stream (`.ts` is also TypeScript) | media window |
 | audio | `mp3 wav flac m4a aac ogg opus` | media window |
 | other | everything else | fetch → print cache path (A6) |
 
@@ -60,13 +60,27 @@ anything not in the table below is out of scope until usage says otherwise (§10
 
 ## 5. Writes back (conflict-safe, never silent)
 
-- Every fetch records the remote `(size, mtime)`.
-- Before any write: re-`stat`. If either differs, refuse, keep the edited local copy, print its path. No overwrite.
-- Write = upload to `.<name>.sopen-<random>` in the same remote directory → `fsync@openssh.com` if offered →
-  `posix-rename@openssh.com` over the target (plain rename if not offered) → restore the original permission bits.
+- Every fetch records the remote `(size, mtime)` and the SHA-256 of the fetched bytes. The write target is the
+  `realpath` resolved at fetch time.
+- Before any write: `lstat` the target. If it is gone, now a symlink or not a regular file, or its size or mtime
+  differ — or, up to 256 MiB, its content hash differs (above that: size and mtime only, and the result says so) —
+  refuse, keep the edited local copy, print its path. No overwrite. A server that leaves out size, mtime,
+  permissions, type or owner gets no write.
+- Write = upload to `.<name>.sopen-<random>` (created exclusively) in the same remote directory → give it the
+  target's owner (refuse when that is impossible) and permission bits → `fsync@openssh.com` if offered → re-check →
+  `posix-rename@openssh.com` over the target (plain rename if not offered). Only a temp this write created is ever
+  removed; one that cannot be removed is named. The next baseline is the uploaded bytes; a size mismatch right after
+  the rename is reported ("another writer?") and makes the next save refuse.
+- Conflict detection is best-effort: it catches changes made before you save (size, mtime, and content hash up to
+  256 MiB); it cannot lock the remote file, so a write racing the final rename is not detected.
+- Any save that does not land moves the edited copy aside to `<copy>.conflict-<UTC stamp>` and prints that path. A
+  fetch never overwrites a cached copy holding unsaved edits: it moves it aside first.
+- Nothing waits forever: ssh keepalives (10 s × 3), 30 s per SFTP request, 60 s without transfer progress. A
+  rename or link with no reply is "outcome unknown — check the remote", never "nothing was written".
 - Image Save (Cmd/Ctrl+S) overwrites the original **after** copying the fetched original to the local backup
   `<cache>/backup/<host>/<abs path>.<UTC stamp>` and printing that path. "Save copy" writes `<stem>.edited.<ext>`
-  next to the original instead. Media Export never overwrites (sibling file; `-N` suffix if the name exists).
+  next to the original instead. Media Export never overwrites (sibling file; `-N` suffix if the name exists): it is
+  published by hard link from a temp, or — where links are unavailable — written into a name created exclusively.
 - Live receipts run only on files created under the remote `/tmp` for that purpose.
 
 ## 6. Image window (A3)
