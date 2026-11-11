@@ -130,7 +130,7 @@ From `usage.jsonl` across machines: < 5 runs/week, or ≥ 80 % text/dir → arch
 A conflict refusal or failed write → fix before anything else. Large-media waits (≥ 500 MB or fetch ≥ 30 s, 3+ times)
 → consider streaming. The owner naming the same missing edit 3 times → that one edit, nothing more.
 
-## 11. Spike results (filled from the 2026-11-11 spike)
+## 11. Spike results (2026-11-11, throwaway spike, ~1.4k LOC)
 
 - **Toolkit:** eframe/egui 0.37 — one dependency for window, input and texture upload, no system UI
   libraries to link. Renderer: wgpu by default, glow (OpenGL) compiled in as the fallback — chosen with
@@ -148,3 +148,7 @@ A conflict refusal or failed write → fix before anything else. Large-media wai
 - **macOS:** a window started from a terminal can come up behind it — sopen asks for focus on its first
   frames. A window can screenshot itself (`ViewportCommand::Screenshot`), which is how window receipts are
   taken (AGENTS.md "Receipts").
+- **Measured in the spike (2026-11-11):** time to first frame — image 128–180 ms warm (541 ms first launch),
+  video ~150 ms, audio waveform ~140 ms; A/V drift with a real-time null sink mean −11 ms / max 16.6 ms; a
+  2.5–4.0 s cut = 45 frames starting at 00:00:02.500; 0.03–0.11 s per 2–4 s export; on Arch, Homebrew's
+  pkg-config misses `/usr/lib/pkgconfig` (set `PKG_CONFIG_PATH` to build).
