@@ -1,0 +1,111 @@
+---
+title: sopen — spec v1
+type: spec
+tags: [sopen, spec]
+---
+
+# sopen — spec v1 (2026-11-11)
+
+`sopen host:/path` opens any file or folder on any of my machines as if it were local:
+folders and text go to Zed's remote mode, images and audio/video open in a small built-in
+window where the few edits I actually need are one drag away.
+
+## 1. Owner intent (verbatim, in order — the SSOT for scope)
+
+1. "scp 처럼 그냥 `snote <host>:/tmp/a.sh` 로 리모트 파일을 그냥 로컬처럼 사용하고 싶은거야. … 디렉토리 폴더 프로젝트로 볼수 있게하고 파일 편집할수 있고 신택스 하일라이트 볼수 있고 이미지나 영상도 볼수 있는 … rust면 좋겠고 linux, macos에서 다 지원되고 brew install .../snote 로 설치하고 즉시 `snote <host>:/tmp/a.mp3` 를 쓸수 있으면 좋겠음. llmux 오픈소스 처럼 개발 해줬으면 좋겠고"
+2. "먼저 만들가치가 있는지부터 리서치해줘"
+3. "그냥 일종의 파일 만능툴이 필요함 … 내 머신들에서 아무렇게나 아무 머신에 이는 파일을 볼수 있고 편집할수 있는 기능 - mp3, wav, 아무 파일, 영상등 / mp3나 영상등은 즉시 원하는 구간만 잘라내는 기능 … ffmpeg로 하면 되잖아 / 이미지 편집은 irfanview에 있는 이미지 편집 기능 정도 / 파일은 그냥 텍스트 편집이랑 원하면 hex 편집기능정도까지"
+4. "기존에 macshot 소스강 있는데 여기서 시작하는게 좋을것 같기도하고"
+5. "너무 쓸데 없는 기능까지 요구 하는건 아닌가 싶기도 하고"
+6. (after the research verdict "a router, not an editor") "그럼 이름이 snote가 아니라 sopen이지 그렇게 진행해줘 근데 이미지나 영상은 보고 바로 편집할수 있으면 좋겠는데 사각형으로 자르고 시간상에서 시간으로 컷 정도랑 이미지의 경우 사각형으로 지정해서 pixelize 정도"
+
+Message 6 supersedes 3's "IrfanView 정도" with an exact list. Message 5 is a standing constraint:
+anything not in the table below is out of scope until usage says otherwise (§10).
+
+## 2. Intent → acceptance
+
+| # | Owner intent | Acceptance (observable) |
+|---|---|---|
+| A1 | `sopen host:/path`, scp syntax, any machine in `~/.ssh/config` | `sopen <alias>:/abs/file`, `sopen <alias>:rel/to/home`, `sopen user@host:/x` all open; aliases, ProxyJump, agent behave exactly as `ssh <alias>` does (system ssh is used). Local paths (`sopen ./x.png`) open too. |
+| A2 | Folder as a project, text edit, syntax highlight | Folder or text file → Zed opens the remote path (`zed ssh://…` on macOS, `zeditor`/`zed` on Linux). Save in Zed writes the remote file (Zed owns this). |
+| A3 | Image: view + rectangle crop + rectangle pixelize | Built-in window shows the image; drag draws a rectangle in image pixels; Crop and Pixelize act on it; Undo; Save writes back to the remote file. |
+| A4 | Video: view + rectangle crop + time cut | Built-in window plays the video with sound; scrub timeline; set In/Out; drag a crop rectangle; Export writes `<stem>.cut-<in>-<out>.<ext>` next to the original on the remote. |
+| A5 | Audio (mp3/wav): view + time cut | Same window: waveform, play, In/Out, Export. |
+| A6 | "아무 파일" | Any other type is fetched to the local cache and its path printed; `--app <App>` opens it in a named local app and uploads it back when the user presses Enter in the terminal. (This is the hex-editor path: `--app ImHex`.) |
+| A7 | Rust, macOS + Linux, `brew install …` and use immediately | `brew install 2lab-ai/tap/sopen-preview` on macOS (arm64, x86_64) and Linux (x86_64, aarch64) installs `sopen` and the `ffmpeg` it needs; the first `sopen host:/a.mp3` works with no further setup. |
+| A8 | Developed like llmux | Public repo `2lab-ai/sopen`, MIT; `ci.yml` (macOS + Linux), `preview.yml` (every main push → prerelease + tap bump), `release.yml` (`v*` tag = owner gate); `AGENTS.md` SSOT; `.prd/` spec. |
+
+## 3. Routing
+
+| Kind | Detected by | Opens in |
+|---|---|---|
+| directory | remote `stat` | Zed remote (`ssh://[user@]host[:port]/abs`) |
+| text | extension list, else first 8 KiB has no NUL and is valid UTF-8 | Zed remote |
+| image | `png jpg jpeg webp bmp gif tif tiff` | image window |
+| video | `mp4 mov m4v mkv webm avi` (and ffprobe says it has a video stream) | media window |
+| audio | `mp3 wav flac m4a aac ogg opus` | media window |
+| other | everything else | fetch → print cache path (A6) |
+
+- Zed not found (`zed` / `zeditor` on PATH, macOS also `/Applications/Zed.app/Contents/MacOS/cli`): text → fetch, run `$VISUAL`/`$EDITOR` in the terminal, upload on exit if changed; directory → error that names the missing editor.
+- Remote relative paths resolve against the remote home (SFTP `realpath`), as scp does.
+
+## 4. Remote layer
+
+- Transport = the system `ssh` binary (so `~/.ssh/config` is honoured completely), one multiplexed master per host
+  (`ControlMaster=auto`, `ControlPath=<state>/cm-%C`, `ControlPersist=60s`).
+- File operations = SFTP over that session (`openssh` + `openssh-sftp-client` crates): `stat`, `realpath`, read, write.
+  SFTP keeps the code independent of the remote OS (macOS BSD tools vs GNU) — no remote shell parsing.
+- Nothing is installed on the remote. Only sshd's SFTP subsystem is required. (Zed installs its own server when the
+  owner opens folders/text; that is Zed's behaviour, documented in the README.)
+
+## 5. Writes back (conflict-safe, never silent)
+
+- Every fetch records the remote `(size, mtime)`.
+- Before any write: re-`stat`. If either differs, refuse, keep the edited local copy, print its path. No overwrite.
+- Write = upload to `.<name>.sopen-<random>` in the same remote directory → `fsync@openssh.com` if offered →
+  `posix-rename@openssh.com` over the target (plain rename if not offered) → restore the original permission bits.
+- Image Save (Cmd/Ctrl+S) overwrites the original **after** copying the fetched original to the local backup
+  `<cache>/backup/<host>/<abs path>.<UTC stamp>` and printing that path. "Save copy" writes `<stem>.edited.<ext>`
+  next to the original instead. Media Export never overwrites (sibling file; `-N` suffix if the name exists).
+- Live receipts run only on files created under the remote `/tmp` for that purpose.
+
+## 6. Image window (A3)
+
+- Fit-to-window view, zoom (wheel / pinch), pan; status bar shows image size, rectangle `x,y w×h`.
+- Drag = rectangle in image pixels (handles to adjust). `C` Crop, `P` Pixelize (block size, default 16 px), Undo/Redo
+  (Cmd/Ctrl+Z / Shift+Cmd/Ctrl+Z), Cmd/Ctrl+S Save, Save copy, Esc clears the rectangle.
+- Encoding keeps the format: PNG lossless, JPEG quality 95, WebP lossless, BMP, TIFF. Animated GIF opens read-only
+  (frame 1 shown, Save disabled with a reason).
+
+## 7. Media window (A4, A5)
+
+- Probe with `ffprobe` (duration, streams, size). `ffmpeg`/`ffprobe` are resolved at runtime (`SOPEN_FFMPEG`, then PATH;
+  the brew formula depends on `ffmpeg`).
+- Video: playback in the window with sound (ffmpeg subprocess decode → frames; audio → `cpal`; audio clock master),
+  timeline scrub, `I`/`O` set In/Out, drag = crop rectangle in source pixels, Space play/pause, Export.
+- Audio: waveform (downsampled PCM), same transport and In/Out, Export.
+- Export: `ffmpeg -ss In -to Out -i src [-vf crop=w:h:x:y] …` → re-encode (H.264 + AAC for video; the source codec for
+  audio) so cuts are exact; progress shown; result uploaded as a sibling (§5).
+- `sopen cut <target> <in> <out> [--crop x,y,w,h]` = the same export, headless (scripting + CI receipts).
+- Renderer / playback details fixed by the spike (§11).
+
+## 8. Usage log
+
+One JSON line per run in `<state>/usage.jsonl`: `ts, host_hash, kind, ext, bytes, fetch_ms, action (open|save|export|cut|discard), conflict`.
+Local only, never sent anywhere. Exists for §10.
+
+## 9. Out of scope (until §10 says otherwise)
+
+Own text editor / tree / highlighting (Zed does it), hex editor (`--app`), filters beyond crop/pixelize, frame-accurate
+copy without re-encode, streaming playback before download completes, directory sync / mounts, file watching,
+Windows, a `.app` bundle or cask, any agent on the remote, macshot (Swift, macOS-only, GPL-3 — incompatible with A7/A8).
+
+## 10. Two-week review (from 2026-11-xx first preview)
+
+From `usage.jsonl` across machines: < 5 runs/week, or ≥ 80 % text/dir → archive, keep a `zed ssh://` alias.
+A conflict refusal or failed write → fix before anything else. Large-media waits (≥ 500 MB or fetch ≥ 30 s, 3+ times)
+→ consider streaming. The owner naming the same missing edit 3 times → that one edit, nothing more.
+
+## 11. Spike results (filled from the 2026-11-11 spike)
+
+_pending_
