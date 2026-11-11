@@ -44,6 +44,8 @@ struct Hooks {
     no_links: bool,
     /// `can_link` says no (the server lacks hardlink@openssh.com).
     cannot_link: bool,
+    /// `can_replace` says no (the server lacks posix-rename@openssh.com).
+    cannot_replace: bool,
     /// Right before the first publish of a final name, another writer creates it.
     competitor: bool,
     fail_remove: bool,
@@ -54,6 +56,13 @@ struct Hooks {
     owner_fix_works: bool,
     /// The server leaves this attribute out of the target's stat.
     missing: Option<&'static str>,
+    /// Content checks stop above this size (stands in for 256 MiB).
+    hash_limit: Option<u64>,
+    /// Right after our rename, another writer installs same-size content with another mtime.
+    rewrite_after_rename: bool,
+    /// The request reaches the server and takes effect, but its reply is lost (connection
+    /// closed): "rename", "link" or "create".
+    lost_reply: Option<&'static str>,
 }
 
 #[derive(Default)]
@@ -126,6 +135,12 @@ impl RemoteFs for Hooked {
         }
         self.race(path);
         let up = self.inner.create_from(local, path, mode)?;
+        if self.h.lost_reply == Some("create") {
+            return Err(CreateError::new(
+                Created::Unknown,
+                anyhow!("simulated: connection closed before the reply"),
+            ));
+        }
         if self.h.fail_create_after_bytes {
             return Err(CreateError::new(
                 Created::Yes,
@@ -153,6 +168,16 @@ impl RemoteFs for Hooked {
             return Err(unknown("simulated: rename sent, no reply"));
         }
         self.inner.rename_over(from, to)?;
+        if self.h.lost_reply == Some("rename") {
+            return Err(unknown(
+                "rename: simulated connection closed before the reply",
+            ));
+        }
+        if self.h.rewrite_after_rename {
+            let len = std::fs::metadata(to).unwrap().len() as usize;
+            std::fs::write(to, "x".repeat(len)).unwrap();
+            set_mtime(Path::new(to), 1_700_009_999);
+        }
         if self.h.grow_after_rename {
             let mut f = std::fs::OpenOptions::new().append(true).open(to).unwrap();
             f.write_all(b" + another writer").unwrap();
@@ -164,10 +189,22 @@ impl RemoteFs for Hooked {
             bail!("simulated: hard links are not supported here");
         }
         self.race(to);
-        self.inner.link_new(from, to)
+        self.inner.link_new(from, to)?;
+        if self.h.lost_reply == Some("link") {
+            return Err(unknown(
+                "link: simulated connection closed before the reply",
+            ));
+        }
+        Ok(())
     }
     fn can_link(&self) -> bool {
         !self.h.cannot_link
+    }
+    fn can_replace(&self) -> bool {
+        !self.h.cannot_replace
+    }
+    fn hash_check_limit(&self) -> u64 {
+        self.h.hash_limit.unwrap_or(HASH_CHECK_MAX)
     }
     fn remove(&mut self, path: &str) -> Result<()> {
         if self.h.fail_remove {
@@ -838,4 +875,181 @@ fn path_helpers() {
     assert_eq!(random_hex().len(), 16);
     assert!(is_temp(".a.txt.sopen-0123456789abcdef"));
     assert!(!is_temp(".a.txt.sopen-baseline"));
+}
+
+/// Two saves above the content-check limit: another writer puts same-size bytes with another
+/// mtime in place right after our rename. The baseline must be our staged temp, so the second
+/// save is refused instead of layering over the other write.
+#[test]
+fn f2_large_file_baseline_comes_from_the_staged_temp() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (target, local, at) = fetched(tmp.path(), "big.bin", "0123456789");
+    std::fs::write(&local, "abcdefghij").unwrap();
+    let mut first = Hooked::new(Hooks {
+        hash_limit: Some(4),
+        rewrite_after_rename: true,
+        ..Hooks::default()
+    });
+    let outcome = first
+        .write_atomic(&local, p(&target), at.fingerprint())
+        .unwrap();
+    let WriteOutcome::Written { now, notes } = outcome else {
+        panic!("{outcome:?}")
+    };
+    assert!(
+        notes
+            .iter()
+            .any(|n| n.starts_with("saved, but the remote changed right after")),
+        "{notes:?}"
+    );
+    std::fs::write(&local, "klmnopqrst").unwrap();
+    let mut second = Hooked::new(Hooks {
+        hash_limit: Some(4),
+        ..Hooks::default()
+    });
+    let next = second
+        .write_atomic(&local, p(&target), now.fingerprint())
+        .unwrap();
+    assert!(matches!(next, WriteOutcome::Conflict { .. }), "{next:?}");
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "xxxxxxxxxx");
+}
+
+/// The create reached the server (the temp exists) but its reply was lost.
+#[test]
+fn f2_a_lost_create_reply_is_named_not_forgotten() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (target, local, at) = fetched(tmp.path(), "a.txt", "v1");
+    std::fs::write(&local, "edit").unwrap();
+    let mut fs = Hooked::new(Hooks {
+        lost_reply: Some("create"),
+        ..Hooks::default()
+    });
+    let err = fs
+        .write_atomic(&local, p(&target), at.fingerprint())
+        .unwrap_err();
+    assert!(is_outcome_unknown(&err), "{err:#}");
+    let left = temps(tmp.path());
+    assert_eq!(left.len(), 1, "the maybe-created temp is not removed");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains(&format!(
+            "outcome unknown — check {}",
+            tmp.path().join(&left[0]).display()
+        )),
+        "{msg}"
+    );
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "v1");
+}
+
+/// The rename reached the server and landed, but its reply was lost.
+#[test]
+fn f2_a_lost_rename_reply_is_outcome_unknown_not_not_replaced() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (target, local, at) = fetched(tmp.path(), "a.txt", "v1");
+    std::fs::write(&local, "edit").unwrap();
+    let mut fs = Hooked::new(Hooks {
+        lost_reply: Some("rename"),
+        ..Hooks::default()
+    });
+    let err = fs
+        .write_atomic(&local, p(&target), at.fingerprint())
+        .unwrap_err();
+    assert!(is_outcome_unknown(&err), "{err:#}");
+    let top = outcome_unknown(&err).unwrap().to_string();
+    assert!(
+        top.ends_with(&format!("outcome unknown — check {}", p(&target))),
+        "{top}"
+    );
+    assert!(!format!("{err:#}").contains("was not replaced"), "{err:#}");
+    assert_eq!(
+        std::fs::read_to_string(&target).unwrap(),
+        "edit",
+        "it did land"
+    );
+}
+
+/// The link reached the server and landed, but its reply was lost: no second copy under `-1`.
+#[test]
+fn f2_a_lost_link_reply_is_named_and_not_published_twice() {
+    let tmp = tempfile::tempdir().unwrap();
+    let local = tmp.path().join("export.bin");
+    std::fs::write(&local, "mine").unwrap();
+    let dir = tmp.path().join("out");
+    std::fs::create_dir(&dir).unwrap();
+    let mut fs = Hooked::new(Hooks {
+        lost_reply: Some("link"),
+        ..Hooks::default()
+    });
+    let err = fs
+        .write_new_sibling(&local, p(&dir), "clip.mp4")
+        .unwrap_err();
+    assert!(is_outcome_unknown(&err), "{err:#}");
+    let top = outcome_unknown(&err).unwrap().to_string();
+    assert!(
+        top.ends_with(&format!("outcome unknown — check {}/clip.mp4", p(&dir))),
+        "{top}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.join("clip.mp4")).unwrap(),
+        "mine"
+    );
+    assert!(!dir.join("clip-1.mp4").exists());
+    assert!(temps(&dir).is_empty(), "{:?}", temps(&dir));
+}
+
+/// Without links the export is created directly; a lost create reply names that file and
+/// leaves it (it may be ours or a racing writer's).
+#[test]
+fn f2_a_lost_sibling_create_reply_names_the_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    let local = tmp.path().join("export.bin");
+    std::fs::write(&local, "mine").unwrap();
+    let dir = tmp.path().join("out");
+    std::fs::create_dir(&dir).unwrap();
+    let mut fs = Hooked::new(Hooks {
+        cannot_link: true,
+        lost_reply: Some("create"),
+        ..Hooks::default()
+    });
+    let err = fs
+        .write_new_sibling(&local, p(&dir), "clip.mp4")
+        .unwrap_err();
+    assert!(is_outcome_unknown(&err), "{err:#}");
+    let top = outcome_unknown(&err).unwrap().to_string();
+    assert!(
+        top.ends_with(&format!("outcome unknown — check {}/clip.mp4", p(&dir))),
+        "{top}"
+    );
+    assert!(
+        dir.join("clip.mp4").exists(),
+        "not removed: it may not be ours"
+    );
+}
+
+/// No posix-rename: a replace is impossible, so nothing is uploaded and Save copy is offered.
+#[test]
+fn f2_no_atomic_replace_refuses_before_uploading() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (target, local, at) = fetched(tmp.path(), "a.txt", "v1");
+    std::fs::write(&local, "edit").unwrap();
+    let mut fs = Hooked::new(Hooks {
+        cannot_replace: true,
+        ..Hooks::default()
+    });
+    let err = fs
+        .write_atomic(&local, p(&target), at.fingerprint())
+        .unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("posix-rename") && msg.contains("Save copy"),
+        "{msg}"
+    );
+    assert_eq!(fs.renames, 0);
+    assert!(temps(tmp.path()).is_empty(), "nothing was uploaded");
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "v1");
+    // Save copy (a new sibling) needs no replace.
+    let name = fs
+        .write_new_sibling(&local, p(tmp.path()), "a.edited.txt")
+        .unwrap();
+    assert_eq!(name, "a.edited.txt");
 }

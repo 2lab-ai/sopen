@@ -117,8 +117,9 @@ impl std::fmt::Display for CreateError {
 
 impl std::error::Error for CreateError {}
 
-/// A request that changes the remote timed out after it was sent: it may or may not have taken
-/// effect. Never report "nothing was written" for it.
+/// A request that changes the remote was sent and no status reply came back (timeout, connection
+/// closed, broken pipe, a garbled reply): it may or may not have taken effect. Only an SFTP status
+/// reply proves a request did not happen. Never report "nothing was written" for it.
 #[derive(Debug)]
 pub struct OutcomeUnknown(pub String);
 
@@ -131,7 +132,20 @@ impl std::fmt::Display for OutcomeUnknown {
 impl std::error::Error for OutcomeUnknown {}
 
 pub fn is_outcome_unknown(e: &anyhow::Error) -> bool {
-    e.chain().any(|c| c.is::<OutcomeUnknown>())
+    outcome_unknown(e).is_some()
+}
+
+/// The outermost [`OutcomeUnknown`] in `e` (as a context layer or in the chain).
+pub fn outcome_unknown(e: &anyhow::Error) -> Option<&OutcomeUnknown> {
+    e.downcast_ref::<OutcomeUnknown>()
+        .or_else(|| e.chain().find_map(|c| c.downcast_ref::<OutcomeUnknown>()))
+}
+
+/// `e` under an [`OutcomeUnknown`] that reads "<what>: outcome unknown — check <path>".
+fn unknown_at(e: anyhow::Error, what: &str, path: &str) -> anyhow::Error {
+    e.context(OutcomeUnknown(format!(
+        "{what}: outcome unknown — check {path}"
+    )))
 }
 
 /// An [`OutcomeUnknown`] error: a request that changes the remote got no reply in time.
@@ -216,7 +230,16 @@ pub trait RemoteFs {
     fn can_link(&self) -> bool {
         true
     }
+    /// Whether [`RemoteFs::rename_over`] can replace an existing file (SFTP:
+    /// `posix-rename@openssh.com`; plain SFTP rename refuses an existing target).
+    fn can_replace(&self) -> bool {
+        true
+    }
     fn remove(&mut self, path: &str) -> Result<()>;
+    /// Largest target whose content is re-read and hashed before a replace (tests lower it).
+    fn hash_check_limit(&self) -> u64 {
+        HASH_CHECK_MAX
+    }
 
     fn stat(&mut self, path: &str) -> Result<Stat> {
         self.stat_opt(path)?
@@ -297,13 +320,21 @@ pub trait RemoteFs {
     /// the same content. Upload goes to `.<name>.sopen-<random>` in the same directory, created
     /// exclusively with the target's permission bits and given the target's owner; the target is
     /// re-checked, then the temp is renamed over it. A temp this call created is removed on every
-    /// failure, or named in the error/notes when it cannot be.
+    /// failure, or named in the error/notes when it cannot be. The returned baseline is the
+    /// staged temp as stat'ed before the rename, never the target's stat after it.
     fn write_atomic(
         &mut self,
         local: &Path,
         target: &str,
         expected: Fingerprint,
     ) -> Result<WriteOutcome> {
+        if !self.can_replace() {
+            bail!(
+                "this server cannot replace a file in one step (it does not offer \
+                 posix-rename@openssh.com), so {target} was not touched; use Save copy to write \
+                 the edit next to it instead"
+            );
+        }
         let mut notes = Vec::new();
         let current = match check_target(self, target, &expected)? {
             Check::Same(s) => s,
@@ -316,16 +347,22 @@ pub trait RemoteFs {
         let tmp = join(dir, &format!(".{name}.sopen-{}", random_hex()));
         let uploaded = match self.create_from(local, &tmp, Some(mode)) {
             Ok(u) => u,
+            Err(e) if e.created == Created::Unknown => {
+                let what = format!("{target} was not replaced, but creating {tmp} got no reply");
+                return Err(unknown_at(e.error, &what, &tmp));
+            }
             Err(e) => {
                 let e = abandon(self, &tmp, e);
                 return Err(e.context(format!("{target} was not replaced")));
             }
         };
         // The temp is ours from here: every exit removes it or names it.
-        let staged = prepare_swap(self, target, &tmp, &current, &expected, mode, &mut notes);
-        match staged {
-            Ok(None) => {}
-            Ok(Some((now, reason))) => {
+        let swap = prepare_swap(
+            self, target, &tmp, &current, &expected, &uploaded, mode, &mut notes,
+        );
+        let staged = match swap {
+            Ok(Swap::Ready(staged)) => staged,
+            Ok(Swap::Changed(now, reason)) => {
                 if let Err(e) = self.remove(&tmp) {
                     notes.push(format!("the temp file {tmp} could not be removed: {e:#}"));
                 }
@@ -335,37 +372,44 @@ pub trait RemoteFs {
                 let e = e.context(format!("{target} was not replaced"));
                 return Err(remove_or_name(self, &tmp, e));
             }
-        }
+        };
         if let Err(e) = self.rename_over(&tmp, target) {
             if is_outcome_unknown(&e) {
-                return Err(e.context(format!(
-                    "saving {target}: outcome unknown — check the remote ({tmp} may be left)"
-                )));
+                // It may have landed: the temp is not removed, and both paths are named.
+                let what = format!("the rename of {tmp} over {target} got no reply");
+                return Err(unknown_at(e, &what, target));
             }
             let e = e.context(format!(
                 "cannot rename {tmp} over {target}; {target} was not replaced"
             ));
             return Err(remove_or_name(self, &tmp, e));
         }
-        let mut now = self
-            .stat(target)
+        // Replaced. Is the target still the object sopen staged?
+        let after = self
+            .lstat_opt(target)
             .with_context(|| format!("replaced {target} but cannot stat it"))?;
-        if now.mode & 0o7777 != mode {
-            self.set_mode(target, mode)
-                .with_context(|| format!("wrote {target} but could not restore mode {mode:o}"))?;
-            now = self.stat(target)?;
+        match after {
+            Some(now) if now.is_file && !now.is_symlink && same_stat(&now, &staged) => {
+                if now.mode & 0o7777 != mode {
+                    self.set_mode(target, mode).with_context(|| {
+                        format!("wrote {target} but could not restore mode {mode:o}")
+                    })?;
+                }
+            }
+            other => notes.push(format!(
+                "saved, but the remote changed right after: {target} is {} — sopen wrote {} \
+                 (another writer?); the next save from this copy will be refused",
+                other.map_or("gone".to_string(), |s| describe_stat(&s)),
+                describe_stat(&staged)
+            )),
         }
-        if now.size != uploaded.size {
-            notes.push(format!(
-                "saved, but {target} changed right after ({} bytes written, {} there now; \
-                 another writer?) — the next save from this copy will be refused",
-                uploaded.size, now.size
-            ));
-        }
-        // The baseline describes what sopen wrote: if the remote does not hold exactly that,
-        // the next save sees a size mismatch and refuses.
-        now.size = uploaded.size;
-        now.sha256 = Some(uploaded.sha256);
+        // The baseline is what sopen staged; if the remote holds anything else, the next save
+        // sees a different (size, mtime) and refuses.
+        let now = Stat {
+            mode,
+            sha256: Some(uploaded.sha256),
+            ..staged
+        };
         if crate::cache::baseline_record_path(local).exists() {
             if let Err(e) = crate::cache::write_baseline(local, &uploaded.sha256) {
                 crate::debug!("baseline not recorded: {e:#}");
@@ -412,6 +456,21 @@ pub trait RemoteFs {
 
 fn same_stat(a: &Stat, b: &Stat) -> bool {
     a.size == b.size && a.mtime == b.mtime
+}
+
+fn describe_stat(s: &Stat) -> String {
+    let kind = if s.is_symlink {
+        "a symbolic link, "
+    } else if !s.is_file {
+        "not a regular file, "
+    } else {
+        ""
+    };
+    format!(
+        "{kind}{} bytes modified {}",
+        s.size,
+        crate::cache::rfc3339(s.mtime)
+    )
 }
 
 /// How `now` differs from the fetch baseline, for a conflict message.
@@ -471,17 +530,25 @@ fn check_target<F: RemoteFs + ?Sized>(
     Ok(Check::Same(now))
 }
 
-/// With the temp uploaded: give it the target's owner and mode, compare the target's content
-/// with the fetch, and re-check its stat last. `Ok(Some(..))` = the target changed.
+enum Swap {
+    /// The temp as it will be renamed: its `(size, mtime)` is the next baseline.
+    Ready(Stat),
+    Changed(Option<Stat>, String),
+}
+
+/// With the temp uploaded: give it the target's owner and mode, stat it (the next baseline),
+/// compare the target's content with the fetch, and re-check the target's stat last.
+#[allow(clippy::too_many_arguments)]
 fn prepare_swap<F: RemoteFs + ?Sized>(
     fs: &mut F,
     target: &str,
     tmp: &str,
     current: &Stat,
     expected: &Fingerprint,
+    uploaded: &Uploaded,
     mode: u32,
     notes: &mut Vec<String>,
-) -> Result<Option<(Option<Stat>, String)>> {
+) -> Result<Swap> {
     let staged = fs
         .lstat_opt(tmp)?
         .with_context(|| format!("{tmp} vanished right after it was uploaded"))?;
@@ -519,16 +586,30 @@ fn prepare_swap<F: RemoteFs + ?Sized>(
     if staged.mode & 0o7777 != mode {
         fs.set_mode(tmp, mode)?;
     }
+    // The staged object after every setstat: what the target will be right after the rename.
+    let staged = fs
+        .lstat_opt(tmp)?
+        .with_context(|| format!("{tmp} vanished"))?;
+    if let Some(attr) = staged.missing {
+        bail!("the server does not report the {attr} of {tmp}");
+    }
+    if !staged.is_file || staged.size != uploaded.size {
+        bail!(
+            "{tmp} is not the {} bytes just uploaded ({})",
+            uploaded.size,
+            describe_stat(&staged)
+        );
+    }
     if let Some(want) = expected.sha256 {
-        if current.size <= HASH_CHECK_MAX {
+        if current.size <= fs.hash_check_limit() {
             let mut sink = Hashing::new(std::io::sink());
             fs.read_to(target, &mut sink, &mut |_| {})
                 .with_context(|| format!("cannot re-read {target} to check it for changes"))?;
             if sink.finish().sha256 != want {
-                return Ok(Some((
+                return Ok(Swap::Changed(
                     Some(*current),
                     "its content changed (same size and modification time)".to_string(),
-                )));
+                ));
             }
         } else {
             notes.push(format!(
@@ -537,8 +618,8 @@ fn prepare_swap<F: RemoteFs + ?Sized>(
         }
     }
     match check_target(fs, target, expected)? {
-        Check::Same(_) => Ok(None),
-        Check::Changed(now, reason) => Ok(Some((now, reason))),
+        Check::Same(_) => Ok(Swap::Ready(staged)),
+        Check::Changed(now, reason) => Ok(Swap::Changed(now, reason)),
     }
 }
 
@@ -552,9 +633,7 @@ fn abandon<F: RemoteFs + ?Sized>(fs: &mut F, path: &str, e: CreateError) -> anyh
     match e.created {
         Created::No => e.error,
         Created::Yes => remove_or_name(fs, path, e.error),
-        Created::Unknown => e
-            .error
-            .context(format!("{path} may have been created — check the remote")),
+        Created::Unknown => unknown_at(e.error, &format!("creating {path} got no reply"), path),
     }
 }
 
@@ -595,7 +674,8 @@ fn publish_linked<F: RemoteFs + ?Sized>(
         match fs.link_new(tmp, &path) {
             Ok(()) => return Ok(Linked::As(name)),
             Err(e) if is_outcome_unknown(&e) => {
-                return Err(e.context(format!("publishing {path}: outcome unknown — check it")));
+                let what = format!("linking {tmp} to {path} got no reply");
+                return Err(unknown_at(e, &what, &path));
             }
             Err(_) if fs.lstat_opt(&path)?.is_some() => continue,
             Err(e) => {

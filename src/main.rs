@@ -478,16 +478,16 @@ fn upload_back(
     }
 }
 
-/// The one line for a save that failed. A request that got no reply is "outcome unknown" —
-/// never "not uploaded".
+/// The one line for a save that failed. A request that got no reply is "outcome unknown —
+/// check <path>" — never "not uploaded".
 fn failed_upload(e: &anyhow::Error, keep: &Path) -> String {
-    if remote::is_outcome_unknown(e) {
-        format!(
-            "{e:#} — outcome unknown, check the remote; your copy is at {}",
-            keep.display()
-        )
-    } else {
-        format!("{e:#}; your copy is at {}", keep.display())
+    match remote::outcome_unknown(e) {
+        Some(unknown) => format!(
+            "{unknown}; your copy is at {} (cause: {})",
+            keep.display(),
+            e.root_cause()
+        ),
+        None => format!("{e:#}; your copy is at {}", keep.display()),
     }
 }
 
@@ -657,15 +657,83 @@ mod tests {
     #[test]
     fn w8_failure_wording() {
         let keep = Path::new("/c/a.txt.conflict-x");
-        let unknown = remote::unknown("rename a to b: no reply").context("saving /a.txt");
-        let line = failed_upload(&unknown, keep);
-        assert!(line.contains("outcome unknown, check the remote"), "{line}");
-        assert!(
-            line.ends_with("your copy is at /c/a.txt.conflict-x"),
-            "{line}"
+        // As write_atomic reports a rename that landed but whose reply was lost.
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("a.txt");
+        std::fs::write(&target, "v1").unwrap();
+        let local = tmp.path().join("cache/a.txt");
+        let at = LocalFs::new()
+            .fetch(target.to_str().unwrap(), &local, &mut |_, _| {})
+            .unwrap();
+        std::fs::write(&local, "edit").unwrap();
+        let e = LostRenameReply(LocalFs::new())
+            .write_atomic(&local, target.to_str().unwrap(), at.fingerprint())
+            .unwrap_err();
+        let line = failed_upload(&e, keep);
+        let want = format!(
+            "outcome unknown — check {}; your copy is at /c/a.txt.conflict-x (cause: ",
+            target.display()
         );
+        assert!(line.contains(&want), "{line}");
+        assert!(line.contains("connection closed"), "{line}");
+        assert!(!line.contains("not replaced"), "{line}");
         let plain = failed_upload(&anyhow::anyhow!("disk full"), keep);
         assert_eq!(plain, "disk full; your copy is at /c/a.txt.conflict-x");
+    }
+
+    /// LocalFs whose rename lands but whose reply is lost.
+    struct LostRenameReply(LocalFs);
+
+    impl RemoteFs for LostRenameReply {
+        fn stat_opt(&mut self, path: &str) -> Result<Option<Stat>> {
+            self.0.stat_opt(path)
+        }
+        fn lstat_opt(&mut self, path: &str) -> Result<Option<Stat>> {
+            self.0.lstat_opt(path)
+        }
+        fn realpath(&mut self, path: &str) -> Result<String> {
+            self.0.realpath(path)
+        }
+        fn read_head(&mut self, path: &str, max: usize) -> Result<Vec<u8>> {
+            self.0.read_head(path, max)
+        }
+        fn list_dir(&mut self, path: &str) -> Result<Vec<String>> {
+            self.0.list_dir(path)
+        }
+        fn read_to(
+            &mut self,
+            path: &str,
+            out: &mut dyn Write,
+            progress: &mut dyn FnMut(u64),
+        ) -> Result<u64> {
+            self.0.read_to(path, out, progress)
+        }
+        fn create_from(
+            &mut self,
+            local: &Path,
+            path: &str,
+            mode: Option<u32>,
+        ) -> std::result::Result<remote::Uploaded, remote::CreateError> {
+            self.0.create_from(local, path, mode)
+        }
+        fn set_mode(&mut self, path: &str, mode: u32) -> Result<()> {
+            self.0.set_mode(path, mode)
+        }
+        fn set_owner(&mut self, path: &str, uid: u32, gid: u32) -> Result<()> {
+            self.0.set_owner(path, uid, gid)
+        }
+        fn rename_over(&mut self, from: &str, to: &str) -> Result<()> {
+            self.0.rename_over(from, to)?;
+            Err(remote::unknown(
+                "rename: connection closed before the reply",
+            ))
+        }
+        fn link_new(&mut self, from: &str, to: &str) -> Result<()> {
+            self.0.link_new(from, to)
+        }
+        fn remove(&mut self, path: &str) -> Result<()> {
+            self.0.remove(path)
+        }
     }
 
     #[test]

@@ -69,14 +69,19 @@ anything not in the table below is out of scope until usage says otherwise (§10
 - Write = upload to `.<name>.sopen-<random>` (created exclusively) in the same remote directory → give it the
   target's owner (refuse when that is impossible) and permission bits → `fsync@openssh.com` if offered → re-check →
   `posix-rename@openssh.com` over the target (plain rename if not offered). Only a temp this write created is ever
-  removed; one that cannot be removed is named. The next baseline is the uploaded bytes; a size mismatch right after
-  the rename is reported ("another writer?") and makes the next save refuse.
+  removed; one that cannot be removed is named. The next baseline is the staged temp — its size and mtime as stat'ed
+  right before the rename, plus the uploaded bytes' hash — never the target's stat after the rename; if the target
+  differs from it right after the rename, that is reported ("saved, but the remote changed right after") and the next
+  save refuses. A server without `posix-rename@openssh.com` cannot replace a file in one step: Save is refused before
+  anything is uploaded, and Save copy (a new sibling) is offered.
 - Conflict detection is best-effort: it catches changes made before you save (size, mtime, and content hash up to
   256 MiB); it cannot lock the remote file, so a write racing the final rename is not detected.
 - Any save that does not land moves the edited copy aside to `<copy>.conflict-<UTC stamp>` and prints that path. A
   fetch never overwrites a cached copy holding unsaved edits: it moves it aside first.
-- Nothing waits forever: ssh keepalives (10 s × 3), 30 s per SFTP request, 60 s without transfer progress. A
-  rename or link with no reply is "outcome unknown — check the remote", never "nothing was written".
+- Nothing waits forever: ssh keepalives (10 s × 3), 30 s per SFTP request, 60 s without transfer progress. Only an
+  SFTP status reply proves a rename, link or exclusive create did not happen; a timeout or a lost reply (connection
+  closed, EOF, garbled reply) is "outcome unknown — check <path>", never "nothing was written", and a temp or export
+  that may have been created is named, not removed.
 - Image Save (Cmd/Ctrl+S) overwrites the original **after** copying the fetched original to the local backup
   `<cache>/backup/<host>/<abs path>.<UTC stamp>` and printing that path. "Save copy" writes `<stem>.edited.<ext>`
   next to the original instead. Media Export never overwrites (sibling file; `-N` suffix if the name exists): it is

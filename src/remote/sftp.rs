@@ -116,16 +116,45 @@ impl SftpRemote {
     }
 }
 
-/// The result of a request that changes the remote: a timeout is
+/// Did the server answer? Only an SFTP status reply (`SSH_FX_FAILURE`, `PERMISSION_DENIED`,
+/// `NO_SUCH_FILE`, …) proves a request did not happen; an extension the server does not offer is
+/// refused before anything is sent. Every other error — connection closed, EOF, broken pipe, a
+/// garbled or unexpected reply — came after the request may have reached the server.
+fn answered(e: &SftpErr) -> bool {
+    matches!(e, SftpErr::SftpError(..) | SftpErr::UnsupportedExtension(_))
+}
+
+/// A failed request that changes the remote: refused by the server, or outcome unknown.
+fn failed_change(what: &str, e: SftpErr) -> anyhow::Error {
+    if answered(&e) {
+        anyhow!("cannot {what}: {e}")
+    } else {
+        unknown(format!(
+            "{what}: request sent, reply lost ({e}) — it may or may not have happened"
+        ))
+    }
+}
+
+/// The result of a request that changes the remote: a timeout or a lost reply is
 /// [`OutcomeUnknown`](super::OutcomeUnknown), never "nothing happened".
 fn changed(what: &str, got: std::result::Result<Result<(), SftpErr>, ()>) -> Result<()> {
     match got {
-        Ok(r) => r.map_err(|e| anyhow!("cannot {what}: {e}")),
+        Ok(r) => r.map_err(|e| failed_change(what, e)),
         Err(()) => Err(unknown(format!(
             "{what}: request sent, no reply in {}s — it may or may not have happened",
             META_TIMEOUT.as_secs()
         ))),
     }
+}
+
+/// A failed exclusive open: refused by the server = not created; a lost reply = unknown.
+fn failed_create(path: &str, e: SftpErr) -> CreateError {
+    let created = if answered(&e) {
+        Created::No
+    } else {
+        Created::Unknown
+    };
+    CreateError::new(created, failed_change(&format!("create {path}"), e))
 }
 
 impl Drop for SftpRemote {
@@ -400,7 +429,7 @@ impl RemoteFs for SftpRemote {
             .await;
             let mut file = match opened {
                 Ok(Ok(file)) => file,
-                Ok(Err(e)) => return Err(not_created(anyhow!("cannot create {path}: {e}"))),
+                Ok(Err(e)) => return Err(failed_create(path, e)),
                 Err(()) => {
                     return Err(CreateError::new(
                         Created::Unknown,
@@ -480,6 +509,10 @@ impl RemoteFs for SftpRemote {
 
     fn can_link(&self) -> bool {
         self.sftp.as_ref().is_some_and(|s| s.support_hardlink())
+    }
+
+    fn can_replace(&self) -> bool {
+        self.sftp.as_ref().is_some_and(|s| s.support_posix_rename())
     }
 
     fn remove(&mut self, path: &str) -> Result<()> {
@@ -568,5 +601,50 @@ mod tests {
         let e = timed_out("stat /x", META_TIMEOUT);
         assert_eq!(e.to_string(), "stat /x: no reply from the server in 30s");
         assert!(super::super::is_outcome_unknown(&unknown("rename a to b")));
+    }
+
+    fn lost() -> SftpErr {
+        SftpErr::IOError(std::io::Error::new(
+            std::io::ErrorKind::BrokenPipe,
+            "connection closed",
+        ))
+    }
+
+    /// A transport failure after the request went out proves nothing about the remote.
+    #[test]
+    fn f2_transport_errors_after_sending_are_outcome_unknown() {
+        let e = changed("rename /a to /b", Ok(Err(lost()))).unwrap_err();
+        assert!(super::super::is_outcome_unknown(&e), "{e:#}");
+        assert!(e.to_string().contains("reply lost"), "{e}");
+        for other in [
+            SftpErr::BackgroundTaskFailure(&"read task failed"),
+            SftpErr::IOError(std::io::ErrorKind::UnexpectedEof.into()),
+        ] {
+            assert!(!answered(&other), "{other}");
+        }
+        let create = failed_create("/d/.a.sopen-0", lost());
+        assert_eq!(create.created, Created::Unknown);
+        assert!(super::super::is_outcome_unknown(&create.error));
+    }
+
+    /// Only a status reply (or an extension never sent) proves the request did not happen.
+    #[test]
+    fn f2_status_replies_prove_nothing_happened() {
+        let refused = SftpErr::UnsupportedExtension(&"hardlink");
+        assert!(answered(&refused));
+        let e = changed("link /a to /b", Ok(Err(refused))).unwrap_err();
+        assert!(!super::super::is_outcome_unknown(&e), "{e:#}");
+        // SSH_FX_FAILURE as the server sends it (the message type is only deserializable).
+        let msg: openssh_sftp_client::error::SftpErrMsg =
+            serde_json::from_str(r#"["file exists", "en"]"#).unwrap();
+        let status = SftpErr::SftpError(SftpErrorKind::Failure, msg);
+        assert!(answered(&status));
+        let create = failed_create("/d/out.mp4", status);
+        assert_eq!(create.created, Created::No);
+        assert!(!super::super::is_outcome_unknown(&create.error));
+        assert!(create
+            .error
+            .to_string()
+            .starts_with("cannot create /d/out.mp4"));
     }
 }
