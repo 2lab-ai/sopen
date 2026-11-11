@@ -106,6 +106,19 @@ From `usage.jsonl` across machines: < 5 runs/week, or ≥ 80 % text/dir → arch
 A conflict refusal or failed write → fix before anything else. Large-media waits (≥ 500 MB or fetch ≥ 30 s, 3+ times)
 → consider streaming. The owner naming the same missing edit 3 times → that one edit, nothing more.
 
-## 11. Spike results (filled from the 2026-11-11 spike)
+## 11. Spike results (2026-11-11, throwaway spike, ~1.4k LOC)
 
-_pending_
+- Toolkit: eframe/egui 0.37.0 — wgpu (Metal) default works on macOS; glow also works and is compiled in as the
+  fallback (`SOPEN_RENDERER=glow`). Linux (Arch-family laptop) links with the same code; runtime-loaded libs =
+  Vulkan/EGL, Wayland, X11/xcb, xkbcommon, fontconfig; hard links = libasound.so.2 + libc/libm/libgcc_s.
+- Time to first frame: image 128–180 ms warm (541 ms first launch), video first frame ~150 ms, audio waveform ~140 ms.
+- Image: drag-rectangle in image pixels, Crop, Pixelize (block slider), Undo, encode back — self-screenshots read.
+- Video/audio: in-window playback = two ffmpeg subprocesses (rgba rawvideo frames ≤1280 wide + f32le 48 kHz PCM) →
+  cpal, audio clock master. 720p30, 5 s: 152 frames shown of ~151 expected, 0 dropped, A/V drift mean −11 ms /
+  max 16.6 ms (with a real-time null sink — the CoreAudio device itself was not reachable from the test sandbox).
+- Export: `-ss/-to` + `crop` re-encode is frame-exact (2.5–4.0 s cut = 45 frames, first 00:00:02.500); crop sizes are
+  rounded down to even; mp3/wav keep their codec; 0.03–0.11 s per 2–4 s export.
+- Product notes from the spike: (1) Linux build needs ALSA headers (`libasound2-dev` in CI; Homebrew's pkg-config
+  misses `/usr/lib/pkgconfig` on Arch — set `PKG_CONFIG_PATH`); (2) the window came up unfocused — activate the app
+  on start; (3) constant-frame-rate assumption for frame timestamps (VFR files drift); (4) every seek respawns both
+  decoders.
