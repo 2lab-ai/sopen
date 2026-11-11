@@ -95,6 +95,8 @@ anything not in the table below is out of scope until usage says otherwise (§10
   (Cmd/Ctrl+Z / Shift+Cmd/Ctrl+Z), Cmd/Ctrl+S Save, Save copy, Esc clears the rectangle.
 - Encoding keeps the format: PNG lossless, JPEG quality 95, WebP lossless, BMP, TIFF. Animated GIF opens read-only
   (frame 1 shown, Save disabled with a reason).
+- Never lose data silently: Save keeps the ICC profile and Exif where the format holds them; metadata it does not
+  carry (XMP, text chunks, IPTC, comments) or an encoder refuses is named when the image opens and in the result.
 
 ## 7. Media window (A4, A5)
 
@@ -105,6 +107,9 @@ anything not in the table below is out of scope until usage says otherwise (§10
 - Audio: waveform (downsampled PCM), same transport and In/Out, Export.
 - Export: `ffmpeg -ss In -to Out -i src [-vf crop=w:h:x:y] …` → re-encode (H.264 + AAC for video; the source codec for
   audio) so cuts are exact; progress shown; result uploaded as a sibling (§5).
+- Export maps streams explicitly: the first picture stream and every audio track (one, for one-track containers);
+  >8-bit sources stay 10-bit where libx264 has it; colour tags are carried. What is not kept (subtitles, data,
+  attachments, cover art, alpha, depth) is named in the window before Export and in the result line.
 - `sopen cut <target> <in> <out> [--crop x,y,w,h]` = the same export, headless (scripting + CI receipts).
 - Renderer / playback details fixed by the spike (§11).
 
@@ -127,17 +132,23 @@ A conflict refusal or failed write → fix before anything else. Large-media wai
 
 ## 11. Spike results (2026-11-11, throwaway spike, ~1.4k LOC)
 
-- Toolkit: eframe/egui 0.37.0 — wgpu (Metal) default works on macOS; glow also works and is compiled in as the
-  fallback (`SOPEN_RENDERER=glow`). Linux (Arch-family laptop) links with the same code; runtime-loaded libs =
-  Vulkan/EGL, Wayland, X11/xcb, xkbcommon, fontconfig; hard links = libasound.so.2 + libc/libm/libgcc_s.
-- Time to first frame: image 128–180 ms warm (541 ms first launch), video first frame ~150 ms, audio waveform ~140 ms.
-- Image: drag-rectangle in image pixels, Crop, Pixelize (block slider), Undo, encode back — self-screenshots read.
-- Video/audio: in-window playback = two ffmpeg subprocesses (rgba rawvideo frames ≤1280 wide + f32le 48 kHz PCM) →
-  cpal, audio clock master. 720p30, 5 s: 152 frames shown of ~151 expected, 0 dropped, A/V drift mean −11 ms /
-  max 16.6 ms (with a real-time null sink — the CoreAudio device itself was not reachable from the test sandbox).
-- Export: `-ss/-to` + `crop` re-encode is frame-exact (2.5–4.0 s cut = 45 frames, first 00:00:02.500); crop sizes are
-  rounded down to even; mp3/wav keep their codec; 0.03–0.11 s per 2–4 s export.
-- Product notes from the spike: (1) Linux build needs ALSA headers (`libasound2-dev` in CI; Homebrew's pkg-config
-  misses `/usr/lib/pkgconfig` on Arch — set `PKG_CONFIG_PATH`); (2) the window came up unfocused — activate the app
-  on start; (3) constant-frame-rate assumption for frame timestamps (VFR files drift); (4) every seek respawns both
-  decoders.
+- **Toolkit:** eframe/egui 0.37 — one dependency for window, input and texture upload, no system UI
+  libraries to link. Renderer: wgpu by default, glow (OpenGL) compiled in as the fallback — chosen with
+  `SOPEN_RENDERER`, and used automatically when wgpu does not start. Both rendered the same frames on macOS.
+- **Playback in the window:** two ffmpeg subprocesses from the play position — video as RGBA frames
+  (decoded ≤ 1280 wide, forced to a constant frame rate so a frame's time is its index over the rate),
+  audio as f32 PCM at the output device's rate — feeding `cpal` 0.18 through an `rtrb` ring. Audio is the
+  master clock (frames the device consumed, minus its output latency); video frames are shown when due
+  and dropped when late. 720p30 for 5 s: 152 frames shown, 0 dropped. No audio device → the clock falls
+  back to the wall clock and the window says so.
+- **Scrub:** one ffmpeg run per requested frame, latest request wins.
+- **Export:** input-side `-ss`/`-to` + re-encode is frame-exact (duration = Out − In).
+- **Linux build:** `cpal` links ALSA (`libasound2-dev` in CI); X11, Wayland, EGL, Vulkan and fontconfig are
+  loaded at runtime.
+- **macOS:** a window started from a terminal can come up behind it — sopen asks for focus on its first
+  frames. A window can screenshot itself (`ViewportCommand::Screenshot`), which is how window receipts are
+  taken (AGENTS.md "Receipts").
+- **Measured in the spike (2026-11-11):** time to first frame — image 128–180 ms warm (541 ms first launch),
+  video ~150 ms, audio waveform ~140 ms; A/V drift with a real-time null sink mean −11 ms / max 16.6 ms; a
+  2.5–4.0 s cut = 45 frames starting at 00:00:02.500; 0.03–0.11 s per 2–4 s export; on Arch, Homebrew's
+  pkg-config misses `/usr/lib/pkgconfig` (set `PKG_CONFIG_PATH` to build).

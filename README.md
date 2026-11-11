@@ -18,14 +18,48 @@ Same syntax as `scp`. Uses your `ssh` and `~/.ssh/config`; the remote needs noth
 brew install 2lab-ai/tap/sopen-preview    # macOS (arm64, x86_64), Linux (x86_64, aarch64); pulls in ffmpeg
 ```
 
+## Requirements
+
+- Media needs `ffmpeg` and `ffprobe` (the formula installs them).
+- Linux: the ALSA runtime library (libasound2 / alsa-lib) — present on desktop Linux; sopen runs
+  on the machine you sit at, not on the remote. The image and media windows need a desktop
+  session (X11 or Wayland).
+
 ## What the remote needs
 
 Only sshd with its SFTP subsystem (the default). sopen installs and runs nothing there. When you open
 a folder or text file, Zed installs its own remote server on first use — that is Zed's behaviour,
 not sopen's. Images and media are fetched over SFTP and handled locally.
 
-The image and media window is in progress; this release fetches images, video and audio to the
-local cache and prints the path.
+## Images
+
+The window shows the image fitted; the mouse wheel or a pinch zooms, a trackpad scroll or a
+right-drag pans (`F` fits again, `1` is 100 %). Drag a rectangle (handles adjust it, dragging
+inside moves it), then:
+
+| Key | |
+|---|---|
+| `C` | crop to the rectangle |
+| `P` | pixelize the rectangle (block size slider, 16 px by default) |
+| `Esc` | clear the rectangle |
+| `⌘Z` / `⇧⌘Z` (Ctrl on Linux) | undo / redo |
+| `⌘S` | Save: the original is first backed up locally (path printed), then overwritten in place in the same format (PNG, WebP, BMP, TIFF lossless; JPEG quality 95). A server without `posix-rename@openssh.com` cannot replace a file safely: Save is off there, Save copy works |
+| `⇧⌘S` | Save copy: `<name>.edited.<ext>` next to the original |
+
+Animated GIF/PNG/WebP and multi-page TIFF open read-only (first frame / page). Closing with unsaved
+changes asks first. Save keeps the ICC profile and Exif where the format holds them; anything it
+cannot keep (XMP, text chunks, IPTC, comments) is named in the window when the image opens and
+again in the result line.
+
+## Video and audio
+
+Video plays in the window with sound; audio shows its waveform. Click or drag the timeline to
+seek, `Space` plays/pauses, `←`/`→` step 1 s (`⇧` 5 s), `I` / `O` set In and Out. On video, drag
+a rectangle to crop. `E` exports In–Out (and the crop) as a new file next to the original,
+exactly like `sopen cut`, and shows its remote path. If no audio device can be opened the video
+plays silently and says so. Export keeps the picture and every audio track; what it cannot keep
+(subtitles, data streams, cover art, alpha, more than 8 bits where this ffmpeg's libx264 has no
+10-bit) is named in the window before you export and again in the result line.
 
 ## Any other file: `--app`
 

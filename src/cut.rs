@@ -2,7 +2,7 @@
 //! publish it next to the original as `<stem>.cut-<in>-<out>.<ext>` — never over an existing file.
 //! The same function serves remote targets (fetched copy → SFTP) and local ones (LocalFs).
 
-use crate::ffmpeg::{self, MediaKind, Rect, Tools};
+use crate::ffmpeg::{self, ExportPlan, MediaKind, Probe, Rect, Tools};
 use crate::kind::{self, Kind};
 use crate::remote::{random_hex, RemoteFs};
 use anyhow::{bail, Context, Result};
@@ -33,8 +33,41 @@ fn stem_ext(name: &str) -> (&str, &str) {
     }
 }
 
+/// What an export of `src_name` (probed as `probe`) is: video or audio, the output extension,
+/// and the plan — stream mapping, pixel format and what it will not keep. The window shows
+/// the plan's notes before Export; the result line repeats them.
+pub fn plan(
+    tools: &Tools,
+    probe: &Probe,
+    src_name: &str,
+) -> Result<(MediaKind, String, ExportPlan)> {
+    let by_ext = media_kind_of(src_name)?;
+    let media = match kind::refine_with_probe(by_ext, probe.video.is_some()) {
+        Kind::Video => MediaKind::Video,
+        _ if probe.has_audio => MediaKind::Audio,
+        _ => bail!("{src_name} has no audio or video stream"),
+    };
+    let (_, ext) = stem_ext(src_name);
+    let out_ext = ffmpeg::output_ext(ext, media, probe.audio_codec.as_deref());
+    // Only a source above 8 bits needs to know whether libx264 here does 10-bit.
+    let x264 = if media == MediaKind::Video && ffmpeg::high_depth(probe) {
+        ffmpeg::encoder_pix_fmts(tools, "libx264").ok()
+    } else {
+        None
+    };
+    let plan = ExportPlan::new(probe, media, &out_ext, x264.as_ref());
+    Ok((media, out_ext, plan))
+}
+
+/// A published export: the new file's name and what it did not keep.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Published {
+    pub name: String,
+    pub notes: Vec<String>,
+}
+
 /// Exports the cut of local file `src` (originally `src_name` in `dir` on `fs`), uploads it as a
-/// new sibling and returns the final file name. `work_root` holds the local export (removed
+/// new sibling and returns its name and notes. `work_root` holds the local export (removed
 /// afterwards); `progress` gets 0.0..=1.0 of the encode.
 #[allow(clippy::too_many_arguments)]
 pub fn cut_and_publish(
@@ -46,14 +79,9 @@ pub fn cut_and_publish(
     req: &CutRequest,
     work_root: &Path,
     progress: &mut dyn FnMut(f64),
-) -> Result<String> {
-    let by_ext = media_kind_of(src_name)?;
+) -> Result<Published> {
     let probe = ffmpeg::probe(tools, src)?;
-    let media = match kind::refine_with_probe(by_ext, probe.video.is_some()) {
-        Kind::Video => MediaKind::Video,
-        _ if probe.has_audio => MediaKind::Audio,
-        _ => bail!("{src_name} has no audio or video stream"),
-    };
+    let (media, out_ext, plan) = plan(tools, &probe, src_name)?;
     if let Some(duration) = probe.duration {
         if req.in_s >= duration {
             bail!("IN {}s is past the end ({duration:.3}s)", req.in_s);
@@ -69,22 +97,23 @@ pub fn cut_and_publish(
         (Some(r), Some((w, h)), MediaKind::Video) => Some(ffmpeg::fit_crop(r, w, h)?),
         _ => None,
     };
-    let audio_codec = probe.audio_codec.as_deref();
-    let (stem, ext) = stem_ext(src_name);
-    let out_ext = ffmpeg::output_ext(ext, media, audio_codec);
+    let (stem, _) = stem_ext(src_name);
     let name = ffmpeg::cut_name(stem, req.in_s, req.out_s, &out_ext);
 
     let work = work_root.join(random_hex());
     std::fs::create_dir_all(&work).with_context(|| format!("cannot create {}", work.display()))?;
     let result = (|| -> Result<String> {
         let dst = work.join(&name);
-        let args = ffmpeg::export_args(src, &dst, req.in_s, req.out_s, crop, media, audio_codec)?;
+        let args = ffmpeg::export_args(src, &dst, req.in_s, req.out_s, crop, media, &plan)?;
         let args = ffmpeg::adapt_to_encoders(args, &ffmpeg::available_encoders(tools)?)?;
         ffmpeg::run_export(tools, &args, req.out_s - req.in_s, progress)?;
         fs.write_new_sibling(&dst, dir, &name)
     })();
     let _ = std::fs::remove_dir_all(&work);
-    result
+    result.map(|name| Published {
+        name,
+        notes: plan.notes,
+    })
 }
 
 #[cfg(test)]
@@ -144,6 +173,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(last, 1.0, "progress reaches the end");
+        let out = out.name;
         let probe = ffmpeg::probe(tools, &dir.join(&out)).unwrap();
         let d = probe.duration.unwrap();
         assert!((d - 2.0).abs() <= 0.1, "{out}: duration {d}");
@@ -392,5 +422,255 @@ mod tests {
         assert!(media_kind_of("notes.txt").is_err());
         assert_eq!(media_kind_of("x.MOV").unwrap(), Kind::Video);
         assert_eq!(media_kind_of("x.ts").unwrap(), Kind::Video);
+    }
+
+    /// ffmpeg with `args` after the global flags; false (with the reason printed) when this
+    /// ffmpeg cannot make the fixture.
+    fn make(tools: &Tools, args: &[&str], what: &str) -> bool {
+        let out = Command::new(&tools.ffmpeg)
+            .args(["-hide_banner", "-loglevel", "error", "-nostdin", "-y"])
+            .args(args)
+            .output()
+            .unwrap();
+        if !out.status.success() {
+            eprintln!(
+                "skipping: this ffmpeg cannot make {what}: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+        out.status.success()
+    }
+
+    fn publish(tools: &Tools, dir: &Path, name: &str) -> (Published, ffmpeg::Probe) {
+        let req = CutRequest {
+            in_s: 1.0,
+            out_s: 3.0,
+            crop: None,
+        };
+        let published = cut_and_publish(
+            &mut LocalFs::new(),
+            tools,
+            &dir.join(name),
+            dir.to_str().unwrap(),
+            name,
+            &req,
+            &dir.join("work"),
+            &mut |_| {},
+        )
+        .unwrap();
+        let probe = ffmpeg::probe(tools, &dir.join(&published.name)).unwrap();
+        (published, probe)
+    }
+
+    /// Two audio tracks (440 Hz and 880 Hz) and a subtitle track: the export keeps both audio
+    /// tracks and says that the subtitle track is not kept.
+    #[test]
+    fn every_audio_stream_is_kept_and_subtitles_are_reported() {
+        let Some(tools) = tools_or_skip() else { return };
+        let tmp = tempfile::tempdir().unwrap();
+        let srt = tmp.path().join("s.srt");
+        std::fs::write(&srt, "1\n00:00:00,000 --> 00:00:03,500\nhello\n\n").unwrap();
+        let src = tmp.path().join("two.mkv");
+        let ok = make(
+            &tools,
+            &[
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc2=size=320x240:rate=25:duration=4",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=440:duration=4",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=880:duration=4",
+                "-i",
+                srt.to_str().unwrap(),
+                "-map",
+                "0",
+                "-map",
+                "1",
+                "-map",
+                "2",
+                "-map",
+                "3",
+                "-c:v",
+                "libx264",
+                "-pix_fmt",
+                "yuv420p",
+                "-c:a",
+                "aac",
+                "-c:s",
+                "srt",
+                src.to_str().unwrap(),
+            ],
+            "an mkv with two audio tracks and subtitles",
+        );
+        assert!(ok, "fixture");
+        let probe = ffmpeg::probe(&tools, &src).unwrap();
+        assert_eq!(probe.audio_streams, 2);
+        assert_eq!(probe.dropped, ["subtitle"]);
+        let (published, out) = publish(&tools, tmp.path(), "two.mkv");
+        assert_eq!(published.name, "two.cut-1-3.mkv");
+        assert_eq!(out.audio_streams, 2, "both audio tracks exported");
+        assert_eq!(published.notes, ["not kept: 1 subtitle stream"]);
+    }
+
+    /// A 10-bit source exports 10-bit where libx264 has it, else says "exported as 8-bit".
+    #[test]
+    fn ten_bit_source_keeps_its_depth_or_says_so() {
+        let Some(tools) = tools_or_skip() else { return };
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("deep.mp4");
+        let made = make(
+            &tools,
+            &[
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc2=size=320x240:rate=25:duration=4",
+                "-c:v",
+                "libx264",
+                "-pix_fmt",
+                "yuv420p10le",
+                src.to_str().unwrap(),
+            ],
+            "a 10-bit H.264 fixture (libx264 without 10-bit)",
+        );
+        if !made {
+            return;
+        }
+        let probe = ffmpeg::probe(&tools, &src).unwrap();
+        assert!(
+            ffmpeg::high_depth(&probe),
+            "{:?} {:?}",
+            probe.pix_fmt,
+            probe.bits
+        );
+        let (published, out) = publish(&tools, tmp.path(), "deep.mp4");
+        let ten = ffmpeg::encoder_pix_fmts(&tools, "libx264")
+            .unwrap()
+            .contains("yuv420p10le");
+        if ten {
+            assert_eq!(out.pix_fmt.as_deref(), Some("yuv420p10le"));
+            assert!(published.notes.is_empty(), "{:?}", published.notes);
+        } else {
+            assert_eq!(out.pix_fmt.as_deref(), Some("yuv420p"));
+            assert!(published.notes[0].contains("exported as 8-bit"));
+        }
+    }
+
+    /// A 12-bit source (FFV1 yuv422p12le) exports at 10 bits (or 8) and says it lost depth.
+    #[test]
+    fn twelve_bit_source_says_it_was_exported_with_fewer_bits() {
+        let Some(tools) = tools_or_skip() else { return };
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("deep12.mkv");
+        let made = make(
+            &tools,
+            &[
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc2=size=160x120:rate=25:duration=4",
+                "-c:v",
+                "ffv1",
+                "-pix_fmt",
+                "yuv422p12le",
+                src.to_str().unwrap(),
+            ],
+            "a 12-bit FFV1 fixture",
+        );
+        if !made {
+            return;
+        }
+        let probe = ffmpeg::probe(&tools, &src).unwrap();
+        assert_eq!(ffmpeg::source_bits(&probe), Some(12), "{:?}", probe.pix_fmt);
+        let (published, out) = publish(&tools, tmp.path(), "deep12.mkv");
+        let ten = ffmpeg::encoder_pix_fmts(&tools, "libx264")
+            .unwrap()
+            .contains("yuv420p10le");
+        if ten {
+            assert_eq!(out.pix_fmt.as_deref(), Some("yuv420p10le"));
+            assert_eq!(published.notes, ["exported as 10-bit (source is 12-bit)"]);
+        } else {
+            assert_eq!(
+                published.notes,
+                ["exported as 8-bit (source is 12-bit; this ffmpeg's libx264 has no 10-bit)"]
+            );
+        }
+    }
+
+    /// An alpha source (FFV1 yuva420p) exports without alpha and says so.
+    #[test]
+    fn alpha_source_says_alpha_is_dropped() {
+        let Some(tools) = tools_or_skip() else { return };
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("alpha.mkv");
+        let made = make(
+            &tools,
+            &[
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc2=size=160x120:rate=25:duration=4",
+                "-vf",
+                "format=yuva420p",
+                "-c:v",
+                "ffv1",
+                "-pix_fmt",
+                "yuva420p",
+                src.to_str().unwrap(),
+            ],
+            "an FFV1 yuva420p fixture",
+        );
+        if !made {
+            return;
+        }
+        let probe = ffmpeg::probe(&tools, &src).unwrap();
+        assert_eq!(probe.pix_fmt.as_deref(), Some("yuva420p"));
+        let (published, out) = publish(&tools, tmp.path(), "alpha.mkv");
+        assert_eq!(out.pix_fmt.as_deref(), Some("yuv420p"));
+        assert_eq!(published.notes, ["alpha is dropped (H.264 has no alpha)"]);
+    }
+
+    /// Colour tags the source sets travel with the export.
+    #[test]
+    fn colour_tags_are_carried() {
+        let Some(tools) = tools_or_skip() else { return };
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("tagged.mp4");
+        let made = make(
+            &tools,
+            &[
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc2=size=160x120:rate=25:duration=4",
+                "-c:v",
+                "libx264",
+                "-pix_fmt",
+                "yuv420p",
+                "-color_primaries",
+                "bt709",
+                "-color_trc",
+                "bt709",
+                "-colorspace",
+                "bt709",
+                "-color_range",
+                "tv",
+                src.to_str().unwrap(),
+            ],
+            "a colour-tagged fixture",
+        );
+        if !made {
+            return;
+        }
+        let probe = ffmpeg::probe(&tools, &src).unwrap();
+        assert!(!probe.color.is_empty(), "fixture has tags");
+        let (_, out) = publish(&tools, tmp.path(), "tagged.mp4");
+        assert_eq!(out.color, probe.color);
     }
 }

@@ -32,8 +32,22 @@ futures-core = "0.3.31"
 serde_json = "1.0.150"
 # Content hash (did the editor change the file?) and the host hash in the usage log.
 sha2 = "0.10.9"
+# The image and media windows (spec §6, §7): wgpu renderer by default, glow as the fallback.
+eframe = { version = "0.37.0", features = ["glow"] }
+# Image window: decode, crop/pixelize, re-encode in the source format (spec §6).
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "webp", "bmp", "tiff", "gif"] }
+# Generic pixel arithmetic for pixelize over 8-bit, 16-bit and float images.
+num-traits = "0.2.19"
+# In-window playback: audio out (the master clock) fed from ffmpeg through a lock-free ring.
+cpal = "0.18.2"
+rtrb = "0.4.1"
 # openssh / openssh-sftp-client are async; sopen drives them from a current-thread runtime.
 tokio = { version = "1.54.1", features = ["rt", "time"] }
 
 [dev-dependencies]
 tempfile = "3.27.0"
+
+# macOS: the app menu's Quit item would end the process past the unsaved-changes prompt; sopen
+# turns the default menu off and handles Cmd+Q itself.
+[target.'cfg(target_os = "macos")'.dependencies]
+winit = { version = "0.30.13", default-features = false }

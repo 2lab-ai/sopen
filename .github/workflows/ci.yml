@@ -32,11 +32,13 @@ jobs:
           persist-credentials: false
 
       # The export tests encode real media (spec §7); the formula depends on ffmpeg the same way.
-      - name: Install ffmpeg (Linux)
+      # libasound2-dev: cpal (the media window's audio output) links ALSA; everything else the
+      # window needs on Linux (X11, Wayland, EGL, Vulkan, fontconfig) is loaded at runtime.
+      - name: Install ffmpeg and ALSA headers (Linux)
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y ffmpeg
+          sudo apt-get install -y ffmpeg libasound2-dev pkg-config
 
       - name: Install ffmpeg (macOS)
         if: runner.os == 'macOS'
@@ -64,3 +66,14 @@ jobs:
           # A missing ffmpeg fails the export tests here instead of skipping them.
           SOPEN_REQUIRE_FFMPEG: "1"
         run: cargo test --locked
+
+      # The Linux binary loads only libasound and libc at start (X11, Wayland, EGL, Vulkan and
+      # fontconfig are opened at runtime): prove it on a clean system with just the ALSA runtime.
+      # Same Ubuntu release as the runner: the binary needs the build host's glibc or newer.
+      - name: Runtime libraries (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          cargo build --release --locked
+          docker run --rm -v "$PWD/target/release/sopen:/usr/local/bin/sopen:ro" ubuntu:24.04 \
+            bash -c 'apt-get update -qq && apt-get install -y -qq libasound2t64 > /dev/null \
+              && ldd /usr/local/bin/sopen && sopen --version'

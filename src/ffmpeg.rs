@@ -53,9 +53,23 @@ pub struct Probe {
     /// `video` as shown: width and height swapped for 90/270. ffmpeg rotates frames before
     /// filters run, so crop rectangles are in these pixels.
     pub display: Option<(u32, u32)>,
+    /// Frame rate of that stream (`avg_frame_rate`, else `r_frame_rate`), when ffprobe knows it.
+    pub fps: Option<f64>,
+    /// That stream's index among the video streams (`-map 0:v:N`; cover art counts).
+    pub video_index: usize,
+    /// That stream's pixel format and bits per sample, when ffprobe reports them.
+    pub pix_fmt: Option<String>,
+    pub bits: Option<u32>,
+    /// That stream's colour tags as `(ffmpeg output option, value)`: primaries, transfer,
+    /// matrix, range — only the ones the file sets.
+    pub color: Vec<(String, String)>,
     pub has_audio: bool,
     /// ffprobe `codec_name` of the first audio stream (`aac`, `opus`, `pcm_s24le`, …).
     pub audio_codec: Option<String>,
+    pub audio_streams: usize,
+    /// Streams no export keeps, one entry per stream: `subtitle`, `data`, `attachment`,
+    /// `cover art`, `video` (a second picture stream).
+    pub dropped: Vec<String>,
 }
 
 /// `ffprobe -v error -print_format json -show_format -show_streams <path>`.
@@ -91,19 +105,53 @@ pub fn parse_probe(json: &str) -> Result<Probe> {
             .or_else(|| x.as_f64())
     };
     let duration = num(&v["format"]["duration"]);
+    // `30000/1001`; `0/0` when unknown.
+    let rate = |x: &serde_json::Value| -> Option<f64> {
+        let (a, b) = x.as_str()?.split_once('/')?;
+        let (a, b): (f64, f64) = (a.parse().ok()?, b.parse().ok()?);
+        (a > 0.0 && b > 0.0).then(|| a / b)
+    };
     let mut video = None;
     let mut rotation = 0;
+    let mut fps = None;
     let mut audio_codec = None;
     let mut has_audio = false;
+    let (mut video_index, mut videos_seen) = (0, 0);
+    let (mut pix_fmt, mut bits, mut color) = (None, None, Vec::new());
+    let mut audio_streams = 0;
+    let mut dropped = Vec::new();
+    let text = |x: &serde_json::Value| x.as_str().map(str::to_string);
     for s in v["streams"].as_array().into_iter().flatten() {
-        match s["codec_type"].as_str() {
+        let kind = s["codec_type"].as_str();
+        if kind == Some("video") {
+            videos_seen += 1;
+        }
+        match kind {
+            Some("video") if s["disposition"]["attached_pic"].as_i64() == Some(1) => {
+                dropped.push("cover art".to_string());
+            }
+            Some("video") if video.is_some() => dropped.push("video".to_string()),
             // The first video stream that is not cover art.
-            Some("video")
-                if video.is_none() && s["disposition"]["attached_pic"].as_i64() != Some(1) =>
-            {
+            Some("video") => {
                 let w = s["width"].as_u64().unwrap_or(0) as u32;
                 let h = s["height"].as_u64().unwrap_or(0) as u32;
                 video = Some((w, h));
+                video_index = videos_seen - 1;
+                pix_fmt = text(&s["pix_fmt"]);
+                bits = num(&s["bits_per_raw_sample"]).map(|b| b as u32);
+                for (key, option) in [
+                    ("color_primaries", "-color_primaries"),
+                    ("color_transfer", "-color_trc"),
+                    ("color_space", "-colorspace"),
+                    ("color_range", "-color_range"),
+                ] {
+                    if let Some(value) = text(&s[key]).filter(|v| {
+                        !matches!(v.as_str(), "unknown" | "unspecified" | "reserved" | "")
+                    }) {
+                        color.push((option.to_string(), value));
+                    }
+                }
+                fps = rate(&s["avg_frame_rate"]).or_else(|| rate(&s["r_frame_rate"]));
                 let matrix = s["side_data_list"]
                     .as_array()
                     .into_iter()
@@ -116,7 +164,9 @@ pub fn parse_probe(json: &str) -> Result<Probe> {
                     audio_codec = s["codec_name"].as_str().map(str::to_string);
                 }
                 has_audio = true;
+                audio_streams += 1;
             }
+            Some(other @ ("subtitle" | "data" | "attachment")) => dropped.push(other.to_string()),
             _ => {}
         }
     }
@@ -126,9 +176,232 @@ pub fn parse_probe(json: &str) -> Result<Probe> {
         video,
         rotation,
         display,
+        fps,
+        video_index,
+        pix_fmt,
+        bits,
+        color,
         has_audio,
         audio_codec,
+        audio_streams,
+        dropped,
     })
+}
+
+/// More than 8 bits per sample: from `bits_per_raw_sample`, else the pixel format's name.
+pub fn high_depth(probe: &Probe) -> bool {
+    if let Some(bits) = probe.bits {
+        return bits > 8;
+    }
+    let Some(fmt) = probe.pix_fmt.as_deref() else {
+        return false;
+    };
+    const MARKERS: [&str; 22] = [
+        "p9", "p10", "p12", "p14", "p16", "p010", "p012", "p016", "p210", "p216", "p410", "p416",
+        "gray9", "gray10", "gray12", "gray14", "gray16", "rgb48", "bgr48", "rgba64", "bgra64",
+        "f32",
+    ];
+    MARKERS.iter().any(|m| fmt.contains(m))
+        || [
+            "y210", "y212", "xv30", "xv36", "x2rgb10", "x2bgr10", "f16", "ya16",
+        ]
+        .iter()
+        .any(|m| fmt.contains(m))
+}
+
+/// The source's bits per sample, when known: `bits_per_raw_sample`, else the number in the
+/// pixel format's name (`yuv422p12le` → 12, `rgb48le` → 16 per channel). Float formats → 32.
+pub fn source_bits(probe: &Probe) -> Option<u32> {
+    if let Some(bits) = probe.bits.filter(|b| *b > 0) {
+        return Some(bits);
+    }
+    let fmt = probe.pix_fmt.as_deref()?;
+    const TABLE: [(&str, u32); 28] = [
+        ("f32", 32),
+        ("f16", 16),
+        ("rgb48", 16),
+        ("bgr48", 16),
+        ("rgba64", 16),
+        ("bgra64", 16),
+        ("ya16", 16),
+        ("p16", 16),
+        ("p016", 16),
+        ("p216", 16),
+        ("p416", 16),
+        ("gray16", 16),
+        ("p14", 14),
+        ("gray14", 14),
+        ("p12", 12),
+        ("p012", 12),
+        ("gray12", 12),
+        ("y212", 12),
+        ("xv36", 12),
+        ("p10", 10),
+        ("p010", 10),
+        ("p210", 10),
+        ("p410", 10),
+        ("gray10", 10),
+        ("y210", 10),
+        ("xv30", 10),
+        ("p9", 9),
+        ("gray9", 9),
+    ];
+    TABLE
+        .iter()
+        .find(|(marker, _)| fmt.contains(marker))
+        .map(|(_, bits)| *bits)
+        .or_else(|| (fmt.contains("x2rgb10") || fmt.contains("x2bgr10")).then_some(10))
+}
+
+/// The pixel format carries an alpha channel (`yuva*`, `rgba`, `argb`, `bgra`, `abgr`,
+/// `gbrap*`, `ya*`).
+pub fn has_alpha(pix_fmt: &str) -> bool {
+    pix_fmt.starts_with("yuva")
+        || pix_fmt.starts_with("ya")
+        || pix_fmt.starts_with("gbrap")
+        || ["rgba", "argb", "bgra", "abgr"]
+            .iter()
+            .any(|a| pix_fmt.contains(a))
+}
+
+/// Pixel formats from `ffmpeg -h encoder=<name>` ("Supported pixel formats: …").
+pub fn parse_pix_fmts(help: &str) -> HashSet<String> {
+    help.lines()
+        .find_map(|l| l.trim().strip_prefix("Supported pixel formats:"))
+        .map(|list| list.split_whitespace().map(str::to_string).collect())
+        .unwrap_or_default()
+}
+
+/// The pixel formats this ffmpeg's `encoder` accepts; asked once per ffmpeg and encoder.
+pub fn encoder_pix_fmts(tools: &Tools, encoder: &str) -> Result<HashSet<String>> {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    type Cache = Mutex<HashMap<(PathBuf, String), HashSet<String>>>;
+    static CACHE: OnceLock<Cache> = OnceLock::new();
+    let key = (tools.ffmpeg.clone(), encoder.to_string());
+    let cache = CACHE.get_or_init(Mutex::default);
+    if let Some(hit) = cache.lock().unwrap().get(&key) {
+        return Ok(hit.clone());
+    }
+    let out = Command::new(&tools.ffmpeg)
+        .args(["-hide_banner", "-h"])
+        .arg(format!("encoder={encoder}"))
+        .stdin(Stdio::null())
+        .output()
+        .with_context(|| format!("cannot run {}", tools.ffmpeg.display()))?;
+    let formats = parse_pix_fmts(&String::from_utf8_lossy(&out.stdout));
+    cache.lock().unwrap().insert(key, formats.clone());
+    Ok(formats)
+}
+
+/// How one export maps and encodes the source, and what it does not keep (spec §7: never lose
+/// data silently — the window shows `notes` before Export, the result line repeats them).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExportPlan {
+    /// The source's first audio codec (audio exports re-create it).
+    pub audio_codec: Option<String>,
+    /// `-map 0:v:N` for video exports.
+    pub video_index: usize,
+    /// Output pixel format for video exports.
+    pub pix_fmt: &'static str,
+    /// Colour tags carried over, as `(option, value)`.
+    pub color: Vec<(String, String)>,
+    pub notes: Vec<String>,
+}
+
+/// Containers that hold one audio stream.
+fn single_audio(ext: &str) -> bool {
+    matches!(ext, "mp3" | "wav" | "flac" | "aac")
+}
+
+fn count(n: usize, what: &str) -> String {
+    if n == 1 {
+        format!("1 {what}")
+    } else {
+        format!("{n} {what}s")
+    }
+}
+
+impl ExportPlan {
+    /// First video stream, 8-bit 4:2:0, no colour tags, nothing to report.
+    pub fn basic(audio_codec: Option<&str>) -> Self {
+        Self {
+            audio_codec: audio_codec.map(str::to_string),
+            video_index: 0,
+            pix_fmt: "yuv420p",
+            color: Vec::new(),
+            notes: Vec::new(),
+        }
+    }
+
+    /// The plan for exporting `probe`'s file as `kind` into a `.dst_ext` file. `x264_formats`
+    /// = what this ffmpeg's libx264 accepts (only needed for a source above 8 bits).
+    pub fn new(
+        probe: &Probe,
+        kind: MediaKind,
+        dst_ext: &str,
+        x264_formats: Option<&HashSet<String>>,
+    ) -> Self {
+        let mut plan = Self::basic(probe.audio_codec.as_deref());
+        plan.video_index = probe.video_index;
+        let mut dropped: Vec<(String, usize)> = Vec::new();
+        for kind_name in &probe.dropped {
+            match dropped.iter_mut().find(|(k, _)| k == kind_name) {
+                Some((_, n)) => *n += 1,
+                None => dropped.push((kind_name.clone(), 1)),
+            }
+        }
+        if kind == MediaKind::Audio && probe.video.is_some() {
+            dropped.push(("video".to_string(), 1));
+        }
+        let mut lost: Vec<String> = dropped
+            .iter()
+            .map(|(k, n)| match k.as_str() {
+                "cover art" => "cover art".to_string(),
+                other => count(*n, &format!("{other} stream")),
+            })
+            .collect();
+        if single_audio(dst_ext) && probe.audio_streams > 1 {
+            lost.push(format!(
+                "{} (.{dst_ext} holds one)",
+                count(probe.audio_streams - 1, "more audio stream")
+            ));
+        }
+        if !lost.is_empty() {
+            plan.notes.push(format!("not kept: {}", lost.join(", ")));
+        }
+        if kind == MediaKind::Video {
+            plan.color = probe.color.clone();
+            if high_depth(probe) {
+                let ten = x264_formats.is_some_and(|f| f.contains("yuv420p10le"));
+                if ten {
+                    plan.pix_fmt = "yuv420p10le";
+                }
+                let out_bits = if ten { 10 } else { 8 };
+                // Fewer bits out than in: say so (12/16-bit → 10-bit, anything deeper → 8-bit).
+                let src = source_bits(probe);
+                if src.is_none_or(|b| b > out_bits) {
+                    let source = match src {
+                        Some(32) => "source is floating point".to_string(),
+                        Some(b) => format!("source is {b}-bit"),
+                        None => "source has more than 8 bits".to_string(),
+                    };
+                    let why = if ten {
+                        String::new()
+                    } else {
+                        "; this ffmpeg's libx264 has no 10-bit".to_string()
+                    };
+                    plan.notes
+                        .push(format!("exported as {out_bits}-bit ({source}{why})"));
+                }
+            }
+            if probe.pix_fmt.as_deref().is_some_and(has_alpha) {
+                plan.notes
+                    .push("alpha is dropped (H.264 has no alpha)".to_string());
+            }
+        }
+        plan
+    }
 }
 
 /// Degrees (either sign, any multiple) → 0, 90, 180 or 270.
@@ -289,9 +562,11 @@ fn secs_arg(s: f64) -> OsString {
     OsString::from(format!("{s:.3}"))
 }
 
-/// The ffmpeg arguments for one export (everything after the global flags). Pure.
-/// `audio_codec` is the source's audio codec (ffprobe `codec_name`); audio exports re-create it,
-/// falling back to the destination container's usual codec when it is unknown.
+/// The ffmpeg arguments for one export (everything after the global flags). Pure. Streams are
+/// mapped explicitly: video = the plan's video stream, audio = every audio stream (the first
+/// only, for containers that hold one), each re-encoded. `plan.audio_codec` is the source's
+/// audio codec (ffprobe `codec_name`); audio exports re-create it, falling back to the
+/// destination container's usual codec when it is unknown.
 pub fn export_args(
     src: &Path,
     dst: &Path,
@@ -299,8 +574,9 @@ pub fn export_args(
     out_s: f64,
     crop: Option<Rect>,
     kind: MediaKind,
-    audio_codec: Option<&str>,
+    plan: &ExportPlan,
 ) -> Result<Vec<OsString>> {
+    let audio_codec = plan.audio_codec.as_deref();
     if !(in_s >= 0.0 && out_s > in_s && out_s.is_finite()) {
         bail!("cut range {in_s}..{out_s} is empty or negative");
     }
@@ -344,6 +620,9 @@ pub fn export_args(
     };
     match kind {
         MediaKind::Video => {
+            let video_map = format!("0:v:{}", plan.video_index);
+            let audio_map = if single_audio(&ext) { "0:a:0?" } else { "0:a?" };
+            push(&mut args, &["-map", &video_map, "-map", audio_map]);
             if let Some(r) = crop {
                 let (w, h) = (r.w & !1, r.h & !1);
                 push(
@@ -354,10 +633,20 @@ pub fn export_args(
             push(
                 &mut args,
                 &[
-                    "-c:v", "libx264", "-preset", "veryfast", "-crf", "18", "-pix_fmt", "yuv420p",
-                    "-c:a", "aac", "-b:a", "192k",
+                    "-c:v",
+                    "libx264",
+                    "-preset",
+                    "veryfast",
+                    "-crf",
+                    "18",
+                    "-pix_fmt",
+                    plan.pix_fmt,
                 ],
             );
+            for (option, value) in &plan.color {
+                push(&mut args, &[option, value]);
+            }
+            push(&mut args, &["-c:a", "aac", "-b:a", "192k"]);
             // A muxer rejects options it does not know; +faststart is mov/mp4 only.
             if matches!(ext.as_str(), "mp4" | "mov" | "m4v") {
                 push(&mut args, &["-movflags", "+faststart"]);
@@ -367,8 +656,9 @@ pub fn export_args(
             if crop.is_some() {
                 bail!("--crop applies to video only");
             }
-            // -vn: cover art is not part of a cut, and not every audio container can hold it.
-            push(&mut args, &["-vn"]);
+            // Cover art is not part of a cut, and not every audio container can hold it.
+            let audio_map = if single_audio(&ext) { "0:a:0" } else { "0:a" };
+            push(&mut args, &["-map", audio_map, "-vn"]);
             match audio_codec.and_then(encoder_for_codec) {
                 Some(codec) => args.extend(codec.into_iter().map(OsString::from)),
                 None => match encoder_for_container(&ext) {
