@@ -562,6 +562,47 @@ mod tests {
         }
     }
 
+    /// A 12-bit source (FFV1 yuv422p12le) exports at 10 bits (or 8) and says it lost depth.
+    #[test]
+    fn twelve_bit_source_says_it_was_exported_with_fewer_bits() {
+        let Some(tools) = tools_or_skip() else { return };
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("deep12.mkv");
+        let made = make(
+            &tools,
+            &[
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc2=size=160x120:rate=25:duration=4",
+                "-c:v",
+                "ffv1",
+                "-pix_fmt",
+                "yuv422p12le",
+                src.to_str().unwrap(),
+            ],
+            "a 12-bit FFV1 fixture",
+        );
+        if !made {
+            return;
+        }
+        let probe = ffmpeg::probe(&tools, &src).unwrap();
+        assert_eq!(ffmpeg::source_bits(&probe), Some(12), "{:?}", probe.pix_fmt);
+        let (published, out) = publish(&tools, tmp.path(), "deep12.mkv");
+        let ten = ffmpeg::encoder_pix_fmts(&tools, "libx264")
+            .unwrap()
+            .contains("yuv420p10le");
+        if ten {
+            assert_eq!(out.pix_fmt.as_deref(), Some("yuv420p10le"));
+            assert_eq!(published.notes, ["exported as 10-bit (source is 12-bit)"]);
+        } else {
+            assert_eq!(
+                published.notes,
+                ["exported as 8-bit (source is 12-bit; this ffmpeg's libx264 has no 10-bit)"]
+            );
+        }
+    }
+
     /// An alpha source (FFV1 yuva420p) exports without alpha and says so.
     #[test]
     fn alpha_source_says_alpha_is_dropped() {

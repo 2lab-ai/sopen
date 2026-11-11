@@ -385,6 +385,7 @@ fn export_plan_notes() {
         plan.notes,
         [
             "not kept: 2 subtitle streams, 1 attachment stream",
+            "exported as 10-bit (source is 12-bit)",
             "alpha is dropped (H.264 has no alpha)"
         ]
     );
@@ -470,5 +471,49 @@ fn pixel_formats() {
         "yuv420p", "nv12", "rgb24", "yuvj420p", "bgra", "gray", "yuv422p",
     ] {
         assert!(!depth(eight), "{eight}");
+    }
+}
+
+/// Fewer bits out than in is named: 12/16-bit → 10-bit, deeper than 8 → 8-bit where libx264
+/// has no 10-bit; a 10-bit source exported as 10-bit says nothing.
+#[test]
+fn depth_reduction_notes() {
+    let video = |pix_fmt: &str, bits: Option<&str>| {
+        let bits = bits.map_or(String::new(), |b| {
+            format!(r#","bits_per_raw_sample":"{b}""#)
+        });
+        parse_probe(&format!(
+            r#"{{"streams":[{{"codec_type":"video","width":8,"height":8,"pix_fmt":"{pix_fmt}"{bits}}}]}}"#
+        ))
+        .unwrap()
+    };
+    let ten: HashSet<String> = ["yuv420p", "yuv420p10le"].map(String::from).into();
+    let eight: HashSet<String> = ["yuv420p".to_string()].into();
+    let notes = |probe: &Probe, formats: &HashSet<String>| {
+        ExportPlan::new(probe, MediaKind::Video, "mkv", Some(formats)).notes
+    };
+    let p12 = video("yuv422p12le", Some("12"));
+    assert_eq!(notes(&p12, &ten), ["exported as 10-bit (source is 12-bit)"]);
+    let p16 = video("rgb48le", None);
+    assert_eq!(source_bits(&p16), Some(16));
+    assert_eq!(notes(&p16, &ten), ["exported as 10-bit (source is 16-bit)"]);
+    assert_eq!(
+        notes(&p12, &eight),
+        ["exported as 8-bit (source is 12-bit; this ffmpeg's libx264 has no 10-bit)"]
+    );
+    let p10 = video("yuv420p10le", Some("10"));
+    assert!(notes(&p10, &ten).is_empty());
+    assert_eq!(
+        notes(&p10, &eight),
+        ["exported as 8-bit (source is 10-bit; this ffmpeg's libx264 has no 10-bit)"]
+    );
+    assert!(notes(&video("yuv420p", Some("8")), &eight).is_empty());
+    for (fmt, bits) in [
+        ("p210le", 10),
+        ("gray9be", 9),
+        ("yuv444p14le", 14),
+        ("gbrpf32le", 32),
+    ] {
+        assert_eq!(source_bits(&video(fmt, None)), Some(bits), "{fmt}");
     }
 }

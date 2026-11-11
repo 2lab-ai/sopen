@@ -930,11 +930,14 @@ pub fn open(file: ImageFile, hooks: &Hooks, notice: Option<String>) -> Result<Ou
     let (w, h) = doc.size();
     let can_replace = file.can_replace();
     let leftover: Arc<Mutex<Option<Job>>> = Arc::default();
-    // Before the owner acts: what Save cannot do or will not keep.
+    // Before the owner acts: what Save cannot do (status line) and what it will not keep
+    // (a label that stays in the status bar). Both also go to the terminal.
+    if let Some(line) = doc.not_kept_line() {
+        eprintln!("sopen: {line}");
+    }
     let warnings: Vec<String> = notice
         .into_iter()
         .chain((!can_replace).then(|| CANNOT_REPLACE.to_string()))
-        .chain(doc.not_kept_line())
         .collect();
     let status = if warnings.is_empty() {
         Status::default()

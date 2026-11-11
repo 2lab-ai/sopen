@@ -209,6 +209,50 @@ pub fn high_depth(probe: &Probe) -> bool {
         .any(|m| fmt.contains(m))
 }
 
+/// The source's bits per sample, when known: `bits_per_raw_sample`, else the number in the
+/// pixel format's name (`yuv422p12le` → 12, `rgb48le` → 16 per channel). Float formats → 32.
+pub fn source_bits(probe: &Probe) -> Option<u32> {
+    if let Some(bits) = probe.bits.filter(|b| *b > 0) {
+        return Some(bits);
+    }
+    let fmt = probe.pix_fmt.as_deref()?;
+    const TABLE: [(&str, u32); 28] = [
+        ("f32", 32),
+        ("f16", 16),
+        ("rgb48", 16),
+        ("bgr48", 16),
+        ("rgba64", 16),
+        ("bgra64", 16),
+        ("ya16", 16),
+        ("p16", 16),
+        ("p016", 16),
+        ("p216", 16),
+        ("p416", 16),
+        ("gray16", 16),
+        ("p14", 14),
+        ("gray14", 14),
+        ("p12", 12),
+        ("p012", 12),
+        ("gray12", 12),
+        ("y212", 12),
+        ("xv36", 12),
+        ("p10", 10),
+        ("p010", 10),
+        ("p210", 10),
+        ("p410", 10),
+        ("gray10", 10),
+        ("y210", 10),
+        ("xv30", 10),
+        ("p9", 9),
+        ("gray9", 9),
+    ];
+    TABLE
+        .iter()
+        .find(|(marker, _)| fmt.contains(marker))
+        .map(|(_, bits)| *bits)
+        .or_else(|| (fmt.contains("x2rgb10") || fmt.contains("x2bgr10")).then_some(10))
+}
+
 /// The pixel format carries an alpha channel (`yuva*`, `rgba`, `argb`, `bgra`, `abgr`,
 /// `gbrap*`, `ya*`).
 pub fn has_alpha(pix_fmt: &str) -> bool {
@@ -329,12 +373,26 @@ impl ExportPlan {
         if kind == MediaKind::Video {
             plan.color = probe.color.clone();
             if high_depth(probe) {
-                if x264_formats.is_some_and(|f| f.contains("yuv420p10le")) {
+                let ten = x264_formats.is_some_and(|f| f.contains("yuv420p10le"));
+                if ten {
                     plan.pix_fmt = "yuv420p10le";
-                } else {
-                    plan.notes.push(
-                        "exported as 8-bit (this ffmpeg's libx264 has no 10-bit)".to_string(),
-                    );
+                }
+                let out_bits = if ten { 10 } else { 8 };
+                // Fewer bits out than in: say so (12/16-bit → 10-bit, anything deeper → 8-bit).
+                let src = source_bits(probe);
+                if src.is_none_or(|b| b > out_bits) {
+                    let source = match src {
+                        Some(32) => "source is floating point".to_string(),
+                        Some(b) => format!("source is {b}-bit"),
+                        None => "source has more than 8 bits".to_string(),
+                    };
+                    let why = if ten {
+                        String::new()
+                    } else {
+                        "; this ffmpeg's libx264 has no 10-bit".to_string()
+                    };
+                    plan.notes
+                        .push(format!("exported as {out_bits}-bit ({source}{why})"));
                 }
             }
             if probe.pix_fmt.as_deref().is_some_and(has_alpha) {
