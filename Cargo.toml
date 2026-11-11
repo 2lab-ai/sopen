@@ -2,6 +2,8 @@
 name = "sopen"
 version = "0.1.0"
 edition = "2021"
+# The floor the GUI stack (eframe) needs; the Linux gate builds with exactly this toolchain.
+rust-version = "1.95"
 license = "MIT"
 description = "Open a file or folder on another machine as if it were local (scp syntax, system ssh, SFTP)"
 repository = "https://github.com/2lab-ai/sopen"

@@ -97,18 +97,19 @@ pub fn parse_probe(json: &str) -> Result<Probe> {
     let mut has_audio = false;
     for s in v["streams"].as_array().into_iter().flatten() {
         match s["codec_type"].as_str() {
-            Some("video") if s["disposition"]["attached_pic"].as_i64() != Some(1) => {
-                if video.is_none() {
-                    let w = s["width"].as_u64().unwrap_or(0) as u32;
-                    let h = s["height"].as_u64().unwrap_or(0) as u32;
-                    video = Some((w, h));
-                    let matrix = s["side_data_list"]
-                        .as_array()
-                        .into_iter()
-                        .flatten()
-                        .find_map(|d| d["rotation"].as_f64());
-                    rotation = quarter_turns(matrix.or_else(|| num(&s["tags"]["rotate"])));
-                }
+            // The first video stream that is not cover art.
+            Some("video")
+                if video.is_none() && s["disposition"]["attached_pic"].as_i64() != Some(1) =>
+            {
+                let w = s["width"].as_u64().unwrap_or(0) as u32;
+                let h = s["height"].as_u64().unwrap_or(0) as u32;
+                video = Some((w, h));
+                let matrix = s["side_data_list"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .find_map(|d| d["rotation"].as_f64());
+                rotation = quarter_turns(matrix.or_else(|| num(&s["tags"]["rotate"])));
             }
             Some("audio") => {
                 if !has_audio {

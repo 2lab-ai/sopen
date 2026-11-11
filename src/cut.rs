@@ -152,6 +152,43 @@ mod tests {
 
     const SINE: &str = "sine=frequency=440:duration=4";
 
+    /// `ffmpeg -version` major: `5.1.9-0+deb12u1` → 5, `n6.1.1` → 6; `None` for git builds.
+    fn ffmpeg_major(tools: &Tools) -> Option<u32> {
+        let out = Command::new(&tools.ffmpeg).arg("-version").output().ok()?;
+        let text = String::from_utf8_lossy(&out.stdout);
+        let version = text.lines().next()?.strip_prefix("ffmpeg version ")?;
+        let version = version.strip_prefix('n').unwrap_or(version);
+        version.split(['.', '-', ' ']).next()?.parse().ok()
+    }
+
+    /// `plain` re-muxed to display rotated by 90°: the display matrix (`-display_rotation`,
+    /// ffmpeg ≥ 6), else the legacy `rotate` tag (older mp4 muxers turn it into the matrix).
+    /// `None` when this ffmpeg writes neither.
+    fn rotated_copy(tools: &Tools, plain: &Path, dst: &Path) -> Option<ffmpeg::Probe> {
+        let attempts: [(&[&str], &[&str]); 2] = [
+            (&["-display_rotation", "90"], &[]),
+            (&[], &["-metadata:s:v:0", "rotate=90"]),
+        ];
+        for (input_opts, output_opts) in attempts {
+            let made = Command::new(&tools.ffmpeg)
+                .args(["-hide_banner", "-loglevel", "error", "-nostdin", "-y"])
+                .args(input_opts)
+                .arg("-i")
+                .arg(plain)
+                .args(["-c", "copy"])
+                .args(output_opts)
+                .arg(dst)
+                .status()
+                .is_ok_and(|s| s.success());
+            if let Some(probe) = made.then(|| ffmpeg::probe(tools, dst).ok()).flatten() {
+                if probe.rotation % 180 == 90 {
+                    return Some(probe);
+                }
+            }
+        }
+        None
+    }
+
     #[test]
     fn video_cut_with_crop() {
         let Some(tools) = tools_or_skip() else { return };
@@ -242,19 +279,18 @@ mod tests {
             &["testsrc2=size=640x360:rate=30:duration=4"],
             &["-c:v", "libx264", "-pix_fmt", "yuv420p"],
         );
-        // `-display_rotation` on a stream copy writes the display matrix (ffmpeg ≥ 6.1).
-        let status = Command::new(&tools.ffmpeg)
-            .args(["-hide_banner", "-loglevel", "error", "-nostdin", "-y"])
-            .args(["-display_rotation", "90", "-i"])
-            .arg(&plain)
-            .args(["-c", "copy"])
-            .arg(tmp.path().join("r.mp4"))
-            .status()
-            .unwrap();
-        assert!(status.success());
-        let src = ffmpeg::probe(&tools, &tmp.path().join("r.mp4")).unwrap();
+        let Some(src) = rotated_copy(&tools, &plain, &tmp.path().join("r.mp4")) else {
+            let major = ffmpeg_major(&tools);
+            // ffmpeg 6+ has -display_rotation; a CI that requires ffmpeg must not skip there.
+            if std::env::var_os("SOPEN_REQUIRE_FFMPEG").is_some() && major.is_some_and(|m| m >= 6) {
+                panic!("ffmpeg {major:?} wrote no display rotation into the fixture");
+            }
+            eprintln!("skipping: this ffmpeg ({major:?}) cannot tag a fixture as rotated");
+            return;
+        };
         assert_eq!(src.video, Some((640, 360)));
-        assert_eq!(src.rotation, 90);
+        // 90 from the display matrix; older ffprobe reports the tag's matrix as -90 = 270.
+        assert!(matches!(src.rotation, 90 | 270), "{}", src.rotation);
         assert_eq!(src.display, Some((360, 640)));
 
         let crop = Rect {
