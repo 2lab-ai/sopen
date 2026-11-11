@@ -23,14 +23,15 @@ fn export_args_table() {
             3.0,
             crop,
             MediaKind::Video,
-            None,
+            &ExportPlan::basic(None),
         )
         .unwrap(),
     );
     assert_eq!(
         video.join(" "),
-        "-ss 1.000 -to 3.000 -i /c/talk.mp4 -vf crop=320:180:10:20 -c:v libx264 -preset veryfast \
-         -crf 18 -pix_fmt yuv420p -c:a aac -b:a 192k -movflags +faststart /o/talk.cut-1-3.mp4"
+        "-ss 1.000 -to 3.000 -i /c/talk.mp4 -map 0:v:0 -map 0:a? -vf crop=320:180:10:20 \
+         -c:v libx264 -preset veryfast -crf 18 -pix_fmt yuv420p -c:a aac -b:a 192k \
+         -movflags +faststart /o/talk.cut-1-3.mp4"
     );
     let mkv = strs(
         &export_args(
@@ -40,14 +41,14 @@ fn export_args_table() {
             2.25,
             None,
             MediaKind::Video,
-            None,
+            &ExportPlan::basic(None),
         )
         .unwrap(),
     );
     assert_eq!(
         mkv.join(" "),
-        "-ss 0.500 -to 2.250 -i /c/talk.mp4 -c:v libx264 -preset veryfast -crf 18 -pix_fmt yuv420p \
-         -c:a aac -b:a 192k /o/a.mkv"
+        "-ss 0.500 -to 2.250 -i /c/talk.mp4 -map 0:v:0 -map 0:a? -c:v libx264 -preset veryfast \
+         -crf 18 -pix_fmt yuv420p -c:a aac -b:a 192k /o/a.mkv"
     );
 
     let audio = [
@@ -60,6 +61,12 @@ fn export_args_table() {
         ("a.opus", "-c:a libopus"),
     ];
     for (dst, codec) in audio {
+        // Containers that hold one audio stream get the first; the others get them all.
+        let map = if matches!(dst, "a.mp3" | "a.wav" | "a.flac" | "a.aac") {
+            "0:a:0"
+        } else {
+            "0:a"
+        };
         let got = strs(
             &export_args(
                 Path::new("/c/s"),
@@ -68,13 +75,13 @@ fn export_args_table() {
                 3.0,
                 None,
                 MediaKind::Audio,
-                None,
+                &ExportPlan::basic(None),
             )
             .unwrap(),
         );
         assert_eq!(
             got.join(" "),
-            format!("-ss 1.000 -to 3.000 -i /c/s -vn {codec} {dst}"),
+            format!("-ss 1.000 -to 3.000 -i /c/s -map {map} -vn {codec} {dst}"),
             "{dst}"
         );
     }
@@ -88,13 +95,13 @@ fn export_args_table() {
             15.5,
             None,
             MediaKind::Video,
-            None,
+            &ExportPlan::basic(None),
         )
         .unwrap(),
     );
     assert_eq!(
-        late[..10].join(" "),
-        "-ss 2.500 -i /c/rec.ts -ss 10.000 -to 13.000 -c:v libx264"
+        late[..14].join(" "),
+        "-ss 2.500 -i /c/rec.ts -ss 10.000 -to 13.000 -map 0:v:0 -map 0:a? -c:v libx264"
     );
     let early = strs(
         &export_args(
@@ -104,20 +111,21 @@ fn export_args_table() {
             3.0,
             None,
             MediaKind::Video,
-            None,
+            &ExportPlan::basic(None),
         )
         .unwrap(),
     );
     assert_eq!(
-        early[..8].join(" "),
-        "-i /c/rec.ts -ss 1.000 -to 3.000 -c:v libx264"
+        early[..12].join(" "),
+        "-i /c/rec.ts -ss 1.000 -to 3.000 -map 0:v:0 -map 0:a? -c:v libx264"
     );
 
     let audio = MediaKind::Audio;
-    assert!(export_args(src, Path::new("a.xyz"), 1.0, 3.0, None, audio, None).is_err());
-    assert!(export_args(src, Path::new("a.mp3"), 1.0, 3.0, crop, audio, None).is_err());
+    let none = ExportPlan::basic(None);
+    assert!(export_args(src, Path::new("a.xyz"), 1.0, 3.0, None, audio, &none).is_err());
+    assert!(export_args(src, Path::new("a.mp3"), 1.0, 3.0, crop, audio, &none).is_err());
     let video = MediaKind::Video;
-    assert!(export_args(src, Path::new("a.mp4"), 3.0, 3.0, None, video, None).is_err());
+    assert!(export_args(src, Path::new("a.mp4"), 3.0, 3.0, None, video, &none).is_err());
 
     // The source codec decides the encoder (spec §7), whatever the container.
     let by_codec = [
@@ -131,11 +139,26 @@ fn export_args_table() {
         ("ac3", "a.mp4", "-c:a aac -b:a 192k"),
     ];
     for (codec, dst, want) in by_codec {
-        let got =
-            strs(&export_args(src, Path::new(dst), 1.0, 3.0, None, audio, Some(codec)).unwrap());
+        let map = if matches!(dst, "a.flac" | "a.wav") {
+            "0:a:0"
+        } else {
+            "0:a"
+        };
+        let got = strs(
+            &export_args(
+                src,
+                Path::new(dst),
+                1.0,
+                3.0,
+                None,
+                audio,
+                &ExportPlan::basic(Some(codec)),
+            )
+            .unwrap(),
+        );
         assert_eq!(
             got.join(" "),
-            format!("-ss 1.000 -to 3.000 -i /c/talk.mp4 -vn {want} {dst}"),
+            format!("-ss 1.000 -to 3.000 -i /c/talk.mp4 -map {map} -vn {want} {dst}"),
             "{codec}"
         );
     }
@@ -207,7 +230,7 @@ fn encoders() {
         2.0,
         None,
         MediaKind::Audio,
-        Some("vorbis"),
+        &ExportPlan::basic(Some("vorbis")),
     )
     .unwrap();
     let adapted = strs(&adapt_to_encoders(args.clone(), &set).unwrap());
@@ -234,8 +257,14 @@ fn probe_json() {
             rotation: 0,
             display: Some((640, 360)),
             fps: Some(30000.0 / 1001.0),
+            video_index: 0,
+            pix_fmt: None,
+            bits: None,
+            color: Vec::new(),
             has_audio: true,
             audio_codec: Some("aac".to_string()),
+            audio_streams: 1,
+            dropped: Vec::new(),
         }
     );
     let unknown_avg = r#"{"streams":[{"codec_type":"video","width":2,"height":2,
@@ -298,4 +327,148 @@ fn times() {
     assert_eq!(name_time(1.5), "1.5");
     assert_eq!(name_time(62.25), "62.25");
     assert_eq!(cut_name("t", 1.0, 3.0, "mp3"), "t.cut-1-3.mp3");
+}
+
+#[test]
+fn probe_stream_inventory() {
+    // Cover art first (it still counts in `0:v:N`), then the picture, two audio tracks, a
+    // subtitle and a data stream.
+    let json = r#"{"streams":[
+        {"codec_type":"video","width":500,"height":500,"disposition":{"attached_pic":1}},
+        {"codec_type":"video","width":1920,"height":1080,"pix_fmt":"yuv420p10le",
+         "bits_per_raw_sample":"10","color_primaries":"bt2020","color_transfer":"smpte2084",
+         "color_space":"bt2020nc","color_range":"unknown","disposition":{"attached_pic":0}},
+        {"codec_type":"audio","codec_name":"aac"},
+        {"codec_type":"audio","codec_name":"ac3"},
+        {"codec_type":"subtitle","codec_name":"mov_text"},
+        {"codec_type":"data","codec_name":"bin_data"}],"format":{"duration":"9"}}"#;
+    let p = parse_probe(json).unwrap();
+    assert_eq!(p.video, Some((1920, 1080)));
+    assert_eq!(p.video_index, 1);
+    assert_eq!(p.pix_fmt.as_deref(), Some("yuv420p10le"));
+    assert_eq!(p.bits, Some(10));
+    let color: Vec<(&str, &str)> = p
+        .color
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+    assert_eq!(
+        color,
+        [
+            ("-color_primaries", "bt2020"),
+            ("-color_trc", "smpte2084"),
+            ("-colorspace", "bt2020nc")
+        ]
+    );
+    assert_eq!(
+        (p.audio_streams, p.audio_codec.as_deref()),
+        (2, Some("aac"))
+    );
+    assert_eq!(p.dropped, ["cover art", "subtitle", "data"]);
+}
+
+#[test]
+fn export_plan_notes() {
+    let probe = parse_probe(
+        r#"{"streams":[
+        {"codec_type":"video","width":64,"height":64,"pix_fmt":"yuva444p12le"},
+        {"codec_type":"audio","codec_name":"aac"},{"codec_type":"audio","codec_name":"aac"},
+        {"codec_type":"subtitle"},{"codec_type":"subtitle"},{"codec_type":"attachment"}],
+        "format":{"duration":"9"}}"#,
+    )
+    .unwrap();
+    assert!(high_depth(&probe));
+    let with_10bit: HashSet<String> = ["yuv420p", "yuv420p10le"].map(String::from).into();
+    let plan = ExportPlan::new(&probe, MediaKind::Video, "mkv", Some(&with_10bit));
+    assert_eq!(plan.pix_fmt, "yuv420p10le");
+    assert_eq!(
+        plan.notes,
+        [
+            "not kept: 2 subtitle streams, 1 attachment stream",
+            "alpha is dropped (H.264 has no alpha)"
+        ]
+    );
+    let eight: HashSet<String> = ["yuv420p".to_string()].into();
+    let plan = ExportPlan::new(&probe, MediaKind::Video, "mkv", Some(&eight));
+    assert_eq!(plan.pix_fmt, "yuv420p");
+    assert!(plan
+        .notes
+        .iter()
+        .any(|n| n.starts_with("exported as 8-bit")));
+    // An audio export into a one-track container names the tracks it leaves out.
+    let audio = parse_probe(
+        r#"{"streams":[{"codec_type":"audio","codec_name":"mp3"},
+        {"codec_type":"audio","codec_name":"mp3"},
+        {"codec_type":"video","width":9,"height":9,"disposition":{"attached_pic":1}}],
+        "format":{"duration":"9"}}"#,
+    )
+    .unwrap();
+    let plan = ExportPlan::new(&audio, MediaKind::Audio, "mp3", None);
+    assert_eq!(
+        plan.notes,
+        ["not kept: cover art, 1 more audio stream (.mp3 holds one)"]
+    );
+    // An ordinary 8-bit file: nothing to say.
+    let plain = parse_probe(
+        r#"{"streams":[{"codec_type":"video","width":9,"height":9,"pix_fmt":"yuv420p"},
+        {"codec_type":"audio","codec_name":"aac"}],"format":{"duration":"9"}}"#,
+    )
+    .unwrap();
+    let plan = ExportPlan::new(&plain, MediaKind::Video, "mp4", None);
+    assert!(plan.notes.is_empty(), "{:?}", plan.notes);
+}
+
+#[test]
+fn pixel_formats() {
+    let help =
+        "Encoder libx264 [libx264 H.264 / AVC]:\n    General capabilities: delay threads\n    \
+                Supported pixel formats: yuv420p yuvj420p yuv422p yuv420p10le gray10le\n";
+    let set = parse_pix_fmts(help);
+    assert!(set.contains("yuv420p10le") && set.contains("gray10le") && set.len() == 5);
+    assert!(parse_pix_fmts("no such line").is_empty());
+    for alpha in [
+        "yuva420p",
+        "rgba",
+        "argb",
+        "bgra",
+        "abgr",
+        "gbrap",
+        "gbrap10le",
+        "ya8",
+        "rgba64le",
+    ] {
+        assert!(has_alpha(alpha), "{alpha}");
+    }
+    for plain in [
+        "yuv420p",
+        "gbrp",
+        "rgb24",
+        "nv12",
+        "gray",
+        "yuv444p10le",
+        "pal8",
+    ] {
+        assert!(!has_alpha(plain), "{plain}");
+    }
+    let depth = |fmt: &str| {
+        high_depth(&Probe {
+            pix_fmt: Some(fmt.to_string()),
+            ..parse_probe(r#"{"streams":[]}"#).unwrap()
+        })
+    };
+    for deep in [
+        "yuv420p10le",
+        "p010le",
+        "yuv444p12le",
+        "gray16be",
+        "rgb48le",
+        "gbrp10le",
+    ] {
+        assert!(depth(deep), "{deep}");
+    }
+    for eight in [
+        "yuv420p", "nv12", "rgb24", "yuvj420p", "bgra", "gray", "yuv422p",
+    ] {
+        assert!(!depth(eight), "{eight}");
+    }
 }

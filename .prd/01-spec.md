@@ -95,6 +95,8 @@ anything not in the table below is out of scope until usage says otherwise (§10
   (Cmd/Ctrl+Z / Shift+Cmd/Ctrl+Z), Cmd/Ctrl+S Save, Save copy, Esc clears the rectangle.
 - Encoding keeps the format: PNG lossless, JPEG quality 95, WebP lossless, BMP, TIFF. Animated GIF opens read-only
   (frame 1 shown, Save disabled with a reason).
+- Never lose data silently: Save keeps the ICC profile and Exif where the format holds them; metadata it does not
+  carry (XMP, text chunks, IPTC, comments) or an encoder refuses is named when the image opens and in the result.
 
 ## 7. Media window (A4, A5)
 
@@ -105,6 +107,9 @@ anything not in the table below is out of scope until usage says otherwise (§10
 - Audio: waveform (downsampled PCM), same transport and In/Out, Export.
 - Export: `ffmpeg -ss In -to Out -i src [-vf crop=w:h:x:y] …` → re-encode (H.264 + AAC for video; the source codec for
   audio) so cuts are exact; progress shown; result uploaded as a sibling (§5).
+- Export maps streams explicitly: the first picture stream and every audio track (one, for one-track containers);
+  >8-bit sources stay 10-bit where libx264 has it; colour tags are carried. What is not kept (subtitles, data,
+  attachments, cover art, alpha, depth) is named in the window before Export and in the result line.
 - `sopen cut <target> <in> <out> [--crop x,y,w,h]` = the same export, headless (scripting + CI receipts).
 - Renderer / playback details fixed by the spike (§11).
 

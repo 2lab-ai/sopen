@@ -42,6 +42,8 @@ pub struct Media {
     pub rotation: u32,
     pub fps: f64,
     pub has_audio: bool,
+    /// What an Export will not keep (or keeps differently), shown before Export.
+    pub notes: Vec<String>,
 }
 
 impl Media {
@@ -55,6 +57,13 @@ impl Media {
         if probe.video.is_none() && !probe.has_audio {
             bail!("{} has no audio or video stream", local.display());
         }
+        let name = local
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let notes = cut::plan(&tools, &probe, &name)
+            .map(|(_, _, plan)| plan.notes)
+            .unwrap_or_default();
         Ok(Self {
             tools,
             local: local.to_path_buf(),
@@ -63,6 +72,7 @@ impl Media {
             rotation: probe.rotation,
             fps: probe.fps.unwrap_or(30.0),
             has_audio: probe.has_audio,
+            notes,
         })
     }
 
@@ -229,14 +239,14 @@ impl Marks {
 }
 
 /// The export of `[in, out]` (cropped when `crop` is set) as a new sibling of the original.
-/// Returns the new file's printed path (`host:/dir/name`).
+/// Returns the new file's printed path (`host:/dir/name`) and what it did not keep.
 pub fn export(
     origin: &mut Origin,
     media: &Media,
     req: &CutRequest,
     work_root: &Path,
     progress: &mut dyn FnMut(f64),
-) -> Result<String> {
+) -> Result<(String, Vec<String>)> {
     if req.out_s <= req.in_s {
         bail!(
             "Out ({}) must be after In ({})",
@@ -256,7 +266,8 @@ pub fn export(
         work_root,
         progress,
     )?;
-    Ok(origin.show(&crate::remote::join(&dir, &published)))
+    let path = origin.show(&crate::remote::join(&dir, &published.name));
+    Ok((path, published.notes))
 }
 
 /// A failed export, in one line. An upload that got no reply is "outcome unknown — check
@@ -307,9 +318,12 @@ pub fn open(
         let crop = media.source_size().and_then(|b| sel.pixels(b));
         let req = request(&media, &marks, crop);
         let started = Instant::now();
-        let path = export(&mut origin, &media, &req, &work_root, &mut |_| {})
+        for note in &media.notes {
+            eprintln!("sopen: export: {note}");
+        }
+        let (path, notes) = export(&mut origin, &media, &req, &work_root, &mut |_| {})
             .map_err(|e| export_error(&e))?;
-        println!(
+        let line = format!(
             "exported {path} ({} → {}{}) in {:.1} s",
             clock_text(req.in_s),
             clock_text(req.out_s),
@@ -318,6 +332,7 @@ pub fn open(
                 .unwrap_or_default(),
             started.elapsed().as_secs_f64()
         );
+        println!("{}", super::with_notes(&line, &notes));
         return Ok(Outcome {
             exported: true,
             ..Outcome::default()
@@ -372,12 +387,17 @@ pub fn open(
 }
 
 /// Prints a finished export to the terminal, records it and returns the status line.
-fn report_export(result: Result<String>, outcome: &mut Outcome) -> Status {
+fn report_export(result: Result<(String, Vec<String>)>, outcome: &mut Outcome) -> Status {
     match result {
-        Ok(path) => {
+        Ok((path, notes)) => {
             outcome.exported = true;
-            println!("exported {path}");
-            Status::info(format!("exported {path}"))
+            let line = super::with_notes(&format!("exported {path}"), &notes);
+            println!("{line}");
+            if notes.is_empty() {
+                Status::info(line)
+            } else {
+                Status::error(line)
+            }
         }
         Err(e) => {
             let e = export_error(&e);
@@ -390,7 +410,7 @@ fn report_export(result: Result<String>, outcome: &mut Outcome) -> Status {
 struct ExportJob {
     /// 0..=1000 (per mille), written by the worker.
     progress: Arc<AtomicU32>,
-    rx: Receiver<Result<String>>,
+    rx: Receiver<Result<(String, Vec<String>)>>,
 }
 
 struct MediaWindow {
@@ -809,6 +829,13 @@ impl MediaWindow {
             ui.separator();
             self.status.show(ui);
         });
+        // What Export will not keep, before the owner exports (never lost silently).
+        if !m.notes.is_empty() {
+            ui.colored_label(
+                ui.visuals().warn_fg_color,
+                format!("Export: {}", m.notes.join("; ")),
+            );
+        }
     }
 
     fn picture(&mut self, ui: &mut egui::Ui) {
@@ -980,6 +1007,7 @@ mod tests {
             rotation: 0,
             fps: 25.0,
             has_audio: false,
+            notes: Vec::new(),
         };
         let leftover: Arc<Mutex<Option<ExportJob>>> = Arc::default();
         let (tx, rx) = mpsc::channel();
@@ -1015,7 +1043,8 @@ mod tests {
         assert!(w.close_requested(), "second close closes the window");
         drop(w);
         let job = leftover.lock().unwrap().take().expect("export handed over");
-        tx.send(Ok("box:/v.cut-1-2.mp4".to_string())).unwrap();
+        tx.send(Ok(("box:/v.cut-1-2.mp4".to_string(), Vec::new())))
+            .unwrap();
         let mut outcome = Outcome::default();
         let status = report_export(job.rx.recv().unwrap(), &mut outcome);
         assert!(outcome.exported);
@@ -1148,7 +1177,8 @@ mod tests {
             &tmp.path().join("work"),
             &mut |_| {},
         )
-        .unwrap();
+        .unwrap()
+        .0;
         let probe = ffmpeg::probe(&tools, Path::new(&out)).unwrap();
         assert_eq!(probe.display, Some((300, 600)));
     }
@@ -1204,7 +1234,8 @@ mod tests {
             &tmp.path().join("work"),
             &mut |f| last = f,
         )
-        .unwrap();
+        .unwrap()
+        .0;
         assert!(path.ends_with("/clip.cut-0.5-2.25.mp4"), "{path}");
         assert_eq!(last, 1.0);
         let probe = ffmpeg::probe(&tools, Path::new(&path)).unwrap();

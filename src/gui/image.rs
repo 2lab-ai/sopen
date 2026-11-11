@@ -38,6 +38,11 @@ pub struct Doc {
     exif: Option<Vec<u8>>,
     /// Why the image cannot be edited or saved (animated images), if so.
     pub read_only: Option<String>,
+    /// Metadata in the file that Save does not carry over (`XMP`, `2 text chunks`, …).
+    pub foreign: Vec<String>,
+    /// Metadata that could not be read or would be rejected by the encoder, one sentence each
+    /// (`ICC profile not kept: …`).
+    pub lost: Vec<String>,
     undo: Vec<DynamicImage>,
     redo: Vec<DynamicImage>,
     /// Bumped by every change; `saved_rev` is the revision in the original file, `copied_rev`
@@ -103,6 +108,161 @@ pub fn tiff_pages(bytes: &[u8], limit: usize) -> usize {
     seen.len()
 }
 
+fn be16(b: &[u8], i: usize) -> Option<usize> {
+    Some(u16::from_be_bytes(b.get(i..i + 2)?.try_into().ok()?) as usize)
+}
+
+fn be32(b: &[u8], i: usize) -> Option<usize> {
+    Some(u32::from_be_bytes(b.get(i..i + 4)?.try_into().ok()?) as usize)
+}
+
+fn plural(n: usize, what: &str) -> String {
+    if n == 1 {
+        format!("1 {what}")
+    } else {
+        format!("{n} {what}s")
+    }
+}
+
+/// PNG: `XMP` (iTXt `XML:com.adobe.xmp`) and text chunks (tEXt / zTXt / other iTXt).
+fn png_foreign(b: &[u8]) -> Vec<String> {
+    let (mut xmp, mut text) = (false, 0);
+    let mut i = 8;
+    while let (Some(len), Some(kind)) = (be32(b, i), b.get(i + 4..i + 8)) {
+        let Some(data) = b.get(i + 8..(i + 8).saturating_add(len)) else {
+            break;
+        };
+        match kind {
+            b"iTXt" if data.starts_with(b"XML:com.adobe.xmp\0") => xmp = true,
+            b"tEXt" | b"zTXt" | b"iTXt" => text += 1,
+            b"IEND" => break,
+            _ => {}
+        }
+        i += 12 + len;
+    }
+    let mut out = Vec::new();
+    if xmp {
+        out.push("XMP".to_string());
+    }
+    if text > 0 {
+        out.push(plural(text, "text chunk"));
+    }
+    out
+}
+
+/// JPEG segments before the image data: XMP (APP1), IPTC (APP13), comments (COM).
+fn jpeg_foreign(b: &[u8]) -> Vec<String> {
+    let (mut xmp, mut iptc, mut comment) = (false, false, false);
+    let mut i = 2;
+    while b.get(i) == Some(&0xFF) {
+        let Some(&marker) = b.get(i + 1) else { break };
+        match marker {
+            0xFF => {
+                i += 1;
+                continue;
+            }
+            0x01 | 0xD0..=0xD8 => {
+                i += 2;
+                continue;
+            }
+            0xD9 | 0xDA => break,
+            _ => {}
+        }
+        let Some(len) = be16(b, i + 2) else { break };
+        let data = b.get(i + 4..i + 2 + len).unwrap_or_default();
+        match marker {
+            0xE1 if data.starts_with(b"http://ns.adobe.com/xap/1.0/\0")
+                || data.starts_with(b"http://ns.adobe.com/xmp/extension/\0") =>
+            {
+                xmp = true
+            }
+            0xED => iptc = true,
+            0xFE => comment = true,
+            _ => {}
+        }
+        i += 2 + len;
+    }
+    [(xmp, "XMP"), (iptc, "IPTC"), (comment, "comment")]
+        .into_iter()
+        .filter(|(on, _)| *on)
+        .map(|(_, name)| name.to_string())
+        .collect()
+}
+
+/// TIFF first-page tags sopen's encoder does not write: XMP (700), IPTC (33723), and the
+/// description / artist / copyright text tags.
+fn tiff_foreign(b: &[u8]) -> Vec<String> {
+    let le = b.starts_with(b"II");
+    let uint = |at: usize, len: usize| -> Option<usize> {
+        let s = b.get(at..at.checked_add(len)?)?;
+        Some(s.iter().enumerate().fold(0usize, |acc, (i, &v)| {
+            let shift = if le { 8 * i } else { 8 * (len - 1 - i) };
+            acc | (usize::from(v) << shift)
+        }))
+    };
+    let big = matches!(b.get(..4), Some(b"II+\0") | Some(b"MM\0+"));
+    let (ifd, count_len, entry_len) = if big {
+        (uint(8, 8), 8, 20)
+    } else {
+        (uint(4, 4), 2, 12)
+    };
+    let mut tags = Vec::new();
+    if let Some(at) = ifd {
+        let n = uint(at, count_len).unwrap_or(0).min(4096);
+        for k in 0..n {
+            match uint(at + count_len + k * entry_len, 2) {
+                Some(tag) => tags.push(tag),
+                None => break,
+            }
+        }
+    }
+    let mut out = Vec::new();
+    if tags.contains(&700) {
+        out.push("XMP".to_string());
+    }
+    if tags.contains(&33723) {
+        out.push("IPTC".to_string());
+    }
+    let text = tags
+        .iter()
+        .filter(|t| matches!(t, 270 | 315 | 33432))
+        .count();
+    if text > 0 {
+        out.push(plural(text, "text tag"));
+    }
+    out
+}
+
+/// WebP RIFF chunks: XMP (`XMP `).
+fn webp_foreign(b: &[u8]) -> Vec<String> {
+    let mut i = 12;
+    while let Some(kind) = b.get(i..i + 4) {
+        let Some(len) = b
+            .get(i + 4..i + 8)
+            .map(|l| u32::from_le_bytes(l.try_into().unwrap()) as usize)
+        else {
+            break;
+        };
+        if kind == b"XMP " {
+            return vec!["XMP".to_string()];
+        }
+        i += 8 + len + (len & 1);
+    }
+    Vec::new()
+}
+
+/// Metadata in the file that Save does not carry over. ICC profiles and Exif are carried
+/// (where the format holds them); this names the rest, so nothing is lost silently.
+pub fn foreign_metadata(bytes: &[u8], format: ImageFormat) -> Vec<String> {
+    match format {
+        ImageFormat::Png => png_foreign(bytes),
+        ImageFormat::Jpeg => jpeg_foreign(bytes),
+        ImageFormat::Tiff => tiff_foreign(bytes),
+        ImageFormat::WebP => webp_foreign(bytes),
+        _ => Vec::new(),
+    }
+}
+
 fn format_name(format: ImageFormat) -> &'static str {
     match format {
         ImageFormat::Png => "PNG",
@@ -137,16 +297,35 @@ impl Doc {
             bail!("{format:?} images are not supported");
         }
         let mut decoder = reader.into_decoder().context("cannot decode the image")?;
-        let icc = decoder.icc_profile().ok().flatten();
-        let mut exif = decoder.exif_metadata().ok().flatten();
+        let mut lost = Vec::new();
+        let icc = decoder.icc_profile().unwrap_or_else(|e| {
+            lost.push(format!("ICC profile not kept: cannot read it ({e})"));
+            None
+        });
+        let mut exif = decoder.exif_metadata().unwrap_or_else(|e| {
+            lost.push(format!("Exif not kept: cannot read it ({e})"));
+            None
+        });
         let orientation = decoder
             .orientation()
             .unwrap_or(image::metadata::Orientation::NoTransforms);
         let mut img = DynamicImage::from_decoder(decoder).context("cannot decode the image")?;
         img.apply_orientation(orientation);
         if let Some(chunk) = exif.as_mut() {
-            let _ = image::metadata::Orientation::remove_from_exif_chunk(chunk);
+            let reset = image::metadata::Orientation::remove_from_exif_chunk(chunk);
+            if reset.is_none() && orientation != image::metadata::Orientation::NoTransforms {
+                // Writing it back would rotate the (already upright) pixels a second time.
+                exif = None;
+                lost.push("Exif not kept: its orientation tag could not be reset".to_string());
+            }
         }
+        // What this format's encoder would refuse to carry, learnt on a 1×1 image now — before
+        // the owner edits anything.
+        let probe_img = DynamicImage::ImageRgba8(image::RgbaImage::new(1, 1));
+        if let Ok(trial) = encode(&probe_img, format, icc.clone(), exif.clone()) {
+            lost.extend(trial.not_kept);
+        }
+        let foreign = foreign_metadata(bytes, format);
         let pages = if format == ImageFormat::Tiff {
             tiff_pages(bytes, 1000)
         } else {
@@ -170,12 +349,53 @@ impl Doc {
             icc,
             exif,
             read_only,
+            foreign,
+            lost,
             undo: Vec::new(),
             redo: Vec::new(),
             rev: 0,
             saved_rev: 0,
             copied_rev: 0,
         })
+    }
+
+    /// "Save will not keep: XMP, 2 text chunks; ICC profile not kept: …", or `None` when Save
+    /// keeps everything sopen read. Shown when the image opens.
+    pub fn not_kept_line(&self) -> Option<String> {
+        let mut parts = Vec::new();
+        if !self.foreign.is_empty() {
+            parts.push(format!("Save will not keep: {}", self.foreign.join(", ")));
+        }
+        parts.extend(self.lost.iter().cloned());
+        (!parts.is_empty()).then(|| parts.join("; "))
+    }
+
+    /// An encoder for the current image that runs anywhere (the window runs it on a worker
+    /// thread): same format and metadata, and the notes about what the result does not keep.
+    pub fn encoder(&self) -> impl FnOnce() -> Result<Encoded> + Send + 'static {
+        let (img, format) = (self.img.clone(), self.format);
+        let (icc, exif) = (self.icc.clone(), self.exif.clone());
+        let mut carried = Vec::new();
+        if !self.foreign.is_empty() {
+            carried.push(format!("not kept: {}", self.foreign.join(", ")));
+        }
+        // Read failures; encoder refusals come from the real encode below.
+        carried.extend(
+            self.lost
+                .iter()
+                .filter(|l| l.contains("cannot read") || l.contains("could not be reset"))
+                .cloned(),
+        );
+        let read_only = self.read_only.clone();
+        move || {
+            if let Some(reason) = read_only {
+                bail!("read-only — {reason}");
+            }
+            let mut out = encode(&img, format, icc, exif)?;
+            carried.append(&mut out.not_kept);
+            out.not_kept = carried;
+            Ok(out)
+        }
     }
 
     pub fn size(&self) -> (u32, u32) {
@@ -281,9 +501,9 @@ impl Doc {
 
     /// The current image encoded like the original: same format, PNG/WebP/BMP/TIFF lossless,
     /// JPEG quality 95, ICC profile and Exif kept where the format carries them.
-    pub fn encode(&self) -> Result<Vec<u8>> {
+    pub fn encode(&self) -> Result<Encoded> {
         self.editable()?;
-        encode(&self.img, self.format, self.icc.clone(), self.exif.clone())
+        self.encoder()()
     }
 }
 
@@ -319,53 +539,93 @@ fn encodable(img: &DynamicImage, format: ImageFormat) -> DynamicImage {
     }
 }
 
+/// Encoded bytes, and what the encoder did not carry (one sentence each).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Encoded {
+    pub bytes: Vec<u8>,
+    pub not_kept: Vec<String>,
+}
+
+impl Encoded {
+    /// Bytes with nothing to report.
+    pub fn plain(bytes: Vec<u8>) -> Self {
+        Self {
+            bytes,
+            not_kept: Vec::new(),
+        }
+    }
+}
+
 pub fn encode(
     img: &DynamicImage,
     format: ImageFormat,
     icc: Option<Vec<u8>>,
     exif: Option<Vec<u8>>,
-) -> Result<Vec<u8>> {
+) -> Result<Encoded> {
     use image::codecs::{bmp, gif, jpeg, png, tiff, webp};
     fn with_meta(
         mut enc: impl ImageEncoder,
         img: &DynamicImage,
         icc: Option<Vec<u8>>,
         exif: Option<Vec<u8>>,
+        not_kept: &mut Vec<String>,
     ) -> image::ImageResult<()> {
-        // A format that cannot carry the profile or the Exif simply drops it.
+        // The save goes on without what the encoder refuses — and says so.
         if let Some(icc) = icc {
-            let _ = enc.set_icc_profile(icc);
+            if let Err(e) = enc.set_icc_profile(icc) {
+                not_kept.push(format!("ICC profile not kept: {e}"));
+            }
         }
         if let Some(exif) = exif {
-            let _ = enc.set_exif_metadata(exif);
+            if let Err(e) = enc.set_exif_metadata(exif) {
+                not_kept.push(format!("Exif not kept: {e}"));
+            }
         }
         img.write_with_encoder(enc)
     }
     let img = encodable(img, format);
     let mut out = Vec::new();
+    let mut not_kept = Vec::new();
+    let nk = &mut not_kept;
     let written = match format {
-        ImageFormat::Png => with_meta(png::PngEncoder::new(&mut out), &img, icc, exif),
+        ImageFormat::Png => with_meta(png::PngEncoder::new(&mut out), &img, icc, exif, nk),
         ImageFormat::Jpeg => with_meta(
             jpeg::JpegEncoder::new_with_quality(&mut out, 95),
             &img,
             icc,
             exif,
+            nk,
         ),
-        ImageFormat::WebP => with_meta(webp::WebPEncoder::new_lossless(&mut out), &img, icc, exif),
-        ImageFormat::Bmp => with_meta(bmp::BmpEncoder::new(&mut out), &img, icc, exif),
+        ImageFormat::WebP => with_meta(
+            webp::WebPEncoder::new_lossless(&mut out),
+            &img,
+            icc,
+            exif,
+            nk,
+        ),
+        ImageFormat::Bmp => with_meta(bmp::BmpEncoder::new(&mut out), &img, icc, exif, nk),
         ImageFormat::Tiff => {
             let mut cursor = Cursor::new(Vec::new());
-            with_meta(tiff::TiffEncoder::new(&mut cursor), &img, icc, exif)
+            with_meta(tiff::TiffEncoder::new(&mut cursor), &img, icc, exif, nk)
                 .map(|()| out = cursor.into_inner())
         }
         // GIF holds 256 colours per frame: pixelized areas are quantised by the encoder.
         ImageFormat::Gif => {
+            if icc.is_some() {
+                nk.push("ICC profile not kept: the GIF encoder writes none".to_string());
+            }
+            if exif.is_some() {
+                nk.push("Exif not kept: the GIF encoder writes none".to_string());
+            }
             gif::GifEncoder::new(&mut out).encode_frame(image::Frame::new(img.to_rgba8()))
         }
         other => return Err(anyhow!("cannot save {other:?} images")),
     };
     written.with_context(|| format!("cannot encode the {}", format_name(format)))?;
-    Ok(out)
+    Ok(Encoded {
+        bytes: out,
+        not_kept,
+    })
 }
 
 /// Replaces every `block`×`block` cell of `rect` with its mean colour (cells at the right and
@@ -468,6 +728,8 @@ pub enum Saved {
         remote: String,
         backup: PathBuf,
         notes: Vec<String>,
+        /// What the saved file does not carry (metadata), shown with the result.
+        not_kept: Vec<String>,
     },
     /// The remote changed since it was fetched; nothing was written.
     Refused { message: String, kept: PathBuf },
@@ -549,7 +811,7 @@ impl ImageFile {
     /// `encode` → stage the edit locally → conflict-checked overwrite. An encode failure leaves
     /// the backup made; a refusal or a transport error keeps the edit in a local file whose
     /// path the message names.
-    pub fn save(&mut self, encode: impl FnOnce() -> Result<Vec<u8>>) -> Result<Saved> {
+    pub fn save(&mut self, encode: impl FnOnce() -> Result<Encoded>) -> Result<Saved> {
         if !self.can_replace() {
             bail!(
                 "{} was not touched: {CANNOT_REPLACE}",
@@ -564,7 +826,8 @@ impl ImageFile {
                 backup.display()
             )
         })?;
-        let staged = self.stage(&encoded, "edited")?;
+        let not_kept = encoded.not_kept;
+        let staged = self.stage(&encoded.bytes, "edited")?;
         let result = (|| -> Result<Saved> {
             let at = self.origin.at;
             let abs = self.origin.abs.clone();
@@ -580,6 +843,7 @@ impl ImageFile {
                         remote: self.origin.display(),
                         backup,
                         notes,
+                        not_kept,
                     })
                 }
                 WriteOutcome::Conflict { reason, notes, .. } => {
@@ -666,10 +930,19 @@ pub fn open(file: ImageFile, hooks: &Hooks, notice: Option<String>) -> Result<Ou
     let (w, h) = doc.size();
     let can_replace = file.can_replace();
     let leftover: Arc<Mutex<Option<Job>>> = Arc::default();
-    let status = match (notice, can_replace) {
-        (Some(text), _) => Status::error(text),
-        (None, false) => Status::error(CANNOT_REPLACE),
-        (None, true) => Status::default(),
+    // Before the owner acts: what Save cannot do or will not keep.
+    let warnings: Vec<String> = notice
+        .into_iter()
+        .chain((!can_replace).then(|| CANNOT_REPLACE.to_string()))
+        .chain(doc.not_kept_line())
+        .collect();
+    let status = if warnings.is_empty() {
+        Status::default()
+    } else {
+        for line in &warnings {
+            eprintln!("sopen: {line}");
+        }
+        Status::error(warnings.join(" · "))
     };
     let window = ImageWindow {
         title: title.clone(),
@@ -717,11 +990,20 @@ fn autosave(mut file: ImageFile, doc: &Doc, hooks: &Hooks) -> Result<Outcome> {
         std::thread::sleep(delay);
     }
     let mut outcome = Outcome::default();
-    match file.save(|| doc.encode())? {
-        Saved::Written { remote, notes, .. } => {
+    if let Some(line) = doc.not_kept_line() {
+        eprintln!("sopen: {line}");
+    }
+    match file.save(doc.encoder())? {
+        Saved::Written {
+            remote,
+            notes,
+            not_kept,
+            ..
+        } => {
             outcome.saved = true;
             let (w, h) = doc.size();
-            println!("saved {remote} ({w}×{h} {})", format_name(doc.format));
+            let line = format!("saved {remote} ({w}×{h} {})", format_name(doc.format));
+            println!("{}", super::with_notes(&line, &not_kept));
             for note in notes {
                 eprintln!("sopen: {note}");
             }
@@ -745,21 +1027,26 @@ fn report(result: &Result<JobDone>, outcome: &mut Outcome) -> Status {
             remote,
             backup,
             notes,
+            not_kept,
         })) => {
             outcome.saved = true;
             outcome.refused = None;
-            println!("saved {remote}");
+            println!(
+                "{}",
+                super::with_notes(&format!("saved {remote}"), not_kept)
+            );
             for note in notes {
                 eprintln!("sopen: {note}");
             }
-            if notes.is_empty() {
+            let all: Vec<String> = notes.iter().chain(not_kept).cloned().collect();
+            if all.is_empty() {
                 Status::info(format!(
                     "saved {remote} · original backed up at {}",
                     backup.display()
                 ))
             } else {
-                // The owner has to see these (e.g. the remote changed right after).
-                Status::error(format!("saved {remote} — {}", notes.join("; ")))
+                // The owner has to see these (the remote changed right after; metadata).
+                Status::error(super::with_notes(&format!("saved {remote}"), &all))
             }
         }
         Ok(JobDone::Saved(Saved::Refused { message, .. })) => {
@@ -768,9 +1055,14 @@ fn report(result: &Result<JobDone>, outcome: &mut Outcome) -> Status {
             eprintln!("sopen: {message}");
             Status::error(message.clone())
         }
-        Ok(JobDone::Copy(path)) => {
-            println!("saved a copy at {path}");
-            Status::info(format!("saved a copy at {path}"))
+        Ok(JobDone::Copy(path, not_kept)) => {
+            let line = super::with_notes(&format!("saved a copy at {path}"), not_kept);
+            println!("{line}");
+            if not_kept.is_empty() {
+                Status::info(line)
+            } else {
+                Status::error(line)
+            }
         }
         Err(e) => {
             eprintln!("sopen: {e:#}");
@@ -800,7 +1092,8 @@ struct Job {
 
 enum JobDone {
     Saved(Saved),
-    Copy(String),
+    /// The copy's printed path and what it does not carry.
+    Copy(String, Vec<String>),
 }
 
 struct ImageWindow {
@@ -901,21 +1194,20 @@ impl ImageWindow {
                 return self.status = Status::info("no changes to save");
             }
         }
-        let (img, format) = (self.doc.img.clone(), self.doc.format);
-        let (icc, exif) = (self.doc.icc.clone(), self.doc.exif.clone());
+        let encoder = self.doc.encoder();
         let file = self.file.clone();
         let copy = matches!(kind, JobKind::SaveCopy { .. });
         let (tx, rx) = mpsc::channel();
         let ctx = ctx.clone();
         std::thread::spawn(move || {
-            let encoded = || encode(&img, format, icc, exif);
             let mut file = file.lock().unwrap();
             let result = if copy {
-                encoded()
-                    .and_then(|bytes| file.save_copy(&bytes))
-                    .map(JobDone::Copy)
+                encoder().and_then(|enc| {
+                    file.save_copy(&enc.bytes)
+                        .map(|path| JobDone::Copy(path, enc.not_kept))
+                })
             } else {
-                file.save(encoded).map(JobDone::Saved)
+                file.save(encoder).map(JobDone::Saved)
             };
             drop(file);
             let _ = tx.send(result);
@@ -947,7 +1239,7 @@ impl ImageWindow {
                 self.doc.mark_saved(job.rev);
                 matches!(job.kind, JobKind::Save { close_after: true }) && notes.is_empty()
             }
-            Ok(JobDone::Copy(_)) => {
+            Ok(JobDone::Copy(..)) => {
                 self.doc.mark_copied(job.rev);
                 matches!(job.kind, JobKind::SaveCopy { close_after: true })
             }
@@ -1072,7 +1364,7 @@ impl ImageWindow {
     fn status_bar(&mut self, ui: &mut egui::Ui) {
         let zoom = self.zoom;
         let (w, h) = self.doc.size();
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             ui.monospace(format!(
                 "{w}×{h} {} · {:.0}%",
                 format_name(self.doc.format),
@@ -1089,6 +1381,9 @@ impl ImageWindow {
             if let Some(reason) = &self.doc.read_only {
                 ui.separator();
                 ui.colored_label(ui.visuals().warn_fg_color, format!("read-only: {reason}"));
+            } else if let Some(line) = self.doc.not_kept_line() {
+                ui.separator();
+                ui.colored_label(ui.visuals().warn_fg_color, line);
             }
             ui.separator();
             self.status.show(ui);
@@ -1294,7 +1589,7 @@ mod tests {
     }
 
     fn png_bytes(img: &DynamicImage) -> Vec<u8> {
-        encode(img, ImageFormat::Png, None, None).unwrap()
+        encode(img, ImageFormat::Png, None, None).unwrap().bytes
     }
 
     #[test]
@@ -1389,7 +1684,7 @@ mod tests {
             (ImageFormat::Jpeg, &rgb, image::ColorType::Rgb8, false),
         ];
         for (format, img, color, lossless) in cases {
-            let bytes = encode(img, format, None, None).unwrap();
+            let bytes = encode(img, format, None, None).unwrap().bytes;
             let back = Doc::decode(&bytes).unwrap();
             assert_eq!(back.format, format, "{format:?}");
             assert_eq!(back.img.color(), color, "{format:?} colour type");
@@ -1414,7 +1709,9 @@ mod tests {
 
     #[test]
     fn gif_static_saves_and_animated_is_read_only() {
-        let still = encode(&gradient(10, 10), ImageFormat::Gif, None, None).unwrap();
+        let still = encode(&gradient(10, 10), ImageFormat::Gif, None, None)
+            .unwrap()
+            .bytes;
         let doc = Doc::decode(&still).unwrap();
         assert_eq!(doc.format, ImageFormat::Gif);
         assert!(doc.read_only.is_none());
@@ -1459,7 +1756,9 @@ mod tests {
 
     #[test]
     fn tiff_page_count_reads_both_byte_orders_and_stops_on_garbage() {
-        let one = encode(&gradient(4, 4), ImageFormat::Tiff, None, None).unwrap();
+        let one = encode(&gradient(4, 4), ImageFormat::Tiff, None, None)
+            .unwrap()
+            .bytes;
         assert_eq!(tiff_pages(&one, 10), 1);
         assert_eq!(tiff_pages(&two_page_tiff(&one), 10), 2);
         assert_eq!(tiff_pages(&two_page_tiff(&one), 1), 1, "limit");
@@ -1480,7 +1779,9 @@ mod tests {
 
     #[test]
     fn multi_page_tiff_is_read_only() {
-        let one = encode(&gradient(16, 8), ImageFormat::Tiff, None, None).unwrap();
+        let one = encode(&gradient(16, 8), ImageFormat::Tiff, None, None)
+            .unwrap()
+            .bytes;
         let single = Doc::decode(&one).unwrap();
         assert!(single.read_only.is_none(), "one page is editable");
         let two = two_page_tiff(&one);
@@ -1490,6 +1791,158 @@ mod tests {
         assert!(reason.contains("multi-page TIFF"), "{reason}");
         assert!(doc.crop([0, 0, 4, 4]).is_err());
         assert!(doc.encode().is_err());
+    }
+
+    /// Exif with no tags (big-endian TIFF header, empty IFD).
+    const EMPTY_EXIF: &[u8] = b"MM\x00\x2a\x00\x00\x00\x08\x00\x00\x00\x00\x00\x00";
+
+    fn fake_icc() -> Vec<u8> {
+        (0..=255u8).cycle().take(600).collect()
+    }
+
+    #[test]
+    fn png_and_jpeg_keep_icc_and_exif() {
+        for format in [ImageFormat::Png, ImageFormat::Jpeg] {
+            let src = DynamicImage::ImageRgb8(gradient(24, 16).to_rgb8());
+            let made = encode(&src, format, Some(fake_icc()), Some(EMPTY_EXIF.to_vec())).unwrap();
+            assert!(made.not_kept.is_empty(), "{format:?}: {:?}", made.not_kept);
+            let doc = Doc::decode(&made.bytes).unwrap();
+            assert_eq!(
+                doc.icc.as_deref(),
+                Some(fake_icc().as_slice()),
+                "{format:?}"
+            );
+            assert_eq!(doc.exif.as_deref(), Some(EMPTY_EXIF), "{format:?}");
+            assert_eq!(doc.not_kept_line(), None, "{format:?}");
+            let saved = doc.encode().unwrap();
+            assert!(
+                saved.not_kept.is_empty(),
+                "{format:?}: {:?}",
+                saved.not_kept
+            );
+            let again = Doc::decode(&saved.bytes).unwrap();
+            assert_eq!(again.icc, doc.icc, "{format:?} ICC round trip");
+            assert_eq!(again.exif, doc.exif, "{format:?} Exif round trip");
+        }
+    }
+
+    /// A profile or Exif the encoder refuses is not swallowed: the save goes on and says what
+    /// it did not keep.
+    #[test]
+    fn encoder_refusals_are_reported() {
+        let img = gradient(8, 8);
+        let bmp = encode(&img, ImageFormat::Bmp, Some(fake_icc()), None).unwrap();
+        assert_eq!(bmp.not_kept.len(), 1);
+        assert!(
+            bmp.not_kept[0].starts_with("ICC profile not kept: "),
+            "{:?}",
+            bmp.not_kept
+        );
+        let tiff = encode(&img, ImageFormat::Tiff, None, Some(EMPTY_EXIF.to_vec())).unwrap();
+        assert!(
+            tiff.not_kept[0].starts_with("Exif not kept: "),
+            "{:?}",
+            tiff.not_kept
+        );
+        let gif = encode(&img, ImageFormat::Gif, Some(fake_icc()), None).unwrap();
+        assert!(gif.not_kept[0].starts_with("ICC profile not kept: "));
+        assert!(
+            !bmp.bytes.is_empty() && !tiff.bytes.is_empty(),
+            "the save went on"
+        );
+    }
+
+    fn crc32(data: &[u8]) -> u32 {
+        let mut crc = !0u32;
+        for &b in data {
+            crc ^= u32::from(b);
+            for _ in 0..8 {
+                crc = if crc & 1 == 1 {
+                    (crc >> 1) ^ 0xEDB8_8320
+                } else {
+                    crc >> 1
+                };
+            }
+        }
+        !crc
+    }
+
+    /// `png` with `chunks` inserted before IEND.
+    fn png_with_chunks(png: &[u8], chunks: &[(&[u8; 4], &[u8])]) -> Vec<u8> {
+        let iend = png.len() - 12;
+        let mut out = png[..iend].to_vec();
+        for (kind, data) in chunks {
+            out.extend_from_slice(&(data.len() as u32).to_be_bytes());
+            let typed: Vec<u8> = [kind.as_slice(), data].concat();
+            out.extend_from_slice(&typed);
+            out.extend_from_slice(&crc32(&typed).to_be_bytes());
+        }
+        out.extend_from_slice(&png[iend..]);
+        out
+    }
+
+    /// XMP and text the encoder cannot write are named when the image opens and again in the
+    /// save outcome — PNG (iTXt XMP + tEXt) and JPEG (APP1 XMP).
+    #[test]
+    fn xmp_and_text_chunks_are_reported_on_open_and_in_the_save_outcome() {
+        let xmp = b"XML:com.adobe.xmp\0\0\0\0\0<x:xmpmeta xmlns:x='adobe:ns:meta/'/>";
+        let png = png_with_chunks(
+            &png_bytes(&gradient(16, 16)),
+            &[(b"iTXt", xmp.as_slice()), (b"tEXt", b"Comment\0shot")],
+        );
+        let doc = Doc::decode(&png).unwrap();
+        assert_eq!(
+            doc.not_kept_line().as_deref(),
+            Some("Save will not keep: XMP, 1 text chunk")
+        );
+
+        let jpeg = encode(&gradient(16, 16), ImageFormat::Jpeg, None, None)
+            .unwrap()
+            .bytes;
+        let payload = b"http://ns.adobe.com/xap/1.0/\0<x:xmpmeta xmlns:x='adobe:ns:meta/'/>";
+        let mut with_xmp = jpeg[..2].to_vec();
+        with_xmp.extend_from_slice(&[0xFF, 0xE1]);
+        with_xmp.extend_from_slice(&((payload.len() + 2) as u16).to_be_bytes());
+        with_xmp.extend_from_slice(payload);
+        with_xmp.extend_from_slice(&jpeg[2..]);
+        let jdoc = Doc::decode(&with_xmp).unwrap();
+        assert_eq!(
+            jdoc.not_kept_line().as_deref(),
+            Some("Save will not keep: XMP")
+        );
+
+        // The model's save outcome repeats it.
+        let tmp = tempfile::tempdir().unwrap();
+        let mut file = local_file(tmp.path(), "x.png", &png);
+        let mut doc = Doc::decode(file.original()).unwrap();
+        doc.pixelize([0, 0, 8, 8], 4).unwrap();
+        let Saved::Written { not_kept, .. } = file.save(doc.encoder()).unwrap() else {
+            panic!("expected Written")
+        };
+        assert_eq!(not_kept, ["not kept: XMP, 1 text chunk"]);
+    }
+
+    #[test]
+    fn tiff_and_webp_xmp_are_found() {
+        // Little-endian TIFF, one IFD with tags 270 (description) and 700 (XMP).
+        let mut tiff = b"II*\0\x08\0\0\0\x02\0".to_vec();
+        for tag in [270u16, 700] {
+            tiff.extend_from_slice(&tag.to_le_bytes());
+            tiff.extend_from_slice(&[2, 0, 1, 0, 0, 0, 0, 0, 0, 0]);
+        }
+        tiff.extend_from_slice(&[0, 0, 0, 0]);
+        assert_eq!(
+            foreign_metadata(&tiff, ImageFormat::Tiff),
+            ["XMP", "1 text tag"]
+        );
+        let mut webp = b"RIFF\0\0\0\0WEBPVP8L".to_vec();
+        webp.extend_from_slice(&3u32.to_le_bytes());
+        webp.extend_from_slice(&[1, 2, 3, 0]);
+        webp.extend_from_slice(b"XMP ");
+        webp.extend_from_slice(&2u32.to_le_bytes());
+        webp.extend_from_slice(b"<>");
+        assert_eq!(foreign_metadata(&webp, ImageFormat::WebP), ["XMP"]);
+        assert!(foreign_metadata(b"\x89PNG\r\n\x1a\n", ImageFormat::Png).is_empty());
     }
 
     #[test]
@@ -1506,10 +1959,12 @@ mod tests {
             &[0x00, 0x00, 0x00, 0x00],
         ]
         .concat();
-        let bytes = encode(&img, ImageFormat::Jpeg, None, Some(exif)).unwrap();
+        let bytes = encode(&img, ImageFormat::Jpeg, None, Some(exif))
+            .unwrap()
+            .bytes;
         let doc = Doc::decode(&bytes).unwrap();
         assert_eq!(doc.size(), (2, 4));
-        let saved = Doc::decode(&doc.encode().unwrap()).unwrap();
+        let saved = Doc::decode(&doc.encode().unwrap().bytes).unwrap();
         assert_eq!(saved.size(), (2, 4), "not rotated twice");
     }
 
@@ -1530,8 +1985,10 @@ mod tests {
         let mut file = local_file(tmp.path(), "a.png", &original);
         let mut doc = Doc::decode(file.original()).unwrap();
         doc.pixelize([0, 0, 16, 16], 8).unwrap();
-        let encoded = doc.encode().unwrap();
-        let Saved::Written { backup, .. } = file.save(|| Ok(encoded.clone())).unwrap() else {
+        let encoded = doc.encode().unwrap().bytes;
+        let Saved::Written { backup, .. } =
+            file.save(|| Ok(Encoded::plain(encoded.clone()))).unwrap()
+        else {
             panic!("expected Written")
         };
         assert_eq!(std::fs::read(&backup).unwrap(), original);
@@ -1539,8 +1996,10 @@ mod tests {
         assert_eq!(std::fs::read(tmp.path().join("a.png")).unwrap(), encoded);
         // A second save in the same session goes over our own write and keeps the backup.
         doc.crop([0, 0, 10, 10]).unwrap();
-        let second = doc.encode().unwrap();
-        let Saved::Written { backup: again, .. } = file.save(|| Ok(second.clone())).unwrap() else {
+        let second = doc.encode().unwrap().bytes;
+        let Saved::Written { backup: again, .. } =
+            file.save(|| Ok(Encoded::plain(second.clone()))).unwrap()
+        else {
             panic!("expected Written")
         };
         assert_eq!(again, backup);
@@ -1581,7 +2040,7 @@ mod tests {
             .save(|| {
                 seen_at_encode = walk(&backups);
                 assert!(walk(&edits).is_empty(), "nothing staged before encoding");
-                Ok(encoded.clone())
+                Ok(Encoded::plain(encoded.clone()))
             })
             .unwrap();
         assert!(matches!(saved, Saved::Written { .. }), "{saved:?}");
@@ -1675,8 +2134,10 @@ mod tests {
         std::fs::write(tmp.path().join("a.png"), b"someone else's bytes").unwrap();
         let mut doc = Doc::decode(file.original()).unwrap();
         doc.pixelize([0, 0, 8, 8], 4).unwrap();
-        let encoded = doc.encode().unwrap();
-        let Saved::Refused { message, kept } = file.save(|| Ok(encoded.clone())).unwrap() else {
+        let encoded = doc.encode().unwrap().bytes;
+        let Saved::Refused { message, kept } =
+            file.save(|| Ok(Encoded::plain(encoded.clone()))).unwrap()
+        else {
             panic!("expected Refused")
         };
         assert!(message.contains("changed since it was opened"), "{message}");
@@ -1758,8 +2219,11 @@ mod tests {
         assert!(!file.can_replace());
         let mut doc = Doc::decode(file.original()).unwrap();
         doc.pixelize([0, 0, 8, 8], 4).unwrap();
-        let encoded = doc.encode().unwrap();
-        let err = file.save(|| Ok(encoded.clone())).unwrap_err().to_string();
+        let encoded = doc.encode().unwrap().bytes;
+        let err = file
+            .save(|| Ok(Encoded::plain(encoded.clone())))
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("Save copy"), "{err}");
         assert_eq!(std::fs::read(&path).unwrap(), original, "untouched");
         assert!(

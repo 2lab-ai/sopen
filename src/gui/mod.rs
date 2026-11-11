@@ -540,6 +540,15 @@ impl Status {
     }
 }
 
+/// `line`, followed by what was not kept: `"<line> — not kept: XMP; alpha is dropped …"`.
+pub fn with_notes(line: &str, notes: &[String]) -> String {
+    if notes.is_empty() {
+        line.to_string()
+    } else {
+        format!("{line} — {}", notes.join("; "))
+    }
+}
+
 /// A key pressed without modifiers (the single-letter commands) — not while a text field
 /// (the block size box) is being edited.
 pub fn plain_key(ctx: &egui::Context, key: egui::Key) -> bool {

@@ -617,7 +617,11 @@ fn run_cut(
     );
     progress.finish();
     let final_name = result?;
-    println!("{}", place.display(&remote::join(&dir, &final_name)));
+    println!("{}", place.display(&remote::join(&dir, &final_name.name)));
+    // Never lost silently: what the export did not keep (also in the window before Export).
+    for note in &final_name.notes {
+        eprintln!("sopen: {note}");
+    }
     Ok(())
 }
 

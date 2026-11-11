@@ -46,7 +46,10 @@ inside moves it), then:
 | `⌘S` | Save: the original is first backed up locally (path printed), then overwritten in place in the same format (PNG, WebP, BMP, TIFF lossless; JPEG quality 95). A server without `posix-rename@openssh.com` cannot replace a file safely: Save is off there, Save copy works |
 | `⇧⌘S` | Save copy: `<name>.edited.<ext>` next to the original |
 
-Animated GIF/PNG/WebP open read-only (first frame). Closing with unsaved changes asks first.
+Animated GIF/PNG/WebP and multi-page TIFF open read-only (first frame / page). Closing with unsaved
+changes asks first. Save keeps the ICC profile and Exif where the format holds them; anything it
+cannot keep (XMP, text chunks, IPTC, comments) is named in the window when the image opens and
+again in the result line.
 
 ## Video and audio
 
@@ -54,7 +57,9 @@ Video plays in the window with sound; audio shows its waveform. Click or drag th
 seek, `Space` plays/pauses, `←`/`→` step 1 s (`⇧` 5 s), `I` / `O` set In and Out. On video, drag
 a rectangle to crop. `E` exports In–Out (and the crop) as a new file next to the original,
 exactly like `sopen cut`, and shows its remote path. If no audio device can be opened the video
-plays silently and says so.
+plays silently and says so. Export keeps the picture and every audio track; what it cannot keep
+(subtitles, data streams, cover art, alpha, more than 8 bits where this ffmpeg's libx264 has no
+10-bit) is named in the window before you export and again in the result line.
 
 ## Any other file: `--app`
 
