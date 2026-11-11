@@ -1,0 +1,39 @@
+[package]
+name = "sopen"
+version = "0.1.0"
+edition = "2021"
+# The floor the GUI stack (eframe) needs; the Linux gate builds with exactly this toolchain.
+rust-version = "1.95"
+license = "MIT"
+description = "Open a file or folder on another machine as if it were local (scp syntax, system ssh, SFTP)"
+repository = "https://github.com/2lab-ai/sopen"
+
+[lib]
+name = "sopen"
+path = "src/lib.rs"
+
+[[bin]]
+name = "sopen"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0.102"
+# Buffers handed to SFTP reads (openssh-sftp-client takes `bytes::BytesMut`).
+bytes = "1.11.0"
+clap = { version = "4.6.7", features = ["derive", "string"] }
+# Cache dir per platform (spec §5: `<cache>/<host>/<abs path>`).
+directories = "6.0.0"
+# Transport = the system `ssh` binary (spec §4); process-mux (default) attaches to our own ControlMaster.
+openssh = "0.11.6"
+openssh-sftp-client = { version = "0.15.12", features = ["openssh"] }
+# `ReadDir` is a `futures_core::Stream` (directory listing over SFTP).
+futures-core = "0.3.31"
+# ffprobe output and the usage log are JSON.
+serde_json = "1.0.150"
+# Content hash (did the editor change the file?) and the host hash in the usage log.
+sha2 = "0.10.9"
+# openssh / openssh-sftp-client are async; sopen drives them from a current-thread runtime.
+tokio = { version = "1.54.1", features = ["rt", "time"] }
+
+[dev-dependencies]
+tempfile = "3.27.0"

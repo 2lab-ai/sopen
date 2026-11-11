@@ -23,9 +23,11 @@ exists: a command output or a window screenshot that someone actually looked at.
 
 - **The remote needs only sshd.** Never install, upload or run a helper on the remote. Transport is the system
   `ssh` binary (so `~/.ssh/config` is honoured); file operations are SFTP over that session.
-- **Never overwrite silently.** Every write re-checks the remote `(size, mtime)` first and refuses on change;
-  writes go to a temp name in the same directory and are renamed over the target. Image Save keeps a local
-  backup of the original first. Media exports always write a new sibling file.
+- **Never overwrite silently.** Every write re-checks the remote file first (`lstat`: still a regular file,
+  same `(size, mtime)`, same content hash up to 256 MiB) and refuses on change; writes go to a temp name in the
+  same directory with the target's owner and mode and are renamed over the target. Spec §5 is the full rule.
+  Image Save keeps a local backup of the original first. Media exports always write a new sibling file and
+  never use a replacing rename to publish it.
 - **No new edit features without the owner.** The edit list above is the whole list (owner, 2026-11-11).
 - **ffmpeg/ffprobe are external programs**, resolved at runtime (`SOPEN_FFMPEG` / `SOPEN_FFPROBE`, then PATH).
   Do not link libav*.
@@ -36,9 +38,19 @@ exists: a command output or a window screenshot that someone actually looked at.
 
 ## Distribution (llmux shape)
 
-- `ci.yml` — every PR and main push: the gate on `macos-latest` and `ubuntu-latest`.
-- `preview.yml` — every main push: builds macOS arm64/x86_64 and Linux x86_64/aarch64 binaries, publishes a
-  `preview-<YYYY-MM-DD-HHMM>-<sha12>` prerelease, bumps `2lab-ai/homebrew-tap` `Formula/sopen-preview.rb`.
-- `release.yml` — `v*` tag equal to the Cargo version: stable release + `Formula/sopen.rb`. Tagging is the
-  owner's call.
+- `ci.yml` — every PR and main push: the gate on `macos-latest` and `ubuntu-latest`. `preview.yml` and
+  `release.yml` call it first and publish nothing unless it is green.
+- `preview.yml` — every main push: gate, then macOS arm64/x86_64 and Linux x86_64/aarch64 binaries (Linux built
+  on `ubuntu-22.04` / `ubuntu-22.04-arm` for an older glibc floor), a `preview-<YYYY-MM-DD-HHMM>-<sha12>`
+  prerelease, and the tap's `Formula/sopen-preview.rb`.
+- `release.yml` — `v*` tag equal to the Cargo version (tagging is the owner's call): gate, the same four
+  binaries, a stable release, then the tap's `Formula/sopen.rb`.
+- Tap bump = `.github/scripts/bump-tap.sh` (regression test `.github/scripts/tests/bump-tap.test.sh`): renders
+  `Formula/<name>.rb` from this repo's `packaging/homebrew/<name>.rb.tmpl` with the sha256s of the published
+  assets and pushes only that file to `2lab-ai/homebrew-tap`. The tap holds no templates.
+  - With the repo secret `TAP_DISPATCH_TOKEN`: the workflow pushes the formula; a failed bump fails the job.
+  - Without it: the bump job only prints a notice and the tap is not touched. The dispatcher then pushes the
+    rendered formula to the tap by hand: download the release assets into `release/`, and from a checkout of
+    the released commit run `FORMULA=<sopen-preview|sopen> TAG=<tag> [BUILD_ID=<build id>] GH_TOKEN=<token
+    that can push the tap> .github/scripts/bump-tap.sh`.
 - Install: `brew install 2lab-ai/tap/sopen-preview`. The formula depends on `ffmpeg`.
