@@ -370,6 +370,9 @@ pub fn open(
         leftover: leftover.clone(),
         export_hold: hooks.export_hold,
         resume: false,
+        sink: Sink::Device,
+        map: None,
+        timeline_rect: None,
     };
     let run = super::run_window(&title, size, window, hooks);
     // Never exit with an export in flight without its outcome on the terminal.
@@ -440,6 +443,11 @@ struct MediaWindow {
     export_hold: Option<std::time::Duration>,
     /// Playback paused by a timeline drag, to resume on release.
     resume: bool,
+    /// Where playback sound goes: the device (tests: the null sink).
+    sink: Sink,
+    /// Where the last pass drew the frame (screen ↔ source pixels) and the timeline.
+    map: Option<Map>,
+    timeline_rect: Option<Rect>,
 }
 
 impl MediaWindow {
@@ -503,7 +511,7 @@ impl MediaWindow {
         };
         let waker = ctx.clone();
         let wake: Arc<dyn Fn() + Send + Sync> = Arc::new(move || waker.request_repaint());
-        match Player::start(&media.tools, &src, from, 1.0, Sink::Device, wake) {
+        match Player::start(&media.tools, &src, from, 1.0, self.sink, wake) {
             Ok(player) => {
                 self.player = Some(player);
                 self.status = Status::default();
@@ -659,6 +667,7 @@ impl MediaWindow {
             Vec2::new(ui.available_width(), height),
             Sense::click_and_drag(),
         );
+        self.timeline_rect = Some(rect);
         let painter = ui.painter_at(rect);
         painter.rect_filled(rect, 3.0, Color32::from_gray(40));
         let duration = self.media.duration.max(1e-6);
@@ -866,6 +875,7 @@ impl MediaWindow {
         );
         self.sel.handle(ui, &resp, map);
         self.sel.draw(&painter, map);
+        self.map = Some(map);
         self.painted = true;
     }
 }
@@ -980,6 +990,9 @@ impl super::Window for MediaWindow {
 }
 
 #[cfg(test)]
+mod input_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::remote::{LocalFs, RemoteFs};
@@ -1036,6 +1049,9 @@ mod tests {
             leftover: leftover.clone(),
             export_hold: None,
             resume: false,
+            sink: Sink::Null,
+            map: None,
+            timeline_rect: None,
         };
         use super::super::Window;
         assert!(!w.close_requested(), "first close waits for the export");

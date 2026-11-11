@@ -966,6 +966,7 @@ pub fn open(file: ImageFile, hooks: &Hooks, notice: Option<String>) -> Result<Ou
         leftover: leftover.clone(),
         painted: false,
         zoom: 1.0,
+        map: None,
     };
     // A window that shows the image near 1:1 where the screen allows; eframe clamps to it.
     let size = [
@@ -1123,6 +1124,8 @@ struct ImageWindow {
     painted: bool,
     /// Device pixels per image pixel, for the status bar.
     zoom: f32,
+    /// Where the last pass drew the image (screen ↔ image pixels).
+    map: Option<Map>,
 }
 
 impl Drop for ImageWindow {
@@ -1495,6 +1498,7 @@ impl ImageWindow {
             self.sel.handle(ui, &resp, map);
         }
         self.sel.draw(&painter, map);
+        self.map = Some(map);
         self.painted = true;
         scale * ctx.pixels_per_point()
     }
@@ -1578,6 +1582,12 @@ impl super::Window for ImageWindow {
         false
     }
 }
+
+#[cfg(test)]
+mod input_tests;
+
+#[cfg(test)]
+mod robustness_tests;
 
 #[cfg(test)]
 mod tests {
@@ -2095,6 +2105,7 @@ mod tests {
             leftover,
             painted: false,
             zoom: 1.0,
+            map: None,
         }
     }
 

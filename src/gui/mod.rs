@@ -8,6 +8,8 @@ pub mod image;
 pub mod media;
 pub mod playback;
 mod select;
+#[cfg(test)]
+pub(crate) mod testkit;
 
 pub use select::{fit, Map, Selection};
 
