@@ -127,4 +127,19 @@ A conflict refusal or failed write → fix before anything else. Large-media wai
 
 ## 11. Spike results (filled from the 2026-11-11 spike)
 
-_pending_
+- **Toolkit:** eframe/egui 0.37 — one dependency for window, input and texture upload, no system UI
+  libraries to link. Renderer: wgpu by default, glow (OpenGL) compiled in as the fallback — chosen with
+  `SOPEN_RENDERER`, and used automatically when wgpu does not start. Both rendered the same frames on macOS.
+- **Playback in the window:** two ffmpeg subprocesses from the play position — video as RGBA frames
+  (decoded ≤ 1280 wide, forced to a constant frame rate so a frame's time is its index over the rate),
+  audio as f32 PCM at the output device's rate — feeding `cpal` 0.18 through an `rtrb` ring. Audio is the
+  master clock (frames the device consumed, minus its output latency); video frames are shown when due
+  and dropped when late. 720p30 for 5 s: 152 frames shown, 0 dropped. No audio device → the clock falls
+  back to the wall clock and the window says so.
+- **Scrub:** one ffmpeg run per requested frame, latest request wins.
+- **Export:** input-side `-ss`/`-to` + re-encode is frame-exact (duration = Out − In).
+- **Linux build:** `cpal` links ALSA (`libasound2-dev` in CI); X11, Wayland, EGL, Vulkan and fontconfig are
+  loaded at runtime.
+- **macOS:** a window started from a terminal can come up behind it — sopen asks for focus on its first
+  frames. A window can screenshot itself (`ViewportCommand::Screenshot`), which is how window receipts are
+  taken (AGENTS.md "Receipts").

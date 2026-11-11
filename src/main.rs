@@ -6,6 +6,7 @@ use clap::{Parser, Subcommand};
 use sopen::cache::{self, Dirs};
 use sopen::cut::{self, CutRequest};
 use sopen::ffmpeg::{self, Rect};
+use sopen::gui;
 use sopen::kind::{self, Kind};
 use sopen::remote::{self, LocalFs, RemoteFs, SftpRemote, Stat, WriteOutcome};
 use sopen::target::{self, RemoteSpec, Target};
@@ -34,11 +35,15 @@ struct Cli {
     #[command(subcommand)]
     cmd: Option<Cmd>,
     /// [user@]host:path, or a local path
-    #[arg(required = true)]
+    #[arg(required_unless_present = "selftest_audio")]
     target: Option<String>,
     /// Open a copy in this local app; Enter in the terminal uploads the changes
     #[arg(long, value_name = "APP")]
     app: Option<String>,
+    /// Receipt check: play FILE on the real audio device at gain 0 for ~2 s and print the
+    /// callback / underrun counts (AGENTS.md "Receipts").
+    #[arg(long, hide = true, value_name = "FILE", conflicts_with_all = ["target", "app"])]
+    selftest_audio: Option<PathBuf>,
 }
 
 #[derive(Subcommand)]
@@ -73,6 +78,18 @@ impl std::error::Error for Refused {}
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
+    if let Some(file) = &cli.selftest_audio {
+        return match gui::playback::selftest(file) {
+            Ok(line) => {
+                println!("{line}");
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("sopen: {}", format!("{e:#}").replace('\n', " "));
+                ExitCode::from(EXIT_ERROR)
+            }
+        };
+    }
     let mut rec = Record::default();
     let dirs = cache::dirs();
     let result = dirs
@@ -223,6 +240,23 @@ impl Place {
             Place::Local(_) => cache::LOCAL_HOST.to_string(),
         }
     }
+
+    /// Hands the connection to a window: the file layer, how to reopen it if the session dies
+    /// while the window is open, and the host label (`None` for local files).
+    fn into_origin(self, abs: &str, at: Stat, dirs: &Dirs) -> gui::Origin {
+        match self {
+            Place::Remote(spec, fs) => {
+                let label = spec.label();
+                let state = dirs.state.clone();
+                let reconnect: gui::Reconnect = Box::new(move || {
+                    let fs = SftpRemote::connect(&spec, &state)?;
+                    Ok(Box::new(fs) as Box<dyn RemoteFs + Send>)
+                });
+                gui::Origin::new(fs, Some(reconnect), Some(label), abs.to_string(), at)
+            }
+            Place::Local(fs) => gui::Origin::new(Box::new(fs), None, None, abs.to_string(), at),
+        }
+    }
 }
 
 /// Fetches `abs` into the cache with a progress line; records size and fetch time.
@@ -278,25 +312,7 @@ fn run_open(arg: &str, app_name: Option<&str>, dirs: &Dirs, rec: &mut Record) ->
     }
     match kind {
         Kind::Directory | Kind::Text => open_in_editor(&mut place, &abs, kind, dirs, rec),
-        Kind::Image | Kind::Video | Kind::Audio => {
-            let (local, shown) = match place {
-                Place::Local(_) => (PathBuf::from(&abs), format!("file at {abs}")),
-                Place::Remote(..) => {
-                    let (local, _) = fetch_to_cache(&mut place, &abs, dirs, rec)?;
-                    let shown = format!("cached at {}", local.display());
-                    (local, shown)
-                }
-            };
-            let kind = refine_kind(&local, &abs, kind);
-            rec.kind = Some(kind);
-            match kind {
-                // A `.ts` ffprobe cannot read as media.
-                Kind::Other => println!("{}", local.display()),
-                Kind::Image => println!("image window lands in the next release — {shown}"),
-                _ => println!("media window lands in the next release — {shown}"),
-            }
-            Ok(())
-        }
+        Kind::Image | Kind::Video | Kind::Audio => open_in_window(place, &abs, kind, dirs, rec),
         Kind::Other => {
             match place {
                 Place::Local(_) => println!("{abs}"),
@@ -307,6 +323,69 @@ fn run_open(arg: &str, app_name: Option<&str>, dirs: &Dirs, rec: &mut Record) ->
             }
             Ok(())
         }
+    }
+}
+
+/// Images and media open in sopen's own window (spec §6, §7). Images are always fetched (a
+/// local one is copied into the cache: Save needs the bytes as opened); local media is played
+/// in place. Without a display (Linux over ssh) the local copy's path is printed instead.
+fn open_in_window(
+    mut place: Place,
+    abs: &str,
+    kind: Kind,
+    dirs: &Dirs,
+    rec: &mut Record,
+) -> Result<()> {
+    let hooks = gui::Hooks::from_env()?;
+    let mut notice = None;
+    let (local, at) = match (&place, kind) {
+        (Place::Local(_), Kind::Video | Kind::Audio) => {
+            let at = place.fs().stat(abs)?;
+            (PathBuf::from(abs), at)
+        }
+        _ => {
+            // A copy with unsaved edits (an earlier `--app` / editor session) is kept, not
+            // replaced by this fetch; the window repeats where it went.
+            let cached = cache::cache_path(&dirs.cache, &place.host_label(), abs);
+            if let Some(kept) = cache::set_aside_unsaved(&cached)? {
+                let text = format!(
+                    "the previous copy had unsaved edits; kept them at {}",
+                    kept.display()
+                );
+                eprintln!("sopen: {text}");
+                notice = Some(text);
+            }
+            fetch_to_cache(&mut place, abs, dirs, rec)?
+        }
+    };
+    let kind = refine_kind(&local, abs, kind);
+    rec.kind = Some(kind);
+    if kind == Kind::Other {
+        // A `.ts` ffprobe cannot read as media.
+        println!("{}", local.display());
+        return Ok(());
+    }
+    if !gui::display_available() && !hooks.autosave && !hooks.autoexport {
+        println!(
+            "no display for a window (DISPLAY / WAYLAND_DISPLAY unset); {}",
+            local.display()
+        );
+        return Ok(());
+    }
+    let origin = place.into_origin(abs, at, dirs);
+    let outcome = if kind == Kind::Image {
+        let bytes =
+            std::fs::read(&local).with_context(|| format!("cannot read {}", local.display()))?;
+        let file = gui::image::ImageFile::new(origin, bytes, &dirs.cache);
+        gui::image::open(file, &hooks, notice)?
+    } else {
+        gui::media::open(origin, &local, &dirs.cache, &hooks, notice)?
+    };
+    rec.action = Some(outcome.action());
+    rec.conflict = outcome.conflict;
+    match outcome.refused {
+        Some(message) => Err(Refused(message).into()),
+        None => Ok(()),
     }
 }
 

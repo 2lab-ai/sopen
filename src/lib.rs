@@ -9,6 +9,7 @@ pub mod app;
 pub mod cache;
 pub mod cut;
 pub mod ffmpeg;
+pub mod gui;
 pub mod kind;
 pub mod remote;
 pub mod target;

@@ -36,6 +36,24 @@ exists: a command output or a window screenshot that someone actually looked at.
 - Public repo hygiene: no machine names, IP addresses, home-directory paths or session scratch paths in
   commits, receipts or docs. Commit identity `Z <z@2lab.ai>`.
 
+## Receipts
+
+Windows are verified with test hooks — environment variables, deliberately not in the README.
+A scripted run ignores keyboard and mouse input (the owner may be typing elsewhere) and never
+prompts on close.
+
+| Hook | Effect |
+|---|---|
+| `SOPEN_STATE='rect=x,y,w,h;t=3.5;in=2;out=6;op=crop\|pixelize;block=16'` | Initial state in source pixels and seconds; `op` (images only, comma-separated, applied in order) uses `rect`. |
+| `SOPEN_SCREENSHOT=<png>` | Open the window, render the state, write a screenshot of the window, exit. Prints `screenshot <png> <w>x<h> title="<host:/abs>" focused=<bool> …`. `SOPEN_WATCHDOG=<s>` (default 30) ends a stalled run. |
+| `SOPEN_AUTOSAVE=1` | Images: apply the state and Save without a window (backup, conflict-checked overwrite); exit 0 saved, 3 refused. `SOPEN_AUTOSAVE_DELAY_MS=<ms>` waits before the write so a second process can change the remote (the conflict receipt). |
+| `SOPEN_AUTOEXPORT=1` | Media: apply the state and Export without a window; prints the new sibling's path. |
+| `SOPEN_RENDERER=wgpu\|glow` | Force a renderer (default: wgpu, glow when wgpu does not start; `WGPU_BACKEND=dx12` on macOS forces that fallback). |
+| `sopen --selftest-audio <file>` | Hidden: play the file on the real output device at gain 0 for ~2 s; prints `callbacks=N underruns=M device=<name> … decoder=ffmpeg\|wav` (a WAV is read in-process where there is no ffmpeg). |
+
+A screenshot is a receipt only after someone has looked at it. Live receipts write only under a
+remote `/tmp/sopen-receipts/` directory created for the purpose.
+
 ## Distribution (llmux shape)
 
 - `ci.yml` — every PR and main push: the gate on `macos-latest` and `ubuntu-latest`. `preview.yml` and

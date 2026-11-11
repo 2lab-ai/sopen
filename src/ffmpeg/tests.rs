@@ -223,7 +223,8 @@ fn encoders() {
 #[test]
 fn probe_json() {
     let json = r#"{"streams":[
-        {"codec_type":"video","width":640,"height":360,"disposition":{"attached_pic":0}},
+        {"codec_type":"video","width":640,"height":360,"disposition":{"attached_pic":0},
+         "avg_frame_rate":"30000/1001","r_frame_rate":"30/1"},
         {"codec_type":"audio","codec_name":"aac"}],"format":{"duration":"4.000000"}}"#;
     assert_eq!(
         parse_probe(json).unwrap(),
@@ -232,10 +233,14 @@ fn probe_json() {
             video: Some((640, 360)),
             rotation: 0,
             display: Some((640, 360)),
+            fps: Some(30000.0 / 1001.0),
             has_audio: true,
             audio_codec: Some("aac".to_string()),
         }
     );
+    let unknown_avg = r#"{"streams":[{"codec_type":"video","width":2,"height":2,
+        "avg_frame_rate":"0/0","r_frame_rate":"25/1"}],"format":{}}"#;
+    assert_eq!(parse_probe(unknown_avg).unwrap().fps, Some(25.0));
     let cover = r#"{"streams":[{"codec_type":"audio","codec_name":"mp3"},
         {"codec_type":"video","width":500,"height":500,"disposition":{"attached_pic":1}}],
         "format":{"duration":"2.5"}}"#;

@@ -24,8 +24,34 @@ Only sshd with its SFTP subsystem (the default). sopen installs and runs nothing
 a folder or text file, Zed installs its own remote server on first use — that is Zed's behaviour,
 not sopen's. Images and media are fetched over SFTP and handled locally.
 
-The image and media window is in progress; this release fetches images, video and audio to the
-local cache and prints the path.
+## Images
+
+The window shows the image fitted; the mouse wheel or a pinch zooms, a trackpad scroll or a
+right-drag pans (`F` fits again, `1` is 100 %). Drag a rectangle (handles adjust it, dragging
+inside moves it), then:
+
+| Key | |
+|---|---|
+| `C` | crop to the rectangle |
+| `P` | pixelize the rectangle (block size slider, 16 px by default) |
+| `Esc` | clear the rectangle |
+| `⌘Z` / `⇧⌘Z` (Ctrl on Linux) | undo / redo |
+| `⌘S` | Save: the original is first backed up locally (path printed), then overwritten in place in the same format (PNG, WebP, BMP, TIFF lossless; JPEG quality 95). A server without `posix-rename@openssh.com` cannot replace a file safely: Save is off there, Save copy works |
+| `⇧⌘S` | Save copy: `<name>.edited.<ext>` next to the original |
+
+Animated GIF/PNG/WebP open read-only (first frame). Closing with unsaved changes asks first.
+
+## Video and audio
+
+Video plays in the window with sound; audio shows its waveform. Click or drag the timeline to
+seek, `Space` plays/pauses, `←`/`→` step 1 s (`⇧` 5 s), `I` / `O` set In and Out. On video, drag
+a rectangle to crop. `E` exports In–Out (and the crop) as a new file next to the original,
+exactly like `sopen cut`, and shows its remote path. If no audio device can be opened the video
+plays silently and says so.
+
+On Linux the window needs a desktop session (`DISPLAY` or `WAYLAND_DISPLAY`) and the ALSA library
+(`libasound.so.2`, present on desktop installs); without a display, sopen prints the fetched copy's
+path instead.
 
 ## Any other file: `--app`
 

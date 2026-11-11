@@ -179,3 +179,130 @@ fn app_that_does_not_exist_is_one_error_line() {
     assert_eq!(err.lines().count(), 1, "{err}");
     assert!(err.contains("NoSuchAppSopenTest"), "{err}");
 }
+
+fn small_png(path: &Path) {
+    let img = image::RgbImage::from_fn(48, 32, |x, y| {
+        image::Rgb([(x * 5) as u8, (y * 7) as u8, 90])
+    });
+    img.save(path).unwrap();
+}
+
+/// Files under `dir`, recursively.
+fn files(dir: &Path) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        let p = entry.path();
+        if p.is_dir() {
+            out.extend(files(&p));
+        } else {
+            out.push(p);
+        }
+    }
+    out
+}
+
+#[test]
+fn image_autosave_backs_up_then_overwrites() {
+    let tmp = tempfile::tempdir().unwrap();
+    let png = tmp.path().join("shot.png");
+    small_png(&png);
+    let before = std::fs::read(&png).unwrap();
+    let out = sopen(
+        tmp.path(),
+        &[png.to_str().unwrap()],
+        &[
+            ("SOPEN_STATE", "rect=4,4,24,16;op=pixelize;block=8"),
+            ("SOPEN_AUTOSAVE", "1"),
+        ],
+    );
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let printed = text(&out.stdout);
+    assert!(printed.contains("backup of "), "{printed}");
+    assert!(printed.contains("saved "), "{printed}");
+    let after = std::fs::read(&png).unwrap();
+    assert_ne!(after, before);
+    let saved = image::load_from_memory(&after).unwrap();
+    assert_eq!((saved.width(), saved.height()), (48, 32));
+    let backups = files(&tmp.path().join("cache/backup"));
+    assert_eq!(backups.len(), 1, "{backups:?}");
+    assert_eq!(std::fs::read(&backups[0]).unwrap(), before);
+    let log = std::fs::read_to_string(tmp.path().join("state/usage.jsonl")).unwrap();
+    let v: serde_json::Value = serde_json::from_str(log.trim()).unwrap();
+    assert_eq!(
+        (v["kind"].as_str(), v["action"].as_str()),
+        (Some("image"), Some("save"))
+    );
+}
+
+#[test]
+fn image_autosave_refuses_a_file_changed_meanwhile() {
+    let tmp = tempfile::tempdir().unwrap();
+    let png = tmp.path().join("shot.png");
+    small_png(&png);
+    let mut child = Command::new(env!("CARGO_BIN_EXE_sopen"))
+        .arg(&png)
+        .env("SOPEN_CACHE_DIR", tmp.path().join("cache"))
+        .env("SOPEN_STATE_DIR", tmp.path().join("state"))
+        .env("SOPEN_STATE", "rect=0,0,8,8;op=crop")
+        .env("SOPEN_AUTOSAVE", "1")
+        .env("SOPEN_AUTOSAVE_DELAY_MS", "1000")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    // Change the file once sopen has opened it and is waiting to save.
+    use std::io::BufRead;
+    let mut lines = std::io::BufReader::new(child.stderr.take().unwrap()).lines();
+    let first = lines.next().unwrap().unwrap();
+    assert!(first.starts_with("waiting "), "{first}");
+    std::fs::write(&png, b"another writer").unwrap();
+    let err: String = lines.map(|l| l.unwrap() + "\n").collect();
+    let status = child.wait().unwrap();
+    assert_eq!(status.code(), Some(3), "{err}");
+    assert!(err.contains("changed since it was opened"), "{err}");
+    assert_eq!(std::fs::read(&png).unwrap(), b"another writer");
+    let kept: Vec<_> = files(&tmp.path().join("cache/edits"))
+        .into_iter()
+        .filter(|p| p.to_string_lossy().contains(".conflict-"))
+        .collect();
+    assert_eq!(kept.len(), 1, "{kept:?}");
+    assert!(err.contains(kept[0].to_str().unwrap()), "{err}");
+}
+
+#[test]
+fn media_autoexport_writes_a_sibling() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ffmpeg = std::env::var("SOPEN_FFMPEG").unwrap_or_else(|_| "ffmpeg".into());
+    let wav = tmp.path().join("talk.wav");
+    let generated = Command::new(&ffmpeg)
+        .args(["-hide_banner", "-loglevel", "error", "-nostdin", "-y"])
+        .args(["-f", "lavfi", "-i", "sine=frequency=440:duration=4"])
+        .arg(&wav)
+        .status();
+    match generated {
+        Ok(s) if s.success() => {}
+        _ if std::env::var_os("SOPEN_REQUIRE_FFMPEG").is_some() => {
+            panic!("SOPEN_REQUIRE_FFMPEG is set but ffmpeg did not run")
+        }
+        _ => {
+            eprintln!("skipping autoexport test: ffmpeg not available");
+            return;
+        }
+    }
+    let out = sopen(
+        tmp.path(),
+        &[wav.to_str().unwrap()],
+        &[("SOPEN_STATE", "in=1;out=2.5"), ("SOPEN_AUTOEXPORT", "1")],
+    );
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let printed = text(&out.stdout);
+    assert!(printed.contains("/talk.cut-1-2.5.wav"), "{printed}");
+    assert!(tmp.path().join("talk.cut-1-2.5.wav").is_file());
+    // An image op on media is a hook error, not a silent no-op.
+    let bad = sopen(
+        tmp.path(),
+        &[wav.to_str().unwrap()],
+        &[("SOPEN_STATE", "op=crop"), ("SOPEN_AUTOEXPORT", "1")],
+    );
+    assert_eq!(bad.status.code(), Some(1));
+}

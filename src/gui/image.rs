@@ -1,0 +1,1546 @@
+//! The image window (spec §6): fit/zoom/pan, a rectangle in image pixels, Crop, Pixelize,
+//! Undo/Redo, Save (backup first, conflict-checked overwrite) and Save copy (a new sibling).
+//!
+//! [`Doc`] is the edit model (decode, ops, history, encode) and [`ImageFile`] the write side;
+//! both are window-free, so the tests and the `SOPEN_AUTOSAVE` hook run the exact code the
+//! window's buttons run.
+
+use super::{Hooks, Map, Op, Origin, Outcome, Selection, Status};
+use crate::remote::WriteOutcome;
+use anyhow::{anyhow, bail, Context as _, Result};
+use eframe::egui::{self, Color32, Key, Pos2, Rect, Sense, TextureHandle, Vec2};
+use image::{
+    AnimationDecoder, DynamicImage, ImageBuffer, ImageDecoder, ImageEncoder, ImageFormat,
+    ImageReader, Pixel, Primitive,
+};
+use num_traits::ToPrimitive;
+use std::io::Cursor;
+use std::path::{Path, PathBuf};
+use std::sync::mpsc::{self, Receiver};
+use std::sync::{Arc, Mutex};
+use std::time::SystemTime;
+
+/// Default pixelize block, in image pixels.
+pub const DEFAULT_BLOCK: u32 = 16;
+/// Undo history bound: whichever of these is hit first drops the oldest step.
+const HISTORY_STEPS: usize = 32;
+const HISTORY_BYTES: usize = 1 << 30;
+
+// ---------------------------------------------------------------------------------------------
+// The edit model.
+
+pub struct Doc {
+    pub img: DynamicImage,
+    pub format: ImageFormat,
+    icc: Option<Vec<u8>>,
+    /// Exif with the orientation reset: the pixels are stored upright (orientation applied on
+    /// open), so writing the original tag back would rotate the image a second time.
+    exif: Option<Vec<u8>>,
+    /// Why the image cannot be edited or saved (animated images), if so.
+    pub read_only: Option<String>,
+    undo: Vec<DynamicImage>,
+    redo: Vec<DynamicImage>,
+    /// Bumped by every change; `saved_rev` is the revision in the original file, `copied_rev`
+    /// the one last written by Save copy.
+    rev: u64,
+    saved_rev: u64,
+    copied_rev: u64,
+}
+
+fn animated(bytes: &[u8], format: ImageFormat) -> bool {
+    match format {
+        ImageFormat::Gif => image::codecs::gif::GifDecoder::new(Cursor::new(bytes))
+            .map(|d| d.into_frames().take(2).count() > 1)
+            .unwrap_or(false),
+        ImageFormat::Png => image::codecs::png::PngDecoder::new(Cursor::new(bytes))
+            .and_then(|d| d.is_apng())
+            .unwrap_or(false),
+        ImageFormat::WebP => image::codecs::webp::WebPDecoder::new(Cursor::new(bytes))
+            .map(|d| d.has_animation())
+            .unwrap_or(false),
+        _ => false,
+    }
+}
+
+fn format_name(format: ImageFormat) -> &'static str {
+    match format {
+        ImageFormat::Png => "PNG",
+        ImageFormat::Jpeg => "JPEG",
+        ImageFormat::WebP => "WebP",
+        ImageFormat::Bmp => "BMP",
+        ImageFormat::Tiff => "TIFF",
+        ImageFormat::Gif => "GIF",
+        _ => "image",
+    }
+}
+
+impl Doc {
+    /// Decodes `bytes` (format by content, not by name), applies the Exif orientation and keeps
+    /// the ICC profile and Exif for the save.
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let reader = ImageReader::new(Cursor::new(bytes))
+            .with_guessed_format()
+            .context("cannot read the image")?;
+        let format = reader
+            .format()
+            .context("not an image format sopen can read")?;
+        if !matches!(
+            format,
+            ImageFormat::Png
+                | ImageFormat::Jpeg
+                | ImageFormat::WebP
+                | ImageFormat::Bmp
+                | ImageFormat::Tiff
+                | ImageFormat::Gif
+        ) {
+            bail!("{format:?} images are not supported");
+        }
+        let mut decoder = reader.into_decoder().context("cannot decode the image")?;
+        let icc = decoder.icc_profile().ok().flatten();
+        let mut exif = decoder.exif_metadata().ok().flatten();
+        let orientation = decoder
+            .orientation()
+            .unwrap_or(image::metadata::Orientation::NoTransforms);
+        let mut img = DynamicImage::from_decoder(decoder).context("cannot decode the image")?;
+        img.apply_orientation(orientation);
+        if let Some(chunk) = exif.as_mut() {
+            let _ = image::metadata::Orientation::remove_from_exif_chunk(chunk);
+        }
+        let read_only = animated(bytes, format).then(|| {
+            format!(
+                "animated {}, first frame shown; saving would drop the animation",
+                format_name(format)
+            )
+        });
+        Ok(Self {
+            img,
+            format,
+            icc,
+            exif,
+            read_only,
+            undo: Vec::new(),
+            redo: Vec::new(),
+            rev: 0,
+            saved_rev: 0,
+            copied_rev: 0,
+        })
+    }
+
+    pub fn size(&self) -> (u32, u32) {
+        (self.img.width(), self.img.height())
+    }
+
+    /// The state differs from the original file (what Save would write).
+    pub fn dirty(&self) -> bool {
+        self.rev != self.saved_rev
+    }
+
+    /// The state is written nowhere — neither the original nor a Save copy (the close prompt).
+    pub fn unsaved(&self) -> bool {
+        self.dirty() && self.rev != self.copied_rev
+    }
+
+    pub fn mark_copied(&mut self, rev: u64) {
+        self.copied_rev = rev;
+    }
+
+    pub fn rev(&self) -> u64 {
+        self.rev
+    }
+
+    pub fn mark_saved(&mut self, rev: u64) {
+        self.saved_rev = rev;
+    }
+
+    pub fn can_undo(&self) -> bool {
+        !self.undo.is_empty()
+    }
+
+    pub fn can_redo(&self) -> bool {
+        !self.redo.is_empty()
+    }
+
+    fn editable(&self) -> Result<()> {
+        match &self.read_only {
+            Some(reason) => bail!("read-only — {reason}"),
+            None => Ok(()),
+        }
+    }
+
+    fn check_rect(&self, [x, y, w, h]: [u32; 4]) -> Result<()> {
+        let (iw, ih) = self.size();
+        if w == 0 || h == 0 || x.saturating_add(w) > iw || y.saturating_add(h) > ih {
+            bail!("rectangle {x},{y} {w}×{h} is outside the {iw}×{ih} image");
+        }
+        Ok(())
+    }
+
+    fn commit(&mut self, next: DynamicImage) {
+        let prev = std::mem::replace(&mut self.img, next);
+        self.undo.push(prev);
+        self.redo.clear();
+        let mut bytes: usize = self.undo.iter().map(|i| i.as_bytes().len()).sum();
+        while self.undo.len() > HISTORY_STEPS || (bytes > HISTORY_BYTES && self.undo.len() > 1) {
+            bytes -= self.undo.remove(0).as_bytes().len();
+        }
+        self.rev += 1;
+    }
+
+    pub fn crop(&mut self, rect: [u32; 4]) -> Result<String> {
+        self.editable()?;
+        self.check_rect(rect)?;
+        let [x, y, w, h] = rect;
+        let next = self.img.crop_imm(x, y, w, h);
+        self.commit(next);
+        Ok(format!("cropped to {w}×{h}"))
+    }
+
+    pub fn pixelize(&mut self, rect: [u32; 4], block: u32) -> Result<String> {
+        self.editable()?;
+        self.check_rect(rect)?;
+        let mut next = self.img.clone();
+        pixelize(&mut next, rect, block);
+        self.commit(next);
+        Ok(format!(
+            "pixelized {}×{} with {}px blocks",
+            rect[2],
+            rect[3],
+            block.max(1)
+        ))
+    }
+
+    pub fn undo(&mut self) -> bool {
+        let Some(prev) = self.undo.pop() else {
+            return false;
+        };
+        self.redo.push(std::mem::replace(&mut self.img, prev));
+        self.rev += 1;
+        true
+    }
+
+    pub fn redo(&mut self) -> bool {
+        let Some(next) = self.redo.pop() else {
+            return false;
+        };
+        self.undo.push(std::mem::replace(&mut self.img, next));
+        self.rev += 1;
+        true
+    }
+
+    /// The current image encoded like the original: same format, PNG/WebP/BMP/TIFF lossless,
+    /// JPEG quality 95, ICC profile and Exif kept where the format carries them.
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        self.editable()?;
+        encode(&self.img, self.format, self.icc.clone(), self.exif.clone())
+    }
+}
+
+/// The pixels converted to what `format`'s encoder accepts, keeping bit depth and alpha where
+/// the format can hold them.
+fn encodable(img: &DynamicImage, format: ImageFormat) -> DynamicImage {
+    use image::ColorType as C;
+    let color = img.color();
+    let gray = matches!(color, C::L8 | C::L16 | C::La8 | C::La16);
+    let alpha = color.has_alpha();
+    match format {
+        ImageFormat::Jpeg if gray => DynamicImage::ImageLuma8(img.to_luma8()),
+        ImageFormat::Jpeg => DynamicImage::ImageRgb8(img.to_rgb8()),
+        ImageFormat::Png => match color {
+            C::Rgb32F => DynamicImage::ImageRgb16(img.to_rgb16()),
+            C::Rgba32F => DynamicImage::ImageRgba16(img.to_rgba16()),
+            _ => img.clone(),
+        },
+        ImageFormat::Tiff => match color {
+            C::La8 => DynamicImage::ImageRgba8(img.to_rgba8()),
+            C::La16 => DynamicImage::ImageRgba16(img.to_rgba16()),
+            _ => img.clone(),
+        },
+        ImageFormat::Bmp => match (gray, alpha) {
+            (true, false) => DynamicImage::ImageLuma8(img.to_luma8()),
+            (true, true) => DynamicImage::ImageLumaA8(img.to_luma_alpha8()),
+            (false, false) => DynamicImage::ImageRgb8(img.to_rgb8()),
+            (false, true) => DynamicImage::ImageRgba8(img.to_rgba8()),
+        },
+        ImageFormat::WebP if alpha => DynamicImage::ImageRgba8(img.to_rgba8()),
+        ImageFormat::WebP => DynamicImage::ImageRgb8(img.to_rgb8()),
+        _ => DynamicImage::ImageRgba8(img.to_rgba8()),
+    }
+}
+
+pub fn encode(
+    img: &DynamicImage,
+    format: ImageFormat,
+    icc: Option<Vec<u8>>,
+    exif: Option<Vec<u8>>,
+) -> Result<Vec<u8>> {
+    use image::codecs::{bmp, gif, jpeg, png, tiff, webp};
+    fn with_meta(
+        mut enc: impl ImageEncoder,
+        img: &DynamicImage,
+        icc: Option<Vec<u8>>,
+        exif: Option<Vec<u8>>,
+    ) -> image::ImageResult<()> {
+        // A format that cannot carry the profile or the Exif simply drops it.
+        if let Some(icc) = icc {
+            let _ = enc.set_icc_profile(icc);
+        }
+        if let Some(exif) = exif {
+            let _ = enc.set_exif_metadata(exif);
+        }
+        img.write_with_encoder(enc)
+    }
+    let img = encodable(img, format);
+    let mut out = Vec::new();
+    let written = match format {
+        ImageFormat::Png => with_meta(png::PngEncoder::new(&mut out), &img, icc, exif),
+        ImageFormat::Jpeg => with_meta(
+            jpeg::JpegEncoder::new_with_quality(&mut out, 95),
+            &img,
+            icc,
+            exif,
+        ),
+        ImageFormat::WebP => with_meta(webp::WebPEncoder::new_lossless(&mut out), &img, icc, exif),
+        ImageFormat::Bmp => with_meta(bmp::BmpEncoder::new(&mut out), &img, icc, exif),
+        ImageFormat::Tiff => {
+            let mut cursor = Cursor::new(Vec::new());
+            with_meta(tiff::TiffEncoder::new(&mut cursor), &img, icc, exif)
+                .map(|()| out = cursor.into_inner())
+        }
+        // GIF holds 256 colours per frame: pixelized areas are quantised by the encoder.
+        ImageFormat::Gif => {
+            gif::GifEncoder::new(&mut out).encode_frame(image::Frame::new(img.to_rgba8()))
+        }
+        other => return Err(anyhow!("cannot save {other:?} images")),
+    };
+    written.with_context(|| format!("cannot encode the {}", format_name(format)))?;
+    Ok(out)
+}
+
+/// Replaces every `block`×`block` cell of `rect` with its mean colour (cells at the right and
+/// bottom edges are clipped to the rectangle). Works on the image's own pixel type, so 16-bit
+/// and float images keep their precision.
+pub fn pixelize(img: &mut DynamicImage, rect: [u32; 4], block: u32) {
+    macro_rules! each {
+        ($($variant:ident),*) => {
+            match img {
+                $(DynamicImage::$variant(buf) => pixelize_buf(buf, rect, block),)*
+                other => {
+                    let mut rgba = other.to_rgba8();
+                    pixelize_buf(&mut rgba, rect, block);
+                    *other = DynamicImage::ImageRgba8(rgba);
+                }
+            }
+        };
+    }
+    each!(
+        ImageLuma8,
+        ImageLumaA8,
+        ImageRgb8,
+        ImageRgba8,
+        ImageLuma16,
+        ImageLumaA16,
+        ImageRgb16,
+        ImageRgba16,
+        ImageRgb32F,
+        ImageRgba32F
+    );
+}
+
+fn pixelize_buf<P: Pixel>(buf: &mut ImageBuffer<P, Vec<P::Subpixel>>, rect: [u32; 4], block: u32) {
+    let [x0, y0, w, h] = rect;
+    let (x1, y1) = (
+        x0.saturating_add(w).min(buf.width()),
+        y0.saturating_add(h).min(buf.height()),
+    );
+    let b = block.max(1);
+    let channels = usize::from(P::CHANNEL_COUNT);
+    let integer = P::Subpixel::DEFAULT_MAX_VALUE.to_f64().unwrap_or(1.0) > 1.0;
+    let mut sum = vec![0f64; channels];
+    let mut by = y0;
+    while by < y1 {
+        let bh = b.min(y1 - by);
+        let mut bx = x0;
+        while bx < x1 {
+            let bw = b.min(x1 - bx);
+            sum.iter_mut().for_each(|s| *s = 0.0);
+            for y in by..by + bh {
+                for x in bx..bx + bw {
+                    for (s, c) in sum.iter_mut().zip(buf.get_pixel(x, y).channels()) {
+                        *s += c.to_f64().unwrap_or(0.0);
+                    }
+                }
+            }
+            let n = f64::from(bw * bh);
+            let mean: Vec<P::Subpixel> = sum
+                .iter()
+                .map(|s| {
+                    let v = if integer { (s / n).round() } else { s / n };
+                    num_traits::NumCast::from(v).unwrap_or(P::Subpixel::DEFAULT_MIN_VALUE)
+                })
+                .collect();
+            let cell = *P::from_slice(&mean);
+            for y in by..by + bh {
+                for x in bx..bx + bw {
+                    buf.put_pixel(x, y, cell);
+                }
+            }
+            bx += bw;
+        }
+        by += bh;
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// The write side.
+
+/// The opened image file: where it lives, its bytes as opened (for the backup) and the local
+/// places sopen writes to.
+pub struct ImageFile {
+    pub origin: Origin,
+    /// The bytes as opened — what the backup holds. Kept in memory: a later fetch of the same
+    /// file can replace the cached copy while this window is open.
+    original: Arc<Vec<u8>>,
+    /// Encoded edits waiting to be uploaded, and refused ones: `<cache>/edits/<host>/<abs>`.
+    edits: PathBuf,
+    /// `<cache>` (backups go to `<cache>/backup/<host>/<abs>.<stamp>`).
+    cache_root: PathBuf,
+    /// Set by the first successful backup; later saves of the same session keep it.
+    backup: Option<PathBuf>,
+}
+
+/// Result of one Save.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Saved {
+    /// `notes`: what the owner must still hear (e.g. the remote changed right after the save).
+    Written {
+        remote: String,
+        backup: PathBuf,
+        notes: Vec<String>,
+    },
+    /// The remote changed since it was fetched; nothing was written.
+    Refused { message: String, kept: PathBuf },
+}
+
+/// Why Save cannot replace the file on this server (spec §5): Save copy still works.
+pub const CANNOT_REPLACE: &str = "this server cannot replace a file in one step (no \
+     posix-rename@openssh.com) — Save copy writes the edit next to the original instead";
+
+/// The one line for a write that failed, keeping the edit. A request that got no reply is
+/// "outcome unknown — check <path>", never "not saved".
+fn failed(e: &anyhow::Error, staged: &Path) -> anyhow::Error {
+    match crate::remote::outcome_unknown(e) {
+        Some(unknown) => anyhow!(
+            "{unknown}; your edit is at {} (cause: {})",
+            staged.display(),
+            e.root_cause()
+        ),
+        None => anyhow!("{e:#}; not saved — your edit is at {}", staged.display()),
+    }
+}
+
+impl ImageFile {
+    pub fn new(origin: Origin, original: Vec<u8>, cache_root: &Path) -> Self {
+        let edits = crate::cache::cache_path(&cache_root.join("edits"), origin.host(), &origin.abs);
+        Self {
+            origin,
+            original: Arc::new(original),
+            edits,
+            cache_root: cache_root.to_path_buf(),
+            backup: None,
+        }
+    }
+
+    pub fn original(&self) -> &[u8] {
+        &self.original
+    }
+
+    /// Whether Save can replace the original here (Save copy always can).
+    pub fn can_replace(&self) -> bool {
+        self.origin.can_replace()
+    }
+
+    fn stage(&self, encoded: &[u8], tag: &str) -> Result<PathBuf> {
+        let path = super::keep_path(&self.edits, tag, SystemTime::now());
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)
+                .with_context(|| format!("cannot create {}", dir.display()))?;
+        }
+        std::fs::write(&path, encoded)
+            .with_context(|| format!("cannot write {}", path.display()))?;
+        Ok(path)
+    }
+
+    /// The local backup of the original, written once per session before the first overwrite.
+    fn ensure_backup(&mut self) -> Result<PathBuf> {
+        if let Some(path) = &self.backup {
+            return Ok(path.clone());
+        }
+        let path = crate::cache::backup_path(
+            &self.cache_root,
+            self.origin.host(),
+            &self.origin.abs,
+            SystemTime::now(),
+        );
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)
+                .with_context(|| format!("cannot create {}", dir.display()))?;
+        }
+        std::fs::write(&path, self.original.as_slice())
+            .with_context(|| format!("cannot write the backup {}", path.display()))?;
+        println!("backup of {} at {}", self.origin.display(), path.display());
+        self.backup = Some(path.clone());
+        Ok(path)
+    }
+
+    /// Save (spec §5): backup first, then the conflict-checked overwrite. On a refusal the
+    /// edit stays in a local file whose path the message names. Transport errors also keep it.
+    /// A server that cannot replace a file in one step is refused before anything is written.
+    pub fn save(&mut self, encoded: &[u8]) -> Result<Saved> {
+        if !self.can_replace() {
+            bail!(
+                "{} was not touched: {CANNOT_REPLACE}",
+                self.origin.display()
+            );
+        }
+        let staged = self.stage(encoded, "edited")?;
+        let result = (|| -> Result<Saved> {
+            let backup = self.ensure_backup()?;
+            let at = self.origin.at;
+            let abs = self.origin.abs.clone();
+            match self
+                .origin
+                .fs()?
+                .write_atomic(&staged, &abs, at.fingerprint())?
+            {
+                WriteOutcome::Written { now, notes } => {
+                    self.origin.at = now;
+                    let _ = std::fs::remove_file(&staged);
+                    Ok(Saved::Written {
+                        remote: self.origin.display(),
+                        backup,
+                        notes,
+                    })
+                }
+                WriteOutcome::Conflict { reason, notes, .. } => {
+                    let kept = super::keep_path(&self.edits, "conflict", SystemTime::now());
+                    std::fs::rename(&staged, &kept).with_context(|| {
+                        format!("cannot keep the edited copy at {}", kept.display())
+                    })?;
+                    let mut message = format!(
+                        "{} changed since it was opened ({reason}); not saved — your edit is at {}",
+                        self.origin.display(),
+                        kept.display()
+                    );
+                    for note in notes {
+                        message.push_str(&format!("; {note}"));
+                    }
+                    Ok(Saved::Refused { message, kept })
+                }
+            }
+        })();
+        result.map_err(|e| failed(&e, &staged))
+    }
+
+    /// Save copy: `<stem>.edited.<ext>` next to the original (`-N` when taken). Returns the
+    /// printed path of the new file.
+    pub fn save_copy(&mut self, encoded: &[u8]) -> Result<String> {
+        let staged = self.stage(encoded, "copy")?;
+        let (dir, name) = self.origin.parent();
+        let wanted = match name.rfind('.') {
+            Some(i) if i > 0 => format!("{}.edited{}", &name[..i], &name[i..]),
+            _ => format!("{name}.edited"),
+        };
+        let result = self
+            .origin
+            .fs()
+            .and_then(|fs| fs.write_new_sibling(&staged, &dir, &wanted));
+        match result {
+            Ok(final_name) => {
+                let _ = std::fs::remove_file(&staged);
+                Ok(self.origin.show(&crate::remote::join(&dir, &final_name)))
+            }
+            Err(e) => Err(failed(&e, &staged)),
+        }
+    }
+}
+
+fn apply_state(doc: &mut Doc, sel: &mut Selection, block: &mut u32, hooks: &Hooks) -> Result<()> {
+    let state = &hooks.state;
+    if let Some(b) = state.block {
+        *block = b.max(1);
+    }
+    if let Some(r) = state.rect {
+        sel.set(r);
+    }
+    for op in &state.ops {
+        let (w, h) = doc.size();
+        let rect = sel
+            .pixels(Vec2::new(w as f32, h as f32))
+            .context("SOPEN_STATE op needs a rect inside the image")?;
+        match op {
+            Op::Crop => {
+                doc.crop(rect)?;
+                sel.clear();
+            }
+            Op::Pixelize => {
+                doc.pixelize(rect, *block)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Opens the image: the window, or the windowless `SOPEN_AUTOSAVE` run.
+/// `notice` is shown in the status line on open (an earlier copy with unsaved edits was kept).
+pub fn open(file: ImageFile, hooks: &Hooks, notice: Option<String>) -> Result<Outcome> {
+    let mut doc = Doc::decode(file.original())?;
+    let mut sel = Selection::default();
+    let mut block = DEFAULT_BLOCK;
+    apply_state(&mut doc, &mut sel, &mut block, hooks)?;
+    if hooks.autosave {
+        return autosave(file, &doc, hooks);
+    }
+    let title = file.origin.display();
+    let outcome = Arc::new(Mutex::new(Outcome::default()));
+    let (w, h) = doc.size();
+    let can_replace = file.can_replace();
+    let status = match (notice, can_replace) {
+        (Some(text), _) => Status::error(text),
+        (None, false) => Status::error(CANNOT_REPLACE),
+        (None, true) => Status::default(),
+    };
+    let window = ImageWindow {
+        title: title.clone(),
+        can_replace,
+        doc,
+        file: Arc::new(Mutex::new(file)),
+        tex: None,
+        tex_rev: None,
+        sel,
+        block,
+        view: View::default(),
+        status,
+        job: None,
+        outcome: outcome.clone(),
+        prompt: false,
+        close_ok: false,
+        painted: false,
+        zoom: 1.0,
+    };
+    // A window that shows the image near 1:1 where the screen allows; eframe clamps to it.
+    let size = [
+        (w as f32).clamp(640.0, 1400.0),
+        (h as f32 + 90.0).clamp(420.0, 940.0),
+    ];
+    super::run_window(&title, size, window, hooks)?;
+    let outcome = outcome.lock().unwrap().clone();
+    Ok(outcome)
+}
+
+fn autosave(mut file: ImageFile, doc: &Doc, hooks: &Hooks) -> Result<Outcome> {
+    let encoded = doc.encode()?;
+    if let Some(delay) = hooks.save_delay {
+        eprintln!("waiting {} ms before saving", delay.as_millis());
+        std::thread::sleep(delay);
+    }
+    let mut outcome = Outcome::default();
+    match file.save(&encoded)? {
+        Saved::Written { remote, notes, .. } => {
+            outcome.saved = true;
+            let (w, h) = doc.size();
+            println!("saved {remote} ({w}×{h} {})", format_name(doc.format));
+            for note in notes {
+                eprintln!("sopen: {note}");
+            }
+        }
+        Saved::Refused { message, .. } => {
+            outcome.conflict = true;
+            outcome.refused = Some(message);
+        }
+    }
+    Ok(outcome)
+}
+
+// ---------------------------------------------------------------------------------------------
+// The window.
+
+/// `scale` = screen points per image pixel (`None` = fit); `center` = the image point at the
+/// centre of the view.
+#[derive(Debug, Clone, Copy, Default)]
+struct View {
+    scale: Option<f32>,
+    center: Option<Pos2>,
+}
+
+enum JobKind {
+    Save { close_after: bool },
+    SaveCopy { close_after: bool },
+}
+
+struct Job {
+    kind: JobKind,
+    rev: u64,
+    rx: Receiver<Result<JobDone>>,
+}
+
+enum JobDone {
+    Saved(Saved),
+    Copy(String),
+}
+
+struct ImageWindow {
+    /// `host:/abs` (the file is locked by a running save; the title is not).
+    title: String,
+    /// False on a server without `posix-rename@openssh.com`: Save is off, Save copy works.
+    can_replace: bool,
+    doc: Doc,
+    file: Arc<Mutex<ImageFile>>,
+    tex: Option<TextureHandle>,
+    tex_rev: Option<u64>,
+    sel: Selection,
+    block: u32,
+    view: View,
+    status: Status,
+    job: Option<Job>,
+    outcome: Arc<Mutex<Outcome>>,
+    prompt: bool,
+    close_ok: bool,
+    painted: bool,
+    /// Device pixels per image pixel, for the status bar.
+    zoom: f32,
+}
+
+impl ImageWindow {
+    fn bounds(&self) -> Vec2 {
+        let (w, h) = self.doc.size();
+        Vec2::new(w as f32, h as f32)
+    }
+
+    fn rect(&self) -> Option<[u32; 4]> {
+        self.sel.pixels(self.bounds())
+    }
+
+    fn report(&mut self, result: Result<String>) {
+        self.status = match result {
+            Ok(text) => Status::info(text),
+            Err(e) => Status::error(format!("{e:#}")),
+        };
+    }
+
+    fn crop(&mut self) {
+        let Some(rect) = self.rect() else {
+            return self.status = Status::error("draw a rectangle first");
+        };
+        let done = self.doc.crop(rect);
+        if done.is_ok() {
+            self.sel.clear();
+            self.view = View::default();
+        }
+        self.report(done);
+    }
+
+    fn pixelize(&mut self) {
+        let Some(rect) = self.rect() else {
+            return self.status = Status::error("draw a rectangle first");
+        };
+        let done = self.doc.pixelize(rect, self.block);
+        self.report(done);
+    }
+
+    fn undo(&mut self) {
+        if self.doc.undo() {
+            self.status = Status::info("undone");
+        }
+    }
+
+    fn redo(&mut self) {
+        if self.doc.redo() {
+            self.status = Status::info("redone");
+        }
+    }
+
+    fn start(&mut self, ctx: &egui::Context, kind: JobKind) {
+        if self.job.is_some() {
+            return;
+        }
+        if let Some(reason) = &self.doc.read_only {
+            return self.status = Status::error(format!("cannot save: {reason}"));
+        }
+        if matches!(kind, JobKind::Save { .. }) {
+            if !self.can_replace {
+                return self.status = Status::error(CANNOT_REPLACE);
+            }
+            if !self.doc.dirty() {
+                return self.status = Status::info("no changes to save");
+            }
+        }
+        let (img, format) = (self.doc.img.clone(), self.doc.format);
+        let (icc, exif) = (self.doc.icc.clone(), self.doc.exif.clone());
+        let file = self.file.clone();
+        let copy = matches!(kind, JobKind::SaveCopy { .. });
+        let (tx, rx) = mpsc::channel();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let result = encode(&img, format, icc, exif).and_then(|bytes| {
+                let mut file = file.lock().unwrap();
+                if copy {
+                    file.save_copy(&bytes).map(JobDone::Copy)
+                } else {
+                    file.save(&bytes).map(JobDone::Saved)
+                }
+            });
+            let _ = tx.send(result);
+            ctx.request_repaint();
+        });
+        self.status = Status::info(if copy {
+            "saving a copy…"
+        } else {
+            "saving…"
+        });
+        self.job = Some(Job {
+            kind,
+            rev: self.doc.rev(),
+            rx,
+        });
+    }
+
+    fn poll_job(&mut self, ctx: &egui::Context) {
+        let Some(job) = &self.job else {
+            return;
+        };
+        let Ok(result) = job.rx.try_recv() else {
+            return;
+        };
+        let job = self.job.take().expect("checked above");
+        let mut outcome = self.outcome.lock().unwrap();
+        match result {
+            Ok(JobDone::Saved(Saved::Written {
+                remote,
+                backup,
+                notes,
+            })) => {
+                self.doc.mark_saved(job.rev);
+                outcome.saved = true;
+                outcome.refused = None;
+                println!("saved {remote}");
+                for note in &notes {
+                    eprintln!("sopen: {note}");
+                }
+                self.status = if notes.is_empty() {
+                    Status::info(format!(
+                        "saved {remote} · original backed up at {}",
+                        backup.display()
+                    ))
+                } else {
+                    // The owner has to see these (e.g. the remote changed right after).
+                    Status::error(format!("saved {remote} — {}", notes.join("; ")))
+                };
+                if matches!(job.kind, JobKind::Save { close_after: true }) && notes.is_empty() {
+                    self.close_ok = true;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+            }
+            Ok(JobDone::Saved(Saved::Refused { message, .. })) => {
+                outcome.conflict = true;
+                outcome.refused = Some(message.clone());
+                eprintln!("sopen: {message}");
+                self.status = Status::error(message);
+            }
+            Ok(JobDone::Copy(path)) => {
+                self.doc.mark_copied(job.rev);
+                println!("saved a copy at {path}");
+                self.status = Status::info(format!("saved a copy at {path}"));
+                if matches!(job.kind, JobKind::SaveCopy { close_after: true }) {
+                    self.close_ok = true;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+            }
+            Err(e) => {
+                eprintln!("sopen: {e:#}");
+                self.status = Status::error(format!("{e:#}"));
+            }
+        }
+    }
+
+    fn keys(&mut self, ctx: &egui::Context) {
+        use super::{command_key, plain_key};
+        if self.prompt {
+            return;
+        }
+        if command_key(ctx, Key::Z, true) {
+            self.redo();
+        } else if command_key(ctx, Key::Z, false) {
+            self.undo();
+        }
+        if command_key(ctx, Key::S, true) {
+            self.start(ctx, JobKind::SaveCopy { close_after: false });
+        } else if command_key(ctx, Key::S, false) {
+            self.start(ctx, JobKind::Save { close_after: false });
+        }
+        if plain_key(ctx, Key::C) {
+            self.crop();
+        }
+        if plain_key(ctx, Key::P) {
+            self.pixelize();
+        }
+        if plain_key(ctx, Key::Escape) {
+            self.sel.clear();
+        }
+        if plain_key(ctx, Key::F) {
+            self.view = View::default();
+        }
+        if plain_key(ctx, Key::Num1) {
+            self.view.scale = Some(1.0 / ctx.pixels_per_point());
+        }
+    }
+
+    fn toolbar(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
+        let editable = self.doc.read_only.is_none();
+        let has_rect = self.rect().is_some();
+        let busy = self.job.is_some();
+        ui.horizontal(|ui| {
+            let why = "draw a rectangle on the image first";
+            if ui
+                .add_enabled(editable && has_rect, egui::Button::new("Crop  C"))
+                .on_disabled_hover_text(why)
+                .clicked()
+            {
+                self.crop();
+            }
+            if ui
+                .add_enabled(editable && has_rect, egui::Button::new("Pixelize  P"))
+                .on_disabled_hover_text(why)
+                .clicked()
+            {
+                self.pixelize();
+            }
+            ui.add_enabled(
+                editable,
+                egui::Slider::new(&mut self.block, 2..=128)
+                    .text("block px")
+                    .logarithmic(true),
+            );
+            ui.separator();
+            if ui
+                .add_enabled(self.doc.can_undo(), egui::Button::new("Undo"))
+                .on_hover_text("⌘/Ctrl+Z")
+                .clicked()
+            {
+                self.undo();
+            }
+            if ui
+                .add_enabled(self.doc.can_redo(), egui::Button::new("Redo"))
+                .on_hover_text("⇧⌘/Shift+Ctrl+Z")
+                .clicked()
+            {
+                self.redo();
+            }
+            ui.separator();
+            let reason = self.doc.read_only.clone().unwrap_or_default();
+            let save = ui
+                .add_enabled(
+                    editable && !busy && self.doc.dirty() && self.can_replace,
+                    egui::Button::new("Save"),
+                )
+                .on_hover_text("⌘/Ctrl+S — overwrites the original after a local backup")
+                .on_disabled_hover_text(if !reason.is_empty() {
+                    &reason
+                } else if !self.can_replace {
+                    CANNOT_REPLACE
+                } else {
+                    "no changes to save"
+                });
+            if save.clicked() {
+                self.start(&ctx, JobKind::Save { close_after: false });
+            }
+            let copy = ui
+                .add_enabled(editable && !busy, egui::Button::new("Save copy"))
+                .on_hover_text("⇧⌘/Shift+Ctrl+S — a new <name>.edited file next to the original")
+                .on_disabled_hover_text(&reason);
+            if copy.clicked() {
+                self.start(&ctx, JobKind::SaveCopy { close_after: false });
+            }
+            if busy {
+                ui.spinner();
+            }
+        });
+    }
+
+    /// `zoom` is the previous pass's (the image is laid out after the bar).
+    fn status_bar(&mut self, ui: &mut egui::Ui) {
+        let zoom = self.zoom;
+        let (w, h) = self.doc.size();
+        ui.horizontal(|ui| {
+            ui.monospace(format!(
+                "{w}×{h} {} · {:.0}%",
+                format_name(self.doc.format),
+                zoom * 100.0
+            ));
+            if let Some([x, y, rw, rh]) = self.rect() {
+                ui.separator();
+                ui.monospace(format!("rect {x},{y} {rw}×{rh}"));
+            }
+            if self.doc.unsaved() {
+                ui.separator();
+                ui.label("unsaved changes");
+            }
+            if let Some(reason) = &self.doc.read_only {
+                ui.separator();
+                ui.colored_label(ui.visuals().warn_fg_color, format!("read-only: {reason}"));
+            }
+            ui.separator();
+            self.status.show(ui);
+        });
+    }
+
+    fn texture(&mut self, ctx: &egui::Context) -> egui::TextureId {
+        if self.tex_rev != Some(self.doc.rev()) || self.tex.is_none() {
+            let max = ctx.input(|i| i.max_texture_side) as u32;
+            let (w, h) = self.doc.size();
+            // A picture bigger than the GPU's texture limit is shown downscaled; edits still
+            // address the full-resolution pixels.
+            let shown = if w > max || h > max {
+                self.doc.img.thumbnail(max, max).to_rgba8()
+            } else {
+                self.doc.img.to_rgba8()
+            };
+            let ci = egui::ColorImage::from_rgba_unmultiplied(
+                [shown.width() as usize, shown.height() as usize],
+                shown.as_raw(),
+            );
+            let options = egui::TextureOptions {
+                magnification: egui::TextureFilter::Nearest,
+                ..egui::TextureOptions::LINEAR
+            };
+            match &mut self.tex {
+                Some(tex) => tex.set(ci, options),
+                None => self.tex = Some(ctx.load_texture("image", ci, options)),
+            }
+            self.tex_rev = Some(self.doc.rev());
+        }
+        self.tex.as_ref().expect("just set").id()
+    }
+
+    /// Wheel (mouse) and pinch zoom about the pointer; trackpad scroll and secondary/middle
+    /// drag pan.
+    fn navigate(&mut self, ui: &egui::Ui, resp: &egui::Response, panel: Rect, fit_scale: f32) {
+        let src = self.bounds();
+        let mut scale = self.view.scale.unwrap_or(fit_scale);
+        let mut center = self.view.center.unwrap_or((src / 2.0).to_pos2());
+        let (mut zoom, mut pan) = (1.0f32, Vec2::ZERO);
+        if resp.hovered() {
+            ui.input(|i| {
+                zoom *= i.zoom_delta();
+                for event in &i.events {
+                    if let egui::Event::MouseWheel {
+                        unit,
+                        delta,
+                        modifiers,
+                        ..
+                    } = event
+                    {
+                        if modifiers.command || modifiers.ctrl {
+                            continue; // already in zoom_delta
+                        }
+                        match unit {
+                            egui::MouseWheelUnit::Point => pan += *delta,
+                            _ => zoom *= 1.15f32.powf(delta.y),
+                        }
+                    }
+                }
+            });
+        }
+        if resp.dragged_by(egui::PointerButton::Secondary)
+            || resp.dragged_by(egui::PointerButton::Middle)
+        {
+            pan += resp.drag_delta();
+        }
+        if zoom != 1.0 {
+            let next = (scale * zoom).clamp(fit_scale.min(0.05), 64.0);
+            if let Some(p) = resp.hover_pos() {
+                // Keep the image point under the pointer where it is.
+                let under = center + (p - panel.center()) / scale;
+                center = under - (p - panel.center()) / next;
+            }
+            scale = next;
+            self.view.scale = Some(scale);
+            self.view.center = Some(center);
+        }
+        if pan != Vec2::ZERO && self.view.scale.is_some() {
+            self.view.center = Some(center - pan / scale);
+        }
+    }
+
+    fn central(&mut self, ui: &mut egui::Ui) -> f32 {
+        let ctx = ui.ctx().clone();
+        let panel = ui.max_rect();
+        let src = self.bounds();
+        let fit_scale = (panel.width() / src.x).min(panel.height() / src.y);
+        let resp = ui.allocate_rect(panel, Sense::click_and_drag());
+        self.navigate(ui, &resp, panel, fit_scale);
+        let scale = self.view.scale.unwrap_or(fit_scale);
+        let center = self.view.center.unwrap_or((src / 2.0).to_pos2());
+        let disp = Rect::from_min_size(panel.center() - center.to_vec2() * scale, src * scale);
+        let map = Map { disp, src };
+        let tex = self.texture(&ctx);
+        let painter = ui.painter_at(panel);
+        painter.rect_filled(panel, 0.0, Color32::from_gray(28));
+        painter.image(
+            tex,
+            disp,
+            Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+            Color32::WHITE,
+        );
+        if self.doc.read_only.is_none() && !self.prompt {
+            self.sel.handle(ui, &resp, map);
+        }
+        self.sel.draw(&painter, map);
+        self.painted = true;
+        scale * ctx.pixels_per_point()
+    }
+
+    fn close_prompt(&mut self, ctx: &egui::Context) {
+        if !self.prompt {
+            return;
+        }
+        let modal = egui::Modal::new(egui::Id::unique("unsaved")).show(ctx, |ui| {
+            ui.set_width(360.0);
+            ui.heading("Unsaved changes");
+            ui.label(format!(
+                "Save the changes to {} before closing?",
+                self.title
+            ));
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                if self.can_replace && ui.button("Save").clicked() {
+                    self.prompt = false;
+                    self.start(ctx, JobKind::Save { close_after: true });
+                }
+                if !self.can_replace && ui.button("Save copy").clicked() {
+                    self.prompt = false;
+                    self.start(ctx, JobKind::SaveCopy { close_after: true });
+                }
+                if ui.button("Discard").clicked() {
+                    self.prompt = false;
+                    self.close_ok = true;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+                if ui.button("Cancel").clicked() {
+                    self.prompt = false;
+                }
+            });
+        });
+        if modal.should_close() {
+            self.prompt = false;
+        }
+    }
+}
+
+impl super::Window for ImageWindow {
+    fn ui(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
+        self.poll_job(&ctx);
+        self.keys(&ctx);
+        egui::Panel::top("tools").show(ui, |ui| {
+            ui.add_space(3.0);
+            self.toolbar(ui);
+            ui.add_space(1.0);
+        });
+        egui::Panel::bottom("status").show(ui, |ui| {
+            ui.add_space(2.0);
+            self.status_bar(ui);
+            ui.add_space(2.0);
+        });
+        egui::CentralPanel::default()
+            .frame(egui::Frame::NONE)
+            .show(ui, |ui| self.zoom = self.central(ui));
+        self.close_prompt(&ctx);
+    }
+
+    fn ready(&self) -> bool {
+        self.painted && self.job.is_none()
+    }
+
+    fn close_requested(&mut self) -> bool {
+        if self.close_ok || !self.doc.unsaved() {
+            return true;
+        }
+        if self.job.is_none() {
+            self.prompt = true;
+        }
+        false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::remote::{LocalFs, RemoteFs};
+    use image::{GenericImageView, Rgb, Rgba};
+
+    fn gradient(w: u32, h: u32) -> DynamicImage {
+        DynamicImage::ImageRgba8(ImageBuffer::from_fn(w, h, |x, y| {
+            Rgba([(x * 7) as u8, (y * 5) as u8, ((x + y) * 3) as u8, 255])
+        }))
+    }
+
+    fn png_bytes(img: &DynamicImage) -> Vec<u8> {
+        encode(img, ImageFormat::Png, None, None).unwrap()
+    }
+
+    #[test]
+    fn crop_keeps_the_selected_pixels() {
+        let img = gradient(40, 30);
+        let mut doc = Doc::decode(&png_bytes(&img)).unwrap();
+        assert_eq!(doc.crop([5, 7, 21, 11]).unwrap(), "cropped to 21×11");
+        assert_eq!(doc.size(), (21, 11));
+        assert_eq!(doc.img.get_pixel(0, 0), img.get_pixel(5, 7));
+        assert_eq!(doc.img.get_pixel(20, 10), img.get_pixel(25, 17));
+        assert!(
+            doc.crop([10, 0, 20, 5]).is_err(),
+            "outside the cropped image"
+        );
+    }
+
+    #[test]
+    fn pixelize_averages_cells_and_leaves_the_rest() {
+        let img = DynamicImage::ImageRgb8(ImageBuffer::from_fn(8, 4, |x, _| {
+            Rgb([if x % 2 == 0 { 0 } else { 200 }, 10, 20])
+        }));
+        let mut px = img.clone();
+        // 5 px wide region with 2 px blocks: cells at x=1..3, 3..5, and a clipped 5..6.
+        pixelize(&mut px, [1, 0, 5, 4], 2);
+        assert_eq!(px.get_pixel(0, 0), img.get_pixel(0, 0), "outside untouched");
+        assert_eq!(px.get_pixel(7, 3), img.get_pixel(7, 3), "outside untouched");
+        assert_eq!(px.get_pixel(1, 0).0, [100, 10, 20, 255]);
+        assert_eq!(px.get_pixel(2, 3).0, [100, 10, 20, 255]);
+        assert_eq!(
+            px.get_pixel(5, 2).0,
+            [200, 10, 20, 255],
+            "clipped edge cell"
+        );
+        assert_eq!(px.color(), image::ColorType::Rgb8, "pixel type kept");
+    }
+
+    #[test]
+    fn pixelize_keeps_sixteen_bit_precision() {
+        let img = DynamicImage::ImageLuma16(ImageBuffer::from_fn(4, 1, |x, _| {
+            image::Luma([[1000u16, 1001, 60000, 60003][x as usize]])
+        }));
+        let mut px = img.clone();
+        pixelize(&mut px, [0, 0, 4, 1], 2);
+        let DynamicImage::ImageLuma16(buf) = px else {
+            panic!("variant changed")
+        };
+        assert_eq!(buf.as_raw(), &[1001, 1001, 60002, 60002]);
+    }
+
+    #[test]
+    fn undo_redo_and_dirty_tracking() {
+        let mut doc = Doc::decode(&png_bytes(&gradient(20, 20))).unwrap();
+        assert!(!doc.dirty() && !doc.can_undo());
+        doc.pixelize([0, 0, 10, 10], 4).unwrap();
+        doc.crop([0, 0, 5, 5]).unwrap();
+        assert!(doc.dirty());
+        let saved = doc.rev();
+        doc.mark_saved(saved);
+        assert!(!doc.dirty());
+        assert!(doc.undo());
+        assert_eq!(doc.size(), (20, 20));
+        assert!(doc.dirty());
+        assert!(doc.redo());
+        assert_eq!(doc.size(), (5, 5));
+        assert!(!doc.redo());
+        doc.undo();
+        doc.undo();
+        assert!(!doc.can_undo());
+        assert_eq!(
+            doc.img,
+            Doc::decode(&png_bytes(&gradient(20, 20))).unwrap().img
+        );
+    }
+
+    /// Every format round-trips: same container, same colour type where the format holds it,
+    /// and exact pixels for the lossless ones.
+    #[test]
+    fn encoders_round_trip_per_format() {
+        let rgba = gradient(33, 17);
+        let rgb = DynamicImage::ImageRgb8(rgba.to_rgb8());
+        let rgb16 = DynamicImage::ImageRgb16(ImageBuffer::from_fn(9, 5, |x, y| {
+            Rgb([x as u16 * 7001, y as u16 * 13007, 65535])
+        }));
+        let cases: [(ImageFormat, &DynamicImage, image::ColorType, bool); 8] = [
+            (ImageFormat::Png, &rgba, image::ColorType::Rgba8, true),
+            (ImageFormat::Png, &rgb16, image::ColorType::Rgb16, true),
+            (ImageFormat::WebP, &rgba, image::ColorType::Rgba8, true),
+            (ImageFormat::WebP, &rgb, image::ColorType::Rgb8, true),
+            (ImageFormat::Bmp, &rgb, image::ColorType::Rgb8, true),
+            (ImageFormat::Tiff, &rgba, image::ColorType::Rgba8, true),
+            (ImageFormat::Tiff, &rgb16, image::ColorType::Rgb16, true),
+            (ImageFormat::Jpeg, &rgb, image::ColorType::Rgb8, false),
+        ];
+        for (format, img, color, lossless) in cases {
+            let bytes = encode(img, format, None, None).unwrap();
+            let back = Doc::decode(&bytes).unwrap();
+            assert_eq!(back.format, format, "{format:?}");
+            assert_eq!(back.img.color(), color, "{format:?} colour type");
+            assert_eq!(back.size(), (img.width(), img.height()), "{format:?}");
+            if lossless {
+                assert_eq!(back.img.as_bytes(), img.as_bytes(), "{format:?} pixels");
+            } else {
+                // JPEG q95 on a smooth gradient: every channel within a few levels.
+                let worst = back
+                    .img
+                    .to_rgb8()
+                    .as_raw()
+                    .iter()
+                    .zip(img.to_rgb8().as_raw())
+                    .map(|(a, b)| a.abs_diff(*b))
+                    .max()
+                    .unwrap();
+                assert!(worst <= 12, "{format:?} worst channel error {worst}");
+            }
+        }
+    }
+
+    #[test]
+    fn gif_static_saves_and_animated_is_read_only() {
+        let still = encode(&gradient(10, 10), ImageFormat::Gif, None, None).unwrap();
+        let doc = Doc::decode(&still).unwrap();
+        assert_eq!(doc.format, ImageFormat::Gif);
+        assert!(doc.read_only.is_none());
+        assert!(doc.encode().is_ok());
+
+        let mut anim = Vec::new();
+        {
+            let mut enc = image::codecs::gif::GifEncoder::new(&mut anim);
+            for shade in [10u8, 200] {
+                let frame = image::RgbaImage::from_pixel(6, 6, Rgba([shade, 0, 0, 255]));
+                enc.encode_frame(image::Frame::new(frame)).unwrap();
+            }
+        }
+        let mut doc = Doc::decode(&anim).unwrap();
+        let reason = doc.read_only.clone().expect("animated GIF is read-only");
+        assert!(reason.contains("animated GIF"), "{reason}");
+        assert_eq!(doc.img.get_pixel(0, 0).0[0], 10, "frame 1 shown");
+        assert!(doc.crop([0, 0, 2, 2]).is_err());
+        assert!(doc.encode().unwrap_err().to_string().contains("read-only"));
+    }
+
+    #[test]
+    fn exif_orientation_is_applied_and_cleared() {
+        // A 4×2 JPEG tagged "rotate 90° clockwise" opens as 2×4, and the saved Exif no longer
+        // asks viewers to rotate it again.
+        let img = DynamicImage::ImageRgb8(image::RgbImage::from_pixel(4, 2, Rgb([90, 90, 90])));
+        let exif: Vec<u8> = [
+            b"MM\x00\x2a\x00\x00\x00\x08".as_slice(),
+            &[0x00, 0x01],
+            &[
+                0x01, 0x12, 0x00, 0x03, 0x00, 0x00, 0x00, 0x01, 0x00, 0x06, 0x00, 0x00,
+            ],
+            &[0x00, 0x00, 0x00, 0x00],
+        ]
+        .concat();
+        let bytes = encode(&img, ImageFormat::Jpeg, None, Some(exif)).unwrap();
+        let doc = Doc::decode(&bytes).unwrap();
+        assert_eq!(doc.size(), (2, 4));
+        let saved = Doc::decode(&doc.encode().unwrap()).unwrap();
+        assert_eq!(saved.size(), (2, 4), "not rotated twice");
+    }
+
+    fn local_file(dir: &Path, name: &str, bytes: &[u8]) -> ImageFile {
+        let path = dir.join(name);
+        std::fs::write(&path, bytes).unwrap();
+        let abs = path.to_str().unwrap().to_string();
+        let mut fs = LocalFs::new();
+        let at = fs.stat(&abs).unwrap();
+        let origin = Origin::new(Box::new(fs), None, None, abs, at);
+        ImageFile::new(origin, bytes.to_vec(), &dir.join("cache"))
+    }
+
+    #[test]
+    fn save_backs_up_then_overwrites() {
+        let tmp = tempfile::tempdir().unwrap();
+        let original = png_bytes(&gradient(30, 20));
+        let mut file = local_file(tmp.path(), "a.png", &original);
+        let mut doc = Doc::decode(file.original()).unwrap();
+        doc.pixelize([0, 0, 16, 16], 8).unwrap();
+        let encoded = doc.encode().unwrap();
+        let Saved::Written { backup, .. } = file.save(&encoded).unwrap() else {
+            panic!("expected Written")
+        };
+        assert_eq!(std::fs::read(&backup).unwrap(), original);
+        assert!(backup.starts_with(tmp.path().join("cache/backup/local")));
+        assert_eq!(std::fs::read(tmp.path().join("a.png")).unwrap(), encoded);
+        // A second save in the same session goes over our own write and keeps the backup.
+        doc.crop([0, 0, 10, 10]).unwrap();
+        let second = doc.encode().unwrap();
+        let Saved::Written { backup: again, .. } = file.save(&second).unwrap() else {
+            panic!("expected Written")
+        };
+        assert_eq!(again, backup);
+        assert_eq!(std::fs::read(tmp.path().join("a.png")).unwrap(), second);
+        // Nothing left in the edits staging area.
+        let edits = tmp.path().join("cache/edits");
+        let left: Vec<_> = walk(&edits);
+        assert!(left.is_empty(), "{left:?}");
+    }
+
+    fn walk(dir: &Path) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        if let Ok(rd) = std::fs::read_dir(dir) {
+            for entry in rd.flatten() {
+                let p = entry.path();
+                if p.is_dir() {
+                    out.extend(walk(&p));
+                } else {
+                    out.push(p);
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn save_refuses_a_changed_file_and_keeps_the_edit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let original = png_bytes(&gradient(30, 20));
+        let mut file = local_file(tmp.path(), "a.png", &original);
+        // Someone else writes the file after it was opened.
+        std::fs::write(tmp.path().join("a.png"), b"someone else's bytes").unwrap();
+        let mut doc = Doc::decode(file.original()).unwrap();
+        doc.pixelize([0, 0, 8, 8], 4).unwrap();
+        let encoded = doc.encode().unwrap();
+        let Saved::Refused { message, kept } = file.save(&encoded).unwrap() else {
+            panic!("expected Refused")
+        };
+        assert!(message.contains("changed since it was opened"), "{message}");
+        assert!(message.contains(kept.to_str().unwrap()), "{message}");
+        assert_eq!(std::fs::read(&kept).unwrap(), encoded);
+        assert_eq!(
+            std::fs::read(tmp.path().join("a.png")).unwrap(),
+            b"someone else's bytes"
+        );
+        assert_eq!(kept.extension().unwrap(), "png");
+    }
+
+    /// The local disk, posing as a server without `posix-rename@openssh.com`.
+    struct NoReplace(LocalFs);
+
+    impl RemoteFs for NoReplace {
+        fn stat_opt(&mut self, p: &str) -> Result<Option<crate::remote::Stat>> {
+            self.0.stat_opt(p)
+        }
+        fn lstat_opt(&mut self, p: &str) -> Result<Option<crate::remote::Stat>> {
+            self.0.lstat_opt(p)
+        }
+        fn realpath(&mut self, p: &str) -> Result<String> {
+            self.0.realpath(p)
+        }
+        fn read_head(&mut self, p: &str, max: usize) -> Result<Vec<u8>> {
+            self.0.read_head(p, max)
+        }
+        fn list_dir(&mut self, p: &str) -> Result<Vec<String>> {
+            self.0.list_dir(p)
+        }
+        fn read_to(
+            &mut self,
+            p: &str,
+            out: &mut dyn std::io::Write,
+            progress: &mut dyn FnMut(u64),
+        ) -> Result<u64> {
+            self.0.read_to(p, out, progress)
+        }
+        fn create_from(
+            &mut self,
+            local: &Path,
+            p: &str,
+            mode: Option<u32>,
+        ) -> std::result::Result<crate::remote::Uploaded, crate::remote::CreateError> {
+            self.0.create_from(local, p, mode)
+        }
+        fn set_mode(&mut self, p: &str, mode: u32) -> Result<()> {
+            self.0.set_mode(p, mode)
+        }
+        fn set_owner(&mut self, p: &str, uid: u32, gid: u32) -> Result<()> {
+            self.0.set_owner(p, uid, gid)
+        }
+        fn rename_over(&mut self, from: &str, to: &str) -> Result<()> {
+            self.0.rename_over(from, to)
+        }
+        fn link_new(&mut self, from: &str, to: &str) -> Result<()> {
+            self.0.link_new(from, to)
+        }
+        fn remove(&mut self, p: &str) -> Result<()> {
+            self.0.remove(p)
+        }
+        fn can_replace(&self) -> bool {
+            false
+        }
+    }
+
+    #[test]
+    fn save_without_posix_rename_is_refused_before_upload_and_save_copy_works() {
+        let tmp = tempfile::tempdir().unwrap();
+        let original = png_bytes(&gradient(20, 20));
+        let path = tmp.path().join("a.png");
+        std::fs::write(&path, &original).unwrap();
+        let abs = path.to_str().unwrap().to_string();
+        let mut fs = NoReplace(LocalFs::new());
+        let at = fs.stat(&abs).unwrap();
+        let origin = Origin::new(Box::new(fs), None, None, abs, at);
+        let mut file = ImageFile::new(origin, original.clone(), &tmp.path().join("cache"));
+        assert!(!file.can_replace());
+        let mut doc = Doc::decode(file.original()).unwrap();
+        doc.pixelize([0, 0, 8, 8], 4).unwrap();
+        let encoded = doc.encode().unwrap();
+        let err = file.save(&encoded).unwrap_err().to_string();
+        assert!(err.contains("Save copy"), "{err}");
+        assert_eq!(std::fs::read(&path).unwrap(), original, "untouched");
+        assert!(
+            walk(&tmp.path().join("cache/backup")).is_empty(),
+            "no backup"
+        );
+        let copy = file.save_copy(&encoded).unwrap();
+        assert!(copy.ends_with("/a.edited.png"), "{copy}");
+    }
+
+    #[test]
+    fn save_copy_writes_an_edited_sibling() {
+        let tmp = tempfile::tempdir().unwrap();
+        let original = png_bytes(&gradient(12, 12));
+        let mut file = local_file(tmp.path(), "shot.png", &original);
+        let encoded = png_bytes(&gradient(6, 6));
+        let first = file.save_copy(&encoded).unwrap();
+        assert!(first.ends_with("/shot.edited.png"), "{first}");
+        let second = file.save_copy(&encoded).unwrap();
+        assert!(second.ends_with("/shot.edited-1.png"), "{second}");
+        assert_eq!(
+            std::fs::read(tmp.path().join("shot.png")).unwrap(),
+            original
+        );
+        assert_eq!(std::fs::read(&first).unwrap(), encoded);
+    }
+
+    #[test]
+    fn state_hook_applies_ops_in_order() {
+        let mut doc = Doc::decode(&png_bytes(&gradient(40, 40))).unwrap();
+        let mut sel = Selection::default();
+        let mut block = DEFAULT_BLOCK;
+        let hooks = Hooks {
+            state: super::super::State::parse("rect=10,10,21,15;op=pixelize,crop;block=4").unwrap(),
+            ..Hooks::default()
+        };
+        apply_state(&mut doc, &mut sel, &mut block, &hooks).unwrap();
+        assert_eq!(block, 4);
+        assert_eq!(doc.size(), (21, 15));
+        assert!(doc.can_undo());
+        let mut bad = Doc::decode(&png_bytes(&gradient(4, 4))).unwrap();
+        let hooks = Hooks {
+            state: super::super::State::parse("op=crop").unwrap(),
+            ..Hooks::default()
+        };
+        assert!(apply_state(&mut bad, &mut sel, &mut block, &hooks).is_err());
+    }
+}

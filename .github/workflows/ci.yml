@@ -32,11 +32,13 @@ jobs:
           persist-credentials: false
 
       # The export tests encode real media (spec §7); the formula depends on ffmpeg the same way.
-      - name: Install ffmpeg (Linux)
+      # libasound2-dev: cpal (the media window's audio output) links ALSA; everything else the
+      # window needs on Linux (X11, Wayland, EGL, Vulkan, fontconfig) is loaded at runtime.
+      - name: Install ffmpeg and ALSA headers (Linux)
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y ffmpeg
+          sudo apt-get install -y ffmpeg libasound2-dev pkg-config
 
       - name: Install ffmpeg (macOS)
         if: runner.os == 'macOS'

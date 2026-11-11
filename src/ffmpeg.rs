@@ -53,6 +53,8 @@ pub struct Probe {
     /// `video` as shown: width and height swapped for 90/270. ffmpeg rotates frames before
     /// filters run, so crop rectangles are in these pixels.
     pub display: Option<(u32, u32)>,
+    /// Frame rate of that stream (`avg_frame_rate`, else `r_frame_rate`), when ffprobe knows it.
+    pub fps: Option<f64>,
     pub has_audio: bool,
     /// ffprobe `codec_name` of the first audio stream (`aac`, `opus`, `pcm_s24le`, …).
     pub audio_codec: Option<String>,
@@ -91,8 +93,15 @@ pub fn parse_probe(json: &str) -> Result<Probe> {
             .or_else(|| x.as_f64())
     };
     let duration = num(&v["format"]["duration"]);
+    // `30000/1001`; `0/0` when unknown.
+    let rate = |x: &serde_json::Value| -> Option<f64> {
+        let (a, b) = x.as_str()?.split_once('/')?;
+        let (a, b): (f64, f64) = (a.parse().ok()?, b.parse().ok()?);
+        (a > 0.0 && b > 0.0).then(|| a / b)
+    };
     let mut video = None;
     let mut rotation = 0;
+    let mut fps = None;
     let mut audio_codec = None;
     let mut has_audio = false;
     for s in v["streams"].as_array().into_iter().flatten() {
@@ -104,6 +113,7 @@ pub fn parse_probe(json: &str) -> Result<Probe> {
                 let w = s["width"].as_u64().unwrap_or(0) as u32;
                 let h = s["height"].as_u64().unwrap_or(0) as u32;
                 video = Some((w, h));
+                fps = rate(&s["avg_frame_rate"]).or_else(|| rate(&s["r_frame_rate"]));
                 let matrix = s["side_data_list"]
                     .as_array()
                     .into_iter()
@@ -126,6 +136,7 @@ pub fn parse_probe(json: &str) -> Result<Probe> {
         video,
         rotation,
         display,
+        fps,
         has_audio,
         audio_codec,
     })
