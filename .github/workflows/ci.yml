@@ -66,3 +66,14 @@ jobs:
           # A missing ffmpeg fails the export tests here instead of skipping them.
           SOPEN_REQUIRE_FFMPEG: "1"
         run: cargo test --locked
+
+      # The Linux binary loads only libasound and libc at start (X11, Wayland, EGL, Vulkan and
+      # fontconfig are opened at runtime): prove it on a clean system with just the ALSA runtime.
+      # Same Ubuntu release as the runner: the binary needs the build host's glibc or newer.
+      - name: Runtime libraries (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          cargo build --release --locked
+          docker run --rm -v "$PWD/target/release/sopen:/usr/local/bin/sopen:ro" ubuntu:24.04 \
+            bash -c 'apt-get update -qq && apt-get install -y -qq libasound2t64 > /dev/null \
+              && ldd /usr/local/bin/sopen && sopen --version'

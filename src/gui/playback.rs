@@ -725,6 +725,14 @@ impl Player {
                 });
             }
         }
+        // The audio track ended before the picture (a shorter audio stream): the audio clock
+        // stops there, so the picture continues on the wall clock from that point.
+        let video_left = self.video.is_some() && !self.picker.done;
+        if let (Some(a), None, true) = (&self.audio, self.wall, video_left) {
+            if a.drained(now) {
+                self.wall = Some((now, self.clock(now)));
+            }
+        }
         let clock = self.clock(now);
         let half = 0.5 / self.fps;
         let frame = match &self.video {
@@ -1124,6 +1132,51 @@ mod tests {
         );
         assert!(shown >= 8, "frames shown: {shown}");
         assert!(player.clock(Instant::now()) > 0.5);
+    }
+
+    /// A video whose audio track is shorter (4 s of picture, 2 s of sound): once the audio has
+    /// drained the clock continues on the wall clock and playback reaches the end — it must not
+    /// freeze at 2 s and repaint forever.
+    #[test]
+    fn short_audio_track_still_plays_the_video_to_the_end() {
+        let Some(tools) = tools_or_skip() else { return };
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("v.mp4");
+        generate(
+            &tools,
+            &path,
+            &[
+                "testsrc2=size=160x90:rate=20:duration=4",
+                "sine=frequency=440:duration=2",
+            ],
+            &["-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac"],
+        );
+        let probe = crate::ffmpeg::probe(&tools, &path).unwrap();
+        let duration = probe.duration.unwrap();
+        assert!(duration > 3.9, "container duration {duration}");
+        let src = Source {
+            path,
+            duration,
+            video: Some(((160, 90), 20.0)),
+            audio: true,
+        };
+        let mut player =
+            Player::start(&tools, &src, 0.0, 0.0, Sink::Null, Arc::new(|| {})).unwrap();
+        let begin = Instant::now();
+        let (ended, last) = loop {
+            let p = player.pump(Instant::now());
+            if p.ended || begin.elapsed() > Duration::from_secs(8) {
+                break (p.ended, p.position);
+            }
+            std::thread::sleep(p.wake_in.min(Duration::from_millis(10)));
+        };
+        assert!(
+            ended,
+            "NOT ENDED pos={last:.3} after {:.2} s",
+            begin.elapsed().as_secs_f64()
+        );
+        assert!(last > 3.8, "ended early at {last:.3}");
+        assert!(player.audio_note.is_none(), "{:?}", player.audio_note);
     }
 
     #[test]

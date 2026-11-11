@@ -211,6 +211,9 @@ pub struct Hooks {
     /// `SOPEN_AUTOSAVE_DELAY_MS`: wait between applying the state and saving, so a second
     /// process can change the remote meanwhile (the conflict receipt).
     pub save_delay: Option<Duration>,
+    /// `SOPEN_EXPORT_HOLD_MS`: the media window starts an Export on open and holds it, at its
+    /// first progress report at or past 30 %, for this long (a screenshot mid-export).
+    pub export_hold: Option<Duration>,
 }
 
 impl Hooks {
@@ -220,12 +223,16 @@ impl Hooks {
             Ok(text) => State::parse(&text)?,
             Err(_) => State::default(),
         };
-        let save_delay = match std::env::var("SOPEN_AUTOSAVE_DELAY_MS") {
-            Ok(ms) => Some(Duration::from_millis(ms.parse().map_err(|_| {
-                anyhow!("SOPEN_AUTOSAVE_DELAY_MS must be a whole number of milliseconds")
-            })?)),
-            Err(_) => None,
+        let millis = |name: &str| -> Result<Option<Duration>> {
+            match std::env::var(name) {
+                Ok(ms) => Ok(Some(Duration::from_millis(ms.parse().map_err(|_| {
+                    anyhow!("{name} must be a whole number of milliseconds")
+                })?))),
+                Err(_) => Ok(None),
+            }
         };
+        let save_delay = millis("SOPEN_AUTOSAVE_DELAY_MS")?;
+        let export_hold = millis("SOPEN_EXPORT_HOLD_MS")?;
         Ok(Self {
             screenshot: std::env::var_os("SOPEN_SCREENSHOT")
                 .filter(|p| !p.is_empty())
@@ -234,6 +241,7 @@ impl Hooks {
             autosave: flag("SOPEN_AUTOSAVE"),
             autoexport: flag("SOPEN_AUTOEXPORT"),
             save_delay,
+            export_hold,
         })
     }
 

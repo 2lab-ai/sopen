@@ -18,6 +18,13 @@ Same syntax as `scp`. Uses your `ssh` and `~/.ssh/config`; the remote needs noth
 brew install 2lab-ai/tap/sopen-preview    # macOS (arm64, x86_64), Linux (x86_64, aarch64); pulls in ffmpeg
 ```
 
+## Requirements
+
+- Media needs `ffmpeg` and `ffprobe` (the formula installs them).
+- Linux: the ALSA runtime library (libasound2 / alsa-lib) — present on desktop Linux; sopen runs
+  on the machine you sit at, not on the remote. The image and media windows need a desktop
+  session (X11 or Wayland).
+
 ## What the remote needs
 
 Only sshd with its SFTP subsystem (the default). sopen installs and runs nothing there. When you open
@@ -48,10 +55,6 @@ seek, `Space` plays/pauses, `←`/`→` step 1 s (`⇧` 5 s), `I` / `O` set In a
 a rectangle to crop. `E` exports In–Out (and the crop) as a new file next to the original,
 exactly like `sopen cut`, and shows its remote path. If no audio device can be opened the video
 plays silently and says so.
-
-On Linux the window needs a desktop session (`DISPLAY` or `WAYLAND_DISPLAY`) and the ALSA library
-(`libasound.so.2`, present on desktop installs); without a display, sopen prints the fetched copy's
-path instead.
 
 ## Any other file: `--app`
 

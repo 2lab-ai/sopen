@@ -62,6 +62,47 @@ fn animated(bytes: &[u8], format: ImageFormat) -> bool {
     }
 }
 
+/// Pages (IFDs) in a TIFF, counted up to `limit`: classic and BigTIFF, either byte order.
+/// A chain that runs off the end of the data or loops stops the count there.
+pub fn tiff_pages(bytes: &[u8], limit: usize) -> usize {
+    let big = match bytes.get(..4) {
+        Some(b"II*\0") | Some(b"MM\0*") => false,
+        Some(b"II+\0") | Some(b"MM\0+") => true,
+        _ => return 0,
+    };
+    let le = bytes[0] == b'I';
+    let uint = |at: usize, len: usize| -> Option<u64> {
+        let b = bytes.get(at..at.checked_add(len)?)?;
+        Some(b.iter().enumerate().fold(0u64, |acc, (i, &v)| {
+            let shift = if le { 8 * i } else { 8 * (len - 1 - i) };
+            acc | (u64::from(v) << shift)
+        }))
+    };
+    let (mut ifd, count_len, entry_len, next_len) = if big {
+        (uint(8, 8), 8, 20, 8)
+    } else {
+        (uint(4, 4), 2, 12, 4)
+    };
+    let mut seen = Vec::new();
+    while let Some(at) = ifd
+        .filter(|&o| o != 0)
+        .and_then(|o| usize::try_from(o).ok())
+    {
+        if seen.len() >= limit || seen.contains(&at) {
+            break;
+        }
+        let Some(n) = uint(at, count_len).and_then(|n| usize::try_from(n).ok()) else {
+            break;
+        };
+        seen.push(at);
+        let next_at = n
+            .checked_mul(entry_len)
+            .and_then(|e| e.checked_add(at + count_len));
+        ifd = next_at.and_then(|i| uint(i, next_len));
+    }
+    seen.len()
+}
+
 fn format_name(format: ImageFormat) -> &'static str {
     match format {
         ImageFormat::Png => "PNG",
@@ -106,12 +147,23 @@ impl Doc {
         if let Some(chunk) = exif.as_mut() {
             let _ = image::metadata::Orientation::remove_from_exif_chunk(chunk);
         }
-        let read_only = animated(bytes, format).then(|| {
-            format!(
+        let pages = if format == ImageFormat::Tiff {
+            tiff_pages(bytes, 1000)
+        } else {
+            1
+        };
+        let read_only = if animated(bytes, format) {
+            Some(format!(
                 "animated {}, first frame shown; saving would drop the animation",
                 format_name(format)
-            )
-        });
+            ))
+        } else if pages > 1 {
+            Some(format!(
+                "multi-page TIFF ({pages} pages), first page shown; saving would drop the others"
+            ))
+        } else {
+            None
+        };
         Ok(Self {
             img,
             format,
@@ -492,19 +544,28 @@ impl ImageFile {
         Ok(path)
     }
 
-    /// Save (spec §5): backup first, then the conflict-checked overwrite. On a refusal the
-    /// edit stays in a local file whose path the message names. Transport errors also keep it.
-    /// A server that cannot replace a file in one step is refused before anything is written.
-    pub fn save(&mut self, encoded: &[u8]) -> Result<Saved> {
+    /// Save (spec §5), in this order: can this server replace a file in one step (refused
+    /// before anything is written if not) → the local backup of the original (printed) →
+    /// `encode` → stage the edit locally → conflict-checked overwrite. An encode failure leaves
+    /// the backup made; a refusal or a transport error keeps the edit in a local file whose
+    /// path the message names.
+    pub fn save(&mut self, encode: impl FnOnce() -> Result<Vec<u8>>) -> Result<Saved> {
         if !self.can_replace() {
             bail!(
                 "{} was not touched: {CANNOT_REPLACE}",
                 self.origin.display()
             );
         }
-        let staged = self.stage(encoded, "edited")?;
+        let backup = self.ensure_backup()?;
+        let encoded = encode().with_context(|| {
+            format!(
+                "{} was not touched (the original is backed up at {})",
+                self.origin.display(),
+                backup.display()
+            )
+        })?;
+        let staged = self.stage(&encoded, "edited")?;
         let result = (|| -> Result<Saved> {
-            let backup = self.ensure_backup()?;
             let at = self.origin.at;
             let abs = self.origin.abs.clone();
             match self
@@ -604,6 +665,7 @@ pub fn open(file: ImageFile, hooks: &Hooks, notice: Option<String>) -> Result<Ou
     let outcome = Arc::new(Mutex::new(Outcome::default()));
     let (w, h) = doc.size();
     let can_replace = file.can_replace();
+    let leftover: Arc<Mutex<Option<Job>>> = Arc::default();
     let status = match (notice, can_replace) {
         (Some(text), _) => Status::error(text),
         (None, false) => Status::error(CANNOT_REPLACE),
@@ -624,6 +686,8 @@ pub fn open(file: ImageFile, hooks: &Hooks, notice: Option<String>) -> Result<Ou
         outcome: outcome.clone(),
         prompt: false,
         close_ok: false,
+        close_when_done: false,
+        leftover: leftover.clone(),
         painted: false,
         zoom: 1.0,
     };
@@ -632,19 +696,28 @@ pub fn open(file: ImageFile, hooks: &Hooks, notice: Option<String>) -> Result<Ou
         (w as f32).clamp(640.0, 1400.0),
         (h as f32 + 90.0).clamp(420.0, 940.0),
     ];
-    super::run_window(&title, size, window, hooks)?;
+    let run = super::run_window(&title, size, window, hooks);
+    // Never exit with a write in flight without its outcome on the terminal.
+    if let Some(job) = leftover.lock().unwrap().take() {
+        eprintln!("sopen: the window closed during a save; waiting for it to finish");
+        let result = job
+            .rx
+            .recv()
+            .unwrap_or_else(|_| Err(anyhow!("the save stopped without a result")));
+        report(&result, &mut outcome.lock().unwrap());
+    }
+    run?;
     let outcome = outcome.lock().unwrap().clone();
     Ok(outcome)
 }
 
 fn autosave(mut file: ImageFile, doc: &Doc, hooks: &Hooks) -> Result<Outcome> {
-    let encoded = doc.encode()?;
     if let Some(delay) = hooks.save_delay {
         eprintln!("waiting {} ms before saving", delay.as_millis());
         std::thread::sleep(delay);
     }
     let mut outcome = Outcome::default();
-    match file.save(&encoded)? {
+    match file.save(|| doc.encode())? {
         Saved::Written { remote, notes, .. } => {
             outcome.saved = true;
             let (w, h) = doc.size();
@@ -663,6 +736,48 @@ fn autosave(mut file: ImageFile, doc: &Doc, hooks: &Hooks) -> Result<Outcome> {
 
 // ---------------------------------------------------------------------------------------------
 // The window.
+
+/// Prints a finished save to the terminal, records it in `outcome` and returns the window's
+/// status line. Also used for a save still in flight when the window went away.
+fn report(result: &Result<JobDone>, outcome: &mut Outcome) -> Status {
+    match result {
+        Ok(JobDone::Saved(Saved::Written {
+            remote,
+            backup,
+            notes,
+        })) => {
+            outcome.saved = true;
+            outcome.refused = None;
+            println!("saved {remote}");
+            for note in notes {
+                eprintln!("sopen: {note}");
+            }
+            if notes.is_empty() {
+                Status::info(format!(
+                    "saved {remote} · original backed up at {}",
+                    backup.display()
+                ))
+            } else {
+                // The owner has to see these (e.g. the remote changed right after).
+                Status::error(format!("saved {remote} — {}", notes.join("; ")))
+            }
+        }
+        Ok(JobDone::Saved(Saved::Refused { message, .. })) => {
+            outcome.conflict = true;
+            outcome.refused = Some(message.clone());
+            eprintln!("sopen: {message}");
+            Status::error(message.clone())
+        }
+        Ok(JobDone::Copy(path)) => {
+            println!("saved a copy at {path}");
+            Status::info(format!("saved a copy at {path}"))
+        }
+        Err(e) => {
+            eprintln!("sopen: {e:#}");
+            Status::error(format!("{e:#}"))
+        }
+    }
+}
 
 /// `scale` = screen points per image pixel (`None` = fit); `center` = the image point at the
 /// centre of the view.
@@ -705,9 +820,21 @@ struct ImageWindow {
     outcome: Arc<Mutex<Outcome>>,
     prompt: bool,
     close_ok: bool,
+    /// Close was asked for while a save ran: close when it is done.
+    close_when_done: bool,
+    /// Where a save still in flight goes if the window is dropped anyway; `open` waits for it.
+    leftover: Arc<Mutex<Option<Job>>>,
     painted: bool,
     /// Device pixels per image pixel, for the status bar.
     zoom: f32,
+}
+
+impl Drop for ImageWindow {
+    fn drop(&mut self) {
+        if let Some(job) = self.job.take() {
+            *self.leftover.lock().unwrap() = Some(job);
+        }
+    }
 }
 
 impl ImageWindow {
@@ -781,14 +908,16 @@ impl ImageWindow {
         let (tx, rx) = mpsc::channel();
         let ctx = ctx.clone();
         std::thread::spawn(move || {
-            let result = encode(&img, format, icc, exif).and_then(|bytes| {
-                let mut file = file.lock().unwrap();
-                if copy {
-                    file.save_copy(&bytes).map(JobDone::Copy)
-                } else {
-                    file.save(&bytes).map(JobDone::Saved)
-                }
-            });
+            let encoded = || encode(&img, format, icc, exif);
+            let mut file = file.lock().unwrap();
+            let result = if copy {
+                encoded()
+                    .and_then(|bytes| file.save_copy(&bytes))
+                    .map(JobDone::Copy)
+            } else {
+                file.save(encoded).map(JobDone::Saved)
+            };
+            drop(file);
             let _ = tx.send(result);
             ctx.request_repaint();
         });
@@ -812,53 +941,25 @@ impl ImageWindow {
             return;
         };
         let job = self.job.take().expect("checked above");
-        let mut outcome = self.outcome.lock().unwrap();
-        match result {
-            Ok(JobDone::Saved(Saved::Written {
-                remote,
-                backup,
-                notes,
-            })) => {
+        self.status = report(&result, &mut self.outcome.lock().unwrap());
+        let close_after = match &result {
+            Ok(JobDone::Saved(Saved::Written { notes, .. })) => {
                 self.doc.mark_saved(job.rev);
-                outcome.saved = true;
-                outcome.refused = None;
-                println!("saved {remote}");
-                for note in &notes {
-                    eprintln!("sopen: {note}");
-                }
-                self.status = if notes.is_empty() {
-                    Status::info(format!(
-                        "saved {remote} · original backed up at {}",
-                        backup.display()
-                    ))
-                } else {
-                    // The owner has to see these (e.g. the remote changed right after).
-                    Status::error(format!("saved {remote} — {}", notes.join("; ")))
-                };
-                if matches!(job.kind, JobKind::Save { close_after: true }) && notes.is_empty() {
-                    self.close_ok = true;
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                }
+                matches!(job.kind, JobKind::Save { close_after: true }) && notes.is_empty()
             }
-            Ok(JobDone::Saved(Saved::Refused { message, .. })) => {
-                outcome.conflict = true;
-                outcome.refused = Some(message.clone());
-                eprintln!("sopen: {message}");
-                self.status = Status::error(message);
-            }
-            Ok(JobDone::Copy(path)) => {
+            Ok(JobDone::Copy(_)) => {
                 self.doc.mark_copied(job.rev);
-                println!("saved a copy at {path}");
-                self.status = Status::info(format!("saved a copy at {path}"));
-                if matches!(job.kind, JobKind::SaveCopy { close_after: true }) {
-                    self.close_ok = true;
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                }
+                matches!(job.kind, JobKind::SaveCopy { close_after: true })
             }
-            Err(e) => {
-                eprintln!("sopen: {e:#}");
-                self.status = Status::error(format!("{e:#}"));
-            }
+            _ => false,
+        };
+        let waited = std::mem::take(&mut self.close_when_done);
+        if close_after || (waited && !self.doc.unsaved()) {
+            self.close_ok = true;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        } else if waited {
+            // Closing was asked for during a save that did not land: ask what to do.
+            self.prompt = true;
         }
     }
 
@@ -1163,12 +1264,19 @@ impl super::Window for ImageWindow {
     }
 
     fn close_requested(&mut self) -> bool {
-        if self.close_ok || !self.doc.unsaved() {
+        if self.close_ok {
             return true;
         }
-        if self.job.is_none() {
-            self.prompt = true;
+        if self.job.is_some() {
+            // Never close mid-write: the window closes once the save has reported.
+            self.close_when_done = true;
+            self.status = Status::info("saving… the window closes when the save is done");
+            return false;
         }
+        if !self.doc.unsaved() {
+            return true;
+        }
+        self.prompt = true;
         false
     }
 }
@@ -1328,6 +1436,62 @@ mod tests {
         assert!(doc.encode().unwrap_err().to_string().contains("read-only"));
     }
 
+    /// A copy of a one-page little-endian TIFF with its first page linked in again as page 2
+    /// (both pages share the strip data — a valid two-page file).
+    fn two_page_tiff(one: &[u8]) -> Vec<u8> {
+        assert_eq!(&one[..4], b"II*\0");
+        let u16_at = |b: &[u8], i: usize| u16::from_le_bytes([b[i], b[i + 1]]) as usize;
+        let u32_at = |b: &[u8], i: usize| u32::from_le_bytes(b[i..i + 4].try_into().unwrap());
+        let ifd0 = u32_at(one, 4) as usize;
+        let n = u16_at(one, ifd0);
+        let next_at = ifd0 + 2 + 12 * n;
+        assert_eq!(u32_at(one, next_at), 0, "one page");
+        let mut out = one.to_vec();
+        if out.len() % 2 == 1 {
+            out.push(0);
+        }
+        let ifd1 = out.len();
+        out.extend_from_slice(&one[ifd0..next_at]);
+        out.extend_from_slice(&0u32.to_le_bytes());
+        out[next_at..next_at + 4].copy_from_slice(&(ifd1 as u32).to_le_bytes());
+        out
+    }
+
+    #[test]
+    fn tiff_page_count_reads_both_byte_orders_and_stops_on_garbage() {
+        let one = encode(&gradient(4, 4), ImageFormat::Tiff, None, None).unwrap();
+        assert_eq!(tiff_pages(&one, 10), 1);
+        assert_eq!(tiff_pages(&two_page_tiff(&one), 10), 2);
+        assert_eq!(tiff_pages(&two_page_tiff(&one), 1), 1, "limit");
+        // Big-endian header, one IFD with no entries at offset 8.
+        let mm = [b"MM\0*".as_slice(), &[0, 0, 0, 8], &[0, 0], &[0, 0, 0, 0]].concat();
+        assert_eq!(tiff_pages(&mm, 10), 1);
+        // An IFD whose "next" points at itself counts once.
+        let mut lp = mm.clone();
+        lp[10..14].copy_from_slice(&[0, 0, 0, 8]);
+        assert_eq!(tiff_pages(&lp, 10), 1);
+        assert_eq!(
+            tiff_pages(b"II*\0\xff\xff\xff\x7f", 10),
+            0,
+            "offset past the end"
+        );
+        assert_eq!(tiff_pages(b"GIF89a", 10), 0);
+    }
+
+    #[test]
+    fn multi_page_tiff_is_read_only() {
+        let one = encode(&gradient(16, 8), ImageFormat::Tiff, None, None).unwrap();
+        let single = Doc::decode(&one).unwrap();
+        assert!(single.read_only.is_none(), "one page is editable");
+        let two = two_page_tiff(&one);
+        let mut doc = Doc::decode(&two).unwrap();
+        assert_eq!(doc.size(), (16, 8), "page 1 shown");
+        let reason = doc.read_only.clone().expect("two pages: read-only");
+        assert!(reason.contains("multi-page TIFF"), "{reason}");
+        assert!(doc.crop([0, 0, 4, 4]).is_err());
+        assert!(doc.encode().is_err());
+    }
+
     #[test]
     fn exif_orientation_is_applied_and_cleared() {
         // A 4×2 JPEG tagged "rotate 90° clockwise" opens as 2×4, and the saved Exif no longer
@@ -1367,7 +1531,7 @@ mod tests {
         let mut doc = Doc::decode(file.original()).unwrap();
         doc.pixelize([0, 0, 16, 16], 8).unwrap();
         let encoded = doc.encode().unwrap();
-        let Saved::Written { backup, .. } = file.save(&encoded).unwrap() else {
+        let Saved::Written { backup, .. } = file.save(|| Ok(encoded.clone())).unwrap() else {
             panic!("expected Written")
         };
         assert_eq!(std::fs::read(&backup).unwrap(), original);
@@ -1376,7 +1540,7 @@ mod tests {
         // A second save in the same session goes over our own write and keeps the backup.
         doc.crop([0, 0, 10, 10]).unwrap();
         let second = doc.encode().unwrap();
-        let Saved::Written { backup: again, .. } = file.save(&second).unwrap() else {
+        let Saved::Written { backup: again, .. } = file.save(|| Ok(second.clone())).unwrap() else {
             panic!("expected Written")
         };
         assert_eq!(again, backup);
@@ -1402,6 +1566,106 @@ mod tests {
         out
     }
 
+    /// Save order (spec §5): capability → backup (on disk before encoding starts) → encode →
+    /// stage → replace.
+    #[test]
+    fn save_backs_up_before_encoding() {
+        let tmp = tempfile::tempdir().unwrap();
+        let original = png_bytes(&gradient(30, 20));
+        let mut file = local_file(tmp.path(), "a.png", &original);
+        let backups = tmp.path().join("cache/backup");
+        let edits = tmp.path().join("cache/edits");
+        let mut seen_at_encode = Vec::new();
+        let encoded = png_bytes(&gradient(30, 20).crop_imm(0, 0, 10, 10));
+        let saved = file
+            .save(|| {
+                seen_at_encode = walk(&backups);
+                assert!(walk(&edits).is_empty(), "nothing staged before encoding");
+                Ok(encoded.clone())
+            })
+            .unwrap();
+        assert!(matches!(saved, Saved::Written { .. }), "{saved:?}");
+        assert_eq!(
+            seen_at_encode.len(),
+            1,
+            "backup existed when encoding began"
+        );
+        assert_eq!(std::fs::read(&seen_at_encode[0]).unwrap(), original);
+        assert_eq!(std::fs::read(tmp.path().join("a.png")).unwrap(), encoded);
+    }
+
+    #[test]
+    fn encode_failure_leaves_the_backup_and_the_original() {
+        let tmp = tempfile::tempdir().unwrap();
+        let original = png_bytes(&gradient(30, 20));
+        let mut file = local_file(tmp.path(), "a.png", &original);
+        let err = file
+            .save(|| Err(anyhow!("injected encoder failure")))
+            .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("injected encoder failure"), "{msg}");
+        assert!(msg.contains("backed up at"), "{msg}");
+        let backups = walk(&tmp.path().join("cache/backup"));
+        assert_eq!(backups.len(), 1);
+        assert_eq!(std::fs::read(&backups[0]).unwrap(), original);
+        assert_eq!(std::fs::read(tmp.path().join("a.png")).unwrap(), original);
+        assert!(walk(&tmp.path().join("cache/edits")).is_empty());
+    }
+
+    fn window_for(file: ImageFile, leftover: Arc<Mutex<Option<Job>>>) -> ImageWindow {
+        let doc = Doc::decode(file.original()).unwrap();
+        ImageWindow {
+            title: file.origin.display(),
+            can_replace: true,
+            doc,
+            file: Arc::new(Mutex::new(file)),
+            tex: None,
+            tex_rev: None,
+            sel: Selection::default(),
+            block: DEFAULT_BLOCK,
+            view: View::default(),
+            status: Status::default(),
+            job: None,
+            outcome: Arc::default(),
+            prompt: false,
+            close_ok: false,
+            close_when_done: false,
+            leftover,
+            painted: false,
+            zoom: 1.0,
+        }
+    }
+
+    /// Closing while a save runs never closes mid-write: the window stays until the save has
+    /// reported. A window dropped anyway hands the in-flight save to `open`, which waits.
+    #[test]
+    fn close_waits_for_a_running_save() {
+        let tmp = tempfile::tempdir().unwrap();
+        let original = png_bytes(&gradient(12, 12));
+        let file = local_file(tmp.path(), "a.png", &original);
+        let leftover: Arc<Mutex<Option<Job>>> = Arc::default();
+        let mut w = window_for(file, leftover.clone());
+        assert!(
+            super::super::Window::close_requested(&mut w),
+            "idle, clean: closes"
+        );
+        let (_tx, rx) = mpsc::channel();
+        w.job = Some(Job {
+            kind: JobKind::Save { close_after: false },
+            rev: 0,
+            rx,
+        });
+        assert!(!super::super::Window::close_requested(&mut w));
+        assert!(w.close_when_done);
+        assert!(w.status.text.contains("closes when the save is done"));
+        assert!(!super::super::Window::close_requested(&mut w), "still not");
+        drop(w);
+        assert!(
+            leftover.lock().unwrap().is_some(),
+            "in-flight save handed over"
+        );
+    }
+
     #[test]
     fn save_refuses_a_changed_file_and_keeps_the_edit() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1412,7 +1676,7 @@ mod tests {
         let mut doc = Doc::decode(file.original()).unwrap();
         doc.pixelize([0, 0, 8, 8], 4).unwrap();
         let encoded = doc.encode().unwrap();
-        let Saved::Refused { message, kept } = file.save(&encoded).unwrap() else {
+        let Saved::Refused { message, kept } = file.save(|| Ok(encoded.clone())).unwrap() else {
             panic!("expected Refused")
         };
         assert!(message.contains("changed since it was opened"), "{message}");
@@ -1495,7 +1759,7 @@ mod tests {
         let mut doc = Doc::decode(file.original()).unwrap();
         doc.pixelize([0, 0, 8, 8], 4).unwrap();
         let encoded = doc.encode().unwrap();
-        let err = file.save(&encoded).unwrap_err().to_string();
+        let err = file.save(|| Ok(encoded.clone())).unwrap_err().to_string();
         assert!(err.contains("Save copy"), "{err}");
         assert_eq!(std::fs::read(&path).unwrap(), original, "untouched");
         assert!(

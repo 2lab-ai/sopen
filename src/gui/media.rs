@@ -325,6 +325,7 @@ pub fn open(
     }
     let title = origin.display();
     let outcome = Arc::new(Mutex::new(Outcome::default()));
+    let leftover: Arc<Mutex<Option<ExportJob>>> = Arc::default();
     let size = match media.decode_size() {
         Some((w, h)) => [
             (w as f32).clamp(640.0, 1280.0),
@@ -349,12 +350,41 @@ pub fn open(
         outcome: outcome.clone(),
         started: false,
         painted: false,
-        close_armed: false,
+        close_when_done: false,
+        close_ok: false,
+        leftover: leftover.clone(),
+        export_hold: hooks.export_hold,
         resume: false,
     };
-    super::run_window(&title, size, window, hooks)?;
+    let run = super::run_window(&title, size, window, hooks);
+    // Never exit with an export in flight without its outcome on the terminal.
+    if let Some(job) = leftover.lock().unwrap().take() {
+        eprintln!("sopen: the window closed during an export; waiting for it to finish");
+        let result = job
+            .rx
+            .recv()
+            .unwrap_or_else(|_| Err(anyhow::anyhow!("the export stopped without a result")));
+        report_export(result, &mut outcome.lock().unwrap());
+    }
+    run?;
     let outcome = outcome.lock().unwrap().clone();
     Ok(outcome)
+}
+
+/// Prints a finished export to the terminal, records it and returns the status line.
+fn report_export(result: Result<String>, outcome: &mut Outcome) -> Status {
+    match result {
+        Ok(path) => {
+            outcome.exported = true;
+            println!("exported {path}");
+            Status::info(format!("exported {path}"))
+        }
+        Err(e) => {
+            let e = export_error(&e);
+            eprintln!("sopen: {e:#}");
+            Status::error(format!("{e:#}"))
+        }
+    }
 }
 
 struct ExportJob {
@@ -381,7 +411,13 @@ struct MediaWindow {
     outcome: Arc<Mutex<Outcome>>,
     started: bool,
     painted: bool,
-    close_armed: bool,
+    /// Close was asked for during an export: close when it is done.
+    close_when_done: bool,
+    close_ok: bool,
+    /// Where an export still in flight goes if the window is dropped; `open` waits for it.
+    leftover: Arc<Mutex<Option<ExportJob>>>,
+    /// Receipt hook: start an Export on open and hold it at 30 % (AGENTS.md "Receipts").
+    export_hold: Option<std::time::Duration>,
     /// Playback paused by a timeline drag, to resume on release.
     resume: bool,
 }
@@ -523,11 +559,18 @@ impl MediaWindow {
             self.work_root.clone(),
         );
         let (shared, waker) = (progress.clone(), ctx.clone());
+        let mut hold = self.export_hold;
         std::thread::spawn(move || {
             let mut origin = origin.lock().unwrap();
             let result = export(&mut origin, &media, &req, &work, &mut |f| {
                 shared.store((f * 1000.0) as u32, SeqCst);
                 waker.request_repaint();
+                if f >= 0.3 {
+                    if let Some(d) = hold.take() {
+                        // Receipt hook: ffmpeg blocks on its progress pipe meanwhile.
+                        std::thread::sleep(d);
+                    }
+                }
             });
             let _ = tx.send(result);
             waker.request_repaint();
@@ -536,7 +579,7 @@ impl MediaWindow {
         self.job = Some(ExportJob { progress, rx });
     }
 
-    fn poll_export(&mut self) {
+    fn poll_export(&mut self, ctx: &egui::Context) {
         let Some(job) = &self.job else {
             return;
         };
@@ -544,18 +587,10 @@ impl MediaWindow {
             return;
         };
         self.job = None;
-        self.close_armed = false;
-        match result {
-            Ok(path) => {
-                self.outcome.lock().unwrap().exported = true;
-                println!("exported {path}");
-                self.status = Status::info(format!("exported {path}"));
-            }
-            Err(e) => {
-                let e = export_error(&e);
-                eprintln!("sopen: {e:#}");
-                self.status = Status::error(format!("{e:#}"));
-            }
+        self.status = report_export(result, &mut self.outcome.lock().unwrap());
+        if std::mem::take(&mut self.close_when_done) {
+            self.close_ok = true;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
     }
 
@@ -632,13 +667,17 @@ impl MediaWindow {
                 [Pos2::new(x, rect.top()), Pos2::new(x, rect.bottom())],
                 Stroke::new(2.0, color),
             );
-            painter.text(
-                Pos2::new(x + 3.0, rect.top() + 2.0),
-                egui::Align2::LEFT_TOP,
-                label,
-                font.clone(),
-                color,
-            );
+            // Labels near the right end go on the marker's left so they stay inside.
+            let right = x + 3.0 + 9.0 * label.chars().count() as f32 > rect.right();
+            let (pos, align) = if right {
+                (
+                    Pos2::new(x - 3.0, rect.top() + 2.0),
+                    egui::Align2::RIGHT_TOP,
+                )
+            } else {
+                (Pos2::new(x + 3.0, rect.top() + 2.0), egui::Align2::LEFT_TOP)
+            };
+            painter.text(pos, align, label, font.clone(), color);
         };
         if let Some(i) = self.marks.in_s {
             mark(
@@ -678,7 +717,7 @@ impl MediaWindow {
 
     fn transport(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             let playing = self.player.is_some();
             if ui
                 .button(if playing { "Pause" } else { "Play" })
@@ -725,20 +764,21 @@ impl MediaWindow {
                 clock_text(out_s),
                 (out_s - in_s).max(0.0)
             ));
-            if let Some(job) = &self.job {
-                let f = job.progress.load(SeqCst) as f32 / 1000.0;
-                ui.add(
-                    egui::ProgressBar::new(f)
-                        .desired_width(160.0)
-                        .show_percentage(),
-                );
-            }
         });
+        // Its own full-width row: a portrait (rotated) clip makes a narrow window.
+        if let Some(job) = &self.job {
+            let f = job.progress.load(SeqCst) as f32 / 1000.0;
+            ui.add(
+                egui::ProgressBar::new(f)
+                    .text(format!("exporting {:.0} %", f * 100.0))
+                    .desired_width(ui.available_width()),
+            );
+        }
     }
 
     fn info(&self, ui: &mut egui::Ui) {
         let m = &self.media;
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             match m.video {
                 Some((w, h)) => ui.monospace(format!(
                     "{w}×{h}{} · {:.2} fps · {}{}",
@@ -803,6 +843,14 @@ impl MediaWindow {
     }
 }
 
+impl Drop for MediaWindow {
+    fn drop(&mut self) {
+        if let Some(job) = self.job.take() {
+            *self.leftover.lock().unwrap() = Some(job);
+        }
+    }
+}
+
 impl super::Window for MediaWindow {
     fn ui(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
@@ -813,8 +861,11 @@ impl super::Window for MediaWindow {
                 self.wave = Some(start_waveform(&self.media, ctx.clone()));
             }
             self.seek(&ctx, self.marks.t);
+            if self.export_hold.is_some() {
+                self.start_export(&ctx);
+            }
         }
-        self.poll_export();
+        self.poll_export(&ctx);
         self.keys(&ctx);
         self.pump(&ctx);
         if self.player.is_none() {
@@ -874,15 +925,29 @@ impl super::Window for MediaWindow {
 
     fn ready(&self) -> bool {
         let frame_ok = self.audio_only() || (self.want.is_some() && self.tex_pts == self.want);
-        self.painted && frame_ok && self.player.is_none()
+        // With the export hook, the shot is taken while the export is held mid-way.
+        let export_ok = self.export_hold.is_none()
+            || self
+                .job
+                .as_ref()
+                .is_some_and(|j| j.progress.load(SeqCst) >= 300);
+        self.painted && frame_ok && self.player.is_none() && export_ok
     }
 
     fn close_requested(&mut self) -> bool {
-        if self.job.is_none() || self.close_armed {
+        if self.close_ok || self.job.is_none() {
             return true;
         }
-        self.close_armed = true;
-        self.status = Status::error("an export is running — close again to stop it");
+        if self.close_when_done {
+            // Second request: the window goes now; `open` waits for the export and prints
+            // its outcome in the terminal.
+            return true;
+        }
+        self.close_when_done = true;
+        self.status = Status::info(
+            "exporting… the window closes when the export is done (close again to close it \
+             now — sopen still waits for the export and prints the result in the terminal)",
+        );
         false
     }
 }
@@ -891,6 +956,71 @@ impl super::Window for MediaWindow {
 mod tests {
     use super::*;
     use crate::remote::{LocalFs, RemoteFs};
+
+    /// Closing during an export: the first request keeps the window (it closes when the export
+    /// reports), the second closes it, and the in-flight export is handed to `open`, which
+    /// waits and prints its outcome — never an exit with the write unreported.
+    #[test]
+    fn close_during_export_hands_the_job_over() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("v.mp4");
+        std::fs::write(&path, b"x").unwrap();
+        let abs = path.to_str().unwrap().to_string();
+        let mut fs = LocalFs::new();
+        let at = fs.stat(&abs).unwrap();
+        let origin = Origin::new(Box::new(fs), None, None, abs, at);
+        let media = Media {
+            tools: Tools {
+                ffmpeg: "ffmpeg".into(),
+                ffprobe: "ffprobe".into(),
+            },
+            local: path,
+            duration: 4.0,
+            video: Some((64, 36)),
+            rotation: 0,
+            fps: 25.0,
+            has_audio: false,
+        };
+        let leftover: Arc<Mutex<Option<ExportJob>>> = Arc::default();
+        let (tx, rx) = mpsc::channel();
+        let mut w = MediaWindow {
+            media: Arc::new(media),
+            origin: Arc::new(Mutex::new(origin)),
+            work_root: tmp.path().join("work"),
+            marks: Marks::default(),
+            sel: Selection::default(),
+            tex: None,
+            tex_pts: None,
+            want: None,
+            scrub: None,
+            wave: None,
+            player: None,
+            job: Some(ExportJob {
+                progress: Arc::default(),
+                rx,
+            }),
+            status: Status::default(),
+            outcome: Arc::default(),
+            started: false,
+            painted: false,
+            close_when_done: false,
+            close_ok: false,
+            leftover: leftover.clone(),
+            export_hold: None,
+            resume: false,
+        };
+        use super::super::Window;
+        assert!(!w.close_requested(), "first close waits for the export");
+        assert!(w.status.text.contains("closes when the export is done"));
+        assert!(w.close_requested(), "second close closes the window");
+        drop(w);
+        let job = leftover.lock().unwrap().take().expect("export handed over");
+        tx.send(Ok("box:/v.cut-1-2.mp4".to_string())).unwrap();
+        let mut outcome = Outcome::default();
+        let status = report_export(job.rx.recv().unwrap(), &mut outcome);
+        assert!(outcome.exported);
+        assert!(status.text.contains("exported box:/v.cut-1-2.mp4"));
+    }
 
     #[test]
     fn clock_text_shapes() {
