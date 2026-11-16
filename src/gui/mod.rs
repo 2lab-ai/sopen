@@ -216,6 +216,9 @@ pub struct Hooks {
     /// `SOPEN_EXPORT_HOLD_MS`: the media window starts an Export on open and holds it, at its
     /// first progress report at or past 30 %, for this long (a screenshot mid-export).
     pub export_hold: Option<Duration>,
+    /// `SOPEN_WINDOW_SIZE=<w>x<h>`: open the window at this size in points (layout receipts on
+    /// a narrow window).
+    pub window_size: Option<[f32; 2]>,
 }
 
 impl Hooks {
@@ -235,6 +238,16 @@ impl Hooks {
         };
         let save_delay = millis("SOPEN_AUTOSAVE_DELAY_MS")?;
         let export_hold = millis("SOPEN_EXPORT_HOLD_MS")?;
+        let window_size = match std::env::var("SOPEN_WINDOW_SIZE") {
+            Ok(text) => {
+                let bad = || anyhow!("SOPEN_WINDOW_SIZE must be <width>x<height> (got '{text}')");
+                let (w, h) = text.split_once('x').ok_or_else(bad)?;
+                let (w, h): (f32, f32) =
+                    (w.parse().map_err(|_| bad())?, h.parse().map_err(|_| bad())?);
+                Some([w, h])
+            }
+            Err(_) => None,
+        };
         Ok(Self {
             screenshot: std::env::var_os("SOPEN_SCREENSHOT")
                 .filter(|p| !p.is_empty())
@@ -244,6 +257,7 @@ impl Hooks {
             autoexport: flag("SOPEN_AUTOEXPORT"),
             save_delay,
             export_hold,
+            window_size,
         })
     }
 
@@ -469,8 +483,12 @@ pub fn run_window<W: Window + 'static>(
             viewport: egui::ViewportBuilder::default()
                 .with_title(title)
                 .with_app_id("sopen")
-                .with_inner_size(size)
-                .with_min_inner_size([480.0, 320.0])
+                .with_inner_size(hooks.window_size.unwrap_or(size))
+                .with_min_inner_size(
+                    hooks
+                        .window_size
+                        .map_or([480.0, 320.0], |[w, h]| [w.min(480.0), h.min(320.0)]),
+                )
                 .with_active(true),
             renderer,
             centered: true,
@@ -546,9 +564,19 @@ impl Status {
 }
 
 /// A label that never wraps: text longer than the room left is cut with "…" and shown whole
-/// on hover.
+/// on hover. Only for text that may be cut — never for what is lost (see [`disclosures`]).
 pub fn one_line(ui: &mut egui::Ui, text: &str, color: egui::Color32) {
     ui.add(egui::Label::new(egui::RichText::new(text).color(color)).truncate());
+}
+
+/// What the owner must read whole — what Save / Export will not keep, a refused write and
+/// where the edit went — in its own rows that wrap instead of cutting. Their text changes only
+/// on open and when a write reports (applied between drags), so they never move the picture
+/// under a drag.
+pub fn disclosures(ui: &mut egui::Ui, lines: &[(String, egui::Color32)]) {
+    for (text, color) in lines {
+        ui.add(egui::Label::new(egui::RichText::new(text).color(*color)).wrap());
+    }
 }
 
 /// `line`, followed by what was not kept: `"<line> — not kept: XMP; alpha is dropped …"`.

@@ -967,6 +967,8 @@ pub fn open(file: ImageFile, hooks: &Hooks, notice: Option<String>) -> Result<Ou
         painted: false,
         zoom: 1.0,
         map: None,
+        notices: Vec::new(),
+        pending_notices: None,
     };
     // A window that shows the image near 1:1 where the screen allows; eframe clamps to it.
     let size = [
@@ -981,7 +983,7 @@ pub fn open(file: ImageFile, hooks: &Hooks, notice: Option<String>) -> Result<Ou
             .rx
             .recv()
             .unwrap_or_else(|_| Err(anyhow!("the save stopped without a result")));
-        report(&result, &mut outcome.lock().unwrap());
+        let _ = report(&result, &mut outcome.lock().unwrap());
     }
     run?;
     let outcome = outcome.lock().unwrap().clone();
@@ -1024,8 +1026,10 @@ fn autosave(mut file: ImageFile, doc: &Doc, hooks: &Hooks) -> Result<Outcome> {
 // The window.
 
 /// Prints a finished save to the terminal, records it in `outcome` and returns the window's
-/// status line. Also used for a save still in flight when the window went away.
-fn report(result: &Result<JobDone>, outcome: &mut Outcome) -> Status {
+/// one-line status and what must be shown whole (the disclosure rows): write notes, what was
+/// not kept, a refusal and where the edit went. Also used for a save still in flight when the
+/// window went away.
+fn report(result: &Result<JobDone>, outcome: &mut Outcome) -> (Status, Vec<String>) {
     match result {
         Ok(JobDone::Saved(Saved::Written {
             remote,
@@ -1042,35 +1046,32 @@ fn report(result: &Result<JobDone>, outcome: &mut Outcome) -> Status {
             for note in notes {
                 eprintln!("sopen: {note}");
             }
-            let all: Vec<String> = notes.iter().chain(not_kept).cloned().collect();
-            if all.is_empty() {
-                Status::info(format!(
-                    "saved {remote} · original backed up at {}",
-                    backup.display()
-                ))
-            } else {
-                // The owner has to see these (the remote changed right after; metadata).
-                Status::error(super::with_notes(&format!("saved {remote}"), &all))
-            }
+            let status = Status::info(format!(
+                "saved {remote} · original backed up at {}",
+                backup.display()
+            ));
+            (status, notes.iter().chain(not_kept).cloned().collect())
         }
         Ok(JobDone::Saved(Saved::Refused { message, .. })) => {
             outcome.conflict = true;
             outcome.refused = Some(message.clone());
             eprintln!("sopen: {message}");
-            Status::error(message.clone())
+            (
+                Status::error("not saved: the file changed"),
+                vec![message.clone()],
+            )
         }
         Ok(JobDone::Copy(path, not_kept)) => {
             let line = super::with_notes(&format!("saved a copy at {path}"), not_kept);
             println!("{line}");
-            if not_kept.is_empty() {
-                Status::info(line)
-            } else {
-                Status::error(line)
-            }
+            (
+                Status::info(format!("saved a copy at {path}")),
+                not_kept.clone(),
+            )
         }
         Err(e) => {
             eprintln!("sopen: {e:#}");
-            Status::error(format!("{e:#}"))
+            (Status::error("save failed"), vec![format!("{e:#}")])
         }
     }
 }
@@ -1126,6 +1127,10 @@ struct ImageWindow {
     zoom: f32,
     /// Where the last pass drew the image (screen ↔ image pixels).
     map: Option<Map>,
+    /// What the last write reported that must be read whole (see [`super::disclosures`]), and
+    /// the next such report, held while a rectangle is being drawn.
+    notices: Vec<String>,
+    pending_notices: Option<Vec<String>>,
 }
 
 impl Drop for ImageWindow {
@@ -1239,7 +1244,9 @@ impl ImageWindow {
             return;
         };
         let job = self.job.take().expect("checked above");
-        self.status = report(&result, &mut self.outcome.lock().unwrap());
+        let (status, shown) = report(&result, &mut self.outcome.lock().unwrap());
+        self.status = status;
+        self.pending_notices = Some(shown);
         let close_after = match &result {
             Ok(JobDone::Saved(Saved::Written { notes, .. })) => {
                 self.doc.mark_saved(job.rev);
@@ -1298,7 +1305,9 @@ impl ImageWindow {
         let editable = self.doc.read_only.is_none();
         let has_rect = self.rect().is_some();
         let busy = self.job.is_some();
-        ui.horizontal(|ui| {
+        // Wraps on a narrow window so Save stays reachable; its height depends only on the
+        // window width (button labels never change), so it cannot move the image mid-drag.
+        ui.horizontal_wrapped(|ui| {
             let why = "draw a rectangle on the image first";
             if ui
                 .add_enabled(editable && has_rect, egui::Button::new("Crop  C"))
@@ -1385,34 +1394,7 @@ impl ImageWindow {
                 ui.separator();
                 ui.label("unsaved changes");
             }
-            let warn = match &self.doc.read_only {
-                Some(reason) => Some(format!("read-only: {reason}")),
-                None => self.doc.not_kept_line(),
-            };
             ui.separator();
-            if let Some(warn) = warn {
-                // The warning and the status share the rest of the line: the status keeps up
-                // to half of it, the warning gets everything else.
-                let font = egui::TextStyle::Body.resolve(ui.style());
-                let width = |text: &str| {
-                    ui.painter()
-                        .layout_no_wrap(text.to_string(), font.clone(), Color32::WHITE)
-                        .size()
-                        .x
-                };
-                let room = ui.available_width();
-                let status = if self.status.text.is_empty() {
-                    0.0
-                } else {
-                    (width(&self.status.text) + 16.0).min(room / 2.0)
-                };
-                let size = Vec2::new(room - status, ui.available_height());
-                let color = ui.visuals().warn_fg_color;
-                ui.allocate_ui(size, |ui| super::one_line(ui, &warn, color));
-                if !self.status.text.is_empty() {
-                    ui.separator();
-                }
-            }
             self.status.show(ui);
         });
     }
@@ -1571,11 +1553,34 @@ impl super::Window for ImageWindow {
             self.toolbar(ui);
             ui.add_space(1.0);
         });
+        // A report that lands mid-drag waits until the rectangle is let go.
+        if !self.sel.dragging() {
+            if let Some(next) = self.pending_notices.take() {
+                self.notices = next;
+            }
+        }
         egui::Panel::bottom("status").show(ui, |ui| {
             ui.add_space(2.0);
             self.status_bar(ui);
             ui.add_space(2.0);
         });
+        let warn = ui.visuals().warn_fg_color;
+        let error = ui.visuals().error_fg_color;
+        let lines: Vec<(String, Color32)> = match &self.doc.read_only {
+            Some(reason) => Some(format!("read-only: {reason}")),
+            None => self.doc.not_kept_line(),
+        }
+        .map(|l| (l, warn))
+        .into_iter()
+        .chain(self.notices.iter().map(|n| (n.clone(), error)))
+        .collect();
+        if !lines.is_empty() {
+            egui::Panel::bottom("disclosures").show(ui, |ui| {
+                ui.add_space(2.0);
+                super::disclosures(ui, &lines);
+                ui.add_space(2.0);
+            });
+        }
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE)
             .show(ui, |ui| self.zoom = self.central(ui));
@@ -2127,6 +2132,8 @@ mod tests {
             painted: false,
             zoom: 1.0,
             map: None,
+            notices: Vec::new(),
+            pending_notices: None,
         }
     }
 

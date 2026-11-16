@@ -131,11 +131,12 @@ impl Driver {
         self.idle(win, 1);
     }
 
-    /// Where the last pass drew `text` (a button's label), if it did.
+    /// Where the last pass drew `text` whole (a button's label, a disclosure), if it did. A
+    /// galley cut short with "…" keeps the full string but is `elided`: that does not count.
     pub fn find_text(&self, text: &str) -> Option<Rect> {
         fn walk(shape: &egui::Shape, text: &str) -> Option<Rect> {
             match shape {
-                egui::Shape::Text(t) if t.galley.text() == text => {
+                egui::Shape::Text(t) if t.galley.text() == text && !t.galley.elided => {
                     Some(t.galley.rect.translate(t.pos.to_vec2()))
                 }
                 egui::Shape::Vec(v) => v.iter().find_map(|s| walk(s, text)),

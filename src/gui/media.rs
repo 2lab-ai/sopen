@@ -373,6 +373,8 @@ pub fn open(
         sink: Sink::Device,
         map: None,
         timeline_rect: None,
+        notices: Vec::new(),
+        pending_notices: None,
     };
     let run = super::run_window(&title, size, window, hooks);
     // Never exit with an export in flight without its outcome on the terminal.
@@ -382,30 +384,29 @@ pub fn open(
             .rx
             .recv()
             .unwrap_or_else(|_| Err(anyhow::anyhow!("the export stopped without a result")));
-        report_export(result, &mut outcome.lock().unwrap());
+        let _ = report_export(result, &mut outcome.lock().unwrap());
     }
     run?;
     let outcome = outcome.lock().unwrap().clone();
     Ok(outcome)
 }
 
-/// Prints a finished export to the terminal, records it and returns the status line.
-fn report_export(result: Result<(String, Vec<String>)>, outcome: &mut Outcome) -> Status {
+/// Prints a finished export to the terminal, records it and returns the one-line status and
+/// what must be shown whole (the disclosure rows): what the export did not keep, or the error.
+fn report_export(
+    result: Result<(String, Vec<String>)>,
+    outcome: &mut Outcome,
+) -> (Status, Vec<String>) {
     match result {
         Ok((path, notes)) => {
             outcome.exported = true;
-            let line = super::with_notes(&format!("exported {path}"), &notes);
-            println!("{line}");
-            if notes.is_empty() {
-                Status::info(line)
-            } else {
-                Status::error(line)
-            }
+            println!("{}", super::with_notes(&format!("exported {path}"), &notes));
+            (Status::info(format!("exported {path}")), notes)
         }
         Err(e) => {
             let e = export_error(&e);
             eprintln!("sopen: {e:#}");
-            Status::error(format!("{e:#}"))
+            (Status::error("export failed"), vec![format!("{e:#}")])
         }
     }
 }
@@ -448,6 +449,10 @@ struct MediaWindow {
     /// Where the last pass drew the frame (screen ↔ source pixels) and the timeline.
     map: Option<Map>,
     timeline_rect: Option<Rect>,
+    /// What the last export reported that must be read whole, and the next such report, held
+    /// while a crop is being drawn.
+    notices: Vec<String>,
+    pending_notices: Option<Vec<String>>,
 }
 
 impl MediaWindow {
@@ -615,7 +620,14 @@ impl MediaWindow {
             return;
         };
         self.job = None;
-        self.status = report_export(result, &mut self.outcome.lock().unwrap());
+        let (status, shown) = report_export(result, &mut self.outcome.lock().unwrap());
+        self.status = status;
+        // The plan's notes are on screen from the start; show only what is new.
+        let new: Vec<String> = shown
+            .into_iter()
+            .filter(|n| !self.media.notes.contains(n))
+            .collect();
+        self.pending_notices = Some(new);
         if std::mem::take(&mut self.close_when_done) {
             self.close_ok = true;
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -833,18 +845,13 @@ impl MediaWindow {
                 } else {
                     String::new()
                 };
-                ui.monospace(format!("crop {x},{y} {w}×{h}{even}"));
+                // Cut, not wrapped, on a narrow window: this line changes during a drag.
+                let text = egui::RichText::new(format!("crop {x},{y} {w}×{h}{even}")).monospace();
+                ui.add(egui::Label::new(text).truncate());
             }
             ui.separator();
             self.status.show(ui);
         });
-        // What Export will not keep, before the owner exports (never lost silently).
-        if !m.notes.is_empty() {
-            ui.colored_label(
-                ui.visuals().warn_fg_color,
-                format!("Export: {}", m.notes.join("; ")),
-            );
-        }
     }
 
     fn picture(&mut self, ui: &mut egui::Ui) {
@@ -916,11 +923,29 @@ impl super::Window for MediaWindow {
                 None => {}
             }
         }
+        if !self.sel.dragging() {
+            if let Some(next) = self.pending_notices.take() {
+                self.notices = next;
+            }
+        }
         egui::Panel::top("info").show(ui, |ui| {
             ui.add_space(3.0);
             self.info(ui);
             ui.add_space(1.0);
         });
+        let warn = ui.visuals().warn_fg_color;
+        let error = ui.visuals().error_fg_color;
+        let lines: Vec<(String, Color32)> = (!self.media.notes.is_empty())
+            .then(|| (format!("Export: {}", self.media.notes.join("; ")), warn))
+            .into_iter()
+            .chain(self.notices.iter().map(|n| (n.clone(), error)))
+            .collect();
+        if !lines.is_empty() {
+            egui::Panel::top("disclosures").show(ui, |ui| {
+                super::disclosures(ui, &lines);
+                ui.add_space(2.0);
+            });
+        }
         let mut seek = None;
         let audio_only = self.audio_only();
         egui::Panel::bottom("transport").show(ui, |ui| {
@@ -1052,6 +1077,8 @@ mod tests {
             sink: Sink::Null,
             map: None,
             timeline_rect: None,
+            notices: Vec::new(),
+            pending_notices: None,
         };
         use super::super::Window;
         assert!(!w.close_requested(), "first close waits for the export");
@@ -1062,7 +1089,7 @@ mod tests {
         tx.send(Ok(("box:/v.cut-1-2.mp4".to_string(), Vec::new())))
             .unwrap();
         let mut outcome = Outcome::default();
-        let status = report_export(job.rx.recv().unwrap(), &mut outcome);
+        let (status, _) = report_export(job.rx.recv().unwrap(), &mut outcome);
         assert!(outcome.exported);
         assert!(status.text.contains("exported box:/v.cut-1-2.mp4"));
     }

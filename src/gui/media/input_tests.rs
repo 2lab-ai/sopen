@@ -52,7 +52,13 @@ fn open(path: PathBuf, tmp: tempfile::TempDir) -> Fixture {
 }
 
 fn open_sized(path: PathBuf, tmp: tempfile::TempDir, w: f32, h: f32) -> Fixture {
-    let media = Media::probe(&path).unwrap();
+    open_with(path, tmp, w, h, Vec::new())
+}
+
+/// `notes` are added to what the probe found (a long "not kept" note for the layout tests).
+fn open_with(path: PathBuf, tmp: tempfile::TempDir, w: f32, h: f32, notes: Vec<String>) -> Fixture {
+    let mut media = Media::probe(&path).unwrap();
+    media.notes.extend(notes);
     let abs = path.to_str().unwrap().to_string();
     let mut fs = LocalFs::new();
     let at = fs.stat(&abs).unwrap();
@@ -82,6 +88,8 @@ fn open_sized(path: PathBuf, tmp: tempfile::TempDir, w: f32, h: f32) -> Fixture 
         sink: Sink::Null,
         map: None,
         timeline_rect: None,
+        notices: Vec::new(),
+        pending_notices: None,
     };
     let mut fx = Fixture {
         tmp,
@@ -247,7 +255,10 @@ fn e_and_the_export_button_export_in_out_and_crop() {
     assert_eq!(fx.win.crop(), Some([41, 21, 200, 120]));
 
     fx.key(Key::E);
-    assert!(fx.win.job.is_some(), "E started an export");
+    assert!(
+        fx.win.job.is_some() || fx.win.status.text.starts_with("exported "),
+        "E started an export"
+    );
     fx.drv.until(&mut fx.win, 60, |w| w.job.is_none());
     assert!(
         fx.win.status.text.starts_with("exported "),
@@ -270,7 +281,10 @@ fn e_and_the_export_button_export_in_out_and_crop() {
     // The Export button does the same, into a new sibling.
     fx.drv.idle(&mut fx.win, 2);
     fx.drv.click_text(&mut fx.win, "Export  E");
-    assert!(fx.win.job.is_some(), "the button started an export");
+    assert!(
+        fx.win.job.is_some() || fx.win.outcome.lock().unwrap().exported,
+        "the button started an export"
+    );
     fx.drv.until(&mut fx.win, 60, |w| w.job.is_none());
     assert_eq!(fx.cuts().len(), 2, "{:?}", fx.cuts());
 }
@@ -293,4 +307,39 @@ fn frame_stays_put_while_a_crop_is_drawn_next_to_a_long_status() {
     fx.drv.drag(&mut fx.win, PointerButton::Primary, a, b);
     assert_eq!(fx.win.map, map, "the frame stayed put during the drag");
     assert_eq!(fx.win.crop(), Some([20, 30, 180, 120]));
+}
+
+/// What Export will not keep is never cut off: on a 420 px window the whole note is laid out
+/// (its own row, wrapping) and the frame does not move while a crop is drawn.
+#[test]
+fn export_note_is_shown_whole_on_a_narrow_window_and_the_frame_stays_put() {
+    let Some(tools) = tools_or_skip() else { return };
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("clip.mp4");
+    clip(&tools, &path);
+    let note =
+        "not kept: 1 subtitle stream, 2 data streams, 1 attachment stream, cover art".to_string();
+    let mut fx = open_with(path, tmp, 420.0, 560.0, vec![note.clone()]);
+    let row = format!("Export: {}", fx.win.media.notes.join("; "));
+    assert!(fx.drv.find_text(&row).is_some(), "shown whole: {row}");
+    let quiet = fx.win.map;
+    let (a, b) = (fx.at(20.0, 30.0), fx.at(200.0, 150.0));
+    fx.drv.drag(&mut fx.win, PointerButton::Primary, a, b);
+    assert_eq!(fx.win.map, quiet, "the frame moved");
+    assert_eq!(fx.win.crop(), Some([20, 30, 180, 120]));
+}
+
+/// An export result's notes go to the always-visible row; the one-line status only says where
+/// the file went.
+#[test]
+fn export_result_notes_leave_the_status_line() {
+    let mut outcome = Outcome::default();
+    let notes = vec!["not kept: 1 subtitle stream".to_string()];
+    let (status, shown) = report_export(
+        Ok(("box:/a.cut-1-2.mp4".to_string(), notes.clone())),
+        &mut outcome,
+    );
+    assert_eq!(status.text, "exported box:/a.cut-1-2.mp4");
+    assert_eq!(shown, notes);
+    assert!(outcome.exported);
 }

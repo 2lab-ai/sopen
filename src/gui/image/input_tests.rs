@@ -31,11 +31,35 @@ fn open() -> Fixture {
 }
 
 fn open_sized(w: f32, h: f32) -> Fixture {
-    let tmp = tempfile::tempdir().unwrap();
-    let path = tmp.path().join("shot.png");
     let bytes = encode(&coordinates(), ImageFormat::Png, None, None)
         .unwrap()
         .bytes;
+    open_bytes("shot.png", bytes, w, h)
+}
+
+/// A JPEG of the coordinate image carrying XMP (APP1) and a comment (COM): Save keeps neither.
+fn xmp_jpeg() -> Vec<u8> {
+    let jpeg = encode(&coordinates(), ImageFormat::Jpeg, None, None)
+        .unwrap()
+        .bytes;
+    let mut out = jpeg[..2].to_vec();
+    let xmp = [
+        b"http://ns.adobe.com/xap/1.0/\0".as_slice(),
+        b"<x:xmpmeta/>",
+    ]
+    .concat();
+    for (marker, data) in [(0xE1u8, xmp), (0xFE, b"a comment".to_vec())] {
+        out.extend_from_slice(&[0xFF, marker]);
+        out.extend_from_slice(&((data.len() + 2) as u16).to_be_bytes());
+        out.extend_from_slice(&data);
+    }
+    out.extend_from_slice(&jpeg[2..]);
+    out
+}
+
+fn open_bytes(name: &str, bytes: Vec<u8>, w: f32, h: f32) -> Fixture {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join(name);
     std::fs::write(&path, &bytes).unwrap();
     let abs = path.to_str().unwrap().to_string();
     let mut fs = LocalFs::new();
@@ -63,6 +87,8 @@ fn open_sized(w: f32, h: f32) -> Fixture {
         painted: false,
         zoom: 1.0,
         map: None,
+        notices: Vec::new(),
+        pending_notices: None,
     };
     let mut fx = Fixture {
         tmp,
@@ -204,8 +230,14 @@ fn escape_clears_and_a_handle_drag_resizes() {
     assert_eq!(fx.rect(), None);
 }
 
+/// The save the last input started has finished. A small save can finish within the passes
+/// that delivered the key or click, so "started" is the job running or its result already in.
 fn wait_for_save(fx: &mut Fixture) {
-    assert!(fx.win.job.is_some(), "a save job started");
+    assert!(
+        fx.win.job.is_some() || fx.win.status.text.starts_with("saved "),
+        "no save started: {}",
+        fx.win.status.text
+    );
     fx.drv.until(&mut fx.win, 20, |w| w.job.is_none());
 }
 
@@ -271,4 +303,48 @@ fn image_stays_put_while_a_rectangle_is_drawn_next_to_a_long_status() {
     assert_eq!(fx.rect(), Some([10, 10, 50, 30]));
     fx.settle();
     assert_eq!(fx.win.map, quiet, "the status bar changed height");
+}
+
+/// What Save will not keep is never cut off: on a 420 px window with a long disclosure the
+/// whole text is laid out (its own row, wrapping), and that row does not move the image while a
+/// rectangle is drawn. After Save, the result's "not kept" lands in that row too, whole, and the
+/// one-line status says only "saved …".
+#[test]
+fn loss_disclosure_is_shown_whole_on_a_narrow_window_and_the_image_stays_put() {
+    let mut fx = open_bytes("x.jpg", xmp_jpeg(), 420.0, 560.0);
+    fx.win.doc.lost.push(
+        "ICC profile not kept: a long reason that will not fit on one line of a narrow window"
+            .to_string(),
+    );
+    fx.settle();
+    let line = fx.win.doc.not_kept_line().unwrap();
+    assert!(
+        line.starts_with("Save will not keep: XMP, comment"),
+        "{line}"
+    );
+    assert!(fx.drv.find_text(&line).is_some(), "shown whole: {line}");
+    let quiet = fx.win.map;
+    fx.select((10.0, 10.0), (60.0, 40.0)); // asserts the image stayed put during the drag
+    fx.settle();
+    assert_eq!(fx.win.map, quiet, "the image moved");
+    assert_eq!(fx.rect(), Some([10, 10, 50, 30]));
+
+    fx.key(Key::P, Modifiers::NONE);
+    fx.key(Key::S, command(false));
+    wait_for_save(&mut fx);
+    fx.settle();
+    assert!(
+        fx.win.status.text.starts_with("saved "),
+        "{}",
+        fx.win.status.text
+    );
+    assert!(
+        !fx.win.status.text.contains("not kept"),
+        "{}",
+        fx.win.status.text
+    );
+    assert!(
+        fx.drv.find_text("not kept: XMP, comment").is_some(),
+        "the save result's disclosure is shown whole"
+    );
 }
