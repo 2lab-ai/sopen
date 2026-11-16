@@ -533,13 +533,22 @@ impl Status {
         }
     }
 
+    /// On one line, cut to the room left (the full text on hover): a status bar must keep its
+    /// height, or the picture above it moves under the pointer.
     pub fn show(&self, ui: &mut egui::Ui) {
-        if self.error {
-            ui.colored_label(ui.visuals().error_fg_color, &self.text);
+        let color = if self.error {
+            ui.visuals().error_fg_color
         } else {
-            ui.label(&self.text);
-        }
+            ui.visuals().text_color()
+        };
+        one_line(ui, &self.text, color);
     }
+}
+
+/// A label that never wraps: text longer than the room left is cut with "…" and shown whole
+/// on hover.
+pub fn one_line(ui: &mut egui::Ui, text: &str, color: egui::Color32) {
+    ui.add(egui::Label::new(egui::RichText::new(text).color(color)).truncate());
 }
 
 /// `line`, followed by what was not kept: `"<line> — not kept: XMP; alpha is dropped …"`.

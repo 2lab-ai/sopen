@@ -748,11 +748,10 @@ impl MediaWindow {
         let ctx = ui.ctx().clone();
         ui.horizontal_wrapped(|ui| {
             let playing = self.player.is_some();
-            if ui
-                .button(if playing { "Pause" } else { "Play" })
-                .on_hover_text("Space")
-                .clicked()
-            {
+            // Fixed width: "Play" ↔ "Pause" must not reflow the row.
+            let play = egui::Button::new(if playing { "Pause" } else { "Play" })
+                .min_size(Vec2::new(64.0, 0.0));
+            if ui.add(play).on_hover_text("Space").clicked() {
                 if playing {
                     self.pause(&ctx);
                 } else {
@@ -805,9 +804,10 @@ impl MediaWindow {
         }
     }
 
+    /// One line whatever it says (see [`super::one_line`]): the frame below must not move.
     fn info(&self, ui: &mut egui::Ui) {
         let m = &self.media;
-        ui.horizontal_wrapped(|ui| {
+        ui.horizontal(|ui| {
             match m.video {
                 Some((w, h)) => ui.monospace(format!(
                     "{w}×{h}{} · {:.2} fps · {}{}",

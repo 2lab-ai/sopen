@@ -48,6 +48,10 @@ struct Fixture {
 }
 
 fn open(path: PathBuf, tmp: tempfile::TempDir) -> Fixture {
+    open_sized(path, tmp, 900.0, 700.0)
+}
+
+fn open_sized(path: PathBuf, tmp: tempfile::TempDir, w: f32, h: f32) -> Fixture {
     let media = Media::probe(&path).unwrap();
     let abs = path.to_str().unwrap().to_string();
     let mut fs = LocalFs::new();
@@ -82,7 +86,7 @@ fn open(path: PathBuf, tmp: tempfile::TempDir) -> Fixture {
     let mut fx = Fixture {
         tmp,
         win,
-        drv: Driver::new(900.0, 700.0),
+        drv: Driver::new(w, h),
     };
     fx.settle();
     fx
@@ -269,4 +273,24 @@ fn e_and_the_export_button_export_in_out_and_crop() {
     assert!(fx.win.job.is_some(), "the button started an export");
     fx.drv.until(&mut fx.win, 60, |w| w.job.is_none());
     assert_eq!(fx.cuts().len(), 2, "{:?}", fx.cuts());
+}
+
+/// The frame must not move under the pointer while a crop is drawn: the info bar keeps its
+/// height when the "crop …" readout appears next to a long status (it used to wrap).
+#[test]
+fn frame_stays_put_while_a_crop_is_drawn_next_to_a_long_status() {
+    let Some(tools) = tools_or_skip() else { return };
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("clip.mp4");
+    clip(&tools, &path);
+    let mut fx = open_sized(path, tmp, 560.0, 520.0);
+    let quiet = fx.win.map;
+    fx.win.status = Status::info(format!("exported {}", "/a/rather/long/path".repeat(5)));
+    fx.settle();
+    assert_eq!(fx.win.map, quiet, "the info bar changed height");
+    let map = fx.win.map;
+    let (a, b) = (fx.at(20.0, 30.0), fx.at(200.0, 150.0));
+    fx.drv.drag(&mut fx.win, PointerButton::Primary, a, b);
+    assert_eq!(fx.win.map, map, "the frame stayed put during the drag");
+    assert_eq!(fx.win.crop(), Some([20, 30, 180, 120]));
 }

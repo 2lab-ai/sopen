@@ -27,6 +27,10 @@ struct Fixture {
 }
 
 fn open() -> Fixture {
+    open_sized(1000.0, 700.0)
+}
+
+fn open_sized(w: f32, h: f32) -> Fixture {
     let tmp = tempfile::tempdir().unwrap();
     let path = tmp.path().join("shot.png");
     let bytes = encode(&coordinates(), ImageFormat::Png, None, None)
@@ -64,7 +68,7 @@ fn open() -> Fixture {
         tmp,
         path,
         win,
-        drv: Driver::new(1000.0, 700.0),
+        drv: Driver::new(w, h),
     };
     fx.drv.idle(&mut fx.win, 2);
     fx
@@ -246,4 +250,25 @@ fn save_button_and_command_s_save_to_disk() {
     let backups = files(&fx.tmp.path().join("cache/backup"));
     assert_eq!(backups.len(), 1, "{backups:?}");
     assert_eq!(std::fs::read(&backups[0]).unwrap(), original);
+}
+
+/// The image must not move under the pointer while a rectangle is drawn. On a narrow window
+/// with a long status line, the "rect …" readout that appears with the rectangle wrapped the
+/// status bar onto a second line mid-drag, so the image shifted up and the rectangle landed on
+/// other pixels than the ones under the pointer (seen on Linux, 2026-11-16).
+#[test]
+fn image_stays_put_while_a_rectangle_is_drawn_next_to_a_long_status() {
+    let mut fx = open_sized(640.0, 480.0);
+    fx.settle();
+    let quiet = fx.win.map;
+    // However long the status and whatever the readouts, the status bar keeps one line.
+    fx.win.status = Status::info(format!(
+        "saved {} · original backed up at {}",
+        "/a/rather/long/path".repeat(4),
+        "/the/backup/path".repeat(4)
+    ));
+    fx.select((10.0, 10.0), (60.0, 40.0));
+    assert_eq!(fx.rect(), Some([10, 10, 50, 30]));
+    fx.settle();
+    assert_eq!(fx.win.map, quiet, "the status bar changed height");
 }

@@ -1367,10 +1367,11 @@ impl ImageWindow {
     }
 
     /// `zoom` is the previous pass's (the image is laid out after the bar).
+    /// One line whatever it says (see [`super::one_line`]): the image above must not move.
     fn status_bar(&mut self, ui: &mut egui::Ui) {
         let zoom = self.zoom;
         let (w, h) = self.doc.size();
-        ui.horizontal_wrapped(|ui| {
+        ui.horizontal(|ui| {
             ui.monospace(format!(
                 "{w}×{h} {} · {:.0}%",
                 format_name(self.doc.format),
@@ -1384,14 +1385,34 @@ impl ImageWindow {
                 ui.separator();
                 ui.label("unsaved changes");
             }
-            if let Some(reason) = &self.doc.read_only {
-                ui.separator();
-                ui.colored_label(ui.visuals().warn_fg_color, format!("read-only: {reason}"));
-            } else if let Some(line) = self.doc.not_kept_line() {
-                ui.separator();
-                ui.colored_label(ui.visuals().warn_fg_color, line);
-            }
+            let warn = match &self.doc.read_only {
+                Some(reason) => Some(format!("read-only: {reason}")),
+                None => self.doc.not_kept_line(),
+            };
             ui.separator();
+            if let Some(warn) = warn {
+                // The warning and the status share the rest of the line: the status keeps up
+                // to half of it, the warning gets everything else.
+                let font = egui::TextStyle::Body.resolve(ui.style());
+                let width = |text: &str| {
+                    ui.painter()
+                        .layout_no_wrap(text.to_string(), font.clone(), Color32::WHITE)
+                        .size()
+                        .x
+                };
+                let room = ui.available_width();
+                let status = if self.status.text.is_empty() {
+                    0.0
+                } else {
+                    (width(&self.status.text) + 16.0).min(room / 2.0)
+                };
+                let size = Vec2::new(room - status, ui.available_height());
+                let color = ui.visuals().warn_fg_color;
+                ui.allocate_ui(size, |ui| super::one_line(ui, &warn, color));
+                if !self.status.text.is_empty() {
+                    ui.separator();
+                }
+            }
             self.status.show(ui);
         });
     }
