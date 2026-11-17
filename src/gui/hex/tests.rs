@@ -6,6 +6,7 @@ use crate::gui::testkit::{command, Driver};
 use crate::gui::Window;
 use crate::remote::{LocalFs, RemoteFs};
 use eframe::egui::{Event, Modifiers};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// The first row spells something; the second is short and has non-printable bytes.
 const FIXTURE: &[u8] = b"sopen hex view\x00\xffABC\n\x80";
@@ -427,10 +428,12 @@ fn save_writes_the_patched_bytes_back_after_a_backup() {
 }
 
 /// The local disk, calling `before_write` the first time anything is created on it (the first
-/// write of a Save, before the remote is touched).
+/// write of a Save, before the remote is touched), and `after_rename` right after the first
+/// rename over the target lands.
 struct FirstWrite {
     fs: LocalFs,
     before_write: Option<Box<dyn FnOnce() + Send>>,
+    after_rename: Option<Box<dyn FnOnce() + Send>>,
 }
 
 impl RemoteFs for FirstWrite {
@@ -472,7 +475,11 @@ impl RemoteFs for FirstWrite {
         self.fs.set_mode(p, mode)
     }
     fn rename_over(&mut self, from: &str, to: &str) -> Result<()> {
-        self.fs.rename_over(from, to)
+        self.fs.rename_over(from, to)?;
+        if let Some(hook) = self.after_rename.take() {
+            hook();
+        }
+        Ok(())
     }
     fn link_new(&mut self, from: &str, to: &str) -> Result<()> {
         self.fs.link_new(from, to)
@@ -501,6 +508,7 @@ fn the_backup_is_complete_before_the_remote_is_written() {
             let found = walk(&backups);
             *seen2.lock().unwrap() = found.iter().map(|p| std::fs::read(p).unwrap()).collect();
         })),
+        after_rename: None,
     };
     let origin = Origin::new(Box::new(fs), None, None, abs.clone(), at);
     let mut file = HexFile::open(origin, &base, None, &cache).unwrap();
@@ -1230,6 +1238,7 @@ fn same_length_changes_are_refused() {
     let fs = FirstWrite {
         fs: LocalFs::new(),
         before_write: Some(Box::new(move || std::fs::rename(&swap, &target).unwrap())),
+        after_rename: None,
     };
     let origin = Origin::new(Box::new(fs), None, None, abs, at);
     let mut file = HexFile::open(origin, &pair.base, None, &pair.cache()).unwrap();
@@ -1394,6 +1403,53 @@ fn a_save_that_lands_with_notes_keeps_the_window_open() {
     }
 }
 
+/// A close asked for during a Save that was itself chosen in the close prompt is used up by that
+/// Save, whatever it reports (notes, or a failure): a later ordinary Save never closes the window.
+#[test]
+fn a_close_request_does_not_outlive_its_save() {
+    let written = |notes: Vec<String>| {
+        Ok(JobDone::Saved(Saved::Written {
+            remote: "box:/blob.bin".to_string(),
+            backup: PathBuf::from("/backup/blob.bin"),
+            notes,
+        }))
+    };
+    for first in ["notes", "failure"] {
+        let mut fx = fetched("blob.bin", FIXTURE, 1000.0, 600.0);
+        fx.typed("00");
+        let (tx, rx) = mpsc::channel();
+        fx.win.job = Some(Job {
+            kind: JobKind::Save { close_after: true },
+            snapshot: fx.win.doc.patches().clone(),
+            rx,
+        });
+        assert!(!fx.win.close_requested(), "{first}: waits for the save");
+        tx.send(if first == "notes" {
+            written(vec!["saved, but the remote changed right after".to_string()])
+        } else {
+            Err(anyhow!("the disk is full"))
+        })
+        .unwrap();
+        fx.settle();
+        assert!(!fx.win.close_ok, "{first}: the first save keeps it open");
+        fx.win.prompt = false;
+        // Later, an ordinary Save (not asked to close) lands cleanly.
+        fx.typed("11");
+        let (tx, rx) = mpsc::channel();
+        fx.win.job = Some(Job {
+            kind: JobKind::Save { close_after: false },
+            snapshot: fx.win.doc.patches().clone(),
+            rx,
+        });
+        tx.send(written(Vec::new())).unwrap();
+        fx.settle();
+        assert!(
+            !fx.win.close_ok,
+            "{first}: a stale close request closed the window"
+        );
+    }
+}
+
 /// A save whose worker ends without a result is a visible failure: the edits stay, the window
 /// stays usable, and a new Save works — even when the dead worker held the file.
 #[test]
@@ -1482,6 +1538,29 @@ fn the_go_to_field_owns_the_typing_of_its_frame() {
         "a click into the field with typing edited a byte"
     );
     assert_eq!(fx.win.doc.changed_count(), 0);
+    assert_eq!(fx.win.cursor, cursor, "the typing moved the cursor");
+    // Back to the grid; then the press itself and typing in one frame.
+    fx.key(Key::Escape, Modifiers::NONE);
+    fx.win.goto.clear();
+    fx.drv.idle(&mut fx.win, 2);
+    assert_ne!(fx.drv.ctx.memory(|m| m.focused()), Some(goto_id()));
+    let events = vec![
+        Event::PointerButton {
+            pos: field.center(),
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: Modifiers::NONE,
+        },
+        Event::Text("a".into()),
+    ];
+    fx.drv.frame(&mut fx.win, events, Modifiers::NONE);
+    fx.drv.release(&mut fx.win, egui::PointerButton::Primary);
+    fx.drv.idle(&mut fx.win, 1);
+    assert_eq!(
+        fx.win.doc.rev(),
+        rev,
+        "a press into the field with typing edited a byte"
+    );
     assert_eq!(fx.win.cursor, cursor, "the typing moved the cursor");
 }
 
@@ -1605,4 +1684,247 @@ fn the_cursor_is_painted_in_both_columns() {
     assert_eq!(painted(&fx, 18), (false, true, true, false));
     assert!(fx.drv.find_text("ABC..").is_some());
     assert!(fx.drv.find_text("41 42 43 0A 80").is_some());
+    fx.key(Key::Z, command(true));
+    assert_eq!(fx.at(), 18, "redo puts the cursor on the byte");
+    assert_eq!(painted(&fx, 18), (false, true, true, false));
+    assert!(
+        fx.drv.find_text("ABZ..").is_some(),
+        "redone in the ASCII column"
+    );
+    assert!(
+        fx.drv.find_text("41 42 5A 0A 80").is_some(),
+        "redone in the hex column"
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// After a save: what the window reads from, and where nothing may be left.
+
+/// A cached copy changed during an upload, with its mtime put back: the upload cannot change the
+/// copy, so its identity is never refreshed after a save — the next Save sees the change and
+/// refuses instead of uploading the changed bytes.
+#[test]
+fn a_cached_copy_changed_during_an_upload_is_refused_by_the_next_save() {
+    use sha2::Digest;
+    let pair = Pair::new(FIXTURE, false);
+    let abs = pair.remote.to_str().unwrap().to_string();
+    let (base, was) = (pair.base.clone(), mtime(&pair.base));
+    let fs = FirstWrite {
+        fs: LocalFs::new(),
+        before_write: Some(Box::new(move || {
+            let f = File::options().write(true).open(&base).unwrap();
+            f.write_all_at(b"X", 5).unwrap();
+            f.set_times(std::fs::FileTimes::new().set_modified(was))
+                .unwrap();
+        })),
+        after_rename: None,
+    };
+    let mut at = LocalFs::new().stat(&abs).unwrap();
+    at.sha256 = Some(sha2::Sha256::digest(FIXTURE).into());
+    let origin = Origin::new(Box::new(fs), None, None, abs, at);
+    let mut file = HexFile::open(origin, &pair.base, None, &pair.cache()).unwrap();
+    let first = file.save(&BTreeMap::from([(0u64, 0u8)])).unwrap();
+    assert!(matches!(first, Saved::Written { .. }), "{first:?}");
+    let mut want = FIXTURE.to_vec();
+    want[0] = 0;
+    assert_eq!(std::fs::read(&pair.remote).unwrap(), want);
+    assert_eq!(mtime(&pair.base), was, "the change hides behind its mtime");
+    let second = file.save(&BTreeMap::from([(0u64, 0u8), (1, 0)])).unwrap();
+    assert!(matches!(second, Saved::Refused { .. }), "{second:?}");
+    assert_eq!(
+        std::fs::read(&pair.remote).unwrap(),
+        want,
+        "the changed copy's bytes were uploaded"
+    );
+}
+
+/// A local file saved in place: the rename replaced the file the window read, so the window
+/// reads the new one from then on — checked to hold exactly what was saved — and it is the new
+/// original: no byte counts as changed, undo still goes back.
+#[test]
+fn a_local_file_saved_in_place_becomes_the_new_original() {
+    use std::os::unix::fs::MetadataExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("local.bin");
+    std::fs::write(&path, FIXTURE).unwrap();
+    let mut fx = in_place(&path, tmp, 1000.0, 600.0);
+    fx.key(Key::ArrowRight, Modifiers::NONE);
+    fx.typed("00");
+    fx.key(Key::S, command(false));
+    fx.wait_for_save();
+    let held = fx.win.file.lock().unwrap().base().metadata().unwrap().ino();
+    assert_eq!(
+        held,
+        std::fs::metadata(&path).unwrap().ino(),
+        "reads the new file"
+    );
+    assert_eq!(
+        fx.win.doc.changed_count(),
+        0,
+        "the saved byte is the original now"
+    );
+    assert!(!fx.win.doc.dirty() && !fx.win.doc.unsaved());
+    assert_eq!(fx.win.doc.byte(1), Some(0));
+    fx.settle();
+    assert!(fx.drv.find_text("0 bytes changed").is_some());
+    // Undo goes back past the save: a change against the new original.
+    fx.key(Key::Z, command(false));
+    assert_eq!(fx.win.doc.byte(1), Some(b'o'));
+    assert_eq!(fx.win.doc.changed_count(), 1);
+    fx.key(Key::Z, command(true));
+    assert_eq!(fx.win.doc.byte(1), Some(0));
+    assert_eq!(fx.win.doc.changed_count(), 0);
+}
+
+/// A local file changed by someone else right after sopen's save replaced it: the new file does
+/// not hold what was saved, so the window does not take it as the original — it turns
+/// read-only, says so whole, and lists the edits in a file of their own.
+#[test]
+fn a_local_file_changed_right_after_its_save_turns_the_window_read_only() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("local.bin");
+    std::fs::write(&path, FIXTURE).unwrap();
+    let abs = path.to_str().unwrap().to_string();
+    let target = path.clone();
+    let fs = FirstWrite {
+        fs: LocalFs::new(),
+        before_write: None,
+        after_rename: Some(Box::new(move || {
+            File::options()
+                .write(true)
+                .open(&target)
+                .unwrap()
+                .write_all_at(b"ZZ", 3)
+                .unwrap();
+        })),
+    };
+    let at = LocalFs::new().stat(&abs).unwrap();
+    let origin = Origin::new(Box::new(fs), None, None, abs, at);
+    let cache = tmp.path().join("cache");
+    let file = HexFile::open(origin, &path, None, &cache).unwrap();
+    let mut fx = Fx {
+        remote: path.clone(),
+        base: path.clone(),
+        tmp,
+        win: window_for(file),
+        drv: Driver::new(1000.0, 600.0),
+    };
+    fx.drv.idle(&mut fx.win, 2);
+    fx.typed("00");
+    fx.key(Key::S, command(false));
+    fx.wait_for_save();
+    fx.settle();
+    let lists: Vec<PathBuf> = walk(&cache)
+        .into_iter()
+        .filter(|p| p.to_string_lossy().contains(".hexpatch-"))
+        .collect();
+    assert_eq!(lists.len(), 1, "{lists:?}");
+    assert!(std::fs::read_to_string(&lists[0])
+        .unwrap()
+        .lines()
+        .any(|l| l == "0x0: 00"));
+    let rows: Vec<String> = fx
+        .win
+        .opened
+        .iter()
+        .chain(&fx.win.notices)
+        .cloned()
+        .collect();
+    let said = rows
+        .iter()
+        .find(|r| r.contains("read-only"))
+        .unwrap_or_else(|| panic!("not said: {rows:?}"))
+        .clone();
+    assert!(said.contains(&*lists[0].to_string_lossy()), "{said}");
+    assert!(fx.drv.find_text(&said).is_some(), "said whole");
+    let changed = fx.win.doc.changed_count();
+    fx.key(Key::ArrowRight, Modifiers::NONE);
+    fx.typed("11");
+    assert_eq!(
+        fx.win.doc.changed_count(),
+        changed,
+        "edited a read-only window"
+    );
+    let on_disk = std::fs::read(&path).unwrap();
+    fx.key(Key::S, command(false));
+    assert!(fx.win.job.is_none(), "saved a read-only window");
+    assert_eq!(std::fs::read(&path).unwrap(), on_disk);
+    assert!(
+        fx.win.close_requested(),
+        "the edits are listed: closing does not ask"
+    );
+}
+
+/// Any failure after the pass started — here the stat that ends it — leaves no stage and no
+/// backup behind.
+#[test]
+fn a_failure_after_the_pass_leaves_nothing() {
+    let pair = Pair::new(FIXTURE, false);
+    let mut file = pair.open();
+    file.fail_stat_after_pass = true;
+    assert!(file.save(&BTreeMap::from([(0u64, 0u8)])).is_err());
+    assert!(walk(&pair.cache()).is_empty(), "{:?}", walk(&pair.cache()));
+    assert_eq!(std::fs::read(&pair.remote).unwrap(), FIXTURE);
+    assert!(file.save_copy(&BTreeMap::from([(0u64, 0u8)])).is_err());
+    assert!(walk(&pair.cache()).is_empty(), "{:?}", walk(&pair.cache()));
+}
+
+/// Save copy's own pass, with its own writer in the middle: refused, the edits listed, nothing
+/// published.
+#[test]
+fn save_copy_refuses_a_source_written_during_its_own_pass() {
+    let body: Vec<u8> = (0..(3 * CHUNK) as u32).map(|i| (i % 251) as u8).collect();
+    let pair = Pair::new(&body, false);
+    let mut file = pair.open();
+    let (base, ran) = (pair.base.clone(), Arc::new(AtomicBool::new(false)));
+    let ran2 = ran.clone();
+    file.chunk_hook = Some(Box::new(move |done| {
+        if done == CHUNK as u64 {
+            File::options()
+                .write(true)
+                .open(&base)
+                .unwrap()
+                .write_all_at(&[0xEE], 2 * CHUNK as u64)
+                .unwrap();
+            ran2.store(true, Ordering::SeqCst);
+        }
+    }));
+    let err = file
+        .save_copy(&BTreeMap::from([(10u64, 0u8)]))
+        .unwrap_err()
+        .to_string();
+    assert!(
+        ran.load(Ordering::SeqCst),
+        "the writer ran during Save copy's pass"
+    );
+    assert!(err.contains("while it was being read"), "{err}");
+    let left = walk(&pair.cache());
+    assert_eq!(left.len(), 1, "{left:?}");
+    assert!(left[0].to_string_lossy().contains(".hexpatch-"));
+    assert!(err.contains(&*left[0].to_string_lossy()), "{err}");
+    assert!(!pair.remote.with_file_name("a.edited.bin").exists());
+    assert_eq!(std::fs::read(&pair.remote).unwrap(), body);
+}
+
+/// The list of edits is the owner's only (0600) whatever the umask strips from the creating
+/// call — here the owner's own write bit.
+#[test]
+fn the_list_of_edits_is_owner_only_under_any_umask() {
+    if crate::testutil::rerun_under_umask_022(
+        "gui::hex::tests::the_list_of_edits_is_owner_only_under_any_umask",
+    ) {
+        return;
+    }
+    use std::os::unix::fs::PermissionsExt;
+    let pair = Pair::new(FIXTURE, true);
+    let file = pair.open();
+    crate::cache::private_dir(file.edits.parent().unwrap()).unwrap();
+    // Alone in this child process (one test): no other thread creates files meanwhile.
+    // SAFETY: umask has no memory effects.
+    unsafe { libc::umask(0o277) };
+    let kept = file.keep_patches(&BTreeMap::from([(0u64, 1u8)]), "a test");
+    unsafe { libc::umask(0o022) };
+    let kept = kept.unwrap();
+    let mode = std::fs::metadata(&kept).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600);
 }

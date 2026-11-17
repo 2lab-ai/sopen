@@ -15,8 +15,11 @@ use super::{Choice, Hooks, Origin, Outcome, Window};
 use crate::remote::RemoteFs;
 use anyhow::{anyhow, bail, Context as _, Result};
 use eframe::egui::{self, Color32, Key};
-use std::fs::{File, OpenOptions};
+use std::ffi::{CStr, CString};
+use std::fs::File;
 use std::io::{Read, Write};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -212,125 +215,417 @@ pub struct SavedTo {
     pub notes: Vec<String>,
 }
 
-/// Removes the staging file (its random name is this save's own). A failure is said, never
-/// dropped.
-fn remove_staging(path: &Path) -> Option<String> {
-    std::fs::remove_file(path).err().map(|e| {
-        format!(
-            "the staging file {} could not be removed ({e}); it is safe to delete",
-            path.display()
-        )
-    })
-}
-
 fn exists(dest: &Path) -> SaveError {
     SaveError::Exists {
         next: next_free(dest),
     }
 }
 
+/// A link a save makes (tests stand in for it, or fail it: the stand-in runs first, and its
+/// error is the link's).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LinkStep {
+    /// The still-empty `part` to a second name in the private folder: can this filesystem
+    /// publish without replacing anything?
+    Probe,
+    /// The complete `part` to the chosen name.
+    Publish,
+}
+
+/// The names a save makes inside its private folder.
+const PART: &CStr = c"part";
+const PROBE: &CStr = c"probe";
+const MODE: &CStr = c"mode";
+
+fn sys(ret: libc::c_int) -> std::io::Result<libc::c_int> {
+    if ret < 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(ret)
+    }
+}
+
+fn c_name(bytes: &[u8]) -> std::io::Result<CString> {
+    CString::new(bytes).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "the name holds a NUL byte",
+        )
+    })
+}
+
+/// `openat(dir, name, flags | O_CLOEXEC, mode)` as an owned descriptor.
+fn open_at(
+    dir: libc::c_int,
+    name: &CStr,
+    flags: libc::c_int,
+    mode: libc::c_uint,
+) -> std::io::Result<OwnedFd> {
+    // SAFETY: `name` is NUL-terminated; a descriptor returned here is ours alone.
+    let fd = sys(unsafe { libc::openat(dir, name.as_ptr(), flags | libc::O_CLOEXEC, mode) })?;
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+/// The kinds of failure that mean "this filesystem cannot make hard links here".
+fn no_hard_links(e: &std::io::Error) -> bool {
+    e.raw_os_error().is_some_and(|c| {
+        c == libc::ENOTSUP
+            || c == libc::EOPNOTSUPP
+            || c == libc::EPERM
+            || c == libc::EXDEV
+            || c == libc::EMLINK
+    })
+}
+
+/// The private folder `.sopen-<16 hex>` (0700) a save makes in the destination folder, and the
+/// names it made inside it. Everything is reached through the two folders' descriptors — the
+/// destination folder opened once — never by path again. The folder is the owner's only from
+/// the call that makes it, so no other user can put or swap an entry in it; other processes of
+/// the same user are trusted. Cleanup only ever removes sopen's own names inside it, then it.
+struct Staging {
+    dir: OwnedFd,
+    private: OwnedFd,
+    private_name: CString,
+    /// `<destination folder>/.sopen-<16 hex>`, for messages.
+    shown: PathBuf,
+    /// Names made inside the private folder that are still there.
+    made: Vec<&'static CStr>,
+    /// Removed, or kept on purpose.
+    done: bool,
+}
+
+impl Staging {
+    /// Makes the private folder in `dir` (the destination folder's descriptor; `parent` is how
+    /// it is shown).
+    fn make(dir: OwnedFd, parent: &Path) -> Result<Self> {
+        for _ in 0..32 {
+            let hex = crate::remote::random_hex();
+            let name = format!(".sopen-{hex}");
+            let cname = c_name(name.as_bytes())?;
+            // SAFETY: `cname` is NUL-terminated.
+            match sys(unsafe { libc::mkdirat(dir.as_raw_fd(), cname.as_ptr(), 0o700) }) {
+                Ok(_) => {}
+                Err(e) if e.raw_os_error() == Some(libc::EEXIST) => continue,
+                Err(e) => {
+                    return Err(e)
+                        .with_context(|| format!("cannot make a folder in {}", parent.display()))
+                }
+            }
+            let private = open_at(
+                dir.as_raw_fd(),
+                &cname,
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW,
+                0,
+            );
+            let mut staging = Self {
+                private: match private {
+                    Ok(fd) => fd,
+                    Err(e) => {
+                        // SAFETY: `cname` is NUL-terminated; it names the folder just made.
+                        unsafe {
+                            libc::unlinkat(dir.as_raw_fd(), cname.as_ptr(), libc::AT_REMOVEDIR)
+                        };
+                        return Err(e).with_context(|| {
+                            format!("cannot open {}", parent.join(&name).display())
+                        });
+                    }
+                },
+                dir,
+                private_name: cname,
+                shown: parent.join(&name),
+                made: Vec::new(),
+                done: false,
+            };
+            // SAFETY: a descriptor this save owns.
+            if let Err(e) = sys(unsafe { libc::fchmod(staging.private.as_raw_fd(), 0o700) }) {
+                let left = staging.clean();
+                return Err(with_left(
+                    anyhow::Error::new(e).context(format!(
+                        "cannot make {} owner-only",
+                        staging.shown.display()
+                    )),
+                    left,
+                ));
+            }
+            return Ok(staging);
+        }
+        bail!("no free name for a folder in {}", parent.display())
+    }
+
+    /// Creates `name` inside the private folder with `mode` in the creating call (never through
+    /// a link, never an existing entry).
+    fn create(&mut self, name: &'static CStr, mode: libc::c_uint) -> std::io::Result<File> {
+        let fd = open_at(
+            self.private.as_raw_fd(),
+            name,
+            libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW,
+            mode,
+        )?;
+        self.made.push(name);
+        Ok(File::from(fd))
+    }
+
+    fn unlink(&mut self, name: &'static CStr) -> std::io::Result<()> {
+        // SAFETY: `name` is NUL-terminated and names an entry this save made in its folder.
+        sys(unsafe { libc::unlinkat(self.private.as_raw_fd(), name.as_ptr(), 0) })?;
+        self.made.retain(|n| *n != name);
+        Ok(())
+    }
+
+    /// The mode a new file gets in this folder (the umask, any default ACL): a file created
+    /// with 0666 shows it; it is removed at once.
+    fn new_file_mode(&mut self) -> std::io::Result<u32> {
+        let probe = self.create(MODE, 0o666)?;
+        let mode = probe.metadata()?.permissions().mode() & 0o777;
+        drop(probe);
+        self.unlink(MODE)?;
+        Ok(mode)
+    }
+
+    /// Links `part` to `name` in `to` (`None`: a second name inside the private folder).
+    fn link(&self, to: Option<&CStr>) -> std::io::Result<()> {
+        let (dir, name) = match to {
+            Some(name) => (self.dir.as_raw_fd(), name),
+            None => (self.private.as_raw_fd(), PROBE),
+        };
+        // SAFETY: both names are NUL-terminated; both descriptors are this save's.
+        sys(unsafe {
+            libc::linkat(
+                self.private.as_raw_fd(),
+                PART.as_ptr(),
+                dir,
+                name.as_ptr(),
+                0,
+            )
+        })
+        .map(|_| ())
+    }
+
+    /// Removes what this save made — its names inside the private folder, then the folder.
+    /// What cannot be removed is said, never dropped.
+    fn clean(&mut self) -> Option<String> {
+        self.done = true;
+        let mut problems = Vec::new();
+        for name in std::mem::take(&mut self.made) {
+            // SAFETY: as in `unlink`.
+            if let Err(e) =
+                sys(unsafe { libc::unlinkat(self.private.as_raw_fd(), name.as_ptr(), 0) })
+            {
+                problems.push(format!("{}: {e}", name.to_string_lossy()));
+            }
+        }
+        // SAFETY: `private_name` is NUL-terminated and names the folder this save made.
+        if let Err(e) = sys(unsafe {
+            libc::unlinkat(
+                self.dir.as_raw_fd(),
+                self.private_name.as_ptr(),
+                libc::AT_REMOVEDIR,
+            )
+        }) {
+            problems.push(e.to_string());
+        }
+        (!problems.is_empty()).then(|| {
+            format!(
+                "the staging folder {} could not be removed ({}); it is safe to delete",
+                self.shown.display(),
+                problems.join("; ")
+            )
+        })
+    }
+
+    /// Keeps the folder with the complete `part` in it; returns where that is.
+    fn keep(mut self) -> PathBuf {
+        self.done = true;
+        self.shown.join("part")
+    }
+}
+
+impl Drop for Staging {
+    fn drop(&mut self) {
+        // Every return path cleans or keeps on purpose; this is for a panic in the transfer.
+        if !self.done {
+            if let Some(left) = self.clean() {
+                eprintln!("sopen: {left}");
+            }
+        }
+    }
+}
+
+/// `e`, with what cleanup could not remove.
+fn with_left(e: anyhow::Error, left: Option<String>) -> anyhow::Error {
+    match left {
+        Some(left) => e.context(left),
+        None => e,
+    }
+}
+
+/// Opens the destination's folder once, as a folder (a link to a folder is followed here, as
+/// the path says); its failures are said as what the path names.
+fn open_folder(parent: &Path) -> Result<OwnedFd> {
+    let cpath = c_name(parent.as_os_str().as_bytes())?;
+    match open_at(
+        libc::AT_FDCWD,
+        &cpath,
+        libc::O_RDONLY | libc::O_DIRECTORY,
+        0,
+    ) {
+        Ok(fd) => Ok(fd),
+        Err(e) if e.raw_os_error() == Some(libc::ENOENT) => {
+            bail!("the folder {} does not exist", parent.display())
+        }
+        Err(e) if e.raw_os_error() == Some(libc::ENOTDIR) => {
+            bail!("{} is not a folder", parent.display())
+        }
+        Err(e) => Err(e).with_context(|| format!("cannot open the folder {}", parent.display())),
+    }
+}
+
 /// Saves new bytes at `dest` without ever putting an incomplete file, or anything over an
-/// existing one, under that name: `fill` writes a staging file `.<name>.sopen-<random>.part` in
-/// the same folder (created exclusively; owner-only while it fills), which is flushed to disk,
-/// given the mode any new file there gets (read back from the staging file while it is still
-/// empty) and published by a hard link to `dest` — which fails if anything is there — then
-/// unlinked. When linking fails, publishing is refused and the complete staging file is kept
-/// and named in the error. An interrupted save leaves only the hidden staging file; cleanup
-/// only ever removes that.
+/// existing one, under that name. The destination's folder is opened once and everything after
+/// goes through its descriptor: a private folder `.sopen-<16 hex>` (0700) is made in it, and in
+/// that `part`, created owner-only (0600) by the creating call. Before any byte moves, `part` is
+/// linked to a second name in the private folder and unlinked again — a folder whose filesystem
+/// has no hard links (or a path ending in '/', or a folder that does not exist) fails here, with
+/// nothing transferred. Then `fill` writes `part`, which is flushed to disk, given the mode any
+/// new file there gets, and published by a hard link to `dest` — which fails if anything is
+/// there — then the private folder is removed. A publish that fails otherwise keeps the
+/// complete `part` and names it. Cleanup only ever removes sopen's own names in its private
+/// folder, then the folder.
 pub fn save_new(
     dest: &Path,
     fill: impl FnOnce(&mut File) -> Result<u64>,
 ) -> std::result::Result<SavedTo, SaveError> {
-    save_new_with(dest, fill, &mut |from, to| std::fs::hard_link(from, to))
+    save_new_with(dest, fill, &mut |_, _| Ok(()))
 }
 
-/// [`save_new`] with `link` standing in for `hard_link` (tests: a folder without hard links,
-/// a name taken at the last moment).
+/// [`save_new`] with `link` run before each link (tests: a folder without hard links, a name
+/// taken at the last moment, something put in the private folder). Its error is the link's.
 fn save_new_with(
     dest: &Path,
     fill: impl FnOnce(&mut File) -> Result<u64>,
-    link: &mut dyn FnMut(&Path, &Path) -> std::io::Result<()>,
+    link: &mut dyn FnMut(LinkStep, &Path) -> std::io::Result<()>,
 ) -> std::result::Result<SavedTo, SaveError> {
-    if std::fs::symlink_metadata(dest).is_ok() {
-        return Err(exists(dest));
+    let nothing = |e: anyhow::Error| {
+        SaveError::Failed(e.context(format!(
+            "{} was not saved; nothing was transferred",
+            dest.display()
+        )))
+    };
+    if dest.as_os_str().as_bytes().ends_with(b"/") {
+        return Err(nothing(anyhow!(
+            "{} ends with '/', so it names a folder, not a file to save",
+            dest.display()
+        )));
     }
-    let failed = |e: anyhow::Error| SaveError::Failed(e);
     let name = dest
         .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .ok_or_else(|| failed(anyhow!("{} has no file name", dest.display())))?;
-    let dir = match dest.parent() {
+        .ok_or_else(|| nothing(anyhow!("{} has no file name", dest.display())))?;
+    let cname = c_name(name.as_bytes()).map_err(|e| nothing(e.into()))?;
+    let parent = match dest.parent() {
         Some(d) if !d.as_os_str().is_empty() => d.to_path_buf(),
         _ => PathBuf::from("."),
     };
-    let (staging, mut file) = (|| -> Result<(PathBuf, File)> {
-        for _ in 0..32 {
-            let random = crate::remote::random_hex();
-            let path = dir.join(format!(".{name}.sopen-{random}.part"));
-            match OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create_new(true)
-                .open(&path)
-            {
-                Ok(file) => return Ok((path, file)),
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-                Err(e) => {
-                    return Err(e)
-                        .with_context(|| format!("cannot create a file in {}", dir.display()))
-                }
-            }
+    let dir = open_folder(&parent).map_err(nothing)?;
+    // Anything already there — a file, a folder, a link (followed or not) — is taken.
+    // SAFETY: `cname` is NUL-terminated; `st` is written by the call.
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    match sys(unsafe {
+        libc::fstatat(
+            dir.as_raw_fd(),
+            cname.as_ptr(),
+            &mut st,
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    }) {
+        Ok(_) => return Err(exists(dest)),
+        Err(e) if e.raw_os_error() == Some(libc::ENOENT) => {}
+        Err(e) => {
+            return Err(nothing(
+                anyhow::Error::new(e).context(format!("cannot look at {}", dest.display())),
+            ))
         }
-        bail!("no free staging name in {}", dir.display())
-    })()
-    .map_err(failed)?;
-    // The mode a new file gets here (umask, default ACLs), read while the file is empty; then
-    // owner-only until the bytes are complete.
-    let mode = file
-        .metadata()
-        .map(|m| m.permissions().mode() & 0o777)
-        .unwrap_or(0o644);
-    let give_up = |e: anyhow::Error, staging: &Path| -> SaveError {
-        let e = e.context(format!("{} was not saved", dest.display()));
-        SaveError::Failed(match remove_staging(staging) {
-            Some(left) => e.context(left),
-            None => e,
-        })
+    }
+    let mut staging = Staging::make(dir, &parent).map_err(nothing)?;
+    let give_up = |staging: &mut Staging, e: anyhow::Error| {
+        let left = staging.clean();
+        with_left(e, left)
     };
+    let prepared = (|| -> Result<(File, u32)> {
+        let part = staging
+            .create(PART, 0o600)
+            .with_context(|| format!("cannot create {}", staging.shown.join("part").display()))?;
+        let mode = staging
+            .new_file_mode()
+            .with_context(|| format!("cannot create a file in {}", staging.shown.display()))?;
+        Ok((part, mode))
+    })();
+    let (mut file, mode) = match prepared {
+        Ok(made) => made,
+        Err(e) => return Err(nothing(give_up(&mut staging, e))),
+    };
+    let probed = link(LinkStep::Probe, &staging.shown)
+        .and_then(|()| staging.link(None))
+        .and_then(|()| {
+            staging.made.push(PROBE);
+            staging.unlink(PROBE)
+        });
+    if let Err(e) = probed {
+        let e = if no_hard_links(&e) {
+            anyhow!(
+                "the filesystem of {} has no hard links ({e}); sopen can't publish there \
+                 without risking a replace — choose another folder",
+                parent.display()
+            )
+        } else {
+            anyhow::Error::new(e).context(format!(
+                "cannot test whether {} takes hard links",
+                parent.display()
+            ))
+        };
+        return Err(nothing(give_up(&mut staging, e)));
+    }
     let filled = (|| -> Result<u64> {
-        file.set_permissions(std::fs::Permissions::from_mode(0o600))
-            .with_context(|| format!("cannot make {} owner-only", staging.display()))?;
         let n = fill(&mut file)?;
         file.sync_all()
-            .with_context(|| format!("cannot write {}", staging.display()))?;
+            .with_context(|| format!("cannot write {}", staging.shown.join("part").display()))?;
         file.set_permissions(std::fs::Permissions::from_mode(mode))
-            .with_context(|| format!("cannot set the mode of {}", staging.display()))?;
+            .with_context(|| {
+                format!(
+                    "cannot set the mode of {}",
+                    staging.shown.join("part").display()
+                )
+            })?;
         Ok(n)
     })();
     let bytes = match filled {
         Ok(n) => n,
-        Err(e) => return Err(give_up(e, &staging)),
+        Err(e) => {
+            let e = e.context(format!("{} was not saved", dest.display()));
+            return Err(SaveError::Failed(give_up(&mut staging, e)));
+        }
     };
-    let mut notes = Vec::new();
-    match link(&staging, dest) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            if let Some(left) = remove_staging(&staging) {
+    drop(file);
+    match link(LinkStep::Publish, &staging.shown).and_then(|()| staging.link(Some(&cname))) {
+        Ok(()) => Ok(SavedTo {
+            bytes,
+            notes: staging.clean().into_iter().collect(),
+        }),
+        Err(e) if e.raw_os_error() == Some(libc::EEXIST) => {
+            if let Some(left) = staging.clean() {
                 eprintln!("sopen: {left}");
             }
-            return Err(exists(dest));
+            Err(exists(dest))
         }
-        Err(link_err) => {
-            return Err(SaveError::Failed(anyhow!(
-                "cannot publish {} without replacing an existing file ({link_err}); \
-                 the complete staging file is kept at {}",
+        Err(e) => {
+            let part = staging.keep();
+            Err(SaveError::Failed(anyhow!(
+                "cannot publish {} ({e}); nothing was put under that name — the complete \
+                 download is kept at {}",
                 dest.display(),
-                staging.display()
-            )));
+                part.display()
+            )))
         }
     }
-    notes.extend(remove_staging(&staging));
-    Ok(SavedTo { bytes, notes })
 }
 
 /// Downloads `abs` into a new file at `dest` ([`save_new`]). Best-effort change check: a file
@@ -604,6 +899,8 @@ pub struct FileOutcome {
     pub refused: Option<String>,
     pub fetch_ms: Option<u64>,
     pub saved_to: Option<PathBuf>,
+    /// The line said when the run ended without opening or saving anything.
+    pub cancelled: Option<String>,
 }
 
 impl FileOutcome {
@@ -642,11 +939,7 @@ pub fn open_file(
             info.title
         );
     }
-    let cancelled = if info.local {
-        "sopen: cancelled"
-    } else {
-        "sopen: cancelled; nothing was downloaded"
-    };
+    let cancelled = cancel_line(info.local, Moved::Nothing);
     let windowless = match choice {
         Some(Choice::Save | Choice::Cancel) => true,
         Some(Choice::Hex) => hooks.autosave,
@@ -669,6 +962,7 @@ pub fn open_file(
     match choice {
         Some(Choice::Cancel) => {
             eprintln!("{cancelled}");
+            out.cancelled = Some(cancelled.to_string());
         }
         Some(Choice::Save) => {
             meter.start(&format!("saving {}", info.name));
@@ -694,17 +988,48 @@ pub fn open_file(
         // The dialog; with SOPEN_CHOICE=hex already answered (the fetch starts at once, in the
         // window, which then becomes the hex window).
         Some(Choice::Hex) | None => {
+            let local = info.local;
             let ended = dialog(info, Box::new(source), chooser, hooks, run)?;
             out.fetch_ms = ended.fetch_ms;
             match ended.hex {
                 Some(outcome) => out.hex(outcome),
-                None if ended.saved_to.is_none() => eprintln!("{cancelled}"),
+                None if ended.saved_to.is_none() => {
+                    let line = cancel_line(local, ended.moved);
+                    eprintln!("{line}");
+                    out.cancelled = Some(line.to_string());
+                }
                 None => {}
             }
             out.saved_to = ended.saved_to;
         }
     }
     Ok(out)
+}
+
+/// What a run that opened and saved nothing transferred before it ended.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Moved {
+    /// No fetch or download was started.
+    #[default]
+    Nothing,
+    /// One was started and did not land (it may have moved some bytes).
+    Started,
+    /// The hex fetch landed in the cache, and the window was closed before the hex editor
+    /// opened.
+    Fetched,
+}
+
+/// The line said when a binary file's run ends without opening or saving it: it claims nothing
+/// was downloaded only when that is so.
+pub fn cancel_line(local: bool, moved: Moved) -> &'static str {
+    match (local, moved) {
+        (_, Moved::Fetched) => {
+            "sopen: cancelled; the file was fetched into sopen's cache, but the hex editor did \
+             not open"
+        }
+        (true, _) | (false, Moved::Started) => "sopen: cancelled",
+        (false, Moved::Nothing) => "sopen: cancelled; nothing was downloaded",
+    }
 }
 
 /// "Save to…" answered without a window (`SOPEN_CHOICE=save`): saves to `SOPEN_SAVE_TO`, else
@@ -761,7 +1086,7 @@ pub fn dialog(
     if let Some(rx) = leftover.lock().unwrap().take() {
         eprintln!("sopen: the window closed during a transfer; waiting for it to finish");
         match rx.recv() {
-            Ok(Moved {
+            Ok(Landed {
                 result: MovedResult::Saved(dest, Ok(saved)),
                 ..
             }) => {
@@ -771,17 +1096,24 @@ pub fn dialog(
                 }
                 ended.lock().unwrap().saved_to = Some(dest);
             }
-            Ok(Moved {
+            Ok(Landed {
                 result: MovedResult::Saved(dest, Err(e)),
                 ..
             }) => eprintln!("sopen: {} not saved: {e}", dest.display()),
-            Ok(Moved {
+            Ok(Landed {
                 result: MovedResult::Hex(result),
                 ..
             }) => match *result {
-                Ok(_) => eprintln!(
-                    "sopen: fetched; the window was closed, so the hex editor did not open"
-                ),
+                Ok(opened) => {
+                    eprintln!(
+                        "sopen: fetched; the window was closed, so the hex editor did not open"
+                    );
+                    let mut ended = ended.lock().unwrap();
+                    ended.fetch_ms = opened.fetch_ms;
+                    if opened.fetch_ms.is_some() {
+                        ended.moved = Moved::Fetched;
+                    }
+                }
                 Err(e) => eprintln!("sopen: {e:#}"),
             },
             Err(_) => eprintln!("sopen: the transfer stopped without a result"),
@@ -806,10 +1138,12 @@ pub struct Ended {
     /// The hex window's outcome, when it opened.
     pub hex: Option<Outcome>,
     pub fetch_ms: Option<u64>,
+    /// What was transferred, for the closing line.
+    pub moved: Moved,
 }
 
 /// A fetch or a download, back from its worker with the source.
-struct Moved {
+struct Landed {
     source: Box<dyn Source>,
     result: MovedResult,
 }
@@ -828,7 +1162,7 @@ enum Stage {
         dest: Option<PathBuf>,
         done: Arc<AtomicU64>,
         total: Arc<AtomicU64>,
-        rx: Receiver<Moved>,
+        rx: Receiver<Landed>,
     },
     /// Saved: the line stays a moment, then the window closes — unless there are notes to read.
     Saved {
@@ -855,7 +1189,7 @@ pub struct BinaryWindow {
     hex_outcome: Arc<Mutex<Outcome>>,
     hex_leftover: Arc<Mutex<Option<hex::Job>>>,
     /// A transfer still running when the window is dropped; its opener waits for it.
-    leftover: Arc<Mutex<Option<Receiver<Moved>>>>,
+    leftover: Arc<Mutex<Option<Receiver<Landed>>>>,
     close_when_done: bool,
     close_ok: bool,
     painted: bool,
@@ -920,6 +1254,15 @@ impl BinaryWindow {
         }
     }
 
+    /// A fetch or a download is under way: from now on the closing line no longer claims that
+    /// nothing was downloaded.
+    fn started(&mut self) {
+        let mut ended = self.ended.lock().unwrap();
+        if ended.moved == Moved::Nothing {
+            ended.moved = Moved::Started;
+        }
+    }
+
     fn asking(&self) -> bool {
         matches!(self.stage, Stage::Ask)
     }
@@ -929,6 +1272,7 @@ impl BinaryWindow {
         let Some(mut source) = self.source.take() else {
             return;
         };
+        self.started();
         self.notes.clear();
         self.field_save = false;
         let (done, total) = (Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)));
@@ -940,7 +1284,7 @@ impl BinaryWindow {
                 t.store(all, Ordering::Relaxed);
                 ctx2.request_repaint();
             });
-            let _ = tx.send(Moved {
+            let _ = tx.send(Landed {
                 source,
                 result: MovedResult::Hex(Box::new(result)),
             });
@@ -971,6 +1315,7 @@ impl BinaryWindow {
         let Some(mut source) = self.source.take() else {
             return;
         };
+        self.started();
         self.notes.clear();
         self.field_save = from_field;
         let (done, total) = (Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)));
@@ -982,7 +1327,7 @@ impl BinaryWindow {
                 t.store(all, Ordering::Relaxed);
                 ctx2.request_repaint();
             });
-            let _ = tx.send(Moved {
+            let _ = tx.send(Landed {
                 source,
                 result: MovedResult::Saved(to, result),
             });
@@ -1058,7 +1403,7 @@ impl BinaryWindow {
     }
 
     /// A fetch or a download came back.
-    fn landed(&mut self, ctx: &egui::Context, moved: Moved) {
+    fn landed(&mut self, ctx: &egui::Context, moved: Landed) {
         self.source = Some(moved.source);
         self.stage = Stage::Ask;
         match moved.result {
@@ -1103,6 +1448,13 @@ impl BinaryWindow {
     fn opened(&mut self, ctx: &egui::Context, result: Result<Opened>) {
         match result {
             Ok(opened) => {
+                {
+                    let mut ended = self.ended.lock().unwrap();
+                    ended.fetch_ms = opened.fetch_ms;
+                    if opened.fetch_ms.is_some() {
+                        ended.moved = Moved::Fetched;
+                    }
+                }
                 if self.close_when_done {
                     eprintln!(
                         "sopen: the window was closed during the fetch; the hex editor did not \
@@ -1111,7 +1463,6 @@ impl BinaryWindow {
                     self.close(ctx);
                     return;
                 }
-                self.ended.lock().unwrap().fetch_ms = opened.fetch_ms;
                 match hex::embedded(
                     opened.file,
                     &self.hooks,

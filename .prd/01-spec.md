@@ -229,16 +229,25 @@ Esc do nothing and closing waits for it.
   opening the copy) comes before the connection is handed to the hex window: after a failure the
   dialog is as it was, for a retry or "Save to…" (from the copy already fetched).
 - Save to…: bytes are never put under the chosen name before they are complete, and never over, or
-  through, anything already there (a file, a link). A taken name is refused before anything moves.
-  The bytes go into a staging file `.<name>.sopen-<random>.part` in the same folder (created
-  exclusively, owner-only while it fills), which is flushed to disk, given the mode any new file
-  there gets (not the cache's 0600), and published by a hard link to the chosen name — which fails if
-  anything is there — then unlinked. When safe no-replace publication is unavailable or fails,
-  the save fails and names the complete staging file it keeps; it never copies into a final name.
-  A name taken at
+  through, anything already there (a file, a link). The chosen path's folder is opened once (a link
+  to a folder is followed at that moment) and everything after goes through that descriptor, never
+  the path again. A path ending in '/', a folder that does not exist or a file where the folder
+  should be fails at once; a taken name is refused before anything moves. sopen makes a private
+  folder `.sopen-<16 hex>` (0700) in it and, inside, `part` — created exclusively, without following
+  a link, owner-only (0600) by the creating call — so the staging name never grows with the chosen
+  one, and no other user can put or swap anything in it (other processes of the same user are
+  trusted). Before a byte is transferred, `part` is linked to a second name inside the private
+  folder and unlinked again: a filesystem without hard links (exFAT, some network shares) fails
+  here, nothing transferred, the private folder removed ("this folder's filesystem has no hard
+  links … choose another folder"). Then the bytes go into `part`, which is flushed to disk, given the
+  mode any new file there gets (not the cache's 0600), and published by a hard link to the chosen
+  name — which fails if anything is there — then `part` and the private folder are removed. A
+  publish that fails for another reason keeps the complete `part` and the error says why and where;
+  sopen never copies into a final name. A name taken at
   the last moment is refused like any taken name: the dialog says so and puts the next free
-  `<stem>-N<ext>` in the field; "Save to…" again saves there. Cleanup only ever removes the staging
-  file (a failure to remove it is said); an interrupted save leaves only that hidden file. A download
+  `<stem>-N<ext>` in the field; "Save to…" again saves there. Cleanup only ever removes sopen's own
+  names inside its private folder, then the folder (a failure to remove it is said); an interrupted
+  save leaves only that hidden folder. A download
   whose source changes meanwhile is not saved — a best-effort check: the remote's size and mtime
   after the transfer, and the bytes received, against its stat before. A local file (or the cached
   copy) is copied the same way, checked by its handle: size, mtime, change time and bytes copied.
@@ -246,7 +255,9 @@ Esc do nothing and closing waits for it.
   unless there are notes to read (a Close button then).
 - Closing the window during a fetch or a download does not cut it: the window says it closes when
   the transfer is done, and does. A transfer whose worker ends without a result is a final, visible
-  failure (the window says so and offers only Close; a close asked for meanwhile closes it).
+  failure (the window says so and offers only Close; a close asked for meanwhile closes it). The
+  line on the terminal when nothing was opened or saved says "nothing was downloaded" only when no
+  transfer was started; a hex fetch that landed while the window closed is said as such.
 
 `sopen --hex SOURCE` opens any file (any kind; not a folder) straight in the hex window — no dialog;
 a remote one is fetched first, with the progress on the terminal. `--hex` and `--app` are exclusive.
@@ -285,8 +296,10 @@ once the primary button is up, and take rows off the grid's bottom.
   Save; path printed), the staged copy with the edits applied (created exclusively and owner-only
   under `<cache>/.edits`), and their SHA-256. The handle's size, mtime, change time and inode are
   compared with what was opened before the pass and with before after it; any difference and the
-  save is refused with nothing staged or backed up left — the edits are written to
-  `<name>.hexpatch-<stamp>.txt` among the edits (owner-only; a header naming the source as opened,
+  save is refused with nothing staged or backed up left (so is any failure during or after the
+  pass) — the edits are written to
+  `<name>.hexpatch-<stamp>.txt` among the edits (0600, set on the file whatever the umask; a header
+  naming the source as opened,
   then one `offset: bytes` line per run of changed bytes), named in the disclosure rows. Then the
   conflict-checked overwrite; a local file opened in place has no hash from a fetch, so the pass's
   hash is its baseline (the target's content is checked against it up to 256 MiB). A refused or
@@ -294,16 +307,26 @@ once the primary button is up, and take rows off the grid's bottom.
   names it in the disclosure rows; the remote is untouched. Save copy (Shift+Cmd/Ctrl+S) is staged by
   the same pass (refused, and the edits listed, the same way) and publishes `<stem>.edited<ext>` next
   to the original (`-N` when taken), never replacing anything, as image Save copy does. The bytes are
-  read through the handle opened with the file, never again by path, so after a Save renames a new
-  file over a local path the window still edits the bytes as opened. A save whose worker ends
-  without a result is a visible failure; the edits stay and the window stays usable.
+  read through the handle opened with the file, never again by path. The change-time part of that
+  check also refuses after a change to the file's metadata alone (chmod, an extended attribute):
+  accepted as conservative. A fetched copy's identity is never renewed after a Save (an upload does
+  not change it), so a copy changed during an upload — even with its mtime put back — is refused by
+  the next Save. A local file saved in place was replaced by the rename: the window re-binds to the
+  file now at the path only if its content's SHA-256 equals the stage's (taken in the same pass);
+  it becomes the new original (the edits and the undo history are said again against it, so the
+  bytes shown and undo stay as they were). If it does not match (another writer, right after), the
+  window turns read-only, says so whole in the rows, and lists the edits in a `.hexpatch` file; the
+  edits are not lost. A save whose worker ends without a result is a visible failure; the edits stay
+  and the window stays usable.
 - Where the server cannot replace a file in one step (`posix-rename@openssh.com`), Save is off with
   the reason on hover and in the rows; editing and Save copy work — the image window's rule.
 - Closing with unsaved edits asks: Save (Save copy where Save is off) / Discard / Cancel. Closing
   during a save waits for it. Either way the window closes only when the save landed with nothing
   to read and nothing unsaved — a finished save is taken after the frame's input, so an edit or an
   undo in that frame counts; one that did not land, or landed with notes (the remote changed right
-  after), keeps the window open; newer edits ask again. Once closing is decided nothing edits.
+  after), keeps the window open; newer edits ask again. A close asked for during a save is used up
+  by that save, whatever it reports: it never closes the window after a later Save. Once closing
+  is decided nothing edits.
 
 ## 7. Media window (A4, A5)
 

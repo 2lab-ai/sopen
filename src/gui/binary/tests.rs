@@ -491,38 +491,69 @@ fn a_dead_transfer_worker_is_a_visible_failure() {
 // ---------------------------------------------------------------------------------------------
 // Save to…'s file rules.
 
-/// A fill that checks what is on disk while it writes: the final name is absent, the only new
-/// file is the hidden owner-only staging file in the same folder.
+/// The names directly in `dir`, sorted (folders too, hidden ones too).
+fn names(dir: &Path) -> Vec<String> {
+    let mut out: Vec<String> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    out.sort();
+    out
+}
+
+/// The private staging folder a save made in `dir`, if there is one.
+fn private_folder(dir: &Path) -> Option<PathBuf> {
+    let found: Vec<String> = names(dir)
+        .into_iter()
+        .filter(|n| n.starts_with(".sopen-"))
+        .collect();
+    assert!(found.len() <= 1, "{found:?}");
+    found.first().map(|n| dir.join(n))
+}
+
+fn os_error(code: i32) -> std::io::Error {
+    std::io::Error::from_raw_os_error(code)
+}
+
+/// A fill that checks what is on disk while it writes: the final name is absent; the only new
+/// entry in the folder is the private staging folder `.sopen-<16 hex>` (0700), holding only
+/// `part` (0600, one link: the probe's second name is gone) — the very file being written.
 fn watching_fill<'a>(dir: &'a Path, dest: &'a Path) -> impl FnOnce(&mut File) -> Result<u64> + 'a {
     move |f: &mut File| {
+        use std::os::unix::fs::MetadataExt;
         f.write_all(BODY)?;
         assert!(
             !dest.exists(),
             "bytes under the final name before they are complete"
         );
-        let staging: Vec<_> = std::fs::read_dir(dir)
-            .unwrap()
-            .map(|e| e.unwrap().path())
-            .filter(|p| p != dest)
+        let private = private_folder(dir).expect("a private staging folder");
+        let pname = private.file_name().unwrap().to_string_lossy().into_owned();
+        assert_eq!(pname.len(), ".sopen-".len() + 16, "{pname}");
+        assert!(pname[7..].chars().all(|c| c.is_ascii_hexdigit()), "{pname}");
+        let others: Vec<String> = names(dir)
+            .into_iter()
+            .filter(|n| *n != pname && dest.file_name().unwrap() != n.as_str())
             .collect();
-        assert_eq!(staging.len(), 1, "{staging:?}");
-        let name = staging[0]
-            .file_name()
-            .unwrap()
-            .to_string_lossy()
-            .into_owned();
-        assert!(
-            name.starts_with(".a.bin.sopen-") && name.ends_with(".part"),
-            "{name}"
+        assert!(others.is_empty(), "{others:?}");
+        assert_eq!(mode(&private), 0o700, "a private folder");
+        assert_eq!(names(&private), ["part"]);
+        let part = std::fs::symlink_metadata(private.join("part")).unwrap();
+        assert!(part.file_type().is_file());
+        assert_eq!(part.mode() & 0o777, 0o600, "owner-only while it fills");
+        assert_eq!(part.nlink(), 1, "the probe's link is gone");
+        let ours = f.metadata().unwrap();
+        assert_eq!(
+            (part.dev(), part.ino()),
+            (ours.dev(), ours.ino()),
+            "bound to its inode"
         );
-        assert_eq!(mode(&staging[0]), 0o600, "owner-only while it fills");
         Ok(BODY.len() as u64)
     }
 }
 
-/// Bytes go under the final name only complete: the staging file fills, then is linked to the
-/// name (never over anything) with a new file's mode, then unlinked. A failed fill leaves no
-/// file of either name.
+/// Bytes go under the final name only complete: `part` fills inside the private folder, then is
+/// linked to the name (never over anything) with a new file's mode; the private folder goes. A
+/// failed fill leaves nothing of either.
 #[test]
 fn save_new_publishes_only_complete_bytes() {
     if crate::testutil::rerun_under_umask_022(
@@ -542,11 +573,7 @@ fn save_new_publishes_only_complete_bytes() {
     );
     assert_eq!(std::fs::read(&dest).unwrap(), BODY);
     assert_eq!(mode(&dest), 0o644);
-    assert_eq!(
-        walk(tmp.path()),
-        std::slice::from_ref(&dest),
-        "the staging file is gone"
-    );
+    assert_eq!(names(tmp.path()), ["a.bin"], "the staging folder is gone");
 
     let fresh = tmp.path().join("b.bin");
     let failing = |f: &mut File| -> Result<u64> {
@@ -557,16 +584,45 @@ fn save_new_publishes_only_complete_bytes() {
         Err(SaveError::Failed(e)) => assert!(format!("{e:#}").contains("dropped"), "{e:#}"),
         other => panic!("{other:?}"),
     }
-    assert_eq!(
-        walk(tmp.path()),
-        [dest],
-        "nothing of the failed save is left"
-    );
+    assert_eq!(names(tmp.path()), ["a.bin"], "nothing of the failed save");
+}
+
+/// The staging name does not grow with the chosen one: a name at the longest a folder takes
+/// saves like any other.
+#[test]
+fn save_new_takes_the_longest_name_a_folder_takes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let long = format!("{}.bin", "n".repeat(251));
+    assert_eq!(long.len(), 255);
+    let dest = tmp.path().join(&long);
+    save_new(&dest, |f: &mut File| {
+        f.write_all(BODY)?;
+        Ok(BODY.len() as u64)
+    })
+    .unwrap();
+    assert_eq!(std::fs::read(&dest).unwrap(), BODY);
+    assert_eq!(names(tmp.path()), [long]);
+}
+
+/// The folder is opened once, following a link to a folder: the file lands in the real folder.
+#[test]
+fn save_new_follows_a_link_to_a_folder() {
+    let tmp = tempfile::tempdir().unwrap();
+    let real_dir = tmp.path().join("real");
+    std::fs::create_dir(&real_dir).unwrap();
+    std::os::unix::fs::symlink(&real_dir, tmp.path().join("via")).unwrap();
+    save_new(&tmp.path().join("via/a.bin"), |f: &mut File| {
+        f.write_all(BODY)?;
+        Ok(BODY.len() as u64)
+    })
+    .unwrap();
+    assert_eq!(std::fs::read(real_dir.join("a.bin")).unwrap(), BODY);
+    assert_eq!(names(&real_dir), ["a.bin"]);
 }
 
 /// Never over, or through, anything: an existing file or a link (even a dangling one) is
-/// "exists" before any byte moves; a name taken at the last moment (between the fill and the
-/// link) is "exists" too, the other file untouched and the staging file removed.
+/// "exists" before any byte moves; a name taken at the last moment (during the fill, or between
+/// the fill and the link) is "exists" too, the other file untouched and the staging folder gone.
 #[test]
 fn save_new_never_replaces_or_writes_through_a_link() {
     let tmp = tempfile::tempdir().unwrap();
@@ -603,75 +659,133 @@ fn save_new_never_replaces_or_writes_through_a_link() {
         b"someone else's, meanwhile"
     );
 
+    // Taken between the fill and the link.
     let late = tmp.path().join("late.bin");
     let fill = |f: &mut File| -> Result<u64> {
         f.write_all(BODY)?;
         Ok(BODY.len() as u64)
     };
-    let mut someone = |from: &Path, to: &Path| {
-        std::fs::write(to, b"someone else's, just now")?;
-        std::fs::hard_link(from, to)
+    let late2 = late.clone();
+    let mut someone = move |step: LinkStep, _: &Path| {
+        if step == LinkStep::Publish {
+            std::fs::write(&late2, b"someone else's, just now")?;
+        }
+        Ok(())
     };
     match save_new_with(&late, fill, &mut someone) {
         Err(SaveError::Exists { next }) => assert_eq!(next, tmp.path().join("late-1.bin")),
         other => panic!("{other:?}"),
     }
     assert_eq!(std::fs::read(&late).unwrap(), b"someone else's, just now");
-    let mut left = walk(tmp.path());
-    left.sort();
-    let mut want = vec![dest, during, late, link];
-    want.sort();
-    // `link` is a dangling symlink: listed, never followed.
-    assert_eq!(left, want, "the staging file was removed");
-}
-
-/// Without hard links, publishing fails without creating the final name; the complete staging
-/// file stays and the error names it.
-#[test]
-fn save_new_without_hard_links_keeps_the_complete_staging_file() {
-    let tmp = tempfile::tempdir().unwrap();
-    let dest = tmp.path().join("a.bin");
-    let mut unsupported = |_: &Path, _: &Path| -> std::io::Result<()> {
-        Err(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            "no hard links on this volume",
-        ))
-    };
-    let err = save_new_with(&dest, watching_fill(tmp.path(), &dest), &mut unsupported).unwrap_err();
-    assert!(!dest.exists(), "the final name must not be created");
-    let staged = walk(tmp.path());
-    assert_eq!(staged.len(), 1, "{staged:?}");
-    assert_eq!(std::fs::read(&staged[0]).unwrap(), BODY);
-    let name = staged[0].file_name().unwrap().to_string_lossy();
-    assert!(name.starts_with(".a.bin.sopen-") && name.ends_with(".part"));
-    let message = err.to_string();
-    assert!(
-        message.contains("no hard links on this volume"),
-        "{message}"
+    assert_eq!(
+        names(tmp.path()),
+        ["a.bin", "during.bin", "late.bin", "link.bin"],
+        "the staging folder was removed"
     );
-    assert!(message.contains(&*staged[0].to_string_lossy()), "{message}");
 }
 
-/// A staging file that cannot be removed is said, not dropped.
+/// Where publishing cannot work, the save fails before a byte is transferred, saying why: a
+/// folder whose filesystem has no hard links (found by linking the still-empty `part` to a
+/// second name), a path ending in '/', a folder that does not exist, a file where the folder
+/// should be. Nothing is left.
 #[test]
-fn a_staging_file_that_cannot_be_removed_is_said() {
+fn save_new_fails_before_transferring_where_it_cannot_publish() {
+    let tmp = tempfile::tempdir().unwrap();
+    let never = |_: &mut File| -> Result<u64> { panic!("transferred although it cannot publish") };
+    let codes = [
+        libc::ENOTSUP,
+        libc::EOPNOTSUPP,
+        libc::EPERM,
+        libc::EXDEV,
+        libc::EMLINK,
+    ];
+    for code in codes {
+        let dest = tmp.path().join("a.bin");
+        let mut no_links = |step: LinkStep, _: &Path| match step {
+            LinkStep::Probe => Err(os_error(code)),
+            LinkStep::Publish => panic!("published after a failed probe"),
+        };
+        let err = save_new_with(&dest, never, &mut no_links).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("has no hard links"), "{code}: {msg}");
+        assert!(msg.contains("choose another folder"), "{code}: {msg}");
+        assert!(!msg.contains("an existing file"), "{code}: {msg}");
+        assert!(
+            names(tmp.path()).is_empty(),
+            "{code}: {:?}",
+            names(tmp.path())
+        );
+    }
+    // Another probe failure is said as it is.
+    let mut broken = |step: LinkStep, _: &Path| match step {
+        LinkStep::Probe => Err(os_error(libc::EIO)),
+        LinkStep::Publish => panic!("published after a failed probe"),
+    };
+    let msg = save_new_with(&tmp.path().join("a.bin"), never, &mut broken)
+        .unwrap_err()
+        .to_string();
+    assert!(msg.contains("cannot test whether"), "{msg}");
+    assert!(names(tmp.path()).is_empty());
+
+    let typed = format!("{}/newdir/", tmp.path().display());
+    let msg = save_new(Path::new(&typed), never).unwrap_err().to_string();
+    assert!(msg.contains("ends with '/'"), "{msg}");
+    let msg = save_new(&tmp.path().join("missing/a.bin"), never)
+        .unwrap_err()
+        .to_string();
+    assert!(msg.contains("does not exist"), "{msg}");
+    std::fs::write(tmp.path().join("file.txt"), b"").unwrap();
+    let msg = save_new(&tmp.path().join("file.txt/a.bin"), never)
+        .unwrap_err()
+        .to_string();
+    assert!(msg.contains("is not a folder"), "{msg}");
+    assert_eq!(names(tmp.path()), ["file.txt"]);
+}
+
+/// A link that fails at publishing for another reason keeps the complete download inside the
+/// private folder, never under the chosen name, and the error says why and where.
+#[test]
+fn a_failed_publish_keeps_the_complete_download_and_says_why() {
     let tmp = tempfile::tempdir().unwrap();
     let dest = tmp.path().join("a.bin");
     let fill = |f: &mut File| -> Result<u64> {
         f.write_all(BODY)?;
         Ok(BODY.len() as u64)
     };
-    let mut blocked = Vec::new();
-    let mut link_then_block = |from: &Path, to: &Path| {
-        std::fs::hard_link(from, to)?;
-        // Something now stands where the staging file was, which unlink cannot remove.
-        std::fs::remove_file(from)?;
-        std::fs::create_dir(from)?;
-        std::fs::write(from.join("inside"), b"")?;
-        blocked.push(from.to_path_buf());
+    let mut fails = |step: LinkStep, _: &Path| match step {
+        LinkStep::Probe => Ok(()),
+        LinkStep::Publish => Err(os_error(libc::EIO)),
+    };
+    let msg = save_new_with(&dest, fill, &mut fails)
+        .unwrap_err()
+        .to_string();
+    assert!(!dest.exists());
+    let part = private_folder(tmp.path()).unwrap().join("part");
+    assert_eq!(std::fs::read(&part).unwrap(), BODY);
+    assert!(msg.contains(&os_error(libc::EIO).to_string()), "{msg}");
+    assert!(msg.contains(&*part.to_string_lossy()), "{msg}");
+    assert!(!msg.contains("an existing file"), "{msg}");
+}
+
+/// A staging folder that cannot be removed is said, not dropped.
+#[test]
+fn a_staging_folder_that_cannot_be_removed_is_said() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dest = tmp.path().join("a.bin");
+    let fill = |f: &mut File| -> Result<u64> {
+        f.write_all(BODY)?;
+        Ok(BODY.len() as u64)
+    };
+    let mut seen = Vec::new();
+    let mut intrude = |step: LinkStep, private: &Path| {
+        if step == LinkStep::Publish {
+            // Something sopen did not make is now in its folder: it is left alone.
+            std::fs::write(private.join("intruder"), b"")?;
+            seen.push(private.to_path_buf());
+        }
         Ok(())
     };
-    let saved = save_new_with(&dest, fill, &mut link_then_block).unwrap();
+    let saved = save_new_with(&dest, fill, &mut intrude).unwrap();
     assert_eq!(std::fs::read(&dest).unwrap(), BODY);
     assert_eq!(saved.notes.len(), 1, "{:?}", saved.notes);
     assert!(
@@ -679,7 +793,12 @@ fn a_staging_file_that_cannot_be_removed_is_said() {
         "{:?}",
         saved.notes
     );
-    assert!(saved.notes[0].contains(&*blocked[0].to_string_lossy()));
+    assert!(saved.notes[0].contains(&*seen[0].to_string_lossy()));
+    assert_eq!(
+        names(&seen[0]),
+        ["intruder"],
+        "only sopen's own entries removed"
+    );
 }
 
 /// A local (or cached) source that changes during the copy is not saved: truncated midway
@@ -720,7 +839,7 @@ fn copy_to_refuses_a_source_that_changes_mid_copy() {
         }
         assert!(!dest.exists(), "{case}");
     }
-    assert_eq!(walk(tmp.path()), [src], "no staging file left");
+    assert_eq!(names(tmp.path()), ["src.bin"], "no staging folder left");
 }
 
 /// A download whose source changes during the transfer is not saved (and leaves nothing).
@@ -746,7 +865,7 @@ fn a_download_of_a_file_that_changes_meanwhile_is_not_saved() {
         other => panic!("{other:?}"),
     }
     assert!(!dest.exists());
-    assert_eq!(walk(tmp.path()), std::slice::from_ref(&src));
+    assert_eq!(names(tmp.path()), ["src.bin"]);
     // Quiet: saved whole.
     let saved = download_to(
         &mut LocalFs::new(),
@@ -931,9 +1050,33 @@ fn the_route_main_takes_downloads_nothing_before_the_choice() {
     });
     assert!(asked);
     assert!(out.saved_to.is_none() && out.action.is_none() && out.fetch_ms.is_none());
+    assert_eq!(
+        out.cancelled.as_deref(),
+        Some("sopen: cancelled; nothing was downloaded")
+    );
     assert_eq!(route.reads(), 0);
     assert!(walk(&route.cache()).is_empty());
     assert!(!route.tmp.path().join("out.zip").exists());
+}
+
+/// Closed while the hex fetch ran: the fetch finishes and the window closes, and the closing
+/// line does not claim that nothing was downloaded — the file is in the cache.
+#[test]
+fn a_fetch_finished_during_close_is_not_called_nothing_downloaded() {
+    let route = Route::new();
+    let out = route.open(&route.hooks(), |drv, win| {
+        drv.idle(win, 3);
+        let ctx = drv.ctx.clone();
+        win.start_hex(&ctx);
+        assert!(!win.close_requested(), "waits for the fetch");
+        drv.until(win, 20, |w| w.close_ok);
+    });
+    assert_eq!(route.reads(), 1, "the fetch happened");
+    assert!(out.action.is_none(), "the hex window did not open");
+    assert!(out.fetch_ms.is_some(), "the fetch is in the usage log");
+    let line = out.cancelled.expect("a closing line");
+    assert!(!line.contains("nothing was downloaded"), "{line}");
+    assert!(line.contains("cache"), "{line}");
 }
 
 /// The same route, answered: Enter fetches once (into the cache, claimed and recorded) and the
@@ -968,8 +1111,8 @@ fn the_route_main_takes_fetches_once_on_the_choice() {
 }
 
 /// Opening the hex window can fail after the fetch (here the cached copy is not a regular file):
-/// the source keeps the connection and the copy — Save to… then works from the copy, and a
-/// retry opens.
+/// the source keeps the connection and the copy — a retry fails the same way and keeps them
+/// again, Save to… then works from the copy (no second download), and a retry opens.
 #[test]
 fn a_failed_hex_open_keeps_the_source_for_save_and_a_retry() {
     let route = Route::new();
@@ -978,15 +1121,20 @@ fn a_failed_hex_open_keeps_the_source_for_save_and_a_retry() {
     assert_eq!(route.reads(), 1);
     std::fs::remove_file(&copy).unwrap();
     std::fs::create_dir(&copy).unwrap();
-    let err = source
-        .open_hex(&mut |_, _| {})
-        .err()
-        .expect("not a regular file");
-    assert!(format!("{err:#}").contains("not a regular file"), "{err:#}");
-    assert!(
-        source.fs.is_some() && source.fetched.is_some(),
-        "the source was kept"
-    );
+    for attempt in ["first", "retry"] {
+        let err = source
+            .open_hex(&mut |_, _| {})
+            .err()
+            .expect("not a regular file");
+        assert!(
+            format!("{err:#}").contains("not a regular file"),
+            "{attempt}: {err:#}"
+        );
+        assert!(
+            source.fs.is_some() && source.fetched.is_some(),
+            "{attempt}: the source was kept"
+        );
+    }
     std::fs::remove_dir(&copy).unwrap();
     std::fs::write(&copy, BODY).unwrap();
     let dest = route.tmp.path().join("saved.zip");

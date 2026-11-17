@@ -462,6 +462,49 @@ impl HexDoc {
     pub fn mark_copied(&mut self, changes: BTreeMap<u64, u8>) {
         self.copied = Some(changes);
     }
+
+    /// The file was saved in place with `wrote` (changes against the bytes as opened) and is
+    /// read through `file` from now on: those bytes are the new original. Every change — the
+    /// current ones, what is saved and copied, each undo and redo step — is said again against
+    /// them, so the bytes shown and the history stay exactly as they were.
+    pub fn rebase(&mut self, file: Arc<File>, wrote: &BTreeMap<u64, u8>) {
+        let mut offsets: std::collections::BTreeSet<u64> = wrote.keys().copied().collect();
+        offsets.extend(self.patches.keys());
+        offsets.extend(self.saved.keys());
+        offsets.extend(self.copied.iter().flat_map(|c| c.keys()));
+        offsets.extend(self.undo.iter().chain(&self.redo).map(|s| s.at));
+        // The bytes as opened, read from the old file before it is let go.
+        let old: HashMap<u64, Option<u8>> = offsets
+            .iter()
+            .map(|&at| (at, self.pages.byte(at)))
+            .collect();
+        let new_original = |at: u64| wrote.get(&at).copied().or(old[&at]);
+        let absolute = |at: u64, v: Option<u8>| v.or(old[&at]);
+        let relative = |at: u64, v: Option<u8>| v.filter(|&b| Some(b) != new_original(at));
+        let map = |m: &BTreeMap<u64, u8>| -> BTreeMap<u64, u8> {
+            let keys: std::collections::BTreeSet<u64> =
+                m.keys().chain(wrote.keys()).copied().collect();
+            keys.into_iter()
+                .filter_map(|at| relative(at, absolute(at, m.get(&at).copied())).map(|b| (at, b)))
+                .collect()
+        };
+        self.patches = map(&self.patches);
+        self.saved = map(&self.saved);
+        self.copied = self.copied.as_ref().map(map);
+        for step in self.undo.iter_mut().chain(self.redo.iter_mut()) {
+            step.before = relative(step.at, absolute(step.at, step.before));
+            step.after = relative(step.at, absolute(step.at, step.after));
+        }
+        self.pages = Pages {
+            file,
+            size: self.pages.size,
+            held: HashMap::new(),
+            tick: 0,
+            error: None,
+            reads: self.pages.reads,
+        };
+        self.rev += 1;
+    }
 }
 
 /// `SOPEN_STATE` for the hex window: the patches (each byte one undo step), then the cursor.
@@ -572,7 +615,7 @@ pub struct HexFile {
     base: Arc<File>,
     /// Where `base` was opened: the session's cached copy, or the local file itself.
     base_path: PathBuf,
-    /// `base` when it was opened (renewed after a Save of our own lands).
+    /// `base` when it was opened (and when a Save of a local file in place re-bound it).
     opened: Ident,
     /// The session's claim on the cached copy, held while the file is open.
     _claim: Option<crate::cache::Claim>,
@@ -582,12 +625,20 @@ pub struct HexFile {
     cache_root: PathBuf,
     /// Set by the first successful backup; later saves of the same session keep it.
     backup: Option<PathBuf>,
+    /// What the last Save of a local file in place did to the file read (see [`Rebind`]), for
+    /// the window to take.
+    rebind: Option<Rebind>,
+    /// Why nothing more can be saved from this file, if so.
+    read_only: Option<String>,
     /// Called between the pre-pass observations (tests: a writer in that gap).
     #[cfg(test)]
     pub(crate) pre_pass_hook: Option<Box<dyn FnMut() + Send>>,
     /// Called after each chunk of a save's pass over the bytes (tests: a writer in the middle).
     #[cfg(test)]
     pub(crate) chunk_hook: Option<Box<dyn FnMut(u64) + Send>>,
+    /// The stat that ends a save's pass fails (tests).
+    #[cfg(test)]
+    pub(crate) fail_stat_after_pass: bool,
 }
 
 /// Result of one Save.
@@ -615,6 +666,36 @@ struct Pass {
     backup: Option<PathBuf>,
     /// SHA-256 of the bytes as opened.
     sha256: [u8; 32],
+    /// SHA-256 of the stage: what a Save that lands puts in the file.
+    stage_sha256: [u8; 32],
+}
+
+/// What a Save of a local file in place did to the file the window reads: the rename put a new
+/// file at its path and the old one is gone from it.
+pub enum Rebind {
+    /// The new file holds exactly what was saved: it is read from now on (the window rebases
+    /// its edits on it).
+    Rebound(Arc<File>),
+    /// It does not (another writer, right after): nothing more is saved from this window.
+    Lost(String),
+}
+
+/// Files a save's pass made, removed when it is dropped unless kept: every way out of the pass
+/// — an error, a refusal, a panic — leaves none behind.
+struct Made(Vec<PathBuf>);
+
+impl Made {
+    fn keep(mut self) {
+        self.0.clear();
+    }
+}
+
+impl Drop for Made {
+    fn drop(&mut self) {
+        for path in &self.0 {
+            let _ = std::fs::remove_file(path);
+        }
+    }
 }
 
 enum PassResult {
@@ -655,10 +736,14 @@ impl HexFile {
             edits,
             cache_root: cache_root.to_path_buf(),
             backup: None,
+            rebind: None,
+            read_only: None,
             #[cfg(test)]
             pre_pass_hook: None,
             #[cfg(test)]
             chunk_hook: None,
+            #[cfg(test)]
+            fail_stat_after_pass: false,
         }
     }
 
@@ -703,6 +788,9 @@ impl HexFile {
     /// pass creates is new (created exclusively, owner-only) and removed if the pass fails.
     fn pass(&mut self, patches: &BTreeMap<u64, u8>, tag: &str, backup: bool) -> Result<PassResult> {
         use sha2::Digest;
+        if let Some(why) = &self.read_only {
+            bail!("{why}");
+        }
         // A writer at the former gap between two observations is now seen by this one.
         #[cfg(test)]
         if let Some(hook) = self.pre_pass_hook.as_mut() {
@@ -713,25 +801,15 @@ impl HexFile {
             return Ok(PassResult::Changed(self.opened.change(&before)));
         }
         let (stage, mut stage_file) = super::create_keep(&self.edits, tag)?;
+        let mut made = Made(vec![stage.clone()]);
         let mut backup_file = None;
         if backup {
-            match self.new_backup() {
-                Ok(made) => backup_file = Some(made),
-                Err(e) => {
-                    let _ = std::fs::remove_file(&stage);
-                    return Err(e);
-                }
-            }
+            let (path, file) = self.new_backup()?;
+            made.0.push(path.clone());
+            backup_file = Some((path, file));
         }
-        let made: Vec<PathBuf> = std::iter::once(stage.clone())
-            .chain(backup_file.as_ref().map(|(p, _)| p.clone()))
-            .collect();
-        let discard = |made: &[PathBuf]| {
-            for path in made {
-                let _ = std::fs::remove_file(path);
-            }
-        };
         let mut hasher = sha2::Sha256::new();
+        let mut stage_hasher = sha2::Sha256::new();
         let mut buf = vec![0u8; CHUNK];
         let len = self.size();
         let mut at = 0u64;
@@ -749,6 +827,7 @@ impl HexFile {
                 for (&off, &b) in patches.range(at..at + n as u64) {
                     buf[(off - at) as usize] = b;
                 }
+                stage_hasher.update(&buf[..n]);
                 stage_file
                     .write_all(&buf[..n])
                     .with_context(|| format!("cannot write {}", stage.display()))?;
@@ -764,36 +843,89 @@ impl HexFile {
             }
             Ok(())
         })();
-        if let Err(e) = copied {
-            discard(&made);
-            let after = Ident::of(&self.base, &self.base_path)?;
-            if after != before {
-                return Ok(PassResult::Changed(format!(
-                    "{} while it was being read",
-                    before.change(&after)
-                )));
-            }
-            return Err(e);
+        #[cfg(test)]
+        if self.fail_stat_after_pass {
+            bail!("cannot stat {} (test)", self.base_path.display());
         }
         let after = Ident::of(&self.base, &self.base_path)?;
         if after != before {
-            discard(&made);
             return Ok(PassResult::Changed(format!(
                 "{} while it was being read",
                 before.change(&after)
             )));
         }
+        copied?;
+        made.keep();
         Ok(PassResult::Done(Pass {
             stage,
             backup: backup_file.map(|(p, _)| p),
             sha256: hasher.finalize().into(),
+            stage_sha256: stage_hasher.finalize().into(),
         }))
+    }
+
+    /// Whether the file read is the file saved — a local file opened in place (a fetched copy
+    /// is only read: no upload changes it).
+    fn in_place(&self) -> bool {
+        self.origin.is_local() && self.base_path == Path::new(&self.origin.abs)
+    }
+
+    /// After a Save of a local file in place landed: the file now at the path is opened and
+    /// becomes the file read — only if it holds exactly what was saved (`want`, the stage's
+    /// SHA-256), read through its own handle, unchanged while it was read.
+    fn rebind(&mut self, want: &[u8; 32]) -> Rebind {
+        use sha2::Digest;
+        let check = (|| -> Result<Option<Base>> {
+            let base = Base::open(&self.base_path)?;
+            let mut hasher = sha2::Sha256::new();
+            let mut buf = vec![0u8; CHUNK];
+            let mut at = 0u64;
+            while at < base.opened.len {
+                let n = (base.opened.len - at).min(CHUNK as u64) as usize;
+                base.file.read_exact_at(&mut buf[..n], at)?;
+                hasher.update(&buf[..n]);
+                at += n as u64;
+            }
+            let same: [u8; 32] = hasher.finalize().into();
+            let still = Ident::of(&base.file, &base.path)? == base.opened;
+            Ok((still && &same == want && base.opened.len == self.opened.len).then_some(base))
+        })();
+        match check {
+            Ok(Some(base)) => {
+                self.base = Arc::new(base.file);
+                self.opened = base.opened;
+                Rebind::Rebound(self.base.clone())
+            }
+            Ok(None) => self.lose(format!(
+                "{} no longer holds what was saved (changed right after the save?)",
+                self.base_path.display()
+            )),
+            Err(e) => self.lose(format!(
+                "{} cannot be read back after the save ({e:#})",
+                self.base_path.display()
+            )),
+        }
+    }
+
+    fn lose(&mut self, why: String) -> Rebind {
+        self.read_only = Some(why.clone());
+        Rebind::Lost(why)
+    }
+
+    /// What the last Save did to the file read, once.
+    pub fn take_rebind(&mut self) -> Option<Rebind> {
+        self.rebind.take()
+    }
+
+    /// Why nothing more can be saved from this file, if so.
+    pub fn read_only(&self) -> Option<&str> {
+        self.read_only.as_deref()
     }
 
     /// The changes, when the bytes they apply to changed: `<name>.hexpatch-<stamp>.txt` among
     /// the edits (owner-only, a new file), one `offset: bytes` line per run of changed bytes
     /// under a header naming the source as it was opened.
-    fn keep_patches(&self, patches: &BTreeMap<u64, u8>, why: &str) -> Result<PathBuf> {
+    pub(super) fn keep_patches(&self, patches: &BTreeMap<u64, u8>, why: &str) -> Result<PathBuf> {
         let stamp = crate::cache::utc_stamp(SystemTime::now());
         let name = self
             .edits
@@ -833,7 +965,12 @@ impl HexFile {
             let hex: String = bytes.iter().map(|b| format!("{b:02X}")).collect();
             text.push_str(&format!("0x{start:X}: {hex}\n"));
         }
-        if let Err(e) = file.write_all(text.as_bytes()) {
+        // Owner-only whatever the umask took from the creating call.
+        use std::os::unix::fs::PermissionsExt;
+        let written = file
+            .set_permissions(std::fs::Permissions::from_mode(0o600))
+            .and_then(|()| file.write_all(text.as_bytes()));
+        if let Err(e) = written {
             let _ = std::fs::remove_file(&path);
             return Err(e).with_context(|| format!("cannot write {}", path.display()));
         }
@@ -878,7 +1015,7 @@ impl HexFile {
             self.backup = Some(path.clone());
         }
         let backup = self.backup.clone().expect("made by the first pass");
-        let staged = pass.stage;
+        let (staged, stage_sha256) = (pass.stage, pass.stage_sha256);
         // A local file opened in place has no hash from a fetch: the pass's is what was opened.
         if self.origin.at.sha256.is_none() {
             self.origin.at.sha256 = Some(pass.sha256);
@@ -894,14 +1031,10 @@ impl HexFile {
                 WriteOutcome::Written { now, notes } => {
                     self.origin.at = now;
                     let _ = std::fs::remove_file(&staged);
-                    // A local file opened in place was just renamed over: its old inode's change
-                    // time moved with the unlink. What it holds did not (checked by the pass).
-                    if let Ok(now) = Ident::of(&self.base, &self.base_path) {
-                        if (now.len, now.mtime, now.ino)
-                            == (self.opened.len, self.opened.mtime, self.opened.ino)
-                        {
-                            self.opened = now;
-                        }
+                    // A local file opened in place was just renamed over: the file read is
+                    // gone from its path. A fetched copy is untouched: it stays as opened.
+                    if self.in_place() {
+                        self.rebind = Some(self.rebind(&stage_sha256));
                     }
                     Ok(Saved::Written {
                         remote: self.origin.display(),
@@ -1043,6 +1176,9 @@ fn autosave(mut file: HexFile, doc: &HexDoc, hooks: &Hooks) -> Result<Outcome> {
             for note in notes {
                 eprintln!("sopen: {note}");
             }
+            if let Some(Rebind::Lost(why)) = file.take_rebind() {
+                eprintln!("sopen: {why}");
+            }
         }
         Saved::Refused { message, .. } => {
             outcome.conflict = true;
@@ -1167,6 +1303,8 @@ pub(super) struct HexWindow {
     /// The grid as last laid out, and how many rows the last pass painted.
     layout: Option<Layout>,
     rows_painted: u64,
+    /// Why the window is read-only (the file saved in place changed right after), if it is.
+    read_only: Option<String>,
     /// Lines from open that must be read whole and stay (see [`super::disclosures`]).
     opened: Vec<String>,
     /// What the last write reported that must be read whole, and the next such report, held
@@ -1226,6 +1364,7 @@ impl HexWindow {
             painted: false,
             layout: None,
             rows_painted: 0,
+            read_only: None,
             opened,
             notices: Vec::new(),
             pending_notices: None,
@@ -1294,6 +1433,9 @@ impl HexWindow {
         if self.job.is_some() {
             return;
         }
+        if let Some(why) = &self.read_only {
+            return self.status = Status::error(why.clone());
+        }
         if matches!(kind, JobKind::Save { .. }) {
             if !self.can_replace {
                 return self.status = Status::error(CANNOT_REPLACE);
@@ -1345,12 +1487,23 @@ impl HexWindow {
             )),
         };
         let job = self.job.take().expect("checked above");
-        let (status, shown) = report(&result, &mut self.outcome.lock().unwrap());
+        let (status, mut shown) = report(&result, &mut self.outcome.lock().unwrap());
         self.status = status;
-        self.pending_notices = Some(shown);
+        // An edit made while the save ran is not in what it wrote.
+        let newer = *self.doc.patches() != job.snapshot;
         let landed = match &result {
             Ok(JobDone::Saved(Saved::Written { .. })) => {
                 self.doc.mark_saved(job.snapshot.clone());
+                let rebind = self
+                    .file
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .take_rebind();
+                match rebind {
+                    Some(Rebind::Rebound(file)) => self.doc.rebase(file, &job.snapshot),
+                    Some(Rebind::Lost(why)) => shown.push(self.turn_read_only(&why)),
+                    None => {}
+                }
                 true
             }
             Ok(JobDone::Copy(..)) => {
@@ -1359,17 +1512,20 @@ impl HexWindow {
             }
             _ => false,
         };
-        let notes = matches!(&result, Ok(JobDone::Saved(Saved::Written { notes, .. })) if !notes.is_empty());
-        let asked = matches!(
-            job.kind,
-            JobKind::Save { close_after: true } | JobKind::SaveCopy { close_after: true }
-        ) || std::mem::take(&mut self.close_when_done);
+        self.pending_notices = Some(shown);
+        let notes = matches!(&result, Ok(JobDone::Saved(Saved::Written { notes, .. })) if !notes.is_empty())
+            || self.read_only.is_some();
+        // A close asked for during this save is used up by it, whatever it reports.
+        let waited = std::mem::take(&mut self.close_when_done);
+        let asked = waited
+            || matches!(
+                job.kind,
+                JobKind::Save { close_after: true } | JobKind::SaveCopy { close_after: true }
+            );
         if !asked || !landed {
             return;
         }
-        // An edit made while the save ran is not in what it wrote.
-        let newer = *self.doc.patches() != job.snapshot;
-        if newer || self.doc.unsaved() {
+        if (newer || self.doc.unsaved()) && self.read_only.is_none() {
             if newer {
                 self.status =
                     Status::info(format!("newer edits are not saved · {}", self.status.text));
@@ -1387,9 +1543,30 @@ impl HexWindow {
     }
 
     /// Whether input may change anything: not under the close prompt, not once closing is
-    /// decided.
+    /// decided, not once the window is read-only.
     fn locked(&self) -> bool {
-        self.prompt || self.close_ok
+        self.prompt || self.close_ok || self.read_only.is_some()
+    }
+
+    /// The file saved in place no longer holds what was saved: nothing more is edited or saved
+    /// here. The edits are listed in a file of their own; returns the line saying so (read
+    /// whole, in the rows).
+    fn turn_read_only(&mut self, why: &str) -> String {
+        let listed = self
+            .file
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .keep_patches(self.doc.patches(), why);
+        let line = match listed {
+            Ok(path) => format!(
+                "read-only now: {why}; your edits are listed in {}",
+                path.display()
+            ),
+            Err(e) => format!("read-only now: {why}; your edits could not be listed ({e:#})"),
+        };
+        eprintln!("sopen: {line}");
+        self.read_only = Some(line.clone());
+        line
     }
 
     /// Keys for the whole window. `goto_owns` = the Go to field has this frame's typing (it is
@@ -1924,7 +2101,8 @@ impl super::Window for HexWindow {
     }
 
     fn close_requested(&mut self) -> bool {
-        if self.close_ok {
+        // Read-only: the edits are listed in a file; there is nothing to save or ask.
+        if self.close_ok || (self.read_only.is_some() && self.job.is_none()) {
             return true;
         }
         if self.job.is_some() {

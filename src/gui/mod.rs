@@ -71,6 +71,11 @@ impl Origin {
         }
     }
 
+    /// A file on this machine (no host).
+    pub fn is_local(&self) -> bool {
+        self.label.is_none()
+    }
+
     /// Whether this server can replace a file in one step (`posix-rename@openssh.com`).
     pub fn can_replace(&self) -> bool {
         self.fs.can_replace()

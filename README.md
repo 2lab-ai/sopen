@@ -117,11 +117,12 @@ offers the next free one (`data-1.zip`). **Esc** (or closing the window) downloa
 Exceptions: Enter in the path field saves there (it never opens the hex editor); while a transfer
 runs, Enter and Esc do nothing and closing the window waits for it to finish.
 
-The file appears under its name only complete: it is written to a hidden `.<name>.sopen-….part` in
-the same folder and published with a hard link. If it cannot be published without replacing a file,
-the save fails and names the complete staging file it kept. A download whose source changes
-meanwhile is not saved; that check is best-effort (the remote file's size and modification time,
-and the bytes received).
+The file appears under its name only complete: it is written into a private hidden folder
+(`.sopen-…`) in the chosen folder and published from there with a hard link, never over anything.
+A folder whose filesystem has no hard links (exFAT, some network shares), a folder that does not
+exist, or a path ending in '/' is refused before anything is transferred. A download whose source
+changes meanwhile is not saved; that check is best-effort (the remote file's size and modification
+time, and the bytes received).
 
 The hex editor shows rows of 16 bytes — offset, hex, ASCII — and reads only what is on screen, so a
 file of any size scrolls the same. It overwrites bytes and never changes the file's size:
@@ -132,7 +133,7 @@ file of any size scrolls the same. It overwrites bytes and never changes the fil
 | hex digits / characters | overwrite: in the hex column two digits per byte, in the ASCII column one character; `Tab` switches the column |
 | `⌘G` | go to an offset (`0x…` or decimal) |
 | `⌘Z` / `⇧⌘Z` (Ctrl on Linux) | undo / redo |
-| `⌘S` | Save: the original is first backed up locally (path printed), then overwritten in place, as image Save does. If the file changed since it was opened, nothing is written and your edits are listed in a `.hexpatch-….txt` file, named in the window |
+| `⌘S` | Save: the original is first backed up locally (path printed), then overwritten in place, as image Save does. When it is refused, the window names where your edits were kept: if the file changed since it was opened, nothing is written and the edits are listed in a `.hexpatch-….txt` file; if the overwrite itself is refused (the remote changed), the staged edited file is kept |
 | `⇧⌘S` | Save copy: `<name>.edited.<ext>` next to the original |
 
 ## Any other app: `--app`
