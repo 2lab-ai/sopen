@@ -1,8 +1,9 @@
 //! Local paths: the fetch cache `<cache>/<host>/<abs path>`, edits kept aside as
 //! `<copy>.conflict-<UTC stamp>`, image backups `<cache>/.backup/<host>/<abs path>.<UTC stamp>`,
-//! image edits under `<cache>/.edits`, exports under `<cache>/.exports` (spec §5), and the state dir (ssh control sockets, `usage.jsonl`). What sopen knows about a
-//! copy lives apart from the mirrored tree, under `<cache>/.meta` (see [`Claim`]): the record of
-//! what the copy held when fetched or saved, and the session lock. `SOPEN_CACHE_DIR` /
+//! image edits under `<cache>/.edits`, exports under `<cache>/.exports`, session copies under
+//! `<cache>/.sessions` (spec §5), and the state dir (ssh control sockets, `usage.jsonl`). What
+//! sopen knows about a copy lives apart from the mirrored tree, under `<cache>/.meta` (see
+//! [`Claim`]): the record of what the copy held when fetched or saved, and the session lock. `SOPEN_CACHE_DIR` /
 //! `SOPEN_STATE_DIR` override both. What sopen creates under the cache is the owner's only
 //! (0700 directories, 0600 files).
 
@@ -92,6 +93,8 @@ fn meta_path(cache: &Path, kind: &str, local: &Path) -> Result<PathBuf> {
 /// older build made without the dot (`backup`, `edits`, `exports`) are just cache now: never
 /// read, never written.
 const BACKUP: &str = ".backup";
+/// Session copies: `<cache>/.sessions/<host>/<abs path>.<random><ext>` (see [`claim`]).
+const SESSIONS: &str = ".sessions";
 const EDITS: &str = ".edits";
 const EXPORTS: &str = ".exports";
 
@@ -169,11 +172,10 @@ pub fn create_unique(mut name: impl FnMut(u32) -> PathBuf) -> Result<(PathBuf, F
     anyhow::bail!("no free name for a new file after {TRIES} tries")
 }
 
-/// The cached copy one session works on — its app or editor, its window — locked for as long
-/// as this lives, with what sopen knows about it.
+/// The cached copy one session works on — its app or editor, its window — with what sopen
+/// knows about it. The shared copy is locked for as long as this lives.
 pub struct Claim {
     pub local: PathBuf,
-    cache: PathBuf,
     /// The record of what the copy held when sopen last fetched or saved it.
     record: PathBuf,
     /// Why this session works on a copy of its own (`local` is not the shared copy): the one
@@ -181,61 +183,39 @@ pub struct Claim {
     pub note: Option<String>,
     /// `local` was created empty by this claim (a session copy): nothing in it to keep.
     fresh: bool,
-    /// `None` only for a session copy whose lock failed (the copy is still its own).
+    /// The shared copy's lock; `None` for a session copy (only its own session uses it).
     _lock: Option<File>,
 }
 
+/// A copy moved aside before a fetch, and what is known about it.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Kept {
+    pub path: PathBuf,
+    /// It differs from what sopen recorded it held: it has unsaved edits. `false`: there is no
+    /// record of what was fetched, so it is only kept in case it holds edits.
+    pub edited: bool,
+}
+
 impl Claim {
-    /// Before a fetch writes the copy: a copy that differs from its record (or has none — it
-    /// may hold unsaved edits) is moved aside; returns where it went.
-    pub fn set_aside_unsaved(&self) -> Result<Option<PathBuf>> {
+    /// Before a fetch writes the copy: a copy that differs from its record, or has none, is
+    /// moved aside; returns where it went and which of the two it was.
+    pub fn set_aside_unsaved(&self) -> Result<Option<Kept>> {
         if self.fresh || !self.local.is_file() {
             return Ok(None);
         }
         let held = hex(&crate::app::file_hash(&self.local)?);
-        if read_record(&self.record).as_deref() == Some(held.as_str()) {
-            return Ok(None);
-        }
-        set_aside(&self.local).map(Some)
+        let edited = match read_record(&self.record) {
+            Some(record) if record == held => return Ok(None),
+            Some(_) => true,
+            None => false,
+        };
+        let path = set_aside(&self.local)?;
+        Ok(Some(Kept { path, edited }))
     }
 
     /// Records `sha256` as what the copy holds now (fetched, or saved back).
     pub fn record(&self, sha256: &[u8; 32]) -> Result<()> {
         write_record(&self.record, sha256)
-    }
-
-    /// For the shared copy's claim: the session copies earlier sessions left next to it
-    /// (`<stem>.session-<hex><ext>`) whose session has ended — their lock is free. One holding
-    /// unsaved edits (it differs from its record, or has none) is moved aside, and where it went
-    /// is returned to be said; a clean one is removed with its record and lock, as is one a
-    /// failed fetch left empty. A copy whose session still runs (its lock is held, or cannot be
-    /// tried) is never touched; one that cannot be tidied is left as it is.
-    pub fn tidy_session_copies(&self) -> Vec<PathBuf> {
-        let mut kept = Vec::new();
-        let (Some(dir), None) = (self.local.parent(), &self.note) else {
-            return kept;
-        };
-        let name = self.local.file_name().unwrap_or_default().to_string_lossy();
-        let (stem, ext) = split_ext(&name);
-        let prefix = format!("{stem}.session-");
-        let Ok(entries) = std::fs::read_dir(dir) else {
-            return kept;
-        };
-        for entry in entries.flatten() {
-            let sibling = entry.file_name();
-            let sibling = sibling.to_string_lossy();
-            let random = sibling
-                .strip_prefix(&prefix)
-                .and_then(|rest| rest.strip_suffix(ext));
-            if !random.is_some_and(|r| r.len() == 8 && r.bytes().all(|b| b.is_ascii_hexdigit())) {
-                continue;
-            }
-            match tidy_session_copy(&self.cache, &entry.path()) {
-                Ok(moved) => kept.extend(moved),
-                Err(e) => crate::debug!("{} left as it is: {e:#}", entry.path().display()),
-            }
-        }
-        kept
     }
 }
 
@@ -247,38 +227,11 @@ fn split_ext(name: &str) -> (&str, &str) {
     }
 }
 
-/// One ended session's copy, see [`Claim::tidy_session_copies`]: its lock is taken first and
-/// held throughout, so a session that starts meanwhile cannot be working on it.
-fn tidy_session_copy(cache: &Path, copy: &Path) -> Result<Option<PathBuf>> {
-    let (lock, lock_path) = open_lock(cache, copy)?;
-    if lock.try_lock().is_err() {
-        return Ok(None);
-    }
-    let meta = std::fs::symlink_metadata(copy)?;
-    if !meta.file_type().is_file() {
-        return Ok(None);
-    }
-    let record = meta_path(cache, "record", copy)?;
-    let clean = match read_record(&record) {
-        Some(held) => held == hex(&crate::app::file_hash(copy)?),
-        // Never fetched into (its fetch failed): the empty file its claim created.
-        None => meta.len() == 0,
-    };
-    let moved = if clean {
-        std::fs::remove_file(copy)?;
-        None
-    } else {
-        Some(set_aside(copy)?)
-    };
-    let _ = std::fs::remove_file(&record);
-    let _ = std::fs::remove_file(&lock_path);
-    Ok(moved)
-}
-
 /// Claims the cached copy of `abs` on `host` for this session. When another sopen session holds
-/// it — or it cannot be locked at all — this one gets a copy of its own next to it,
-/// `<stem>.session-<random>.<ext>`, created exclusively, so neither replaces nor moves aside
-/// the copy another session is editing.
+/// it — or it cannot be locked at all — this one gets a copy of its own outside the mirror,
+/// `<cache>/.sessions/<host>/<abs path>.<random><ext>`, created exclusively, so neither replaces
+/// nor moves aside the copy another session is editing. Session copies stay until the cache is
+/// cleared: sopen never deletes them.
 pub fn claim(cache: &Path, host: &str, abs: &str) -> Result<Claim> {
     claim_with(cache, &cache_path(cache, host, abs), &mut |file| {
         file.try_lock()
@@ -302,7 +255,6 @@ fn claim_with(
         Ok(()) => {
             return Ok(Claim {
                 local: cached.to_path_buf(),
-                cache: cache.to_path_buf(),
                 record: meta_path(cache, "record", cached)?,
                 note: None,
                 fresh: false,
@@ -316,32 +268,29 @@ fn claim_with(
             format!("{} cannot be locked ({e})", lock.display())
         }
     };
-    let name = cached.file_name().unwrap_or_default().to_string_lossy();
-    let (stem, ext) = split_ext(&name);
-    // The session copy itself, created exclusively (empty, owner-only): the fetch fills it.
+    // A copy of its own, outside the mirror (where no remote file can be it or be taken for
+    // it), created exclusively — empty, owner-only — for the fetch to fill. Only this session
+    // uses it, so it has no lock.
+    let rel = cached
+        .strip_prefix(cache)
+        .with_context(|| format!("{} is not under the cache", cached.display()))?;
+    let base = cache.join(SESSIONS).join(rel);
+    let name = base.file_name().unwrap_or_default().to_string_lossy();
+    let (_, ext) = split_ext(&name);
     let (local, _) = create_unique(|_| {
         let random = crate::remote::random_hex();
-        cached.with_file_name(format!("{stem}.session-{}{ext}", &random[..8]))
+        base.with_file_name(format!("{name}.{}{ext}", &random[..8]))
     })?;
-    let (file, lock) = open_lock(cache, &local)?;
-    let lock_held = match try_lock(&file) {
-        Ok(()) => true,
-        Err(e) => {
-            crate::debug!("{} not locked ({e})", lock.display());
-            false
-        }
-    };
     let note = format!(
         "{why}; this session works on its own copy {}",
         local.display()
     );
     Ok(Claim {
         record: meta_path(cache, "record", &local)?,
-        cache: cache.to_path_buf(),
         local,
         note: Some(note),
         fresh: true,
-        _lock: lock_held.then_some(file),
+        _lock: None,
     })
 }
 
@@ -525,9 +474,18 @@ mod tests {
             edits_root(root),
             exports_root(root),
             root.join(META),
+            root.join(SESSIONS),
         ];
         for host in [
-            "backup", "edits", "exports", ".meta", ".backup", ".edits", ".exports",
+            "backup",
+            "edits",
+            "exports",
+            "sessions",
+            ".meta",
+            ".backup",
+            ".edits",
+            ".exports",
+            ".sessions",
         ] {
             let mirrored = cache_path(root, host, "/x");
             for r in &fixed {
@@ -572,42 +530,68 @@ mod tests {
             .set_aside_unsaved()
             .unwrap()
             .expect("edited copy moved");
+        assert!(kept.edited, "it differs from its record");
+        let kept = kept.path;
         assert!(!copy.exists());
         assert_eq!(std::fs::read_to_string(&kept).unwrap(), "my edit");
         let name = kept.file_name().unwrap().to_string_lossy().into_owned();
         assert!(name.starts_with("a.txt.conflict-"), "{name}");
 
-        // A copy with no record (an older sopen kept it next to the copy) is treated as
-        // possibly edited; a second set-aside in the same second gets its own name instead of
-        // replacing the first.
+        // A copy with no record is kept in case it holds edits (and said so: not "edited"); a
+        // second set-aside in the same second gets its own name instead of replacing the first.
         std::fs::write(&copy, "second edit").unwrap();
         std::fs::remove_file(&claim.record).unwrap();
         let again = claim
             .set_aside_unsaved()
             .unwrap()
             .expect("unrecorded copy moved");
+        assert!(!again.edited, "no record: not known to be edited");
+        let again = again.path;
         assert_ne!(again, kept);
         assert_eq!(std::fs::read_to_string(&kept).unwrap(), "my edit");
         assert_eq!(std::fs::read_to_string(&again).unwrap(), "second edit");
     }
 
-    /// A session copy (the shared one is held) is created by the claim itself — empty,
-    /// owner-only, under a name no other claim gets — and holds nothing to move aside.
+    /// A session copy (the shared one is held) lives outside the mirror, under
+    /// `<cache>/.sessions/<host>/<abs path>.<8 hex><ext>`: created by the claim itself — empty,
+    /// owner-only, under a name no other claim gets — holding nothing to move aside, and with no
+    /// lock (only its own session uses it).
     #[test]
-    fn a_session_copy_is_created_exclusively() {
+    fn a_session_copy_lands_under_sessions() {
+        use std::os::unix::fs::PermissionsExt;
         let tmp = tempfile::tempdir().unwrap();
-        let one = claim(tmp.path(), "box", "/a.txt").unwrap();
-        let two = claim(tmp.path(), "box", "/a.txt").unwrap();
-        let three = claim(tmp.path(), "box", "/a.txt").unwrap();
+        let one = claim(tmp.path(), "box", "/d/a.txt").unwrap();
+        let two = claim(tmp.path(), "box", "/d/a.txt").unwrap();
+        let three = claim(tmp.path(), "box", "/d/a.txt").unwrap();
         assert!(one.note.is_none() && !one.local.exists());
+        let dir = tmp.path().join(".sessions/box/d");
         for c in [&two, &three] {
+            assert_eq!(c.local.parent(), Some(dir.as_path()), "{:?}", c.local);
+            let name = c.local.file_name().unwrap().to_string_lossy().into_owned();
+            let hex = name
+                .strip_prefix("a.txt.")
+                .and_then(|r| r.strip_suffix(".txt"));
+            assert!(
+                hex.is_some_and(|h| h.len() == 8 && h.bytes().all(|b| b.is_ascii_hexdigit())),
+                "{name}"
+            );
             let meta = std::fs::symlink_metadata(&c.local).expect("created by the claim");
             assert!(
                 meta.file_type().is_file() && meta.len() == 0,
                 "{:?}",
                 c.local
             );
+            assert_eq!(meta.permissions().mode() & 0o777, 0o600);
             assert_eq!(c.set_aside_unsaved().unwrap(), None);
+            assert!(
+                !meta_path(tmp.path(), "lock", &c.local).unwrap().exists(),
+                "no lock"
+            );
+            assert!(c
+                .note
+                .as_deref()
+                .unwrap()
+                .ends_with(&*c.local.to_string_lossy()));
         }
         assert_ne!(two.local, three.local);
         assert_ne!(two.record, three.record);
@@ -791,7 +775,7 @@ mod tests {
             assert_ne!(c.local, cached);
             let name = c.local.file_name().unwrap().to_string_lossy().into_owned();
             assert!(
-                name.starts_with("a.session-") && name.ends_with(".txt"),
+                name.starts_with("a.txt.") && name.ends_with(".txt"),
                 "{name}"
             );
         }
@@ -825,74 +809,6 @@ mod tests {
         let mode = std::fs::metadata(&referent).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o644);
         assert_eq!(std::fs::read_to_string(&referent).unwrap(), "referent");
-    }
-
-    /// Tidying on the shared copy's claim: ended sessions' copies that hold nothing unsaved —
-    /// a clean one, one a failed fetch left empty — go with their record and lock; a running
-    /// session's copy and files merely named alike stay.
-    #[test]
-    fn tidy_removes_ended_clean_session_copies_with_their_record_and_lock() {
-        let tmp = tempfile::tempdir().unwrap();
-        let c = tmp.path();
-        let one = claim(c, "box", "/a.txt").unwrap();
-        let unfilled = claim(c, "box", "/a.txt").unwrap();
-        let clean = claim(c, "box", "/a.txt").unwrap();
-        std::fs::write(&clean.local, "v1").unwrap();
-        clean
-            .record(&crate::app::file_hash(&clean.local).unwrap())
-            .unwrap();
-        let running = claim(c, "box", "/a.txt").unwrap();
-        std::fs::write(&running.local, "in progress").unwrap();
-        let alike = [
-            "a.session-1234567.txt",
-            "a.session-xyzxyzxy.txt",
-            "b.session-12345678.txt",
-        ]
-        .map(|n| one.local.with_file_name(n));
-        for path in &alike {
-            std::fs::write(path, "not a session copy of a.txt").unwrap();
-        }
-        let gone: Vec<PathBuf> = [&unfilled, &clean]
-            .iter()
-            .flat_map(|s| {
-                [
-                    s.local.clone(),
-                    s.record.clone(),
-                    meta_path(c, "lock", &s.local).unwrap(),
-                ]
-            })
-            .collect();
-        assert!(gone.iter().filter(|p| p.exists()).count() >= 5, "{gone:?}");
-        drop((one, unfilled, clean));
-        assert!(
-            running.tidy_session_copies().is_empty(),
-            "a session copy's claim never tidies"
-        );
-        // A lock let go here can stay held for a moment by a process another test thread is
-        // spawning (fork duplicates the descriptor until exec): a held lock is left alone by
-        // design, so try again until it is let go.
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        loop {
-            let again = claim(c, "box", "/a.txt").unwrap();
-            if again.note.is_none() {
-                assert_eq!(again.tidy_session_copies(), Vec::<PathBuf>::new());
-                if gone.iter().all(|p| !p.exists()) {
-                    break;
-                }
-            }
-            let left: Vec<_> = gone.iter().filter(|p| p.exists()).collect();
-            assert!(std::time::Instant::now() < deadline, "not tidied: {left:?}");
-            drop(again);
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        assert_eq!(
-            std::fs::read_to_string(&running.local).unwrap(),
-            "in progress"
-        );
-        assert!(meta_path(c, "lock", &running.local).unwrap().exists());
-        for path in &alike {
-            assert!(path.exists(), "{path:?}");
-        }
     }
 
     #[test]

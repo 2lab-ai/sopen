@@ -278,18 +278,22 @@ fn fetch_to_cache(place: &mut Place, abs: &str, dirs: &Dirs, rec: &mut Record) -
         eprintln!("sopen: {note}");
     }
     let mut notices = Vec::new();
-    for earlier in claim.tidy_session_copies() {
-        notices.push(format!(
-            "an earlier session's copy had unsaved edits; kept them at {}",
-            earlier.display()
-        ));
-    }
-    let kept = claim.set_aside_unsaved()?;
-    if let Some(kept) = &kept {
-        notices.push(format!(
+    // Said as known: a copy that differs from what was recorded has unsaved edits; one with no
+    // record may or may not.
+    match claim.set_aside_unsaved()? {
+        Some(cache::Kept { path, edited: true }) => notices.push(format!(
             "the previous copy had unsaved edits; kept them at {}",
-            kept.display()
-        ));
+            path.display()
+        )),
+        Some(cache::Kept {
+            path,
+            edited: false,
+        }) => notices.push(format!(
+            "no record of what was fetched for {}; kept it at {} in case it holds edits",
+            claim.local.display(),
+            path.display()
+        )),
+        None => {}
     }
     for line in &notices {
         eprintln!("sopen: {line}");
@@ -750,9 +754,17 @@ mod tests {
         );
         assert_eq!(std::fs::read_to_string(&second).unwrap(), "v1");
         assert!(conflict_copies(first.parent().unwrap()).is_empty());
+        // Its own copy lives outside the mirror, under `<cache>/.sessions`.
+        let mirrored = first.strip_prefix(&dirs.cache).unwrap();
         let name = second.file_name().unwrap().to_string_lossy().into_owned();
+        assert_eq!(
+            second.parent().unwrap(),
+            dirs.cache
+                .join(".sessions")
+                .join(mirrored.parent().unwrap())
+        );
         assert!(
-            name.starts_with("a.session-") && name.ends_with(".txt"),
+            name.starts_with("a.txt.") && name.ends_with(".txt"),
             "{name}"
         );
         let note = two.claim.note.as_deref().unwrap();
@@ -888,11 +900,43 @@ mod tests {
         );
     }
 
-    /// Session copies are revisited when a later session claims the shared copy: one whose
-    /// session ended with unsaved edits is moved aside (and said), a clean one is removed, and
-    /// one whose session still runs is left alone.
     #[test]
-    fn ended_sessions_copies_are_kept_aside_or_removed_on_the_next_claim() {
+    fn a_remote_file_named_like_a_session_copy_is_just_another_copy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let remote = tmp.path().join("remote");
+        std::fs::create_dir(&remote).unwrap();
+        std::fs::write(remote.join("a.txt"), "v1").unwrap();
+        std::fs::write(remote.join("a.session-1a2b3c4d.txt"), "a remote file").unwrap();
+        let abs = |name: &str| remote.join(name).to_str().unwrap().to_string();
+        let dirs = Dirs {
+            cache: tmp.path().join("cache"),
+            state: tmp.path().join("state"),
+        };
+        let mut place = Place::Local(LocalFs::new());
+        let mut fetch =
+            |name: &str| fetch_to_cache(&mut place, &abs(name), &dirs, &mut Record::default());
+        let alike = fetch("a.session-1a2b3c4d.txt").unwrap();
+        let alike_copy = alike.claim.local.clone();
+        std::fs::write(&alike_copy, "my unsaved edit of it").unwrap();
+        drop(alike);
+        // Sessions on a.txt come and go, sharing its copy and getting their own.
+        let one = fetch("a.txt").unwrap();
+        let two = fetch("a.txt").unwrap();
+        drop((one, two));
+        let three = fetch("a.txt").unwrap();
+        drop(three);
+        assert_eq!(
+            std::fs::read_to_string(&alike_copy).unwrap(),
+            "my unsaved edit of it",
+            "another file's copy was moved or removed"
+        );
+    }
+
+    /// What the notice claims matches what sopen knows: a copy that differs from its record
+    /// "had unsaved edits"; a copy with no record (its fetch was never recorded) is only kept in
+    /// case it holds edits.
+    #[test]
+    fn a_kept_copy_is_described_by_what_is_known_about_it() {
         let tmp = tempfile::tempdir().unwrap();
         let target = tmp.path().join("a.txt");
         std::fs::write(&target, "v1").unwrap();
@@ -903,39 +947,41 @@ mod tests {
         };
         let mut place = Place::Local(LocalFs::new());
         let mut fetch = || fetch_to_cache(&mut place, &abs, &dirs, &mut Record::default()).unwrap();
+
         let one = fetch();
-        let running = fetch();
-        std::fs::write(&running.claim.local, "still being edited").unwrap();
-        let edited = fetch();
-        std::fs::write(&edited.claim.local, "unsaved session edit").unwrap();
-        let clean = fetch();
-        let (edited_copy, clean_copy) = (edited.claim.local.clone(), clean.claim.local.clone());
-        let shared = one.claim.local.clone();
-        drop((edited, clean, one));
-        let again = fetch();
-        assert_eq!(again.claim.local, shared);
-        assert!(!clean_copy.exists(), "a clean session copy is removed");
-        assert!(
-            !edited_copy.exists(),
-            "an edited session copy is moved aside"
-        );
-        let kept = conflict_copies(shared.parent().unwrap());
-        assert_eq!(kept.len(), 1, "{kept:?}");
+        let copy = one.claim.local.clone();
+        std::fs::write(&copy, "an edit").unwrap();
+        drop(one);
+        let two = fetch();
+        let kept = conflict_copies(copy.parent().unwrap());
         assert_eq!(
-            std::fs::read_to_string(&kept[0]).unwrap(),
-            "unsaved session edit"
-        );
-        assert_eq!(
-            again.notices,
+            two.notices,
             [format!(
-                "an earlier session's copy had unsaved edits; kept them at {}",
+                "the previous copy had unsaved edits; kept them at {}",
                 kept[0].display()
             )]
         );
+        drop(two);
+
+        // No record of what was fetched (as if never recorded): only "in case".
+        let record = dirs
+            .cache
+            .join(".meta/record")
+            .join(copy.strip_prefix(&dirs.cache).unwrap());
+        std::fs::remove_file(&record).unwrap();
+        let three = fetch();
+        let kept: Vec<_> = conflict_copies(copy.parent().unwrap())
+            .into_iter()
+            .filter(|k| !kept.contains(k))
+            .collect();
+        assert_eq!(kept.len(), 1, "{kept:?}");
         assert_eq!(
-            std::fs::read_to_string(&running.claim.local).unwrap(),
-            "still being edited",
-            "a running session's copy is never touched"
+            three.notices,
+            [format!(
+                "no record of what was fetched for {}; kept it at {} in case it holds edits",
+                copy.display(),
+                kept[0].display()
+            )]
         );
     }
 

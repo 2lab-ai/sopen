@@ -114,7 +114,9 @@ impl RemoteFs for LocalFs {
             .with_context(|| format!("cannot open {}", local.display()))
             .map_err(|e| CreateError::new(Created::No, e))?;
         // A brand-new file gets 0666 minus the umask, as `cp` would; a temp that stands in for an
-        // existing file starts private and then takes that file's bits before any content lands.
+        // existing file starts private and takes that file's owner and bits through the open file:
+        // owner first (a chown can clear set-id bits), the permission bits before the content,
+        // and the full mode once more after it (writing clears set-id bits).
         let dst = fs::OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -123,17 +125,24 @@ impl RemoteFs for LocalFs {
             .with_context(|| format!("cannot create {path}"))
             .map_err(|e| CreateError::new(Created::No, e))?;
         let mut fill = || -> Result<Uploaded> {
+            let set_mode = |mode: u32| {
+                dst.set_permissions(fs::Permissions::from_mode(mode))
+                    .with_context(|| format!("cannot set mode on {path}"))
+            };
             if let Some(like) = like {
-                // Through the open file: owner first (a chown can clear set-id bits), then mode.
+                // A refused owner change is not fatal here: the caller checks the result (a
+                // mismatch refuses the save; an owner that was already right passes).
                 if let Err(e) = std::os::unix::fs::fchown(&dst, Some(like.uid), Some(like.gid)) {
                     crate::debug!("fchown {path}: {e}");
                 }
-                dst.set_permissions(fs::Permissions::from_mode(like.mode))
-                    .with_context(|| format!("cannot set mode on {path}"))?;
+                set_mode(like.mode & 0o777)?;
             }
             let mut out = Hashing::new(&dst);
             std::io::copy(&mut src, &mut out).with_context(|| format!("cannot write {path}"))?;
             let written = out.finish();
+            if let Some(like) = like {
+                set_mode(like.mode)?;
+            }
             dst.sync_all()
                 .with_context(|| format!("cannot sync {path}"))?;
             Ok(written)

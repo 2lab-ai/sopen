@@ -271,3 +271,39 @@ fn sftp_sibling_publish_never_replaces() {
     a.remove(&join(&dir, &wanted)).unwrap();
     live.done(&dir);
 }
+
+/// A setuid target keeps its set-id bit over SFTP: the server clears it when the temp is
+/// written, and sopen sets the full mode again through the still-open handle (fsetstat) before
+/// the rename.
+#[test]
+#[ignore = "needs SOPEN_TEST_SFTP_HOST=<ssh alias> and an existing SOPEN_TEST_SFTP_DIR"]
+fn sftp_set_id_bits_survive_the_write() {
+    let Some(live) = live() else { return };
+    let local = tempfile::tempdir().unwrap();
+    let v1 = local_file(local.path(), "v1", "one\n");
+    let mut fs = live.connect();
+    let dir = live.scratch("setid", &mut fs);
+    let name = fs
+        .write_new_sibling(&v1, &dir, &format!("tool-{}", random_hex()))
+        .unwrap();
+    let target = join(&dir, &name);
+    fs.set_mode(&target, 0o4755).unwrap();
+    let at = fs.stat(&target).unwrap();
+    assert_eq!(
+        at.mode & 0o7777,
+        0o4755,
+        "the server keeps setuid on a plain chmod"
+    );
+    let v2 = local_file(local.path(), "v2", "two\n");
+    let saved = fs.write_atomic(&v2, &target, at.fingerprint()).unwrap();
+    let WriteOutcome::Written { now, notes } = saved else {
+        panic!("expected Written, got {saved:?}")
+    };
+    assert!(notes.is_empty(), "{notes:?}");
+    assert_eq!(now.mode & 0o7777, 0o4755);
+    assert_eq!(fs.stat(&target).unwrap().mode & 0o7777, 0o4755);
+    println!("setuid write_atomic -> Written, mode {:o}", now.mode);
+    assert!(temps(&mut fs, &dir).is_empty());
+    fs.remove(&target).unwrap();
+    live.done(&dir);
+}

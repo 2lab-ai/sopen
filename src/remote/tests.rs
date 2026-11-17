@@ -67,6 +67,12 @@ struct Hooks {
     /// Right after the temp is created and filled, someone with write access to the
     /// directory replaces it with a symlink to this file.
     temp_swapped_for_link_to: Option<PathBuf>,
+    /// The target looks owned by another uid, so the backend is asked for an owner it cannot
+    /// give (unless running as root): its real `fchown` is refused.
+    foreign_target_owner: bool,
+    /// The backend is asked to give the temp root's owner — refused (unless running as root)
+    /// while the temp's owner already is the target's.
+    owner_asked_as_root: bool,
 }
 
 #[derive(Default)]
@@ -105,6 +111,9 @@ impl RemoteFs for Hooked {
             if temp && self.h.foreign_temp_owner && !self.owner_fixed {
                 s.uid = s.uid.map(|u| u + 1);
             }
+            if !temp && self.h.foreign_target_owner {
+                s.uid = s.uid.map(|u| u + 1);
+            }
             if !temp && self.h.missing.is_some() {
                 s.missing = self.h.missing;
             }
@@ -141,6 +150,14 @@ impl RemoteFs for Hooked {
             std::fs::write(path, "theirs").unwrap();
         }
         self.race(path);
+        let like = like.map(|l| match self.h.owner_asked_as_root {
+            true => Like {
+                uid: 0,
+                gid: 0,
+                ..l
+            },
+            false => l,
+        });
         let up = self.inner.create_from(local, path, like)?;
         if let Some(victim) = &self.h.temp_swapped_for_link_to {
             std::fs::remove_file(path).unwrap();
@@ -443,6 +460,77 @@ fn w3_a_writer_right_after_the_rename_is_reported_and_poisons_the_baseline() {
         std::fs::read_to_string(&target).unwrap(),
         "mine + another writer"
     );
+}
+
+/// Writing to a file clears its set-user-ID bit (for a non-root writer): the mode is finalized
+/// through the still-open handle after the content is written, so a setuid target keeps it.
+#[test]
+fn a_set_id_bit_cleared_by_writing_is_set_again_through_the_handle() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (target, local, at) = fetched(tmp.path(), "tool", "v1");
+    std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o4755)).unwrap();
+    std::fs::write(&local, "v2").unwrap();
+    let mut fs = LocalFs::new();
+    let outcome = fs
+        .write_atomic(&local, p(&target), at.fingerprint())
+        .unwrap();
+    let WriteOutcome::Written { now, notes } = outcome else {
+        panic!("expected Written, got {outcome:?}")
+    };
+    assert!(notes.is_empty(), "{notes:?}");
+    assert_eq!(now.mode, 0o4755);
+    let mode = std::fs::metadata(&target).unwrap().permissions().mode() & 0o7777;
+    assert_eq!(mode, 0o4755);
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "v2");
+}
+
+/// Backend level (LocalFs's real `fchown`): an owner change the system refuses leaves the temp
+/// owned by this account while the target is someone else's — the save is refused, nothing
+/// replaced. (Root's chown is never refused, so there this case cannot be made.)
+#[test]
+fn a_refused_owner_change_that_leaves_a_mismatch_refuses_the_save() {
+    use std::os::unix::fs::MetadataExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let (target, local, at) = fetched(tmp.path(), "a.txt", "v1");
+    if std::fs::metadata(&target).unwrap().uid() == 0 {
+        eprintln!("skipping: root's chown is never refused");
+        return;
+    }
+    std::fs::write(&local, "edit").unwrap();
+    let mut fs = Hooked::new(Hooks {
+        foreign_target_owner: true,
+        ..Hooks::default()
+    });
+    let err = fs
+        .write_atomic(&local, p(&target), at.fingerprint())
+        .unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(msg.contains("is owned by uid"), "{msg}");
+    assert!(msg.contains("was not replaced"), "{msg}");
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "v1");
+    assert!(temps(tmp.path()).is_empty(), "{:?}", temps(tmp.path()));
+    assert_eq!(fs.renames, 0);
+}
+
+/// Backend level: an owner change that fails while the temp's owner already is the target's
+/// (here: asked for root's, refused for a non-root account) does not stop the save.
+#[test]
+fn a_failed_owner_change_with_the_owner_already_right_lets_the_save_proceed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (target, local, at) = fetched(tmp.path(), "a.txt", "v1");
+    std::fs::write(&local, "edit").unwrap();
+    let mut fs = Hooked::new(Hooks {
+        owner_asked_as_root: true,
+        ..Hooks::default()
+    });
+    let outcome = fs
+        .write_atomic(&local, p(&target), at.fingerprint())
+        .unwrap();
+    assert!(
+        matches!(outcome, WriteOutcome::Written { .. }),
+        "{outcome:?}"
+    );
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "edit");
 }
 
 /// Owner and mode are given to the temp through its open handle, never by path afterwards: a

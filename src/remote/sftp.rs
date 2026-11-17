@@ -227,6 +227,12 @@ fn parse_ssh_g(stdout: &str) -> Result<SshConfig> {
 /// account — then made 0700 through the same descriptor if group or others had access; never
 /// chmodded by path. Anything else is refused with one error.
 fn create_private_dir(dir: &Path) -> Result<()> {
+    create_private_dir_with(dir, &mut || {})
+}
+
+/// [`create_private_dir`], with `between` called between the path check and the open (tests:
+/// the entry swapped meanwhile).
+fn create_private_dir_with(dir: &Path, between: &mut dyn FnMut()) -> Result<()> {
     use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
     let refuse = |why: String| {
         anyhow!(
@@ -248,18 +254,23 @@ fn create_private_dir(dir: &Path) -> Result<()> {
         }
         Err(e) => return Err(e).with_context(|| format!("cannot stat {}", dir.display())),
     }
+    between();
     let opened = std::fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY)
         .open(dir);
     let handle = match opened {
         Ok(h) => h,
-        // Swapped since the check above.
-        Err(e) if e.raw_os_error() == Some(libc::ELOOP) => {
-            return Err(refuse("is a symlink".into()))
-        }
-        Err(e) if e.raw_os_error() == Some(libc::ENOTDIR) => {
-            return Err(refuse("is not a directory".into()))
+        // Swapped since the check above (a symlink fails the open with ELOOP, or with ENOTDIR
+        // on systems that check O_DIRECTORY first): say which, from what is there now.
+        Err(e) if matches!(e.raw_os_error(), Some(libc::ELOOP | libc::ENOTDIR)) => {
+            let link = std::fs::symlink_metadata(dir).is_ok_and(|m| m.file_type().is_symlink());
+            let why = if link {
+                "is a symlink"
+            } else {
+                "is not a directory"
+            };
+            return Err(refuse(why.into()));
         }
         Err(e) => return Err(e).with_context(|| format!("cannot open {}", dir.display())),
     };
@@ -486,9 +497,12 @@ impl RemoteFs for SftpRemote {
             };
             // From here `path` is ours.
             let fill = async {
+                // fsetstat/fstat on the open handle, never by path: owner first (a chown can
+                // clear set-id bits), the permission bits before the content, and the full mode
+                // once more after it (writing clears set-id bits).
                 if let Some(like) = like {
-                    // fsetstat on the open handle: owner first (a chown can clear set-id bits),
-                    // then mode. An owner the server refuses is caught by the caller's check.
+                    // A refused owner change is not fatal here: the caller checks the result
+                    // (a mismatch refuses the save; an owner that was already right passes).
                     let owner = MetaDataBuilder::new().id((like.uid, like.gid)).create();
                     match within(META_TIMEOUT, file.set_metadata(owner)).await {
                         Ok(Ok(())) => {}
@@ -497,7 +511,7 @@ impl RemoteFs for SftpRemote {
                             return Err(timed_out(&format!("set owner on {path}"), META_TIMEOUT))
                         }
                     }
-                    within(META_TIMEOUT, file.set_permissions(perms(like.mode)))
+                    within(META_TIMEOUT, file.set_permissions(perms(like.mode & 0o777)))
                         .await
                         .map_err(|()| timed_out(&format!("set mode on {path}"), META_TIMEOUT))?
                         .map_err(|e| anyhow!("cannot set mode on {path}: {e}"))?;
@@ -517,6 +531,12 @@ impl RemoteFs for SftpRemote {
                         .map_err(|()| timed_out(&format!("write {path}"), STALL_TIMEOUT))?
                         .map_err(|e| anyhow!("cannot write {path}: {e}"))?;
                     out.write_all(&buf[..n])?;
+                }
+                if let Some(like) = like {
+                    within(META_TIMEOUT, file.set_permissions(perms(like.mode)))
+                        .await
+                        .map_err(|()| timed_out(&format!("set mode on {path}"), META_TIMEOUT))?
+                        .map_err(|e| anyhow!("cannot set mode on {path}: {e}"))?;
                 }
                 if sftp.support_fsync() {
                     within(STALL_TIMEOUT, file.sync_all())
@@ -647,6 +667,22 @@ mod tests {
         std::fs::write(&file, "").unwrap();
         let err = format!("{:#}", create_private_dir(&file).unwrap_err());
         assert!(err.contains("is not a directory"), "{err}");
+
+        // A directory swapped for a symlink between the check and the open: the open does not
+        // follow it, and nothing is changed through it.
+        let swapped = tmp.path().join("swapped");
+        std::fs::create_dir(&swapped).unwrap();
+        let err = create_private_dir_with(&swapped, &mut || {
+            std::fs::remove_dir(&swapped).unwrap();
+            std::os::unix::fs::symlink(&elsewhere, &swapped).unwrap();
+        })
+        .unwrap_err();
+        let err = format!("{err:#}");
+        assert!(err.contains("is a symlink"), "{err}");
+        assert_eq!(mode(&elsewhere), 0o755, "nothing changed through the link");
+
+        // A directory owned by another account is refused too ("is owned by uid …"); making
+        // one needs root, so that case has no test here.
     }
 
     #[test]
