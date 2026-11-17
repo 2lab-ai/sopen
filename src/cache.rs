@@ -135,14 +135,26 @@ pub fn lock_path(local: &Path) -> PathBuf {
 /// as this lives.
 pub struct Claim {
     pub local: PathBuf,
-    /// `None` only where the filesystem has no advisory locks.
+    /// Why this session works on a copy of its own (`local` is not the shared copy): the one
+    /// line to print.
+    pub note: Option<String>,
+    /// `None` only for a session copy whose own lock failed (its name is still its own).
     _lock: Option<File>,
 }
 
-/// Claims `cached` for this session. When another sopen session holds it, this one gets a
-/// sibling copy of its own, `<stem>.session-<random>.<ext>`, so neither replaces nor moves
-/// aside the copy the other is editing.
+/// Claims `cached` for this session. When another sopen session holds it — or it cannot be
+/// locked at all — this one gets a sibling copy of its own, `<stem>.session-<random>.<ext>`
+/// (created exclusively), so neither replaces nor moves aside the copy another is editing.
 pub fn claim(cached: &Path) -> Result<Claim> {
+    claim_with(cached, &mut |file| file.try_lock())
+}
+
+/// [`claim`], with `try_lock` standing in for `File::try_lock` (tests: a filesystem whose
+/// locks fail).
+fn claim_with(
+    cached: &Path,
+    try_lock: &mut dyn FnMut(&File) -> std::result::Result<(), std::fs::TryLockError>,
+) -> Result<Claim> {
     if let Some(dir) = cached.parent() {
         private_dir(dir)?;
     }
@@ -155,25 +167,23 @@ pub fn claim(cached: &Path) -> Result<Claim> {
         .mode(0o600)
         .open(&path)
         .with_context(|| format!("cannot create {}", path.display()))?;
-    match file.try_lock() {
+    // Held by another session, or not lockable here at all: either way this session must not
+    // work on the shared copy.
+    let why = match try_lock(&file) {
         Ok(()) => {
             return Ok(Claim {
                 local: cached.to_path_buf(),
+                note: None,
                 _lock: Some(file),
             })
         }
-        Err(std::fs::TryLockError::WouldBlock) => {}
-        Err(std::fs::TryLockError::Error(e)) => {
-            crate::debug!(
-                "{} not locked ({e}); working on it unlocked",
-                path.display()
-            );
-            return Ok(Claim {
-                local: cached.to_path_buf(),
-                _lock: None,
-            });
+        Err(std::fs::TryLockError::WouldBlock) => {
+            format!("another sopen session has {} open", cached.display())
         }
-    }
+        Err(std::fs::TryLockError::Error(e)) => {
+            format!("{} cannot be locked ({e})", cached.display())
+        }
+    };
     let name = cached.file_name().unwrap_or_default().to_string_lossy();
     let (stem, ext) = match name.rfind('.') {
         Some(i) if i > 0 => (&name[..i], &name[i..]),
@@ -186,12 +196,21 @@ pub fn claim(cached: &Path) -> Result<Claim> {
         local = cached.with_file_name(format!("{stem}.session-{}{ext}", &random[..8]));
         lock_path(&local)
     })?;
-    if let Err(e) = file.try_lock() {
-        crate::debug!("{} not locked ({e})", lock.display());
-    }
+    let lock_held = match try_lock(&file) {
+        Ok(()) => true,
+        Err(e) => {
+            crate::debug!("{} not locked ({e})", lock.display());
+            false
+        }
+    };
+    let note = format!(
+        "{why}; this session works on its own copy {}",
+        local.display()
+    );
     Ok(Claim {
         local,
-        _lock: Some(file),
+        note: Some(note),
+        _lock: lock_held.then_some(file),
     })
 }
 
@@ -223,6 +242,9 @@ fn set_aside_with(edited: &Path, before_move: &mut dyn FnMut(&Path)) -> Result<P
         first.with_file_name(name)
     })
     .with_context(|| format!("no free conflict-copy name next to {}", edited.display()))?;
+    // What is at the copy's name, not what it may point at: only a regular file is the edit
+    // itself; a symlink is moved aside as the link, and nothing is done through it.
+    let regular = std::fs::symlink_metadata(edited).is_ok_and(|m| m.file_type().is_file());
     before_move(&keep);
     if let Err(e) = std::fs::rename(edited, &keep) {
         let _ = std::fs::remove_file(&keep);
@@ -235,7 +257,12 @@ fn set_aside_with(edited: &Path, before_move: &mut dyn FnMut(&Path)) -> Result<P
         });
     }
     // An editor may have rewritten the copy with the umask's mode: the edit is private.
-    if let Err(e) = std::fs::set_permissions(&keep, std::fs::Permissions::from_mode(0o600)) {
+    if !regular {
+        crate::debug!(
+            "{} is not a regular file; moved aside as is",
+            keep.display()
+        );
+    } else if let Err(e) = std::fs::set_permissions(&keep, std::fs::Permissions::from_mode(0o600)) {
         crate::debug!("{} not made owner-only: {e}", keep.display());
     }
     Ok(keep)
@@ -254,21 +281,24 @@ pub fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// Records `sha256` as what the fetched copy `local` holds — owner-only (0600), like the copy;
-/// a record an older sopen left with the umask's mode is made so too.
+/// Records `sha256` as what the fetched copy `local` holds — owner-only (0600), like the copy.
+/// Written to a new file next to it and renamed onto the record's name: the rename replaces
+/// whatever entry is there (an older sopen's 0644 record, a symlink) and never writes through
+/// it.
 pub fn write_baseline(local: &Path, sha256: &[u8; 32]) -> Result<()> {
     let record = baseline_record_path(local);
-    let write = || -> std::io::Result<()> {
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(&record)?;
-        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-        std::io::Write::write_all(&mut file, format!("{}\n", hex(sha256)).as_bytes())
-    };
-    write().with_context(|| format!("cannot write {}", record.display()))
+    let (temp, mut file) = create_unique(|_| {
+        let mut name = record.file_name().unwrap_or_default().to_os_string();
+        name.push(format!("-{}", &crate::remote::random_hex()[..8]));
+        record.with_file_name(name)
+    })?;
+    let written = std::io::Write::write_all(&mut file, format!("{}\n", hex(sha256)).as_bytes())
+        .and_then(|()| std::fs::rename(&temp, &record));
+    if let Err(e) = written {
+        let _ = std::fs::remove_file(&temp);
+        return Err(e).with_context(|| format!("cannot write {}", record.display()));
+    }
+    Ok(())
 }
 
 fn read_baseline(local: &Path) -> Option<String> {
@@ -397,6 +427,11 @@ mod tests {
     /// elsewhere — without touching either, and makes an owner-only file under the next one.
     #[test]
     fn create_unique_never_opens_an_existing_name() {
+        if crate::testutil::rerun_under_umask_022(
+            "cache::tests::create_unique_never_opens_an_existing_name",
+        ) {
+            return;
+        }
         use std::os::unix::fs::PermissionsExt;
         let tmp = tempfile::tempdir().unwrap();
         let taken = tmp.path().join("d/taken");
@@ -458,6 +493,9 @@ mod tests {
     /// sopen left with the umask's mode.
     #[test]
     fn baseline_records_are_owner_only() {
+        if crate::testutil::rerun_under_umask_022("cache::tests::baseline_records_are_owner_only") {
+            return;
+        }
         use std::os::unix::fs::PermissionsExt;
         let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
         let tmp = tempfile::tempdir().unwrap();
@@ -474,6 +512,85 @@ mod tests {
             assert_eq!(mode(&record), 0o600, "{record:?}");
             assert_eq!(read_baseline(copy), Some(hex(&[7; 32])));
         }
+    }
+
+    /// A symlink at the record's name is replaced by the record, never written through: the
+    /// file it pointed at keeps its content and mode.
+    #[test]
+    fn write_baseline_never_writes_through_a_symlink() {
+        if crate::testutil::rerun_under_umask_022(
+            "cache::tests::write_baseline_never_writes_through_a_symlink",
+        ) {
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let unrelated = tmp.path().join("unrelated");
+        std::fs::write(&unrelated, "unrelated").unwrap();
+        std::fs::set_permissions(&unrelated, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let copy = tmp.path().join("a.txt");
+        std::os::unix::fs::symlink(&unrelated, baseline_record_path(&copy)).unwrap();
+        write_baseline(&copy, &[7; 32]).unwrap();
+        assert_eq!(std::fs::read_to_string(&unrelated).unwrap(), "unrelated");
+        let mode = std::fs::metadata(&unrelated).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o644);
+        let record = std::fs::symlink_metadata(baseline_record_path(&copy)).unwrap();
+        assert!(record.file_type().is_file(), "the record replaced the link");
+        assert_eq!(record.permissions().mode() & 0o777, 0o600);
+        assert_eq!(read_baseline(&copy), Some(hex(&[7; 32])));
+        let names: Vec<_> = std::fs::read_dir(tmp.path()).unwrap().flatten().collect();
+        assert_eq!(names.len(), 2, "no temp left behind: {names:?}");
+    }
+
+    /// A copy that is a symlink is moved aside as the link itself: what it points at keeps its
+    /// content and mode.
+    #[test]
+    fn set_aside_moves_a_symlink_without_touching_what_it_points_at() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let referent = tmp.path().join("referent");
+        std::fs::write(&referent, "referent").unwrap();
+        std::fs::set_permissions(&referent, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let copy = tmp.path().join("a.txt");
+        std::os::unix::fs::symlink(&referent, &copy).unwrap();
+        let kept = set_aside(&copy).unwrap();
+        assert!(std::fs::symlink_metadata(&kept)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(std::fs::read_link(&kept).unwrap(), referent);
+        assert_eq!(std::fs::read_to_string(&referent).unwrap(), "referent");
+        let mode = std::fs::metadata(&referent).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o644);
+        assert!(
+            copy.symlink_metadata().is_err(),
+            "out of the way of the next fetch"
+        );
+    }
+
+    /// Where the copy cannot be locked at all (a filesystem without working locks), a session
+    /// never works on the shared copy unlocked: it gets an exclusively created copy of its own,
+    /// as when another session holds the lock.
+    #[test]
+    fn a_copy_that_cannot_be_locked_is_not_shared() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cached = tmp.path().join("box/a.txt");
+        let unsupported =
+            || std::fs::TryLockError::Error(std::io::Error::from(std::io::ErrorKind::Unsupported));
+        let one = claim_with(&cached, &mut |_| Err(unsupported())).unwrap();
+        let two = claim_with(&cached, &mut |_| Err(unsupported())).unwrap();
+        for c in [&one, &two] {
+            assert_ne!(c.local, cached);
+            let name = c.local.file_name().unwrap().to_string_lossy().into_owned();
+            assert!(
+                name.starts_with("a.session-") && name.ends_with(".txt"),
+                "{name}"
+            );
+        }
+        assert_ne!(one.local, two.local);
+        let note = one.note.as_deref().unwrap();
+        assert!(note.contains("cannot be locked"), "{note}");
+        assert!(note.ends_with(&*one.local.to_string_lossy()), "{note}");
     }
 
     #[test]

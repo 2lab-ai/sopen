@@ -274,12 +274,8 @@ struct Fetched {
 fn fetch_to_cache(place: &mut Place, abs: &str, dirs: &Dirs, rec: &mut Record) -> Result<Fetched> {
     let cached = cache::cache_path(&dirs.cache, &place.host_label(), abs);
     let claim = cache::claim(&cached)?;
-    if claim.local != cached {
-        eprintln!(
-            "sopen: another sopen session has {} open; this one works on its own copy {}",
-            cached.display(),
-            claim.local.display()
-        );
+    if let Some(note) = &claim.note {
+        eprintln!("sopen: {note}");
     }
     let kept = cache::set_aside_unsaved(&claim.local)?;
     if let Some(kept) = &kept {
@@ -737,6 +733,9 @@ mod tests {
             name.starts_with("a.session-") && name.ends_with(".txt"),
             "{name}"
         );
+        let note = two.claim.note.as_deref().unwrap();
+        assert!(note.starts_with("another sopen session has"), "{note}");
+        assert!(one.claim.note.is_none());
         // The lock lasts as long as the session: once the first one ends, the copy is free
         // again (its unsaved edit is moved aside by the next fetch, as before).
         drop(one);

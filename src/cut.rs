@@ -174,7 +174,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(last, 1.0, "progress reaches the end");
-        // The local export lived in an owner-only work dir.
+        // The local export lived in an owner-only work dir (meaningful under a permissive umask:
+        // `video_cut_with_crop` runs under 022).
         use std::os::unix::fs::PermissionsExt;
         let work = std::fs::metadata(dir.join("work")).unwrap().permissions();
         assert_eq!(work.mode() & 0o777, 0o700);
@@ -196,6 +197,10 @@ mod tests {
 
     #[test]
     fn video_cut_with_crop() {
+        // Also where `cut_one`'s work-dir mode check means something (see the helper).
+        if crate::testutil::rerun_under_umask_022("cut::tests::video_cut_with_crop") {
+            return;
+        }
         let Some(tools) = tools_or_skip() else { return };
         let tmp = tempfile::tempdir().unwrap();
         generate(

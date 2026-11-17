@@ -2230,13 +2230,70 @@ mod tests {
                 w.poll_job(&egui::Context::default());
                 assert_eq!(w.close_ok, !newer, "{case}");
                 assert_eq!(w.prompt, newer, "{case}: asks again");
+                assert_eq!(
+                    w.doc.unsaved(),
+                    newer,
+                    "{case}: the newer edit is still unsaved"
+                );
                 if newer {
                     assert!(
                         w.status.text.starts_with("newer edits are not saved"),
                         "{case}: {}",
                         w.status.text
                     );
+                    // Cancel, then close again: still asked, never closed with the edit unsaved.
+                    w.prompt = false;
+                    assert!(!super::super::Window::close_requested(&mut w), "{case}");
+                    assert!(
+                        w.prompt && !w.close_ok,
+                        "{case}: asks again on a second close"
+                    );
                 }
+            }
+        }
+    }
+
+    /// A close asked for during a plain Save / Save copy (not one chosen in the prompt) waits
+    /// for it, then closes — unless an edit was made meanwhile: then it asks.
+    #[test]
+    fn a_close_during_a_plain_save_closes_after_it_unless_there_are_newer_edits() {
+        for copy in [false, true] {
+            for newer in [false, true] {
+                let case = format!("copy={copy} newer={newer}");
+                let tmp = tempfile::tempdir().unwrap();
+                let file = local_file(tmp.path(), "a.png", &png_bytes(&gradient(12, 12)));
+                let mut w = window_for(file, Arc::default());
+                w.doc.pixelize([0, 0, 4, 4], 2).unwrap();
+                let (tx, rx) = mpsc::channel();
+                w.job = Some(Job {
+                    kind: if copy {
+                        JobKind::SaveCopy { close_after: false }
+                    } else {
+                        JobKind::Save { close_after: false }
+                    },
+                    rev: w.doc.rev(),
+                    rx,
+                });
+                assert!(!super::super::Window::close_requested(&mut w), "{case}");
+                assert!(w.close_when_done, "{case}");
+                if newer {
+                    w.doc.pixelize([4, 4, 8, 8], 2).unwrap();
+                }
+                let done = if copy {
+                    JobDone::Copy("box:/a.edited.png".to_string(), Vec::new())
+                } else {
+                    JobDone::Saved(Saved::Written {
+                        remote: "box:/a.png".to_string(),
+                        backup: PathBuf::from("/backup/a.png"),
+                        notes: Vec::new(),
+                        not_kept: Vec::new(),
+                    })
+                };
+                tx.send(Ok(done)).unwrap();
+                w.poll_job(&egui::Context::default());
+                assert_eq!(w.close_ok, !newer, "{case}");
+                assert_eq!(w.prompt, newer, "{case}: asks");
+                assert_eq!(w.doc.unsaved(), newer, "{case}");
             }
         }
     }
@@ -2403,6 +2460,11 @@ mod tests {
     /// gets the mode any new file in that directory gets.
     #[test]
     fn local_copies_of_an_image_are_owner_only() {
+        if crate::testutil::rerun_under_umask_022(
+            "gui::image::tests::local_copies_of_an_image_are_owner_only",
+        ) {
+            return;
+        }
         use std::os::unix::fs::PermissionsExt;
         let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
         let tmp = tempfile::tempdir().unwrap();

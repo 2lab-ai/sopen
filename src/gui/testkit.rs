@@ -171,9 +171,12 @@ impl Driver {
             }
         }
         let viewport = Rect::from_min_size(Pos2::ZERO, self.size);
-        self.shapes
-            .iter()
-            .find_map(|c| walk(&c.shape, text, c.clip_rect.intersect(viewport)))
+        // The clip rect is in the space the shape's transform maps to: compare there.
+        self.shapes.iter().find_map(|c| {
+            let visible = c.clip_rect.intersect(viewport);
+            let moved = c.transform_after_tessellation;
+            walk(&c.shape, text, moved.inverse().mul_rect(visible)).map(|r| moved.mul_rect(r))
+        })
     }
 
     /// Clicks the control labelled `text`.
@@ -223,15 +226,64 @@ mod tests {
         }
     }
 
-    /// The "shown whole" oracle: a complete (not elided) galley that is clipped, or drawn
-    /// outside the viewport, is not shown — the negative controls must fail the check.
+    /// Whether the last pass holds a complete galley of `text` at all, wherever it lies.
+    fn painted(drv: &Driver, text: &str) -> bool {
+        fn walk(shape: &egui::Shape, text: &str) -> bool {
+            match shape {
+                egui::Shape::Text(t) => t.galley.text() == text && !t.galley.elided,
+                egui::Shape::Vec(v) => v.iter().any(|s| walk(s, text)),
+                _ => false,
+            }
+        }
+        drv.shapes.iter().any(|c| walk(&c.shape, text))
+    }
+
+    /// The "shown whole" oracle: a complete (not elided) galley that is clipped is not shown —
+    /// the negative control is painted, and must fail the check.
     #[test]
     fn find_text_requires_the_text_inside_its_clip_and_the_viewport() {
-        for (place, shown) in [("open", true), ("clipped", false), ("offscreen", false)] {
+        for (place, shown) in [("open", true), ("clipped", false)] {
             let mut drv = Driver::new(600.0, 400.0);
             let mut win = One { place };
             drv.idle(&mut win, 2);
+            assert!(painted(&drv, TEXT), "{place}: the galley is there");
             assert_eq!(drv.find_text(TEXT).is_some(), shown, "{place}");
+        }
+    }
+
+    /// Outside the viewport, with egui's own culling out of the way: the shapes are made here.
+    /// A complete galley whose clip holds it is shown only where the window is — also after its
+    /// transform.
+    #[test]
+    fn find_text_requires_the_text_inside_the_viewport() {
+        let mut drv = Driver::new(600.0, 400.0);
+        drv.idle(&mut One { place: "open" }, 1);
+        let galley = drv.ctx.fonts_mut(|f| {
+            f.layout_no_wrap(
+                TEXT.to_string(),
+                egui::FontId::proportional(14.0),
+                egui::Color32::WHITE,
+            )
+        });
+        let shape = |pos: Pos2, moved: Vec2| {
+            let mut c = egui::epaint::ClippedShape::new(
+                Rect::EVERYTHING,
+                egui::Shape::galley(pos, galley.clone(), egui::Color32::WHITE),
+            );
+            c.transform_after_tessellation = egui::emath::TSTransform::from_translation(moved);
+            c
+        };
+        for (pos, moved, shown) in [
+            (Pos2::new(10.0, 10.0), Vec2::ZERO, true),
+            (Pos2::new(10.0, 1000.0), Vec2::ZERO, false),
+            (Pos2::new(700.0, 10.0), Vec2::ZERO, false),
+            (Pos2::new(10.0, 10.0), Vec2::new(0.0, 1000.0), false),
+            (Pos2::new(10.0, 1000.0), Vec2::new(0.0, -990.0), true),
+        ] {
+            drv.shapes = vec![shape(pos, moved)];
+            assert!(painted(&drv, TEXT));
+            let case = format!("at {pos:?} moved {moved:?}");
+            assert_eq!(drv.find_text(TEXT).is_some(), shown, "{case}");
         }
     }
 }

@@ -807,6 +807,11 @@ fn fetch_keeps_unsaved_edits_of_the_previous_copy() {
 /// the umask's mode.
 #[test]
 fn fetched_copies_and_kept_edits_are_owner_only() {
+    if crate::testutil::rerun_under_umask_022(
+        "remote::tests::fetched_copies_and_kept_edits_are_owner_only",
+    ) {
+        return;
+    }
     let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
     let tmp = tempfile::tempdir().unwrap();
     let target = tmp.path().join("a.txt");
