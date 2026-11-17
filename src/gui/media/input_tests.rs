@@ -332,30 +332,95 @@ fn export_result_notes_leave_the_status_line() {
     assert!(outcome.exported);
 }
 
-/// The export's progress row never moves the frame: with an export running the frame sits
-/// where it sits with none, at every width (it used to be added only while exporting).
+/// An export never moves the frame — not when it starts, as it progresses, or when it reports —
+/// at every width: its spinner (painted) and "exporting NN %" (whole) share the clock line's
+/// row, and the clock line stays one line (a progress row of its own used to come and go with
+/// the export, then sat empty at the bottom while none ran).
 #[test]
 fn a_running_export_never_moves_the_frame() {
     let Some(tools) = tools_or_skip() else { return };
     let tmp = tempfile::tempdir().unwrap();
     let path = tmp.path().join("clip.mp4");
     clip(&tools, &path);
-    let mut moved = Vec::new();
+    let (mut moved, mut unshown) = (Vec::new(), Vec::new());
     for w in [420, 560, 640, 760, 900, 1100, 1280] {
         let copy = tempfile::tempdir().unwrap();
         let mut fx = open_sized(path.clone(), copy, w as f32, 700.0);
         let idle = fx.win.map;
-        let (_tx, rx) = mpsc::channel();
+        let line = transport_text(&fx.win.marks, fx.win.media.duration);
+        let progress = Arc::new(AtomicU32::new(0));
+        let (tx, rx) = mpsc::channel();
         fx.win.job = Some(ExportJob {
-            progress: Arc::default(),
+            progress: progress.clone(),
             rx,
         });
+        for per_mille in [0, 300, 1000] {
+            progress.store(per_mille, SeqCst);
+            fx.settle();
+            if fx.win.map != idle {
+                moved.push((w, format!("at {} %", per_mille / 10)));
+            }
+            let shown = format!("exporting {} %", per_mille / 10);
+            // Its spinner: one arc painted just before the text, on its line (within a spacing
+            // and a spinner's width: where on its circle the arc is depends on the time).
+            let spins = fx.drv.find_text(&shown).is_some_and(|at| {
+                let arcs = fx.drv.strokes().into_iter().filter(|r| {
+                    r.right() <= at.left()
+                        && r.left() >= at.left() - 30.0
+                        && r.max.y >= at.min.y
+                        && r.min.y <= at.max.y
+                });
+                arcs.count() == 1
+            });
+            if !spins || fx.drv.rows_of(&line) != Some(1) {
+                unshown.push((w, shown));
+            }
+        }
+        tx.send(Ok(("box:/clip.cut-0-4.mp4".to_string(), Vec::new())))
+            .unwrap();
         fx.settle();
+        assert!(fx.win.job.is_none(), "the export reported");
         if fx.win.map != idle {
-            moved.push(w);
+            moved.push((w, "after it reported".to_string()));
         }
     }
-    assert!(moved.is_empty(), "the frame moved at widths {moved:?}");
+    assert!(moved.is_empty(), "the frame moved: {moved:?}");
+    assert!(
+        unshown.is_empty(),
+        "no spinner, the progress not whole, or the clock line not one line: {unshown:?}"
+    );
+}
+
+/// The transport's clock line is never broken across rows: at every width it is one line drawn
+/// inside its clip and the window, cut with "…" (the whole line on hover) where the window is
+/// too narrow for it. It used to share
+/// the buttons' wrapping row and break after "In …" at 640 px, the default width.
+#[test]
+fn the_transport_line_never_wraps_at_any_width() {
+    let Some(tools) = tools_or_skip() else { return };
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("clip.mp4");
+    clip(&tools, &path);
+    let mut fx = open_sized(path, tmp, 1400.0, 560.0);
+    let line = transport_text(&fx.win.marks, fx.win.media.duration);
+    let (mut broken, mut whole) = (Vec::new(), Vec::new());
+    for w in 420..=1400 {
+        fx.drv.resize(w as f32, 560.0);
+        fx.settle();
+        // `rows_of` sees only a line drawn inside its clip and the window.
+        if fx.drv.rows_of(&line) != Some(1) {
+            broken.push(w);
+        }
+        if fx.drv.find_text(&line).is_some() {
+            whole.push(w);
+        }
+    }
+    assert!(
+        broken.is_empty(),
+        "the transport line is not one row in view at widths {broken:?}"
+    );
+    // Cut only where it must be: whole at the default width.
+    assert!(whole.contains(&640), "whole only at widths {whole:?}");
 }
 
 /// An export that finishes while the button is down — before the pointer has moved far enough

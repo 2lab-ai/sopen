@@ -1332,8 +1332,8 @@ impl ImageWindow {
         let has_rect = self.rect().is_some();
         let busy = self.job.is_some();
         // Wraps on a narrow window so Save stays reachable; its height depends only on the
-        // window width (button labels never change, the spinner's slot is always reserved), so
-        // it cannot move the image mid-drag.
+        // window width (button labels never change, nothing in it comes and goes — the busy
+        // spinner is in the status bar), so it cannot move the image mid-drag.
         ui.horizontal_wrapped(|ui| {
             let why = "draw a rectangle on the image first";
             if ui
@@ -1396,14 +1396,13 @@ impl ImageWindow {
             if copy.clicked() {
                 self.start(&ctx, JobKind::SaveCopy { close_after: false });
             }
-            // Its slot is always there: a spinner that came and went would rewrap the bar at
-            // some widths and move the image.
-            ui.add_visible(busy, egui::Spinner::new());
         });
     }
 
     /// `zoom` is the previous pass's (the image is laid out after the bar).
-    /// One line whatever it says (see [`super::one_line`]): the image above must not move.
+    /// One line whatever it says (see [`super::one_line`]): the image above must not move. The
+    /// busy spinner sits here, before "saving…", rather than in the wrapping toolbar: kept out
+    /// of sight there, its slot wrapped alone onto an empty second row at some widths.
     fn status_bar(&mut self, ui: &mut egui::Ui) {
         let zoom = self.zoom;
         let (w, h) = self.doc.size();
@@ -1422,6 +1421,11 @@ impl ImageWindow {
                 ui.label("unsaved changes");
             }
             ui.separator();
+            if self.job.is_some() {
+                // No taller than the status text beside it, so the bar keeps its height.
+                let size = ui.text_style_height(&egui::TextStyle::Body);
+                ui.add(egui::Spinner::new().size(size));
+            }
             self.status.show(ui);
         });
     }
