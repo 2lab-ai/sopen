@@ -322,7 +322,9 @@ fn media_autoexport_writes_a_sibling() {
 // sopen on the target, and then runs it as OpenSSH does — the words after the destination
 // joined with spaces, `sh -c "<line>"` on the "target" (here, in a home of its own, with a
 // non-interactive macOS session's PATH and a display set; the script's Linux branch has its own
-// tests). `FAKE_SSH_EXIT` stops it before the run, with that code.
+// tests). The target has nothing installed: the absolute install paths in the command are
+// pointed at a directory that does not exist, so a sopen installed on the test machine is never
+// run. `FAKE_SSH_EXIT` stops it before the run, with that code.
 
 /// A target name no test machine has.
 const HOST: &str = "sopen-test-target";
@@ -330,7 +332,8 @@ const HOST: &str = "sopen-test-target";
 /// What the fake `ssh -G` reports; nothing binds it. Short, so no temp dir is too long for it.
 const CONTROL_PATH: &str = "/s/cm-test";
 
-/// Where the target looks for sopen besides PATH (spec §4a), outside the target's home.
+/// Where the target looks for sopen besides PATH (spec §4a), outside the target's home; the fake
+/// ssh points them elsewhere.
 const INSTALLED: [&str; 3] = [
     "/opt/homebrew/bin/sopen",
     "/usr/local/bin/sopen",
@@ -355,6 +358,10 @@ impl FakeSsh {
     fn new(home: &Path) -> Self {
         let dir = home.join("fake-ssh");
         std::fs::create_dir_all(&dir).unwrap();
+        let unplug: String = INSTALLED
+            .iter()
+            .map(|p| format!(" -e 's|{p}|{}/not-installed{p}|g'", dir.display()))
+            .collect();
         executable(
             &dir.join("ssh"),
             &format!(
@@ -364,8 +371,9 @@ impl FakeSsh {
                  if [ -n \"${{FAKE_SSH_EXIT:-}}\" ]; then exit \"$FAKE_SSH_EXIT\"; fi\n\
                  while [ \"$#\" -gt 0 ] && [ \"$1\" != -- ]; do shift; done\n\
                  shift\n\
+                 line=$(printf '%s' \"$*\" | sed{unplug})\n\
                  mkdir -p '{dir}/target-home'\n\
-                 HOME='{dir}/target-home' PATH=/usr/bin:/bin:/usr/sbin:/sbin DISPLAY=:99 exec /bin/sh -c \"$*\"\n",
+                 HOME='{dir}/target-home' PATH=/usr/bin:/bin:/usr/sbin:/sbin DISPLAY=:99 exec /bin/sh -c \"$line\"\n",
                 dir = dir.display()
             ),
         );
@@ -473,8 +481,8 @@ fn target_runs_sopen_there_over_ssh_and_keeps_its_exit_code() {
     let words = &argv[want.len()..];
     let hook = format!("SOPEN_TARGET_BIN={bin}");
     assert_eq!(
-        words[..4],
-        [q("env"), q(&hook), q("sh"), q("-c")],
+        words[..5],
+        ["exec".to_string(), q("env"), q(&hook), q("sh"), q("-c")],
         "{words:#?}"
     );
     // The file is on the target itself: its path there, opened there with --here.
@@ -530,8 +538,8 @@ fn target_runs_sopen_there_over_ssh_and_keeps_its_exit_code() {
     let argv = ssh.argv().unwrap();
     let at = argv.iter().position(|a| a == "--").unwrap();
     assert_eq!(
-        argv[at + 1..at + 4],
-        [q("env"), q("SOPEN_LOG=debug"), q(&hook)]
+        argv[at + 1..at + 5],
+        ["exec".to_string(), q("env"), q("SOPEN_LOG=debug"), q(&hook)]
     );
     // `--app` waits for Enter on this side's input: no `-n`.
     let n = ssh.connection().len();
@@ -562,10 +570,6 @@ fn target_runs_sopen_there_over_ssh_and_keeps_its_exit_code() {
 
 #[test]
 fn no_sopen_on_the_target_is_its_own_message_and_127() {
-    if let Some(found) = INSTALLED.iter().find(|p| Path::new(p).exists()) {
-        eprintln!("skipping: {found} exists, so the target's script would find a sopen");
-        return;
-    }
     let tmp = tempfile::tempdir().unwrap();
     let ssh = FakeSsh::new(tmp.path());
     let out = sopen(
@@ -579,6 +583,29 @@ fn no_sopen_on_the_target_is_its_own_message_and_127() {
         format!("sopen is not installed on {HOST} (brew install 2lab-ai/tap/sopen-preview)\n")
     );
     assert!(ssh.sopen_argv().is_none());
+    // What was sent is the real list: the fake only pointed these elsewhere.
+    let argv = ssh.argv().unwrap();
+    for path in INSTALLED {
+        assert!(argv.iter().any(|w| w.contains(path)), "{path} not sent");
+    }
+}
+
+#[test]
+fn here_and_target_together_are_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ssh = FakeSsh::new(tmp.path());
+    let out = sopen(
+        tmp.path(),
+        &["--here", "--target", HOST, "x:/a.png"],
+        &[("PATH", &ssh.path)],
+    );
+    assert_eq!(out.status.code(), Some(2), "{}", text(&out.stderr));
+    assert!(
+        text(&out.stderr).contains("cannot be used with"),
+        "{}",
+        text(&out.stderr)
+    );
+    assert!(ssh.argv().is_none(), "ssh ran");
 }
 
 #[test]
@@ -610,7 +637,7 @@ fn ssh_failing_is_could_not_reach() {
     let err = text(&out.stderr);
     assert_eq!(
         err.lines().last(),
-        Some(format!("sopen: sopen on {HOST} was stopped by signal 15").as_str()),
+        Some(format!("sopen: sopen on {HOST} ended with status 143 (signal 15?)").as_str()),
         "{err}"
     );
     // A HOST that would read as an ssh option is refused before ssh runs.

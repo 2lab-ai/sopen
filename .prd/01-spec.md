@@ -38,7 +38,7 @@ where a file opens — this machine, or another machine's screen (§4a); they ad
 | A6 | "아무 파일" | Any other type is fetched to the local cache and its path printed; `--app <App>` opens it in a named local app and uploads it back when the user presses Enter in the terminal. (This is the hex-editor path: `--app ImHex`.) |
 | A7 | Rust, macOS + Linux, `brew install …` and use immediately | `brew install 2lab-ai/tap/sopen-preview` on macOS (arm64, x86_64) and Linux (x86_64, aarch64) installs `sopen` and the `ffmpeg` it needs; the first `sopen host:/a.mp3` works with no further setup. |
 | A8 | Developed like llmux | Public repo `2lab-ai/sopen`, MIT; `ci.yml` (macOS + Linux), `preview.yml` (every main push → prerelease + tap bump), `release.yml` (`v*` tag = owner gate); `AGENTS.md` SSOT; `.prd/` spec. |
-| A9 | `sopen SOURCE` opens here; `sopen --target <host> SOURCE` opens it on `<host>` (msg 7) | `sopen <host-a>:/tmp/a.html` opens on the machine it was typed on, as before. `sopen --target <host-b> <host-a>:/tmp/a.html` opens it on `<host-b>`'s screen: the same window or Zed, started by `<host-b>`'s own sopen (on macOS sopen's window floats above the others for a moment; Zed opens behind the active app, §4a); exit code is `<host-b>`'s; `could not reach <host-b>` when ssh cannot get there; `sopen is not installed on <host-b> …` (exit 127) when it has no sopen. A file on `<host-b>` itself opens there as a local file; a local file reaches `<host-b>` as `<this machine>:<path>`. |
+| A9 | `sopen SOURCE` opens here; `sopen --target <host> SOURCE` opens it on `<host>` (msg 7) | `sopen <host-a>:/tmp/a.html` opens on the machine it was typed on, as before. `sopen --target <host-b> <host-a>:/tmp/a.html` opens it on `<host-b>`'s screen: the same window or Zed, started by `<host-b>`'s own sopen (on macOS sopen's window floats above the others until it is used; Zed opens behind the active app, §4a); exit code is `<host-b>`'s; `could not reach <host-b>` when ssh cannot get there; `sopen is not installed on <host-b> …` (exit 127) when it has no sopen. A file on `<host-b>` itself opens there as a local file; a local file reaches `<host-b>` as `<this machine>:<path>`. |
 | A10 | Default target in sopen's settings (msg 8) | `sopen config target <host-b>` writes `target = "<host-b>"` to the config file (§4a); from then on `sopen SOURCE` opens on `<host-b>`, `--here` opens on this machine anyway, `--target` picks another; `sopen config` shows the file and the target; `sopen config target --unset` removes it. A config sopen cannot read is an error naming the file, never ignored. |
 
 ## 3. Routing
@@ -71,8 +71,8 @@ where a file opens — this machine, or another machine's screen (§4a); they ad
 instead: sopen starts HOST's own sopen as `sopen --here [--app APP] -- SOURCE` over the system `ssh`, with the same
 multiplexed master and connection options as §4, waits for it, and exits with its exit code (0, 1 and 3 mean what
 they mean here; 127 is no sopen on HOST). When ssh itself fails (its exit code 255) sopen exits 1 with `could not
-reach HOST`; when HOST's sopen is stopped by a signal (128 + n) it exits 1 with `sopen on HOST was stopped by
-signal n`. HOST needs sopen installed; the machine holding the file still needs only sshd. Because HOST is always
+reach HOST`; any other status above 128 (sopen itself exits only 0, 1 or 3, so most likely a signal, 128 + n)
+exits 1 with `sopen on HOST ended with status N (signal n?)`. HOST needs sopen installed; the machine holding the file still needs only sshd. Because HOST is always
 told `--here`, it never forwards again, whatever its own default is. `sopen cut` always runs here.
 
 Which machine opens it: `--here` (this machine) or `--target HOST` — one or the other, the command line refuses
@@ -80,15 +80,18 @@ both — else the environment variable `SOPEN_TARGET`, else the `target` key of 
 `SOPEN_TARGET` and the config file are read only when they are the ones deciding, so a broken file or an unreadable
 variable does not stop `--here` or `--target`, and `cut` reads neither. HOST is `[user@]host` — an ssh alias or a
 host name; a port or an IPv6 address goes into `~/.ssh/config` under an alias. Wherever it comes from it must be
-non-empty, without whitespace or `:`, and must not start with `-`. HOST is this machine — opened here, no ssh — when
-its host part (without `user@`) is a loopback name or address (`localhost`, `127.x.x.x`) or its first DNS label is
-this machine's host name up to the first `.`, in any case (`box.lan` from `box`); an IP address is compared whole.
+non-empty, without whitespace or `:`, and must not start with `-`. HOST is this machine — opened here, no ssh — only when
+its host part (without `user@`) is loopback (exactly `localhost` or a name under `.localhost`, `127.0.0.0/8`, `::1`)
+or equals this machine's host name as `gethostname` gives it, or that name up to the first `.` — in any case,
+trailing dot ignored. Nothing else counts, because opening on the wrong machine is worse than an ssh hop to this
+one: `box.lan` from a machine named just `box` is forwarded, and so is `box.other` from `box.lan`.
 
 SOURCE is rewritten to what HOST must be given. A file on HOST itself (`[user@]HOST:path`, with no user or HOST's
 user) becomes `path`, which HOST opens as a local file; a relative path stays relative to HOST's home, where the
 command starts. A file on any other machine is passed unchanged, and HOST fetches it over SFTP itself. A local path
-becomes `<this machine's short host name>:<absolute path>`, and a loopback source (`localhost:path`, `[::1]:path`),
-which would mean HOST itself there, becomes `<this machine's short host name>:path` — so HOST must reach this machine
+becomes `<this machine's short host name>:<absolute path>`, and a loopback source (by the same rule:
+`localhost:path`, `[::1]:path`, not `localhost.example.com:path`), which would mean HOST itself there, becomes
+`<this machine's short host name>:path` — so HOST must reach this machine
 by that name with `ssh`. A local file that does not exist is the same error a local open gives.
 
 On HOST, sopen is looked for on PATH, then in the usual Homebrew and cargo install paths; when there is none HOST
@@ -99,12 +102,17 @@ appended after the session's own entries. On Linux an ssh session has no display
 WAYLAND_DISPLAY is set the desktop session's DISPLAY, WAYLAND_DISPLAY, XAUTHORITY, XDG_RUNTIME_DIR,
 DBUS_SESSION_BUS_ADDRESS and XDG_SESSION_TYPE are taken from `systemctl --user show-environment` — exported by name,
 never evaluated. If that gives none, the first Wayland socket in `/run/user/<uid>` is used, else X display `:0` when
-it exists. HOST's sopen runs as a child of the script, which catches INT, TERM and HUP (sopen itself keeps their
-default handling), so a sopen stopped by a signal comes back as an exit code rather than as a lost connection.
+it exists. HOST's sopen runs as a foreground child of the script, which catches INT, TERM and HUP (sopen itself
+keeps their default handling), so a sopen stopped by a signal comes back as an exit code rather than as a lost
+connection. It is not started in the background, where a non-interactive shell would have it ignore SIGINT. Ctrl+C
+under `ssh -t` reaches the whole process group, sopen included; a signal sent to the script's shell alone leaves
+sopen running.
 
 A window asks for focus on its first frames. On macOS an app started over ssh cannot take focus: macOS keeps it
 behind the active app. sopen's own image and media window, still unfocused after asking, floats above the other
-windows for 1.5 s, or until the first click or key in it, and then returns to the normal level. Zed, opened for
+windows until it gains focus or gets its first click, key, scroll or typed text, and then returns to the normal
+level — with no timeout, because back at the normal level while unfocused macOS puts it straight behind the active
+app again. Zed, opened for
 folders and text, comes up behind the active app.
 
 HOST gets a terminal (`ssh -t`) when this side's input and output are both terminals. Otherwise it gets none
@@ -113,8 +121,10 @@ HOST gets a terminal (`ssh -t`) when this side's input and output are both termi
 Ctrl+C reaches HOST and closes the window there; without one, stopping this side's sopen leaves the window on HOST
 open. The forwarding ssh also sets `RemoteCommand=none` (a `RemoteCommand` in `~/.ssh/config`, such as a tmux
 auto-attach, would refuse the command) and `LogLevel=ERROR` (no "Shared connection … closed." after each run;
-errors still print). Every word of the command is single-quoted (a `'` or `\` is written outside the quotes) so the
-login shell on HOST — sh, bash, zsh, fish — reads each one back exactly. The receipt hooks (AGENTS.md "Receipts")
+errors still print). The command starts with a bare `exec`, so the login shell on HOST that parses it is replaced
+rather than left as a parent that a Ctrl+C would kill (dash and fish do not replace themselves on their own); every
+other word is single-quoted (a `'` or `\` is written outside the quotes) so that shell — sh, bash, zsh, fish — reads
+each one back exactly. The receipt hooks (AGENTS.md "Receipts")
 travel to HOST; settings that name local paths (`SOPEN_ZED`, `SOPEN_FFMPEG`, `SOPEN_FFPROBE`, `SOPEN_CACHE_DIR`,
 `SOPEN_STATE_DIR`, `SOPEN_CONFIG`) do not.
 

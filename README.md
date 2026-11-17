@@ -62,13 +62,13 @@ name, so that name must work for `ssh` on `<host>`.
 
 The window opens on `<host>`'s desktop session (on Linux sopen finds it through
 `systemctl --user`). On macOS an app started over ssh cannot take focus: sopen's own window
-floats above the other windows for a moment (until 1.5 s pass or you click or type in it), but
-Zed opens behind the active app. From a terminal, Ctrl+C reaches `<host>` and closes the window
+floats above the other windows until you click, type or scroll in it (or it gets focus), but Zed
+opens behind the active app. From a terminal, Ctrl+C reaches `<host>` and closes the window
 there; a sopen stopped without a terminal leaves the window on `<host>` open.
 
 The exit code is `<host>`'s; `could not reach <host>` means ssh did not get there, `sopen is not
-installed on <host>` (exit 127) means it has no sopen, and `sopen on <host> was stopped by
-signal N` means it was interrupted there.
+installed on <host>` (exit 127) means it has no sopen, and `sopen on <host> ended with status
+N (signal n?)` means it most likely was interrupted there.
 
 ## Images
 

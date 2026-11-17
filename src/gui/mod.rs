@@ -289,20 +289,20 @@ struct Shell<W: Window> {
 
 /// How long the window may take to report focus after the first focus request.
 const FOCUS_GRACE: Duration = Duration::from_millis(300);
-/// How long a window that did not get focus floats above the others.
-const RAISE_FOR: Duration = Duration::from_millis(1500);
 
 /// Bringing a window to the front when focus is refused: macOS keeps an app started over ssh
 /// (`--target`) unfocused and behind the active app, whatever it asks for. Still unfocused
 /// [`FOCUS_GRACE`] after the focus requests, the window floats above the others
-/// (`WindowLevel::AlwaysOnTop`) until [`RAISE_FOR`] has passed or the first key or click lands in
-/// it, then goes back to the normal level. Focus itself is untouched (`focused=` stays truthful).
+/// (`WindowLevel::AlwaysOnTop`) until it gains focus or the first key, click, scroll or text lands
+/// in it, then goes back to the normal level. No timeout: back at the normal level while
+/// unfocused, macOS puts it straight behind the active app again (measured). Focus itself is
+/// untouched (`focused=` stays truthful).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Raise {
     /// Waiting to see whether the focus requests worked.
     Waiting,
-    /// Above the other windows since this instant.
-    Floating(Instant),
+    /// Above the other windows.
+    Floating,
     /// Nothing more to do.
     Done,
 }
@@ -322,13 +322,11 @@ impl Raise {
             Raise::Waiting => match asked {
                 Some(_) if focused == Some(true) && requests_done => (Raise::Done, None),
                 Some(at) if requests_done && now.saturating_duration_since(at) >= FOCUS_GRACE => {
-                    (Raise::Floating(now), Some(egui::WindowLevel::AlwaysOnTop))
+                    (Raise::Floating, Some(egui::WindowLevel::AlwaysOnTop))
                 }
                 _ => (self, None),
             },
-            Raise::Floating(since)
-                if input || now.saturating_duration_since(since) >= RAISE_FOR =>
-            {
+            Raise::Floating if input || focused == Some(true) => {
                 (Raise::Done, Some(egui::WindowLevel::Normal))
             }
             other => (other, None),
@@ -441,10 +439,8 @@ impl<W: Window> eframe::App for Shell<W> {
         }
         match self.raise {
             Raise::Waiting => ctx.request_repaint_after(Duration::from_millis(50)),
-            Raise::Floating(since) => {
-                ctx.request_repaint_after(RAISE_FOR.saturating_sub(since.elapsed()))
-            }
-            Raise::Done => {}
+            // Focus and input arrive as window events, which repaint by themselves.
+            Raise::Floating | Raise::Done => {}
         }
         if command_key(&ctx, egui::Key::Q, false) || command_key(&ctx, egui::Key::W, false) {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -672,7 +668,7 @@ mod tests {
     }
 
     #[test]
-    fn an_unfocused_window_floats_above_the_others_for_a_while() {
+    fn an_unfocused_window_floats_above_the_others_until_it_is_used() {
         use egui::WindowLevel::{AlwaysOnTop, Normal};
         let t0 = Instant::now();
         let at = |ms: u64| t0 + Duration::from_millis(ms);
@@ -696,21 +692,24 @@ mod tests {
         for focused in [Some(false), None] {
             assert_eq!(
                 w.step(Some(t0), true, focused, false, at(300)),
-                (Raise::Floating(at(300)), Some(AlwaysOnTop))
+                (Raise::Floating, Some(AlwaysOnTop))
             );
         }
-        // Back to normal at RAISE_FOR, or at the first input, whichever comes first.
-        let f = Raise::Floating(at(300));
+        // No timeout: still floating, unfocused and untouched, a minute later.
+        let f = Raise::Floating;
+        for focused in [Some(false), None] {
+            assert_eq!(
+                f.step(Some(t0), true, focused, false, at(60_000)),
+                (f, None)
+            );
+        }
+        // Back to normal when it gains focus, or at the first input.
         assert_eq!(
-            f.step(Some(t0), true, Some(false), false, at(1700)),
-            (f, None)
-        );
-        assert_eq!(
-            f.step(Some(t0), true, Some(false), false, at(1800)),
+            f.step(Some(t0), true, Some(true), false, at(60_000)),
             (Raise::Done, Some(Normal))
         );
         assert_eq!(
-            f.step(Some(t0), true, Some(true), true, at(400)),
+            f.step(Some(t0), true, Some(false), true, at(400)),
             (Raise::Done, Some(Normal))
         );
         let d = Raise::Done;

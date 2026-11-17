@@ -378,12 +378,12 @@ fn run_source(
     let chosen = forward::choose(here, flag, forward::target_env, || {
         Ok(config::load(&config::path()?)?.target)
     })?;
-    let short = forward::short_hostname();
+    let hostname = forward::hostname();
     let host = match chosen {
-        Some(host) if !forward::is_here(&host, short.as_deref()) => host,
+        Some(host) if !forward::is_here(&host, hostname.as_deref()) => host,
         _ => return run_open(source, app_name, dirs, rec).map(|()| 0),
     };
-    let there = forward::source_for(&host, source, short.as_deref(), |path| {
+    let there = forward::source_for(&host, source, hostname.as_deref(), |path| {
         LocalFs::new().realpath(path)
     })?;
     if let Ok(Target::Remote(spec)) = target::parse(source) {
