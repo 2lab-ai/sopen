@@ -29,6 +29,11 @@ impl Driver {
         }
     }
 
+    /// The window is now `w`×`h` points, from the next pass on (as when the owner resizes it).
+    pub fn resize(&mut self, w: f32, h: f32) {
+        self.size = Vec2::new(w, h);
+    }
+
     /// One pass with `events`, `modifiers` held (sent first, as a backend does).
     pub fn frame<W: Window>(&mut self, win: &mut W, events: Vec<Event>, modifiers: Modifiers) {
         self.time += 1.0 / 60.0;
@@ -177,6 +182,18 @@ impl Driver {
             let moved = c.transform_after_tessellation;
             walk(&c.shape, text, moved.inverse().mul_rect(visible)).map(|r| moved.mul_rect(r))
         })
+    }
+
+    /// How many rows the last pass laid `text` out in (whole or cut with "…"), if it drew it.
+    pub fn rows_of(&self, text: &str) -> Option<usize> {
+        fn walk(shape: &egui::Shape, text: &str) -> Option<usize> {
+            match shape {
+                egui::Shape::Text(t) if t.galley.text() == text => Some(t.galley.rows.len()),
+                egui::Shape::Vec(v) => v.iter().find_map(|s| walk(s, text)),
+                _ => None,
+            }
+        }
+        self.shapes.iter().find_map(|c| walk(&c.shape, text))
     }
 
     /// Clicks the control labelled `text`.

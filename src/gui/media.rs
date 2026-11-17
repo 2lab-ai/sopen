@@ -102,8 +102,8 @@ pub fn clock_text(secs: f64) -> String {
 }
 
 /// The transport's clock line, as wide for any playhead and markers as for the clip's end: a
-/// line that grew while playing (9:59.99 → 10:00.00) could rewrap the transport and move the
-/// frame under a crop being drawn.
+/// line that grew while playing (9:59.99 → 10:00.00) would jump, and on a narrow window be cut
+/// at a different place.
 fn transport_text(marks: &Marks, duration: f64) -> String {
     let (in_s, out_s) = marks.range(duration);
     let w = clock_text(duration).len();
@@ -833,21 +833,32 @@ impl MediaWindow {
             {
                 self.start_export(&ctx);
             }
-            ui.separator();
-            ui.monospace(transport_text(&self.marks, self.media.duration));
         });
-        // Its own full-width row (a portrait clip makes a narrow window), always there: a row
-        // that came and went with the export would move the frame under the pointer.
-        let f = self
+        // The clock line has a row of its own, always there and always one line — cut with "…"
+        // (whole on hover) where the window is too narrow (a portrait clip makes a narrow
+        // window); in the buttons' wrapping row it broke mid-text. A running export shows its
+        // spinner and progress at the row's end, no taller than the row: a row that came and
+        // went with the export would move the frame under the pointer.
+        let progress = self
             .job
             .as_ref()
-            .map_or(0.0, |job| job.progress.load(SeqCst) as f32 / 1000.0);
-        ui.add_visible(
-            self.job.is_some(),
-            egui::ProgressBar::new(f)
-                .text(format!("exporting {:.0} %", f * 100.0))
-                .desired_width(ui.available_width()),
-        );
+            .map(|job| job.progress.load(SeqCst) as f32 / 10.0);
+        let line =
+            egui::RichText::new(transport_text(&self.marks, self.media.duration)).monospace();
+        ui.horizontal(|ui| {
+            ui.set_min_height(ui.spacing().interact_size.y);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if let Some(percent) = progress {
+                    ui.label(format!("exporting {percent:.0} %"));
+                    let size = ui.text_style_height(&egui::TextStyle::Body);
+                    ui.add(egui::Spinner::new().size(size));
+                    ui.separator();
+                }
+                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                    ui.add(egui::Label::new(line).truncate());
+                });
+            });
+        });
     }
 
     /// One line whatever it says (see [`super::one_line`]): the frame below must not move.

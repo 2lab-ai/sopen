@@ -401,9 +401,10 @@ fn a_save_result_landing_mid_drag_waits_for_the_release() {
     assert_eq!(fx.rect(), Some([10, 10, 80, 50]));
 }
 
-/// The toolbar's busy spinner never moves the image: with a save running the image sits where
-/// it sits with none, at every width — including 638–664 px, where the spinner used to wrap the
-/// toolbar onto a second line (640 px is the default width for any image up to 640 px).
+/// The busy spinner never moves the image: with a save running the image sits where it sits
+/// with none, at every width — including 637–664 px, where a spinner in the toolbar used to wrap
+/// it onto a second line (640 px is the default width for any image up to 640 px). It is in the
+/// status bar now, which it must not make taller.
 #[test]
 fn a_running_save_never_moves_the_image_at_any_width() {
     let mut moved = Vec::new();
@@ -425,7 +426,77 @@ fn a_running_save_never_moves_the_image_at_any_width() {
     assert!(moved.is_empty(), "the image moved at widths {moved:?}");
 }
 
-/// Held from the press, not from the drag: a save result that lands after the button went down
+/// The toolbar is one row tall wherever its buttons fit on one row: nothing hidden while idle
+/// wraps alone onto a second, empty-looking row (the save spinner's reserved slot did, just
+/// past the widths where "Save copy" fits — 640 px, the default width for any image up to
+/// 640 px, among them).
+#[test]
+fn the_toolbar_is_one_row_tall_wherever_its_buttons_fit_on_one() {
+    // A short window fits the picture by height, so its top is the toolbar's bottom edge.
+    let measure = |w: f32| {
+        let mut fx = open_sized(w, 300.0);
+        fx.settle();
+        let disp = fx.win.map.expect("drawn").disp;
+        assert!(
+            disp.left() > 1.0,
+            "fitted by width at {w} px, not by height"
+        );
+        let row = |label: &str| {
+            fx.drv
+                .find_text(label)
+                .unwrap_or_else(|| panic!("no {label:?} on screen at {w} px"))
+                .center()
+                .y
+        };
+        let one_line = (row("Crop  C") - row("Save copy")).abs() < 0.5;
+        (disp.top(), one_line)
+    };
+    // Wide enough for anything to fit on one row.
+    let (one_row, one_line) = measure(3000.0);
+    assert!(one_line);
+    let (mut fits, mut taller) = (Vec::new(), Vec::new());
+    for w in (600..=700).chain((480..=1400).step_by(20)) {
+        let (top, one_line) = measure(w as f32);
+        if one_line {
+            fits.push(w);
+            if (top - one_row).abs() > 0.5 {
+                taller.push(w);
+            }
+        }
+    }
+    assert!(
+        fits.contains(&640) && fits.contains(&1280),
+        "the buttons fit on one row only at {fits:?}"
+    );
+    assert!(
+        taller.is_empty(),
+        "the toolbar is more than one row tall at widths {taller:?}"
+    );
+}
+
+/// While a save runs, its spinner turns in the status bar, on the line of its "saving…".
+#[test]
+fn a_running_save_spins_beside_its_status() {
+    let mut fx = open_sized(640.0, 420.0);
+    fx.win.status = Status::info("saving a copy…");
+    fx.settle();
+    let idle = fx.drv.find_text("saving a copy…").expect("status shown");
+    let (_tx, rx) = mpsc::channel();
+    fx.win.job = Some(Job {
+        kind: JobKind::SaveCopy { close_after: false },
+        rev: fx.win.doc.rev(),
+        rx,
+    });
+    fx.settle();
+    let busy = fx.drv.find_text("saving a copy…").expect("status shown");
+    assert!(
+        busy.left() > idle.left() + 10.0,
+        "nothing before the status: {idle:?} → {busy:?}"
+    );
+    assert!((busy.center().y - idle.center().y).abs() < 0.5);
+}
+
+/// Held from the press, not from the drag:a save result that lands after the button went down
 /// but before the pointer moved far enough to count as a drag still waits for the release.
 #[test]
 fn a_save_result_landing_between_press_and_drag_waits_for_the_release() {
