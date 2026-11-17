@@ -114,9 +114,10 @@ impl RemoteFs for LocalFs {
             .with_context(|| format!("cannot open {}", local.display()))
             .map_err(|e| CreateError::new(Created::No, e))?;
         // A brand-new file gets 0666 minus the umask, as `cp` would; a temp that stands in for an
-        // existing file starts private and takes that file's owner and bits through the open file:
-        // owner first (a chown can clear set-id bits), the permission bits before the content,
-        // and the full mode once more after it (writing clears set-id bits).
+        // existing file starts private and takes that file's owner and permission bits through
+        // handle-based metadata updates on the open file, never by path: the owner, then the
+        // permission bits without set-id bits before the content, then the full mode restored
+        // after the content, so set-id bits are applied last.
         let dst = fs::OpenOptions::new()
             .write(true)
             .create_new(true)

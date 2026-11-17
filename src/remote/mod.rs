@@ -222,9 +222,10 @@ pub trait RemoteFs {
     ) -> Result<u64>;
     /// Creates `path` exclusively (fails if anything exists there), writes the local file into
     /// it and flushes it to disk (`fsync@openssh.com` when the server offers it). With `like`,
-    /// before any content: gives it that owner (where the server lets it; the caller checks)
-    /// and then that mode — both through the open handle (SFTP fsetstat), never by path, so a
-    /// name swapped meanwhile is never changed through. Returns the size and SHA-256 of the
+    /// through handle-based metadata updates on the open file, never by path (so a name swapped
+    /// meanwhile is never changed through): that owner (where the server lets it; the caller
+    /// checks) and the permission bits without set-id bits before the content, then the full
+    /// mode restored after the content. Returns the size and SHA-256 of the
     /// bytes written; a failure says whether `path` had been created ([`CreateError::created`]).
     fn create_from(
         &mut self,

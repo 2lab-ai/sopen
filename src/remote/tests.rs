@@ -516,8 +516,13 @@ fn a_refused_owner_change_that_leaves_a_mismatch_refuses_the_save() {
 /// (here: asked for root's, refused for a non-root account) does not stop the save.
 #[test]
 fn a_failed_owner_change_with_the_owner_already_right_lets_the_save_proceed() {
+    use std::os::unix::fs::MetadataExt;
     let tmp = tempfile::tempdir().unwrap();
     let (target, local, at) = fetched(tmp.path(), "a.txt", "v1");
+    if std::fs::metadata(&target).unwrap().uid() == 0 {
+        eprintln!("skipping: root's chown is never refused");
+        return;
+    }
     std::fs::write(&local, "edit").unwrap();
     let mut fs = Hooked::new(Hooks {
         owner_asked_as_root: true,

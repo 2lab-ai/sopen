@@ -497,9 +497,9 @@ impl RemoteFs for SftpRemote {
             };
             // From here `path` is ours.
             let fill = async {
-                // fsetstat/fstat on the open handle, never by path: owner first (a chown can
-                // clear set-id bits), the permission bits before the content, and the full mode
-                // once more after it (writing clears set-id bits).
+                // Handle-based metadata updates on the open file, never by path: the owner, then
+                // the permission bits without set-id bits before the content, then the full mode
+                // restored after the content, so set-id bits are applied last.
                 if let Some(like) = like {
                     // A refused owner change is not fatal here: the caller checks the result
                     // (a mismatch refuses the save; an owner that was already right passes).
