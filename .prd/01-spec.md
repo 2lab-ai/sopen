@@ -328,7 +328,11 @@ once the primary button is up, and take rows off the grid's bottom.
   rows and lists the edits (the bytes wanted, absolute) in a `.hexpatch` file. When that list
   cannot be written, the rows say why and offer "Keep edits…" (try again) and "Write the list
   there" (a path the owner types, written as Save to… writes: a new file, never over anything);
-  while the edits are kept nowhere and unsaved, closing asks (Discard / Cancel). A save whose worker ends without a result is a visible failure; the edits stay
+  while the edits are kept nowhere and unsaved, closing asks (Discard / Cancel). That path field
+  owns the typing of a frame it has the keyboard in, as the Go to field does (the grid does not
+  take the keyboard back); what writing the list had to say (a staging folder it could not
+  remove) is shown with where the list went. A re-bind forgets what the last Save copy holds
+  (it was remembered against the old file): closing asks unless the bytes equal the saved file. A save whose worker ends without a result is a visible failure; the edits stay
   and the window stays usable.
 - Where the server cannot replace a file in one step (`posix-rename@openssh.com`), Save is off with
   the reason on hover and in the rows; editing and Save copy work — the image window's rule.

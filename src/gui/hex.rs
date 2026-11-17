@@ -216,6 +216,26 @@ pub struct HexDoc {
     copied: Option<BTreeMap<u64, u8>>,
     /// `changed_count` at `rev` (it compares every entry with the file).
     counted: Option<(u64, usize)>,
+    /// Bumped by everything that can change `dirty` / `unsaved` (edits, a Save or a Save copy
+    /// landing, a rebase); their answers are kept for the generation they were given at.
+    generation: u64,
+    answers: Option<(u64, bool, bool)>,
+}
+
+/// Whether the bytes shown with `a` and with `b` over the file differ anywhere (a byte the file
+/// cannot give counts as different). Walks both maps; reads the file only where one has an
+/// entry and the other does not.
+fn differ(pages: &mut Pages, a: &BTreeMap<u64, u8>, b: &BTreeMap<u64, u8>) -> bool {
+    for (&at, &x) in a {
+        match b.get(&at) {
+            Some(&y) if x != y => return true,
+            Some(_) => {}
+            None if pages.byte(at) != Some(x) => return true,
+            None => {}
+        }
+    }
+    b.iter()
+        .any(|(&at, &y)| !a.contains_key(&at) && pages.byte(at) != Some(y))
 }
 
 fn pages(file: Arc<File>, size: u64) -> Pages {
@@ -243,6 +263,8 @@ impl HexDoc {
             saved: BTreeMap::new(),
             copied: None,
             counted: None,
+            generation: 0,
+            answers: None,
         }
     }
 
@@ -353,7 +375,7 @@ impl HexDoc {
             self.undo.pop_front();
         }
         self.redo.clear();
-        self.rev += 1;
+        self.bump();
         Some(true)
     }
 
@@ -371,7 +393,7 @@ impl HexDoc {
             self.undo.pop_back();
         }
         self.patches.insert(at, value);
-        self.rev += 1;
+        self.bump();
         true
     }
 
@@ -421,7 +443,7 @@ impl HexDoc {
         let step = self.undo.pop_back()?;
         self.patches.insert(step.at, step.before);
         self.redo.push(step);
-        self.rev += 1;
+        self.bump();
         Some(Cursor {
             at: step.at,
             low: false,
@@ -435,7 +457,7 @@ impl HexDoc {
         let step = self.redo.pop()?;
         self.patches.insert(step.at, step.after);
         self.undo.push_back(step);
-        self.rev += 1;
+        self.bump();
         Some(Cursor {
             at: step.at,
             low: false,
@@ -455,57 +477,61 @@ impl HexDoc {
         self.rev
     }
 
-    /// Whether the bytes shown with `a` and with `b` over the file differ anywhere (a byte the
-    /// file cannot give counts as different).
-    fn differ(&mut self, a: &BTreeMap<u64, u8>, b: &BTreeMap<u64, u8>) -> bool {
-        let offsets: std::collections::BTreeSet<u64> = a.keys().chain(b.keys()).copied().collect();
-        offsets.into_iter().any(|at| {
-            let (x, y) = (a.get(&at).copied(), b.get(&at).copied());
-            match (x, y) {
-                (Some(x), Some(y)) => x != y,
-                (Some(v), None) | (None, Some(v)) => self.pages.byte(at) != Some(v),
-                (None, None) => false,
+    /// Something shown changed.
+    fn bump(&mut self) {
+        self.rev += 1;
+        self.generation += 1;
+    }
+
+    /// `dirty` and `unsaved`, worked out once per generation.
+    fn answers(&mut self) -> (bool, bool) {
+        if let Some((generation, dirty, unsaved)) = self.answers {
+            if generation == self.generation {
+                return (dirty, unsaved);
             }
-        })
+        }
+        let dirty = differ(&mut self.pages, &self.patches, &self.saved);
+        let unsaved = dirty
+            && match &self.copied {
+                Some(copied) => differ(&mut self.pages, &self.patches, copied),
+                None => true,
+            };
+        self.answers = Some((self.generation, dirty, unsaved));
+        (dirty, unsaved)
     }
 
     /// The bytes differ from what the file holds now (what Save would write) — by content: an
     /// edit undone, or a byte typed back to its value, is no change.
     pub fn dirty(&mut self) -> bool {
-        let (patches, saved) = (self.patches.clone(), self.saved.clone());
-        self.differ(&patches, &saved)
+        self.answers().0
     }
 
     /// The bytes are written nowhere — neither the file nor the last Save copy (the close
     /// prompt).
     pub fn unsaved(&mut self) -> bool {
-        if !self.dirty() {
-            return false;
-        }
-        match self.copied.clone() {
-            Some(copied) => {
-                let patches = self.patches.clone();
-                self.differ(&patches, &copied)
-            }
-            None => true,
-        }
+        self.answers().1
     }
 
     /// A Save of `changes` landed: the file holds them now.
     pub fn mark_saved(&mut self, changes: BTreeMap<u64, u8>) {
         self.saved = changes;
+        self.generation += 1;
     }
 
     /// A Save copy of `changes` landed.
     pub fn mark_copied(&mut self, changes: BTreeMap<u64, u8>) {
         self.copied = Some(changes);
+        self.generation += 1;
     }
 
     /// The file was saved in place and is read through `file` from now on — it holds what was
     /// saved (checked by its hash before this). The edits, and every undo and redo step, are
     /// absolute bytes: they stay as they are. An entry is dropped only where it equals the new
-    /// file's byte, read from `file`; nothing is read from the old one. All or nothing: a byte
-    /// `file` cannot give is an error and nothing is changed.
+    /// file's byte, read from `file`; nothing is read from the old one. What the last Save copy
+    /// holds is forgotten, not translated: it was remembered against the old file (an offset
+    /// left out meant the old byte), so it no longer says what the copy holds — closing asks
+    /// unless the bytes equal the saved file. All or nothing: a byte `file` cannot give is an
+    /// error and nothing is changed.
     pub fn rebase(&mut self, file: Arc<File>) -> Result<()> {
         let mut new = pages(file, self.pages.size);
         let mut keep = |m: &BTreeMap<u64, u8>| -> Result<BTreeMap<u64, u8>> {
@@ -527,13 +553,12 @@ impl HexDoc {
         };
         let patches = keep(&self.patches)?;
         let saved = keep(&self.saved)?;
-        let copied = self.copied.as_ref().map(&mut keep).transpose()?;
         new.reads += self.pages.reads;
         self.pages = new;
         self.patches = patches;
         self.saved = saved;
-        self.copied = copied;
-        self.rev += 1;
+        self.copied = None;
+        self.bump();
         Ok(())
     }
 }
@@ -1360,6 +1385,10 @@ pub(super) struct HexWindow {
     retained: Option<PathBuf>,
     /// Where "Write the list there" writes the list of edits.
     pub(super) keep_to: String,
+    /// Run before each link that writing the list makes (tests: something put in the private
+    /// folder, so its removal fails and is said).
+    #[cfg(test)]
+    pub(super) keep_link: Option<KeepLink>,
     /// Lines from open that must be read whole and stay (see [`super::disclosures`]).
     opened: Vec<String>,
     /// What the last write reported that must be read whole, and the next such report, held
@@ -1382,6 +1411,15 @@ fn grid_id() -> egui::Id {
 
 fn goto_id() -> egui::Id {
     egui::Id::unique("sopen-hex-goto")
+}
+
+/// A stand-in run before each link of writing the list (tests).
+#[cfg(test)]
+type KeepLink = Box<dyn FnMut(super::binary::LinkStep, &Path) -> std::io::Result<()> + Send>;
+
+/// The read-only window's "Write the list there" path field.
+fn keep_id() -> egui::Id {
+    egui::Id::unique("sopen-hex-keep-to")
 }
 
 impl HexWindow {
@@ -1423,6 +1461,8 @@ impl HexWindow {
             read_only_why: String::new(),
             retained: None,
             keep_to: String::new(),
+            #[cfg(test)]
+            keep_link: None,
             opened,
             notices: Vec::new(),
             pending_notices: None,
@@ -1640,7 +1680,11 @@ impl HexWindow {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .keep_patches(self.doc.patches(), &self.read_only_why);
-        self.kept(listed.map_err(|e| format!("{e:#}")));
+        self.kept(
+            listed
+                .map(|p| (p, Vec::new()))
+                .map_err(|e| format!("{e:#}")),
+        );
     }
 
     /// Writes the list of the edits to the path in the field, as Save to… writes: a new file,
@@ -1660,12 +1704,19 @@ impl HexWindow {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .list_text(self.doc.patches(), &self.read_only_why);
-        let saved = super::binary::save_new(&dest, |f| {
+        let fill = |f: &mut File| -> Result<u64> {
             f.write_all(text.as_bytes())?;
             Ok(text.len() as u64)
-        });
+        };
+        #[cfg(test)]
+        let saved = match self.keep_link.as_mut() {
+            Some(link) => super::binary::save_new_with(&dest, fill, link.as_mut()),
+            None => super::binary::save_new(&dest, fill),
+        };
+        #[cfg(not(test))]
+        let saved = super::binary::save_new(&dest, fill);
         let result = match saved {
-            Ok(_) => Ok(dest),
+            Ok(saved) => Ok((dest, saved.notes)),
             Err(super::binary::SaveError::Exists { next }) => {
                 self.keep_to = super::binary::tilde(&next);
                 Err(format!(
@@ -1679,13 +1730,16 @@ impl HexWindow {
     }
 
     /// Says where the edits are kept now, or why they are not.
-    fn kept(&mut self, result: std::result::Result<PathBuf, String>) {
+    fn kept(&mut self, result: std::result::Result<(PathBuf, Vec<String>), String>) {
         let why = &self.read_only_why;
         let line = match result {
-            Ok(path) => {
-                let line = format!(
-                    "read-only now: {why}; your edits are listed in {}",
-                    path.display()
+            Ok((path, notes)) => {
+                let line = super::with_notes(
+                    &format!(
+                        "read-only now: {why}; your edits are listed in {}",
+                        path.display()
+                    ),
+                    &notes,
                 );
                 self.retained = Some(path);
                 line
@@ -1710,7 +1764,11 @@ impl HexWindow {
                 self.keep_edits();
             }
             let room = (ui.available_width() - 170.0).max(120.0);
-            ui.add(egui::TextEdit::singleline(&mut self.keep_to).desired_width(room));
+            ui.add(
+                egui::TextEdit::singleline(&mut self.keep_to)
+                    .id(keep_id())
+                    .desired_width(room),
+            );
             if ui
                 .button("Write the list there")
                 .on_hover_text("a new file at that path, never over an existing one")
@@ -1948,7 +2006,7 @@ impl HexWindow {
         let resp = ui.interact(rows_rect, grid_id(), Sense::click_and_drag());
         let bar_resp = ui.interact(bar, grid_id().with("bar"), Sense::click_and_drag());
         // The grid holds the keyboard (arrows and Tab act on the cursor, not on focus), except
-        // while the Go to field or the close prompt has it.
+        // while a field (Go to, the read-only path field) or the close prompt has it.
         if !goto_focused && !self.prompt {
             if ctx.memory(|m| m.focused()) != Some(grid_id()) {
                 resp.request_focus();
@@ -2219,8 +2277,10 @@ impl super::Window for HexWindow {
             })
             .inner;
         let goto_owns = cmd_g || field.has_focus() || field.lost_focus() || field.clicked();
-        self.keys(&ctx, goto_owns);
-        let goto_focused = goto_owns;
+        // The read-only window's path field (laid out below, with the rows) owns the typing of
+        // a frame it had the keyboard in, as the Go to field does.
+        let keep_had = ctx.memory(|m| m.focused()) == Some(keep_id());
+        self.keys(&ctx, goto_owns || keep_had);
         // A report that lands while the button is down waits until it is let go. Its rows sit
         // below the grid: they take rows off its bottom, never move its top or its rows.
         if !ctx.input(|i| i.pointer.primary_down()) {
@@ -2254,7 +2314,12 @@ impl super::Window for HexWindow {
         }
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE)
-            .show(ui, |ui| self.grid(ui, goto_focused));
+            .show(ui, |ui| {
+                // A field that took the keyboard this frame (a click into the path field) keeps
+                // it: the grid does not take it back.
+                let field_owns = goto_owns || ctx.memory(|m| m.focused()) == Some(keep_id());
+                self.grid(ui, field_owns)
+            });
         self.poll_job(&ctx);
         self.close_prompt(&ctx);
     }

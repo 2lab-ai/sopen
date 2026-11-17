@@ -246,7 +246,7 @@ fn exists(dest: &Path) -> SaveError {
 /// A link a save makes (tests stand in for it, or fail it: the stand-in runs first, and its
 /// error is the link's).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum LinkStep {
+pub(super) enum LinkStep {
     /// The still-empty `part` to a second name in the private folder: can this filesystem
     /// publish without replacing anything?
     Probe,
@@ -534,7 +534,7 @@ pub fn save_new(
 
 /// [`save_new`] with `link` run before each link (tests: a folder without hard links, a name
 /// taken at the last moment, something put in the private folder). Its error is the link's.
-fn save_new_with(
+pub(super) fn save_new_with(
     dest: &Path,
     fill: impl FnOnce(&mut File) -> Result<u64>,
     link: &mut dyn FnMut(LinkStep, &Path) -> std::io::Result<()>,

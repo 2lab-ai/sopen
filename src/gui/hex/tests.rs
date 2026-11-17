@@ -5,7 +5,7 @@ use super::*;
 use crate::gui::testkit::{command, Driver};
 use crate::gui::Window;
 use crate::remote::{LocalFs, RemoteFs};
-use eframe::egui::{Event, Modifiers};
+use eframe::egui::{Event, Modifiers, Pos2};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 /// The first row spells something; the second is short and has non-printable bytes.
@@ -2143,13 +2143,137 @@ fn read_only_edits_can_be_listed_at_a_chosen_path() {
     fx.typed("11");
     let blocked = fx.block_lists();
     fx.lands(saved, snapshot);
-    let chosen = fx.tmp.path().join("my-edits.txt");
-    fx.win.keep_to = chosen.to_str().unwrap().to_string();
     fx.settle();
+    // Typed into the path field, as the owner does: click it, select all, type across frames.
+    let write = fx.drv.find_text("Write the list there").expect("the row");
+    let field = Pos2::new(write.left() - 60.0, write.center().y);
+    fx.drv.click(&mut fx.win, field);
+    fx.drv.idle(&mut fx.win, 2);
+    assert_eq!(
+        fx.drv.ctx.memory(|m| m.focused()),
+        Some(keep_id()),
+        "the grid took the keyboard from the path field"
+    );
+    fx.key(Key::A, command(false));
+    let chosen = fx.tmp.path().join("my-edits.txt");
+    let typed = chosen.to_str().unwrap().to_string();
+    let (head, tail) = typed.split_at(typed.len() / 2);
+    for part in [head, tail] {
+        fx.drv
+            .frame(&mut fx.win, vec![Event::Text(part.into())], Modifiers::NONE);
+        fx.drv.idle(&mut fx.win, 1);
+    }
+    // Checked before anything is written: a wrong path must not be written anywhere.
+    assert_eq!(fx.win.keep_to, typed, "the typing did not reach the field");
     fx.drv.click_text(&mut fx.win, "Write the list there");
     fx.settle();
     let text = std::fs::read_to_string(&chosen).unwrap();
     assert!(text.lines().any(|l| l == "0x0: 0011"), "{text}");
     assert!(fx.win.close_requested());
     unblock(&blocked);
+}
+
+/// Where the list was written, with what that save had to say (a staging folder it could not
+/// remove, …), is shown whole in the rows.
+#[test]
+fn the_kept_line_carries_the_saves_notes() {
+    if running_as_root() {
+        eprintln!("skipping: root ignores folder permissions");
+        return;
+    }
+    let mut fx = fetched("blob.bin", FIXTURE, 1000.0, 600.0);
+    fx.typed("00");
+    // sopen's own place for kept edits refuses, so the row to write the list elsewhere shows.
+    let blocked = fx.block_lists();
+    fx.win.turn_read_only("a test");
+    let chosen = fx.tmp.path().join("list.txt");
+    fx.win.keep_to = chosen.to_str().unwrap().to_string();
+    let private = Arc::new(Mutex::new(None::<PathBuf>));
+    let seen = private.clone();
+    fx.win.keep_link = Some(Box::new(move |step, dir| {
+        if step == crate::gui::binary::LinkStep::Publish {
+            // Something sopen did not make is now in its folder: the folder stays.
+            std::fs::write(dir.join("intruder"), b"")?;
+            *seen.lock().unwrap() = Some(dir.to_path_buf());
+        }
+        Ok(())
+    }));
+    fx.settle();
+    fx.drv.click_text(&mut fx.win, "Write the list there");
+    fx.settle();
+    assert!(std::fs::read_to_string(&chosen)
+        .unwrap()
+        .contains("0x0: 00"));
+    let line = fx.win.read_only.clone().unwrap();
+    assert!(line.contains(&*chosen.to_string_lossy()), "{line}");
+    assert!(line.contains("could not be removed"), "{line}");
+    let dir = private.lock().unwrap().clone().unwrap();
+    assert!(line.contains(&*dir.to_string_lossy()), "{line}");
+    assert!(fx.drv.find_text(&line).is_some(), "shown whole");
+    unblock(&blocked);
+}
+
+/// A Save copy's remembered state does not survive a change of the file under it: file `ab`,
+/// byte 0 → X and Save copy (the copy is `Xb`), then `ZY` saved in place (the window re-binds to
+/// `ZY`), then byte 0 → X: the window shows `XY`, which is written nowhere — closing asks.
+#[test]
+fn a_save_copy_does_not_count_after_the_file_under_it_changed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("local.bin");
+    std::fs::write(&path, b"ab").unwrap();
+    let mut fx = in_place(&path, tmp, 1000.0, 600.0);
+    fx.key(Key::Tab, Modifiers::NONE);
+    fx.typed("X");
+    fx.key(Key::S, command(true));
+    fx.wait_for_save();
+    assert_eq!(
+        std::fs::read(path.with_file_name("local.edited.bin")).unwrap(),
+        b"Xb"
+    );
+    fx.key(Key::Home, command(false));
+    fx.typed("ZY");
+    fx.key(Key::S, command(false));
+    fx.wait_for_save();
+    assert_eq!(std::fs::read(&path).unwrap(), b"ZY");
+    assert_eq!(fx.win.doc.changed_count(), 0, "re-bound onto ZY");
+    fx.key(Key::Home, command(false));
+    fx.typed("X");
+    assert_eq!(
+        (fx.win.doc.byte(0), fx.win.doc.byte(1)),
+        (Some(b'X'), Some(b'Y'))
+    );
+    assert!(fx.win.doc.unsaved(), "XY is written nowhere");
+    assert!(!fx.win.close_requested(), "closed without asking");
+    assert!(fx.win.prompt);
+}
+
+/// Many bytes touched, then undone: clean — and asking again does not read the file again
+/// (the answer is kept until something changes).
+#[test]
+fn a_large_touched_then_undone_document_is_clean_and_cheap_to_ask() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("big.bin");
+    let body: Vec<u8> = (0..(1u32 << 20)).map(|i| (i % 251) as u8).collect();
+    std::fs::write(&path, &body).unwrap();
+    let mut doc = HexDoc::new(Arc::new(File::open(&path).unwrap()), body.len() as u64);
+    let c = Cursor::default();
+    let n = 50_000u64;
+    for i in 0..n {
+        let at = i * 17;
+        assert!(doc.set(at, !body[at as usize], c));
+    }
+    assert!(doc.dirty() && doc.unsaved());
+    for _ in 0..n {
+        doc.undo();
+    }
+    assert_eq!(doc.patches().len(), n as usize, "absolute entries stay");
+    assert!(!doc.dirty() && !doc.unsaved());
+    assert_eq!(doc.changed_count(), 0);
+    let reads = doc.reads();
+    for _ in 0..100 {
+        assert!(!doc.dirty() && !doc.unsaved());
+    }
+    assert_eq!(doc.reads(), reads, "asked again: read again");
+    doc.redo();
+    assert!(doc.dirty(), "a change after the answer was kept");
 }
