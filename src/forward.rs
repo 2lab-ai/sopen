@@ -137,15 +137,27 @@ fn bare(name: &str) -> &str {
     name.strip_suffix('.').unwrap_or(name)
 }
 
-/// Loopback, so whoever resolves it means itself: exactly `localhost` or a name under
-/// `.localhost` (RFC 6761), `127.0.0.0/8`, or `::1`. `localhost.example.com` is not.
+/// The loopback aliases common in `/etc/hosts` (Debian, Red Hat), matched whole.
+const LOOPBACK_ALIASES: [&str; 5] = [
+    "localhost.localdomain",
+    "localhost6",
+    "localhost6.localdomain6",
+    "ip6-localhost",
+    "ip6-loopback",
+];
+
+/// Loopback, so whoever resolves it means itself: exactly `localhost`, a name under
+/// `.localhost` (RFC 6761) or one of [`LOOPBACK_ALIASES`], `127.0.0.0/8`, or `::1`.
+/// `localhost.example.com` is not.
 fn is_loopback(name: &str) -> bool {
     let name = bare(name);
     match name.parse::<std::net::IpAddr>() {
         Ok(ip) => ip.is_loopback(),
         Err(_) => {
             let name = name.to_ascii_lowercase();
-            name == "localhost" || name.ends_with(".localhost")
+            name == "localhost"
+                || name.ends_with(".localhost")
+                || LOOPBACK_ALIASES.contains(&name.as_str())
         }
     }
 }
@@ -389,9 +401,10 @@ pub fn run(host: &str, source: &str, app: Option<&str>, state_dir: &Path) -> Res
     exit_code(host, status)
 }
 
-/// HOST's exit code (0, 1, 3, 127 for no sopen there) is ours; ssh's own failure (255) is
-/// "could not reach". sopen itself exits only 0, 1 or 3, so anything above 128 is most likely
-/// a signal (128 + n) — said as a guess, with the status as it came.
+/// HOST's exit code is ours: 0, 1 and 3 from sopen, 2 from an older sopen that does not know
+/// `--here` (a usage error), 127 for no sopen there. ssh's own failure (255) is "could not
+/// reach". sopen itself exits with nothing above 3, so a status above 128 is most likely a
+/// signal (128 + n) — said as a guess, with the status as it came.
 fn exit_code(host: &str, status: ExitStatus) -> Result<u8> {
     match status.code() {
         Some(255) => bail!("could not reach {host}"),
@@ -493,14 +506,24 @@ mod tests {
             "me@x.LOCALHOST",
             "127.0.0.1",
             "me@127.1.2.3",
+            // The /etc/hosts aliases, whole, any case, trailing dot.
+            "localhost.localdomain",
+            "LocalHost.LocalDomain.",
+            "localhost6",
+            "me@localhost6.localdomain6",
+            "IP6-LOCALHOST",
+            "ip6-loopback.",
         ] {
             assert!(is_here(here, None), "{here}");
         }
         for elsewhere in [
             "localhost.example.com",
-            "localhost.localdomain",
             "mylocalhost",
             "localhostx",
+            "localhost6x",
+            "a.localhost6",
+            "ip6-loopback.example.com",
+            "localhost.localdomain.example.com",
         ] {
             assert!(!is_here(elsewhere, None), "{elsewhere}");
         }
@@ -548,6 +571,8 @@ mod tests {
             // Loopback means this machine, not HOST: named by this machine's short name.
             ("box", "localhost:/p", "here:/p"),
             ("box", "a.localhost:/p", "here:/p"),
+            ("box", "localhost.localdomain:/p", "here:/p"),
+            ("box", "me@ip6-localhost:/p", "me@here:/p"),
             (
                 "box",
                 "localhost.example.com:/p",
@@ -714,6 +739,8 @@ mod tests {
         let code = |c: i32| exit_code("box", ExitStatus::from_raw(c << 8));
         assert_eq!(code(0).unwrap(), 0);
         assert_eq!(code(3).unwrap(), 3);
+        // An older sopen on HOST without `--here`: its usage error, as it is.
+        assert_eq!(code(2).unwrap(), 2);
         assert_eq!(code(127).unwrap(), 127);
         assert_eq!(code(255).unwrap_err().to_string(), "could not reach box");
         assert_eq!(

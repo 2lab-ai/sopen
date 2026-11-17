@@ -70,8 +70,10 @@ where a file opens — this machine, or another machine's screen (§4a); they ad
 `sopen SOURCE` opens SOURCE on the machine it was typed on. `sopen --target HOST SOURCE` opens it on HOST's screen
 instead: sopen starts HOST's own sopen as `sopen --here [--app APP] -- SOURCE` over the system `ssh`, with the same
 multiplexed master and connection options as §4, waits for it, and exits with its exit code (0, 1 and 3 mean what
-they mean here; 127 is no sopen on HOST). When ssh itself fails (its exit code 255) sopen exits 1 with `could not
-reach HOST`; any other status above 128 (sopen itself exits only 0, 1 or 3, so most likely a signal, 128 + n)
+they mean here; 127 is no sopen on HOST; 2 is a usage error from a sopen on HOST too old to know `--here`, passed on
+as it is). When ssh itself fails (its exit code 255) sopen exits 1 with `could not
+reach HOST`; any other status above 128 (sopen itself exits only 0, 1 or 3 — 2 for a usage error — so most likely a
+signal, 128 + n)
 exits 1 with `sopen on HOST ended with status N (signal n?)`. HOST needs sopen installed; the machine holding the file still needs only sshd. Because HOST is always
 told `--here`, it never forwards again, whatever its own default is. `sopen cut` always runs here.
 
@@ -81,7 +83,9 @@ both — else the environment variable `SOPEN_TARGET`, else the `target` key of 
 variable does not stop `--here` or `--target`, and `cut` reads neither. HOST is `[user@]host` — an ssh alias or a
 host name; a port or an IPv6 address goes into `~/.ssh/config` under an alias. Wherever it comes from it must be
 non-empty, without whitespace or `:`, and must not start with `-`. HOST is this machine — opened here, no ssh — only when
-its host part (without `user@`) is loopback (exactly `localhost` or a name under `.localhost`, `127.0.0.0/8`, `::1`)
+its host part (without `user@`) is loopback (exactly `localhost`, a name under `.localhost`, or one of the
+`/etc/hosts` aliases `localhost.localdomain`, `localhost6`, `localhost6.localdomain6`, `ip6-localhost`,
+`ip6-loopback`; `127.0.0.0/8`; `::1`)
 or equals this machine's host name as `gethostname` gives it, or that name up to the first `.` — in any case,
 trailing dot ignored. Nothing else counts, because opening on the wrong machine is worse than an ssh hop to this
 one: `box.lan` from a machine named just `box` is forwarded, and so is `box.other` from `box.lan`.
