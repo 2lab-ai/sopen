@@ -57,17 +57,17 @@ fn open_sized(path: PathBuf, tmp: tempfile::TempDir, w: f32, h: f32) -> Fixture 
 
 /// `notes` are added to what the probe found (a long "not kept" note for the layout tests).
 fn open_with(path: PathBuf, tmp: tempfile::TempDir, w: f32, h: f32, notes: Vec<String>) -> Fixture {
-    open_noticed(path, tmp, w, h, notes, None)
+    open_noticed(path, tmp, w, h, notes, Vec::new())
 }
 
-/// As `open` does it, with `notice` (an earlier copy's unsaved edits were kept).
+/// As `open` does it, with `notices` (where earlier copies' unsaved edits went).
 fn open_noticed(
     path: PathBuf,
     tmp: tempfile::TempDir,
     w: f32,
     h: f32,
     notes: Vec<String>,
-    notice: Option<String>,
+    notices: Vec<String>,
 ) -> Fixture {
     let mut media = Media::probe(&path).unwrap();
     media.notes.extend(notes);
@@ -81,7 +81,7 @@ fn open_noticed(
         tmp.path().join("work"),
         Marks::default(),
         Selection::default(),
-        notice,
+        notices,
     );
     win.sink = Sink::Null;
     let mut fx = Fixture {
@@ -414,10 +414,10 @@ fn the_kept_copy_notice_is_shown_whole_on_open_and_stays() {
     let tmp = tempfile::tempdir().unwrap();
     let path = tmp.path().join("clip.mp4");
     clip(&tools, &path);
-    let notice = "the previous copy had unsaved edits; kept them at /Users/someone/Library/Caches/\
-                  sopen/example-host/home/someone/videos/2026/clip.mp4.conflict-20261116T101010Z"
+    let notice = "the previous copy had unsaved edits; kept them at <cache>/example-host/srv/\
+                  shared/archive/recordings/2026/november/clip.mp4.conflict-20261116T101010Z"
         .to_string();
-    let mut fx = open_noticed(path, tmp, 640.0, 560.0, Vec::new(), Some(notice.clone()));
+    let mut fx = open_noticed(path, tmp, 640.0, 560.0, Vec::new(), vec![notice.clone()]);
     assert!(fx.drv.find_text(&notice).is_some(), "shown whole on open");
     assert!(fx.win.status.text.is_empty(), "{}", fx.win.status.text);
     let (tx, rx) = mpsc::channel();

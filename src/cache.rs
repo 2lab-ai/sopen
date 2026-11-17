@@ -1,9 +1,10 @@
-//! Local paths: the fetch cache `<cache>/<host>/<abs path>` (each copy with a
-//! `.<name>.sopen-baseline` record of what it held when fetched or saved, and the session lock
-//! `.<name>.sopen-lock`), edits kept aside as `<copy>.conflict-<UTC stamp>`, image backups
-//! `<cache>/backup/<host>/<abs path>.<UTC stamp>` (spec §5), and the state dir (ssh control
-//! sockets, `usage.jsonl`). `SOPEN_CACHE_DIR` / `SOPEN_STATE_DIR` override both. What sopen
-//! creates under the cache is the owner's only (0700 directories, 0600 files).
+//! Local paths: the fetch cache `<cache>/<host>/<abs path>`, edits kept aside as
+//! `<copy>.conflict-<UTC stamp>`, image backups `<cache>/.backup/<host>/<abs path>.<UTC stamp>`,
+//! image edits under `<cache>/.edits`, exports under `<cache>/.exports` (spec §5), and the state dir (ssh control sockets, `usage.jsonl`). What sopen knows about a
+//! copy lives apart from the mirrored tree, under `<cache>/.meta` (see [`Claim`]): the record of
+//! what the copy held when fetched or saved, and the session lock. `SOPEN_CACHE_DIR` /
+//! `SOPEN_STATE_DIR` override both. What sopen creates under the cache is the owner's only
+//! (0700 directories, 0600 files).
 
 use anyhow::{Context, Result};
 use std::fs::{DirBuilder, File, OpenOptions};
@@ -57,23 +58,70 @@ fn under(root: &Path, host: &str, abs: &str) -> PathBuf {
     out
 }
 
+/// A host label as one path component. Never empty and never starting with `.`: so no
+/// mirrored path is `.`/`..`, and none reaches [`META`].
 fn sanitize(host: &str) -> String {
     let cleaned: String = host
         .chars()
         .map(|c| if c == '/' || c == '\0' { '_' } else { c })
         .collect();
-    match cleaned.as_str() {
-        "" | "." | ".." => "_".to_string(),
-        _ => cleaned,
+    if cleaned.is_empty() || cleaned.starts_with('.') {
+        format!("_{cleaned}")
+    } else {
+        cleaned
     }
 }
+
+/// `<cache>/.meta`: what sopen knows about its cached copies — `record/<mirrored path>` (the
+/// SHA-256 a copy held when sopen last fetched or saved it) and `lock/<mirrored path>` (the
+/// session lock). No mirrored path reaches it (every one starts with a [`sanitize`]d host
+/// label), and each kind is a tree of its own shaped like the mirror, so a remote file can
+/// never be named onto a record or a lock.
+const META: &str = ".meta";
+
+/// Where sopen keeps `kind` (`record`, `lock`) for the cached copy `local` (under `cache`).
+fn meta_path(cache: &Path, kind: &str, local: &Path) -> Result<PathBuf> {
+    let rel = local
+        .strip_prefix(cache)
+        .with_context(|| format!("{} is not under the cache", local.display()))?;
+    Ok(cache.join(META).join(kind).join(rel))
+}
+
+/// The cache's fixed roots, beside the mirrored hosts: image backups, staged and kept image
+/// edits, local exports. Dot names: no host label reaches them (see [`sanitize`]). Roots an
+/// older build made without the dot (`backup`, `edits`, `exports`) are just cache now: never
+/// read, never written.
+const BACKUP: &str = ".backup";
+const EDITS: &str = ".edits";
+const EXPORTS: &str = ".exports";
 
 pub fn cache_path(cache: &Path, host: &str, abs: &str) -> PathBuf {
     under(cache, host, abs)
 }
 
+/// Where image edits are staged and refused ones kept.
+pub fn edits_root(cache: &Path) -> PathBuf {
+    cache.join(EDITS)
+}
+
+/// Where an image's edits are staged and refused ones kept: `<edits root>/<host>/<abs path>`
+/// (the files themselves are siblings named after it).
+pub fn edits_path(cache: &Path, host: &str, abs: &str) -> PathBuf {
+    under(&edits_root(cache), host, abs)
+}
+
+/// Where local exports are made before they are published.
+pub fn exports_root(cache: &Path) -> PathBuf {
+    cache.join(EXPORTS)
+}
+
+/// Where image backups go: `<backup root>/<host>/<abs path>.<UTC stamp>`.
+pub fn backup_root(cache: &Path) -> PathBuf {
+    cache.join(BACKUP)
+}
+
 pub fn backup_path(cache: &Path, host: &str, abs: &str, at: SystemTime) -> PathBuf {
-    let mut path = under(&cache.join("backup"), host, abs);
+    let mut path = under(&backup_root(cache), host, abs);
     let name = format!(
         "{}.{}",
         path.file_name()
@@ -121,59 +169,143 @@ pub fn create_unique(mut name: impl FnMut(u32) -> PathBuf) -> Result<(PathBuf, F
     anyhow::bail!("no free name for a new file after {TRIES} tries")
 }
 
-/// `<dir>/.<name>.sopen-lock` next to a cached copy: the advisory lock a session holds on the
-/// copy (hidden, like the baseline record, so a remote file named `<name>.lock` is not it).
-/// Never removed: removing it would let two sessions lock two different files.
-pub fn lock_path(local: &Path) -> PathBuf {
-    let mut name = std::ffi::OsString::from(".");
-    name.push(local.file_name().unwrap_or_default());
-    name.push(".sopen-lock");
-    local.with_file_name(name)
-}
-
 /// The cached copy one session works on — its app or editor, its window — locked for as long
-/// as this lives.
+/// as this lives, with what sopen knows about it.
 pub struct Claim {
     pub local: PathBuf,
+    cache: PathBuf,
+    /// The record of what the copy held when sopen last fetched or saved it.
+    record: PathBuf,
     /// Why this session works on a copy of its own (`local` is not the shared copy): the one
     /// line to print.
     pub note: Option<String>,
-    /// `None` only for a session copy whose own lock failed (its name is still its own).
+    /// `local` was created empty by this claim (a session copy): nothing in it to keep.
+    fresh: bool,
+    /// `None` only for a session copy whose lock failed (the copy is still its own).
     _lock: Option<File>,
 }
 
-/// Claims `cached` for this session. When another sopen session holds it — or it cannot be
-/// locked at all — this one gets a sibling copy of its own, `<stem>.session-<random>.<ext>`
-/// (created exclusively), so neither replaces nor moves aside the copy another is editing.
-pub fn claim(cached: &Path) -> Result<Claim> {
-    claim_with(cached, &mut |file| file.try_lock())
+impl Claim {
+    /// Before a fetch writes the copy: a copy that differs from its record (or has none — it
+    /// may hold unsaved edits) is moved aside; returns where it went.
+    pub fn set_aside_unsaved(&self) -> Result<Option<PathBuf>> {
+        if self.fresh || !self.local.is_file() {
+            return Ok(None);
+        }
+        let held = hex(&crate::app::file_hash(&self.local)?);
+        if read_record(&self.record).as_deref() == Some(held.as_str()) {
+            return Ok(None);
+        }
+        set_aside(&self.local).map(Some)
+    }
+
+    /// Records `sha256` as what the copy holds now (fetched, or saved back).
+    pub fn record(&self, sha256: &[u8; 32]) -> Result<()> {
+        write_record(&self.record, sha256)
+    }
+
+    /// For the shared copy's claim: the session copies earlier sessions left next to it
+    /// (`<stem>.session-<hex><ext>`) whose session has ended — their lock is free. One holding
+    /// unsaved edits (it differs from its record, or has none) is moved aside, and where it went
+    /// is returned to be said; a clean one is removed with its record and lock, as is one a
+    /// failed fetch left empty. A copy whose session still runs (its lock is held, or cannot be
+    /// tried) is never touched; one that cannot be tidied is left as it is.
+    pub fn tidy_session_copies(&self) -> Vec<PathBuf> {
+        let mut kept = Vec::new();
+        let (Some(dir), None) = (self.local.parent(), &self.note) else {
+            return kept;
+        };
+        let name = self.local.file_name().unwrap_or_default().to_string_lossy();
+        let (stem, ext) = split_ext(&name);
+        let prefix = format!("{stem}.session-");
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return kept;
+        };
+        for entry in entries.flatten() {
+            let sibling = entry.file_name();
+            let sibling = sibling.to_string_lossy();
+            let random = sibling
+                .strip_prefix(&prefix)
+                .and_then(|rest| rest.strip_suffix(ext));
+            if !random.is_some_and(|r| r.len() == 8 && r.bytes().all(|b| b.is_ascii_hexdigit())) {
+                continue;
+            }
+            match tidy_session_copy(&self.cache, &entry.path()) {
+                Ok(moved) => kept.extend(moved),
+                Err(e) => crate::debug!("{} left as it is: {e:#}", entry.path().display()),
+            }
+        }
+        kept
+    }
 }
 
-/// [`claim`], with `try_lock` standing in for `File::try_lock` (tests: a filesystem whose
-/// locks fail).
+/// `name` as (stem, extension with its dot): `a.txt` → (`a`, `.txt`), `README` → (`README`, ``).
+fn split_ext(name: &str) -> (&str, &str) {
+    match name.rfind('.') {
+        Some(i) if i > 0 => (&name[..i], &name[i..]),
+        _ => (name, ""),
+    }
+}
+
+/// One ended session's copy, see [`Claim::tidy_session_copies`]: its lock is taken first and
+/// held throughout, so a session that starts meanwhile cannot be working on it.
+fn tidy_session_copy(cache: &Path, copy: &Path) -> Result<Option<PathBuf>> {
+    let (lock, lock_path) = open_lock(cache, copy)?;
+    if lock.try_lock().is_err() {
+        return Ok(None);
+    }
+    let meta = std::fs::symlink_metadata(copy)?;
+    if !meta.file_type().is_file() {
+        return Ok(None);
+    }
+    let record = meta_path(cache, "record", copy)?;
+    let clean = match read_record(&record) {
+        Some(held) => held == hex(&crate::app::file_hash(copy)?),
+        // Never fetched into (its fetch failed): the empty file its claim created.
+        None => meta.len() == 0,
+    };
+    let moved = if clean {
+        std::fs::remove_file(copy)?;
+        None
+    } else {
+        Some(set_aside(copy)?)
+    };
+    let _ = std::fs::remove_file(&record);
+    let _ = std::fs::remove_file(&lock_path);
+    Ok(moved)
+}
+
+/// Claims the cached copy of `abs` on `host` for this session. When another sopen session holds
+/// it — or it cannot be locked at all — this one gets a copy of its own next to it,
+/// `<stem>.session-<random>.<ext>`, created exclusively, so neither replaces nor moves aside
+/// the copy another session is editing.
+pub fn claim(cache: &Path, host: &str, abs: &str) -> Result<Claim> {
+    claim_with(cache, &cache_path(cache, host, abs), &mut |file| {
+        file.try_lock()
+    })
+}
+
+/// [`claim`] of the cached copy `cached`, with `try_lock` standing in for `File::try_lock`
+/// (tests: a filesystem whose locks fail).
 fn claim_with(
+    cache: &Path,
     cached: &Path,
     try_lock: &mut dyn FnMut(&File) -> std::result::Result<(), std::fs::TryLockError>,
 ) -> Result<Claim> {
     if let Some(dir) = cached.parent() {
         private_dir(dir)?;
     }
-    let path = lock_path(cached);
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .mode(0o600)
-        .open(&path)
-        .with_context(|| format!("cannot create {}", path.display()))?;
+    let (file, lock) = open_lock(cache, cached)?;
     // Held by another session, or not lockable here at all: either way this session must not
     // work on the shared copy.
     let why = match try_lock(&file) {
         Ok(()) => {
             return Ok(Claim {
                 local: cached.to_path_buf(),
+                cache: cache.to_path_buf(),
+                record: meta_path(cache, "record", cached)?,
                 note: None,
+                fresh: false,
                 _lock: Some(file),
             })
         }
@@ -181,21 +313,17 @@ fn claim_with(
             format!("another sopen session has {} open", cached.display())
         }
         Err(std::fs::TryLockError::Error(e)) => {
-            format!("{} cannot be locked ({e})", cached.display())
+            format!("{} cannot be locked ({e})", lock.display())
         }
     };
     let name = cached.file_name().unwrap_or_default().to_string_lossy();
-    let (stem, ext) = match name.rfind('.') {
-        Some(i) if i > 0 => (&name[..i], &name[i..]),
-        _ => (&name[..], ""),
-    };
-    // The sibling's own lock file, created exclusively, reserves its name.
-    let mut local = PathBuf::new();
-    let (lock, file) = create_unique(|_| {
+    let (stem, ext) = split_ext(&name);
+    // The session copy itself, created exclusively (empty, owner-only): the fetch fills it.
+    let (local, _) = create_unique(|_| {
         let random = crate::remote::random_hex();
-        local = cached.with_file_name(format!("{stem}.session-{}{ext}", &random[..8]));
-        lock_path(&local)
+        cached.with_file_name(format!("{stem}.session-{}{ext}", &random[..8]))
     })?;
+    let (file, lock) = open_lock(cache, &local)?;
     let lock_held = match try_lock(&file) {
         Ok(()) => true,
         Err(e) => {
@@ -208,10 +336,31 @@ fn claim_with(
         local.display()
     );
     Ok(Claim {
+        record: meta_path(cache, "record", &local)?,
+        cache: cache.to_path_buf(),
         local,
         note: Some(note),
+        fresh: true,
         _lock: lock_held.then_some(file),
     })
+}
+
+/// The session lock file of the cached copy `local`, open (created owner-only if new). Never
+/// removed: removing it would let two sessions lock two different files.
+fn open_lock(cache: &Path, local: &Path) -> Result<(File, PathBuf)> {
+    let lock = meta_path(cache, "lock", local)?;
+    if let Some(dir) = lock.parent() {
+        private_dir(dir)?;
+    }
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(&lock)
+        .with_context(|| format!("cannot create {}", lock.display()))?;
+    Ok((file, lock))
 }
 
 /// A sibling of `edited` that keeps a refused edit out of the way of the next fetch:
@@ -225,13 +374,17 @@ pub fn conflict_copy_path(edited: &Path, at: SystemTime) -> PathBuf {
 /// Moves `edited` to its conflict-copy path (`-N` added when that name is taken) and returns
 /// where it went. Used whenever an edit cannot be uploaded, so no later fetch can overwrite it.
 pub fn set_aside(edited: &Path) -> Result<PathBuf> {
-    set_aside_with(edited, &mut |_| {})
+    set_aside_with(edited, &mut |_| {}, &mut |_| {})
 }
 
 /// [`set_aside`], with `before_move` called on the chosen name right before the move (tests: a
 /// racing process). The name is first created exclusively (an empty owner-only placeholder),
 /// so the move can only ever replace that placeholder — never a file someone else made.
-fn set_aside_with(edited: &Path, before_move: &mut dyn FnMut(&Path)) -> Result<PathBuf> {
+fn set_aside_with(
+    edited: &Path,
+    before_move: &mut dyn FnMut(&Path),
+    after_move: &mut dyn FnMut(&Path),
+) -> Result<PathBuf> {
     let first = conflict_copy_path(edited, SystemTime::now());
     let (keep, _) = create_unique(|n| {
         if n == 0 {
@@ -242,9 +395,6 @@ fn set_aside_with(edited: &Path, before_move: &mut dyn FnMut(&Path)) -> Result<P
         first.with_file_name(name)
     })
     .with_context(|| format!("no free conflict-copy name next to {}", edited.display()))?;
-    // What is at the copy's name, not what it may point at: only a regular file is the edit
-    // itself; a symlink is moved aside as the link, and nothing is done through it.
-    let regular = std::fs::symlink_metadata(edited).is_ok_and(|m| m.file_type().is_file());
     before_move(&keep);
     if let Err(e) = std::fs::rename(edited, &keep) {
         let _ = std::fs::remove_file(&keep);
@@ -256,44 +406,44 @@ fn set_aside_with(edited: &Path, before_move: &mut dyn FnMut(&Path)) -> Result<P
             )
         });
     }
+    after_move(&keep);
     // An editor may have rewritten the copy with the umask's mode: the edit is private.
-    if !regular {
-        crate::debug!(
-            "{} is not a regular file; moved aside as is",
-            keep.display()
-        );
-    } else if let Err(e) = std::fs::set_permissions(&keep, std::fs::Permissions::from_mode(0o600)) {
+    if let Err(e) = make_private(&keep) {
         crate::debug!("{} not made owner-only: {e}", keep.display());
     }
     Ok(keep)
 }
 
-/// `<dir>/.<name>.sopen-baseline` next to a fetched copy: the hex SHA-256 the copy held when
-/// sopen last fetched or saved it. A copy that no longer matches holds unsaved edits.
-pub fn baseline_record_path(local: &Path) -> PathBuf {
-    let mut name = std::ffi::OsString::from(".");
-    name.push(local.file_name().unwrap_or_default());
-    name.push(".sopen-baseline");
-    local.with_file_name(name)
+/// Makes the regular file at `path` owner-only (0600) through its own descriptor: opened
+/// without following a symlink (one fails the open and is left as it is) and without blocking
+/// on a FIFO, checked to be a regular file, then chmodded via that descriptor — never through a
+/// path that may by then name something else.
+fn make_private(path: &Path) -> std::io::Result<()> {
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)?;
+    if !file.metadata()?.file_type().is_file() {
+        return Err(std::io::Error::other("not a regular file; left as it is"));
+    }
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))
 }
 
 pub fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// Records `sha256` as what the fetched copy `local` holds — owner-only (0600), like the copy.
-/// Written to a new file next to it and renamed onto the record's name: the rename replaces
-/// whatever entry is there (an older sopen's 0644 record, a symlink) and never writes through
-/// it.
-pub fn write_baseline(local: &Path, sha256: &[u8; 32]) -> Result<()> {
-    let record = baseline_record_path(local);
+/// Writes `sha256` as the record at `record` — owner-only (0600), like the copy. Written to a
+/// new file next to it and renamed onto the record's name: the rename replaces whatever entry
+/// is there and never writes through it.
+fn write_record(record: &Path, sha256: &[u8; 32]) -> Result<()> {
     let (temp, mut file) = create_unique(|_| {
         let mut name = record.file_name().unwrap_or_default().to_os_string();
-        name.push(format!("-{}", &crate::remote::random_hex()[..8]));
+        name.push(format!(".tmp-{}", &crate::remote::random_hex()[..8]));
         record.with_file_name(name)
     })?;
     let written = std::io::Write::write_all(&mut file, format!("{}\n", hex(sha256)).as_bytes())
-        .and_then(|()| std::fs::rename(&temp, &record));
+        .and_then(|()| std::fs::rename(&temp, record));
     if let Err(e) = written {
         let _ = std::fs::remove_file(&temp);
         return Err(e).with_context(|| format!("cannot write {}", record.display()));
@@ -301,22 +451,9 @@ pub fn write_baseline(local: &Path, sha256: &[u8; 32]) -> Result<()> {
     Ok(())
 }
 
-fn read_baseline(local: &Path) -> Option<String> {
-    let text = std::fs::read_to_string(baseline_record_path(local)).ok()?;
+fn read_record(record: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(record).ok()?;
     Some(text.trim().to_string())
-}
-
-/// Before a fetch overwrites `local`: if it exists and differs from its recorded baseline (or
-/// has no record), it may hold unsaved edits — move it aside and return where it went.
-pub fn set_aside_unsaved(local: &Path) -> Result<Option<PathBuf>> {
-    if !local.is_file() {
-        return Ok(None);
-    }
-    let held = hex(&crate::app::file_hash(local)?);
-    if read_baseline(local).as_deref() == Some(held.as_str()) {
-        return Ok(None);
-    }
-    set_aside(local).map(Some)
 }
 
 /// Civil date from days since 1970-01-01 (H. Hinnant's algorithm).
@@ -371,11 +508,39 @@ mod tests {
             cache_path(root, "me@[::1]", "/x/../../etc/y"),
             PathBuf::from("/c/me@[::1]/x/etc/y")
         );
-        assert_eq!(cache_path(root, "..", "/a"), PathBuf::from("/c/_/a"));
+        assert_eq!(cache_path(root, "..", "/a"), PathBuf::from("/c/_../a"));
+        // No host label reaches what sopen keeps about its copies.
+        assert_eq!(
+            cache_path(root, ".meta", "/a"),
+            PathBuf::from("/c/_.meta/a")
+        );
+        assert_eq!(cache_path(root, "", "/a"), PathBuf::from("/c/_/a"));
+        assert_eq!(
+            meta_path(root, "record", Path::new("/c/box/tmp/a.mp3")).unwrap(),
+            PathBuf::from("/c/.meta/record/box/tmp/a.mp3")
+        );
+        // No mirrored host lands in a fixed root: not even hosts named like one.
+        let fixed = [
+            backup_root(root),
+            edits_root(root),
+            exports_root(root),
+            root.join(META),
+        ];
+        for host in [
+            "backup", "edits", "exports", ".meta", ".backup", ".edits", ".exports",
+        ] {
+            let mirrored = cache_path(root, host, "/x");
+            for r in &fixed {
+                assert!(
+                    !mirrored.starts_with(r),
+                    "host {host:?}: {mirrored:?} is under {r:?}"
+                );
+            }
+        }
         let at = SystemTime::UNIX_EPOCH + Duration::from_secs(1_794_389_076);
         assert_eq!(
             backup_path(root, "box", "/tmp/shot.png", at),
-            PathBuf::from("/c/backup/box/tmp/shot.png.20261111T092436Z")
+            PathBuf::from("/c/.backup/box/tmp/shot.png.20261111T092436Z")
         );
         assert_eq!(
             conflict_copy_path(Path::new("/c/box/a.txt"), at),
@@ -386,20 +551,25 @@ mod tests {
     #[test]
     fn unsaved_copies_are_set_aside_not_overwritten() {
         let tmp = tempfile::tempdir().unwrap();
-        let copy = tmp.path().join("a.txt");
+        let claim = claim(tmp.path(), "box", "/a.txt").unwrap();
+        let copy = claim.local.clone();
+        assert_eq!(copy, tmp.path().join("box/a.txt"));
         assert_eq!(
-            set_aside_unsaved(&copy).unwrap(),
+            claim.set_aside_unsaved().unwrap(),
             None,
             "nothing cached yet"
         );
 
         std::fs::write(&copy, "fetched").unwrap();
-        write_baseline(&copy, &crate::app::file_hash(&copy).unwrap()).unwrap();
-        assert_eq!(set_aside_unsaved(&copy).unwrap(), None, "clean copy stays");
+        claim
+            .record(&crate::app::file_hash(&copy).unwrap())
+            .unwrap();
+        assert_eq!(claim.set_aside_unsaved().unwrap(), None, "clean copy stays");
         assert!(copy.exists());
 
         std::fs::write(&copy, "my edit").unwrap();
-        let kept = set_aside_unsaved(&copy)
+        let kept = claim
+            .set_aside_unsaved()
             .unwrap()
             .expect("edited copy moved");
         assert!(!copy.exists());
@@ -407,20 +577,40 @@ mod tests {
         let name = kept.file_name().unwrap().to_string_lossy().into_owned();
         assert!(name.starts_with("a.txt.conflict-"), "{name}");
 
-        // A copy with no record is treated as possibly edited; a second set-aside in the same
-        // second gets its own name instead of replacing the first.
+        // A copy with no record (an older sopen kept it next to the copy) is treated as
+        // possibly edited; a second set-aside in the same second gets its own name instead of
+        // replacing the first.
         std::fs::write(&copy, "second edit").unwrap();
-        std::fs::remove_file(baseline_record_path(&copy)).unwrap();
-        let again = set_aside_unsaved(&copy)
+        std::fs::remove_file(&claim.record).unwrap();
+        let again = claim
+            .set_aside_unsaved()
             .unwrap()
             .expect("unrecorded copy moved");
         assert_ne!(again, kept);
         assert_eq!(std::fs::read_to_string(&kept).unwrap(), "my edit");
         assert_eq!(std::fs::read_to_string(&again).unwrap(), "second edit");
-        assert_eq!(
-            baseline_record_path(Path::new("/c/h/x.bin")),
-            PathBuf::from("/c/h/.x.bin.sopen-baseline")
-        );
+    }
+
+    /// A session copy (the shared one is held) is created by the claim itself — empty,
+    /// owner-only, under a name no other claim gets — and holds nothing to move aside.
+    #[test]
+    fn a_session_copy_is_created_exclusively() {
+        let tmp = tempfile::tempdir().unwrap();
+        let one = claim(tmp.path(), "box", "/a.txt").unwrap();
+        let two = claim(tmp.path(), "box", "/a.txt").unwrap();
+        let three = claim(tmp.path(), "box", "/a.txt").unwrap();
+        assert!(one.note.is_none() && !one.local.exists());
+        for c in [&two, &three] {
+            let meta = std::fs::symlink_metadata(&c.local).expect("created by the claim");
+            assert!(
+                meta.file_type().is_file() && meta.len() == 0,
+                "{:?}",
+                c.local
+            );
+            assert_eq!(c.set_aside_unsaved().unwrap(), None);
+        }
+        assert_ne!(two.local, three.local);
+        assert_ne!(two.record, three.record);
     }
 
     /// `create_unique` skips a name that is taken — by a file or by a symlink pointing
@@ -473,13 +663,17 @@ mod tests {
         let copy = tmp.path().join("a.txt");
         std::fs::write(&copy, "my edit").unwrap();
         let mut theirs = None;
-        let kept = set_aside_with(&copy, &mut |name| {
-            let created = OpenOptions::new().write(true).create_new(true).open(name);
-            if let Ok(mut file) = created {
-                std::io::Write::write_all(&mut file, b"someone else's").unwrap();
-                theirs = Some(name.to_path_buf());
-            }
-        })
+        let kept = set_aside_with(
+            &copy,
+            &mut |name| {
+                let created = OpenOptions::new().write(true).create_new(true).open(name);
+                if let Ok(mut file) = created {
+                    std::io::Write::write_all(&mut file, b"someone else's").unwrap();
+                    theirs = Some(name.to_path_buf());
+                }
+            },
+            &mut |_| {},
+        )
         .unwrap();
         assert_eq!(std::fs::read_to_string(&kept).unwrap(), "my edit");
         if let Some(theirs) = theirs {
@@ -489,37 +683,47 @@ mod tests {
         assert!(!copy.exists());
     }
 
-    /// The baseline record is the owner's only, like the copy it describes — also one an older
-    /// sopen left with the umask's mode.
+    /// The record and the lock are the owner's only, like the copy they describe, in 0700
+    /// directories — also a record left with the umask's mode.
     #[test]
-    fn baseline_records_are_owner_only() {
-        if crate::testutil::rerun_under_umask_022("cache::tests::baseline_records_are_owner_only") {
+    fn records_and_locks_are_owner_only() {
+        if crate::testutil::rerun_under_umask_022("cache::tests::records_and_locks_are_owner_only")
+        {
             return;
         }
         use std::os::unix::fs::PermissionsExt;
         let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
         let tmp = tempfile::tempdir().unwrap();
-        let (fresh, old) = (tmp.path().join("a.txt"), tmp.path().join("b.txt"));
-        std::fs::write(baseline_record_path(&old), "stale\n").unwrap();
-        std::fs::set_permissions(
-            baseline_record_path(&old),
-            std::fs::Permissions::from_mode(0o644),
-        )
-        .unwrap();
-        for copy in [&fresh, &old] {
-            write_baseline(copy, &[7; 32]).unwrap();
-            let record = baseline_record_path(copy);
-            assert_eq!(mode(&record), 0o600, "{record:?}");
-            assert_eq!(read_baseline(copy), Some(hex(&[7; 32])));
+        let (one, two) = (
+            claim(tmp.path(), "box", "/d/a.txt").unwrap(),
+            claim(tmp.path(), "box", "/d/b.txt").unwrap(),
+        );
+        private_dir(two.record.parent().unwrap()).unwrap();
+        std::fs::write(&two.record, "stale\n").unwrap();
+        std::fs::set_permissions(&two.record, std::fs::Permissions::from_mode(0o644)).unwrap();
+        for c in [&one, &two] {
+            c.record(&[7; 32]).unwrap();
+            assert_eq!(mode(&c.record), 0o600, "{:?}", c.record);
+            assert_eq!(read_record(&c.record), Some(hex(&[7; 32])));
+            let lock = meta_path(tmp.path(), "lock", &c.local).unwrap();
+            assert_eq!(mode(&lock), 0o600, "{lock:?}");
+            for dir in [c.record.parent().unwrap(), lock.parent().unwrap()] {
+                for d in dir
+                    .ancestors()
+                    .take_while(|d| d.starts_with(tmp.path().join(META)))
+                {
+                    assert_eq!(mode(d), 0o700, "{d:?}");
+                }
+            }
         }
     }
 
     /// A symlink at the record's name is replaced by the record, never written through: the
     /// file it pointed at keeps its content and mode.
     #[test]
-    fn write_baseline_never_writes_through_a_symlink() {
+    fn a_record_is_never_written_through_a_symlink() {
         if crate::testutil::rerun_under_umask_022(
-            "cache::tests::write_baseline_never_writes_through_a_symlink",
+            "cache::tests::a_record_is_never_written_through_a_symlink",
         ) {
             return;
         }
@@ -528,18 +732,22 @@ mod tests {
         let unrelated = tmp.path().join("unrelated");
         std::fs::write(&unrelated, "unrelated").unwrap();
         std::fs::set_permissions(&unrelated, std::fs::Permissions::from_mode(0o644)).unwrap();
-        let copy = tmp.path().join("a.txt");
-        std::os::unix::fs::symlink(&unrelated, baseline_record_path(&copy)).unwrap();
-        write_baseline(&copy, &[7; 32]).unwrap();
+        let claim = claim(tmp.path(), "box", "/a.txt").unwrap();
+        private_dir(claim.record.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&unrelated, &claim.record).unwrap();
+        claim.record(&[7; 32]).unwrap();
         assert_eq!(std::fs::read_to_string(&unrelated).unwrap(), "unrelated");
         let mode = std::fs::metadata(&unrelated).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o644);
-        let record = std::fs::symlink_metadata(baseline_record_path(&copy)).unwrap();
+        let record = std::fs::symlink_metadata(&claim.record).unwrap();
         assert!(record.file_type().is_file(), "the record replaced the link");
         assert_eq!(record.permissions().mode() & 0o777, 0o600);
-        assert_eq!(read_baseline(&copy), Some(hex(&[7; 32])));
-        let names: Vec<_> = std::fs::read_dir(tmp.path()).unwrap().flatten().collect();
-        assert_eq!(names.len(), 2, "no temp left behind: {names:?}");
+        assert_eq!(read_record(&claim.record), Some(hex(&[7; 32])));
+        let names: Vec<_> = std::fs::read_dir(claim.record.parent().unwrap())
+            .unwrap()
+            .flatten()
+            .collect();
+        assert_eq!(names.len(), 1, "no temp left behind: {names:?}");
     }
 
     /// A copy that is a symlink is moved aside as the link itself: what it points at keeps its
@@ -574,11 +782,11 @@ mod tests {
     #[test]
     fn a_copy_that_cannot_be_locked_is_not_shared() {
         let tmp = tempfile::tempdir().unwrap();
-        let cached = tmp.path().join("box/a.txt");
+        let cached = cache_path(tmp.path(), "box", "/a.txt");
         let unsupported =
             || std::fs::TryLockError::Error(std::io::Error::from(std::io::ErrorKind::Unsupported));
-        let one = claim_with(&cached, &mut |_| Err(unsupported())).unwrap();
-        let two = claim_with(&cached, &mut |_| Err(unsupported())).unwrap();
+        let one = claim_with(tmp.path(), &cached, &mut |_| Err(unsupported())).unwrap();
+        let two = claim_with(tmp.path(), &cached, &mut |_| Err(unsupported())).unwrap();
         for c in [&one, &two] {
             assert_ne!(c.local, cached);
             let name = c.local.file_name().unwrap().to_string_lossy().into_owned();
@@ -591,6 +799,100 @@ mod tests {
         let note = one.note.as_deref().unwrap();
         assert!(note.contains("cannot be locked"), "{note}");
         assert!(note.ends_with(&*one.local.to_string_lossy()), "{note}");
+    }
+
+    /// The owner-only chmod after the move goes through the moved entry itself, never through a
+    /// path that may by then name something else: here the kept name is swapped for a symlink
+    /// right after the move, and what it points at keeps its mode.
+    #[test]
+    fn set_aside_never_chmods_through_a_name_swapped_after_the_move() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let referent = tmp.path().join("referent");
+        std::fs::write(&referent, "referent").unwrap();
+        std::fs::set_permissions(&referent, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let copy = tmp.path().join("a.txt");
+        std::fs::write(&copy, "my edit").unwrap();
+        let kept = set_aside_with(&copy, &mut |_| {}, &mut |kept| {
+            std::fs::rename(kept, tmp.path().join("moved-on")).unwrap();
+            std::os::unix::fs::symlink(&referent, kept).unwrap();
+        })
+        .unwrap();
+        assert!(std::fs::symlink_metadata(&kept)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        let mode = std::fs::metadata(&referent).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o644);
+        assert_eq!(std::fs::read_to_string(&referent).unwrap(), "referent");
+    }
+
+    /// Tidying on the shared copy's claim: ended sessions' copies that hold nothing unsaved —
+    /// a clean one, one a failed fetch left empty — go with their record and lock; a running
+    /// session's copy and files merely named alike stay.
+    #[test]
+    fn tidy_removes_ended_clean_session_copies_with_their_record_and_lock() {
+        let tmp = tempfile::tempdir().unwrap();
+        let c = tmp.path();
+        let one = claim(c, "box", "/a.txt").unwrap();
+        let unfilled = claim(c, "box", "/a.txt").unwrap();
+        let clean = claim(c, "box", "/a.txt").unwrap();
+        std::fs::write(&clean.local, "v1").unwrap();
+        clean
+            .record(&crate::app::file_hash(&clean.local).unwrap())
+            .unwrap();
+        let running = claim(c, "box", "/a.txt").unwrap();
+        std::fs::write(&running.local, "in progress").unwrap();
+        let alike = [
+            "a.session-1234567.txt",
+            "a.session-xyzxyzxy.txt",
+            "b.session-12345678.txt",
+        ]
+        .map(|n| one.local.with_file_name(n));
+        for path in &alike {
+            std::fs::write(path, "not a session copy of a.txt").unwrap();
+        }
+        let gone: Vec<PathBuf> = [&unfilled, &clean]
+            .iter()
+            .flat_map(|s| {
+                [
+                    s.local.clone(),
+                    s.record.clone(),
+                    meta_path(c, "lock", &s.local).unwrap(),
+                ]
+            })
+            .collect();
+        assert!(gone.iter().filter(|p| p.exists()).count() >= 5, "{gone:?}");
+        drop((one, unfilled, clean));
+        assert!(
+            running.tidy_session_copies().is_empty(),
+            "a session copy's claim never tidies"
+        );
+        // A lock let go here can stay held for a moment by a process another test thread is
+        // spawning (fork duplicates the descriptor until exec): a held lock is left alone by
+        // design, so try again until it is let go.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let again = claim(c, "box", "/a.txt").unwrap();
+            if again.note.is_none() {
+                assert_eq!(again.tidy_session_copies(), Vec::<PathBuf>::new());
+                if gone.iter().all(|p| !p.exists()) {
+                    break;
+                }
+            }
+            let left: Vec<_> = gone.iter().filter(|p| p.exists()).collect();
+            assert!(std::time::Instant::now() < deadline, "not tidied: {left:?}");
+            drop(again);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            std::fs::read_to_string(&running.local).unwrap(),
+            "in progress"
+        );
+        assert!(meta_path(c, "lock", &running.local).unwrap().exists());
+        for path in &alike {
+            assert!(path.exists(), "{path:?}");
+        }
     }
 
     #[test]

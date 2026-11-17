@@ -8,7 +8,7 @@
 //! progress. A request that changes the remote and times out is reported as
 //! [`OutcomeUnknown`](super::OutcomeUnknown), never as "nothing written".
 
-use super::{unknown, CreateError, Created, Hashing, RemoteFs, Stat, Uploaded};
+use super::{unknown, CreateError, Created, Hashing, Like, RemoteFs, Stat, Uploaded};
 use crate::target::RemoteSpec;
 use anyhow::{anyhow, bail, Context, Result};
 use bytes::BytesMut;
@@ -221,16 +221,60 @@ fn parse_ssh_g(stdout: &str) -> Result<SshConfig> {
     })
 }
 
+/// The state dir holds ssh control sockets, so it must be this account's own private
+/// directory. Created 0700 (with missing parents) when absent. An existing one is opened
+/// without following a symlink and checked through that descriptor — a directory owned by this
+/// account — then made 0700 through the same descriptor if group or others had access; never
+/// chmodded by path. Anything else is refused with one error.
 fn create_private_dir(dir: &Path) -> Result<()> {
-    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
-    std::fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(dir)
-        .with_context(|| format!("cannot create {}", dir.display()))?;
-    let mode = std::fs::metadata(dir)?.permissions().mode();
-    if mode & 0o077 != 0 {
-        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+    let refuse = |why: String| {
+        anyhow!(
+            "{} {why}; sopen keeps its ssh control sockets there — remove it or set \
+             SOPEN_STATE_DIR",
+            dir.display()
+        )
+    };
+    match std::fs::symlink_metadata(dir) {
+        Ok(m) if m.file_type().is_symlink() => return Err(refuse("is a symlink".into())),
+        Ok(m) if !m.is_dir() => return Err(refuse("is not a directory".into())),
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(dir)
+                .with_context(|| format!("cannot create {}", dir.display()))?;
+        }
+        Err(e) => return Err(e).with_context(|| format!("cannot stat {}", dir.display())),
+    }
+    let opened = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY)
+        .open(dir);
+    let handle = match opened {
+        Ok(h) => h,
+        // Swapped since the check above.
+        Err(e) if e.raw_os_error() == Some(libc::ELOOP) => {
+            return Err(refuse("is a symlink".into()))
+        }
+        Err(e) if e.raw_os_error() == Some(libc::ENOTDIR) => {
+            return Err(refuse("is not a directory".into()))
+        }
+        Err(e) => return Err(e).with_context(|| format!("cannot open {}", dir.display())),
+    };
+    let meta = handle.metadata()?;
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    let me = unsafe { libc::geteuid() };
+    if meta.uid() != me {
+        return Err(refuse(format!(
+            "is owned by uid {}, not this account (uid {me})",
+            meta.uid()
+        )));
+    }
+    if meta.mode() & 0o077 != 0 {
+        handle
+            .set_permissions(std::fs::Permissions::from_mode(0o700))
             .with_context(|| format!("cannot make {} private", dir.display()))?;
     }
     Ok(())
@@ -414,7 +458,7 @@ impl RemoteFs for SftpRemote {
         &mut self,
         local: &Path,
         path: &str,
-        mode: Option<u32>,
+        like: Option<Like>,
     ) -> std::result::Result<Uploaded, CreateError> {
         let not_created = |e| CreateError::new(Created::No, e);
         let mut src = std::fs::File::open(local)
@@ -442,8 +486,18 @@ impl RemoteFs for SftpRemote {
             };
             // From here `path` is ours.
             let fill = async {
-                if let Some(mode) = mode {
-                    within(META_TIMEOUT, file.set_permissions(perms(mode)))
+                if let Some(like) = like {
+                    // fsetstat on the open handle: owner first (a chown can clear set-id bits),
+                    // then mode. An owner the server refuses is caught by the caller's check.
+                    let owner = MetaDataBuilder::new().id((like.uid, like.gid)).create();
+                    match within(META_TIMEOUT, file.set_metadata(owner)).await {
+                        Ok(Ok(())) => {}
+                        Ok(Err(e)) => crate::debug!("set owner on {path}: {e}"),
+                        Err(()) => {
+                            return Err(timed_out(&format!("set owner on {path}"), META_TIMEOUT))
+                        }
+                    }
+                    within(META_TIMEOUT, file.set_permissions(perms(like.mode)))
                         .await
                         .map_err(|()| timed_out(&format!("set mode on {path}"), META_TIMEOUT))?
                         .map_err(|e| anyhow!("cannot set mode on {path}: {e}"))?;
@@ -484,13 +538,6 @@ impl RemoteFs for SftpRemote {
         let (rt, _, fs) = self.parts();
         let got = rt.block_on(within(META_TIMEOUT, fs.set_permissions(path, perms(mode))));
         changed(&format!("set mode on {path}"), got)
-    }
-
-    fn set_owner(&mut self, path: &str, uid: u32, gid: u32) -> Result<()> {
-        let (rt, _, fs) = self.parts();
-        let meta = MetaDataBuilder::new().id((uid, gid)).create();
-        let got = rt.block_on(within(META_TIMEOUT, fs.set_metadata(path, meta)));
-        changed(&format!("set owner {uid}:{gid} on {path}"), got)
     }
 
     fn rename_over(&mut self, from: &str, to: &str) -> Result<()> {
@@ -566,6 +613,41 @@ impl SftpRemote {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The state dir (ssh control sockets) is this account's own private directory: created
+    /// 0700; an existing one of ours with group/other access is made 0700 through its own
+    /// descriptor; a symlink or a non-directory there is refused — and nothing is changed
+    /// through it.
+    #[test]
+    fn the_state_dir_is_ours_and_private_or_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        let tmp = tempfile::tempdir().unwrap();
+        let fresh = tmp.path().join("new/state");
+        create_private_dir(&fresh).unwrap();
+        assert_eq!(mode(&fresh), 0o700);
+
+        let open = tmp.path().join("open");
+        std::fs::create_dir(&open).unwrap();
+        std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o755)).unwrap();
+        create_private_dir(&open).unwrap();
+        assert_eq!(mode(&open), 0o700);
+
+        let elsewhere = tmp.path().join("elsewhere");
+        std::fs::create_dir(&elsewhere).unwrap();
+        std::fs::set_permissions(&elsewhere, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(&elsewhere, &link).unwrap();
+        let err = format!("{:#}", create_private_dir(&link).unwrap_err());
+        assert!(err.contains("is a symlink"), "{err}");
+        assert!(err.contains("SOPEN_STATE_DIR"), "{err}");
+        assert_eq!(mode(&elsewhere), 0o755, "nothing changed through the link");
+
+        let file = tmp.path().join("file");
+        std::fs::write(&file, "").unwrap();
+        let err = format!("{:#}", create_private_dir(&file).unwrap_err());
+        assert!(err.contains("is not a directory"), "{err}");
+    }
 
     #[test]
     fn ssh_g_parsing_and_master_options() {

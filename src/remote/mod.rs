@@ -80,6 +80,15 @@ pub enum WriteOutcome {
     },
 }
 
+/// What a temp standing in for an existing file takes from it: its owner and permission bits,
+/// given through the temp's open handle by [`RemoteFs::create_from`] before any content.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Like {
+    pub mode: u32,
+    pub uid: u32,
+    pub gid: u32,
+}
+
 /// What [`RemoteFs::create_from`] wrote.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Uploaded {
@@ -211,18 +220,21 @@ pub trait RemoteFs {
         out: &mut dyn Write,
         progress: &mut dyn FnMut(u64),
     ) -> Result<u64>;
-    /// Creates `path` exclusively (fails if anything exists there), sets `mode` first when
-    /// given, writes the local file into it and flushes it to disk (`fsync@openssh.com` when
-    /// the server offers it). Returns the size and SHA-256 of the bytes written; a failure says
-    /// whether `path` had been created ([`CreateError::created`]).
+    /// Creates `path` exclusively (fails if anything exists there), writes the local file into
+    /// it and flushes it to disk (`fsync@openssh.com` when the server offers it). With `like`,
+    /// before any content: gives it that owner (where the server lets it; the caller checks)
+    /// and then that mode — both through the open handle (SFTP fsetstat), never by path, so a
+    /// name swapped meanwhile is never changed through. Returns the size and SHA-256 of the
+    /// bytes written; a failure says whether `path` had been created ([`CreateError::created`]).
     fn create_from(
         &mut self,
         local: &Path,
         path: &str,
-        mode: Option<u32>,
+        like: Option<Like>,
     ) -> std::result::Result<Uploaded, CreateError>;
+    /// Sets `path`'s permission bits by path (setstat). The write algorithms never use it —
+    /// they set modes through the open handle; it is for setting up tests and tools.
     fn set_mode(&mut self, path: &str, mode: u32) -> Result<()>;
-    fn set_owner(&mut self, path: &str, uid: u32, gid: u32) -> Result<()>;
     /// Renames `from` over `to`, replacing it (`posix-rename@openssh.com` when offered).
     fn rename_over(&mut self, from: &str, to: &str) -> Result<()>;
     /// Publishes `from` as `to` without replacing anything (a hard link; fails if `to` exists).
@@ -250,8 +262,8 @@ pub trait RemoteFs {
     /// Downloads `remote` to `local` (written via a `.part` file, then renamed) and returns the
     /// stat it was fetched at, with the SHA-256 of the fetched bytes. The stat is taken before
     /// and after the transfer; if they differ the file changed mid-transfer and the fetch is
-    /// retried once, then refused. A previous copy at `local` that differs from what sopen last
-    /// fetched or saved there (unsaved edits) is moved aside first and its new path printed.
+    /// retried once, then refused. Whatever is at `local` is replaced: the caller owns it (a
+    /// [`crate::cache::Claim`] moves unsaved edits aside first and records what was fetched).
     fn fetch(
         &mut self,
         remote: &str,
@@ -261,13 +273,6 @@ pub trait RemoteFs {
         // The copy is the owner's only: 0700 directories, a 0600 file.
         if let Some(parent) = local.parent() {
             crate::cache::private_dir(parent)?;
-        }
-        if let Some(kept) = crate::cache::set_aside_unsaved(local)? {
-            eprintln!(
-                "sopen: the previous copy {} had unsaved edits; kept them at {}",
-                local.display(),
-                kept.display()
-            );
         }
         let part = local.with_file_name(format!(
             "{}.part-{}",
@@ -307,9 +312,6 @@ pub trait RemoteFs {
             if after.is_some_and(|a| same_stat(&a, &before)) && whole {
                 std::fs::rename(&part, local)
                     .with_context(|| format!("cannot move into {}", local.display()))?;
-                if let Err(e) = crate::cache::write_baseline(local, &got.sha256) {
-                    crate::debug!("baseline not recorded: {e:#}");
-                }
                 return Ok(Stat {
                     sha256: Some(got.sha256),
                     ..before
@@ -348,9 +350,13 @@ pub trait RemoteFs {
             }
         };
         let mode = current.mode & 0o7777;
+        let (Some(uid), Some(gid)) = (current.uid, current.gid) else {
+            unreachable!("check_target refuses a target without an owner")
+        };
         let (dir, name) = split_parent(target);
         let tmp = join(dir, &format!(".{name}.sopen-{}", random_hex()));
-        let uploaded = match self.create_from(local, &tmp, Some(mode)) {
+        let like = Like { mode, uid, gid };
+        let uploaded = match self.create_from(local, &tmp, Some(like)) {
             Ok(u) => u,
             Err(e) if e.created == Created::Unknown => {
                 let what = format!("{target} was not replaced, but creating {tmp} got no reply");
@@ -395,10 +401,15 @@ pub trait RemoteFs {
             .with_context(|| format!("replaced {target} but cannot stat it"))?;
         match after {
             Some(now) if now.is_file && !now.is_symlink && same_stat(&now, &staged) => {
+                // The staged temp had the mode (checked right before the rename); a rename does
+                // not change it, so a difference is someone else's chmod. Said, never undone by
+                // path.
                 if now.mode & 0o7777 != mode {
-                    self.set_mode(target, mode).with_context(|| {
-                        format!("wrote {target} but could not restore mode {mode:o}")
-                    })?;
+                    notes.push(format!(
+                        "saved, but {target} now has mode {:o}, not {mode:o} (changed right \
+                         after the save?)",
+                        now.mode & 0o7777
+                    ));
                 }
             }
             other => notes.push(format!(
@@ -415,11 +426,6 @@ pub trait RemoteFs {
             sha256: Some(uploaded.sha256),
             ..staged
         };
-        if crate::cache::baseline_record_path(local).exists() {
-            if let Err(e) = crate::cache::write_baseline(local, &uploaded.sha256) {
-                crate::debug!("baseline not recorded: {e:#}");
-            }
-        }
         Ok(WriteOutcome::Written { now, notes })
     }
 
@@ -541,8 +547,8 @@ enum Swap {
     Changed(Option<Stat>, String),
 }
 
-/// With the temp uploaded: give it the target's owner and mode, stat it (the next baseline),
-/// compare the target's content with the fetch, and re-check the target's stat last.
+/// With the temp uploaded: stat it (the next baseline) and check it took the target's owner
+/// and mode, compare the target's content with the fetch, and re-check the target's stat last.
 #[allow(clippy::too_many_arguments)]
 fn prepare_swap<F: RemoteFs + ?Sized>(
     fs: &mut F,
@@ -554,54 +560,36 @@ fn prepare_swap<F: RemoteFs + ?Sized>(
     mode: u32,
     notes: &mut Vec<String>,
 ) -> Result<Swap> {
+    // The temp as it will be renamed: what the target will be right after the rename. Owner
+    // and mode were given through its handle (create_from); here they are only checked, never
+    // set by path — the name may no longer be the file just written.
     let staged = fs
         .lstat_opt(tmp)?
         .with_context(|| format!("{tmp} vanished right after it was uploaded"))?;
     if let Some(attr) = staged.missing {
         bail!("the server does not report the {attr} of {tmp}; cannot match the target's owner");
     }
-    let want = (current.uid, current.gid);
-    let mut staged_owner = (staged.uid, staged.gid);
-    if staged_owner != want {
-        let (Some(uid), Some(gid)) = want else {
-            unreachable!("check_target refuses a target without an owner")
-        };
-        match fs.set_owner(tmp, uid, gid) {
-            Ok(()) => {
-                let again = fs
-                    .lstat_opt(tmp)?
-                    .with_context(|| format!("{tmp} vanished"))?;
-                staged_owner = (again.uid, again.gid);
-            }
-            Err(e) => crate::debug!("set_owner {tmp}: {e:#}"),
-        }
-        if staged_owner != want {
-            bail!(
-                "{target} is owned by {} and a file this account creates there is owned by {}; \
-                 the replacement cannot keep the original owner",
-                owner(want),
-                owner(staged_owner)
-            );
-        }
-    }
-    // A change of owner can clear setuid/setgid bits.
-    let staged = fs
-        .lstat_opt(tmp)?
-        .with_context(|| format!("{tmp} vanished"))?;
-    if staged.mode & 0o7777 != mode {
-        fs.set_mode(tmp, mode)?;
-    }
-    // The staged object after every setstat: what the target will be right after the rename.
-    let staged = fs
-        .lstat_opt(tmp)?
-        .with_context(|| format!("{tmp} vanished"))?;
-    if let Some(attr) = staged.missing {
-        bail!("the server does not report the {attr} of {tmp}");
-    }
     if !staged.is_file || staged.size != uploaded.size {
         bail!(
             "{tmp} is not the {} bytes just uploaded ({})",
             uploaded.size,
+            describe_stat(&staged)
+        );
+    }
+    let want = (current.uid, current.gid);
+    let staged_owner = (staged.uid, staged.gid);
+    if staged_owner != want {
+        bail!(
+            "{target} is owned by {} and a file this account creates there is owned by {}; \
+             the replacement cannot keep the original owner",
+            owner(want),
+            owner(staged_owner)
+        );
+    }
+    if staged.mode & 0o7777 != mode {
+        bail!(
+            "{tmp} did not take mode {mode:o} ({}); the replacement cannot keep the original \
+             permissions",
             describe_stat(&staged)
         );
     }

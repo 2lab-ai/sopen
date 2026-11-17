@@ -81,16 +81,26 @@ anything not in the table below is out of scope until usage says otherwise (§10
 - Local copies are the owner's only: cache, edit, backup and export directories are created 0700; fetched copies,
   staged and kept image edits, backups and edits moved aside are 0600. A staged or kept image edit gets a new name
   (`<stem>.<tag>-<UTC stamp>-<random>.<ext>`), created exclusively — never over or through an existing file.
+- The cache's fixed roots are dot-named — `<cache>/.backup`, `<cache>/.edits` (staged and kept image edits),
+  `<cache>/.exports` (local exports before they are published), `<cache>/.meta` — and a host label never starts with
+  `.`, so no mirrored host lands in one (a host named `backup` is `<cache>/backup/…`, plain cache). Roots an older
+  build made without the dot are just cache: never read or written.
+- What sopen knows about a cached copy lives outside the mirrored tree, where no remote path can reach it:
+  `<cache>/.meta/record/<host>/<abs path>` (the SHA-256 the copy held when last fetched or saved) and
+  `<cache>/.meta/lock/<host>/<abs path>` (host labels never start with `.`). Records from older versions, kept next
+  to the copy, are not read: such a copy counts as possibly edited and is moved aside on the next fetch.
 - One session at a time works on a cached copy: a session (`--app`, the terminal editor, a window) holds an advisory
-  lock on `.<name>.sopen-lock` next to it until it ends; a second session on the same file — or any session where
-  the copy cannot be locked — fetches into its own `<stem>.session-<random>.<ext>` (created exclusively) and says
-  so in one line. Records and edits moved aside are never written or chmodded through a symlink.
+  lock on it until it ends; a second session on the same file — or any session where the copy cannot be locked —
+  fetches into its own `<stem>.session-<random>.<ext>` (the copy itself created exclusively) and says so in one
+  line. The next session that claims the shared copy revisits ended sessions' copies (their lock is free): one
+  holding unsaved edits is moved aside and said, a clean one is removed; a running session's copy is never touched.
+  Records and edits moved aside are never written or chmodded through a symlink.
 - Nothing waits forever: ssh keepalives (10 s × 3), 30 s per SFTP request, 60 s without transfer progress. Only an
   SFTP status reply proves a rename, link or exclusive create did not happen; a timeout or a lost reply (connection
   closed, EOF, garbled reply) is "outcome unknown — check <path>", never "nothing was written", and a temp or export
   that may have been created is named, not removed.
 - Image Save (Cmd/Ctrl+S) overwrites the original **after** copying the fetched original to the local backup
-  `<cache>/backup/<host>/<abs path>.<UTC stamp>` and printing that path. "Save copy" writes `<stem>.edited.<ext>`
+  `<cache>/.backup/<host>/<abs path>.<UTC stamp>` and printing that path. "Save copy" writes `<stem>.edited.<ext>`
   next to the original instead. Media Export never overwrites (sibling file; `-N` suffix if the name exists): it is
   published by hard link from a temp, or — where links are unavailable — written into a name created exclusively.
 - Live receipts run only on files created under the remote `/tmp` for that purpose.

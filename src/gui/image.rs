@@ -712,9 +712,9 @@ pub struct ImageFile {
     /// The bytes as opened — what the backup holds. Kept in memory: a later fetch of the same
     /// file can replace the cached copy while this window is open.
     original: Arc<Vec<u8>>,
-    /// Encoded edits waiting to be uploaded, and refused ones: `<cache>/edits/<host>/<abs>`.
+    /// Encoded edits waiting to be uploaded, and refused ones: `<cache>/.edits/<host>/<abs>`.
     edits: PathBuf,
-    /// `<cache>` (backups go to `<cache>/backup/<host>/<abs>.<stamp>`).
+    /// `<cache>` (backups go to `<cache>/.backup/<host>/<abs>.<stamp>`).
     cache_root: PathBuf,
     /// Set by the first successful backup; later saves of the same session keep it.
     backup: Option<PathBuf>,
@@ -757,7 +757,7 @@ fn failed(e: &anyhow::Error, staged: &Path) -> anyhow::Error {
 
 impl ImageFile {
     pub fn new(origin: Origin, original: Vec<u8>, cache_root: &Path) -> Self {
-        let edits = crate::cache::cache_path(&cache_root.join("edits"), origin.host(), &origin.abs);
+        let edits = crate::cache::edits_path(cache_root, origin.host(), &origin.abs);
         Self {
             origin,
             original: Arc::new(original),
@@ -930,8 +930,8 @@ fn apply_state(doc: &mut Doc, sel: &mut Selection, block: &mut u32, hooks: &Hook
 }
 
 /// Opens the image: the window, or the windowless `SOPEN_AUTOSAVE` run.
-/// `notice` (where an earlier copy's unsaved edits went) is shown whole in the window's rows.
-pub fn open(file: ImageFile, hooks: &Hooks, notice: Option<String>) -> Result<Outcome> {
+/// `notices` (where earlier copies' unsaved edits went) are shown whole in the window's rows.
+pub fn open(file: ImageFile, hooks: &Hooks, notices: Vec<String>) -> Result<Outcome> {
     let mut doc = Doc::decode(file.original())?;
     let mut sel = Selection::default();
     let mut block = DEFAULT_BLOCK;
@@ -942,14 +942,14 @@ pub fn open(file: ImageFile, hooks: &Hooks, notice: Option<String>) -> Result<Ou
     let title = file.origin.display();
     let (w, h) = doc.size();
     // Before the owner acts, on the terminal too: what Save will not keep and what Save cannot
-    // do here (`notice` is already there: the caller printed it).
+    // do here (`notices` are already there: the caller printed them).
     if let Some(line) = doc.not_kept_line() {
         eprintln!("sopen: {line}");
     }
     if !file.can_replace() {
         eprintln!("sopen: {CANNOT_REPLACE}");
     }
-    let window = ImageWindow::new(file, doc, sel, block, notice);
+    let window = ImageWindow::new(file, doc, sel, block, notices);
     let outcome = window.outcome.clone();
     let leftover = window.leftover.clone();
     // A window that shows the image near 1:1 where the screen allows; eframe clamps to it.
@@ -1126,12 +1126,12 @@ impl Drop for ImageWindow {
 }
 
 impl ImageWindow {
-    /// The window as `open` makes it. `notice` (where an earlier copy's unsaved edits went)
+    /// The window as `open` makes it. `notices` (where earlier copies' unsaved edits went)
     /// and what Save cannot do here are read whole, in the always-visible rows, for the whole
     /// session; the one-line status is for short news.
-    fn new(file: ImageFile, doc: Doc, sel: Selection, block: u32, notice: Option<String>) -> Self {
+    fn new(file: ImageFile, doc: Doc, sel: Selection, block: u32, notices: Vec<String>) -> Self {
         let can_replace = file.can_replace();
-        let opened = notice
+        let opened = notices
             .into_iter()
             .chain((!can_replace).then(|| CANNOT_REPLACE.to_string()))
             .collect();
@@ -2074,7 +2074,9 @@ mod tests {
             panic!("expected Written")
         };
         assert_eq!(std::fs::read(&backup).unwrap(), original);
-        assert!(backup.starts_with(tmp.path().join("cache/backup/local")));
+        assert!(
+            backup.starts_with(crate::cache::backup_root(&tmp.path().join("cache")).join("local"))
+        );
         assert_eq!(std::fs::read(tmp.path().join("a.png")).unwrap(), encoded);
         // A second save in the same session goes over our own write and keeps the backup.
         doc.crop([0, 0, 10, 10]).unwrap();
@@ -2087,7 +2089,7 @@ mod tests {
         assert_eq!(again, backup);
         assert_eq!(std::fs::read(tmp.path().join("a.png")).unwrap(), second);
         // Nothing left in the edits staging area.
-        let edits = tmp.path().join("cache/edits");
+        let edits = crate::cache::edits_root(&tmp.path().join("cache"));
         let left: Vec<_> = walk(&edits);
         assert!(left.is_empty(), "{left:?}");
     }
@@ -2114,8 +2116,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let original = png_bytes(&gradient(30, 20));
         let mut file = local_file(tmp.path(), "a.png", &original);
-        let backups = tmp.path().join("cache/backup");
-        let edits = tmp.path().join("cache/edits");
+        let backups = crate::cache::backup_root(&tmp.path().join("cache"));
+        let edits = crate::cache::edits_root(&tmp.path().join("cache"));
         let mut seen_at_encode = Vec::new();
         let encoded = png_bytes(&gradient(30, 20).crop_imm(0, 0, 10, 10));
         let saved = file
@@ -2146,16 +2148,16 @@ mod tests {
         let msg = format!("{err:#}");
         assert!(msg.contains("injected encoder failure"), "{msg}");
         assert!(msg.contains("backed up at"), "{msg}");
-        let backups = walk(&tmp.path().join("cache/backup"));
+        let backups = walk(&crate::cache::backup_root(&tmp.path().join("cache")));
         assert_eq!(backups.len(), 1);
         assert_eq!(std::fs::read(&backups[0]).unwrap(), original);
         assert_eq!(std::fs::read(tmp.path().join("a.png")).unwrap(), original);
-        assert!(walk(&tmp.path().join("cache/edits")).is_empty());
+        assert!(walk(&crate::cache::edits_root(&tmp.path().join("cache"))).is_empty());
     }
 
     fn window_for(file: ImageFile, leftover: Arc<Mutex<Option<Job>>>) -> ImageWindow {
         let doc = Doc::decode(file.original()).unwrap();
-        let mut w = ImageWindow::new(file, doc, Selection::default(), DEFAULT_BLOCK, None);
+        let mut w = ImageWindow::new(file, doc, Selection::default(), DEFAULT_BLOCK, Vec::new());
         w.leftover = leftover;
         w
     }
@@ -2354,15 +2356,12 @@ mod tests {
             &mut self,
             local: &Path,
             p: &str,
-            mode: Option<u32>,
+            like: Option<crate::remote::Like>,
         ) -> std::result::Result<crate::remote::Uploaded, crate::remote::CreateError> {
-            self.0.create_from(local, p, mode)
+            self.0.create_from(local, p, like)
         }
         fn set_mode(&mut self, p: &str, mode: u32) -> Result<()> {
             self.0.set_mode(p, mode)
-        }
-        fn set_owner(&mut self, p: &str, uid: u32, gid: u32) -> Result<()> {
-            self.0.set_owner(p, uid, gid)
         }
         fn rename_over(&mut self, from: &str, to: &str) -> Result<()> {
             self.0.rename_over(from, to)
@@ -2400,7 +2399,7 @@ mod tests {
         assert!(err.contains("Save copy"), "{err}");
         assert_eq!(std::fs::read(&path).unwrap(), original, "untouched");
         assert!(
-            walk(&tmp.path().join("cache/backup")).is_empty(),
+            walk(&crate::cache::backup_root(&tmp.path().join("cache"))).is_empty(),
             "no backup"
         );
         let copy = file.save_copy(&encoded).unwrap();
@@ -2447,7 +2446,7 @@ mod tests {
         }
         assert_eq!(std::fs::read(&kept).unwrap(), encoded);
         // The backup took the next free name: the stamped one plus `-<random>`.
-        let backups: Vec<PathBuf> = walk(&file.cache_root.join("backup"))
+        let backups: Vec<PathBuf> = walk(&crate::cache::backup_root(&file.cache_root))
             .into_iter()
             .filter(|p| !planted.iter().any(|(q, _)| q == p))
             .collect();
@@ -2478,7 +2477,7 @@ mod tests {
             panic!("expected Refused")
         };
         let cache = tmp.path().join("cache");
-        let backups = walk(&cache.join("backup"));
+        let backups = walk(&crate::cache::backup_root(&cache));
         assert_eq!(backups.len(), 1);
         for f in [&backups[0], &kept] {
             assert_eq!(mode(f), 0o600, "{f:?}");

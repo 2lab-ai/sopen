@@ -312,14 +312,14 @@ fn request(media: &Media, marks: &Marks, crop: Option<[u32; 4]>) -> CutRequest {
     }
 }
 
-/// Opens the media file: the window, or the windowless `SOPEN_AUTOEXPORT` run. `notice` (where
-/// an earlier copy's unsaved edits went) is shown whole in the window's rows.
+/// Opens the media file: the window, or the windowless `SOPEN_AUTOEXPORT` run. `notices` (where
+/// earlier copies' unsaved edits went) are shown whole in the window's rows.
 pub fn open(
     mut origin: Origin,
     local: &Path,
     cache: &Path,
     hooks: &Hooks,
-    notice: Option<String>,
+    notices: Vec<String>,
 ) -> Result<Outcome> {
     let media = Media::probe(local)?;
     let state = &hooks.state;
@@ -335,7 +335,7 @@ pub fn open(
     if let (Some(r), Some(_)) = (state.rect, media.video) {
         sel.set(r);
     }
-    let work_root = cache.join("exports");
+    let work_root = crate::cache::exports_root(cache);
     if hooks.autoexport {
         let crop = media.source_size().and_then(|b| sel.pixels(b));
         let req = request(&media, &marks, crop);
@@ -368,7 +368,7 @@ pub fn open(
         ],
         None => [1000.0, 420.0],
     };
-    let mut window = MediaWindow::new(media, origin, work_root, marks, sel, notice);
+    let mut window = MediaWindow::new(media, origin, work_root, marks, sel, notices);
     window.export_hold = hooks.export_hold;
     let outcome = window.outcome.clone();
     let leftover = window.leftover.clone();
@@ -454,7 +454,7 @@ struct MediaWindow {
 }
 
 impl MediaWindow {
-    /// The window as `open` makes it. `notice` (where an earlier copy's unsaved edits went) is
+    /// The window as `open` makes it. `notices` (where earlier copies' unsaved edits went) are
     /// read whole, in the always-visible rows, for the whole session.
     fn new(
         media: Media,
@@ -462,7 +462,7 @@ impl MediaWindow {
         work_root: PathBuf,
         marks: Marks,
         sel: Selection,
-        notice: Option<String>,
+        notices: Vec<String>,
     ) -> Self {
         Self {
             media: Arc::new(media),
@@ -489,7 +489,7 @@ impl MediaWindow {
             sink: Sink::Device,
             map: None,
             timeline_rect: None,
-            opened: notice.into_iter().collect(),
+            opened: notices,
             notices: Vec::new(),
             pending_notices: None,
         }
@@ -1102,7 +1102,7 @@ mod tests {
             path,
             Marks::default(),
             Selection::default(),
-            None,
+            Vec::new(),
         );
         w.sink = Sink::Null;
         w.leftover = leftover.clone();

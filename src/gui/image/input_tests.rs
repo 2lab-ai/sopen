@@ -58,11 +58,11 @@ fn xmp_jpeg() -> Vec<u8> {
 }
 
 fn open_bytes(name: &str, bytes: Vec<u8>, w: f32, h: f32) -> Fixture {
-    open_noticed(name, bytes, w, h, None)
+    open_noticed(name, bytes, w, h, Vec::new())
 }
 
-/// As `open` does it, with `notice` (an earlier copy's unsaved edits were kept).
-fn open_noticed(name: &str, bytes: Vec<u8>, w: f32, h: f32, notice: Option<String>) -> Fixture {
+/// As `open` does it, with `notices` (where earlier copies' unsaved edits went).
+fn open_noticed(name: &str, bytes: Vec<u8>, w: f32, h: f32, notices: Vec<String>) -> Fixture {
     let tmp = tempfile::tempdir().unwrap();
     let path = tmp.path().join(name);
     std::fs::write(&path, &bytes).unwrap();
@@ -72,7 +72,7 @@ fn open_noticed(name: &str, bytes: Vec<u8>, w: f32, h: f32, notice: Option<Strin
     let origin = Origin::new(Box::new(fs), None, None, abs, at);
     let file = ImageFile::new(origin, bytes, &tmp.path().join("cache"));
     let doc = Doc::decode(file.original()).unwrap();
-    let win = ImageWindow::new(file, doc, Selection::default(), DEFAULT_BLOCK, notice);
+    let win = ImageWindow::new(file, doc, Selection::default(), DEFAULT_BLOCK, notices);
     let mut fx = Fixture {
         tmp,
         path,
@@ -275,7 +275,7 @@ fn save_button_and_command_s_save_to_disk() {
         }
         out
     }
-    let backups = files(&fx.tmp.path().join("cache/backup"));
+    let backups = files(&crate::cache::backup_root(&fx.tmp.path().join("cache")));
     assert_eq!(backups.len(), 1, "{backups:?}");
     assert_eq!(std::fs::read(&backups[0]).unwrap(), original);
 }
@@ -474,13 +474,13 @@ fn a_save_result_landing_between_press_and_drag_waits_for_the_release() {
 /// the status line stays free for short news.
 #[test]
 fn the_kept_copy_notice_is_shown_whole_on_open_and_stays() {
-    let notice = "the previous copy had unsaved edits; kept them at /Users/someone/Library/Caches/\
-                  sopen/example-host/home/someone/photos/2026/IMG_0001.png.conflict-20261116T101010Z"
+    let notice = "the previous copy had unsaved edits; kept them at <cache>/example-host/srv/\
+                  shared/archive/photographs/2026/november/IMG_0001.png.conflict-20261116T101010Z"
         .to_string();
     let bytes = encode(&coordinates(), ImageFormat::Png, None, None)
         .unwrap()
         .bytes;
-    let mut fx = open_noticed("shot.png", bytes, 640.0, 560.0, Some(notice.clone()));
+    let mut fx = open_noticed("shot.png", bytes, 640.0, 560.0, vec![notice.clone()]);
     fx.settle();
     assert!(fx.drv.find_text(&notice).is_some(), "shown whole on open");
     assert!(fx.win.status.text.is_empty(), "{}", fx.win.status.text);

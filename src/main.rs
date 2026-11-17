@@ -264,25 +264,35 @@ struct Fetched {
     /// The copy, locked for as long as this lives: another session gets a copy of its own.
     claim: cache::Claim,
     at: Stat,
-    /// Where an earlier copy's unsaved edits were moved (already printed).
-    kept: Option<PathBuf>,
+    /// Where earlier copies' unsaved edits went (already printed), for a window to repeat.
+    notices: Vec<String>,
 }
 
 /// Claims the cached copy of `abs` for this session, moves an earlier copy's unsaved edits
-/// aside, and fetches with a progress line; records size and fetch time. Every fetch into the
-/// cache goes through here, so no session replaces or moves a copy another one is editing.
+/// aside, fetches with a progress line, and records what the copy now holds; records size and
+/// fetch time. Every fetch into the cache goes through here, so no session replaces or moves a
+/// copy another one is editing.
 fn fetch_to_cache(place: &mut Place, abs: &str, dirs: &Dirs, rec: &mut Record) -> Result<Fetched> {
-    let cached = cache::cache_path(&dirs.cache, &place.host_label(), abs);
-    let claim = cache::claim(&cached)?;
+    let claim = cache::claim(&dirs.cache, &place.host_label(), abs)?;
     if let Some(note) = &claim.note {
         eprintln!("sopen: {note}");
     }
-    let kept = cache::set_aside_unsaved(&claim.local)?;
+    let mut notices = Vec::new();
+    for earlier in claim.tidy_session_copies() {
+        notices.push(format!(
+            "an earlier session's copy had unsaved edits; kept them at {}",
+            earlier.display()
+        ));
+    }
+    let kept = claim.set_aside_unsaved()?;
     if let Some(kept) = &kept {
-        eprintln!(
-            "sopen: the previous copy had unsaved edits; kept them at {}",
+        notices.push(format!(
+            "the previous copy had unsaved edits; kept them at {}",
             kept.display()
-        );
+        ));
+    }
+    for line in &notices {
+        eprintln!("sopen: {line}");
     }
     let (_, name) = remote::split_parent(abs);
     let mut progress = Progress::new(format!("fetching {name}"));
@@ -292,9 +302,14 @@ fn fetch_to_cache(place: &mut Place, abs: &str, dirs: &Dirs, rec: &mut Record) -
     });
     progress.finish();
     let at = fetched?;
+    if let Some(sha) = &at.sha256 {
+        if let Err(e) = claim.record(sha) {
+            sopen::debug!("not recorded: {e:#}");
+        }
+    }
     rec.fetch_ms = started.elapsed().as_millis() as u64;
     rec.bytes = at.size;
-    Ok(Fetched { claim, at, kept })
+    Ok(Fetched { claim, at, notices })
 }
 
 fn classify(fs: &mut dyn RemoteFs, abs: &str, stat: &Stat) -> Result<Kind> {
@@ -354,7 +369,7 @@ fn open_in_window(
     rec: &mut Record,
 ) -> Result<()> {
     let hooks = gui::Hooks::from_env()?;
-    let mut notice = None;
+    let mut notices = Vec::new();
     // Held until the window closes (media plays from the copy).
     let mut _claim = None;
     let (local, at) = match (&place, kind) {
@@ -366,12 +381,7 @@ fn open_in_window(
             // A copy with unsaved edits (an earlier `--app` / editor session) is kept, not
             // replaced by this fetch; the window repeats where it went.
             let fetched = fetch_to_cache(&mut place, abs, dirs, rec)?;
-            notice = fetched.kept.map(|kept| {
-                format!(
-                    "the previous copy had unsaved edits; kept them at {}",
-                    kept.display()
-                )
-            });
+            notices = fetched.notices;
             let local = fetched.claim.local.clone();
             _claim = Some(fetched.claim);
             (local, fetched.at)
@@ -396,9 +406,9 @@ fn open_in_window(
         let bytes =
             std::fs::read(&local).with_context(|| format!("cannot read {}", local.display()))?;
         let file = gui::image::ImageFile::new(origin, bytes, &dirs.cache);
-        gui::image::open(file, &hooks, notice)?
+        gui::image::open(file, &hooks, notices)?
     } else {
-        gui::media::open(origin, &local, &dirs.cache, &hooks, notice)?
+        gui::media::open(origin, &local, &dirs.cache, &hooks, notices)?
     };
     rec.action = Some(outcome.action());
     rec.conflict = outcome.conflict;
@@ -472,7 +482,7 @@ fn open_in_editor(
                 rec.action = Some("discard");
                 return Ok(());
             }
-            upload_back(place.fs(), &shown, local, abs, &at, rec)
+            upload_back(place.fs(), &shown, &claim, abs, &at, rec)
         }
     }
 }
@@ -519,7 +529,7 @@ fn open_in_app(
         rec.action = Some("discard");
         return Ok(());
     }
-    upload_back(place.fs(), &shown, local, abs, &at, rec)
+    upload_back(place.fs(), &shown, &claim, abs, &at, rec)
 }
 
 /// Does the fetched copy differ from what was fetched?
@@ -541,19 +551,26 @@ fn keep_edits(local: &Path, at: &Stat, e: anyhow::Error) -> anyhow::Error {
 
 /// Conflict-safe upload of an edited copy (spec §5). Whenever it does not land — a conflict
 /// (exit 3) or any failure — the edit is moved aside to `<copy>.conflict-<stamp>` first, so the
-/// next fetch cannot overwrite it, and the error prints that path.
+/// next fetch cannot overwrite it, and the error prints that path. A save that lands is what
+/// the copy holds from now on (its record).
 fn upload_back(
     fs: &mut dyn RemoteFs,
     shown: &str,
-    local: &Path,
+    copy: &cache::Claim,
     abs: &str,
     at: &Stat,
     rec: &mut Record,
 ) -> Result<()> {
+    let local = &copy.local;
     // The run is a save attempt from here on, whether it lands, conflicts or fails.
     rec.action = Some("save");
     match fs.write_atomic(local, abs, at.fingerprint()) {
-        Ok(WriteOutcome::Written { notes, .. }) => {
+        Ok(WriteOutcome::Written { now, notes }) => {
+            if let Some(sha) = &now.sha256 {
+                if let Err(e) = copy.record(sha) {
+                    sopen::debug!("not recorded: {e:#}");
+                }
+            }
             println!("saved {shown}");
             for note in notes {
                 eprintln!("sopen: {note}");
@@ -638,7 +655,7 @@ fn run_cut(
         &dir,
         &name,
         &req,
-        &dirs.cache.join("exports"),
+        &cache::exports_root(&dirs.cache),
         &mut |f| progress.fraction(f),
     );
     progress.finish();
@@ -681,16 +698,21 @@ mod tests {
         assert_eq!(human(1_500_000), "1.5 MB");
     }
 
-    /// A fetched copy of `body` at `<tmp>/cache/a.txt`, edited to `edit`.
-    fn edited_copy(tmp: &Path, body: &str, edit: &str) -> (PathBuf, PathBuf, Stat) {
+    /// `<tmp>/a.txt` holding `body`, fetched into the cache under `<tmp>/cache` (claimed for
+    /// as long as the returned claim lives) and edited to `edit`.
+    fn edited_copy(tmp: &Path, body: &str, edit: &str) -> (PathBuf, cache::Claim, Stat) {
         let target = tmp.join("a.txt");
         std::fs::write(&target, body).unwrap();
-        let local = tmp.join("cache/a.txt");
-        let at = LocalFs::new()
-            .fetch(target.to_str().unwrap(), &local, &mut |_, _| {})
-            .unwrap();
-        std::fs::write(&local, edit).unwrap();
-        (target, local, at)
+        let dirs = Dirs {
+            cache: tmp.join("cache"),
+            state: tmp.join("state"),
+        };
+        let abs = target.to_str().unwrap();
+        let mut place = Place::Local(LocalFs::new());
+        let Fetched { claim, at, .. } =
+            fetch_to_cache(&mut place, abs, &dirs, &mut Record::default()).unwrap();
+        std::fs::write(&claim.local, edit).unwrap();
+        (target, claim, at)
     }
 
     fn conflict_copies(dir: &Path) -> Vec<PathBuf> {
@@ -742,23 +764,192 @@ mod tests {
         let three = fetch_to_cache(&mut place, abs, &dirs, &mut rec).unwrap();
         assert_eq!(three.claim.local, first);
         assert_eq!(std::fs::read_to_string(&first).unwrap(), "v1");
-        let kept = three.kept.expect("the first session's edit was kept");
+        let kept = conflict_copies(first.parent().unwrap());
+        assert_eq!(kept.len(), 1, "{kept:?}");
         assert_eq!(
-            std::fs::read_to_string(kept).unwrap(),
+            std::fs::read_to_string(&kept[0]).unwrap(),
             "the first session's edit in progress"
+        );
+        assert_eq!(
+            three.notices,
+            [format!(
+                "the previous copy had unsaved edits; kept them at {}",
+                kept[0].display()
+            )]
+        );
+    }
+
+    /// The cache mirrors remote paths, so a remote file may be named like anything sopen keeps
+    /// about a copy (here: the old in-tree record and lock names). Such a file is just another
+    /// copy: fetching it replaces neither its sibling's record nor its lock.
+    #[test]
+    fn a_remote_file_named_like_sopen_bookkeeping_is_just_another_copy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let remote = tmp.path().join("remote");
+        std::fs::create_dir(&remote).unwrap();
+        let named = [
+            ("a.txt", "v1"),
+            (".a.txt.sopen-baseline", "a remote file 1"),
+            (".a.txt.sopen-lock", "a remote file 2"),
+        ];
+        for (name, body) in named {
+            std::fs::write(remote.join(name), body).unwrap();
+        }
+        let abs = |name: &str| remote.join(name).to_str().unwrap().to_string();
+        let dirs = Dirs {
+            cache: tmp.path().join("cache"),
+            state: tmp.path().join("state"),
+        };
+        let mut place = Place::Local(LocalFs::new());
+        let mut rec = Record::default();
+        let mut fetch =
+            |name: &str| fetch_to_cache(&mut place, &abs(name), &dirs, &mut rec).unwrap();
+        let one = fetch("a.txt");
+        let two = fetch(".a.txt.sopen-baseline");
+        let three = fetch(".a.txt.sopen-lock");
+        assert_eq!(
+            std::fs::read_to_string(&two.claim.local).unwrap(),
+            "a remote file 1"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&three.claim.local).unwrap(),
+            "a remote file 2"
+        );
+        // a.txt's lock still holds: another session on it gets a copy of its own.
+        let four = fetch("a.txt");
+        assert_ne!(four.claim.local, one.claim.local, "the lock was replaced");
+        // a.txt's record still says what its copy holds: once its sessions end, the next fetch
+        // finds nothing unsaved to move aside.
+        let first = one.claim.local.clone();
+        drop((one, four));
+        let five = fetch("a.txt");
+        assert_eq!(five.claim.local, first);
+        assert!(
+            five.notices.is_empty(),
+            "the record was replaced: {:?}",
+            five.notices
+        );
+    }
+
+    /// A save that lands is what the copy holds from then on: the next fetch finds nothing
+    /// unsaved to move aside.
+    #[test]
+    fn a_saved_copy_is_recorded_so_the_next_fetch_keeps_nothing_aside() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (target, copy, at) = edited_copy(tmp.path(), "v1", "my edit");
+        let abs = target.to_str().unwrap();
+        upload_back(
+            &mut LocalFs::new(),
+            "box:/a.txt",
+            &copy,
+            abs,
+            &at,
+            &mut Record::default(),
+        )
+        .unwrap();
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "my edit");
+        drop(copy);
+        let dirs = Dirs {
+            cache: tmp.path().join("cache"),
+            state: tmp.path().join("state"),
+        };
+        let mut place = Place::Local(LocalFs::new());
+        let again = fetch_to_cache(&mut place, abs, &dirs, &mut Record::default()).unwrap();
+        assert!(again.notices.is_empty(), "{:?}", again.notices);
+        assert_eq!(
+            std::fs::read_to_string(&again.claim.local).unwrap(),
+            "my edit"
+        );
+    }
+
+    /// A copy edited outside a session (or by one that ended without saving) is moved aside by
+    /// the next fetch, not overwritten, and the fetch says where it went.
+    #[test]
+    fn a_fetch_keeps_unsaved_edits_of_the_previous_copy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (target, copy, _) = edited_copy(tmp.path(), "v1", "unsaved edit");
+        let abs = target.to_str().unwrap().to_string();
+        drop(copy);
+        std::fs::write(&target, "v2").unwrap();
+        let dirs = Dirs {
+            cache: tmp.path().join("cache"),
+            state: tmp.path().join("state"),
+        };
+        let mut place = Place::Local(LocalFs::new());
+        let again = fetch_to_cache(&mut place, &abs, &dirs, &mut Record::default()).unwrap();
+        assert_eq!(std::fs::read_to_string(&again.claim.local).unwrap(), "v2");
+        let kept = conflict_copies(again.claim.local.parent().unwrap());
+        assert_eq!(kept.len(), 1, "{kept:?}");
+        assert_eq!(std::fs::read_to_string(&kept[0]).unwrap(), "unsaved edit");
+        assert!(
+            again.notices[0].ends_with(&*kept[0].to_string_lossy()),
+            "{:?}",
+            again.notices
+        );
+    }
+
+    /// Session copies are revisited when a later session claims the shared copy: one whose
+    /// session ended with unsaved edits is moved aside (and said), a clean one is removed, and
+    /// one whose session still runs is left alone.
+    #[test]
+    fn ended_sessions_copies_are_kept_aside_or_removed_on_the_next_claim() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("a.txt");
+        std::fs::write(&target, "v1").unwrap();
+        let abs = target.to_str().unwrap().to_string();
+        let dirs = Dirs {
+            cache: tmp.path().join("cache"),
+            state: tmp.path().join("state"),
+        };
+        let mut place = Place::Local(LocalFs::new());
+        let mut fetch = || fetch_to_cache(&mut place, &abs, &dirs, &mut Record::default()).unwrap();
+        let one = fetch();
+        let running = fetch();
+        std::fs::write(&running.claim.local, "still being edited").unwrap();
+        let edited = fetch();
+        std::fs::write(&edited.claim.local, "unsaved session edit").unwrap();
+        let clean = fetch();
+        let (edited_copy, clean_copy) = (edited.claim.local.clone(), clean.claim.local.clone());
+        let shared = one.claim.local.clone();
+        drop((edited, clean, one));
+        let again = fetch();
+        assert_eq!(again.claim.local, shared);
+        assert!(!clean_copy.exists(), "a clean session copy is removed");
+        assert!(
+            !edited_copy.exists(),
+            "an edited session copy is moved aside"
+        );
+        let kept = conflict_copies(shared.parent().unwrap());
+        assert_eq!(kept.len(), 1, "{kept:?}");
+        assert_eq!(
+            std::fs::read_to_string(&kept[0]).unwrap(),
+            "unsaved session edit"
+        );
+        assert_eq!(
+            again.notices,
+            [format!(
+                "an earlier session's copy had unsaved edits; kept them at {}",
+                kept[0].display()
+            )]
+        );
+        assert_eq!(
+            std::fs::read_to_string(&running.claim.local).unwrap(),
+            "still being edited",
+            "a running session's copy is never touched"
         );
     }
 
     #[test]
     fn w8_a_conflict_keeps_the_edit_aside_and_exits_3() {
         let tmp = tempfile::tempdir().unwrap();
-        let (target, local, at) = edited_copy(tmp.path(), "v1", "my edit");
+        let (target, copy, at) = edited_copy(tmp.path(), "v1", "my edit");
+        let local = copy.local.clone();
         std::fs::write(&target, "v2, someone else").unwrap();
         let mut rec = Record::default();
         let err = upload_back(
             &mut LocalFs::new(),
             "box:/a.txt",
-            &local,
+            &copy,
             target.to_str().unwrap(),
             &at,
             &mut rec,
@@ -766,7 +957,7 @@ mod tests {
         .unwrap_err();
         assert!(err.chain().any(|c| c.is::<Refused>()));
         assert!(rec.conflict);
-        let kept = conflict_copies(&tmp.path().join("cache"));
+        let kept = conflict_copies(local.parent().unwrap());
         assert_eq!(kept.len(), 1);
         assert_eq!(std::fs::read_to_string(&kept[0]).unwrap(), "my edit");
         assert!(
@@ -779,7 +970,8 @@ mod tests {
     #[test]
     fn w8_any_failed_upload_keeps_the_edit_aside() {
         let tmp = tempfile::tempdir().unwrap();
-        let (target, local, at) = edited_copy(tmp.path(), "v1", "my edit");
+        let (target, copy, at) = edited_copy(tmp.path(), "v1", "my edit");
+        let local = copy.local.clone();
         // The remote directory refuses new files (unless running as root, which ignores modes).
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
         if std::fs::metadata(&local).unwrap().uid() == 0 {
@@ -791,7 +983,7 @@ mod tests {
         let result = upload_back(
             &mut LocalFs::new(),
             "box:/a.txt",
-            &local,
+            &copy,
             target.to_str().unwrap(),
             &at,
             &mut rec,
@@ -804,7 +996,7 @@ mod tests {
         );
         let msg = format!("{err:#}");
         assert!(msg.contains("was not replaced"), "{msg}");
-        let kept = conflict_copies(&tmp.path().join("cache"));
+        let kept = conflict_copies(local.parent().unwrap());
         assert_eq!(kept.len(), 1);
         assert_eq!(std::fs::read_to_string(&kept[0]).unwrap(), "my edit");
         assert!(msg.contains(&kept[0].display().to_string()), "{msg}");
@@ -869,15 +1061,12 @@ mod tests {
             &mut self,
             local: &Path,
             path: &str,
-            mode: Option<u32>,
+            like: Option<remote::Like>,
         ) -> std::result::Result<remote::Uploaded, remote::CreateError> {
-            self.0.create_from(local, path, mode)
+            self.0.create_from(local, path, like)
         }
         fn set_mode(&mut self, path: &str, mode: u32) -> Result<()> {
             self.0.set_mode(path, mode)
-        }
-        fn set_owner(&mut self, path: &str, uid: u32, gid: u32) -> Result<()> {
-            self.0.set_owner(path, uid, gid)
         }
         fn rename_over(&mut self, from: &str, to: &str) -> Result<()> {
             self.0.rename_over(from, to)?;
@@ -896,17 +1085,18 @@ mod tests {
     #[test]
     fn w8_editor_failure_keeps_an_edited_copy() {
         let tmp = tempfile::tempdir().unwrap();
-        let (_, local, at) = edited_copy(tmp.path(), "v1", "half-done edit");
-        let err = keep_edits(&local, &at, anyhow::anyhow!("vi exited with 1"));
-        let kept = conflict_copies(&tmp.path().join("cache"));
+        let (_, copy, at) = edited_copy(tmp.path(), "v1", "half-done edit");
+        let err = keep_edits(&copy.local, &at, anyhow::anyhow!("vi exited with 1"));
+        let kept = conflict_copies(copy.local.parent().unwrap());
         assert_eq!(kept.len(), 1);
         assert!(err.to_string().contains("your edited copy is at"), "{err}");
 
         // An untouched copy stays where it is; there is nothing to keep.
-        let (_, local, at) = edited_copy(tmp.path(), "v1", "v1");
-        let err = keep_edits(&local, &at, anyhow::anyhow!("vi exited with 1"));
+        drop(copy);
+        let (_, copy, at) = edited_copy(tmp.path(), "v1", "v1");
+        let err = keep_edits(&copy.local, &at, anyhow::anyhow!("vi exited with 1"));
         assert_eq!(err.to_string(), "vi exited with 1");
-        assert!(local.exists());
+        assert!(copy.local.exists());
     }
 
     impl Cli {

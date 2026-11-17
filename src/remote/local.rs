@@ -1,6 +1,6 @@
 //! [`RemoteFs`] on the local disk: local targets, and the implementation every test runs against.
 
-use super::{CreateError, Created, Hashing, RemoteFs, Stat, Uploaded};
+use super::{CreateError, Created, Hashing, Like, RemoteFs, Stat, Uploaded};
 use anyhow::{anyhow, Context, Result};
 use std::fs;
 use std::io::{ErrorKind, Read, Write};
@@ -108,7 +108,7 @@ impl RemoteFs for LocalFs {
         &mut self,
         local: &Path,
         path: &str,
-        mode: Option<u32>,
+        like: Option<Like>,
     ) -> std::result::Result<Uploaded, CreateError> {
         let mut src = fs::File::open(local)
             .with_context(|| format!("cannot open {}", local.display()))
@@ -118,13 +118,17 @@ impl RemoteFs for LocalFs {
         let dst = fs::OpenOptions::new()
             .write(true)
             .create_new(true)
-            .mode(if mode.is_some() { 0o600 } else { 0o666 })
+            .mode(if like.is_some() { 0o600 } else { 0o666 })
             .open(path)
             .with_context(|| format!("cannot create {path}"))
             .map_err(|e| CreateError::new(Created::No, e))?;
         let mut fill = || -> Result<Uploaded> {
-            if let Some(mode) = mode {
-                dst.set_permissions(fs::Permissions::from_mode(mode))
+            if let Some(like) = like {
+                // Through the open file: owner first (a chown can clear set-id bits), then mode.
+                if let Err(e) = std::os::unix::fs::fchown(&dst, Some(like.uid), Some(like.gid)) {
+                    crate::debug!("fchown {path}: {e}");
+                }
+                dst.set_permissions(fs::Permissions::from_mode(like.mode))
                     .with_context(|| format!("cannot set mode on {path}"))?;
             }
             let mut out = Hashing::new(&dst);
@@ -140,11 +144,6 @@ impl RemoteFs for LocalFs {
     fn set_mode(&mut self, path: &str, mode: u32) -> Result<()> {
         fs::set_permissions(path, fs::Permissions::from_mode(mode))
             .with_context(|| format!("cannot set mode on {path}"))
-    }
-
-    fn set_owner(&mut self, path: &str, uid: u32, gid: u32) -> Result<()> {
-        std::os::unix::fs::lchown(path, Some(uid), Some(gid))
-            .with_context(|| format!("cannot set owner {uid}:{gid} on {path}"))
     }
 
     fn rename_over(&mut self, from: &str, to: &str) -> Result<()> {

@@ -51,7 +51,8 @@ struct Hooks {
     fail_remove: bool,
     /// Another writer appends to the target right after our rename lands.
     grow_after_rename: bool,
-    /// Temps look owned by another uid; `owner_fix_works` decides whether set_owner helps.
+    /// Temps look owned by another uid; `owner_fix_works` decides whether giving them the
+    /// target's owner (through the handle, in `create_from`) helps.
     foreign_temp_owner: bool,
     owner_fix_works: bool,
     /// The server leaves this attribute out of the target's stat.
@@ -63,6 +64,9 @@ struct Hooks {
     /// The request reaches the server and takes effect, but its reply is lost (connection
     /// closed): "rename", "link" or "create".
     lost_reply: Option<&'static str>,
+    /// Right after the temp is created and filled, someone with write access to the
+    /// directory replaces it with a symlink to this file.
+    temp_swapped_for_link_to: Option<PathBuf>,
 }
 
 #[derive(Default)]
@@ -128,13 +132,20 @@ impl RemoteFs for Hooked {
         &mut self,
         local: &Path,
         path: &str,
-        mode: Option<u32>,
+        like: Option<Like>,
     ) -> std::result::Result<Uploaded, CreateError> {
+        if like.is_some() && self.h.foreign_temp_owner && self.h.owner_fix_works {
+            self.owner_fixed = true;
+        }
         if self.h.take_temp_name && is_temp(path.rsplit('/').next().unwrap()) {
             std::fs::write(path, "theirs").unwrap();
         }
         self.race(path);
-        let up = self.inner.create_from(local, path, mode)?;
+        let up = self.inner.create_from(local, path, like)?;
+        if let Some(victim) = &self.h.temp_swapped_for_link_to {
+            std::fs::remove_file(path).unwrap();
+            std::os::unix::fs::symlink(victim, path).unwrap();
+        }
         if self.h.lost_reply == Some("create") {
             return Err(CreateError::new(
                 Created::Unknown,
@@ -151,13 +162,6 @@ impl RemoteFs for Hooked {
     }
     fn set_mode(&mut self, path: &str, mode: u32) -> Result<()> {
         self.inner.set_mode(path, mode)
-    }
-    fn set_owner(&mut self, path: &str, uid: u32, gid: u32) -> Result<()> {
-        if self.h.foreign_temp_owner && !self.h.owner_fix_works {
-            bail!("simulated: operation not permitted");
-        }
-        self.owner_fixed = true;
-        self.inner.set_owner(path, uid, gid)
     }
     fn rename_over(&mut self, from: &str, to: &str) -> Result<()> {
         self.renames += 1;
@@ -281,11 +285,8 @@ fn fetch_then_write_atomic_happy_path_keeps_mode() {
         .unwrap();
     assert!(matches!(again, WriteOutcome::Written { .. }), "{again:?}");
     assert_eq!(std::fs::read_to_string(&target).unwrap(), "echo three\n");
-
-    // The saved copy is the new baseline: fetching again keeps nothing aside.
-    fs.fetch(p(&target), &local, &mut |_, _| {}).unwrap();
-    let names: Vec<_> = fs.list_dir(p(local.parent().unwrap())).unwrap();
-    assert!(!names.iter().any(|n| n.contains(".conflict-")), "{names:?}");
+    // (That the saved copy is then recorded, so the next fetch keeps nothing aside, is the
+    // cache's part: `main::tests::a_saved_copy_is_recorded_so_the_next_fetch_keeps_nothing_aside`.)
 }
 
 #[test]
@@ -442,6 +443,41 @@ fn w3_a_writer_right_after_the_rename_is_reported_and_poisons_the_baseline() {
         std::fs::read_to_string(&target).unwrap(),
         "mine + another writer"
     );
+}
+
+/// Owner and mode are given to the temp through its open handle, never by path afterwards: a
+/// temp swapped for a symlink right after it was written is refused, and the file the link
+/// points at keeps its mode.
+#[test]
+fn a_temp_swapped_for_a_link_is_never_chmodded_through() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (target, local, at) = fetched(tmp.path(), "a.txt", "v1");
+    std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o640)).unwrap();
+    let at = LocalFs::new()
+        .stat(p(&target))
+        .map(|s| Stat {
+            sha256: at.sha256,
+            ..s
+        })
+        .unwrap();
+    std::fs::write(&local, "edit").unwrap();
+    let victim = tmp.path().join("victim");
+    std::fs::write(&victim, "someone's").unwrap();
+    std::fs::set_permissions(&victim, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let mut fs = Hooked::new(Hooks {
+        temp_swapped_for_link_to: Some(victim.clone()),
+        ..Hooks::default()
+    });
+    let err = fs
+        .write_atomic(&local, p(&target), at.fingerprint())
+        .unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(msg.contains("was not replaced"), "{msg}");
+    let mode = std::fs::metadata(&victim).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o644, "chmodded through the link");
+    assert_eq!(std::fs::read_to_string(&victim).unwrap(), "someone's");
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "v1");
+    assert_eq!(fs.renames, 0);
 }
 
 #[test]
@@ -780,57 +816,6 @@ fn w1_concurrent_publishers_never_lose_a_file() {
         }
         assert!(temps(&dir).is_empty(), "{:?}", temps(&dir));
     }
-}
-
-#[test]
-fn fetch_keeps_unsaved_edits_of_the_previous_copy() {
-    let tmp = tempfile::tempdir().unwrap();
-    let (target, local, _) = fetched(tmp.path(), "a.txt", "v1");
-    std::fs::write(&local, "unsaved edit").unwrap();
-    std::fs::write(&target, "v2").unwrap();
-    let at = LocalFs::new()
-        .fetch(p(&target), &local, &mut |_, _| {})
-        .unwrap();
-    assert_eq!(std::fs::read_to_string(&local).unwrap(), "v2");
-    assert_eq!(at.sha256, Some(sha(b"v2")));
-    let kept: Vec<_> = std::fs::read_dir(local.parent().unwrap())
-        .unwrap()
-        .map(|e| e.unwrap().path())
-        .filter(|p| p.to_string_lossy().contains(".conflict-"))
-        .collect();
-    assert_eq!(kept.len(), 1, "{kept:?}");
-    assert_eq!(std::fs::read_to_string(&kept[0]).unwrap(), "unsaved edit");
-}
-
-/// A fetched copy and the cache directories made for it are the owner's only (0600 / 0700),
-/// whatever the umask lets through; so is an edit moved aside, even one an editor rewrote with
-/// the umask's mode.
-#[test]
-fn fetched_copies_and_kept_edits_are_owner_only() {
-    if crate::testutil::rerun_under_umask_022(
-        "remote::tests::fetched_copies_and_kept_edits_are_owner_only",
-    ) {
-        return;
-    }
-    let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
-    let tmp = tempfile::tempdir().unwrap();
-    let target = tmp.path().join("a.txt");
-    std::fs::write(&target, "v1").unwrap();
-    let cache = tmp.path().join("cache");
-    let local = cache.join("box/srv/a.txt");
-    LocalFs::new()
-        .fetch(p(&target), &local, &mut |_, _| {})
-        .unwrap();
-    assert_eq!(mode(&local), 0o600);
-    for dir in local.parent().unwrap().ancestors().take(3) {
-        assert_eq!(mode(dir), 0o700, "{dir:?}");
-    }
-    // The editor replaced the copy with a file of the umask's mode.
-    std::fs::remove_file(&local).unwrap();
-    std::fs::write(&local, "edit").unwrap();
-    std::fs::set_permissions(&local, std::fs::Permissions::from_mode(0o644)).unwrap();
-    let kept = crate::cache::set_aside(&local).unwrap();
-    assert_eq!(mode(&kept), 0o600);
 }
 
 #[test]
