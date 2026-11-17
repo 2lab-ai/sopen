@@ -1,5 +1,5 @@
 //! One JSON line per run in `<state>/usage.jsonl` (spec §8), for the two-week review (§10).
-//! Local only, never sent anywhere. The host is a short hash, never the name.
+//! Local only, never sent anywhere. Hosts are short hashes, never names.
 
 use crate::kind::Kind;
 use anyhow::{Context, Result};
@@ -21,6 +21,8 @@ pub struct Record {
     pub conflict: bool,
     /// False when the run ended in an error (§10: a failed write is fixed before anything else).
     pub ok: bool,
+    /// `[user@]host` the open was forwarded to (`--target`, spec §4a); `None` = opened here.
+    pub target: Option<String>,
 }
 
 /// First 12 hex characters of SHA-256 over the host label: stable per host, not reversible to
@@ -41,6 +43,8 @@ pub fn line(rec: &Record, at: SystemTime) -> String {
         "action": rec.action,
         "conflict": rec.conflict,
         "ok": rec.ok,
+        "forwarded": rec.target.is_some(),
+        "target_hash": rec.target.as_deref().map(host_hash),
     })
     .to_string()
 }
@@ -74,10 +78,12 @@ mod tests {
             action: Some("cut"),
             conflict: false,
             ok: true,
+            target: Some("me@view-box".into()),
         };
         let at = SystemTime::UNIX_EPOCH + Duration::from_secs(86_400);
         let text = line(&rec, at);
         assert!(!text.contains("build-box"), "{text}");
+        assert!(!text.contains("view-box"), "{text}");
         let v: serde_json::Value = serde_json::from_str(&text).unwrap();
         assert_eq!(v["ts"], "1970-01-02T00:00:00Z");
         assert_eq!(v["host_hash"].as_str().unwrap().len(), 12);
@@ -87,6 +93,11 @@ mod tests {
         assert_eq!(v["fetch_ms"], 56);
         assert_eq!(v["action"], "cut");
         assert_eq!(v["conflict"], false);
+        assert_eq!(v["forwarded"], true);
+        assert_eq!(
+            v["target_hash"].as_str(),
+            Some(host_hash("me@view-box").as_str())
+        );
         assert_eq!(host_hash("a"), host_hash("a"));
         assert_ne!(host_hash("a"), host_hash("b"));
     }
@@ -100,5 +111,8 @@ mod tests {
         let text = std::fs::read_to_string(tmp.path().join("usage.jsonl")).unwrap();
         assert_eq!(text.lines().count(), 2);
         assert!(text.contains("\"host_hash\":\"local\""));
+        let v: serde_json::Value = serde_json::from_str(text.lines().next().unwrap()).unwrap();
+        assert_eq!(v["forwarded"], false);
+        assert!(v["target_hash"].is_null(), "{text}");
     }
 }

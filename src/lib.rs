@@ -1,14 +1,17 @@
 //! sopen: open a file or folder on another machine as if it were local. Spec: `.prd/01-spec.md`.
 //!
-//! Module map: [`target`] parses the scp-style argument, [`remote`] is the file layer (SFTP over the
-//! system ssh, or the local disk), [`kind`] routes by type, [`zed`] / [`app`] hand the file to an
-//! editor, [`ffmpeg`] / [`cut`] cut media, [`cache`] owns local paths, [`usage`] appends the run
-//! log.
+//! Module map: [`target`] parses the scp-style argument, [`forward`] decides where it opens (here,
+//! or on another machine's screen — [`config`] holds the default), [`remote`] is the file layer
+//! (SFTP over the system ssh, or the local disk), [`kind`] routes by type, [`zed`] / [`app`] hand
+//! the file to an editor, [`ffmpeg`] / [`cut`] cut media, [`cache`] owns local paths, [`usage`]
+//! appends the run log.
 
 pub mod app;
 pub mod cache;
+pub mod config;
 pub mod cut;
 pub mod ffmpeg;
+pub mod forward;
 pub mod gui;
 pub mod kind;
 pub mod remote;

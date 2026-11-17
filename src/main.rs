@@ -1,5 +1,6 @@
-//! `sopen` CLI. Routing per spec §3; every error is one line on stderr and a non-zero exit
-//! (1 = error, 3 = a write refused because the remote changed).
+//! `sopen` CLI. Where it opens per spec §4a, routing per spec §3; every error is one line on
+//! stderr and a non-zero exit (1 = error, 3 = a write refused because the remote changed). A run
+//! forwarded to another machine leaves with that machine's exit code.
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
@@ -11,7 +12,7 @@ use sopen::kind::{self, Kind};
 use sopen::remote::{self, LocalFs, RemoteFs, SftpRemote, Stat, WriteOutcome};
 use sopen::target::{self, RemoteSpec, Target};
 use sopen::usage::Record;
-use sopen::{app, zed};
+use sopen::{app, config, forward, zed};
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -26,8 +27,11 @@ const EXIT_CONFLICT: u8 = 3;
     version = sopen::version_text(),
     about = "Open a file or folder on another machine as if it were local",
     long_about = "Open a file or folder on another machine as if it were local.\n\n\
-        TARGET uses scp syntax: [user@]host:path (relative paths are under the remote home) or a \
-        local path. Folders and text open in Zed; other files are fetched to the local cache.",
+        SOURCE uses scp syntax: [user@]host:path (relative paths are under the remote home) or a \
+        local path. Folders and text open in Zed; other files are fetched to the local cache.\n\n\
+        It opens on this machine, or with --target HOST on HOST's screen (sopen runs there, \
+        started over ssh). SOPEN_TARGET or `sopen config target HOST` make a HOST the default; \
+        --here opens on this machine anyway.",
     args_conflicts_with_subcommands = true,
     subcommand_negates_reqs = true
 )]
@@ -35,14 +39,25 @@ struct Cli {
     #[command(subcommand)]
     cmd: Option<Cmd>,
     /// [user@]host:path, or a local path
-    #[arg(required_unless_present = "selftest_audio")]
+    #[arg(value_name = "SOURCE", required_unless_present = "selftest_audio")]
+    source: Option<String>,
+    /// Open on HOST's screen instead of this machine's (sopen runs on HOST, over ssh)
+    #[arg(long, value_name = "HOST", conflicts_with = "here")]
     target: Option<String>,
+    /// Open on this machine, whatever SOPEN_TARGET or the config say
+    #[arg(long)]
+    here: bool,
     /// Open a copy in this local app; Enter in the terminal uploads the changes
     #[arg(long, value_name = "APP")]
     app: Option<String>,
     /// Receipt check: play FILE on the real audio device at gain 0 for ~2 s and print the
     /// callback / underrun counts (AGENTS.md "Receipts").
-    #[arg(long, hide = true, value_name = "FILE", conflicts_with_all = ["target", "app"])]
+    #[arg(
+        long,
+        hide = true,
+        value_name = "FILE",
+        conflicts_with_all = ["source", "app", "target", "here"]
+    )]
     selftest_audio: Option<PathBuf>,
 }
 
@@ -51,6 +66,7 @@ enum Cmd {
     /// Cut IN..OUT of an audio/video file into a new file next to it (never overwrites)
     Cut {
         /// [user@]host:path, or a local path
+        #[arg(value_name = "SOURCE")]
         target: String,
         /// Start: SS, MM:SS or HH:MM:SS(.ms)
         #[arg(value_name = "IN")]
@@ -61,6 +77,24 @@ enum Cmd {
         /// Crop the video to this rectangle in source pixels
         #[arg(long, value_name = "X,Y,W,H")]
         crop: Option<String>,
+    },
+    /// Show the config file, or set where `sopen SOURCE` opens by default
+    Config {
+        #[command(subcommand)]
+        key: Option<ConfigKey>,
+    },
+}
+
+#[derive(Subcommand)]
+enum ConfigKey {
+    /// Open on HOST by default (--here and --target still decide one run)
+    Target {
+        /// [user@]host, as --target takes it
+        #[arg(value_name = "HOST", required_unless_present = "unset")]
+        host: Option<String>,
+        /// Open on this machine by default again
+        #[arg(long, conflicts_with = "host")]
+        unset: bool,
     },
 }
 
@@ -92,31 +126,42 @@ fn main() -> ExitCode {
     }
     let mut rec = Record::default();
     let dirs = cache::dirs();
-    let result = dirs
-        .as_ref()
-        .map_err(|e| anyhow::anyhow!("{e:#}"))
-        .and_then(|dirs| match cli.cmd {
-            Some(Cmd::Cut {
-                target,
-                start,
-                end,
-                crop,
-            }) => run_cut(&target, &start, &end, crop.as_deref(), dirs, &mut rec),
-            None => run_open(
-                cli.target.as_deref().unwrap_or_default(),
+    let with_dirs = || dirs.as_ref().map_err(|e| anyhow::anyhow!("{e:#}"));
+    let result = match cli.cmd {
+        // Not a run on a file: no usage line.
+        Some(Cmd::Config { key }) => return exit(run_config(key).map(|()| 0)),
+        Some(Cmd::Cut {
+            target,
+            start,
+            end,
+            crop,
+        }) => with_dirs().and_then(|dirs| {
+            run_cut(&target, &start, &end, crop.as_deref(), dirs, &mut rec).map(|()| 0)
+        }),
+        None => with_dirs().and_then(|dirs| {
+            run_source(
+                cli.source.as_deref().unwrap_or_default(),
+                cli.target.as_deref(),
+                cli.here,
                 cli.app.as_deref(),
                 dirs,
                 &mut rec,
-            ),
-        });
-    rec.ok = result.is_ok();
+            )
+        }),
+    };
+    rec.ok = matches!(result, Ok(0));
     if let Ok(dirs) = &dirs {
         if let Err(e) = sopen::usage::append(&dirs.state, &rec) {
             sopen::debug!("usage log not written: {e:#}");
         }
     }
+    exit(result)
+}
+
+/// The exit code: a forwarded run's own, else 0, or 1 / 3 with the error on one stderr line.
+fn exit(result: Result<u8>) -> ExitCode {
     match result {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(code) => ExitCode::from(code),
         Err(e) => {
             let line = format!("{e:#}").replace('\n', " ");
             eprintln!("sopen: {line}");
@@ -290,6 +335,70 @@ fn classify(fs: &mut dyn RemoteFs, abs: &str, stat: &Stat) -> Result<Kind> {
     }
     let head = fs.read_head(abs, kind::SNIFF_BYTES)?;
     Ok(kind::classify(name, || head, stat.size))
+}
+
+/// `sopen config [target HOST | target --unset]`.
+fn run_config(key: Option<ConfigKey>) -> Result<()> {
+    let path = config::path()?;
+    match key {
+        None => {
+            let current = config::load(&path)?;
+            println!("{}", path.display());
+            match current.target {
+                Some(host) => println!("target = {host}"),
+                None => println!("target is not set"),
+            }
+            if let Some(host) = std::env::var("SOPEN_TARGET").ok().filter(|h| !h.is_empty()) {
+                println!("SOPEN_TARGET={host} is set in this environment and comes first");
+            }
+        }
+        Some(ConfigKey::Target { unset: true, .. }) => {
+            config::unset_target(&path)?;
+            println!("target is not set ({})", path.display());
+        }
+        Some(ConfigKey::Target { host, .. }) => {
+            let host = host.context("give a HOST, or --unset")?;
+            config::set_target(&path, &host)?;
+            println!("target = {host} ({})", path.display());
+        }
+    }
+    Ok(())
+}
+
+/// `sopen SOURCE`: on this machine, or forwarded to the target HOST (spec §4a). Returns the exit
+/// code — HOST's own when forwarded.
+fn run_source(
+    source: &str,
+    flag: Option<&str>,
+    here: bool,
+    app_name: Option<&str>,
+    dirs: &Dirs,
+    rec: &mut Record,
+) -> Result<u8> {
+    let env = match std::env::var("SOPEN_TARGET") {
+        Ok(host) => Some(host),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(std::env::VarError::NotUnicode(_)) => bail!("SOPEN_TARGET is not valid UTF-8"),
+    };
+    let chosen = forward::choose(here, flag, env.as_deref(), || {
+        Ok(config::load(&config::path()?)?.target)
+    })?;
+    let short = forward::short_hostname();
+    let host = match chosen {
+        Some(host) if !forward::is_here(&host, short.as_deref()) => host,
+        _ => return run_open(source, app_name, dirs, rec).map(|()| 0),
+    };
+    let there = forward::source_for(&host, source, short.as_deref(), |path| {
+        LocalFs::new().realpath(path)
+    })?;
+    if let Ok(Target::Remote(spec)) = target::parse(source) {
+        rec.host = Some(spec.label());
+    }
+    rec.ext = kind::extension(remote::split_parent(&there).1);
+    rec.action = Some("open");
+    rec.target = Some(host.clone());
+    sopen::debug!("opening {there} on {host}");
+    forward::run(&host, &there, app_name, &dirs.state)
 }
 
 fn run_open(arg: &str, app_name: Option<&str>, dirs: &Dirs, rec: &mut Record) -> Result<()> {
@@ -633,8 +742,41 @@ mod tests {
     fn cli_shapes() {
         Cli::command_for_test().debug_assert();
         let cli = Cli::try_parse_from(["sopen", "box:/a.bin", "--app", "ImHex"]).unwrap();
-        assert_eq!(cli.target.as_deref(), Some("box:/a.bin"));
+        assert_eq!(cli.source.as_deref(), Some("box:/a.bin"));
         assert_eq!(cli.app.as_deref(), Some("ImHex"));
+        assert!(cli.target.is_none() && !cli.here);
+        let cli = Cli::try_parse_from(["sopen", "--target", "me@box", "src:/a.png"]).unwrap();
+        assert_eq!(cli.target.as_deref(), Some("me@box"));
+        assert_eq!(cli.source.as_deref(), Some("src:/a.png"));
+        assert!(Cli::try_parse_from(["sopen", "--here", "--target", "box", "a"]).is_err());
+        assert!(Cli::try_parse_from(["sopen", "--target", "box", "cut", "a", "1", "2"]).is_err());
+        // What HOST's sopen is given: after `--`, even a subcommand's name or a leading `-` is
+        // SOURCE, and so is an empty SOURCE (HOST's home).
+        for source in ["cut", "config", "-x.png", ""] {
+            let cli = Cli::try_parse_from(["sopen", "--here", "--", source]).unwrap();
+            assert!(cli.cmd.is_none(), "{source}");
+            assert_eq!(cli.source.as_deref(), Some(source));
+            assert!(cli.here);
+        }
+        let cli = Cli::try_parse_from(["sopen", "config", "target", "box"]).unwrap();
+        assert!(matches!(
+            cli.cmd,
+            Some(Cmd::Config { key: Some(ConfigKey::Target { host: Some(ref h), unset: false }) }) if h == "box"
+        ));
+        let cli = Cli::try_parse_from(["sopen", "config", "target", "--unset"]).unwrap();
+        assert!(matches!(
+            cli.cmd,
+            Some(Cmd::Config {
+                key: Some(ConfigKey::Target {
+                    host: None,
+                    unset: true
+                })
+            })
+        ));
+        assert!(Cli::try_parse_from(["sopen", "config", "target"]).is_err());
+        assert!(Cli::try_parse_from(["sopen", "config", "target", "box", "--unset"]).is_err());
+        let cli = Cli::try_parse_from(["sopen", "config"]).unwrap();
+        assert!(matches!(cli.cmd, Some(Cmd::Config { key: None })));
         let cli = Cli::try_parse_from([
             "sopen",
             "cut",

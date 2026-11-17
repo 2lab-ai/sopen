@@ -16,6 +16,7 @@ use openssh_sftp_client::error::{Error as SftpErr, SftpErrorKind};
 use openssh_sftp_client::fs::Fs;
 use openssh_sftp_client::metadata::{MetaData, MetaDataBuilder, Permissions};
 use openssh_sftp_client::{Sftp, SftpOptions};
+use std::ffi::OsString;
 use std::future::Future;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -236,6 +237,22 @@ fn create_private_dir(dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// The connection options of sopen's multiplexed master for `dest`, for an ssh that runs a
+/// command there (`--target`, spec §4a): `-S <ControlPath>` and [`master_options`]. With
+/// `ControlMaster=auto` that ssh attaches to a running master or becomes one.
+pub fn connection_args(dest: &str, state_dir: &Path) -> Result<Vec<OsString>> {
+    Ok(connection_args_for(&ssh_config(dest, state_dir)?))
+}
+
+fn connection_args_for(config: &SshConfig) -> Vec<OsString> {
+    let mut args = vec![
+        OsString::from("-S"),
+        config.control_path.clone().into_os_string(),
+    ];
+    args.extend(master_options(config).into_iter().map(OsString::from));
+    args
+}
+
 /// Options for a new master: multiplexing, keepalives (a dead link drops the master after
 /// ~30 s instead of hanging every request), and a connect bound unless the config has one.
 /// Command-line `-o` wins over `~/.ssh/config`.
@@ -272,9 +289,7 @@ fn ensure_master(dest: &str, config: &SshConfig) -> Result<()> {
         return Ok(());
     }
     let mut cmd = Command::new("ssh");
-    cmd.arg("-S")
-        .arg(ctl)
-        .args(master_options(config))
+    cmd.args(connection_args_for(config))
         .args(["-f", "-N", dest])
         // Prompts (passphrase, host key) go through the terminal as they do for plain ssh.
         .stdout(Stdio::null());
@@ -585,6 +600,20 @@ mod tests {
         assert!(set.connect_timeout_set);
         assert!(!master_options(&set).join(" ").contains("ConnectTimeout"));
         assert!(parse_ssh_g("hostname box\n").is_err());
+
+        // `--target` runs its command over the same master, with the same options.
+        let args = connection_args_for(&config);
+        assert_eq!(
+            args[..2],
+            [OsString::from("-S"), OsString::from("/s/cm-abc")]
+        );
+        assert_eq!(
+            args[2..],
+            master_options(&config)
+                .into_iter()
+                .map(OsString::from)
+                .collect::<Vec<_>>()[..]
+        );
     }
 
     #[test]

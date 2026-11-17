@@ -7,8 +7,11 @@ Single source of truth for anyone (human or agent) changing this repo. `CLAUDE.m
 `sopen [user@]host:path` opens a remote file or folder as if it were local. Folders and text go to Zed's
 remote mode; images, video and audio open in sopen's own small window with exactly these edits: rectangle
 crop and rectangle pixelize (images), rectangle crop and time cut (video), time cut (audio). Everything else
-is fetched to a local cache. Spec and scope: [`.prd/01-spec.md`](.prd/01-spec.md) — its §1 owner intent and
-§9 out-of-scope list decide every "should we add X" question.
+is fetched to a local cache. It opens on the machine it was typed on, or — with `--target HOST`, `SOPEN_TARGET`
+or `target` in sopen's config — on HOST's screen, by running HOST's installed sopen with `--here` over ssh: HOST
+is a machine the owner uses sopen on, not a file's remote, which still needs only sshd (spec §4a). Spec and
+scope: [`.prd/01-spec.md`](.prd/01-spec.md) — its §1 owner intent and §9 out-of-scope list decide every "should
+we add X" question.
 
 ## Gate (run before every commit, CI runs the same)
 
@@ -50,6 +53,8 @@ prompts on close.
 | `SOPEN_AUTOEXPORT=1` | Media: apply the state and Export without a window; prints the new sibling's path. |
 | `SOPEN_EXPORT_HOLD_MS=<ms>` | Media window: start an Export on open and hold it, at its first progress report at or past 30 %, for that long, so `SOPEN_SCREENSHOT` captures the window mid-export; when the window closes sopen waits for the export and prints its result. |
 | `SOPEN_RENDERER=wgpu\|glow` | Force a renderer (default: wgpu, glow when wgpu does not start; `WGPU_BACKEND=dx12` on macOS forces that fallback). |
+| `SOPEN_TARGET_BIN=<path>` | `--target` runs this sopen binary on HOST (a build not installed there yet) instead of the one on HOST's PATH or in its Homebrew / cargo install paths. A `--target` run carries this and the hooks above, and `SOPEN_LOG`, to HOST; settings naming local paths stay here. |
+| `SOPEN_CONFIG=<file>` | The config file to use instead of `$XDG_CONFIG_HOME/sopen/config.toml` / `~/.config/sopen/config.toml` (tests point it at a temp file, so the owner's default target never forwards a test run). |
 | `sopen --selftest-audio <file>` | Hidden: play the file on the real output device at gain 0 for ~2 s; prints `callbacks=N underruns=M device=<name> … decoder=ffmpeg\|wav` (a WAV is read in-process where there is no ffmpeg). |
 
 A screenshot is a receipt only after someone has looked at it. Live receipts write only under a
