@@ -7,7 +7,8 @@ tags: [sopen, spec]
 # sopen — spec v1 (2026-11-11)
 
 `sopen host:/path` opens any file or folder on any of my machines as if it were local:
-folders and text go to Zed's remote mode, images and audio/video open in a small built-in
+folders and text go to VS Code when it is installed (remote ones only with its Remote - SSH
+extension), otherwise Zed's remote mode; images and audio/video open in a small built-in
 window where the few edits I actually need are one drag away, and any other file (a zip, a
 binary) asks first — open it in a built-in hex editor, or save it where I choose — on the
 machine I typed it on, or with `--target` on another machine's screen.
@@ -23,41 +24,43 @@ machine I typed it on, or with `--target` on another machine's screen.
 7. "그리고 이거 기능 추가해줘 / soepn <host-a>:/tmp/a.html (현재 머신에서 저 파일 오픈) / sopen --target <host-b> <host-a>:/tmp/a.html / 명백하지 진행 ㄱ"
 8. "그리고 sopen 설정으로 디폴트 타겟 설정할 수 있도록해줘"
 9. "mp4랑 html 잘 열리는데 (<host-a>에서 <host-a>파일을 <host-b>우로) (내 작업 디폴트 터미널이 <host-b>임), zip파일은 그냥 다운만 받아지는데 디폴트는 헥스에디터로 여는거야 바이너리들은, 다이얼로그 뜨고 원하는 위치로 저장혹은 헥스에디터 여는것 이게 좋겠음"
+10. "sopen이 vscode가 있으면 먼저 vscode로 열개해줘 vscode -> zeditor"
 
 Message 6 supersedes 3's "IrfanView 정도" with an exact list. Message 5 is a standing constraint:
 anything not in the table below is out of scope until usage says otherwise (§10). Messages 7–8 add
 where a file opens — this machine, or another machine's screen (§4a); they add no edit. Message 9
 replaces A6's "fetched to the cache and its path printed" for binary files with a dialog — the hex
 editor (the default) or save to a chosen path — and takes the hex editor off §9's list: it is
-message 3's "원하면 hex 편집기능정도까지", built in (§6a).
+message 3's "원하면 hex 편집기능정도까지", built in (§6a). Message 10 puts VS Code before Zed for
+folders and text (A2, §3); it adds no edit.
 
 ## 2. Intent → acceptance
 
 | # | Owner intent | Acceptance (observable) |
 |---|---|---|
 | A1 | `sopen host:/path`, scp syntax, any machine in `~/.ssh/config` | `sopen <alias>:/abs/file`, `sopen <alias>:rel/to/home`, `sopen user@host:/x` all open; aliases, ProxyJump, agent behave exactly as `ssh <alias>` does (system ssh is used). Local paths (`sopen ./x.png`) open too. |
-| A2 | Folder as a project, text edit, syntax highlight | Folder or text file → Zed opens the remote path (`zed ssh://…` on macOS, `zeditor`/`zed` on Linux). Save in Zed writes the remote file (Zed owns this). |
+| A2 | Folder as a project, text edit, syntax highlight; VS Code first (msg 10) | Folder or text file → VS Code when `code` is found; a remote one only when VS Code's Remote - SSH extension is installed (`code --folder-uri` / `--file-uri vscode-remote://ssh-remote+[user@]host/<percent-encoded abs>` by the kind sopen detected, since a bare `--remote` path's kind is guessed from its name; the extension is never installed by sopen), else Zed with `VS Code has no Remote - SSH extension; opening in Zed` on stderr. Without VS Code, Zed (`zed ssh://…` on macOS, `zeditor`/`zed` on Linux). A VS Code launch failure is reported, not followed by Zed. The editor owns Save. |
 | A3 | Image: view + rectangle crop + rectangle pixelize | Built-in window shows the image; drag draws a rectangle in image pixels; Crop and Pixelize act on it; Undo; Save writes back to the remote file. |
 | A4 | Video: view + rectangle crop + time cut | Built-in window plays the video with sound; scrub timeline; set In/Out; drag a crop rectangle; Export writes `<stem>.cut-<in>-<out>.<ext>` next to the original on the remote. |
 | A5 | Audio (mp3/wav): view + time cut | Same window: waveform, play, In/Out, Export. |
 | A6 | "아무 파일"; binary files open in a hex editor by default, after a dialog (msg 9) | Any other type (a zip, any binary) opens a small dialog before anything is downloaded — name, size, type when the extension says it: Enter = "Open in hex editor" (the default: fetched to the cache, then sopen's hex window, §6a); "Save to…" downloads it to a path the owner picks (the download folder by default, never over an existing file); Esc or closing it downloads nothing. `sopen --hex SOURCE` opens any file straight in the hex window. `--app <App>` still opens it in a named local app and uploads it back when the user presses Enter in the terminal. With no display (Linux over ssh) the file is fetched and its path printed, and one line says why. |
 | A7 | Rust, macOS + Linux, `brew install …` and use immediately | `brew install 2lab-ai/tap/sopen-preview` on macOS (arm64, x86_64) and Linux (x86_64, aarch64) installs `sopen` and the `ffmpeg` it needs; the first `sopen host:/a.mp3` works with no further setup. |
 | A8 | Developed like llmux | Public repo `2lab-ai/sopen`, MIT; `ci.yml` (macOS + Linux), `preview.yml` (every main push → prerelease + tap bump), `release.yml` (`v*` tag = owner gate); `AGENTS.md` SSOT; `.prd/` spec. |
-| A9 | `sopen SOURCE` opens here; `sopen --target <host> SOURCE` opens it on `<host>` (msg 7) | `sopen <host-a>:/tmp/a.html` opens on the machine it was typed on, as before. `sopen --target <host-b> <host-a>:/tmp/a.html` opens it on `<host-b>`'s screen: the same window or Zed, started by `<host-b>`'s own sopen (on macOS sopen's window floats above the others until it is used; Zed opens behind the active app, §4a); exit code is `<host-b>`'s; `could not reach <host-b>` when ssh cannot get there; `sopen is not installed on <host-b> …` (exit 127) when it has no sopen. A file on `<host-b>` itself opens there as a local file; a local file reaches `<host-b>` as `<this machine>:<path>`. |
+| A9 | `sopen SOURCE` opens here; `sopen --target <host> SOURCE` opens it on `<host>` (msg 7) | `sopen <host-a>:/tmp/a.html` opens on the machine it was typed on, as before. `sopen --target <host-b> <host-a>:/tmp/a.html` opens it on `<host-b>`'s screen: the same window or editor, started by `<host-b>`'s own sopen (on macOS sopen's window floats above the others until it is used; the editor opens behind the active app, §4a); exit code is `<host-b>`'s; `could not reach <host-b>` when ssh cannot get there; `sopen is not installed on <host-b> …` (exit 127) when it has no sopen. A file on `<host-b>` itself opens there as a local file; a local file reaches `<host-b>` as `<this machine>:<path>`. |
 | A10 | Default target in sopen's settings (msg 8) | `sopen config target <host-b>` writes `target = "<host-b>"` to the config file (§4a); from then on `sopen SOURCE` opens on `<host-b>`, `--here` opens on this machine anyway, `--target` picks another; `sopen config` shows the file and the target; `sopen config target --unset` removes it. A config sopen cannot read is an error naming the file, never ignored. |
 
 ## 3. Routing
 
 | Kind | Detected by | Opens in |
 |---|---|---|
-| directory | remote `stat` | Zed remote (`ssh://[user@]host[:port]/abs`) |
-| text | extension list, else first 8 KiB has no NUL and is valid UTF-8 | Zed remote |
+| directory | remote `stat` | VS Code remote (`code --folder-uri vscode-remote://ssh-remote+[user@]host/abs`), else Zed remote (`ssh://[user@]host[:port]/abs`) |
+| text | extension list, else first 8 KiB has no NUL and is valid UTF-8 | VS Code remote (`code --file-uri vscode-remote://…`), else Zed remote |
 | image | `png jpg jpeg webp bmp gif tif tiff` | image window |
 | video | `mp4 mov m4v mkv webm avi` (and ffprobe says it has a video stream); `ts` only when it is not text and ffprobe sees a video stream (`.ts` is also TypeScript) | media window |
 | audio | `mp3 wav flac m4a aac ogg opus` | media window |
 | other | everything else | the binary dialog: hex window (default) or Save to… (A6, §6a) |
 
-- Zed not found (`zed` / `zeditor` on PATH, macOS also `/Applications/Zed.app/Contents/MacOS/cli`): text → fetch, run `$VISUAL`/`$EDITOR` in the terminal, upload on exit if changed; directory → error that names the missing editor.
+- VS Code is found as `code` on PATH, then on macOS `/Applications/Visual Studio Code.app/Contents/Resources/app/bin/code` or the same path under `~/Applications`. Remote - SSH counts as installed when a directory `ms-vscode-remote.remote-ssh-<version>` is in `$VSCODE_EXTENSIONS` (when non-empty) or `~/.vscode/extensions` and is not a key of the `.obsolete` JSON object there; VS Code is not started to check. Without a usable VS Code, Zed is found as `zed` / `zeditor` on PATH, macOS also `/Applications/Zed.app/Contents/MacOS/cli`. Neither found: text → fetch, run `$VISUAL`/`$EDITOR` in the terminal, upload on exit if changed; directory → error that names the missing editors.
 - Remote relative paths resolve against the remote home (SFTP `realpath`), as scp does.
 
 ## 4. Remote layer
@@ -66,8 +69,8 @@ message 3's "원하면 hex 편집기능정도까지", built in (§6a).
   (`ControlMaster=auto`, `ControlPath=<state>/cm-%C`, `ControlPersist=60s`).
 - File operations = SFTP over that session (`openssh` + `openssh-sftp-client` crates): `stat`, `realpath`, read, write.
   SFTP keeps the code independent of the remote OS (macOS BSD tools vs GNU) — no remote shell parsing.
-- Nothing is installed on the remote. Only sshd's SFTP subsystem is required. (Zed installs its own server when the
-  owner opens folders/text; that is Zed's behaviour, documented in the README.) A `--target` machine (§4a) is not a
+- Nothing is installed on the remote. Only sshd's SFTP subsystem is required. (VS Code Remote - SSH or Zed installs its own server when the
+  owner opens folders/text; that is the editor's behaviour, documented in the README.) A `--target` machine (§4a) is not a
   file's remote: it is a machine the owner uses sopen on, and runs the sopen installed there.
 
 ## 4a. Where it opens
@@ -121,7 +124,7 @@ A window asks for focus on its first frames. On macOS an app started over ssh ca
 behind the active app. sopen's own image and media window, still unfocused after asking, floats above the other
 windows until it gains focus or gets its first click, key, scroll or typed text, and then returns to the normal
 level — with no timeout, because back at the normal level while unfocused macOS puts it straight behind the active
-app again. Zed, opened for
+app again. VS Code or Zed, opened for
 folders and text, comes up behind the active app.
 
 HOST gets a terminal (`ssh -t`) when this side's input and output are both terminals. Otherwise it gets none
@@ -134,7 +137,7 @@ errors still print). The command starts with a bare `exec`, so the login shell o
 rather than left as a parent that a Ctrl+C would kill (dash and fish do not replace themselves on their own); every
 other word is single-quoted (a `'` or `\` is written outside the quotes) so that shell — sh, bash, zsh, fish — reads
 each one back exactly. The receipt hooks (AGENTS.md "Receipts")
-travel to HOST; settings that name local paths (`SOPEN_ZED`, `SOPEN_FFMPEG`, `SOPEN_FFPROBE`, `SOPEN_CACHE_DIR`,
+travel to HOST; settings that name local paths (`SOPEN_CODE`, `SOPEN_ZED`, `SOPEN_FFMPEG`, `SOPEN_FFPROBE`, `SOPEN_CACHE_DIR`,
 `SOPEN_STATE_DIR`, `SOPEN_CONFIG`) do not.
 
 The config file is `$SOPEN_CONFIG` if set, else `$XDG_CONFIG_HOME/sopen/config.toml`, else
@@ -362,7 +365,7 @@ Local only, never sent anywhere. Exists for §10.
 
 ## 9. Out of scope (until §10 says otherwise)
 
-Own text editor / tree / highlighting (Zed does it), hex insert / delete or anything that changes a file's size, filters beyond crop/pixelize, frame-accurate
+Own text editor / tree / highlighting (VS Code or Zed does it), hex insert / delete or anything that changes a file's size, filters beyond crop/pixelize, frame-accurate
 copy without re-encode, streaming playback before download completes, directory sync / mounts, file watching,
 Windows, a `.app` bundle or cask, any agent on the remote, macshot (Swift, macOS-only, GPL-3 — incompatible with A7/A8).
 
