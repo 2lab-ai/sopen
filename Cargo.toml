@@ -50,6 +50,10 @@ serde = { version = "1.0.229", features = ["derive"] }
 toml = "1.2.1"
 # Is `--target HOST` this machine? (spec §4a) — HOST is compared with this machine's host name.
 gethostname = "1.1.0"
+# Binary files (spec §6a): the "Save to…" Browse button opens the platform's save dialog — the
+# native panel on macOS, xdg-desktop-portal over D-Bus on Linux (libdbus is loaded at runtime;
+# no GTK, nothing new linked).
+rfd = { version = "0.18.0", default-features = false, features = ["xdg-portal"] }
 
 [dev-dependencies]
 tempfile = "3.27.0"

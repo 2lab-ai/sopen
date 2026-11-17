@@ -1,5 +1,6 @@
 //! `--app <App>` (spec A6): the fetched copy opens in a named local app; the terminal waits for
-//! "Enter = upload changes · q = discard". This is also the hex-editor path (`--app ImHex`).
+//! "Enter = upload changes · q = discard". An external hex editor works this way too
+//! (`--app ImHex`); sopen's own is the hex window (`--hex`, spec §6a).
 
 use anyhow::{bail, Context, Result};
 use sha2::{Digest, Sha256};

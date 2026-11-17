@@ -1,9 +1,12 @@
-//! The image window (spec §6) and the media window (spec §7). This module is the shared shell:
-//! where the opened file lives ([`Origin`]), the window runner (wgpu renderer, glow fallback,
-//! activation on start, Cmd/Ctrl+Q through the close prompt), the receipt hooks ([`Hooks`]) and
-//! the screenshot driver. Everything that writes (Save, Save copy, Export) is a plain function
-//! over [`Origin`], called by the window's buttons and by the windowless hooks alike.
+//! The image window (spec §6), the binary-file dialog and hex window (spec §6a) and the media
+//! window (spec §7). This module is the shared shell: where the opened file lives ([`Origin`]),
+//! the window runner (wgpu renderer, glow fallback, activation on start, Cmd/Ctrl+Q through the
+//! close prompt), the receipt hooks ([`Hooks`]) and the screenshot driver. Everything that writes
+//! (Save, Save copy, Export, Save to…) is a plain function over [`Origin`] or a local path,
+//! called by the window's buttons and by the windowless hooks alike.
 
+pub mod binary;
+pub mod hex;
 pub mod image;
 pub mod media;
 pub mod playback;
@@ -136,6 +139,15 @@ pub fn keep_path(cached: &Path, tag: &str, at: SystemTime, unique: &str) -> Path
     cached.with_file_name(name)
 }
 
+/// The name Save copy publishes next to `name`: `<stem>.edited<.ext>` (`shot.png` →
+/// `shot.edited.png`, `README` → `README.edited`). The image and hex windows share it.
+pub fn edited_name(name: &str) -> String {
+    match name.rfind('.') {
+        Some(i) if i > 0 => format!("{}.edited{}", &name[..i], &name[i..]),
+        _ => format!("{name}.edited"),
+    }
+}
+
 /// Creates a new owner-only file at a [`keep_path`] with a random `unique` part (another one
 /// when the name is taken) and returns it open.
 pub fn create_keep(cached: &Path, tag: &str) -> Result<(PathBuf, std::fs::File)> {
@@ -156,7 +168,8 @@ pub enum Op {
 }
 
 /// `SOPEN_STATE=rect=x,y,w,h;t=3.5;in=2;out=6;op=crop|pixelize;block=16` — source pixels and
-/// seconds. `op` may list several, comma-separated, applied in order.
+/// seconds. `op` may list several, comma-separated, applied in order. The hex window takes
+/// `at=OFFSET;patch=OFFSET:HEXBYTES[,OFFSET:HEXBYTES]` (offsets `0x…` or decimal).
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct State {
     pub rect: Option<[u32; 4]>,
@@ -165,6 +178,10 @@ pub struct State {
     pub out_s: Option<f64>,
     pub ops: Vec<Op>,
     pub block: Option<u32>,
+    /// Hex window: where the cursor starts.
+    pub at: Option<u64>,
+    /// Hex window: bytes overwritten at an offset, applied in order (each one an undo step).
+    pub patches: Vec<(u64, Vec<u8>)>,
 }
 
 impl State {
@@ -201,10 +218,43 @@ impl State {
                         });
                     }
                 }
+                "at" => state.at = Some(hex::parse_offset(value).context("SOPEN_STATE at")?),
+                "patch" => {
+                    for one in value.split(',').map(str::trim) {
+                        let (at, bytes) = one.split_once(':').ok_or_else(|| {
+                            anyhow!("SOPEN_STATE patch: '{one}' is not OFFSET:HEXBYTES")
+                        })?;
+                        let at = hex::parse_offset(at).context("SOPEN_STATE patch")?;
+                        let bytes = hex::parse_bytes(bytes).context("SOPEN_STATE patch")?;
+                        state.patches.push((at, bytes));
+                    }
+                }
                 other => bail!("SOPEN_STATE: unknown key '{other}'"),
             }
         }
         Ok(state)
+    }
+}
+
+/// The answer to the binary-file dialog (spec §6a), given by `SOPEN_CHOICE` instead of a click.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Choice {
+    /// Fetch into the cache and open the hex window.
+    Hex,
+    /// Save a copy at a chosen path (`SOPEN_SAVE_TO`, else the download folder).
+    Save,
+    /// Nothing is downloaded.
+    Cancel,
+}
+
+impl Choice {
+    pub fn parse(text: &str) -> Result<Self> {
+        match text {
+            "hex" => Ok(Choice::Hex),
+            "save" => Ok(Choice::Save),
+            "cancel" => Ok(Choice::Cancel),
+            other => bail!("SOPEN_CHOICE must be hex, save or cancel (got '{other}')"),
+        }
     }
 }
 
@@ -228,6 +278,11 @@ pub struct Hooks {
     /// `SOPEN_WINDOW_SIZE=<w>x<h>`: open the window at this size in points (layout receipts on
     /// a narrow window).
     pub window_size: Option<[f32; 2]>,
+    /// `SOPEN_CHOICE=hex|save|cancel`: the binary-file dialog's answer; the dialog is not shown.
+    pub choice: Option<Choice>,
+    /// `SOPEN_SAVE_TO=<path>`: where "Save to…" saves (the path field's first value), without
+    /// the native dialog.
+    pub save_to: Option<PathBuf>,
 }
 
 impl Hooks {
@@ -257,6 +312,10 @@ impl Hooks {
             }
             Err(_) => None,
         };
+        let choice = match std::env::var("SOPEN_CHOICE") {
+            Ok(text) => Some(Choice::parse(&text)?),
+            Err(_) => None,
+        };
         Ok(Self {
             screenshot: std::env::var_os("SOPEN_SCREENSHOT")
                 .filter(|p| !p.is_empty())
@@ -267,6 +326,10 @@ impl Hooks {
             save_delay,
             export_hold,
             window_size,
+            choice,
+            save_to: std::env::var_os("SOPEN_SAVE_TO")
+                .filter(|p| !p.is_empty())
+                .map(PathBuf::from),
         })
     }
 
@@ -714,6 +777,40 @@ mod tests {
         assert!(State::parse("zoom=2").is_err());
         assert!(State::parse("rect=1,2,3").is_err());
         assert_eq!(State::parse("").unwrap(), State::default());
+    }
+
+    #[test]
+    fn hex_state_parses() {
+        let s = State::parse("at=0x1f;patch=0x10:DEad,17:00ff").unwrap();
+        assert_eq!(s.at, Some(31));
+        assert_eq!(
+            s.patches,
+            vec![(16, vec![0xde, 0xad]), (17, vec![0x00, 0xff])]
+        );
+        assert_eq!(State::parse("at=42").unwrap().at, Some(42));
+        for bad in [
+            "at=x",
+            "at=-1",
+            "patch=1",
+            "patch=1:",
+            "patch=1:abc",
+            "patch=1:zz",
+            "patch=q:00",
+        ] {
+            assert!(State::parse(bad).is_err(), "{bad}");
+        }
+        assert_eq!(Choice::parse("hex").unwrap(), Choice::Hex);
+        assert_eq!(Choice::parse("save").unwrap(), Choice::Save);
+        assert_eq!(Choice::parse("cancel").unwrap(), Choice::Cancel);
+        assert!(Choice::parse("Hex").is_err());
+    }
+
+    #[test]
+    fn edited_name_keeps_the_extension() {
+        assert_eq!(edited_name("shot.png"), "shot.edited.png");
+        assert_eq!(edited_name("a.tar.gz"), "a.tar.edited.gz");
+        assert_eq!(edited_name("README"), "README.edited");
+        assert_eq!(edited_name(".bashrc"), ".bashrc.edited");
     }
 
     #[test]

@@ -6,9 +6,11 @@ Single source of truth for anyone (human or agent) changing this repo. `CLAUDE.m
 
 `sopen [user@]host:path` opens a remote file or folder as if it were local. Folders and text go to Zed's
 remote mode; images, video and audio open in sopen's own small window with exactly these edits: rectangle
-crop and rectangle pixelize (images), rectangle crop and time cut (video), time cut (audio). Everything else
-is fetched to a local cache. It opens on the machine it was typed on, or — with `--target HOST`, `SOPEN_TARGET`
-or `target` in sopen's config — on HOST's screen, by running HOST's installed sopen with `--here` over ssh: HOST
+crop and rectangle pixelize (images), rectangle crop and time cut (video), time cut (audio). Any other file
+(a zip, any binary) opens a dialog before anything is downloaded: sopen's hex window (the default; byte
+overwrite only) or "Save to…" a chosen path; `--hex` opens any file in the hex window. It opens on the
+machine it was typed on, or — with `--target HOST`, `SOPEN_TARGET` or `target` in sopen's config — on
+HOST's screen, by running HOST's installed sopen with `--here` over ssh: HOST
 is a machine the owner uses sopen on, not a file's remote, which still needs only sshd (spec §4a). Spec and
 scope: [`.prd/01-spec.md`](.prd/01-spec.md) — its §1 owner intent and §9 out-of-scope list decide every "should
 we add X" question.
@@ -31,9 +33,11 @@ zsh or fish skip with a note when it is missing; CI installs them and sets `SOPE
 - **Never overwrite silently.** Every write re-checks the remote file first (`lstat`: still a regular file,
   same `(size, mtime)`, same content hash up to 256 MiB) and refuses on change; writes go to a temp name in the
   same directory with the target's owner and mode and are renamed over the target. Spec §5 is the full rule.
-  Image Save keeps a local backup of the original first. Media exports always write a new sibling file and
-  never use a replacing rename to publish it.
-- **No new edit features without the owner.** The edit list above is the whole list (owner, 2026-11-11).
+  Image and hex Save keep a local backup of the original first. Media exports always write a new sibling file and
+  never use a replacing rename to publish it. The binary dialog's "Save to…" creates its file exclusively and
+  never replaces one (spec §6a).
+- **No new edit features without the owner.** The edit list above is the whole list (owner, 2026-11-11; hex
+  overwrite added by spec §1 message 9).
 - **ffmpeg/ffprobe are external programs**, resolved at runtime (`SOPEN_FFMPEG` / `SOPEN_FFPROBE`, then PATH).
   Do not link libav*.
 - Tests must not need ssh or a network: the remote layer sits behind a trait with a local-filesystem
@@ -49,9 +53,11 @@ prompts on close.
 
 | Hook | Effect |
 |---|---|
-| `SOPEN_STATE='rect=x,y,w,h;t=3.5;in=2;out=6;op=crop\|pixelize;block=16'` | Initial state in source pixels and seconds; `op` (images only, comma-separated, applied in order) uses `rect`. |
+| `SOPEN_STATE='rect=x,y,w,h;t=3.5;in=2;out=6;op=crop\|pixelize;block=16'` | Initial state in source pixels and seconds; `op` (images only, comma-separated, applied in order) uses `rect`. The hex window takes `at=OFFSET;patch=OFFSET:HEXBYTES[,OFFSET:HEXBYTES]` (offsets `0x…` or decimal): the cursor, and bytes overwritten in order, each an undo step. |
 | `SOPEN_SCREENSHOT=<png>` | Open the window, render the state, write a screenshot of the window, exit. Prints `screenshot <png> <w>x<h> title="<host:/abs>" focused=<bool> …`. `SOPEN_WATCHDOG=<s>` (default 30) ends a stalled run. |
-| `SOPEN_AUTOSAVE=1` | Images: apply the state and Save without a window (backup, conflict-checked overwrite); exit 0 saved, 3 refused. `SOPEN_AUTOSAVE_DELAY_MS=<ms>` waits before the write so a second process can change the remote (the conflict receipt). |
+| `SOPEN_AUTOSAVE=1` | Images and the hex window: apply the state and Save without a window (backup, conflict-checked overwrite); exit 0 saved, 3 refused. `SOPEN_AUTOSAVE_DELAY_MS=<ms>` waits before the write so a second process can change the remote (the conflict receipt). |
+| `SOPEN_CHOICE=hex\|save\|cancel` | Answers the binary-file dialog: `hex` starts the fetch at once in the window, which becomes the hex window, as Enter would (with `SOPEN_SCREENSHOT`, the hex window is shot after the switch; with `SOPEN_AUTOSAVE`, no window: fetched and saved); `save` downloads to `SOPEN_SAVE_TO` without a window and prints `saved <path>` (a taken path is exit 1, naming the next free name); `cancel` downloads nothing. Without it, `SOPEN_SCREENSHOT` shoots the dialog and nothing is downloaded, and `SOPEN_AUTOSAVE` on a binary file is an error (nothing would answer the dialog). |
+| `SOPEN_SAVE_TO=<path>` | Where the dialog's "Save to…" saves (the path field's first value; a folder gets the file's name), instead of the download folder — no native dialog. |
 | `SOPEN_AUTOEXPORT=1` | Media: apply the state and Export without a window; prints the new sibling's path. |
 | `SOPEN_EXPORT_HOLD_MS=<ms>` | Media window: start an Export on open and hold it, at its first progress report at or past 30 %, for that long, so `SOPEN_SCREENSHOT` captures the window mid-export; when the window closes sopen waits for the export and prints its result. |
 | `SOPEN_WINDOW_SIZE=<w>x<h>` | Open the window at that size in points (layout receipts on a narrow window). |

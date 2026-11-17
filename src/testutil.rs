@@ -1,6 +1,9 @@
 //! Support shared by the unit tests.
 
+use crate::remote::{LocalFs, RemoteFs};
+use anyhow::Result;
 use std::os::unix::fs::PermissionsExt;
+use std::path::Path;
 use std::process::Command;
 
 /// Set in the child [`rerun_under_umask_022`] starts, to the name of the test it runs.
@@ -46,4 +49,56 @@ pub fn rerun_under_umask_022(test: &str) -> bool {
         "{test} did not run in the child:\n{text}"
     );
     true
+}
+
+/// The local disk, posing as a server without `posix-rename@openssh.com`.
+pub(crate) struct NoReplace(pub(crate) LocalFs);
+
+impl RemoteFs for NoReplace {
+    fn stat_opt(&mut self, p: &str) -> Result<Option<crate::remote::Stat>> {
+        self.0.stat_opt(p)
+    }
+    fn lstat_opt(&mut self, p: &str) -> Result<Option<crate::remote::Stat>> {
+        self.0.lstat_opt(p)
+    }
+    fn realpath(&mut self, p: &str) -> Result<String> {
+        self.0.realpath(p)
+    }
+    fn read_head(&mut self, p: &str, max: usize) -> Result<Vec<u8>> {
+        self.0.read_head(p, max)
+    }
+    fn list_dir(&mut self, p: &str) -> Result<Vec<String>> {
+        self.0.list_dir(p)
+    }
+    fn read_to(
+        &mut self,
+        p: &str,
+        out: &mut dyn std::io::Write,
+        progress: &mut dyn FnMut(u64),
+    ) -> Result<u64> {
+        self.0.read_to(p, out, progress)
+    }
+    fn create_from(
+        &mut self,
+        local: &Path,
+        p: &str,
+        like: Option<crate::remote::Like>,
+    ) -> std::result::Result<crate::remote::Uploaded, crate::remote::CreateError> {
+        self.0.create_from(local, p, like)
+    }
+    fn set_mode(&mut self, p: &str, mode: u32) -> Result<()> {
+        self.0.set_mode(p, mode)
+    }
+    fn rename_over(&mut self, from: &str, to: &str) -> Result<()> {
+        self.0.rename_over(from, to)
+    }
+    fn link_new(&mut self, from: &str, to: &str) -> Result<()> {
+        self.0.link_new(from, to)
+    }
+    fn remove(&mut self, p: &str) -> Result<()> {
+        self.0.remove(p)
+    }
+    fn can_replace(&self) -> bool {
+        false
+    }
 }

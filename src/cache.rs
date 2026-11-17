@@ -1,7 +1,8 @@
 //! Local paths: the fetch cache `<cache>/<host>/<abs path>`, edits kept aside as
-//! `<copy>.conflict-<UTC stamp>`, image backups `<cache>/.backup/<host>/<abs path>.<UTC stamp>`,
-//! image edits under `<cache>/.edits`, exports under `<cache>/.exports`, session copies under
-//! `<cache>/.sessions` (spec §5), and the state dir (ssh control sockets, `usage.jsonl`). What
+//! `<copy>.conflict-<UTC stamp>`, image and hex backups
+//! `<cache>/.backup/<host>/<abs path>.<UTC stamp>`, image and hex edits under `<cache>/.edits`,
+//! exports under `<cache>/.exports`, session copies under `<cache>/.sessions` (spec §5), and the
+//! state dir (ssh control sockets, `usage.jsonl`). What
 //! sopen knows about a copy lives apart from the mirrored tree, under `<cache>/.meta` (see
 //! [`Claim`]): the record of what the copy held when fetched or saved, and the session lock. `SOPEN_CACHE_DIR` /
 //! `SOPEN_STATE_DIR` override both. What sopen creates under the cache is the owner's only
@@ -88,8 +89,8 @@ fn meta_path(cache: &Path, kind: &str, local: &Path) -> Result<PathBuf> {
     Ok(cache.join(META).join(kind).join(rel))
 }
 
-/// The cache's fixed roots, beside the mirrored hosts: image backups, staged and kept image
-/// edits, local exports. Dot names: no host label reaches them (see [`sanitize`]). Roots an
+/// The cache's fixed roots, beside the mirrored hosts: image and hex backups, staged and kept
+/// image and hex edits, local exports. Dot names: no host label reaches them (see [`sanitize`]). Roots an
 /// older build made without the dot (`backup`, `edits`, `exports`) are just cache now: never
 /// read, never written.
 const BACKUP: &str = ".backup";
@@ -102,7 +103,7 @@ pub fn cache_path(cache: &Path, host: &str, abs: &str) -> PathBuf {
     under(cache, host, abs)
 }
 
-/// Where image edits are staged and refused ones kept.
+/// Where image and hex edits are staged and refused ones kept.
 pub fn edits_root(cache: &Path) -> PathBuf {
     cache.join(EDITS)
 }
@@ -118,7 +119,7 @@ pub fn exports_root(cache: &Path) -> PathBuf {
     cache.join(EXPORTS)
 }
 
-/// Where image backups go: `<backup root>/<host>/<abs path>.<UTC stamp>`.
+/// Where image and hex backups go: `<backup root>/<host>/<abs path>.<UTC stamp>`.
 pub fn backup_root(cache: &Path) -> PathBuf {
     cache.join(BACKUP)
 }
