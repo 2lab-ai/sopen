@@ -474,13 +474,29 @@ fn the_toolbar_is_one_row_tall_wherever_its_buttons_fit_on_one() {
     );
 }
 
-/// While a save runs, its spinner turns in the status bar, on the line of its "saving…".
+/// While a save runs, its spinner turns in the status bar, just before its "saving…" and on its
+/// line; at rest none is painted there.
 #[test]
 fn a_running_save_spins_beside_its_status() {
+    let text = "saving a copy…";
+    // The status text, and the arcs painted just before it on its line (within a spacing and a
+    // spinner's width: where on its circle the arc is depends on the time).
+    let status = |fx: &Fixture| {
+        let at = fx.drv.find_text(text).expect("status shown");
+        let arcs: Vec<Rect> = fx
+            .drv
+            .strokes()
+            .into_iter()
+            .filter(|r| r.right() <= at.left() && r.left() >= at.left() - 30.0)
+            .filter(|r| r.max.y >= at.min.y && r.min.y <= at.max.y)
+            .collect();
+        (at, arcs)
+    };
     let mut fx = open_sized(640.0, 420.0);
-    fx.win.status = Status::info("saving a copy…");
+    fx.win.status = Status::info(text);
     fx.settle();
-    let idle = fx.drv.find_text("saving a copy…").expect("status shown");
+    let (idle, arcs) = status(&fx);
+    assert!(arcs.is_empty(), "a spinner at rest: {arcs:?}");
     let (_tx, rx) = mpsc::channel();
     fx.win.job = Some(Job {
         kind: JobKind::SaveCopy { close_after: false },
@@ -488,7 +504,8 @@ fn a_running_save_spins_beside_its_status() {
         rx,
     });
     fx.settle();
-    let busy = fx.drv.find_text("saving a copy…").expect("status shown");
+    let (busy, arcs) = status(&fx);
+    assert_eq!(arcs.len(), 1, "one spinner painted before the status");
     assert!(
         busy.left() > idle.left() + 10.0,
         "nothing before the status: {idle:?} → {busy:?}"
@@ -496,7 +513,7 @@ fn a_running_save_spins_beside_its_status() {
     assert!((busy.center().y - idle.center().y).abs() < 0.5);
 }
 
-/// Held from the press, not from the drag:a save result that lands after the button went down
+/// Held from the press, not from the drag: a save result that lands after the button went down
 /// but before the pointer moved far enough to count as a drag still waits for the release.
 #[test]
 fn a_save_result_landing_between_press_and_drag_waits_for_the_release() {

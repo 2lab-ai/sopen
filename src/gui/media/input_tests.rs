@@ -333,9 +333,9 @@ fn export_result_notes_leave_the_status_line() {
 }
 
 /// An export never moves the frame — not when it starts, as it progresses, or when it reports —
-/// at every width: its spinner and "exporting NN %" share the clock line's row, shown whole,
-/// and the clock line stays one line (a progress row of its own used to come and go with the
-/// export, then sat empty at the bottom while none ran).
+/// at every width: its spinner (painted) and "exporting NN %" (whole) share the clock line's
+/// row, and the clock line stays one line (a progress row of its own used to come and go with
+/// the export, then sat empty at the bottom while none ran).
 #[test]
 fn a_running_export_never_moves_the_frame() {
     let Some(tools) = tools_or_skip() else { return };
@@ -361,7 +361,18 @@ fn a_running_export_never_moves_the_frame() {
                 moved.push((w, format!("at {} %", per_mille / 10)));
             }
             let shown = format!("exporting {} %", per_mille / 10);
-            if fx.drv.find_text(&shown).is_none() || fx.drv.rows_of(&line) != Some(1) {
+            // Its spinner: one arc painted just before the text, on its line (within a spacing
+            // and a spinner's width: where on its circle the arc is depends on the time).
+            let spins = fx.drv.find_text(&shown).is_some_and(|at| {
+                let arcs = fx.drv.strokes().into_iter().filter(|r| {
+                    r.right() <= at.left()
+                        && r.left() >= at.left() - 30.0
+                        && r.max.y >= at.min.y
+                        && r.min.y <= at.max.y
+                });
+                arcs.count() == 1
+            });
+            if !spins || fx.drv.rows_of(&line) != Some(1) {
                 unshown.push((w, shown));
             }
         }
@@ -376,12 +387,13 @@ fn a_running_export_never_moves_the_frame() {
     assert!(moved.is_empty(), "the frame moved: {moved:?}");
     assert!(
         unshown.is_empty(),
-        "the progress is not whole, or the clock line not one line: {unshown:?}"
+        "no spinner, the progress not whole, or the clock line not one line: {unshown:?}"
     );
 }
 
-/// The transport's clock line is never broken across rows: at every width it is one line, cut
-/// with "…" (the whole line on hover) where the window is too narrow for it. It used to share
+/// The transport's clock line is never broken across rows: at every width it is one line drawn
+/// inside its clip and the window, cut with "…" (the whole line on hover) where the window is
+/// too narrow for it. It used to share
 /// the buttons' wrapping row and break after "In …" at 640 px, the default width.
 #[test]
 fn the_transport_line_never_wraps_at_any_width() {
@@ -395,6 +407,7 @@ fn the_transport_line_never_wraps_at_any_width() {
     for w in 420..=1400 {
         fx.drv.resize(w as f32, 560.0);
         fx.settle();
+        // `rows_of` sees only a line drawn inside its clip and the window.
         if fx.drv.rows_of(&line) != Some(1) {
             broken.push(w);
         }
@@ -404,7 +417,7 @@ fn the_transport_line_never_wraps_at_any_width() {
     }
     assert!(
         broken.is_empty(),
-        "the transport line is not one row at widths {broken:?}"
+        "the transport line is not one row in view at widths {broken:?}"
     );
     // Cut only where it must be: whole at the default width.
     assert!(whole.contains(&640), "whole only at widths {whole:?}");

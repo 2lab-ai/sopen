@@ -160,40 +160,78 @@ impl Driver {
         self.idle(win, 1);
     }
 
+    /// What the last pass drew where it can be seen: each shape `pick` takes, with its bounds on
+    /// screen, when all of those bounds lie inside the shape's clip rect and the window.
+    fn shown<T>(&self, pick: impl Fn(&egui::Shape) -> Option<(Rect, T)>) -> Vec<(Rect, T)> {
+        fn walk<T>(
+            shape: &egui::Shape,
+            visible: Rect,
+            pick: &dyn Fn(&egui::Shape) -> Option<(Rect, T)>,
+            out: &mut Vec<(Rect, T)>,
+        ) {
+            if let egui::Shape::Vec(v) = shape {
+                v.iter().for_each(|s| walk(s, visible, pick, out));
+            } else if let Some((bounds, t)) = pick(shape) {
+                // A hair of slack for float rounding at the edges.
+                if visible.expand(0.5).contains_rect(bounds) {
+                    out.push((bounds, t));
+                }
+            }
+        }
+        let viewport = Rect::from_min_size(Pos2::ZERO, self.size);
+        let mut out = Vec::new();
+        for c in &self.shapes {
+            // The clip rect is in the space the shape's transform maps to: compare there.
+            let visible = c.clip_rect.intersect(viewport);
+            let moved = c.transform_after_tessellation;
+            let mut found = Vec::new();
+            walk(
+                &c.shape,
+                moved.inverse().mul_rect(visible),
+                &pick,
+                &mut found,
+            );
+            out.extend(found.into_iter().map(|(r, t)| (moved.mul_rect(r), t)));
+        }
+        out
+    }
+
     /// Where the last pass drew `text` whole (a button's label, a disclosure), if it did:
     /// the galley holds all of it (a galley cut short with "…" keeps the full string but is
     /// `elided`), and all of its bounds lie inside the shape's clip rect and the window.
     pub fn find_text(&self, text: &str) -> Option<Rect> {
-        fn walk(shape: &egui::Shape, text: &str, visible: Rect) -> Option<Rect> {
-            match shape {
-                egui::Shape::Text(t) if t.galley.text() == text && !t.galley.elided => {
-                    let bounds = t.galley.rect.translate(t.pos.to_vec2());
-                    // A hair of slack for float rounding at the edges.
-                    visible.expand(0.5).contains_rect(bounds).then_some(bounds)
-                }
-                egui::Shape::Vec(v) => v.iter().find_map(|s| walk(s, text, visible)),
-                _ => None,
+        let found = self.shown(|s| match s {
+            egui::Shape::Text(t) if t.galley.text() == text && !t.galley.elided => {
+                Some((t.galley.rect.translate(t.pos.to_vec2()), ()))
             }
-        }
-        let viewport = Rect::from_min_size(Pos2::ZERO, self.size);
-        // The clip rect is in the space the shape's transform maps to: compare there.
-        self.shapes.iter().find_map(|c| {
-            let visible = c.clip_rect.intersect(viewport);
-            let moved = c.transform_after_tessellation;
-            walk(&c.shape, text, moved.inverse().mul_rect(visible)).map(|r| moved.mul_rect(r))
-        })
+            _ => None,
+        });
+        found.first().map(|(r, ())| *r)
     }
 
-    /// How many rows the last pass laid `text` out in (whole or cut with "…"), if it drew it.
+    /// How many rows the last pass laid `text` out in, whole or cut with "…", if it drew it
+    /// where it can be seen (as for [`Driver::find_text`]: inside its clip rect and the window).
     pub fn rows_of(&self, text: &str) -> Option<usize> {
-        fn walk(shape: &egui::Shape, text: &str) -> Option<usize> {
-            match shape {
-                egui::Shape::Text(t) if t.galley.text() == text => Some(t.galley.rows.len()),
-                egui::Shape::Vec(v) => v.iter().find_map(|s| walk(s, text)),
-                _ => None,
+        let found = self.shown(|s| match s {
+            egui::Shape::Text(t) if t.galley.text() == text => Some((
+                t.galley.rect.translate(t.pos.to_vec2()),
+                t.galley.rows.len(),
+            )),
+            _ => None,
+        });
+        found.first().map(|(_, rows)| *rows)
+    }
+
+    /// The bounds of every open stroked path the last pass drew where it can be seen (as for
+    /// [`Driver::find_text`]) — a spinner's arc is one.
+    pub fn strokes(&self) -> Vec<Rect> {
+        let found = self.shown(|s| match s {
+            egui::Shape::Path(p) if !p.closed && p.stroke.width > 0.0 => {
+                Some((p.visual_bounding_rect(), ()))
             }
-        }
-        self.shapes.iter().find_map(|c| walk(&c.shape, text))
+            _ => None,
+        });
+        found.into_iter().map(|(r, ())| r).collect()
     }
 
     /// Clicks the control labelled `text`.
@@ -265,6 +303,7 @@ mod tests {
             drv.idle(&mut win, 2);
             assert!(painted(&drv, TEXT), "{place}: the galley is there");
             assert_eq!(drv.find_text(TEXT).is_some(), shown, "{place}");
+            assert_eq!(drv.rows_of(TEXT), shown.then_some(1), "{place}");
         }
     }
 
@@ -301,6 +340,43 @@ mod tests {
             assert!(painted(&drv, TEXT));
             let case = format!("at {pos:?} moved {moved:?}");
             assert_eq!(drv.find_text(TEXT).is_some(), shown, "{case}");
+            assert_eq!(drv.rows_of(TEXT), shown.then_some(1), "{case}");
+        }
+    }
+
+    /// Draws one spinner: in the open, or with a 4×4 clip at its corner.
+    struct Spin {
+        clipped: bool,
+    }
+
+    impl Window for Spin {
+        fn ui(&mut self, ui: &mut egui::Ui) {
+            if self.clipped {
+                let min = ui.max_rect().min;
+                ui.set_clip_rect(Rect::from_min_size(min, Vec2::splat(4.0)));
+            }
+            ui.add(egui::Spinner::new());
+        }
+
+        fn ready(&self) -> bool {
+            true
+        }
+    }
+
+    /// A spinner's arc is found where it can be seen, not where its clip hides it — the clipped
+    /// one is painted (egui skips only a spinner wholly outside its clip), and must fail.
+    #[test]
+    fn strokes_require_the_path_inside_its_clip() {
+        for (clipped, shown) in [(false, 1), (true, 0)] {
+            let mut drv = Driver::new(600.0, 400.0);
+            drv.idle(&mut Spin { clipped }, 2);
+            let arcs = drv
+                .shapes
+                .iter()
+                .filter(|c| matches!(c.shape, egui::Shape::Path(_)))
+                .count();
+            assert_eq!(arcs, 1, "clipped={clipped}: the arc is painted");
+            assert_eq!(drv.strokes().len(), shown, "clipped={clipped}");
         }
     }
 }
