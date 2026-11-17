@@ -136,6 +136,11 @@ file of any size scrolls the same. It overwrites bytes and never changes the fil
 | `⌘S` | Save: the original is first backed up locally (path printed), then overwritten in place, as image Save does. When it is refused, the window names where your edits were kept: if the file changed since it was opened, nothing is written and the edits are listed in a `.hexpatch-….txt` file; if the overwrite itself is refused (the remote changed), the staged edited file is kept |
 | `⇧⌘S` | Save copy: `<name>.edited.<ext>` next to the original |
 
+If a local file saved in place is changed by someone else right after the save, the window turns
+read-only and lists your edits in a `.hexpatch` file it names. When even that list cannot be
+written, the window offers **Keep edits…** (try again) and **Write the list there** (a path you
+choose), and closing asks before your edits are lost.
+
 ## Any other app: `--app`
 
 ```sh

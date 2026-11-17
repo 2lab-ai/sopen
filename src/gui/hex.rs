@@ -182,18 +182,22 @@ pub struct Cursor {
     pub low: bool,
 }
 
-/// One change, undone by writing `before` back (`None` = the original byte).
+/// One change, as the bytes were shown: undone by putting `before` back, redone by `after`.
 #[derive(Debug, Clone, Copy)]
 struct Step {
     at: u64,
-    before: Option<u8>,
-    after: Option<u8>,
+    before: u8,
+    after: u8,
     /// Where the cursor was when the change was made (undo puts it back there).
     cursor: Cursor,
 }
 
-/// The bytes as opened (never written: read through [`Pages`]) and the changes made to them, a
-/// sparse map offset → byte that holds only bytes that differ from the original.
+/// The bytes as opened (never written: read through [`Pages`]) and the edits made to them: a
+/// sparse map offset → byte holding the byte wanted at every offset set — absolute values, as
+/// shown, never said relative to the file under them. An entry may equal the file's byte (an
+/// edit undone, a byte typed back); whether a byte is changed is a comparison with the file, so
+/// when the file under the edits is replaced (a Save in place) nothing about the edits has to
+/// be read from the old one.
 pub struct HexDoc {
     pages: Pages,
     patches: BTreeMap<u64, u8>,
@@ -206,24 +210,30 @@ pub struct HexDoc {
     open_step: Option<u64>,
     /// Bumped by every change (a repaint key; what is saved is compared by content).
     rev: u64,
-    /// The changes the original file holds now (empty until a Save lands), and the ones the
-    /// last Save copy holds.
+    /// The bytes the file holds beyond the bytes read (what the last Save in it wrote), and
+    /// the ones the last Save copy holds — absolute, like `patches`.
     saved: BTreeMap<u64, u8>,
     copied: Option<BTreeMap<u64, u8>>,
+    /// `changed_count` at `rev` (it compares every entry with the file).
+    counted: Option<(u64, usize)>,
+}
+
+fn pages(file: Arc<File>, size: u64) -> Pages {
+    Pages {
+        file,
+        size,
+        held: HashMap::new(),
+        tick: 0,
+        error: None,
+        reads: 0,
+    }
 }
 
 impl HexDoc {
     /// The document over `file`, whose first `size` bytes are shown.
     pub fn new(file: Arc<File>, size: u64) -> Self {
         Self {
-            pages: Pages {
-                file,
-                size,
-                held: HashMap::new(),
-                tick: 0,
-                error: None,
-                reads: 0,
-            },
+            pages: pages(file, size),
             patches: BTreeMap::new(),
             undo: VecDeque::new(),
             redo: Vec::new(),
@@ -232,6 +242,7 @@ impl HexDoc {
             rev: 0,
             saved: BTreeMap::new(),
             copied: None,
+            counted: None,
         }
     }
 
@@ -266,21 +277,37 @@ impl HexDoc {
         }
     }
 
-    /// The byte as opened.
+    /// The byte the file holds.
     pub fn original(&mut self, at: u64) -> Option<u8> {
         self.pages.byte(at)
     }
 
-    /// Whether the byte at `at` differs from the file as opened.
-    pub fn changed(&self, at: u64) -> bool {
-        self.patches.contains_key(&at)
+    /// Whether the byte at `at` differs from the file (one that cannot be read counts as
+    /// different).
+    pub fn changed(&mut self, at: u64) -> bool {
+        match self.patches.get(&at).copied() {
+            Some(b) => self.pages.byte(at) != Some(b),
+            None => false,
+        }
     }
 
-    /// How many bytes differ from the file as opened.
-    pub fn changed_count(&self) -> usize {
-        self.patches.len()
+    /// How many bytes differ from the file.
+    pub fn changed_count(&mut self) -> usize {
+        if let Some((rev, n)) = self.counted {
+            if rev == self.rev {
+                return n;
+            }
+        }
+        let entries: Vec<(u64, u8)> = self.patches.iter().map(|(&a, &b)| (a, b)).collect();
+        let n = entries
+            .into_iter()
+            .filter(|&(at, b)| self.pages.byte(at) != Some(b))
+            .count();
+        self.counted = Some((self.rev, n));
+        n
     }
 
+    /// The bytes wanted at every offset set (absolute; some may equal the file's).
     pub fn patches(&self) -> &BTreeMap<u64, u8> {
         &self.patches
     }
@@ -300,35 +327,26 @@ impl HexDoc {
         self.pages.reads
     }
 
-    fn put(&mut self, at: u64, value: Option<u8>) {
-        match value {
-            Some(b) => self.patches.insert(at, b),
-            None => self.patches.remove(&at),
-        };
-    }
-
     /// Overwrites the byte at `at` with `value`, one undo step (`cursor` = where the cursor is,
-    /// for the undo). Writing a byte's original value drops it from the changes. `false` past
-    /// the end or where the file cannot be read.
+    /// for the undo). Writing the byte already shown is no step. `false` past the end or where
+    /// the file cannot be read.
     pub fn set(&mut self, at: u64, value: u8, cursor: Cursor) -> bool {
         self.change(at, value, cursor).is_some()
     }
 
     /// [`HexDoc::set`], saying whether it made an undo step (`Some(false)`: the byte already
-    /// held `value`; `None`: past the end or unreadable).
+    /// showed `value`; `None`: past the end or unreadable).
     fn change(&mut self, at: u64, value: u8, cursor: Cursor) -> Option<bool> {
         self.open_step = None;
-        let original = self.pages.byte(at)?;
-        let before = self.patches.get(&at).copied();
-        let after = (value != original).then_some(value);
-        if before == after {
+        let before = self.byte(at)?;
+        if before == value {
             return Some(false);
         }
-        self.put(at, after);
+        self.patches.insert(at, value);
         self.undo.push_back(Step {
             at,
             before,
-            after,
+            after: value,
             cursor,
         });
         while self.undo.len() > self.undo_cap.max(1) {
@@ -347,16 +365,12 @@ impl HexDoc {
         if !open {
             return self.set(at, value, cursor);
         }
-        let Some(original) = self.pages.byte(at) else {
-            return false;
-        };
-        let after = (value != original).then_some(value);
         let step = self.undo.back_mut().expect("checked above");
-        step.after = after;
-        if step.before == after {
+        step.after = value;
+        if step.before == value {
             self.undo.pop_back();
         }
-        self.put(at, after);
+        self.patches.insert(at, value);
         self.rev += 1;
         true
     }
@@ -405,7 +419,7 @@ impl HexDoc {
     pub fn undo(&mut self) -> Option<Cursor> {
         self.open_step = None;
         let step = self.undo.pop_back()?;
-        self.put(step.at, step.before);
+        self.patches.insert(step.at, step.before);
         self.redo.push(step);
         self.rev += 1;
         Some(Cursor {
@@ -419,7 +433,7 @@ impl HexDoc {
     pub fn redo(&mut self) -> Option<Cursor> {
         self.open_step = None;
         let step = self.redo.pop()?;
-        self.put(step.at, step.after);
+        self.patches.insert(step.at, step.after);
         self.undo.push_back(step);
         self.rev += 1;
         Some(Cursor {
@@ -441,19 +455,43 @@ impl HexDoc {
         self.rev
     }
 
-    /// The bytes differ from what the original file holds now (what Save would write) — by
-    /// content: an edit undone, or a byte typed back to its value, is no change.
-    pub fn dirty(&self) -> bool {
-        self.patches != self.saved
+    /// Whether the bytes shown with `a` and with `b` over the file differ anywhere (a byte the
+    /// file cannot give counts as different).
+    fn differ(&mut self, a: &BTreeMap<u64, u8>, b: &BTreeMap<u64, u8>) -> bool {
+        let offsets: std::collections::BTreeSet<u64> = a.keys().chain(b.keys()).copied().collect();
+        offsets.into_iter().any(|at| {
+            let (x, y) = (a.get(&at).copied(), b.get(&at).copied());
+            match (x, y) {
+                (Some(x), Some(y)) => x != y,
+                (Some(v), None) | (None, Some(v)) => self.pages.byte(at) != Some(v),
+                (None, None) => false,
+            }
+        })
     }
 
-    /// The bytes are written nowhere — neither the original nor the last Save copy (the close
+    /// The bytes differ from what the file holds now (what Save would write) — by content: an
+    /// edit undone, or a byte typed back to its value, is no change.
+    pub fn dirty(&mut self) -> bool {
+        let (patches, saved) = (self.patches.clone(), self.saved.clone());
+        self.differ(&patches, &saved)
+    }
+
+    /// The bytes are written nowhere — neither the file nor the last Save copy (the close
     /// prompt).
-    pub fn unsaved(&self) -> bool {
-        self.dirty() && self.copied.as_ref() != Some(&self.patches)
+    pub fn unsaved(&mut self) -> bool {
+        if !self.dirty() {
+            return false;
+        }
+        match self.copied.clone() {
+            Some(copied) => {
+                let patches = self.patches.clone();
+                self.differ(&patches, &copied)
+            }
+            None => true,
+        }
     }
 
-    /// A Save of `changes` landed: the original file holds them now.
+    /// A Save of `changes` landed: the file holds them now.
     pub fn mark_saved(&mut self, changes: BTreeMap<u64, u8>) {
         self.saved = changes;
     }
@@ -463,47 +501,40 @@ impl HexDoc {
         self.copied = Some(changes);
     }
 
-    /// The file was saved in place with `wrote` (changes against the bytes as opened) and is
-    /// read through `file` from now on: those bytes are the new original. Every change — the
-    /// current ones, what is saved and copied, each undo and redo step — is said again against
-    /// them, so the bytes shown and the history stay exactly as they were.
-    pub fn rebase(&mut self, file: Arc<File>, wrote: &BTreeMap<u64, u8>) {
-        let mut offsets: std::collections::BTreeSet<u64> = wrote.keys().copied().collect();
-        offsets.extend(self.patches.keys());
-        offsets.extend(self.saved.keys());
-        offsets.extend(self.copied.iter().flat_map(|c| c.keys()));
-        offsets.extend(self.undo.iter().chain(&self.redo).map(|s| s.at));
-        // The bytes as opened, read from the old file before it is let go.
-        let old: HashMap<u64, Option<u8>> = offsets
-            .iter()
-            .map(|&at| (at, self.pages.byte(at)))
-            .collect();
-        let new_original = |at: u64| wrote.get(&at).copied().or(old[&at]);
-        let absolute = |at: u64, v: Option<u8>| v.or(old[&at]);
-        let relative = |at: u64, v: Option<u8>| v.filter(|&b| Some(b) != new_original(at));
-        let map = |m: &BTreeMap<u64, u8>| -> BTreeMap<u64, u8> {
-            let keys: std::collections::BTreeSet<u64> =
-                m.keys().chain(wrote.keys()).copied().collect();
-            keys.into_iter()
-                .filter_map(|at| relative(at, absolute(at, m.get(&at).copied())).map(|b| (at, b)))
-                .collect()
+    /// The file was saved in place and is read through `file` from now on — it holds what was
+    /// saved (checked by its hash before this). The edits, and every undo and redo step, are
+    /// absolute bytes: they stay as they are. An entry is dropped only where it equals the new
+    /// file's byte, read from `file`; nothing is read from the old one. All or nothing: a byte
+    /// `file` cannot give is an error and nothing is changed.
+    pub fn rebase(&mut self, file: Arc<File>) -> Result<()> {
+        let mut new = pages(file, self.pages.size);
+        let mut keep = |m: &BTreeMap<u64, u8>| -> Result<BTreeMap<u64, u8>> {
+            let mut out = BTreeMap::new();
+            for (&at, &b) in m {
+                let there = new.byte(at).ok_or_else(|| {
+                    anyhow!(
+                        "the saved file cannot be read at 0x{at:X} ({})",
+                        new.error
+                            .clone()
+                            .unwrap_or_else(|| "no byte there".to_string())
+                    )
+                })?;
+                if there != b {
+                    out.insert(at, b);
+                }
+            }
+            Ok(out)
         };
-        self.patches = map(&self.patches);
-        self.saved = map(&self.saved);
-        self.copied = self.copied.as_ref().map(map);
-        for step in self.undo.iter_mut().chain(self.redo.iter_mut()) {
-            step.before = relative(step.at, absolute(step.at, step.before));
-            step.after = relative(step.at, absolute(step.at, step.after));
-        }
-        self.pages = Pages {
-            file,
-            size: self.pages.size,
-            held: HashMap::new(),
-            tick: 0,
-            error: None,
-            reads: self.pages.reads,
-        };
+        let patches = keep(&self.patches)?;
+        let saved = keep(&self.saved)?;
+        let copied = self.copied.as_ref().map(&mut keep).transpose()?;
+        new.reads += self.pages.reads;
+        self.pages = new;
+        self.patches = patches;
+        self.saved = saved;
+        self.copied = copied;
         self.rev += 1;
+        Ok(())
     }
 }
 
@@ -941,6 +972,22 @@ impl HexFile {
             self.edits
                 .with_file_name(format!("{name}.hexpatch-{stamp}{unique}.txt"))
         })?;
+        let text = self.list_text(patches, why);
+        // Owner-only whatever the umask took from the creating call.
+        use std::os::unix::fs::PermissionsExt;
+        let written = file
+            .set_permissions(std::fs::Permissions::from_mode(0o600))
+            .and_then(|()| file.write_all(text.as_bytes()));
+        if let Err(e) = written {
+            let _ = std::fs::remove_file(&path);
+            return Err(e).with_context(|| format!("cannot write {}", path.display()));
+        }
+        Ok(path)
+    }
+
+    /// The list of edits as a `.hexpatch` file holds it: a header naming the source, then one
+    /// `offset: bytes` line per run of bytes (the bytes wanted, absolute).
+    pub(super) fn list_text(&self, patches: &BTreeMap<u64, u8>, why: &str) -> String {
         let mtime = self
             .opened
             .mtime
@@ -965,16 +1012,17 @@ impl HexFile {
             let hex: String = bytes.iter().map(|b| format!("{b:02X}")).collect();
             text.push_str(&format!("0x{start:X}: {hex}\n"));
         }
-        // Owner-only whatever the umask took from the creating call.
-        use std::os::unix::fs::PermissionsExt;
-        let written = file
-            .set_permissions(std::fs::Permissions::from_mode(0o600))
-            .and_then(|()| file.write_all(text.as_bytes()));
-        if let Err(e) = written {
-            let _ = std::fs::remove_file(&path);
-            return Err(e).with_context(|| format!("cannot write {}", path.display()));
-        }
-        Ok(path)
+        text
+    }
+
+    /// Nothing more is saved from this file.
+    pub(super) fn set_read_only(&mut self, why: &str) {
+        self.read_only.get_or_insert_with(|| why.to_string());
+    }
+
+    /// The file's name, for naming a list of its edits.
+    pub(super) fn name(&self) -> String {
+        self.origin.parent().1
     }
 
     /// The refusal for bytes as opened that changed: nothing written, the changes listed.
@@ -1107,7 +1155,7 @@ pub fn open(file: HexFile, hooks: &Hooks, notices: Vec<String>) -> Result<Outcom
     let mut doc = HexDoc::new(file.base(), file.size());
     let cursor = apply_state(&mut doc, hooks)?;
     if hooks.autosave {
-        return autosave(file, &doc, hooks);
+        return autosave(file, &mut doc, hooks);
     }
     let title = file.origin.display();
     if !file.can_replace() {
@@ -1158,7 +1206,7 @@ pub(super) fn finish(leftover: &Mutex<Option<Job>>, outcome: &Mutex<Outcome>) {
     }
 }
 
-fn autosave(mut file: HexFile, doc: &HexDoc, hooks: &Hooks) -> Result<Outcome> {
+fn autosave(mut file: HexFile, doc: &mut HexDoc, hooks: &Hooks) -> Result<Outcome> {
     let mut outcome = Outcome::default();
     if !doc.dirty() {
         println!("no changes; {} untouched", file.origin.display());
@@ -1303,8 +1351,15 @@ pub(super) struct HexWindow {
     /// The grid as last laid out, and how many rows the last pass painted.
     layout: Option<Layout>,
     rows_painted: u64,
-    /// Why the window is read-only (the file saved in place changed right after), if it is.
+    /// Why the window is read-only (the file saved in place changed right after, or cannot be
+    /// read back), and where the edits are kept — the line shown whole in the rows.
     read_only: Option<String>,
+    /// The reason alone, for the header of a list of the edits.
+    read_only_why: String,
+    /// Where the list of the edits was written, once it was.
+    retained: Option<PathBuf>,
+    /// Where "Write the list there" writes the list of edits.
+    pub(super) keep_to: String,
     /// Lines from open that must be read whole and stay (see [`super::disclosures`]).
     opened: Vec<String>,
     /// What the last write reported that must be read whole, and the next such report, held
@@ -1365,6 +1420,9 @@ impl HexWindow {
             layout: None,
             rows_painted: 0,
             read_only: None,
+            read_only_why: String::new(),
+            retained: None,
+            keep_to: String::new(),
             opened,
             notices: Vec::new(),
             pending_notices: None,
@@ -1487,7 +1545,7 @@ impl HexWindow {
             )),
         };
         let job = self.job.take().expect("checked above");
-        let (status, mut shown) = report(&result, &mut self.outcome.lock().unwrap());
+        let (status, shown) = report(&result, &mut self.outcome.lock().unwrap());
         self.status = status;
         // An edit made while the save ran is not in what it wrote.
         let newer = *self.doc.patches() != job.snapshot;
@@ -1500,8 +1558,12 @@ impl HexWindow {
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
                     .take_rebind();
                 match rebind {
-                    Some(Rebind::Rebound(file)) => self.doc.rebase(file, &job.snapshot),
-                    Some(Rebind::Lost(why)) => shown.push(self.turn_read_only(&why)),
+                    Some(Rebind::Rebound(file)) => {
+                        if let Err(e) = self.doc.rebase(file) {
+                            self.turn_read_only(&format!("{e:#}"));
+                        }
+                    }
+                    Some(Rebind::Lost(why)) => self.turn_read_only(&why),
                     None => {}
                 }
                 true
@@ -1548,25 +1610,115 @@ impl HexWindow {
         self.prompt || self.close_ok || self.read_only.is_some()
     }
 
-    /// The file saved in place no longer holds what was saved: nothing more is edited or saved
-    /// here. The edits are listed in a file of their own; returns the line saying so (read
-    /// whole, in the rows).
-    fn turn_read_only(&mut self, why: &str) -> String {
+    /// Nothing more is edited or saved here (the file saved in place no longer holds what was
+    /// saved, or cannot be read back): the edits are listed in a file of their own — or, when
+    /// that fails, the window says so and offers to try again or to write the list elsewhere,
+    /// and closing asks while they are unsaved.
+    fn turn_read_only(&mut self, why: &str) {
+        self.file
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .set_read_only(why);
+        self.read_only_why = why.to_string();
+        if self.keep_to.is_empty() {
+            let name = self
+                .file
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .name();
+            let dir = super::binary::download_dir();
+            self.keep_to = super::binary::tilde(&dir.join(format!("{name}.hexpatch.txt")));
+        }
+        self.read_only = Some(format!("read-only now: {why}"));
+        self.keep_edits();
+    }
+
+    /// Lists the edits among sopen's kept edits ("Keep edits…").
+    fn keep_edits(&mut self) {
         let listed = self
             .file
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .keep_patches(self.doc.patches(), why);
-        let line = match listed {
-            Ok(path) => format!(
-                "read-only now: {why}; your edits are listed in {}",
-                path.display()
+            .keep_patches(self.doc.patches(), &self.read_only_why);
+        self.kept(listed.map_err(|e| format!("{e:#}")));
+    }
+
+    /// Writes the list of the edits to the path in the field, as Save to… writes: a new file,
+    /// never over anything ("Write the list there").
+    fn keep_edits_at(&mut self) {
+        let mut dest = super::binary::untilde(&self.keep_to);
+        if dest.is_dir() {
+            let name = self
+                .file
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .name();
+            dest = dest.join(format!("{name}.hexpatch.txt"));
+        }
+        let text = self
+            .file
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .list_text(self.doc.patches(), &self.read_only_why);
+        let saved = super::binary::save_new(&dest, |f| {
+            f.write_all(text.as_bytes())?;
+            Ok(text.len() as u64)
+        });
+        let result = match saved {
+            Ok(_) => Ok(dest),
+            Err(super::binary::SaveError::Exists { next }) => {
+                self.keep_to = super::binary::tilde(&next);
+                Err(format!(
+                    "{} exists — not replaced; the field now holds the next free name",
+                    dest.display()
+                ))
+            }
+            Err(e) => Err(e.to_string()),
+        };
+        self.kept(result);
+    }
+
+    /// Says where the edits are kept now, or why they are not.
+    fn kept(&mut self, result: std::result::Result<PathBuf, String>) {
+        let why = &self.read_only_why;
+        let line = match result {
+            Ok(path) => {
+                let line = format!(
+                    "read-only now: {why}; your edits are listed in {}",
+                    path.display()
+                );
+                self.retained = Some(path);
+                line
+            }
+            Err(e) => format!(
+                "read-only now: {why}; your edits could not be listed ({e}) — Keep edits… tries \
+                 again, or write the list to a path of your choice"
             ),
-            Err(e) => format!("read-only now: {why}; your edits could not be listed ({e:#})"),
         };
         eprintln!("sopen: {line}");
-        self.read_only = Some(line.clone());
-        line
+        self.read_only = Some(line);
+    }
+
+    /// The row under the read-only line while the edits are not kept anywhere.
+    fn keep_row(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            if ui
+                .button("Keep edits…")
+                .on_hover_text("writes the list of your edits among sopen's kept edits")
+                .clicked()
+            {
+                self.keep_edits();
+            }
+            let room = (ui.available_width() - 170.0).max(120.0);
+            ui.add(egui::TextEdit::singleline(&mut self.keep_to).desired_width(room));
+            if ui
+                .button("Write the list there")
+                .on_hover_text("a new file at that path, never over an existing one")
+                .clicked()
+            {
+                self.keep_edits_at();
+            }
+        });
     }
 
     /// Keys for the whole window. `goto_owns` = the Go to field has this frame's typing (it is
@@ -2009,17 +2161,23 @@ impl HexWindow {
         let modal = egui::Modal::new(egui::Id::unique("sopen-hex-unsaved")).show(ctx, |ui| {
             ui.set_width(360.0);
             ui.heading("Unsaved changes");
-            ui.label(format!(
-                "Save the changes to {} before closing?",
-                self.title
-            ));
+            let read_only = self.read_only.is_some();
+            ui.label(if read_only {
+                format!(
+                    "Your edits to {} are kept nowhere and cannot be saved here; close anyway?",
+                    self.title
+                )
+            } else {
+                format!("Save the changes to {} before closing?", self.title)
+            });
             ui.add_space(8.0);
             ui.horizontal(|ui| {
-                if self.can_replace && ui.button("Save").clicked() {
+                if read_only {
+                } else if self.can_replace && ui.button("Save").clicked() {
                     self.prompt = false;
                     self.start(ctx, JobKind::Save { close_after: true });
                 }
-                if !self.can_replace && ui.button("Save copy").clicked() {
+                if !read_only && !self.can_replace && ui.button("Save copy").clicked() {
                     self.prompt = false;
                     self.start(ctx, JobKind::SaveCopy { close_after: true });
                 }
@@ -2079,13 +2237,18 @@ impl super::Window for HexWindow {
         let lines: Vec<(String, Color32)> = self
             .opened
             .iter()
+            .chain(&self.read_only)
             .chain(&self.notices)
             .map(|n| (n.clone(), error))
             .collect();
-        if !lines.is_empty() {
+        let keep_row = self.read_only.is_some() && self.retained.is_none();
+        if !lines.is_empty() || keep_row {
             egui::Panel::bottom("disclosures").show(ui, |ui| {
                 ui.add_space(2.0);
                 super::disclosures(ui, &lines);
+                if keep_row {
+                    self.keep_row(ui);
+                }
                 ui.add_space(2.0);
             });
         }
@@ -2101,9 +2264,16 @@ impl super::Window for HexWindow {
     }
 
     fn close_requested(&mut self) -> bool {
-        // Read-only: the edits are listed in a file; there is nothing to save or ask.
-        if self.close_ok || (self.read_only.is_some() && self.job.is_none()) {
+        if self.close_ok {
             return true;
+        }
+        // Read-only: nothing can be saved; closing asks only while the edits are kept nowhere.
+        if self.read_only.is_some() && self.job.is_none() {
+            if self.retained.is_some() || !self.doc.unsaved() {
+                return true;
+            }
+            self.prompt = true;
+            return false;
         }
         if self.job.is_some() {
             // Never close mid-write: the window closes once the save has reported.

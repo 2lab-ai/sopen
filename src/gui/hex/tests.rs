@@ -1827,6 +1827,7 @@ fn a_local_file_changed_right_after_its_save_turns_the_window_read_only() {
         .win
         .opened
         .iter()
+        .chain(&fx.win.read_only)
         .chain(&fx.win.notices)
         .cloned()
         .collect();
@@ -1927,4 +1928,228 @@ fn the_list_of_edits_is_owner_only_under_any_umask() {
     let kept = kept.unwrap();
     let mode = std::fs::metadata(&kept).unwrap().permissions().mode() & 0o777;
     assert_eq!(mode, 0o600);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Rebinding after a Save in place: the edits are never lost, never silently clean.
+
+/// A local file opened in place, with a second handle on the file as opened (to take its bytes
+/// away later) and a Save of the window's edits run as the worker would — before the result is
+/// handed to the window.
+fn saved_in_place(fs: Box<dyn RemoteFs + Send>, edit: impl FnOnce(&mut Fx)) -> (Fx, File, Saved) {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("local.bin");
+    std::fs::write(&path, FIXTURE).unwrap();
+    let old = File::options().write(true).open(&path).unwrap();
+    let abs = path.to_str().unwrap().to_string();
+    let at = LocalFs::new().stat(&abs).unwrap();
+    let origin = Origin::new(fs, None, None, abs, at);
+    let cache = tmp.path().join("cache");
+    let file = HexFile::open(origin, &path, None, &cache).unwrap();
+    let mut fx = Fx {
+        remote: path.clone(),
+        base: path,
+        tmp,
+        win: window_for(file),
+        drv: Driver::new(1000.0, 600.0),
+    };
+    fx.drv.idle(&mut fx.win, 2);
+    edit(&mut fx);
+    let snapshot = fx.win.doc.patches().clone();
+    let saved = fx.win.file.lock().unwrap().save(&snapshot).unwrap();
+    (fx, old, saved)
+}
+
+impl Fx {
+    /// The save started with the current edits as its snapshot lands now.
+    fn lands(&mut self, saved: Saved, snapshot: BTreeMap<u64, u8>) {
+        let (tx, rx) = mpsc::channel();
+        self.win.job = Some(Job {
+            kind: JobKind::Save { close_after: false },
+            snapshot,
+            rx,
+        });
+        tx.send(Ok(JobDone::Saved(saved))).unwrap();
+        self.settle();
+    }
+
+    /// The folder lists of edits go to refuses new files (until [`unblock`]).
+    fn block_lists(&self) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let file = self.win.file.lock().unwrap();
+        let dir = file.edits.parent().unwrap().to_path_buf();
+        drop(file);
+        crate::cache::private_dir(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+        dir
+    }
+
+    fn lists(&self) -> Vec<PathBuf> {
+        walk(&self.tmp.path().join("cache"))
+            .into_iter()
+            .filter(|p| p.to_string_lossy().contains(".hexpatch-"))
+            .collect()
+    }
+}
+
+fn unblock(dir: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+}
+
+/// Root ignores folder permissions: the tests that block a folder that way skip under it.
+fn running_as_root() -> bool {
+    // SAFETY: geteuid has no preconditions.
+    unsafe { libc::geteuid() == 0 }
+}
+
+/// A change saved in place, undone while the save ran; then the file as opened goes away (its
+/// page dropped from the cache, its bytes truncated): after the rebind the undo is still there
+/// — the byte shown is the one before the change, unsaved, and closing asks.
+#[test]
+fn an_undo_during_an_in_place_save_survives_the_rebind() {
+    let (mut fx, old, saved) = saved_in_place(Box::new(LocalFs::new()), |fx| {
+        fx.key(Key::ArrowRight, Modifiers::NONE);
+        fx.typed("00");
+    });
+    assert!(matches!(saved, Saved::Written { .. }), "{saved:?}");
+    let snapshot = BTreeMap::from([(1u64, 0u8)]);
+    fx.key(Key::Z, command(false));
+    assert_eq!(fx.win.doc.byte(1), Some(b'o'));
+    fx.win.doc.pages.held.clear();
+    old.set_len(0).unwrap();
+    fx.lands(saved, snapshot);
+    assert!(fx.win.read_only.is_none(), "{:?}", fx.win.read_only);
+    assert_eq!(fx.win.doc.byte(1), Some(b'o'), "the undo vanished");
+    assert!(fx.win.doc.unsaved(), "silently clean");
+    assert!(!fx.win.close_requested(), "closed over the undo");
+    assert!(fx.win.prompt);
+    // And it saves: the file gets the byte back.
+    fx.win.prompt = false;
+    fx.key(Key::S, command(false));
+    fx.wait_for_save();
+    assert_eq!(std::fs::read(&fx.remote).unwrap(), FIXTURE);
+}
+
+/// The new file cannot be read where the window must check an edit against it (truncated right
+/// after the save): the rebase is not made — the window turns read-only and the edits are kept
+/// in a list, desired bytes as shown.
+#[test]
+fn a_new_file_that_cannot_be_read_keeps_the_edits_read_only() {
+    let (mut fx, _old, saved) = saved_in_place(Box::new(LocalFs::new()), |fx| {
+        fx.key(Key::ArrowRight, Modifiers::NONE);
+        fx.typed("00");
+    });
+    let snapshot = fx.win.doc.patches().clone();
+    fx.key(Key::Z, command(false));
+    File::options()
+        .write(true)
+        .open(&fx.remote)
+        .unwrap()
+        .set_len(0)
+        .unwrap();
+    fx.lands(saved, snapshot);
+    let said = fx.win.read_only.clone().expect("read-only");
+    let lists = fx.lists();
+    assert_eq!(lists.len(), 1, "{lists:?}");
+    let text = std::fs::read_to_string(&lists[0]).unwrap();
+    assert!(text.lines().any(|l| l == "0x1: 6F"), "{text}");
+    assert!(said.contains(&*lists[0].to_string_lossy()), "{said}");
+}
+
+/// Read-only after a failed rebind, with newer edits, and the list of edits cannot be written
+/// (the edits folder is blocked): closing does not succeed silently — it asks (Discard /
+/// Cancel). "Keep edits…" retries the list once the cause is gone; then closing is free.
+#[test]
+fn read_only_with_unlisted_edits_asks_before_closing_and_retries() {
+    if running_as_root() {
+        eprintln!("skipping: root ignores folder permissions");
+        return;
+    }
+    let after = Arc::new(Mutex::new(None::<PathBuf>));
+    let target = after.clone();
+    let fs = FirstWrite {
+        fs: LocalFs::new(),
+        before_write: None,
+        after_rename: Some(Box::new(move || {
+            let path = target.lock().unwrap().clone().unwrap();
+            File::options()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .write_all_at(b"ZZ", 3)
+                .unwrap();
+        })),
+    };
+    let after2 = after.clone();
+    let (mut fx, _old, saved) = saved_in_place(Box::new(fs), move |fx| {
+        *after2.lock().unwrap() = Some(fx.remote.clone());
+        fx.typed("00");
+    });
+    let snapshot = fx.win.doc.patches().clone();
+    // A newer edit, made while the save ran (the cursor moved on to byte 1).
+    fx.typed("11");
+    let blocked = fx.block_lists();
+    fx.lands(saved, snapshot);
+    assert!(fx.win.read_only.is_some());
+    assert!(fx.lists().is_empty());
+    assert!(!fx.win.close_requested(), "closed with unlisted edits");
+    fx.drv.idle(&mut fx.win, 2);
+    for label in ["Discard", "Cancel"] {
+        assert!(fx.drv.find_text(label).is_some(), "{label}");
+    }
+    fx.drv.click_text(&mut fx.win, "Cancel");
+    assert!(!fx.win.close_ok);
+    unblock(&blocked);
+    fx.settle();
+    fx.drv.click_text(&mut fx.win, "Keep edits…");
+    fx.settle();
+    let lists = fx.lists();
+    assert_eq!(lists.len(), 1, "{lists:?}");
+    let text = std::fs::read_to_string(&lists[0]).unwrap();
+    assert!(text.lines().any(|l| l == "0x0: 0011"), "{text}");
+    assert!(fx.win.close_requested(), "the edits are listed now");
+}
+
+/// The list of edits can also be written where the owner chooses, with Save to…'s rules (a new
+/// file, never over anything).
+#[test]
+fn read_only_edits_can_be_listed_at_a_chosen_path() {
+    if running_as_root() {
+        eprintln!("skipping: root ignores folder permissions");
+        return;
+    }
+    let after = Arc::new(Mutex::new(None::<PathBuf>));
+    let target = after.clone();
+    let fs = FirstWrite {
+        fs: LocalFs::new(),
+        before_write: None,
+        after_rename: Some(Box::new(move || {
+            let path = target.lock().unwrap().clone().unwrap();
+            File::options()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .write_all_at(b"ZZ", 3)
+                .unwrap();
+        })),
+    };
+    let after2 = after.clone();
+    let (mut fx, _old, saved) = saved_in_place(Box::new(fs), move |fx| {
+        *after2.lock().unwrap() = Some(fx.remote.clone());
+        fx.typed("00");
+    });
+    let snapshot = fx.win.doc.patches().clone();
+    fx.typed("11");
+    let blocked = fx.block_lists();
+    fx.lands(saved, snapshot);
+    let chosen = fx.tmp.path().join("my-edits.txt");
+    fx.win.keep_to = chosen.to_str().unwrap().to_string();
+    fx.settle();
+    fx.drv.click_text(&mut fx.win, "Write the list there");
+    fx.settle();
+    let text = std::fs::read_to_string(&chosen).unwrap();
+    assert!(text.lines().any(|l| l == "0x0: 0011"), "{text}");
+    assert!(fx.win.close_requested());
+    unblock(&blocked);
 }

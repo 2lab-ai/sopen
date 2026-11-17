@@ -233,7 +233,8 @@ Esc do nothing and closing waits for it.
   to a folder is followed at that moment) and everything after goes through that descriptor, never
   the path again. A path ending in '/', a folder that does not exist or a file where the folder
   should be fails at once; a taken name is refused before anything moves. sopen makes a private
-  folder `.sopen-<16 hex>` (0700) in it and, inside, `part` — created exclusively, without following
+  folder `.sopen-<16 hex>` (0700; 02700 in a setgid folder, so on Linux `part` and the published
+  file still get the shared folder's group) in it and, inside, `part` — created exclusively, without following
   a link, owner-only (0600) by the creating call — so the staging name never grows with the chosen
   one, and no other user can put or swap anything in it (other processes of the same user are
   trusted). Before a byte is transferred, `part` is linked to a second name inside the private
@@ -245,7 +246,8 @@ Esc do nothing and closing waits for it.
   publish that fails for another reason keeps the complete `part` and the error says why and where;
   sopen never copies into a final name. A name taken at
   the last moment is refused like any taken name: the dialog says so and puts the next free
-  `<stem>-N<ext>` in the field; "Save to…" again saves there. Cleanup only ever removes sopen's own
+  `<stem>-N<ext>` in the field (the stem gives way, on a character boundary, so the name stays
+  within 255 bytes); "Save to…" again saves there. Cleanup only ever removes sopen's own
   names inside its private folder, then the folder (a failure to remove it is said); an interrupted
   save leaves only that hidden folder. A download
   whose source changes meanwhile is not saved — a best-effort check: the remote's size and mtime
@@ -284,9 +286,11 @@ once the primary button is up, and take rows off the grid's bottom.
 - Editing only overwrites; the file's size never changes. In the hex column a hex digit overwrites
   the high nibble, the next one the low nibble, and the cursor moves on (the two digits are one undo
   step, also at the undo bound); in the ASCII column a printable ASCII character overwrites the
-  byte. Edits are a sparse map offset → byte over the bytes as opened — the cached copy is never
-  written; a byte typed back to its original value is no longer a change. "Unsaved" is by content:
-  edits undone back to what the file holds (as opened, or as last saved) are not unsaved. Changed
+  byte. Edits are a sparse map offset → the byte wanted there, in absolute values (and each undo
+  and redo step records the bytes shown before and after) — the cached copy is never written;
+  whether a byte is changed is a comparison with the file, so a byte typed back to its value is no
+  longer a change. "Unsaved" is by content: edits undone back to what the file holds (as opened,
+  or as last saved) are not unsaved. Changed
   bytes are marked in both columns. Undo/Redo: Cmd/Ctrl+Z, Shift+Cmd/Ctrl+Z.
 - Status bar: the cursor's offset (hex and decimal), its byte (hex, decimal, the character when
   printable), the file's size (the exact count on hover), "N bytes changed", "unsaved", and the
@@ -313,10 +317,15 @@ once the primary button is up, and take rows off the grid's bottom.
   not change it), so a copy changed during an upload — even with its mtime put back — is refused by
   the next Save. A local file saved in place was replaced by the rename: the window re-binds to the
   file now at the path only if its content's SHA-256 equals the stage's (taken in the same pass);
-  it becomes the new original (the edits and the undo history are said again against it, so the
-  bytes shown and undo stay as they were). If it does not match (another writer, right after), the
-  window turns read-only, says so whole in the rows, and lists the edits in a `.hexpatch` file; the
-  edits are not lost. A save whose worker ends without a result is a visible failure; the edits stay
+  it becomes the new original. Nothing is read from the old file then: the edits and the history
+  are absolute and stay as they are, and an edit is dropped only where it equals the new file's
+  byte, read from the new file. That rebase is all or nothing: a byte the new file cannot give
+  leaves the edits as they were and turns the window read-only. If the hash does not match
+  (another writer, right after), the window turns read-only too. Read-only says so whole in the
+  rows and lists the edits (the bytes wanted, absolute) in a `.hexpatch` file. When that list
+  cannot be written, the rows say why and offer "Keep edits…" (try again) and "Write the list
+  there" (a path the owner types, written as Save to… writes: a new file, never over anything);
+  while the edits are kept nowhere and unsaved, closing asks (Discard / Cancel). A save whose worker ends without a result is a visible failure; the edits stay
   and the window stays usable.
 - Where the server cannot replace a file in one step (`posix-rename@openssh.com`), Save is off with
   the reason on hover and in the rows; editing and Save copy work — the image window's rule.

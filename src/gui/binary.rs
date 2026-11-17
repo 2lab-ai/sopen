@@ -150,12 +150,34 @@ pub fn next_free(path: &Path) -> PathBuf {
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
     for n in 1..10_000 {
-        let candidate = path.with_file_name(crate::remote::suffixed(&name, n));
+        let candidate = path.with_file_name(fitted(&name, n));
         if std::fs::symlink_metadata(&candidate).is_err() {
             return candidate;
         }
     }
-    path.with_file_name(crate::remote::suffixed(&name, 10_000))
+    path.with_file_name(fitted(&name, 10_000))
+}
+
+/// The longest name a folder takes, in bytes (macOS and Linux alike).
+const NAME_MAX: usize = 255;
+
+/// `<stem>-N<ext>` within [`NAME_MAX`] bytes: the stem gives way (cut on a character boundary)
+/// when the name is already at the limit.
+fn fitted(name: &str, n: u32) -> String {
+    let full = crate::remote::suffixed(name, n);
+    if full.len() <= NAME_MAX {
+        return full;
+    }
+    let (stem, ext) = match name.rfind('.') {
+        Some(i) if i > 0 => name.split_at(i),
+        _ => (name, ""),
+    };
+    let tail = format!("-{n}{ext}");
+    let mut room = NAME_MAX.saturating_sub(tail.len()).min(stem.len());
+    while !stem.is_char_boundary(room) {
+        room -= 1;
+    }
+    format!("{}{tail}", &stem[..room])
 }
 
 /// Where "Save to…" saves first: `SOPEN_SAVE_TO`, else `<download folder>/<name>`.
@@ -298,6 +320,17 @@ impl Staging {
     /// Makes the private folder in `dir` (the destination folder's descriptor; `parent` is how
     /// it is shown).
     fn make(dir: OwnedFd, parent: &Path) -> Result<Self> {
+        // A setgid folder (a shared one) gives what is made in it its group — on Linux only while
+        // the private folder keeps the bit, so owner-only keeps it too.
+        // SAFETY: `st` is written by the call; the descriptor is ours.
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        sys(unsafe { libc::fstat(dir.as_raw_fd(), &mut st) })
+            .with_context(|| format!("cannot stat the folder {}", parent.display()))?;
+        let private_mode = if st.st_mode & libc::S_ISGID != 0 {
+            0o2700
+        } else {
+            0o700
+        };
         for _ in 0..32 {
             let hex = crate::remote::random_hex();
             let name = format!(".sopen-{hex}");
@@ -337,7 +370,8 @@ impl Staging {
                 done: false,
             };
             // SAFETY: a descriptor this save owns.
-            if let Err(e) = sys(unsafe { libc::fchmod(staging.private.as_raw_fd(), 0o700) }) {
+            if let Err(e) = sys(unsafe { libc::fchmod(staging.private.as_raw_fd(), private_mode) })
+            {
                 let left = staging.clean();
                 return Err(with_left(
                     anyhow::Error::new(e).context(format!(

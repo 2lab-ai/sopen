@@ -620,6 +620,115 @@ fn save_new_follows_a_link_to_a_folder() {
     assert_eq!(names(&real_dir), ["a.bin"]);
 }
 
+/// The next free name of a name already at the longest a folder takes still fits: the stem
+/// gives way to the `-N`, and a save there works.
+#[test]
+fn the_next_free_name_of_a_longest_name_still_fits() {
+    let tmp = tempfile::tempdir().unwrap();
+    let long = format!("{}.bin", "n".repeat(251));
+    let taken = tmp.path().join(&long);
+    std::fs::write(&taken, b"mine").unwrap();
+    let next = next_free(&taken);
+    let name = next.file_name().unwrap().to_string_lossy().into_owned();
+    assert!(name.len() <= 255, "{} bytes: {name}", name.len());
+    assert!(name.ends_with("-1.bin"), "{name}");
+    save_new(&next, |f: &mut File| {
+        f.write_all(BODY)?;
+        Ok(BODY.len() as u64)
+    })
+    .unwrap();
+    assert_eq!(std::fs::read(&next).unwrap(), BODY);
+    // A multi-byte stem is cut on a character boundary.
+    let wide = "한".repeat(85);
+    assert_eq!(wide.len(), 255);
+    let taken = tmp.path().join(&wide);
+    std::fs::write(&taken, b"mine").unwrap();
+    let next = next_free(&taken);
+    let name = next.file_name().unwrap().to_str().unwrap().to_string();
+    assert_eq!(name, format!("{}-1", "한".repeat(84)));
+    std::fs::write(&next, b"").unwrap();
+}
+
+/// A group of ours other than the primary one (root may use any), to see a folder's group pass
+/// to a new file; `None` when there is none.
+fn another_group() -> Option<u32> {
+    // SAFETY: plain id queries; getgroups fills at most the room given.
+    unsafe {
+        if libc::geteuid() == 0 {
+            return Some(4242);
+        }
+        let primary = libc::getegid();
+        let mut groups = vec![0 as libc::gid_t; 256];
+        let n = libc::getgroups(groups.len() as libc::c_int, groups.as_mut_ptr());
+        groups
+            .into_iter()
+            .take(n.max(0) as usize)
+            .find(|&g| g != primary)
+            .map(|g| g as _)
+    }
+}
+
+/// A setgid folder (a shared folder) keeps its group on what is saved in it: the private
+/// staging folder keeps the setgid bit when it is made owner-only, so `part` — and the published
+/// file — get the folder's group (Linux follows the bit; BSD and macOS always give the folder's
+/// group). Where the folder's group is another group of ours, the file is checked to carry it.
+#[test]
+fn a_setgid_folders_group_reaches_the_saved_file() {
+    use std::os::unix::fs::MetadataExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let shared = tmp.path().join("shared");
+    std::fs::create_dir(&shared).unwrap();
+    let group = another_group();
+    if let Some(gid) = group {
+        std::os::unix::fs::chown(&shared, None, Some(gid)).unwrap();
+    }
+    std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o2775)).unwrap();
+    let want_gid = std::fs::metadata(&shared).unwrap().gid();
+    let dest = shared.join("a.bin");
+    let seen = std::cell::Cell::new(None);
+    save_new(&dest, |f: &mut File| {
+        f.write_all(BODY)?;
+        let private = private_folder(&shared).expect("a private staging folder");
+        let mode = std::fs::metadata(&private).unwrap().mode();
+        seen.set(Some((mode & 0o7777, f.metadata().unwrap().gid())));
+        Ok(BODY.len() as u64)
+    })
+    .unwrap();
+    let (private_mode, part_gid) = seen.get().unwrap();
+    assert_eq!(
+        private_mode, 0o2700,
+        "{private_mode:o}: setgid kept, owner-only"
+    );
+    if group.is_none() {
+        eprintln!("note: no second group of ours here; only the setgid bit was checked");
+        return;
+    }
+    assert_eq!(part_gid, want_gid, "part has the folder's group");
+    assert_eq!(std::fs::metadata(&dest).unwrap().gid(), want_gid);
+}
+
+/// The folder is opened once: a link to it retargeted while the bytes are on their way changes
+/// nothing — the file is published in the folder opened, and the new target is left untouched.
+#[test]
+fn a_folder_link_retargeted_during_the_save_changes_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (first, second) = (tmp.path().join("first"), tmp.path().join("second"));
+    std::fs::create_dir(&first).unwrap();
+    std::fs::create_dir(&second).unwrap();
+    let via = tmp.path().join("via");
+    std::os::unix::fs::symlink(&first, &via).unwrap();
+    let fill = |f: &mut File| -> Result<u64> {
+        f.write_all(BODY)?;
+        std::fs::remove_file(&via)?;
+        std::os::unix::fs::symlink(&second, &via)?;
+        Ok(BODY.len() as u64)
+    };
+    save_new(&via.join("a.bin"), fill).unwrap();
+    assert_eq!(std::fs::read(first.join("a.bin")).unwrap(), BODY);
+    assert_eq!(names(&first), ["a.bin"], "cleanup in the folder opened");
+    assert!(names(&second).is_empty(), "the new target was touched");
+}
+
 /// Never over, or through, anything: an existing file or a link (even a dangling one) is
 /// "exists" before any byte moves; a name taken at the last moment (during the fill, or between
 /// the fill and the link) is "exists" too, the other file untouched and the staging folder gone.
