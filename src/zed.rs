@@ -1,5 +1,6 @@
-//! Zed as the folder/text editor (spec §3 A2): locate the CLI, build the `ssh://` URL, spawn it
-//! detached. When Zed is absent, text falls back to `$VISUAL` / `$EDITOR` in the terminal.
+//! Folder/text editors (spec §3 A2): VS Code first, then Zed. Locate the CLI, build its
+//! arguments, spawn it detached. When neither is present, text falls back to `$VISUAL` /
+//! `$EDITOR` in the terminal.
 
 use anyhow::{bail, Context, Result};
 use std::ffi::{OsStr, OsString};
@@ -60,6 +61,131 @@ pub fn locate_in(
     fixed.iter().map(PathBuf::from).find(|p| exists(p))
 }
 
+/// The VS Code CLI, or `None`. `SOPEN_CODE` overrides the search (an empty value = "no VS Code").
+pub fn locate_code() -> Option<PathBuf> {
+    if let Some(forced) = std::env::var_os("SOPEN_CODE") {
+        return (!forced.is_empty()).then(|| PathBuf::from(forced));
+    }
+    locate_code_in(
+        Os::current(),
+        std::env::var_os("PATH").as_deref(),
+        std::env::var_os("HOME").as_deref(),
+        is_executable,
+    )
+}
+
+fn locate_code_in(
+    os: Os,
+    path_var: Option<&OsStr>,
+    home: Option<&OsStr>,
+    exists: impl Fn(&Path) -> bool,
+) -> Option<PathBuf> {
+    for dir in path_var.map(std::env::split_paths).into_iter().flatten() {
+        let candidate = dir.join("code");
+        if exists(&candidate) {
+            return Some(candidate);
+        }
+    }
+    if os == Os::MacOs {
+        let bundle = "Visual Studio Code.app/Contents/Resources/app/bin/code";
+        let system = Path::new("/Applications").join(bundle);
+        if exists(&system) {
+            return Some(system);
+        }
+        if let Some(home) = home {
+            let user = Path::new(home).join("Applications").join(bundle);
+            if exists(&user) {
+                return Some(user);
+            }
+        }
+    }
+    None
+}
+
+/// The editor a folder or text file opens in.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Editor {
+    Code(PathBuf),
+    /// `code_cannot_remote`: VS Code is installed but has no Remote - SSH for this remote path.
+    Zed {
+        cli: PathBuf,
+        code_cannot_remote: bool,
+    },
+    Neither {
+        code_cannot_remote: bool,
+    },
+}
+
+/// VS Code when found (a remote path also needs its Remote - SSH extension), else Zed.
+pub fn choose(
+    remote: bool,
+    code: Option<PathBuf>,
+    remote_ssh: impl FnOnce() -> bool,
+    zed: impl FnOnce() -> Option<PathBuf>,
+) -> Editor {
+    let code_cannot_remote = match code {
+        Some(code) if !remote || remote_ssh() => return Editor::Code(code),
+        Some(_) => true,
+        None => false,
+    };
+    match zed() {
+        Some(cli) => Editor::Zed {
+            cli,
+            code_cannot_remote,
+        },
+        None => Editor::Neither { code_cannot_remote },
+    }
+}
+
+/// Whether Remote - SSH is in VS Code's extensions directory: `$VSCODE_EXTENSIONS` when set (VS
+/// Code's own override, also the test hook), else `~/.vscode/extensions`. Read from disk, without
+/// starting VS Code.
+pub fn remote_ssh_installed() -> bool {
+    let dir = match std::env::var_os("VSCODE_EXTENSIONS").filter(|d| !d.is_empty()) {
+        Some(dir) => PathBuf::from(dir),
+        None => match std::env::var_os("HOME") {
+            Some(home) => Path::new(&home).join(".vscode").join("extensions"),
+            None => return false,
+        },
+    };
+    remote_ssh_in(&dir)
+}
+
+/// Whether `dir` (a VS Code extensions directory) holds Remote - SSH: a directory
+/// `ms-vscode-remote.remote-ssh-<version>` that `.obsolete` (uninstalled, not yet removed) does
+/// not name. `remote-ssh-edit-<version>` is a different extension.
+pub fn remote_ssh_in(dir: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    let obsolete = std::fs::read_to_string(dir.join(".obsolete")).unwrap_or_default();
+    entries.flatten().any(|entry| {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            return false;
+        };
+        let is_remote_ssh = name
+            .to_ascii_lowercase()
+            .strip_prefix("ms-vscode-remote.remote-ssh-")
+            .is_some_and(|version| version.starts_with(|c: char| c.is_ascii_digit()));
+        is_remote_ssh && entry.path().is_dir() && !obsolete.contains(&format!("\"{name}\""))
+    })
+}
+
+/// VS Code's remote authority is an SSH alias or user@host, not a Zed URL.
+pub fn code_args(remote: Option<(Option<&str>, &str)>, path: &str) -> Vec<OsString> {
+    let mut args = Vec::new();
+    if let Some((user, host)) = remote {
+        let authority = match user {
+            Some(user) => format!("ssh-remote+{user}@{host}"),
+            None => format!("ssh-remote+{host}"),
+        };
+        args.extend([OsString::from("--remote"), OsString::from(authority)]);
+    }
+    args.push(OsString::from(path));
+    args
+}
+
 fn is_executable(path: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
     std::fs::metadata(path).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
@@ -103,23 +229,27 @@ fn encode_path(path: &str) -> String {
 /// terminal's Ctrl-C. Waits briefly: the CLI hands off to the app and exits; a quick non-zero
 /// exit is reported. Returns the command line that was run (for the debug log and receipts).
 pub fn open(zed: &Path, arg: &OsStr) -> Result<String> {
+    open_args(zed, &[arg.to_os_string()])
+}
+
+/// Spawns an editor with argv-only arguments, without shell interpolation.
+pub fn open_args(editor: &Path, args: &[OsString]) -> Result<String> {
     use std::os::unix::process::CommandExt;
-    let args = vec![arg.to_os_string()];
-    let line = crate::render_command(zed.as_os_str(), &args);
+    let line = crate::render_command(editor.as_os_str(), args);
     crate::debug!("spawn: {line}");
-    let mut child = Command::new(zed)
-        .args(&args)
+    let mut child = Command::new(editor)
+        .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .process_group(0)
         .spawn()
-        .with_context(|| format!("cannot start {}", zed.display()))?;
+        .with_context(|| format!("cannot start {}", editor.display()))?;
     let deadline = Instant::now() + Duration::from_secs(3);
     while Instant::now() < deadline {
         if let Some(status) = child.try_wait()? {
             if !status.success() {
-                bail!("{} exited with {status}", zed.display());
+                bail!("{} exited with {status}", editor.display());
             }
             return Ok(line);
         }
@@ -159,6 +289,118 @@ pub fn run_terminal_editor(file: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn code_discovery_and_arguments() {
+        let path = std::env::join_paths(["/a", "/b"]).unwrap();
+        let bundle = "/Applications/Visual Studio Code.app/Contents/Resources/app/bin/code";
+        let user = "/home/test/Applications/Visual Studio Code.app/Contents/Resources/app/bin/code";
+        assert_eq!(
+            locate_code_in(
+                Os::MacOs,
+                Some(&path),
+                Some(OsStr::new("/home/test")),
+                |p| p == Path::new("/b/code") || p == Path::new(bundle)
+            ),
+            Some(PathBuf::from("/b/code"))
+        );
+        assert_eq!(
+            locate_code_in(Os::MacOs, None, Some(OsStr::new("/home/test")), |p| p
+                == Path::new(bundle)),
+            Some(PathBuf::from(bundle))
+        );
+        assert_eq!(
+            locate_code_in(Os::MacOs, None, Some(OsStr::new("/home/test")), |p| p
+                == Path::new(user)),
+            Some(PathBuf::from(user))
+        );
+        assert_eq!(
+            locate_code_in(Os::Linux, None, Some(OsStr::new("/home/test")), |p| p
+                == Path::new(user)),
+            None
+        );
+        for path in ["/folder # % 한글", "/folder # % 한글/file $(touch x).txt"] {
+            assert_eq!(code_args(None, path), [OsString::from(path)]);
+            assert_eq!(
+                code_args(Some((Some("user"), "alias")), path),
+                [
+                    OsString::from("--remote"),
+                    OsString::from("ssh-remote+user@alias"),
+                    OsString::from(path)
+                ]
+            );
+            assert_eq!(
+                code_args(Some((None, "alias")), path),
+                [
+                    OsString::from("--remote"),
+                    OsString::from("ssh-remote+alias"),
+                    OsString::from(path)
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn remote_without_remote_ssh_falls_back_to_zed() {
+        let code = || Some(PathBuf::from("/bin/code"));
+        let zed = || Some(PathBuf::from("/bin/zed"));
+        assert_eq!(
+            choose(true, code(), || true, zed),
+            Editor::Code(PathBuf::from("/bin/code"))
+        );
+        assert_eq!(
+            choose(true, code(), || false, zed),
+            Editor::Zed {
+                cli: PathBuf::from("/bin/zed"),
+                code_cannot_remote: true
+            }
+        );
+        assert_eq!(
+            choose(true, code(), || false, || None),
+            Editor::Neither {
+                code_cannot_remote: true
+            }
+        );
+        // A local path never needs the extension (and does not look for it).
+        let unused = || -> bool { panic!("extensions read for a local path") };
+        assert_eq!(
+            choose(false, code(), unused, zed),
+            Editor::Code(PathBuf::from("/bin/code"))
+        );
+        assert_eq!(
+            choose(true, None, || true, zed),
+            Editor::Zed {
+                cli: PathBuf::from("/bin/zed"),
+                code_cannot_remote: false
+            }
+        );
+        assert_eq!(
+            choose(false, None, || true, || None),
+            Editor::Neither {
+                code_cannot_remote: false
+            }
+        );
+    }
+
+    #[test]
+    fn remote_ssh_extension_detection() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        assert!(!remote_ssh_in(&dir.join("missing")));
+        assert!(!remote_ssh_in(dir));
+        // Remote - SSH: Editing Configuration Files shares the prefix; it is not Remote - SSH.
+        std::fs::create_dir(dir.join("ms-vscode-remote.remote-ssh-edit-0.87.0")).unwrap();
+        assert!(!remote_ssh_in(dir));
+        std::fs::create_dir(dir.join("ms-vscode-remote.remote-ssh-0.120.0")).unwrap();
+        assert!(remote_ssh_in(dir));
+        // Uninstalled but not yet removed: VS Code lists it in `.obsolete`.
+        std::fs::write(
+            dir.join(".obsolete"),
+            r#"{"ms-vscode-remote.remote-ssh-0.120.0":true}"#,
+        )
+        .unwrap();
+        assert!(!remote_ssh_in(dir));
+    }
 
     #[test]
     fn urls() {

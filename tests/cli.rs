@@ -11,6 +11,8 @@ fn sopen_command(home: &Path) -> Command {
     cmd.env("SOPEN_CACHE_DIR", home.join("cache"))
         .env("SOPEN_STATE_DIR", home.join("state"))
         .env("SOPEN_CONFIG", home.join("config.toml"))
+        .env("SOPEN_CODE", "")
+        .env("VSCODE_EXTENSIONS", home.join("vscode-extensions"))
         .env_remove("SOPEN_TARGET");
     for key in sopen::forward::FORWARDED_ENV {
         cmd.env_remove(key);
@@ -73,6 +75,90 @@ fn other_files_print_their_path_and_log_usage() {
 }
 
 #[test]
+fn code_takes_priority_over_zed_for_folder_and_text() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let code = tmp.path().join("code");
+    let zed = tmp.path().join("zed");
+    let code_record = tmp.path().join("code-record");
+    let zed_record = tmp.path().join("zed-record");
+    for (exe, record) in [(&code, &code_record), (&zed, &zed_record)] {
+        std::fs::write(
+            exe,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" >> '{}'\n",
+                record.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let dir = tmp.path().join("project # % 한글");
+    std::fs::create_dir(&dir).unwrap();
+    let file = dir.join("hello world.txt");
+    std::fs::write(&file, "text").unwrap();
+    // `sopen_command`'s VSCODE_EXTENSIONS has no Remote - SSH: a local path uses VS Code anyway.
+    for target in [&dir, &file] {
+        let out = sopen(
+            tmp.path(),
+            &[target.to_str().unwrap()],
+            &[
+                ("SOPEN_CODE", code.to_str().unwrap()),
+                ("SOPEN_ZED", zed.to_str().unwrap()),
+            ],
+        );
+        assert!(out.status.success(), "{}", text(&out.stderr));
+        assert!(
+            text(&out.stdout).contains("in VS Code"),
+            "{}",
+            text(&out.stdout)
+        );
+    }
+    let seen = std::fs::read_to_string(&code_record).unwrap();
+    assert_eq!(
+        seen.lines().collect::<Vec<_>>(),
+        [
+            std::fs::canonicalize(&dir)
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_string(),
+            std::fs::canonicalize(&file)
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_string()
+        ]
+    );
+    assert!(!zed_record.exists());
+}
+
+#[test]
+fn code_failure_does_not_open_zed() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let code = tmp.path().join("code");
+    let zed = tmp.path().join("zed");
+    let marker = tmp.path().join("zed-opened");
+    std::fs::write(&code, "#!/bin/sh\nexit 42\n").unwrap();
+    std::fs::write(&zed, format!("#!/bin/sh\ntouch '{}'\n", marker.display())).unwrap();
+    for exe in [&code, &zed] {
+        std::fs::set_permissions(exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let out = sopen(
+        tmp.path(),
+        &[tmp.path().to_str().unwrap()],
+        &[
+            ("SOPEN_CODE", code.to_str().unwrap()),
+            ("SOPEN_ZED", zed.to_str().unwrap()),
+        ],
+    );
+    assert_eq!(out.status.code(), Some(1));
+    assert!(text(&out.stderr).contains("42"), "{}", text(&out.stderr));
+    assert!(!marker.exists());
+}
+
+#[test]
 fn folders_and_text_go_to_the_editor_command() {
     let tmp = tempfile::tempdir().unwrap();
     // A stand-in Zed CLI that records its argument.
@@ -125,7 +211,7 @@ fn folders_and_text_go_to_the_editor_command() {
     let out = sopen(tmp.path(), &[dir.to_str().unwrap()], &[("SOPEN_ZED", "")]);
     assert_eq!(out.status.code(), Some(1));
     assert!(
-        text(&out.stderr).contains("Zed was not found"),
+        text(&out.stderr).contains("VS Code was not found and Zed was not found"),
         "{}",
         text(&out.stderr)
     );
@@ -136,6 +222,23 @@ fn folders_and_text_go_to_the_editor_command() {
         &[("SOPEN_ZED", ""), ("VISUAL", "true")],
     );
     assert!(out.status.success(), "{}", text(&out.stderr));
+}
+
+#[test]
+fn app_selection_does_not_open_code() {
+    let tmp = tempfile::tempdir().unwrap();
+    let code = tmp.path().join("code");
+    let marker = tmp.path().join("code-opened");
+    executable(&code, &format!("#!/bin/sh\ntouch '{}'\n", marker.display()));
+    let file = tmp.path().join("notes.txt");
+    std::fs::write(&file, "text").unwrap();
+    let out = sopen(
+        tmp.path(),
+        &[file.to_str().unwrap(), "--app", "NoSuchAppSopenTest"],
+        &[("SOPEN_CODE", code.to_str().unwrap())],
+    );
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out.stderr));
+    assert!(!marker.exists());
 }
 
 #[test]
