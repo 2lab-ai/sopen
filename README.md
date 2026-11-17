@@ -8,6 +8,7 @@ sopen myserver:~/project           # folder → Zed remote, as a project
 sopen myserver:/tmp/shot.png       # image → view, rectangle crop / pixelize, save back
 sopen myserver:/tmp/talk.mp4       # video → play, rectangle crop, time cut → new file next to it
 sopen myserver:/tmp/a.mp3          # audio → play, time cut
+sopen --target <host> myserver:/tmp/a.mp3   # the same, on <host>'s screen instead of this one
 ```
 
 Same syntax as `scp`. Uses your `ssh` and `~/.ssh/config`; the remote needs nothing but sshd.
@@ -22,14 +23,52 @@ brew install 2lab-ai/tap/sopen-preview    # macOS (arm64, x86_64), Linux (x86_64
 
 - Media needs `ffmpeg` and `ffprobe` (the formula installs them).
 - Linux: the ALSA runtime library (libasound2 / alsa-lib) — present on desktop Linux; sopen runs
-  on the machine you sit at, not on the remote. The image and media windows need a desktop
-  session (X11 or Wayland).
+  on the machine whose screen shows the file (the one you sit at, or the `--target`), not on the
+  remote. The image and media windows need a desktop session (X11 or Wayland).
 
 ## What the remote needs
 
 Only sshd with its SFTP subsystem (the default). sopen installs and runs nothing there. When you open
 a folder or text file, Zed installs its own remote server on first use — that is Zed's behaviour,
-not sopen's. Images and media are fetched over SFTP and handled locally.
+not sopen's. Images and media are fetched over SFTP and handled locally. (A `--target` machine is
+different: it shows the file, so it needs sopen installed — see below.)
+
+## Open on another machine's screen: `--target`
+
+```sh
+sopen myserver:/tmp/a.html                    # opens here, on the machine you typed it on
+sopen --target <host> myserver:/tmp/a.html    # opens on <host>'s screen (sopen runs there, over ssh)
+sopen --target <host> <host>:/tmp/a.html      # a file on <host> itself opens there as a local file
+sopen --target <host> ./notes.txt             # a local file: <host> fetches it from this machine
+sopen config target <host>                    # from now on `sopen SOURCE` opens on <host>
+sopen --here myserver:/tmp/a.html             # …but this one here
+sopen config                                  # where the config file is, and the target
+sopen config target --unset                   # back to this machine
+```
+
+The config file is `~/.config/sopen/config.toml` (`$XDG_CONFIG_HOME/sopen/config.toml` when that is
+set, `$SOPEN_CONFIG` overrides both) on macOS and Linux alike:
+
+```toml
+target = "<host>"
+```
+
+`--target` or `--here` (not both) decides one run; without them `SOPEN_TARGET=<host>` in the
+environment comes first, then the config. `<host>` is `[user@]host` — an ssh alias or a host
+name that `ssh <host>` reaches; a port or an IPv6 address goes into `~/.ssh/config` under an
+alias. It needs sopen installed; sopen there gets `--here`, so it never sends the file on again.
+A local file (or a `localhost:` one) is fetched by `<host>` from this machine by its short host
+name, so that name must work for `ssh` on `<host>`.
+
+The window opens on `<host>`'s desktop session (on Linux sopen finds it through
+`systemctl --user`). On macOS an app started over ssh cannot take focus: sopen's own window
+floats above the other windows until you click, type or scroll in it (or it gets focus), but Zed
+opens behind the active app. From a terminal, Ctrl+C reaches `<host>` and closes the window
+there; a sopen stopped without a terminal leaves the window on `<host>` open.
+
+The exit code is `<host>`'s; `could not reach <host>` means ssh did not get there, `sopen is not
+installed on <host>` (exit 127) means it has no sopen, and `sopen on <host> ended with status
+N (signal n?)` means it most likely was interrupted there.
 
 ## Images
 

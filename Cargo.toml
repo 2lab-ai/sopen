@@ -45,6 +45,11 @@ rtrb = "0.4.1"
 libc = "0.2.191"
 # openssh / openssh-sftp-client are async; sopen drives them from a current-thread runtime.
 tokio = { version = "1.54.1", features = ["rt", "time"] }
+# The config file (`target = "<host>"`, spec §4a) is TOML; a key sopen does not know is an error.
+serde = { version = "1.0.229", features = ["derive"] }
+toml = "1.2.1"
+# Is `--target HOST` this machine? (spec §4a) — HOST is compared with this machine's host name.
+gethostname = "1.1.0"
 
 [dev-dependencies]
 tempfile = "3.27.0"

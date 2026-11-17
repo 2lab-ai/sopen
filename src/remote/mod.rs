@@ -7,7 +7,7 @@ mod local;
 mod sftp;
 
 pub use local::LocalFs;
-pub use sftp::SftpRemote;
+pub use sftp::{connection_args, SftpRemote};
 
 use anyhow::{anyhow, bail, Context, Result};
 use sha2::{Digest, Sha256};

@@ -1,14 +1,26 @@
-//! The `sopen` binary on local targets: no ssh, no network. Cache and state go to a temp dir.
+//! The `sopen` binary on local targets: no ssh, no network. Cache, state and config go to a temp
+//! dir; `--target` runs a fake `ssh`.
 
 use std::path::Path;
 use std::process::{Command, Output};
 
-fn sopen(home: &Path, args: &[&str], env: &[(&str, &str)]) -> Output {
+/// The binary with cache, state and config under `home`, and nothing from the caller's
+/// environment that would forward the run (a default target) or change it (a receipt hook).
+fn sopen_command(home: &Path) -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_sopen"));
-    cmd.args(args)
-        .env("SOPEN_CACHE_DIR", home.join("cache"))
+    cmd.env("SOPEN_CACHE_DIR", home.join("cache"))
         .env("SOPEN_STATE_DIR", home.join("state"))
-        .env_remove("SOPEN_LOG");
+        .env("SOPEN_CONFIG", home.join("config.toml"))
+        .env_remove("SOPEN_TARGET");
+    for key in sopen::forward::FORWARDED_ENV {
+        cmd.env_remove(key);
+    }
+    cmd
+}
+
+fn sopen(home: &Path, args: &[&str], env: &[(&str, &str)]) -> Output {
+    let mut cmd = sopen_command(home);
+    cmd.args(args);
     for (k, v) in env {
         cmd.env(k, v);
     }
@@ -239,10 +251,8 @@ fn image_autosave_refuses_a_file_changed_meanwhile() {
     let tmp = tempfile::tempdir().unwrap();
     let png = tmp.path().join("shot.png");
     small_png(&png);
-    let mut child = Command::new(env!("CARGO_BIN_EXE_sopen"))
+    let mut child = sopen_command(tmp.path())
         .arg(&png)
-        .env("SOPEN_CACHE_DIR", tmp.path().join("cache"))
-        .env("SOPEN_STATE_DIR", tmp.path().join("state"))
         .env("SOPEN_STATE", "rect=0,0,8,8;op=crop")
         .env("SOPEN_AUTOSAVE", "1")
         .env("SOPEN_AUTOSAVE_DELAY_MS", "1000")
@@ -305,4 +315,530 @@ fn media_autoexport_writes_a_sibling() {
         &[("SOPEN_STATE", "op=crop"), ("SOPEN_AUTOEXPORT", "1")],
     );
     assert_eq!(bad.status.code(), Some(1));
+}
+
+// ---------------------------------------------------------------------------------------------
+// Where it opens (spec §4a). `ssh` is a stand-in: it answers `ssh -G`, records the call that runs
+// sopen on the target, and then runs it as OpenSSH does — the words after the destination
+// joined with spaces, `sh -c "<line>"` on the "target" (here, in a home of its own, with a
+// PATH of only the tools the script uses and a display set; the script's Linux branch has its
+// own tests). The target has nothing installed: no sopen on that PATH, and the absolute install
+// paths in the command are pointed at a directory that does not exist, so a sopen installed on
+// the test machine is never run. `FAKE_SSH_EXIT` stops it before the run, with that code.
+
+/// A target name no test machine has.
+const HOST: &str = "sopen-test-target";
+
+/// What the fake `ssh -G` reports; nothing binds it. Short, so no temp dir is too long for it.
+const CONTROL_PATH: &str = "/s/cm-test";
+
+/// Where the target looks for sopen besides PATH (spec §4a), outside the target's home; the fake
+/// ssh points them elsewhere.
+const INSTALLED: [&str; 3] = [
+    "/opt/homebrew/bin/sopen",
+    "/usr/local/bin/sopen",
+    "/home/linuxbrew/.linuxbrew/bin/sopen",
+];
+
+/// The tools the target's script runs besides shell builtins (its Linux display branch is not
+/// taken: the fake target has a display).
+const TARGET_TOOLS: [&str; 3] = ["env", "sh", "uname"];
+
+/// `name` on the test process's PATH: the first absolute, executable file, canonicalized.
+fn which(name: &str) -> Option<std::path::PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .filter(|dir| dir.is_absolute())
+        .filter_map(|dir| dir.join(name).canonicalize().ok())
+        .find(|p| {
+            std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+        })
+}
+
+struct FakeSsh {
+    dir: std::path::PathBuf,
+    path: String,
+    /// A sopen for the target that records its arguments (`FAKE_SOPEN_EXIT` = its exit code,
+    /// `FAKE_SOPEN_SIGNAL` = a signal it sends itself).
+    sopen: std::path::PathBuf,
+}
+
+fn executable(path: &Path, body: &str) {
+    std::fs::write(path, body).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+impl FakeSsh {
+    fn new(home: &Path) -> Self {
+        let dir = home.join("fake-ssh");
+        let target_path = dir.join("target-path");
+        std::fs::create_dir_all(&target_path).unwrap();
+        for tool in TARGET_TOOLS {
+            let real = which(tool).unwrap_or_else(|| panic!("{tool} is not on PATH"));
+            std::os::unix::fs::symlink(real, target_path.join(tool)).unwrap();
+        }
+        let unplug: String = INSTALLED
+            .iter()
+            .map(|p| format!(" -e 's|{p}|{}/not-installed{p}|g'", dir.display()))
+            .collect();
+        executable(
+            &dir.join("ssh"),
+            &format!(
+                "#!/bin/sh\n\
+                 if [ \"$1\" = -G ]; then printf 'controlpath {CONTROL_PATH}\\nconnecttimeout none\\n'; exit 0; fi\n\
+                 for a in \"$@\"; do printf '%s\\n' \"$a\"; done > '{dir}/argv'\n\
+                 if [ -n \"${{FAKE_SSH_EXIT:-}}\" ]; then exit \"$FAKE_SSH_EXIT\"; fi\n\
+                 while [ \"$#\" -gt 0 ] && [ \"$1\" != -- ]; do shift; done\n\
+                 shift\n\
+                 line=$(printf '%s' \"$*\" | sed{unplug})\n\
+                 mkdir -p '{dir}/target-home'\n\
+                 HOME='{dir}/target-home' PATH='{dir}/target-path' DISPLAY=:99 exec /bin/sh -c \"$line\"\n",
+                dir = dir.display()
+            ),
+        );
+        // A sopen on this machine's PATH (first on it, beside the fake ssh) that the target must
+        // never run: it leaves `decoy-ran` behind.
+        executable(
+            &dir.join("sopen"),
+            &format!("#!/bin/sh\n: > '{}/decoy-ran'\n", dir.display()),
+        );
+        let sopen = dir.join("target-sopen");
+        executable(
+            &sopen,
+            &format!(
+                "#!/bin/sh\nfor a in \"$@\"; do printf '%s\\n' \"$a\"; done > '{dir}/sopen-argv'\n\
+                 if [ -n \"${{FAKE_SOPEN_SIGNAL:-}}\" ]; then kill -\"$FAKE_SOPEN_SIGNAL\" $$; fi\n\
+                 exit \"${{FAKE_SOPEN_EXIT:-0}}\"\n",
+                dir = dir.display()
+            ),
+        );
+        let path = format!(
+            "{}:{}",
+            dir.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        Self { dir, path, sopen }
+    }
+
+    fn lines(&self, name: &str) -> Option<Vec<String>> {
+        let text = std::fs::read_to_string(self.dir.join(name)).ok()?;
+        Some(text.lines().map(str::to_string).collect())
+    }
+
+    /// The arguments of the call that ran sopen on the target (`None`: ssh was not run).
+    fn argv(&self) -> Option<Vec<String>> {
+        self.lines("argv")
+    }
+
+    /// The arguments the target's sopen got (`None`: it did not run).
+    fn sopen_argv(&self) -> Option<Vec<String>> {
+        self.lines("sopen-argv")
+    }
+
+    fn forget(&self) {
+        for name in ["argv", "sopen-argv"] {
+            let _ = std::fs::remove_file(self.dir.join(name));
+        }
+    }
+
+    fn connection(&self) -> Vec<String> {
+        let mut args = vec!["-S".to_string(), CONTROL_PATH.to_string()];
+        for opt in [
+            "ControlMaster=auto",
+            "ControlPersist=60s",
+            "ServerAliveInterval=10",
+            "ServerAliveCountMax=3",
+            "ConnectTimeout=15",
+        ] {
+            args.extend(["-o".to_string(), opt.to_string()]);
+        }
+        args
+    }
+}
+
+/// `'word'` — the target's words are single-quoted (spec §4a).
+fn q(word: &str) -> String {
+    format!("'{word}'")
+}
+
+fn usage_lines(home: &Path) -> Vec<serde_json::Value> {
+    std::fs::read_to_string(home.join("state/usage.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect()
+}
+
+#[test]
+fn target_runs_sopen_there_over_ssh_and_keeps_its_exit_code() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ssh = FakeSsh::new(tmp.path());
+    let bin = ssh.sopen.to_str().unwrap();
+    let source = format!("{HOST}:/tmp/a b.png");
+    let out = sopen(
+        tmp.path(),
+        &["--target", HOST, &source],
+        &[
+            ("PATH", &ssh.path),
+            ("SOPEN_TARGET_BIN", bin),
+            ("FAKE_SOPEN_EXIT", "3"),
+        ],
+    );
+    assert_eq!(out.status.code(), Some(3), "{}", text(&out.stderr));
+    let argv = ssh.argv().expect("ssh ran");
+    let mut want = ssh.connection();
+    // No terminal here (stdin is not one), so none there, and no input either; a RemoteCommand
+    // in ~/.ssh/config is overridden.
+    want.extend(
+        [
+            "-T",
+            "-n",
+            "-o",
+            "RemoteCommand=none",
+            "-o",
+            "LogLevel=ERROR",
+            HOST,
+            "--",
+        ]
+        .map(String::from),
+    );
+    assert_eq!(argv[..want.len()], want[..], "{argv:#?}");
+    let words = &argv[want.len()..];
+    let hook = format!("SOPEN_TARGET_BIN={bin}");
+    assert_eq!(
+        words[..5],
+        ["exec".to_string(), q("env"), q(&hook), q("sh"), q("-c")],
+        "{words:#?}"
+    );
+    // The file is on the target itself: its path there, opened there with --here.
+    assert_eq!(ssh.sopen_argv().unwrap(), ["--here", "--", "/tmp/a b.png"]);
+    // HOST refused a write: a conflict in this machine's log too.
+    let log = usage_lines(tmp.path());
+    assert_eq!(log[0]["forwarded"], true);
+    assert_eq!(log[0]["conflict"], true);
+    assert_eq!(log[0]["ext"], "png");
+    assert_eq!(log[0]["ok"], false, "exit 3 is not ok");
+
+    // Quotes, backslashes, `$`, spaces and non-ASCII arrive as typed.
+    let odd = r#"/tmp/it's a $HOME \x "y" 한글.png"#;
+    let out = sopen(
+        tmp.path(),
+        &["--target", HOST, &format!("{HOST}:{odd}")],
+        &[("PATH", &ssh.path), ("SOPEN_TARGET_BIN", bin)],
+    );
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert_eq!(ssh.sopen_argv().unwrap(), ["--here", "--", odd]);
+
+    // A local file is fetched by the target from this machine; hooks travel, local paths stay.
+    let blob = tmp.path().join("blob.bin");
+    std::fs::write(&blob, [0u8, 1]).unwrap();
+    let out = sopen(
+        tmp.path(),
+        &[
+            "--target",
+            HOST,
+            "--app",
+            "Hex Fiend",
+            blob.to_str().unwrap(),
+        ],
+        &[
+            ("PATH", &ssh.path),
+            ("SOPEN_TARGET_BIN", bin),
+            ("SOPEN_LOG", "debug"),
+        ],
+    );
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let short = sopen::forward::short_hostname().expect("this machine has a host name");
+    let real = std::fs::canonicalize(&blob).unwrap();
+    assert_eq!(
+        ssh.sopen_argv().unwrap(),
+        [
+            "--here",
+            "--app",
+            "Hex Fiend",
+            "--",
+            &format!("{short}:{}", real.display())
+        ]
+    );
+    let argv = ssh.argv().unwrap();
+    let at = argv.iter().position(|a| a == "--").unwrap();
+    assert_eq!(
+        argv[at + 1..at + 5],
+        ["exec".to_string(), q("env"), q("SOPEN_LOG=debug"), q(&hook)]
+    );
+    // `--app` waits for Enter on this side's input: no `-n`.
+    let n = ssh.connection().len();
+    assert_eq!(argv[n..n + 2], ["-T", "-o"], "{argv:#?}");
+    assert!(
+        !argv.iter().any(|a| a.contains("SOPEN_CACHE_DIR")),
+        "{argv:#?}"
+    );
+
+    // A missing local file is the same error as a local open, and nothing is run.
+    ssh.forget();
+    let missing = tmp.path().join("nope.txt");
+    let out = sopen(
+        tmp.path(),
+        &["--target", HOST, missing.to_str().unwrap()],
+        &[("PATH", &ssh.path), ("SOPEN_TARGET_BIN", bin)],
+    );
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        text(&out.stderr).contains("no such file"),
+        "{}",
+        text(&out.stderr)
+    );
+    assert!(ssh.argv().is_none());
+    let log = std::fs::read_to_string(tmp.path().join("state/usage.jsonl")).unwrap();
+    assert!(!log.contains(HOST), "{log}");
+}
+
+#[test]
+fn no_sopen_on_the_target_is_its_own_message_and_127() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ssh = FakeSsh::new(tmp.path());
+    let out = sopen(
+        tmp.path(),
+        &["--target", HOST, "other:/x.png"],
+        &[("PATH", &ssh.path)],
+    );
+    assert_eq!(out.status.code(), Some(127), "{}", text(&out.stderr));
+    assert!(
+        !ssh.dir.join("decoy-ran").exists(),
+        "the target ran a sopen from this machine's PATH"
+    );
+    assert_eq!(
+        text(&out.stderr),
+        format!("sopen is not installed on {HOST} (brew install 2lab-ai/tap/sopen-preview)\n")
+    );
+    assert!(ssh.sopen_argv().is_none());
+    // What was sent is the real list: the fake only pointed these elsewhere.
+    let argv = ssh.argv().unwrap();
+    for path in INSTALLED {
+        assert!(argv.iter().any(|w| w.contains(path)), "{path} not sent");
+    }
+}
+
+#[test]
+fn here_and_target_together_are_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ssh = FakeSsh::new(tmp.path());
+    let out = sopen(
+        tmp.path(),
+        &["--here", "--target", HOST, "x:/a.png"],
+        &[("PATH", &ssh.path)],
+    );
+    assert_eq!(out.status.code(), Some(2), "{}", text(&out.stderr));
+    assert!(
+        text(&out.stderr).contains("cannot be used with"),
+        "{}",
+        text(&out.stderr)
+    );
+    assert!(ssh.argv().is_none(), "ssh ran");
+}
+
+#[test]
+fn ssh_failing_is_could_not_reach() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ssh = FakeSsh::new(tmp.path());
+    let out = sopen(
+        tmp.path(),
+        &["--target", HOST, "other:/x.png"],
+        &[("PATH", &ssh.path), ("FAKE_SSH_EXIT", "255")],
+    );
+    assert_eq!(out.status.code(), Some(1));
+    let err = text(&out.stderr);
+    assert_eq!(err, format!("sopen: could not reach {HOST}\n"));
+    // Another machine's file goes as it was typed.
+    assert_eq!(ssh.argv().unwrap().last().unwrap(), &q("other:/x.png"));
+    // The target's sopen stopped by a signal is said so — not "could not reach".
+    let out = sopen(
+        tmp.path(),
+        &["--target", HOST, "other:/x.png"],
+        &[
+            ("PATH", &ssh.path),
+            ("SOPEN_TARGET_BIN", ssh.sopen.to_str().unwrap()),
+            ("FAKE_SOPEN_SIGNAL", "TERM"),
+        ],
+    );
+    assert_eq!(out.status.code(), Some(1));
+    // (The target's shell may report the signal on its own line first.)
+    let err = text(&out.stderr);
+    assert_eq!(
+        err.lines().last(),
+        Some(format!("sopen: sopen on {HOST} ended with status 143 (signal 15?)").as_str()),
+        "{err}"
+    );
+    // A HOST that would read as an ssh option is refused before ssh runs.
+    ssh.forget();
+    let out = sopen(
+        tmp.path(),
+        &["--target=-oProxyCommand=x", "other:/x.png"],
+        &[("PATH", &ssh.path)],
+    );
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        text(&out.stderr).contains("--target: "),
+        "{}",
+        text(&out.stderr)
+    );
+    assert!(ssh.argv().is_none());
+}
+
+/// The destination ssh was asked for (`None`: ssh was not run).
+fn destination(ssh: &FakeSsh) -> Option<String> {
+    let argv = ssh.argv()?;
+    let at = argv.iter().position(|a| a == "--")?;
+    Some(argv[at - 1].clone())
+}
+
+#[test]
+fn default_target_from_config_or_env_and_the_flags_beat_both() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ssh = FakeSsh::new(tmp.path());
+    let path = [("PATH", ssh.path.as_str()), ("FAKE_SSH_EXIT", "0")];
+    let set = sopen(tmp.path(), &["config", "target", HOST], &path);
+    assert!(set.status.success(), "{}", text(&set.stderr));
+    let shown = sopen(tmp.path(), &["config"], &path);
+    let config = tmp.path().join("config.toml");
+    assert_eq!(
+        text(&shown.stdout),
+        format!("{}\ntarget = {HOST}\n", config.display())
+    );
+
+    // The config's target, with no flag.
+    let blob = tmp.path().join("blob.bin");
+    std::fs::write(&blob, [0u8, 1]).unwrap();
+    let out = sopen(tmp.path(), &["x:/a.mp3"], &path);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert_eq!(destination(&ssh).as_deref(), Some(HOST));
+
+    // SOPEN_TARGET comes before the config.
+    let env = [
+        ("PATH", ssh.path.as_str()),
+        ("FAKE_SSH_EXIT", "0"),
+        ("SOPEN_TARGET", "env-target"),
+    ];
+    let out = sopen(tmp.path(), &["x:/a.mp3"], &env);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert_eq!(destination(&ssh).as_deref(), Some("env-target"));
+
+    // --target comes before both.
+    let out = sopen(tmp.path(), &["--target", "flag-target", "x:/a.mp3"], &env);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert_eq!(destination(&ssh).as_deref(), Some("flag-target"));
+
+    // --here beats both: opened here, no ssh.
+    ssh.forget();
+    let out = sopen(tmp.path(), &["--here", blob.to_str().unwrap()], &env);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let real = std::fs::canonicalize(&blob).unwrap();
+    assert_eq!(text(&out.stdout).trim(), real.to_str().unwrap());
+    assert!(ssh.argv().is_none(), "ssh ran for --here");
+    assert_eq!(usage_lines(tmp.path()).last().unwrap()["forwarded"], false);
+
+    // Unset: back to this machine.
+    let out = sopen(tmp.path(), &["config", "target", "--unset"], &path);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert_eq!(std::fs::read_to_string(&config).unwrap(), "");
+    let shown = sopen(tmp.path(), &["config"], &path);
+    assert!(text(&shown.stdout).ends_with("target is not set\n"));
+    let out = sopen(tmp.path(), &[blob.to_str().unwrap()], &path);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert!(ssh.argv().is_none(), "ssh ran with no target");
+}
+
+#[test]
+fn an_unreadable_sopen_target_only_matters_without_a_flag() {
+    use std::os::unix::ffi::OsStrExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let ssh = FakeSsh::new(tmp.path());
+    let blob = tmp.path().join("blob.bin");
+    std::fs::write(&blob, [0u8, 1]).unwrap();
+    let bad = std::ffi::OsStr::from_bytes(b"box\xff");
+    let run = |args: &[&str]| {
+        sopen_command(tmp.path())
+            .args(args)
+            .env("PATH", &ssh.path)
+            .env("FAKE_SSH_EXIT", "0")
+            .env("SOPEN_TARGET", bad)
+            .output()
+            .unwrap()
+    };
+    let out = run(&["--here", blob.to_str().unwrap()]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let out = run(&["--target", HOST, "x:/a.mp3"]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert_eq!(destination(&ssh).as_deref(), Some(HOST));
+    let out = run(&[blob.to_str().unwrap()]);
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(
+        text(&out.stderr),
+        "sopen: SOPEN_TARGET is not valid UTF-8\n"
+    );
+}
+
+/// A 4 s sine WAV at `path`, or `false` when there is no ffmpeg (a failure under
+/// `SOPEN_REQUIRE_FFMPEG`).
+fn sine_wav(path: &Path) -> bool {
+    let ffmpeg = std::env::var("SOPEN_FFMPEG").unwrap_or_else(|_| "ffmpeg".into());
+    let generated = Command::new(&ffmpeg)
+        .args(["-hide_banner", "-loglevel", "error", "-nostdin", "-y"])
+        .args(["-f", "lavfi", "-i", "sine=frequency=440:duration=4"])
+        .arg(path)
+        .status();
+    match generated {
+        Ok(s) if s.success() => true,
+        _ if std::env::var_os("SOPEN_REQUIRE_FFMPEG").is_some() => {
+            panic!("SOPEN_REQUIRE_FFMPEG is set but ffmpeg did not run")
+        }
+        _ => false,
+    }
+}
+
+#[test]
+fn a_broken_config_is_an_error_where_it_is_read() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = tmp.path().join("config.toml");
+    std::fs::write(&config, "target = \"box\"\ncolour = \"red\"\n").unwrap();
+    let blob = tmp.path().join("blob.bin");
+    std::fs::write(&blob, [0u8, 1]).unwrap();
+    let out = sopen(tmp.path(), &[blob.to_str().unwrap()], &[]);
+    assert_eq!(out.status.code(), Some(1));
+    let err = text(&out.stderr);
+    assert!(
+        err.starts_with(&format!("sopen: {}: line 2: ", config.display())),
+        "{err}"
+    );
+    assert!(err.contains("colour"), "{err}");
+    assert_eq!(err.lines().count(), 1, "{err}");
+    let shown = sopen(tmp.path(), &["config"], &[]);
+    assert_eq!(shown.status.code(), Some(1));
+    let set = sopen(tmp.path(), &["config", "target", "other"], &[]);
+    assert_eq!(
+        set.status.code(),
+        Some(1),
+        "a file sopen cannot read is not replaced"
+    );
+    assert!(std::fs::read_to_string(&config).unwrap().contains("colour"));
+    let bad = sopen(tmp.path(), &["config", "target", "a b"], &[]);
+    assert_eq!(bad.status.code(), Some(1));
+
+    // Not consulted, so not in the way: --here, and cut.
+    let out = sopen(tmp.path(), &["--here", blob.to_str().unwrap()], &[]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let wav = tmp.path().join("a.wav");
+    if !sine_wav(&wav) {
+        eprintln!("skipping the cut under a broken config: ffmpeg not available");
+        return;
+    }
+    let out = sopen(
+        tmp.path(),
+        &["cut", wav.to_str().unwrap(), "1", "0:03"],
+        &[],
+    );
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert!(text(&out.stdout).trim().ends_with("/a.cut-1-3.wav"));
 }

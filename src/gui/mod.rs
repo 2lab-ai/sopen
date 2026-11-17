@@ -307,6 +307,67 @@ struct Shell<W: Window> {
     shot: Option<Shot>,
     frames: u64,
     started: Instant,
+    /// When the first focus request went out.
+    focus_asked: Option<Instant>,
+    raise: Raise,
+}
+
+/// How long the window may take to report focus after the first focus request.
+const FOCUS_GRACE: Duration = Duration::from_millis(300);
+
+/// Bringing a window to the front when focus is refused: macOS keeps an app started over ssh
+/// (`--target`) unfocused and behind the active app, whatever it asks for. Still unfocused
+/// [`FOCUS_GRACE`] after the focus requests, the window floats above the others
+/// (`WindowLevel::AlwaysOnTop`) until it gains focus or the first key, click, scroll or text lands
+/// in it, then goes back to the normal level. No timeout: back at the normal level while
+/// unfocused, macOS puts it straight behind the active app again (measured). Focus itself is
+/// untouched (`focused=` stays truthful).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Raise {
+    /// Waiting to see whether the focus requests worked.
+    Waiting,
+    /// Above the other windows.
+    Floating,
+    /// Nothing more to do.
+    Done,
+}
+
+impl Raise {
+    /// One frame: the next state and the window level to set, if it changes. `asked` = when the
+    /// first focus request went out (`None` before), `requests_done` = all of them went out.
+    fn step(
+        self,
+        asked: Option<Instant>,
+        requests_done: bool,
+        focused: Option<bool>,
+        input: bool,
+        now: Instant,
+    ) -> (Self, Option<egui::WindowLevel>) {
+        match self {
+            Raise::Waiting => match asked {
+                Some(_) if focused == Some(true) && requests_done => (Raise::Done, None),
+                Some(at) if requests_done && now.saturating_duration_since(at) >= FOCUS_GRACE => {
+                    (Raise::Floating, Some(egui::WindowLevel::AlwaysOnTop))
+                }
+                _ => (self, None),
+            },
+            Raise::Floating if input || focused == Some(true) => {
+                (Raise::Done, Some(egui::WindowLevel::Normal))
+            }
+            other => (other, None),
+        }
+    }
+}
+
+/// A key press, click, scroll or typed text — the user is in the window.
+fn user_input(event: &egui::Event) -> bool {
+    matches!(
+        event,
+        egui::Event::Key { pressed: true, .. }
+            | egui::Event::PointerButton { pressed: true, .. }
+            | egui::Event::MouseWheel { .. }
+            | egui::Event::Text(_)
+    )
 }
 
 impl<W: Window> Shell<W> {
@@ -385,8 +446,27 @@ impl<W: Window> eframe::App for Shell<W> {
         }
         if (1..=3).contains(&self.frames) {
             ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+            self.focus_asked.get_or_insert_with(Instant::now);
         }
         self.frames += 1;
+        let (focused, input) =
+            ctx.input(|i| (i.viewport().focused, i.events.iter().any(user_input)));
+        let (raise, level) = self.raise.step(
+            self.focus_asked,
+            self.frames > 3,
+            focused,
+            input,
+            Instant::now(),
+        );
+        self.raise = raise;
+        if let Some(level) = level {
+            ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(level));
+        }
+        match self.raise {
+            Raise::Waiting => ctx.request_repaint_after(Duration::from_millis(50)),
+            // Focus and input arrive as window events, which repaint by themselves.
+            Raise::Floating | Raise::Done => {}
+        }
         if command_key(&ctx, egui::Key::Q, false) || command_key(&ctx, egui::Key::W, false) {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
@@ -483,6 +563,8 @@ pub fn run_window<W: Window + 'static>(
         }),
         frames: 0,
         started: Instant::now(),
+        focus_asked: None,
+        raise: Raise::Waiting,
     };
     // The app moves into whichever renderer starts. A renderer that fails before creating the
     // app leaves it here for the next one.
@@ -632,6 +714,78 @@ mod tests {
         assert!(State::parse("zoom=2").is_err());
         assert!(State::parse("rect=1,2,3").is_err());
         assert_eq!(State::parse("").unwrap(), State::default());
+    }
+
+    #[test]
+    fn an_unfocused_window_floats_above_the_others_until_it_is_used() {
+        use egui::WindowLevel::{AlwaysOnTop, Normal};
+        let t0 = Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        let w = Raise::Waiting;
+        // Before or during the focus requests, and within the grace: wait.
+        assert_eq!(w.step(None, false, None, false, at(0)), (w, None));
+        assert_eq!(
+            w.step(Some(t0), false, Some(false), false, at(900)),
+            (w, None)
+        );
+        assert_eq!(
+            w.step(Some(t0), true, Some(false), false, at(100)),
+            (w, None)
+        );
+        // Focused: nothing to do, ever.
+        assert_eq!(
+            w.step(Some(t0), true, Some(true), false, at(100)),
+            (Raise::Done, None)
+        );
+        // Not focused (or not known) after the grace: float.
+        for focused in [Some(false), None] {
+            assert_eq!(
+                w.step(Some(t0), true, focused, false, at(300)),
+                (Raise::Floating, Some(AlwaysOnTop))
+            );
+        }
+        // No timeout: still floating, unfocused and untouched, a minute later.
+        let f = Raise::Floating;
+        for focused in [Some(false), None] {
+            assert_eq!(
+                f.step(Some(t0), true, focused, false, at(60_000)),
+                (f, None)
+            );
+        }
+        // Back to normal when it gains focus, or at the first input.
+        assert_eq!(
+            f.step(Some(t0), true, Some(true), false, at(60_000)),
+            (Raise::Done, Some(Normal))
+        );
+        assert_eq!(
+            f.step(Some(t0), true, Some(false), true, at(400)),
+            (Raise::Done, Some(Normal))
+        );
+        let d = Raise::Done;
+        assert_eq!(
+            d.step(Some(t0), true, Some(false), true, at(9000)),
+            (d, None)
+        );
+    }
+
+    #[test]
+    fn user_input_is_keys_clicks_scrolls_and_text() {
+        let click = egui::Event::PointerButton {
+            pos: egui::Pos2::ZERO,
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: egui::Modifiers::NONE,
+        };
+        assert!(user_input(&click));
+        assert!(user_input(&egui::Event::Text("a".into())));
+        assert!(!user_input(&egui::Event::PointerMoved(egui::Pos2::ZERO)));
+        let release = egui::Event::PointerButton {
+            pos: egui::Pos2::ZERO,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+        assert!(!user_input(&release));
     }
 
     #[test]
