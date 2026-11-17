@@ -122,18 +122,27 @@ impl Outcome {
 }
 
 /// A local file next to `cached` that keeps the stem and the extension (so it still opens by
-/// double-click): `<stem>.<tag>-<UTC stamp>.<ext>`.
-pub fn keep_path(cached: &Path, tag: &str, at: SystemTime) -> PathBuf {
+/// double-click): `<stem>.<tag>-<UTC stamp>-<unique>.<ext>`.
+pub fn keep_path(cached: &Path, tag: &str, at: SystemTime, unique: &str) -> PathBuf {
     let stem = cached
         .file_stem()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_default();
     let stamp = crate::cache::utc_stamp(at);
     let name = match cached.extension() {
-        Some(ext) => format!("{stem}.{tag}-{stamp}.{}", ext.to_string_lossy()),
-        None => format!("{stem}.{tag}-{stamp}"),
+        Some(ext) => format!("{stem}.{tag}-{stamp}-{unique}.{}", ext.to_string_lossy()),
+        None => format!("{stem}.{tag}-{stamp}-{unique}"),
     };
     cached.with_file_name(name)
+}
+
+/// Creates a new owner-only file at a [`keep_path`] with a random `unique` part (another one
+/// when the name is taken) and returns it open.
+pub fn create_keep(cached: &Path, tag: &str) -> Result<(PathBuf, std::fs::File)> {
+    crate::cache::create_unique(|_| {
+        let random = crate::remote::random_hex();
+        keep_path(cached, tag, SystemTime::now(), &random[..8])
+    })
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -569,10 +578,11 @@ pub fn one_line(ui: &mut egui::Ui, text: &str, color: egui::Color32) {
     ui.add(egui::Label::new(egui::RichText::new(text).color(color)).truncate());
 }
 
-/// What the owner must read whole — what Save / Export will not keep, a refused write and
-/// where the edit went — in its own rows that wrap instead of cutting. Their text changes only
-/// on open and when a write reports (applied between drags), so they never move the picture
-/// under a drag.
+/// What the owner must read whole — what Save / Export will not keep, a refused write, where
+/// the edit went, what closing during a write does — in its own rows that wrap instead of
+/// cutting. Their text changes only on open, when a write reports and when closing is asked
+/// for during a write; a change waits while the primary button is down, so they never move the
+/// picture under a drag.
 pub fn disclosures(ui: &mut egui::Ui, lines: &[(String, egui::Color32)]) {
     for (text, color) in lines {
         ui.add(egui::Label::new(egui::RichText::new(text).color(*color)).wrap());
@@ -638,12 +648,12 @@ mod tests {
     fn keep_path_keeps_the_extension() {
         let at = SystemTime::UNIX_EPOCH + Duration::from_secs(1_794_389_076);
         assert_eq!(
-            keep_path(Path::new("/c/box/tmp/shot.png"), "conflict", at),
-            PathBuf::from("/c/box/tmp/shot.conflict-20261111T092436Z.png")
+            keep_path(Path::new("/c/box/tmp/shot.png"), "conflict", at, "1a2b"),
+            PathBuf::from("/c/box/tmp/shot.conflict-20261111T092436Z-1a2b.png")
         );
         assert_eq!(
-            keep_path(Path::new("/c/box/README"), "unsaved", at),
-            PathBuf::from("/c/box/README.unsaved-20261111T092436Z")
+            keep_path(Path::new("/c/box/README"), "unsaved", at, "1a2b"),
+            PathBuf::from("/c/box/README.unsaved-20261111T092436Z-1a2b")
         );
     }
 }

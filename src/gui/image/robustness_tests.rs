@@ -141,16 +141,27 @@ fn one(bytes: &[u8], format: ImageFormat) -> Result<(), String> {
     Ok(())
 }
 
-/// Every truncation and every flip of the first 256 bytes, on a thread with a deadline.
+/// The intact fixture, every truncation and every flip of the first 256 bytes — all of it on
+/// a thread with a deadline, so a scanner that hangs on the intact file fails too.
 fn sweep(name: &'static str, bytes: Vec<u8>, format: ImageFormat) {
-    assert!(
-        !foreign_metadata(&bytes, format).is_empty() || format == ImageFormat::Tiff,
-        "{name}: the fixture carries metadata to scan"
-    );
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         // The decoders' own panic messages would flood the output; the result says enough.
         let mut failures = Vec::new();
+        let scanned = catch_unwind(AssertUnwindSafe(|| foreign_metadata(&bytes, format)));
+        let carries = match scanned {
+            Ok(found) => !found.is_empty(),
+            Err(_) => {
+                failures.push("intact: panicked".to_string());
+                true
+            }
+        };
+        if let Err(why) = one(&bytes, format) {
+            failures.push(format!("intact: {why}"));
+        }
+        if !carries && format != ImageFormat::Tiff {
+            failures.push("the intact fixture carries no metadata to scan".to_string());
+        }
         for n in 0..bytes.len() {
             if let Err(why) = one(&bytes[..n], format) {
                 failures.push(format!("truncated to {n}: {why}"));

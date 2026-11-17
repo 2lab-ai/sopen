@@ -24,6 +24,11 @@ use std::time::Instant;
 type Wave = Arc<Mutex<Option<Vec<[f32; 2]>>>>;
 
 /// Waveform columns.
+/// Closing was asked for during an export: what happens, and what a second close does (its own
+/// row: read whole on a narrow window).
+const CLOSE_AGAIN: &str = "the window closes when the export is done — close it again to close \
+     it now; sopen still waits for the export and prints the result in the terminal";
+
 const WAVE_BINS: usize = 2000;
 /// Waveform decode rate (mono).
 const WAVE_RATE: f64 = 8000.0;
@@ -94,6 +99,23 @@ pub fn clock_text(secs: f64) -> String {
     } else {
         format!("{m}:{s:02}.{c:02}")
     }
+}
+
+/// The transport's clock line, as wide for any playhead and markers as for the clip's end: a
+/// line that grew while playing (9:59.99 → 10:00.00) could rewrap the transport and move the
+/// frame under a crop being drawn.
+fn transport_text(marks: &Marks, duration: f64) -> String {
+    let (in_s, out_s) = marks.range(duration);
+    let w = clock_text(duration).len();
+    let dw = format!("{duration:.2}").len();
+    format!(
+        "{:>w$} / {}  ·  In {:>w$}  Out {:>w$}  ({:>dw$.2} s)",
+        clock_text(marks.t),
+        clock_text(duration),
+        clock_text(in_s),
+        clock_text(out_s),
+        (out_s - in_s).max(0.0)
+    )
 }
 
 /// Running min/max per column over a stream of samples whose total is estimated up front.
@@ -290,8 +312,8 @@ fn request(media: &Media, marks: &Marks, crop: Option<[u32; 4]>) -> CutRequest {
     }
 }
 
-/// Opens the media file: the window, or the windowless `SOPEN_AUTOEXPORT` run. `notice` is
-/// shown in the status line on open.
+/// Opens the media file: the window, or the windowless `SOPEN_AUTOEXPORT` run. `notice` (where
+/// an earlier copy's unsaved edits went) is shown whole in the window's rows.
 pub fn open(
     mut origin: Origin,
     local: &Path,
@@ -339,8 +361,6 @@ pub fn open(
         });
     }
     let title = origin.display();
-    let outcome = Arc::new(Mutex::new(Outcome::default()));
-    let leftover: Arc<Mutex<Option<ExportJob>>> = Arc::default();
     let size = match media.decode_size() {
         Some((w, h)) => [
             (w as f32).clamp(640.0, 1280.0),
@@ -348,34 +368,10 @@ pub fn open(
         ],
         None => [1000.0, 420.0],
     };
-    let window = MediaWindow {
-        media: Arc::new(media),
-        origin: Arc::new(Mutex::new(origin)),
-        work_root,
-        marks,
-        sel,
-        tex: None,
-        tex_pts: None,
-        want: None,
-        scrub: None,
-        wave: None,
-        player: None,
-        job: None,
-        status: notice.map(Status::error).unwrap_or_default(),
-        outcome: outcome.clone(),
-        started: false,
-        painted: false,
-        close_when_done: false,
-        close_ok: false,
-        leftover: leftover.clone(),
-        export_hold: hooks.export_hold,
-        resume: false,
-        sink: Sink::Device,
-        map: None,
-        timeline_rect: None,
-        notices: Vec::new(),
-        pending_notices: None,
-    };
+    let mut window = MediaWindow::new(media, origin, work_root, marks, sel, notice);
+    window.export_hold = hooks.export_hold;
+    let outcome = window.outcome.clone();
+    let leftover = window.leftover.clone();
     let run = super::run_window(&title, size, window, hooks);
     // Never exit with an export in flight without its outcome on the terminal.
     if let Some(job) = leftover.lock().unwrap().take() {
@@ -449,13 +445,56 @@ struct MediaWindow {
     /// Where the last pass drew the frame (screen ↔ source pixels) and the timeline.
     map: Option<Map>,
     timeline_rect: Option<Rect>,
+    /// Lines from open that must be read whole and stay (see [`super::disclosures`]).
+    opened: Vec<String>,
     /// What the last export reported that must be read whole, and the next such report, held
-    /// while a crop is being drawn.
+    /// while the button is down.
     notices: Vec<String>,
     pending_notices: Option<Vec<String>>,
 }
 
 impl MediaWindow {
+    /// The window as `open` makes it. `notice` (where an earlier copy's unsaved edits went) is
+    /// read whole, in the always-visible rows, for the whole session.
+    fn new(
+        media: Media,
+        origin: Origin,
+        work_root: PathBuf,
+        marks: Marks,
+        sel: Selection,
+        notice: Option<String>,
+    ) -> Self {
+        Self {
+            media: Arc::new(media),
+            origin: Arc::new(Mutex::new(origin)),
+            work_root,
+            marks,
+            sel,
+            tex: None,
+            tex_pts: None,
+            want: None,
+            scrub: None,
+            wave: None,
+            player: None,
+            job: None,
+            status: Status::default(),
+            outcome: Arc::default(),
+            started: false,
+            painted: false,
+            close_when_done: false,
+            close_ok: false,
+            leftover: Arc::default(),
+            export_hold: None,
+            resume: false,
+            sink: Sink::Device,
+            map: None,
+            timeline_rect: None,
+            opened: notice.into_iter().collect(),
+            notices: Vec::new(),
+            pending_notices: None,
+        }
+    }
+
     fn audio_only(&self) -> bool {
         self.media.video.is_none()
     }
@@ -795,25 +834,20 @@ impl MediaWindow {
                 self.start_export(&ctx);
             }
             ui.separator();
-            let (in_s, out_s) = self.marks.range(self.media.duration);
-            ui.monospace(format!(
-                "{} / {}  ·  In {}  Out {}  ({:.2} s)",
-                clock_text(self.marks.t),
-                clock_text(self.media.duration),
-                clock_text(in_s),
-                clock_text(out_s),
-                (out_s - in_s).max(0.0)
-            ));
+            ui.monospace(transport_text(&self.marks, self.media.duration));
         });
-        // Its own full-width row: a portrait (rotated) clip makes a narrow window.
-        if let Some(job) = &self.job {
-            let f = job.progress.load(SeqCst) as f32 / 1000.0;
-            ui.add(
-                egui::ProgressBar::new(f)
-                    .text(format!("exporting {:.0} %", f * 100.0))
-                    .desired_width(ui.available_width()),
-            );
-        }
+        // Its own full-width row (a portrait clip makes a narrow window), always there: a row
+        // that came and went with the export would move the frame under the pointer.
+        let f = self
+            .job
+            .as_ref()
+            .map_or(0.0, |job| job.progress.load(SeqCst) as f32 / 1000.0);
+        ui.add_visible(
+            self.job.is_some(),
+            egui::ProgressBar::new(f)
+                .text(format!("exporting {:.0} %", f * 100.0))
+                .desired_width(ui.available_width()),
+        );
     }
 
     /// One line whatever it says (see [`super::one_line`]): the frame below must not move.
@@ -923,7 +957,10 @@ impl super::Window for MediaWindow {
                 None => {}
             }
         }
-        if !self.sel.dragging() {
+        // A report that lands while the button is down (a drag, or a press that may become one)
+        // waits until it is let go: its row would move the frame under the pointer.
+        let held = self.sel.dragging() || ctx.input(|i| i.pointer.primary_down());
+        if !held {
             if let Some(next) = self.pending_notices.take() {
                 self.notices = next;
             }
@@ -938,7 +975,12 @@ impl super::Window for MediaWindow {
         let lines: Vec<(String, Color32)> = (!self.media.notes.is_empty())
             .then(|| (format!("Export: {}", self.media.notes.join("; ")), warn))
             .into_iter()
-            .chain(self.notices.iter().map(|n| (n.clone(), error)))
+            .chain(
+                self.opened
+                    .iter()
+                    .chain(&self.notices)
+                    .map(|n| (n.clone(), error)),
+            )
             .collect();
         if !lines.is_empty() {
             egui::Panel::top("disclosures").show(ui, |ui| {
@@ -1006,10 +1048,14 @@ impl super::Window for MediaWindow {
             return true;
         }
         self.close_when_done = true;
-        self.status = Status::info(
-            "exporting… the window closes when the export is done (close again to close it \
-             now — sopen still waits for the export and prints the result in the terminal)",
-        );
+        self.status = Status::info("exporting…");
+        // What a second close does goes to the rows (read whole), after any report still held.
+        let mut next = self
+            .pending_notices
+            .take()
+            .unwrap_or_else(|| self.notices.clone());
+        next.push(CLOSE_AGAIN.to_string());
+        self.pending_notices = Some(next);
         false
     }
 }
@@ -1049,40 +1095,24 @@ mod tests {
         };
         let leftover: Arc<Mutex<Option<ExportJob>>> = Arc::default();
         let (tx, rx) = mpsc::channel();
-        let mut w = MediaWindow {
-            media: Arc::new(media),
-            origin: Arc::new(Mutex::new(origin)),
-            work_root: tmp.path().join("work"),
-            marks: Marks::default(),
-            sel: Selection::default(),
-            tex: None,
-            tex_pts: None,
-            want: None,
-            scrub: None,
-            wave: None,
-            player: None,
-            job: Some(ExportJob {
-                progress: Arc::default(),
-                rx,
-            }),
-            status: Status::default(),
-            outcome: Arc::default(),
-            started: false,
-            painted: false,
-            close_when_done: false,
-            close_ok: false,
-            leftover: leftover.clone(),
-            export_hold: None,
-            resume: false,
-            sink: Sink::Null,
-            map: None,
-            timeline_rect: None,
-            notices: Vec::new(),
-            pending_notices: None,
-        };
+        let path = tmp.path().join("work");
+        let mut w = MediaWindow::new(
+            media,
+            origin,
+            path,
+            Marks::default(),
+            Selection::default(),
+            None,
+        );
+        w.sink = Sink::Null;
+        w.leftover = leftover.clone();
+        w.job = Some(ExportJob {
+            progress: Arc::default(),
+            rx,
+        });
         use super::super::Window;
         assert!(!w.close_requested(), "first close waits for the export");
-        assert!(w.status.text.contains("closes when the export is done"));
+        assert_eq!(w.pending_notices, Some(vec![CLOSE_AGAIN.to_string()]));
         assert!(w.close_requested(), "second close closes the window");
         drop(w);
         let job = leftover.lock().unwrap().take().expect("export handed over");
@@ -1092,6 +1122,27 @@ mod tests {
         let (status, _) = report_export(job.rx.recv().unwrap(), &mut outcome);
         assert!(outcome.exported);
         assert!(status.text.contains("exported box:/v.cut-1-2.mp4"));
+    }
+
+    #[test]
+    fn transport_text_keeps_its_width_wherever_the_playhead_is() {
+        let duration = 754.0;
+        let width = |t: f64, in_s: Option<f64>, out_s: Option<f64>| {
+            let marks = Marks { t, in_s, out_s };
+            transport_text(&marks, duration).chars().count()
+        };
+        let full = width(0.0, None, None);
+        assert_eq!(
+            transport_text(&Marks::default(), duration),
+            " 0:00.00 / 12:34.00  ·  In  0:00.00  Out 12:34.00  (754.00 s)"
+        );
+        for (t, i, o) in [
+            (599.99, None, None),
+            (600.0, Some(1.0), Some(2.5)),
+            (754.0, Some(600.0), None),
+        ] {
+            assert_eq!(width(t, i, o), full, "t={t} in={i:?} out={o:?}");
+        }
     }
 
     #[test]
@@ -1161,28 +1212,11 @@ mod tests {
             .success();
         assert!(ok);
         let src = tmp.path().join("phone.mp4");
-        let tagged = [
-            (vec!["-display_rotation", "90"], vec![]),
-            (vec![], vec!["-metadata:s:v:0", "rotate=90"]),
-        ]
-        .into_iter()
-        .any(|(input, output)| {
-            std::process::Command::new(&tools.ffmpeg)
-                .args(["-hide_banner", "-loglevel", "error", "-nostdin", "-y"])
-                .args(input)
-                .arg("-i")
-                .arg(&plain)
-                .args(["-c", "copy"])
-                .args(output)
-                .arg(&src)
-                .status()
-                .is_ok_and(|s| s.success())
-                && Media::probe(&src).is_ok_and(|m| m.rotation % 180 == 90)
-        });
-        if !tagged {
-            eprintln!("skipping: this ffmpeg cannot tag a fixture as rotated");
-            return;
+        // ffprobe decides whether the fixture is rotated; the app's probe must then agree.
+        if !crate::ffmpeg::fixtures::rotated_copy(&tools, &plain, &src) {
+            return; // this ffmpeg cannot tag a fixture as rotated (said by `rotated_copy`)
         }
+        assert_eq!(Media::probe(&src).unwrap().rotation % 180, 90);
         let media = Media::probe(&src).unwrap();
         assert_eq!(media.video, Some((360, 640)), "display size");
         let src_spec = playback::Source {

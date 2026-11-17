@@ -84,21 +84,45 @@ impl Driver {
         self.frame(win, vec![event], Modifiers::NONE);
     }
 
+    /// Presses `button` where the pointer is (it stays held through later passes).
+    pub fn press<W: Window>(&mut self, win: &mut W, button: PointerButton) {
+        self.button(win, button, true);
+    }
+
+    pub fn release<W: Window>(&mut self, win: &mut W, button: PointerButton) {
+        self.button(win, button, false);
+    }
+
     /// Press at `from`, move to `to` in steps, release there.
     pub fn drag<W: Window>(&mut self, win: &mut W, button: PointerButton, from: Pos2, to: Pos2) {
+        self.drag_watching(win, button, from, to, |_| {});
+    }
+
+    /// As [`Driver::drag`], with `held` called after the press and after every move while the
+    /// button is down.
+    pub fn drag_watching<W: Window>(
+        &mut self,
+        win: &mut W,
+        button: PointerButton,
+        from: Pos2,
+        to: Pos2,
+        mut held: impl FnMut(&W),
+    ) {
         self.move_to(win, from);
-        self.button(win, button, true);
+        self.press(win, button);
+        held(win);
         for k in 1..=8 {
             self.move_to(win, from + (to - from) * (k as f32 / 8.0));
+            held(win);
         }
-        self.button(win, button, false);
+        self.release(win, button);
         self.idle(win, 1);
     }
 
     pub fn click<W: Window>(&mut self, win: &mut W, at: Pos2) {
         self.move_to(win, at);
-        self.button(win, PointerButton::Primary, true);
-        self.button(win, PointerButton::Primary, false);
+        self.press(win, PointerButton::Primary);
+        self.release(win, PointerButton::Primary);
         self.idle(win, 1);
     }
 
@@ -131,19 +155,25 @@ impl Driver {
         self.idle(win, 1);
     }
 
-    /// Where the last pass drew `text` whole (a button's label, a disclosure), if it did. A
-    /// galley cut short with "…" keeps the full string but is `elided`: that does not count.
+    /// Where the last pass drew `text` whole (a button's label, a disclosure), if it did:
+    /// the galley holds all of it (a galley cut short with "…" keeps the full string but is
+    /// `elided`), and all of its bounds lie inside the shape's clip rect and the window.
     pub fn find_text(&self, text: &str) -> Option<Rect> {
-        fn walk(shape: &egui::Shape, text: &str) -> Option<Rect> {
+        fn walk(shape: &egui::Shape, text: &str, visible: Rect) -> Option<Rect> {
             match shape {
                 egui::Shape::Text(t) if t.galley.text() == text && !t.galley.elided => {
-                    Some(t.galley.rect.translate(t.pos.to_vec2()))
+                    let bounds = t.galley.rect.translate(t.pos.to_vec2());
+                    // A hair of slack for float rounding at the edges.
+                    visible.expand(0.5).contains_rect(bounds).then_some(bounds)
                 }
-                egui::Shape::Vec(v) => v.iter().find_map(|s| walk(s, text)),
+                egui::Shape::Vec(v) => v.iter().find_map(|s| walk(s, text, visible)),
                 _ => None,
             }
         }
-        self.shapes.iter().find_map(|c| walk(&c.shape, text))
+        let viewport = Rect::from_min_size(Pos2::ZERO, self.size);
+        self.shapes
+            .iter()
+            .find_map(|c| walk(&c.shape, text, c.clip_rect.intersect(viewport)))
     }
 
     /// Clicks the control labelled `text`.
@@ -161,5 +191,47 @@ pub fn command(shift: bool) -> Modifiers {
         Modifiers::COMMAND | Modifiers::SHIFT
     } else {
         Modifiers::COMMAND
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const TEXT: &str = "a complete label, never cut with an ellipsis";
+
+    /// Draws one label: in the open, inside a 20×20 clip, or below the bottom of the window.
+    struct One {
+        place: &'static str,
+    }
+
+    impl Window for One {
+        fn ui(&mut self, ui: &mut egui::Ui) {
+            match self.place {
+                "clipped" => {
+                    let min = ui.max_rect().min;
+                    ui.set_clip_rect(Rect::from_min_size(min, Vec2::splat(20.0)));
+                }
+                "offscreen" => ui.add_space(2000.0),
+                _ => {}
+            }
+            ui.add(egui::Label::new(TEXT).extend());
+        }
+
+        fn ready(&self) -> bool {
+            true
+        }
+    }
+
+    /// The "shown whole" oracle: a complete (not elided) galley that is clipped, or drawn
+    /// outside the viewport, is not shown — the negative controls must fail the check.
+    #[test]
+    fn find_text_requires_the_text_inside_its_clip_and_the_viewport() {
+        for (place, shown) in [("open", true), ("clipped", false), ("offscreen", false)] {
+            let mut drv = Driver::new(600.0, 400.0);
+            let mut win = One { place };
+            drv.idle(&mut win, 2);
+            assert_eq!(drv.find_text(TEXT).is_some(), shown, "{place}");
+        }
     }
 }

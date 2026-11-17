@@ -1,10 +1,13 @@
 //! Local paths: the fetch cache `<cache>/<host>/<abs path>` (each copy with a
-//! `.<name>.sopen-baseline` record of what it held when fetched or saved), edits kept aside as
-//! `<copy>.conflict-<UTC stamp>`, image backups `<cache>/backup/<host>/<abs path>.<UTC stamp>`
-//! (spec §5), and the state dir (ssh control sockets, `usage.jsonl`). `SOPEN_CACHE_DIR` /
-//! `SOPEN_STATE_DIR` override both.
+//! `.<name>.sopen-baseline` record of what it held when fetched or saved, and the session lock
+//! `.<name>.sopen-lock`), edits kept aside as `<copy>.conflict-<UTC stamp>`, image backups
+//! `<cache>/backup/<host>/<abs path>.<UTC stamp>` (spec §5), and the state dir (ssh control
+//! sockets, `usage.jsonl`). `SOPEN_CACHE_DIR` / `SOPEN_STATE_DIR` override both. What sopen
+//! creates under the cache is the owner's only (0700 directories, 0600 files).
 
 use anyhow::{Context, Result};
+use std::fs::{DirBuilder, File, OpenOptions};
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::time::SystemTime;
 
@@ -82,6 +85,116 @@ pub fn backup_path(cache: &Path, host: &str, abs: &str, at: SystemTime) -> PathB
     path
 }
 
+/// Creates `dir` and its missing parents for the owner only (0700). Directories that already
+/// exist keep their mode.
+pub fn private_dir(dir: &Path) -> Result<()> {
+    DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)
+        .with_context(|| format!("cannot create {}", dir.display()))
+}
+
+/// A new file for the owner only (0600, in [`private_dir`]s), under the first name `name`
+/// gives (attempt 0, 1, …) that nothing has yet — never an existing file, never through a
+/// symlink. Returns it open for writing.
+pub fn create_unique(mut name: impl FnMut(u32) -> PathBuf) -> Result<(PathBuf, File)> {
+    const TRIES: u32 = 32;
+    for attempt in 0..TRIES {
+        let path = name(attempt);
+        if let Some(dir) = path.parent() {
+            private_dir(dir)?;
+        }
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+        {
+            Ok(file) => return Ok((path, file)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => {
+                return Err(e).with_context(|| format!("cannot create {}", path.display()));
+            }
+        }
+    }
+    anyhow::bail!("no free name for a new file after {TRIES} tries")
+}
+
+/// `<dir>/.<name>.sopen-lock` next to a cached copy: the advisory lock a session holds on the
+/// copy (hidden, like the baseline record, so a remote file named `<name>.lock` is not it).
+/// Never removed: removing it would let two sessions lock two different files.
+pub fn lock_path(local: &Path) -> PathBuf {
+    let mut name = std::ffi::OsString::from(".");
+    name.push(local.file_name().unwrap_or_default());
+    name.push(".sopen-lock");
+    local.with_file_name(name)
+}
+
+/// The cached copy one session works on — its app or editor, its window — locked for as long
+/// as this lives.
+pub struct Claim {
+    pub local: PathBuf,
+    /// `None` only where the filesystem has no advisory locks.
+    _lock: Option<File>,
+}
+
+/// Claims `cached` for this session. When another sopen session holds it, this one gets a
+/// sibling copy of its own, `<stem>.session-<random>.<ext>`, so neither replaces nor moves
+/// aside the copy the other is editing.
+pub fn claim(cached: &Path) -> Result<Claim> {
+    if let Some(dir) = cached.parent() {
+        private_dir(dir)?;
+    }
+    let path = lock_path(cached);
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(&path)
+        .with_context(|| format!("cannot create {}", path.display()))?;
+    match file.try_lock() {
+        Ok(()) => {
+            return Ok(Claim {
+                local: cached.to_path_buf(),
+                _lock: Some(file),
+            })
+        }
+        Err(std::fs::TryLockError::WouldBlock) => {}
+        Err(std::fs::TryLockError::Error(e)) => {
+            crate::debug!(
+                "{} not locked ({e}); working on it unlocked",
+                path.display()
+            );
+            return Ok(Claim {
+                local: cached.to_path_buf(),
+                _lock: None,
+            });
+        }
+    }
+    let name = cached.file_name().unwrap_or_default().to_string_lossy();
+    let (stem, ext) = match name.rfind('.') {
+        Some(i) if i > 0 => (&name[..i], &name[i..]),
+        _ => (&name[..], ""),
+    };
+    // The sibling's own lock file, created exclusively, reserves its name.
+    let mut local = PathBuf::new();
+    let (lock, file) = create_unique(|_| {
+        let random = crate::remote::random_hex();
+        local = cached.with_file_name(format!("{stem}.session-{}{ext}", &random[..8]));
+        lock_path(&local)
+    })?;
+    if let Err(e) = file.try_lock() {
+        crate::debug!("{} not locked ({e})", lock.display());
+    }
+    Ok(Claim {
+        local,
+        _lock: Some(file),
+    })
+}
+
 /// A sibling of `edited` that keeps a refused edit out of the way of the next fetch:
 /// `<file>.conflict-<UTC stamp>`.
 pub fn conflict_copy_path(edited: &Path, at: SystemTime) -> PathBuf {
@@ -93,28 +206,39 @@ pub fn conflict_copy_path(edited: &Path, at: SystemTime) -> PathBuf {
 /// Moves `edited` to its conflict-copy path (`-N` added when that name is taken) and returns
 /// where it went. Used whenever an edit cannot be uploaded, so no later fetch can overwrite it.
 pub fn set_aside(edited: &Path) -> Result<PathBuf> {
+    set_aside_with(edited, &mut |_| {})
+}
+
+/// [`set_aside`], with `before_move` called on the chosen name right before the move (tests: a
+/// racing process). The name is first created exclusively (an empty owner-only placeholder),
+/// so the move can only ever replace that placeholder — never a file someone else made.
+fn set_aside_with(edited: &Path, before_move: &mut dyn FnMut(&Path)) -> Result<PathBuf> {
     let first = conflict_copy_path(edited, SystemTime::now());
-    for n in 0..1000u32 {
-        let keep = if n == 0 {
-            first.clone()
-        } else {
-            let mut name = first.file_name().unwrap_or_default().to_os_string();
-            name.push(format!("-{n}"));
-            first.with_file_name(name)
-        };
-        if keep.symlink_metadata().is_ok() {
-            continue;
+    let (keep, _) = create_unique(|n| {
+        if n == 0 {
+            return first.clone();
         }
-        std::fs::rename(edited, &keep).with_context(|| {
+        let mut name = first.file_name().unwrap_or_default().to_os_string();
+        name.push(format!("-{n}"));
+        first.with_file_name(name)
+    })
+    .with_context(|| format!("no free conflict-copy name next to {}", edited.display()))?;
+    before_move(&keep);
+    if let Err(e) = std::fs::rename(edited, &keep) {
+        let _ = std::fs::remove_file(&keep);
+        return Err(e).with_context(|| {
             format!(
                 "cannot move {} aside to {}",
                 edited.display(),
                 keep.display()
             )
-        })?;
-        return Ok(keep);
+        });
     }
-    anyhow::bail!("no free conflict-copy name next to {}", edited.display())
+    // An editor may have rewritten the copy with the umask's mode: the edit is private.
+    if let Err(e) = std::fs::set_permissions(&keep, std::fs::Permissions::from_mode(0o600)) {
+        crate::debug!("{} not made owner-only: {e}", keep.display());
+    }
+    Ok(keep)
 }
 
 /// `<dir>/.<name>.sopen-baseline` next to a fetched copy: the hex SHA-256 the copy held when
@@ -130,11 +254,21 @@ pub fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// Records `sha256` as what the fetched copy `local` holds.
+/// Records `sha256` as what the fetched copy `local` holds — owner-only (0600), like the copy;
+/// a record an older sopen left with the umask's mode is made so too.
 pub fn write_baseline(local: &Path, sha256: &[u8; 32]) -> Result<()> {
     let record = baseline_record_path(local);
-    std::fs::write(&record, format!("{}\n", hex(sha256)))
-        .with_context(|| format!("cannot write {}", record.display()))
+    let write = || -> std::io::Result<()> {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&record)?;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        std::io::Write::write_all(&mut file, format!("{}\n", hex(sha256)).as_bytes())
+    };
+    write().with_context(|| format!("cannot write {}", record.display()))
 }
 
 fn read_baseline(local: &Path) -> Option<String> {
@@ -257,6 +391,89 @@ mod tests {
             baseline_record_path(Path::new("/c/h/x.bin")),
             PathBuf::from("/c/h/.x.bin.sopen-baseline")
         );
+    }
+
+    /// `create_unique` skips a name that is taken — by a file or by a symlink pointing
+    /// elsewhere — without touching either, and makes an owner-only file under the next one.
+    #[test]
+    fn create_unique_never_opens_an_existing_name() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let taken = tmp.path().join("d/taken");
+        std::fs::create_dir_all(taken.parent().unwrap()).unwrap();
+        std::fs::write(&taken, "someone's").unwrap();
+        let outside = tmp.path().join("outside");
+        std::fs::write(&outside, "elsewhere").unwrap();
+        let link = tmp.path().join("d/link");
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+        let dangling = tmp.path().join("d/dangling");
+        std::os::unix::fs::symlink(tmp.path().join("nowhere"), &dangling).unwrap();
+        let names = [&taken, &link, &dangling, &tmp.path().join("d/e/free")];
+        let mut tried = Vec::new();
+        let (path, mut file) = create_unique(|n| {
+            tried.push(n);
+            names[n as usize].to_path_buf()
+        })
+        .unwrap();
+        std::io::Write::write_all(&mut file, b"mine").unwrap();
+        assert_eq!(tried, [0, 1, 2, 3]);
+        assert_eq!(path, *names[3]);
+        assert_eq!(std::fs::read_to_string(&taken).unwrap(), "someone's");
+        assert_eq!(std::fs::read_to_string(&outside).unwrap(), "elsewhere");
+        assert!(
+            !tmp.path().join("nowhere").exists(),
+            "not created through the symlink"
+        );
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&path), 0o600);
+        assert_eq!(mode(path.parent().unwrap()), 0o700);
+    }
+
+    /// Another process that creates a file under the chosen name just before the move (the
+    /// way a second sopen would, exclusively) never has it replaced: the edit lands under a
+    /// name of its own and the other file is intact.
+    #[test]
+    fn set_aside_never_replaces_a_file_created_under_its_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let copy = tmp.path().join("a.txt");
+        std::fs::write(&copy, "my edit").unwrap();
+        let mut theirs = None;
+        let kept = set_aside_with(&copy, &mut |name| {
+            let created = OpenOptions::new().write(true).create_new(true).open(name);
+            if let Ok(mut file) = created {
+                std::io::Write::write_all(&mut file, b"someone else's").unwrap();
+                theirs = Some(name.to_path_buf());
+            }
+        })
+        .unwrap();
+        assert_eq!(std::fs::read_to_string(&kept).unwrap(), "my edit");
+        if let Some(theirs) = theirs {
+            assert_ne!(theirs, kept);
+            assert_eq!(std::fs::read_to_string(&theirs).unwrap(), "someone else's");
+        }
+        assert!(!copy.exists());
+    }
+
+    /// The baseline record is the owner's only, like the copy it describes — also one an older
+    /// sopen left with the umask's mode.
+    #[test]
+    fn baseline_records_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        let tmp = tempfile::tempdir().unwrap();
+        let (fresh, old) = (tmp.path().join("a.txt"), tmp.path().join("b.txt"));
+        std::fs::write(baseline_record_path(&old), "stale\n").unwrap();
+        std::fs::set_permissions(
+            baseline_record_path(&old),
+            std::fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
+        for copy in [&fresh, &old] {
+            write_baseline(copy, &[7; 32]).unwrap();
+            let record = baseline_record_path(copy);
+            assert_eq!(mode(&record), 0o600, "{record:?}");
+            assert_eq!(read_baseline(copy), Some(hex(&[7; 32])));
+        }
     }
 
     #[test]

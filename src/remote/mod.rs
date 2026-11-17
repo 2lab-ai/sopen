@@ -12,6 +12,7 @@ pub use sftp::SftpRemote;
 use anyhow::{anyhow, bail, Context, Result};
 use sha2::{Digest, Sha256};
 use std::io::Write;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use std::time::SystemTime;
 
@@ -257,9 +258,9 @@ pub trait RemoteFs {
         local: &Path,
         progress: &mut dyn FnMut(u64, u64),
     ) -> Result<Stat> {
+        // The copy is the owner's only: 0700 directories, a 0600 file.
         if let Some(parent) = local.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("cannot create {}", parent.display()))?;
+            crate::cache::private_dir(parent)?;
         }
         if let Some(kept) = crate::cache::set_aside_unsaved(local)? {
             eprintln!(
@@ -282,7 +283,11 @@ pub trait RemoteFs {
                 bail!("{remote} is a directory");
             }
             let result = (|| -> Result<Uploaded> {
-                let file = std::fs::File::create(&part)
+                let file = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .open(&part)
                     .with_context(|| format!("cannot create {}", part.display()))?;
                 let mut out = Hashing::new(std::io::BufWriter::with_capacity(1 << 20, file));
                 let mut cb = |done: u64| progress(done, before.size);

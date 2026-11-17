@@ -259,25 +259,46 @@ impl Place {
     }
 }
 
-/// Fetches `abs` into the cache with a progress line; records size and fetch time.
-fn fetch_to_cache(
-    place: &mut Place,
-    abs: &str,
-    dirs: &Dirs,
-    rec: &mut Record,
-) -> Result<(PathBuf, Stat)> {
-    let local = cache::cache_path(&dirs.cache, &place.host_label(), abs);
+/// A remote file fetched into this session's cached copy.
+struct Fetched {
+    /// The copy, locked for as long as this lives: another session gets a copy of its own.
+    claim: cache::Claim,
+    at: Stat,
+    /// Where an earlier copy's unsaved edits were moved (already printed).
+    kept: Option<PathBuf>,
+}
+
+/// Claims the cached copy of `abs` for this session, moves an earlier copy's unsaved edits
+/// aside, and fetches with a progress line; records size and fetch time. Every fetch into the
+/// cache goes through here, so no session replaces or moves a copy another one is editing.
+fn fetch_to_cache(place: &mut Place, abs: &str, dirs: &Dirs, rec: &mut Record) -> Result<Fetched> {
+    let cached = cache::cache_path(&dirs.cache, &place.host_label(), abs);
+    let claim = cache::claim(&cached)?;
+    if claim.local != cached {
+        eprintln!(
+            "sopen: another sopen session has {} open; this one works on its own copy {}",
+            cached.display(),
+            claim.local.display()
+        );
+    }
+    let kept = cache::set_aside_unsaved(&claim.local)?;
+    if let Some(kept) = &kept {
+        eprintln!(
+            "sopen: the previous copy had unsaved edits; kept them at {}",
+            kept.display()
+        );
+    }
     let (_, name) = remote::split_parent(abs);
     let mut progress = Progress::new(format!("fetching {name}"));
     let started = Instant::now();
-    let fetched = place
-        .fs()
-        .fetch(abs, &local, &mut |done, total| progress.bytes(done, total));
+    let fetched = place.fs().fetch(abs, &claim.local, &mut |done, total| {
+        progress.bytes(done, total)
+    });
     progress.finish();
-    let stat = fetched?;
+    let at = fetched?;
     rec.fetch_ms = started.elapsed().as_millis() as u64;
-    rec.bytes = stat.size;
-    Ok((local, stat))
+    rec.bytes = at.size;
+    Ok(Fetched { claim, at, kept })
 }
 
 fn classify(fs: &mut dyn RemoteFs, abs: &str, stat: &Stat) -> Result<Kind> {
@@ -317,8 +338,8 @@ fn run_open(arg: &str, app_name: Option<&str>, dirs: &Dirs, rec: &mut Record) ->
             match place {
                 Place::Local(_) => println!("{abs}"),
                 Place::Remote(..) => {
-                    let (local, _) = fetch_to_cache(&mut place, &abs, dirs, rec)?;
-                    println!("{}", local.display());
+                    let fetched = fetch_to_cache(&mut place, &abs, dirs, rec)?;
+                    println!("{}", fetched.claim.local.display());
                 }
             }
             Ok(())
@@ -338,6 +359,8 @@ fn open_in_window(
 ) -> Result<()> {
     let hooks = gui::Hooks::from_env()?;
     let mut notice = None;
+    // Held until the window closes (media plays from the copy).
+    let mut _claim = None;
     let (local, at) = match (&place, kind) {
         (Place::Local(_), Kind::Video | Kind::Audio) => {
             let at = place.fs().stat(abs)?;
@@ -346,16 +369,16 @@ fn open_in_window(
         _ => {
             // A copy with unsaved edits (an earlier `--app` / editor session) is kept, not
             // replaced by this fetch; the window repeats where it went.
-            let cached = cache::cache_path(&dirs.cache, &place.host_label(), abs);
-            if let Some(kept) = cache::set_aside_unsaved(&cached)? {
-                let text = format!(
+            let fetched = fetch_to_cache(&mut place, abs, dirs, rec)?;
+            notice = fetched.kept.map(|kept| {
+                format!(
                     "the previous copy had unsaved edits; kept them at {}",
                     kept.display()
-                );
-                eprintln!("sopen: {text}");
-                notice = Some(text);
-            }
-            fetch_to_cache(&mut place, abs, dirs, rec)?
+                )
+            });
+            let local = fetched.claim.local.clone();
+            _claim = Some(fetched.claim);
+            (local, fetched.at)
         }
     };
     let kind = refine_kind(&local, abs, kind);
@@ -439,20 +462,21 @@ fn open_in_editor(
         }
         Place::Remote(..) => {
             let shown = place.display(abs);
-            let (local, at) = fetch_to_cache(place, abs, dirs, rec)?;
+            let Fetched { claim, at, .. } = fetch_to_cache(place, abs, dirs, rec)?;
+            let local = &claim.local;
             eprintln!(
                 "Zed not found; editing a copy with {}",
                 editor.to_string_lossy()
             );
-            if let Err(e) = zed::run_terminal_editor(&local) {
-                return Err(keep_edits(&local, &at, e.context("not uploaded")));
+            if let Err(e) = zed::run_terminal_editor(local) {
+                return Err(keep_edits(local, &at, e.context("not uploaded")));
             }
-            if !edited(&local, &at)? {
+            if !edited(local, &at)? {
                 println!("no changes; {shown} untouched");
                 rec.action = Some("discard");
                 return Ok(());
             }
-            upload_back(place.fs(), &shown, &local, abs, &at, rec)
+            upload_back(place.fs(), &shown, local, abs, &at, rec)
         }
     }
 }
@@ -471,8 +495,10 @@ fn open_in_app(
         return Ok(());
     }
     let shown = place.display(abs);
-    let (local, at) = fetch_to_cache(place, abs, dirs, rec)?;
-    app::open_with(app_name, &local)?;
+    // The claim is held until this returns: the whole app session.
+    let Fetched { claim, at, .. } = fetch_to_cache(place, abs, dirs, rec)?;
+    let local = &claim.local;
+    app::open_with(app_name, local)?;
     eprintln!(
         "opened {shown} in {app_name} (local copy {})",
         local.display()
@@ -480,16 +506,16 @@ fn open_in_app(
     let stdin = std::io::stdin();
     let decision = match app::prompt(&mut stdin.lock(), &mut std::io::stderr()) {
         Ok(decision) => decision,
-        Err(e) => return Err(keep_edits(&local, &at, e.context("not uploaded"))),
+        Err(e) => return Err(keep_edits(local, &at, e.context("not uploaded"))),
     };
-    if !edited(&local, &at)? {
+    if !edited(local, &at)? {
         println!("no changes; {shown} untouched");
         rec.action = Some("discard");
         return Ok(());
     }
     if decision == app::Decision::Discard {
         // Out of the way of the next fetch, but not deleted.
-        let keep = cache::set_aside(&local)?;
+        let keep = cache::set_aside(local)?;
         println!(
             "discarded; {shown} untouched (your edited copy is at {})",
             keep.display()
@@ -497,7 +523,7 @@ fn open_in_app(
         rec.action = Some("discard");
         return Ok(());
     }
-    upload_back(place.fs(), &shown, &local, abs, &at, rec)
+    upload_back(place.fs(), &shown, local, abs, &at, rec)
 }
 
 /// Does the fetched copy differ from what was fetched?
@@ -600,9 +626,13 @@ fn run_cut(
     rec.kind = Some(cut::media_kind_of(&name)?);
     rec.ext = kind::extension(&name);
     rec.bytes = stat.size;
-    let src = match place {
-        Place::Local(_) => PathBuf::from(&abs),
-        Place::Remote(..) => fetch_to_cache(&mut place, &abs, dirs, rec)?.0,
+    // A fetched source stays claimed until the cut is published.
+    let (src, _claim) = match place {
+        Place::Local(_) => (PathBuf::from(&abs), None),
+        Place::Remote(..) => {
+            let fetched = fetch_to_cache(&mut place, &abs, dirs, rec)?;
+            (fetched.claim.local.clone(), Some(fetched.claim))
+        }
     };
     let mut progress = Progress::new(format!("cutting {name}"));
     let result = cut::cut_and_publish(
@@ -673,6 +703,51 @@ mod tests {
             .map(|e| e.unwrap().path())
             .filter(|p| p.to_string_lossy().contains(".conflict-"))
             .collect()
+    }
+
+    /// Two sessions on one file never share its cached copy: while the first one's app or
+    /// editor works on the copy, the second fetches into a copy of its own (and says so); the
+    /// first one's copy is neither replaced nor moved aside.
+    #[test]
+    fn a_second_session_gets_its_own_copy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("a.txt");
+        std::fs::write(&target, "v1").unwrap();
+        let abs = target.to_str().unwrap();
+        let dirs = Dirs {
+            cache: tmp.path().join("cache"),
+            state: tmp.path().join("state"),
+        };
+        let mut place = Place::Local(LocalFs::new());
+        let mut rec = Record::default();
+        let one = fetch_to_cache(&mut place, abs, &dirs, &mut rec).unwrap();
+        let first = one.claim.local.clone();
+        std::fs::write(&first, "the first session's edit in progress").unwrap();
+        let two = fetch_to_cache(&mut place, abs, &dirs, &mut rec).unwrap();
+        let second = two.claim.local.clone();
+        assert_ne!(second, first);
+        assert_eq!(
+            std::fs::read_to_string(&first).unwrap(),
+            "the first session's edit in progress"
+        );
+        assert_eq!(std::fs::read_to_string(&second).unwrap(), "v1");
+        assert!(conflict_copies(first.parent().unwrap()).is_empty());
+        let name = second.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(
+            name.starts_with("a.session-") && name.ends_with(".txt"),
+            "{name}"
+        );
+        // The lock lasts as long as the session: once the first one ends, the copy is free
+        // again (its unsaved edit is moved aside by the next fetch, as before).
+        drop(one);
+        let three = fetch_to_cache(&mut place, abs, &dirs, &mut rec).unwrap();
+        assert_eq!(three.claim.local, first);
+        assert_eq!(std::fs::read_to_string(&first).unwrap(), "v1");
+        let kept = three.kept.expect("the first session's edit was kept");
+        assert_eq!(
+            std::fs::read_to_string(kept).unwrap(),
+            "the first session's edit in progress"
+        );
     }
 
     #[test]

@@ -58,6 +58,11 @@ fn xmp_jpeg() -> Vec<u8> {
 }
 
 fn open_bytes(name: &str, bytes: Vec<u8>, w: f32, h: f32) -> Fixture {
+    open_noticed(name, bytes, w, h, None)
+}
+
+/// As `open` does it, with `notice` (an earlier copy's unsaved edits were kept).
+fn open_noticed(name: &str, bytes: Vec<u8>, w: f32, h: f32, notice: Option<String>) -> Fixture {
     let tmp = tempfile::tempdir().unwrap();
     let path = tmp.path().join(name);
     std::fs::write(&path, &bytes).unwrap();
@@ -67,29 +72,7 @@ fn open_bytes(name: &str, bytes: Vec<u8>, w: f32, h: f32) -> Fixture {
     let origin = Origin::new(Box::new(fs), None, None, abs, at);
     let file = ImageFile::new(origin, bytes, &tmp.path().join("cache"));
     let doc = Doc::decode(file.original()).unwrap();
-    let win = ImageWindow {
-        title: file.origin.display(),
-        can_replace: true,
-        doc,
-        file: Arc::new(Mutex::new(file)),
-        tex: None,
-        tex_rev: None,
-        sel: Selection::default(),
-        block: DEFAULT_BLOCK,
-        view: View::default(),
-        status: Status::default(),
-        job: None,
-        outcome: Arc::default(),
-        prompt: false,
-        close_ok: false,
-        close_when_done: false,
-        leftover: Arc::default(),
-        painted: false,
-        zoom: 1.0,
-        map: None,
-        notices: Vec::new(),
-        pending_notices: None,
-    };
+    let win = ImageWindow::new(file, doc, Selection::default(), DEFAULT_BLOCK, notice);
     let mut fx = Fixture {
         tmp,
         path,
@@ -125,13 +108,26 @@ impl Fixture {
         panic!("the layout never settled");
     }
 
-    /// A primary-button drag between two image pixels, on a settled layout.
+    /// A primary-button drag between two image pixels, on a settled layout. The image must not
+    /// move under the pointer: checked after the press, after every held move, and after the
+    /// release.
     fn select(&mut self, from: (f32, f32), to: (f32, f32)) {
         self.settle();
         let map = self.win.map;
         let (a, b) = (self.at(from.0, from.1), self.at(to.0, to.1));
-        self.drv.drag(&mut self.win, PointerButton::Primary, a, b);
-        assert_eq!(self.win.map, map, "the image stayed put during the drag");
+        let mut step = 0;
+        self.drv
+            .drag_watching(&mut self.win, PointerButton::Primary, a, b, |w| {
+                assert_eq!(
+                    w.map, map,
+                    "the image moved under the held pointer (step {step})"
+                );
+                step += 1;
+            });
+        assert_eq!(
+            self.win.map, map,
+            "the image stayed put through the release"
+        );
     }
 
     fn rect(&self) -> Option<[u32; 4]> {
@@ -346,5 +342,180 @@ fn loss_disclosure_is_shown_whole_on_a_narrow_window_and_the_image_stays_put() {
     assert!(
         fx.drv.find_text("not kept: XMP, comment").is_some(),
         "the save result's disclosure is shown whole"
+    );
+}
+
+/// A save result that lands while the button is held: the picture stays put (its disclosure row
+/// would shrink the picture's panel) until the rectangle is let go; then the row appears, whole.
+#[test]
+fn a_save_result_landing_mid_drag_waits_for_the_release() {
+    let mut fx = open();
+    fx.settle();
+    let map = fx.win.map;
+    let note = "not kept: XMP, comment".to_string();
+    // The result is handed in by the test, so it lands exactly while the button is down.
+    let (tx, rx) = mpsc::channel();
+    fx.win.job = Some(Job {
+        kind: JobKind::Save { close_after: false },
+        rev: fx.win.doc.rev(),
+        rx,
+    });
+    let (a, b) = (fx.at(10.0, 10.0), fx.at(90.0, 60.0));
+    fx.drv.move_to(&mut fx.win, a);
+    fx.drv.press(&mut fx.win, PointerButton::Primary);
+    fx.drv.move_to(&mut fx.win, b);
+    assert!(fx.win.sel.dragging());
+    tx.send(Ok(JobDone::Saved(Saved::Written {
+        remote: "box:/shot.png".to_string(),
+        backup: PathBuf::from("/backup/shot.png"),
+        notes: Vec::new(),
+        not_kept: vec![note.clone()],
+    })))
+    .unwrap();
+    for pass in 0..5 {
+        fx.drv.idle(&mut fx.win, 1);
+        assert_eq!(
+            fx.win.map, map,
+            "the image moved under the held pointer ({pass})"
+        );
+    }
+    assert!(
+        fx.win.job.is_none(),
+        "the result was taken while the button was held"
+    );
+    assert!(
+        fx.win.status.text.starts_with("saved "),
+        "{}",
+        fx.win.status.text
+    );
+    assert!(
+        fx.drv.find_text(&note).is_none(),
+        "not while the button is held"
+    );
+    fx.drv.release(&mut fx.win, PointerButton::Primary);
+    fx.settle();
+    assert!(
+        fx.drv.find_text(&note).is_some(),
+        "shown whole after the release"
+    );
+    assert_eq!(fx.rect(), Some([10, 10, 80, 50]));
+}
+
+/// The toolbar's busy spinner never moves the image: with a save running the image sits where
+/// it sits with none, at every width — including 638–664 px, where the spinner used to wrap the
+/// toolbar onto a second line (640 px is the default width for any image up to 640 px).
+#[test]
+fn a_running_save_never_moves_the_image_at_any_width() {
+    let mut moved = Vec::new();
+    for w in (600..=700).chain((480..=1400).step_by(20)) {
+        let mut fx = open_sized(w as f32, 700.0);
+        fx.settle();
+        let idle = fx.win.map;
+        let (_tx, rx) = mpsc::channel();
+        fx.win.job = Some(Job {
+            kind: JobKind::SaveCopy { close_after: false },
+            rev: fx.win.doc.rev(),
+            rx,
+        });
+        fx.settle();
+        if fx.win.map != idle {
+            moved.push(w);
+        }
+    }
+    assert!(moved.is_empty(), "the image moved at widths {moved:?}");
+}
+
+/// Held from the press, not from the drag: a save result that lands after the button went down
+/// but before the pointer moved far enough to count as a drag still waits for the release.
+#[test]
+fn a_save_result_landing_between_press_and_drag_waits_for_the_release() {
+    let mut fx = open();
+    fx.settle();
+    let map = fx.win.map;
+    let note = "not kept: XMP, comment".to_string();
+    let (tx, rx) = mpsc::channel();
+    fx.win.job = Some(Job {
+        kind: JobKind::Save { close_after: false },
+        rev: fx.win.doc.rev(),
+        rx,
+    });
+    let a = fx.at(10.0, 10.0);
+    fx.drv.move_to(&mut fx.win, a);
+    fx.drv.press(&mut fx.win, PointerButton::Primary);
+    assert!(!fx.win.sel.dragging(), "not a drag yet");
+    tx.send(Ok(JobDone::Saved(Saved::Written {
+        remote: "box:/shot.png".to_string(),
+        backup: PathBuf::from("/backup/shot.png"),
+        notes: Vec::new(),
+        not_kept: vec![note.clone()],
+    })))
+    .unwrap();
+    for pass in 0..5 {
+        fx.drv.idle(&mut fx.win, 1);
+        assert_eq!(
+            fx.win.map, map,
+            "the image moved under the pressed pointer ({pass})"
+        );
+    }
+    assert!(
+        fx.win.job.is_none(),
+        "the result was taken while the button was down"
+    );
+    fx.drv.release(&mut fx.win, PointerButton::Primary);
+    fx.settle();
+    assert!(
+        fx.drv.find_text(&note).is_some(),
+        "shown whole after the release"
+    );
+}
+
+/// Where an earlier copy's unsaved edits went is read whole on open, at the default width for
+/// a small image (640 px), in the always-visible rows — and stays there after a save reports;
+/// the status line stays free for short news.
+#[test]
+fn the_kept_copy_notice_is_shown_whole_on_open_and_stays() {
+    let notice = "the previous copy had unsaved edits; kept them at /Users/someone/Library/Caches/\
+                  sopen/example-host/home/someone/photos/2026/IMG_0001.png.conflict-20261116T101010Z"
+        .to_string();
+    let bytes = encode(&coordinates(), ImageFormat::Png, None, None)
+        .unwrap()
+        .bytes;
+    let mut fx = open_noticed("shot.png", bytes, 640.0, 560.0, Some(notice.clone()));
+    fx.settle();
+    assert!(fx.drv.find_text(&notice).is_some(), "shown whole on open");
+    assert!(fx.win.status.text.is_empty(), "{}", fx.win.status.text);
+    fx.select((0.0, 0.0), (120.0, 80.0));
+    fx.key(Key::P, Modifiers::NONE);
+    fx.key(Key::S, command(false));
+    wait_for_save(&mut fx);
+    fx.settle();
+    assert!(
+        fx.win.status.text.starts_with("saved "),
+        "{}",
+        fx.win.status.text
+    );
+    assert!(
+        fx.drv.find_text(&notice).is_some(),
+        "still shown after the save"
+    );
+}
+
+/// Closing during a save on a narrow window: that the window closes when the save is done is
+/// read whole.
+#[test]
+fn the_close_during_save_hint_is_shown_whole_on_a_narrow_window() {
+    let mut fx = open_sized(420.0, 560.0);
+    let (_tx, rx) = mpsc::channel();
+    fx.win.job = Some(Job {
+        kind: JobKind::Save { close_after: false },
+        rev: fx.win.doc.rev(),
+        rx,
+    });
+    use crate::gui::Window;
+    assert!(!fx.win.close_requested());
+    fx.settle();
+    assert!(
+        fx.drv.find_text(CLOSES_AFTER_SAVE).is_some(),
+        "shown whole: {CLOSES_AFTER_SAVE}"
     );
 }

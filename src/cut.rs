@@ -5,7 +5,7 @@
 use crate::ffmpeg::{self, ExportPlan, MediaKind, Probe, Rect, Tools};
 use crate::kind::{self, Kind};
 use crate::remote::{random_hex, RemoteFs};
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, Result};
 use std::path::Path;
 
 #[derive(Debug, Clone, Copy)]
@@ -101,7 +101,8 @@ pub fn cut_and_publish(
     let name = ffmpeg::cut_name(stem, req.in_s, req.out_s, &out_ext);
 
     let work = work_root.join(random_hex());
-    std::fs::create_dir_all(&work).with_context(|| format!("cannot create {}", work.display()))?;
+    // The export is private until it is published: an owner-only (0700) work dir.
+    crate::cache::private_dir(&work)?;
     let result = (|| -> Result<String> {
         let dst = work.join(&name);
         let args = ffmpeg::export_args(src, &dst, req.in_s, req.out_s, crop, media, &plan)?;
@@ -173,6 +174,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(last, 1.0, "progress reaches the end");
+        // The local export lived in an owner-only work dir.
+        use std::os::unix::fs::PermissionsExt;
+        let work = std::fs::metadata(dir.join("work")).unwrap().permissions();
+        assert_eq!(work.mode() & 0o777, 0o700);
         let out = out.name;
         let probe = ffmpeg::probe(tools, &dir.join(&out)).unwrap();
         let d = probe.duration.unwrap();
@@ -182,41 +187,11 @@ mod tests {
 
     const SINE: &str = "sine=frequency=440:duration=4";
 
-    /// `ffmpeg -version` major: `5.1.9-0+deb12u1` → 5, `n6.1.1` → 6; `None` for git builds.
-    fn ffmpeg_major(tools: &Tools) -> Option<u32> {
-        let out = Command::new(&tools.ffmpeg).arg("-version").output().ok()?;
-        let text = String::from_utf8_lossy(&out.stdout);
-        let version = text.lines().next()?.strip_prefix("ffmpeg version ")?;
-        let version = version.strip_prefix('n').unwrap_or(version);
-        version.split(['.', '-', ' ']).next()?.parse().ok()
-    }
-
-    /// `plain` re-muxed to display rotated by 90°: the display matrix (`-display_rotation`,
-    /// ffmpeg ≥ 6), else the legacy `rotate` tag (older mp4 muxers turn it into the matrix).
-    /// `None` when this ffmpeg writes neither.
+    /// `plain` re-muxed to display rotated by 90°, decided by ffprobe's own output (not by
+    /// the probe under test); then this module's probe of it.
     fn rotated_copy(tools: &Tools, plain: &Path, dst: &Path) -> Option<ffmpeg::Probe> {
-        let attempts: [(&[&str], &[&str]); 2] = [
-            (&["-display_rotation", "90"], &[]),
-            (&[], &["-metadata:s:v:0", "rotate=90"]),
-        ];
-        for (input_opts, output_opts) in attempts {
-            let made = Command::new(&tools.ffmpeg)
-                .args(["-hide_banner", "-loglevel", "error", "-nostdin", "-y"])
-                .args(input_opts)
-                .arg("-i")
-                .arg(plain)
-                .args(["-c", "copy"])
-                .args(output_opts)
-                .arg(dst)
-                .status()
-                .is_ok_and(|s| s.success());
-            if let Some(probe) = made.then(|| ffmpeg::probe(tools, dst).ok()).flatten() {
-                if probe.rotation % 180 == 90 {
-                    return Some(probe);
-                }
-            }
-        }
-        None
+        ffmpeg::fixtures::rotated_copy(tools, plain, dst)
+            .then(|| ffmpeg::probe(tools, dst).expect("the app probes a fixture ffprobe reads"))
     }
 
     #[test]
@@ -310,13 +285,7 @@ mod tests {
             &["-c:v", "libx264", "-pix_fmt", "yuv420p"],
         );
         let Some(src) = rotated_copy(&tools, &plain, &tmp.path().join("r.mp4")) else {
-            let major = ffmpeg_major(&tools);
-            // ffmpeg 6+ has -display_rotation; a CI that requires ffmpeg must not skip there.
-            if std::env::var_os("SOPEN_REQUIRE_FFMPEG").is_some() && major.is_some_and(|m| m >= 6) {
-                panic!("ffmpeg {major:?} wrote no display rotation into the fixture");
-            }
-            eprintln!("skipping: this ffmpeg ({major:?}) cannot tag a fixture as rotated");
-            return;
+            return; // this ffmpeg cannot tag a fixture as rotated (said by `rotated_copy`)
         };
         assert_eq!(src.video, Some((640, 360)));
         // 90 from the display matrix; older ffprobe reports the tag's matrix as -90 = 270.

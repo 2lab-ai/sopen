@@ -57,40 +57,33 @@ fn open_sized(path: PathBuf, tmp: tempfile::TempDir, w: f32, h: f32) -> Fixture 
 
 /// `notes` are added to what the probe found (a long "not kept" note for the layout tests).
 fn open_with(path: PathBuf, tmp: tempfile::TempDir, w: f32, h: f32, notes: Vec<String>) -> Fixture {
+    open_noticed(path, tmp, w, h, notes, None)
+}
+
+/// As `open` does it, with `notice` (an earlier copy's unsaved edits were kept).
+fn open_noticed(
+    path: PathBuf,
+    tmp: tempfile::TempDir,
+    w: f32,
+    h: f32,
+    notes: Vec<String>,
+    notice: Option<String>,
+) -> Fixture {
     let mut media = Media::probe(&path).unwrap();
     media.notes.extend(notes);
     let abs = path.to_str().unwrap().to_string();
     let mut fs = LocalFs::new();
     let at = fs.stat(&abs).unwrap();
     let origin = Origin::new(Box::new(fs), None, None, abs, at);
-    let win = MediaWindow {
-        media: Arc::new(media),
-        origin: Arc::new(Mutex::new(origin)),
-        work_root: tmp.path().join("work"),
-        marks: Marks::default(),
-        sel: Selection::default(),
-        tex: None,
-        tex_pts: None,
-        want: None,
-        scrub: None,
-        wave: None,
-        player: None,
-        job: None,
-        status: Status::default(),
-        outcome: Arc::default(),
-        started: false,
-        painted: false,
-        close_when_done: false,
-        close_ok: false,
-        leftover: Arc::default(),
-        export_hold: None,
-        resume: false,
-        sink: Sink::Null,
-        map: None,
-        timeline_rect: None,
-        notices: Vec::new(),
-        pending_notices: None,
-    };
+    let mut win = MediaWindow::new(
+        media,
+        origin,
+        tmp.path().join("work"),
+        Marks::default(),
+        Selection::default(),
+        notice,
+    );
+    win.sink = Sink::Null;
     let mut fx = Fixture {
         tmp,
         win,
@@ -198,28 +191,17 @@ fn crop_on_a_rotated_source_is_in_displayed_pixels() {
     let plain = tmp.path().join("plain.mp4");
     clip(&tools, &plain);
     let src = tmp.path().join("phone.mp4");
-    let tagged = [
-        (vec!["-display_rotation", "90"], vec![]),
-        (vec![], vec!["-metadata:s:v:0", "rotate=90"]),
-    ]
-    .into_iter()
-    .any(|(input, output)| {
-        std::process::Command::new(&tools.ffmpeg)
-            .args(["-hide_banner", "-loglevel", "error", "-nostdin", "-y"])
-            .args(input)
-            .arg("-i")
-            .arg(&plain)
-            .args(["-c", "copy"])
-            .args(output)
-            .arg(&src)
-            .status()
-            .is_ok_and(|s| s.success())
-            && Media::probe(&src).is_ok_and(|m| m.rotation % 180 == 90)
-    });
-    if !tagged {
-        eprintln!("skipping: this ffmpeg cannot tag a fixture as rotated");
-        return;
+    // Whether the fixture is rotated is ffprobe's word, not the app's: from here on the app's
+    // probe must agree.
+    if !crate::ffmpeg::fixtures::rotated_copy(&tools, &plain, &src) {
+        return; // this ffmpeg cannot tag a fixture as rotated (said by `rotated_copy`)
     }
+    let media = Media::probe(&src).unwrap();
+    assert_eq!(
+        media.rotation % 180,
+        90,
+        "the app's probe sees the rotation"
+    );
     let mut fx = open(src, tmp);
     assert_eq!(fx.win.media.video, Some((240, 320)));
     let (a, b) = (fx.at(10.0, 20.0), fx.at(200.0, 300.0));
@@ -304,8 +286,11 @@ fn frame_stays_put_while_a_crop_is_drawn_next_to_a_long_status() {
     assert_eq!(fx.win.map, quiet, "the info bar changed height");
     let map = fx.win.map;
     let (a, b) = (fx.at(20.0, 30.0), fx.at(200.0, 150.0));
-    fx.drv.drag(&mut fx.win, PointerButton::Primary, a, b);
-    assert_eq!(fx.win.map, map, "the frame stayed put during the drag");
+    fx.drv
+        .drag_watching(&mut fx.win, PointerButton::Primary, a, b, |w| {
+            assert_eq!(w.map, map, "the frame moved under the held pointer");
+        });
+    assert_eq!(fx.win.map, map, "the frame stayed put through the release");
     assert_eq!(fx.win.crop(), Some([20, 30, 180, 120]));
 }
 
@@ -324,7 +309,10 @@ fn export_note_is_shown_whole_on_a_narrow_window_and_the_frame_stays_put() {
     assert!(fx.drv.find_text(&row).is_some(), "shown whole: {row}");
     let quiet = fx.win.map;
     let (a, b) = (fx.at(20.0, 30.0), fx.at(200.0, 150.0));
-    fx.drv.drag(&mut fx.win, PointerButton::Primary, a, b);
+    fx.drv
+        .drag_watching(&mut fx.win, PointerButton::Primary, a, b, |w| {
+            assert_eq!(w.map, quiet, "the frame moved under the held pointer");
+        });
     assert_eq!(fx.win.map, quiet, "the frame moved");
     assert_eq!(fx.win.crop(), Some([20, 30, 180, 120]));
 }
@@ -342,4 +330,134 @@ fn export_result_notes_leave_the_status_line() {
     assert_eq!(status.text, "exported box:/a.cut-1-2.mp4");
     assert_eq!(shown, notes);
     assert!(outcome.exported);
+}
+
+/// The export's progress row never moves the frame: with an export running the frame sits
+/// where it sits with none, at every width (it used to be added only while exporting).
+#[test]
+fn a_running_export_never_moves_the_frame() {
+    let Some(tools) = tools_or_skip() else { return };
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("clip.mp4");
+    clip(&tools, &path);
+    let mut moved = Vec::new();
+    for w in [420, 560, 640, 760, 900, 1100, 1280] {
+        let copy = tempfile::tempdir().unwrap();
+        let mut fx = open_sized(path.clone(), copy, w as f32, 700.0);
+        let idle = fx.win.map;
+        let (_tx, rx) = mpsc::channel();
+        fx.win.job = Some(ExportJob {
+            progress: Arc::default(),
+            rx,
+        });
+        fx.settle();
+        if fx.win.map != idle {
+            moved.push(w);
+        }
+    }
+    assert!(moved.is_empty(), "the frame moved at widths {moved:?}");
+}
+
+/// An export that finishes while the button is down — before the pointer has moved far enough
+/// to count as a drag, and during the drag — changes nothing under the pointer: the crop lands
+/// where it was aimed, and the result's row appears after the release.
+#[test]
+fn an_export_finishing_under_a_held_button_waits_for_the_release() {
+    let Some(mut fx) = fixture() else { return };
+    let map = fx.win.map;
+    let note = "not kept: 1 subtitle stream".to_string();
+    let (tx, rx) = mpsc::channel();
+    fx.win.job = Some(ExportJob {
+        progress: Arc::default(),
+        rx,
+    });
+    fx.settle();
+    assert_eq!(fx.win.map, map);
+    let (a, b) = (fx.at(20.0, 30.0), fx.at(200.0, 150.0));
+    fx.drv.move_to(&mut fx.win, a);
+    fx.drv.press(&mut fx.win, PointerButton::Primary);
+    tx.send(Ok((
+        "box:/clip.cut-0-4.mp4".to_string(),
+        vec![note.clone()],
+    )))
+    .unwrap();
+    for pass in 0..5 {
+        fx.drv.idle(&mut fx.win, 1);
+        assert_eq!(
+            fx.win.map, map,
+            "the frame moved under the pressed pointer ({pass})"
+        );
+    }
+    assert!(
+        fx.win.job.is_none(),
+        "the result was taken while the button was down"
+    );
+    for k in 1..=8 {
+        fx.drv.move_to(&mut fx.win, a + (b - a) * (k as f32 / 8.0));
+        assert_eq!(fx.win.map, map, "the frame moved under the held pointer");
+    }
+    fx.drv.release(&mut fx.win, PointerButton::Primary);
+    fx.drv.idle(&mut fx.win, 1);
+    assert_eq!(fx.win.crop(), Some([20, 30, 180, 120]));
+    fx.settle();
+    assert!(
+        fx.drv.find_text(&note).is_some(),
+        "shown whole after the release"
+    );
+}
+
+/// Where an earlier copy's unsaved edits went is read whole on open (640 px) and stays after an
+/// export reports; the one-line status stays free for short news.
+#[test]
+fn the_kept_copy_notice_is_shown_whole_on_open_and_stays() {
+    let Some(tools) = tools_or_skip() else { return };
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("clip.mp4");
+    clip(&tools, &path);
+    let notice = "the previous copy had unsaved edits; kept them at /Users/someone/Library/Caches/\
+                  sopen/example-host/home/someone/videos/2026/clip.mp4.conflict-20261116T101010Z"
+        .to_string();
+    let mut fx = open_noticed(path, tmp, 640.0, 560.0, Vec::new(), Some(notice.clone()));
+    assert!(fx.drv.find_text(&notice).is_some(), "shown whole on open");
+    assert!(fx.win.status.text.is_empty(), "{}", fx.win.status.text);
+    let (tx, rx) = mpsc::channel();
+    fx.win.job = Some(ExportJob {
+        progress: Arc::default(),
+        rx,
+    });
+    tx.send(Ok(("box:/clip.cut-0-4.mp4".to_string(), Vec::new())))
+        .unwrap();
+    fx.settle();
+    assert!(
+        fx.win.status.text.starts_with("exported "),
+        "{}",
+        fx.win.status.text
+    );
+    assert!(
+        fx.drv.find_text(&notice).is_some(),
+        "still shown after the export"
+    );
+}
+
+/// Closing during an export on a narrow window: what a second close does is read whole.
+#[test]
+fn the_close_during_export_hint_is_shown_whole_on_a_narrow_window() {
+    let Some(tools) = tools_or_skip() else { return };
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("clip.mp4");
+    clip(&tools, &path);
+    let mut fx = open_sized(path, tmp, 420.0, 560.0);
+    let (_tx, rx) = mpsc::channel();
+    fx.win.job = Some(ExportJob {
+        progress: Arc::default(),
+        rx,
+    });
+    fx.settle();
+    use crate::gui::Window;
+    assert!(!fx.win.close_requested());
+    fx.settle();
+    assert!(
+        fx.drv.find_text(CLOSE_AGAIN).is_some(),
+        "shown whole: {CLOSE_AGAIN}"
+    );
 }

@@ -802,6 +802,32 @@ fn fetch_keeps_unsaved_edits_of_the_previous_copy() {
     assert_eq!(std::fs::read_to_string(&kept[0]).unwrap(), "unsaved edit");
 }
 
+/// A fetched copy and the cache directories made for it are the owner's only (0600 / 0700),
+/// whatever the umask lets through; so is an edit moved aside, even one an editor rewrote with
+/// the umask's mode.
+#[test]
+fn fetched_copies_and_kept_edits_are_owner_only() {
+    let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+    let tmp = tempfile::tempdir().unwrap();
+    let target = tmp.path().join("a.txt");
+    std::fs::write(&target, "v1").unwrap();
+    let cache = tmp.path().join("cache");
+    let local = cache.join("box/srv/a.txt");
+    LocalFs::new()
+        .fetch(p(&target), &local, &mut |_, _| {})
+        .unwrap();
+    assert_eq!(mode(&local), 0o600);
+    for dir in local.parent().unwrap().ancestors().take(3) {
+        assert_eq!(mode(dir), 0o700, "{dir:?}");
+    }
+    // The editor replaced the copy with a file of the umask's mode.
+    std::fs::remove_file(&local).unwrap();
+    std::fs::write(&local, "edit").unwrap();
+    std::fs::set_permissions(&local, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let kept = crate::cache::set_aside(&local).unwrap();
+    assert_eq!(mode(&kept), 0o600);
+}
+
 #[test]
 fn fetch_of_a_directory_is_refused() {
     let tmp = tempfile::tempdir().unwrap();

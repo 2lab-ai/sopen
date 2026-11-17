@@ -14,7 +14,7 @@ use image::{
     ImageReader, Pixel, Primitive,
 };
 use num_traits::ToPrimitive;
-use std::io::Cursor;
+use std::io::{Cursor, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex};
@@ -735,6 +735,9 @@ pub enum Saved {
     Refused { message: String, kept: PathBuf },
 }
 
+/// Closing was asked for while a save runs.
+const CLOSES_AFTER_SAVE: &str = "the window closes when the save is done";
+
 /// Why Save cannot replace the file on this server (spec §5): Save copy still works.
 pub const CANNOT_REPLACE: &str = "this server cannot replace a file in one step (no \
      posix-rename@openssh.com) — Save copy writes the edit next to the original instead";
@@ -773,14 +776,14 @@ impl ImageFile {
         self.origin.can_replace()
     }
 
+    /// The encoded edit in a new owner-only file next to where edits are kept (never over or
+    /// through an existing one).
     fn stage(&self, encoded: &[u8], tag: &str) -> Result<PathBuf> {
-        let path = super::keep_path(&self.edits, tag, SystemTime::now());
-        if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir)
-                .with_context(|| format!("cannot create {}", dir.display()))?;
+        let (path, mut file) = super::create_keep(&self.edits, tag)?;
+        if let Err(e) = file.write_all(encoded) {
+            let _ = std::fs::remove_file(&path);
+            return Err(e).with_context(|| format!("cannot write {}", path.display()));
         }
-        std::fs::write(&path, encoded)
-            .with_context(|| format!("cannot write {}", path.display()))?;
         Ok(path)
     }
 
@@ -789,18 +792,25 @@ impl ImageFile {
         if let Some(path) = &self.backup {
             return Ok(path.clone());
         }
-        let path = crate::cache::backup_path(
+        let first = crate::cache::backup_path(
             &self.cache_root,
             self.origin.host(),
             &self.origin.abs,
             SystemTime::now(),
         );
-        if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir)
-                .with_context(|| format!("cannot create {}", dir.display()))?;
+        // Another session's backup from the same second keeps its name: this one adds `-<random>`.
+        let (path, mut file) = crate::cache::create_unique(|attempt| {
+            if attempt == 0 {
+                return first.clone();
+            }
+            let mut name = first.file_name().unwrap_or_default().to_os_string();
+            name.push(format!("-{}", &crate::remote::random_hex()[..8]));
+            first.with_file_name(name)
+        })?;
+        if let Err(e) = file.write_all(self.original.as_slice()) {
+            let _ = std::fs::remove_file(&path);
+            return Err(e).with_context(|| format!("cannot write the backup {}", path.display()));
         }
-        std::fs::write(&path, self.original.as_slice())
-            .with_context(|| format!("cannot write the backup {}", path.display()))?;
         println!("backup of {} at {}", self.origin.display(), path.display());
         self.backup = Some(path.clone());
         Ok(path)
@@ -847,10 +857,14 @@ impl ImageFile {
                     })
                 }
                 WriteOutcome::Conflict { reason, notes, .. } => {
-                    let kept = super::keep_path(&self.edits, "conflict", SystemTime::now());
-                    std::fs::rename(&staged, &kept).with_context(|| {
-                        format!("cannot keep the edited copy at {}", kept.display())
-                    })?;
+                    // A name of its own first, so the move cannot replace anyone's file.
+                    let (kept, _) = super::create_keep(&self.edits, "conflict")?;
+                    if let Err(e) = std::fs::rename(&staged, &kept) {
+                        let _ = std::fs::remove_file(&kept);
+                        return Err(e).with_context(|| {
+                            format!("cannot keep the edited copy at {}", kept.display())
+                        });
+                    }
                     let mut message = format!(
                         "{} changed since it was opened ({reason}); not saved — your edit is at {}",
                         self.origin.display(),
@@ -916,7 +930,7 @@ fn apply_state(doc: &mut Doc, sel: &mut Selection, block: &mut u32, hooks: &Hook
 }
 
 /// Opens the image: the window, or the windowless `SOPEN_AUTOSAVE` run.
-/// `notice` is shown in the status line on open (an earlier copy with unsaved edits was kept).
+/// `notice` (where an earlier copy's unsaved edits went) is shown whole in the window's rows.
 pub fn open(file: ImageFile, hooks: &Hooks, notice: Option<String>) -> Result<Outcome> {
     let mut doc = Doc::decode(file.original())?;
     let mut sel = Selection::default();
@@ -926,50 +940,18 @@ pub fn open(file: ImageFile, hooks: &Hooks, notice: Option<String>) -> Result<Ou
         return autosave(file, &doc, hooks);
     }
     let title = file.origin.display();
-    let outcome = Arc::new(Mutex::new(Outcome::default()));
     let (w, h) = doc.size();
-    let can_replace = file.can_replace();
-    let leftover: Arc<Mutex<Option<Job>>> = Arc::default();
-    // Before the owner acts: what Save cannot do (status line) and what it will not keep
-    // (a label that stays in the status bar). Both also go to the terminal.
+    // Before the owner acts, on the terminal too: what Save will not keep and what Save cannot
+    // do here (`notice` is already there: the caller printed it).
     if let Some(line) = doc.not_kept_line() {
         eprintln!("sopen: {line}");
     }
-    let warnings: Vec<String> = notice
-        .into_iter()
-        .chain((!can_replace).then(|| CANNOT_REPLACE.to_string()))
-        .collect();
-    let status = if warnings.is_empty() {
-        Status::default()
-    } else {
-        for line in &warnings {
-            eprintln!("sopen: {line}");
-        }
-        Status::error(warnings.join(" · "))
-    };
-    let window = ImageWindow {
-        title: title.clone(),
-        can_replace,
-        doc,
-        file: Arc::new(Mutex::new(file)),
-        tex: None,
-        tex_rev: None,
-        sel,
-        block,
-        view: View::default(),
-        status,
-        job: None,
-        outcome: outcome.clone(),
-        prompt: false,
-        close_ok: false,
-        close_when_done: false,
-        leftover: leftover.clone(),
-        painted: false,
-        zoom: 1.0,
-        map: None,
-        notices: Vec::new(),
-        pending_notices: None,
-    };
+    if !file.can_replace() {
+        eprintln!("sopen: {CANNOT_REPLACE}");
+    }
+    let window = ImageWindow::new(file, doc, sel, block, notice);
+    let outcome = window.outcome.clone();
+    let leftover = window.leftover.clone();
     // A window that shows the image near 1:1 where the screen allows; eframe clamps to it.
     let size = [
         (w as f32).clamp(640.0, 1400.0),
@@ -1127,8 +1109,10 @@ struct ImageWindow {
     zoom: f32,
     /// Where the last pass drew the image (screen ↔ image pixels).
     map: Option<Map>,
-    /// What the last write reported that must be read whole (see [`super::disclosures`]), and
-    /// the next such report, held while a rectangle is being drawn.
+    /// Lines from open that must be read whole and stay (see [`super::disclosures`]).
+    opened: Vec<String>,
+    /// What the last write reported that must be read whole, and the next such report, held
+    /// while the button is down.
     notices: Vec<String>,
     pending_notices: Option<Vec<String>>,
 }
@@ -1142,6 +1126,41 @@ impl Drop for ImageWindow {
 }
 
 impl ImageWindow {
+    /// The window as `open` makes it. `notice` (where an earlier copy's unsaved edits went)
+    /// and what Save cannot do here are read whole, in the always-visible rows, for the whole
+    /// session; the one-line status is for short news.
+    fn new(file: ImageFile, doc: Doc, sel: Selection, block: u32, notice: Option<String>) -> Self {
+        let can_replace = file.can_replace();
+        let opened = notice
+            .into_iter()
+            .chain((!can_replace).then(|| CANNOT_REPLACE.to_string()))
+            .collect();
+        Self {
+            title: file.origin.display(),
+            can_replace,
+            doc,
+            file: Arc::new(Mutex::new(file)),
+            tex: None,
+            tex_rev: None,
+            sel,
+            block,
+            view: View::default(),
+            status: Status::default(),
+            job: None,
+            outcome: Arc::default(),
+            prompt: false,
+            close_ok: false,
+            close_when_done: false,
+            leftover: Arc::default(),
+            painted: false,
+            zoom: 1.0,
+            map: None,
+            opened,
+            notices: Vec::new(),
+            pending_notices: None,
+        }
+    }
+
     fn bounds(&self) -> Vec2 {
         let (w, h) = self.doc.size();
         Vec2::new(w as f32, h as f32)
@@ -1258,12 +1277,19 @@ impl ImageWindow {
             }
             _ => false,
         };
+        // An edit made while the save ran is not in what it wrote.
+        let newer = self.doc.rev() != job.rev;
         let waited = std::mem::take(&mut self.close_when_done);
-        if close_after || (waited && !self.doc.unsaved()) {
+        if (close_after && !newer) || (waited && !self.doc.unsaved()) {
             self.close_ok = true;
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-        } else if waited {
-            // Closing was asked for during a save that did not land: ask what to do.
+        } else if close_after || waited {
+            // Closing was asked for, but the save did not land or the picture changed since it
+            // started: say so first (the status is cut to one line) and ask what to do.
+            if close_after && newer {
+                self.status =
+                    Status::info(format!("newer edits are not saved · {}", self.status.text));
+            }
             self.prompt = true;
         }
     }
@@ -1306,7 +1332,8 @@ impl ImageWindow {
         let has_rect = self.rect().is_some();
         let busy = self.job.is_some();
         // Wraps on a narrow window so Save stays reachable; its height depends only on the
-        // window width (button labels never change), so it cannot move the image mid-drag.
+        // window width (button labels never change, the spinner's slot is always reserved), so
+        // it cannot move the image mid-drag.
         ui.horizontal_wrapped(|ui| {
             let why = "draw a rectangle on the image first";
             if ui
@@ -1369,9 +1396,9 @@ impl ImageWindow {
             if copy.clicked() {
                 self.start(&ctx, JobKind::SaveCopy { close_after: false });
             }
-            if busy {
-                ui.spinner();
-            }
+            // Its slot is always there: a spinner that came and went would rewrap the bar at
+            // some widths and move the image.
+            ui.add_visible(busy, egui::Spinner::new());
         });
     }
 
@@ -1553,8 +1580,10 @@ impl super::Window for ImageWindow {
             self.toolbar(ui);
             ui.add_space(1.0);
         });
-        // A report that lands mid-drag waits until the rectangle is let go.
-        if !self.sel.dragging() {
+        // A report that lands while the button is down (a drag, or a press that may become one)
+        // waits until it is let go: its row would move the image under the pointer.
+        let held = self.sel.dragging() || ctx.input(|i| i.pointer.primary_down());
+        if !held {
             if let Some(next) = self.pending_notices.take() {
                 self.notices = next;
             }
@@ -1572,7 +1601,12 @@ impl super::Window for ImageWindow {
         }
         .map(|l| (l, warn))
         .into_iter()
-        .chain(self.notices.iter().map(|n| (n.clone(), error)))
+        .chain(
+            self.opened
+                .iter()
+                .chain(&self.notices)
+                .map(|n| (n.clone(), error)),
+        )
         .collect();
         if !lines.is_empty() {
             egui::Panel::bottom("disclosures").show(ui, |ui| {
@@ -1596,9 +1630,18 @@ impl super::Window for ImageWindow {
             return true;
         }
         if self.job.is_some() {
-            // Never close mid-write: the window closes once the save has reported.
+            // Never close mid-write: the window closes once the save has reported. Said in the
+            // rows (read whole on a narrow window), after any report still held.
             self.close_when_done = true;
-            self.status = Status::info("saving… the window closes when the save is done");
+            self.status = Status::info("saving…");
+            let mut next = self
+                .pending_notices
+                .take()
+                .unwrap_or_else(|| self.notices.clone());
+            if !next.iter().any(|n| n == CLOSES_AFTER_SAVE) {
+                next.push(CLOSES_AFTER_SAVE.to_string());
+            }
+            self.pending_notices = Some(next);
             return false;
         }
         if !self.doc.unsaved() {
@@ -2112,29 +2155,9 @@ mod tests {
 
     fn window_for(file: ImageFile, leftover: Arc<Mutex<Option<Job>>>) -> ImageWindow {
         let doc = Doc::decode(file.original()).unwrap();
-        ImageWindow {
-            title: file.origin.display(),
-            can_replace: true,
-            doc,
-            file: Arc::new(Mutex::new(file)),
-            tex: None,
-            tex_rev: None,
-            sel: Selection::default(),
-            block: DEFAULT_BLOCK,
-            view: View::default(),
-            status: Status::default(),
-            job: None,
-            outcome: Arc::default(),
-            prompt: false,
-            close_ok: false,
-            close_when_done: false,
-            leftover,
-            painted: false,
-            zoom: 1.0,
-            map: None,
-            notices: Vec::new(),
-            pending_notices: None,
-        }
+        let mut w = ImageWindow::new(file, doc, Selection::default(), DEFAULT_BLOCK, None);
+        w.leftover = leftover;
+        w
     }
 
     /// Closing while a save runs never closes mid-write: the window stays until the save has
@@ -2158,13 +2181,64 @@ mod tests {
         });
         assert!(!super::super::Window::close_requested(&mut w));
         assert!(w.close_when_done);
-        assert!(w.status.text.contains("closes when the save is done"));
         assert!(!super::super::Window::close_requested(&mut w), "still not");
+        // Said once, in the rows, however often closing is asked for.
+        assert_eq!(w.pending_notices, Some(vec![CLOSES_AFTER_SAVE.to_string()]));
         drop(w);
         assert!(
             leftover.lock().unwrap().is_some(),
             "in-flight save handed over"
         );
+    }
+
+    /// Save (or Save copy) chosen in the close prompt closes the window only when what it wrote
+    /// is the picture on screen: an edit made while it ran keeps the window open, says so, and
+    /// asks again.
+    #[test]
+    fn close_after_save_waits_for_edits_made_during_the_save() {
+        for copy in [false, true] {
+            for newer in [false, true] {
+                let case = format!("copy={copy} newer={newer}");
+                let tmp = tempfile::tempdir().unwrap();
+                let file = local_file(tmp.path(), "a.png", &png_bytes(&gradient(12, 12)));
+                let mut w = window_for(file, Arc::default());
+                w.doc.pixelize([0, 0, 4, 4], 2).unwrap();
+                let (tx, rx) = mpsc::channel();
+                w.job = Some(Job {
+                    kind: if copy {
+                        JobKind::SaveCopy { close_after: true }
+                    } else {
+                        JobKind::Save { close_after: true }
+                    },
+                    rev: w.doc.rev(),
+                    rx,
+                });
+                if newer {
+                    w.doc.pixelize([4, 4, 8, 8], 2).unwrap();
+                }
+                let done = if copy {
+                    JobDone::Copy("box:/a.edited.png".to_string(), Vec::new())
+                } else {
+                    JobDone::Saved(Saved::Written {
+                        remote: "box:/a.png".to_string(),
+                        backup: PathBuf::from("/backup/a.png"),
+                        notes: Vec::new(),
+                        not_kept: Vec::new(),
+                    })
+                };
+                tx.send(Ok(done)).unwrap();
+                w.poll_job(&egui::Context::default());
+                assert_eq!(w.close_ok, !newer, "{case}");
+                assert_eq!(w.prompt, newer, "{case}: asks again");
+                if newer {
+                    assert!(
+                        w.status.text.starts_with("newer edits are not saved"),
+                        "{case}: {}",
+                        w.status.text
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -2274,6 +2348,88 @@ mod tests {
         );
         let copy = file.save_copy(&encoded).unwrap();
         assert!(copy.ends_with("/a.edited.png"), "{copy}");
+    }
+
+    /// Staging an edit and keeping a refused one never write over (or through) a file that
+    /// already has the name: here, files planted under every name a second-precision stamp
+    /// could give in the next three seconds.
+    #[test]
+    fn save_never_writes_over_an_existing_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let original = png_bytes(&gradient(30, 20));
+        let mut file = local_file(tmp.path(), "a.png", &original);
+        std::fs::write(tmp.path().join("a.png"), b"someone else's bytes").unwrap();
+        let now = SystemTime::now();
+        let mut planted = Vec::new();
+        for k in 0..3 {
+            let at = now + std::time::Duration::from_secs(k);
+            let stamp = crate::cache::utc_stamp(at);
+            let backup = crate::cache::backup_path(
+                &file.cache_root,
+                file.origin.host(),
+                &file.origin.abs,
+                at,
+            );
+            let names = ["edited", "conflict"]
+                .map(|tag| file.edits.with_file_name(format!("a.{tag}-{stamp}.png")));
+            for (n, path) in names.into_iter().chain([backup]).enumerate() {
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                let body = format!("someone's file {n} at {k}");
+                std::fs::write(&path, &body).unwrap();
+                planted.push((path, body));
+            }
+        }
+        let encoded = png_bytes(&gradient(6, 6));
+        let Saved::Refused { kept, .. } =
+            file.save(|| Ok(Encoded::plain(encoded.clone()))).unwrap()
+        else {
+            panic!("expected Refused")
+        };
+        for (path, body) in &planted {
+            assert_eq!(&std::fs::read_to_string(path).unwrap(), body, "{path:?}");
+        }
+        assert_eq!(std::fs::read(&kept).unwrap(), encoded);
+        // The backup took the next free name: the stamped one plus `-<random>`.
+        let backups: Vec<PathBuf> = walk(&file.cache_root.join("backup"))
+            .into_iter()
+            .filter(|p| !planted.iter().any(|(q, _)| q == p))
+            .collect();
+        assert_eq!(backups.len(), 1, "{backups:?}");
+        assert_eq!(std::fs::read(&backups[0]).unwrap(), original);
+    }
+
+    /// The backup, the staged edit and a kept (refused) edit are the owner's only: 0600 files in
+    /// 0700 directories, whatever the umask lets through. What Save copy publishes is not: it
+    /// gets the mode any new file in that directory gets.
+    #[test]
+    fn local_copies_of_an_image_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        let tmp = tempfile::tempdir().unwrap();
+        let original = png_bytes(&gradient(30, 20));
+        let mut file = local_file(tmp.path(), "a.png", &original);
+        std::fs::write(tmp.path().join("a.png"), b"someone else's bytes").unwrap();
+        let Saved::Refused { kept, .. } = file
+            .save(|| Ok(Encoded::plain(png_bytes(&gradient(6, 6)))))
+            .unwrap()
+        else {
+            panic!("expected Refused")
+        };
+        let cache = tmp.path().join("cache");
+        let backups = walk(&cache.join("backup"));
+        assert_eq!(backups.len(), 1);
+        for f in [&backups[0], &kept] {
+            assert_eq!(mode(f), 0o600, "{f:?}");
+        }
+        for leaf in [backups[0].parent().unwrap(), kept.parent().unwrap()] {
+            for dir in leaf.ancestors().take_while(|d| d.starts_with(&cache)) {
+                assert_eq!(mode(dir), 0o700, "{dir:?}");
+            }
+        }
+        let published = file.save_copy(&png_bytes(&gradient(6, 6))).unwrap();
+        let control = tmp.path().join("control");
+        std::fs::File::create(&control).unwrap();
+        assert_eq!(mode(Path::new(&published)), mode(&control));
     }
 
     #[test]

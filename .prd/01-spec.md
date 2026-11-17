@@ -78,6 +78,12 @@ anything not in the table below is out of scope until usage says otherwise (§10
   256 MiB); it cannot lock the remote file, so a write racing the final rename is not detected.
 - Any save that does not land moves the edited copy aside to `<copy>.conflict-<UTC stamp>` and prints that path. A
   fetch never overwrites a cached copy holding unsaved edits: it moves it aside first.
+- Local copies are the owner's only: cache, edit, backup and export directories are created 0700; fetched copies,
+  staged and kept image edits, backups and edits moved aside are 0600. A staged or kept image edit gets a new name
+  (`<stem>.<tag>-<UTC stamp>-<random>.<ext>`), created exclusively — never over or through an existing file.
+- One session at a time works on a cached copy: a session (`--app`, the terminal editor, a window) holds an advisory
+  lock on `.<name>.sopen-lock` next to it until it ends; a second session on the same file fetches into its own
+  `<stem>.session-<random>.<ext>` and says so in one line.
 - Nothing waits forever: ssh keepalives (10 s × 3), 30 s per SFTP request, 60 s without transfer progress. Only an
   SFTP status reply proves a rename, link or exclusive create did not happen; a timeout or a lost reply (connection
   closed, EOF, garbled reply) is "outcome unknown — check <path>", never "nothing was written", and a temp or export
