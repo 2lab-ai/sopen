@@ -141,24 +141,32 @@ pub fn choose(
 /// Code's own override, also the test hook), else `~/.vscode/extensions`. Read from disk, without
 /// starting VS Code.
 pub fn remote_ssh_installed() -> bool {
-    let dir = match std::env::var_os("VSCODE_EXTENSIONS").filter(|d| !d.is_empty()) {
-        Some(dir) => PathBuf::from(dir),
-        None => match std::env::var_os("HOME") {
-            Some(home) => Path::new(&home).join(".vscode").join("extensions"),
-            None => return false,
-        },
-    };
-    remote_ssh_in(&dir)
+    extensions_dir(
+        std::env::var_os("VSCODE_EXTENSIONS"),
+        std::env::var_os("HOME"),
+    )
+    .is_some_and(|dir| remote_ssh_in(&dir))
+}
+
+/// `$VSCODE_EXTENSIONS` when non-empty, else `$HOME/.vscode/extensions`.
+fn extensions_dir(var: Option<OsString>, home: Option<OsString>) -> Option<PathBuf> {
+    match var.filter(|d| !d.is_empty()) {
+        Some(dir) => Some(PathBuf::from(dir)),
+        None => home.map(|h| Path::new(&h).join(".vscode").join("extensions")),
+    }
 }
 
 /// Whether `dir` (a VS Code extensions directory) holds Remote - SSH: a directory
-/// `ms-vscode-remote.remote-ssh-<version>` that `.obsolete` (uninstalled, not yet removed) does
-/// not name. `remote-ssh-edit-<version>` is a different extension.
+/// `ms-vscode-remote.remote-ssh-<version>` that is not a key of `.obsolete` (a JSON object of
+/// uninstalled, not yet removed directories). `remote-ssh-edit-<version>` is a different extension.
 pub fn remote_ssh_in(dir: &Path) -> bool {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return false;
     };
-    let obsolete = std::fs::read_to_string(dir.join(".obsolete")).unwrap_or_default();
+    let obsolete: serde_json::Map<String, serde_json::Value> = std::fs::read(dir.join(".obsolete"))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default();
     entries.flatten().any(|entry| {
         let name = entry.file_name();
         let Some(name) = name.to_str() else {
@@ -168,22 +176,30 @@ pub fn remote_ssh_in(dir: &Path) -> bool {
             .to_ascii_lowercase()
             .strip_prefix("ms-vscode-remote.remote-ssh-")
             .is_some_and(|version| version.starts_with(|c: char| c.is_ascii_digit()));
-        is_remote_ssh && entry.path().is_dir() && !obsolete.contains(&format!("\"{name}\""))
+        is_remote_ssh && entry.path().is_dir() && !obsolete.contains_key(name)
     })
 }
 
-/// VS Code's remote authority is an SSH alias or user@host, not a Zed URL.
-pub fn code_args(remote: Option<(Option<&str>, &str)>, path: &str) -> Vec<OsString> {
-    let mut args = Vec::new();
-    if let Some((user, host)) = remote {
-        let authority = match user {
-            Some(user) => format!("ssh-remote+{user}@{host}"),
-            None => format!("ssh-remote+{host}"),
-        };
-        args.extend([OsString::from("--remote"), OsString::from(authority)]);
-    }
-    args.push(OsString::from(path));
-    args
+/// `code` arguments. A local path is passed as it is (VS Code stats it). A remote one is a
+/// `vscode-remote://ssh-remote+[user@]host/<path>` URI behind `--folder-uri` or `--file-uri`:
+/// `--remote` with a bare path would make VS Code guess the kind from the name (a dot = file).
+/// VS Code percent-decodes the URI path, so it is encoded the way [`remote_url`] encodes it.
+pub fn code_args(remote: Option<(Option<&str>, &str)>, path: &str, is_dir: bool) -> Vec<OsString> {
+    let Some((user, host)) = remote else {
+        return vec![OsString::from(path)];
+    };
+    let user = user.map(|u| format!("{u}@")).unwrap_or_default();
+    let path = if path.starts_with('/') {
+        path.to_string()
+    } else {
+        format!("/{path}")
+    };
+    let flag = if is_dir { "--folder-uri" } else { "--file-uri" };
+    let uri = format!(
+        "vscode-remote://ssh-remote+{user}{host}{}",
+        encode_path(&path)
+    );
+    vec![OsString::from(flag), OsString::from(uri)]
 }
 
 fn is_executable(path: &Path) -> bool {
@@ -319,25 +335,61 @@ mod tests {
                 == Path::new(user)),
             None
         );
+        // A local path is passed as it is: VS Code stats it.
         for path in ["/folder # % 한글", "/folder # % 한글/file $(touch x).txt"] {
-            assert_eq!(code_args(None, path), [OsString::from(path)]);
-            assert_eq!(
-                code_args(Some((Some("user"), "alias")), path),
-                [
-                    OsString::from("--remote"),
-                    OsString::from("ssh-remote+user@alias"),
-                    OsString::from(path)
-                ]
-            );
-            assert_eq!(
-                code_args(Some((None, "alias")), path),
-                [
-                    OsString::from("--remote"),
-                    OsString::from("ssh-remote+alias"),
-                    OsString::from(path)
-                ]
-            );
+            assert_eq!(code_args(None, path, true), [OsString::from(path)]);
+            assert_eq!(code_args(None, path, false), [OsString::from(path)]);
         }
+    }
+
+    #[test]
+    fn remote_code_args_name_the_kind() {
+        let os = OsString::from;
+        let remote = Some((Some("user"), "alias"));
+        // A bare `--remote` path's kind is guessed from its name (a dot = file); the URI flags
+        // say it: a folder named like a file, a file without an extension.
+        assert_eq!(
+            code_args(remote, "/srv/proj.v2", true),
+            [
+                os("--folder-uri"),
+                os("vscode-remote://ssh-remote+user@alias/srv/proj.v2")
+            ]
+        );
+        assert_eq!(
+            code_args(Some((None, "alias")), "/srv/Makefile", false),
+            [
+                os("--file-uri"),
+                os("vscode-remote://ssh-remote+alias/srv/Makefile")
+            ]
+        );
+        // VS Code percent-decodes the URI path: space, `#`, `?`, `%` and UTF-8 are encoded.
+        assert_eq!(
+            code_args(remote, "/t/my dir #1 100%41 한글", true),
+            [
+                os("--folder-uri"),
+                os("vscode-remote://ssh-remote+user@alias/t/my%20dir%20%231%20100%2541%20%ED%95%9C%EA%B8%80")
+            ]
+        );
+        assert_eq!(
+            code_args(remote, "/t/a?.txt", false),
+            [
+                os("--file-uri"),
+                os("vscode-remote://ssh-remote+user@alias/t/a%3F.txt")
+            ]
+        );
+    }
+
+    #[test]
+    fn extensions_dir_falls_back_when_unset_or_empty() {
+        let home = || Some(OsString::from("/home/u"));
+        let default = Some(PathBuf::from("/home/u/.vscode/extensions"));
+        assert_eq!(
+            extensions_dir(Some(OsString::from("/x/ext")), home()),
+            Some(PathBuf::from("/x/ext"))
+        );
+        assert_eq!(extensions_dir(Some(OsString::new()), home()), default);
+        assert_eq!(extensions_dir(None, home()), default);
+        assert_eq!(extensions_dir(None, None), None);
     }
 
     #[test]
@@ -400,6 +452,16 @@ mod tests {
         )
         .unwrap();
         assert!(!remote_ssh_in(dir));
+        // Only `.obsolete`'s keys count, not a value that happens to spell the name.
+        std::fs::write(
+            dir.join(".obsolete"),
+            r#"{"other":"ms-vscode-remote.remote-ssh-0.120.0"}"#,
+        )
+        .unwrap();
+        assert!(remote_ssh_in(dir));
+        // An unreadable `.obsolete` marks nothing obsolete.
+        std::fs::write(dir.join(".obsolete"), "not json").unwrap();
+        assert!(remote_ssh_in(dir));
     }
 
     #[test]

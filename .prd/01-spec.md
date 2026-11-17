@@ -32,7 +32,7 @@ where a file opens — this machine, or another machine's screen (§4a); they ad
 | # | Owner intent | Acceptance (observable) |
 |---|---|---|
 | A1 | `sopen host:/path`, scp syntax, any machine in `~/.ssh/config` | `sopen <alias>:/abs/file`, `sopen <alias>:rel/to/home`, `sopen user@host:/x` all open; aliases, ProxyJump, agent behave exactly as `ssh <alias>` does (system ssh is used). Local paths (`sopen ./x.png`) open too. |
-| A2 | Folder as a project, text edit, syntax highlight; VS Code first (msg 9) | Folder or text file → VS Code when `code` is found; a remote one only when VS Code's Remote - SSH extension is installed (`code --remote ssh-remote+[user@]host /abs`; never installed by sopen), else Zed with `VS Code has no Remote - SSH extension; opening in Zed` on stderr. Without VS Code, Zed (`zed ssh://…` on macOS, `zeditor`/`zed` on Linux). A VS Code launch failure is reported, not followed by Zed. The editor owns Save. |
+| A2 | Folder as a project, text edit, syntax highlight; VS Code first (msg 9) | Folder or text file → VS Code when `code` is found; a remote one only when VS Code's Remote - SSH extension is installed (`code --folder-uri` / `--file-uri vscode-remote://ssh-remote+[user@]host/<percent-encoded abs>` by the kind sopen detected, since a bare `--remote` path's kind is guessed from its name; the extension is never installed by sopen), else Zed with `VS Code has no Remote - SSH extension; opening in Zed` on stderr. Without VS Code, Zed (`zed ssh://…` on macOS, `zeditor`/`zed` on Linux). A VS Code launch failure is reported, not followed by Zed. The editor owns Save. |
 | A3 | Image: view + rectangle crop + rectangle pixelize | Built-in window shows the image; drag draws a rectangle in image pixels; Crop and Pixelize act on it; Undo; Save writes back to the remote file. |
 | A4 | Video: view + rectangle crop + time cut | Built-in window plays the video with sound; scrub timeline; set In/Out; drag a crop rectangle; Export writes `<stem>.cut-<in>-<out>.<ext>` next to the original on the remote. |
 | A5 | Audio (mp3/wav): view + time cut | Same window: waveform, play, In/Out, Export. |
@@ -46,14 +46,14 @@ where a file opens — this machine, or another machine's screen (§4a); they ad
 
 | Kind | Detected by | Opens in |
 |---|---|---|
-| directory | remote `stat` | VS Code remote (`code --remote ssh-remote+[user@]host /abs`), else Zed remote (`ssh://[user@]host[:port]/abs`) |
-| text | extension list, else first 8 KiB has no NUL and is valid UTF-8 | VS Code remote, else Zed remote |
+| directory | remote `stat` | VS Code remote (`code --folder-uri vscode-remote://ssh-remote+[user@]host/abs`), else Zed remote (`ssh://[user@]host[:port]/abs`) |
+| text | extension list, else first 8 KiB has no NUL and is valid UTF-8 | VS Code remote (`code --file-uri vscode-remote://…`), else Zed remote |
 | image | `png jpg jpeg webp bmp gif tif tiff` | image window |
 | video | `mp4 mov m4v mkv webm avi` (and ffprobe says it has a video stream); `ts` only when it is not text and ffprobe sees a video stream (`.ts` is also TypeScript) | media window |
 | audio | `mp3 wav flac m4a aac ogg opus` | media window |
 | other | everything else | fetch → print cache path (A6) |
 
-- VS Code is found as `code` on PATH, then on macOS `/Applications/Visual Studio Code.app/Contents/Resources/app/bin/code` or the same path under `~/Applications`. Remote - SSH counts as installed when a directory `ms-vscode-remote.remote-ssh-<version>` is in `$VSCODE_EXTENSIONS` (if set) or `~/.vscode/extensions` and `.obsolete` there does not name it; VS Code is not started to check. Without a usable VS Code, Zed is found as `zed` / `zeditor` on PATH, macOS also `/Applications/Zed.app/Contents/MacOS/cli`. Neither found: text → fetch, run `$VISUAL`/`$EDITOR` in the terminal, upload on exit if changed; directory → error that names the missing editors.
+- VS Code is found as `code` on PATH, then on macOS `/Applications/Visual Studio Code.app/Contents/Resources/app/bin/code` or the same path under `~/Applications`. Remote - SSH counts as installed when a directory `ms-vscode-remote.remote-ssh-<version>` is in `$VSCODE_EXTENSIONS` (when non-empty) or `~/.vscode/extensions` and is not a key of the `.obsolete` JSON object there; VS Code is not started to check. Without a usable VS Code, Zed is found as `zed` / `zeditor` on PATH, macOS also `/Applications/Zed.app/Contents/MacOS/cli`. Neither found: text → fetch, run `$VISUAL`/`$EDITOR` in the terminal, upload on exit if changed; directory → error that names the missing editors.
 - Remote relative paths resolve against the remote home (SFTP `realpath`), as scp does.
 
 ## 4. Remote layer

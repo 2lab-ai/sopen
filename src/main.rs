@@ -564,7 +564,7 @@ fn open_in_editor(
                 Place::Remote(spec, _) => Some((spec.user.as_deref(), spec.host.as_str())),
                 Place::Local(_) => None,
             };
-            zed::open_args(&code, &zed::code_args(remote, abs))?;
+            zed::open_args(&code, &zed::code_args(remote, abs, kind == Kind::Directory))?;
             println!("opened {} in VS Code", place.display(abs));
             return Ok(());
         }

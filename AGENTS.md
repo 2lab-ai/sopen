@@ -57,7 +57,7 @@ prompts on close.
 | `SOPEN_WINDOW_SIZE=<w>x<h>` | Open the window at that size in points (layout receipts on a narrow window). |
 | `SOPEN_RENDERER=wgpu\|glow` | Force a renderer (default: wgpu, glow when wgpu does not start; `WGPU_BACKEND=dx12` on macOS forces that fallback). |
 | `SOPEN_CODE=<path>` | Use this VS Code CLI for folders and text; an empty value means VS Code is absent. A local setting, not forwarded by `--target`. |
-| `VSCODE_EXTENSIONS=<dir>` | VS Code's own extensions-dir variable; sopen looks there (instead of `~/.vscode/extensions`) for Remote - SSH before opening a remote path in VS Code. Tests point it at a temp dir. Not forwarded by `--target`. |
+| `VSCODE_EXTENSIONS=<dir>` | VS Code's own extensions-dir variable; when non-empty sopen looks there (instead of `~/.vscode/extensions`) for Remote - SSH before opening a remote path in VS Code. Tests point it at a temp dir. Not forwarded by `--target`. |
 | `SOPEN_TARGET_BIN=<path>` | `--target` runs this sopen binary on HOST (a build not installed there yet) instead of the one on HOST's PATH or in its Homebrew / cargo install paths. A `--target` run carries this and the hooks above, and `SOPEN_LOG`, to HOST; settings naming local paths stay here. |
 | `SOPEN_CONFIG=<file>` | The config file to use instead of `$XDG_CONFIG_HOME/sopen/config.toml` / `~/.config/sopen/config.toml` (tests point it at a temp file, so the owner's default target never forwards a test run). |
 | `sopen --selftest-audio <file>` | Hidden: play the file on the real output device at gain 0 for ~2 s; prints `callbacks=N underruns=M device=<name> … decoder=ffmpeg\|wav` (a WAV is read in-process where there is no ffmpeg). |
