@@ -8,7 +8,8 @@ tags: [sopen, spec]
 
 `sopen host:/path` opens any file or folder on any of my machines as if it were local:
 folders and text go to Zed's remote mode, images and audio/video open in a small built-in
-window where the few edits I actually need are one drag away.
+window where the few edits I actually need are one drag away — on the machine I typed it on,
+or with `--target` on another machine's screen.
 
 ## 1. Owner intent (verbatim, in order — the SSOT for scope)
 
@@ -18,9 +19,12 @@ window where the few edits I actually need are one drag away.
 4. "기존에 macshot 소스강 있는데 여기서 시작하는게 좋을것 같기도하고"
 5. "너무 쓸데 없는 기능까지 요구 하는건 아닌가 싶기도 하고"
 6. (after the research verdict "a router, not an editor") "그럼 이름이 snote가 아니라 sopen이지 그렇게 진행해줘 근데 이미지나 영상은 보고 바로 편집할수 있으면 좋겠는데 사각형으로 자르고 시간상에서 시간으로 컷 정도랑 이미지의 경우 사각형으로 지정해서 pixelize 정도"
+7. "그리고 이거 기능 추가해줘 / soepn <host-a>:/tmp/a.html (현재 머신에서 저 파일 오픈) / sopen --target <host-b> <host-a>:/tmp/a.html / 명백하지 진행 ㄱ"
+8. "그리고 sopen 설정으로 디폴트 타겟 설정할 수 있도록해줘"
 
 Message 6 supersedes 3's "IrfanView 정도" with an exact list. Message 5 is a standing constraint:
-anything not in the table below is out of scope until usage says otherwise (§10).
+anything not in the table below is out of scope until usage says otherwise (§10). Messages 7–8 add
+where a file opens — this machine, or another machine's screen (§4a); they add no edit.
 
 ## 2. Intent → acceptance
 
@@ -34,6 +38,8 @@ anything not in the table below is out of scope until usage says otherwise (§10
 | A6 | "아무 파일" | Any other type is fetched to the local cache and its path printed; `--app <App>` opens it in a named local app and uploads it back when the user presses Enter in the terminal. (This is the hex-editor path: `--app ImHex`.) |
 | A7 | Rust, macOS + Linux, `brew install …` and use immediately | `brew install 2lab-ai/tap/sopen-preview` on macOS (arm64, x86_64) and Linux (x86_64, aarch64) installs `sopen` and the `ffmpeg` it needs; the first `sopen host:/a.mp3` works with no further setup. |
 | A8 | Developed like llmux | Public repo `2lab-ai/sopen`, MIT; `ci.yml` (macOS + Linux), `preview.yml` (every main push → prerelease + tap bump), `release.yml` (`v*` tag = owner gate); `AGENTS.md` SSOT; `.prd/` spec. |
+| A9 | `sopen SOURCE` opens here; `sopen --target <host> SOURCE` opens it on `<host>` (msg 7) | `sopen <host-a>:/tmp/a.html` opens on the machine it was typed on, as before. `sopen --target <host-b> <host-a>:/tmp/a.html` opens it on `<host-b>`'s screen: the same window or Zed, started by `<host-b>`'s own sopen (on macOS sopen's window floats above the others until it is used; Zed opens behind the active app, §4a); exit code is `<host-b>`'s; `could not reach <host-b>` when ssh cannot get there; `sopen is not installed on <host-b> …` (exit 127) when it has no sopen. A file on `<host-b>` itself opens there as a local file; a local file reaches `<host-b>` as `<this machine>:<path>`. |
+| A10 | Default target in sopen's settings (msg 8) | `sopen config target <host-b>` writes `target = "<host-b>"` to the config file (§4a); from then on `sopen SOURCE` opens on `<host-b>`, `--here` opens on this machine anyway, `--target` picks another; `sopen config` shows the file and the target; `sopen config target --unset` removes it. A config sopen cannot read is an error naming the file, never ignored. |
 
 ## 3. Routing
 
@@ -56,7 +62,83 @@ anything not in the table below is out of scope until usage says otherwise (§10
 - File operations = SFTP over that session (`openssh` + `openssh-sftp-client` crates): `stat`, `realpath`, read, write.
   SFTP keeps the code independent of the remote OS (macOS BSD tools vs GNU) — no remote shell parsing.
 - Nothing is installed on the remote. Only sshd's SFTP subsystem is required. (Zed installs its own server when the
-  owner opens folders/text; that is Zed's behaviour, documented in the README.)
+  owner opens folders/text; that is Zed's behaviour, documented in the README.) A `--target` machine (§4a) is not a
+  file's remote: it is a machine the owner uses sopen on, and runs the sopen installed there.
+
+## 4a. Where it opens
+
+`sopen SOURCE` opens SOURCE on the machine it was typed on. `sopen --target HOST SOURCE` opens it on HOST's screen
+instead: sopen starts HOST's own sopen as `sopen --here [--app APP] -- SOURCE` over the system `ssh`, with the same
+multiplexed master and connection options as §4, waits for it, and exits with its exit code (0, 1 and 3 mean what
+they mean here; 127 is no sopen on HOST; 2 is a usage error from a sopen on HOST too old to know `--here`, passed on
+as it is). When ssh itself fails (its exit code 255) sopen exits 1 with `could not
+reach HOST`; any other status above 128 (sopen itself exits only 0, 1 or 3 — 2 for a usage error — so most likely a
+signal, 128 + n)
+exits 1 with `sopen on HOST ended with status N (signal n?)`. HOST needs sopen installed; the machine holding the file still needs only sshd. Because HOST is always
+told `--here`, it never forwards again, whatever its own default is. `sopen cut` always runs here.
+
+Which machine opens it: `--here` (this machine) or `--target HOST` — one or the other, the command line refuses
+both — else the environment variable `SOPEN_TARGET`, else the `target` key of the config file, else this machine.
+`SOPEN_TARGET` and the config file are read only when they are the ones deciding, so a broken file or an unreadable
+variable does not stop `--here` or `--target`, and `cut` reads neither. HOST is `[user@]host` — an ssh alias or a
+host name; a port or an IPv6 address goes into `~/.ssh/config` under an alias. Wherever it comes from it must be
+non-empty, without whitespace or `:`, and must not start with `-`. HOST is this machine — opened here, no ssh — only when
+its host part (without `user@`) is loopback (exactly `localhost`, a name under `.localhost`, or one of the
+`/etc/hosts` aliases `localhost.localdomain`, `localhost6`, `localhost6.localdomain6`, `ip6-localhost`,
+`ip6-loopback`; `127.0.0.0/8`; `::1`)
+or equals this machine's host name as `gethostname` gives it, or that name up to the first `.` — in any case,
+trailing dot ignored. Nothing else counts, because opening on the wrong machine is worse than an ssh hop to this
+one: `box.lan` from a machine named just `box` is forwarded, and so is `box.other` from `box.lan`.
+
+SOURCE is rewritten to what HOST must be given. A file on HOST itself (`[user@]HOST:path`, with no user or HOST's
+user) becomes `path`, which HOST opens as a local file; a relative path stays relative to HOST's home, where the
+command starts. A file on any other machine is passed unchanged, and HOST fetches it over SFTP itself. A local path
+becomes `<this machine's short host name>:<absolute path>`, and a loopback source (by the same rule:
+`localhost:path`, `[::1]:path`, not `localhost.example.com:path`), which would mean HOST itself there, becomes
+`<this machine's short host name>:path` — so HOST must reach this machine
+by that name with `ssh`. A local file that does not exist is the same error a local open gives.
+
+On HOST, sopen is looked for on PATH, then in the usual Homebrew and cargo install paths; when there is none HOST
+prints `sopen is not installed on HOST (brew install 2lab-ai/tap/sopen-preview)` and the run exits 127. A
+non-interactive ssh session on macOS has no Homebrew on PATH, and sopen finds ffmpeg on PATH: HOST's sopen runs with
+its own directory first on PATH (brew's ffmpeg sits next to brew's sopen) and Homebrew's bin directories that exist
+appended after the session's own entries. On Linux an ssh session has no display, so when neither DISPLAY nor
+WAYLAND_DISPLAY is set the desktop session's DISPLAY, WAYLAND_DISPLAY, XAUTHORITY, XDG_RUNTIME_DIR,
+DBUS_SESSION_BUS_ADDRESS and XDG_SESSION_TYPE are taken from `systemctl --user show-environment` — exported by name,
+never evaluated. If that gives none, the first Wayland socket in `/run/user/<uid>` is used, else X display `:0` when
+it exists. HOST's sopen runs as a foreground child of the script, which catches INT, TERM and HUP (sopen itself
+keeps their default handling), so a sopen stopped by a signal comes back as an exit code rather than as a lost
+connection. It is not started in the background, where a non-interactive shell would have it ignore SIGINT. Ctrl+C
+under `ssh -t` reaches the whole process group, sopen included; a signal sent to the script's shell alone leaves
+sopen running.
+
+A window asks for focus on its first frames. On macOS an app started over ssh cannot take focus: macOS keeps it
+behind the active app. sopen's own image and media window, still unfocused after asking, floats above the other
+windows until it gains focus or gets its first click, key, scroll or typed text, and then returns to the normal
+level — with no timeout, because back at the normal level while unfocused macOS puts it straight behind the active
+app again. Zed, opened for
+folders and text, comes up behind the active app.
+
+HOST gets a terminal (`ssh -t`) when this side's input and output are both terminals. Otherwise it gets none
+(`-T`) and no input either (`-n`) — ssh would read this side's input to its end, eating the rest of a
+`while read f; do sopen "$f"; done < list` — except with `--app`, whose Enter prompt reads it. With a terminal,
+Ctrl+C reaches HOST and closes the window there; without one, stopping this side's sopen leaves the window on HOST
+open. The forwarding ssh also sets `RemoteCommand=none` (a `RemoteCommand` in `~/.ssh/config`, such as a tmux
+auto-attach, would refuse the command) and `LogLevel=ERROR` (no "Shared connection … closed." after each run;
+errors still print). The command starts with a bare `exec`, so the login shell on HOST that parses it is replaced
+rather than left as a parent that a Ctrl+C would kill (dash and fish do not replace themselves on their own); every
+other word is single-quoted (a `'` or `\` is written outside the quotes) so that shell — sh, bash, zsh, fish — reads
+each one back exactly. The receipt hooks (AGENTS.md "Receipts")
+travel to HOST; settings that name local paths (`SOPEN_ZED`, `SOPEN_FFMPEG`, `SOPEN_FFPROBE`, `SOPEN_CACHE_DIR`,
+`SOPEN_STATE_DIR`, `SOPEN_CONFIG`) do not.
+
+The config file is `$SOPEN_CONFIG` if set, else `$XDG_CONFIG_HOME/sopen/config.toml`, else
+`~/.config/sopen/config.toml`, on macOS as on Linux. It is TOML with one key, `target = "<host>"`. A key sopen does
+not know, a value it cannot use or text that is not TOML is an error naming the file and the line. `sopen config`
+prints the file's path and its target (or `target is not set`). `sopen config target HOST` checks HOST, creates the
+directories, and replaces the file atomically (a temp file in the same directory, renamed over it; a config that is a
+symlink keeps its link). A new file is readable by its owner only (0600); a replaced one keeps its mode.
+`sopen config target --unset` removes the key and leaves the file, empty.
 
 ## 5. Writes back (conflict-safe, never silent)
 
@@ -131,12 +213,15 @@ anything not in the table below is out of scope until usage says otherwise (§10
 - Export maps streams explicitly: the first picture stream and every audio track (one, for one-track containers);
   >8-bit sources stay 10-bit where libx264 has it; colour tags are carried. What is not kept (subtitles, data,
   attachments, cover art, alpha, depth) is named in the window before Export and in the result line.
-- `sopen cut <target> <in> <out> [--crop x,y,w,h]` = the same export, headless (scripting + CI receipts).
+- `sopen cut <source> <in> <out> [--crop x,y,w,h]` = the same export, headless (scripting + CI receipts); it always
+  runs on this machine (§4a).
 - Renderer / playback details fixed by the spike (§11).
 
 ## 8. Usage log
 
-One JSON line per run in `<state>/usage.jsonl`: `ts, host_hash, kind, ext, bytes, fetch_ms, action (open|save|export|cut|discard), conflict`.
+One JSON line per run in `<state>/usage.jsonl`: `ts, host_hash, kind, ext, bytes, fetch_ms, action (open|save|export|cut|discard), conflict, ok, forwarded, target_hash`.
+Hosts are hashed, never written by name. A run forwarded with `--target` (§4a) is logged on both machines: here with
+`forwarded: true` and the target's hash (its kind is known only there), there as an ordinary open.
 Local only, never sent anywhere. Exists for §10.
 
 ## 9. Out of scope (until §10 says otherwise)
@@ -167,7 +252,7 @@ A conflict refusal or failed write → fix before anything else. Large-media wai
 - **Linux build:** `cpal` links ALSA (`libasound2-dev` in CI); X11, Wayland, EGL, Vulkan and fontconfig are
   loaded at runtime.
 - **macOS:** a window started from a terminal can come up behind it — sopen asks for focus on its first
-  frames. A window can screenshot itself (`ViewportCommand::Screenshot`), which is how window receipts are
+  frames (one started over ssh cannot take focus at all; §4a). A window can screenshot itself (`ViewportCommand::Screenshot`), which is how window receipts are
   taken (AGENTS.md "Receipts").
 - **Measured in the spike (2026-11-11):** time to first frame — image 128–180 ms warm (541 ms first launch),
   video ~150 ms, audio waveform ~140 ms; A/V drift with a real-time null sink mean −11 ms / max 16.6 ms; a
