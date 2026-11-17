@@ -1,6 +1,6 @@
 //! [`RemoteFs`] on the local disk: local targets, and the implementation every test runs against.
 
-use super::{CreateError, Created, Hashing, RemoteFs, Stat, Uploaded};
+use super::{CreateError, Created, Hashing, Like, RemoteFs, Stat, Uploaded};
 use anyhow::{anyhow, Context, Result};
 use std::fs;
 use std::io::{ErrorKind, Read, Write};
@@ -108,28 +108,42 @@ impl RemoteFs for LocalFs {
         &mut self,
         local: &Path,
         path: &str,
-        mode: Option<u32>,
+        like: Option<Like>,
     ) -> std::result::Result<Uploaded, CreateError> {
         let mut src = fs::File::open(local)
             .with_context(|| format!("cannot open {}", local.display()))
             .map_err(|e| CreateError::new(Created::No, e))?;
         // A brand-new file gets 0666 minus the umask, as `cp` would; a temp that stands in for an
-        // existing file starts private and then takes that file's bits before any content lands.
+        // existing file starts private and takes that file's owner and permission bits through
+        // handle-based metadata updates on the open file, never by path: the owner, then the
+        // permission bits without set-id bits before the content, then the full mode restored
+        // after the content, so set-id bits are applied last.
         let dst = fs::OpenOptions::new()
             .write(true)
             .create_new(true)
-            .mode(if mode.is_some() { 0o600 } else { 0o666 })
+            .mode(if like.is_some() { 0o600 } else { 0o666 })
             .open(path)
             .with_context(|| format!("cannot create {path}"))
             .map_err(|e| CreateError::new(Created::No, e))?;
         let mut fill = || -> Result<Uploaded> {
-            if let Some(mode) = mode {
+            let set_mode = |mode: u32| {
                 dst.set_permissions(fs::Permissions::from_mode(mode))
-                    .with_context(|| format!("cannot set mode on {path}"))?;
+                    .with_context(|| format!("cannot set mode on {path}"))
+            };
+            if let Some(like) = like {
+                // A refused owner change is not fatal here: the caller checks the result (a
+                // mismatch refuses the save; an owner that was already right passes).
+                if let Err(e) = std::os::unix::fs::fchown(&dst, Some(like.uid), Some(like.gid)) {
+                    crate::debug!("fchown {path}: {e}");
+                }
+                set_mode(like.mode & 0o777)?;
             }
             let mut out = Hashing::new(&dst);
             std::io::copy(&mut src, &mut out).with_context(|| format!("cannot write {path}"))?;
             let written = out.finish();
+            if let Some(like) = like {
+                set_mode(like.mode)?;
+            }
             dst.sync_all()
                 .with_context(|| format!("cannot sync {path}"))?;
             Ok(written)
@@ -140,11 +154,6 @@ impl RemoteFs for LocalFs {
     fn set_mode(&mut self, path: &str, mode: u32) -> Result<()> {
         fs::set_permissions(path, fs::Permissions::from_mode(mode))
             .with_context(|| format!("cannot set mode on {path}"))
-    }
-
-    fn set_owner(&mut self, path: &str, uid: u32, gid: u32) -> Result<()> {
-        std::os::unix::fs::lchown(path, Some(uid), Some(gid))
-            .with_context(|| format!("cannot set owner {uid}:{gid} on {path}"))
     }
 
     fn rename_over(&mut self, from: &str, to: &str) -> Result<()> {

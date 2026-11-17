@@ -51,7 +51,8 @@ struct Hooks {
     fail_remove: bool,
     /// Another writer appends to the target right after our rename lands.
     grow_after_rename: bool,
-    /// Temps look owned by another uid; `owner_fix_works` decides whether set_owner helps.
+    /// Temps look owned by another uid; `owner_fix_works` decides whether giving them the
+    /// target's owner (through the handle, in `create_from`) helps.
     foreign_temp_owner: bool,
     owner_fix_works: bool,
     /// The server leaves this attribute out of the target's stat.
@@ -63,6 +64,15 @@ struct Hooks {
     /// The request reaches the server and takes effect, but its reply is lost (connection
     /// closed): "rename", "link" or "create".
     lost_reply: Option<&'static str>,
+    /// Right after the temp is created and filled, someone with write access to the
+    /// directory replaces it with a symlink to this file.
+    temp_swapped_for_link_to: Option<PathBuf>,
+    /// The target looks owned by another uid, so the backend is asked for an owner it cannot
+    /// give (unless running as root): its real `fchown` is refused.
+    foreign_target_owner: bool,
+    /// The backend is asked to give the temp root's owner — refused (unless running as root)
+    /// while the temp's owner already is the target's.
+    owner_asked_as_root: bool,
 }
 
 #[derive(Default)]
@@ -101,6 +111,9 @@ impl RemoteFs for Hooked {
             if temp && self.h.foreign_temp_owner && !self.owner_fixed {
                 s.uid = s.uid.map(|u| u + 1);
             }
+            if !temp && self.h.foreign_target_owner {
+                s.uid = s.uid.map(|u| u + 1);
+            }
             if !temp && self.h.missing.is_some() {
                 s.missing = self.h.missing;
             }
@@ -128,13 +141,28 @@ impl RemoteFs for Hooked {
         &mut self,
         local: &Path,
         path: &str,
-        mode: Option<u32>,
+        like: Option<Like>,
     ) -> std::result::Result<Uploaded, CreateError> {
+        if like.is_some() && self.h.foreign_temp_owner && self.h.owner_fix_works {
+            self.owner_fixed = true;
+        }
         if self.h.take_temp_name && is_temp(path.rsplit('/').next().unwrap()) {
             std::fs::write(path, "theirs").unwrap();
         }
         self.race(path);
-        let up = self.inner.create_from(local, path, mode)?;
+        let like = like.map(|l| match self.h.owner_asked_as_root {
+            true => Like {
+                uid: 0,
+                gid: 0,
+                ..l
+            },
+            false => l,
+        });
+        let up = self.inner.create_from(local, path, like)?;
+        if let Some(victim) = &self.h.temp_swapped_for_link_to {
+            std::fs::remove_file(path).unwrap();
+            std::os::unix::fs::symlink(victim, path).unwrap();
+        }
         if self.h.lost_reply == Some("create") {
             return Err(CreateError::new(
                 Created::Unknown,
@@ -151,13 +179,6 @@ impl RemoteFs for Hooked {
     }
     fn set_mode(&mut self, path: &str, mode: u32) -> Result<()> {
         self.inner.set_mode(path, mode)
-    }
-    fn set_owner(&mut self, path: &str, uid: u32, gid: u32) -> Result<()> {
-        if self.h.foreign_temp_owner && !self.h.owner_fix_works {
-            bail!("simulated: operation not permitted");
-        }
-        self.owner_fixed = true;
-        self.inner.set_owner(path, uid, gid)
     }
     fn rename_over(&mut self, from: &str, to: &str) -> Result<()> {
         self.renames += 1;
@@ -281,11 +302,8 @@ fn fetch_then_write_atomic_happy_path_keeps_mode() {
         .unwrap();
     assert!(matches!(again, WriteOutcome::Written { .. }), "{again:?}");
     assert_eq!(std::fs::read_to_string(&target).unwrap(), "echo three\n");
-
-    // The saved copy is the new baseline: fetching again keeps nothing aside.
-    fs.fetch(p(&target), &local, &mut |_, _| {}).unwrap();
-    let names: Vec<_> = fs.list_dir(p(local.parent().unwrap())).unwrap();
-    assert!(!names.iter().any(|n| n.contains(".conflict-")), "{names:?}");
+    // (That the saved copy is then recorded, so the next fetch keeps nothing aside, is the
+    // cache's part: `main::tests::a_saved_copy_is_recorded_so_the_next_fetch_keeps_nothing_aside`.)
 }
 
 #[test]
@@ -442,6 +460,117 @@ fn w3_a_writer_right_after_the_rename_is_reported_and_poisons_the_baseline() {
         std::fs::read_to_string(&target).unwrap(),
         "mine + another writer"
     );
+}
+
+/// Writing to a file clears its set-user-ID bit (for a non-root writer): the mode is finalized
+/// through the still-open handle after the content is written, so a setuid target keeps it.
+#[test]
+fn a_set_id_bit_cleared_by_writing_is_set_again_through_the_handle() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (target, local, at) = fetched(tmp.path(), "tool", "v1");
+    std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o4755)).unwrap();
+    std::fs::write(&local, "v2").unwrap();
+    let mut fs = LocalFs::new();
+    let outcome = fs
+        .write_atomic(&local, p(&target), at.fingerprint())
+        .unwrap();
+    let WriteOutcome::Written { now, notes } = outcome else {
+        panic!("expected Written, got {outcome:?}")
+    };
+    assert!(notes.is_empty(), "{notes:?}");
+    assert_eq!(now.mode, 0o4755);
+    let mode = std::fs::metadata(&target).unwrap().permissions().mode() & 0o7777;
+    assert_eq!(mode, 0o4755);
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "v2");
+}
+
+/// Backend level (LocalFs's real `fchown`): an owner change the system refuses leaves the temp
+/// owned by this account while the target is someone else's — the save is refused, nothing
+/// replaced. (Root's chown is never refused, so there this case cannot be made.)
+#[test]
+fn a_refused_owner_change_that_leaves_a_mismatch_refuses_the_save() {
+    use std::os::unix::fs::MetadataExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let (target, local, at) = fetched(tmp.path(), "a.txt", "v1");
+    if std::fs::metadata(&target).unwrap().uid() == 0 {
+        eprintln!("skipping: root's chown is never refused");
+        return;
+    }
+    std::fs::write(&local, "edit").unwrap();
+    let mut fs = Hooked::new(Hooks {
+        foreign_target_owner: true,
+        ..Hooks::default()
+    });
+    let err = fs
+        .write_atomic(&local, p(&target), at.fingerprint())
+        .unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(msg.contains("is owned by uid"), "{msg}");
+    assert!(msg.contains("was not replaced"), "{msg}");
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "v1");
+    assert!(temps(tmp.path()).is_empty(), "{:?}", temps(tmp.path()));
+    assert_eq!(fs.renames, 0);
+}
+
+/// Backend level: an owner change that fails while the temp's owner already is the target's
+/// (here: asked for root's, refused for a non-root account) does not stop the save.
+#[test]
+fn a_failed_owner_change_with_the_owner_already_right_lets_the_save_proceed() {
+    use std::os::unix::fs::MetadataExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let (target, local, at) = fetched(tmp.path(), "a.txt", "v1");
+    if std::fs::metadata(&target).unwrap().uid() == 0 {
+        eprintln!("skipping: root's chown is never refused");
+        return;
+    }
+    std::fs::write(&local, "edit").unwrap();
+    let mut fs = Hooked::new(Hooks {
+        owner_asked_as_root: true,
+        ..Hooks::default()
+    });
+    let outcome = fs
+        .write_atomic(&local, p(&target), at.fingerprint())
+        .unwrap();
+    assert!(
+        matches!(outcome, WriteOutcome::Written { .. }),
+        "{outcome:?}"
+    );
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "edit");
+}
+
+/// Owner and mode are given to the temp through its open handle, never by path afterwards: a
+/// temp swapped for a symlink right after it was written is refused, and the file the link
+/// points at keeps its mode.
+#[test]
+fn a_temp_swapped_for_a_link_is_never_chmodded_through() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (target, local, at) = fetched(tmp.path(), "a.txt", "v1");
+    std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o640)).unwrap();
+    let at = LocalFs::new()
+        .stat(p(&target))
+        .map(|s| Stat {
+            sha256: at.sha256,
+            ..s
+        })
+        .unwrap();
+    std::fs::write(&local, "edit").unwrap();
+    let victim = tmp.path().join("victim");
+    std::fs::write(&victim, "someone's").unwrap();
+    std::fs::set_permissions(&victim, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let mut fs = Hooked::new(Hooks {
+        temp_swapped_for_link_to: Some(victim.clone()),
+        ..Hooks::default()
+    });
+    let err = fs
+        .write_atomic(&local, p(&target), at.fingerprint())
+        .unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(msg.contains("was not replaced"), "{msg}");
+    let mode = std::fs::metadata(&victim).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o644, "chmodded through the link");
+    assert_eq!(std::fs::read_to_string(&victim).unwrap(), "someone's");
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "v1");
+    assert_eq!(fs.renames, 0);
 }
 
 #[test]
@@ -780,26 +909,6 @@ fn w1_concurrent_publishers_never_lose_a_file() {
         }
         assert!(temps(&dir).is_empty(), "{:?}", temps(&dir));
     }
-}
-
-#[test]
-fn fetch_keeps_unsaved_edits_of_the_previous_copy() {
-    let tmp = tempfile::tempdir().unwrap();
-    let (target, local, _) = fetched(tmp.path(), "a.txt", "v1");
-    std::fs::write(&local, "unsaved edit").unwrap();
-    std::fs::write(&target, "v2").unwrap();
-    let at = LocalFs::new()
-        .fetch(p(&target), &local, &mut |_, _| {})
-        .unwrap();
-    assert_eq!(std::fs::read_to_string(&local).unwrap(), "v2");
-    assert_eq!(at.sha256, Some(sha(b"v2")));
-    let kept: Vec<_> = std::fs::read_dir(local.parent().unwrap())
-        .unwrap()
-        .map(|e| e.unwrap().path())
-        .filter(|p| p.to_string_lossy().contains(".conflict-"))
-        .collect();
-    assert_eq!(kept.len(), 1, "{kept:?}");
-    assert_eq!(std::fs::read_to_string(&kept[0]).unwrap(), "unsaved edit");
 }
 
 #[test]
