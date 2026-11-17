@@ -34,18 +34,20 @@ jobs:
       # The export tests encode real media (spec §7); the formula depends on ffmpeg the same way.
       # libasound2-dev: cpal (the media window's audio output) links ALSA; everything else the
       # window needs on Linux (X11, Wayland, EGL, Vulkan, fontconfig) is loaded at runtime.
-      - name: Install ffmpeg and ALSA headers (Linux)
+      # zsh and fish: `--target` runs its command through the target's login shell (spec §4a);
+      # the tests run it under each one.
+      - name: Install ffmpeg, ALSA headers and login shells (Linux)
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y ffmpeg libasound2-dev pkg-config
+          sudo apt-get install -y ffmpeg libasound2-dev pkg-config zsh fish
 
-      - name: Install ffmpeg (macOS)
+      - name: Install ffmpeg and fish (macOS)
         if: runner.os == 'macOS'
         env:
           HOMEBREW_NO_AUTO_UPDATE: "1"
           HOMEBREW_NO_INSTALL_CLEANUP: "1"
-        run: brew install ffmpeg
+        run: brew install ffmpeg fish
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -63,8 +65,10 @@ jobs:
 
       - name: cargo test
         env:
-          # A missing ffmpeg fails the export tests here instead of skipping them.
+          # A missing ffmpeg fails the export tests here instead of skipping them, and a missing
+          # zsh or fish fails the login-shell lanes.
           SOPEN_REQUIRE_FFMPEG: "1"
+          SOPEN_REQUIRE_SHELLS: "1"
         run: cargo test --locked
 
       # The Linux binary loads only libasound and libc at start (X11, Wayland, EGL, Vulkan and

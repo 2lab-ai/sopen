@@ -53,13 +53,22 @@ set, `$SOPEN_CONFIG` overrides both) on macOS and Linux alike:
 target = "<host>"
 ```
 
-`SOPEN_TARGET=<host>` in the environment comes before the config; `--target` and `--here` come
-before both. `<host>` is anything `ssh <host>` reaches and needs sopen installed; sopen there gets
-`--here`, so it never sends the file on again. The window comes to the front of `<host>`'s desktop
-session (on Linux sopen finds it through `systemctl --user`). A local file is fetched by `<host>`
-from this machine by its short host name, so that name must work for `ssh` on `<host>`. The exit
-code is `<host>`'s; `could not reach <host>` means ssh did not get there, and `sopen is not
-installed on <host>` (exit 127) means it has no sopen.
+`--target` or `--here` (not both) decides one run; without them `SOPEN_TARGET=<host>` in the
+environment comes first, then the config. `<host>` is `[user@]host` — an ssh alias or a host
+name that `ssh <host>` reaches; a port or an IPv6 address goes into `~/.ssh/config` under an
+alias. It needs sopen installed; sopen there gets `--here`, so it never sends the file on again.
+A local file (or a `localhost:` one) is fetched by `<host>` from this machine by its short host
+name, so that name must work for `ssh` on `<host>`.
+
+The window opens on `<host>`'s desktop session (on Linux sopen finds it through
+`systemctl --user`). On macOS an app started over ssh cannot take focus: sopen's own window
+floats above the other windows for a moment (until 1.5 s pass or you click or type in it), but
+Zed opens behind the active app. From a terminal, Ctrl+C reaches `<host>` and closes the window
+there; a sopen stopped without a terminal leaves the window on `<host>` open.
+
+The exit code is `<host>`'s; `could not reach <host>` means ssh did not get there, `sopen is not
+installed on <host>` (exit 127) means it has no sopen, and `sopen on <host> was stopped by
+signal N` means it was interrupted there.
 
 ## Images
 

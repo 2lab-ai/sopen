@@ -20,7 +20,9 @@ just check   # cargo fmt --check · cargo clippy --all-targets --locked -- -D wa
 ```
 
 A change is done when the gate is green on macOS and Linux (CI) and, for anything user-visible, a receipt
-exists: a command output or a window screenshot that someone actually looked at.
+exists: a command output or a window screenshot that someone actually looked at. Locally, tests that need ffmpeg,
+zsh or fish skip with a note when it is missing; CI installs them and sets `SOPEN_REQUIRE_FFMPEG=1` and
+`SOPEN_REQUIRE_SHELLS=1`, so there they fail instead.
 
 ## Rules
 

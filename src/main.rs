@@ -375,12 +375,7 @@ fn run_source(
     dirs: &Dirs,
     rec: &mut Record,
 ) -> Result<u8> {
-    let env = match std::env::var("SOPEN_TARGET") {
-        Ok(host) => Some(host),
-        Err(std::env::VarError::NotPresent) => None,
-        Err(std::env::VarError::NotUnicode(_)) => bail!("SOPEN_TARGET is not valid UTF-8"),
-    };
-    let chosen = forward::choose(here, flag, env.as_deref(), || {
+    let chosen = forward::choose(here, flag, forward::target_env, || {
         Ok(config::load(&config::path()?)?.target)
     })?;
     let short = forward::short_hostname();
@@ -398,7 +393,10 @@ fn run_source(
     rec.action = Some("open");
     rec.target = Some(host.clone());
     sopen::debug!("opening {there} on {host}");
-    forward::run(&host, &there, app_name, &dirs.state)
+    let code = forward::run(&host, &there, app_name, &dirs.state)?;
+    // HOST refused a write because the file changed (spec §5): a conflict here too (§10).
+    rec.conflict = code == EXIT_CONFLICT;
+    Ok(code)
 }
 
 fn run_open(arg: &str, app_name: Option<&str>, dirs: &Dirs, rec: &mut Record) -> Result<()> {

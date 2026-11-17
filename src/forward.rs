@@ -78,13 +78,14 @@ pub fn check_host(host: &str) -> std::result::Result<(), String> {
     }
 }
 
-/// Where to open, first match wins: `--here` > `--target` > `SOPEN_TARGET` > the config's
-/// `target` > this machine (`None`). `config` is called only when nothing before it decided, so a
-/// broken config file does not stop `--here`, `--target` or `SOPEN_TARGET`.
+/// Where to open (`None` = this machine): `--here` or `--target` (never both — the command line
+/// refuses that), else `SOPEN_TARGET`, else the config's `target`, else this machine. `env` and
+/// `config` are read only when nothing before them decided, so a broken config file or an
+/// unreadable `SOPEN_TARGET` does not stop `--here` or `--target`.
 pub fn choose(
     here: bool,
     flag: Option<&str>,
-    env: Option<&str>,
+    env: impl FnOnce() -> Result<Option<String>>,
     config: impl FnOnce() -> Result<Option<String>>,
 ) -> Result<Option<String>> {
     if here {
@@ -94,11 +95,20 @@ pub fn choose(
         check_host(host).map_err(|problem| anyhow!("--target: {problem}"))?;
         return Ok(Some(host.to_string()));
     }
-    if let Some(host) = env.filter(|h| !h.is_empty()) {
-        check_host(host).map_err(|problem| anyhow!("SOPEN_TARGET: {problem}"))?;
-        return Ok(Some(host.to_string()));
+    if let Some(host) = env()?.filter(|h| !h.is_empty()) {
+        check_host(&host).map_err(|problem| anyhow!("SOPEN_TARGET: {problem}"))?;
+        return Ok(Some(host));
     }
     config()
+}
+
+/// `SOPEN_TARGET` from the environment; one that is not UTF-8 is an error.
+pub fn target_env() -> Result<Option<String>> {
+    match std::env::var("SOPEN_TARGET") {
+        Ok(host) => Ok(Some(host)),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => bail!("SOPEN_TARGET is not valid UTF-8"),
+    }
 }
 
 /// This machine's host name up to the first `.` (`box.local` → `box`).
@@ -111,11 +121,28 @@ fn short_name(name: &str) -> Option<String> {
     (!short.is_empty()).then(|| short.to_string())
 }
 
-/// HOST is this machine: its host part (without `user@`) is `localhost` or `short` (this
-/// machine's short host name), in any case.
+/// A host name's first DNS label (`box.lan` → `box`); an IP literal stays whole.
+fn first_label(name: &str) -> &str {
+    if name.parse::<std::net::IpAddr>().is_ok() {
+        name
+    } else {
+        name.split('.').next().unwrap_or(name)
+    }
+}
+
+/// `localhost` (or a name under it), `127.x.x.x` or `::1`: whoever resolves it means itself.
+fn is_loopback(name: &str) -> bool {
+    match name.parse::<std::net::IpAddr>() {
+        Ok(ip) => ip.is_loopback(),
+        Err(_) => first_label(name).eq_ignore_ascii_case("localhost"),
+    }
+}
+
+/// HOST is this machine: its host part (without `user@`) is a loopback name or address, or its
+/// first DNS label is `short` (this machine's short host name), in any case.
 pub fn is_here(host: &str, short: Option<&str>) -> bool {
     let (_, name) = split_user(host);
-    name.eq_ignore_ascii_case("localhost") || short.is_some_and(|s| name.eq_ignore_ascii_case(s))
+    is_loopback(name) || short.is_some_and(|s| first_label(name).eq_ignore_ascii_case(s))
 }
 
 /// SOURCE as HOST must be given it:
@@ -123,7 +150,8 @@ pub fn is_here(host: &str, short: Option<&str>) -> bool {
 ///   opens as a local file (a relative path is under HOST's home: the script starts there);
 /// - a file on any other machine → unchanged;
 /// - a file on this machine → `<short>:<abs>`, `abs` from `local_abs` (which fails on a missing
-///   file exactly as a local open does).
+///   file exactly as a local open does); a loopback host (`localhost:p`, `[::1]:p`) would mean
+///   HOST itself, so it becomes `[user@]<short>:p`.
 pub fn source_for(
     host: &str,
     source: &str,
@@ -131,6 +159,10 @@ pub fn source_for(
     local_abs: impl FnOnce(&str) -> Result<String>,
 ) -> Result<String> {
     match target::parse(source).map_err(anyhow::Error::msg)? {
+        Target::Remote(spec) if is_loopback(&spec.host) => {
+            let user = spec.user.map(|u| format!("{u}@")).unwrap_or_default();
+            Ok(format!("{user}{}:{}", this_machine(short)?, spec.path))
+        }
         Target::Remote(spec) => {
             let (user, name) = split_user(host);
             let same_user = spec.user.is_none() || spec.user.as_deref() == user;
@@ -152,12 +184,17 @@ pub fn source_for(
             }
         }
         Target::Local(_) => {
-            let short = short.context(
-                "cannot read this machine's host name, which the other machine needs to fetch a local file",
-            )?;
+            let short = this_machine(short)?;
             Ok(format!("{short}:{}", local_abs(source)?))
         }
     }
+}
+
+/// The name HOST reaches this machine by.
+fn this_machine(short: Option<&str>) -> Result<&str> {
+    short.context(
+        "cannot read this machine's host name, which the other machine needs to fetch a file from here",
+    )
 }
 
 /// `K=V` for each of [`FORWARDED_ENV`] that is set here, in that order.
@@ -233,7 +270,11 @@ fn script(host: &str, install_paths: &str) -> String {
             .to_string(),
         "fi;".to_string(),
         "fi;".to_string(),
-        r#"exec "$bin" --here "$@""#.to_string(),
+        // Not `exec`: sopen runs as a child, with default signal handling (a trap's handler
+        // does not carry over to it, as an ignored signal would), while this shell catches INT,
+        // TERM and HUP and lives to report 128 + n — a signal that ended the shell itself would
+        // reach ssh as a lost connection (255).
+        r#"trap ':' INT TERM HUP; "$bin" --here "$@"; exit $?"#.to_string(),
     ]
     .join(" ")
 }
@@ -266,16 +307,33 @@ pub fn remote_words(
     words.iter().map(|w| quote(w)).collect()
 }
 
-/// `ssh <connection> -t|-T HOST -- <words>`: a terminal on HOST only when this one is one (an
-/// `--app` or editor prompt reads it).
+/// Options for the command run only: a `RemoteCommand` in `~/.ssh/config` (a tmux auto-attach)
+/// would make ssh refuse a command line, and "Shared connection to HOST closed." would follow
+/// every terminal run (errors still print).
+const RUN_OPTIONS: [&str; 4] = ["-o", "RemoteCommand=none", "-o", "LogLevel=ERROR"];
+
+/// HOST's terminal and input: a terminal (`-t`) when this side has one; otherwise none (`-T`)
+/// and no input (`-n`) — ssh would read this side's input to its end, eating the rest of a
+/// `while read` loop's list — unless `--app` waits for Enter on it.
+fn session_flags(tty: bool, app: bool) -> &'static [&'static str] {
+    match (tty, app) {
+        (true, _) => &["-t"],
+        (false, true) => &["-T"],
+        (false, false) => &["-T", "-n"],
+    }
+}
+
+/// `ssh <connection> <session flags> <run options> HOST -- <words>`.
 pub fn ssh_args(
     connection: Vec<OsString>,
     tty: bool,
+    app: bool,
     host: &str,
     words: Vec<String>,
 ) -> Vec<OsString> {
     let mut args = connection;
-    args.push(if tty { "-t" } else { "-T" }.into());
+    args.extend(session_flags(tty, app).iter().map(OsString::from));
+    args.extend(RUN_OPTIONS.iter().map(OsString::from));
     args.push(host.into());
     args.push("--".into());
     args.extend(words.into_iter().map(OsString::from));
@@ -289,7 +347,7 @@ pub fn run(host: &str, source: &str, app: Option<&str>, state_dir: &Path) -> Res
     let words = remote_words(host, source, app, &env, INSTALL_PATHS);
     let connection = crate::remote::connection_args(host, state_dir)?;
     let tty = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
-    let args = ssh_args(connection, tty, host, words);
+    let args = ssh_args(connection, tty, app.is_some(), host, words);
     crate::debug!(
         "{}",
         crate::render_command(std::ffi::OsStr::new("ssh"), &args)
@@ -301,11 +359,12 @@ pub fn run(host: &str, source: &str, app: Option<&str>, state_dir: &Path) -> Res
     exit_code(host, status)
 }
 
-/// HOST's exit code (0, 1, 3, 127 for no sopen there, …) is ours; ssh's own failure (255) is
-/// "could not reach".
+/// HOST's exit code (0, 1, 3, 127 for no sopen there) is ours; ssh's own failure (255) is
+/// "could not reach", and 128 + n is HOST's sopen stopped by signal n.
 fn exit_code(host: &str, status: ExitStatus) -> Result<u8> {
     match status.code() {
         Some(255) => bail!("could not reach {host}"),
+        Some(code @ 129..=254) => bail!("sopen on {host} was stopped by signal {}", code - 128),
         Some(code) => Ok(u8::try_from(code).unwrap_or(1)),
         None => bail!("ssh to {host} ended without an exit code ({status})"),
     }
@@ -339,38 +398,32 @@ mod tests {
 
     #[test]
     fn precedence() {
-        let none = || Ok(None);
-        let cfg = || Ok(Some("c".to_string()));
-        let never = || -> Result<Option<String>> { panic!("the config was read") };
-        assert_eq!(choose(true, Some("f"), Some("e"), never).unwrap(), None);
-        assert_eq!(
-            choose(false, Some("f"), Some("e"), never)
-                .unwrap()
-                .as_deref(),
-            Some("f")
-        );
-        assert_eq!(
-            choose(false, None, Some("e"), never).unwrap().as_deref(),
-            Some("e")
-        );
-        assert_eq!(
-            choose(false, None, Some(""), cfg).unwrap().as_deref(),
-            Some("c")
-        );
-        assert_eq!(
-            choose(false, None, None, cfg).unwrap().as_deref(),
-            Some("c")
-        );
-        assert_eq!(choose(false, None, None, none).unwrap(), None);
-        // A broken config only matters when it is consulted.
-        let broken = || Err(anyhow!("/c/config.toml: line 1: bad"));
-        assert!(choose(false, None, None, broken).is_err());
-        assert_eq!(choose(true, None, None, broken).unwrap(), None);
-        let e = choose(false, Some("-x"), None, none)
+        type Read = Result<Option<String>>;
+        let none = || -> Read { Ok(None) };
+        let host = |h: &'static str| move || -> Read { Ok(Some(h.to_string())) };
+        let never_env = || -> Read { panic!("SOPEN_TARGET was read") };
+        let never = || -> Read { panic!("the config was read") };
+        let pick = |here, flag, env: &dyn Fn() -> Read, cfg: &dyn Fn() -> Read| {
+            choose(here, flag, env, cfg).map(|h| h.unwrap_or_else(|| "here".to_string()))
+        };
+        assert_eq!(pick(true, None, &never_env, &never).unwrap(), "here");
+        assert_eq!(pick(false, Some("f"), &never_env, &never).unwrap(), "f");
+        assert_eq!(pick(false, None, &host("e"), &never).unwrap(), "e");
+        assert_eq!(pick(false, None, &host(""), &host("c")).unwrap(), "c");
+        assert_eq!(pick(false, None, &none, &host("c")).unwrap(), "c");
+        assert_eq!(pick(false, None, &none, &none).unwrap(), "here");
+        // A broken config or SOPEN_TARGET only matters when it is consulted.
+        let broken = || -> Read { Err(anyhow!("/c/config.toml: line 1: bad")) };
+        assert!(pick(false, None, &none, &broken).is_err());
+        let bad_env = || -> Read { Err(anyhow!("SOPEN_TARGET is not valid UTF-8")) };
+        assert!(pick(false, None, &bad_env, &none).is_err());
+        assert_eq!(pick(true, None, &bad_env, &broken).unwrap(), "here");
+        assert_eq!(pick(false, Some("f"), &bad_env, &broken).unwrap(), "f");
+        let e = pick(false, Some("-x"), &none, &none)
             .unwrap_err()
             .to_string();
         assert!(e.starts_with("--target: "), "{e}");
-        let e = choose(false, None, Some("a b"), none)
+        let e = pick(false, None, &host("a b"), &none)
             .unwrap_err()
             .to_string();
         assert!(e.starts_with("SOPEN_TARGET: "), "{e}");
@@ -387,10 +440,23 @@ mod tests {
         assert!(is_here("me@BOX", short));
         assert!(is_here("localhost", None));
         assert!(is_here("me@LocalHost", short));
-        assert!(!is_here("box.lan", short));
         assert!(!is_here("other", short));
         assert!(!is_here("box", None));
-        assert!(short_hostname().is_none_or(|s| !s.is_empty() && !s.contains('.')));
+        // A name by its first DNS label.
+        assert!(is_here("box.lan", short));
+        assert!(is_here("me@BOX.example.com", short));
+        assert!(!is_here("boxer.lan", short));
+        assert!(!is_here("lan.box", short));
+        // Loopback names and addresses are here.
+        assert!(is_here("localhost.localdomain", None));
+        assert!(is_here("127.0.0.1", None));
+        assert!(is_here("me@127.1.2.3", None));
+        // An IP literal is not cut at its first dot.
+        // (192.0.2.0/24 is the range reserved for documentation, RFC 5737.)
+        assert!(!is_here("192.0.2.7", Some("192")));
+        let mine = short_hostname().expect("this machine has a host name");
+        assert!(!mine.is_empty() && !mine.contains('.'), "{mine}");
+        assert!(is_here(&mine.to_uppercase(), Some(&mine)));
     }
 
     #[test]
@@ -411,6 +477,13 @@ mod tests {
             ("box", "box:~other/x", "box:~other/x"),
             ("box", "other:/x", "other:/x"),
             ("box", "Box:/x", "Box:/x"),
+            // Loopback means this machine, not HOST: named by this machine's short name.
+            ("box", "localhost:/p", "here:/p"),
+            ("box", "me@LocalHost:rel/p", "me@here:rel/p"),
+            ("box", "127.0.0.1:/p", "here:/p"),
+            ("box", "127.9.9.9:/p", "here:/p"),
+            ("box", "[::1]:/p", "here:/p"),
+            ("box", "me@[::1]:", "me@here:"),
         ];
         for (host, source, want) in cases {
             assert_eq!(
@@ -432,6 +505,7 @@ mod tests {
         let e = source_for("box", "nope.txt", Some("here"), missing).unwrap_err();
         assert_eq!(e.to_string(), "nope.txt: no such file or directory");
         assert!(source_for("box", "a.png", None, |_| Ok("/a.png".into())).is_err());
+        assert!(source_for("box", "localhost:/p", None, no_local).is_err());
         assert!(source_for("box", "@box:/x", Some("here"), no_local).is_err());
     }
 
@@ -482,16 +556,18 @@ mod tests {
             "\"dq\"",
             "!x",
         ];
-        for sh in shells() {
-            let quoted: Vec<String> = words.iter().map(|w| quote(w)).collect();
-            let out = Command::new(&sh)
+        let quoted: Vec<String> = words.iter().map(|w| quote(w)).collect();
+        let want: String = words.iter().map(|w| format!("[{w}]\n")).collect();
+        for sh in login_shells() {
+            let out = Command::new(&sh.path)
                 .arg("-c")
                 .arg(format!("printf '[%s]\\n' {}", quoted.join(" ")))
+                .env_clear()
+                .env("HOME", std::env::temp_dir())
                 .output()
                 .unwrap();
-            assert!(out.status.success(), "{sh}");
-            let want: String = words.iter().map(|w| format!("[{w}]\n")).collect();
-            assert_eq!(String::from_utf8(out.stdout).unwrap(), want, "{sh}");
+            assert!(out.status.success(), "{sh:?}");
+            assert_eq!(String::from_utf8_lossy(&out.stdout), want, "{sh:?}");
         }
     }
 
@@ -501,9 +577,21 @@ mod tests {
             .map(OsString::from)
             .to_vec();
         let words = remote_words("box", "/tmp/a b.png", Some("ImHex"), &[], INSTALL_PATHS);
-        let args = ssh_args(connection.clone(), false, "box", words.clone());
+        // No terminal here, `--app` waiting for Enter: no terminal there, but this side's input.
+        let args = ssh_args(connection.clone(), false, true, "box", words.clone());
         let mut want = connection.clone();
-        want.extend(["-T", "box", "--"].map(OsString::from));
+        want.extend(
+            [
+                "-T",
+                "-o",
+                "RemoteCommand=none",
+                "-o",
+                "LogLevel=ERROR",
+                "box",
+                "--",
+            ]
+            .map(OsString::from),
+        );
         want.extend(words.iter().map(OsString::from));
         assert_eq!(args, want);
         assert_eq!(words[0], "'sh'");
@@ -512,8 +600,16 @@ mod tests {
             words[3..],
             ["'sopen'", "'--app'", "'ImHex'", "'--'", "'/tmp/a b.png'"]
         );
-        let tty = ssh_args(connection, true, "box", vec![]);
-        assert_eq!(tty[4], "-t");
+        // The session flags: a terminal there only with one here; no input without `--app`.
+        let flags = |tty, app| {
+            let args = ssh_args(connection.clone(), tty, app, "box", vec![]);
+            let rest = &args[connection.len()..];
+            rest[..rest.iter().position(|a| a == "-o").unwrap()].to_vec()
+        };
+        assert_eq!(flags(true, false), ["-t"]);
+        assert_eq!(flags(true, true), ["-t"]);
+        assert_eq!(flags(false, true), ["-T"]);
+        assert_eq!(flags(false, false), ["-T", "-n"]);
 
         let env = ["SOPEN_LOG=debug".to_string()];
         let words = remote_words("box", "/x", None, &env, INSTALL_PATHS);
@@ -522,7 +618,10 @@ mod tests {
 
         let script = script("box", INSTALL_PATHS);
         assert!(!script.contains('\n'), "{script}");
-        assert!(script.ends_with(r#"exec "$bin" --here "$@""#), "{script}");
+        assert!(
+            script.ends_with(r#"trap ':' INT TERM HUP; "$bin" --here "$@"; exit $?"#),
+            "{script}"
+        );
         for place in [
             "/opt/homebrew/bin/sopen",
             "/usr/local/bin/sopen",
@@ -543,20 +642,62 @@ mod tests {
         assert_eq!(code(3).unwrap(), 3);
         assert_eq!(code(127).unwrap(), 127);
         assert_eq!(code(255).unwrap_err().to_string(), "could not reach box");
+        assert_eq!(
+            code(130).unwrap_err().to_string(),
+            "sopen on box was stopped by signal 2"
+        );
+        assert_eq!(
+            code(143).unwrap_err().to_string(),
+            "sopen on box was stopped by signal 15"
+        );
         assert!(exit_code("box", ExitStatus::from_raw(9)).is_err());
     }
 
     // -----------------------------------------------------------------------------------------
-    // The command run as sshd runs it: the words joined into one string for `sh -c`.
+    // The command run as OpenSSH runs it: sshd joins the words with spaces into one string and
+    // hands it to the login shell (`$SHELL -c "<string>"`), which parses the whole line first.
+    // Each lane is one login shell: sh, dash (Debian's sh), zsh (macOS's) and fish (the default
+    // of some Linux distributions).
+    // A missing zsh or fish is skipped with a note — or fails, under SOPEN_REQUIRE_SHELLS=1 (CI).
 
-    /// `/bin/sh`, and `/bin/dash` where it exists (the `sh` of Debian and Ubuntu).
-    fn shells() -> Vec<String> {
-        let mut shells = vec!["/bin/sh".to_string()];
-        if Path::new("/bin/dash").exists() {
-            shells.push("/bin/dash".to_string());
-        }
-        shells
+    /// A login shell lane (its binary).
+    #[derive(Debug)]
+    struct Shell {
+        path: PathBuf,
     }
+
+    /// `name` on the test process's PATH.
+    fn which(name: &str) -> Option<PathBuf> {
+        let path = std::env::var_os("PATH")?;
+        std::env::split_paths(&path)
+            .map(|dir| dir.join(name))
+            .find(|p| p.is_file())
+    }
+
+    fn login_shells() -> Vec<Shell> {
+        let require = std::env::var_os("SOPEN_REQUIRE_SHELLS").is_some_and(|v| v == "1");
+        let mut lanes = vec![Shell {
+            path: PathBuf::from("/bin/sh"),
+        }];
+        let dash = Path::new("/bin/dash");
+        // Where /bin/sh is dash already, one lane covers both.
+        if dash.exists() && dash.canonicalize().ok() != Path::new("/bin/sh").canonicalize().ok() {
+            lanes.push(Shell {
+                path: dash.to_path_buf(),
+            });
+        }
+        for name in ["zsh", "fish"] {
+            match which(name) {
+                Some(path) => lanes.push(Shell { path }),
+                None if require => panic!("SOPEN_REQUIRE_SHELLS=1 but {name} is not on PATH"),
+                None => eprintln!("note: {name} is not on PATH; its login-shell lane is skipped"),
+            }
+        }
+        lanes
+    }
+
+    /// The tools the script and the fakes run, besides shell builtins.
+    const TOOLS: [&str; 6] = ["env", "sh", "cat", "grep", "head", "id"];
 
     struct Host {
         _tmp: tempfile::TempDir,
@@ -571,20 +712,33 @@ mod tests {
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
 
-    /// A stand-in for HOST: a home, and a `bin` with a fake `uname` (reporting `os`) and a fake
-    /// `systemctl` (printing `session`).
+    /// A stand-in for HOST: a home, and a `bin` that is the whole PATH — links to [`TOOLS`], a
+    /// fake `uname` (reporting `os`) and a fake `systemctl` that records its arguments in
+    /// `systemctl-args`, prints `session-env` and exits with the code in `systemctl-exit`, if
+    /// any. No real sopen can be on that PATH.
     fn host(os: &str, session: &str) -> Host {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().canonicalize().unwrap();
         let bin = root.join("bin");
         let home = root.join("home");
         std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&bin).unwrap();
+        for tool in TOOLS {
+            let real = which(tool).unwrap_or_else(|| panic!("{tool} is not on PATH"));
+            std::os::unix::fs::symlink(real, bin.join(tool)).unwrap();
+        }
         executable(&bin.join("uname"), &format!("#!/bin/sh\necho {os}\n"));
-        let listing = root.join("session-env");
-        std::fs::write(&listing, session).unwrap();
+        std::fs::write(root.join("session-env"), session).unwrap();
+        let file = |name: &str| quote(root.join(name).to_str().unwrap());
         executable(
             &bin.join("systemctl"),
-            &format!("#!/bin/sh\ncat {}\n", quote(listing.to_str().unwrap())),
+            &format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > {args}\ncat {session}\n\
+                 if [ -s {exit} ]; then echo 'Failed to connect to bus' >&2; exit \"$(cat {exit})\"; fi\n",
+                args = file("systemctl-args"),
+                session = file("session-env"),
+                exit = file("systemctl-exit"),
+            ),
         );
         Host {
             _tmp: tmp,
@@ -594,23 +748,29 @@ mod tests {
         }
     }
 
-    /// A fake sopen that prints its arguments, where it runs and the variables a run depends on.
+    /// The variables a run on HOST depends on; the fake sopen prints each.
+    const SEEN: [&str; 11] = [
+        "SOPEN_STATE",
+        "SOPEN_LOG",
+        "SOPEN_TARGET_BIN",
+        "DISPLAY",
+        "WAYLAND_DISPLAY",
+        "XAUTHORITY",
+        "XDG_RUNTIME_DIR",
+        "DBUS_SESSION_BUS_ADDRESS",
+        "XDG_SESSION_TYPE",
+        "EVIL",
+        "PATH",
+    ];
+
+    /// A fake sopen that prints its arguments, where it runs, [`SEEN`] and which ffmpeg it
+    /// would run.
     fn fake_sopen() -> String {
         let mut body = String::from(
             "#!/bin/sh\nfor a in \"$@\"; do printf 'arg [%s]\\n' \"$a\"; done\nprintf 'pwd %s\\n' \"$PWD\"\n\
-             printf 'PATH [%s]\\n' \"$PATH\"\nprintf 'ffmpeg [%s]\\n' \"$(command -v ffmpeg)\"\n",
+             printf 'ffmpeg [%s]\\n' \"$(command -v ffmpeg)\"\n",
         );
-        for var in [
-            "SOPEN_STATE",
-            "SOPEN_LOG",
-            "SOPEN_TARGET_BIN",
-            "DISPLAY",
-            "WAYLAND_DISPLAY",
-            "XAUTHORITY",
-            "XDG_RUNTIME_DIR",
-            "XDG_SESSION_TYPE",
-            "EVIL",
-        ] {
+        for var in SEEN {
             body.push_str(&format!("printf '{var} [%s]\\n' \"${{{var}-unset}}\"\n"));
         }
         body
@@ -621,19 +781,31 @@ mod tests {
         out.lines().any(|l| l == line)
     }
 
+    /// The `[…]` value of the `name [value]` line the fake sopen printed.
+    fn value<'a>(out: &'a str, name: &str) -> &'a str {
+        out.lines()
+            .find_map(|l| l.strip_prefix(&format!("{name} ["))?.strip_suffix(']'))
+            .unwrap_or_else(|| panic!("no {name} line in {out}"))
+    }
+
     impl Host {
-        /// Runs `words` the way sshd does: joined with spaces, one string for the login shell.
+        /// Runs `words` as sshd does: joined with spaces, `<login shell> -c "<line>"`, with only
+        /// HOST's PATH and HOME (and `extra_env`, which may replace them).
         fn run(
             &self,
-            sh: &str,
+            sh: &Shell,
             words: &[String],
             extra_env: &[(&str, &str)],
         ) -> (i32, String, String) {
-            let mut cmd = Command::new(sh);
-            cmd.arg("-c")
+            use std::os::unix::process::CommandExt;
+            let mut cmd = Command::new(&sh.path);
+            // A process group of its own, as a session on HOST has: a test can signal all of
+            // it (Ctrl+C on a terminal) without reaching the test runner.
+            cmd.process_group(0)
+                .arg("-c")
                 .arg(words.join(" "))
                 .env_clear()
-                .env("PATH", format!("{}:/usr/bin:/bin", self.bin.display()))
+                .env("PATH", &self.bin)
                 .env("HOME", &self.home);
             for (k, v) in extra_env {
                 cmd.env(k, v);
@@ -645,21 +817,26 @@ mod tests {
                 String::from_utf8_lossy(&out.stderr).into_owned(),
             )
         }
+
+        fn systemctl_args(&self) -> String {
+            std::fs::read_to_string(self.root.join("systemctl-args")).unwrap_or_default()
+        }
     }
 
     #[test]
     fn the_script_runs_sopen_here_with_the_source_and_hooks() {
-        let source = r#"it's a "b" $HOME `id` \x.png"#;
+        let source = r#"it's a "b" $HOME `id` \x 한글 ü.png"#;
         let env = [
             "SOPEN_STATE=rect=1,2,3,4;op=crop|pixelize".to_string(),
             "SOPEN_LOG=debug".to_string(),
         ];
-        for sh in shells() {
+        for sh in login_shells() {
             let h = host("Darwin", "");
             executable(&h.bin.join("sopen"), &fake_sopen());
             let words = remote_words("box", source, Some("Hex Fiend"), &env, INSTALL_PATHS);
             let (code, out, err) = h.run(&sh, &words, &[]);
-            assert_eq!(code, 0, "{sh}: {err}");
+            assert_eq!(code, 0, "{sh:?}: {err}");
+            assert_eq!(err, "", "{sh:?}");
             let args: Vec<&str> = out.lines().filter_map(|l| l.strip_prefix("arg ")).collect();
             assert_eq!(
                 args,
@@ -670,26 +847,24 @@ mod tests {
                     "[--]",
                     &format!("[{source}]")
                 ],
-                "{sh}"
+                "{sh:?}"
             );
             assert!(
                 has_line(&out, &format!("pwd {}", h.home.display())),
-                "{sh}: {out}"
+                "{sh:?}: {out}"
             );
-            assert!(
-                has_line(&out, "SOPEN_STATE [rect=1,2,3,4;op=crop|pixelize]"),
-                "{out}"
-            );
-            assert!(has_line(&out, "SOPEN_LOG [debug]"), "{out}");
-            // Not Linux: no display variables are made up.
-            assert!(has_line(&out, "DISPLAY [unset]"), "{out}");
-            assert!(has_line(&out, "WAYLAND_DISPLAY [unset]"), "{out}");
+            assert_eq!(value(&out, "SOPEN_STATE"), "rect=1,2,3,4;op=crop|pixelize");
+            assert_eq!(value(&out, "SOPEN_LOG"), "debug");
+            // Not Linux: no display variables are made up, and systemd is not asked.
+            assert_eq!(value(&out, "DISPLAY"), "unset", "{sh:?}");
+            assert_eq!(value(&out, "WAYLAND_DISPLAY"), "unset");
+            assert_eq!(h.systemctl_args(), "", "{sh:?}");
         }
     }
 
     #[test]
     fn the_script_finds_sopen_by_target_bin_or_install_path() {
-        for sh in shells() {
+        for sh in login_shells() {
             let h = host("Darwin", "");
             // Not on PATH and not installed: only SOPEN_TARGET_BIN names it.
             let elsewhere = h.root.join("build/sopen-dev");
@@ -697,12 +872,9 @@ mod tests {
             let env = [format!("SOPEN_TARGET_BIN={}", elsewhere.display())];
             let words = remote_words("box", "/x", None, &env, "/nonexistent-sopen-test/sopen");
             let (code, out, err) = h.run(&sh, &words, &[]);
-            assert_eq!(code, 0, "{sh}: {err}");
+            assert_eq!(code, 0, "{sh:?}: {err}");
             assert!(has_line(&out, "arg [--here]"), "{out}");
-            assert!(
-                has_line(&out, &format!("SOPEN_TARGET_BIN [{}]", elsewhere.display())),
-                "{out}"
-            );
+            assert_eq!(value(&out, "SOPEN_TARGET_BIN"), elsewhere.to_str().unwrap());
 
             // Not on PATH: the install paths, in order, `$HOME` expanded on HOST. (Not the
             // production list: a sopen installed on the test machine would be found first.)
@@ -710,35 +882,28 @@ mod tests {
             let paths = r#"/nonexistent-sopen-test/sopen "$HOME/.cargo/bin/sopen""#;
             let words = remote_words("box", "/x", None, &[], paths);
             let (code, out, err) = h.run(&sh, &words, &[]);
-            assert_eq!(code, 0, "{sh}: {err}");
+            assert_eq!(code, 0, "{sh:?}: {err}");
             assert!(has_line(&out, "arg [/x]"), "{out}");
         }
     }
 
-    /// The `[…]` value of the `name [value]` line the fake sopen printed.
-    fn value<'a>(out: &'a str, name: &str) -> &'a str {
-        out.lines()
-            .find_map(|l| l.strip_prefix(&format!("{name} ["))?.strip_suffix(']'))
-            .unwrap_or_else(|| panic!("no {name} line in {out}"))
-    }
-
     #[test]
     fn sopen_on_the_target_finds_the_ffmpeg_next_to_it() {
-        for sh in shells() {
+        for sh in login_shells() {
             let h = host("Darwin", "");
-            // A brew-style install outside the session's minimal PATH, ffmpeg beside sopen.
+            let session = h.bin.to_str().unwrap().to_string();
+            // A brew-style install outside the session's PATH, ffmpeg beside sopen.
             let brew = h.root.join("brew/bin");
             executable(&brew.join("sopen"), &fake_sopen());
             executable(&brew.join("ffmpeg"), "#!/bin/sh\n");
             let paths = quote(brew.join("sopen").to_str().unwrap());
             let words = remote_words("box", "/x", None, &[], &paths);
             let (code, out, err) = h.run(&sh, &words, &[]);
-            assert_eq!(code, 0, "{sh}: {err}");
-            let session = format!("{}:/usr/bin:/bin", h.bin.display());
+            assert_eq!(code, 0, "{sh:?}: {err}");
             let path = value(&out, "PATH");
             assert!(
                 path.starts_with(&format!("{}:{session}", brew.display())),
-                "{sh}: {path}"
+                "{sh:?}: {path}"
             );
             assert_eq!(value(&out, "ffmpeg"), brew.join("ffmpeg").to_str().unwrap());
 
@@ -752,12 +917,12 @@ mod tests {
             let env = [format!("SOPEN_TARGET_BIN={}", elsewhere.display())];
             let words = remote_words("box", "/x", None, &env, "/nonexistent-sopen-test/sopen");
             let (code, out, err) = h.run(&sh, &words, &[]);
-            assert_eq!(code, 0, "{sh}: {err}");
+            assert_eq!(code, 0, "{sh:?}: {err}");
             let path = value(&out, "PATH");
             let first = format!("{}:{session}:", h.root.join("build").display());
             let appended = path
                 .strip_prefix(&first)
-                .unwrap_or_else(|| panic!("{sh}: {path}"));
+                .unwrap_or_else(|| panic!("{sh:?}: {path}"));
             let fixed = [
                 "/opt/homebrew/bin",
                 "/usr/local/bin",
@@ -771,10 +936,8 @@ mod tests {
 
             // Already on the session's PATH: not appended again.
             let session_with = format!("{session}:{}", linuxbrew.display());
-            let mut cmd_words = words.clone();
-            cmd_words.insert(0, format!("PATH={}", quote(&session_with)));
-            let (code, out, err) = h.run(&sh, &cmd_words, &[]);
-            assert_eq!(code, 0, "{sh}: {err}");
+            let (code, out, err) = h.run(&sh, &words, &[("PATH", &session_with)]);
+            assert_eq!(code, 0, "{sh:?}: {err}");
             let path = value(&out, "PATH");
             assert_eq!(
                 path.matches(linuxbrew.to_str().unwrap()).count(),
@@ -786,56 +949,99 @@ mod tests {
 
     #[test]
     fn the_script_says_when_sopen_is_missing() {
-        for sh in shells() {
+        for sh in login_shells() {
             let h = host("Darwin", "");
             let words = remote_words("me@box", "/x", None, &[], "/nonexistent-sopen-test/sopen");
             let (code, out, err) = h.run(&sh, &words, &[]);
-            assert_eq!(code, 127, "{sh}: {out} {err}");
+            assert_eq!(code, 127, "{sh:?}: {out} {err}");
             assert_eq!(
                 err, "sopen is not installed on me@box (brew install 2lab-ai/tap/sopen-preview)\n",
-                "{sh}"
+                "{sh:?}"
             );
-            assert_eq!(out, "", "{sh}");
+            assert_eq!(out, "", "{sh:?}");
+        }
+    }
+
+    #[test]
+    fn a_sopen_stopped_by_a_signal_comes_back_as_an_exit_code() {
+        for sh in login_shells() {
+            let h = host("Darwin", "");
+            // Ctrl+C on HOST's terminal: SIGINT to the whole process group. sopen must see the
+            // default handling (it stops; "survived" would mean it was ignored), and the script
+            // must survive it to exit 128 + 2 — not die of it, which ssh reports as 255.
+            executable(
+                &h.bin.join("sopen"),
+                "#!/bin/sh\nkill -INT 0\necho survived\n",
+            );
+            let words = remote_words("box", "/x", None, &[], INSTALL_PATHS);
+            let (code, out, err) = h.run(&sh, &words, &[]);
+            assert_eq!(code, 130, "{sh:?}: {out} {err}");
+            assert!(!out.contains("survived"), "{sh:?}: {out}");
+            // TERM to sopen alone (a crash, a kill): 128 + 15.
+            executable(
+                &h.bin.join("sopen"),
+                "#!/bin/sh\nkill -TERM $$\necho survived\n",
+            );
+            let (code, out, err) = h.run(&sh, &words, &[]);
+            assert_eq!(code, 143, "{sh:?}: {out} {err}");
+            // An ordinary exit code is passed on as it is.
+            executable(&h.bin.join("sopen"), "#!/bin/sh\nexit 3\n");
+            let (code, _, _) = h.run(&sh, &words, &[]);
+            assert_eq!(code, 3, "{sh:?}");
         }
     }
 
     #[test]
     fn linux_without_a_display_takes_the_session_display() {
-        for sh in shells() {
+        for sh in login_shells() {
             let h = host("Linux", "");
             let pwned = h.root.join("pwned");
             // A value with command substitutions, in a name that is imported: kept as text.
             let hostile = format!("x $(touch {p}) `touch {p}`", p = pwned.display());
-            let session = format!(
-                "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1/bus\nDISPLAY=:7\n\
-                 EVIL=$(touch {p})\nPATH=/nowhere\nWAYLAND_DISPLAY=wayland-9\n\
-                 XAUTHORITY=$'/a b'\nXDG_SESSION_TYPE={hostile}\nNOT_DISPLAY=:3\n",
+            let imported = [
+                (
+                    "DBUS_SESSION_BUS_ADDRESS",
+                    "unix:path=/run/user/1/bus,guid=0a1b",
+                ),
+                ("DISPLAY", ":7"),
+                ("WAYLAND_DISPLAY", "wayland-9"),
+                ("XAUTHORITY", "/run/user/1/xauth_q"),
+                ("XDG_RUNTIME_DIR", "/run/user/1"),
+                ("XDG_SESSION_TYPE", hostile.as_str()),
+            ];
+            let mut session = format!(
+                "EVIL=$(touch {p})\nPATH=/nowhere\nNOT_DISPLAY=:3\n",
                 p = pwned.display()
             );
+            for (key, val) in imported {
+                session.push_str(&format!("{key}={val}\n"));
+            }
             std::fs::write(h.root.join("session-env"), session).unwrap();
             executable(&h.bin.join("sopen"), &fake_sopen());
             let words = remote_words("box", "/x", None, &[], INSTALL_PATHS);
             let (code, out, err) = h.run(&sh, &words, &[]);
-            assert_eq!(code, 0, "{sh}: {err}");
-            assert!(has_line(&out, "DISPLAY [:7]"), "{sh}: {out}");
-            assert!(has_line(&out, "WAYLAND_DISPLAY [wayland-9]"), "{out}");
-            assert!(
-                has_line(&out, &format!("XDG_SESSION_TYPE [{hostile}]")),
-                "{out}"
-            );
-            assert!(
-                has_line(&out, "XAUTHORITY [unset]"),
-                "C-quoted value skipped: {out}"
-            );
-            assert!(has_line(&out, "EVIL [unset]"), "{out}");
-            assert!(!pwned.exists(), "{sh}: a session value was evaluated");
-            assert!(has_line(&out, "arg [--here]"), "PATH kept: {out}");
+            assert_eq!(code, 0, "{sh:?}: {err}");
+            assert_eq!(h.systemctl_args(), "--user\nshow-environment\n", "{sh:?}");
+            for (key, val) in imported {
+                assert_eq!(value(&out, key), val, "{sh:?} {key}");
+            }
+            assert_eq!(value(&out, "EVIL"), "unset");
+            assert!(!value(&out, "PATH").contains("/nowhere"), "{out}");
+            assert!(!pwned.exists(), "{sh:?}: a session value was evaluated");
+
+            // A value systemd prints C-quoted (`$'…'`) is left alone.
+            let session = "DISPLAY=:7\nXAUTHORITY=$'/a b'\n";
+            std::fs::write(h.root.join("session-env"), session).unwrap();
+            let (code, out, err) = h.run(&sh, &words, &[]);
+            assert_eq!(code, 0, "{sh:?}: {err}");
+            assert_eq!(value(&out, "DISPLAY"), ":7");
+            assert_eq!(value(&out, "XAUTHORITY"), "unset", "{sh:?}");
         }
     }
 
     #[test]
     fn linux_without_any_session_uses_the_wayland_socket() {
-        for sh in shells() {
+        for sh in login_shells() {
             let h = host("Linux", "");
             executable(&h.bin.join("sopen"), &fake_sopen());
             let run = h.root.join("run");
@@ -845,19 +1051,27 @@ mod tests {
             let words = remote_words("box", "/x", None, &[], INSTALL_PATHS);
             let runtime = [("XDG_RUNTIME_DIR", run.to_str().unwrap())];
             let (code, out, err) = h.run(&sh, &words, &runtime);
-            assert_eq!(code, 0, "{sh}: {err}");
-            assert!(has_line(&out, "WAYLAND_DISPLAY [wayland-3]"), "{sh}: {out}");
-            assert!(has_line(&out, "DISPLAY [unset]"), "{out}");
-            assert!(
-                has_line(&out, &format!("XDG_RUNTIME_DIR [{}]", run.display())),
-                "{out}"
-            );
+            assert_eq!(code, 0, "{sh:?}: {err}");
+            assert_eq!(value(&out, "WAYLAND_DISPLAY"), "wayland-3", "{sh:?}");
+            assert_eq!(value(&out, "DISPLAY"), "unset");
+            assert_eq!(value(&out, "XDG_RUNTIME_DIR"), run.to_str().unwrap());
 
-            // A display already set is left alone.
+            // systemd failing (no user manager) is quiet and falls back the same way.
+            std::fs::write(h.root.join("session-env"), "").unwrap();
+            std::fs::write(h.root.join("systemctl-exit"), "1").unwrap();
+            let (code, out, err) = h.run(&sh, &words, &runtime);
+            assert_eq!(code, 0, "{sh:?}: {err}");
+            assert_eq!(err, "", "{sh:?}");
+            assert_eq!(h.systemctl_args(), "--user\nshow-environment\n");
+            assert_eq!(value(&out, "WAYLAND_DISPLAY"), "wayland-3", "{sh:?}");
+
+            // A display already set is left alone, and systemd is not asked.
+            std::fs::remove_file(h.root.join("systemctl-args")).unwrap();
             let (code, out, _) = h.run(&sh, &words, &[("DISPLAY", ":1")]);
             assert_eq!(code, 0);
-            assert!(has_line(&out, "DISPLAY [:1]"), "{out}");
-            assert!(has_line(&out, "WAYLAND_DISPLAY [unset]"), "{out}");
+            assert_eq!(value(&out, "DISPLAY"), ":1");
+            assert_eq!(value(&out, "WAYLAND_DISPLAY"), "unset");
+            assert_eq!(h.systemctl_args(), "");
         }
     }
 }

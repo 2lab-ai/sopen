@@ -94,9 +94,13 @@ pub fn unset_target(path: &Path) -> Result<bool> {
     Ok(true)
 }
 
+/// A new config file is private (it names the machines you use); a replaced one keeps its mode.
+const NEW_FILE_MODE: u32 = 0o600;
+
 /// Atomic replace: a temp file in the same directory, flushed, renamed over the config. A config
 /// that is a symlink (a dotfiles checkout) has the file it points at replaced, so the link stays.
 fn write(path: &Path, config: &Config) -> Result<()> {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
     let text = toml::to_string(config).context("cannot encode the config")?;
     let dest = match std::fs::symlink_metadata(path) {
         Ok(meta) if meta.file_type().is_symlink() => std::fs::canonicalize(path)
@@ -119,14 +123,21 @@ fn write(path: &Path, config: &Config) -> Result<()> {
     temp_name.push(name);
     temp_name.push(format!(".sopen-{}-{nanos}", std::process::id()));
     let temp = dir.join(temp_name);
+    let mode = match std::fs::metadata(&dest) {
+        Ok(meta) => meta.permissions().mode() & 0o7777,
+        Err(_) => NEW_FILE_MODE,
+    };
     let mut file = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
+        .mode(NEW_FILE_MODE)
         .open(&temp)
         .with_context(|| format!("cannot create {}", temp.display()))?;
-    // From here the temp is ours, and it is removed if it does not become the config.
+    // From here the temp is ours, and it is removed if it does not become the config. The mode
+    // is set exactly (the umask applies only at creation).
     let written = file
-        .write_all(text.as_bytes())
+        .set_permissions(std::fs::Permissions::from_mode(mode))
+        .and_then(|()| file.write_all(text.as_bytes()))
         .and_then(|()| file.sync_all())
         .and_then(|()| std::fs::rename(&temp, &dest));
     if let Err(e) = written {
@@ -235,6 +246,21 @@ mod tests {
             std::fs::read_to_string(&file).unwrap(),
             "colour = \"red\"\n"
         );
+    }
+
+    #[test]
+    fn a_new_config_is_private_and_a_replaced_one_keeps_its_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o7777;
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("config.toml");
+        set_target(&file, "box").unwrap();
+        assert_eq!(mode(&file), 0o600);
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o640)).unwrap();
+        set_target(&file, "other").unwrap();
+        assert_eq!(mode(&file), 0o640);
+        assert!(unset_target(&file).unwrap());
+        assert_eq!(mode(&file), 0o640);
     }
 
     #[test]
