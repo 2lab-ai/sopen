@@ -512,7 +512,17 @@ mod tests {
         // The real machine.
         let mine = hostname().expect("this machine has a host name");
         let short = short_hostname().expect("this machine has a short host name");
-        assert!(!short.is_empty() && !short.contains('.'), "{short}");
+        // As normalised: an IP literal stays whole (a runner may be named by one), a name is
+        // cut at its first dot.
+        let normalised = |full: &str, short: &str| match bare(full).parse::<std::net::IpAddr>() {
+            Ok(_) => short == bare(full),
+            Err(_) => !short.is_empty() && !short.contains('.'),
+        };
+        assert!(normalised("192.0.2.7", "192.0.2.7"));
+        assert!(normalised("box.lan.", "box"));
+        assert!(!normalised("box.lan", "box.lan"));
+        assert!(!normalised("192.0.2.7", "192"));
+        assert!(normalised(&mine, &short), "{mine} -> {short}");
         assert!(is_here(&mine.to_uppercase(), Some(&mine)));
         assert!(is_here(&short, Some(&mine)));
     }
@@ -1070,7 +1080,8 @@ mod tests {
             let pwned = h.root.join("pwned");
             // A value with command substitutions, in a name that is imported: kept as text. The
             // sentinel is a redirect, a shell builtin, so it works on HOST's bare PATH.
-            let hostile = format!("x $(: > {p}) `: > {p}`", p = pwned.display());
+            let marker = quote(pwned.to_str().unwrap());
+            let hostile = format!("x $(: > {marker}) `: > {marker}`");
             // Positive control: evaluated, the value does leave the marker.
             let evaluated = Command::new("/bin/sh")
                 .arg("-c")
@@ -1093,10 +1104,7 @@ mod tests {
                 ("XDG_RUNTIME_DIR", "/run/user/1"),
                 ("XDG_SESSION_TYPE", hostile.as_str()),
             ];
-            let mut session = format!(
-                "EVIL=$(: > {p})\nPATH=/nowhere\nNOT_DISPLAY=:3\n",
-                p = pwned.display()
-            );
+            let mut session = format!("EVIL=$(: > {marker})\nPATH=/nowhere\nNOT_DISPLAY=:3\n");
             for (key, val) in imported {
                 session.push_str(&format!("{key}={val}\n"));
             }

@@ -321,10 +321,10 @@ fn media_autoexport_writes_a_sibling() {
 // Where it opens (spec §4a). `ssh` is a stand-in: it answers `ssh -G`, records the call that runs
 // sopen on the target, and then runs it as OpenSSH does — the words after the destination
 // joined with spaces, `sh -c "<line>"` on the "target" (here, in a home of its own, with a
-// non-interactive macOS session's PATH and a display set; the script's Linux branch has its own
-// tests). The target has nothing installed: the absolute install paths in the command are
-// pointed at a directory that does not exist, so a sopen installed on the test machine is never
-// run. `FAKE_SSH_EXIT` stops it before the run, with that code.
+// PATH of only the tools the script uses and a display set; the script's Linux branch has its
+// own tests). The target has nothing installed: no sopen on that PATH, and the absolute install
+// paths in the command are pointed at a directory that does not exist, so a sopen installed on
+// the test machine is never run. `FAKE_SSH_EXIT` stops it before the run, with that code.
 
 /// A target name no test machine has.
 const HOST: &str = "sopen-test-target";
@@ -339,6 +339,22 @@ const INSTALLED: [&str; 3] = [
     "/usr/local/bin/sopen",
     "/home/linuxbrew/.linuxbrew/bin/sopen",
 ];
+
+/// The tools the target's script runs besides shell builtins (its Linux display branch is not
+/// taken: the fake target has a display).
+const TARGET_TOOLS: [&str; 3] = ["env", "sh", "uname"];
+
+/// `name` on the test process's PATH: the first absolute, executable file, canonicalized.
+fn which(name: &str) -> Option<std::path::PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .filter(|dir| dir.is_absolute())
+        .filter_map(|dir| dir.join(name).canonicalize().ok())
+        .find(|p| {
+            std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+        })
+}
 
 struct FakeSsh {
     dir: std::path::PathBuf,
@@ -357,7 +373,12 @@ fn executable(path: &Path, body: &str) {
 impl FakeSsh {
     fn new(home: &Path) -> Self {
         let dir = home.join("fake-ssh");
-        std::fs::create_dir_all(&dir).unwrap();
+        let target_path = dir.join("target-path");
+        std::fs::create_dir_all(&target_path).unwrap();
+        for tool in TARGET_TOOLS {
+            let real = which(tool).unwrap_or_else(|| panic!("{tool} is not on PATH"));
+            std::os::unix::fs::symlink(real, target_path.join(tool)).unwrap();
+        }
         let unplug: String = INSTALLED
             .iter()
             .map(|p| format!(" -e 's|{p}|{}/not-installed{p}|g'", dir.display()))
@@ -373,9 +394,15 @@ impl FakeSsh {
                  shift\n\
                  line=$(printf '%s' \"$*\" | sed{unplug})\n\
                  mkdir -p '{dir}/target-home'\n\
-                 HOME='{dir}/target-home' PATH=/usr/bin:/bin:/usr/sbin:/sbin DISPLAY=:99 exec /bin/sh -c \"$line\"\n",
+                 HOME='{dir}/target-home' PATH='{dir}/target-path' DISPLAY=:99 exec /bin/sh -c \"$line\"\n",
                 dir = dir.display()
             ),
+        );
+        // A sopen on this machine's PATH (first on it, beside the fake ssh) that the target must
+        // never run: it leaves `decoy-ran` behind.
+        executable(
+            &dir.join("sopen"),
+            &format!("#!/bin/sh\n: > '{}/decoy-ran'\n", dir.display()),
         );
         let sopen = dir.join("target-sopen");
         executable(
@@ -578,6 +605,10 @@ fn no_sopen_on_the_target_is_its_own_message_and_127() {
         &[("PATH", &ssh.path)],
     );
     assert_eq!(out.status.code(), Some(127), "{}", text(&out.stderr));
+    assert!(
+        !ssh.dir.join("decoy-ran").exists(),
+        "the target ran a sopen from this machine's PATH"
+    );
     assert_eq!(
         text(&out.stderr),
         format!("sopen is not installed on {HOST} (brew install 2lab-ai/tap/sopen-preview)\n")
