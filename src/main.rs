@@ -28,7 +28,7 @@ const EXIT_CONFLICT: u8 = 3;
     about = "Open a file or folder on another machine as if it were local",
     long_about = "Open a file or folder on another machine as if it were local.\n\n\
         SOURCE uses scp syntax: [user@]host:path (relative paths are under the remote home) or a \
-        local path. Folders and text open in Zed; other files are fetched to the local cache.\n\n\
+        local path. Folders and text open in VS Code when present, otherwise Zed; other files are fetched to the local cache.\n\n\
         It opens on this machine, or with --target HOST on HOST's screen (sopen runs there, \
         started over ssh). SOPEN_TARGET or `sopen config target HOST` make a HOST the default; \
         --here opens on this machine anyway.",
@@ -552,21 +552,50 @@ fn open_in_editor(
     dirs: &Dirs,
     rec: &mut Record,
 ) -> Result<()> {
-    if let Some(zed_cli) = zed::locate() {
-        let arg = match place {
-            Place::Remote(spec, _) => zed::remote_url(spec.user.as_deref(), &spec.host, abs),
-            Place::Local(_) => abs.to_string(),
-        };
-        zed::open(&zed_cli, arg.as_ref())?;
-        println!("opened {} in Zed", place.display(abs));
-        return Ok(());
-    }
+    let is_remote = matches!(place, Place::Remote(..));
+    let code_cannot_remote = match zed::choose(
+        is_remote,
+        zed::locate_code(),
+        zed::remote_ssh_installed,
+        zed::locate,
+    ) {
+        zed::Editor::Code(code) => {
+            let remote = match &*place {
+                Place::Remote(spec, _) => Some((spec.user.as_deref(), spec.host.as_str())),
+                Place::Local(_) => None,
+            };
+            zed::open_args(&code, &zed::code_args(remote, abs, kind == Kind::Directory))?;
+            println!("opened {} in VS Code", place.display(abs));
+            return Ok(());
+        }
+        zed::Editor::Zed {
+            cli,
+            code_cannot_remote,
+        } => {
+            if code_cannot_remote {
+                eprintln!("VS Code has no Remote - SSH extension; opening in Zed");
+            }
+            let arg = match place {
+                Place::Remote(spec, _) => zed::remote_url(spec.user.as_deref(), &spec.host, abs),
+                Place::Local(_) => abs.to_string(),
+            };
+            zed::open(&cli, arg.as_ref())?;
+            println!("opened {} in Zed", place.display(abs));
+            return Ok(());
+        }
+        zed::Editor::Neither { code_cannot_remote } => code_cannot_remote,
+    };
+    let no_code = if code_cannot_remote {
+        "VS Code has no Remote - SSH extension"
+    } else {
+        "VS Code was not found"
+    };
     if kind == Kind::Directory {
         let (names, fixed) = zed::candidates(zed::Os::current());
         let mut looked: Vec<&str> = names.to_vec();
         looked.extend_from_slice(fixed);
         bail!(
-            "folders open in Zed, and Zed was not found (looked for {}); install Zed or set SOPEN_ZED",
+            "folders open in VS Code or Zed; {no_code} and Zed was not found (looked for {}); install an editor",
             looked.join(", ")
         );
     }
@@ -582,7 +611,7 @@ fn open_in_editor(
             let Fetched { claim, at, .. } = fetch_to_cache(place, abs, dirs, rec)?;
             let local = &claim.local;
             eprintln!(
-                "Zed not found; editing a copy with {}",
+                "{no_code} and Zed was not found; editing a copy with {}",
                 editor.to_string_lossy()
             );
             if let Err(e) = zed::run_terminal_editor(local) {
