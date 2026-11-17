@@ -16,6 +16,9 @@ pub mod target;
 pub mod usage;
 pub mod zed;
 
+#[cfg(test)]
+pub(crate) mod testutil;
+
 /// `<ver> (<channel> <sha12>)` — `sopen --version` prints `sopen ` before it. Channel and build id
 /// come from `SOPEN_BUILD_CHANNEL` / `SOPEN_BUILD_ID` at compile time (`dev` / `unknown` otherwise);
 /// the build id is a commit sha, of which the first 12 characters are kept.

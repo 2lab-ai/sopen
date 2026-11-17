@@ -5,6 +5,10 @@
 //! SOPEN_TEST_SFTP_HOST=<alias> SOPEN_TEST_SFTP_DIR=/tmp/sopen-receipts \
 //!   cargo test --test sftp_live -- --ignored --nocapture
 //! ```
+//!
+//! Each test works in its own new subdirectory `<dir>/<test>-<pid>-<nanos>` (so they run in
+//! parallel without seeing each other's files) and removes it when it passes; a failing test
+//! leaves it for inspection.
 
 use sopen::remote::{join, random_hex, RemoteFs, SftpRemote, WriteOutcome};
 use sopen::target::RemoteSpec;
@@ -37,6 +41,40 @@ fn live() -> Option<Live> {
 impl Live {
     fn connect(&self) -> SftpRemote {
         SftpRemote::connect(&self.spec, &self.state).unwrap()
+    }
+
+    /// `ssh <dest> <args>` (the test's own setup; sopen itself never runs remote commands).
+    fn ssh(&self, args: &[&str]) {
+        let ok = std::process::Command::new("ssh")
+            .args(["-o", "BatchMode=yes", &self.spec.destination()])
+            .args(args)
+            .stdin(std::process::Stdio::null())
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok, "ssh {} {args:?} failed", self.spec.destination());
+    }
+
+    /// A new directory of this test's own: `<dir>/<test>-<pid>-<nanos>`, as an absolute path.
+    fn scratch(&self, test: &str, fs: &mut SftpRemote) -> String {
+        let base = self.dir.trim_end_matches('/');
+        assert!(
+            base.chars()
+                .all(|c| c.is_ascii_alphanumeric() || "/._-~".contains(c)),
+            "SOPEN_TEST_SFTP_DIR must be a plain path (letters, digits, / . _ - ~): {base}"
+        );
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = format!("{base}/{test}-{}-{nanos}", std::process::id());
+        self.ssh(&["mkdir", "-p", &dir]);
+        fs.realpath(&dir).unwrap()
+    }
+
+    /// Removes a scratch directory the test has emptied (`rmdir`: refuses if anything is left).
+    fn done(&self, dir: &str) {
+        self.ssh(&["rmdir", dir]);
     }
 }
 
@@ -73,7 +111,7 @@ fn sftp_write_atomic_refuses_a_changed_remote() {
 
     // Writer A creates the file (a new sibling, never over an existing one) and fetches it.
     let mut a = live.connect();
-    let dir = a.realpath(&live.dir).unwrap();
+    let dir = live.scratch("refuses", &mut a);
     let name = a
         .write_new_sibling(&v1, &dir, &format!("conflict-{}.txt", random_hex()))
         .unwrap();
@@ -116,6 +154,7 @@ fn sftp_write_atomic_refuses_a_changed_remote() {
     assert!(left.is_empty(), "temp files left: {left:?}");
     println!("no temp files left in {dir}");
     a.remove(&target).unwrap();
+    live.done(&dir);
 }
 
 /// W2: a rewrite with the same size inside the same second has the same `(size, mtime)` over
@@ -127,7 +166,7 @@ fn sftp_same_size_same_second_rewrite_is_a_conflict() {
     let local = tempfile::tempdir().unwrap();
     let mut a = live.connect();
     let mut b = live.connect();
-    let dir = a.realpath(&live.dir).unwrap();
+    let dir = live.scratch("same-second", &mut a);
     let base = local_file(local.path(), "base", "aaaa\n");
     let other = local_file(local.path(), "other", "bbbb\n");
     let copy = local.path().join("copy");
@@ -170,6 +209,7 @@ fn sftp_same_size_same_second_rewrite_is_a_conflict() {
     assert!(left.is_empty(), "temp files left: {left:?}");
     println!("remote kept the other writer's bytes; no temp files left");
     a.remove(&target).unwrap();
+    live.done(&dir);
 }
 
 /// W1: publishing a sibling never replaces anything, also with two connections racing for the
@@ -181,7 +221,7 @@ fn sftp_sibling_publish_never_replaces() {
     let Some(live) = live() else { return };
     let local = tempfile::tempdir().unwrap();
     let mut a = live.connect();
-    let dir = a.realpath(&live.dir).unwrap();
+    let dir = live.scratch("sibling", &mut a);
     let wanted = format!("w1-{}.cut-1-3.mp4", random_hex());
     let theirs = local_file(local.path(), "theirs", "already here\n");
     assert_eq!(a.write_new_sibling(&theirs, &dir, &wanted).unwrap(), wanted);
@@ -229,4 +269,41 @@ fn sftp_sibling_publish_never_replaces() {
         a.remove(&join(&dir, name)).unwrap();
     }
     a.remove(&join(&dir, &wanted)).unwrap();
+    live.done(&dir);
+}
+
+/// A setuid target keeps its set-id bit over SFTP: the server clears it when the temp is
+/// written, and sopen sets the full mode again through the still-open handle (fsetstat) before
+/// the rename.
+#[test]
+#[ignore = "needs SOPEN_TEST_SFTP_HOST=<ssh alias> and an existing SOPEN_TEST_SFTP_DIR"]
+fn sftp_set_id_bits_survive_the_write() {
+    let Some(live) = live() else { return };
+    let local = tempfile::tempdir().unwrap();
+    let v1 = local_file(local.path(), "v1", "one\n");
+    let mut fs = live.connect();
+    let dir = live.scratch("setid", &mut fs);
+    let name = fs
+        .write_new_sibling(&v1, &dir, &format!("tool-{}", random_hex()))
+        .unwrap();
+    let target = join(&dir, &name);
+    fs.set_mode(&target, 0o4755).unwrap();
+    let at = fs.stat(&target).unwrap();
+    assert_eq!(
+        at.mode & 0o7777,
+        0o4755,
+        "the server keeps setuid on a plain chmod"
+    );
+    let v2 = local_file(local.path(), "v2", "two\n");
+    let saved = fs.write_atomic(&v2, &target, at.fingerprint()).unwrap();
+    let WriteOutcome::Written { now, notes } = saved else {
+        panic!("expected Written, got {saved:?}")
+    };
+    assert!(notes.is_empty(), "{notes:?}");
+    assert_eq!(now.mode & 0o7777, 0o4755);
+    assert_eq!(fs.stat(&target).unwrap().mode & 0o7777, 0o4755);
+    println!("setuid write_atomic -> Written, mode {:o}", now.mode);
+    assert!(temps(&mut fs, &dir).is_empty());
+    fs.remove(&target).unwrap();
+    live.done(&dir);
 }

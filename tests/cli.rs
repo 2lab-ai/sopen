@@ -223,7 +223,7 @@ fn image_autosave_backs_up_then_overwrites() {
     assert_ne!(after, before);
     let saved = image::load_from_memory(&after).unwrap();
     assert_eq!((saved.width(), saved.height()), (48, 32));
-    let backups = files(&tmp.path().join("cache/backup"));
+    let backups = files(&sopen::cache::backup_root(&tmp.path().join("cache")));
     assert_eq!(backups.len(), 1, "{backups:?}");
     assert_eq!(std::fs::read(&backups[0]).unwrap(), before);
     let log = std::fs::read_to_string(tmp.path().join("state/usage.jsonl")).unwrap();
@@ -261,7 +261,7 @@ fn image_autosave_refuses_a_file_changed_meanwhile() {
     assert_eq!(status.code(), Some(3), "{err}");
     assert!(err.contains("changed since it was opened"), "{err}");
     assert_eq!(std::fs::read(&png).unwrap(), b"another writer");
-    let kept: Vec<_> = files(&tmp.path().join("cache/edits"))
+    let kept: Vec<_> = files(&sopen::cache::edits_root(&tmp.path().join("cache")))
         .into_iter()
         .filter(|p| p.to_string_lossy().contains(".conflict-"))
         .collect();

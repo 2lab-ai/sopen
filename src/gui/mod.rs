@@ -8,6 +8,8 @@ pub mod image;
 pub mod media;
 pub mod playback;
 mod select;
+#[cfg(test)]
+pub(crate) mod testkit;
 
 pub use select::{fit, Map, Selection};
 
@@ -120,18 +122,27 @@ impl Outcome {
 }
 
 /// A local file next to `cached` that keeps the stem and the extension (so it still opens by
-/// double-click): `<stem>.<tag>-<UTC stamp>.<ext>`.
-pub fn keep_path(cached: &Path, tag: &str, at: SystemTime) -> PathBuf {
+/// double-click): `<stem>.<tag>-<UTC stamp>-<unique>.<ext>`.
+pub fn keep_path(cached: &Path, tag: &str, at: SystemTime, unique: &str) -> PathBuf {
     let stem = cached
         .file_stem()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_default();
     let stamp = crate::cache::utc_stamp(at);
     let name = match cached.extension() {
-        Some(ext) => format!("{stem}.{tag}-{stamp}.{}", ext.to_string_lossy()),
-        None => format!("{stem}.{tag}-{stamp}"),
+        Some(ext) => format!("{stem}.{tag}-{stamp}-{unique}.{}", ext.to_string_lossy()),
+        None => format!("{stem}.{tag}-{stamp}-{unique}"),
     };
     cached.with_file_name(name)
+}
+
+/// Creates a new owner-only file at a [`keep_path`] with a random `unique` part (another one
+/// when the name is taken) and returns it open.
+pub fn create_keep(cached: &Path, tag: &str) -> Result<(PathBuf, std::fs::File)> {
+    crate::cache::create_unique(|_| {
+        let random = crate::remote::random_hex();
+        keep_path(cached, tag, SystemTime::now(), &random[..8])
+    })
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -214,6 +225,9 @@ pub struct Hooks {
     /// `SOPEN_EXPORT_HOLD_MS`: the media window starts an Export on open and holds it, at its
     /// first progress report at or past 30 %, for this long (a screenshot mid-export).
     pub export_hold: Option<Duration>,
+    /// `SOPEN_WINDOW_SIZE=<w>x<h>`: open the window at this size in points (layout receipts on
+    /// a narrow window).
+    pub window_size: Option<[f32; 2]>,
 }
 
 impl Hooks {
@@ -233,6 +247,16 @@ impl Hooks {
         };
         let save_delay = millis("SOPEN_AUTOSAVE_DELAY_MS")?;
         let export_hold = millis("SOPEN_EXPORT_HOLD_MS")?;
+        let window_size = match std::env::var("SOPEN_WINDOW_SIZE") {
+            Ok(text) => {
+                let bad = || anyhow!("SOPEN_WINDOW_SIZE must be <width>x<height> (got '{text}')");
+                let (w, h) = text.split_once('x').ok_or_else(bad)?;
+                let (w, h): (f32, f32) =
+                    (w.parse().map_err(|_| bad())?, h.parse().map_err(|_| bad())?);
+                Some([w, h])
+            }
+            Err(_) => None,
+        };
         Ok(Self {
             screenshot: std::env::var_os("SOPEN_SCREENSHOT")
                 .filter(|p| !p.is_empty())
@@ -242,6 +266,7 @@ impl Hooks {
             autoexport: flag("SOPEN_AUTOEXPORT"),
             save_delay,
             export_hold,
+            window_size,
         })
     }
 
@@ -467,8 +492,12 @@ pub fn run_window<W: Window + 'static>(
             viewport: egui::ViewportBuilder::default()
                 .with_title(title)
                 .with_app_id("sopen")
-                .with_inner_size(size)
-                .with_min_inner_size([480.0, 320.0])
+                .with_inner_size(hooks.window_size.unwrap_or(size))
+                .with_min_inner_size(
+                    hooks
+                        .window_size
+                        .map_or([480.0, 320.0], |[w, h]| [w.min(480.0), h.min(320.0)]),
+                )
                 .with_active(true),
             renderer,
             centered: true,
@@ -531,12 +560,32 @@ impl Status {
         }
     }
 
+    /// On one line, cut to the room left (the full text on hover): a status bar must keep its
+    /// height, or the picture above it moves under the pointer.
     pub fn show(&self, ui: &mut egui::Ui) {
-        if self.error {
-            ui.colored_label(ui.visuals().error_fg_color, &self.text);
+        let color = if self.error {
+            ui.visuals().error_fg_color
         } else {
-            ui.label(&self.text);
-        }
+            ui.visuals().text_color()
+        };
+        one_line(ui, &self.text, color);
+    }
+}
+
+/// A label that never wraps: text longer than the room left is cut with "…" and shown whole
+/// on hover. Only for text that may be cut — never for what is lost (see [`disclosures`]).
+pub fn one_line(ui: &mut egui::Ui, text: &str, color: egui::Color32) {
+    ui.add(egui::Label::new(egui::RichText::new(text).color(color)).truncate());
+}
+
+/// What the owner must read whole — what Save / Export will not keep, a refused write, where
+/// the edit went, what closing during a write does — in its own rows that wrap instead of
+/// cutting. Their text changes only on open, when a write reports and when closing is asked
+/// for during a write; a change waits while the primary button is down, so they never move the
+/// picture under a drag.
+pub fn disclosures(ui: &mut egui::Ui, lines: &[(String, egui::Color32)]) {
+    for (text, color) in lines {
+        ui.add(egui::Label::new(egui::RichText::new(text).color(*color)).wrap());
     }
 }
 
@@ -599,12 +648,12 @@ mod tests {
     fn keep_path_keeps_the_extension() {
         let at = SystemTime::UNIX_EPOCH + Duration::from_secs(1_794_389_076);
         assert_eq!(
-            keep_path(Path::new("/c/box/tmp/shot.png"), "conflict", at),
-            PathBuf::from("/c/box/tmp/shot.conflict-20261111T092436Z.png")
+            keep_path(Path::new("/c/box/tmp/shot.png"), "conflict", at, "1a2b"),
+            PathBuf::from("/c/box/tmp/shot.conflict-20261111T092436Z-1a2b.png")
         );
         assert_eq!(
-            keep_path(Path::new("/c/box/README"), "unsaved", at),
-            PathBuf::from("/c/box/README.unsaved-20261111T092436Z")
+            keep_path(Path::new("/c/box/README"), "unsaved", at, "1a2b"),
+            PathBuf::from("/c/box/README.unsaved-20261111T092436Z-1a2b")
         );
     }
 }

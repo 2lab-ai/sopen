@@ -843,4 +843,7 @@ pub fn cut_name(stem: &str, in_s: f64, out_s: f64, ext: &str) -> String {
 }
 
 #[cfg(test)]
+pub(crate) mod fixtures;
+
+#[cfg(test)]
 mod tests;
