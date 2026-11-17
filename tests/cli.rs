@@ -76,6 +76,11 @@ fn other_files_save_to_a_path_or_cancel_and_log_usage() {
         format!("saved {}", dest.display())
     );
     assert_eq!(std::fs::read(&dest).unwrap(), body);
+    assert_eq!(
+        files(&out_dir),
+        std::slice::from_ref(&dest),
+        "only the saved file (no staging left)"
+    );
     let log = usage_lines(tmp.path());
     assert_eq!(log[0]["kind"], "other");
     assert_eq!(log[0]["ext"], "bin");
@@ -114,7 +119,7 @@ fn other_files_save_to_a_path_or_cancel_and_log_usage() {
     );
     assert!(out.status.success(), "{}", text(&out.stderr));
     assert!(
-        text(&out.stderr).contains("nothing was downloaded"),
+        text(&out.stderr).contains("sopen: cancelled"),
         "{}",
         text(&out.stderr)
     );
@@ -265,6 +270,15 @@ fn hex_autosave_refuses_a_file_changed_meanwhile() {
     assert_eq!(status.code(), Some(3), "{err}");
     assert!(err.contains("changed since it was opened"), "{err}");
     assert_eq!(std::fs::read(&blob).unwrap(), b"another writer");
+    // The edits are listed where the refusal says: one `offset: bytes` line.
+    let lists: Vec<_> = files(&sopen::cache::edits_root(&tmp.path().join("cache")))
+        .into_iter()
+        .filter(|p| p.to_string_lossy().contains("blob.bin.hexpatch-"))
+        .collect();
+    assert_eq!(lists.len(), 1, "{lists:?}");
+    assert!(err.contains(lists[0].to_str().unwrap()), "{err}");
+    let text = std::fs::read_to_string(&lists[0]).unwrap();
+    assert!(text.lines().any(|l| l == "0x0: FF"), "{text}");
 }
 
 #[test]
@@ -394,11 +408,18 @@ fn small_png(path: &Path) {
     img.save(path).unwrap();
 }
 
-/// Files under `dir`, recursively.
+/// Files under `dir`, recursively; an absent `dir` has none, any other error fails the test.
 fn files(dir: &Path) -> Vec<std::path::PathBuf> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+        Err(e) => panic!("cannot list {}: {e}", dir.display()),
+    };
     let mut out = Vec::new();
-    for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
-        let p = entry.path();
+    for entry in entries {
+        let p = entry
+            .unwrap_or_else(|e| panic!("cannot list {}: {e}", dir.display()))
+            .path();
         if p.is_dir() {
             out.extend(files(&p));
         } else {
@@ -955,7 +976,7 @@ fn default_target_from_config_or_env_and_the_flags_beat_both() {
     let out = sopen(tmp.path(), &["--here", blob.to_str().unwrap()], &here);
     assert!(out.status.success(), "{}", text(&out.stderr));
     assert!(
-        text(&out.stderr).contains("cancelled; nothing was downloaded"),
+        text(&out.stderr).contains("sopen: cancelled"),
         "{}",
         text(&out.stderr)
     );

@@ -210,28 +210,43 @@ symlink keeps its link). A new file is readable by its owner only (0600); a repl
 
 **The dialog.** A file of kind "other" (§3) opens a small sopen window titled `host:/abs` before
 anything is fetched, from the stat alone: the file's name, its size (human and exact), and its type
-when the extension says it cheaply (`ZIP archive`, `PDF document`, …). Buttons: "Open in hex editor"
-(the default — Enter), "Save to…" and "Cancel" (Esc, or closing the window: nothing is downloaded).
-Under them, the path "Save to…" saves to: `<download folder>/<name>` (the platform's download folder,
-else the home folder; `~` for the home folder), or the next free `<stem>-N<ext>` when that name is
-taken (the dialog says so). "Browse…" opens the system's save dialog (AppKit on macOS,
-xdg-desktop-portal on Linux — loaded at runtime, nothing linked); choosing a path there saves to it.
-When it gives no path — cancelled, or no system dialog available — one line says the path field
-still works. Enter in the path field saves there; it never opens the hex editor. Enter and Esc do
-nothing during a transfer.
+when the extension says it cheaply (`ZIP archive`, `PDF document`, …). The window is as tall as its
+content. Buttons: "Open in hex editor" (the default — Enter), "Save to…" and "Cancel" (Esc, or
+closing the window: nothing is downloaded). Under them, the path "Save to…" saves to:
+`<download folder>/<name>` (the platform's download folder, else the home folder; `~` for the home
+folder), or the next free `<stem>-N<ext>` when that name is taken (the dialog says so). "Browse…"
+opens the system's save dialog (AppKit on macOS, xdg-desktop-portal on Linux — loaded at runtime,
+nothing linked); choosing a path there saves to it. When it gives no path — cancelled, or no system
+dialog available — one line says the path field still works. A one-line hint says what Enter and
+Esc do, and — only when something would be downloaded — that nothing is until a choice is made.
+The exceptions: Enter in the path field saves there (it never opens the hex editor; when that save
+is refused the field keeps the keyboard, so the next Enter saves again); during a transfer Enter and
+Esc do nothing and closing waits for it.
 
 - Hex: the file is fetched into the cache as every fetch is (claimed, recorded, an earlier copy's
   unsaved edits moved aside first — §5), with the progress in the dialog; then the same window
-  becomes the hex window. A local file is read in place.
-- Save to…: the file is downloaded straight to the chosen path, which is created exclusively — never
-  over, or through, anything already there (a file, a link). An existing path is not replaced: the
-  dialog says so and puts the next free `<stem>-N<ext>` in the field; "Save to…" again saves there.
-  The new file gets the mode any new file there gets (not the cache's 0600). A file that changes
-  during the download is not saved, and the partial file this download created is removed. Then
-  "saved <path>" shows a moment, the same line is printed on stdout, and the window closes. A local
-  file (or one already in the cache) is copied the same way.
+  becomes the hex window. A local file is read in place. Every step that can fail (the fetch,
+  opening the copy) comes before the connection is handed to the hex window: after a failure the
+  dialog is as it was, for a retry or "Save to…" (from the copy already fetched).
+- Save to…: bytes are never put under the chosen name before they are complete, and never over, or
+  through, anything already there (a file, a link). A taken name is refused before anything moves.
+  The bytes go into a staging file `.<name>.sopen-<random>.part` in the same folder (created
+  exclusively, owner-only while it fills), which is flushed to disk, given the mode any new file
+  there gets (not the cache's 0600), and published by a hard link to the chosen name — which fails if
+  anything is there — then unlinked. When safe no-replace publication is unavailable or fails,
+  the save fails and names the complete staging file it keeps; it never copies into a final name.
+  A name taken at
+  the last moment is refused like any taken name: the dialog says so and puts the next free
+  `<stem>-N<ext>` in the field; "Save to…" again saves there. Cleanup only ever removes the staging
+  file (a failure to remove it is said); an interrupted save leaves only that hidden file. A download
+  whose source changes meanwhile is not saved — a best-effort check: the remote's size and mtime
+  after the transfer, and the bytes received, against its stat before. A local file (or the cached
+  copy) is copied the same way, checked by its handle: size, mtime, change time and bytes copied.
+  Then "saved <path>" shows a moment, the same line is printed on stdout, and the window closes —
+  unless there are notes to read (a Close button then).
 - Closing the window during a fetch or a download does not cut it: the window says it closes when
-  the transfer is done, and does.
+  the transfer is done, and does. A transfer whose worker ends without a result is a final, visible
+  failure (the window says so and offers only Close; a close asked for meanwhile closes it).
 
 `sopen --hex SOURCE` opens any file (any kind; not a folder) straight in the hex window — no dialog;
 a remote one is fetched first, with the progress on the terminal. `--hex` and `--app` are exclusive.
@@ -239,41 +254,56 @@ With no display (Linux, neither `DISPLAY` nor `WAYLAND_DISPLAY`) the dialog and 
 fetching the file and printing its local path, with one line on stderr saying why.
 
 **The hex window** has the image and media windows' look and layout rules: a one-line toolbar on
-top, a one-line status bar at the bottom, the disclosure rows above it, and nothing changes size
-while you work (the row grid never moves when the status changes).
+top, a one-line status bar at the bottom, nothing that changes size while you work. The grid's top
+and every row's position never move: not when the status changes, and not when a report arrives —
+the disclosure rows (what must be read whole) sit between the grid and the status bar, appear only
+once the primary button is up, and take rows off the grid's bottom.
 
 - Rows of 16 bytes: the offset (hex, as many digits as the file size needs, at least 4), the 16 bytes
   in hex grouped 8 + 8, and the ASCII column (non-printable bytes as `.`). Only the rows on screen are
-  read and painted: the file is read through a small page cache (64 pages of 4 KiB), never whole, so
-  a file of any size scrolls the same. The grid has its own scroll bar (row positions are kept as
-  64-bit row numbers, not as pixels).
-- The cursor is on a byte, shown in both columns (filled in the column that types). Arrows,
-  PgUp/PgDn, Home/End (start / end of the row), Cmd/Ctrl+Home/End (start / end of the file), a click
-  places it (in the column clicked), Tab switches the column, the wheel scrolls (three rows a line).
-  Cmd/Ctrl+G = the "Go to" field in the toolbar: an offset as `0x…` (hex) or decimal, Enter goes
-  there.
+  read and painted: the file is read through a small page cache (at most 64 pages of 4 KiB; the least
+  recently used goes first), never whole, so a file of any size scrolls the same. The grid has its
+  own scroll bar (row positions are kept as 64-bit row numbers, not as pixels).
+- The cursor is on a byte, shown in both columns (filled in the column that types, outlined in the
+  other). Arrows, PgUp/PgDn, Home/End (start / end of the row), Cmd/Ctrl+Home/End (start / end of the
+  file), a click places it (in the column clicked), Tab switches the column, the wheel scrolls (three
+  rows a line). Cmd/Ctrl+G = the "Go to" field in the toolbar: an offset as `0x…` (hex) or decimal,
+  Enter goes there. Typing goes to exactly one place: the Go to field when it has the keyboard —
+  focused, clicked, or given it by Cmd/Ctrl+G in that same frame — else the bytes.
 - Editing only overwrites; the file's size never changes. In the hex column a hex digit overwrites
   the high nibble, the next one the low nibble, and the cursor moves on (the two digits are one undo
-  step); in the ASCII column a printable ASCII character overwrites the byte. Edits are a sparse map
-  offset → byte over the bytes as opened — the cached copy is never written; a byte typed back to its
-  original value is no longer a change. Changed bytes are marked in both columns. Undo/Redo:
-  Cmd/Ctrl+Z, Shift+Cmd/Ctrl+Z.
+  step, also at the undo bound); in the ASCII column a printable ASCII character overwrites the
+  byte. Edits are a sparse map offset → byte over the bytes as opened — the cached copy is never
+  written; a byte typed back to its original value is no longer a change. "Unsaved" is by content:
+  edits undone back to what the file holds (as opened, or as last saved) are not unsaved. Changed
+  bytes are marked in both columns. Undo/Redo: Cmd/Ctrl+Z, Shift+Cmd/Ctrl+Z.
 - Status bar: the cursor's offset (hex and decimal), its byte (hex, decimal, the character when
   printable), the file's size (the exact count on hover), "N bytes changed", "unsaved", and the
   last result.
-- Save (Cmd/Ctrl+S) is image Save's contract (§5): the bytes as opened must still be what was opened
-  (refused otherwise — nothing written); a local backup of the original under `<cache>/.backup`
-  (path printed, once per session); a staged copy of the original with the edits applied, created
-  exclusively and owner-only under `<cache>/.edits`; then the conflict-checked overwrite. A refused
-  or failed save keeps the staged edit (`<stem>.conflict-<stamp>-<random><ext>` when refused) and
-  names it in the disclosure rows; the remote is untouched. Save copy (Shift+Cmd/Ctrl+S) publishes
-  `<stem>.edited<ext>` next to the original (`-N` when taken), never replacing anything, as image
-  Save copy does. The bytes are read through the handle opened with the file, never again by path,
-  so after a Save renames a new file over a local path the window still edits the bytes as opened.
+- Save (Cmd/Ctrl+S) is image Save's contract (§5), from one pass over the bytes as opened: the
+  same reads write the local backup of the original under `<cache>/.backup` (the session's first
+  Save; path printed), the staged copy with the edits applied (created exclusively and owner-only
+  under `<cache>/.edits`), and their SHA-256. The handle's size, mtime, change time and inode are
+  compared with what was opened before the pass and with before after it; any difference and the
+  save is refused with nothing staged or backed up left — the edits are written to
+  `<name>.hexpatch-<stamp>.txt` among the edits (owner-only; a header naming the source as opened,
+  then one `offset: bytes` line per run of changed bytes), named in the disclosure rows. Then the
+  conflict-checked overwrite; a local file opened in place has no hash from a fetch, so the pass's
+  hash is its baseline (the target's content is checked against it up to 256 MiB). A refused or
+  failed overwrite keeps the staged edit (`<stem>.conflict-<stamp>-<random><ext>` when refused) and
+  names it in the disclosure rows; the remote is untouched. Save copy (Shift+Cmd/Ctrl+S) is staged by
+  the same pass (refused, and the edits listed, the same way) and publishes `<stem>.edited<ext>` next
+  to the original (`-N` when taken), never replacing anything, as image Save copy does. The bytes are
+  read through the handle opened with the file, never again by path, so after a Save renames a new
+  file over a local path the window still edits the bytes as opened. A save whose worker ends
+  without a result is a visible failure; the edits stay and the window stays usable.
 - Where the server cannot replace a file in one step (`posix-rename@openssh.com`), Save is off with
   the reason on hover and in the rows; editing and Save copy work — the image window's rule.
 - Closing with unsaved edits asks: Save (Save copy where Save is off) / Discard / Cancel. Closing
-  during a save waits for it.
+  during a save waits for it. Either way the window closes only when the save landed with nothing
+  to read and nothing unsaved — a finished save is taken after the frame's input, so an edit or an
+  undo in that frame counts; one that did not land, or landed with notes (the remote changed right
+  after), keeps the window open; newer edits ask again. Once closing is decided nothing edits.
 
 ## 7. Media window (A4, A5)
 

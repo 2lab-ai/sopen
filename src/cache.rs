@@ -295,6 +295,63 @@ fn claim_with(
     })
 }
 
+/// A remote file fetched into this session's cached copy.
+pub struct Fetched {
+    /// The copy, locked for as long as this lives: another session gets a copy of its own.
+    pub claim: Claim,
+    pub at: crate::remote::Stat,
+    /// Where earlier copies' unsaved edits went (already printed), for a window to repeat.
+    pub notices: Vec<String>,
+}
+
+/// Claims the cached copy of `abs` on `host` for this session (a line says when it is a copy
+/// of its own), moves an earlier copy's unsaved edits aside (said as known), fetches with
+/// `progress` (`(bytes done, total)`), and records what the copy now holds. Returns the fetch
+/// and how long it took in milliseconds. Every fetch into the cache goes through here, so no
+/// session replaces or moves a copy another one is editing.
+pub fn fetch_claimed(
+    fs: &mut dyn crate::remote::RemoteFs,
+    host: &str,
+    abs: &str,
+    cache: &Path,
+    progress: &mut dyn FnMut(u64, u64),
+) -> Result<(Fetched, u64)> {
+    let claim = claim(cache, host, abs)?;
+    if let Some(note) = &claim.note {
+        eprintln!("sopen: {note}");
+    }
+    let mut notices = Vec::new();
+    // Said as known: a copy that differs from what was recorded has unsaved edits; one with no
+    // record may or may not.
+    match claim.set_aside_unsaved()? {
+        Some(Kept { path, edited: true }) => notices.push(format!(
+            "the previous copy had unsaved edits; kept them at {}",
+            path.display()
+        )),
+        Some(Kept {
+            path,
+            edited: false,
+        }) => notices.push(format!(
+            "no record of what was fetched for {}; kept it at {} in case it holds edits",
+            claim.local.display(),
+            path.display()
+        )),
+        None => {}
+    }
+    for line in &notices {
+        eprintln!("sopen: {line}");
+    }
+    let started = std::time::Instant::now();
+    let at = fs.fetch(abs, &claim.local, progress)?;
+    if let Some(sha) = &at.sha256 {
+        if let Err(e) = claim.record(sha) {
+            crate::debug!("not recorded: {e:#}");
+        }
+    }
+    let ms = started.elapsed().as_millis() as u64;
+    Ok((Fetched { claim, at, notices }, ms))
+}
+
 /// The session lock file of the cached copy `local`, open (created owner-only if new). Never
 /// removed: removing it would let two sessions lock two different files.
 fn open_lock(cache: &Path, local: &Path) -> Result<(File, PathBuf)> {

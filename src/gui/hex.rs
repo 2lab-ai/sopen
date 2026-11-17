@@ -199,14 +199,17 @@ pub struct HexDoc {
     patches: BTreeMap<u64, u8>,
     undo: VecDeque<Step>,
     redo: Vec<Step>,
+    /// Undo steps kept (the oldest goes first).
+    undo_cap: usize,
     /// The byte whose high nibble was just typed (its step is the last one): the low nibble
     /// typed next joins that step, so a byte typed as two digits undoes as one.
     open_step: Option<u64>,
-    /// Bumped by every change; `saved_rev` is the revision in the original file, `copied_rev`
-    /// the one last written by Save copy.
+    /// Bumped by every change (a repaint key; what is saved is compared by content).
     rev: u64,
-    saved_rev: u64,
-    copied_rev: u64,
+    /// The changes the original file holds now (empty until a Save lands), and the ones the
+    /// last Save copy holds.
+    saved: BTreeMap<u64, u8>,
+    copied: Option<BTreeMap<u64, u8>>,
 }
 
 impl HexDoc {
@@ -224,11 +227,23 @@ impl HexDoc {
             patches: BTreeMap::new(),
             undo: VecDeque::new(),
             redo: Vec::new(),
+            undo_cap: UNDO_STEPS,
             open_step: None,
             rev: 0,
-            saved_rev: 0,
-            copied_rev: 0,
+            saved: BTreeMap::new(),
+            copied: None,
         }
+    }
+
+    /// A smaller undo bound (tests reach it without a hundred thousand edits).
+    #[cfg(test)]
+    pub(crate) fn set_undo_cap(&mut self, cap: usize) {
+        self.undo_cap = cap;
+    }
+
+    /// Undo steps held now.
+    pub fn undo_len(&self) -> usize {
+        self.undo.len()
     }
 
     pub fn size(&self) -> u64 {
@@ -296,14 +311,18 @@ impl HexDoc {
     /// for the undo). Writing a byte's original value drops it from the changes. `false` past
     /// the end or where the file cannot be read.
     pub fn set(&mut self, at: u64, value: u8, cursor: Cursor) -> bool {
+        self.change(at, value, cursor).is_some()
+    }
+
+    /// [`HexDoc::set`], saying whether it made an undo step (`Some(false)`: the byte already
+    /// held `value`; `None`: past the end or unreadable).
+    fn change(&mut self, at: u64, value: u8, cursor: Cursor) -> Option<bool> {
         self.open_step = None;
-        let Some(original) = self.pages.byte(at) else {
-            return false;
-        };
+        let original = self.pages.byte(at)?;
         let before = self.patches.get(&at).copied();
         let after = (value != original).then_some(value);
         if before == after {
-            return true;
+            return Some(false);
         }
         self.put(at, after);
         self.undo.push_back(Step {
@@ -312,12 +331,12 @@ impl HexDoc {
             after,
             cursor,
         });
-        if self.undo.len() > UNDO_STEPS {
+        while self.undo.len() > self.undo_cap.max(1) {
             self.undo.pop_front();
         }
         self.redo.clear();
         self.rev += 1;
-        true
+        Some(true)
     }
 
     /// The low nibble typed right after the high one: into the high nibble's step when it
@@ -362,12 +381,11 @@ impl HexDoc {
                     self.set_low(at, (current & 0xf0) | digit, cursor)
                         .then_some(next)
                 } else {
-                    let steps = self.undo.len();
-                    let done = self.set(at, (digit << 4) | (current & 0x0f), cursor);
-                    if done && self.undo.len() > steps {
+                    let made_step = self.change(at, (digit << 4) | (current & 0x0f), cursor)?;
+                    if made_step {
                         self.open_step = Some(at);
                     }
-                    done.then_some(Cursor {
+                    Some(Cursor {
                         at,
                         low: true,
                         ..cursor
@@ -423,22 +441,26 @@ impl HexDoc {
         self.rev
     }
 
-    /// The state differs from the original file (what Save would write).
+    /// The bytes differ from what the original file holds now (what Save would write) — by
+    /// content: an edit undone, or a byte typed back to its value, is no change.
     pub fn dirty(&self) -> bool {
-        self.rev != self.saved_rev
+        self.patches != self.saved
     }
 
-    /// The state is written nowhere — neither the original nor a Save copy (the close prompt).
+    /// The bytes are written nowhere — neither the original nor the last Save copy (the close
+    /// prompt).
     pub fn unsaved(&self) -> bool {
-        self.dirty() && self.rev != self.copied_rev
+        self.dirty() && self.copied.as_ref() != Some(&self.patches)
     }
 
-    pub fn mark_saved(&mut self, rev: u64) {
-        self.saved_rev = rev;
+    /// A Save of `changes` landed: the original file holds them now.
+    pub fn mark_saved(&mut self, changes: BTreeMap<u64, u8>) {
+        self.saved = changes;
     }
 
-    pub fn mark_copied(&mut self, rev: u64) {
-        self.copied_rev = rev;
+    /// A Save copy of `changes` landed.
+    pub fn mark_copied(&mut self, changes: BTreeMap<u64, u8>) {
+        self.copied = Some(changes);
     }
 }
 
@@ -479,6 +501,68 @@ fn apply_state(doc: &mut HexDoc, hooks: &Hooks) -> Result<Cursor> {
 // ---------------------------------------------------------------------------------------------
 // The write side.
 
+/// What a file's handle says about it: a difference means its bytes may differ.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Ident {
+    len: u64,
+    mtime: Option<SystemTime>,
+    ctime: (i64, i64),
+    ino: u64,
+}
+
+impl Ident {
+    fn of(file: &File, path: &Path) -> Result<Self> {
+        use std::os::unix::fs::MetadataExt;
+        let meta = file
+            .metadata()
+            .with_context(|| format!("cannot stat {}", path.display()))?;
+        Ok(Self {
+            len: meta.len(),
+            mtime: meta.modified().ok(),
+            ctime: (meta.ctime(), meta.ctime_nsec()),
+            ino: meta.ino(),
+        })
+    }
+
+    /// How `now` differs from `self`, for a message.
+    fn change(&self, now: &Ident) -> String {
+        if now.len != self.len {
+            format!("{} bytes then, {} now", grouped(self.len), grouped(now.len))
+        } else if now.mtime != self.mtime {
+            "its modification time changed".to_string()
+        } else {
+            "it was written to or replaced (its change time moved)".to_string()
+        }
+    }
+}
+
+/// The local file a hex window reads, opened: the cached copy or the local file itself, by its
+/// handle. Opening it is the only step of opening a hex window that can fail on the bytes, so
+/// it comes before anything is handed over (the connection, the claim).
+pub struct Base {
+    file: File,
+    path: PathBuf,
+    opened: Ident,
+}
+
+impl Base {
+    pub fn open(path: &Path) -> Result<Self> {
+        let file = File::open(path).with_context(|| format!("cannot open {}", path.display()))?;
+        let meta = file
+            .metadata()
+            .with_context(|| format!("cannot stat {}", path.display()))?;
+        if !meta.is_file() {
+            bail!("{} is not a regular file", path.display());
+        }
+        let opened = Ident::of(&file, path)?;
+        Ok(Self {
+            file,
+            path: path.to_path_buf(),
+            opened,
+        })
+    }
+}
+
 /// The opened file: where it lives, the local file its bytes are read from, and the local places
 /// sopen writes to.
 pub struct HexFile {
@@ -488,8 +572,8 @@ pub struct HexFile {
     base: Arc<File>,
     /// Where `base` was opened: the session's cached copy, or the local file itself.
     base_path: PathBuf,
-    /// `base`'s size and mtime when it was opened.
-    opened: (u64, Option<SystemTime>),
+    /// `base` when it was opened (renewed after a Save of our own lands).
+    opened: Ident,
     /// The session's claim on the cached copy, held while the file is open.
     _claim: Option<crate::cache::Claim>,
     /// Staged edits and refused ones: `<cache>/.edits/<host>/<abs>`.
@@ -498,6 +582,12 @@ pub struct HexFile {
     cache_root: PathBuf,
     /// Set by the first successful backup; later saves of the same session keep it.
     backup: Option<PathBuf>,
+    /// Called between the pre-pass observations (tests: a writer in that gap).
+    #[cfg(test)]
+    pub(crate) pre_pass_hook: Option<Box<dyn FnMut() + Send>>,
+    /// Called after each chunk of a save's pass over the bytes (tests: a writer in the middle).
+    #[cfg(test)]
+    pub(crate) chunk_hook: Option<Box<dyn FnMut(u64) + Send>>,
 }
 
 /// Result of one Save.
@@ -509,34 +599,32 @@ pub enum Saved {
         backup: PathBuf,
         notes: Vec<String>,
     },
-    /// Nothing was written: the file changed since it was opened. `kept` = where the edited
-    /// copy went, when one had been staged.
+    /// Nothing was written: the file changed since it was opened. `kept` = where the edits
+    /// went: the staged copy, or (when the bytes as opened changed) a list of the changes.
     Refused {
         message: String,
         kept: Option<PathBuf>,
     },
 }
 
-/// Copies `len` bytes of `src` into `out` with `patches` applied, a megabyte at a time.
-fn copy_patched(
-    src: &File,
-    len: u64,
-    out: &mut File,
-    patches: &BTreeMap<u64, u8>,
-) -> std::io::Result<()> {
-    let mut buf = vec![0u8; 1 << 20];
-    let mut at = 0u64;
-    while at < len {
-        let n = (len - at).min(buf.len() as u64) as usize;
-        src.read_exact_at(&mut buf[..n], at)?;
-        for (&off, &b) in patches.range(at..at + n as u64) {
-            buf[(off - at) as usize] = b;
-        }
-        out.write_all(&buf[..n])?;
-        at += n as u64;
-    }
-    out.flush()
+/// A save's pass over the bytes as opened.
+struct Pass {
+    /// The bytes with the changes applied, in a new owner-only file.
+    stage: PathBuf,
+    /// The bytes as opened, when the pass wrote the backup too.
+    backup: Option<PathBuf>,
+    /// SHA-256 of the bytes as opened.
+    sha256: [u8; 32],
 }
+
+enum PassResult {
+    Done(Pass),
+    /// The bytes as opened changed (before or during the pass); nothing is kept but this.
+    Changed(String),
+}
+
+/// Bytes read per step of a save's pass.
+const CHUNK: usize = 1 << 20;
 
 impl HexFile {
     /// Opens `base` (the cached copy, or the local file itself) for `origin`. `claim` is held
@@ -547,29 +635,36 @@ impl HexFile {
         claim: Option<crate::cache::Claim>,
         cache_root: &Path,
     ) -> Result<Self> {
-        let file = File::open(base).with_context(|| format!("cannot open {}", base.display()))?;
-        let meta = file
-            .metadata()
-            .with_context(|| format!("cannot stat {}", base.display()))?;
-        if !meta.is_file() {
-            bail!("{} is not a regular file", base.display());
-        }
+        Ok(Self::new(origin, Base::open(base)?, claim, cache_root))
+    }
+
+    /// The hex file over an opened `base`; nothing here can fail.
+    pub fn new(
+        origin: Origin,
+        base: Base,
+        claim: Option<crate::cache::Claim>,
+        cache_root: &Path,
+    ) -> Self {
         let edits = crate::cache::edits_path(cache_root, origin.host(), &origin.abs);
-        Ok(Self {
+        Self {
             origin,
-            base: Arc::new(file),
-            base_path: base.to_path_buf(),
-            opened: (meta.len(), meta.modified().ok()),
+            base: Arc::new(base.file),
+            base_path: base.path,
+            opened: base.opened,
             _claim: claim,
             edits,
             cache_root: cache_root.to_path_buf(),
             backup: None,
-        })
+            #[cfg(test)]
+            pre_pass_hook: None,
+            #[cfg(test)]
+            chunk_hook: None,
+        }
     }
 
     /// Bytes in the file as opened.
     pub fn size(&self) -> u64 {
-        self.opened.0
+        self.opened.len
     }
 
     /// The handle the bytes are read through (for [`HexDoc::new`]).
@@ -582,68 +677,189 @@ impl HexFile {
         self.origin.can_replace()
     }
 
-    /// Whether the bytes as opened are still what `base` holds (size and mtime of the handle).
-    fn base_changed(&self) -> Result<Option<String>> {
-        let meta = self
-            .base
-            .metadata()
-            .with_context(|| format!("cannot stat {}", self.base_path.display()))?;
-        if (meta.len(), meta.modified().ok()) == self.opened {
-            return Ok(None);
-        }
-        Ok(Some(format!(
-            "{} changed since it was opened ({} bytes then, {} now); nothing was written",
-            self.base_path.display(),
-            grouped(self.opened.0),
-            grouped(meta.len())
-        )))
-    }
-
-    /// A new owner-only file next to where edits are kept holding the bytes with `patches`
-    /// applied (never over or through an existing file).
-    fn stage(&self, patches: &BTreeMap<u64, u8>, tag: &str) -> Result<PathBuf> {
-        let (path, mut file) = super::create_keep(&self.edits, tag)?;
-        if let Err(e) = copy_patched(&self.base, self.size(), &mut file, patches) {
-            let _ = std::fs::remove_file(&path);
-            return Err(e).with_context(|| format!("cannot write {}", path.display()));
-        }
-        Ok(path)
-    }
-
-    /// The local backup of the original, written once per session before the first overwrite.
-    fn ensure_backup(&mut self) -> Result<PathBuf> {
-        if let Some(path) = &self.backup {
-            return Ok(path.clone());
-        }
+    /// The backup's path: `<cache>/.backup/<host>/<abs>.<stamp>`, `-<random>` added when another
+    /// session's backup from the same second has the name.
+    fn new_backup(&self) -> Result<(PathBuf, File)> {
         let first = crate::cache::backup_path(
             &self.cache_root,
             self.origin.host(),
             &self.origin.abs,
             SystemTime::now(),
         );
-        // Another session's backup from the same second keeps its name: this one adds `-<random>`.
-        let (path, mut file) = crate::cache::create_unique(|attempt| {
+        crate::cache::create_unique(|attempt| {
             if attempt == 0 {
                 return first.clone();
             }
             let mut name = first.file_name().unwrap_or_default().to_os_string();
             name.push(format!("-{}", &crate::remote::random_hex()[..8]));
             first.with_file_name(name)
-        })?;
-        if let Err(e) = copy_patched(&self.base, self.size(), &mut file, &BTreeMap::new()) {
-            let _ = std::fs::remove_file(&path);
-            return Err(e).with_context(|| format!("cannot write the backup {}", path.display()));
+        })
+    }
+
+    /// One pass over the bytes as opened: from the same reads, the stage (with `patches`
+    /// applied), the backup when `backup` (the session's first Save), and their SHA-256. The
+    /// handle's size, mtime, change time and inode are compared before the pass with what was
+    /// opened, and after it with before: any difference and nothing is kept. Every file this
+    /// pass creates is new (created exclusively, owner-only) and removed if the pass fails.
+    fn pass(&mut self, patches: &BTreeMap<u64, u8>, tag: &str, backup: bool) -> Result<PassResult> {
+        use sha2::Digest;
+        // A writer at the former gap between two observations is now seen by this one.
+        #[cfg(test)]
+        if let Some(hook) = self.pre_pass_hook.as_mut() {
+            hook();
         }
-        println!("backup of {} at {}", self.origin.display(), path.display());
-        self.backup = Some(path.clone());
+        let before = Ident::of(&self.base, &self.base_path)?;
+        if before != self.opened {
+            return Ok(PassResult::Changed(self.opened.change(&before)));
+        }
+        let (stage, mut stage_file) = super::create_keep(&self.edits, tag)?;
+        let mut backup_file = None;
+        if backup {
+            match self.new_backup() {
+                Ok(made) => backup_file = Some(made),
+                Err(e) => {
+                    let _ = std::fs::remove_file(&stage);
+                    return Err(e);
+                }
+            }
+        }
+        let made: Vec<PathBuf> = std::iter::once(stage.clone())
+            .chain(backup_file.as_ref().map(|(p, _)| p.clone()))
+            .collect();
+        let discard = |made: &[PathBuf]| {
+            for path in made {
+                let _ = std::fs::remove_file(path);
+            }
+        };
+        let mut hasher = sha2::Sha256::new();
+        let mut buf = vec![0u8; CHUNK];
+        let len = self.size();
+        let mut at = 0u64;
+        let copied = (|| -> Result<()> {
+            while at < len {
+                let n = (len - at).min(CHUNK as u64) as usize;
+                self.base
+                    .read_exact_at(&mut buf[..n], at)
+                    .with_context(|| format!("cannot read {}", self.base_path.display()))?;
+                hasher.update(&buf[..n]);
+                if let Some((path, file)) = backup_file.as_mut() {
+                    file.write_all(&buf[..n])
+                        .with_context(|| format!("cannot write the backup {}", path.display()))?;
+                }
+                for (&off, &b) in patches.range(at..at + n as u64) {
+                    buf[(off - at) as usize] = b;
+                }
+                stage_file
+                    .write_all(&buf[..n])
+                    .with_context(|| format!("cannot write {}", stage.display()))?;
+                at += n as u64;
+                #[cfg(test)]
+                if let Some(hook) = self.chunk_hook.as_mut() {
+                    hook(at);
+                }
+            }
+            stage_file.flush()?;
+            if let Some((_, file)) = backup_file.as_mut() {
+                file.flush()?;
+            }
+            Ok(())
+        })();
+        if let Err(e) = copied {
+            discard(&made);
+            let after = Ident::of(&self.base, &self.base_path)?;
+            if after != before {
+                return Ok(PassResult::Changed(format!(
+                    "{} while it was being read",
+                    before.change(&after)
+                )));
+            }
+            return Err(e);
+        }
+        let after = Ident::of(&self.base, &self.base_path)?;
+        if after != before {
+            discard(&made);
+            return Ok(PassResult::Changed(format!(
+                "{} while it was being read",
+                before.change(&after)
+            )));
+        }
+        Ok(PassResult::Done(Pass {
+            stage,
+            backup: backup_file.map(|(p, _)| p),
+            sha256: hasher.finalize().into(),
+        }))
+    }
+
+    /// The changes, when the bytes they apply to changed: `<name>.hexpatch-<stamp>.txt` among
+    /// the edits (owner-only, a new file), one `offset: bytes` line per run of changed bytes
+    /// under a header naming the source as it was opened.
+    fn keep_patches(&self, patches: &BTreeMap<u64, u8>, why: &str) -> Result<PathBuf> {
+        let stamp = crate::cache::utc_stamp(SystemTime::now());
+        let name = self
+            .edits
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let (path, mut file) = crate::cache::create_unique(|attempt| {
+            let unique = if attempt == 0 {
+                String::new()
+            } else {
+                format!("-{}", &crate::remote::random_hex()[..8])
+            };
+            self.edits
+                .with_file_name(format!("{name}.hexpatch-{stamp}{unique}.txt"))
+        })?;
+        let mtime = self
+            .opened
+            .mtime
+            .map_or("unknown".to_string(), crate::cache::rfc3339);
+        let mut text = format!(
+            "# sopen hex edits, not saved: {} changed since it was opened ({why})\n\
+             # source: {}\n\
+             # as opened: {} bytes, modified {mtime}\n\
+             # one line per run of changed bytes — offset: bytes (hex)\n",
+            self.origin.display(),
+            self.base_path.display(),
+            self.size()
+        );
+        let mut runs: Vec<(u64, Vec<u8>)> = Vec::new();
+        for (&off, &b) in patches {
+            match runs.last_mut() {
+                Some((start, bytes)) if *start + bytes.len() as u64 == off => bytes.push(b),
+                _ => runs.push((off, vec![b])),
+            }
+        }
+        for (start, bytes) in runs {
+            let hex: String = bytes.iter().map(|b| format!("{b:02X}")).collect();
+            text.push_str(&format!("0x{start:X}: {hex}\n"));
+        }
+        if let Err(e) = file.write_all(text.as_bytes()) {
+            let _ = std::fs::remove_file(&path);
+            return Err(e).with_context(|| format!("cannot write {}", path.display()));
+        }
         Ok(path)
     }
 
+    /// The refusal for bytes as opened that changed: nothing written, the changes listed.
+    fn refuse_changed(&self, patches: &BTreeMap<u64, u8>, why: &str) -> Result<Saved> {
+        let kept = self.keep_patches(patches, why)?;
+        Ok(Saved::Refused {
+            message: format!(
+                "not saved: {} changed since it was opened ({why}); nothing was written — your \
+                 edits are listed in {}",
+                self.base_path.display(),
+                kept.display()
+            ),
+            kept: Some(kept),
+        })
+    }
+
     /// Save (spec §5, §6a), in this order: can this server replace a file in one step (refused
-    /// before anything is written if not) → are the bytes as opened unchanged (refused if not)
-    /// → the local backup of the original (printed) → stage the original with `patches`
-    /// applied → conflict-checked overwrite. A refusal or a transport error keeps the staged
-    /// edit in a local file whose path the message names.
+    /// before anything is written if not) → one pass over the bytes as opened that writes the
+    /// backup of the original (the session's first Save; printed) and the stage, refused when
+    /// those bytes changed → the conflict-checked overwrite, checked against the content hash
+    /// from that pass when the baseline has none (a local file opened in place). A refusal or
+    /// a transport error keeps the edits in a local file whose path the message names.
     pub fn save(&mut self, patches: &BTreeMap<u64, u8>) -> Result<Saved> {
         if !self.can_replace() {
             bail!(
@@ -651,20 +867,22 @@ impl HexFile {
                 self.origin.display()
             );
         }
-        if let Some(message) = self.base_changed()? {
-            return Ok(Saved::Refused {
-                message: format!("not saved: {message}"),
-                kept: None,
-            });
+        let first = self.backup.is_none();
+        let pass = match self.pass(patches, "edited", first) {
+            Ok(PassResult::Done(pass)) => pass,
+            Ok(PassResult::Changed(why)) => return self.refuse_changed(patches, &why),
+            Err(e) => return Err(e.context(format!("{} was not touched", self.origin.display()))),
+        };
+        if let Some(path) = &pass.backup {
+            println!("backup of {} at {}", self.origin.display(), path.display());
+            self.backup = Some(path.clone());
         }
-        let backup = self.ensure_backup()?;
-        let staged = self.stage(patches, "edited").with_context(|| {
-            format!(
-                "{} was not touched (the original is backed up at {})",
-                self.origin.display(),
-                backup.display()
-            )
-        })?;
+        let backup = self.backup.clone().expect("made by the first pass");
+        let staged = pass.stage;
+        // A local file opened in place has no hash from a fetch: the pass's is what was opened.
+        if self.origin.at.sha256.is_none() {
+            self.origin.at.sha256 = Some(pass.sha256);
+        }
         let result = (|| -> Result<Saved> {
             let at = self.origin.at;
             let abs = self.origin.abs.clone();
@@ -676,6 +894,15 @@ impl HexFile {
                 WriteOutcome::Written { now, notes } => {
                     self.origin.at = now;
                     let _ = std::fs::remove_file(&staged);
+                    // A local file opened in place was just renamed over: its old inode's change
+                    // time moved with the unlink. What it holds did not (checked by the pass).
+                    if let Ok(now) = Ident::of(&self.base, &self.base_path) {
+                        if (now.len, now.mtime, now.ino)
+                            == (self.opened.len, self.opened.mtime, self.opened.ino)
+                        {
+                            self.opened = now;
+                        }
+                    }
                     Ok(Saved::Written {
                         remote: self.origin.display(),
                         backup,
@@ -710,12 +937,21 @@ impl HexFile {
     }
 
     /// Save copy: `<stem>.edited.<ext>` next to the original (`-N` when taken), never replacing
-    /// anything. Returns the printed path of the new file.
+    /// anything; staged by the same pass as Save (refused when the bytes as opened changed,
+    /// the changes listed). Returns the printed path of the new file.
     pub fn save_copy(&mut self, patches: &BTreeMap<u64, u8>) -> Result<String> {
-        if let Some(message) = self.base_changed()? {
-            bail!("no copy saved: {message}");
-        }
-        let staged = self.stage(patches, "copy")?;
+        let staged = match self.pass(patches, "copy", false)? {
+            PassResult::Done(pass) => pass.stage,
+            PassResult::Changed(why) => {
+                let kept = self.keep_patches(patches, &why)?;
+                bail!(
+                    "no copy saved: {} changed since it was opened ({why}); nothing was written \
+                     — your edits are listed in {}",
+                    self.base_path.display(),
+                    kept.display()
+                );
+            }
+        };
         let (dir, name) = self.origin.parent();
         let wanted = super::edited_name(&name);
         let result = self
@@ -879,7 +1115,8 @@ enum JobKind {
 
 pub(super) struct Job {
     kind: JobKind,
-    rev: u64,
+    /// The changes the save writes (what the file holds if it lands).
+    snapshot: BTreeMap<u64, u8>,
     rx: Receiver<Result<JobDone>>,
 }
 
@@ -915,9 +1152,8 @@ pub(super) struct HexWindow {
     follow: bool,
     /// Wheel points not yet a whole row (trackpads scroll in points).
     wheel_rest: f32,
-    /// The Go to field's text, and a request to give it the keyboard.
+    /// The Go to field's text.
     goto: String,
-    focus_goto: bool,
     status: Status,
     job: Option<Job>,
     outcome: Arc<Mutex<Outcome>>,
@@ -980,7 +1216,6 @@ impl HexWindow {
             follow: true,
             wheel_rest: 0.0,
             goto: String::new(),
-            focus_goto: false,
             status: Status::default(),
             job: None,
             outcome,
@@ -1068,12 +1303,14 @@ impl HexWindow {
             }
         }
         let patches = self.doc.patches().clone();
+        let snapshot = patches.clone();
         let file = self.file.clone();
         let copy = matches!(kind, JobKind::SaveCopy { .. });
         let (tx, rx) = mpsc::channel();
         let ctx = ctx.clone();
         std::thread::spawn(move || {
-            let mut file = file.lock().unwrap();
+            // A save whose worker died holding the file leaves it as it was: usable.
+            let mut file = file.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             let result = if copy {
                 file.save_copy(&patches).map(JobDone::Copy)
             } else {
@@ -1088,54 +1325,79 @@ impl HexWindow {
         } else {
             "saving…"
         });
-        self.job = Some(Job {
-            kind,
-            rev: self.doc.rev(),
-            rx,
-        });
+        self.job = Some(Job { kind, snapshot, rx });
     }
 
+    /// A finished save, taken after this frame's input (an edit or an undo in the same frame is
+    /// in the comparison, never lost to a close). Closing — asked for in the prompt, or during
+    /// the save — happens only when the save landed with nothing to read and nothing is unsaved;
+    /// a save that did not land, or landed with notes, keeps the window open; newer edits ask.
     fn poll_job(&mut self, ctx: &egui::Context) {
         let Some(job) = &self.job else {
             return;
         };
-        let Ok(result) = job.rx.try_recv() else {
-            return;
+        let result = match job.rx.try_recv() {
+            Ok(result) => result,
+            Err(mpsc::TryRecvError::Empty) => return,
+            Err(mpsc::TryRecvError::Disconnected) => Err(anyhow!(
+                "the save stopped without a result (its worker ended); your edits are still \
+                 here"
+            )),
         };
         let job = self.job.take().expect("checked above");
         let (status, shown) = report(&result, &mut self.outcome.lock().unwrap());
         self.status = status;
         self.pending_notices = Some(shown);
-        let close_after = match &result {
-            Ok(JobDone::Saved(Saved::Written { notes, .. })) => {
-                self.doc.mark_saved(job.rev);
-                matches!(job.kind, JobKind::Save { close_after: true }) && notes.is_empty()
+        let landed = match &result {
+            Ok(JobDone::Saved(Saved::Written { .. })) => {
+                self.doc.mark_saved(job.snapshot.clone());
+                true
             }
             Ok(JobDone::Copy(..)) => {
-                self.doc.mark_copied(job.rev);
-                matches!(job.kind, JobKind::SaveCopy { close_after: true })
+                self.doc.mark_copied(job.snapshot.clone());
+                true
             }
             _ => false,
         };
+        let notes = matches!(&result, Ok(JobDone::Saved(Saved::Written { notes, .. })) if !notes.is_empty());
+        let asked = matches!(
+            job.kind,
+            JobKind::Save { close_after: true } | JobKind::SaveCopy { close_after: true }
+        ) || std::mem::take(&mut self.close_when_done);
+        if !asked || !landed {
+            return;
+        }
         // An edit made while the save ran is not in what it wrote.
-        let newer = self.doc.rev() != job.rev;
-        let waited = std::mem::take(&mut self.close_when_done);
-        if (close_after && !newer) || (waited && !self.doc.unsaved()) {
-            self.close_ok = true;
-            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-        } else if close_after || waited {
-            if close_after && newer {
+        let newer = *self.doc.patches() != job.snapshot;
+        if newer || self.doc.unsaved() {
+            if newer {
                 self.status =
                     Status::info(format!("newer edits are not saved · {}", self.status.text));
             }
             self.prompt = true;
+        } else if notes {
+            self.status = Status::info(format!(
+                "not closed: read the notes below · {}",
+                self.status.text
+            ));
+        } else {
+            self.close_ok = true;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
     }
 
-    /// Keys for the whole window (not while the Go to field or the close prompt has them).
-    fn keys(&mut self, ctx: &egui::Context, goto_focused: bool) {
+    /// Whether input may change anything: not under the close prompt, not once closing is
+    /// decided.
+    fn locked(&self) -> bool {
+        self.prompt || self.close_ok
+    }
+
+    /// Keys for the whole window. `goto_owns` = the Go to field has this frame's typing (it is
+    /// focused, was clicked, lost focus on Enter, or Cmd/Ctrl+G gave it the keyboard): then no
+    /// byte is typed and no key moves the cursor.
+    fn keys(&mut self, ctx: &egui::Context, goto_owns: bool) {
         use super::command_key;
-        if self.prompt {
+        if self.locked() {
             return;
         }
         if command_key(ctx, Key::S, true) {
@@ -1143,11 +1405,7 @@ impl HexWindow {
         } else if command_key(ctx, Key::S, false) {
             self.start(ctx, JobKind::Save { close_after: false });
         }
-        if command_key(ctx, Key::G, false) {
-            self.goto.clear();
-            self.focus_goto = true;
-        }
-        if goto_focused {
+        if goto_owns {
             return;
         }
         if command_key(ctx, Key::Z, true) {
@@ -1232,6 +1490,7 @@ impl HexWindow {
     fn toolbar(&mut self, ui: &mut egui::Ui) -> egui::Response {
         let ctx = ui.ctx().clone();
         let busy = self.job.is_some();
+        let free = !self.locked();
         // One row, whatever the state: nothing in it comes, goes or changes its label.
         ui.horizontal(|ui| {
             ui.label("Go to");
@@ -1243,22 +1502,19 @@ impl HexWindow {
                         .desired_width(130.0),
                 )
                 .on_hover_text("⌘/Ctrl+G · Enter goes there");
-            if std::mem::take(&mut self.focus_goto) {
-                field.request_focus();
-            }
             if field.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
                 self.goto();
             }
             ui.separator();
             if ui
-                .add_enabled(self.doc.can_undo(), egui::Button::new("Undo"))
+                .add_enabled(free && self.doc.can_undo(), egui::Button::new("Undo"))
                 .on_hover_text("⌘/Ctrl+Z")
                 .clicked()
             {
                 self.undo();
             }
             if ui
-                .add_enabled(self.doc.can_redo(), egui::Button::new("Redo"))
+                .add_enabled(free && self.doc.can_redo(), egui::Button::new("Redo"))
                 .on_hover_text("⇧⌘/Shift+Ctrl+Z")
                 .clicked()
             {
@@ -1267,7 +1523,7 @@ impl HexWindow {
             ui.separator();
             let save = ui
                 .add_enabled(
-                    !busy && self.doc.dirty() && self.can_replace,
+                    free && !busy && self.doc.dirty() && self.can_replace,
                     egui::Button::new("Save"),
                 )
                 .on_hover_text("⌘/Ctrl+S — overwrites the original after a local backup")
@@ -1282,7 +1538,7 @@ impl HexWindow {
                 self.start(&ctx, JobKind::Save { close_after: false });
             }
             let copy = ui
-                .add_enabled(!busy, egui::Button::new("Save copy"))
+                .add_enabled(free && !busy, egui::Button::new("Save copy"))
                 .on_hover_text("⇧⌘/Shift+Ctrl+S — a new <name>.edited file next to the original")
                 .on_disabled_hover_text("a save is running");
             if copy.clicked() {
@@ -1607,11 +1863,18 @@ impl HexWindow {
 }
 
 impl super::Window for HexWindow {
+    /// One pass, in this order: Cmd/Ctrl+G (the Go to field takes the keyboard before it is
+    /// laid out, so this frame's typing goes there), the toolbar, which then knows whether the
+    /// field has this frame's typing, the keys and typing (to exactly one place: the field or
+    /// the bytes), the panels and the grid, and last a finished save — after every input of
+    /// this frame, so an edit made in the same frame counts.
     fn ui(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
-        self.poll_job(&ctx);
-        let goto_had_focus = ctx.memory(|m| m.focused()) == Some(goto_id());
-        self.keys(&ctx, goto_had_focus);
+        let cmd_g = !self.locked() && super::command_key(&ctx, Key::G, false);
+        if cmd_g {
+            self.goto.clear();
+            ctx.memory_mut(|m| m.request_focus(goto_id()));
+        }
         let field = egui::Panel::top("hexbar")
             .show(ui, |ui| {
                 ui.add_space(3.0);
@@ -1620,9 +1883,11 @@ impl super::Window for HexWindow {
                 field
             })
             .inner;
-        let goto_focused = field.has_focus() || field.lost_focus();
-        // A report that lands while the button is down waits until it is let go: its row would
-        // move the grid under the pointer.
+        let goto_owns = cmd_g || field.has_focus() || field.lost_focus() || field.clicked();
+        self.keys(&ctx, goto_owns);
+        let goto_focused = goto_owns;
+        // A report that lands while the button is down waits until it is let go. Its rows sit
+        // below the grid: they take rows off its bottom, never move its top or its rows.
         if !ctx.input(|i| i.pointer.primary_down()) {
             if let Some(next) = self.pending_notices.take() {
                 self.notices = next;
@@ -1650,6 +1915,7 @@ impl super::Window for HexWindow {
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE)
             .show(ui, |ui| self.grid(ui, goto_focused));
+        self.poll_job(&ctx);
         self.close_prompt(&ctx);
     }
 

@@ -114,6 +114,14 @@ and type; nothing is downloaded yet. **Enter** fetches it and opens sopen's hex 
 default). **Save to…** downloads it to the path below the buttons — your download folder at first,
 or the one "Browse…" picks — and never over an existing file: if the name is taken it says so and
 offers the next free one (`data-1.zip`). **Esc** (or closing the window) downloads nothing.
+Exceptions: Enter in the path field saves there (it never opens the hex editor); while a transfer
+runs, Enter and Esc do nothing and closing the window waits for it to finish.
+
+The file appears under its name only complete: it is written to a hidden `.<name>.sopen-….part` in
+the same folder and published with a hard link. If it cannot be published without replacing a file,
+the save fails and names the complete staging file it kept. A download whose source changes
+meanwhile is not saved; that check is best-effort (the remote file's size and modification time,
+and the bytes received).
 
 The hex editor shows rows of 16 bytes — offset, hex, ASCII — and reads only what is on screen, so a
 file of any size scrolls the same. It overwrites bytes and never changes the file's size:
@@ -124,7 +132,7 @@ file of any size scrolls the same. It overwrites bytes and never changes the fil
 | hex digits / characters | overwrite: in the hex column two digits per byte, in the ASCII column one character; `Tab` switches the column |
 | `⌘G` | go to an offset (`0x…` or decimal) |
 | `⌘Z` / `⇧⌘Z` (Ctrl on Linux) | undo / redo |
-| `⌘S` | Save: the original is first backed up locally (path printed), then overwritten in place, as image Save does |
+| `⌘S` | Save: the original is first backed up locally (path printed), then overwritten in place, as image Save does. If the file changed since it was opened, nothing is written and your edits are listed in a `.hexpatch-….txt` file, named in the window |
 | `⇧⌘S` | Save copy: `<name>.edited.<ext>` next to the original |
 
 ## Any other app: `--app`

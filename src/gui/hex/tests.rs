@@ -139,11 +139,18 @@ impl Fx {
     }
 }
 
-/// Files under `dir`, recursively.
+/// Files under `dir`, recursively; an absent `dir` has none, any other error fails the test.
 fn walk(dir: &Path) -> Vec<PathBuf> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+        Err(e) => panic!("cannot list {}: {e}", dir.display()),
+    };
     let mut out = Vec::new();
-    for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
-        let p = entry.path();
+    for entry in entries {
+        let p = entry
+            .unwrap_or_else(|e| panic!("cannot list {}: {e}", dir.display()))
+            .path();
         if p.is_dir() {
             out.extend(walk(&p));
         } else {
@@ -419,30 +426,107 @@ fn save_writes_the_patched_bytes_back_after_a_backup() {
     );
 }
 
-/// Save order: the backup is on disk before anything is staged or written — here staging
-/// fails (the edits folder cannot be made), the backup is there and the remote untouched.
+/// The local disk, calling `before_write` the first time anything is created on it (the first
+/// write of a Save, before the remote is touched).
+struct FirstWrite {
+    fs: LocalFs,
+    before_write: Option<Box<dyn FnOnce() + Send>>,
+}
+
+impl RemoteFs for FirstWrite {
+    fn stat_opt(&mut self, p: &str) -> Result<Option<crate::remote::Stat>> {
+        self.fs.stat_opt(p)
+    }
+    fn lstat_opt(&mut self, p: &str) -> Result<Option<crate::remote::Stat>> {
+        self.fs.lstat_opt(p)
+    }
+    fn realpath(&mut self, p: &str) -> Result<String> {
+        self.fs.realpath(p)
+    }
+    fn read_head(&mut self, p: &str, max: usize) -> Result<Vec<u8>> {
+        self.fs.read_head(p, max)
+    }
+    fn list_dir(&mut self, p: &str) -> Result<Vec<String>> {
+        self.fs.list_dir(p)
+    }
+    fn read_to(
+        &mut self,
+        p: &str,
+        out: &mut dyn std::io::Write,
+        progress: &mut dyn FnMut(u64),
+    ) -> Result<u64> {
+        self.fs.read_to(p, out, progress)
+    }
+    fn create_from(
+        &mut self,
+        local: &Path,
+        p: &str,
+        like: Option<crate::remote::Like>,
+    ) -> std::result::Result<crate::remote::Uploaded, crate::remote::CreateError> {
+        if let Some(hook) = self.before_write.take() {
+            hook();
+        }
+        self.fs.create_from(local, p, like)
+    }
+    fn set_mode(&mut self, p: &str, mode: u32) -> Result<()> {
+        self.fs.set_mode(p, mode)
+    }
+    fn rename_over(&mut self, from: &str, to: &str) -> Result<()> {
+        self.fs.rename_over(from, to)
+    }
+    fn link_new(&mut self, from: &str, to: &str) -> Result<()> {
+        self.fs.link_new(from, to)
+    }
+    fn remove(&mut self, p: &str) -> Result<()> {
+        self.fs.remove(p)
+    }
+}
+
+/// Save order: the backup is complete on disk before the first write to the remote, and a
+/// failure to stage leaves nothing (no partial backup) and the remote untouched.
 #[test]
-fn save_backs_up_before_staging_or_writing() {
+fn the_backup_is_complete_before_the_remote_is_written() {
     let tmp = tempfile::tempdir().unwrap();
     let remote = tmp.path().join("a.bin");
     std::fs::write(&remote, FIXTURE).unwrap();
     let abs = remote.to_str().unwrap().to_string();
-    let mut fs = LocalFs::new();
     let base = tmp.path().join("copy/a.bin");
-    let at = fs.fetch(&abs, &base, &mut |_, _| {}).unwrap();
-    let origin = Origin::new(Box::new(fs), None, None, abs, at);
+    let at = LocalFs::new().fetch(&abs, &base, &mut |_, _| {}).unwrap();
     let cache = tmp.path().join("cache");
+    let seen: Arc<Mutex<Vec<Vec<u8>>>> = Arc::default();
+    let (seen2, backups) = (seen.clone(), crate::cache::backup_root(&cache));
+    let fs = FirstWrite {
+        fs: LocalFs::new(),
+        before_write: Some(Box::new(move || {
+            let found = walk(&backups);
+            *seen2.lock().unwrap() = found.iter().map(|p| std::fs::read(p).unwrap()).collect();
+        })),
+    };
+    let origin = Origin::new(Box::new(fs), None, None, abs.clone(), at);
+    let mut file = HexFile::open(origin, &base, None, &cache).unwrap();
+    let saved = file.save(&BTreeMap::from([(0u64, 0u8)])).unwrap();
+    assert!(matches!(saved, Saved::Written { .. }), "{saved:?}");
+    assert_eq!(
+        *seen.lock().unwrap(),
+        [FIXTURE.to_vec()],
+        "the backup, whole, first"
+    );
+
+    // Staging cannot start (the edits folder is a file): nothing written anywhere.
+    let tmp = tempfile::tempdir().unwrap();
+    let remote = tmp.path().join("a.bin");
+    std::fs::write(&remote, FIXTURE).unwrap();
+    let abs = remote.to_str().unwrap().to_string();
+    let base = tmp.path().join("copy/a.bin");
+    let at = LocalFs::new().fetch(&abs, &base, &mut |_, _| {}).unwrap();
+    let cache = tmp.path().join("cache");
+    let origin = Origin::new(Box::new(LocalFs::new()), None, None, abs, at);
     let mut file = HexFile::open(origin, &base, None, &cache).unwrap();
     std::fs::create_dir_all(&cache).unwrap();
     std::fs::write(crate::cache::edits_root(&cache), b"not a folder").unwrap();
-    let patches = BTreeMap::from([(0u64, 0u8)]);
-    let err = file.save(&patches).unwrap_err();
-    let msg = format!("{err:#}");
-    assert!(msg.contains("was not touched"), "{msg}");
-    assert!(msg.contains("backed up at"), "{msg}");
-    let backups = walk(&crate::cache::backup_root(&cache));
-    assert_eq!(backups.len(), 1, "{backups:?}");
-    assert_eq!(std::fs::read(&backups[0]).unwrap(), FIXTURE);
+    let err = file.save(&BTreeMap::from([(0u64, 0u8)])).unwrap_err();
+    assert!(format!("{err:#}").contains("was not touched"), "{err:#}");
+    assert!(walk(&crate::cache::backup_root(&cache)).is_empty());
     assert_eq!(std::fs::read(&remote).unwrap(), FIXTURE);
 }
 
@@ -545,10 +629,23 @@ fn a_base_changed_in_place_is_refused_before_anything_is_written() {
     }
     fx.key(Key::S, command(false));
     fx.wait_for_save();
+    fx.settle();
     let refused = fx.win.outcome.lock().unwrap().refused.clone().unwrap();
     assert!(refused.contains("changed since it was opened"), "{refused}");
+    // Nothing but the list of the edits: no backup, no stage.
     let cache = fx.tmp.path().join("cache");
-    assert!(walk(&cache).is_empty(), "{:?}", walk(&cache));
+    let left = walk(&cache);
+    assert_eq!(left.len(), 1, "{left:?}");
+    let list = &left[0];
+    assert!(
+        list.to_string_lossy().contains("local.bin.hexpatch-"),
+        "{list:?}"
+    );
+    assert!(refused.contains(&*list.to_string_lossy()), "{refused}");
+    assert!(
+        fx.drv.find_text(&refused).is_some(),
+        "named whole in the rows"
+    );
     assert!(std::fs::read(&path).unwrap().ends_with(b"more"));
 }
 
@@ -583,7 +680,7 @@ fn a_large_file_paints_only_the_visible_rows() {
         "the last row's offset"
     );
     assert!(fx.drv.find_text("0xFFFFFFF (268435455) · 0x00 0").is_some());
-    // Scrolled through half a file's worth of pages: still at most the cache's bound held.
+    // Forty pages down from the start: only the pages those screens show were read.
     fx.key(Key::Home, command(false));
     for _ in 0..40 {
         fx.key(Key::PageDown, Modifiers::NONE);
@@ -621,7 +718,7 @@ fn the_bars_stay_one_line_and_the_grid_stays_put() {
     let (_tx, rx) = mpsc::channel();
     fx.win.job = Some(Job {
         kind: JobKind::Save { close_after: false },
-        rev: fx.win.doc.rev(),
+        snapshot: fx.win.doc.patches().clone(),
         rx,
     });
     fx.settle();
@@ -742,4 +839,770 @@ fn an_empty_file_opens() {
     assert!(fx.drv.find_text("empty file").is_some());
     assert!(fx.drv.find_text("empty file — nothing to show").is_some());
     assert_eq!(fx.win.rows_painted, 0);
+}
+
+// ---------------------------------------------------------------------------------------------
+// The model's history and dirtiness; the page cache's bound.
+
+/// At the undo bound the two digits of a byte are still one step: one undo restores the byte
+/// whole (the bound drops the oldest step, never splits a byte).
+#[test]
+fn two_digits_stay_one_step_at_the_undo_bound() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("a.bin");
+    std::fs::write(&path, FIXTURE).unwrap();
+    let mut doc = HexDoc::new(Arc::new(File::open(&path).unwrap()), FIXTURE.len() as u64);
+    doc.set_undo_cap(3);
+    let c = Cursor::default();
+    for at in 0..3 {
+        assert!(doc.set(at, b'#', c));
+    }
+    assert_eq!(doc.undo_len(), 3, "full");
+    let c = Cursor { at: 5, ..c };
+    let c = doc.type_char(c, 'a').unwrap();
+    doc.type_char(c, 'b').unwrap();
+    assert_eq!(doc.byte(5), Some(0xab));
+    assert_eq!(doc.undo_len(), 3, "the oldest went");
+    assert_eq!(doc.undo().unwrap().at, 5);
+    assert_eq!(doc.byte(5), Some(FIXTURE[5]), "the whole byte at once");
+}
+
+/// Dirty means "differs from what the file holds": an edit undone, or a byte typed back to its
+/// value, is clean — before a save and after one (against what the save wrote).
+#[test]
+fn dirty_follows_content_not_history() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("a.bin");
+    std::fs::write(&path, FIXTURE).unwrap();
+    let mut doc = HexDoc::new(Arc::new(File::open(&path).unwrap()), FIXTURE.len() as u64);
+    let c = Cursor::default();
+    assert!(!doc.dirty());
+    doc.set(0, 0, c);
+    assert!(doc.dirty() && doc.unsaved());
+    doc.undo();
+    assert!(
+        !doc.dirty() && !doc.unsaved(),
+        "undone to the file as opened"
+    );
+    doc.set(1, 0, c);
+    doc.set(1, b'o', c);
+    assert!(!doc.dirty(), "typed back to its value");
+    // A save of {1: 0x00}: clean; edit + undo is clean again; undo past the save is dirty.
+    doc.set(1, 0, c);
+    doc.mark_saved(doc.patches().clone());
+    assert!(!doc.dirty());
+    doc.set(2, 0, c);
+    doc.undo();
+    assert!(!doc.dirty(), "undone to what was saved");
+    doc.undo();
+    assert!(
+        doc.dirty(),
+        "the file holds the saved byte; this is the original"
+    );
+    // A Save copy of a state: not unsaved while the state is that.
+    doc.mark_copied(doc.patches().clone());
+    assert!(doc.dirty() && !doc.unsaved());
+}
+
+/// The page cache never holds more than its bound: more distinct pages than it holds are read
+/// in turn, the bound checked after each; a page that was dropped reads back the same bytes.
+#[test]
+fn the_page_cache_stays_within_its_bound() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("pages.bin");
+    let pages = PAGES as u64 + 8;
+    let byte = |at: u64| ((at / PAGE) as u8).wrapping_mul(7) ^ (at % 251) as u8;
+    let body: Vec<u8> = (0..pages * PAGE).map(byte).collect();
+    std::fs::write(&path, &body).unwrap();
+    let mut doc = HexDoc::new(Arc::new(File::open(&path).unwrap()), body.len() as u64);
+    let bound = PAGES * PAGE as usize;
+    for p in 0..pages {
+        let at = p * PAGE + 7;
+        assert_eq!(doc.byte(at), Some(byte(at)), "page {p}");
+        assert!(doc.resident() <= bound, "page {p}: {} held", doc.resident());
+    }
+    assert_eq!(doc.reads(), pages, "each page read once");
+    // Page 0 was the least recently used: dropped; it reads again, the same bytes.
+    assert_eq!(doc.byte(7), Some(byte(7)));
+    assert_eq!(doc.byte(PAGE - 1), Some(byte(PAGE - 1)));
+    assert_eq!(doc.reads(), pages + 1, "page 0 was read again");
+    assert!(doc.resident() <= bound);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Save: one pass, the changes kept when the bytes as opened change, conflicts at equal size.
+
+/// A file whose bytes the window reads (`base`) and a "remote" Save writes; `in_place` = they
+/// are one file (a local file opened in place).
+struct Pair {
+    tmp: tempfile::TempDir,
+    remote: PathBuf,
+    base: PathBuf,
+}
+
+impl Pair {
+    fn new(body: &[u8], in_place: bool) -> Self {
+        let tmp = tempfile::tempdir().unwrap();
+        let remote = tmp.path().join("remote/a.bin");
+        std::fs::create_dir_all(remote.parent().unwrap()).unwrap();
+        std::fs::write(&remote, body).unwrap();
+        // A fixed mtime in the past: a write during a test always moves it.
+        set_mtime(&remote, 1_600_000_000);
+        let base = if in_place {
+            remote.clone()
+        } else {
+            let base = tmp.path().join("copy/a.bin");
+            LocalFs::new()
+                .fetch(remote.to_str().unwrap(), &base, &mut |_, _| {})
+                .unwrap();
+            set_mtime(&base, 1_600_000_000);
+            base
+        };
+        Self { tmp, remote, base }
+    }
+
+    fn cache(&self) -> PathBuf {
+        self.tmp.path().join("cache")
+    }
+
+    /// As the window opens it: a fetched copy has the fetch's stat (with its hash); a local
+    /// file opened in place a plain stat (no hash).
+    fn open(&self) -> HexFile {
+        let abs = self.remote.to_str().unwrap().to_string();
+        let mut fs = LocalFs::new();
+        let mut at = fs.stat(&abs).unwrap();
+        if self.base != self.remote {
+            let bytes = std::fs::read(&self.base).unwrap();
+            use sha2::Digest;
+            at.sha256 = Some(sha2::Sha256::digest(&bytes).into());
+        }
+        let origin = Origin::new(Box::new(fs), None, None, abs, at);
+        HexFile::open(origin, &self.base, None, &self.cache()).unwrap()
+    }
+}
+
+fn set_mtime(path: &Path, secs: u64) {
+    let at = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(secs);
+    File::options()
+        .write(true)
+        .open(path)
+        .unwrap()
+        .set_times(std::fs::FileTimes::new().set_modified(at))
+        .unwrap();
+}
+
+fn mtime(path: &Path) -> SystemTime {
+    std::fs::metadata(path).unwrap().modified().unwrap()
+}
+
+/// A writer in the gap between the pre-pass check and the streaming baseline must not make
+/// changed bytes look like the original. Test both Save and Save copy on a cached source.
+#[test]
+fn a_change_between_pre_pass_observations_is_refused() {
+    for copy in [false, true] {
+        let pair = Pair::new(FIXTURE, false);
+        let mut file = pair.open();
+        let base = pair.base.clone();
+        file.pre_pass_hook = Some(Box::new(move || {
+            File::options()
+                .write(true)
+                .open(&base)
+                .unwrap()
+                .write_all_at(&[0xEE], 4)
+                .unwrap();
+            set_mtime(&base, 1_700_000_000);
+        }));
+        let patches = BTreeMap::from([(0u64, 0xff)]);
+        let message = if copy {
+            file.save_copy(&patches)
+                .expect_err("changed source must be refused")
+                .to_string()
+        } else {
+            match file.save(&patches).unwrap() {
+                Saved::Refused { message, .. } => message,
+                other => panic!("changed source must be refused: {other:?}"),
+            }
+        };
+        assert!(message.contains("changed since it was opened"), "{message}");
+        assert_eq!(std::fs::read(&pair.remote).unwrap(), FIXTURE);
+        assert!(!pair.remote.with_file_name("a.edited.bin").exists());
+        let kept = walk(&pair.cache());
+        assert_eq!(kept.len(), 1, "only the patch list should remain: {kept:?}");
+        assert!(kept[0].to_string_lossy().contains(".hexpatch-"));
+        assert!(std::fs::read_to_string(&kept[0])
+            .unwrap()
+            .contains("0x0: FF"));
+    }
+}
+
+/// The source written in place in the middle of the save's pass (between two chunks): the
+/// save is refused, nothing staged or backed up is left, the remote is untouched, and the
+/// changes are listed in a file of their own. Save copy is refused the same way.
+#[test]
+fn a_source_written_during_the_pass_is_refused_and_only_the_list_is_kept() {
+    let body: Vec<u8> = (0..(3 * CHUNK) as u32).map(|i| (i % 253) as u8).collect();
+    for in_place in [false, true] {
+        let pair = Pair::new(&body, in_place);
+        let mut file = pair.open();
+        let base = pair.base.clone();
+        file.chunk_hook = Some(Box::new(move |done| {
+            if done == CHUNK as u64 {
+                File::options()
+                    .write(true)
+                    .open(&base)
+                    .unwrap()
+                    .write_all_at(&[0xEE], 2 * CHUNK as u64)
+                    .unwrap();
+            }
+        }));
+        let patches = BTreeMap::from([(10u64, 0u8)]);
+        let Saved::Refused { message, kept } = file.save(&patches).unwrap() else {
+            panic!("in_place={in_place}: expected Refused")
+        };
+        assert!(message.contains("while it was being read"), "{message}");
+        let kept = kept.unwrap();
+        assert!(
+            kept.to_string_lossy().contains("a.bin.hexpatch-"),
+            "{kept:?}"
+        );
+        let left = walk(&pair.cache());
+        assert_eq!(
+            left,
+            std::slice::from_ref(&kept),
+            "in_place={in_place}: only the list"
+        );
+        if !in_place {
+            assert_eq!(
+                std::fs::read(&pair.remote).unwrap(),
+                body,
+                "remote untouched"
+            );
+        }
+        // Save copy: refused, listed, nothing published.
+        let err = file.save_copy(&patches).unwrap_err().to_string();
+        assert!(err.contains("no copy saved"), "{err}");
+        assert!(!pair.remote.with_file_name("a.edited.bin").exists());
+    }
+}
+
+/// Truncating the source mid-pass makes the next read fail; the sparse edits must still be
+/// retained as a patch list rather than lost with the partial stage.
+#[test]
+fn truncation_during_the_pass_keeps_the_patch_list() {
+    let pair = Pair::new(&vec![0x41; 2 * CHUNK], false);
+    let mut file = pair.open();
+    let base = pair.base.clone();
+    file.chunk_hook = Some(Box::new(move |done| {
+        if done == CHUNK as u64 {
+            File::options()
+                .write(true)
+                .open(&base)
+                .unwrap()
+                .set_len(0)
+                .unwrap();
+        }
+    }));
+    let patches = BTreeMap::from([(0u64, 0xff)]);
+    let Saved::Refused {
+        kept: Some(kept), ..
+    } = file.save(&patches).unwrap()
+    else {
+        panic!("a changed source must retain its edits");
+    };
+    assert!(std::fs::read_to_string(&kept).unwrap().contains("0x0: FF"));
+    assert_eq!(walk(&pair.cache()), [kept]);
+}
+
+/// The list of changes when the bytes as opened changed before the save: a new owner-only file
+/// `<name>.hexpatch-<stamp>.txt` among the edits — a header naming the source as opened, then
+/// one `offset: bytes` line per run of changed bytes.
+#[test]
+fn the_list_of_changes_names_the_source_and_each_run() {
+    let pair = Pair::new(FIXTURE, true);
+    let mut file = pair.open();
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&pair.base)
+        .unwrap()
+        .write_all(b"more")
+        .unwrap();
+    let patches = BTreeMap::from([(1u64, 0xaa), (2, 0xbb), (10, 0xcc)]);
+    let Saved::Refused { message, kept } = file.save(&patches).unwrap() else {
+        panic!("expected Refused")
+    };
+    let kept = kept.unwrap();
+    let name = kept.file_name().unwrap().to_string_lossy().into_owned();
+    assert!(
+        name.starts_with("a.bin.hexpatch-") && name.ends_with(".txt"),
+        "{name}"
+    );
+    assert!(message.contains(&*kept.to_string_lossy()), "{message}");
+    use std::os::unix::fs::PermissionsExt;
+    let mode = std::fs::metadata(&kept).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600);
+    let text = std::fs::read_to_string(&kept).unwrap();
+    assert!(
+        text.contains(&format!("# source: {}", pair.base.display())),
+        "{text}"
+    );
+    assert!(
+        text.contains("# as opened: 21 bytes, modified 2020-09-13T"),
+        "{text}"
+    );
+    let lines: Vec<&str> = text.lines().filter(|l| !l.starts_with('#')).collect();
+    assert_eq!(lines, ["0x1: AABB", "0xA: CC"]);
+}
+
+/// Conflicts at the same length — what a size check alone misses. The remote rewritten with a
+/// different mtime, or with the fetch's own mtime put back (the fetch's hash catches it); a
+/// local file written in place (its handle sees it); a local file replaced by another of the
+/// same size and mtime (the hash the save's pass takes catches it). Never overwritten.
+#[test]
+fn same_length_changes_are_refused() {
+    let other = b"SOPEN HEX VIEW\x00\xffabc\n\x80"; // FIXTURE's length, other bytes
+    assert_eq!(other.len(), FIXTURE.len());
+    let patches = BTreeMap::from([(0u64, 0u8)]);
+    for case in ["fetched, new mtime", "fetched, same mtime"] {
+        let pair = Pair::new(FIXTURE, false);
+        let mut file = pair.open();
+        let was = mtime(&pair.remote);
+        std::fs::write(&pair.remote, other).unwrap();
+        if case.ends_with("new mtime") {
+            set_mtime(&pair.remote, 1_700_000_000);
+        } else {
+            File::options()
+                .write(true)
+                .open(&pair.remote)
+                .unwrap()
+                .set_times(std::fs::FileTimes::new().set_modified(was))
+                .unwrap();
+        }
+        let saved = file.save(&patches).unwrap();
+        assert!(matches!(saved, Saved::Refused { .. }), "{case}: {saved:?}");
+        assert_eq!(std::fs::read(&pair.remote).unwrap(), other, "{case}");
+    }
+    // In place, written in place with a new mtime: the handle sees it before anything is made.
+    let pair = Pair::new(FIXTURE, true);
+    let mut file = pair.open();
+    File::options()
+        .write(true)
+        .open(&pair.remote)
+        .unwrap()
+        .write_all_at(other, 0)
+        .unwrap();
+    set_mtime(&pair.remote, 1_700_000_000);
+    let Saved::Refused { kept, .. } = file.save(&patches).unwrap() else {
+        panic!("in place, rewritten: expected Refused")
+    };
+    assert!(kept.unwrap().to_string_lossy().contains(".hexpatch-"));
+    assert_eq!(std::fs::read(&pair.remote).unwrap(), other);
+    // In place, replaced by another file of the same size and mtime before the save: the old
+    // file's change time moved (unlinked), so the handle refuses at once.
+    let other_file = |pair: &Pair| {
+        let swap = pair.remote.with_file_name("swap.bin");
+        std::fs::write(&swap, other).unwrap();
+        File::options()
+            .write(true)
+            .open(&swap)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(mtime(&pair.remote)))
+            .unwrap();
+        swap
+    };
+    let pair = Pair::new(FIXTURE, true);
+    let mut file = pair.open();
+    std::fs::rename(other_file(&pair), &pair.remote).unwrap();
+    let saved = file.save(&patches).unwrap();
+    assert!(matches!(saved, Saved::Refused { .. }), "{saved:?}");
+    assert_eq!(
+        std::fs::read(&pair.remote).unwrap(),
+        other,
+        "not overwritten"
+    );
+    // In place, replaced during the save itself — after the pass and the target's first check,
+    // when the remote is first written: same size, same mtime, so only content tells. The
+    // overwrite checks the target against the hash the pass took, and refuses.
+    let pair = Pair::new(FIXTURE, true);
+    let abs = pair.remote.to_str().unwrap().to_string();
+    let at = LocalFs::new().stat(&abs).unwrap();
+    assert!(at.sha256.is_none(), "a plain stat: no hash from a fetch");
+    let (swap, target) = (other_file(&pair), pair.remote.clone());
+    let fs = FirstWrite {
+        fs: LocalFs::new(),
+        before_write: Some(Box::new(move || std::fs::rename(&swap, &target).unwrap())),
+    };
+    let origin = Origin::new(Box::new(fs), None, None, abs, at);
+    let mut file = HexFile::open(origin, &pair.base, None, &pair.cache()).unwrap();
+    let saved = file.save(&patches).unwrap();
+    let Saved::Refused { message, kept } = saved else {
+        panic!("in place, replaced during the save: expected Refused, got {saved:?}")
+    };
+    assert!(message.contains("its content changed"), "{message}");
+    assert!(kept.unwrap().to_string_lossy().contains(".conflict-"));
+    assert_eq!(
+        std::fs::read(&pair.remote).unwrap(),
+        other,
+        "not overwritten"
+    );
+}
+
+/// A save spanning several chunks: changes on both sides of each chunk boundary and at the last
+/// byte land exactly; the backup is the original exactly.
+#[test]
+fn a_multi_chunk_save_writes_every_byte_exactly() {
+    let len = 2 * CHUNK + CHUNK / 2;
+    let body: Vec<u8> = (0..len as u32).map(|i| (i % 241) as u8).collect();
+    let pair = Pair::new(&body, false);
+    let mut file = pair.open();
+    let c = CHUNK as u64;
+    let at = [0, c - 1, c, c + 1, 2 * c - 1, 2 * c, len as u64 - 1];
+    let patches: BTreeMap<u64, u8> = at.iter().map(|&o| (o, !body[o as usize])).collect();
+    let Saved::Written { backup, .. } = file.save(&patches).unwrap() else {
+        panic!("expected Written")
+    };
+    let mut want = body.clone();
+    for (&o, &b) in &patches {
+        want[o as usize] = b;
+    }
+    assert!(
+        std::fs::read(&pair.remote).unwrap() == want,
+        "the whole file"
+    );
+    assert!(std::fs::read(&backup).unwrap() == body, "the whole backup");
+}
+
+// ---------------------------------------------------------------------------------------------
+// The window: one frame's input against a finished save; the Go to field; the rows.
+
+/// A save (chosen in the close prompt) that lands in the same frame as an edit or an undo:
+/// the frame's input counts first — the window asks again rather than closing over it.
+/// Without input in that frame it closes.
+#[test]
+fn a_save_landing_in_the_same_frame_as_an_edit_never_closes_over_it() {
+    for input in ["typed", "undo", "none"] {
+        let mut fx = fetched("blob.bin", FIXTURE, 1000.0, 600.0);
+        fx.typed("00");
+        let before = fx.win.doc.patches().clone();
+        let (tx, rx) = mpsc::channel();
+        fx.win.job = Some(Job {
+            kind: JobKind::Save { close_after: true },
+            snapshot: before.clone(),
+            rx,
+        });
+        tx.send(Ok(JobDone::Saved(Saved::Written {
+            remote: "box:/blob.bin".to_string(),
+            backup: PathBuf::from("/backup/blob.bin"),
+            notes: Vec::new(),
+        })))
+        .unwrap();
+        let (events, mods) = match input {
+            "typed" => (vec![Event::Text("ff".into())], Modifiers::NONE),
+            "undo" => (
+                vec![Event::Key {
+                    key: Key::Z,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: command(false),
+                }],
+                command(false),
+            ),
+            _ => (Vec::new(), Modifiers::NONE),
+        };
+        fx.drv.frame(&mut fx.win, events, mods);
+        assert!(fx.win.job.is_none(), "{input}: the result was taken");
+        if input == "none" {
+            assert!(fx.win.close_ok, "nothing new: closes");
+            continue;
+        }
+        assert!(!fx.win.close_ok, "{input}: closed over the frame's edit");
+        assert!(fx.win.prompt, "{input}: asks again");
+        assert_ne!(
+            *fx.win.doc.patches(),
+            before,
+            "{input}: the frame's input is kept"
+        );
+        assert!(fx.win.doc.unsaved(), "{input}");
+    }
+}
+
+/// Once closing is decided nothing edits: typing in the frames before the window goes away
+/// changes nothing.
+#[test]
+fn nothing_edits_once_closing_is_decided() {
+    let mut fx = fetched("blob.bin", FIXTURE, 1000.0, 600.0);
+    fx.typed("00");
+    assert_eq!(fx.win.doc.changed_count(), 1);
+    fx.win.close_ok = true;
+    fx.typed("ff");
+    assert_eq!(
+        fx.win.doc.byte(1),
+        Some(FIXTURE[1]),
+        "typed after closing was decided"
+    );
+    fx.key(Key::Z, command(false));
+    assert_eq!(
+        fx.win.doc.changed_count(),
+        1,
+        "undone after closing was decided"
+    );
+    assert_eq!(fx.win.doc.byte(0), Some(0));
+}
+
+/// A close asked for during a save that then lands with notes (say, the remote changed right
+/// after it) keeps the window open so they can be read — as Save chosen in the close prompt
+/// does.
+#[test]
+fn a_save_that_lands_with_notes_keeps_the_window_open() {
+    let note = "saved, but the remote changed right after: another writer".to_string();
+    for prompt in [false, true] {
+        let mut fx = fetched("blob.bin", FIXTURE, 1000.0, 600.0);
+        fx.typed("00");
+        let (tx, rx) = mpsc::channel();
+        fx.win.job = Some(Job {
+            kind: JobKind::Save {
+                close_after: prompt,
+            },
+            snapshot: fx.win.doc.patches().clone(),
+            rx,
+        });
+        if !prompt {
+            assert!(!fx.win.close_requested());
+            assert!(fx.win.close_when_done);
+        }
+        tx.send(Ok(JobDone::Saved(Saved::Written {
+            remote: "box:/blob.bin".to_string(),
+            backup: PathBuf::from("/backup/blob.bin"),
+            notes: vec![note.clone()],
+        })))
+        .unwrap();
+        fx.settle();
+        assert!(
+            !fx.win.close_ok,
+            "prompt={prompt}: closed with notes unread"
+        );
+        assert!(!fx.win.prompt, "prompt={prompt}: nothing is unsaved");
+        assert!(
+            fx.drv.find_text(&note).is_some(),
+            "prompt={prompt}: shown whole"
+        );
+        assert!(
+            fx.win.status.text.starts_with("not closed"),
+            "{}",
+            fx.win.status.text
+        );
+    }
+}
+
+/// A save whose worker ends without a result is a visible failure: the edits stay, the window
+/// stays usable, and a new Save works — even when the dead worker held the file.
+#[test]
+fn a_dead_save_worker_is_a_visible_failure_and_the_window_stays_usable() {
+    let mut fx = fetched("blob.bin", FIXTURE, 1000.0, 600.0);
+    fx.typed("00");
+    let (tx, rx) = mpsc::channel::<Result<JobDone>>();
+    drop(tx);
+    fx.win.job = Some(Job {
+        kind: JobKind::Save { close_after: false },
+        snapshot: fx.win.doc.patches().clone(),
+        rx,
+    });
+    let file = fx.win.file.clone();
+    let _ = std::thread::spawn(move || {
+        let _held = file.lock().unwrap();
+        panic!("the save worker dies holding the file (test)");
+    })
+    .join();
+    assert!(fx.win.file.is_poisoned());
+    fx.settle();
+    assert!(fx.win.job.is_none());
+    assert!(fx.win.status.error, "{}", fx.win.status.text);
+    assert!(
+        fx.win.notices[0].contains("stopped without a result"),
+        "{:?}",
+        fx.win.notices
+    );
+    assert!(fx.win.doc.dirty(), "the edits stay");
+    fx.key(Key::S, command(false));
+    fx.wait_for_save();
+    assert!(
+        fx.win.status.text.starts_with("saved "),
+        "{}",
+        fx.win.status.text
+    );
+    assert_eq!(std::fs::read(&fx.remote).unwrap()[0], 0);
+}
+
+/// Cmd/Ctrl+G and typing in one frame: the typing goes to the Go to field (or nowhere), never
+/// into the bytes. A click into the field with typing in the same frame: the same.
+#[test]
+fn the_go_to_field_owns_the_typing_of_its_frame() {
+    let mut fx = fetched("blob.bin", FIXTURE, 1000.0, 600.0);
+    fx.settle();
+    let rev = fx.win.doc.rev();
+    assert_eq!(FIXTURE[0] >> 4, 7, "'1' would change the first byte");
+    let events = vec![
+        Event::Key {
+            key: Key::G,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: command(false),
+        },
+        Event::Text("12".into()),
+    ];
+    fx.drv.frame(&mut fx.win, events, command(false));
+    fx.drv.idle(&mut fx.win, 1);
+    assert_eq!(fx.win.doc.rev(), rev, "Cmd+G with typing edited a byte");
+    assert_eq!(fx.win.doc.changed_count(), 0);
+    assert_eq!(fx.win.goto, "12", "the typing went to the field");
+    // Back to the grid; then a click into the empty field with typing in the same frame.
+    fx.key(Key::Escape, Modifiers::NONE);
+    fx.win.goto.clear();
+    fx.drv.idle(&mut fx.win, 2);
+    let field = fx.drv.find_text("0x… or decimal").expect("the empty field");
+    fx.drv.move_to(&mut fx.win, field.center());
+    fx.drv.press(&mut fx.win, egui::PointerButton::Primary);
+    let events = vec![
+        Event::PointerButton {
+            pos: field.center(),
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: Modifiers::NONE,
+        },
+        // Not a digit the first byte already starts with ('s' = 0x73): typing it would change it.
+        Event::Text("a".into()),
+    ];
+    let cursor = fx.win.cursor;
+    fx.drv.frame(&mut fx.win, events, Modifiers::NONE);
+    fx.drv.idle(&mut fx.win, 1);
+    assert_eq!(
+        fx.win.doc.rev(),
+        rev,
+        "a click into the field with typing edited a byte"
+    );
+    assert_eq!(fx.win.doc.changed_count(), 0);
+    assert_eq!(fx.win.cursor, cursor, "the typing moved the cursor");
+}
+
+/// The disclosure rows sit below the grid: a report — a long one, wrapping — appears there only
+/// once the button is let go, takes rows off the grid's bottom, and never moves the grid's top
+/// or any row on it.
+#[test]
+fn a_report_never_moves_the_rows() {
+    let bytes: Vec<u8> = (0..1024u32).map(|i| (i * 7 % 256) as u8).collect();
+    let mut fx = fetched("blob.bin", &bytes, 700.0, 500.0);
+    fx.settle();
+    let before = fx.win.layout.unwrap();
+    let visible = fx.win.visible;
+    let row1 = hex_cells(&bytes[16..32].iter().map(|&b| Some(b)).collect::<Vec<_>>());
+    let row_at = |fx: &Fx| fx.drv.find_text(&row1).expect("row 1 shown").min;
+    let row1_at = row_at(&fx);
+    let long = format!(
+        "{} changed since it was opened (size 1024 → 2048); not saved — your edit is at {}",
+        "box:/srv/a/rather/long/path/to/the/file/blob.bin",
+        "<cache>/.edits/box/srv/a/rather/long/path/to/the/file/blob.conflict-20261117T000000Z-1a2b3c4d.bin"
+    );
+    let (tx, rx) = mpsc::channel();
+    fx.win.job = Some(Job {
+        kind: JobKind::Save { close_after: false },
+        snapshot: fx.win.doc.patches().clone(),
+        rx,
+    });
+    let p = fx.pos(40, Pane::Hex);
+    fx.drv.move_to(&mut fx.win, p);
+    fx.drv.press(&mut fx.win, egui::PointerButton::Primary);
+    tx.send(Ok(JobDone::Saved(Saved::Refused {
+        message: long.clone(),
+        kept: None,
+    })))
+    .unwrap();
+    for pass in 0..4 {
+        fx.drv.idle(&mut fx.win, 1);
+        assert!(
+            fx.drv.find_text(&long).is_none(),
+            "{pass}: not while the button is down"
+        );
+        assert_eq!(fx.win.layout.unwrap(), before, "{pass}");
+    }
+    fx.drv.release(&mut fx.win, egui::PointerButton::Primary);
+    fx.settle();
+    assert!(
+        fx.drv.find_text(&long).is_some(),
+        "shown whole after the release"
+    );
+    let after = fx.win.layout.unwrap();
+    assert_eq!(after.rows.top(), before.rows.top(), "the grid's top moved");
+    assert_eq!(
+        (after.row_h, after.hex_x, after.ascii_x),
+        (before.row_h, before.hex_x, before.ascii_x)
+    );
+    assert_eq!(row_at(&fx), row1_at, "a row moved");
+    assert!(
+        after.rows.bottom() < before.rows.bottom(),
+        "the rows below it give way"
+    );
+    assert!(fx.win.visible < visible, "{} vs {visible}", fx.win.visible);
+}
+
+/// The cursor is painted in both columns — filled where it types, outlined in the other — and
+/// follows navigation, Tab and undo.
+#[test]
+fn the_cursor_is_painted_in_both_columns() {
+    let mut fx = fetched("blob.bin", FIXTURE, 1000.0, 600.0);
+    let fill = fx.drv.ctx.global_style().visuals.selection.bg_fill;
+    let painted = |fx: &Fx, at: u64| {
+        let rects = fx.drv.rects();
+        let filled = |pane| {
+            let p = fx.pos(at, pane);
+            rects.iter().any(|(r, f, _)| *f == fill && r.contains(p))
+        };
+        let outlined = |pane| {
+            let p = fx.pos(at, pane);
+            rects
+                .iter()
+                .any(|(r, f, w)| *f != fill && *w > 0.0 && r.contains(p))
+        };
+        (
+            filled(Pane::Hex),
+            outlined(Pane::Hex),
+            filled(Pane::Ascii),
+            outlined(Pane::Ascii),
+        )
+    };
+    fx.key(Key::ArrowDown, Modifiers::NONE);
+    fx.key(Key::ArrowRight, Modifiers::NONE);
+    fx.key(Key::ArrowRight, Modifiers::NONE);
+    assert_eq!(fx.at(), 18);
+    assert_eq!(
+        painted(&fx, 18),
+        (true, false, false, true),
+        "hex column types"
+    );
+    assert_eq!(
+        painted(&fx, 0),
+        (false, false, false, false),
+        "not where it was"
+    );
+    fx.key(Key::Tab, Modifiers::NONE);
+    assert_eq!(
+        painted(&fx, 18),
+        (false, true, true, false),
+        "ASCII column types"
+    );
+    fx.typed("Z");
+    assert_eq!(fx.at(), 19);
+    assert!(
+        fx.drv.find_text("ABZ..").is_some(),
+        "the ASCII column shows it"
+    );
+    assert!(
+        fx.drv.find_text("41 42 5A 0A 80").is_some(),
+        "the hex column too"
+    );
+    fx.key(Key::Z, command(false));
+    assert_eq!(fx.at(), 18, "undo puts the cursor back on the byte");
+    assert_eq!(painted(&fx, 18), (false, true, true, false));
+    assert!(fx.drv.find_text("ABC..").is_some());
+    assert!(fx.drv.find_text("41 42 43 0A 80").is_some());
 }

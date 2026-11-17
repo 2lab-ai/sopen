@@ -596,6 +596,17 @@ pub fn run_window<W: Window + 'static>(
     window: W,
     hooks: &Hooks,
 ) -> Result<()> {
+    run_window_sized(title, size, [480.0, 320.0], window, hooks)
+}
+
+/// [`run_window`] with a smallest size of `min` points (the binary dialog is smaller).
+pub fn run_window_sized<W: Window + 'static>(
+    title: &str,
+    size: [f32; 2],
+    min: [f32; 2],
+    window: W,
+    hooks: &Hooks,
+) -> Result<()> {
     let choice = renderer_choice()?;
     let shot_done = Arc::new(AtomicBool::new(false));
     let shot_result: Arc<Mutex<Option<Result<String, String>>>> = Arc::default();
@@ -641,7 +652,7 @@ pub fn run_window<W: Window + 'static>(
                 .with_min_inner_size(
                     hooks
                         .window_size
-                        .map_or([480.0, 320.0], |[w, h]| [w.min(480.0), h.min(320.0)]),
+                        .map_or(min, |[w, h]| [w.min(min[0]), h.min(min[1])]),
                 )
                 .with_active(true),
             renderer,

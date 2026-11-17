@@ -2,12 +2,12 @@
 //! stderr and a non-zero exit (1 = error, 3 = a write refused because the remote changed). A run
 //! forwarded to another machine leaves with that machine's exit code.
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
-use sopen::cache::{self, Dirs};
+use sopen::cache::{self, Dirs, Fetched};
 use sopen::cut::{self, CutRequest};
 use sopen::ffmpeg::{self, Rect};
-use sopen::gui::{self, binary::SaveError, Choice};
+use sopen::gui;
 use sopen::human;
 use sopen::kind::{self, Kind};
 use sopen::remote::{self, LocalFs, RemoteFs, SftpRemote, Stat, WriteOutcome};
@@ -278,9 +278,16 @@ impl Place {
         }
     }
 
-    /// Hands the connection to a window: the file layer, how to reopen it if the session dies
-    /// while the window is open, and the host label (`None` for local files).
-    fn into_origin(self, abs: &str, at: Stat, dirs: &Dirs) -> gui::Origin {
+    /// Hands the connection over: the file layer, how to reopen it if the session dies while
+    /// a window is open, and the host label (`None` for local files).
+    fn into_parts(
+        self,
+        dirs: &Dirs,
+    ) -> (
+        Box<dyn RemoteFs + Send>,
+        Option<gui::Reconnect>,
+        Option<String>,
+    ) {
         match self {
             Place::Remote(spec, fs) => {
                 let label = spec.label();
@@ -289,30 +296,28 @@ impl Place {
                     let fs = SftpRemote::connect(&spec, &state)?;
                     Ok(Box::new(fs) as Box<dyn RemoteFs + Send>)
                 });
-                gui::Origin::new(fs, Some(reconnect), Some(label), abs.to_string(), at)
+                (fs, Some(reconnect), Some(label))
             }
-            Place::Local(fs) => gui::Origin::new(Box::new(fs), None, None, abs.to_string(), at),
+            Place::Local(fs) => (Box::new(fs), None, None),
         }
     }
-}
 
-/// A remote file fetched into this session's cached copy.
-struct Fetched {
-    /// The copy, locked for as long as this lives: another session gets a copy of its own.
-    claim: cache::Claim,
-    at: Stat,
-    /// Where earlier copies' unsaved edits went (already printed), for a window to repeat.
-    notices: Vec<String>,
+    /// Hands the connection to a window ([`Place::into_parts`]).
+    fn into_origin(self, abs: &str, at: Stat, dirs: &Dirs) -> gui::Origin {
+        let (fs, reconnect, label) = self.into_parts(dirs);
+        gui::Origin::new(fs, reconnect, label, abs.to_string(), at)
+    }
 }
 
 /// Claims the cached copy of `abs` for this session, moves an earlier copy's unsaved edits
 /// aside, fetches with a progress line, and records what the copy now holds; records size and
-/// fetch time. Every fetch into the cache goes through here (or [`fetch_claimed`], its core),
-/// so no session replaces or moves a copy another one is editing.
+/// fetch time. Every fetch into the cache goes through here (or [`cache::fetch_claimed`], its
+/// core), so no session replaces or moves a copy another one is editing.
 fn fetch_to_cache(place: &mut Place, abs: &str, dirs: &Dirs, rec: &mut Record) -> Result<Fetched> {
     let (_, name) = remote::split_parent(abs);
     let mut progress = Progress::new(format!("fetching {name}"));
-    let fetched = fetch_claimed(place, abs, dirs, &mut |done, total| {
+    let host = place.host_label();
+    let fetched = cache::fetch_claimed(place.fs(), &host, abs, &dirs.cache, &mut |done, total| {
         progress.bytes(done, total)
     });
     progress.finish();
@@ -320,50 +325,6 @@ fn fetch_to_cache(place: &mut Place, abs: &str, dirs: &Dirs, rec: &mut Record) -
     rec.fetch_ms = ms;
     rec.bytes = fetched.at.size;
     Ok(fetched)
-}
-
-/// [`fetch_to_cache`] with the progress going to `progress` (`(bytes done, total)`), returning
-/// the fetch and how long it took in milliseconds — what the binary dialog runs on its worker.
-fn fetch_claimed(
-    place: &mut Place,
-    abs: &str,
-    dirs: &Dirs,
-    progress: &mut dyn FnMut(u64, u64),
-) -> Result<(Fetched, u64)> {
-    let claim = cache::claim(&dirs.cache, &place.host_label(), abs)?;
-    if let Some(note) = &claim.note {
-        eprintln!("sopen: {note}");
-    }
-    let mut notices = Vec::new();
-    // Said as known: a copy that differs from what was recorded has unsaved edits; one with no
-    // record may or may not.
-    match claim.set_aside_unsaved()? {
-        Some(cache::Kept { path, edited: true }) => notices.push(format!(
-            "the previous copy had unsaved edits; kept them at {}",
-            path.display()
-        )),
-        Some(cache::Kept {
-            path,
-            edited: false,
-        }) => notices.push(format!(
-            "no record of what was fetched for {}; kept it at {} in case it holds edits",
-            claim.local.display(),
-            path.display()
-        )),
-        None => {}
-    }
-    for line in &notices {
-        eprintln!("sopen: {line}");
-    }
-    let started = Instant::now();
-    let at = place.fs().fetch(abs, &claim.local, progress)?;
-    if let Some(sha) = &at.sha256 {
-        if let Err(e) = claim.record(sha) {
-            sopen::debug!("not recorded: {e:#}");
-        }
-    }
-    let ms = started.elapsed().as_millis() as u64;
-    Ok((Fetched { claim, at, notices }, ms))
 }
 
 fn classify(fs: &mut dyn RemoteFs, abs: &str, stat: &Stat) -> Result<Kind> {
@@ -478,98 +439,29 @@ fn run_open(
     }
 }
 
-/// The binary dialog's two answers, carried out on the connection (spec §6a).
-struct BinarySource {
-    /// Taken when the hex window opens (it holds the connection from then on).
-    place: Option<Place>,
-    abs: String,
-    dirs: Dirs,
-    /// Already in the cache, claimed (a `.ts` that turned out not to be media).
-    fetched: Option<Fetched>,
-}
+/// The terminal's progress line ([`Progress`]) for the binary route's windowless transfers.
+#[derive(Default)]
+struct Meter(Option<Progress>);
 
-impl BinarySource {
-    /// Without a window: the local file, or the cached copy (fetched now if it is not yet).
-    fn local_path(&mut self, rec: &mut Record) -> Result<PathBuf> {
-        if let Some(fetched) = &self.fetched {
-            return Ok(fetched.claim.local.clone());
-        }
-        let place = self.place.as_mut().context("the file was already opened")?;
-        if let Place::Local(_) = place {
-            return Ok(PathBuf::from(&self.abs));
-        }
-        let fetched = fetch_to_cache(place, &self.abs, &self.dirs, rec)?;
-        let local = fetched.claim.local.clone();
-        self.fetched = Some(fetched);
-        Ok(local)
+impl gui::binary::Meter for Meter {
+    fn start(&mut self, label: &str) {
+        self.0 = Some(Progress::new(label));
     }
-}
-
-impl gui::binary::Source for BinarySource {
-    /// A remote file is fetched into the cache (claimed, as every fetch is) and the hex window
-    /// reads that copy; a local file is read in place.
-    fn open_hex(&mut self, progress: &mut dyn FnMut(u64, u64)) -> Result<gui::binary::Opened> {
-        let mut place = self.place.take().context("the file was already opened")?;
-        let made = match self.fetched.take() {
-            Some(fetched) => Ok(Some((fetched, None))),
-            None if matches!(place, Place::Local(_)) => Ok(None),
-            None => fetch_claimed(&mut place, &self.abs, &self.dirs, progress)
-                .map(|(fetched, ms)| Some((fetched, Some(ms)))),
-        };
-        let made = match made {
-            Ok(made) => made,
-            Err(e) => {
-                // The dialog stays: the owner may try again, or save instead.
-                self.place = Some(place);
-                return Err(e);
-            }
-        };
-        let (base, claim, at, notices, fetch_ms) = match made {
-            Some((fetched, ms)) => (
-                fetched.claim.local.clone(),
-                Some(fetched.claim),
-                fetched.at,
-                fetched.notices,
-                ms,
-            ),
-            None => match place.fs().stat(&self.abs) {
-                Ok(at) => (PathBuf::from(&self.abs), None, at, Vec::new(), None),
-                Err(e) => {
-                    self.place = Some(place);
-                    return Err(e);
-                }
-            },
-        };
-        let origin = place.into_origin(&self.abs, at, &self.dirs);
-        let file = gui::hex::HexFile::open(origin, &base, claim, &self.dirs.cache)?;
-        Ok(gui::binary::Opened {
-            file,
-            notices,
-            fetch_ms,
-        })
-    }
-
-    fn save_to(
-        &mut self,
-        dest: &Path,
-        progress: &mut dyn FnMut(u64, u64),
-    ) -> std::result::Result<u64, SaveError> {
-        if let Some(fetched) = &self.fetched {
-            return gui::binary::copy_to(&fetched.claim.local, dest, progress);
+    fn bytes(&mut self, done: u64, total: u64) {
+        if let Some(p) = self.0.as_mut() {
+            p.bytes(done, total);
         }
-        match self.place.as_mut() {
-            Some(Place::Local(_)) => gui::binary::copy_to(Path::new(&self.abs), dest, progress),
-            Some(place) => gui::binary::download_to(place.fs(), &self.abs, dest, progress),
-            None => Err(SaveError::Failed(anyhow!("the file was already opened"))),
+    }
+    fn finish(&mut self) {
+        if let Some(mut p) = self.0.take() {
+            p.finish();
         }
     }
 }
 
-/// A file sopen has no window for, or any file with `--hex` (spec §6a): the dialog — open it in
-/// the hex window (the default) or save it to a chosen path — or, with `--hex` or
-/// `SOPEN_CHOICE`, that answer without the dialog. `fetched` = already in the cache (a `.ts`
-/// that turned out not to be media). With no display, the local copy's path is printed, as
-/// before the dialog existed.
+/// A file sopen has no window for, or any file with `--hex` (spec §6a): the library's route
+/// ([`gui::binary::open_file`]) over this file's connection. `fetched` = already in the cache
+/// (a `.ts` that turned out not to be media).
 fn open_binary(
     place: Place,
     abs: &str,
@@ -580,106 +472,33 @@ fn open_binary(
     rec: &mut Record,
 ) -> Result<()> {
     let hooks = gui::Hooks::from_env()?;
-    let choice = if hex { Some(Choice::Hex) } else { hooks.choice };
-    if choice.is_none() && hooks.screenshot.is_none() && (hooks.autosave || hooks.autoexport) {
-        // A scripted run ignores input: the dialog would wait for an answer no one gives.
-        bail!(
-            "{} is a binary file: SOPEN_AUTOSAVE / SOPEN_AUTOEXPORT need SOPEN_CHOICE=hex (or \
-             --hex) to say what to open",
-            place.display(abs)
-        );
-    }
-    let already = fetched.is_some();
-    let cancelled = if already {
-        "sopen: cancelled"
-    } else {
-        "sopen: cancelled; nothing was downloaded"
-    };
-    let windowless = match choice {
-        Some(Choice::Save | Choice::Cancel) => true,
-        Some(Choice::Hex) => hooks.autosave,
-        None => false,
-    };
     let (_, name) = remote::split_parent(abs);
     let info = gui::binary::Info {
         title: place.display(abs),
         name: name.to_string(),
         size,
+        local: fetched.is_some() || matches!(place, Place::Local(_)),
     };
-    let mut source = BinarySource {
-        place: Some(place),
-        abs: abs.to_string(),
-        dirs: dirs.clone(),
-        fetched,
-    };
-    if !gui::display_available() && !windowless {
-        let local = source.local_path(rec)?;
-        eprintln!(
-            "sopen: no display for a window (DISPLAY / WAYLAND_DISPLAY unset); printing the \
-             local path instead"
-        );
-        println!("{}", local.display());
-        return Ok(());
+    let (fs, reconnect, label) = place.into_parts(dirs);
+    let source = gui::binary::FileSource::new(fs, reconnect, label, abs, &dirs.cache, fetched);
+    let out = gui::binary::open_file(
+        info,
+        source,
+        &hooks,
+        hex,
+        gui::display_available(),
+        &mut Meter::default(),
+        Box::new(gui::binary::NativeChooser),
+        &mut |window| gui::binary::run_on_screen(window, &hooks),
+    )?;
+    if let Some(ms) = out.fetch_ms {
+        rec.fetch_ms = ms;
     }
-    match choice {
-        Some(Choice::Cancel) => {
-            eprintln!("{cancelled}");
-            Ok(())
-        }
-        Some(Choice::Save) => {
-            let mut progress = Progress::new(format!("saving {name}"));
-            let saved =
-                gui::binary::save_without_window(&info, &mut source, &hooks, &mut |done, total| {
-                    progress.bytes(done, total)
-                });
-            progress.finish();
-            println!("saved {}", saved?.display());
-            Ok(())
-        }
-        // `--hex`, and the windowless autosave: fetched with the progress on the terminal.
-        Some(Choice::Hex) if hex || hooks.autosave => {
-            let mut progress = Progress::new(format!("fetching {name}"));
-            let opened = gui::binary::Source::open_hex(&mut source, &mut |done, total| {
-                progress.bytes(done, total)
-            });
-            progress.finish();
-            let opened = opened?;
-            if let Some(ms) = opened.fetch_ms {
-                rec.fetch_ms = ms;
-            }
-            let outcome = gui::hex::open(opened.file, &hooks, opened.notices)?;
-            window_outcome(outcome, rec)
-        }
-        // The dialog; with SOPEN_CHOICE=hex already answered (the fetch starts at once, in the
-        // window, which then becomes the hex window).
-        Some(Choice::Hex) | None => {
-            let ended = gui::binary::open(
-                info,
-                Box::new(source),
-                Box::new(gui::binary::NativeChooser),
-                &hooks,
-            )?;
-            if let Some(ms) = ended.fetch_ms {
-                rec.fetch_ms = ms;
-            }
-            match ended.hex {
-                Some(outcome) => window_outcome(outcome, rec),
-                None => {
-                    if ended.saved_to.is_none() {
-                        eprintln!("{cancelled}");
-                    }
-                    Ok(())
-                }
-            }
-        }
+    if let Some(action) = out.action {
+        rec.action = Some(action);
     }
-}
-
-/// A window's outcome in the usage log; a refused save is exit 3.
-fn window_outcome(outcome: gui::Outcome, rec: &mut Record) -> Result<()> {
-    rec.action = Some(outcome.action());
-    rec.conflict = outcome.conflict;
-    match outcome.refused {
+    rec.conflict = out.conflict;
+    match out.refused {
         Some(message) => Err(Refused(message).into()),
         None => Ok(()),
     }

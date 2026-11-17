@@ -34,8 +34,8 @@ zsh or fish skip with a note when it is missing; CI installs them and sets `SOPE
   same `(size, mtime)`, same content hash up to 256 MiB) and refuses on change; writes go to a temp name in the
   same directory with the target's owner and mode and are renamed over the target. Spec §5 is the full rule.
   Image and hex Save keep a local backup of the original first. Media exports always write a new sibling file and
-  never use a replacing rename to publish it. The binary dialog's "Save to…" creates its file exclusively and
-  never replaces one (spec §6a).
+  never use a replacing rename to publish it. The binary dialog's "Save to…" fills a hidden staging file and
+  publishes it complete by a hard link, never over anything (spec §6a).
 - **No new edit features without the owner.** The edit list above is the whole list (owner, 2026-11-11; hex
   overwrite added by spec §1 message 9).
 - **ffmpeg/ffprobe are external programs**, resolved at runtime (`SOPEN_FFMPEG` / `SOPEN_FFPROBE`, then PATH).
