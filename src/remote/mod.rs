@@ -14,6 +14,7 @@ use sha2::{Digest, Sha256};
 use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::SystemTime;
 
 /// A replace re-reads the remote and compares its SHA-256 with the fetch's up to this size;
@@ -78,6 +79,73 @@ pub enum WriteOutcome {
         reason: String,
         notes: Vec<String>,
     },
+}
+
+/// What a directory entry is — for a symbolic link, what it points at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EntryKind {
+    Dir,
+    File,
+    /// A fifo, socket or device: never opened (reading a fifo would block).
+    Special,
+    /// A symbolic link that points nowhere (or at something this account cannot stat).
+    Broken,
+    /// The entry itself could not be stat'ed (a folder that may be read but not searched).
+    Unknown,
+}
+
+/// One directory entry as a listing shows it, from the listing itself: SFTP readdir carries
+/// each name's attributes, so a listing costs one round trip, plus one stat per symbolic link
+/// (to say what it points at).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Entry {
+    pub name: String,
+    pub kind: EntryKind,
+    /// The entry is a symbolic link: `kind`, `size` and `mtime` are its target's (the link's
+    /// own when it is broken).
+    pub link: bool,
+    pub size: u64,
+    pub mtime: SystemTime,
+}
+
+impl EntryKind {
+    fn of(stat: &Stat) -> Self {
+        if stat.is_dir {
+            EntryKind::Dir
+        } else if stat.is_file {
+            EntryKind::File
+        } else {
+            EntryKind::Special
+        }
+    }
+}
+
+/// The entry `name` from its own attributes (`own`, as `lstat` gives them) and, for a symbolic
+/// link, its target's (`None`: the link is broken).
+fn entry(name: String, own: &Stat, target: Option<Stat>) -> Entry {
+    let (kind, at) = match (own.is_symlink, target) {
+        (true, Some(t)) => (EntryKind::of(&t), t),
+        (true, None) => (EntryKind::Broken, *own),
+        (false, _) => (EntryKind::of(own), *own),
+    };
+    Entry {
+        name,
+        kind,
+        link: own.is_symlink,
+        size: at.size,
+        mtime: at.mtime,
+    }
+}
+
+/// An entry whose own attributes could not be read.
+fn unknown_entry(name: String) -> Entry {
+    Entry {
+        name,
+        kind: EntryKind::Unknown,
+        link: false,
+        size: 0,
+        mtime: std::time::UNIX_EPOCH,
+    }
 }
 
 /// What a temp standing in for an existing file takes from it: its owner and permission bits,
@@ -163,6 +231,43 @@ pub fn unknown(what: impl Into<String>) -> anyhow::Error {
     anyhow!(OutcomeUnknown(what.into()))
 }
 
+/// A fetch its caller stopped ([`RemoteFs::fetch_cancellable`]); nothing was kept of it.
+#[derive(Debug)]
+pub struct Cancelled;
+
+impl std::fmt::Display for Cancelled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("cancelled")
+    }
+}
+
+impl std::error::Error for Cancelled {}
+
+/// Whether `e` is a fetch its caller stopped.
+pub fn is_cancelled(e: &anyhow::Error) -> bool {
+    e.chain().any(|c| c.is::<Cancelled>())
+}
+
+/// Writes through to `inner` until `stop` is set; from then on every write fails, which ends
+/// the transfer feeding it. (Not `ErrorKind::Interrupted`: `write_all` retries that.)
+struct Stoppable<'a, W> {
+    inner: W,
+    stop: &'a AtomicBool,
+}
+
+impl<W: Write> Write for Stoppable<'_, W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if self.stop.load(Ordering::Relaxed) {
+            return Err(std::io::Error::other("cancelled"));
+        }
+        self.inner.write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
 /// Counts and hashes what passes through to `inner`.
 pub struct Hashing<W> {
     inner: W,
@@ -213,6 +318,36 @@ pub trait RemoteFs {
     fn read_head(&mut self, path: &str, max: usize) -> Result<Vec<u8>>;
     /// Entry names of a directory, sorted (detection only — sopen never syncs directories).
     fn list_dir(&mut self, path: &str) -> Result<Vec<String>>;
+    /// The entries of a directory with their kind, size and modification time, sorted by name
+    /// (the file browser's listing). The local disk and SFTP read the attributes with the
+    /// listing; this fallback stats each name (a round trip per name over a network).
+    fn list_entries(&mut self, path: &str) -> Result<Vec<Entry>> {
+        let mut out = Vec::new();
+        for name in self.list_dir(path)? {
+            let full = join(path, &name);
+            let own = match self.lstat_opt(&full) {
+                Ok(Some(own)) => own,
+                // Gone since the listing.
+                Ok(None) => continue,
+                Err(_) => {
+                    out.push(unknown_entry(name));
+                    continue;
+                }
+            };
+            let target = if own.is_symlink {
+                self.stat_opt(&full).ok().flatten()
+            } else {
+                None
+            };
+            out.push(entry(name, &own, target));
+        }
+        Ok(out)
+    }
+    /// Bytes free for this account on the filesystem holding `path`, when that costs one
+    /// request (`None` otherwise, or when it fails).
+    fn free_space(&mut self, _path: &str) -> Option<u64> {
+        None
+    }
     /// Streams a file's content into `out`; `progress` gets the running byte count.
     fn read_to(
         &mut self,
@@ -271,6 +406,19 @@ pub trait RemoteFs {
         local: &Path,
         progress: &mut dyn FnMut(u64, u64),
     ) -> Result<Stat> {
+        self.fetch_cancellable(remote, local, progress, &AtomicBool::new(false))
+    }
+
+    /// [`RemoteFs::fetch`] that stops when `cancel` is set (checked at every write into the
+    /// copy): the partial copy is removed, `local` is left as it was, and the error is
+    /// [`Cancelled`].
+    fn fetch_cancellable(
+        &mut self,
+        remote: &str,
+        local: &Path,
+        progress: &mut dyn FnMut(u64, u64),
+        cancel: &AtomicBool,
+    ) -> Result<Stat> {
         // The copy is the owner's only: 0700 directories, a 0600 file.
         if let Some(parent) = local.parent() {
             crate::cache::private_dir(parent)?;
@@ -295,7 +443,10 @@ pub trait RemoteFs {
                     .mode(0o600)
                     .open(&part)
                     .with_context(|| format!("cannot create {}", part.display()))?;
-                let mut out = Hashing::new(std::io::BufWriter::with_capacity(1 << 20, file));
+                let mut out = Hashing::new(Stoppable {
+                    inner: std::io::BufWriter::with_capacity(1 << 20, file),
+                    stop: cancel,
+                });
                 let mut cb = |done: u64| progress(done, before.size);
                 self.read_to(remote, &mut out, &mut cb)?;
                 out.flush()?;
@@ -305,6 +456,9 @@ pub trait RemoteFs {
                 Ok(got) => got,
                 Err(e) => {
                     let _ = std::fs::remove_file(&part);
+                    if cancel.load(Ordering::Relaxed) {
+                        return Err(anyhow!(Cancelled));
+                    }
                     return Err(e);
                 }
             };

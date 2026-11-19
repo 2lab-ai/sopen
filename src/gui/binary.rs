@@ -1388,7 +1388,7 @@ impl BinaryWindow {
 
     fn close(&mut self, ctx: &egui::Context) {
         self.close_ok = true;
-        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        super::request_close(ctx);
     }
 
     fn poll(&mut self, ctx: &egui::Context) {

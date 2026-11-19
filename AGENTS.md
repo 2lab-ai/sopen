@@ -4,7 +4,10 @@ Single source of truth for anyone (human or agent) changing this repo. `CLAUDE.m
 
 ## What sopen is
 
-`sopen [user@]host:path` opens a remote file or folder as if it were local. Folders and text go to VS Code when it
+`sopen [user@]host:path` opens a remote file or folder as if it were local. A folder opens in sopen's own file
+browser (two panels, Total Commander-like; Enter shows a file in the viewer for its kind in the same window — a
+read-only text viewer with syntax highlighting, or the image, media or hex window below; F4 hands the entry to the
+editor). Text goes to VS Code when it
 is installed (remote ones only with its Remote - SSH extension), otherwise Zed's remote mode; images, video and
 audio open in sopen's own small window with exactly these edits: rectangle crop and rectangle pixelize (images),
 rectangle crop and time cut (video), time cut (audio). Any other file (a zip, any binary) opens a dialog before
@@ -38,7 +41,8 @@ zsh or fish skip with a note when it is missing; CI installs them and sets `SOPE
   never use a replacing rename to publish it. The binary dialog's "Save to…" fills a file in a private staging
   folder and publishes it complete by a hard link, never over anything (spec §6a).
 - **No new edit features without the owner.** The edit list above is the whole list (owner, 2026-11-11; hex
-  overwrite added by spec §1 message 9).
+  overwrite added by spec §1 message 9). The file browser (message 12) adds viewing, not file operations: no
+  copy, move, delete, rename or new folder, and its viewers keep exactly their own edits.
 - **ffmpeg/ffprobe are external programs**, resolved at runtime (`SOPEN_FFMPEG` / `SOPEN_FFPROBE`, then PATH).
   Do not link libav*.
 - Tests must not need ssh or a network: the remote layer sits behind a trait with a local-filesystem
@@ -54,22 +58,23 @@ prompts on close.
 
 | Hook | Effect |
 |---|---|
-| `SOPEN_STATE='rect=x,y,w,h;t=3.5;in=2;out=6;op=crop\|pixelize;block=16'` | Initial state in source pixels and seconds; `op` (images only, comma-separated, applied in order) uses `rect`. The hex window takes `at=OFFSET;patch=OFFSET:HEXBYTES[,OFFSET:HEXBYTES]` (offsets `0x…` or decimal): the cursor, and bytes overwritten in order, each an undo step. |
+| `SOPEN_STATE='rect=x,y,w,h;t=3.5;in=2;out=6;op=crop\|pixelize;block=16'` | Initial state in source pixels and seconds; `op` (images only, comma-separated, applied in order) uses `rect`. The hex window takes `at=OFFSET;patch=OFFSET:HEXBYTES[,OFFSET:HEXBYTES]` (offsets `0x…` or decimal): the cursor, and bytes overwritten in order, each an undo step. The file browser takes `open=NAME`: that entry of the folder is opened, as Enter would, once it is listed (with `SOPEN_SCREENSHOT`, the viewer is shot). |
 | `SOPEN_SCREENSHOT=<png>` | Open the window, render the state, write a screenshot of the window, exit. Prints `screenshot <png> <w>x<h> title="<host:/abs>" focused=<bool> …`. `SOPEN_WATCHDOG=<s>` (default 30) ends a stalled run. |
 | `SOPEN_AUTOSAVE=1` | Images and the hex window: apply the state and Save without a window (backup, conflict-checked overwrite); exit 0 saved, 3 refused. `SOPEN_AUTOSAVE_DELAY_MS=<ms>` waits before the write so a second process can change the remote (the conflict receipt). |
 | `SOPEN_CHOICE=hex\|save\|cancel` | Answers the binary-file dialog: `hex` starts the fetch at once in the window, which becomes the hex window, as Enter would (with `SOPEN_SCREENSHOT`, the hex window is shot after the switch; with `SOPEN_AUTOSAVE`, no window: fetched and saved); `save` downloads to `SOPEN_SAVE_TO` without a window and prints `saved <path>` (a taken path is exit 1, naming the next free name); `cancel` downloads nothing. Without it, `SOPEN_SCREENSHOT` shoots the dialog and nothing is downloaded, and `SOPEN_AUTOSAVE` on a binary file is an error (nothing would answer the dialog). |
+| `SOPEN_LIST=1` | A folder: print what the file browser lists (the path, a row per entry — Name, Ext, Size, Date, Time — and the `N listed = N bytes` foot) instead of opening the window. A scripted save or export (`SOPEN_AUTOSAVE`, `SOPEN_AUTOEXPORT`) on a folder is an error. |
 | `SOPEN_SAVE_TO=<path>` | Where the dialog's "Save to…" saves (the path field's first value; a folder gets the file's name), instead of the download folder — no native dialog. |
 | `SOPEN_AUTOEXPORT=1` | Media: apply the state and Export without a window; prints the new sibling's path. |
 | `SOPEN_EXPORT_HOLD_MS=<ms>` | Media window: start an Export on open and hold it, at its first progress report at or past 30 %, for that long, so `SOPEN_SCREENSHOT` captures the window mid-export; when the window closes sopen waits for the export and prints its result. |
 | `SOPEN_WINDOW_SIZE=<w>x<h>` | Open the window at that size in points (layout receipts on a narrow window). |
 | `SOPEN_RENDERER=wgpu\|glow` | Force a renderer (default: wgpu, glow when wgpu does not start; `WGPU_BACKEND=dx12` on macOS forces that fallback). |
-| `SOPEN_CODE=<path>` | Use this VS Code CLI for folders and text; an empty value means VS Code is absent. A local setting, not forwarded by `--target`. |
+| `SOPEN_CODE=<path>` | Use this VS Code CLI for text and for the file browser's F4 (a folder itself opens in the browser); an empty value means VS Code is absent. A local setting, not forwarded by `--target`. |
 | `VSCODE_EXTENSIONS=<dir>` | VS Code's own extensions-dir variable; when non-empty sopen looks there (instead of `~/.vscode/extensions`) for Remote - SSH before opening a remote path in VS Code. Tests point it at a temp dir. Not forwarded by `--target`. |
 | `SOPEN_TARGET_BIN=<path>` | `--target` runs this sopen binary on HOST (a build not installed there yet) instead of the one on HOST's PATH or in its Homebrew / cargo install paths. A `--target` run carries this and the hooks above, and `SOPEN_LOG`, to HOST; settings naming local paths stay here. |
 | `SOPEN_CONFIG=<file>` | The config file to use instead of `$XDG_CONFIG_HOME/sopen/config.toml` / `~/.config/sopen/config.toml` (tests point it at a temp file, so the owner's default target never forwards a test run). |
 | `sopen --selftest-audio <file>` | Hidden: play the file on the real output device at gain 0 for ~2 s; prints `callbacks=N underruns=M device=<name> … decoder=ffmpeg\|wav` (a WAV is read in-process where there is no ffmpeg). |
 
-A screenshot is a receipt only after someone has looked at it. Live receipts write only under a
+`SOPEN_SCREENSHOT` on a folder shoots the file browser (its list, or with `SOPEN_STATE=open=NAME` that entry's viewer). A screenshot is a receipt only after someone has looked at it. Live receipts write only under a
 remote `/tmp/sopen-receipts/` directory created for the purpose.
 
 ## Distribution (llmux shape)

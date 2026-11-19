@@ -1,6 +1,6 @@
 //! [`RemoteFs`] on the local disk: local targets, and the implementation every test runs against.
 
-use super::{CreateError, Created, Hashing, Like, RemoteFs, Stat, Uploaded};
+use super::{CreateError, Created, Entry, Hashing, Like, RemoteFs, Stat, Uploaded};
 use anyhow::{anyhow, Context, Result};
 use std::fs;
 use std::io::{ErrorKind, Read, Write};
@@ -80,6 +80,44 @@ impl RemoteFs for LocalFs {
         }
         names.sort();
         Ok(names)
+    }
+
+    /// One `read_dir` and an `lstat` per name (a local call, not a round trip); a link is
+    /// followed only to say what it points at.
+    fn list_entries(&mut self, path: &str) -> Result<Vec<Entry>> {
+        let mut out = Vec::new();
+        for item in fs::read_dir(path).with_context(|| format!("cannot list {path}"))? {
+            let item = item.with_context(|| format!("cannot list {path}"))?;
+            let name = item.file_name().to_string_lossy().into_owned();
+            let own = match fs::symlink_metadata(item.path()) {
+                Ok(meta) => stat_of(&meta),
+                // Gone since the listing.
+                Err(e) if e.kind() == ErrorKind::NotFound => continue,
+                Err(_) => {
+                    out.push(super::unknown_entry(name));
+                    continue;
+                }
+            };
+            let target = own
+                .is_symlink
+                .then(|| fs::metadata(item.path()).ok().map(|m| stat_of(&m)))
+                .flatten();
+            out.push(super::entry(name, &own, target));
+        }
+        out.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(out)
+    }
+
+    #[allow(clippy::unnecessary_cast)] // the field types differ between macOS and Linux
+    fn free_space(&mut self, path: &str) -> Option<u64> {
+        let c = std::ffi::CString::new(path).ok()?;
+        // SAFETY: an all-zero statvfs is a valid value to be overwritten.
+        let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+        // SAFETY: `c` is a NUL-terminated path and `st` a valid place for the result.
+        if unsafe { libc::statvfs(c.as_ptr(), &mut st) } != 0 {
+            return None;
+        }
+        Some((st.f_bavail as u64).saturating_mul(st.f_frsize as u64))
     }
 
     fn read_to(

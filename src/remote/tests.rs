@@ -1162,3 +1162,145 @@ fn f2_no_atomic_replace_refuses_before_uploading() {
         .unwrap();
     assert_eq!(name, "a.edited.txt");
 }
+
+/// A folder with one entry of each kind a listing must tell apart: a folder, a file, a hidden
+/// file, links to a folder and to a file, a broken link and a fifo. Whole-second mtimes (SFTP
+/// v3 carries seconds).
+fn listing_fixture(dir: &Path) {
+    std::fs::create_dir(dir.join("sub")).unwrap();
+    std::fs::write(dir.join("a.txt"), "abc").unwrap();
+    set_mtime(&dir.join("a.txt"), 1_700_000_000);
+    std::fs::write(dir.join(".hidden"), "12345").unwrap();
+    set_mtime(&dir.join(".hidden"), 1_700_000_100);
+    std::os::unix::fs::symlink("sub", dir.join("to-sub")).unwrap();
+    std::os::unix::fs::symlink("a.txt", dir.join("to-a")).unwrap();
+    std::os::unix::fs::symlink("nowhere", dir.join("broken")).unwrap();
+    let fifo = std::ffi::CString::new(p(&dir.join("pipe"))).unwrap();
+    // SAFETY: a valid NUL-terminated path.
+    assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+}
+
+/// What the browser lists for [`listing_fixture`]: each entry's kind (a link's target's), its
+/// size and mtime (a link's target's too), and whether it is a link.
+fn check_listing(fs: &mut dyn RemoteFs, dir: &Path) {
+    let entries = fs.list_entries(p(dir)).unwrap();
+    let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+    assert_eq!(
+        names,
+        [".hidden", "a.txt", "broken", "pipe", "sub", "to-a", "to-sub"]
+    );
+    let by = |name: &str| entries.iter().find(|e| e.name == name).unwrap().clone();
+    let at = |secs: u64| UNIX_EPOCH + Duration::from_secs(secs);
+    let a = by("a.txt");
+    assert_eq!(
+        (a.kind, a.link, a.size, a.mtime),
+        (EntryKind::File, false, 3, at(1_700_000_000))
+    );
+    let hidden = by(".hidden");
+    assert_eq!(
+        (hidden.kind, hidden.size, hidden.mtime),
+        (EntryKind::File, 5, at(1_700_000_100))
+    );
+    assert_eq!((by("sub").kind, by("sub").link), (EntryKind::Dir, false));
+    assert_eq!(
+        (by("to-sub").kind, by("to-sub").link),
+        (EntryKind::Dir, true)
+    );
+    let to_a = by("to-a");
+    assert_eq!(
+        (to_a.kind, to_a.link, to_a.size, to_a.mtime),
+        (EntryKind::File, true, 3, at(1_700_000_000)),
+        "a link shows what it points at"
+    );
+    assert_eq!(
+        (by("broken").kind, by("broken").link),
+        (EntryKind::Broken, true)
+    );
+    assert_eq!(
+        (by("pipe").kind, by("pipe").link),
+        (EntryKind::Special, false)
+    );
+    let free = fs.free_space(p(dir));
+    assert!(free.is_some_and(|b| b > 0), "{free:?}");
+}
+
+#[test]
+fn local_listing_carries_kind_size_and_mtime() {
+    let tmp = tempfile::tempdir().unwrap();
+    listing_fixture(tmp.path());
+    check_listing(&mut LocalFs::new(), tmp.path());
+}
+
+/// Over a real SFTP server (OpenSSH's, as a local child): the attributes come with the readdir
+/// reply — one stat request per symbolic link (what it points at), none per name.
+#[test]
+fn sftp_listing_carries_the_attributes_without_a_stat_per_name() {
+    let Some(mut fs) = SftpRemote::local_server() else {
+        return;
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    listing_fixture(tmp.path());
+    check_listing(&mut fs, tmp.path());
+    assert_eq!(
+        fs.stats(),
+        3,
+        "one stat per link (to-sub, to-a, broken), none per name"
+    );
+}
+
+/// A folder that may be read but not searched: its names list, their attributes cannot be
+/// read — the listing still comes back, each such entry marked unknown.
+#[test]
+fn a_folder_read_but_not_searched_still_lists() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("locked");
+    std::fs::create_dir(&dir).unwrap();
+    std::fs::write(dir.join("x"), "1").unwrap();
+    use std::os::unix::fs::MetadataExt;
+    if std::fs::metadata(&dir).unwrap().uid() == 0 {
+        eprintln!("skipping: root ignores directory permissions");
+        return;
+    }
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o444)).unwrap();
+    let listed = LocalFs::new().list_entries(p(&dir));
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let listed = listed.unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(
+        (listed[0].name.as_str(), listed[0].kind),
+        ("x", EntryKind::Unknown)
+    );
+}
+
+/// A fetch stopped mid-transfer (the browser's Esc): it ends at the next write with
+/// [`Cancelled`], leaves no partial copy, and the copy already at `local` is as it was.
+#[test]
+fn a_cancelled_fetch_keeps_nothing_and_leaves_the_copy_alone() {
+    let tmp = tempfile::tempdir().unwrap();
+    let remote = tmp.path().join("big.bin");
+    std::fs::write(&remote, vec![7u8; 3 << 20]).unwrap();
+    let local = tmp.path().join("cache/big.bin");
+    std::fs::create_dir_all(local.parent().unwrap()).unwrap();
+    std::fs::write(&local, "the earlier copy").unwrap();
+    let cancel = std::sync::atomic::AtomicBool::new(false);
+    let mut calls = 0;
+    let err = LocalFs::new()
+        .fetch_cancellable(
+            p(&remote),
+            &local,
+            &mut |_, _| {
+                calls += 1;
+                cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+            },
+            &cancel,
+        )
+        .unwrap_err();
+    assert!(is_cancelled(&err), "{err:#}");
+    assert_eq!(calls, 1, "it stopped at the first write after the flag");
+    assert_eq!(std::fs::read(&local).unwrap(), b"the earlier copy");
+    let left: Vec<_> = std::fs::read_dir(local.parent().unwrap())
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    assert_eq!(left, ["big.bin"], "no partial copy left");
+}

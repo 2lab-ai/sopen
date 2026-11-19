@@ -316,6 +316,22 @@ pub fn fetch_claimed(
     cache: &Path,
     progress: &mut dyn FnMut(u64, u64),
 ) -> Result<(Fetched, u64)> {
+    let never = std::sync::atomic::AtomicBool::new(false);
+    fetch_claimed_cancellable(fs, host, abs, cache, progress, &never)
+}
+
+/// [`fetch_claimed`] that stops when `cancel` is set
+/// ([`RemoteFs::fetch_cancellable`](crate::remote::RemoteFs::fetch_cancellable)): the copy is
+/// left as it was, the claim released, and the error is
+/// [`Cancelled`](crate::remote::Cancelled).
+pub fn fetch_claimed_cancellable(
+    fs: &mut dyn crate::remote::RemoteFs,
+    host: &str,
+    abs: &str,
+    cache: &Path,
+    progress: &mut dyn FnMut(u64, u64),
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Result<(Fetched, u64)> {
     let claim = claim(cache, host, abs)?;
     if let Some(note) = &claim.note {
         eprintln!("sopen: {note}");
@@ -342,7 +358,7 @@ pub fn fetch_claimed(
         eprintln!("sopen: {line}");
     }
     let started = std::time::Instant::now();
-    let at = fs.fetch(abs, &claim.local, progress)?;
+    let at = fs.fetch_cancellable(abs, &claim.local, progress, cancel)?;
     if let Some(sha) = &at.sha256 {
         if let Err(e) = claim.record(sha) {
             crate::debug!("not recorded: {e:#}");

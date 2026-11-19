@@ -1,11 +1,14 @@
-//! The image window (spec §6), the binary-file dialog and hex window (spec §6a) and the media
-//! window (spec §7). This module is the shared shell: where the opened file lives ([`Origin`]),
+//! The file browser and its text viewer (spec §3a), the image window (spec §6), the binary-file
+//! dialog and hex window (spec §6a) and the media window (spec §7). This module is the shared
+//! shell: where the opened file lives ([`Origin`]),
 //! the window runner (wgpu renderer, glow fallback, activation on start, Cmd/Ctrl+Q through the
 //! close prompt), the receipt hooks ([`Hooks`]) and the screenshot driver. Everything that writes
 //! (Save, Save copy, Export, Save to…) is a plain function over [`Origin`] or a local path,
 //! called by the window's buttons and by the windowless hooks alike.
 
 pub mod binary;
+pub mod browser;
+pub mod chrome;
 pub mod hex;
 pub mod image;
 pub mod media;
@@ -13,6 +16,7 @@ pub mod playback;
 mod select;
 #[cfg(test)]
 pub(crate) mod testkit;
+pub mod text;
 
 pub use select::{fit, Map, Selection};
 
@@ -174,7 +178,8 @@ pub enum Op {
 
 /// `SOPEN_STATE=rect=x,y,w,h;t=3.5;in=2;out=6;op=crop|pixelize;block=16` — source pixels and
 /// seconds. `op` may list several, comma-separated, applied in order. The hex window takes
-/// `at=OFFSET;patch=OFFSET:HEXBYTES[,OFFSET:HEXBYTES]` (offsets `0x…` or decimal).
+/// `at=OFFSET;patch=OFFSET:HEXBYTES[,OFFSET:HEXBYTES]` (offsets `0x…` or decimal); the file
+/// browser `open=NAME`.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct State {
     pub rect: Option<[u32; 4]>,
@@ -187,6 +192,8 @@ pub struct State {
     pub at: Option<u64>,
     /// Hex window: bytes overwritten at an offset, applied in order (each one an undo step).
     pub patches: Vec<(u64, Vec<u8>)>,
+    /// File browser: the entry of the opened folder to open (as Enter would) once it is listed.
+    pub open: Option<String>,
 }
 
 impl State {
@@ -224,6 +231,7 @@ impl State {
                     }
                 }
                 "at" => state.at = Some(hex::parse_offset(value).context("SOPEN_STATE at")?),
+                "open" => state.open = Some(value.to_string()),
                 "patch" => {
                     for one in value.split(',').map(str::trim) {
                         let (at, bytes) = one.split_once(':').ok_or_else(|| {
@@ -288,6 +296,8 @@ pub struct Hooks {
     /// `SOPEN_SAVE_TO=<path>`: where "Save to…" saves (the path field's first value), without
     /// the native dialog.
     pub save_to: Option<PathBuf>,
+    /// `SOPEN_LIST=1`: a folder prints what the file browser lists for it, without a window.
+    pub list: bool,
 }
 
 impl Hooks {
@@ -335,6 +345,7 @@ impl Hooks {
             save_to: std::env::var_os("SOPEN_SAVE_TO")
                 .filter(|p| !p.is_empty())
                 .map(PathBuf::from),
+            list: flag("SOPEN_LIST"),
         })
     }
 
@@ -357,6 +368,69 @@ pub trait Window {
     /// second request must then return `true`).
     fn close_requested(&mut self) -> bool {
         true
+    }
+}
+
+/// While a window is hosted inside another (the file browser shows a viewer in its own
+/// window): whether it asked to close during its pass.
+#[derive(Debug, Clone, Copy, Default)]
+struct Hosted {
+    asked: bool,
+}
+
+fn hosted_id() -> egui::Id {
+    egui::Id::unique("sopen-hosted-window")
+}
+
+/// A window asks to be closed — after its own prompt was answered, or a write it waited for
+/// landed: the viewport closes (the shell asks [`Window::close_requested`] again first). A
+/// window hosted inside another one ([`host_pass`]) tells its host instead, which asks the same
+/// question: a hosted viewer never closes the window around it.
+pub fn request_close(ctx: &egui::Context) {
+    let hosted = ctx.data_mut(|d| match d.get_temp::<Hosted>(hosted_id()) {
+        Some(_) => {
+            d.insert_temp(hosted_id(), Hosted { asked: true });
+            true
+        }
+        None => false,
+    });
+    if !hosted {
+        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+    }
+}
+
+/// Runs a hosted window's pass (`pass`) and says whether the window asked to close in it
+/// ([`request_close`]).
+pub fn host_pass<R>(ctx: &egui::Context, pass: impl FnOnce() -> R) -> (R, bool) {
+    ctx.data_mut(|d| d.insert_temp(hosted_id(), Hosted::default()));
+    let out = pass();
+    let asked = ctx
+        .data_mut(|d| d.remove_temp::<Hosted>(hosted_id()))
+        .is_some_and(|h| h.asked);
+    (out, asked)
+}
+
+/// A window made to be hosted inside another one (the file browser's viewers), and how its
+/// writes end.
+pub struct Embedded {
+    pub window: Box<dyn Window>,
+    /// After the window is gone: `Some(outcome)` once no write it started is still running — a
+    /// write that finished since is printed and counted, as the standalone window's opener
+    /// does — or `None` while one runs. `true` waits for it.
+    pub settle: Box<dyn FnMut(bool) -> Option<Outcome>>,
+}
+
+impl Outcome {
+    /// One window's outcome added to the session's (the browser's viewers, one after
+    /// another): any save or export counts, and a window whose last save was refused makes it
+    /// the session's word (exit 3).
+    pub fn merge(&mut self, next: Outcome) {
+        self.saved |= next.saved;
+        self.exported |= next.exported;
+        self.conflict |= next.conflict;
+        if next.refused.is_some() {
+            self.refused = next.refused;
+        }
     }
 }
 
@@ -804,6 +878,10 @@ mod tests {
             vec![(16, vec![0xde, 0xad]), (17, vec![0x00, 0xff])]
         );
         assert_eq!(State::parse("at=42").unwrap().at, Some(42));
+        assert_eq!(
+            State::parse("open=main.rs").unwrap().open.as_deref(),
+            Some("main.rs")
+        );
         for bad in [
             "at=x",
             "at=-1",

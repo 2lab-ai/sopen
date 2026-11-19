@@ -15,6 +15,8 @@ pub struct Driver {
     pointer: Pos2,
     /// What the last pass painted (to find a button by its label).
     shapes: Vec<egui::epaint::ClippedShape>,
+    /// Every viewport command the passes sent (a close, a resize), oldest first, until taken.
+    commands: Vec<egui::ViewportCommand>,
 }
 
 impl Driver {
@@ -26,6 +28,7 @@ impl Driver {
             time: 0.0,
             pointer: Pos2::new(w / 2.0, h / 2.0),
             shapes: Vec::new(),
+            commands: Vec::new(),
         }
     }
 
@@ -49,8 +52,23 @@ impl Driver {
         };
         let mut out = self.ctx.run_ui(raw, |ui| win.ui(ui));
         self.shapes = std::mem::take(&mut out.shapes);
+        for (_, viewport) in std::mem::take(&mut out.viewport_output) {
+            self.commands.extend(viewport.commands);
+        }
         // No renderer: the texture uploads are dropped on purpose.
         out.textures_delta.clear();
+    }
+
+    /// The viewport commands sent since the last call.
+    pub fn take_commands(&mut self) -> Vec<egui::ViewportCommand> {
+        std::mem::take(&mut self.commands)
+    }
+
+    /// Whether a pass since the last [`Driver::take_commands`] asked the viewport to close.
+    pub fn closed(&self) -> bool {
+        self.commands
+            .iter()
+            .any(|c| matches!(c, egui::ViewportCommand::Close))
     }
 
     /// `n` passes without input.
@@ -207,6 +225,24 @@ impl Driver {
             _ => None,
         });
         found.first().map(|(r, ())| *r)
+    }
+
+    /// The colour of each section of the galley the last pass drew for exactly `text`, where it
+    /// can be seen (as for [`Driver::find_text`]) — a highlighted line has several.
+    pub fn colors_of(&self, text: &str) -> Option<Vec<egui::Color32>> {
+        let found = self.shown(|s| match s {
+            egui::Shape::Text(t) if t.galley.text() == text && !t.galley.elided => Some((
+                t.galley.rect.translate(t.pos.to_vec2()),
+                t.galley
+                    .job
+                    .sections
+                    .iter()
+                    .map(|s| s.format.color)
+                    .collect::<Vec<_>>(),
+            )),
+            _ => None,
+        });
+        found.into_iter().next().map(|(_, colors)| colors)
     }
 
     /// How many rows the last pass laid `text` out in, whole or cut with "…", if it drew it

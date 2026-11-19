@@ -3,8 +3,8 @@
 Open a file or folder on another machine as if it were local:
 
 ```sh
+sopen myserver:~/project           # folder → sopen's file browser: two panels, Enter views any file
 sopen myserver:/var/log/app.log    # text → VS Code remote (Remote - SSH), else Zed
-sopen myserver:~/project           # folder → the same, as a project
 sopen myserver:/tmp/shot.png       # image → view, rectangle crop / pixelize, save back
 sopen myserver:/tmp/talk.mp4       # video → play, rectangle crop, time cut → new file next to it
 sopen myserver:/tmp/a.mp3          # audio → play, time cut
@@ -23,19 +23,20 @@ brew install 2lab-ai/tap/sopen-preview    # macOS (arm64, x86_64), Linux (x86_64
 ## Requirements
 
 - Media needs `ffmpeg` and `ffprobe` (the formula installs them).
-- Folders and text: local ones open in VS Code (`code`) when it is installed; remote ones open in
-  VS Code when its Remote - SSH extension is installed (sopen does not install it), else in Zed.
-  Without VS Code, sopen uses Zed.
+- Text (and F4 in the file browser): local files open in VS Code (`code`) when it is installed;
+  remote ones open in VS Code when its Remote - SSH extension is installed (sopen does not install
+  it), else in Zed. Without VS Code, sopen uses Zed.
 - Linux: the ALSA runtime library (libasound2 / alsa-lib) — present on desktop Linux; sopen runs
   on the machine whose screen shows the file (the one you sit at, or the `--target`), not on the
-  remote. The image and media windows, the binary-file dialog and the hex window need a desktop
-  session (X11 or Wayland); without one a binary file is fetched and its path printed.
+  remote. The file browser, the image and media windows, the binary-file dialog and the hex window
+  need a desktop session (X11 or Wayland); without one a folder opens in the editor and a binary
+  file is fetched and its path printed.
 
 ## What the remote needs
 
 Only sshd with its SFTP subsystem (the default). sopen installs and runs nothing there. When you open
-a folder or text file, VS Code Remote - SSH or Zed installs its own remote server on first use — that is the editor's behaviour,
-not sopen's. Images and media are fetched over SFTP and handled locally. (A `--target` machine is
+a text file (or press F4 in the file browser), VS Code Remote - SSH or Zed installs its own remote server on first use — that is the editor's behaviour,
+not sopen's. Folders are listed over SFTP. Images and media are fetched over SFTP and handled locally. (A `--target` machine is
 different: it shows the file, so it needs sopen installed — see below.)
 
 ## Open on another machine's screen: `--target`
@@ -68,12 +69,40 @@ name, so that name must work for `ssh` on `<host>`.
 The window opens on `<host>`'s desktop session (on Linux sopen finds it through
 `systemctl --user`). On macOS an app started over ssh cannot take focus: sopen's own window
 floats above the other windows until you click, type or scroll in it (or it gets focus), but the editor
-opens behind the active app. From a terminal, Ctrl+C reaches `<host>` and closes the window
+(for text) opens behind the active app. From a terminal, Ctrl+C reaches `<host>` and closes the window
 there; a sopen stopped without a terminal leaves the window on `<host>` open.
 
 The exit code is `<host>`'s; `could not reach <host>` means ssh did not get there, `sopen is not
 installed on <host>` (exit 127) means it has no sopen, and `sopen on <host> ended with status
 N (signal n?)` means it most likely was interrupted there.
+
+## Folders: the file browser
+
+```sh
+sopen myserver:/srv/app        # two panels on the folder, as in Total Commander
+```
+
+A folder opens in sopen's own window: two file panels side by side, each listing `..`, then the
+folders, then the files (Name · Ext · Size · Date · Time; hidden files dimmed), with
+`N listed = N bytes` and the free space at the foot.
+
+| Key | |
+|---|---|
+| arrows, `PgUp` / `PgDn`, `Home` / `End` | move the bar |
+| `Tab` | the other panel |
+| `Enter` | a folder: go in; `..`: go up; a file: show it in the viewer for its kind, in the same window |
+| `Backspace` | up one folder |
+| a letter | the next name starting with it |
+| `F3` | view the file (as Enter) |
+| `F4` | open the folder or file in VS Code / Zed |
+| `Esc` / `F3` in a viewer | back to the list, the bar where it was |
+
+Text shows read-only with syntax highlighting and line numbers, a page at a time (a file of any
+size opens alike); images open in the image window, video and audio in the media window, anything
+else in the hex editor — each with its own edits and Save, as below. Leaving a viewer with unsaved
+changes asks first, as its own window does. A remote file is fetched with its progress in the
+status row; `Esc` stops the fetch. The browser views only: it does not copy, move, delete or
+rename.
 
 ## Images
 

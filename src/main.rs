@@ -29,8 +29,9 @@ const EXIT_CONFLICT: u8 = 3;
     about = "Open a file or folder on another machine as if it were local",
     long_about = "Open a file or folder on another machine as if it were local.\n\n\
         SOURCE uses scp syntax: [user@]host:path (relative paths are under the remote home) or a \
-        local path. Folders and text open in VS Code when present, otherwise Zed; images, video \
-        and audio in sopen's own window. Any other file (a zip, a binary) asks first: open it in \
+        local path. A folder opens in sopen's own file browser (two panels; Enter shows a file in \
+        its viewer, F4 opens VS Code or Zed); text opens in VS Code when present, otherwise Zed; \
+        images, video and audio in sopen's own window. Any other file (a zip, a binary) asks first: open it in \
         sopen's hex editor (the default) or save it to a path you choose. --hex opens any file in \
         the hex editor.\n\n\
         It opens on this machine, or with --target HOST on HOST's screen (sopen runs there, \
@@ -328,18 +329,6 @@ fn fetch_to_cache(place: &mut Place, abs: &str, dirs: &Dirs, rec: &mut Record) -
     Ok(fetched)
 }
 
-fn classify(fs: &mut dyn RemoteFs, abs: &str, stat: &Stat) -> Result<Kind> {
-    if stat.is_dir {
-        return Ok(Kind::Directory);
-    }
-    let (_, name) = remote::split_parent(abs);
-    if let Some(kind) = kind::by_extension(name) {
-        return Ok(kind);
-    }
-    let head = fs.read_head(abs, kind::SNIFF_BYTES)?;
-    Ok(kind::classify(name, || head, stat.size))
-}
-
 /// `sopen config [target HOST | target --unset]`.
 fn run_config(key: Option<ConfigKey>) -> Result<()> {
     let path = config::path()?;
@@ -414,7 +403,7 @@ fn run_open(
     let (mut place, path) = Place::connect(&target, dirs, rec)?;
     let abs = place.fs().realpath(&path)?;
     let stat = place.fs().stat(&abs)?;
-    let kind = classify(place.fs(), &abs, &stat)?;
+    let kind = kind::detect(place.fs(), &abs, &stat)?;
     rec.kind = Some(kind);
     rec.ext = kind::extension(remote::split_parent(&abs).1);
     rec.bytes = stat.size;
@@ -434,9 +423,98 @@ fn run_open(
         return open_binary(place, &abs, stat.size, None, true, dirs, rec);
     }
     match kind {
-        Kind::Directory | Kind::Text => open_in_editor(&mut place, &abs, kind, dirs, rec),
+        Kind::Directory => open_in_browser(place, &abs, dirs, rec),
+        Kind::Text => open_in_editor(&mut place, &abs, kind, dirs, rec),
         Kind::Image | Kind::Video | Kind::Audio => open_in_window(place, &abs, kind, dirs, rec),
         Kind::Other => open_binary(place, &abs, stat.size, None, false, dirs, rec),
+    }
+}
+
+/// A folder opens in sopen's file browser (spec §3a, owner message 12): two panels, Enter
+/// shows a file in the viewer for its kind in the same window, F4 opens VS Code or Zed. With
+/// `SOPEN_LIST` the listing is printed instead of a window; with no display (Linux over ssh)
+/// the folder opens in the editor as before, and one line says why.
+fn open_in_browser(mut place: Place, abs: &str, dirs: &Dirs, rec: &mut Record) -> Result<()> {
+    let hooks = gui::Hooks::from_env()?;
+    if hooks.list {
+        let label = match &place {
+            Place::Remote(spec, _) => Some(spec.label()),
+            Place::Local(_) => None,
+        };
+        for line in gui::browser::listing(place.fs(), label.as_deref(), abs)? {
+            println!("{line}");
+        }
+        return Ok(());
+    }
+    if hooks.autosave || hooks.autoexport {
+        // A scripted run ignores input: a browser no one can move through would wait forever.
+        bail!(
+            "{} is a folder: SOPEN_AUTOSAVE / SOPEN_AUTOEXPORT act on a file (SOPEN_LIST prints \
+             the folder's listing)",
+            place.display(abs)
+        );
+    }
+    if !gui::display_available() {
+        eprintln!(
+            "sopen: no display for the file browser (DISPLAY / WAYLAND_DISPLAY unset); opening \
+             the folder in the editor"
+        );
+        return open_in_editor(&mut place, abs, Kind::Directory, dirs, rec);
+    }
+    let remote = match &place {
+        Place::Remote(spec, _) => Some(spec.clone()),
+        Place::Local(_) => None,
+    };
+    let connect: gui::browser::Connect = match remote.clone() {
+        Some(spec) => {
+            let state = dirs.state.clone();
+            std::sync::Arc::new(move || {
+                let fs = SftpRemote::connect(&spec, &state)?;
+                Ok(Box::new(fs) as Box<dyn RemoteFs + Send>)
+            })
+        }
+        None => std::sync::Arc::new(|| Ok(Box::new(LocalFs::new()) as Box<dyn RemoteFs + Send>)),
+    };
+    let launch: gui::browser::Launch = std::sync::Arc::new(move |path: &str, is_dir: bool| {
+        let editor = zed::choose(
+            remote.is_some(),
+            zed::locate_code(),
+            zed::remote_ssh_installed,
+            zed::locate,
+        );
+        let at = remote
+            .as_ref()
+            .map(|s| (s.user.as_deref(), s.host.as_str()));
+        let name = zed::launch(&editor, at, path, is_dir)?;
+        let shown = match &remote {
+            Some(spec) => spec.display(path),
+            None => path.to_string(),
+        };
+        let mut line = format!("opened {shown} in {name}");
+        if let zed::Editor::Zed {
+            code_cannot_remote: true,
+            ..
+        } = editor
+        {
+            line.push_str(" (VS Code has no Remote - SSH extension)");
+        }
+        Ok(line)
+    });
+    let (fs, _, label) = place.into_parts(dirs);
+    let start = gui::browser::Start {
+        fs,
+        connect,
+        label,
+        abs: abs.to_string(),
+        cache: dirs.cache.clone(),
+        launch,
+    };
+    let outcome = gui::browser::open(start, &hooks)?;
+    rec.action = Some(outcome.action());
+    rec.conflict = outcome.conflict;
+    match outcome.refused {
+        Some(message) => Err(Refused(message).into()),
+        None => Ok(()),
     }
 }
 
@@ -532,7 +610,7 @@ fn open_in_window(
             (local, at)
         }
     };
-    let kind = refine_kind(&local, abs, kind);
+    let kind = kind::refine_local(&local, abs, kind);
     rec.kind = Some(kind);
     if kind == Kind::Other {
         // A `.ts` ffprobe cannot read as media: the binary dialog, on the copy already here.
@@ -568,22 +646,6 @@ fn open_in_window(
     }
 }
 
-/// Video by extension but no video stream (per ffprobe) is audio; without ffprobe, keep it
-/// (a `.ts` ffprobe cannot read is not media).
-fn refine_kind(local: &Path, name: &str, kind: Kind) -> Kind {
-    if kind != Kind::Video {
-        return kind;
-    }
-    let probe = match ffmpeg::resolve().and_then(|t| ffmpeg::probe(&t, local)) {
-        Ok(probe) => Some((probe.video.is_some(), probe.has_audio)),
-        Err(e) => {
-            sopen::debug!("not probed: {e:#}");
-            None
-        }
-    };
-    kind::refine_after_fetch(name, kind, probe)
-}
-
 fn open_in_editor(
     place: &mut Place,
     abs: &str,
@@ -592,37 +654,32 @@ fn open_in_editor(
     rec: &mut Record,
 ) -> Result<()> {
     let is_remote = matches!(place, Place::Remote(..));
-    let code_cannot_remote = match zed::choose(
+    let editor = zed::choose(
         is_remote,
         zed::locate_code(),
         zed::remote_ssh_installed,
         zed::locate,
-    ) {
-        zed::Editor::Code(code) => {
+    );
+    let code_cannot_remote = match editor {
+        zed::Editor::Neither { code_cannot_remote } => code_cannot_remote,
+        _ => {
+            if matches!(
+                editor,
+                zed::Editor::Zed {
+                    code_cannot_remote: true,
+                    ..
+                }
+            ) {
+                eprintln!("VS Code has no Remote - SSH extension; opening in Zed");
+            }
             let remote = match &*place {
                 Place::Remote(spec, _) => Some((spec.user.as_deref(), spec.host.as_str())),
                 Place::Local(_) => None,
             };
-            zed::open_args(&code, &zed::code_args(remote, abs, kind == Kind::Directory))?;
-            println!("opened {} in VS Code", place.display(abs));
+            let name = zed::launch(&editor, remote, abs, kind == Kind::Directory)?;
+            println!("opened {} in {name}", place.display(abs));
             return Ok(());
         }
-        zed::Editor::Zed {
-            cli,
-            code_cannot_remote,
-        } => {
-            if code_cannot_remote {
-                eprintln!("VS Code has no Remote - SSH extension; opening in Zed");
-            }
-            let arg = match place {
-                Place::Remote(spec, _) => zed::remote_url(spec.user.as_deref(), &spec.host, abs),
-                Place::Local(_) => abs.to_string(),
-            };
-            zed::open(&cli, arg.as_ref())?;
-            println!("opened {} in Zed", place.display(abs));
-            return Ok(());
-        }
-        zed::Editor::Neither { code_cannot_remote } => code_cannot_remote,
     };
     let no_code = if code_cannot_remote {
         "VS Code has no Remote - SSH extension"
@@ -634,7 +691,7 @@ fn open_in_editor(
         let mut looked: Vec<&str> = names.to_vec();
         looked.extend_from_slice(fixed);
         bail!(
-            "folders open in VS Code or Zed; {no_code} and Zed was not found (looked for {}); install an editor",
+            "without a display a folder opens in VS Code or Zed; {no_code} and Zed was not found (looked for {}); install an editor",
             looked.join(", ")
         );
     }

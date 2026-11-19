@@ -1279,7 +1279,7 @@ impl ImageWindow {
         let waited = std::mem::take(&mut self.close_when_done);
         if (close_after && !newer) || (waited && !self.doc.unsaved()) {
             self.close_ok = true;
-            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            super::request_close(ctx);
         } else if close_after || waited {
             // Closing was asked for, but the save did not land or the picture changed since it
             // started: say so first (the status is cut to one line) and ask what to do.
@@ -1312,7 +1312,7 @@ impl ImageWindow {
         if plain_key(ctx, Key::P) {
             self.pixelize();
         }
-        if plain_key(ctx, Key::Escape) {
+        if self.sel.is_set() && plain_key(ctx, Key::Escape) {
             self.sel.clear();
         }
         if plain_key(ctx, Key::F) {
@@ -1558,7 +1558,7 @@ impl ImageWindow {
                 if ui.button("Discard").clicked() {
                     self.prompt = false;
                     self.close_ok = true;
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    super::request_close(ctx);
                 }
                 if ui.button("Cancel").clicked() {
                     self.prompt = false;
@@ -1651,6 +1651,40 @@ impl super::Window for ImageWindow {
         self.prompt = true;
         false
     }
+}
+
+/// The image window inside another window (the file browser): the window [`open`] shows,
+/// without the receipt hooks. `notices` are shown whole in its rows, as `open` shows them.
+pub fn embed(file: ImageFile, doc: Doc, notices: Vec<String>) -> super::Embedded {
+    let window = ImageWindow::new(file, doc, Selection::default(), DEFAULT_BLOCK, notices);
+    let (outcome, leftover) = (window.outcome.clone(), window.leftover.clone());
+    super::Embedded {
+        window: Box::new(window),
+        settle: Box::new(move |wait| settle(&leftover, &outcome, wait)),
+    }
+}
+
+/// A save the window left running when it went away, as [`open`] waits for it: with `wait`
+/// waited for, else taken only once it has finished; printed and counted either way. The
+/// window's outcome once none runs.
+fn settle(leftover: &Mutex<Option<Job>>, outcome: &Mutex<Outcome>, wait: bool) -> Option<Outcome> {
+    let mut slot = leftover.lock().unwrap();
+    if let Some(job) = slot.as_ref() {
+        let stopped = || Err(anyhow!("the save stopped without a result"));
+        let result = if wait {
+            eprintln!("sopen: the window closed during a save; waiting for it to finish");
+            job.rx.recv().unwrap_or_else(|_| stopped())
+        } else {
+            match job.rx.try_recv() {
+                Ok(result) => result,
+                Err(mpsc::TryRecvError::Empty) => return None,
+                Err(mpsc::TryRecvError::Disconnected) => stopped(),
+            }
+        };
+        *slot = None;
+        let _ = report(&result, &mut outcome.lock().unwrap());
+    }
+    Some(outcome.lock().unwrap().clone())
 }
 
 #[cfg(test)]

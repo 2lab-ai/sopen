@@ -8,7 +8,7 @@
 //! progress. A request that changes the remote and times out is reported as
 //! [`OutcomeUnknown`](super::OutcomeUnknown), never as "nothing written".
 
-use super::{unknown, CreateError, Created, Hashing, Like, RemoteFs, Stat, Uploaded};
+use super::{unknown, CreateError, Created, Entry, Hashing, Like, RemoteFs, Stat, Uploaded};
 use crate::target::RemoteSpec;
 use anyhow::{anyhow, bail, Context, Result};
 use bytes::BytesMut;
@@ -40,6 +40,9 @@ pub struct SftpRemote {
     rt: Runtime,
     sftp: Option<Sftp>,
     fs: Option<Fs>,
+    /// Stat requests sent (tests: a listing must not stat every name).
+    #[cfg(test)]
+    stats: u64,
 }
 
 /// `Err` = the request got no reply within `limit`.
@@ -90,11 +93,13 @@ impl SftpRemote {
             rt,
             sftp: Some(sftp),
             fs: Some(fs),
+            #[cfg(test)]
+            stats: 0,
         })
     }
 
     fn parts(&mut self) -> (&Runtime, &Sftp, &mut Fs) {
-        let Self { rt, sftp, fs } = self;
+        let Self { rt, sftp, fs, .. } = self;
         (
             rt,
             sftp.as_ref().expect("open session"),
@@ -103,6 +108,10 @@ impl SftpRemote {
     }
 
     fn stat_by(&mut self, path: &str, follow: bool) -> Result<Option<Stat>> {
+        #[cfg(test)]
+        {
+            self.stats += 1;
+        }
         let (rt, _, fs) = self.parts();
         let got = if follow {
             rt.block_on(within(META_TIMEOUT, fs.metadata(path)))
@@ -447,27 +456,44 @@ impl RemoteFs for SftpRemote {
     }
 
     fn list_dir(&mut self, path: &str) -> Result<Vec<String>> {
-        use futures_core::Stream;
-        let (rt, _, fs) = self.parts();
-        let listed = rt.block_on(within(META_TIMEOUT, async {
-            let dir = fs
-                .open_dir(path)
-                .await
-                .map_err(|e| anyhow!("cannot list {path}: {e}"))?;
-            let mut entries = Box::pin(dir.read_dir());
-            let mut names = Vec::new();
-            while let Some(entry) = std::future::poll_fn(|cx| entries.as_mut().poll_next(cx)).await
-            {
-                let entry = entry.map_err(|e| anyhow!("cannot list {path}: {e}"))?;
-                let name = entry.filename().to_string_lossy().into_owned();
-                if name != "." && name != ".." {
-                    names.push(name);
+        Ok(self.read_dir(path)?.into_iter().map(|(n, _)| n).collect())
+    }
+
+    /// The readdir reply carries each name's attributes (as `lstat` gives them); only a
+    /// symbolic link costs one stat more, to say what it points at, and so does an entry whose
+    /// type the server left out.
+    fn list_entries(&mut self, path: &str) -> Result<Vec<Entry>> {
+        let listed = self.read_dir(path)?;
+        let mut out = Vec::with_capacity(listed.len());
+        for (name, own) in listed {
+            let untyped = !own.is_dir && !own.is_file && !own.is_symlink && own.missing.is_some();
+            if own.is_symlink || untyped {
+                let full = super::join(path, &name);
+                let target = self.stat_opt(&full).ok().flatten();
+                if untyped {
+                    out.push(match target {
+                        Some(t) => super::entry(name, &t, None),
+                        None => super::unknown_entry(name),
+                    });
+                    continue;
                 }
+                out.push(super::entry(name, &own, target));
+            } else {
+                out.push(super::entry(name, &own, None));
             }
-            names.sort();
-            Ok(names)
-        }));
-        listed.map_err(|()| timed_out(&format!("list {path}"), META_TIMEOUT))?
+        }
+        Ok(out)
+    }
+
+    fn free_space(&mut self, path: &str) -> Option<u64> {
+        if !self.sftp.as_ref().is_some_and(|s| s.support_statvfs()) {
+            return None;
+        }
+        let (rt, _, fs) = self.parts();
+        match rt.block_on(within(META_TIMEOUT, fs.statvfs(path))) {
+            Ok(Ok(st)) => Some(st.bavail.saturating_mul(st.frsize)),
+            _ => None,
+        }
     }
 
     fn read_to(
@@ -605,6 +631,32 @@ impl RemoteFs for SftpRemote {
 }
 
 impl SftpRemote {
+    /// A directory's names with their attributes from the readdir reply, sorted by name
+    /// (`.` and `..` left out).
+    fn read_dir(&mut self, path: &str) -> Result<Vec<(String, Stat)>> {
+        use futures_core::Stream;
+        let (rt, _, fs) = self.parts();
+        let listed = rt.block_on(within(META_TIMEOUT, async {
+            let dir = fs
+                .open_dir(path)
+                .await
+                .map_err(|e| anyhow!("cannot list {path}: {e}"))?;
+            let mut entries = Box::pin(dir.read_dir());
+            let mut out = Vec::new();
+            while let Some(entry) = std::future::poll_fn(|cx| entries.as_mut().poll_next(cx)).await
+            {
+                let entry = entry.map_err(|e| anyhow!("cannot list {path}: {e}"))?;
+                let name = entry.filename().to_string_lossy().into_owned();
+                if name != "." && name != ".." {
+                    out.push((name, stat_of(&entry.metadata())));
+                }
+            }
+            out.sort_by(|a: &(String, Stat), b| a.0.cmp(&b.0));
+            Ok(out)
+        }));
+        listed.map_err(|()| timed_out(&format!("list {path}"), META_TIMEOUT))?
+    }
+
     /// Reads `path` (up to `max` bytes) into `sink`, failing after [`STALL_TIMEOUT`] without data.
     fn read_with(
         &mut self,
@@ -642,6 +694,60 @@ impl SftpRemote {
             let _ = within(Duration::from_secs(5), file.close()).await;
             Ok(done)
         })
+    }
+}
+
+/// Where OpenSSH installs its SFTP server (macOS, Debian/Ubuntu, Fedora, Arch).
+#[cfg(test)]
+const SFTP_SERVERS: [&str; 4] = [
+    "/usr/libexec/sftp-server",
+    "/usr/lib/openssh/sftp-server",
+    "/usr/libexec/openssh/sftp-server",
+    "/usr/lib/ssh/sftp-server",
+];
+
+#[cfg(test)]
+impl SftpRemote {
+    /// SFTP to this machine's own `sftp-server`, run as a child over pipes: a real server's
+    /// replies (readdir attributes, extensions) without ssh or a network. `None`, with a note,
+    /// where OpenSSH's server is not installed.
+    pub(crate) fn local_server() -> Option<Self> {
+        let Some(server) = SFTP_SERVERS.iter().find(|p| Path::new(p).exists()) else {
+            eprintln!("skipping: no sftp-server on this machine ({SFTP_SERVERS:?})");
+            return None;
+        };
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let sftp = rt.block_on(async {
+            let mut child = tokio::process::Command::new(server)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .kill_on_drop(true)
+                .spawn()
+                .unwrap();
+            let (stdin, stdout) = (child.stdin.take().unwrap(), child.stdout.take().unwrap());
+            // The child lives as long as the session (and is killed with it).
+            let keep = openssh_sftp_client::SftpAuxiliaryData::Boxed(Box::new(
+                std::sync::Mutex::new(child),
+            ));
+            Sftp::new_with_auxiliary(stdin, stdout, SftpOptions::default(), keep)
+                .await
+                .unwrap()
+        });
+        let fs = sftp.fs();
+        Some(Self {
+            rt,
+            sftp: Some(sftp),
+            fs: Some(fs),
+            stats: 0,
+        })
+    }
+
+    /// Stat requests sent so far.
+    pub(crate) fn stats(&self) -> u64 {
+        self.stats
     }
 }
 

@@ -1,6 +1,6 @@
-//! Folder/text editors (spec §3 A2): VS Code first, then Zed. Locate the CLI, build its
-//! arguments, spawn it detached. When neither is present, text falls back to `$VISUAL` /
-//! `$EDITOR` in the terminal.
+//! Text editors (spec §3 A2), also the file browser's F4 for a folder or a file (spec §3a): VS
+//! Code first, then Zed. Locate the CLI, build its arguments, spawn it detached. When neither is
+//! present, text falls back to `$VISUAL` / `$EDITOR` in the terminal.
 
 use anyhow::{bail, Context, Result};
 use std::ffi::{OsStr, OsString};
@@ -102,7 +102,7 @@ fn locate_code_in(
     None
 }
 
-/// The editor a folder or text file opens in.
+/// The editor a text file opens in (and the file browser's F4, for a folder or a file).
 #[derive(Debug, PartialEq, Eq)]
 pub enum Editor {
     Code(PathBuf),
@@ -134,6 +134,39 @@ pub fn choose(
             code_cannot_remote,
         },
         None => Editor::Neither { code_cannot_remote },
+    }
+}
+
+/// Opens `abs` — a folder when `is_dir` — in `editor` and returns the editor's name. `remote` is
+/// the `(user, host)` of a remote path. `Neither` is an error that says what was not found
+/// (the terminal editor is the CLI's own fallback, never this one's).
+pub fn launch(
+    editor: &Editor,
+    remote: Option<(Option<&str>, &str)>,
+    abs: &str,
+    is_dir: bool,
+) -> Result<&'static str> {
+    match editor {
+        Editor::Code(code) => {
+            open_args(code, &code_args(remote, abs, is_dir))?;
+            Ok("VS Code")
+        }
+        Editor::Zed { cli, .. } => {
+            let arg = match remote {
+                Some((user, host)) => remote_url(user, host, abs),
+                None => abs.to_string(),
+            };
+            open(cli, arg.as_ref())?;
+            Ok("Zed")
+        }
+        Editor::Neither { code_cannot_remote } => {
+            let no_code = if *code_cannot_remote {
+                "VS Code has no Remote - SSH extension"
+            } else {
+                "VS Code was not found"
+            };
+            bail!("{no_code} and Zed was not found; install an editor")
+        }
     }
 }
 
