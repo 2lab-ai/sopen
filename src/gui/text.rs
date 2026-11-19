@@ -548,14 +548,27 @@ pub fn warm() {
     themes();
 }
 
-/// The syntax for a file named `name` whose first line is `first`: by extension, by the whole
-/// name (`Makefile`), then by the first line (`#!/bin/sh`). `None` for plain text.
-fn syntax_for(name: &str, first: &str) -> Option<&'static SyntaxReference> {
+/// The syntax for a file named `name`: by extension, by the whole name (`Makefile`), and only
+/// when the name does not decide, by the first line (`#!/bin/sh`) read through `doc` — an index
+/// that may be read (`None`: the name alone). `None` for plain text.
+fn syntax_of(name: &str, doc: Option<&mut TextDoc>) -> Option<&'static SyntaxReference> {
     let set = syntaxes();
-    let found = crate::kind::extension(name)
+    let by_name = crate::kind::extension(name)
         .and_then(|ext| set.find_syntax_by_extension(&ext))
-        .or_else(|| set.find_syntax_by_extension(name))
-        .or_else(|| set.find_syntax_by_first_line(first))?;
+        .or_else(|| set.find_syntax_by_extension(name));
+    let found = match (by_name, doc) {
+        (Some(found), _) => found,
+        (None, Some(doc)) => {
+            let first = doc
+                .read_lines(0, 1)
+                .ok()
+                .and_then(|l| l.into_iter().next())
+                .map(|l| l.text)
+                .unwrap_or_default();
+            set.find_syntax_by_first_line(&first)?
+        }
+        (None, None) => return None,
+    };
     (found.name != "Plain Text").then_some(found)
 }
 
@@ -953,6 +966,8 @@ struct Page {
 struct TextWindow {
     /// `host:/abs`.
     title: String,
+    /// The file's name (it picks the syntax, with the first line when it does not decide).
+    name: String,
     doc: TextDoc,
     syntax: Option<&'static SyntaxReference>,
     /// Started on the first pass (it needs the theme: dark or light); `None` without a syntax,
@@ -1034,16 +1049,9 @@ impl TextWindow {
         // Changed since it was indexed (between the opener's worker and now): nothing is read
         // through that index; the first pass re-reads it.
         let now = doc.now_since_pass();
-        let first = if now == Now::Same {
-            doc.read_lines(0, 1)
-                .ok()
-                .and_then(|l| l.into_iter().next())
-                .map(|l| l.text)
-                .unwrap_or_default()
-        } else {
-            String::new()
-        };
-        let syntax = syntax_for(name, &first);
+        // The first line refines the choice only through an index that may be read.
+        let readable = matches!(now, Now::Same | Now::Grown);
+        let syntax = syntax_of(name, readable.then_some(&mut doc));
         let index_took = doc.indexed_in;
         let status = match (syntax, doc.first_long) {
             _ if now == Now::Gone => Status::error("the file was deleted"),
@@ -1060,6 +1068,7 @@ impl TextWindow {
         };
         Self {
             title,
+            name: name.to_string(),
             doc,
             syntax,
             worker: None,
@@ -1201,6 +1210,8 @@ impl TextWindow {
                 let grew = doc.size() > self.doc.size();
                 self.index_took = doc.indexed_in;
                 self.doc = doc;
+                // The first line may have changed (another shebang): the grammar follows it.
+                self.syntax = syntax_of(&self.name, Some(&mut self.doc));
                 self.waiting = false;
                 // The old page stays up until one is read through the new index (a write
                 // landing first leaves it up).

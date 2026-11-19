@@ -1498,3 +1498,58 @@ fn an_opening_index_whose_pass_met_a_shrink_is_not_read() {
     assert!(win.waiting, "not read through");
     assert_eq!(win.doc.page_reads(), 0);
 }
+
+/// The grammar a shebang names, as the viewer shows it.
+fn grammar(win: &TextWindow) -> Option<&str> {
+    win.syntax.map(|s| s.name.as_str())
+}
+
+/// An extensionless script whose name does not decide: its first line does, also when the file
+/// grew between indexing and the window (an accepted, only-grown index).
+#[test]
+fn an_extensionless_script_racing_the_open_is_highlighted_by_its_shebang() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = write(tmp.path(), "run", b"#!/bin/sh\necho hello\n");
+    let doc = TextDoc::open(&path).unwrap();
+    append(&path, "echo more\n");
+    let mut win = TextWindow::new(doc, "run".into(), "run", vec![]);
+    let _clock = on_clock(&mut win);
+    let mut drv = Driver::new(600.0, 400.0);
+    drv.until(&mut win, 5, |w| w.ready());
+    assert_eq!(grammar(&win), Some("Bourne Again Shell (bash)"));
+    let colors = drv.colors_of("echo hello").expect("shown");
+    let distinct: std::collections::HashSet<_> = colors.iter().collect();
+    assert!(distinct.len() >= 2, "highlighted: {colors:?}");
+}
+
+/// A re-read after the shebang changed switches the grammar; a name that decides keeps its own.
+#[test]
+fn a_reread_after_the_shebang_changed_switches_grammar() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut win = viewer(tmp.path(), "tool", "#!/bin/sh\necho hi\n");
+    let clock = on_clock(&mut win);
+    let mut drv = Driver::new(600.0, 400.0);
+    drv.until(&mut win, 5, |w| w.ready());
+    assert_eq!(grammar(&win), Some("Bourne Again Shell (bash)"));
+    let fresh = write(
+        tmp.path(),
+        ".tool.tmp",
+        b"#!/usr/bin/env python3\nprint('hi')\n",
+    );
+    std::fs::rename(&fresh, tmp.path().join("tool")).unwrap();
+    later(&clock, 2.0);
+    reread(&mut drv, &mut win, 2);
+    assert_eq!(grammar(&win), Some("Python"));
+    let colors = drv.colors_of("print('hi')").expect("shown");
+    let distinct: std::collections::HashSet<_> = colors.iter().collect();
+    assert!(distinct.len() >= 2, "highlighted: {colors:?}");
+    // The name decides when it can: a `.rs` file stays Rust whatever its first line says.
+    let mut named = viewer(tmp.path(), "main.rs", "fn main() {}\n");
+    let clock = on_clock(&mut named);
+    drv.until(&mut named, 5, |w| w.ready());
+    let fresh = write(tmp.path(), ".main.tmp", b"#!/bin/sh\nfn main() {}\n");
+    std::fs::rename(&fresh, tmp.path().join("main.rs")).unwrap();
+    later(&clock, 2.0);
+    reread(&mut drv, &mut named, 2);
+    assert_eq!(grammar(&named), Some("Rust"));
+}

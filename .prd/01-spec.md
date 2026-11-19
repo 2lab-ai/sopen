@@ -169,14 +169,15 @@ replaces that module alone.
   stays claimed until it is gone. The viewers keep exactly their edits, keys and Save rules
   (§6, §6a, §7); no new save path.
 - **The text viewer** is read-only: line numbers, syntax highlighting (syntect — Sublime
-  syntaxes and themes, on the pure-Rust regex engine, nothing linked) chosen by the extension, the
-  whole name or the first line; ↑/↓, PgUp/PgDn (a page keeps one line of context), Home/End
-  (start and end of the file), ←/→ scroll sideways, the wheel scrolls. It never reads the file
-  whole: opening indexes the lines in one pass (a mark every 256 lines, and at the first line
-  start 64 KiB past the last mark), and a page reads at most 64 KiB before it plus the shown part
-  of each line. 4096 bytes of a line are shown (the bar says when lines are cut); invalid UTF-8
-  shows as U+FFFD (a real character cut in two at the end of a cut line is left out; bytes that
-  can never start one stay U+FFFD). Highlighting carries state from the top of the file: the
+  syntaxes and themes, on the pure-Rust regex engine, nothing linked) chosen by the extension or
+  the whole name, else by the first line (a shebang) as read through an index that may be read —
+  at open and again from each new index; ↑/↓, PgUp/PgDn (a page keeps one line of context),
+  Home/End (start and end of the file), ←/→ scroll sideways, the wheel scrolls. It never reads
+  the file whole: opening indexes the lines in one pass (a mark every 256 lines, and at the first
+  line start 64 KiB past the last mark), and a page reads at most 64 KiB before it plus the shown
+  part of each line. 4096 bytes of a line are shown (the bar says when lines are cut); invalid
+  UTF-8 shows as U+FFFD (a real character cut in two at the end of a cut line is left out; bytes
+  that can never start one stay U+FFFD). Highlighting carries state from the top of the file: the
   state at each mark is computed once, on a worker of the viewer's own with its own handle on the
   file — never on a frame (one parse call cannot be interrupted, and a pathological line can take
   minutes). A page shows plain and its highlighted lines replace the plain ones when the worker
