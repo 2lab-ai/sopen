@@ -8,6 +8,7 @@ sopen myserver:~/project           # folder → the same, as a project
 sopen myserver:/tmp/shot.png       # image → view, rectangle crop / pixelize, save back
 sopen myserver:/tmp/talk.mp4       # video → play, rectangle crop, time cut → new file next to it
 sopen myserver:/tmp/a.mp3          # audio → play, time cut
+sopen myserver:/tmp/a.zip          # anything else → asks: hex editor (default) or save it to a path
 sopen --target <host> myserver:/tmp/a.mp3   # the same, on <host>'s screen instead of this one
 ```
 
@@ -27,7 +28,8 @@ brew install 2lab-ai/tap/sopen-preview    # macOS (arm64, x86_64), Linux (x86_64
   Without VS Code, sopen uses Zed.
 - Linux: the ALSA runtime library (libasound2 / alsa-lib) — present on desktop Linux; sopen runs
   on the machine whose screen shows the file (the one you sit at, or the `--target`), not on the
-  remote. The image and media windows need a desktop session (X11 or Wayland).
+  remote. The image and media windows, the binary-file dialog and the hex window need a desktop
+  session (X11 or Wayland); without one a binary file is fetched and its path printed.
 
 ## What the remote needs
 
@@ -103,7 +105,46 @@ plays silently and says so. Export keeps the picture and every audio track; what
 (subtitles, data streams, cover art, alpha, more than 8 bits where this ffmpeg's libx264 has no
 10-bit) is named in the window before you export and again in the result line.
 
-## Any other file: `--app`
+## Binary files
+
+```sh
+sopen myserver:/srv/data.zip          # a dialog: Open in hex editor (Enter) · Save to… · Cancel (Esc)
+sopen --hex myserver:/srv/notes.txt   # any file straight in the hex editor, no dialog
+```
+
+Anything that is not a folder, text, an image or media opens a small dialog first — its name, size
+and type; nothing is downloaded yet. **Enter** fetches it and opens sopen's hex editor (the
+default). **Save to…** downloads it to the path below the buttons — your download folder at first,
+or the one "Browse…" picks — and never over an existing file: if the name is taken it says so and
+offers the next free one (`data-1.zip`). **Esc** (or closing the window) downloads nothing.
+Exceptions: Enter in the path field saves there (it never opens the hex editor); while a transfer
+runs, Enter and Esc do nothing and closing the window waits for it to finish.
+
+The file appears under its name only complete: it is written into a private hidden folder
+(`.sopen-…`) in the chosen folder and published from there with a hard link, never over anything.
+A folder whose filesystem has no hard links (exFAT, some network shares), a folder that does not
+exist, or a path ending in '/' is refused before anything is transferred. A download whose source
+changes meanwhile is not saved; that check is best-effort (the remote file's size and modification
+time, and the bytes received).
+
+The hex editor shows rows of 16 bytes — offset, hex, ASCII — and reads only what is on screen, so a
+file of any size scrolls the same. It overwrites bytes and never changes the file's size:
+
+| Key | |
+|---|---|
+| arrows, `PgUp` / `PgDn`, `Home` / `End`, `⌘Home` / `⌘End` | move the cursor (row start / end, file start / end); a click places it |
+| hex digits / characters | overwrite: in the hex column two digits per byte, in the ASCII column one character; `Tab` switches the column |
+| `⌘G` | go to an offset (`0x…` or decimal) |
+| `⌘Z` / `⇧⌘Z` (Ctrl on Linux) | undo / redo |
+| `⌘S` | Save: the original is first backed up locally (path printed), then overwritten in place, as image Save does. When it is refused, the window names where your edits were kept: if the file changed since it was opened, nothing is written and the edits are listed in a `.hexpatch-….txt` file; if the overwrite itself is refused (the remote changed), the staged edited file is kept |
+| `⇧⌘S` | Save copy: `<name>.edited.<ext>` next to the original |
+
+If a local file saved in place is changed by someone else right after the save, the window turns
+read-only and lists your edits in a `.hexpatch` file it names. When even that list cannot be
+written, the window offers **Keep edits…** (try again) and **Write the list there** (a path you
+choose), and closing asks before your edits are lost.
+
+## Any other app: `--app`
 
 ```sh
 sopen myserver:/srv/data.bin --app ImHex    # macOS: the app's name, as `open -a` takes it
@@ -111,7 +152,7 @@ sopen myserver:/srv/data.bin --app imhex    # Linux: the command on PATH
 ```
 
 Fetches a copy, opens it in the named local app, and waits: Enter uploads your changes, `q`
-discards them. Files with no better route are fetched to the cache and their path is printed.
+discards them.
 
 ## Cut audio and video: `sopen cut`
 
@@ -136,7 +177,8 @@ H.264 + AAC; audio: the source's codec) and uploaded next to the original as
   nothing is written.
 - A save that fails for any reason moves your edited copy aside (`<file>.conflict-<time>`) and
   prints where. Opening the file again never overwrites an unsaved edit.
-- The local copies sopen creates (the cache, image backups, kept edits) are readable by you only.
+- The local copies sopen creates (the cache, image and hex backups, kept edits) are readable by you
+  only. A binary file saved with "Save to…" is created new, never over an existing file.
   A second sopen session on a file that is still open in the first gets its own copy, so neither
   overwrites the other's edits.
 - Exports never overwrite: if the name exists, sopen adds `-1`, `-2`, ….

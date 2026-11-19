@@ -35,6 +35,22 @@ pub fn version_text() -> String {
     format!("{} ({channel} {rev12})", env!("CARGO_PKG_VERSION"))
 }
 
+/// A size for people: `999 B`, `1.5 MB` (powers of 1000).
+pub fn human(bytes: u64) -> String {
+    const UNITS: [&str; 4] = ["B", "KB", "MB", "GB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1000.0 && unit + 1 < UNITS.len() {
+        value /= 1000.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
 /// True when `SOPEN_LOG=debug`: [`debug!`] lines go to stderr.
 pub fn debug_enabled() -> bool {
     std::env::var("SOPEN_LOG").is_ok_and(|v| v.eq_ignore_ascii_case("debug"))

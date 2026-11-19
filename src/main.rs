@@ -4,10 +4,11 @@
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
-use sopen::cache::{self, Dirs};
+use sopen::cache::{self, Dirs, Fetched};
 use sopen::cut::{self, CutRequest};
 use sopen::ffmpeg::{self, Rect};
 use sopen::gui;
+use sopen::human;
 use sopen::kind::{self, Kind};
 use sopen::remote::{self, LocalFs, RemoteFs, SftpRemote, Stat, WriteOutcome};
 use sopen::target::{self, RemoteSpec, Target};
@@ -28,7 +29,10 @@ const EXIT_CONFLICT: u8 = 3;
     about = "Open a file or folder on another machine as if it were local",
     long_about = "Open a file or folder on another machine as if it were local.\n\n\
         SOURCE uses scp syntax: [user@]host:path (relative paths are under the remote home) or a \
-        local path. Folders and text open in VS Code when present, otherwise Zed; other files are fetched to the local cache.\n\n\
+        local path. Folders and text open in VS Code when present, otherwise Zed; images, video \
+        and audio in sopen's own window. Any other file (a zip, a binary) asks first: open it in \
+        sopen's hex editor (the default) or save it to a path you choose. --hex opens any file in \
+        the hex editor.\n\n\
         It opens on this machine, or with --target HOST on HOST's screen (sopen runs there, \
         started over ssh). SOPEN_TARGET or `sopen config target HOST` make a HOST the default; \
         --here opens on this machine anyway.",
@@ -50,13 +54,16 @@ struct Cli {
     /// Open a copy in this local app; Enter in the terminal uploads the changes
     #[arg(long, value_name = "APP")]
     app: Option<String>,
+    /// Open the file in sopen's hex editor, whatever its type (no dialog first)
+    #[arg(long, conflicts_with = "app")]
+    hex: bool,
     /// Receipt check: play FILE on the real audio device at gain 0 for ~2 s and print the
     /// callback / underrun counts (AGENTS.md "Receipts").
     #[arg(
         long,
         hide = true,
         value_name = "FILE",
-        conflicts_with_all = ["source", "app", "target", "here"]
+        conflicts_with_all = ["source", "app", "hex", "target", "here"]
     )]
     selftest_audio: Option<PathBuf>,
 }
@@ -144,6 +151,7 @@ fn main() -> ExitCode {
                 cli.target.as_deref(),
                 cli.here,
                 cli.app.as_deref(),
+                cli.hex,
                 dirs,
                 &mut rec,
             )
@@ -225,21 +233,6 @@ impl Progress {
     }
 }
 
-fn human(bytes: u64) -> String {
-    const UNITS: [&str; 4] = ["B", "KB", "MB", "GB"];
-    let mut value = bytes as f64;
-    let mut unit = 0;
-    while value >= 1000.0 && unit + 1 < UNITS.len() {
-        value /= 1000.0;
-        unit += 1;
-    }
-    if unit == 0 {
-        format!("{bytes} B")
-    } else {
-        format!("{value:.1} {}", UNITS[unit])
-    }
-}
-
 /// Where a target lives: the remote connection or the local disk, plus labels for output.
 enum Place {
     Remote(RemoteSpec, Box<SftpRemote>),
@@ -286,9 +279,16 @@ impl Place {
         }
     }
 
-    /// Hands the connection to a window: the file layer, how to reopen it if the session dies
-    /// while the window is open, and the host label (`None` for local files).
-    fn into_origin(self, abs: &str, at: Stat, dirs: &Dirs) -> gui::Origin {
+    /// Hands the connection over: the file layer, how to reopen it if the session dies while
+    /// a window is open, and the host label (`None` for local files).
+    fn into_parts(
+        self,
+        dirs: &Dirs,
+    ) -> (
+        Box<dyn RemoteFs + Send>,
+        Option<gui::Reconnect>,
+        Option<String>,
+    ) {
         match self {
             Place::Remote(spec, fs) => {
                 let label = spec.label();
@@ -297,68 +297,35 @@ impl Place {
                     let fs = SftpRemote::connect(&spec, &state)?;
                     Ok(Box::new(fs) as Box<dyn RemoteFs + Send>)
                 });
-                gui::Origin::new(fs, Some(reconnect), Some(label), abs.to_string(), at)
+                (fs, Some(reconnect), Some(label))
             }
-            Place::Local(fs) => gui::Origin::new(Box::new(fs), None, None, abs.to_string(), at),
+            Place::Local(fs) => (Box::new(fs), None, None),
         }
     }
-}
 
-/// A remote file fetched into this session's cached copy.
-struct Fetched {
-    /// The copy, locked for as long as this lives: another session gets a copy of its own.
-    claim: cache::Claim,
-    at: Stat,
-    /// Where earlier copies' unsaved edits went (already printed), for a window to repeat.
-    notices: Vec<String>,
+    /// Hands the connection to a window ([`Place::into_parts`]).
+    fn into_origin(self, abs: &str, at: Stat, dirs: &Dirs) -> gui::Origin {
+        let (fs, reconnect, label) = self.into_parts(dirs);
+        gui::Origin::new(fs, reconnect, label, abs.to_string(), at)
+    }
 }
 
 /// Claims the cached copy of `abs` for this session, moves an earlier copy's unsaved edits
 /// aside, fetches with a progress line, and records what the copy now holds; records size and
-/// fetch time. Every fetch into the cache goes through here, so no session replaces or moves a
-/// copy another one is editing.
+/// fetch time. Every fetch into the cache goes through here (or [`cache::fetch_claimed`], its
+/// core), so no session replaces or moves a copy another one is editing.
 fn fetch_to_cache(place: &mut Place, abs: &str, dirs: &Dirs, rec: &mut Record) -> Result<Fetched> {
-    let claim = cache::claim(&dirs.cache, &place.host_label(), abs)?;
-    if let Some(note) = &claim.note {
-        eprintln!("sopen: {note}");
-    }
-    let mut notices = Vec::new();
-    // Said as known: a copy that differs from what was recorded has unsaved edits; one with no
-    // record may or may not.
-    match claim.set_aside_unsaved()? {
-        Some(cache::Kept { path, edited: true }) => notices.push(format!(
-            "the previous copy had unsaved edits; kept them at {}",
-            path.display()
-        )),
-        Some(cache::Kept {
-            path,
-            edited: false,
-        }) => notices.push(format!(
-            "no record of what was fetched for {}; kept it at {} in case it holds edits",
-            claim.local.display(),
-            path.display()
-        )),
-        None => {}
-    }
-    for line in &notices {
-        eprintln!("sopen: {line}");
-    }
     let (_, name) = remote::split_parent(abs);
     let mut progress = Progress::new(format!("fetching {name}"));
-    let started = Instant::now();
-    let fetched = place.fs().fetch(abs, &claim.local, &mut |done, total| {
+    let host = place.host_label();
+    let fetched = cache::fetch_claimed(place.fs(), &host, abs, &dirs.cache, &mut |done, total| {
         progress.bytes(done, total)
     });
     progress.finish();
-    let at = fetched?;
-    if let Some(sha) = &at.sha256 {
-        if let Err(e) = claim.record(sha) {
-            sopen::debug!("not recorded: {e:#}");
-        }
-    }
-    rec.fetch_ms = started.elapsed().as_millis() as u64;
-    rec.bytes = at.size;
-    Ok(Fetched { claim, at, notices })
+    let (fetched, ms) = fetched?;
+    rec.fetch_ms = ms;
+    rec.bytes = fetched.at.size;
+    Ok(fetched)
 }
 
 fn classify(fs: &mut dyn RemoteFs, abs: &str, stat: &Stat) -> Result<Kind> {
@@ -408,6 +375,7 @@ fn run_source(
     flag: Option<&str>,
     here: bool,
     app_name: Option<&str>,
+    hex: bool,
     dirs: &Dirs,
     rec: &mut Record,
 ) -> Result<u8> {
@@ -417,7 +385,7 @@ fn run_source(
     let hostname = forward::hostname();
     let host = match chosen {
         Some(host) if !forward::is_here(&host, hostname.as_deref()) => host,
-        _ => return run_open(source, app_name, dirs, rec).map(|()| 0),
+        _ => return run_open(source, app_name, hex, dirs, rec).map(|()| 0),
     };
     let there = forward::source_for(&host, source, hostname.as_deref(), |path| {
         LocalFs::new().realpath(path)
@@ -429,13 +397,19 @@ fn run_source(
     rec.action = Some("open");
     rec.target = Some(host.clone());
     sopen::debug!("opening {there} on {host}");
-    let code = forward::run(&host, &there, app_name, &dirs.state)?;
+    let code = forward::run(&host, &there, app_name, hex, &dirs.state)?;
     // HOST refused a write because the file changed (spec §5): a conflict here too (§10).
     rec.conflict = code == EXIT_CONFLICT;
     Ok(code)
 }
 
-fn run_open(arg: &str, app_name: Option<&str>, dirs: &Dirs, rec: &mut Record) -> Result<()> {
+fn run_open(
+    arg: &str,
+    app_name: Option<&str>,
+    hex: bool,
+    dirs: &Dirs,
+    rec: &mut Record,
+) -> Result<()> {
     let target = target::parse(arg).map_err(anyhow::Error::msg)?;
     let (mut place, path) = Place::connect(&target, dirs, rec)?;
     let abs = place.fs().realpath(&path)?;
@@ -453,19 +427,81 @@ fn run_open(arg: &str, app_name: Option<&str>, dirs: &Dirs, rec: &mut Record) ->
         }
         return open_in_app(&mut place, &abs, app_name, dirs, rec);
     }
+    if hex {
+        if stat.is_dir {
+            bail!("--hex opens files; {} is a directory", place.display(&abs));
+        }
+        return open_binary(place, &abs, stat.size, None, true, dirs, rec);
+    }
     match kind {
         Kind::Directory | Kind::Text => open_in_editor(&mut place, &abs, kind, dirs, rec),
         Kind::Image | Kind::Video | Kind::Audio => open_in_window(place, &abs, kind, dirs, rec),
-        Kind::Other => {
-            match place {
-                Place::Local(_) => println!("{abs}"),
-                Place::Remote(..) => {
-                    let fetched = fetch_to_cache(&mut place, &abs, dirs, rec)?;
-                    println!("{}", fetched.claim.local.display());
-                }
-            }
-            Ok(())
+        Kind::Other => open_binary(place, &abs, stat.size, None, false, dirs, rec),
+    }
+}
+
+/// The terminal's progress line ([`Progress`]) for the binary route's windowless transfers.
+#[derive(Default)]
+struct Meter(Option<Progress>);
+
+impl gui::binary::Meter for Meter {
+    fn start(&mut self, label: &str) {
+        self.0 = Some(Progress::new(label));
+    }
+    fn bytes(&mut self, done: u64, total: u64) {
+        if let Some(p) = self.0.as_mut() {
+            p.bytes(done, total);
         }
+    }
+    fn finish(&mut self) {
+        if let Some(mut p) = self.0.take() {
+            p.finish();
+        }
+    }
+}
+
+/// A file sopen has no window for, or any file with `--hex` (spec §6a): the library's route
+/// ([`gui::binary::open_file`]) over this file's connection. `fetched` = already in the cache
+/// (a `.ts` that turned out not to be media).
+fn open_binary(
+    place: Place,
+    abs: &str,
+    size: u64,
+    fetched: Option<Fetched>,
+    hex: bool,
+    dirs: &Dirs,
+    rec: &mut Record,
+) -> Result<()> {
+    let hooks = gui::Hooks::from_env()?;
+    let (_, name) = remote::split_parent(abs);
+    let info = gui::binary::Info {
+        title: place.display(abs),
+        name: name.to_string(),
+        size,
+        local: fetched.is_some() || matches!(place, Place::Local(_)),
+    };
+    let (fs, reconnect, label) = place.into_parts(dirs);
+    let source = gui::binary::FileSource::new(fs, reconnect, label, abs, &dirs.cache, fetched);
+    let out = gui::binary::open_file(
+        info,
+        source,
+        &hooks,
+        hex,
+        gui::display_available(),
+        &mut Meter::default(),
+        Box::new(gui::binary::NativeChooser),
+        &mut |window| gui::binary::run_on_screen(window, &hooks),
+    )?;
+    if let Some(ms) = out.fetch_ms {
+        rec.fetch_ms = ms;
+    }
+    if let Some(action) = out.action {
+        rec.action = Some(action);
+    }
+    rec.conflict = out.conflict;
+    match out.refused {
+        Some(message) => Err(Refused(message).into()),
+        None => Ok(()),
     }
 }
 
@@ -480,9 +516,7 @@ fn open_in_window(
     rec: &mut Record,
 ) -> Result<()> {
     let hooks = gui::Hooks::from_env()?;
-    let mut notices = Vec::new();
-    // Held until the window closes (media plays from the copy).
-    let mut _claim = None;
+    let mut fetched = None;
     let (local, at) = match (&place, kind) {
         (Place::Local(_), Kind::Video | Kind::Audio) => {
             let at = place.fs().stat(abs)?;
@@ -491,20 +525,25 @@ fn open_in_window(
         _ => {
             // A copy with unsaved edits (an earlier `--app` / editor session) is kept, not
             // replaced by this fetch; the window repeats where it went.
-            let fetched = fetch_to_cache(&mut place, abs, dirs, rec)?;
-            notices = fetched.notices;
-            let local = fetched.claim.local.clone();
-            _claim = Some(fetched.claim);
-            (local, fetched.at)
+            let copy = fetch_to_cache(&mut place, abs, dirs, rec)?;
+            let local = copy.claim.local.clone();
+            let at = copy.at;
+            fetched = Some(copy);
+            (local, at)
         }
     };
     let kind = refine_kind(&local, abs, kind);
     rec.kind = Some(kind);
     if kind == Kind::Other {
-        // A `.ts` ffprobe cannot read as media.
-        println!("{}", local.display());
-        return Ok(());
+        // A `.ts` ffprobe cannot read as media: the binary dialog, on the copy already here.
+        return open_binary(place, abs, at.size, fetched, false, dirs, rec);
     }
+    let notices = fetched
+        .as_ref()
+        .map(|f| f.notices.clone())
+        .unwrap_or_default();
+    // Held until the window closes (media plays from the copy).
+    let _claim = fetched.map(|f| f.claim);
     if !gui::display_available() && !hooks.autosave && !hooks.autoexport {
         println!(
             "no display for a window (DISPLAY / WAYLAND_DISPLAY unset); {}",
@@ -818,7 +857,15 @@ mod tests {
         let cli = Cli::try_parse_from(["sopen", "box:/a.bin", "--app", "ImHex"]).unwrap();
         assert_eq!(cli.source.as_deref(), Some("box:/a.bin"));
         assert_eq!(cli.app.as_deref(), Some("ImHex"));
-        assert!(cli.target.is_none() && !cli.here);
+        assert!(cli.target.is_none() && !cli.here && !cli.hex);
+        let cli = Cli::try_parse_from(["sopen", "--hex", "box:/a.txt"]).unwrap();
+        assert!(cli.hex && cli.app.is_none());
+        assert_eq!(cli.source.as_deref(), Some("box:/a.txt"));
+        // As HOST's sopen is given it.
+        let cli = Cli::try_parse_from(["sopen", "--here", "--hex", "--", "-x.bin"]).unwrap();
+        assert!(cli.hex && cli.here);
+        assert_eq!(cli.source.as_deref(), Some("-x.bin"));
+        assert!(Cli::try_parse_from(["sopen", "--hex", "--app", "ImHex", "a"]).is_err());
         let cli = Cli::try_parse_from(["sopen", "--target", "me@box", "src:/a.png"]).unwrap();
         assert_eq!(cli.target.as_deref(), Some("me@box"));
         assert_eq!(cli.source.as_deref(), Some("src:/a.png"));

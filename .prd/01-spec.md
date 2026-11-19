@@ -7,9 +7,11 @@ tags: [sopen, spec]
 # sopen — spec v1 (2026-11-11)
 
 `sopen host:/path` opens any file or folder on any of my machines as if it were local:
-folders and text go to VS Code when it is installed (remote ones only with its Remote - SSH extension), otherwise Zed's remote mode; images and audio/video open in a small built-in
-window where the few edits I actually need are one drag away — on the machine I typed it on,
-or with `--target` on another machine's screen.
+folders and text go to VS Code when it is installed (remote ones only with its Remote - SSH
+extension), otherwise Zed's remote mode; images and audio/video open in a small built-in
+window where the few edits I actually need are one drag away, and any other file (a zip, a
+binary) asks first — open it in a built-in hex editor, or save it where I choose — on the
+machine I typed it on, or with `--target` on another machine's screen.
 
 ## 1. Owner intent (verbatim, in order — the SSOT for scope)
 
@@ -21,22 +23,27 @@ or with `--target` on another machine's screen.
 6. (after the research verdict "a router, not an editor") "그럼 이름이 snote가 아니라 sopen이지 그렇게 진행해줘 근데 이미지나 영상은 보고 바로 편집할수 있으면 좋겠는데 사각형으로 자르고 시간상에서 시간으로 컷 정도랑 이미지의 경우 사각형으로 지정해서 pixelize 정도"
 7. "그리고 이거 기능 추가해줘 / soepn <host-a>:/tmp/a.html (현재 머신에서 저 파일 오픈) / sopen --target <host-b> <host-a>:/tmp/a.html / 명백하지 진행 ㄱ"
 8. "그리고 sopen 설정으로 디폴트 타겟 설정할 수 있도록해줘"
-9. "sopen이 vscode가 있으면 먼저 vscode로 열개해줘 vscode -> zeditor"
+9. "mp4랑 html 잘 열리는데 (<host-a>에서 <host-a>파일을 <host-b>우로) (내 작업 디폴트 터미널이 <host-b>임), zip파일은 그냥 다운만 받아지는데 디폴트는 헥스에디터로 여는거야 바이너리들은, 다이얼로그 뜨고 원하는 위치로 저장혹은 헥스에디터 여는것 이게 좋겠음"
+10. "sopen이 vscode가 있으면 먼저 vscode로 열개해줘 vscode -> zeditor"
 
 Message 6 supersedes 3's "IrfanView 정도" with an exact list. Message 5 is a standing constraint:
 anything not in the table below is out of scope until usage says otherwise (§10). Messages 7–8 add
-where a file opens — this machine, or another machine's screen (§4a); they add no edit.
+where a file opens — this machine, or another machine's screen (§4a); they add no edit. Message 9
+replaces A6's "fetched to the cache and its path printed" for binary files with a dialog — the hex
+editor (the default) or save to a chosen path — and takes the hex editor off §9's list: it is
+message 3's "원하면 hex 편집기능정도까지", built in (§6a). Message 10 puts VS Code before Zed for
+folders and text (A2, §3); it adds no edit.
 
 ## 2. Intent → acceptance
 
 | # | Owner intent | Acceptance (observable) |
 |---|---|---|
 | A1 | `sopen host:/path`, scp syntax, any machine in `~/.ssh/config` | `sopen <alias>:/abs/file`, `sopen <alias>:rel/to/home`, `sopen user@host:/x` all open; aliases, ProxyJump, agent behave exactly as `ssh <alias>` does (system ssh is used). Local paths (`sopen ./x.png`) open too. |
-| A2 | Folder as a project, text edit, syntax highlight; VS Code first (msg 9) | Folder or text file → VS Code when `code` is found; a remote one only when VS Code's Remote - SSH extension is installed (`code --folder-uri` / `--file-uri vscode-remote://ssh-remote+[user@]host/<percent-encoded abs>` by the kind sopen detected, since a bare `--remote` path's kind is guessed from its name; the extension is never installed by sopen), else Zed with `VS Code has no Remote - SSH extension; opening in Zed` on stderr. Without VS Code, Zed (`zed ssh://…` on macOS, `zeditor`/`zed` on Linux). A VS Code launch failure is reported, not followed by Zed. The editor owns Save. |
+| A2 | Folder as a project, text edit, syntax highlight; VS Code first (msg 10) | Folder or text file → VS Code when `code` is found; a remote one only when VS Code's Remote - SSH extension is installed (`code --folder-uri` / `--file-uri vscode-remote://ssh-remote+[user@]host/<percent-encoded abs>` by the kind sopen detected, since a bare `--remote` path's kind is guessed from its name; the extension is never installed by sopen), else Zed with `VS Code has no Remote - SSH extension; opening in Zed` on stderr. Without VS Code, Zed (`zed ssh://…` on macOS, `zeditor`/`zed` on Linux). A VS Code launch failure is reported, not followed by Zed. The editor owns Save. |
 | A3 | Image: view + rectangle crop + rectangle pixelize | Built-in window shows the image; drag draws a rectangle in image pixels; Crop and Pixelize act on it; Undo; Save writes back to the remote file. |
 | A4 | Video: view + rectangle crop + time cut | Built-in window plays the video with sound; scrub timeline; set In/Out; drag a crop rectangle; Export writes `<stem>.cut-<in>-<out>.<ext>` next to the original on the remote. |
 | A5 | Audio (mp3/wav): view + time cut | Same window: waveform, play, In/Out, Export. |
-| A6 | "아무 파일" | Any other type is fetched to the local cache and its path printed; `--app <App>` opens it in a named local app and uploads it back when the user presses Enter in the terminal. (This is the hex-editor path: `--app ImHex`.) |
+| A6 | "아무 파일"; binary files open in a hex editor by default, after a dialog (msg 9) | Any other type (a zip, any binary) opens a small dialog before anything is downloaded — name, size, type when the extension says it: Enter = "Open in hex editor" (the default: fetched to the cache, then sopen's hex window, §6a); "Save to…" downloads it to a path the owner picks (the download folder by default, never over an existing file); Esc or closing it downloads nothing. `sopen --hex SOURCE` opens any file straight in the hex window. `--app <App>` still opens it in a named local app and uploads it back when the user presses Enter in the terminal. With no display (Linux over ssh) the file is fetched and its path printed, and one line says why. |
 | A7 | Rust, macOS + Linux, `brew install …` and use immediately | `brew install 2lab-ai/tap/sopen-preview` on macOS (arm64, x86_64) and Linux (x86_64, aarch64) installs `sopen` and the `ffmpeg` it needs; the first `sopen host:/a.mp3` works with no further setup. |
 | A8 | Developed like llmux | Public repo `2lab-ai/sopen`, MIT; `ci.yml` (macOS + Linux), `preview.yml` (every main push → prerelease + tap bump), `release.yml` (`v*` tag = owner gate); `AGENTS.md` SSOT; `.prd/` spec. |
 | A9 | `sopen SOURCE` opens here; `sopen --target <host> SOURCE` opens it on `<host>` (msg 7) | `sopen <host-a>:/tmp/a.html` opens on the machine it was typed on, as before. `sopen --target <host-b> <host-a>:/tmp/a.html` opens it on `<host-b>`'s screen: the same window or editor, started by `<host-b>`'s own sopen (on macOS sopen's window floats above the others until it is used; the editor opens behind the active app, §4a); exit code is `<host-b>`'s; `could not reach <host-b>` when ssh cannot get there; `sopen is not installed on <host-b> …` (exit 127) when it has no sopen. A file on `<host-b>` itself opens there as a local file; a local file reaches `<host-b>` as `<this machine>:<path>`. |
@@ -51,7 +58,7 @@ where a file opens — this machine, or another machine's screen (§4a); they ad
 | image | `png jpg jpeg webp bmp gif tif tiff` | image window |
 | video | `mp4 mov m4v mkv webm avi` (and ffprobe says it has a video stream); `ts` only when it is not text and ffprobe sees a video stream (`.ts` is also TypeScript) | media window |
 | audio | `mp3 wav flac m4a aac ogg opus` | media window |
-| other | everything else | fetch → print cache path (A6) |
+| other | everything else | the binary dialog: hex window (default) or Save to… (A6, §6a) |
 
 - VS Code is found as `code` on PATH, then on macOS `/Applications/Visual Studio Code.app/Contents/Resources/app/bin/code` or the same path under `~/Applications`. Remote - SSH counts as installed when a directory `ms-vscode-remote.remote-ssh-<version>` is in `$VSCODE_EXTENSIONS` (when non-empty) or `~/.vscode/extensions` and is not a key of the `.obsolete` JSON object there; VS Code is not started to check. Without a usable VS Code, Zed is found as `zed` / `zeditor` on PATH, macOS also `/Applications/Zed.app/Contents/MacOS/cli`. Neither found: text → fetch, run `$VISUAL`/`$EDITOR` in the terminal, upload on exit if changed; directory → error that names the missing editors.
 - Remote relative paths resolve against the remote home (SFTP `realpath`), as scp does.
@@ -69,7 +76,7 @@ where a file opens — this machine, or another machine's screen (§4a); they ad
 ## 4a. Where it opens
 
 `sopen SOURCE` opens SOURCE on the machine it was typed on. `sopen --target HOST SOURCE` opens it on HOST's screen
-instead: sopen starts HOST's own sopen as `sopen --here [--app APP] -- SOURCE` over the system `ssh`, with the same
+instead: sopen starts HOST's own sopen as `sopen --here [--app APP] [--hex] -- SOURCE` over the system `ssh`, with the same
 multiplexed master and connection options as §4, waits for it, and exits with its exit code (0, 1 and 3 mean what
 they mean here; 127 is no sopen on HOST; 2 is a usage error from a sopen on HOST too old to know `--here`, passed on
 as it is). When ssh itself fails (its exit code 255) sopen exits 1 with `could not
@@ -166,9 +173,9 @@ symlink keeps its link). A new file is readable by its owner only (0600); a repl
   unsaved edits" when the copy differs from what sopen recorded, "no record of what was fetched … kept it … in case
   it holds edits" when there is no record.
 - Local copies are the owner's only: cache, edit, backup and export directories are created 0700; fetched copies,
-  staged and kept image edits, backups and edits moved aside are 0600. A staged or kept image edit gets a new name
+  staged and kept image and hex edits, backups and edits moved aside are 0600. A staged or kept image or hex edit gets a new name
   (`<stem>.<tag>-<UTC stamp>-<random>.<ext>`), created exclusively — never over or through an existing file.
-- The cache's fixed roots are dot-named — `<cache>/.backup`, `<cache>/.edits` (staged and kept image edits),
+- The cache's fixed roots are dot-named — `<cache>/.backup`, `<cache>/.edits` (staged and kept image and hex edits),
   `<cache>/.exports` (local exports before they are published), `<cache>/.sessions`, `<cache>/.meta` — and a host
   label never starts with `.`, so no mirrored host lands in one (a host named `backup` is `<cache>/backup/…`, plain
   cache). Roots an older build made without the dot are just cache: never read or written.
@@ -202,6 +209,141 @@ symlink keeps its link). A new file is readable by its owner only (0600); a repl
 - Never lose data silently: Save keeps the ICC profile and Exif where the format holds them; metadata it does not
   carry (XMP, text chunks, IPTC, comments) or an encoder refuses is named when the image opens and in the result.
 
+## 6a. Binary files: the dialog and the hex window (A6, msg 9)
+
+**The dialog.** A file of kind "other" (§3) opens a small sopen window titled `host:/abs` before
+anything is fetched, from the stat alone: the file's name, its size (human and exact), and its type
+when the extension says it cheaply (`ZIP archive`, `PDF document`, …). The window is as tall as its
+content. Buttons: "Open in hex editor" (the default — Enter), "Save to…" and "Cancel" (Esc, or
+closing the window: nothing is downloaded). Under them, the path "Save to…" saves to:
+`<download folder>/<name>` (the platform's download folder, else the home folder; `~` for the home
+folder), or the next free `<stem>-N<ext>` when that name is taken (the dialog says so). "Browse…"
+opens the system's save dialog (AppKit on macOS, xdg-desktop-portal on Linux — loaded at runtime,
+nothing linked); choosing a path there saves to it. When it gives no path — cancelled, or no system
+dialog available — one line says the path field still works. A one-line hint says what Enter and
+Esc do, and — only when something would be downloaded — that nothing is until a choice is made.
+The exceptions: Enter in the path field saves there (it never opens the hex editor; when that save
+is refused the field keeps the keyboard, so the next Enter saves again); during a transfer Enter and
+Esc do nothing and closing waits for it.
+
+- Hex: the file is fetched into the cache as every fetch is (claimed, recorded, an earlier copy's
+  unsaved edits moved aside first — §5), with the progress in the dialog; then the same window
+  becomes the hex window. A local file is read in place. Every step that can fail (the fetch,
+  opening the copy) comes before the connection is handed to the hex window: after a failure the
+  dialog is as it was, for a retry or "Save to…" (from the copy already fetched).
+- Save to…: bytes are never put under the chosen name before they are complete, and never over, or
+  through, anything already there (a file, a link). The chosen path's folder is opened once (a link
+  to a folder is followed at that moment) and everything after goes through that descriptor, never
+  the path again. A path ending in '/', a folder that does not exist or a file where the folder
+  should be fails at once; a taken name is refused before anything moves. sopen makes a private
+  folder `.sopen-<16 hex>` (0700; 02700 in a setgid folder, so on Linux `part` and the published
+  file still get the shared folder's group) in it and, inside, `part` — created exclusively, without following
+  a link, owner-only (0600) by the creating call — so the staging name never grows with the chosen
+  one, and no other user can put or swap anything in it (other processes of the same user are
+  trusted). Before a byte is transferred, `part` is linked to a second name inside the private
+  folder and unlinked again: a filesystem without hard links (exFAT, some network shares) fails
+  here, nothing transferred, the private folder removed ("this folder's filesystem has no hard
+  links … choose another folder"). Then the bytes go into `part`, which is flushed to disk, given the
+  mode any new file there gets (not the cache's 0600), and published by a hard link to the chosen
+  name — which fails if anything is there — then `part` and the private folder are removed. A
+  publish that fails for another reason keeps the complete `part` and the error says why and where;
+  sopen never copies into a final name. A name taken at
+  the last moment is refused like any taken name: the dialog says so and puts the next free
+  `<stem>-N<ext>` in the field (the stem gives way, on a character boundary, so the name stays
+  within 255 bytes); "Save to…" again saves there. Cleanup only ever removes sopen's own
+  names inside its private folder, then the folder (a failure to remove it is said); an interrupted
+  save leaves only that hidden folder. A download
+  whose source changes meanwhile is not saved — a best-effort check: the remote's size and mtime
+  after the transfer, and the bytes received, against its stat before. A local file (or the cached
+  copy) is copied the same way, checked by its handle: size, mtime, change time and bytes copied.
+  Then "saved <path>" shows a moment, the same line is printed on stdout, and the window closes —
+  unless there are notes to read (a Close button then).
+- Closing the window during a fetch or a download does not cut it: the window says it closes when
+  the transfer is done, and does. A transfer whose worker ends without a result is a final, visible
+  failure (the window says so and offers only Close; a close asked for meanwhile closes it). The
+  line on the terminal when nothing was opened or saved says "nothing was downloaded" only when no
+  transfer was started; a hex fetch that landed while the window closed is said as such.
+
+`sopen --hex SOURCE` opens any file (any kind; not a folder) straight in the hex window — no dialog;
+a remote one is fetched first, with the progress on the terminal. `--hex` and `--app` are exclusive.
+With no display (Linux, neither `DISPLAY` nor `WAYLAND_DISPLAY`) the dialog and `--hex` fall back to
+fetching the file and printing its local path, with one line on stderr saying why.
+
+**The hex window** has the image and media windows' look and layout rules: a one-line toolbar on
+top, a one-line status bar at the bottom, nothing that changes size while you work. The grid's top
+and every row's position never move: not when the status changes, and not when a report arrives —
+the disclosure rows (what must be read whole) sit between the grid and the status bar, appear only
+once the primary button is up, and take rows off the grid's bottom.
+
+- Rows of 16 bytes: the offset (hex, as many digits as the file size needs, at least 4), the 16 bytes
+  in hex grouped 8 + 8, and the ASCII column (non-printable bytes as `.`). Only the rows on screen are
+  read and painted: the file is read through a small page cache (at most 64 pages of 4 KiB; the least
+  recently used goes first), never whole, so a file of any size scrolls the same. The grid has its
+  own scroll bar (row positions are kept as 64-bit row numbers, not as pixels).
+- The cursor is on a byte, shown in both columns (filled in the column that types, outlined in the
+  other). Arrows, PgUp/PgDn, Home/End (start / end of the row), Cmd/Ctrl+Home/End (start / end of the
+  file), a click places it (in the column clicked), Tab switches the column, the wheel scrolls (three
+  rows a line). Cmd/Ctrl+G = the "Go to" field in the toolbar: an offset as `0x…` (hex) or decimal,
+  Enter goes there. Typing goes to exactly one place: the Go to field when it has the keyboard —
+  focused, clicked, or given it by Cmd/Ctrl+G in that same frame — else the bytes.
+- Editing only overwrites; the file's size never changes. In the hex column a hex digit overwrites
+  the high nibble, the next one the low nibble, and the cursor moves on (the two digits are one undo
+  step, also at the undo bound); in the ASCII column a printable ASCII character overwrites the
+  byte. Edits are a sparse map offset → the byte wanted there, in absolute values (and each undo
+  and redo step records the bytes shown before and after) — the cached copy is never written;
+  whether a byte is changed is a comparison with the file, so a byte typed back to its value is no
+  longer a change. "Unsaved" is by content: edits undone back to what the file holds (as opened,
+  or as last saved) are not unsaved. Changed
+  bytes are marked in both columns. Undo/Redo: Cmd/Ctrl+Z, Shift+Cmd/Ctrl+Z.
+- Status bar: the cursor's offset (hex and decimal), its byte (hex, decimal, the character when
+  printable), the file's size (the exact count on hover), "N bytes changed", "unsaved", and the
+  last result.
+- Save (Cmd/Ctrl+S) is image Save's contract (§5), from one pass over the bytes as opened: the
+  same reads write the local backup of the original under `<cache>/.backup` (the session's first
+  Save; path printed), the staged copy with the edits applied (created exclusively and owner-only
+  under `<cache>/.edits`), and their SHA-256. The handle's size, mtime, change time and inode are
+  compared with what was opened before the pass and with before after it; any difference and the
+  save is refused with nothing staged or backed up left (so is any failure during or after the
+  pass) — the edits are written to
+  `<name>.hexpatch-<stamp>.txt` among the edits (0600, set on the file whatever the umask; a header
+  naming the source as opened,
+  then one `offset: bytes` line per run of changed bytes), named in the disclosure rows. Then the
+  conflict-checked overwrite; a local file opened in place has no hash from a fetch, so the pass's
+  hash is its baseline (the target's content is checked against it up to 256 MiB). A refused or
+  failed overwrite keeps the staged edit (`<stem>.conflict-<stamp>-<random><ext>` when refused) and
+  names it in the disclosure rows; the remote is untouched. Save copy (Shift+Cmd/Ctrl+S) is staged by
+  the same pass (refused, and the edits listed, the same way) and publishes `<stem>.edited<ext>` next
+  to the original (`-N` when taken), never replacing anything, as image Save copy does. The bytes are
+  read through the handle opened with the file, never again by path. The change-time part of that
+  check also refuses after a change to the file's metadata alone (chmod, an extended attribute):
+  accepted as conservative. A fetched copy's identity is never renewed after a Save (an upload does
+  not change it), so a copy changed during an upload — even with its mtime put back — is refused by
+  the next Save. A local file saved in place was replaced by the rename: the window re-binds to the
+  file now at the path only if its content's SHA-256 equals the stage's (taken in the same pass);
+  it becomes the new original. Nothing is read from the old file then: the edits and the history
+  are absolute and stay as they are, and an edit is dropped only where it equals the new file's
+  byte, read from the new file. That rebase is all or nothing: a byte the new file cannot give
+  leaves the edits as they were and turns the window read-only. If the hash does not match
+  (another writer, right after), the window turns read-only too. Read-only says so whole in the
+  rows and lists the edits (the bytes wanted, absolute) in a `.hexpatch` file. When that list
+  cannot be written, the rows say why and offer "Keep edits…" (try again) and "Write the list
+  there" (a path the owner types, written as Save to… writes: a new file, never over anything);
+  while the edits are kept nowhere and unsaved, closing asks (Discard / Cancel). That path field
+  owns the typing of a frame it has the keyboard in, as the Go to field does (the grid does not
+  take the keyboard back); what writing the list had to say (a staging folder it could not
+  remove) is shown with where the list went. A re-bind forgets what the last Save copy holds
+  (it was remembered against the old file): closing asks unless the bytes equal the saved file. A save whose worker ends without a result is a visible failure; the edits stay
+  and the window stays usable.
+- Where the server cannot replace a file in one step (`posix-rename@openssh.com`), Save is off with
+  the reason on hover and in the rows; editing and Save copy work — the image window's rule.
+- Closing with unsaved edits asks: Save (Save copy where Save is off) / Discard / Cancel. Closing
+  during a save waits for it. Either way the window closes only when the save landed with nothing
+  to read and nothing unsaved — a finished save is taken after the frame's input, so an edit or an
+  undo in that frame counts; one that did not land, or landed with notes (the remote changed right
+  after), keeps the window open; newer edits ask again. A close asked for during a save is used up
+  by that save, whatever it reports: it never closes the window after a later Save. Once closing
+  is decided nothing edits.
+
 ## 7. Media window (A4, A5)
 
 - Probe with `ffprobe` (duration, streams, size). `ffmpeg`/`ffprobe` are resolved at runtime (`SOPEN_FFMPEG`, then PATH;
@@ -227,7 +369,7 @@ Local only, never sent anywhere. Exists for §10.
 
 ## 9. Out of scope (until §10 says otherwise)
 
-Own text editor / tree / highlighting (Zed does it), hex editor (`--app`), filters beyond crop/pixelize, frame-accurate
+Own text editor / tree / highlighting (VS Code or Zed does it), hex insert / delete or anything that changes a file's size, filters beyond crop/pixelize, frame-accurate
 copy without re-encode, streaming playback before download completes, directory sync / mounts, file watching,
 Windows, a `.app` bundle or cask, any agent on the remote, macshot (Swift, macOS-only, GPL-3 — incompatible with A7/A8).
 

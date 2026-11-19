@@ -1,7 +1,8 @@
 //! Local paths: the fetch cache `<cache>/<host>/<abs path>`, edits kept aside as
-//! `<copy>.conflict-<UTC stamp>`, image backups `<cache>/.backup/<host>/<abs path>.<UTC stamp>`,
-//! image edits under `<cache>/.edits`, exports under `<cache>/.exports`, session copies under
-//! `<cache>/.sessions` (spec §5), and the state dir (ssh control sockets, `usage.jsonl`). What
+//! `<copy>.conflict-<UTC stamp>`, image and hex backups
+//! `<cache>/.backup/<host>/<abs path>.<UTC stamp>`, image and hex edits under `<cache>/.edits`,
+//! exports under `<cache>/.exports`, session copies under `<cache>/.sessions` (spec §5), and the
+//! state dir (ssh control sockets, `usage.jsonl`). What
 //! sopen knows about a copy lives apart from the mirrored tree, under `<cache>/.meta` (see
 //! [`Claim`]): the record of what the copy held when fetched or saved, and the session lock. `SOPEN_CACHE_DIR` /
 //! `SOPEN_STATE_DIR` override both. What sopen creates under the cache is the owner's only
@@ -88,8 +89,8 @@ fn meta_path(cache: &Path, kind: &str, local: &Path) -> Result<PathBuf> {
     Ok(cache.join(META).join(kind).join(rel))
 }
 
-/// The cache's fixed roots, beside the mirrored hosts: image backups, staged and kept image
-/// edits, local exports. Dot names: no host label reaches them (see [`sanitize`]). Roots an
+/// The cache's fixed roots, beside the mirrored hosts: image and hex backups, staged and kept
+/// image and hex edits, local exports. Dot names: no host label reaches them (see [`sanitize`]). Roots an
 /// older build made without the dot (`backup`, `edits`, `exports`) are just cache now: never
 /// read, never written.
 const BACKUP: &str = ".backup";
@@ -102,7 +103,7 @@ pub fn cache_path(cache: &Path, host: &str, abs: &str) -> PathBuf {
     under(cache, host, abs)
 }
 
-/// Where image edits are staged and refused ones kept.
+/// Where image and hex edits are staged and refused ones kept.
 pub fn edits_root(cache: &Path) -> PathBuf {
     cache.join(EDITS)
 }
@@ -118,7 +119,7 @@ pub fn exports_root(cache: &Path) -> PathBuf {
     cache.join(EXPORTS)
 }
 
-/// Where image backups go: `<backup root>/<host>/<abs path>.<UTC stamp>`.
+/// Where image and hex backups go: `<backup root>/<host>/<abs path>.<UTC stamp>`.
 pub fn backup_root(cache: &Path) -> PathBuf {
     cache.join(BACKUP)
 }
@@ -292,6 +293,63 @@ fn claim_with(
         fresh: true,
         _lock: None,
     })
+}
+
+/// A remote file fetched into this session's cached copy.
+pub struct Fetched {
+    /// The copy, locked for as long as this lives: another session gets a copy of its own.
+    pub claim: Claim,
+    pub at: crate::remote::Stat,
+    /// Where earlier copies' unsaved edits went (already printed), for a window to repeat.
+    pub notices: Vec<String>,
+}
+
+/// Claims the cached copy of `abs` on `host` for this session (a line says when it is a copy
+/// of its own), moves an earlier copy's unsaved edits aside (said as known), fetches with
+/// `progress` (`(bytes done, total)`), and records what the copy now holds. Returns the fetch
+/// and how long it took in milliseconds. Every fetch into the cache goes through here, so no
+/// session replaces or moves a copy another one is editing.
+pub fn fetch_claimed(
+    fs: &mut dyn crate::remote::RemoteFs,
+    host: &str,
+    abs: &str,
+    cache: &Path,
+    progress: &mut dyn FnMut(u64, u64),
+) -> Result<(Fetched, u64)> {
+    let claim = claim(cache, host, abs)?;
+    if let Some(note) = &claim.note {
+        eprintln!("sopen: {note}");
+    }
+    let mut notices = Vec::new();
+    // Said as known: a copy that differs from what was recorded has unsaved edits; one with no
+    // record may or may not.
+    match claim.set_aside_unsaved()? {
+        Some(Kept { path, edited: true }) => notices.push(format!(
+            "the previous copy had unsaved edits; kept them at {}",
+            path.display()
+        )),
+        Some(Kept {
+            path,
+            edited: false,
+        }) => notices.push(format!(
+            "no record of what was fetched for {}; kept it at {} in case it holds edits",
+            claim.local.display(),
+            path.display()
+        )),
+        None => {}
+    }
+    for line in &notices {
+        eprintln!("sopen: {line}");
+    }
+    let started = std::time::Instant::now();
+    let at = fs.fetch(abs, &claim.local, progress)?;
+    if let Some(sha) = &at.sha256 {
+        if let Err(e) = claim.record(sha) {
+            crate::debug!("not recorded: {e:#}");
+        }
+    }
+    let ms = started.elapsed().as_millis() as u64;
+    Ok((Fetched { claim, at, notices }, ms))
 }
 
 /// The session lock file of the cached copy `local`, open (created owner-only if new). Never

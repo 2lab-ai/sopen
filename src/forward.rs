@@ -17,7 +17,7 @@ use std::process::{Command, ExitStatus};
 /// Receipt hooks (AGENTS.md "Receipts") a forwarded run carries to HOST. Settings that name local
 /// paths — `SOPEN_CODE`, `SOPEN_ZED`, `SOPEN_FFMPEG`, `SOPEN_FFPROBE`, `SOPEN_CACHE_DIR`, `SOPEN_STATE_DIR`,
 /// `SOPEN_CONFIG` — mean nothing on HOST and stay here.
-pub const FORWARDED_ENV: [&str; 11] = [
+pub const FORWARDED_ENV: [&str; 13] = [
     "SOPEN_STATE",
     "SOPEN_SCREENSHOT",
     "SOPEN_WATCHDOG",
@@ -27,6 +27,8 @@ pub const FORWARDED_ENV: [&str; 11] = [
     "SOPEN_EXPORT_HOLD_MS",
     "SOPEN_RENDERER",
     "SOPEN_WINDOW_SIZE",
+    "SOPEN_CHOICE",
+    "SOPEN_SAVE_TO",
     "SOPEN_LOG",
     "SOPEN_TARGET_BIN",
 ];
@@ -264,7 +266,7 @@ pub fn quote(word: &str) -> String {
 }
 
 /// The `sh` script HOST runs, on one line (no shell reads it differently for a newline). Its
-/// arguments are `[--app APP] -- SOURCE`; it always adds `--here`.
+/// arguments are `[--app APP] [--hex] -- SOURCE`; it always adds `--here`.
 fn script(host: &str, install_paths: &str) -> String {
     let missing = quote(&format!(
         "sopen is not installed on {host} (brew install 2lab-ai/tap/sopen-preview)"
@@ -316,7 +318,8 @@ fn script(host: &str, install_paths: &str) -> String {
     .join(" ")
 }
 
-/// The command for HOST's sshd: `exec [env K=V…] sh -c <script> sopen [--app APP] -- SOURCE`,
+/// The command for HOST's sshd: `exec [env K=V…] sh -c <script> sopen [--app APP] [--hex] --
+/// SOURCE`,
 /// every word but `exec` quoted. The hooks go in front of `sh`, so the script sees
 /// `SOPEN_TARGET_BIN` and the sopen it starts sees them all. The bare `exec` (a constant, never
 /// data) replaces the login shell that parses the line — dash and fish would otherwise stay as
@@ -326,6 +329,7 @@ pub fn remote_words(
     host: &str,
     source: &str,
     app: Option<&str>,
+    hex: bool,
     env: &[String],
     install_paths: &str,
 ) -> Vec<String> {
@@ -342,6 +346,9 @@ pub fn remote_words(
     ]);
     if let Some(app) = app {
         words.extend(["--app".to_string(), app.to_string()]);
+    }
+    if hex {
+        words.push("--hex".to_string());
     }
     words.extend(["--".to_string(), source.to_string()]);
     std::iter::once("exec".to_string())
@@ -384,9 +391,9 @@ pub fn ssh_args(
 
 /// Runs sopen on HOST for `source` (already as HOST sees it) and waits; returns the exit code to
 /// leave with.
-pub fn run(host: &str, source: &str, app: Option<&str>, state_dir: &Path) -> Result<u8> {
+pub fn run(host: &str, source: &str, app: Option<&str>, hex: bool, state_dir: &Path) -> Result<u8> {
     let env = forwarded_env(|key| std::env::var_os(key))?;
-    let words = remote_words(host, source, app, &env, INSTALL_PATHS);
+    let words = remote_words(host, source, app, hex, &env, INSTALL_PATHS);
     let connection = crate::remote::connection_args(host, state_dir)?;
     let tty = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
     let args = ssh_args(connection, tty, app.is_some(), host, words);
@@ -677,7 +684,14 @@ mod tests {
         let connection = ["-S", "/s/cm-x", "-o", "ControlMaster=auto"]
             .map(OsString::from)
             .to_vec();
-        let words = remote_words("box", "/tmp/a b.png", Some("ImHex"), &[], INSTALL_PATHS);
+        let words = remote_words(
+            "box",
+            "/tmp/a b.png",
+            Some("ImHex"),
+            false,
+            &[],
+            INSTALL_PATHS,
+        );
         // No terminal here, `--app` waiting for Enter: no terminal there, but this side's input.
         let args = ssh_args(connection.clone(), false, true, "box", words.clone());
         let mut want = connection.clone();
@@ -713,9 +727,20 @@ mod tests {
         assert_eq!(flags(false, false), ["-T", "-n"]);
 
         let env = ["SOPEN_LOG=debug".to_string()];
-        let words = remote_words("box", "/x", None, &env, INSTALL_PATHS);
+        let words = remote_words("box", "/x", None, false, &env, INSTALL_PATHS);
         assert_eq!(words[..4], ["exec", "'env'", "'SOPEN_LOG=debug'", "'sh'"]);
         assert_eq!(words[words.len() - 3..], ["'sopen'", "'--'", "'/x'"]);
+        // `--hex` travels after `--app`, before `--`.
+        let words = remote_words("box", "/x", None, true, &[], INSTALL_PATHS);
+        assert_eq!(
+            words[words.len() - 4..],
+            ["'sopen'", "'--hex'", "'--'", "'/x'"]
+        );
+        let words = remote_words("box", "/x", Some("ImHex"), true, &[], INSTALL_PATHS);
+        assert_eq!(
+            words[words.len() - 6..],
+            ["'sopen'", "'--app'", "'ImHex'", "'--hex'", "'--'", "'/x'"]
+        );
 
         let script = script("box", INSTALL_PATHS);
         assert!(!script.contains('\n'), "{script}");
@@ -946,7 +971,7 @@ mod tests {
         for sh in login_shells() {
             let h = host("Darwin", "");
             executable(&h.bin.join("sopen"), &fake_sopen());
-            let words = remote_words("box", source, Some("Hex Fiend"), &env, INSTALL_PATHS);
+            let words = remote_words("box", source, Some("Hex Fiend"), false, &env, INSTALL_PATHS);
             let (code, out, err) = h.run(&sh, &words, &[]);
             assert_eq!(code, 0, "{sh:?}: {err}");
             assert_eq!(err, "", "{sh:?}");
@@ -968,6 +993,16 @@ mod tests {
             );
             assert_eq!(value(&out, "SOPEN_STATE"), "rect=1,2,3,4;op=crop|pixelize");
             assert_eq!(value(&out, "SOPEN_LOG"), "debug");
+            // `--hex` reaches HOST's sopen after `--here`, before `--`.
+            let words = remote_words("box", source, None, true, &env, INSTALL_PATHS);
+            let (code, out, err) = h.run(&sh, &words, &[]);
+            assert_eq!(code, 0, "{sh:?}: {err}");
+            let args: Vec<&str> = out.lines().filter_map(|l| l.strip_prefix("arg ")).collect();
+            assert_eq!(
+                args,
+                ["[--here]", "[--hex]", "[--]", &format!("[{source}]")],
+                "{sh:?}"
+            );
             // Not Linux: no display variables are made up, and systemd is not asked.
             assert_eq!(value(&out, "DISPLAY"), "unset", "{sh:?}");
             assert_eq!(value(&out, "WAYLAND_DISPLAY"), "unset");
@@ -983,7 +1018,7 @@ mod tests {
             let elsewhere = h.root.join("build/sopen-dev");
             executable(&elsewhere, &fake_sopen());
             let env = [format!("SOPEN_TARGET_BIN={}", elsewhere.display())];
-            let words = remote_words("box", "/x", None, &env, &h.not_installed());
+            let words = remote_words("box", "/x", None, false, &env, &h.not_installed());
             let (code, out, err) = h.run(&sh, &words, &[]);
             assert_eq!(code, 0, "{sh:?}: {err}");
             assert!(has_line(&out, "arg [--here]"), "{out}");
@@ -993,7 +1028,7 @@ mod tests {
             // production list: a sopen installed on the test machine would be found first.)
             executable(&h.home.join(".cargo/bin/sopen"), &fake_sopen());
             let paths = format!(r#"{} "$HOME/.cargo/bin/sopen""#, h.not_installed());
-            let words = remote_words("box", "/x", None, &[], &paths);
+            let words = remote_words("box", "/x", None, false, &[], &paths);
             let (code, out, err) = h.run(&sh, &words, &[]);
             assert_eq!(code, 0, "{sh:?}: {err}");
             assert!(has_line(&out, "arg [/x]"), "{out}");
@@ -1010,7 +1045,7 @@ mod tests {
             executable(&brew.join("sopen"), &fake_sopen());
             executable(&brew.join("ffmpeg"), "#!/bin/sh\n");
             let paths = quote(brew.join("sopen").to_str().unwrap());
-            let words = remote_words("box", "/x", None, &[], &paths);
+            let words = remote_words("box", "/x", None, false, &[], &paths);
             let (code, out, err) = h.run(&sh, &words, &[]);
             assert_eq!(code, 0, "{sh:?}: {err}");
             let path = value(&out, "PATH");
@@ -1028,7 +1063,7 @@ mod tests {
             let elsewhere = h.root.join("build/sopen-dev");
             executable(&elsewhere, &fake_sopen());
             let env = [format!("SOPEN_TARGET_BIN={}", elsewhere.display())];
-            let words = remote_words("box", "/x", None, &env, &h.not_installed());
+            let words = remote_words("box", "/x", None, false, &env, &h.not_installed());
             let (code, out, err) = h.run(&sh, &words, &[]);
             assert_eq!(code, 0, "{sh:?}: {err}");
             let path = value(&out, "PATH");
@@ -1064,7 +1099,7 @@ mod tests {
     fn the_script_says_when_sopen_is_missing() {
         for sh in login_shells() {
             let h = host("Darwin", "");
-            let words = remote_words("me@box", "/x", None, &[], &h.not_installed());
+            let words = remote_words("me@box", "/x", None, false, &[], &h.not_installed());
             let (code, out, err) = h.run(&sh, &words, &[]);
             assert_eq!(code, 127, "{sh:?}: {out} {err}");
             assert_eq!(
@@ -1085,7 +1120,7 @@ mod tests {
         // show here as no exit code (-1) — and to ssh as a lost connection (255).
         for sh in login_shells() {
             let h = host("Darwin", "");
-            let words = remote_words("box", "/x", None, &[], INSTALL_PATHS);
+            let words = remote_words("box", "/x", None, false, &[], INSTALL_PATHS);
             for (signal, code) in [("INT", 130), ("TERM", 143), ("HUP", 129)] {
                 executable(
                     &h.bin.join("sopen"),
@@ -1139,7 +1174,7 @@ mod tests {
             }
             std::fs::write(h.root.join("session-env"), session).unwrap();
             executable(&h.bin.join("sopen"), &fake_sopen());
-            let words = remote_words("box", "/x", None, &[], INSTALL_PATHS);
+            let words = remote_words("box", "/x", None, false, &[], INSTALL_PATHS);
             let (code, out, err) = h.run(&sh, &words, &[]);
             assert_eq!(code, 0, "{sh:?}: {err}");
             assert!(!pwned.exists(), "{sh:?}: a session value was evaluated");
@@ -1169,7 +1204,7 @@ mod tests {
             std::fs::create_dir_all(&run).unwrap();
             std::fs::write(run.join("wayland-0.lock"), "").unwrap();
             let _socket = std::os::unix::net::UnixListener::bind(run.join("wayland-3")).unwrap();
-            let words = remote_words("box", "/x", None, &[], INSTALL_PATHS);
+            let words = remote_words("box", "/x", None, false, &[], INSTALL_PATHS);
             let runtime = [("XDG_RUNTIME_DIR", run.to_str().unwrap())];
             let (code, out, err) = h.run(&sh, &words, &runtime);
             assert_eq!(code, 0, "{sh:?}: {err}");

@@ -743,8 +743,8 @@ pub const CANNOT_REPLACE: &str = "this server cannot replace a file in one step 
      posix-rename@openssh.com) — Save copy writes the edit next to the original instead";
 
 /// The one line for a write that failed, keeping the edit. A request that got no reply is
-/// "outcome unknown — check <path>", never "not saved".
-fn failed(e: &anyhow::Error, staged: &Path) -> anyhow::Error {
+/// "outcome unknown — check <path>", never "not saved". The hex window says it the same way.
+pub(super) fn failed(e: &anyhow::Error, staged: &Path) -> anyhow::Error {
     match crate::remote::outcome_unknown(e) {
         Some(unknown) => anyhow!(
             "{unknown}; your edit is at {} (cause: {})",
@@ -885,10 +885,7 @@ impl ImageFile {
     pub fn save_copy(&mut self, encoded: &[u8]) -> Result<String> {
         let staged = self.stage(encoded, "copy")?;
         let (dir, name) = self.origin.parent();
-        let wanted = match name.rfind('.') {
-            Some(i) if i > 0 => format!("{}.edited{}", &name[..i], &name[i..]),
-            _ => format!("{name}.edited"),
-        };
+        let wanted = super::edited_name(&name);
         let result = self
             .origin
             .fs()
@@ -1666,6 +1663,7 @@ mod robustness_tests;
 mod tests {
     use super::*;
     use crate::remote::{LocalFs, RemoteFs};
+    use crate::testutil::NoReplace;
     use image::{GenericImageView, Rgb, Rgba};
 
     fn gradient(w: u32, h: u32) -> DynamicImage {
@@ -2327,58 +2325,6 @@ mod tests {
             b"someone else's bytes"
         );
         assert_eq!(kept.extension().unwrap(), "png");
-    }
-
-    /// The local disk, posing as a server without `posix-rename@openssh.com`.
-    struct NoReplace(LocalFs);
-
-    impl RemoteFs for NoReplace {
-        fn stat_opt(&mut self, p: &str) -> Result<Option<crate::remote::Stat>> {
-            self.0.stat_opt(p)
-        }
-        fn lstat_opt(&mut self, p: &str) -> Result<Option<crate::remote::Stat>> {
-            self.0.lstat_opt(p)
-        }
-        fn realpath(&mut self, p: &str) -> Result<String> {
-            self.0.realpath(p)
-        }
-        fn read_head(&mut self, p: &str, max: usize) -> Result<Vec<u8>> {
-            self.0.read_head(p, max)
-        }
-        fn list_dir(&mut self, p: &str) -> Result<Vec<String>> {
-            self.0.list_dir(p)
-        }
-        fn read_to(
-            &mut self,
-            p: &str,
-            out: &mut dyn std::io::Write,
-            progress: &mut dyn FnMut(u64),
-        ) -> Result<u64> {
-            self.0.read_to(p, out, progress)
-        }
-        fn create_from(
-            &mut self,
-            local: &Path,
-            p: &str,
-            like: Option<crate::remote::Like>,
-        ) -> std::result::Result<crate::remote::Uploaded, crate::remote::CreateError> {
-            self.0.create_from(local, p, like)
-        }
-        fn set_mode(&mut self, p: &str, mode: u32) -> Result<()> {
-            self.0.set_mode(p, mode)
-        }
-        fn rename_over(&mut self, from: &str, to: &str) -> Result<()> {
-            self.0.rename_over(from, to)
-        }
-        fn link_new(&mut self, from: &str, to: &str) -> Result<()> {
-            self.0.link_new(from, to)
-        }
-        fn remove(&mut self, p: &str) -> Result<()> {
-            self.0.remove(p)
-        }
-        fn can_replace(&self) -> bool {
-            false
-        }
     }
 
     #[test]

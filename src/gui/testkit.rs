@@ -234,6 +234,19 @@ impl Driver {
         found.into_iter().map(|(r, ())| r).collect()
     }
 
+    /// Every rectangle the last pass drew where it can be seen (as for [`Driver::find_text`]):
+    /// its bounds, fill colour and stroke width.
+    pub fn rects(&self) -> Vec<(Rect, egui::Color32, f32)> {
+        let found = self.shown(|s| match s {
+            egui::Shape::Rect(r) => Some((r.rect, (r.fill, r.stroke.width))),
+            _ => None,
+        });
+        found
+            .into_iter()
+            .map(|(rect, (fill, width))| (rect, fill, width))
+            .collect()
+    }
+
     /// Clicks the control labelled `text`.
     pub fn click_text<W: Window>(&mut self, win: &mut W, text: &str) {
         let rect = self

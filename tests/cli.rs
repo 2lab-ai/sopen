@@ -56,22 +56,231 @@ fn missing_file_is_one_error_line() {
     assert!(err.contains("no such file"), "{err}");
 }
 
+/// A binary file's dialog answered by `SOPEN_CHOICE` (no window): "save" copies it to
+/// `SOPEN_SAVE_TO` and never over anything; "cancel" writes nothing.
 #[test]
-fn other_files_print_their_path_and_log_usage() {
+fn other_files_save_to_a_path_or_cancel_and_log_usage() {
+    let tmp = tempfile::tempdir().unwrap();
+    let blob = tmp.path().join("blob.bin");
+    let body = [0u8, 1, 2, 3, 0xff];
+    std::fs::write(&blob, body).unwrap();
+    let out_dir = tmp.path().join("out");
+    std::fs::create_dir(&out_dir).unwrap();
+    let dest = out_dir.join("copy.bin");
+    let save = [
+        ("SOPEN_CHOICE", "save"),
+        ("SOPEN_SAVE_TO", dest.to_str().unwrap()),
+    ];
+    let out = sopen(tmp.path(), &[blob.to_str().unwrap()], &save);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert_eq!(
+        text(&out.stdout).trim(),
+        format!("saved {}", dest.display())
+    );
+    assert_eq!(std::fs::read(&dest).unwrap(), body);
+    assert_eq!(
+        files(&out_dir),
+        std::slice::from_ref(&dest),
+        "only the saved file (no staging left)"
+    );
+    let log = usage_lines(tmp.path());
+    assert_eq!(log[0]["kind"], "other");
+    assert_eq!(log[0]["ext"], "bin");
+    assert_eq!(log[0]["action"], "open");
+    assert_eq!(log[0]["host_hash"], "local");
+    assert_eq!(log[0]["ok"], true);
+
+    // Again: the path is taken now. Not replaced; the next free name is named.
+    std::fs::write(&dest, b"mine").unwrap();
+    let out = sopen(tmp.path(), &[blob.to_str().unwrap()], &save);
+    assert_eq!(out.status.code(), Some(1));
+    let err = text(&out.stderr);
+    assert!(err.contains("exists; not replaced"), "{err}");
+    assert!(err.contains("copy-1.bin"), "{err}");
+    assert_eq!(std::fs::read(&dest).unwrap(), b"mine");
+    assert!(!out_dir.join("copy-1.bin").exists());
+
+    // A folder: the file's own name inside it.
+    let out = sopen(
+        tmp.path(),
+        &[blob.to_str().unwrap()],
+        &[
+            ("SOPEN_CHOICE", "save"),
+            ("SOPEN_SAVE_TO", out_dir.to_str().unwrap()),
+        ],
+    );
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert_eq!(std::fs::read(out_dir.join("blob.bin")).unwrap(), body);
+
+    // Cancel: nothing written.
+    let before = files(&out_dir);
+    let out = sopen(
+        tmp.path(),
+        &[blob.to_str().unwrap()],
+        &[("SOPEN_CHOICE", "cancel")],
+    );
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert!(
+        text(&out.stderr).contains("sopen: cancelled"),
+        "{}",
+        text(&out.stderr)
+    );
+    assert_eq!(files(&out_dir), before);
+    let out = sopen(
+        tmp.path(),
+        &[blob.to_str().unwrap()],
+        &[("SOPEN_CHOICE", "maybe")],
+    );
+    assert_eq!(out.status.code(), Some(1));
+}
+
+/// No display (Linux over ssh): the binary file is not asked about; its local path is printed
+/// as before, with one line saying why.
+#[cfg(target_os = "linux")]
+#[test]
+fn other_files_without_a_display_print_their_path() {
     let tmp = tempfile::tempdir().unwrap();
     let blob = tmp.path().join("blob.bin");
     std::fs::write(&blob, [0u8, 1, 2, 3]).unwrap();
-    let out = sopen(tmp.path(), &[blob.to_str().unwrap()], &[]);
+    let mut cmd = sopen_command(tmp.path());
+    cmd.arg(&blob)
+        .env_remove("DISPLAY")
+        .env_remove("WAYLAND_DISPLAY");
+    let out = cmd.output().unwrap();
     assert!(out.status.success(), "{}", text(&out.stderr));
     let real = std::fs::canonicalize(&blob).unwrap();
     assert_eq!(text(&out.stdout).trim(), real.to_str().unwrap());
-    let log = std::fs::read_to_string(tmp.path().join("state/usage.jsonl")).unwrap();
-    let v: serde_json::Value = serde_json::from_str(log.trim()).unwrap();
-    assert_eq!(v["kind"], "other");
-    assert_eq!(v["ext"], "bin");
-    assert_eq!(v["action"], "open");
-    assert_eq!(v["host_hash"], "local");
-    assert_eq!(v["ok"], true);
+    assert!(
+        text(&out.stderr).contains("no display for a window"),
+        "{}",
+        text(&out.stderr)
+    );
+}
+
+/// `--hex` opens any file — here a text file — in the hex editor; with `SOPEN_STATE` patches
+/// and `SOPEN_AUTOSAVE` it saves them without a window, after a backup.
+#[test]
+fn hex_flag_saves_patches_to_a_text_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    let file = tmp.path().join("notes.txt");
+    std::fs::write(&file, "hello, world\n").unwrap();
+    let out = sopen(
+        tmp.path(),
+        &["--hex", file.to_str().unwrap()],
+        &[
+            ("SOPEN_STATE", "at=0x7;patch=0:48,0x7:574F"),
+            ("SOPEN_AUTOSAVE", "1"),
+        ],
+    );
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert_eq!(std::fs::read(&file).unwrap(), b"Hello, WOrld\n");
+    let printed = text(&out.stdout);
+    assert!(printed.contains("backup of "), "{printed}");
+    assert!(printed.contains("(3 bytes changed)"), "{printed}");
+    let backups = files(&sopen::cache::backup_root(&tmp.path().join("cache")));
+    assert_eq!(backups.len(), 1, "{backups:?}");
+    assert_eq!(std::fs::read(&backups[0]).unwrap(), b"hello, world\n");
+    let log = usage_lines(tmp.path());
+    assert_eq!(
+        (log[0]["kind"].as_str(), log[0]["action"].as_str()),
+        (Some("text"), Some("save"))
+    );
+    // A patch past the end is an error; nothing is written.
+    let out = sopen(
+        tmp.path(),
+        &["--hex", file.to_str().unwrap()],
+        &[("SOPEN_STATE", "patch=0xd:00"), ("SOPEN_AUTOSAVE", "1")],
+    );
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(std::fs::read(&file).unwrap(), b"Hello, WOrld\n");
+    // Folders are not files.
+    let out = sopen(tmp.path(), &["--hex", tmp.path().to_str().unwrap()], &[]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        text(&out.stderr).contains("--hex opens files"),
+        "{}",
+        text(&out.stderr)
+    );
+    assert!(
+        sopen(tmp.path(), &["--hex", "--app", "X", "a"], &[])
+            .status
+            .code()
+            == Some(2)
+    );
+}
+
+/// A scripted save on a binary file must say what to open: the dialog would wait for an answer
+/// no one gives (a scripted run ignores input). An error, not a window.
+#[test]
+fn autosave_on_a_binary_file_needs_the_hex_answer() {
+    let tmp = tempfile::tempdir().unwrap();
+    let blob = tmp.path().join("blob.bin");
+    std::fs::write(&blob, [0u8, 1, 2, 3]).unwrap();
+    let out = sopen(
+        tmp.path(),
+        &[blob.to_str().unwrap()],
+        &[("SOPEN_STATE", "patch=0:ff"), ("SOPEN_AUTOSAVE", "1")],
+    );
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out.stderr));
+    let err = text(&out.stderr);
+    assert!(err.contains("need SOPEN_CHOICE=hex"), "{err}");
+    assert_eq!(err.lines().count(), 1, "{err}");
+    assert_eq!(std::fs::read(&blob).unwrap(), [0, 1, 2, 3]);
+}
+
+/// The dialog answered "hex" for a binary file: the same hex save path.
+#[test]
+fn hex_choice_on_a_binary_file_saves_patches() {
+    let tmp = tempfile::tempdir().unwrap();
+    let blob = tmp.path().join("blob.bin");
+    std::fs::write(&blob, [0u8, 1, 2, 3]).unwrap();
+    let out = sopen(
+        tmp.path(),
+        &[blob.to_str().unwrap()],
+        &[
+            ("SOPEN_CHOICE", "hex"),
+            ("SOPEN_STATE", "patch=3:ff"),
+            ("SOPEN_AUTOSAVE", "1"),
+        ],
+    );
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert_eq!(std::fs::read(&blob).unwrap(), [0, 1, 2, 0xff]);
+}
+
+/// Exit 3: the file changed while the autosave waited; nothing of ours is written.
+#[test]
+fn hex_autosave_refuses_a_file_changed_meanwhile() {
+    let tmp = tempfile::tempdir().unwrap();
+    let blob = tmp.path().join("blob.bin");
+    std::fs::write(&blob, [0u8, 1, 2, 3]).unwrap();
+    let mut child = sopen_command(tmp.path())
+        .args(["--hex", blob.to_str().unwrap()])
+        .env("SOPEN_STATE", "patch=0:ff")
+        .env("SOPEN_AUTOSAVE", "1")
+        .env("SOPEN_AUTOSAVE_DELAY_MS", "1000")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    use std::io::BufRead;
+    let mut lines = std::io::BufReader::new(child.stderr.take().unwrap()).lines();
+    let first = lines.next().unwrap().unwrap();
+    assert!(first.starts_with("waiting "), "{first}");
+    std::fs::write(&blob, b"another writer").unwrap();
+    let err: String = lines.map(|l| l.unwrap() + "\n").collect();
+    let status = child.wait().unwrap();
+    assert_eq!(status.code(), Some(3), "{err}");
+    assert!(err.contains("changed since it was opened"), "{err}");
+    assert_eq!(std::fs::read(&blob).unwrap(), b"another writer");
+    // The edits are listed where the refusal says: one `offset: bytes` line.
+    let lists: Vec<_> = files(&sopen::cache::edits_root(&tmp.path().join("cache")))
+        .into_iter()
+        .filter(|p| p.to_string_lossy().contains("blob.bin.hexpatch-"))
+        .collect();
+    assert_eq!(lists.len(), 1, "{lists:?}");
+    assert!(err.contains(lists[0].to_str().unwrap()), "{err}");
+    let text = std::fs::read_to_string(&lists[0]).unwrap();
+    assert!(text.lines().any(|l| l == "0x0: FF"), "{text}");
 }
 
 #[test]
@@ -302,11 +511,18 @@ fn small_png(path: &Path) {
     img.save(path).unwrap();
 }
 
-/// Files under `dir`, recursively.
+/// Files under `dir`, recursively; an absent `dir` has none, any other error fails the test.
 fn files(dir: &Path) -> Vec<std::path::PathBuf> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+        Err(e) => panic!("cannot list {}: {e}", dir.display()),
+    };
     let mut out = Vec::new();
-    for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
-        let p = entry.path();
+    for entry in entries {
+        let p = entry
+            .unwrap_or_else(|e| panic!("cannot list {}: {e}", dir.display()))
+            .path();
         if p.is_dir() {
             out.extend(files(&p));
         } else {
@@ -674,6 +890,30 @@ fn target_runs_sopen_there_over_ssh_and_keeps_its_exit_code() {
     // `--app` waits for Enter on this side's input: no `-n`.
     let n = ssh.connection().len();
     assert_eq!(argv[n..n + 2], ["-T", "-o"], "{argv:#?}");
+
+    // `--hex` travels to the target's sopen, with the dialog's hooks.
+    let out = sopen(
+        tmp.path(),
+        &["--target", HOST, "--hex", &format!("{HOST}:/tmp/a.bin")],
+        &[
+            ("PATH", &ssh.path),
+            ("SOPEN_TARGET_BIN", bin),
+            ("SOPEN_CHOICE", "save"),
+            ("SOPEN_SAVE_TO", "/tmp/sopen-receipts/a.bin"),
+        ],
+    );
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert_eq!(
+        ssh.sopen_argv().unwrap(),
+        ["--here", "--hex", "--", "/tmp/a.bin"]
+    );
+    let argv = ssh.argv().unwrap();
+    for hook in [
+        "SOPEN_CHOICE=save",
+        "SOPEN_SAVE_TO=/tmp/sopen-receipts/a.bin",
+    ] {
+        assert!(argv.contains(&q(hook)), "{hook}: {argv:#?}");
+    }
     assert!(
         !argv.iter().any(|a| a.contains("SOPEN_CACHE_DIR")),
         "{argv:#?}"
@@ -833,12 +1073,16 @@ fn default_target_from_config_or_env_and_the_flags_beat_both() {
     assert!(out.status.success(), "{}", text(&out.stderr));
     assert_eq!(destination(&ssh).as_deref(), Some("flag-target"));
 
-    // --here beats both: opened here, no ssh.
+    // --here beats both: opened here (its binary-file dialog, answered "cancel"), no ssh.
     ssh.forget();
-    let out = sopen(tmp.path(), &["--here", blob.to_str().unwrap()], &env);
+    let here = [env.as_slice(), &[("SOPEN_CHOICE", "cancel")]].concat();
+    let out = sopen(tmp.path(), &["--here", blob.to_str().unwrap()], &here);
     assert!(out.status.success(), "{}", text(&out.stderr));
-    let real = std::fs::canonicalize(&blob).unwrap();
-    assert_eq!(text(&out.stdout).trim(), real.to_str().unwrap());
+    assert!(
+        text(&out.stderr).contains("sopen: cancelled"),
+        "{}",
+        text(&out.stderr)
+    );
     assert!(ssh.argv().is_none(), "ssh ran for --here");
     assert_eq!(usage_lines(tmp.path()).last().unwrap()["forwarded"], false);
 
@@ -848,7 +1092,8 @@ fn default_target_from_config_or_env_and_the_flags_beat_both() {
     assert_eq!(std::fs::read_to_string(&config).unwrap(), "");
     let shown = sopen(tmp.path(), &["config"], &path);
     assert!(text(&shown.stdout).ends_with("target is not set\n"));
-    let out = sopen(tmp.path(), &[blob.to_str().unwrap()], &path);
+    let here = [path.as_slice(), &[("SOPEN_CHOICE", "cancel")]].concat();
+    let out = sopen(tmp.path(), &[blob.to_str().unwrap()], &here);
     assert!(out.status.success(), "{}", text(&out.stderr));
     assert!(ssh.argv().is_none(), "ssh ran with no target");
 }
@@ -867,6 +1112,8 @@ fn an_unreadable_sopen_target_only_matters_without_a_flag() {
             .env("PATH", &ssh.path)
             .env("FAKE_SSH_EXIT", "0")
             .env("SOPEN_TARGET", bad)
+            // A run here reaches the binary-file dialog: answered without a window.
+            .env("SOPEN_CHOICE", "cancel")
             .output()
             .unwrap()
     };
@@ -930,7 +1177,11 @@ fn a_broken_config_is_an_error_where_it_is_read() {
     assert_eq!(bad.status.code(), Some(1));
 
     // Not consulted, so not in the way: --here, and cut.
-    let out = sopen(tmp.path(), &["--here", blob.to_str().unwrap()], &[]);
+    let out = sopen(
+        tmp.path(),
+        &["--here", blob.to_str().unwrap()],
+        &[("SOPEN_CHOICE", "cancel")],
+    );
     assert!(out.status.success(), "{}", text(&out.stderr));
     let wav = tmp.path().join("a.wav");
     if !sine_wav(&wav) {
