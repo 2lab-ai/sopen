@@ -1850,15 +1850,18 @@ impl HexWindow {
         if self.locked() {
             return;
         }
-        // F5 is PC Shell's Save, the same as Cmd/Ctrl+S.
-        let f5 = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::F5));
         if command_key(ctx, Key::S, true) {
             self.start(ctx, JobKind::SaveCopy { close_after: false });
-        } else if command_key(ctx, Key::S, false) || f5 {
+        } else if command_key(ctx, Key::S, false) {
             self.start(ctx, JobKind::Save { close_after: false });
         }
         if goto_owns {
             return;
+        }
+        // F5 is PC Shell's Save, as Cmd/Ctrl+S — but a plain key: never while a field has
+        // the typing.
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::F5)) {
+            self.start(ctx, JobKind::Save { close_after: false });
         }
         if command_key(ctx, Key::Z, true) {
             self.redo();
@@ -2344,10 +2347,12 @@ impl super::Window for HexWindow {
             // `SOPEN_STATE` `close=ask`: as if closing were asked for (the prompt's receipt).
             self.close_requested();
         }
-        // F6 is PC Shell's Goto, the same as Cmd/Ctrl+G.
+        // F6 is PC Shell's Goto, as Cmd/Ctrl+G — but a plain key: not while a field (Go to,
+        // the read-only path field) has the typing.
         let cmd_g = !self.locked()
             && (super::command_key(&ctx, Key::G, false)
-                || ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::F6)));
+                || (!ctx.text_edit_focused()
+                    && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::F6))));
         if cmd_g {
             self.goto.clear();
             ctx.memory_mut(|m| m.request_focus(goto_id()));

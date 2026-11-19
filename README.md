@@ -246,5 +246,5 @@ License: MIT (the font below keeps its own licence).
 The windows' font is PxPlus IBM VGA 8x16 (`assets/fonts/PxPlus_IBM_VGA_8x16.ttf`) from
 [The Ultimate Oldschool PC Font Pack](https://int10h.org/oldschool-pc-fonts/) by VileR, licensed
 under [CC BY-SA 4.0](https://creativecommons.org/licenses/by-sa/4.0/)
-(`assets/fonts/LICENSE-PxPlus_IBM_VGA_8x16.txt`). The look follows PC Tools by Central Point
-Software.
+(`assets/fonts/LICENSE-PxPlus_IBM_VGA_8x16.txt`); `sopen --version` and `sopen --help` print the
+credit too. The look follows PC Tools by Central Point Software.

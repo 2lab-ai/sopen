@@ -40,10 +40,29 @@ fn version_line() {
     let tmp = tempfile::tempdir().unwrap();
     let out = sopen(tmp.path(), &["--version"], &[]);
     assert!(out.status.success());
-    let line = text(&out.stdout);
+    let all = text(&out.stdout);
+    let line = all.lines().next().unwrap_or_default();
     let want = format!("sopen {} (", env!("CARGO_PKG_VERSION"));
-    assert!(line.starts_with(&want), "{line}");
-    assert!(line.trim_end().ends_with(')'), "{line}");
+    assert!(line.starts_with(&want), "{all}");
+    assert!(line.ends_with(')'), "{all}");
+}
+
+/// The windows' font is CC BY-SA 4.0: its credit travels with the binary (a Homebrew install
+/// has nothing else), in `--version` and the long help; `-V` stays the one version line.
+#[test]
+fn version_and_help_credit_the_font() {
+    let tmp = tempfile::tempdir().unwrap();
+    let credit = "Font: PxPlus IBM VGA 8x16 by VileR (The Ultimate Oldschool PC Font Pack, \
+                  https://int10h.org/oldschool-pc-fonts/), CC BY-SA 4.0";
+    for args in [&["--version"][..], &["--help"][..]] {
+        let out = sopen(tmp.path(), args, &[]);
+        assert!(out.status.success(), "{args:?}");
+        let said = text(&out.stdout);
+        assert!(said.lines().any(|l| l.trim() == credit), "{args:?}: {said}");
+    }
+    let short = text(&sopen(tmp.path(), &["-V"], &[]).stdout);
+    assert_eq!(short.lines().count(), 1, "{short}");
+    assert!(!short.contains("VileR"), "{short}");
 }
 
 #[test]

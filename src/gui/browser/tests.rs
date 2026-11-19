@@ -378,6 +378,46 @@ fn a_viewers_f_keys_join_the_browsers_row() {
     assert!(fx.drv.find_text("Asc/hx ").is_none());
 }
 
+/// In the browser the hex viewer's own F-keys work as in its own window: F5 saves an edit, F6
+/// gives the Go to field the typing; under its unsaved-changes prompt F5 saves nothing.
+#[test]
+fn a_hosted_hex_viewers_f5_and_f6_work_and_respect_its_prompt() {
+    let mut fx = fixture();
+    let file = format!("{}/data.bin", fx.root);
+    fx.open("data.bin");
+    // The first row is 00 01 02 …: 7A over the first byte, then F5.
+    fx.typed("7A");
+    fx.key(Key::F5);
+    fx.drv
+        .until(&mut fx.b, 20, |_| std::fs::read(&file).unwrap()[0] == 0x7A);
+    // F6: "16" goes into the Go to field (not over bytes 1–2), Enter goes there, FF over 16.
+    fx.key(Key::F6);
+    fx.typed("16");
+    fx.key(Key::Enter);
+    fx.typed("FF");
+    assert!(
+        fx.drv.text_starting_with("7A 01 02").is_some(),
+        "row 0 as saved"
+    );
+    assert!(
+        fx.drv.text_starting_with("FF 11 12").is_some(),
+        "FF went to offset 16"
+    );
+    // Esc with that edit: the prompt; F5 under it saves nothing.
+    fx.key(Key::Escape);
+    assert!(fx.drv.find_text("Unsaved changes").is_some());
+    fx.key(Key::F5);
+    fx.drv.idle(&mut fx.b, 5);
+    assert_eq!(
+        std::fs::read(&file).unwrap()[16],
+        0x10,
+        "F5 under the prompt"
+    );
+    fx.drv.click_text(&mut fx.b, "Discard");
+    assert!(fx.b.viewer.is_none());
+    assert_eq!(std::fs::read(&file).unwrap()[16], 0x10);
+}
+
 /// F4 runs the real editor launch (`zed::launch`) — VS Code's CLI here is a script that writes
 /// down its arguments — for the folder or file under the bar, and for the file in a viewer.
 #[test]

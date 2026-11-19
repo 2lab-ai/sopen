@@ -527,13 +527,35 @@ fn the_close_during_export_hint_is_shown_whole_on_a_narrow_window() {
     );
 }
 
-/// On its own the window has PC Shell's F-key row, with F3 Exit: closing is asked for, as
-/// Cmd/Ctrl+W asks.
+/// On its own the window has PC Shell's F-key row, with F3 Exit, and F3 goes through the real
+/// close: during an export the first close is refused (the rows say a second one closes), the
+/// second one closes; without an export it closes at once.
 #[test]
 fn f3_closes_the_window() {
     let Some(mut fx) = fixture() else { return };
+    fx.drv.as_shell();
     assert!(fx.drv.find_text("Exit   ").is_some(), "the F-key row");
-    fx.drv.take_viewport_commands();
+    // An export that is still running (its worker never answers).
+    let (_tx, rx) = mpsc::channel();
+    fx.win.job = Some(ExportJob {
+        progress: Arc::default(),
+        rx,
+    });
     fx.key(Key::F3);
-    assert!(fx.drv.closed(), "F3 asks the window to close");
+    assert_eq!(
+        fx.drv.refused_closes, 1,
+        "the first close waits for the export"
+    );
+    assert!(!fx.drv.window_closed);
+    assert!(fx.drv.find_text(CLOSE_AGAIN).is_some(), "said in the rows");
+    fx.key(Key::F3);
+    assert!(fx.drv.window_closed, "the second one closes");
+    fx.win.job = None;
+    let Some(mut clean) = fixture() else { return };
+    clean.drv.as_shell();
+    clean.key(Key::F3);
+    assert_eq!(
+        (clean.drv.refused_closes, clean.drv.window_closed),
+        (0, true)
+    );
 }

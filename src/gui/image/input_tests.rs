@@ -1304,22 +1304,31 @@ fn a_key_let_go_while_the_close_prompt_is_up_still_ends_a_held_paste() {
     assert!(!fx.win.doc.can_undo());
 }
 
-/// On its own the window has PC Shell's F-key row, with F3 Exit: closing is asked for, as
-/// Cmd/Ctrl+W asks — with an edit, through the unsaved-changes prompt.
+/// On its own the window has PC Shell's F-key row, with F3 Exit, and F3 goes through the real
+/// close: with an edit the shell's close is refused and the unsaved-changes prompt comes up;
+/// Discard closes. Without an edit it closes at once.
 #[test]
 fn f3_closes_the_window_through_its_prompt() {
     let mut fx = open();
+    fx.drv.as_shell();
     fx.settle();
     assert!(fx.drv.find_text("Exit   ").is_some(), "the F-key row");
-    fx.drv.take_viewport_commands();
-    fx.key(Key::F3, Modifiers::NONE);
-    assert!(fx.drv.closed(), "F3 asks the window to close");
     fx.select((40.0, 30.0), (100.0, 80.0));
     fx.key(Key::P, Modifiers::NONE);
-    assert!(
-        !crate::gui::Window::close_requested(&mut fx.win),
-        "an edit: it asks first"
+    assert!(fx.win.doc.unsaved(), "an edit");
+    fx.key(Key::F3, Modifiers::NONE);
+    assert_eq!(fx.drv.refused_closes, 1, "the close is refused");
+    assert!(!fx.drv.window_closed);
+    assert!(fx.drv.find_text("Unsaved changes").is_some(), "the prompt");
+    fx.drv.click_text(&mut fx.win, "Discard");
+    fx.drv.idle(&mut fx.win, 1);
+    assert!(fx.drv.window_closed, "Discard closes it");
+    let mut clean = open();
+    clean.drv.as_shell();
+    clean.settle();
+    clean.key(Key::F3, Modifiers::NONE);
+    assert_eq!(
+        (clean.drv.refused_closes, clean.drv.window_closed),
+        (0, true)
     );
-    fx.drv.idle(&mut fx.win, 2);
-    assert!(fx.drv.find_text("Unsaved changes").is_some());
 }

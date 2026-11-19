@@ -799,7 +799,8 @@ pub fn panel_frame(painter: &egui::Painter, rect: Rect, title: &str, active: boo
 /// The scroll bar on a window's right border, beside the rows: `column` is that border's cell
 /// column from the first row to the last. ↑ and ↓ at its ends, the `░` track between them, and
 /// the red thumb one cell tall where `at` (0 at the top, 1 at the end) puts it — at the top when
-/// there is nothing to scroll (`None`). Returns the track (between the arrows).
+/// there is nothing to scroll (`None`), and nowhere when no track cell fits between the arrows.
+/// Returns the track (between the arrows).
 pub fn scroll_bar(painter: &egui::Painter, column: Rect, at: Option<f32>) -> Rect {
     let p = PALETTE;
     painter.rect_filled(column, 0.0, p.track_back);
@@ -817,6 +818,10 @@ pub fn scroll_bar(painter: &egui::Painter, column: Rect, at: Option<f32>) -> Rec
     }
     text.push_str("\n↓");
     painter.text(column.min, egui::Align2::LEFT_TOP, text, font(), p.track);
+    if rows < 3 {
+        // The arrows alone: no cell for a thumb.
+        return track;
+    }
     let room = (track.height() - CELL.y).max(0.0);
     let y = (track.top() + room * at.unwrap_or(0.0).clamp(0.0, 1.0)).round();
     painter.rect_filled(

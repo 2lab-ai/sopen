@@ -656,17 +656,22 @@ impl<W: Window> eframe::App for Shell<W> {
             // Focus and input arrive as window events, which repaint by themselves.
             Raise::Floating | Raise::Done => {}
         }
-        if command_key(&ctx, egui::Key::Q, false) || command_key(&ctx, egui::Key::W, false) {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-        }
-        if ctx.input(|i| i.viewport().close_requested())
-            && !self.scripted
-            && !self.inner.close_requested()
-        {
-            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-        }
+        closing(&ctx, &mut self.inner, self.scripted);
         self.inner.ui(ui);
         self.screenshot_tick(&ctx);
+    }
+}
+
+/// The shell's part of closing, before the window's pass: Cmd/Ctrl+Q and +W ask to close, as
+/// the window's close button does; a close asked for (by those, or by the window itself —
+/// F3, its prompt answered) goes to the window first, and its refusal cancels it (it shows
+/// its own prompt). A scripted run never refuses. The test kit runs the same function.
+pub(crate) fn closing<W: Window + ?Sized>(ctx: &egui::Context, inner: &mut W, scripted: bool) {
+    if command_key(ctx, egui::Key::Q, false) || command_key(ctx, egui::Key::W, false) {
+        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+    }
+    if ctx.input(|i| i.viewport().close_requested()) && !scripted && !inner.close_requested() {
+        ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
     }
 }
 

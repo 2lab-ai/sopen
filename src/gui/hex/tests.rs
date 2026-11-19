@@ -2343,53 +2343,170 @@ fn the_f_keys_do_what_their_labels_say() {
     );
     assert_eq!(std::fs::read(&fx.remote).unwrap()[16], 0x7A);
     // F3: closing is asked for, as Cmd/Ctrl+W (nothing unsaved: it closes).
-    fx.drv.take_viewport_commands();
+    fx.drv.as_shell();
     fx.key(Key::F3, Modifiers::NONE);
-    assert!(fx.drv.closed(), "F3 asks the window to close");
+    assert!(fx.drv.window_closed, "F3 closes the window");
 }
 
-/// Hosted in another window, the row is the host's: none of the window's own, and F3 is left
-/// for the host (it leaves the viewer, not the window).
+/// The browser's part, played by a host: it runs the hex window's pass as hosted
+/// ([`crate::gui::host_pass`]) and reads F3 after it, as the browser does.
+struct Host {
+    win: HexWindow,
+    /// The hosted window asked to close (it must not, for F3: that is the host's).
+    asked: bool,
+    /// F3 was still there for the host after the window's pass.
+    f3_left: bool,
+}
+
+impl Window for Host {
+    fn ui(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
+        let ((), asked) = crate::gui::host_pass(&ctx, || self.win.ui(ui));
+        self.asked |= asked;
+        self.f3_left |= ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::F3));
+    }
+
+    fn ready(&self) -> bool {
+        true
+    }
+}
+
+/// Hosted in another window, the row is the host's: the window draws no F-key row of its own,
+/// does not take F3 (the host gets it, untouched) and asks nothing; the host lists the window's
+/// own keys.
 #[test]
 fn a_hosted_window_leaves_the_row_and_f3_to_its_host() {
-    let mut fx = fetched("blob.bin", FIXTURE, 1000.0, 600.0);
-    fx.drv.take_viewport_commands();
-    let (ctx, win) = (fx.drv.ctx.clone(), &mut fx.win);
-    let event = |pressed| Event::Key {
-        key: Key::F3,
-        physical_key: None,
-        pressed,
-        repeat: false,
-        modifiers: Modifiers::NONE,
+    let Fx {
+        tmp: _tmp,
+        win,
+        mut drv,
+        ..
+    } = fetched("blob.bin", FIXTURE, 1000.0, 600.0);
+    // On its own it has the row (the control: the check below can see one).
+    assert!(drv.find_text("Exit   ").is_some());
+    let mut host = Host {
+        win,
+        asked: false,
+        f3_left: false,
     };
-    let mut hosted = |events: Vec<Event>| {
-        let raw = egui::RawInput {
-            screen_rect: Some(egui::Rect::from_min_size(
-                Pos2::ZERO,
-                egui::vec2(1000.0, 600.0),
-            )),
-            events,
-            ..Default::default()
-        };
-        let mut left = false;
-        let out = ctx.run_ui(raw, |ui| {
-            let host = ui.ctx().clone();
-            let ((), asked) = crate::gui::host_pass(&host, || win.ui(ui));
-            left = asked || ui.input(|i| i.key_pressed(Key::F3));
-        });
-        (out, left)
-    };
-    let (out, f3_left) = hosted(vec![event(true)]);
-    assert!(f3_left, "F3 is still there for the host");
-    let closes = out
-        .viewport_output
-        .values()
-        .any(|v| v.commands.contains(&egui::ViewportCommand::Close));
-    assert!(!closes, "a hosted window never closes the window around it");
+    drv.idle(&mut host, 2);
+    for label in ["Exit   ", "Save   ", "Goto   ", "Asc/hx "] {
+        assert!(
+            drv.find_text(label).is_none(),
+            "{label:?}: no row of its own"
+        );
+    }
+    drv.take_viewport_commands();
+    drv.key(&mut host, Key::F3, Modifiers::NONE);
+    assert!(host.f3_left, "F3 is the host's");
+    assert!(!host.asked, "the hosted window asked nothing");
+    assert!(!drv.closed(), "nor did it close the window around it");
     assert_eq!(
-        Window::keys(&*win),
+        Window::keys(&host.win),
         HEX_KEYS,
         "the host lists the window's own keys"
+    );
+}
+
+/// F3 on its own goes through the real close: with an edit the shell's close is refused and
+/// the unsaved-changes prompt comes up; Discard closes. Without an edit it closes at once.
+#[test]
+fn f3_on_a_dirty_window_brings_up_the_prompt_and_discard_closes() {
+    let mut fx = fetched("blob.bin", FIXTURE, 1000.0, 600.0);
+    fx.drv.as_shell();
+    fx.typed("41");
+    assert!(fx.win.doc.unsaved());
+    fx.key(Key::F3, Modifiers::NONE);
+    assert_eq!(fx.drv.refused_closes, 1, "an edit: the close is refused");
+    assert!(!fx.drv.window_closed);
+    assert!(fx.drv.find_text("Unsaved changes").is_some(), "the prompt");
+    fx.drv.click_text(&mut fx.win, "Discard");
+    fx.drv.idle(&mut fx.win, 1);
+    assert!(fx.drv.window_closed, "Discard closes it");
+    assert_eq!(
+        std::fs::read(&fx.remote).unwrap(),
+        FIXTURE,
+        "nothing written"
+    );
+    let mut clean = fetched("blob.bin", FIXTURE, 1000.0, 600.0);
+    clean.drv.as_shell();
+    clean.key(Key::F3, Modifiers::NONE);
+    assert_eq!(
+        (clean.drv.refused_closes, clean.drv.window_closed),
+        (0, true)
+    );
+}
+
+/// F5, F6 and F8 act only where their keys would: F5 saves nothing while the Go to field has
+/// the typing, while a save runs, while the prompt is up or while the window is read-only; F6
+/// leaves a focused field and the prompt alone; F8 moves no column while either is there.
+#[test]
+fn f5_f6_f8_respect_a_focused_field_the_prompt_a_save_and_read_only() {
+    let mut fx = fetched("blob.bin", FIXTURE, 1000.0, 600.0);
+    fx.typed("7A");
+    // The Go to field has the typing.
+    fx.key(Key::G, command(false));
+    fx.typed("12");
+    assert_eq!(fx.drv.ctx.memory(|m| m.focused()), Some(goto_id()));
+    fx.key(Key::F5, Modifiers::NONE);
+    assert!(fx.win.job.is_none(), "F5 in the field saves nothing");
+    assert!(
+        !fx.win.status.text.starts_with("saved"),
+        "{}",
+        fx.win.status.text
+    );
+    fx.key(Key::F6, Modifiers::NONE);
+    assert_eq!(fx.win.goto, "12", "F6 leaves what is typed in the field");
+    let pane = fx.win.cursor.pane;
+    fx.key(Key::F8, Modifiers::NONE);
+    assert_eq!(fx.win.cursor.pane, pane, "F8 in the field moves no column");
+    assert_eq!(fx.win.goto, "12");
+    fx.key(Key::Escape, Modifiers::NONE);
+    fx.drv.ctx.memory_mut(|m| m.surrender_focus(goto_id()));
+    fx.settle();
+    // A save running: no second one.
+    let (_tx, rx) = mpsc::channel();
+    fx.win.job = Some(Job {
+        kind: JobKind::Save { close_after: false },
+        snapshot: fx.win.doc.patches().clone(),
+        rx,
+    });
+    fx.key(Key::F5, Modifiers::NONE);
+    assert!(
+        matches!(
+            fx.win.job,
+            Some(Job {
+                kind: JobKind::Save { .. },
+                ..
+            })
+        ),
+        "the running save is the only one"
+    );
+    fx.win.job = None;
+    // The prompt is up.
+    assert!(!fx.win.close_requested());
+    assert!(fx.win.prompt);
+    fx.drv.idle(&mut fx.win, 2);
+    let pane = fx.win.cursor.pane;
+    for key in [Key::F5, Key::F6, Key::F8] {
+        fx.key(key, Modifiers::NONE);
+    }
+    assert!(fx.win.job.is_none(), "F5 under the prompt saves nothing");
+    assert_ne!(
+        fx.drv.ctx.memory(|m| m.focused()),
+        Some(goto_id()),
+        "F6 under the prompt"
+    );
+    assert_eq!(fx.win.cursor.pane, pane, "F8 under the prompt");
+    fx.drv.click_text(&mut fx.win, "Cancel");
+    // Read-only.
+    fx.win.turn_read_only("the file changed");
+    fx.key(Key::F5, Modifiers::NONE);
+    assert!(fx.win.job.is_none(), "F5 read-only saves nothing");
+    assert_eq!(
+        std::fs::read(&fx.remote).unwrap(),
+        FIXTURE,
+        "nothing written"
     );
 }
 

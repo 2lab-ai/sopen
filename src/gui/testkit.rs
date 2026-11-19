@@ -20,6 +20,13 @@ pub struct Driver {
     commands: Vec<egui::OutputCommand>,
     /// Every viewport command the passes sent (a close, a resize), oldest first, until taken.
     viewport: Vec<egui::ViewportCommand>,
+    /// Passes run as the shell runs them ([`Driver::as_shell`]).
+    shell: bool,
+    /// A pass asked to close: the next one carries the close request, as eframe delivers it.
+    close_pending: bool,
+    /// Closes the window refused (the shell cancelled them) and whether one went through.
+    pub refused_closes: usize,
+    pub window_closed: bool,
 }
 
 impl Driver {
@@ -36,7 +43,19 @@ impl Driver {
             shapes: Vec::new(),
             commands: Vec::new(),
             viewport: Vec::new(),
+            shell: false,
+            close_pending: false,
+            refused_closes: 0,
+            window_closed: false,
         }
+    }
+
+    /// From now on each pass is run as the shell runs a window of its own: a close asked for in
+    /// one pass reaches the next as the platform's close request, the shell asks the window
+    /// ([`crate::gui::closing`]), and its answer is counted ([`Driver::refused_closes`]) or
+    /// closes it ([`Driver::window_closed`]).
+    pub fn as_shell(&mut self) {
+        self.shell = true;
     }
 
     /// The platform commands of the passes since the last call (see [`Driver::commands`]).
@@ -54,7 +73,7 @@ impl Driver {
         self.time += 1.0 / 60.0;
         let mut all = vec![Event::ModifiersChanged(modifiers)];
         all.extend(events);
-        let raw = RawInput {
+        let mut raw = RawInput {
             screen_rect: Some(Rect::from_min_size(Pos2::ZERO, self.size)),
             time: Some(self.time),
             max_texture_side: Some(8192),
@@ -62,12 +81,37 @@ impl Driver {
             focused: true,
             ..Default::default()
         };
-        let mut out = self.ctx.run_ui(raw, |ui| win.ui(ui));
+        let delivered = self.shell && std::mem::take(&mut self.close_pending);
+        if delivered {
+            raw.viewports
+                .entry(egui::ViewportId::ROOT)
+                .or_default()
+                .events
+                .push(egui::ViewportEvent::Close);
+        }
+        let shell = self.shell;
+        let mut out = self.ctx.run_ui(raw, |ui| {
+            if shell {
+                super::closing(ui.ctx(), win, false);
+            }
+            win.ui(ui)
+        });
         self.shapes = std::mem::take(&mut out.shapes);
         self.commands.append(&mut out.platform_output.commands);
+        let mut sent = Vec::new();
         for (_, viewport) in std::mem::take(&mut out.viewport_output) {
-            self.viewport.extend(viewport.commands);
+            sent.extend(viewport.commands);
         }
+        if self.shell {
+            let cancelled = sent.contains(&egui::ViewportCommand::CancelClose);
+            if delivered && cancelled {
+                self.refused_closes += 1;
+            } else if delivered {
+                self.window_closed = true;
+            }
+            self.close_pending |= sent.contains(&egui::ViewportCommand::Close);
+        }
+        self.viewport.extend(sent);
         // No renderer: the texture uploads are dropped on purpose.
         out.textures_delta.clear();
     }
@@ -509,6 +553,59 @@ mod tests {
             assert_eq!(drv.find_text(TEXT).is_some(), shown, "{case}");
             assert_eq!(drv.rows_of(TEXT), shown.then_some(1), "{case}");
         }
+    }
+
+    /// Says no to the first close it is asked for, then yes.
+    struct Reluctant {
+        asked: usize,
+    }
+
+    impl Window for Reluctant {
+        fn ui(&mut self, ui: &mut egui::Ui) {
+            if ui.input(|i| i.key_pressed(Key::F3)) {
+                ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+        }
+
+        fn ready(&self) -> bool {
+            true
+        }
+
+        fn close_requested(&mut self) -> bool {
+            self.asked += 1;
+            self.asked > 1
+        }
+    }
+
+    /// As the shell: a close a pass asks for reaches the window on the next pass; a refusal is
+    /// counted and the window stays, a yes closes it. Without the shell nothing asks the window.
+    #[test]
+    fn as_shell_asks_the_window_on_the_next_pass() {
+        let mut drv = Driver::new(200.0, 100.0);
+        let mut win = Reluctant { asked: 0 };
+        drv.key(&mut win, Key::F3, Modifiers::NONE);
+        assert!(drv.closed());
+        assert_eq!(
+            (win.asked, drv.refused_closes, drv.window_closed),
+            (0, 0, false)
+        );
+        drv.as_shell();
+        drv.key(&mut win, Key::F3, Modifiers::NONE);
+        assert_eq!(
+            (win.asked, drv.refused_closes, drv.window_closed),
+            (1, 1, false)
+        );
+        drv.key(&mut win, Key::F3, Modifiers::NONE);
+        assert_eq!(
+            (win.asked, drv.refused_closes, drv.window_closed),
+            (2, 1, true)
+        );
+        // Cmd/Ctrl+W asks the same way.
+        let mut again = Reluctant { asked: 0 };
+        let mut drv = Driver::new(200.0, 100.0);
+        drv.as_shell();
+        drv.key(&mut again, Key::W, command(false));
+        assert_eq!((again.asked, drv.refused_closes), (1, 1));
     }
 
     /// Draws one spinner: in the open, or with a 4×4 clip at its corner.
