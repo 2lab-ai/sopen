@@ -848,7 +848,8 @@ pub fn fit_left(ctx: &egui::Context, text: &str, font: &FontId, room: f32) -> St
                 .x
         })
     };
-    if width(text) <= room {
+    // Nothing to cut in an empty text (whatever the room, a negative one too).
+    if text.is_empty() || width(text) <= room {
         return text.to_string();
     }
     let starts: Vec<usize> = text.char_indices().map(|(i, _)| i).collect();
@@ -878,12 +879,15 @@ pub fn fit_start(ctx: &egui::Context, text: &str, font: &FontId, room: f32) -> S
                 .x
         })
     };
-    if width(text) <= room {
+    // Nothing to cut in an empty text (whatever the room, a negative one too).
+    if text.is_empty() || width(text) <= room {
         return text.to_string();
     }
+    // Where each character starts: keeping `k` characters is `text[..ends[k]]`, for `k` up to
+    // all but the last (the whole text was measured above). Not empty: returned above.
     let ends: Vec<usize> = text.char_indices().map(|(i, _)| i).collect();
     // The most characters kept from the front with "…" after them.
-    let (mut lo, mut hi) = (0, ends.len());
+    let (mut lo, mut hi) = (0, ends.len() - 1);
     while lo < hi {
         let mid = (lo + hi).div_ceil(2);
         if width(&format!("{}…", &text[..ends[mid]])) <= room {

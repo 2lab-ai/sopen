@@ -390,3 +390,129 @@ fn fit_start_keeps_the_start() {
     assert_eq!(fit_start(&drv.ctx, text, &f, 1.0 * CELL.x), "…");
     assert_eq!(fit_start(&drv.ctx, text, &f, 0.0), "…");
 }
+
+/// Lays out `names` (so a font provider is asked for their glyphs).
+struct Names(&'static [&'static str]);
+
+impl Window for Names {
+    fn ui(&mut self, ui: &mut egui::Ui) {
+        for name in self.0 {
+            ui.label(egui::RichText::new(*name).font(font()));
+        }
+    }
+
+    fn ready(&self) -> bool {
+        true
+    }
+}
+
+const WIDE_NAMES: &[&str] = &[
+    "ab한",
+    "가나다라마",
+    "가나다라마.txt",
+    "사진 폴더",
+    "a한b글c",
+    "日本語のファイル名",
+    "😀🎉 party",
+    "ab\u{3000}",
+    "x",
+];
+
+/// `fit_start` / `fit_left` over every width from nothing to the whole text, for `names`: never
+/// a panic; the whole text where it fits, else a start + "…" (an end after "…") that fits —
+/// "…" alone when nothing more does.
+fn sweep(drv: &Driver, names: &[&str]) {
+    let f = font();
+    let width = |t: &str| {
+        drv.ctx.fonts_mut(|fonts| {
+            fonts
+                .layout_no_wrap(t.to_string(), f.clone(), Color32::WHITE)
+                .size()
+                .x
+        })
+    };
+    for name in names {
+        let whole = width(name);
+        let mut room = 0.0;
+        while room <= whole + CELL.x {
+            for (cut, start) in [
+                (fit_start(&drv.ctx, name, &f, room), true),
+                (fit_left(&drv.ctx, name, &f, room), false),
+            ] {
+                let case = format!("{name:?} in {room}: {cut:?}");
+                if cut == *name {
+                    assert!(whole <= room, "{case}: whole only where it fits");
+                    continue;
+                }
+                assert!(whole > room, "{case}: cut only where it does not fit");
+                if start {
+                    let kept = cut.strip_suffix('…').expect(&case);
+                    assert!(name.starts_with(kept), "{case}");
+                } else {
+                    let kept = cut.strip_prefix('…').expect(&case);
+                    assert!(name.ends_with(kept), "{case}");
+                }
+                assert!(cut == "…" || width(&cut) <= room, "{case}: it fits");
+            }
+            room += 0.5;
+        }
+    }
+}
+
+/// The cut name's last character wider than "…" (an ideographic space here, Hangul in a
+/// system font): `fit_start` keeps all but it — and never reads past the text.
+#[test]
+fn fit_start_keeps_all_but_a_wide_last_character() {
+    let mut drv = Driver::new(100.0, 100.0);
+    drv.idle(&mut Parts { active: true }, 1);
+    let f = font();
+    let room = drv.ctx.fonts_mut(|fonts| {
+        fonts
+            .layout_no_wrap("ab…".to_string(), f.clone(), Color32::WHITE)
+            .size()
+            .x
+    });
+    assert_eq!(fit_start(&drv.ctx, "ab\u{3000}", &f, room), "ab…");
+    // An empty text is never cut, whatever the room; a room below nothing leaves "…".
+    for room in [-8.0, 0.0, 8.0] {
+        assert_eq!(fit_start(&drv.ctx, "", &f, room), "");
+        assert_eq!(fit_left(&drv.ctx, "", &f, room), "");
+    }
+    assert_eq!(fit_start(&drv.ctx, "ab", &f, -8.0), "…");
+    assert_eq!(fit_left(&drv.ctx, "ab", &f, -8.0), "…");
+    sweep(&drv, WIDE_NAMES);
+}
+
+/// The same with the installed fonts a window gets (eframe's system font provider): Hangul,
+/// CJK and emoji drawn by a system font, wider than a cell.
+#[test]
+fn fit_start_and_fit_left_with_system_fonts() {
+    use egui_system_font_provider::SystemFontProvider;
+    let mut drv = Driver::new(400.0, 400.0);
+    drv.ctx
+        .add_font_provider(std::sync::Arc::new(SystemFontProvider::new()));
+    drv.idle(&mut Names(WIDE_NAMES), 3);
+    let f = font();
+    let han = drv.ctx.fonts_mut(|fonts| {
+        fonts
+            .has_glyph(&f, '한')
+            .then(|| fonts.glyph_width(&f, '한'))
+    });
+    let Some(han) = han else {
+        eprintln!("skipping: no installed font with Hangul");
+        return;
+    };
+    let ellipsis = drv.ctx.fonts_mut(|fonts| fonts.glyph_width(&f, '…'));
+    assert!(
+        han > ellipsis,
+        "the case: 한 ({han}) wider than … ({ellipsis})"
+    );
+    let room = drv.ctx.fonts_mut(|fonts| {
+        fonts
+            .layout_no_wrap("ab…".to_string(), f.clone(), Color32::WHITE)
+            .size()
+            .x
+    });
+    assert_eq!(fit_start(&drv.ctx, "ab한", &f, room), "ab…");
+    sweep(&drv, WIDE_NAMES);
+}
