@@ -82,6 +82,9 @@ pub struct TextDoc {
     opened: Identity,
     /// The last bytes of what was indexed (up to [`TAIL`]): an append leaves them as they were.
     tail: Vec<u8>,
+    /// Index intervals checked against the file as it is now (see [`TextDoc::check_intervals`]),
+    /// for the size it was seen at.
+    checked: (u64, std::collections::BTreeSet<usize>),
     /// The path it was opened by (the local file, or the session's cached copy).
     path: std::path::PathBuf,
     /// Bytes read for lines (not the index pass) — what paging costs.
@@ -200,6 +203,7 @@ impl TextDoc {
             first_long,
             opened,
             tail,
+            checked: (size, Default::default()),
             path: path.to_path_buf(),
             page_reads: 0,
             #[cfg(test)]
@@ -268,6 +272,7 @@ impl TextDoc {
             first_long: self.first_long,
             opened: self.opened,
             tail: self.tail.clone(),
+            checked: (self.size, Default::default()),
             path: self.path.clone(),
             page_reads: 0,
             #[cfg(test)]
@@ -335,6 +340,7 @@ impl TextDoc {
         if first >= last {
             return Ok(out);
         }
+        self.check_intervals(first, last)?;
         let mut idx = self.mark_before(first);
         let (mut line, mut pos) = (self.marks[idx].line, self.marks[idx].offset);
         let mut window = Window_::default();
@@ -431,6 +437,84 @@ pub fn is_stale(e: &anyhow::Error) -> bool {
 /// What the window says once the file changed: it reads no more.
 const CHANGED: &str =
     "the file changed since it was opened — Esc, then open it again to see it now";
+
+impl TextDoc {
+    /// Once the file is not as indexed any more (larger, or written to — growth that looks like
+    /// an append by its tail may still have moved lines before it): the index intervals that a
+    /// read of lines `first..last` relies on are checked against the bytes now, each once for
+    /// the size seen ([`TextDoc::check_interval`]). One that no longer holds its lines is
+    /// [`Stale`].
+    fn check_intervals(&mut self, first: u64, last: u64) -> Result<()> {
+        let meta = self.file.metadata().context("cannot stat the file")?;
+        let (_, _, len, mtime) = self.opened;
+        if meta.len() == len && meta.modified().ok() == mtime {
+            return Ok(());
+        }
+        if self.checked.0 != meta.len() {
+            self.checked = (meta.len(), Default::default());
+        }
+        let (from, to) = (self.mark_before(first), self.mark_before(last - 1));
+        for i in from..=to {
+            if !self.checked.1.contains(&i) {
+                self.check_interval(i)?;
+                self.checked.1.insert(i);
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether the interval from mark `i` to the next one still holds the lines the index says:
+    /// counted over at most a span plus a shown line's bytes from the mark — where all its line
+    /// starts but the last line's are (or a mark would be there) and the shown part of its last
+    /// line — and the byte before the next mark a newline. A newline added deep inside a long
+    /// last line, past what is shown of it, is not seen.
+    fn check_interval(&mut self, i: usize) -> Result<()> {
+        let (mark, next) = (self.marks[i], self.next_mark(i));
+        let lines = next.line.saturating_sub(mark.line);
+        if lines == 0 {
+            return Ok(());
+        }
+        let end = next.offset;
+        let seen_end = end.min(mark.offset.saturating_add(SPAN + LINE_MAX as u64));
+        let mut seen = vec![0u8; seen_end.saturating_sub(mark.offset) as usize];
+        self.read_exactly(&mut seen, mark.offset)?;
+        let newlines = seen.iter().filter(|&&b| b == b'\n').count() as u64;
+        // Every line of the interval ends with a newline, but the file's last line may not.
+        let last_has_newline = next.line < self.lines || self.ends_newline;
+        let whole = seen_end == end;
+        let want = if whole && last_has_newline {
+            lines
+        } else {
+            lines - 1
+        };
+        let ends_right = !last_has_newline || {
+            if whole {
+                seen.last() == Some(&b'\n')
+            } else {
+                let mut byte = [0u8; 1];
+                self.read_exactly(&mut byte, end - 1)?;
+                byte[0] == b'\n'
+            }
+        };
+        if newlines != want || !ends_right {
+            return Err(anyhow::Error::new(Stale));
+        }
+        Ok(())
+    }
+
+    /// Exactly `buf.len()` bytes at `at` (counted as page reads); fewer is [`Stale`].
+    fn read_exactly(&mut self, buf: &mut [u8], at: u64) -> Result<()> {
+        let mut got = 0;
+        while got < buf.len() {
+            let n = self.read_at(&mut buf[got..], at + got as u64)?;
+            if n == 0 {
+                return Err(anyhow::Error::new(Stale));
+            }
+            got += n;
+        }
+        Ok(())
+    }
+}
 
 /// The last [`CHUNK`] read for [`TextDoc::read_lines`]: short lines next to each other cost one
 /// read.

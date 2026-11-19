@@ -487,8 +487,9 @@ fn a_page_never_reads_past_a_span_when_the_next_mark_is_far() {
     assert_eq!(doc.marks(), 2, "a mark at `last` only, 100 MB on");
     rewrite_as_one_huge_line(&path, 2 * huge);
     let got = doc.read_lines(0, 1);
+    // At most one interval check: a span and a shown line from the mark, and one byte.
     assert!(
-        doc.page_reads() <= 64 * 1024,
+        doc.page_reads() <= 64 * 1024 + LINE_MAX as u64 + 1,
         "read {} bytes",
         doc.page_reads()
     );
@@ -877,4 +878,94 @@ fn a_grow_that_rewrites_the_indexed_tail_is_a_change() {
     f.write_all_at(b"LINE", 0).unwrap();
     drop(f);
     assert_eq!(doc.now(), Now::Changed);
+}
+
+/// The 2000-line fixture (`line 00000` … `line 01999`, 11 bytes a line).
+fn two_thousand_lines(dir: &Path, name: &str) -> (std::path::PathBuf, String) {
+    let body: String = (0..2000).map(|i| format!("line {i:05}\n")).collect();
+    (write(dir, name, body.as_bytes()), body)
+}
+
+/// Grown, but not by an append: line 0's newline overwritten (two lines merged), then more
+/// appended. The tail still matches, so it looks like growth — the first page read checks the
+/// index intervals it uses and finds one line start fewer: a change, said and read no more.
+#[test]
+fn a_merged_line_under_growth_is_a_change_on_the_first_read() {
+    use std::os::unix::fs::FileExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let (path, _) = two_thousand_lines(tmp.path(), "merged.log");
+    let mut doc = TextDoc::open(&path).unwrap();
+    let f = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+    f.write_all_at(b" ", 10).unwrap();
+    drop(f);
+    append(&path, "more\n");
+    assert!(
+        matches!(doc.now(), Now::Grew(_)),
+        "the tail alone cannot tell"
+    );
+    let err = doc
+        .read_lines(0, 5)
+        .expect_err("the merged lines are not read as two");
+    assert!(is_stale(&err), "{err:#}");
+    // The window says the file changed, from its first read.
+    let doc = TextDoc::open(&path).unwrap();
+    let f = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+    f.write_all_at(b" ", 21).unwrap();
+    drop(f);
+    append(&path, "more\n");
+    let mut win = TextWindow::new(doc, "m".into(), "merged.log", vec![]);
+    let mut drv = Driver::new(600.0, 400.0);
+    drv.until(&mut win, 5, |w| w.ready());
+    assert!(
+        win.stale && win.status.text.contains("changed"),
+        "{}",
+        win.status.text
+    );
+}
+
+/// Truncated, then written again past the old size with the old tail bytes in place but other
+/// lines before them: a change, found by the interval check.
+#[test]
+fn a_truncate_and_regrow_with_the_old_tail_is_a_change() {
+    use std::os::unix::fs::FileExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let (path, body) = two_thousand_lines(tmp.path(), "regrown.log");
+    let _ = body.len();
+    let mut doc = TextDoc::open(&path).unwrap();
+    // Written again from nothing: the same bytes but two early lines merged (one newline a
+    // space — every span still has newlines, so no read runs into the next mark), the old tail
+    // as it was, then more.
+    let mut fresh = body.as_bytes().to_vec();
+    fresh[2 * 11 - 1] = b' ';
+    fresh.extend_from_slice(b"appended\n");
+    let f = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+    f.set_len(0).unwrap();
+    f.write_all_at(&fresh, 0).unwrap();
+    drop(f);
+    assert!(matches!(doc.now(), Now::Grew(_)));
+    let err = doc.read_lines(0, 5).expect_err("another line structure");
+    assert!(is_stale(&err), "{err:#}");
+}
+
+/// Edits that keep every line where it was (characters only), then an append: still growth —
+/// the pages read as they now are (highlighting of earlier pages may lag until reopened).
+#[test]
+fn character_edits_that_keep_the_lines_stay_growth() {
+    use std::os::unix::fs::FileExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let (path, _) = two_thousand_lines(tmp.path(), "edited.log");
+    let doc = TextDoc::open(&path).unwrap();
+    let f = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+    f.write_all_at(b"LINE", 0).unwrap();
+    drop(f);
+    append(&path, "more\n");
+    let mut win = TextWindow::new(doc, "e".into(), "edited.log", vec![]);
+    let mut drv = Driver::new(600.0, 400.0);
+    drv.until(&mut win, 5, |w| w.ready());
+    assert!(!win.stale, "{}", win.status.text);
+    assert!(drv.find_text("LINE 00000").is_some());
+    assert!(win.status.text.contains("grew"), "{}", win.status.text);
+    drv.key(&mut win, Key::End, Modifiers::NONE);
+    drv.until(&mut win, 5, |w| w.ready());
+    assert!(drv.find_text("line 01999").is_some() && !win.stale);
 }

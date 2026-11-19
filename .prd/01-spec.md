@@ -193,8 +193,14 @@ replaces that module alone.
   same file (device and inode, through the open handle and its path), larger, with the last 4 KiB
   of what was indexed still the same bytes — a log being written to — keeps scrolling over the
   indexed part (End reaches the indexed end, highlighting goes on) and the status row says "the
-  file grew since it was opened (+N bytes) — Esc and open it again to see the end". Anything else
-  is a change: what its path now names is another file (as when an editor saves by renaming a new
+  file grew since it was opened (+N bytes) — Esc and open it again to see the end". A matching
+  tail does not prove what comes before it, so while the file is not as indexed every read first
+  checks the index intervals it relies on — the lines between two marks still start where
+  counted (over at most a span and a shown line from the mark) and the byte before the next mark
+  is a newline — once per interval for each size seen; one that does not hold is a change.
+  Edits that keep every line where it was (characters only) pass: the pages read as they now are,
+  but highlighting already computed for lines before the page on screen can lag until the file
+  is opened again. Anything else is a change: what its path now names is another file (as when an editor saves by renaming a new
   file over it) or none (deleted; a remote file's path is its cached copy), it is smaller, the same
   size with another modification time, or the indexed end was rewritten. Then the status row says
   so and the viewer reads no more (Esc and open it again). A write that lands after the check cannot make a read run away either: a line is never
