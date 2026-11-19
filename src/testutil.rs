@@ -147,6 +147,9 @@ impl RemoteFs for NoReplace {
     fn list_dir(&mut self, p: &str) -> Result<Vec<String>> {
         self.0.list_dir(p)
     }
+    fn list_entries(&mut self, p: &str) -> Result<Vec<crate::remote::Entry>> {
+        self.0.list_entries(p)
+    }
     fn read_to(
         &mut self,
         p: &str,

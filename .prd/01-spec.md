@@ -7,11 +7,13 @@ tags: [sopen, spec]
 # sopen — spec v1 (2026-11-11)
 
 `sopen host:/path` opens any file or folder on any of my machines as if it were local:
-folders and text go to VS Code when it is installed (remote ones only with its Remote - SSH
-extension), otherwise Zed's remote mode; images and audio/video open in a small built-in
-window where the few edits I actually need are one drag away, and any other file (a zip, a
-binary) asks first — open it in a built-in hex editor, or save it where I choose — on the
-machine I typed it on, or with `--target` on another machine's screen.
+a folder opens in sopen's own file browser — two panels, and Enter shows any file in a
+built-in viewer (text highlighted, images, video and audio, anything else as hex); text goes to
+VS Code when it is installed (remote ones only with its Remote - SSH extension), otherwise
+Zed's remote mode; images and audio/video open in a small built-in window where the few edits I
+actually need are one drag away, and any other file (a zip, a binary) asks first — open it in a
+built-in hex editor, or save it where I choose — on the machine I typed it on, or with
+`--target` on another machine's screen.
 
 ## 1. Owner intent (verbatim, in order — the SSOT for scope)
 
@@ -40,15 +42,21 @@ and the window is to come to the screen the owner is on, not the owner to it (A2
 edit. Message 12's item 3 adds copy, cut and paste through the system clipboard to the image window
 (A3, §6): the rectangle stays the selection, cut leaves the background colour, paste lays a picture
 (stretched by default, or fitted, or 1:1) or text into the rectangle, and pixelize is unchanged. Its
-item 1 is message 11's request in the same words (A2, §3); items 2 and 4 are other work, not
-specified here.
+item 1 is message 11's request in the same words (A2, §3). Its item 2 supersedes message 10 for
+folders only: a folder opens in sopen's own file browser (A11, §3a), where Enter on a file shows the
+viewer for its kind in the same window — a read-only text viewer with syntax highlighting (taking
+"own highlighting" off §9), and the existing image, media and hex windows; text opened directly
+still goes to VS Code / Zed. The browser views: copy, move, delete and rename are not part of it
+(§9), and the viewers keep exactly their edits. Its item 4 asks for the PC Tools look: the browser
+is laid out where PC Shell puts things (§3a); the skin itself (colours, VGA font, frames) comes
+after.
 
 ## 2. Intent → acceptance
 
 | # | Owner intent | Acceptance (observable) |
 |---|---|---|
 | A1 | `sopen host:/path`, scp syntax, any machine in `~/.ssh/config` | `sopen <alias>:/abs/file`, `sopen <alias>:rel/to/home`, `sopen user@host:/x` all open; aliases, ProxyJump, agent behave exactly as `ssh <alias>` does (system ssh is used). Local paths (`sopen ./x.png`) open too. |
-| A2 | Folder as a project, text edit, syntax highlight; VS Code first (msg 10) | Folder or text file → VS Code when `code` is found; a remote one only when VS Code's Remote - SSH extension is installed (`code --folder-uri` / `--file-uri vscode-remote://ssh-remote+[user@]host/<percent-encoded abs>` by the kind sopen detected, since a bare `--remote` path's kind is guessed from its name; the extension is never installed by sopen), else Zed with `VS Code has no Remote - SSH extension; opening in Zed` on stderr. Without VS Code, Zed (`zed ssh://…` on macOS, `zeditor`/`zed` on Linux). A VS Code launch failure is reported, not followed by Zed. The editor owns Save. On Linux under KDE Plasma (msg 11) the editor's window that asked for attention is brought to where the user is — the active window's desktop and screen — and activated (§3). |
+| A2 | Text edit, syntax highlight; VS Code first (msg 10; folders: msg 12, A11) | Text file → VS Code when `code` is found; a remote one only when VS Code's Remote - SSH extension is installed (`code --folder-uri` / `--file-uri vscode-remote://ssh-remote+[user@]host/<percent-encoded abs>` by the kind sopen detected, since a bare `--remote` path's kind is guessed from its name; the extension is never installed by sopen), else Zed with `VS Code has no Remote - SSH extension; opening in Zed` on stderr. Without VS Code, Zed (`zed ssh://…` on macOS, `zeditor`/`zed` on Linux). A VS Code launch failure is reported, not followed by Zed. The editor owns Save. The file browser's F4 hands a folder or file to the same editor the same way (A11). On Linux under KDE Plasma (msg 11) the editor's window that asked for attention is brought to where the user is — the active window's desktop and screen — and activated (§3). |
 | A3 | Image: view + rectangle crop + rectangle pixelize + clipboard copy / cut / paste (msg 12) | Built-in window shows the image; drag draws a rectangle in image pixels; Crop and Pixelize act on it; Cmd/Ctrl+C copies it (the whole image without one) to the system clipboard as a picture, Cmd/Ctrl+X copies it and leaves it in the background colour, Cmd/Ctrl+V pastes the clipboard's picture (Stretch by default, Fit or 1:1) or text into it; Undo; Save writes back to the remote file. |
 | A4 | Video: view + rectangle crop + time cut | Built-in window plays the video with sound; scrub timeline; set In/Out; drag a crop rectangle; Export writes `<stem>.cut-<in>-<out>.<ext>` next to the original on the remote. |
 | A5 | Audio (mp3/wav): view + time cut | Same window: waveform, play, In/Out, Export. |
@@ -57,21 +65,23 @@ specified here.
 | A8 | Developed like llmux | Public repo `2lab-ai/sopen`, MIT; `ci.yml` (macOS + Linux), `preview.yml` (every main push → prerelease + tap bump), `release.yml` (`v*` tag = owner gate); `AGENTS.md` SSOT; `.prd/` spec. |
 | A9 | `sopen SOURCE` opens here; `sopen --target <host> SOURCE` opens it on `<host>` (msg 7) | `sopen <host-a>:/tmp/a.html` opens on the machine it was typed on, as before. `sopen --target <host-b> <host-a>:/tmp/a.html` opens it on `<host-b>`'s screen: the same window or editor, started by `<host-b>`'s own sopen (on macOS sopen's window floats above the others until it is used; the editor opens behind the active app, §4a); exit code is `<host-b>`'s; `could not reach <host-b>` when ssh cannot get there; `sopen is not installed on <host-b> …` (exit 127) when it has no sopen. A file on `<host-b>` itself opens there as a local file; a local file reaches `<host-b>` as `<this machine>:<path>`. |
 | A10 | Default target in sopen's settings (msg 8) | `sopen config target <host-b>` writes `target = "<host-b>"` to the config file (§4a); from then on `sopen SOURCE` opens on `<host-b>`, `--here` opens on this machine anyway, `--target` picks another; `sopen config` shows the file and the target; `sopen config target --unset` removes it. A config sopen cannot read is an error naming the file, never ignored. |
+| A11 | A folder opens in a Total Commander-like program; Enter on a file runs its default viewer there (msg 12) | `sopen host:/dir` opens sopen's file browser (§3a): two panels on the folder, folders first; Tab switches panels, Enter enters a folder, Backspace goes up, a letter jumps to the next name with it; Enter on a file shows it in the same window — text highlighted with line numbers, an image in the image window, video/audio in the media window, anything else in the hex window — and Esc returns to the list with the bar where it was; F4 opens the entry in VS Code / Zed (A2's choice). An edited image or hex file is never dropped unasked: leaving asks as its own window does. `--app` still opens a file in a named app; a folder with `--app` / `--hex` is an error, as before. |
 
 ## 3. Routing
 
 | Kind | Detected by | Opens in |
 |---|---|---|
-| directory | remote `stat` | VS Code remote (`code --folder-uri vscode-remote://ssh-remote+[user@]host/abs`), else Zed remote (`ssh://[user@]host[:port]/abs`) |
+| directory | remote `stat` | sopen's file browser (§3a, msg 12); F4 there opens VS Code remote (`code --folder-uri vscode-remote://ssh-remote+[user@]host/abs`), else Zed remote (`ssh://[user@]host[:port]/abs`) |
 | text | extension list, else first 8 KiB has no NUL and is valid UTF-8 | VS Code remote (`code --file-uri vscode-remote://…`), else Zed remote |
 | image | `png jpg jpeg webp bmp gif tif tiff` | image window |
 | video | `mp4 mov m4v mkv webm avi` (and ffprobe says it has a video stream); `ts` only when it is not text and ffprobe sees a video stream (`.ts` is also TypeScript) | media window |
 | audio | `mp3 wav flac m4a aac ogg opus` | media window |
 | other | everything else | the binary dialog: hex window (default) or Save to… (A6, §6a) |
 
-- VS Code is found as `code` on PATH, then on macOS `/Applications/Visual Studio Code.app/Contents/Resources/app/bin/code` or the same path under `~/Applications`. Remote - SSH counts as installed when a directory `ms-vscode-remote.remote-ssh-<version>` is in `$VSCODE_EXTENSIONS` (when non-empty) or `~/.vscode/extensions` and is not a key of the `.obsolete` JSON object there; VS Code is not started to check. Without a usable VS Code, Zed is found as `zed` / `zeditor` on PATH, macOS also `/Applications/Zed.app/Contents/MacOS/cli`. Neither found: text → fetch, run `$VISUAL`/`$EDITOR` in the terminal, upload on exit if changed; directory → error that names the missing editors.
+- VS Code is found as `code` on PATH, then on macOS `/Applications/Visual Studio Code.app/Contents/Resources/app/bin/code` or the same path under `~/Applications`. Remote - SSH counts as installed when a directory `ms-vscode-remote.remote-ssh-<version>` is in `$VSCODE_EXTENSIONS` (when non-empty) or `~/.vscode/extensions` and is not a key of the `.obsolete` JSON object there; VS Code is not started to check. Without a usable VS Code, Zed is found as `zed` / `zeditor` on PATH, macOS also `/Applications/Zed.app/Contents/MacOS/cli`. Neither found: text → fetch, run `$VISUAL`/`$EDITOR` in the terminal, upload on exit if changed; F4 in the browser says in its status row that neither was found. A folder opens in an editor only where the browser cannot open (no display, §3a); then neither found is an error that names the missing editors.
 - On Linux, when `XDG_CURRENT_DESKTOP` names KDE (any case, anywhere in its colon-separated list) and
-  `SOPEN_RAISE` is not `0`, sopen brings the editor's window to the user after the hand-off (msg 11).
+  `SOPEN_RAISE` is not `0`, sopen brings the editor's window to the user after the hand-off — the CLI's own and the
+  file browser's F4 alike (msg 11).
   The editor asks KWin to activate its window, but a CLI started by sopen carries no activation token,
   so KWin only marks the window as demanding attention — maybe on another desktop or screen. sopen
   starts a detached `sopen --raise-window code|zed --raise-caption=<name>` (a session of its own, no
@@ -104,6 +114,136 @@ specified here.
     failed load or run (then it is unloaded at once). Elsewhere (macOS, GNOME, any other window
     manager) nothing changes.
 - Remote relative paths resolve against the remote home (SFTP `realpath`), as scp does.
+
+## 3a. The file browser (A11, msg 12)
+
+A folder opens in a sopen window titled `host:/abs` (the local path for a local folder). Its rows
+are where PC Shell puts them: the program's name on the top row; two file panels side by side,
+each in a frame with its folder (`host:/abs`) centred in the top border and the active panel's
+frame drawn heavier; the status row (a fetch's progress, the last result, else what the keys do);
+the bottom row lists the F-keys that work there and nothing else (the list: 3 View, 4 Edit; a
+viewer: 3 Exit, 4 Edit). All drawing of those rows, the frames, the bar and every colour sits in
+one module (`gui::chrome`), so the PC Tools skin (msg 12 item 4: palette, VGA font, frames)
+replaces that module alone.
+
+- **A panel** lists `..` (not at `/`), then folders and links to folders, then everything else,
+  each by name regardless of case. Columns: Name · Ext (a file's extension; a folder, a dot file
+  — any name starting with `.`, `.config.json` too — and a name without a dot keep the whole
+  name) · Size (`<DIR>`, `<LINK>` for a link to a folder,
+  `<SPECIAL>` for a fifo, socket or device, `<BROKEN>` for a link to nothing, `?` when the entry's
+  attributes could not be read) · Date · Time (local time, of a link's target). Hidden (dot)
+  entries are shown, dimmed. A name that is not valid UTF-8 shows with U+FFFD for its bad bytes
+  and is never opened, entered or handed to the editor (sopen's paths are UTF-8; the name as
+  shown may even be another file's), and nothing is looked up by it. The foot reads `N listed = N bytes` (the entries but `..`; the bytes
+  of the files) and, when one request can tell, `N bytes free`. Both panels start on the opened
+  folder; a folder is listed again each time it is entered.
+- **Listing** is one round trip: SFTP's readdir carries each name's attributes, and only a
+  symbolic link costs a stat more (to say what it points at). A link is followed only to classify
+  it. An entry whose type the server left out gets an `lstat` first (a link stays a link, a
+  dangling one is `<BROKEN>`), then is followed only if that says link. Every stat goes by the
+  name's own bytes. Each READDIR reply has the 30 s request timeout, not the listing as a whole,
+  so a big folder on a slow link lists as long as the server answers. Locally: `read_dir` and an
+  `lstat` per name. The free space is `statvfs@openssh.com` when
+  the server offers it, `statvfs` locally.
+- **Keys** (the list): ↑/↓, PgUp/PgDn, Home/End move the bar; Tab (or Shift+Tab) switches the
+  active panel; Enter on a folder enters it; Backspace, or Enter on `..`, goes up with the bar on
+  the folder just left; a typed letter puts the bar on the next name starting with it (any case,
+  around the end); Enter or F3 on a file opens its viewer (F3 leaves folders alone); F4 opens the
+  entry — folder or file — in the external editor, VS Code then Zed, chosen as A2 chooses (§3);
+  a click puts the bar on a row, a double click opens it; the wheel scrolls the rows, and the
+  next key brings them back to the bar. While a file is being made ready only Esc works (it
+  stops a fetch); while a folder is listed, no key.
+- **Enter on a file** opens the viewer for its kind (§3: extension, then the sniff) in the same
+  window, in place of the two panels: text → the text viewer; image → the image window; video
+  and audio → the media window (a `.ts` ffprobe cannot read as media → hex); anything else → the
+  hex window (the binary dialog's "ask first" is not needed here: the hex view is the default).
+  The path is resolved first (a link opens, and saves, as the file it points at: §5). A remote
+  file is fetched into the cache exactly as the standalone routes fetch it (claimed, recorded, an
+  earlier copy's unsaved edits moved aside), with its progress on the status row; Esc stops the
+  fetch (and the indexing of a text file, checked every MiB): the partial copy is removed and the cached copy left as it was, also when Esc comes
+  after the last byte but before the copy is in place. Esc once the copy is in place (while the
+  file is decoded, probed or indexed) keeps the viewer from opening; the fetched copy stays in
+  the cache, recorded, and the status row says so. An image is always a
+  copy (Save needs the bytes as opened); local media, text and other files are read in place.
+  Each viewer gets a connection of its own (its Save and Export use it), and the copy it shows
+  stays claimed until it is gone. The viewers keep exactly their edits, keys and Save rules
+  (§6, §6a, §7); no new save path.
+- **The text viewer** is read-only: line numbers, syntax highlighting (syntect — Sublime
+  syntaxes and themes, on the pure-Rust regex engine, nothing linked) chosen by the extension or
+  the whole name, else by the first line (a shebang) as read through an index that may be read —
+  at open and again from each new index; ↑/↓, PgUp/PgDn (a page keeps one line of context),
+  Home/End (start and end of the file), ←/→ scroll sideways, the wheel scrolls. It never reads
+  the file whole: opening indexes the lines in one pass (a mark every 256 lines, and at the first
+  line start 64 KiB past the last mark), and a page reads at most 64 KiB before it plus the shown
+  part of each line. 4096 bytes of a line are shown (the bar says when lines are cut); invalid
+  UTF-8 shows as U+FFFD (a real character cut in two at the end of a cut line is left out; bytes
+  that can never start one stay U+FFFD). Highlighting carries state from the top of the file: the
+  state at each mark is computed once, on a worker of the viewer's own with its own handle on the
+  file — never on a frame (one parse call cannot be interrupted, and a pathological line can take
+  minutes). A page shows plain and its highlighted lines replace the plain ones when the worker
+  sends them; the worker works on the page on screen only (a newer page makes it drop the older,
+  checked between lines). Leaving the viewer or closing the window tells it to stop and never
+  waits for it. At most 3 such workers run in the whole process, counting those whose viewer is
+  gone but whose parse call still runs (a slot is given back only when the worker's thread
+  ends): with none free, a viewer shows plain for its lifetime and its status row says
+  highlighting is busy in other viewers. A worker that fails (a read error, a panic) leaves the
+  page plain, ready, with the reason on the status row. A line is parsed only whole, so
+  highlighting stops at the first line over 4096 bytes (the status row says which) and the rest
+  is plain; files over 16 MiB are shown plain. The file is read live, the index is of the file as
+  scanned, checked when the viewer opens and before each page against the open handle and the
+  path it was opened by. Both still showing the indexed device, inode, size and modification
+  time: unchanged. Both still showing the indexed device and inode, the scan having read every
+  byte the file had when it started, and both no shorter than that (modification time may
+  differ): only grown — a log being written to — and the index still describes the bytes as
+  scanned, so pages are read through it (reads stay bounded, below) while a re-read is due. Any
+  other difference — truncated, another file renamed over the path by an editor's save, a shrink
+  the scan met — and the file is never read through the old index. A due re-read indexes the
+  file again from its path, on a worker (stopped by Esc or closing the window), while the page on
+  screen stays shown with "re-reading the file…" and scrolling (keys and wheel) waits. A change
+  the highlighting worker finds starts that re-read, or schedules it, in the same frame. At most
+  one re-read runs, and the next starts no sooner than max(1 s, 4 × the last index pass) after
+  the previous ended (until then "the file changed; re-reading it in a moment…"), whether it
+  succeeded, failed or was overtaken, and whether a page is shown or not; only a viewer's very
+  first attempt, with nothing shown yet, starts at once. A just-built index — the one the viewer
+  opens with, and each re-read's — is used when the file is unchanged or only grown since its
+  pass started, checked on the worker right after the pass and again when the viewer takes the
+  result; a fresh index is used while the file only grows; any other change is picked up by the
+  next re-read, at most one re-read period later (an index taken while the file grew is never
+  unchanged against it, so the next re-read is always scheduled). A shrink, another inode or a
+  vanished path during the pass: the index is not used, the page on screen stays, nothing is
+  read through the old index either (scrolling waits; the file may look grown to it), and the
+  next pass waits as above (a vanished path: "the file was deleted"). Even a used index replaces
+  the page on screen only with a page read through it, so a change landing first also leaves
+  the last page up. The new index starts highlighting afresh; the viewer keeps its top line
+  (clamped), or follows the new end if it was at the end ("the file grew; following the end",
+  like `tail -f`; else "the file changed; re-read"). A local file viewed at its end is looked at
+  again each second with no input (one stat), so a growing log is followed without a key press —
+  also one written to without pause (each re-read is used though the file grew during it); away
+  from the end it is looked at only on the next frame. A path that names nothing any more keeps
+  the last page with "the file was deleted" and reads no more. A remote file is viewed from its
+  cached copy, which does not change under the viewer and is not followed. A write that lands
+  between a change and its detection, or one that only looks like growth (written in place, no
+  shorter), cannot make a read run away: a line is never read past where the index says it must
+  end — the next mark, or 64 KiB past its own block's mark when the next line was no mark — and
+  one that does not end there makes the index unusable and starts a re-read. Offsets from the
+  index are always checked.
+- **Leaving a viewer** — Esc or F3 (when the viewer does not use Esc itself: the image and media
+  windows' Esc first clears a drawn rectangle; an Esc that takes the keyboard from a text field
+  is the field's), or closing the window — goes through that viewer's own close question: its
+  unsaved-changes prompt (Save / Discard / Cancel), its "closes when the save is done", its second
+  close during an export. The viewer goes only once it says yes; Esc then shows the list with the
+  bar where it was, and closing the window closes it. Cancel keeps the viewer. A save or export
+  still running when a viewer goes is waited for before sopen exits, its result printed, as its
+  own window's opener does. A fetch running when the window closes is stopped.
+- F4 in a viewer opens its file in the external editor too; the viewer stays.
+- **Without a display** (Linux over ssh) a folder opens in the editor as before message 12, with
+  one line on stderr saying why. `SOPEN_LIST` prints the browser's listing (the path, a row per
+  entry, the foot) instead of a window; a scripted save or export (`SOPEN_AUTOSAVE`,
+  `SOPEN_AUTOEXPORT`) on a folder is an error (nothing to act on).
+- With `--target` the browser runs on HOST, which lists the folder over SFTP as it fetches any
+  file; nothing new is forwarded but the `SOPEN_LIST` receipt hook.
+- **Usage log:** a browser session is one line, kind `dir`; its action is `save` / `export` when a
+  viewer in it saved or exported, and a viewer whose last save was refused makes the exit code 3.
 
 ## 4. Remote layer
 
@@ -164,12 +304,13 @@ under `ssh -t` reaches the whole process group, sopen included; a signal sent to
 sopen running.
 
 A window asks for focus on its first frames. On macOS an app started over ssh cannot take focus: macOS keeps it
-behind the active app. sopen's own image and media window, still unfocused after asking, floats above the other
+behind the active app. sopen's own window (the file browser, image, media and hex windows, the binary dialog), still
+unfocused after asking, floats above the other
 windows until it gains focus or gets its first click, key, scroll or typed text, and then returns to the normal
 level — with no timeout, because back at the normal level while unfocused macOS puts it straight behind the active
 app again. VS Code or Zed, opened for
-folders and text, comes up behind the active app. On Linux under KDE Plasma sopen brings it to the
-screen the user is on (§3).
+text (or from the browser's F4), comes up behind the active app. On Linux under KDE Plasma sopen
+brings it to the screen the user is on (§3).
 
 HOST gets a terminal (`ssh -t`) when this side's input and output are both terminals. Otherwise it gets none
 (`-T`) and no input either (`-n`) — ssh would read this side's input to its end, eating the rest of a
@@ -427,7 +568,10 @@ Local only, never sent anywhere. Exists for §10.
 
 ## 9. Out of scope (until §10 says otherwise)
 
-Own text editor / tree / highlighting (VS Code or Zed does it), hex insert / delete or anything that changes a file's size, image edits beyond crop, pixelize and clipboard copy / cut / paste (no drawing or text tool, no layers, no filters), frame-accurate
+Own text editor (the browser's text viewer is read-only; VS Code or Zed edits), a directory tree,
+file operations in the browser (copy, move, delete, rename, make folder — msg 12 asks for viewing),
+hex insert / delete or anything that changes a file's size, image edits beyond crop, pixelize and
+clipboard copy / cut / paste (no drawing or text tool, no layers, no filters), frame-accurate
 copy without re-encode, streaming playback before download completes, directory sync / mounts, file watching,
 Windows, a `.app` bundle or cask, any agent on the remote, macshot (Swift, macOS-only, GPL-3 — incompatible with A7/A8).
 

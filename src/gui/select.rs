@@ -178,6 +178,11 @@ impl Selection {
         self.rect.and_then(|r| to_pixels(r, bounds))
     }
 
+    /// A rectangle is drawn (Esc clears it; with none, Esc is not the window's).
+    pub fn is_set(&self) -> bool {
+        self.rect.is_some()
+    }
+
     pub fn dragging(&self) -> bool {
         self.drag.is_some()
     }

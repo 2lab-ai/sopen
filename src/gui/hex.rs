@@ -1218,6 +1218,49 @@ pub(super) fn embedded(
     ))
 }
 
+/// The hex window inside another window (the file browser): the window [`open`] shows, without
+/// the receipt hooks.
+pub fn embed(file: HexFile, notices: Vec<String>) -> super::Embedded {
+    let outcome: Arc<Mutex<Outcome>> = Arc::default();
+    let leftover: Arc<Mutex<Option<Job>>> = Arc::default();
+    let doc = HexDoc::new(file.base(), file.size());
+    let window = HexWindow::new(
+        file,
+        doc,
+        Cursor::default(),
+        notices,
+        outcome.clone(),
+        leftover.clone(),
+    );
+    super::Embedded {
+        window: Box::new(window),
+        settle: Box::new(move |wait| settle(&leftover, &outcome, wait)),
+    }
+}
+
+/// A save the window left running when it went away, as [`finish`] waits for it: with `wait`
+/// waited for, else taken only once it has finished; printed and counted either way. The
+/// window's outcome once none runs.
+fn settle(leftover: &Mutex<Option<Job>>, outcome: &Mutex<Outcome>, wait: bool) -> Option<Outcome> {
+    if wait {
+        finish(leftover, outcome);
+    } else {
+        let mut slot = leftover.lock().unwrap();
+        if let Some(job) = slot.as_ref() {
+            let result = match job.rx.try_recv() {
+                Ok(result) => result,
+                Err(mpsc::TryRecvError::Empty) => return None,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    Err(anyhow!("the save stopped without a result"))
+                }
+            };
+            *slot = None;
+            let _ = report(&result, &mut outcome.lock().unwrap());
+        }
+    }
+    Some(outcome.lock().unwrap().clone())
+}
+
 /// Never exit with a write in flight without its outcome on the terminal: a save the window
 /// handed over when it closed is waited for here.
 pub(super) fn finish(leftover: &Mutex<Option<Job>>, outcome: &Mutex<Outcome>) {
@@ -1640,7 +1683,7 @@ impl HexWindow {
             ));
         } else {
             self.close_ok = true;
-            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            super::request_close(ctx);
         }
     }
 
@@ -2242,7 +2285,7 @@ impl HexWindow {
                 if ui.button("Discard").clicked() {
                     self.prompt = false;
                     self.close_ok = true;
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    super::request_close(ctx);
                 }
                 if ui.button("Cancel").clicked() {
                     self.prompt = false;

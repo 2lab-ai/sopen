@@ -129,6 +129,9 @@ impl RemoteFs for Hooked {
     fn list_dir(&mut self, path: &str) -> Result<Vec<String>> {
         self.inner.list_dir(path)
     }
+    fn list_entries(&mut self, path: &str) -> Result<Vec<Entry>> {
+        self.inner.list_entries(path)
+    }
     fn read_to(
         &mut self,
         path: &str,
@@ -1161,4 +1164,311 @@ fn f2_no_atomic_replace_refuses_before_uploading() {
         .write_new_sibling(&local, p(tmp.path()), "a.edited.txt")
         .unwrap();
     assert_eq!(name, "a.edited.txt");
+}
+
+/// A folder with one entry of each kind a listing must tell apart: a folder, a file, a hidden
+/// file, links to a folder and to a file, a broken link and a fifo. Whole-second mtimes (SFTP
+/// v3 carries seconds).
+fn listing_fixture(dir: &Path) {
+    std::fs::create_dir(dir.join("sub")).unwrap();
+    std::fs::write(dir.join("a.txt"), "abc").unwrap();
+    set_mtime(&dir.join("a.txt"), 1_700_000_000);
+    std::fs::write(dir.join(".hidden"), "12345").unwrap();
+    set_mtime(&dir.join(".hidden"), 1_700_000_100);
+    std::os::unix::fs::symlink("sub", dir.join("to-sub")).unwrap();
+    std::os::unix::fs::symlink("a.txt", dir.join("to-a")).unwrap();
+    std::os::unix::fs::symlink("nowhere", dir.join("broken")).unwrap();
+    let fifo = std::ffi::CString::new(p(&dir.join("pipe"))).unwrap();
+    // SAFETY: a valid NUL-terminated path.
+    assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+}
+
+/// What the browser lists for [`listing_fixture`]: each entry's kind (a link's target's), its
+/// size and mtime (a link's target's too), and whether it is a link.
+fn check_listing(fs: &mut dyn RemoteFs, dir: &Path) {
+    let entries = fs.list_entries(p(dir)).unwrap();
+    let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+    assert_eq!(
+        names,
+        [".hidden", "a.txt", "broken", "pipe", "sub", "to-a", "to-sub"]
+    );
+    let by = |name: &str| entries.iter().find(|e| e.name == name).unwrap().clone();
+    let at = |secs: u64| UNIX_EPOCH + Duration::from_secs(secs);
+    let a = by("a.txt");
+    assert_eq!(
+        (a.kind, a.link, a.size, a.mtime),
+        (EntryKind::File, false, 3, at(1_700_000_000))
+    );
+    let hidden = by(".hidden");
+    assert_eq!(
+        (hidden.kind, hidden.size, hidden.mtime),
+        (EntryKind::File, 5, at(1_700_000_100))
+    );
+    assert_eq!((by("sub").kind, by("sub").link), (EntryKind::Dir, false));
+    assert_eq!(
+        (by("to-sub").kind, by("to-sub").link),
+        (EntryKind::Dir, true)
+    );
+    let to_a = by("to-a");
+    assert_eq!(
+        (to_a.kind, to_a.link, to_a.size, to_a.mtime),
+        (EntryKind::File, true, 3, at(1_700_000_000)),
+        "a link shows what it points at"
+    );
+    assert_eq!(
+        (by("broken").kind, by("broken").link),
+        (EntryKind::Broken, true)
+    );
+    assert_eq!(
+        (by("pipe").kind, by("pipe").link),
+        (EntryKind::Special, false)
+    );
+    let free = fs.free_space(p(dir));
+    assert!(free.is_some_and(|b| b > 0), "{free:?}");
+}
+
+#[test]
+fn local_listing_carries_kind_size_and_mtime() {
+    let tmp = tempfile::tempdir().unwrap();
+    listing_fixture(tmp.path());
+    check_listing(&mut LocalFs::new(), tmp.path());
+}
+
+/// Over a real SFTP server (OpenSSH's, as a local child): the attributes come with the readdir
+/// reply — one stat request per symbolic link (what it points at), none per name (counted where
+/// sopen sends them).
+#[test]
+fn sftp_listing_carries_the_attributes_without_a_stat_per_name() {
+    let Some(mut fs) = SftpRemote::local_server() else {
+        return;
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    listing_fixture(tmp.path());
+    check_listing(&mut fs, tmp.path());
+    assert_eq!(
+        fs.stats(),
+        3,
+        "one stat per link (to-sub, to-a, broken), none per name"
+    );
+}
+
+/// A folder that may be read but not searched: its names list, their attributes cannot be
+/// read — the listing still comes back, each such entry marked unknown.
+#[test]
+fn a_folder_read_but_not_searched_still_lists() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("locked");
+    std::fs::create_dir(&dir).unwrap();
+    std::fs::write(dir.join("x"), "1").unwrap();
+    use std::os::unix::fs::MetadataExt;
+    if std::fs::metadata(&dir).unwrap().uid() == 0 {
+        eprintln!("skipping: root ignores directory permissions");
+        return;
+    }
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o444)).unwrap();
+    let listed = LocalFs::new().list_entries(p(&dir));
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let listed = listed.unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(
+        (listed[0].name.as_str(), listed[0].kind),
+        ("x", EntryKind::Unknown)
+    );
+}
+
+/// A fetch stopped mid-transfer (the browser's Esc): it ends at the next write with
+/// [`Cancelled`], leaves no partial copy, and the copy already at `local` is as it was.
+#[test]
+fn a_cancelled_fetch_keeps_nothing_and_leaves_the_copy_alone() {
+    let tmp = tempfile::tempdir().unwrap();
+    let remote = tmp.path().join("big.bin");
+    std::fs::write(&remote, vec![7u8; 3 << 20]).unwrap();
+    let local = tmp.path().join("cache/big.bin");
+    std::fs::create_dir_all(local.parent().unwrap()).unwrap();
+    std::fs::write(&local, "the earlier copy").unwrap();
+    let cancel = std::sync::atomic::AtomicBool::new(false);
+    let mut calls = 0;
+    let err = LocalFs::new()
+        .fetch_cancellable(
+            p(&remote),
+            &local,
+            &mut |_, _| {
+                calls += 1;
+                cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+            },
+            &cancel,
+        )
+        .unwrap_err();
+    assert!(is_cancelled(&err), "{err:#}");
+    assert_eq!(calls, 1, "it stopped at the first write after the flag");
+    assert_eq!(std::fs::read(&local).unwrap(), b"the earlier copy");
+    let left: Vec<_> = std::fs::read_dir(local.parent().unwrap())
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    assert_eq!(left, ["big.bin"], "no partial copy left");
+}
+
+/// What a cancelled fetch must leave: the earlier copy as it was, and nothing else in its
+/// folder.
+fn earlier_copy_untouched(local: &Path) {
+    assert_eq!(std::fs::read(local).unwrap(), b"the earlier copy");
+    let left: Vec<_> = std::fs::read_dir(local.parent().unwrap())
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    assert_eq!(left.len(), 1, "no partial copy left: {left:?}");
+}
+
+/// A fetch cancelled before it starts, of a file with no bytes (so no write ever sees the
+/// flag): nothing is published over the earlier copy.
+#[test]
+fn a_fetch_cancelled_before_it_starts_publishes_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let remote = tmp.path().join("empty.txt");
+    std::fs::write(&remote, b"").unwrap();
+    let local = tmp.path().join("cache/empty.txt");
+    std::fs::create_dir_all(local.parent().unwrap()).unwrap();
+    std::fs::write(&local, "the earlier copy").unwrap();
+    let cancel = std::sync::atomic::AtomicBool::new(true);
+    let err = LocalFs::new()
+        .fetch_cancellable(p(&remote), &local, &mut |_, _| {}, &cancel)
+        .unwrap_err();
+    assert!(is_cancelled(&err), "{err:#}");
+    earlier_copy_untouched(&local);
+}
+
+/// A cancel that lands after the last write (here from the progress report of the only chunk):
+/// the complete copy is not published either.
+#[test]
+fn a_fetch_cancelled_after_its_last_write_publishes_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let remote = tmp.path().join("small.txt");
+    std::fs::write(&remote, b"one chunk of text").unwrap();
+    let local = tmp.path().join("cache/small.txt");
+    std::fs::create_dir_all(local.parent().unwrap()).unwrap();
+    std::fs::write(&local, "the earlier copy").unwrap();
+    let cancel = std::sync::atomic::AtomicBool::new(false);
+    let err = LocalFs::new()
+        .fetch_cancellable(
+            p(&remote),
+            &local,
+            &mut |done, total| {
+                if done == total {
+                    cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+            },
+            &cancel,
+        )
+        .unwrap_err();
+    assert!(is_cancelled(&err), "{err:#}");
+    earlier_copy_untouched(&local);
+}
+
+/// Attributes for the listing seam's tests: a regular file, a folder, a link, and an entry
+/// whose type the server left out.
+fn attrs(kind: &str, size: u64) -> Stat {
+    Stat {
+        is_dir: kind == "dir",
+        is_file: kind == "file",
+        is_symlink: kind == "link",
+        size,
+        mtime: UNIX_EPOCH + Duration::from_secs(1_700_000_000),
+        mode: 0o644,
+        uid: Some(1),
+        gid: Some(1),
+        missing: (kind == "untyped").then_some("type"),
+        sha256: None,
+    }
+}
+
+/// A name that is not UTF-8 and a name that shows the same (a literal U+FFFD): each entry's
+/// attributes come from its own bytes, never from the name as shown — and the first is marked
+/// lossy (the browser does not open it).
+#[test]
+fn names_that_show_alike_keep_their_own_attributes() {
+    use std::os::unix::ffi::OsStrExt;
+    let bad = OsStr::from_bytes(b"a\xff").to_os_string();
+    let alike = OsString::from("a\u{FFFD}");
+    let listed: Listed = vec![
+        (bad.clone(), Some(attrs("link", 1))),
+        (alike.clone(), Some(attrs("link", 1))),
+    ];
+    let mut asked = Vec::new();
+    let entries = entries_from(listed, &mut |name, follow| {
+        asked.push((name.to_os_string(), follow));
+        Ok(Some(if name == bad.as_os_str() {
+            attrs("file", 111)
+        } else if name == alike.as_os_str() {
+            attrs("dir", 222)
+        } else {
+            panic!("looked up by a name no entry has: {name:?}")
+        }))
+    });
+    let of = |lossy: bool| entries.iter().find(|e| e.lossy == lossy).unwrap();
+    assert_eq!(of(true).name, "a\u{FFFD}");
+    assert_eq!((of(true).kind, of(true).size), (EntryKind::File, 111));
+    assert_eq!((of(false).kind, of(false).size), (EntryKind::Dir, 222));
+    assert_eq!(asked, [(bad, true), (alike, true)]);
+}
+
+/// Entries whose type the server left out: their own type comes from an `lstat` (a link stays
+/// a link: to a file, to a folder, or broken), and only a confirmed link is followed — two stats
+/// for a link, one for anything else.
+#[test]
+fn untyped_entries_are_lstat_first_and_followed_only_when_links() {
+    let listed: Listed = ["to-file", "to-dir", "dangling", "plain"]
+        .iter()
+        .map(|n| (OsString::from(n), Some(attrs("untyped", 0))))
+        .collect();
+    let mut asked = Vec::new();
+    let entries = entries_from(listed, &mut |name, follow| {
+        asked.push((name.to_string_lossy().into_owned(), follow));
+        Ok(match (name.to_str().unwrap(), follow) {
+            ("plain", false) => Some(attrs("file", 5)),
+            (_, false) => Some(attrs("link", 9)),
+            ("to-file", true) => Some(attrs("file", 7)),
+            ("to-dir", true) => Some(attrs("dir", 64)),
+            ("dangling", true) => None,
+            (other, true) => panic!("{other} is not a link: never followed"),
+        })
+    });
+    let by = |n: &str| entries.iter().find(|e| e.name == n).unwrap().clone();
+    assert_eq!(
+        (by("to-file").kind, by("to-file").link, by("to-file").size),
+        (EntryKind::File, true, 7)
+    );
+    assert_eq!(
+        (by("to-dir").kind, by("to-dir").link),
+        (EntryKind::Dir, true)
+    );
+    assert_eq!(
+        (by("dangling").kind, by("dangling").link),
+        (EntryKind::Broken, true)
+    );
+    assert_eq!(
+        (by("plain").kind, by("plain").link, by("plain").size),
+        (EntryKind::File, false, 5)
+    );
+    let follows = asked.iter().filter(|(_, f)| *f).count();
+    assert_eq!((asked.len(), follows), (7, 3), "{asked:?}");
+}
+
+/// On a filesystem that takes any bytes (Linux; macOS refuses names that are not UTF-8): a
+/// file named `a\xff` and one named `a\u{FFFD}` list as two entries with their own sizes.
+#[test]
+fn local_names_that_are_not_utf8_list_with_their_own_attributes() {
+    use std::os::unix::ffi::OsStrExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let bad = tmp.path().join(OsStr::from_bytes(b"a\xff"));
+    if let Err(e) = std::fs::write(&bad, "1") {
+        eprintln!("skipping: this filesystem refuses a name that is not UTF-8 ({e})");
+        return;
+    }
+    std::fs::write(tmp.path().join("a\u{FFFD}"), "22").unwrap();
+    let entries = LocalFs::new().list_entries(p(tmp.path())).unwrap();
+    assert_eq!(entries.len(), 2);
+    let of = |lossy: bool| entries.iter().find(|e| e.lossy == lossy).unwrap();
+    assert_eq!((of(true).name.as_str(), of(true).size), ("a\u{FFFD}", 1));
+    assert_eq!((of(false).name.as_str(), of(false).size), ("a\u{FFFD}", 2));
 }

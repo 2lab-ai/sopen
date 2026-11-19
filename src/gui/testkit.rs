@@ -18,6 +18,8 @@ pub struct Driver {
     /// What the passes so far asked the platform to do (copy to the clipboard, …), in order —
     /// what eframe hands to egui-winit, which writes the system clipboard.
     commands: Vec<egui::OutputCommand>,
+    /// Every viewport command the passes sent (a close, a resize), oldest first, until taken.
+    viewport: Vec<egui::ViewportCommand>,
 }
 
 impl Driver {
@@ -30,6 +32,7 @@ impl Driver {
             pointer: Pos2::new(w / 2.0, h / 2.0),
             shapes: Vec::new(),
             commands: Vec::new(),
+            viewport: Vec::new(),
         }
     }
 
@@ -59,8 +62,24 @@ impl Driver {
         let mut out = self.ctx.run_ui(raw, |ui| win.ui(ui));
         self.shapes = std::mem::take(&mut out.shapes);
         self.commands.append(&mut out.platform_output.commands);
+        for (_, viewport) in std::mem::take(&mut out.viewport_output) {
+            self.viewport.extend(viewport.commands);
+        }
         // No renderer: the texture uploads are dropped on purpose.
         out.textures_delta.clear();
+    }
+
+    /// The viewport commands sent since the last call (a close, a resize).
+    pub fn take_viewport_commands(&mut self) -> Vec<egui::ViewportCommand> {
+        std::mem::take(&mut self.viewport)
+    }
+
+    /// Whether a pass since the last [`Driver::take_viewport_commands`] asked the viewport to
+    /// close.
+    pub fn closed(&self) -> bool {
+        self.viewport
+            .iter()
+            .any(|c| matches!(c, egui::ViewportCommand::Close))
     }
 
     /// `n` passes without input.
@@ -260,6 +279,50 @@ impl Driver {
             _ => None,
         });
         found.first().map(|(r, ())| *r)
+    }
+
+    /// The colour of each section of the galley the last pass drew for exactly `text`, where it
+    /// can be seen (as for [`Driver::find_text`]) — a highlighted line has several.
+    pub fn colors_of(&self, text: &str) -> Option<Vec<egui::Color32>> {
+        let found = self.shown(|s| match s {
+            egui::Shape::Text(t) if t.galley.text() == text && !t.galley.elided => Some((
+                t.galley.rect.translate(t.pos.to_vec2()),
+                t.galley
+                    .job
+                    .sections
+                    .iter()
+                    .map(|s| s.format.color)
+                    .collect::<Vec<_>>(),
+            )),
+            _ => None,
+        });
+        found.into_iter().next().map(|(_, colors)| colors)
+    }
+
+    /// The first text the last pass drew whole, where it can be seen, that starts with `prefix`.
+    pub fn text_starting_with(&self, prefix: &str) -> Option<String> {
+        let found = self.shown(|s| match s {
+            egui::Shape::Text(t) if t.galley.text().starts_with(prefix) && !t.galley.elided => {
+                Some((
+                    t.galley.rect.translate(t.pos.to_vec2()),
+                    t.galley.text().to_string(),
+                ))
+            }
+            _ => None,
+        });
+        found.into_iter().next().map(|(_, text)| text)
+    }
+
+    /// Where the last pass drew a picture (a mesh on a texture of the window's own, not the font
+    /// atlas) that can be seen.
+    pub fn pictures(&self) -> Vec<Rect> {
+        let found = self.shown(|s| match s {
+            egui::Shape::Mesh(m) if m.texture_id != egui::TextureId::default() => {
+                Some((m.calc_bounds(), ()))
+            }
+            _ => None,
+        });
+        found.into_iter().map(|(r, ())| r).collect()
     }
 
     /// How many rows the last pass laid `text` out in, whole or cut with "…", if it drew it

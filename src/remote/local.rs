@@ -1,6 +1,6 @@
 //! [`RemoteFs`] on the local disk: local targets, and the implementation every test runs against.
 
-use super::{CreateError, Created, Hashing, Like, RemoteFs, Stat, Uploaded};
+use super::{CreateError, Created, Entry, Hashing, Like, RemoteFs, Stat, Uploaded};
 use anyhow::{anyhow, Context, Result};
 use std::fs;
 use std::io::{ErrorKind, Read, Write};
@@ -80,6 +80,42 @@ impl RemoteFs for LocalFs {
         }
         names.sort();
         Ok(names)
+    }
+
+    /// One `read_dir`, then an `lstat` per name (a local call, not a round trip), by the
+    /// name's own bytes; a link is followed only to say what it points at.
+    fn list_entries(&mut self, path: &str) -> Result<Vec<Entry>> {
+        let mut listed = Vec::new();
+        for item in fs::read_dir(path).with_context(|| format!("cannot list {path}"))? {
+            let item = item.with_context(|| format!("cannot list {path}"))?;
+            listed.push((item.file_name(), None));
+        }
+        let dir = Path::new(path);
+        Ok(super::entries_from(listed, &mut |name, follow| {
+            let full = dir.join(name);
+            let meta = if follow {
+                fs::metadata(&full)
+            } else {
+                fs::symlink_metadata(&full)
+            };
+            match meta {
+                Ok(meta) => Ok(Some(stat_of(&meta))),
+                Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),
+                Err(e) => Err(e).with_context(|| format!("cannot stat {}", full.display())),
+            }
+        }))
+    }
+
+    #[allow(clippy::unnecessary_cast)] // the field types differ between macOS and Linux
+    fn free_space(&mut self, path: &str) -> Option<u64> {
+        let c = std::ffi::CString::new(path).ok()?;
+        // SAFETY: an all-zero statvfs is a valid value to be overwritten.
+        let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+        // SAFETY: `c` is a NUL-terminated path and `st` a valid place for the result.
+        if unsafe { libc::statvfs(c.as_ptr(), &mut st) } != 0 {
+            return None;
+        }
+        Some((st.f_bavail as u64).saturating_mul(st.f_frsize as u64))
     }
 
     fn read_to(

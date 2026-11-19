@@ -62,9 +62,15 @@ icu_normalizer = { version = "2.4.0", default-features = false, features = ["com
 # native panel on macOS, xdg-desktop-portal over D-Bus on Linux (libdbus is loaded at runtime;
 # no GTK, nothing new linked).
 rfd = { version = "0.18.0", default-features = false, features = ["xdg-portal"] }
+# The file browser's text viewer: Sublime syntaxes and themes, with the pure-Rust regex engine
+# (fancy-regex), not oniguruma — nothing linked, so the binary still loads with libc and
+# libasound alone. No HTML output, plist or YAML loaders: only the bundled dumps are read.
+syntect = { version = "5.3.0", default-features = false, features = ["default-syntaxes", "default-themes", "regex-fancy"] }
 
 [dev-dependencies]
 tempfile = "3.27.0"
+# Tests run OpenSSH's own `sftp-server` as a child over pipes (a real server without ssh).
+tokio = { version = "1.54.1", features = ["process"] }
 
 # macOS: the app menu's Quit item would end the process past the unsaved-changes prompt; sopen
 # turns the default menu off and handles Cmd+Q itself.

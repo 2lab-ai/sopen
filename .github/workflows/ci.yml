@@ -39,18 +39,10 @@ jobs:
       - name: Install ffmpeg, ALSA headers and login shells (Linux)
         if: runner.os == 'Linux'
         run: |
-          # archive.ubuntu.com and security.ubuntu.com, and the runner's own mirror list (which falls
-          # back to them), time out at times; azure.archive.ubuntu.com carries the same suites,
-          # security included. ports.ubuntu.com (the arm64 runners) is left as it is. Retries and a
-          # per-request timeout turn a stalled request into a retry instead of a hung job.
-          for f in /etc/apt/sources.list /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do
-            if [ -f "$f" ]; then
-              sudo sed -i -E 's#mirror\+file:/etc/apt/apt-mirrors\.txt|https?://([a-z0-9-]+\.)*(archive|security)\.ubuntu\.com/ubuntu/?#http://azure.archive.ubuntu.com/ubuntu/#g' "$f"
-            fi
-          done
-          apt=(-o Acquire::Retries=5 -o Acquire::http::Timeout=30)
-          sudo apt-get "${apt[@]}" update
-          sudo apt-get "${apt[@]}" install -y ffmpeg libasound2-dev pkg-config zsh fish
+          # Through a list of Ubuntu mirrors, with retries and a timeout (the script says why);
+          # its own test first. openssh-sftp-server: the SFTP listing test runs a real server.
+          bash .github/scripts/tests/apt-install.test.sh
+          bash .github/scripts/apt-install.sh ffmpeg libasound2-dev pkg-config zsh fish openssh-sftp-server
 
       - name: Install ffmpeg and fish (macOS)
         if: runner.os == 'macOS'
@@ -77,10 +69,12 @@ jobs:
         env:
           # A missing ffmpeg fails the export tests here instead of skipping them, a missing zsh or
           # fish fails the login-shell lanes, and a missing node fails the KWin script's behaviour
-          # test (node is preinstalled on GitHub's runners).
+          # test (node is preinstalled on GitHub's runners). A missing OpenSSH `sftp-server` fails the
+          # SFTP listing test (a real server over pipes; macOS ships it, Linux installs it above).
           SOPEN_REQUIRE_FFMPEG: "1"
           SOPEN_REQUIRE_SHELLS: "1"
           SOPEN_REQUIRE_NODE: "1"
+          SOPEN_REQUIRE_SFTP_SERVER: "1"
         run: cargo test --locked
 
       # The Linux binary loads only libasound and libc at start (X11, Wayland, EGL, Vulkan and
@@ -93,15 +87,10 @@ jobs:
           cargo build --release --locked
           image="ubuntu:$(. /etc/os-release && echo "$VERSION_ID")"
           echo "clean system: $image"
-          # The image's sources name archive.ubuntu.com and security.ubuntu.com: pointed at the
-          # Azure mirror first, as on the runner (see "Install ffmpeg, ALSA headers…").
-          docker run --rm -v "$PWD/target/release/sopen:/usr/local/bin/sopen:ro" "$image" \
-            bash -c 'for f in /etc/apt/sources.list /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do \
-                if [ -f "$f" ]; then \
-                  sed -i -E "s#https?://([a-z0-9-]+\.)*(archive|security)\.ubuntu\.com/ubuntu/?#http://azure.archive.ubuntu.com/ubuntu/#g" "$f"; \
-                fi; \
-              done \
-              && apt=(-o Acquire::Retries=5 -o Acquire::http::Timeout=30) \
-              && apt-get "${apt[@]}" update -qq \
-              && apt-get "${apt[@]}" install -y -qq libasound2t64 > /dev/null \
+          # The image's sources name archive.ubuntu.com and security.ubuntu.com: through the same
+          # mirror list as on the runner (.github/scripts/apt-install.sh).
+          docker run --rm -v "$PWD/target/release/sopen:/usr/local/bin/sopen:ro" \
+            -v "$PWD/.github/scripts/apt-install.sh:/usr/local/bin/apt-install.sh:ro" \
+            -e SOPEN_APT_QUIET=1 "$image" \
+            bash -c 'bash /usr/local/bin/apt-install.sh libasound2t64 > /dev/null \
               && ldd /usr/local/bin/sopen && sopen --version'

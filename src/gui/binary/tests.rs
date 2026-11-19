@@ -1013,6 +1013,9 @@ impl RemoteFs for Counting {
     fn list_dir(&mut self, p: &str) -> Result<Vec<String>> {
         self.fs.list_dir(p)
     }
+    fn list_entries(&mut self, p: &str) -> Result<Vec<crate::remote::Entry>> {
+        self.fs.list_entries(p)
+    }
     fn read_to(
         &mut self,
         p: &str,

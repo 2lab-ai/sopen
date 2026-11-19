@@ -214,6 +214,41 @@ pub fn refine_after_fetch(name: &str, kind: Kind, probe: Option<(bool, bool)>) -
     }
 }
 
+/// The kind of the file or folder at `abs` (`stat` is its stat): the folder by its stat, then
+/// the extension, then a sniff of its first bytes (one read).
+pub fn detect(
+    fs: &mut dyn crate::remote::RemoteFs,
+    abs: &str,
+    stat: &crate::remote::Stat,
+) -> anyhow::Result<Kind> {
+    if stat.is_dir {
+        return Ok(Kind::Directory);
+    }
+    let (_, name) = crate::remote::split_parent(abs);
+    if let Some(kind) = by_extension(name) {
+        return Ok(kind);
+    }
+    let head = fs.read_head(abs, SNIFF_BYTES)?;
+    Ok(classify(name, || head, stat.size))
+}
+
+/// The kind once the file is local at `local` (`name` = its name): video by extension but with
+/// no video stream (per ffprobe) is audio; a `.ts` ffprobe cannot read as media is not media.
+/// Without ffprobe, video stays video.
+pub fn refine_local(local: &std::path::Path, name: &str, kind: Kind) -> Kind {
+    if kind != Kind::Video {
+        return kind;
+    }
+    let probe = match crate::ffmpeg::resolve().and_then(|t| crate::ffmpeg::probe(&t, local)) {
+        Ok(probe) => Some((probe.video.is_some(), probe.has_audio)),
+        Err(e) => {
+            crate::debug!("not probed: {e:#}");
+            None
+        }
+    };
+    refine_after_fetch(name, kind, probe)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -73,18 +73,8 @@ jobs:
       - name: Install ALSA headers (Linux)
         if: runner.os == 'Linux'
         run: |
-          # archive.ubuntu.com and security.ubuntu.com, and the runner's own mirror list (which falls
-          # back to them), time out at times; azure.archive.ubuntu.com carries the same suites,
-          # security included. ports.ubuntu.com (the arm64 runners) is left as it is. Retries and a
-          # per-request timeout turn a stalled request into a retry instead of a hung job.
-          for f in /etc/apt/sources.list /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do
-            if [ -f "$f" ]; then
-              sudo sed -i -E 's#mirror\+file:/etc/apt/apt-mirrors\.txt|https?://([a-z0-9-]+\.)*(archive|security)\.ubuntu\.com/ubuntu/?#http://azure.archive.ubuntu.com/ubuntu/#g' "$f"
-            fi
-          done
-          apt=(-o Acquire::Retries=5 -o Acquire::http::Timeout=30)
-          sudo apt-get "${apt[@]}" update
-          sudo apt-get "${apt[@]}" install -y libasound2-dev pkg-config
+          # Through a list of Ubuntu mirrors, with retries and a timeout (the script says why).
+          bash .github/scripts/apt-install.sh libasound2-dev pkg-config
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable

@@ -8,7 +8,7 @@
 //! progress. A request that changes the remote and times out is reported as
 //! [`OutcomeUnknown`](super::OutcomeUnknown), never as "nothing written".
 
-use super::{unknown, CreateError, Created, Hashing, Like, RemoteFs, Stat, Uploaded};
+use super::{unknown, CreateError, Created, Entry, Hashing, Like, RemoteFs, Stat, Uploaded};
 use crate::target::RemoteSpec;
 use anyhow::{anyhow, bail, Context, Result};
 use bytes::BytesMut;
@@ -40,11 +40,34 @@ pub struct SftpRemote {
     rt: Runtime,
     sftp: Option<Sftp>,
     fs: Option<Fs>,
+    /// Stat requests sopen sent (tests: a listing must not stat every name).
+    #[cfg(test)]
+    stats: u64,
 }
 
 /// `Err` = the request got no reply within `limit`.
 async fn within<F: Future>(limit: Duration, fut: F) -> std::result::Result<F::Output, ()> {
     tokio::time::timeout(limit, fut).await.map_err(|_| ())
+}
+
+/// Every item of `stream`, each within `limit` of the one before (`Err`: one did not come in
+/// time). A listing's READDIR replies each get the timeout, not the listing as a whole: a big
+/// folder on a slow link takes as long as it takes while the server answers.
+async fn each_within<S: futures_core::Stream>(
+    stream: S,
+    limit: Duration,
+) -> std::result::Result<Vec<S::Item>, ()> {
+    let mut stream = std::pin::pin!(stream);
+    let mut out = Vec::new();
+    while let Some(item) = within(
+        limit,
+        std::future::poll_fn(|cx| stream.as_mut().poll_next(cx)),
+    )
+    .await?
+    {
+        out.push(item);
+    }
+    Ok(out)
 }
 
 fn timed_out(what: &str, limit: Duration) -> anyhow::Error {
@@ -90,11 +113,13 @@ impl SftpRemote {
             rt,
             sftp: Some(sftp),
             fs: Some(fs),
+            #[cfg(test)]
+            stats: 0,
         })
     }
 
     fn parts(&mut self) -> (&Runtime, &Sftp, &mut Fs) {
-        let Self { rt, sftp, fs } = self;
+        let Self { rt, sftp, fs, .. } = self;
         (
             rt,
             sftp.as_ref().expect("open session"),
@@ -103,16 +128,27 @@ impl SftpRemote {
     }
 
     fn stat_by(&mut self, path: &str, follow: bool) -> Result<Option<Stat>> {
+        self.stat_path(Path::new(path), follow)
+    }
+
+    /// [`SftpRemote::stat_by`] for a path of any bytes (a listed name that is not UTF-8).
+    fn stat_path(&mut self, path: &Path, follow: bool) -> Result<Option<Stat>> {
+        #[cfg(test)]
+        {
+            self.stats += 1;
+        }
         let (rt, _, fs) = self.parts();
+        // The path goes to the server as its bytes; it is shown (lossily) only in messages.
         let got = if follow {
             rt.block_on(within(META_TIMEOUT, fs.metadata(path)))
         } else {
             rt.block_on(within(META_TIMEOUT, fs.symlink_metadata(path)))
         };
-        match got.map_err(|()| timed_out(&format!("stat {path}"), META_TIMEOUT))? {
+        let shown = path.display();
+        match got.map_err(|()| timed_out(&format!("stat {shown}"), META_TIMEOUT))? {
             Ok(meta) => Ok(Some(stat_of(&meta))),
             Err(e) if is_not_found(&e) => Ok(None),
-            Err(e) => Err(anyhow!("cannot stat {path}: {e}")),
+            Err(e) => Err(anyhow!("cannot stat {shown}: {e}")),
         }
     }
 }
@@ -447,27 +483,34 @@ impl RemoteFs for SftpRemote {
     }
 
     fn list_dir(&mut self, path: &str) -> Result<Vec<String>> {
-        use futures_core::Stream;
+        let listed = self.read_dir(path)?;
+        Ok(listed
+            .into_iter()
+            .map(|(n, _)| n.to_string_lossy().into_owned())
+            .collect())
+    }
+
+    /// The readdir reply carries each name's attributes (as `lstat` gives them); only a
+    /// symbolic link costs one stat more, to say what it points at, and an entry whose type the
+    /// server left out an `lstat` first. Every stat goes by the name's own bytes.
+    fn list_entries(&mut self, path: &str) -> Result<Vec<Entry>> {
+        let listed = self.read_dir(path)?;
+        let listed = listed.into_iter().map(|(n, s)| (n, Some(s))).collect();
+        let dir = Path::new(path).to_path_buf();
+        Ok(super::entries_from(listed, &mut |name, follow| {
+            self.stat_path(&dir.join(name), follow)
+        }))
+    }
+
+    fn free_space(&mut self, path: &str) -> Option<u64> {
+        if !self.sftp.as_ref().is_some_and(|s| s.support_statvfs()) {
+            return None;
+        }
         let (rt, _, fs) = self.parts();
-        let listed = rt.block_on(within(META_TIMEOUT, async {
-            let dir = fs
-                .open_dir(path)
-                .await
-                .map_err(|e| anyhow!("cannot list {path}: {e}"))?;
-            let mut entries = Box::pin(dir.read_dir());
-            let mut names = Vec::new();
-            while let Some(entry) = std::future::poll_fn(|cx| entries.as_mut().poll_next(cx)).await
-            {
-                let entry = entry.map_err(|e| anyhow!("cannot list {path}: {e}"))?;
-                let name = entry.filename().to_string_lossy().into_owned();
-                if name != "." && name != ".." {
-                    names.push(name);
-                }
-            }
-            names.sort();
-            Ok(names)
-        }));
-        listed.map_err(|()| timed_out(&format!("list {path}"), META_TIMEOUT))?
+        match rt.block_on(within(META_TIMEOUT, fs.statvfs(path))) {
+            Ok(Ok(st)) => Some(st.bavail.saturating_mul(st.frsize)),
+            _ => None,
+        }
     }
 
     fn read_to(
@@ -605,6 +648,32 @@ impl RemoteFs for SftpRemote {
 }
 
 impl SftpRemote {
+    /// A directory's names with their attributes from the readdir reply, sorted by name
+    /// (`.` and `..` left out).
+    fn read_dir(&mut self, path: &str) -> Result<Vec<(std::ffi::OsString, Stat)>> {
+        let (rt, _, fs) = self.parts();
+        rt.block_on(async {
+            let dir = within(META_TIMEOUT, fs.open_dir(path))
+                .await
+                .map_err(|()| timed_out(&format!("list {path}"), META_TIMEOUT))?
+                .map_err(|e| anyhow!("cannot list {path}: {e}"))?;
+            // Each reply within the request timeout, not the whole listing.
+            let entries = each_within(dir.read_dir(), META_TIMEOUT)
+                .await
+                .map_err(|()| timed_out(&format!("list {path}"), META_TIMEOUT))?;
+            let mut out = Vec::with_capacity(entries.len());
+            for entry in entries {
+                let entry = entry.map_err(|e| anyhow!("cannot list {path}: {e}"))?;
+                let name = entry.filename().as_os_str().to_os_string();
+                if name != "." && name != ".." {
+                    out.push((name, stat_of(&entry.metadata())));
+                }
+            }
+            out.sort_by(|a: &(std::ffi::OsString, Stat), b| a.0.cmp(&b.0));
+            Ok(out)
+        })
+    }
+
     /// Reads `path` (up to `max` bytes) into `sink`, failing after [`STALL_TIMEOUT`] without data.
     fn read_with(
         &mut self,
@@ -642,6 +711,66 @@ impl SftpRemote {
             let _ = within(Duration::from_secs(5), file.close()).await;
             Ok(done)
         })
+    }
+}
+
+/// Where OpenSSH installs its SFTP server (macOS, Debian/Ubuntu, Fedora, Arch).
+#[cfg(test)]
+const SFTP_SERVERS: [&str; 4] = [
+    "/usr/libexec/sftp-server",
+    "/usr/lib/openssh/sftp-server",
+    "/usr/libexec/openssh/sftp-server",
+    "/usr/lib/ssh/sftp-server",
+];
+
+#[cfg(test)]
+impl SftpRemote {
+    /// SFTP to this machine's own `sftp-server`, run as a child over pipes: a real server's
+    /// replies (readdir attributes, extensions) without ssh or a network. `None`, with a note,
+    /// where OpenSSH's server is not installed — a failure instead when
+    /// `SOPEN_REQUIRE_SFTP_SERVER` is set (CI installs it).
+    pub(crate) fn local_server() -> Option<Self> {
+        let Some(server) = SFTP_SERVERS.iter().find(|p| Path::new(p).exists()) else {
+            let missing = format!("no sftp-server on this machine ({SFTP_SERVERS:?})");
+            if std::env::var_os("SOPEN_REQUIRE_SFTP_SERVER").is_some() {
+                panic!("SOPEN_REQUIRE_SFTP_SERVER is set but {missing}");
+            }
+            eprintln!("skipping: {missing}");
+            return None;
+        };
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let sftp = rt.block_on(async {
+            let mut child = tokio::process::Command::new(server)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .kill_on_drop(true)
+                .spawn()
+                .unwrap();
+            let (stdin, stdout) = (child.stdin.take().unwrap(), child.stdout.take().unwrap());
+            // The child lives as long as the session (and is killed with it).
+            let keep = openssh_sftp_client::SftpAuxiliaryData::Boxed(Box::new(
+                std::sync::Mutex::new(child),
+            ));
+            Sftp::new_with_auxiliary(stdin, stdout, SftpOptions::default(), keep)
+                .await
+                .unwrap()
+        });
+        let fs = sftp.fs();
+        Some(Self {
+            rt,
+            sftp: Some(sftp),
+            fs: Some(fs),
+            stats: 0,
+        })
+    }
+
+    /// Stat requests this connection made so far (counted where sopen sends them, in
+    /// `stat_path`: an application-level count, not the server's).
+    pub(crate) fn stats(&self) -> u64 {
+        self.stats
     }
 }
 
@@ -732,6 +861,65 @@ mod tests {
                 .map(OsString::from)
                 .collect::<Vec<_>>()[..]
         );
+    }
+
+    /// A stream of `0, 1, …` whose items come after the given delays.
+    struct Delayed {
+        delays: std::collections::VecDeque<Duration>,
+        sleep: Option<std::pin::Pin<Box<tokio::time::Sleep>>>,
+        next: u32,
+    }
+
+    impl Delayed {
+        fn new(delays: &[u64]) -> Self {
+            Self {
+                delays: delays.iter().map(|&ms| Duration::from_millis(ms)).collect(),
+                sleep: None,
+                next: 0,
+            }
+        }
+    }
+
+    impl futures_core::Stream for Delayed {
+        type Item = u32;
+        fn poll_next(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<u32>> {
+            use std::task::Poll;
+            if self.sleep.is_none() {
+                let Some(d) = self.delays.pop_front() else {
+                    return Poll::Ready(None);
+                };
+                self.sleep = Some(Box::pin(tokio::time::sleep(d)));
+            }
+            match self.sleep.as_mut().unwrap().as_mut().poll(cx) {
+                Poll::Ready(()) => {
+                    self.sleep = None;
+                    self.next += 1;
+                    Poll::Ready(Some(self.next - 1))
+                }
+                Poll::Pending => Poll::Pending,
+            }
+        }
+    }
+
+    /// A listing's timeout is per reply, not for the whole listing: a server that answers every
+    /// READDIR within the limit is never cut off however long the folder takes; one that stops
+    /// answering is.
+    #[test]
+    fn a_listing_times_out_per_reply_not_as_a_whole() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let limit = Duration::from_millis(150);
+        // Eight replies 50 ms apart: 400 ms in all, each well within the limit.
+        let got = rt.block_on(each_within(Delayed::new(&[50; 8]), limit));
+        assert_eq!(got, Ok((0..8).collect::<Vec<_>>()));
+        // A reply that never comes in time.
+        let got = rt.block_on(each_within(Delayed::new(&[50, 50, 400, 50]), limit));
+        assert_eq!(got, Err(()));
     }
 
     #[test]

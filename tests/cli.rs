@@ -285,8 +285,123 @@ fn hex_autosave_refuses_a_file_changed_meanwhile() {
     assert!(text.lines().any(|l| l == "0x0: FF"), "{text}");
 }
 
+/// A folder opens in sopen's own file browser (owner message 12), not in an editor: VS Code
+/// (`SOPEN_CODE`) is not run. `SOPEN_LIST` answers without a window, with what the browser
+/// lists: the path, folders first, the footer. Text files still go to VS Code.
 #[test]
-fn code_takes_priority_over_zed_for_folder_and_text() {
+fn a_folder_opens_in_the_browser_not_the_editor() {
+    let tmp = tempfile::tempdir().unwrap();
+    let code = tmp.path().join("code");
+    let record = tmp.path().join("code-record");
+    executable(
+        &code,
+        &format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" >> '{}'\n",
+            record.display()
+        ),
+    );
+    let dir = tmp.path().join("project");
+    std::fs::create_dir_all(dir.join("sub")).unwrap();
+    std::fs::write(dir.join("a.txt"), "text").unwrap();
+    let out = sopen(
+        tmp.path(),
+        &[dir.to_str().unwrap()],
+        &[("SOPEN_CODE", code.to_str().unwrap()), ("SOPEN_LIST", "1")],
+    );
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let real = std::fs::canonicalize(&dir).unwrap();
+    let listed = text(&out.stdout);
+    let lines: Vec<&str> = listed.lines().collect();
+    assert_eq!(lines[0], real.to_str().unwrap(), "{listed}");
+    assert!(
+        lines[1].starts_with("..") && lines[1].ends_with("<UP>"),
+        "{listed}"
+    );
+    assert!(
+        lines[2].starts_with("sub ") && lines[2].contains("<DIR>"),
+        "{listed}"
+    );
+    assert!(
+        lines[3].starts_with("a ") && lines[3].contains(" txt "),
+        "{listed}"
+    );
+    assert!(lines[4].starts_with("2 listed = 4 bytes"), "{listed}");
+    assert!(!record.exists(), "VS Code was run for a folder");
+    let log = usage_lines(tmp.path());
+    assert_eq!(
+        (log[0]["kind"].as_str(), log[0]["action"].as_str()),
+        (Some("dir"), Some("open"))
+    );
+    // A scripted save has nothing to act on in a folder: an error, not a window no one can use.
+    let out = sopen(
+        tmp.path(),
+        &[dir.to_str().unwrap()],
+        &[("SOPEN_AUTOSAVE", "1")],
+    );
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        text(&out.stderr).contains("is a folder"),
+        "{}",
+        text(&out.stderr)
+    );
+    // A text file still opens in VS Code.
+    let out = sopen(
+        tmp.path(),
+        &[dir.join("a.txt").to_str().unwrap()],
+        &[("SOPEN_CODE", code.to_str().unwrap())],
+    );
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    // The CLI is detached (and a new script's first run can be slow); give it a moment.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !record.exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let seen = std::fs::read_to_string(&record).unwrap();
+    assert_eq!(seen.trim(), real.join("a.txt").to_str().unwrap());
+}
+
+/// No display (Linux over ssh): a folder cannot show the browser; it opens in the editor as
+/// before message 12, and one line says why.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_folder_without_a_display_opens_in_the_editor() {
+    let tmp = tempfile::tempdir().unwrap();
+    let code = tmp.path().join("code");
+    let record = tmp.path().join("code-record");
+    executable(
+        &code,
+        &format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" >> '{}'\n",
+            record.display()
+        ),
+    );
+    let dir = tmp.path().join("project");
+    std::fs::create_dir(&dir).unwrap();
+    let mut cmd = sopen_command(tmp.path());
+    cmd.arg(&dir)
+        .env("SOPEN_CODE", &code)
+        .env_remove("DISPLAY")
+        .env_remove("WAYLAND_DISPLAY");
+    let out = cmd.output().unwrap();
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert!(
+        text(&out.stderr).contains("no display"),
+        "{}",
+        text(&out.stderr)
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !record.exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let seen = std::fs::read_to_string(&record).unwrap();
+    assert_eq!(
+        seen.trim(),
+        std::fs::canonicalize(&dir).unwrap().to_str().unwrap()
+    );
+}
+
+#[test]
+fn code_takes_priority_over_zed_for_text() {
     use std::os::unix::fs::PermissionsExt;
     let tmp = tempfile::tempdir().unwrap();
     let code = tmp.path().join("code");
@@ -309,37 +424,32 @@ fn code_takes_priority_over_zed_for_folder_and_text() {
     let file = dir.join("hello world.txt");
     std::fs::write(&file, "text").unwrap();
     // `sopen_command`'s VSCODE_EXTENSIONS has no Remote - SSH: a local path uses VS Code anyway.
-    for target in [&dir, &file] {
-        let out = sopen(
-            tmp.path(),
-            &[target.to_str().unwrap()],
-            &[
-                ("SOPEN_CODE", code.to_str().unwrap()),
-                ("SOPEN_ZED", zed.to_str().unwrap()),
-            ],
-        );
-        assert!(out.status.success(), "{}", text(&out.stderr));
-        assert!(
-            text(&out.stdout).contains("in VS Code"),
-            "{}",
-            text(&out.stdout)
-        );
+    let out = sopen(
+        tmp.path(),
+        &[file.to_str().unwrap()],
+        &[
+            ("SOPEN_CODE", code.to_str().unwrap()),
+            ("SOPEN_ZED", zed.to_str().unwrap()),
+        ],
+    );
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert!(
+        text(&out.stdout).contains("in VS Code"),
+        "{}",
+        text(&out.stdout)
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !code_record.exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(50));
     }
     let seen = std::fs::read_to_string(&code_record).unwrap();
     assert_eq!(
         seen.lines().collect::<Vec<_>>(),
-        [
-            std::fs::canonicalize(&dir)
-                .unwrap()
-                .to_str()
-                .unwrap()
-                .to_string(),
-            std::fs::canonicalize(&file)
-                .unwrap()
-                .to_str()
-                .unwrap()
-                .to_string()
-        ]
+        [std::fs::canonicalize(&file)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string()]
     );
     assert!(!zed_record.exists());
 }
@@ -356,9 +466,11 @@ fn code_failure_does_not_open_zed() {
     for exe in [&code, &zed] {
         std::fs::set_permissions(exe, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
+    let file = tmp.path().join("notes.txt");
+    std::fs::write(&file, "text").unwrap();
     let out = sopen(
         tmp.path(),
-        &[tmp.path().to_str().unwrap()],
+        &[file.to_str().unwrap()],
         &[
             ("SOPEN_CODE", code.to_str().unwrap()),
             ("SOPEN_ZED", zed.to_str().unwrap()),
@@ -370,7 +482,7 @@ fn code_failure_does_not_open_zed() {
 }
 
 #[test]
-fn folders_and_text_go_to_the_editor_command() {
+fn text_goes_to_the_editor_command() {
     let tmp = tempfile::tempdir().unwrap();
     // A stand-in Zed CLI that records its argument.
     let record = tmp.path().join("zed-args");
@@ -390,21 +502,19 @@ fn folders_and_text_go_to_the_editor_command() {
     std::fs::write(dir.join("Makefile"), "all:\n\ttrue\n").unwrap();
 
     let zed = [("SOPEN_ZED", fake.to_str().unwrap())];
-    for target in [dir.clone(), dir.join("Makefile")] {
-        let out = sopen(tmp.path(), &[target.to_str().unwrap()], &zed);
-        assert!(out.status.success(), "{}", text(&out.stderr));
-        assert!(
-            text(&out.stdout).starts_with("opened "),
-            "{}",
-            text(&out.stdout)
-        );
-    }
+    let out = sopen(tmp.path(), &[dir.join("Makefile").to_str().unwrap()], &zed);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert!(
+        text(&out.stdout).starts_with("opened "),
+        "{}",
+        text(&out.stdout)
+    );
     // The CLI is detached; give it a moment to write.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     let mut seen = String::new();
     while std::time::Instant::now() < deadline {
         seen = std::fs::read_to_string(&record).unwrap_or_default();
-        if seen.lines().count() >= 2 {
+        if seen.lines().count() >= 1 {
             break;
         }
         std::thread::sleep(std::time::Duration::from_millis(50));
@@ -412,19 +522,7 @@ fn folders_and_text_go_to_the_editor_command() {
     let real = std::fs::canonicalize(&dir).unwrap();
     assert_eq!(
         seen.lines().collect::<Vec<_>>(),
-        [
-            real.to_str().unwrap().to_string(),
-            real.join("Makefile").to_str().unwrap().to_string()
-        ]
-    );
-
-    // No Zed: a folder is a clear error naming the editor.
-    let out = sopen(tmp.path(), &[dir.to_str().unwrap()], &[("SOPEN_ZED", "")]);
-    assert_eq!(out.status.code(), Some(1));
-    assert!(
-        text(&out.stderr).contains("VS Code was not found and Zed was not found"),
-        "{}",
-        text(&out.stderr)
+        [real.join("Makefile").to_str().unwrap().to_string()]
     );
     // No Zed: local text runs $VISUAL in place.
     let out = sopen(
@@ -544,7 +642,8 @@ fn the_raise_child_asks_kwin_and_cleans_up() {
     assert!(seen[1].contains(" unloadScript s "), "{seen:?}");
 }
 
-/// After VS Code took a folder: on KDE Plasma (Linux) sopen brings its window to the user; not
+/// After VS Code took a text file (a folder opens in sopen's own browser, owner message 12; the
+/// browser's F4 raises the same way): on KDE Plasma (Linux) sopen brings its window to the user; not
 /// elsewhere, not with SOPEN_RAISE=0, and a failing client changes nothing sopen says or exits
 /// with. By default the script runs detached and sopen returns at once.
 #[test]
@@ -556,12 +655,14 @@ fn the_editor_window_is_brought_to_the_user_on_kde_only() {
     executable(&code, "#!/bin/sh\nexit 0\n");
     let dir = tmp.path().join("project");
     std::fs::create_dir(&dir).unwrap();
+    let file = dir.join("notes.txt");
+    std::fs::write(&file, "text").unwrap();
     let kde = cfg!(target_os = "linux");
     let open = |desktop: &str, raise: Option<&str>, fail: bool| {
         let _ = std::fs::remove_file(&calls);
         let _ = std::fs::remove_file(&script);
         let mut cmd = sopen_command(tmp.path());
-        cmd.arg(&dir)
+        cmd.arg(&file)
             .env("SOPEN_CODE", &code)
             .env("PATH", &path)
             .env("XDG_CURRENT_DESKTOP", desktop);
@@ -588,7 +689,7 @@ fn the_editor_window_is_brought_to_the_user_on_kde_only() {
     if kde {
         assert_one_run(&lines_of(&calls));
         let loaded = std::fs::read_to_string(&script).unwrap();
-        assert!(loaded.contains("const opened = \"project\";"), "{loaded}");
+        assert!(loaded.contains("const opened = \"notes.txt\";"), "{loaded}");
     } else {
         assert_eq!(lines_of(&calls), Vec::<String>::new(), "not Linux: no call");
     }

@@ -387,6 +387,45 @@ pub fn open(
     Ok(outcome)
 }
 
+/// The media window inside another window (the file browser): the window [`open`] shows for
+/// the probed `media`, without the receipt hooks. `cache` is where exports are staged.
+pub fn embed(origin: Origin, media: Media, cache: &Path, notices: Vec<String>) -> super::Embedded {
+    let work_root = crate::cache::exports_root(cache);
+    let window = MediaWindow::new(
+        media,
+        origin,
+        work_root,
+        Marks::default(),
+        Selection::default(),
+        notices,
+    );
+    let (outcome, leftover) = (window.outcome.clone(), window.leftover.clone());
+    super::Embedded {
+        window: Box::new(window),
+        settle: Box::new(move |wait| {
+            let mut slot = leftover.lock().unwrap();
+            if let Some(job) = slot.as_ref() {
+                let stopped = || Err(anyhow::anyhow!("the export stopped without a result"));
+                let result = if wait {
+                    eprintln!(
+                        "sopen: the window closed during an export; waiting for it to finish"
+                    );
+                    job.rx.recv().unwrap_or_else(|_| stopped())
+                } else {
+                    match job.rx.try_recv() {
+                        Ok(result) => result,
+                        Err(mpsc::TryRecvError::Empty) => return None,
+                        Err(mpsc::TryRecvError::Disconnected) => stopped(),
+                    }
+                };
+                *slot = None;
+                let _ = report_export(result, &mut outcome.lock().unwrap());
+            }
+            Some(outcome.lock().unwrap().clone())
+        }),
+    }
+}
+
 /// Prints a finished export to the terminal, records it and returns the one-line status and
 /// what must be shown whole (the disclosure rows): what the export did not keep, or the error.
 fn report_export(
@@ -669,7 +708,7 @@ impl MediaWindow {
         self.pending_notices = Some(new);
         if std::mem::take(&mut self.close_when_done) {
             self.close_ok = true;
-            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            super::request_close(ctx);
         }
     }
 
@@ -691,7 +730,7 @@ impl MediaWindow {
         if plain_key(ctx, Key::E) {
             self.start_export(ctx);
         }
-        if plain_key(ctx, Key::Escape) {
+        if self.sel.is_set() && plain_key(ctx, Key::Escape) {
             self.sel.clear();
         }
         let step = |ctx: &egui::Context, key| {
