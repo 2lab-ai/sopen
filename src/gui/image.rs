@@ -585,7 +585,8 @@ impl Doc {
         let mut next = self.img.clone();
         let drawn = clip::draw_text(&mut next, rect, text, colour, &faces, size);
         self.commit(next);
-        let mut line = format!("pasted text ({} chars)", text.chars().count());
+        // Counted as drawn: composed (a decomposed Korean syllable is one character, not three).
+        let mut line = format!("pasted text ({} chars)", clip::composed(text).count());
         match (drawn.missing, hangul.is_some()) {
             (0, _) => {}
             (_, false) => line.push_str(" · no Hangul font found, so Hangul may not render"),
@@ -1257,23 +1258,32 @@ struct ImageWindow {
     has_alpha: bool,
     /// Pasted text's colour.
     text_colour: Color32,
-    /// The last cut or paste, to tell a held key from a new press (see [`LastClip`]).
-    last_clip: Option<LastClip>,
+    /// A cut or paste whose key is still down (see [`Held`]).
+    held: Option<Held>,
 }
 
-/// A cut or paste and everything it depended on, as they were right after it. egui-winit 0.37
-/// drops winit's key-repeat flag (`repeat: _` in its `on_keyboard_input`), so a Cmd/Ctrl+X or V
-/// held a moment too long arrives as the same event again: a second Cut would copy the blank it
-/// left over the picture on the clipboard, a second Paste would draw over itself. An event
-/// equal to this one with nothing changed since is that repeat, and is ignored.
-#[derive(PartialEq)]
-struct LastClip {
-    event: egui::Event,
-    rev: u64,
-    rect: Option<[u32; 4]>,
-    fit: clip::Fit,
-    background: clip::Colour,
-    text_colour: Color32,
+/// A Cut or Paste whose key has not been let go yet. egui-winit 0.37 drops winit's key-repeat
+/// flag (`repeat: _` in its `on_keyboard_input`), so a Cmd/Ctrl+X or V held a moment too long
+/// arrives as the same event again: a second Cut would put the blank the first one left on the
+/// clipboard, a second Paste would draw over the first. While one is held, more of its events
+/// are that repeat and are ignored; it ends when its key comes up (winit forwards that key-up
+/// even with Cmd held on macOS, `platform_impl/macos/app.rs`), when Cmd/Ctrl comes up, or when
+/// the window loses focus (where a key-up can go missing). The next press is a new cut or
+/// paste, whatever it pastes and wherever.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Held {
+    Cut,
+    Paste,
+}
+
+impl Held {
+    /// The keys that make it: Cmd/Ctrl+X or V, or a keyboard's own Cut or Paste key.
+    fn keys(self) -> [Key; 2] {
+        match self {
+            Held::Cut => [Key::X, Key::Cut],
+            Held::Paste => [Key::V, Key::Paste],
+        }
+    }
 }
 
 impl Drop for ImageWindow {
@@ -1325,7 +1335,7 @@ impl ImageWindow {
             transparent: false,
             has_alpha,
             text_colour: Color32::BLACK,
-            last_clip: None,
+            held: None,
         }
     }
 
@@ -1421,11 +1431,11 @@ impl ImageWindow {
     /// Cmd/Ctrl+C, X and V. egui-winit turns these shortcuts into these events — never into
     /// key presses — and for V reads the system clipboard: its text when it holds text, else
     /// its image. Not while a text field has the keyboard (its own copy and paste) or the close
-    /// prompt is up.
+    /// prompt is up. The events are taken in order with the key-ups, focus and modifier changes
+    /// that end a held one ([`Held`]) — also while the shortcuts themselves are off, so that a
+    /// key let go meanwhile is not missed.
     fn clipboard(&mut self, ctx: &egui::Context) {
-        if self.prompt || ctx.text_edit_focused() {
-            return;
-        }
+        let off = self.prompt || ctx.text_edit_focused();
         let events: Vec<egui::Event> = ctx.input(|i| {
             i.events
                 .iter()
@@ -1436,26 +1446,39 @@ impl ImageWindow {
                             | egui::Event::Cut
                             | egui::Event::Paste(_)
                             | egui::Event::PasteImage(_)
+                            | egui::Event::Key { pressed: false, .. }
+                            | egui::Event::WindowFocused(false)
+                            | egui::Event::ModifiersChanged(_)
                     )
                 })
                 .cloned()
                 .collect()
         });
         for event in events {
-            let now = |w: &Self, event: &egui::Event| LastClip {
-                event: event.clone(),
-                rev: w.doc.rev(),
-                rect: w.rect(),
-                fit: w.fit,
-                background: w.background(),
-                text_colour: w.text_colour,
+            let action = match &event {
+                egui::Event::Key { key, .. } => {
+                    if self.held.is_some_and(|h| h.keys().contains(key)) {
+                        self.held = None;
+                    }
+                    continue;
+                }
+                egui::Event::WindowFocused(_) => {
+                    self.held = None;
+                    continue;
+                }
+                egui::Event::ModifiersChanged(mods) => {
+                    if !mods.command {
+                        self.held = None;
+                    }
+                    continue;
+                }
+                egui::Event::Cut => Some(Held::Cut),
+                egui::Event::Paste(_) | egui::Event::PasteImage(_) => Some(Held::Paste),
+                _ => None,
             };
-            if !matches!(event, egui::Event::Copy)
-                && self.last_clip.as_ref() == Some(&now(self, &event))
-            {
+            if off || (action.is_some() && self.held == action) {
                 continue;
             }
-            let rev = self.doc.rev();
             match &event {
                 egui::Event::Copy => self.copy(ctx),
                 egui::Event::Cut => self.cut(ctx),
@@ -1475,8 +1498,8 @@ impl ImageWindow {
                 }
                 _ => {}
             }
-            if self.doc.rev() != rev {
-                self.last_clip = Some(now(self, &event));
+            if action.is_some() {
+                self.held = action;
             }
         }
     }
@@ -2810,6 +2833,27 @@ mod tests {
             "one step: the blank paste made none"
         );
         assert_eq!(doc.img, before);
+    }
+
+    /// The window never asks for an empty rectangle: a drag that covers no whole pixel leaves
+    /// none, and the model refuses one for every cut and paste.
+    #[test]
+    fn the_window_never_asks_for_an_empty_rectangle() {
+        let bounds = Vec2::new(20.0, 10.0);
+        let mut sel = Selection::default();
+        for empty in [[3, 2, 0, 5], [3, 2, 5, 0]] {
+            sel.set(empty);
+            assert_eq!(sel.pixels(bounds), None, "{empty:?}");
+            let mut doc = Doc::decode(&png_bytes(&gradient(20, 10))).unwrap();
+            let picture = image::RgbaImage::new(2, 2);
+            let black = [0, 0, 0, 255];
+            assert!(doc.cut(Some(empty), black).is_err(), "{empty:?}");
+            for fit in [clip::Fit::Stretch, clip::Fit::Fit, clip::Fit::OneToOne] {
+                assert!(doc.paste_image(Some(empty), &picture, fit, black).is_err());
+            }
+            assert!(doc.paste_text(Some(empty), "x", black, None).is_err());
+            assert!(!doc.can_undo(), "{empty:?}");
+        }
     }
 
     #[test]

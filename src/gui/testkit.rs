@@ -171,45 +171,46 @@ impl Driver {
     }
 
     /// Cmd/Ctrl+`key` as egui-winit 0.37 delivers a clipboard shortcut (its `src/lib.rs`,
-    /// `State::on_keyboard_input`): each press becomes `event` alone — no pressed `Key` — and
-    /// only the release arrives as a `Key`. It drops winit's repeat flag, so a key held until it
-    /// repeats is `event` again, once per repeat: `presses` passes of it before the release.
-    pub fn shortcut<W: Window>(&mut self, win: &mut W, key: Key, event: Event, presses: usize) {
+    /// `State::on_keyboard_input`): each press becomes `event` alone — no pressed `Key`; none
+    /// at all for a paste of empty text — and only the release arrives as a `Key`. It drops
+    /// winit's repeat flag, so a key held until it repeats is `event` again, once per repeat:
+    /// `presses` passes of it before the release. Cmd/Ctrl is let go after.
+    pub fn shortcut<W: Window>(
+        &mut self,
+        win: &mut W,
+        key: Key,
+        event: Option<Event>,
+        presses: usize,
+    ) {
         let mods = command(false);
         for _ in 0..presses {
-            self.frame(win, vec![event.clone()], mods);
+            self.frame(win, event.clone().into_iter().collect(), mods);
         }
-        let release = Event::Key {
-            key,
-            physical_key: None,
-            pressed: false,
-            repeat: false,
-            modifiers: mods,
-        };
-        self.frame(win, vec![release], mods);
+        self.frame(win, vec![key_up(key)], mods);
         self.idle(win, 1);
     }
 
     /// Cmd/Ctrl+C.
     pub fn copy<W: Window>(&mut self, win: &mut W) {
-        self.shortcut(win, Key::C, Event::Copy, 1);
+        self.shortcut(win, Key::C, Some(Event::Copy), 1);
     }
 
     /// Cmd/Ctrl+X.
     pub fn cut<W: Window>(&mut self, win: &mut W) {
-        self.shortcut(win, Key::X, Event::Cut, 1);
+        self.shortcut(win, Key::X, Some(Event::Cut), 1);
     }
 
     /// Cmd/Ctrl+V with text on the clipboard (egui-winit sends nothing for empty text).
     pub fn paste_text<W: Window>(&mut self, win: &mut W, text: &str) {
-        self.shortcut(win, Key::V, Event::Paste(text.to_string()), 1);
+        let event = (!text.is_empty()).then(|| Event::Paste(text.to_string()));
+        self.shortcut(win, Key::V, event, 1);
     }
 
     /// Cmd/Ctrl+V with only an image on the clipboard: egui-winit reads it with arboard and
     /// hands it over as premultiplied [`egui::ColorImage`].
     pub fn paste_image<W: Window>(&mut self, win: &mut W, image: egui::ColorImage) {
         let event = Event::PasteImage(std::sync::Arc::new(image));
-        self.shortcut(win, Key::V, event, 1);
+        self.shortcut(win, Key::V, Some(event), 1);
     }
 
     /// What the last pass drew where it can be seen: each shape `pick` takes, with its bounds on
@@ -305,6 +306,17 @@ impl Driver {
             .find_text(text)
             .unwrap_or_else(|| panic!("nothing labelled {text:?} on screen"));
         self.click(win, rect.center());
+    }
+}
+
+/// `key` let go with Cmd/Ctrl still held.
+pub fn key_up(key: Key) -> Event {
+    Event::Key {
+        key,
+        physical_key: None,
+        pressed: false,
+        repeat: false,
+        modifiers: command(false),
     }
 }
 

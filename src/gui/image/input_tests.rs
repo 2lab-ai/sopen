@@ -5,7 +5,7 @@
 //! read from the pixels, independent of the screen ↔ image mapping.
 
 use super::*;
-use crate::gui::testkit::{command, Driver};
+use crate::gui::testkit::{command, key_up, Driver};
 use crate::remote::{LocalFs, RemoteFs};
 use eframe::egui::{Key, Modifiers, PointerButton};
 use image::{GenericImageView, Rgb};
@@ -816,6 +816,25 @@ fn command_v_draws_pasted_text_inside_the_rectangle_only() {
     let before = fx.win.doc.img.clone();
     fx.select((40.0, 30.0), (200.0, 120.0));
     fx.drv.paste_text(&mut fx.win, "sopen 한글");
+    // Exactly what the text drawing makes of it (its own tests check the glyphs).
+    let mut expected = before.clone();
+    let faces: Vec<&fonts::Face> = fonts::hangul()
+        .into_iter()
+        .chain([fonts::fallback()])
+        .collect();
+    let rect = [40, 30, 160, 90];
+    clip::draw_text(
+        &mut expected,
+        rect,
+        "sopen 한글",
+        [0, 0, 0, 255],
+        &faces,
+        clip::TextSize::Fill,
+    );
+    assert!(
+        fx.win.doc.img == expected,
+        "the window drew other pixels than draw_text"
+    );
     let img = &fx.win.doc.img;
     let dark = img
         .pixels()
@@ -834,6 +853,26 @@ fn command_v_draws_pasted_text_inside_the_rectangle_only() {
     }
     fx.key(Key::Z, command(false));
     assert_eq!(fx.win.doc.img, before, "one undo step, exact pixels back");
+}
+
+/// Korean as Finder copies a file name — decomposed into conjoining jamo (NFD) — pastes the
+/// same pixels and the same status as the composed text.
+#[test]
+fn command_v_with_decomposed_korean_pastes_like_composed_korean() {
+    let nfd = "\u{1112}\u{1161}\u{11AB}\u{1100}\u{1173}\u{11AF}";
+    let paste = |text: &str| {
+        let mut fx = open();
+        fx.select((40.0, 30.0), (200.0, 120.0));
+        fx.drv.paste_text(&mut fx.win, text);
+        (fx.win.doc.img.clone(), fx.win.status.text.clone())
+    };
+    let (composed, said) = paste("한글");
+    let (decomposed, says) = paste(nfd);
+    assert_eq!(says, said);
+    assert!(
+        decomposed == composed,
+        "NFD 한글 drew other pixels than NFC 한글"
+    );
 }
 
 /// Text without a rectangle: at the top-left in letters a tenth of the image's height, and
@@ -906,7 +945,20 @@ fn a_read_only_image_copies_but_refuses_cut_and_paste() {
         "{}",
         fx.win.status.text
     );
+    // No rectangle can be drawn on a read-only image; Cmd/Ctrl+X is refused for being one.
+    fx.drv.take_commands();
+    fx.drv.cut(&mut fx.win);
+    assert!(
+        copied_images(&mut fx).is_empty(),
+        "nothing cut to the clipboard"
+    );
+    assert!(
+        fx.win.status.text.starts_with("read-only — animated GIF"),
+        "{}",
+        fx.win.status.text
+    );
     assert_eq!(fx.win.doc.img, before);
+    assert!(!fx.win.doc.can_undo());
 }
 
 /// While the unsaved-changes prompt is up, the clipboard shortcuts do nothing.
@@ -952,7 +1004,8 @@ fn a_held_command_x_cuts_once() {
     let before = fx.win.doc.img.clone();
     fx.select((40.0, 30.0), (100.0, 80.0));
     fx.drv.take_commands();
-    fx.drv.shortcut(&mut fx.win, Key::X, egui::Event::Cut, 3);
+    fx.drv
+        .shortcut(&mut fx.win, Key::X, Some(egui::Event::Cut), 3);
     let copied = copied_images(&mut fx);
     assert_eq!(copied.len(), 1, "one image to the clipboard");
     assert_eq!(
@@ -974,7 +1027,7 @@ fn a_held_command_v_pastes_once() {
     let before = fx.win.doc.img.clone();
     fx.select((40.0, 30.0), (200.0, 120.0));
     let text = egui::Event::Paste("sopen".to_string());
-    fx.drv.shortcut(&mut fx.win, Key::V, text, 3);
+    fx.drv.shortcut(&mut fx.win, Key::V, Some(text), 3);
     assert!(fx.win.doc.undo());
     assert!(!fx.win.doc.can_undo(), "text: one undo step");
     assert_eq!(fx.win.doc.img, before);
@@ -982,7 +1035,7 @@ fn a_held_command_v_pastes_once() {
     let mut fx = open();
     let before = fx.win.doc.img.clone();
     let picture = egui::Event::PasteImage(std::sync::Arc::new(halves(30, 20)));
-    fx.drv.shortcut(&mut fx.win, Key::V, picture, 3);
+    fx.drv.shortcut(&mut fx.win, Key::V, Some(picture), 3);
     assert_eq!(fx.rect(), Some([0, 0, 30, 20]));
     assert!(fx.win.doc.undo());
     assert!(!fx.win.doc.can_undo(), "picture: one undo step");
@@ -1039,4 +1092,197 @@ fn the_paste_row_is_one_line_at_every_window_width() {
             assert!(swatch, "{colour:?} swatch shown whole at {w} px");
         }
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// A held shortcut against a new press: egui-winit sends a repeat the same way as a press.
+
+/// Cmd/Ctrl held throughout, X pressed, let go, pressed again: two cuts.
+#[test]
+fn command_x_pressed_again_after_letting_go_cuts_again() {
+    let mut fx = open();
+    let before = fx.win.doc.img.clone();
+    fx.select((40.0, 30.0), (100.0, 80.0));
+    fx.drv.take_commands();
+    for _ in 0..2 {
+        fx.drv
+            .frame(&mut fx.win, vec![egui::Event::Cut], command(false));
+        fx.drv
+            .frame(&mut fx.win, vec![key_up(Key::X)], command(false));
+    }
+    assert_eq!(copied_images(&mut fx).len(), 2, "cut twice");
+    assert!(fx.win.doc.undo() && fx.win.doc.undo(), "two undo steps");
+    assert!(!fx.win.doc.can_undo());
+    assert_eq!(fx.win.doc.img, before);
+}
+
+/// A second Cmd/Ctrl+V after the key was let go pastes again — the same clipboard, rectangle
+/// and choices: text drawn twice, a half-transparent picture laid twice.
+#[test]
+fn command_v_pressed_again_after_letting_go_pastes_again() {
+    let translucent = {
+        let img = image::RgbaImage::from_pixel(10, 10, image::Rgba([255, 0, 0, 128]));
+        egui::ColorImage::from_rgba_unmultiplied([10, 10], img.as_raw())
+    };
+    let events = [
+        egui::Event::Paste("sopen".to_string()),
+        egui::Event::PasteImage(std::sync::Arc::new(translucent)),
+    ];
+    for event in events {
+        let mut fx = open();
+        let before = fx.win.doc.img.clone();
+        fx.select((40.0, 30.0), (100.0, 80.0));
+        fx.drv
+            .frame(&mut fx.win, vec![event.clone()], command(false));
+        fx.drv
+            .frame(&mut fx.win, vec![key_up(Key::V)], command(false));
+        let once = fx.win.doc.img.clone();
+        fx.drv
+            .frame(&mut fx.win, vec![event.clone()], command(false));
+        fx.drv
+            .frame(&mut fx.win, vec![key_up(Key::V)], command(false));
+        assert_ne!(fx.win.doc.img, once, "laid again over the first");
+        assert!(fx.win.doc.undo() && fx.win.doc.undo(), "two undo steps");
+        assert!(!fx.win.doc.can_undo());
+        assert_eq!(fx.win.doc.img, before);
+    }
+}
+
+/// A paste, the rectangle moved away and back, a paste again: two pastes.
+#[test]
+fn a_paste_after_moving_the_rectangle_away_and_back_pastes_again() {
+    let mut fx = open();
+    fx.select((40.0, 30.0), (100.0, 80.0));
+    fx.drv.paste_text(&mut fx.win, "sopen");
+    let (inside, away) = (fx.at(70.0, 55.0), fx.at(90.0, 65.0));
+    fx.drv
+        .drag(&mut fx.win, PointerButton::Primary, inside, away);
+    assert_eq!(fx.rect(), Some([60, 40, 60, 50]), "moved away");
+    fx.drv
+        .drag(&mut fx.win, PointerButton::Primary, away, inside);
+    assert_eq!(fx.rect(), Some([40, 30, 60, 50]), "and back");
+    fx.drv.paste_text(&mut fx.win, "sopen");
+    assert!(fx.win.doc.undo() && fx.win.doc.undo(), "two undo steps");
+    assert!(!fx.win.doc.can_undo());
+}
+
+/// The window losing focus, or Cmd/Ctrl going up, ends a held Cmd/Ctrl+V (its release may
+/// never reach the window): the next press pastes.
+#[test]
+fn losing_focus_or_letting_go_of_command_ends_a_held_shortcut() {
+    let paste = egui::Event::Paste("sopen".to_string());
+    let gaps: [Vec<(Vec<egui::Event>, Modifiers)>; 2] = [
+        vec![
+            (vec![egui::Event::WindowFocused(false)], command(false)),
+            (vec![egui::Event::WindowFocused(true)], command(false)),
+        ],
+        vec![(Vec::new(), Modifiers::NONE)],
+    ];
+    for (case, gap) in ["focus lost", "command let go"].into_iter().zip(gaps) {
+        let mut fx = open();
+        fx.select((40.0, 30.0), (100.0, 80.0));
+        fx.drv
+            .frame(&mut fx.win, vec![paste.clone()], command(false));
+        for (events, mods) in gap {
+            fx.drv.frame(&mut fx.win, events, mods);
+        }
+        fx.drv
+            .frame(&mut fx.win, vec![paste.clone()], command(false));
+        assert!(
+            fx.win.doc.undo() && fx.win.doc.undo(),
+            "{case}: two undo steps"
+        );
+        assert!(!fx.win.doc.can_undo(), "{case}");
+    }
+}
+
+/// Drawing a rectangle is only that: no pixel, no undo step, nothing to the clipboard.
+#[test]
+fn drawing_a_rectangle_changes_and_copies_nothing() {
+    let mut fx = open();
+    let before = fx.win.doc.img.clone();
+    fx.drv.take_commands();
+    fx.select((40.0, 30.0), (100.0, 80.0));
+    assert_eq!(fx.rect(), Some([40, 30, 60, 50]));
+    assert_eq!(fx.win.doc.img, before);
+    assert!(!fx.win.doc.can_undo());
+    assert!(fx.drv.take_commands().is_empty(), "no clipboard command");
+}
+
+/// The background swatch, changed through its own picker (its "G 255" value dragged down to
+/// 0), is what Cmd/Ctrl+X leaves.
+#[test]
+fn a_background_picked_on_the_swatch_is_what_a_cut_leaves() {
+    let mut fx = open();
+    fx.settle();
+    fx.select((40.0, 30.0), (100.0, 80.0));
+    let row = fx
+        .drv
+        .find_text("Background")
+        .expect("the label")
+        .center()
+        .y;
+    let swatch = fx
+        .drv
+        .rects()
+        .into_iter()
+        .find(|(r, fill, _)| *fill == Color32::WHITE && (r.center().y - row).abs() < 3.0)
+        .expect("the white background swatch")
+        .0;
+    fx.drv.click(&mut fx.win, swatch.center());
+    let g = fx
+        .drv
+        .find_text("G ")
+        .expect("the picker's green value")
+        .center();
+    fx.drv.drag(
+        &mut fx.win,
+        PointerButton::Primary,
+        g,
+        g - Vec2::new(600.0, 0.0),
+    );
+    // The picker stays open (Esc would clear the rectangle too); the cut goes to the image.
+    fx.drv.cut(&mut fx.win);
+    assert_eq!(fx.win.status.text, "cut 60×50");
+    assert_eq!(fx.win.doc.img.get_pixel(40, 30).0, [255, 0, 255, 255]);
+    assert_eq!(fx.win.doc.img.get_pixel(99, 79).0, [255, 0, 255, 255]);
+}
+
+/// A Cmd/Ctrl+V let go while the shortcuts are off (here: the close prompt is up) still ends
+/// the held paste: after Cancel — Cmd/Ctrl held all along — the next press pastes.
+#[test]
+fn a_key_let_go_while_the_close_prompt_is_up_still_ends_a_held_paste() {
+    let mut fx = open();
+    fx.select((40.0, 30.0), (100.0, 80.0));
+    let cmd = command(false);
+    let paste = egui::Event::Paste("sopen".to_string());
+    fx.drv.frame(&mut fx.win, vec![paste.clone()], cmd);
+    use crate::gui::Window;
+    assert!(!fx.win.close_requested(), "unsaved: asks");
+    fx.drv.frame(&mut fx.win, vec![key_up(Key::V)], cmd);
+    for _ in 0..3 {
+        fx.drv.frame(&mut fx.win, Vec::new(), cmd); // the prompt lays itself out
+    }
+    let cancel = fx.drv.find_text("Cancel").expect("the prompt").center();
+    for event in [
+        egui::Event::PointerMoved(cancel),
+        egui::Event::PointerButton {
+            pos: cancel,
+            button: PointerButton::Primary,
+            pressed: true,
+            modifiers: cmd,
+        },
+        egui::Event::PointerButton {
+            pos: cancel,
+            button: PointerButton::Primary,
+            pressed: false,
+            modifiers: cmd,
+        },
+    ] {
+        fx.drv.frame(&mut fx.win, vec![event], cmd);
+    }
+    assert!(!fx.win.prompt, "cancelled");
+    fx.drv.frame(&mut fx.win, vec![paste], cmd);
+    assert!(fx.win.doc.undo() && fx.win.doc.undo(), "two undo steps");
+    assert!(!fx.win.doc.can_undo());
 }

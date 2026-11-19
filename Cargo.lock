@@ -3672,6 +3672,7 @@ dependencies = [
  "egui_system_font_provider",
  "futures-core",
  "gethostname",
+ "icu_normalizer",
  "image",
  "libc",
  "num-traits",

@@ -96,11 +96,12 @@ inside moves it), then:
 The second toolbar row holds the **Paste** choice and two colours: **Background** (white by
 default; on an image with alpha, **transparent** too) and **Text** (black). A pasted picture's
 own transparency blends over what is there. When the clipboard holds both text and a picture,
-text wins (that is what the window is handed); Korean text is drawn with an installed font that
-has Hangul — without one the status line says Hangul may not render. Every cut and paste is one
-undo step (a key held until it repeats counts once), saved by Save or Save copy like the other
-edits. Pictures go through the clipboard as
-8-bit RGBA, so a 16-bit image's copy is 8-bit.
+text wins (that is what the window is handed); Korean text — also as Finder copies a file name,
+decomposed into jamo — is drawn as syllables with an installed font that has Hangul; without one
+Hangul shows as boxes and the status line says Hangul may not render. Every cut and paste is one
+undo step, saved by Save or Save copy like the other edits; a key held until it repeats counts
+once, a second press pastes again. Pictures go through the clipboard as 8-bit RGBA, so a 16-bit
+image's copy is 8-bit.
 
 Animated GIF/PNG/WebP and multi-page TIFF open read-only (first frame / page; `⌘C` still copies).
 Closing with unsaved changes asks first. Save keeps the ICC profile and Exif where the format

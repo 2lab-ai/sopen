@@ -41,15 +41,19 @@ fn unit(c: Colour) -> [f32; 4] {
 /// needs a band's worth of extra memory, not four times the photo.
 const BAND: u32 = 256;
 
-/// Runs `edit` on the pixels of `rect`, a band of rows at a time — straight RGBA in 0..=1, with
-/// the band's first row (counted from the rectangle's top) — and writes them back in the
-/// image's own pixel type. Nothing outside `rect` is touched, and a pixel `edit` leaves alone
-/// comes back bit for bit (8- and 16-bit values survive the trip through 32-bit float).
-fn edit_rect(
-    img: &mut DynamicImage,
-    [x, y, w, h]: [u32; 4],
-    mut edit: impl FnMut(&mut Rgba32FImage, u32),
-) {
+/// The part of `rect` inside an image of `size`: `(w, h)` from the same top-left corner.
+fn inside((iw, ih): (u32, u32), [x, y, w, h]: [u32; 4]) -> (u32, u32) {
+    (w.min(iw.saturating_sub(x)), h.min(ih.saturating_sub(y)))
+}
+
+/// Runs `edit` on the pixels of `rect` that are inside the image, a band of rows at a time —
+/// straight RGBA in 0..=1; pixel `(rx, ry)` of a band is pixel `(rx, top + ry)` of the
+/// rectangle — and writes them back in the image's own pixel type. Nothing outside `rect` is
+/// touched, and a pixel `edit` leaves alone comes back bit for bit (8- and 16-bit values
+/// survive the trip through 32-bit float).
+fn edit_rect(img: &mut DynamicImage, rect: [u32; 4], mut edit: impl FnMut(&mut Rgba32FImage, u32)) {
+    let [x, y, ..] = rect;
+    let (w, h) = inside((img.width(), img.height()), rect);
     let mut top = 0;
     while top < h {
         let rows = BAND.min(h - top);
@@ -162,7 +166,8 @@ impl Laid {
 
 /// Lays `picture` into `rect` as `fit` says, over what is there (its alpha blends); with
 /// [`Fit::Fit`] the part of `rect` it does not cover gets `background`. Returns where the
-/// picture went, `[x, y, w, h]` in image pixels.
+/// picture went, `[x, y, w, h]` in image pixels — no width and height, and nothing changed,
+/// when `rect` or `picture` has none.
 pub fn place(
     img: &mut DynamicImage,
     rect: [u32; 4],
@@ -172,6 +177,10 @@ pub fn place(
 ) -> [u32; 4] {
     let [x, y, w, h] = rect;
     let (pw, ph) = picture.dimensions();
+    if w == 0 || h == 0 || pw == 0 || ph == 0 {
+        // Nowhere to lay it, or nothing to lay: nothing changes (the window asks for neither).
+        return [x, y, 0, 0];
+    }
     let (tw, th) = match fit {
         Fit::Stretch => (w, h),
         Fit::Fit => {
@@ -218,6 +227,19 @@ pub fn place(
     at
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Characters of pasted text read — by the layout, through [`composed`] — for the tests
+    /// that bound its work.
+    static READ: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Counts one character read by the layout (tests only).
+fn read_one() {
+    #[cfg(test)]
+    READ.with(|r| r.set(r.get() + 1));
+}
+
 /// How big pasted text is drawn.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum TextSize {
@@ -232,7 +254,8 @@ pub enum TextSize {
 pub struct Drawn {
     /// The text's block — its lines' extent — inside the rectangle.
     pub area: [u32; 4],
-    /// Characters in the lines that show (not counting spaces) none of the faces has.
+    /// Characters in the lines that show none of the faces has (drawn as the first face's
+    /// missing-glyph box; spaces and invisible characters not counted).
     pub missing: usize,
 }
 
@@ -244,54 +267,224 @@ struct Shaper<'a> {
 
 type Glyph = (usize, GlyphId);
 
+/// How one character is drawn.
+#[derive(Debug, Clone, Copy)]
+enum Look {
+    /// A glyph of the first face that has it.
+    Glyph(Glyph),
+    /// No face has it: the first face's missing-glyph box (`.notdef`). Counted as missing.
+    Missing(Glyph),
+    /// A space no face has: the missing glyph's room, nothing drawn.
+    Blank(Glyph),
+    /// A control or default-ignorable character (zero-width space, joiner, soft hyphen,
+    /// variation selector, …): nothing drawn, no room taken.
+    Invisible,
+}
+
+/// Unicode's Default_Ignorable_Code_Point (DerivedCoreProperties.txt): characters a renderer
+/// shows nothing for when it cannot shape them.
+fn ignorable(c: char) -> bool {
+    matches!(
+        u32::from(c),
+        0xAD | 0x34F
+            | 0x61C
+            | 0x115F..=0x1160
+            | 0x17B4..=0x17B5
+            | 0x180B..=0x180F
+            | 0x200B..=0x200F
+            | 0x202A..=0x202E
+            | 0x2060..=0x206F
+            | 0x3164
+            | 0xFE00..=0xFE0F
+            | 0xFEFF
+            | 0xFFA0
+            | 0xFFF0..=0xFFF8
+            | 0x1BCA0..=0x1BCA3
+            | 0x1D173..=0x1D17A
+            | 0xE0000..=0xE0FFF
+    )
+}
+
+/// `text` composed (Unicode NFC) as it is read, without copying it: Korean copied from a macOS
+/// file name comes decomposed into conjoining jamo (한 = ᄒ ᅡ ᆫ), which the faces draw as loose
+/// letters, not the syllable — composed, it is the syllable.
+pub fn composed(text: &str) -> impl Iterator<Item = char> + '_ {
+    let read = text.chars().inspect(|_| read_one());
+    icu_normalizer::ComposingNormalizerBorrowed::new_nfc().normalize_iter(stream_safe(read))
+}
+
+/// Unicode's Stream-Safe Text Format (UAX #15 §13), so that the normalizer reads only as far
+/// as the layout does: it holds every combining mark that follows a letter until the next
+/// letter (to put them in canonical order), so a megabyte of marks would be read whole before
+/// the first one came out. After 30 characters in a row that begin with a combining mark (no
+/// real text has more), U+034F COMBINING GRAPHEME JOINER — a letter to the normalizer, drawn
+/// as nothing — ends the run.
+fn stream_safe(chars: impl Iterator<Item = char>) -> impl Iterator<Item = char> {
+    use icu_normalizer::properties::{
+        CanonicalCombiningClassMapBorrowed, CanonicalDecompositionBorrowed, Decomposed,
+    };
+    let (class, parts) = (
+        CanonicalCombiningClassMapBorrowed::new(),
+        CanonicalDecompositionBorrowed::new(),
+    );
+    let mut run = 0;
+    chars.flat_map(move |c| {
+        // The first character of its full canonical decomposition (a few levels at most).
+        let mut first = c;
+        for _ in 0..4 {
+            match parts.decompose(first) {
+                Decomposed::Default => break,
+                Decomposed::Singleton(x) | Decomposed::Expansion(x, _) => first = x,
+            }
+        }
+        let mut joiner = None;
+        if class.get_u8(first) == 0 {
+            run = 0;
+        } else if run == 30 {
+            (run, joiner) = (1, Some('\u{34F}'));
+        } else {
+            run += 1;
+        }
+        joiner.into_iter().chain(std::iter::once(c))
+    })
+}
+
+/// [`composed`] `text` with each tab as four spaces.
+fn expanded(text: &str) -> impl Iterator<Item = char> + '_ {
+    composed(text).flat_map(|c| {
+        let (c, n) = if c == '\t' { (' ', 4) } else { (c, 1) };
+        std::iter::repeat_n(c, n)
+    })
+}
+
 impl Shaper<'_> {
-    /// The first face that has `c`.
-    fn glyph(&self, c: char) -> Option<Glyph> {
-        self.fonts.iter().enumerate().find_map(|(i, f)| {
+    fn look(&self, c: char) -> Look {
+        if c.is_control() || ignorable(c) {
+            return Look::Invisible;
+        }
+        let found = self.fonts.iter().enumerate().find_map(|(i, f)| {
             let id = f.glyph_id(c);
             (id.0 != 0).then_some((i, id))
-        })
-    }
-
-    fn advance(&self, (i, id): Glyph) -> f32 {
-        self.fonts[i].as_scaled(self.scale).h_advance(id)
-    }
-
-    fn kern(&self, (i, a): Glyph, (j, b): Glyph) -> f32 {
-        if i == j {
-            self.fonts[i].as_scaled(self.scale).kern(a, b)
-        } else {
-            0.0
+        });
+        match found {
+            Some(g) => Look::Glyph(g),
+            None if c.is_whitespace() => Look::Blank((0, GlyphId(0))),
+            None => Look::Missing((0, GlyphId(0))),
         }
     }
 
-    fn width(&self, line: &[char]) -> f32 {
-        self.width_until(line, f32::INFINITY)
+    fn advance(&self, look: Look) -> f32 {
+        match look {
+            Look::Glyph((i, id)) | Look::Missing((i, id)) | Look::Blank((i, id)) => {
+                self.fonts[i].as_scaled(self.scale).h_advance(id)
+            }
+            Look::Invisible => 0.0,
+        }
     }
 
-    /// The width of `line`, or — as soon as it passes `limit` — some width past `limit`.
-    fn width_until(&self, line: &[char], limit: f32) -> f32 {
+    fn kern(&self, a: Look, b: Look) -> f32 {
+        match (a, b) {
+            (Look::Glyph((i, a)), Look::Glyph((j, b))) if i == j => {
+                self.fonts[i].as_scaled(self.scale).kern(a, b)
+            }
+            _ => 0.0,
+        }
+    }
+
+    /// The least room a character takes when lines are filled — a quarter of the letter size —
+    /// so that one that advances by nothing (a combining mark, an invisible character, a
+    /// font's empty missing-glyph box) still fills a line: no line holds more than four per
+    /// pixel of letter size across, however long the text.
+    fn floor(&self) -> f32 {
+        self.scale.y / 4.0
+    }
+
+    /// The width `line` is drawn at.
+    fn width(&self, line: &[char]) -> f32 {
         let mut x = 0.0;
         let mut prev = None;
-        for g in line.iter().filter_map(|&c| self.glyph(c)) {
+        for look in line.iter().map(|&c| self.look(c)) {
             if let Some(p) = prev {
-                x += self.kern(p, g);
+                x += self.kern(p, look);
             }
-            x += self.advance(g);
-            if x > limit {
-                break;
-            }
-            prev = Some(g);
+            x += self.advance(look);
+            prev = Some(look);
         }
         x
     }
 
+    /// `text` broken into lines no wider than `room`: at newlines, after the last space that
+    /// fits, and between letters inside a word longer than a line (Korean or Chinese without
+    /// spaces, a long URL). Read one character at a time, each taking at least
+    /// [`Self::floor`], and stopped after `most + 1` lines — enough to know a block taller than
+    /// `most` lines does not fit — so a huge paste costs no more than the rectangle can show.
+    fn wrap(&self, text: &str, room: f32, most: usize) -> Vec<Vec<char>> {
+        let floor = self.floor();
+        let step = |c: char| self.advance(self.look(c)).max(floor);
+        let trimmed = |mut line: Vec<char>| {
+            while line.last() == Some(&' ') {
+                line.pop();
+            }
+            line
+        };
+        let mut lines: Vec<Vec<char>> = Vec::new();
+        let mut line: Vec<char> = Vec::new();
+        let mut used = 0.0;
+        // Where the line may break: just after its last space.
+        let mut after_space = None;
+        for c in expanded(text) {
+            if c == '\n' {
+                lines.push(trimmed(std::mem::take(&mut line)));
+                (used, after_space) = (0.0, None);
+                if lines.len() > most {
+                    return lines;
+                }
+                continue;
+            }
+            let wide = step(c);
+            if used + wide > room && !line.is_empty() {
+                if c == ' ' {
+                    // The line ends at this space, which goes nowhere.
+                    lines.push(trimmed(std::mem::take(&mut line)));
+                    (used, after_space) = (0.0, None);
+                    if lines.len() > most {
+                        return lines;
+                    }
+                    continue;
+                }
+                // The word begun after the line's last space goes on to the next line.
+                let carried = match after_space {
+                    Some(at) if at < line.len() => line.split_off(at),
+                    _ => Vec::new(),
+                };
+                lines.push(trimmed(std::mem::take(&mut line)));
+                if lines.len() > most {
+                    return lines;
+                }
+                used = carried.iter().map(|&c| step(c)).sum();
+                (line, after_space) = (carried, None);
+                if used + wide > room && !line.is_empty() {
+                    // Too long for a line of its own: broken between letters.
+                    lines.push(std::mem::take(&mut line));
+                    used = 0.0;
+                    if lines.len() > most {
+                        return lines;
+                    }
+                }
+            }
+            line.push(c);
+            used += wide;
+            if c == ' ' {
+                after_space = Some(line.len());
+            }
+        }
+        lines.push(trimmed(line));
+        lines
+    }
+
     /// `(ascent, line height, gap between lines)` of the first face.
     fn metrics(&self) -> (f32, f32, f32) {
-        let Some(first) = self.fonts.first() else {
-            return (0.0, 0.0, 0.0);
-        };
-        let s = first.as_scaled(self.scale);
+        let s = self.fonts[0].as_scaled(self.scale);
         (
             s.ascent(),
             s.ascent() - s.descent() + s.line_gap(),
@@ -299,68 +492,11 @@ impl Shaper<'_> {
         )
     }
 
-    /// `text` broken into lines no wider than `room`: at spaces, and between letters inside a
-    /// word longer than the line (Korean or Chinese without spaces, a long URL). Stops after
-    /// `most + 1` lines — enough to know a block taller than `most` lines does not fit — so a
-    /// huge paste costs no more than the rectangle can show.
-    fn wrap(&self, text: &str, room: f32, most: usize) -> Vec<Vec<char>> {
-        let space = self.width(&[' ']);
-        let mut lines = Vec::new();
-        for paragraph in text.split('\n') {
-            let (mut line, mut used): (Vec<char>, f32) = (Vec::new(), 0.0);
-            for word in paragraph.split(' ') {
-                if lines.len() > most {
-                    return lines;
-                }
-                let word: Vec<char> = word.chars().collect();
-                let wide = self.width_until(&word, room);
-                let gap = if line.is_empty() { 0.0 } else { space };
-                if used + gap + wide <= room {
-                    if !line.is_empty() {
-                        line.push(' ');
-                    }
-                    line.extend(&word);
-                    used += gap + wide;
-                    continue;
-                }
-                if !line.is_empty() {
-                    lines.push(std::mem::take(&mut line));
-                }
-                if wide <= room {
-                    (line, used) = (word, wide);
-                    continue;
-                }
-                used = 0.0;
-                for c in word {
-                    let step = self.width(&[c]);
-                    if !line.is_empty() && used + step > room {
-                        lines.push(std::mem::take(&mut line));
-                        if lines.len() > most {
-                            return lines;
-                        }
-                        used = 0.0;
-                    }
-                    line.push(c);
-                    used += step;
-                }
-            }
-            lines.push(line);
-            if lines.len() > most {
-                break;
-            }
-        }
-        lines
-    }
-
     /// The lines of `text` wrapped to `w` — those that can show in `h`, and one more if there
     /// are — and the block's `(width, height)`.
     fn block(&self, text: &str, w: u32, h: u32) -> (Vec<Vec<char>>, f32, f32) {
         let (_, line_height, gap) = self.metrics();
-        let most = if line_height > 0.0 {
-            ((h as f32 + gap) / line_height) as usize
-        } else {
-            usize::MAX - 1
-        };
+        let most = ((h as f32 + gap) / line_height.max(1e-3)) as usize;
         let lines = self.wrap(text, w as f32, most);
         let width = lines.iter().map(|l| self.width(l)).fold(0.0, f32::max);
         let height = lines.len() as f32 * line_height - gap;
@@ -369,8 +505,10 @@ impl Shaper<'_> {
 }
 
 /// Draws `text` in `colour` inside `rect`, wrapped to its width, left and top aligned, in the
-/// first of `faces` that has each character (the first face sets the line spacing). Nothing
-/// outside `rect` is touched; what does not fit is cut off.
+/// first of `faces` that has each character (the first face sets the line spacing, and draws
+/// its missing-glyph box for a character none has). Tabs are four spaces. Nothing outside
+/// `rect` is touched; what does not fit — in the rectangle or the image — is cut off. An empty
+/// rectangle draws nothing.
 pub fn draw_text(
     img: &mut DynamicImage,
     rect: [u32; 4],
@@ -380,11 +518,17 @@ pub fn draw_text(
     size: TextSize,
 ) -> Drawn {
     let [x, y, w, h] = rect;
-    let text = text.replace("\r\n", "\n").replace('\t', "    ");
+    let empty = Drawn {
+        area: [x, y, 0, 0],
+        missing: 0,
+    };
     let fonts: Vec<FontRef> = faces
         .iter()
         .filter_map(|f| FontRef::try_from_slice_and_index(f.bytes(), f.index()).ok())
         .collect();
+    if w == 0 || h == 0 || fonts.is_empty() {
+        return empty;
+    }
     let at = |px: f32| Shaper {
         fonts: fonts.clone(),
         scale: PxScale::from(px),
@@ -396,10 +540,10 @@ pub fn draw_text(
             // when none does.
             let fits = |px: u32| {
                 let shaper = at(px as f32);
-                let (_, width, height) = shaper.block(&text, w, h);
+                let (_, width, height) = shaper.block(text, w, h);
                 width <= w as f32 && height <= h as f32
             };
-            let (mut lo, mut hi) = (1u32, h.max(1));
+            let (mut lo, mut hi) = (1u32, h);
             while lo < hi {
                 let mid = (lo + hi).div_ceil(2);
                 if fits(mid) {
@@ -412,11 +556,13 @@ pub fn draw_text(
         }
     };
     let shaper = at(px);
-    let mut missing = 0;
-    let (lines, width, height) = shaper.block(&text, w, h);
+    let (lines, width, height) = shaper.block(text, w, h);
     let (ascent, line_height, _) = shaper.metrics();
-    // Coverage, 0..=255 per pixel of the rectangle.
-    let mut mask = vec![0u8; w as usize * h as usize];
+    // Coverage, 0..=255, of the rectangle's pixels inside the image (the text is laid out for
+    // the whole rectangle, and cut off at the image's edge).
+    let (vw, vh) = inside((img.width(), img.height()), rect);
+    let mut mask = vec![0u8; vw as usize * vh as usize];
+    let mut missing = 0;
     for (row, line) in lines.iter().enumerate() {
         let baseline = ascent + row as f32 * line_height;
         if baseline - ascent >= h as f32 {
@@ -425,36 +571,43 @@ pub fn draw_text(
         let mut pen = 0.0;
         let mut prev = None;
         for &c in line {
-            let Some(g) = shaper.glyph(c) else {
-                missing += usize::from(!c.is_whitespace() && !c.is_control());
-                continue;
-            };
+            let look = shaper.look(c);
             if let Some(p) = prev {
-                pen += shaper.kern(p, g);
+                pen += shaper.kern(p, look);
             }
-            let glyph =
-                g.1.with_scale_and_position(shaper.scale, ab_glyph::point(pen, baseline));
-            if let Some(outline) = shaper.fonts[g.0].outline_glyph(glyph) {
-                let b = outline.px_bounds();
-                outline.draw(|gx, gy, coverage| {
-                    let (px, py) = (
-                        b.min.x as i64 + i64::from(gx),
-                        b.min.y as i64 + i64::from(gy),
-                    );
-                    if (0..i64::from(w)).contains(&px) && (0..i64::from(h)).contains(&py) {
-                        let m = &mut mask[py as usize * w as usize + px as usize];
-                        *m = (*m).max((coverage.clamp(0.0, 1.0) * 255.0).round() as u8);
-                    }
-                });
+            let drawn = match look {
+                Look::Glyph(g) => Some(g),
+                Look::Missing(g) => {
+                    missing += 1;
+                    Some(g)
+                }
+                Look::Blank(_) | Look::Invisible => None,
+            };
+            if let Some((i, id)) = drawn {
+                let glyph =
+                    id.with_scale_and_position(shaper.scale, ab_glyph::point(pen, baseline));
+                if let Some(outline) = shaper.fonts[i].outline_glyph(glyph) {
+                    let b = outline.px_bounds();
+                    outline.draw(|gx, gy, coverage| {
+                        let (px, py) = (
+                            b.min.x as i64 + i64::from(gx),
+                            b.min.y as i64 + i64::from(gy),
+                        );
+                        if (0..i64::from(vw)).contains(&px) && (0..i64::from(vh)).contains(&py) {
+                            let m = &mut mask[py as usize * vw as usize + px as usize];
+                            *m = (*m).max((coverage.clamp(0.0, 1.0) * 255.0).round() as u8);
+                        }
+                    });
+                }
             }
-            pen += shaper.advance(g);
-            prev = Some(g);
+            pen += shaper.advance(look);
+            prev = Some(look);
         }
     }
     let c = unit(colour);
     edit_rect(img, rect, |band, top| {
-        let rows = &mask[top as usize * w as usize..];
-        for (p, &m) in band.pixels_mut().zip(rows) {
+        for (rx, ry, p) in band.enumerate_pixels_mut() {
+            let m = mask[(top + ry) as usize * vw as usize + rx as usize];
             if m > 0 {
                 p.0 = over([c[0], c[1], c[2], c[3] * f32::from(m) / 255.0], p.0);
             }
@@ -746,6 +899,24 @@ mod tests {
         assert_ne!(band(0), band(BAND));
     }
 
+    /// Panics, naming the first pixel that differs, unless `a` and `b` are the same image.
+    #[track_caller]
+    fn assert_same(a: &DynamicImage, b: &DynamicImage, what: &str) {
+        assert_eq!(a.dimensions(), b.dimensions(), "{what}: size");
+        assert_eq!(a.color(), b.color(), "{what}: pixel type");
+        let (pa, pb) = (a.to_rgba16(), b.to_rgba16());
+        if let Some((x, y, p)) = pa
+            .enumerate_pixels()
+            .find(|(x, y, p)| *p != pb.get_pixel(*x, *y))
+        {
+            panic!(
+                "{what}: ({x},{y}) is {:?}, wants {:?}",
+                p.0,
+                pb.get_pixel(x, y).0
+            );
+        }
+    }
+
     /// Pixels of `img` that differ from `before`, as `(x, y)`.
     fn changed(img: &DynamicImage, before: &DynamicImage) -> Vec<(u32, u32)> {
         img.pixels()
@@ -879,6 +1050,65 @@ mod tests {
         assert_eq!(drawn.missing, 0);
         let ink = changed(&img, &before);
         assert!(ink.len() > 300, "{} pixels of Hangul", ink.len());
+        // Real glyphs, not one box for every letter: 한 and 글 differ, and neither is what the
+        // font without Hangul draws for it.
+        let one = |c: &str, faces: &[&Face]| {
+            let mut img = white(60, 60);
+            draw_text(
+                &mut img,
+                [0, 0, 60, 60],
+                c,
+                BLACK,
+                faces,
+                TextSize::Px(40.0),
+            );
+            img
+        };
+        let (han, geul) = (one("한", &[hangul]), one("글", &[hangul]));
+        assert_ne!(han, geul);
+        assert_ne!(han, one("한", &[fonts::fallback()]));
+    }
+
+    /// Composing keeps what is already composed, composes what is not, and ends a run of more
+    /// than 30 combining marks with a grapheme joiner (stream-safe) — never sooner.
+    #[test]
+    fn composing_is_nfc_with_runs_of_marks_cut_at_thirty() {
+        let nfc = |t: &str| composed(t).collect::<String>();
+        assert_eq!(nfc("한글 e\u{0301} ok"), "한글 é ok");
+        assert_eq!(nfc("\u{1112}\u{1161}\u{11AB}"), "한");
+        let marks = |n: usize| "\u{0316}".repeat(n);
+        assert_eq!(nfc(&format!("a{}", marks(30))), format!("a{}", marks(30)));
+        assert_eq!(
+            nfc(&format!("a{}", marks(61))),
+            format!("a{}\u{34F}{}\u{34F}{}", marks(30), marks(30), marks(1))
+        );
+    }
+
+    /// Korean copied from a macOS file name comes decomposed (NFD: 한 = ㅎ ㅏ ㄴ as conjoining
+    /// jamo); it is drawn as the syllables it spells, like the same text composed (NFC).
+    #[test]
+    fn decomposed_korean_is_drawn_as_its_syllables() {
+        let Some(hangul) = fonts::hangul() else {
+            eprintln!("skipping: no installed font with Hangul");
+            return;
+        };
+        let nfd = "\u{1112}\u{1161}\u{11AB}\u{1100}\u{1173}\u{11AF}";
+        let draw = |text: &str| {
+            let mut img = white(160, 80);
+            let drawn = draw_text(
+                &mut img,
+                [10, 10, 140, 60],
+                text,
+                BLACK,
+                &[hangul, fonts::fallback()],
+                TextSize::Fill,
+            );
+            (img, drawn)
+        };
+        let (composed, c) = draw("한글");
+        let (decomposed, d) = draw(nfd);
+        assert_eq!(c, d);
+        assert_same(&decomposed, &composed, "NFD 한글 against NFC 한글");
     }
 
     #[test]
@@ -897,40 +1127,211 @@ mod tests {
         assert_eq!(img.color(), image::ColorType::Rgba8);
     }
 
-    /// A paste far longer than the rectangle can show costs only what it shows: the lines
-    /// past its bottom are never laid out.
+    /// Characters the layout reads to draw `text` filling a 120×60 rectangle.
+    fn read_by_layout(text: &str) -> usize {
+        READ.with(|r| r.set(0));
+        let mut img = white(120, 60);
+        let rect = [0, 0, 120, 60];
+        draw_text(
+            &mut img,
+            rect,
+            text,
+            BLACK,
+            &[fonts::fallback()],
+            TextSize::Fill,
+        );
+        READ.with(|r| r.get())
+    }
+
+    /// A paste far longer than the rectangle can show costs only what it shows: the layout
+    /// reads as much of 2 MB as of 1 MB, a few thousand characters — for words, one endless
+    /// word, a character no font has, a zero-width mark and an invisible character alike.
     #[test]
-    fn a_huge_paste_is_drawn_into_a_small_rectangle() {
-        let before = white(120, 60);
-        // Words, and one endless word (a base64 blob) that breaks between letters.
-        for text in [
-            "lorem ipsum dolor sit amet ".repeat(20_000),
-            "QUJD".repeat(150_000),
+    fn layout_reads_only_what_the_rectangle_can_show() {
+        for (what, piece) in [
+            ("words", "lorem ipsum dolor sit amet "),
+            ("one endless word", "a"),
+            ("a character no font has", "\u{10FFFD}"),
+            ("a zero-width mark", "\u{0301}"),
+            ("a letter whose decomposition is marks", "\u{0F73}"),
+            (
+                "a letter, then marks",
+                &format!("e{}", "\u{0301}".repeat(4096)),
+            ),
+            ("an invisible character", "\u{200B}"),
         ] {
+            let mb = |n: usize| piece.repeat((n << 20) / piece.len());
+            let one = read_by_layout(&mb(1));
+            let two = read_by_layout(&mb(2));
+            assert_eq!(one, two, "{what}: reads more of 2 MB than of 1 MB");
+            assert!(one < 100_000, "{what}: read {one} characters");
+        }
+    }
+
+    /// A character no font has takes room (the first face's missing-glyph box), so it wraps
+    /// like a letter and is counted.
+    #[test]
+    fn a_character_no_font_has_takes_room_and_is_counted() {
+        let before = white(200, 200);
+        let mut img = before.clone();
+        let drawn = draw_text(
+            &mut img,
+            [0, 0, 200, 200],
+            &"\u{10FFFD}".repeat(40),
+            BLACK,
+            &[fonts::fallback()],
+            TextSize::Px(20.0),
+        );
+        assert!(
+            drawn.area[3] > 20,
+            "wrapped onto several lines: {:?}",
+            drawn.area
+        );
+        assert!(
+            drawn.missing > 0 && drawn.missing <= 40,
+            "{}",
+            drawn.missing
+        );
+    }
+
+    /// A rectangle that runs past the image's right or bottom edge: what lands is what a larger
+    /// canvas shows, cut to the image — text is laid out for the whole rectangle and each row of
+    /// it lands on its own row.
+    #[test]
+    fn edits_past_the_image_edge_match_a_larger_canvas_cut_down() {
+        let words = "one two three four five six seven";
+        for rect in [[80, 10, 100, 40], [10, 30, 60, 80], [90, 40, 80, 60]] {
+            let (mut small, mut big) = (white(120, 60), white(240, 160));
+            for img in [&mut small, &mut big] {
+                draw_text(
+                    img,
+                    rect,
+                    words,
+                    BLACK,
+                    &[fonts::fallback()],
+                    TextSize::Fill,
+                );
+            }
+            assert_same(
+                &small,
+                &big.crop_imm(0, 0, 120, 60),
+                &format!("text in {rect:?}"),
+            );
+            for fit in [Fit::Stretch, Fit::Fit, Fit::OneToOne] {
+                let (mut small, mut big) = (coordinates(120, 60), coordinates(240, 160));
+                let picture = halves(70, 50);
+                let a = place(&mut small, rect, &picture, fit, WHITE);
+                let b = place(&mut big, rect, &picture, fit, WHITE);
+                assert_eq!(a, b, "{fit:?} in {rect:?}");
+                let what = format!("{fit:?} in {rect:?}");
+                assert_same(&small, &big.crop_imm(0, 0, 120, 60), &what);
+            }
+            let (mut small, mut big) = (coordinates(120, 60), coordinates(240, 160));
+            fill(&mut small, rect, BLACK);
+            fill(&mut big, rect, BLACK);
+            assert_same(
+                &small,
+                &big.crop_imm(0, 0, 120, 60),
+                &format!("fill {rect:?}"),
+            );
+        }
+    }
+
+    /// A rectangle with no width or no height, or a picture with none, changes nothing (the
+    /// window never asks for one: see `Doc`'s tests).
+    #[test]
+    fn an_empty_rectangle_or_picture_changes_nothing() {
+        let before = coordinates(20, 10);
+        let fits = [Fit::Fit, Fit::Stretch, Fit::OneToOne];
+        for rect in [[3, 2, 0, 5], [3, 2, 5, 0]] {
+            for fit in fits {
+                let mut img = before.clone();
+                let at = place(&mut img, rect, &halves(4, 2), fit, BLACK);
+                assert_eq!(at, [3, 2, 0, 0], "{fit:?} into {rect:?}");
+                assert_same(&img, &before, &format!("{fit:?} into {rect:?}"));
+            }
             let mut img = before.clone();
-            let started = std::time::Instant::now();
+            fill(&mut img, rect, BLACK);
+            assert_same(&img, &before, &format!("fill {rect:?}"));
             let drawn = draw_text(
                 &mut img,
-                [0, 0, 120, 60],
-                &text,
+                rect,
+                "x",
                 BLACK,
                 &[fonts::fallback()],
                 TextSize::Fill,
             );
-            assert!(!changed(&img, &before).is_empty());
-            assert!(
-                drawn.area[2] <= 120 && drawn.area[3] <= 60,
-                "{:?}",
-                drawn.area
+            assert_eq!(
+                drawn,
+                Drawn {
+                    area: [3, 2, 0, 0],
+                    missing: 0
+                },
+                "text {rect:?}"
             );
-            // Laying out every line took 5.8 s here (debug build); bounded, it takes 0.2 s.
+            assert_same(&img, &before, &format!("text {rect:?}"));
+        }
+        for picture in [RgbaImage::new(0, 3), RgbaImage::new(3, 0)] {
+            for fit in fits {
+                let mut img = before.clone();
+                let at = place(&mut img, [1, 1, 6, 6], &picture, fit, BLACK);
+                assert_eq!(at, [1, 1, 0, 0], "{fit:?}: {:?}", picture.dimensions());
+                let what = format!("{fit:?}: {:?}", picture.dimensions());
+                assert_same(&img, &before, &what);
+            }
+        }
+    }
+
+    /// Resampling a picture with transparency blends in premultiplied alpha: between opaque
+    /// red and fully transparent, a pixel is red with partial alpha — never darkened towards
+    /// the transparent pixels' black, as blending straight RGBA would. Laid over opaque white,
+    /// it then mixes by that alpha.
+    #[test]
+    fn a_resized_translucent_picture_keeps_its_colour_at_the_edge() {
+        let picture = RgbaImage::from_vec(2, 1, vec![255, 0, 0, 255, 0, 0, 0, 0]).unwrap();
+        let mut clear = DynamicImage::ImageRgba8(RgbaImage::new(8, 1));
+        place(&mut clear, [0, 0, 8, 1], &picture, Fit::Stretch, WHITE);
+        let edge = (0..8)
+            .map(|x| clear.get_pixel(x, 0).0)
+            .find(|p| p[3] > 10 && p[3] < 245)
+            .expect("a partly transparent pixel between the two");
+        assert!(
+            edge[0] >= 254 && edge[1] <= 1 && edge[2] <= 1,
+            "red, not darkened: {edge:?}"
+        );
+        let mut white_img = white(8, 1);
+        place(&mut white_img, [0, 0, 8, 1], &picture, Fit::Stretch, WHITE);
+        for x in 0..8 {
+            let a = f64::from(clear.get_pixel(x, 0).0[3]) / 255.0;
+            let want = (255.0 * (1.0 - a)).round();
+            let got = f64::from(white_img.get_pixel(x, 0).0[1]);
             assert!(
-                started.elapsed() < std::time::Duration::from_secs(10),
-                "{} chars took {:?}",
-                text.len(),
-                started.elapsed()
+                (got - want).abs() <= 1.0,
+                "x={x}: green {got}, alpha {a} wants {want}"
             );
         }
+    }
+
+    /// Half-transparent paint over a 16-bit image mixes at 16-bit precision.
+    #[test]
+    fn half_transparent_paint_mixes_into_sixteen_bits() {
+        let dst = [1000u16, 30000, 65535];
+        let mut img = DynamicImage::ImageRgb16(ImageBuffer::from_pixel(3, 1, Rgb(dst)));
+        let paint = RgbaImage::from_pixel(1, 1, Rgba([255, 0, 0, 128]));
+        place(&mut img, [1, 0, 1, 1], &paint, Fit::Stretch, WHITE);
+        let DynamicImage::ImageRgb16(buf) = &img else {
+            panic!("variant changed")
+        };
+        let a = 128.0 / 255.0;
+        let want = [65535.0, 0.0, 0.0].map(|s: f64| s * a);
+        for (i, (got, d)) in buf.get_pixel(1, 0).0.iter().zip(dst).enumerate() {
+            let want = want[i] + f64::from(d) * (1.0 - a);
+            assert!(
+                (f64::from(*got) - want).abs() <= 2.0,
+                "channel {i}: {got} vs {want}"
+            );
+        }
+        assert_eq!(buf.get_pixel(0, 0).0, dst, "beside it: untouched");
     }
 
     #[test]
