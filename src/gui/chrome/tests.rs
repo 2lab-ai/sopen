@@ -516,3 +516,31 @@ fn fit_start_and_fit_left_with_system_fonts() {
     assert_eq!(fit_start(&drv.ctx, "ab한", &f, room), "ab…");
     sweep(&drv, WIDE_NAMES);
 }
+
+/// The title row's clock asks for a repaint when the minute turns: a minute away at its start
+/// (where the test kit's driver puts the time), a second away in its last second. Tests that
+/// watch repaint delays must count their own requests (see `text::follows`), not delays.
+#[test]
+fn the_clock_asks_for_a_repaint_when_the_minute_turns() {
+    use crate::gui::testkit::START_OF_A_MINUTE;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+    let asked = |at: Option<i64>| {
+        let mut drv = Driver::new(640.0, 400.0);
+        if at.is_some() {
+            set_test_now(at);
+        }
+        let delays = Arc::new(Mutex::new(Vec::new()));
+        let seen = delays.clone();
+        drv.ctx
+            .set_repaint_observer(move |info| seen.lock().unwrap().push(info.delay));
+        drv.idle(&mut Parts { active: true }, 1);
+        let delays = delays.lock().unwrap().clone();
+        delays
+    };
+    let start = asked(None);
+    assert!(start.contains(&Duration::from_secs(60)), "{start:?}");
+    assert!(!start.contains(&Duration::from_secs(1)), "{start:?}");
+    let last = asked(Some(START_OF_A_MINUTE + 59));
+    assert!(last.contains(&Duration::from_secs(1)), "{last:?}");
+}

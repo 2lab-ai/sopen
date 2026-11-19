@@ -1332,23 +1332,18 @@ fn a_running_save_is_not_cut_off() {
 }
 
 /// A text file read in place is followed at its end (the viewer asks to look again each
-/// second); a copy fetched from a host is not.
+/// second); a copy fetched from a host is not. Counted at the viewer's own follow request, not
+/// by repaint delays: with the title row's clock in a minute's last second it asks for a repaint
+/// a second away too (the preview build's failure at :59).
 #[test]
 fn only_a_local_text_file_is_followed() {
     for (label, followed) in [(None, true), (Some("box"), false)] {
         let mut fx = fixture_with(label, local_connect(), None);
+        crate::gui::chrome::set_test_now(Some(crate::gui::testkit::START_OF_A_MINUTE + 59));
         fx.open("notes.txt");
-        let asked = Arc::new(Mutex::new(Vec::new()));
-        let seen = asked.clone();
-        fx.drv
-            .ctx
-            .set_repaint_observer(move |info| seen.lock().unwrap().push(info.delay));
+        let before = crate::gui::text::follows();
         fx.drv.idle(&mut fx.b, 1);
-        let second = asked
-            .lock()
-            .unwrap()
-            .iter()
-            .any(|d| *d == std::time::Duration::from_secs(1));
-        assert_eq!(second, followed, "{label:?}");
+        let asked = crate::gui::text::follows() > before;
+        assert_eq!(asked, followed, "{label:?}");
     }
 }
