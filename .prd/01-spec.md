@@ -189,23 +189,43 @@ replaces that module alone.
   page plain, ready, with the reason on the status row. A line is parsed only whole, so
   highlighting stops at the first line over 4096 bytes (the status row says which) and the rest
   is plain; files over 16 MiB are shown plain. The file is read live, the index is of the file as
-  opened, checked when the viewer opens and before each page: the open handle and the path it was
-  opened by must still show the indexed device, inode, size and modification time. Any
-  difference — written to, grown (a log being written to), truncated, another file renamed over
-  the path by an editor's save — and the file is never read through the old index: it is indexed
-  again from its path, on a worker (stopped by Esc or closing the window), while the page on
-  screen stays shown with "re-reading the file…" and scrolling waits. At most one re-read runs,
-  and the next starts no sooner than max(1 s, 4 × the last index pass) after the previous ended
-  (until then "the file changed; re-reading it in a moment…"); a file that changed before
-  anything was shown is re-read at once. The new index replaces the old one with a fresh start
-  for highlighting; the viewer keeps its top line (clamped), or follows the new end if it was at
-  the end ("the file grew; following the end", like `tail -f`; else "the file changed; re-read").
-  A path that names nothing any more keeps the last page with "the file was deleted" and reads no
-  more. A remote file is viewed from its cached copy, which does not change under the viewer. A
-  write that lands between a change and its detection cannot make a read run away: a line is
-  never read past where the index says it must end — the next mark, or 64 KiB past its own
-  block's mark when the next line was no mark — and one that does not end there starts the same
-  re-read. Offsets from the index are always checked.
+  scanned, checked when the viewer opens and before each page against the open handle and the
+  path it was opened by. Both still showing the indexed device, inode, size and modification
+  time: unchanged. Both still showing the indexed device and inode, the scan having read every
+  byte the file had when it started, and both no shorter than that (modification time may
+  differ): only grown — a log being written to — and the index still describes the bytes as
+  scanned, so pages are read through it (reads stay bounded, below) while a re-read is due. Any
+  other difference — truncated, another file renamed over the path by an editor's save, a shrink
+  the scan met — and the file is never read through the old index. A due re-read indexes the
+  file again from its path, on a worker (stopped by Esc or closing the window), while the page on
+  screen stays shown with "re-reading the file…" and scrolling (keys and wheel) waits. A change
+  the highlighting worker finds starts that re-read, or schedules it, in the same frame. At most
+  one re-read runs, and the next starts no sooner than max(1 s, 4 × the last index pass) after
+  the previous ended (until then "the file changed; re-reading it in a moment…"), whether it
+  succeeded, failed or was overtaken, and whether a page is shown or not; only a viewer's very
+  first attempt, with nothing shown yet, starts at once. A just-built index — the one the viewer
+  opens with, and each re-read's — is used when the file is unchanged or only grown since its
+  pass started, checked on the worker right after the pass and again when the viewer takes the
+  result; a fresh index is used while the file only grows; any other change is picked up by the
+  next re-read, at most one re-read period later (an index taken while the file grew is never
+  unchanged against it, so the next re-read is always scheduled). A shrink, another inode or a
+  vanished path during the pass: the index is not used, the page on screen stays, nothing is
+  read through the old index either (scrolling waits; the file may look grown to it), and the
+  next pass waits as above (a vanished path: "the file was deleted"). Even a used index replaces
+  the page on screen only with a page read through it, so a change landing first also leaves
+  the last page up. The new index starts highlighting afresh; the viewer keeps its top line
+  (clamped), or follows the new end if it was at the end ("the file grew; following the end",
+  like `tail -f`; else "the file changed; re-read"). A local file viewed at its end is looked at
+  again each second with no input (one stat), so a growing log is followed without a key press —
+  also one written to without pause (each re-read is used though the file grew during it); away
+  from the end it is looked at only on the next frame. A path that names nothing any more keeps
+  the last page with "the file was deleted" and reads no more. A remote file is viewed from its
+  cached copy, which does not change under the viewer and is not followed. A write that lands
+  between a change and its detection, or one that only looks like growth (written in place, no
+  shorter), cannot make a read run away: a line is never read past where the index says it must
+  end — the next mark, or 64 KiB past its own block's mark when the next line was no mark — and
+  one that does not end there makes the index unusable and starts a re-read. Offsets from the
+  index are always checked.
 - **Leaving a viewer** — Esc or F3 (when the viewer does not use Esc itself: the image and media
   windows' Esc first clears a drawn rectangle; an Esc that takes the keyboard from a text field
   is the field's), or closing the window — goes through that viewer's own close question: its

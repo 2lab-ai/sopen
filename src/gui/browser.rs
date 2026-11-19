@@ -485,7 +485,11 @@ impl Browser {
                 doc,
                 notices,
                 claim,
-            } => (super::text::embed(doc, title, &name, notices), claim),
+            } => {
+                // A file read in place (no fetched copy) is followed at its end.
+                let live = claim.is_none();
+                (super::text::embed(doc, title, &name, notices, live), claim)
+            }
         };
         // The list gave up the keyboard: the viewer's keys are its own now.
         ctx.memory_mut(|m| m.surrender_focus(list_id()));

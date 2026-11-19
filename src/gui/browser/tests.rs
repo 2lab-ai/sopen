@@ -1080,3 +1080,25 @@ fn a_running_save_is_not_cut_off() {
         "the original was backed up first"
     );
 }
+
+/// A text file read in place is followed at its end (the viewer asks to look again each
+/// second); a copy fetched from a host is not.
+#[test]
+fn only_a_local_text_file_is_followed() {
+    for (label, followed) in [(None, true), (Some("box"), false)] {
+        let mut fx = fixture_with(label, local_connect(), None);
+        fx.open("notes.txt");
+        let asked = Arc::new(Mutex::new(Vec::new()));
+        let seen = asked.clone();
+        fx.drv
+            .ctx
+            .set_repaint_observer(move |info| seen.lock().unwrap().push(info.delay));
+        fx.drv.idle(&mut fx.b, 1);
+        let second = asked
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|d| *d == std::time::Duration::from_secs(1));
+        assert_eq!(second, followed, "{label:?}");
+    }
+}

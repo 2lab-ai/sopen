@@ -85,6 +85,8 @@ pub struct TextDoc {
     opened: Identity,
     /// How long the index pass took (a re-read waits a multiple of it).
     indexed_in: std::time::Duration,
+    /// The file as found right after the pass ([`TextDoc::now`] then).
+    after_pass: Now,
     /// The path it was opened by (the local file, or the session's cached copy).
     path: std::path::PathBuf,
     /// Bytes read for lines (not the index pass) — what paging costs.
@@ -94,6 +96,11 @@ pub struct TextDoc {
     pub(crate) fail_worker_reads: bool,
     #[cfg(test)]
     fail_reads: bool,
+    /// Tests: the worker's copy reads `Stale` (the file changed under it).
+    #[cfg(test)]
+    pub(crate) stale_worker_reads: bool,
+    #[cfg(test)]
+    stale_reads: bool,
 }
 
 /// What [`TextDoc::changed`] compares: device, inode, size and modification time.
@@ -186,7 +193,7 @@ impl TextDoc {
         if last_byte.is_some() && !ends_newline {
             line += 1;
         }
-        Ok(Self {
+        let mut doc = Self {
             file,
             size,
             marks,
@@ -195,31 +202,65 @@ impl TextDoc {
             first_long,
             opened,
             indexed_in: started.elapsed(),
+            after_pass: Now::Same,
             path: path.to_path_buf(),
             page_reads: 0,
             #[cfg(test)]
             fail_worker_reads: false,
             #[cfg(test)]
             fail_reads: false,
-        })
+            #[cfg(test)]
+            stale_worker_reads: false,
+            #[cfg(test)]
+            stale_reads: false,
+        };
+        // Checked here, right after the pass (on the opener's or re-read's worker), as well as
+        // when the viewer takes the index: a change between the two is caught by one of them.
+        doc.after_pass = doc.now();
+        Ok(doc)
     }
 
     /// What the file is now, against the index: [`Now::Same`] only when the open handle and the
     /// path it was opened by (followed through links, as opened) both still show the indexed
     /// device, inode, size and modification time; [`Now::Gone`] when nothing is at the path
-    /// (deleted); anything else — written to, grown, truncated, another file renamed over the
-    /// path — [`Now::Changed`]. The viewer never reads a changed file through the old index: it
-    /// indexes the path again.
+    /// (deleted); [`Now::Grown`] when both still show the indexed device and inode, the scan read
+    /// every byte the file had as opened, and both are no shorter than that (appended to, or
+    /// written in place: the size cannot tell); anything else — truncated, another file renamed
+    /// over the path, a shrink met while scanning — [`Now::Changed`]. The viewer reads a grown
+    /// file through its index (bounded reads, [`Stale`] the net) and indexes it again soon; a
+    /// changed one is never read through it.
     pub fn now(&self) -> Now {
         let named = match std::fs::metadata(&self.path) {
             Ok(meta) => meta,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Now::Gone,
             Err(_) => return Now::Changed,
         };
+        let Ok(handle) = self.file.metadata() else {
+            return Now::Changed;
+        };
         let same = |m: &std::fs::Metadata| identity(m) == self.opened;
-        match self.file.metadata() {
-            Ok(handle) if same(&handle) && same(&named) => Now::Same,
-            _ => Now::Changed,
+        if same(&handle) && same(&named) {
+            return Now::Same;
+        }
+        let (dev, ino, len, _) = self.opened;
+        let grown = |m: &std::fs::Metadata| {
+            let (d, i, l, _) = identity(m);
+            d == dev && i == ino && l >= len
+        };
+        if self.size == len && grown(&handle) && grown(&named) {
+            Now::Grown
+        } else {
+            Now::Changed
+        }
+    }
+
+    /// [`TextDoc::now`], counting what the check right after the pass found too: a change seen
+    /// there (a shrink, another file) is not undone by the file looking grown later.
+    pub fn now_since_pass(&self) -> Now {
+        match (self.after_pass, self.now()) {
+            (_, Now::Gone) => Now::Gone,
+            (Now::Changed | Now::Gone, _) => Now::Changed,
+            (_, now) => now,
         }
     }
 
@@ -247,12 +288,17 @@ impl TextDoc {
             first_long: self.first_long,
             opened: self.opened,
             indexed_in: self.indexed_in,
+            after_pass: self.after_pass,
             path: self.path.clone(),
             page_reads: 0,
             #[cfg(test)]
             fail_worker_reads: false,
             #[cfg(test)]
             fail_reads: self.fail_worker_reads,
+            #[cfg(test)]
+            stale_worker_reads: false,
+            #[cfg(test)]
+            stale_reads: self.stale_worker_reads,
         })
     }
 
@@ -298,6 +344,10 @@ impl TextDoc {
         #[cfg(test)]
         if self.fail_reads {
             anyhow::bail!("an injected read error");
+        }
+        #[cfg(test)]
+        if self.stale_reads {
+            return Err(anyhow::Error::new(Stale));
         }
         let n = self.file.read_at(buf, at).context("cannot read the file")?;
         self.page_reads += n as u64;
@@ -386,6 +436,10 @@ impl TextDoc {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Now {
     Same,
+    /// Written to since, but only grown: the same file (device and inode, at the handle and the
+    /// path), every byte indexed still there as far as the size can tell, and no shorter than
+    /// them (a log being written to). The index still describes the bytes as it scanned them.
+    Grown,
     Changed,
     /// Nothing is at the path any more.
     Gone,
@@ -919,6 +973,9 @@ struct TextWindow {
     left: usize,
     wheel_rest: f32,
     page: Option<Page>,
+    /// The page on screen is from an index replaced since: it stays up until a page is read
+    /// through the new one.
+    stale_page: bool,
     /// Lines from open that must be read whole (where earlier copies' unsaved edits went).
     notices: Vec<String>,
     status: Status,
@@ -935,9 +992,17 @@ struct TextWindow {
     index_took: std::time::Duration,
     /// Re-reads started so far.
     reindexes: usize,
+    /// A local file (followed at its end); a remote one's cached copy is not.
+    live: bool,
     /// Called as a re-read's worker starts (tests: hold it).
     #[cfg(test)]
     reindex_hook: Option<Arc<dyn Fn() + Send + Sync>>,
+    /// Called after every chunk of a re-read's pass (tests: change the file during it).
+    #[cfg(test)]
+    reindex_chunk_hook: Option<Arc<dyn Fn() + Send + Sync>>,
+    /// Called right after a re-read's index is installed (tests: write to the file there).
+    #[cfg(test)]
+    after_install: Option<Box<dyn FnMut()>>,
 }
 
 /// A re-read of the file from its path, on a worker. Dropping it (the viewer gone) cancels it;
@@ -961,11 +1026,14 @@ impl Drop for Reindex {
 /// The shortest wait between the end of one index pass and the start of the next.
 const REINDEX_GAP: std::time::Duration = std::time::Duration::from_secs(1);
 
+/// How often a local file viewed at its end is looked at again.
+const FOLLOW_EVERY: std::time::Duration = std::time::Duration::from_secs(1);
+
 impl TextWindow {
     fn new(mut doc: TextDoc, title: String, name: &str, notices: Vec<String>) -> Self {
         // Changed since it was indexed (between the opener's worker and now): nothing is read
         // through that index; the first pass re-reads it.
-        let now = doc.now();
+        let now = doc.now_since_pass();
         let first = if now == Now::Same {
             doc.read_lines(0, 1)
                 .ok()
@@ -1009,13 +1077,19 @@ impl TextWindow {
             index_done: std::time::Instant::now(),
             index_took,
             reindexes: 0,
+            live: true,
             #[cfg(test)]
             reindex_hook: None,
+            #[cfg(test)]
+            reindex_chunk_hook: None,
+            #[cfg(test)]
+            after_install: None,
             top: 0,
             visible: 1,
             left: 0,
             wheel_rest: 0.0,
             page: None,
+            stale_page: false,
             notices,
             status,
             painted: false,
@@ -1034,14 +1108,16 @@ impl TextWindow {
     }
 
     /// The file differs from its index: a re-read starts now if the last pass is long enough
-    /// ago (or nothing is on screen yet), else a repaint is asked for when it will be.
+    /// ago, else a repaint is asked for when it will be. Only a viewer's very first attempt with
+    /// nothing ever shown starts at once; every later one waits (a page on screen or not).
     fn start_reindex(&mut self, ctx: &egui::Context) {
         if self.reindex.is_some() {
             return;
         }
         let now = (self.clock)();
         let due = self.next_pass_at();
-        if self.page.is_some() && now < due {
+        let first = self.reindexes == 0 && self.page.is_none();
+        if !first && now < due {
             self.status = Status::info("the file changed; re-reading it in a moment…");
             ctx.request_repaint_after(due - now);
             return;
@@ -1057,13 +1133,19 @@ impl TextWindow {
             ctx.clone(),
         );
         #[cfg(test)]
-        let hook = self.reindex_hook.clone();
+        let (hook, chunk_hook) = (self.reindex_hook.clone(), self.reindex_chunk_hook.clone());
         std::thread::spawn(move || {
             #[cfg(test)]
             if let Some(hook) = hook {
                 hook();
             }
-            let result = TextDoc::open_cancellable(&path, &stop);
+            let mut on_chunk = |_: u64| {
+                #[cfg(test)]
+                if let Some(hook) = &chunk_hook {
+                    hook();
+                }
+            };
+            let result = TextDoc::open_with(&path, &stop, &mut on_chunk);
             let _ = tx.send(result);
             ex.store(true, Ordering::Relaxed);
             waker.request_repaint();
@@ -1080,9 +1162,12 @@ impl TextWindow {
         });
     }
 
-    /// A re-read that landed: its index replaces the old one, with a fresh generation and a new
-    /// highlighter (next pass); the same top line (clamped), or the new end if the viewer was at
-    /// the end.
+    /// A re-read that landed: if the file is still as it read it, or only grown since (as the
+    /// worker found it right after the pass, and as it is now), its index replaces the old one,
+    /// with a fresh generation and a new highlighter (next pass); the same top line (clamped), or
+    /// the new end if the viewer was at the end. A file grown meanwhile is re-read again, no
+    /// sooner than the usual wait. Any other change meanwhile: the page on screen stays and the
+    /// next pass waits the usual time.
     fn poll_reindex(&mut self) {
         let Some(reindex) = &self.reindex else {
             return;
@@ -1095,13 +1180,31 @@ impl TextWindow {
         let at_end = reindex.at_end;
         self.reindex = None;
         self.index_done = (self.clock)();
+        let result = result.map(|doc| {
+            let now = doc.now_since_pass();
+            (doc, now)
+        });
         match result {
-            Ok(doc) => {
+            Ok((_, Now::Gone)) => {
+                self.waiting = false;
+                self.gone = true;
+                self.status = Status::error("the file was deleted");
+            }
+            Ok((doc, Now::Changed)) => {
+                // Overtaken by another change: not readable either, so the old page stays — and
+                // the old index is not read through either (the file may look grown to it).
+                self.index_took = doc.indexed_in;
+                self.waiting = true;
+                self.status = Status::info("the file changed again; re-reading it in a moment…");
+            }
+            Ok((doc, _)) => {
                 let grew = doc.size() > self.doc.size();
                 self.index_took = doc.indexed_in;
                 self.doc = doc;
                 self.waiting = false;
-                self.page = None;
+                // The old page stays up until one is read through the new index (a write
+                // landing first leaves it up).
+                self.stale_page = true;
                 self.worker = None;
                 self.hl_tried = false;
                 let last_top = self.doc.line_count().saturating_sub(self.visible);
@@ -1115,6 +1218,10 @@ impl TextWindow {
                 } else {
                     "the file changed; re-read"
                 });
+                #[cfg(test)]
+                if let Some(hook) = self.after_install.as_mut() {
+                    hook();
+                }
             }
             Err(_) if self.doc.now() == Now::Gone => {
                 self.waiting = false;
@@ -1165,13 +1272,18 @@ impl TextWindow {
     /// The page at `top`, read once and highlighted as soon as the states reach it.
     fn ensure_page(&mut self, ctx: &egui::Context, plain: Color32) {
         let (top, count) = (self.top, self.visible as usize);
-        let same = self
-            .page
-            .as_ref()
-            .is_some_and(|p| p.top == top && p.count == count);
+        let same = !self.stale_page
+            && self
+                .page
+                .as_ref()
+                .is_some_and(|p| p.top == top && p.count == count);
+        let mut due = false;
         if !self.frozen() {
-            match self.doc.now() {
+            match self.doc.now_since_pass() {
                 Now::Same => {}
+                // Only grown (a log being written): the index still describes the bytes it
+                // scanned, so the page is read through it; a re-read is due (after the read).
+                Now::Grown => due = true,
                 Now::Changed => self.waiting = true,
                 Now::Gone => {
                     self.gone = true;
@@ -1213,6 +1325,7 @@ impl TextWindow {
                     Vec::new()
                 }
             };
+            self.stale_page = false;
             let runs = lines
                 .iter()
                 .map(|l| expand_tabs(vec![(plain, l.text.clone())]))
@@ -1229,7 +1342,16 @@ impl TextWindow {
                 worker.ask(self.gen, top, count);
             }
         }
-        // What the worker finished meanwhile: the page on screen's lines replace its plain ones.
+        self.worker_results();
+        if (self.waiting || due) && self.reindex.is_none() {
+            // A change (also one the highlighter found): the re-read starts, or is scheduled,
+            // in this frame, not at the next input.
+            self.start_reindex(ctx);
+        }
+    }
+
+    /// What the worker finished meanwhile: the page on screen's lines replace its plain ones.
+    fn worker_results(&mut self) {
         let (Some(worker), Some(page)) = (self.worker.as_ref(), self.page.as_mut()) else {
             return;
         };
@@ -1268,7 +1390,6 @@ impl TextWindow {
                 self.status = Status::error(why);
             }
         }
-        let _ = ctx;
     }
 
     fn bar(&self, ui: &mut egui::Ui) {
@@ -1319,7 +1440,8 @@ impl TextWindow {
         let row_h = (text_h + 2.0).ceil();
         let lines = self.doc.line_count();
         self.visible = (((rect.height() - 4.0) / row_h).floor() as u64).max(1);
-        if ui.rect_contains_pointer(rect) {
+        // Scrolling waits for a re-read, as the keys do.
+        if ui.rect_contains_pointer(rect) && !self.waiting && self.reindex.is_none() {
             let mut rows = 0f32;
             ctx.input(|i| {
                 for event in &i.events {
@@ -1372,6 +1494,11 @@ impl TextWindow {
             }
         }
         self.ensure_page(&ctx, p.text);
+        if self.live && !self.frozen() && self.top.saturating_add(self.visible) >= lines {
+            // At the end of a local file: looked at again each second with no input (one stat),
+            // so a growing log is followed.
+            ctx.request_repaint_after(FOLLOW_EVERY);
+        }
         let painter = ui.painter_at(rect);
         painter.rect_filled(rect, 0.0, p.back);
         let digits = lines.max(1).to_string().len();
@@ -1451,10 +1578,19 @@ impl Window for TextWindow {
 }
 
 /// The text viewer inside another window (the file browser). `title` is `host:/abs`, `name` the
-/// file's name (it picks the syntax); `notices` are shown whole in its rows.
-pub fn embed(doc: TextDoc, title: String, name: &str, notices: Vec<String>) -> Embedded {
+/// file's name (it picks the syntax); `notices` are shown whole in its rows. `live`: the file is
+/// read in place (followed at its end), not a fetched copy.
+pub fn embed(
+    doc: TextDoc,
+    title: String,
+    name: &str,
+    notices: Vec<String>,
+    live: bool,
+) -> Embedded {
+    let mut window = TextWindow::new(doc, title, name, notices);
+    window.live = live;
     Embedded {
-        window: Box::new(TextWindow::new(doc, title, name, notices)),
+        window: Box::new(window),
         settle: Box::new(|_| Some(Outcome::default())),
     }
 }

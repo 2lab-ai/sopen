@@ -5,7 +5,7 @@
 use super::*;
 use crate::gui::chrome;
 use crate::gui::testkit::Driver;
-use eframe::egui::{Key, Modifiers};
+use eframe::egui::{Key, Modifiers, Pos2};
 use std::sync::Mutex;
 
 fn write(dir: &Path, name: &str, bytes: &[u8]) -> std::path::PathBuf {
@@ -352,7 +352,8 @@ fn a_line_cut_for_display_stops_highlighting_there() {
 }
 
 /// T3: the file changes under the viewer (it reads it live, a page at a time): grown,
-/// truncated, rewritten in place — any difference is a change. Reads never panic.
+/// truncated, rewritten in place — any difference is a change (grown or rewritten no shorter:
+/// `Grown`, re-read soon; truncated: `Changed`). Reads never panic.
 #[test]
 fn a_file_changed_after_it_was_indexed_never_panics_and_is_noticed() {
     let tmp = tempfile::tempdir().unwrap();
@@ -378,7 +379,12 @@ fn a_file_changed_after_it_was_indexed_never_panics_and_is_noticed() {
         }
         drop(f);
         assert!(doc.changed(), "{case}: noticed");
-        assert_eq!(doc.now(), Now::Changed);
+        let want = if case == "truncate" {
+            Now::Changed
+        } else {
+            Now::Grown
+        };
+        assert_eq!(doc.now(), want, "{case}");
         // Whatever the bytes now are, reading the old lines does not panic.
         let _ = doc.read_lines(0, 3);
         let _ = doc.read_lines(1, 5);
@@ -579,7 +585,8 @@ fn indexing_stops_when_cancelled() {
 }
 
 /// O3: a file that grows while it is indexed: the index covers the bytes it read as opened, the
-/// last line reads back whole, nothing panics, and the growth counts as a change.
+/// last line reads back whole, nothing panics, and the growth counts as a change (`Grown`: the
+/// index stays readable, a re-read is due).
 #[test]
 fn a_file_growing_while_it_is_indexed() {
     use std::io::Write as _;
@@ -604,8 +611,8 @@ fn a_file_growing_while_it_is_indexed() {
     let last = doc.read_lines(399_998, 5).unwrap();
     let texts: Vec<&str> = last.iter().map(|l| l.text.as_str()).collect();
     assert_eq!(texts, ["00399998", "00399999"]);
-    // Appended to while indexed: a difference, so a change (the viewer reads it again).
-    assert_eq!(doc.now(), Now::Changed);
+    // Appended to while indexed: only grown (the viewer reads it again soon).
+    assert_eq!(doc.now(), Now::Grown);
 }
 
 /// A viewer drawing from its own admission pool of `cap` (tests do not share the process's).
@@ -848,7 +855,8 @@ fn a_log_appended_while_viewed_at_its_end_follows_it() {
 }
 
 /// Two lines merged and more appended, then End: re-read, the lines are the new ones under
-/// their new numbers — never the old numbering over the new bytes.
+/// their new numbers. (Until then a merge plus an append looks like growth: a page may be read
+/// through the old index, bounded, for at most one re-read period.)
 #[test]
 fn a_merged_line_and_an_append_are_reread_with_the_new_lines() {
     use std::os::unix::fs::FileExt;
@@ -930,8 +938,8 @@ fn a_deleted_file_keeps_its_page() {
     assert!(win.ready() && win.reindex.is_none());
 }
 
-/// An append that lands between indexing and the window: the window re-reads at once (it has
-/// nothing on screen yet) and opens with every line.
+/// An append that lands between indexing and the window: the window opens at once with the lines
+/// indexed (the file only grew), then re-reads it after the usual wait with every line.
 #[test]
 fn an_append_racing_the_open_still_opens() {
     let tmp = tempfile::tempdir().unwrap();
@@ -939,7 +947,12 @@ fn an_append_racing_the_open_still_opens() {
     let doc = TextDoc::open(&path).unwrap();
     append(&path, "third\n");
     let mut win = TextWindow::new(doc, "race".into(), "race.log", vec![]);
+    let clock = on_clock(&mut win);
     let mut drv = Driver::new(600.0, 400.0);
+    drv.idle(&mut win, 1);
+    assert!(drv.find_text("second").is_some(), "shown at once");
+    assert_eq!(win.reindexes, 0, "re-read after the usual wait");
+    later(&clock, 1.1);
     reread(&mut drv, &mut win, 3);
     assert!(drv.find_text("first").is_some() && drv.find_text("third").is_some());
 }
@@ -1035,4 +1048,453 @@ fn esc_during_a_reread_cancels_it() {
         );
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
+}
+
+/// A re-read whose file grew again while it ran (before its result is taken) is installed: it
+/// describes the bytes as scanned. The growth is picked up by the next pass, no sooner than the
+/// usual wait.
+#[test]
+fn a_reread_overtaken_by_growth_is_installed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let body: String = (1..=50).map(|i| format!("row {i}\n")).collect();
+    let mut win = viewer(tmp.path(), "busy.log", &body);
+    let path = tmp.path().join("busy.log");
+    let clock = on_clock(&mut win);
+    let (reached, go) = held_rereads(&mut win);
+    let mut drv = Driver::new(600.0, 400.0);
+    drv.until(&mut win, 5, |w| w.ready());
+    append(&path, "row 51\n");
+    later(&clock, 2.0);
+    drv.idle(&mut win, 1);
+    reached
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .unwrap();
+    // The pass will index "row 51"; the file grows again before its result is taken.
+    go.send(()).unwrap();
+    let r = win.reindex.as_ref().unwrap().exited.clone();
+    while !r.load(Ordering::Relaxed) {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    append(&path, "row 52\n");
+    drv.idle(&mut win, 2);
+    assert_eq!(win.doc.line_count(), 51, "installed, as scanned");
+    assert!(drv.find_text("row 1").is_some(), "a page is shown");
+    assert_eq!(win.reindexes, 1, "the next pass waits the usual time");
+    later(&clock, 1.1);
+    drv.idle(&mut win, 1);
+    reached
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .unwrap();
+    assert_eq!(win.reindexes, 2);
+    go.send(()).unwrap();
+    drv.until(&mut win, 10, |w| {
+        w.reindex.is_none() && w.doc.line_count() == 52
+    });
+    drop(go);
+}
+
+/// L1: a viewer that never showed anything retries a failing first read with the usual delay,
+/// not at once every frame.
+#[test]
+fn repeated_initial_failures_are_throttled() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = write(tmp.path(), "flaky.log", b"one\n");
+    let doc = TextDoc::open(&path).unwrap();
+    append(&path, "two\n");
+    let mut win = TextWindow::new(doc, "f".into(), "flaky.log", vec![]);
+    let clock = on_clock(&mut win);
+    // Every re-read fails: the path is a folder by the time it runs.
+    std::fs::remove_file(&path).unwrap();
+    std::fs::create_dir(&path).unwrap();
+    let mut drv = Driver::new(600.0, 400.0);
+    drv.idle(&mut win, 1);
+    drv.until(&mut win, 5, |w| w.reindex.is_none() && w.reindexes == 1);
+    drv.idle(&mut win, 5);
+    assert_eq!(win.reindexes, 1, "no immediate retry: {}", win.status.text);
+    later(&clock, 1.1);
+    drv.idle(&mut win, 1);
+    assert_eq!(win.reindexes, 2, "retried after the usual wait");
+}
+
+/// L2: a change the highlighter finds (its read is `Stale`) starts the re-read — or schedules
+/// it — in the frame that hears of it, with no further input.
+#[test]
+fn a_change_found_by_the_highlighter_starts_the_reread() {
+    let tmp = tempfile::tempdir().unwrap();
+    // Long enough not to be at its end (no follow repaints in the way).
+    let body = "fn main() {}\n".repeat(500);
+    let mut win = viewer(tmp.path(), "hl.rs", &body);
+    win.doc.stale_worker_reads = true;
+    let clock = on_clock(&mut win);
+    later(&clock, 2.0);
+    let mut drv = Driver::new(600.0, 400.0);
+    drv.until(&mut win, 5, |w| w.waiting || w.reindexes > 0);
+    assert_eq!(
+        win.reindexes, 1,
+        "started in the frame that heard of the change"
+    );
+}
+
+/// L2: before the deadline, the frame that hears of the change from the highlighter asks for a
+/// repaint when the re-read is due (no further input or frames needed).
+#[test]
+fn a_change_found_by_the_highlighter_schedules_the_reread() {
+    let tmp = tempfile::tempdir().unwrap();
+    // Long enough not to be at its end (no follow repaints in the way).
+    let body = "fn main() {}\n".repeat(500);
+    let mut win = viewer(tmp.path(), "hl2.rs", &body);
+    win.doc.stale_worker_reads = true;
+    let _clock = on_clock(&mut win);
+    let mut drv = Driver::new(600.0, 400.0);
+    let asked = Arc::new(Mutex::new(Vec::new()));
+    let seen = asked.clone();
+    drv.ctx
+        .set_repaint_observer(move |info| seen.lock().unwrap().push(info.delay));
+    drv.until(&mut win, 5, |w| w.waiting);
+    assert_eq!(win.reindexes, 0);
+    let delays = asked.lock().unwrap().clone();
+    assert!(
+        delays
+            .iter()
+            .any(|d| *d > std::time::Duration::from_millis(500)
+                && *d <= std::time::Duration::from_secs(1)),
+        "a repaint at the deadline: {delays:?}"
+    );
+}
+
+/// L3: the wheel does not scroll while a re-read is under way, as the keys do not.
+#[test]
+fn the_wheel_waits_during_a_reread() {
+    let tmp = tempfile::tempdir().unwrap();
+    let body: String = (1..=500).map(|i| format!("row {i}\n")).collect();
+    let mut win = viewer(tmp.path(), "wheel.log", &body);
+    let clock = on_clock(&mut win);
+    let (reached, go) = held_rereads(&mut win);
+    let mut drv = Driver::new(600.0, 400.0);
+    drv.until(&mut win, 5, |w| w.ready());
+    append(&tmp.path().join("wheel.log"), "row 501\n");
+    later(&clock, 2.0);
+    drv.idle(&mut win, 1);
+    reached
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .unwrap();
+    drv.wheel(&mut win, Pos2::new(300.0, 200.0), -10.0);
+    assert_eq!(win.top, 0, "the wheel waited");
+    drop(go);
+}
+
+/// L4: a local file viewed at its end is checked again about every second with no input (a
+/// growing log is followed); away from the end, or for a remote copy, it is not.
+#[test]
+fn a_viewer_at_the_end_checks_again_every_second() {
+    let tmp = tempfile::tempdir().unwrap();
+    let body: String = (1..=500).map(|i| format!("row {i}\n")).collect();
+    let mut win = viewer(tmp.path(), "tail.log", &body);
+    let mut drv = Driver::new(600.0, 400.0);
+    drv.until(&mut win, 5, |w| w.ready());
+    let asked = Arc::new(Mutex::new(Vec::new()));
+    let seen = asked.clone();
+    drv.ctx
+        .set_repaint_observer(move |info| seen.lock().unwrap().push(info.delay));
+    let second = |a: &Arc<Mutex<Vec<std::time::Duration>>>| {
+        a.lock()
+            .unwrap()
+            .iter()
+            .any(|d| *d == std::time::Duration::from_secs(1))
+    };
+    drv.idle(&mut win, 1);
+    assert!(!second(&asked), "not at the end: no follow");
+    drv.key(&mut win, Key::End, Modifiers::NONE);
+    asked.lock().unwrap().clear();
+    drv.idle(&mut win, 1);
+    assert!(second(&asked), "at the end: the next check is asked for");
+    win.live = false;
+    asked.lock().unwrap().clear();
+    drv.idle(&mut win, 1);
+    assert!(!second(&asked), "a remote copy is not followed");
+}
+
+/// L1: a change other than growth (here a shrink) landing right after a re-read is installed,
+/// before its first page is read through it, keeps the last page up (it is not blanked) and the
+/// next pass waits as usual.
+#[test]
+fn a_change_right_after_a_reread_lands_keeps_the_page() {
+    let tmp = tempfile::tempdir().unwrap();
+    let body: String = (1..=50).map(|i| format!("row {i}\n")).collect();
+    let mut win = viewer(tmp.path(), "busy.log", &body);
+    let path = tmp.path().join("busy.log");
+    let clock = on_clock(&mut win);
+    let (reached, go) = held_rereads(&mut win);
+    let mut drv = Driver::new(600.0, 400.0);
+    drv.until(&mut win, 5, |w| w.ready());
+    append(&path, "row 51\n");
+    later(&clock, 2.0);
+    drv.idle(&mut win, 1);
+    reached
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .unwrap();
+    let again = path.clone();
+    win.after_install = Some(Box::new(move || {
+        let f = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&again)
+            .unwrap();
+        f.set_len(20).unwrap();
+    }));
+    go.send(()).unwrap();
+    drv.until(&mut win, 5, |w| {
+        w.reindex.is_none() && w.doc.line_count() == 51
+    });
+    drv.idle(&mut win, 2);
+    assert!(drv.find_text("row 1").is_some(), "the last page stays up");
+    assert_eq!(win.reindexes, 1, "the next pass waits the usual time");
+    later(&clock, 1.1);
+    drv.idle(&mut win, 1);
+    reached
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .unwrap();
+    assert_eq!(win.reindexes, 2);
+    drop(go);
+}
+
+/// A log written every millisecond (real time), opened while it is written: a page is shown at
+/// once (through the index the opener built), and at its end the viewer shows the log growing —
+/// each re-read installed though the file never stops growing — with no more passes than the
+/// throttle allows.
+#[test]
+fn a_busy_log_shows_a_page_at_once_and_follows_it() {
+    use std::sync::atomic::AtomicBool;
+    let tmp = tempfile::tempdir().unwrap();
+    let body: String = (1..=2000).map(|i| format!("row {i}\n")).collect();
+    let path = write(tmp.path(), "busy.log", body.as_bytes());
+    let doc = TextDoc::open(&path).unwrap();
+    let stop = Arc::new(AtomicBool::new(false));
+    let (st, p) = (stop.clone(), path.clone());
+    let writer = std::thread::spawn(move || {
+        let mut n = 0u64;
+        while !st.load(Ordering::Relaxed) {
+            append(&p, &format!("more {n}\n"));
+            n += 1;
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    });
+    // Written to between the opener's index and the window (the browser's open).
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    let mut win = TextWindow::new(doc, "busy".into(), "busy.log", vec![]);
+    let opened = std::time::Instant::now();
+    let mut drv = Driver::new(600.0, 400.0);
+    drv.until(&mut win, 1, |w| {
+        w.page.as_ref().is_some_and(|p| !p.runs.is_empty())
+    });
+    assert!(
+        drv.find_text("row 1").is_some(),
+        "a page within the first second"
+    );
+    drv.key(&mut win, Key::End, Modifiers::NONE);
+    let mut installs = 0;
+    let mut lines = win.doc.line_count();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+    while installs < 2 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{installs} installs in {} passes: {}",
+            win.reindexes,
+            win.status.text
+        );
+        drv.idle(&mut win, 1);
+        if win.doc.line_count() > lines {
+            installs += 1;
+            lines = win.doc.line_count();
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    drv.idle(&mut win, 1);
+    let elapsed = opened.elapsed().as_secs_f64();
+    stop.store(true, Ordering::Relaxed);
+    writer.join().unwrap();
+    assert!(
+        drv.text_starting_with("more ").is_some(),
+        "the end shows the appended lines"
+    );
+    assert!(
+        (win.reindexes as f64) <= elapsed + 1.0,
+        "{} passes in {elapsed:.1} s",
+        win.reindexes
+    );
+}
+
+/// What counts as only grown: the same file at the handle and the path, no byte indexed gone
+/// as far as the size can tell. Anything else is a change; a missing path is gone.
+#[test]
+fn now_tells_growth_from_other_changes() {
+    use std::os::unix::fs::FileExt;
+    use std::sync::atomic::AtomicBool;
+    let tmp = tempfile::tempdir().unwrap();
+    let body = "abc\ndef\n";
+    let fresh = |name: &str| {
+        let path = write(tmp.path(), name, body.as_bytes());
+        (TextDoc::open(&path).unwrap(), path)
+    };
+    let (doc, path) = fresh("grow.txt");
+    append(&path, "ghi\n");
+    assert_eq!(doc.now(), Now::Grown, "appended");
+    let (doc, path) = fresh("same.txt");
+    std::thread::sleep(std::time::Duration::from_millis(10));
+    let f = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+    f.write_all_at(b"x", 0).unwrap();
+    assert_eq!(doc.now(), Now::Grown, "written in place, no shorter");
+    let (doc, path) = fresh("shrink.txt");
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_len(3)
+        .unwrap();
+    assert_eq!(doc.now(), Now::Changed, "shorter");
+    let (doc, path) = fresh("swap.txt");
+    let other = write(tmp.path(), ".swap.tmp", format!("{body}more\n").as_bytes());
+    std::fs::rename(&other, &path).unwrap();
+    assert_eq!(doc.now(), Now::Changed, "another file at the path, longer");
+    let (doc, path) = fresh("gone.txt");
+    std::fs::remove_file(&path).unwrap();
+    assert_eq!(doc.now(), Now::Gone);
+    // A scan that met a shrink (it read fewer bytes than it opened with) is a change even once
+    // the file is as long again.
+    let big: String = (0..300_000u32).map(|i| format!("{i:07}\n")).collect();
+    let path = write(tmp.path(), "cut.log", big.as_bytes());
+    let mut cut = false;
+    let doc = TextDoc::open_with(&path, &AtomicBool::new(false), &mut |_| {
+        if !cut {
+            cut = true;
+            let f = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+            f.set_len(1 << 20).unwrap();
+        }
+    })
+    .unwrap();
+    assert!(doc.size() < big.len() as u64);
+    append(&path, &big);
+    assert_eq!(doc.now(), Now::Changed, "a shrink met while scanning");
+}
+
+/// Runs `change` once, during the next re-read's pass (after its first chunk).
+fn during_the_pass(win: &mut TextWindow, change: impl Fn() + Send + Sync + 'static) {
+    let once = AtomicBool::new(false);
+    win.reindex_chunk_hook = Some(Arc::new(move || {
+        if !once.swap(true, Ordering::Relaxed) {
+            change();
+        }
+    }));
+}
+
+/// Starts a re-read of the changed file and waits until its worker is done (its result not
+/// taken yet).
+fn pass_done(drv: &mut Driver, win: &mut TextWindow, clock: &Arc<Mutex<std::time::Instant>>) {
+    later(clock, 2.0);
+    drv.idle(win, 1);
+    let exited = win.reindex.as_ref().expect("a re-read runs").exited.clone();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !exited.load(Ordering::Relaxed) {
+        assert!(std::time::Instant::now() < deadline, "the pass never ended");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
+/// A shrink during a re-read's pass: its index is not installed, the page on screen stays and
+/// the next pass waits the usual time — also when the file is as long again by the time the
+/// result is taken (the worker's own check, right after the pass, saw the shrink).
+#[test]
+fn a_shrink_during_a_reread_is_not_installed() {
+    for regrown in [false, true] {
+        let tmp = tempfile::tempdir().unwrap();
+        let body: String = (1..=50).map(|i| format!("row {i}\n")).collect();
+        let mut win = viewer(tmp.path(), "cut.log", &body);
+        let path = tmp.path().join("cut.log");
+        let clock = on_clock(&mut win);
+        let mut drv = Driver::new(600.0, 400.0);
+        drv.until(&mut win, 5, |w| w.ready());
+        append(&path, "row 51\n");
+        let p = path.clone();
+        during_the_pass(&mut win, move || {
+            let f = std::fs::OpenOptions::new().write(true).open(&p).unwrap();
+            f.set_len(20).unwrap();
+        });
+        pass_done(&mut drv, &mut win, &clock);
+        if regrown {
+            // As long again, in lines: the old index would look grown.
+            let more: String = (1..=80).map(|i| format!("new {i}\n")).collect();
+            append(&path, &more);
+        }
+        drv.idle(&mut win, 2);
+        assert_eq!(win.doc.line_count(), 50, "regrown {regrown}: not installed");
+        assert!(
+            drv.find_text("row 1").is_some(),
+            "regrown {regrown}: page kept"
+        );
+        // What the pass learned stands: nothing is read through the old index meanwhile.
+        drv.key(&mut win, Key::PageDown, Modifiers::NONE);
+        assert_eq!(win.top, 0, "regrown {regrown}: scrolling waits");
+        assert!(
+            drv.find_text("row 1").is_some(),
+            "regrown {regrown}: page kept after a key"
+        );
+        assert_eq!(win.reindexes, 1, "regrown {regrown}: the next pass waits");
+        later(&clock, 1.1);
+        drv.idle(&mut win, 1);
+        assert_eq!(win.reindexes, 2, "regrown {regrown}: then it runs");
+    }
+}
+
+/// Another file renamed over the path during a re-read's pass (an editor's save): the pass's
+/// index (of the old file) is not installed; the next pass, after the usual wait, shows the new
+/// file.
+#[test]
+fn an_inode_swap_during_a_reread_is_not_installed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let body: String = (1..=50).map(|i| format!("row {i}\n")).collect();
+    let mut win = viewer(tmp.path(), "saved.log", &body);
+    let path = tmp.path().join("saved.log");
+    let clock = on_clock(&mut win);
+    let mut drv = Driver::new(600.0, 400.0);
+    drv.until(&mut win, 5, |w| w.ready());
+    append(&path, "row 51\n");
+    let (dir, p) = (tmp.path().to_path_buf(), path.clone());
+    // Longer than the old file: only the inode tells them apart.
+    let anew: String = std::iter::once("saved anew\n".to_string())
+        .chain((1..=60).map(|i| format!("row {i}\n")))
+        .collect();
+    during_the_pass(&mut win, move || {
+        let fresh = write(&dir, ".saved.tmp", anew.as_bytes());
+        std::fs::rename(&fresh, &p).unwrap();
+    });
+    pass_done(&mut drv, &mut win, &clock);
+    drv.idle(&mut win, 2);
+    assert_eq!(win.doc.line_count(), 50, "not installed");
+    assert!(drv.find_text("row 1").is_some(), "page kept");
+    assert_eq!(win.reindexes, 1, "the next pass waits");
+    later(&clock, 1.1);
+    reread(&mut drv, &mut win, 61);
+    assert!(drv.find_text("saved anew").is_some());
+}
+
+/// The opener's index gets the same check right after its pass as a re-read's: a shrink there
+/// makes it unusable even once the file is as long again — the window reads nothing through it
+/// and indexes the file again.
+#[test]
+fn an_opening_index_whose_pass_met_a_shrink_is_not_read() {
+    use std::sync::atomic::AtomicBool;
+    let tmp = tempfile::tempdir().unwrap();
+    let body: String = (1..=50).map(|i| format!("row {i}\n")).collect();
+    let path = write(tmp.path(), "open.log", body.as_bytes());
+    let p = path.clone();
+    let doc = TextDoc::open_with(&path, &AtomicBool::new(false), &mut |_| {
+        let f = std::fs::OpenOptions::new().write(true).open(&p).unwrap();
+        f.set_len(20).unwrap();
+    })
+    .unwrap();
+    let more: String = (1..=80).map(|i| format!("new {i}\n")).collect();
+    append(&path, &more);
+    assert_eq!(doc.now(), Now::Grown, "it looks grown now");
+    let win = TextWindow::new(doc, "open".into(), "open.log", vec![]);
+    assert!(win.waiting, "not read through");
+    assert_eq!(win.doc.page_reads(), 0);
 }
