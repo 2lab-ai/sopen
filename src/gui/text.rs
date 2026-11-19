@@ -18,7 +18,8 @@
 //! [`HIGHLIGHT_MAX`] are always shown plain.
 //!
 //! The file is read live; the index is of the file as opened. A file that changes since then
-//! (size, modification time, inode) is noticed before each new page: the window says so and
+//! (size, modification time; or its path now names another file, or none) is noticed before each
+//! new page: the window says so and
 //! reads no more. Every offset taken from the index is checked, never trusted.
 
 use super::{chrome, Embedded, Outcome, Status, Window};
@@ -75,15 +76,19 @@ pub struct TextDoc {
     /// The first line longer than [`LINE_MAX`] bytes (0-based), if any.
     first_long: Option<u64>,
     /// The file as indexed: size, modification time and inode.
-    opened: (u64, Option<std::time::SystemTime>, u64),
+    opened: Identity,
+    /// The path it was opened by (the local file, or the session's cached copy).
+    path: std::path::PathBuf,
     /// Bytes read for lines (not the index pass) — what paging costs.
     page_reads: u64,
 }
 
-/// What [`TextDoc::changed`] compares.
-fn identity(meta: &std::fs::Metadata) -> (u64, Option<std::time::SystemTime>, u64) {
+/// What [`TextDoc::changed`] compares: device, inode, size and modification time.
+type Identity = (u64, u64, u64, Option<std::time::SystemTime>);
+
+fn identity(meta: &std::fs::Metadata) -> Identity {
     use std::os::unix::fs::MetadataExt;
-    (meta.len(), meta.modified().ok(), meta.ino())
+    (meta.dev(), meta.ino(), meta.len(), meta.modified().ok())
 }
 
 impl TextDoc {
@@ -148,14 +153,21 @@ impl TextDoc {
             ends_newline,
             first_long,
             opened,
+            path: path.to_path_buf(),
             page_reads: 0,
         })
     }
 
-    /// The file is not the one indexed any more: another size, modification time or inode
-    /// (or it cannot be stat'ed).
+    /// The file is not the one indexed any more. The handle is checked (written in place: another
+    /// size or modification time) and so is the path it was opened by, followed through links
+    /// as the open followed them: a save that writes a new file and renames it over this one, or
+    /// a delete, leaves the handle on the old file — another device or inode at the path, or
+    /// nothing there, is a change too.
     pub fn changed(&self) -> bool {
-        self.file.metadata().map(|m| identity(&m)).ok() != Some(self.opened)
+        let same = |meta: std::io::Result<std::fs::Metadata>| {
+            meta.is_ok_and(|m| identity(&m) == self.opened)
+        };
+        !same(self.file.metadata()) || !same(std::fs::metadata(&self.path))
     }
 
     pub fn line_count(&self) -> u64 {

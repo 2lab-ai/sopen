@@ -462,3 +462,32 @@ fn a_cut_line_keeps_bad_bytes_and_drops_only_a_real_half_character() {
     // A line that is not cut keeps everything.
     assert_eq!(shown(vec![b'a', 0xe2, 0x82], false).text, "a\u{FFFD}");
 }
+
+/// A save that writes a new file and renames it over the opened one (many editors do), or a
+/// delete, leaves the viewer's handle on the old file: the path is checked too, so both count
+/// as changed — also through a link the file was opened by.
+#[test]
+fn a_file_replaced_by_rename_or_deleted_counts_as_changed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = write(tmp.path(), "saved.txt", b"one\ntwo\n");
+    let doc = TextDoc::open(&path).unwrap();
+    assert!(!doc.changed());
+    let fresh = write(tmp.path(), ".saved.txt.tmp", b"one\ntwo\n");
+    std::fs::rename(&fresh, &path).unwrap();
+    assert!(doc.changed(), "replaced by a rename");
+
+    let doc = TextDoc::open(&path).unwrap();
+    assert!(!doc.changed());
+    std::fs::remove_file(&path).unwrap();
+    assert!(doc.changed(), "deleted");
+
+    // Opened through a link: the link's target is what is checked (and stays unchanged).
+    let target = write(tmp.path(), "target.txt", b"x\n");
+    let link = tmp.path().join("link.txt");
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    let doc = TextDoc::open(&link).unwrap();
+    assert!(!doc.changed(), "a link to the same file is not a change");
+    let other = write(tmp.path(), "other.txt", b"x\n");
+    std::fs::rename(&other, &target).unwrap();
+    assert!(doc.changed(), "the link's target was replaced");
+}

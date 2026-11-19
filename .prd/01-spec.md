@@ -180,8 +180,10 @@ replaces that module alone.
   frame goes on from there; a page is shown plain until it is reached. A line is parsed only whole, so
   highlighting stops at the first line over 4096 bytes (the status row says which) and the rest
   is plain; files over 16 MiB are shown plain. The file is read live, the index is of the file as
-  opened: when its size, modification time or inode changes — checked when the viewer opens and
-  before each page — the status row says so and the viewer reads no more (Esc and open it
+  opened: when it changes — its size or modification time through the open handle, or what its
+  path now names (another device or inode, as when an editor saves by renaming a new file over
+  it, or nothing: deleted; a remote file's path is its cached copy) — checked when the viewer
+  opens and before each page, the status row says so and the viewer reads no more (Esc and open it
   again). A write that lands after the check cannot make a read run away either: a line is never
   read past where the index says it must end — the next mark, or 64 KiB past its own block's mark
   when the next line was no mark — and one that does not end there is the same changed-file
