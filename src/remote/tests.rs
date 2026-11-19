@@ -129,6 +129,9 @@ impl RemoteFs for Hooked {
     fn list_dir(&mut self, path: &str) -> Result<Vec<String>> {
         self.inner.list_dir(path)
     }
+    fn list_entries(&mut self, path: &str) -> Result<Vec<Entry>> {
+        self.inner.list_entries(path)
+    }
     fn read_to(
         &mut self,
         path: &str,
@@ -1232,7 +1235,8 @@ fn local_listing_carries_kind_size_and_mtime() {
 }
 
 /// Over a real SFTP server (OpenSSH's, as a local child): the attributes come with the readdir
-/// reply — one stat request per symbolic link (what it points at), none per name.
+/// reply — one stat request per symbolic link (what it points at), none per name (counted where
+/// sopen sends them).
 #[test]
 fn sftp_listing_carries_the_attributes_without_a_stat_per_name() {
     let Some(mut fs) = SftpRemote::local_server() else {
@@ -1303,4 +1307,168 @@ fn a_cancelled_fetch_keeps_nothing_and_leaves_the_copy_alone() {
         .map(|e| e.unwrap().file_name())
         .collect();
     assert_eq!(left, ["big.bin"], "no partial copy left");
+}
+
+/// What a cancelled fetch must leave: the earlier copy as it was, and nothing else in its
+/// folder.
+fn earlier_copy_untouched(local: &Path) {
+    assert_eq!(std::fs::read(local).unwrap(), b"the earlier copy");
+    let left: Vec<_> = std::fs::read_dir(local.parent().unwrap())
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    assert_eq!(left.len(), 1, "no partial copy left: {left:?}");
+}
+
+/// A fetch cancelled before it starts, of a file with no bytes (so no write ever sees the
+/// flag): nothing is published over the earlier copy.
+#[test]
+fn a_fetch_cancelled_before_it_starts_publishes_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let remote = tmp.path().join("empty.txt");
+    std::fs::write(&remote, b"").unwrap();
+    let local = tmp.path().join("cache/empty.txt");
+    std::fs::create_dir_all(local.parent().unwrap()).unwrap();
+    std::fs::write(&local, "the earlier copy").unwrap();
+    let cancel = std::sync::atomic::AtomicBool::new(true);
+    let err = LocalFs::new()
+        .fetch_cancellable(p(&remote), &local, &mut |_, _| {}, &cancel)
+        .unwrap_err();
+    assert!(is_cancelled(&err), "{err:#}");
+    earlier_copy_untouched(&local);
+}
+
+/// A cancel that lands after the last write (here from the progress report of the only chunk):
+/// the complete copy is not published either.
+#[test]
+fn a_fetch_cancelled_after_its_last_write_publishes_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let remote = tmp.path().join("small.txt");
+    std::fs::write(&remote, b"one chunk of text").unwrap();
+    let local = tmp.path().join("cache/small.txt");
+    std::fs::create_dir_all(local.parent().unwrap()).unwrap();
+    std::fs::write(&local, "the earlier copy").unwrap();
+    let cancel = std::sync::atomic::AtomicBool::new(false);
+    let err = LocalFs::new()
+        .fetch_cancellable(
+            p(&remote),
+            &local,
+            &mut |done, total| {
+                if done == total {
+                    cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+            },
+            &cancel,
+        )
+        .unwrap_err();
+    assert!(is_cancelled(&err), "{err:#}");
+    earlier_copy_untouched(&local);
+}
+
+/// Attributes for the listing seam's tests: a regular file, a folder, a link, and an entry
+/// whose type the server left out.
+fn attrs(kind: &str, size: u64) -> Stat {
+    Stat {
+        is_dir: kind == "dir",
+        is_file: kind == "file",
+        is_symlink: kind == "link",
+        size,
+        mtime: UNIX_EPOCH + Duration::from_secs(1_700_000_000),
+        mode: 0o644,
+        uid: Some(1),
+        gid: Some(1),
+        missing: (kind == "untyped").then_some("type"),
+        sha256: None,
+    }
+}
+
+/// A name that is not UTF-8 and a name that shows the same (a literal U+FFFD): each entry's
+/// attributes come from its own bytes, never from the name as shown — and the first is marked
+/// lossy (the browser does not open it).
+#[test]
+fn names_that_show_alike_keep_their_own_attributes() {
+    use std::os::unix::ffi::OsStrExt;
+    let bad = OsStr::from_bytes(b"a\xff").to_os_string();
+    let alike = OsString::from("a\u{FFFD}");
+    let listed: Listed = vec![
+        (bad.clone(), Some(attrs("link", 1))),
+        (alike.clone(), Some(attrs("link", 1))),
+    ];
+    let mut asked = Vec::new();
+    let entries = entries_from(listed, &mut |name, follow| {
+        asked.push((name.to_os_string(), follow));
+        Ok(Some(if name == bad.as_os_str() {
+            attrs("file", 111)
+        } else if name == alike.as_os_str() {
+            attrs("dir", 222)
+        } else {
+            panic!("looked up by a name no entry has: {name:?}")
+        }))
+    });
+    let of = |lossy: bool| entries.iter().find(|e| e.lossy == lossy).unwrap();
+    assert_eq!(of(true).name, "a\u{FFFD}");
+    assert_eq!((of(true).kind, of(true).size), (EntryKind::File, 111));
+    assert_eq!((of(false).kind, of(false).size), (EntryKind::Dir, 222));
+    assert_eq!(asked, [(bad, true), (alike, true)]);
+}
+
+/// Entries whose type the server left out: their own type comes from an `lstat` (a link stays
+/// a link: to a file, to a folder, or broken), and only a confirmed link is followed — two stats
+/// for a link, one for anything else.
+#[test]
+fn untyped_entries_are_lstat_first_and_followed_only_when_links() {
+    let listed: Listed = ["to-file", "to-dir", "dangling", "plain"]
+        .iter()
+        .map(|n| (OsString::from(n), Some(attrs("untyped", 0))))
+        .collect();
+    let mut asked = Vec::new();
+    let entries = entries_from(listed, &mut |name, follow| {
+        asked.push((name.to_string_lossy().into_owned(), follow));
+        Ok(match (name.to_str().unwrap(), follow) {
+            ("plain", false) => Some(attrs("file", 5)),
+            (_, false) => Some(attrs("link", 9)),
+            ("to-file", true) => Some(attrs("file", 7)),
+            ("to-dir", true) => Some(attrs("dir", 64)),
+            ("dangling", true) => None,
+            (other, true) => panic!("{other} is not a link: never followed"),
+        })
+    });
+    let by = |n: &str| entries.iter().find(|e| e.name == n).unwrap().clone();
+    assert_eq!(
+        (by("to-file").kind, by("to-file").link, by("to-file").size),
+        (EntryKind::File, true, 7)
+    );
+    assert_eq!(
+        (by("to-dir").kind, by("to-dir").link),
+        (EntryKind::Dir, true)
+    );
+    assert_eq!(
+        (by("dangling").kind, by("dangling").link),
+        (EntryKind::Broken, true)
+    );
+    assert_eq!(
+        (by("plain").kind, by("plain").link, by("plain").size),
+        (EntryKind::File, false, 5)
+    );
+    let follows = asked.iter().filter(|(_, f)| *f).count();
+    assert_eq!((asked.len(), follows), (7, 3), "{asked:?}");
+}
+
+/// On a filesystem that takes any bytes (Linux; macOS refuses names that are not UTF-8): a
+/// file named `a\xff` and one named `a\u{FFFD}` list as two entries with their own sizes.
+#[test]
+fn local_names_that_are_not_utf8_list_with_their_own_attributes() {
+    use std::os::unix::ffi::OsStrExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let bad = tmp.path().join(OsStr::from_bytes(b"a\xff"));
+    if let Err(e) = std::fs::write(&bad, "1") {
+        eprintln!("skipping: this filesystem refuses a name that is not UTF-8 ({e})");
+        return;
+    }
+    std::fs::write(tmp.path().join("a\u{FFFD}"), "22").unwrap();
+    let entries = LocalFs::new().list_entries(p(tmp.path())).unwrap();
+    assert_eq!(entries.len(), 2);
+    let of = |lossy: bool| entries.iter().find(|e| e.lossy == lossy).unwrap();
+    assert_eq!((of(true).name.as_str(), of(true).size), ("a\u{FFFD}", 1));
+    assert_eq!((of(false).name.as_str(), of(false).size), ("a\u{FFFD}", 2));
 }

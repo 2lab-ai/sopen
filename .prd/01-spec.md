@@ -128,15 +128,20 @@ replaces that module alone.
 
 - **A panel** lists `..` (not at `/`), then folders and links to folders, then everything else,
   each by name regardless of case. Columns: Name · Ext (a file's extension; a folder, a dot file
-  and a name without a dot keep the whole name) · Size (`<DIR>`, `<LINK>` for a link to a folder,
+  — any name starting with `.`, `.config.json` too — and a name without a dot keep the whole
+  name) · Size (`<DIR>`, `<LINK>` for a link to a folder,
   `<SPECIAL>` for a fifo, socket or device, `<BROKEN>` for a link to nothing, `?` when the entry's
   attributes could not be read) · Date · Time (local time, of a link's target). Hidden (dot)
-  entries are shown, dimmed. The foot reads `N listed = N bytes` (the entries but `..`; the bytes
+  entries are shown, dimmed. A name that is not valid UTF-8 shows with U+FFFD for its bad bytes
+  and is never opened, entered or handed to the editor (sopen's paths are UTF-8; the name as
+  shown may even be another file's), and nothing is looked up by it. The foot reads `N listed = N bytes` (the entries but `..`; the bytes
   of the files) and, when one request can tell, `N bytes free`. Both panels start on the opened
   folder; a folder is listed again each time it is entered.
 - **Listing** is one round trip: SFTP's readdir carries each name's attributes, and only a
   symbolic link costs a stat more (to say what it points at). A link is followed only to classify
-  it. Locally: `read_dir` and an `lstat` per name. The free space is `statvfs@openssh.com` when
+  it. An entry whose type the server left out gets an `lstat` first (a link stays a link, a
+  dangling one is `<BROKEN>`), then is followed only if that says link. Every stat goes by the
+  name's own bytes. Locally: `read_dir` and an `lstat` per name. The free space is `statvfs@openssh.com` when
   the server offers it, `statvfs` locally.
 - **Keys** (the list): ↑/↓, PgUp/PgDn, Home/End move the bar; Tab (or Shift+Tab) switches the
   active panel; Enter on a folder enters it; Backspace, or Enter on `..`, goes up with the bar on
@@ -153,7 +158,10 @@ replaces that module alone.
   The path is resolved first (a link opens, and saves, as the file it points at: §5). A remote
   file is fetched into the cache exactly as the standalone routes fetch it (claimed, recorded, an
   earlier copy's unsaved edits moved aside), with its progress on the status row; Esc stops the
-  fetch — the partial copy is removed and the cached copy left as it was. An image is always a
+  fetch — the partial copy is removed and the cached copy left as it was, also when Esc comes
+  after the last byte but before the copy is in place. Esc once the copy is in place (while the
+  file is decoded, probed or indexed) keeps the viewer from opening; the fetched copy stays in
+  the cache, recorded, and the status row says so. An image is always a
   copy (Save needs the bytes as opened); local media, text and other files are read in place.
   Each viewer gets a connection of its own (its Save and Export use it), and the copy it shows
   stays claimed until it is gone. The viewers keep exactly their edits, keys and Save rules
@@ -165,9 +173,14 @@ replaces that module alone.
   whole: opening indexes the lines in one pass (a mark every 256 lines, and at the first line
   start 64 KiB past the last mark), and a page reads at most 64 KiB before it plus the shown part
   of each line. 4096 bytes of a line are shown (the bar says when lines are cut); invalid UTF-8
-  shows as U+FFFD. Highlighting carries state from the top of the file: the state at each mark is
-  computed once, a few milliseconds per frame, and a page is shown plain until it is reached;
-  files over 16 MiB are shown plain.
+  shows as U+FFFD (a character cut in two at the end of a cut line is left out). Highlighting
+  carries state from the top of the file: the state at each mark is computed once, and a frame
+  spends at most 6 ms on highlighting, checked after every line; the next frame goes on from
+  there, and a page is shown plain until it is reached. A line is parsed only whole, so
+  highlighting stops at the first line over 4096 bytes (the status row says which) and the rest
+  is plain; files over 16 MiB are shown plain. The file is read live, the index is of the file as
+  opened: when its size, modification time or inode changes, the status row says so and the
+  viewer reads no more (Esc and open it again); offsets from the index are always checked.
 - **Leaving a viewer** — Esc or F3 (when the viewer does not use Esc itself: the image and media
   windows' Esc first clears a drawn rectangle; an Esc that takes the keyboard from a text field
   is the field's), or closing the window — goes through that viewer's own close question: its

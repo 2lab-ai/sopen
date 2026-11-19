@@ -169,18 +169,34 @@ pub fn panel_frame(painter: &egui::Painter, rect: Rect, title: &str, active: boo
     )
 }
 
-/// `text` as it fits in `room` points of `font` (monospace): whole, or its end after "…" — a
-/// path keeps the folder it ends in.
+/// `text` as it fits in `room` points of `font`: whole, or its longest end that fits after "…"
+/// — a path keeps the folder it ends in. Measured as egui lays it out (wide glyphs too).
 pub fn fit_left(ctx: &egui::Context, text: &str, font: &FontId, room: f32) -> String {
-    let cw = ctx.fonts_mut(|f| f.glyph_width(font, '0')).max(1.0);
-    let fits = (room / cw).floor() as usize;
-    let n = text.chars().count();
-    if n <= fits {
+    let width = |t: &str| {
+        ctx.fonts_mut(|f| {
+            f.layout_no_wrap(t.to_string(), font.clone(), Color32::WHITE)
+                .size()
+                .x
+        })
+    };
+    if width(text) <= room {
         return text.to_string();
     }
-    let keep = fits.saturating_sub(1);
-    let tail: String = text.chars().skip(n - keep).collect();
-    format!("…{tail}")
+    let starts: Vec<usize> = text.char_indices().map(|(i, _)| i).collect();
+    // The fewest characters dropped from the front for "…" and the rest to fit.
+    let (mut lo, mut hi) = (1, starts.len());
+    while lo < hi {
+        let mid = (lo + hi) / 2;
+        if width(&format!("…{}", &text[starts[mid]..])) <= room {
+            hi = mid;
+        } else {
+            lo = mid + 1;
+        }
+    }
+    match starts.get(lo) {
+        Some(&at) => format!("…{}", &text[at..]),
+        None => "…".to_string(),
+    }
 }
 
 /// The highlight bar behind a row.

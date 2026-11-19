@@ -453,11 +453,58 @@ fn run_open(
         }
         return open_binary(place, &abs, stat.size, None, true, dirs, rec);
     }
+    match route(kind) {
+        Route::Browser => open_in_browser(place, &abs, dirs, rec),
+        Route::Editor => open_in_editor(&mut place, &abs, kind, dirs, rec),
+        Route::Window => open_in_window(place, &abs, kind, dirs, rec),
+        Route::Binary => open_binary(place, &abs, stat.size, None, false, dirs, rec),
+    }
+}
+
+/// Where a kind opens without `--app` / `--hex` (spec §3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Route {
+    /// sopen's file browser (§3a).
+    Browser,
+    /// VS Code, else Zed.
+    Editor,
+    /// The image or media window.
+    Window,
+    /// The binary dialog.
+    Binary,
+}
+
+fn route(kind: Kind) -> Route {
     match kind {
-        Kind::Directory => open_in_browser(place, &abs, dirs, rec),
-        Kind::Text => open_in_editor(&mut place, &abs, kind, dirs, rec),
-        Kind::Image | Kind::Video | Kind::Audio => open_in_window(place, &abs, kind, dirs, rec),
-        Kind::Other => open_binary(place, &abs, stat.size, None, false, dirs, rec),
+        Kind::Directory => Route::Browser,
+        Kind::Text => Route::Editor,
+        Kind::Image | Kind::Video | Kind::Audio => Route::Window,
+        Kind::Other => Route::Binary,
+    }
+}
+
+/// What a folder run does (spec §3a), from the receipt hooks and whether there is a display.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FolderRun {
+    /// `SOPEN_LIST`: print the listing.
+    List,
+    /// A scripted save or export: nothing to act on.
+    Refuse,
+    /// No display: the editor, as before owner message 12.
+    Editor,
+    /// The browser window.
+    Browser,
+}
+
+fn folder_run(hooks: &gui::Hooks, display: bool) -> FolderRun {
+    if hooks.list {
+        FolderRun::List
+    } else if hooks.autosave || hooks.autoexport {
+        FolderRun::Refuse
+    } else if !display {
+        FolderRun::Editor
+    } else {
+        FolderRun::Browser
     }
 }
 
@@ -467,30 +514,31 @@ fn run_open(
 /// the folder opens in the editor as before, and one line says why.
 fn open_in_browser(mut place: Place, abs: &str, dirs: &Dirs, rec: &mut Record) -> Result<()> {
     let hooks = gui::Hooks::from_env()?;
-    if hooks.list {
-        let label = match &place {
-            Place::Remote(spec, _) => Some(spec.label()),
-            Place::Local(_) => None,
-        };
-        for line in gui::browser::listing(place.fs(), label.as_deref(), abs)? {
-            println!("{line}");
+    match folder_run(&hooks, gui::display_available()) {
+        FolderRun::List => {
+            let label = match &place {
+                Place::Remote(spec, _) => Some(spec.label()),
+                Place::Local(_) => None,
+            };
+            for line in gui::browser::listing(place.fs(), label.as_deref(), abs)? {
+                println!("{line}");
+            }
+            return Ok(());
         }
-        return Ok(());
-    }
-    if hooks.autosave || hooks.autoexport {
         // A scripted run ignores input: a browser no one can move through would wait forever.
-        bail!(
+        FolderRun::Refuse => bail!(
             "{} is a folder: SOPEN_AUTOSAVE / SOPEN_AUTOEXPORT act on a file (SOPEN_LIST prints \
              the folder's listing)",
             place.display(abs)
-        );
-    }
-    if !gui::display_available() {
-        eprintln!(
-            "sopen: no display for the file browser (DISPLAY / WAYLAND_DISPLAY unset); opening \
-             the folder in the editor"
-        );
-        return open_in_editor(&mut place, abs, Kind::Directory, dirs, rec);
+        ),
+        FolderRun::Editor => {
+            eprintln!(
+                "sopen: no display for the file browser (DISPLAY / WAYLAND_DISPLAY unset); \
+                 opening the folder in the editor"
+            );
+            return open_in_editor(&mut place, abs, Kind::Directory, dirs, rec);
+        }
+        FolderRun::Browser => {}
     }
     let remote = match &place {
         Place::Remote(spec, _) => Some(spec.clone()),
@@ -1013,6 +1061,37 @@ mod tests {
         assert!(Cli::try_parse_from(["sopen"]).is_err());
     }
 
+    /// A folder, with no `--app` / `--hex`, opens in the browser (not the editor); with a
+    /// display and no hook, a folder run is the browser window itself.
+    #[test]
+    fn a_folder_routes_to_the_browser_window() {
+        assert_eq!(route(Kind::Directory), Route::Browser);
+        assert_eq!(route(Kind::Text), Route::Editor);
+        for kind in [Kind::Image, Kind::Video, Kind::Audio] {
+            assert_eq!(route(kind), Route::Window);
+        }
+        assert_eq!(route(Kind::Other), Route::Binary);
+        let none = gui::Hooks::default();
+        assert_eq!(folder_run(&none, true), FolderRun::Browser);
+        assert_eq!(folder_run(&none, false), FolderRun::Editor);
+        let list = gui::Hooks {
+            list: true,
+            ..Default::default()
+        };
+        assert_eq!(folder_run(&list, true), FolderRun::List);
+        let autosave = gui::Hooks {
+            autosave: true,
+            ..Default::default()
+        };
+        assert_eq!(folder_run(&autosave, true), FolderRun::Refuse);
+        // A screenshot of a folder is the browser window (its receipt).
+        let shot = gui::Hooks {
+            screenshot: Some(PathBuf::from("shot.png")),
+            ..Default::default()
+        };
+        assert_eq!(folder_run(&shot, true), FolderRun::Browser);
+    }
+
     #[test]
     fn sizes() {
         assert_eq!(human(999), "999 B");
@@ -1411,6 +1490,9 @@ mod tests {
         }
         fn list_dir(&mut self, path: &str) -> Result<Vec<String>> {
             self.0.list_dir(path)
+        }
+        fn list_entries(&mut self, path: &str) -> Result<Vec<remote::Entry>> {
+            self.0.list_entries(path)
         }
         fn read_to(
             &mut self,

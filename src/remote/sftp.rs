@@ -40,7 +40,7 @@ pub struct SftpRemote {
     rt: Runtime,
     sftp: Option<Sftp>,
     fs: Option<Fs>,
-    /// Stat requests sent (tests: a listing must not stat every name).
+    /// Stat requests sopen sent (tests: a listing must not stat every name).
     #[cfg(test)]
     stats: u64,
 }
@@ -108,20 +108,27 @@ impl SftpRemote {
     }
 
     fn stat_by(&mut self, path: &str, follow: bool) -> Result<Option<Stat>> {
+        self.stat_path(Path::new(path), follow)
+    }
+
+    /// [`SftpRemote::stat_by`] for a path of any bytes (a listed name that is not UTF-8).
+    fn stat_path(&mut self, path: &Path, follow: bool) -> Result<Option<Stat>> {
         #[cfg(test)]
         {
             self.stats += 1;
         }
         let (rt, _, fs) = self.parts();
+        // The path goes to the server as its bytes; it is shown (lossily) only in messages.
         let got = if follow {
             rt.block_on(within(META_TIMEOUT, fs.metadata(path)))
         } else {
             rt.block_on(within(META_TIMEOUT, fs.symlink_metadata(path)))
         };
-        match got.map_err(|()| timed_out(&format!("stat {path}"), META_TIMEOUT))? {
+        let shown = path.display();
+        match got.map_err(|()| timed_out(&format!("stat {shown}"), META_TIMEOUT))? {
             Ok(meta) => Ok(Some(stat_of(&meta))),
             Err(e) if is_not_found(&e) => Ok(None),
-            Err(e) => Err(anyhow!("cannot stat {path}: {e}")),
+            Err(e) => Err(anyhow!("cannot stat {shown}: {e}")),
         }
     }
 }
@@ -456,33 +463,23 @@ impl RemoteFs for SftpRemote {
     }
 
     fn list_dir(&mut self, path: &str) -> Result<Vec<String>> {
-        Ok(self.read_dir(path)?.into_iter().map(|(n, _)| n).collect())
+        let listed = self.read_dir(path)?;
+        Ok(listed
+            .into_iter()
+            .map(|(n, _)| n.to_string_lossy().into_owned())
+            .collect())
     }
 
     /// The readdir reply carries each name's attributes (as `lstat` gives them); only a
-    /// symbolic link costs one stat more, to say what it points at, and so does an entry whose
-    /// type the server left out.
+    /// symbolic link costs one stat more, to say what it points at, and an entry whose type the
+    /// server left out an `lstat` first. Every stat goes by the name's own bytes.
     fn list_entries(&mut self, path: &str) -> Result<Vec<Entry>> {
         let listed = self.read_dir(path)?;
-        let mut out = Vec::with_capacity(listed.len());
-        for (name, own) in listed {
-            let untyped = !own.is_dir && !own.is_file && !own.is_symlink && own.missing.is_some();
-            if own.is_symlink || untyped {
-                let full = super::join(path, &name);
-                let target = self.stat_opt(&full).ok().flatten();
-                if untyped {
-                    out.push(match target {
-                        Some(t) => super::entry(name, &t, None),
-                        None => super::unknown_entry(name),
-                    });
-                    continue;
-                }
-                out.push(super::entry(name, &own, target));
-            } else {
-                out.push(super::entry(name, &own, None));
-            }
-        }
-        Ok(out)
+        let listed = listed.into_iter().map(|(n, s)| (n, Some(s))).collect();
+        let dir = Path::new(path).to_path_buf();
+        Ok(super::entries_from(listed, &mut |name, follow| {
+            self.stat_path(&dir.join(name), follow)
+        }))
     }
 
     fn free_space(&mut self, path: &str) -> Option<u64> {
@@ -633,7 +630,7 @@ impl RemoteFs for SftpRemote {
 impl SftpRemote {
     /// A directory's names with their attributes from the readdir reply, sorted by name
     /// (`.` and `..` left out).
-    fn read_dir(&mut self, path: &str) -> Result<Vec<(String, Stat)>> {
+    fn read_dir(&mut self, path: &str) -> Result<Vec<(std::ffi::OsString, Stat)>> {
         use futures_core::Stream;
         let (rt, _, fs) = self.parts();
         let listed = rt.block_on(within(META_TIMEOUT, async {
@@ -646,12 +643,12 @@ impl SftpRemote {
             while let Some(entry) = std::future::poll_fn(|cx| entries.as_mut().poll_next(cx)).await
             {
                 let entry = entry.map_err(|e| anyhow!("cannot list {path}: {e}"))?;
-                let name = entry.filename().to_string_lossy().into_owned();
+                let name = entry.filename().as_os_str().to_os_string();
                 if name != "." && name != ".." {
                     out.push((name, stat_of(&entry.metadata())));
                 }
             }
-            out.sort_by(|a: &(String, Stat), b| a.0.cmp(&b.0));
+            out.sort_by(|a: &(std::ffi::OsString, Stat), b| a.0.cmp(&b.0));
             Ok(out)
         }));
         listed.map_err(|()| timed_out(&format!("list {path}"), META_TIMEOUT))?
@@ -710,10 +707,15 @@ const SFTP_SERVERS: [&str; 4] = [
 impl SftpRemote {
     /// SFTP to this machine's own `sftp-server`, run as a child over pipes: a real server's
     /// replies (readdir attributes, extensions) without ssh or a network. `None`, with a note,
-    /// where OpenSSH's server is not installed.
+    /// where OpenSSH's server is not installed — a failure instead when
+    /// `SOPEN_REQUIRE_SFTP_SERVER` is set (CI installs it).
     pub(crate) fn local_server() -> Option<Self> {
         let Some(server) = SFTP_SERVERS.iter().find(|p| Path::new(p).exists()) else {
-            eprintln!("skipping: no sftp-server on this machine ({SFTP_SERVERS:?})");
+            let missing = format!("no sftp-server on this machine ({SFTP_SERVERS:?})");
+            if std::env::var_os("SOPEN_REQUIRE_SFTP_SERVER").is_some() {
+                panic!("SOPEN_REQUIRE_SFTP_SERVER is set but {missing}");
+            }
+            eprintln!("skipping: {missing}");
             return None;
         };
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -745,7 +747,8 @@ impl SftpRemote {
         })
     }
 
-    /// Stat requests sent so far.
+    /// Stat requests this connection made so far (counted where sopen sends them, in
+    /// `stat_path`: an application-level count, not the server's).
     pub(crate) fn stats(&self) -> u64 {
         self.stats
     }

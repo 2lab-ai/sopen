@@ -9,9 +9,16 @@
 //! Only [`LINE_MAX`] bytes of a line are shown.
 //!
 //! Highlighting carries state from the top of the file: the state at each mark is computed
-//! once, in order, a few milliseconds' worth per frame, and a page is highlighted from the mark
-//! before it. Until the marks reach a page it is shown plain; files over [`HIGHLIGHT_MAX`] are
-//! always shown plain.
+//! once, in order, and a page is highlighted from the mark before it. A frame spends at most
+//! [`HIGHLIGHT_BUDGET`] on it, checked after every line, and the next frame goes on from there;
+//! until then the page shows plain. A line is parsed only whole: highlighting stops at the first
+//! line longer than [`LINE_MAX`] (only its start is read, and a comment or string closed past the
+//! cut would colour everything after it), and the rest of the file is plain. Files over
+//! [`HIGHLIGHT_MAX`] are always shown plain.
+//!
+//! The file is read live; the index is of the file as opened. A file that changes since then
+//! (size, modification time, inode) is noticed before each new page: the window says so and
+//! reads no more. Every offset taken from the index is checked, never trusted.
 
 use super::{chrome, Embedded, Outcome, Status, Window};
 use anyhow::{Context as _, Result};
@@ -63,23 +70,31 @@ pub struct TextDoc {
     lines: u64,
     /// The last line ends with a newline.
     ends_newline: bool,
-    /// Some line is longer than [`LINE_MAX`] bytes.
-    long_lines: bool,
+    /// The first line longer than [`LINE_MAX`] bytes (0-based), if any.
+    first_long: Option<u64>,
+    /// The file as indexed: size, modification time and inode.
+    opened: (u64, Option<std::time::SystemTime>, u64),
     /// Bytes read for lines (not the index pass) — what paging costs.
     page_reads: u64,
+}
+
+/// What [`TextDoc::changed`] compares.
+fn identity(meta: &std::fs::Metadata) -> (u64, Option<std::time::SystemTime>, u64) {
+    use std::os::unix::fs::MetadataExt;
+    (meta.len(), meta.modified().ok(), meta.ino())
 }
 
 impl TextDoc {
     /// Opens `path` and indexes its lines (one pass over the file, holding no text).
     pub fn open(path: &Path) -> Result<Self> {
         let file = File::open(path).with_context(|| format!("cannot open {}", path.display()))?;
-        let size = file
+        let meta = file
             .metadata()
-            .with_context(|| format!("cannot stat {}", path.display()))?
-            .len();
+            .with_context(|| format!("cannot stat {}", path.display()))?;
+        let (size, opened) = (meta.len(), identity(&meta));
         let mut marks = vec![Mark { line: 0, offset: 0 }];
         let (mut line, mut at, mut line_len) = (0u64, 0u64, 0u64);
-        let (mut long_lines, mut last_byte) = (false, None);
+        let (mut first_long, mut last_byte) = (None, None);
         let mut buf = vec![0u8; 1 << 20];
         loop {
             let n = file
@@ -88,12 +103,19 @@ impl TextDoc {
             if n == 0 {
                 break;
             }
+            // Only the bytes as opened: a file growing meanwhile is noticed later.
+            let n = n.min(size.saturating_sub(at) as usize);
+            if n == 0 {
+                break;
+            }
             for (i, &b) in buf[..n].iter().enumerate() {
                 if b != b'\n' {
                     line_len += 1;
                     continue;
                 }
-                long_lines |= line_len > LINE_MAX as u64;
+                if line_len > LINE_MAX as u64 && first_long.is_none() {
+                    first_long = Some(line);
+                }
                 line_len = 0;
                 line += 1;
                 let start = at + i as u64 + 1;
@@ -109,7 +131,9 @@ impl TextDoc {
             last_byte = Some(buf[n - 1]);
             at += n as u64;
         }
-        long_lines |= line_len > LINE_MAX as u64;
+        if line_len > LINE_MAX as u64 && first_long.is_none() {
+            first_long = Some(line);
+        }
         let ends_newline = last_byte == Some(b'\n');
         if last_byte.is_some() && !ends_newline {
             line += 1;
@@ -120,9 +144,16 @@ impl TextDoc {
             marks,
             lines: line,
             ends_newline,
-            long_lines,
+            first_long,
+            opened,
             page_reads: 0,
         })
+    }
+
+    /// The file is not the one indexed any more: another size, modification time or inode
+    /// (or it cannot be stat'ed).
+    pub fn changed(&self) -> bool {
+        self.file.metadata().map(|m| identity(&m)).ok() != Some(self.opened)
     }
 
     pub fn line_count(&self) -> u64 {
@@ -135,7 +166,7 @@ impl TextDoc {
 
     /// Some line is cut at [`LINE_MAX`] bytes.
     pub fn long_lines(&self) -> bool {
-        self.long_lines
+        self.first_long.is_some()
     }
 
     /// Bytes read for lines so far (the index pass not counted).
@@ -188,7 +219,12 @@ impl TextDoc {
             if line + 1 == next.line {
                 // It ends where the next mark starts: read only what is shown of it.
                 let newline = u64::from(next.line < self.lines || self.ends_newline);
-                let len = next.offset - pos - newline;
+                // Checked: a file changed since it was indexed can put `pos` past the mark.
+                let len = next
+                    .offset
+                    .checked_sub(pos)
+                    .and_then(|n| n.checked_sub(newline))
+                    .unwrap_or(0);
                 if keep {
                     let want = len.min(LINE_MAX as u64) as usize;
                     let bytes = window.take(self, pos, want)?;
@@ -270,15 +306,33 @@ impl Window_ {
     }
 }
 
+/// Where a character cut in two at the end of `bytes` starts (`bytes.len()` when none is):
+/// found from the end alone, whatever comes before.
+fn cut_char_start(bytes: &[u8]) -> usize {
+    // A UTF-8 character is at most 4 bytes: its lead byte is among the last 4.
+    for back in 1..=bytes.len().min(4) {
+        let i = bytes.len() - back;
+        let b = bytes[i];
+        if b & 0xC0 == 0x80 {
+            continue;
+        }
+        let need = match b {
+            0xF0.. => 4,
+            0xE0.. => 3,
+            0xC0.. => 2,
+            _ => 1,
+        };
+        return if back < need { i } else { bytes.len() };
+    }
+    bytes.len()
+}
+
 /// A line's shown bytes as text: a trailing `\r` dropped; when `cut`, a character cut in two
 /// at the end left out; anything else that is not UTF-8 shown as U+FFFD.
 fn shown(mut bytes: Vec<u8>, cut: bool) -> Line {
     if cut {
-        if let Err(e) = std::str::from_utf8(&bytes) {
-            if e.error_len().is_none() {
-                bytes.truncate(e.valid_up_to());
-            }
-        }
+        let keep = cut_char_start(&bytes);
+        bytes.truncate(keep);
     } else if bytes.last() == Some(&b'\r') {
         bytes.pop();
     }
@@ -319,15 +373,63 @@ fn syntax_for(name: &str, first: &str) -> Option<&'static SyntaxReference> {
 /// A highlighted line: runs of text and their colour.
 type Runs = Vec<(Color32, String)>;
 
-/// Highlighting state at each mark, computed in order from the top of the file.
-struct Highlight {
-    highlighter: Highlighter<'static>,
-    states: Vec<(ParseState, HighlightState)>,
-    plain: Color32,
+/// Parser and highlighter state after some line.
+type State = (ParseState, HighlightState);
+
+/// What one frame may spend on highlighting — until a moment, and (tests) a number of lines —
+/// and the lines parsed so far this frame.
+#[derive(Debug, Clone, Copy)]
+struct Budget {
+    until: Instant,
+    lines: usize,
+    done: usize,
 }
 
+impl Budget {
+    fn spent(&self) -> bool {
+        self.done >= self.lines || Instant::now() >= self.until
+    }
+}
+
+/// Where highlighting got to: the state before line `next`.
+struct Cursor {
+    next: u64,
+    state: State,
+}
+
+/// A page being highlighted: the cursor, and the page's lines done so far.
+struct PageJob {
+    top: u64,
+    at: Cursor,
+    runs: Vec<Runs>,
+}
+
+/// Highlighting state at each mark, computed in order from the top of the file, a budget at a
+/// time; and the page on screen, the same way.
+struct Highlight {
+    highlighter: Highlighter<'static>,
+    /// The state at mark `i`'s line, for every `i < states.len()`.
+    states: Vec<State>,
+    /// On the way to the next mark.
+    frontier: Option<Cursor>,
+    job: Option<PageJob>,
+    /// Lines from here on are plain (the first line cut for display, see the module doc).
+    stop: u64,
+    plain: Color32,
+    /// Lines parsed so far (tests: the work a frame does).
+    parsed: u64,
+}
+
+/// Lines read at a time while highlighting.
+const BATCH: usize = 64;
+
 impl Highlight {
-    fn new(syntax: &'static SyntaxReference, dark: bool, plain: Color32) -> Option<Self> {
+    fn new(
+        syntax: &'static SyntaxReference,
+        dark: bool,
+        plain: Color32,
+        stop: u64,
+    ) -> Option<Self> {
         let theme = themes().themes.get(chrome::syntax_theme(dark))?;
         let highlighter = Highlighter::new(theme);
         let start = (
@@ -337,11 +439,16 @@ impl Highlight {
         Some(Self {
             highlighter,
             states: vec![start],
+            frontier: None,
+            job: None,
+            stop,
             plain,
+            parsed: 0,
         })
     }
 
-    fn run(&self, state: &mut (ParseState, HighlightState), line: &str) -> Runs {
+    fn run(&mut self, state: &mut State, line: &str) -> Runs {
+        self.parsed += 1;
         let Ok(ops) = state.0.parse_line(line, syntaxes()) else {
             return vec![(self.plain, line.to_string())];
         };
@@ -353,52 +460,104 @@ impl Highlight {
             .collect()
     }
 
-    /// Computes the states up to mark `upto`, until `deadline`; whether they are there.
-    fn advance(&mut self, doc: &mut TextDoc, upto: usize, deadline: Instant) -> bool {
-        while self.states.len() <= upto {
-            if Instant::now() >= deadline {
+    /// Parses lines from `at` up to line `to` while `budget` lasts (checked after every line),
+    /// keeping each line's runs in `keep` when given; whether it got there.
+    fn walk(
+        &mut self,
+        doc: &mut TextDoc,
+        at: &mut Cursor,
+        to: u64,
+        budget: &mut Budget,
+        mut keep: Option<&mut Vec<Runs>>,
+    ) -> bool {
+        while at.next < to {
+            if budget.spent() {
                 return false;
             }
-            let i = self.states.len() - 1;
-            let (from, to) = (doc.marks[i].line, doc.next_mark(i).line);
-            let Ok(lines) = doc.read_lines(from, (to - from) as usize) else {
+            let want = (to - at.next).min(BATCH as u64) as usize;
+            let Ok(lines) = doc.read_lines(at.next, want) else {
                 return false;
             };
-            let mut state = self.states[i].clone();
-            for line in &lines {
-                self.run(&mut state, &line.text);
+            if lines.is_empty() {
+                return false;
             }
-            self.states.push(state);
+            for line in &lines {
+                if budget.spent() {
+                    return false;
+                }
+                let runs = self.run(&mut at.state, &line.text);
+                if let Some(keep) = keep.as_deref_mut() {
+                    keep.push(runs);
+                }
+                at.next += 1;
+                budget.done += 1;
+            }
         }
         true
     }
 
-    /// The page at line `top` (its `lines`), highlighted — or `None` while the states have not
-    /// reached it.
+    /// Computes the states up to mark `upto` while `budget` lasts; whether they are there.
+    fn advance(&mut self, doc: &mut TextDoc, upto: usize, budget: &mut Budget) -> bool {
+        while self.states.len() <= upto {
+            let i = self.states.len() - 1;
+            let to = doc.next_mark(i).line;
+            let mut at = self.frontier.take().unwrap_or_else(|| Cursor {
+                next: doc.marks[i].line,
+                state: self.states[i].clone(),
+            });
+            if !self.walk(doc, &mut at, to, budget, None) {
+                self.frontier = Some(at);
+                return false;
+            }
+            self.states.push(at.state);
+        }
+        true
+    }
+
+    /// The page at `top` (its `lines`), highlighted up to the stop line (plain after it) — or
+    /// `None` while it is not done; the next call goes on from where this one stopped.
     fn page(
         &mut self,
         doc: &mut TextDoc,
         top: u64,
         lines: &[Line],
-        deadline: Instant,
+        budget: &mut Budget,
     ) -> Option<Vec<Runs>> {
-        let k = doc.mark_before(top);
-        if !self.advance(doc, k, deadline) {
-            return None;
-        }
-        let mut state = self.states[k].clone();
-        let from = doc.marks[k].line;
-        if from < top {
-            for line in doc.read_lines(from, (top - from) as usize).ok()? {
-                self.run(&mut state, &line.text);
+        let end = (top + lines.len() as u64).min(self.stop);
+        let mut runs = Vec::new();
+        if top < end {
+            if self.job.as_ref().is_none_or(|j| j.top != top) {
+                let k = doc.mark_before(top);
+                if !self.advance(doc, k, budget) {
+                    return None;
+                }
+                self.job = Some(PageJob {
+                    top,
+                    at: Cursor {
+                        next: doc.marks[k].line,
+                        state: self.states[k].clone(),
+                    },
+                    runs: Vec::new(),
+                });
             }
+            let mut job = self.job.take().expect("set above");
+            // Up to the page (from the mark before it), then the page's own lines.
+            let reached = self.walk(doc, &mut job.at, top, budget, None)
+                && self.walk(doc, &mut job.at, end, budget, Some(&mut job.runs));
+            if !reached {
+                self.job = Some(job);
+                return None;
+            }
+            runs = job.runs;
         }
-        Some(
-            lines
+        runs.truncate(lines.len());
+        let plain = self.plain;
+        runs.extend(
+            lines[runs.len()..]
                 .iter()
-                .map(|l| self.run(&mut state, &l.text))
-                .collect(),
-        )
+                .map(|l| vec![(plain, l.text.clone())]),
+        );
+        Some(runs)
     }
 }
 
@@ -451,9 +610,19 @@ struct TextWindow {
     notices: Vec<String>,
     status: Status,
     painted: bool,
+    /// The file changed since it was opened: nothing more is read.
+    stale: bool,
+    /// Lines a frame may parse (tests); the time budget holds in any case.
+    budget_lines: usize,
 }
 
 impl TextWindow {
+    /// Lines highlighted so far (tests).
+    #[cfg(test)]
+    fn parsed(&self) -> u64 {
+        self.hl.as_ref().map_or(0, |h| h.parsed)
+    }
+
     fn new(mut doc: TextDoc, title: String, name: &str, notices: Vec<String>) -> Self {
         let first = doc
             .read_lines(0, 1)
@@ -462,13 +631,17 @@ impl TextWindow {
             .map(|l| l.text)
             .unwrap_or_default();
         let syntax = syntax_for(name, &first);
-        let status = if doc.size() > HIGHLIGHT_MAX && syntax.is_some() {
-            Status::info(format!(
+        let status = match (syntax, doc.first_long) {
+            (None, _) => Status::default(),
+            _ if doc.size() > HIGHLIGHT_MAX => Status::info(format!(
                 "over {}: shown without highlighting",
                 crate::human(HIGHLIGHT_MAX)
-            ))
-        } else {
-            Status::default()
+            )),
+            (Some(_), Some(line)) => Status::info(format!(
+                "highlighting stops at line {}: it is over {LINE_MAX} bytes",
+                line + 1
+            )),
+            (Some(_), None) => Status::default(),
         };
         Self {
             title,
@@ -484,6 +657,8 @@ impl TextWindow {
             notices,
             status,
             painted: false,
+            stale: false,
+            budget_lines: usize::MAX,
         }
     }
 
@@ -523,6 +698,19 @@ impl TextWindow {
             .page
             .as_ref()
             .is_some_and(|p| p.top == top && p.count == count);
+        if !self.stale && self.doc.changed() {
+            self.stale = true;
+            self.status = Status::error(
+                "the file changed since it was opened — Esc, then open it again to see it now",
+            );
+        }
+        if self.stale {
+            // The index no longer describes the file: the page on screen stays, nothing more.
+            if let Some(page) = self.page.as_mut() {
+                page.highlighted = true;
+            }
+            return;
+        }
         if !same {
             let lines = match self.doc.read_lines(top, count) {
                 Ok(lines) => lines,
@@ -549,8 +737,12 @@ impl TextWindow {
         if page.highlighted {
             return;
         }
-        let deadline = Instant::now() + HIGHLIGHT_BUDGET;
-        match hl.page(&mut self.doc, top, &page.lines, deadline) {
+        let mut budget = Budget {
+            until: Instant::now() + HIGHLIGHT_BUDGET,
+            lines: self.budget_lines,
+            done: 0,
+        };
+        match hl.page(&mut self.doc, top, &page.lines, &mut budget) {
             Some(runs) => {
                 page.runs = runs.into_iter().map(expand_tabs).collect();
                 page.highlighted = true;
@@ -633,9 +825,10 @@ impl TextWindow {
         if !self.hl_tried {
             self.hl_tried = true;
             if self.doc.size() <= HIGHLIGHT_MAX {
+                let stop = self.doc.first_long.unwrap_or(u64::MAX);
                 self.hl = self
                     .syntax
-                    .and_then(|s| Highlight::new(s, ui.visuals().dark_mode, p.text));
+                    .and_then(|s| Highlight::new(s, ui.visuals().dark_mode, p.text, stop));
             }
         }
         self.ensure_page(&ctx, p.text);

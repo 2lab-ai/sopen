@@ -90,6 +90,12 @@ fn show(label: Option<&str>, abs: &str) -> String {
     }
 }
 
+/// Why an entry whose name is not UTF-8 is not opened (sopen's paths are UTF-8; the name as
+/// shown, with U+FFFD, may even be another file's).
+fn not_utf8(shown: &str) -> String {
+    format!("{shown}: the name is not valid UTF-8; sopen cannot open it")
+}
+
 /// What the browser is doing on a worker.
 enum Task {
     /// Listing `dir` for one panel (`None`: both, at the start); `select` = the entry to put
@@ -350,6 +356,10 @@ impl Browser {
                     self.task = None;
                     match result {
                         Ok((entries, free)) => {
+                            if self.status.error {
+                                // An earlier listing's failure is over.
+                                self.status = Status::default();
+                            }
                             for i in panel.map_or(vec![0, 1], |p| vec![p]) {
                                 let (e, s) = (entries.clone(), select.as_deref());
                                 self.panels[i].fill(dir.clone(), e, free, s);
@@ -525,11 +535,13 @@ impl Browser {
 
     /// F4: the entry (or the viewer's file) in VS Code or Zed, on a worker (the editor's CLI
     /// may take a moment to hand over).
-    fn edit(&mut self, abs: String, is_dir: bool) {
+    fn edit(&mut self, ctx: &egui::Context, abs: String, is_dir: bool) {
         let (tx, rx) = mpsc::channel();
-        let launch = self.launch.clone();
+        let (launch, waker) = (self.launch.clone(), ctx.clone());
         std::thread::spawn(move || {
             let _ = tx.send(launch(&abs, is_dir));
+            // The window may be idle (no input, no other work): wake it for the result.
+            waker.request_repaint();
         });
         self.status = Status::info("opening in the editor…");
         self.launches.push(rx);
@@ -542,6 +554,10 @@ impl Browser {
         let Some(entry) = panel.current().cloned() else {
             return;
         };
+        if entry.lossy {
+            self.status = Status::error(not_utf8(&entry.name));
+            return;
+        }
         let path = panel.path_of(&entry);
         let shown = show(self.label.as_deref(), &path);
         match entry.kind {
@@ -637,10 +653,14 @@ impl Browser {
             self.up(ctx);
         } else if pressed(Key::F4) {
             let panel = &self.panels[self.active];
-            if let Some(entry) = panel.current() {
-                let is_dir = entry.kind == EntryKind::Dir;
-                let path = panel.path_of(entry);
-                self.edit(path, is_dir);
+            match panel.current() {
+                Some(entry) if entry.lossy => self.status = Status::error(not_utf8(&entry.name)),
+                Some(entry) => {
+                    let is_dir = entry.kind == EntryKind::Dir;
+                    let path = panel.path_of(entry);
+                    self.edit(ctx, path, is_dir);
+                }
+                None => {}
             }
         }
     }
@@ -665,7 +685,7 @@ impl Browser {
         let pressed = |key: Key| ctx.input_mut(|i| i.consume_key(Modifiers::NONE, key));
         if pressed(Key::F4) {
             let abs = viewer.abs.clone();
-            self.edit(abs, false);
+            self.edit(&ctx, abs, false);
         }
         let esc = !esc_was_a_fields && pressed(Key::Escape);
         if esc || pressed(Key::F3) {
@@ -913,7 +933,7 @@ impl Window for Browser {
                     self.panels_ui(ui);
                 }
             });
-        if self.task.is_some() {
+        if self.task.is_some() || !self.launches.is_empty() {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
         self.focused_before = ctx.memory(|m| m.focused()).is_some();

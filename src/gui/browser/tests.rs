@@ -36,7 +36,6 @@ struct Fx {
     cache: PathBuf,
     drv: Driver,
     b: Browser,
-    #[allow(dead_code)]
     launched: Launched,
 }
 
@@ -425,24 +424,68 @@ fn a_viewer_holds_its_cached_copy_only_while_it_shows_it() {
     assert!(fx.b.viewer.is_none());
 }
 
-/// The local disk posing as a slow remote: a fetch takes a while.
-struct Slow(LocalFs);
+/// A worker held at a known point until the test lets it go: `hold` (on the worker) says it
+/// is there and waits; the test waits for `reached`, acts, then `release`s it.
+#[derive(Clone, Default)]
+struct Gate(Arc<(Mutex<(bool, bool)>, std::sync::Condvar)>);
 
-impl RemoteFs for Slow {
+impl Gate {
+    fn hold(&self) {
+        let (lock, cv) = &*self.0;
+        let mut st = lock.lock().unwrap();
+        st.0 = true;
+        cv.notify_all();
+        while !st.1 {
+            st = cv.wait(st).unwrap();
+        }
+    }
+
+    /// Waits (at most 10 s) until a worker is held.
+    fn reached(&self) {
+        let (lock, cv) = &*self.0;
+        let st = lock.lock().unwrap();
+        let (st, timeout) = cv
+            .wait_timeout_while(st, std::time::Duration::from_secs(10), |s| !s.0)
+            .unwrap();
+        assert!(
+            !timeout.timed_out() && st.0,
+            "the worker never got to the gate"
+        );
+    }
+
+    fn release(&self) {
+        let (lock, cv) = &*self.0;
+        lock.lock().unwrap().1 = true;
+        cv.notify_all();
+    }
+}
+
+/// The local disk posing as a remote whose `read_to` (a fetch: after the first chunk) or
+/// `create_from` (a save's upload) stops at a gate.
+struct Gated {
+    fs: LocalFs,
+    gate: Gate,
+    at: &'static str,
+}
+
+impl RemoteFs for Gated {
     fn stat_opt(&mut self, p: &str) -> Result<Option<Stat>> {
-        self.0.stat_opt(p)
+        self.fs.stat_opt(p)
     }
     fn lstat_opt(&mut self, p: &str) -> Result<Option<Stat>> {
-        self.0.lstat_opt(p)
+        self.fs.lstat_opt(p)
     }
     fn realpath(&mut self, p: &str) -> Result<String> {
-        self.0.realpath(p)
+        self.fs.realpath(p)
     }
     fn read_head(&mut self, p: &str, max: usize) -> Result<Vec<u8>> {
-        self.0.read_head(p, max)
+        self.fs.read_head(p, max)
     }
     fn list_dir(&mut self, p: &str) -> Result<Vec<String>> {
-        self.0.list_dir(p)
+        self.fs.list_dir(p)
+    }
+    fn list_entries(&mut self, p: &str) -> Result<Vec<crate::remote::Entry>> {
+        self.fs.list_entries(p)
     }
     fn read_to(
         &mut self,
@@ -450,13 +493,18 @@ impl RemoteFs for Slow {
         out: &mut dyn Write,
         progress: &mut dyn FnMut(u64),
     ) -> Result<u64> {
+        if self.at != "read_to" {
+            return self.fs.read_to(p, out, progress);
+        }
         let bytes = std::fs::read(p)?;
         let mut done = 0u64;
-        for chunk in bytes.chunks(64 * 1024) {
-            std::thread::sleep(std::time::Duration::from_millis(30));
+        for (i, chunk) in bytes.chunks(64 * 1024).enumerate() {
             out.write_all(chunk)?;
             done += chunk.len() as u64;
             progress(done);
+            if i == 0 {
+                self.gate.hold();
+            }
         }
         Ok(done)
     }
@@ -466,48 +514,59 @@ impl RemoteFs for Slow {
         p: &str,
         like: Option<crate::remote::Like>,
     ) -> std::result::Result<crate::remote::Uploaded, crate::remote::CreateError> {
-        self.0.create_from(local, p, like)
+        if self.at == "create_from" {
+            self.gate.hold();
+        }
+        self.fs.create_from(local, p, like)
     }
     fn set_mode(&mut self, p: &str, mode: u32) -> Result<()> {
-        self.0.set_mode(p, mode)
+        self.fs.set_mode(p, mode)
     }
     fn rename_over(&mut self, from: &str, to: &str) -> Result<()> {
-        self.0.rename_over(from, to)
+        self.fs.rename_over(from, to)
     }
     fn link_new(&mut self, from: &str, to: &str) -> Result<()> {
-        self.0.link_new(from, to)
+        self.fs.link_new(from, to)
     }
     fn remove(&mut self, p: &str) -> Result<()> {
-        self.0.remove(p)
+        self.fs.remove(p)
     }
+}
+
+/// A `Connect` whose connections stop at `gate` in `at`.
+fn gated(gate: &Gate, at: &'static str) -> Connect {
+    let gate = gate.clone();
+    Arc::new(move || {
+        Ok(Box::new(Gated {
+            fs: LocalFs::new(),
+            gate: gate.clone(),
+            at,
+        }) as Box<dyn RemoteFs + Send>)
+    })
 }
 
 /// Esc during a fetch stops it: back to the list, nothing of it kept in the cache; the progress
 /// was on the status row meanwhile.
 #[test]
 fn esc_stops_a_fetch() {
-    let slow: Connect = Arc::new(|| Ok(Box::new(Slow(LocalFs::new())) as Box<dyn RemoteFs + Send>));
-    let mut fx = fixture_with(Some("box"), slow, None);
+    let gate = Gate::default();
+    let mut fx = fixture_with(Some("box"), gated(&gate, "read_to"), None);
     std::fs::write(format!("{}/big.bin", fx.root), vec![1u8; 2 << 20]).unwrap();
-    // Listed again (Enter on `..`, then back) so the new file shows.
-    fx.key(Key::Enter);
-    fx.settle();
-    fx.select("root");
-    fx.key(Key::Enter);
+    let root = fx.root.clone();
+    fx.b.list(Some(0), root, None, None);
     fx.settle();
     fx.select("big.bin");
     fx.key(Key::Enter);
-    fx.drv.until(
-        &mut fx.b,
-        10,
-        |b| matches!(&b.task, Some(Task::Opening { done, .. }) if done.load(Ordering::Relaxed) > 0),
-    );
+    // The worker is held inside the fetch, a chunk in.
+    gate.reached();
+    fx.drv.idle(&mut fx.b, 1);
     let shown = fx.b.status_line().text;
     assert!(
         shown.starts_with("fetching big.bin ") && shown.ends_with("Esc cancels"),
         "{shown}"
     );
     fx.key(Key::Escape);
+    gate.release();
     fx.drv.until(&mut fx.b, 10, |b| b.task.is_none());
     assert!(fx.b.viewer.is_none());
     assert!(
@@ -634,15 +693,20 @@ fn esc_clears_a_rectangle_before_it_leaves_the_image() {
 /// read in place, an image decoded): the viewer does not appear once it is ready.
 #[test]
 fn esc_while_opening_keeps_the_viewer_from_appearing() {
-    let slow: Connect = Arc::new(|| {
-        std::thread::sleep(std::time::Duration::from_millis(300));
+    let gate = Gate::default();
+    let held = gate.clone();
+    let connect: Connect = Arc::new(move || {
+        held.hold();
         Ok(Box::new(LocalFs::new()) as Box<dyn RemoteFs + Send>)
     });
-    let mut fx = fixture_with(None, slow, None);
+    let mut fx = fixture_with(None, connect, None);
     fx.select("main.rs");
     fx.key(Key::Enter);
+    gate.reached();
     assert!(matches!(fx.b.task, Some(Task::Opening { .. })));
+    // Esc while the worker is held before it has read anything; then it goes on to the end.
     fx.key(Key::Escape);
+    gate.release();
     fx.drv.until(&mut fx.b, 10, |b| b.task.is_none());
     fx.drv.idle(&mut fx.b, 2);
     assert!(fx.b.viewer.is_none(), "the viewer appeared after Esc");
@@ -690,7 +754,8 @@ fn a_video_opens_in_the_media_window_and_esc_leaves_it() {
         }
     };
     let mut fx = fixture();
-    let ok = std::process::Command::new(&tools.ffmpeg)
+    // A bounded wait: a stuck ffmpeg fails the test instead of hanging it.
+    let mut child = std::process::Command::new(&tools.ffmpeg)
         .args(["-hide_banner", "-loglevel", "error", "-nostdin", "-y"])
         .args([
             "-f",
@@ -700,14 +765,35 @@ fn a_video_opens_in_the_media_window_and_esc_leaves_it() {
         ])
         .args(["-c:v", "libx264", "-pix_fmt", "yuv420p"])
         .arg(format!("{}/clip.mp4", fx.root))
-        .status()
-        .unwrap()
-        .success();
-    assert!(ok, "fixture");
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if std::time::Instant::now() > deadline {
+            let _ = child.kill();
+            panic!("ffmpeg did not make the fixture in 60 s");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    assert!(status.success(), "fixture");
     let root = fx.root.clone();
     fx.b.list(Some(0), root, None, None);
     fx.settle();
+    // `open` waits for the viewer to be ready: the media window's first frame decoded.
     fx.open("clip.mp4");
+    let info = fx.drv.text_starting_with("160×120 · 25.00 fps · ");
+    assert!(
+        info.as_deref().is_some_and(|i| i.ends_with("no audio")),
+        "the media window's info line: {info:?}"
+    );
+    let frame = fx.drv.pictures();
+    assert!(
+        frame.iter().any(|r| r.width() > 50.0 && r.height() > 30.0),
+        "the decoded frame is drawn: {frame:?}"
+    );
     assert!(fx.drv.find_text("Exit   ").is_some(), "the viewer's F-keys");
     fx.key(Key::Escape);
     assert!(fx.b.viewer.is_none());
@@ -716,7 +802,8 @@ fn a_video_opens_in_the_media_window_and_esc_leaves_it() {
 }
 
 /// Cmd/Ctrl+C, X and V reach a hosted image as in its own window (the browser takes none of
-/// them): Copy puts the image on the clipboard, and Paste then Esc asks before the edit goes.
+/// them): Copy and Cut put pictures on the clipboard, a paste lands, and leaving asks before
+/// the edits go.
 #[test]
 fn clipboard_shortcuts_reach_a_hosted_image() {
     let mut fx = fixture();
@@ -734,19 +821,244 @@ fn clipboard_shortcuts_reach_a_hosted_image() {
         .collect();
     assert_eq!(copied, [[64, 48]], "the whole image went to the clipboard");
     assert!(fx.b.viewer.is_some());
-    // A picture pasted without a rectangle selects what it covers (the first Esc clears that)
-    // and is an edit: the second Esc asks before it goes.
+    // Cut a drawn rectangle: its pixels to the clipboard, the rectangle left in the
+    // background colour (an edit); a picture pasted into it is another.
+    let c = Pos2::new(500.0, 350.0);
+    fx.drv.drag(
+        &mut fx.b,
+        PointerButton::Primary,
+        c - Vec2::new(60.0, 40.0),
+        c + Vec2::new(60.0, 40.0),
+    );
+    fx.drv.cut(&mut fx.b);
+    let cut = fx
+        .drv
+        .take_commands()
+        .into_iter()
+        .filter(|c| matches!(c, egui::OutputCommand::CopyImage(_)))
+        .count();
+    assert_eq!(cut, 1, "Cut put the rectangle on the clipboard");
     let red = egui::ColorImage::new([4, 4], vec![egui::Color32::RED; 16]);
     fx.drv.paste_image(&mut fx.b, red);
+    // The first Esc clears the rectangle (the image's own Esc); the second asks, as the cut and
+    // the paste are unsaved edits.
     fx.key(Key::Escape);
     assert!(fx.drv.find_text("Unsaved changes").is_none());
     assert!(fx.b.viewer.is_some());
     fx.key(Key::Escape);
     assert!(
         fx.drv.find_text("Unsaved changes").is_some(),
-        "the paste was an edit"
+        "the cut and the paste were edits"
     );
     fx.drv.click_text(&mut fx.b, "Discard");
     assert!(fx.b.viewer.is_none());
     assert!(!fx.drv.closed());
+}
+
+/// An entry whose name is not UTF-8 (it shows with U+FFFD) is never opened or handed to the
+/// editor: the status says why.
+#[test]
+fn an_entry_named_in_bad_utf8_is_not_opened() {
+    let mut fx = fixture();
+    let mut entries = fx.b.panels[0].entries[1..].to_vec();
+    entries.push(crate::remote::Entry {
+        name: "q\u{FFFD}.txt".to_string(),
+        lossy: true,
+        kind: EntryKind::File,
+        link: false,
+        size: 3,
+        mtime: std::time::SystemTime::UNIX_EPOCH,
+    });
+    let dir = fx.root.clone();
+    fx.b.panels[0].fill(dir, entries, None, None);
+    fx.select("q\u{FFFD}.txt");
+    fx.key(Key::Enter);
+    assert!(fx.b.task.is_none() && fx.b.viewer.is_none());
+    assert!(
+        fx.b.status.text.contains("not valid UTF-8"),
+        "{}",
+        fx.b.status.text
+    );
+    fx.key(Key::F4);
+    fx.drv.idle(&mut fx.b, 2);
+    assert!(
+        fx.launched.lock().unwrap().is_empty(),
+        "F4 handed it to no editor"
+    );
+}
+
+/// P1: a path of wide glyphs (Hangul) is fitted by its laid-out width: the text drawn in the
+/// frame, "…" included, fits the room and keeps the path's end.
+#[test]
+fn a_wide_path_is_fitted_by_its_real_width() {
+    let fx = fixture();
+    let font = egui::FontId::monospace(13.0);
+    // The test kit has only egui's own fonts, where most glyphs (Hangul too, which a system
+    // font draws wide) are as wide as "0"; the ideographic space U+3000 is wider there.
+    let path = format!("/srv/{}/마지막폴더", "한\u{3000}글\u{3000}".repeat(8));
+    let w = |t: &str| {
+        fx.drv.ctx.fonts_mut(|f| {
+            f.layout_no_wrap(t.to_string(), font.clone(), egui::Color32::WHITE)
+                .size()
+                .x
+        })
+    };
+    assert!(
+        w("\u{3000}") > w("0") * 1.2,
+        "the case needs a glyph wider than 0"
+    );
+    for room in [120.0, 260.0, 400.0] {
+        let fitted = chrome::fit_left(&fx.drv.ctx, &path, &font, room);
+        let width = w(&fitted);
+        assert!(width <= room, "{fitted:?} is {width} wide in {room}");
+        assert!(
+            fitted.starts_with('…') && fitted.ends_with("마지막폴더"),
+            "{fitted:?}"
+        );
+    }
+    let short = "/a/b";
+    assert_eq!(chrome::fit_left(&fx.drv.ctx, short, &font, 400.0), short);
+}
+
+/// P2: a dot file keeps its whole name, however many dots (spec §3a): no extension.
+#[test]
+fn dot_files_keep_their_whole_name() {
+    let file = |name: &str| crate::remote::Entry {
+        name: name.to_string(),
+        lossy: false,
+        kind: EntryKind::File,
+        link: false,
+        size: 1,
+        mtime: std::time::SystemTime::UNIX_EPOCH,
+    };
+    assert_eq!(panel::split_name(&file(".bashrc")), (".bashrc", ""));
+    assert_eq!(
+        panel::split_name(&file(".config.json")),
+        (".config.json", "")
+    );
+    assert_eq!(panel::split_name(&file("main.rs")), ("main", "rs"));
+    assert_eq!(panel::split_name(&file("a.tar.gz")), ("a.tar", "gz"));
+}
+
+/// P-nice: a time before 1970 with a fraction of a second floors (the second it is in), and
+/// the footer adds sizes without overflow.
+#[test]
+fn early_times_floor_and_the_footer_never_overflows() {
+    let mut e = crate::remote::Entry {
+        name: "old".to_string(),
+        lossy: false,
+        kind: EntryKind::File,
+        link: false,
+        size: u64::MAX,
+        mtime: std::time::SystemTime::UNIX_EPOCH - std::time::Duration::from_millis(500),
+    };
+    assert_eq!(panel::unix_secs(e.mtime), -1);
+    assert_eq!(panel::unix_secs(std::time::SystemTime::UNIX_EPOCH), 0);
+    let mut p = Panel::new("/x");
+    e.name = "b".into();
+    let mut f = e.clone();
+    f.name = "c".into();
+    p.fill("/x".into(), vec![e, f], None, None);
+    assert!(
+        p.footer()
+            .starts_with("2 listed = 36,893,488,147,419,103,230 bytes"),
+        "{}",
+        p.footer()
+    );
+}
+
+/// B1: an F4 launch that finishes later (here: fails after a moment) wakes the window by
+/// itself — no input comes — and its error shows on the next pass.
+#[test]
+fn a_finished_f4_launch_wakes_the_window() {
+    let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+    let go = Arc::new(Mutex::new(go_rx));
+    let launch: Launch = Arc::new(move |_: &str, _: bool| {
+        go.lock().unwrap().recv().unwrap();
+        anyhow::bail!("VS Code was not found and Zed was not found; install an editor")
+    });
+    let mut fx = fixture_with(None, local_connect(), Some(launch));
+    fx.select("main.rs");
+    fx.key(Key::F4);
+    assert!(fx.b.status.text.starts_with("opening in the editor"));
+    // From here no pass runs until the window asks for one: every repaint request is seen.
+    let woken = Arc::new(Mutex::new(Vec::new()));
+    let seen = woken.clone();
+    fx.drv
+        .ctx
+        .set_repaint_observer(move |info| seen.lock().unwrap().push(info.delay));
+    go_tx.send(()).unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !woken.lock().unwrap().iter().any(|d| d.is_zero()) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the window was never woken"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    fx.drv.idle(&mut fx.b, 1);
+    assert!(
+        fx.b.status.error && fx.b.status.text.contains("Zed was not found"),
+        "{}",
+        fx.b.status.text
+    );
+}
+
+/// B-nice: a listing that works after one that failed clears the failure from the status row.
+#[test]
+fn a_good_listing_clears_an_earlier_listing_error() {
+    let mut fx = fixture();
+    let gone = format!("{}/gone", fx.root);
+    fx.b.list(Some(0), gone, None, None);
+    fx.settle();
+    assert!(fx.b.status.error, "{}", fx.b.status.text);
+    let root = fx.root.clone();
+    fx.b.list(Some(0), root, None, None);
+    fx.settle();
+    assert!(
+        !fx.b.status.error && fx.b.status.text.is_empty(),
+        "{}",
+        fx.b.status.text
+    );
+}
+
+/// X1: a running save is never cut off. The upload is held at a gate; Esc and closing the window
+/// both leave the image (it says it closes when the save is done); once the save lands the
+/// viewer goes — and the window with it, as the last thing asked was closing it — and the file
+/// holds the saved edit, its original backed up.
+#[test]
+fn a_running_save_is_not_cut_off() {
+    let gate = Gate::default();
+    let mut fx = fixture_with(None, gated(&gate, "create_from"), None);
+    fx.open("photo.png");
+    edit_image(&mut fx);
+    fx.drv
+        .key(&mut fx.b, Key::S, crate::gui::testkit::command(false));
+    gate.reached();
+    fx.key(Key::Escape);
+    assert!(fx.b.viewer.is_some(), "Esc during the save left the image");
+    assert!(
+        fx.drv
+            .find_text("the window closes when the save is done")
+            .is_some(),
+        "it says why it stays"
+    );
+    assert!(
+        !Window::close_requested(&mut fx.b),
+        "closing the window waits too"
+    );
+    fx.drv.idle(&mut fx.b, 1);
+    assert!(fx.b.viewer.is_some() && !fx.drv.closed());
+    gate.release();
+    fx.drv.until(&mut fx.b, 10, |b| b.viewer.is_none());
+    assert!(fx.drv.closed(), "the window closes once the save is done");
+    let (w, h) = image::image_dimensions(format!("{}/photo.png", fx.root)).unwrap();
+    assert!(
+        (w, h) != (64, 48) && w > 0 && h > 0,
+        "the crop was saved: {w}×{h}"
+    );
+    assert!(
+        fx.cache.join(".backup").exists(),
+        "the original was backed up first"
+    );
 }

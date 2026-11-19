@@ -299,6 +299,32 @@ impl Driver {
         found.into_iter().next().map(|(_, colors)| colors)
     }
 
+    /// The first text the last pass drew whole, where it can be seen, that starts with `prefix`.
+    pub fn text_starting_with(&self, prefix: &str) -> Option<String> {
+        let found = self.shown(|s| match s {
+            egui::Shape::Text(t) if t.galley.text().starts_with(prefix) && !t.galley.elided => {
+                Some((
+                    t.galley.rect.translate(t.pos.to_vec2()),
+                    t.galley.text().to_string(),
+                ))
+            }
+            _ => None,
+        });
+        found.into_iter().next().map(|(_, text)| text)
+    }
+
+    /// Where the last pass drew a picture (a mesh on a texture of the window's own, not the font
+    /// atlas) that can be seen.
+    pub fn pictures(&self) -> Vec<Rect> {
+        let found = self.shown(|s| match s {
+            egui::Shape::Mesh(m) if m.texture_id != egui::TextureId::default() => {
+                Some((m.calc_bounds(), ()))
+            }
+            _ => None,
+        });
+        found.into_iter().map(|(r, ())| r).collect()
+    }
+
     /// How many rows the last pass laid `text` out in, whole or cut with "…", if it drew it
     /// where it can be seen (as for [`Driver::find_text`]: inside its clip rect and the window).
     pub fn rows_of(&self, text: &str) -> Option<usize> {

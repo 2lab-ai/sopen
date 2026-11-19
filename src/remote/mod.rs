@@ -11,6 +11,7 @@ pub use sftp::{connection_args, SftpRemote};
 
 use anyhow::{anyhow, bail, Context, Result};
 use sha2::{Digest, Sha256};
+use std::ffi::{OsStr, OsString};
 use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
@@ -99,7 +100,12 @@ pub enum EntryKind {
 /// (to say what it points at).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Entry {
+    /// The name as shown: a name that is not valid UTF-8 has U+FFFD for its bad bytes.
     pub name: String,
+    /// The name is not valid UTF-8 (`name` is only how it shows): the file layer takes paths as
+    /// UTF-8, so the browser never opens such an entry, and nothing is ever looked up by `name`
+    /// — two different names can show alike.
+    pub lossy: bool,
     pub kind: EntryKind,
     /// The entry is a symbolic link: `kind`, `size` and `mtime` are its target's (the link's
     /// own when it is broken).
@@ -122,14 +128,15 @@ impl EntryKind {
 
 /// The entry `name` from its own attributes (`own`, as `lstat` gives them) and, for a symbolic
 /// link, its target's (`None`: the link is broken).
-fn entry(name: String, own: &Stat, target: Option<Stat>) -> Entry {
+fn entry(name: &OsStr, own: &Stat, target: Option<Stat>) -> Entry {
     let (kind, at) = match (own.is_symlink, target) {
         (true, Some(t)) => (EntryKind::of(&t), t),
         (true, None) => (EntryKind::Broken, *own),
         (false, _) => (EntryKind::of(own), *own),
     };
     Entry {
-        name,
+        name: name.to_string_lossy().into_owned(),
+        lossy: name.to_str().is_none(),
         kind,
         link: own.is_symlink,
         size: at.size,
@@ -138,14 +145,55 @@ fn entry(name: String, own: &Stat, target: Option<Stat>) -> Entry {
 }
 
 /// An entry whose own attributes could not be read.
-fn unknown_entry(name: String) -> Entry {
+fn unknown_entry(name: &OsStr) -> Entry {
     Entry {
-        name,
+        name: name.to_string_lossy().into_owned(),
+        lossy: name.to_str().is_none(),
         kind: EntryKind::Unknown,
         link: false,
         size: 0,
         mtime: std::time::UNIX_EPOCH,
     }
+}
+
+/// A directory's names as the listing gave them (their bytes) with the attributes it gave for
+/// each (`None`: none).
+pub(crate) type Listed = Vec<(OsString, Option<Stat>)>;
+
+/// The entries of a listing, sorted by name. `lookup(name, follow)` stats the entry by its own
+/// bytes — never by the name as shown, which two names can share: `follow` = false gives the
+/// entry's own attributes, asked only when the listing left them or its type out; `true` what a
+/// link points at, asked only for an entry its own attributes say is a link.
+pub(crate) fn entries_from(
+    listed: Listed,
+    lookup: &mut dyn FnMut(&OsStr, bool) -> Result<Option<Stat>>,
+) -> Vec<Entry> {
+    let untyped = |s: &Stat| !s.is_dir && !s.is_file && !s.is_symlink && s.missing.is_some();
+    let mut out = Vec::with_capacity(listed.len());
+    for (raw, given) in listed {
+        let own = match given {
+            Some(own) if !untyped(&own) => own,
+            // The listing left the attributes or the type out: the entry's own, by `lstat`.
+            _ => match lookup(&raw, false) {
+                Ok(Some(own)) if !untyped(&own) => own,
+                // Gone since the listing.
+                Ok(None) => continue,
+                Ok(Some(_)) | Err(_) => {
+                    out.push(unknown_entry(&raw));
+                    continue;
+                }
+            },
+        };
+        let target = if own.is_symlink {
+            lookup(&raw, true).ok().flatten()
+        } else {
+            None
+        };
+        out.push(entry(&raw, &own, target));
+    }
+    // By name as shown; two names that show alike by their bytes.
+    out.sort_by(|a, b| a.name.cmp(&b.name).then(a.lossy.cmp(&b.lossy)));
+    out
 }
 
 /// What a temp standing in for an existing file takes from it: its owner and permission bits,
@@ -319,30 +367,9 @@ pub trait RemoteFs {
     /// Entry names of a directory, sorted (detection only — sopen never syncs directories).
     fn list_dir(&mut self, path: &str) -> Result<Vec<String>>;
     /// The entries of a directory with their kind, size and modification time, sorted by name
-    /// (the file browser's listing). The local disk and SFTP read the attributes with the
-    /// listing; this fallback stats each name (a round trip per name over a network).
-    fn list_entries(&mut self, path: &str) -> Result<Vec<Entry>> {
-        let mut out = Vec::new();
-        for name in self.list_dir(path)? {
-            let full = join(path, &name);
-            let own = match self.lstat_opt(&full) {
-                Ok(Some(own)) => own,
-                // Gone since the listing.
-                Ok(None) => continue,
-                Err(_) => {
-                    out.push(unknown_entry(name));
-                    continue;
-                }
-            };
-            let target = if own.is_symlink {
-                self.stat_opt(&full).ok().flatten()
-            } else {
-                None
-            };
-            out.push(entry(name, &own, target));
-        }
-        Ok(out)
-    }
+    /// (the file browser's listing), from the listing's own attributes ([`entries_from`]): one
+    /// round trip over SFTP, plus a stat per link.
+    fn list_entries(&mut self, path: &str) -> Result<Vec<Entry>>;
     /// Bytes free for this account on the filesystem holding `path`, when that costs one
     /// request (`None` otherwise, or when it fails).
     fn free_space(&mut self, _path: &str) -> Option<u64> {
@@ -409,9 +436,10 @@ pub trait RemoteFs {
         self.fetch_cancellable(remote, local, progress, &AtomicBool::new(false))
     }
 
-    /// [`RemoteFs::fetch`] that stops when `cancel` is set (checked at every write into the
-    /// copy): the partial copy is removed, `local` is left as it was, and the error is
-    /// [`Cancelled`].
+    /// [`RemoteFs::fetch`] that stops when `cancel` is set — checked before each attempt, at
+    /// every write into the copy, and once more before the complete copy is published (a cancel
+    /// after the last write, or of a file with no bytes): the partial copy is removed, `local`
+    /// is left as it was, and the error is [`Cancelled`].
     fn fetch_cancellable(
         &mut self,
         remote: &str,
@@ -431,7 +459,11 @@ pub trait RemoteFs {
                 .unwrap_or_default(),
             random_hex()
         ));
+        let stopped = || cancel.load(Ordering::Relaxed);
         for _ in 0..2 {
+            if stopped() {
+                return Err(anyhow!(Cancelled));
+            }
             let before = self.stat(remote)?;
             if before.is_dir {
                 bail!("{remote} is a directory");
@@ -453,17 +485,22 @@ pub trait RemoteFs {
                 Ok(out.finish())
             })();
             let got = match result {
-                Ok(got) => got,
-                Err(e) => {
+                Ok(got) if !stopped() => got,
+                outcome => {
                     let _ = std::fs::remove_file(&part);
-                    if cancel.load(Ordering::Relaxed) {
-                        return Err(anyhow!(Cancelled));
-                    }
-                    return Err(e);
+                    return match outcome {
+                        Err(e) if !stopped() => Err(e),
+                        _ => Err(anyhow!(Cancelled)),
+                    };
                 }
             };
             let after = self.stat_opt(remote)?;
             let whole = before.missing == Some("size") || got.size == before.size;
+            if stopped() {
+                // Cancelled during the check: the copy is complete, but not wanted.
+                let _ = std::fs::remove_file(&part);
+                return Err(anyhow!(Cancelled));
+            }
             if after.is_some_and(|a| same_stat(&a, &before)) && whole {
                 std::fs::rename(&part, local)
                     .with_context(|| format!("cannot move into {}", local.display()))?;

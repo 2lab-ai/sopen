@@ -48,6 +48,7 @@ impl Panel {
                 0,
                 Entry {
                     name: UP.to_string(),
+                    lossy: false,
                     kind: EntryKind::Dir,
                     link: false,
                     size: 0,
@@ -56,7 +57,7 @@ impl Panel {
             );
         }
         self.highlight = select
-            .and_then(|name| entries.iter().position(|e| e.name == name))
+            .and_then(|name| entries.iter().position(|e| e.name == name && !e.lossy))
             .unwrap_or(0);
         self.top = 0;
         self.moved = true;
@@ -131,25 +132,34 @@ impl Panel {
     /// `N listed = N bytes` (the entries but `..`, the bytes of the files), and the free space.
     pub fn footer(&self) -> String {
         let listed: Vec<&Entry> = self.entries.iter().filter(|e| e.name != UP).collect();
-        let bytes: u64 = listed
+        let bytes: u128 = listed
             .iter()
             .filter(|e| e.kind == EntryKind::File)
-            .map(|e| e.size)
+            .map(|e| u128::from(e.size))
             .sum();
         let mut line = format!(
             "{} listed = {} bytes",
-            grouped(listed.len() as u64),
+            grouped(listed.len() as u128),
             grouped(bytes)
         );
         if let Some(free) = self.free {
-            line.push_str(&format!(" · {} bytes free", grouped(free)));
+            line.push_str(&format!(" · {} bytes free", grouped(u128::from(free))));
         }
         line
     }
 }
 
-fn grouped(n: u64) -> String {
-    crate::gui::hex::grouped(n)
+/// `1234567` → `1,234,567`.
+fn grouped(n: u128) -> String {
+    let digits = n.to_string();
+    let mut out = String::new();
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
 }
 
 /// Folders (and links to folders) first, then everything else; each by name regardless of
@@ -170,10 +180,10 @@ pub fn hidden(entry: &Entry) -> bool {
 }
 
 /// The Name and Ext columns: a file's extension apart (`main.rs` → `main`, `rs`); a folder,
-/// a dot file (`.bashrc`) and a name without a dot keep the whole name.
+/// a dot file (`.bashrc`, `.config.json`) and a name without a dot keep the whole name.
 pub fn split_name(entry: &Entry) -> (&str, &str) {
     let name = entry.name.as_str();
-    if entry.kind == EntryKind::Dir {
+    if entry.kind == EntryKind::Dir || name.starts_with('.') {
         return (name, "");
     }
     match name.rfind('.') {
@@ -188,7 +198,7 @@ pub fn size_cell(entry: &Entry) -> String {
         _ if entry.name == UP => "<UP>".to_string(),
         EntryKind::Dir if entry.link => "<LINK>".to_string(),
         EntryKind::Dir => "<DIR>".to_string(),
-        EntryKind::File => grouped(entry.size),
+        EntryKind::File => grouped(u128::from(entry.size)),
         EntryKind::Special => "<SPECIAL>".to_string(),
         EntryKind::Broken => "<BROKEN>".to_string(),
         EntryKind::Unknown => "?".to_string(),
@@ -201,10 +211,7 @@ pub fn date_cells(entry: &Entry) -> (String, String) {
     if entry.name == UP || entry.kind == EntryKind::Unknown {
         return (String::new(), String::new());
     }
-    let secs = match entry.mtime.duration_since(SystemTime::UNIX_EPOCH) {
-        Ok(d) => d.as_secs() as libc::time_t,
-        Err(e) => -(e.duration().as_secs() as libc::time_t),
-    };
+    let secs = unix_secs(entry.mtime) as libc::time_t;
     // SAFETY: an all-zero tm is a valid value to be overwritten.
     let mut tm: libc::tm = unsafe { std::mem::zeroed() };
     // SAFETY: both pointers are valid for the call; localtime_r is the thread-safe variant.
@@ -220,6 +227,18 @@ pub fn date_cells(entry: &Entry) -> (String, String) {
         ),
         format!("{:02}:{:02}", tm.tm_hour, tm.tm_min),
     )
+}
+
+/// Seconds since 1970, floored: a moment before it is in the second that starts at or before
+/// it (half a second before is -1).
+pub fn unix_secs(t: SystemTime) -> i64 {
+    match t.duration_since(SystemTime::UNIX_EPOCH) {
+        Ok(d) => d.as_secs() as i64,
+        Err(e) => {
+            let d = e.duration();
+            -(d.as_secs() as i64) - i64::from(d.subsec_nanos() > 0)
+        }
+    }
 }
 
 /// A row as plain text, the columns the panel shows (the `SOPEN_LIST` hook prints these).

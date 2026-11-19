@@ -28,8 +28,9 @@ just check   # cargo fmt --check · cargo clippy --all-targets --locked -- -D wa
 
 A change is done when the gate is green on macOS and Linux (CI) and, for anything user-visible, a receipt
 exists: a command output or a window screenshot that someone actually looked at. Locally, tests that need ffmpeg,
-zsh, fish or node skip with a note when it is missing; CI installs them (node is on the runners) and sets
-`SOPEN_REQUIRE_FFMPEG=1`, `SOPEN_REQUIRE_SHELLS=1` and `SOPEN_REQUIRE_NODE=1`, so there they fail instead.
+zsh, fish, node or OpenSSH's `sftp-server` skip with a note when it is missing; CI installs them (node is on the
+runners, `sftp-server` on macOS) and sets `SOPEN_REQUIRE_FFMPEG=1`, `SOPEN_REQUIRE_SHELLS=1`,
+`SOPEN_REQUIRE_NODE=1` and `SOPEN_REQUIRE_SFTP_SERVER=1`, so there they fail instead.
 
 ## Rules
 

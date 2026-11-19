@@ -82,30 +82,28 @@ impl RemoteFs for LocalFs {
         Ok(names)
     }
 
-    /// One `read_dir` and an `lstat` per name (a local call, not a round trip); a link is
-    /// followed only to say what it points at.
+    /// One `read_dir`, then an `lstat` per name (a local call, not a round trip), by the
+    /// name's own bytes; a link is followed only to say what it points at.
     fn list_entries(&mut self, path: &str) -> Result<Vec<Entry>> {
-        let mut out = Vec::new();
+        let mut listed = Vec::new();
         for item in fs::read_dir(path).with_context(|| format!("cannot list {path}"))? {
             let item = item.with_context(|| format!("cannot list {path}"))?;
-            let name = item.file_name().to_string_lossy().into_owned();
-            let own = match fs::symlink_metadata(item.path()) {
-                Ok(meta) => stat_of(&meta),
-                // Gone since the listing.
-                Err(e) if e.kind() == ErrorKind::NotFound => continue,
-                Err(_) => {
-                    out.push(super::unknown_entry(name));
-                    continue;
-                }
-            };
-            let target = own
-                .is_symlink
-                .then(|| fs::metadata(item.path()).ok().map(|m| stat_of(&m)))
-                .flatten();
-            out.push(super::entry(name, &own, target));
+            listed.push((item.file_name(), None));
         }
-        out.sort_by(|a, b| a.name.cmp(&b.name));
-        Ok(out)
+        let dir = Path::new(path);
+        Ok(super::entries_from(listed, &mut |name, follow| {
+            let full = dir.join(name);
+            let meta = if follow {
+                fs::metadata(&full)
+            } else {
+                fs::symlink_metadata(&full)
+            };
+            match meta {
+                Ok(meta) => Ok(Some(stat_of(&meta))),
+                Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),
+                Err(e) => Err(e).with_context(|| format!("cannot stat {}", full.display())),
+            }
+        }))
     }
 
     #[allow(clippy::unnecessary_cast)] // the field types differ between macOS and Linux
