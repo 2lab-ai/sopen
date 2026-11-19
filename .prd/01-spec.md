@@ -189,24 +189,23 @@ replaces that module alone.
   page plain, ready, with the reason on the status row. A line is parsed only whole, so
   highlighting stops at the first line over 4096 bytes (the status row says which) and the rest
   is plain; files over 16 MiB are shown plain. The file is read live, the index is of the file as
-  opened, checked when the viewer opens and before each page. An append is not a change: the
-  same file (device and inode, through the open handle and its path), larger, with the last 4 KiB
-  of what was indexed still the same bytes — a log being written to — keeps scrolling over the
-  indexed part (End reaches the indexed end, highlighting goes on) and the status row says "the
-  file grew since it was opened (+N bytes) — Esc and open it again to see the end". A matching
-  tail does not prove what comes before it, so while the file is not as indexed every read first
-  checks the index intervals it relies on — the lines between two marks still start where
-  counted (over at most a span and a shown line from the mark) and the byte before the next mark
-  is a newline — once per interval for each size seen; one that does not hold is a change.
-  Edits that keep every line where it was (characters only) pass: the pages read as they now are,
-  but highlighting already computed for lines before the page on screen can lag until the file
-  is opened again. Anything else is a change: what its path now names is another file (as when an editor saves by renaming a new
-  file over it) or none (deleted; a remote file's path is its cached copy), it is smaller, the same
-  size with another modification time, or the indexed end was rewritten. Then the status row says
-  so and the viewer reads no more (Esc and open it again). A write that lands after the check cannot make a read run away either: a line is never
-  read past where the index says it must end — the next mark, or 64 KiB past its own block's mark
-  when the next line was no mark — and one that does not end there is the same changed-file
-  status. Offsets from the index are always checked.
+  opened, checked when the viewer opens and before each page: the open handle and the path it was
+  opened by must still show the indexed device, inode, size and modification time. Any
+  difference — written to, grown (a log being written to), truncated, another file renamed over
+  the path by an editor's save — and the file is never read through the old index: it is indexed
+  again from its path, on a worker (stopped by Esc or closing the window), while the page on
+  screen stays shown with "re-reading the file…" and scrolling waits. At most one re-read runs,
+  and the next starts no sooner than max(1 s, 4 × the last index pass) after the previous ended
+  (until then "the file changed; re-reading it in a moment…"); a file that changed before
+  anything was shown is re-read at once. The new index replaces the old one with a fresh start
+  for highlighting; the viewer keeps its top line (clamped), or follows the new end if it was at
+  the end ("the file grew; following the end", like `tail -f`; else "the file changed; re-read").
+  A path that names nothing any more keeps the last page with "the file was deleted" and reads no
+  more. A remote file is viewed from its cached copy, which does not change under the viewer. A
+  write that lands between a change and its detection cannot make a read run away: a line is
+  never read past where the index says it must end — the next mark, or 64 KiB past its own
+  block's mark when the next line was no mark — and one that does not end there starts the same
+  re-read. Offsets from the index are always checked.
 - **Leaving a viewer** — Esc or F3 (when the viewer does not use Esc itself: the image and media
   windows' Esc first clears a drawn rectangle; an Esc that takes the keyboard from a text field
   is the field's), or closing the window — goes through that viewer's own close question: its

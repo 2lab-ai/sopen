@@ -21,9 +21,12 @@
 //! cut would colour everything after it), and the rest of the file is plain. Files over
 //! [`HIGHLIGHT_MAX`] are always shown plain.
 //!
-//! The file is read live; the index is of the file as opened. An append (the same file, larger,
-//! its indexed end as it was) only says so: the indexed part reads on. A file that changes
-//! otherwise ([`TextDoc::now`]) is noticed before each new page: the window says so and
+//! The file is read live; the index is of the file as opened. A file that differs from it in any
+//! way ([`TextDoc::now`]: written to, grown, truncated, another file renamed over its path) is
+//! never read through the old index: the viewer indexes the path again on a worker of its own —
+//! one at a time, the next no sooner than max(1 s, 4 × the last index pass) after the previous
+//! ended — keeps the page on screen meanwhile, and swaps the new index in (following the end if
+//! it was at the end). A deleted file keeps its page. Checked before each new page: the window says so and
 //! reads no more. Every offset taken from the index is checked, never trusted.
 
 use super::{chrome, Embedded, Outcome, Status, Window};
@@ -80,11 +83,8 @@ pub struct TextDoc {
     first_long: Option<u64>,
     /// The file as indexed: size, modification time and inode.
     opened: Identity,
-    /// The last bytes of what was indexed (up to [`TAIL`]): an append leaves them as they were.
-    tail: Vec<u8>,
-    /// Index intervals checked against the file as it is now (see [`TextDoc::check_intervals`]),
-    /// for the size it was seen at.
-    checked: (u64, std::collections::BTreeSet<usize>),
+    /// How long the index pass took (a re-read waits a multiple of it).
+    indexed_in: std::time::Duration,
     /// The path it was opened by (the local file, or the session's cached copy).
     path: std::path::PathBuf,
     /// Bytes read for lines (not the index pass) — what paging costs.
@@ -98,9 +98,6 @@ pub struct TextDoc {
 
 /// What [`TextDoc::changed`] compares: device, inode, size and modification time.
 type Identity = (u64, u64, u64, Option<std::time::SystemTime>);
-
-/// How much of the indexed end is kept to tell an append from a rewrite.
-const TAIL: usize = 4096;
 
 fn identity(meta: &std::fs::Metadata) -> Identity {
     use std::os::unix::fs::MetadataExt;
@@ -131,6 +128,7 @@ impl TextDoc {
             }
         };
         stopped()?;
+        let started = std::time::Instant::now();
         let file = File::open(path).with_context(|| format!("cannot open {}", path.display()))?;
         let meta = file
             .metadata()
@@ -139,7 +137,6 @@ impl TextDoc {
         let mut marks = vec![Mark { line: 0, offset: 0 }];
         let (mut line, mut at, mut line_len) = (0u64, 0u64, 0u64);
         let (mut first_long, mut last_byte) = (None, None);
-        let mut tail: Vec<u8> = Vec::with_capacity(TAIL);
         let mut buf = vec![0u8; 1 << 20];
         loop {
             let n = file
@@ -174,11 +171,6 @@ impl TextDoc {
                 }
             }
             last_byte = Some(buf[n - 1]);
-            // The last TAIL bytes scanned (of what is indexed, not of the file now).
-            tail.extend_from_slice(&buf[n.saturating_sub(TAIL)..n]);
-            if tail.len() > TAIL {
-                tail.drain(..tail.len() - TAIL);
-            }
             at += n as u64;
             on_chunk(at);
             stopped()?;
@@ -202,8 +194,7 @@ impl TextDoc {
             ends_newline,
             first_long,
             opened,
-            tail,
-            checked: (size, Default::default()),
+            indexed_in: started.elapsed(),
             path: path.to_path_buf(),
             page_reads: 0,
             #[cfg(test)]
@@ -213,49 +204,33 @@ impl TextDoc {
         })
     }
 
-    /// The file is not the one indexed any more. The handle is checked (written in place: another
-    /// size or modification time) and so is the path it was opened by, followed through links
-    /// as the open followed them: a save that writes a new file and renames it over this one, or
-    /// a delete, leaves the handle on the old file — another device or inode at the path, or
-    /// nothing there, is a change too.
-    /// What the file is now, against the index. It is the same file — the handle's and the
-    /// path's (followed through links, as opened) device and inode — or it [`Now::Changed`]:
-    /// a save by rename, a delete. Then by its size: the same size and modification time is
-    /// [`Now::Same`]; larger, with the last indexed bytes still as they were (a bounded read of
-    /// up to [`TAIL`] bytes), is an append, [`Now::Grew`] by that many bytes; anything else —
-    /// smaller, the same size written to, the indexed end rewritten — is [`Now::Changed`].
+    /// What the file is now, against the index: [`Now::Same`] only when the open handle and the
+    /// path it was opened by (followed through links, as opened) both still show the indexed
+    /// device, inode, size and modification time; [`Now::Gone`] when nothing is at the path
+    /// (deleted); anything else — written to, grown, truncated, another file renamed over the
+    /// path — [`Now::Changed`]. The viewer never reads a changed file through the old index: it
+    /// indexes the path again.
     pub fn now(&self) -> Now {
-        use std::os::unix::fs::MetadataExt;
-        let (dev, ino, len, mtime) = self.opened;
-        let (Ok(handle), Ok(named)) = (self.file.metadata(), std::fs::metadata(&self.path)) else {
-            return Now::Changed;
+        let named = match std::fs::metadata(&self.path) {
+            Ok(meta) => meta,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Now::Gone,
+            Err(_) => return Now::Changed,
         };
-        if [&handle, &named]
-            .iter()
-            .any(|m| m.dev() != dev || m.ino() != ino)
-        {
-            return Now::Changed;
-        }
-        let now = handle.len();
-        if now == len && handle.modified().ok() == mtime {
-            return Now::Same;
-        }
-        if now <= len || len != self.size {
-            return Now::Changed;
-        }
-        // Appended to, if the indexed end is still the bytes indexed.
-        let mut held = vec![0u8; self.tail.len()];
-        let from = self.size - self.tail.len() as u64;
-        match self.file.read_exact_at(&mut held, from) {
-            Ok(()) if held == self.tail => Now::Grew(now - len),
+        let same = |m: &std::fs::Metadata| identity(m) == self.opened;
+        match self.file.metadata() {
+            Ok(handle) if same(&handle) && same(&named) => Now::Same,
             _ => Now::Changed,
         }
     }
 
-    /// The file is not the one indexed any more ([`TextDoc::now`] says [`Now::Changed`]); an
-    /// append is not a change.
+    /// The file is not as indexed any more ([`TextDoc::now`] is not [`Now::Same`]).
     pub fn changed(&self) -> bool {
-        self.now() == Now::Changed
+        self.now() != Now::Same
+    }
+
+    /// The path the file was opened by.
+    pub fn path(&self) -> &Path {
+        &self.path
     }
 
     /// The same file and index on a handle of its own (the highlighting worker's).
@@ -271,8 +246,7 @@ impl TextDoc {
             ends_newline: self.ends_newline,
             first_long: self.first_long,
             opened: self.opened,
-            tail: self.tail.clone(),
-            checked: (self.size, Default::default()),
+            indexed_in: self.indexed_in,
             path: self.path.clone(),
             page_reads: 0,
             #[cfg(test)]
@@ -340,7 +314,6 @@ impl TextDoc {
         if first >= last {
             return Ok(out);
         }
-        self.check_intervals(first, last)?;
         let mut idx = self.mark_before(first);
         let (mut line, mut pos) = (self.marks[idx].line, self.marks[idx].offset);
         let mut window = Window_::default();
@@ -413,8 +386,9 @@ impl TextDoc {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Now {
     Same,
-    Grew(u64),
     Changed,
+    /// Nothing is at the path any more.
+    Gone,
 }
 
 /// The file is not what was indexed: a line that should end before the next mark does not.
@@ -432,88 +406,6 @@ impl std::error::Error for Stale {}
 /// Whether `e` says the file changed under the index ([`Stale`]).
 pub fn is_stale(e: &anyhow::Error) -> bool {
     e.chain().any(|c| c.is::<Stale>())
-}
-
-/// What the window says once the file changed: it reads no more.
-const CHANGED: &str =
-    "the file changed since it was opened — Esc, then open it again to see it now";
-
-impl TextDoc {
-    /// Once the file is not as indexed any more (larger, or written to — growth that looks like
-    /// an append by its tail may still have moved lines before it): the index intervals that a
-    /// read of lines `first..last` relies on are checked against the bytes now, each once for
-    /// the size seen ([`TextDoc::check_interval`]). One that no longer holds its lines is
-    /// [`Stale`].
-    fn check_intervals(&mut self, first: u64, last: u64) -> Result<()> {
-        let meta = self.file.metadata().context("cannot stat the file")?;
-        let (_, _, len, mtime) = self.opened;
-        if meta.len() == len && meta.modified().ok() == mtime {
-            return Ok(());
-        }
-        if self.checked.0 != meta.len() {
-            self.checked = (meta.len(), Default::default());
-        }
-        let (from, to) = (self.mark_before(first), self.mark_before(last - 1));
-        for i in from..=to {
-            if !self.checked.1.contains(&i) {
-                self.check_interval(i)?;
-                self.checked.1.insert(i);
-            }
-        }
-        Ok(())
-    }
-
-    /// Whether the interval from mark `i` to the next one still holds the lines the index says:
-    /// counted over at most a span plus a shown line's bytes from the mark — where all its line
-    /// starts but the last line's are (or a mark would be there) and the shown part of its last
-    /// line — and the byte before the next mark a newline. A newline added deep inside a long
-    /// last line, past what is shown of it, is not seen.
-    fn check_interval(&mut self, i: usize) -> Result<()> {
-        let (mark, next) = (self.marks[i], self.next_mark(i));
-        let lines = next.line.saturating_sub(mark.line);
-        if lines == 0 {
-            return Ok(());
-        }
-        let end = next.offset;
-        let seen_end = end.min(mark.offset.saturating_add(SPAN + LINE_MAX as u64));
-        let mut seen = vec![0u8; seen_end.saturating_sub(mark.offset) as usize];
-        self.read_exactly(&mut seen, mark.offset)?;
-        let newlines = seen.iter().filter(|&&b| b == b'\n').count() as u64;
-        // Every line of the interval ends with a newline, but the file's last line may not.
-        let last_has_newline = next.line < self.lines || self.ends_newline;
-        let whole = seen_end == end;
-        let want = if whole && last_has_newline {
-            lines
-        } else {
-            lines - 1
-        };
-        let ends_right = !last_has_newline || {
-            if whole {
-                seen.last() == Some(&b'\n')
-            } else {
-                let mut byte = [0u8; 1];
-                self.read_exactly(&mut byte, end - 1)?;
-                byte[0] == b'\n'
-            }
-        };
-        if newlines != want || !ends_right {
-            return Err(anyhow::Error::new(Stale));
-        }
-        Ok(())
-    }
-
-    /// Exactly `buf.len()` bytes at `at` (counted as page reads); fewer is [`Stale`].
-    fn read_exactly(&mut self, buf: &mut [u8], at: u64) -> Result<()> {
-        let mut got = 0;
-        while got < buf.len() {
-            let n = self.read_at(&mut buf[got..], at + got as u64)?;
-            if n == 0 {
-                return Err(anyhow::Error::new(Stale));
-            }
-            got += n;
-        }
-        Ok(())
-    }
 }
 
 /// The last [`CHUNK`] read for [`TextDoc::read_lines`]: short lines next to each other cost one
@@ -1031,29 +923,62 @@ struct TextWindow {
     notices: Vec<String>,
     status: Status,
     painted: bool,
-    /// The file changed since it was opened: nothing more is read.
-    stale: bool,
-    /// Bytes appended since it was opened (the status says so); the indexed part is shown.
-    grew: Option<u64>,
+    /// The file differs from its index: nothing is read through it until a re-read lands.
+    waiting: bool,
+    /// The file was deleted: the page stays, nothing more is read.
+    gone: bool,
+    /// The re-read under way, if one is.
+    reindex: Option<Reindex>,
+    /// The time (tests move it), when the last index pass ended and how long it took.
+    clock: Box<dyn Fn() -> std::time::Instant>,
+    index_done: std::time::Instant,
+    index_took: std::time::Duration,
+    /// Re-reads started so far.
+    reindexes: usize,
+    /// Called as a re-read's worker starts (tests: hold it).
+    #[cfg(test)]
+    reindex_hook: Option<Arc<dyn Fn() + Send + Sync>>,
 }
+
+/// A re-read of the file from its path, on a worker. Dropping it (the viewer gone) cancels it;
+/// it is never waited for.
+struct Reindex {
+    cancel: Arc<AtomicBool>,
+    rx: Receiver<Result<TextDoc>>,
+    /// The viewer was at the end when the change was seen (it follows the new end).
+    at_end: bool,
+    /// The worker's thread ended (tests).
+    #[cfg_attr(not(test), allow(dead_code))]
+    exited: Arc<AtomicBool>,
+}
+
+impl Drop for Reindex {
+    fn drop(&mut self) {
+        self.cancel.store(true, Ordering::Relaxed);
+    }
+}
+
+/// The shortest wait between the end of one index pass and the start of the next.
+const REINDEX_GAP: std::time::Duration = std::time::Duration::from_secs(1);
 
 impl TextWindow {
     fn new(mut doc: TextDoc, title: String, name: &str, notices: Vec<String>) -> Self {
-        // Changed since it was indexed (between the opener's worker and now): nothing is read.
-        // Appended to is not a change: the indexed part reads as it was.
-        let stale = doc.changed();
-        let first = if stale {
-            String::new()
-        } else {
+        // Changed since it was indexed (between the opener's worker and now): nothing is read
+        // through that index; the first pass re-reads it.
+        let now = doc.now();
+        let first = if now == Now::Same {
             doc.read_lines(0, 1)
                 .ok()
                 .and_then(|l| l.into_iter().next())
                 .map(|l| l.text)
                 .unwrap_or_default()
+        } else {
+            String::new()
         };
         let syntax = syntax_for(name, &first);
+        let index_took = doc.indexed_in;
         let status = match (syntax, doc.first_long) {
-            _ if stale => Status::error(CHANGED),
+            _ if now == Now::Gone => Status::error("the file was deleted"),
             (None, _) => Status::default(),
             _ if doc.size() > HIGHLIGHT_MAX => Status::info(format!(
                 "over {}: shown without highlighting",
@@ -1077,7 +1002,15 @@ impl TextWindow {
             #[cfg(test)]
             after_wake: None,
             pool: Pool::global(),
-            grew: None,
+            waiting: now == Now::Changed,
+            gone: now == Now::Gone,
+            reindex: None,
+            clock: Box::new(std::time::Instant::now),
+            index_done: std::time::Instant::now(),
+            index_took,
+            reindexes: 0,
+            #[cfg(test)]
+            reindex_hook: None,
             top: 0,
             visible: 1,
             left: 0,
@@ -1086,11 +1019,121 @@ impl TextWindow {
             notices,
             status,
             painted: false,
-            stale,
+        }
+    }
+
+    /// Nothing is read now: the file differs from its index (a re-read is due or under way), or
+    /// it was deleted.
+    fn frozen(&self) -> bool {
+        self.waiting || self.reindex.is_some() || self.gone
+    }
+
+    /// When the next index pass may start: max(1 s, 4 × the last pass) after it ended.
+    fn next_pass_at(&self) -> std::time::Instant {
+        self.index_done + REINDEX_GAP.max(self.index_took * 4)
+    }
+
+    /// The file differs from its index: a re-read starts now if the last pass is long enough
+    /// ago (or nothing is on screen yet), else a repaint is asked for when it will be.
+    fn start_reindex(&mut self, ctx: &egui::Context) {
+        if self.reindex.is_some() {
+            return;
+        }
+        let now = (self.clock)();
+        let due = self.next_pass_at();
+        if self.page.is_some() && now < due {
+            self.status = Status::info("the file changed; re-reading it in a moment…");
+            ctx.request_repaint_after(due - now);
+            return;
+        }
+        let at_end = self.top.saturating_add(self.visible) >= self.doc.line_count();
+        let (tx, rx) = mpsc::channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let exited = Arc::new(AtomicBool::new(false));
+        let (stop, ex, path, waker) = (
+            cancel.clone(),
+            exited.clone(),
+            self.doc.path().to_path_buf(),
+            ctx.clone(),
+        );
+        #[cfg(test)]
+        let hook = self.reindex_hook.clone();
+        std::thread::spawn(move || {
+            #[cfg(test)]
+            if let Some(hook) = hook {
+                hook();
+            }
+            let result = TextDoc::open_cancellable(&path, &stop);
+            let _ = tx.send(result);
+            ex.store(true, Ordering::Relaxed);
+            waker.request_repaint();
+        });
+        self.reindexes += 1;
+        // The old index is not read any more: its highlighting goes too.
+        self.worker = None;
+        self.status = Status::info("re-reading the file…");
+        self.reindex = Some(Reindex {
+            cancel,
+            rx,
+            at_end,
+            exited,
+        });
+    }
+
+    /// A re-read that landed: its index replaces the old one, with a fresh generation and a new
+    /// highlighter (next pass); the same top line (clamped), or the new end if the viewer was at
+    /// the end.
+    fn poll_reindex(&mut self) {
+        let Some(reindex) = &self.reindex else {
+            return;
+        };
+        let result = match reindex.rx.try_recv() {
+            Ok(result) => result,
+            Err(mpsc::TryRecvError::Empty) => return,
+            Err(mpsc::TryRecvError::Disconnected) => Err(anyhow::anyhow!("the re-read stopped")),
+        };
+        let at_end = reindex.at_end;
+        self.reindex = None;
+        self.index_done = (self.clock)();
+        match result {
+            Ok(doc) => {
+                let grew = doc.size() > self.doc.size();
+                self.index_took = doc.indexed_in;
+                self.doc = doc;
+                self.waiting = false;
+                self.page = None;
+                self.worker = None;
+                self.hl_tried = false;
+                let last_top = self.doc.line_count().saturating_sub(self.visible);
+                self.top = if at_end {
+                    last_top
+                } else {
+                    self.top.min(last_top)
+                };
+                self.status = Status::info(if grew && at_end {
+                    "the file grew; following the end"
+                } else {
+                    "the file changed; re-read"
+                });
+            }
+            Err(_) if self.doc.now() == Now::Gone => {
+                self.waiting = false;
+                self.gone = true;
+                self.status = Status::error("the file was deleted");
+            }
+            Err(e) => {
+                // Tried again after the usual wait.
+                self.index_took = std::time::Duration::ZERO;
+                self.status = Status::error(format!("cannot read the file again: {e:#}"));
+            }
         }
     }
 
     fn keys(&mut self, ctx: &egui::Context) {
+        if self.waiting || self.reindex.is_some() {
+            // Scrolling waits for the new index (the page on screen stays meanwhile).
+            return;
+        }
         let pressed = |key: Key| ctx.input_mut(|i| i.consume_key(Modifiers::NONE, key));
         let page = self.visible.saturating_sub(1).max(1);
         if pressed(Key::ArrowDown) {
@@ -1126,42 +1169,43 @@ impl TextWindow {
             .page
             .as_ref()
             .is_some_and(|p| p.top == top && p.count == count);
-        if !self.stale {
+        if !self.frozen() {
             match self.doc.now() {
-                Now::Changed => {
-                    self.stale = true;
-                    self.status = Status::error(CHANGED);
+                Now::Same => {}
+                Now::Changed => self.waiting = true,
+                Now::Gone => {
+                    self.gone = true;
+                    self.worker = None;
+                    self.status = Status::error("the file was deleted");
                 }
-                Now::Grew(more) if self.grew != Some(more) => {
-                    self.grew = Some(more);
-                    self.status = Status::info(format!(
-                        "the file grew since it was opened (+{more} bytes) — Esc and open it \
-                         again to see the end"
-                    ));
-                }
-                Now::Grew(_) | Now::Same => {}
             }
         }
-        if self.stale {
-            // The index no longer describes the file: the page on screen stays (an empty one if
-            // none was read yet), nothing more is read.
-            let page = self.page.get_or_insert_with(|| Page {
-                top,
-                count,
-                runs: Vec::new(),
-                highlighted: true,
-                gen: 0,
-            });
-            page.highlighted = true;
+        if self.waiting && self.reindex.is_none() {
+            self.start_reindex(ctx);
+        }
+        if self.frozen() {
+            // The page on screen stays (from memory); nothing is read through the old index. A
+            // file deleted before anything was shown shows an empty page.
+            if self.gone && self.page.is_none() {
+                self.page = Some(Page {
+                    top,
+                    count,
+                    runs: Vec::new(),
+                    highlighted: true,
+                    gen: 0,
+                });
+            }
+            if let Some(page) = self.page.as_mut() {
+                page.highlighted = true;
+            }
             return;
         }
         if !same {
             let lines = match self.doc.read_lines(top, count) {
                 Ok(lines) => lines,
                 Err(e) if is_stale(&e) => {
-                    // Changed after the check, during the read: said the same way.
-                    self.stale = true;
-                    self.status = Status::error(CHANGED);
+                    // Changed after the check, during the read: read again from the path.
+                    self.waiting = true;
                     return self.ensure_page(ctx, plain);
                 }
                 Err(e) => {
@@ -1198,8 +1242,8 @@ impl TextWindow {
                 }
                 Ok(Done::Page { .. }) => {}
                 Ok(Done::Stale) => {
-                    self.stale = true;
-                    self.status = Status::error(CHANGED);
+                    // The file changed under the worker: read again from the path.
+                    self.waiting = true;
                     gone = Some(None);
                     break;
                 }
@@ -1265,6 +1309,9 @@ impl TextWindow {
 
     fn body(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
+        // A re-read that landed is swapped in before anything reads or is measured (the
+        // highlighter below starts on the new index).
+        self.poll_reindex();
         let rect = ui.max_rect();
         let p = chrome::Palette::of(ui.visuals());
         let font = chrome::mono(ui);
@@ -1300,7 +1347,7 @@ impl TextWindow {
         self.top = self.top.min(lines.saturating_sub(self.visible));
         if !self.hl_tried {
             self.hl_tried = true;
-            if self.doc.size() <= HIGHLIGHT_MAX && !self.stale {
+            if self.doc.size() <= HIGHLIGHT_MAX && !self.frozen() {
                 let stop = self.doc.first_long.unwrap_or(u64::MAX);
                 let hl = self
                     .syntax
@@ -1394,6 +1441,8 @@ impl Window for TextWindow {
 
     fn ready(&self) -> bool {
         self.painted
+            && !self.waiting
+            && self.reindex.is_none()
             && self
                 .page
                 .as_ref()
