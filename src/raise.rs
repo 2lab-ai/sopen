@@ -4,15 +4,16 @@
 //! to activate its window. KWin grants that only with an activation token, which a CLI started by
 //! sopen — over ssh (`--target`) or from a terminal — does not carry: the window only demands
 //! attention, maybe on another virtual desktop or screen, and nothing visible happens. So after
-//! the hand-off sopen asks KWin itself, over its D-Bus scripting interface: a small script takes
-//! the newest window of the editor's class that demands attention and brings it to where the user
-//! is — the active window's desktops and screen (without one, the current desktop and the active
-//! screen) — un-minimized, and activates it. The user is never moved to another desktop. It runs a
-//! few times over about 3 s: the demand arrives after the CLI returns, and it clears once the
-//! window is active, so later runs do nothing. Windows of other apps, and the editor's windows
-//! that ask for nothing, are never touched. The runs happen in a detached `sopen --raise-window`,
-//! so sopen itself (and the ssh session of a `--target` run) ends at once. Every failure is
-//! silent: the open itself has already happened.
+//! the hand-off sopen asks KWin itself, over its D-Bus scripting interface: one script per open,
+//! loaded and run once and unloaded about 3 s later, brings the editor window of this open to where
+//! the user is — the active window's desktops and screen (without one, the current desktop and the
+//! active screen) — un-minimized, and activates it, once. The user is never moved to another
+//! desktop. "The window of this open" is the first editor window that asks for attention and
+//! shows the opened name in its title, or that starts asking, or appears, while the script is
+//! loaded; a window that already asked before and shows another name asked for something else, and
+//! is left alone, as are other apps' windows. The script runs in a detached
+//! `sopen --raise-window`, so sopen itself (and the ssh session of a `--target` run) ends at once.
+//! Every failure is silent: the open itself has already happened.
 
 use crate::zed::Os;
 use std::ffi::{OsStr, OsString};
@@ -21,15 +22,11 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-/// When the script runs, counted from the end of the hand-off.
-const RUNS: [Duration; 4] = [
-    Duration::from_millis(300),
-    Duration::from_millis(800),
-    Duration::from_millis(1500),
-    Duration::from_millis(3000),
-];
+/// How long the script stays loaded: the editor's window may ask for attention, change its title
+/// or appear only after the CLI returned.
+const HOLD: Duration = Duration::from_secs(3);
 /// The longest one D-Bus call may take (KWin answers in milliseconds); a call still running then
-/// is killed and ends the runs.
+/// is killed, and the script is unloaded.
 const CALL: Duration = Duration::from_millis(500);
 
 /// The editor sopen handed the folder or file to.
@@ -65,11 +62,22 @@ impl Editor {
     }
 }
 
-/// After `editor` was handed a folder or file: on KDE Plasma (Linux, `XDG_CURRENT_DESKTOP` names
-/// KDE), unless `SOPEN_RAISE=0`, starts a detached `sopen --raise-window` that brings its window
-/// to the user, and returns at once. `SOPEN_RAISE=wait` does it here instead, about 3 s (tests and
-/// receipts wait for it). Never fails.
-pub fn editor_window(editor: Editor) {
+/// The name an editor window shows in its title for `path` (a folder's or a file's last
+/// component; nothing for `/`).
+pub fn opened_name(path: &str) -> String {
+    Path::new(path)
+        .file_name()
+        .and_then(OsStr::to_str)
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// After `editor` was handed a folder or file named `opened` ([`opened_name`]): on KDE Plasma
+/// (Linux, `XDG_CURRENT_DESKTOP` names KDE), unless `SOPEN_RAISE=0`, starts a detached
+/// `sopen --raise-window` that brings its window to the user, and returns at once.
+/// `SOPEN_RAISE=wait` does it here instead, about 3 s (tests and receipts wait for it). Never
+/// fails.
+pub fn editor_window(editor: Editor, opened: &str) {
     let var = std::env::var_os;
     let mode = var("SOPEN_RAISE");
     let desktop = var("XDG_CURRENT_DESKTOP");
@@ -81,19 +89,19 @@ pub fn editor_window(editor: Editor) {
         return;
     };
     if mode.as_deref() == Some(OsStr::new("wait")) {
-        return raise(&tool, editor, &script_dir(), &RUNS, CALL);
+        return raise(&tool, editor, opened, &script_dir(), HOLD, CALL);
     }
-    if let Err(e) = detach(editor) {
+    if let Err(e) = detach(editor, opened) {
         crate::debug!("raise: cannot start sopen --raise-window: {e}");
     }
 }
 
-/// `sopen --raise-window <editor>` (hidden): the runs, in the foreground of this process — the
-/// detached child [`editor_window`] starts. Never fails.
-pub fn window_now(editor: Editor) {
+/// `sopen --raise-window <editor> --raise-caption=<opened>` (hidden): the script, in the
+/// foreground of this process — the detached child [`editor_window`] starts. Never fails.
+pub fn window_now(editor: Editor, opened: &str) {
     let path = std::env::var_os("PATH");
     if let Some(tool) = find_tool(path.as_deref(), crate::zed::is_executable) {
-        raise(&tool, editor, &script_dir(), &RUNS, CALL);
+        raise(&tool, editor, opened, &script_dir(), HOLD, CALL);
     }
 }
 
@@ -106,13 +114,14 @@ fn script_dir() -> PathBuf {
         .unwrap_or_else(std::env::temp_dir)
 }
 
-/// Starts this sopen as `sopen --raise-window <editor>` in a session of its own (a hangup of this
-/// terminal, or the end of a `--target` run's ssh session, does not reach it), with no input or
-/// output, and does not wait for it.
-fn detach(editor: Editor) -> std::io::Result<()> {
+/// Starts this sopen as `sopen --raise-window <editor> --raise-caption=<opened>` in a session of
+/// its own (a hangup of this terminal, or the end of a `--target` run's ssh session, does not reach
+/// it), with no input or output, and does not wait for it.
+fn detach(editor: Editor, opened: &str) -> std::io::Result<()> {
     use std::os::unix::process::CommandExt;
     let mut cmd = Command::new(std::env::current_exe()?);
     cmd.args(["--raise-window", editor.arg()])
+        .arg(format!("--raise-caption={opened}"))
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
@@ -209,22 +218,42 @@ fn find_tool(path_var: Option<&OsStr>, exists: impl Fn(&Path) -> bool) -> Option
     })
 }
 
-/// The KWin script (KWin 6's scripting API): the newest window of `editor`'s class that demands
-/// attention comes to where the user is — the active window's desktops and screen, else the
-/// current desktop and the active screen — un-minimized, and is activated.
-fn script(editor: Editor) -> String {
+/// The KWin script (KWin 6's scripting API) for an open of `opened` in `editor`. It brings one
+/// window to where the user is, once, and then does nothing more: the first editor window that
+/// (a) asks for attention and shows `opened` in its title — at load, newest first, or when its title
+/// changes later — or (b) starts asking for attention, or (c) appears, after the script started.
+/// The user is never moved to another desktop.
+fn script(editor: Editor, opened: &str) -> String {
     const SCRIPT: &str = "\
-// sopen: bring the editor window that asked for attention (the newest one) to where the user is,
-// and activate it. The user is never moved to another desktop.
-const editor = CLASS;
-const windows = workspace.windowList();
-let w = null;
-for (let i = windows.length - 1; i >= 0 && !w; i--) {
-    if (windows[i].demandsAttention && editor.test(windows[i].resourceClass)) {
-        w = windows[i];
-    }
+// sopen: bring the editor window of this open to where the user is, once, and activate it. The
+// user is never moved to another desktop.
+const editor = @CLASS@;
+const opened = @OPENED@;
+let done = false;
+const hooks = [];
+
+function hook(signal, handler) {
+    signal.connect(handler);
+    hooks.push([signal, handler]);
 }
-if (w) {
+
+function isEditor(w) {
+    return !!w && editor.test(w.resourceClass);
+}
+
+function shows(w) {
+    return opened !== \"\" && String(w.caption).indexOf(opened) !== -1;
+}
+
+function bring(w) {
+    if (done) {
+        return;
+    }
+    done = true;
+    for (const [signal, handler] of hooks) {
+        signal.disconnect(handler);
+    }
+    hooks.length = 0;
     // Where the user is: the active window's desktops (objects: names need not be unique) and
     // screen; without one (or on all desktops), the current desktop and the active screen.
     const here = workspace.activeWindow;
@@ -247,8 +276,62 @@ if (w) {
     }
     workspace.activeWindow = w;
 }
+
+// (b) an editor window that starts asking for attention now; (a) one that asks and shows the
+// name once its title changes (a new window's title comes later).
+function watch(w) {
+    hook(w.demandsAttentionChanged, () => {
+        if (w.demandsAttention) {
+            bring(w);
+        }
+    });
+    hook(w.captionChanged, () => {
+        if (w.demandsAttention && shows(w)) {
+            bring(w);
+        }
+    });
+}
+
+const windows = workspace.windowList();
+// (a) at load, newest first. A window that asks but shows another name asked before this open.
+for (let i = windows.length - 1; i >= 0 && !done; i--) {
+    const w = windows[i];
+    if (isEditor(w) && w.demandsAttention && shows(w)) {
+        bring(w);
+    }
+}
+if (!done) {
+    for (const w of windows) {
+        if (isEditor(w)) {
+            watch(w);
+        }
+    }
+    // (c) a new editor window: a folder not open yet opens one.
+    hook(workspace.windowAdded, (w) => {
+        if (isEditor(w)) {
+            bring(w);
+        }
+    });
+}
 ";
-    SCRIPT.replace("CLASS", editor.class())
+    SCRIPT
+        .replacen("@CLASS@", editor.class(), 1)
+        .replacen("@OPENED@", &js_string(opened), 1)
+}
+
+/// `text` as a JavaScript string literal in plain ASCII: letters, digits, space and `-._` as they
+/// are, every other UTF-16 unit as `\uXXXX` — so no quote, backslash, line break or comment marker
+/// in a file name can end the literal or the script.
+fn js_string(text: &str) -> String {
+    let mut out = String::from("\"");
+    for unit in text.encode_utf16() {
+        match char::from_u32(u32::from(unit)) {
+            Some(c) if c.is_ascii_alphanumeric() || " -._".contains(c) => out.push(c),
+            _ => out.push_str(&format!("\\u{unit:04x}")),
+        }
+    }
+    out.push('"');
+    out
 }
 
 /// The id in a `loadScript` reply: `i 7` (busctl) or `7` (qdbus). A negative one means KWin did
@@ -287,27 +370,23 @@ impl Drop for ScriptFile {
     }
 }
 
-/// At each of `runs` (from now): the script loaded, run and unloaded — unloaded even when the
-/// load or the run failed, since a load that failed may have half-happened. The first failure ends
-/// the runs. Each call gets `budget`. The script file is removed at the end.
-fn raise(tool: &Tool, editor: Editor, dir: &Path, runs: &[Duration], budget: Duration) {
-    let start = Instant::now();
-    let Some(file) = ScriptFile::new(dir, &script(editor)) else {
+/// The script for `opened` loaded and run once, left loaded for `hold`, then unloaded — unloaded
+/// also when the load or the run failed, since a load that failed may have half-happened. Each call
+/// gets `budget`. The script file is removed at the end.
+fn raise(tool: &Tool, editor: Editor, opened: &str, dir: &Path, hold: Duration, budget: Duration) {
+    let Some(file) = ScriptFile::new(dir, &script(editor, opened)) else {
         return;
     };
     let name = format!("sopen-raise-{}", crate::remote::random_hex());
-    for &at in runs {
-        std::thread::sleep((start + at).saturating_duration_since(Instant::now()));
-        let reply = call(tool, &tool.load(&file.0, &name), budget);
-        let ran = reply
-            .as_deref()
-            .and_then(script_id)
-            .is_some_and(|id| call(tool, &tool.run(id), budget).is_some());
-        let unloaded = call(tool, &tool.unload(&name), budget).is_some();
-        if !(ran && unloaded) {
-            break;
-        }
+    let reply = call(tool, &tool.load(&file.0, &name), budget);
+    let ran = reply
+        .as_deref()
+        .and_then(script_id)
+        .is_some_and(|id| call(tool, &tool.run(id), budget).is_some());
+    if ran {
+        std::thread::sleep(hold);
     }
+    call(tool, &tool.unload(&name), budget);
     drop(file);
 }
 
@@ -354,19 +433,32 @@ mod tests {
         Some(OsStr::new(s))
     }
 
-    const RUNS: [Duration; 3] = [
-        Duration::ZERO,
-        Duration::from_millis(20),
-        Duration::from_millis(40),
-    ];
     /// A test's budget per call: the stand-in client is a shell script, slower than busctl.
     const BUDGET: Duration = Duration::from_secs(5);
+    /// A test's hold: long enough to see that it was (or was not) waited.
+    const HOLD: Duration = Duration::from_millis(400);
+
+    /// Opened names that must reach the script as they are.
+    const ODD: [&str; 11] = [
+        "it's \"quoted\"",
+        r"back\slash\",
+        "new\nline",
+        "</script><script>alert(1)</script>",
+        "한글 폴더",
+        "*/ x /*",
+        "${x} `y`",
+        "\u{2028}line sep\u{2029}",
+        "tab\there",
+        "emoji 😀",
+        "@OPENED@ @CLASS@",
+    ];
 
     #[test]
     fn only_under_kde_on_linux_unless_turned_off() {
         for desktop in ["KDE", "kde", "ubuntu:KDE", "KDE:Plasma"] {
             assert!(wanted(Os::Linux, os(desktop), None), "{desktop}");
             assert!(wanted(Os::Linux, os(desktop), os("1")), "{desktop}");
+            assert!(wanted(Os::Linux, os(desktop), os("wait")), "{desktop}");
             assert!(!wanted(Os::Linux, os(desktop), os("0")), "{desktop}");
             assert!(!wanted(Os::MacOs, os(desktop), None), "{desktop}");
         }
@@ -403,9 +495,33 @@ mod tests {
         assert_eq!(find_tool(None, only(&["/a/busctl"])), None);
     }
 
+    #[test]
+    fn opened_names() {
+        assert_eq!(opened_name("/home/u/project"), "project");
+        assert_eq!(opened_name("/home/u/project/"), "project");
+        assert_eq!(opened_name("/srv/a b/notes.md"), "notes.md");
+        assert_eq!(opened_name("/"), "");
+    }
+
+    /// What a stand-in client answers to each method: a shell snippet (a reply, an exit status).
+    struct Replies {
+        load: &'static str,
+        run: &'static str,
+        unload: &'static str,
+    }
+
+    /// busctl's replies when KWin does what is asked: `i <id>`, nothing (`run` returns nothing),
+    /// `b true`.
+    const BUSCTL_OK: Replies = Replies {
+        load: "printf 'i 7\\n'",
+        run: ":",
+        unload: "printf 'b true\\n'",
+    };
+    const FAILED: &str = "echo 'Call failed: No such object path' >&2; exit 1";
+
     /// A stand-in D-Bus client in `dir`: writes each call's arguments as one line to `calls`,
-    /// copies a `.js` argument (the script) to `script` with its `ls -l` line in `mode`, then
-    /// runs `then` (a call's reply and exit status).
+    /// copies a `.js` argument (the script) to `script` with its `ls -l` line in `mode`, and
+    /// answers by the method's exact name.
     struct Fake {
         tool: Tool,
         calls: PathBuf,
@@ -413,19 +529,29 @@ mod tests {
         mode: PathBuf,
     }
 
-    fn fake(dir: &Path, busctl: bool, then: &str) -> Fake {
+    fn fake(dir: &Path, busctl: bool, replies: &Replies) -> Fake {
         use std::os::unix::fs::PermissionsExt;
         let path = dir.join(if busctl { "busctl" } else { "qdbus6" });
         let calls = dir.join("calls");
         let script = dir.join("script");
         let mode = dir.join("mode");
+        // busctl: `--user call SERVICE OBJECT INTERFACE METHOD …`; qdbus: `SERVICE OBJECT
+        // INTERFACE.METHOD …`.
+        let method = if busctl { "$6" } else { "${3##*.}" };
         let body = format!(
             "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{calls}'\n\
              for a in \"$@\"; do case $a in *.js) cat \"$a\" > '{script}'; ls -l \"$a\" > '{mode}';; esac; done\n\
-             {then}\n",
+             case \"{method}\" in\n\
+             unloadScript) {unload};;\n\
+             loadScript) {load};;\n\
+             run) {run};;\n\
+             esac\n",
             calls = calls.display(),
             script = script.display(),
             mode = mode.display(),
+            load = replies.load,
+            run = replies.run,
+            unload = replies.unload,
         );
         std::fs::write(&path, body).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -455,33 +581,43 @@ mod tests {
         (words[at].to_string(), words[at + 1].to_string())
     }
 
+    /// busctl's three calls for a load under `name` of `file` (id 7).
+    fn busctl_calls(file: &str, name: &str) -> [String; 3] {
+        [
+            format!(
+                "--user call org.kde.KWin /Scripting org.kde.kwin.Scripting loadScript ss {file} {name}"
+            ),
+            "--user call org.kde.KWin /Scripting/Script7 org.kde.kwin.Script run".to_string(),
+            format!(
+                "--user call org.kde.KWin /Scripting org.kde.kwin.Scripting unloadScript s {name}"
+            ),
+        ]
+    }
+
+    /// One script per open: loaded and run once, held, unloaded once; private while it exists,
+    /// gone after.
     #[test]
-    fn busctl_loads_runs_and_unloads_the_script_at_each_run() {
+    fn busctl_loads_runs_holds_and_unloads_one_script() {
         let tmp = tempfile::tempdir().unwrap();
-        let fake = fake(
+        let fake = fake(tmp.path(), true, &BUSCTL_OK);
+        let started = Instant::now();
+        raise(
+            &fake.tool,
+            Editor::Code,
+            "project",
             tmp.path(),
-            true,
-            "case \"$*\" in *loadScript*) printf 'i 7\\n';; *unloadScript*) printf 'b true\\n';; esac",
+            HOLD,
+            BUDGET,
         );
-        raise(&fake.tool, Editor::Code, tmp.path(), &RUNS, BUDGET);
+        assert!(started.elapsed() >= HOLD, "{:?}", started.elapsed());
         let calls = lines(&fake.calls);
         assert!(!calls.is_empty(), "no call");
         let (file, name) = loaded(&calls, 7);
         assert!(file.starts_with(tmp.path().to_str().unwrap()), "{file}");
         assert!(name.starts_with("sopen-raise-"), "{name}");
-        let load = format!(
-            "--user call org.kde.KWin /Scripting org.kde.kwin.Scripting loadScript ss {file} {name}"
-        );
-        let run = "--user call org.kde.KWin /Scripting/Script7 org.kde.kwin.Script run".to_string();
-        let unload = format!(
-            "--user call org.kde.KWin /Scripting org.kde.kwin.Scripting unloadScript s {name}"
-        );
-        let once = [load, run, unload];
-        let every: Vec<String> = once.iter().cycle().take(3 * RUNS.len()).cloned().collect();
-        assert_eq!(calls, every);
-        // The script, private to this user while it exists, and gone after.
+        assert_eq!(calls, busctl_calls(&file, &name));
         let text = std::fs::read_to_string(&fake.script).unwrap();
-        assert_eq!(text, script(Editor::Code));
+        assert_eq!(text, script(Editor::Code, "project"));
         let mode = std::fs::read_to_string(&fake.mode).unwrap();
         assert_eq!(mode.get(..10), Some("-rw-------"), "{mode}");
         assert!(!Path::new(&file).exists(), "{file} left behind");
@@ -490,12 +626,13 @@ mod tests {
     #[test]
     fn qdbus_takes_the_same_calls_in_its_own_form() {
         let tmp = tempfile::tempdir().unwrap();
-        let fake = fake(
-            tmp.path(),
-            false,
-            "case \"$*\" in *loadScript*) printf '7\\n';; *unloadScript*) printf 'true\\n';; esac",
-        );
-        raise(&fake.tool, Editor::Zed, tmp.path(), &RUNS[..1], BUDGET);
+        let replies = Replies {
+            load: "printf '7\\n'",
+            run: ":",
+            unload: "printf 'true\\n'",
+        };
+        let fake = fake(tmp.path(), false, &replies);
+        raise(&fake.tool, Editor::Zed, "proj", tmp.path(), HOLD, BUDGET);
         let calls = lines(&fake.calls);
         assert!(!calls.is_empty(), "no call");
         let (file, name) = loaded(&calls, 3);
@@ -509,35 +646,187 @@ mod tests {
         );
         assert_eq!(
             std::fs::read_to_string(&fake.script).unwrap(),
-            script(Editor::Zed)
+            script(Editor::Zed, "proj")
         );
         assert!(!Path::new(&file).exists(), "{file} left behind");
     }
 
-    /// The script picks only a window of the editor's class that demands attention, the newest
-    /// first, and brings it to where the user is: the active window's desktops and screen (else
-    /// the current desktop and the active screen), un-minimized, then activated. It never sets
-    /// the current desktop, and never looks at a desktop's name.
+    /// A load that fails or is refused: unloaded anyway (it may have half-happened), not run, not
+    /// held; quiet, and the script file is removed.
     #[test]
-    fn the_script_brings_only_the_editor_window_that_asks_to_the_user() {
+    fn a_failed_load_is_unloaded_at_once() {
+        for load in [FAILED, "printf 'i -1\\n'"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let fake = fake(tmp.path(), true, &Replies { load, ..BUSCTL_OK });
+            let started = Instant::now();
+            raise(
+                &fake.tool,
+                Editor::Code,
+                "project",
+                tmp.path(),
+                HOLD,
+                BUDGET,
+            );
+            assert!(started.elapsed() < HOLD, "{load}: held");
+            let calls = lines(&fake.calls);
+            let (file, name) = loaded(&calls, 7);
+            let [load_call, _, unload_call] = busctl_calls(&file, &name);
+            assert_eq!(calls, [load_call, unload_call], "{load}");
+            assert!(!Path::new(&file).exists(), "{load}: {file} left behind");
+        }
+    }
+
+    /// A run that fails: unloaded at once, not held.
+    #[test]
+    fn a_failed_run_is_unloaded_at_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fake = fake(
+            tmp.path(),
+            true,
+            &Replies {
+                run: FAILED,
+                ..BUSCTL_OK
+            },
+        );
+        let started = Instant::now();
+        raise(
+            &fake.tool,
+            Editor::Code,
+            "project",
+            tmp.path(),
+            HOLD,
+            BUDGET,
+        );
+        assert!(started.elapsed() < HOLD, "held");
+        let calls = lines(&fake.calls);
+        let (file, name) = loaded(&calls, 7);
+        assert_eq!(calls, busctl_calls(&file, &name));
+        assert!(!Path::new(&file).exists(), "{file} left behind");
+    }
+
+    /// An unload that fails changes nothing: quiet, and the script file is removed.
+    #[test]
+    fn a_failed_unload_is_quiet() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fake = fake(
+            tmp.path(),
+            true,
+            &Replies {
+                unload: FAILED,
+                ..BUSCTL_OK
+            },
+        );
+        raise(
+            &fake.tool,
+            Editor::Code,
+            "project",
+            tmp.path(),
+            HOLD,
+            BUDGET,
+        );
+        let calls = lines(&fake.calls);
+        let (file, name) = loaded(&calls, 7);
+        assert_eq!(calls, busctl_calls(&file, &name));
+        assert!(!Path::new(&file).exists(), "{file} left behind");
+    }
+
+    /// A client that hangs is killed at its budget: sopen never waits on KWin longer.
+    #[test]
+    fn a_hanging_client_is_cut_off() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fake = fake(
+            tmp.path(),
+            true,
+            &Replies {
+                load: "exec sleep 30",
+                ..BUSCTL_OK
+            },
+        );
+        let started = Instant::now();
+        let budget = Duration::from_millis(300);
+        raise(
+            &fake.tool,
+            Editor::Code,
+            "project",
+            tmp.path(),
+            HOLD,
+            budget,
+        );
+        let took = started.elapsed();
+        assert!(took >= budget && took < Duration::from_secs(2), "{took:?}");
+        let calls = lines(&fake.calls);
+        assert_eq!(calls.len(), 2, "{calls:?}");
+        assert!(calls[1].contains(" unloadScript s "), "{calls:?}");
+    }
+
+    /// Any opened name stays inside its string literal: plain ASCII, no quote, backslash-letter,
+    /// line break or `<` of its own, and it reads back as the name.
+    #[test]
+    fn an_opened_name_is_one_string_literal() {
+        assert_eq!(js_string("project"), "\"project\"");
+        assert_eq!(js_string(""), "\"\"");
+        for name in ODD {
+            let literal = js_string(name);
+            assert!(literal.is_ascii(), "{literal}");
+            let inner = &literal[1..literal.len() - 1];
+            assert!(
+                literal.starts_with('"') && literal.ends_with('"'),
+                "{literal}"
+            );
+            for bad in ['"', '\n', '\r', '<', '>', '`', '$', '*', '/', '\''] {
+                assert!(!inner.contains(bad), "{bad:?} in {literal}");
+            }
+            assert!(
+                inner
+                    .split("\\u")
+                    .skip(1)
+                    .all(|u| u.len() >= 4 && u[..4].chars().all(|c| c.is_ascii_hexdigit())),
+                "{literal}"
+            );
+            // JSON reads `\uXXXX` (and surrogate pairs) as JavaScript does.
+            let back: String = serde_json::from_str(&literal).unwrap();
+            assert_eq!(back, name);
+            let text = script(Editor::Code, name);
+            assert!(
+                text.contains(&format!("const opened = {literal};")),
+                "{text}"
+            );
+            assert!(
+                !text.contains("@OPENED@") && !text.contains("@CLASS@"),
+                "{text}"
+            );
+            assert!(text.contains("const editor = /^code$/i;"), "{text}");
+        }
+    }
+
+    /// The script's shape: one window, once (a `done` flag; every handler disconnected), the three
+    /// ways a window qualifies, and the steps that bring it — never setting the current desktop,
+    /// never reading a desktop's name.
+    #[test]
+    fn the_script_brings_one_window_once() {
         for (editor, class) in [
             (Editor::Code, r"/^code$/i"),
             (Editor::Zed, r"/^(dev\.zed\.)?zed(-[a-z]+)?$/i"),
         ] {
-            let text = script(editor);
+            let text = script(editor, "project");
             assert!(text.contains(&format!("const editor = {class};")), "{text}");
             for line in [
-                "const windows = workspace.windowList();",
-                "for (let i = windows.length - 1; i >= 0 && !w; i--) {",
-                "if (windows[i].demandsAttention && editor.test(windows[i].resourceClass)) {",
+                "const opened = \"project\";",
+                "if (done) {",
+                "done = true;",
+                "signal.disconnect(handler);",
+                "return opened !== \"\" && String(w.caption).indexOf(opened) !== -1;",
+                "for (let i = windows.length - 1; i >= 0 && !done; i--) {",
+                "if (isEditor(w) && w.demandsAttention && shows(w)) {",
+                "hook(w.demandsAttentionChanged, () => {",
+                "hook(w.captionChanged, () => {",
+                "if (w.demandsAttention && shows(w)) {",
+                "hook(workspace.windowAdded, (w) => {",
                 "let desktops = [workspace.currentDesktop];",
                 "let output = workspace.activeScreen;",
                 "if (here && here !== w) {",
-                "if (!here.onAllDesktops) {",
                 "desktops = here.desktops;",
                 "output = here.output;",
-                "if (!w.onAllDesktops) {",
-                "if (output && (!w.output || w.output.name !== output.name)) {",
             ] {
                 assert!(text.contains(line), "{line}: {text}");
             }
@@ -556,55 +845,49 @@ mod tests {
                 })
                 .collect();
             assert!(at.windows(2).all(|p| p[0] < p[1]), "in this order: {text}");
-            // Reading the current desktop is fine; setting it would move the user.
             assert!(!text.contains("currentDesktop ="), "{text}");
             assert!(!text.contains("currentDesktop="), "{text}");
-            // Names only of screens (unique); desktops' need not be.
             assert_eq!(text.matches(".name").count(), 2, "{text}");
         }
     }
 
-    /// A client that fails ends the runs at once: the load, then one unload in case the load
-    /// half-happened; quiet and quick, and the script file is removed.
-    #[test]
-    fn a_failing_client_stops_quietly() {
-        for then in ["exit 1", "printf 'i -1\\n'"] {
-            let tmp = tempfile::tempdir().unwrap();
-            let fake = fake(tmp.path(), true, then);
-            let started = Instant::now();
-            raise(&fake.tool, Editor::Code, tmp.path(), &RUNS, BUDGET);
-            assert!(started.elapsed() < Duration::from_secs(2), "{then}");
-            let calls = lines(&fake.calls);
-            assert_eq!(calls.len(), 2, "{then}: {calls:?}");
-            assert!(calls[0].contains(" loadScript ss "), "{then}: {calls:?}");
-            assert!(calls[1].contains(" unloadScript s "), "{then}: {calls:?}");
-            let (file, _) = loaded(&calls, 7);
-            assert!(!Path::new(&file).exists(), "{then}: {file} left behind");
-        }
+    /// `name` on the test process's PATH (absolute dirs only).
+    fn on_path(name: &str) -> Option<PathBuf> {
+        let path = std::env::var_os("PATH")?;
+        std::env::split_paths(&path)
+            .filter(|dir| dir.is_absolute())
+            .map(|dir| dir.join(name))
+            .find(|p| crate::zed::is_executable(p))
     }
 
-    /// A client that hangs is killed at its budget: sopen never waits on KWin longer.
+    /// The script, run under node against a stand-in `workspace` with signals
+    /// (tests/kwin-script.mjs): the window of this open comes, once; an older demand never does.
+    /// Skipped with a note where node is missing — except under SOPEN_REQUIRE_NODE=1 (CI).
     #[test]
-    fn a_hanging_client_is_cut_off() {
+    fn the_script_under_a_stand_in_kwin() {
+        let Some(node) = on_path("node") else {
+            if std::env::var_os("SOPEN_REQUIRE_NODE").is_some_and(|v| v == "1") {
+                panic!("SOPEN_REQUIRE_NODE=1 but node is not on PATH");
+            }
+            eprintln!("note: node is not on PATH; the KWin script's behaviour test is skipped");
+            return;
+        };
         let tmp = tempfile::tempdir().unwrap();
-        let fake = fake(
-            tmp.path(),
-            true,
-            "case \"$*\" in *loadScript*) exec sleep 30;; esac",
+        let dir = tmp.path();
+        std::fs::write(dir.join("code.js"), script(Editor::Code, "project")).unwrap();
+        std::fs::write(dir.join("zed.js"), script(Editor::Zed, "project")).unwrap();
+        std::fs::write(dir.join("names.json"), serde_json::to_string(&ODD).unwrap()).unwrap();
+        for (i, name) in ODD.iter().enumerate() {
+            std::fs::write(dir.join(format!("odd-{i}.js")), script(Editor::Code, name)).unwrap();
+        }
+        let harness = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/kwin-script.mjs");
+        let out = Command::new(node).arg(harness).arg(dir).output().unwrap();
+        let report = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
         );
-        let started = Instant::now();
-        raise(
-            &fake.tool,
-            Editor::Code,
-            tmp.path(),
-            &RUNS,
-            Duration::from_millis(300),
-        );
-        let took = started.elapsed();
-        assert!(took >= Duration::from_millis(300), "{took:?}");
-        assert!(took < Duration::from_secs(2), "{took:?}");
-        let calls = lines(&fake.calls);
-        assert_eq!(calls.len(), 2, "{calls:?}");
-        assert!(calls[1].contains(" unloadScript s "), "{calls:?}");
+        assert!(out.status.success(), "{report}");
+        assert!(report.ends_with("all ok\n"), "{report}");
     }
 }

@@ -69,21 +69,30 @@ edit.
   `SOPEN_RAISE` is not `0`, sopen brings the editor's window to the user after the hand-off (msg 11).
   The editor asks KWin to activate its window, but a CLI started by sopen carries no activation token,
   so KWin only marks the window as demanding attention — maybe on another desktop or screen. sopen
-  starts a detached `sopen --raise-window code|zed` (a session of its own, no input or output; sopen
-  and a `--target` run's ssh session end without waiting for it). At 0.3, 0.8, 1.5 and 3 s it loads a
-  script into KWin, runs it and unloads it (`org.kde.KWin` `/Scripting` `loadScript`, then
-  `/Scripting/Script<id>` `run`, then `unloadScript`), through `busctl --user`, else `qdbus6` or
-  `qdbus`. The script is a file only the user can read (0600) in `$XDG_RUNTIME_DIR` (else the temp
-  dir), removed at the end. It takes
-  the newest window whose resource class is the editor's (`code`; `zed`, `dev.zed.Zed` or
-  `dev.zed.Zed-<channel>`) and that demands attention, and brings it to where the user is: the
-  active window's desktops (desktop objects; their names need not be unique) and screen — or the
-  current desktop and the active screen when there is no active window, or it is on all desktops.
-  The window is un-minimized, moved there (a window on all desktops stays so) and activated. The
-  user's current desktop is never changed, and no other window is touched. The demand clears once
-  the window is active, so later runs do nothing. Any failure ends the runs without a word: no
-  client, a call not answered within 0.5 s, a refused load. Elsewhere (macOS, GNOME, any other
-  window manager) nothing changes.
+  starts a detached `sopen --raise-window code|zed --raise-caption=<name>` (a session of its own, no
+  input or output; sopen and a `--target` run's ssh session end without waiting for it), where
+  `<name>` is the opened folder's or file's last path component. It writes one script for this open
+  — a file only the user can read (0600) in `$XDG_RUNTIME_DIR`, else the temp dir — then loads it
+  into KWin once and runs it once (`org.kde.KWin` `/Scripting` `loadScript`, then
+  `/Scripting/Script<id>` `run`). About 3 s later it unloads it (`unloadScript`) and removes the
+  file. It talks to KWin through `busctl --user`, else `qdbus6` or `qdbus`.
+  - Which window: one whose resource class is the editor's (`code`; `zed`, `dev.zed.Zed` or
+    `dev.zed.Zed-<channel>`), and the first of:
+    - (a) one that demands attention and shows `<name>` in its title: newest first at load, or
+      when its title changes while the script is loaded;
+    - (b) one whose demand for attention starts while the script is loaded;
+    - (c) one that appears while the script is loaded (a folder not open yet opens a new window).
+  - A window already demanding attention at load whose title shows another name asked for
+    something else, and is left alone. `<name>` reaches the script as one escaped string literal.
+  - Once one window is brought, the script disconnects every handler and does nothing more.
+  - Bringing it: the window goes to where the user is, un-minimized (a window on all desktops stays
+    so), and is activated. Where the user is means the active window's desktops (desktop objects:
+    their names need not be unique) and screen. Without an active window, or when it is on all
+    desktops, the current desktop and the active screen are used. The user's current desktop is
+    never changed, and no other window is touched.
+  - Any failure ends it without a word: no client, a call not answered within 0.5 s, a refused or
+    failed load or run (then it is unloaded at once). Elsewhere (macOS, GNOME, any other window
+    manager) nothing changes.
 - Remote relative paths resolve against the remote home (SFTP `realpath`), as scp does.
 
 ## 4. Remote layer

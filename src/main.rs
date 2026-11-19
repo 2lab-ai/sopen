@@ -79,6 +79,16 @@ struct Cli {
         conflicts_with_all = ["source", "app", "hex", "target", "here", "selftest_audio"]
     )]
     raise_window: Option<String>,
+    /// Internal: the opened folder's or file's name, which the editor window shows (with
+    /// --raise-window).
+    #[arg(
+        long,
+        hide = true,
+        value_name = "NAME",
+        requires = "raise_window",
+        allow_hyphen_values = true
+    )]
+    raise_caption: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -137,7 +147,7 @@ fn main() -> ExitCode {
         .as_deref()
         .and_then(raise::Editor::from_arg)
     {
-        raise::window_now(editor);
+        raise::window_now(editor, cli.raise_caption.as_deref().unwrap_or_default());
         return ExitCode::SUCCESS;
     }
     if let Some(file) = &cli.selftest_audio {
@@ -626,7 +636,7 @@ fn open_in_editor(
             };
             zed::open_args(&code, &zed::code_args(remote, abs, kind == Kind::Directory))?;
             println!("opened {} in VS Code", place.display(abs));
-            raise::editor_window(raise::Editor::Code);
+            raise::editor_window(raise::Editor::Code, &raise::opened_name(abs));
             return Ok(());
         }
         zed::Editor::Zed {
@@ -642,7 +652,7 @@ fn open_in_editor(
             };
             zed::open(&cli, arg.as_ref())?;
             println!("opened {} in Zed", place.display(abs));
-            raise::editor_window(raise::Editor::Zed);
+            raise::editor_window(raise::Editor::Zed, &raise::opened_name(abs));
             return Ok(());
         }
         zed::Editor::Neither { code_cannot_remote } => code_cannot_remote,
