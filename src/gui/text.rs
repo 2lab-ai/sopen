@@ -9,9 +9,10 @@
 //! Only [`LINE_MAX`] bytes of a line are shown.
 //!
 //! Highlighting carries state from the top of the file: the state at each mark is computed
-//! once, in order, and a page is highlighted from the mark before it. A frame spends at most
-//! [`HIGHLIGHT_BUDGET`] on it, checked after every line, and the next frame goes on from there;
-//! until then the page shows plain. A line is parsed only whole: highlighting stops at the first
+//! once, in order, and a page is highlighted from the mark before it. Each frame aims to spend
+//! no more than [`HIGHLIGHT_BUDGET`] on it — a cooperative target, checked after every line (a
+//! line in progress finishes) — and the next frame goes on from there; until then the page
+//! shows plain. A line is parsed only whole: highlighting stops at the first
 //! line longer than [`LINE_MAX`] (only its start is read, and a comment or string closed past the
 //! cut would colour everything after it), and the rest of the file is plain. Files over
 //! [`HIGHLIGHT_MAX`] are always shown plain.
@@ -39,7 +40,8 @@ const SPAN: u64 = 64 * 1024;
 pub const LINE_MAX: usize = 4096;
 /// Files above this are shown without highlighting (its state runs from the top of the file).
 pub const HIGHLIGHT_MAX: u64 = 16 << 20;
-/// Highlighting work per frame while it catches up with the page on screen.
+/// Highlighting work per frame while it catches up with the page on screen: a cooperative
+/// target, checked between lines (one line's parse, at most [`LINE_MAX`] bytes, always finishes).
 const HIGHLIGHT_BUDGET: Duration = Duration::from_millis(6);
 /// Reads while looking for the end of a line.
 const CHUNK: usize = 16 * 1024;
@@ -233,13 +235,20 @@ impl TextDoc {
                 pos = next.offset;
                 idx += 1;
             } else {
-                // Shorter than a span (else the next line would start a mark).
+                // More lines start before the next mark, so this one ends before it: never read
+                // past the mark (a file changed meanwhile could make it a line of any length).
                 let mut text = Vec::new();
                 let mut cut = false;
                 loop {
-                    let avail = window.at(self, pos, CHUNK)?;
+                    let room_to_mark = next.offset.saturating_sub(pos);
+                    if room_to_mark == 0 {
+                        return Err(anyhow::Error::new(Stale));
+                    }
+                    let want = room_to_mark.min(CHUNK as u64) as usize;
+                    let avail = window.at(self, pos, want)?;
+                    let avail = &avail[..avail.len().min(room_to_mark as usize)];
                     if avail.is_empty() {
-                        break;
+                        return Err(anyhow::Error::new(Stale));
                     }
                     let (body, end) = match avail.iter().position(|&b| b == b'\n') {
                         Some(i) => (&avail[..i], Some(i)),
@@ -267,6 +276,27 @@ impl TextDoc {
         Ok(out)
     }
 }
+
+/// The file is not what was indexed: a line that should end before the next mark does not.
+#[derive(Debug)]
+pub struct Stale;
+
+impl std::fmt::Display for Stale {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the file changed since it was opened")
+    }
+}
+
+impl std::error::Error for Stale {}
+
+/// Whether `e` says the file changed under the index ([`Stale`]).
+pub fn is_stale(e: &anyhow::Error) -> bool {
+    e.chain().any(|c| c.is::<Stale>())
+}
+
+/// What the window says once the file changed: it reads no more.
+const CHANGED: &str =
+    "the file changed since it was opened — Esc, then open it again to see it now";
 
 /// The last [`CHUNK`] read for [`TextDoc::read_lines`]: short lines next to each other cost one
 /// read.
@@ -306,25 +336,20 @@ impl Window_ {
     }
 }
 
-/// Where a character cut in two at the end of `bytes` starts (`bytes.len()` when none is):
-/// found from the end alone, whatever comes before.
+/// Where a character cut in two at the end of `bytes` starts (`bytes.len()` when none is),
+/// found from the end alone, whatever comes before: the last up-to-4 bytes from their last
+/// non-continuation byte on must be the start of a real character (`from_utf8` checks the
+/// lead byte, overlongs, surrogates and the U+10FFFF bound) that only lacks its end. Bytes that
+/// can never start a character are not a cut character: they show as U+FFFD.
 fn cut_char_start(bytes: &[u8]) -> usize {
-    // A UTF-8 character is at most 4 bytes: its lead byte is among the last 4.
-    for back in 1..=bytes.len().min(4) {
-        let i = bytes.len() - back;
-        let b = bytes[i];
-        if b & 0xC0 == 0x80 {
-            continue;
-        }
-        let need = match b {
-            0xF0.. => 4,
-            0xE0.. => 3,
-            0xC0.. => 2,
-            _ => 1,
-        };
-        return if back < need { i } else { bytes.len() };
+    let from = bytes.len().saturating_sub(4);
+    let Some(i) = (from..bytes.len()).rev().find(|&i| bytes[i] & 0xC0 != 0x80) else {
+        return bytes.len();
+    };
+    match std::str::from_utf8(&bytes[i..]) {
+        Err(e) if e.valid_up_to() == 0 && e.error_len().is_none() => i,
+        _ => bytes.len(),
     }
-    bytes.len()
 }
 
 /// A line's shown bytes as text: a trailing `\r` dropped; when `cut`, a character cut in two
@@ -418,6 +443,8 @@ struct Highlight {
     plain: Color32,
     /// Lines parsed so far (tests: the work a frame does).
     parsed: u64,
+    /// A read found the file changed under the index ([`Stale`]): nothing more is done.
+    stale: bool,
 }
 
 /// Lines read at a time while highlighting.
@@ -444,6 +471,7 @@ impl Highlight {
             stop,
             plain,
             parsed: 0,
+            stale: false,
         })
     }
 
@@ -475,8 +503,12 @@ impl Highlight {
                 return false;
             }
             let want = (to - at.next).min(BATCH as u64) as usize;
-            let Ok(lines) = doc.read_lines(at.next, want) else {
-                return false;
+            let lines = match doc.read_lines(at.next, want) {
+                Ok(lines) => lines,
+                Err(e) => {
+                    self.stale |= is_stale(&e);
+                    return false;
+                }
             };
             if lines.is_empty() {
                 return false;
@@ -624,14 +656,20 @@ impl TextWindow {
     }
 
     fn new(mut doc: TextDoc, title: String, name: &str, notices: Vec<String>) -> Self {
-        let first = doc
-            .read_lines(0, 1)
-            .ok()
-            .and_then(|l| l.into_iter().next())
-            .map(|l| l.text)
-            .unwrap_or_default();
+        // Changed since it was indexed (between the opener's worker and now): nothing is read.
+        let stale = doc.changed();
+        let first = if stale {
+            String::new()
+        } else {
+            doc.read_lines(0, 1)
+                .ok()
+                .and_then(|l| l.into_iter().next())
+                .map(|l| l.text)
+                .unwrap_or_default()
+        };
         let syntax = syntax_for(name, &first);
         let status = match (syntax, doc.first_long) {
+            _ if stale => Status::error(CHANGED),
             (None, _) => Status::default(),
             _ if doc.size() > HIGHLIGHT_MAX => Status::info(format!(
                 "over {}: shown without highlighting",
@@ -657,7 +695,7 @@ impl TextWindow {
             notices,
             status,
             painted: false,
-            stale: false,
+            stale,
             budget_lines: usize::MAX,
         }
     }
@@ -700,20 +738,30 @@ impl TextWindow {
             .is_some_and(|p| p.top == top && p.count == count);
         if !self.stale && self.doc.changed() {
             self.stale = true;
-            self.status = Status::error(
-                "the file changed since it was opened — Esc, then open it again to see it now",
-            );
+            self.status = Status::error(CHANGED);
         }
         if self.stale {
-            // The index no longer describes the file: the page on screen stays, nothing more.
-            if let Some(page) = self.page.as_mut() {
-                page.highlighted = true;
-            }
+            // The index no longer describes the file: the page on screen stays (an empty one if
+            // none was read yet), nothing more is read.
+            let page = self.page.get_or_insert_with(|| Page {
+                top,
+                count,
+                lines: Vec::new(),
+                runs: Vec::new(),
+                highlighted: true,
+            });
+            page.highlighted = true;
             return;
         }
         if !same {
             let lines = match self.doc.read_lines(top, count) {
                 Ok(lines) => lines,
+                Err(e) if is_stale(&e) => {
+                    // Changed after the check, during the read: said the same way.
+                    self.stale = true;
+                    self.status = Status::error(CHANGED);
+                    return self.ensure_page(ctx, plain);
+                }
                 Err(e) => {
                     self.status = Status::error(format!("{e:#}"));
                     Vec::new()
@@ -745,6 +793,11 @@ impl TextWindow {
         match hl.page(&mut self.doc, top, &page.lines, &mut budget) {
             Some(runs) => {
                 page.runs = runs.into_iter().map(expand_tabs).collect();
+                page.highlighted = true;
+            }
+            None if hl.stale => {
+                self.stale = true;
+                self.status = Status::error(CHANGED);
                 page.highlighted = true;
             }
             None => ctx.request_repaint(),

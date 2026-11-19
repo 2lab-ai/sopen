@@ -349,3 +349,85 @@ fn a_cut_line_drops_its_half_character_even_after_a_bad_byte() {
     let line = shown(bytes, true);
     assert_eq!(line.text, "\u{FFFD}a");
 }
+
+/// Rewrites `path` in place (the same inode) as one line with no newline, `len` bytes long
+/// (sparse: the file reads as zeros).
+fn rewrite_as_one_huge_line(path: &Path, len: u64) {
+    use std::os::unix::fs::FileExt;
+    let f = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+    f.set_len(0).unwrap();
+    f.set_len(len).unwrap();
+    f.write_all_at(b"abcdefgh", 0).unwrap();
+}
+
+/// T3 (constructor): a file rewritten after it was indexed and before the window is made —
+/// here as one 100 MB line — is not scanned: the window says the file changed, having read
+/// almost nothing.
+#[test]
+fn a_file_rewritten_before_the_window_opens_is_not_scanned() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = write(tmp.path(), "a.txt", b"a\nb\nc\n");
+    let doc = TextDoc::open(&path).unwrap();
+    rewrite_as_one_huge_line(&path, 100 << 20);
+    let mut win = TextWindow::new(doc, "a".into(), "a.txt", vec![]);
+    assert!(win.status.text.contains("changed"), "{}", win.status.text);
+    // Shown (an empty page and the status), and still nothing read.
+    let mut drv = Driver::new(600.0, 400.0);
+    drv.until(&mut win, 5, |w| w.ready());
+    assert!(
+        win.doc.page_reads() <= 64 * 1024,
+        "read {} bytes",
+        win.doc.page_reads()
+    );
+}
+
+/// T3 (paging): a write that lands after the change check cannot make a page read past what
+/// the index covers: a line that should end before the next mark and does not is the
+/// changed-file error, after a bounded read.
+#[test]
+fn a_page_never_reads_past_the_indexed_span() {
+    let tmp = tempfile::tempdir().unwrap();
+    let body: String = (0..10).map(|i| format!("line {i}\n")).collect();
+    let path = write(tmp.path(), "b.txt", body.as_bytes());
+    let mut doc = TextDoc::open(&path).unwrap();
+    rewrite_as_one_huge_line(&path, 100 << 20);
+    let got = doc.read_lines(0, 5);
+    assert!(
+        doc.page_reads() <= 64 * 1024,
+        "read {} bytes",
+        doc.page_reads()
+    );
+    let err = got.expect_err("a line that does not end where the index says is an error");
+    assert!(is_stale(&err), "{err:#}");
+}
+
+/// Only a genuinely incomplete character at the end of a cut line is left out: bytes that can
+/// never start one (0xff, 0xc0, 0xc1, 0xf5…) or a start no character has (an overlong, a
+/// surrogate, past U+10FFFF) are bad bytes and show as U+FFFD.
+#[test]
+fn a_cut_line_keeps_bad_bytes_and_drops_only_a_real_half_character() {
+    let cut = |b: &[u8]| shown(b.to_vec(), true).text;
+    assert_eq!(cut(&[b'a', 0xff]), "a\u{FFFD}");
+    assert_eq!(cut(&[b'a', 0xc0]), "a\u{FFFD}");
+    assert_eq!(cut(&[b'a', 0xc1]), "a\u{FFFD}");
+    assert_eq!(cut(&[b'a', 0xf5]), "a\u{FFFD}");
+    for bad in [
+        &[0xe0, 0x80][..],
+        &[0xed, 0xa0],
+        &[0xf0, 0x80],
+        &[0xf4, 0x90],
+    ] {
+        let mut b = vec![b'a'];
+        b.extend_from_slice(bad);
+        assert!(
+            cut(&b).starts_with("a\u{FFFD}"),
+            "{bad:x?} is not a half character"
+        );
+    }
+    // Real halves: of "€" (e2 82 ac) and of "😀" (f0 9f 98 80).
+    assert_eq!(cut(&[b'a', 0xe2, 0x82]), "a");
+    assert_eq!(cut(&[b'a', 0xf0, 0x9f, 0x98]), "a");
+    assert_eq!(cut(&[b'a', 0xc3]), "a");
+    // A line that is not cut keeps everything.
+    assert_eq!(shown(vec![b'a', 0xe2, 0x82], false).text, "a\u{FFFD}");
+}

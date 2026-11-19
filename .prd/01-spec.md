@@ -173,14 +173,18 @@ replaces that module alone.
   whole: opening indexes the lines in one pass (a mark every 256 lines, and at the first line
   start 64 KiB past the last mark), and a page reads at most 64 KiB before it plus the shown part
   of each line. 4096 bytes of a line are shown (the bar says when lines are cut); invalid UTF-8
-  shows as U+FFFD (a character cut in two at the end of a cut line is left out). Highlighting
-  carries state from the top of the file: the state at each mark is computed once, and a frame
-  spends at most 6 ms on highlighting, checked after every line; the next frame goes on from
-  there, and a page is shown plain until it is reached. A line is parsed only whole, so
+  shows as U+FFFD (a real character cut in two at the end of a cut line is left out; bytes that
+  can never start one stay U+FFFD). Highlighting carries state from the top of the file: the
+  state at each mark is computed once, and each frame aims at 6 ms of highlighting — a
+  cooperative target checked after every line, so a line in progress finishes — and the next
+  frame goes on from there; a page is shown plain until it is reached. A line is parsed only whole, so
   highlighting stops at the first line over 4096 bytes (the status row says which) and the rest
   is plain; files over 16 MiB are shown plain. The file is read live, the index is of the file as
-  opened: when its size, modification time or inode changes, the status row says so and the
-  viewer reads no more (Esc and open it again); offsets from the index are always checked.
+  opened: when its size, modification time or inode changes — checked when the viewer opens and
+  before each page — the status row says so and the viewer reads no more (Esc and open it
+  again). A write that lands after the check cannot make a read run away either: a line is never
+  read past the index mark it must end before, and one that does not end there is the same
+  changed-file status. Offsets from the index are always checked.
 - **Leaving a viewer** — Esc or F3 (when the viewer does not use Esc itself: the image and media
   windows' Esc first clears a drawn rectangle; an Esc that takes the keyboard from a text field
   is the field's), or closing the window — goes through that viewer's own close question: its

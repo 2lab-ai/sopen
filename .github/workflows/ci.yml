@@ -39,8 +39,10 @@ jobs:
       - name: Install ffmpeg, ALSA headers and login shells (Linux)
         if: runner.os == 'Linux'
         run: |
-          sudo apt-get update
-          sudo apt-get install -y ffmpeg libasound2-dev pkg-config zsh fish openssh-sftp-server
+          # Through a list of Ubuntu mirrors, with retries and a timeout (the script says why);
+          # its own test first. openssh-sftp-server: the SFTP listing test runs a real server.
+          bash .github/scripts/tests/apt-install.test.sh
+          bash .github/scripts/apt-install.sh ffmpeg libasound2-dev pkg-config zsh fish openssh-sftp-server
 
       - name: Install ffmpeg and fish (macOS)
         if: runner.os == 'macOS'
@@ -85,6 +87,10 @@ jobs:
           cargo build --release --locked
           image="ubuntu:$(. /etc/os-release && echo "$VERSION_ID")"
           echo "clean system: $image"
-          docker run --rm -v "$PWD/target/release/sopen:/usr/local/bin/sopen:ro" "$image" \
-            bash -c 'apt-get update -qq && apt-get install -y -qq libasound2t64 > /dev/null \
+          # The image's sources name archive.ubuntu.com and security.ubuntu.com: through the same
+          # mirror list as on the runner (.github/scripts/apt-install.sh).
+          docker run --rm -v "$PWD/target/release/sopen:/usr/local/bin/sopen:ro" \
+            -v "$PWD/.github/scripts/apt-install.sh:/usr/local/bin/apt-install.sh:ro" \
+            -e SOPEN_APT_QUIET=1 "$image" \
+            bash -c 'bash /usr/local/bin/apt-install.sh libasound2t64 > /dev/null \
               && ldd /usr/local/bin/sopen && sopen --version'

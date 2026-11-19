@@ -774,6 +774,7 @@ fn a_video_opens_in_the_media_window_and_esc_leaves_it() {
         }
         if std::time::Instant::now() > deadline {
             let _ = child.kill();
+            let _ = child.wait();
             panic!("ffmpeg did not make the fixture in 60 s");
         }
         std::thread::sleep(std::time::Duration::from_millis(20));
@@ -821,8 +822,29 @@ fn clipboard_shortcuts_reach_a_hosted_image() {
         .collect();
     assert_eq!(copied, [[64, 48]], "the whole image went to the clipboard");
     assert!(fx.b.viewer.is_some());
-    // Cut a drawn rectangle: its pixels to the clipboard, the rectangle left in the
-    // background colour (an edit); a picture pasted into it is another.
+    // Copy changed nothing: leaving asks nothing.
+    fx.key(Key::Escape);
+    assert!(fx.b.viewer.is_none(), "Copy is not an edit");
+
+    // A paste alone is an edit. Pasted without a rectangle it selects what it covers: the
+    // first Esc clears that, the second asks before the paste goes.
+    fx.open("photo.png");
+    let red = egui::ColorImage::new([4, 4], vec![egui::Color32::RED; 16]);
+    fx.drv.paste_image(&mut fx.b, red);
+    fx.key(Key::Escape);
+    assert!(fx.drv.find_text("Unsaved changes").is_none());
+    assert!(fx.b.viewer.is_some());
+    fx.key(Key::Escape);
+    assert!(
+        fx.drv.find_text("Unsaved changes").is_some(),
+        "the paste was an edit"
+    );
+    fx.drv.click_text(&mut fx.b, "Discard");
+    assert!(fx.b.viewer.is_none());
+
+    // Cut alone: a drawn rectangle's pixels to the clipboard, the rectangle left in the
+    // background colour — an edit too.
+    fx.open("photo.png");
     let c = Pos2::new(500.0, 350.0);
     fx.drv.drag(
         &mut fx.b,
@@ -830,6 +852,7 @@ fn clipboard_shortcuts_reach_a_hosted_image() {
         c - Vec2::new(60.0, 40.0),
         c + Vec2::new(60.0, 40.0),
     );
+    fx.drv.take_commands();
     fx.drv.cut(&mut fx.b);
     let cut = fx
         .drv
@@ -838,17 +861,12 @@ fn clipboard_shortcuts_reach_a_hosted_image() {
         .filter(|c| matches!(c, egui::OutputCommand::CopyImage(_)))
         .count();
     assert_eq!(cut, 1, "Cut put the rectangle on the clipboard");
-    let red = egui::ColorImage::new([4, 4], vec![egui::Color32::RED; 16]);
-    fx.drv.paste_image(&mut fx.b, red);
-    // The first Esc clears the rectangle (the image's own Esc); the second asks, as the cut and
-    // the paste are unsaved edits.
     fx.key(Key::Escape);
-    assert!(fx.drv.find_text("Unsaved changes").is_none());
-    assert!(fx.b.viewer.is_some());
+    assert!(fx.b.viewer.is_some(), "the first Esc cleared the rectangle");
     fx.key(Key::Escape);
     assert!(
         fx.drv.find_text("Unsaved changes").is_some(),
-        "the cut and the paste were edits"
+        "the cut was an edit"
     );
     fx.drv.click_text(&mut fx.b, "Discard");
     assert!(fx.b.viewer.is_none());

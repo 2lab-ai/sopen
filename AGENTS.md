@@ -86,6 +86,10 @@ remote `/tmp/sopen-receipts/` directory created for the purpose.
 
 - `ci.yml` — every PR and main push: the gate on `macos-latest` and `ubuntu-latest`. `preview.yml` and
   `release.yml` call it first and publish nothing unless it is green.
+- Every apt install in the workflows (runners and the runtime-library container) goes through
+  `.github/scripts/apt-install.sh`: the Ubuntu archive and security sources point at a mirror list (apt's mirror
+  method falls back to the next mirror), with retries and a request timeout; its test is
+  `.github/scripts/tests/apt-install.test.sh` (no apt, no network), run by `ci.yml` on Linux.
 - `preview.yml` — every main push: gate, then macOS arm64/x86_64 and Linux x86_64/aarch64 binaries (Linux built
   on `ubuntu-22.04` / `ubuntu-22.04-arm` for an older glibc floor), a `preview-<YYYY-MM-DD-HHMM>-<sha12>`
   prerelease, and the tap's `Formula/sopen-preview.rb`.

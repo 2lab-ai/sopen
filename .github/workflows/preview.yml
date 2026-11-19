@@ -93,8 +93,8 @@ jobs:
       - name: Install ALSA headers (Linux)
         if: runner.os == 'Linux'
         run: |
-          sudo apt-get update
-          sudo apt-get install -y libasound2-dev pkg-config
+          # Through a list of Ubuntu mirrors, with retries and a timeout (the script says why).
+          bash .github/scripts/apt-install.sh libasound2-dev pkg-config
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable

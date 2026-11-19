@@ -191,7 +191,7 @@ pub(crate) fn entries_from(
         };
         out.push(entry(&raw, &own, target));
     }
-    // By name as shown; two names that show alike by their bytes.
+    // By name as shown; of two names that show alike, the one that is valid UTF-8 first.
     out.sort_by(|a, b| a.name.cmp(&b.name).then(a.lossy.cmp(&b.lossy)));
     out
 }
