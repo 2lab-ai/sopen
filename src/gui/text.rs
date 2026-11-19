@@ -235,12 +235,15 @@ impl TextDoc {
                 pos = next.offset;
                 idx += 1;
             } else {
-                // More lines start before the next mark, so this one ends before it: never read
-                // past the mark (a file changed meanwhile could make it a line of any length).
+                // More lines start before the next mark, and none of them started a mark: the
+                // next one starts within a span of this block's mark (or a mark would be there)
+                // and before the next mark. So this line ends before both, and is never read past
+                // them — a file changed meanwhile could make it a line of any length.
+                let end = next.offset.min(self.marks[idx].offset.saturating_add(SPAN));
                 let mut text = Vec::new();
                 let mut cut = false;
                 loop {
-                    let room_to_mark = next.offset.saturating_sub(pos);
+                    let room_to_mark = end.saturating_sub(pos);
                     if room_to_mark == 0 {
                         return Err(anyhow::Error::new(Stale));
                     }

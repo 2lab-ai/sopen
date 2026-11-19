@@ -401,6 +401,37 @@ fn a_page_never_reads_past_the_indexed_span() {
     assert!(is_stale(&err), "{err:#}");
 }
 
+/// The same when the next mark is far away: indexed as `a`, a 100 MB second line, then `last`
+/// (no mark between the first line and the line after the huge one), then rewritten with no
+/// newline. The first line must end within a span of its mark (else the second line would
+/// have started a mark), so its read stops there, not at the mark 100 MB away.
+#[test]
+fn a_page_never_reads_past_a_span_when_the_next_mark_is_far() {
+    use std::os::unix::fs::FileExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("huge-second-line.txt");
+    let huge = 100u64 << 20;
+    {
+        let f = std::fs::File::create(&path).unwrap();
+        f.write_all_at(b"a\n", 0).unwrap();
+        // The second line: 100 MB that are not a newline (sparse zeros).
+        f.set_len(2 + huge).unwrap();
+        f.write_all_at(b"\nlast\n", 2 + huge).unwrap();
+    }
+    let mut doc = TextDoc::open(&path).unwrap();
+    assert_eq!(doc.line_count(), 3);
+    assert_eq!(doc.marks(), 2, "a mark at `last` only, 100 MB on");
+    rewrite_as_one_huge_line(&path, 2 * huge);
+    let got = doc.read_lines(0, 1);
+    assert!(
+        doc.page_reads() <= 64 * 1024,
+        "read {} bytes",
+        doc.page_reads()
+    );
+    let err = got.expect_err("the first line no longer ends within its span");
+    assert!(is_stale(&err), "{err:#}");
+}
+
 /// Only a genuinely incomplete character at the end of a cut line is left out: bytes that can
 /// never start one (0xff, 0xc0, 0xc1, 0xf5…) or a start no character has (an overlong, a
 /// surrogate, past U+10FFFF) are bad bytes and show as U+FFFD.

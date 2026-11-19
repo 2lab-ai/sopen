@@ -183,8 +183,9 @@ replaces that module alone.
   opened: when its size, modification time or inode changes — checked when the viewer opens and
   before each page — the status row says so and the viewer reads no more (Esc and open it
   again). A write that lands after the check cannot make a read run away either: a line is never
-  read past the index mark it must end before, and one that does not end there is the same
-  changed-file status. Offsets from the index are always checked.
+  read past where the index says it must end — the next mark, or 64 KiB past its own block's mark
+  when the next line was no mark — and one that does not end there is the same changed-file
+  status. Offsets from the index are always checked.
 - **Leaving a viewer** — Esc or F3 (when the viewer does not use Esc itself: the image and media
   windows' Esc first clears a drawn rectangle; an Esc that takes the keyboard from a text field
   is the field's), or closing the window — goes through that viewer's own close question: its
