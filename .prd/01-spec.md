@@ -25,6 +25,7 @@ machine I typed it on, or with `--target` on another machine's screen.
 8. "그리고 sopen 설정으로 디폴트 타겟 설정할 수 있도록해줘"
 9. "mp4랑 html 잘 열리는데 (<host-a>에서 <host-a>파일을 <host-b>우로) (내 작업 디폴트 터미널이 <host-b>임), zip파일은 그냥 다운만 받아지는데 디폴트는 헥스에디터로 여는거야 바이너리들은, 다이얼로그 뜨고 원하는 위치로 저장혹은 헥스에디터 여는것 이게 좋겠음"
 10. "sopen이 vscode가 있으면 먼저 vscode로 열개해줘 vscode -> zeditor"
+11. (on KDE Plasma, after `sopen .` printed "opened … in VS Code") "vscode 안나옴", then "해당 앱이 현재 화면으로 이동시켜줘"
 
 Message 6 supersedes 3's "IrfanView 정도" with an exact list. Message 5 is a standing constraint:
 anything not in the table below is out of scope until usage says otherwise (§10). Messages 7–8 add
@@ -32,14 +33,17 @@ where a file opens — this machine, or another machine's screen (§4a); they ad
 replaces A6's "fetched to the cache and its path printed" for binary files with a dialog — the hex
 editor (the default) or save to a chosen path — and takes the hex editor off §9's list: it is
 message 3's "원하면 hex 편집기능정도까지", built in (§6a). Message 10 puts VS Code before Zed for
-folders and text (A2, §3); it adds no edit.
+folders and text (A2, §3); it adds no edit. Message 11 is a bug report: on KDE Plasma the editor sopen
+opened never came up — KWin refused its activation and only flagged the window, on another desktop —
+and the window is to come to the screen the owner is on, not the owner to it (A2, §3). It adds no
+edit.
 
 ## 2. Intent → acceptance
 
 | # | Owner intent | Acceptance (observable) |
 |---|---|---|
 | A1 | `sopen host:/path`, scp syntax, any machine in `~/.ssh/config` | `sopen <alias>:/abs/file`, `sopen <alias>:rel/to/home`, `sopen user@host:/x` all open; aliases, ProxyJump, agent behave exactly as `ssh <alias>` does (system ssh is used). Local paths (`sopen ./x.png`) open too. |
-| A2 | Folder as a project, text edit, syntax highlight; VS Code first (msg 10) | Folder or text file → VS Code when `code` is found; a remote one only when VS Code's Remote - SSH extension is installed (`code --folder-uri` / `--file-uri vscode-remote://ssh-remote+[user@]host/<percent-encoded abs>` by the kind sopen detected, since a bare `--remote` path's kind is guessed from its name; the extension is never installed by sopen), else Zed with `VS Code has no Remote - SSH extension; opening in Zed` on stderr. Without VS Code, Zed (`zed ssh://…` on macOS, `zeditor`/`zed` on Linux). A VS Code launch failure is reported, not followed by Zed. The editor owns Save. |
+| A2 | Folder as a project, text edit, syntax highlight; VS Code first (msg 10) | Folder or text file → VS Code when `code` is found; a remote one only when VS Code's Remote - SSH extension is installed (`code --folder-uri` / `--file-uri vscode-remote://ssh-remote+[user@]host/<percent-encoded abs>` by the kind sopen detected, since a bare `--remote` path's kind is guessed from its name; the extension is never installed by sopen), else Zed with `VS Code has no Remote - SSH extension; opening in Zed` on stderr. Without VS Code, Zed (`zed ssh://…` on macOS, `zeditor`/`zed` on Linux). A VS Code launch failure is reported, not followed by Zed. The editor owns Save. On Linux under KDE Plasma (msg 11) the editor's window that asked for attention is brought to where the user is — the active window's desktop and screen — and activated (§3). |
 | A3 | Image: view + rectangle crop + rectangle pixelize | Built-in window shows the image; drag draws a rectangle in image pixels; Crop and Pixelize act on it; Undo; Save writes back to the remote file. |
 | A4 | Video: view + rectangle crop + time cut | Built-in window plays the video with sound; scrub timeline; set In/Out; drag a crop rectangle; Export writes `<stem>.cut-<in>-<out>.<ext>` next to the original on the remote. |
 | A5 | Audio (mp3/wav): view + time cut | Same window: waveform, play, In/Out, Export. |
@@ -61,6 +65,39 @@ folders and text (A2, §3); it adds no edit.
 | other | everything else | the binary dialog: hex window (default) or Save to… (A6, §6a) |
 
 - VS Code is found as `code` on PATH, then on macOS `/Applications/Visual Studio Code.app/Contents/Resources/app/bin/code` or the same path under `~/Applications`. Remote - SSH counts as installed when a directory `ms-vscode-remote.remote-ssh-<version>` is in `$VSCODE_EXTENSIONS` (when non-empty) or `~/.vscode/extensions` and is not a key of the `.obsolete` JSON object there; VS Code is not started to check. Without a usable VS Code, Zed is found as `zed` / `zeditor` on PATH, macOS also `/Applications/Zed.app/Contents/MacOS/cli`. Neither found: text → fetch, run `$VISUAL`/`$EDITOR` in the terminal, upload on exit if changed; directory → error that names the missing editors.
+- On Linux, when `XDG_CURRENT_DESKTOP` names KDE (any case, anywhere in its colon-separated list) and
+  `SOPEN_RAISE` is not `0`, sopen brings the editor's window to the user after the hand-off (msg 11).
+  The editor asks KWin to activate its window, but a CLI started by sopen carries no activation token,
+  so KWin only marks the window as demanding attention — maybe on another desktop or screen. sopen
+  starts a detached `sopen --raise-window code|zed --raise-caption=<name>` (a session of its own, no
+  input or output; sopen and a `--target` run's ssh session end without waiting for it), where
+  `<name>` is the opened folder's or file's last path component. It writes one script for this open
+  — a file only the user can read (0600) in `$XDG_RUNTIME_DIR`, else the temp dir — then loads it
+  into KWin once and runs it once (`org.kde.KWin` `/Scripting` `loadScript`, then
+  `/Scripting/Script<id>` `run`). About 3 s later it unloads it (`unloadScript`) and removes the
+  file. It talks to KWin through `busctl --user`, else `qdbus6` or `qdbus`.
+  - Which window: one whose resource class is the editor's (`code`; `zed`, `dev.zed.Zed` or
+    `dev.zed.Zed-<channel>`), and the first of:
+    - (a) one that demands attention and shows `<name>` in its title: newest first at load, or
+      when its title changes while the script is loaded;
+    - (b) one whose demand for attention starts while the script is loaded;
+    - (c) one that appears while the script is loaded (a folder not open yet opens a new window).
+  - A window already demanding attention at load whose title shows another name asked for
+    something else, and is left alone. `<name>` reaches the script as one escaped string literal.
+  - Once one window is brought, the script disconnects every handler and does nothing more.
+  - The script also keeps its own deadline: the hold plus 0.5 s, measured from its run. Every
+    handler and the load-time check test it first. Once it has passed, the script disconnects
+    every handler and does nothing. KWin's script timer (`QTimer`) stops it at that moment; without
+    the timer, the first signal after the deadline does. So a script whose unload never reaches KWin
+    cannot act later. The unload is only cleanup.
+  - Bringing it: the window goes to where the user is, un-minimized (a window on all desktops stays
+    so), and is activated. Where the user is means the active window's desktops (desktop objects:
+    their names need not be unique) and screen. Without an active window, or when it is on all
+    desktops, the current desktop and the active screen are used. The user's current desktop is
+    never changed, and no other window is touched.
+  - Any failure ends it without a word: no client, a call not answered within 0.5 s, a refused or
+    failed load or run (then it is unloaded at once). Elsewhere (macOS, GNOME, any other window
+    manager) nothing changes.
 - Remote relative paths resolve against the remote home (SFTP `realpath`), as scp does.
 
 ## 4. Remote layer
@@ -112,7 +149,8 @@ non-interactive ssh session on macOS has no Homebrew on PATH, and sopen finds ff
 its own directory first on PATH (brew's ffmpeg sits next to brew's sopen) and Homebrew's bin directories that exist
 appended after the session's own entries. On Linux an ssh session has no display, so when neither DISPLAY nor
 WAYLAND_DISPLAY is set the desktop session's DISPLAY, WAYLAND_DISPLAY, XAUTHORITY, XDG_RUNTIME_DIR,
-DBUS_SESSION_BUS_ADDRESS and XDG_SESSION_TYPE are taken from `systemctl --user show-environment` — exported by name,
+DBUS_SESSION_BUS_ADDRESS, XDG_SESSION_TYPE and XDG_CURRENT_DESKTOP (§3: KDE Plasma) are taken from
+`systemctl --user show-environment` — exported by name,
 never evaluated. If that gives none, the first Wayland socket in `/run/user/<uid>` is used, else X display `:0` when
 it exists. HOST's sopen runs as a foreground child of the script, which catches INT, TERM and HUP (sopen itself
 keeps their default handling), so a sopen stopped by a signal comes back as an exit code rather than as a lost
@@ -125,7 +163,8 @@ behind the active app. sopen's own image and media window, still unfocused after
 windows until it gains focus or gets its first click, key, scroll or typed text, and then returns to the normal
 level — with no timeout, because back at the normal level while unfocused macOS puts it straight behind the active
 app again. VS Code or Zed, opened for
-folders and text, comes up behind the active app.
+folders and text, comes up behind the active app. On Linux under KDE Plasma sopen brings it to the
+screen the user is on (§3).
 
 HOST gets a terminal (`ssh -t`) when this side's input and output are both terminals. Otherwise it gets none
 (`-T`) and no input either (`-n`) — ssh would read this side's input to its end, eating the rest of a

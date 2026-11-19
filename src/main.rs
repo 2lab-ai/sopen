@@ -13,7 +13,7 @@ use sopen::kind::{self, Kind};
 use sopen::remote::{self, LocalFs, RemoteFs, SftpRemote, Stat, WriteOutcome};
 use sopen::target::{self, RemoteSpec, Target};
 use sopen::usage::Record;
-use sopen::{app, config, forward, zed};
+use sopen::{app, config, forward, raise, zed};
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -43,7 +43,10 @@ struct Cli {
     #[command(subcommand)]
     cmd: Option<Cmd>,
     /// [user@]host:path, or a local path
-    #[arg(value_name = "SOURCE", required_unless_present = "selftest_audio")]
+    #[arg(
+        value_name = "SOURCE",
+        required_unless_present_any = ["selftest_audio", "raise_window"]
+    )]
     source: Option<String>,
     /// Open on HOST's screen instead of this machine's (sopen runs on HOST, over ssh)
     #[arg(long, value_name = "HOST", conflicts_with = "here")]
@@ -66,6 +69,26 @@ struct Cli {
         conflicts_with_all = ["source", "app", "hex", "target", "here"]
     )]
     selftest_audio: Option<PathBuf>,
+    /// Internal: bring the window of the editor just opened to the user on KDE Plasma (the
+    /// detached child sopen starts after the hand-off; spec §3).
+    #[arg(
+        long,
+        hide = true,
+        value_name = "EDITOR",
+        value_parser = ["code", "zed"],
+        conflicts_with_all = ["source", "app", "hex", "target", "here", "selftest_audio"]
+    )]
+    raise_window: Option<String>,
+    /// Internal: the opened folder's or file's name, which the editor window shows (with
+    /// --raise-window).
+    #[arg(
+        long,
+        hide = true,
+        value_name = "NAME",
+        requires = "raise_window",
+        allow_hyphen_values = true
+    )]
+    raise_caption: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -119,6 +142,14 @@ impl std::error::Error for Refused {}
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
+    if let Some(editor) = cli
+        .raise_window
+        .as_deref()
+        .and_then(raise::Editor::from_arg)
+    {
+        raise::window_now(editor, cli.raise_caption.as_deref().unwrap_or_default());
+        return ExitCode::SUCCESS;
+    }
     if let Some(file) = &cli.selftest_audio {
         return match gui::playback::selftest(file) {
             Ok(line) => {
@@ -605,6 +636,7 @@ fn open_in_editor(
             };
             zed::open_args(&code, &zed::code_args(remote, abs, kind == Kind::Directory))?;
             println!("opened {} in VS Code", place.display(abs));
+            raise::editor_window(raise::Editor::Code, &raise::opened_name(abs));
             return Ok(());
         }
         zed::Editor::Zed {
@@ -620,6 +652,7 @@ fn open_in_editor(
             };
             zed::open(&cli, arg.as_ref())?;
             println!("opened {} in Zed", place.display(abs));
+            raise::editor_window(raise::Editor::Zed, &raise::opened_name(abs));
             return Ok(());
         }
         zed::Editor::Neither { code_cannot_remote } => code_cannot_remote,
