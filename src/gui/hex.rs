@@ -1457,6 +1457,9 @@ pub(super) struct HexWindow {
     pending_notices: Option<Vec<String>>,
     /// `SOPEN_STATE` `close=ask`: closing is asked for on the first pass.
     ask_close: bool,
+    /// Saves started so far (tests: a key starts exactly one).
+    #[cfg(test)]
+    pub(super) save_starts: usize,
 }
 
 impl Drop for HexWindow {
@@ -1529,6 +1532,8 @@ impl HexWindow {
             notices: Vec::new(),
             pending_notices: None,
             ask_close: false,
+            #[cfg(test)]
+            save_starts: 0,
         }
     }
 
@@ -1604,6 +1609,10 @@ impl HexWindow {
             if !self.doc.dirty() {
                 return self.status = Status::info("no changes to save");
             }
+        }
+        #[cfg(test)]
+        {
+            self.save_starts += 1;
         }
         let patches = self.doc.patches().clone();
         let snapshot = patches.clone();

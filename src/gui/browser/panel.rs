@@ -132,21 +132,29 @@ impl Panel {
     /// `N Listed = N bytes` (the entries but `..`, the bytes of the files), then the free space
     /// as `N Bytes Free` — PC Shell's two window feet on one line.
     pub fn footer(&self) -> String {
+        match self.foot_parts() {
+            (listed, Some(free)) => format!("{listed} · {free}"),
+            (listed, None) => listed,
+        }
+    }
+
+    /// The footer's two parts: `N Listed = N bytes`, and `N Bytes Free` when the listing said.
+    pub fn foot_parts(&self) -> (String, Option<String>) {
         let listed: Vec<&Entry> = self.entries.iter().filter(|e| e.name != UP).collect();
         let bytes: u128 = listed
             .iter()
             .filter(|e| e.kind == EntryKind::File)
             .map(|e| u128::from(e.size))
             .sum();
-        let mut line = format!(
+        let count = format!(
             "{} Listed = {} bytes",
             grouped(listed.len() as u128),
             grouped(bytes)
         );
-        if let Some(free) = self.free {
-            line.push_str(&format!(" · {} Bytes Free", grouped(u128::from(free))));
-        }
-        line
+        let free = self
+            .free
+            .map(|free| format!("{} Bytes Free", grouped(u128::from(free))));
+        (count, free)
     }
 }
 
@@ -204,6 +212,26 @@ pub fn size_cell(entry: &Entry) -> String {
         EntryKind::Broken => "<BROKEN>".to_string(),
         EntryKind::Unknown => "?".to_string(),
     }
+}
+
+/// The Size column's text in `cells` characters: [`size_cell`] when it fits, else the size in
+/// the smallest unit (KB, MB, GB, TB, PB, EB — powers of 1000, rounded) that does — a size is
+/// never cut.
+pub fn size_in(entry: &Entry, cells: usize) -> String {
+    let exact = size_cell(entry);
+    if exact.chars().count() <= cells || entry.kind != EntryKind::File || entry.name == UP {
+        return exact;
+    }
+    let mut div: u128 = 1;
+    for unit in ["KB", "MB", "GB", "TB", "PB", "EB"] {
+        div *= 1000;
+        let value = (u128::from(entry.size) + div / 2) / div;
+        let text = format!("{} {unit}", grouped(value));
+        if text.chars().count() <= cells {
+            return text;
+        }
+    }
+    exact
 }
 
 /// The Date and Time columns, in local time (`2026-11-19`, `14:03`); blank for `..` and for an

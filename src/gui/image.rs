@@ -1616,6 +1616,11 @@ impl ImageWindow {
         } else if command_key(ctx, Key::S, false) {
             self.start(ctx, JobKind::Save { close_after: false });
         }
+        // F5 is PC Shell's Save, as Cmd/Ctrl+S — a plain key: not while a field (the block
+        // size) has the typing.
+        if plain_key(ctx, Key::F5) {
+            self.start(ctx, JobKind::Save { close_after: false });
+        }
         if plain_key(ctx, Key::C) {
             self.crop();
         }
@@ -1947,7 +1952,7 @@ impl super::Window for ImageWindow {
             ui.add_space(1.0);
         });
         // The F-key row, the window's last (on its own: the browser around it has the row).
-        super::own_keys(ui, &[]);
+        super::own_keys(ui, super::chrome::IMAGE_KEYS);
         // A report that lands while the button is down (a drag, or a press that may become one)
         // waits until it is let go: its row would move the image under the pointer.
         let held = self.sel.dragging() || ctx.input(|i| i.pointer.primary_down());
@@ -1991,6 +1996,10 @@ impl super::Window for ImageWindow {
 
     fn ready(&self) -> bool {
         self.painted && self.job.is_none()
+    }
+
+    fn keys(&self) -> &'static [super::chrome::FKey] {
+        super::chrome::IMAGE_KEYS
     }
 
     fn close_requested(&mut self) -> bool {

@@ -374,3 +374,19 @@ fn cp437_is_unicodes_table() {
         assert_eq!(u32::from(cp437(b)), want, "{b:#04X}");
     }
 }
+
+/// `fit_start` keeps a text's start: whole when it fits, else the longest start that fits
+/// before "…" (and "…" alone when nothing does).
+#[test]
+fn fit_start_keeps_the_start() {
+    let mut drv = Driver::new(100.0, 100.0);
+    drv.idle(&mut Parts { active: true }, 1);
+    let text = "12 Listed = 594,004 bytes";
+    let f = font();
+    assert_eq!(fit_start(&drv.ctx, text, &f, 400.0), text);
+    // 8 cells: seven characters and "…".
+    assert_eq!(fit_start(&drv.ctx, text, &f, 8.0 * CELL.x), "12 List…");
+    assert_eq!(fit_start(&drv.ctx, text, &f, 8.5 * CELL.x), "12 List…");
+    assert_eq!(fit_start(&drv.ctx, text, &f, 1.0 * CELL.x), "…");
+    assert_eq!(fit_start(&drv.ctx, text, &f, 0.0), "…");
+}

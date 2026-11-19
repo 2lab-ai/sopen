@@ -692,7 +692,10 @@ impl Browser {
             self.edit(&ctx, abs, false);
         }
         let esc = !esc_was_a_fields && pressed(Key::Escape);
-        if esc || pressed(Key::F3) {
+        // F3 is not text, but a text field with the typing (the hex window's Go to) is the
+        // owner's: it does not leave the viewer from there.
+        let f3 = !ctx.text_edit_focused() && pressed(Key::F3);
+        if esc || f3 {
             self.leave(&ctx, Exit::List);
         }
     }
@@ -824,21 +827,26 @@ impl Browser {
             } else {
                 p.text
             };
+            // Each cell fits its column at a glyph boundary, "…" where it is cut: never a
+            // sliver of a glyph (a wide Hangul one included). A size too long for its column
+            // is said in a larger unit, never cut.
             let (name, ext) = panel::split_name(entry);
             let name_rect =
                 Rect::from_min_max(row_rect.min, Pos2::new(x_ext - cw, row_rect.bottom()));
+            let name = chrome::fit_start(&ctx, name, &font, name_rect.width());
+            let ext = chrome::fit_start(&ctx, ext, &font, cw * ext_w as f32);
             cell(
                 &painter.with_clip_rect(name_rect),
                 inner.left(),
                 y,
-                name,
+                &name,
                 color,
             );
-            cell(&painter, x_ext, y, ext, color);
+            cell(&painter, x_ext, y, &ext, color);
             painter.text(
                 Pos2::new(x_size_end, y),
                 egui::Align2::RIGHT_TOP,
-                panel::size_cell(entry),
+                panel::size_in(entry, size_w),
                 font.clone(),
                 color,
             );
@@ -873,10 +881,37 @@ impl Browser {
             rule_y + half.y,
             active,
         );
-        painter.text(
-            Pos2::new(inner.center().x.round(), foot_y),
-            egui::Align2::CENTER_TOP,
-            panel.footer(),
+        // The foot, centred when it fits inside the frame; else without the free space; else
+        // the count from the left, its end cut — the count is never lost.
+        let (listed, free) = panel.foot_parts();
+        let width = |t: &str| {
+            ctx.fonts_mut(|f| {
+                f.layout_no_wrap(t.to_string(), font.clone(), p.text)
+                    .size()
+                    .x
+            })
+        };
+        let whole = match &free {
+            Some(free) => format!("{listed} · {free}"),
+            None => listed.clone(),
+        };
+        let room = inner.width();
+        let (foot, centred) = if width(&whole) <= room {
+            (whole, true)
+        } else if width(&listed) <= room {
+            (listed, true)
+        } else {
+            (chrome::fit_start(&ctx, &listed, &font, room), false)
+        };
+        let (at, align) = if centred {
+            (inner.center().x.round(), egui::Align2::CENTER_TOP)
+        } else {
+            (inner.left(), egui::Align2::LEFT_TOP)
+        };
+        painter.with_clip_rect(inner).text(
+            Pos2::new(at, foot_y),
+            align,
+            foot,
             font.clone(),
             p.text,
         );

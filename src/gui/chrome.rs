@@ -112,6 +112,12 @@ pub const HEX_KEYS: &[FKey] = &[
     },
 ];
 
+/// The image window's own key: F5 is Save, the same as Cmd/Ctrl+S (as in the hex window).
+pub const IMAGE_KEYS: &[FKey] = &[FKey {
+    n: 5,
+    label: "Save",
+}];
+
 /// `keys` and `more` as one row, by number (a number in both keeps the first).
 pub fn merged(keys: &[FKey], more: &[FKey]) -> Vec<FKey> {
     let mut all: Vec<FKey> = keys.to_vec();
@@ -860,6 +866,33 @@ pub fn fit_left(ctx: &egui::Context, text: &str, font: &FontId, room: f32) -> St
         Some(&at) => format!("…{}", &text[at..]),
         None => "…".to_string(),
     }
+}
+
+/// `text` as it fits in `room` points of `font`: whole, or its longest start that fits before
+/// "…" — a count keeps its beginning. Measured as egui lays it out.
+pub fn fit_start(ctx: &egui::Context, text: &str, font: &FontId, room: f32) -> String {
+    let width = |t: &str| {
+        ctx.fonts_mut(|f| {
+            f.layout_no_wrap(t.to_string(), font.clone(), Color32::WHITE)
+                .size()
+                .x
+        })
+    };
+    if width(text) <= room {
+        return text.to_string();
+    }
+    let ends: Vec<usize> = text.char_indices().map(|(i, _)| i).collect();
+    // The most characters kept from the front with "…" after them.
+    let (mut lo, mut hi) = (0, ends.len());
+    while lo < hi {
+        let mid = (lo + hi).div_ceil(2);
+        if width(&format!("{}…", &text[..ends[mid]])) <= room {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    format!("{}…", &text[..ends[lo]])
 }
 
 /// The highlight bar behind a row.

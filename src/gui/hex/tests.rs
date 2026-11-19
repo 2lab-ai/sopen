@@ -2331,10 +2331,12 @@ fn the_f_keys_do_what_their_labels_say() {
     assert_eq!(fx.win.doc.changed_count(), 0, "no byte was typed");
     fx.key(Key::Enter, Modifiers::NONE);
     assert_eq!(fx.at(), 16);
-    // F5: Save, as Cmd/Ctrl+S.
+    // F5: Save, as Cmd/Ctrl+S — one save.
     fx.typed("7A");
     assert!(fx.win.doc.dirty());
+    let starts = fx.win.save_starts;
     fx.key(Key::F5, Modifiers::NONE);
+    assert_eq!(fx.win.save_starts, starts + 1, "F5 starts exactly one save");
     fx.wait_for_save();
     assert!(
         fx.win.status.text.starts_with("saved "),
@@ -2464,24 +2466,17 @@ fn f5_f6_f8_respect_a_focused_field_the_prompt_a_save_and_read_only() {
     fx.key(Key::Escape, Modifiers::NONE);
     fx.drv.ctx.memory_mut(|m| m.surrender_focus(goto_id()));
     fx.settle();
-    // A save running: no second one.
+    // A save running: no second one starts.
     let (_tx, rx) = mpsc::channel();
     fx.win.job = Some(Job {
         kind: JobKind::Save { close_after: false },
         snapshot: fx.win.doc.patches().clone(),
         rx,
     });
+    let starts = fx.win.save_starts;
     fx.key(Key::F5, Modifiers::NONE);
-    assert!(
-        matches!(
-            fx.win.job,
-            Some(Job {
-                kind: JobKind::Save { .. },
-                ..
-            })
-        ),
-        "the running save is the only one"
-    );
+    fx.key(Key::S, command(false));
+    assert_eq!(fx.win.save_starts, starts, "no save starts while one runs");
     fx.win.job = None;
     // The prompt is up.
     assert!(!fx.win.close_requested());

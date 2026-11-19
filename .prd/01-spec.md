@@ -123,7 +123,11 @@ each in a frame with its folder (`host:/abs`) centred in the top border and the 
 frame drawn heavier; the status row (a fetch's progress, the last result, else what the keys do);
 the bottom row lists the F-keys that work there and nothing else (the list: 3 View, 4 Edit; a
 viewer: 3 Exit, 4 Edit and the viewer's own — the hex window's 5 Save, 6 Goto, 8 Asc/hx, aliases
-of ⌘S, ⌘G and Tab). All drawing of those rows, the frames, the bar and every colour sits in
+of ⌘S, ⌘G and Tab, and the image window's 5 Save; a plain F-key never acts while a text field has
+the typing). The foot shows `N Listed = N bytes` whole inside the frame whatever the width: the
+free space gives way first, then the end of the total. Every cell fits its column at a glyph
+boundary (a name or an extension too long ends in "…"; a size too long for its column is said in
+the smallest unit that fits, KB to EB, never cut). All drawing of those rows, the frames, the bar and every colour sits in
 one module (`gui::chrome`): the PC Tools skin (msg 12 item 4) of every sopen window — light grey
 on DOS blue, the VGA font (PxPlus IBM VGA 8x16, CC BY-SA 4.0) on its 8×16 grid, the active
 window's double frame, the white-on-light-red bar, the red program block on the cyan title row

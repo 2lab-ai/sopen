@@ -1332,3 +1332,57 @@ fn f3_closes_the_window_through_its_prompt() {
         (0, true)
     );
 }
+
+/// F5 is PC Shell's Save, as Cmd/Ctrl+S: it saves an edit — and nothing while a text field
+/// (the block size) has the typing, while the unsaved-changes prompt is up, or while the
+/// picture is read-only. The F-key row lists it, and so does the browser's when it hosts the
+/// window.
+#[test]
+fn f5_saves_as_command_s_does_and_only_where_it_would() {
+    let mut fx = open();
+    fx.settle();
+    assert!(fx.drv.find_text("Save   ").is_some(), "5Save in the row");
+    assert_eq!(
+        crate::gui::Window::keys(&fx.win),
+        crate::gui::chrome::IMAGE_KEYS
+    );
+    let original = std::fs::read(&fx.path).unwrap();
+    fx.select((0.0, 0.0), (120.0, 80.0));
+    fx.key(Key::C, Modifiers::NONE);
+    // The block size field has the typing: F5 is not for it either.
+    fx.drv.click_text(&mut fx.win, "16");
+    assert!(fx.drv.ctx.text_edit_focused());
+    fx.key(Key::F5, Modifiers::NONE);
+    assert!(fx.win.job.is_none(), "F5 in a field saves nothing");
+    assert_eq!(std::fs::read(&fx.path).unwrap(), original);
+    fx.drv.ctx.memory_mut(|m| m.stop_text_input());
+    fx.drv
+        .ctx
+        .memory_mut(|m| m.focused().map(|id| m.surrender_focus(id)));
+    fx.drv.idle(&mut fx.win, 2);
+    assert!(!fx.drv.ctx.egui_wants_keyboard_input());
+    // Under the prompt.
+    assert!(!crate::gui::Window::close_requested(&mut fx.win));
+    fx.drv.idle(&mut fx.win, 2);
+    fx.key(Key::F5, Modifiers::NONE);
+    assert!(fx.win.job.is_none(), "F5 under the prompt saves nothing");
+    fx.drv.click_text(&mut fx.win, "Cancel");
+    // F5 saves.
+    fx.key(Key::F5, Modifiers::NONE);
+    wait_for_save(&mut fx);
+    assert!(
+        fx.win.status.text.starts_with("saved "),
+        "{}",
+        fx.win.status.text
+    );
+    let saved = image::load_from_memory(&std::fs::read(&fx.path).unwrap()).unwrap();
+    assert_eq!((saved.width(), saved.height()), (120, 80));
+    // Read-only: nothing.
+    fx.select((10.0, 10.0), (60.0, 40.0));
+    fx.key(Key::C, Modifiers::NONE);
+    let written = std::fs::read(&fx.path).unwrap();
+    fx.win.doc.read_only = Some("a test".into());
+    fx.key(Key::F5, Modifiers::NONE);
+    assert!(fx.win.job.is_none(), "F5 read-only saves nothing");
+    assert_eq!(std::fs::read(&fx.path).unwrap(), written);
+}
