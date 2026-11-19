@@ -1036,6 +1036,19 @@ const REINDEX_GAP: std::time::Duration = std::time::Duration::from_secs(1);
 /// How often a local file viewed at its end is looked at again.
 const FOLLOW_EVERY: std::time::Duration = std::time::Duration::from_secs(1);
 
+#[cfg(test)]
+thread_local! {
+    static FOLLOWS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Tests: how many times a viewer on this thread asked to look at its file again
+/// ([`FOLLOW_EVERY`]) — the follow itself, not any repaint that happens to be a second away (the
+/// title row's clock asks for one in a minute's last second).
+#[cfg(test)]
+pub(crate) fn follows() -> usize {
+    FOLLOWS.with(std::cell::Cell::get)
+}
+
 impl TextWindow {
     fn new(mut doc: TextDoc, title: String, name: &str, notices: Vec<String>) -> Self {
         // Changed since it was indexed (between the opener's worker and now): nothing is read
@@ -1503,6 +1516,8 @@ impl TextWindow {
             // At the end of a local file: looked at again each second with no input (one stat),
             // so a growing log is followed.
             ctx.request_repaint_after(FOLLOW_EVERY);
+            #[cfg(test)]
+            FOLLOWS.with(|n| n.set(n.get() + 1));
         }
         let painter = ui.painter_at(rect);
         // The scroll bar on the right border, beside the lines.

@@ -8,6 +8,9 @@ use eframe::egui::{
     Rect, TouchPhase, Vec2,
 };
 
+/// 2026-11-11 09:24:00 UTC: a whole minute (seconds since the epoch).
+pub const START_OF_A_MINUTE: i64 = 1_794_389_040;
+
 pub struct Driver {
     pub ctx: egui::Context,
     size: Vec2,
@@ -35,6 +38,9 @@ impl Driver {
     pub fn new(w: f32, h: f32) -> Self {
         let ctx = egui::Context::default();
         super::chrome::install(&ctx);
+        // The title row's clock at the start of a minute: its next repaint is a minute away,
+        // out of any test's way (a test that wants another second sets it after this).
+        super::chrome::set_test_now(Some(START_OF_A_MINUTE));
         Self {
             ctx,
             size: Vec2::new(w, h),

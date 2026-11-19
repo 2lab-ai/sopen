@@ -1184,7 +1184,8 @@ fn the_wheel_waits_during_a_reread() {
 }
 
 /// L4: a local file viewed at its end is checked again about every second with no input (a
-/// growing log is followed); away from the end, or for a remote copy, it is not.
+/// growing log is followed); away from the end, or for a remote copy, it is not. Counted at the
+/// viewer's follow request, not by repaint delays (a one-second repaint can be another's).
 #[test]
 fn a_viewer_at_the_end_checks_again_every_second() {
     let tmp = tempfile::tempdir().unwrap();
@@ -1196,22 +1197,33 @@ fn a_viewer_at_the_end_checks_again_every_second() {
     let seen = asked.clone();
     drv.ctx
         .set_repaint_observer(move |info| seen.lock().unwrap().push(info.delay));
-    let second = |a: &Arc<Mutex<Vec<std::time::Duration>>>| {
-        a.lock()
-            .unwrap()
-            .iter()
-            .any(|d| *d == std::time::Duration::from_secs(1))
+    let follows_in_a_pass = |drv: &mut Driver, win: &mut TextWindow| {
+        let before = follows();
+        drv.idle(win, 1);
+        follows() - before
     };
-    drv.idle(&mut win, 1);
-    assert!(!second(&asked), "not at the end: no follow");
+    assert_eq!(
+        follows_in_a_pass(&mut drv, &mut win),
+        0,
+        "not at the end: no follow"
+    );
     drv.key(&mut win, Key::End, Modifiers::NONE);
     asked.lock().unwrap().clear();
-    drv.idle(&mut win, 1);
-    assert!(second(&asked), "at the end: the next check is asked for");
+    assert_eq!(
+        follows_in_a_pass(&mut drv, &mut win),
+        1,
+        "at the end: the next check"
+    );
+    assert!(
+        asked.lock().unwrap().contains(&FOLLOW_EVERY),
+        "asked for a second later"
+    );
     win.live = false;
-    asked.lock().unwrap().clear();
-    drv.idle(&mut win, 1);
-    assert!(!second(&asked), "a remote copy is not followed");
+    assert_eq!(
+        follows_in_a_pass(&mut drv, &mut win),
+        0,
+        "a remote copy is not followed"
+    );
 }
 
 /// L1: a change other than growth (here a shrink) landing right after a re-read is installed,

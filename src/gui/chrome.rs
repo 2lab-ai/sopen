@@ -573,11 +573,28 @@ pub fn clock_text(hour: i32, minute: i32) -> String {
     format!("{h:>2}:{minute:02}{half}")
 }
 
-/// Seconds since the epoch, now.
+/// Seconds since the epoch, now (in tests, the time [`set_test_now`] gave this thread, if any).
 fn now_secs() -> i64 {
+    #[cfg(test)]
+    if let Some(now) = TEST_NOW.with(std::cell::Cell::get) {
+        return now;
+    }
     SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs() as i64)
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_NOW: std::cell::Cell<Option<i64>> = const { std::cell::Cell::new(None) };
+}
+
+/// Tests: the clock on the title row reads `now` (seconds since the epoch) on this thread —
+/// the test kit's driver sets the start of a minute, so the clock asks to be repainted only a
+/// minute later, never in the second a test watches (`None`: the real time).
+#[cfg(test)]
+pub(crate) fn set_test_now(now: Option<i64>) {
+    TEST_NOW.with(|t| t.set(now));
 }
 
 /// A row one cell tall across `ui`.
