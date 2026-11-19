@@ -182,7 +182,11 @@ replaces that module alone.
   minutes). A page shows plain and its highlighted lines replace the plain ones when the worker
   sends them; the worker works on the page on screen only (a newer page makes it drop the older,
   checked between lines). Leaving the viewer or closing the window tells it to stop and never
-  waits for it. A line is parsed only whole, so
+  waits for it. At most 3 such workers run in the whole process, counting those whose viewer is
+  gone but whose parse call still runs (a slot is given back only when the worker's thread
+  ends): with none free, a viewer shows plain for its lifetime and its status row says
+  highlighting is busy in other viewers. A worker that fails (a read error, a panic) leaves the
+  page plain, ready, with the reason on the status row. A line is parsed only whole, so
   highlighting stops at the first line over 4096 bytes (the status row says which) and the rest
   is plain; files over 16 MiB are shown plain. The file is read live, the index is of the file as
   opened: when it changes — its size or modification time through the open handle, or what its

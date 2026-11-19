@@ -603,3 +603,138 @@ fn a_file_growing_while_it_is_indexed() {
     assert_eq!(texts, ["00399998", "00399999"]);
     assert!(doc.changed(), "the growth is a change");
 }
+
+/// A viewer drawing from its own admission pool of `cap` (tests do not share the process's).
+fn pooled_viewer(dir: &Path, name: &str, body: &str, pool: &Arc<Pool>) -> TextWindow {
+    let mut win = viewer(dir, name, body);
+    win.pool = pool.clone();
+    win
+}
+
+/// W1: highlighting workers are bounded across viewers: a worker stuck in the parser keeps its
+/// slot after its viewer is gone, so with all slots taken a new viewer is plain (and says so)
+/// instead of starting another parser; once the stuck ones finish, slots are free again.
+#[test]
+fn stuck_workers_are_bounded_across_viewers() {
+    let tmp = tempfile::tempdir().unwrap();
+    let pool = Pool::new(3);
+    let (hook, reached, go) = blocking_hook();
+    let body = "// MARKER\nfn main() {}\n";
+    for k in 0..5 {
+        let mut win = pooled_viewer(tmp.path(), &format!("v{k}.rs"), body, &pool);
+        win.hook = Some(hook.clone());
+        let mut drv = Driver::new(800.0, 400.0);
+        drv.idle(&mut win, 2);
+        if k < 3 {
+            reached
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .expect("a stuck worker");
+            assert!(win.worker.is_some());
+        } else {
+            assert!(
+                win.worker.is_none(),
+                "viewer {k} started a parser past the cap"
+            );
+            assert!(win.status.text.contains("busy"), "{}", win.status.text);
+            drv.until(&mut win, 5, |w| w.ready());
+        }
+        assert!(pool.live() <= 3, "{} parsers", pool.live());
+        drop(win);
+    }
+    assert_eq!(
+        pool.live(),
+        3,
+        "the stuck ones hold their slots after their viewers went"
+    );
+    for _ in 0..3 {
+        go.send(()).unwrap();
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while pool.live() > 0 {
+        assert!(std::time::Instant::now() < deadline, "slots never freed");
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let mut win = pooled_viewer(tmp.path(), "after.rs", "fn main() {}\n", &pool);
+    let mut drv = Driver::new(800.0, 400.0);
+    drv.until(&mut win, 10, |w| w.ready());
+    assert!(win.worker.is_some(), "a slot again");
+}
+
+/// W2: a worker that fails (a read error that is not a change, or a panic) says so: the page is
+/// shown plain and the window is ready, with a status — never waiting forever.
+#[test]
+fn a_failed_worker_leaves_the_page_plain_and_says_why() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut win = viewer(tmp.path(), "err.rs", "fn main() {}\n");
+    win.doc.fail_worker_reads = true;
+    let mut drv = Driver::new(800.0, 400.0);
+    drv.until(&mut win, 5, |w| w.ready());
+    assert!(win.worker.is_none());
+    assert!(
+        win.status.text.contains("highlighting stopped"),
+        "{}",
+        win.status.text
+    );
+    let plain = chrome::Palette::of(&drv.ctx.global_style().visuals).text;
+    assert_eq!(drv.colors_of("fn main() {}"), Some(vec![plain]));
+    // A worker that dies without a word (a panic in the parser) counts the same.
+    let mut win = viewer(tmp.path(), "panic.rs", "// PANIC\nfn main() {}\n");
+    win.hook = Some(Arc::new(|line: &str| {
+        if line.contains("PANIC") {
+            panic!("the parser broke");
+        }
+    }));
+    drv.until(&mut win, 5, |w| w.ready());
+    assert!(win.worker.is_none());
+    assert!(
+        win.status.text.contains("highlighting stopped"),
+        "{}",
+        win.status.text
+    );
+}
+
+/// Nice: a page asked earlier and finished late never lands on the page now on screen.
+#[test]
+fn a_late_page_never_lands_on_the_current_one() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut drv = Driver::new(800.0, 300.0);
+    // How many lines a page holds at this size.
+    let mut probe = viewer(tmp.path(), "probe.txt", "x\n");
+    drv.idle(&mut probe, 2);
+    let visible = probe.visible as usize;
+    // The first page's last line stops the parser: released, that page completes (late).
+    let body: String = (0..visible)
+        .map(|i| {
+            if i == visible - 1 {
+                "// MARKER\n".to_string()
+            } else {
+                format!("fn first{i}() {{}}\n")
+            }
+        })
+        .chain((0..400).map(|i| format!("fn second{i}() {{}}\n")))
+        .collect();
+    let mut win = viewer(tmp.path(), "late.rs", &body);
+    let (hook, reached, go) = blocking_hook();
+    win.hook = Some(hook);
+    drv.idle(&mut win, 2);
+    reached
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .unwrap();
+    drv.key(&mut win, Key::End, Modifiers::NONE);
+    let current = win.page.as_ref().unwrap().gen;
+    // Released for good (the second page's states pass the same line again).
+    go.send(()).unwrap();
+    drop(go);
+    drv.until(&mut win, 10, |w| w.ready());
+    assert_eq!(win.page.as_ref().unwrap().gen, current);
+    assert!(
+        drv.find_text("fn first0() {}").is_none(),
+        "the first page's lines never came back"
+    );
+    let colors: std::collections::HashSet<_> = drv
+        .colors_of("fn second399() {}")
+        .expect("the last page is shown")
+        .into_iter()
+        .collect();
+    assert!(colors.len() >= 2, "and highlighted: {colors:?}");
+}

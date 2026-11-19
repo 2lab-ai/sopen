@@ -15,7 +15,8 @@
 //! interrupted, and a pathological line can take minutes. The window shows a page plain and
 //! swaps in its highlighted lines when the worker sends them; it asks for the page on screen
 //! only (a newer request makes the worker drop the older one, checked between lines), and when
-//! the window goes the worker is told to stop and is never waited for. A line is parsed only whole: highlighting stops at the first
+//! the window goes the worker is told to stop and is never waited for. At most [`MAX_WORKERS`]
+//! run in the process, stuck ones included ([`Pool`]); a viewer that gets no slot stays plain. A line is parsed only whole: highlighting stops at the first
 //! line longer than [`LINE_MAX`] (only its start is read, and a comment or string closed past the
 //! cut would colour everything after it), and the rest of the file is plain. Files over
 //! [`HIGHLIGHT_MAX`] are always shown plain.
@@ -31,7 +32,7 @@ use eframe::egui::{self, text::LayoutJob, Color32, Key, Modifiers, Pos2, Rect};
 use std::fs::File;
 use std::os::unix::fs::FileExt;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
 use std::sync::OnceLock;
@@ -83,6 +84,11 @@ pub struct TextDoc {
     path: std::path::PathBuf,
     /// Bytes read for lines (not the index pass) — what paging costs.
     page_reads: u64,
+    /// Tests: the worker's copy ([`TextDoc::share`]) fails every read (not as a change).
+    #[cfg(test)]
+    pub(crate) fail_worker_reads: bool,
+    #[cfg(test)]
+    fail_reads: bool,
 }
 
 /// What [`TextDoc::changed`] compares: device, inode, size and modification time.
@@ -184,6 +190,10 @@ impl TextDoc {
             opened,
             path: path.to_path_buf(),
             page_reads: 0,
+            #[cfg(test)]
+            fail_worker_reads: false,
+            #[cfg(test)]
+            fail_reads: false,
         })
     }
 
@@ -214,6 +224,10 @@ impl TextDoc {
             opened: self.opened,
             path: self.path.clone(),
             page_reads: 0,
+            #[cfg(test)]
+            fail_worker_reads: false,
+            #[cfg(test)]
+            fail_reads: self.fail_worker_reads,
         })
     }
 
@@ -256,6 +270,10 @@ impl TextDoc {
     }
 
     fn read_at(&mut self, buf: &mut [u8], at: u64) -> Result<usize> {
+        #[cfg(test)]
+        if self.fail_reads {
+            anyhow::bail!("an injected read error");
+        }
         let n = self.file.read_at(buf, at).context("cannot read the file")?;
         self.page_reads += n as u64;
         Ok(n)
@@ -600,6 +618,69 @@ impl Highlight {
     }
 }
 
+/// Highlighting workers that may run at once, in the whole process: a worker stuck in one
+/// parse call outlives its viewer (it cannot be interrupted), and opening the same file again
+/// must not pile up parsers, handles and indexes.
+pub const MAX_WORKERS: usize = 3;
+
+/// Admission for highlighting workers: a slot is taken when a worker starts and given back only
+/// when its thread ends ([`Slot`], owned by the thread) — so it counts live workers and those
+/// whose viewer is gone but whose parse still runs.
+pub(crate) struct Pool {
+    cap: usize,
+    live: AtomicUsize,
+}
+
+impl Pool {
+    pub(crate) fn new(cap: usize) -> Arc<Self> {
+        Arc::new(Self {
+            cap,
+            live: AtomicUsize::new(0),
+        })
+    }
+
+    /// The process's pool ([`MAX_WORKERS`]; tests, which run many viewers side by side, get a
+    /// roomier one — the bound itself is tested on pools of their own).
+    pub(crate) fn global() -> Arc<Self> {
+        static POOL: OnceLock<Arc<Pool>> = OnceLock::new();
+        let cap = if cfg!(test) { 64 } else { MAX_WORKERS };
+        POOL.get_or_init(|| Pool::new(cap)).clone()
+    }
+
+    /// Workers holding a slot now (tests).
+    #[cfg(test)]
+    pub(crate) fn live(&self) -> usize {
+        self.live.load(Ordering::Acquire)
+    }
+
+    /// A slot, if one is free.
+    fn admit(self: &Arc<Self>) -> Option<Slot> {
+        let mut n = self.live.load(Ordering::Acquire);
+        loop {
+            if n >= self.cap {
+                return None;
+            }
+            match self
+                .live
+                .compare_exchange_weak(n, n + 1, Ordering::AcqRel, Ordering::Acquire)
+            {
+                Ok(_) => return Some(Slot(self.clone())),
+                Err(now) => n = now,
+            }
+        }
+    }
+}
+
+/// One worker's place in its [`Pool`], given back when dropped (when the worker's thread ends,
+/// however it ends).
+struct Slot(Arc<Pool>);
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        self.0.live.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 /// A page the window wants highlighted: asked under generation `gen`.
 struct Ask {
     gen: u64,
@@ -615,6 +696,8 @@ enum Done {
     },
     /// The file changed under the index: the worker stopped.
     Stale,
+    /// The worker stopped for another reason (a read error): why.
+    Failed(String),
 }
 
 /// The highlighting worker, from the window's side. Dropping it tells the worker to stop; it is
@@ -633,6 +716,15 @@ struct Worker {
     exited: Arc<AtomicBool>,
 }
 
+/// Wakes the window when dropped: the worker's thread ending (a panic included) is news.
+struct Wake(egui::Context);
+
+impl Drop for Wake {
+    fn drop(&mut self) {
+        self.0.request_repaint();
+    }
+}
+
 impl Drop for Worker {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
@@ -640,9 +732,15 @@ impl Drop for Worker {
 }
 
 impl Worker {
-    /// Starts the worker on `doc` (a handle of its own) with `hl`; `ctx` is woken when a page
-    /// is done.
-    fn start(mut doc: TextDoc, mut hl: Highlight, ctx: egui::Context) -> Self {
+    /// Starts the worker on `doc` (a handle of its own) with `hl`, if `pool` has a slot free;
+    /// `ctx` is woken when a page is done or the worker stops.
+    fn start(
+        mut doc: TextDoc,
+        mut hl: Highlight,
+        ctx: egui::Context,
+        pool: &Arc<Pool>,
+    ) -> Option<Self> {
+        let slot = pool.admit()?;
         let (asks, rx) = mpsc::channel::<Ask>();
         let (tx, done) = mpsc::channel();
         let latest = Arc::new(AtomicU64::new(0));
@@ -651,6 +749,10 @@ impl Worker {
         let parsed = hl.parsed.clone();
         let (l, st, ex) = (latest.clone(), stop.clone(), exited.clone());
         std::thread::spawn(move || {
+            // Given back when this thread ends — normally, or by a panic in the parser.
+            let _slot = slot;
+            // A panic ends the thread without a word: the window sees its channel close.
+            let _wake = Wake(ctx.clone());
             while let Ok(mut ask) = rx.recv() {
                 // Only the newest request matters.
                 while let Ok(newer) = rx.try_recv() {
@@ -669,24 +771,26 @@ impl Worker {
                     Ok(None) => {}
                     Err(e) => {
                         crate::debug!("highlighting stopped: {e:#}");
-                        if is_stale(&e) {
-                            let _ = tx.send(Done::Stale);
-                            ctx.request_repaint();
-                        }
+                        let _ = tx.send(if is_stale(&e) {
+                            Done::Stale
+                        } else {
+                            Done::Failed(format!("{e:#}"))
+                        });
+                        ctx.request_repaint();
                         break;
                     }
                 }
             }
             ex.store(true, Ordering::Relaxed);
         });
-        Self {
+        Some(Self {
             asks,
             done,
             latest,
             stop,
             parsed,
             exited,
-        }
+        })
     }
 
     fn ask(&self, gen: u64, top: u64, count: usize) {
@@ -739,6 +843,7 @@ struct TextWindow {
     gen: u64,
     #[cfg(test)]
     hook: Option<ParseHook>,
+    pool: Arc<Pool>,
     /// The first line on screen, and how many fit (the last pass's).
     top: u64,
     visible: u64,
@@ -790,6 +895,7 @@ impl TextWindow {
             gen: 0,
             #[cfg(test)]
             hook: None,
+            pool: Pool::global(),
             top: 0,
             visible: 1,
             left: 0,
@@ -889,18 +995,39 @@ impl TextWindow {
         let (Some(worker), Some(page)) = (self.worker.as_ref(), self.page.as_mut()) else {
             return;
         };
-        while let Ok(done) = worker.done.try_recv() {
-            match done {
-                Done::Page { gen, runs } if gen == page.gen => {
+        let mut gone = None;
+        loop {
+            match worker.done.try_recv() {
+                Ok(Done::Page { gen, runs }) if gen == page.gen => {
                     page.runs = runs.into_iter().map(expand_tabs).collect();
                     page.highlighted = true;
                 }
-                Done::Page { .. } => {}
-                Done::Stale => {
+                Ok(Done::Page { .. }) => {}
+                Ok(Done::Stale) => {
                     self.stale = true;
                     self.status = Status::error(CHANGED);
-                    page.highlighted = true;
+                    gone = Some(None);
+                    break;
                 }
+                Ok(Done::Failed(why)) => {
+                    gone = Some(Some(format!("highlighting stopped ({why}); shown plain")));
+                    break;
+                }
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    gone = Some(Some(
+                        "highlighting stopped unexpectedly; shown plain".to_string(),
+                    ));
+                    break;
+                }
+            }
+        }
+        if let Some(why) = gone {
+            // The worker is over: the page stays plain and is ready, and nothing more is asked.
+            page.highlighted = true;
+            self.worker = None;
+            if let Some(why) = why {
+                self.status = Status::error(why);
             }
         }
         let _ = ctx;
@@ -990,7 +1117,14 @@ impl TextWindow {
                     h
                 });
                 self.worker = match (hl, self.doc.share()) {
-                    (Some(hl), Ok(doc)) => Some(Worker::start(doc, hl, ctx.clone())),
+                    (Some(hl), Ok(doc)) => {
+                        let started = Worker::start(doc, hl, ctx.clone(), &self.pool);
+                        if started.is_none() {
+                            self.status =
+                                Status::info("highlighting is busy in other viewers; shown plain");
+                        }
+                        started
+                    }
                     _ => None,
                 };
             }
