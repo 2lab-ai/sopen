@@ -1,10 +1,14 @@
 //! The image window (spec §6): fit/zoom/pan, a rectangle in image pixels, Crop, Pixelize,
-//! Undo/Redo, Save (backup first, conflict-checked overwrite) and Save copy (a new sibling).
+//! Cut / Copy / Paste through the system clipboard ([`clip`]), Undo/Redo, Save (backup first,
+//! conflict-checked overwrite) and Save copy (a new sibling).
 //!
 //! [`Doc`] is the edit model (decode, ops, history, encode) and [`ImageFile`] the write side;
 //! both are window-free, so the tests and the `SOPEN_AUTOSAVE` hook run the exact code the
 //! window's buttons run.
 
+pub mod clip;
+
+use super::fonts::{self, Face};
 use super::{Hooks, Map, Op, Origin, Outcome, Selection, Status};
 use crate::remote::WriteOutcome;
 use anyhow::{anyhow, bail, Context as _, Result};
@@ -481,6 +485,118 @@ impl Doc {
         ))
     }
 
+    /// The pixels of `rect` — the whole image when `None` — as 8-bit RGBA, for the clipboard.
+    /// Reads only, so a read-only image can be copied too.
+    pub fn copy(&self, rect: Option<[u32; 4]>) -> Result<image::RgbaImage> {
+        let [x, y, w, h] = match rect {
+            Some(rect) => {
+                self.check_rect(rect)?;
+                rect
+            }
+            None => {
+                let (w, h) = self.size();
+                [0, 0, w, h]
+            }
+        };
+        Ok(self.img.crop_imm(x, y, w, h).to_rgba8())
+    }
+
+    /// Cut: the pixels of `rect` (returned, for the clipboard), and `rect` left in
+    /// `background`. One undo step.
+    pub fn cut(
+        &mut self,
+        rect: Option<[u32; 4]>,
+        background: clip::Colour,
+    ) -> Result<(image::RgbaImage, String)> {
+        self.editable()?;
+        let rect = rect.context("draw a rectangle first")?;
+        let cut = self.copy(Some(rect))?;
+        let mut next = self.img.clone();
+        clip::fill(&mut next, rect, background);
+        self.commit(next);
+        Ok((cut, format!("cut {}×{}", rect[2], rect[3])))
+    }
+
+    /// Paste a picture into `rect` as `fit` says (see [`clip::place`]); without a rectangle,
+    /// unscaled at the top-left, cut off at the image's edges. Returns the status line and
+    /// the area the picture covers (the selection after a paste without one). One undo step.
+    pub fn paste_image(
+        &mut self,
+        rect: Option<[u32; 4]>,
+        picture: &image::RgbaImage,
+        fit: clip::Fit,
+        background: clip::Colour,
+    ) -> Result<(String, [u32; 4])> {
+        self.editable()?;
+        let (pw, ph) = picture.dimensions();
+        if pw == 0 || ph == 0 {
+            bail!("the clipboard image is empty");
+        }
+        let (rect, fit) = match rect {
+            Some(rect) => {
+                self.check_rect(rect)?;
+                (rect, fit)
+            }
+            None => {
+                let (w, h) = self.size();
+                ([0, 0, w, h], clip::Fit::OneToOne)
+            }
+        };
+        let mut next = self.img.clone();
+        let at = clip::place(&mut next, rect, picture, fit, background);
+        self.commit(next);
+        let line = format!(
+            "pasted image {pw}×{ph} → {}×{} ({})",
+            at[2],
+            at[3],
+            fit.name()
+        );
+        Ok((line, at))
+    }
+
+    /// Paste text into `rect`, wrapped to its width and sized to fill it, in `colour`; without
+    /// a rectangle, at the top-left in letters a tenth of the image's height (at least 12 px),
+    /// wrapped to the image's width. Drawn in `hangul` (an installed font with Hangul, if there
+    /// is one), then egui's built-in font. Returns the status line and the text's block (the
+    /// selection after a paste without a rectangle). One undo step.
+    pub fn paste_text(
+        &mut self,
+        rect: Option<[u32; 4]>,
+        text: &str,
+        colour: clip::Colour,
+        hangul: Option<&Face>,
+    ) -> Result<(String, [u32; 4])> {
+        self.editable()?;
+        if text.trim().is_empty() {
+            bail!("the clipboard text is blank");
+        }
+        let (rect, size) = match rect {
+            Some(rect) => {
+                self.check_rect(rect)?;
+                (rect, clip::TextSize::Fill)
+            }
+            None => {
+                let (w, h) = self.size();
+                let px = (h as f32 / 10.0).max(12.0);
+                ([0, 0, w, h], clip::TextSize::Px(px))
+            }
+        };
+        let faces: Vec<&Face> = hangul.into_iter().chain([fonts::fallback()]).collect();
+        let mut next = self.img.clone();
+        let drawn = clip::draw_text(&mut next, rect, text, colour, &faces, size);
+        self.commit(next);
+        let mut line = format!("pasted text ({} chars)", text.chars().count());
+        match (drawn.missing, hangul.is_some()) {
+            (0, _) => {}
+            (_, false) => line.push_str(" · no Hangul font found, so Hangul may not render"),
+            (n, true) => line.push_str(&format!(
+                " · {} without a glyph in any font found",
+                plural(n, "character")
+            )),
+        }
+        Ok((line, drawn.area))
+    }
+
     pub fn undo(&mut self) -> bool {
         let Some(prev) = self.undo.pop() else {
             return false;
@@ -949,10 +1065,11 @@ pub fn open(file: ImageFile, hooks: &Hooks, notices: Vec<String>) -> Result<Outc
     let window = ImageWindow::new(file, doc, sel, block, notices);
     let outcome = window.outcome.clone();
     let leftover = window.leftover.clone();
-    // A window that shows the image near 1:1 where the screen allows; eframe clamps to it.
+    // A window that shows the image near 1:1 where the screen allows (the two toolbar rows
+    // and the status bar above and below it); eframe clamps to it.
     let size = [
         (w as f32).clamp(640.0, 1400.0),
-        (h as f32 + 90.0).clamp(420.0, 940.0),
+        (h as f32 + 113.0).clamp(420.0, 940.0),
     ];
     let run = super::run_window(&title, size, window, hooks);
     // Never exit with a write in flight without its outcome on the terminal.
@@ -1003,6 +1120,24 @@ fn autosave(mut file: ImageFile, doc: &Doc, hooks: &Hooks) -> Result<Outcome> {
 
 // ---------------------------------------------------------------------------------------------
 // The window.
+
+/// A picture for the clipboard: egui keeps premultiplied alpha, so a pixel that is neither
+/// opaque nor fully transparent is rounded on the way (8-bit premultiplied).
+fn color_image(picture: &image::RgbaImage) -> egui::ColorImage {
+    let (w, h) = picture.dimensions();
+    egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], picture.as_raw())
+}
+
+/// A pasted picture (egui-winit hands it over premultiplied) as straight 8-bit RGBA.
+fn rgba_image(pasted: &egui::ColorImage) -> image::RgbaImage {
+    let [w, h] = pasted.size;
+    let bytes = pasted
+        .pixels
+        .iter()
+        .flat_map(|c| c.to_srgba_unmultiplied())
+        .collect();
+    image::RgbaImage::from_raw(w as u32, h as u32, bytes).expect("w×h×4 bytes")
+}
 
 /// Prints a finished save to the terminal, records it in `outcome` and returns the window's
 /// one-line status and what must be shown whole (the disclosure rows): write notes, what was
@@ -1112,6 +1247,33 @@ struct ImageWindow {
     /// while the button is down.
     notices: Vec<String>,
     pending_notices: Option<Vec<String>>,
+    /// How Cmd/Ctrl+V lays a picture into the rectangle.
+    fit: clip::Fit,
+    /// What Cut leaves and Fit puts around a pasted picture (opaque; see `transparent`).
+    background: Color32,
+    /// The background is transparent instead — offered only when the image has alpha.
+    transparent: bool,
+    /// The image's pixel type has alpha (never changes: the edits keep the pixel type).
+    has_alpha: bool,
+    /// Pasted text's colour.
+    text_colour: Color32,
+    /// The last cut or paste, to tell a held key from a new press (see [`LastClip`]).
+    last_clip: Option<LastClip>,
+}
+
+/// A cut or paste and everything it depended on, as they were right after it. egui-winit 0.37
+/// drops winit's key-repeat flag (`repeat: _` in its `on_keyboard_input`), so a Cmd/Ctrl+X or V
+/// held a moment too long arrives as the same event again: a second Cut would copy the blank it
+/// left over the picture on the clipboard, a second Paste would draw over itself. An event
+/// equal to this one with nothing changed since is that repeat, and is ignored.
+#[derive(PartialEq)]
+struct LastClip {
+    event: egui::Event,
+    rev: u64,
+    rect: Option<[u32; 4]>,
+    fit: clip::Fit,
+    background: clip::Colour,
+    text_colour: Color32,
 }
 
 impl Drop for ImageWindow {
@@ -1128,6 +1290,9 @@ impl ImageWindow {
     /// session; the one-line status is for short news.
     fn new(file: ImageFile, doc: Doc, sel: Selection, block: u32, notices: Vec<String>) -> Self {
         let can_replace = file.can_replace();
+        // Looked up only when text is pasted, but enumerating the fonts takes a moment.
+        fonts::prefetch();
+        let has_alpha = doc.img.color().has_alpha();
         let opened = notices
             .into_iter()
             .chain((!can_replace).then(|| CANNOT_REPLACE.to_string()))
@@ -1155,6 +1320,12 @@ impl ImageWindow {
             opened,
             notices: Vec::new(),
             pending_notices: None,
+            fit: clip::Fit::default(),
+            background: Color32::WHITE,
+            transparent: false,
+            has_alpha,
+            text_colour: Color32::BLACK,
+            last_clip: None,
         }
     }
 
@@ -1197,6 +1368,116 @@ impl ImageWindow {
     fn undo(&mut self) {
         if self.doc.undo() {
             self.status = Status::info("undone");
+        }
+    }
+
+    /// The background as the edits take it: transparent only where the image has alpha.
+    fn background(&self) -> clip::Colour {
+        let [r, g, b, _] = self.background.to_srgba_unmultiplied();
+        let a = if self.transparent && self.has_alpha {
+            0
+        } else {
+            255
+        };
+        [r, g, b, a]
+    }
+
+    /// Cmd/Ctrl+C: the rectangle, or the whole image, to the system clipboard (eframe hands the
+    /// picture to egui-winit, which writes it with arboard).
+    fn copy(&mut self, ctx: &egui::Context) {
+        match self.doc.copy(self.rect()) {
+            Ok(picture) => {
+                let (w, h) = picture.dimensions();
+                ctx.copy_image(color_image(&picture));
+                self.status = Status::info(format!("copied {w}×{h}"));
+            }
+            Err(e) => self.report(Err(e)),
+        }
+    }
+
+    /// Cmd/Ctrl+X: copy, then the rectangle in the background colour.
+    fn cut(&mut self, ctx: &egui::Context) {
+        match self.doc.cut(self.rect(), self.background()) {
+            Ok((picture, line)) => {
+                ctx.copy_image(color_image(&picture));
+                self.report(Ok(line));
+            }
+            Err(e) => self.report(Err(e)),
+        }
+    }
+
+    /// A paste's result. One made without a rectangle selects what it covers; one made into a
+    /// rectangle keeps it.
+    fn pasted(&mut self, done: Result<(String, [u32; 4])>) {
+        let had_rect = self.rect().is_some();
+        if let Ok((_, area)) = &done {
+            if !had_rect && area[2] > 0 && area[3] > 0 {
+                self.sel.set(*area);
+            }
+        }
+        self.report(done.map(|(line, _)| line));
+    }
+
+    /// Cmd/Ctrl+C, X and V. egui-winit turns these shortcuts into these events — never into
+    /// key presses — and for V reads the system clipboard: its text when it holds text, else
+    /// its image. Not while a text field has the keyboard (its own copy and paste) or the close
+    /// prompt is up.
+    fn clipboard(&mut self, ctx: &egui::Context) {
+        if self.prompt || ctx.text_edit_focused() {
+            return;
+        }
+        let events: Vec<egui::Event> = ctx.input(|i| {
+            i.events
+                .iter()
+                .filter(|e| {
+                    matches!(
+                        e,
+                        egui::Event::Copy
+                            | egui::Event::Cut
+                            | egui::Event::Paste(_)
+                            | egui::Event::PasteImage(_)
+                    )
+                })
+                .cloned()
+                .collect()
+        });
+        for event in events {
+            let now = |w: &Self, event: &egui::Event| LastClip {
+                event: event.clone(),
+                rev: w.doc.rev(),
+                rect: w.rect(),
+                fit: w.fit,
+                background: w.background(),
+                text_colour: w.text_colour,
+            };
+            if !matches!(event, egui::Event::Copy)
+                && self.last_clip.as_ref() == Some(&now(self, &event))
+            {
+                continue;
+            }
+            let rev = self.doc.rev();
+            match &event {
+                egui::Event::Copy => self.copy(ctx),
+                egui::Event::Cut => self.cut(ctx),
+                egui::Event::Paste(text) => {
+                    let [r, g, b, a] = self.text_colour.to_srgba_unmultiplied();
+                    let done =
+                        self.doc
+                            .paste_text(self.rect(), text, [r, g, b, a], fonts::hangul());
+                    self.pasted(done);
+                }
+                egui::Event::PasteImage(image) => {
+                    let picture = rgba_image(image);
+                    let done =
+                        self.doc
+                            .paste_image(self.rect(), &picture, self.fit, self.background());
+                    self.pasted(done);
+                }
+                _ => {}
+            }
+            if self.doc.rev() != rev {
+                self.last_clip = Some(now(self, &event));
+            }
         }
     }
 
@@ -1396,6 +1677,49 @@ impl ImageWindow {
         });
     }
 
+    /// The second toolbar row: how Cmd/Ctrl+V lays a picture into the rectangle, and the
+    /// background and text colours. One line from the smallest window up, and the same for the
+    /// whole session (the transparent choice depends only on the image's pixel type), so it
+    /// never moves the image.
+    fn paste_row(&mut self, ui: &mut egui::Ui) {
+        use egui::color_picker::{color_edit_button_srgba, Alpha};
+        let editable = self.doc.read_only.is_none();
+        ui.add_enabled_ui(editable, |ui| {
+            ui.horizontal(|ui| {
+                // Narrow swatches and no separators: the row, transparent choice included,
+                // fits the smallest window (480 px).
+                ui.spacing_mut().interact_size.x = 24.0;
+                ui.label("Paste")
+                    .on_hover_text("⌘/Ctrl+V: how a picture fills the rectangle");
+                for (fit, label, hint) in [
+                    (clip::Fit::Stretch, "Stretch", "scaled to the rectangle"),
+                    (
+                        clip::Fit::Fit,
+                        "Fit",
+                        "scaled to fit inside it, aspect kept; the rest gets the background",
+                    ),
+                    (
+                        clip::Fit::OneToOne,
+                        "1:1",
+                        "unscaled at its top-left, cut off at its edges",
+                    ),
+                ] {
+                    ui.selectable_value(&mut self.fit, fit, label)
+                        .on_hover_text(hint);
+                }
+                ui.label("Background");
+                color_edit_button_srgba(ui, &mut self.background, Alpha::Opaque)
+                    .on_hover_text("what ⌘/Ctrl+X leaves, and what Fit puts around a picture");
+                if self.has_alpha {
+                    ui.checkbox(&mut self.transparent, "transparent");
+                }
+                ui.label("Text");
+                color_edit_button_srgba(ui, &mut self.text_colour, Alpha::Opaque)
+                    .on_hover_text("the colour of pasted text");
+            });
+        });
+    }
+
     /// `zoom` is the previous pass's (the image is laid out after the bar).
     /// One line whatever it says (see [`super::one_line`]): the image above must not move. The
     /// busy spinner sits here, before "saving…", rather than in the wrapping toolbar: kept out
@@ -1576,9 +1900,11 @@ impl super::Window for ImageWindow {
         let ctx = ui.ctx().clone();
         self.poll_job(&ctx);
         self.keys(&ctx);
+        self.clipboard(&ctx);
         egui::Panel::top("tools").show(ui, |ui| {
             ui.add_space(3.0);
             self.toolbar(ui);
+            self.paste_row(ui);
             ui.add_space(1.0);
         });
         // A report that lands while the button is down (a drag, or a press that may become one)
@@ -2458,6 +2784,32 @@ mod tests {
             original
         );
         assert_eq!(std::fs::read(&first).unwrap(), encoded);
+    }
+
+    /// Pasted text with no installed Hangul font is still drawn (egui's built-in font), and
+    /// the status line says Hangul may not render; blank text is refused.
+    #[test]
+    fn pasted_text_without_a_hangul_font_says_hangul_may_not_render() {
+        let mut doc = Doc::decode(&png_bytes(&gradient(80, 40))).unwrap();
+        let before = doc.img.clone();
+        let (line, area) = doc
+            .paste_text(Some([0, 0, 80, 40]), "한글 ok", [0, 0, 0, 255], None)
+            .unwrap();
+        assert_eq!(
+            line,
+            "pasted text (5 chars) · no Hangul font found, so Hangul may not render"
+        );
+        assert_ne!(doc.img, before, "\"ok\" is drawn");
+        assert_eq!(area[..2], [0, 0]);
+        let err = doc
+            .paste_text(Some([0, 0, 80, 40]), " \n\t", [0, 0, 0, 255], None)
+            .unwrap_err();
+        assert_eq!(err.to_string(), "the clipboard text is blank");
+        assert!(
+            doc.undo() && !doc.can_undo(),
+            "one step: the blank paste made none"
+        );
+        assert_eq!(doc.img, before);
     }
 
     #[test]

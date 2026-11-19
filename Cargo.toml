@@ -50,6 +50,11 @@ serde = { version = "1.0.229", features = ["derive"] }
 toml = "1.2.1"
 # Is `--target HOST` this machine? (spec §4a) — HOST is compared with this machine's host name.
 gethostname = "1.1.0"
+# Pasted text in the image window (spec §1 message 12): the installed font with Hangul is found
+# by the provider eframe already puts in every window (same version, no new crates), and the
+# text is rasterised with ab_glyph (pure Rust; already in the Linux build through winit).
+egui_system_font_provider = "0.37.0"
+ab_glyph = "0.2.32"
 # Binary files (spec §6a): the "Save to…" Browse button opens the platform's save dialog — the
 # native panel on macOS, xdg-desktop-portal over D-Bus on Linux (libdbus is loaded at runtime;
 # no GTK, nothing new linked).

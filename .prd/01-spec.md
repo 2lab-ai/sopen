@@ -26,13 +26,18 @@ machine I typed it on, or with `--target` on another machine's screen.
 9. "mp4랑 html 잘 열리는데 (<host-a>에서 <host-a>파일을 <host-b>우로) (내 작업 디폴트 터미널이 <host-b>임), zip파일은 그냥 다운만 받아지는데 디폴트는 헥스에디터로 여는거야 바이너리들은, 다이얼로그 뜨고 원하는 위치로 저장혹은 헥스에디터 여는것 이게 좋겠음"
 10. "sopen이 vscode가 있으면 먼저 vscode로 열개해줘 vscode -> zeditor"
 
+Message 12 (2026-11-19): "다음처럼 개선해줘. 1. 해당 앱이 현재 화면으로 이동시켜줘. 2. 디폴트로 폴더를 고르면 토탈 커맨드 같은 프로그램이 떠야함 거기서 파일별로 엔터 누르면 해당 프로그램에서 디폴트 뷰어가 다 동작해야함 신택스 하이라이트 들어간 파일 뷰어 이미지 뷰어 영상 뷰어 헥스뷰어 모두 3. 이미지 편집은 ctrl+x ctrl+v작동하도록 해줘. 선택은 선택이고 선택하고 ctrl+c나 ctrl+x(자르기-해당부분만 배경색으로 잘리고 그림은 클리보드) ctrl+v(현재 선택된 영역으로 클립보드 내용 붙여넣기. 이미지면 그냥 스트레츠로 붙여넣고(고를수 있음), 텍스트면 텍스트채로 붙여줘). 픽셀라이즈는 ㅇㅋ 4. 디렉토리 뷰어 + 뷰어 + 헥스에디터 이거 pctools 레퍼런스 찾고 pctools 냄새 나게 해줘."
+
 Message 6 supersedes 3's "IrfanView 정도" with an exact list. Message 5 is a standing constraint:
 anything not in the table below is out of scope until usage says otherwise (§10). Messages 7–8 add
 where a file opens — this machine, or another machine's screen (§4a); they add no edit. Message 9
 replaces A6's "fetched to the cache and its path printed" for binary files with a dialog — the hex
 editor (the default) or save to a chosen path — and takes the hex editor off §9's list: it is
 message 3's "원하면 hex 편집기능정도까지", built in (§6a). Message 10 puts VS Code before Zed for
-folders and text (A2, §3); it adds no edit.
+folders and text (A2, §3); it adds no edit. Message 12's item 3 adds copy, cut and paste through
+the system clipboard to the image window (A3, §6): the rectangle stays the selection, cut leaves
+the background colour, paste lays a picture (stretched by default, or fitted, or 1:1) or text into
+the rectangle, and pixelize is unchanged. Its items 1, 2 and 4 are other work, not specified here.
 
 ## 2. Intent → acceptance
 
@@ -40,7 +45,7 @@ folders and text (A2, §3); it adds no edit.
 |---|---|---|
 | A1 | `sopen host:/path`, scp syntax, any machine in `~/.ssh/config` | `sopen <alias>:/abs/file`, `sopen <alias>:rel/to/home`, `sopen user@host:/x` all open; aliases, ProxyJump, agent behave exactly as `ssh <alias>` does (system ssh is used). Local paths (`sopen ./x.png`) open too. |
 | A2 | Folder as a project, text edit, syntax highlight; VS Code first (msg 10) | Folder or text file → VS Code when `code` is found; a remote one only when VS Code's Remote - SSH extension is installed (`code --folder-uri` / `--file-uri vscode-remote://ssh-remote+[user@]host/<percent-encoded abs>` by the kind sopen detected, since a bare `--remote` path's kind is guessed from its name; the extension is never installed by sopen), else Zed with `VS Code has no Remote - SSH extension; opening in Zed` on stderr. Without VS Code, Zed (`zed ssh://…` on macOS, `zeditor`/`zed` on Linux). A VS Code launch failure is reported, not followed by Zed. The editor owns Save. |
-| A3 | Image: view + rectangle crop + rectangle pixelize | Built-in window shows the image; drag draws a rectangle in image pixels; Crop and Pixelize act on it; Undo; Save writes back to the remote file. |
+| A3 | Image: view + rectangle crop + rectangle pixelize + clipboard copy / cut / paste (msg 12) | Built-in window shows the image; drag draws a rectangle in image pixels; Crop and Pixelize act on it; Cmd/Ctrl+C copies it (the whole image without one) to the system clipboard as a picture, Cmd/Ctrl+X copies it and leaves it in the background colour, Cmd/Ctrl+V pastes the clipboard's picture (Stretch by default, Fit or 1:1) or text into it; Undo; Save writes back to the remote file. |
 | A4 | Video: view + rectangle crop + time cut | Built-in window plays the video with sound; scrub timeline; set In/Out; drag a crop rectangle; Export writes `<stem>.cut-<in>-<out>.<ext>` next to the original on the remote. |
 | A5 | Audio (mp3/wav): view + time cut | Same window: waveform, play, In/Out, Export. |
 | A6 | "아무 파일"; binary files open in a hex editor by default, after a dialog (msg 9) | Any other type (a zip, any binary) opens a small dialog before anything is downloaded — name, size, type when the extension says it: Enter = "Open in hex editor" (the default: fetched to the cache, then sopen's hex window, §6a); "Save to…" downloads it to a path the owner picks (the download folder by default, never over an existing file); Esc or closing it downloads nothing. `sopen --hex SOURCE` opens any file straight in the hex window. `--app <App>` still opens it in a named local app and uploads it back when the user presses Enter in the terminal. With no display (Linux over ssh) the file is fetched and its path printed, and one line says why. |
@@ -204,8 +209,19 @@ symlink keeps its link). A new file is readable by its owner only (0600); a repl
 - Fit-to-window view, zoom (wheel / pinch), pan; status bar shows image size, rectangle `x,y w×h`.
 - Drag = rectangle in image pixels (handles to adjust). `C` Crop, `P` Pixelize (block size, default 16 px), Undo/Redo
   (Cmd/Ctrl+Z / Shift+Cmd/Ctrl+Z), Cmd/Ctrl+S Save, Save copy, Esc clears the rectangle.
+- Clipboard (msg 12 item 3): Cmd/Ctrl+C copies the rectangle — the whole image without one — as a picture;
+  Cmd/Ctrl+X copies it and fills it with the background colour (white; transparent offered on an image with alpha);
+  Cmd/Ctrl+V pastes into it a picture — stretched (the default), fitted (aspect kept, centred, the rest in the
+  background colour) or 1:1 (top-left, cut off), chosen on the toolbar's second row — over what is there, or text in
+  the text colour (black), wrapped to the rectangle's width and as large as fits; Hangul is drawn with an installed
+  font that has it (eframe's system-font fallback finds the same one for the window's own text), and without one the
+  status line says Hangul may not render. No rectangle: a picture goes 1:1 at the top-left, text at the top-left in
+  letters a tenth of the image's height, and what was pasted becomes the rectangle. Each cut or paste is one undo
+  step, written only by Save / Save copy. The shortcuts reach the window as egui's Copy / Cut / Paste / PasteImage
+  events (egui-winit reads and writes the system clipboard with arboard): text wins when the clipboard holds both,
+  and pictures cross it as 8-bit RGBA.
 - Encoding keeps the format: PNG lossless, JPEG quality 95, WebP lossless, BMP, TIFF. Animated GIF opens read-only
-  (frame 1 shown, Save disabled with a reason).
+  (frame 1 shown, Save disabled with a reason; it can still be copied).
 - Never lose data silently: Save keeps the ICC profile and Exif where the format holds them; metadata it does not
   carry (XMP, text chunks, IPTC, comments) or an encoder refuses is named when the image opens and in the result.
 
@@ -369,7 +385,7 @@ Local only, never sent anywhere. Exists for §10.
 
 ## 9. Out of scope (until §10 says otherwise)
 
-Own text editor / tree / highlighting (VS Code or Zed does it), hex insert / delete or anything that changes a file's size, filters beyond crop/pixelize, frame-accurate
+Own text editor / tree / highlighting (VS Code or Zed does it), hex insert / delete or anything that changes a file's size, image edits beyond crop, pixelize and clipboard copy / cut / paste (no drawing or text tool, no layers, no filters), frame-accurate
 copy without re-encode, streaming playback before download completes, directory sync / mounts, file watching,
 Windows, a `.app` bundle or cask, any agent on the remote, macshot (Swift, macOS-only, GPL-3 — incompatible with A7/A8).
 

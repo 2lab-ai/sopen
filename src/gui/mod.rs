@@ -6,6 +6,7 @@
 //! called by the window's buttons and by the windowless hooks alike.
 
 pub mod binary;
+pub mod fonts;
 pub mod hex;
 pub mod image;
 pub mod media;
