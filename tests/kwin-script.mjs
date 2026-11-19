@@ -6,7 +6,8 @@
 //
 // <dir> holds `code.js` (VS Code's script for the opened name "project"), `zed.js` (Zed's, same
 // name), `names.json` (odd names) and `odd-<i>.js` (VS Code's script for each odd name).
-// Prints one line per check; exits 1 when any fails.
+// Prints one line per check; exits 1 when any fails. The clock (`Date.now()`) and KWin's script
+// timer (`QTimer`) are stand-ins too: a test moves the time and fires the timer itself.
 
 import fs from 'node:fs';
 import path from 'node:path';
@@ -64,9 +65,39 @@ class Win {
   }
 }
 
-/// A workspace over `windows` with `active` as the active window; runs `script` in it.
-function world(script, windows, active) {
+/// A KWin script timer (a QTimer): fired only by `fire()`.
+class Timer {
+  constructor() {
+    this.interval = 0;
+    this.singleShot = false;
+    this.active = false;
+    this.timeout = new Signal();
+  }
+  start() {
+    this.active = true;
+  }
+  stop() {
+    this.active = false;
+  }
+}
+
+/// A workspace over `windows` with `active` as the active window; runs `script` in it, at time
+/// `ws.now` (moved by `ws.advance(ms)`). Without `timers`, the script finds no QTimer.
+function world(script, windows, active, { timers = true } = {}) {
+  const made = [];
   const ws = {
+    now: 1_700_000_000_000,
+    timers: made,
+    advance(ms) {
+      this.now += ms;
+    },
+    // Fires the script's timers that are running, as their time came.
+    fire() {
+      for (const t of made.filter((t) => t.active)) {
+        if (t.singleShot) t.active = false;
+        t.timeout.emit();
+      }
+    },
     windowAdded: new Signal(),
     activations: [],
     sent: [],
@@ -99,12 +130,30 @@ function world(script, windows, active) {
     },
     // Handlers still connected anywhere.
     connected() {
-      return [this.windowAdded, ...windows.flatMap((w) => [w.demandsAttentionChanged, w.captionChanged])]
-        .reduce((n, s) => n + s.handlers.length, 0);
+      return [
+        this.windowAdded,
+        ...made.map((t) => t.timeout),
+        ...windows.flatMap((w) => [w.demandsAttentionChanged, w.captionChanged]),
+      ].reduce((n, s) => n + s.handlers.length, 0);
     },
   };
-  vm.runInNewContext(script, { workspace: ws });
+  const context = { workspace: ws, Date: { now: () => ws.now } };
+  if (timers) {
+    context.QTimer = class extends Timer {
+      constructor() {
+        super();
+        made.push(this);
+      }
+    };
+  }
+  vm.runInNewContext(script, context);
   return ws;
+}
+
+/// The script's lifetime in milliseconds, as written into it.
+function lifeOf(script) {
+  const m = /const life = (\d+);/.exec(script);
+  return m ? Number(m[1]) : 3500;
 }
 
 let failed = 0;
@@ -195,6 +244,49 @@ const stale = 'notes.md - other [SSH: box] - Visual Studio Code';
   const newer = new Win('code', shown, { demandsAttention: true });
   const ws = world(code, [old, newer], null);
   check('newest first', ws.activations.length === 1 && ws.activations[0] === newer && old.untouched());
+}
+{
+  // The script's own deadline: past it, nothing qualifies any more and every handler goes, even
+  // though KWin was never told to unload it; just before it, things still work.
+  const life = lifeOf(code);
+  const setup = (timers) => {
+    const term = new Win('konsole', '~ : zsh', { desktops: [D5b], output: DP2 });
+    const b = new Win('code', stale, { demandsAttention: true });
+    const c = new Win('code', 'other window - Visual Studio Code');
+    const a = new Win('code', 'Visual Studio Code', { demandsAttention: true });
+    const ws = world(code, [a, c, term, b], term, { timers });
+    return { ws, a, b, c };
+  };
+  for (const timers of [true, false]) {
+    const how = timers ? 'timer not fired' : 'no timer';
+    const { ws, a, b, c } = setup(timers);
+    ws.advance(life + 1);
+    c.demand(true);
+    a.retitle(shown);
+    ws.add(new Win('code', 'new - Visual Studio Code'));
+    b.demand(false);
+    b.demand(true);
+    check(`expired (${how}): nothing activated or moved`, ws.activations.length === 0 && ws.sent.length === 0
+      && a.untouched() && b.untouched() && c.untouched());
+    check(`expired (${how}): nothing left connected`, ws.connected() === 0);
+  }
+  {
+    const { ws, c } = setup(true);
+    const t = ws.timers;
+    check('timer: one single shot over the lifetime, started',
+      t.length === 1 && t[0].singleShot === true && t[0].interval === life && t[0].active === true);
+    ws.advance(life);
+    ws.fire();
+    check('timer fired: nothing left connected', ws.connected() === 0);
+    c.demand(true);
+    check('timer fired: then nothing', ws.activations.length === 0 && c.untouched());
+  }
+  {
+    const { ws, c } = setup(true);
+    ws.advance(life - 1);
+    c.demand(true);
+    check('just before the deadline: still brought', ws.activations.length === 1 && ws.activations[0] === c);
+  }
 }
 {
   // Zed's classes.

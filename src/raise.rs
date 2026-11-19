@@ -25,6 +25,9 @@ use std::time::{Duration, Instant};
 /// How long the script stays loaded: the editor's window may ask for attention, change its title
 /// or appear only after the CLI returned.
 const HOLD: Duration = Duration::from_secs(3);
+/// How much longer than the hold the script lives on its own clock: past it, it stops acting and
+/// lets go of every signal even if the unload never reached KWin.
+const LIFE_MARGIN: Duration = Duration::from_millis(500);
 /// The longest one D-Bus call may take (KWin answers in milliseconds); a call still running then
 /// is killed, and the script is unloaded.
 const CALL: Duration = Duration::from_millis(500);
@@ -222,19 +225,40 @@ fn find_tool(path_var: Option<&OsStr>, exists: impl Fn(&Path) -> bool) -> Option
 /// window to where the user is, once, and then does nothing more: the first editor window that
 /// (a) asks for attention and shows `opened` in its title — at load, newest first, or when its title
 /// changes later — or (b) starts asking for attention, or (c) appears, after the script started.
-/// The user is never moved to another desktop.
-fn script(editor: Editor, opened: &str) -> String {
+/// The user is never moved to another desktop. It lives `hold` + [`LIFE_MARGIN`] on its own clock:
+/// past that it does nothing and lets go of every signal (a KWin timer ends it then; failing that,
+/// the first signal after it does), whether or not KWin is ever told to unload it.
+fn script(editor: Editor, opened: &str, hold: Duration) -> String {
     const SCRIPT: &str = "\
 // sopen: bring the editor window of this open to where the user is, once, and activate it. The
-// user is never moved to another desktop.
+// user is never moved to another desktop. After `life` ms it does nothing more.
 const editor = @CLASS@;
 const opened = @OPENED@;
+const life = @LIFE@;
+const deadline = Date.now() + life;
 let done = false;
 const hooks = [];
 
 function hook(signal, handler) {
     signal.connect(handler);
     hooks.push([signal, handler]);
+}
+
+// Done: every handler disconnected, nothing more happens.
+function stop() {
+    done = true;
+    for (const [signal, handler] of hooks) {
+        signal.disconnect(handler);
+    }
+    hooks.length = 0;
+}
+
+// Whether the script may still act: not done, and its deadline not passed (else it stops now).
+function live() {
+    if (!done && Date.now() >= deadline) {
+        stop();
+    }
+    return !done;
 }
 
 function isEditor(w) {
@@ -246,14 +270,10 @@ function shows(w) {
 }
 
 function bring(w) {
-    if (done) {
+    if (!live()) {
         return;
     }
-    done = true;
-    for (const [signal, handler] of hooks) {
-        signal.disconnect(handler);
-    }
-    hooks.length = 0;
+    stop();
     // Where the user is: the active window's desktops (objects: names need not be unique) and
     // screen; without one (or on all desktops), the current desktop and the active screen.
     const here = workspace.activeWindow;
@@ -281,12 +301,12 @@ function bring(w) {
 // name once its title changes (a new window's title comes later).
 function watch(w) {
     hook(w.demandsAttentionChanged, () => {
-        if (w.demandsAttention) {
+        if (live() && w.demandsAttention) {
             bring(w);
         }
     });
     hook(w.captionChanged, () => {
-        if (w.demandsAttention && shows(w)) {
+        if (live() && w.demandsAttention && shows(w)) {
             bring(w);
         }
     });
@@ -294,13 +314,13 @@ function watch(w) {
 
 const windows = workspace.windowList();
 // (a) at load, newest first. A window that asks but shows another name asked before this open.
-for (let i = windows.length - 1; i >= 0 && !done; i--) {
+for (let i = windows.length - 1; i >= 0 && live(); i--) {
     const w = windows[i];
     if (isEditor(w) && w.demandsAttention && shows(w)) {
         bring(w);
     }
 }
-if (!done) {
+if (live()) {
     for (const w of windows) {
         if (isEditor(w)) {
             watch(w);
@@ -308,15 +328,25 @@ if (!done) {
     }
     // (c) a new editor window: a folder not open yet opens one.
     hook(workspace.windowAdded, (w) => {
-        if (isEditor(w)) {
+        if (live() && isEditor(w)) {
             bring(w);
         }
     });
+    // The deadline, kept by KWin's script timer as well: it stops the script then, with no signal
+    // needed.
+    if (typeof QTimer !== \"undefined\") {
+        const timer = new QTimer();
+        timer.singleShot = true;
+        timer.interval = life;
+        hook(timer.timeout, stop);
+        timer.start();
+    }
 }
 ";
     SCRIPT
         .replacen("@CLASS@", editor.class(), 1)
         .replacen("@OPENED@", &js_string(opened), 1)
+        .replacen("@LIFE@", &(hold + LIFE_MARGIN).as_millis().to_string(), 1)
 }
 
 /// `text` as a JavaScript string literal in plain ASCII: letters, digits, space and `-._` as they
@@ -374,7 +404,7 @@ impl Drop for ScriptFile {
 /// also when the load or the run failed, since a load that failed may have half-happened. Each call
 /// gets `budget`. The script file is removed at the end.
 fn raise(tool: &Tool, editor: Editor, opened: &str, dir: &Path, hold: Duration, budget: Duration) {
-    let Some(file) = ScriptFile::new(dir, &script(editor, opened)) else {
+    let Some(file) = ScriptFile::new(dir, &script(editor, opened, hold)) else {
         return;
     };
     let name = format!("sopen-raise-{}", crate::remote::random_hex());
@@ -617,7 +647,7 @@ mod tests {
         assert!(name.starts_with("sopen-raise-"), "{name}");
         assert_eq!(calls, busctl_calls(&file, &name));
         let text = std::fs::read_to_string(&fake.script).unwrap();
-        assert_eq!(text, script(Editor::Code, "project"));
+        assert_eq!(text, script(Editor::Code, "project", HOLD));
         let mode = std::fs::read_to_string(&fake.mode).unwrap();
         assert_eq!(mode.get(..10), Some("-rw-------"), "{mode}");
         assert!(!Path::new(&file).exists(), "{file} left behind");
@@ -646,7 +676,7 @@ mod tests {
         );
         assert_eq!(
             std::fs::read_to_string(&fake.script).unwrap(),
-            script(Editor::Zed, "proj")
+            script(Editor::Zed, "proj", HOLD)
         );
         assert!(!Path::new(&file).exists(), "{file} left behind");
     }
@@ -786,7 +816,7 @@ mod tests {
             // JSON reads `\uXXXX` (and surrogate pairs) as JavaScript does.
             let back: String = serde_json::from_str(&literal).unwrap();
             assert_eq!(back, name);
-            let text = script(Editor::Code, name);
+            let text = script(Editor::Code, name, HOLD);
             assert!(
                 text.contains(&format!("const opened = {literal};")),
                 "{text}"
@@ -799,29 +829,39 @@ mod tests {
         }
     }
 
-    /// The script's shape: one window, once (a `done` flag; every handler disconnected), the three
-    /// ways a window qualifies, and the steps that bring it — never setting the current desktop,
-    /// never reading a desktop's name.
+    /// The script's shape: one window, once (a `done` flag; every handler disconnected), within its
+    /// own lifetime (the hold and a margin; every handler and the load-time check ask `live()`
+    /// first; a KWin timer stops it then), the three ways a window qualifies, and the steps that
+    /// bring it — never setting the current desktop, never reading a desktop's name.
     #[test]
     fn the_script_brings_one_window_once() {
         for (editor, class) in [
             (Editor::Code, r"/^code$/i"),
             (Editor::Zed, r"/^(dev\.zed\.)?zed(-[a-z]+)?$/i"),
         ] {
-            let text = script(editor, "project");
+            let text = script(editor, "project", Duration::from_secs(3));
             assert!(text.contains(&format!("const editor = {class};")), "{text}");
             for line in [
                 "const opened = \"project\";",
-                "if (done) {",
+                "const life = 3500;",
+                "const deadline = Date.now() + life;",
+                "if (!done && Date.now() >= deadline) {",
                 "done = true;",
                 "signal.disconnect(handler);",
                 "return opened !== \"\" && String(w.caption).indexOf(opened) !== -1;",
-                "for (let i = windows.length - 1; i >= 0 && !done; i--) {",
+                "for (let i = windows.length - 1; i >= 0 && live(); i--) {",
                 "if (isEditor(w) && w.demandsAttention && shows(w)) {",
                 "hook(w.demandsAttentionChanged, () => {",
+                "if (live() && w.demandsAttention) {",
                 "hook(w.captionChanged, () => {",
-                "if (w.demandsAttention && shows(w)) {",
+                "if (live() && w.demandsAttention && shows(w)) {",
                 "hook(workspace.windowAdded, (w) => {",
+                "if (live() && isEditor(w)) {",
+                "const timer = new QTimer();",
+                "timer.singleShot = true;",
+                "timer.interval = life;",
+                "hook(timer.timeout, stop);",
+                "timer.start();",
                 "let desktops = [workspace.currentDesktop];",
                 "let output = workspace.activeScreen;",
                 "if (here && here !== w) {",
@@ -874,11 +914,16 @@ mod tests {
         };
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path();
-        std::fs::write(dir.join("code.js"), script(Editor::Code, "project")).unwrap();
-        std::fs::write(dir.join("zed.js"), script(Editor::Zed, "project")).unwrap();
+        let hold = super::HOLD;
+        std::fs::write(dir.join("code.js"), script(Editor::Code, "project", hold)).unwrap();
+        std::fs::write(dir.join("zed.js"), script(Editor::Zed, "project", hold)).unwrap();
         std::fs::write(dir.join("names.json"), serde_json::to_string(&ODD).unwrap()).unwrap();
         for (i, name) in ODD.iter().enumerate() {
-            std::fs::write(dir.join(format!("odd-{i}.js")), script(Editor::Code, name)).unwrap();
+            std::fs::write(
+                dir.join(format!("odd-{i}.js")),
+                script(Editor::Code, name, hold),
+            )
+            .unwrap();
         }
         let harness = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/kwin-script.mjs");
         let out = Command::new(node).arg(harness).arg(dir).output().unwrap();

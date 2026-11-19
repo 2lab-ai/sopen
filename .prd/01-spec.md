@@ -85,6 +85,11 @@ edit.
   - A window already demanding attention at load whose title shows another name asked for
     something else, and is left alone. `<name>` reaches the script as one escaped string literal.
   - Once one window is brought, the script disconnects every handler and does nothing more.
+  - The script also keeps its own deadline: the hold plus 0.5 s, measured from its run. Every
+    handler and the load-time check test it first. Once it has passed, the script disconnects
+    every handler and does nothing. KWin's script timer (`QTimer`) stops it at that moment; without
+    the timer, the first signal after the deadline does. So a script whose unload never reaches KWin
+    cannot act later. The unload is only cleanup.
   - Bringing it: the window goes to where the user is, un-minimized (a window on all desktops stays
     so), and is activated. Where the user is means the active window's desktops (desktop objects:
     their names need not be unique) and screen. Without an active window, or when it is on all
