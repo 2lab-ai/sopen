@@ -128,8 +128,7 @@ impl Fx {
     /// `path` as a panel's frame shows it (a 1000-point window: two 496-point panels): whole,
     /// or its end after "…".
     fn framed(&self, path: &str) -> String {
-        let font = egui::FontId::monospace(13.0);
-        chrome::fit_left(&self.drv.ctx, path, &font, 496.0 - 24.0)
+        chrome::frame_title(&self.drv.ctx, path, 496.0)
     }
 
     /// Opens `name` (Enter) and waits until its viewer is on screen and ready.
@@ -165,8 +164,8 @@ fn both_panels_list_the_folder_folders_first() {
     assert_eq!(fx.b.panels[0].dir, fx.root);
     // The footer: entries but `..`, the files' bytes, the free space.
     let footer = fx.b.panels[0].footer();
-    assert!(footer.starts_with("8 listed = "), "{footer}");
-    assert!(footer.contains("bytes free"), "{footer}");
+    assert!(footer.starts_with("8 Listed = "), "{footer}");
+    assert!(footer.contains("Bytes Free"), "{footer}");
     // On screen: the path in the frame, the column heads, a hidden file dimmed, the F-keys.
     let framed = fx.framed(&fx.root);
     assert!(
@@ -346,6 +345,226 @@ fn keys_in_a_viewer_never_move_the_list() {
     assert!(fx.b.viewer.is_none());
     assert!(!fx.drv.closed());
     assert_eq!((fx.b.active, fx.current().as_str()), (0, "data.bin"));
+}
+
+/// A viewer's own F-keys join the browser's on its row (the hex window's Save, Goto and Asc/hx
+/// beside Exit and Edit), and they work there; F3 still leaves the viewer, not the window.
+#[test]
+fn a_viewers_f_keys_join_the_browsers_row() {
+    let mut fx = fixture();
+    fx.open("data.bin");
+    for label in ["Exit   ", "Edit   ", "Save   ", "Goto   ", "Asc/hx "] {
+        assert!(fx.drv.find_text(label).is_some(), "{label:?} in the row");
+    }
+    // The first row is 00 01 02 …: F8 moves the typing to the ASCII column, where Z is a byte.
+    fx.key(Key::F8);
+    fx.typed("Z");
+    assert!(
+        fx.drv.text_starting_with("5A 01 02").is_some(),
+        "F8 put the typing in the ASCII column"
+    );
+    fx.key(Key::F3);
+    assert!(
+        fx.drv.find_text("Unsaved changes").is_some(),
+        "the hex window asks"
+    );
+    fx.drv.click_text(&mut fx.b, "Discard");
+    assert!(fx.b.viewer.is_none());
+    assert!(!fx.drv.closed(), "only the viewer went");
+    assert!(
+        fx.drv.find_text("View   ").is_some(),
+        "the list's row again"
+    );
+    assert!(fx.drv.find_text("Asc/hx ").is_none());
+}
+
+/// In the browser the hex viewer's own F-keys work as in its own window: F5 saves an edit, F6
+/// gives the Go to field the typing; under its unsaved-changes prompt F5 saves nothing.
+#[test]
+fn a_hosted_hex_viewers_f5_and_f6_work_and_respect_its_prompt() {
+    let mut fx = fixture();
+    let file = format!("{}/data.bin", fx.root);
+    fx.open("data.bin");
+    // The first row is 00 01 02 …: 7A over the first byte, then F5.
+    fx.typed("7A");
+    fx.key(Key::F5);
+    fx.drv
+        .until(&mut fx.b, 20, |_| std::fs::read(&file).unwrap()[0] == 0x7A);
+    // F6: "16" goes into the Go to field (not over bytes 1–2), Enter goes there, FF over 16.
+    fx.key(Key::F6);
+    fx.typed("16");
+    fx.key(Key::Enter);
+    fx.typed("FF");
+    assert!(
+        fx.drv.text_starting_with("7A 01 02").is_some(),
+        "row 0 as saved"
+    );
+    assert!(
+        fx.drv.text_starting_with("FF 11 12").is_some(),
+        "FF went to offset 16"
+    );
+    // Esc with that edit: the prompt; F5 under it saves nothing.
+    fx.key(Key::Escape);
+    assert!(fx.drv.find_text("Unsaved changes").is_some());
+    fx.key(Key::F5);
+    fx.drv.idle(&mut fx.b, 5);
+    assert_eq!(
+        std::fs::read(&file).unwrap()[16],
+        0x10,
+        "F5 under the prompt"
+    );
+    fx.drv.click_text(&mut fx.b, "Discard");
+    assert!(fx.b.viewer.is_none());
+    assert_eq!(std::fs::read(&file).unwrap()[16], 0x10);
+}
+
+/// The image viewer's F5 joins the browser's row beside Exit and Edit.
+#[test]
+fn a_hosted_image_viewer_lists_its_f5() {
+    let mut fx = fixture();
+    fx.open("photo.png");
+    for label in ["Exit   ", "Edit   ", "Save   "] {
+        assert!(fx.drv.find_text(label).is_some(), "{label:?} in the row");
+    }
+}
+
+/// F3 while a viewer's text field has the typing (the hex window's Go to field) is the
+/// field's: the browser does not leave the viewer.
+#[test]
+fn f3_in_a_viewers_text_field_does_not_leave_the_viewer() {
+    let mut fx = fixture();
+    fx.open("data.bin");
+    fx.key(Key::F6);
+    fx.typed("1");
+    assert!(
+        fx.drv.ctx.text_edit_focused(),
+        "the Go to field has the typing"
+    );
+    fx.key(Key::F3);
+    assert!(fx.b.viewer.is_some(), "still in the viewer");
+    assert!(fx.drv.ctx.text_edit_focused(), "the field still has it");
+    // Out of the field, F3 leaves as before.
+    fx.key(Key::Enter);
+    fx.key(Key::F3);
+    assert!(fx.b.viewer.is_none(), "F3 leaves the viewer");
+}
+
+/// The panel's foot never hides its count: on the narrowest window, and with a total too long
+/// for the panel, "N Listed" is drawn whole inside each panel's frame — the free space gives
+/// way first, then the end of the total.
+#[test]
+fn the_foot_always_shows_the_count_inside_the_frame() {
+    let mut fx = fixture();
+    // Wide enough, it is the whole line, centred.
+    let whole = fx.b.panels[0].footer();
+    assert!(whole.contains(" Bytes Free"), "{whole}");
+    assert!(fx.drv.find_text(&whole).is_some(), "{whole}");
+    fx.drv.resize(480.0, 320.0);
+    fx.drv.idle(&mut fx.b, 3);
+    // Two panels of 240 points; inside each frame: 10..230 and 250..470.
+    let feet = |fx: &Fx| {
+        let feet = fx.drv.texts_starting_with("8 Listed = ");
+        assert_eq!(feet.len(), 2, "both counts whole on screen: {feet:?}");
+        for ((rect, _), (left, right)) in feet.iter().zip([(10.0, 230.0), (250.0, 470.0)]) {
+            assert!(
+                rect.left() >= left - 0.5 && rect.right() <= right + 0.5,
+                "inside the frame: {rect:?}"
+            );
+        }
+        feet.into_iter().map(|(_, text)| text).collect::<Vec<_>>()
+    };
+    let shown = feet(&fx);
+    assert!(
+        !shown[0].contains("Bytes Free"),
+        "the free space gave way: {}",
+        shown[0]
+    );
+    assert!(shown[0].ends_with(" bytes"), "{}", shown[0]);
+    // A total far too long for the panel.
+    for panel in &mut fx.b.panels {
+        for e in &mut panel.entries {
+            if e.kind == EntryKind::File {
+                e.size = u64::MAX;
+            }
+        }
+    }
+    fx.drv.idle(&mut fx.b, 2);
+    let shown = feet(&fx);
+    assert!(
+        shown[0].ends_with('…'),
+        "the end of the total gave way: {}",
+        shown[0]
+    );
+}
+
+/// Every cell of a row fits its column at a glyph boundary — never a sliver of a glyph: a long
+/// Hangul name (with wide glyphs) and a long ASCII name end in "…" inside the Name column, a
+/// long extension inside Ext; a size too long for its column is said in a larger unit.
+#[test]
+fn cells_fit_their_columns_at_a_glyph_boundary() {
+    let mut fx = fixture();
+    // The ideographic space is wider than a cell in the test kit's fonts (a system font draws
+    // Hangul wide too).
+    let hangul = "한글\u{3000}폴더\u{3000}이름이\u{3000}아주\u{3000}길다";
+    std::fs::create_dir(format!("{}/{hangul}", fx.root)).unwrap();
+    let ascii = "a_very_long_ascii_file_name.verylongextension";
+    std::fs::write(format!("{}/{ascii}", fx.root), b"x").unwrap();
+    // Listed again: into alpha and back up.
+    fx.select("alpha");
+    fx.key(Key::Enter);
+    fx.settle();
+    fx.key(Key::Backspace);
+    fx.settle();
+    for panel in &mut fx.b.panels {
+        for e in &mut panel.entries {
+            if e.name == ascii {
+                e.size = 1 << 40;
+            }
+        }
+    }
+    fx.drv.resize(480.0, 320.0);
+    fx.drv.idle(&mut fx.b, 3);
+    // The left panel's inside is 10..230: 27 cells — Name 5, a gap, Ext 5, a gap, Size 14.
+    let cell = 8.0;
+    let (name, ext, size) = (
+        (10.0, 10.0 + 5.0 * cell),
+        (10.0 + 6.0 * cell, 10.0 + 11.0 * cell),
+        (10.0 + 12.0 * cell, 10.0 + 26.0 * cell),
+    );
+    let inside =
+        |r: Rect, (left, right): (f32, f32)| r.left() >= left - 0.5 && r.right() <= right + 0.5;
+    for (full, column) in [
+        (hangul, name),
+        ("a_very_long_ascii_file_name", name),
+        ("verylongextension", ext),
+    ] {
+        let start: String = full.chars().take(1).collect();
+        let shown: Vec<_> = fx
+            .drv
+            .texts_starting_with(&start)
+            .into_iter()
+            .filter(|(r, _)| r.left() < 240.0)
+            .collect();
+        let (rect, text) = shown
+            .iter()
+            .find(|(_, t)| t.ends_with('…'))
+            .unwrap_or_else(|| panic!("{full:?}: no whole, cut cell on screen ({shown:?})"));
+        let kept = text.trim_end_matches('…');
+        assert!(
+            !kept.is_empty() && full.starts_with(kept),
+            "{text:?} is a start of {full:?}"
+        );
+        assert!(
+            inside(*rect, column),
+            "{text:?} inside its column: {rect:?}"
+        );
+    }
+    // 1 TiB in bytes does not fit 14 cells: the smallest unit that does (MB).
+    let shown = fx.drv.texts_starting_with("1,099,512 MB");
+    assert!(
+        shown.iter().any(|(r, _)| inside(*r, size)),
+        "the size in its column: {shown:?}"
+    );
 }
 
 /// F4 runs the real editor launch (`zed::launch`) — VS Code's CLI here is a script that writes
@@ -607,7 +826,7 @@ fn the_listing_hook_prints_what_the_panel_shows() {
         "{main}"
     );
     assert!(
-        lines.last().unwrap().starts_with("8 listed = "),
+        lines.last().unwrap().starts_with("8 Listed = "),
         "{lines:?}"
     );
 }
@@ -910,10 +1129,10 @@ fn an_entry_named_in_bad_utf8_is_not_opened() {
 #[test]
 fn a_wide_path_is_fitted_by_its_real_width() {
     let fx = fixture();
-    let font = egui::FontId::monospace(13.0);
-    // The test kit has only egui's own fonts, where most glyphs (Hangul too, which a system
-    // font draws wide) are as wide as "0"; the ideographic space U+3000 is wider there.
-    let path = format!("/srv/{}/마지막폴더", "한\u{3000}글\u{3000}".repeat(8));
+    let font = chrome::font();
+    // The test kit has the skin's VGA font and egui's own after it, where Hangul (which a
+    // system font draws wide) is as wide as "0"; the ideographic space U+3000 is wider there.
+    let path = format!("/srv/{}/마지막폴더", "한\u{3000}글\u{3000}".repeat(12));
     let w = |t: &str| {
         fx.drv.ctx.fonts_mut(|f| {
             f.layout_no_wrap(t.to_string(), font.clone(), egui::Color32::WHITE)
@@ -936,6 +1155,37 @@ fn a_wide_path_is_fitted_by_its_real_width() {
     }
     let short = "/a/b";
     assert_eq!(chrome::fit_left(&fx.drv.ctx, short, &font, 400.0), short);
+}
+
+/// A size too long for its column is said in the smallest unit that fits (powers of 1000,
+/// rounded); one that fits, and what is not a file, as they are.
+#[test]
+fn a_size_too_long_for_its_column_takes_a_larger_unit() {
+    let file = |size: u64| crate::remote::Entry {
+        name: "f".to_string(),
+        lossy: false,
+        kind: EntryKind::File,
+        link: false,
+        size,
+        mtime: std::time::SystemTime::UNIX_EPOCH,
+    };
+    assert_eq!(panel::size_in(&file(99_999_999_999), 14), "99,999,999,999");
+    assert_eq!(panel::size_in(&file(1 << 40), 14), "1,099,512 MB");
+    assert_eq!(panel::size_in(&file(u64::MAX), 14), "18,446,744 TB");
+    assert_eq!(panel::size_in(&file(1_500), 4), "2 KB");
+    for size in [0, 1, 999, 1 << 20, 1 << 40, u64::MAX] {
+        assert!(
+            panel::size_in(&file(size), 14).chars().count() <= 14,
+            "{size}"
+        );
+    }
+    let mut dir = file(0);
+    dir.kind = EntryKind::Special;
+    assert_eq!(
+        panel::size_in(&dir, 4),
+        "<SPECIAL>",
+        "a kind is never turned into a unit"
+    );
 }
 
 /// P2: a dot file keeps its whole name, however many dots (spec §3a): no extension.
@@ -979,7 +1229,7 @@ fn early_times_floor_and_the_footer_never_overflows() {
     p.fill("/x".into(), vec![e, f], None, None);
     assert!(
         p.footer()
-            .starts_with("2 listed = 36,893,488,147,419,103,230 bytes"),
+            .starts_with("2 Listed = 36,893,488,147,419,103,230 bytes"),
         "{}",
         p.footer()
     );

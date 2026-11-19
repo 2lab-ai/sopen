@@ -26,6 +26,8 @@ const EXIT_CONFLICT: u8 = 3;
 #[command(
     name = "sopen",
     version = sopen::version_text(),
+    long_version = sopen::long_version_text(),
+    after_long_help = sopen::FONT_CREDIT,
     about = "Open a file or folder on another machine as if it were local",
     long_about = "Open a file or folder on another machine as if it were local.\n\n\
         SOURCE uses scp syntax: [user@]host:path (relative paths are under the remote home) or a \

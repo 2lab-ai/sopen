@@ -3,7 +3,7 @@
 //! pixels, or video source pixels when the frame on screen is a scaled decode).
 
 use eframe::egui::{
-    self, Color32, CursorIcon, PointerButton, Pos2, Rect, Response, Stroke, StrokeKind, Vec2,
+    self, CursorIcon, PointerButton, Pos2, Rect, Response, Stroke, StrokeKind, Vec2,
 };
 
 /// Screen rectangle `disp` showing a `src`-sized source.
@@ -257,7 +257,8 @@ impl Selection {
         };
         let src = Rect::from_min_size(Pos2::new(x as f32, y as f32), Vec2::new(w as f32, h as f32));
         let r = map.rect_to_disp(src);
-        let shade = Color32::from_black_alpha(110);
+        let p = super::chrome::PALETTE;
+        let shade = p.select_shade;
         let d = map.disp;
         for part in [
             Rect::from_min_max(d.min, Pos2::new(d.max.x, r.min.y)),
@@ -269,27 +270,22 @@ impl Selection {
                 painter.rect_filled(part, 0.0, shade);
             }
         }
-        painter.rect_stroke(
-            r,
-            0.0,
-            Stroke::new(1.5, Color32::YELLOW),
-            StrokeKind::Outside,
-        );
+        painter.rect_stroke(r, 0.0, Stroke::new(1.5, p.select), StrokeKind::Outside);
         if r.width() >= 3.0 * GRAB && r.height() >= 3.0 * GRAB {
             for handle in Handle::ALL {
                 let c = handle.pos(r);
                 let square = Rect::from_center_size(c, Vec2::splat(GRAB));
-                painter.rect_filled(square, 1.0, Color32::YELLOW);
+                painter.rect_filled(square, 0.0, p.select);
                 painter.rect_stroke(
                     square,
-                    1.0,
-                    Stroke::new(1.0, Color32::BLACK),
+                    0.0,
+                    Stroke::new(1.0, p.select_text),
                     StrokeKind::Inside,
                 );
             }
         }
         let label = format!("{w}×{h} @ {x},{y}");
-        let galley = painter.layout_no_wrap(label, egui::FontId::monospace(13.0), Color32::BLACK);
+        let galley = painter.layout_no_wrap(label, super::chrome::font(), p.select_text);
         let above = r.top() - galley.size().y - 6.0;
         let top = if above >= d.top() {
             above
@@ -297,8 +293,8 @@ impl Selection {
             r.top() + 4.0
         };
         let bg = Rect::from_min_size(Pos2::new(r.left(), top), galley.size()).expand(2.0);
-        painter.rect_filled(bg, 2.0, Color32::YELLOW);
-        painter.galley(bg.min + Vec2::splat(2.0), galley, Color32::BLACK);
+        painter.rect_filled(bg, 0.0, p.select);
+        painter.galley(bg.min + Vec2::splat(2.0), galley, p.select_text);
     }
 }
 

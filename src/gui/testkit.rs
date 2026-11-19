@@ -20,20 +20,42 @@ pub struct Driver {
     commands: Vec<egui::OutputCommand>,
     /// Every viewport command the passes sent (a close, a resize), oldest first, until taken.
     viewport: Vec<egui::ViewportCommand>,
+    /// Passes run as the shell runs them ([`Driver::as_shell`]).
+    shell: bool,
+    /// A pass asked to close: the next one carries the close request, as eframe delivers it.
+    close_pending: bool,
+    /// Closes the window refused (the shell cancelled them) and whether one went through.
+    pub refused_closes: usize,
+    pub window_closed: bool,
 }
 
 impl Driver {
-    /// A `w`×`h`-point window at 1 pixel per point.
+    /// A `w`×`h`-point window at 1 pixel per point, in the skin every window gets before its
+    /// first frame ([`super::chrome::install`]), so tests lay out what the owner sees.
     pub fn new(w: f32, h: f32) -> Self {
+        let ctx = egui::Context::default();
+        super::chrome::install(&ctx);
         Self {
-            ctx: egui::Context::default(),
+            ctx,
             size: Vec2::new(w, h),
             time: 0.0,
             pointer: Pos2::new(w / 2.0, h / 2.0),
             shapes: Vec::new(),
             commands: Vec::new(),
             viewport: Vec::new(),
+            shell: false,
+            close_pending: false,
+            refused_closes: 0,
+            window_closed: false,
         }
+    }
+
+    /// From now on each pass is run as the shell runs a window of its own: a close asked for in
+    /// one pass reaches the next as the platform's close request, the shell asks the window
+    /// ([`crate::gui::closing`]), and its answer is counted ([`Driver::refused_closes`]) or
+    /// closes it ([`Driver::window_closed`]).
+    pub fn as_shell(&mut self) {
+        self.shell = true;
     }
 
     /// The platform commands of the passes since the last call (see [`Driver::commands`]).
@@ -51,7 +73,7 @@ impl Driver {
         self.time += 1.0 / 60.0;
         let mut all = vec![Event::ModifiersChanged(modifiers)];
         all.extend(events);
-        let raw = RawInput {
+        let mut raw = RawInput {
             screen_rect: Some(Rect::from_min_size(Pos2::ZERO, self.size)),
             time: Some(self.time),
             max_texture_side: Some(8192),
@@ -59,12 +81,37 @@ impl Driver {
             focused: true,
             ..Default::default()
         };
-        let mut out = self.ctx.run_ui(raw, |ui| win.ui(ui));
+        let delivered = self.shell && std::mem::take(&mut self.close_pending);
+        if delivered {
+            raw.viewports
+                .entry(egui::ViewportId::ROOT)
+                .or_default()
+                .events
+                .push(egui::ViewportEvent::Close);
+        }
+        let shell = self.shell;
+        let mut out = self.ctx.run_ui(raw, |ui| {
+            if shell {
+                super::closing(ui.ctx(), win, false);
+            }
+            win.ui(ui)
+        });
         self.shapes = std::mem::take(&mut out.shapes);
         self.commands.append(&mut out.platform_output.commands);
+        let mut sent = Vec::new();
         for (_, viewport) in std::mem::take(&mut out.viewport_output) {
-            self.viewport.extend(viewport.commands);
+            sent.extend(viewport.commands);
         }
+        if self.shell {
+            let cancelled = sent.contains(&egui::ViewportCommand::CancelClose);
+            if delivered && cancelled {
+                self.refused_closes += 1;
+            } else if delivered {
+                self.window_closed = true;
+            }
+            self.close_pending |= sent.contains(&egui::ViewportCommand::Close);
+        }
+        self.viewport.extend(sent);
         // No renderer: the texture uploads are dropped on purpose.
         out.textures_delta.clear();
     }
@@ -299,6 +346,30 @@ impl Driver {
         found.into_iter().next().map(|(_, colors)| colors)
     }
 
+    /// The colours `text` is painted in on screen, where the last pass drew it whole (as for
+    /// [`Driver::colors_of`]) — a widget's label is laid out in a placeholder colour and painted
+    /// in its state's text colour, which this resolves.
+    pub fn painted_colors_of(&self, text: &str) -> Option<Vec<egui::Color32>> {
+        let found = self.shown(|s| match s {
+            egui::Shape::Text(t) if t.galley.text() == text && !t.galley.elided => {
+                let colors = t
+                    .galley
+                    .job
+                    .sections
+                    .iter()
+                    .map(|s| match (t.override_text_color, s.format.color) {
+                        (Some(c), _) => c,
+                        (None, c) if c == egui::Color32::PLACEHOLDER => t.fallback_color,
+                        (None, c) => c,
+                    })
+                    .collect::<Vec<_>>();
+                Some((t.galley.rect.translate(t.pos.to_vec2()), colors))
+            }
+            _ => None,
+        });
+        found.into_iter().next().map(|(_, colors)| colors)
+    }
+
     /// The first text the last pass drew whole, where it can be seen, that starts with `prefix`.
     pub fn text_starting_with(&self, prefix: &str) -> Option<String> {
         let found = self.shown(|s| match s {
@@ -311,6 +382,20 @@ impl Driver {
             _ => None,
         });
         found.into_iter().next().map(|(_, text)| text)
+    }
+
+    /// Every text the last pass drew whole, where it can be seen, that starts with `prefix`,
+    /// with where it is, in drawing order.
+    pub fn texts_starting_with(&self, prefix: &str) -> Vec<(Rect, String)> {
+        self.shown(|s| match s {
+            egui::Shape::Text(t) if t.galley.text().starts_with(prefix) && !t.galley.elided => {
+                Some((
+                    t.galley.rect.translate(t.pos.to_vec2()),
+                    t.galley.text().to_string(),
+                ))
+            }
+            _ => None,
+        })
     }
 
     /// Where the last pass drew a picture (a mesh on a texture of the window's own, not the font
@@ -482,6 +567,59 @@ mod tests {
             assert_eq!(drv.find_text(TEXT).is_some(), shown, "{case}");
             assert_eq!(drv.rows_of(TEXT), shown.then_some(1), "{case}");
         }
+    }
+
+    /// Says no to the first close it is asked for, then yes.
+    struct Reluctant {
+        asked: usize,
+    }
+
+    impl Window for Reluctant {
+        fn ui(&mut self, ui: &mut egui::Ui) {
+            if ui.input(|i| i.key_pressed(Key::F3)) {
+                ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+        }
+
+        fn ready(&self) -> bool {
+            true
+        }
+
+        fn close_requested(&mut self) -> bool {
+            self.asked += 1;
+            self.asked > 1
+        }
+    }
+
+    /// As the shell: a close a pass asks for reaches the window on the next pass; a refusal is
+    /// counted and the window stays, a yes closes it. Without the shell nothing asks the window.
+    #[test]
+    fn as_shell_asks_the_window_on_the_next_pass() {
+        let mut drv = Driver::new(200.0, 100.0);
+        let mut win = Reluctant { asked: 0 };
+        drv.key(&mut win, Key::F3, Modifiers::NONE);
+        assert!(drv.closed());
+        assert_eq!(
+            (win.asked, drv.refused_closes, drv.window_closed),
+            (0, 0, false)
+        );
+        drv.as_shell();
+        drv.key(&mut win, Key::F3, Modifiers::NONE);
+        assert_eq!(
+            (win.asked, drv.refused_closes, drv.window_closed),
+            (1, 1, false)
+        );
+        drv.key(&mut win, Key::F3, Modifiers::NONE);
+        assert_eq!(
+            (win.asked, drv.refused_closes, drv.window_closed),
+            (2, 1, true)
+        );
+        // Cmd/Ctrl+W asks the same way.
+        let mut again = Reluctant { asked: 0 };
+        let mut drv = Driver::new(200.0, 100.0);
+        drv.as_shell();
+        drv.key(&mut again, Key::W, command(false));
+        assert_eq!((again.asked, drv.refused_closes), (1, 1));
     }
 
     /// Draws one spinner: in the open, or with a 4×4 clip at its corner.

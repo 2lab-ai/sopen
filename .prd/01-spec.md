@@ -48,8 +48,8 @@ viewer for its kind in the same window — a read-only text viewer with syntax h
 "own highlighting" off §9), and the existing image, media and hex windows; text opened directly
 still goes to VS Code / Zed. The browser views: copy, move, delete and rename are not part of it
 (§9), and the viewers keep exactly their edits. Its item 4 asks for the PC Tools look: the browser
-is laid out where PC Shell puts things (§3a); the skin itself (colours, VGA font, frames) comes
-after.
+is laid out where PC Shell puts things (§3a), and every sopen window wears PC Shell 5.5 / 6's skin
+(§3a: palette, VGA font, frames, title and F-key rows, dialogs).
 
 ## 2. Intent → acceptance
 
@@ -122,9 +122,19 @@ are where PC Shell puts them: the program's name on the top row; two file panels
 each in a frame with its folder (`host:/abs`) centred in the top border and the active panel's
 frame drawn heavier; the status row (a fetch's progress, the last result, else what the keys do);
 the bottom row lists the F-keys that work there and nothing else (the list: 3 View, 4 Edit; a
-viewer: 3 Exit, 4 Edit). All drawing of those rows, the frames, the bar and every colour sits in
-one module (`gui::chrome`), so the PC Tools skin (msg 12 item 4: palette, VGA font, frames)
-replaces that module alone.
+viewer: 3 Exit, 4 Edit and the viewer's own — the hex window's 5 Save, 6 Goto, 8 Asc/hx, aliases
+of ⌘S, ⌘G and Tab, and the image window's 5 Save; a plain F-key never acts while a text field has
+the typing). The foot shows `N Listed = N bytes` whole inside the frame whatever the width: the
+free space gives way first, then the end of the total. Every cell fits its column at a glyph
+boundary (a name or an extension too long ends in "…"; a size too long for its column is said in
+the smallest unit that fits, KB to EB, never cut). All drawing of those rows, the frames, the bar and every colour sits in
+one module (`gui::chrome`): the PC Tools skin (msg 12 item 4) of every sopen window — light grey
+on DOS blue, the VGA font (PxPlus IBM VGA 8x16, CC BY-SA 4.0) on its 8×16 grid, the active
+window's double frame, the white-on-light-red bar, the red program block on the cyan title row
+with the clock, digit-on-black / label-on-cyan F-keys, the ░ scroll bar with its red thumb, cyan
+dialogs with a 2×1 shadow, a sixteen-colour syntax theme, and the hex window's `dddd(hhhh)`
+offsets and code page 437 ASCII column. A window of its own (image, media, hex) has the F-key row
+too, where F3 closes it as ⌘W does.
 
 - **A panel** lists `..` (not at `/`), then folders and links to folders, then everything else,
   each by name regardless of case. Columns: Name · Ext (a file's extension; a folder, a dot file
@@ -134,8 +144,8 @@ replaces that module alone.
   attributes could not be read) · Date · Time (local time, of a link's target). Hidden (dot)
   entries are shown, dimmed. A name that is not valid UTF-8 shows with U+FFFD for its bad bytes
   and is never opened, entered or handed to the editor (sopen's paths are UTF-8; the name as
-  shown may even be another file's), and nothing is looked up by it. The foot reads `N listed = N bytes` (the entries but `..`; the bytes
-  of the files) and, when one request can tell, `N bytes free`. Both panels start on the opened
+  shown may even be another file's), and nothing is looked up by it. The foot reads `N Listed = N bytes` (the entries but `..`; the bytes
+  of the files) and, when one request can tell, `N Bytes Free` — PC Shell's words. Both panels start on the opened
   folder; a folder is listed again each time it is entered.
 - **Listing** is one round trip: SFTP's readdir carries each name's attributes, and only a
   symbolic link costs a stat more (to say what it points at). A link is followed only to classify

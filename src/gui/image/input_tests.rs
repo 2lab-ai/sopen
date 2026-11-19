@@ -1303,3 +1303,86 @@ fn a_key_let_go_while_the_close_prompt_is_up_still_ends_a_held_paste() {
     assert!(fx.win.doc.undo() && fx.win.doc.undo(), "two undo steps");
     assert!(!fx.win.doc.can_undo());
 }
+
+/// On its own the window has PC Shell's F-key row, with F3 Exit, and F3 goes through the real
+/// close: with an edit the shell's close is refused and the unsaved-changes prompt comes up;
+/// Discard closes. Without an edit it closes at once.
+#[test]
+fn f3_closes_the_window_through_its_prompt() {
+    let mut fx = open();
+    fx.drv.as_shell();
+    fx.settle();
+    assert!(fx.drv.find_text("Exit   ").is_some(), "the F-key row");
+    fx.select((40.0, 30.0), (100.0, 80.0));
+    fx.key(Key::P, Modifiers::NONE);
+    assert!(fx.win.doc.unsaved(), "an edit");
+    fx.key(Key::F3, Modifiers::NONE);
+    assert_eq!(fx.drv.refused_closes, 1, "the close is refused");
+    assert!(!fx.drv.window_closed);
+    assert!(fx.drv.find_text("Unsaved changes").is_some(), "the prompt");
+    fx.drv.click_text(&mut fx.win, "Discard");
+    fx.drv.idle(&mut fx.win, 1);
+    assert!(fx.drv.window_closed, "Discard closes it");
+    let mut clean = open();
+    clean.drv.as_shell();
+    clean.settle();
+    clean.key(Key::F3, Modifiers::NONE);
+    assert_eq!(
+        (clean.drv.refused_closes, clean.drv.window_closed),
+        (0, true)
+    );
+}
+
+/// F5 is PC Shell's Save, as Cmd/Ctrl+S: it saves an edit — and nothing while a text field
+/// (the block size) has the typing, while the unsaved-changes prompt is up, or while the
+/// picture is read-only. The F-key row lists it, and so does the browser's when it hosts the
+/// window.
+#[test]
+fn f5_saves_as_command_s_does_and_only_where_it_would() {
+    let mut fx = open();
+    fx.settle();
+    assert!(fx.drv.find_text("Save   ").is_some(), "5Save in the row");
+    assert_eq!(
+        crate::gui::Window::keys(&fx.win),
+        crate::gui::chrome::IMAGE_KEYS
+    );
+    let original = std::fs::read(&fx.path).unwrap();
+    fx.select((0.0, 0.0), (120.0, 80.0));
+    fx.key(Key::C, Modifiers::NONE);
+    // The block size field has the typing: F5 is not for it either.
+    fx.drv.click_text(&mut fx.win, "16");
+    assert!(fx.drv.ctx.text_edit_focused());
+    fx.key(Key::F5, Modifiers::NONE);
+    assert!(fx.win.job.is_none(), "F5 in a field saves nothing");
+    assert_eq!(std::fs::read(&fx.path).unwrap(), original);
+    fx.drv.ctx.memory_mut(|m| m.stop_text_input());
+    fx.drv
+        .ctx
+        .memory_mut(|m| m.focused().map(|id| m.surrender_focus(id)));
+    fx.drv.idle(&mut fx.win, 2);
+    assert!(!fx.drv.ctx.egui_wants_keyboard_input());
+    // Under the prompt.
+    assert!(!crate::gui::Window::close_requested(&mut fx.win));
+    fx.drv.idle(&mut fx.win, 2);
+    fx.key(Key::F5, Modifiers::NONE);
+    assert!(fx.win.job.is_none(), "F5 under the prompt saves nothing");
+    fx.drv.click_text(&mut fx.win, "Cancel");
+    // F5 saves.
+    fx.key(Key::F5, Modifiers::NONE);
+    wait_for_save(&mut fx);
+    assert!(
+        fx.win.status.text.starts_with("saved "),
+        "{}",
+        fx.win.status.text
+    );
+    let saved = image::load_from_memory(&std::fs::read(&fx.path).unwrap()).unwrap();
+    assert_eq!((saved.width(), saved.height()), (120, 80));
+    // Read-only: nothing.
+    fx.select((10.0, 10.0), (60.0, 40.0));
+    fx.key(Key::C, Modifiers::NONE);
+    let written = std::fs::read(&fx.path).unwrap();
+    fx.win.doc.read_only = Some("a test".into());
+    fx.key(Key::F5, Modifiers::NONE);
+    assert!(fx.win.job.is_none(), "F5 read-only saves nothing");
+    assert_eq!(std::fs::read(&fx.path).unwrap(), written);
+}

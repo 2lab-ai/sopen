@@ -2,6 +2,7 @@
 //! with modifiers, typed text, clicks) through its `ui`.
 
 use super::*;
+use crate::gui::chrome::cga;
 use crate::gui::testkit::{command, Driver};
 use crate::gui::Window;
 use crate::remote::{LocalFs, RemoteFs};
@@ -187,9 +188,15 @@ fn offsets_and_bytes_parse_and_format() {
         "00 01 02 03 04 05 06 07  08 09 0A 0B 0C 0D 0E 0F"
     );
     assert_eq!(hex_cells(&[Some(0xab), None]), "AB ??");
+    // The ASCII column shows code page 437's glyphs, as PC Shell does; an unreadable byte is `?`.
     assert_eq!(ascii_char(Some(b'~')), '~');
-    assert_eq!(ascii_char(Some(0x7f)), '.');
-    assert_eq!(ascii_char(None), '.');
+    assert_eq!(ascii_char(Some(0x7f)), '⌂');
+    assert_eq!(ascii_char(Some(0x01)), '☺');
+    assert_eq!(ascii_char(Some(0x00)), ' ');
+    assert_eq!(ascii_char(None), '?');
+    // Offsets read as PC Shell's File Edit: decimal, then hex in parentheses.
+    assert_eq!(offset_text(16, 21), "0016(0010)");
+    assert_eq!(offset_text(0, 0), "0000(0000)");
     // The hex column's grid: two digits and a space per byte, one more space after the 8th.
     assert_eq!(hex_col(7), 21);
     assert_eq!(hex_col(8), 25);
@@ -251,12 +258,12 @@ fn rows_show_offsets_hex_and_ascii() {
     let mut fx = fetched("view.bin", FIXTURE, 1000.0, 600.0);
     fx.settle();
     for text in [
-        "0000",
-        "0010",
+        "0000(0000)",
+        "0016(0010)",
         "73 6F 70 65 6E 20 68 65  78 20 76 69 65 77 00 FF",
-        "sopen hex view..",
+        "sopen hex view \u{A0}",
         "41 42 43 0A 80",
-        "ABC..",
+        "ABC◙Ç",
     ] {
         assert!(fx.drv.find_text(text).is_some(), "{text:?} not shown");
     }
@@ -265,7 +272,7 @@ fn rows_show_offsets_hex_and_ascii() {
         .drv
         .find_text("73 6F 70 65 6E 20 68 65  78 20 76 69 65 77 00 FF")
         .unwrap();
-    let ascii = fx.drv.find_text("sopen hex view..").unwrap();
+    let ascii = fx.drv.find_text("sopen hex view \u{A0}").unwrap();
     assert!(ascii.left() > hex.right(), "{hex:?} {ascii:?}");
     assert!((ascii.center().y - hex.center().y).abs() < 0.5);
     // The status bar: offset, byte, size, changes.
@@ -368,7 +375,7 @@ fn typing_overwrites_and_undo_redo_keys_work() {
             .is_some(),
         "changed bytes shown"
     );
-    assert!(fx.drv.find_text("AZpen hex view..").is_some());
+    assert!(fx.drv.find_text("AZpen hex view \u{A0}").is_some());
     assert!(fx.drv.find_text("2 bytes changed").is_some());
     assert!(fx.drv.find_text("unsaved").is_some());
     // The cached copy is never written.
@@ -687,7 +694,7 @@ fn a_large_file_paints_only_the_visible_rows() {
         fx.win.rows_painted
     );
     assert!(
-        fx.drv.find_text("FFFFFF0").is_some(),
+        fx.drv.find_text("268435440(FFFFFF0)").is_some(),
         "the last row's offset"
     );
     assert!(fx.drv.find_text("0xFFFFFFF (268435455) · 0x00 0").is_some());
@@ -1675,7 +1682,7 @@ fn the_cursor_is_painted_in_both_columns() {
     fx.typed("Z");
     assert_eq!(fx.at(), 19);
     assert!(
-        fx.drv.find_text("ABZ..").is_some(),
+        fx.drv.find_text("ABZ◙Ç").is_some(),
         "the ASCII column shows it"
     );
     assert!(
@@ -1685,13 +1692,13 @@ fn the_cursor_is_painted_in_both_columns() {
     fx.key(Key::Z, command(false));
     assert_eq!(fx.at(), 18, "undo puts the cursor back on the byte");
     assert_eq!(painted(&fx, 18), (false, true, true, false));
-    assert!(fx.drv.find_text("ABC..").is_some());
+    assert!(fx.drv.find_text("ABC◙Ç").is_some());
     assert!(fx.drv.find_text("41 42 43 0A 80").is_some());
     fx.key(Key::Z, command(true));
     assert_eq!(fx.at(), 18, "redo puts the cursor on the byte");
     assert_eq!(painted(&fx, 18), (false, true, true, false));
     assert!(
-        fx.drv.find_text("ABZ..").is_some(),
+        fx.drv.find_text("ABZ◙Ç").is_some(),
         "redone in the ASCII column"
     );
     assert!(
@@ -2279,4 +2286,266 @@ fn a_large_touched_then_undone_document_is_clean_and_cheap_to_ask() {
     assert_eq!(doc.reads(), reads, "asked again: read again");
     doc.redo();
     assert!(doc.dirty(), "a change after the answer was kept");
+}
+
+// ---------------------------------------------------------------------------------------------
+// The PC Shell look: File Edit's offsets and F-keys.
+
+/// Offsets read decimal then hex, each column as wide as the file's last offset needs.
+#[test]
+fn offsets_read_decimal_then_hex_and_widen_with_the_file() {
+    assert_eq!(offset_text(0, 21), "0000(0000)");
+    assert_eq!(offset_text(240, 4096), "0240(00F0)");
+    assert_eq!(decimal_digits(10_000), 4);
+    assert_eq!(decimal_digits(10_001), 5);
+    assert_eq!(offset_text(16, 10_001), "00016(0010)");
+    let big = 0x1_0000_0001;
+    assert_eq!(offset_text(0, big), "0000000000(000000000)");
+    assert_eq!(offset_text(big - 1, big), "4294967296(100000000)");
+    // Every row of a file has the same width, down to the last.
+    for size in [1, 4096, 1 << 20, big, u64::MAX] {
+        let first = offset_text(0, size).len();
+        assert_eq!(offset_text(size - 1, size).len(), first, "{size}");
+    }
+}
+
+/// On its own the window's bottom row is PC Shell's F-key row with what works here: F3 Exit,
+/// F5 Save, F6 Goto, F8 Asc/hx — each the same as the key it stands for.
+#[test]
+fn the_f_keys_do_what_their_labels_say() {
+    let mut fx = fetched("blob.bin", FIXTURE, 1000.0, 600.0);
+    for label in ["Exit   ", "Save   ", "Goto   ", "Asc/hx "] {
+        assert!(fx.drv.find_text(label).is_some(), "{label:?} in the row");
+    }
+    // F8: the typing column, as Tab.
+    assert_eq!(fx.win.cursor.pane, Pane::Hex);
+    fx.key(Key::F8, Modifiers::NONE);
+    assert_eq!(fx.win.cursor.pane, Pane::Ascii);
+    fx.key(Key::F8, Modifiers::NONE);
+    assert_eq!(fx.win.cursor.pane, Pane::Hex);
+    // F6: the Go to field takes the typing, as Cmd/Ctrl+G.
+    fx.key(Key::F6, Modifiers::NONE);
+    assert_eq!(fx.drv.ctx.memory(|m| m.focused()), Some(goto_id()));
+    fx.typed("16");
+    assert_eq!(fx.win.goto, "16");
+    assert_eq!(fx.win.doc.changed_count(), 0, "no byte was typed");
+    fx.key(Key::Enter, Modifiers::NONE);
+    assert_eq!(fx.at(), 16);
+    // F5: Save, as Cmd/Ctrl+S — one save.
+    fx.typed("7A");
+    assert!(fx.win.doc.dirty());
+    let starts = fx.win.save_starts;
+    fx.key(Key::F5, Modifiers::NONE);
+    assert_eq!(fx.win.save_starts, starts + 1, "F5 starts exactly one save");
+    fx.wait_for_save();
+    assert!(
+        fx.win.status.text.starts_with("saved "),
+        "{}",
+        fx.win.status.text
+    );
+    assert_eq!(std::fs::read(&fx.remote).unwrap()[16], 0x7A);
+    // F3: closing is asked for, as Cmd/Ctrl+W (nothing unsaved: it closes).
+    fx.drv.as_shell();
+    fx.key(Key::F3, Modifiers::NONE);
+    assert!(fx.drv.window_closed, "F3 closes the window");
+}
+
+/// The browser's part, played by a host: it runs the hex window's pass as hosted
+/// ([`crate::gui::host_pass`]) and reads F3 after it, as the browser does.
+struct Host {
+    win: HexWindow,
+    /// The hosted window asked to close (it must not, for F3: that is the host's).
+    asked: bool,
+    /// F3 was still there for the host after the window's pass.
+    f3_left: bool,
+}
+
+impl Window for Host {
+    fn ui(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
+        let ((), asked) = crate::gui::host_pass(&ctx, || self.win.ui(ui));
+        self.asked |= asked;
+        self.f3_left |= ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::F3));
+    }
+
+    fn ready(&self) -> bool {
+        true
+    }
+}
+
+/// Hosted in another window, the row is the host's: the window draws no F-key row of its own,
+/// does not take F3 (the host gets it, untouched) and asks nothing; the host lists the window's
+/// own keys.
+#[test]
+fn a_hosted_window_leaves_the_row_and_f3_to_its_host() {
+    let Fx {
+        tmp: _tmp,
+        win,
+        mut drv,
+        ..
+    } = fetched("blob.bin", FIXTURE, 1000.0, 600.0);
+    // On its own it has the row (the control: the check below can see one).
+    assert!(drv.find_text("Exit   ").is_some());
+    let mut host = Host {
+        win,
+        asked: false,
+        f3_left: false,
+    };
+    drv.idle(&mut host, 2);
+    for label in ["Exit   ", "Save   ", "Goto   ", "Asc/hx "] {
+        assert!(
+            drv.find_text(label).is_none(),
+            "{label:?}: no row of its own"
+        );
+    }
+    drv.take_viewport_commands();
+    drv.key(&mut host, Key::F3, Modifiers::NONE);
+    assert!(host.f3_left, "F3 is the host's");
+    assert!(!host.asked, "the hosted window asked nothing");
+    assert!(!drv.closed(), "nor did it close the window around it");
+    assert_eq!(
+        Window::keys(&host.win),
+        HEX_KEYS,
+        "the host lists the window's own keys"
+    );
+}
+
+/// F3 on its own goes through the real close: with an edit the shell's close is refused and
+/// the unsaved-changes prompt comes up; Discard closes. Without an edit it closes at once.
+#[test]
+fn f3_on_a_dirty_window_brings_up_the_prompt_and_discard_closes() {
+    let mut fx = fetched("blob.bin", FIXTURE, 1000.0, 600.0);
+    fx.drv.as_shell();
+    fx.typed("41");
+    assert!(fx.win.doc.unsaved());
+    fx.key(Key::F3, Modifiers::NONE);
+    assert_eq!(fx.drv.refused_closes, 1, "an edit: the close is refused");
+    assert!(!fx.drv.window_closed);
+    assert!(fx.drv.find_text("Unsaved changes").is_some(), "the prompt");
+    fx.drv.click_text(&mut fx.win, "Discard");
+    fx.drv.idle(&mut fx.win, 1);
+    assert!(fx.drv.window_closed, "Discard closes it");
+    assert_eq!(
+        std::fs::read(&fx.remote).unwrap(),
+        FIXTURE,
+        "nothing written"
+    );
+    let mut clean = fetched("blob.bin", FIXTURE, 1000.0, 600.0);
+    clean.drv.as_shell();
+    clean.key(Key::F3, Modifiers::NONE);
+    assert_eq!(
+        (clean.drv.refused_closes, clean.drv.window_closed),
+        (0, true)
+    );
+}
+
+/// F5, F6 and F8 act only where their keys would: F5 saves nothing while the Go to field has
+/// the typing, while a save runs, while the prompt is up or while the window is read-only; F6
+/// leaves a focused field and the prompt alone; F8 moves no column while either is there.
+#[test]
+fn f5_f6_f8_respect_a_focused_field_the_prompt_a_save_and_read_only() {
+    let mut fx = fetched("blob.bin", FIXTURE, 1000.0, 600.0);
+    fx.typed("7A");
+    // The Go to field has the typing.
+    fx.key(Key::G, command(false));
+    fx.typed("12");
+    assert_eq!(fx.drv.ctx.memory(|m| m.focused()), Some(goto_id()));
+    fx.key(Key::F5, Modifiers::NONE);
+    assert!(fx.win.job.is_none(), "F5 in the field saves nothing");
+    assert!(
+        !fx.win.status.text.starts_with("saved"),
+        "{}",
+        fx.win.status.text
+    );
+    fx.key(Key::F6, Modifiers::NONE);
+    assert_eq!(fx.win.goto, "12", "F6 leaves what is typed in the field");
+    let pane = fx.win.cursor.pane;
+    fx.key(Key::F8, Modifiers::NONE);
+    assert_eq!(fx.win.cursor.pane, pane, "F8 in the field moves no column");
+    assert_eq!(fx.win.goto, "12");
+    fx.key(Key::Escape, Modifiers::NONE);
+    fx.drv.ctx.memory_mut(|m| m.surrender_focus(goto_id()));
+    fx.settle();
+    // A save running: no second one starts.
+    let (_tx, rx) = mpsc::channel();
+    fx.win.job = Some(Job {
+        kind: JobKind::Save { close_after: false },
+        snapshot: fx.win.doc.patches().clone(),
+        rx,
+    });
+    let starts = fx.win.save_starts;
+    fx.key(Key::F5, Modifiers::NONE);
+    fx.key(Key::S, command(false));
+    assert_eq!(fx.win.save_starts, starts, "no save starts while one runs");
+    fx.win.job = None;
+    // The prompt is up.
+    assert!(!fx.win.close_requested());
+    assert!(fx.win.prompt);
+    fx.drv.idle(&mut fx.win, 2);
+    let pane = fx.win.cursor.pane;
+    for key in [Key::F5, Key::F6, Key::F8] {
+        fx.key(key, Modifiers::NONE);
+    }
+    assert!(fx.win.job.is_none(), "F5 under the prompt saves nothing");
+    assert_ne!(
+        fx.drv.ctx.memory(|m| m.focused()),
+        Some(goto_id()),
+        "F6 under the prompt"
+    );
+    assert_eq!(fx.win.cursor.pane, pane, "F8 under the prompt");
+    fx.drv.click_text(&mut fx.win, "Cancel");
+    // Read-only.
+    fx.win.turn_read_only("the file changed");
+    fx.key(Key::F5, Modifiers::NONE);
+    assert!(fx.win.job.is_none(), "F5 read-only saves nothing");
+    assert_eq!(
+        std::fs::read(&fx.remote).unwrap(),
+        FIXTURE,
+        "nothing written"
+    );
+}
+
+/// `SOPEN_STATE` `close=ask` (the prompt's receipt): with an edit, the first pass brings up the
+/// unsaved-changes prompt in the dialog look — black on cyan, its title in its frame.
+#[test]
+fn close_ask_brings_up_the_prompt_in_the_dialog_look() {
+    let mut fx = fetched("blob.bin", FIXTURE, 1000.0, 600.0);
+    fx.typed("41");
+    fx.win.ask_close = true;
+    fx.drv.idle(&mut fx.win, 3);
+    assert!(fx.win.prompt);
+    let p = chrome::PALETTE;
+    assert_eq!(
+        fx.drv.colors_of("Unsaved changes"),
+        Some(vec![p.dialog_text])
+    );
+    let discard = fx.drv.find_text("Discard").expect("the prompt's buttons");
+    let cyan = fx.drv.rects().iter().any(|(r, f, _)| {
+        *f == p.dialog_back && r.contains(discard.left_top() - egui::vec2(4.0, 4.0))
+    });
+    assert!(cyan, "the prompt is cyan");
+    assert!(!fx.win.ask_close, "asked once");
+    // Its text is black on cyan; a button's label keeps its state's colour, so the one under
+    // the pointer (inverted: cyan on black) never goes black on black.
+    let message = fx.drv.text_starting_with("Save the changes").unwrap();
+    assert_eq!(
+        fx.drv.painted_colors_of(&message),
+        Some(vec![p.dialog_text])
+    );
+    assert_eq!(fx.drv.painted_colors_of("Cancel"), Some(vec![cga::BLACK]));
+    let under = |fx: &Fx, at: Pos2| {
+        fx.drv
+            .rects()
+            .iter()
+            .rev()
+            .find(|(r, _, _)| r.contains(at))
+            .map(|(_, f, _)| *f)
+    };
+    let at = discard.center();
+    fx.drv.move_to(&mut fx.win, at);
+    fx.drv.idle(&mut fx.win, 2);
+    let label = fx.drv.painted_colors_of("Discard").unwrap();
+    let fill = under(&fx, at).expect("the button's fill");
+    assert_eq!(fill, cga::BLACK, "hovered: inverted");
+    assert_eq!(label, vec![cga::CYAN], "hovered: cyan on black");
 }

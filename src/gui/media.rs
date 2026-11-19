@@ -29,6 +29,9 @@ type Wave = Arc<Mutex<Option<Vec<[f32; 2]>>>>;
 const CLOSE_AGAIN: &str = "the window closes when the export is done — close it again to close \
      it now; sopen still waits for the export and prints the result in the terminal";
 
+/// The window's title in its frame, in the manner of PC Shell's `File Edit`: a video, a sound.
+const VIDEO_TITLE: &str = "Video Edit";
+const AUDIO_TITLE: &str = "Audio Edit";
 const WAVE_BINS: usize = 2000;
 /// Waveform decode rate (mono).
 const WAVE_RATE: f64 = 8000.0;
@@ -363,7 +366,7 @@ pub fn open(
     let title = origin.display();
     let size = match media.decode_size() {
         Some((w, h)) => [
-            (w as f32).clamp(640.0, 1280.0),
+            (w as f32 + 2.0 * super::chrome::CELL.x).clamp(640.0, 1280.0),
             (h as f32 + 150.0).clamp(420.0, 900.0),
         ],
         None => [1000.0, 420.0],
@@ -758,14 +761,15 @@ impl MediaWindow {
             Sense::click_and_drag(),
         );
         self.timeline_rect = Some(rect);
+        let p = super::chrome::PALETTE;
         let painter = ui.painter_at(rect);
-        painter.rect_filled(rect, 3.0, Color32::from_gray(40));
+        painter.rect_filled(rect, 0.0, p.timeline);
         let duration = self.media.duration.max(1e-6);
         let x_of = |t: f64| rect.left() + (t / duration) as f32 * rect.width();
         let (in_s, out_s) = self.marks.range(duration);
         if self.marks.in_s.is_some() || self.marks.out_s.is_some() {
             let span = Rect::from_x_y_ranges(x_of(in_s)..=x_of(out_s), rect.y_range());
-            painter.rect_filled(span, 0.0, Color32::from_rgba_unmultiplied(80, 160, 255, 45));
+            painter.rect_filled(span, 0.0, p.span);
         }
         if let Some(wave) = self.wave.as_ref().and_then(|w| w.lock().unwrap().clone()) {
             let mid = rect.center().y;
@@ -775,11 +779,11 @@ impl MediaWindow {
                 let x = rect.left() + (k as f32 + 0.5) / n * rect.width();
                 painter.line_segment(
                     [Pos2::new(x, mid - hi * amp), Pos2::new(x, mid - lo * amp)],
-                    Stroke::new(1.0, Color32::from_rgb(90, 200, 140)),
+                    Stroke::new(1.0, p.wave),
                 );
             }
         }
-        let font = egui::FontId::monospace(12.0);
+        let font = super::chrome::font();
         let mark = |t: f64, color: Color32, label: String| {
             let x = x_of(t);
             painter.line_segment(
@@ -787,7 +791,8 @@ impl MediaWindow {
                 Stroke::new(2.0, color),
             );
             // Labels near the right end go on the marker's left so they stay inside.
-            let right = x + 3.0 + 9.0 * label.chars().count() as f32 > rect.right();
+            let cell = super::chrome::CELL.x;
+            let right = x + 3.0 + cell * label.chars().count() as f32 > rect.right();
             let (pos, align) = if right {
                 (
                     Pos2::new(x - 3.0, rect.top() + 2.0),
@@ -799,23 +804,15 @@ impl MediaWindow {
             painter.text(pos, align, label, font.clone(), color);
         };
         if let Some(i) = self.marks.in_s {
-            mark(
-                i,
-                Color32::from_rgb(70, 220, 90),
-                format!("In {}", clock_text(i)),
-            );
+            mark(i, p.mark_in, format!("In {}", clock_text(i)));
         }
         if let Some(o) = self.marks.out_s {
-            mark(
-                o,
-                Color32::from_rgb(240, 90, 80),
-                format!("Out {}", clock_text(o)),
-            );
+            mark(o, p.mark_out, format!("Out {}", clock_text(o)));
         }
         let x = x_of(self.marks.t);
         painter.line_segment(
             [Pos2::new(x, rect.top()), Pos2::new(x, rect.bottom())],
-            Stroke::new(2.0, Color32::WHITE),
+            Stroke::new(2.0, p.playhead),
         );
         if resp.hovered() {
             ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
@@ -942,16 +939,19 @@ impl MediaWindow {
         let Some(src) = self.media.source_size() else {
             return;
         };
-        let panel = ui.max_rect();
+        // The window's frame; the frame on black inside it.
+        let outer = ui.max_rect();
+        let p = super::chrome::PALETTE;
+        let panel = super::chrome::frame(&ui.painter_at(outer), outer, VIDEO_TITLE, true);
         let painter = ui.painter_at(panel);
-        painter.rect_filled(panel, 0.0, Color32::from_gray(22));
+        painter.rect_filled(panel, 0.0, p.picture_back);
         let Some(tex) = &self.tex else {
             painter.text(
                 panel.center(),
                 egui::Align2::CENTER_CENTER,
                 "decoding…",
-                egui::FontId::proportional(16.0),
-                Color32::GRAY,
+                super::chrome::font(),
+                p.dim,
             );
             return;
         };
@@ -1040,6 +1040,8 @@ impl super::Window for MediaWindow {
         }
         let mut seek = None;
         let audio_only = self.audio_only();
+        // The F-key row, the window's last (on its own: the browser around it has the row).
+        super::own_keys(ui, &[]);
         egui::Panel::bottom("transport").show(ui, |ui| {
             ui.add_space(4.0);
             if !audio_only {
@@ -1053,16 +1055,14 @@ impl super::Window for MediaWindow {
             .frame(egui::Frame::NONE)
             .show(ui, |ui| {
                 if audio_only {
-                    ui.painter()
-                        .rect_filled(ui.max_rect(), 0.0, Color32::from_gray(22));
-                    ui.add_space(12.0);
-                    let h = (ui.available_height() - 12.0).max(60.0);
-                    ui.horizontal(|ui| {
-                        ui.add_space(8.0);
-                        ui.vertical(|ui| {
-                            ui.set_width(ui.available_width() - 8.0);
-                            seek = self.timeline(ui, h).or(seek);
-                        });
+                    // The window's frame, the waveform's timeline inside it.
+                    let outer = ui.max_rect();
+                    let inner =
+                        super::chrome::frame(&ui.painter_at(outer), outer, AUDIO_TITLE, true);
+                    let room = inner.shrink(4.0);
+                    ui.scope_builder(egui::UiBuilder::new().max_rect(room), |ui| {
+                        let h = ui.available_height().max(60.0);
+                        seek = self.timeline(ui, h).or(seek);
                     });
                     self.painted = self
                         .wave

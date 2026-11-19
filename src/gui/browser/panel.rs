@@ -1,6 +1,6 @@
 //! One file panel: the folder it shows, its entries in the browser's order (`..` first, then
 //! folders, then files, each by name), the highlight bar and the first row on screen — and how a
-//! row and the footer read (`N listed = N bytes`, then the free space).
+//! row and the footer read (`N Listed = N bytes`, then `N Bytes Free`, in PC Shell's words).
 
 use crate::remote::{Entry, EntryKind};
 use std::time::SystemTime;
@@ -129,23 +129,32 @@ impl Panel {
         }
     }
 
-    /// `N listed = N bytes` (the entries but `..`, the bytes of the files), and the free space.
+    /// `N Listed = N bytes` (the entries but `..`, the bytes of the files), then the free space
+    /// as `N Bytes Free` — PC Shell's two window feet on one line.
     pub fn footer(&self) -> String {
+        match self.foot_parts() {
+            (listed, Some(free)) => format!("{listed} · {free}"),
+            (listed, None) => listed,
+        }
+    }
+
+    /// The footer's two parts: `N Listed = N bytes`, and `N Bytes Free` when the listing said.
+    pub fn foot_parts(&self) -> (String, Option<String>) {
         let listed: Vec<&Entry> = self.entries.iter().filter(|e| e.name != UP).collect();
         let bytes: u128 = listed
             .iter()
             .filter(|e| e.kind == EntryKind::File)
             .map(|e| u128::from(e.size))
             .sum();
-        let mut line = format!(
-            "{} listed = {} bytes",
+        let count = format!(
+            "{} Listed = {} bytes",
             grouped(listed.len() as u128),
             grouped(bytes)
         );
-        if let Some(free) = self.free {
-            line.push_str(&format!(" · {} bytes free", grouped(u128::from(free))));
-        }
-        line
+        let free = self
+            .free
+            .map(|free| format!("{} Bytes Free", grouped(u128::from(free))));
+        (count, free)
     }
 }
 
@@ -205,19 +214,35 @@ pub fn size_cell(entry: &Entry) -> String {
     }
 }
 
+/// The Size column's text in `cells` characters: [`size_cell`] when it fits, else the size in
+/// the smallest unit (KB, MB, GB, TB, PB, EB — powers of 1000, rounded) that does — a size is
+/// never cut.
+pub fn size_in(entry: &Entry, cells: usize) -> String {
+    let exact = size_cell(entry);
+    if exact.chars().count() <= cells || entry.kind != EntryKind::File || entry.name == UP {
+        return exact;
+    }
+    let mut div: u128 = 1;
+    for unit in ["KB", "MB", "GB", "TB", "PB", "EB"] {
+        div *= 1000;
+        let value = (u128::from(entry.size) + div / 2) / div;
+        let text = format!("{} {unit}", grouped(value));
+        if text.chars().count() <= cells {
+            return text;
+        }
+    }
+    exact
+}
+
 /// The Date and Time columns, in local time (`2026-11-19`, `14:03`); blank for `..` and for an
 /// entry whose attributes could not be read.
 pub fn date_cells(entry: &Entry) -> (String, String) {
     if entry.name == UP || entry.kind == EntryKind::Unknown {
         return (String::new(), String::new());
     }
-    let secs = unix_secs(entry.mtime) as libc::time_t;
-    // SAFETY: an all-zero tm is a valid value to be overwritten.
-    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
-    // SAFETY: both pointers are valid for the call; localtime_r is the thread-safe variant.
-    if unsafe { libc::localtime_r(&secs, &mut tm) }.is_null() {
+    let Some(tm) = crate::gui::chrome::local_tm(unix_secs(entry.mtime)) else {
         return (String::new(), String::new());
-    }
+    };
     (
         format!(
             "{:04}-{:02}-{:02}",

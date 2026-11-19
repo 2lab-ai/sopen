@@ -86,7 +86,12 @@ sopen myserver:/srv/app        # two panels on the folder, as in Total Commander
 
 A folder opens in sopen's own window: two file panels side by side, each listing `..`, then the
 folders, then the files (Name · Ext · Size · Date · Time; hidden files dimmed), with
-`N listed = N bytes` and the free space at the foot.
+`N Listed = N bytes` and `N Bytes Free` at the foot.
+
+Every sopen window looks like PC Shell from the DOS PC Tools 5.5 / 6: the VGA text font, blue
+windows framed in box lines (a double line around the active one) with their title in the frame,
+the light-red highlight bar, the title row with the clock, the F-key row at the bottom (only the
+keys that work there are labelled), cyan dialogs with a shadow.
 
 | Key | |
 |---|---|
@@ -98,6 +103,7 @@ folders, then the files (Name · Ext · Size · Date · Time; hidden files dimme
 | `F3` | view the file (as Enter) |
 | `F4` | open the folder or file in VS Code / Zed |
 | `Esc` / `F3` in a viewer | back to the list, the bar where it was |
+| `F3` in a window of its own | close it, as `⌘W` (asks first when there are unsaved changes) |
 
 Text shows read-only with syntax highlighting and line numbers, a page at a time (a file of any
 size opens alike); images open in the image window, video and audio in the media window, anything
@@ -121,7 +127,7 @@ inside moves it), then:
 | `⌘V` | paste into the rectangle: a picture as the toolbar's **Paste** choice says (**Stretch**, the default, to the rectangle's size; **Fit** keeps its aspect, centred, the rest in the background colour; **1:1** unscaled at the rectangle's top-left, cut off at its edges), text in the **Text** colour, wrapped to the rectangle's width and as large as fits. With no rectangle a picture goes 1:1 at the top-left, text at the top-left in letters a tenth of the image's height, and what was pasted becomes the rectangle |
 | `Esc` | clear the rectangle |
 | `⌘Z` / `⇧⌘Z` (Ctrl on Linux) | undo / redo |
-| `⌘S` | Save: the original is first backed up locally (path printed), then overwritten in place in the same format (PNG, WebP, BMP, TIFF lossless; JPEG quality 95). A server without `posix-rename@openssh.com` cannot replace a file safely: Save is off there, Save copy works |
+| `⌘S` or `F5` | Save: the original is first backed up locally (path printed), then overwritten in place in the same format (PNG, WebP, BMP, TIFF lossless; JPEG quality 95). A server without `posix-rename@openssh.com` cannot replace a file safely: Save is off there, Save copy works |
 | `⇧⌘S` | Save copy: `<name>.edited.<ext>` next to the original |
 
 The second toolbar row holds the **Paste** choice and two colours: **Background** (white by
@@ -171,16 +177,18 @@ exist, or a path ending in '/' is refused before anything is transferred. A down
 changes meanwhile is not saved; that check is best-effort (the remote file's size and modification
 time, and the bytes received).
 
-The hex editor shows rows of 16 bytes — offset, hex, ASCII — and reads only what is on screen, so a
-file of any size scrolls the same. It overwrites bytes and never changes the file's size:
+The hex editor shows rows of 16 bytes — the offset in decimal and hex (`0016(0010)`), the hex, and
+the bytes as a DOS screen shows them (code page 437: `☺ ♥ ▲`, `é`, `░ ═`) — and reads only what is
+on screen, so a file of any size scrolls the same. It overwrites bytes and never changes the file's
+size:
 
 | Key | |
 |---|---|
 | arrows, `PgUp` / `PgDn`, `Home` / `End`, `⌘Home` / `⌘End` | move the cursor (row start / end, file start / end); a click places it |
-| hex digits / characters | overwrite: in the hex column two digits per byte, in the ASCII column one character; `Tab` switches the column |
-| `⌘G` | go to an offset (`0x…` or decimal) |
+| hex digits / characters | overwrite: in the hex column two digits per byte, in the ASCII column one character (printable ASCII); `Tab` or `F8` switches the column |
+| `⌘G` or `F6` | go to an offset (`0x…` or decimal) |
 | `⌘Z` / `⇧⌘Z` (Ctrl on Linux) | undo / redo |
-| `⌘S` | Save: the original is first backed up locally (path printed), then overwritten in place, as image Save does. When it is refused, the window names where your edits were kept: if the file changed since it was opened, nothing is written and the edits are listed in a `.hexpatch-….txt` file; if the overwrite itself is refused (the remote changed), the staged edited file is kept |
+| `⌘S` or `F5` | Save: the original is first backed up locally (path printed), then overwritten in place, as image Save does. When it is refused, the window names where your edits were kept: if the file changed since it was opened, nothing is written and the edits are listed in a `.hexpatch-….txt` file; if the overwrite itself is refused (the remote changed), the staged edited file is kept |
 | `⇧⌘S` | Save copy: `<name>.edited.<ext>` next to the original |
 
 If a local file saved in place is changed by someone else right after the save, the window turns
@@ -231,4 +239,12 @@ H.264 + AAC; audio: the source's codec) and uploaded next to the original as
 
 Under construction — see [`.prd/01-spec.md`](.prd/01-spec.md).
 
-License: MIT
+License: MIT (the font below keeps its own licence).
+
+## Credits
+
+The windows' font is PxPlus IBM VGA 8x16 (`assets/fonts/PxPlus_IBM_VGA_8x16.ttf`) from
+[The Ultimate Oldschool PC Font Pack](https://int10h.org/oldschool-pc-fonts/) by VileR, licensed
+under [CC BY-SA 4.0](https://creativecommons.org/licenses/by-sa/4.0/)
+(`assets/fonts/LICENSE-PxPlus_IBM_VGA_8x16.txt`); `sopen --version` and `sopen --help` print the
+credit too. The look follows PC Tools by Central Point Software.

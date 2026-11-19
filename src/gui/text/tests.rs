@@ -1553,3 +1553,36 @@ fn a_reread_after_the_shebang_changed_switches_grammar() {
     reread(&mut drv, &mut named, 2);
     assert_eq!(grammar(&named), Some("Rust"));
 }
+
+/// As on a DOS screen, a control character shows as its code page 437 glyph (an escape
+/// sequence reads `←[31m`), one cell each, so the columns stay where they are.
+#[test]
+fn control_characters_show_as_their_glyphs() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut win = viewer(tmp.path(), "log.txt", "a\u{1}b\u{1b}[31mred\u{7f}\nnext\n");
+    let mut drv = Driver::new(600.0, 400.0);
+    drv.until(&mut win, 5, |w| w.ready());
+    assert!(drv.find_text("a☺b←[31mred⌂").is_some());
+    assert!(drv.find_text("next").is_some());
+}
+
+/// Only the columns that fit are laid out: a line of thousands of characters is drawn as the
+/// part on screen (its start whole, inside the window), and Right brings the next part.
+#[test]
+fn a_long_line_is_laid_out_as_far_as_the_window_shows() {
+    let tmp = tempfile::tempdir().unwrap();
+    let line: String = (0..400).map(|i| format!("{i:04} ")).collect();
+    let mut win = viewer(tmp.path(), "wide.txt", &format!("{line}\n"));
+    let mut drv = Driver::new(600.0, 400.0);
+    drv.until(&mut win, 5, |w| w.ready());
+    let shown = drv
+        .text_starting_with("0000 0001")
+        .expect("the start, whole");
+    assert!(shown.len() < 100, "{} characters laid out", shown.len());
+    assert!(line.starts_with(&shown));
+    drv.key(&mut win, Key::ArrowRight, Modifiers::NONE);
+    let moved = drv
+        .text_starting_with(&line[8..20])
+        .expect("scrolled by eight columns");
+    assert!(line[8..].starts_with(&moved));
+}

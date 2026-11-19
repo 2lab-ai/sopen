@@ -36,6 +36,16 @@ pub fn version_text() -> String {
     format!("{} ({channel} {rev12})", env!("CARGO_PKG_VERSION"))
 }
 
+/// The credit the windows' font asks for (CC BY-SA 4.0, `assets/fonts/`): it travels with the
+/// binary, in `--version` and the long help — a Homebrew install has nothing else.
+pub const FONT_CREDIT: &str = "Font: PxPlus IBM VGA 8x16 by VileR (The Ultimate Oldschool PC \
+                               Font Pack, https://int10h.org/oldschool-pc-fonts/), CC BY-SA 4.0";
+
+/// `--version`: the version line, then [`FONT_CREDIT`] (`-V` is the version line alone).
+pub fn long_version_text() -> String {
+    format!("{}\n{FONT_CREDIT}", version_text())
+}
+
 /// A size for people: `999 B`, `1.5 MB` (powers of 1000).
 pub fn human(bytes: u64) -> String {
     const UNITS: [&str; 4] = ["B", "KB", "MB", "GB"];

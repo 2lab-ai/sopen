@@ -7,6 +7,7 @@
 //! [`HexFile`] the write side; both are window-free, so the tests and the `SOPEN_AUTOSAVE` hook
 //! run the exact code the window's buttons run.
 
+use super::chrome::{self, HEX_KEYS};
 use super::image::CANNOT_REPLACE;
 use super::{Hooks, Origin, Outcome, Status};
 use crate::remote::WriteOutcome;
@@ -30,8 +31,8 @@ const PAGES: usize = 64;
 const UNDO_STEPS: usize = 100_000;
 /// The window's size when it opens as a hex window.
 pub const WINDOW: [f32; 2] = [760.0, 560.0];
-/// Width of the scroll bar at the grid's right edge.
-const SCROLLBAR: f32 = 12.0;
+/// The window's title in its frame, as PC Shell names its hex view.
+const TITLE: &str = "File Edit";
 
 /// An offset as typed: `0x…` (hex) or decimal digits.
 pub fn parse_offset(text: &str) -> Result<u64> {
@@ -81,6 +82,19 @@ pub fn offset_digits(size: u64) -> usize {
     bits.div_ceil(4).max(4)
 }
 
+/// Decimal digits the offset column needs for a file of `size` bytes (at least 4).
+pub fn decimal_digits(size: u64) -> usize {
+    size.saturating_sub(1).to_string().len().max(4)
+}
+
+/// A row's offset as PC Shell's File Edit prints it: decimal, then hex in parentheses —
+/// `0016(0010)` — each as wide as the file's last offset needs (at least four digits), so the
+/// column keeps its width down the file.
+pub fn offset_text(at: u64, size: u64) -> String {
+    let (dec, hex) = (decimal_digits(size), offset_digits(size));
+    format!("{at:0dec$}({at:0hex$X})")
+}
+
 /// One row's 16 (or fewer, at the end) bytes as the hex column shows them: two digits each,
 /// one space between, two between the 8th and the 9th.
 pub fn hex_cells(bytes: &[Option<u8>]) -> String {
@@ -97,11 +111,13 @@ pub fn hex_cells(bytes: &[Option<u8>]) -> String {
     out
 }
 
-/// The ASCII column's character for a byte: itself when printable, else `.`.
+/// The ASCII column's character for a byte: its code page 437 glyph, as PC Shell shows the
+/// column — printable ASCII as itself, ☺ ♥ ▲ … for the control bytes, Ç é ░ ═ … for the upper
+/// half, a blank for 0x00 — and `?` for a byte that could not be read (`??` beside it).
 pub fn ascii_char(b: Option<u8>) -> char {
     match b {
-        Some(b @ 0x20..=0x7e) => b as char,
-        _ => '.',
+        Some(b) => chrome::cp437(b),
+        None => '?',
     }
 }
 
@@ -1188,7 +1204,7 @@ pub fn open(file: HexFile, hooks: &Hooks, notices: Vec<String>) -> Result<Outcom
     }
     let outcome: Arc<Mutex<Outcome>> = Arc::default();
     let leftover: Arc<Mutex<Option<Job>>> = Arc::default();
-    let window = HexWindow::new(
+    let mut window = HexWindow::new(
         file,
         doc,
         cursor,
@@ -1196,6 +1212,7 @@ pub fn open(file: HexFile, hooks: &Hooks, notices: Vec<String>) -> Result<Outcom
         outcome.clone(),
         leftover.clone(),
     );
+    window.ask_close = hooks.state.ask_close;
     let run = super::run_window(&title, WINDOW, window, hooks);
     finish(&leftover, &outcome);
     run?;
@@ -1213,9 +1230,9 @@ pub(super) fn embedded(
 ) -> Result<HexWindow> {
     let mut doc = HexDoc::new(file.base(), file.size());
     let cursor = apply_state(&mut doc, hooks)?;
-    Ok(HexWindow::new(
-        file, doc, cursor, notices, outcome, leftover,
-    ))
+    let mut window = HexWindow::new(file, doc, cursor, notices, outcome, leftover);
+    window.ask_close = hooks.state.ask_close;
+    Ok(window)
 }
 
 /// The hex window inside another window (the file browser): the window [`open`] shows, without
@@ -1438,6 +1455,11 @@ pub(super) struct HexWindow {
     /// while the button is down.
     notices: Vec<String>,
     pending_notices: Option<Vec<String>>,
+    /// `SOPEN_STATE` `close=ask`: closing is asked for on the first pass.
+    ask_close: bool,
+    /// Saves started so far (tests: a key starts exactly one).
+    #[cfg(test)]
+    pub(super) save_starts: usize,
 }
 
 impl Drop for HexWindow {
@@ -1509,6 +1531,9 @@ impl HexWindow {
             opened,
             notices: Vec::new(),
             pending_notices: None,
+            ask_close: false,
+            #[cfg(test)]
+            save_starts: 0,
         }
     }
 
@@ -1584,6 +1609,10 @@ impl HexWindow {
             if !self.doc.dirty() {
                 return self.status = Status::info("no changes to save");
             }
+        }
+        #[cfg(test)]
+        {
+            self.save_starts += 1;
         }
         let patches = self.doc.patches().clone();
         let snapshot = patches.clone();
@@ -1808,7 +1837,7 @@ impl HexWindow {
             }
             let room = (ui.available_width() - 170.0).max(120.0);
             ui.add(
-                egui::TextEdit::singleline(&mut self.keep_to)
+                chrome::field(&mut self.keep_to)
                     .id(keep_id())
                     .desired_width(room),
             );
@@ -1837,6 +1866,11 @@ impl HexWindow {
         }
         if goto_owns {
             return;
+        }
+        // F5 is PC Shell's Save, as Cmd/Ctrl+S — but a plain key: never while a field has
+        // the typing.
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::F5)) {
+            self.start(ctx, JobKind::Save { close_after: false });
         }
         if command_key(ctx, Key::Z, true) {
             self.redo();
@@ -1884,7 +1918,8 @@ impl HexWindow {
         if pressed(Key::End) {
             self.place(row_start + ROW - 1, self.cursor.pane);
         }
-        if pressed(Key::Tab) {
+        // F8 is PC Shell's Asc/hx: the typing column, as Tab.
+        if pressed(Key::Tab) || pressed(Key::F8) {
             let pane = match self.cursor.pane {
                 Pane::Hex => Pane::Ascii,
                 Pane::Ascii => Pane::Hex,
@@ -1926,7 +1961,7 @@ impl HexWindow {
             ui.label("Go to");
             let field = ui
                 .add(
-                    egui::TextEdit::singleline(&mut self.goto)
+                    chrome::field(&mut self.goto)
                         .id(goto_id())
                         .hint_text("0x… or decimal")
                         .desired_width(130.0),
@@ -2027,18 +2062,29 @@ impl HexWindow {
         });
     }
 
-    /// The rows: offsets, hex, ASCII, the cursor in both columns, changed bytes marked; and the
-    /// scroll bar. Only the rows on screen are read and painted.
+    /// The window, as PC Shell's File Edit: its frame, the file on its first line, then the
+    /// rows — offsets, hex, ASCII, the cursor in both columns, changed bytes marked — and the
+    /// scroll bar on its right border. Only the rows on screen are read and painted.
     fn grid(&mut self, ui: &mut egui::Ui, goto_focused: bool) {
         let ctx = ui.ctx().clone();
-        let panel = ui.max_rect();
-        let font = egui::TextStyle::Monospace.resolve(ui.style());
+        let outer = ui.max_rect();
+        let p = chrome::Palette::of(ui.visuals());
+        let panel = chrome::frame(&ui.painter_at(outer), outer, TITLE, true);
+        let font = chrome::mono(ui);
         let (cw, text_h) = ctx.fonts_mut(|f| (f.glyph_width(&font, '0'), f.row_height(&font)));
-        let row_h = (text_h + 3.0).ceil();
-        let bar = Rect::from_min_max(Pos2::new(panel.right() - SCROLLBAR, panel.top()), panel.max);
+        // Rows touch, a cell apart, as on a text screen.
+        let row_h = text_h.ceil();
+        let bar = Rect::from_min_max(
+            Pos2::new(panel.right(), panel.top()),
+            Pos2::new(panel.right() + chrome::CELL.x, panel.bottom()),
+        );
+        // The file's name on the first line, a blank line, then the rows.
         let rows_rect = Rect::from_min_max(
-            Pos2::new(panel.left(), panel.top() + 4.0),
-            Pos2::new(bar.left(), panel.bottom()),
+            Pos2::new(
+                panel.left(),
+                (panel.top() + 2.0 * row_h).min(panel.bottom()),
+            ),
+            panel.max,
         );
         let size = self.doc.size();
         let total = self.doc.rows();
@@ -2093,22 +2139,19 @@ impl HexWindow {
                 };
             }
         }
-        // The scroll bar: the thumb follows the pointer while the button is down on the track.
-        let thumb_h = if total == 0 {
-            bar.height()
-        } else {
-            (bar.height() * visible as f32 / total as f32)
-                .clamp(20.0_f32.min(bar.height()), bar.height())
-        };
+        // The scroll bar: the thumb (a cell, between the arrows) follows the pointer while the
+        // button is down on the bar.
         if bar_resp.is_pointer_button_down_on() && max_top > 0 {
-            if let Some(p) = bar_resp.interact_pointer_pos() {
-                let room = (bar.height() - thumb_h).max(1.0);
-                let frac = ((p.y - bar.top() - thumb_h / 2.0) / room).clamp(0.0, 1.0);
+            if let Some(at) = bar_resp.interact_pointer_pos() {
+                let cell = chrome::CELL.y;
+                let room = (bar.height() - 3.0 * cell).max(1.0);
+                let frac = ((at.y - bar.top() - 1.5 * cell) / room).clamp(0.0, 1.0);
                 self.top_row = (f64::from(frac) * max_top as f64).round() as u64;
             }
         }
 
-        let hex_x = rows_rect.left() + 8.0 + cw * (offset_digits(size) + 2) as f32;
+        let offset_chars = offset_text(0, size).chars().count();
+        let hex_x = rows_rect.left() + cw * (offset_chars + 1) as f32;
         let ascii_x = hex_x + cw * (HEX_CHARS + 2) as f32;
         // A click places the cursor on the byte under it, in that column.
         if resp.clicked() || resp.drag_started_by(egui::PointerButton::Primary) {
@@ -2144,26 +2187,27 @@ impl HexWindow {
         self.top_row = self.top_row.min(max_top);
 
         let visuals = ui.visuals().clone();
-        let back = ui.painter_at(panel);
-        back.rect_filled(panel, 0.0, visuals.extreme_bg_color);
         // The rows never run under the scroll bar (on a narrow window the ASCII column is cut).
-        let painter = ui.painter_at(Rect::from_min_max(
+        let painter = ui.painter_at(panel);
+        let title = chrome::fit_left(&ctx, &self.title, &font, panel.width());
+        painter.text(
             panel.min,
-            Pos2::new(bar.left(), panel.bottom()),
-        ));
+            egui::Align2::LEFT_TOP,
+            title,
+            font.clone(),
+            p.text,
+        );
         if size == 0 {
             painter.text(
                 rows_rect.center(),
                 egui::Align2::CENTER_CENTER,
                 "empty file — nothing to show",
-                egui::FontId::proportional(14.0),
-                visuals.weak_text_color(),
+                font.clone(),
+                p.dim,
             );
         }
-        let digits = offset_digits(size);
-        let text = visuals.text_color();
-        let changed_fg = visuals.warn_fg_color;
-        let changed_bg = visuals.warn_fg_color.gamma_multiply(0.18);
+        let text = p.text;
+        let (changed_fg, changed_bg) = (p.changed, p.changed_back);
         let cursor_bg = visuals.selection.bg_fill;
         let cursor_line = egui::Stroke::new(1.0, visuals.selection.stroke.color);
         let rows = ((rows_rect.height() / row_h).ceil() as u64).min(total - self.top_row);
@@ -2173,11 +2217,11 @@ impl HexWindow {
             let off = row * ROW;
             let n = (size - off).min(ROW);
             painter.text(
-                Pos2::new(rows_rect.left() + 8.0, y),
+                Pos2::new(rows_rect.left(), y),
                 egui::Align2::LEFT_TOP,
-                format!("{off:0digits$X}"),
+                offset_text(off, size),
                 font.clone(),
-                visuals.weak_text_color(),
+                p.dim,
             );
             let cell = |x: f32, chars: f32| {
                 Rect::from_min_size(
@@ -2194,20 +2238,26 @@ impl HexWindow {
                 let b = self.doc.byte(at);
                 bytes.push(b);
                 let changed = self.doc.changed(at);
-                let color = if changed { changed_fg } else { text };
+                let color = if at == self.cursor.at {
+                    p.bar_text
+                } else if changed {
+                    changed_fg
+                } else {
+                    text
+                };
                 let hx = hex_x + cw * hex_col(i) as f32;
                 let ax = ascii_x + cw * i as f32;
                 if changed {
-                    painter.rect_filled(cell(hx, 2.0), 2.0, changed_bg);
-                    painter.rect_filled(cell(ax, 1.0), 2.0, changed_bg);
+                    painter.rect_filled(cell(hx, 2.0), 0.0, changed_bg);
+                    painter.rect_filled(cell(ax, 1.0), 0.0, changed_bg);
                 }
                 if at == self.cursor.at {
                     let (active, other) = match self.cursor.pane {
                         Pane::Hex => (cell(hx, 2.0), cell(ax, 1.0)),
                         Pane::Ascii => (cell(ax, 1.0), cell(hx, 2.0)),
                     };
-                    painter.rect_filled(active, 2.0, cursor_bg);
-                    painter.rect_stroke(other, 2.0, cursor_line, egui::StrokeKind::Inside);
+                    painter.rect_filled(active, 0.0, cursor_bg);
+                    painter.rect_stroke(other, 0.0, cursor_line, egui::StrokeKind::Inside);
                     if self.cursor.pane == Pane::Hex && self.cursor.low {
                         // The next digit goes into the low nibble: underline it.
                         let x = hx + cw;
@@ -2236,15 +2286,11 @@ impl HexWindow {
             painter.galley(Pos2::new(ascii_x, y), ascii_galley, text);
         }
         self.rows_painted = rows;
-        // The scroll bar's track and thumb.
-        back.rect_filled(bar.shrink(2.0), 4.0, visuals.faint_bg_color);
-        if max_top > 0 {
-            let room = bar.height() - thumb_h;
-            let top = bar.top() + room * (self.top_row as f64 / max_top as f64) as f32;
-            let thumb =
-                Rect::from_min_size(Pos2::new(bar.left(), top), Vec2::new(SCROLLBAR, thumb_h));
-            back.rect_filled(thumb.shrink(2.0), 4.0, visuals.widgets.inactive.bg_fill);
-        }
+        chrome::scroll_bar(
+            &ui.painter_at(outer),
+            bar,
+            (max_top > 0).then(|| (self.top_row as f64 / max_top as f64) as f32),
+        );
         self.layout = Some(Layout {
             rows: rows_rect,
             row_h,
@@ -2259,9 +2305,9 @@ impl HexWindow {
         if !self.prompt {
             return;
         }
-        let modal = egui::Modal::new(egui::Id::unique("sopen-hex-unsaved")).show(ctx, |ui| {
+        let id = egui::Id::unique("sopen-hex-unsaved");
+        let modal = super::chrome::dialog(ctx, id, "Unsaved changes", |ui| {
             ui.set_width(360.0);
-            ui.heading("Unsaved changes");
             let read_only = self.read_only.is_some();
             ui.label(if read_only {
                 format!(
@@ -2306,7 +2352,16 @@ impl super::Window for HexWindow {
     /// this frame, so an edit made in the same frame counts.
     fn ui(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
-        let cmd_g = !self.locked() && super::command_key(&ctx, Key::G, false);
+        if std::mem::take(&mut self.ask_close) {
+            // `SOPEN_STATE` `close=ask`: as if closing were asked for (the prompt's receipt).
+            self.close_requested();
+        }
+        // F6 is PC Shell's Goto, as Cmd/Ctrl+G — but a plain key: not while a field (Go to,
+        // the read-only path field) has the typing.
+        let cmd_g = !self.locked()
+            && (super::command_key(&ctx, Key::G, false)
+                || (!ctx.text_edit_focused()
+                    && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::F6))));
         if cmd_g {
             self.goto.clear();
             ctx.memory_mut(|m| m.request_focus(goto_id()));
@@ -2320,6 +2375,8 @@ impl super::Window for HexWindow {
             })
             .inner;
         let goto_owns = cmd_g || field.has_focus() || field.lost_focus() || field.clicked();
+        // The F-key row, the window's last (on its own: the browser around it has the row).
+        super::own_keys(ui, HEX_KEYS);
         // The read-only window's path field (laid out below, with the rows) owns the typing of
         // a frame it had the keyboard in, as the Go to field does.
         let keep_had = ctx.memory(|m| m.focused()) == Some(keep_id());
@@ -2369,6 +2426,10 @@ impl super::Window for HexWindow {
 
     fn ready(&self) -> bool {
         self.painted && self.job.is_none()
+    }
+
+    fn keys(&self) -> &'static [chrome::FKey] {
+        HEX_KEYS
     }
 
     fn close_requested(&mut self) -> bool {
