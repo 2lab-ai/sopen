@@ -305,12 +305,26 @@ fn ignorable(c: char) -> bool {
     )
 }
 
-/// `text` composed (Unicode NFC) as it is read, without copying it: Korean copied from a macOS
-/// file name comes decomposed into conjoining jamo (한 = ᄒ ᅡ ᆫ), which the faces draw as loose
-/// letters, not the syllable — composed, it is the syllable.
+/// `text` composed (Unicode NFC), every line break as `\n`, as it is read, without copying it:
+/// Korean copied from a macOS file name comes decomposed into conjoining jamo (한 = ᄒ ᅡ ᆫ),
+/// which the faces draw as loose letters, not the syllable — composed, it is the syllable.
 pub fn composed(text: &str) -> impl Iterator<Item = char> + '_ {
-    let read = text.chars().inspect(|_| read_one());
+    let read = newlines(text.chars().inspect(|_| read_one()));
     icu_normalizer::ComposingNormalizerBorrowed::new_nfc().normalize_iter(stream_safe(read))
+}
+
+/// Windows' `\r\n` and old Mac text's lone `\r` as `\n`. A `\r` left in would take room on the
+/// line before the break — enough, on a nearly full one, to wrap onto a line of its own.
+fn newlines(chars: impl Iterator<Item = char>) -> impl Iterator<Item = char> {
+    let mut chars = chars.peekable();
+    std::iter::from_fn(move || {
+        let c = chars.next()?;
+        if c == '\r' {
+            chars.next_if_eq(&'\n');
+            return Some('\n');
+        }
+        Some(c)
+    })
 }
 
 /// Unicode's Stream-Safe Text Format (UAX #15 §13), so that the normalizer reads only as far
@@ -1069,6 +1083,36 @@ mod tests {
         assert_ne!(han, one("한", &[fonts::fallback()]));
     }
 
+    /// Windows (`\r\n`) and old Mac (`\r`) line breaks are line breaks: the same text with any of
+    /// them draws exactly what it draws with `\n` — also where the line before the break nearly
+    /// fills the rectangle (every width from 40 to 160 px is tried), at a fixed size and filled.
+    #[test]
+    fn any_line_break_draws_like_a_newline() {
+        let lf = "one two three four\nfive six\n\nseven";
+        let mut checked = 0;
+        for crlf in [lf.replace('\n', "\r\n"), lf.replace('\n', "\r")] {
+            for w in 40..=160 {
+                for size in [TextSize::Px(16.0), TextSize::Fill] {
+                    let draw = |text: &str| {
+                        let mut img = white(170, 200);
+                        let rect = [5, 5, w, 190];
+                        let drawn =
+                            draw_text(&mut img, rect, text, BLACK, &[fonts::fallback()], size);
+                        (img, drawn)
+                    };
+                    let ((want, want_drawn), (got, got_drawn)) = (draw(lf), draw(&crlf));
+                    let what = format!("{crlf:?} at {w} px, {size:?}");
+                    assert_eq!(got_drawn, want_drawn, "{what}");
+                    assert_same(&got, &want, &what);
+                    checked += 1;
+                }
+            }
+        }
+        assert_eq!(checked, 2 * 121 * 2);
+        let nl = |t: &str| composed(t).collect::<String>();
+        assert_eq!(nl("a\r\nb\rc\r\r\nd\n\re"), "a\nb\nc\n\nd\n\ne");
+    }
+
     /// Composing keeps what is already composed, composes what is not, and ends a run of more
     /// than 30 combining marks with a grapheme joiner (stream-safe) — never sooner.
     #[test]
@@ -1159,6 +1203,8 @@ mod tests {
                 &format!("e{}", "\u{0301}".repeat(4096)),
             ),
             ("an invisible character", "\u{200B}"),
+            ("Windows line breaks", "\r\n"),
+            ("old Mac line breaks", "\r"),
         ] {
             let mb = |n: usize| piece.repeat((n << 20) / piece.len());
             let one = read_by_layout(&mb(1));

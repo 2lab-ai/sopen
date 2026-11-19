@@ -875,6 +875,23 @@ fn command_v_with_decomposed_korean_pastes_like_composed_korean() {
     );
 }
 
+/// Text copied on Windows (`\r\n` line breaks) pastes the same pixels and the same status as
+/// the same text with `\n`.
+#[test]
+fn command_v_with_windows_line_breaks_pastes_like_newlines() {
+    let paste = |text: &str| {
+        let mut fx = open();
+        fx.select((40.0, 30.0), (200.0, 120.0));
+        fx.drv.paste_text(&mut fx.win, text);
+        (fx.win.doc.img.clone(), fx.win.status.text.clone())
+    };
+    let (lf, said) = paste("one two three\nfour\n\nfive");
+    let (crlf, says) = paste("one two three\r\nfour\r\n\r\nfive");
+    assert_eq!(says, said);
+    assert_eq!(said, "pasted text (24 chars)");
+    assert!(crlf == lf, "CRLF drew other pixels than LF");
+}
+
 /// Text without a rectangle: at the top-left in letters a tenth of the image's height, and
 /// the block it takes becomes the selection.
 #[test]

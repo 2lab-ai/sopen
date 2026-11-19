@@ -213,16 +213,16 @@ symlink keeps its link). A new file is readable by its owner only (0600); a repl
   Cmd/Ctrl+X copies it and fills it with the background colour (white; transparent offered on an image with alpha);
   Cmd/Ctrl+V pastes into it a picture — stretched (the default), fitted (aspect kept, centred, the rest in the
   background colour) or 1:1 (top-left, cut off), chosen on the toolbar's second row — over what is there, or text in
-  the text colour (black), composed to NFC (Finder copies Korean file names decomposed), wrapped to the rectangle's
-  width and as large as fits; Hangul is drawn with an installed font that has it (eframe's system-font fallback
-  finds the same one for the window's own text), and without one it shows as missing-glyph boxes and the status line
-  says Hangul may not render. No rectangle: a picture goes 1:1 at the top-left, text at the top-left in letters a
-  tenth of the image's height, and what was pasted becomes the rectangle. Each cut or paste is one undo step,
-  written only by Save / Save copy; a key held until it repeats counts once (the shortcut is over at its key-up, at
-  Cmd/Ctrl-up or when the window loses focus), a second press pastes again. The shortcuts reach the window as
-  egui's Copy / Cut / Paste / PasteImage
-  events (egui-winit reads and writes the system clipboard with arboard): text wins when the clipboard holds both,
-  and pictures cross it as 8-bit RGBA.
+  the text colour (black), composed to NFC (Finder copies Korean file names decomposed) with `\r\n` and `\r` as line
+  breaks, wrapped to the rectangle's width and as large as fits; Hangul is drawn with an installed font that has it
+  (eframe's system-font fallback finds the same one for the window's own text), and without one it shows as
+  missing-glyph boxes and the status line says Hangul may not render. No rectangle: a picture goes 1:1 at the
+  top-left, text at the top-left in letters a tenth of the image's height, and what was pasted becomes the
+  rectangle. Each cut or paste is one undo step, written only by Save / Save copy; a key held until it repeats
+  counts once (the shortcut is over at its key-up, at Cmd/Ctrl-up or when the window loses focus), a second press
+  pastes again. The shortcuts reach the window as egui's Copy / Cut / Paste / PasteImage events (egui-winit reads
+  and writes the system clipboard with arboard): text wins when the clipboard holds both, and pictures cross it as
+  8-bit RGBA.
 - Encoding keeps the format: PNG lossless, JPEG quality 95, WebP lossless, BMP, TIFF. Animated GIF opens read-only
   (frame 1 shown, Save disabled with a reason; it can still be copied).
 - Never lose data silently: Save keeps the ICC profile and Exif where the format holds them; metadata it does not
