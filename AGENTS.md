@@ -9,8 +9,9 @@ browser (two panels, Total Commander-like; Enter shows a file in the viewer for 
 read-only text viewer with syntax highlighting, or the image, media or hex window below; F4 hands the entry to the
 editor). Text goes to VS Code when it
 is installed (remote ones only with its Remote - SSH extension), otherwise Zed's remote mode; images, video and
-audio open in sopen's own small window with exactly these edits: rectangle crop and rectangle pixelize (images),
-rectangle crop and time cut (video), time cut (audio). Any other file (a zip, any binary) opens a dialog before
+audio open in sopen's own small window with exactly these edits: rectangle crop, rectangle pixelize and clipboard
+copy / cut / paste (images: cut leaves the background colour; paste lays a picture — stretched, fitted or 1:1 — or
+text into the rectangle), rectangle crop and time cut (video), time cut (audio). Any other file (a zip, any binary) opens a dialog before
 anything is downloaded: sopen's hex window (the default; byte overwrite only) or "Save to…" a chosen path;
 `--hex` opens any file in the hex window. It opens on the machine it was typed on, or — with `--target HOST`,
 `SOPEN_TARGET` or `target` in sopen's config — on HOST's screen, by running HOST's installed sopen with `--here`
@@ -27,8 +28,8 @@ just check   # cargo fmt --check · cargo clippy --all-targets --locked -- -D wa
 
 A change is done when the gate is green on macOS and Linux (CI) and, for anything user-visible, a receipt
 exists: a command output or a window screenshot that someone actually looked at. Locally, tests that need ffmpeg,
-zsh or fish skip with a note when it is missing; CI installs them and sets `SOPEN_REQUIRE_FFMPEG=1` and
-`SOPEN_REQUIRE_SHELLS=1`, so there they fail instead.
+zsh, fish or node skip with a note when it is missing; CI installs them (node is on the runners) and sets
+`SOPEN_REQUIRE_FFMPEG=1`, `SOPEN_REQUIRE_SHELLS=1` and `SOPEN_REQUIRE_NODE=1`, so there they fail instead.
 
 ## Rules
 
@@ -41,8 +42,9 @@ zsh or fish skip with a note when it is missing; CI installs them and sets `SOPE
   never use a replacing rename to publish it. The binary dialog's "Save to…" fills a file in a private staging
   folder and publishes it complete by a hard link, never over anything (spec §6a).
 - **No new edit features without the owner.** The edit list above is the whole list (owner, 2026-11-11; hex
-  overwrite added by spec §1 message 9). The file browser (message 12) adds viewing, not file operations: no
-  copy, move, delete, rename or new folder, and its viewers keep exactly their own edits.
+  overwrite added by spec §1 message 9; image clipboard copy / cut / paste by message 12). The file browser
+  (message 12) adds viewing, not file operations: no copy, move, delete, rename or new folder, and its viewers
+  keep exactly their own edits.
 - **ffmpeg/ffprobe are external programs**, resolved at runtime (`SOPEN_FFMPEG` / `SOPEN_FFPROBE`, then PATH).
   Do not link libav*.
 - Tests must not need ssh or a network: the remote layer sits behind a trait with a local-filesystem
@@ -70,6 +72,8 @@ prompts on close.
 | `SOPEN_RENDERER=wgpu\|glow` | Force a renderer (default: wgpu, glow when wgpu does not start; `WGPU_BACKEND=dx12` on macOS forces that fallback). |
 | `SOPEN_CODE=<path>` | Use this VS Code CLI for text and for the file browser's F4 (a folder itself opens in the browser); an empty value means VS Code is absent. A local setting, not forwarded by `--target`. |
 | `VSCODE_EXTENSIONS=<dir>` | VS Code's own extensions-dir variable; when non-empty sopen looks there (instead of `~/.vscode/extensions`) for Remote - SSH before opening a remote path in VS Code. Tests point it at a temp dir. Not forwarded by `--target`. |
+| `SOPEN_RAISE=0\|wait` | KDE Plasma (spec §3, msg 11): `0` leaves the editor's window where KWin put it (tests/cli.rs sets it, so a test run in a KDE session never moves a real window); `wait` brings it forward in sopen's own process, about 3 s, instead of a detached `sopen --raise-window`, so a test sees every D-Bus call before sopen exits. HOST's own setting: not forwarded by `--target`. |
+| `sopen --raise-window code\|zed --raise-caption=<name>` | Hidden, internal: the detached child. It loads one KWin script for the opened `<name>` and runs it once, through `busctl --user` (else `qdbus6`/`qdbus`) on PATH, then unloads it ~3 s later. It prints nothing and always exits 0. Tests run it with a stand-in `busctl` first on PATH. The script's behaviour is tested under node against a stand-in `workspace` with signals (`tests/kwin-script.mjs`). |
 | `SOPEN_TARGET_BIN=<path>` | `--target` runs this sopen binary on HOST (a build not installed there yet) instead of the one on HOST's PATH or in its Homebrew / cargo install paths. A `--target` run carries this and the hooks above, and `SOPEN_LOG`, to HOST; settings naming local paths stay here. |
 | `SOPEN_CONFIG=<file>` | The config file to use instead of `$XDG_CONFIG_HOME/sopen/config.toml` / `~/.config/sopen/config.toml` (tests point it at a temp file, so the owner's default target never forwards a test run). |
 | `sopen --selftest-audio <file>` | Hidden: play the file on the real output device at gain 0 for ~2 s; prints `callbacks=N underruns=M device=<name> … decoder=ffmpeg\|wav` (a WAV is read in-process where there is no ffmpeg). |

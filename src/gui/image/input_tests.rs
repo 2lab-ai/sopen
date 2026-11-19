@@ -5,7 +5,7 @@
 //! read from the pixels, independent of the screen ↔ image mapping.
 
 use super::*;
-use crate::gui::testkit::{command, Driver};
+use crate::gui::testkit::{command, key_up, Driver};
 use crate::remote::{LocalFs, RemoteFs};
 use eframe::egui::{Key, Modifiers, PointerButton};
 use image::{GenericImageView, Rgb};
@@ -606,4 +606,700 @@ fn the_close_during_save_hint_is_shown_whole_on_a_narrow_window() {
         fx.drv.find_text(CLOSES_AFTER_SAVE).is_some(),
         "shown whole: {CLOSES_AFTER_SAVE}"
     );
+}
+
+// ---------------------------------------------------------------------------------------------
+// The clipboard (spec §1 message 12): Cmd/Ctrl+C, X and V arrive as egui-winit sends them
+// ([`Driver::copy`] and the rest), and what goes to the system clipboard is read off the
+// commands eframe hands back to egui-winit.
+
+const WHITE: [u8; 4] = [255, 255, 255, 255];
+const BLUE: [u8; 4] = [0, 0, 255, 255];
+const RED: [u8; 4] = [255, 0, 0, 255];
+
+/// A `w`×`h` picture, blue on its left half and red on its right, as egui-winit hands a
+/// pasted image over.
+fn halves(w: u32, h: u32) -> egui::ColorImage {
+    let img =
+        image::RgbaImage::from_fn(w, h, |x, _| image::Rgba(if x < w / 2 { BLUE } else { RED }));
+    egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], img.as_raw())
+}
+
+/// The images the passes since the last call put on the clipboard.
+fn copied_images(fx: &mut Fixture) -> Vec<egui::ColorImage> {
+    fx.drv
+        .take_commands()
+        .into_iter()
+        .filter_map(|c| match c {
+            egui::OutputCommand::CopyImage(image) => Some(image),
+            _ => None,
+        })
+        .collect()
+}
+
+fn pixel(img: &egui::ColorImage, x: usize, y: usize) -> [u8; 4] {
+    img.pixels[y * img.width() + x].to_srgba_unmultiplied()
+}
+
+/// Every pixel of `img` outside `rect` is as in `before`.
+fn untouched_outside(img: &DynamicImage, before: &DynamicImage, [rx, ry, rw, rh]: [u32; 4]) {
+    for (x, y, p) in img.pixels() {
+        let inside = (rx..rx + rw).contains(&x) && (ry..ry + rh).contains(&y);
+        if !inside {
+            assert_eq!(
+                p,
+                before.get_pixel(x, y),
+                "({x},{y}) is outside {rx},{ry} {rw}×{rh}"
+            );
+        }
+    }
+}
+
+/// Cmd/Ctrl+C with a rectangle puts exactly its pixels on the clipboard as an image; the
+/// picture is not touched (C alone crops — Cmd/Ctrl+C must not) and the rectangle stays.
+#[test]
+fn command_c_copies_the_rectangle_as_an_image() {
+    let mut fx = open();
+    fx.select((40.0, 30.0), (100.0, 80.0));
+    let before = fx.win.doc.img.clone();
+    fx.drv.take_commands();
+    fx.drv.copy(&mut fx.win);
+    let copied = copied_images(&mut fx);
+    assert_eq!(copied.len(), 1, "one image to the clipboard");
+    assert_eq!(copied[0].size, [60, 50]);
+    assert_eq!(pixel(&copied[0], 0, 0), [40, 30, 0, 255]);
+    assert_eq!(pixel(&copied[0], 59, 49), [99, 79, 0, 255]);
+    assert_eq!(fx.win.doc.img, before, "not cropped, not changed");
+    assert!(!fx.win.doc.can_undo());
+    assert_eq!(fx.rect(), Some([40, 30, 60, 50]), "still selected");
+    assert_eq!(fx.win.status.text, "copied 60×50");
+}
+
+#[test]
+fn command_c_without_a_rectangle_copies_the_whole_image() {
+    let mut fx = open();
+    fx.drv.take_commands();
+    fx.drv.copy(&mut fx.win);
+    let copied = copied_images(&mut fx);
+    assert_eq!(copied.len(), 1);
+    assert_eq!(copied[0].size, [W as usize, H as usize]);
+    assert_eq!(pixel(&copied[0], 239, 159), [239, 159, 0, 255]);
+    assert_eq!(fx.win.status.text, "copied 240×160");
+}
+
+/// Cmd/Ctrl+X: the rectangle's pixels go to the clipboard and the rectangle — only it — is left
+/// in the background colour (white by default); Cmd/Ctrl+Z brings back exactly what it had.
+#[test]
+fn command_x_cuts_the_rectangle_to_the_clipboard_and_leaves_the_background() {
+    let mut fx = open();
+    let before = fx.win.doc.img.clone();
+    fx.select((40.0, 30.0), (100.0, 80.0));
+    fx.drv.take_commands();
+    fx.drv.cut(&mut fx.win);
+    let copied = copied_images(&mut fx);
+    assert_eq!(copied.len(), 1, "one image to the clipboard");
+    assert_eq!(copied[0].size, [60, 50]);
+    assert_eq!(pixel(&copied[0], 0, 0), [40, 30, 0, 255]);
+    let img = &fx.win.doc.img;
+    for (x, y) in [(40, 30), (99, 79), (70, 55)] {
+        assert_eq!(img.get_pixel(x, y).0, WHITE, "({x},{y})");
+    }
+    untouched_outside(img, &before, [40, 30, 60, 50]);
+    assert_eq!(img.color(), before.color(), "pixel type kept");
+    assert_eq!(fx.win.status.text, "cut 60×50");
+    assert_eq!(fx.rect(), Some([40, 30, 60, 50]), "still selected");
+    fx.key(Key::Z, command(false));
+    assert_eq!(fx.win.doc.img, before, "undo restores the exact pixels");
+}
+
+#[test]
+fn command_x_without_a_rectangle_cuts_nothing() {
+    let mut fx = open();
+    let before = fx.win.doc.img.clone();
+    fx.drv.take_commands();
+    fx.drv.cut(&mut fx.win);
+    assert!(copied_images(&mut fx).is_empty());
+    assert_eq!(fx.win.doc.img, before);
+    assert!(!fx.win.doc.can_undo());
+    assert_eq!(fx.win.status.text, "draw a rectangle first");
+}
+
+/// Cmd/Ctrl+V with an image on the clipboard stretches it over the rectangle (the default
+/// choice), one undo step.
+#[test]
+fn command_v_stretches_a_pasted_image_over_the_rectangle_by_default() {
+    let mut fx = open();
+    let before = fx.win.doc.img.clone();
+    fx.select((40.0, 30.0), (100.0, 80.0));
+    fx.drv.paste_image(&mut fx.win, halves(30, 25));
+    let img = &fx.win.doc.img;
+    assert_eq!(img.get_pixel(40, 30).0, BLUE);
+    assert_eq!(img.get_pixel(41, 78).0, BLUE);
+    assert_eq!(img.get_pixel(98, 31).0, RED);
+    assert_eq!(img.get_pixel(99, 79).0, RED);
+    untouched_outside(img, &before, [40, 30, 60, 50]);
+    assert_eq!(img.color(), before.color(), "pixel type kept");
+    assert_eq!(fx.win.status.text, "pasted image 30×25 → 60×50 (stretch)");
+    assert_eq!(fx.rect(), Some([40, 30, 60, 50]), "still selected");
+    fx.key(Key::Z, command(false));
+    assert_eq!(fx.win.doc.img, before, "one undo step, exact pixels back");
+}
+
+/// "Fit" (a toolbar choice): the picture keeps its aspect, centred, and the rest of the
+/// rectangle gets the background colour.
+#[test]
+fn the_fit_choice_keeps_the_aspect_and_fills_the_rest_with_the_background() {
+    let mut fx = open();
+    let before = fx.win.doc.img.clone();
+    fx.settle();
+    fx.drv.click_text(&mut fx.win, "Fit");
+    fx.select((40.0, 30.0), (100.0, 80.0));
+    // 30×10 into 60×50: 60×20, rows 45..65.
+    fx.drv.paste_image(&mut fx.win, halves(30, 10));
+    let img = &fx.win.doc.img;
+    assert_eq!(img.get_pixel(41, 31).0, WHITE, "above the picture");
+    assert_eq!(img.get_pixel(41, 44).0, WHITE, "above the picture");
+    assert_eq!(img.get_pixel(41, 45).0, BLUE);
+    assert_eq!(img.get_pixel(98, 64).0, RED);
+    assert_eq!(img.get_pixel(98, 65).0, WHITE, "below the picture");
+    assert_eq!(img.get_pixel(99, 79).0, WHITE, "below the picture");
+    untouched_outside(img, &before, [40, 30, 60, 50]);
+    assert_eq!(fx.win.status.text, "pasted image 30×10 → 60×20 (fit)");
+}
+
+/// "1:1": unscaled at the rectangle's top-left, cut off at its edges; what it does not cover
+/// keeps its pixels.
+#[test]
+fn the_one_to_one_choice_pastes_unscaled_at_the_top_left_clipped_to_the_rectangle() {
+    let mut fx = open();
+    let before = fx.win.doc.img.clone();
+    fx.settle();
+    fx.drv.click_text(&mut fx.win, "1:1");
+    fx.select((40.0, 30.0), (100.0, 80.0));
+    fx.drv.paste_image(&mut fx.win, halves(80, 20));
+    let img = &fx.win.doc.img;
+    assert_eq!(img.get_pixel(40, 30).0, BLUE);
+    assert_eq!(img.get_pixel(79, 49).0, BLUE);
+    assert_eq!(img.get_pixel(80, 30).0, RED);
+    assert_eq!(img.get_pixel(99, 49).0, RED);
+    // Below the picture, inside the rectangle: as before.
+    untouched_outside(img, &before, [40, 30, 60, 20]);
+    assert_eq!(fx.win.status.text, "pasted image 80×20 → 60×20 (1:1)");
+}
+
+/// No rectangle: the picture goes 1:1 at the image's top-left, cut off at its edges, and the
+/// pasted area becomes the selection.
+#[test]
+fn command_v_without_a_rectangle_pastes_at_the_top_left_and_selects_it() {
+    let mut fx = open();
+    let before = fx.win.doc.img.clone();
+    fx.drv.paste_image(&mut fx.win, halves(300, 50));
+    let img = &fx.win.doc.img;
+    assert_eq!(img.get_pixel(0, 0).0, BLUE);
+    assert_eq!(img.get_pixel(149, 49).0, BLUE);
+    assert_eq!(img.get_pixel(150, 0).0, RED);
+    assert_eq!(img.get_pixel(239, 49).0, RED);
+    untouched_outside(img, &before, [0, 0, 240, 50]);
+    assert_eq!(
+        fx.rect(),
+        Some([0, 0, 240, 50]),
+        "the pasted area is selected"
+    );
+    assert_eq!(fx.win.status.text, "pasted image 300×50 → 240×50 (1:1)");
+}
+
+/// Text on the clipboard is drawn into the rectangle in the text colour (black by default) —
+/// nothing outside it changes — and is one undo step.
+#[test]
+fn command_v_draws_pasted_text_inside_the_rectangle_only() {
+    let mut fx = open();
+    let before = fx.win.doc.img.clone();
+    fx.select((40.0, 30.0), (200.0, 120.0));
+    fx.drv.paste_text(&mut fx.win, "sopen 한글");
+    // Exactly what the text drawing makes of it (its own tests check the glyphs).
+    let mut expected = before.clone();
+    let faces: Vec<&fonts::Face> = fonts::hangul()
+        .into_iter()
+        .chain([fonts::fallback()])
+        .collect();
+    let rect = [40, 30, 160, 90];
+    clip::draw_text(
+        &mut expected,
+        rect,
+        "sopen 한글",
+        [0, 0, 0, 255],
+        &faces,
+        clip::TextSize::Fill,
+    );
+    assert!(
+        fx.win.doc.img == expected,
+        "the window drew other pixels than draw_text"
+    );
+    let img = &fx.win.doc.img;
+    let dark = img
+        .pixels()
+        .filter(|(x, y, p)| p != &before.get_pixel(*x, *y) && p.0[..3].iter().all(|c| *c < 60))
+        .count();
+    assert!(dark > 100, "text drawn: {dark} dark pixels");
+    untouched_outside(img, &before, [40, 30, 160, 90]);
+    if fonts::hangul().is_some() {
+        // Every letter drawn, 한 and 글 included.
+        assert_eq!(fx.win.status.text, "pasted text (8 chars)");
+    } else {
+        assert_eq!(
+            fx.win.status.text,
+            "pasted text (8 chars) · no Hangul font found, so Hangul may not render"
+        );
+    }
+    fx.key(Key::Z, command(false));
+    assert_eq!(fx.win.doc.img, before, "one undo step, exact pixels back");
+}
+
+/// Korean as Finder copies a file name — decomposed into conjoining jamo (NFD) — pastes the
+/// same pixels and the same status as the composed text.
+#[test]
+fn command_v_with_decomposed_korean_pastes_like_composed_korean() {
+    let nfd = "\u{1112}\u{1161}\u{11AB}\u{1100}\u{1173}\u{11AF}";
+    let paste = |text: &str| {
+        let mut fx = open();
+        fx.select((40.0, 30.0), (200.0, 120.0));
+        fx.drv.paste_text(&mut fx.win, text);
+        (fx.win.doc.img.clone(), fx.win.status.text.clone())
+    };
+    let (composed, said) = paste("한글");
+    let (decomposed, says) = paste(nfd);
+    assert_eq!(says, said);
+    assert!(
+        decomposed == composed,
+        "NFD 한글 drew other pixels than NFC 한글"
+    );
+}
+
+/// Text copied on Windows (`\r\n` line breaks) pastes the same pixels and the same status as
+/// the same text with `\n`.
+#[test]
+fn command_v_with_windows_line_breaks_pastes_like_newlines() {
+    let paste = |text: &str| {
+        let mut fx = open();
+        fx.select((40.0, 30.0), (200.0, 120.0));
+        fx.drv.paste_text(&mut fx.win, text);
+        (fx.win.doc.img.clone(), fx.win.status.text.clone())
+    };
+    let (lf, said) = paste("one two three\nfour\n\nfive");
+    let (crlf, says) = paste("one two three\r\nfour\r\n\r\nfive");
+    assert_eq!(says, said);
+    assert_eq!(said, "pasted text (24 chars)");
+    assert!(crlf == lf, "CRLF drew other pixels than LF");
+}
+
+/// Text without a rectangle: at the top-left in letters a tenth of the image's height, and
+/// the block it takes becomes the selection.
+#[test]
+fn command_v_with_text_and_no_rectangle_writes_at_the_top_left_and_selects_it() {
+    let mut fx = open();
+    let before = fx.win.doc.img.clone();
+    fx.drv.paste_text(&mut fx.win, "hello");
+    let rect = fx.rect().expect("the text's block is selected");
+    let [x, y, w, h] = rect;
+    assert_eq!([x, y], [0, 0]);
+    assert!((16..=24).contains(&h), "a line of 16 px letters: {rect:?}");
+    assert!(w > 20 && w < W / 2, "{rect:?}");
+    assert_ne!(fx.win.doc.img, before);
+    untouched_outside(&fx.win.doc.img, &before, rect);
+    assert_eq!(fx.win.status.text, "pasted text (5 chars)");
+}
+
+/// An image with alpha offers a transparent background: a cut then leaves the rectangle
+/// transparent. An image without alpha does not offer it.
+#[test]
+fn a_transparent_background_is_offered_for_images_with_alpha() {
+    let rgb = open();
+    assert!(rgb.drv.find_text("transparent").is_none(), "not for RGB");
+
+    let rgba = DynamicImage::ImageRgba8(ImageBuffer::from_fn(W, H, |x, y| {
+        image::Rgba([x as u8, y as u8, 0, 255])
+    }));
+    let bytes = encode(&rgba, ImageFormat::Png, None, None).unwrap().bytes;
+    let mut fx = open_bytes("alpha.png", bytes, 1000.0, 700.0);
+    fx.settle();
+    fx.drv.click_text(&mut fx.win, "transparent");
+    fx.select((40.0, 30.0), (100.0, 80.0));
+    fx.drv.cut(&mut fx.win);
+    let img = &fx.win.doc.img;
+    assert_eq!(img.get_pixel(40, 30).0[3], 0, "transparent");
+    assert_eq!(img.get_pixel(99, 79).0[3], 0, "transparent");
+    untouched_outside(img, &rgba, [40, 30, 60, 50]);
+    assert_eq!(img.color(), image::ColorType::Rgba8);
+}
+
+/// A read-only image (an animated GIF) can be copied, not cut or pasted into.
+#[test]
+fn a_read_only_image_copies_but_refuses_cut_and_paste() {
+    let mut anim = Vec::new();
+    {
+        let mut enc = image::codecs::gif::GifEncoder::new(&mut anim);
+        for shade in [10u8, 200] {
+            let frame = image::RgbaImage::from_pixel(6, 6, image::Rgba([shade, 0, 0, 255]));
+            enc.encode_frame(image::Frame::new(frame)).unwrap();
+        }
+    }
+    let mut fx = open_bytes("a.gif", anim, 1000.0, 700.0);
+    let before = fx.win.doc.img.clone();
+    fx.drv.take_commands();
+    fx.drv.copy(&mut fx.win);
+    let copied = copied_images(&mut fx);
+    assert_eq!(copied.len(), 1);
+    assert_eq!(copied[0].size, [6, 6]);
+    fx.drv.paste_image(&mut fx.win, halves(4, 4));
+    assert!(
+        fx.win.status.text.starts_with("read-only — animated GIF"),
+        "{}",
+        fx.win.status.text
+    );
+    fx.drv.paste_text(&mut fx.win, "x");
+    assert!(
+        fx.win.status.text.starts_with("read-only"),
+        "{}",
+        fx.win.status.text
+    );
+    // No rectangle can be drawn on a read-only image; Cmd/Ctrl+X is refused for being one.
+    fx.drv.take_commands();
+    fx.drv.cut(&mut fx.win);
+    assert!(
+        copied_images(&mut fx).is_empty(),
+        "nothing cut to the clipboard"
+    );
+    assert!(
+        fx.win.status.text.starts_with("read-only — animated GIF"),
+        "{}",
+        fx.win.status.text
+    );
+    assert_eq!(fx.win.doc.img, before);
+    assert!(!fx.win.doc.can_undo());
+}
+
+/// While the unsaved-changes prompt is up, the clipboard shortcuts do nothing.
+#[test]
+fn clipboard_shortcuts_wait_while_the_close_prompt_is_up() {
+    let mut fx = open();
+    fx.select((40.0, 30.0), (100.0, 80.0));
+    fx.key(Key::P, Modifiers::NONE);
+    use crate::gui::Window;
+    assert!(!fx.win.close_requested(), "unsaved: asks");
+    let before = fx.win.doc.img.clone();
+    fx.drv.take_commands();
+    fx.drv.copy(&mut fx.win);
+    fx.drv.cut(&mut fx.win);
+    fx.drv.paste_image(&mut fx.win, halves(4, 4));
+    assert!(copied_images(&mut fx).is_empty());
+    assert_eq!(fx.win.doc.img, before);
+}
+
+/// While the block size is being typed, Cmd/Ctrl+C, X and V belong to that text field.
+#[test]
+fn clipboard_shortcuts_leave_a_text_field_being_edited_alone() {
+    let mut fx = open();
+    fx.select((40.0, 30.0), (100.0, 80.0));
+    // A click on the slider's number turns it into a text field with the keyboard.
+    fx.drv.click_text(&mut fx.win, "16");
+    assert!(fx.drv.ctx.text_edit_focused(), "editing the block size");
+    let before = fx.win.doc.img.clone();
+    fx.drv.take_commands();
+    fx.drv.copy(&mut fx.win);
+    fx.drv.cut(&mut fx.win);
+    fx.drv.paste_image(&mut fx.win, halves(4, 4));
+    assert!(copied_images(&mut fx).is_empty());
+    assert_eq!(fx.win.doc.img, before);
+    assert!(fx.win.status.text.is_empty(), "{}", fx.win.status.text);
+}
+
+/// A Cmd/Ctrl+X held until the key repeats cuts once: the clipboard gets the picture, not the
+/// blank the first cut left, and one undo brings it all back.
+#[test]
+fn a_held_command_x_cuts_once() {
+    let mut fx = open();
+    let before = fx.win.doc.img.clone();
+    fx.select((40.0, 30.0), (100.0, 80.0));
+    fx.drv.take_commands();
+    fx.drv
+        .shortcut(&mut fx.win, Key::X, Some(egui::Event::Cut), 3);
+    let copied = copied_images(&mut fx);
+    assert_eq!(copied.len(), 1, "one image to the clipboard");
+    assert_eq!(
+        pixel(&copied[0], 0, 0),
+        [40, 30, 0, 255],
+        "the picture, not the blank"
+    );
+    assert_eq!(fx.win.doc.img.get_pixel(40, 30).0, WHITE);
+    assert!(fx.win.doc.undo());
+    assert_eq!(fx.win.doc.img, before);
+    assert!(!fx.win.doc.can_undo(), "one undo step");
+}
+
+/// A held Cmd/Ctrl+V pastes once — text into the rectangle, and a picture with no rectangle
+/// (whose pasted area becomes the selection the repeats would otherwise paste into).
+#[test]
+fn a_held_command_v_pastes_once() {
+    let mut fx = open();
+    let before = fx.win.doc.img.clone();
+    fx.select((40.0, 30.0), (200.0, 120.0));
+    let text = egui::Event::Paste("sopen".to_string());
+    fx.drv.shortcut(&mut fx.win, Key::V, Some(text), 3);
+    assert!(fx.win.doc.undo());
+    assert!(!fx.win.doc.can_undo(), "text: one undo step");
+    assert_eq!(fx.win.doc.img, before);
+
+    let mut fx = open();
+    let before = fx.win.doc.img.clone();
+    let picture = egui::Event::PasteImage(std::sync::Arc::new(halves(30, 20)));
+    fx.drv.shortcut(&mut fx.win, Key::V, Some(picture), 3);
+    assert_eq!(fx.rect(), Some([0, 0, 30, 20]));
+    assert!(fx.win.doc.undo());
+    assert!(!fx.win.doc.can_undo(), "picture: one undo step");
+    assert_eq!(fx.win.doc.img, before);
+}
+
+/// Pasting the same thing again after changing a choice is a new paste, not a repeat.
+#[test]
+fn the_same_paste_after_another_fit_is_pasted_again() {
+    let mut fx = open();
+    fx.settle();
+    fx.select((40.0, 30.0), (100.0, 80.0));
+    fx.drv.paste_image(&mut fx.win, halves(30, 10));
+    assert_eq!(fx.win.doc.img.get_pixel(41, 31).0, BLUE, "stretched");
+    fx.drv.click_text(&mut fx.win, "Fit");
+    fx.drv.paste_image(&mut fx.win, halves(30, 10));
+    assert_eq!(
+        fx.win.doc.img.get_pixel(41, 31).0,
+        WHITE,
+        "fitted: above it"
+    );
+    assert_eq!(fx.win.status.text, "pasted image 30×10 → 60×20 (fit)");
+    assert!(fx.win.doc.undo() && fx.win.doc.undo() && !fx.win.doc.can_undo());
+}
+
+/// The paste choices and colours sit on their own row, which fits on one line from the
+/// smallest window width up (with the transparent choice an image with alpha adds).
+#[test]
+fn the_paste_row_is_one_line_at_every_window_width() {
+    let rgba = DynamicImage::ImageRgba8(ImageBuffer::from_fn(W, H, |x, y| {
+        image::Rgba([x as u8, y as u8, 0, 255])
+    }));
+    let bytes = encode(&rgba, ImageFormat::Png, None, None).unwrap().bytes;
+    for w in [480.0, 640.0, 1400.0] {
+        let mut fx = open_bytes("alpha.png", bytes.clone(), w, 400.0);
+        fx.settle();
+        let y = |label: &str| {
+            fx.drv
+                .find_text(label)
+                .unwrap_or_else(|| panic!("no {label:?} at {w} px"))
+                .center()
+                .y
+        };
+        let row = y("Stretch");
+        assert!((y("transparent") - row).abs() < 0.5, "{w} px");
+        assert!((y("Text") - row).abs() < 0.5, "{w} px");
+        // Both swatches whole on screen, on the row: white (background), black (text).
+        for colour in [Color32::WHITE, Color32::BLACK] {
+            let swatch = fx
+                .drv
+                .rects()
+                .into_iter()
+                .any(|(r, fill, _)| fill == colour && (r.center().y - row).abs() < 3.0);
+            assert!(swatch, "{colour:?} swatch shown whole at {w} px");
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// A held shortcut against a new press: egui-winit sends a repeat the same way as a press.
+
+/// Cmd/Ctrl held throughout, X pressed, let go, pressed again: two cuts.
+#[test]
+fn command_x_pressed_again_after_letting_go_cuts_again() {
+    let mut fx = open();
+    let before = fx.win.doc.img.clone();
+    fx.select((40.0, 30.0), (100.0, 80.0));
+    fx.drv.take_commands();
+    for _ in 0..2 {
+        fx.drv
+            .frame(&mut fx.win, vec![egui::Event::Cut], command(false));
+        fx.drv
+            .frame(&mut fx.win, vec![key_up(Key::X)], command(false));
+    }
+    assert_eq!(copied_images(&mut fx).len(), 2, "cut twice");
+    assert!(fx.win.doc.undo() && fx.win.doc.undo(), "two undo steps");
+    assert!(!fx.win.doc.can_undo());
+    assert_eq!(fx.win.doc.img, before);
+}
+
+/// A second Cmd/Ctrl+V after the key was let go pastes again — the same clipboard, rectangle
+/// and choices: text drawn twice, a half-transparent picture laid twice.
+#[test]
+fn command_v_pressed_again_after_letting_go_pastes_again() {
+    let translucent = {
+        let img = image::RgbaImage::from_pixel(10, 10, image::Rgba([255, 0, 0, 128]));
+        egui::ColorImage::from_rgba_unmultiplied([10, 10], img.as_raw())
+    };
+    let events = [
+        egui::Event::Paste("sopen".to_string()),
+        egui::Event::PasteImage(std::sync::Arc::new(translucent)),
+    ];
+    for event in events {
+        let mut fx = open();
+        let before = fx.win.doc.img.clone();
+        fx.select((40.0, 30.0), (100.0, 80.0));
+        fx.drv
+            .frame(&mut fx.win, vec![event.clone()], command(false));
+        fx.drv
+            .frame(&mut fx.win, vec![key_up(Key::V)], command(false));
+        let once = fx.win.doc.img.clone();
+        fx.drv
+            .frame(&mut fx.win, vec![event.clone()], command(false));
+        fx.drv
+            .frame(&mut fx.win, vec![key_up(Key::V)], command(false));
+        assert_ne!(fx.win.doc.img, once, "laid again over the first");
+        assert!(fx.win.doc.undo() && fx.win.doc.undo(), "two undo steps");
+        assert!(!fx.win.doc.can_undo());
+        assert_eq!(fx.win.doc.img, before);
+    }
+}
+
+/// A paste, the rectangle moved away and back, a paste again: two pastes.
+#[test]
+fn a_paste_after_moving_the_rectangle_away_and_back_pastes_again() {
+    let mut fx = open();
+    fx.select((40.0, 30.0), (100.0, 80.0));
+    fx.drv.paste_text(&mut fx.win, "sopen");
+    let (inside, away) = (fx.at(70.0, 55.0), fx.at(90.0, 65.0));
+    fx.drv
+        .drag(&mut fx.win, PointerButton::Primary, inside, away);
+    assert_eq!(fx.rect(), Some([60, 40, 60, 50]), "moved away");
+    fx.drv
+        .drag(&mut fx.win, PointerButton::Primary, away, inside);
+    assert_eq!(fx.rect(), Some([40, 30, 60, 50]), "and back");
+    fx.drv.paste_text(&mut fx.win, "sopen");
+    assert!(fx.win.doc.undo() && fx.win.doc.undo(), "two undo steps");
+    assert!(!fx.win.doc.can_undo());
+}
+
+/// The window losing focus, or Cmd/Ctrl going up, ends a held Cmd/Ctrl+V (its release may
+/// never reach the window): the next press pastes.
+#[test]
+fn losing_focus_or_letting_go_of_command_ends_a_held_shortcut() {
+    let paste = egui::Event::Paste("sopen".to_string());
+    let gaps: [Vec<(Vec<egui::Event>, Modifiers)>; 2] = [
+        vec![
+            (vec![egui::Event::WindowFocused(false)], command(false)),
+            (vec![egui::Event::WindowFocused(true)], command(false)),
+        ],
+        vec![(Vec::new(), Modifiers::NONE)],
+    ];
+    for (case, gap) in ["focus lost", "command let go"].into_iter().zip(gaps) {
+        let mut fx = open();
+        fx.select((40.0, 30.0), (100.0, 80.0));
+        fx.drv
+            .frame(&mut fx.win, vec![paste.clone()], command(false));
+        for (events, mods) in gap {
+            fx.drv.frame(&mut fx.win, events, mods);
+        }
+        fx.drv
+            .frame(&mut fx.win, vec![paste.clone()], command(false));
+        assert!(
+            fx.win.doc.undo() && fx.win.doc.undo(),
+            "{case}: two undo steps"
+        );
+        assert!(!fx.win.doc.can_undo(), "{case}");
+    }
+}
+
+/// Drawing a rectangle is only that: no pixel, no undo step, nothing to the clipboard.
+#[test]
+fn drawing_a_rectangle_changes_and_copies_nothing() {
+    let mut fx = open();
+    let before = fx.win.doc.img.clone();
+    fx.drv.take_commands();
+    fx.select((40.0, 30.0), (100.0, 80.0));
+    assert_eq!(fx.rect(), Some([40, 30, 60, 50]));
+    assert_eq!(fx.win.doc.img, before);
+    assert!(!fx.win.doc.can_undo());
+    assert!(fx.drv.take_commands().is_empty(), "no clipboard command");
+}
+
+/// The background swatch, changed through its own picker (its "G 255" value dragged down to
+/// 0), is what Cmd/Ctrl+X leaves.
+#[test]
+fn a_background_picked_on_the_swatch_is_what_a_cut_leaves() {
+    let mut fx = open();
+    fx.settle();
+    fx.select((40.0, 30.0), (100.0, 80.0));
+    let row = fx
+        .drv
+        .find_text("Background")
+        .expect("the label")
+        .center()
+        .y;
+    let swatch = fx
+        .drv
+        .rects()
+        .into_iter()
+        .find(|(r, fill, _)| *fill == Color32::WHITE && (r.center().y - row).abs() < 3.0)
+        .expect("the white background swatch")
+        .0;
+    fx.drv.click(&mut fx.win, swatch.center());
+    let g = fx
+        .drv
+        .find_text("G ")
+        .expect("the picker's green value")
+        .center();
+    fx.drv.drag(
+        &mut fx.win,
+        PointerButton::Primary,
+        g,
+        g - Vec2::new(600.0, 0.0),
+    );
+    // The picker stays open (Esc would clear the rectangle too); the cut goes to the image.
+    fx.drv.cut(&mut fx.win);
+    assert_eq!(fx.win.status.text, "cut 60×50");
+    assert_eq!(fx.win.doc.img.get_pixel(40, 30).0, [255, 0, 255, 255]);
+    assert_eq!(fx.win.doc.img.get_pixel(99, 79).0, [255, 0, 255, 255]);
+}
+
+/// A Cmd/Ctrl+V let go while the shortcuts are off (here: the close prompt is up) still ends
+/// the held paste: after Cancel — Cmd/Ctrl held all along — the next press pastes.
+#[test]
+fn a_key_let_go_while_the_close_prompt_is_up_still_ends_a_held_paste() {
+    let mut fx = open();
+    fx.select((40.0, 30.0), (100.0, 80.0));
+    let cmd = command(false);
+    let paste = egui::Event::Paste("sopen".to_string());
+    fx.drv.frame(&mut fx.win, vec![paste.clone()], cmd);
+    use crate::gui::Window;
+    assert!(!fx.win.close_requested(), "unsaved: asks");
+    fx.drv.frame(&mut fx.win, vec![key_up(Key::V)], cmd);
+    for _ in 0..3 {
+        fx.drv.frame(&mut fx.win, Vec::new(), cmd); // the prompt lays itself out
+    }
+    let cancel = fx.drv.find_text("Cancel").expect("the prompt").center();
+    for event in [
+        egui::Event::PointerMoved(cancel),
+        egui::Event::PointerButton {
+            pos: cancel,
+            button: PointerButton::Primary,
+            pressed: true,
+            modifiers: cmd,
+        },
+        egui::Event::PointerButton {
+            pos: cancel,
+            button: PointerButton::Primary,
+            pressed: false,
+            modifiers: cmd,
+        },
+    ] {
+        fx.drv.frame(&mut fx.win, vec![event], cmd);
+    }
+    assert!(!fx.win.prompt, "cancelled");
+    fx.drv.frame(&mut fx.win, vec![paste], cmd);
+    assert!(fx.win.doc.undo() && fx.win.doc.undo(), "two undo steps");
+    assert!(!fx.win.doc.can_undo());
 }

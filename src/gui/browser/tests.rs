@@ -287,7 +287,7 @@ fn an_edited_image_is_asked_before_it_goes() {
     let mut fx = fixture();
     fx.open("photo.png");
     edit_image(&mut fx);
-    fx.drv.take_commands();
+    fx.drv.take_viewport_commands();
     fx.key(Key::Escape);
     assert!(
         fx.drv.find_text("Unsaved changes").is_some(),
@@ -366,6 +366,10 @@ fn f4_opens_the_entry_in_the_editor() {
     )
     .unwrap();
     std::fs::set_permissions(&code, std::fs::Permissions::from_mode(0o755)).unwrap();
+    // Started once first: a stub just written can be "busy" on Linux for a moment (another test
+    // thread's fork), and its first start on macOS can be slow.
+    crate::testutil::run_fresh(&mut std::process::Command::new(&code));
+    std::fs::remove_file(&record).unwrap();
     let editor = crate::zed::Editor::Code(code);
     let launch: Launch = Arc::new(move |abs: &str, is_dir: bool| {
         let name = crate::zed::launch(&editor, None, abs, is_dir)?;
@@ -708,5 +712,41 @@ fn a_video_opens_in_the_media_window_and_esc_leaves_it() {
     fx.key(Key::Escape);
     assert!(fx.b.viewer.is_none());
     assert_eq!(fx.current(), "clip.mp4");
+    assert!(!fx.drv.closed());
+}
+
+/// Cmd/Ctrl+C, X and V reach a hosted image as in its own window (the browser takes none of
+/// them): Copy puts the image on the clipboard, and Paste then Esc asks before the edit goes.
+#[test]
+fn clipboard_shortcuts_reach_a_hosted_image() {
+    let mut fx = fixture();
+    fx.open("photo.png");
+    fx.drv.take_commands();
+    fx.drv.copy(&mut fx.b);
+    let copied: Vec<[usize; 2]> = fx
+        .drv
+        .take_commands()
+        .into_iter()
+        .filter_map(|c| match c {
+            egui::OutputCommand::CopyImage(image) => Some(image.size),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(copied, [[64, 48]], "the whole image went to the clipboard");
+    assert!(fx.b.viewer.is_some());
+    // A picture pasted without a rectangle selects what it covers (the first Esc clears that)
+    // and is an edit: the second Esc asks before it goes.
+    let red = egui::ColorImage::new([4, 4], vec![egui::Color32::RED; 16]);
+    fx.drv.paste_image(&mut fx.b, red);
+    fx.key(Key::Escape);
+    assert!(fx.drv.find_text("Unsaved changes").is_none());
+    assert!(fx.b.viewer.is_some());
+    fx.key(Key::Escape);
+    assert!(
+        fx.drv.find_text("Unsaved changes").is_some(),
+        "the paste was an edit"
+    );
+    fx.drv.click_text(&mut fx.b, "Discard");
+    assert!(fx.b.viewer.is_none());
     assert!(!fx.drv.closed());
 }

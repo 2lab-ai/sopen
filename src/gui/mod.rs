@@ -9,6 +9,7 @@
 pub mod binary;
 pub mod browser;
 pub mod chrome;
+pub mod fonts;
 pub mod hex;
 pub mod image;
 pub mod media;

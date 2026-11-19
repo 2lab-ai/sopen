@@ -13,7 +13,7 @@ use sopen::kind::{self, Kind};
 use sopen::remote::{self, LocalFs, RemoteFs, SftpRemote, Stat, WriteOutcome};
 use sopen::target::{self, RemoteSpec, Target};
 use sopen::usage::Record;
-use sopen::{app, config, forward, zed};
+use sopen::{app, config, forward, raise, zed};
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -44,7 +44,10 @@ struct Cli {
     #[command(subcommand)]
     cmd: Option<Cmd>,
     /// [user@]host:path, or a local path
-    #[arg(value_name = "SOURCE", required_unless_present = "selftest_audio")]
+    #[arg(
+        value_name = "SOURCE",
+        required_unless_present_any = ["selftest_audio", "raise_window"]
+    )]
     source: Option<String>,
     /// Open on HOST's screen instead of this machine's (sopen runs on HOST, over ssh)
     #[arg(long, value_name = "HOST", conflicts_with = "here")]
@@ -67,6 +70,26 @@ struct Cli {
         conflicts_with_all = ["source", "app", "hex", "target", "here"]
     )]
     selftest_audio: Option<PathBuf>,
+    /// Internal: bring the window of the editor just opened to the user on KDE Plasma (the
+    /// detached child sopen starts after the hand-off; spec §3).
+    #[arg(
+        long,
+        hide = true,
+        value_name = "EDITOR",
+        value_parser = ["code", "zed"],
+        conflicts_with_all = ["source", "app", "hex", "target", "here", "selftest_audio"]
+    )]
+    raise_window: Option<String>,
+    /// Internal: the opened folder's or file's name, which the editor window shows (with
+    /// --raise-window).
+    #[arg(
+        long,
+        hide = true,
+        value_name = "NAME",
+        requires = "raise_window",
+        allow_hyphen_values = true
+    )]
+    raise_caption: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -120,6 +143,14 @@ impl std::error::Error for Refused {}
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
+    if let Some(editor) = cli
+        .raise_window
+        .as_deref()
+        .and_then(raise::Editor::from_arg)
+    {
+        raise::window_now(editor, cli.raise_caption.as_deref().unwrap_or_default());
+        return ExitCode::SUCCESS;
+    }
     if let Some(file) = &cli.selftest_audio {
         return match gui::playback::selftest(file) {
             Ok(line) => {
@@ -486,6 +517,7 @@ fn open_in_browser(mut place: Place, abs: &str, dirs: &Dirs, rec: &mut Record) -
             .as_ref()
             .map(|s| (s.user.as_deref(), s.host.as_str()));
         let name = zed::launch(&editor, at, path, is_dir)?;
+        raise_editor(&editor, path);
         let shown = match &remote {
             Some(spec) => spec.display(path),
             None => path.to_string(),
@@ -516,6 +548,17 @@ fn open_in_browser(mut place: Place, abs: &str, dirs: &Dirs, rec: &mut Record) -
         Some(message) => Err(Refused(message).into()),
         None => Ok(()),
     }
+}
+
+/// After a folder or file was handed to `editor`: on KDE Plasma its window is brought to the
+/// user (spec §3, owner message 11) — for the CLI's editor route and the browser's F4 alike.
+fn raise_editor(editor: &zed::Editor, abs: &str) {
+    let which = match editor {
+        zed::Editor::Code(_) => raise::Editor::Code,
+        zed::Editor::Zed { .. } => raise::Editor::Zed,
+        zed::Editor::Neither { .. } => return,
+    };
+    raise::editor_window(which, &raise::opened_name(abs));
 }
 
 /// The terminal's progress line ([`Progress`]) for the binary route's windowless transfers.
@@ -678,6 +721,7 @@ fn open_in_editor(
             };
             let name = zed::launch(&editor, remote, abs, kind == Kind::Directory)?;
             println!("opened {} in {name}", place.display(abs));
+            raise_editor(&editor, abs);
             return Ok(());
         }
     };
