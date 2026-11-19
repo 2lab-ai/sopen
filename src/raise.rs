@@ -587,7 +587,7 @@ mod tests {
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
         // Run once first: the first start of a new executable can be slow (macOS checks it), and
         // a call has a deadline.
-        Command::new(&path).arg("warm").output().unwrap();
+        crate::testutil::run_fresh(Command::new(&path).arg("warm"));
         std::fs::remove_file(&calls).unwrap();
         Fake {
             tool: Tool { path, busctl },

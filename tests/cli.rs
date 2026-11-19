@@ -461,7 +461,7 @@ fn fake_busctl(home: &Path) -> (PathBuf, PathBuf, PathBuf) {
     );
     // Run once first: the first start of a new executable can be slow (macOS checks it), and
     // each call has a deadline.
-    Command::new(&busctl).arg("warm").output().unwrap();
+    run_fresh(Command::new(&busctl).arg("warm"));
     std::fs::remove_file(&calls).unwrap();
     (bin, calls, script)
 }
@@ -890,6 +890,25 @@ fn executable(path: &Path, body: &str) {
     std::fs::write(path, body).unwrap();
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+/// Runs `cmd` to its end, for a stub executable this test has just written. On Linux such a file
+/// can be "busy" (ETXTBSY) for a moment: a child that another test thread forked meanwhile still
+/// holds its write descriptor until that child execs. A busy start is retried, up to 50 times
+/// 20 ms apart; any other error, or the last busy one, panics. (The lib's tests have the same
+/// helper, tested, in src/testutil.rs.)
+fn run_fresh(cmd: &mut Command) -> Output {
+    let mut retries = 0;
+    loop {
+        match cmd.output() {
+            Ok(out) => return out,
+            Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy && retries < 50 => {
+                retries += 1;
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            Err(e) => panic!("cannot run {cmd:?}: {e}"),
+        }
+    }
 }
 
 impl FakeSsh {
