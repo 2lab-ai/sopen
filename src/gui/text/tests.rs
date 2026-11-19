@@ -738,3 +738,48 @@ fn a_late_page_never_lands_on_the_current_one() {
         .collect();
     assert!(colors.len() >= 2, "and highlighted: {colors:?}");
 }
+
+/// W2 (ordering): when the worker's thread ends by a panic, the end is receivable before the
+/// window is woken for it — the wake is never spent on an empty channel. The worker is paused
+/// right after it asked for the wake; the window's side must already see `Failed` or the closed
+/// channel then.
+#[test]
+fn a_panicked_worker_is_visible_before_the_wake() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut win = viewer(tmp.path(), "panic.rs", "// PANIC\nfn main() {}\n");
+    let (go, go_rx) = mpsc::channel::<()>();
+    let go_rx = Mutex::new(go_rx);
+    win.hook = Some(Arc::new(move |line: &str| {
+        if line.contains("PANIC") {
+            let _ = go_rx.lock().unwrap().recv();
+            panic!("the parser broke");
+        }
+    }));
+    let (woken_tx, woken) = mpsc::channel::<()>();
+    let (resume, resume_rx) = mpsc::channel::<()>();
+    let (woken_tx, resume_rx) = (Mutex::new(woken_tx), Mutex::new(resume_rx));
+    win.after_wake = Some(Arc::new(move || {
+        let _ = woken_tx.lock().unwrap().send(());
+        let _ = resume_rx.lock().unwrap().recv();
+    }));
+    let mut drv = Driver::new(800.0, 400.0);
+    drv.idle(&mut win, 2);
+    // No pass runs from here until the check: only the worker moves.
+    go.send(()).unwrap();
+    woken
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("the worker asked for the wake");
+    let seen = win.worker.as_ref().unwrap().done.try_recv();
+    let visible = matches!(
+        seen,
+        Ok(Done::Failed(_)) | Err(mpsc::TryRecvError::Disconnected)
+    );
+    resume.send(()).unwrap();
+    assert!(visible, "the wake came before the end was receivable");
+    drv.until(&mut win, 5, |w| w.ready());
+    assert!(
+        win.status.text.contains("highlighting stopped"),
+        "{}",
+        win.status.text
+    );
+}

@@ -497,6 +497,10 @@ struct Highlight {
     parsed: Arc<AtomicU64>,
     #[cfg(test)]
     hook: Option<ParseHook>,
+    /// Called right after the worker's thread asked the window to wake as it ends (tests: the
+    /// end must already be visible to the window by then).
+    #[cfg(test)]
+    after_wake: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 /// Lines read at a time while highlighting.
@@ -523,6 +527,8 @@ impl Highlight {
             parsed: Arc::default(),
             #[cfg(test)]
             hook: None,
+            #[cfg(test)]
+            after_wake: None,
         })
     }
 
@@ -716,12 +722,32 @@ struct Worker {
     exited: Arc<AtomicBool>,
 }
 
-/// Wakes the window when dropped: the worker's thread ending (a panic included) is news.
-struct Wake(egui::Context);
+/// The worker thread's end, made visible before it is announced: dropped as the thread ends
+/// (however it ends), it drops the sender first — the window's channel closes, so the end is
+/// receivable — and only then wakes the window.
+struct End {
+    tx: Option<Sender<Done>>,
+    ctx: egui::Context,
+    #[cfg(test)]
+    after_wake: Option<Arc<dyn Fn() + Send + Sync>>,
+}
 
-impl Drop for Wake {
+impl End {
+    fn send(&self, done: Done) {
+        if let Some(tx) = &self.tx {
+            let _ = tx.send(done);
+        }
+    }
+}
+
+impl Drop for End {
     fn drop(&mut self) {
-        self.0.request_repaint();
+        drop(self.tx.take());
+        self.ctx.request_repaint();
+        #[cfg(test)]
+        if let Some(after) = &self.after_wake {
+            after();
+        }
     }
 }
 
@@ -751,37 +777,47 @@ impl Worker {
         std::thread::spawn(move || {
             // Given back when this thread ends — normally, or by a panic in the parser.
             let _slot = slot;
-            // A panic ends the thread without a word: the window sees its channel close.
-            let _wake = Wake(ctx.clone());
-            while let Ok(mut ask) = rx.recv() {
-                // Only the newest request matters.
-                while let Ok(newer) = rx.try_recv() {
-                    ask = newer;
-                }
-                if st.load(Ordering::Relaxed) {
-                    break;
-                }
-                let gen = ask.gen;
-                let dropped = || st.load(Ordering::Relaxed) || l.load(Ordering::Relaxed) != gen;
-                match hl.page(&mut doc, ask.top, ask.count, &dropped) {
-                    Ok(Some(runs)) => {
-                        let _ = tx.send(Done::Page { gen, runs });
-                        ctx.request_repaint();
+            let end = End {
+                tx: Some(tx),
+                ctx: ctx.clone(),
+                #[cfg(test)]
+                after_wake: hl.after_wake.clone(),
+            };
+            let work = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                while let Ok(mut ask) = rx.recv() {
+                    // Only the newest request matters.
+                    while let Ok(newer) = rx.try_recv() {
+                        ask = newer;
                     }
-                    Ok(None) => {}
-                    Err(e) => {
-                        crate::debug!("highlighting stopped: {e:#}");
-                        let _ = tx.send(if is_stale(&e) {
-                            Done::Stale
-                        } else {
-                            Done::Failed(format!("{e:#}"))
-                        });
-                        ctx.request_repaint();
+                    if st.load(Ordering::Relaxed) {
                         break;
                     }
+                    let gen = ask.gen;
+                    let dropped = || st.load(Ordering::Relaxed) || l.load(Ordering::Relaxed) != gen;
+                    match hl.page(&mut doc, ask.top, ask.count, &dropped) {
+                        Ok(Some(runs)) => {
+                            end.send(Done::Page { gen, runs });
+                            ctx.request_repaint();
+                        }
+                        Ok(None) => {}
+                        Err(e) => {
+                            crate::debug!("highlighting stopped: {e:#}");
+                            end.send(if is_stale(&e) {
+                                Done::Stale
+                            } else {
+                                Done::Failed(format!("{e:#}"))
+                            });
+                            break;
+                        }
+                    }
                 }
+            }));
+            if work.is_err() {
+                end.send(Done::Failed("the highlighter panicked".to_string()));
             }
             ex.store(true, Ordering::Relaxed);
+            // The channel closes, then the window is woken.
+            drop(end);
         });
         Some(Self {
             asks,
@@ -843,6 +879,8 @@ struct TextWindow {
     gen: u64,
     #[cfg(test)]
     hook: Option<ParseHook>,
+    #[cfg(test)]
+    after_wake: Option<Arc<dyn Fn() + Send + Sync>>,
     pool: Arc<Pool>,
     /// The first line on screen, and how many fit (the last pass's).
     top: u64,
@@ -895,6 +933,8 @@ impl TextWindow {
             gen: 0,
             #[cfg(test)]
             hook: None,
+            #[cfg(test)]
+            after_wake: None,
             pool: Pool::global(),
             top: 0,
             visible: 1,
@@ -1114,6 +1154,7 @@ impl TextWindow {
                 #[cfg(test)]
                 let hl = hl.map(|mut h| {
                     h.hook = self.hook.clone();
+                    h.after_wake = self.after_wake.clone();
                     h
                 });
                 self.worker = match (hl, self.doc.share()) {
