@@ -2,9 +2,11 @@
 
 use crate::remote::{LocalFs, RemoteFs};
 use anyhow::Result;
+use std::io::ErrorKind;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Output};
+use std::time::Duration;
 
 /// Set in the child [`rerun_under_umask_022`] starts, to the name of the test it runs.
 const CHILD: &str = "SOPEN_TEST_UMASK_CHILD";
@@ -49,6 +51,81 @@ pub fn rerun_under_umask_022(test: &str) -> bool {
         "{test} did not run in the child:\n{text}"
     );
     true
+}
+
+/// Runs `cmd` to its end, for a stub executable a test has just written. On Linux such a file can
+/// be "busy" (ETXTBSY) for a moment: a child that another test thread forked meanwhile still holds
+/// its write descriptor until that child execs. A busy start is retried, up to 50 times 20 ms
+/// apart; any other error, or the last busy one, panics.
+pub fn run_fresh(cmd: &mut Command) -> Output {
+    retry_busy(|| cmd.output()).unwrap_or_else(|e| panic!("cannot run {cmd:?}: {e}"))
+}
+
+/// `attempt` until it is not refused as busy (ETXTBSY), at most 50 retries 20 ms apart.
+fn retry_busy<T>(mut attempt: impl FnMut() -> std::io::Result<T>) -> std::io::Result<T> {
+    let mut retries = 0;
+    loop {
+        match attempt() {
+            Err(e) if e.kind() == ErrorKind::ExecutableFileBusy && retries < 50 => {
+                retries += 1;
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            done => return done,
+        }
+    }
+}
+
+#[test]
+fn a_busy_start_is_retried_then_given_up() {
+    let busy = || std::io::Error::from(ErrorKind::ExecutableFileBusy);
+    let mut calls = 0;
+    let got = retry_busy(|| {
+        calls += 1;
+        if calls < 3 {
+            Err(busy())
+        } else {
+            Ok(calls)
+        }
+    });
+    assert_eq!(got.unwrap(), 3);
+    // Busy for good: given up after 50 retries, with that error.
+    let mut calls = 0;
+    let got = retry_busy(|| -> std::io::Result<()> {
+        calls += 1;
+        Err(busy())
+    });
+    assert_eq!(got.unwrap_err().kind(), ErrorKind::ExecutableFileBusy);
+    assert_eq!(calls, 51);
+    // Any other error: at once.
+    let mut calls = 0;
+    let got = retry_busy(|| -> std::io::Result<()> {
+        calls += 1;
+        Err(ErrorKind::NotFound.into())
+    });
+    assert_eq!(got.unwrap_err().kind(), ErrorKind::NotFound);
+    assert_eq!(calls, 1);
+}
+
+/// The real thing (Linux only: macOS starts a script that is still open for writing): a stub
+/// whose write descriptor is still open is busy; it runs once that descriptor is closed.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_stub_still_open_for_writing_runs_once_it_is_closed() {
+    use std::io::Write as _;
+    let tmp = tempfile::tempdir().unwrap();
+    let stub = tmp.path().join("stub");
+    let mut file = std::fs::File::create(&stub).unwrap();
+    file.write_all(b"#!/bin/sh\necho ran\n").unwrap();
+    std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let err = Command::new(&stub).output().unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::ExecutableFileBusy, "{err}");
+    let closer = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(100));
+        drop(file);
+    });
+    let out = run_fresh(&mut Command::new(&stub));
+    closer.join().unwrap();
+    assert_eq!(out.stdout, b"ran\n");
 }
 
 /// The local disk, posing as a server without `posix-rename@openssh.com`.

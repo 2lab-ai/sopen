@@ -1,7 +1,7 @@
 //! The `sopen` binary on local targets: no ssh, no network. Cache, state and config go to a temp
 //! dir; `--target` runs a fake `ssh`.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 /// The binary with cache, state and config under `home`, and nothing from the caller's
@@ -13,6 +13,8 @@ fn sopen_command(home: &Path) -> Command {
         .env("SOPEN_CONFIG", home.join("config.toml"))
         .env("SOPEN_CODE", "")
         .env("VSCODE_EXTENSIONS", home.join("vscode-extensions"))
+        // Never ask a real KWin (a test run inside a KDE session) to move a window.
+        .env("SOPEN_RAISE", "0")
         .env_remove("SOPEN_TARGET");
     for key in sopen::forward::FORWARDED_ENV {
         cmd.env_remove(key);
@@ -433,6 +435,207 @@ fn folders_and_text_go_to_the_editor_command() {
     assert!(out.status.success(), "{}", text(&out.stderr));
 }
 
+/// A stand-in `busctl` in `<home>/raise-bin` that records each call's arguments as one line in
+/// `<home>/busctl-calls`, copies the script it is asked to load to `<home>/busctl-script`, and
+/// answers by the exact method name as KWin does; with `FAKE_FAIL` set, loadScript fails.
+/// Returns that bin dir, the calls file and the script copy.
+fn fake_busctl(home: &Path) -> (PathBuf, PathBuf, PathBuf) {
+    let bin = home.join("raise-bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let calls = home.join("busctl-calls");
+    let script = home.join("busctl-script");
+    let busctl = bin.join("busctl");
+    executable(
+        &busctl,
+        &format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{calls}'\n\
+             case $6 in\n\
+             unloadScript) printf 'b true\\n';;\n\
+             loadScript) cat \"$8\" > '{script}'\n\
+             if [ -n \"$FAKE_FAIL\" ]; then echo 'Call failed: Access denied' >&2; exit 1; fi\n\
+             printf 'i 7\\n';;\n\
+             esac\n",
+            calls = calls.display(),
+            script = script.display(),
+        ),
+    );
+    // Run once first: the first start of a new executable can be slow (macOS checks it), and
+    // each call has a deadline.
+    run_fresh(Command::new(&busctl).arg("warm"));
+    std::fs::remove_file(&calls).unwrap();
+    (bin, calls, script)
+}
+
+fn lines_of(path: &Path) -> Vec<String> {
+    std::fs::read_to_string(path)
+        .unwrap_or_default()
+        .lines()
+        .map(str::to_string)
+        .collect()
+}
+
+/// One script loaded, run and unloaded once under one name, and the script file gone.
+fn assert_one_run(calls: &[String]) {
+    assert_eq!(calls.len(), 3, "{calls:?}");
+    let words: Vec<&str> = calls[0].split(' ').collect();
+    let (file, name) = (words[7], words[8]);
+    assert_eq!(
+        calls,
+        [
+            format!(
+                "--user call org.kde.KWin /Scripting org.kde.kwin.Scripting loadScript ss {file} {name}"
+            ),
+            "--user call org.kde.KWin /Scripting/Script7 org.kde.kwin.Script run".to_string(),
+            format!(
+                "--user call org.kde.KWin /Scripting org.kde.kwin.Scripting unloadScript s {name}"
+            ),
+        ]
+    );
+    assert!(!Path::new(file).exists(), "{file} left behind");
+}
+
+/// The detached child (`sopen --raise-window`): one script for the opened name, loaded, run,
+/// held about 3 s and unloaded, silently; a failing load is unloaded at once, silently too.
+#[test]
+fn the_raise_child_asks_kwin_and_cleans_up() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (bin, calls, script) = fake_busctl(tmp.path());
+    let path = format!("{}:/usr/bin:/bin", bin.display());
+    let started = std::time::Instant::now();
+    let out = sopen(
+        tmp.path(),
+        &["--raise-window", "code", "--raise-caption=-it's \"한글\"\n"],
+        &[("PATH", &path)],
+    );
+    let took = started.elapsed();
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert_eq!(
+        (text(&out.stdout), text(&out.stderr)),
+        (String::new(), String::new())
+    );
+    assert_one_run(&lines_of(&calls));
+    assert!(
+        took >= std::time::Duration::from_secs(3),
+        "not held: {took:?}"
+    );
+    // The name, as one escaped string literal.
+    let loaded = std::fs::read_to_string(&script).unwrap();
+    assert!(
+        loaded.contains("const opened = \"-it\\u0027s \\u0022\\ud55c\\uae00\\u0022\\u000a\";"),
+        "{loaded}"
+    );
+
+    std::fs::remove_file(&calls).unwrap();
+    let started = std::time::Instant::now();
+    let out = sopen(
+        tmp.path(),
+        &["--raise-window", "zed", "--raise-caption=proj"],
+        &[("PATH", &path), ("FAKE_FAIL", "1")],
+    );
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert_eq!(
+        (text(&out.stdout), text(&out.stderr)),
+        (String::new(), String::new())
+    );
+    assert!(started.elapsed() < std::time::Duration::from_secs(2));
+    let seen = lines_of(&calls);
+    assert_eq!(seen.len(), 2, "{seen:?}");
+    assert!(seen[0].contains(" loadScript ss "), "{seen:?}");
+    assert!(seen[1].contains(" unloadScript s "), "{seen:?}");
+}
+
+/// After VS Code took a folder: on KDE Plasma (Linux) sopen brings its window to the user; not
+/// elsewhere, not with SOPEN_RAISE=0, and a failing client changes nothing sopen says or exits
+/// with. By default the script runs detached and sopen returns at once.
+#[test]
+fn the_editor_window_is_brought_to_the_user_on_kde_only() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (bin, calls, script) = fake_busctl(tmp.path());
+    let path = format!("{}:/usr/bin:/bin", bin.display());
+    let code = tmp.path().join("code");
+    executable(&code, "#!/bin/sh\nexit 0\n");
+    let dir = tmp.path().join("project");
+    std::fs::create_dir(&dir).unwrap();
+    let kde = cfg!(target_os = "linux");
+    let open = |desktop: &str, raise: Option<&str>, fail: bool| {
+        let _ = std::fs::remove_file(&calls);
+        let _ = std::fs::remove_file(&script);
+        let mut cmd = sopen_command(tmp.path());
+        cmd.arg(&dir)
+            .env("SOPEN_CODE", &code)
+            .env("PATH", &path)
+            .env("XDG_CURRENT_DESKTOP", desktop);
+        match raise {
+            Some(mode) => cmd.env("SOPEN_RAISE", mode),
+            None => cmd.env_remove("SOPEN_RAISE"),
+        };
+        if fail {
+            cmd.env("FAKE_FAIL", "1");
+        }
+        let started = std::time::Instant::now();
+        let out = cmd.output().unwrap();
+        (out, started.elapsed())
+    };
+
+    let (out, _) = open("KDE", Some("wait"), false);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let opened = text(&out.stdout);
+    assert!(
+        opened.starts_with("opened ") && opened.ends_with(" in VS Code\n"),
+        "{opened}"
+    );
+    assert_eq!(text(&out.stderr), "");
+    if kde {
+        assert_one_run(&lines_of(&calls));
+        let loaded = std::fs::read_to_string(&script).unwrap();
+        assert!(loaded.contains("const opened = \"project\";"), "{loaded}");
+    } else {
+        assert_eq!(lines_of(&calls), Vec::<String>::new(), "not Linux: no call");
+    }
+
+    for (desktop, raise) in [
+        ("GNOME", Some("wait")),
+        ("ubuntu:GNOME", None),
+        ("KDE", Some("0")),
+    ] {
+        let (out, _) = open(desktop, raise, false);
+        assert!(out.status.success(), "{}", text(&out.stderr));
+        assert_eq!(text(&out.stdout), opened, "{desktop} {raise:?}");
+        assert_eq!(
+            lines_of(&calls),
+            Vec::<String>::new(),
+            "{desktop} {raise:?}"
+        );
+    }
+
+    // KWin refusing: the same line, no error, exit 0.
+    let (out, _) = open("KDE", Some("wait"), true);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert_eq!(text(&out.stdout), opened);
+    assert_eq!(text(&out.stderr), "");
+    if kde {
+        assert_eq!(lines_of(&calls).len(), 2, "{:?}", lines_of(&calls));
+    }
+
+    // Detached (the default): sopen returns at once; the script is unloaded after it.
+    let (out, took) = open("KDE", None, false);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert_eq!(text(&out.stdout), opened);
+    assert!(took < std::time::Duration::from_secs(2), "{took:?}");
+    if kde {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while lines_of(&calls).len() < 3 && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        // The script file's removal may lag the last line by a moment.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert_one_run(&lines_of(&calls));
+    } else {
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        assert_eq!(lines_of(&calls), Vec::<String>::new(), "not Linux: no call");
+    }
+}
+
 #[test]
 fn app_selection_does_not_open_code() {
     let tmp = tempfile::tempdir().unwrap();
@@ -687,6 +890,25 @@ fn executable(path: &Path, body: &str) {
     std::fs::write(path, body).unwrap();
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+/// Runs `cmd` to its end, for a stub executable this test has just written. On Linux such a file
+/// can be "busy" (ETXTBSY) for a moment: a child that another test thread forked meanwhile still
+/// holds its write descriptor until that child execs. A busy start is retried, up to 50 times
+/// 20 ms apart; any other error, or the last busy one, panics. (The lib's tests have the same
+/// helper, tested, in src/testutil.rs.)
+fn run_fresh(cmd: &mut Command) -> Output {
+    let mut retries = 0;
+    loop {
+        match cmd.output() {
+            Ok(out) => return out,
+            Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy && retries < 50 => {
+                retries += 1;
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            Err(e) => panic!("cannot run {cmd:?}: {e}"),
+        }
+    }
 }
 
 impl FakeSsh {
