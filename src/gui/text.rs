@@ -2,17 +2,20 @@
 //! Sublime syntaxes on the pure-Rust regex engine), line numbers, and paging: the file is read a
 //! page at a time through a sparse line index, never whole, so a file of any size opens alike.
 //!
-//! The index is one pass over the file when it opens (on the opener's worker): a mark every
+//! The index is one pass over the file when it opens (on the opener's worker, stopped by Esc
+//! between chunks): a mark every
 //! [`BLOCK_LINES`] lines, and at the first line start [`SPAN`] bytes past the last mark. A line
 //! that does not start at a mark starts less than a span past one, so finding any line reads at
 //! most a span; a longer line is followed by a mark, so its end is known without reading it.
 //! Only [`LINE_MAX`] bytes of a line are shown.
 //!
 //! Highlighting carries state from the top of the file: the state at each mark is computed
-//! once, in order, and a page is highlighted from the mark before it. Each frame aims to spend
-//! no more than [`HIGHLIGHT_BUDGET`] on it — a cooperative target, checked after every line (a
-//! line in progress finishes) — and the next frame goes on from there; until then the page
-//! shows plain. A line is parsed only whole: highlighting stops at the first
+//! once, in order, and a page is highlighted from the mark before it. It runs on a worker of
+//! its own, with its own handle on the file — never on a frame: one syntect call cannot be
+//! interrupted, and a pathological line can take minutes. The window shows a page plain and
+//! swaps in its highlighted lines when the worker sends them; it asks for the page on screen
+//! only (a newer request makes the worker drop the older one, checked between lines), and when
+//! the window goes the worker is told to stop and is never waited for. A line is parsed only whole: highlighting stops at the first
 //! line longer than [`LINE_MAX`] (only its start is read, and a comment or string closed past the
 //! cut would colour everything after it), and the rest of the file is plain. Files over
 //! [`HIGHLIGHT_MAX`] are always shown plain.
@@ -28,8 +31,10 @@ use eframe::egui::{self, text::LayoutJob, Color32, Key, Modifiers, Pos2, Rect};
 use std::fs::File;
 use std::os::unix::fs::FileExt;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::Arc;
 use std::sync::OnceLock;
-use std::time::{Duration, Instant};
 use syntect::highlighting::{HighlightIterator, HighlightState, Highlighter, ThemeSet};
 use syntect::parsing::{ParseState, ScopeStack, SyntaxReference, SyntaxSet};
 
@@ -41,9 +46,6 @@ const SPAN: u64 = 64 * 1024;
 pub const LINE_MAX: usize = 4096;
 /// Files above this are shown without highlighting (its state runs from the top of the file).
 pub const HIGHLIGHT_MAX: u64 = 16 << 20;
-/// Highlighting work per frame while it catches up with the page on screen: a cooperative
-/// target, checked between lines (one line's parse, at most [`LINE_MAX`] bytes, always finishes).
-const HIGHLIGHT_BUDGET: Duration = Duration::from_millis(6);
 /// Reads while looking for the end of a line.
 const CHUNK: usize = 16 * 1024;
 /// Columns a tab advances to.
@@ -94,6 +96,27 @@ fn identity(meta: &std::fs::Metadata) -> Identity {
 impl TextDoc {
     /// Opens `path` and indexes its lines (one pass over the file, holding no text).
     pub fn open(path: &Path) -> Result<Self> {
+        Self::open_cancellable(path, &AtomicBool::new(false))
+    }
+
+    /// [`TextDoc::open`] that stops when `cancel` is set (Esc while a big file is indexed):
+    /// checked before the pass and after every chunk of it; the error is
+    /// [`Cancelled`](crate::remote::Cancelled).
+    pub fn open_cancellable(path: &Path, cancel: &AtomicBool) -> Result<Self> {
+        Self::open_with(path, cancel, &mut |_| {})
+    }
+
+    /// [`TextDoc::open_cancellable`], with `on_chunk(bytes indexed so far)` after every chunk
+    /// (tests: a cancel, or a writer, in the middle of the pass).
+    fn open_with(path: &Path, cancel: &AtomicBool, on_chunk: &mut dyn FnMut(u64)) -> Result<Self> {
+        let stopped = || {
+            if cancel.load(Ordering::Relaxed) {
+                Err(anyhow::Error::new(crate::remote::Cancelled))
+            } else {
+                Ok(())
+            }
+        };
+        stopped()?;
         let file = File::open(path).with_context(|| format!("cannot open {}", path.display()))?;
         let meta = file
             .metadata()
@@ -137,7 +160,13 @@ impl TextDoc {
             }
             last_byte = Some(buf[n - 1]);
             at += n as u64;
+            on_chunk(at);
+            stopped()?;
         }
+        // The bytes actually indexed (fewer than the size as opened if it shrank meanwhile: the
+        // change is noticed later), and no mark at or past their end.
+        let size = at;
+        marks.retain(|m| m.line == 0 || m.offset < size);
         if line_len > LINE_MAX as u64 && first_long.is_none() {
             first_long = Some(line);
         }
@@ -168,6 +197,24 @@ impl TextDoc {
             meta.is_ok_and(|m| identity(&m) == self.opened)
         };
         !same(self.file.metadata()) || !same(std::fs::metadata(&self.path))
+    }
+
+    /// The same file and index on a handle of its own (the highlighting worker's).
+    fn share(&self) -> Result<TextDoc> {
+        Ok(TextDoc {
+            file: self
+                .file
+                .try_clone()
+                .context("cannot open the file again")?,
+            size: self.size,
+            marks: self.marks.clone(),
+            lines: self.lines,
+            ends_newline: self.ends_newline,
+            first_long: self.first_long,
+            opened: self.opened,
+            path: self.path.clone(),
+            page_reads: 0,
+        })
     }
 
     pub fn line_count(&self) -> u64 {
@@ -416,50 +463,22 @@ type Runs = Vec<(Color32, String)>;
 /// Parser and highlighter state after some line.
 type State = (ParseState, HighlightState);
 
-/// What one frame may spend on highlighting — until a moment, and (tests) a number of lines —
-/// and the lines parsed so far this frame.
-#[derive(Debug, Clone, Copy)]
-struct Budget {
-    until: Instant,
-    lines: usize,
-    done: usize,
-}
+/// Called with each line before it is parsed (tests: a parser that blocks on a line).
+#[cfg(test)]
+pub(crate) type ParseHook = Arc<dyn Fn(&str) + Send + Sync>;
 
-impl Budget {
-    fn spent(&self) -> bool {
-        self.done >= self.lines || Instant::now() >= self.until
-    }
-}
-
-/// Where highlighting got to: the state before line `next`.
-struct Cursor {
-    next: u64,
-    state: State,
-}
-
-/// A page being highlighted: the cursor, and the page's lines done so far.
-struct PageJob {
-    top: u64,
-    at: Cursor,
-    runs: Vec<Runs>,
-}
-
-/// Highlighting state at each mark, computed in order from the top of the file, a budget at a
-/// time; and the page on screen, the same way.
+/// Highlighting state at each mark, computed in order from the top of the file — the worker's.
 struct Highlight {
     highlighter: Highlighter<'static>,
     /// The state at mark `i`'s line, for every `i < states.len()`.
     states: Vec<State>,
-    /// On the way to the next mark.
-    frontier: Option<Cursor>,
-    job: Option<PageJob>,
     /// Lines from here on are plain (the first line cut for display, see the module doc).
     stop: u64,
     plain: Color32,
-    /// Lines parsed so far (tests: the work a frame does).
-    parsed: u64,
-    /// A read found the file changed under the index ([`Stale`]): nothing more is done.
-    stale: bool,
+    /// Lines parsed so far (tests).
+    parsed: Arc<AtomicU64>,
+    #[cfg(test)]
+    hook: Option<ParseHook>,
 }
 
 /// Lines read at a time while highlighting.
@@ -481,17 +500,20 @@ impl Highlight {
         Some(Self {
             highlighter,
             states: vec![start],
-            frontier: None,
-            job: None,
             stop,
             plain,
-            parsed: 0,
-            stale: false,
+            parsed: Arc::default(),
+            #[cfg(test)]
+            hook: None,
         })
     }
 
-    fn run(&mut self, state: &mut State, line: &str) -> Runs {
-        self.parsed += 1;
+    fn run(&self, state: &mut State, line: &str) -> Runs {
+        #[cfg(test)]
+        if let Some(hook) = &self.hook {
+            hook(line);
+        }
+        self.parsed.fetch_add(1, Ordering::Relaxed);
         let Ok(ops) = state.0.parse_line(line, syntaxes()) else {
             return vec![(self.plain, line.to_string())];
         };
@@ -503,99 +525,69 @@ impl Highlight {
             .collect()
     }
 
-    /// Parses lines from `at` up to line `to` while `budget` lasts (checked after every line),
-    /// keeping each line's runs in `keep` when given; whether it got there.
+    /// Parses lines `next..to` from `state`, keeping each line's runs in `keep` when given.
+    /// `Ok(false)`: `dropped()` said to stop (checked before every line).
     fn walk(
-        &mut self,
+        &self,
         doc: &mut TextDoc,
-        at: &mut Cursor,
+        mut next: u64,
         to: u64,
-        budget: &mut Budget,
+        state: &mut State,
+        dropped: &dyn Fn() -> bool,
         mut keep: Option<&mut Vec<Runs>>,
-    ) -> bool {
-        while at.next < to {
-            if budget.spent() {
-                return false;
-            }
-            let want = (to - at.next).min(BATCH as u64) as usize;
-            let lines = match doc.read_lines(at.next, want) {
-                Ok(lines) => lines,
-                Err(e) => {
-                    self.stale |= is_stale(&e);
-                    return false;
-                }
-            };
+    ) -> Result<bool> {
+        while next < to {
+            let want = (to - next).min(BATCH as u64) as usize;
+            let lines = doc.read_lines(next, want)?;
             if lines.is_empty() {
-                return false;
+                return Err(anyhow::Error::new(Stale));
             }
             for line in &lines {
-                if budget.spent() {
-                    return false;
+                if dropped() {
+                    return Ok(false);
                 }
-                let runs = self.run(&mut at.state, &line.text);
+                let runs = self.run(state, &line.text);
                 if let Some(keep) = keep.as_deref_mut() {
                     keep.push(runs);
                 }
-                at.next += 1;
-                budget.done += 1;
+                next += 1;
             }
         }
-        true
+        Ok(true)
     }
 
-    /// Computes the states up to mark `upto` while `budget` lasts; whether they are there.
-    fn advance(&mut self, doc: &mut TextDoc, upto: usize, budget: &mut Budget) -> bool {
-        while self.states.len() <= upto {
-            let i = self.states.len() - 1;
-            let to = doc.next_mark(i).line;
-            let mut at = self.frontier.take().unwrap_or_else(|| Cursor {
-                next: doc.marks[i].line,
-                state: self.states[i].clone(),
-            });
-            if !self.walk(doc, &mut at, to, budget, None) {
-                self.frontier = Some(at);
-                return false;
-            }
-            self.states.push(at.state);
-        }
-        true
-    }
-
-    /// The page at `top` (its `lines`), highlighted up to the stop line (plain after it) — or
-    /// `None` while it is not done; the next call goes on from where this one stopped.
+    /// The page of `count` lines at `top`, highlighted up to the stop line (plain after it).
+    /// `Ok(None)`: dropped for a newer request (or the window went).
     fn page(
         &mut self,
         doc: &mut TextDoc,
         top: u64,
-        lines: &[Line],
-        budget: &mut Budget,
-    ) -> Option<Vec<Runs>> {
+        count: usize,
+        dropped: &dyn Fn() -> bool,
+    ) -> Result<Option<Vec<Runs>>> {
+        let lines = doc.read_lines(top, count)?;
         let end = (top + lines.len() as u64).min(self.stop);
         let mut runs = Vec::new();
         if top < end {
-            if self.job.as_ref().is_none_or(|j| j.top != top) {
-                let k = doc.mark_before(top);
-                if !self.advance(doc, k, budget) {
-                    return None;
+            // The states up to the mark before the page, a whole block at a time.
+            let k = doc.mark_before(top);
+            while self.states.len() <= k {
+                let i = self.states.len() - 1;
+                let mut state = self.states[i].clone();
+                let (from, to) = (doc.marks[i].line, doc.next_mark(i).line);
+                if !self.walk(doc, from, to, &mut state, dropped, None)? {
+                    return Ok(None);
                 }
-                self.job = Some(PageJob {
-                    top,
-                    at: Cursor {
-                        next: doc.marks[k].line,
-                        state: self.states[k].clone(),
-                    },
-                    runs: Vec::new(),
-                });
+                self.states.push(state);
             }
-            let mut job = self.job.take().expect("set above");
-            // Up to the page (from the mark before it), then the page's own lines.
-            let reached = self.walk(doc, &mut job.at, top, budget, None)
-                && self.walk(doc, &mut job.at, end, budget, Some(&mut job.runs));
-            if !reached {
-                self.job = Some(job);
-                return None;
+            // From that mark to the page, then the page's own lines.
+            let mut state = self.states[k].clone();
+            let from = doc.marks[k].line;
+            if !self.walk(doc, from, top, &mut state, dropped, None)?
+                || !self.walk(doc, top, end, &mut state, dropped, Some(&mut runs))?
+            {
+                return Ok(None);
             }
-            runs = job.runs;
         }
         runs.truncate(lines.len());
         let plain = self.plain;
@@ -604,7 +596,102 @@ impl Highlight {
                 .iter()
                 .map(|l| vec![(plain, l.text.clone())]),
         );
-        Some(runs)
+        Ok(Some(runs))
+    }
+}
+
+/// A page the window wants highlighted: asked under generation `gen`.
+struct Ask {
+    gen: u64,
+    top: u64,
+    count: usize,
+}
+
+/// What the worker sends back.
+enum Done {
+    Page {
+        gen: u64,
+        runs: Vec<Runs>,
+    },
+    /// The file changed under the index: the worker stopped.
+    Stale,
+}
+
+/// The highlighting worker, from the window's side. Dropping it tells the worker to stop; it is
+/// never joined (a syntect call in progress finishes on its own, its result unused).
+struct Worker {
+    asks: Sender<Ask>,
+    done: Receiver<Done>,
+    /// The newest generation asked: the worker drops older work (checked between lines).
+    latest: Arc<AtomicU64>,
+    stop: Arc<AtomicBool>,
+    /// Lines the worker parsed (tests).
+    #[cfg_attr(not(test), allow(dead_code))]
+    parsed: Arc<AtomicU64>,
+    /// The worker's thread ended (tests).
+    #[cfg_attr(not(test), allow(dead_code))]
+    exited: Arc<AtomicBool>,
+}
+
+impl Drop for Worker {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+    }
+}
+
+impl Worker {
+    /// Starts the worker on `doc` (a handle of its own) with `hl`; `ctx` is woken when a page
+    /// is done.
+    fn start(mut doc: TextDoc, mut hl: Highlight, ctx: egui::Context) -> Self {
+        let (asks, rx) = mpsc::channel::<Ask>();
+        let (tx, done) = mpsc::channel();
+        let latest = Arc::new(AtomicU64::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
+        let exited = Arc::new(AtomicBool::new(false));
+        let parsed = hl.parsed.clone();
+        let (l, st, ex) = (latest.clone(), stop.clone(), exited.clone());
+        std::thread::spawn(move || {
+            while let Ok(mut ask) = rx.recv() {
+                // Only the newest request matters.
+                while let Ok(newer) = rx.try_recv() {
+                    ask = newer;
+                }
+                if st.load(Ordering::Relaxed) {
+                    break;
+                }
+                let gen = ask.gen;
+                let dropped = || st.load(Ordering::Relaxed) || l.load(Ordering::Relaxed) != gen;
+                match hl.page(&mut doc, ask.top, ask.count, &dropped) {
+                    Ok(Some(runs)) => {
+                        let _ = tx.send(Done::Page { gen, runs });
+                        ctx.request_repaint();
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        crate::debug!("highlighting stopped: {e:#}");
+                        if is_stale(&e) {
+                            let _ = tx.send(Done::Stale);
+                            ctx.request_repaint();
+                        }
+                        break;
+                    }
+                }
+            }
+            ex.store(true, Ordering::Relaxed);
+        });
+        Self {
+            asks,
+            done,
+            latest,
+            stop,
+            parsed,
+            exited,
+        }
+    }
+
+    fn ask(&self, gen: u64, top: u64, count: usize) {
+        self.latest.store(gen, Ordering::Relaxed);
+        let _ = self.asks.send(Ask { gen, top, count });
     }
 }
 
@@ -629,13 +716,14 @@ fn expand_tabs(runs: Runs) -> Runs {
         .collect()
 }
 
-/// The page on screen: its first line, how many, the lines and how they are drawn.
+/// The page on screen: its first line, how many, and how its lines are drawn.
 struct Page {
     top: u64,
     count: usize,
-    lines: Vec<Line>,
     runs: Vec<Runs>,
     highlighted: bool,
+    /// The generation its highlighting was asked under.
+    gen: u64,
 }
 
 struct TextWindow {
@@ -643,9 +731,14 @@ struct TextWindow {
     title: String,
     doc: TextDoc,
     syntax: Option<&'static SyntaxReference>,
-    /// Built on the first pass (it needs the theme: dark or light).
-    hl: Option<Highlight>,
+    /// Started on the first pass (it needs the theme: dark or light); `None` without a syntax,
+    /// for a file over [`HIGHLIGHT_MAX`], or when the file cannot be opened again.
+    worker: Option<Worker>,
     hl_tried: bool,
+    /// The last generation asked of the worker.
+    gen: u64,
+    #[cfg(test)]
+    hook: Option<ParseHook>,
     /// The first line on screen, and how many fit (the last pass's).
     top: u64,
     visible: u64,
@@ -659,17 +752,9 @@ struct TextWindow {
     painted: bool,
     /// The file changed since it was opened: nothing more is read.
     stale: bool,
-    /// Lines a frame may parse (tests); the time budget holds in any case.
-    budget_lines: usize,
 }
 
 impl TextWindow {
-    /// Lines highlighted so far (tests).
-    #[cfg(test)]
-    fn parsed(&self) -> u64 {
-        self.hl.as_ref().map_or(0, |h| h.parsed)
-    }
-
     fn new(mut doc: TextDoc, title: String, name: &str, notices: Vec<String>) -> Self {
         // Changed since it was indexed (between the opener's worker and now): nothing is read.
         let stale = doc.changed();
@@ -700,8 +785,11 @@ impl TextWindow {
             title,
             doc,
             syntax,
-            hl: None,
+            worker: None,
             hl_tried: false,
+            gen: 0,
+            #[cfg(test)]
+            hook: None,
             top: 0,
             visible: 1,
             left: 0,
@@ -711,7 +799,6 @@ impl TextWindow {
             status,
             painted: false,
             stale,
-            budget_lines: usize::MAX,
         }
     }
 
@@ -761,9 +848,9 @@ impl TextWindow {
             let page = self.page.get_or_insert_with(|| Page {
                 top,
                 count,
-                lines: Vec::new(),
                 runs: Vec::new(),
                 highlighted: true,
+                gen: 0,
             });
             page.highlighted = true;
             return;
@@ -786,37 +873,37 @@ impl TextWindow {
                 .iter()
                 .map(|l| expand_tabs(vec![(plain, l.text.clone())]))
                 .collect();
+            self.gen += 1;
             self.page = Some(Page {
                 top,
                 count,
-                lines,
                 runs,
-                highlighted: false,
+                highlighted: self.worker.is_none(),
+                gen: self.gen,
             });
+            if let Some(worker) = &self.worker {
+                worker.ask(self.gen, top, count);
+            }
         }
-        let (Some(hl), Some(page)) = (self.hl.as_mut(), self.page.as_mut()) else {
+        // What the worker finished meanwhile: the page on screen's lines replace its plain ones.
+        let (Some(worker), Some(page)) = (self.worker.as_ref(), self.page.as_mut()) else {
             return;
         };
-        if page.highlighted {
-            return;
-        }
-        let mut budget = Budget {
-            until: Instant::now() + HIGHLIGHT_BUDGET,
-            lines: self.budget_lines,
-            done: 0,
-        };
-        match hl.page(&mut self.doc, top, &page.lines, &mut budget) {
-            Some(runs) => {
-                page.runs = runs.into_iter().map(expand_tabs).collect();
-                page.highlighted = true;
+        while let Ok(done) = worker.done.try_recv() {
+            match done {
+                Done::Page { gen, runs } if gen == page.gen => {
+                    page.runs = runs.into_iter().map(expand_tabs).collect();
+                    page.highlighted = true;
+                }
+                Done::Page { .. } => {}
+                Done::Stale => {
+                    self.stale = true;
+                    self.status = Status::error(CHANGED);
+                    page.highlighted = true;
+                }
             }
-            None if hl.stale => {
-                self.stale = true;
-                self.status = Status::error(CHANGED);
-                page.highlighted = true;
-            }
-            None => ctx.request_repaint(),
         }
+        let _ = ctx;
     }
 
     fn bar(&self, ui: &mut egui::Ui) {
@@ -892,11 +979,20 @@ impl TextWindow {
         self.top = self.top.min(lines.saturating_sub(self.visible));
         if !self.hl_tried {
             self.hl_tried = true;
-            if self.doc.size() <= HIGHLIGHT_MAX {
+            if self.doc.size() <= HIGHLIGHT_MAX && !self.stale {
                 let stop = self.doc.first_long.unwrap_or(u64::MAX);
-                self.hl = self
+                let hl = self
                     .syntax
                     .and_then(|s| Highlight::new(s, ui.visuals().dark_mode, p.text, stop));
+                #[cfg(test)]
+                let hl = hl.map(|mut h| {
+                    h.hook = self.hook.clone();
+                    h
+                });
+                self.worker = match (hl, self.doc.share()) {
+                    (Some(hl), Ok(doc)) => Some(Worker::start(doc, hl, ctx.clone())),
+                    _ => None,
+                };
             }
         }
         self.ensure_page(&ctx, p.text);
@@ -972,7 +1068,7 @@ impl Window for TextWindow {
             && self
                 .page
                 .as_ref()
-                .is_some_and(|p| p.highlighted || self.hl.is_none())
+                .is_some_and(|p| p.highlighted || self.worker.is_none())
     }
 }
 

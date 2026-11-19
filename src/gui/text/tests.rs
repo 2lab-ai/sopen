@@ -6,6 +6,7 @@ use super::*;
 use crate::gui::chrome;
 use crate::gui::testkit::Driver;
 use eframe::egui::{Key, Modifiers};
+use std::sync::Mutex;
 
 fn write(dir: &Path, name: &str, bytes: &[u8]) -> std::path::PathBuf {
     let path = dir.join(name);
@@ -222,39 +223,95 @@ fn keys_page_through_the_file() {
     assert_eq!(win.top, 1);
 }
 
-/// T1: highlighting is bounded per frame and resumes. With a budget of 100 parsed lines per
-/// frame, jumping to the end of 3000 lines of Rust does at most 100 lines' work in a frame (the
-/// page shows plain meanwhile) and finishes over the following frames.
+/// A parser hook that stops on any line holding `MARKER` until released: it says when it got
+/// there, and lets go on `go`.
+fn blocking_hook() -> (ParseHook, mpsc::Receiver<()>, mpsc::Sender<()>) {
+    let (reached_tx, reached) = mpsc::channel::<()>();
+    let (go, go_rx) = mpsc::channel::<()>();
+    let (reached_tx, go_rx) = (Mutex::new(reached_tx), Mutex::new(go_rx));
+    let hook: ParseHook = Arc::new(move |line: &str| {
+        if line.contains("MARKER") {
+            let _ = reached_tx.lock().unwrap().send(());
+            let _ = go_rx.lock().unwrap().recv();
+        }
+    });
+    (hook, reached, go)
+}
+
+/// O1: the window's frames never parse. With the parser stuck (on the first line, for as long
+/// as the test likes), the window still shows the page — plain —, scrolls, and goes away at once;
+/// the worker then stops on its own.
 #[test]
-fn highlighting_yields_each_frame_and_resumes() {
+fn the_window_never_waits_for_the_parser() {
     let tmp = tempfile::tempdir().unwrap();
-    let body: String = (0..3000)
-        .map(|i| format!("fn f{i}() {{ let x = {i}; }}\n"))
+    let body: String = std::iter::once("// MARKER\n".to_string())
+        .chain((1..600).map(|i| format!("fn f{i}() {{}}\n")))
         .collect();
-    let mut win = viewer(tmp.path(), "many.rs", &body);
-    win.budget_lines = 100;
+    let mut win = viewer(tmp.path(), "stuck.rs", &body);
+    let (hook, reached, go) = blocking_hook();
+    win.hook = Some(hook);
     let mut drv = Driver::new(800.0, 500.0);
-    drv.idle(&mut win, 1);
-    drv.until(&mut win, 10, |w| w.ready());
+    drv.idle(&mut win, 2);
+    reached
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("the worker reached the stuck line");
+    let plain = chrome::Palette::of(&drv.ctx.global_style().visuals).text;
+    assert_eq!(
+        drv.colors_of("fn f1() {}"),
+        Some(vec![plain]),
+        "shown plain meanwhile"
+    );
+    let started = std::time::Instant::now();
+    drv.key(&mut win, Key::PageDown, Modifiers::NONE);
     drv.key(&mut win, Key::End, Modifiers::NONE);
-    let mut frames = 0;
-    let mut before = win.parsed();
-    while !win.ready() {
-        drv.idle(&mut win, 1);
-        let now = win.parsed();
-        assert!(now - before <= 100, "a frame parsed {} lines", now - before);
-        before = now;
-        frames += 1;
-        assert!(frames < 1000, "never finished");
+    assert!(drv.find_text("fn f599() {}").is_some(), "it scrolled");
+    let (parsed, exited) = {
+        let w = win.worker.as_ref().unwrap();
+        (w.parsed.clone(), w.exited.clone())
+    };
+    drop(win);
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(2),
+        "frames and closing did not wait for the parser: {:?}",
+        started.elapsed()
+    );
+    assert!(!exited.load(Ordering::Relaxed), "still stuck in the parser");
+    let before = parsed.load(Ordering::Relaxed);
+    go.send(()).unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !exited.load(Ordering::Relaxed) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the worker never stopped"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
     }
     assert!(
-        frames >= 20,
-        "finished in {frames} frames: the work was not spread out"
+        parsed.load(Ordering::Relaxed) <= before + 1,
+        "after the window went the worker parsed on"
     );
-    let last = "fn f2999() { let x = 2999; }";
-    let colors = drv.colors_of(last).expect("the last line is shown");
-    let distinct: std::collections::HashSet<_> = colors.iter().collect();
-    assert!(distinct.len() >= 2, "highlighted: {colors:?}");
+}
+
+/// O1: highlighted lines replace the plain ones when the worker sends them.
+#[test]
+fn highlighted_lines_arrive_and_replace_plain_ones() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut win = viewer(tmp.path(), "late.rs", "// MARKER\nfn main() {}\n");
+    let (hook, reached, go) = blocking_hook();
+    win.hook = Some(hook);
+    let mut drv = Driver::new(800.0, 500.0);
+    drv.idle(&mut win, 2);
+    reached
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .unwrap();
+    let plain = chrome::Palette::of(&drv.ctx.global_style().visuals).text;
+    assert_eq!(drv.colors_of("fn main() {}"), Some(vec![plain]));
+    assert!(!win.ready());
+    go.send(()).unwrap();
+    drv.until(&mut win, 10, |w| w.ready());
+    let colors: std::collections::HashSet<_> =
+        drv.colors_of("fn main() {}").unwrap().into_iter().collect();
+    assert!(colors.len() >= 2, "highlighted now: {colors:?}");
 }
 
 /// T2: a line longer than LINE_MAX is never parsed cut short: a comment closed past the cut
@@ -490,4 +547,59 @@ fn a_file_replaced_by_rename_or_deleted_counts_as_changed() {
     let other = write(tmp.path(), "other.txt", b"x\n");
     std::fs::rename(&other, &target).unwrap();
     assert!(doc.changed(), "the link's target was replaced");
+}
+
+/// O2: indexing stops when asked (Esc while a big local text file is indexed): checked before
+/// it starts and after every chunk, the error is `Cancelled`.
+#[test]
+fn indexing_stops_when_cancelled() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let tmp = tempfile::tempdir().unwrap();
+    let body: String = (0..400_000u32).map(|i| format!("{i:08}\n")).collect();
+    let path = write(tmp.path(), "big.log", body.as_bytes());
+    let stop = AtomicBool::new(true);
+    let err = TextDoc::open_cancellable(&path, &stop)
+        .err()
+        .expect("cancelled");
+    assert!(crate::remote::is_cancelled(&err), "{err:#}");
+    // Asked after the first chunk: no second chunk is read.
+    let stop = AtomicBool::new(false);
+    let mut chunks = 0;
+    let err = TextDoc::open_with(&path, &stop, &mut |_| {
+        chunks += 1;
+        stop.store(true, Ordering::Relaxed);
+    })
+    .err()
+    .expect("cancelled");
+    assert!(crate::remote::is_cancelled(&err), "{err:#}");
+    assert_eq!(chunks, 1);
+}
+
+/// O3: a file that grows while it is indexed: the index covers the bytes it read as opened, the
+/// last line reads back whole, nothing panics, and the growth counts as a change.
+#[test]
+fn a_file_growing_while_it_is_indexed() {
+    use std::io::Write as _;
+    use std::sync::atomic::AtomicBool;
+    let tmp = tempfile::tempdir().unwrap();
+    let body: String = (0..400_000u32).map(|i| format!("{i:08}\n")).collect();
+    let path = write(tmp.path(), "growing.log", body.as_bytes());
+    let mut grown = false;
+    let mut doc = TextDoc::open_with(&path, &AtomicBool::new(false), &mut |_| {
+        if !grown {
+            grown = true;
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap();
+            f.write_all(b"appended while indexing\nand more").unwrap();
+        }
+    })
+    .unwrap();
+    assert_eq!(doc.line_count(), 400_000);
+    assert_eq!(doc.size(), body.len() as u64);
+    let last = doc.read_lines(399_998, 5).unwrap();
+    let texts: Vec<&str> = last.iter().map(|l| l.text.as_str()).collect();
+    assert_eq!(texts, ["00399998", "00399999"]);
+    assert!(doc.changed(), "the growth is a change");
 }

@@ -163,7 +163,7 @@ pub fn prepare(
                 None => PathBuf::from(req.abs),
             };
             text::warm();
-            let doc = TextDoc::open(&path)?;
+            let doc = TextDoc::open_cancellable(&path, cancel)?;
             let (notices, claim) = match fetched {
                 Some(f) => (f.notices, Some(f.claim)),
                 None => (Vec::new(), None),

@@ -141,7 +141,9 @@ replaces that module alone.
   symbolic link costs a stat more (to say what it points at). A link is followed only to classify
   it. An entry whose type the server left out gets an `lstat` first (a link stays a link, a
   dangling one is `<BROKEN>`), then is followed only if that says link. Every stat goes by the
-  name's own bytes. Locally: `read_dir` and an `lstat` per name. The free space is `statvfs@openssh.com` when
+  name's own bytes. Each READDIR reply has the 30 s request timeout, not the listing as a whole,
+  so a big folder on a slow link lists as long as the server answers. Locally: `read_dir` and an
+  `lstat` per name. The free space is `statvfs@openssh.com` when
   the server offers it, `statvfs` locally.
 - **Keys** (the list): ↑/↓, PgUp/PgDn, Home/End move the bar; Tab (or Shift+Tab) switches the
   active panel; Enter on a folder enters it; Backspace, or Enter on `..`, goes up with the bar on
@@ -158,7 +160,7 @@ replaces that module alone.
   The path is resolved first (a link opens, and saves, as the file it points at: §5). A remote
   file is fetched into the cache exactly as the standalone routes fetch it (claimed, recorded, an
   earlier copy's unsaved edits moved aside), with its progress on the status row; Esc stops the
-  fetch — the partial copy is removed and the cached copy left as it was, also when Esc comes
+  fetch (and the indexing of a text file, checked every MiB): the partial copy is removed and the cached copy left as it was, also when Esc comes
   after the last byte but before the copy is in place. Esc once the copy is in place (while the
   file is decoded, probed or indexed) keeps the viewer from opening; the fetched copy stays in
   the cache, recorded, and the status row says so. An image is always a
@@ -175,9 +177,12 @@ replaces that module alone.
   of each line. 4096 bytes of a line are shown (the bar says when lines are cut); invalid UTF-8
   shows as U+FFFD (a real character cut in two at the end of a cut line is left out; bytes that
   can never start one stay U+FFFD). Highlighting carries state from the top of the file: the
-  state at each mark is computed once, and each frame aims at 6 ms of highlighting — a
-  cooperative target checked after every line, so a line in progress finishes — and the next
-  frame goes on from there; a page is shown plain until it is reached. A line is parsed only whole, so
+  state at each mark is computed once, on a worker of the viewer's own with its own handle on the
+  file — never on a frame (one parse call cannot be interrupted, and a pathological line can take
+  minutes). A page shows plain and its highlighted lines replace the plain ones when the worker
+  sends them; the worker works on the page on screen only (a newer page makes it drop the older,
+  checked between lines). Leaving the viewer or closing the window tells it to stop and never
+  waits for it. A line is parsed only whole, so
   highlighting stops at the first line over 4096 bytes (the status row says which) and the rest
   is plain; files over 16 MiB are shown plain. The file is read live, the index is of the file as
   opened: when it changes — its size or modification time through the open handle, or what its

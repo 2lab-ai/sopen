@@ -50,6 +50,26 @@ async fn within<F: Future>(limit: Duration, fut: F) -> std::result::Result<F::Ou
     tokio::time::timeout(limit, fut).await.map_err(|_| ())
 }
 
+/// Every item of `stream`, each within `limit` of the one before (`Err`: one did not come in
+/// time). A listing's READDIR replies each get the timeout, not the listing as a whole: a big
+/// folder on a slow link takes as long as it takes while the server answers.
+async fn each_within<S: futures_core::Stream>(
+    stream: S,
+    limit: Duration,
+) -> std::result::Result<Vec<S::Item>, ()> {
+    let mut stream = std::pin::pin!(stream);
+    let mut out = Vec::new();
+    while let Some(item) = within(
+        limit,
+        std::future::poll_fn(|cx| stream.as_mut().poll_next(cx)),
+    )
+    .await?
+    {
+        out.push(item);
+    }
+    Ok(out)
+}
+
 fn timed_out(what: &str, limit: Duration) -> anyhow::Error {
     anyhow!("{what}: no reply from the server in {}s", limit.as_secs())
 }
@@ -631,17 +651,18 @@ impl SftpRemote {
     /// A directory's names with their attributes from the readdir reply, sorted by name
     /// (`.` and `..` left out).
     fn read_dir(&mut self, path: &str) -> Result<Vec<(std::ffi::OsString, Stat)>> {
-        use futures_core::Stream;
         let (rt, _, fs) = self.parts();
-        let listed = rt.block_on(within(META_TIMEOUT, async {
-            let dir = fs
-                .open_dir(path)
+        rt.block_on(async {
+            let dir = within(META_TIMEOUT, fs.open_dir(path))
                 .await
+                .map_err(|()| timed_out(&format!("list {path}"), META_TIMEOUT))?
                 .map_err(|e| anyhow!("cannot list {path}: {e}"))?;
-            let mut entries = Box::pin(dir.read_dir());
-            let mut out = Vec::new();
-            while let Some(entry) = std::future::poll_fn(|cx| entries.as_mut().poll_next(cx)).await
-            {
+            // Each reply within the request timeout, not the whole listing.
+            let entries = each_within(dir.read_dir(), META_TIMEOUT)
+                .await
+                .map_err(|()| timed_out(&format!("list {path}"), META_TIMEOUT))?;
+            let mut out = Vec::with_capacity(entries.len());
+            for entry in entries {
                 let entry = entry.map_err(|e| anyhow!("cannot list {path}: {e}"))?;
                 let name = entry.filename().as_os_str().to_os_string();
                 if name != "." && name != ".." {
@@ -650,8 +671,7 @@ impl SftpRemote {
             }
             out.sort_by(|a: &(std::ffi::OsString, Stat), b| a.0.cmp(&b.0));
             Ok(out)
-        }));
-        listed.map_err(|()| timed_out(&format!("list {path}"), META_TIMEOUT))?
+        })
     }
 
     /// Reads `path` (up to `max` bytes) into `sink`, failing after [`STALL_TIMEOUT`] without data.
@@ -841,6 +861,65 @@ mod tests {
                 .map(OsString::from)
                 .collect::<Vec<_>>()[..]
         );
+    }
+
+    /// A stream of `0, 1, …` whose items come after the given delays.
+    struct Delayed {
+        delays: std::collections::VecDeque<Duration>,
+        sleep: Option<std::pin::Pin<Box<tokio::time::Sleep>>>,
+        next: u32,
+    }
+
+    impl Delayed {
+        fn new(delays: &[u64]) -> Self {
+            Self {
+                delays: delays.iter().map(|&ms| Duration::from_millis(ms)).collect(),
+                sleep: None,
+                next: 0,
+            }
+        }
+    }
+
+    impl futures_core::Stream for Delayed {
+        type Item = u32;
+        fn poll_next(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<u32>> {
+            use std::task::Poll;
+            if self.sleep.is_none() {
+                let Some(d) = self.delays.pop_front() else {
+                    return Poll::Ready(None);
+                };
+                self.sleep = Some(Box::pin(tokio::time::sleep(d)));
+            }
+            match self.sleep.as_mut().unwrap().as_mut().poll(cx) {
+                Poll::Ready(()) => {
+                    self.sleep = None;
+                    self.next += 1;
+                    Poll::Ready(Some(self.next - 1))
+                }
+                Poll::Pending => Poll::Pending,
+            }
+        }
+    }
+
+    /// A listing's timeout is per reply, not for the whole listing: a server that answers every
+    /// READDIR within the limit is never cut off however long the folder takes; one that stops
+    /// answering is.
+    #[test]
+    fn a_listing_times_out_per_reply_not_as_a_whole() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let limit = Duration::from_millis(150);
+        // Eight replies 50 ms apart: 400 ms in all, each well within the limit.
+        let got = rt.block_on(each_within(Delayed::new(&[50; 8]), limit));
+        assert_eq!(got, Ok((0..8).collect::<Vec<_>>()));
+        // A reply that never comes in time.
+        let got = rt.block_on(each_within(Delayed::new(&[50, 50, 400, 50]), limit));
+        assert_eq!(got, Err(()));
     }
 
     #[test]
