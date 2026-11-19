@@ -73,11 +73,14 @@ jobs:
 
       # The Linux binary loads only libasound and libc at start (X11, Wayland, EGL, Vulkan and
       # fontconfig are opened at runtime): prove it on a clean system with just the ALSA runtime.
-      # Same Ubuntu release as the runner: the binary needs the build host's glibc or newer.
+      # Same Ubuntu release as the runner (read from its /etc/os-release, so a new runner image
+      # moves it too): the binary needs the build host's glibc or newer.
       - name: Runtime libraries (Linux)
         if: runner.os == 'Linux'
         run: |
           cargo build --release --locked
-          docker run --rm -v "$PWD/target/release/sopen:/usr/local/bin/sopen:ro" ubuntu:24.04 \
+          image="ubuntu:$(. /etc/os-release && echo "$VERSION_ID")"
+          echo "clean system: $image"
+          docker run --rm -v "$PWD/target/release/sopen:/usr/local/bin/sopen:ro" "$image" \
             bash -c 'apt-get update -qq && apt-get install -y -qq libasound2t64 > /dev/null \
               && ldd /usr/local/bin/sopen && sopen --version'
