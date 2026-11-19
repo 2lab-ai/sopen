@@ -21,9 +21,9 @@
 //! cut would colour everything after it), and the rest of the file is plain. Files over
 //! [`HIGHLIGHT_MAX`] are always shown plain.
 //!
-//! The file is read live; the index is of the file as opened. A file that changes since then
-//! (size, modification time; or its path now names another file, or none) is noticed before each
-//! new page: the window says so and
+//! The file is read live; the index is of the file as opened. An append (the same file, larger,
+//! its indexed end as it was) only says so: the indexed part reads on. A file that changes
+//! otherwise ([`TextDoc::now`]) is noticed before each new page: the window says so and
 //! reads no more. Every offset taken from the index is checked, never trusted.
 
 use super::{chrome, Embedded, Outcome, Status, Window};
@@ -80,6 +80,8 @@ pub struct TextDoc {
     first_long: Option<u64>,
     /// The file as indexed: size, modification time and inode.
     opened: Identity,
+    /// The last bytes of what was indexed (up to [`TAIL`]): an append leaves them as they were.
+    tail: Vec<u8>,
     /// The path it was opened by (the local file, or the session's cached copy).
     path: std::path::PathBuf,
     /// Bytes read for lines (not the index pass) — what paging costs.
@@ -93,6 +95,9 @@ pub struct TextDoc {
 
 /// What [`TextDoc::changed`] compares: device, inode, size and modification time.
 type Identity = (u64, u64, u64, Option<std::time::SystemTime>);
+
+/// How much of the indexed end is kept to tell an append from a rewrite.
+const TAIL: usize = 4096;
 
 fn identity(meta: &std::fs::Metadata) -> Identity {
     use std::os::unix::fs::MetadataExt;
@@ -131,6 +136,7 @@ impl TextDoc {
         let mut marks = vec![Mark { line: 0, offset: 0 }];
         let (mut line, mut at, mut line_len) = (0u64, 0u64, 0u64);
         let (mut first_long, mut last_byte) = (None, None);
+        let mut tail: Vec<u8> = Vec::with_capacity(TAIL);
         let mut buf = vec![0u8; 1 << 20];
         loop {
             let n = file
@@ -165,6 +171,11 @@ impl TextDoc {
                 }
             }
             last_byte = Some(buf[n - 1]);
+            // The last TAIL bytes scanned (of what is indexed, not of the file now).
+            tail.extend_from_slice(&buf[n.saturating_sub(TAIL)..n]);
+            if tail.len() > TAIL {
+                tail.drain(..tail.len() - TAIL);
+            }
             at += n as u64;
             on_chunk(at);
             stopped()?;
@@ -188,6 +199,7 @@ impl TextDoc {
             ends_newline,
             first_long,
             opened,
+            tail,
             path: path.to_path_buf(),
             page_reads: 0,
             #[cfg(test)]
@@ -202,11 +214,44 @@ impl TextDoc {
     /// as the open followed them: a save that writes a new file and renames it over this one, or
     /// a delete, leaves the handle on the old file — another device or inode at the path, or
     /// nothing there, is a change too.
-    pub fn changed(&self) -> bool {
-        let same = |meta: std::io::Result<std::fs::Metadata>| {
-            meta.is_ok_and(|m| identity(&m) == self.opened)
+    /// What the file is now, against the index. It is the same file — the handle's and the
+    /// path's (followed through links, as opened) device and inode — or it [`Now::Changed`]:
+    /// a save by rename, a delete. Then by its size: the same size and modification time is
+    /// [`Now::Same`]; larger, with the last indexed bytes still as they were (a bounded read of
+    /// up to [`TAIL`] bytes), is an append, [`Now::Grew`] by that many bytes; anything else —
+    /// smaller, the same size written to, the indexed end rewritten — is [`Now::Changed`].
+    pub fn now(&self) -> Now {
+        use std::os::unix::fs::MetadataExt;
+        let (dev, ino, len, mtime) = self.opened;
+        let (Ok(handle), Ok(named)) = (self.file.metadata(), std::fs::metadata(&self.path)) else {
+            return Now::Changed;
         };
-        !same(self.file.metadata()) || !same(std::fs::metadata(&self.path))
+        if [&handle, &named]
+            .iter()
+            .any(|m| m.dev() != dev || m.ino() != ino)
+        {
+            return Now::Changed;
+        }
+        let now = handle.len();
+        if now == len && handle.modified().ok() == mtime {
+            return Now::Same;
+        }
+        if now <= len || len != self.size {
+            return Now::Changed;
+        }
+        // Appended to, if the indexed end is still the bytes indexed.
+        let mut held = vec![0u8; self.tail.len()];
+        let from = self.size - self.tail.len() as u64;
+        match self.file.read_exact_at(&mut held, from) {
+            Ok(()) if held == self.tail => Now::Grew(now - len),
+            _ => Now::Changed,
+        }
+    }
+
+    /// The file is not the one indexed any more ([`TextDoc::now`] says [`Now::Changed`]); an
+    /// append is not a change.
+    pub fn changed(&self) -> bool {
+        self.now() == Now::Changed
     }
 
     /// The same file and index on a handle of its own (the highlighting worker's).
@@ -222,6 +267,7 @@ impl TextDoc {
             ends_newline: self.ends_newline,
             first_long: self.first_long,
             opened: self.opened,
+            tail: self.tail.clone(),
             path: self.path.clone(),
             page_reads: 0,
             #[cfg(test)]
@@ -355,6 +401,14 @@ impl TextDoc {
         }
         Ok(out)
     }
+}
+
+/// What the file is now, against the index.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Now {
+    Same,
+    Grew(u64),
+    Changed,
 }
 
 /// The file is not what was indexed: a line that should end before the next mark does not.
@@ -895,11 +949,14 @@ struct TextWindow {
     painted: bool,
     /// The file changed since it was opened: nothing more is read.
     stale: bool,
+    /// Bytes appended since it was opened (the status says so); the indexed part is shown.
+    grew: Option<u64>,
 }
 
 impl TextWindow {
     fn new(mut doc: TextDoc, title: String, name: &str, notices: Vec<String>) -> Self {
         // Changed since it was indexed (between the opener's worker and now): nothing is read.
+        // Appended to is not a change: the indexed part reads as it was.
         let stale = doc.changed();
         let first = if stale {
             String::new()
@@ -936,6 +993,7 @@ impl TextWindow {
             #[cfg(test)]
             after_wake: None,
             pool: Pool::global(),
+            grew: None,
             top: 0,
             visible: 1,
             left: 0,
@@ -984,9 +1042,21 @@ impl TextWindow {
             .page
             .as_ref()
             .is_some_and(|p| p.top == top && p.count == count);
-        if !self.stale && self.doc.changed() {
-            self.stale = true;
-            self.status = Status::error(CHANGED);
+        if !self.stale {
+            match self.doc.now() {
+                Now::Changed => {
+                    self.stale = true;
+                    self.status = Status::error(CHANGED);
+                }
+                Now::Grew(more) if self.grew != Some(more) => {
+                    self.grew = Some(more);
+                    self.status = Status::info(format!(
+                        "the file grew since it was opened (+{more} bytes) — Esc and open it \
+                         again to see the end"
+                    ));
+                }
+                Now::Grew(_) | Now::Same => {}
+            }
         }
         if self.stale {
             // The index no longer describes the file: the page on screen stays (an empty one if

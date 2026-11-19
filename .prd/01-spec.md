@@ -189,11 +189,15 @@ replaces that module alone.
   page plain, ready, with the reason on the status row. A line is parsed only whole, so
   highlighting stops at the first line over 4096 bytes (the status row says which) and the rest
   is plain; files over 16 MiB are shown plain. The file is read live, the index is of the file as
-  opened: when it changes — its size or modification time through the open handle, or what its
-  path now names (another device or inode, as when an editor saves by renaming a new file over
-  it, or nothing: deleted; a remote file's path is its cached copy) — checked when the viewer
-  opens and before each page, the status row says so and the viewer reads no more (Esc and open it
-  again). A write that lands after the check cannot make a read run away either: a line is never
+  opened, checked when the viewer opens and before each page. An append is not a change: the
+  same file (device and inode, through the open handle and its path), larger, with the last 4 KiB
+  of what was indexed still the same bytes — a log being written to — keeps scrolling over the
+  indexed part (End reaches the indexed end, highlighting goes on) and the status row says "the
+  file grew since it was opened (+N bytes) — Esc and open it again to see the end". Anything else
+  is a change: what its path now names is another file (as when an editor saves by renaming a new
+  file over it) or none (deleted; a remote file's path is its cached copy), it is smaller, the same
+  size with another modification time, or the indexed end was rewritten. Then the status row says
+  so and the viewer reads no more (Esc and open it again). A write that lands after the check cannot make a read run away either: a line is never
   read past where the index says it must end — the next mark, or 64 KiB past its own block's mark
   when the next line was no mark — and one that does not end there is the same changed-file
   status. Offsets from the index are always checked.

@@ -351,8 +351,9 @@ fn a_line_cut_for_display_stops_highlighting_there() {
     assert_eq!(drv.colors_of("fn after399() {}"), Some(vec![plain]));
 }
 
-/// T3: the file changes under the viewer (it reads it live, a page at a time): growing,
-/// truncated, rewritten in place. Reads never panic, and the change is noticed.
+/// T3: the file changes under the viewer (it reads it live, a page at a time): truncated or
+/// rewritten in place is a change; appended to is growth (the indexed part is still what it
+/// was). Reads never panic.
 #[test]
 fn a_file_changed_after_it_was_indexed_never_panics_and_is_noticed() {
     let tmp = tempfile::tempdir().unwrap();
@@ -377,7 +378,13 @@ fn a_file_changed_after_it_was_indexed_never_panics_and_is_noticed() {
             }
         }
         drop(f);
-        assert!(doc.changed(), "{case}: noticed");
+        if case == "grow" {
+            assert!(!doc.changed(), "appended to: not a change");
+            assert_eq!(doc.now(), Now::Grew(4));
+        } else {
+            assert!(doc.changed(), "{case}: noticed");
+            assert_eq!(doc.now(), Now::Changed);
+        }
         // Whatever the bytes now are, reading the old lines does not panic.
         let _ = doc.read_lines(0, 3);
         let _ = doc.read_lines(1, 5);
@@ -601,7 +608,12 @@ fn a_file_growing_while_it_is_indexed() {
     let last = doc.read_lines(399_998, 5).unwrap();
     let texts: Vec<&str> = last.iter().map(|l| l.text.as_str()).collect();
     assert_eq!(texts, ["00399998", "00399999"]);
-    assert!(doc.changed(), "the growth is a change");
+    // Appended to while indexed: the indexed part is intact, so it grew, nothing changed.
+    assert!(!doc.changed());
+    assert_eq!(
+        doc.now(),
+        Now::Grew(b"appended while indexing\nand more".len() as u64)
+    );
 }
 
 /// A viewer drawing from its own admission pool of `cap` (tests do not share the process's).
@@ -782,4 +794,87 @@ fn a_panicked_worker_is_visible_before_the_wake() {
         "{}",
         win.status.text
     );
+}
+
+/// Appends `text` to the file at `path`.
+fn append(path: &Path, text: &str) {
+    use std::io::Write as _;
+    let mut f = std::fs::OpenOptions::new().append(true).open(path).unwrap();
+    f.write_all(text.as_bytes()).unwrap();
+}
+
+/// A log appended to while it is viewed keeps scrolling over what was indexed — End reaches
+/// the indexed end — and the status says how much it grew.
+#[test]
+fn a_log_appended_while_viewed_scrolls_to_its_indexed_end() {
+    let tmp = tempfile::tempdir().unwrap();
+    let body: String = (1..=500).map(|i| format!("row {i}\n")).collect();
+    let mut win = viewer(tmp.path(), "app.log", &body);
+    let mut drv = Driver::new(600.0, 400.0);
+    drv.until(&mut win, 5, |w| w.ready());
+    let more: String = (501..=600).map(|i| format!("row {i}\n")).collect();
+    append(&tmp.path().join("app.log"), &more);
+    drv.key(&mut win, Key::PageDown, Modifiers::NONE);
+    assert!(win.top > 0 && !win.stale, "it scrolled");
+    let shown = win.page.as_ref().unwrap();
+    assert_eq!(shown.top, win.top, "the page follows the scroll");
+    drv.key(&mut win, Key::End, Modifiers::NONE);
+    drv.until(&mut win, 5, |w| w.ready());
+    assert!(
+        drv.find_text("row 500").is_some(),
+        "the indexed end is shown"
+    );
+    assert!(
+        drv.find_text("row 501").is_none(),
+        "nothing past what was indexed"
+    );
+    assert!(
+        win.status.text.contains("grew") && win.status.text.contains(&format!("+{}", more.len())),
+        "{}",
+        win.status.text
+    );
+}
+
+/// An append that lands between indexing and the window opening: the window still opens with
+/// the indexed lines (not empty), and says the file grew.
+#[test]
+fn an_append_racing_the_open_still_opens() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = write(tmp.path(), "race.log", b"first\nsecond\n");
+    let doc = TextDoc::open(&path).unwrap();
+    append(&path, "third\n");
+    let mut win = TextWindow::new(doc, "race".into(), "race.log", vec![]);
+    let mut drv = Driver::new(600.0, 400.0);
+    drv.until(&mut win, 5, |w| w.ready());
+    assert!(!win.stale);
+    assert!(drv.find_text("first").is_some() && drv.find_text("second").is_some());
+    assert!(win.status.text.contains("grew"), "{}", win.status.text);
+}
+
+/// Growth that also rewrites the indexed tail is a change, not an append.
+#[test]
+fn a_grow_that_rewrites_the_indexed_tail_is_a_change() {
+    use std::os::unix::fs::FileExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let body: String = (0..2000).map(|i| format!("line {i:05}\n")).collect();
+    let path = write(tmp.path(), "rewritten.log", body.as_bytes());
+    let doc = TextDoc::open(&path).unwrap();
+    let f = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+    // The last indexed line, rewritten, then more appended.
+    f.write_all_at(b"LINE", body.len() as u64 - 11).unwrap();
+    drop(f);
+    append(&path, "more\n");
+    assert!(doc.changed());
+    assert_eq!(doc.now(), Now::Changed);
+    // Same size, touched in place far before the tail: also a change (the modification time).
+    let path2 = write(tmp.path(), "touched.log", body.as_bytes());
+    let doc = TextDoc::open(&path2).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    let f = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&path2)
+        .unwrap();
+    f.write_all_at(b"LINE", 0).unwrap();
+    drop(f);
+    assert_eq!(doc.now(), Now::Changed);
 }
