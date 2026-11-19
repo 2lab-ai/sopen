@@ -951,6 +951,18 @@ mod tests {
             )
         }
 
+        /// The PATH `sh` starts the line with, given HOST's PATH (and `extra_env`): the shell's
+        /// own startup files may have changed it (snapd's fish config appends /snap/bin; zsh
+        /// reads /etc/zshenv, bash `$BASH_ENV`). Read from `env`, run the way the line is.
+        fn start_path(&self, sh: &Shell, extra_env: &[(&str, &str)]) -> String {
+            let (code, out, err) = self.run(sh, &["env".to_string()], extra_env);
+            assert_eq!(code, 0, "{sh:?}: {err}");
+            out.lines()
+                .find_map(|l| l.strip_prefix("PATH="))
+                .unwrap_or_else(|| panic!("{sh:?}: no PATH in {out}"))
+                .to_string()
+        }
+
         /// An install path candidate under this host's temp dir, where nothing is installed.
         fn not_installed(&self) -> String {
             quote(self.root.join("not-installed/sopen").to_str().unwrap())
@@ -991,8 +1003,12 @@ mod tests {
                 has_line(&out, &format!("pwd {}", h.home.display())),
                 "{sh:?}: {out}"
             );
-            assert_eq!(value(&out, "SOPEN_STATE"), "rect=1,2,3,4;op=crop|pixelize");
-            assert_eq!(value(&out, "SOPEN_LOG"), "debug");
+            assert_eq!(
+                value(&out, "SOPEN_STATE"),
+                "rect=1,2,3,4;op=crop|pixelize",
+                "{sh:?}"
+            );
+            assert_eq!(value(&out, "SOPEN_LOG"), "debug", "{sh:?}");
             // `--hex` reaches HOST's sopen after `--here`, before `--`.
             let words = remote_words("box", source, None, true, &env, INSTALL_PATHS);
             let (code, out, err) = h.run(&sh, &words, &[]);
@@ -1005,7 +1021,7 @@ mod tests {
             );
             // Not Linux: no display variables are made up, and systemd is not asked.
             assert_eq!(value(&out, "DISPLAY"), "unset", "{sh:?}");
-            assert_eq!(value(&out, "WAYLAND_DISPLAY"), "unset");
+            assert_eq!(value(&out, "WAYLAND_DISPLAY"), "unset", "{sh:?}");
             assert_eq!(h.systemctl_args(), "", "{sh:?}");
         }
     }
@@ -1021,8 +1037,12 @@ mod tests {
             let words = remote_words("box", "/x", None, false, &env, &h.not_installed());
             let (code, out, err) = h.run(&sh, &words, &[]);
             assert_eq!(code, 0, "{sh:?}: {err}");
-            assert!(has_line(&out, "arg [--here]"), "{out}");
-            assert_eq!(value(&out, "SOPEN_TARGET_BIN"), elsewhere.to_str().unwrap());
+            assert!(has_line(&out, "arg [--here]"), "{sh:?}: {out}");
+            assert_eq!(
+                value(&out, "SOPEN_TARGET_BIN"),
+                elsewhere.to_str().unwrap(),
+                "{sh:?}"
+            );
 
             // Not on PATH: the install paths, in order, `$HOME` expanded on HOST. (Not the
             // production list: a sopen installed on the test machine would be found first.)
@@ -1031,68 +1051,147 @@ mod tests {
             let words = remote_words("box", "/x", None, false, &[], &paths);
             let (code, out, err) = h.run(&sh, &words, &[]);
             assert_eq!(code, 0, "{sh:?}: {err}");
-            assert!(has_line(&out, "arg [/x]"), "{out}");
+            assert!(has_line(&out, "arg [/x]"), "{sh:?}: {out}");
         }
     }
 
     #[test]
     fn sopen_on_the_target_finds_the_ffmpeg_next_to_it() {
         for sh in login_shells() {
-            let h = host("Darwin", "");
-            let session = h.bin.to_str().unwrap().to_string();
-            // A brew-style install outside the session's PATH, ffmpeg beside sopen.
-            let brew = h.root.join("brew/bin");
-            executable(&brew.join("sopen"), &fake_sopen());
-            executable(&brew.join("ffmpeg"), "#!/bin/sh\n");
-            let paths = quote(brew.join("sopen").to_str().unwrap());
-            let words = remote_words("box", "/x", None, false, &[], &paths);
-            let (code, out, err) = h.run(&sh, &words, &[]);
-            assert_eq!(code, 0, "{sh:?}: {err}");
-            let path = value(&out, "PATH");
+            ffmpeg_next_to_sopen(&sh, false);
+        }
+    }
+
+    /// The PATH a login shell starts the line with is its own: its startup files may have
+    /// changed the session's (snapd's fish config appends /snap/bin; zsh reads /etc/zshenv, bash
+    /// `$BASH_ENV`). sopen keeps it. Here bash reads a `$BASH_ENV` that appends a dir.
+    #[test]
+    fn a_path_changed_by_the_login_shells_startup_is_kept() {
+        let bash = login_shells()
+            .into_iter()
+            .find(|sh| sh.path.file_name().is_some_and(|n| n == "bash"));
+        match bash {
+            Some(bash) => ffmpeg_next_to_sopen(&bash, true),
+            None => eprintln!("note: bash is not on PATH; its $BASH_ENV case is skipped"),
+        }
+    }
+
+    /// What the script appended to `path` after `first` (sopen's dir, then the PATH the shell
+    /// started with, `start`): Homebrew's bin dirs that exist and are not on `start`, once each.
+    fn appended<'a>(sh: &Shell, path: &'a str, first: &str, start: &str) -> Vec<&'a str> {
+        let rest = path
+            .strip_prefix(first)
+            .unwrap_or_else(|| panic!("{sh:?}: {path} does not start with {first}"));
+        let entries: Vec<&str> = match rest {
+            "" => Vec::new(),
+            rest => rest
+                .strip_prefix(':')
+                .unwrap_or_else(|| panic!("{sh:?}: {path} does not start with {first}:"))
+                .split(':')
+                .collect(),
+        };
+        let on_start: Vec<&str> = start.split(':').collect();
+        for (i, entry) in entries.iter().enumerate() {
+            assert!(Path::new(entry).is_dir(), "{sh:?}: {entry} in {path}");
+            assert!(!on_start.contains(entry), "{sh:?}: {entry} again in {path}");
             assert!(
-                path.starts_with(&format!("{}:{session}", brew.display())),
-                "{sh:?}: {path}"
-            );
-            assert_eq!(value(&out, "ffmpeg"), brew.join("ffmpeg").to_str().unwrap());
-
-            // SOPEN_TARGET_BIN elsewhere: its dir first, and Homebrew's bin dirs that exist are
-            // appended after the session's own entries, once each. (`$HOME/.linuxbrew/bin` is
-            // the one a test can create; the absolute ones count where this machine has them.)
-            let linuxbrew = h.home.join(".linuxbrew/bin");
-            std::fs::create_dir_all(&linuxbrew).unwrap();
-            let elsewhere = h.root.join("build/sopen-dev");
-            executable(&elsewhere, &fake_sopen());
-            let env = [format!("SOPEN_TARGET_BIN={}", elsewhere.display())];
-            let words = remote_words("box", "/x", None, false, &env, &h.not_installed());
-            let (code, out, err) = h.run(&sh, &words, &[]);
-            assert_eq!(code, 0, "{sh:?}: {err}");
-            let path = value(&out, "PATH");
-            let first = format!("{}:{session}:", h.root.join("build").display());
-            let appended = path
-                .strip_prefix(&first)
-                .unwrap_or_else(|| panic!("{sh:?}: {path}"));
-            let fixed = [
-                "/opt/homebrew/bin",
-                "/usr/local/bin",
-                "/home/linuxbrew/.linuxbrew/bin",
-            ];
-            let entries: Vec<&str> = appended.split(':').collect();
-            assert_eq!(entries.last(), Some(&linuxbrew.to_str().unwrap()), "{path}");
-            for entry in &entries[..entries.len() - 1] {
-                assert!(fixed.contains(entry), "{entry} in {path}");
-            }
-
-            // Already on the session's PATH: not appended again.
-            let session_with = format!("{session}:{}", linuxbrew.display());
-            let (code, out, err) = h.run(&sh, &words, &[("PATH", &session_with)]);
-            assert_eq!(code, 0, "{sh:?}: {err}");
-            let path = value(&out, "PATH");
-            assert_eq!(
-                path.matches(linuxbrew.to_str().unwrap()).count(),
-                1,
-                "{path}"
+                !entries[..i].contains(entry),
+                "{sh:?}: {entry} twice in {path}"
             );
         }
+        entries
+    }
+
+    /// One lane of [`sopen_on_the_target_finds_the_ffmpeg_next_to_it`]. With `startup`, bash
+    /// reads a `$BASH_ENV` that appends a dir to PATH before it runs the line.
+    fn ffmpeg_next_to_sopen(sh: &Shell, startup: bool) {
+        let h = host("Darwin", "");
+        let session = h.bin.to_str().unwrap().to_string();
+        let added = h.root.join("snap/bin");
+        let bash_env = h.root.join("bash-env");
+        let mut base: Vec<(&str, &str)> = Vec::new();
+        if startup {
+            std::fs::create_dir_all(&added).unwrap();
+            let line = format!("PATH=$PATH:{}\n", quote(added.to_str().unwrap()));
+            std::fs::write(&bash_env, line).unwrap();
+            base.push(("BASH_ENV", bash_env.to_str().unwrap()));
+        }
+        // The session's PATH as the login shell starts the line with it; the script builds on
+        // this, not on the PATH the session handed the shell.
+        let start = h.start_path(sh, &base);
+        if startup {
+            assert_eq!(
+                start,
+                format!("{session}:{}", added.display()),
+                "{sh:?}: $BASH_ENV was not read"
+            );
+        }
+        let fixed = [
+            "/opt/homebrew/bin",
+            "/usr/local/bin",
+            "/home/linuxbrew/.linuxbrew/bin",
+        ];
+
+        // A brew-style install outside the session's PATH, ffmpeg beside sopen: its dir first,
+        // then the start PATH, then Homebrew's bin dirs that exist.
+        let brew = h.root.join("brew/bin");
+        executable(&brew.join("sopen"), &fake_sopen());
+        executable(&brew.join("ffmpeg"), "#!/bin/sh\n");
+        let paths = quote(brew.join("sopen").to_str().unwrap());
+        let words = remote_words("box", "/x", None, false, &[], &paths);
+        let (code, out, err) = h.run(sh, &words, &base);
+        assert_eq!(code, 0, "{sh:?}: {err}");
+        let path = value(&out, "PATH");
+        let first = format!("{}:{start}", brew.display());
+        for entry in appended(sh, path, &first, &start) {
+            assert!(fixed.contains(&entry), "{sh:?}: {entry} in {path}");
+        }
+        assert_eq!(
+            value(&out, "ffmpeg"),
+            brew.join("ffmpeg").to_str().unwrap(),
+            "{sh:?}"
+        );
+
+        // SOPEN_TARGET_BIN elsewhere: its dir first, and Homebrew's bin dirs that exist are
+        // appended after the session's own entries, once each. (`$HOME/.linuxbrew/bin` is
+        // the one a test can create; the absolute ones count where this machine has them.)
+        let linuxbrew = h.home.join(".linuxbrew/bin");
+        std::fs::create_dir_all(&linuxbrew).unwrap();
+        let elsewhere = h.root.join("build/sopen-dev");
+        executable(&elsewhere, &fake_sopen());
+        let env = [format!("SOPEN_TARGET_BIN={}", elsewhere.display())];
+        let words = remote_words("box", "/x", None, false, &env, &h.not_installed());
+        let (code, out, err) = h.run(sh, &words, &base);
+        assert_eq!(code, 0, "{sh:?}: {err}");
+        let path = value(&out, "PATH");
+        let first = format!("{}:{start}", h.root.join("build").display());
+        let entries = appended(sh, path, &first, &start);
+        assert_eq!(
+            entries.last(),
+            Some(&linuxbrew.to_str().unwrap()),
+            "{sh:?}: {path}"
+        );
+        for entry in &entries[..entries.len() - 1] {
+            assert!(fixed.contains(entry), "{sh:?}: {entry} in {path}");
+        }
+
+        // Already on the session's PATH: not appended again.
+        let session_with = format!("{session}:{}", linuxbrew.display());
+        let mut with = base.clone();
+        with.push(("PATH", &session_with));
+        let start_with = h.start_path(sh, &with);
+        let (code, out, err) = h.run(sh, &words, &with);
+        assert_eq!(code, 0, "{sh:?}: {err}");
+        let path = value(&out, "PATH");
+        let first = format!("{}:{start_with}", h.root.join("build").display());
+        for entry in appended(sh, path, &first, &start_with) {
+            assert!(fixed.contains(&entry), "{sh:?}: {entry} in {path}");
+        }
+        assert_eq!(
+            path.matches(linuxbrew.to_str().unwrap()).count(),
+            1,
+            "{sh:?}: {path}"
+        );
     }
 
     #[test]
@@ -1182,15 +1281,15 @@ mod tests {
             for (key, val) in imported {
                 assert_eq!(value(&out, key), val, "{sh:?} {key}");
             }
-            assert_eq!(value(&out, "EVIL"), "unset");
-            assert!(!value(&out, "PATH").contains("/nowhere"), "{out}");
+            assert_eq!(value(&out, "EVIL"), "unset", "{sh:?}");
+            assert!(!value(&out, "PATH").contains("/nowhere"), "{sh:?}: {out}");
 
             // A value systemd prints C-quoted (`$'…'`) is left alone.
             let session = "DISPLAY=:7\nXAUTHORITY=$'/a b'\n";
             std::fs::write(h.root.join("session-env"), session).unwrap();
             let (code, out, err) = h.run(&sh, &words, &[]);
             assert_eq!(code, 0, "{sh:?}: {err}");
-            assert_eq!(value(&out, "DISPLAY"), ":7");
+            assert_eq!(value(&out, "DISPLAY"), ":7", "{sh:?}");
             assert_eq!(value(&out, "XAUTHORITY"), "unset", "{sh:?}");
         }
     }
@@ -1209,8 +1308,12 @@ mod tests {
             let (code, out, err) = h.run(&sh, &words, &runtime);
             assert_eq!(code, 0, "{sh:?}: {err}");
             assert_eq!(value(&out, "WAYLAND_DISPLAY"), "wayland-3", "{sh:?}");
-            assert_eq!(value(&out, "DISPLAY"), "unset");
-            assert_eq!(value(&out, "XDG_RUNTIME_DIR"), run.to_str().unwrap());
+            assert_eq!(value(&out, "DISPLAY"), "unset", "{sh:?}");
+            assert_eq!(
+                value(&out, "XDG_RUNTIME_DIR"),
+                run.to_str().unwrap(),
+                "{sh:?}"
+            );
 
             // systemd failing (no user manager) is quiet and falls back the same way.
             std::fs::write(h.root.join("session-env"), "").unwrap();
@@ -1218,16 +1321,16 @@ mod tests {
             let (code, out, err) = h.run(&sh, &words, &runtime);
             assert_eq!(code, 0, "{sh:?}: {err}");
             assert_eq!(err, "", "{sh:?}");
-            assert_eq!(h.systemctl_args(), "--user\nshow-environment\n");
+            assert_eq!(h.systemctl_args(), "--user\nshow-environment\n", "{sh:?}");
             assert_eq!(value(&out, "WAYLAND_DISPLAY"), "wayland-3", "{sh:?}");
 
             // A display already set is left alone, and systemd is not asked.
             std::fs::remove_file(h.root.join("systemctl-args")).unwrap();
-            let (code, out, _) = h.run(&sh, &words, &[("DISPLAY", ":1")]);
-            assert_eq!(code, 0);
-            assert_eq!(value(&out, "DISPLAY"), ":1");
-            assert_eq!(value(&out, "WAYLAND_DISPLAY"), "unset");
-            assert_eq!(h.systemctl_args(), "");
+            let (code, out, err) = h.run(&sh, &words, &[("DISPLAY", ":1")]);
+            assert_eq!(code, 0, "{sh:?}: {err}");
+            assert_eq!(value(&out, "DISPLAY"), ":1", "{sh:?}");
+            assert_eq!(value(&out, "WAYLAND_DISPLAY"), "unset", "{sh:?}");
+            assert_eq!(h.systemctl_args(), "", "{sh:?}");
         }
     }
 }
