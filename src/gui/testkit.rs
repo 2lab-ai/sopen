@@ -23,10 +23,13 @@ pub struct Driver {
 }
 
 impl Driver {
-    /// A `w`×`h`-point window at 1 pixel per point.
+    /// A `w`×`h`-point window at 1 pixel per point, in the skin every window gets before its
+    /// first frame ([`super::chrome::install`]), so tests lay out what the owner sees.
     pub fn new(w: f32, h: f32) -> Self {
+        let ctx = egui::Context::default();
+        super::chrome::install(&ctx);
         Self {
-            ctx: egui::Context::default(),
+            ctx,
             size: Vec2::new(w, h),
             time: 0.0,
             pointer: Pos2::new(w / 2.0, h / 2.0),
@@ -294,6 +297,30 @@ impl Driver {
                     .map(|s| s.format.color)
                     .collect::<Vec<_>>(),
             )),
+            _ => None,
+        });
+        found.into_iter().next().map(|(_, colors)| colors)
+    }
+
+    /// The colours `text` is painted in on screen, where the last pass drew it whole (as for
+    /// [`Driver::colors_of`]) — a widget's label is laid out in a placeholder colour and painted
+    /// in its state's text colour, which this resolves.
+    pub fn painted_colors_of(&self, text: &str) -> Option<Vec<egui::Color32>> {
+        let found = self.shown(|s| match s {
+            egui::Shape::Text(t) if t.galley.text() == text && !t.galley.elided => {
+                let colors = t
+                    .galley
+                    .job
+                    .sections
+                    .iter()
+                    .map(|s| match (t.override_text_color, s.format.color) {
+                        (Some(c), _) => c,
+                        (None, c) if c == egui::Color32::PLACEHOLDER => t.fallback_color,
+                        (None, c) => c,
+                    })
+                    .collect::<Vec<_>>();
+                Some((t.galley.rect.translate(t.pos.to_vec2()), colors))
+            }
             _ => None,
         });
         found.into_iter().next().map(|(_, colors)| colors)

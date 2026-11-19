@@ -740,7 +740,8 @@ impl Browser {
         let p = chrome::Palette::of(ui.visuals());
         let font = chrome::mono(ui);
         let (cw, text_h) = ctx.fonts_mut(|f| (f.glyph_width(&font, '0'), f.row_height(&font)));
-        let row_h = (text_h + 2.0).ceil();
+        // Rows touch, a cell apart, as on a text screen.
+        let row_h = text_h.ceil();
         // Columns, in characters: Name (what is left) · Ext · Size · Date · Time.
         let chars = (inner.width() / cw).floor().max(10.0) as usize;
         let dated = chars >= 48;
@@ -777,8 +778,10 @@ impl Browser {
             cell(&painter, x_time, head_y, "Time", p.dim);
         }
         let rows_top = head_y + row_h;
+        // The foot: a row with the line across the window, then the counts.
         let foot_y = inner.bottom() - row_h;
-        let visible = (((foot_y - rows_top - 4.0) / row_h).floor() as usize).max(1);
+        let rule_y = foot_y - row_h;
+        let visible = (((rule_y - rows_top) / row_h).floor() as usize).max(1);
         self.visible = visible;
         let panel = &mut self.panels[i];
         // The wheel scrolls the rows (the bar stays where it is).
@@ -807,10 +810,8 @@ impl Browser {
         for (row, idx) in (panel.top..panel.entries.len()).take(visible).enumerate() {
             let entry = &panel.entries[idx];
             let y = rows_top + row as f32 * row_h;
-            let row_rect = Rect::from_min_size(
-                Pos2::new(inner.left() - 2.0, y),
-                Vec2::new(inner.width() + 4.0, row_h),
-            );
+            let row_rect =
+                Rect::from_min_size(Pos2::new(inner.left(), y), Vec2::new(inner.width(), row_h));
             if idx == panel.highlight {
                 chrome::bar(&painter, row_rect, active);
             }
@@ -853,8 +854,32 @@ impl Browser {
                 clicked = Some((idx, false));
             }
         }
-        chrome::rule(&painter, inner.left(), inner.right(), foot_y - 2.0);
-        cell(&painter, inner.left(), foot_y, &panel.footer(), p.text);
+        // The scroll bar on the right border, beside the rows.
+        let max_top = panel.entries.len().saturating_sub(visible);
+        let column = Rect::from_min_max(
+            Pos2::new(inner.right(), inner.top()),
+            Pos2::new(inner.right() + chrome::CELL.x, rule_y),
+        );
+        chrome::scroll_bar(
+            &painter,
+            column,
+            (max_top > 0).then(|| panel.top as f32 / max_top as f32),
+        );
+        let half = chrome::CELL / 2.0;
+        chrome::rule(
+            &painter,
+            inner.left() - half.x,
+            inner.right() + half.x,
+            rule_y + half.y,
+            active,
+        );
+        painter.text(
+            Pos2::new(inner.center().x.round(), foot_y),
+            egui::Align2::CENTER_TOP,
+            panel.footer(),
+            font.clone(),
+            p.text,
+        );
         if let Some((idx, open)) = clicked {
             if self.task.is_none() && self.viewer.is_none() {
                 self.active = i;
@@ -906,27 +931,15 @@ impl Window for Browser {
         // Before anything else this pass: did this frame's Esc take the keyboard from a field?
         let esc_was_a_fields = self.focused_before && ctx.memory(|m| m.focused()).is_none();
         self.poll(&ctx);
-        let keys: &[FKey] = if self.viewer.is_some() {
-            chrome::VIEWER_KEYS
-        } else {
-            chrome::LIST_KEYS
+        let keys: Vec<FKey> = match &self.viewer {
+            Some(v) => chrome::merged(chrome::VIEWER_KEYS, v.embedded.window.keys()),
+            None => chrome::LIST_KEYS.to_vec(),
         };
-        egui::Panel::top("sopen-browser-title").show(ui, |ui| {
-            ui.add_space(2.0);
-            chrome::title_row(ui, &self.title);
-            ui.add_space(1.0);
-        });
-        egui::Panel::bottom("sopen-browser-keys").show(ui, |ui| {
-            ui.add_space(2.0);
-            chrome::fkey_row(ui, keys);
-            ui.add_space(2.0);
-        });
+        chrome::title_panel(ui, "sopen-browser-title", &self.title);
+        chrome::key_panel(ui, "sopen-browser-keys", &keys);
         let status = self.status_line();
-        egui::Panel::bottom("sopen-browser-status").show(ui, |ui| {
-            ui.add_space(2.0);
-            chrome::status_row(ui, &status);
-            ui.add_space(1.0);
-        });
+        chrome::bar_panel(egui::Panel::bottom("sopen-browser-status"))
+            .show(ui, |ui| chrome::status_row(ui, &status));
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE)
             .show(ui, |ui| {

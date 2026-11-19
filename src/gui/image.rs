@@ -26,6 +26,8 @@ use std::time::SystemTime;
 
 /// Default pixelize block, in image pixels.
 pub const DEFAULT_BLOCK: u32 = 16;
+/// The window's title in its frame, in the manner of PC Shell's `File Edit`.
+const TITLE: &str = "Image Edit";
 /// Undo history bound: whichever of these is hit first drops the oldest step.
 const HISTORY_STEPS: usize = 32;
 const HISTORY_BYTES: usize = 1 << 30;
@@ -1063,14 +1065,15 @@ pub fn open(file: ImageFile, hooks: &Hooks, notices: Vec<String>) -> Result<Outc
     if !file.can_replace() {
         eprintln!("sopen: {CANNOT_REPLACE}");
     }
-    let window = ImageWindow::new(file, doc, sel, block, notices);
+    let mut window = ImageWindow::new(file, doc, sel, block, notices);
+    window.ask_close = hooks.state.ask_close;
     let outcome = window.outcome.clone();
     let leftover = window.leftover.clone();
-    // A window that shows the image near 1:1 where the screen allows (the two toolbar rows
-    // and the status bar above and below it); eframe clamps to it.
+    // A window that shows the image near 1:1 where the screen allows (the two toolbar rows,
+    // the frame, the status bar and the F-key row around it); eframe clamps to it.
     let size = [
-        (w as f32).clamp(640.0, 1400.0),
-        (h as f32 + 113.0).clamp(420.0, 940.0),
+        (w as f32 + 2.0 * super::chrome::CELL.x).clamp(640.0, 1400.0),
+        (h as f32 + 121.0).clamp(420.0, 940.0),
     ];
     let run = super::run_window(&title, size, window, hooks);
     // Never exit with a write in flight without its outcome on the terminal.
@@ -1260,6 +1263,8 @@ struct ImageWindow {
     text_colour: Color32,
     /// A cut or paste whose key is still down (see [`Held`]).
     held: Option<Held>,
+    /// `SOPEN_STATE` `close=ask`: closing is asked for on the first pass.
+    ask_close: bool,
 }
 
 /// A Cut or Paste whose key has not been let go yet. egui-winit 0.37 drops winit's key-repeat
@@ -1336,6 +1341,7 @@ impl ImageWindow {
             has_alpha,
             text_colour: Color32::BLACK,
             held: None,
+            ask_close: false,
         }
     }
 
@@ -1727,8 +1733,12 @@ impl ImageWindow {
                         "unscaled at its top-left, cut off at its edges",
                     ),
                 ] {
-                    ui.selectable_value(&mut self.fit, fit, label)
-                        .on_hover_text(hint);
+                    if super::chrome::choice(ui, self.fit == fit, label)
+                        .on_hover_text(hint)
+                        .clicked()
+                    {
+                        self.fit = fit;
+                    }
                 }
                 ui.label("Background");
                 color_edit_button_srgba(ui, &mut self.background, Alpha::Opaque)
@@ -1854,7 +1864,9 @@ impl ImageWindow {
 
     fn central(&mut self, ui: &mut egui::Ui) -> f32 {
         let ctx = ui.ctx().clone();
-        let panel = ui.max_rect();
+        // The window's frame; the picture on black inside it.
+        let outer = ui.max_rect();
+        let panel = super::chrome::frame(&ui.painter_at(outer), outer, TITLE, true);
         let src = self.bounds();
         let fit_scale = (panel.width() / src.x).min(panel.height() / src.y);
         let resp = ui.allocate_rect(panel, Sense::click_and_drag());
@@ -1865,7 +1877,7 @@ impl ImageWindow {
         let map = Map { disp, src };
         let tex = self.texture(&ctx);
         let painter = ui.painter_at(panel);
-        painter.rect_filled(panel, 0.0, Color32::from_gray(28));
+        painter.rect_filled(panel, 0.0, super::chrome::PALETTE.picture_back);
         painter.image(
             tex,
             disp,
@@ -1885,9 +1897,9 @@ impl ImageWindow {
         if !self.prompt {
             return;
         }
-        let modal = egui::Modal::new(egui::Id::unique("unsaved")).show(ctx, |ui| {
+        let id = egui::Id::unique("unsaved");
+        let modal = super::chrome::dialog(ctx, id, "Unsaved changes", |ui| {
             ui.set_width(360.0);
-            ui.heading("Unsaved changes");
             ui.label(format!(
                 "Save the changes to {} before closing?",
                 self.title
@@ -1921,6 +1933,10 @@ impl ImageWindow {
 impl super::Window for ImageWindow {
     fn ui(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
+        if std::mem::take(&mut self.ask_close) {
+            // `SOPEN_STATE` `close=ask`: as if closing were asked for (the prompt's receipt).
+            self.close_requested();
+        }
         self.poll_job(&ctx);
         self.keys(&ctx);
         self.clipboard(&ctx);
@@ -1930,6 +1946,8 @@ impl super::Window for ImageWindow {
             self.paste_row(ui);
             ui.add_space(1.0);
         });
+        // The F-key row, the window's last (on its own: the browser around it has the row).
+        super::own_keys(ui, &[]);
         // A report that lands while the button is down (a drag, or a press that may become one)
         // waits until it is let go: its row would move the image under the pointer.
         let held = self.sel.dragging() || ctx.input(|i| i.pointer.primary_down());

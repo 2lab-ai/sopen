@@ -128,8 +128,7 @@ impl Fx {
     /// `path` as a panel's frame shows it (a 1000-point window: two 496-point panels): whole,
     /// or its end after "…".
     fn framed(&self, path: &str) -> String {
-        let font = egui::FontId::monospace(13.0);
-        chrome::fit_left(&self.drv.ctx, path, &font, 496.0 - 24.0)
+        chrome::frame_title(&self.drv.ctx, path, 496.0)
     }
 
     /// Opens `name` (Enter) and waits until its viewer is on screen and ready.
@@ -165,8 +164,8 @@ fn both_panels_list_the_folder_folders_first() {
     assert_eq!(fx.b.panels[0].dir, fx.root);
     // The footer: entries but `..`, the files' bytes, the free space.
     let footer = fx.b.panels[0].footer();
-    assert!(footer.starts_with("8 listed = "), "{footer}");
-    assert!(footer.contains("bytes free"), "{footer}");
+    assert!(footer.starts_with("8 Listed = "), "{footer}");
+    assert!(footer.contains("Bytes Free"), "{footer}");
     // On screen: the path in the frame, the column heads, a hidden file dimmed, the F-keys.
     let framed = fx.framed(&fx.root);
     assert!(
@@ -346,6 +345,37 @@ fn keys_in_a_viewer_never_move_the_list() {
     assert!(fx.b.viewer.is_none());
     assert!(!fx.drv.closed());
     assert_eq!((fx.b.active, fx.current().as_str()), (0, "data.bin"));
+}
+
+/// A viewer's own F-keys join the browser's on its row (the hex window's Save, Goto and Asc/hx
+/// beside Exit and Edit), and they work there; F3 still leaves the viewer, not the window.
+#[test]
+fn a_viewers_f_keys_join_the_browsers_row() {
+    let mut fx = fixture();
+    fx.open("data.bin");
+    for label in ["Exit   ", "Edit   ", "Save   ", "Goto   ", "Asc/hx "] {
+        assert!(fx.drv.find_text(label).is_some(), "{label:?} in the row");
+    }
+    // The first row is 00 01 02 …: F8 moves the typing to the ASCII column, where Z is a byte.
+    fx.key(Key::F8);
+    fx.typed("Z");
+    assert!(
+        fx.drv.text_starting_with("5A 01 02").is_some(),
+        "F8 put the typing in the ASCII column"
+    );
+    fx.key(Key::F3);
+    assert!(
+        fx.drv.find_text("Unsaved changes").is_some(),
+        "the hex window asks"
+    );
+    fx.drv.click_text(&mut fx.b, "Discard");
+    assert!(fx.b.viewer.is_none());
+    assert!(!fx.drv.closed(), "only the viewer went");
+    assert!(
+        fx.drv.find_text("View   ").is_some(),
+        "the list's row again"
+    );
+    assert!(fx.drv.find_text("Asc/hx ").is_none());
 }
 
 /// F4 runs the real editor launch (`zed::launch`) — VS Code's CLI here is a script that writes
@@ -607,7 +637,7 @@ fn the_listing_hook_prints_what_the_panel_shows() {
         "{main}"
     );
     assert!(
-        lines.last().unwrap().starts_with("8 listed = "),
+        lines.last().unwrap().starts_with("8 Listed = "),
         "{lines:?}"
     );
 }
@@ -910,10 +940,10 @@ fn an_entry_named_in_bad_utf8_is_not_opened() {
 #[test]
 fn a_wide_path_is_fitted_by_its_real_width() {
     let fx = fixture();
-    let font = egui::FontId::monospace(13.0);
-    // The test kit has only egui's own fonts, where most glyphs (Hangul too, which a system
-    // font draws wide) are as wide as "0"; the ideographic space U+3000 is wider there.
-    let path = format!("/srv/{}/마지막폴더", "한\u{3000}글\u{3000}".repeat(8));
+    let font = chrome::font();
+    // The test kit has the skin's VGA font and egui's own after it, where Hangul (which a
+    // system font draws wide) is as wide as "0"; the ideographic space U+3000 is wider there.
+    let path = format!("/srv/{}/마지막폴더", "한\u{3000}글\u{3000}".repeat(12));
     let w = |t: &str| {
         fx.drv.ctx.fonts_mut(|f| {
             f.layout_no_wrap(t.to_string(), font.clone(), egui::Color32::WHITE)
@@ -979,7 +1009,7 @@ fn early_times_floor_and_the_footer_never_overflows() {
     p.fill("/x".into(), vec![e, f], None, None);
     assert!(
         p.footer()
-            .starts_with("2 listed = 36,893,488,147,419,103,230 bytes"),
+            .starts_with("2 Listed = 36,893,488,147,419,103,230 bytes"),
         "{}",
         p.footer()
     );

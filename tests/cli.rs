@@ -325,7 +325,7 @@ fn a_folder_opens_in_the_browser_not_the_editor() {
         lines[3].starts_with("a ") && lines[3].contains(" txt "),
         "{listed}"
     );
-    assert!(lines[4].starts_with("2 listed = 4 bytes"), "{listed}");
+    assert!(lines[4].starts_with("2 Listed = 4 bytes"), "{listed}");
     assert!(!record.exists(), "VS Code was run for a folder");
     let log = usage_lines(tmp.path());
     assert_eq!(

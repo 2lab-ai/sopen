@@ -180,7 +180,7 @@ pub enum Op {
 /// `SOPEN_STATE=rect=x,y,w,h;t=3.5;in=2;out=6;op=crop|pixelize;block=16` — source pixels and
 /// seconds. `op` may list several, comma-separated, applied in order. The hex window takes
 /// `at=OFFSET;patch=OFFSET:HEXBYTES[,OFFSET:HEXBYTES]` (offsets `0x…` or decimal); the file
-/// browser `open=NAME`.
+/// browser `open=NAME`; the image and hex windows `close=ask`.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct State {
     pub rect: Option<[u32; 4]>,
@@ -195,6 +195,9 @@ pub struct State {
     pub patches: Vec<(u64, Vec<u8>)>,
     /// File browser: the entry of the opened folder to open (as Enter would) once it is listed.
     pub open: Option<String>,
+    /// Image and hex windows: closing is asked for once the state is on screen, so an edit the
+    /// state made brings up the unsaved-changes prompt (`close=ask`, the prompt's receipt).
+    pub ask_close: bool,
 }
 
 impl State {
@@ -233,6 +236,10 @@ impl State {
                 }
                 "at" => state.at = Some(hex::parse_offset(value).context("SOPEN_STATE at")?),
                 "open" => state.open = Some(value.to_string()),
+                "close" => match value {
+                    "ask" => state.ask_close = true,
+                    other => bail!("SOPEN_STATE: close must be 'ask' (got '{other}')"),
+                },
                 "patch" => {
                     for one in value.split(',').map(str::trim) {
                         let (at, bytes) = one.split_once(':').ok_or_else(|| {
@@ -370,6 +377,12 @@ pub trait Window {
     fn close_requested(&mut self) -> bool {
         true
     }
+
+    /// The F-keys the window handles itself, for the browser's F-key row while it is hosted
+    /// there (a window of its own shows them in its own row, see [`own_keys`]).
+    fn keys(&self) -> &'static [chrome::FKey] {
+        &[]
+    }
 }
 
 /// While a window is hosted inside another (the file browser shows a viewer in its own
@@ -397,6 +410,34 @@ pub fn request_close(ctx: &egui::Context) {
     });
     if !hosted {
         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+    }
+}
+
+/// Whether this pass is a window hosted inside another one ([`host_pass`]): the host draws the
+/// rows around it (the F-keys) and reads its keys F3 and F4.
+pub fn hosted(ctx: &egui::Context) -> bool {
+    ctx.data(|d| d.get_temp::<Hosted>(hosted_id()).is_some())
+}
+
+/// A window's F-key row at the bottom of `ui` — F3 (closes it, as Cmd/Ctrl+W does) and its own
+/// `keys` — and F3 itself. Nothing while it is hosted: the host's row lists the window's keys
+/// with its own, and its F3 leaves the window. Call it before the window's other bottom panels
+/// (the row is the window's last).
+pub fn own_keys(ui: &mut egui::Ui, keys: &[chrome::FKey]) {
+    let ctx = ui.ctx().clone();
+    if hosted(&ctx) {
+        return;
+    }
+    chrome::key_panel(
+        ui,
+        "sopen-own-keys",
+        &chrome::merged(&[chrome::EXIT_KEY], keys),
+    );
+    // Not while a text field has the keyboard (F3 is not text, but the field is the owner's).
+    if !ctx.text_edit_focused()
+        && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::F3))
+    {
+        request_close(&ctx);
     }
 }
 
@@ -567,6 +608,11 @@ impl<W: Window> Shell<W> {
 }
 
 impl<W: Window> eframe::App for Shell<W> {
+    /// The skin's window body where nothing is painted (eframe's default is a dark grey).
+    fn clear_color(&self, visuals: &egui::Visuals) -> [f32; 4] {
+        visuals.panel_fill.to_normalized_gamma_f32()
+    }
+
     fn raw_input_hook(&mut self, _ctx: &egui::Context, raw: &mut egui::RawInput) {
         if self.scripted {
             // A scripted run renders the state it was given; keys typed into whatever window
@@ -743,7 +789,9 @@ pub fn run_window_sized<W: Window + 'static>(
         eframe::run_native(
             "sopen",
             options,
-            Box::new(|_cc| {
+            Box::new(|cc| {
+                // The look, before the first frame.
+                chrome::install(&cc.egui_ctx);
                 let shell = slot
                     .borrow_mut()
                     .take()
@@ -883,6 +931,9 @@ mod tests {
             State::parse("open=main.rs").unwrap().open.as_deref(),
             Some("main.rs")
         );
+        assert!(State::parse("patch=0:00;close=ask").unwrap().ask_close);
+        assert!(!State::parse("at=1").unwrap().ask_close);
+        assert!(State::parse("close=now").is_err());
         for bad in [
             "at=x",
             "at=-1",

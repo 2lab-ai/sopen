@@ -1347,3 +1347,30 @@ fn names_paths_and_kinds() {
     assert_eq!(tilde(Path::new("/tmp/x")), "/tmp/x");
     assert_eq!(untilde("/tmp/x"), PathBuf::from("/tmp/x"));
 }
+
+/// The dialog is a PC Shell dialog box: its title in its frame, the hint on one line, the F-key
+/// row at the bottom (under the box's shadow), where F3 closes it as Esc does, downloading
+/// nothing.
+#[test]
+fn the_dialog_is_a_pc_shell_box_and_f3_closes_it() {
+    let mut fx = dialog();
+    assert!(
+        fx.drv.find_text("Binary File").is_some(),
+        "titled in its frame"
+    );
+    assert_eq!(fx.drv.rows_of(hint(false)), Some(1), "the hint is one line");
+    assert!(fx.drv.find_text("Exit   ").is_some(), "the F-key row");
+    let p = crate::gui::chrome::PALETTE;
+    let name = fx.drv.find_text("blob.zip").expect("the name");
+    let cyan = fx
+        .drv
+        .rects()
+        .iter()
+        .any(|(r, f, _)| *f == p.dialog_back && r.contains(name.center()));
+    assert!(cyan, "on the cyan box");
+    fx.drv.take_viewport_commands();
+    fx.drv.key(&mut fx.win, Key::F3, egui::Modifiers::NONE);
+    assert!(fx.drv.closed(), "F3 asks the window to close");
+    assert!(fx.win.close_requested(), "and it may: nothing runs");
+    assert_eq!(fx.calls(), (0, 0), "nothing was fetched or saved");
+}

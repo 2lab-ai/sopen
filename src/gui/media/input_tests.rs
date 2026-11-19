@@ -526,3 +526,14 @@ fn the_close_during_export_hint_is_shown_whole_on_a_narrow_window() {
         "shown whole: {CLOSE_AGAIN}"
     );
 }
+
+/// On its own the window has PC Shell's F-key row, with F3 Exit: closing is asked for, as
+/// Cmd/Ctrl+W asks.
+#[test]
+fn f3_closes_the_window() {
+    let Some(mut fx) = fixture() else { return };
+    assert!(fx.drv.find_text("Exit   ").is_some(), "the F-key row");
+    fx.drv.take_viewport_commands();
+    fx.key(Key::F3);
+    assert!(fx.drv.closed(), "F3 asks the window to close");
+}

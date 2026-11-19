@@ -52,6 +52,10 @@ runners, `sftp-server` on macOS) and sets `SOPEN_REQUIRE_FFMPEG=1`, `SOPEN_REQUI
   implementation used by tests.
 - Public repo hygiene: no machine names, IP addresses, home-directory paths or session scratch paths in
   commits, receipts or docs. Commit identity `Z <z@2lab.ai>`.
+- **One look, one place.** Every window wears the PC Tools (PC Shell 5.5 / 6) skin from
+  `src/gui/chrome.rs`: colours, the font, frames, the title and F-key rows, dialogs and the syntax
+  theme. Windows never pick a colour or a font size themselves. The VGA font in `assets/fonts/` is
+  CC BY-SA 4.0, not MIT: its licence file and the README credit stay with it.
 
 ## Receipts
 
@@ -61,11 +65,11 @@ prompts on close.
 
 | Hook | Effect |
 |---|---|
-| `SOPEN_STATE='rect=x,y,w,h;t=3.5;in=2;out=6;op=crop\|pixelize;block=16'` | Initial state in source pixels and seconds; `op` (images only, comma-separated, applied in order) uses `rect`. The hex window takes `at=OFFSET;patch=OFFSET:HEXBYTES[,OFFSET:HEXBYTES]` (offsets `0x…` or decimal): the cursor, and bytes overwritten in order, each an undo step. The file browser takes `open=NAME`: that entry of the folder is opened, as Enter would, once it is listed (with `SOPEN_SCREENSHOT`, the viewer is shot). |
+| `SOPEN_STATE='rect=x,y,w,h;t=3.5;in=2;out=6;op=crop\|pixelize;block=16'` | Initial state in source pixels and seconds; `op` (images only, comma-separated, applied in order) uses `rect`. The hex window takes `at=OFFSET;patch=OFFSET:HEXBYTES[,OFFSET:HEXBYTES]` (offsets `0x…` or decimal): the cursor, and bytes overwritten in order, each an undo step. The file browser takes `open=NAME`: that entry of the folder is opened, as Enter would, once it is listed (with `SOPEN_SCREENSHOT`, the viewer is shot). The image and hex windows take `close=ask`: closing is asked for on the first pass, so an edit the state made brings up the unsaved-changes prompt (its receipt). |
 | `SOPEN_SCREENSHOT=<png>` | Open the window, render the state, write a screenshot of the window, exit. Prints `screenshot <png> <w>x<h> title="<host:/abs>" focused=<bool> …`. `SOPEN_WATCHDOG=<s>` (default 30) ends a stalled run. |
 | `SOPEN_AUTOSAVE=1` | Images and the hex window: apply the state and Save without a window (backup, conflict-checked overwrite); exit 0 saved, 3 refused. `SOPEN_AUTOSAVE_DELAY_MS=<ms>` waits before the write so a second process can change the remote (the conflict receipt). |
 | `SOPEN_CHOICE=hex\|save\|cancel` | Answers the binary-file dialog: `hex` starts the fetch at once in the window, which becomes the hex window, as Enter would (with `SOPEN_SCREENSHOT`, the hex window is shot after the switch; with `SOPEN_AUTOSAVE`, no window: fetched and saved); `save` downloads to `SOPEN_SAVE_TO` without a window and prints `saved <path>` (a taken path is exit 1, naming the next free name); `cancel` downloads nothing. Without it, `SOPEN_SCREENSHOT` shoots the dialog and nothing is downloaded, and `SOPEN_AUTOSAVE` on a binary file is an error (nothing would answer the dialog). |
-| `SOPEN_LIST=1` | A folder: print what the file browser lists (the path, a row per entry — Name, Ext, Size, Date, Time — and the `N listed = N bytes` foot) instead of opening the window. A scripted save or export (`SOPEN_AUTOSAVE`, `SOPEN_AUTOEXPORT`) on a folder is an error. |
+| `SOPEN_LIST=1` | A folder: print what the file browser lists (the path, a row per entry — Name, Ext, Size, Date, Time — and the `N Listed = N bytes` foot) instead of opening the window. A scripted save or export (`SOPEN_AUTOSAVE`, `SOPEN_AUTOEXPORT`) on a folder is an error. |
 | `SOPEN_SAVE_TO=<path>` | Where the dialog's "Save to…" saves (the path field's first value; a folder gets the file's name), instead of the download folder — no native dialog. |
 | `SOPEN_AUTOEXPORT=1` | Media: apply the state and Export without a window; prints the new sibling's path. |
 | `SOPEN_EXPORT_HOLD_MS=<ms>` | Media window: start an Export on open and hold it, at its first progress report at or past 30 %, for that long, so `SOPEN_SCREENSHOT` captures the window mid-export; when the window closes sopen waits for the export and prints its result. |

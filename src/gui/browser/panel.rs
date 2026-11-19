@@ -1,6 +1,6 @@
 //! One file panel: the folder it shows, its entries in the browser's order (`..` first, then
 //! folders, then files, each by name), the highlight bar and the first row on screen — and how a
-//! row and the footer read (`N listed = N bytes`, then the free space).
+//! row and the footer read (`N Listed = N bytes`, then `N Bytes Free`, in PC Shell's words).
 
 use crate::remote::{Entry, EntryKind};
 use std::time::SystemTime;
@@ -129,7 +129,8 @@ impl Panel {
         }
     }
 
-    /// `N listed = N bytes` (the entries but `..`, the bytes of the files), and the free space.
+    /// `N Listed = N bytes` (the entries but `..`, the bytes of the files), then the free space
+    /// as `N Bytes Free` — PC Shell's two window feet on one line.
     pub fn footer(&self) -> String {
         let listed: Vec<&Entry> = self.entries.iter().filter(|e| e.name != UP).collect();
         let bytes: u128 = listed
@@ -138,12 +139,12 @@ impl Panel {
             .map(|e| u128::from(e.size))
             .sum();
         let mut line = format!(
-            "{} listed = {} bytes",
+            "{} Listed = {} bytes",
             grouped(listed.len() as u128),
             grouped(bytes)
         );
         if let Some(free) = self.free {
-            line.push_str(&format!(" · {} bytes free", grouped(u128::from(free))));
+            line.push_str(&format!(" · {} Bytes Free", grouped(u128::from(free))));
         }
         line
     }
@@ -211,13 +212,9 @@ pub fn date_cells(entry: &Entry) -> (String, String) {
     if entry.name == UP || entry.kind == EntryKind::Unknown {
         return (String::new(), String::new());
     }
-    let secs = unix_secs(entry.mtime) as libc::time_t;
-    // SAFETY: an all-zero tm is a valid value to be overwritten.
-    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
-    // SAFETY: both pointers are valid for the call; localtime_r is the thread-safe variant.
-    if unsafe { libc::localtime_r(&secs, &mut tm) }.is_null() {
+    let Some(tm) = crate::gui::chrome::local_tm(unix_secs(entry.mtime)) else {
         return (String::new(), String::new());
-    }
+    };
     (
         format!(
             "{:04}-{:02}-{:02}",

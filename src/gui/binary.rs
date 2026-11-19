@@ -10,11 +10,12 @@
 //! connection. The dialog's answers go through [`Source`] and the native save dialog through
 //! [`Chooser`]; both are traits, so the tests drive the real window with stand-ins too.
 
+use super::chrome;
 use super::hex::{self, HexFile, HexWindow};
 use super::{Choice, Hooks, Origin, Outcome, Window};
 use crate::remote::RemoteFs;
 use anyhow::{anyhow, bail, Context as _, Result};
-use eframe::egui::{self, Color32, Key};
+use eframe::egui::{self, Color32, Key, Pos2, Rect, Vec2};
 use std::ffi::{CStr, CString};
 use std::fs::File;
 use std::io::{Read, Write};
@@ -28,9 +29,13 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
 /// The dialog's size when it opens (its height then follows its content).
-pub const WINDOW: [f32; 2] = [560.0, 240.0];
+pub const WINDOW: [f32; 2] = [704.0, 240.0];
 /// The smallest the dialog may be made.
 const MIN_SIZE: [f32; 2] = [420.0, 160.0];
+/// The dialog box's title in its frame.
+const TITLE: &str = "Binary File";
+/// How far the box runs below its last line (its double line sits in the last half of it).
+const BOX_BELOW: f32 = 10.0;
 /// How long "saved <path>" stays before the window closes.
 const SAVED_LINGER: Duration = Duration::from_millis(1200);
 /// Browse… came back without a path: cancelled, or no system dialog could be shown (rfd says
@@ -1605,7 +1610,7 @@ impl BinaryWindow {
             let room = (ui.available_width() - 90.0).max(120.0);
             let field = ui.add_enabled(
                 asking,
-                egui::TextEdit::singleline(&mut self.path)
+                chrome::field(&mut self.path)
                     .id(path_id())
                     .desired_width(room),
             );
@@ -1635,12 +1640,14 @@ impl BinaryWindow {
                     (None, true) => "opening it in the hex editor…".to_string(),
                     (None, false) => "fetching for the hex editor…".to_string(),
                 });
-                ui.add(egui::ProgressBar::new(frac).text(format!(
+                let label = format!(
                     "{:.0}% · {} / {}",
                     frac * 100.0,
                     crate::human(d),
                     crate::human(t)
-                )));
+                );
+                let label = egui::RichText::new(label).color(chrome::PALETTE.field_text);
+                ui.add(egui::ProgressBar::new(frac).text(label));
             }
             Stage::Saved { line, notes, .. } => {
                 ui.add_space(6.0);
@@ -1693,12 +1700,13 @@ impl BinaryWindow {
         ui.cursor().top()
     }
 
-    /// The window as tall as its content (unless `SOPEN_WINDOW_SIZE` fixed it).
+    /// The window as tall as its content — `bottom` is where the dialog's shadow ends — unless
+    /// `SOPEN_WINDOW_SIZE` fixed it.
     fn fit(&mut self, ctx: &egui::Context, bottom: f32) {
         if self.hooks.window_size.is_some() {
             return;
         }
-        let height = (bottom + 12.0).ceil().max(MIN_SIZE[1]);
+        let height = bottom.ceil().max(MIN_SIZE[1]);
         if self.asked.is_some_and(|(h, _)| (h - height).abs() < 1.0) {
             return;
         }
@@ -1735,8 +1743,54 @@ impl Window for BinaryWindow {
         if let Stage::Hex(window) = &mut self.stage {
             return window.ui(ui);
         }
+        // The F-key row at the bottom (F3 closes, as Cmd/Ctrl+W and Esc do).
+        super::own_keys(ui, &[]);
+        // A PC Shell dialog box on the blue screen: cyan, its double line a cell in, the file's
+        // question in it, the shadow two cells right and one down — over the F-key row, which
+        // shows through it. The box (and its shadow) are laid under the content, which decides
+        // how tall they are.
+        let cell = chrome::CELL;
+        let margin = egui::Margin {
+            left: (2.0 * cell.x) as i8,
+            right: (4.0 * cell.x) as i8,
+            top: (1.5 * cell.y) as i8,
+            bottom: 0,
+        };
         let bottom = egui::CentralPanel::default()
-            .show(ui, |ui| self.dialog(ui))
+            .frame(
+                egui::Frame::NONE
+                    .fill(chrome::PALETTE.back)
+                    .inner_margin(margin),
+            )
+            .show(ui, |ui| {
+                let window = ui.ctx().viewport_rect();
+                // The whole window, the F-key row's cells too (the shadow falls on them).
+                let mut screen = ui.painter().clone();
+                screen.set_clip_rect(window);
+                let under = screen.add(egui::Shape::Noop);
+                chrome::dialog_visuals(ui);
+                // Where the last line ends (the cursor is a line's spacing below it).
+                let end = self.dialog(ui) - ui.spacing().item_spacing.y;
+                let dialog = Rect::from_min_max(
+                    window.min,
+                    Pos2::new(window.right() - 2.0 * cell.x, end + BOX_BELOW),
+                );
+                let p = chrome::PALETTE;
+                screen.set(
+                    under,
+                    egui::Shape::Vec(vec![
+                        egui::Shape::rect_filled(
+                            dialog.translate(Vec2::new(2.0 * cell.x, cell.y)),
+                            0.0,
+                            p.shadow,
+                        ),
+                        egui::Shape::rect_filled(dialog, 0.0, p.dialog_back),
+                    ]),
+                );
+                chrome::dialog_lines(&screen, dialog, TITLE);
+                // The shadow's row is the F-key row's.
+                dialog.bottom() + cell.y
+            })
             .inner;
         self.fit(&ctx, bottom);
         self.painted = true;

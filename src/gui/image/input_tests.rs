@@ -1303,3 +1303,23 @@ fn a_key_let_go_while_the_close_prompt_is_up_still_ends_a_held_paste() {
     assert!(fx.win.doc.undo() && fx.win.doc.undo(), "two undo steps");
     assert!(!fx.win.doc.can_undo());
 }
+
+/// On its own the window has PC Shell's F-key row, with F3 Exit: closing is asked for, as
+/// Cmd/Ctrl+W asks — with an edit, through the unsaved-changes prompt.
+#[test]
+fn f3_closes_the_window_through_its_prompt() {
+    let mut fx = open();
+    fx.settle();
+    assert!(fx.drv.find_text("Exit   ").is_some(), "the F-key row");
+    fx.drv.take_viewport_commands();
+    fx.key(Key::F3, Modifiers::NONE);
+    assert!(fx.drv.closed(), "F3 asks the window to close");
+    fx.select((40.0, 30.0), (100.0, 80.0));
+    fx.key(Key::P, Modifiers::NONE);
+    assert!(
+        !crate::gui::Window::close_requested(&mut fx.win),
+        "an edit: it asks first"
+    );
+    fx.drv.idle(&mut fx.win, 2);
+    assert!(fx.drv.find_text("Unsaved changes").is_some());
+}

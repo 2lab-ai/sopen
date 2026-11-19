@@ -39,7 +39,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
 use std::sync::OnceLock;
-use syntect::highlighting::{HighlightIterator, HighlightState, Highlighter, ThemeSet};
+use syntect::highlighting::{HighlightIterator, HighlightState, Highlighter};
 use syntect::parsing::{ParseState, ScopeStack, SyntaxReference, SyntaxSet};
 
 /// A mark in the line index every this many lines…
@@ -536,16 +536,11 @@ fn syntaxes() -> &'static SyntaxSet {
     SET.get_or_init(SyntaxSet::load_defaults_nonewlines)
 }
 
-fn themes() -> &'static ThemeSet {
-    static SET: OnceLock<ThemeSet> = OnceLock::new();
-    SET.get_or_init(ThemeSet::load_defaults)
-}
-
-/// Loads the bundled syntaxes and themes (tens of milliseconds, once): the opener calls it on its
-/// worker, so the window does not wait for it.
+/// Loads the bundled syntaxes and builds the skin's theme (tens of milliseconds, once): the
+/// opener calls it on its worker, so the window does not wait for it.
 pub fn warm() {
     syntaxes();
-    themes();
+    chrome::syntax_theme();
 }
 
 /// The syntax for a file named `name`: by extension, by the whole name (`Makefile`), and only
@@ -604,14 +599,8 @@ struct Highlight {
 const BATCH: usize = 64;
 
 impl Highlight {
-    fn new(
-        syntax: &'static SyntaxReference,
-        dark: bool,
-        plain: Color32,
-        stop: u64,
-    ) -> Option<Self> {
-        let theme = themes().themes.get(chrome::syntax_theme(dark))?;
-        let highlighter = Highlighter::new(theme);
+    fn new(syntax: &'static SyntaxReference, plain: Color32, stop: u64) -> Option<Self> {
+        let highlighter = Highlighter::new(chrome::syntax_theme());
         let start = (
             ParseState::new(syntax),
             HighlightState::new(&highlighter, ScopeStack::new()),
@@ -963,6 +952,9 @@ struct Page {
     gen: u64,
 }
 
+/// The window's title in its frame, as PC Shell names its text viewer.
+const TITLE: &str = "Text Viewer";
+
 struct TextWindow {
     /// `host:/abs`.
     title: String,
@@ -1270,7 +1262,8 @@ impl TextWindow {
             self.top = 0;
         }
         if pressed(Key::End) {
-            self.top = self.doc.line_count().saturating_sub(self.visible);
+            // Past the end: the body puts the last page on screen with this pass's row count.
+            self.top = self.doc.line_count();
         }
         if pressed(Key::ArrowRight) {
             self.left += SIDEWAYS;
@@ -1444,15 +1437,18 @@ impl TextWindow {
         // A re-read that landed is swapped in before anything reads or is measured (the
         // highlighter below starts on the new index).
         self.poll_reindex();
-        let rect = ui.max_rect();
+        let outer = ui.max_rect();
         let p = chrome::Palette::of(ui.visuals());
+        // The window: its frame, titled as PC Shell's, the lines inside it.
+        let rect = chrome::frame(&ui.painter_at(outer), outer, TITLE, true);
         let font = chrome::mono(ui);
         let (cw, text_h) = ctx.fonts_mut(|f| (f.glyph_width(&font, '0'), f.row_height(&font)));
-        let row_h = (text_h + 2.0).ceil();
+        // Rows touch, a cell apart, as on a text screen.
+        let row_h = text_h.ceil();
         let lines = self.doc.line_count();
-        self.visible = (((rect.height() - 4.0) / row_h).floor() as u64).max(1);
+        self.visible = ((rect.height() / row_h).floor() as u64).max(1);
         // Scrolling waits for a re-read, as the keys do.
-        if ui.rect_contains_pointer(rect) && !self.waiting && self.reindex.is_none() {
+        if ui.rect_contains_pointer(outer) && !self.waiting && self.reindex.is_none() {
             let mut rows = 0f32;
             ctx.input(|i| {
                 for event in &i.events {
@@ -1482,9 +1478,7 @@ impl TextWindow {
             self.hl_tried = true;
             if self.doc.size() <= HIGHLIGHT_MAX && !self.frozen() {
                 let stop = self.doc.first_long.unwrap_or(u64::MAX);
-                let hl = self
-                    .syntax
-                    .and_then(|s| Highlight::new(s, ui.visuals().dark_mode, p.text, stop));
+                let hl = self.syntax.and_then(|s| Highlight::new(s, p.text, stop));
                 #[cfg(test)]
                 let hl = hl.map(|mut h| {
                     h.hook = self.hook.clone();
@@ -1511,15 +1505,26 @@ impl TextWindow {
             ctx.request_repaint_after(FOLLOW_EVERY);
         }
         let painter = ui.painter_at(rect);
-        painter.rect_filled(rect, 0.0, p.back);
+        // The scroll bar on the right border, beside the lines.
+        let max_top = lines.saturating_sub(self.visible);
+        chrome::scroll_bar(
+            &ui.painter_at(outer),
+            Rect::from_min_max(
+                Pos2::new(rect.right(), rect.top()),
+                Pos2::new(rect.right() + chrome::CELL.x, rect.bottom()),
+            ),
+            (max_top > 0).then(|| self.top as f32 / max_top as f32),
+        );
         let digits = lines.max(1).to_string().len();
-        let gutter = cw * (digits as f32 + 1.0) + 6.0;
+        let gutter = cw * (digits as f32 + 1.0);
         let text_x = rect.left() + gutter + cw;
         let text_painter =
             ui.painter_at(Rect::from_min_max(Pos2::new(text_x, rect.top()), rect.max));
+        // Only the columns that fit are laid out: a line can be thousands of characters.
+        let columns = ((rect.right() - text_x) / cw).floor().max(0.0) as usize;
         if let Some(page) = &self.page {
             for (k, runs) in page.runs.iter().enumerate() {
-                let y = rect.top() + 2.0 + k as f32 * row_h;
+                let y = rect.top() + k as f32 * row_h;
                 painter.text(
                     Pos2::new(rect.left() + gutter, y),
                     egui::Align2::RIGHT_TOP,
@@ -1528,17 +1533,23 @@ impl TextWindow {
                     p.dim,
                 );
                 let mut job = LayoutJob::default();
-                let mut skip = self.left;
+                let (mut skip, mut room) = (self.left, columns);
                 for (color, text) in runs {
+                    if room == 0 {
+                        break;
+                    }
                     let n = text.chars().count();
-                    let part: String = if skip >= n {
+                    if skip >= n {
                         skip -= n;
                         continue;
-                    } else {
-                        let rest = text.chars().skip(skip).collect();
-                        skip = 0;
-                        rest
-                    };
+                    }
+                    let part: String = text
+                        .chars()
+                        .skip(std::mem::take(&mut skip))
+                        .take(room)
+                        .map(chrome::shown_char)
+                        .collect();
+                    room -= part.chars().count();
                     job.append(&part, 0.0, egui::TextFormat::simple(font.clone(), *color));
                 }
                 let galley = ctx.fonts_mut(|f| f.layout_job(job));
@@ -1552,16 +1563,9 @@ impl TextWindow {
 impl Window for TextWindow {
     fn ui(&mut self, ui: &mut egui::Ui) {
         self.keys(&ui.ctx().clone());
-        egui::Panel::top("sopen-text-bar").show(ui, |ui| {
-            ui.add_space(3.0);
-            self.bar(ui);
-            ui.add_space(1.0);
-        });
-        egui::Panel::bottom("sopen-text-status").show(ui, |ui| {
-            ui.add_space(2.0);
-            self.status_bar(ui);
-            ui.add_space(2.0);
-        });
+        chrome::bar_panel(egui::Panel::top("sopen-text-bar")).show(ui, |ui| self.bar(ui));
+        chrome::bar_panel(egui::Panel::bottom("sopen-text-status"))
+            .show(ui, |ui| self.status_bar(ui));
         if !self.notices.is_empty() {
             let error = ui.visuals().error_fg_color;
             let lines: Vec<(String, Color32)> =
