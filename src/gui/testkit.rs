@@ -15,6 +15,9 @@ pub struct Driver {
     pointer: Pos2,
     /// What the last pass painted (to find a button by its label).
     shapes: Vec<egui::epaint::ClippedShape>,
+    /// What the passes so far asked the platform to do (copy to the clipboard, …), in order —
+    /// what eframe hands to egui-winit, which writes the system clipboard.
+    commands: Vec<egui::OutputCommand>,
 }
 
 impl Driver {
@@ -26,7 +29,13 @@ impl Driver {
             time: 0.0,
             pointer: Pos2::new(w / 2.0, h / 2.0),
             shapes: Vec::new(),
+            commands: Vec::new(),
         }
+    }
+
+    /// The platform commands of the passes since the last call (see [`Driver::commands`]).
+    pub fn take_commands(&mut self) -> Vec<egui::OutputCommand> {
+        std::mem::take(&mut self.commands)
     }
 
     /// The window is now `w`×`h` points, from the next pass on (as when the owner resizes it).
@@ -49,6 +58,7 @@ impl Driver {
         };
         let mut out = self.ctx.run_ui(raw, |ui| win.ui(ui));
         self.shapes = std::mem::take(&mut out.shapes);
+        self.commands.append(&mut out.platform_output.commands);
         // No renderer: the texture uploads are dropped on purpose.
         out.textures_delta.clear();
     }
@@ -160,6 +170,49 @@ impl Driver {
         self.idle(win, 1);
     }
 
+    /// Cmd/Ctrl+`key` as egui-winit 0.37 delivers a clipboard shortcut (its `src/lib.rs`,
+    /// `State::on_keyboard_input`): each press becomes `event` alone — no pressed `Key`; none
+    /// at all for a paste of empty text — and only the release arrives as a `Key`. It drops
+    /// winit's repeat flag, so a key held until it repeats is `event` again, once per repeat:
+    /// `presses` passes of it before the release. Cmd/Ctrl is let go after.
+    pub fn shortcut<W: Window>(
+        &mut self,
+        win: &mut W,
+        key: Key,
+        event: Option<Event>,
+        presses: usize,
+    ) {
+        let mods = command(false);
+        for _ in 0..presses {
+            self.frame(win, event.clone().into_iter().collect(), mods);
+        }
+        self.frame(win, vec![key_up(key)], mods);
+        self.idle(win, 1);
+    }
+
+    /// Cmd/Ctrl+C.
+    pub fn copy<W: Window>(&mut self, win: &mut W) {
+        self.shortcut(win, Key::C, Some(Event::Copy), 1);
+    }
+
+    /// Cmd/Ctrl+X.
+    pub fn cut<W: Window>(&mut self, win: &mut W) {
+        self.shortcut(win, Key::X, Some(Event::Cut), 1);
+    }
+
+    /// Cmd/Ctrl+V with text on the clipboard (egui-winit sends nothing for empty text).
+    pub fn paste_text<W: Window>(&mut self, win: &mut W, text: &str) {
+        let event = (!text.is_empty()).then(|| Event::Paste(text.to_string()));
+        self.shortcut(win, Key::V, event, 1);
+    }
+
+    /// Cmd/Ctrl+V with only an image on the clipboard: egui-winit reads it with arboard and
+    /// hands it over as premultiplied [`egui::ColorImage`].
+    pub fn paste_image<W: Window>(&mut self, win: &mut W, image: egui::ColorImage) {
+        let event = Event::PasteImage(std::sync::Arc::new(image));
+        self.shortcut(win, Key::V, Some(event), 1);
+    }
+
     /// What the last pass drew where it can be seen: each shape `pick` takes, with its bounds on
     /// screen, when all of those bounds lie inside the shape's clip rect and the window.
     fn shown<T>(&self, pick: impl Fn(&egui::Shape) -> Option<(Rect, T)>) -> Vec<(Rect, T)> {
@@ -253,6 +306,17 @@ impl Driver {
             .find_text(text)
             .unwrap_or_else(|| panic!("nothing labelled {text:?} on screen"));
         self.click(win, rect.center());
+    }
+}
+
+/// `key` let go with Cmd/Ctrl still held.
+pub fn key_up(key: Key) -> Event {
+    Event::Key {
+        key,
+        physical_key: None,
+        pressed: false,
+        repeat: false,
+        modifiers: command(false),
     }
 }
 

@@ -3662,14 +3662,17 @@ dependencies = [
 name = "sopen"
 version = "0.1.0"
 dependencies = [
+ "ab_glyph",
  "anyhow",
  "bytes",
  "clap",
  "cpal",
  "directories",
  "eframe",
+ "egui_system_font_provider",
  "futures-core",
  "gethostname",
+ "icu_normalizer",
  "image",
  "libc",
  "num-traits",

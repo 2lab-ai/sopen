@@ -6,8 +6,9 @@ Single source of truth for anyone (human or agent) changing this repo. `CLAUDE.m
 
 `sopen [user@]host:path` opens a remote file or folder as if it were local. Folders and text go to VS Code when it
 is installed (remote ones only with its Remote - SSH extension), otherwise Zed's remote mode; images, video and
-audio open in sopen's own small window with exactly these edits: rectangle crop and rectangle pixelize (images),
-rectangle crop and time cut (video), time cut (audio). Any other file (a zip, any binary) opens a dialog before
+audio open in sopen's own small window with exactly these edits: rectangle crop, rectangle pixelize and clipboard
+copy / cut / paste (images: cut leaves the background colour; paste lays a picture — stretched, fitted or 1:1 — or
+text into the rectangle), rectangle crop and time cut (video), time cut (audio). Any other file (a zip, any binary) opens a dialog before
 anything is downloaded: sopen's hex window (the default; byte overwrite only) or "Save to…" a chosen path;
 `--hex` opens any file in the hex window. It opens on the machine it was typed on, or — with `--target HOST`,
 `SOPEN_TARGET` or `target` in sopen's config — on HOST's screen, by running HOST's installed sopen with `--here`
@@ -38,7 +39,7 @@ zsh, fish or node skip with a note when it is missing; CI installs them (node is
   never use a replacing rename to publish it. The binary dialog's "Save to…" fills a file in a private staging
   folder and publishes it complete by a hard link, never over anything (spec §6a).
 - **No new edit features without the owner.** The edit list above is the whole list (owner, 2026-11-11; hex
-  overwrite added by spec §1 message 9).
+  overwrite added by spec §1 message 9; image clipboard copy / cut / paste by message 12).
 - **ffmpeg/ffprobe are external programs**, resolved at runtime (`SOPEN_FFMPEG` / `SOPEN_FFPROBE`, then PATH).
   Do not link libav*.
 - Tests must not need ssh or a network: the remote layer sits behind a trait with a local-filesystem
