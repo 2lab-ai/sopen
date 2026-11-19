@@ -45,9 +45,10 @@ const BREW_BIN_DIRS: &str =
     "/opt/homebrew/bin /usr/local/bin /home/linuxbrew/.linuxbrew/bin \"$HOME/.linuxbrew/bin\"";
 
 /// The desktop session's variables a window needs, imported from the systemd user manager when
-/// an ssh session on Linux has no display.
-const SESSION_ENV: &str =
-    "DISPLAY WAYLAND_DISPLAY XAUTHORITY XDG_RUNTIME_DIR DBUS_SESSION_BUS_ADDRESS XDG_SESSION_TYPE";
+/// an ssh session on Linux has no display — with the desktop's name (KDE Plasma: sopen brings the
+/// editor's window forward, [`crate::raise`]).
+const SESSION_ENV: &str = "DISPLAY WAYLAND_DISPLAY XAUTHORITY XDG_RUNTIME_DIR \
+     DBUS_SESSION_BUS_ADDRESS XDG_SESSION_TYPE XDG_CURRENT_DESKTOP";
 
 /// `[user@]host` split at the last `@`, as ssh does.
 fn split_user(host: &str) -> (Option<&str>, &str) {
@@ -882,7 +883,7 @@ mod tests {
     }
 
     /// The variables a run on HOST depends on; the fake sopen prints each.
-    const SEEN: [&str; 11] = [
+    const SEEN: [&str; 12] = [
         "SOPEN_STATE",
         "SOPEN_LOG",
         "SOPEN_TARGET_BIN",
@@ -892,6 +893,7 @@ mod tests {
         "XDG_RUNTIME_DIR",
         "DBUS_SESSION_BUS_ADDRESS",
         "XDG_SESSION_TYPE",
+        "XDG_CURRENT_DESKTOP",
         "EVIL",
         "PATH",
     ];
@@ -1266,6 +1268,7 @@ mod tests {
                 ("XAUTHORITY", "/run/user/1/xauth_q"),
                 ("XDG_RUNTIME_DIR", "/run/user/1"),
                 ("XDG_SESSION_TYPE", hostile.as_str()),
+                ("XDG_CURRENT_DESKTOP", "KDE"),
             ];
             let mut session = format!("EVIL=$(: > {marker})\nPATH=/nowhere\nNOT_DISPLAY=:3\n");
             for (key, val) in imported {

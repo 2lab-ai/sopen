@@ -1,7 +1,7 @@
 //! The `sopen` binary on local targets: no ssh, no network. Cache, state and config go to a temp
 //! dir; `--target` runs a fake `ssh`.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 /// The binary with cache, state and config under `home`, and nothing from the caller's
@@ -13,6 +13,8 @@ fn sopen_command(home: &Path) -> Command {
         .env("SOPEN_CONFIG", home.join("config.toml"))
         .env("SOPEN_CODE", "")
         .env("VSCODE_EXTENSIONS", home.join("vscode-extensions"))
+        // Never ask a real KWin (a test run inside a KDE session) to move a window.
+        .env("SOPEN_RAISE", "0")
         .env_remove("SOPEN_TARGET");
     for key in sopen::forward::FORWARDED_ENV {
         cmd.env_remove(key);
@@ -431,6 +433,173 @@ fn folders_and_text_go_to_the_editor_command() {
         &[("SOPEN_ZED", ""), ("VISUAL", "true")],
     );
     assert!(out.status.success(), "{}", text(&out.stderr));
+}
+
+/// A stand-in `busctl` in `<home>/raise-bin` that records each call's arguments as one line in
+/// `<home>/busctl-calls` and answers as KWin does; with `FAKE_FAIL` set, loadScript fails.
+/// Returns that bin dir and the calls file.
+fn fake_busctl(home: &Path) -> (PathBuf, PathBuf) {
+    let bin = home.join("raise-bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let calls = home.join("busctl-calls");
+    let busctl = bin.join("busctl");
+    executable(
+        &busctl,
+        &format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\n\
+             case \"$*\" in *loadScript*) [ -n \"$FAKE_FAIL\" ] && exit 1; printf 'i 7\\n';; \
+             *unloadScript*) printf 'b true\\n';; esac\n",
+            calls.display()
+        ),
+    );
+    // Run once first: the first start of a new executable can be slow (macOS checks it), and
+    // each call has a deadline.
+    Command::new(&busctl).arg("warm").output().unwrap();
+    std::fs::remove_file(&calls).unwrap();
+    (bin, calls)
+}
+
+fn lines_of(path: &Path) -> Vec<String> {
+    std::fs::read_to_string(path)
+        .unwrap_or_default()
+        .lines()
+        .map(str::to_string)
+        .collect()
+}
+
+/// Four runs of load, run, unload of one script under one name, and the script file gone.
+fn assert_four_runs(calls: &[String]) {
+    assert_eq!(calls.len(), 12, "{calls:?}");
+    let words: Vec<&str> = calls[0].split(' ').collect();
+    let (file, name) = (words[7], words[8]);
+    let once = [
+        format!("--user call org.kde.KWin /Scripting org.kde.kwin.Scripting loadScript ss {file} {name}"),
+        "--user call org.kde.KWin /Scripting/Script7 org.kde.kwin.Script run".to_string(),
+        format!("--user call org.kde.KWin /Scripting org.kde.kwin.Scripting unloadScript s {name}"),
+    ];
+    let every: Vec<String> = once.iter().cycle().take(12).cloned().collect();
+    assert_eq!(calls, every);
+    assert!(!Path::new(file).exists(), "{file} left behind");
+}
+
+/// The detached child (`sopen --raise-window`): KWin's script loaded, run and unloaded four
+/// times, silently; a failing client ends it at once, silently too.
+#[test]
+fn the_raise_child_asks_kwin_and_cleans_up() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (bin, calls) = fake_busctl(tmp.path());
+    let path = format!("{}:/usr/bin:/bin", bin.display());
+    let out = sopen(tmp.path(), &["--raise-window", "code"], &[("PATH", &path)]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert_eq!(
+        (text(&out.stdout), text(&out.stderr)),
+        (String::new(), String::new())
+    );
+    assert_four_runs(&lines_of(&calls));
+
+    std::fs::remove_file(&calls).unwrap();
+    let out = sopen(
+        tmp.path(),
+        &["--raise-window", "zed"],
+        &[("PATH", &path), ("FAKE_FAIL", "1")],
+    );
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert_eq!(
+        (text(&out.stdout), text(&out.stderr)),
+        (String::new(), String::new())
+    );
+    let seen = lines_of(&calls);
+    assert_eq!(seen.len(), 2, "{seen:?}");
+    assert!(seen[1].contains(" unloadScript s "), "{seen:?}");
+}
+
+/// After VS Code took a folder: on KDE Plasma (Linux) sopen brings its window to the user; not
+/// elsewhere, not with SOPEN_RAISE=0, and a failing client changes nothing sopen says or exits
+/// with. By default the runs are detached and sopen returns at once.
+#[test]
+fn the_editor_window_is_brought_to_the_user_on_kde_only() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (bin, calls) = fake_busctl(tmp.path());
+    let path = format!("{}:/usr/bin:/bin", bin.display());
+    let code = tmp.path().join("code");
+    executable(&code, "#!/bin/sh\nexit 0\n");
+    let dir = tmp.path().join("project");
+    std::fs::create_dir(&dir).unwrap();
+    let kde = cfg!(target_os = "linux");
+    let open = |desktop: &str, raise: Option<&str>, fail: bool| {
+        let _ = std::fs::remove_file(&calls);
+        let mut cmd = sopen_command(tmp.path());
+        cmd.arg(&dir)
+            .env("SOPEN_CODE", &code)
+            .env("PATH", &path)
+            .env("XDG_CURRENT_DESKTOP", desktop);
+        match raise {
+            Some(mode) => cmd.env("SOPEN_RAISE", mode),
+            None => cmd.env_remove("SOPEN_RAISE"),
+        };
+        if fail {
+            cmd.env("FAKE_FAIL", "1");
+        }
+        let started = std::time::Instant::now();
+        let out = cmd.output().unwrap();
+        (out, started.elapsed())
+    };
+
+    let (out, _) = open("KDE", Some("wait"), false);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let opened = text(&out.stdout);
+    assert!(
+        opened.starts_with("opened ") && opened.ends_with(" in VS Code\n"),
+        "{opened}"
+    );
+    assert_eq!(text(&out.stderr), "");
+    if kde {
+        assert_four_runs(&lines_of(&calls));
+    } else {
+        assert_eq!(lines_of(&calls), Vec::<String>::new(), "not Linux: no call");
+    }
+
+    for (desktop, raise) in [
+        ("GNOME", Some("wait")),
+        ("ubuntu:GNOME", None),
+        ("KDE", Some("0")),
+    ] {
+        let (out, _) = open(desktop, raise, false);
+        assert!(out.status.success(), "{}", text(&out.stderr));
+        assert_eq!(text(&out.stdout), opened, "{desktop} {raise:?}");
+        assert_eq!(
+            lines_of(&calls),
+            Vec::<String>::new(),
+            "{desktop} {raise:?}"
+        );
+    }
+
+    // KWin not answering: the same line, no error, exit 0.
+    let (out, _) = open("KDE", Some("wait"), true);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert_eq!(text(&out.stdout), opened);
+    assert_eq!(text(&out.stderr), "");
+    if kde {
+        assert_eq!(lines_of(&calls).len(), 2, "{:?}", lines_of(&calls));
+    }
+
+    // Detached (the default): sopen returns at once; the runs finish after it.
+    let (out, took) = open("KDE", None, false);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert_eq!(text(&out.stdout), opened);
+    assert!(took < std::time::Duration::from_secs(2), "{took:?}");
+    if kde {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while lines_of(&calls).len() < 12 && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        // The last unload, then the file's removal, may lag the last line by a moment.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert_four_runs(&lines_of(&calls));
+    } else {
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        assert_eq!(lines_of(&calls), Vec::<String>::new(), "not Linux: no call");
+    }
 }
 
 #[test]

@@ -25,7 +25,9 @@ brew install 2lab-ai/tap/sopen-preview    # macOS (arm64, x86_64), Linux (x86_64
 - Media needs `ffmpeg` and `ffprobe` (the formula installs them).
 - Folders and text: local ones open in VS Code (`code`) when it is installed; remote ones open in
   VS Code when its Remote - SSH extension is installed (sopen does not install it), else in Zed.
-  Without VS Code, sopen uses Zed.
+  Without VS Code, sopen uses Zed. On Linux under KDE Plasma, KWin would only flag the editor's
+  window (often on another desktop), so sopen brings it to your current desktop and screen and
+  activates it; `SOPEN_RAISE=0` turns that off.
 - Linux: the ALSA runtime library (libasound2 / alsa-lib) — present on desktop Linux; sopen runs
   on the machine whose screen shows the file (the one you sit at, or the `--target`), not on the
   remote. The image and media windows, the binary-file dialog and the hex window need a desktop
@@ -68,7 +70,7 @@ name, so that name must work for `ssh` on `<host>`.
 The window opens on `<host>`'s desktop session (on Linux sopen finds it through
 `systemctl --user`). On macOS an app started over ssh cannot take focus: sopen's own window
 floats above the other windows until you click, type or scroll in it (or it gets focus), but the editor
-opens behind the active app. From a terminal, Ctrl+C reaches `<host>` and closes the window
+opens behind the active app; under KDE Plasma it is brought to the screen you are on. From a terminal, Ctrl+C reaches `<host>` and closes the window
 there; a sopen stopped without a terminal leaves the window on `<host>` open.
 
 The exit code is `<host>`'s; `could not reach <host>` means ssh did not get there, `sopen is not
