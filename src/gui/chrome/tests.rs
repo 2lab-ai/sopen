@@ -203,7 +203,14 @@ fn the_f_key_tables() {
         [(3, "Exit"), (4, "Edit")]
     );
     // PC Shell's labels are six characters at most ("Disply", "Locate"); so are these.
-    for key in LIST_KEYS.iter().chain(VIEWER_KEYS).chain(HEX_KEYS) {
+    assert_eq!(pairs(TEXT_WRAPPED_KEYS), [(2, "Unwrap")]);
+    assert_eq!(pairs(TEXT_UNWRAPPED_KEYS), [(2, "Wrap")]);
+    let all = LIST_KEYS
+        .iter()
+        .chain(VIEWER_KEYS)
+        .chain(HEX_KEYS)
+        .chain(IMAGE_KEYS);
+    for key in all.chain(TEXT_WRAPPED_KEYS).chain(TEXT_UNWRAPPED_KEYS) {
         assert!(key.label.chars().count() <= 6, "{key:?}");
     }
 }

@@ -180,8 +180,10 @@ pub enum Op {
 /// `SOPEN_STATE=rect=x,y,w,h;t=3.5;in=2;out=6;op=crop|pixelize;block=16` — source pixels and
 /// seconds. `op` may list several, comma-separated, applied in order. The hex window takes
 /// `at=OFFSET;patch=OFFSET:HEXBYTES[,OFFSET:HEXBYTES]` (offsets `0x…` or decimal); the file
-/// browser `open=NAME`; the image, hex and media windows `close=ask`; the media window
-/// `clips=START-END[,START-END]` (its edit list, source seconds) and `stereo=1`.
+/// browser `open=NAME`, and `at=OFFSET` for the first text file it opens — by `open=NAME` or by
+/// hand, whichever comes first (the row that byte is in at the top); the image, hex and media
+/// windows `close=ask`; the media window `clips=START-END[,START-END]` (its edit list, source
+/// seconds) and `stereo=1`.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct State {
     pub rect: Option<[u32; 4]>,
@@ -190,7 +192,8 @@ pub struct State {
     pub out_s: Option<f64>,
     pub ops: Vec<Op>,
     pub block: Option<u32>,
-    /// Hex window: where the cursor starts.
+    /// Hex window: where the cursor starts. The file browser: the first text file it opens (by
+    /// `open=` or by hand) starts with the row this byte is in at the top; later ones do not.
     pub at: Option<u64>,
     /// Hex window: bytes overwritten at an offset, applied in order (each one an undo step).
     pub patches: Vec<(u64, Vec<u8>)>,
@@ -956,6 +959,11 @@ mod tests {
             vec![(16, vec![0xde, 0xad]), (17, vec![0x00, 0xff])]
         );
         assert_eq!(State::parse("at=42").unwrap().at, Some(42));
+        let s = State::parse("open=big.txt;at=524293700").unwrap();
+        assert_eq!(
+            (s.open.as_deref(), s.at),
+            (Some("big.txt"), Some(524_293_700))
+        );
         assert_eq!(
             State::parse("open=main.rs").unwrap().open.as_deref(),
             Some("main.rs")

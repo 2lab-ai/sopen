@@ -63,6 +63,7 @@ pub fn open(start: Start, hooks: &Hooks) -> Result<Outcome> {
     let title = show(start.label.as_deref(), &start.abs);
     let mut browser = Browser::new(start);
     browser.open_first = hooks.state.open.clone();
+    browser.open_at = hooks.state.at;
     let leftover = browser.leftover.clone();
     let run = super::run_window(&title, WINDOW, browser, hooks);
     let outcome = leftover.borrow_mut().finish();
@@ -203,6 +204,10 @@ pub(crate) struct Browser {
     painted: bool,
     /// `SOPEN_STATE` `open=NAME`: opened once the folder is first listed (receipts of a viewer).
     open_first: Option<String>,
+    /// `SOPEN_STATE` `at=OFFSET`: where the first text viewer opened in this browser starts (the
+    /// row that byte is in at the top) — the one `open=` opens, or else the first the owner
+    /// opens; taken by it, so no later viewer gets it.
+    open_at: Option<u64>,
 }
 
 impl Drop for Browser {
@@ -252,6 +257,7 @@ impl Browser {
             visible: 1,
             painted: false,
             open_first: None,
+            open_at: None,
         };
         browser.list(None, start.abs, None, None);
         browser
@@ -488,7 +494,11 @@ impl Browser {
             } => {
                 // A file read in place (no fetched copy) is followed at its end.
                 let live = claim.is_none();
-                (super::text::embed(doc, title, &name, notices, live), claim)
+                let at = self.open_at.take();
+                (
+                    super::text::embed(doc, title, &name, notices, live, at),
+                    claim,
+                )
             }
         };
         // The list gave up the keyboard: the viewer's keys are its own now.
