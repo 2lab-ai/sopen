@@ -8,6 +8,7 @@ sopen myserver:/var/log/app.log    # text → VS Code remote (Remote - SSH), els
 sopen myserver:/tmp/shot.png       # image → view, rectangle crop / pixelize, cut / copy / paste, save back
 sopen myserver:/tmp/talk.mp4       # video → play, rectangle crop, time cut → new file next to it
 sopen myserver:/tmp/a.mp3          # audio → play, time cut
+sopen stems myserver:/tmp/a.mp3    # voice and music → two new files next to it
 sopen myserver:/tmp/a.zip          # anything else → asks: hex editor (default) or save it to a path
 sopen --target <host> myserver:/tmp/a.mp3   # the same, on <host>'s screen instead of this one
 ```
@@ -23,12 +24,15 @@ brew install 2lab-ai/tap/sopen-preview    # macOS (arm64, x86_64), Linux (x86_64
 ## Requirements
 
 - Media needs `ffmpeg` and `ffprobe` (the formula installs them).
+- `sopen stems` needs its model, which the formula installs too (67 MB), and memory: about
+  6.5 GB at its peak, whatever the length of the track.
 - Text (and F4 in the file browser): local files open in VS Code (`code`) when it is installed;
   remote ones open in VS Code when its Remote - SSH extension is installed (sopen does not install
   it), else in Zed. Without VS Code, sopen uses Zed. On Linux under KDE Plasma, KWin would only
   flag the editor's window (often on another desktop), so sopen brings it to your current desktop
   and screen and activates it; `SOPEN_RAISE=0` turns that off.
-- Linux: the ALSA runtime library (libasound2 / alsa-lib) — present on desktop Linux; sopen runs
+- Linux: the ALSA runtime library (libasound2 / alsa-lib) and the C++ runtime (libstdc++, for
+  `sopen stems`) — both present on desktop Linux; sopen runs
   on the machine whose screen shows the file (the one you sit at, or the `--target`), not on the
   remote. The file browser, the image and media windows, the binary-file dialog and the hex window
   need a desktop session (X11 or Wayland); without one a folder opens in the editor and a binary
@@ -233,6 +237,27 @@ sopen cut myserver:/tmp/a.mp3 3 9
 H.264 + AAC; audio: the source's codec) and uploaded next to the original as
 `<stem>.cut-<in>-<out>.<ext>`. The remote path of the result is printed.
 
+## Split voice and music: `sopen stems`
+
+```sh
+sopen stems myserver:/tmp/talk.mp3    # → talk.voice.mp3 and talk.music.mp3 next to it
+sopen stems ./clip.mp4                # a video → clip.voice.m4a and clip.music.m4a (AAC)
+```
+
+Separates the voice from the music on this machine's CPU — a 4-minute song takes about 3 minutes
+on an Apple-silicon Mac, and memory peaks at about 6.5 GB however long the track is — and uploads
+both as new files next to the original, never over anything (`-1`, `-2`, … when a name is taken,
+the same number for both unless another program takes one of the names in between); their paths
+are printed, voice first. Each keeps the original's audio codec, sample rate, channels and exact
+length (a lossy codec such as AAC may decode up to one codec frame longer: its encoder pads the
+last frame) — mono stays mono, more than two channels come out as stereo, downmixed without
+clipping (a note says so); a video gives `.m4a` (AAC); only the first audio track is
+separated. Progress goes to stderr, one line per 30-second piece:
+`stems: piece 3/8, 61s elapsed, 102s remaining`.
+
+The model (UVR-MDX-NET-Voc_FT) comes with the Homebrew formula, and sopen checks it is exactly
+that file before it uses it; `--model PATH` or `SOPEN_STEMS_MODEL` names another copy of it.
+
 ## Safety
 
 - Every write first re-checks the remote file: still the same regular file (not a symlink), same
@@ -255,7 +280,7 @@ H.264 + AAC; audio: the source's codec) and uploaded next to the original as
 
 Under construction — see [`.prd/01-spec.md`](.prd/01-spec.md).
 
-License: MIT (the font below keeps its own licence).
+License: MIT (the font and the libraries below keep their own licences).
 
 ## Credits
 
@@ -264,3 +289,9 @@ The windows' font is PxPlus IBM VGA 8x16 (`assets/fonts/PxPlus_IBM_VGA_8x16.ttf`
 under [CC BY-SA 4.0](https://creativecommons.org/licenses/by-sa/4.0/)
 (`assets/fonts/LICENSE-PxPlus_IBM_VGA_8x16.txt`); `sopen --version` and `sopen --help` print the
 credit too. The look follows PC Tools by Central Point Software.
+
+Voice/music separation: UVR-MDX-NET-Voc_FT from Ultimate Vocal Remover (Anjok07 & aufr33, MIT —
+credit requested by its authors); ONNX conversion and engine: k2-fsa/sherpa-onnx (Apache-2.0).
+sherpa-onnx and the ONNX Runtime it brings are linked into the binary; their licences, and those
+of what they include, are in [`THIRD-PARTY-NOTICES`](THIRD-PARTY-NOTICES), which the formula
+installs with sopen. `sopen --version` and `sopen --help` print this credit too.
