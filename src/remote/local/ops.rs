@@ -11,8 +11,8 @@
 //! same volume is still a rename; only a same-volume copy loses the clone's speed.
 
 use super::LocalFs;
-use crate::remote::ops::{taken, FileMeta, FileOps, NoRename, Opened, Staged};
-use crate::remote::{split_parent, Cancelled, CreateError, Created, Hashing};
+use crate::remote::ops::{taken, FileMeta, FileOps, NoRename, Opened, Publish, Renamed, Staged};
+use crate::remote::{join, random_hex, split_parent, Cancelled, CreateError, Created, Hashing};
 use anyhow::{anyhow, Context, Result};
 use std::ffi::{CStr, CString};
 use std::fs;
@@ -140,6 +140,20 @@ fn rename_excl(from: &CString, to: &CString) -> std::io::Result<()> {
     }
 }
 
+/// [`rename_excl`], or (test seam) the refusal of a filesystem without it.
+fn try_rename_excl(from: &CString, to: &CString) -> std::io::Result<()> {
+    #[cfg(test)]
+    if NO_EXCLUSIVE_RENAME.with(|s| s.get()) {
+        return Err(std::io::Error::from_raw_os_error(libc::ENOTSUP));
+    }
+    rename_excl(from, to)
+}
+
+/// A link refused because this filesystem has none (exFAT, FAT).
+fn no_link_here(e: &std::io::Error) -> bool {
+    is_errno(e, &[libc::ENOTSUP, libc::EOPNOTSUPP])
+}
+
 /// `e` is one of `codes` (a list, not a pattern: some are one value on Linux, two on macOS).
 fn is_errno(e: &std::io::Error, codes: &[i32]) -> bool {
     e.raw_os_error().is_some_and(|c| codes.contains(&c))
@@ -210,7 +224,10 @@ fn finish(file: &fs::File, path: &str, meta: &FileMeta) -> Result<Vec<String>> {
             notes.push(format!("cannot set the times of {path}: {e}"));
         }
     }
-    file.sync_all()
+    // A plain fsync per file; the volume's write cache is flushed once per operation by
+    // [`FileOps::barrier`] (macOS `F_FULLFSYNC`), not once per file.
+    // SAFETY: an open descriptor.
+    zero_ok(unsafe { libc::fsync(file.as_raw_fd()) })
         .with_context(|| format!("cannot sync {path}"))?;
     Ok(notes)
 }
@@ -313,18 +330,10 @@ impl FileOps for LocalFs {
         Ok(meta_of(&m))
     }
 
-    fn rename_new(&mut self, from: &str, to: &str) -> Result<Vec<String>> {
+    fn rename_new(&mut self, from: &str, to: &str) -> Result<Renamed> {
         let (f, t) = (c_path(from)?, c_path(to)?);
-        #[cfg(test)]
-        let tried = if NO_EXCLUSIVE_RENAME.with(|s| s.get()) {
-            Err(std::io::Error::from_raw_os_error(libc::ENOTSUP))
-        } else {
-            rename_excl(&f, &t)
-        };
-        #[cfg(not(test))]
-        let tried = rename_excl(&f, &t);
-        let e = match tried {
-            Ok(()) => return Ok(Vec::new()),
+        let e = match try_rename_excl(&f, &t) {
+            Ok(()) => return Ok(Renamed::Moved),
             Err(e) => e,
         };
         match e.raw_os_error() {
@@ -354,6 +363,8 @@ impl FileOps for LocalFs {
                 // directory, as `to` is given.
                 zero_ok(unsafe { libc::symlinkat(target.as_ptr(), libc::AT_FDCWD, t.as_ptr()) })
             })
+        } else if no_links() {
+            Err(std::io::Error::from_raw_os_error(libc::ENOTSUP))
         } else {
             // SAFETY: an open descriptor and two NUL-terminated paths; flags 0 never follows a
             // link at the old name.
@@ -375,6 +386,14 @@ impl FileOps for LocalFs {
                     "{from} and {to} are on different filesystems"
                 ))))
             }
+            // Neither an exclusive rename nor links (exFAT, FAT): a move copies, checks and
+            // removes; nothing was changed.
+            Err(e) if no_link_here(&e) => {
+                return Err(anyhow!(NoRename(format!(
+                    "this filesystem can neither rename {from} without the risk of replacing \
+                     {to} nor link it ({e})"
+                ))))
+            }
             Err(e) => return Err(e).with_context(|| format!("cannot rename {from} to {to}")),
         }
         #[cfg(test)]
@@ -384,14 +403,19 @@ impl FileOps for LocalFs {
         // Best effort: between this check and the unlink the name can still be swapped — the
         // two steps are not one atomic rename.
         let both = |why: String| {
-            vec![format!(
+            Renamed::OldRemains(format!(
                 "{to} is in place, but {from} was not removed ({why}): both names exist — {from} \
                  and {to}"
-            )]
+            ))
         };
         match stat_at(&folder, &name) {
-            Err(e) if e.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(e) => return Ok(both(format!("it could not be checked again: {e}"))),
+            Err(e) if e.kind() == ErrorKind::NotFound => return Ok(Renamed::Moved),
+            Err(e) => {
+                return Ok(Renamed::Unconfirmed(format!(
+                    "{to} is in place; {from} was left, as it could not be checked again ({e}): \
+                     whether it is still there could not be confirmed"
+                )))
+            }
             Ok(now) if (now.dev, now.ino) != (own.dev, own.ino) => {
                 return Ok(both("another entry has its name now".into()))
             }
@@ -400,10 +424,88 @@ impl FileOps for LocalFs {
         // SAFETY: an open descriptor and a NUL-terminated name; flags 0 removes a non-folder.
         Ok(
             match zero_ok(unsafe { libc::unlinkat(folder.as_raw_fd(), name.as_ptr(), 0) }) {
-                Ok(()) => Vec::new(),
+                Ok(()) => Renamed::Moved,
                 Err(e) => both(format!("removing it failed: {e}")),
             },
         )
+    }
+
+    /// Probed once per folder with a file of its own: renamed exclusively, else linked; where
+    /// neither works (exFAT, FAT) copies are written in place. A probe that cannot even be made
+    /// says nothing — the copy's own create will give the reason.
+    fn publish_mode(&mut self, dir: &str) -> Result<Publish> {
+        let probe = join(dir, &format!(".sopen-probe-{}", random_hex()));
+        let other = join(dir, &format!(".sopen-probe-{}", random_hex()));
+        let made = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .mode(0o600)
+            .open(&probe);
+        if made.is_err() {
+            return Ok(Publish::Atomic);
+        }
+        let (p, o) = (c_path(&probe)?, c_path(&other)?);
+        let mode = match try_rename_excl(&p, &o) {
+            Ok(()) => {
+                let _ = fs::remove_file(&other);
+                Publish::Atomic
+            }
+            Err(e) if no_exclusive_rename(&e) => {
+                let linked = if no_links() {
+                    Err(std::io::Error::from_raw_os_error(libc::ENOTSUP))
+                } else {
+                    fs::hard_link(&probe, &other)
+                };
+                match linked {
+                    Ok(()) => {
+                        let _ = fs::remove_file(&other);
+                        Publish::Atomic
+                    }
+                    Err(e) if no_link_here(&e) => Publish::InPlace,
+                    Err(_) => Publish::Atomic,
+                }
+            }
+            Err(_) => Publish::Atomic,
+        };
+        let _ = fs::remove_file(&probe);
+        Ok(mode)
+    }
+
+    /// macOS: one `F_FULLFSYNC` through the folder's descriptor flushes the drive's cache for
+    /// the volume (a plain `fsync` where the filesystem refuses it). Linux: each file's `fsync`
+    /// already is the barrier.
+    fn barrier(&mut self, dir: &str) -> Result<()> {
+        #[cfg(target_os = "macos")]
+        {
+            let folder = fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_DIRECTORY)
+                .open(dir)
+                .with_context(|| format!("cannot open {dir} to flush it"))?;
+            // SAFETY: an open descriptor.
+            let full = unsafe { libc::fcntl(folder.as_raw_fd(), libc::F_FULLFSYNC) };
+            if full != 0 {
+                // SAFETY: an open descriptor.
+                zero_ok(unsafe { libc::fsync(folder.as_raw_fd()) })
+                    .with_context(|| format!("cannot flush the volume of {dir}"))?;
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        let _ = dir;
+        Ok(())
+    }
+
+    #[allow(clippy::unnecessary_cast)] // the field type differs between macOS and Linux
+    fn fs_id(&mut self, path: &str) -> Option<u64> {
+        let c = c_path(path).ok()?;
+        // SAFETY: an all-zero statvfs is a valid value to be overwritten.
+        let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+        // SAFETY: a NUL-terminated path and a valid place for the result.
+        if unsafe { libc::statvfs(c.as_ptr(), &mut st) } != 0 {
+            return None;
+        }
+        Some(st.f_fsid as u64)
     }
 
     fn make_dir(&mut self, path: &str) -> Result<()> {
@@ -535,8 +637,20 @@ impl FileOps for LocalFs {
     }
 }
 
+/// Test seam: links fail as on a filesystem without them (`ENOTSUP`).
+#[cfg(test)]
+fn no_links() -> bool {
+    NO_LINKS.with(|s| s.get())
+}
+
+#[cfg(not(test))]
+fn no_links() -> bool {
+    false
+}
+
 #[cfg(test)]
 thread_local! {
+    static NO_LINKS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static NO_EXCLUSIVE_RENAME: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static BEFORE_UNLINK: std::cell::RefCell<Option<crate::remote::ops::SeamHook>> =
         const { std::cell::RefCell::new(None) };
@@ -552,6 +666,13 @@ impl LocalFs {
     pub(crate) fn seam_no_exclusive_rename() -> crate::remote::ops::SeamGuard {
         NO_EXCLUSIVE_RENAME.with(|s| s.set(true));
         crate::remote::ops::SeamGuard::new(|| NO_EXCLUSIVE_RENAME.with(|s| s.set(false)))
+    }
+
+    /// Links fail as on a filesystem without them (`ENOTSUP`, exFAT); with
+    /// [`LocalFs::seam_no_exclusive_rename`], nothing can publish a finished copy atomically.
+    pub(crate) fn seam_no_links() -> crate::remote::ops::SeamGuard {
+        NO_LINKS.with(|s| s.set(true));
+        crate::remote::ops::SeamGuard::new(|| NO_LINKS.with(|s| s.set(false)))
     }
 
     /// In that fallback: after the new name is made, before the old one is checked and

@@ -10,7 +10,7 @@ use super::{
     CHUNK, META_TIMEOUT, STALL_TIMEOUT,
 };
 use crate::remote::ops::{
-    taken, FileMeta, FileOps, NoRename, Opened, Staged, COPY_STEP, REMOTE_FOLDER_RENAME,
+    taken, FileMeta, FileOps, NoRename, Opened, Renamed, Staged, COPY_STEP, REMOTE_FOLDER_RENAME,
 };
 use crate::remote::{split_parent, Cancelled, CreateError, Created, Hashing, RemoteFs};
 use anyhow::{anyhow, Context, Result};
@@ -348,7 +348,7 @@ impl FileOps for SftpRemote {
         Ok(file_meta(&got))
     }
 
-    fn rename_new(&mut self, from: &str, to: &str) -> Result<Vec<String>> {
+    fn rename_new(&mut self, from: &str, to: &str) -> Result<Renamed> {
         let own = self
             .lstat_opt(from)?
             .with_context(|| format!("{from}: no such file or directory"))?;
@@ -372,22 +372,22 @@ impl FileOps for SftpRemote {
         // inode and whole-second times, so a file rewritten to the same size within the same
         // second cannot be told apart — the same best-effort limit as 01 §5's writes.
         let both = |why: String| {
-            vec![format!(
+            Renamed::OldRemains(format!(
                 "{to} is in place, but {from} was not removed ({why}): both names exist — {from} \
                  and {to}"
-            )]
+            ))
         };
         // When it cannot be checked again, it is left, and the report says so without claiming
         // what is there.
         let unconfirmed = |e: anyhow::Error| {
-            vec![format!(
+            Renamed::Unconfirmed(format!(
                 "{to} is in place; {from} was left, as it could not be checked again ({e:#}): \
                  whether it is still there could not be confirmed"
-            )]
+            ))
         };
         let now = match self.lstat_opt(from) {
             Ok(Some(now)) => now,
-            Ok(None) => return Ok(Vec::new()),
+            Ok(None) => return Ok(Renamed::Moved),
             Err(e) => return Ok(unconfirmed(e)),
         };
         let kind = |s: &crate::remote::Stat| (s.is_dir, s.is_file, s.is_symlink);
@@ -406,20 +406,32 @@ impl FileOps for SftpRemote {
             }
         }
         match self.remove(from) {
-            Ok(()) => Ok(Vec::new()),
+            Ok(()) => Ok(Renamed::Moved),
             // Did the removal happen (a reply lost) or not? The name says.
             Err(e) => Ok(match self.lstat_opt(from) {
-                Ok(None) => Vec::new(),
+                Ok(None) => Renamed::Moved,
                 Ok(Some(_)) => both(format!("removing it failed: {e:#}")),
-                Err(_) => vec![format!(
+                Err(_) => Renamed::Unconfirmed(format!(
                     "{to} is in place; the removal of {from} could not be confirmed ({e:#})"
-                )],
+                )),
             }),
         }
     }
 
     fn can_rename_dir(&self) -> bool {
         false
+    }
+
+    /// `statvfs@openssh.com`'s `f_fsid`, where the server offers it.
+    fn fs_id(&mut self, path: &str) -> Option<u64> {
+        if !self.sftp.as_ref().is_some_and(|s| s.support_statvfs()) {
+            return None;
+        }
+        let (rt, _, fs) = self.parts();
+        match rt.block_on(within(META_TIMEOUT, fs.statvfs(path))) {
+            Ok(Ok(st)) => Some(st.fsid),
+            _ => None,
+        }
     }
 
     fn make_dir(&mut self, path: &str) -> Result<()> {

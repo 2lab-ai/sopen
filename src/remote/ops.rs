@@ -50,6 +50,30 @@ pub struct Staged {
     pub id: Option<(u64, u64)>,
 }
 
+/// What a never-replacing rename did besides giving the new name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Renamed {
+    /// The old name is gone.
+    Moved,
+    /// The new name is in place, but the old name remains — its removal failed, or another
+    /// entry has it now (left as it is): the reason, naming both paths.
+    OldRemains(String),
+    /// The new name is in place; whether the old name remains could not be confirmed (it could
+    /// not be checked again, or its removal got no answer): the reason.
+    Unconfirmed(String),
+}
+
+/// How finished copies get their final names in a folder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Publish {
+    /// A complete temp gets the name by a rename that never replaces (or a link).
+    Atomic,
+    /// The filesystem has neither an exclusive rename nor links (exFAT, FAT): the copy is
+    /// written straight into its final name, created exclusively — still never replacing, but
+    /// an interrupted copy leaves a partial file under that name.
+    InPlace,
+}
+
 /// A source file opened for a copy to another host: its bytes, and what its open handle says.
 pub struct Opened<'a> {
     pub read: Box<dyn Read + 'a>,
@@ -158,11 +182,31 @@ pub trait FileOps: RemoteFs {
     fn meta(&mut self, path: &str) -> Result<FileMeta>;
 
     /// Renames `from` to `to`, never replacing: [`Taken`] when `to` exists, [`NoRename`] when
-    /// this host cannot rename it without replacing (another filesystem; over SFTP, a folder).
-    /// Over SFTP a file is linked to the new name with `hardlink@openssh.com` and the old name
-    /// removed; a link is made again at the new name and the old one removed. `Ok` carries what
-    /// the report must say (both names left on one file when the old one could not be removed).
-    fn rename_new(&mut self, from: &str, to: &str) -> Result<Vec<String>>;
+    /// this host cannot rename it without replacing (another filesystem; a filesystem with
+    /// neither an exclusive rename nor links; over SFTP, a folder). Over SFTP a file is linked
+    /// to the new name with `hardlink@openssh.com` and the old name removed; a link is made again
+    /// at the new name and the old one removed. [`Renamed::OldRemains`]: `to` is in place but
+    /// `from` was not removed; [`Renamed::Unconfirmed`]: whether it was could not be confirmed.
+    fn rename_new(&mut self, from: &str, to: &str) -> Result<Renamed>;
+
+    /// How finished copies get their names in the folder `dir` (04 §5.6), probed once per folder
+    /// by the engine.
+    fn publish_mode(&mut self, _dir: &str) -> Result<Publish> {
+        Ok(Publish::Atomic)
+    }
+
+    /// Makes what was written on the volume holding `dir` durable (macOS: one `F_FULLFSYNC`;
+    /// elsewhere each file's own `fsync` already is) — once before a moved source is removed and
+    /// once at an operation's end.
+    fn barrier(&mut self, _dir: &str) -> Result<()> {
+        Ok(())
+    }
+
+    /// The id of the filesystem holding `path` (`statvfs`'s `f_fsid`), where it costs one call:
+    /// two connections that report the same id for nested paths are one filesystem.
+    fn fs_id(&mut self, _path: &str) -> Option<u64> {
+        None
+    }
 
     /// Whether [`FileOps::rename_new`] can rename a folder here.
     fn can_rename_dir(&self) -> bool {
