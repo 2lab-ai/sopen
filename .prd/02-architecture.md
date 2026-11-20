@@ -488,7 +488,9 @@ a slice depends on runs before it (§8.2).
 - **Hand-overs between slices** are the only shared files: `keys.rs` (S1-A writes every row; a later
   slice changes a row in its scaffold step, declared there), `gui/mod.rs` (S1-A, then each
   integration WU for its receipt keys: `State::parse` rejects unknown keys and `Hooks` flags accept
-  only `1` today), `browser.rs`, `main.rs`, `view.rs`, the viewers (S1-B → S2-E).
+  only `1` today), `browser.rs`, `main.rs`, `view.rs`, the viewers (S1-B → S2-E). S2-E changes the
+  viewer files (`text`, `image`, `hex`, `media`) only after the streaming units W4–W7 and ED4–ED6
+  have merged, or it touches only the `Window` trait's default (`.prd/06-streaming.md` §13).
 - Each WU's gate is AGENTS.md's (`just check`, with `SOPEN_REQUIRE_FFMPEG=1` and, from S2,
   `SOPEN_REQUIRE_GIT=1`); a WU that shows something on screen brings a screenshot receipt (§9). The
   live plan — branches, worktrees, status — is in [`browser/loop.md`](browser/loop.md).
