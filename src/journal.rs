@@ -801,57 +801,49 @@ fn containing(path: &Path) -> &Path {
     }
 }
 
-/// Makes the directories down to `dir` that are missing, owner-only, and makes every component
-/// of `dir`'s path, from `/` down, durable in the directory containing it (an fsync of that
-/// directory) — found or made, at every call: an earlier creation may have made one and failed
-/// at that fsync, and a fetch makes the cache's directories without one. A component at or
-/// above `cache` that was found, in a directory this account may not read or that is read-only,
-/// is left as it is: this account cannot have made its entry there. Below `cache` every
-/// directory must be a real one (never through a link); `cache` itself and what is above it may
-/// be links (the owner's choice; the directories a link leads through are not walked).
+/// Makes the cache root, if missing, and the directories below it down to `dir`, owner-only,
+/// and makes each of them durable in the directory containing it — the cache root in its own
+/// parent — found or made, at every call, failing on any error: an earlier creation may have made
+/// one and failed at that fsync, and a fetch makes the cache's directories without one. Nothing
+/// above the cache root is made or fsynced: those are the owner's directories, and one that is
+/// missing refuses the journal. Below `cache` every directory must be a real one (never through
+/// a link); `cache` itself may be a link (the owner's choice).
 fn make_dirs(fs: &dyn Fs, cache: &Path, dir: &Path) -> Result<()> {
-    ensure!(
-        dir.starts_with(cache),
-        "{} is not under the cache",
-        dir.display()
-    );
-    let mut at = PathBuf::new();
-    for comp in dir.components() {
-        at.push(comp);
-        if !matches!(comp, Component::Normal(_)) {
-            continue;
+    let below = dir
+        .strip_prefix(cache)
+        .with_context(|| format!("{} is not under the cache", dir.display()))?;
+    let outside = containing(cache);
+    match fs
+        .node(outside, true)
+        .map_err(|e| io_err(e, "look at", outside))?
+    {
+        Some(Node::Dir) => {}
+        Some(_) => bail!("{} is not a directory", outside.display()),
+        None => bail!(
+            "{} does not exist; the journal makes nothing above the cache root",
+            outside.display()
+        ),
+    }
+    let mut at = cache.to_path_buf();
+    let steps = std::iter::once(None).chain(below.components().map(Some));
+    for step in steps {
+        if let Some(comp) = step {
+            at.push(comp);
         }
-        let below = at != cache && at.starts_with(cache);
-        let made = match fs
-            .node(&at, !below)
-            .map_err(|e| io_err(e, "look at", &at))?
-        {
-            Some(Node::Dir) => false,
-            Some(_) if below => bail!(
+        // The cache root may be a link; nothing below it.
+        let root = step.is_none();
+        match fs.node(&at, root).map_err(|e| io_err(e, "look at", &at))? {
+            Some(Node::Dir) => {}
+            Some(_) if root => bail!("{} is not a directory", at.display()),
+            Some(_) => bail!(
                 "{} is not a directory (a link or a file is there)",
                 at.display()
             ),
-            Some(_) => bail!("{} is not a directory", at.display()),
-            None => {
-                fs.create_dir(&at).map_err(|e| io_err(e, "create", &at))?;
-                true
-            }
-        };
-        let parent = containing(&at);
-        match fs.sync_dir(parent) {
-            Ok(()) => {}
-            Err(e)
-                if !below
-                    && !made
-                    && matches!(
-                        e.kind(),
-                        io::ErrorKind::PermissionDenied | io::ErrorKind::ReadOnlyFilesystem
-                    ) =>
-            {
-                crate::debug!("journal: {} not fsynced: {e}", parent.display());
-            }
-            Err(e) => return Err(io_err(e, "make durable the folder", parent)),
+            None => fs.create_dir(&at).map_err(|e| io_err(e, "create", &at))?,
         }
+        let parent = containing(&at);
+        fs.sync_dir(parent)
+            .map_err(|e| io_err(e, "make durable the folder", parent))?;
     }
     Ok(())
 }

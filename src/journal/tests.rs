@@ -531,6 +531,8 @@ struct Flaky {
     inner: Arc<dyn Fs>,
     pick: Pick,
     kind: io::ErrorKind,
+    /// Fails only the first step `pick` chooses; otherwise every one (a lasting refusal).
+    once: bool,
     fired: AtomicBool,
     log: Mutex<Vec<String>>,
 }
@@ -553,6 +555,24 @@ impl Flaky {
             inner,
             pick: Box::new(pick),
             kind,
+            once: true,
+            fired: AtomicBool::new(false),
+            log: Mutex::new(Vec::new()),
+        })
+    }
+
+    /// Fails every step `pick` chooses with an error of `kind`, as a directory this account may
+    /// not read refuses each time.
+    fn refusing(
+        inner: Arc<dyn Fs>,
+        kind: io::ErrorKind,
+        pick: impl Fn(&[String], &str) -> bool + Send + Sync + 'static,
+    ) -> Arc<Flaky> {
+        Arc::new(Flaky {
+            inner,
+            pick: Box::new(pick),
+            kind,
+            once: false,
             fired: AtomicBool::new(false),
             log: Mutex::new(Vec::new()),
         })
@@ -561,7 +581,7 @@ impl Flaky {
     fn step(&self, what: &str, path: &Path) -> io::Result<()> {
         let op = format!("{what} {}", path.display());
         let mut log = self.log.lock().unwrap();
-        if !self.fired.load(Ordering::SeqCst) && (self.pick)(&log, &op) {
+        if !(self.once && self.fired.load(Ordering::SeqCst)) && (self.pick)(&log, &op) {
             self.fired.store(true, Ordering::SeqCst);
             log.push(format!("FAILED {op}"));
             return Err(io::Error::new(self.kind, "injected failure (test)"));
@@ -3917,36 +3937,100 @@ fn an_edit_on_the_last_page_of_the_offset_space_does_not_overflow() {
 // ---------------------------------------------------------------------------------------------
 // Round 3.
 
-/// A directory made above the cache root whose containing directory's fsync failed is made
-/// durable again by the next creation, which finds it there: every component of the journal's
-/// path, from `/` down, is fsynced in its containing directory at each creation.
+/// The cache root made by a creation whose fsync of the folder containing it failed is made
+/// durable again by the next creation, which finds it there.
 #[test]
-fn a_failed_fsync_above_the_cache_root_is_redone_before_kept() {
+fn a_failed_fsync_of_the_cache_roots_folder_is_redone_before_kept() {
     let cache = Path::new("/home/u/cache");
-    for made in ["/home", "/home/u", "/home/u/cache"] {
-        let mem = MemFs::new();
-        let parent = Path::new(made).parent().unwrap().display().to_string();
-        let flaky = Flaky::new(Arc::new(mem.clone()), move |log, op| {
-            op == format!("fsyncdir {parent}")
-                && log.last().is_some_and(|l| l == &format!("mkdir {made}"))
-        });
-        let fs: Arc<dyn Fs> = flaky.clone();
-        assert!(Journal::create(fs, cache, HOST, PATH, Kind::Hex).is_err());
-        assert!(flaky.fired(), "{made}");
-        let fs: Arc<dyn Fs> = Arc::new(mem.clone());
-        let mut j = Journal::create(fs, cache, HOST, PATH, Kind::Hex).unwrap();
-        j.publish(&hex_snap(1)).unwrap();
-        drop(j);
-        let gens: BTreeMap<u64, Snapshot> = [(1, hex_snap(1))].into();
-        for (how, after) in reopened(&mem) {
-            let fs: Arc<dyn Fs> = Arc::new(after);
-            match recover(&fs, cache, &[Ack::Gen(1)], &gens) {
-                Ok(Some(r)) => assert_eq!(r.gen.at.n, 1, "{made}, {how}"),
-                Ok(None) => panic!("{made}, {how}: gen-1 was kept, then lost"),
-                Err(why) => panic!("{made}, {how}: {why}"),
-            }
+    let mem = MemFs::new();
+    for d in ["/home", "/home/u"] {
+        mem.create_dir(Path::new(d)).unwrap();
+        mem.sync_dir(Path::new(d).parent().unwrap()).unwrap();
+    }
+    let flaky = Flaky::new(Arc::new(mem.clone()), |log, op| {
+        op == "fsyncdir /home/u" && log.last().is_some_and(|l| l == "mkdir /home/u/cache")
+    });
+    let fs: Arc<dyn Fs> = flaky.clone();
+    assert!(Journal::create(fs, cache, HOST, PATH, Kind::Hex).is_err());
+    assert!(flaky.fired());
+    let fs: Arc<dyn Fs> = Arc::new(mem.clone());
+    let mut j = Journal::create(fs, cache, HOST, PATH, Kind::Hex).unwrap();
+    j.publish(&hex_snap(1)).unwrap();
+    drop(j);
+    let gens: BTreeMap<u64, Snapshot> = [(1, hex_snap(1))].into();
+    for (how, after) in reopened(&mem) {
+        let fs: Arc<dyn Fs> = Arc::new(after);
+        match recover(&fs, cache, &[Ack::Gen(1)], &gens) {
+            Ok(Some(r)) => assert_eq!(r.gen.at.n, 1, "{how}"),
+            Ok(None) => panic!("{how}: gen-1 was kept, then lost"),
+            Err(why) => panic!("{how}: {why}"),
         }
     }
+}
+
+/// The folder containing the cache root refuses its fsync every time (this account may write
+/// and search it but not read it): the first creation makes the cache root and fails; the
+/// retry, finding it, fails the same way. No generation is ever published, so `kept` is never
+/// said, and a power cut finds nothing.
+#[test]
+fn a_cache_root_whose_folder_refuses_its_fsync_never_says_kept() {
+    let cache = Path::new("/home/u/cache");
+    let mem = MemFs::new();
+    for d in ["/home", "/home/u"] {
+        mem.create_dir(Path::new(d)).unwrap();
+        mem.sync_dir(Path::new(d).parent().unwrap()).unwrap();
+    }
+    let refusing = Flaky::refusing(
+        Arc::new(mem.clone()),
+        io::ErrorKind::PermissionDenied,
+        |_, op| op == "fsyncdir /home/u",
+    );
+    for attempt in ["first", "retry"] {
+        let fs: Arc<dyn Fs> = refusing.clone();
+        let made = Journal::create(fs, cache, HOST, PATH, Kind::Hex);
+        let err = made
+            .err()
+            .unwrap_or_else(|| panic!("{attempt}: a journal was made"));
+        assert!(format!("{err:#}").contains("/home/u"), "{attempt}: {err:#}");
+    }
+    assert!(mem.exists(cache), "the first attempt made the cache root");
+    for (how, after) in reopened(&mem) {
+        let fs: Arc<dyn Fs> = Arc::new(after);
+        assert!(
+            listed_at(&fs, cache).iter().all(|o| matches!(
+                o.found,
+                Found::Unusable {
+                    generation: None,
+                    ..
+                }
+            )),
+            "{how}"
+        );
+    }
+}
+
+/// The journal makes nothing above the cache root: a folder missing there refuses it, naming
+/// the folder, and nothing is created.
+#[test]
+fn a_missing_folder_above_the_cache_root_refuses_the_journal() {
+    let mem = MemFs::new();
+    mem.create_dir(Path::new("/home")).unwrap();
+    let fs: Arc<dyn Fs> = Arc::new(mem.clone());
+    let err = Journal::create(fs, Path::new("/home/u/cache"), HOST, PATH, Kind::Hex)
+        .err()
+        .expect("refused");
+    assert!(
+        format!("{err:#}").contains("/home/u does not exist"),
+        "{err:#}"
+    );
+    assert!(
+        !mem.exists(Path::new("/home/u")),
+        "nothing made above the cache root"
+    );
+}
+
+fn listed_at(fs: &Arc<dyn Fs>, cache: &Path) -> Vec<Orphan> {
+    orphans(fs, cache, HOST, PATH).unwrap()
 }
 
 /// A plan whose route and phase do not go together (a temp named for a write in place) is
@@ -4103,7 +4187,7 @@ fn every_save_the_journal_records_reads_back_as_written() {
         assert_eq!(Some(&parsed), j.pending_save(), "{what}");
         assert_eq!(intent_bytes(&parsed), bytes, "{what}");
     }
-    let (mut accepted, mut refused, mut phases) = (0, 0, 0);
+    let (mut accepted, mut refused, mut phases, mut stagings_refused) = (0, 0, 0, 0);
     for kind in [Kind::Hex, Kind::Image, Kind::Media] {
         for (snap_name, snap) in snaps(kind) {
             for (plan_name, plan) in plans() {
@@ -4127,31 +4211,46 @@ fn every_save_the_journal_records_reads_back_as_written() {
                 }
                 j.save_created(file_stat(0, 1_794_389_500)).unwrap();
                 reads_back(&mem, &j, &format!("{what}, created"));
-                let mut staged_once = false;
+                drop(j);
+                // Every size and evidence on a journal of its own, brought to `created` the same
+                // way: each is accepted and read back, or refused with the record unchanged.
                 for size in [1_000_000u64, 300 << 20] {
                     let staged = file_stat(size, 1_794_389_600);
                     for (post_name, post) in posts(&staged) {
-                        let before = mem.read(&j.dir().join("save")).unwrap();
                         let what = format!("{what}, staged {size} with {post_name} evidence");
-                        if staged_once || j.save_staged(staged, post).is_err() {
+                        let (mem, _, mut j) = mem_journal(kind);
+                        let plan = plans()
+                            .into_iter()
+                            .find(|(name, _)| *name == plan_name)
+                            .unwrap()
+                            .1;
+                        j.begin_save(&snap, plan).unwrap();
+                        j.save_created(file_stat(0, 1_794_389_500)).unwrap();
+                        let before = mem.read(&j.dir().join("save")).unwrap();
+                        let own = post_name == kind.word();
+                        if j.save_staged(staged, post).is_err() {
+                            assert!(!own, "{what}: refused");
+                            stagings_refused += 1;
                             assert_eq!(mem.read(&j.dir().join("save")).unwrap(), before, "{what}");
                             continue;
                         }
-                        staged_once = true;
+                        assert!(own, "{what}: accepted");
                         phases += 1;
                         reads_back(&mem, &j, &what);
                         j.save_renaming().unwrap();
                         reads_back(&mem, &j, &format!("{what}, renaming"));
                     }
                 }
-                assert!(staged_once, "{what}: no post-save evidence was taken");
             }
         }
     }
     // hex: 2 temp routes + 2 run sets; image: upload; media: upload, at two sizes.
     assert_eq!(accepted, 4 + 1 + 2, "accepted");
     assert!(refused > 50, "{refused} refused");
-    assert_eq!(phases, 2 + 1 + 2);
+    // 5 temp-route saves × 2 sizes: the kind's own evidence taken, the other kinds' and the
+    // empty check refused.
+    assert_eq!(phases, 5 * 2);
+    assert_eq!(stagings_refused, 5 * 2 * 3);
 }
 
 /// A write in place whose run sits on the last page of the offset space reconciles as landed
@@ -4184,51 +4283,42 @@ fn a_landed_write_in_place_on_the_last_page_does_not_overflow() {
     assert_eq!(seen, Seen::pages([(last, file.page(last))]));
 }
 
-/// A directory above the cache that this account may not read, or that is read-only, is not
-/// fsynced when the component in it was found: the journal is still made. The same refusal for
-/// a component made in that call, for the cache's own directories, or an I/O error, stops it.
+/// No refusal at the cache root or above it is passed over: the folder containing the cache
+/// root refusing its fsync (unreadable, read-only, or an I/O error) stops the journal, whether
+/// the cache root was found or made.
 #[test]
-fn an_unreadable_folder_above_the_cache_is_left_alone_only_when_nothing_was_made_in_it() {
+fn a_refused_fsync_of_the_cache_roots_folder_always_stops_the_journal() {
     let cache = Path::new("/home/u/cache");
-    let with = |dirs: &[&str]| {
-        let mem = MemFs::new();
-        for d in dirs {
-            mem.create_dir(Path::new(d)).unwrap();
+    for kind in [
+        io::ErrorKind::PermissionDenied,
+        io::ErrorKind::ReadOnlyFilesystem,
+        io::ErrorKind::Other,
+    ] {
+        for found in [true, false] {
+            let mem = MemFs::new();
+            let mut dirs = vec!["/home", "/home/u"];
+            if found {
+                dirs.push("/home/u/cache");
+            }
+            for d in dirs {
+                mem.create_dir(Path::new(d)).unwrap();
+            }
+            let refusing = Flaky::refusing(Arc::new(mem.clone()), kind, |_, op| {
+                op == "fsyncdir /home/u"
+            });
+            let fs: Arc<dyn Fs> = refusing.clone();
+            assert!(
+                Journal::create(fs, cache, HOST, PATH, Kind::Hex).is_err(),
+                "{kind:?}, cache root found: {found}"
+            );
+            assert!(refusing.fired());
+            // Nothing above the cache root is fsynced.
+            let log = refusing.log.lock().unwrap().clone();
+            assert!(
+                !log.iter()
+                    .any(|op| op == "fsyncdir /" || op == "fsyncdir /home"),
+                "{log:?}"
+            );
         }
-        mem
-    };
-    let create = |mem: &MemFs, kind: io::ErrorKind, fails: &'static str| {
-        let flaky = Flaky::with_kind(Arc::new(mem.clone()), kind, move |_, op| op == fails);
-        let fs: Arc<dyn Fs> = flaky.clone();
-        let made = Journal::create(fs, cache, HOST, PATH, Kind::Hex);
-        assert!(flaky.fired(), "{fails}");
-        made.is_ok()
-    };
-    let denied = io::ErrorKind::PermissionDenied;
-    let all = ["/home", "/home/u", "/home/u/cache"];
-    assert!(create(&with(&all), denied, "fsyncdir /"), "found /home");
-    assert!(
-        create(
-            &with(&all),
-            io::ErrorKind::ReadOnlyFilesystem,
-            "fsyncdir /home"
-        ),
-        "found /home/u"
-    );
-    assert!(
-        create(&with(&all), denied, "fsyncdir /home/u"),
-        "found the cache root"
-    );
-    assert!(
-        !create(&with(&["/home", "/home/u"]), denied, "fsyncdir /home/u"),
-        "the cache root was made in that call"
-    );
-    assert!(
-        !create(&with(&all), denied, "fsyncdir /home/u/cache"),
-        "the cache's own directory"
-    );
-    assert!(
-        !create(&with(&all), io::ErrorKind::Other, "fsyncdir /"),
-        "an I/O error"
-    );
+    }
 }
