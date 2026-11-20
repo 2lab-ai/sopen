@@ -8,7 +8,7 @@ use super::engine::{Engine, Separated};
 use super::{media_kind_of, stem_names, Layout, PieceProgress, Published, Span};
 use crate::ffmpeg::{self, MediaKind, Tools};
 use crate::kind::{self, Kind};
-use crate::remote::{self, RemoteFs};
+use crate::remote::RemoteFs;
 use anyhow::{bail, Context, Result};
 use std::ffi::OsString;
 use std::io::{Read, Write};
@@ -212,19 +212,15 @@ pub fn separate_and_publish(
     music.finish("encoding the music")?;
 
     before_publish()?;
-    let (voice_name, music_name) = super::free_pair(fs, dir, &voice_name, &music_name)?;
-    let voice_published = fs.write_new_sibling(&files.0[0], dir, &voice_name)?;
-    let music_published = fs
-        .write_new_sibling(&files.0[1], dir, &music_name)
-        .map_err(|e| {
-            anyhow::anyhow!(
-                "{e:#} — the voice was published as {}, the music was not",
-                remote::join(dir, &voice_published)
-            )
-        })?;
+    let (voice, music) = super::publish_pair(
+        fs,
+        (&files.0[0], &voice_name),
+        (&files.0[1], &music_name),
+        dir,
+    )?;
     Ok(Published {
-        voice: voice_published,
-        music: music_published,
+        voice,
+        music,
         notes,
     })
 }

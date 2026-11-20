@@ -284,8 +284,9 @@ pub struct Published {
 
 /// The names the pair is published under: the first `n` (none, then `-1`, `-2`, …) for which
 /// neither `voice` nor `music` with it names anything in `dir` (not even a dangling link), so
-/// the two always carry the same number — never `a.voice-1.wav` with `a.music-3.wav`. Publishing
-/// still never overwrites: a name taken between this look and the publish gets the next free one.
+/// the two carry the same number — not `a.voice-1.wav` with `a.music-3.wav` — unless another
+/// program takes one of them before [`publish_pair`] publishes it, which then never overwrites:
+/// that one gets the next free name.
 pub fn free_pair(
     fs: &mut dyn crate::remote::RemoteFs,
     dir: &str,
@@ -303,6 +304,27 @@ pub fn free_pair(
         }
     }
     bail!("no free pair of names for {voice} and {music} in {dir}")
+}
+
+/// Publishes the two local encodes as new siblings in `dir` under [`free_pair`]'s names, voice
+/// first, and returns the names they got. Each publish is on its own and never overwrites: a
+/// name another program takes between the look and the publish gets the next free one, so then
+/// the numbers may differ — what was published is what is returned.
+pub fn publish_pair(
+    fs: &mut dyn crate::remote::RemoteFs,
+    (voice_file, voice): (&Path, &str),
+    (music_file, music): (&Path, &str),
+    dir: &str,
+) -> Result<(String, String)> {
+    let (voice, music) = free_pair(fs, dir, voice, music)?;
+    let voice = fs.write_new_sibling(voice_file, dir, &voice)?;
+    let music = fs.write_new_sibling(music_file, dir, &music).map_err(|e| {
+        anyhow::anyhow!(
+            "{e:#} — the voice was published as {}, the music was not",
+            crate::remote::join(dir, &voice)
+        )
+    })?;
+    Ok((voice, music))
 }
 
 /// `<stem>.voice.<ext>`, `<stem>.music.<ext>`.

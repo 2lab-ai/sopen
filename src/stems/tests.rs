@@ -573,3 +573,91 @@ mod piece_loop {
         }
     }
 }
+
+/// LocalFs, but another program takes `name` in the folder the moment the first publish starts
+/// (after the names were chosen).
+struct TakenMidway {
+    fs: crate::remote::LocalFs,
+    take: Option<PathBuf>,
+}
+
+impl crate::remote::RemoteFs for TakenMidway {
+    fn stat_opt(&mut self, path: &str) -> Result<Option<crate::remote::Stat>> {
+        self.fs.stat_opt(path)
+    }
+    fn lstat_opt(&mut self, path: &str) -> Result<Option<crate::remote::Stat>> {
+        self.fs.lstat_opt(path)
+    }
+    fn realpath(&mut self, path: &str) -> Result<String> {
+        self.fs.realpath(path)
+    }
+    fn read_head(&mut self, path: &str, max: usize) -> Result<Vec<u8>> {
+        self.fs.read_head(path, max)
+    }
+    fn list_dir(&mut self, path: &str) -> Result<Vec<String>> {
+        self.fs.list_dir(path)
+    }
+    fn list_entries(&mut self, path: &str) -> Result<Vec<crate::remote::Entry>> {
+        self.fs.list_entries(path)
+    }
+    fn read_to(
+        &mut self,
+        path: &str,
+        out: &mut dyn std::io::Write,
+        progress: &mut dyn FnMut(u64),
+    ) -> Result<u64> {
+        self.fs.read_to(path, out, progress)
+    }
+    fn create_from(
+        &mut self,
+        local: &Path,
+        path: &str,
+        like: Option<crate::remote::Like>,
+    ) -> std::result::Result<crate::remote::Uploaded, crate::remote::CreateError> {
+        if let Some(name) = self.take.take() {
+            std::fs::write(name, "another program's").unwrap();
+        }
+        self.fs.create_from(local, path, like)
+    }
+    fn set_mode(&mut self, path: &str, mode: u32) -> Result<()> {
+        self.fs.set_mode(path, mode)
+    }
+    fn rename_over(&mut self, from: &str, to: &str) -> Result<()> {
+        self.fs.rename_over(from, to)
+    }
+    fn link_new(&mut self, from: &str, to: &str) -> Result<()> {
+        self.fs.link_new(from, to)
+    }
+    fn remove(&mut self, path: &str) -> Result<()> {
+        self.fs.remove(path)
+    }
+}
+
+/// The voice's chosen name is taken by another program after the names were chosen: nothing is
+/// overwritten, the voice goes to the next free name, the music keeps the chosen one, and the
+/// pair returned is what was really published.
+#[test]
+fn a_name_taken_after_the_choice_is_never_overwritten_and_the_real_pair_is_reported() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("out");
+    std::fs::create_dir(&dir).unwrap();
+    let (voice_file, music_file) = (tmp.path().join("v.wav"), tmp.path().join("m.wav"));
+    std::fs::write(&voice_file, "voice").unwrap();
+    std::fs::write(&music_file, "music").unwrap();
+    let mut fs = TakenMidway {
+        fs: crate::remote::LocalFs::new(),
+        take: Some(dir.join("a.voice.wav")),
+    };
+    let got = publish_pair(
+        &mut fs,
+        (&voice_file, "a.voice.wav"),
+        (&music_file, "a.music.wav"),
+        dir.to_str().unwrap(),
+    )
+    .unwrap();
+    assert_eq!(got, ("a.voice-1.wav".into(), "a.music.wav".into()));
+    let read = |name: &str| std::fs::read_to_string(dir.join(name)).unwrap();
+    assert_eq!(read("a.voice.wav"), "another program's");
+    assert_eq!(read("a.voice-1.wav"), "voice");
+    assert_eq!(read("a.music.wav"), "music");
+}

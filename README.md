@@ -247,10 +247,12 @@ sopen stems ./clip.mp4                # a video → clip.voice.m4a and clip.musi
 Separates the voice from the music on this machine's CPU — a 4-minute song takes about 3 minutes
 on an Apple-silicon Mac, and memory peaks at about 6.5 GB however long the track is — and uploads
 both as new files next to the original, never over anything (`-1`, `-2`, … when a name is taken,
-the same number for both); their paths are printed, voice first. Each keeps the original's audio
-codec, sample rate, channels and exact length — mono stays mono, more than two channels come out
-as stereo, downmixed without clipping (a note says so); a video gives `.m4a` (AAC); only the
-first audio track is separated. Progress goes to stderr, one line per 30-second piece:
+the same number for both unless another program takes one of the names in between); their paths
+are printed, voice first. Each keeps the original's audio codec, sample rate, channels and exact
+length (a lossy codec such as AAC may decode up to one codec frame longer: its encoder pads the
+last frame) — mono stays mono, more than two channels come out as stereo, downmixed without
+clipping (a note says so); a video gives `.m4a` (AAC); only the first audio track is
+separated. Progress goes to stderr, one line per 30-second piece:
 `stems: piece 3/8, 61s elapsed, 102s remaining`.
 
 The model (UVR-MDX-NET-Voc_FT) comes with the Homebrew formula, and sopen checks it is exactly

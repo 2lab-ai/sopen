@@ -707,13 +707,14 @@ into the cache (claimed while it runs), and it always runs on this machine (§4a
   note says so). At the source's own rate each stem has exactly the source's sample count: the
   resampling to the engine's rate and back can add a sample at the end (in AAC a whole frame),
   so when the rates differ the source's count is taken from a decode of its own, run while the
-  first piece is separated, and each stem is padded or cut to it. A
-  video source
+  first piece is separated, and each stem is padded or cut to it (a lossy codec such as AAC may
+  then decode up to one codec frame longer: its encoder pads the last frame). A video source
   gives AAC in `.m4a`. Only the first audio track is separated (a note names the others). Both
   are published as new siblings the way `sopen cut` publishes (§5: never over anything, `-N`
-  when the name is taken — the first number free for both, so the pair always matches):
-  `<stem>.voice.<ext>`, then `<stem>.music.<ext>`; both paths are
-  printed on stdout, voice first. A music stem that cannot be published after the voice was is
+  when the name is taken — the first number free for both, so the pair carries the same number
+  unless another program takes one of the names between that look and the two publishes, which
+  are each on their own; nothing is overwritten either way): `<stem>.voice.<ext>`, then
+  `<stem>.music.<ext>`; the paths actually published are printed on stdout, voice first. A music stem that cannot be published after the voice was is
   an error that names the published voice.
 - **Progress** on stderr, one line per finished piece, parseable:
   `stems: piece 3/8, 61s elapsed, 102s remaining` (`0/N` with no `remaining` before the first;

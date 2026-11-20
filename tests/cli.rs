@@ -1587,8 +1587,8 @@ struct StemsCheck {
 }
 
 /// [`StemsCheck`] of `voice` and `music` against `reference` (all interleaved, `channels` per
-/// frame). Each stem must be as long as the reference to within `tail` frames: 0 for PCM, one
-/// codec frame for a lossy codec, whose encoder pads the end.
+/// frame). Each stem must be at least as long as the reference and at most `tail` frames longer:
+/// 0 for PCM, one codec frame for a lossy codec, whose encoder pads the end.
 fn check_stems(
     reference: &[f32],
     voice: &[f32],
@@ -1597,12 +1597,10 @@ fn check_stems(
     tail: usize,
 ) -> StemsCheck {
     for (name, stem) in [("voice", voice), ("music", music)] {
-        let off = stem.len().abs_diff(reference.len()) / channels;
+        let (got, want) = (stem.len() / channels, reference.len() / channels);
         assert!(
-            off <= tail,
-            "the {name} is {} frames, the reference {} (allowed: {tail} off)",
-            stem.len() / channels,
-            reference.len() / channels
+            (want..=want + tail).contains(&got),
+            "the {name} is {got} frames, the reference {want} (allowed: up to {tail} more)"
         );
     }
     let n = reference.len().min(voice.len()).min(music.len());
@@ -1631,6 +1629,28 @@ fn check_stems(
         level_db: 10.0 * (energy(&both) / energy(&r)).log10(),
         lag,
         reconstruction_db: 10.0 * (energy(&r) / energy(&error).max(1e-30)).log10(),
+    }
+}
+
+/// The length check: a stem may be longer than the reference by up to `tail` frames (a lossy
+/// encoder pads its last frame), never shorter — a short one would be compared on its prefix
+/// alone.
+#[test]
+fn check_stems_takes_a_padded_stem_but_not_a_short_one() {
+    let reference = vec![0.5f32; 2 * 4096];
+    let padded = vec![0.25f32; 2 * (4096 + 1024)];
+    let check = check_stems(&reference, &padded, &padded, 2, 1024);
+    assert_eq!(check.lag, 0, "{check:?}");
+    for (stem, why) in [
+        (vec![0.25f32; 2 * (4096 - 1)], "one frame short"),
+        (
+            vec![0.25f32; 2 * (4096 + 1025)],
+            "a frame and one sample over",
+        ),
+    ] {
+        let refused =
+            std::panic::catch_unwind(|| check_stems(&reference, &stem, &padded, 2, 1024)).is_err();
+        assert!(refused, "{why} was taken");
     }
 }
 
