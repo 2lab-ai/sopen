@@ -453,86 +453,7 @@ const TAIL_LINES: usize = 64;
 const TAIL_BYTES: usize = 16 * 1024;
 
 /// The bounded tail of a stream ([`TAIL_LINES`], [`TAIL_BYTES`]); the whole stream is read.
-#[derive(Debug, Default)]
-struct Tail {
-    lines: std::collections::VecDeque<String>,
-    bytes: usize,
-    partial: Vec<u8>,
-    cut: bool,
-}
-
-impl Tail {
-    /// Reads `r` to its end (a read error ends it too), keeping the tail.
-    fn read(mut r: impl Read) -> Self {
-        let mut tail = Self::default();
-        let mut chunk = [0u8; 8192];
-        loop {
-            match r.read(&mut chunk) {
-                Ok(0) => break,
-                Ok(n) => tail.feed(&chunk[..n]),
-                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(_) => break,
-            }
-        }
-        if !tail.partial.is_empty() || tail.cut {
-            tail.end_line();
-        }
-        tail
-    }
-
-    fn feed(&mut self, mut bytes: &[u8]) {
-        while !bytes.is_empty() {
-            let (part, ended) = match bytes.iter().position(|&b| b == b'\n') {
-                Some(i) => (&bytes[..i], Some(i + 1)),
-                None => (bytes, None),
-            };
-            let room = TAIL_BYTES.saturating_sub(self.partial.len());
-            self.partial
-                .extend_from_slice(&part[..part.len().min(room)]);
-            self.cut |= part.len() > room;
-            match ended {
-                Some(next) => {
-                    self.end_line();
-                    bytes = &bytes[next..];
-                }
-                None => break,
-            }
-        }
-    }
-
-    fn end_line(&mut self) {
-        let mut line = String::from_utf8_lossy(&self.partial).into_owned();
-        if self.cut {
-            line.push('…');
-        }
-        self.partial.clear();
-        self.cut = false;
-        self.bytes += line.len();
-        self.lines.push_back(line);
-        while self.lines.len() > TAIL_LINES || (self.bytes > TAIL_BYTES && self.lines.len() > 1) {
-            if let Some(gone) = self.lines.pop_front() {
-                self.bytes -= gone.len();
-            }
-        }
-    }
-
-    /// The bytes kept (lines and the unfinished one).
-    #[cfg(test)]
-    fn kept(&self) -> usize {
-        self.bytes + self.partial.len()
-    }
-
-    /// The last line with something on it.
-    fn last_line(&self) -> String {
-        self.lines
-            .iter()
-            .rev()
-            .map(|l| l.trim())
-            .find(|l| !l.is_empty())
-            .unwrap_or("no error output")
-            .to_string()
-    }
-}
+type Tail = crate::ffmpeg::Tail<TAIL_LINES, TAIL_BYTES>;
 
 impl Ffmpeg {
     fn start(tools: &Tools, args: &[OsString], pipe: Pipe) -> Result<Self> {
@@ -568,7 +489,7 @@ impl Ffmpeg {
             .spawn()
             .with_context(|| format!("cannot run {}", tools.ffmpeg.display()))?;
         let stderr = child.stderr.take().expect("piped");
-        let errors = std::thread::spawn(move || Tail::read(stderr));
+        let errors = Tail::spawn(stderr);
         let stdin = child.stdin.take();
         Ok(Self {
             child,

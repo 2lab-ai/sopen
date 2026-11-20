@@ -43,7 +43,7 @@ pub enum Prepared {
     },
     Media {
         origin: Origin,
-        media: Media,
+        media: Box<Media>,
         notices: Vec<String>,
         claim: Option<Claim>,
     },
@@ -209,7 +209,7 @@ fn prepare_with(
             };
             Ok(Prepared::Media {
                 origin: req.origin(fs, at),
-                media,
+                media: Box::new(media),
                 notices,
                 claim,
             })
