@@ -205,4 +205,17 @@ impl RemoteFs for LocalFs {
     fn remove(&mut self, path: &str) -> Result<()> {
         fs::remove_file(path).with_context(|| format!("cannot remove {path}"))
     }
+
+    /// Tests only (06 §2): outside them a local file never gets a stream, so the default
+    /// ("does not stream") stands.
+    #[cfg(test)]
+    fn into_ranged(
+        self: Box<Self>,
+        path: &str,
+    ) -> std::result::Result<Box<dyn super::Ranged>, super::Refused> {
+        match super::ranged::local(path) {
+            Ok(r) => Ok(Box::new(r)),
+            Err(error) => Err(super::Refused { conn: self, error }),
+        }
+    }
 }

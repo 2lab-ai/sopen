@@ -1472,3 +1472,1409 @@ fn local_names_that_are_not_utf8_list_with_their_own_attributes() {
     assert_eq!((of(true).name.as_str(), of(true).size), ("a\u{FFFD}", 1));
     assert_eq!((of(false).name.as_str(), of(false).size), ("a\u{FFFD}", 2));
 }
+
+// ── Streaming transport (06 §2) ─────────────────────────────────────────────────────────────
+
+use super::ranged::{Pipeline, PIPE_IN_FLIGHT, PIPE_REQUEST};
+use super::sftp::{Proxy, SftpRanged, Timing, Wired, Writes};
+use bytes::Bytes;
+
+/// `len` bytes in which every 8-byte word holds its own offset (the Fake's pattern), so a read
+/// placed at the wrong offset, or bytes skipped, cannot match.
+fn patterned(len: usize) -> Vec<u8> {
+    let bytes = pattern(0, len);
+    debug_assert!(bytes
+        .iter()
+        .take(4096)
+        .enumerate()
+        .all(|(i, b)| *b == pattern_byte(i as u64)));
+    bytes
+}
+
+/// The clipping proxy of 06 §2: every DATA reply cut to 20 000 bytes.
+fn clipping() -> Proxy {
+    Proxy {
+        clip: Some(20_000),
+        ..Default::default()
+    }
+}
+
+/// A 4 MiB patterned file in a new temp dir.
+fn four_mib() -> (tempfile::TempDir, PathBuf, Vec<u8>) {
+    let tmp = tempfile::tempdir().unwrap();
+    let body = patterned(4 << 20);
+    let path = tmp.path().join("four.bin");
+    std::fs::write(&path, &body).unwrap();
+    (tmp, path, body)
+}
+
+/// The next completion, which must come.
+fn next(r: &mut dyn Ranged) -> Completion {
+    r.next(Some(Duration::from_secs(10))).expect("a completion")
+}
+
+fn stat_of(c: &Completion) -> Stat {
+    match &c.reply {
+        Ok(Reply::Stat(Some(s))) => *s,
+        other => panic!("not a stat: {other:?}"),
+    }
+}
+
+/// What every whole-file read must give for a 4 MiB file: the file's own bytes. Run over the
+/// plain local server (the control) and through the clipping proxy (V5).
+fn whole_reads_match(fs: &mut SftpRemote, dir: &Path, body: &[u8]) {
+    let path = dir.join("four.bin");
+    let mut got = Vec::new();
+    let n = fs.read_to(p(&path), &mut got, &mut |_| {}).unwrap();
+    assert_eq!(
+        (n as usize, got.len()),
+        (body.len(), body.len()),
+        "read_to's length"
+    );
+    assert!(got == body, "read_to's bytes");
+    let head = fs.read_head(p(&path), body.len()).unwrap();
+    assert_eq!(head.len(), body.len(), "read_head's length");
+    assert!(head == body, "read_head's bytes");
+    let part = fs.read_head(p(&path), 100_000).unwrap();
+    assert!(part == body[..100_000], "read_head's first 100 000 bytes");
+    // The kind sniff: 8 KiB, under the proxy's 20 000 — it fits in one reply either way.
+    let sniff = fs.read_head(p(&path), crate::kind::SNIFF_BYTES).unwrap();
+    assert!(
+        sniff == body[..crate::kind::SNIFF_BYTES],
+        "the sniff's bytes"
+    );
+    let local = dir.join("cache/four.bin");
+    let at = fs.fetch(p(&path), &local, &mut |_, _| {}).unwrap();
+    assert_eq!(at.sha256, Some(sha(body)), "fetch's hash");
+    assert!(std::fs::read(&local).unwrap() == body, "fetch's copy");
+    std::fs::remove_file(&local).unwrap();
+}
+
+/// V5: a server that answers a read with fewer bytes than asked (the proxy cuts every DATA to
+/// 20 000) still gives every whole-file read the file's exact bytes: each read carries its own
+/// offset and a short reply is followed by a read of the rest. 3a426b6's loop, which moved the
+/// crate's cursor by the length asked, gets 16 × 20 000 bytes + the tail there.
+#[test]
+fn v5_whole_reads_through_the_clipping_proxy_give_the_files_bytes() {
+    let Some(mut plain) = SftpRemote::local_server() else {
+        return;
+    };
+    let (tmp, path, body) = four_mib();
+    whole_reads_match(&mut plain, tmp.path(), &body);
+    assert!(plain.read_through_cursor(p(&path)).unwrap() == body);
+    let mut clipped = SftpRemote::local_server_with(Some(clipping())).unwrap();
+    whole_reads_match(&mut clipped, tmp.path(), &body);
+    let old = clipped.read_through_cursor(p(&path)).unwrap();
+    assert_eq!(old.len(), 16 * 20_000 + 16_384, "3a426b6's read skips");
+}
+
+/// V5, the transport: reads queued together, each through its own clone of the handle at its own
+/// offset, come back with the bytes of that offset — 20 000 of them through the proxy — and a
+/// read of the rest at its own offset completes the block. They leave in the order queued.
+#[test]
+fn v5_ranged_reads_carry_their_own_offsets_through_the_clipping_proxy() {
+    if SftpRemote::local_server().is_none() {
+        return;
+    }
+    let (_tmp, path, body) = four_mib();
+    let proxy = clipping();
+    let fs = SftpRemote::local_server_with(Some(proxy.clone())).unwrap();
+    let mut r = Box::new(fs).into_ranged(p(&path)).unwrap();
+    assert_eq!(r.size(), body.len() as u64);
+    proxy.wire.lock().unwrap().clear();
+    let size = body.len() as u64;
+    let offsets = [3 << 20, 0, (1 << 20) + 7, 0, size - 100];
+    let block = 64 * 1024u32;
+    let tickets: Vec<Ticket> = offsets.iter().map(|&o| r.read(o, block)).collect();
+    for (&off, ticket) in offsets.iter().zip(&tickets) {
+        let c = next(r.as_mut());
+        assert_eq!(c.ticket, *ticket, "completions come in the order queued");
+        let want = (block as u64).min(size - off).min(20_000) as usize;
+        let got = c.data().unwrap();
+        assert!(
+            got[..] == body[off as usize..off as usize + want],
+            "bytes at {off}"
+        );
+        assert!(!c.early_end());
+    }
+    let sent: Vec<u64> = proxy
+        .wire
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|w| w.read.map(|(off, _)| off))
+        .collect();
+    assert_eq!(sent, offsets, "on the wire in the order queued");
+    // A block read whole by following each short reply with the rest, at its own offset.
+    let off = (2 << 20) + 3;
+    let mut whole = Vec::new();
+    while whole.len() < block as usize {
+        let at = off + whole.len() as u64;
+        r.read(at, block - whole.len() as u32);
+        let c = next(r.as_mut());
+        let got = c.data().unwrap();
+        assert!(!got.is_empty());
+        whole.extend_from_slice(got);
+    }
+    assert!(whole[..] == body[off as usize..off as usize + block as usize]);
+}
+
+/// V5, the early end on the real server: a reply short of the block, the file cut in the middle
+/// of the block, then the rest: what lies before the cut comes, and a read past it gets nothing
+/// (`SSH_FX_EOF`) — an early end, which the stream turns into `Changed`. The handle's `fstat` then
+/// shows the new size.
+#[test]
+fn v5_a_short_reply_then_a_cut_ends_the_block_early_on_the_local_server() {
+    if SftpRemote::local_server().is_none() {
+        return;
+    }
+    let (_tmp, path, body) = four_mib();
+    let fs = SftpRemote::local_server_with(Some(clipping())).unwrap();
+    let mut r = Box::new(fs).into_ranged(p(&path)).unwrap();
+    r.read(0, 65_536);
+    assert_eq!(next(r.as_mut()).data().unwrap().len(), 20_000);
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_len(30_000)
+        .unwrap();
+    r.read(20_000, 45_536);
+    let c = next(r.as_mut());
+    assert!(
+        c.data().unwrap()[..] == body[20_000..30_000],
+        "the rest up to the cut"
+    );
+    r.read(30_000, 35_536);
+    let c = next(r.as_mut());
+    assert!(c.early_end(), "{c:?}");
+    assert_eq!(
+        c.asked,
+        Asked::Read {
+            off: 30_000,
+            len: 35_536
+        }
+    );
+    r.fstat();
+    assert_eq!(stat_of(&next(r.as_mut())).size, 30_000);
+}
+
+/// V5 on the in-order Fake: the same short reply and early end, with the file changed in place.
+#[test]
+fn v5_on_the_fake_a_short_reply_then_a_cut_ends_the_block_early() {
+    let link = Link {
+        clip: Some(20_000),
+        ..Link::gate()
+    };
+    let (mut r, control) = fake("/m.bin", FakeFile::pattern(1 << 20), link);
+    let before = r.opened();
+    r.read(0, 65_536);
+    let c = next(r.as_mut());
+    assert!(c.data().unwrap()[..] == patterned(20_000)[..]);
+    control.change(Change::Truncate(30_000));
+    r.read(20_000, 45_536);
+    assert_eq!(next(r.as_mut()).data().unwrap().len(), 10_000);
+    r.read(30_000, 35_536);
+    assert!(next(r.as_mut()).early_end());
+    r.fstat();
+    let now = stat_of(&next(r.as_mut()));
+    assert_eq!(now.size, 30_000);
+    assert!(now.mtime > before.mtime, "the cut moved the mtime");
+}
+
+/// 06 §2 (V5): on the in-order Fake every validation `fstat` arrives after each read queued
+/// before it: requests reach the server in the order queued and come back in that order.
+#[test]
+fn v5_on_the_fake_every_fence_arrives_after_the_reads_it_validates() {
+    let (mut r, control) = fake("/m.bin", FakeFile::pattern(8 << 20), Link::gate());
+    let mut queued = Vec::new();
+    for batch in [8u64, 3] {
+        for i in 0..batch {
+            queued.push(r.read(i * 65_536, 65_536));
+        }
+        queued.push(r.fstat());
+    }
+    let sent: Vec<Ticket> = control.sent().iter().map(|s| s.ticket).collect();
+    assert_eq!(sent, queued, "received in the order queued");
+    let mut reads_done = 0;
+    for (i, t) in queued.iter().enumerate() {
+        let c = next(r.as_mut());
+        assert_eq!(c.ticket, *t);
+        match c.asked {
+            Asked::Read { .. } => reads_done += 1,
+            Asked::Fstat => {
+                let reads_before = queued[..i].len() - (i >= 9) as usize;
+                assert_eq!(reads_done, reads_before, "the fence after its reads");
+            }
+            Asked::StatPath => unreachable!(),
+        }
+    }
+    assert_eq!(r.pending(), 0);
+}
+
+/// 06 §2: over SFTP the transport writes every request from one task, in the order queued — the
+/// wire, as the proxy saw it, has the reads at their offsets, then the fence, then the stat.
+#[test]
+fn sftp_requests_leave_in_the_order_queued() {
+    if SftpRemote::local_server().is_none() {
+        return;
+    }
+    let (_tmp, path, _) = four_mib();
+    let proxy = Proxy::default();
+    let fs = SftpRemote::local_server_with(Some(proxy.clone())).unwrap();
+    let mut r = Box::new(fs).into_ranged(p(&path)).unwrap();
+    proxy.wire.lock().unwrap().clear();
+    let offsets = [7 << 18, 1 << 20, 0, 3 << 20, 5 << 16, 2 << 20, 9, 6 << 18];
+    for o in offsets {
+        r.read(o, 65_536);
+    }
+    r.fstat();
+    r.stat_path();
+    for _ in 0..offsets.len() + 2 {
+        next(r.as_mut()).reply.unwrap();
+    }
+    let wire: Vec<(u8, Option<u64>)> = proxy
+        .wire
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|w| !w.reply)
+        .map(|w| (w.kind, w.read.map(|(o, _)| o)))
+        .collect();
+    let mut want: Vec<(u8, Option<u64>)> =
+        offsets.iter().map(|&o| (Wired::READ, Some(o))).collect();
+    want.extend([(Wired::FSTAT, None), (Wired::STAT, None)]);
+    assert_eq!(wire, want);
+}
+
+/// V6: on the Fake (20 ms, 5 MB/s, simulated time), `read_to`'s plan reads 64 MiB in at most ⅔
+/// of the time the same requests take one at a time. Its window starts at one request, grows by
+/// one per reply, and never has more than 4 MiB out — and reaches it.
+#[test]
+fn v6_pipelined_whole_read_on_the_fake() {
+    let size = 64u64 << 20;
+    let (mut r, control): (Box<dyn Ranged>, FakeControl) =
+        fake("/big.bin", FakeFile::pattern(size), Link::gate());
+    let mut out = Hashing::new(std::io::sink());
+    assert_eq!(read_to_over(r.as_mut(), &mut out).unwrap(), size);
+    let pipelined = control.elapsed();
+    assert_eq!(out.finish().sha256, sha(&patterned(size as usize)));
+    let sent: Vec<SentRecord> = control.sent();
+    let mut most = 0;
+    for (n, s) in sent.iter().enumerate() {
+        let Asked::Read { len, .. } = s.asked else {
+            panic!()
+        };
+        most = most.max(s.outstanding + len as u64);
+        assert!(
+            s.outstanding / PIPE_REQUEST as u64 <= n as u64 / 2,
+            "request {n} went out with {} bytes outstanding: the window grows by one per reply",
+            s.outstanding
+        );
+    }
+    assert_eq!(
+        sent[1].outstanding, 0,
+        "the second request waits for the first reply"
+    );
+    assert_eq!(most, PIPE_IN_FLIGHT, "up to 4 MiB in flight, and no more");
+
+    let (mut one, control) = fake("/big.bin", FakeFile::pattern(size), Link::gate());
+    for off in (0..size).step_by(PIPE_REQUEST as usize) {
+        one.read(off, PIPE_REQUEST);
+        next(one.as_mut()).reply.unwrap();
+    }
+    let sequential = control.elapsed();
+    assert!(
+        pipelined.as_secs_f64() <= sequential.as_secs_f64() * 2.0 / 3.0,
+        "pipelined {pipelined:?} against one at a time {sequential:?}"
+    );
+}
+
+/// 06 §2 over SFTP: `read_to`'s requests, as the proxy saw them, grow from one in flight by one
+/// per reply and never have more than 4 MiB out.
+#[test]
+fn sftp_read_to_is_pipelined_within_its_bound() {
+    if SftpRemote::local_server().is_none() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("eight.bin");
+    std::fs::write(&path, patterned(8 << 20)).unwrap();
+    let proxy = Proxy::default();
+    let mut fs = SftpRemote::local_server_with(Some(proxy.clone())).unwrap();
+    proxy.wire.lock().unwrap().clear();
+    let mut out = Hashing::new(std::io::sink());
+    fs.read_to(p(&path), &mut out, &mut |_| {}).unwrap();
+    assert_eq!(out.finish().size, 8 << 20);
+    let wire = proxy.wire.lock().unwrap().clone();
+    let first = wire.iter().position(|w| w.kind == Wired::READ).unwrap();
+    let (mut reads, mut answered, mut most) = (0u64, 0u64, 0u64);
+    for w in &wire[first..] {
+        match (w.reply, w.kind) {
+            (false, Wired::READ) => {
+                let out = reads - answered;
+                assert!(out <= reads / 2, "read {reads} went out with {out} ahead");
+                reads += 1;
+                most = most.max((reads - answered) * PIPE_REQUEST as u64);
+            }
+            (true, Wired::DATA | Wired::STATUS) => answered += 1,
+            _ => {}
+        }
+    }
+    assert!(most <= PIPE_IN_FLIGHT, "{most}");
+    assert!(
+        most > PIPE_REQUEST as u64,
+        "more than one request in flight"
+    );
+}
+
+/// The plan alone: the window opens one request per reply; a short reply's rest goes next and
+/// is delivered in order; a server's limit is learned; an empty reply ends the file; a reply
+/// longer than asked, or for nothing asked, is an error.
+#[test]
+fn the_pipeline_plan() {
+    let block = PIPE_REQUEST;
+    let mut plan = Pipeline::new(None);
+    assert_eq!(plan.send(), Some((0, block)));
+    assert_eq!(plan.send(), None, "one request until the first reply");
+    plan.reply(0, Some(patterned(block as usize).into()))
+        .unwrap();
+    assert_eq!(plan.take().map(|b| b.len()), Some(block as usize));
+    assert_eq!(plan.send(), Some((block as u64, block)));
+    assert_eq!(plan.send(), Some((2 * block as u64, block)));
+    assert_eq!(plan.send(), None, "two after one reply");
+    // A short reply: its rest is asked next and delivered before the bytes after it.
+    plan.reply(2 * block as u64, Some(vec![2; 1000].into()))
+        .unwrap();
+    plan.reply(block as u64, Some(vec![1; 20_000].into()))
+        .unwrap();
+    assert_eq!(plan.take().map(|b| b.len()), Some(20_000));
+    assert_eq!(plan.take(), None, "the rest of the short reply comes first");
+    assert_eq!(plan.send(), Some((block as u64 + 20_000, block - 20_000)));
+    // 20 000 bytes mid-file is the server's limit from now on.
+    assert_eq!(plan.send(), Some((2 * block as u64 + 1000, block - 1000)));
+    assert_eq!(plan.send(), Some((3 * block as u64, 20_000)));
+    plan.reply(
+        block as u64 + 20_000,
+        Some(vec![1; (block - 20_000) as usize].into()),
+    )
+    .unwrap();
+    assert_eq!(
+        plan.take().map(|b| b.len()),
+        Some((block - 20_000) as usize)
+    );
+    assert_eq!(plan.take().map(|b| b.len()), Some(1000));
+    plan.reply(2 * block as u64 + 1000, Some(Bytes::new()))
+        .unwrap();
+    assert!(plan.done(), "an empty reply ends the file");
+    assert_eq!(plan.send(), None);
+    assert!(plan
+        .reply(3 * block as u64, Some(vec![0; 30_000].into()))
+        .is_err());
+    assert!(plan.reply(99, Some(Bytes::new())).is_err());
+
+    // A read of at most `end` bytes asks exactly up to it.
+    let mut head = Pipeline::new(Some(70_000));
+    assert_eq!(head.send(), Some((0, block)));
+    head.reply(0, Some(vec![0; block as usize].into())).unwrap();
+    assert_eq!(head.send(), Some((block as u64, 70_000 - block)));
+    assert_eq!(head.send(), None);
+    head.take();
+    head.reply(
+        block as u64,
+        Some(vec![0; (70_000 - block) as usize].into()),
+    )
+    .unwrap();
+    head.take();
+    assert!(head.done());
+}
+
+/// `into_ranged` gives the connection back when the open fails: a missing file, a folder, and a
+/// connection that does not stream (the provided default). The connection works afterwards.
+#[test]
+fn into_ranged_gives_the_connection_back_on_failure() {
+    let tmp = tempfile::tempdir().unwrap();
+    let file = tmp.path().join("a.txt");
+    std::fs::write(&file, "abc").unwrap();
+    let missing = tmp.path().join("missing");
+    let works = |conn: &mut Box<dyn RemoteFs + Send>| {
+        assert_eq!(conn.stat(p(&file)).unwrap().size, 3);
+        let mut out = Vec::new();
+        conn.read_to(p(&file), &mut out, &mut |_| {}).unwrap();
+        assert_eq!(out, b"abc");
+    };
+    let refused = |conn: Box<dyn RemoteFs + Send>, path: &Path, why: &str| {
+        let e = conn.into_ranged(p(path)).unwrap_err();
+        assert!(format!("{:#}", e.error).contains(why), "{:#}", e.error);
+        e.conn
+    };
+    let hooked: Box<dyn RemoteFs + Send> = Box::new(Hooked::new(Hooks::default()));
+    works(&mut refused(hooked, &file, "does not stream"));
+    let local: Box<dyn RemoteFs + Send> = Box::new(LocalFs::new());
+    works(&mut refused(local, &missing, "cannot open"));
+    let Some(sftp) = SftpRemote::local_server() else {
+        return;
+    };
+    let mut conn = refused(Box::new(sftp), &missing, "cannot open");
+    works(&mut conn);
+    let mut conn = refused(conn, tmp.path(), "not a regular file");
+    works(&mut conn);
+    let mut r = conn.into_ranged(p(&file)).unwrap();
+    assert_eq!(r.opened().size, 3);
+    r.read(0, 10);
+    assert_eq!(&next(r.as_mut()).data().unwrap()[..], b"abc");
+}
+
+/// `reopen` closes the handle and opens another file on the same session; `into_connection`
+/// closes the handle and gives the session back, which works as before. Each close is sent.
+#[test]
+fn reopen_and_into_connection_keep_the_session() {
+    if SftpRemote::local_server().is_none() {
+        return;
+    }
+    let (tmp, a, body) = four_mib();
+    let b = tmp.path().join("b.txt");
+    std::fs::write(&b, "bee").unwrap();
+    let proxy = Proxy::default();
+    let fs = SftpRemote::local_server_with(Some(proxy.clone())).unwrap();
+    let mut r = Box::new(fs).into_ranged(p(&a)).unwrap();
+    r.read(1000, 10);
+    assert!(next(r.as_mut()).data().unwrap()[..] == body[1000..1010]);
+    let closes = || {
+        let wire = proxy.wire.lock().unwrap();
+        wire.iter()
+            .filter(|w| !w.reply && w.kind == Wired::CLOSE)
+            .count()
+    };
+    let before = closes();
+    let mut r = r.reopen(p(&b)).unwrap();
+    assert_eq!(closes(), before + 1, "the first handle closed");
+    assert_eq!((r.path(), r.size()), (p(&b), 3));
+    r.read(0, 64);
+    assert_eq!(&next(r.as_mut()).data().unwrap()[..], b"bee");
+    // Giving the connection back does not wait for the server: the second handle's close goes
+    // out with the session's next use, ahead of it.
+    let mut conn = r.into_connection();
+    let mut out = Vec::new();
+    conn.read_to(p(&a), &mut out, &mut |_| {}).unwrap();
+    assert!(out == body);
+    let requests: Vec<u8> = proxy
+        .wire
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|w| !w.reply)
+        .map(|w| w.kind)
+        .collect();
+    let last_open = requests.iter().rposition(|k| *k == Wired::OPEN).unwrap();
+    let closed = requests[..last_open]
+        .iter()
+        .filter(|k| **k == Wired::CLOSE)
+        .count();
+    assert_eq!(
+        closed,
+        before + 2,
+        "the second handle closed before read_to's open"
+    );
+    // A failed reopen gives the session back too.
+    let r = conn.into_ranged(p(&b)).unwrap();
+    let e = r.reopen(p(&tmp.path().join("gone"))).unwrap_err();
+    assert_eq!(e.conn.into_ranged(p(&b)).unwrap().size(), 3);
+}
+
+/// Runs `f` on a thread of its own: its result, or `None` when it has not returned within
+/// `limit` (a watchdog for hangs, never a timing assertion).
+fn watchdog<T: Send + 'static>(
+    limit: Duration,
+    f: impl FnOnce() -> T + Send + 'static,
+) -> Option<T> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(f());
+    });
+    rx.recv_timeout(limit).ok()
+}
+
+/// Waits, polling, until `cond` holds; false when `limit` passed first.
+fn eventually(limit: Duration, mut cond: impl FnMut() -> bool) -> bool {
+    let started = std::time::Instant::now();
+    while !cond() {
+        if started.elapsed() > limit {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    true
+}
+
+/// READ requests the proxy has passed to the server.
+fn reads_on_the_wire(proxy: &Proxy) -> usize {
+    let wire = proxy.wire.lock().unwrap();
+    wire.iter()
+        .filter(|w| !w.reply && w.kind == Wired::READ)
+        .count()
+}
+
+/// A generous bound for anything that must happen "soon": only a hang reaches it.
+const HANG: Duration = Duration::from_secs(30);
+
+/// A transport over the proxy with `reads` reads on the wire and every reply held behind the
+/// proxy's latch, and a close deadline of `close`.
+fn held_transport(path: &Path, reads: u64, close: Duration) -> (SftpRanged, Proxy) {
+    let proxy = Proxy::default();
+    let fs = SftpRemote::local_server_with(Some(proxy.clone())).unwrap();
+    let timing = Timing {
+        close,
+        ..Timing::default()
+    };
+    let mut r = Box::new(fs).open_ranged(p(path), timing).unwrap();
+    proxy.hold.store(true, std::sync::atomic::Ordering::Relaxed);
+    for i in 0..reads {
+        r.read(i * 65_536, 65_536);
+    }
+    let out = eventually(HANG, || reads_on_the_wire(&proxy) == reads as usize);
+    assert!(out, "the reads reached the wire");
+    (r, proxy)
+}
+
+/// 06 §2, §9: `close`, a drop and `into_connection` return while the server holds every reply
+/// — the latch closed, 16 reads on the wire — long before the close deadline (120 s); the
+/// teardown is still blocked then, and ends once the replies flow.
+#[test]
+fn closing_returns_while_the_teardown_is_blocked() {
+    if SftpRemote::local_server().is_none() {
+        return;
+    }
+    let (_tmp, path, _) = four_mib();
+    let deadline = Duration::from_secs(120);
+    for how in ["close", "drop", "into_connection"] {
+        let (r, proxy) = held_transport(&path, 16, deadline);
+        let ended = r.teardown();
+        let r: Box<dyn Ranged> = Box::new(r);
+        let call = watchdog(HANG, move || match how {
+            "close" => {
+                r.close();
+                None
+            }
+            "drop" => {
+                drop(r);
+                None
+            }
+            _ => Some(r.into_connection()),
+        });
+        let conn = call.unwrap_or_else(|| panic!("{how} waited on the server"));
+        if how != "into_connection" {
+            assert!(
+                !ended.done(),
+                "{how}: the teardown waits for the held replies"
+            );
+        }
+        proxy
+            .hold
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            ended.wait(HANG),
+            "{how}: the teardown ends once replies flow"
+        );
+        if let Some(mut conn) = conn {
+            assert_eq!(
+                conn.stat(p(&path)).unwrap().size,
+                4 << 20,
+                "the session works"
+            );
+        }
+    }
+}
+
+/// The requests the proxy has passed to the server, by packet type, in order.
+fn requests_on_the_wire(proxy: &Proxy) -> Vec<u8> {
+    let wire = proxy.wire.lock().unwrap();
+    wire.iter().filter(|w| !w.reply).map(|w| w.kind).collect()
+}
+
+/// 06 §2: giving the connection back sends the handle's CLOSE before it returns, without
+/// waiting for the reply. The session then sits idle in its owner's hands — nothing drives it —
+/// and the CLOSE still reaches the server, with nothing sent after it. With every reply held
+/// behind the latch, the same: it returns at once and the CLOSE is on the wire.
+#[test]
+fn giving_the_connection_back_sends_the_close_at_once() {
+    if SftpRemote::local_server().is_none() {
+        return;
+    }
+    let (_tmp, path, body) = four_mib();
+    for held in [false, true] {
+        let proxy = Proxy::default();
+        let fs = SftpRemote::local_server_with(Some(proxy.clone())).unwrap();
+        let mut r = Box::new(fs).into_ranged(p(&path)).unwrap();
+        r.read(0, 65_536);
+        assert!(next(r.as_mut()).data().unwrap()[..] == body[..65_536]);
+        if held {
+            proxy.hold.store(true, std::sync::atomic::Ordering::Relaxed);
+            r.read(65_536, 65_536);
+            r.read(131_072, 65_536);
+            assert!(eventually(HANG, || reads_on_the_wire(&proxy) == 3));
+        }
+        let before = requests_on_the_wire(&proxy).len();
+        let conn = watchdog(HANG, move || r.into_connection());
+        let conn = conn.unwrap_or_else(|| panic!("held={held}: into_connection waited"));
+        // Idle from here: nothing uses `conn` until the CLOSE has been seen.
+        let closed = eventually(HANG, || requests_on_the_wire(&proxy).len() > before);
+        assert!(closed, "held={held}: the CLOSE never reached the server");
+        assert_eq!(
+            requests_on_the_wire(&proxy)[before..],
+            [Wired::CLOSE],
+            "held={held}: the CLOSE, and nothing else"
+        );
+        proxy
+            .hold
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        let mut conn = conn;
+        assert_eq!(
+            conn.stat(p(&path)).unwrap().size,
+            4 << 20,
+            "the session works"
+        );
+    }
+}
+
+/// A transport over the proxy that has read one block, and its session's request pipe.
+fn idle_transport(path: &Path, timing: Timing) -> (SftpRanged, Proxy, std::sync::Arc<Writes>) {
+    let proxy = Proxy::default();
+    let fs = SftpRemote::local_server_with(Some(proxy.clone())).unwrap();
+    let writes = fs.writes();
+    let mut r = Box::new(fs).open_ranged(p(path), timing).unwrap();
+    r.read(0, 65_536);
+    next(&mut r).reply.unwrap();
+    (r, proxy, writes)
+}
+
+/// 06 §2: giving the connection back waits until the handle's CLOSE has been written to the
+/// session's pipe and flushed — observed, not assumed after some scheduler passes. With the pipe
+/// held shut by the test's gate, it returns only after the gate opens (from another thread, 50
+/// ms on), with the CLOSE written; the proxy then sees it. The wait's bound is 60 s here, so
+/// returning at all shows the write, not the bound, ended it.
+#[test]
+fn giving_the_connection_back_waits_for_the_close_to_be_written() {
+    if SftpRemote::local_server().is_none() {
+        return;
+    }
+    let (_tmp, path, _) = four_mib();
+    let timing = Timing {
+        flush: Duration::from_secs(60),
+        ..Timing::default()
+    };
+    let (r, proxy, writes) = idle_transport(&path, timing);
+    let closes = writes.closes();
+    writes.gate.close();
+    let opened = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let opener = {
+        let (writes, opened) = (writes.clone(), opened.clone());
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            opened.store(true, std::sync::atomic::Ordering::SeqCst);
+            writes.gate.open();
+        })
+    };
+    let r: Box<dyn Ranged> = Box::new(r);
+    let conn = watchdog(HANG, move || r.into_connection()).expect("it returned");
+    assert!(
+        opened.load(std::sync::atomic::Ordering::SeqCst),
+        "it returned before the pipe opened"
+    );
+    assert_eq!(
+        writes.closes(),
+        closes + 1,
+        "the CLOSE was written before it returned"
+    );
+    opener.join().unwrap();
+    let seen = eventually(HANG, || {
+        requests_on_the_wire(&proxy).last() == Some(&Wired::CLOSE)
+    });
+    assert!(seen, "the proxy saw the CLOSE");
+    drop(conn);
+}
+
+/// 06 §2: a pipe that stays shut ends the wait at its bound (200 ms) — not before — with the
+/// CLOSE still unwritten; it goes out with the session's next use, ahead of it.
+#[test]
+fn a_shut_pipe_ends_the_wait_at_its_bound() {
+    if SftpRemote::local_server().is_none() {
+        return;
+    }
+    let (_tmp, path, _) = four_mib();
+    let (r, proxy, writes) = idle_transport(&path, Timing::default());
+    let closes = writes.closes();
+    writes.gate.close();
+    let started = std::time::Instant::now();
+    let r: Box<dyn Ranged> = Box::new(r);
+    let conn = watchdog(HANG, move || r.into_connection()).expect("it returned at its bound");
+    assert!(
+        started.elapsed() >= Timing::default().flush,
+        "it returned before its bound: {:?}",
+        started.elapsed()
+    );
+    assert_eq!(
+        writes.closes(),
+        closes,
+        "nothing went through the shut pipe"
+    );
+    let before = requests_on_the_wire(&proxy).len();
+    writes.gate.open();
+    let mut conn = conn;
+    assert_eq!(conn.stat(p(&path)).unwrap().size, 4 << 20);
+    assert_eq!(
+        requests_on_the_wire(&proxy)[before..],
+        [Wired::CLOSE, Wired::STAT],
+        "the CLOSE went out with the next use, ahead of it"
+    );
+}
+
+/// 06 §2: the close drops every clone of the handle before `Sftp::close`, which waits while
+/// any lives. With 64 reads on the wire, their replies held, and a close deadline of 120 s, the
+/// session closes as soon as the replies flow — not at its deadline.
+#[test]
+fn closing_drops_every_clone_before_the_session_closes() {
+    if SftpRemote::local_server().is_none() {
+        return;
+    }
+    let (_tmp, path, _) = four_mib();
+    let (r, proxy) = held_transport(&path, 64, Duration::from_secs(120));
+    let ended = r.teardown();
+    drop(r);
+    proxy
+        .hold
+        .store(false, std::sync::atomic::Ordering::Relaxed);
+    assert!(
+        ended.wait(HANG),
+        "the session closed cleanly, not at its deadline"
+    );
+}
+
+/// 06 §2: a server that never answers again — the latch never opens — still lets the
+/// teardown end, at the close deadline.
+#[test]
+fn a_silent_server_still_closes_at_the_deadline() {
+    if SftpRemote::local_server().is_none() {
+        return;
+    }
+    let (_tmp, path, _) = four_mib();
+    let (r, _proxy) = held_transport(&path, 16, Duration::from_millis(500));
+    let ended = r.teardown();
+    drop(r);
+    assert!(ended.wait(HANG), "bounded by the close deadline");
+}
+
+/// 06 §2: closing, dropping or giving the connection back discards what is queued and not yet
+/// sent. With the driver paused, eight reads are queued, then the transport ends: none of them
+/// reaches the wire.
+#[test]
+fn closing_discards_what_was_queued_and_not_sent() {
+    if SftpRemote::local_server().is_none() {
+        return;
+    }
+    let (_tmp, path, _) = four_mib();
+    for how in ["close", "drop", "into_connection"] {
+        let proxy = Proxy::default();
+        let fs = SftpRemote::local_server_with(Some(proxy.clone())).unwrap();
+        let mut r = Box::new(fs)
+            .open_ranged(p(&path), Timing::default())
+            .unwrap();
+        let ended = r.teardown();
+        let signalled = r.end_signalled();
+        let go = r.pause();
+        for i in 0..8 {
+            r.read(i * 65_536, 65_536);
+        }
+        let r: Box<dyn Ranged> = Box::new(r);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let ending = std::thread::spawn(move || match how {
+            "close" => r.close(),
+            "drop" => drop(r),
+            _ => tx.send(r.into_connection()).unwrap(),
+        });
+        // The end is signalled before the driver runs again.
+        assert!(eventually(HANG, &signalled), "{how}: the end was signalled");
+        let _ = go.send(());
+        assert!(watchdog(HANG, move || ending.join().is_ok()).unwrap_or(false));
+        assert!(ended.wait(HANG), "{how}: the transport ended");
+        if let Ok(mut conn) = rx.try_recv() {
+            // Whatever the driver wrote goes out ahead of this.
+            conn.stat(p(&path)).unwrap();
+        }
+        assert_eq!(
+            reads_on_the_wire(&proxy),
+            0,
+            "{how}: a queued read went out"
+        );
+    }
+}
+
+/// 06 §2: every request has its own deadline from when it was sent. A reply withheld while
+/// later replies keep coming fails at its deadline — a later reply does not extend it — and the
+/// completions behind it then come in ticket order, each with its own bytes.
+#[test]
+fn a_withheld_reply_fails_at_its_own_deadline() {
+    if SftpRemote::local_server().is_none() {
+        return;
+    }
+    let (_tmp, path, body) = four_mib();
+    let proxy = Proxy::default();
+    proxy.rules.lock().unwrap().withhold.push(65_536);
+    let fs = SftpRemote::local_server_with(Some(proxy.clone())).unwrap();
+    let deadline = Duration::from_secs(1);
+    let timing = Timing {
+        stall: deadline,
+        ..Timing::default()
+    };
+    let mut r = Box::new(fs).open_ranged(p(&path), timing).unwrap();
+    let first = r.read(0, 65_536);
+    let held = r.read(65_536, 65_536);
+    let c = next(&mut r);
+    assert_eq!(c.ticket, first);
+    c.reply.unwrap();
+    // Later reads keep being answered while the withheld one waits.
+    let started = std::time::Instant::now();
+    let mut later = Vec::new();
+    let failed = loop {
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "the withheld read never failed while later replies kept coming"
+        );
+        let off = (2 + later.len() as u64 % 60) * 65_536;
+        later.push((r.read(off, 65_536), off));
+        if let Some(c) = r.next(Some(Duration::from_millis(50))) {
+            break c;
+        }
+    };
+    assert_eq!(failed.ticket, held);
+    let e = format!("{:#}", failed.reply.unwrap_err());
+    assert!(e.contains("no reply from the server"), "{e}");
+    assert!(failed.took >= deadline, "{:?}", failed.took);
+    for (ticket, off) in later {
+        let c = next(&mut r);
+        assert_eq!(c.ticket, ticket, "in ticket order");
+        let at = off as usize;
+        assert!(c.data().unwrap()[..] == body[at..at + 65_536]);
+    }
+}
+
+/// A transport whose thread dies (a panic) never leaves `next` waiting: every request still
+/// queued, and every one queued later, fails in its turn (under a watchdog). Giving the
+/// connection back or reopening then yields a connection that says the session was lost.
+#[test]
+fn a_dead_transport_fails_what_is_queued() {
+    if SftpRemote::local_server().is_none() {
+        return;
+    }
+    let (_tmp, path, _) = four_mib();
+    let owned = path.clone();
+    let run = watchdog(HANG, move || {
+        let fs = SftpRemote::local_server().unwrap();
+        let mut r = Box::new(fs)
+            .open_ranged(p(&owned), Timing::default())
+            .unwrap();
+        r.read(0, 10);
+        next(&mut r).reply.unwrap();
+        r.kill_transport();
+        r.read(0, 10);
+        r.fstat();
+        assert_eq!(r.pending(), 2);
+        for _ in 0..2 {
+            let c = r.next(None).expect("failed, not waiting forever");
+            let e = format!("{:#}", c.reply.unwrap_err());
+            assert!(e.contains("transport stopped"), "{e}");
+        }
+        assert!(r.next(None).is_none());
+        assert_eq!(r.pending(), 0);
+        r
+    });
+    let r = run.expect("next(None) returned");
+    let e = (Box::new(r) as Box<dyn Ranged>)
+        .reopen(p(&path))
+        .unwrap_err();
+    assert!(
+        format!("{:#}", e.error).contains("transport stopped"),
+        "{:#}",
+        e.error
+    );
+    let mut lost = e.conn;
+    let why = format!("{:#}", lost.stat(p(&path)).unwrap_err());
+    assert!(why.contains("transport stopped"), "{why}");
+    let e = lost.into_ranged(p(&path)).unwrap_err();
+    assert!(format!("{:#}", e.error).contains("transport stopped"));
+}
+
+/// The pattern a word at a time is the pattern byte by byte, from any offset.
+#[test]
+fn the_pattern_from_any_offset() {
+    for off in [0u64, 1, 7, 8, 13, 4093] {
+        for len in [0usize, 1, 5, 8, 9, 100] {
+            let want: Vec<u8> = (off..off + len as u64).map(pattern_byte).collect();
+            assert_eq!(pattern(off, len), want, "{off} {len}");
+        }
+    }
+}
+
+/// The Fake's link (06 §2): replies come in order, each `latency` after its request and then at
+/// `rate`, in simulated time; each request records the reply bytes ahead of it; a reply is cut
+/// to `clip`; a rate drop applies to later requests; with the real clock `next` sleeps.
+#[test]
+fn the_fakes_link() {
+    let (mut r, control) = fake("/m.bin", FakeFile::pattern(1 << 20), Link::gate());
+    let start = r.now();
+    for i in 0..3 {
+        r.read(i * 65_536, 65_536);
+    }
+    let per = Duration::from_secs_f64(65_536.0 / 5e6);
+    let ms20 = Duration::from_millis(20);
+    let c = next(r.as_mut());
+    assert_eq!(c.took, ms20 + per);
+    assert_eq!(c.at - start, ms20 + per);
+    assert_eq!(
+        next(r.as_mut()).at - start,
+        ms20 + per * 2,
+        "behind the reply before"
+    );
+    let backlogs: Vec<u64> = control.sent().iter().map(|s| s.backlog).collect();
+    assert_eq!(backlogs, [0, 65_536, 131_072]);
+    let outstanding: Vec<u64> = control.sent().iter().map(|s| s.outstanding).collect();
+    assert_eq!(outstanding, [0, 65_536, 131_072]);
+    assert_eq!(r.pending(), 1);
+    next(r.as_mut());
+    assert_eq!(r.pending(), 0);
+    // Nothing out: a wait passes simulated time and returns nothing.
+    let before = control.elapsed();
+    assert!(r.next(Some(Duration::from_secs(2))).is_none());
+    assert_eq!(control.elapsed() - before, Duration::from_secs(2));
+    // A read past the size at open sends nothing.
+    r.read(5 << 20, 10);
+    assert_eq!(
+        next(r.as_mut()).asked,
+        Asked::Read {
+            off: 5 << 20,
+            len: 0
+        }
+    );
+    assert_eq!(control.sent().len(), 3);
+    control.set_link(|l| {
+        l.rate = 500_000;
+        l.clip = Some(1000);
+    });
+    r.read(0, 65_536);
+    let c = next(r.as_mut());
+    assert_eq!(c.data().unwrap().len(), 1000);
+    assert_eq!(c.took, ms20 + Duration::from_secs_f64(1000.0 / 5e5));
+    // A reply not due yet: a shorter wait returns nothing and passes only its own time.
+    let at = control.elapsed();
+    r.read(0, 100);
+    assert!(
+        r.next(Some(Duration::from_millis(1))).is_none(),
+        "not due yet"
+    );
+    assert_eq!(control.elapsed() - at, Duration::from_millis(1));
+    let c = next(r.as_mut());
+    assert_eq!(c.data().unwrap().len(), 100);
+    assert_eq!(
+        control.elapsed() - at,
+        ms20 + Duration::from_secs_f64(100.0 / 5e5)
+    );
+
+    // The real clock: a reply comes no sooner than its latency (a lower bound only — a slow
+    // machine can only make it later).
+    let real = Link {
+        latency: Duration::from_millis(50),
+        clock: Clock::Real,
+        ..Link::gate()
+    };
+    let (mut r, _) = fake("/m.bin", FakeFile::pattern(1 << 20), real);
+    let started = std::time::Instant::now();
+    r.read(0, 100);
+    next(r.as_mut());
+    assert!(started.elapsed() >= Duration::from_millis(50));
+}
+
+/// The Fake's two measures (06 §4): `outstanding`, the bytes asked and not yet taken by
+/// `next` — what a scheduler admits against — and `backlog`, the reply bytes still on the link.
+/// A clipped reply shows the difference: 64 KiB asked, 20 000 sent.
+#[test]
+fn the_fakes_outstanding_counts_bytes_asked() {
+    let link = Link {
+        clip: Some(20_000),
+        ..Link::gate()
+    };
+    let (mut r, control) = fake("/m.bin", FakeFile::pattern(1 << 20), link);
+    r.read(0, 65_536);
+    r.read(65_536, 65_536);
+    r.fstat();
+    let sent = control.sent();
+    let outstanding: Vec<u64> = sent.iter().map(|s| s.outstanding).collect();
+    assert_eq!(outstanding, [0, 65_536, 131_072]);
+    let backlog: Vec<u64> = sent.iter().map(|s| s.backlog).collect();
+    assert_eq!(backlog, [0, 20_000, 40_000]);
+    // Taken by `next`, a request stops counting.
+    next(r.as_mut());
+    r.read(0, 1000);
+    let last = *control.sent().last().unwrap();
+    assert_eq!(last.outstanding, 65_536 + STAT_REPLY);
+    assert_eq!(last.backlog, 20_000 + STAT_REPLY);
+}
+
+/// A lost channel that has handed back every completion returns `None` at once, even from a
+/// wait without a timeout; completions queued before that still come first.
+#[test]
+fn a_lost_and_drained_fake_does_not_wait() {
+    let (r, control) = fake("/m.bin", FakeFile::pattern(1000), Link::gate());
+    control.fault(1, Fault::Lost);
+    let got = watchdog(HANG, move || {
+        let mut r = r;
+        r.read(0, 10);
+        r.read(10, 10);
+        r.read(20, 10);
+        let ok: Vec<bool> = (0..3).map(|_| next(r.as_mut()).reply.is_ok()).collect();
+        (ok, r.next(None).is_none())
+    });
+    assert_eq!(got, Some((vec![true, false, false], true)));
+}
+
+/// A wake from another thread ends a `next` that waits without a timeout: the waker waits for
+/// the wait to begin, and the wait ends only after the wake.
+#[test]
+fn a_wake_ends_a_wait() {
+    let (mut r, control) = fake("/m.bin", FakeFile::pattern(100), Link::gate());
+    let wake = r.waker();
+    let woke = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = woke.clone();
+    let waker = std::thread::spawn(move || {
+        let began = eventually(HANG, || control.waiting() == 1);
+        flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        wake.wake();
+        began
+    });
+    assert!(r.next(None).is_none());
+    assert!(
+        woke.load(std::sync::atomic::Ordering::SeqCst),
+        "it ended before the wake"
+    );
+    assert!(waker.join().unwrap(), "the wait began");
+    r.read(0, 10);
+    assert_eq!(
+        next(r.as_mut()).data().unwrap().len(),
+        10,
+        "and nothing is lost"
+    );
+}
+
+/// The Fake's file (06 §2): written in place (the mtime moves, or not within the same second),
+/// cut, replaced under the path (the open handle keeps the old file) and removed; a change can
+/// land right before a given request.
+#[test]
+fn the_fakes_file_changes() {
+    let (mut r, control) = fake("/m.bin", FakeFile::pattern(1000), Link::gate());
+    let t0 = r.opened().mtime;
+    control.change(Change::Write {
+        off: 10,
+        bytes: vec![0xAA; 4],
+        same_second: false,
+    });
+    r.read(8, 8);
+    r.fstat();
+    let mut want = patterned(16)[8..].to_vec();
+    want[2..6].fill(0xAA);
+    assert_eq!(next(r.as_mut()).data().unwrap()[..], want[..]);
+    assert_eq!(
+        stat_of(&next(r.as_mut())).mtime,
+        t0 + Duration::from_secs(1)
+    );
+    r.read(0, 1);
+    let was = next(r.as_mut()).data().unwrap()[0];
+    control.change(Change::Write {
+        off: 0,
+        bytes: vec![!was],
+        same_second: true,
+    });
+    r.read(0, 1);
+    r.fstat();
+    assert_eq!(
+        next(r.as_mut()).data().unwrap()[..],
+        [!was],
+        "the byte changed"
+    );
+    let same = stat_of(&next(r.as_mut()));
+    assert_eq!(
+        (same.size, same.mtime),
+        (1000, t0 + Duration::from_secs(1)),
+        "and the stat cannot show it"
+    );
+    // Right before request n (the one after the next): cut to 500.
+    let n = control.sent().len();
+    control.change_before(n + 1, Change::Truncate(500));
+    r.fstat();
+    r.fstat();
+    assert_eq!(stat_of(&next(r.as_mut())).size, 1000);
+    assert_eq!(stat_of(&next(r.as_mut())).size, 500);
+    control.change(Change::Truncate(600));
+    r.read(490, 20);
+    let mut grown = patterned(500)[490..].to_vec();
+    grown.extend([0; 10]);
+    assert_eq!(
+        next(r.as_mut()).data().unwrap()[..],
+        grown[..],
+        "zeros past the cut"
+    );
+    // Replaced: the handle reads the old file, the path names the new one.
+    control.change(Change::Replace(FakeFile::bytes(b"new".to_vec())));
+    r.fstat();
+    r.stat_path();
+    assert_eq!(stat_of(&next(r.as_mut())).size, 600);
+    assert_eq!(stat_of(&next(r.as_mut())).size, 3);
+    let mut reopened = control.open().unwrap();
+    reopened.read(0, 10);
+    assert_eq!(&next(reopened.as_mut()).data().unwrap()[..], b"new");
+    control.change(Change::Remove);
+    r.stat_path();
+    assert!(matches!(next(r.as_mut()).reply, Ok(Reply::Stat(None))));
+    r.read(0, 4);
+    assert_eq!(
+        next(r.as_mut()).data().unwrap().len(),
+        4,
+        "the handle still reads"
+    );
+    assert!(control.open().is_err());
+    assert!(control.file().is_none());
+    // Another file renamed onto the removed path.
+    control.change(Change::Replace(FakeFile::bytes(b"back".to_vec())));
+    r.stat_path();
+    assert_eq!(stat_of(&next(r.as_mut())).size, 4);
+    assert_eq!(control.file().unwrap().size, 4);
+}
+
+/// The Fake's faults: a status error on one request, then a lost channel failing that request
+/// and every later one on it; a new channel works.
+#[test]
+fn the_fakes_faults() {
+    let (mut r, control) = fake("/m.bin", FakeFile::pattern(1000), Link::gate());
+    control.fault(1, Fault::Status("Failure"));
+    control.fault(3, Fault::Lost);
+    for _ in 0..5 {
+        r.read(0, 10);
+    }
+    let ok: Vec<bool> = (0..5).map(|_| next(r.as_mut()).reply.is_ok()).collect();
+    assert_eq!(ok, [true, false, true, false, false]);
+    r.fstat();
+    let e = format!("{:#}", next(r.as_mut()).reply.unwrap_err());
+    assert!(e.contains("the connection closed"), "{e}");
+    let mut fresh = control.open().unwrap();
+    fresh.read(0, 10);
+    assert!(next(fresh.as_mut()).reply.is_ok());
+}
+
+/// The Fake gives back a connection that stats and reads its path and opens it again.
+#[test]
+fn the_fakes_connection() {
+    let (r, control) = fake("/m.bin", FakeFile::pattern(1000), Link::gate());
+    let mut conn = r.into_connection();
+    assert_eq!(conn.stat("/m.bin").unwrap().size, 1000);
+    assert_eq!(conn.stat_opt("/other").unwrap(), None);
+    assert!(conn.read_head("/m.bin", 16).unwrap() == patterned(16));
+    let mut out = Vec::new();
+    conn.read_to("/m.bin", &mut out, &mut |_| {}).unwrap();
+    assert!(out == control.file().unwrap().read(0, 1000));
+    let r = conn.into_ranged("/m.bin").unwrap();
+    let e = r.reopen("/other").unwrap_err();
+    assert!(e.conn.into_ranged("/m.bin").is_ok());
+}
+
+/// The local implementation (tests only): a local file's reads at their offsets, its `fstat` and
+/// its path's `stat`, an early end after a cut, and the connection given back.
+#[test]
+fn the_local_ranged() {
+    let (tmp, path, body) = four_mib();
+    let mut r = Box::new(LocalFs::new()).into_ranged(p(&path)).unwrap();
+    assert_eq!(r.size(), body.len() as u64);
+    r.read(3 << 20, 100);
+    r.read(10, 100);
+    assert!(next(r.as_mut()).data().unwrap()[..] == body[3 << 20..(3 << 20) + 100]);
+    assert!(next(r.as_mut()).data().unwrap()[..] == body[10..110]);
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_len(50)
+        .unwrap();
+    r.read(40, 100);
+    assert_eq!(next(r.as_mut()).data().unwrap().len(), 10);
+    r.read(60, 100);
+    assert!(next(r.as_mut()).early_end());
+    r.fstat();
+    assert_eq!(stat_of(&next(r.as_mut())).size, 50);
+    std::fs::rename(&path, tmp.path().join("moved")).unwrap();
+    r.stat_path();
+    assert!(matches!(next(r.as_mut()).reply, Ok(Reply::Stat(None))));
+    let mut conn = r.into_connection();
+    assert_eq!(conn.stat(p(&tmp.path().join("moved"))).unwrap().size, 50);
+}
+
+/// Throughput of a whole-file read against the local `sftp-server` (06 §2's measurement), today's
+/// pipelined read against 3a426b6's loop, and the p50 of a random 64 KiB read through the
+/// transport: `SOPEN_BENCH_FILE=<a large file> cargo test --release --lib bench_ -- --ignored
+/// --nocapture`.
+#[test]
+#[ignore]
+fn bench_whole_read_throughput() {
+    let file = std::env::var("SOPEN_BENCH_FILE").expect("SOPEN_BENCH_FILE");
+    let mut fs = SftpRemote::local_server().unwrap();
+    let size = std::fs::metadata(&file).unwrap().len();
+    let rate = |n: u64, s: f64| n as f64 / s / 1e6;
+    for round in 0..3 {
+        let started = std::time::Instant::now();
+        let n = fs
+            .read_to(&file, &mut std::io::sink(), &mut |_| {})
+            .unwrap();
+        let s = started.elapsed().as_secs_f64();
+        assert_eq!(n, size);
+        eprintln!(
+            "bench read_to round {round}: {n} bytes in {s:.3} s = {:.0} MB/s",
+            rate(n, s)
+        );
+        let started = std::time::Instant::now();
+        let n = fs.read_through_cursor(&file).unwrap().len() as u64;
+        let s = started.elapsed().as_secs_f64();
+        assert_eq!(n, size);
+        eprintln!(
+            "bench 3a426b6 loop round {round}: {s:.3} s = {:.0} MB/s",
+            rate(n, s)
+        );
+    }
+    let mut r = Box::new(fs).into_ranged(&file).unwrap();
+    let mut seed = 0x2545_F491_4F6C_DD1Du64;
+    let mut took = Vec::new();
+    for _ in 0..1000 {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        let off = seed % (size - 65_536);
+        r.read(off, 65_536);
+        let c = next(r.as_mut());
+        assert_eq!(c.data().unwrap().len(), 65_536);
+        took.push(c.took);
+    }
+    took.sort();
+    eprintln!(
+        "bench random 64 KiB read: p50 {:?} p95 {:?} max {:?}",
+        took[500], took[950], took[999]
+    );
+}
+
+/// The plan at the end of the offsets: a read that would run past 2^64 − 1 asks only what is
+/// left, and then the plan is done, rather than overflowing.
+#[test]
+fn the_pipeline_plan_at_the_end_of_the_offsets() {
+    let mut plan = Pipeline::new(None).starting_at(u64::MAX - 100);
+    assert_eq!(plan.send(), Some((u64::MAX - 100, 100)));
+    plan.reply(u64::MAX - 100, Some(vec![7; 100].into()))
+        .unwrap();
+    assert_eq!(plan.take().map(|b| b.len()), Some(100));
+    assert_eq!(plan.send(), None, "nothing is left to ask");
+    assert!(plan.done());
+}
+
+/// 06 §2 over SFTP: a whole read cancelled between chunks (`fetch_cancellable`, as Esc does)
+/// stops asking — three reads in all — keeps nothing, closes its handle, and the connection
+/// reads on.
+#[test]
+fn a_cancelled_whole_read_stops_asking() {
+    if SftpRemote::local_server().is_none() {
+        return;
+    }
+    let (tmp, path, body) = four_mib();
+    let proxy = Proxy::default();
+    let mut fs = SftpRemote::local_server_with(Some(proxy.clone())).unwrap();
+    proxy.wire.lock().unwrap().clear();
+    let cancel = std::sync::atomic::AtomicBool::new(false);
+    let local = tmp.path().join("cache/four.bin");
+    let err = fs
+        .fetch_cancellable(
+            p(&path),
+            &local,
+            &mut |_, _| cancel.store(true, std::sync::atomic::Ordering::Relaxed),
+            &cancel,
+        )
+        .unwrap_err();
+    assert!(is_cancelled(&err), "{err:#}");
+    // The first reply opened the window to two; the third read was the last.
+    assert_eq!(reads_on_the_wire(&proxy), 3);
+    let closes = proxy
+        .wire
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|w| !w.reply && w.kind == Wired::CLOSE)
+        .count();
+    assert_eq!(closes, 1, "its handle closed");
+    let left: Vec<_> = std::fs::read_dir(local.parent().unwrap())
+        .unwrap()
+        .collect();
+    assert!(left.is_empty(), "nothing kept: {left:?}");
+    let mut out = Vec::new();
+    fs.read_to(p(&path), &mut out, &mut |_| {}).unwrap();
+    assert!(out == body);
+}
+
+/// 06 §2: when the `fstat` at open fails, the connection comes back unchanged — the handle
+/// opened for it closed — and works.
+#[test]
+fn a_failed_fstat_at_open_gives_the_connection_back() {
+    if SftpRemote::local_server().is_none() {
+        return;
+    }
+    let (_tmp, path, body) = four_mib();
+    let proxy = Proxy::default();
+    proxy.rules.lock().unwrap().fail = Some(Wired::FSTAT);
+    let fs = SftpRemote::local_server_with(Some(proxy.clone())).unwrap();
+    let e = Box::new(fs).into_ranged(p(&path)).unwrap_err();
+    let why = format!("{:#}", e.error);
+    assert!(
+        why.contains("cannot stat") && why.contains("failed by the test proxy"),
+        "{why}"
+    );
+    let mut conn = e.conn;
+    let mut out = Vec::new();
+    conn.read_to(p(&path), &mut out, &mut |_| {}).unwrap();
+    assert!(out == body);
+    let closes = proxy
+        .wire
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|w| !w.reply && w.kind == Wired::CLOSE)
+        .count();
+    assert_eq!(closes, 2, "the refused open's handle and read_to's");
+    assert_eq!(conn.into_ranged(p(&path)).unwrap().size(), 4 << 20);
+}
+
+/// 06 §2 over SFTP: a DATA reply of zero bytes inside the file is an early end — for a
+/// transport read (`early_end`), and for a whole read, which stops there; `fetch` then refuses
+/// rather than keep a short copy.
+#[test]
+fn a_zero_byte_data_reply_is_an_early_end() {
+    if SftpRemote::local_server().is_none() {
+        return;
+    }
+    let (tmp, path, body) = four_mib();
+    let proxy = Proxy::default();
+    proxy.rules.lock().unwrap().empty.push(65_536);
+    let mut fs = SftpRemote::local_server_with(Some(proxy.clone())).unwrap();
+    let mut out = Vec::new();
+    let n = fs.read_to(p(&path), &mut out, &mut |_| {}).unwrap();
+    assert_eq!(n, 65_536, "the whole read ends at the empty reply");
+    assert!(out == body[..65_536]);
+    let local = tmp.path().join("cache/four.bin");
+    let e = fs.fetch(p(&path), &local, &mut |_, _| {}).unwrap_err();
+    assert!(format!("{e:#}").contains("kept changing"), "{e:#}");
+    let mut r = Box::new(fs).into_ranged(p(&path)).unwrap();
+    r.read(0, 65_536);
+    r.read(65_536, 65_536);
+    assert_eq!(next(r.as_mut()).data().unwrap().len(), 65_536);
+    let c = next(r.as_mut());
+    assert!(c.early_end(), "{c:?}");
+}

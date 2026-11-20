@@ -9,12 +9,22 @@
 //! [`OutcomeUnknown`](super::OutcomeUnknown), never as "nothing written".
 
 mod ops;
+mod ranged;
+mod writes;
 
-use super::{unknown, CreateError, Created, Entry, Hashing, Like, RemoteFs, Stat, Uploaded};
+#[cfg(test)]
+pub(crate) use ranged::{SftpRanged, Timing};
+pub(crate) use writes::{Counted, Writes};
+
+use super::ranged::Pipeline;
+use super::{
+    unknown, CreateError, Created, Entry, Hashing, Like, Ranged, Refused, RemoteFs, Stat, Uploaded,
+};
 use crate::target::RemoteSpec;
 use anyhow::{anyhow, bail, Context, Result};
 use bytes::BytesMut;
 use openssh_sftp_client::error::{Error as SftpErr, SftpErrorKind};
+use openssh_sftp_client::file::File;
 use openssh_sftp_client::fs::Fs;
 use openssh_sftp_client::metadata::{MetaData, MetaDataBuilder, Permissions};
 use openssh_sftp_client::{Sftp, SftpOptions};
@@ -22,6 +32,7 @@ use std::ffi::OsString;
 use std::future::Future;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
@@ -30,7 +41,7 @@ use tokio::runtime::Runtime;
 /// macOS `sun_path` holds 104 bytes; ssh binds the master at `<ControlPath>.<16 random>` first.
 const MAX_SOCKET_PATH: usize = 103 - 17;
 
-/// Bytes per read request / local read when uploading.
+/// Bytes per local read when uploading (and per request of 3a426b6's read loop, kept for tests).
 const CHUNK: usize = 256 * 1024;
 
 /// One metadata request (stat, open, rename, setstat, …).
@@ -39,12 +50,80 @@ pub const META_TIMEOUT: Duration = Duration::from_secs(30);
 pub const STALL_TIMEOUT: Duration = Duration::from_secs(60);
 
 pub struct SftpRemote {
-    rt: Runtime,
+    /// `None` only while the session is the transport of a stream (`sftp/ranged.rs`).
+    rt: Option<Runtime>,
     sftp: Option<Sftp>,
     fs: Option<Fs>,
+    /// What the session's request pipe has taken (`sftp/writes.rs`).
+    writes: Arc<Writes>,
     /// Stat requests sopen sent (tests: a listing must not stat every name).
     #[cfg(test)]
     stats: u64,
+}
+
+/// How long a failed start waits for the sftp subsystem to exit, to say how it ended.
+const STARTUP_EXIT_WAIT: Duration = Duration::from_secs(2);
+
+/// Starts the SFTP subsystem over `session` and the client on it, its request pipe counted by
+/// `writes`. The same steps as the crate's `Sftp::from_clonable_session`, which keeps the pipe to
+/// itself: the subsystem's stdin and stdout piped, stderr discarded. The child is kept as the
+/// session's auxiliary data, which the crate drops only after its flush and read tasks have
+/// ended — the local `ssh` must outlive every byte written to it. Dropping the `Arc<Session>`
+/// with it never stops the shared master: a resumed session does not `-O exit`.
+///
+/// Until the session is up the child is shared with this function, so that a failed start can
+/// still say how the subsystem ended — no subsystem, a server that exited 127 — as the crate's
+/// own session task does (`openssh_session.rs:106-116`).
+async fn start_sftp(session: Arc<openssh::Session>, writes: Arc<Writes>) -> Result<Sftp> {
+    let mut child = openssh::Session::to_subsystem(session, "sftp")
+        .stdin(openssh::Stdio::piped())
+        .stdout(openssh::Stdio::piped())
+        .stderr(openssh::Stdio::null())
+        .spawn()
+        .await?;
+    let stdin = child
+        .stdin()
+        .take()
+        .context("the sftp subsystem has no stdin")?;
+    let stdout = child
+        .stdout()
+        .take()
+        .context("the sftp subsystem has no stdout")?;
+    let child = Arc::new(std::sync::Mutex::new(Some(child)));
+    let keep = openssh_sftp_client::SftpAuxiliaryData::Arced(child.clone());
+    let stdin = Counted::new(stdin, writes);
+    match Sftp::new_with_auxiliary(stdin, stdout, SftpOptions::default(), keep).await {
+        // Our share of the child goes here: the session's is the one that keeps it.
+        Ok(sftp) => Ok(sftp),
+        Err(e) => {
+            let child = child.lock().unwrap().take();
+            let exited = child.map(|c| c.wait());
+            Err(startup_failure(e.into(), exited, STARTUP_EXIT_WAIT).await)
+        }
+    }
+}
+
+/// A failed start, with how the subsystem ended when it ends within `limit`: a non-zero exit
+/// status, or what `openssh` says of it (exit 127: "remote command not found"; 255: "the remote
+/// process has terminated", ssh's own failure). A clean exit, or none in time, adds nothing.
+async fn startup_failure<F>(
+    error: anyhow::Error,
+    exited: Option<F>,
+    limit: Duration,
+) -> anyhow::Error
+where
+    F: Future<Output = std::result::Result<std::process::ExitStatus, openssh::Error>>,
+{
+    let Some(exited) = exited else {
+        return error;
+    };
+    match tokio::time::timeout(limit, exited).await {
+        Ok(Ok(status)) if !status.success() => {
+            anyhow!("{error:#} (the sftp subsystem exited with {status})")
+        }
+        Ok(Err(e)) => anyhow!("{error:#} ({:#})", anyhow::Error::from(e)),
+        Ok(Ok(_)) | Err(_) => error,
+    }
 }
 
 /// `Err` = the request got no reply within `limit`.
@@ -86,15 +165,16 @@ impl SftpRemote {
             .enable_all()
             .build()
             .context("cannot start the async runtime")?;
-        // `resume` attaches to our master and never tears it down on drop; `from_clonable_session`
-        // closes only the sftp channel (`from_session` would `-O exit` the shared master).
+        // `resume` attaches to our master and never tears it down on drop; closing the session
+        // closes only the sftp channel (`Session::from_session` would `-O exit` the shared master).
         let session = openssh::Session::resume(config.control_path.into_boxed_path(), None);
+        let writes = Arc::new(Writes::default());
         let started = rt.block_on(within(
             META_TIMEOUT,
-            Sftp::from_clonable_session(Arc::new(session), SftpOptions::default()),
+            start_sftp(Arc::new(session), writes.clone()),
         ));
         let sftp = match started {
-            Ok(r) => r.map_err(|e| anyhow!("cannot start sftp on {}: {e}", spec.label()))?,
+            Ok(r) => r.map_err(|e| anyhow!("cannot start sftp on {}: {e:#}", spec.label()))?,
             Err(()) => {
                 return Err(timed_out(
                     &format!("starting sftp on {}", spec.label()),
@@ -112,9 +192,10 @@ impl SftpRemote {
         );
         let fs = sftp.fs();
         Ok(Self {
-            rt,
+            rt: Some(rt),
             sftp: Some(sftp),
             fs: Some(fs),
+            writes,
             #[cfg(test)]
             stats: 0,
         })
@@ -123,7 +204,7 @@ impl SftpRemote {
     fn parts(&mut self) -> (&Runtime, &Sftp, &mut Fs) {
         let Self { rt, sftp, fs, .. } = self;
         (
-            rt,
+            rt.as_ref().expect("open session"),
             sftp.as_ref().expect("open session"),
             fs.as_mut().expect("open session"),
         )
@@ -199,8 +280,8 @@ fn failed_create(path: &str, e: SftpErr) -> CreateError {
 impl Drop for SftpRemote {
     fn drop(&mut self) {
         drop(self.fs.take());
-        if let Some(sftp) = self.sftp.take() {
-            let _ = self.rt.block_on(async {
+        if let (Some(rt), Some(sftp)) = (&self.rt, self.sftp.take()) {
+            let _ = rt.block_on(async {
                 tokio::time::timeout(Duration::from_secs(5), sftp.close()).await
             });
         }
@@ -647,6 +728,47 @@ impl RemoteFs for SftpRemote {
         let got = rt.block_on(within(META_TIMEOUT, fs.remove_file(path)));
         changed(&format!("remove {path}"), got)
     }
+
+    fn into_ranged(self: Box<Self>, path: &str) -> std::result::Result<Box<dyn Ranged>, Refused> {
+        let r = self.open_ranged(path, ranged::Timing::default())?;
+        Ok(Box::new(r))
+    }
+}
+
+/// One request reading `len` bytes at `off` of `file` through a clone of its handle, so the
+/// offset is this request's own, never the crate's cursor — which moves by the length asked,
+/// not by the bytes that came back (`openssh-sftp-client` 0.15.12, `file/mod.rs:403-428`). The
+/// request is written when the future is first polled. `None`: the end of the file.
+type ReadReply = Pin<Box<dyn Future<Output = ReadResult>>>;
+type ReadResult = std::result::Result<Option<BytesMut>, SftpErr>;
+
+fn read_at(file: &File, off: u64, len: u32) -> ReadReply {
+    let mut file = file.clone();
+    Box::pin(async move {
+        use tokio::io::AsyncSeek;
+        Pin::new(&mut file).start_seek(std::io::SeekFrom::Start(off))?;
+        file.read(len, BytesMut::with_capacity(len as usize)).await
+    })
+}
+
+/// Polls every request in `flight` in order — a new one's first poll writes it, so they go out
+/// in the order pushed — and takes out those answered, with their offsets.
+fn poll_replies(
+    flight: &mut Vec<(u64, ReadReply)>,
+    cx: &mut std::task::Context<'_>,
+) -> std::task::Poll<Vec<(u64, ReadResult)>> {
+    let mut ready = Vec::new();
+    flight.retain_mut(|(off, reply)| match reply.as_mut().poll(cx) {
+        std::task::Poll::Ready(r) => {
+            ready.push((*off, r));
+            false
+        }
+        std::task::Poll::Pending => true,
+    });
+    match ready.is_empty() {
+        true => std::task::Poll::Pending,
+        false => std::task::Poll::Ready(ready),
+    }
 }
 
 impl SftpRemote {
@@ -676,7 +798,11 @@ impl SftpRemote {
         })
     }
 
-    /// Reads `path` (up to `max` bytes) into `sink`, failing after [`STALL_TIMEOUT`] without data.
+    /// Reads `path` (up to `max` bytes) into `sink`, pipelined (06 §2): every request carries its
+    /// own offset, a short reply is followed by a request for the rest, the bytes reach `sink`
+    /// in file order, and up to 4 MiB is asked ahead ([`Pipeline`]). Fails after
+    /// [`STALL_TIMEOUT`] with no reply at all. A failing `sink` (a cancel, as `Stoppable`) ends
+    /// it between chunks.
     fn read_with(
         &mut self,
         path: &str,
@@ -686,32 +812,64 @@ impl SftpRemote {
     ) -> Result<u64> {
         let (rt, sftp, _) = self.parts();
         rt.block_on(async {
-            let mut file = within(META_TIMEOUT, sftp.open(path))
+            let file = within(META_TIMEOUT, sftp.open(path))
                 .await
                 .map_err(|()| timed_out(&format!("open {path}"), META_TIMEOUT))?
                 .map_err(|e| anyhow!("cannot open {path}: {e}"))?;
-            let mut done = 0u64;
-            loop {
-                // The client caps each request at the server's read limit.
-                let want = match max {
-                    Some(max) if done as usize >= max => break,
-                    Some(max) => (max - done as usize).min(CHUNK),
-                    None => CHUNK,
-                } as u32;
-                let chunk = within(
-                    STALL_TIMEOUT,
-                    file.read(want, BytesMut::with_capacity(want as usize)),
-                )
-                .await
-                .map_err(|()| timed_out(&format!("read {path}"), STALL_TIMEOUT))?
-                .map_err(|e| anyhow!("cannot read {path}: {e}"))?;
-                let Some(bytes) = chunk else { break };
-                sink(&bytes)?;
-                done += bytes.len() as u64;
-                progress(done);
-            }
+            let mut flight = Vec::new();
+            let read = async {
+                let mut plan = Pipeline::new(max.map(|m| m as u64));
+                let mut done = 0u64;
+                loop {
+                    while let Some((off, len)) = plan.send() {
+                        flight.push((off, read_at(&file, off, len)));
+                    }
+                    if plan.done() {
+                        return Ok(done);
+                    }
+                    let replies = within(
+                        STALL_TIMEOUT,
+                        std::future::poll_fn(|cx| poll_replies(&mut flight, cx)),
+                    )
+                    .await
+                    .map_err(|()| timed_out(&format!("read {path}"), STALL_TIMEOUT))?;
+                    for (off, reply) in replies {
+                        let got = reply.map_err(|e| anyhow!("cannot read {path}: {e}"))?;
+                        plan.reply(off, got.map(BytesMut::freeze))
+                            .with_context(|| format!("cannot read {path}"))?;
+                    }
+                    while let Some(bytes) = plan.take() {
+                        sink(&bytes)?;
+                        done += bytes.len() as u64;
+                        progress(done);
+                    }
+                }
+            };
+            let result = read.await;
+            // Requests still out hold clones of the handle: drop them first, or the close below
+            // (sent only by the last clone) never goes out.
+            drop(flight);
             let _ = within(Duration::from_secs(5), file.close()).await;
-            Ok(done)
+            result
+        })
+    }
+
+    /// 3a426b6's `read_with`, kept to show what V5 fixes: one 256 KiB request at a time through
+    /// the crate's cursor, which moves by the length asked.
+    #[cfg(test)]
+    pub(crate) fn read_through_cursor(&mut self, path: &str) -> Result<Vec<u8>> {
+        let (rt, sftp, _) = self.parts();
+        rt.block_on(async {
+            let mut file = sftp.open(path).await?;
+            let mut out = Vec::new();
+            while let Some(bytes) = file
+                .read(CHUNK as u32, BytesMut::with_capacity(CHUNK))
+                .await?
+            {
+                out.extend_from_slice(&bytes);
+            }
+            let _ = file.close().await;
+            Ok(out)
         })
     }
 }
@@ -725,6 +883,201 @@ const SFTP_SERVERS: [&str; 4] = [
     "/usr/lib/ssh/sftp-server",
 ];
 
+/// What the test proxy between sopen and the local `sftp-server` does (06 §2, V5): it cuts every
+/// `SSH_FXP_DATA` payload to `clip` bytes, as a server with a lower read limit would answer (and
+/// OpenSSH's own never does); holds every reply back while the latch `hold` is set (a link gone
+/// quiet); applies [`Rules`] to the replies of particular requests; and logs every packet it
+/// passes.
+#[cfg(test)]
+#[derive(Default, Clone)]
+pub(crate) struct Proxy {
+    pub clip: Option<usize>,
+    pub hold: Arc<std::sync::atomic::AtomicBool>,
+    pub rules: Arc<std::sync::Mutex<Rules>>,
+    pub wire: Arc<std::sync::Mutex<Vec<Wired>>>,
+    /// Request id → what happens to its reply, marked as the request passes (the proxy's own).
+    pub marked: Arc<std::sync::Mutex<std::collections::HashMap<u32, Rule>>>,
+    /// The session closed its end (the proxy's own).
+    pub ended: Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// Sets its flag when dropped: the proxy's requests loop has ended.
+#[cfg(test)]
+struct Ended(Arc<std::sync::atomic::AtomicBool>);
+
+#[cfg(test)]
+impl Drop for Ended {
+    fn drop(&mut self) {
+        self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Replies the proxy changes, chosen by their requests.
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct Rules {
+    /// The replies to reads at these offsets never pass.
+    pub withhold: Vec<u64>,
+    /// Reads at these offsets are answered with a DATA of zero bytes.
+    pub empty: Vec<u64>,
+    /// The next request of this packet type is answered `SSH_FX_FAILURE`.
+    pub fail: Option<u8>,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum Rule {
+    Withhold,
+    Empty,
+    Fail,
+}
+
+/// One packet as the proxy passed it: a request from sopen or a reply from the server, its SFTP
+/// packet type and, for a read, its offset and length.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Wired {
+    pub reply: bool,
+    pub kind: u8,
+    pub read: Option<(u64, u32)>,
+}
+
+#[cfg(test)]
+impl Wired {
+    pub const OPEN: u8 = 3;
+    pub const CLOSE: u8 = 4;
+    pub const READ: u8 = 5;
+    pub const FSTAT: u8 = 8;
+    pub const STAT: u8 = 17;
+    pub const STATUS: u8 = 101;
+    pub const DATA: u8 = 103;
+}
+
+/// One SFTP packet from `from`, whole: its 4-byte length, then that many bytes. `None` at the end.
+#[cfg(test)]
+async fn packet<R: tokio::io::AsyncRead + Unpin>(from: &mut R) -> Option<Vec<u8>> {
+    use tokio::io::AsyncReadExt;
+    let mut len = [0u8; 4];
+    from.read_exact(&mut len).await.ok()?;
+    let mut body = vec![0u8; u32::from_be_bytes(len) as usize];
+    from.read_exact(&mut body).await.ok()?;
+    Some(body)
+}
+
+#[cfg(test)]
+fn be32(b: &[u8]) -> u32 {
+    u32::from_be_bytes(b[..4].try_into().unwrap())
+}
+
+#[cfg(test)]
+async fn send_packet<W: tokio::io::AsyncWrite + Unpin>(to: &mut W, body: &[u8]) -> Option<()> {
+    use tokio::io::AsyncWriteExt;
+    to.write_all(&(body.len() as u32).to_be_bytes())
+        .await
+        .ok()?;
+    to.write_all(body).await.ok()?;
+    to.flush().await.ok()
+}
+
+#[cfg(test)]
+impl Proxy {
+    /// Requests from sopen to the server, logged and passed on unchanged.
+    async fn requests<R, W>(self, mut from: R, mut to: W)
+    where
+        R: tokio::io::AsyncRead + Unpin,
+        W: tokio::io::AsyncWrite + Unpin,
+    {
+        // The session gone: the replies stop waiting behind the latch, and the server ends.
+        let _gone = Ended(self.ended.clone());
+        while let Some(body) = packet(&mut from).await {
+            // READ: type, id, handle (a string), offset, length.
+            let read = (body.first() == Some(&Wired::READ)).then(|| {
+                let handle = be32(&body[5..]) as usize;
+                let at = 9 + handle;
+                let off = u64::from_be_bytes(body[at..at + 8].try_into().unwrap());
+                (off, be32(&body[at + 8..]))
+            });
+            self.wire.lock().unwrap().push(Wired {
+                reply: false,
+                kind: body[0],
+                read,
+            });
+            let rule = {
+                let mut rules = self.rules.lock().unwrap();
+                match read {
+                    Some((off, _)) if rules.withhold.contains(&off) => Some(Rule::Withhold),
+                    Some((off, _)) if rules.empty.contains(&off) => Some(Rule::Empty),
+                    _ if rules.fail == Some(body[0]) => rules.fail.take().map(|_| Rule::Fail),
+                    _ => None,
+                }
+            };
+            if let Some(rule) = rule {
+                self.marked.lock().unwrap().insert(be32(&body[1..]), rule);
+            }
+            if send_packet(&mut to, &body).await.is_none() {
+                return;
+            }
+        }
+    }
+
+    /// Replies from the server to sopen: a DATA payload over `clip` is cut to it.
+    async fn replies<R, W>(self, mut from: R, mut to: W)
+    where
+        R: tokio::io::AsyncRead + Unpin,
+        W: tokio::io::AsyncWrite + Unpin,
+    {
+        const VERSION: u8 = 2;
+        while let Some(mut body) = packet(&mut from).await {
+            while self.hold.load(std::sync::atomic::Ordering::Relaxed) {
+                if self.ended.load(std::sync::atomic::Ordering::Relaxed) {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            // Every reply but VERSION carries its request's id.
+            let rule = match body[0] {
+                VERSION => None,
+                _ => self.marked.lock().unwrap().remove(&be32(&body[1..])),
+            };
+            match rule {
+                Some(Rule::Withhold) => continue,
+                Some(Rule::Empty) if body[0] == Wired::DATA => {
+                    body.truncate(9);
+                    body[5..9].copy_from_slice(&0u32.to_be_bytes());
+                }
+                Some(Rule::Fail) => {
+                    // STATUS: type, id, code (4 = SSH_FX_FAILURE), message, language.
+                    let id = body[1..5].to_vec();
+                    let msg = b"failed by the test proxy";
+                    body = vec![Wired::STATUS];
+                    body.extend(id);
+                    body.extend(4u32.to_be_bytes());
+                    body.extend((msg.len() as u32).to_be_bytes());
+                    body.extend(msg);
+                    body.extend(0u32.to_be_bytes());
+                }
+                _ => {}
+            }
+            self.wire.lock().unwrap().push(Wired {
+                reply: true,
+                kind: body[0],
+                read: None,
+            });
+            // DATA: type, id, data (a string).
+            if let (Some(&Wired::DATA), Some(clip)) = (body.first(), self.clip) {
+                let len = be32(&body[5..]) as usize;
+                if len > clip {
+                    body.truncate(9 + clip);
+                    body[5..9].copy_from_slice(&(clip as u32).to_be_bytes());
+                }
+            }
+            if send_packet(&mut to, &body).await.is_none() {
+                return;
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 impl SftpRemote {
     /// SFTP to this machine's own `sftp-server`, run as a child over pipes: a real server's
@@ -732,7 +1085,18 @@ impl SftpRemote {
     /// where OpenSSH's server is not installed — a failure instead when
     /// `SOPEN_REQUIRE_SFTP_SERVER` is set (CI installs it).
     pub(crate) fn local_server() -> Option<Self> {
-        let Some(server) = SFTP_SERVERS.iter().find(|p| Path::new(p).exists()) else {
+        Self::local_server_with(None)
+    }
+
+    /// [`SftpRemote::local_server`], with the session's bytes passing through `proxy`.
+    pub(crate) fn local_server_with(proxy: Option<Proxy>) -> Option<Self> {
+        // `SOPEN_TEST_HIDE_SFTP_SERVER` makes the server look absent: the receipt that every test
+        // needing it fails under `SOPEN_REQUIRE_SFTP_SERVER`, rather than passing as a skip.
+        let hidden = std::env::var_os("SOPEN_TEST_HIDE_SFTP_SERVER").is_some();
+        let found = SFTP_SERVERS
+            .iter()
+            .find(|p| !hidden && Path::new(p).exists());
+        let Some(server) = found else {
             let missing = format!("no sftp-server on this machine ({SFTP_SERVERS:?})");
             if std::env::var_os("SOPEN_REQUIRE_SFTP_SERVER").is_some() {
                 panic!("SOPEN_REQUIRE_SFTP_SERVER is set but {missing}");
@@ -744,29 +1108,72 @@ impl SftpRemote {
             .enable_all()
             .build()
             .unwrap();
-        let sftp = rt.block_on(async {
-            let mut child = tokio::process::Command::new(server)
+        let spawn = |server: &str| {
+            tokio::process::Command::new(server)
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .kill_on_drop(true)
                 .spawn()
-                .unwrap();
-            let (stdin, stdout) = (child.stdin.take().unwrap(), child.stdout.take().unwrap());
-            // The child lives as long as the session (and is killed with it).
-            let keep = openssh_sftp_client::SftpAuxiliaryData::Boxed(Box::new(
-                std::sync::Mutex::new(child),
-            ));
-            Sftp::new_with_auxiliary(stdin, stdout, SftpOptions::default(), keep)
-                .await
                 .unwrap()
-        });
+        };
+        let writes = Arc::new(Writes::default());
+        let sftp = match proxy {
+            None => rt.block_on(async {
+                let mut child = spawn(server);
+                let (stdin, stdout) = (child.stdin.take().unwrap(), child.stdout.take().unwrap());
+                // The child lives as long as the session (and is killed with it).
+                let keep = openssh_sftp_client::SftpAuxiliaryData::Boxed(Box::new(
+                    std::sync::Mutex::new(child),
+                ));
+                let stdin = Counted::new(stdin, writes.clone());
+                Sftp::new_with_auxiliary(stdin, stdout, SftpOptions::default(), keep)
+                    .await
+                    .unwrap()
+            }),
+            Some(proxy) => {
+                // The proxy and the server run on a thread and runtime of their own, as a remote
+                // does: what the session writes reaches them whether or not anything drives the
+                // session's runtime. In-memory pipes join the two.
+                let (to_proxy, from_sopen) = tokio::io::duplex(1 << 20);
+                let (to_sopen, from_proxy) = tokio::io::duplex(1 << 20);
+                let server = server.to_string();
+                std::thread::spawn(move || {
+                    let rt = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .unwrap();
+                    rt.block_on(async move {
+                        let mut child = spawn(&server);
+                        let (stdin, stdout) =
+                            (child.stdin.take().unwrap(), child.stdout.take().unwrap());
+                        let requests = tokio::spawn(proxy.clone().requests(from_sopen, stdin));
+                        proxy.replies(stdout, to_sopen).await;
+                        let _ = requests.await;
+                        drop(child);
+                    })
+                });
+                rt.block_on(Sftp::new_with_auxiliary(
+                    Counted::new(to_proxy, writes.clone()),
+                    from_proxy,
+                    SftpOptions::default(),
+                    openssh_sftp_client::SftpAuxiliaryData::None,
+                ))
+                .unwrap()
+            }
+        };
         let fs = sftp.fs();
         Some(Self {
-            rt,
+            rt: Some(rt),
             sftp: Some(sftp),
             fs: Some(fs),
+            writes,
             stats: 0,
         })
+    }
+
+    /// What this session's request pipe has taken, with its test gate.
+    pub(crate) fn writes(&self) -> Arc<Writes> {
+        self.writes.clone()
     }
 
     /// Stat requests this connection made so far (counted where sopen sends them, in
@@ -911,8 +1318,11 @@ mod tests {
     /// answering is.
     #[test]
     fn a_listing_times_out_per_reply_not_as_a_whole() {
+        // Paused time: the clock moves only when every task waits, so the 400 ms reply and the
+        // 150 ms limit are ordered by their deadlines, never by how late this thread runs.
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
+            .start_paused(true)
             .build()
             .unwrap();
         let limit = Duration::from_millis(150);
@@ -938,6 +1348,77 @@ mod tests {
         let e = timed_out("stat /x", META_TIMEOUT);
         assert_eq!(e.to_string(), "stat /x: no reply from the server in 30s");
         assert!(super::super::is_outcome_unknown(&unknown("rename a to b")));
+    }
+
+    /// A failed start says how the sftp subsystem ended (the crate's session task did): a real
+    /// child that exits non-zero gives its status, `openssh`'s view of an exit (127) its words; a
+    /// clean exit or none in time adds nothing, and the wait ends at its bound.
+    #[test]
+    fn a_failed_start_says_how_the_subsystem_ended() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        // The children are tokio's, spawned within this runtime.
+        let _within = rt.enter();
+        let failed = || anyhow!("cannot start sftp: unexpected end of file");
+        let exits = |code: u32| {
+            let mut child = tokio::process::Command::new("sh")
+                .args(["-c", &format!("exit {code}")])
+                .spawn()
+                .unwrap();
+            async move { child.wait().await.map_err(openssh::Error::Remote) }
+        };
+        let limit = Duration::from_secs(30);
+        let e = rt.block_on(startup_failure(failed(), Some(exits(3)), limit));
+        let msg = format!("{e:#}");
+        assert!(
+            msg.starts_with("cannot start sftp: unexpected end of file"),
+            "{msg}"
+        );
+        assert!(
+            msg.contains("the sftp subsystem exited with exit status: 3"),
+            "{msg}"
+        );
+
+        let not_found = async {
+            Err::<std::process::ExitStatus, _>(openssh::Error::Remote(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "remote command not found",
+            )))
+        };
+        let e = rt.block_on(startup_failure(failed(), Some(not_found), limit));
+        let msg = format!("{e:#}");
+        assert!(
+            msg.contains("the remote command could not be executed"),
+            "{msg}"
+        );
+        assert!(msg.contains("remote command not found"), "{msg}");
+
+        let e = rt.block_on(startup_failure(failed(), Some(exits(0)), limit));
+        assert_eq!(
+            format!("{e:#}"),
+            "cannot start sftp: unexpected end of file"
+        );
+        let none: Option<std::future::Ready<_>> = None;
+        let e = rt.block_on(startup_failure(failed(), none, limit));
+        assert_eq!(
+            format!("{e:#}"),
+            "cannot start sftp: unexpected end of file"
+        );
+
+        // A subsystem that does not exit: the wait ends at its bound, adding nothing.
+        let paused = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .start_paused(true)
+            .build()
+            .unwrap();
+        let never = std::future::pending::<std::result::Result<std::process::ExitStatus, _>>();
+        let e = paused.block_on(startup_failure(failed(), Some(never), STARTUP_EXIT_WAIT));
+        assert_eq!(
+            format!("{e:#}"),
+            "cannot start sftp: unexpected end of file"
+        );
     }
 
     fn lost() -> SftpErr {

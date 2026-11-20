@@ -557,8 +557,9 @@ fn a_remote_read_stops_at_the_budget() {
     .show();
     assert_eq!(card_why(&p), "over the preview limit: Enter opens it");
     // At the read boundary: what the server sent, response by response, read once, in order —
-    // and no further than the response that crossed the budget (the SFTP reader asks for the
-    // next response only after the last one was taken: nothing else is in flight).
+    // and taken no further than the response that crossed the budget. (The SFTP reader keeps
+    // requests in flight, at most 4 MiB, 06 §2: what was already sent past that response
+    // arrives and is dropped, never taken.)
     let responses = fx.counts.responses(&abs);
     assert_ranges_once(&responses);
     let sent: u64 = responses.iter().map(|r| r.1).sum();
@@ -573,8 +574,9 @@ fn a_remote_read_stops_at_the_budget() {
     assert!(fx.preview_copies().is_empty(), "{:?}", fx.preview_copies());
 }
 
-/// The most one SFTP read response carries: the reader's request size (`sftp.rs` `CHUNK`).
-const SFTP_RESPONSE: u64 = 256 << 10;
+/// The most one SFTP read response carries: what the whole-file reader asks per request
+/// (`remote::ranged::PIPE_REQUEST`, 06 §2), which OpenSSH's `sftp-server` answers in full.
+const SFTP_RESPONSE: u64 = crate::remote::PIPE_REQUEST as u64;
 
 /// A file whose bytes say where they are: 16-byte records `@<offset, 14 hex digits>\n`, so any
 /// run of its bytes holding one whole record tells its own offset (it is text, too).
@@ -1529,8 +1531,14 @@ fn a_read_lifted_mid_way_goes_past_its_read_budget() {
         let responses = fx.counts.responses(&abs);
         assert_eq!(
             responses.first().map(|r| r.1),
-            Some(SFTP_RESPONSE - 1024),
-            "the first response is full-size: {responses:?}"
+            Some(SFTP_RESPONSE),
+            "the first response is full-size — the length asked, no short read: {responses:?}"
+        );
+        // Enter (the gate, at the first response) came before the read crossed its budget; the
+        // lifted read then crosses it.
+        assert!(
+            SFTP_RESPONSE < cap,
+            "the first response alone is under the budget"
         );
         assert_ranges_once(&responses);
         assert_eq!(fx.counts.reads.lock().unwrap().len(), reads + 1, "one read");
