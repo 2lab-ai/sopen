@@ -211,6 +211,9 @@ impl Panel {
 
     /// The selected entries, in the panel's order.
     pub fn selection(&self) -> Vec<&Entry> {
+        if self.selected.is_empty() {
+            return Vec::new();
+        }
         self.entries
             .iter()
             .filter(|e| self.is_selected(e))
@@ -233,20 +236,19 @@ impl Panel {
     /// `N selected = X bytes` while anything is selected: the files' bytes, folders counted as
     /// entries (04 §4).
     pub fn selected_foot(&self) -> Option<String> {
-        let selection = self.selection();
-        if selection.is_empty() {
+        if self.selected.is_empty() {
             return None;
         }
-        let bytes: u128 = selection
-            .iter()
-            .filter(|e| e.kind == EntryKind::File)
-            .map(|e| u128::from(e.size))
-            .sum();
-        Some(format!(
-            "{} selected = {} bytes",
-            grouped(selection.len() as u128),
-            grouped(bytes)
-        ))
+        let (mut count, mut bytes) = (0u128, 0u128);
+        for e in self.entries.iter().filter(|e| self.is_selected(e)) {
+            count += 1;
+            if e.kind == EntryKind::File {
+                bytes += u128::from(e.size);
+            }
+        }
+        // The set holds only names listed here (fill keeps it so), but say nothing rather than
+        // `0 selected` should it ever not.
+        (count > 0).then(|| format!("{} selected = {} bytes", grouped(count), grouped(bytes)))
     }
 
     /// `N Listed = N bytes` (the entries but `..`, the bytes of the files), then the free space
@@ -321,9 +323,10 @@ pub fn selectable(entry: &Entry) -> bool {
 }
 
 /// Whether `name` matches the select-group `pattern` (04 §4): `*` any run of characters, `?`
-/// one character, every other character itself in any case.
+/// one character, every other character itself in any case — compared by [`fold`], character
+/// for character.
 pub fn matches(pattern: &str, name: &str) -> bool {
-    let same = |a: char, b: char| a == b || a.to_lowercase().eq(b.to_lowercase());
+    let same = |a: char, b: char| a == b || fold(a) == fold(b);
     let (p, n): (Vec<char>, Vec<char>) = (pattern.chars().collect(), name.chars().collect());
     let (mut i, mut j) = (0, 0);
     // The last `*` seen: where it is in the pattern, and how much of the name it has taken.
@@ -345,6 +348,25 @@ pub fn matches(pattern: &str, name: &str) -> bool {
         }
     }
     p[i..].iter().all(|&c| c == '*')
+}
+
+/// `c` with its case folded, one character for one: the lower case of its upper case, so the
+/// forms a letter takes fold together — `Σ σ ς` to `σ`, `S s ſ` to `s`, `K k` and the Kelvin
+/// sign to `k`, `Μ μ` and the micro sign to `μ`, `ẞ ß` to `ß`. A case mapping that yields more
+/// than one character (`ß` → `SS`, `İ` → `i̇`) is not taken: a character stays one character,
+/// as Unicode's simple case folding keeps it, and `?` still matches exactly one. (One step past
+/// simple folding: the dotless `ı` folds with `i`, its upper case being `I`.)
+fn fold(c: char) -> char {
+    let one = |mut mapped: std::char::ToUppercase| match (mapped.next(), mapped.next()) {
+        (Some(m), None) => m,
+        _ => c,
+    };
+    let upper = one(c.to_uppercase());
+    let mut lower = upper.to_lowercase();
+    match (lower.next(), lower.next()) {
+        (Some(l), None) => l,
+        _ => upper,
+    }
 }
 
 /// The Name and Ext columns: a file's extension apart (`main.rs` → `main`, `rs`); a folder,
@@ -698,6 +720,33 @@ mod tests {
             ("", "x", false),
             ("main.rs", "main.rs", true),
             ("main.rs", "main_rs", false),
+        ] {
+            assert_eq!(matches(pattern, name), want, "{pattern:?} vs {name:?}");
+        }
+    }
+
+    /// "Any case" is case folding, not lowercase equality: a final sigma is a sigma, the long s
+    /// an s, the micro sign a mu, the Kelvin sign a k, the capital sharp s a sharp s — each one
+    /// character for one, so `?` still takes exactly one. Folds that change the length (`ß` and
+    /// `ss`, Turkish `İ` and `i`) do not match: a character matches a character.
+    #[test]
+    fn patterns_fold_case_as_unicode_does() {
+        for (pattern, name, want) in [
+            ("Σ.txt", "ς.txt", true),
+            ("ς.txt", "Σ.TXT", true),
+            ("*ς", "ΟΔΟΣ", true),
+            ("ΟΔΟ?", "οδος", true),
+            ("ſ*", "Song", true),
+            ("s?", "ſt", true),
+            ("µ*", "Μικρό", true),
+            ("\u{212A}elvin", "kelvin", true),
+            ("KELVIN", "\u{212A}elvin", true),
+            ("ẞ", "ß", true),
+            ("?", "ß", true),
+            ("ß", "ss", false),
+            ("ss", "ß", false),
+            ("İ", "i", false),
+            ("Σ", "Ϛ", false),
         ] {
             assert_eq!(matches(pattern, name), want, "{pattern:?} vs {name:?}");
         }
