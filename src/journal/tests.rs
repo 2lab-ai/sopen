@@ -46,6 +46,48 @@ struct MemState {
 #[derive(Clone)]
 struct MemFs(Arc<Mutex<MemState>>);
 
+/// How a power cut leaves the directories: four of the outcomes, not every mix. Every directory
+/// back at the entries of its last fsync (what was created, renamed or removed since is undone);
+/// none (every rename reached the disk, the data behind it only if fsynced — the reordering a
+/// journaling filesystem allows); and the two splits between a journal's own directory and the
+/// folders above it. A mix inside one directory (one rename kept, another not) is not modelled.
+#[derive(Clone, Copy, Debug)]
+enum Cut {
+    Durable,
+    Renames,
+    /// The folders above a journal went back to their last fsync; the journal's own directory
+    /// kept what was done in it.
+    Parents,
+    /// The journal's own directory went back to its last fsync; the folders above kept what was
+    /// done in them.
+    Journal,
+}
+
+const CUTS: [Cut; 4] = [Cut::Durable, Cut::Renames, Cut::Parents, Cut::Journal];
+
+impl Cut {
+    fn reverts(self, dir: &Path) -> bool {
+        let journal = dir
+            .file_name()
+            .is_some_and(|n| n.to_string_lossy().contains(".journal-"));
+        match self {
+            Cut::Durable => true,
+            Cut::Renames => false,
+            Cut::Parents => !journal,
+            Cut::Journal => journal,
+        }
+    }
+}
+
+/// `mem` as the next open finds it: after a kill, and after each modelled power cut.
+fn reopened(mem: &MemFs) -> Vec<(String, MemFs)> {
+    let mut out = vec![("kill".to_string(), mem.killed())];
+    for cut in CUTS {
+        out.push((format!("power cut ({cut:?})"), mem.power_cut(cut)));
+    }
+    out
+}
+
 fn no(kind: io::ErrorKind, path: &Path) -> io::Error {
     io::Error::new(kind, path.display().to_string())
 }
@@ -144,16 +186,14 @@ impl MemFs {
         })))
     }
 
-    /// The power was cut. A file keeps only the data of its last fsync (a file never synced is
-    /// torn: half of it). With `durable_entries`, a directory keeps only the entries of its last
-    /// fsync, so what was created, renamed or removed since is undone; without, every rename
-    /// reached the disk but the data behind it may not have (the reordering a journaling
-    /// filesystem allows).
-    fn power_cut(&self, durable_entries: bool) -> MemFs {
+    /// The power was cut, leaving the directories as `cut` says. A file keeps only the data of
+    /// its last fsync (a file never synced is torn: half of it).
+    fn power_cut(&self, cut: Cut) -> MemFs {
         fn copy(
             old: &MemState,
             id: usize,
-            durable_entries: bool,
+            path: &Path,
+            cut: Cut,
             new: &mut MemState,
             seen: &mut HashMap<usize, usize>,
         ) -> usize {
@@ -177,10 +217,11 @@ impl MemFs {
                     }
                 }
                 Inode::Dir { entries, durable } => {
-                    let from = if durable_entries { durable } else { entries };
+                    let from = if cut.reverts(path) { durable } else { entries };
                     let mut out = BTreeMap::new();
                     for (name, &child) in from {
-                        out.insert(name.clone(), copy(old, child, durable_entries, new, seen));
+                        let child = copy(old, child, &path.join(name), cut, new, seen);
+                        out.insert(name.clone(), child);
                     }
                     Inode::Dir {
                         entries: out.clone(),
@@ -193,7 +234,7 @@ impl MemFs {
         }
         let old = self.0.lock().unwrap();
         let mut new = MemState::default();
-        copy(&old, 0, durable_entries, &mut new, &mut HashMap::new());
+        copy(&old, 0, Path::new("/"), cut, &mut new, &mut HashMap::new());
         MemFs(Arc::new(Mutex::new(new)))
     }
 
@@ -482,6 +523,91 @@ impl Fs for NoSync {
     }
 }
 
+type Pick = Box<dyn Fn(&[String], &str) -> bool + Send + Sync>;
+
+/// Fails one step — the first that `pick`, given the steps done so far, chooses — without doing
+/// it, and carries on: the process lives on after the failure.
+struct Flaky {
+    inner: Arc<dyn Fs>,
+    pick: Pick,
+    fired: AtomicBool,
+    log: Mutex<Vec<String>>,
+}
+
+impl Flaky {
+    fn new(
+        inner: Arc<dyn Fs>,
+        pick: impl Fn(&[String], &str) -> bool + Send + Sync + 'static,
+    ) -> Arc<Flaky> {
+        Arc::new(Flaky {
+            inner,
+            pick: Box::new(pick),
+            fired: AtomicBool::new(false),
+            log: Mutex::new(Vec::new()),
+        })
+    }
+
+    fn step(&self, what: &str, path: &Path) -> io::Result<()> {
+        let op = format!("{what} {}", path.display());
+        let mut log = self.log.lock().unwrap();
+        if !self.fired.load(Ordering::SeqCst) && (self.pick)(&log, &op) {
+            self.fired.store(true, Ordering::SeqCst);
+            log.push(format!("FAILED {op}"));
+            return Err(io::Error::other("injected failure (test)"));
+        }
+        log.push(op);
+        Ok(())
+    }
+
+    fn fired(&self) -> bool {
+        self.fired.load(Ordering::SeqCst)
+    }
+}
+
+impl Fs for Flaky {
+    fn create_dir(&self, path: &Path) -> io::Result<()> {
+        self.step("mkdir", path)?;
+        self.inner.create_dir(path)
+    }
+    fn write_new(&self, path: &Path, bytes: &[u8]) -> io::Result<()> {
+        self.step("write", path)?;
+        self.inner.write_new(path, bytes)
+    }
+    fn sync_file(&self, path: &Path) -> io::Result<()> {
+        self.step("fsync", path)?;
+        self.inner.sync_file(path)
+    }
+    fn sync_dir(&self, path: &Path) -> io::Result<()> {
+        self.step("fsyncdir", path)?;
+        self.inner.sync_dir(path)
+    }
+    fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
+        self.step("rename", from)?;
+        self.inner.rename(from, to)
+    }
+    fn remove_file(&self, path: &Path) -> io::Result<()> {
+        self.step("rm", path)?;
+        self.inner.remove_file(path)
+    }
+    fn remove_dir(&self, path: &Path) -> io::Result<()> {
+        self.step("rmdir", path)?;
+        self.inner.remove_dir(path)
+    }
+    fn read(&self, path: &Path) -> io::Result<Vec<u8>> {
+        self.inner.read(path)
+    }
+    fn list(&self, dir: &Path) -> io::Result<Vec<String>> {
+        self.inner.list(dir)
+    }
+    fn node(&self, path: &Path, follow: bool) -> io::Result<Option<Node>> {
+        self.inner.node(path, follow)
+    }
+    fn lock(&self, path: &Path, create: bool) -> io::Result<Option<Held>> {
+        self.step("lock", path)?;
+        self.inner.lock(path, create)
+    }
+}
+
 // ---------------------------------------------------------------------------------------------
 // Snapshots the scenarios publish.
 
@@ -562,6 +688,8 @@ struct Scenario {
     gens: BTreeMap<u64, Snapshot>,
     /// The scenario's own rule over what recovery found (after the shared rules held).
     check: Check,
+    /// What the whole run reports.
+    full: Vec<Ack>,
 }
 
 struct Recovered {
@@ -690,16 +818,21 @@ fn recover(
 }
 
 /// Runs `scenario` once whole to count its steps, then once per step k on a fresh filesystem
-/// that dies before step k, and checks recovery after a kill and after both kinds of power cut.
-/// Returns every rule broken.
+/// that dies before step k. Each run is checked as the next open finds it after a kill; after a
+/// kill and an open that only listed (taking locks, emptying tombstones), as the one after that
+/// finds it; and after each modelled power cut, with and without that listing first. Returns
+/// every rule broken.
 fn mem_matrix(scenario: &Scenario, wrap: fn(Arc<dyn Fs>) -> Arc<dyn Fs>) -> Vec<String> {
     let cache = Path::new(MEM_CACHE);
+    let home = Path::new("/cache/.edits/box/data");
     let all = {
         let mem = MemFs::with_cache();
         let dying = Dying::new(wrap(Arc::new(mem)), usize::MAX);
         let fs: Arc<dyn Fs> = dying.clone();
-        (scenario.run)(&fs, cache, &mut Vec::new())
+        let mut acks = Vec::new();
+        (scenario.run)(&fs, cache, &mut acks)
             .unwrap_or_else(|e| panic!("{}: the scenario fails whole: {e:#}", scenario.name));
+        assert_eq!(acks, scenario.full, "{}: the whole run", scenario.name);
         dying.ops()
     };
     let mut broken = Vec::new();
@@ -709,29 +842,81 @@ fn mem_matrix(scenario: &Scenario, wrap: fn(Arc<dyn Fs>) -> Arc<dyn Fs>) -> Vec<
         let fs: Arc<dyn Fs> = dying.clone();
         let mut acks = Vec::new();
         let ran = (scenario.run)(&fs, cache, &mut acks);
+        let name = scenario.name;
+        let ops = dying.ops();
+        let stopped = dying.dead.load(Ordering::SeqCst);
+        let same = ops
+            .iter()
+            .map(|op| no_id(op))
+            .eq(all.iter().take(k).map(|op| no_id(op)));
+        if k < all.len() && (!stopped || ops.len() != k || !same) {
+            broken.push(format!(
+                "{name}: the stop before step {k} did not fire there ({} steps ran)",
+                ops.len()
+            ));
+        }
         if k == all.len() {
             if let Err(e) = ran {
-                broken.push(format!("{}: whole run failed: {e:#}", scenario.name));
+                broken.push(format!("{name}: whole run failed: {e:#}"));
+            }
+            if acks != scenario.full {
+                broken.push(format!("{name}: the whole run reported {acks:?}"));
+            }
+            if acks.contains(&Ack::Removed) {
+                let left: Vec<String> = mem
+                    .list(home)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|n| n.contains(".journal-"))
+                    .collect();
+                if !left.is_empty() {
+                    broken.push(format!("{name}: removed, yet {left:?} is left"));
+                }
             }
         }
         let step = all.get(k).map_or("the end", String::as_str);
-        for (how, after) in [
-            ("kill", mem.killed()),
-            ("power cut", mem.power_cut(true)),
-            ("power cut, renames on disk", mem.power_cut(false)),
-        ] {
+        let listed = mem.killed();
+        drop(orphans(
+            &(Arc::new(listed.clone()) as Arc<dyn Fs>),
+            cache,
+            HOST,
+            PATH,
+        ));
+        let mut states = vec![
+            ("kill".to_string(), mem.killed()),
+            ("kill, then a listing".to_string(), listed.killed()),
+        ];
+        for cut in CUTS {
+            states.push((format!("power cut ({cut:?})"), mem.power_cut(cut)));
+            states.push((
+                format!("kill, a listing, then a power cut ({cut:?})"),
+                listed.power_cut(cut),
+            ));
+        }
+        for (how, after) in states {
             let after: Arc<dyn Fs> = Arc::new(after);
             let outcome = recover(&after, cache, &acks, &scenario.gens)
                 .and_then(|found| (scenario.check)(&acks, found.as_ref(), &after));
             if let Err(why) = outcome {
                 broken.push(format!(
-                    "{}: {how} before `{step}` (step {k}, acks {acks:?}): {why}",
-                    scenario.name
+                    "{name}: [{how}] before `{step}` (step {k}, acks {acks:?}): {why}"
                 ));
             }
         }
     }
     broken
+}
+
+/// A step with the journal's random id taken out, for comparing two runs.
+fn no_id(op: &str) -> String {
+    match op.find(".journal-") {
+        Some(at) => {
+            let id = at + ".journal-".len();
+            let end = (id + 25).min(op.len());
+            format!("{}ID{}", &op[..id], &op[end..])
+        }
+        None => op.to_string(),
+    }
 }
 
 fn no_extra(_: &[Ack], _: Option<&Recovered>, _: &Arc<dyn Fs>) -> std::result::Result<(), String> {
@@ -752,6 +937,7 @@ fn publishes() -> Scenario {
         run,
         gens: (1..=3).map(|i| (i, hex_snap(i))).collect(),
         check: no_extra,
+        full: vec![Ack::Gen(1), Ack::Gen(2), Ack::Gen(3)],
     }
 }
 
@@ -774,6 +960,7 @@ fn pastes() -> Scenario {
         ]
         .into(),
         check: no_extra,
+        full: vec![Ack::Gen(1), Ack::Gen(2), Ack::Gen(3)],
     }
 }
 
@@ -856,6 +1043,16 @@ fn save_rebased() -> Scenario {
         run,
         gens,
         check,
+        full: vec![
+            Ack::Gen(1),
+            Ack::Gen(2),
+            Ack::Phase(0),
+            Ack::Phase(1),
+            Ack::Phase(2),
+            Ack::Phase(3),
+            Ack::Gen(3),
+            Ack::SaveEnded,
+        ],
     }
 }
 
@@ -894,6 +1091,15 @@ fn save_retired() -> Scenario {
         run,
         gens: [(1, hex_snap(1))].into(),
         check,
+        full: vec![
+            Ack::Gen(1),
+            Ack::Phase(0),
+            Ack::Phase(1),
+            Ack::Phase(2),
+            Ack::Phase(3),
+            Ack::Removing,
+            Ack::Removed,
+        ],
     }
 }
 
@@ -922,6 +1128,7 @@ fn in_place_retired() -> Scenario {
         run,
         gens: [(1, hex_snap(1))].into(),
         check: save_retired().check,
+        full: vec![Ack::Gen(1), Ack::Phase(0), Ack::Removing, Ack::Removed],
     }
 }
 
@@ -974,6 +1181,13 @@ fn unknown_then_edits() -> Scenario {
         ]
         .into(),
         check,
+        full: vec![
+            Ack::Gen(1),
+            Ack::Gen(2),
+            Ack::Phase(0),
+            Ack::Gen(3),
+            Ack::Gen(4),
+        ],
     }
 }
 
@@ -992,6 +1206,7 @@ fn discarded() -> Scenario {
         run,
         gens: [(1, image_snap(&[1])), (2, image_snap(&[1, 2]))].into(),
         check: no_extra,
+        full: vec![Ack::Gen(1), Ack::Gen(2), Ack::Removing, Ack::Removed],
     }
 }
 
@@ -1054,7 +1269,7 @@ fn a_crash_while_discarding_never_brings_back_part_of_a_journal() {
 }
 
 /// The matrix is worth something only if it sees a missing fsync: with every fsync a no-op,
-/// a power cut loses generations reported kept.
+/// a power cut loses generations reported kept, and a kill alone breaks nothing.
 #[test]
 fn the_crash_matrix_catches_missing_fsyncs() {
     for scenario in [publishes(), pastes(), save_rebased()] {
@@ -1065,7 +1280,9 @@ fn the_crash_matrix_catches_missing_fsyncs() {
             scenario.name
         );
         assert!(
-            !broken.iter().any(|b| b.contains(": kill before")),
+            !broken
+                .iter()
+                .any(|b| b.contains("[kill]") || b.contains("[kill, then a listing]")),
             "{}: a kill needs no fsync:\n{}",
             scenario.name,
             broken.join("\n")
@@ -1125,7 +1342,8 @@ fn creation_fsyncs_the_parent_of_every_directory_it_makes() {
     let j = Journal::create(fs, Path::new(MEM_CACHE), HOST, PATH, Kind::Hex).unwrap();
     let ops = log.ops();
     let dir = j.dir().to_path_buf();
-    let mut want = Vec::new();
+    // The cache root was there: only its entry is made durable again.
+    let mut want = vec!["fsyncdir /".to_string()];
     for d in [
         "/cache/.edits",
         "/cache/.edits/box",
@@ -1151,10 +1369,21 @@ fn creation_fsyncs_the_parent_of_every_directory_it_makes() {
         hex.len() == 8 && hex.bytes().all(|b| b.is_ascii_hexdigit()),
         "{name}"
     );
-    // Nothing is created again for the next journal of the same file but the journal itself.
+    // The next journal of the same file creates only itself, yet makes every directory above it
+    // durable again: an earlier creation may have failed right after its `mkdir`.
     let (log, fs) = logged(&mem);
     let two = Journal::create(fs, Path::new(MEM_CACHE), HOST, PATH, Kind::Hex).unwrap();
-    assert_eq!(log.ops()[0], format!("mkdir {}", two.dir().display()));
+    let want: Vec<String> = [
+        "fsyncdir /".to_string(),
+        "fsyncdir /cache".to_string(),
+        "fsyncdir /cache/.edits".to_string(),
+        "fsyncdir /cache/.edits/box".to_string(),
+        format!("mkdir {}", two.dir().display()),
+        "fsyncdir /cache/.edits/box/data".to_string(),
+        format!("lock {}", two.dir().join("lock").display()),
+    ]
+    .into();
+    assert_eq!(log.ops(), want);
 }
 
 /// §3 steps 1–3: each new paste written, fsynced, renamed, the directory fsynced; then the
@@ -1249,6 +1478,27 @@ fn kept_is_said_only_after_the_directory_fsync() {
     assert_eq!((g.at.n, &g.edits), (3, &hex_snap(1).edits));
 }
 
+/// Makes `j` die after `steps` more steps: by the caller's count, right before the fsync of the
+/// directory that publishes `CURRENT` ([`assert_stopped_after_current`] checks that it was).
+fn stop_at_currents_fsync(mem: &MemFs, j: &mut Journal, steps: usize) -> Arc<Dying> {
+    let dying = Dying::new(Arc::new(mem.clone()), steps);
+    j.fs = dying.clone();
+    dying
+}
+
+/// The stop came exactly after `CURRENT`'s rename, and `CURRENT` on disk names gen-`n`.
+fn assert_stopped_after_current(mem: &MemFs, j: &Journal, dying: &Dying, n: u64) {
+    let ops = dying.ops();
+    let last = ops.last().expect("steps ran");
+    assert!(
+        dying.dead.load(Ordering::SeqCst)
+            && last == &format!("rename {}", j.dir().join("CURRENT.tmp").display()),
+        "stopped after {ops:?}"
+    );
+    let on_disk = parse_current(&mem.read(&j.dir().join("CURRENT")).unwrap()).unwrap();
+    assert_eq!(on_disk.n, n, "CURRENT names gen-{n} on disk");
+}
+
 /// A generation whose publication failed may still be what `CURRENT` names on disk: nothing
 /// removes it until a later one is current, and the next Save writes its edits afresh.
 #[test]
@@ -1258,8 +1508,9 @@ fn a_failed_publication_is_never_cleaned_away_or_saved_as_current() {
     j.begin_save(&hex_snap(1), temp_plan()).unwrap();
     j.save_unknown();
     // gen-2 published up to CURRENT's rename; its directory fsync never answers.
-    j.fs = Dying::new(Arc::new(mem.clone()), 7);
+    let dying = stop_at_currents_fsync(&mem, &mut j, 7);
     assert!(j.publish(&hex_snap(2)).is_err());
+    assert_stopped_after_current(&mem, &j, &dying, 2);
     j.fs = Arc::new(mem.clone());
     j.clear_save().unwrap();
     let dir = j.dir().to_path_buf();
@@ -1273,28 +1524,49 @@ fn a_failed_publication_is_never_cleaned_away_or_saved_as_current() {
     assert_eq!(edits_of(&found[0]).at.n, 2);
     assert!(found[0].notes.is_empty(), "{:?}", found[0].notes);
     drop(found);
-    // The same failure, then a Save of gen-1's content: its intent names a new generation.
+    // The same failure, then a Save of gen-1's content: its intent names a new generation, and
+    // so does every reopen — after a kill or any modelled power cut — with that generation whole.
     let (mem, _, mut j) = mem_journal(Kind::Hex);
     j.publish(&hex_snap(1)).unwrap();
-    j.fs = Dying::new(Arc::new(mem.clone()), 7);
+    let dying = stop_at_currents_fsync(&mem, &mut j, 7);
     assert!(j.publish(&hex_snap(2)).is_err());
+    assert_stopped_after_current(&mem, &j, &dying, 2);
     j.fs = Arc::new(mem.clone());
     j.begin_save(&hex_snap(1), temp_plan()).unwrap();
     let saved = j.pending_save().unwrap().saved;
     assert_eq!(saved.n, 3);
     assert_eq!(Some(saved), j.current());
+    let dir = j.dir().to_path_buf();
     drop(j);
+    for (how, after) in reopened(&mem) {
+        let fs: Arc<dyn Fs> = Arc::new(after);
+        let found = listed(&fs);
+        assert_eq!(found.len(), 1, "{how}");
+        assert_eq!(edits_of(&found[0]).at, saved, "{how}");
+        let SaveFile::Intent(intent) = &found[0].save else {
+            panic!("{how}: the save record is gone");
+        };
+        assert_eq!(
+            intent.saved, saved,
+            "{how}: the record names gen-3 and its hash"
+        );
+        let gen = parse_generation(&fs.read(&dir.join("gen-3")).unwrap()).unwrap();
+        let want = hex_snap(1);
+        assert_eq!(
+            (gen.at, gen.head.baseline, &gen.seen, &gen.edits),
+            (saved, want.baseline, &want.seen, &want.edits),
+            "{how}: gen-3 holds the whole snapshot"
+        );
+    }
     // An image generation with a new paste, failed the same way: the paste it names stays too.
     let (mem, _, mut j) = mem_journal(Kind::Image);
     j.publish(&image_snap(&[1])).unwrap();
     j.begin_save(&image_snap(&[1]), upload_plan()).unwrap();
     j.save_unknown();
     // The paste (4 steps), gen-2 (4), CURRENT's write, fsync and rename: then it dies.
-    j.fs = Dying::new(Arc::new(mem.clone()), 11);
+    let dying = stop_at_currents_fsync(&mem, &mut j, 11);
     assert!(j.publish(&image_snap(&[2])).is_err());
-    let dir = j.dir().to_path_buf();
-    let on_disk = parse_current(&mem.read(&dir.join("CURRENT")).unwrap()).unwrap();
-    assert_eq!(on_disk.n, 2, "CURRENT names gen-2 on disk");
+    assert_stopped_after_current(&mem, &j, &dying, 2);
     j.fs = Arc::new(mem.clone());
     j.clear_save().unwrap();
     drop(j);
@@ -1765,7 +2037,7 @@ fn sample_intents() -> Vec<SaveIntent> {
         ..base.clone()
     };
     let naming = SaveIntent {
-        seen: Seen::Pending,
+        seen: Seen::pages([(PAGE, [7; 32])]),
         phase: Phase::Naming { temp: TEMP.into() },
         ..base.clone()
     };
@@ -2052,8 +2324,30 @@ impl FakeFile {
         sha256(&self.read(offset, PAGE as usize))
     }
 
+    /// The SHA-256 of the content. Above 256 MiB this stands in for it with the SHA-256 of the
+    /// file's description (size, bytes, patches): hashing 300 MiB takes about 10 s in a debug
+    /// build. The journal treats a digest as an opaque value, and this one is still the same for
+    /// the same content and different for any change.
     fn whole(&self) -> Sha {
+        if self.size > crate::remote::HASH_CHECK_MAX {
+            let mut h = Sha256::new();
+            h.update(b"a fake whole");
+            h.update(self.size.to_be_bytes());
+            h.update(&self.data);
+            for (at, b) in &self.patch {
+                h.update(at.to_be_bytes());
+                h.update([*b]);
+            }
+            return h.finalize().into();
+        }
         sha256(&self.read(0, self.size as usize))
+    }
+
+    /// The same file with the byte at `offset` changed, and nothing else.
+    fn corrupted(&self, offset: u64) -> FakeFile {
+        let mut out = self.clone();
+        out.set(offset, &[self.read(offset, 1)[0] ^ 0xff]);
+        out
     }
 
     fn ends(&self) -> Ends {
@@ -2070,6 +2364,8 @@ struct FakeRemote {
     files: BTreeMap<String, FakeFile>,
     wholes: usize,
     broken: bool,
+    /// A whole hash above 256 MiB is allowed (image Restore); otherwise it fails the test.
+    big_wholes: bool,
 }
 
 impl FakeRemote {
@@ -2103,18 +2399,18 @@ impl Inspect for FakeRemote {
         Ok(file.read(offset, len))
     }
 
-    fn whole_sha256(&mut self, path: &str) -> Result<Sha> {
+    fn whole_sha256(&mut self, path: &str, size: u64) -> Result<Option<Sha>> {
         self.wholes += 1;
         let file = self
             .files
             .get(path)
             .ok_or_else(|| anyhow::anyhow!("no {path}"))?;
         assert!(
-            file.size <= crate::remote::HASH_CHECK_MAX,
+            self.big_wholes || size.max(file.size) <= crate::remote::HASH_CHECK_MAX,
             "the whole of a {} byte file was hashed",
             file.size
         );
-        Ok(file.whole())
+        Ok((file.size == size).then(|| file.whole()))
     }
 }
 
@@ -2329,7 +2625,20 @@ fn inspect_provides_pages_whole_and_ends_from_reads() {
         Some(sha256(&content[last as usize..]))
     );
     assert_eq!(p.page_sha256(PATH, f.size + PAGE).unwrap(), None);
-    assert_eq!(p.whole_sha256(PATH).unwrap(), sha256(&content));
+    assert_eq!(
+        p.whole_sha256(PATH, f.size).unwrap(),
+        Some(sha256(&content))
+    );
+    assert_eq!(
+        p.whole_sha256(PATH, f.size - 1).unwrap(),
+        None,
+        "longer than the stat"
+    );
+    assert_eq!(
+        p.whole_sha256(PATH, f.size + 1).unwrap(),
+        None,
+        "shorter than the stat"
+    );
     assert_eq!(p.ends_sha256(PATH, f.size).unwrap(), Ends::of(&content));
 }
 
@@ -2766,8 +3075,11 @@ fn post_save_evidence_follows_the_table() {
 /// E18 for every kind and size, route and phase, against every state of the target: the
 /// original (not landed: a temp proven sopen's is removed, one from `naming` kept), the output
 /// (landed once `staged` was recorded, unknown before), another writer's file (unknown, nothing
-/// removed). No file above 256 MiB is ever hashed whole: hex then decides by the stat and the
-/// pages, image and media by the stat and the first and last MiB.
+/// removed), and the original or the output with one evidence byte changed under the same size,
+/// mtime, owner and mode (unknown: metadata never decides alone). A staged temp changed the same
+/// way is kept and named. Nothing above 256 MiB is ever hashed whole: hex then decides by the
+/// stat and the pages, image and media by the stat and the first and last MiB — and an image
+/// original above 256 MiB, whose evidence is a whole hash, cannot be told: unknown.
 #[test]
 fn every_kind_route_and_phase_is_reconciled() {
     struct Case {
@@ -2778,6 +3090,11 @@ fn every_kind_route_and_phase_is_reconciled() {
         out: FakeFile,
         seen: Seen,
         post: PostEvidence,
+        /// The pre-save evidence can decide without a whole read above 256 MiB.
+        orig_decides: bool,
+        /// Evidence bytes of the output and of the original (each changed alone).
+        out_marks: Vec<u64>,
+        orig_marks: Vec<u64>,
     }
     let big = 300u64 << 20;
     let edited = |f: &FakeFile, secs: u64| {
@@ -2797,6 +3114,8 @@ fn every_kind_route_and_phase_is_reconciled() {
     let mut image_big_out = FakeFile::big(big + 7, 1_794_389_600);
     image_big_out.set(0, b"\x89PNG");
     image_big_out.set(big, b"IEND");
+    let mut image_big_orig = FakeFile::big(big + 99, 1_794_389_076);
+    image_big_orig.set(0, b"\xff\xd8\xff");
     let mut media_orig = FakeFile::big(4096, 1_794_389_076);
     media_orig.set(0, b"orig");
     let mut media_out = FakeFile::big(3096, 1_794_389_600);
@@ -2806,6 +3125,7 @@ fn every_kind_route_and_phase_is_reconciled() {
     let mut media_big_out = FakeFile::big(big + 1000, 1_794_389_600);
     media_big_out.set(big + 999, b"!");
     let hex_routes: &[Route] = &[Route::ServerCopy, Route::StreamedRewrite];
+    let ends_marks = |f: &FakeFile| vec![10, f.size - 10];
     let cases = vec![
         Case {
             name: "hex at most 256 MiB",
@@ -2818,6 +3138,10 @@ fn every_kind_route_and_phase_is_reconciled() {
                 Some(hex_small_out.whole()),
             )
             .unwrap(),
+            orig_decides: true,
+            // In the edited page, and far from it (only the whole hash sees that one).
+            out_marks: vec![PAGE + 5, 2 * PAGE + 1],
+            orig_marks: vec![PAGE + 5],
             orig: hex_small,
             out: hex_small_out,
         },
@@ -2832,6 +3156,9 @@ fn every_kind_route_and_phase_is_reconciled() {
                 None,
             )
             .unwrap(),
+            orig_decides: true,
+            out_marks: vec![PAGE + 5],
+            orig_marks: vec![PAGE + 5],
             orig: hex_big,
             out: hex_big_out,
         },
@@ -2841,8 +3168,11 @@ fn every_kind_route_and_phase_is_reconciled() {
             routes: &[Route::Upload],
             seen: Seen::whole(image_orig.whole()),
             post: PostEvidence::image(&image_out.file_stat(), image_out.whole(), None).unwrap(),
+            orig_decides: true,
+            out_marks: vec![1],
+            orig_marks: vec![1],
             orig: image_orig.clone(),
-            out: image_out,
+            out: image_out.clone(),
         },
         Case {
             name: "image output above 256 MiB",
@@ -2851,12 +3181,27 @@ fn every_kind_route_and_phase_is_reconciled() {
             seen: Seen::whole(image_orig.whole()),
             post: PostEvidence::image(
                 &image_big_out.file_stat(),
-                [0x77; 32],
+                image_big_out.whole(),
                 Some(image_big_out.ends()),
             )
             .unwrap(),
+            orig_decides: true,
+            out_marks: ends_marks(&image_big_out),
+            orig_marks: vec![1],
             orig: image_orig,
             out: image_big_out,
+        },
+        Case {
+            name: "image original above 256 MiB",
+            kind: Kind::Image,
+            routes: &[Route::Upload],
+            seen: Seen::whole(image_big_orig.whole()),
+            post: PostEvidence::image(&image_out.file_stat(), image_out.whole(), None).unwrap(),
+            orig_decides: false,
+            out_marks: vec![1],
+            orig_marks: ends_marks(&image_big_orig),
+            orig: image_big_orig,
+            out: image_out,
         },
         Case {
             name: "media at most 256 MiB",
@@ -2865,6 +3210,9 @@ fn every_kind_route_and_phase_is_reconciled() {
             seen: Seen::whole(media_orig.whole()),
             post: PostEvidence::media(&media_out.file_stat(), Some(media_out.whole()), None)
                 .unwrap(),
+            orig_decides: true,
+            out_marks: vec![1],
+            orig_marks: vec![1],
             orig: media_orig,
             out: media_out,
         },
@@ -2875,6 +3223,9 @@ fn every_kind_route_and_phase_is_reconciled() {
             seen: Seen::ends(media_big.ends()),
             post: PostEvidence::media(&media_big_out.file_stat(), None, Some(media_big_out.ends()))
                 .unwrap(),
+            orig_decides: true,
+            out_marks: ends_marks(&media_big_out),
+            orig_marks: ends_marks(&media_big),
             orig: media_big,
             out: media_big_out,
         },
@@ -2884,8 +3235,13 @@ fn every_kind_route_and_phase_is_reconciled() {
         Original,
         Output,
         Neither,
+        /// The output, one evidence byte changed, the stat the same.
+        OutputMarked(u64),
+        /// The original, one evidence byte changed, the stat the same.
+        OriginalMarked(u64),
     }
     let mut seen_cases = 0;
+    let mut want_cases = 0;
     for case in &cases {
         let created = FileStat {
             size: 0,
@@ -2920,56 +3276,58 @@ fn every_kind_route_and_phase_is_reconciled() {
                 post: case.post.clone(),
             },
         ];
+        let mut targets = vec![Target::Original, Target::Output, Target::Neither];
+        targets.extend(case.out_marks.iter().map(|&m| Target::OutputMarked(m)));
+        targets.extend(case.orig_marks.iter().map(|&m| Target::OriginalMarked(m)));
+        want_cases += case.routes.len() * phases.len() * targets.len();
+        want_cases += case.routes.len() * 2 * case.out_marks.len();
         for &route in case.routes {
             for phase in &phases {
-                for target in [Target::Original, Target::Output, Target::Neither] {
+                let reached_staged = phase.staged().is_some();
+                let i = intent(
+                    case.kind,
+                    route,
+                    baseline_of(&case.orig, None),
+                    case.seen.clone(),
+                    phase.clone(),
+                );
+                for &target in &targets {
                     let what = format!("{} {route:?} {} {target:?}", case.name, phase.word());
-                    let i = intent(
-                        case.kind,
-                        route,
-                        baseline_of(&case.orig, None),
-                        case.seen.clone(),
-                        phase.clone(),
-                    );
                     // The temp as the phase left it; once renamed it is gone.
+                    let renamed = matches!(target, Target::Output | Target::OutputMarked(_));
                     let temp = match phase {
-                        _ if target == Target::Output => None,
+                        _ if renamed => None,
                         Phase::Naming { .. } => Some(theirs.clone()),
                         Phase::Created { .. } => Some(created_temp.clone()),
                         _ => Some(case.out.clone()),
                     };
                     let at_target = match target {
-                        Target::Original => &case.orig,
-                        Target::Output => &case.out,
-                        Target::Neither => &theirs,
+                        Target::Original => case.orig.clone(),
+                        Target::Output => case.out.clone(),
+                        Target::Neither => theirs.clone(),
+                        Target::OutputMarked(m) => case.out.corrupted(m),
+                        Target::OriginalMarked(m) => case.orig.corrupted(m),
                     };
-                    let mut remote = FakeRemote::with(&[(PATH, at_target)]);
+                    let mut remote = FakeRemote::with(&[(PATH, &at_target)]);
                     if let Some(t) = temp {
                         remote.files.insert(TEMP.into(), t);
                     }
                     let r = reconcile(&i, HOST, &mut remote);
-                    let reached_staged = phase.staged().is_some();
                     let (outcome, verdict) = match target {
-                        Target::Original => (
+                        Target::Original if case.orig_decides => (
                             Outcome::NotLanded,
                             match phase {
                                 Phase::Naming { .. } => "keep",
                                 _ => "remove",
                             },
                         ),
+                        Target::Original => (Outcome::Unknown, "keep"),
                         Target::Output if reached_staged => (Outcome::Landed, "gone"),
-                        Target::Output => (Outcome::Unknown, "gone"),
-                        Target::Neither => (Outcome::Unknown, "keep"),
+                        Target::Output | Target::OutputMarked(_) => (Outcome::Unknown, "gone"),
+                        Target::Neither | Target::OriginalMarked(_) => (Outcome::Unknown, "keep"),
                     };
                     assert_eq!(r.outcome, outcome, "{what}: {}", r.line);
-                    let got = match &r.temp {
-                        Temp::Keep { .. } => "keep",
-                        Temp::Remove(p) | Temp::Gone(p) if p != TEMP => "wrong path",
-                        Temp::Remove(_) => "remove",
-                        Temp::Gone(_) => "gone",
-                        Temp::None => "none",
-                    };
-                    assert_eq!(got, verdict, "{what}: {:?}", r.temp);
+                    assert_eq!(temp_word(&r.temp), verdict, "{what}: {:?}", r.temp);
                     if verdict == "keep" {
                         assert!(r.line.contains(TEMP), "{what}: {}", r.line);
                     }
@@ -2978,8 +3336,569 @@ fn every_kind_route_and_phase_is_reconciled() {
                     assert_eq!(r.next, next, "{what}");
                     seen_cases += 1;
                 }
+                // Not landed, and a temp of the staged stat whose evidence differs: someone
+                // else's file under the recorded name.
+                if !reached_staged {
+                    continue;
+                }
+                for &m in &case.out_marks {
+                    let what = format!(
+                        "{} {route:?} {} temp marked at {m}",
+                        case.name,
+                        phase.word()
+                    );
+                    let mut remote = FakeRemote::with(&[(PATH, &case.orig)]);
+                    remote.files.insert(TEMP.into(), case.out.corrupted(m));
+                    let r = reconcile(&i, HOST, &mut remote);
+                    let want = if case.orig_decides {
+                        Outcome::NotLanded
+                    } else {
+                        Outcome::Unknown
+                    };
+                    assert_eq!(r.outcome, want, "{what}: {}", r.line);
+                    assert_eq!(temp_word(&r.temp), "keep", "{what}: {:?}", r.temp);
+                    assert!(r.line.contains(TEMP), "{what}: {}", r.line);
+                    seen_cases += 1;
+                }
             }
         }
     }
-    assert_eq!(seen_cases, (2 * 2 + 4) * 4 * 3);
+    assert_eq!(seen_cases, want_cases);
+    // 7 cases: 56 + 44 + 22 + 28 + 26 + 22 + 32.
+    assert_eq!(seen_cases, 230);
+}
+
+fn temp_word(temp: &Temp) -> &'static str {
+    match temp {
+        Temp::Keep { .. } => "keep",
+        Temp::Remove(p) | Temp::Gone(p) if p != TEMP => "wrong path",
+        Temp::Remove(_) => "remove",
+        Temp::Gone(_) => "gone",
+        Temp::None => "none",
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Round 2: a failed step the process lives through, evidence a checksum cannot vouch for.
+
+/// The step right after the last one logged, when the last is a rename of `name`.
+fn after_rename(log: &[String], op: &str, name: &str, then: &str) -> bool {
+    op.starts_with(then)
+        && log
+            .last()
+            .is_some_and(|l| l.starts_with("rename ") && l.ends_with(name))
+}
+
+/// The save record's rename reached the disk but its directory fsync failed, and the session
+/// goes on. The record may be on disk, so the journal keeps it: the generation it names and its
+/// pastes outlive a later edit, no second Save writes over it, and the next open — after a kill
+/// or any modelled power cut — finds it naming a whole generation. Nothing was sent, so clearing
+/// it frees the journal.
+#[test]
+fn a_save_record_whose_publication_failed_stays_recorded() {
+    let (mem, _, mut j) = mem_journal(Kind::Image);
+    j.publish(&image_snap(&[1])).unwrap();
+    let flaky = Flaky::new(Arc::new(mem.clone()), |log, op| {
+        after_rename(log, op, "/save.tmp", "fsyncdir ")
+    });
+    j.fs = flaky.clone();
+    assert!(j.begin_save(&image_snap(&[1, 2]), upload_plan()).is_err());
+    assert!(flaky.fired());
+    let dir = j.dir().to_path_buf();
+    assert!(mem.exists(&dir.join("save")), "the record's rename landed");
+    // Editing goes on.
+    assert_eq!(j.publish(&image_snap(&[3])).unwrap().n, 3);
+    assert!(
+        mem.exists(&dir.join("gen-2")),
+        "the generation the record names stays"
+    );
+    for i in [1, 2] {
+        let name = format!("paste-{}.png", crate::cache::hex(&picture(i).sha256));
+        assert!(mem.exists(&dir.join(&name)), "{name} stays");
+    }
+    let err = j.begin_save(&image_snap(&[3]), upload_plan()).unwrap_err();
+    assert!(format!("{err:#}").contains("recorded"), "{err:#}");
+    let saved = j.pending_save().expect("the record is pinned").saved;
+    assert_eq!(saved.n, 2);
+    drop(j);
+    for (how, after) in reopened(&mem) {
+        let fs: Arc<dyn Fs> = Arc::new(after);
+        let found = listed(&fs);
+        assert_eq!(edits_of(&found[0]).at.n, 3, "{how}");
+        let SaveFile::Intent(intent) = &found[0].save else {
+            panic!("{how}: the record is lost");
+        };
+        assert_eq!(intent.saved, saved, "{how}");
+        let gen2 = parse_generation(&fs.read(&dir.join("gen-2")).unwrap()).unwrap();
+        assert_eq!(gen2.at, saved, "{how}");
+        assert_eq!(gen2.edits, image_snap(&[1, 2]).edits, "{how}");
+        for sha in &gen2.pastes {
+            found[0].read_paste(sha).unwrap();
+        }
+    }
+    // Nothing was sent: the record is cleared, and the next Save starts.
+    let fs: Arc<dyn Fs> = Arc::new(mem.killed());
+    let mut o = listed(&fs).into_iter().next().unwrap();
+    o.clear_save().unwrap();
+    let mut j = o.adopt().unwrap();
+    j.begin_save(&image_snap(&[3]), upload_plan()).unwrap();
+}
+
+/// A directory the creation made whose parent's fsync failed is made durable again by the next
+/// creation, which finds it already there: `kept` is never said over an entry a power cut can
+/// take away.
+#[test]
+fn a_parent_fsync_that_failed_is_redone_before_kept() {
+    for made in [
+        "/cache/.edits",
+        "/cache/.edits/box",
+        "/cache/.edits/box/data",
+    ] {
+        let mem = MemFs::with_cache();
+        let parent = Path::new(made).parent().unwrap().display().to_string();
+        let flaky = Flaky::new(Arc::new(mem.clone()), move |log, op| {
+            op == format!("fsyncdir {parent}")
+                && log.last().is_some_and(|l| l == &format!("mkdir {made}"))
+        });
+        let fs: Arc<dyn Fs> = flaky.clone();
+        assert!(Journal::create(fs, Path::new(MEM_CACHE), HOST, PATH, Kind::Hex).is_err());
+        assert!(flaky.fired(), "{made}");
+        // The next edit tries again on a disk that works.
+        let fs: Arc<dyn Fs> = Arc::new(mem.clone());
+        let mut j = Journal::create(fs, Path::new(MEM_CACHE), HOST, PATH, Kind::Hex).unwrap();
+        j.publish(&hex_snap(1)).unwrap();
+        drop(j);
+        let gens: BTreeMap<u64, Snapshot> = [(1, hex_snap(1))].into();
+        for (how, after) in reopened(&mem) {
+            let fs: Arc<dyn Fs> = Arc::new(after);
+            match recover(&fs, Path::new(MEM_CACHE), &[Ack::Gen(1)], &gens) {
+                Ok(Some(r)) => assert_eq!(r.gen.at.n, 1, "{made}, {how}"),
+                Ok(None) => panic!("{made}, {how}: gen-1 was kept, then lost"),
+                Err(why) => panic!("{made}, {how}: {why}"),
+            }
+        }
+    }
+}
+
+/// A Discard killed after renaming the journal to its tombstone, before the parent's fsync; the
+/// next open lists (and empties tombstones); then the power fails. The journal comes back whole
+/// or not at all — never with its files gone under its own name.
+#[test]
+fn a_listing_never_empties_a_tombstone_whose_rename_is_not_durable() {
+    let (mem, _, mut j) = mem_journal(Kind::Hex);
+    j.publish(&hex_snap(1)).unwrap();
+    let dying = Dying::new(Arc::new(mem.clone()), 1);
+    j.fs = dying.clone();
+    assert!(j.remove().is_err());
+    let ops = dying.ops();
+    assert!(ops.len() == 1 && ops[0].starts_with("rename "), "{ops:?}");
+    let after = mem.killed();
+    drop(orphans(
+        &(Arc::new(after.clone()) as Arc<dyn Fs>),
+        Path::new(MEM_CACHE),
+        HOST,
+        PATH,
+    ));
+    for cut in CUTS {
+        let fs: Arc<dyn Fs> = Arc::new(after.power_cut(cut));
+        let found = listed(&fs);
+        match found.as_slice() {
+            [] => {}
+            [one] => match &one.found {
+                Found::Edits(g) => assert_eq!(g.at.n, 1, "{cut:?}"),
+                other => panic!("{cut:?}: a torn journal came back: {other:?}"),
+            },
+            more => panic!("{cut:?}: {} journals", more.len()),
+        }
+    }
+}
+
+/// Hex Restore applies nothing automatically unless every edited page has its evidence: none at
+/// all, or only some of the pages, asks; edits it cannot read are refused. Such a generation is
+/// never written in the first place.
+#[test]
+fn hex_edits_without_page_evidence_are_never_applied() {
+    let (orig, _) = hex_files();
+    let changed = orig.corrupted(PAGE + 4);
+    let edits = "0x1004: 41 was 00\n0x2010: 42 was 00\n".to_string();
+    let base = baseline_of(&orig, None);
+    for seen in [
+        Seen::pages([]),
+        Seen::pages([(2 * PAGE, orig.page(2 * PAGE))]),
+    ] {
+        let mut g = generation(Kind::Hex, base, seen.clone());
+        g.edits = edits.clone();
+        for f in [&orig, &changed] {
+            let r = restore_check(&g, Kind::Hex, &mut FakeRemote::with(&[(PATH, f)]));
+            assert_eq!(r, Restore::Ask, "{seen:?}");
+        }
+        let snap = Snapshot {
+            baseline: base,
+            seen,
+            edits: edits.clone(),
+            pastes: Vec::new(),
+        };
+        let (_, _, mut j) = mem_journal(Kind::Hex);
+        assert!(j.publish(&snap).is_err(), "{:?}", snap.seen);
+        assert!(j.begin_save(&snap, temp_plan()).is_err(), "{:?}", snap.seen);
+    }
+    let covered = Seen::pages([(PAGE, orig.page(PAGE)), (2 * PAGE, orig.page(2 * PAGE))]);
+    let mut g = generation(Kind::Hex, base, covered.clone());
+    g.edits = edits.clone();
+    assert_eq!(
+        restore_check(&g, Kind::Hex, &mut FakeRemote::with(&[(PATH, &orig)])),
+        Restore::Apply { notes: Vec::new() }
+    );
+    g.edits = "not a patch line\n".into();
+    assert!(matches!(
+        restore_check(&g, Kind::Hex, &mut FakeRemote::with(&[(PATH, &orig)])),
+        Restore::Refuse { .. }
+    ));
+    let (_, _, mut j) = mem_journal(Kind::Hex);
+    let mut snap = Snapshot {
+        baseline: base,
+        seen: covered,
+        edits: "not a patch line\n".into(),
+        pastes: Vec::new(),
+    };
+    assert!(j.publish(&snap).is_err());
+    // A run crossing into the next page needs both pages; the `.hexpatch` header and blank lines
+    // are not edits.
+    snap.edits = "# sopen hex edits\n\n0x1FFE: 414243 was 000000\n".into();
+    j.publish(&snap).unwrap();
+    snap.seen = Seen::pages([(PAGE, orig.page(PAGE))]);
+    assert!(j.publish(&snap).is_err(), "page 0x2000 has no evidence");
+}
+
+/// A whole hash reads at most the size the `lstat` gave, and one byte past it to see growth: a
+/// file that grew after the `lstat` is a different file, never a match — in reconciliation and
+/// in image Restore alike.
+#[test]
+fn a_whole_hash_stops_at_the_stat_size() {
+    struct Growing {
+        file: FakeFile,
+        stat_size: u64,
+        read: u64,
+    }
+    impl Inspect for Growing {
+        fn lstat(&mut self, path: &str) -> Result<Option<Stat>> {
+            let mut stat = self.file.stat();
+            stat.size = self.stat_size;
+            Ok((path == PATH).then_some(stat))
+        }
+        fn read_at(&mut self, _: &str, offset: u64, len: usize) -> Result<Vec<u8>> {
+            let bytes = self.file.read(offset, len);
+            self.read += bytes.len() as u64;
+            Ok(bytes)
+        }
+    }
+    let size = 3u64 << 20;
+    let mut file = FakeFile::big(size + (8 << 20), 1_794_389_600);
+    file.set(0, b"cut!");
+    let as_staged = FakeFile {
+        size,
+        ..file.clone()
+    };
+    let post = PostEvidence::media(&as_staged.file_stat(), Some(as_staged.whole()), None).unwrap();
+    let i = intent(
+        Kind::Media,
+        Route::Upload,
+        fp(4096, 1_794_389_076, None),
+        Seen::whole([9; 32]),
+        Phase::Renaming {
+            temp: TEMP.into(),
+            created: FileStat {
+                size: 0,
+                ..as_staged.file_stat()
+            },
+            staged: as_staged.file_stat(),
+            post,
+        },
+    );
+    let mut grown = Growing {
+        file: file.clone(),
+        stat_size: size,
+        read: 0,
+    };
+    let r = reconcile(&i, HOST, &mut grown);
+    assert_eq!(r.outcome, Outcome::Unknown, "{}", r.line);
+    assert!(
+        grown.read <= size + 1,
+        "{} bytes read for {size}",
+        grown.read
+    );
+    let g = generation(
+        Kind::Image,
+        baseline_of(&as_staged, None),
+        Seen::whole(as_staged.whole()),
+    );
+    let mut grown = Growing {
+        file,
+        stat_size: size,
+        read: 0,
+    };
+    assert!(matches!(
+        restore_check(&g, Kind::Image, &mut grown),
+        Restore::Refuse { .. }
+    ));
+    assert!(
+        grown.read <= size + 1,
+        "{} bytes read for {size}",
+        grown.read
+    );
+}
+
+/// A record whose checksum is right but whose evidence the table does not allow is refused when
+/// read, refused when recorded, and never makes a stat alone count as a landing.
+#[test]
+fn a_checksummed_record_with_unfit_evidence_is_refused() {
+    let c = hex_case();
+    let mut empty = c.intent(Route::ServerCopy, c.renaming());
+    if let Phase::Renaming { post, .. } = &mut empty.phase {
+        post.check = Evidence::default();
+    }
+    assert!(parse_save(empty.text().as_bytes()).is_err(), "empty check");
+    let r = reconcile(&empty, HOST, &mut FakeRemote::with(&[(PATH, &c.new)]));
+    assert_ne!(r.outcome, Outcome::Landed, "{}", r.line);
+    let mut unfit = Vec::new();
+    // Image evidence in a hex record; a next baseline that is not the staged stat; next evidence
+    // that is not what was checked.
+    let mut i = c.intent(Route::ServerCopy, c.renaming());
+    if let Phase::Renaming { post, .. } = &mut i.phase {
+        post.check.ends = Some(Ends {
+            first: [1; 32],
+            last: [2; 32],
+        });
+    }
+    unfit.push(("ends in a hex check", i));
+    let mut i = c.intent(Route::ServerCopy, c.renaming());
+    if let Phase::Renaming { post, .. } = &mut i.phase {
+        post.next_baseline.size += 1;
+    }
+    unfit.push(("next baseline of another size", i));
+    let mut i = c.intent(Route::ServerCopy, c.renaming());
+    if let Phase::Renaming { post, .. } = &mut i.phase {
+        post.next_seen = Seen::Pending;
+    }
+    unfit.push(("next evidence pending", i));
+    // Pre-save evidence: none, pending, or of another kind.
+    let mut i = c.intent(Route::ServerCopy, c.renaming());
+    i.seen = Seen::pages([]);
+    unfit.push(("no pre-save pages", i));
+    let mut i = c.intent(Route::ServerCopy, c.renaming());
+    i.seen = Seen::Pending;
+    unfit.push(("pre-save evidence pending", i));
+    let mut i = c.intent(Route::ServerCopy, c.renaming());
+    i.seen = Seen::whole([3; 32]);
+    unfit.push(("a whole hash as hex evidence", i));
+    let mut i = c.intent(Route::ServerCopy, c.renaming());
+    i.route = Route::Upload;
+    unfit.push(("an upload of a hex save", i));
+    for (what, i) in unfit {
+        assert!(parse_save(i.text().as_bytes()).is_err(), "{what}");
+    }
+    // Recording any of it is refused before anything is written.
+    let (mem, _, mut j) = mem_journal(Kind::Hex);
+    j.begin_save(&hex_snap(1), temp_plan()).unwrap();
+    j.save_created(file_stat(0, 1)).unwrap();
+    let dir = j.dir().to_path_buf();
+    let before = mem.read(&dir.join("save")).unwrap();
+    let staged = file_stat(1_000_000, 2);
+    let mut post = hex_post(&staged);
+    post.check = Evidence::default();
+    assert!(j.save_staged(staged, post).is_err());
+    let mut post = hex_post(&staged);
+    post.next_seen = Seen::pages([]);
+    assert!(j.save_staged(staged, post).is_err());
+    assert_eq!(mem.read(&dir.join("save")).unwrap(), before);
+    let (_, _, mut j) = mem_journal(Kind::Hex);
+    let nothing = Snapshot {
+        baseline: fp(10, 1, None),
+        seen: Seen::pages([]),
+        edits: String::new(),
+        pastes: Vec::new(),
+    };
+    assert!(
+        j.begin_save(&nothing, temp_plan()).is_err(),
+        "a hex save of nothing"
+    );
+    let pending = Snapshot {
+        seen: Seen::Pending,
+        ..hex_snap(1)
+    };
+    assert!(
+        j.begin_save(&pending, temp_plan()).is_err(),
+        "no evidence yet"
+    );
+}
+
+/// Write-in-place runs never overlap (in a Save or in a record read back); and a record is read
+/// only in the form sopen writes it, so reading it back and writing it again gives its bytes.
+#[test]
+fn overlapping_runs_and_non_canonical_records_are_refused() {
+    let (_, _, mut j) = mem_journal(Kind::Hex);
+    let overlapping = vec![
+        Run {
+            offset: PAGE + 4,
+            old: vec![0; 4],
+            new: vec![1; 4],
+        },
+        Run {
+            offset: PAGE + 6,
+            old: vec![0; 2],
+            new: vec![2; 2],
+        },
+    ];
+    let plan = Plan::InPlace {
+        target: PATH.into(),
+        undo: PathBuf::from("/u"),
+        runs: overlapping.clone(),
+    };
+    assert!(j.begin_save(&hex_snap(1), plan).is_err());
+    let mut i = sample_intents()[1].clone();
+    i.phase = Phase::Writing {
+        undo: PathBuf::from("/u"),
+        runs: overlapping,
+    };
+    assert!(parse_save(i.text().as_bytes()).is_err());
+
+    let (mem, _, mut j) = mem_journal(Kind::Hex);
+    j.publish(&hex_snap(1)).unwrap();
+    let dir = j.dir().to_path_buf();
+    let bytes = mem.read(&dir.join("gen-1")).unwrap();
+    let body = String::from_utf8(bytes[..bytes.len() - 72].to_vec()).unwrap();
+    assert!(parse_generation(&signed(body.clone().into_bytes())).is_ok());
+    let created = body.lines().find(|l| l.starts_with("created ")).unwrap();
+    for (from, to) in [
+        ("\ngen 1\n", "\ngen 01\n".to_string()),
+        ("\nhost box\n", "\nhost b%6Fx\n".to_string()),
+        (created, "created -0.000000000".to_string()),
+        ("\nedits ", "\nedits +".to_string()),
+    ] {
+        let changed = body.replacen(from, &to, 1);
+        assert_ne!(changed, body, "{to}");
+        assert!(
+            parse_generation(&signed(changed.into_bytes())).is_err(),
+            "{to:?} read as canonical"
+        );
+    }
+    let current = mem.read(&dir.join("CURRENT")).unwrap();
+    let text = String::from_utf8(current).unwrap();
+    assert!(parse_current(text.replacen("gen-1 ", "gen-01 ", 1).as_bytes()).is_err());
+}
+
+/// An image whose encoded output exceeds 256 MiB: the whole hash the encoder gave travels through
+/// the save record, the reopen's reconciliation (decided by the stat and the first and last MiB)
+/// or the live rebase, and the next generation; a Restore after a kill or any power cut checks the
+/// file against it — independently hashed by the remote — and a changed byte is refused.
+#[test]
+fn a_large_image_save_keeps_the_whole_hash_through_the_disk() {
+    let orig = FakeFile::new(b"the original image", 1_794_389_076);
+    let mut out = FakeFile::big((300 << 20) + 5, 1_794_389_600);
+    out.set(0, b"\x89PNG");
+    out.set(out.size - 4, b"IEND");
+    out.set(150 << 20, b"middle");
+    let whole = out.whole();
+    let staged = out.file_stat();
+    let post = PostEvidence::image(&staged, whole, Some(out.ends())).unwrap();
+    let snap = Snapshot {
+        baseline: baseline_of(&orig, Some(orig.whole())),
+        seen: Seen::whole(orig.whole()),
+        edits: "crop 0,0,10,10\n".into(),
+        pastes: Vec::new(),
+    };
+    let next_edit = "pixelize 0,0,4,4,2\n";
+    for route in ["reopen", "live"] {
+        let (mem, _, mut j) = mem_journal(Kind::Image);
+        j.begin_save(&snap, upload_plan()).unwrap();
+        j.save_created(FileStat { size: 0, ..staged }).unwrap();
+        j.save_staged(staged, post.clone()).unwrap();
+        j.save_renaming().unwrap();
+        let mem = if route == "live" {
+            let rest = Snapshot {
+                baseline: post.next_baseline,
+                seen: post.next_seen.clone(),
+                edits: next_edit.into(),
+                pastes: Vec::new(),
+            };
+            drop(j.save_landed(Some(&rest)).unwrap().unwrap());
+            mem
+        } else {
+            // The rename's reply was lost: the reopen reconciles, retires, and the next session's
+            // first edit is against the next baseline the record kept.
+            drop(j);
+            let after = mem.killed();
+            let fs: Arc<dyn Fs> = Arc::new(after.clone());
+            let o = listed(&fs).into_iter().next().unwrap();
+            let mut remote = FakeRemote::with(&[(PATH, &out)]);
+            let r = o.reconcile(&mut remote).unwrap();
+            assert_eq!(r.outcome, Outcome::Landed, "{}", r.line);
+            assert_eq!(remote.wholes, 0, "decided without a whole read");
+            assert!(o.landed().unwrap().is_none(), "retired");
+            let (baseline, seen) = r.next.unwrap();
+            let mut j = Journal::create(fs, Path::new(MEM_CACHE), HOST, PATH, Kind::Image).unwrap();
+            j.publish(&Snapshot {
+                baseline,
+                seen,
+                edits: next_edit.into(),
+                pastes: Vec::new(),
+            })
+            .unwrap();
+            drop(j);
+            after
+        };
+        for (how, after) in reopened(&mem) {
+            let fs: Arc<dyn Fs> = Arc::new(after);
+            let found = listed(&fs);
+            assert_eq!(found.len(), 1, "{route}, {how}");
+            let g = edits_of(&found[0]);
+            assert_eq!(g.edits, next_edit, "{route}, {how}");
+            // The next Save's baseline and Restore's evidence: the whole hash, at this size too.
+            assert_eq!(g.head.baseline, post.next_baseline, "{route}, {how}");
+            assert_eq!(g.head.baseline.sha256, Some(whole), "{route}, {how}");
+            assert_eq!(g.seen, Seen::whole(whole), "{route}, {how}");
+            let mut remote = FakeRemote::with(&[(PATH, &out)]);
+            remote.big_wholes = true;
+            assert_eq!(
+                restore_check(g, Kind::Image, &mut remote),
+                Restore::Apply { notes: Vec::new() },
+                "{route}, {how}"
+            );
+            assert_eq!(
+                remote.wholes, 1,
+                "{route}, {how}: checked by the whole hash"
+            );
+            let mut remote = FakeRemote::with(&[(PATH, &out.corrupted(150 << 20))]);
+            remote.big_wholes = true;
+            assert!(
+                matches!(
+                    restore_check(g, Kind::Image, &mut remote),
+                    Restore::Refuse { .. }
+                ),
+                "{route}, {how}"
+            );
+        }
+    }
+}
+
+/// An edit on the last page of the offset space is counted without overflow — in a record read
+/// back as well as in a snapshot.
+#[test]
+fn an_edit_on_the_last_page_of_the_offset_space_does_not_overflow() {
+    let last = u64::MAX / PAGE * PAGE;
+    let snap = Snapshot {
+        baseline: fp(10, 1, None),
+        seen: Seen::pages([(last, [5; 32])]),
+        edits: format!("0x{:X}: 41 was 00\n", u64::MAX - 1),
+        pastes: Vec::new(),
+    };
+    let (mem, _, mut j) = mem_journal(Kind::Hex);
+    let at = j.publish(&snap).unwrap();
+    let bytes = mem.read(&j.dir().join(format!("gen-{}", at.n))).unwrap();
+    assert_eq!(parse_generation(&bytes).unwrap().edits, snap.edits);
+    let past = Snapshot {
+        edits: format!("0x{:X}: 4142 was 0000\n", u64::MAX),
+        ..snap
+    };
+    assert!(j.publish(&past).is_err(), "a run past the end of any file");
 }

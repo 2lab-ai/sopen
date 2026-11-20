@@ -792,9 +792,12 @@ fn io_err(e: io::Error, what: &str, path: &Path) -> anyhow::Error {
     anyhow::Error::new(e).context(format!("cannot {what} {}", path.display()))
 }
 
-/// Makes the directories down to `dir` that are missing, owner-only, each `mkdir` followed by
-/// an fsync of its parent. Below `cache` every directory that exists must be a real one (never
-/// through a link); `cache` itself and what is above it may be links (the owner's choice).
+/// Makes the directories down to `dir` that are missing, owner-only, and makes every directory
+/// from `cache` down durable in its parent (fsync of the parent) — found or made, every time: an
+/// earlier creation may have made one and failed at that fsync, and a fetch makes the cache root
+/// without one. Ancestors above `cache` are fsynced in their parent only when this call makes
+/// them. Below `cache` every directory that exists must be a real one (never through a link);
+/// `cache` itself and what is above it may be links (the owner's choice).
 fn make_dirs(fs: &dyn Fs, cache: &Path, dir: &Path) -> Result<()> {
     let below = dir
         .strip_prefix(cache)
@@ -815,14 +818,17 @@ fn make_dirs(fs: &dyn Fs, cache: &Path, dir: &Path) -> Result<()> {
             }
         }
     }
-    let make = |d: &Path| -> Result<()> {
-        fs.create_dir(d).map_err(|e| io_err(e, "create", d))?;
+    let in_parent = |d: &Path| -> Result<()> {
         let parent = d.parent().unwrap_or(Path::new("/"));
         fs.sync_dir(parent)
             .map_err(|e| io_err(e, "make durable the folder", parent))
     };
     for d in missing.iter().rev() {
-        make(d)?;
+        fs.create_dir(d).map_err(|e| io_err(e, "create", d))?;
+        in_parent(d)?;
+    }
+    if missing.is_empty() {
+        in_parent(cache)?;
     }
     let mut at = cache.to_path_buf();
     for comp in below.components() {
@@ -833,25 +839,81 @@ fn make_dirs(fs: &dyn Fs, cache: &Path, dir: &Path) -> Result<()> {
                 "{} is not a directory (a link or a file is there)",
                 at.display()
             ),
-            None => make(&at)?,
+            None => fs.create_dir(&at).map_err(|e| io_err(e, "create", &at))?,
         }
+        in_parent(&at)?;
     }
     Ok(())
 }
 
-/// Checks that `snap` holds the evidence its kind keeps (§3 `seen`).
-fn check_shape(kind: Kind, snap: &Snapshot) -> Result<()> {
-    ensure!(
-        kind == Kind::Image || snap.pastes.is_empty(),
-        "only image edits paste pictures"
-    );
-    for p in &snap.pastes {
+/// The byte runs hex edits change, as `[start, end)`: the `.hexpatch` lines `0xOFF: BYTES`, each
+/// optionally followed by ` was OLD` (§3 `edits`); `#` lines and blank lines are not edits.
+fn hex_runs(edits: &str) -> Result<Vec<(u64, u64)>> {
+    let hex_len = |h: &str| -> Result<u64> {
         ensure!(
-            sha256(&p.png) == p.sha256,
-            "a paste does not match its hash"
+            !h.is_empty() && h.len().is_multiple_of(2) && h.bytes().all(|c| c.is_ascii_hexdigit()),
+            "bytes are pairs of hex digits"
         );
+        Ok(h.len() as u64 / 2)
+    };
+    let mut out = Vec::new();
+    for line in edits.lines() {
+        if line.trim().is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let parsed = (|| -> Result<(u64, u64)> {
+            let (off, rest) = line.split_once(": ").context("no `: `")?;
+            let off = off.strip_prefix("0x").context("an offset is 0x…")?;
+            ensure!(
+                !off.is_empty() && off.bytes().all(|c| c.is_ascii_hexdigit()),
+                "not a hex offset"
+            );
+            let off = u64::from_str_radix(off, 16)?;
+            let (new, old) = match rest.split_once(" was ") {
+                Some((new, old)) => (new, Some(old)),
+                None => (rest, None),
+            };
+            let len = hex_len(new)?;
+            if let Some(old) = old {
+                ensure!(
+                    hex_len(old)? == len,
+                    "the bytes replaced have another length"
+                );
+            }
+            let end = off.checked_add(len).context("past the end of any file")?;
+            Ok((off, end))
+        })();
+        out.push(parsed.with_context(|| format!("`{line}` is not a hex edit"))?);
     }
-    let Seen::Known(ev) = &snap.seen else {
+    Ok(out)
+}
+
+/// The 4 KiB pages hex edits touch.
+fn edited_pages(edits: &str) -> Result<BTreeSet<u64>> {
+    let mut pages = BTreeSet::new();
+    for (start, end) in hex_runs(edits)? {
+        let mut page = Some(start / PAGE * PAGE);
+        while let Some(at) = page.filter(|&at| at < end) {
+            pages.insert(at);
+            page = at.checked_add(PAGE);
+        }
+    }
+    Ok(pages)
+}
+
+/// Checks that `seen` is the evidence its kind keeps (§3 `seen`): hex the pages — every page
+/// the edits touch, when known; image the whole SHA-256; media the whole SHA-256 up to 256 MiB,
+/// else the first and last MiB. Hex edits must be `.hexpatch` lines.
+fn check_seen(kind: Kind, baseline: &Fingerprint, seen: &Seen, edits: &str) -> Result<()> {
+    if kind == Kind::Hex {
+        let pages = edited_pages(edits)?;
+        if let Seen::Known(ev) = seen {
+            if let Some(page) = pages.iter().find(|p| !ev.pages.contains_key(p)) {
+                bail!("the edited page at 0x{page:x} has no evidence");
+            }
+        }
+    }
+    let Seen::Known(ev) = seen else {
         return Ok(());
     };
     ensure!(
@@ -861,7 +923,7 @@ fn check_shape(kind: Kind, snap: &Snapshot) -> Result<()> {
     let ok = match kind {
         Kind::Hex => ev.whole.is_none() && ev.ends.is_none(),
         Kind::Image => ev.pages.is_empty() && ev.ends.is_none() && ev.whole.is_some(),
-        Kind::Media if snap.baseline.size <= HASH_CHECK_MAX => {
+        Kind::Media if baseline.size <= HASH_CHECK_MAX => {
             ev.pages.is_empty() && ev.ends.is_none() && ev.whole.is_some()
         }
         Kind::Media => ev.pages.is_empty() && ev.whole.is_none() && ev.ends.is_some(),
@@ -875,6 +937,97 @@ fn check_shape(kind: Kind, snap: &Snapshot) -> Result<()> {
             Kind::Image => "the whole file's SHA-256",
             Kind::Media => "the whole SHA-256 up to 256 MiB, else the first and last MiB",
         }
+    );
+    Ok(())
+}
+
+/// Checks that `snap` holds the evidence its kind keeps, and pastes only where they belong.
+fn check_shape(kind: Kind, snap: &Snapshot) -> Result<()> {
+    ensure!(
+        kind == Kind::Image || snap.pastes.is_empty(),
+        "only image edits paste pictures"
+    );
+    for p in &snap.pastes {
+        ensure!(
+            sha256(&p.png) == p.sha256,
+            "a paste does not match its hash"
+        );
+    }
+    check_seen(kind, &snap.baseline, &snap.seen, &snap.edits)
+}
+
+/// The pre-save evidence a Save starts from (§3.1): known, of the kind's shape, and for hex at
+/// least one page.
+fn check_pre(kind: Kind, baseline: &Fingerprint, seen: &Seen) -> Result<()> {
+    let Seen::Known(ev) = seen else {
+        bail!("a save starts once the file's evidence is known");
+    };
+    check_seen(kind, baseline, seen, "")?;
+    ensure!(
+        kind != Kind::Hex || !ev.pages.is_empty(),
+        "a hex save names the pages it changes"
+    );
+    Ok(())
+}
+
+/// The post-save evidence is exactly what §3.1's table gives for the kind and the staged size.
+fn check_post(kind: Kind, staged: &FileStat, post: &PostEvidence) -> Result<()> {
+    ensure!(
+        post.kind == kind,
+        "{} evidence for a {} save",
+        post.kind.word(),
+        kind.word()
+    );
+    let rebuilt = match kind {
+        Kind::Hex => PostEvidence::hex(staged, post.check.pages.clone(), post.check.whole)?,
+        Kind::Image => {
+            let whole = post
+                .next_baseline
+                .sha256
+                .context("an image's next baseline is its whole SHA-256")?;
+            PostEvidence::image(staged, whole, post.check.ends)?
+        }
+        Kind::Media => PostEvidence::media(staged, post.check.whole, post.check.ends)?,
+    };
+    ensure!(
+        rebuilt == *post,
+        "the post-save evidence is not what the {} save of this size keeps",
+        kind.word()
+    );
+    Ok(())
+}
+
+/// The routes a kind has (§3.1).
+fn route_fits(kind: Kind, route: Route) -> bool {
+    match kind {
+        Kind::Hex => matches!(
+            route,
+            Route::ServerCopy | Route::StreamedRewrite | Route::InPlace
+        ),
+        Kind::Image | Kind::Media => route == Route::Upload,
+    }
+}
+
+/// Write-in-place runs: at least one, each with old and new bytes of one length, none
+/// overlapping another (each is judged by its own bytes).
+fn check_runs(runs: &[Run]) -> Result<()> {
+    ensure!(!runs.is_empty(), "a write in place has runs");
+    let mut spans = Vec::with_capacity(runs.len());
+    for run in runs {
+        ensure!(
+            !run.new.is_empty() && run.old.len() == run.new.len(),
+            "a run's old and new bytes have one length"
+        );
+        let end = run
+            .offset
+            .checked_add(run.new.len() as u64)
+            .context("a run past the end of any file")?;
+        spans.push((run.offset, end));
+    }
+    spans.sort_unstable();
+    ensure!(
+        spans.windows(2).all(|w| w[0].1 <= w[1].0),
+        "write-in-place runs overlap"
     );
     Ok(())
 }
@@ -1090,7 +1243,11 @@ impl Journal {
     /// `naming` with the temp's name, or `writing` with the runs — before anything is sent. No
     /// generation is written again until the Save ends ([`Journal::save_landed`],
     /// [`Journal::save_not_landed`], [`Journal::save_unknown`]). Refused while another save is
-    /// recorded, and for a route the kind does not have.
+    /// recorded, for a route the kind does not have, and without the evidence a Save needs.
+    ///
+    /// An error while the record is written may still leave it on disk. The journal then keeps
+    /// it as an unknown outcome — its generation and pastes kept, no other Save started — and the
+    /// caller, having sent nothing, clears it with [`Journal::clear_save`].
     pub fn begin_save(&mut self, snap: &Snapshot, plan: Plan) -> Result<()> {
         if let Some(save) = &self.save {
             bail!(
@@ -1105,30 +1262,18 @@ impl Journal {
                 temp,
             } => (route, target, Phase::Naming { temp }),
             Plan::InPlace { target, undo, runs } => {
-                ensure!(!runs.is_empty(), "a write in place has runs");
-                for run in &runs {
-                    ensure!(
-                        !run.new.is_empty() && run.old.len() == run.new.len(),
-                        "a run's old and new bytes have one length"
-                    );
-                }
+                check_runs(&runs)?;
                 (Route::InPlace, target, Phase::Writing { undo, runs })
             }
         };
-        let fits = match self.kind {
-            Kind::Hex => matches!(
-                route,
-                Route::ServerCopy | Route::StreamedRewrite | Route::InPlace
-            ),
-            Kind::Image | Kind::Media => route == Route::Upload,
-        };
         ensure!(
-            fits,
+            route_fits(self.kind, route),
             "a {} save has no {} route",
             self.kind.word(),
             route.word()
         );
         check_shape(self.kind, snap)?;
+        check_pre(self.kind, &snap.baseline, &snap.seen)?;
         let saved = self.write_generation(snap, false)?;
         let intent = SaveIntent {
             saved,
@@ -1140,11 +1285,12 @@ impl Journal {
             seen: snap.seen.clone(),
             phase,
         };
-        self.replace(SAVE, &intent_bytes(&intent))?;
+        let recorded = self.replace(SAVE, &intent_bytes(&intent));
+        // Whatever the outcome, a record naming `saved` may be on disk now.
         self.saved_pastes = Content::of(snap).pastes;
         self.save = Some(intent);
-        self.running = true;
-        Ok(())
+        self.running = recorded.is_ok();
+        recorded
     }
 
     /// Moves the running save to `phase`, durably, before the request that needs it.
@@ -1176,16 +1322,7 @@ impl Journal {
             Some(Phase::Created { temp, created }) => (temp.clone(), *created),
             _ => bail!("phase staged comes after created"),
         };
-        ensure!(
-            post.kind == self.kind,
-            "{} evidence for a {} save",
-            post.kind.word(),
-            self.kind.word()
-        );
-        ensure!(
-            post.next_baseline.size == staged.size && post.next_baseline.mtime == staged.mtime,
-            "the post-save evidence is for another stat"
-        );
+        check_post(self.kind, &staged, &post)?;
         self.advance(Phase::Staged {
             temp,
             created,
@@ -1252,6 +1389,9 @@ impl Journal {
     }
 
     fn end_save(&mut self) -> Result<()> {
+        // The save has ended either way; if the record cannot be removed it stays pinned, and a
+        // later `clear_save` tries again.
+        self.running = false;
         let path = self.dir.join(SAVE);
         match self.fs.remove_file(&path) {
             Ok(()) => {}
@@ -1263,7 +1403,6 @@ impl Journal {
             .map_err(|e| io_err(e, "make durable the folder", &self.dir))?;
         self.save = None;
         self.saved_pastes.clear();
-        self.running = false;
         self.collect();
         Ok(())
     }
@@ -1360,6 +1499,8 @@ pub fn orphans(fs: &Arc<dyn Fs>, cache: &Path, host: &str, path: &str) -> Result
         }
     }
     let mut out = Vec::new();
+    // Whether the renames into tombstones found here are durable (an fsync of `home`, once).
+    let mut tombstones_durable = None;
     let names = fs.list(&home).map_err(|e| io_err(e, "list", &home))?;
     for name in names.iter().rev() {
         let Some(tombstone) = journal_entry(name, &file) else {
@@ -1383,7 +1524,11 @@ pub fn orphans(fs: &Arc<dyn Fs>, cache: &Path, host: &str, path: &str) -> Result
             }
         };
         if tombstone {
-            empty_out(fs.as_ref(), &dir);
+            // Only once its rename is durable: a power cut could otherwise bring the journal
+            // back under its own name, emptied.
+            if *tombstones_durable.get_or_insert_with(|| fs.sync_dir(&home).is_ok()) {
+                empty_out(fs.as_ref(), &dir);
+            }
             continue;
         }
         let Some(lock) = lock else { continue };
@@ -1662,19 +1807,28 @@ pub trait Inspect {
         Ok((!bytes.is_empty()).then(|| sha256(&bytes)))
     }
 
-    /// The whole file's SHA-256.
-    fn whole_sha256(&mut self, path: &str) -> Result<Sha> {
-        const CHUNK: usize = 1 << 20;
+    /// The SHA-256 of a file of `size` bytes (the size its `lstat` gave), reading those bytes and
+    /// one past them, nothing more: `None` when the file is shorter or longer than `size` — it
+    /// changed since that `lstat`. Reconciliation asks for it only at most 256 MiB; image Restore
+    /// at any size (the window has it from its streamed read).
+    fn whole_sha256(&mut self, path: &str, size: u64) -> Result<Option<Sha>> {
+        const CHUNK: u64 = 1 << 20;
         let mut hasher = Sha256::new();
         let mut offset = 0u64;
-        loop {
-            let bytes = self.read_at(path, offset, CHUNK)?;
+        while offset < size {
+            let want = CHUNK.min(size - offset) as usize;
+            let bytes = self.read_at(path, offset, want)?;
+            ensure!(bytes.len() <= want, "a read gave more than was asked");
+            if bytes.is_empty() {
+                return Ok(None);
+            }
             hasher.update(&bytes);
             offset += bytes.len() as u64;
-            if bytes.len() < CHUNK {
-                return Ok(hasher.finalize().into());
-            }
         }
+        if !self.read_at(path, size, 1)?.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(hasher.finalize().into()))
     }
 
     /// The SHA-256 of the first and last MiB of a file of `size` bytes.
@@ -1689,25 +1843,45 @@ pub trait Inspect {
     }
 }
 
-/// Whether `path` holds what `ev` says: every page, the ends (for a file of `size` bytes) and
-/// the whole hash, cheapest first. `Ok(false)` at the first difference.
-fn holds(inspect: &mut dyn Inspect, path: &str, size: u64, ev: &Evidence) -> Result<bool> {
+/// What the evidence says of a file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Verdict {
+    Holds,
+    Differs,
+    /// Nothing in the evidence can be checked within the bounds (a whole hash above 256 MiB
+    /// alone, or no evidence at all): a stat never decides by itself.
+    Cannot,
+}
+
+/// Whether `path`, a file of `size` bytes, holds what `ev` says: every page, the ends, and the
+/// whole hash at most 256 MiB — cheapest first, `Differs` at the first difference.
+fn holds(inspect: &mut dyn Inspect, path: &str, size: u64, ev: &Evidence) -> Result<Verdict> {
+    let mut checked = false;
     for (&off, sha) in &ev.pages {
         if inspect.page_sha256(path, off)?.as_ref() != Some(sha) {
-            return Ok(false);
+            return Ok(Verdict::Differs);
         }
+        checked = true;
     }
     if let Some(ends) = &ev.ends {
         if inspect.ends_sha256(path, size)? != *ends {
-            return Ok(false);
+            return Ok(Verdict::Differs);
         }
+        checked = true;
     }
     if let Some(whole) = &ev.whole {
-        if inspect.whole_sha256(path)? != *whole {
-            return Ok(false);
+        if size <= HASH_CHECK_MAX {
+            if inspect.whole_sha256(path, size)? != Some(*whole) {
+                return Ok(Verdict::Differs);
+            }
+            checked = true;
         }
     }
-    Ok(true)
+    Ok(if checked {
+        Verdict::Holds
+    } else {
+        Verdict::Cannot
+    })
 }
 
 /// What Restore may do with a generation (§3 Recovery).
@@ -1750,6 +1924,18 @@ fn check_restore(gen: &Generation, ev: &Evidence, inspect: &mut dyn Inspect) -> 
     let changed = || Restore::Refuse {
         why: "the file's content changed since these edits were made".to_string(),
     };
+    if gen.head.kind == Kind::Hex {
+        // Every page the edits touch needs its evidence, or nothing is applied without asking.
+        match edited_pages(&gen.edits) {
+            Ok(pages) if pages.iter().all(|p| ev.pages.contains_key(p)) => {}
+            Ok(_) => return Ok(Restore::Ask),
+            Err(e) => {
+                return Ok(Restore::Refuse {
+                    why: format!("the edits cannot be read ({e:#})"),
+                })
+            }
+        }
+    }
     let Some(now) = inspect.lstat(path)?.filter(|s| s.is_file && !s.is_symlink) else {
         return Ok(Restore::Refuse {
             why: format!("{path} is no longer a regular file there"),
@@ -1778,8 +1964,12 @@ fn check_restore(gen: &Generation, ev: &Evidence, inspect: &mut dyn Inspect) -> 
             if now.size != base.size {
                 return Ok(changed());
             }
+            if gen.head.kind == Kind::Media && now.size > HASH_CHECK_MAX {
+                // Media is never hashed whole above 256 MiB.
+                return Ok(Restore::Ask);
+            }
             match ev.whole {
-                Some(whole) if inspect.whole_sha256(path)? == whole => {
+                Some(whole) if inspect.whole_sha256(path, now.size)? == Some(whole) => {
                     Restore::Apply { notes: Vec::new() }
                 }
                 _ => changed(),
@@ -1857,27 +2047,41 @@ pub fn reconcile(intent: &SaveIntent, host: &str, inspect: &mut dyn Inspect) -> 
     }
     let target = intent.target.as_str();
     let temp = intent.phase.temp().unwrap_or_default().to_string();
-    let decided = (|| -> Result<(Outcome, Option<(Fingerprint, Seen)>)> {
+    const UNTOLD: &str =
+        "the evidence kept cannot tell it within what reconciliation reads (at most 256 MiB whole)";
+    type Decided = (Outcome, Option<(Fingerprint, Seen)>, Option<String>);
+    let decided = (|| -> Result<Decided> {
         let Some(now) = inspect
             .lstat(target)?
             .filter(|s| s.is_file && !s.is_symlink)
         else {
-            return Ok((Outcome::Unknown, None));
+            return Ok((Outcome::Unknown, None, None));
         };
         if let Some((staged, post)) = intent.phase.staged() {
-            if staged.matches(&now) && holds(inspect, target, now.size, &post.check)? {
-                let next = (post.next_baseline, post.next_seen.clone());
-                return Ok((Outcome::Landed, Some(next)));
+            if staged.matches(&now) {
+                match holds(inspect, target, now.size, &post.check)? {
+                    Verdict::Holds => {
+                        let next = (post.next_baseline, post.next_seen.clone());
+                        return Ok((Outcome::Landed, Some(next), None));
+                    }
+                    Verdict::Cannot => return Ok((Outcome::Unknown, None, Some(UNTOLD.into()))),
+                    Verdict::Differs => {}
+                }
             }
         }
-        if matches_pre(intent, &now, inspect)? {
-            return Ok((Outcome::NotLanded, None));
-        }
-        Ok((Outcome::Unknown, None))
+        Ok(match matches_pre(intent, &now, inspect)? {
+            Verdict::Holds => (Outcome::NotLanded, None, None),
+            Verdict::Differs => (Outcome::Unknown, None, None),
+            Verdict::Cannot => (Outcome::Unknown, None, Some(UNTOLD.into())),
+        })
     })();
-    let (outcome, next, unread) = match decided {
-        Ok((outcome, next)) => (outcome, next, None),
-        Err(e) => (Outcome::Unknown, None, Some(format!("{e:#}"))),
+    let (outcome, next, why) = match decided {
+        Ok(decided) => decided,
+        Err(e) => (
+            Outcome::Unknown,
+            None,
+            Some(format!("the remote could not be read ({e:#})")),
+        ),
     };
     let verdict = temp_verdict(intent, &temp, outcome, inspect);
     let named = |v: &Temp| match v {
@@ -1897,9 +2101,7 @@ pub fn reconcile(intent: &SaveIntent, host: &str, inspect: &mut dyn Inspect) -> 
         ),
         Outcome::InPart | Outcome::Unknown => format!(
             "a save was cut off{}; check {host}:{target} and {host}:{temp}",
-            unread.map_or(String::new(), |e| format!(
-                " and the remote could not be read ({e})"
-            ))
+            why.map_or(String::new(), |why| format!(" ({why})"))
         ),
     };
     Reconciled {
@@ -1910,20 +2112,15 @@ pub fn reconcile(intent: &SaveIntent, host: &str, inspect: &mut dyn Inspect) -> 
     }
 }
 
-/// The target still holds the file the Save started from: `(size, mtime)` of the pre-save
-/// baseline, and its `seen` evidence.
-fn matches_pre(intent: &SaveIntent, now: &Stat, inspect: &mut dyn Inspect) -> Result<bool> {
+/// Whether the target still holds the file the Save started from: `(size, mtime)` of the
+/// pre-save baseline, and its `seen` evidence (known whenever a Save is recorded).
+fn matches_pre(intent: &SaveIntent, now: &Stat, inspect: &mut dyn Inspect) -> Result<Verdict> {
     if now.size != intent.baseline.size || now.mtime != intent.baseline.mtime {
-        return Ok(false);
+        return Ok(Verdict::Differs);
     }
     match &intent.seen {
         Seen::Known(ev) => holds(inspect, &intent.target, now.size, ev),
-        Seen::Pending => match intent.baseline.sha256 {
-            Some(sha) if now.size <= HASH_CHECK_MAX => {
-                Ok(inspect.whole_sha256(&intent.target)? == sha)
-            }
-            _ => Ok(true),
-        },
+        Seen::Pending => Ok(Verdict::Cannot),
     }
 }
 
@@ -1961,7 +2158,7 @@ fn temp_verdict(
         }
         Phase::Staged { staged, post, .. } | Phase::Renaming { staged, post, .. } => {
             let same = staged.matches(&now)
-                && holds(inspect, temp, now.size, &post.check).unwrap_or(false);
+                && holds(inspect, temp, now.size, &post.check).ok() == Some(Verdict::Holds);
             if same {
                 Temp::Remove(temp.to_string())
             } else {
@@ -2556,7 +2753,8 @@ impl<'a> Lines<'a> {
     }
 }
 
-/// A `gen-<n>` file, refused unless whole: its last line's SHA-256 must match everything above.
+/// A `gen-<n>` file, refused unless whole — its last line's SHA-256 must match everything above
+/// — in the form sopen writes, and holding the evidence its kind keeps.
 pub fn parse_generation(bytes: &[u8]) -> Result<Generation> {
     let (body, sha) = verified(bytes)?;
     let mut r = Lines { rest: body };
@@ -2582,7 +2780,7 @@ pub fn parse_generation(bytes: &[u8]) -> Result<Generation> {
     let edits = String::from_utf8(r.take(len)?.to_vec()).context("edits are not UTF-8")?;
     ensure!(r.take(1)? == b"\n", "the edits end with a newline");
     r.end()?;
-    Ok(Generation {
+    let gen = Generation {
         at: GenRef { n, sha256: sha },
         head: Head {
             kind,
@@ -2595,7 +2793,17 @@ pub fn parse_generation(bytes: &[u8]) -> Result<Generation> {
         seen,
         edits,
         pastes,
-    })
+    };
+    ensure!(
+        gen.bytes() == bytes,
+        "not in the form sopen writes a generation"
+    );
+    ensure!(
+        kind == Kind::Image || gen.pastes.is_empty(),
+        "only image edits paste pictures"
+    );
+    check_seen(kind, &gen.head.baseline, &gen.seen, &gen.edits)?;
+    Ok(gen)
 }
 
 /// `CURRENT`: `gen-<n> <sha256>` and a newline, nothing else.
@@ -2610,13 +2818,20 @@ pub fn parse_current(bytes: &[u8]) -> Result<GenRef> {
     let n = name
         .strip_prefix(b"gen-")
         .context("CURRENT names a generation")?;
-    Ok(GenRef {
+    let at = GenRef {
         n: parse_u64(n)?,
         sha256: parse_sha(sha)?,
-    })
+    };
+    ensure!(
+        current_text(&at).as_bytes() == bytes,
+        "not in the form sopen writes CURRENT"
+    );
+    Ok(at)
 }
 
-/// A `save` file, refused unless whole.
+/// A `save` file, refused unless whole, in the form sopen writes, and holding what a Save of its
+/// kind and route records: a route the kind has, known pre-save evidence of its shape, the
+/// post-save evidence §3.1's table gives, write-in-place runs that do not overlap.
 pub fn parse_save(bytes: &[u8]) -> Result<SaveIntent> {
     let (body, _) = verified(bytes)?;
     let mut r = Lines { rest: body };
@@ -2678,24 +2893,19 @@ pub fn parse_save(bytes: &[u8]) -> Result<SaveIntent> {
             let mut runs = Vec::new();
             while r.next_key() == Some(b"run") {
                 let [off, old, new] = r.words("run")?;
-                let run = Run {
+                runs.push(Run {
                     offset: parse_offset(off)?,
                     old: parse_hex_bytes(old)?,
                     new: parse_hex_bytes(new)?,
-                };
-                ensure!(
-                    !run.new.is_empty() && run.old.len() == run.new.len(),
-                    "a run's old and new bytes have one length"
-                );
-                runs.push(run);
+                });
             }
-            ensure!(!runs.is_empty(), "a write in place has runs");
+            check_runs(&runs)?;
             Phase::Writing { undo, runs }
         }
         _ => bail!("unknown phase"),
     };
     r.end()?;
-    Ok(SaveIntent {
+    let intent = SaveIntent {
         saved,
         kind,
         route,
@@ -2704,14 +2914,37 @@ pub fn parse_save(bytes: &[u8]) -> Result<SaveIntent> {
         baseline,
         seen,
         phase,
-    })
+    };
+    ensure!(
+        intent_bytes(&intent) == bytes,
+        "not in the form sopen writes a save record"
+    );
+    ensure!(
+        route_fits(kind, route),
+        "a {} save has no {} route",
+        kind.word(),
+        route.word()
+    );
+    ensure!(
+        matches!(intent.phase, Phase::Writing { .. }) == (route == Route::InPlace),
+        "only a write in place has phase writing"
+    );
+    check_pre(kind, &intent.baseline, &intent.seen)?;
+    if let Some((staged, post)) = intent.phase.staged() {
+        check_post(kind, staged, post)?;
+    }
+    Ok(intent)
 }
 
 impl Generation {
+    fn bytes(&self) -> Vec<u8> {
+        let body = generation_body(self.at.n, &self.head, &self.seen, &self.edits, &self.pastes);
+        signed(body)
+    }
+
     /// The generation as its file holds it (readable text).
     pub fn text(&self) -> String {
-        let body = generation_body(self.at.n, &self.head, &self.seen, &self.edits, &self.pastes);
-        String::from_utf8_lossy(&signed(body)).into_owned()
+        String::from_utf8_lossy(&self.bytes()).into_owned()
     }
 }
 
