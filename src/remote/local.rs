@@ -1,5 +1,7 @@
 //! [`RemoteFs`] on the local disk: local targets, and the implementation every test runs against.
 
+mod ops;
+
 use super::{CreateError, Created, Entry, Hashing, Like, RemoteFs, Stat, Uploaded};
 use anyhow::{anyhow, Context, Result};
 use std::fs;

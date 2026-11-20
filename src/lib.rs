@@ -4,13 +4,15 @@
 //! or on another machine's screen — [`config`] holds the default), [`remote`] is the file layer
 //! (SFTP over the system ssh, or the local disk), [`kind`] routes by type, [`zed`] / [`app`] hand
 //! the file to an editor ([`raise`] brings the editor's window to the user on KDE Plasma),
-//! [`ffmpeg`] / [`cut`] cut media, [`cache`] owns local paths, [`usage`] appends the run log.
+//! [`ffmpeg`] / [`cut`] cut media, [`cache`] owns local paths, [`usage`] appends the run log,
+//! [`fileops`] renames, copies and moves for the file browser.
 
 pub mod app;
 pub mod cache;
 pub mod config;
 pub mod cut;
 pub mod ffmpeg;
+pub mod fileops;
 pub mod forward;
 pub mod gui;
 pub mod kind;
