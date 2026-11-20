@@ -251,10 +251,10 @@ bar does not have to move).
     are drawn as a viewer's, input reaches it.
   - **Work the preview stopped at its budget continues where it stopped** — the text index resumes at
     the offset where the 4 MiB pass stopped and keeps its marks; the audio waveform keeps its first 10
-    minutes and decodes on from there — so no byte the preview read is read again. (Checking is not
-    reading again: the text index re-hashes the bytes before the cut, before and after it resumes,
-    and any difference reads the file again whole; those checking reads index nothing and are
-    counted apart from the index's.)
+    minutes and decodes on from there. For the text index the guarantee is exactly this: during a
+    continuation that succeeds, each byte is indexed once; the bytes before the cut are also read
+    twice more to verify them (hashed before and after the continuation); a mismatch re-indexes
+    the whole file.
   - **A preparation still running** becomes the viewer's opening task: its read or decode continues
     under the viewer's rules (no preview budget, no 5 s deadline), its progress moves to the status row,
     Esc stops it as Enter's does.

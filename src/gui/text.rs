@@ -236,9 +236,10 @@ impl TextDoc {
 
     /// The whole file's index, for an index that stopped short ([`TextDoc::cut_short`]): the
     /// pass goes on from where it stopped, with the marks it had, through a handle of its own on
-    /// the same file — the bytes it read before are not read again — to the size the file had
-    /// when it was opened. Stops when `cancel` is set. An index that is whole comes back as it
-    /// is (on a handle of its own).
+    /// the same file, to the size the file had when it was opened — each byte indexed once; the
+    /// bytes before the cut are read twice more only to verify them (hashed before and after),
+    /// and a mismatch is [`Stale`] (the file is indexed again whole). Stops when `cancel` is set.
+    /// An index that is whole comes back as it is (on a handle of its own).
     pub fn resume(&self, cancel: &AtomicBool) -> Result<TextDoc> {
         self.resume_counted(cancel, &mut |_| {})
     }
@@ -1668,7 +1669,7 @@ impl TextWindow {
     }
 
     /// The hand-over of a preview whose index stopped short: the rest of the file is indexed on
-    /// a worker, from where the preview's pass stopped ([`TextDoc::resume`]: nothing read twice),
+    /// a worker, from where the preview's pass stopped ([`TextDoc::resume`]: nothing indexed twice),
     /// and swapped in as a re-read is; meanwhile the page stays and the status row counts.
     fn start_resume(&mut self, ctx: &egui::Context) {
         if !self.doc.cut_short() || self.reindex.is_some() {

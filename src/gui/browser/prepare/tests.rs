@@ -1493,3 +1493,58 @@ fn a_read_started_again_shares_one_budget() {
     );
     assert!(fx.preview_copies().is_empty(), "{:?}", fx.preview_copies());
 }
+
+/// P6 (remote, the read budget itself): Enter while the read is under way lifts the read budget
+/// for that same read. The file was just under the budget at the stat that decided it and grew
+/// before it was read; Enter comes at the first (full-size) response, and the whole larger file
+/// arrives in that one read — past the budget, every range once, not started again — and shows.
+/// Without Enter the same read stops at the response that crossed the budget: the card.
+#[test]
+fn a_read_lifted_mid_way_goes_past_its_read_budget() {
+    let Some(mut fx) = remote() else { return };
+    let cap = 300u64 << 10;
+    let grown = stamped(1 << 20);
+    for lift in [true, false] {
+        let abs = fx.file(&format!("grown-{lift}.txt"), &stamped(cap - (10 << 10)));
+        let (path, bigger) = (abs.clone(), grown.clone());
+        let mut armed = true;
+        *fx.counts.after.lock().unwrap() = Some(Box::new(move |op, p| {
+            // After the stat that decided it fits.
+            if op == "stat" && p == path && std::mem::take(&mut armed) {
+                std::fs::write(&path, &bigger).unwrap();
+            }
+        }));
+        let budget = Budget::new(Limits {
+            read: cap,
+            ..Limits::PREVIEW
+        });
+        if lift {
+            let enter = budget.clone();
+            *fx.counts.gate.lock().unwrap() = Some(Box::new(move || enter.lift()));
+        }
+        let reads = fx.counts.reads.lock().unwrap().len();
+        let p = fx
+            .preview_with(&abs, &budget, &AtomicBool::new(false))
+            .unwrap();
+        let responses = fx.counts.responses(&abs);
+        assert_eq!(
+            responses.first().map(|r| r.1),
+            Some(SFTP_RESPONSE - 1024),
+            "the first response is full-size: {responses:?}"
+        );
+        assert_ranges_once(&responses);
+        assert_eq!(fx.counts.reads.lock().unwrap().len(), reads + 1, "one read");
+        let sent: u64 = responses.iter().map(|r| r.1).sum();
+        if lift {
+            assert!(p.card().is_none(), "{}", card_why(&p));
+            assert_eq!(sent, grown.len() as u64, "the whole larger file");
+            assert!(sent > cap, "past the read budget");
+            let copy = fx.preview_copies().remove(0);
+            assert_eq!(std::fs::read(copy).unwrap(), grown);
+        } else {
+            assert_eq!(card_why(&p), OVER_LIMIT);
+            assert!(sent <= cap + SFTP_RESPONSE, "the server sent {sent} bytes");
+            assert!(fx.preview_copies().is_empty());
+        }
+    }
+}

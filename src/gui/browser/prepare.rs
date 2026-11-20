@@ -949,10 +949,10 @@ impl<W: std::io::Write> std::io::Write for Watched<'_, W> {
 /// Reads the remote file at `real` (named `name`) into a new private copy of the window's (02
 /// §4.4: 0600, removed with its name on every way out), as a fetch reads it — the stat before and
 /// after, read again once when they differ — with cancel looked at between every two requests
-/// and at every response. While it holds, the read budget is one for the whole preview: each
-/// attempt's fresh stat must fit in what the attempts before left of it (else the card), and
-/// every response is checked against it — a file that grew past its stat is read no further than
-/// the response that crossed it.
+/// and at every response. While it holds, the read budget is one for the whole preview: a read
+/// started again must fit in what the first left of it (else the card), and every response is
+/// checked against it — a file that grew past its stat is read no further than the response that
+/// crossed it; lifted meanwhile (Enter), the same read goes on to the end.
 fn read_copy(
     fs: &mut dyn RemoteFs,
     real: &str,
@@ -969,10 +969,13 @@ fn read_copy(
         budget.check(cancel)?;
         let before = fs.stat(real)?;
         budget.check(cancel)?;
+        // A read started again must fit in what the first left of the budget. The first read's
+        // size was decided at the preview's own stat; a file grown since is stopped by its
+        // responses (below) — or, Enter coming meanwhile, read on whole.
         let left = budget
             .limit(budget.limits.read)
             .map(|max| max.saturating_sub(spent));
-        if left.is_some_and(|left| before.size > left) {
+        if attempt > 0 && left.is_some_and(|left| before.size > left) {
             return Err(over(OVER_LIMIT));
         }
         let file = std::fs::OpenOptions::new()
