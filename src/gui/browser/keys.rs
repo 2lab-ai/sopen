@@ -2,7 +2,9 @@
 //! and 05 §1: each row is a key, its modifiers, the context it acts in and its [`Command`]. A
 //! row matches only when the pressed modifiers are exactly its own (egui's `consume_key` ignores
 //! extra Shift and Alt, so the table does not use it), and the event it matches is consumed;
-//! `+`, `-`, `*` and the jump letters come from the frame's typed text.
+//! `+`, `-`, `*` and the jump letters come from the frame's typed text, an input method's
+//! committed characters included (a Korean name can be jumped to; what is still being composed
+//! never acts).
 //!
 //! - **Every context's rows are here**, each marked with the slice that lands it (02 §8.1).
 //!   [`lookup`], [`row`] and the help screen use only the rows of the slices merged so far
@@ -548,7 +550,10 @@ pub(crate) fn find(events: &mut Vec<Event>, context: Context, upto: u8) -> Optio
                     return Some(row.command);
                 }
             }
-            Event::Text(typed) => {
+            // Typed text, and what an input method commits — egui-winit hands a commit over as
+            // `Ime(Commit)` alone (its `on_ime`), so a committed character acts once; what is
+            // still being composed (`Ime(Preedit)`) acts never and stays in the frame.
+            Event::Text(typed) | Event::Ime(egui::ImeEvent::Commit(typed)) => {
                 // The first character of the text that has a row here, taken out of it.
                 let hit = typed.char_indices().find_map(|(i, c)| {
                     char_row(context, upto, c).map(|row| (i, c, row.command.with_char(c)))
@@ -1027,6 +1032,80 @@ mod tests {
             find(&mut vec![press(K::F9, NONE)], List, LANDED),
             Some(Command::SwitchMode)
         );
+    }
+
+    /// What `lookup` returns over a frame of `events` in `context`, one call after another, and
+    /// what is left of the frame — through egui's own input, as the browser asks.
+    fn looked_up(context: Context, events: Vec<Event>) -> (Vec<Command>, Vec<Event>) {
+        let ctx = egui::Context::default();
+        let raw = egui::RawInput {
+            events,
+            ..Default::default()
+        };
+        let mut got = Vec::new();
+        let mut left = Vec::new();
+        let mut out = ctx.run_ui(raw, |ui| {
+            ui.input_mut(|i| {
+                while let Some(c) = lookup(i, context) {
+                    got.push(c);
+                }
+                left = i.events.clone();
+            })
+        });
+        out.textures_delta.clear();
+        (got, left)
+    }
+
+    fn preedit(text: &str) -> Event {
+        Event::Ime(egui::ImeEvent::Preedit {
+            text: text.into(),
+            active_range_chars: None,
+        })
+    }
+
+    fn commit(text: &str) -> Event {
+        Event::Ime(egui::ImeEvent::Commit(text.into()))
+    }
+
+    /// A composing input method (Hangul here): what is still being composed never jumps and
+    /// stays in the frame; a committed character jumps as a typed one does — once, since
+    /// egui-winit 0.37 hands a commit over as `Ime(Commit)` alone, never also as typed text
+    /// (`on_ime`, src/lib.rs:823–827). So a Korean name can be jumped to.
+    #[test]
+    fn a_committed_character_jumps_once_and_composing_never() {
+        let composing = vec![preedit("ㅎ"), preedit("하"), preedit("한")];
+        assert_eq!(looked_up(List, composing.clone()), (vec![], composing));
+        // 한 committed, 그 started: one jump, the preedits untouched.
+        let (got, left) = looked_up(List, vec![preedit("한"), commit("한"), preedit("ㄱ")]);
+        assert_eq!(got, [C::Jump('한')]);
+        assert_eq!(left, vec![preedit("한"), preedit("ㄱ")]);
+        // A commit of several characters: one jump each, in order.
+        let (got, left) = looked_up(List, vec![commit("测试")]);
+        assert_eq!(got, [C::Jump('测'), C::Jump('试')]);
+        assert!(left.is_empty());
+        // `+` committed is the select-group key, as typed; an empty commit is nothing.
+        assert_eq!(looked_up(List, vec![commit("+")]).0, [C::SelectGroup]);
+        assert_eq!(looked_up(List, vec![commit("")]).0, []);
+        // The tree jumps, the git panel finds; a dialog's field keeps its composition and commit.
+        assert_eq!(
+            looked_up(TreeSide, vec![commit("한")]).0,
+            [] as [C; 0],
+            "S5"
+        );
+        assert_eq!(
+            find(&mut vec![commit("한")], TreeSide, ALL_SLICES),
+            Some(C::Jump('한'))
+        );
+        assert_eq!(
+            find(&mut vec![commit("한")], Git, ALL_SLICES),
+            Some(C::FindWith('한'))
+        );
+        let field = vec![preedit("한"), commit("한")];
+        assert_eq!(looked_up(Dialog, field.clone()), (vec![], field));
+        // Shift+letter still jumps (the key event has no row; its typed text does), once.
+        let (got, left) = looked_up(List, vec![press(K::A, SHIFT), Event::Text("A".into())]);
+        assert_eq!(got, [C::Jump('A')]);
+        assert_eq!(left, vec![press(K::A, SHIFT)]);
     }
 
     /// The help screen's names: the platform's command key, the arrows as glyphs.

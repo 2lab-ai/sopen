@@ -496,9 +496,21 @@ pub fn own_keys(ui: &mut egui::Ui, keys: &[chrome::FKey]) {
 /// pass and [`help::end_pass`] after it.
 #[derive(Debug, Default)]
 pub(crate) struct FKeyInput {
-    /// The digits whose press became an F-key and that are still down: their release lets go
-    /// of the F-key, whatever modifiers are still held then.
-    held: [bool; 10],
+    /// What each digit key (1…9, 0) is while it is down.
+    digits: [Digit; 10],
+}
+
+/// A digit key between its press and its release: the shell decides at the press what it is,
+/// and it stays that — its repeats and its release go with it — whatever happens to the
+/// modifiers or the typing in between, so every key down the window sees comes up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum Digit {
+    #[default]
+    Up,
+    /// Pressed without exactly Cmd/Ctrl (or while a field has the typing): the digit itself.
+    Plain,
+    /// Pressed with exactly Cmd/Ctrl: its F-key.
+    Alias,
 }
 
 impl egui::Plugin for FKeyInput {
@@ -510,7 +522,13 @@ impl egui::Plugin for FKeyInput {
         // The focus as the last pass left it: what has the typing now.
         let typing = ctx.text_edit_focused();
         let clicked = chrome::take_clicked(ctx);
-        fkey_events(&mut input.events, &mut self.held, typing, clicked);
+        fkey_events(
+            &mut input.events,
+            &mut self.digits,
+            typing,
+            input.focused,
+            clicked,
+        );
     }
 
     fn on_begin_pass(&mut self, ui: &mut egui::Ui) {
@@ -522,61 +540,93 @@ impl egui::Plugin for FKeyInput {
     }
 }
 
-/// The F-key events of a pass (see [`FKeyInput`]): each press of a digit with exactly Cmd/Ctrl
-/// is that F-key pressed without modifiers, and its release the F-key's. The digit is the
+/// The F-key events of a pass (see [`FKeyInput`]): a digit pressed with exactly Cmd/Ctrl, not
+/// while a field has the typing, is that F-key pressed without modifiers until it is let go —
+/// its repeats are the F-key's (the digit they type is dropped: egui-winit puts a key's typed
+/// text right after its key event), its release the F-key's. A digit pressed otherwise stays
+/// the digit, its repeats too. Losing the window's focus lets go of every F-key held so (winit
+/// may never send those releases; egui clears its own keys then too). The digit is the
 /// physical key's first, so on a layout whose digits need Shift, Cmd/Ctrl and the key printed 5
 /// still make F5. `clicked` adds a press and a release of its F-key.
 fn fkey_events(
     events: &mut Vec<egui::Event>,
-    held: &mut [bool; 10],
+    digits: &mut [Digit; 10],
     typing: bool,
+    focused: bool,
     clicked: Option<u8>,
 ) {
     use egui::Key::*;
-    let digit = |key: egui::Key| -> Option<u8> {
+    let number = |key: egui::Key| -> Option<u8> {
         let n = [Num1, Num2, Num3, Num4, Num5, Num6, Num7, Num8, Num9, Num0]
             .iter()
             .position(|k| *k == key)?;
         Some(n as u8 + 1)
     };
-    for event in events.iter_mut() {
-        let egui::Event::Key {
-            key,
-            physical_key,
-            pressed,
-            modifiers,
-            ..
-        } = event
-        else {
-            continue;
-        };
-        let Some(n) = physical_key.and_then(digit).or_else(|| digit(*key)) else {
-            continue;
-        };
-        let slot = usize::from(n - 1);
-        let alias = if *pressed {
-            !typing && browser::keys::Mods::Command.matches(*modifiers)
-        } else {
-            held[slot]
-        };
-        if alias {
-            held[slot] = *pressed;
-            *key = chrome::fkey(n).expect("F1…F10");
-            *physical_key = None;
-            *modifiers = egui::Modifiers::NONE;
+    let fkey = |n: u8, pressed: bool| egui::Event::Key {
+        key: chrome::fkey(n).expect("F1…F10"),
+        physical_key: None,
+        pressed,
+        repeat: false,
+        modifiers: egui::Modifiers::NONE,
+    };
+    let let_go = |digits: &mut [Digit; 10], out: &mut Vec<egui::Event>| {
+        for (n, digit) in (1..=10u8).zip(digits.iter_mut()) {
+            if std::mem::take(digit) == Digit::Alias {
+                out.push(fkey(n, false));
+            }
         }
-    }
-    if let Some(key) = clicked.filter(|_| !typing).and_then(chrome::fkey) {
-        for pressed in [true, false] {
-            events.push(egui::Event::Key {
+    };
+    let mut out = Vec::with_capacity(events.len() + 2);
+    let mut after_alias = false;
+    for event in events.drain(..) {
+        let typed_by_alias = std::mem::take(&mut after_alias);
+        let (key, physical_key, pressed, modifiers) = match &event {
+            egui::Event::Text(_) if typed_by_alias => continue,
+            egui::Event::WindowFocused(false) => {
+                let_go(digits, &mut out);
+                out.push(event);
+                continue;
+            }
+            egui::Event::Key {
                 key,
-                physical_key: None,
+                physical_key,
                 pressed,
-                repeat: false,
-                modifiers: egui::Modifiers::NONE,
-            });
+                modifiers,
+                ..
+            } => (*key, *physical_key, *pressed, *modifiers),
+            _ => {
+                out.push(event);
+                continue;
+            }
+        };
+        let Some(n) = physical_key.and_then(number).or_else(|| number(key)) else {
+            out.push(event);
+            continue;
+        };
+        let digit = &mut digits[usize::from(n - 1)];
+        let now = match (pressed, *digit) {
+            (true, Digit::Up) if !typing && browser::keys::Mods::Command.matches(modifiers) => {
+                Digit::Alias
+            }
+            (true, Digit::Up) => Digit::Plain,
+            (true, held) => held,
+            (false, _) => Digit::Up,
+        };
+        if *digit == Digit::Alias || now == Digit::Alias {
+            out.push(fkey(n, pressed));
+            after_alias = pressed;
+        } else {
+            out.push(event);
         }
+        *digit = now;
     }
+    if !focused {
+        let_go(digits, &mut out);
+    }
+    if let Some(n) = clicked.filter(|n| !typing && chrome::fkey(*n).is_some()) {
+        out.extend([fkey(n, true), fkey(n, false)]);
+    }
+    *events = out;
 }
 
 /// Runs a hosted window's pass (`pass`) and says whether the window asked to close in it
@@ -1485,6 +1535,172 @@ mod tests {
         );
         assert_eq!(win.f5, 2);
         assert!(!drv.ctx.input(|i| i.key_down(egui::Key::F5)), "F5 let go");
+    }
+
+    /// Every key event and typed text that reaches the window's pass, in order, and a field
+    /// that has the typing while `focus` is set.
+    struct Recorder {
+        seen: Vec<egui::Event>,
+        text: String,
+        focus: bool,
+    }
+
+    impl Window for Recorder {
+        fn ui(&mut self, ui: &mut egui::Ui) {
+            ui.input(|i| {
+                self.seen.extend(
+                    i.events
+                        .iter()
+                        .filter(|e| matches!(e, egui::Event::Key { .. } | egui::Event::Text(_)))
+                        .cloned(),
+                );
+            });
+            let resp = ui.add(chrome::field(&mut self.text));
+            if self.focus {
+                resp.request_focus();
+            } else {
+                resp.surrender_focus();
+            }
+        }
+
+        fn ready(&self) -> bool {
+            true
+        }
+    }
+
+    fn digit(key: egui::Key, pressed: bool, modifiers: egui::Modifiers) -> egui::Event {
+        egui::Event::Key {
+            key,
+            physical_key: Some(key),
+            pressed,
+            repeat: false,
+            modifiers,
+        }
+    }
+
+    /// The keys `seen` leaves down, pressing and releasing in order (a press of a key already
+    /// down is its repeat), and the `(key, pressed)` sequence.
+    fn left_down(seen: &[egui::Event]) -> (Vec<egui::Key>, Vec<(egui::Key, bool)>) {
+        let mut down = Vec::new();
+        let mut keys = Vec::new();
+        for e in seen {
+            if let egui::Event::Key { key, pressed, .. } = e {
+                keys.push((*key, *pressed));
+                if *pressed {
+                    if !down.contains(key) {
+                        down.push(*key);
+                    }
+                } else {
+                    down.retain(|k| k != key);
+                }
+            }
+        }
+        (down, keys)
+    }
+
+    /// A frame for [`alias_run`]: its events, the modifiers held, and the field's focus to set
+    /// first (with two passes for it to take).
+    type AliasFrame = (Vec<egui::Event>, egui::Modifiers, Option<bool>);
+
+    /// `frames` through a real window (the shell's hook runs before each pass): what the
+    /// window saw, and the keys egui still has down at the end.
+    fn alias_run(frames: Vec<AliasFrame>) -> (Recorder, Vec<egui::Key>) {
+        let mut drv = testkit::Driver::new(400.0, 200.0);
+        let mut win = Recorder {
+            seen: Vec::new(),
+            text: String::new(),
+            focus: false,
+        };
+        drv.idle(&mut win, 2);
+        for (events, mods, focus) in frames {
+            if let Some(focus) = focus {
+                win.focus = focus;
+                drv.idle(&mut win, 2);
+            }
+            drv.frame(&mut win, events, mods);
+        }
+        let stuck = [egui::Key::Num5, egui::Key::F5]
+            .into_iter()
+            .filter(|k| drv.ctx.input(|i| i.key_down(*k)))
+            .collect();
+        (win, stuck)
+    }
+
+    /// The window saw exactly `want` as `(key, pressed)`, and nothing is left down — neither in
+    /// what it saw (a press of a key already down is its repeat) nor in egui.
+    fn assert_balanced(win: &Recorder, stuck: &[egui::Key], want: &[(egui::Key, bool)]) {
+        let (down, keys) = left_down(&win.seen);
+        assert_eq!(keys, want, "{:?}", win.seen);
+        assert!(down.is_empty() && stuck.is_empty(), "{down:?} {stuck:?}");
+    }
+
+    fn text5() -> egui::Event {
+        egui::Event::Text("5".into())
+    }
+
+    /// 04 §6.1: a digit that became an F-key stays that F-key until it is let go: Cmd/Ctrl+5,
+    /// Cmd/Ctrl let go, 5 repeats, 5 let go → the repeats are F5's (the typed 5 goes) and the
+    /// release is F5's.
+    #[test]
+    fn an_aliased_digit_repeats_as_its_f_key_after_cmd_goes() {
+        use egui::Key::{Num5, F5};
+        let (cmd, none) = (real_command(), egui::Modifiers::NONE);
+        let (win, stuck) = alias_run(vec![
+            (vec![digit(Num5, true, cmd)], cmd, None),
+            (vec![], none, None),
+            (vec![digit(Num5, true, none), text5()], none, None),
+            (vec![digit(Num5, false, none)], none, None),
+        ]);
+        assert_balanced(&win, &stuck, &[(F5, true), (F5, true), (F5, false)]);
+        assert!(!win.seen.iter().any(|e| matches!(e, egui::Event::Text(_))));
+    }
+
+    /// Focus lost with Cmd/Ctrl+5 down (its release never comes), then a plain 5: the F-key is
+    /// let go at the focus loss, and the plain 5 keeps its own release.
+    #[test]
+    fn losing_focus_lets_go_of_an_aliased_f_key() {
+        use egui::Key::{Num5, F5};
+        let (cmd, none) = (real_command(), egui::Modifiers::NONE);
+        let (win, stuck) = alias_run(vec![
+            (vec![digit(Num5, true, cmd)], cmd, None),
+            (vec![egui::Event::WindowFocused(false)], none, None),
+            (vec![egui::Event::WindowFocused(true)], none, None),
+            (vec![digit(Num5, true, none), text5()], none, None),
+            (vec![digit(Num5, false, none)], none, None),
+        ]);
+        assert_balanced(
+            &win,
+            &stuck,
+            &[(F5, true), (F5, false), (Num5, true), (Num5, false)],
+        );
+    }
+
+    /// A field takes the typing while Cmd/Ctrl+5 is down: the repeats and the release stay
+    /// F5's, and no 5 is typed into the field.
+    #[test]
+    fn an_aliased_digit_stays_balanced_when_a_field_takes_the_typing() {
+        use egui::Key::{Num5, F5};
+        let (cmd, none) = (real_command(), egui::Modifiers::NONE);
+        let (win, stuck) = alias_run(vec![
+            (vec![digit(Num5, true, cmd)], cmd, None),
+            (vec![digit(Num5, true, none), text5()], none, Some(true)),
+            (vec![digit(Num5, false, none)], none, None),
+        ]);
+        assert_balanced(&win, &stuck, &[(F5, true), (F5, true), (F5, false)]);
+        assert_eq!(win.text, "", "nothing typed");
+    }
+
+    /// 5 pressed plain, then Cmd/Ctrl held while it repeats: it stays the digit to its release.
+    #[test]
+    fn a_plain_digit_stays_plain_when_cmd_comes() {
+        use egui::Key::Num5;
+        let (cmd, none) = (real_command(), egui::Modifiers::NONE);
+        let (win, stuck) = alias_run(vec![
+            (vec![digit(Num5, true, none), text5()], none, None),
+            (vec![digit(Num5, true, cmd)], cmd, None),
+            (vec![digit(Num5, false, cmd)], cmd, None),
+        ]);
+        assert_balanced(&win, &stuck, &[(Num5, true), (Num5, true), (Num5, false)]);
     }
 
     /// A window of its own with the hex window's keys: what reaches its pass is counted.
