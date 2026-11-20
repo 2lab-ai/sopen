@@ -6,7 +6,11 @@
 //! between chunks): a mark every
 //! [`BLOCK_LINES`] lines, and at the first line start [`SPAN`] bytes past the last mark. A line
 //! that does not start at a mark starts less than a span past one, so finding any line reads at
-//! most a span; a longer line is followed by a mark, so its end is known without reading it.
+//! most a span; a longer line is followed by a mark, so its end is known without reading it. A
+//! preview's pass (the file browser's, 02 §4.3) stops after its budget, 4 MiB, keeping where it
+//! stopped and its marks; the hand-over resumes it from there ([`TextDoc::resume`]), so no byte is
+//! indexed twice. A preview draws without its bars, takes no input and neither follows nor re-reads
+//! its file ([`Window::set_preview`]).
 //!
 //! Lines wrap by default ([`wrap`]): every line is shown whole, in rows broken by the measured
 //! width of their glyphs, and a page reads only its rows' bytes — a line of hundreds of megabytes
@@ -99,6 +103,10 @@ pub struct TextDoc {
     path: std::path::PathBuf,
     /// Bytes read for lines (not the index pass) — what paging costs.
     page_reads: u64,
+    /// The index pass stopped short of the file, at a preview's budget (02 §4.3): where it
+    /// stopped and what it had found, for [`TextDoc::resume`] to go on from. The index covers
+    /// the bytes before that point only.
+    rest: Option<Scan>,
     /// Tests: the worker's copy ([`TextDoc::share`]) fails every read (not as a change).
     #[cfg(test)]
     pub(crate) fail_worker_reads: bool,
@@ -135,84 +143,75 @@ impl TextDoc {
     /// [`TextDoc::open_cancellable`], with `on_chunk(bytes indexed so far)` after every chunk
     /// (tests: a cancel, or a writer, in the middle of the pass).
     fn open_with(path: &Path, cancel: &AtomicBool, on_chunk: &mut dyn FnMut(u64)) -> Result<Self> {
-        let stopped = || {
-            if cancel.load(Ordering::Relaxed) {
-                Err(anyhow::Error::new(crate::remote::Cancelled))
-            } else {
-                Ok(())
-            }
-        };
-        stopped()?;
+        Self::open_scan(path, &|| None, &|| stopped(cancel), on_chunk)
+    }
+
+    /// Opens `path` and indexes its lines as far as `cap()` says (asked again after every
+    /// chunk: `None` = to the end; a preview's budget is 4 MiB, lifted by the hand-over), with
+    /// `check()` after every chunk (an error stops the pass: a cancel, a preview's deadline). A
+    /// pass stopped by the cap is an index of the bytes before it ([`TextDoc::cut_short`]) that
+    /// [`TextDoc::resume`] goes on from.
+    pub fn open_capped(
+        path: &Path,
+        cap: &dyn Fn() -> Option<u64>,
+        check: &dyn Fn() -> Result<()>,
+    ) -> Result<Self> {
+        Self::open_scan(path, cap, check, &mut |_| {})
+    }
+
+    fn open_scan(
+        path: &Path,
+        cap: &dyn Fn() -> Option<u64>,
+        check: &dyn Fn() -> Result<()>,
+        on_chunk: &mut dyn FnMut(u64),
+    ) -> Result<Self> {
+        check()?;
         let started = std::time::Instant::now();
         let file = File::open(path).with_context(|| format!("cannot open {}", path.display()))?;
         let meta = file
             .metadata()
             .with_context(|| format!("cannot stat {}", path.display()))?;
-        let (size, opened) = (meta.len(), identity(&meta));
-        let mut marks = vec![Mark { line: 0, offset: 0 }];
-        let (mut line, mut at, mut line_len) = (0u64, 0u64, 0u64);
-        let (mut first_long, mut last_byte) = (None, None);
-        let mut buf = vec![0u8; 1 << 20];
-        loop {
-            let n = file
-                .read_at(&mut buf, at)
-                .with_context(|| format!("cannot read {}", path.display()))?;
-            if n == 0 {
-                break;
-            }
-            // Only the bytes as opened: a file growing meanwhile is noticed later.
-            let n = n.min(size.saturating_sub(at) as usize);
-            if n == 0 {
-                break;
-            }
-            for (i, &b) in buf[..n].iter().enumerate() {
-                if b != b'\n' {
-                    line_len += 1;
-                    continue;
-                }
-                if line_len > LINE_MAX as u64 && first_long.is_none() {
-                    first_long = Some(line);
-                }
-                line_len = 0;
-                line += 1;
-                let start = at + i as u64 + 1;
-                let last = marks[marks.len() - 1];
-                if start < size && (line - last.line >= BLOCK_LINES || start - last.offset >= SPAN)
-                {
-                    marks.push(Mark {
-                        line,
-                        offset: start,
-                    });
-                }
-            }
-            last_byte = Some(buf[n - 1]);
-            at += n as u64;
-            on_chunk(at);
-            stopped()?;
-        }
+        let opened = identity(&meta);
+        let mut scan = Scan::default();
+        scan.run(&file, path, opened.2, cap, check, on_chunk)?;
+        let mut doc = Self::indexed(file, scan, opened, path.to_path_buf());
+        doc.indexed_in = started.elapsed();
+        // Checked here, right after the pass (on the opener's or re-read's worker), as well as
+        // when the viewer takes the index: a change between the two is caught by one of them.
+        doc.after_pass = doc.now();
+        Ok(doc)
+    }
+
+    /// The index a pass found (`scan`), for the file as `opened`: of the bytes it read, and no
+    /// mark at or past their end. A pass the cap stopped keeps what it found, to go on from.
+    fn indexed(file: File, scan: Scan, opened: Identity, path: std::path::PathBuf) -> Self {
         // The bytes actually indexed (fewer than the size as opened if it shrank meanwhile: the
-        // change is noticed later), and no mark at or past their end.
-        let size = at;
+        // change is noticed later).
+        let size = scan.at;
+        let mut marks = scan.marks.clone();
         marks.retain(|m| m.line == 0 || m.offset < size);
-        if line_len > LINE_MAX as u64 && first_long.is_none() {
-            first_long = Some(line);
+        let mut first_long = scan.first_long;
+        if scan.line_len > LINE_MAX as u64 && first_long.is_none() {
+            first_long = Some(scan.line);
         }
-        let ends_newline = last_byte == Some(b'\n');
-        if last_byte.is_some() && !ends_newline {
-            line += 1;
+        let ends_newline = scan.last_byte == Some(b'\n');
+        let mut lines = scan.line;
+        if scan.last_byte.is_some() && !ends_newline {
+            lines += 1;
         }
-        let mut doc = Self {
+        Self {
             file,
             size,
             marks,
-            lines: line,
+            lines,
             ends_newline,
             first_long,
             opened,
-            indexed_in: started.elapsed(),
+            indexed_in: std::time::Duration::ZERO,
             after_pass: Now::Same,
-            path: path.to_path_buf(),
+            path,
             page_reads: 0,
+            rest: scan.capped.then_some(scan),
             #[cfg(test)]
             fail_worker_reads: false,
             #[cfg(test)]
@@ -221,9 +220,50 @@ impl TextDoc {
             stale_worker_reads: false,
             #[cfg(test)]
             stale_reads: false,
+        }
+    }
+
+    /// The index stopped short of the file (a preview's budget): it covers [`TextDoc::size`]
+    /// bytes of more.
+    pub fn cut_short(&self) -> bool {
+        self.rest.is_some()
+    }
+
+    /// The whole file's index, for an index that stopped short ([`TextDoc::cut_short`]): the
+    /// pass goes on from where it stopped, with the marks it had, through a handle of its own on
+    /// the same file — the bytes it read before are not read again — to the size the file had
+    /// when it was opened. Stops when `cancel` is set. An index that is whole comes back as it
+    /// is (on a handle of its own).
+    pub fn resume(&self, cancel: &AtomicBool) -> Result<TextDoc> {
+        self.resume_counted(cancel, &mut |_| {})
+    }
+
+    /// [`TextDoc::resume`], with `on_chunk(bytes indexed so far)` after every chunk.
+    fn resume_counted(
+        &self,
+        cancel: &AtomicBool,
+        on_chunk: &mut dyn FnMut(u64),
+    ) -> Result<TextDoc> {
+        let started = std::time::Instant::now();
+        let file = self
+            .file
+            .try_clone()
+            .context("cannot open the file again")?;
+        let mut scan = match &self.rest {
+            Some(rest) => rest.clone(),
+            None => return self.share(),
         };
-        // Checked here, right after the pass (on the opener's or re-read's worker), as well as
-        // when the viewer takes the index: a change between the two is caught by one of them.
+        scan.capped = false;
+        scan.run(
+            &file,
+            &self.path,
+            self.opened.2,
+            &|| None,
+            &|| stopped(cancel),
+            on_chunk,
+        )?;
+        let mut doc = Self::indexed(file, scan, self.opened, self.path.clone());
+        doc.indexed_in = self.indexed_in + started.elapsed();
         doc.after_pass = doc.now();
         Ok(doc)
     }
@@ -232,7 +272,8 @@ impl TextDoc {
     /// path it was opened by (followed through links, as opened) both still show the indexed
     /// device, inode, size and modification time; [`Now::Gone`] when nothing is at the path
     /// (deleted); [`Now::Grown`] when both still show the indexed device and inode, the scan read
-    /// every byte the file had as opened, and both are no shorter than that (appended to, or
+    /// every byte the file had as opened (or stopped at a preview's budget), and both are no
+    /// shorter than that (appended to, or
     /// written in place: the size cannot tell); anything else — truncated, another file renamed
     /// over the path, a shrink met while scanning — [`Now::Changed`]. The viewer reads a grown
     /// file through its index (bounded reads, [`Stale`] the net) and indexes it again soon; a
@@ -255,7 +296,10 @@ impl TextDoc {
             let (d, i, l, _) = identity(m);
             d == dev && i == ino && l >= len
         };
-        if self.size == len && grown(&handle) && grown(&named) {
+        // A pass a preview's budget stopped read the file's first bytes only: still every byte
+        // it indexed (a pass cut short by a shrink is not one of these).
+        let whole = self.size == len || self.rest.is_some();
+        if whole && grown(&handle) && grown(&named) {
             Now::Grown
         } else {
             Now::Changed
@@ -299,6 +343,7 @@ impl TextDoc {
             after_pass: self.after_pass,
             path: self.path.clone(),
             page_reads: 0,
+            rest: self.rest.clone(),
             #[cfg(test)]
             fail_worker_reads: false,
             #[cfg(test)]
@@ -572,6 +617,130 @@ impl TextDoc {
             .or(spans.last())
             .copied())
     }
+}
+
+/// `Err(Cancelled)` once `cancel` is set.
+fn stopped(cancel: &AtomicBool) -> Result<()> {
+    if cancel.load(Ordering::Relaxed) {
+        Err(anyhow::Error::new(crate::remote::Cancelled))
+    } else {
+        Ok(())
+    }
+}
+
+/// An index pass: where it is in the file and what it found so far — every mark (also one at
+/// where it stopped), the line it is in and how long that line is so far, the first long line,
+/// the last byte read.
+#[derive(Debug, Clone, Default)]
+struct Scan {
+    at: u64,
+    line: u64,
+    line_len: u64,
+    first_long: Option<u64>,
+    last_byte: Option<u8>,
+    marks: Vec<Mark>,
+    /// The pass stopped at its cap, short of the file as opened.
+    capped: bool,
+}
+
+/// Bytes an index pass reads at a time (the cancel and the cap are looked at between reads).
+const PASS_READ: usize = 1 << 20;
+
+impl Scan {
+    /// The pass over `file` (opened at `path`, `size` bytes as opened) from where it is, to the
+    /// end of those bytes or to `cap()` (asked before every read); `check()` after every read.
+    /// Stops early, not capped, where the file ends sooner (it shrank meanwhile: the change is
+    /// noticed later).
+    fn run(
+        &mut self,
+        file: &File,
+        path: &Path,
+        size: u64,
+        cap: &dyn Fn() -> Option<u64>,
+        check: &dyn Fn() -> Result<()>,
+        on_chunk: &mut dyn FnMut(u64),
+    ) -> Result<()> {
+        if self.marks.is_empty() {
+            self.marks.push(Mark { line: 0, offset: 0 });
+        }
+        let mut buf = vec![0u8; PASS_READ];
+        self.capped = false;
+        loop {
+            // Only the bytes as opened: a file growing meanwhile is noticed later.
+            let end = match cap() {
+                Some(cap) if cap < size => {
+                    if self.at >= cap {
+                        self.capped = true;
+                        return Ok(());
+                    }
+                    cap
+                }
+                _ => size,
+            };
+            let want = (end.saturating_sub(self.at) as usize).min(buf.len());
+            if want == 0 {
+                return Ok(());
+            }
+            let n = file
+                .read_at(&mut buf[..want], self.at)
+                .with_context(|| format!("cannot read {}", path.display()))?;
+            if n == 0 {
+                return Ok(());
+            }
+            #[cfg(test)]
+            log_index_read(path, self.at, n as u64);
+            for (i, &b) in buf[..n].iter().enumerate() {
+                if b != b'\n' {
+                    self.line_len += 1;
+                    continue;
+                }
+                if self.line_len > LINE_MAX as u64 && self.first_long.is_none() {
+                    self.first_long = Some(self.line);
+                }
+                self.line_len = 0;
+                self.line += 1;
+                let start = self.at + i as u64 + 1;
+                let last = self.marks[self.marks.len() - 1];
+                if start < size
+                    && (self.line - last.line >= BLOCK_LINES || start - last.offset >= SPAN)
+                {
+                    self.marks.push(Mark {
+                        line: self.line,
+                        offset: start,
+                    });
+                }
+            }
+            self.last_byte = Some(buf[n - 1]);
+            self.at += n as u64;
+            on_chunk(self.at);
+            check()?;
+        }
+    }
+}
+
+#[cfg(test)]
+static INDEX_READS: std::sync::Mutex<Vec<(std::path::PathBuf, u64, u64)>> =
+    std::sync::Mutex::new(Vec::new());
+
+#[cfg(test)]
+fn log_index_read(path: &Path, at: u64, n: u64) {
+    INDEX_READS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .push((path.to_path_buf(), at, n));
+}
+
+/// Tests: every read an index pass made of `path` (its first pass, a resume, a re-read), as
+/// `(offset, bytes)`, in order.
+#[cfg(test)]
+pub(crate) fn index_reads(path: &Path) -> Vec<(u64, u64)> {
+    INDEX_READS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .iter()
+        .filter(|(p, _, _)| p == path)
+        .map(|&(_, at, n)| (at, n))
+        .collect()
 }
 
 /// Where a line is: its first byte in the file, and how many bytes it shows (its newline, and a
@@ -1229,6 +1398,10 @@ struct TextWindow {
     reindexes: usize,
     /// A local file (followed at its end); a remote one's cached copy is not.
     live: bool,
+    /// A preview in the file browser (02 §4.2): drawn without bars in a single-lined frame, no
+    /// input of its own, no following and no re-read. Its index may stop short of the file (the
+    /// preview's 4 MiB); the hand-over ([`Window::set_preview`] `false`) resumes it.
+    preview: bool,
     /// Called as a re-read's worker starts (tests: hold it).
     #[cfg(test)]
     reindex_hook: Option<Arc<dyn Fn() + Send + Sync>>,
@@ -1247,6 +1420,9 @@ struct Reindex {
     rx: Receiver<Result<TextDoc>>,
     /// The viewer was at the end when the change was seen (it follows the new end).
     at_end: bool,
+    /// The rest of an index a preview stopped short (the hand-over), not a re-read: the bytes
+    /// indexed so far and the size as opened, for the status row.
+    resume: Option<(Arc<AtomicU64>, u64)>,
     /// The worker's thread ended (tests).
     #[cfg_attr(not(test), allow(dead_code))]
     exited: Arc<AtomicBool>,
@@ -1286,18 +1462,9 @@ impl TextWindow {
         let readable = matches!(now, Now::Same | Now::Grown);
         let syntax = syntax_of(name, readable.then_some(&mut doc));
         let index_took = doc.indexed_in;
-        let status = match (syntax, doc.first_long) {
-            _ if now == Now::Gone => Status::error("the file was deleted"),
-            (None, _) => Status::default(),
-            _ if doc.size() > HIGHLIGHT_MAX => Status::info(format!(
-                "over {}: shown without highlighting",
-                crate::human(HIGHLIGHT_MAX)
-            )),
-            (Some(_), Some(line)) => Status::info(format!(
-                "highlighting stops at line {}: it is over {LINE_MAX} bytes",
-                line + 1
-            )),
-            (Some(_), None) => Status::default(),
+        let status = match now {
+            Now::Gone => Status::error("the file was deleted"),
+            _ => opening_status(syntax, &doc),
         };
         Self {
             title,
@@ -1320,6 +1487,7 @@ impl TextWindow {
             index_took,
             reindexes: 0,
             live: true,
+            preview: false,
             #[cfg(test)]
             reindex_hook: None,
             #[cfg(test)]
@@ -1419,6 +1587,50 @@ impl TextWindow {
             cancel,
             rx,
             at_end,
+            resume: None,
+            exited,
+        });
+    }
+
+    /// The hand-over of a preview whose index stopped short: the rest of the file is indexed on
+    /// a worker, from where the preview's pass stopped ([`TextDoc::resume`]: nothing read twice),
+    /// and swapped in as a re-read is; meanwhile the page stays and the status row counts.
+    fn start_resume(&mut self, ctx: &egui::Context) {
+        if !self.doc.cut_short() || self.reindex.is_some() {
+            return;
+        }
+        let (tx, rx) = mpsc::channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let exited = Arc::new(AtomicBool::new(false));
+        let done = Arc::new(AtomicU64::new(self.doc.size()));
+        let total = self.doc.opened.2;
+        let doc = match self.doc.share() {
+            Ok(doc) => doc,
+            Err(e) => {
+                // Read again from the path, as a change would be, after the usual wait.
+                self.status = Status::error(format!("{e:#}"));
+                self.waiting = true;
+                return;
+            }
+        };
+        let (stop, ex, waker, counted) =
+            (cancel.clone(), exited.clone(), ctx.clone(), done.clone());
+        std::thread::spawn(move || {
+            let result = doc.resume_counted(&stop, &mut |at| {
+                counted.store(at, Ordering::Relaxed);
+                waker.request_repaint();
+            });
+            let _ = tx.send(result);
+            ex.store(true, Ordering::Relaxed);
+            waker.request_repaint();
+        });
+        // The highlighter reads through the short index; it starts again on the whole one.
+        self.worker = None;
+        self.reindex = Some(Reindex {
+            cancel,
+            rx,
+            at_end: false,
+            resume: Some((done, total)),
             exited,
         });
     }
@@ -1439,6 +1651,7 @@ impl TextWindow {
             Err(mpsc::TryRecvError::Disconnected) => Err(anyhow::anyhow!("the re-read stopped")),
         };
         let at_end = reindex.at_end;
+        let resumed = reindex.resume.is_some();
         self.reindex = None;
         self.index_done = (self.clock)();
         let result = result.map(|doc| {
@@ -1490,11 +1703,15 @@ impl TextWindow {
                         self.top.min(last_top)
                     };
                 }
-                self.status = Status::info(if grew && at_end {
-                    "the file grew; following the end"
+                self.status = if resumed {
+                    opening_status(self.syntax, &self.doc)
                 } else {
-                    "the file changed; re-read"
-                });
+                    Status::info(if grew && at_end {
+                        "the file grew; following the end"
+                    } else {
+                        "the file changed; re-read"
+                    })
+                };
                 #[cfg(test)]
                 if let Some(hook) = self.after_install.as_mut() {
                     hook();
@@ -1506,7 +1723,8 @@ impl TextWindow {
                 self.status = Status::error("the file was deleted");
             }
             Err(e) => {
-                // Tried again after the usual wait.
+                // Tried again after the usual wait — a failed resume too, as a whole re-read.
+                self.waiting |= resumed;
                 self.index_took = std::time::Duration::ZERO;
                 self.status = Status::error(format!("cannot read the file again: {e:#}"));
             }
@@ -1514,7 +1732,7 @@ impl TextWindow {
     }
 
     fn keys(&mut self, ctx: &egui::Context) {
-        if self.waiting || self.reindex.is_some() {
+        if self.preview || self.waiting || self.reindex.is_some() {
             // Scrolling waits for the new index (the page on screen stays meanwhile).
             return;
         }
@@ -1525,7 +1743,7 @@ impl TextWindow {
                 i.consume_key(Modifiers::COMMAND, key) || i.consume_key(Modifiers::CTRL, key)
             })
         };
-        if (pressed(Key::W) | pressed(Key::F2)) && !self.gone {
+        if (pressed(Key::W) | super::hex::bare_key(ctx, Key::F2)) && !self.gone {
             // The same line at the top, from its start. (A deleted file keeps its page as it
             // was read: nothing is read again to show it the other way.)
             self.wrap = !self.wrap;
@@ -1616,7 +1834,7 @@ impl TextWindow {
                 }
             }
         }
-        if self.waiting && self.reindex.is_none() {
+        if self.waiting && self.reindex.is_none() && !self.preview {
             self.start_reindex(ctx);
         }
         if self.frozen() {
@@ -1666,7 +1884,7 @@ impl TextWindow {
             ctx.request_repaint();
         }
         self.worker_results();
-        if (self.waiting || due) && self.reindex.is_none() {
+        if (self.waiting || due) && self.reindex.is_none() && !self.preview {
             // A change (also one the highlighter found): the re-read starts, or is scheduled,
             // in this frame, not at the next input.
             self.start_reindex(ctx);
@@ -1870,11 +2088,19 @@ impl TextWindow {
                 format!("lines {}–{last} of {lines}", self.top + 1)
             }
         };
+        let status = match self.reindex.as_ref().and_then(|r| r.resume.as_ref()) {
+            Some((done, total)) => Status::info(format!(
+                "indexing the rest of the file… {} of {}",
+                crate::human(done.load(Ordering::Relaxed)),
+                crate::human(*total)
+            )),
+            None => self.status.clone(),
+        };
         ui.horizontal(|ui| {
             ui.monospace(shown);
-            if !self.status.text.is_empty() {
+            if !status.text.is_empty() {
                 ui.separator();
-                self.status.show(ui);
+                status.show(ui);
             }
         });
     }
@@ -1905,20 +2131,39 @@ impl TextWindow {
         self.poll_reindex();
         let outer = ui.max_rect();
         let p = chrome::Palette::of(ui.visuals());
-        // The window: its frame, titled as PC Shell's, the lines inside it.
-        let rect = chrome::frame(&ui.painter_at(outer), outer, TITLE, true);
+        // The window: its frame, titled as PC Shell's (single-lined in a preview: it does not
+        // have the keyboard), the lines inside it.
+        let framed = chrome::frame(&ui.painter_at(outer), outer, TITLE, !self.preview);
         let font = chrome::mono(ui);
         let (cw, text_h) = ctx.fonts_mut(|f| (f.glyph_width(&font, '0'), f.row_height(&font)));
         // Rows touch, a cell apart, as on a text screen.
         let row_h = text_h.ceil();
+        // A preview that shows only the start of its file says so on its last row (02 §4.3).
+        let note = (self.preview && self.doc.cut_short() && framed.height() >= 2.0 * row_h)
+            .then(|| format!("preview of the first {}", amount(self.doc.size())));
+        let rect = match note {
+            Some(_) => Rect::from_min_max(
+                framed.min,
+                Pos2::new(framed.right(), framed.bottom() - row_h),
+            ),
+            None => framed,
+        };
+        if !self.preview && self.doc.cut_short() && !self.waiting && self.reindex.is_none() {
+            // Handed over: the index goes on from where the preview's pass stopped.
+            self.start_resume(&ctx);
+        }
         let lines = self.doc.line_count();
         self.visible = ((rect.height() / row_h).floor() as u64).max(1);
         let digits = lines.max(1).to_string().len();
         let gutter = cw * (digits as f32 + 1.0);
         let text_x = rect.left() + gutter + cw;
         self.room = (rect.right() - text_x).max(0.0);
-        // Scrolling waits for a re-read, as the keys do.
-        if ui.rect_contains_pointer(outer) && !self.waiting && self.reindex.is_none() {
+        // Scrolling waits for a re-read, as the keys do; a preview takes no wheel.
+        if !self.preview
+            && ui.rect_contains_pointer(outer)
+            && !self.waiting
+            && self.reindex.is_none()
+        {
             let mut rows = 0f32;
             ctx.input(|i| {
                 for event in &i.events {
@@ -1975,7 +2220,7 @@ impl TextWindow {
             }
         }
         self.ensure_page(&ctx, p.text, &font);
-        if self.live && !self.frozen() && self.at_end() {
+        if self.live && !self.preview && !self.frozen() && self.at_end() {
             // At the end of a local file: looked at again each second with no input (one stat),
             // so a growing log is followed.
             ctx.request_repaint_after(FOLLOW_EVERY);
@@ -2090,6 +2335,15 @@ impl TextWindow {
             }
             None => {}
         }
+        if let Some(note) = &note {
+            ui.painter_at(framed).text(
+                Pos2::new(rect.left(), rect.bottom()),
+                egui::Align2::LEFT_TOP,
+                note,
+                font.clone(),
+                p.dim,
+            );
+        }
         if overflow && !self.rewrapped && !self.frozen() {
             // A plain row wider than it was wrapped for: the fonts changed since (a fallback
             // font came in). Wrapped again from scratch, once.
@@ -2201,6 +2455,13 @@ fn directed_job(chars: Vec<(char, Color32)>, font: &FontId) -> LayoutJob {
 
 impl Window for TextWindow {
     fn ui(&mut self, ui: &mut egui::Ui) {
+        if self.preview {
+            // Only the lines, in the frame: no bars, no notes, no keys (02 §4.2).
+            egui::CentralPanel::default()
+                .frame(egui::Frame::NONE)
+                .show(ui, |ui| self.body(ui));
+            return;
+        }
         self.keys(&ui.ctx().clone());
         chrome::bar_panel(egui::Panel::top("sopen-text-bar")).show(ui, |ui| self.bar(ui));
         chrome::bar_panel(egui::Panel::bottom("sopen-text-status"))
@@ -2221,13 +2482,22 @@ impl Window for TextWindow {
     }
 
     fn ready(&self) -> bool {
-        self.painted
-            && !self.waiting
-            && self.reindex.is_none()
-            && self
-                .page
-                .as_ref()
-                .is_some_and(|p| p.highlighted || self.worker.is_none())
+        let page = self
+            .page
+            .as_ref()
+            .is_some_and(|p| p.highlighted || self.worker.is_none());
+        if self.preview {
+            // A preview whose file changed keeps what it shows: it is not re-read.
+            return self.painted && (page || self.frozen());
+        }
+        self.painted && !self.waiting && self.reindex.is_none() && page
+    }
+
+    /// A preview (02 §4.2): no bars, a single-lined frame, no keys or wheel, no following and no
+    /// re-read. `false` (the hand-over) brings all of that back; an index the preview stopped
+    /// short goes on from where it stopped on the next pass.
+    fn set_preview(&mut self, on: bool) {
+        self.preview = on;
     }
 
     /// F2 switches wrapping: the row says what it does now.
@@ -2237,6 +2507,31 @@ impl Window for TextWindow {
         } else {
             chrome::TEXT_UNWRAPPED_KEYS
         }
+    }
+}
+
+/// The status a viewer opens with: why highlighting is off or stops early, if it is.
+fn opening_status(syntax: Option<&SyntaxReference>, doc: &TextDoc) -> Status {
+    match (syntax, doc.first_long) {
+        (None, _) => Status::default(),
+        _ if doc.size() > HIGHLIGHT_MAX => Status::info(format!(
+            "over {}: shown without highlighting",
+            crate::human(HIGHLIGHT_MAX)
+        )),
+        (Some(_), Some(line)) => Status::info(format!(
+            "highlighting stops at line {}: it is over {LINE_MAX} bytes",
+            line + 1
+        )),
+        (Some(_), None) => Status::default(),
+    }
+}
+
+/// `4 MiB` for a whole number of MiB (a preview's budget), else the size for people.
+fn amount(bytes: u64) -> String {
+    if bytes > 0 && bytes.is_multiple_of(1 << 20) {
+        format!("{} MiB", bytes >> 20)
+    } else {
+        crate::human(bytes)
     }
 }
 
@@ -2260,6 +2555,9 @@ pub fn embed(
         settle: Box::new(|_| Some(Outcome::default())),
     }
 }
+
+#[cfg(test)]
+mod preview_tests;
 
 #[cfg(test)]
 mod tests;

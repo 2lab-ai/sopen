@@ -1386,3 +1386,23 @@ fn f5_saves_as_command_s_does_and_only_where_it_would() {
     assert!(fx.win.job.is_none(), "F5 read-only saves nothing");
     assert_eq!(std::fs::read(&fx.path).unwrap(), written);
 }
+
+/// 04 §3: F5 saves with no modifier only; Shift+F5 and Alt+F5 start nothing.
+#[test]
+fn f5_saves_only_without_modifiers() {
+    let mut fx = open();
+    fx.select((10.0, 10.0), (60.0, 40.0));
+    fx.key(Key::C, Modifiers::NONE);
+    assert!(fx.win.doc.dirty());
+    for mods in [Modifiers::SHIFT, Modifiers::ALT] {
+        fx.key(Key::F5, mods);
+        assert!(fx.win.job.is_none(), "{mods:?}+F5 started a save");
+    }
+    fx.key(Key::F5, Modifiers::NONE);
+    assert!(
+        fx.win.job.is_some() || fx.win.status.text.starts_with("saved"),
+        "F5 alone saves: {}",
+        fx.win.status.text
+    );
+    fx.drv.until(&mut fx.win, 20, |w| w.job.is_none());
+}
