@@ -183,7 +183,9 @@ pub enum Op {
 /// `at=OFFSET;patch=OFFSET:HEXBYTES[,OFFSET:HEXBYTES]` (offsets `0x…` or decimal); the file
 /// browser `open=NAME`, and `at=OFFSET` for the first text file it opens — by `open=NAME` or by
 /// hand, whichever comes first (the row that byte is in at the top), `mode=dual|preview` and
-/// `bar=NAME` (02 §9); the image and hex windows `close=ask`; every window `help=1`.
+/// `bar=NAME` (02 §9); the image, hex and media windows `close=ask`; the media window
+/// `clips=START-END[,START-END]` (its edit list, source seconds) and `stereo=1`; every window
+/// `help=1`.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct State {
     pub rect: Option<[u32; 4]>,
@@ -199,9 +201,15 @@ pub struct State {
     pub patches: Vec<(u64, Vec<u8>)>,
     /// File browser: the entry of the opened folder to open (as Enter would) once it is listed.
     pub open: Option<String>,
-    /// Image and hex windows: closing is asked for once the state is on screen, so an edit the
-    /// state made brings up the unsaved-changes prompt (`close=ask`, the prompt's receipt).
+    /// Image, hex and media windows: closing is asked for once the state is on screen, so an
+    /// edit the state made brings up the unsaved-changes prompt (`close=ask`, the prompt's
+    /// receipt).
     pub ask_close: bool,
+    /// Media window: the edit list as source ranges in seconds, in output order
+    /// (`clips=0-1.5,3-4`).
+    pub clips: Vec<(f64, f64)>,
+    /// Media window: Mono → Stereo (`stereo=1`).
+    pub stereo: bool,
     /// File browser: the mode it opens in, `mode=dual` or `mode=preview` (the default; 02 §9).
     pub(crate) mode: browser::view::Mode,
     /// File browser: the entry of the active panel the bar goes on once it is listed, without
@@ -248,6 +256,23 @@ impl State {
                 }
                 "at" => state.at = Some(hex::parse_offset(value).context("SOPEN_STATE at")?),
                 "open" => state.open = Some(value.to_string()),
+                "clips" => {
+                    for one in value.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+                        let (a, b) = one.split_once('-').ok_or_else(|| {
+                            anyhow!("SOPEN_STATE clips: '{one}' is not START-END")
+                        })?;
+                        let (a, b) = (secs(a.trim())?, secs(b.trim())?);
+                        if b <= a {
+                            bail!("SOPEN_STATE clips: '{one}' ends before it starts");
+                        }
+                        state.clips.push((a, b));
+                    }
+                }
+                "stereo" => match value {
+                    "1" => state.stereo = true,
+                    "0" => state.stereo = false,
+                    other => bail!("SOPEN_STATE: stereo must be 1 or 0 (got '{other}')"),
+                },
                 "close" => match value {
                     "ask" => state.ask_close = true,
                     other => bail!("SOPEN_STATE: close must be 'ask' (got '{other}')"),
@@ -1116,6 +1141,13 @@ pub fn plain_key(ctx: &egui::Context, key: egui::Key) -> bool {
     !ctx.egui_wants_keyboard_input() && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, key))
 }
 
+/// A window's own F-key pressed with no modifier at all (04 §3: Shift, Alt or Cmd/Ctrl with it
+/// is another key, not this one) — not while a text field is being edited.
+pub fn fkey_alone(ctx: &egui::Context, key: egui::Key) -> bool {
+    !ctx.egui_wants_keyboard_input()
+        && ctx.input_mut(|i| browser::keys::take(i, key, browser::keys::Mods::None))
+}
+
 /// Cmd (macOS) / Ctrl (elsewhere) + key, with or without Shift.
 pub fn command_key(ctx: &egui::Context, key: egui::Key, shift: bool) -> bool {
     let mods = if shift {
@@ -1182,6 +1214,18 @@ mod tests {
         assert_eq!(Choice::parse("save").unwrap(), Choice::Save);
         assert_eq!(Choice::parse("cancel").unwrap(), Choice::Cancel);
         assert!(Choice::parse("Hex").is_err());
+    }
+
+    /// The media window's edit list and Mono → Stereo, as the receipts give them.
+    #[test]
+    fn media_state_parses() {
+        let s = State::parse("clips=4-6, 0:01-2.5 ,6-8;stereo=1;close=ask").unwrap();
+        assert_eq!(s.clips, vec![(4.0, 6.0), (1.0, 2.5), (6.0, 8.0)]);
+        assert!(s.stereo && s.ask_close);
+        assert!(!State::parse("stereo=0").unwrap().stereo);
+        for bad in ["clips=3", "clips=3-2", "clips=a-b", "stereo=yes"] {
+            assert!(State::parse(bad).is_err(), "{bad}");
+        }
     }
 
     /// The receipt keys of slice S1 (02 §9): `mode=`, `bar=`, and `help=1`; anything else is

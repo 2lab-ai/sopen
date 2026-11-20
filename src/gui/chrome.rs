@@ -145,6 +145,13 @@ pub const IMAGE_KEYS: &[FKey] = &[FKey {
     label: "Save",
 }];
 
+/// The media window's own key: F5 is Save, as in the image and hex windows (message 13 made
+/// video and audio savable).
+pub const MEDIA_KEYS: &[FKey] = &[FKey {
+    n: 5,
+    label: "Save",
+}];
+
 /// The text viewer's own key while lines wrap: F2 (or W) shows one row per line instead, as
 /// Norton Commander's and Far's viewers name it.
 pub const TEXT_WRAPPED_KEYS: &[FKey] = &[FKey {

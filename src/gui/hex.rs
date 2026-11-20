@@ -6,6 +6,9 @@
 //! [`HexDoc`] is the edit model (the bytes as opened plus a sparse map of changed bytes) and
 //! [`HexFile`] the write side; both are window-free, so the tests and the `SOPEN_AUTOSAVE` hook
 //! run the exact code the window's buttons run.
+//!
+//! As the file browser's preview (02 §4.2, [`super::Window::set_preview`]) the window shows its
+//! first rows without toolbar, status row or cursor, takes no input and never takes the keyboard.
 
 use super::chrome::{self, HEX_KEYS};
 use super::image::CANNOT_REPLACE;
@@ -1457,6 +1460,10 @@ pub(super) struct HexWindow {
     pending_notices: Option<Vec<String>>,
     /// `SOPEN_STATE` `close=ask`: closing is asked for on the first pass.
     ask_close: bool,
+    /// A preview in the file browser (02 §4.2): its first rows in a single-lined frame, no
+    /// toolbar, status row, cursor or disclosures, no input of its own, and it never takes the
+    /// keyboard.
+    preview: bool,
     /// Saves started so far (tests: a key starts exactly one).
     #[cfg(test)]
     pub(super) save_starts: usize,
@@ -1468,6 +1475,23 @@ impl Drop for HexWindow {
             *self.leftover.lock().unwrap() = Some(job);
         }
     }
+}
+
+/// A key a viewer handles itself (its F-keys) pressed with no modifier at all, consumed: 04 §3's
+/// exact matching. egui's `consume_key(Modifiers::NONE, …)` also takes it with Shift or Alt held
+/// (it ignores those), so Shift+F5 would save. The image and text windows use it too.
+pub(super) fn bare_key(ctx: &egui::Context, key: Key) -> bool {
+    ctx.input_mut(|i| {
+        let before = i.events.len();
+        i.events.retain(|e| {
+            !matches!(
+                e,
+                egui::Event::Key { key: k, pressed: true, modifiers, .. }
+                    if *k == key && modifiers.is_none()
+            )
+        });
+        i.events.len() != before
+    })
 }
 
 fn grid_id() -> egui::Id {
@@ -1532,6 +1556,7 @@ impl HexWindow {
             notices: Vec::new(),
             pending_notices: None,
             ask_close: false,
+            preview: false,
             #[cfg(test)]
             save_starts: 0,
         }
@@ -1869,7 +1894,7 @@ impl HexWindow {
         }
         // F5 is PC Shell's Save, as Cmd/Ctrl+S — but a plain key: never while a field has
         // the typing.
-        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::F5)) {
+        if bare_key(ctx, Key::F5) {
             self.start(ctx, JobKind::Save { close_after: false });
         }
         if command_key(ctx, Key::Z, true) {
@@ -1919,7 +1944,7 @@ impl HexWindow {
             self.place(row_start + ROW - 1, self.cursor.pane);
         }
         // F8 is PC Shell's Asc/hx: the typing column, as Tab.
-        if pressed(Key::Tab) || pressed(Key::F8) {
+        if pressed(Key::Tab) || bare_key(ctx, Key::F8) {
             let pane = match self.cursor.pane {
                 Pane::Hex => Pane::Ascii,
                 Pane::Ascii => Pane::Hex,
@@ -2069,7 +2094,8 @@ impl HexWindow {
         let ctx = ui.ctx().clone();
         let outer = ui.max_rect();
         let p = chrome::Palette::of(ui.visuals());
-        let panel = chrome::frame(&ui.painter_at(outer), outer, TITLE, true);
+        // Single-lined in a preview: it does not have the keyboard.
+        let panel = chrome::frame(&ui.painter_at(outer), outer, TITLE, !self.preview);
         let font = chrome::mono(ui);
         let (cw, text_h) = ctx.fonts_mut(|f| (f.glyph_width(&font, '0'), f.row_height(&font)));
         // Rows touch, a cell apart, as on a text screen.
@@ -2092,11 +2118,18 @@ impl HexWindow {
         self.visible = visible;
         let max_top = total.saturating_sub(visible);
 
-        let resp = ui.interact(rows_rect, grid_id(), Sense::click_and_drag());
-        let bar_resp = ui.interact(bar, grid_id().with("bar"), Sense::click_and_drag());
+        // A preview takes no click, drag or wheel, and never the keyboard (it belongs to the
+        // list beside it, 02 §4.4).
+        let sense = if self.preview {
+            Sense::hover()
+        } else {
+            Sense::click_and_drag()
+        };
+        let resp = ui.interact(rows_rect, grid_id(), sense);
+        let bar_resp = ui.interact(bar, grid_id().with("bar"), sense);
         // The grid holds the keyboard (arrows and Tab act on the cursor, not on focus), except
         // while a field (Go to, the read-only path field) or the close prompt has it.
-        if !goto_focused && !self.prompt {
+        if !goto_focused && !self.prompt && !self.preview {
             if ctx.memory(|m| m.focused()) != Some(grid_id()) {
                 resp.request_focus();
             }
@@ -2114,7 +2147,7 @@ impl HexWindow {
         }
 
         // Wheel / trackpad: whole rows; a line is three.
-        if resp.hovered() || bar_resp.hovered() {
+        if !self.preview && (resp.hovered() || bar_resp.hovered()) {
             let mut rows = 0f32;
             ctx.input(|i| {
                 for event in &i.events {
@@ -2209,6 +2242,8 @@ impl HexWindow {
         let text = p.text;
         let (changed_fg, changed_bg) = (p.changed, p.changed_back);
         let cursor_bg = visuals.selection.bg_fill;
+        // No cursor in a preview: nothing there is being edited.
+        let cursor_at = (!self.preview).then_some(self.cursor.at);
         let cursor_line = egui::Stroke::new(1.0, visuals.selection.stroke.color);
         let rows = ((rows_rect.height() / row_h).ceil() as u64).min(total - self.top_row);
         for k in 0..rows {
@@ -2238,7 +2273,7 @@ impl HexWindow {
                 let b = self.doc.byte(at);
                 bytes.push(b);
                 let changed = self.doc.changed(at);
-                let color = if at == self.cursor.at {
+                let color = if Some(at) == cursor_at {
                     p.bar_text
                 } else if changed {
                     changed_fg
@@ -2251,7 +2286,7 @@ impl HexWindow {
                     painter.rect_filled(cell(hx, 2.0), 0.0, changed_bg);
                     painter.rect_filled(cell(ax, 1.0), 0.0, changed_bg);
                 }
-                if at == self.cursor.at {
+                if Some(at) == cursor_at {
                     let (active, other) = match self.cursor.pane {
                         Pane::Hex => (cell(hx, 2.0), cell(ax, 1.0)),
                         Pane::Ascii => (cell(ax, 1.0), cell(hx, 2.0)),
@@ -2352,6 +2387,13 @@ impl super::Window for HexWindow {
     /// this frame, so an edit made in the same frame counts.
     fn ui(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
+        if self.preview {
+            // The rows alone (02 §4.2): no Go to, keys, typing, toolbar, rows below or prompt.
+            egui::CentralPanel::default()
+                .frame(egui::Frame::NONE)
+                .show(ui, |ui| self.grid(ui, false));
+            return;
+        }
         if std::mem::take(&mut self.ask_close) {
             // `SOPEN_STATE` `close=ask`: as if closing were asked for (the prompt's receipt).
             self.close_requested();
@@ -2360,8 +2402,7 @@ impl super::Window for HexWindow {
         // the read-only path field) has the typing.
         let cmd_g = !self.locked()
             && (super::command_key(&ctx, Key::G, false)
-                || (!ctx.text_edit_focused()
-                    && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::F6))));
+                || (!ctx.text_edit_focused() && bare_key(&ctx, Key::F6)));
         if cmd_g {
             self.goto.clear();
             ctx.memory_mut(|m| m.request_focus(goto_id()));
@@ -2432,8 +2473,14 @@ impl super::Window for HexWindow {
         HEX_KEYS
     }
 
+    /// A preview (02 §4.2) shows its first rows without bars or cursor and takes no input or
+    /// focus; `false` (the hand-over) makes it the hex window again, at the same rows.
+    fn set_preview(&mut self, on: bool) {
+        self.preview = on;
+    }
+
     fn close_requested(&mut self) -> bool {
-        if self.close_ok {
+        if self.close_ok || self.preview {
             return true;
         }
         // Read-only: nothing can be saved; closing asks only while the edits are kept nowhere.
@@ -2468,3 +2515,6 @@ impl super::Window for HexWindow {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod preview_tests;

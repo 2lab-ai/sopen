@@ -1023,6 +1023,8 @@ fn run_cut(
             (fetched.claim.local.clone(), Some(fetched.claim))
         }
     };
+    // What an export left when its sopen was killed goes first.
+    cache::sweep_stale_jobs(&dirs.cache);
     let mut progress = Progress::new(format!("cutting {name}"));
     let result = cut::cut_and_publish(
         place.fs(),
@@ -1099,14 +1101,20 @@ fn run_stems(
             (fetched.claim.local.clone(), Some(fetched.claim))
         }
     };
-    let (work, owned) = match work_dir {
-        Some(work) => (work.to_path_buf(), false),
+    // Its own work folder holds a job lock while it runs: a stems run killed (Ctrl-C) leaves the
+    // folder to the next start's sweep, which goes first. A window's child works in the
+    // window's folder, locked by the window.
+    let (work, job) = match work_dir {
+        Some(work) => (work.to_path_buf(), None),
         None => {
+            cache::sweep_stale_jobs(&dirs.cache);
             let work = cache::exports_root(&dirs.cache).join(remote::random_hex());
+            let job = cache::JobLock::take(&work)?;
             cache::private_dir(&work)?;
-            (work, true)
+            (work, Some(job))
         }
     };
+    let owned = job.is_some();
     let result = separate(
         &mut place,
         &tools,
@@ -1123,6 +1131,7 @@ fn run_stems(
         // The parent's folder, empty again: gone even if the parent is.
         let _ = std::fs::remove_dir(&work);
     }
+    drop(job);
     let published = result?;
     println!("{}", place.display(&remote::join(&dir, &published.voice)));
     println!("{}", place.display(&remote::join(&dir, &published.music)));

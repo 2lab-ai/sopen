@@ -6,8 +6,8 @@ Open a file or folder on another machine as if it were local:
 sopen myserver:~/project           # folder → sopen's file browser: two panels, Enter views any file
 sopen myserver:/var/log/app.log    # text → VS Code remote (Remote - SSH), else Zed
 sopen myserver:/tmp/shot.png       # image → view, rectangle crop / pixelize, cut / copy / paste, save back
-sopen myserver:/tmp/talk.mp4       # video → play, rectangle crop, time cut → new file next to it
-sopen myserver:/tmp/a.mp3          # audio → play, time cut
+sopen myserver:/tmp/talk.mp4       # video → play, cut / copy / paste, crop → save back or a new file
+sopen myserver:/tmp/a.mp3          # audio → play, cut / copy / paste, mono → stereo → save back or a new file
 sopen stems myserver:/tmp/a.mp3    # voice and music → two new files next to it
 sopen myserver:/tmp/a.zip          # anything else → asks: hex editor (default) or save it to a path
 sopen --target <host> myserver:/tmp/a.mp3   # the same, on <host>'s screen instead of this one
@@ -167,13 +167,38 @@ the image opens and again in the result line.
 
 ## Video and audio
 
-Video plays in the window with sound; audio shows its waveform. Click or drag the timeline to
-seek, `Space` plays/pauses, `←`/`→` step 1 s (`⇧` 5 s), `I` / `O` set In and Out. On video, drag
-a rectangle to crop. `E` exports In–Out (and the crop) as a new file next to the original,
-exactly like `sopen cut`, and shows its remote path. If no audio device can be opened the video
-plays silently and says so. Export keeps the picture and every audio track; what it cannot keep
-(subtitles, data streams, cover art, alpha, more than 8 bits where this ffmpeg's libx264 has no
-10-bit) is named in the window before you export and again in the result line.
+Video plays in the window with sound; audio shows its waveform, a stereo file in two lanes (L and
+R). Both are edited on the timeline: cut, copy and paste stretches of it, as the image window
+edits a rectangle. Editing only changes the list of pieces, so playback and the paused frame show
+the edit at once; ffmpeg renders it only when you Save (over the original, after a local backup)
+or Export (a new file next to it). If no audio device can be opened the video plays silently and
+says so.
+
+| Key | |
+|---|---|
+| click on the timeline | move the playhead (and drop the selection) |
+| drag on the timeline | select a stretch (the playhead follows, so you see the frame there) |
+| `I` / `O` | the selection starts / ends at the playhead (to the end / from the start without one) |
+| `←` / `→` | move the playhead 1 s (`⇧` 5 s; `⌥`/Alt one frame on video, 10 ms on audio) |
+| `Space` | play / pause the edited timeline |
+| `⌘C` (Ctrl+C on Linux) | copy the selection (to this window only, not the system clipboard) |
+| `⌘X` | cut: the selection goes, the gap closes, and it can be pasted |
+| `Delete` / `Backspace` | remove the selection without keeping it |
+| `⌘V` | paste what was copied or cut at the playhead, or over the selection |
+| `M` | audio, mono file: Mono → Stereo — left and right are both the one channel (`M` again: mono) |
+| `Esc` | clear the crop rectangle, then the selection |
+| `⌘Z` / `⇧⌘Z` | undo / redo |
+| `⌘S` or `F5` | Save: the original is backed up locally (path printed), the edit is rendered (video: H.264 + AAC; audio: its own codec) and written over it in the same format — refused, nothing rendered, if the file changed since it was opened. Then the window plays the saved file |
+| `E` | Export In–Out of the timeline (all of it without a selection) and the crop as `<stem>.cut-<in>-<out>.<ext>` next to the original, and show its remote path |
+
+On video, drag a rectangle on the picture to crop what Export writes (Save writes the edit only,
+never a crop over the original). Cuts land on frame times, so
+the sound never drifts from the picture. Save and Export keep the picture and every audio track;
+what they cannot keep (subtitles, data streams, cover art, chapters, alpha, more than 8 bits where
+this ffmpeg's libx264 has no 10-bit) is named in the window before you save or export and again in
+the result line. Closing with unsaved edits asks first. A save or export whose ffmpeg makes no
+progress for two minutes is stopped with an error; if sopen itself is killed during one, its ffmpeg
+stops with it and the half-made file is removed the next time a media window or `sopen cut` starts.
 
 ## Binary files
 
@@ -270,7 +295,7 @@ that file before it uses it; `--model PATH` or `SOPEN_STEMS_MODEL` names another
   nothing is written.
 - A save that fails for any reason moves your edited copy aside (`<file>.conflict-<time>`) and
   prints where. Opening the file again never overwrites an unsaved edit.
-- The local copies sopen creates (the cache, image and hex backups, kept edits) are readable by you
+- The local copies sopen creates (the cache, image, hex and media backups, kept edits) are readable by you
   only. A binary file saved with "Save to…" is created new, never over an existing file.
   A second sopen session on a file that is still open in the first gets its own copy, so neither
   overwrites the other's edits.

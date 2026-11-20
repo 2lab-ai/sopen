@@ -1,7 +1,10 @@
 //! In-window playback (spec §7, §11). Two ffmpeg subprocesses decode from the play position —
 //! video to RGBA frames (≤ 1280 wide, forced to a constant frame rate so a frame's time is its
 //! index over the rate), audio to f32 PCM at the output device's rate and channel count — and
-//! the audio output is the master clock. PCM reaches the device callback through a lock-free
+//! the audio output is the master clock. An edited timeline plays as its pieces of the source in
+//! order: each piece is decoded by an ffmpeg of its own, started as soon as the one before it
+//! starts ([`chain`]), and gives exactly its length in frames and samples, so the clock is the
+//! timeline's and a boundary costs no wait. PCM reaches the device callback through a lock-free
 //! ring ([`Mixer`]); the clock is what the device has started playing: the frames handed out
 //! before the latest callback, plus the time since that callback, minus the device's output
 //! latency ([`heard_seconds`]).
@@ -14,7 +17,7 @@
 //! the tests run them without a window, a device or ffmpeg; [`Sink::Null`] is the device-free
 //! output for the tests that decode real media.
 
-use crate::ffmpeg::Tools;
+use crate::ffmpeg::{ErrorTail, Input, Tools};
 use anyhow::{anyhow, bail, Context as _, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use std::io::Read;
@@ -48,15 +51,230 @@ fn ffmpeg_cmd(tools: &Tools) -> Command {
     cmd.args(["-nostdin", "-hide_banner", "-loglevel", "error"])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null());
+        .stderr(Stdio::piped());
     cmd
 }
 
-fn kill(child: &Mutex<Option<Child>>) {
-    if let Some(mut c) = child.lock().unwrap().take() {
+/// The decoders a playback runs right now (the piece being read and the next one, started
+/// early); dropping the playback kills them.
+type Live = Arc<Mutex<Vec<Child>>>;
+
+fn kill_all(live: &Live) {
+    for mut c in live.lock().unwrap().drain(..) {
         let _ = c.kill();
         let _ = c.wait();
     }
+}
+
+/// A decoder taken out of `live`: killed and waited for when dropped, however its piece ended
+/// (a dropped `Child` is neither — it would run on, or stay a zombie — and the playback's own
+/// kill no longer reaches it once it is out of `live`).
+struct Reaped(Child);
+
+impl Drop for Reaped {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// Takes child `id` out of `live` (to wait for its end, or to kill it).
+fn take_child(live: &Live, id: u32) -> Option<Reaped> {
+    let mut list = live.lock().unwrap();
+    list.iter()
+        .position(|c| c.id() == id)
+        .map(|i| Reaped(list.swap_remove(i)))
+}
+
+/// A piece of the source to play: `len` seconds from `start` (`len` infinite: to the end).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Piece {
+    pub start: f64,
+    pub len: f64,
+}
+
+/// A piece as a decoder gives it: from `start`, exactly `count` units (frames, or samples per
+/// channel) — `None`: to the end of the file.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Part {
+    pub start: f64,
+    pub count: Option<u64>,
+}
+
+/// `pieces` on one grid of `per_s` steps per second laid over the whole play
+/// ([`crate::ffmpeg::grid_counts`]): no rounding builds up from piece to piece, so pictures
+/// and sound — each on its own grid — meet at every boundary; a piece shorter than a step may
+/// get none (never stretched to one).
+pub fn parts(pieces: &[Piece], per_s: f64) -> Vec<Part> {
+    let lens: Vec<f64> = pieces
+        .iter()
+        .map(|p| if p.len.is_finite() { p.len } else { 0.0 })
+        .collect();
+    let counts = crate::ffmpeg::grid_counts(&lens, per_s);
+    pieces
+        .iter()
+        .zip(counts)
+        .map(|(p, n)| Part {
+            start: p.start,
+            count: p.len.is_finite().then_some(n),
+        })
+        .collect()
+}
+
+/// What a decoder chain says about itself: how long the reader waited for each piece's first
+/// output after the piece before it ended (the boundary gap; the output already queued hides it
+/// while it is shorter than the queue), and why it stopped before the end, if it failed.
+#[derive(Debug, Default)]
+pub struct ChainState {
+    pub waits: Mutex<Vec<Duration>>,
+    pub error: Mutex<Option<String>>,
+}
+
+impl ChainState {
+    fn fail(&self, why: String) {
+        self.error.lock().unwrap().get_or_insert(why);
+    }
+
+    pub fn error(&self) -> Option<String> {
+        self.error.lock().unwrap().clone()
+    }
+}
+
+/// How reading one piece ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Fed {
+    /// All of its count was given.
+    Done,
+    /// The decoder's output ended first, after `given` units (the rest still owed).
+    Ended { given: u64 },
+    /// Reading its output failed.
+    Failed(String),
+    /// The consumer stopped (playback stopped).
+    Stopped,
+}
+
+/// What a decoder chain hands its output to.
+pub trait Consumer {
+    /// Reads one piece's output; `first` is called at its first usable output.
+    fn read(&mut self, out: &mut dyn Read, part: &Part, first: &mut dyn FnMut()) -> Fed;
+    /// The rest of a piece whose decoder ended early (`given` of its count were given), so the
+    /// clock stays the timeline's; false once stopped.
+    fn pad(&mut self, part: &Part, given: u64) -> bool;
+}
+
+/// The end of what a decoder printed, for its error (read to its end, kept bounded).
+fn tail_of(
+    stderr: Option<std::process::ChildStderr>,
+) -> Option<std::thread::JoinHandle<ErrorTail>> {
+    stderr.map(ErrorTail::spawn)
+}
+
+/// Decodes `parts` one after another, each by the ffmpeg `start` makes for it, the next one
+/// started as soon as the current one is (its seek and first decode happen meanwhile); a part
+/// with a count of 0 is skipped. Every child is in `live` while it runs. A decoder that cannot
+/// start, whose output cannot be read, or that ends early with a failure stops the chain with
+/// the reason in `state`; one that ends early by itself is a short stream (padded); `stop` (or
+/// the consumer stopping) ends it without either.
+fn chain(
+    parts: Vec<Part>,
+    mut start: impl FnMut(&Part) -> std::io::Result<Child>,
+    live: &Live,
+    stop: &AtomicBool,
+    state: &ChainState,
+    consumer: &mut dyn Consumer,
+) {
+    type Running = (
+        u32,
+        std::process::ChildStdout,
+        Option<std::thread::JoinHandle<ErrorTail>>,
+    );
+    let parts: Vec<Part> = parts.into_iter().filter(|p| p.count != Some(0)).collect();
+    let mut spawn = |part: &Part| -> Option<Running> {
+        match start(part) {
+            Ok(mut child) => {
+                let out = child.stdout.take()?;
+                let err = tail_of(child.stderr.take());
+                let id = child.id();
+                live.lock().unwrap().push(child);
+                Some((id, out, err))
+            }
+            Err(e) => {
+                state.fail(format!(
+                    "cannot start ffmpeg for the piece at {:.2} s: {e}",
+                    part.start
+                ));
+                None
+            }
+        }
+    };
+    let mut next = parts.first().and_then(&mut spawn);
+    let mut ended: Option<Instant> = None;
+    for (k, part) in parts.iter().enumerate() {
+        if stop.load(SeqCst) {
+            break;
+        }
+        let Some((id, mut out, err)) = next.take() else {
+            break;
+        };
+        next = parts.get(k + 1).and_then(&mut spawn);
+        let mut noted = false;
+        let since = ended;
+        let mut on_first = || {
+            if let (false, Some(at)) = (noted, since) {
+                state.waits.lock().unwrap().push(at.elapsed());
+            }
+            noted = true;
+        };
+        let fed = consumer.read(&mut out, part, &mut on_first);
+        drop(out);
+        // Killed and waited for below, whichever way the piece ended.
+        let mut child = take_child(live, id);
+        let go_on = match fed {
+            Fed::Done => true,
+            Fed::Stopped => false,
+            Fed::Failed(why) => {
+                state.fail(format!("reading the piece at {:.2} s: {why}", part.start));
+                false
+            }
+            Fed::Ended { .. } if stop.load(SeqCst) => false,
+            Fed::Ended { given } => {
+                // Its output ended by itself: how did it end?
+                let status = child.as_mut().map(|c| {
+                    let deadline = Instant::now() + Duration::from_secs(2);
+                    loop {
+                        match c.0.try_wait() {
+                            Ok(Some(status)) => break Some(status),
+                            Ok(None) if Instant::now() < deadline => {
+                                std::thread::sleep(Duration::from_millis(5));
+                            }
+                            // Still running: killed and waited for as it is dropped below.
+                            _ => break None,
+                        }
+                    }
+                });
+                match status {
+                    Some(Some(s)) if !s.success() => {
+                        let said = err.and_then(|h| h.join().ok()).unwrap_or_default();
+                        let last = said.last_line();
+                        state.fail(format!(
+                            "ffmpeg stopped decoding the piece at {:.2} s ({s}): {last}",
+                            part.start
+                        ));
+                        false
+                    }
+                    // A short stream: the rest of the piece is held (picture) or silent.
+                    _ => consumer.pad(part, given),
+                }
+            }
+        };
+        drop(child);
+        // The piece has given all it will, its padding too: the next one's wait starts here.
+        ended = Some(Instant::now());
+        if !go_on {
+            break;
+        }
+    }
+    kill_all(live);
 }
 
 /// Seconds of audio the listener has heard. `before` = frames handed to the device before the
@@ -205,10 +423,13 @@ enum Output {
 /// Where the PCM comes from: ffmpeg from a position (playback), or a WAV file read in-process
 /// (`--selftest-audio` on a machine without ffmpeg).
 pub enum Decode<'a> {
+    /// `pieces` of `path` in order; `stereo`: left and right are both the source's (mono)
+    /// channel, at its full level — as Save renders it (`-ac 2` alone would lower it 3 dB).
     Ffmpeg {
         tools: &'a Tools,
-        path: &'a Path,
-        t0: f64,
+        input: &'a Input,
+        pieces: Vec<Piece>,
+        stereo: bool,
     },
     Wav(&'a Path),
 }
@@ -274,6 +495,117 @@ pub fn wav_to_f32(bytes: &[u8], rate: u32, channels: u16) -> Result<Vec<f32>> {
     Ok(out)
 }
 
+/// Pads a short piece in blocks of at most this many samples, checking for a stop between them
+/// (a decoder that ends early on a long piece must not cost memory for all of it).
+const PAD_CHUNK: usize = 8192;
+
+/// The PCM side of a decoder chain: f32 samples, `channels` interleaved, to `out` (false: stop).
+struct Pcm<'a> {
+    channels: usize,
+    stop: &'a AtomicBool,
+    out: &'a mut dyn FnMut(&[f32]) -> bool,
+    bytes: Vec<u8>,
+    samples: Vec<f32>,
+}
+
+impl Consumer for Pcm<'_> {
+    /// `given` in [`Fed::Ended`] counts samples (all channels).
+    fn read(&mut self, out: &mut dyn Read, part: &Part, first: &mut dyn FnMut()) -> Fed {
+        let want = part.count.map(|n| n as usize * self.channels);
+        let mut carry: Vec<u8> = Vec::new();
+        let mut given = 0usize;
+        loop {
+            let room = match want {
+                Some(w) if w <= given => return Fed::Done,
+                Some(w) => (w - given) * 4 - carry.len(),
+                None => usize::MAX,
+            };
+            let len = self.bytes.len().min(room);
+            let n = match out.read(&mut self.bytes[..len]) {
+                Ok(0) => {
+                    return Fed::Ended {
+                        given: given as u64,
+                    }
+                }
+                Ok(n) => n,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => return Fed::Failed(e.to_string()),
+            };
+            carry.extend_from_slice(&self.bytes[..n]);
+            let whole = carry.len() - carry.len() % 4;
+            if whole == 0 {
+                continue;
+            }
+            if given == 0 {
+                first();
+            }
+            self.samples.clear();
+            self.samples.extend(
+                carry[..whole]
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|b| f32::from_le_bytes(*b)),
+            );
+            carry.drain(..whole);
+            given += self.samples.len();
+            if !(self.out)(&self.samples) {
+                return Fed::Stopped;
+            }
+        }
+    }
+
+    fn pad(&mut self, part: &Part, given: u64) -> bool {
+        let Some(n) = part.count else { return true };
+        let mut left = (n as usize * self.channels).saturating_sub(given as usize);
+        let zeros = vec![0.0f32; PAD_CHUNK.min(left)];
+        while left > 0 {
+            if self.stop.load(SeqCst) {
+                return false;
+            }
+            let k = left.min(PAD_CHUNK);
+            if !(self.out)(&zeros[..k]) {
+                return false;
+            }
+            left -= k;
+        }
+        true
+    }
+}
+
+/// Decodes `pieces` of `input` as f32 PCM at `rate` × `channels` — each piece exactly its
+/// samples on one grid over the play ([`parts`]), padded with silence where a decoder ends early
+/// — into `out` (false: stop). `first`: the first piece's decoder, already started (its failure
+/// is the caller's error); the others are started here, each as the one before it starts.
+#[allow(clippy::too_many_arguments)]
+fn decode_pcm(
+    tools: &Tools,
+    input: &Input,
+    pieces: &[Piece],
+    stereo: bool,
+    (rate, channels): (u32, u16),
+    first: Option<Child>,
+    (live, stop, state): (&Live, &AtomicBool, &ChainState),
+    out: &mut dyn FnMut(&[f32]) -> bool,
+) {
+    let parts = parts(pieces, f64::from(rate));
+    let mut first = first;
+    let start = |part: &Part| -> std::io::Result<Child> {
+        match first.take() {
+            Some(child) => Ok(child),
+            None => audio_cmd(tools, input, part, stereo, rate, channels),
+        }
+    };
+    let mut pcm = Pcm {
+        channels: usize::from(channels.max(1)),
+        stop,
+        out,
+        bytes: vec![0u8; 16 * 1024],
+        samples: Vec::new(),
+    };
+    chain(parts, start, live, stop, state, &mut pcm);
+}
+
 /// Audio playback from one position: the decoder, the ring and the output.
 pub struct Audio {
     pub shared: Arc<Shared>,
@@ -281,8 +613,9 @@ pub struct Audio {
     pub channels: u16,
     pub device: String,
     _output: Output,
-    child: Arc<Mutex<Option<Child>>>,
+    live: Live,
     stop: Arc<AtomicBool>,
+    pub state: Arc<ChainState>,
 }
 
 fn open_device() -> Result<(cpal::Device, cpal::StreamConfig, String)> {
@@ -363,65 +696,90 @@ impl Audio {
                 (Output::Null, "null".to_string())
             }
         };
-        let (mut out, child): (Box<dyn Read + Send>, Option<Child>) = match decode {
-            Decode::Ffmpeg { tools, path, t0 } => {
-                let mut cmd = ffmpeg_cmd(tools);
-                cmd.args(["-ss", &format!("{t0:.3}"), "-i"])
-                    .arg(path)
-                    .args(["-vn", "-sn", "-f", "f32le", "-ac"])
-                    .arg(channels.to_string())
-                    .arg("-ar")
-                    .arg(rate.to_string())
-                    .arg("-");
-                let mut child = cmd
-                    .spawn()
-                    .with_context(|| format!("cannot run {}", tools.ffmpeg.display()))?;
-                (Box::new(child.stdout.take().expect("piped")), Some(child))
+        let live: Live = Arc::default();
+        let state = Arc::new(ChainState::default());
+        // Where the PCM comes from: pieces of a file through ffmpeg, or a WAV read here.
+        enum From {
+            Ffmpeg {
+                tools: Tools,
+                input: Input,
+                pieces: Vec<Piece>,
+                stereo: bool,
+                first: Option<Child>,
+            },
+            Pcm(Vec<f32>),
+        }
+        let from = match decode {
+            Decode::Ffmpeg {
+                tools,
+                input,
+                pieces,
+                stereo,
+            } => {
+                // The first piece is started here, so a missing ffmpeg is this call's error.
+                let at = parts(&pieces, f64::from(rate))
+                    .into_iter()
+                    .find(|p| p.count != Some(0));
+                let first = match at {
+                    Some(part) => Some(
+                        audio_cmd(tools, input, &part, stereo, rate, channels)
+                            .with_context(|| format!("cannot run {}", tools.ffmpeg.display()))?,
+                    ),
+                    None => None,
+                };
+                From::Ffmpeg {
+                    tools: tools.clone(),
+                    input: input.clone(),
+                    pieces,
+                    stereo,
+                    first,
+                }
             }
             Decode::Wav(path) => {
                 let bytes = std::fs::read(path)
                     .with_context(|| format!("cannot read {}", path.display()))?;
-                let pcm: Vec<u8> = wav_to_f32(&bytes, rate, channels)?
-                    .iter()
-                    .flat_map(|v| v.to_le_bytes())
-                    .collect();
-                (Box::new(std::io::Cursor::new(pcm)), None)
+                From::Pcm(wav_to_f32(&bytes, rate, channels)?)
             }
         };
-        let child = Arc::new(Mutex::new(child));
         let (dec_shared, dec_stop) = (shared.clone(), stop.clone());
+        let (dec_live, dec_state) = (live.clone(), state.clone());
         std::thread::spawn(move || {
             let mut prod = prod;
-            let mut bytes = vec![0u8; 16 * 1024];
-            let mut carry: Vec<u8> = Vec::new();
-            let mut samples: Vec<f32> = Vec::new();
-            'read: loop {
-                let n = match out.read(&mut bytes) {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => n,
-                };
-                carry.extend_from_slice(&bytes[..n]);
-                let whole = carry.len() - carry.len() % 4;
-                samples.clear();
-                samples.extend(
-                    carry[..whole]
-                        .as_chunks::<4>()
-                        .0
-                        .iter()
-                        .map(|b| f32::from_le_bytes(*b)),
-                );
-                carry.drain(..whole);
-                let mut rest = samples.as_slice();
+            // Pushes `samples` into the ring, waiting while it is full; false once stopped.
+            let mut push = |samples: &[f32]| -> bool {
+                let mut rest = samples;
                 while !rest.is_empty() {
+                    if dec_stop.load(SeqCst) {
+                        return false;
+                    }
                     let (pushed, left) = prod.push_partial_slice(rest);
                     dec_shared.pushed.fetch_add(pushed.len() as u64, SeqCst);
                     rest = left;
                     if !rest.is_empty() {
-                        if dec_stop.load(SeqCst) {
-                            break 'read;
-                        }
                         std::thread::sleep(Duration::from_millis(3));
                     }
+                }
+                true
+            };
+            match from {
+                From::Ffmpeg {
+                    tools,
+                    input,
+                    pieces,
+                    stereo,
+                    first,
+                } => decode_pcm(
+                    &tools,
+                    &input,
+                    &pieces,
+                    stereo,
+                    (rate, channels),
+                    first,
+                    (&dec_live, &dec_stop, &dec_state),
+                    &mut push,
+                ),
+                From::Pcm(pcm) => {
+                    push(&pcm);
                 }
             }
             dec_shared.eof.store(true, SeqCst);
@@ -432,8 +790,9 @@ impl Audio {
             channels,
             device: name,
             _output: output,
-            child,
+            live,
             stop,
+            state,
         })
     }
 
@@ -459,8 +818,41 @@ impl Audio {
 impl Drop for Audio {
     fn drop(&mut self) {
         self.stop.store(true, SeqCst);
-        kill(&self.child);
+        kill_all(&self.live);
     }
+}
+
+/// The ffmpeg that decodes one part's audio as f32 PCM at `rate` × `channels` (no count: to the
+/// end). Bounded a little past the part; the reader takes exactly its count.
+fn audio_cmd(
+    tools: &Tools,
+    path: &Input,
+    part: &Part,
+    stereo: bool,
+    rate: u32,
+    channels: u16,
+) -> std::io::Result<Child> {
+    let mut cmd = ffmpeg_cmd(tools);
+    let start = part.start;
+    cmd.args(["-ss", &format!("{start:.6}"), "-i"])
+        .arg(path.arg())
+        .args(["-vn", "-sn"]);
+    // A track that starts after the play position keeps its offset (silence first), as Save
+    // renders it; Mono → Stereo as Save pans it.
+    let mut filters = vec!["aresample=first_pts=0"];
+    if stereo {
+        filters.push("pan=stereo|c0=c0|c1=c0");
+    }
+    cmd.args(["-af", &filters.join(",")]);
+    if let Some(n) = part.count {
+        cmd.args(["-t", &format!("{:.6}", n as f64 / f64::from(rate) + 0.25)]);
+    }
+    cmd.args(["-f", "f32le", "-ac"])
+        .arg(channels.to_string())
+        .arg("-ar")
+        .arg(rate.to_string())
+        .arg("-");
+    crate::ffmpeg::spawn(&mut cmd)
 }
 
 /// One decoded video frame at `pts` seconds.
@@ -476,53 +868,173 @@ pub enum Next {
     Done,
 }
 
-/// Video decode from one position: `size` RGBA frames at a constant `fps`.
+/// Video decode of pieces from one timeline position: `size` RGBA frames at a constant `fps`,
+/// exactly as many per piece as one grid over the play gives it ([`parts`]; the last picture
+/// held where a decoder ends early), timed from `t0` by their index.
 pub struct Video {
     rx: Receiver<Frame>,
-    child: Arc<Mutex<Option<Child>>>,
+    live: Live,
+    stop: Arc<AtomicBool>,
+    pub state: Arc<ChainState>,
+}
+
+/// The ffmpeg that decodes `frames` frames of one piece (or, without a count, to the end).
+fn video_cmd(
+    tools: &Tools,
+    path: &Input,
+    start: f64,
+    fps: f64,
+    (w, h): (u32, u32),
+    frames: Option<u64>,
+) -> std::io::Result<Child> {
+    let mut cmd = ffmpeg_cmd(tools);
+    // Half a frame early, as Save renders a cut: the first frame is the one at `start`.
+    let seek = (start - 0.5 / fps.max(1.0)).max(0.0);
+    cmd.args(["-ss", &format!("{seek:.6}"), "-i"])
+        .arg(path.arg())
+        .args(["-an", "-sn", "-vf"])
+        // Timed from the cut (`start`, which is `start - seek` after the seek), as the sound is:
+        // a picture that starts later than the cut keeps its offset (its first frame held from
+        // the cut on), and the frame-rate filter's grid starts at the cut, not half a frame
+        // before it (that doubled the first frame and lost the last).
+        .arg(format!(
+            "setpts=PTS-{:.6}/TB,fps=fps={}:start_time=0,scale={w}:{h},format=rgba",
+            start - seek,
+            crate::ffmpeg::rate_arg(fps)
+        ));
+    if let Some(n) = frames {
+        cmd.args(["-frames:v", &n.to_string()]);
+    }
+    cmd.args(["-f", "rawvideo", "-"]);
+    crate::ffmpeg::spawn(&mut cmd)
+}
+
+/// The picture side of a decoder chain: frames timed `t0 + index / fps` into a bounded queue.
+struct Frames<'a> {
+    bytes: usize,
+    t0: f64,
+    fps: f64,
+    index: u64,
+    last: Option<Vec<u8>>,
+    stop: &'a AtomicBool,
+    tx: &'a std::sync::mpsc::SyncSender<Frame>,
+    wake: &'a (dyn Fn() + Send + Sync),
+}
+
+impl Frames<'_> {
+    fn send(&mut self, rgba: Vec<u8>) -> bool {
+        let pts = self.t0 + self.index as f64 / self.fps;
+        self.index += 1;
+        let sent = self.tx.send(Frame { pts, rgba }).is_ok();
+        (self.wake)();
+        sent
+    }
+}
+
+impl Consumer for Frames<'_> {
+    /// `given` in [`Fed::Ended`] counts frames.
+    fn read(&mut self, out: &mut dyn Read, part: &Part, first: &mut dyn FnMut()) -> Fed {
+        let mut got = 0u64;
+        while part.count.is_none_or(|n| got < n) {
+            let mut rgba = vec![0u8; self.bytes];
+            match out.read_exact(&mut rgba) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                    return Fed::Ended { given: got };
+                }
+                Err(e) => return Fed::Failed(e.to_string()),
+            }
+            if got == 0 {
+                first();
+            }
+            got += 1;
+            self.last = Some(rgba.clone());
+            if !self.send(rgba) {
+                return Fed::Stopped;
+            }
+        }
+        Fed::Done
+    }
+
+    fn pad(&mut self, part: &Part, given: u64) -> bool {
+        let Some(n) = part.count else { return true };
+        for _ in given..n {
+            if self.stop.load(SeqCst) {
+                return false;
+            }
+            match self.last.clone() {
+                Some(frame) => {
+                    if !self.send(frame) {
+                        return false;
+                    }
+                }
+                None => self.index += 1,
+            }
+        }
+        true
+    }
 }
 
 impl Video {
     pub fn start(
         tools: &Tools,
-        path: &Path,
+        path: &Input,
+        pieces: Vec<Piece>,
         t0: f64,
         fps: f64,
         (w, h): (u32, u32),
         wake: Arc<dyn Fn() + Send + Sync>,
     ) -> Result<Self> {
-        let mut cmd = ffmpeg_cmd(tools);
-        cmd.args(["-ss", &format!("{t0:.3}"), "-i"])
-            .arg(path)
-            .args(["-an", "-sn", "-vf"])
-            .arg(format!("fps={fps:.6},scale={w}:{h},format=rgba"))
-            .args(["-f", "rawvideo", "-"]);
-        let mut child = cmd
-            .spawn()
-            .with_context(|| format!("cannot run {}", tools.ffmpeg.display()))?;
-        let mut out = child.stdout.take().expect("piped");
-        let child = Arc::new(Mutex::new(Some(child)));
+        let pieces = if pieces.is_empty() {
+            vec![Piece {
+                start: t0,
+                len: f64::INFINITY,
+            }]
+        } else {
+            pieces
+        };
+        let parts = parts(&pieces, fps);
+        // The first piece is started here, so a missing ffmpeg is this call's error.
+        let mut first = match parts.iter().find(|p| p.count != Some(0)) {
+            Some(p) => Some(
+                video_cmd(tools, path, p.start, fps, (w, h), p.count)
+                    .with_context(|| format!("cannot run {}", tools.ffmpeg.display()))?,
+            ),
+            None => None,
+        };
+        let live: Live = Arc::default();
+        let stop = Arc::new(AtomicBool::new(false));
+        let state = Arc::new(ChainState::default());
         let (tx, rx) = std::sync::mpsc::sync_channel::<Frame>(6);
-        let reader_child = child.clone();
+        let (tools, path) = (tools.clone(), path.clone());
+        let (r_live, r_stop, r_state) = (live.clone(), stop.clone(), state.clone());
         std::thread::spawn(move || {
-            let mut i = 0u64;
-            loop {
-                let mut rgba = vec![0u8; (w * h * 4) as usize];
-                if out.read_exact(&mut rgba).is_err() {
-                    break;
+            let start = |p: &Part| -> std::io::Result<Child> {
+                match first.take() {
+                    Some(child) => Ok(child),
+                    None => video_cmd(&tools, &path, p.start, fps, (w, h), p.count),
                 }
-                let pts = t0 + i as f64 / fps;
-                i += 1;
-                if tx.send(Frame { pts, rgba }).is_err() {
-                    break;
-                }
-                wake();
-            }
+            };
+            let mut frames = Frames {
+                bytes: (w * h * 4) as usize,
+                t0,
+                fps,
+                index: 0,
+                last: None,
+                stop: &r_stop,
+                tx: &tx,
+                wake: &*wake,
+            };
+            chain(parts, start, &r_live, &r_stop, &r_state, &mut frames);
             drop(tx);
-            kill(&reader_child);
             wake();
         });
-        Ok(Self { rx, child })
+        Ok(Self {
+            rx,
+            live,
+            stop,
+            state,
+        })
     }
 
     pub fn next(&self) -> Next {
@@ -536,7 +1048,8 @@ impl Video {
 
 impl Drop for Video {
     fn drop(&mut self) {
-        kill(&self.child);
+        self.stop.store(true, SeqCst);
+        kill_all(&self.live);
     }
 }
 
@@ -600,11 +1113,49 @@ impl Picker {
 
 /// What to play.
 pub struct Source {
-    pub path: PathBuf,
+    /// What ffmpeg reads (see [`Input`]).
+    pub input: Input,
+    /// The timeline's length.
     pub duration: f64,
     /// `(decode size, fps)` when there is a video stream.
     pub video: Option<((u32, u32), f64)>,
     pub audio: bool,
+    /// The pieces of the source from the play position on, in order (the edit list from there);
+    /// empty: the file itself from the play position.
+    pub pieces: Vec<Piece>,
+    /// Mono → Stereo (see [`Decode::Ffmpeg`]).
+    pub stereo: bool,
+}
+
+impl Source {
+    /// The file as it is.
+    pub fn whole(
+        path: PathBuf,
+        duration: f64,
+        video: Option<((u32, u32), f64)>,
+        audio: bool,
+    ) -> Self {
+        Self {
+            input: Input::path(&path),
+            duration,
+            video,
+            audio,
+            pieces: Vec::new(),
+            stereo: false,
+        }
+    }
+
+    /// What is decoded from timeline position `t0`.
+    fn pieces_from(&self, t0: f64) -> Vec<Piece> {
+        if self.pieces.is_empty() {
+            vec![Piece {
+                start: t0,
+                len: (self.duration - t0).max(0.0),
+            }]
+        } else {
+            self.pieces.clone()
+        }
+    }
 }
 
 /// One pass of [`Player::pump`].
@@ -614,6 +1165,8 @@ pub struct Pump {
     pub ended: bool,
     /// When to call again (the next frame is due, or a playhead refresh).
     pub wake_in: Duration,
+    /// A decoder failed: the session is over, and this says why.
+    pub error: Option<String>,
 }
 
 /// A playback session from `t0`. Dropping it stops both decoders and the output.
@@ -641,15 +1194,25 @@ impl Player {
         wake: Arc<dyn Fn() + Send + Sync>,
     ) -> Result<Self> {
         let t0 = t0.clamp(0.0, src.duration.max(0.0));
+        let pieces = src.pieces_from(t0);
         let video = match src.video {
-            Some((size, fps)) => Some(Video::start(tools, &src.path, t0, fps, size, wake)?),
+            Some((size, fps)) => Some(Video::start(
+                tools,
+                &src.input,
+                pieces.clone(),
+                t0,
+                fps,
+                size,
+                wake,
+            )?),
             None => None,
         };
         let (audio, audio_note) = if src.audio {
             let decode = Decode::Ffmpeg {
                 tools,
-                path: &src.path,
-                t0,
+                input: &src.input,
+                pieces,
+                stereo: src.stereo,
             };
             match Audio::start(decode, gain, sink) {
                 Ok(a) => (Some(a), None),
@@ -693,6 +1256,28 @@ impl Player {
         (self.picker.shown, self.picker.dropped)
     }
 
+    /// How long each decoder waited at each boundary between pieces (video, audio).
+    pub fn boundary_waits(&self) -> (Vec<Duration>, Vec<Duration>) {
+        let of =
+            |b: Option<&Arc<ChainState>>| b.map_or(Vec::new(), |b| b.waits.lock().unwrap().clone());
+        (
+            of(self.video.as_ref().map(|v| &v.state)),
+            of(self.audio.as_ref().map(|a| &a.state)),
+        )
+    }
+
+    /// Why a decoder stopped before the end (a failure, not a short stream or a stop).
+    pub fn error(&self) -> Option<String> {
+        let video = self.video.as_ref().and_then(|v| v.state.error());
+        video.or_else(|| self.audio.as_ref().and_then(|a| a.state.error()))
+    }
+
+    /// The next frame is decoded and waiting (or there is none to come): a clock may move on
+    /// to it without the picture falling behind.
+    pub fn frame_ready(&self) -> bool {
+        self.video.is_none() || self.picker.next_pts().is_some() || self.picker.done
+    }
+
     pub fn pump(&mut self, now: Instant) -> Pump {
         if self.started_at.is_none() {
             let video_ready = match &self.video {
@@ -706,6 +1291,7 @@ impl Player {
                     position: self.t0,
                     ended: false,
                     wake_in: Duration::from_millis(5),
+                    error: None,
                 };
             }
             self.started_at = Some(now);
@@ -752,11 +1338,13 @@ impl Player {
             (None, Some(_)) => 0.005,
             (None, None) => 1.0 / 30.0,
         };
+        let error = self.error();
         Pump {
             frame,
             position: clock.min(self.duration),
-            ended,
+            ended: ended || error.is_some(),
             wake_in: Duration::from_secs_f64(wake_in),
+            error,
         }
     }
 }
@@ -770,12 +1358,17 @@ pub fn selftest(file: &Path) -> Result<String> {
     // ffmpeg when there is one (the playback path); otherwise a WAV is read in-process, so the
     // device check also runs on a machine without ffmpeg.
     let tools = crate::ffmpeg::resolve();
+    let input = Input::path(file);
     let (decode, decoder) = match &tools {
         Ok(tools) => (
             Decode::Ffmpeg {
                 tools,
-                path: file,
-                t0: 0.0,
+                input: &input,
+                pieces: vec![Piece {
+                    start: 0.0,
+                    len: f64::INFINITY,
+                }],
+                stereo: false,
             },
             "ffmpeg",
         ),
@@ -1054,12 +1647,12 @@ mod tests {
         );
         let probe = crate::ffmpeg::probe(&tools, &path).unwrap();
         assert_eq!(probe.fps, Some(25.0));
-        let src = Source {
-            path: path.clone(),
-            duration: probe.duration.unwrap(),
-            video: Some((decode_size(320, 180), 25.0)),
-            audio: true,
-        };
+        let src = Source::whole(
+            path.clone(),
+            probe.duration.unwrap(),
+            Some((decode_size(320, 180), 25.0)),
+            true,
+        );
         let mut player =
             Player::start(&tools, &src, 1.0, 0.0, Sink::Null, Arc::new(|| {})).unwrap();
         assert!(player.audio_note.is_none());
@@ -1110,12 +1703,7 @@ mod tests {
                 "-shortest",
             ],
         );
-        let src = Source {
-            path,
-            duration: 2.0,
-            video: Some(((160, 90), 20.0)),
-            audio: true,
-        };
+        let src = Source::whole(path, 2.0, Some(((160, 90), 20.0)), true);
         let mut player =
             Player::start(&tools, &src, 0.0, 0.0, Sink::Device, Arc::new(|| {})).unwrap();
         let begin = Instant::now();
@@ -1154,12 +1742,7 @@ mod tests {
         let probe = crate::ffmpeg::probe(&tools, &path).unwrap();
         let duration = probe.duration.unwrap();
         assert!(duration > 3.9, "container duration {duration}");
-        let src = Source {
-            path,
-            duration,
-            video: Some(((160, 90), 20.0)),
-            audio: true,
-        };
+        let src = Source::whole(path, duration, Some(((160, 90), 20.0)), true);
         let mut player =
             Player::start(&tools, &src, 0.0, 0.0, Sink::Null, Arc::new(|| {})).unwrap();
         let begin = Instant::now();
@@ -1185,12 +1768,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("a.wav");
         generate(&tools, &path, &["sine=frequency=440:duration=0.6"], &[]);
-        let src = Source {
-            path,
-            duration: 0.6,
-            video: None,
-            audio: true,
-        };
+        let src = Source::whole(path, 0.6, None, true);
         let mut player =
             Player::start(&tools, &src, 0.2, 0.0, Sink::Null, Arc::new(|| {})).unwrap();
         let begin = Instant::now();
@@ -1209,3 +1787,6 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod chain_tests;

@@ -434,3 +434,35 @@ fn poll_never_blocks_on_a_descendant_holding_the_output_open() {
         assert_eq!(signals_after_reaping(child.id()), []);
     }
 }
+
+/// A stems job's folder under `.exports` holds its lock while the child runs, so the startup
+/// sweep keeps it; the lock goes with the folder. A job whose sopen was killed (Ctrl-C) leaves a
+/// folder and a lock nobody holds: the sweep removes it.
+#[test]
+fn a_running_stems_job_holds_its_lock_and_a_dead_one_is_swept() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cache = tmp.path().join("cache");
+    let exports = crate::cache::exports_root(&cache);
+    // A job left by a killed sopen: its folder, a half-written stem, the lock file.
+    let dead = exports.join("stems-0123abcd");
+    std::fs::create_dir_all(&dead).unwrap();
+    std::fs::write(dead.join("voice.mp3"), b"half").unwrap();
+    std::fs::write(exports.join("stems-0123abcd.lock"), b"").unwrap();
+    let program = fake(tmp.path(), "sleep 60");
+    let child = spawn(&program, &exports);
+    let work = child.work_dir().to_path_buf();
+    let mut lock = work.as_os_str().to_os_string();
+    lock.push(".lock");
+    let lock = PathBuf::from(lock);
+    assert!(lock.exists(), "the running job's lock file");
+    let held = std::fs::OpenOptions::new().write(true).open(&lock).unwrap();
+    assert!(held.try_lock().is_err(), "held by the job");
+    drop(held);
+    assert_eq!(crate::cache::sweep_stale_jobs(&cache), [dead.as_path()]);
+    assert!(!dead.exists() && work.exists());
+    drop(child);
+    assert!(
+        !work.exists() && !lock.exists(),
+        "the lock goes with the folder"
+    );
+}

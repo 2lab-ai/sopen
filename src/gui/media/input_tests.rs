@@ -75,9 +75,10 @@ fn open_noticed(
     let mut fs = LocalFs::new();
     let at = fs.stat(&abs).unwrap();
     let origin = Origin::new(Box::new(fs), None, None, abs, at);
+    let file = MediaFile::new(origin, &tmp.path().join("cache"));
     let mut win = MediaWindow::new(
         media,
-        origin,
+        file,
         tmp.path().join("work"),
         Marks::default(),
         Selection::default(),
@@ -97,7 +98,7 @@ impl Fixture {
     /// Passes until the frame asked for is on screen and the layout has stopped moving.
     fn settle(&mut self) {
         self.drv.until(&mut self.win, 20, |w| {
-            w.tex.is_some() && w.want.is_some() && w.tex_pts == w.want && w.map.is_some()
+            w.tex.is_some() && w.frame_ready() && w.map.is_some()
         });
         let mut stable = 0;
         for _ in 0..30 {
@@ -159,7 +160,7 @@ fn timeline_drag_moves_the_playhead_and_i_o_set_the_markers() {
     );
     fx.settle();
     assert_eq!(
-        fx.win.tex_pts,
+        fx.win.tex_pts(),
         Some(fx.win.marks.t),
         "the frame at the playhead"
     );
@@ -305,7 +306,7 @@ fn export_note_is_shown_whole_on_a_narrow_window_and_the_frame_stays_put() {
     let note =
         "not kept: 1 subtitle stream, 2 data streams, 1 attachment stream, cover art".to_string();
     let mut fx = open_with(path, tmp, 420.0, 560.0, vec![note.clone()]);
-    let row = format!("Export: {}", fx.win.media.notes.join("; "));
+    let row = format!("Save / Export: {}", fx.win.media.notes.join("; "));
     assert!(fx.drv.find_text(&row).is_some(), "shown whole: {row}");
     let quiet = fx.win.map;
     let (a, b) = (fx.at(20.0, 30.0), fx.at(200.0, 150.0));
