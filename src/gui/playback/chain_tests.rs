@@ -295,6 +295,160 @@ fn a_failing_decoder_is_an_error_not_silence() {
     assert!(pcm.is_empty());
 }
 
+/// A decoder that prints megabytes of errors — thousands of lines, then one 3 MB line that
+/// never ends — before failing is read to its end (it never blocks on a full pipe) and the
+/// chain's error is the end of what it printed, a few kilobytes at most.
+#[test]
+fn a_noisy_decoder_s_error_is_its_last_words_bounded() {
+    let tmp = tempfile::tempdir().unwrap();
+    let tools = stand_in(
+        tmp.path(),
+        &format!(
+            "{ONES}; i=0; while [ $i -lt 2000 ]; do echo \"noise $i\" >&2; i=$((i+1)); done; \
+             head -c 3000000 /dev/zero | tr '\\0' x >&2; printf 'the end' >&2; exit 1"
+        ),
+    );
+    let piece = [Piece {
+        start: 0.0,
+        len: 1.0,
+    }];
+    let (pcm, state, _) = decode_all(&tools, &Input::path(tmp.path()), &piece, 48_000, None);
+    let error = state.error().expect("a failure");
+    assert!(
+        error.ends_with("xxxthe end"),
+        "{}",
+        &error[..120.min(error.len())]
+    );
+    assert!(error.len() < 8192, "{} bytes", error.len());
+    assert_eq!(pcm.len(), 1000);
+}
+
+/// `ps`'s state of process `pid` (`Z` for a zombie), or `None` once it is gone.
+fn process_state(pid: &str) -> Option<String> {
+    let out = Command::new("ps")
+        .args(["-o", "stat=", "-p", pid])
+        .output()
+        .unwrap();
+    let state = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!state.is_empty()).then_some(state)
+}
+
+/// However a piece's reading ends while its decoder still runs — the consumer stopped, reading
+/// failed, or the playback was dropped just after the chain took the decoder out of `live` (so
+/// the drop's kill could not reach it) — that decoder is killed and waited for: no ffmpeg left
+/// running, none left a zombie. The stand-in ignores SIGPIPE, as ffmpeg does while it decodes.
+#[test]
+fn a_decoder_is_killed_and_reaped_however_its_piece_ends() {
+    struct Ends<'a> {
+        fed: Fed,
+        stop: &'a AtomicBool,
+        pids: &'a Path,
+    }
+    impl Consumer for Ends<'_> {
+        fn read(&mut self, _: &mut dyn Read, _: &Part, _: &mut dyn FnMut()) -> Fed {
+            // The decoder is up (it wrote its pid) before the read ends.
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !self.pids.exists() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            if matches!(self.fed, Fed::Stopped | Fed::Ended { .. }) {
+                self.stop.store(true, SeqCst);
+            }
+            self.fed.clone()
+        }
+        fn pad(&mut self, _: &Part, _: u64) -> bool {
+            false
+        }
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let pids = tmp.path().join("pid");
+    let tools = stand_in(
+        tmp.path(),
+        &format!(
+            "trap '' PIPE; echo $$ > '{}.tmp'; mv '{0}.tmp' '{0}'; while :; do sleep 0.05; done",
+            pids.display()
+        ),
+    );
+    for fed in [
+        Fed::Stopped,
+        Fed::Failed("the pipe broke".into()),
+        Fed::Ended { given: 0 },
+    ] {
+        let _ = std::fs::remove_file(&pids);
+        let live: Live = Arc::default();
+        let stop = AtomicBool::new(false);
+        let state = ChainState::default();
+        let mut consumer = Ends {
+            fed: fed.clone(),
+            stop: &stop,
+            pids: &pids,
+        };
+        let input = Input::path(tmp.path());
+        let part = Part {
+            start: 0.0,
+            count: Some(48_000),
+        };
+        let start = |p: &Part| audio_cmd(&tools, &input, p, false, 48_000, 2);
+        chain(vec![part], start, &live, &stop, &state, &mut consumer);
+        let pid = std::fs::read_to_string(&pids).unwrap();
+        assert_eq!(
+            process_state(pid.trim()),
+            None,
+            "{fed:?}: the decoder is still there (running, or a zombie)"
+        );
+        assert!(live.lock().unwrap().is_empty(), "{fed:?}");
+    }
+}
+
+/// The boundary receipt runs from the moment the piece before stopped giving output — its
+/// padding too, for a stream that ended short — to the next piece's first output: a long
+/// padding (300 ms here) is not counted as the next decoder's wait.
+#[test]
+fn the_boundary_wait_starts_after_the_padding() {
+    struct SlowPad;
+    impl Consumer for SlowPad {
+        fn read(&mut self, out: &mut dyn Read, _: &Part, first: &mut dyn FnMut()) -> Fed {
+            let mut buf = [0u8; 4096];
+            let mut given = 0u64;
+            loop {
+                match out.read(&mut buf) {
+                    Ok(0) => return Fed::Ended { given },
+                    Ok(n) => {
+                        if given == 0 {
+                            first();
+                        }
+                        given += n as u64 / 8;
+                    }
+                    Err(e) => return Fed::Failed(e.to_string()),
+                }
+            }
+        }
+        fn pad(&mut self, _: &Part, _: u64) -> bool {
+            std::thread::sleep(Duration::from_millis(300));
+            true
+        }
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let tools = stand_in(tmp.path(), &format!("{ONES}; exit 0"));
+    let part = Part {
+        start: 0.0,
+        count: Some(48_000),
+    };
+    let live: Live = Arc::default();
+    let stop = AtomicBool::new(false);
+    let state = ChainState::default();
+    let input = Input::path(tmp.path());
+    let start = |p: &Part| audio_cmd(&tools, &input, p, false, 48_000, 2);
+    chain(vec![part, part], start, &live, &stop, &state, &mut SlowPad);
+    assert_eq!(state.error(), None);
+    let waits = state.waits.lock().unwrap().clone();
+    assert_eq!(waits.len(), 1);
+    assert!(
+        waits[0] < Duration::from_millis(150),
+        "the padding was counted: {waits:?}"
+    );
+}
+
 /// The boundary receipt is taken at a piece's first output, not before it is read: `first`
 /// is called only once the decoder's output has given its first samples (a read that marks
 /// itself done shows the order, whatever the timing).

@@ -172,6 +172,15 @@ impl Drop for JobLock {
     }
 }
 
+/// `path` still names the file `file` is open on (device and inode, the link not followed).
+fn same_file(file: &File, path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    match (file.metadata(), std::fs::symlink_metadata(path)) {
+        (Ok(open), Ok(named)) => open.dev() == named.dev() && open.ino() == named.ino(),
+        _ => false,
+    }
+}
+
 fn lock_of(job: &Path) -> PathBuf {
     let mut name = job.file_name().unwrap_or_default().to_os_string();
     name.push(".lock");
@@ -184,6 +193,12 @@ fn lock_of(job: &Path) -> PathBuf {
 /// is touched: a kept edit or render (a refused or failed save names it) has none. Returns what
 /// was removed.
 pub fn sweep_stale_jobs(cache: &Path) -> Vec<PathBuf> {
+    sweep_with(cache, &mut |_| {})
+}
+
+/// [`sweep_stale_jobs`], calling `between` with each lock file it opened before it locks it
+/// (tests pause the sweep there).
+fn sweep_with(cache: &Path, between: &mut dyn FnMut(&Path)) -> Vec<PathBuf> {
     let mut removed = Vec::new();
     let mut walk = vec![exports_root(cache), edits_root(cache)];
     while let Some(dir) = walk.pop() {
@@ -214,8 +229,15 @@ pub fn sweep_stale_jobs(cache: &Path) -> Vec<PathBuf> {
             let Ok(file) = OpenOptions::new().write(true).open(&path) else {
                 continue;
             };
+            between(&path);
             if file.try_lock().is_err() {
                 continue; // its job is running
+            }
+            // A job that ends removes its lock file before letting it go: a lock got after
+            // that is of a file no longer at this path (the job ended — a kept render — or a
+            // new one took the name). Only the file still there is a dead job's.
+            if !same_file(&file, &path) {
+                continue;
             }
             let gone = if job.is_dir() {
                 std::fs::remove_dir_all(&job)
@@ -657,6 +679,39 @@ mod job_tests {
             assert!(kept.exists(), "{} kept", kept.display());
         }
         assert!(lock_of(&live_work).exists(), "a running job's lock stays");
+    }
+
+    /// A sweep that opened a job's lock and then paused: meanwhile the job ended and kept its
+    /// render (a failed Save names it for the owner: its lock removed, then let go), or a new
+    /// job took a new lock of the same name. The sweep then gets the lock it opened — a file no
+    /// longer at that path — and leaves the job alone.
+    #[test]
+    fn a_sweep_never_removes_a_job_whose_lock_went_while_it_paused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = tmp.path();
+        let edits = edits_path(cache, "box", "/srv/clip.mp4");
+        let kept = edits.with_file_name("clip.render-20261120T000000Z-1a2b.mp4");
+        let again = edits.with_file_name("clip.render-20261120T000000Z-3c4d.mp4");
+        let mut held = Vec::new();
+        for render in [&kept, &again] {
+            held.push(Some(JobLock::take(render).unwrap()));
+            std::fs::write(render, b"the render").unwrap();
+        }
+        let mut retaken = None;
+        let gone = sweep_with(cache, &mut |lock: &Path| {
+            // Between the sweep's open and its lock.
+            if lock == lock_of(&kept) {
+                held[0].take();
+            } else if lock == lock_of(&again) {
+                held[1].take();
+                retaken = Some(JobLock::take(&again).unwrap());
+            }
+        });
+        assert!(gone.is_empty(), "{gone:?}");
+        assert_eq!(std::fs::read(&kept).unwrap(), b"the render", "kept");
+        assert!(!lock_of(&kept).exists());
+        assert!(again.exists() && lock_of(&again).exists(), "running again");
+        drop(retaken);
     }
 }
 

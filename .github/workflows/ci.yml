@@ -51,6 +51,31 @@ jobs:
           HOMEBREW_NO_INSTALL_CLEANUP: "1"
         run: brew install ffmpeg fish
 
+      # Which ffmpeg the tests run against, and how its decoder treats the AAC trims a file
+      # carries: ffmpeg 9 applies an MP4 edit list's end and Matroska's CodecDelay, ffmpeg 8
+      # leaves both to the player (the render tests hold renders to a plain encode by the same
+      # ffmpeg for that reason).
+      - name: ffmpeg version and AAC trims
+        continue-on-error: true
+        run: |
+          ffmpeg -hide_banner -version
+          dir=$(mktemp -d)
+          for ext in m4a mkv; do
+            ffmpeg -hide_banner -loglevel error -f lavfi -i sine=f=440:r=48000 \
+              -af atrim=end_sample=96000 -c:a aac "$dir/a.$ext"
+            bytes=$(ffmpeg -hide_banner -loglevel error -i "$dir/a.$ext" -f s16le -ac 1 - | wc -c)
+            echo "$ext: 96000 samples encoded, $((bytes / 2)) decoded;" \
+              "$(ffprobe -v error -select_streams a:0 -of compact=p=0 \
+                -show_entries stream=start_time,duration_ts,initial_padding "$dir/a.$ext")"
+          done
+          python3 - "$dir/a.m4a" "$dir/a.mkv" <<'EOF'
+          import sys
+          m4a = open(sys.argv[1], "rb").read()
+          at = m4a.find(b"elst")
+          print("m4a edit list:", m4a[at - 4:at + 24].hex())
+          print("mkv CodecDelay:", b"\x56\xaa" in open(sys.argv[2], "rb").read()[:4096])
+          EOF
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 

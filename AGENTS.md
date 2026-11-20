@@ -55,7 +55,10 @@ runners, `sftp-server` on macOS) and sets `SOPEN_REQUIRE_FFMPEG=1`, `SOPEN_REQUI
   and the git panel's actions on a repository, every history rewrite or destructive one backed up first (message
   14, `.prd/03-git-panel.md`). Anything beyond them waits for an owner message.
 - **ffmpeg/ffprobe are external programs**, resolved at runtime (`SOPEN_FFMPEG` / `SOPEN_FFPROBE`, then PATH).
-  Do not link libav*.
+  Do not link libav*. Versions differ in how they *decode* AAC trims a file carries: ffmpeg 9 applies an MP4 edit
+  list's end and Matroska's CodecDelay, ffmpeg 8 (Ubuntu 26.04's, the CI Linux runner's) applies neither — both
+  write the same trims. The render tests therefore hold an AAC render to a plain encode of the same sample count by
+  the same ffmpeg (`pcm_as_plain` in `src/cut/edit_tests.rs`), and read frames with `-fps_mode passthrough`.
 - Tests must not need ssh or a network: the remote layer sits behind a trait with a local-filesystem
   implementation used by tests.
 - Public repo hygiene: no machine names, IP addresses, home-directory paths or session scratch paths in
@@ -86,6 +89,7 @@ prompts on close.
 | `SOPEN_CODE=<path>` | Use this VS Code CLI for text and for the file browser's F4 (a folder itself opens in the browser); an empty value means VS Code is absent. A local setting, not forwarded by `--target`. |
 | `VSCODE_EXTENSIONS=<dir>` | VS Code's own extensions-dir variable; when non-empty sopen looks there (instead of `~/.vscode/extensions`) for Remote - SSH before opening a remote path in VS Code. Tests point it at a temp dir. Not forwarded by `--target`. |
 | `SOPEN_RAISE=0\|wait` | KDE Plasma (spec §3, msg 11): `0` leaves the editor's window where KWin put it (tests/cli.rs sets it, so a test run in a KDE session never moves a real window); `wait` brings it forward in sopen's own process, about 3 s, instead of a detached `sopen --raise-window`, so a test sees every D-Bus call before sopen exits. HOST's own setting: not forwarded by `--target`. |
+| `SOPEN_EDITOR_WAIT=exit` | The editor CLI (VS Code, Zed) is waited for until it exits, however long, instead of about 3 s: a test whose stand-in CLI fails sees the failure even on a loaded machine (`code_failure_does_not_open_zed`). A local setting, not forwarded by `--target`. |
 | `sopen --raise-window code\|zed --raise-caption=<name>` | Hidden, internal: the detached child. It loads one KWin script for the opened `<name>` and runs it once, through `busctl --user` (else `qdbus6`/`qdbus`) on PATH, then unloads it ~3 s later. It prints nothing and always exits 0. Tests run it with a stand-in `busctl` first on PATH. The script's behaviour is tested under node against a stand-in `workspace` with signals (`tests/kwin-script.mjs`). |
 | `SOPEN_TARGET_BIN=<path>` | `--target` runs this sopen binary on HOST (a build not installed there yet) instead of the one on HOST's PATH or in its Homebrew / cargo install paths. A `--target` run carries this and the hooks above, and `SOPEN_LOG`, to HOST; settings naming local paths stay here. |
 | `SOPEN_CONFIG=<file>` | The config file to use instead of `$XDG_CONFIG_HOME/sopen/config.toml` / `~/.config/sopen/config.toml` (tests point it at a temp file, so the owner's default target never forwards a test run). |

@@ -276,7 +276,9 @@ fn encode_path(path: &str) -> String {
 
 /// Spawns `zed <arg>` in its own process group with no stdio, so it outlives sopen and the
 /// terminal's Ctrl-C. Waits briefly: the CLI hands off to the app and exits; a quick non-zero
-/// exit is reported. Returns the command line that was run (for the debug log and receipts).
+/// exit is reported (`SOPEN_EDITOR_WAIT=exit`, tests: waits for the exit however long the CLI
+/// takes, so a loaded machine cannot turn a failure into a success). Returns the command line
+/// that was run (for the debug log and receipts).
 pub fn open(zed: &Path, arg: &OsStr) -> Result<String> {
     open_args(zed, &[arg.to_os_string()])
 }
@@ -294,8 +296,9 @@ pub fn open_args(editor: &Path, args: &[OsString]) -> Result<String> {
         .process_group(0)
         .spawn()
         .with_context(|| format!("cannot start {}", editor.display()))?;
+    let until_exit = std::env::var_os("SOPEN_EDITOR_WAIT").is_some_and(|v| v == "exit");
     let deadline = Instant::now() + Duration::from_secs(3);
-    while Instant::now() < deadline {
+    while until_exit || Instant::now() < deadline {
         if let Some(status) = child.try_wait()? {
             if !status.success() {
                 bail!("{} exited with {status}", editor.display());

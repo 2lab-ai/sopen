@@ -371,7 +371,7 @@ fn a_folder_opens_in_the_browser_not_the_editor() {
     );
     assert!(out.status.success(), "{}", text(&out.stderr));
     // The CLI is detached (and a new script's first run can be slow); give it a moment.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     while !record.exists() && std::time::Instant::now() < deadline {
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
@@ -408,7 +408,7 @@ fn a_folder_without_a_display_opens_in_the_editor() {
         "{}",
         text(&out.stderr)
     );
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     while !record.exists() && std::time::Instant::now() < deadline {
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
@@ -457,7 +457,7 @@ fn code_takes_priority_over_zed_for_text() {
         "{}",
         text(&out.stdout)
     );
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     while !code_record.exists() && std::time::Instant::now() < deadline {
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
@@ -473,6 +473,9 @@ fn code_takes_priority_over_zed_for_text() {
     assert!(!zed_record.exists());
 }
 
+/// VS Code's CLI failing is the error, and Zed is not tried instead. `SOPEN_EDITOR_WAIT=exit`:
+/// the failure is seen however long the CLI takes to start and fail on a loaded machine (the
+/// brief wait once ran out first and the run "succeeded").
 #[test]
 fn code_failure_does_not_open_zed() {
     use std::os::unix::fs::PermissionsExt;
@@ -493,6 +496,7 @@ fn code_failure_does_not_open_zed() {
         &[
             ("SOPEN_CODE", code.to_str().unwrap()),
             ("SOPEN_ZED", zed.to_str().unwrap()),
+            ("SOPEN_EDITOR_WAIT", "exit"),
         ],
     );
     assert_eq!(out.status.code(), Some(1));
@@ -528,8 +532,9 @@ fn text_goes_to_the_editor_command() {
         "{}",
         text(&out.stdout)
     );
-    // The CLI is detached; give it a moment to write.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    // The CLI is detached; give it a moment to write (a new script's first run can take long on a
+    // loaded machine; the wait ends as soon as it has written).
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     let mut seen = String::new();
     while std::time::Instant::now() < deadline {
         seen = std::fs::read_to_string(&record).unwrap_or_default();

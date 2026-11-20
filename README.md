@@ -270,7 +270,7 @@ H.264 + AAC; audio: the source's codec) and uploaded next to the original as
   nothing is written.
 - A save that fails for any reason moves your edited copy aside (`<file>.conflict-<time>`) and
   prints where. Opening the file again never overwrites an unsaved edit.
-- The local copies sopen creates (the cache, image and hex backups, kept edits) are readable by you
+- The local copies sopen creates (the cache, image, hex and media backups, kept edits) are readable by you
   only. A binary file saved with "Save to…" is created new, never over an existing file.
   A second sopen session on a file that is still open in the first gets its own copy, so neither
   overwrites the other's edits.

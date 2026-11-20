@@ -1499,13 +1499,48 @@ pub fn adapt_to_encoders(
     Ok(args)
 }
 
-fn last_line(text: &str) -> String {
+/// The last line of `text` that says something (an error output's last words).
+pub(crate) fn last_line(text: &str) -> String {
     text.lines()
         .rev()
         .find(|l| !l.trim().is_empty())
         .unwrap_or("no error output")
         .trim()
         .to_string()
+}
+
+/// How much of a child's error output is kept: its end, for the error it ends with.
+pub(crate) const STDERR_TAIL: usize = 2048;
+
+/// Reads a child's error output to its end on a thread of its own — all of it, so the child
+/// never blocks on a full pipe — keeping only the last [`STDERR_TAIL`] bytes, however much it
+/// prints (a line that never ends is cut the same way). Joined: that end, as text.
+pub(crate) fn stderr_tail(
+    mut stderr: impl Read + Send + 'static,
+) -> std::thread::JoinHandle<String> {
+    std::thread::spawn(move || {
+        let mut tail: Vec<u8> = Vec::with_capacity(2 * STDERR_TAIL);
+        let mut buf = [0u8; 8192];
+        loop {
+            match stderr.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    tail.extend_from_slice(&buf[..n]);
+                    if tail.len() > 2 * STDERR_TAIL {
+                        tail.drain(..tail.len() - STDERR_TAIL);
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(_) => break,
+            }
+        }
+        let mut from = tail.len().saturating_sub(STDERR_TAIL);
+        // From a character's first byte, not the middle of one.
+        while tail.get(from).is_some_and(|b| b & 0xC0 == 0x80) {
+            from += 1;
+        }
+        String::from_utf8_lossy(&tail[from..]).trim().to_string()
+    })
 }
 
 /// How long a save or export may go without its output advancing before ffmpeg is stopped.
@@ -1686,12 +1721,7 @@ pub fn run_watched(
     // Dies with this run: a sopen killed mid-render (even by SIGKILL) takes its ffmpeg along,
     // instead of leaving it rendering for an hour to a file nobody keeps.
     let _guard = Orphan::guard(&child, &tools.ffmpeg);
-    let mut stderr = child.stderr.take().expect("piped");
-    let errors = std::thread::spawn(move || {
-        let mut text = String::new();
-        let _ = stderr.read_to_string(&mut text);
-        text
-    });
+    let errors = stderr_tail(child.stderr.take().expect("piped"));
     // A small queue: while the callback runs (the export-hold hook sleeps in it), the reader
     // stops and ffmpeg blocks on its progress pipe, as it did when this thread read it.
     let (tx, rx) = sync_channel::<std::io::Result<String>>(16);

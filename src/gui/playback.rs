@@ -66,12 +66,24 @@ fn kill_all(live: &Live) {
     }
 }
 
-/// Takes child `id` out of `live` (to kill it, or to wait for its end).
-fn take_child(live: &Live, id: u32) -> Option<Child> {
+/// A decoder taken out of `live`: killed and waited for when dropped, however its piece ended
+/// (a dropped `Child` is neither — it would run on, or stay a zombie — and the playback's own
+/// kill no longer reaches it once it is out of `live`).
+struct Reaped(Child);
+
+impl Drop for Reaped {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// Takes child `id` out of `live` (to wait for its end, or to kill it).
+fn take_child(live: &Live, id: u32) -> Option<Reaped> {
     let mut list = live.lock().unwrap();
     list.iter()
         .position(|c| c.id() == id)
-        .map(|i| list.swap_remove(i))
+        .map(|i| Reaped(list.swap_remove(i)))
 }
 
 /// A piece of the source to play: `len` seconds from `start` (`len` infinite: to the end).
@@ -150,18 +162,9 @@ pub trait Consumer {
     fn pad(&mut self, part: &Part, given: u64) -> bool;
 }
 
-/// The last lines a decoder printed, for its error (bounded).
+/// The end of what a decoder printed, for its error (read to its end, kept bounded).
 fn tail_of(stderr: Option<std::process::ChildStderr>) -> Option<std::thread::JoinHandle<String>> {
-    let mut stderr = stderr?;
-    Some(std::thread::spawn(move || {
-        let mut text = String::new();
-        let _ = stderr.read_to_string(&mut text);
-        let tail = text.len().saturating_sub(2048);
-        let start = (tail..=text.len())
-            .find(|&i| text.is_char_boundary(i))
-            .unwrap_or(text.len());
-        text[start..].trim().to_string()
-    }))
+    stderr.map(crate::ffmpeg::stderr_tail)
 }
 
 /// Decodes `parts` one after another, each by the ffmpeg `start` makes for it, the next one
@@ -222,16 +225,10 @@ fn chain(
         };
         let fed = consumer.read(&mut out, part, &mut on_first);
         drop(out);
-        let child = take_child(live, id);
-        ended = Some(Instant::now());
+        // Killed and waited for below, whichever way the piece ended.
+        let mut child = take_child(live, id);
         let go_on = match fed {
-            Fed::Done => {
-                if let Some(mut c) = child {
-                    let _ = c.kill();
-                    let _ = c.wait();
-                }
-                true
-            }
+            Fed::Done => true,
             Fed::Stopped => false,
             Fed::Failed(why) => {
                 state.fail(format!("reading the piece at {:.2} s: {why}", part.start));
@@ -240,26 +237,23 @@ fn chain(
             Fed::Ended { .. } if stop.load(SeqCst) => false,
             Fed::Ended { given } => {
                 // Its output ended by itself: how did it end?
-                let status = child.map(|mut c| {
+                let status = child.as_mut().map(|c| {
                     let deadline = Instant::now() + Duration::from_secs(2);
                     loop {
-                        match c.try_wait() {
+                        match c.0.try_wait() {
                             Ok(Some(status)) => break Some(status),
                             Ok(None) if Instant::now() < deadline => {
                                 std::thread::sleep(Duration::from_millis(5));
                             }
-                            _ => {
-                                let _ = c.kill();
-                                let _ = c.wait();
-                                break None;
-                            }
+                            // Still running: killed and waited for as it is dropped below.
+                            _ => break None,
                         }
                     }
                 });
                 match status {
                     Some(Some(s)) if !s.success() => {
                         let said = err.and_then(|h| h.join().ok()).unwrap_or_default();
-                        let last = said.lines().last().unwrap_or("no error output").to_string();
+                        let last = crate::ffmpeg::last_line(&said);
                         state.fail(format!(
                             "ffmpeg stopped decoding the piece at {:.2} s ({s}): {last}",
                             part.start
@@ -271,6 +265,9 @@ fn chain(
                 }
             }
         };
+        drop(child);
+        // The piece has given all it will, its padding too: the next one's wait starts here.
+        ended = Some(Instant::now());
         if !go_on {
             break;
         }

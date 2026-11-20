@@ -103,7 +103,7 @@ its git panel changes repositories, every history rewrite or destructive action 
 | A8 | Developed like llmux | Public repo `2lab-ai/sopen`, MIT; `ci.yml` (macOS + Linux), `preview.yml` (every main push → prerelease + tap bump), `release.yml` (`v*` tag = owner gate); `AGENTS.md` SSOT; `.prd/` spec. |
 | A9 | `sopen SOURCE` opens here; `sopen --target <host> SOURCE` opens it on `<host>` (msg 7) | `sopen <host-a>:/tmp/a.html` opens on the machine it was typed on, as before. `sopen --target <host-b> <host-a>:/tmp/a.html` opens it on `<host-b>`'s screen: the same window or editor, started by `<host-b>`'s own sopen (on macOS sopen's window floats above the others until it is used; the editor opens behind the active app, §4a); exit code is `<host-b>`'s; `could not reach <host-b>` when ssh cannot get there; `sopen is not installed on <host-b> …` (exit 127) when it has no sopen. A file on `<host-b>` itself opens there as a local file; a local file reaches `<host-b>` as `<this machine>:<path>`. |
 | A10 | Default target in sopen's settings (msg 8) | `sopen config target <host-b>` writes `target = "<host-b>"` to the config file (§4a); from then on `sopen SOURCE` opens on `<host-b>`, `--here` opens on this machine anyway, `--target` picks another; `sopen config` shows the file and the target; `sopen config target --unset` removes it. A config sopen cannot read is an error naming the file, never ignored. |
-| A11 | A folder opens in a Total Commander-like program; Enter on a file runs its default viewer there (msg 12) | `sopen host:/dir` opens sopen's file browser (§3a): two panels on the folder, folders first; Tab switches panels, Enter enters a folder, Backspace goes up, a letter jumps to the next name with it; Enter on a file shows it in the same window — text highlighted with line numbers, its lines wrapped (msg 13; W or F2: one row per line), an image in the image window, video/audio in the media window, anything else in the hex window — and Esc returns to the list with the bar where it was; F4 opens the entry in VS Code / Zed (A2's choice). An edited image or hex file is never dropped unasked: leaving asks as its own window does. `--app` still opens a file in a named app; a folder with `--app` / `--hex` is an error, as before. |
+| A11 | A folder opens in a Total Commander-like program; Enter on a file runs its default viewer there (msg 12) | `sopen host:/dir` opens sopen's file browser (§3a): two panels on the folder, folders first; Tab switches panels, Enter enters a folder, Backspace goes up, a letter jumps to the next name with it; Enter on a file shows it in the same window — text highlighted with line numbers, its lines wrapped (msg 13; W or F2: one row per line), an image in the image window, video/audio in the media window, anything else in the hex window — and Esc returns to the list with the bar where it was; F4 opens the entry in VS Code / Zed (A2's choice). An edited image, hex or media file is never dropped unasked: leaving asks as its own window does. `--app` still opens a file in a named app; a folder with `--app` / `--hex` is an error, as before. |
 | A12 | Git panel and browser modes (msg 14) | In a folder inside a git work tree, local or remote, the opposite side shows the git panel: every commit and branch as a graph, commit details and diffs, every Git Graph action and free history editing, each history rewrite or destructive action confirmed and backed up; the browser opens in preview mode (the opposite side previews the file under the bar) and F9 switches to dual-directory mode. Scenarios: 02 §4.5, 03 §11. |
 | A13 | F2 rename, F5 copy, F6 move, the conventional rest (msg 15) | The list's F-key row reads `1Help 2Rename 3View 4Edit 5Copy 6Move 7MkDir 8Delete 9Dual 10Tree` once every slice has landed (until then a slot not built yet is empty, 02 §8); every file-changing key asks first and never overwrites an existing name, locally and over SFTP. Scenarios: 04 §8 (K-R, K-S, K-C, K-M, K-N, K-K, K-D). |
 | A14 | Function keys act as F1…F12 in sopen (msg 15) | Every F-key row is clickable and Cmd/Ctrl+1…0 act as F1…F10 in every window; on macOS the top row sends F-keys while a sopen window is focused and the Mac's setting comes back on blur, quit and crash; Linux and Windows have the fallback only. Scenarios: 04 §8 (K-F). |
@@ -452,9 +452,9 @@ symlink keeps its link). A new file is readable by its owner only (0600); a repl
   unsaved edits" when the copy differs from what sopen recorded, "no record of what was fetched … kept it … in case
   it holds edits" when there is no record.
 - Local copies are the owner's only: cache, edit, backup and export directories are created 0700; fetched copies,
-  staged and kept image and hex edits, backups and edits moved aside are 0600. A staged or kept image or hex edit gets a new name
+  staged and kept image, hex and media edits, backups and edits moved aside are 0600. A staged or kept image, hex or media edit gets a new name
   (`<stem>.<tag>-<UTC stamp>-<random>.<ext>`), created exclusively — never over or through an existing file.
-- The cache's fixed roots are dot-named — `<cache>/.backup`, `<cache>/.edits` (staged and kept image and hex edits),
+- The cache's fixed roots are dot-named — `<cache>/.backup`, `<cache>/.edits` (staged and kept image, hex and media edits),
   `<cache>/.exports` (local exports before they are published), `<cache>/.sessions`, `<cache>/.meta` — and a host
   label never starts with `.`, so no mirrored host lands in one (a host named `backup` is `<cache>/backup/…`, plain
   cache). Roots an older build made without the dot are just cache: never read or written.
@@ -669,11 +669,18 @@ once the primary button is up, and take rows off the grid's bottom.
   is: a stream that starts later than the cut keeps its offset (silence first, the first picture held). A decoder
   that ends early by itself is padded (silence in blocks of at most 8192 samples, the last picture held), never
   after a stop; one that cannot start, whose output cannot be read or that exits with an error ends playback with
-  the reason on the status line. Measured 2026-11-20 (release build, null sink; each wait taken at the piece's first
-  output): 64×64 at 25 fps — video 0.02–0.3 ms, audio 1.1–1.5 ms; 1080p long-GOP (keyframes 10 s apart, cuts 8–9 s
-  past one, decoded 1280×720) — video 1.6–3.0 ms, audio 1.6–2.5 ms; against ~240 ms of queued frames; no frame
-  dropped. Paused, the frame at the playhead is the source frame the timeline maps it to — at most the picture's last
-  frame (past it, a longer sound track, that frame holds); the last decoded frames are kept (64 MB), so the frame an
+  the reason on the status line. A decoder taken out of the running list to be waited for is killed and reaped
+  however its piece ended (stopped, unreadable, short); its error output is read to the end and only its last 2 KB
+  kept. Measured 2026-11-20 (release build, null sink; each wait from the end of the piece before — its padding
+  too — to the piece's first output): 64×64 at 25 fps — video 0.02–1.8 ms, audio 0.01–1.5 ms; 1080p long-GOP
+  (keyframes 10 s apart, cuts 8–9 s past one, decoded 1280×720) — video 1.1–4.9 ms, audio 0.02–1.6 ms; against
+  ~240 ms of queued frames; no frame dropped. Short pieces late in a GOP at the start of a play (0.6 s then 0.4 s,
+  1080p) wait up to ~150 ms for sound: the first second of sound is read far faster than it plays (it fills the
+  1 s queue), so the next decoder has had that long, not the piece's length, to seek; the queue covers it (no
+  underrun). Paused, the frame at the playhead is the source frame the timeline maps it to — at most the picture's last
+  frame (past it, a longer sound track, that frame holds; a last frame that starts before its slot is the latest
+  picture of the two seconds before the slot's end, read no further; anywhere else a frame that cannot be decoded
+  is an error, never another picture); the last decoded frames are kept (64 MB), so the frame an
   edit brings under the playhead is usually there at once (measured 1–2 ms; a frame not kept: one decode, 70–95 ms).
   An edit while playing restarts playback at the playhead. On video, timeline frame slot `k` is the source frame at
   `origin + k / fps`, `origin` the picture's offset within a frame period from the file's start (a transport stream
@@ -681,7 +688,7 @@ once the primary button is up, and take rows off the grid's bottom.
 - Save (Cmd/Ctrl+S, F5): refused before anything is backed up or rendered when the file changed since it was opened —
   by the overwrite's own rule: type, size, modification time and (up to 256 MiB) content, against the fetch's hash
   or, for a file opened in place, the hash of its bytes taken on a worker when the window opened (a render can take
-  minutes) — or when the server cannot replace a file in one step; else the original is copied to the
+  minutes; a hash that failed refuses every Save until the file is opened again) — or when the server cannot replace a file in one step; else the original is copied to the
   local backup (§5, once per session, path printed), the edit is rendered into a staged file under `.edits`, and
   that file is written over the original by the conflict-checked overwrite (§5). Then the window plays the saved
   file, unedited (the clipboard and the history were ranges of the old one); a remote file plays from the staged
@@ -693,7 +700,8 @@ once the primary button is up, and take rows off the grid's bottom.
 - A render's work folder (`.exports/<random>`) and its staged file (`<stem>.render-…` in `.edits`) each have a
   `<name>.lock` held while the job runs; a sopen killed meanwhile leaves them to the next media window's or `sopen
   cut`'s start, which removes every one whose lock nobody holds (a kept render — a failed save names it — has no
-  lock and stays). The render's ffmpeg dies with sopen, SIGKILL included: a small `sh` in a process group of its own
+  lock and stays). A job removes its lock file before letting go of it, and the sweep removes a job only while the
+  lock it got is still the file at that path, so a job that ends while the sweep looks keeps what it kept. The render's ffmpeg dies with sopen, SIGKILL included: a small `sh` in a process group of its own
   reads a pipe only sopen writes, and when the pipe closes it kills that ffmpeg if its command line still names the
   program.
 - Render (Save and Export): exact for any number of pieces without decoding the source once per piece — pieces that

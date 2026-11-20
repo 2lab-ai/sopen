@@ -128,6 +128,15 @@ impl MediaFile {
             .is_none_or(|b| b.result.lock().unwrap().is_some())
     }
 
+    /// As if hashing the file as opened had failed for `why` (tests: a failure that leaves the
+    /// file's size and time as they were, such as a read error).
+    #[cfg(test)]
+    pub fn fail_baseline(&mut self, why: &str) {
+        let baseline = Baseline::default();
+        *baseline.result.lock().unwrap() = Some(Err(why.to_string()));
+        self.baseline = Some(Arc::new(baseline));
+    }
+
     /// The staged render a saved remote file plays from, if any (tests).
     #[cfg(test)]
     pub fn rendered_path(&self) -> Option<&Path> {
@@ -135,19 +144,23 @@ impl MediaFile {
     }
 
     /// Waits for the hash of the file as opened and makes it the baseline; why not, when the
-    /// file is no longer the one opened (or cannot be read).
+    /// file is no longer the one opened (or cannot be read). A failure stays: every later Save
+    /// is refused the same way until the file is opened again — none falls back to comparing
+    /// size and time alone.
     fn take_baseline(&mut self) -> Option<String> {
-        let baseline = self.baseline.take()?;
+        let baseline = self.baseline.clone()?;
         let mut slot = baseline.result.lock().unwrap();
         while slot.is_none() {
             slot = baseline.ready.wait(slot).unwrap();
         }
-        match slot.take().expect("checked") {
+        match slot.as_ref().expect("checked") {
             Ok(hash) => {
-                self.origin.at.sha256 = hash;
+                self.origin.at.sha256 = *hash;
+                drop(slot);
+                self.baseline = None;
                 None
             }
-            Err(why) => Some(why),
+            Err(why) => Some(why.clone()),
         }
     }
 

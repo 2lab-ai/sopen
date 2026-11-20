@@ -154,26 +154,14 @@ pub fn start(
             Err(e) => failed(format!("cannot run {}: {e}", tools.ffmpeg.display()), None),
             Ok(mut child) => {
                 let mut stdout = child.stdout.take().expect("piped");
-                let mut stderr = child.stderr.take().expect("piped");
-                let said = std::thread::spawn(move || {
-                    let mut text = String::new();
-                    let _ = stderr.read_to_string(&mut text);
-                    text
-                });
+                let said = crate::ffmpeg::stderr_tail(child.stderr.take().expect("piped"));
                 let read = read_peaks(&mut stdout, lanes, duration, &mut |peaks| {
                     *slot.lock().unwrap() = Some(peaks);
                     wake();
                 });
                 drop(stdout);
                 let status = child.wait();
-                let said = said.join().unwrap_or_default();
-                let last_line = said
-                    .lines()
-                    .rev()
-                    .find(|l| !l.trim().is_empty())
-                    .unwrap_or("no error output")
-                    .trim()
-                    .to_string();
+                let last_line = crate::ffmpeg::last_line(&said.join().unwrap_or_default());
                 match (read, status) {
                     (Err(e), _) => failed(format!("reading the decoded sound: {e}"), None),
                     (Ok(peaks), Ok(s)) if s.success() => Source {
@@ -374,6 +362,49 @@ mod tests {
             ffprobe: tmp.path().join("missing"),
         });
         assert!(gone.error.unwrap().contains("cannot run"));
+    }
+
+    /// A decoder that prints megabytes of errors — thousands of lines, then one 3 MB line that
+    /// never ends — is read to its end and its failure says the end of what it printed, a few
+    /// kilobytes at most.
+    #[test]
+    fn a_noisy_decoder_s_failure_says_its_last_words_bounded() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let fake = tmp.path().join("ffmpeg");
+        std::fs::write(
+            &fake,
+            "#!/bin/sh\n[ \"$1\" = -version ] && exit 0\nhead -c 8000 /dev/zero\n\
+             i=0; while [ $i -lt 2000 ]; do echo \"noise $i\" >&2; i=$((i+1)); done\n\
+             head -c 3000000 /dev/zero | tr '\\0' x >&2\nprintf 'the end' >&2\nexit 1\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        crate::testutil::run_fresh(std::process::Command::new(&fake).arg("-version"));
+        let tools = Tools {
+            ffmpeg: fake.clone(),
+            ffprobe: fake,
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        let shared = start(&tools, &Input::path(tmp.path()), 1, 1.0, move || {
+            let _ = tx.send(());
+        });
+        let got = loop {
+            rx.recv_timeout(std::time::Duration::from_secs(20))
+                .expect("the decode ends");
+            if let Some(s) = shared.lock().unwrap().clone() {
+                if s.complete || s.error.is_some() {
+                    break s;
+                }
+            }
+        };
+        let error = got.error.unwrap();
+        assert!(
+            error.ends_with("xxxthe end"),
+            "{}",
+            &error[..80.min(error.len())]
+        );
+        assert!(error.len() < 8192, "{} bytes", error.len());
     }
 
     /// After a cut and a paste the columns show the source in the edit's order — from the same

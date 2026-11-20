@@ -290,6 +290,7 @@ impl Scrubber {
         let (rq, res, q, store) = (req.clone(), result.clone(), quit.clone(), cache.clone());
         let (tools, path, fps) = (media.tools.clone(), media.input.clone(), media.fps.max(1.0));
         let origin = media.origin();
+        let last_frame = media.last_frame();
         let keep = (FRAME_CACHE_BYTES / (w * h * 4) as usize).max(2);
         std::thread::spawn(move || loop {
             let (t, key) = {
@@ -304,19 +305,38 @@ impl Scrubber {
             };
             // Half a frame early, as Save renders a cut: the frame shown is frame `key` (keys
             // are clamped to the picture's last frame where they are made, [`MediaWindow::
-            // frame_at`]). If nothing comes from there (a last frame stamped a little early),
-            // the last picture of the two seconds before it is the one.
+            // frame_at`]). If nothing comes from there and the slot is past the picture's last
+            // start (the last frame, or any slot with no picture after it: a last frame stamped
+            // a little early, or held long), the latest picture of the two seconds before the
+            // end of its slot is the one — as the frame grid puts there. Anywhere else, nothing
+            // is no frame.
             let at = (origin + key as f64 / fps - 0.5 / fps).max(0.0);
+            let slot_end = origin + (key as f64 + 0.5) / fps;
             let grab = |from: f64, one: bool| -> Result<Vec<u8>, String> {
                 let mut cmd = std::process::Command::new(&tools.ffmpeg);
                 cmd.args(["-nostdin", "-hide_banner", "-loglevel", "error", "-ss"])
-                    .arg(format!("{from:.6}"))
-                    .arg("-i")
-                    .arg(path.arg())
-                    .args(["-an", "-sn", "-vf"])
-                    .arg(format!("scale={w}:{h},format=rgba"));
+                    .arg(format!("{from:.6}"));
+                if !one {
+                    // Read only up to the end of the slot, not to the end of the file.
+                    cmd.arg("-t").arg(format!("{:.6}", slot_end - from));
+                }
+                cmd.arg("-i").arg(path.arg()).args(["-an", "-sn", "-vf"]);
                 if one {
-                    cmd.args(["-frames:v", "1"]);
+                    cmd.arg(format!("scale={w}:{h},format=rgba"))
+                        .args(["-frames:v", "1"]);
+                } else {
+                    // Only pictures from inside the slot's two seconds (times from `from`), each
+                    // once, on the file's own clock (no two collide on a coarser one).
+                    cmd.arg(format!(
+                        "select='lt(t\\,{:.6})',scale={w}:{h},format=rgba",
+                        slot_end - from
+                    ))
+                    .args([
+                        "-fps_mode",
+                        "passthrough",
+                        "-enc_time_base:v",
+                        "demux",
+                    ]);
                 }
                 cmd.args(["-f", "rawvideo", "-"])
                     .stdin(Stdio::null())
@@ -342,7 +362,14 @@ impl Scrubber {
                 last.ok_or_else(|| format!("no frame at {}", clock_text(key as f64 / fps)))
             };
             let frame = {
-                let read = grab(at, true).or_else(|_| grab((at - 2.0).max(0.0), false));
+                let read = grab(at, true).or_else(|e| {
+                    // Past the picture's last start only if nothing comes after the slot
+                    // either; a picture there makes this a frame that failed to decode.
+                    if key < last_frame && grab(slot_end, true).is_ok() {
+                        return Err(e);
+                    }
+                    grab((at - 2.0).max(0.0), false)
+                });
                 {
                     read.map(|rgba| {
                         let rgba = Arc::new(rgba);

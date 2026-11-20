@@ -72,6 +72,67 @@ fn pcm(tools: &Tools, file: &Path, track: usize) -> (u32, Vec<Vec<f32>>) {
     (rate, lanes)
 }
 
+/// [`pcm`] of a track that should hold exactly `n` samples, held to a plain `n`-sample encode by
+/// this ffmpeg in the same codec and container: it must decode exactly as long as that file
+/// does, and comes back as the `n` samples the container declares. A decoder that leaves the
+/// container's trims to the player gives more: ffmpeg 8 decodes Matroska AAC with its 1024
+/// priming samples (CodecDelay) and MP4 AAC to the end of its last frame (the edit list's end);
+/// ffmpeg 9 applies both, and the plain file decodes to exactly `n`. The trims are written into
+/// the file the same way by either.
+fn pcm_as_plain(tools: &Tools, file: &Path, track: usize, n: usize) -> (u32, Vec<Vec<f32>>) {
+    let (rate, lanes) = pcm(tools, file, track);
+    let stream = format!("a:{track}");
+    let codec = probe_lines(tools, file, &stream, "stream=codec_name").remove(0);
+    let encoder = match codec.as_str() {
+        "mp3" => "libmp3lame",
+        other => other,
+    };
+    let ext = file.extension().unwrap().to_str().unwrap();
+    let plain = file.with_file_name(format!("plain-{n}-{track}.{ext}"));
+    let channels = lanes.len().to_string();
+    ff(
+        tools,
+        &[
+            "-f",
+            "lavfi",
+            "-i",
+            &format!("sine=f=1000:r={rate}"),
+            "-af",
+            &format!("atrim=end_sample={n}"),
+            "-ac",
+            &channels,
+            "-c:a",
+            encoder,
+            plain.to_str().unwrap(),
+        ],
+    );
+    let (_, reference) = pcm(tools, &plain, 0);
+    assert_eq!(
+        lanes[0].len(),
+        reference[0].len(),
+        "{}: track {track} decodes as long as a plain {n}-sample {codec} .{ext} \
+         (this ffmpeg decodes that to {} samples)",
+        file.display(),
+        reference[0].len()
+    );
+    // What the decoder gives before the stream's time zero: the codec's priming, where the
+    // container's start trim is not applied.
+    let lead: usize = probe_lines(tools, &plain, "a:0", "frame=pts_time,nb_samples")
+        .iter()
+        .filter_map(|l| {
+            let mut f = l.split(',');
+            let pts: f64 = f.next()?.parse().ok()?;
+            let samples: usize = f.next()?.parse().ok()?;
+            (pts < 0.0).then_some(samples)
+        })
+        .sum();
+    let lanes = lanes
+        .into_iter()
+        .map(|l| l[lead..lead + n].to_vec())
+        .collect();
+    (rate, lanes)
+}
+
 /// The tones of one channel, in order, as `(Hz, seconds)`: the frequency from the spacing of
 /// zero crossings (snapped to the nearest of the fixture's), each stretch measured between the
 /// midpoints of the crossings where the frequency changes.
@@ -216,13 +277,12 @@ fn audio_cut_and_paste_keeps_order_length_and_both_channels() {
             ),
         );
         let out = render(&tools, &src, &format!("out-{name}"), &spec);
-        let (r, lanes) = pcm(&tools, &out, 0);
+        // The timeline's 4 s to the sample: as long as a plain 4 s encode decodes.
+        let (r, lanes) = pcm_as_plain(&tools, &out, 0, s(4.0) as usize);
         assert_eq!(lanes.len(), 2, "{name}: still stereo");
         let want = [(880, 1.0), (440, 1.0), (1320, 1.0), (1760, 1.0)];
         assert_tones(&segments(r, &lanes[0]), &want, tolerance, name);
         assert_tones(&segments(r, &lanes[1]), &[(660, 4.0)], tolerance, name);
-        let total = lanes[0].len() as f64 / f64::from(r);
-        assert!((total - 4.0).abs() <= tolerance, "{name}: {total} s");
     }
 }
 
@@ -298,13 +358,23 @@ fn eval(fps: &str) -> f64 {
     }
 }
 
-/// The frame numbers a file shows, read from each frame's luma.
+/// The frame numbers a file shows, read from each frame's luma — every frame it holds, once
+/// (`passthrough`: raw video output would otherwise be put on a constant-rate grid from the
+/// file's start, repeating the first frame of a picture that starts after the sound).
 pub(crate) fn frame_numbers(tools: &Tools, file: &Path) -> Vec<i64> {
     let out = Command::new(&tools.ffmpeg)
         .args(["-hide_banner", "-loglevel", "error", "-nostdin", "-i"])
         .arg(file)
         .args([
-            "-map", "0:v:0", "-f", "rawvideo", "-pix_fmt", "yuv420p", "-",
+            "-map",
+            "0:v:0",
+            "-fps_mode",
+            "passthrough",
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "yuv420p",
+            "-",
         ])
         .output()
         .unwrap();
@@ -317,6 +387,40 @@ pub(crate) fn frame_numbers(tools: &Tools, file: &Path) -> Vec<i64> {
             ((y - 16.0) / 2.0).round() as i64
         })
         .collect()
+}
+
+/// `frame_numbers` reads the frames a file holds: where its picture starts more than half a
+/// frame after its sound (ffmpeg 8 decodes Matroska AAC that way: its CodecDelay moves the sound
+/// 21 ms earlier), the frames are not put back on a constant-rate grid, which repeated the first.
+#[test]
+fn frame_numbers_reads_the_frames_a_file_holds() {
+    let Some(tools) = tools_or_skip() else { return };
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("late.mkv");
+    ff(
+        &tools,
+        &[
+            "-itsoffset",
+            "0.03",
+            "-f",
+            "lavfi",
+            "-i",
+            "nullsrc=s=64x64:r=25:d=1,geq=lum='16+2*N':cb=128:cr=128,format=yuv420p",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=f=1000:r=48000:d=1",
+            "-c:v",
+            "libx264",
+            "-crf",
+            "10",
+            "-c:a",
+            "pcm_s16le",
+            src.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(count_frames(&tools, &src), 25);
+    assert_eq!(frame_numbers(&tools, &src), (0..25).collect::<Vec<_>>());
 }
 
 /// A cut and paste on video, at 25 and at 30000/1001 fps: the output shows exactly the frames
@@ -344,14 +448,9 @@ fn video_cut_and_paste_is_frame_exact_and_the_sound_follows() {
         let out = render(&tools, &src, &format!("out-{name}"), &spec);
         let want: Vec<i64> = ranges.iter().flat_map(|&(a, b)| a..b).collect();
         assert_eq!(frame_numbers(&tools, &out), want, "{fps}: frames in order");
-        let (r, lanes) = pcm(&tools, &out, 0);
-        let secs = |f: i64| f as f64 / rate;
-        let total = lanes[0].len() as f64 / f64::from(r);
-        assert!(
-            (total - secs(n as i64)).abs() <= 1.0 / rate,
-            "{fps}: sound {total} s for {} s of picture",
-            secs(n as i64)
-        );
+        // The sound is as long as the picture, to the sample (48 kHz).
+        let samples = (f64::from(n) / rate * 48_000.0).round() as usize;
+        let (r, lanes) = pcm_as_plain(&tools, &out, 0, samples);
         // Each second's tone moves with its frames: at 25 fps the pieces are whole seconds
         // (each tone lasts a second); at 29.97 they straddle the seconds by a frame or two,
         // so only the order is checked there.
@@ -427,15 +526,12 @@ fn every_audio_track_is_kept_each_at_its_rate() {
         "the mono track became stereo; the stereo one stayed"
     );
     for (track, source) in probe.tracks.iter().enumerate().take(2) {
-        let (r, lanes) = pcm(&tools, &out, track);
-        assert_eq!(r, source.rate.unwrap(), "track {track} rate");
-        // AAC in Matroska carries no end trim: the last 1024-sample frame may decode whole.
-        let secs = lanes[0].len() as f64 / f64::from(r);
-        assert!(
-            (secs - 2.0).abs() < 1024.0 / f64::from(r),
-            "track {track}: {secs} s"
-        );
-        // The cut between the pieces is exact; the end may run on by the AAC frame above.
+        // Two seconds at the track's own rate. AAC in Matroska carries no end trim: a plain
+        // 2 s file's last 1024-sample frame decodes whole too, and so must this one.
+        let rate = source.rate.unwrap();
+        let (r, lanes) = pcm_as_plain(&tools, &out, track, 2 * rate as usize);
+        assert_eq!(r, rate, "track {track} rate");
+        // The cut between the pieces is exact.
         let tones = segments(r, &lanes[0]);
         let hz: Vec<u32> = tones.iter().map(|t| t.0).collect();
         assert_eq!(hz, [1320, 440], "track {track}: {tones:?}");
@@ -595,6 +691,37 @@ fn a_stuck_ffmpeg_is_stopped_by_the_watchdog() {
     let text = format!("{err:#}");
     assert!(text.contains("made no progress for 0.3 s"), "{text}");
     assert!(text.ends_with("and was stopped"), "{text}");
+}
+
+/// A render whose ffmpeg prints megabytes of errors — thousands of lines, then one 3 MB line
+/// that never ends — is read to its end and fails saying the end of what it printed, a few
+/// kilobytes at most.
+#[test]
+fn a_noisy_render_fails_with_its_last_words_bounded() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let fake = tmp.path().join("ffmpeg");
+    std::fs::write(
+        &fake,
+        "#!/bin/sh\n[ \"$1\" = -version ] && exit 0\n\
+         i=0; while [ $i -lt 2000 ]; do echo \"noise $i\" >&2; i=$((i+1)); done\n\
+         head -c 3000000 /dev/zero | tr '\\0' x >&2\nprintf 'the end' >&2\nexit 1\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let tools = Tools {
+        ffmpeg: fake.clone(),
+        ffprobe: fake,
+    };
+    crate::testutil::run_fresh(Command::new(&tools.ffmpeg).arg("-version"));
+    let err = ffmpeg::run_export(&tools, &["out.mp4".into()], 4.0, &mut |_| {}).unwrap_err();
+    let text = format!("{err:#}");
+    assert!(
+        text.ends_with("xxxthe end"),
+        "{}",
+        &text[..80.min(text.len())]
+    );
+    assert!(text.len() < 8192, "{} bytes", text.len());
 }
 
 /// The window's Export with edits publishes a new sibling named by the timeline's In/Out, the
@@ -806,16 +933,18 @@ fn a_long_filter_graph_is_read_from_a_file() {
 }
 
 /// Times (seconds) where the first channel of `file`'s track `track` goes from silence to a
-/// burst (|x| > 0.3 after 10 ms below it).
+/// burst (|x| > 0.3 after 10 ms below it), timed from the track's first decoded frame (as
+/// [`burst_offsets`] does).
 fn bursts(tools: &Tools, file: &Path, track: usize) -> (Vec<f64>, f64) {
     let (rate, lanes) = pcm(tools, file, track);
+    let start = probe_list(tools, file, &format!("a:{track}"), "frame=pts_time")[0];
     let x = &lanes[0];
     let quiet = (rate / 100) as usize;
     let on: Vec<f64> = (1..x.len())
         .filter(|&i| {
             x[i].abs() > 0.3 && x[i.saturating_sub(quiet)..i].iter().all(|v| v.abs() < 0.3)
         })
-        .map(|i| i as f64 / f64::from(rate))
+        .map(|i| start + i as f64 / f64::from(rate))
         .collect();
     (on, x.len() as f64 / f64::from(rate))
 }
@@ -917,12 +1046,11 @@ fn one_run_and_passes_render_the_same_frames_and_samples() {
     assert_eq!(frame_numbers(&tools, &one), frame_numbers(&tools, &passes));
     let want: Vec<i64> = ranges.iter().flat_map(|&(a, b)| a..b).collect();
     assert_eq!(frame_numbers(&tools, &one), want);
-    let (_, a) = pcm(&tools, &one, 0);
-    let (_, b) = pcm(&tools, &passes, 0);
+    // Both the timeline's samples (as long as a plain encode of that many decodes).
     let frames: i64 = ranges.iter().map(|(a, b)| b - a).sum();
     let samples = (frames as f64 / fps * 48_000.0).round() as usize;
-    assert_eq!(a[0].len(), samples, "one run: the timeline's samples");
-    assert_eq!(b[0].len(), samples, "passes: the timeline's samples");
+    let (_, a) = pcm_as_plain(&tools, &one, 0, samples);
+    let (_, b) = pcm_as_plain(&tools, &passes, 0, samples);
     assert!(a == b, "the same sound, sample for sample");
 }
 
@@ -1064,10 +1192,9 @@ fn an_aac_cut_is_where_it_was_in_the_source() {
         &mut |_| {},
     )
     .unwrap();
-    let (r, cut) = pcm(&tools, &tmp.path().join(&published.name), 0);
-    let (_, full) = pcm(&tools, &src, 0);
-    let secs = cut[0].len() as f64 / f64::from(r);
-    assert!((secs - 2.0).abs() < 0.001, "{secs} s");
+    // 2 s and 4 s to the sample, as far as this ffmpeg decodes AAC in MP4.
+    let (_, cut) = pcm_as_plain(&tools, &tmp.path().join(&published.name), 0, 88_200);
+    let (_, full) = pcm_as_plain(&tools, &src, 0, 176_400);
     let (lag, worst) = best_lag(&full[0], &cut[0], 44_100, 2_500);
     assert_eq!(
         lag, 0,
@@ -1123,8 +1250,8 @@ pub(crate) fn offset_fixture(tools: &Tools, dst: &Path, video_late: f64, audio_l
     );
 }
 
-/// `ffprobe` numbers, one per line of `entries` for `stream`.
-fn probe_list(tools: &Tools, file: &Path, stream: &str, entries: &str) -> Vec<f64> {
+/// `ffprobe`'s lines (comma-separated fields) of `entries` for `stream`.
+fn probe_lines(tools: &Tools, file: &Path, stream: &str, entries: &str) -> Vec<String> {
     let out = Command::new(&tools.ffprobe)
         .args([
             "-v",
@@ -1140,18 +1267,28 @@ fn probe_list(tools: &Tools, file: &Path, stream: &str, entries: &str) -> Vec<f6
         .unwrap();
     String::from_utf8_lossy(&out.stdout)
         .lines()
-        .filter_map(|l| l.trim().trim_end_matches(',').parse().ok())
+        .map(|l| l.trim().trim_end_matches(',').to_string())
+        .collect()
+}
+
+/// `ffprobe` numbers, one per line of `entries` for `stream`.
+fn probe_list(tools: &Tools, file: &Path, stream: &str, entries: &str) -> Vec<f64> {
+    probe_lines(tools, file, stream, entries)
+        .iter()
+        .filter_map(|l| l.parse().ok())
         .collect()
 }
 
 /// Each burst's time against the picture, in the file's own clock (each stream's timestamps,
 /// so a container that starts its streams apart is measured as it plays): `(source second,
-/// ms the burst comes after the frame showing that second)`.
+/// ms the burst comes after the frame showing that second)`. The sound's samples are timed from
+/// its first decoded frame, so priming a decoder leaves in (not trimmed) sits before the
+/// stream's start, where the container puts it.
 fn burst_offsets(tools: &Tools, file: &Path) -> Vec<(i64, f64)> {
     let pts = probe_list(tools, file, "v:0", "frame=pts_time");
     let numbers = frame_numbers(tools, file);
     assert_eq!(pts.len(), numbers.len(), "{}", file.display());
-    let start = probe_list(tools, file, "a:0", "stream=start_time")[0];
+    let start = probe_list(tools, file, "a:0", "frame=pts_time")[0];
     let (rate, lanes) = pcm(tools, file, 0);
     let x = &lanes[0];
     let quiet = (rate / 5) as usize;

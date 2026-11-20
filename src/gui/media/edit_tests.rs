@@ -936,6 +936,55 @@ fn save_refuses_a_same_size_same_time_change_of_content() {
     assert!(fx.win.unsaved());
 }
 
+/// The bytes as opened could not be hashed (a read error, the file's size and time as they
+/// were): every Save is refused for it, not only the first — a second one did not fall back to
+/// comparing size and time alone, and wrote over a change those do not show.
+#[test]
+fn a_failed_hash_of_the_file_as_opened_refuses_every_save() {
+    let Some(mut fx) = audio(true) else { return };
+    fx.drag(0.25, 0.5);
+    fx.key(Key::Delete, Modifiers::NONE);
+    fx.drv
+        .until(&mut fx.win, 20, |w| w.file.lock().unwrap().baseline_ready());
+    fx.win
+        .file
+        .lock()
+        .unwrap()
+        .fail_baseline("cannot read it (Input/output error)");
+    // A change of content that leaves size and time as they were.
+    let meta = std::fs::metadata(&fx.path).unwrap();
+    let mut bytes = std::fs::read(&fx.path).unwrap();
+    let mid = bytes.len() / 2;
+    bytes[mid] ^= 0x55;
+    std::fs::write(&fx.path, &bytes).unwrap();
+    let file = std::fs::File::options().write(true).open(&fx.path).unwrap();
+    file.set_modified(meta.modified().unwrap()).unwrap();
+    drop(file);
+    for attempt in ["first", "second"] {
+        fx.key(Key::S, command(false));
+        wait_save_only(&mut fx);
+        assert_eq!(
+            fx.win.status.text, "not saved: the file changed",
+            "{attempt} Save"
+        );
+        assert!(
+            fx.win
+                .notices
+                .iter()
+                .any(|n| n.contains("cannot read it (Input/output error); not saved")),
+            "{attempt} Save says why: {:?}",
+            fx.win.notices
+        );
+    }
+    assert_eq!(
+        std::fs::read(&fx.path).unwrap(),
+        bytes,
+        "never written over"
+    );
+    assert_eq!(fx.spawned().render, 0, "nothing rendered");
+    assert!(fx.win.unsaved());
+}
+
 /// In's and Out's labels never cover each other or leave the timeline, however narrow the
 /// selection and wherever it is: in the middle, at the right end, at the left end — on the
 /// video window's short timeline too.
@@ -977,5 +1026,124 @@ fn in_and_out_labels_never_meet() {
                 "{a}..{b}: {r:?} out of {timeline:?}"
             );
         }
+    }
+}
+
+/// A paused frame whose decode finds nothing inside the picture is a failure — not the file's
+/// last picture kept under the frame asked for (the fallback for a last frame stamped a little
+/// early once ran after any failure and read to the end of the file). The stand-in's one-frame
+/// decode at the frame's slot gives nothing, one after it a picture (there is picture after the
+/// slot); a decode without a frame limit gives pictures (bytes of `x`).
+#[test]
+fn a_failing_seek_inside_the_picture_is_no_frame_not_the_last_one() {
+    use std::os::unix::fs::PermissionsExt;
+    let Some(fx) = video() else { return };
+    let (w, h) = fx.win.media.decode_size().unwrap();
+    let key = 40;
+    let at = fx.win.media.origin() + (key as f64 - 0.5) / fx.win.media.fps;
+    let stub = fx.tmp.path().join("ffmpeg");
+    std::fs::write(
+        &stub,
+        format!(
+            "#!/bin/sh\n[ \"$1\" = -version ] && exit 0\n\
+             [ \"$6\" = {at:.6} ] && exit 0\n\
+             for a in \"$@\"; do [ \"$a\" = -frames:v ] && exec head -c {one} /dev/zero; done\n\
+             head -c {} /dev/zero | tr '\\0' x\n",
+            3 * w * h * 4,
+            one = w * h * 4
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+    crate::testutil::run_fresh(std::process::Command::new(&stub).arg("-version"));
+    let mut media = (*fx.win.media).clone();
+    media.tools = Tools {
+        ffmpeg: stub.clone(),
+        ffprobe: stub,
+    };
+    let scrub = Scrubber::start(&media, fx.drv.ctx.clone()).unwrap();
+    assert!(key < media.last_frame());
+    scrub.request(1.6, key);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let got = loop {
+        if let Some(r) = scrub.result.lock().unwrap().take() {
+            break r;
+        }
+        assert!(std::time::Instant::now() < deadline, "no answer");
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    };
+    match got {
+        Ok(f) => panic!("frame {} shows a picture of {:#x}", f.key, f.rgba[0]),
+        Err(e) => assert!(e.starts_with("no frame at "), "{e}"),
+    }
+    assert!(
+        scrub.cache.lock().unwrap().iter().all(|(k, _)| *k != key),
+        "nothing kept under frame {key}"
+    );
+}
+
+/// The picture's last frame held for 1.5 s, so the timeline runs on past the last picture's
+/// start: there, and at the very end, the one-frame decode at the slot finds nothing, and the
+/// frame shown is the last picture, read from the two seconds before the slot's end only.
+#[test]
+fn a_last_frame_held_long_shows_the_last_picture() {
+    let Some(tools) = tools_or_skip() else { return };
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("held.mp4");
+    ff(
+        &tools,
+        &[
+            "-f",
+            "lavfi",
+            "-i",
+            "nullsrc=s=64x64:r=25:d=4,geq=lum='16+2*N':cb=128:cr=128,format=yuv420p",
+            "-c:v",
+            "libx264",
+            "-crf",
+            "10",
+            "-bf",
+            "0",
+            "-pix_fmt",
+            "yuv420p",
+            "-enc_time_base:v",
+            "1:1000",
+            "-video_track_timescale",
+            "1000",
+            "-bsf:v",
+            "setts=duration='if(eq(N\\,99)\\,1500\\,DURATION)'",
+            path.to_str().unwrap(),
+        ],
+    );
+    let mut fx = open_file(tmp, path.clone());
+    let (fps, origin) = (fx.win.media.fps, fx.win.media.origin());
+    let gray = |rgba: &[u8]| (f64::from(rgba[0]) * 219.0 / 255.0 / 2.0).round() as i64;
+    for t in [fx.win.length() - 1.0, fx.win.length()] {
+        let ctx = fx.drv.ctx.clone();
+        fx.win.seek(&ctx, t);
+        fx.settle();
+        let (_, key) = fx.win.want.unwrap();
+        // The one-frame decode at this frame's slot finds nothing.
+        let at = origin + (key as f64 - 0.5) / fps;
+        let out = std::process::Command::new(&tools.ffmpeg)
+            .args(["-nostdin", "-loglevel", "error", "-ss", &format!("{at:.6}")])
+            .arg("-i")
+            .arg(&path)
+            .args(["-frames:v", "1", "-f", "rawvideo", "-"])
+            .output()
+            .unwrap();
+        assert!(out.stdout.is_empty(), "frame {key} at {at} s: a picture");
+        let shown = fx
+            .win
+            .scrub
+            .as_ref()
+            .unwrap()
+            .cache
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(k, _)| *k == key)
+            .map(|(_, f)| gray(f));
+        assert_eq!(shown, Some(99), "at {t} s (frame {key})");
+        assert!(!fx.win.status.error, "at {t} s: {}", fx.win.status.text);
     }
 }
