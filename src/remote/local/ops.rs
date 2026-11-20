@@ -1,7 +1,14 @@
 //! [`FileOps`] on the local disk (04 §5.6): `renameat2(RENAME_NOREPLACE)` on Linux and
 //! `renamex_np(RENAME_EXCL)` on macOS (else `link` + `unlink`), `mkdir`, `rmdir`, links, a copy
-//! into a temp created exclusively (`clonefile` on macOS, `copy_file_range` on Linux, else read
-//! and write), published by the same never-replacing rename.
+//! into a temp created exclusively (`O_CREAT|O_EXCL|O_NOFOLLOW`) and filled, given its mode and
+//! times and flushed through that one descriptor — `copy_file_range` on Linux, else read and
+//! write — published by the same never-replacing rename.
+//!
+//! No `clonefile` on macOS: a clone is made by name, and the name can be another file by the
+//! time it is opened (a hard link to an unrelated file put there by a process of the same
+//! account), which nothing can tell from the clone; its mode and times would then go onto that
+//! file. A copy whose descriptor sopen made itself never touches anything else. A move on the
+//! same volume is still a rename; only a same-volume copy loses the clone's speed.
 
 use super::LocalFs;
 use crate::remote::ops::{taken, FileMeta, FileOps, NoRename, Opened, Staged};
@@ -28,7 +35,6 @@ struct At {
     ino: u64,
     dir: bool,
     link: bool,
-    file: bool,
 }
 
 /// `name` in the open folder `dir`, not following a link.
@@ -54,7 +60,6 @@ fn stat_at(dir: &fs::File, name: &CStr) -> std::io::Result<At> {
         ino: st.st_ino as u64,
         dir: kind == libc::S_IFDIR,
         link: kind == libc::S_IFLNK,
-        file: kind == libc::S_IFREG,
     })
 }
 
@@ -165,11 +170,14 @@ fn open_source(path: &str) -> Result<(fs::File, fs::Metadata)> {
     Ok((file, meta))
 }
 
-/// Creates `temp` exclusively, private until its copy is complete.
+/// Creates `temp` exclusively (`O_CREAT|O_EXCL|O_NOFOLLOW`), private until its copy is
+/// complete. Everything after goes through the returned descriptor; the name is used again only
+/// to publish it, after the engine checks that the name is still this file.
 fn create_temp(temp: &str) -> std::result::Result<fs::File, CreateError> {
-    fs::OpenOptions::new()
+    let file = fs::OpenOptions::new()
         .write(true)
         .create_new(true)
+        .custom_flags(libc::O_NOFOLLOW)
         .mode(0o600)
         .open(temp)
         .map_err(|e| {
@@ -179,7 +187,10 @@ fn create_temp(temp: &str) -> std::result::Result<fs::File, CreateError> {
                 anyhow!(e).context(format!("cannot create {temp}"))
             };
             CreateError::new(Created::No, error)
-        })
+        })?;
+    #[cfg(test)]
+    crate::remote::ops::fire_seam(&AFTER_CREATE, temp);
+    Ok(file)
 }
 
 /// After the content: the source's permission bits and times through the handle (a failure is
@@ -231,85 +242,6 @@ fn pump(
         progress(done);
     }
     Ok(out.finish().sha256)
-}
-
-/// macOS: the filesystem's own copy (`fclonefileat`, APFS), made in the temp's folder opened
-/// once, which creates `temp` itself and fails if it exists; then the clone is opened through
-/// that folder — never following a link, never waiting on a fifo — and must be the regular file
-/// of the inode recorded right after the clone, owned by this account. Anything else there fails
-/// the copy and is left as it is (named, not removed: it is not sopen's). `None`: no clone here
-/// (another volume, another filesystem) — copy the bytes.
-#[cfg(target_os = "macos")]
-fn clone_into(src: &fs::File, temp: &str) -> Option<std::result::Result<fs::File, CreateError>> {
-    use std::os::fd::FromRawFd;
-    /// The clone is this account's, as any file it creates (root's too, not the source's owner).
-    const CLONE_NOOWNERCOPY: u32 = 0x0002;
-    let refuse = |e: anyhow::Error| Some(Err(CreateError::new(Created::No, e)));
-    let (folder, name) = match open_folder(temp) {
-        Ok(got) => got,
-        Err(e) => return refuse(e),
-    };
-    // SAFETY: two open descriptors and a NUL-terminated name.
-    let r = unsafe {
-        libc::fclonefileat(
-            src.as_raw_fd(),
-            folder.as_raw_fd(),
-            name.as_ptr(),
-            CLONE_NOOWNERCOPY,
-        )
-    };
-    if r != 0 {
-        let e = std::io::Error::last_os_error();
-        if e.raw_os_error() == Some(libc::EEXIST) {
-            return refuse(taken(temp));
-        }
-        let elsewhere = [
-            libc::EXDEV,
-            libc::ENOTSUP,
-            libc::EOPNOTSUPP,
-            libc::EINVAL,
-            libc::ENOSYS,
-        ];
-        if is_errno(&e, &elsewhere) {
-            return None;
-        }
-        return refuse(anyhow!(e).context(format!("cannot create {temp}")));
-    }
-    let not_ours = |what: String| {
-        refuse(anyhow!(
-            "{temp} is not the clone sopen made ({what}); it is left as it is"
-        ))
-    };
-    // The clone's own inode, recorded at once: what is opened next must be it.
-    let made = match stat_at(&folder, &name) {
-        Ok(made) if made.file => made,
-        Ok(_) => return not_ours("not a regular file".into()),
-        Err(e) => return not_ours(format!("it cannot be read: {e}")),
-    };
-    #[cfg(test)]
-    crate::remote::ops::fire_seam(&AFTER_CLONE, temp);
-    let flags = libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC;
-    // SAFETY: an open descriptor and a NUL-terminated name.
-    let fd = unsafe { libc::openat(folder.as_raw_fd(), name.as_ptr(), flags) };
-    if fd < 0 {
-        let e = std::io::Error::last_os_error();
-        return not_ours(format!("it cannot be opened: {e}"));
-    }
-    // SAFETY: a descriptor just opened, owned by nothing else.
-    let file = unsafe { fs::File::from_raw_fd(fd) };
-    let meta = match file.metadata() {
-        Ok(meta) => meta,
-        Err(e) => return not_ours(format!("it cannot be read: {e}")),
-    };
-    // SAFETY: geteuid has no preconditions and cannot fail.
-    let me = unsafe { libc::geteuid() };
-    if !meta.is_file() {
-        return not_ours("not a regular file".into());
-    }
-    if (meta.dev(), meta.ino()) != (made.dev, made.ino) || meta.uid() != me {
-        return not_ours("another file has its name".into());
-    }
-    Some(Ok(file))
 }
 
 /// Linux: `copy_file_range` in [`COPY_STEP`]s (the kernel copies, reflinks where it can).
@@ -540,22 +472,6 @@ impl FileOps for LocalFs {
             open_source(from).map_err(|e| CreateError::new(Created::No, e))?;
         let source = meta_of(&src_meta);
         let ours = |e: anyhow::Error| CreateError::new(Created::Yes, e);
-        #[cfg(target_os = "macos")]
-        if let Some(cloned) = clone_into(&src, temp) {
-            let file = cloned?;
-            progress(source.size);
-            if cancel.load(Ordering::Relaxed) {
-                return Err(ours(anyhow!(Cancelled)));
-            }
-            let notes = finish(&file, temp, &source).map_err(ours)?;
-            let size = file.metadata().map_err(|e| ours(e.into()))?.len();
-            return Ok(Staged {
-                size,
-                sha256: None,
-                source,
-                notes,
-            });
-        }
         let dst = create_temp(temp)?;
         let mut fill = || -> Result<Staged> {
             #[cfg(target_os = "linux")]
@@ -571,11 +487,13 @@ impl FileOps for LocalFs {
                 return Err(anyhow!(Cancelled));
             }
             let notes = finish(&dst, temp, &source)?;
+            let made = dst.metadata()?;
             Ok(Staged {
-                size: dst.metadata()?.len(),
+                size: made.len(),
                 sha256,
                 source,
                 notes,
+                id: Some((made.dev(), made.ino())),
             })
         };
         fill().map_err(ours)
@@ -604,11 +522,13 @@ impl FileOps for LocalFs {
                 return Err(anyhow!(Cancelled));
             }
             let notes = finish(&dst, temp, meta)?;
+            let made = dst.metadata()?;
             Ok(Staged {
-                size: dst.metadata()?.len(),
+                size: made.len(),
                 sha256: Some(sha256),
                 source: *meta,
                 notes,
+                id: Some((made.dev(), made.ino())),
             })
         };
         fill().map_err(|e| CreateError::new(Created::Yes, e))
@@ -620,11 +540,7 @@ thread_local! {
     static NO_EXCLUSIVE_RENAME: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static BEFORE_UNLINK: std::cell::RefCell<Option<crate::remote::ops::SeamHook>> =
         const { std::cell::RefCell::new(None) };
-}
-
-#[cfg(all(test, target_os = "macos"))]
-thread_local! {
-    static AFTER_CLONE: std::cell::RefCell<Option<crate::remote::ops::SeamHook>> =
+    static AFTER_CREATE: std::cell::RefCell<Option<crate::remote::ops::SeamHook>> =
         const { std::cell::RefCell::new(None) };
 }
 
@@ -646,12 +562,11 @@ impl LocalFs {
         crate::remote::ops::set_seam(&BEFORE_UNLINK, hook)
     }
 
-    /// macOS: right after `fclonefileat` made the clone, before it is opened; the hook gets its
-    /// path.
-    #[cfg(target_os = "macos")]
-    pub(crate) fn seam_after_clone(
+    /// Right after a copy's temp is made (its exclusive create), before any byte or attribute
+    /// goes into it; the hook gets its path.
+    pub(crate) fn seam_after_create(
         hook: impl FnMut(&str) + 'static,
     ) -> crate::remote::ops::SeamGuard {
-        crate::remote::ops::set_seam(&AFTER_CLONE, hook)
+        crate::remote::ops::set_seam(&AFTER_CREATE, hook)
     }
 }

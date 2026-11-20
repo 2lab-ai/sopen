@@ -208,14 +208,17 @@ struct Faulty<'a> {
     copy: CopyHook<'a>,
     copied: CopiedHook<'a>,
     list: ListHook<'a>,
-    /// `identity`, `remove`, `remove_dir`, `list_entries`.
+    /// `identity`, `lstat`, `remove`, `remove_dir`, `list_entries`.
     fault: FaultHook<'a>,
-    /// `make_symlink` (its link), `set_meta`.
+    /// `make_symlink` (its link), `set_meta`, `read_to`.
     after: AfterHook<'a>,
     plain_realpath: bool,
     no_link: bool,
     /// A lower [`RemoteFs::hash_check_limit`].
     hash_limit: Option<u64>,
+    /// A same-host copy is reported as made by the host itself (no digest of its bytes), as
+    /// `copy-data` and `copy_file_range` are: a move then reads it back.
+    host_made: bool,
     /// The stream a copy from another host writes is corrupted (its first byte flipped) on its
     /// way into the temp, while the reader's digest is of the bytes read.
     corrupt: bool,
@@ -235,6 +238,7 @@ impl<'a> Faulty<'a> {
             plain_realpath: false,
             no_link: false,
             hash_limit: None,
+            host_made: false,
             corrupt: false,
         }
     }
@@ -245,6 +249,9 @@ impl RemoteFs for Faulty<'_> {
         self.inner.stat_opt(path)
     }
     fn lstat_opt(&mut self, path: &str) -> anyhow::Result<Option<Stat>> {
+        if let Some(e) = (self.fault)("lstat", path) {
+            return Err(e);
+        }
         self.inner.lstat_opt(path)
     }
     fn realpath(&mut self, path: &str) -> anyhow::Result<String> {
@@ -276,7 +283,9 @@ impl RemoteFs for Faulty<'_> {
         out: &mut dyn Write,
         progress: &mut dyn FnMut(u64),
     ) -> anyhow::Result<u64> {
-        self.inner.read_to(path, out, progress)
+        let read = self.inner.read_to(path, out, progress)?;
+        (self.after)("read_to", path);
+        Ok(read)
     }
     fn create_from(
         &mut self,
@@ -366,7 +375,10 @@ impl FileOps for Faulty<'_> {
         if let Some(e) = (self.copy)(from) {
             return Err(CreateError::new(crate::remote::Created::No, e));
         }
-        let staged = self.inner.copy_within(from, temp, cancel, progress)?;
+        let mut staged = self.inner.copy_within(from, temp, cancel, progress)?;
+        if self.host_made {
+            staged.sha256 = None;
+        }
         (self.copied)(temp);
         Ok(staged)
     }
@@ -1063,7 +1075,9 @@ fn k_m2_a_folder_move_failing_on_its_second_file_removes_no_source() {
 }
 
 /// K-M2: a source rewritten between its copy and its removal is kept, and the report says both
-/// copies exist — a single file, and a file inside a folder (the rest of the folder moves).
+/// copies exist — a single file, and a file inside a folder (the rest of the folder moves). The
+/// copies are streamed (another host): a host-made copy's read-back catches the rewrite earlier
+/// (r14).
 #[test]
 fn k_m2_a_source_rewritten_before_its_removal_is_kept() {
     both(|inner, how| {
@@ -1078,12 +1092,6 @@ fn k_m2_a_source_rewritten_before_its_removal_is_kept() {
             }
         };
         let mut fs = Faulty::new(inner);
-        // The items' own renames are refused (another filesystem); the publishes of their
-        // copies (renames from a temp) go through.
-        let (from_f, from_d) = (s(&src.join("f")), s(&src.join("d")));
-        fs.rename = Box::new(move |f, _| {
-            (f == from_f || f == from_d).then(|| Err(anyhow::anyhow!(NoRename("elsewhere".into()))))
-        });
         let on_f = rewrite(src.join("f"));
         let on_b = rewrite(src.join("d/b.txt"));
         fs.renamed = Box::new(move |from, to| {
@@ -1092,7 +1100,10 @@ fn k_m2_a_source_rewritten_before_its_removal_is_kept() {
         });
         let r = run(
             &job(Op::Move, &src, &["f", "d"], &dst),
-            Hosts::Same(&mut fs),
+            Hosts::Two {
+                src: &mut LocalFs::new(),
+                dst: &mut fs,
+            },
             &mut Script::default(),
         );
         let kept =
@@ -1567,9 +1578,9 @@ fn a_spawned_operation_asks_over_its_channel_and_reports() {
     assert_eq!(names(&dst), ["a", "a-1"]);
 }
 
-/// A move's check reads both files when the host copied the bytes itself (`clonefile` here,
-/// `copy-data` on a server — sopen never saw them): a copy holding other bytes of the same size
-/// fails the item and its source stays.
+/// A move's check reads both files when the host copied the bytes itself (`copy-data` on a
+/// server, `copy_file_range` here — sopen never saw them): a copy holding other bytes of the
+/// same size fails the item and its source stays.
 #[test]
 fn a_move_checks_the_bytes_of_a_copy_the_host_made() {
     both(|inner, how| {
@@ -1578,6 +1589,7 @@ fn a_move_checks_the_bytes_of_a_copy_the_host_made() {
         std::fs::write(&f, "the right bytes").unwrap();
         let kept = (ino(&f), sha(&f));
         let mut fs = Faulty::new(inner);
+        fs.host_made = true;
         let from = s(&f);
         fs.rename = Box::new(move |fr, _| {
             (fr == from).then(|| Err(anyhow::anyhow!(NoRename("elsewhere".into()))))
@@ -1706,10 +1718,6 @@ fn a_local_source_replaced_by_a_lookalike_is_kept() {
     std::fs::write(&f, "same").unwrap();
     let mut local = LocalFs::new();
     let mut fs = Faulty::new(&mut local);
-    let from = s(&f);
-    fs.rename = Box::new(move |fr, _| {
-        (fr == from).then(|| Err(anyhow::anyhow!(NoRename("elsewhere".into()))))
-    });
     let (path, twin) = (f.clone(), src.join("twin"));
     fs.renamed = Box::new(move |_, _| {
         let mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
@@ -1719,9 +1727,13 @@ fn a_local_source_replaced_by_a_lookalike_is_kept() {
             .unwrap();
         std::fs::rename(&twin, &path).unwrap();
     });
+    // Streamed (two connections), so the removal's check is what meets the lookalike.
     let r = run(
         &job(Op::Move, &src, &["f"], &dst),
-        Hosts::Same(&mut fs),
+        Hosts::Two {
+            src: &mut LocalFs::new(),
+            dst: &mut fs,
+        },
         &mut Script::default(),
     );
     let [Item {
@@ -1745,15 +1757,16 @@ fn a_moved_source_gone_before_its_removal_is_not_kept() {
     std::fs::write(&f, "x").unwrap();
     let mut local = LocalFs::new();
     let mut fs = Faulty::new(&mut local);
-    let from = s(&f);
-    fs.rename = Box::new(move |fr, _| {
-        (fr == from).then(|| Err(anyhow::anyhow!(NoRename("elsewhere".into()))))
-    });
     let path = f.clone();
     fs.renamed = Box::new(move |_, _| std::fs::remove_file(&path).unwrap());
+    // Streamed: a host-made copy is read back first, and a source gone then is no verified move
+    // (r14).
     let r = run(
         &job(Op::Move, &src, &["f"], &dst),
-        Hosts::Same(&mut fs),
+        Hosts::Two {
+            src: &mut LocalFs::new(),
+            dst: &mut fs,
+        },
         &mut Script::default(),
     );
     assert_eq!(r.items, vec![item("f", ItemOutcome::Done)], "{r:?}");
@@ -2030,17 +2043,18 @@ fn r3_a_local_source_without_an_identity_is_not_moved() {
         Hosts::Same(&mut fs),
         &mut Script::default(),
     );
-    for i in &r.items {
-        assert!(
-            matches!(&i.outcome, ItemOutcome::Failed(why) if why.contains("injected: no stat")),
-            "{r:?}"
-        );
-    }
+    let failed = |name: &str| {
+        let line = r.items.iter().find(|i| i.name == name);
+        matches!(line, Some(Item { outcome: ItemOutcome::Failed(why), .. })
+            if why.contains("injected: no stat"))
+    };
+    assert_eq!(r.items.len(), 2, "{r:?}");
+    assert!(failed("f") && failed("l"), "{r:?}");
     assert_eq!(names(&src), ["f", "l"]);
     assert_eq!(names(&dst), Vec::<String>::new());
 }
 
-/// A moved file whose host-made copy (`clonefile`, `copy_file_range`, `copy-data`) is corrupted
+/// A moved file whose host-made copy (`copy_file_range`, `copy-data`) is corrupted
 /// in its temp: the size check passes, the bytes do not.
 fn corrupt_the_copy(fs: &mut Faulty<'_>, f: &Path) {
     fs.rename = no_rename_from(&[f]);
@@ -2061,6 +2075,7 @@ fn r4_a_move_verifies_a_host_made_copy_of_any_size() {
         let before = sha(&f);
         let mut fs = Faulty::new(inner);
         fs.hash_limit = Some(16);
+        fs.host_made = true;
         corrupt_the_copy(&mut fs, &f);
         let r = run(
             &job(Op::Move, &src, &["f"], &dst),
@@ -2088,6 +2103,7 @@ fn r4_esc_while_checking_a_moved_copy_keeps_both() {
         std::fs::write(&f, vec![3u8; 300 * 1024]).unwrap();
         let before = sha(&f);
         let mut fs = Faulty::new(inner);
+        fs.host_made = true;
         fs.rename = no_rename_from(&[&f]);
         let mut ctl = Script {
             stop_when: Some("checking"),
@@ -2205,92 +2221,6 @@ fn r7_esc_at_a_clash_moves_nothing() {
         assert_eq!(names(&dst), ["a"], "{how}: nothing renamed");
         assert_eq!(std::fs::read(dst.join("a")).unwrap(), b"theirs", "{how}");
     });
-}
-
-/// Runs a local copy of `src/f` into `dst` on a thread of its own with a seam right after the
-/// clone, and returns its report — or fails, after releasing it, when it hangs.
-#[cfg(target_os = "macos")]
-fn copy_with_clone_swapped(
-    src: &Path,
-    dst: &Path,
-    swap: impl FnMut(&str) + Send + 'static,
-) -> Report {
-    let (tx, rx) = std::sync::mpsc::channel();
-    let (from, to) = (src.to_path_buf(), dst.to_path_buf());
-    let worker = std::thread::spawn(move || {
-        let _seam = LocalFs::seam_after_clone(swap);
-        let r = run(
-            &job(Op::Copy, &from, &["f"], &to),
-            Hosts::Same(&mut LocalFs::new()),
-            &mut Script::default(),
-        );
-        let _ = tx.send(r);
-    });
-    match rx.recv_timeout(std::time::Duration::from_secs(10)) {
-        Ok(r) => {
-            worker.join().unwrap();
-            r
-        }
-        Err(_) => {
-            // Release it: a writer for the fifo it waits on.
-            for t in temps(dst) {
-                let _ = std::fs::OpenOptions::new().write(true).open(t);
-            }
-            panic!("the copy hung on what was swapped in for its clone");
-        }
-    }
-}
-
-/// Finding 8: a fifo swapped in for the clone (macOS `fclonefileat`) fails the item with a
-/// reason and never hangs; what is there is left as it is.
-#[cfg(target_os = "macos")]
-#[test]
-fn r8_a_fifo_swapped_for_the_clone_fails_without_hanging() {
-    let (_t, src, dst) = scratch();
-    std::fs::write(src.join("f"), "data").unwrap();
-    let r = copy_with_clone_swapped(&src, &dst, |temp| {
-        std::fs::remove_file(temp).unwrap();
-        let c = std::ffi::CString::new(temp).unwrap();
-        // SAFETY: a NUL-terminated path.
-        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
-    });
-    assert!(
-        matches!(&r.items[..], [Item { outcome: ItemOutcome::Failed(why), .. }]
-            if why.contains("not the clone")),
-        "{r:?}"
-    );
-    assert_eq!(temps(&dst).len(), 1, "the fifo is left where it is");
-    assert!(!dst.join("f").exists());
-}
-
-/// Finding 8: a regular file swapped in for the clone keeps its own mode and times (sopen
-/// never sets the source's on it), and is left as it is.
-#[cfg(target_os = "macos")]
-#[test]
-fn r8_a_file_swapped_for_the_clone_keeps_its_own_metadata() {
-    let (_t, src, dst) = scratch();
-    let f = src.join("f");
-    std::fs::write(&f, "data").unwrap();
-    set_mode(&f, 0o640);
-    set_mtime(&f, 1_600_000_000);
-    let r = copy_with_clone_swapped(&src, &dst, |temp| {
-        std::fs::remove_file(temp).unwrap();
-        std::fs::write(temp, "someone else's").unwrap();
-        set_mode(Path::new(temp), 0o600);
-        set_mtime(Path::new(temp), 1_000_000_000);
-    });
-    assert!(
-        matches!(&r.items[..], [Item { outcome: ItemOutcome::Failed(why), .. }]
-            if why.contains("not the clone")),
-        "{r:?}"
-    );
-    let [left] = &temps(&dst)[..] else {
-        panic!("the swapped-in file is left where it is: {:?}", temps(&dst))
-    };
-    let left = Path::new(left);
-    assert_eq!(std::fs::read(left).unwrap(), b"someone else's");
-    assert_eq!((mode(left), mtime_secs(left)), (0o600, 1_000_000_000));
-    assert!(!dst.join("f").exists());
 }
 
 /// Finding 10: a hard link refused for permission (as Linux's `fs.protected_hardlinks=1`
@@ -2486,6 +2416,275 @@ fn a_failed_walk_names_a_leftover_target_folder() {
         r.notes
             .iter()
             .any(|n| n.contains(&leftover) && n.contains("injected: no rmdir")),
+        "{r:?}"
+    );
+}
+
+// ---- review round 2 ----
+
+/// Finding r2-1: another process of this account puts a hard link to an unrelated file at the
+/// temp's name right after the temp is made. The copy's bytes, mode and times go through the
+/// descriptor sopen holds, never that file; nothing is published under the final name; a move
+/// keeps its source.
+#[test]
+fn r12_a_temp_name_replaced_after_its_create_redirects_nothing() {
+    for op in [Op::Copy, Op::Move] {
+        let (_t, src, dst) = scratch();
+        let f = src.join("f");
+        std::fs::write(&f, "the data").unwrap();
+        set_mode(&f, 0o640);
+        set_mtime(&f, 1_600_000_000);
+        let victim = dst.parent().unwrap().join("victim");
+        std::fs::write(&victim, "the victim's own").unwrap();
+        set_mode(&victim, 0o600);
+        set_mtime(&victim, 1_000_000_000);
+        let v = victim.clone();
+        let _seam = LocalFs::seam_after_create(move |temp| {
+            std::fs::remove_file(temp).unwrap();
+            std::fs::hard_link(&v, temp).unwrap();
+        });
+        let mut local = LocalFs::new();
+        let mut fs = Faulty::new(&mut local);
+        fs.rename = no_rename_from(&[&f]);
+        let r = run(
+            &job(op.clone(), &src, &["f"], &dst),
+            Hosts::Same(&mut fs),
+            &mut Script::default(),
+        );
+        assert!(
+            matches!(&r.items[..], [Item { outcome: ItemOutcome::Failed(why), .. }]
+                if why.contains("not the copy")),
+            "{op:?}: {r:?}"
+        );
+        assert_eq!(
+            std::fs::read(&victim).unwrap(),
+            b"the victim's own",
+            "{op:?}"
+        );
+        assert_eq!(
+            (mode(&victim), mtime_secs(&victim)),
+            (0o600, 1_000_000_000),
+            "{op:?}: the victim's attributes untouched"
+        );
+        assert!(!dst.join("f").exists(), "{op:?}: nothing published");
+        assert_eq!(std::fs::read(&f).unwrap(), b"the data", "{op:?}");
+    }
+}
+
+/// Finding r2-2: an SFTP rename whose old name cannot be checked again before `REMOVE` (its
+/// folder made unreadable) leaves it, and says the outcome could not be confirmed — not that
+/// both names exist.
+#[test]
+fn r13_sftp_a_name_that_cannot_be_checked_before_remove_is_unconfirmed() {
+    let Some(mut fs) = SftpRemote::local_server() else {
+        return;
+    };
+    let (_t, src, dst) = scratch();
+    std::fs::write(src.join("a"), "a").unwrap();
+    let folder = src.clone();
+    let _seam = SftpRemote::seam_before_remove(move |_| set_mode(&folder, 0o000));
+    let r = run(
+        &job(Op::Move, &src, &["a"], &dst),
+        Hosts::Same(&mut fs),
+        &mut Script::default(),
+    );
+    set_mode(&src, 0o755);
+    assert_eq!(r.items, vec![item("a", ItemOutcome::Done)], "{r:?}");
+    assert!(
+        r.notes.iter().any(|n| n.contains("could not be confirmed")),
+        "{r:?}"
+    );
+    assert!(
+        r.notes.iter().all(|n| !n.contains("both names exist")),
+        "{r:?}"
+    );
+    assert!(src.join("a").exists(), "left");
+}
+
+/// Finding r2-3: a failed read-back never lets a move remove its source — not when the source
+/// cannot be stat'ed at that moment (one transient failure right after the check read it), and a
+/// source gone before the check completed is no verified move. The report says the copy did not
+/// verify.
+#[test]
+fn r14_a_failed_check_never_removes_the_source() {
+    both(|inner, how| {
+        // A corrupt copy, and one transient stat failure of the source after the check's read.
+        {
+            let (_t, src, dst) = scratch();
+            let f = src.join("f");
+            std::fs::write(&f, vec![9u8; 4096]).unwrap();
+            let before = sha(&f);
+            let mut fs = Faulty::new(&mut *inner);
+            fs.host_made = true;
+            corrupt_the_copy(&mut fs, &f);
+            let armed = Arc::new(AtomicBool::new(false));
+            let (arm, fire, path) = (armed.clone(), armed.clone(), s(&f));
+            let path2 = path.clone();
+            fs.after = Box::new(move |op, p| {
+                if op == "read_to" && p == path {
+                    arm.store(true, Ordering::Relaxed);
+                }
+            });
+            fs.fault = Box::new(move |op, p| {
+                (op == "lstat" && p == path2 && fire.swap(false, Ordering::Relaxed))
+                    .then(|| anyhow::anyhow!("injected: a transient stat failure"))
+            });
+            let r = run(
+                &job(Op::Move, &src, &["f"], &dst),
+                Hosts::Same(&mut fs),
+                &mut Script::default(),
+            );
+            assert!(
+                matches!(&r.items[..], [Item { outcome: ItemOutcome::Failed(why), .. }]
+                if why.contains("does not hold the same bytes")),
+                "{how}: {r:?}"
+            );
+            assert_eq!(sha(&f), before, "{how}: the source survives");
+        }
+
+        // A good copy whose source goes right after the check read it: not a verified move.
+        let (_t, src, dst) = scratch();
+        let f = src.join("f");
+        std::fs::write(&f, "good bytes").unwrap();
+        let mut fs = Faulty::new(&mut *inner);
+        fs.host_made = true;
+        fs.rename = no_rename_from(&[&f]);
+        let (path, gone) = (s(&f), f.clone());
+        fs.after = Box::new(move |op, p| {
+            if op == "read_to" && p == path {
+                std::fs::remove_file(&gone).unwrap();
+            }
+        });
+        let r = run(
+            &job(Op::Move, &src, &["f"], &dst),
+            Hosts::Same(&mut fs),
+            &mut Script::default(),
+        );
+        assert!(
+            matches!(&r.items[..], [Item { outcome: ItemOutcome::Failed(why), .. }]
+                if why.contains("verified")),
+            "{how}: {r:?}"
+        );
+        assert_eq!(
+            std::fs::read(dst.join("f")).unwrap(),
+            b"good bytes",
+            "{how}: the copy stays"
+        );
+    });
+}
+
+/// Finding r2-4: on this machine a staged copy whose identity cannot be read is never published,
+/// so a file put at the final name later can never be taken for the copy and removed by a failed
+/// check: the replacement survives, and so does the source.
+#[test]
+fn r15_a_copy_whose_identity_cannot_be_read_is_not_published() {
+    let (_t, src, dst) = scratch();
+    let f = src.join("f");
+    std::fs::write(&f, vec![5u8; 2048]).unwrap();
+    let before = sha(&f);
+    let mut local = LocalFs::new();
+    let mut fs = Faulty::new(&mut local);
+    fs.host_made = true;
+    corrupt_the_copy(&mut fs, &f);
+    let inside = format!("{}/.f.sopen-", s(&dst));
+    fs.fault = Box::new(move |op, p| {
+        (op == "identity" && p.starts_with(&inside))
+            .then(|| anyhow::anyhow!("injected: no identity"))
+    });
+    // At the publish: another inode, with the published file's size and mtime, at its name.
+    let replaced: Arc<Mutex<Option<u64>>> = Arc::default();
+    let (seen, target) = (replaced.clone(), dst.join("f"));
+    fs.renamed = Box::new(move |from, to| {
+        if from.contains(".sopen-") && Path::new(to) == target {
+            let was = std::fs::metadata(&target).unwrap();
+            std::fs::remove_file(&target).unwrap();
+            std::fs::write(&target, vec![b'R'; was.len() as usize]).unwrap();
+            let t = std::fs::File::options().write(true).open(&target).unwrap();
+            t.set_times(std::fs::FileTimes::new().set_modified(was.modified().unwrap()))
+                .unwrap();
+            *seen.lock().unwrap() = Some(ino(&target));
+        }
+    });
+    let r = run(
+        &job(Op::Move, &src, &["f"], &dst),
+        Hosts::Same(&mut fs),
+        &mut Script::default(),
+    );
+    assert!(
+        matches!(
+            &r.items[..],
+            [Item {
+                outcome: ItemOutcome::Failed(_),
+                ..
+            }]
+        ),
+        "{r:?}"
+    );
+    assert_eq!(sha(&f), before, "the source survives");
+    let replacement = *replaced.lock().unwrap();
+    if let Some(replacement) = replacement {
+        assert!(dst.join("f").exists(), "the replacement survives: {r:?}");
+        assert_eq!(ino(&dst.join("f")), replacement);
+    }
+}
+
+/// Finding r2-5: Esc between items and Cancel at a clash each leave a note saying why the rest
+/// was not done.
+#[test]
+fn r16_esc_between_items_and_cancel_are_explained() {
+    let (_t, src, dst) = scratch();
+    for name in ["a", "b", "c"] {
+        std::fs::write(src.join(name), name).unwrap();
+    }
+    // Esc right after `a` was published.
+    let mut ctl = Script::default();
+    let stop = ctl.cancel.clone();
+    let mut local = LocalFs::new();
+    let mut fs = Faulty::new(&mut local);
+    fs.renamed = Box::new(move |_, to| {
+        if to.ends_with("/a") {
+            stop.store(true, Ordering::Relaxed);
+        }
+    });
+    let r = run(
+        &job(Op::Copy, &src, &["a", "b", "c"], &dst),
+        Hosts::Same(&mut fs),
+        &mut ctl,
+    );
+    assert_eq!(
+        r.items,
+        vec![
+            item("a", ItemOutcome::Done),
+            item("b", ItemOutcome::NotReached),
+            item("c", ItemOutcome::NotReached)
+        ]
+    );
+    assert!(
+        r.notes
+            .iter()
+            .any(|n| n.contains("stopped") && n.contains("2")),
+        "{r:?}"
+    );
+
+    // Cancel at the name in the way of `b`.
+    std::fs::write(dst.join("b"), "theirs").unwrap();
+    let mut ctl = Script::answers([reply(Answer::Cancel)]);
+    let r = run(
+        &job(Op::Copy, &src, &["b", "c"], &dst),
+        Hosts::Same(&mut LocalFs::new()),
+        &mut ctl,
+    );
+    assert_eq!(
+        r.items,
+        vec![
+            item("b", ItemOutcome::Skipped),
+            item("c", ItemOutcome::NotReached)
+        ]
+    );
+    assert!(
+        r.notes
+            .iter()
+            .any(|n| n.contains("cancelled") && n.contains("b")),
         "{r:?}"
     );
 }

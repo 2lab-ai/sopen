@@ -112,6 +112,10 @@ pub fn run(job: &Job, hosts: Hosts<'_>, ctl: &mut dyn Control) -> Report {
     for (i, name) in job.names.iter().enumerate() {
         engine.item = i + 1;
         if engine.stopped() {
+            let rest = job.names.len() - i;
+            engine.report.notes.push(format!(
+                "stopped (Esc) before {name}: {rest} item(s) not reached"
+            ));
             engine.not_reached(i);
             break;
         }
@@ -122,9 +126,18 @@ pub fn run(job: &Job, hosts: Hosts<'_>, ctl: &mut dyn Control) -> Report {
         });
         let lines = std::mem::take(&mut engine.lines);
         engine.report.items.extend(lines);
-        if let Flow::Go = flow {
-            continue;
-        }
+        let rest = job.names.len() - i - 1;
+        let note = match flow {
+            Flow::Go => continue,
+            Flow::Stop if rest == 0 => None,
+            Flow::Stop => Some(format!(
+                "stopped (Esc) in {name}: {rest} item(s) after it not reached"
+            )),
+            Flow::Cancel => Some(format!(
+                "cancelled at {name}, a name in the way: {rest} item(s) after it not done"
+            )),
+        };
+        engine.report.notes.extend(note);
         engine.not_reached(i + 1);
         break;
     }
@@ -729,21 +742,25 @@ impl Engine<'_, '_, '_> {
             Err(StageErr::Failed(why)) => return Placed::Failed(why),
         };
         if let Err(why) = self.check_copy(from, shown, &before, &staged, read) {
-            self.drop_temp(&temp);
+            self.drop_staged(&temp, staged.id);
             return Placed::Failed(why);
         }
         if self.stopped() {
-            self.drop_temp(&temp);
+            self.drop_staged(&temp, staged.id);
             return Placed::Stopped(nothing());
         }
+        // The name is published only while it is still the file the copy was written through
+        // (this machine: its inode, by the descriptor). Anything else there is not sopen's.
+        if let Err(why) = self.is_staged(&temp, staged.id) {
+            return Placed::Failed(format!("{why}; nothing was published"));
+        }
         let verify = self.job.op == Op::Move && staged.sha256.is_none();
-        // What is about to get the final name, to know it again if it must go.
-        let published = if verify {
-            let dst = self.ends.dst();
-            let id = dst.identity(&temp, false).ok().flatten();
-            (id, dst.lstat_opt(&temp).ok().flatten())
+        // Over SFTP, with no inode: what gets the final name, by its attributes, to know it again
+        // if it must go.
+        let published = if verify && staged.id.is_none() {
+            self.ends.dst().lstat_opt(&temp).ok().flatten()
         } else {
-            (None, None)
+            None
         };
         let target = loop {
             let target = join(dir, &want);
@@ -758,12 +775,12 @@ impl Engine<'_, '_, '_> {
                 }
                 Err(e) if is_taken(&e) && top => match self.resolve(dir, &want, false) {
                     Ok(Resolved::Name(_)) if self.stopped() => {
-                        self.drop_temp(&temp);
+                        self.drop_staged(&temp, staged.id);
                         return Placed::Stopped(nothing());
                     }
                     Ok(Resolved::Name(n)) => want = n,
                     other => {
-                        self.drop_temp(&temp);
+                        self.drop_staged(&temp, staged.id);
                         return match other {
                             Ok(Resolved::Skip) => Placed::Skipped,
                             Ok(_) => Placed::Cancelled,
@@ -772,11 +789,16 @@ impl Engine<'_, '_, '_> {
                     }
                 },
                 Err(e) => {
-                    self.drop_temp(&temp);
+                    self.drop_staged(&temp, staged.id);
                     return Placed::Failed(format!("{e:#}"));
                 }
             }
         };
+        // Still the copy under its final name? (The name could change hands between the check
+        // above and the rename.) If not, nothing is removed and what is there is left.
+        if let Err(why) = self.is_staged(&target, staged.id) {
+            return Placed::Failed(why);
+        }
         let copied = Copied {
             name: want,
             before,
@@ -785,45 +807,101 @@ impl Engine<'_, '_, '_> {
         };
         if verify {
             match self.verify(from, &target, shown, before.size) {
-                Ok(()) => {}
+                // Verified only while the source is still the entry that was read.
+                Ok(()) => match self.still(from, &copied) {
+                    Still::Same => {}
+                    Still::Gone => {
+                        return Placed::Failed(format!(
+                            "{shown} went before its copy {target} was verified, so this is no \
+                             verified move; the copy stays"
+                        ))
+                    }
+                    Still::Changed(how) => {
+                        return Placed::Failed(format!(
+                            "{shown} changed before its copy {target} was verified ({how}); it \
+                             was kept, so both copies exist"
+                        ))
+                    }
+                },
                 Err(StageErr::Stopped) => {
                     return Placed::Stopped(format!(
                         "while checking its copy {target}: {shown} was not removed, so both \
                          copies exist"
                     ))
                 }
-                // A source that changed or went since it was read is not its copy's fault: the
-                // removal's own check keeps it (both copies listed), or finds nothing to remove.
-                Err(StageErr::Failed(_)) if !matches!(self.still(from, &copied), Still::Same) => {}
+                // A failed read-back is never a move: the source is not removed, whatever is
+                // found afterwards. The copy goes only when the source is certainly still the
+                // entry that was read (then the copy is what is wrong); otherwise it stays.
                 Err(StageErr::Failed(why)) => {
-                    let gone = self.unpublish(&target, published);
-                    return Placed::Failed(format!("{why}; {gone}"));
+                    let what = match self.still(from, &copied) {
+                        Still::Same => {
+                            let gone = self.unpublish(&target, staged.id, published);
+                            format!("{gone}; {shown} stays")
+                        }
+                        Still::Gone => format!("{shown} is gone, so the copy {target} stays"),
+                        Still::Changed(how) => format!(
+                            "{shown} cannot be compared any more ({how}): it was kept, so both \
+                             copies exist"
+                        ),
+                    };
+                    return Placed::Failed(format!("{why}; {what}"));
                 }
             }
         }
         Placed::At(copied)
     }
 
+    /// Is `path` still the file the copy was written through? On this machine by its inode — a
+    /// failure to read it is a no (fail closed). Over SFTP there is no inode (`id` is `None`):
+    /// taken to be, as for every SFTP name.
+    fn is_staged(&mut self, path: &str, id: Option<(u64, u64)>) -> Result<(), String> {
+        let Some(id) = id else {
+            return Ok(());
+        };
+        match self.ends.dst().identity(path, false) {
+            Ok(Some(now)) if now == id => Ok(()),
+            Ok(_) => Err(format!(
+                "{path} is not the copy sopen made (another file has its name now); it is left \
+                 as it is"
+            )),
+            Err(e) => Err(format!(
+                "{path} cannot be confirmed as the copy sopen made ({e:#}); it is left as it is"
+            )),
+        }
+    }
+
+    /// Removes the temp of a copy that goes no further — only while it is still that copy.
+    fn drop_staged(&mut self, temp: &str, id: Option<(u64, u64)>) {
+        match self.is_staged(temp, id) {
+            Ok(()) => self.drop_temp(temp),
+            Err(why) => self.report.notes.push(why),
+        }
+    }
+
     /// Removes a copy just published that proved wrong — only while it is still the file that
-    /// got the name (locally its inode; over SFTP its type, size and mtime). What it says.
-    fn unpublish(&mut self, target: &str, published: (Option<(u64, u64)>, Option<Stat>)) -> String {
-        let dst = self.ends.dst();
-        let still = match published {
-            (Some(id), _) => dst.identity(target, false).ok().flatten() == Some(id),
-            (None, Some(was)) => match dst.lstat_opt(target) {
-                Ok(Some(now)) => {
+    /// got the name: on this machine its inode, by the descriptor it was written through; over
+    /// SFTP its type, size and mtime as published. What it says.
+    fn unpublish(
+        &mut self,
+        target: &str,
+        id: Option<(u64, u64)>,
+        published: Option<Stat>,
+    ) -> String {
+        let still = match id {
+            Some(_) => self.is_staged(target, id).is_ok(),
+            None => match (published, self.ends.dst().lstat_opt(target)) {
+                (Some(was), Ok(Some(now))) => {
                     Kind::of(&now) == Kind::of(&was)
                         && now.size == was.size
                         && now.mtime == was.mtime
                 }
                 _ => false,
             },
-            (None, None) => false,
         };
         if !still {
             return format!("{target} is left as it is (it may not be the copy any more)");
         }
-        match dst.remove(target) {
+        match self.ends.dst().remove(target) {
             Ok(()) => "its copy was removed".to_string(),
             Err(e) => format!("its copy {target} could not be removed: {e:#}"),
         }
@@ -902,8 +980,8 @@ impl Engine<'_, '_, '_> {
         })
     }
 
-    /// A move's check of a copy the host made (`copy-data`, `clonefile`, `copy_file_range`),
-    /// whatever its size: the SHA-256 of the source and of the copy, each read through in full,
+    /// A move's check of a copy the host made (`copy-data`, `copy_file_range`), whatever its
+    /// size: the SHA-256 of the source and of the copy, each read through in full,
     /// compared. Shown as `checking`, both reads one bar; Esc stops it.
     fn verify(&mut self, from: &str, copy: &str, shown: &str, size: u64) -> Result<(), StageErr> {
         let (item, items) = (self.item, self.job.names.len());

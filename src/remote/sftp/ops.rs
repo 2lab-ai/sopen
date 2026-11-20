@@ -377,10 +377,18 @@ impl FileOps for SftpRemote {
                  and {to}"
             )]
         };
+        // When it cannot be checked again, it is left, and the report says so without claiming
+        // what is there.
+        let unconfirmed = |e: anyhow::Error| {
+            vec![format!(
+                "{to} is in place; {from} was left, as it could not be checked again ({e:#}): \
+                 whether it is still there could not be confirmed"
+            )]
+        };
         let now = match self.lstat_opt(from) {
             Ok(Some(now)) => now,
             Ok(None) => return Ok(Vec::new()),
-            Err(e) => return Ok(both(format!("it could not be checked again: {e:#}"))),
+            Err(e) => return Ok(unconfirmed(e)),
         };
         let kind = |s: &crate::remote::Stat| (s.is_dir, s.is_file, s.is_symlink);
         if kind(&now) != kind(&own) || now.size != own.size || now.mtime != own.mtime {
@@ -394,7 +402,7 @@ impl FileOps for SftpRemote {
                     let how = format!("it is now a link to {t}, not {target}");
                     return Ok(both(format!("another entry has its name now: {how}")));
                 }
-                Err(e) => return Ok(both(format!("it could not be checked again: {e:#}"))),
+                Err(e) => return Ok(unconfirmed(e)),
             }
         }
         match self.remove(from) {
@@ -509,6 +517,7 @@ impl FileOps for SftpRemote {
                     sha256,
                     source,
                     notes,
+                    id: None,
                 })
             };
             let staged = fill.await.map_err(|e| CreateError::new(Created::Yes, e));
@@ -577,6 +586,7 @@ impl FileOps for SftpRemote {
                 sha256: Some(sha256),
                 source: *meta,
                 notes,
+                id: None,
             })
         });
         staged.map_err(|e| CreateError::new(Created::Yes, e))

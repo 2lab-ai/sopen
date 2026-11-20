@@ -38,12 +38,16 @@ pub struct Staged {
     /// The temp's size when it was closed.
     pub size: u64,
     /// SHA-256 of the bytes written, when they passed through sopen; `None` when the host
-    /// copied them itself (`copy-data`, `clonefile`), so sopen never saw them.
+    /// copied them itself (`copy-data`, `copy_file_range`), so sopen never saw them.
     pub sha256: Option<[u8; 32]>,
     /// The source as its open handle described it before the copy.
     pub source: FileMeta,
     /// What the copy could not keep (its mode, its times), for the report.
     pub notes: Vec<String>,
+    /// The temp's device and inode, by the descriptor the copy was written through (this
+    /// machine): the engine publishes the name only while it is still this file. `None` over
+    /// SFTP, which carries no inode.
+    pub id: Option<(u64, u64)>,
 }
 
 /// A source file opened for a copy to another host: its bytes, and what its open handle says.
@@ -183,8 +187,9 @@ pub trait FileOps: RemoteFs {
     fn set_meta(&mut self, path: &str, meta: &FileMeta) -> Vec<String>;
 
     /// Copies the regular file `from` into `temp` on this same host — `temp` created exclusively,
-    /// [`COPY_STEP`] at a time where the host copies, with `from`'s permission bits and times set
-    /// through the temp's handle, flushed to disk and closed. `cancel` is checked between steps
+    /// [`COPY_STEP`] at a time where the host copies (`copy-data`, `copy_file_range`), with
+    /// `from`'s permission bits and times set through the temp's handle, flushed to disk and
+    /// closed. `cancel` is checked between steps
     /// ([`Cancelled`](super::Cancelled)); `progress` gets the bytes copied so far. A failure says
     /// whether `temp` was created; the caller removes it.
     fn copy_within(
