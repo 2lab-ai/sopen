@@ -29,6 +29,31 @@ built-in hex editor, or save it where I choose — on the machine I typed it on,
 10. "sopen이 vscode가 있으면 먼저 vscode로 열개해줘 vscode -> zeditor"
 11. (on KDE Plasma, after `sopen .` printed "opened … in VS Code") "vscode 안나옴", then "해당 앱이 현재 화면으로 이동시켜줘"
 12. (2026-11-19) "다음처럼 개선해줘. 1. 해당 앱이 현재 화면으로 이동시켜줘. 2. 디폴트로 폴더를 고르면 토탈 커맨드 같은 프로그램이 떠야함 거기서 파일별로 엔터 누르면 해당 프로그램에서 디폴트 뷰어가 다 동작해야함 신택스 하이라이트 들어간 파일 뷰어 이미지 뷰어 영상 뷰어 헥스뷰어 모두 3. 이미지 편집은 ctrl+x ctrl+v작동하도록 해줘. 선택은 선택이고 선택하고 ctrl+c나 ctrl+x(자르기-해당부분만 배경색으로 잘리고 그림은 클리보드) ctrl+v(현재 선택된 영역으로 클립보드 내용 붙여넣기. 이미지면 그냥 스트레츠로 붙여넣고(고를수 있음), 텍스트면 텍스트채로 붙여줘). 픽셀라이즈는 ㅇㅋ 4. 디렉토리 뷰어 + 뷰어 + 헥스에디터 이거 pctools 레퍼런스 찾고 pctools 냄새 나게 해줘."
+13. (2026-11-20) "1. 오디오도 구간별로 자르고 붙여넣기 기능 넣어줘 이미지 편집 정도까지 할수 있도록 채널이 2개면 둘다 보여주고 모노를 스테레오로 복사해서 변환할 수 있게 해줘 / 1.1 이거 스템 처리 못하나? 어케함? 리서치해서 간단하게 보이스랑 음악이랑 분리해줄수 있는지 리서치해주고 할수 있으면 해줘 / 2. 영상도 마찬가지로 자르고 붙여넣기만 해줘. 오래 걸리는데 이거 편집할때 실시간으로 빠르게 보여줄수 있게 편집해주고 저장할때 실제로 ffmpeg이용해서 처리해줘 (뭔말인지 알지? 영상이라 실시간으로 자르고 붙여넣으면 너무 오래 걸리니까) / 3. 텍스트 표시할때 기본으로 워드랩 처리해줘. 그리고 당연히 전체를 메모리에 올리지 말고 청크처리해줘"
+14. (2026-11-20)
+    > 그리고 만약 폴드가 git 폴더면 vscode중에 git graph있는데 그거 /zworkflow:using-dotprd 사용해서 해당 git graph 기능 모두 뽑아서 해당 기능처럼 자유롭게 git 작업할 수 있도록해줘.
+    > 전체 커핏이랑 브랜치 그래프 볼수 있고 커밋 편집 최대한 자유롭게 할수 있게 해줘. 이런 폴더는 다른쪽은 뷰가 더블 디렉토리 뷰에서 다른쪽에 git 뷰로 변경됨.
+    >
+    > 이건 sopen 모드를 2개로 해주는 셈이고 디폴트가 미리보기 뷰.
+    > - 이 모드일때는 듀얼 디렉토리로 보여주다가 현재 폴더가 git이면 git 패널이 반대편에 나와야하고, 미리보기가 이미지등을 미리 반대편에 적절하게 현재 선택중인 파일의 내용을 미리 보여주도록 해줘.
+15. (2026-11-20)
+    > 그리고 디폴트로 키
+    > f2 = rename
+    > f5 = copy
+    > f6 = move
+    > ---
+    > 이거 주요 이러한 쉘들 단축키 리서치해주고 가장 일반적인 기준으로 단축키들 제안해줘.
+    >
+    > 그리고 맥북이나 윈도우나 리눅스가 기본적으로 펑션키는 항상 sopen에서 f1 f2 f3.. 펑션키로 동작하도록해줘. (이거 잘 모르겠는데 가능한지 리서치해줘)
+16. (2026-11-20)
+    > 그리도 또 기능
+    > f10인가 누르면 디렉토리 트리뷰
+    > 이거 잘 만들어야함.
+    > 1. 예를들어 디폴트로는 루트가 아니라 홈디렉토리 기준임. 현재 cwd가 홈디렉토리 밑에있으면 홈디렉토리가 루트로 트리로 보여줘야함.
+    > 만약 홈디렉토리가 아니면 그때 "/" 기준으로 보여줘야하고.
+    > 2. 디바이스 폴더는 펼쳐주면 안됨. 즉, 펼쳐주는 폴더랑 안펼쳐주는 폴더를 구분할수 있어야함. 예를들어 어떤 폴더 안에 디렉토리가 5개(예)미만이면 디폴트로 펼쳐서 보여주고 아니면 폴더를 닫은채 보여줘야함. (대신에 안에 어떤 느낌인지 폴더랑 파일이 몇개 있고 용량이 얼마 되는지 예측할수 있는 정보는 즉시 보여줘야함)
+    >
+    > 이거 리서치해서 영리하게 디렉토리 트리 보여주도록 해줘.
 
 Message 6 supersedes 3's "IrfanView 정도" with an exact list. Message 5 is a standing constraint:
 anything not in the table below is out of scope until usage says otherwise (§10). Messages 7–8 add
@@ -49,7 +74,20 @@ viewer for its kind in the same window — a read-only text viewer with syntax h
 still goes to VS Code / Zed. The browser views: copy, move, delete and rename are not part of it
 (§9), and the viewers keep exactly their edits. Its item 4 asks for the PC Tools look: the browser
 is laid out where PC Shell puts things (§3a), and every sopen window wears PC Shell 5.5 / 6's skin
-(§3a: palette, VGA font, frames, title and F-key rows, dialogs).
+(§3a: palette, VGA font, frames, title and F-key rows, dialogs). Message 13's item 3 makes the
+browser's text viewer wrap lines by default — every line whole, in rows — still reading the file a
+chunk at a time, never whole, a line of hundreds of megabytes too (A11, §3a); W or F2 goes back to
+one row per line. It adds no edit. Its items 1 and 2 are about the media window (§7).
+
+Messages 14–16 open the browser workstream, fixed in [`browser/ssot.md`](browser/ssot.md): message 14
+adds the git panel and the browser's two modes, preview (the default) and dual-directory (A12;
+[`02-architecture.md`](02-architecture.md), [`03-git-panel.md`](03-git-panel.md)); message 15 the file
+keys F2 rename, F5 copy, F6 move with the conventional rest, and function keys without fn (A13, A14;
+[`04-file-keys.md`](04-file-keys.md)); message 16 the directory tree (A15;
+[`05-directory-tree.md`](05-directory-tree.md)). They supersede message 12's "the browser views": the
+browser renames, copies, moves, makes folders and deletes — never over an existing name (04 §5) — and
+its git panel changes repositories, every history rewrite or destructive action backed up first (03
+§8). File operations in the browser and a directory tree leave §9.
 
 ## 2. Intent → acceptance
 
@@ -65,7 +103,11 @@ is laid out where PC Shell puts things (§3a), and every sopen window wears PC S
 | A8 | Developed like llmux | Public repo `2lab-ai/sopen`, MIT; `ci.yml` (macOS + Linux), `preview.yml` (every main push → prerelease + tap bump), `release.yml` (`v*` tag = owner gate); `AGENTS.md` SSOT; `.prd/` spec. |
 | A9 | `sopen SOURCE` opens here; `sopen --target <host> SOURCE` opens it on `<host>` (msg 7) | `sopen <host-a>:/tmp/a.html` opens on the machine it was typed on, as before. `sopen --target <host-b> <host-a>:/tmp/a.html` opens it on `<host-b>`'s screen: the same window or editor, started by `<host-b>`'s own sopen (on macOS sopen's window floats above the others until it is used; the editor opens behind the active app, §4a); exit code is `<host-b>`'s; `could not reach <host-b>` when ssh cannot get there; `sopen is not installed on <host-b> …` (exit 127) when it has no sopen. A file on `<host-b>` itself opens there as a local file; a local file reaches `<host-b>` as `<this machine>:<path>`. |
 | A10 | Default target in sopen's settings (msg 8) | `sopen config target <host-b>` writes `target = "<host-b>"` to the config file (§4a); from then on `sopen SOURCE` opens on `<host-b>`, `--here` opens on this machine anyway, `--target` picks another; `sopen config` shows the file and the target; `sopen config target --unset` removes it. A config sopen cannot read is an error naming the file, never ignored. |
-| A11 | A folder opens in a Total Commander-like program; Enter on a file runs its default viewer there (msg 12) | `sopen host:/dir` opens sopen's file browser (§3a): two panels on the folder, folders first; Tab switches panels, Enter enters a folder, Backspace goes up, a letter jumps to the next name with it; Enter on a file shows it in the same window — text highlighted with line numbers, an image in the image window, video/audio in the media window, anything else in the hex window — and Esc returns to the list with the bar where it was; F4 opens the entry in VS Code / Zed (A2's choice). An edited image or hex file is never dropped unasked: leaving asks as its own window does. `--app` still opens a file in a named app; a folder with `--app` / `--hex` is an error, as before. |
+| A11 | A folder opens in a Total Commander-like program; Enter on a file runs its default viewer there (msg 12) | `sopen host:/dir` opens sopen's file browser (§3a): two panels on the folder, folders first; Tab switches panels, Enter enters a folder, Backspace goes up, a letter jumps to the next name with it; Enter on a file shows it in the same window — text highlighted with line numbers, its lines wrapped (msg 13; W or F2: one row per line), an image in the image window, video/audio in the media window, anything else in the hex window — and Esc returns to the list with the bar where it was; F4 opens the entry in VS Code / Zed (A2's choice). An edited image or hex file is never dropped unasked: leaving asks as its own window does. `--app` still opens a file in a named app; a folder with `--app` / `--hex` is an error, as before. |
+| A12 | Git panel and browser modes (msg 14) | In a folder inside a git work tree, local or remote, the opposite side shows the git panel: every commit and branch as a graph, commit details and diffs, every Git Graph action and free history editing, each history rewrite or destructive action confirmed and backed up; the browser opens in preview mode (the opposite side previews the file under the bar) and F9 switches to dual-directory mode. Scenarios: 02 §4.5, 03 §11. |
+| A13 | F2 rename, F5 copy, F6 move, the conventional rest (msg 15) | The list's F-key row reads `1Help 2Rename 3View 4Edit 5Copy 6Move 7MkDir 8Delete 9Dual 10Tree` once every slice has landed (until then a slot not built yet is empty, 02 §8); every file-changing key asks first and never overwrites an existing name, locally and over SFTP. Scenarios: 04 §8 (K-R, K-S, K-C, K-M, K-N, K-K, K-D). |
+| A14 | Function keys act as F1…F12 in sopen (msg 15) | Every F-key row is clickable and Cmd/Ctrl+1…0 act as F1…F10 in every window; on macOS the top row sends F-keys while a sopen window is focused and the Mac's setting comes back on blur, quit and crash; Linux and Windows have the fallback only. Scenarios: 04 §8 (K-F). |
+| A15 | F10 directory tree (msg 16) | F10 (or Alt+F10) shows a tree rooted at the home when the folder is under it, else at `/`; device, virtual, network and mount folders never open by themselves; folders with fewer than 5 subfolders open within a row budget; every row shows its folder and file counts and a growing size at once. Scenarios: 05 §8. |
 
 Owner message 17 (2026-11-20, quoted in [`06-streaming.md`](06-streaming.md)) asks that every viewer
 stream and that edits live locally until saved. Its contract is planned, and this file describes
@@ -131,9 +173,9 @@ are where PC Shell puts them: the program's name on the top row; two file panels
 each in a frame with its folder (`host:/abs`) centred in the top border and the active panel's
 frame drawn heavier; the status row (a fetch's progress, the last result, else what the keys do);
 the bottom row lists the F-keys that work there and nothing else (the list: 3 View, 4 Edit; a
-viewer: 3 Exit, 4 Edit and the viewer's own — the hex window's 5 Save, 6 Goto, 8 Asc/hx, aliases
-of ⌘S, ⌘G and Tab, and the image window's 5 Save; a plain F-key never acts while a text field has
-the typing). The foot shows `N Listed = N bytes` whole inside the frame whatever the width: the
+viewer: 3 Exit, 4 Edit and the viewer's own — the text viewer's 2 Unwrap (Wrap once unwrapped),
+an alias of W; the hex window's 5 Save, 6 Goto, 8 Asc/hx, aliases of ⌘S, ⌘G and Tab; and the
+image window's 5 Save; a plain F-key never acts while a text field has the typing). The foot shows `N Listed = N bytes` whole inside the frame whatever the width: the
 free space gives way first, then the end of the total. Every cell fits its column at a glyph
 boundary (a name or an extension too long ends in "…"; a size too long for its column is said in
 the smallest unit that fits, KB to EB, never cut). All drawing of those rows, the frames, the bar and every colour sits in
@@ -192,13 +234,51 @@ too, where F3 closes it as ⌘W does.
 - **The text viewer** is read-only: line numbers, syntax highlighting (syntect — Sublime
   syntaxes and themes, on the pure-Rust regex engine, nothing linked) chosen by the extension or
   the whole name, else by the first line (a shebang) as read through an index that may be read —
-  at open and again from each new index; ↑/↓, PgUp/PgDn (a page keeps one line of context),
-  Home/End (start and end of the file), ←/→ scroll sideways, the wheel scrolls. It never reads
-  the file whole: opening indexes the lines in one pass (a mark every 256 lines, and at the first
-  line start 64 KiB past the last mark), and a page reads at most 64 KiB before it plus the shown
-  part of each line. 4096 bytes of a line are shown (the bar says when lines are cut); invalid
-  UTF-8 shows as U+FFFD (a real character cut in two at the end of a cut line is left out; bytes
-  that can never start one stay U+FFFD). Highlighting carries state from the top of the file: the
+  at open and again from each new index. It never reads the file whole: opening indexes the lines
+  in one pass (a mark every 256 lines, and at the first line start 64 KiB past the last mark).
+  Invalid UTF-8 shows as U+FFFD (each maximal bad sequence one, as Rust's lossy decoding has it);
+  a control character as its code page 437 glyph.
+  - **Wrapped** (the default, msg 13): every line is shown whole, in rows as wide as the window,
+    its number on its first row. A row ends where the next grapheme cluster (a letter and its
+    marks, an Indic syllable, an emoji sequence: never split) would not fit, measured by laying
+    the row out as egui paints it (Hangul, CJK and emoji are wider than a cell; Arabic and Hebrew
+    are shaped right to left), in a few layouts per row — at the last place a row may break when
+    what follows it fits on the next row, else where the row is full. A row may break after a
+    space, and next to an ideograph, kana or fullwidth form (as UAX #14 allows: Chinese and
+    Japanese have no spaces; Hangul words, which are spaced, and Latin words stay whole), never
+    before closing punctuation (`。、」）！？`…) or a space, never after opening punctuation
+    (`「（`…). A space the row is full at is not carried to the next row. A row is painted left
+    to right: each run of right-to-left letters (Hebrew, Arabic…, with the spaces between them;
+    by grapheme cluster, so a mark stays with its letter) is shaped as one, right to left, and
+    everything else left to right, in the row's order —
+    egui would otherwise shape a row whose first strong letter is right to left reversed whole,
+    its English too; painting only, never the measured width. A tab goes to the next stop of four
+    cells counted from its row's start. A line is wrapped afresh at every 16 KiB of it — at the
+    first word start (after a space) within 128 bytes, else the first grapheme cluster start, else
+    (a cluster longer than that) the first character start — so a row's end depends only on where
+    the row starts: the rows are
+    the same reached going down or back up. The place on screen is a line and the byte of it the
+    top row starts at. ↑/↓ move a row, PgUp/PgDn a page of rows (one row of context), the wheel
+    by rows; going back up reads at most 16 KiB of a line before the row (never a long line
+    whole). Home: the line's first row when the top is inside a line, else the start of the file;
+    End: the line's last row at the bottom when the line at the top runs past the page, else the
+    end of the file; Cmd/Ctrl+Home and +End: the start and end of the file. Never past the last
+    page (the file's last row at the bottom). A page finds its lines through the index as an
+    unwrapped page does (from the mark before them, at most a span of each block), then reads its
+    rows' bytes — a row at most 16 bytes per column and 256 more (a row of zero-width characters is
+    cut there) — in reads of at most 16 KiB, never past where the index says a line ends; a
+    character is never decoded cut in two at a read's edge. The status row says which
+    lines are on screen and, when the top row is inside a line, how far into it (`line 7 (12 % of
+    it) of 120`); the scroll bar's thumb goes by bytes (rows cannot be counted without reading
+    everything). A narrower or wider window, or a new index, puts the top back on the start of the
+    row it is in. A highlighted line's colours run on across its rows.
+  - **Unwrapped** (W or F2 again): one row per line, ↑/↓, PgUp/PgDn (a page keeps one line of
+    context), Home/End and Cmd/Ctrl+Home/End (start and end of the file), ←/→ scroll sideways, the
+    wheel scrolls; a page reads at most 64 KiB before it plus the shown part of each line. 4096
+    bytes of a line are shown (the bar says when lines are cut; a real character cut in two at the
+    end of a cut line is left out; bytes that can never start one stay U+FFFD).
+
+  Highlighting carries state from the top of the file: the
   state at each mark is computed once, on a worker of the viewer's own with its own handle on the
   file — never on a frame (one parse call cannot be interrupted, and a pathological line can take
   minutes). A page shows plain and its highlighted lines replace the plain ones when the worker
@@ -210,7 +290,7 @@ too, where F3 closes it as ⌘W does.
   highlighting is busy in other viewers. A worker that fails (a read error, a panic) leaves the
   page plain, ready, with the reason on the status row. A line is parsed only whole, so
   highlighting stops at the first line over 4096 bytes (the status row says which) and the rest
-  is plain; files over 16 MiB are shown plain. The file is read live, the index is of the file as
+  is plain — wrapped, still whole; files over 16 MiB are shown plain. The file is read live, the index is of the file as
   scanned, checked when the viewer opens and before each page against the open handle and the
   path it was opened by. Both still showing the indexed device, inode, size and modification
   time: unchanged. Both still showing the indexed device and inode, the scan having read every
@@ -236,7 +316,8 @@ too, where F3 closes it as ⌘W does.
   next pass waits as above (a vanished path: "the file was deleted"). Even a used index replaces
   the page on screen only with a page read through it, so a change landing first also leaves
   the last page up. The new index starts highlighting afresh; the viewer keeps its top line
-  (clamped), or follows the new end if it was at the end ("the file grew; following the end",
+  (clamped; wrapped, put back on the start of the row it is in), or follows the new end if it was
+  at the end — wrapped, when the file's last row was on screen — ("the file grew; following the end",
   like `tail -f`; else "the file changed; re-read"). A local file viewed at its end is looked at
   again each second with no input (one stat), so a growing log is followed without a key press —
   also one written to without pause (each re-read is used though the file grew during it); away
@@ -275,6 +356,9 @@ too, where F3 closes it as ⌘W does.
 - Nothing is installed on the remote. Only sshd's SFTP subsystem is required. (VS Code Remote - SSH or Zed installs its own server when the
   owner opens folders/text; that is the editor's behaviour, documented in the README.) A `--target` machine (§4a) is not a
   file's remote: it is a machine the owner uses sopen on, and runs the sopen installed there.
+- The git panel (03) runs the `git` already installed on a remote over the same master, as an ssh
+  command whose words are quoted as `--target`'s are (03 §3.2); it uploads and installs nothing, and
+  without git there it is not offered. File operations (04) and the directory tree (05) stay SFTP.
 
 ## 4a. Where it opens
 
@@ -592,8 +676,7 @@ Local only, never sent anywhere. Exists for §10.
 
 ## 9. Out of scope (until §10 says otherwise)
 
-Own text editor (the browser's text viewer is read-only; VS Code or Zed edits), a directory tree,
-file operations in the browser (copy, move, delete, rename, make folder — msg 12 asks for viewing),
+Own text editor (the browser's text viewer is read-only; VS Code or Zed edits),
 hex insert / delete or anything that changes a file's size, image edits beyond crop, pixelize and
 clipboard copy / cut / paste (no drawing or text tool, no layers, no filters), frame-accurate
 copy without re-encode, directory sync / mounts, file watching,

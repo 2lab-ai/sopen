@@ -10,6 +10,7 @@ pub mod binary;
 pub mod browser;
 pub mod chrome;
 pub mod fonts;
+mod help;
 pub mod hex;
 pub mod image;
 pub mod media;
@@ -180,7 +181,9 @@ pub enum Op {
 /// `SOPEN_STATE=rect=x,y,w,h;t=3.5;in=2;out=6;op=crop|pixelize;block=16` — source pixels and
 /// seconds. `op` may list several, comma-separated, applied in order. The hex window takes
 /// `at=OFFSET;patch=OFFSET:HEXBYTES[,OFFSET:HEXBYTES]` (offsets `0x…` or decimal); the file
-/// browser `open=NAME`; the image and hex windows `close=ask`.
+/// browser `open=NAME`, and `at=OFFSET` for the first text file it opens — by `open=NAME` or by
+/// hand, whichever comes first (the row that byte is in at the top); the image and hex windows
+/// `close=ask`.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct State {
     pub rect: Option<[u32; 4]>,
@@ -189,7 +192,8 @@ pub struct State {
     pub out_s: Option<f64>,
     pub ops: Vec<Op>,
     pub block: Option<u32>,
-    /// Hex window: where the cursor starts.
+    /// Hex window: where the cursor starts. The file browser: the first text file it opens (by
+    /// `open=` or by hand) starts with the row this byte is in at the top; later ones do not.
     pub at: Option<u64>,
     /// Hex window: bytes overwritten at an offset, applied in order (each one an undo step).
     pub patches: Vec<(u64, Vec<u8>)>,
@@ -382,6 +386,15 @@ pub trait Window {
     /// there (a window of its own shows them in its own row, see [`own_keys`]).
     fn keys(&self) -> &'static [chrome::FKey] {
         &[]
+    }
+
+    /// The window becomes a preview in the file browser's opposite side (`true`), or a viewer
+    /// again (`false`: the hand-over), 02 §4.2 and §4.4. A preview draws as inactive and without
+    /// its own bars, takes no input, plays nothing, does not follow a growing file and keeps to
+    /// 02 §4.3's budgets; `false` lifts all of that. The default does nothing (S1-B implements it
+    /// for the viewers).
+    fn set_preview(&mut self, on: bool) {
+        let _ = on;
     }
 }
 
@@ -932,6 +945,11 @@ mod tests {
             vec![(16, vec![0xde, 0xad]), (17, vec![0x00, 0xff])]
         );
         assert_eq!(State::parse("at=42").unwrap().at, Some(42));
+        let s = State::parse("open=big.txt;at=524293700").unwrap();
+        assert_eq!(
+            (s.open.as_deref(), s.at),
+            (Some("big.txt"), Some(524_293_700))
+        );
         assert_eq!(
             State::parse("open=main.rs").unwrap().open.as_deref(),
             Some("main.rs")
@@ -1034,6 +1052,34 @@ mod tests {
             modifiers: egui::Modifiers::NONE,
         };
         assert!(!user_input(&release));
+    }
+
+    /// The trait's default `set_preview` changes nothing: a window that does not implement it
+    /// draws and answers the same after it, called as the browser holds its viewers
+    /// (`dyn Window`).
+    #[test]
+    fn the_default_set_preview_does_nothing() {
+        struct Plain;
+        impl Window for Plain {
+            fn ui(&mut self, ui: &mut egui::Ui) {
+                ui.label("a plain window");
+            }
+            fn ready(&self) -> bool {
+                true
+            }
+        }
+        let mut w = Plain;
+        let mut drv = testkit::Driver::new(400.0, 300.0);
+        drv.frame(&mut w, Vec::new(), egui::Modifiers::NONE);
+        let before = drv.texts();
+        assert!(drv.find_text("a plain window").is_some(), "{before:?}");
+        for on in [true, false] {
+            let dyn_w: &mut dyn Window = &mut w;
+            dyn_w.set_preview(on);
+            assert!(dyn_w.ready() && dyn_w.keys().is_empty() && dyn_w.close_requested());
+            drv.frame(&mut w, Vec::new(), egui::Modifiers::NONE);
+            assert_eq!(drv.texts(), before, "set_preview({on})");
+        }
     }
 
     #[test]

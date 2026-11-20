@@ -14,8 +14,12 @@
 //! Nothing slow runs on a frame: listing, opening a connection, fetching, decoding and probing
 //! run on workers, and Esc stops a fetch.
 
+pub(crate) mod keys;
+mod ops;
 mod panel;
 mod prepare;
+mod preview;
+pub(crate) mod view;
 
 use super::chrome::{self, FKey};
 use super::{Embedded, Hooks, Outcome, Status, Window};
@@ -50,11 +54,32 @@ pub struct Start {
     pub connect: Connect,
     /// `[user@]host`; `None` on this machine.
     pub label: Option<String>,
+    /// The host as `ssh` takes it (`user@host`, an IPv6 host unbracketed:
+    /// [`RemoteSpec::destination`](crate::target::RemoteSpec::destination), not `label`); `None`
+    /// on this machine. For what runs over the folder's ssh master besides the listing (02 §5);
+    /// nothing reads it yet.
+    pub destination: Option<String>,
     /// The folder (absolute).
     pub abs: String,
     /// sopen's cache root.
     pub cache: PathBuf,
+    /// sopen's state folder, where the ssh master's socket is
+    /// ([`connection_args`](crate::remote::connection_args)); nothing reads it yet.
+    pub state_dir: PathBuf,
     pub launch: Launch,
+}
+
+/// What the browser's features tell it (02 §7). S1-E sends and handles them.
+#[allow(dead_code)] // S1-0 scaffold: S1-E's wiring uses it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum BrowserEvent {
+    /// Files changed in `dirs` (absolute) on `host` (`[user@]host`; `None`: this machine), after
+    /// a file operation (04 §5.1) or, from S2, a git write: the panels showing one of `dirs`
+    /// re-list, a git panel whose top level holds one soft-refreshes.
+    FilesChanged {
+        host: Option<String>,
+        dirs: Vec<String>,
+    },
 }
 
 /// Shows the browser until its window closes; then waits for anything a viewer may still be
@@ -63,6 +88,7 @@ pub fn open(start: Start, hooks: &Hooks) -> Result<Outcome> {
     let title = show(start.label.as_deref(), &start.abs);
     let mut browser = Browser::new(start);
     browser.open_first = hooks.state.open.clone();
+    browser.open_at = hooks.state.at;
     let leftover = browser.leftover.clone();
     let run = super::run_window(&title, WINDOW, browser, hooks);
     let outcome = leftover.borrow_mut().finish();
@@ -203,6 +229,10 @@ pub(crate) struct Browser {
     painted: bool,
     /// `SOPEN_STATE` `open=NAME`: opened once the folder is first listed (receipts of a viewer).
     open_first: Option<String>,
+    /// `SOPEN_STATE` `at=OFFSET`: where the first text viewer opened in this browser starts (the
+    /// row that byte is in at the top) — the one `open=` opens, or else the first the owner
+    /// opens; taken by it, so no later viewer gets it.
+    open_at: Option<u64>,
 }
 
 impl Drop for Browser {
@@ -252,6 +282,7 @@ impl Browser {
             visible: 1,
             painted: false,
             open_first: None,
+            open_at: None,
         };
         browser.list(None, start.abs, None, None);
         browser
@@ -340,6 +371,11 @@ impl Browser {
             worker: Some(worker),
         });
     }
+
+    /// Carries out a key's command (02 §7); S1-E dispatches it to `ops`, `view` and the rest.
+    /// S1-0 scaffold: no command exists yet, so it does nothing.
+    #[allow(dead_code)] // S1-0 scaffold: S1-E's wiring calls it.
+    fn run(&mut self, _command: keys::Command) {}
 
     /// Results from the workers: a listing, a file ready (its viewer shows), an F4 launch; and
     /// writes of viewers already gone.
@@ -488,7 +524,11 @@ impl Browser {
             } => {
                 // A file read in place (no fetched copy) is followed at its end.
                 let live = claim.is_none();
-                (super::text::embed(doc, title, &name, notices, live), claim)
+                let at = self.open_at.take();
+                (
+                    super::text::embed(doc, title, &name, notices, live, at),
+                    claim,
+                )
             }
         };
         // The list gave up the keyboard: the viewer's keys are its own now.

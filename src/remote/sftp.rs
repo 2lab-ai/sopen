@@ -8,6 +8,8 @@
 //! progress. A request that changes the remote and times out is reported as
 //! [`OutcomeUnknown`](super::OutcomeUnknown), never as "nothing written".
 
+mod ops;
+
 use super::{unknown, CreateError, Created, Entry, Hashing, Like, RemoteFs, Stat, Uploaded};
 use crate::target::RemoteSpec;
 use anyhow::{anyhow, bail, Context, Result};
