@@ -1149,7 +1149,8 @@ fn a_last_frame_held_long_shows_the_last_picture() {
 }
 
 /// The window's own F-key, F5 (Save), is the key alone (04 §3): Shift, Alt or Cmd/Ctrl with it
-/// does nothing — no save starts, nothing is rendered — and F5 by itself saves.
+/// does nothing, nor does F5 while a text field has the keyboard — no save starts, nothing is
+/// rendered — and F5 by itself saves.
 #[test]
 fn f5_with_a_modifier_does_nothing() {
     let Some(mut fx) = audio(true) else { return };
@@ -1159,11 +1160,24 @@ fn f5_with_a_modifier_does_nothing() {
         Modifiers::SHIFT,
         Modifiers::ALT,
         Modifiers::SHIFT | Modifiers::ALT,
+        command(false),
+        command(true),
     ] {
         fx.key(Key::F5, mods);
         fx.drv.idle(&mut fx.win, 2);
         assert!(fx.win.save.is_none(), "{mods:?}+F5 started a save");
     }
+    // Nor F5 alone while a text field has the keyboard: the typing is the field's.
+    let field = egui::Id::unique("a text field");
+    let ctx = fx.drv.ctx.clone();
+    egui::text_edit::TextEditState::default().store(&ctx, field);
+    ctx.memory_mut(|m| m.request_focus(field));
+    assert!(ctx.text_edit_focused());
+    fx.key(Key::F5, Modifiers::NONE);
+    assert!(fx.win.save.is_none(), "F5 into a text field started a save");
+    ctx.memory_mut(|m| m.surrender_focus(field));
+    fx.drv.idle(&mut fx.win, 2);
+    assert!(fx.win.save.is_none());
     assert_eq!(fx.spawned().render, 0, "nothing rendered");
     assert!(fx.win.unsaved());
     fx.key(Key::F5, Modifiers::NONE);
@@ -1173,4 +1187,159 @@ fn f5_with_a_modifier_does_nothing() {
         "{}",
         fx.win.status.text
     );
+}
+
+/// `ps`'s state of process `pid` (`Z` for a zombie), or `None` once it is gone.
+fn process_state(pid: &str) -> Option<String> {
+    let out = std::process::Command::new("ps")
+        .args(["-o", "stat=", "-p", pid])
+        .output()
+        .unwrap();
+    let state = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!state.is_empty()).then_some(state)
+}
+
+/// Stand-in decoders left running by a failed test are ended with it.
+struct KillOnDrop(PathBuf);
+
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        for pid in std::fs::read_to_string(&self.0).unwrap_or_default().lines() {
+            let _ = std::process::Command::new("kill")
+                .args(["-9", pid])
+                .status();
+        }
+    }
+}
+
+/// One paused frame has one work budget, the seek, the look past its slot and the read-back
+/// together: an ffmpeg that never answers (a seek in an unindexed file, a scan to the end of a
+/// long input) is stopped when it runs out — killed and reaped, no child left — and the frame is
+/// "no frame here". Every decode reads a bounded stretch of its input (`-t` before `-i`). The
+/// stand-in records its pid and arguments, then sleeps without a word.
+#[test]
+fn a_paused_frame_that_never_comes_is_given_up_within_its_budget() {
+    use std::os::unix::fs::PermissionsExt;
+    let Some(fx) = video() else { return };
+    let pids = fx.tmp.path().join("pids");
+    let args = fx.tmp.path().join("args");
+    let _cleanup = KillOnDrop(pids.clone());
+    let stub = fx.tmp.path().join("ffmpeg");
+    std::fs::write(
+        &stub,
+        format!(
+            "#!/bin/sh\n[ \"$1\" = -version ] && exit 0\necho $$ >> '{}'\n\
+             echo \"$*\" >> '{}'\nexec sleep 600\n",
+            pids.display(),
+            args.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+    crate::testutil::run_fresh(std::process::Command::new(&stub).arg("-version"));
+    let mut media = (*fx.win.media).clone();
+    media.tools = Tools {
+        ffmpeg: stub.clone(),
+        ffprobe: stub,
+    };
+    let budget = std::time::Duration::from_secs(1);
+    let scrub = Scrubber::start_with(&media, fx.drv.ctx.clone(), budget).unwrap();
+    for key in [40, media.last_frame()] {
+        let asked = std::time::Instant::now();
+        scrub.request(key as f64 / 25.0, key);
+        let got = loop {
+            if let Some(r) = scrub.result.lock().unwrap().take() {
+                break r;
+            }
+            assert!(
+                asked.elapsed() < std::time::Duration::from_secs(20),
+                "frame {key}: no answer"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        let took = asked.elapsed();
+        assert!(
+            took < budget + std::time::Duration::from_secs(2),
+            "{took:?}"
+        );
+        match got {
+            Ok(_) => panic!("frame {key}: a picture from nowhere"),
+            Err(e) => assert!(e.starts_with("no frame here"), "{e}"),
+        }
+        for pid in std::fs::read_to_string(&pids).unwrap().lines() {
+            assert_eq!(process_state(pid), None, "ffmpeg {pid} left behind");
+        }
+    }
+    for line in std::fs::read_to_string(&args).unwrap().lines() {
+        let words: Vec<&str> = line.split(' ').collect();
+        let input = words.iter().position(|w| *w == "-i").unwrap();
+        assert!(words[..input].contains(&"-t"), "unbounded read: {line}");
+    }
+}
+
+/// A 2 s picture with ten minutes of sound after it: the paused frame anywhere past the
+/// picture's end is its last frame, found within the frame's budget, and no ffmpeg is left
+/// reading the file afterwards.
+#[test]
+fn past_a_short_picture_s_end_the_last_frame_comes_within_the_budget() {
+    let Some(tools) = tools_or_skip() else { return };
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("tail.mp4");
+    ff(
+        &tools,
+        &[
+            "-f",
+            "lavfi",
+            "-i",
+            "nullsrc=s=64x64:r=25:d=2,geq=lum='16+2*N':cb=128:cr=128,format=yuv420p",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=f=440:r=8000:d=600",
+            "-c:v",
+            "libx264",
+            "-crf",
+            "10",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "24k",
+            path.to_str().unwrap(),
+        ],
+    );
+    let mut fx = open_file(tmp, path.clone());
+    let gray = |rgba: &[u8]| (f64::from(rgba[0]) * 219.0 / 255.0 / 2.0).round() as i64;
+    for t in [2.5, 300.0, fx.win.length()] {
+        let ctx = fx.drv.ctx.clone();
+        let asked = std::time::Instant::now();
+        fx.win.seek(&ctx, t);
+        fx.settle();
+        assert!(
+            asked.elapsed() < SCRUB_BUDGET,
+            "at {t} s: {:?}",
+            asked.elapsed()
+        );
+        let (_, key) = fx.win.want.unwrap();
+        let shown = fx
+            .win
+            .scrub
+            .as_ref()
+            .unwrap()
+            .cache
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(k, _)| *k == key)
+            .map(|(_, f)| gray(f));
+        assert_eq!(shown, Some(49), "at {t} s (frame {key})");
+        let ps = std::process::Command::new("ps")
+            .args(["-axo", "command="])
+            .output()
+            .unwrap();
+        let left = String::from_utf8_lossy(&ps.stdout)
+            .lines()
+            .filter(|l| l.contains(path.to_str().unwrap()))
+            .count();
+        assert_eq!(left, 0, "at {t} s: ffmpeg left reading the file");
+    }
 }

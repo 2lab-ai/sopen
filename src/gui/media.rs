@@ -31,7 +31,7 @@ use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering::SeqCst};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Condvar, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use timeline::{Clip, Tick, Timeline, View};
 
 /// Closing was asked for during an export: what happens, and what a second close does (its own
@@ -256,6 +256,22 @@ fn transport_text(marks: &Marks, duration: f64) -> String {
     )
 }
 
+/// How long one paused frame may take to find — the seek, the look past its slot, the read
+/// back, all together: then its ffmpeg is stopped and there is no frame here.
+const SCRUB_BUDGET: Duration = Duration::from_secs(5);
+
+/// How far past a paused frame's slot its decode reads before it says there is no picture
+/// there (a picture further on is another slot's).
+const LOOK_PAST_S: f64 = 3.0;
+
+/// Why a paused frame's decode gave no picture.
+enum Miss {
+    /// Nothing there (or ffmpeg could not run): what to say.
+    Nothing(String),
+    /// The frame's work budget ran out; its ffmpeg was stopped.
+    Spent,
+}
+
 /// The frame asked for next: timeline time and source frame (the latest request wins).
 type Request = Arc<(Mutex<Option<(f64, Tick)>>, Condvar)>;
 /// Decoded frames kept, by source frame, oldest first.
@@ -282,6 +298,11 @@ struct Scrubbed {
 
 impl Scrubber {
     fn start(media: &Media, ctx: egui::Context) -> Option<Self> {
+        Self::start_with(media, ctx, SCRUB_BUDGET)
+    }
+
+    /// [`Scrubber::start`] with `budget` for each frame (tests shorten it).
+    fn start_with(media: &Media, ctx: egui::Context, budget: Duration) -> Option<Self> {
         let (w, h) = media.decode_size()?;
         let req: Request = Arc::default();
         let result: Arc<Mutex<Option<Result<Scrubbed, String>>>> = Arc::default();
@@ -309,18 +330,27 @@ impl Scrubber {
             // start (the last frame, or any slot with no picture after it: a last frame stamped
             // a little early, or held long), the latest picture of the two seconds before the
             // end of its slot is the one — as the frame grid puts there. Anywhere else, nothing
-            // is no frame.
+            // is no frame. Each decode reads a bounded stretch of the input, and all of them
+            // together have `budget`.
             let at = (origin + key as f64 / fps - 0.5 / fps).max(0.0);
             let slot_end = origin + (key as f64 + 0.5) / fps;
-            let grab = |from: f64, one: bool| -> Result<Vec<u8>, String> {
+            let deadline = Instant::now() + budget;
+            let no_frame =
+                || Miss::Nothing(format!("no frame at {}", clock_text(key as f64 / fps)));
+            // From `from`, `span` seconds of input: its first picture (`one`), or the latest one
+            // before the slot's end.
+            let grab = |from: f64, span: f64, one: bool| -> Result<Vec<u8>, Miss> {
+                if Instant::now() >= deadline {
+                    return Err(Miss::Spent);
+                }
                 let mut cmd = std::process::Command::new(&tools.ffmpeg);
                 cmd.args(["-nostdin", "-hide_banner", "-loglevel", "error", "-ss"])
-                    .arg(format!("{from:.6}"));
-                if !one {
-                    // Read only up to the end of the slot, not to the end of the file.
-                    cmd.arg("-t").arg(format!("{:.6}", slot_end - from));
-                }
-                cmd.arg("-i").arg(path.arg()).args(["-an", "-sn", "-vf"]);
+                    .arg(format!("{from:.6}"))
+                    .arg("-t")
+                    .arg(format!("{span:.6}"))
+                    .arg("-i")
+                    .arg(path.arg())
+                    .args(["-an", "-sn", "-vf"]);
                 if one {
                     cmd.arg(format!("scale={w}:{h},format=rgba"))
                         .args(["-frames:v", "1"]);
@@ -342,10 +372,28 @@ impl Scrubber {
                     .stdin(Stdio::null())
                     .stdout(Stdio::piped())
                     .stderr(Stdio::null());
-                let mut child = ffmpeg::spawn(&mut cmd)
-                    .map_err(|e| format!("cannot run {}: {e}", tools.ffmpeg.display()))?;
-                use std::io::Read;
+                let mut child = ffmpeg::spawn(&mut cmd).map_err(|e| {
+                    Miss::Nothing(format!("cannot run {}: {e}", tools.ffmpeg.display()))
+                })?;
                 let mut out = child.stdout.take().expect("piped");
+                // Stopped at the deadline from here, its output then ending; killed and reaped
+                // below however the read ended.
+                let child = Arc::new(Mutex::new(child));
+                let spent = Arc::new(AtomicBool::new(false));
+                let (stop, stopped) = std::sync::mpsc::channel::<()>();
+                let killer = {
+                    let (child, spent) = (child.clone(), spent.clone());
+                    let left = deadline.saturating_duration_since(Instant::now());
+                    std::thread::spawn(move || {
+                        if let Err(std::sync::mpsc::RecvTimeoutError::Timeout) =
+                            stopped.recv_timeout(left)
+                        {
+                            spent.store(true, SeqCst);
+                            let _ = child.lock().unwrap().kill();
+                        }
+                    })
+                };
+                use std::io::Read;
                 let mut last: Option<Vec<u8>> = None;
                 loop {
                     let mut rgba = vec![0u8; (w * h * 4) as usize];
@@ -357,31 +405,54 @@ impl Scrubber {
                         break;
                     }
                 }
+                drop(stop);
+                let _ = killer.join();
+                let mut child = child.lock().unwrap();
                 let _ = child.kill();
                 let _ = child.wait();
-                last.ok_or_else(|| format!("no frame at {}", clock_text(key as f64 / fps)))
+                match last {
+                    // The first picture is the one, however close to the deadline it came.
+                    Some(rgba) if one => Ok(rgba),
+                    // Stopped mid-read: the latest picture read may not be the latest there.
+                    _ if spent.load(SeqCst) => Err(Miss::Spent),
+                    Some(rgba) => Ok(rgba),
+                    None => Err(no_frame()),
+                }
             };
             let frame = {
-                let read = grab(at, true).or_else(|e| {
-                    // Past the picture's last start only if nothing comes after the slot
-                    // either; a picture there makes this a frame that failed to decode.
-                    if key < last_frame && grab(slot_end, true).is_ok() {
+                let read = grab(at, slot_end - at + LOOK_PAST_S, true).or_else(|e| {
+                    if matches!(e, Miss::Spent) {
                         return Err(e);
                     }
-                    grab((at - 2.0).max(0.0), false)
-                });
-                {
-                    read.map(|rgba| {
-                        let rgba = Arc::new(rgba);
-                        let mut c = store.lock().unwrap();
-                        c.retain(|(k, _)| *k != key);
-                        c.push_back((key, rgba.clone()));
-                        while c.len() > keep {
-                            c.pop_front();
+                    // Past the picture's last start only if nothing comes after the slot
+                    // either; a picture there makes this a frame that failed to decode.
+                    if key < last_frame {
+                        match grab(slot_end, LOOK_PAST_S, true) {
+                            Ok(_) => return Err(e),
+                            Err(Miss::Spent) => return Err(Miss::Spent),
+                            Err(Miss::Nothing(_)) => {}
                         }
-                        Scrubbed { t, key, rgba }
-                    })
-                }
+                    }
+                    let from = (at - 2.0).max(0.0);
+                    grab(from, slot_end - from, false)
+                });
+                read.map(|rgba| {
+                    let rgba = Arc::new(rgba);
+                    let mut c = store.lock().unwrap();
+                    c.retain(|(k, _)| *k != key);
+                    c.push_back((key, rgba.clone()));
+                    while c.len() > keep {
+                        c.pop_front();
+                    }
+                    Scrubbed { t, key, rgba }
+                })
+                .map_err(|miss| match miss {
+                    Miss::Nothing(why) => why,
+                    Miss::Spent => format!(
+                        "no frame here: finding it took longer than {} s",
+                        budget.as_secs_f64()
+                    ),
+                })
             };
             *res.lock().unwrap() = Some(frame);
             ctx.request_repaint();

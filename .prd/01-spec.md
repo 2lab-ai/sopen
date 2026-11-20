@@ -695,7 +695,8 @@ once the primary button is up, and take rows off the grid's bottom.
   underrun). Paused, the frame at the playhead is the source frame the timeline maps it to — at most the picture's last
   frame (past it, a longer sound track, that frame holds; a last frame that starts before its slot is the latest
   picture of the two seconds before the slot's end, read no further; anywhere else a frame that cannot be decoded
-  is an error, never another picture); the last decoded frames are kept (64 MB), so the frame an
+  is an error, never another picture; each of its decodes reads at most 3 s past the slot, and all of them together
+  have 5 s: then the ffmpeg is stopped and reaped, and the status says there is no frame here); the last decoded frames are kept (64 MB), so the frame an
   edit brings under the playhead is usually there at once (measured 1–2 ms; a frame not kept: one decode, 70–95 ms).
   An edit while playing restarts playback at the playhead. On video, timeline frame slot `k` is the source frame at
   `origin + k / fps`, `origin` the picture's offset within a frame period from the file's start (a transport stream

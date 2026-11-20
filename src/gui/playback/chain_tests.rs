@@ -334,11 +334,12 @@ fn process_state(pid: &str) -> Option<String> {
 }
 
 /// However a piece's reading ends while its decoder still runs — the consumer stopped, reading
-/// failed, or the playback was dropped just after the chain took the decoder out of `live` (so
-/// the drop's kill could not reach it) — that decoder is killed and waited for: no ffmpeg left
-/// running, none left a zombie. The stand-in ignores SIGPIPE, as ffmpeg does while it decodes.
+/// failed, or its output ended with the stop flag set (as a playback dropped mid-piece sets it)
+/// — the chain kills and waits for that decoder itself: no ffmpeg left running, none left a
+/// zombie. Sequential: a drop's own kill running at the same time is not exercised here. The
+/// stand-in ignores SIGPIPE, as ffmpeg does while it decodes.
 #[test]
-fn a_decoder_is_killed_and_reaped_however_its_piece_ends() {
+fn the_chain_kills_and_reaps_a_decoder_however_its_piece_ends() {
     struct Ends<'a> {
         fed: Fed,
         stop: &'a AtomicBool,

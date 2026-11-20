@@ -473,9 +473,9 @@ fn code_takes_priority_over_zed_for_text() {
     assert!(!zed_record.exists());
 }
 
-/// VS Code's CLI failing is the error, and Zed is not tried instead. `SOPEN_EDITOR_WAIT=exit`:
-/// the failure is seen however long the CLI takes to start and fail on a loaded machine (the
-/// brief wait once ran out first and the run "succeeded").
+/// VS Code's CLI failing is the error, and Zed is not tried instead. `SOPEN_EDITOR_WAIT=60`:
+/// the failure is seen even when a loaded machine takes seconds to start the CLI and see it fail
+/// (the usual 3 s once ran out first and the run "succeeded"); the wait ends at its exit.
 #[test]
 fn code_failure_does_not_open_zed() {
     use std::os::unix::fs::PermissionsExt;
@@ -496,12 +496,42 @@ fn code_failure_does_not_open_zed() {
         &[
             ("SOPEN_CODE", code.to_str().unwrap()),
             ("SOPEN_ZED", zed.to_str().unwrap()),
-            ("SOPEN_EDITOR_WAIT", "exit"),
+            ("SOPEN_EDITOR_WAIT", "60"),
         ],
     );
     assert_eq!(out.status.code(), Some(1));
     assert!(text(&out.stderr).contains("42"), "{}", text(&out.stderr));
     assert!(!marker.exists());
+}
+
+/// `SOPEN_EDITOR_WAIT` is a number of seconds, at most 120: no value makes sopen wait for an
+/// editor CLI that never exits (`exit`, once "until it exits", is not a number: the usual 3 s).
+#[test]
+fn an_editor_cli_that_never_exits_is_waited_for_a_bounded_time() {
+    let tmp = tempfile::tempdir().unwrap();
+    let pid = tmp.path().join("code-pid");
+    let code = tmp.path().join("code");
+    executable(
+        &code,
+        &format!("#!/bin/sh\necho $$ > '{}'\nexec sleep 600\n", pid.display()),
+    );
+    let file = tmp.path().join("notes.txt");
+    std::fs::write(&file, "text").unwrap();
+    let begun = std::time::Instant::now();
+    let out = sopen(
+        tmp.path(),
+        &[file.to_str().unwrap()],
+        &[
+            ("SOPEN_CODE", code.to_str().unwrap()),
+            ("SOPEN_EDITOR_WAIT", "exit"),
+        ],
+    );
+    let took = begun.elapsed();
+    if let Ok(pid) = std::fs::read_to_string(&pid) {
+        let _ = Command::new("kill").args(["-9", pid.trim()]).status();
+    }
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert!(took < std::time::Duration::from_secs(30), "{took:?}");
 }
 
 #[test]

@@ -80,6 +80,16 @@ fn pcm(tools: &Tools, file: &Path, track: usize) -> (u32, Vec<Vec<f32>>) {
 /// ffmpeg 9 applies both, and the plain file decodes to exactly `n`. The trims are written into
 /// the file the same way by either.
 fn pcm_as_plain(tools: &Tools, file: &Path, track: usize, n: usize) -> (u32, Vec<Vec<f32>>) {
+    try_pcm_as_plain(tools, file, track, n).unwrap_or_else(|e| panic!("{e}"))
+}
+
+/// [`pcm_as_plain`], saying why not instead of failing the test.
+fn try_pcm_as_plain(
+    tools: &Tools,
+    file: &Path,
+    track: usize,
+    n: usize,
+) -> Result<(u32, Vec<Vec<f32>>), String> {
     let (rate, lanes) = pcm(tools, file, track);
     let stream = format!("a:{track}");
     let codec = probe_lines(tools, file, &stream, "stream=codec_name").remove(0);
@@ -107,14 +117,15 @@ fn pcm_as_plain(tools: &Tools, file: &Path, track: usize, n: usize) -> (u32, Vec
         ],
     );
     let (_, reference) = pcm(tools, &plain, 0);
-    assert_eq!(
-        lanes[0].len(),
-        reference[0].len(),
-        "{}: track {track} decodes as long as a plain {n}-sample {codec} .{ext} \
-         (this ffmpeg decodes that to {} samples)",
-        file.display(),
-        reference[0].len()
-    );
+    if lanes[0].len() != reference[0].len() {
+        return Err(format!(
+            "{}: track {track} decodes to {} samples, a plain {n}-sample {codec} .{ext} to {} \
+             on this ffmpeg",
+            file.display(),
+            lanes[0].len(),
+            reference[0].len()
+        ));
+    }
     // What the decoder gives before the stream's time zero: the codec's priming, where the
     // container's start trim is not applied.
     let lead: usize = probe_lines(tools, &plain, "a:0", "frame=pts_time,nb_samples")
@@ -126,11 +137,184 @@ fn pcm_as_plain(tools: &Tools, file: &Path, track: usize, n: usize) -> (u32, Vec
             (pts < 0.0).then_some(samples)
         })
         .sum();
+    if lanes[0].len() < lead + n {
+        return Err(format!(
+            "{}: track {track} decodes to {} samples, fewer than its {n}",
+            file.display(),
+            lanes[0].len() - lead.min(lanes[0].len())
+        ));
+    }
+    // Matroska declares no end trim for AAC: the padded bound, less than a frame past `n`.
+    if ext == "mkv" && codec == "aac" && lanes[0].len() - lead - n >= 1024 {
+        return Err(format!(
+            "{}: track {track} decodes {} samples past its {n}, more than an AAC frame",
+            file.display(),
+            lanes[0].len() - lead - n
+        ));
+    }
+    declared(file, track, rate, n, &codec)?;
     let lanes = lanes
         .into_iter()
         .map(|l| l[lead..lead + n].to_vec())
         .collect();
-    (rate, lanes)
+    Ok((rate, lanes))
+}
+
+/// What a file says about its length, read from the file itself — not through a decoder, which
+/// may or may not apply it. MP4 / MOV ([`mp4_audio`]): the track's own sample count (`stts`)
+/// less the priming its edit list skips must be exactly `n`, and the edit list's segment must
+/// be `n` to its timescale's precision. Matroska AAC: CodecDelay must declare the priming;
+/// the end is not declared (ffmpeg writes no DiscardPadding for AAC), so only the padded bound
+/// holds there — the decode is at most one AAC frame longer, checked by the caller's plain
+/// comparison and [`pcm_as_plain`]'s crop. Other containers decode exactly on every ffmpeg.
+fn declared(file: &Path, track: usize, rate: u32, n: usize, codec: &str) -> Result<(), String> {
+    let ext = file.extension().and_then(|e| e.to_str()).unwrap_or("");
+    let bytes = std::fs::read(file).map_err(|e| e.to_string())?;
+    match ext {
+        "mp4" | "m4a" | "m4v" | "mov" => {
+            let a = mp4_audio(&bytes, track).ok_or_else(|| {
+                format!("{}: no audio track {track} in its boxes", file.display())
+            })?;
+            let rate = u64::from(rate);
+            let plays = (a.stts as i64 - a.media_time.max(0)) as u64 * rate / a.track_scale;
+            let segment = a.segment as f64 * rate as f64 / a.movie_scale as f64;
+            let tick = rate as f64 / a.movie_scale as f64;
+            if plays != n as u64 || (segment - n as f64).abs() > tick.max(1.0) {
+                return Err(format!(
+                    "{}: track {track} declares {plays} samples (edit list: {segment:.1} from \
+                     sample {}), not {n}",
+                    file.display(),
+                    a.media_time
+                ));
+            }
+        }
+        "mkv" if codec == "aac" => {
+            // CodecDelay (0x56AA), in nanoseconds, in each AAC track's header, in track order
+            // (the picture has none).
+            let head = &bytes[..bytes.len().min(64 * 1024)];
+            let ns = (0..head.len().saturating_sub(3))
+                .filter(|&at| head[at..at + 2] == [0x56, 0xAA] && head[at + 2] & 0x80 != 0)
+                .map(|at| {
+                    let len = usize::from(head[at + 2] & 0x7F);
+                    head[at + 3..(at + 3 + len).min(head.len())]
+                        .iter()
+                        .fold(0u64, |v, b| v << 8 | u64::from(*b))
+                })
+                .nth(track)
+                .ok_or_else(|| format!("{}: no CodecDelay for its AAC priming", file.display()))?;
+            let priming = (ns as f64 * f64::from(rate) / 1e9).round() as u64;
+            if priming != 1024 {
+                return Err(format!(
+                    "{}: CodecDelay declares {priming} samples of priming",
+                    file.display()
+                ));
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// An MP4 / MOV audio track as its boxes declare it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Mp4Audio {
+    /// `mvhd`'s timescale (the edit list's segment durations are in it).
+    movie_scale: u64,
+    /// `mdhd`'s timescale (`stts` and the media time are in it).
+    track_scale: u64,
+    /// The edit list's media segment: its duration, and the media time it starts at.
+    segment: u64,
+    media_time: i64,
+    /// Every sample's duration, summed (`stts`).
+    stts: u64,
+}
+
+/// The boxes in `b` (`size`, `type`, contents), as `(type, contents)`.
+fn boxes(b: &[u8]) -> Vec<(&[u8], &[u8])> {
+    let mut out = Vec::new();
+    let mut at = 0;
+    while at + 8 <= b.len() {
+        let size = u32::from_be_bytes(b[at..at + 4].try_into().unwrap()) as usize;
+        let (head, size) = match size {
+            1 => (
+                16,
+                u64::from_be_bytes(b[at + 8..at + 16].try_into().unwrap()) as usize,
+            ),
+            0 => (8, b.len() - at),
+            n => (8, n),
+        };
+        if size < head || at + size > b.len() {
+            break;
+        }
+        out.push((&b[at + 4..at + 8], &b[at + head..at + size]));
+        at += size;
+    }
+    out
+}
+
+fn child<'a>(b: &'a [u8], path: &[&[u8; 4]]) -> Option<&'a [u8]> {
+    let mut here = b;
+    for name in path {
+        here = boxes(here).into_iter().find(|(t, _)| t == name)?.1;
+    }
+    Some(here)
+}
+
+fn be(b: &[u8], at: usize, len: usize) -> u64 {
+    b[at..at + len]
+        .iter()
+        .fold(0, |v, x| v << 8 | u64::from(*x))
+}
+
+/// The `track`-th sound track of an MP4 / MOV file, read from its boxes.
+fn mp4_audio(file: &[u8], track: usize) -> Option<Mp4Audio> {
+    let moov = child(file, &[b"moov"])?;
+    let mvhd = child(moov, &[b"mvhd"])?;
+    let movie_scale = if mvhd[0] == 1 {
+        be(mvhd, 20, 4)
+    } else {
+        be(mvhd, 12, 4)
+    };
+    let trak = boxes(moov)
+        .into_iter()
+        .filter(|(t, _)| t == b"trak")
+        .map(|(_, c)| c)
+        .filter(|c| child(c, &[b"mdia", b"hdlr"]).is_some_and(|h| &h[8..12] == b"soun"))
+        .nth(track)?;
+    let mdhd = child(trak, &[b"mdia", b"mdhd"])?;
+    let track_scale = if mdhd[0] == 1 {
+        be(mdhd, 20, 4)
+    } else {
+        be(mdhd, 12, 4)
+    };
+    let stts = child(trak, &[b"mdia", b"minf", b"stbl", b"stts"])?;
+    let total = (0..be(stts, 4, 4) as usize)
+        .map(|k| be(stts, 8 + 8 * k, 4) * be(stts, 12 + 8 * k, 4))
+        .sum();
+    // The edit list's media segment (an empty one before it is a late start); none: all of it.
+    let (mut segment, mut media_time) = (total * movie_scale / track_scale, 0i64);
+    if let Some(elst) = child(trak, &[b"edts", b"elst"]) {
+        let wide = elst[0] == 1;
+        let entry = if wide { 20 } else { 12 };
+        for k in 0..be(elst, 4, 4) as usize {
+            let at = 8 + entry * k;
+            let (duration, time) = if wide {
+                (be(elst, at, 8), be(elst, at + 8, 8) as i64)
+            } else {
+                (be(elst, at, 4), be(elst, at + 4, 4) as u32 as i32 as i64)
+            };
+            if time >= 0 {
+                (segment, media_time) = (duration, time);
+            }
+        }
+    }
+    Some(Mp4Audio {
+        movie_scale,
+        track_scale,
+        segment,
+        media_time,
+        stts: total,
+    })
 }
 
 /// The tones of one channel, in order, as `(Hz, seconds)`: the frequency from the spacing of
@@ -1159,6 +1343,62 @@ fn best_lag(full: &[f32], clip: &[f32], at: usize, reach: i64) -> (i64, f32) {
         })
         .min_by(|a, b| a.1.total_cmp(&b.1))
         .unwrap()
+}
+
+/// A render that is 100 samples longer than the timeline, inside the same last AAC frame, is
+/// refused: on a decoder that leaves the end trim to the player it decodes as long as a plain
+/// encode of the right length, so only what the file itself declares tells them apart.
+#[test]
+fn a_render_declaring_100_samples_more_is_refused() {
+    let Some(tools) = tools_or_skip() else { return };
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("t.m4a");
+    tones(
+        &tools,
+        &src,
+        TONES,
+        44_100,
+        &["-c:a", "aac", "-b:a", "192k"],
+    );
+    let probe = ffmpeg::probe(&tools, &src).unwrap();
+    let n = 88_200;
+    let spec = audio_spec(&probe, spans(44_100.0, &[(0, n as i64 + 100)], false));
+    let out = render(&tools, &src, "over.m4a", &spec);
+    let got = try_pcm_as_plain(&tools, &out, 0, n);
+    assert!(got.is_err(), "{n} + 100 samples passed as {n}");
+    assert!(try_pcm_as_plain(&tools, &out, 0, n + 100).is_ok());
+    // What the file declares, read from its boxes: 100 samples more, whatever the decoder does.
+    let said = declared(&out, 0, 44_100, n, "aac").unwrap_err();
+    assert!(said.contains("declares 88300 samples"), "{said}");
+    assert!(declared(&out, 0, 44_100, n + 100, "aac").is_ok());
+    // A movie timescale of 1000 (ffmpeg 8's): the edit list says milliseconds, the track's own
+    // sample count still says exactly how many.
+    let coarse = tmp.path().join("coarse.m4a");
+    ff(
+        &tools,
+        &[
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=f=1000:r=44100",
+            "-af",
+            &format!("atrim=end_sample={}", n + 100),
+            "-c:a",
+            "aac",
+            "-movie_timescale",
+            "1000",
+            coarse.to_str().unwrap(),
+        ],
+    );
+    let boxes = mp4_audio(&std::fs::read(&coarse).unwrap(), 0).unwrap();
+    assert_eq!(
+        (boxes.movie_scale, boxes.segment),
+        (1000, 2002),
+        "{boxes:?}"
+    );
+    assert!(declared(&coarse, 0, 44_100, n + 100, "aac").is_ok());
+    let said = declared(&coarse, 0, 44_100, n, "aac").unwrap_err();
+    assert!(said.contains("declares 88300 samples"), "{said}");
 }
 
 /// `sopen cut` of AAC is Out − In long and its sound is where it was in the source: the old
