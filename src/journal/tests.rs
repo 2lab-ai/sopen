@@ -530,6 +530,7 @@ type Pick = Box<dyn Fn(&[String], &str) -> bool + Send + Sync>;
 struct Flaky {
     inner: Arc<dyn Fs>,
     pick: Pick,
+    kind: io::ErrorKind,
     fired: AtomicBool,
     log: Mutex<Vec<String>>,
 }
@@ -539,9 +540,19 @@ impl Flaky {
         inner: Arc<dyn Fs>,
         pick: impl Fn(&[String], &str) -> bool + Send + Sync + 'static,
     ) -> Arc<Flaky> {
+        Flaky::with_kind(inner, io::ErrorKind::Other, pick)
+    }
+
+    /// [`Flaky::new`] failing with an error of `kind`.
+    fn with_kind(
+        inner: Arc<dyn Fs>,
+        kind: io::ErrorKind,
+        pick: impl Fn(&[String], &str) -> bool + Send + Sync + 'static,
+    ) -> Arc<Flaky> {
         Arc::new(Flaky {
             inner,
             pick: Box::new(pick),
+            kind,
             fired: AtomicBool::new(false),
             log: Mutex::new(Vec::new()),
         })
@@ -553,7 +564,7 @@ impl Flaky {
         if !self.fired.load(Ordering::SeqCst) && (self.pick)(&log, &op) {
             self.fired.store(true, Ordering::SeqCst);
             log.push(format!("FAILED {op}"));
-            return Err(io::Error::other("injected failure (test)"));
+            return Err(io::Error::new(self.kind, "injected failure (test)"));
         }
         log.push(op);
         Ok(())
@@ -2279,7 +2290,7 @@ impl FakeFile {
     }
 
     fn read(&self, offset: u64, len: usize) -> Vec<u8> {
-        let end = (offset + len as u64).min(self.size);
+        let end = offset.saturating_add(len as u64).min(self.size);
         if offset >= end {
             return Vec::new();
         }
@@ -3901,4 +3912,323 @@ fn an_edit_on_the_last_page_of_the_offset_space_does_not_overflow() {
         ..snap
     };
     assert!(j.publish(&past).is_err(), "a run past the end of any file");
+}
+
+// ---------------------------------------------------------------------------------------------
+// Round 3.
+
+/// A directory made above the cache root whose containing directory's fsync failed is made
+/// durable again by the next creation, which finds it there: every component of the journal's
+/// path, from `/` down, is fsynced in its containing directory at each creation.
+#[test]
+fn a_failed_fsync_above_the_cache_root_is_redone_before_kept() {
+    let cache = Path::new("/home/u/cache");
+    for made in ["/home", "/home/u", "/home/u/cache"] {
+        let mem = MemFs::new();
+        let parent = Path::new(made).parent().unwrap().display().to_string();
+        let flaky = Flaky::new(Arc::new(mem.clone()), move |log, op| {
+            op == format!("fsyncdir {parent}")
+                && log.last().is_some_and(|l| l == &format!("mkdir {made}"))
+        });
+        let fs: Arc<dyn Fs> = flaky.clone();
+        assert!(Journal::create(fs, cache, HOST, PATH, Kind::Hex).is_err());
+        assert!(flaky.fired(), "{made}");
+        let fs: Arc<dyn Fs> = Arc::new(mem.clone());
+        let mut j = Journal::create(fs, cache, HOST, PATH, Kind::Hex).unwrap();
+        j.publish(&hex_snap(1)).unwrap();
+        drop(j);
+        let gens: BTreeMap<u64, Snapshot> = [(1, hex_snap(1))].into();
+        for (how, after) in reopened(&mem) {
+            let fs: Arc<dyn Fs> = Arc::new(after);
+            match recover(&fs, cache, &[Ack::Gen(1)], &gens) {
+                Ok(Some(r)) => assert_eq!(r.gen.at.n, 1, "{made}, {how}"),
+                Ok(None) => panic!("{made}, {how}: gen-1 was kept, then lost"),
+                Err(why) => panic!("{made}, {how}: {why}"),
+            }
+        }
+    }
+}
+
+/// A plan whose route and phase do not go together (a temp named for a write in place) is
+/// refused before anything is written: no generation published, no record.
+#[test]
+fn a_temp_plan_with_the_in_place_route_is_refused_before_anything_is_written() {
+    let (mem, _, mut j) = mem_journal(Kind::Hex);
+    let plan = Plan::Temp {
+        route: Route::InPlace,
+        target: PATH.into(),
+        temp: TEMP.into(),
+    };
+    assert!(j.begin_save(&hex_snap(1), plan).is_err());
+    assert_eq!(j.current(), None, "nothing published");
+    assert!(j.pending_save().is_none());
+    assert!(
+        !mem.list(j.dir()).unwrap().iter().any(|n| n != "lock"),
+        "{:?}",
+        mem.list(j.dir())
+    );
+}
+
+/// Every Save `begin_save` and the phases after it accept is recorded as a record `parse_save`
+/// accepts and that reads back as the journal holds it, byte for byte; everything they refuse
+/// writes nothing. Over kinds, routes, plans, evidence shapes and post-save evidence.
+#[test]
+fn every_save_the_journal_records_reads_back_as_written() {
+    fn snaps(kind: Kind) -> Vec<(&'static str, Snapshot)> {
+        let hex = hex_snap(1);
+        let image = image_snap(&[1]);
+        let media_small = Snapshot {
+            baseline: fp(4096, 1_794_389_076, None),
+            seen: Seen::whole([4; 32]),
+            edits: "clips 0..10\n".into(),
+            pastes: Vec::new(),
+        };
+        let media_big = Snapshot {
+            baseline: fp(300 << 20, 1_794_389_076, None),
+            seen: Seen::ends(Ends {
+                first: [5; 32],
+                last: [6; 32],
+            }),
+            ..media_small.clone()
+        };
+        let pending = |s: &Snapshot| Snapshot {
+            seen: Seen::Pending,
+            ..s.clone()
+        };
+        let unfit = |s: &Snapshot| Snapshot {
+            seen: Seen::ends(Ends {
+                first: [7; 32],
+                last: [8; 32],
+            }),
+            ..s.clone()
+        };
+        match kind {
+            Kind::Hex => vec![
+                ("hex", hex.clone()),
+                ("hex pending", pending(&hex)),
+                ("hex unfit", unfit(&hex)),
+            ],
+            Kind::Image => vec![
+                ("image", image.clone()),
+                ("image pending", pending(&image)),
+                ("image unfit", unfit(&image)),
+            ],
+            Kind::Media => vec![
+                ("media small", media_small.clone()),
+                ("media big", media_big.clone()),
+                ("media pending", pending(&media_small)),
+                ("media small unfit", unfit(&media_small)),
+            ],
+        }
+    }
+    fn plans() -> Vec<(String, Plan)> {
+        let mut out = Vec::new();
+        for route in [
+            Route::ServerCopy,
+            Route::StreamedRewrite,
+            Route::Upload,
+            Route::InPlace,
+        ] {
+            out.push((
+                format!("temp {route:?}"),
+                Plan::Temp {
+                    route,
+                    target: "/data/a b\nc%d".into(),
+                    temp: TEMP.into(),
+                },
+            ));
+        }
+        let run = |offset: u64, n: usize| Run {
+            offset,
+            old: vec![0; n],
+            new: vec![1; n],
+        };
+        for (what, runs) in [
+            ("one run", vec![run(PAGE + 4, 1)]),
+            (
+                "two runs in a page",
+                vec![run(PAGE + 4, 2), run(PAGE + 8, 1)],
+            ),
+            ("overlapping runs", vec![run(PAGE + 4, 4), run(PAGE + 6, 2)]),
+            ("no runs", Vec::new()),
+            (
+                "lengths differ",
+                vec![Run {
+                    offset: 0,
+                    old: vec![0],
+                    new: vec![1, 2],
+                }],
+            ),
+        ] {
+            out.push((
+                format!("in place, {what}"),
+                Plan::InPlace {
+                    target: PATH.into(),
+                    undo: PathBuf::from("/cache/.backup/box/data/x\u{fffd}.undo.txt"),
+                    runs,
+                },
+            ));
+        }
+        out
+    }
+    fn posts(staged: &FileStat) -> Vec<(&'static str, PostEvidence)> {
+        let ends = Ends {
+            first: [1; 32],
+            last: [2; 32],
+        };
+        let big = staged.size > crate::remote::HASH_CHECK_MAX;
+        let mut out = Vec::new();
+        let pages: BTreeMap<u64, Sha> = [(PAGE, [3; 32])].into();
+        if let Ok(p) = PostEvidence::hex(staged, pages, (!big).then_some([4; 32])) {
+            out.push(("hex", p));
+        }
+        if let Ok(p) = PostEvidence::image(staged, [5; 32], big.then_some(ends)) {
+            out.push(("image", p));
+        }
+        let media = if big {
+            PostEvidence::media(staged, None, Some(ends))
+        } else {
+            PostEvidence::media(staged, Some([6; 32]), None)
+        };
+        out.push(("media", media.unwrap()));
+        let mut empty = out[0].1.clone();
+        empty.check = Evidence::default();
+        out.push(("empty check", empty));
+        out
+    }
+    /// The record on disk parses, equals what the journal holds, and is the bytes it writes.
+    fn reads_back(mem: &MemFs, j: &Journal, what: &str) {
+        let bytes = mem.read(&j.dir().join("save")).expect(what);
+        let parsed = parse_save(&bytes).unwrap_or_else(|e| panic!("{what}: {e:#}"));
+        assert_eq!(Some(&parsed), j.pending_save(), "{what}");
+        assert_eq!(intent_bytes(&parsed), bytes, "{what}");
+    }
+    let (mut accepted, mut refused, mut phases) = (0, 0, 0);
+    for kind in [Kind::Hex, Kind::Image, Kind::Media] {
+        for (snap_name, snap) in snaps(kind) {
+            for (plan_name, plan) in plans() {
+                let what = format!("{} {snap_name}, {plan_name}", kind.word());
+                let (mem, _, mut j) = mem_journal(kind);
+                let temp_route = matches!(plan, Plan::Temp { .. });
+                if j.begin_save(&snap, plan).is_err() {
+                    refused += 1;
+                    assert_eq!(j.current(), None, "{what}: refused, yet published");
+                    let names = mem.list(j.dir()).unwrap();
+                    assert!(
+                        names.iter().all(|n| n == "lock"),
+                        "{what}: refused, yet wrote {names:?}"
+                    );
+                    continue;
+                }
+                accepted += 1;
+                reads_back(&mem, &j, &what);
+                if !temp_route {
+                    continue;
+                }
+                j.save_created(file_stat(0, 1_794_389_500)).unwrap();
+                reads_back(&mem, &j, &format!("{what}, created"));
+                let mut staged_once = false;
+                for size in [1_000_000u64, 300 << 20] {
+                    let staged = file_stat(size, 1_794_389_600);
+                    for (post_name, post) in posts(&staged) {
+                        let before = mem.read(&j.dir().join("save")).unwrap();
+                        let what = format!("{what}, staged {size} with {post_name} evidence");
+                        if staged_once || j.save_staged(staged, post).is_err() {
+                            assert_eq!(mem.read(&j.dir().join("save")).unwrap(), before, "{what}");
+                            continue;
+                        }
+                        staged_once = true;
+                        phases += 1;
+                        reads_back(&mem, &j, &what);
+                        j.save_renaming().unwrap();
+                        reads_back(&mem, &j, &format!("{what}, renaming"));
+                    }
+                }
+                assert!(staged_once, "{what}: no post-save evidence was taken");
+            }
+        }
+    }
+    // hex: 2 temp routes + 2 run sets; image: upload; media: upload, at two sizes.
+    assert_eq!(accepted, 4 + 1 + 2, "accepted");
+    assert!(refused > 50, "{refused} refused");
+    assert_eq!(phases, 2 + 1 + 2);
+}
+
+/// A write in place whose run sits on the last page of the offset space reconciles as landed
+/// without overflow, its next baseline holding that page.
+#[test]
+fn a_landed_write_in_place_on_the_last_page_does_not_overflow() {
+    let mut file = FakeFile::big(u64::MAX, 1_794_389_076);
+    let runs = vec![Run {
+        offset: u64::MAX - 1,
+        old: vec![0],
+        new: vec![0x41],
+    }];
+    let i = intent(
+        Kind::Hex,
+        Route::InPlace,
+        baseline_of(&file, None),
+        Seen::pages([(u64::MAX / PAGE * PAGE, file.page(u64::MAX / PAGE * PAGE))]),
+        Phase::Writing {
+            undo: PathBuf::from("/u"),
+            runs,
+        },
+    );
+    file.set(u64::MAX - 1, &[0x41]);
+    file.mtime = at(1_794_389_700);
+    let r = reconcile(&i, HOST, &mut FakeRemote::with(&[(PATH, &file)]));
+    assert_eq!(r.outcome, Outcome::Landed, "{}", r.line);
+    let (base, seen) = r.next.expect("a next baseline");
+    assert_eq!(base.size, u64::MAX);
+    let last = u64::MAX / PAGE * PAGE;
+    assert_eq!(seen, Seen::pages([(last, file.page(last))]));
+}
+
+/// A directory above the cache that this account may not read, or that is read-only, is not
+/// fsynced when the component in it was found: the journal is still made. The same refusal for
+/// a component made in that call, for the cache's own directories, or an I/O error, stops it.
+#[test]
+fn an_unreadable_folder_above_the_cache_is_left_alone_only_when_nothing_was_made_in_it() {
+    let cache = Path::new("/home/u/cache");
+    let with = |dirs: &[&str]| {
+        let mem = MemFs::new();
+        for d in dirs {
+            mem.create_dir(Path::new(d)).unwrap();
+        }
+        mem
+    };
+    let create = |mem: &MemFs, kind: io::ErrorKind, fails: &'static str| {
+        let flaky = Flaky::with_kind(Arc::new(mem.clone()), kind, move |_, op| op == fails);
+        let fs: Arc<dyn Fs> = flaky.clone();
+        let made = Journal::create(fs, cache, HOST, PATH, Kind::Hex);
+        assert!(flaky.fired(), "{fails}");
+        made.is_ok()
+    };
+    let denied = io::ErrorKind::PermissionDenied;
+    let all = ["/home", "/home/u", "/home/u/cache"];
+    assert!(create(&with(&all), denied, "fsyncdir /"), "found /home");
+    assert!(
+        create(
+            &with(&all),
+            io::ErrorKind::ReadOnlyFilesystem,
+            "fsyncdir /home"
+        ),
+        "found /home/u"
+    );
+    assert!(
+        create(&with(&all), denied, "fsyncdir /home/u"),
+        "found the cache root"
+    );
+    assert!(
+        !create(&with(&["/home", "/home/u"]), denied, "fsyncdir /home/u"),
+        "the cache root was made in that call"
+    );
+    assert!(
+        !create(&with(&all), denied, "fsyncdir /home/u/cache"),
+        "the cache's own directory"
+    );
+    assert!(
+        !create(&with(&all), io::ErrorKind::Other, "fsyncdir /"),
+        "an I/O error"
+    );
 }

@@ -792,56 +792,66 @@ fn io_err(e: io::Error, what: &str, path: &Path) -> anyhow::Error {
     anyhow::Error::new(e).context(format!("cannot {what} {}", path.display()))
 }
 
-/// Makes the directories down to `dir` that are missing, owner-only, and makes every directory
-/// from `cache` down durable in its parent (fsync of the parent) — found or made, every time: an
-/// earlier creation may have made one and failed at that fsync, and a fetch makes the cache root
-/// without one. Ancestors above `cache` are fsynced in their parent only when this call makes
-/// them. Below `cache` every directory that exists must be a real one (never through a link);
-/// `cache` itself and what is above it may be links (the owner's choice).
+/// The directory `path` is an entry of (`.` for a relative path's first component).
+fn containing(path: &Path) -> &Path {
+    match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        Some(_) => Path::new("."),
+        None => Path::new("/"),
+    }
+}
+
+/// Makes the directories down to `dir` that are missing, owner-only, and makes every component
+/// of `dir`'s path, from `/` down, durable in the directory containing it (an fsync of that
+/// directory) — found or made, at every call: an earlier creation may have made one and failed
+/// at that fsync, and a fetch makes the cache's directories without one. A component at or
+/// above `cache` that was found, in a directory this account may not read or that is read-only,
+/// is left as it is: this account cannot have made its entry there. Below `cache` every
+/// directory must be a real one (never through a link); `cache` itself and what is above it may
+/// be links (the owner's choice; the directories a link leads through are not walked).
 fn make_dirs(fs: &dyn Fs, cache: &Path, dir: &Path) -> Result<()> {
-    let below = dir
-        .strip_prefix(cache)
-        .with_context(|| format!("{} is not under the cache", dir.display()))?;
-    // The cache root and its missing ancestors, links allowed.
-    let mut missing = Vec::new();
-    let mut at = cache.to_path_buf();
-    loop {
-        match fs.node(&at, true).map_err(|e| io_err(e, "look at", &at))? {
-            Some(Node::Dir) => break,
-            Some(_) => bail!("{} is not a directory", at.display()),
-            None => {
-                missing.push(at.clone());
-                match at.parent() {
-                    Some(up) if up != at && !up.as_os_str().is_empty() => at = up.to_path_buf(),
-                    _ => break,
-                }
-            }
-        }
-    }
-    let in_parent = |d: &Path| -> Result<()> {
-        let parent = d.parent().unwrap_or(Path::new("/"));
-        fs.sync_dir(parent)
-            .map_err(|e| io_err(e, "make durable the folder", parent))
-    };
-    for d in missing.iter().rev() {
-        fs.create_dir(d).map_err(|e| io_err(e, "create", d))?;
-        in_parent(d)?;
-    }
-    if missing.is_empty() {
-        in_parent(cache)?;
-    }
-    let mut at = cache.to_path_buf();
-    for comp in below.components() {
+    ensure!(
+        dir.starts_with(cache),
+        "{} is not under the cache",
+        dir.display()
+    );
+    let mut at = PathBuf::new();
+    for comp in dir.components() {
         at.push(comp);
-        match fs.node(&at, false).map_err(|e| io_err(e, "look at", &at))? {
-            Some(Node::Dir) => {}
-            Some(_) => bail!(
+        if !matches!(comp, Component::Normal(_)) {
+            continue;
+        }
+        let below = at != cache && at.starts_with(cache);
+        let made = match fs
+            .node(&at, !below)
+            .map_err(|e| io_err(e, "look at", &at))?
+        {
+            Some(Node::Dir) => false,
+            Some(_) if below => bail!(
                 "{} is not a directory (a link or a file is there)",
                 at.display()
             ),
-            None => fs.create_dir(&at).map_err(|e| io_err(e, "create", &at))?,
+            Some(_) => bail!("{} is not a directory", at.display()),
+            None => {
+                fs.create_dir(&at).map_err(|e| io_err(e, "create", &at))?;
+                true
+            }
+        };
+        let parent = containing(&at);
+        match fs.sync_dir(parent) {
+            Ok(()) => {}
+            Err(e)
+                if !below
+                    && !made
+                    && matches!(
+                        e.kind(),
+                        io::ErrorKind::PermissionDenied | io::ErrorKind::ReadOnlyFilesystem
+                    ) =>
+            {
+                crate::debug!("journal: {} not fsynced: {e}", parent.display());
+            }
+            Err(e) => return Err(io_err(e, "make durable the folder", parent)),
         }
-        in_parent(&at)?;
     }
     Ok(())
 }
@@ -994,6 +1004,32 @@ fn check_post(kind: Kind, staged: &FileStat, post: &PostEvidence) -> Result<()> 
         "the post-save evidence is not what the {} save of this size keeps",
         kind.word()
     );
+    Ok(())
+}
+
+/// What every recorded Save holds (§3.1), checked before a record is written and when one is
+/// read back: a route its kind has; phase `writing` exactly for a write in place, its runs
+/// apart; known pre-save evidence of the kind's shape; from `staged` on, the post-save evidence
+/// the table gives for the kind and the staged size.
+fn check_intent(intent: &SaveIntent) -> Result<()> {
+    let kind = intent.kind;
+    ensure!(
+        route_fits(kind, intent.route),
+        "a {} save has no {} route",
+        kind.word(),
+        intent.route.word()
+    );
+    ensure!(
+        matches!(intent.phase, Phase::Writing { .. }) == (intent.route == Route::InPlace),
+        "a write in place, and only it, has phase writing"
+    );
+    check_pre(kind, &intent.baseline, &intent.seen)?;
+    if let Phase::Writing { runs, .. } = &intent.phase {
+        check_runs(runs)?;
+    }
+    if let Some((staged, post)) = intent.phase.staged() {
+        check_post(kind, staged, post)?;
+    }
     Ok(())
 }
 
@@ -1262,21 +1298,16 @@ impl Journal {
                 temp,
             } => (route, target, Phase::Naming { temp }),
             Plan::InPlace { target, undo, runs } => {
-                check_runs(&runs)?;
                 (Route::InPlace, target, Phase::Writing { undo, runs })
             }
         };
-        ensure!(
-            route_fits(self.kind, route),
-            "a {} save has no {} route",
-            self.kind.word(),
-            route.word()
-        );
         check_shape(self.kind, snap)?;
-        check_pre(self.kind, &snap.baseline, &snap.seen)?;
-        let saved = self.write_generation(snap, false)?;
-        let intent = SaveIntent {
-            saved,
+        let mut intent = SaveIntent {
+            // Known once the generation is written, below.
+            saved: GenRef {
+                n: 0,
+                sha256: [0; 32],
+            },
             kind: self.kind,
             route,
             target,
@@ -1285,6 +1316,9 @@ impl Journal {
             seen: snap.seen.clone(),
             phase,
         };
+        // Everything the record will hold is checked before anything is written.
+        check_intent(&intent)?;
+        intent.saved = self.write_generation(snap, false)?;
         let recorded = self.replace(SAVE, &intent_bytes(&intent));
         // Whatever the outcome, a record naming `saved` may be on disk now.
         self.saved_pastes = Content::of(snap).pastes;
@@ -1301,6 +1335,7 @@ impl Journal {
         ensure!(self.running, "the save is no longer running");
         let mut next = save.clone();
         next.phase = phase;
+        check_intent(&next)?;
         self.replace(SAVE, &intent_bytes(&next))?;
         self.save = Some(next);
         Ok(())
@@ -1322,7 +1357,6 @@ impl Journal {
             Some(Phase::Created { temp, created }) => (temp.clone(), *created),
             _ => bail!("phase staged comes after created"),
         };
-        check_post(self.kind, &staged, &post)?;
         self.advance(Phase::Staged {
             temp,
             created,
@@ -2244,14 +2278,16 @@ fn next_after_in_place(
         .ok_or_else(|| anyhow!("{target} is gone"))?;
     let mut pages = BTreeMap::new();
     for run in runs {
-        let first = run.offset / PAGE * PAGE;
-        let last = (run.offset + run.new.len() as u64 - 1) / PAGE * PAGE;
-        let mut page = first;
-        while page <= last {
-            if let Some(sha) = inspect.page_sha256(target, page)? {
-                pages.insert(page, sha);
+        let end = run
+            .offset
+            .checked_add(run.new.len() as u64)
+            .context("a run past the end of any file")?;
+        let mut page = Some(run.offset / PAGE * PAGE);
+        while let Some(at) = page.filter(|&at| at < end) {
+            if let Some(sha) = inspect.page_sha256(target, at)? {
+                pages.insert(at, sha);
             }
-            page += PAGE;
+            page = at.checked_add(PAGE);
         }
     }
     let base = Fingerprint {
@@ -2899,7 +2935,6 @@ pub fn parse_save(bytes: &[u8]) -> Result<SaveIntent> {
                     new: parse_hex_bytes(new)?,
                 });
             }
-            check_runs(&runs)?;
             Phase::Writing { undo, runs }
         }
         _ => bail!("unknown phase"),
@@ -2919,20 +2954,7 @@ pub fn parse_save(bytes: &[u8]) -> Result<SaveIntent> {
         intent_bytes(&intent) == bytes,
         "not in the form sopen writes a save record"
     );
-    ensure!(
-        route_fits(kind, route),
-        "a {} save has no {} route",
-        kind.word(),
-        route.word()
-    );
-    ensure!(
-        matches!(intent.phase, Phase::Writing { .. }) == (route == Route::InPlace),
-        "only a write in place has phase writing"
-    );
-    check_pre(kind, &intent.baseline, &intent.seen)?;
-    if let Some((staged, post)) = intent.phase.staged() {
-        check_post(kind, staged, post)?;
-    }
+    check_intent(&intent)?;
     Ok(intent)
 }
 
