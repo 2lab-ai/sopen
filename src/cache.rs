@@ -137,6 +137,100 @@ pub fn backup_path(cache: &Path, host: &str, abs: &str, at: SystemTime) -> PathB
     path
 }
 
+/// A job's lock (a render in `.edits`, a work folder in `.exports`): `<path>.lock`, held
+/// while the job runs. The lock file is removed when the job ends; one whose lock nobody holds
+/// is a job whose sopen died — [`sweep_stale_jobs`] removes what it left.
+pub struct JobLock {
+    path: PathBuf,
+    _file: File,
+}
+
+impl JobLock {
+    /// Takes the lock of the job at `job` (its file or folder; the lock is `<job>.lock`).
+    pub fn take(job: &Path) -> Result<Self> {
+        let path = lock_of(job);
+        if let Some(dir) = path.parent() {
+            private_dir(dir)?;
+        }
+        let file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(&path)
+            .with_context(|| format!("cannot create {}", path.display()))?;
+        file.try_lock()
+            .map_err(|e| anyhow::anyhow!("cannot lock {}: {e}", path.display()))?;
+        Ok(Self { path, _file: file })
+    }
+}
+
+impl Drop for JobLock {
+    /// Removed while still held, so no sweep can take a lock file that is going away.
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+fn lock_of(job: &Path) -> PathBuf {
+    let mut name = job.file_name().unwrap_or_default().to_os_string();
+    name.push(".lock");
+    job.with_file_name(name)
+}
+
+/// Removes what jobs left whose sopen died (killed during a Save or an Export): every
+/// `<job>.lock` under `.exports` and `.edits` that nobody holds, with its job — a work folder
+/// in `.exports`, a staged media render (`*.render-*`) in `.edits`. Nothing without a lock file
+/// is touched: a kept edit or render (a refused or failed save names it) has none. Returns what
+/// was removed.
+pub fn sweep_stale_jobs(cache: &Path) -> Vec<PathBuf> {
+    let mut removed = Vec::new();
+    let mut walk = vec![exports_root(cache), edits_root(cache)];
+    while let Some(dir) = walk.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
+            if kind.is_dir() && dir != exports_root(cache) {
+                walk.push(path);
+                continue;
+            }
+            let Some(job) = path
+                .to_str()
+                .and_then(|p| p.strip_suffix(".lock"))
+                .map(PathBuf::from)
+            else {
+                continue;
+            };
+            let in_edits = job.starts_with(edits_root(cache));
+            let name = job.file_name().map(|n| n.to_string_lossy().into_owned());
+            if in_edits && !name.is_some_and(|n| n.contains(".render-")) {
+                continue;
+            }
+            let Ok(file) = OpenOptions::new().write(true).open(&path) else {
+                continue;
+            };
+            if file.try_lock().is_err() {
+                continue; // its job is running
+            }
+            let gone = if job.is_dir() {
+                std::fs::remove_dir_all(&job)
+            } else {
+                std::fs::remove_file(&job)
+            };
+            if gone.is_ok() || !job.exists() {
+                removed.push(job);
+                let _ = std::fs::remove_file(&path);
+            }
+        }
+    }
+    removed
+}
+
 /// Creates `dir` and its missing parents for the owner only (0700). Directories that already
 /// exist keep their mode.
 pub fn private_dir(dir: &Path) -> Result<()> {
@@ -513,6 +607,57 @@ pub fn utc_stamp(at: SystemTime) -> String {
 pub fn rfc3339(at: SystemTime) -> String {
     let (y, mo, d, h, mi, s) = parts(at);
     format!("{y:04}-{mo:02}-{d:02}T{h:02}:{mi:02}:{s:02}Z")
+}
+
+#[cfg(test)]
+mod job_tests {
+    use super::*;
+
+    /// The sweep removes what a killed sopen's jobs left — a work folder, a staged render whose
+    /// lock nobody holds — and nothing else: a running job (its lock held), a folder or render
+    /// without a lock (a kept render a failed save named), an image's staged edit.
+    #[test]
+    fn the_sweep_removes_only_dead_jobs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = tmp.path();
+        let exports = exports_root(cache);
+        let edits = edits_path(cache, "box", "/srv/clip.mp4");
+        let made = |p: &Path, dir: bool| {
+            std::fs::create_dir_all(if dir { p } else { p.parent().unwrap() }).unwrap();
+            if !dir {
+                std::fs::write(p, b"x").unwrap();
+            }
+        };
+        let lock = |job: &Path| std::fs::write(lock_of(job), b"").unwrap();
+        let dead_work = exports.join("aaaa");
+        made(&dead_work, true);
+        std::fs::write(dead_work.join("partial.mp4"), b"x").unwrap();
+        lock(&dead_work);
+        let live_work = exports.join("bbbb");
+        let _held = JobLock::take(&live_work).unwrap();
+        made(&live_work, true);
+        let old_work = exports.join("cccc");
+        made(&old_work, true);
+        let dead_render = edits.with_file_name("clip.render-20261120T000000Z-1a2b.mp4");
+        made(&dead_render, false);
+        lock(&dead_render);
+        let kept_render = edits.with_file_name("clip.render-20261120T000000Z-3c4d.mp4");
+        made(&kept_render, false);
+        let image_edit = edits.with_file_name("shot.edited-20261120T000000Z-5e6f.png");
+        made(&image_edit, false);
+        lock(&image_edit);
+        let mut gone = sweep_stale_jobs(cache);
+        gone.sort();
+        let mut want = vec![dead_work.clone(), dead_render.clone()];
+        want.sort();
+        assert_eq!(gone, want);
+        assert!(!dead_work.exists() && !lock_of(&dead_work).exists());
+        assert!(!dead_render.exists() && !lock_of(&dead_render).exists());
+        for kept in [&live_work, &old_work, &kept_render, &image_edit] {
+            assert!(kept.exists(), "{} kept", kept.display());
+        }
+        assert!(lock_of(&live_work).exists(), "a running job's lock stays");
+    }
 }
 
 #[cfg(test)]

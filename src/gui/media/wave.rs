@@ -50,8 +50,10 @@ pub struct Source {
     pub lanes: Vec<Vec<[f32; 2]>>,
     /// Counts the hand-overs (the window redraws on a new one).
     pub version: u64,
-    /// The decode has read the whole file.
+    /// The decode read the whole file and ended well.
     pub complete: bool,
+    /// The decode failed (what it said): the peaks are what it read before, never complete.
+    pub error: Option<String>,
 }
 
 /// Filled in by the decoder thread as it reads, then once more when it is done.
@@ -67,13 +69,15 @@ pub fn bins_for(duration: f64) -> usize {
 
 /// Reads `input` (interleaved f32le, `lanes` channels at [`RATE`]) into peaks, handing the
 /// peaks so far to `publish` every 1/[`HANDOVERS`] of the expected samples (by count, not by
-/// time) and at the end (`complete`).
+/// time). Returns the peaks at the end of its input, or the read error that stopped it (the
+/// end of input is not an error; a sample cut short at it is dropped). Nothing it publishes
+/// is complete: whether the decode ended well is the caller's to say ([`start`]).
 pub fn read_peaks(
     input: &mut dyn Read,
     lanes: usize,
     duration: f64,
     publish: &mut dyn FnMut(Source),
-) {
+) -> std::io::Result<Source> {
     let lanes = lanes.max(1);
     let bins = bins_for(duration);
     let expected = (duration * RATE).ceil() as usize;
@@ -82,30 +86,38 @@ pub fn read_peaks(
     let step = (expected * lanes / HANDOVERS).max(1);
     let per_bin = peaks[0].per_bin;
     let mut version = 0;
-    let mut snapshot = |peaks: &[Peaks], complete: bool| {
+    let mut snapshot = |peaks: &[Peaks]| {
         version += 1;
         Source {
             bin_secs: per_bin as f64 / RATE,
             lanes: peaks.iter().map(|p| p.bins.clone()).collect(),
             version,
-            complete,
+            complete: false,
+            error: None,
         }
     };
     let mut b4 = [0u8; 4];
     let (mut c, mut n) = (0, 0usize);
-    while reader.read_exact(&mut b4).is_ok() {
+    loop {
+        match reader.read_exact(&mut b4) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+            Err(e) => return Err(e),
+        }
         peaks[c].push(f32::from_le_bytes(b4));
         c = (c + 1) % lanes;
         n += 1;
         if n % step == 0 {
-            publish(snapshot(&peaks, false));
+            publish(snapshot(&peaks));
         }
     }
-    publish(snapshot(&peaks, true));
+    Ok(snapshot(&peaks))
 }
 
 /// Starts the one decode of `input` into `lanes` (1 or 2) lanes of peaks, handed to `out` as
-/// they fill; `wake` is called on each hand-over (and when a failed decode ends).
+/// they fill: complete once the whole file was read and ffmpeg ended well, else with the error
+/// (a read error, ffmpeg's exit and its last words, or a start that failed). `wake` is called on
+/// each hand-over.
 pub fn start(
     tools: &Tools,
     input: &Input,
@@ -124,15 +136,68 @@ pub fn start(
             .args(["-f", "f32le", "-"])
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null());
-        if let Ok(mut child) = crate::ffmpeg::spawn(&mut cmd) {
-            let mut stdout = child.stdout.take().expect("piped");
-            read_peaks(&mut stdout, lanes, duration, &mut |peaks| {
-                *slot.lock().unwrap() = Some(peaks);
-                wake();
+            .stderr(Stdio::piped());
+        let failed = |why: String, last: Option<Source>| {
+            let mut peaks = last.unwrap_or(Source {
+                bin_secs: 1.0,
+                lanes: Vec::new(),
+                version: 0,
+                complete: false,
+                error: None,
             });
-            let _ = child.wait();
-        }
+            peaks.version += 1;
+            peaks.complete = false;
+            peaks.error = Some(why);
+            peaks
+        };
+        let done = match crate::ffmpeg::spawn(&mut cmd) {
+            Err(e) => failed(format!("cannot run {}: {e}", tools.ffmpeg.display()), None),
+            Ok(mut child) => {
+                let mut stdout = child.stdout.take().expect("piped");
+                let mut stderr = child.stderr.take().expect("piped");
+                let said = std::thread::spawn(move || {
+                    let mut text = String::new();
+                    let _ = stderr.read_to_string(&mut text);
+                    text
+                });
+                let read = read_peaks(&mut stdout, lanes, duration, &mut |peaks| {
+                    *slot.lock().unwrap() = Some(peaks);
+                    wake();
+                });
+                drop(stdout);
+                let status = child.wait();
+                let said = said.join().unwrap_or_default();
+                let last_line = said
+                    .lines()
+                    .rev()
+                    .find(|l| !l.trim().is_empty())
+                    .unwrap_or("no error output")
+                    .trim()
+                    .to_string();
+                match (read, status) {
+                    (Err(e), _) => failed(format!("reading the decoded sound: {e}"), None),
+                    (Ok(peaks), Ok(s)) if s.success() => Source {
+                        complete: true,
+                        ..peaks
+                    },
+                    (Ok(peaks), Ok(s)) => failed(format!("ffmpeg {s}: {last_line}"), Some(peaks)),
+                    (Ok(peaks), Err(e)) => failed(format!("ffmpeg: {e}"), Some(peaks)),
+                }
+            }
+        };
+        let mut slot = slot.lock().unwrap();
+        // A failed read keeps what was handed over before it.
+        let done = match (slot.take(), done) {
+            (Some(prev), d) if d.lanes.is_empty() => Source {
+                version: prev.version + 1,
+                complete: false,
+                error: d.error,
+                ..prev
+            },
+            (_, d) => d,
+        };
+        *slot = Some(done);
+        drop(slot);
         wake();
     });
     out
@@ -154,10 +219,10 @@ pub fn columns(
         let secs = timeline.secs(source_tick);
         ((secs / source.bin_secs).floor().max(0.0) as usize).min(bins.saturating_sub(1))
     };
-    let mut out = vec![vec![[0.0f32, 0.0f32]; columns]; lanes.max(1)];
     if bins == 0 {
-        return out;
+        return vec![vec![[0.0f32, 0.0f32]; columns]; lanes.max(1)];
     }
+    let mut out: Vec<Vec<[f32; 2]>> = vec![Vec::with_capacity(columns); lanes.max(1)];
     // Walk the clips and the columns together: each column's ticks, clip by clip.
     let mut clip = 0usize;
     let mut clip_at = 0i64; // where `clips[clip]` starts on the timeline
@@ -189,9 +254,11 @@ pub fn columns(
         }
         for (lane, column) in out.iter_mut().enumerate() {
             let l = lane.min(1);
-            if lo[l] <= hi[l] {
-                column[x] = [lo[l], hi[l]];
-            }
+            column.push(if lo[l] <= hi[l] {
+                [lo[l], hi[l]]
+            } else {
+                [0.0, 0.0]
+            });
         }
     }
     out
@@ -227,15 +294,13 @@ mod tests {
             pcm.extend(r.to_le_bytes());
         }
         let mut handed: Vec<Source> = Vec::new();
-        read_peaks(&mut pcm.as_slice(), 2, 0.1, &mut |s| handed.push(s));
-        // Handed over as it fills (by sample count), complete once at the end.
+        let src = read_peaks(&mut pcm.as_slice(), 2, 0.1, &mut |s| handed.push(s)).unwrap();
+        // Handed over as it fills (by sample count); none of it complete (that is `start`'s).
         assert!(handed.len() > 2, "{}", handed.len());
-        assert!(handed[..handed.len() - 1].iter().all(|s| !s.complete));
+        assert!(handed.iter().all(|s| !s.complete && s.error.is_none()));
         let first = &handed[0];
         assert!(first.lanes[0].iter().any(|b| *b != [0.0, 0.0]));
         assert_eq!(first.lanes[0][9], [0.0, 0.0], "not reached yet");
-        let src = handed.pop().unwrap();
-        assert!(src.complete);
         assert_eq!(src.version as usize, handed.len() + 1);
         assert_eq!(src.lanes.len(), 2);
         assert_eq!(src.lanes[0].len(), 10);
@@ -245,6 +310,70 @@ mod tests {
         assert!(src.lanes[1].iter().all(|b| *b == [0.0, 0.25]));
         assert_eq!(bins_for(3600.0), 360_000);
         assert_eq!(bins_for(10.0 * 3600.0), MAX_BINS);
+    }
+
+    /// A read error is an error, not the end of the sound: `read_peaks` says so.
+    #[test]
+    fn a_read_error_is_not_the_end_of_the_sound() {
+        struct Breaks(usize);
+        impl Read for Breaks {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                if self.0 == 0 {
+                    return Err(std::io::Error::other("the pipe broke"));
+                }
+                let n = buf.len().min(self.0);
+                buf[..n].fill(0);
+                self.0 -= n;
+                Ok(n)
+            }
+        }
+        let got = read_peaks(&mut Breaks(4000), 1, 1.0, &mut |_| {});
+        assert_eq!(got.unwrap_err().to_string(), "the pipe broke");
+    }
+
+    /// A decoder that fails part-way — some sound, then an error exit — leaves peaks that are
+    /// not complete and an error saying what it said; one that cannot start says that.
+    #[test]
+    fn a_failing_decode_is_shown_as_a_failure_not_a_flat_waveform() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let fake = tmp.path().join("ffmpeg");
+        std::fs::write(
+            &fake,
+            "#!/bin/sh\n[ \"$1\" = -version ] && exit 0\nhead -c 8000 /dev/zero\n\
+             echo 'Invalid data found when processing input' >&2\nexit 1\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        crate::testutil::run_fresh(std::process::Command::new(&fake).arg("-version"));
+        let wait = |tools: Tools| -> Source {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let shared = start(&tools, &Input::path(tmp.path()), 1, 1.0, move || {
+                let _ = tx.send(());
+            });
+            loop {
+                rx.recv_timeout(std::time::Duration::from_secs(20))
+                    .expect("the decode ends");
+                if let Some(s) = shared.lock().unwrap().clone() {
+                    if s.complete || s.error.is_some() {
+                        return s;
+                    }
+                }
+            }
+        };
+        let got = wait(Tools {
+            ffmpeg: fake.clone(),
+            ffprobe: fake,
+        });
+        assert!(!got.complete);
+        let error = got.error.unwrap();
+        assert!(error.contains("Invalid data found"), "{error}");
+        assert!(error.contains("exit"), "{error}");
+        let gone = wait(Tools {
+            ffmpeg: tmp.path().join("missing"),
+            ffprobe: tmp.path().join("missing"),
+        });
+        assert!(gone.error.unwrap().contains("cannot run"));
     }
 
     /// After a cut and a paste the columns show the source in the edit's order — from the same
@@ -257,6 +386,7 @@ mod tests {
             lanes: vec![(1..=4).map(|k| [-(k as f32), k as f32]).collect()],
             version: 1,
             complete: true,
+            error: None,
         };
         let mut t = Timeline::new(10.0, 40);
         let whole = columns(&src, &t, 4, 1);

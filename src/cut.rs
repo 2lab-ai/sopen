@@ -99,8 +99,10 @@ pub fn cut_and_publish(
     };
     let (stem, _) = stem_ext(src_name);
     let name = ffmpeg::cut_name(stem, req.in_s, req.out_s, &out_ext);
-
     let work = work_root.join(random_hex());
+    // Held while the export runs: a sopen killed meanwhile leaves the folder to the next
+    // start's sweep ([`crate::cache::sweep_stale_jobs`]).
+    let _job = crate::cache::JobLock::take(&work)?;
     // The export is private until it is published: an owner-only (0700) work dir.
     crate::cache::private_dir(&work)?;
     let result = (|| -> Result<String> {
@@ -115,6 +117,16 @@ pub fn cut_and_publish(
         name,
         notes: plan.notes,
     })
+}
+
+/// The audio tracks a render of `probe`'s file into a `.out_ext` file carries: all of them, or
+/// the first for a container that holds one.
+pub fn tracks_for(probe: &Probe, out_ext: &str) -> Vec<ffmpeg::Track> {
+    let mut tracks = probe.tracks.clone();
+    if ffmpeg::single_audio(out_ext) {
+        tracks.truncate(1);
+    }
+    tracks
 }
 
 /// Renders the edit `spec` of local file `src` into `dst` (spec §7, message 13): one ffmpeg
@@ -132,7 +144,31 @@ pub fn render_edit(
     work: &Path,
     progress: &mut dyn FnMut(f64),
 ) -> Result<()> {
-    let passes = ffmpeg::edit_passes(spec)?;
+    render_edit_with(
+        tools,
+        src,
+        dst,
+        spec,
+        (media, plan),
+        work,
+        progress,
+        ffmpeg::MAX_INPUTS,
+    )
+}
+
+/// [`render_edit`] with at most `max_inputs` inputs per run (the tests force passes).
+#[allow(clippy::too_many_arguments)]
+pub fn render_edit_with(
+    tools: &Tools,
+    src: &Input,
+    dst: &Path,
+    spec: &EditSpec,
+    (media, plan): (MediaKind, &ExportPlan),
+    work: &Path,
+    progress: &mut dyn FnMut(f64),
+    max_inputs: usize,
+) -> Result<()> {
+    let passes = ffmpeg::edit_passes(spec, max_inputs)?;
     let total: f64 = passes.iter().map(EditSpec::length).sum::<f64>().max(1e-9);
     let encoders = ffmpeg::available_encoders(tools)?;
     let mut files: Vec<Input> = vec![src.clone()];
@@ -166,9 +202,8 @@ pub fn render_edit(
     Ok(())
 }
 
-/// The export of an edited timeline's `[in_s, out_s]` (`spec` already cut to it) as a new
-/// sibling `<stem>.cut-<in>-<out>.<ext>` — the window's Export once there are edits; with none
-/// it is [`cut_and_publish`], `sopen cut`'s own export.
+/// The export of a timeline's `[in_s, out_s]` (`spec` already cut to it) as a new sibling
+/// `<stem>.cut-<in>-<out>.<ext>` — the window's Export.
 #[allow(clippy::too_many_arguments)]
 pub fn render_and_publish(
     fs: &mut dyn RemoteFs,
@@ -192,6 +227,7 @@ pub fn render_and_publish(
     let (stem, _) = stem_ext(src_name);
     let name = ffmpeg::cut_name(stem, in_s, out_s, &out_ext);
     let work = work_root.join(random_hex());
+    let _job = crate::cache::JobLock::take(&work)?;
     crate::cache::private_dir(&work)?;
     let result = (|| -> Result<String> {
         let dst = work.join(&name);

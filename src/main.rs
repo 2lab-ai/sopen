@@ -977,6 +977,8 @@ fn run_cut(
             (fetched.claim.local.clone(), Some(fetched.claim))
         }
     };
+    // What an export left when its sopen was killed goes first.
+    cache::sweep_stale_jobs(&dirs.cache);
     let mut progress = Progress::new(format!("cutting {name}"));
     let result = cut::cut_and_publish(
         place.fs(),

@@ -733,6 +733,35 @@ fn check_target<F: RemoteFs + ?Sized>(
     Ok(Check::Same(now))
 }
 
+/// Whether `target` is no longer the file `expected` describes, by the rule a replace checks
+/// before it uploads ([`RemoteFs::write_atomic`]): still a regular file, the same `(size,
+/// mtime)`, and — when `expected` has a hash and the file is not over the hash limit — the same
+/// content. `None`: unchanged; else how it changed. For a check before a long job (a media
+/// render): the replace checks again.
+pub fn changed_since<F: RemoteFs + ?Sized>(
+    fs: &mut F,
+    target: &str,
+    expected: &Fingerprint,
+) -> Result<Option<String>> {
+    let now = match check_target(fs, target, expected)? {
+        Check::Same(now) => now,
+        Check::Changed(_, reason) => return Ok(Some(reason)),
+    };
+    if let Some(want) = expected.sha256 {
+        if now.size <= fs.hash_check_limit() {
+            let mut sink = Hashing::new(std::io::sink());
+            fs.read_to(target, &mut sink, &mut |_| {})
+                .with_context(|| format!("cannot re-read {target} to check it for changes"))?;
+            if sink.finish().sha256 != want {
+                return Ok(Some(
+                    "its content changed (same size and modification time)".to_string(),
+                ));
+            }
+        }
+    }
+    Ok(None)
+}
+
 enum Swap {
     /// The temp as it will be renamed: its `(size, mtime)` is the next baseline.
     Ready(Stat),

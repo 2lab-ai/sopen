@@ -140,6 +140,23 @@ impl Media {
         self.video.map(|(w, h)| playback::decode_size(w, h))
     }
 
+    /// Where timeline tick 0 is in the source (seconds): on video, the picture's offset within
+    /// a frame period ([`Probe::frame_origin`]), so a cut is at a frame's own time for picture
+    /// and sound alike; 0 on audio.
+    pub fn origin(&self) -> f64 {
+        if self.video.is_some() {
+            self.probe.frame_origin()
+        } else {
+            0.0
+        }
+    }
+
+    /// The picture's last frame (its own length, else the file's).
+    pub fn last_frame(&self) -> Tick {
+        let length = self.probe.video_duration.unwrap_or(self.duration);
+        ((length * self.fps.max(1.0)).round() as Tick - 1).max(0)
+    }
+
     /// Ticks per second of the edit list: frames on video, samples on audio.
     pub fn rate(&self) -> f64 {
         if self.video.is_some() {
@@ -193,11 +210,7 @@ impl Media {
     /// The audio tracks a render carries: all, or the first for a container that holds one.
     fn tracks(&self) -> Vec<ffmpeg::Track> {
         let out = self.plan.as_ref().map_or("", |(_, ext, _)| ext.as_str());
-        let mut tracks = self.probe.tracks.clone();
-        if ffmpeg::single_audio(out) {
-            tracks.truncate(1);
-        }
-        tracks
+        cut::tracks_for(&self.probe, out)
     }
 
     /// What Save re-encodes, for its hover text.
@@ -276,8 +289,7 @@ impl Scrubber {
         let cache: Kept = Arc::default();
         let (rq, res, q, store) = (req.clone(), result.clone(), quit.clone(), cache.clone());
         let (tools, path, fps) = (media.tools.clone(), media.input.clone(), media.fps.max(1.0));
-        // The last frame starts one frame before the end; asking past it decodes nothing.
-        let last = (media.duration - 1.5 / fps).max(0.0);
+        let origin = media.origin();
         let keep = (FRAME_CACHE_BYTES / (w * h * 4) as usize).max(2);
         std::thread::spawn(move || loop {
             let (t, key) = {
@@ -290,28 +302,49 @@ impl Scrubber {
                 }
                 g.take().expect("checked")
             };
-            // Half a frame early, as Save renders a cut: the frame shown is frame `key`.
-            let at = (key as f64 / fps).min(last) - 0.5 / fps;
-            let mut cmd = std::process::Command::new(&tools.ffmpeg);
-            cmd.args(["-nostdin", "-hide_banner", "-loglevel", "error", "-ss"])
-                .arg(format!("{:.6}", at.max(0.0)))
-                .arg("-i")
-                .arg(path.arg())
-                .args(["-frames:v", "1", "-an", "-sn", "-vf"])
-                .arg(format!("scale={w}:{h},format=rgba"))
-                .args(["-f", "rawvideo", "-"])
-                .stdin(Stdio::null())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::null());
-            let frame = match ffmpeg::spawn(&mut cmd) {
-                Err(e) => Err(format!("cannot run {}: {e}", tools.ffmpeg.display())),
-                Ok(mut child) => {
+            // Half a frame early, as Save renders a cut: the frame shown is frame `key` (keys
+            // are clamped to the picture's last frame where they are made, [`MediaWindow::
+            // frame_at`]). If nothing comes from there (a last frame stamped a little early),
+            // the last picture of the two seconds before it is the one.
+            let at = (origin + key as f64 / fps - 0.5 / fps).max(0.0);
+            let grab = |from: f64, one: bool| -> Result<Vec<u8>, String> {
+                let mut cmd = std::process::Command::new(&tools.ffmpeg);
+                cmd.args(["-nostdin", "-hide_banner", "-loglevel", "error", "-ss"])
+                    .arg(format!("{from:.6}"))
+                    .arg("-i")
+                    .arg(path.arg())
+                    .args(["-an", "-sn", "-vf"])
+                    .arg(format!("scale={w}:{h},format=rgba"));
+                if one {
+                    cmd.args(["-frames:v", "1"]);
+                }
+                cmd.args(["-f", "rawvideo", "-"])
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::null());
+                let mut child = ffmpeg::spawn(&mut cmd)
+                    .map_err(|e| format!("cannot run {}: {e}", tools.ffmpeg.display()))?;
+                use std::io::Read;
+                let mut out = child.stdout.take().expect("piped");
+                let mut last: Option<Vec<u8>> = None;
+                loop {
                     let mut rgba = vec![0u8; (w * h * 4) as usize];
-                    use std::io::Read;
-                    let read = child.stdout.take().expect("piped").read_exact(&mut rgba);
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    read.map(|()| {
+                    if out.read_exact(&mut rgba).is_err() {
+                        break;
+                    }
+                    last = Some(rgba);
+                    if one {
+                        break;
+                    }
+                }
+                let _ = child.kill();
+                let _ = child.wait();
+                last.ok_or_else(|| format!("no frame at {}", clock_text(key as f64 / fps)))
+            };
+            let frame = {
+                let read = grab(at, true).or_else(|_| grab((at - 2.0).max(0.0), false));
+                {
+                    read.map(|rgba| {
                         let rgba = Arc::new(rgba);
                         let mut c = store.lock().unwrap();
                         c.retain(|(k, _)| *k != key);
@@ -321,7 +354,6 @@ impl Scrubber {
                         }
                         Scrubbed { t, key, rgba }
                     })
-                    .map_err(|_| format!("no frame at {}", clock_text(key as f64 / fps)))
                 }
             };
             *res.lock().unwrap() = Some(frame);
@@ -437,11 +469,11 @@ fn edit_spec(
     EditSpec {
         spans: clips
             .iter()
-            .map(|c| Span {
-                file: 0,
-                start: timeline.secs(c.start),
-                len: timeline.secs(c.len()),
-                frames: video.then_some(c.len() as u64),
+            .map(|c| {
+                Span::of(
+                    media.origin() + timeline.secs(c.start),
+                    timeline.secs(c.len()),
+                )
             })
             .collect(),
         fps: video.then_some(media.fps),
@@ -535,6 +567,7 @@ pub fn open(
     notices: Vec<String>,
 ) -> Result<Outcome> {
     let (_, name) = origin.parent();
+    sweep(cache);
     let media = Media::probe_as(&Input::path(local), &name)?;
     let state = &hooks.state;
     if !state.ops.is_empty() {
@@ -555,6 +588,7 @@ pub fn open(
     let work_root = crate::cache::exports_root(cache);
     let mut file = MediaFile::new(origin, cache);
     if hooks.autosave {
+        file.hash_in_background();
         return autosave(&mut file, &media, &timeline, &work_root, hooks);
     }
     if hooks.autoexport {
@@ -607,6 +641,17 @@ pub fn open(
     Ok(outcome)
 }
 
+/// What a Save or an Export left behind when its sopen was killed: removed before this window
+/// starts its own ([`crate::cache::sweep_stale_jobs`]).
+fn sweep(cache: &Path) {
+    for gone in crate::cache::sweep_stale_jobs(cache) {
+        crate::debug!(
+            "removed {} (left by a sopen that was killed)",
+            gone.display()
+        );
+    }
+}
+
 /// `SOPEN_AUTOSAVE`: the state's edits saved without a window (exit 3 when refused).
 fn autosave(
     file: &mut MediaFile,
@@ -654,6 +699,7 @@ fn autosave(
 /// the probed `media`, without the receipt hooks. `cache` is where exports are staged and Save
 /// keeps its backup.
 pub fn embed(origin: Origin, media: Media, cache: &Path, notices: Vec<String>) -> super::Embedded {
+    sweep(cache);
     let work_root = crate::cache::exports_root(cache);
     let window = MediaWindow::new(
         media,
@@ -890,6 +936,8 @@ impl MediaWindow {
         notices: Vec<String>,
     ) -> Self {
         let timeline = Timeline::new(media.rate(), media.ticks());
+        let mut file = file;
+        file.hash_in_background();
         let can_replace = file.origin.can_replace();
         Self {
             title: file.origin.display(),
@@ -987,11 +1035,12 @@ impl MediaWindow {
         self.tex_at = Some((t, key));
     }
 
-    /// The source frame shown at timeline time `t`.
+    /// The source frame shown at timeline time `t`: past the picture's last frame (a longer
+    /// sound track), the last frame holds.
     fn frame_at(&self, t: f64) -> Tick {
         let tl = &self.timeline;
         let tick = tl.tick(t).clamp(0, (tl.len() - 1).max(0));
-        timeline::source_at(tl.clips(), tick)
+        timeline::source_at(tl.clips(), tick).min(self.media.last_frame())
     }
 
     fn seek(&mut self, ctx: &egui::Context, t: f64) {
@@ -1036,7 +1085,7 @@ impl MediaWindow {
             .from(from)
             .iter()
             .map(|c| Piece {
-                start: tl.secs(c.start),
+                start: media.origin() + tl.secs(c.start),
                 len: tl.secs(c.len()),
             })
             .collect();
@@ -1084,6 +1133,9 @@ impl MediaWindow {
         }
         if let Some(note) = note {
             self.status = Status::error(format!("{note} — playing without sound"));
+        }
+        if let Some(error) = &pump.error {
+            self.status = Status::error(format!("playback stopped: {error}"));
         }
         if pump.ended {
             self.player = None;
@@ -1284,7 +1336,9 @@ impl MediaWindow {
         let (shared, waker) = (progress.clone(), ctx.clone());
         let mut hold = self.export_hold;
         std::thread::spawn(move || {
-            let mut file = file.lock().unwrap();
+            // A worker that panicked mid-write must not lock the file out of every later
+            // Save and Export: its state is the file's own (origin, backup), still valid.
+            let mut file = file.lock().unwrap_or_else(|e| e.into_inner());
             let result = work.run(&mut file.origin, &media, &root, &mut |f| {
                 shared.store((f * 1000.0) as u32, SeqCst);
                 waker.request_repaint();
@@ -1337,7 +1391,9 @@ impl MediaWindow {
             self.marks.t = player.clock(Instant::now()).min(self.length());
         }
         std::thread::spawn(move || {
-            let mut file = file.lock().unwrap();
+            // A worker that panicked mid-write must not lock the file out of every later
+            // Save and Export: its state is the file's own (origin, backup), still valid.
+            let mut file = file.lock().unwrap_or_else(|e| e.into_inner());
             let result = file.save(&media, &spec, &root, &mut |f| {
                 shared.store((f * 1000.0) as u32, SeqCst);
                 waker.request_repaint();
@@ -1358,8 +1414,13 @@ impl MediaWindow {
         let Some(job) = &self.job else {
             return;
         };
-        let Ok(result) = job.rx.try_recv() else {
-            return;
+        // A worker that ended without a word (it panicked) is a failure, said as one.
+        let result = match job.rx.try_recv() {
+            Ok(result) => result,
+            Err(mpsc::TryRecvError::Empty) => return,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                Err(anyhow::anyhow!("the export stopped without a result"))
+            }
         };
         self.job = None;
         let (status, shown) = report_export(result, &mut self.outcome.lock().unwrap());
@@ -1398,8 +1459,14 @@ impl MediaWindow {
         let Some(job) = &self.save else {
             return;
         };
-        let Ok(result) = job.rx.try_recv() else {
-            return;
+        // A worker that ended without a word (it panicked) is a failure, said as one: the edits
+        // stay and the window is usable again.
+        let result = match job.rx.try_recv() {
+            Ok(result) => result,
+            Err(mpsc::TryRecvError::Empty) => return,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                Err(anyhow::anyhow!("the save stopped without a result"))
+            }
         };
         let job = self.save.take().expect("checked above");
         let (status, shown) = report_save(&result, &mut self.outcome.lock().unwrap());
@@ -1650,6 +1717,20 @@ impl MediaWindow {
                     p.dim,
                 );
             }
+            // A decode that failed is said where the waveform is, not drawn as silence.
+            let failed = self
+                .wave
+                .as_ref()
+                .and_then(|w| w.lock().unwrap().as_ref().and_then(|p| p.error.clone()));
+            if let Some(why) = failed {
+                painter.text(
+                    rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    format!("cannot read the waveform: {why}"),
+                    font.clone(),
+                    p.error,
+                );
+            }
         }
         // Where the edits joined pieces of the source.
         for start in timeline::starts(self.timeline.clips()).into_iter().skip(1) {
@@ -1659,49 +1740,59 @@ impl MediaWindow {
                 Stroke::new(1.0, p.dim),
             );
         }
-        // Labels go right of their marker; left of it near the right end (to stay inside),
-        // and In's goes left when it would run into Out's (a narrow selection).
-        let cell = super::chrome::CELL.x;
-        let width = |label: &str| cell * label.chars().count() as f32;
-        let mark = |t: f64, color: Color32, label: String, room: f32| {
+        // Each marker's line, and its label laid out (measured, not counted): right of the
+        // line, left of it where the right would leave the timeline. When In's and Out's
+        // labels would still meet (a narrow selection, either end), In's goes left of its
+        // line if there is room, else Out's drops to a second row — the timeline's height
+        // never changes for it.
+        let row = ui
+            .text_style_height(&egui::TextStyle::Body)
+            .max(super::chrome::CELL.y);
+        let place = |x: f64, label: &str| -> Rect {
+            let galley = painter.layout_no_wrap(label.to_string(), font.clone(), Color32::WHITE);
+            let w = galley.size().x;
+            let x = x_of(x);
+            let left = x + 3.0 + w > rect.right() && x - 3.0 - w >= rect.left();
+            let x0 = if left { x - 3.0 - w } else { x + 3.0 };
+            Rect::from_min_size(Pos2::new(x0, rect.top() + 2.0), Vec2::new(w, row))
+        };
+        let flip_left = |r: Rect, x: f64| -> Rect {
+            let x = x_of(x);
+            Rect::from_min_size(Pos2::new(x - 3.0 - r.width(), r.top()), r.size())
+        };
+        let in_label = self
+            .marks
+            .in_s
+            .map(|i| (i, format!("In {}", clock_text(i))));
+        let out_label = self
+            .marks
+            .out_s
+            .map(|o| (o, format!("Out {}", clock_text(o))));
+        let mut in_rect = in_label.as_ref().map(|(i, l)| place(*i, l));
+        let mut out_rect = out_label.as_ref().map(|(o, l)| place(*o, l));
+        if let (Some((i, _)), Some(ir), Some(or)) = (&in_label, in_rect, out_rect) {
+            if ir.intersects(or) {
+                let left = flip_left(ir, *i);
+                if left.left() >= rect.left() && !left.intersects(or) {
+                    in_rect = Some(left);
+                } else {
+                    out_rect = Some(or.translate(Vec2::new(0.0, row)));
+                }
+            }
+        }
+        for (mark, color, at) in [
+            (in_label.zip(in_rect), p.mark_in, self.marks.in_s),
+            (out_label.zip(out_rect), p.mark_out, self.marks.out_s),
+        ] {
+            let (Some(((_, label), r)), Some(t)) = (mark, at) else {
+                continue;
+            };
             let x = x_of(t);
             painter.line_segment(
                 [Pos2::new(x, rect.top()), Pos2::new(x, rect.bottom())],
                 Stroke::new(2.0, color),
             );
-            let left = x + 3.0 + width(&label) > room && x - 3.0 - width(&label) >= rect.left();
-            let (pos, align) = if left {
-                (
-                    Pos2::new(x - 3.0, rect.top() + 2.0),
-                    egui::Align2::RIGHT_TOP,
-                )
-            } else {
-                (Pos2::new(x + 3.0, rect.top() + 2.0), egui::Align2::LEFT_TOP)
-            };
-            painter.text(pos, align, label, font.clone(), color);
-        };
-        // Out's label first: where it goes decides how much room In's has on its right.
-        let out_label = self.marks.out_s.map(|o| {
-            let label = format!("Out {}", clock_text(o));
-            let x = x_of(o);
-            let left =
-                x + 3.0 + width(&label) > rect.right() && x - 3.0 - width(&label) >= rect.left();
-            let start = if left {
-                x - 3.0 - width(&label)
-            } else {
-                x - 3.0
-            };
-            (o, label, start)
-        });
-        if let Some(i) = self.marks.in_s {
-            let room = out_label
-                .as_ref()
-                .map_or(rect.right(), |(_, _, start)| *start - cell)
-                .min(rect.right());
-            mark(i, p.mark_in, format!("In {}", clock_text(i)), room);
-        }
-        if let Some((o, label, _)) = out_label {
-            mark(o, p.mark_out, label, rect.right());
+            painter.text(r.min, egui::Align2::LEFT_TOP, label, font.clone(), color);
         }
         let playhead = x_of(self.marks.t);
         painter.line_segment(
@@ -2155,10 +2246,12 @@ impl super::Window for MediaWindow {
                         let h = ui.available_height().max(60.0);
                         seek = self.timeline(ui, h, true).or(seek);
                     });
-                    self.painted = self
-                        .wave
-                        .as_ref()
-                        .is_some_and(|w| w.lock().unwrap().as_ref().is_some_and(|p| p.complete));
+                    self.painted = self.wave.as_ref().is_some_and(|w| {
+                        w.lock()
+                            .unwrap()
+                            .as_ref()
+                            .is_some_and(|p| p.complete || p.error.is_some())
+                    });
                 } else {
                     self.picture(ui);
                 }

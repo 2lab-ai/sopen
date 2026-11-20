@@ -206,3 +206,23 @@ fn ticks_and_seconds() {
     assert_eq!(t.secs(50), 2.0);
     assert_eq!(starts(&[clip(5, 10), clip(0, 3), clip(50, 51)]), [0, 5, 8]);
 }
+
+/// A piece that is not a range of this source — past its end, before its start, empty — is
+/// refused by insert and replace, and the list is left as it was.
+#[test]
+fn pieces_outside_the_source_are_refused() {
+    let v = View::default();
+    let mut t = Timeline::new(10.0, 100);
+    for bad in [
+        vec![clip(90, 101)],
+        vec![clip(-1, 5)],
+        vec![clip(5, 5)],
+        vec![clip(0, 10), clip(50, 200)],
+        vec![],
+    ] {
+        assert!(!t.insert(10, &bad, v), "{bad:?}");
+        assert!(!t.replace(10, 20, &bad, v), "{bad:?}");
+        assert!(t.is_identity() && !t.can_undo(), "{bad:?}");
+    }
+    assert!(t.insert(10, &[clip(0, 100)], v));
+}

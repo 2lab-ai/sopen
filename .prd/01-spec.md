@@ -564,7 +564,8 @@ once the primary button is up, and take rows off the grid's bottom.
   timeline scrub, drag = crop rectangle in source pixels, Space play/pause, Export.
 - Audio: waveform — min/max peaks per channel from one decode at 8 kHz, at most 100 per second and 2^19 per lane (an
   hour of stereo is a few MB; the PCM is never held), handed over as they fill; a stereo file shows two lanes, L and
-  R (more channels are mixed down to two); same transport, Export.
+  R (more channels are mixed down to two); same transport, Export. A decode that fails (a read error, ffmpeg's error
+  exit — its last words are kept) is said where the waveform is, never drawn as a finished flat line.
 - Editing (msg 13): the timeline is a list of clips, each a range of the source in ticks — video frames (a cut is a
   frame time, and the sound cut with it cannot drift) or audio samples. A drag on the timeline selects (the playhead
   follows the pointer, so the frame there shows), a click moves the playhead and clears the selection, `I`/`O` set
@@ -578,29 +579,53 @@ once the primary button is up, and take rows off the grid's bottom.
   or ffprobe; keys follow the image window's gating (none while a text field has the typing or a prompt is up), and
   hosted in the browser the row shows `5 Save`.
 - Preview: playback plays the clips in order, each piece by an ffmpeg of its own started as soon as the one before it
-  starts, each giving exactly its length in frames and samples (padded if short), so the clock is the timeline's and
-  a boundary costs no wait (measured 2026-11-20: the next piece's first output 0.4–2 ms after the last, against
-  ~240 ms of queued frames; no frame dropped). Paused, the frame at the playhead is the source frame the timeline
-  maps it to; the last decoded frames are kept (64 MB), so the frame an edit brings under the playhead is usually
-  there at once (measured 1–2 ms; a frame not kept: one decode, 70–95 ms). An edit while playing restarts playback at
-  the playhead.
-- Save (Cmd/Ctrl+S, F5): refused before anything is backed up or rendered when the file changed since it was opened
-  (a render can take minutes) or the server cannot replace a file in one step; else the original is copied to the
+  starts. Picture and sound each lay one grid over the whole play — piece `k` gets `round(end_k · rate) −
+  round(start_k · rate)` frames or samples — so no rounding builds up between them and a piece shorter than a frame
+  adds no frame (never stretched to one); frames are timed by their index. Both are anchored at the cut, as Save
+  is: a stream that starts later than the cut keeps its offset (silence first, the first picture held). A decoder
+  that ends early by itself is padded (silence in blocks of at most 8192 samples, the last picture held), never
+  after a stop; one that cannot start, whose output cannot be read or that exits with an error ends playback with
+  the reason on the status line. Measured 2026-11-20 (release build, null sink; each wait taken at the piece's first
+  output): 64×64 at 25 fps — video 0.02–0.3 ms, audio 1.1–1.5 ms; 1080p long-GOP (keyframes 10 s apart, cuts 8–9 s
+  past one, decoded 1280×720) — video 1.6–3.0 ms, audio 1.6–2.5 ms; against ~240 ms of queued frames; no frame
+  dropped. Paused, the frame at the playhead is the source frame the timeline maps it to — at most the picture's last
+  frame (past it, a longer sound track, that frame holds); the last decoded frames are kept (64 MB), so the frame an
+  edit brings under the playhead is usually there at once (measured 1–2 ms; a frame not kept: one decode, 70–95 ms).
+  An edit while playing restarts playback at the playhead. On video, timeline frame slot `k` is the source frame at
+  `origin + k / fps`, `origin` the picture's offset within a frame period from the file's start (a transport stream
+  whose sound starts first has its frames 21.3 ms in): picture and sound are cut at the same instant.
+- Save (Cmd/Ctrl+S, F5): refused before anything is backed up or rendered when the file changed since it was opened —
+  by the overwrite's own rule: type, size, modification time and (up to 256 MiB) content, against the fetch's hash
+  or, for a file opened in place, the hash of its bytes taken on a worker when the window opened (a render can take
+  minutes) — or when the server cannot replace a file in one step; else the original is copied to the
   local backup (§5, once per session, path printed), the edit is rendered into a staged file under `.edits`, and
   that file is written over the original by the conflict-checked overwrite (§5). Then the window plays the saved
   file, unedited (the clipboard and the history were ranges of the old one); a remote file plays from the staged
-  render, removed when the window goes. Save keeps the file's format: a file whose container cannot take the
+  render — still locked, so a sopen killed later leaves it to the sweep below — removed when the window goes. Save keeps the file's format: a file whose container cannot take the
   re-encoded streams (`.webm` video) is not saved — Export writes `.mp4`. Edits make the window unsaved: closing,
   F3, `close=ask` and leaving it in the browser ask Save / Discard / Cancel as the image window does; a running save
-  closes the window when it is done; a running export keeps the close-again rule.
+  closes the window when it is done; a running export keeps the close-again rule. A save or export whose worker ends
+  without a result (it panicked) is a visible failure; the edits stay and the window is usable.
+- A render's work folder (`.exports/<random>`) and its staged file (`<stem>.render-…` in `.edits`) each have a
+  `<name>.lock` held while the job runs; a sopen killed meanwhile leaves them to the next media window's or `sopen
+  cut`'s start, which removes every one whose lock nobody holds (a kept render — a failed save names it — has no
+  lock and stays). The render's ffmpeg dies with sopen, SIGKILL included: a small `sh` in a process group of its own
+  reads a pipe only sopen writes, and when the pipe closes it kills that ffmpeg if its command line still names the
+  program.
 - Render (Save and Export): exact for any number of pieces without decoding the source once per piece — pieces that
   follow each other in the source (within 10 s) share one input (`-ss` 0.2 s before the first, `-t` past the last,
-  `split`), a piece out of order gets its own; each piece is trimmed from its decoded input (video from half a frame
-  before its first frame) and counted out (`trim=end_frame`; `atrim=end_sample` per track at its own rate; padded if
-  short), then `concat`. Input-side `-t` alone is not exact (AAC came out a frame short), nor a trim right at the seek
+  `split`), a piece out of order gets its own; every stream of a piece is cut at the piece's start and moved by the
+  same amount (video from half a frame before it), so picture, sound and tracks keep their offsets — a stream that
+  starts late keeps its gap, filled (`fps=…:start_time=0` holds the first picture, `aresample=first_pts=0` gives
+  silence) — then counted out to the grid's budget (`trim=end_frame`; `atrim=end_sample` per track at its own rate;
+  padded if short), and each stream joined by a `concat` of its own; the joined frames are timed by index (a
+  one-frame piece's frame carried no duration through `concat`, and the next frame took its time and was dropped).
+  Frame rates are given as fractions (`30000/1001`). Input-side `-t` alone is not exact (AAC came out a frame short), nor a trim right at the seek
   point (AAC 154 samples off, MP3 9); 0.2 s of run-up made both sample-exact. One run opens at most 24 inputs (300
-  took 1.6 GB and ran out of descriptors at `ulimit -n 256`); more are rendered in lossless passes (H.264 `-qp 0` +
-  PCM in Matroska) and a final one; more than 576 separate stretches are refused. A long filter graph goes to a file
+  took 1.6 GB and ran out of descriptors at `ulimit -n 256`); more are rendered in lossless passes (H.264 `-qp 0`;
+  each track as PCM of its own sample format — s16, s32, s64, f32 or f64 — in Matroska) and a final one whose pieces
+  carry the sums of the grid's budgets, so the result is the one-pass result sample for sample; more than 576
+  separate stretches are refused. A long filter graph goes to a file
   (`-/filter_complex`, ffmpeg 7+). Export's crop applies once, to its whole output (Save writes the edit list only:
   a rectangle drawn is said on the status line, not saved); Mono → Stereo pans each mono track
   `pan=stereo|c0=c0|c1=c0`.
@@ -615,6 +640,9 @@ once the primary button is up, and take rows off the grid's bottom.
   stuck, so it watches what they say, not whether they come; a libx264 deadlock once ran 44 h unstopped).
 - `sopen cut <source> <in> <out> [--crop x,y,w,h]` = the unedited export (`-ss In -to Out -i src`), headless
   (scripting + CI receipts); it always runs on this machine (§4a).
+- A raw `.aac` (ADTS) or `.ts` output decodes longer than its cut by the AAC encoder's 1024-sample priming plus the
+  padding of its last frame (1280–1883 samples measured): neither container can say to skip them (MP4 and Matroska
+  carry it). Inherent to the containers; the picture and the sound's timing are right.
 - Renderer / playback details fixed by the spike (§11).
 
 ## 8. Usage log

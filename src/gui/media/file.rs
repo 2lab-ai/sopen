@@ -8,6 +8,7 @@ use crate::gui::Origin;
 use crate::remote::WriteOutcome;
 use anyhow::{bail, Context as _, Result};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::SystemTime;
 
 /// The opened media file: where it lives and the local places sopen writes to.
@@ -20,7 +21,52 @@ pub struct MediaFile {
     backup: Option<PathBuf>,
     /// What the last Save of a remote file wrote, kept here: the window plays it (the cached
     /// copy still holds what was fetched). Removed when the window goes or saves again.
-    rendered: Option<PathBuf>,
+    rendered: Option<(PathBuf, crate::cache::JobLock)>,
+    /// A file opened in place has no hash from a fetch: its content as opened is hashed on a
+    /// worker from the start, the baseline the Save checks compare with (§5).
+    baseline: Option<Arc<Baseline>>,
+}
+
+/// The hash of a local file as it was opened, made on a worker (`None` in it: over the hash
+/// limit — size and modification time only, as §5 does above it).
+#[derive(Default)]
+struct Baseline {
+    result: Mutex<Option<Result<Option<[u8; 32]>, String>>>,
+    ready: Condvar,
+}
+
+/// Hashes `path` if it is still the file `at` describes — size and modification time read
+/// through the handle before and after — up to the hash limit.
+fn hash_as_opened(path: &Path, at: &crate::remote::Stat) -> Result<Option<[u8; 32]>, String> {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+    let same = |m: &std::fs::Metadata| m.len() == at.size && m.modified().ok() == Some(at.mtime);
+    let mut file = std::fs::File::open(path).map_err(|e| format!("cannot read it ({e})"))?;
+    let before = file
+        .metadata()
+        .map_err(|e| format!("cannot read it ({e})"))?;
+    if !same(&before) {
+        return Err("changed since it was opened (before its content was read)".to_string());
+    }
+    if before.len() > crate::remote::HASH_CHECK_MAX {
+        return Ok(None);
+    }
+    let mut hash = Sha256::new();
+    let mut buf = vec![0u8; 1 << 20];
+    loop {
+        match file.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => hash.update(&buf[..n]),
+            Err(e) => return Err(format!("cannot read it ({e})")),
+        }
+    }
+    let after = file
+        .metadata()
+        .map_err(|e| format!("cannot read it ({e})"))?;
+    if !same(&after) {
+        return Err("changed since it was opened (while its content was read)".to_string());
+    }
+    Ok(Some(hash.finalize().into()))
 }
 
 /// Result of one Save.
@@ -49,6 +95,59 @@ impl MediaFile {
             edits,
             backup: None,
             rendered: None,
+            baseline: None,
+        }
+    }
+
+    /// For a file opened in place (no hash from a fetch): its content as opened is hashed on a
+    /// worker from now on — what Save compares the file with, before rendering and before the
+    /// overwrite.
+    pub fn hash_in_background(&mut self) {
+        if !self.origin.is_local() || self.origin.at.sha256.is_some() || self.baseline.is_some() {
+            return;
+        }
+        let baseline = Arc::new(Baseline::default());
+        let (slot, path, at) = (
+            baseline.clone(),
+            PathBuf::from(&self.origin.abs),
+            self.origin.at,
+        );
+        std::thread::spawn(move || {
+            let result = hash_as_opened(&path, &at);
+            *slot.result.lock().unwrap() = Some(result);
+            slot.ready.notify_all();
+        });
+        self.baseline = Some(baseline);
+    }
+
+    /// The hash of the file as opened is made (tests wait for it before changing the file).
+    #[cfg(test)]
+    pub fn baseline_ready(&self) -> bool {
+        self.baseline
+            .as_ref()
+            .is_none_or(|b| b.result.lock().unwrap().is_some())
+    }
+
+    /// The staged render a saved remote file plays from, if any (tests).
+    #[cfg(test)]
+    pub fn rendered_path(&self) -> Option<&Path> {
+        self.rendered.as_ref().map(|(p, _)| p.as_path())
+    }
+
+    /// Waits for the hash of the file as opened and makes it the baseline; why not, when the
+    /// file is no longer the one opened (or cannot be read).
+    fn take_baseline(&mut self) -> Option<String> {
+        let baseline = self.baseline.take()?;
+        let mut slot = baseline.result.lock().unwrap();
+        while slot.is_none() {
+            slot = baseline.ready.wait(slot).unwrap();
+        }
+        match slot.take().expect("checked") {
+            Ok(hash) => {
+                self.origin.at.sha256 = hash;
+                None
+            }
+            Err(why) => Some(why),
         }
     }
 
@@ -113,22 +212,20 @@ impl MediaFile {
             );
         };
         // A render can take minutes, and a file opened in place is what it reads: a file that
-        // changed since it was opened is refused first (the overwrite checks again after).
+        // changed since it was opened is refused first, by the overwrite's own rule — content
+        // too, against the bytes as opened (§5) — and the overwrite checks again after.
+        if let Some(why) = self.take_baseline() {
+            return Ok(Saved::Refused {
+                message: format!(
+                    "{} {why}; not saved — nothing was rendered, and your edits are still in \
+                     the window",
+                    self.origin.display()
+                ),
+            });
+        }
         let at = self.origin.at;
         let abs = self.origin.abs.clone();
-        let now = self.origin.fs()?.lstat_opt(&abs)?;
-        let changed = match now {
-            Some(now)
-                if now.is_file
-                    && !now.is_symlink
-                    && now.size == at.size
-                    && now.mtime == at.mtime =>
-            {
-                None
-            }
-            Some(now) => Some(crate::remote::describe_change(&at.fingerprint(), &now)),
-            None => Some("it is gone".to_string()),
-        };
+        let changed = crate::remote::changed_since(self.origin.fs()?, &abs, &at.fingerprint())?;
         if let Some(reason) = changed {
             return Ok(Saved::Refused {
                 message: format!(
@@ -147,9 +244,26 @@ impl MediaFile {
             );
         };
         let backup = self.ensure_backup(local)?;
-        let (staged, _) = crate::gui::create_keep(&self.edits, "edited")?;
         let work = work_root.join(crate::remote::random_hex());
+        // Both held while the render runs and is written back: a sopen killed meanwhile leaves
+        // them to the next start's sweep ([`crate::cache::sweep_stale_jobs`]), never forever.
+        let _work_job = crate::cache::JobLock::take(&work)?;
         crate::cache::private_dir(&work)?;
+        let staged = match crate::gui::create_keep(&self.edits, "render") {
+            Ok((staged, _)) => staged,
+            Err(e) => {
+                let _ = std::fs::remove_dir_all(&work);
+                return Err(e);
+            }
+        };
+        let mut render_job = match crate::cache::JobLock::take(&staged) {
+            Ok(job) => Some(job),
+            Err(e) => {
+                let _ = std::fs::remove_dir_all(&work);
+                let _ = std::fs::remove_file(&staged);
+                return Err(e);
+            }
+        };
         let rendered = crate::cut::render_edit(
             &media.tools,
             &media.input,
@@ -184,7 +298,10 @@ impl MediaFile {
                         let _ = std::fs::remove_file(&staged);
                         PathBuf::from(&abs)
                     } else {
-                        if let Some(old) = self.rendered.replace(staged.clone()) {
+                        // Kept as the playing copy, with its lock: a sopen killed later still
+                        // leaves it to the next start's sweep.
+                        let job = render_job.take().expect("held until here");
+                        if let Some((old, _)) = self.rendered.replace((staged.clone(), job)) {
                             let _ = std::fs::remove_file(old);
                         }
                         staged.clone()
@@ -229,7 +346,8 @@ impl MediaFile {
 
 impl Drop for MediaFile {
     fn drop(&mut self) {
-        if let Some(path) = self.rendered.take() {
+        // The file first, then its lock (dropped with it).
+        if let Some((path, _job)) = self.rendered.take() {
             let _ = std::fs::remove_file(path);
         }
     }

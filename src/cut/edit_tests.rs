@@ -50,7 +50,7 @@ fn tones(tools: &Tools, dst: &Path, src: &str, rate: u32, codec: &[&str]) {
 /// The file's first audio track decoded as f32 at its own rate: one Vec per channel.
 fn pcm(tools: &Tools, file: &Path, track: usize) -> (u32, Vec<Vec<f32>>) {
     let probe = ffmpeg::probe(tools, file).unwrap();
-    let t = probe.tracks[track];
+    let t = &probe.tracks[track];
     let (rate, ch) = (t.rate.unwrap(), t.channels.unwrap() as usize);
     let out = Command::new(&tools.ffmpeg)
         .args(["-hide_banner", "-loglevel", "error", "-nostdin", "-i"])
@@ -139,16 +139,19 @@ fn spans(rate: f64, ranges: &[(i64, i64)], video: bool) -> Vec<Span> {
     ranges
         .iter()
         .map(|&(a, b)| Span {
-            file: 0,
-            start: a as f64 / rate,
-            len: (b - a) as f64 / rate,
             frames: video.then_some((b - a) as u64),
+            ..Span::of(a as f64 / rate, (b - a) as f64 / rate)
         })
         .collect()
 }
 
 /// Renders `spec` of `src` into `<dir>/<name>` the way Save and Export do.
 fn render(tools: &Tools, src: &Path, name: &str, spec: &EditSpec) -> PathBuf {
+    render_max(tools, src, name, spec, ffmpeg::MAX_INPUTS)
+}
+
+/// [`render`] with at most `max` inputs per run (forcing passes).
+fn render_max(tools: &Tools, src: &Path, name: &str, spec: &EditSpec, max: usize) -> PathBuf {
     let probe = ffmpeg::probe(tools, src).unwrap();
     let (media, _, plan) =
         super::plan(tools, &probe, src.file_name().unwrap().to_str().unwrap()).unwrap();
@@ -157,18 +160,18 @@ fn render(tools: &Tools, src: &Path, name: &str, spec: &EditSpec) -> PathBuf {
     let work = dir.join(format!("work-{name}"));
     crate::cache::private_dir(&work).unwrap();
     let mut last = 0.0;
-    render_edit(
+    render_edit_with(
         tools,
         &ffmpeg::Input::path(src),
         &dst,
         spec,
-        media,
-        &plan,
+        (media, &plan),
         &work,
         &mut |f| {
             assert!(f >= last - 1e-9, "progress never goes back");
             last = f;
         },
+        max,
     )
     .unwrap();
     assert_eq!(last, 1.0, "progress reaches the end");
@@ -423,9 +426,9 @@ fn every_audio_track_is_kept_each_at_its_rate() {
         [Some(2), Some(2)],
         "the mono track became stereo; the stereo one stayed"
     );
-    for track in 0..2 {
+    for (track, source) in probe.tracks.iter().enumerate().take(2) {
         let (r, lanes) = pcm(&tools, &out, track);
-        assert_eq!(r, probe.tracks[track].rate.unwrap(), "track {track} rate");
+        assert_eq!(r, source.rate.unwrap(), "track {track} rate");
         // AAC in Matroska carries no end trim: the last 1024-sample frame may decode whole.
         let secs = lanes[0].len() as f64 / f64::from(r);
         assert!(
@@ -490,7 +493,13 @@ fn a_long_out_of_order_edit_renders_in_passes_frame_exact() {
         crop: None,
         tracks: probe.tracks.clone(),
     };
-    assert!(ffmpeg::edit_passes(&spec).unwrap().len() > 1, "passes");
+    assert!(
+        ffmpeg::edit_passes(&spec, ffmpeg::MAX_INPUTS)
+            .unwrap()
+            .len()
+            > 1,
+        "passes"
+    );
     let out = render(&tools, &src, "out.mp4", &spec);
     let want: Vec<i64> = ranges.iter().flat_map(|&(a, b)| a..b).collect();
     assert_eq!(frame_numbers(&tools, &out), want);
@@ -631,8 +640,9 @@ pub(crate) fn count_frames(tools: &Tools, file: &Path) -> usize {
 }
 
 /// A variable-rate source (25 fps for a second, then a frame every 0.2 s): each piece is put on
-/// the frame-rate grid from its first frame, as the preview shows it — the output holds exactly
-/// the timeline's frames, as long as the timeline says, not frames past a piece's end.
+/// the frame-rate grid from its own start, as the preview shows it — every frame of every piece
+/// is the one the grid puts there (the latest source frame at or before it, a source frame
+/// taking the grid step its time rounds to), the output as long as the timeline says.
 #[test]
 fn a_variable_rate_source_renders_the_timeline_s_frames_and_length() {
     let Some(tools) = tools_or_skip() else { return };
@@ -655,11 +665,16 @@ fn a_variable_rate_source_renders_the_timeline_s_frames_and_length() {
             src.to_str().unwrap(),
         ],
     );
+    // The source's frames: (number, time).
+    let source: Vec<(i64, f64)> = (0..100i64)
+        .filter(|n| *n < 25 || n % 5 == 0)
+        .map(|n| (n, n as f64 / 25.0))
+        .collect();
     let probe = ffmpeg::probe(&tools, &src).unwrap();
     let fps = probe.fps.unwrap();
     assert!(fps < 20.0, "a variable rate averaging below 25: {fps}");
     let tick = |s: f64| (s * fps).round() as i64;
-    // Timeline: [1.0, 1.4) s, [0, 0.4) s, [2.0, 2.8) s.
+    // Timeline: [1.0, 1.4) s, [0, 0.4) s, [2.0, 2.8) s, in ticks.
     let ranges = [
         (tick(1.0), tick(1.4)),
         (0, tick(0.4)),
@@ -673,28 +688,29 @@ fn a_variable_rate_source_renders_the_timeline_s_frames_and_length() {
         tracks: Vec::new(),
     };
     let out = render(&tools, &src, "out.mp4", &spec);
-    let want: i64 = ranges.iter().map(|(a, b)| b - a).sum();
-    assert_eq!(
-        count_frames(&tools, &out) as i64,
-        want,
-        "the timeline's frames"
-    );
+    // What each piece shows: for output step k, the latest source frame from half a step
+    // before the piece's start on whose step (its time from the start, rounded) is ≤ k; before
+    // the first such frame, the first one (held).
+    let mut want: Vec<i64> = Vec::new();
+    for &(a, b) in &ranges {
+        let start = a as f64 / fps;
+        let kept: Vec<(i64, i64)> = source
+            .iter()
+            .filter(|(_, t)| *t >= start - 0.5 / fps - 1e-9)
+            .map(|&(n, t)| (n, ((t - start) * fps).round() as i64))
+            .collect();
+        for k in 0..(b - a) {
+            let n = kept
+                .iter()
+                .rfind(|(_, step)| *step <= k)
+                .unwrap_or(&kept[0])
+                .0;
+            want.push(n);
+        }
+    }
+    assert_eq!(frame_numbers(&tools, &out), want, "every piece's frames");
     let d = ffmpeg::probe(&tools, &out).unwrap().duration.unwrap();
-    assert!((d - want as f64 / fps).abs() < 0.01, "{d} s");
-    let numbers = frame_numbers(&tools, &out);
-    // The first piece starts in the sparse part at source frame 25 (1.0 s) and holds no frame
-    // from 1.4 s on (frame 35); the last starts at frame 50 (2.0 s) and ends before frame 70.
-    assert_eq!(numbers[0], 25, "{numbers:?}");
-    let first = (ranges[0].1 - ranges[0].0) as usize;
-    assert!(
-        numbers[..first].iter().all(|n| (25..35).contains(n)),
-        "{numbers:?}"
-    );
-    let third = first + (ranges[1].1 - ranges[1].0) as usize;
-    assert!(
-        numbers[third..].iter().all(|n| (50..70).contains(n)),
-        "{numbers:?}"
-    );
+    assert!((d - want.len() as f64 / fps).abs() < 0.01, "{d} s");
 }
 
 /// Each audio track keeps its own tags (language, title) through an edit.
@@ -787,4 +803,491 @@ fn a_long_filter_graph_is_read_from_a_file() {
     ffmpeg::run_export(&tools, &args, spec.length(), &mut |_| {}).unwrap();
     let want: Vec<i64> = (50..60).chain(0..10).collect();
     assert_eq!(frame_numbers(&tools, &dst), want);
+}
+
+/// Times (seconds) where the first channel of `file`'s track `track` goes from silence to a
+/// burst (|x| > 0.3 after 10 ms below it).
+fn bursts(tools: &Tools, file: &Path, track: usize) -> (Vec<f64>, f64) {
+    let (rate, lanes) = pcm(tools, file, track);
+    let x = &lanes[0];
+    let quiet = (rate / 100) as usize;
+    let on: Vec<f64> = (1..x.len())
+        .filter(|&i| {
+            x[i].abs() > 0.3 && x[i.saturating_sub(quiet)..i].iter().all(|v| v.abs() < 0.3)
+        })
+        .map(|i| i as f64 / f64::from(rate))
+        .collect();
+    (on, x.len() as f64 / f64::from(rate))
+}
+
+/// A track that starts later than the picture, and one that does not: every stream of a piece
+/// is moved by the same amount, so a burst at source second 1 or 2 lands where its frames land
+/// in both tracks, and the late track's missing start is silence, not sound pulled forward.
+#[test]
+fn a_late_starting_track_keeps_its_offset_from_the_picture_and_the_other_track() {
+    let Some(tools) = tools_or_skip() else { return };
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("late.mov");
+    // Bursts of 1 kHz at whole source seconds; track 0 starts at 0.5 s (its content time
+    // u is source time u + 0.5), track 1 at 0.
+    ff(
+        &tools,
+        &[
+            "-f",
+            "lavfi",
+            "-i",
+            "nullsrc=s=64x64:r=25:d=4,geq=lum='16+2*N':cb=128:cr=128,format=yuv420p",
+            "-itsoffset",
+            "0.5",
+            "-f",
+            "lavfi",
+            "-i",
+            "aevalsrc='if(lt(mod(t+0.5\\,1)\\,0.05)\\,0.8*sin(2*PI*1000*t)\\,0)':s=48000:d=3.5",
+            "-f",
+            "lavfi",
+            "-i",
+            "aevalsrc='if(lt(mod(t\\,1)\\,0.05)\\,0.8*sin(2*PI*1000*t)\\,0)':s=48000:d=4",
+            "-map",
+            "0",
+            "-map",
+            "1",
+            "-map",
+            "2",
+            "-c:v",
+            "libx264",
+            "-crf",
+            "10",
+            "-c:a",
+            "pcm_s16le",
+            src.to_str().unwrap(),
+        ],
+    );
+    let probe = ffmpeg::probe(&tools, &src).unwrap();
+    assert_eq!(probe.audio_streams, 2);
+    // Output: source [2.0, 2.4) then [0.2, 1.4): bursts of source seconds 2 and 1 at output
+    // 0.0 and 1.2; the late track is silent for output 0.4–0.7 (source 0.2–0.5).
+    let ranges = [(50, 60), (5, 35)];
+    let spec = EditSpec {
+        spans: spans(25.0, &ranges, true),
+        fps: Some(25.0),
+        stereo: false,
+        crop: None,
+        tracks: probe.tracks.clone(),
+    };
+    let out = render(&tools, &src, "out.mov", &spec);
+    let want: Vec<i64> = ranges.iter().flat_map(|&(a, b)| a..b).collect();
+    assert_eq!(frame_numbers(&tools, &out), want);
+    for track in [0, 1] {
+        let (on, len) = bursts(&tools, &out, track);
+        assert!((len - 1.6).abs() < 0.03, "track {track}: {len} s");
+        assert_eq!(on.len(), 2, "track {track}: {on:?}");
+        assert!(on[0].abs() < 0.005, "track {track}: {on:?}");
+        assert!((on[1] - 1.2).abs() < 0.005, "track {track}: {on:?}");
+    }
+}
+
+/// The same edit rendered in one run and in lossless passes (a frame at 30000/1001 fps is
+/// 1601.6 samples at 48 kHz: every piece's sample count is a rounding) holds the same frames
+/// and the same sound, sample for sample — and as many samples as the whole timeline's length.
+#[test]
+fn one_run_and_passes_render_the_same_frames_and_samples() {
+    let Some(tools) = tools_or_skip() else { return };
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("ntsc.mp4");
+    counter(&tools, &src, "30000/1001", 120);
+    let probe = ffmpeg::probe(&tools, &src).unwrap();
+    let fps = probe.fps.unwrap();
+    // Out of order pieces of 1, 3, 5, 7 … frames.
+    let ranges: Vec<(i64, i64)> = (0..8i64)
+        .map(|k| {
+            let a = 110 - 13 * k;
+            (a, a + 1 + 2 * (k % 4))
+        })
+        .collect();
+    let spec = EditSpec {
+        spans: spans(fps, &ranges, true),
+        fps: Some(fps),
+        stereo: false,
+        crop: None,
+        tracks: probe.tracks.clone(),
+    };
+    assert_eq!(spec.groups().len(), 8);
+    let one = render_max(&tools, &src, "one.mp4", &spec, 24);
+    let passes = render_max(&tools, &src, "passes.mp4", &spec, 3);
+    assert_eq!(frame_numbers(&tools, &one), frame_numbers(&tools, &passes));
+    let want: Vec<i64> = ranges.iter().flat_map(|&(a, b)| a..b).collect();
+    assert_eq!(frame_numbers(&tools, &one), want);
+    let (_, a) = pcm(&tools, &one, 0);
+    let (_, b) = pcm(&tools, &passes, 0);
+    let frames: i64 = ranges.iter().map(|(a, b)| b - a).sum();
+    let samples = (frames as f64 / fps * 48_000.0).round() as usize;
+    assert_eq!(a[0].len(), samples, "one run: the timeline's samples");
+    assert_eq!(b[0].len(), samples, "passes: the timeline's samples");
+    assert!(a == b, "the same sound, sample for sample");
+}
+
+/// Raw samples written as a WAV of `codec` (`pcm_s32le`, `pcm_f64le`) from `bytes` of
+/// `format` (`s32le`, `f64le`), mono at 48 kHz.
+fn raw_wav(
+    tools: &Tools,
+    dir: &Path,
+    name: &str,
+    bytes: &[u8],
+    format: &str,
+    codec: &str,
+) -> PathBuf {
+    let raw = dir.join(format!("{name}.raw"));
+    std::fs::write(&raw, bytes).unwrap();
+    let wav = dir.join(name);
+    ff(
+        tools,
+        &[
+            "-f",
+            format,
+            "-ar",
+            "48000",
+            "-ac",
+            "1",
+            "-i",
+            raw.to_str().unwrap(),
+            "-c:a",
+            codec,
+            wav.to_str().unwrap(),
+        ],
+    );
+    wav
+}
+
+fn raw_of(tools: &Tools, file: &Path, format: &str) -> Vec<u8> {
+    let out = Command::new(&tools.ffmpeg)
+        .args(["-hide_banner", "-loglevel", "error", "-nostdin", "-i"])
+        .arg(file)
+        .args(["-f", format, "-"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    out.stdout
+}
+
+/// A multi-pass render keeps 32-bit integer and 64-bit float samples exactly: its intermediate
+/// holds each track in its own sample format (a float intermediate would round both).
+#[test]
+fn passes_keep_32_bit_and_64_bit_samples_exactly() {
+    let Some(tools) = tools_or_skip() else { return };
+    let tmp = tempfile::tempdir().unwrap();
+    let mut x = 0x2545_f491_4f6c_dd1du64;
+    let mut next = move || {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        x
+    };
+    let n = 48_000 * 2;
+    let ints: Vec<u8> = (0..n)
+        .flat_map(|_| ((next() >> 32) as i32 / 2).to_le_bytes())
+        .collect();
+    let floats: Vec<u8> = (0..n)
+        .flat_map(|_| ((next() >> 11) as f64 / (1u64 << 53) as f64 - 0.5).to_le_bytes())
+        .collect();
+    for (name, bytes, format, codec, width) in [
+        ("s32.wav", ints, "s32le", "pcm_s32le", 4),
+        ("f64.wav", floats, "f64le", "pcm_f64le", 8),
+    ] {
+        let src = raw_wav(&tools, tmp.path(), name, &bytes, format, codec);
+        let probe = ffmpeg::probe(&tools, &src).unwrap();
+        // Five out-of-order pieces of 0.1 s: passes of at most two inputs.
+        let ranges: Vec<(i64, i64)> = [9, 2, 7, 0, 5]
+            .iter()
+            .map(|k| (k * 9_600, k * 9_600 + 4_800))
+            .collect();
+        let spec = EditSpec {
+            spans: spans(48_000.0, &ranges, false),
+            fps: None,
+            stereo: false,
+            crop: None,
+            tracks: probe.tracks.clone(),
+        };
+        let out = render_max(&tools, &src, &format!("out-{name}"), &spec, 2);
+        let got = raw_of(&tools, &out, format);
+        let want: Vec<u8> = ranges
+            .iter()
+            .flat_map(|&(a, b)| bytes[a as usize * width..b as usize * width].to_vec())
+            .collect();
+        assert_eq!(got.len(), want.len(), "{name}: length");
+        assert!(got == want, "{name}: every sample exactly");
+    }
+}
+
+/// Where `clip` best matches `full` around sample `at` (lag in samples, ±`reach`), and the
+/// largest difference there (over every 97th sample).
+fn best_lag(full: &[f32], clip: &[f32], at: usize, reach: i64) -> (i64, f32) {
+    (-reach..=reach)
+        .map(|lag| {
+            let o = (at as i64 + lag) as usize;
+            let worst = (2_000..clip.len().min(full.len() - o) - 1)
+                .step_by(97)
+                .fold(0f32, |m, i| m.max((clip[i] - full[o + i]).abs()));
+            (lag, worst)
+        })
+        .min_by(|a, b| a.1.total_cmp(&b.1))
+        .unwrap()
+}
+
+/// `sopen cut` of AAC is Out − In long and its sound is where it was in the source: the old
+/// input-side `-ss`/`-to` cut started 1002 samples (22.7 ms) early.
+#[test]
+fn an_aac_cut_is_where_it_was_in_the_source() {
+    let Some(tools) = tools_or_skip() else { return };
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("t.m4a");
+    // A chirp: no two stretches alike, so there is one place the cut matches.
+    let chirp = "aevalsrc='0.5*sin(2*PI*(200*t+300*t*t))'";
+    tones(
+        &tools,
+        &src,
+        chirp,
+        44_100,
+        &["-c:a", "aac", "-b:a", "192k"],
+    );
+    let published = cut_and_publish(
+        &mut crate::remote::LocalFs::new(),
+        &tools,
+        &src,
+        tmp.path().to_str().unwrap(),
+        "t.m4a",
+        &CutRequest {
+            in_s: 1.0,
+            out_s: 3.0,
+            crop: None,
+        },
+        &tmp.path().join("work"),
+        &mut |_| {},
+    )
+    .unwrap();
+    let (r, cut) = pcm(&tools, &tmp.path().join(&published.name), 0);
+    let (_, full) = pcm(&tools, &src, 0);
+    let secs = cut[0].len() as f64 / f64::from(r);
+    assert!((secs - 2.0).abs() < 0.001, "{secs} s");
+    let (lag, worst) = best_lag(&full[0], &cut[0], 44_100, 2_500);
+    assert_eq!(
+        lag, 0,
+        "the cut's sound is {lag} samples off (difference {worst})"
+    );
+    assert!(worst < 0.1, "re-encoded, still the source's sound: {worst}");
+}
+
+/// A 4 s, 25 fps frame counter with 1 kHz bursts at whole source seconds on one AAC track, the
+/// picture starting `video_late` s and the sound `audio_late` s into the file (`-itsoffset`),
+/// in a `.ext` container.
+pub(crate) fn offset_fixture(tools: &Tools, dst: &Path, video_late: f64, audio_late: f64) {
+    let burst = format!(
+        "aevalsrc='if(lt(mod(t+{audio_late}\\,1)\\,0.05)\\,0.8*sin(2*PI*1000*t)\\,0)':s=48000:d={}",
+        4.0 - audio_late
+    );
+    let video = format!(
+        "nullsrc=s=64x64:r=25:d={},geq=lum='16+2*(N+{})':cb=128:cr=128,format=yuv420p",
+        4.0 - video_late,
+        (video_late * 25.0).round()
+    );
+    ff(
+        tools,
+        &[
+            "-itsoffset",
+            &video_late.to_string(),
+            "-f",
+            "lavfi",
+            "-i",
+            &video,
+            "-itsoffset",
+            &audio_late.to_string(),
+            "-f",
+            "lavfi",
+            "-i",
+            &burst,
+            "-map",
+            "0",
+            "-map",
+            "1",
+            "-c:v",
+            "libx264",
+            "-crf",
+            "10",
+            "-g",
+            "25",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "aac",
+            dst.to_str().unwrap(),
+        ],
+    );
+}
+
+/// `ffprobe` numbers, one per line of `entries` for `stream`.
+fn probe_list(tools: &Tools, file: &Path, stream: &str, entries: &str) -> Vec<f64> {
+    let out = Command::new(&tools.ffprobe)
+        .args([
+            "-v",
+            "error",
+            "-select_streams",
+            stream,
+            "-show_entries",
+            entries,
+        ])
+        .args(["-of", "csv=p=0"])
+        .arg(file)
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|l| l.trim().trim_end_matches(',').parse().ok())
+        .collect()
+}
+
+/// Each burst's time against the picture, in the file's own clock (each stream's timestamps,
+/// so a container that starts its streams apart is measured as it plays): `(source second,
+/// ms the burst comes after the frame showing that second)`.
+fn burst_offsets(tools: &Tools, file: &Path) -> Vec<(i64, f64)> {
+    let pts = probe_list(tools, file, "v:0", "frame=pts_time");
+    let numbers = frame_numbers(tools, file);
+    assert_eq!(pts.len(), numbers.len(), "{}", file.display());
+    let start = probe_list(tools, file, "a:0", "stream=start_time")[0];
+    let (rate, lanes) = pcm(tools, file, 0);
+    let x = &lanes[0];
+    let quiet = (rate / 5) as usize;
+    let on: Vec<f64> = (1..x.len())
+        .filter(|&i| {
+            x[i].abs() > 0.3 && x[i.saturating_sub(quiet)..i].iter().all(|v| v.abs() < 0.3)
+        })
+        .map(|i| start + i as f64 / f64::from(rate))
+        .collect();
+    on.iter()
+        .filter_map(|&t| {
+            // The frame on screen at the burst, and the second it shows.
+            let k = pts.iter().rposition(|p| *p <= t + 0.02)?;
+            let second = (numbers[k] as f64 / 25.0).round() as i64;
+            let at = pts[numbers.iter().position(|n| *n == second * 25)?];
+            Some((second, (t - at) * 1000.0))
+        })
+        .collect()
+}
+
+/// Streams that start apart in the source — the sound late, or the picture late — keep their
+/// offset through an edit in every container Save writes: every burst lands on the frame of
+/// its second (the late stream's missing start is silence, or the first picture held).
+#[test]
+fn streams_that_start_apart_stay_in_sync_in_every_container() {
+    let Some(tools) = tools_or_skip() else { return };
+    let tmp = tempfile::tempdir().unwrap();
+    let mut wrong = Vec::new();
+    for ext in ["mp4", "mov", "mkv", "ts"] {
+        for (video_late, audio_late) in [(0.0, 0.48), (0.2, 0.0)] {
+            let name = format!("v{video_late}-a{audio_late}.{ext}");
+            let src = tmp.path().join(&name);
+            offset_fixture(&tools, &src, video_late, audio_late);
+            let probe = ffmpeg::probe(&tools, &src).unwrap();
+            // [2.8, 3.6) then [0, 1.6): the bursts of seconds 3 and 1 (second 0 has no frame
+            // when the picture starts late, no burst when the sound does). The frame slots are
+            // where the window puts them: from the picture's offset within a frame period.
+            let origin = probe.frame_origin();
+            let pieces: Vec<Span> = spans(25.0, &[(70, 90), (0, 40)], true)
+                .into_iter()
+                .map(|s| Span {
+                    start: s.start + origin,
+                    ..s
+                })
+                .collect();
+            let spec = EditSpec {
+                spans: pieces,
+                fps: Some(25.0),
+                stereo: false,
+                crop: None,
+                tracks: probe.tracks.clone(),
+            };
+            let out = render(&tools, &src, &format!("out-{name}"), &spec);
+            let got = burst_offsets(&tools, &out);
+            let seconds: Vec<i64> = got.iter().map(|g| g.0).collect();
+            let want: Vec<i64> = vec![3, 1];
+            let off = got.iter().any(|g| g.1.abs() > 3.0);
+            if seconds != want || off {
+                wrong.push(format!("{name}: {got:?}"));
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "out of sync: {wrong:#?}");
+}
+
+/// A render's ffmpeg dies with sopen: the test runs a render of a stand-in ffmpeg (which
+/// prints progress forever and, as ffmpeg does, survives its progress pipe closing) in a child
+/// process, kills that process with SIGKILL — nothing can be caught — and the stand-in is gone
+/// within a few seconds, not rendering on as an orphan.
+#[test]
+fn a_render_s_ffmpeg_dies_with_its_sopen_even_on_sigkill() {
+    const CHILD: &str = "SOPEN_TEST_ORPHAN_CHILD";
+    if let Ok(dir) = std::env::var(CHILD) {
+        // The child: run the stand-in until killed.
+        let dir = PathBuf::from(dir);
+        let tools = Tools {
+            ffmpeg: dir.join("ffmpeg"),
+            ffprobe: dir.join("ffmpeg"),
+        };
+        let _ = ffmpeg::run_watched(
+            &tools,
+            &["out.mp4".into()],
+            4.0,
+            &mut |_| {},
+            std::time::Duration::from_secs(600),
+        );
+        return;
+    }
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let fake = tmp.path().join("ffmpeg");
+    let pid_file = tmp.path().join("pid");
+    std::fs::write(
+        &fake,
+        format!(
+            "#!/bin/sh\n[ \"$1\" = -version ] && exit 0\ntrap '' PIPE\necho $$ > '{}'\n\
+             i=0; while :; do i=$((i+1)); printf 'out_time_us=%d\\nprogress=continue\\n' $i; \
+             sleep 0.05; done\n",
+            pid_file.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+    crate::testutil::run_fresh(Command::new(&fake).arg("-version"));
+    let test = "cut::edit_tests::a_render_s_ffmpeg_dies_with_its_sopen_even_on_sigkill";
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .args([test, "--exact", "--nocapture", "--test-threads=1"])
+        .env(CHILD, tmp.path())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let waited = std::time::Instant::now();
+    let pid = loop {
+        if let Some(pid) = std::fs::read_to_string(&pid_file)
+            .ok()
+            .and_then(|t| t.trim().parse::<i32>().ok())
+        {
+            break pid;
+        }
+        assert!(
+            waited.elapsed().as_secs() < 30,
+            "the stand-in never started"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    let alive = |pid: i32| unsafe { libc::kill(pid, 0) } == 0;
+    assert!(alive(pid));
+    child.kill().unwrap(); // SIGKILL
+    let _ = child.wait();
+    let killed = std::time::Instant::now();
+    while alive(pid) {
+        if killed.elapsed().as_secs() > 10 {
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+            panic!("the stand-in ffmpeg outlived its sopen");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
 }

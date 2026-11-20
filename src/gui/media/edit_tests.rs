@@ -546,15 +546,20 @@ fn video_edits_preview_at_once_without_running_ffmpeg() {
     let before = fx.spawned();
     let t0 = Instant::now();
     fx.drv.cut(&mut fx.win);
-    let passes = (0..)
-        .find(|_| {
-            let ready = fx.win.frame_ready();
-            if !ready {
-                fx.drv.idle(&mut fx.win, 1);
-            }
-            ready
-        })
-        .unwrap();
+    // A bounded wait: a frame that never comes fails with what the window has.
+    let mut passes = 0;
+    while !fx.win.frame_ready() {
+        assert!(
+            passes < 200,
+            "the frame never came: want {:?}, on screen {:?}, status {:?}",
+            fx.win.want,
+            fx.win.tex_at,
+            fx.win.status.text
+        );
+        fx.drv.idle(&mut fx.win, 1);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        passes += 1;
+    }
     let kept_ms = t0.elapsed().as_secs_f64() * 1000.0;
     assert_eq!(fx.clips(), [(0.0, 1.0), (2.0, 4.0)]);
     assert_eq!(shown(&fx), 50, "the frame now at the playhead");
@@ -588,74 +593,6 @@ fn video_edits_preview_at_once_without_running_ffmpeg() {
         "edit-to-preview: kept frame {passes} pass(es) {kept_ms:.1} ms; decoded frame \
          {decoded_ms:.1} ms"
     );
-}
-
-/// Playing an edited timeline shows its frames in its order, across every boundary, and the
-/// clock is the timeline's; prints how long each decoder waited at each boundary and how late
-/// the frames there were.
-#[test]
-fn playback_follows_the_edit_list_across_boundaries() {
-    let Some(tools) = tools_or_skip() else { return };
-    let tmp = tempfile::tempdir().unwrap();
-    let path = tmp.path().join("count.mp4");
-    counter(&tools, &path);
-    // Timeline: frames [50, 75) then [0, 25) then [75, 100).
-    let pieces = [(50, 75), (0, 25), (75, 100)].map(|(a, b): (i64, i64)| Piece {
-        start: a as f64 / 25.0,
-        len: (b - a) as f64 / 25.0,
-    });
-    let src = Source {
-        input: Input::path(&path),
-        duration: 3.0,
-        video: Some(((64, 64), 25.0)),
-        audio: true,
-        pieces: pieces.to_vec(),
-        stereo: false,
-    };
-    let mut player = Player::start(&tools, &src, 0.0, 0.0, Sink::Null, Arc::new(|| {})).unwrap();
-    let begin = Instant::now();
-    let mut seen: Vec<(f64, i64, f64)> = Vec::new();
-    loop {
-        let p = player.pump(Instant::now());
-        if let Some(f) = p.frame {
-            // Gray: R = (Y - 16) · 255 / 219, Y = 16 + 2N.
-            let n = (f64::from(f.rgba[0]) * 219.0 / 255.0 / 2.0).round() as i64;
-            seen.push((f.pts, n, player.clock(Instant::now()) - f.pts));
-        }
-        if p.ended || begin.elapsed().as_secs() > 15 {
-            break;
-        }
-        std::thread::sleep(p.wake_in.min(std::time::Duration::from_millis(5)));
-    }
-    let numbers: Vec<i64> = seen.iter().map(|s| s.1).collect();
-    let want: Vec<i64> = (50..75).chain(0..25).chain(75..100).collect();
-    // Frames may be dropped when the machine is busy, never shown out of order.
-    let mut pos = 0;
-    for n in &numbers {
-        let at = want[pos..].iter().position(|w| w == n);
-        assert!(at.is_some(), "frame {n} out of order: {numbers:?}");
-        pos += at.unwrap() + 1;
-    }
-    // How many are shown depends on the machine (a busy runner drops frames): the order is
-    // the behaviour; a third of them shown is the house's loose bound.
-    assert!(numbers.len() >= 25, "frames shown: {}", numbers.len());
-    let (video_waits, audio_waits) = player.boundary_waits();
-    let late_at = |k: usize| {
-        seen.iter()
-            .filter(|s| (s.0 - k as f64).abs() < 0.2)
-            .map(|s| s.2)
-            .fold(0f64, f64::max)
-    };
-    eprintln!(
-        "boundary waits: video {:?} audio {:?}; frames dropped {}; latest frame near the \
-         boundaries (1 s, 2 s): {:.1} ms, {:.1} ms",
-        video_waits,
-        audio_waits,
-        player.stats().1,
-        late_at(1) * 1000.0,
-        late_at(2) * 1000.0
-    );
-    assert_eq!(video_waits.len(), 2, "two boundaries");
 }
 
 /// At 30000/1001 fps (a frame time that is no round number), the paused frame at tick `k` and
@@ -807,6 +744,238 @@ fn a_saved_remote_file_plays_from_its_render_until_the_window_goes() {
     );
     assert_eq!(order(&playing), [880, 1320, 1760]);
     assert!(!fx.win.unsaved() && near(fx.win.length(), 3.0));
+    // While it plays, its lock is held: a sweep (another window starting) leaves it.
+    let lock = playing.with_file_name(format!(
+        "{}.lock",
+        playing.file_name().unwrap().to_string_lossy()
+    ));
+    assert!(lock.exists(), "locked while it plays");
+    let cache = fx.tmp.path().join("cache");
+    assert!(crate::cache::sweep_stale_jobs(&cache).is_empty());
+    assert!(playing.exists());
+    assert_eq!(
+        fx.win.file.lock().unwrap().rendered_path(),
+        Some(playing.as_path())
+    );
     drop(fx.win);
     assert!(!playing.exists(), "removed with the window");
+    assert!(!lock.exists(), "and its lock");
+}
+
+/// A save worker that panicked while holding the file (it poisons the lock) does not lock the
+/// file out of the next Save: the window saves again.
+#[test]
+fn a_save_after_a_worker_panicked_still_saves() {
+    let Some(mut fx) = audio(true) else { return };
+    let file = fx.win.file.clone();
+    let _ = std::thread::spawn(move || {
+        let _held = file.lock().unwrap();
+        panic!("a worker panics mid-save (on purpose)");
+    })
+    .join();
+    assert!(fx.win.file.is_poisoned());
+    fx.drag(0.25, 0.5);
+    fx.key(Key::Delete, Modifiers::NONE);
+    fx.key(Key::S, command(false));
+    wait_save(&mut fx);
+    assert!(
+        fx.win.status.text.starts_with("saved "),
+        "{}",
+        fx.win.status.text
+    );
+    assert_eq!(order(&fx.path), [440, 1320, 1760]);
+}
+
+/// A waveform decode that failed is said in the window where the waveform is.
+#[test]
+fn a_failed_waveform_is_said_where_the_waveform_is() {
+    let Some(mut fx) = audio(false) else { return };
+    let failed = wave::Source {
+        bin_secs: 1.0,
+        lanes: Vec::new(),
+        version: 99,
+        complete: false,
+        error: Some("ffmpeg exit status: 1: Invalid data".to_string()),
+    };
+    *fx.win.wave.as_ref().unwrap().lock().unwrap() = Some(failed);
+    fx.drv.idle(&mut fx.win, 2);
+    assert!(fx
+        .drv
+        .find_text("cannot read the waveform: ffmpeg exit status: 1: Invalid data")
+        .is_some());
+    assert!(fx.win.painted, "a finished state for the screenshot hook");
+}
+
+/// The frame a paused playhead shows at the picture's last frame is the last frame (it was the
+/// one before it, cached under the last one's key), and past the picture's end (a longer sound
+/// track) the last frame holds instead of "no frame".
+#[test]
+fn the_last_frame_is_the_last_frame_and_holds_past_the_picture() {
+    let Some(tools) = tools_or_skip() else { return };
+    let gray = |rgba: &[u8]| (f64::from(rgba[0]) * 219.0 / 255.0 / 2.0).round() as i64;
+    for (name, sound) in [("plain.mp4", 4.0), ("longer-sound.mp4", 5.0)] {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join(name);
+        ff(
+            &tools,
+            &[
+                "-f",
+                "lavfi",
+                "-i",
+                "nullsrc=s=64x64:r=25:d=4,geq=lum='16+2*N':cb=128:cr=128,format=yuv420p",
+                "-f",
+                "lavfi",
+                "-i",
+                &format!("sine=frequency=440:duration={sound}"),
+                "-c:v",
+                "libx264",
+                "-crf",
+                "10",
+                "-pix_fmt",
+                "yuv420p",
+                "-c:a",
+                "aac",
+                path.to_str().unwrap(),
+            ],
+        );
+        let mut fx = open_file(tmp, path);
+        for t in [fx.win.length(), 99.0 / 25.0, fx.win.length() - 0.3] {
+            let ctx = fx.drv.ctx.clone();
+            fx.win.seek(&ctx, t);
+            fx.settle();
+            let (_, key) = fx.win.want.unwrap();
+            let shown = fx
+                .win
+                .scrub
+                .as_ref()
+                .unwrap()
+                .cache
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|(k, _)| *k == key)
+                .map(|(_, f)| gray(f));
+            let want = (t * 25.0).round().min(99.0) as i64;
+            assert_eq!(shown, Some(want), "{name} at {t} s (key {key})");
+            assert!(!fx.win.status.error, "{name}: {}", fx.win.status.text);
+        }
+    }
+}
+
+/// A Save whose worker ends without a word (it panicked) is a visible failure: the window is
+/// usable again with its edits, not busy for ever; an Export the same.
+#[test]
+fn a_worker_that_ends_without_a_result_is_a_failure_not_busy_forever() {
+    let Some(mut fx) = audio(true) else { return };
+    fx.drag(0.25, 0.5);
+    fx.key(Key::Delete, Modifiers::NONE);
+    let (tx, rx) = mpsc::channel();
+    fx.win.save = Some(SaveJob {
+        progress: Arc::default(),
+        rx,
+        close_after: false,
+    });
+    drop(tx);
+    fx.drv.idle(&mut fx.win, 2);
+    assert!(fx.win.save.is_none(), "no longer busy");
+    assert_eq!(fx.win.status.text, "save failed");
+    assert!(
+        fx.win.unsaved() && fx.win.editable(),
+        "the edits stay, usable"
+    );
+    assert!(fx
+        .drv
+        .find_text("the save stopped without a result")
+        .is_some());
+    let (tx, rx) = mpsc::channel();
+    fx.win.job = Some(ExportJob {
+        progress: Arc::default(),
+        rx,
+    });
+    drop(tx);
+    fx.drv.idle(&mut fx.win, 2);
+    assert!(fx.win.job.is_none());
+    assert_eq!(fx.win.status.text, "export failed");
+}
+
+/// The bytes of a file opened in place change but its size and modification time do not:
+/// Save compares the content with the bytes as opened (hashed when the window opened) and
+/// refuses before anything is backed up or rendered — it never writes over it.
+#[test]
+fn save_refuses_a_same_size_same_time_change_of_content() {
+    let Some(mut fx) = audio(true) else { return };
+    fx.drag(0.25, 0.5);
+    fx.key(Key::Delete, Modifiers::NONE);
+    // The bytes as opened are hashed on a worker from the window's start: changed after that.
+    fx.drv
+        .until(&mut fx.win, 20, |w| w.file.lock().unwrap().baseline_ready());
+    let meta = std::fs::metadata(&fx.path).unwrap();
+    let mut bytes = std::fs::read(&fx.path).unwrap();
+    let mid = bytes.len() / 2;
+    bytes[mid] ^= 0x55;
+    bytes[mid + 1] ^= 0x55;
+    std::fs::write(&fx.path, &bytes).unwrap();
+    let file = std::fs::File::options().write(true).open(&fx.path).unwrap();
+    file.set_modified(meta.modified().unwrap()).unwrap();
+    drop(file);
+    let now = std::fs::metadata(&fx.path).unwrap();
+    assert_eq!(
+        (now.len(), now.modified().unwrap()),
+        (meta.len(), meta.modified().unwrap())
+    );
+    fx.key(Key::S, command(false));
+    wait_save_only(&mut fx);
+    assert_eq!(fx.win.status.text, "not saved: the file changed");
+    assert_eq!(
+        std::fs::read(&fx.path).unwrap(),
+        bytes,
+        "never written over"
+    );
+    assert_eq!(fx.spawned().render, 0, "nothing rendered");
+    assert!(walk(&fx.tmp.path().join("cache").join(".backup")).is_empty());
+    assert!(fx.win.unsaved());
+}
+
+/// In's and Out's labels never cover each other or leave the timeline, however narrow the
+/// selection and wherever it is: in the middle, at the right end, at the left end — on the
+/// video window's short timeline too.
+#[test]
+fn in_and_out_labels_never_meet() {
+    let Some(mut fx) = video() else { return };
+    let length = fx.win.length();
+    for (a, b) in [
+        (1.5, 1.6),
+        (length - 0.12, length - 0.04),
+        (0.0, 0.08),
+        (2.0, 2.04),
+    ] {
+        fx.win.marks.in_s = Some(a);
+        fx.win.marks.out_s = Some(b);
+        fx.drv.idle(&mut fx.win, 2);
+        let timeline = fx.win.timeline_rect.unwrap();
+        // The labels on the timeline ("In 0:01.50"), not the buttons ("In  I").
+        let find = |prefix: &str| {
+            let all: Vec<Rect> = fx
+                .drv
+                .texts_starting_with(prefix)
+                .into_iter()
+                .filter(|(r, t)| t.contains(':') && timeline.expand(40.0).intersects(*r))
+                .map(|(r, _)| r)
+                .collect();
+            assert_eq!(all.len(), 1, "{prefix}: {all:?}");
+            all[0]
+        };
+        let (i, o) = (find("In "), find("Out "));
+        let overlap = i.intersect(o);
+        assert!(
+            overlap.width() <= 0.0 || overlap.height() <= 0.0,
+            "{a}..{b}: In {i:?} covers Out {o:?}"
+        );
+        for r in [i, o] {
+            assert!(
+                timeline.expand(0.5).contains_rect(r),
+                "{a}..{b}: {r:?} out of {timeline:?}"
+            );
+        }
+    }
 }

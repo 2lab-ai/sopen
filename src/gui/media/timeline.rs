@@ -237,12 +237,21 @@ impl Timeline {
         .then_some(removed)
     }
 
-    /// Puts `piece` at timeline tick `at` (pushing what follows later).
+    /// Whether every clip of `piece` is a range of this source (not empty, inside it).
+    fn fits(&self, piece: &[Clip]) -> bool {
+        !piece.is_empty()
+            && piece
+                .iter()
+                .all(|c| c.start >= 0 && c.end > c.start && c.end <= self.source)
+    }
+
+    /// Puts `piece` at timeline tick `at` (pushing what follows later); refused (false) unless
+    /// every clip of it is a range of this source.
     pub fn insert(&mut self, at: Tick, piece: &[Clip], view: View) -> bool {
-        let piece: Vec<Clip> = piece.iter().copied().filter(|c| c.end > c.start).collect();
-        if piece.is_empty() {
+        if !self.fits(piece) {
             return false;
         }
+        let piece = piece.to_vec();
         let at = at.clamp(0, self.len());
         let mut clips = extract(&self.edit.clips, 0, at);
         clips.extend(piece);
@@ -256,15 +265,16 @@ impl Timeline {
         )
     }
 
-    /// Replaces timeline `[a, b)` with `piece`, as one undo step.
+    /// Replaces timeline `[a, b)` with `piece`, as one undo step; refused (false) unless every
+    /// clip of it is a range of this source.
     pub fn replace(&mut self, a: Tick, b: Tick, piece: &[Clip], view: View) -> bool {
         let Some((a, b)) = self.range(a, b) else {
             return self.insert(a, piece, view);
         };
-        let piece: Vec<Clip> = piece.iter().copied().filter(|c| c.end > c.start).collect();
-        if piece.is_empty() {
+        if !self.fits(piece) {
             return false;
         }
+        let piece = piece.to_vec();
         let mut clips = extract(&self.edit.clips, 0, a);
         clips.extend(piece);
         clips.extend(extract(&self.edit.clips, b, self.len()));

@@ -177,7 +177,8 @@ the sound never drifts from the picture. Save and Export keep the picture and ev
 what they cannot keep (subtitles, data streams, cover art, chapters, alpha, more than 8 bits where
 this ffmpeg's libx264 has no 10-bit) is named in the window before you save or export and again in
 the result line. Closing with unsaved edits asks first. A save or export whose ffmpeg makes no
-progress for two minutes is stopped with an error.
+progress for two minutes is stopped with an error; if sopen itself is killed during one, its ffmpeg
+stops with it and the half-made file is removed the next time a media window or `sopen cut` starts.
 
 ## Binary files
 
