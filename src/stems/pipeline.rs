@@ -99,18 +99,45 @@ pub fn separate_and_publish(
     // explicit `pan`s: ffmpeg's own mono ↔ stereo matrix is not gain-neutral (a 16-bit mono
     // source came back 3 dB down).
     let mono = format.channels == 1;
-    let out_args = |dst: &Path| {
-        let mut args: Vec<OsString> = if mono {
-            vec!["-af".into(), "pan=mono|c0=0.5*c0+0.5*c1".into()]
-        } else {
-            vec!["-ac".into(), "2".into()]
-        };
-        if let Some(r) = format.rate.filter(|r| *r != rate) {
-            args.extend(["-ar".into(), r.to_string().into()]);
+    // Back at the source's own rate, the stems have exactly its sample count: the resampling
+    // there and back can add a sample at the end (192,512 → 192,513; in AAC a whole frame
+    // more), so that count is taken from the source itself — on a decode of its own, while the
+    // first piece is separated — and each stem is padded or cut to it.
+    let resample_to = format.rate.filter(|r| *r != rate);
+    let mut count = match resample_to {
+        Some(_) => Some(SampleCount::start(tools, src)?),
+        None => None,
+    };
+    let out_args = |dst: &Path, frames: Option<u64>| {
+        let mut chain: Vec<String> = Vec::new();
+        if mono {
+            chain.push("pan=mono|c0=0.5*c0+0.5*c1".into());
+        }
+        if let Some(r) = resample_to {
+            chain.push(format!("aresample={r}"));
+        }
+        if let Some(n) = frames {
+            chain.push(format!("apad=whole_len={n}"));
+            chain.push(format!("atrim=end_sample={n}"));
+        }
+        let mut args: Vec<OsString> = Vec::new();
+        if !chain.is_empty() {
+            args.extend(["-af".into(), chain.join(",").into()]);
+        }
+        if !mono {
+            args.extend(["-ac".into(), "2".into()]);
         }
         args.extend(encoder.iter().cloned());
         args.push(dst.as_os_str().to_owned());
         args
+    };
+    // More than two channels: downmixed the way ffmpeg downmixes for integer output, normalised
+    // so nothing goes over full scale (unnormalised, a loud 5.1 file came in at +6.6 dBFS and
+    // its stems clipped).
+    let rematrix: &[&str] = if format.channels > 2 {
+        &["-rematrix_maxval", "1.0"]
+    } else {
+        &[]
     };
     let mut decoder = Ffmpeg::start(
         tools,
@@ -130,6 +157,10 @@ pub fn separate_and_publish(
             },
             "-ac".into(),
             "2".into(),
+        ]
+        .into_iter()
+        .chain(rematrix.iter().map(OsString::from))
+        .chain([
             "-ar".into(),
             rate.to_string().into(),
             "-f".into(),
@@ -137,11 +168,12 @@ pub fn separate_and_publish(
             "-c:a".into(),
             "pcm_f32le".into(),
             "pipe:1".into(),
-        ],
+        ])
+        .collect::<Vec<OsString>>(),
         Pipe::Out,
     )?;
-    let mut voice = Ffmpeg::start(tools, &encoder_input(rate, out_args(&files.0[0])), Pipe::In)?;
-    let mut music = Ffmpeg::start(tools, &encoder_input(rate, out_args(&files.0[1])), Pipe::In)?;
+    // The encoders start with the first piece's output, once the source's count is known.
+    let mut encoders: Option<(Ffmpeg, Ffmpeg)> = None;
 
     let estimate = probe
         .duration
@@ -156,19 +188,31 @@ pub fn separate_and_publish(
         estimate,
         started,
         &mut |v, m| {
+            if encoders.is_none() {
+                let frames = match count.take() {
+                    Some(count) => Some(count.frames()?),
+                    None => None,
+                };
+                let start = |dst: &Path| {
+                    Ffmpeg::start(tools, &encoder_input(rate, out_args(dst, frames)), Pipe::In)
+                };
+                encoders = Some((start(&files.0[0])?, start(&files.0[1])?));
+            }
+            let (voice, music) = encoders.as_mut().expect("started");
             voice.write(v)?;
             music.write(m)
         },
         progress,
     )?;
     decoder.finish("decoding")?;
-    if done == 0 {
+    let Some((mut voice, mut music)) = encoders.take().filter(|_| done > 0) else {
         bail!("{src_name}: ffmpeg decoded no audio");
-    }
+    };
     voice.finish("encoding the voice")?;
     music.finish("encoding the music")?;
 
     before_publish()?;
+    let (voice_name, music_name) = super::free_pair(fs, dir, &voice_name, &music_name)?;
     let voice_published = fs.write_new_sibling(&files.0[0], dir, &voice_name)?;
     let music_published = fs
         .write_new_sibling(&files.0[1], dir, &music_name)
@@ -187,7 +231,7 @@ pub fn separate_and_publish(
 
 /// What the piece loop needs of an engine: one stereo window separated (planar, each stem as
 /// long as the window). [`Engine`] is the real one; the tests have a stand-in.
-trait Separate {
+pub(super) trait Separate {
     fn separate(&mut self, left: &[f32], right: &[f32]) -> Result<Separated>;
 }
 
@@ -198,13 +242,13 @@ impl Separate for Engine {
 }
 
 /// Where the kept part of each window goes: interleaved f32le bytes, voice then music.
-type Sink<'a> = &'a mut dyn FnMut(&[u8], &[u8]) -> Result<()>;
+pub(super) type Sink<'a> = &'a mut dyn FnMut(&[u8], &[u8]) -> Result<()>;
 
 /// The piece loop: reads interleaved stereo f32le frames from `input` only as far as the next
 /// window needs, separates each window ([`Layout::span`]) and hands the kept part of each stem
 /// (interleaved bytes, voice then music) to `out`; reports progress from `estimate` pieces
 /// (exact once the input ends). Returns how many pieces there were.
-fn run_pieces(
+pub(super) fn run_pieces(
     engine: &mut dyn Separate,
     layout: Layout,
     input: impl Read,
@@ -334,6 +378,47 @@ fn audio_format(tools: &Tools, src: &Path) -> Result<AudioFormat> {
         .filter(|r| *r > 0);
     let channels = stream["channels"].as_u64().unwrap_or(2) as u32;
     Ok(AudioFormat { rate, channels })
+}
+
+/// How many samples per channel the source's first audio track decodes to at its own rate: a
+/// decode of its own (to one 8-bit channel, the least to count) whose output is counted.
+struct SampleCount {
+    ffmpeg: Ffmpeg,
+    bytes: JoinHandle<std::io::Result<u64>>,
+}
+
+impl SampleCount {
+    fn start(tools: &Tools, src: &Path) -> Result<Self> {
+        let args: Vec<OsString> = vec![
+            "-i".into(),
+            src.as_os_str().to_owned(),
+            "-map".into(),
+            "0:a:0".into(),
+            "-vn".into(),
+            "-sn".into(),
+            "-dn".into(),
+            "-ac".into(),
+            "1".into(),
+            "-c:a".into(),
+            "pcm_u8".into(),
+            "-f".into(),
+            "u8".into(),
+            "pipe:1".into(),
+        ];
+        let mut ffmpeg = Ffmpeg::start(tools, &args, Pipe::Out)?;
+        let mut out = ffmpeg.child.stdout.take().expect("piped");
+        let bytes = std::thread::spawn(move || std::io::copy(&mut out, &mut std::io::sink()));
+        Ok(Self { ffmpeg, bytes })
+    }
+
+    fn frames(mut self) -> Result<u64> {
+        let counted = self
+            .bytes
+            .join()
+            .map_err(|_| anyhow::anyhow!("the count panicked"))?;
+        self.ffmpeg.finish("counting the source's samples")?;
+        counted.context("counting the source's samples")
+    }
 }
 
 /// The encoder's input: raw stereo f32 at `rate` on stdin, then `out`.
@@ -714,136 +799,6 @@ exit 1",
         frames.fill(&mut buf, 10).unwrap();
         assert!(frames.eof);
         assert_eq!(buf, data);
-    }
-
-    /// A stand-in engine whose voice at each sample is the mean of the window's samples on both
-    /// sides of it (silence past the window's edges) — so it depends on context — and whose
-    /// music is the window minus that. It keeps every window it was given.
-    #[derive(Default)]
-    struct Neighbours {
-        windows: Vec<[Vec<f32>; 2]>,
-    }
-
-    impl Separate for Neighbours {
-        fn separate(&mut self, left: &[f32], right: &[f32]) -> Result<Separated> {
-            let voice = |w: &[f32]| -> Vec<f32> {
-                (0..w.len())
-                    .map(|i| {
-                        let before = if i > 0 { w[i - 1] } else { 0.0 };
-                        let after = w.get(i + 1).copied().unwrap_or(0.0);
-                        0.5 * (before + after)
-                    })
-                    .collect()
-            };
-            let (vl, vr) = (voice(left), voice(right));
-            let music = |w: &[f32], v: &[f32]| -> Vec<f32> {
-                w.iter().zip(v).map(|(a, b)| a - b).collect()
-            };
-            let separated = Separated {
-                music: [music(left, &vl), music(right, &vr)],
-                voice: [vl, vr],
-            };
-            self.windows.push([left.to_vec(), right.to_vec()]);
-            Ok(separated)
-        }
-    }
-
-    /// Reads at most 13 bytes at a time: frames arrive cut anywhere.
-    struct Ragged(std::io::Cursor<Vec<u8>>);
-    impl Read for Ragged {
-        fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
-            let n = out.len().min(13);
-            self.0.read(&mut out[..n])
-        }
-    }
-
-    /// Through the real piece loop with a stand-in that depends on context: every window is the
-    /// file's own frames around its piece (silence only past the file's ends), and every kept
-    /// sample is the stand-in's answer for that very sample with its real neighbours — at the
-    /// joins between pieces too; the last piece is the shorter rest.
-    #[test]
-    fn the_piece_loop_gives_each_window_its_real_context_and_keeps_the_right_samples() {
-        let n = 30usize;
-        let x = |c: usize, t: usize| -> f32 {
-            if c == 0 {
-                (t as f32 * 0.37).sin() + 0.01 * t as f32
-            } else {
-                (t as f32 * 0.91).cos() - 0.02 * t as f32
-            }
-        };
-        let bytes: Vec<u8> = (0..n)
-            .flat_map(|t| [x(0, t), x(1, t)])
-            .flat_map(f32::to_le_bytes)
-            .collect();
-        let layout = Layout {
-            piece: 7,
-            context: 3,
-        };
-        // ffprobe's estimate (5), and one too low (1): the total is never below what is done,
-        // and exact once the input ends (it is read one window ahead, so at piece 4).
-        let mut engine = Neighbours::default();
-        let (mut voice, mut music) = (Vec::new(), Vec::new());
-        for (estimate, want) in [
-            (5, [(0, 5), (1, 5), (2, 5), (3, 5), (4, 5), (5, 5)]),
-            (1, [(0, 1), (1, 1), (2, 2), (3, 3), (4, 5), (5, 5)]),
-        ] {
-            engine = Neighbours::default();
-            voice.clear();
-            music.clear();
-            let mut seen = Vec::new();
-            let done = run_pieces(
-                &mut engine,
-                layout,
-                Ragged(std::io::Cursor::new(bytes.clone())),
-                estimate,
-                Instant::now(),
-                &mut |v, m| {
-                    voice.extend_from_slice(v);
-                    music.extend_from_slice(m);
-                    Ok(())
-                },
-                &mut |p| seen.push((p.done, p.total)),
-            )
-            .unwrap();
-            assert_eq!(done, 5, "7 + 7 + 7 + 7 + 2");
-            assert_eq!(seen, want, "estimate {estimate}");
-        }
-        // The windows: the piece and 3 frames on each side, the file's own where it has them.
-        let at = |c: usize, t: isize| -> f32 {
-            if t < 0 || t >= n as isize {
-                0.0
-            } else {
-                x(c, t as usize)
-            }
-        };
-        assert_eq!(engine.windows.len(), 5);
-        for (k, w) in engine.windows.iter().enumerate() {
-            let start = (k * 7) as isize - 3;
-            let core = if k == 4 { 2 } else { 7 };
-            for (c, channel) in w.iter().enumerate() {
-                let want: Vec<f32> = (0..core as isize + 6).map(|i| at(c, start + i)).collect();
-                assert_eq!(channel, &want, "window {k} channel {c}");
-            }
-        }
-        // The kept samples: each one the stand-in's answer with its real neighbours.
-        let decode = |b: &[u8]| -> Vec<f32> {
-            b.as_chunks::<4>()
-                .0
-                .iter()
-                .map(|q| f32::from_le_bytes(*q))
-                .collect()
-        };
-        let (voice, music) = (decode(&voice), decode(&music));
-        assert_eq!(voice.len(), 2 * n);
-        assert_eq!(music.len(), 2 * n);
-        for t in 0..n as isize {
-            for c in 0..2 {
-                let v = 0.5 * (at(c, t - 1) + at(c, t + 1));
-                let i = 2 * t as usize + c;
-                assert_eq!(voice[i], v, "voice at {t}/{c}");
-                assert_eq!(music[i], at(c, t) - v, "music at {t}/{c}");
-            }
-        }
     }
 
     #[test]

@@ -251,8 +251,20 @@ fn signals_after_reaping(pid: u32) -> Vec<(i32, bool)> {
     })
 }
 
-/// A child that fails before it is ready, waited for: the error comes back, and nothing — not
-/// the wait, not the drop after it — signals its group once it is reaped.
+/// Every group signal this thread sent to `pid`, in order.
+fn signals_to(pid: u32) -> Vec<(i32, bool)> {
+    SIGNALS.with(|s| {
+        s.borrow()
+            .iter()
+            .copied()
+            .filter(|(p, _)| *p == pid as i32)
+            .collect()
+    })
+}
+
+/// A child that fails before it is ready, waited for: the error comes back; its group is
+/// signalled exactly once — when it has exited and is not yet reaped, for whatever it left
+/// behind — and nothing, not the wait, not the drop after it, signals it once it is reaped.
 #[test]
 fn waiting_for_a_failed_child_never_signals_it_after_reaping() {
     let tmp = tempfile::tempdir().unwrap();
@@ -268,6 +280,77 @@ fn waiting_for_a_failed_child_never_signals_it_after_reaping() {
         signals_after_reaping(pid),
         [],
         "a reaped child's group was signalled"
+    );
+    assert_eq!(
+        signals_to(pid),
+        [(pid as i32, false)],
+        "one kill, before reaping"
+    );
+}
+
+/// Dropped while publishing — after the go-ahead, not polled — the handle never cuts the upload
+/// short: it waits for the leader to exit, then kills what the leader left in its group (here a
+/// process holding its output open), then reaps it, all before drop returns. No survivor, no
+/// zombie, the work folder gone, and one kill, before reaping.
+#[test]
+fn dropping_a_publishing_child_waits_for_it_then_kills_its_survivors_and_reaps_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let pid_file = tmp.path().join("descendant.pid");
+    let told = tmp.path().join("told");
+    let program = fake(
+        tmp.path(),
+        &format!(
+            "echo 'stems: ready to publish' >&2
+read go
+touch '{told}'
+sleep 60 &
+echo $! > '{pids}.part' && mv '{pids}.part' '{pids}'
+sleep 1
+echo 'box:/a.voice.mp3'
+echo 'box:/a.music.mp3'",
+            told = told.display(),
+            pids = pid_file.display()
+        ),
+    );
+    let child = spawn(&program, &tmp.path().join("exports"));
+    let pid = child.id();
+    let work = child.work_dir().to_path_buf();
+    until("the go-ahead", || told.exists());
+    let started = Instant::now();
+    drop(child);
+    // The leader was alive when dropped (it sleeps 1 s after the go-ahead): drop waited for it.
+    assert!(
+        started.elapsed() >= Duration::from_millis(500),
+        "{:?}",
+        started.elapsed()
+    );
+    let descendant: i32 = std::fs::read_to_string(&pid_file)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    // No zombie: the leader is not our child any more (reaped), so waitpid has nothing.
+    let mut status = 0;
+    // SAFETY: a plain syscall; WNOHANG never blocks.
+    let r = unsafe { libc::waitpid(pid as i32, &mut status, libc::WNOHANG) };
+    assert_eq!(r, -1, "the leader was left unreaped");
+    assert_eq!(
+        std::io::Error::last_os_error().raw_os_error(),
+        Some(libc::ECHILD)
+    );
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while alive(descendant) {
+        assert!(
+            Instant::now() < deadline,
+            "the descendant survived the drop"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(!work.exists(), "the work folder is left");
+    assert_eq!(
+        signals_to(pid),
+        [(pid as i32, false)],
+        "one kill, before reaping"
     );
 }
 

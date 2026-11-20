@@ -282,6 +282,29 @@ pub struct Published {
     pub notes: Vec<String>,
 }
 
+/// The names the pair is published under: the first `n` (none, then `-1`, `-2`, …) for which
+/// neither `voice` nor `music` with it names anything in `dir` (not even a dangling link), so
+/// the two always carry the same number — never `a.voice-1.wav` with `a.music-3.wav`. Publishing
+/// still never overwrites: a name taken between this look and the publish gets the next free one.
+pub fn free_pair(
+    fs: &mut dyn crate::remote::RemoteFs,
+    dir: &str,
+    voice: &str,
+    music: &str,
+) -> Result<(String, String)> {
+    use crate::remote::{join, suffixed};
+    for n in 0..10_000 {
+        let (v, m) = match n {
+            0 => (voice.to_string(), music.to_string()),
+            n => (suffixed(voice, n), suffixed(music, n)),
+        };
+        if fs.lstat_opt(&join(dir, &v))?.is_none() && fs.lstat_opt(&join(dir, &m))?.is_none() {
+            return Ok((v, m));
+        }
+    }
+    bail!("no free pair of names for {voice} and {music} in {dir}")
+}
+
 /// `<stem>.voice.<ext>`, `<stem>.music.<ext>`.
 pub fn stem_names(src_name: &str, out_ext: &str) -> (String, String) {
     let (stem, _) = crate::cut::stem_ext(src_name);

@@ -78,18 +78,6 @@ thread_local! {
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
-/// SIGKILL to the group `pid` leads. Only ever called while the leader is not reaped (alive or
-/// a zombie), so `pid` is still its own.
-fn signal_group(pid: u32, reaped: bool) {
-    debug_assert!(!reaped, "a reaped child's id may be anyone's");
-    #[cfg(test)]
-    SIGNALS.with(|s| s.borrow_mut().push((pid as i32, reaped)));
-    if let Ok(pid) = i32::try_from(pid) {
-        // SAFETY: a plain syscall on our own child's process group.
-        unsafe { libc::kill(-pid, libc::SIGKILL) };
-    }
-}
-
 /// Whether the child `pid` has exited, without reaping it (`WNOWAIT`: a zombie keeps its id).
 /// `block` waits for it.
 fn has_exited(pid: u32, block: bool) -> std::io::Result<bool> {
@@ -293,13 +281,46 @@ impl StemsChild {
             s.stdin = None;
             // The whole group: the child is its leader (`process_group(0)`), its ffmpeg
             // children are members. Not reaped yet, so the id is still the child's.
-            signal_group(self.child.id(), false);
+            self.signal_group();
         }
         self.reap();
         // Nothing to read: the readers end when the pipes close, on their own.
         self.readers.clear();
         self.result = Some(self.with_leftover(Err(anyhow!("cancelled; nothing was published"))));
         Cancel::Cancelled
+    }
+
+    /// SIGKILL to the process group the child leads — only while the leader is not reaped
+    /// (alive, or a zombie: its id is still its own). Once it is reaped this sends nothing, its
+    /// id may be anyone's by then; the tests' log records the call with the handle's real state.
+    fn signal_group(&self) {
+        let reaped = self.reaped.is_some();
+        #[cfg(test)]
+        SIGNALS.with(|s| s.borrow_mut().push((self.child.id() as i32, reaped)));
+        if reaped {
+            return;
+        }
+        if let Ok(pid) = i32::try_from(self.child.id()) {
+            // SAFETY: a plain syscall on our own, unreaped child's process group.
+            unsafe { libc::kill(-pid, libc::SIGKILL) };
+        }
+    }
+
+    /// The leader's end, without touching its output: once it has exited (seen without reaping
+    /// it — `block` waits for that), what it left running in its group is killed while its id is
+    /// still its own, then it is reaped and the work folder removed. `false` while it runs.
+    fn settle(&mut self, block: bool) -> bool {
+        if self.reaped.is_none() {
+            match has_exited(self.child.id(), block) {
+                Ok(false) => return false,
+                // A descendant holding the output open, say: it goes now.
+                Ok(true) => self.signal_group(),
+                // It cannot be looked at without reaping: reap it, and signal nothing.
+                Err(_) => {}
+            }
+        }
+        self.reap();
+        true
     }
 
     /// Reaps the leader (it has exited, or was just killed) and removes the work folder.
@@ -316,17 +337,8 @@ impl StemsChild {
     /// folder removed), and is its output all read (then: the result). `block` waits for the
     /// exit, never for the output.
     fn step(&mut self, block: bool) {
-        if self.reaped.is_none() {
-            let pid = self.child.id();
-            match has_exited(pid, block) {
-                Ok(false) => return,
-                // Exited, a zombie: whatever it left running in its group (a descendant holding
-                // its output open, say) goes now, while the id is still its own.
-                Ok(true) => signal_group(pid, false),
-                // It cannot be looked at without reaping: reap it, and signal nothing.
-                Err(_) => {}
-            }
-            self.reap();
+        if !self.settle(block) {
+            return;
         }
         if self.readers.iter().any(|r| !r.is_finished()) {
             return;
@@ -412,16 +424,15 @@ impl StemsChild {
 
 impl Drop for StemsChild {
     /// A child nobody waits for is cancelled: no orphan holding gigabytes. One that was already
-    /// reaped (a consumed `wait`, a cancel) is never signalled again; one that is publishing is
-    /// left to finish (an upload is never cut half-way) and reaped.
+    /// reaped (a consumed `wait`, a cancel) is never signalled again. One that is publishing is
+    /// never cut short: drop waits for the leader's exit, then ends it as `poll` would — what it
+    /// left in its group killed, it reaped, the work folder removed — without reading its output
+    /// (the readers end when the pipes close).
     fn drop(&mut self) {
-        if self.reaped.is_some() {
-            self.reap();
-            return;
+        if self.reaped.is_none() && self.cancel() == Cancel::TooLate {
+            self.settle(true);
         }
-        if self.cancel() == Cancel::TooLate {
-            self.reap();
-        }
+        self.reap();
     }
 }
 

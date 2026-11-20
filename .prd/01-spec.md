@@ -647,11 +647,17 @@ into the cache (claimed while it runs), and it always runs on this machine (§4a
   its voice, so voice + music give the source back sample for sample (the test).
 - **Output.** Each stem in the source's audio codec, sample rate and channel count (mono stays
   mono — through the engine as two equal channels, back as their mean, by explicit `pan`s, so
-  the level is kept; more than two channels are separated as stereo and a note says so); a
+  the level is kept; more than two channels are separated as stereo, downmixed normalised as
+  ffmpeg downmixes for integer output (`-rematrix_maxval 1.0`: nothing over full scale), and a
+  note says so). At the source's own rate each stem has exactly the source's sample count: the
+  resampling to the engine's rate and back can add a sample at the end (in AAC a whole frame),
+  so when the rates differ the source's count is taken from a decode of its own, run while the
+  first piece is separated, and each stem is padded or cut to it. A
   video source
   gives AAC in `.m4a`. Only the first audio track is separated (a note names the others). Both
   are published as new siblings the way `sopen cut` publishes (§5: never over anything, `-N`
-  when the name is taken): `<stem>.voice.<ext>`, then `<stem>.music.<ext>`; both paths are
+  when the name is taken — the first number free for both, so the pair always matches):
+  `<stem>.voice.<ext>`, then `<stem>.music.<ext>`; both paths are
   printed on stdout, voice first. A music stem that cannot be published after the voice was is
   an error that names the published voice.
 - **Progress** on stderr, one line per finished piece, parseable:

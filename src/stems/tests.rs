@@ -407,3 +407,169 @@ fn a_file_without_audio_is_refused_before_the_model_loads() {
         "silent.mp4 and work only"
     );
 }
+
+/// The pair carries one number: the first free for both names, whatever is taken (a file, a
+/// folder, a dangling link) under either.
+#[test]
+fn the_pair_gets_the_first_number_free_for_both() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let d = dir.to_str().unwrap();
+    let mut fs = crate::remote::LocalFs::new();
+    let pick =
+        |fs: &mut crate::remote::LocalFs| free_pair(fs, d, "a.voice.wav", "a.music.wav").unwrap();
+    assert_eq!(pick(&mut fs), ("a.voice.wav".into(), "a.music.wav".into()));
+    std::fs::write(dir.join("a.music.wav"), "").unwrap();
+    assert_eq!(
+        pick(&mut fs),
+        ("a.voice-1.wav".into(), "a.music-1.wav".into())
+    );
+    std::fs::write(dir.join("a.voice-1.wav"), "").unwrap();
+    std::fs::create_dir(dir.join("a.music-2.wav")).unwrap();
+    std::os::unix::fs::symlink(dir.join("nowhere"), dir.join("a.voice-3.wav")).unwrap();
+    assert_eq!(
+        pick(&mut fs),
+        ("a.voice-4.wav".into(), "a.music-4.wav".into())
+    );
+}
+
+/// The piece loop (spec §7a) with a deterministic stand-in for the engine — no model needed.
+#[cfg(feature = "stems")]
+mod piece_loop {
+    use super::super::engine::Separated;
+    use super::super::pipeline::{run_pieces, Separate};
+    use super::*;
+    use anyhow::Result;
+    use std::io::Read;
+    use std::time::Instant;
+
+    /// A stand-in engine whose voice at each sample is the mean of the window's samples on both
+    /// sides of it (silence past the window's edges) — so it depends on context — and whose
+    /// music is the window minus that. It keeps every window it was given.
+    #[derive(Default)]
+    struct Neighbours {
+        windows: Vec<[Vec<f32>; 2]>,
+    }
+
+    impl Separate for Neighbours {
+        fn separate(&mut self, left: &[f32], right: &[f32]) -> Result<Separated> {
+            let voice = |w: &[f32]| -> Vec<f32> {
+                (0..w.len())
+                    .map(|i| {
+                        let before = if i > 0 { w[i - 1] } else { 0.0 };
+                        let after = w.get(i + 1).copied().unwrap_or(0.0);
+                        0.5 * (before + after)
+                    })
+                    .collect()
+            };
+            let (vl, vr) = (voice(left), voice(right));
+            let music = |w: &[f32], v: &[f32]| -> Vec<f32> {
+                w.iter().zip(v).map(|(a, b)| a - b).collect()
+            };
+            let separated = Separated {
+                music: [music(left, &vl), music(right, &vr)],
+                voice: [vl, vr],
+            };
+            self.windows.push([left.to_vec(), right.to_vec()]);
+            Ok(separated)
+        }
+    }
+
+    /// Reads at most 13 bytes at a time: frames arrive cut anywhere.
+    struct Ragged(std::io::Cursor<Vec<u8>>);
+    impl Read for Ragged {
+        fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+            let n = out.len().min(13);
+            self.0.read(&mut out[..n])
+        }
+    }
+
+    /// Through the real piece loop with a stand-in that depends on context: every window is the
+    /// file's own frames around its piece (silence only past the file's ends), and every kept
+    /// sample is the stand-in's answer for that very sample with its real neighbours — at the
+    /// joins between pieces too; the last piece is the shorter rest.
+    #[test]
+    fn the_piece_loop_gives_each_window_its_real_context_and_keeps_the_right_samples() {
+        let n = 30usize;
+        let x = |c: usize, t: usize| -> f32 {
+            if c == 0 {
+                (t as f32 * 0.37).sin() + 0.01 * t as f32
+            } else {
+                (t as f32 * 0.91).cos() - 0.02 * t as f32
+            }
+        };
+        let bytes: Vec<u8> = (0..n)
+            .flat_map(|t| [x(0, t), x(1, t)])
+            .flat_map(f32::to_le_bytes)
+            .collect();
+        let layout = Layout {
+            piece: 7,
+            context: 3,
+        };
+        // ffprobe's estimate (5), and one too low (1): the total is never below what is done,
+        // and exact once the input ends (it is read one window ahead, so at piece 4).
+        let mut engine = Neighbours::default();
+        let (mut voice, mut music) = (Vec::new(), Vec::new());
+        for (estimate, want) in [
+            (5, [(0, 5), (1, 5), (2, 5), (3, 5), (4, 5), (5, 5)]),
+            (1, [(0, 1), (1, 1), (2, 2), (3, 3), (4, 5), (5, 5)]),
+        ] {
+            engine = Neighbours::default();
+            voice.clear();
+            music.clear();
+            let mut seen = Vec::new();
+            let done = run_pieces(
+                &mut engine,
+                layout,
+                Ragged(std::io::Cursor::new(bytes.clone())),
+                estimate,
+                Instant::now(),
+                &mut |v, m| {
+                    voice.extend_from_slice(v);
+                    music.extend_from_slice(m);
+                    Ok(())
+                },
+                &mut |p| seen.push((p.done, p.total)),
+            )
+            .unwrap();
+            assert_eq!(done, 5, "7 + 7 + 7 + 7 + 2");
+            assert_eq!(seen, want, "estimate {estimate}");
+        }
+        // The windows: the piece and 3 frames on each side, the file's own where it has them.
+        let at = |c: usize, t: isize| -> f32 {
+            if t < 0 || t >= n as isize {
+                0.0
+            } else {
+                x(c, t as usize)
+            }
+        };
+        assert_eq!(engine.windows.len(), 5);
+        for (k, w) in engine.windows.iter().enumerate() {
+            let start = (k * 7) as isize - 3;
+            let core = if k == 4 { 2 } else { 7 };
+            for (c, channel) in w.iter().enumerate() {
+                let want: Vec<f32> = (0..core as isize + 6).map(|i| at(c, start + i)).collect();
+                assert_eq!(channel, &want, "window {k} channel {c}");
+            }
+        }
+        // The kept samples: each one the stand-in's answer with its real neighbours.
+        let decode = |b: &[u8]| -> Vec<f32> {
+            b.as_chunks::<4>()
+                .0
+                .iter()
+                .map(|q| f32::from_le_bytes(*q))
+                .collect()
+        };
+        let (voice, music) = (decode(&voice), decode(&music));
+        assert_eq!(voice.len(), 2 * n);
+        assert_eq!(music.len(), 2 * n);
+        for t in 0..n as isize {
+            for c in 0..2 {
+                let v = 0.5 * (at(c, t - 1) + at(c, t + 1));
+                let i = 2 * t as usize + c;
+                assert_eq!(voice[i], v, "voice at {t}/{c}");
+                assert_eq!(music[i], at(c, t) - v, "music at {t}/{c}");
+            }
+        }
+    }
+}

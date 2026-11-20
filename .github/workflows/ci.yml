@@ -51,6 +51,13 @@ jobs:
           HOMEBREW_NO_INSTALL_CLEANUP: "1"
         run: brew install ffmpeg fish
 
+      # Which ffmpeg the tests ran against (Ubuntu's and Homebrew's differ, and the stems' exact
+      # length once depended on it).
+      - name: ffmpeg version
+        run: |
+          ffmpeg -hide_banner -version | head -n 3
+          ffprobe -hide_banner -version | head -n 1
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
