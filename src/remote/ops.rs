@@ -89,6 +89,54 @@ pub fn is_no_rename(e: &anyhow::Error) -> bool {
     e.chain().any(|c| c.is::<NoRename>())
 }
 
+/// A test seam set on this thread (a fault or a race at an exact step inside a backend), cleared
+/// when this guard drops — even when the test fails.
+#[cfg(test)]
+pub(crate) struct SeamGuard(Option<Box<dyn FnOnce()>>);
+
+#[cfg(test)]
+impl SeamGuard {
+    pub(crate) fn new(clear: impl FnOnce() + 'static) -> Self {
+        Self(Some(Box::new(clear)))
+    }
+}
+
+#[cfg(test)]
+impl Drop for SeamGuard {
+    fn drop(&mut self) {
+        if let Some(clear) = self.0.take() {
+            clear();
+        }
+    }
+}
+
+/// A seam's hook: gets the path at that step.
+#[cfg(test)]
+pub(crate) type SeamHook = Box<dyn FnMut(&str)>;
+
+/// Runs the hook in `slot` with `path`, taken out while it runs (so it may use the file layer).
+#[cfg(test)]
+pub(crate) fn fire_seam(
+    slot: &'static std::thread::LocalKey<std::cell::RefCell<Option<SeamHook>>>,
+    path: &str,
+) {
+    let hook = slot.with(|s| s.borrow_mut().take());
+    if let Some(mut hook) = hook {
+        hook(path);
+        slot.with(|s| *s.borrow_mut() = Some(hook));
+    }
+}
+
+/// Sets `slot` to `hook` until the returned guard drops.
+#[cfg(test)]
+pub(crate) fn set_seam(
+    slot: &'static std::thread::LocalKey<std::cell::RefCell<Option<SeamHook>>>,
+    hook: impl FnMut(&str) + 'static,
+) -> SeamGuard {
+    slot.with(|s| *s.borrow_mut() = Some(Box::new(hook)));
+    SeamGuard::new(move || slot.with(|s| *s.borrow_mut() = None))
+}
+
 /// Why a remote folder is not renamed before slice S6 (04 §5.3, §5.6).
 pub const REMOTE_FOLDER_RENAME: &str = "renaming a folder on a remote needs SFTP's plain \
     rename, which sopen cannot send yet (it comes with slice S6); nothing was changed";

@@ -8,7 +8,7 @@
 //! removes a source only after its whole item is copied and checked, re-checking each file right
 //! before its removal.
 
-use super::{Answer, Clash, Control, End, Hosts, Item, ItemOutcome, Job, Op, Progress, Report};
+use super::{Answer, Clash, Control, Hosts, Item, ItemOutcome, Job, Op, Progress, Report, STOPPED};
 use crate::remote::ops::{is_no_rename, is_taken, FileOps, Staged, REMOTE_FOLDER_RENAME};
 use crate::remote::{
     describe_change, is_cancelled, join, random_hex, suffixed, Created, EntryKind, Stat,
@@ -30,20 +30,24 @@ const NO_LINK: &str = "this server does not offer hardlink@openssh.com, which so
     a copy under its name without the risk of replacing anything there; copy and move to it come \
     with slice S6";
 
-/// A report for a job refused before anything happened.
-pub(super) fn refused(job: &Job, reason: String) -> Report {
+/// A report for a job refused before anything happened: every item not reached, the reason
+/// its first note.
+pub(super) fn refused(names: &[String], reason: String) -> Report {
     Report {
-        items: job
-            .names
+        items: names
             .iter()
             .map(|n| Item {
                 name: n.clone(),
                 outcome: ItemOutcome::NotReached,
             })
             .collect(),
-        notes: Vec::new(),
-        end: End::Refused(reason),
+        notes: vec![reason],
     }
+}
+
+/// The outcome of the item Esc stopped inside: what is left of it.
+fn stopped(what: &str) -> ItemOutcome {
+    ItemOutcome::Failed(format!("{STOPPED}: {what}"))
 }
 
 /// Whether `name` can be a name in a folder (04 §5.1 "Names"): not empty, not `.` or `..`, no
@@ -103,12 +107,11 @@ pub fn run(job: &Job, hosts: Hosts<'_>, ctl: &mut dyn Control) -> Report {
         item: 0,
     };
     if let Err(why) = engine.check() {
-        return refused(job, why);
+        return refused(&job.names, why);
     }
     for (i, name) in job.names.iter().enumerate() {
         engine.item = i + 1;
         if engine.stopped() {
-            engine.report.end = End::Stopped;
             engine.not_reached(i);
             break;
         }
@@ -119,12 +122,9 @@ pub fn run(job: &Job, hosts: Hosts<'_>, ctl: &mut dyn Control) -> Report {
         });
         let lines = std::mem::take(&mut engine.lines);
         engine.report.items.extend(lines);
-        let end = match flow {
-            Flow::Go => continue,
-            Flow::Stop => End::Stopped,
-            Flow::Cancel => End::Cancelled,
-        };
-        engine.report.end = end;
+        if let Flow::Go = flow {
+            continue;
+        }
         engine.not_reached(i + 1);
         break;
     }
@@ -184,7 +184,8 @@ enum Placed {
     At(Copied),
     Skipped,
     Cancelled,
-    Stopped,
+    /// Esc: what is left.
+    Stopped(String),
     Failed(String),
 }
 
@@ -194,6 +195,8 @@ struct Copied {
     name: String,
     before: Stat,
     id: Option<(u64, u64)>,
+    /// A link's target text, as copied.
+    target: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -469,9 +472,10 @@ impl Engine<'_, '_, '_> {
         }
     }
 
-    /// Is the "exists" of `to` the source itself? Locally the same device and inode prove it;
-    /// remotely attributes prove nothing, so only a fresh listing holding the source's spelling
-    /// and none spelled like `to` does.
+    /// Is the "exists" of `to` the source itself? Only when the two names differ by case or
+    /// Unicode form alone, locally the two stat to one device and inode, and a fresh listing
+    /// holds the source's spelling and none spelled like `to` (remotely attributes prove nothing,
+    /// so the listing alone).
     fn is_itself(
         &mut self,
         dir: &str,
@@ -480,11 +484,19 @@ impl Engine<'_, '_, '_> {
         from: &str,
         target: &str,
     ) -> Result<bool, String> {
+        // Only a change of case or of Unicode form can be the source itself; any other name
+        // that "exists" is another entry (a second hard link of the same file is one too).
+        if name_key(name) != name_key(to) {
+            return Ok(false);
+        }
         let fs = self.ends.src();
         let err = |e: anyhow::Error| format!("{e:#}");
         if let Some(id) = fs.identity(from, false).map_err(err)? {
-            return Ok(fs.identity(target, false).map_err(err)? == Some(id));
+            if fs.identity(target, false).map_err(err)? != Some(id) {
+                return Ok(false);
+            }
         }
+        // And the folder holds one entry for both spellings, not two.
         let names = fs.list_dir(dir).map_err(err)?;
         Ok(names.iter().any(|n| n == name) && !names.iter().any(|n| n == to))
     }
@@ -565,9 +577,18 @@ impl Engine<'_, '_, '_> {
             Ok(Resolved::Cancel) => return (ItemOutcome::Skipped, Flow::Cancel),
             Err(e) => return (ItemOutcome::Failed(e), Flow::Go),
         };
+        let nothing = if mv {
+            "nothing of it was moved"
+        } else {
+            "nothing of it was copied"
+        };
         // A move on one host is a rename where one is possible (04 §5.2).
         if mv && self.ends.same() && (kind != Kind::Dir || self.ends.src().can_rename_dir()) {
             loop {
+                // A question may have been open meanwhile: Esc then renames nothing.
+                if self.stopped() {
+                    return (stopped(nothing), Flow::Stop);
+                }
                 match self.ends.src().rename_new(&from, &join(&dst_dir, &want)) {
                     Ok(notes) => {
                         self.report.notes.extend(notes);
@@ -584,11 +605,14 @@ impl Engine<'_, '_, '_> {
                 }
             }
         }
+        if self.stopped() {
+            return (stopped(nothing), Flow::Stop);
+        }
         if kind == Kind::Dir {
             return self.folder(name, &from, &dst_dir, want, mv);
         }
         let placed = if kind == Kind::Link {
-            self.copy_link(&from, &dst_dir, want, true)
+            self.copy_link(&from, &dst_dir, want, name, true)
         } else {
             self.copy_file(&from, &dst_dir, want, name, true)
         };
@@ -597,7 +621,7 @@ impl Engine<'_, '_, '_> {
             Placed::At(copied) => (named(name, &copied.name), Flow::Go),
             Placed::Skipped => (ItemOutcome::Skipped, Flow::Go),
             Placed::Cancelled => (ItemOutcome::Skipped, Flow::Cancel),
-            Placed::Stopped => (ItemOutcome::Stopped, Flow::Stop),
+            Placed::Stopped(what) => (stopped(&what), Flow::Stop),
             Placed::Failed(why) => (ItemOutcome::Failed(why), Flow::Go),
         }
     }
@@ -668,7 +692,10 @@ impl Engine<'_, '_, '_> {
 
     /// Copies the regular file `from` into a temp in `dir`, checks it, and publishes it as
     /// `want` without replacing. `top`: the item itself — a name taken at the publish asks the
-    /// dialog; inside a folder the copy made, it fails the item.
+    /// dialog; inside a folder the copy made, it fails the item. A move's copy that the host made
+    /// itself (sopen never saw its bytes) is then read back in full against its source (04
+    /// §5.2), whatever its size: a copy that differs goes again and the source stays; Esc while
+    /// checking stops with both copies there.
     fn copy_file(
         &mut self,
         from: &str,
@@ -688,37 +715,37 @@ impl Engine<'_, '_, '_> {
             Ok(None) => return Placed::Failed(format!("{shown} is gone")),
             Err(e) => return Placed::Failed(format!("{e:#}")),
         };
-        let id = self.ends.src().identity(from, false).ok().flatten();
+        // Locally the inode the removal of a moved source checks again; a source whose identity
+        // cannot be read is not copied (fail closed). Over SFTP there is none (`None`).
+        let id = match self.ends.src().identity(from, false) {
+            Ok(id) => id,
+            Err(e) => return Placed::Failed(format!("{e:#}")),
+        };
         let temp = join(dir, &temp_name(&want));
+        let nothing = || "nothing of it was copied (its temp was removed)".to_string();
         let (staged, read) = match self.stage(from, &temp, before.size, shown) {
             Ok(got) => got,
-            Err(StageErr::Stopped) => return Placed::Stopped,
+            Err(StageErr::Stopped) => return Placed::Stopped(nothing()),
             Err(StageErr::Failed(why)) => return Placed::Failed(why),
         };
-        // A move destroys its source: a copy the host made itself (sopen never saw its bytes)
-        // is read back and compared with the source first.
-        if self.job.op == Op::Move && staged.sha256.is_none() {
-            match self.compare_bytes(from, &temp, shown, before.size) {
-                Ok(()) => {}
-                Err(StageErr::Stopped) => {
-                    self.drop_temp(&temp);
-                    return Placed::Stopped;
-                }
-                Err(StageErr::Failed(why)) => {
-                    self.drop_temp(&temp);
-                    return Placed::Failed(why);
-                }
-            }
-        }
         if let Err(why) = self.check_copy(from, shown, &before, &staged, read) {
             self.drop_temp(&temp);
             return Placed::Failed(why);
         }
         if self.stopped() {
             self.drop_temp(&temp);
-            return Placed::Stopped;
+            return Placed::Stopped(nothing());
         }
-        loop {
+        let verify = self.job.op == Op::Move && staged.sha256.is_none();
+        // What is about to get the final name, to know it again if it must go.
+        let published = if verify {
+            let dst = self.ends.dst();
+            let id = dst.identity(&temp, false).ok().flatten();
+            (id, dst.lstat_opt(&temp).ok().flatten())
+        } else {
+            (None, None)
+        };
+        let target = loop {
             let target = join(dir, &want);
             match self.ends.dst().rename_new(&temp, &target) {
                 Ok(notes) => {
@@ -727,13 +754,13 @@ impl Engine<'_, '_, '_> {
                     let kept = staged.notes.iter().map(|n| n.replace(&temp, &target));
                     self.report.notes.extend(kept);
                     self.report.notes.extend(notes);
-                    return Placed::At(Copied {
-                        name: want,
-                        before,
-                        id,
-                    });
+                    break target;
                 }
                 Err(e) if is_taken(&e) && top => match self.resolve(dir, &want, false) {
+                    Ok(Resolved::Name(_)) if self.stopped() => {
+                        self.drop_temp(&temp);
+                        return Placed::Stopped(nothing());
+                    }
                     Ok(Resolved::Name(n)) => want = n,
                     other => {
                         self.drop_temp(&temp);
@@ -749,6 +776,56 @@ impl Engine<'_, '_, '_> {
                     return Placed::Failed(format!("{e:#}"));
                 }
             }
+        };
+        let copied = Copied {
+            name: want,
+            before,
+            id,
+            target: None,
+        };
+        if verify {
+            match self.verify(from, &target, shown, before.size) {
+                Ok(()) => {}
+                Err(StageErr::Stopped) => {
+                    return Placed::Stopped(format!(
+                        "while checking its copy {target}: {shown} was not removed, so both \
+                         copies exist"
+                    ))
+                }
+                // A source that changed or went since it was read is not its copy's fault: the
+                // removal's own check keeps it (both copies listed), or finds nothing to remove.
+                Err(StageErr::Failed(_)) if !matches!(self.still(from, &copied), Still::Same) => {}
+                Err(StageErr::Failed(why)) => {
+                    let gone = self.unpublish(&target, published);
+                    return Placed::Failed(format!("{why}; {gone}"));
+                }
+            }
+        }
+        Placed::At(copied)
+    }
+
+    /// Removes a copy just published that proved wrong — only while it is still the file that
+    /// got the name (locally its inode; over SFTP its type, size and mtime). What it says.
+    fn unpublish(&mut self, target: &str, published: (Option<(u64, u64)>, Option<Stat>)) -> String {
+        let dst = self.ends.dst();
+        let still = match published {
+            (Some(id), _) => dst.identity(target, false).ok().flatten() == Some(id),
+            (None, Some(was)) => match dst.lstat_opt(target) {
+                Ok(Some(now)) => {
+                    Kind::of(&now) == Kind::of(&was)
+                        && now.size == was.size
+                        && now.mtime == was.mtime
+                }
+                _ => false,
+            },
+            (None, None) => false,
+        };
+        if !still {
+            return format!("{target} is left as it is (it may not be the copy any more)");
+        }
+        match dst.remove(target) {
+            Ok(()) => "its copy was removed".to_string(),
+            Err(e) => format!("its copy {target} could not be removed: {e:#}"),
         }
     }
 
@@ -825,55 +902,46 @@ impl Engine<'_, '_, '_> {
         })
     }
 
-    /// A move's check of a copy the host made (`copy-data`, `clonefile`, `copy_file_range`): the
-    /// SHA-256 of the source and of the temp, each read through, compared — up to the target's
-    /// [`hash_check_limit`](crate::remote::RemoteFs::hash_check_limit) (above it the size alone,
-    /// and a note says so, as 01 §5's writes do). Esc stops it.
-    fn compare_bytes(
-        &mut self,
-        from: &str,
-        temp: &str,
-        shown: &str,
-        size: u64,
-    ) -> Result<(), StageErr> {
-        let limit = self.ends.dst().hash_check_limit();
-        if size > limit {
-            self.report.notes.push(format!(
-                "{shown} is over {} MiB: its copy was checked by its size, not by its bytes",
-                limit >> 20
-            ));
-            return Ok(());
-        }
+    /// A move's check of a copy the host made (`copy-data`, `clonefile`, `copy_file_range`),
+    /// whatever its size: the SHA-256 of the source and of the copy, each read through in full,
+    /// compared. Shown as `checking`, both reads one bar; Esc stops it.
+    fn verify(&mut self, from: &str, copy: &str, shown: &str, size: u64) -> Result<(), StageErr> {
         let (item, items) = (self.item, self.job.names.len());
         let Self {
             ends, ctl, cancel, ..
         } = self;
-        let mut hash = |fs: &mut dyn FileOps, path: &str| -> Result<[u8; 32], StageErr> {
-            let mut sink = Checked {
-                hasher: Sha256::new(),
-                stop: cancel,
+        let total = size.saturating_mul(2);
+        let mut hash =
+            |fs: &mut dyn FileOps, path: &str, base: u64| -> Result<[u8; 32], StageErr> {
+                if cancel.load(Ordering::Relaxed) {
+                    return Err(StageErr::Stopped);
+                }
+                let mut sink = Checked {
+                    hasher: Sha256::new(),
+                    stop: cancel,
+                };
+                let mut progress = |done: u64| {
+                    ctl.progress(&Progress {
+                        verb: "checking",
+                        item,
+                        items,
+                        name: shown.to_string(),
+                        done: base + done,
+                        total,
+                    })
+                };
+                match fs.read_to(path, &mut sink, &mut progress) {
+                    Ok(_) if cancel.load(Ordering::Relaxed) => Err(StageErr::Stopped),
+                    Ok(_) => Ok(sink.hasher.finalize().into()),
+                    Err(_) if cancel.load(Ordering::Relaxed) => Err(StageErr::Stopped),
+                    Err(e) => Err(StageErr::Failed(format!("{e:#}"))),
+                }
             };
-            let mut progress = |done: u64| {
-                ctl.progress(&Progress {
-                    verb: "checking",
-                    item,
-                    items,
-                    name: shown.to_string(),
-                    done,
-                    total: size,
-                })
-            };
-            match fs.read_to(path, &mut sink, &mut progress) {
-                Ok(_) => Ok(sink.hasher.finalize().into()),
-                Err(_) if cancel.load(Ordering::Relaxed) => Err(StageErr::Stopped),
-                Err(e) => Err(StageErr::Failed(format!("{e:#}"))),
-            }
-        };
-        let read = hash(ends.src(), from)?;
-        let written = hash(ends.dst(), temp)?;
+        let read = hash(ends.src(), from, 0)?;
+        let written = hash(ends.dst(), copy, size)?;
         if read != written {
             return Err(StageErr::Failed(format!(
-                "the copy of {shown} does not hold the same bytes as {shown}; its copy was removed"
+                "the copy of {shown} does not hold the same bytes as {shown}"
             )));
         }
         Ok(())
@@ -922,27 +990,39 @@ impl Engine<'_, '_, '_> {
         }
     }
 
-    /// A link made again at the target with the same target text (04 §5.1 "Links").
-    fn copy_link(&mut self, from: &str, dir: &str, mut want: String, top: bool) -> Placed {
+    /// A link made again at the target with the same target text (04 §5.1 "Links"); then the
+    /// source is checked again — a link changed while it was copied fails the item and its copy
+    /// goes.
+    fn copy_link(
+        &mut self,
+        from: &str,
+        dir: &str,
+        mut want: String,
+        shown: &str,
+        top: bool,
+    ) -> Placed {
         let before = match self.ends.src().lstat_opt(from) {
             Ok(Some(s)) if s.is_symlink => s,
-            Ok(_) => return Placed::Failed(format!("{from} is no longer a link")),
+            Ok(_) => return Placed::Failed(format!("{shown} is no longer a link")),
+            Err(e) => return Placed::Failed(format!("{e:#}")),
+        };
+        // The link's own inode, never followed; fail closed where it cannot be read.
+        let id = match self.ends.src().identity(from, false) {
+            Ok(id) => id,
             Err(e) => return Placed::Failed(format!("{e:#}")),
         };
         let target = match self.ends.src().read_link(from) {
             Ok(t) => t,
             Err(e) => return Placed::Failed(format!("{e:#}")),
         };
-        loop {
-            match self.ends.dst().make_symlink(&target, &join(dir, &want)) {
-                Ok(()) => {
-                    return Placed::At(Copied {
-                        name: want,
-                        before,
-                        id: None,
-                    })
-                }
+        let made = loop {
+            let made = join(dir, &want);
+            match self.ends.dst().make_symlink(&target, &made) {
+                Ok(()) => break made,
                 Err(e) if is_taken(&e) && top => match self.resolve(dir, &want, false) {
+                    Ok(Resolved::Name(_)) if self.stopped() => {
+                        return Placed::Stopped("nothing of it was copied".into())
+                    }
                     Ok(Resolved::Name(n)) => want = n,
                     Ok(Resolved::Skip) => return Placed::Skipped,
                     Ok(_) => return Placed::Cancelled,
@@ -950,7 +1030,31 @@ impl Engine<'_, '_, '_> {
                 },
                 Err(e) => return Placed::Failed(format!("{e:#}")),
             }
-        }
+        };
+        let copied = Copied {
+            name: want,
+            before,
+            id,
+            target: Some(target.clone()),
+        };
+        let how = match self.still(from, &copied) {
+            Still::Same => return Placed::At(copied),
+            Still::Gone => "it was removed".to_string(),
+            Still::Changed(how) => how,
+        };
+        // The copy made here goes — only while it is still that link.
+        let ours = matches!(self.ends.dst().read_link(&made), Ok(t) if t == target);
+        let gone = if !ours {
+            format!("{made} is left as it is")
+        } else {
+            match self.ends.dst().remove(&made) {
+                Ok(()) => "its copy was removed".to_string(),
+                Err(e) => format!("its copy {made} could not be removed: {e:#}"),
+            }
+        };
+        Placed::Failed(format!(
+            "{shown} changed while it was copied ({how}); {gone}"
+        ))
     }
 
     /// Is a moved source still the entry that was copied (04 §5.1 "Before removing a source")?
@@ -972,6 +1076,13 @@ impl Engine<'_, '_, '_> {
         {
             return Still::Changed("another file has its name now".into());
         }
+        if let Some(target) = &copied.target {
+            match self.ends.src().read_link(path) {
+                Ok(now) if &now == target => {}
+                Ok(now) => return Still::Changed(format!("it now points at {now}, not {target}")),
+                Err(e) => return Still::Changed(format!("{e:#}")),
+            }
+        }
         Still::Same
     }
 
@@ -987,7 +1098,7 @@ impl Engine<'_, '_, '_> {
             // Nothing to remove: the move is done.
             Still::Gone => return named(name, &copied.name),
             Still::Changed(how) => {
-                return ItemOutcome::Kept(format!(
+                return ItemOutcome::Failed(format!(
                     "{name} changed after it was copied ({how}); it was kept, so both copies \
                      exist{to}"
                 ))
@@ -995,7 +1106,7 @@ impl Engine<'_, '_, '_> {
         }
         match self.ends.src().remove(from) {
             Ok(()) => named(name, &copied.name),
-            Err(e) => ItemOutcome::Kept(format!(
+            Err(e) => ItemOutcome::Failed(format!(
                 "{name} could not be removed ({e:#}); both copies exist{to}"
             )),
         }
@@ -1017,6 +1128,9 @@ impl Engine<'_, '_, '_> {
             match self.ends.dst().make_dir(&join(dst_dir, &want)) {
                 Ok(()) => break,
                 Err(e) if is_taken(&e) => match self.resolve(dst_dir, &want, false) {
+                    Ok(Resolved::Name(_)) if self.stopped() => {
+                        return (stopped("nothing of it was copied"), Flow::Stop)
+                    }
                     Ok(Resolved::Name(n)) => want = n,
                     Ok(Resolved::Skip) => return (ItemOutcome::Skipped, Flow::Go),
                     Ok(Resolved::Cancel) => return (ItemOutcome::Skipped, Flow::Cancel),
@@ -1029,17 +1143,25 @@ impl Engine<'_, '_, '_> {
         let partial = |root: &str| {
             format!("the copy {root} is partial: it holds only what was copied before the end")
         };
+        let left = |root: &str| {
+            let source = if mv { "; no source was removed" } else { "" };
+            format!("the copy {root} is partial{source}")
+        };
         let mut nodes = Vec::new();
         if let Err(why) = self.walk(from, "", &mut nodes) {
-            // Nothing is in the new folder yet: it goes again.
-            let _ = self.ends.dst().remove_dir(&root);
+            // Nothing is in the new folder yet: it goes again, or the report names it.
+            if let Err(e) = self.ends.dst().remove_dir(&root) {
+                self.report.notes.push(format!(
+                    "the new folder {root} is left (empty): it could not be removed: {e:#}"
+                ));
+            }
             return (ItemOutcome::Failed(why), Flow::Go);
         }
         let mut copied: Vec<Option<Copied>> = Vec::with_capacity(nodes.len());
         for node in &mut nodes {
             if self.stopped() {
                 self.report.notes.push(partial(&root));
-                return (ItemOutcome::Stopped, Flow::Stop);
+                return (stopped(&left(&root)), Flow::Stop);
             }
             let source = join(from, &node.rel);
             let shown = format!("{name}/{}", node.rel);
@@ -1062,7 +1184,7 @@ impl Engine<'_, '_, '_> {
                     Err(e) => Some(Placed::Failed(format!("{e:#}"))),
                 },
                 Kind::File => Some(self.copy_file(&source, &dir, base.to_string(), &shown, false)),
-                Kind::Link => Some(self.copy_link(&source, &dir, base.to_string(), false)),
+                Kind::Link => Some(self.copy_link(&source, &dir, base.to_string(), &shown, false)),
                 Kind::Special | Kind::NotUtf8 | Kind::Unknown => {
                     let why = match node.kind {
                         Kind::NotUtf8 => "its name is not UTF-8",
@@ -1079,9 +1201,9 @@ impl Engine<'_, '_, '_> {
             match placed {
                 None => copied.push(None),
                 Some(Placed::At(c)) => copied.push(Some(c)),
-                Some(Placed::Stopped) => {
+                Some(Placed::Stopped(_)) => {
                     self.report.notes.push(partial(&root));
-                    return (ItemOutcome::Stopped, Flow::Stop);
+                    return (stopped(&left(&root)), Flow::Stop);
                 }
                 Some(Placed::Failed(why)) => {
                     self.report.notes.push(partial(&root));
@@ -1178,7 +1300,12 @@ impl Engine<'_, '_, '_> {
                     "stopped while removing the source of {name}: what was not removed yet \
                      exists in both places"
                 ));
-                return (ItemOutcome::Stopped, Flow::Stop);
+                return (
+                    stopped(
+                        "while removing its source: what was not removed yet exists in both places",
+                    ),
+                    Flow::Stop,
+                );
             }
             let path = join(from, &node.rel);
             let stays = match (node.kind, copied) {
@@ -1206,14 +1333,14 @@ impl Engine<'_, '_, '_> {
                 blocked.insert(up.to_string());
             }
             if let Some(why) = why {
-                let line = ItemOutcome::Kept(format!("{why}; both copies exist"));
+                let line = ItemOutcome::Failed(format!("{why}; both copies exist"));
                 self.line(format!("{name}/{}", node.rel), line);
             }
         }
         if !blocked.contains("") {
             if let Err(e) = self.ends.src().remove_dir(from) {
                 return (
-                    ItemOutcome::Kept(format!(
+                    ItemOutcome::Failed(format!(
                         "{name} was copied, but its folder could not be removed ({e:#}); both \
                          copies exist"
                     )),
@@ -1230,13 +1357,20 @@ impl Engine<'_, '_, '_> {
             format!(" as {want}")
         };
         (
-            ItemOutcome::Kept(format!(
+            ItemOutcome::Failed(format!(
                 "{name} was copied{to}, but {kept} of its entries stay where they were (listed \
                  below): what was copied of them exists in both places"
             )),
             Flow::Go,
         )
     }
+}
+
+/// A name up to case and Unicode form: NFC of the lower case of the NFC form.
+fn name_key(name: &str) -> String {
+    let nfc = icu_normalizer::ComposingNormalizerBorrowed::new_nfc();
+    nfc.normalize(&nfc.normalize(name).to_lowercase())
+        .into_owned()
 }
 
 fn describe_kind(s: &Stat) -> String {

@@ -76,19 +76,18 @@ pub enum ItemOutcome {
     Skipped,
     /// Done under this other name (Rename at a [`Clash`]).
     Renamed(String),
-    /// Failed, with the reason.
+    /// Failed, with the reason. Also the item Esc stopped inside (the reason starts with
+    /// [`STOPPED`] and says what is left: nothing of an unfinished file is under its target name;
+    /// a folder keeps the files already published; a move removed no source, or both copies of
+    /// what was not removed yet exist), and a move whose source was kept (the reason says both
+    /// copies exist).
     Failed(String),
     /// The operation stopped, was cancelled or failed before it reached this item.
     NotReached,
-    /// Esc stopped the operation inside this item: nothing of an unfinished file is under its
-    /// target name and its temp is gone; a folder keeps the files already published (the report
-    /// notes it as partial); a move removed no source of it, or (stopped while removing) both
-    /// copies of what was not removed yet exist.
-    Stopped,
-    /// Moved by copying, but the source (or part of it) was kept, for this reason: both copies
-    /// exist.
-    Kept(String),
 }
+
+/// How the reason of an item Esc stopped inside begins (`stopped: …`).
+pub const STOPPED: &str = "stopped";
 
 /// One line of the report: an item, by its name, and how it ended. Inside a folder, a file that
 /// was skipped or failed gets a line of its own, named by its path below the operation's folder
@@ -99,42 +98,24 @@ pub struct Item {
     pub outcome: ItemOutcome,
 }
 
-/// How an operation as a whole ended.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub enum End {
-    /// Every item was tried.
-    #[default]
-    Finished,
-    /// Esc stopped it.
-    Stopped,
-    /// Cancel at a [`Clash`].
-    Cancelled,
-    /// Refused before anything happened (a folder into itself, an invalid name, a target that
-    /// is not a folder, a server that cannot publish without replacing, no connection): the
-    /// reason.
-    Refused(String),
-    /// The worker ended by a fault of sopen's own (a panic), the reason: what it did before
-    /// stays, but no item can be said done — the report has no items; the panels' re-read shows
-    /// what is there.
-    Broken(String),
-}
-
 /// What an operation did, listed in a dialog when it ends — done, stopped or failed (04 §5.1);
-/// a fully successful operation on one item is said on the status row instead.
+/// a fully successful operation on one item is said on the status row instead. An operation
+/// refused before anything happened (a folder into itself, an invalid name, a target that is not
+/// a folder, a server that cannot publish without replacing, no connection) has every item
+/// [`ItemOutcome::NotReached`] and the reason as its first note; one whose worker died (a panic)
+/// the same, with that said.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Report {
     pub items: Vec<Item>,
     /// What is to be heard besides the items: a time or a mode that could not be set, a folder
     /// left partial, a source kept so both copies exist.
     pub notes: Vec<String>,
-    pub end: End,
 }
 
 impl Report {
     /// Every item done (under its name or another) and nothing to note: the status row's case.
     pub fn all_done(&self) -> bool {
-        self.end == End::Finished
-            && self.notes.is_empty()
+        self.notes.is_empty()
             && self
                 .items
                 .iter()
@@ -313,7 +294,7 @@ impl Control for Worker {
 }
 
 /// Runs `job` on a worker thread: `connect` opens the operation's own connections there (a
-/// failure ends it [`End::Refused`] with the reason), and `wake` is called after every event (the
+/// failure refuses it, the reason its note), and `wake` is called after every event (the
 /// browser's `request_repaint`).
 pub fn spawn(
     job: Job,
@@ -330,6 +311,7 @@ pub fn spawn(
         wake,
         last: None,
     };
+    let names = job.names.clone();
     let handle = std::thread::spawn(move || {
         // A panic still ends with a report, so the dialog never waits for one that cannot come.
         let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match connect() {
@@ -343,7 +325,7 @@ pub fn spawn(
                 };
                 run(&job, hosts, &mut worker)
             }
-            Err(e) => engine::refused(&job, format!("cannot connect: {e:#}")),
+            Err(e) => engine::refused(&job.names, format!("cannot connect: {e:#}")),
         }));
         let report = ran.unwrap_or_else(|panic| {
             let what = panic
@@ -351,10 +333,12 @@ pub fn spawn(
                 .map(|s| s.to_string())
                 .or_else(|| panic.downcast_ref::<String>().cloned())
                 .unwrap_or_else(|| "a panic".to_string());
-            Report {
-                end: End::Broken(format!("the operation ended by an internal error: {what}")),
-                ..Report::default()
-            }
+            let mut report = engine::refused(&names, String::new());
+            report.notes = vec![format!(
+                "the operation ended by an internal error ({what}): what it did is not known — \
+                 the panels show what is there"
+            )];
+            report
         });
         worker.send(Event::Done(report));
     });

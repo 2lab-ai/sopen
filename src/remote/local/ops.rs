@@ -5,11 +5,12 @@
 
 use super::LocalFs;
 use crate::remote::ops::{taken, FileMeta, FileOps, NoRename, Opened, Staged};
-use crate::remote::{Cancelled, CreateError, Created, Hashing};
+use crate::remote::{split_parent, Cancelled, CreateError, Created, Hashing};
 use anyhow::{anyhow, Context, Result};
-use std::ffi::CString;
+use std::ffi::{CStr, CString};
 use std::fs;
 use std::io::{ErrorKind, Read, Write};
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -18,6 +19,83 @@ const BUF: usize = 1024 * 1024;
 
 fn c_path(path: &str) -> Result<CString> {
     CString::new(path).map_err(|_| anyhow!("{path}: a path with a NUL byte"))
+}
+
+/// An entry as `fstatat(…, AT_SYMLINK_NOFOLLOW)` sees it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct At {
+    dev: u64,
+    ino: u64,
+    dir: bool,
+    link: bool,
+    file: bool,
+}
+
+/// `name` in the open folder `dir`, not following a link.
+#[allow(clippy::unnecessary_cast)] // the field types differ between macOS and Linux
+fn stat_at(dir: &fs::File, name: &CStr) -> std::io::Result<At> {
+    // SAFETY: an all-zero stat is a valid value to be overwritten.
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: an open descriptor, a NUL-terminated name and a valid place for the result.
+    let r = unsafe {
+        libc::fstatat(
+            dir.as_raw_fd(),
+            name.as_ptr(),
+            &mut st,
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if r != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let kind = st.st_mode & libc::S_IFMT;
+    Ok(At {
+        dev: st.st_dev as u64,
+        ino: st.st_ino as u64,
+        dir: kind == libc::S_IFDIR,
+        link: kind == libc::S_IFLNK,
+        file: kind == libc::S_IFREG,
+    })
+}
+
+/// The folder holding `path`, opened once: what is done to its entry goes through this
+/// descriptor, so a folder swapped in above it meanwhile is never followed.
+fn open_folder(path: &str) -> Result<(fs::File, CString)> {
+    let (dir, base) = split_parent(path);
+    let folder = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY)
+        .open(dir)
+        .with_context(|| format!("cannot open the folder {dir}"))?;
+    Ok((folder, c_path(base)?))
+}
+
+/// The target of the link `name` in the open folder `dir`.
+fn read_link_at(dir: &fs::File, name: &CStr) -> std::io::Result<CString> {
+    let mut buf = vec![0u8; libc::PATH_MAX as usize + 1];
+    // SAFETY: an open descriptor, a NUL-terminated name and a buffer of the length given.
+    let n = unsafe {
+        libc::readlinkat(
+            dir.as_raw_fd(),
+            name.as_ptr(),
+            buf.as_mut_ptr().cast(),
+            buf.len(),
+        )
+    };
+    if n < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    buf.truncate(n as usize);
+    CString::new(buf).map_err(|_| std::io::Error::other("a link target with a NUL byte"))
+}
+
+/// The result of a libc call that returns 0 on success.
+fn zero_ok(r: libc::c_int) -> std::io::Result<()> {
+    if r == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
 }
 
 fn meta_of(m: &fs::Metadata) -> FileMeta {
@@ -155,38 +233,83 @@ fn pump(
     Ok(out.finish().sha256)
 }
 
-/// macOS: the filesystem's own copy (`fclonefileat`, APFS), which creates `temp` itself and
-/// fails if it exists. `None`: not here (another volume, another filesystem) — copy the bytes.
+/// macOS: the filesystem's own copy (`fclonefileat`, APFS), made in the temp's folder opened
+/// once, which creates `temp` itself and fails if it exists; then the clone is opened through
+/// that folder — never following a link, never waiting on a fifo — and must be the regular file
+/// of the inode recorded right after the clone, owned by this account. Anything else there fails
+/// the copy and is left as it is (named, not removed: it is not sopen's). `None`: no clone here
+/// (another volume, another filesystem) — copy the bytes.
 #[cfg(target_os = "macos")]
-fn clone_into(src: &fs::File, temp: &str) -> Option<std::result::Result<(), CreateError>> {
-    use std::os::fd::AsRawFd;
-    let to = match c_path(temp) {
-        Ok(to) => to,
-        Err(e) => return Some(Err(CreateError::new(Created::No, e))),
+fn clone_into(src: &fs::File, temp: &str) -> Option<std::result::Result<fs::File, CreateError>> {
+    use std::os::fd::FromRawFd;
+    /// The clone is this account's, as any file it creates (root's too, not the source's owner).
+    const CLONE_NOOWNERCOPY: u32 = 0x0002;
+    let refuse = |e: anyhow::Error| Some(Err(CreateError::new(Created::No, e)));
+    let (folder, name) = match open_folder(temp) {
+        Ok(got) => got,
+        Err(e) => return refuse(e),
     };
-    // SAFETY: an open descriptor and a NUL-terminated path.
-    let r = unsafe { libc::fclonefileat(src.as_raw_fd(), libc::AT_FDCWD, to.as_ptr(), 0) };
-    if r == 0 {
-        return Some(Ok(()));
+    // SAFETY: two open descriptors and a NUL-terminated name.
+    let r = unsafe {
+        libc::fclonefileat(
+            src.as_raw_fd(),
+            folder.as_raw_fd(),
+            name.as_ptr(),
+            CLONE_NOOWNERCOPY,
+        )
+    };
+    if r != 0 {
+        let e = std::io::Error::last_os_error();
+        if e.raw_os_error() == Some(libc::EEXIST) {
+            return refuse(taken(temp));
+        }
+        let elsewhere = [
+            libc::EXDEV,
+            libc::ENOTSUP,
+            libc::EOPNOTSUPP,
+            libc::EINVAL,
+            libc::ENOSYS,
+        ];
+        if is_errno(&e, &elsewhere) {
+            return None;
+        }
+        return refuse(anyhow!(e).context(format!("cannot create {temp}")));
     }
-    let e = std::io::Error::last_os_error();
-    if e.raw_os_error() == Some(libc::EEXIST) {
-        return Some(Err(CreateError::new(Created::No, taken(temp))));
+    let not_ours = |what: String| {
+        refuse(anyhow!(
+            "{temp} is not the clone sopen made ({what}); it is left as it is"
+        ))
+    };
+    // The clone's own inode, recorded at once: what is opened next must be it.
+    let made = match stat_at(&folder, &name) {
+        Ok(made) if made.file => made,
+        Ok(_) => return not_ours("not a regular file".into()),
+        Err(e) => return not_ours(format!("it cannot be read: {e}")),
+    };
+    #[cfg(test)]
+    crate::remote::ops::fire_seam(&AFTER_CLONE, temp);
+    let flags = libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC;
+    // SAFETY: an open descriptor and a NUL-terminated name.
+    let fd = unsafe { libc::openat(folder.as_raw_fd(), name.as_ptr(), flags) };
+    if fd < 0 {
+        let e = std::io::Error::last_os_error();
+        return not_ours(format!("it cannot be opened: {e}"));
     }
-    let elsewhere = [
-        libc::EXDEV,
-        libc::ENOTSUP,
-        libc::EOPNOTSUPP,
-        libc::EINVAL,
-        libc::ENOSYS,
-    ];
-    if is_errno(&e, &elsewhere) {
-        return None;
+    // SAFETY: a descriptor just opened, owned by nothing else.
+    let file = unsafe { fs::File::from_raw_fd(fd) };
+    let meta = match file.metadata() {
+        Ok(meta) => meta,
+        Err(e) => return not_ours(format!("it cannot be read: {e}")),
+    };
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    let me = unsafe { libc::geteuid() };
+    if !meta.is_file() {
+        return not_ours("not a regular file".into());
     }
-    Some(Err(CreateError::new(
-        Created::No,
-        anyhow!(e).context(format!("cannot create {temp}")),
-    )))
+    if (meta.dev(), meta.ino()) != (made.dev, made.ino) || meta.uid() != me {
+        return not_ours("another file has its name".into());
+    }
+    Some(Ok(file))
 }
 
 /// Linux: `copy_file_range` in [`COPY_STEP`]s (the kernel copies, reflinks where it can).
@@ -260,7 +383,15 @@ impl FileOps for LocalFs {
 
     fn rename_new(&mut self, from: &str, to: &str) -> Result<Vec<String>> {
         let (f, t) = (c_path(from)?, c_path(to)?);
-        let e = match rename_excl(&f, &t) {
+        #[cfg(test)]
+        let tried = if NO_EXCLUSIVE_RENAME.with(|s| s.get()) {
+            Err(std::io::Error::from_raw_os_error(libc::ENOTSUP))
+        } else {
+            rename_excl(&f, &t)
+        };
+        #[cfg(not(test))]
+        let tried = rename_excl(&f, &t);
+        let e = match tried {
             Ok(()) => return Ok(Vec::new()),
             Err(e) => e,
         };
@@ -274,19 +405,35 @@ impl FileOps for LocalFs {
             _ if no_exclusive_rename(&e) => {}
             _ => return Err(e).with_context(|| format!("cannot rename {from} to {to}")),
         }
-        // No exclusive rename here: a second name, then the old one removed.
-        let own = fs::symlink_metadata(from).with_context(|| format!("cannot stat {from}"))?;
-        if own.is_dir() {
-            return Err(anyhow!(
+        // No exclusive rename here: a second name, then the old one removed — both through the
+        // old name's folder, opened once.
+        let (folder, name) = open_folder(from)?;
+        let own = stat_at(&folder, &name).with_context(|| format!("cannot stat {from}"))?;
+        if own.dir {
+            // A plain rename would replace an empty folder at `to`: a move copies it instead.
+            return Err(anyhow!(NoRename(format!(
                 "this filesystem cannot rename the folder {from} without the risk of replacing \
                  {to}; nothing was changed"
-            ));
+            ))));
         }
-        let made = if own.file_type().is_symlink() {
-            let target = fs::read_link(from).with_context(|| format!("cannot read {from}"))?;
-            std::os::unix::fs::symlink(target, to)
+        let made = if own.link {
+            read_link_at(&folder, &name).and_then(|target| {
+                // SAFETY: two NUL-terminated paths; the new link's is relative to the working
+                // directory, as `to` is given.
+                zero_ok(unsafe { libc::symlinkat(target.as_ptr(), libc::AT_FDCWD, t.as_ptr()) })
+            })
         } else {
-            fs::hard_link(from, to)
+            // SAFETY: an open descriptor and two NUL-terminated paths; flags 0 never follows a
+            // link at the old name.
+            zero_ok(unsafe {
+                libc::linkat(
+                    folder.as_raw_fd(),
+                    name.as_ptr(),
+                    libc::AT_FDCWD,
+                    t.as_ptr(),
+                    0,
+                )
+            })
         };
         match made {
             Ok(()) => {}
@@ -298,12 +445,33 @@ impl FileOps for LocalFs {
             }
             Err(e) => return Err(e).with_context(|| format!("cannot rename {from} to {to}")),
         }
-        Ok(match fs::remove_file(from) {
-            Ok(()) => Vec::new(),
-            Err(e) => vec![format!(
-                "{to} is in place, but {from} could not be removed ({e}): both names exist"
-            )],
-        })
+        #[cfg(test)]
+        crate::remote::ops::fire_seam(&BEFORE_UNLINK, from);
+        // Right before the unlink: is the old name still the entry that was linked (its device
+        // and inode)? Another writer may have put something else there; that is never removed.
+        // Best effort: between this check and the unlink the name can still be swapped — the
+        // two steps are not one atomic rename.
+        let both = |why: String| {
+            vec![format!(
+                "{to} is in place, but {from} was not removed ({why}): both names exist — {from} \
+                 and {to}"
+            )]
+        };
+        match stat_at(&folder, &name) {
+            Err(e) if e.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Ok(both(format!("it could not be checked again: {e}"))),
+            Ok(now) if (now.dev, now.ino) != (own.dev, own.ino) => {
+                return Ok(both("another entry has its name now".into()))
+            }
+            Ok(_) => {}
+        }
+        // SAFETY: an open descriptor and a NUL-terminated name; flags 0 removes a non-folder.
+        Ok(
+            match zero_ok(unsafe { libc::unlinkat(folder.as_raw_fd(), name.as_ptr(), 0) }) {
+                Ok(()) => Vec::new(),
+                Err(e) => both(format!("removing it failed: {e}")),
+            },
+        )
     }
 
     fn make_dir(&mut self, path: &str) -> Result<()> {
@@ -374,13 +542,7 @@ impl FileOps for LocalFs {
         let ours = |e: anyhow::Error| CreateError::new(Created::Yes, e);
         #[cfg(target_os = "macos")]
         if let Some(cloned) = clone_into(&src, temp) {
-            cloned?;
-            let file = fs::OpenOptions::new()
-                .read(true)
-                .custom_flags(libc::O_NOFOLLOW)
-                .open(temp)
-                .with_context(|| format!("cannot open {temp}"))
-                .map_err(ours)?;
+            let file = cloned?;
             progress(source.size);
             if cancel.load(Ordering::Relaxed) {
                 return Err(ours(anyhow!(Cancelled)));
@@ -450,5 +612,46 @@ impl FileOps for LocalFs {
             })
         };
         fill().map_err(|e| CreateError::new(Created::Yes, e))
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static NO_EXCLUSIVE_RENAME: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static BEFORE_UNLINK: std::cell::RefCell<Option<crate::remote::ops::SeamHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(all(test, target_os = "macos"))]
+thread_local! {
+    static AFTER_CLONE: std::cell::RefCell<Option<crate::remote::ops::SeamHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Test seams on this thread (04 §8's faults at the exact step), each until its guard drops.
+#[cfg(test)]
+impl LocalFs {
+    /// The exclusive rename fails as on a filesystem without it (`ENOTSUP`): the link + unlink
+    /// fallback runs.
+    pub(crate) fn seam_no_exclusive_rename() -> crate::remote::ops::SeamGuard {
+        NO_EXCLUSIVE_RENAME.with(|s| s.set(true));
+        crate::remote::ops::SeamGuard::new(|| NO_EXCLUSIVE_RENAME.with(|s| s.set(false)))
+    }
+
+    /// In that fallback: after the new name is made, before the old one is checked and
+    /// unlinked; the hook gets the old name.
+    pub(crate) fn seam_before_unlink(
+        hook: impl FnMut(&str) + 'static,
+    ) -> crate::remote::ops::SeamGuard {
+        crate::remote::ops::set_seam(&BEFORE_UNLINK, hook)
+    }
+
+    /// macOS: right after `fclonefileat` made the clone, before it is opened; the hook gets its
+    /// path.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn seam_after_clone(
+        hook: impl FnMut(&str) + 'static,
+    ) -> crate::remote::ops::SeamGuard {
+        crate::remote::ops::set_seam(&AFTER_CLONE, hook)
     }
 }

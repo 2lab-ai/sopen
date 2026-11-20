@@ -264,6 +264,17 @@ impl Drop for Reader<'_> {
 }
 
 impl SftpRemote {
+    /// A hard link refused for permission: nothing was moved, and the likely cause besides the
+    /// folders' permissions (on Linux, `fs.protected_hardlinks=1` refuses a link to a file this
+    /// account does not own, 04 §5.6).
+    pub(crate) fn link_refused(from: &str, to: &str, why: &dyn std::fmt::Display) -> anyhow::Error {
+        anyhow!(
+            "cannot link {from} to {to}: {why}; nothing was moved (besides the folders' \
+             permissions: on Linux, fs.protected_hardlinks refuses a link to a file this account \
+             does not own)"
+        )
+    }
+
     /// A failed request that makes `path`: [`taken`] when the name exists now, else the server's
     /// reason (or outcome unknown).
     fn made_or_taken(&mut self, what: &str, path: &str, e: SftpErr) -> anyhow::Error {
@@ -310,11 +321,7 @@ impl SftpRemote {
             return Err(taken(to));
         }
         if matches!(e, SftpErr::SftpError(SftpErrorKind::PermDenied, _)) {
-            return Err(anyhow!(
-                "cannot link {from} to {to}: {e}; nothing was moved (besides the folders' \
-                 permissions: on Linux, fs.protected_hardlinks refuses a link to a file this \
-                 account does not own)"
-            ));
+            return Err(Self::link_refused(from, to, &e));
         }
         if self.same_filesystem(from, to) == Some(true) {
             return Err(anyhow!(
@@ -348,20 +355,59 @@ impl FileOps for SftpRemote {
         if own.is_dir {
             return Err(anyhow!(NoRename(REMOTE_FOLDER_RENAME.to_string())));
         }
-        if own.is_symlink {
+        let target = if own.is_symlink {
             // A link is made again at the new name (never a hard link to a link, whose meaning
             // differs between systems), then the old one removed.
             let target = self.read_link(from)?;
             self.make_symlink(&target, to)?;
+            Some(target)
         } else {
             self.hard_link_new(from, to)?;
+            None
+        };
+        #[cfg(test)]
+        crate::remote::ops::fire_seam(&BEFORE_REMOVE, from);
+        // Right before REMOVE: is the old name still the entry that was linked? Another writer
+        // may have put something else there meanwhile; that is never removed. SFTP carries no
+        // inode and whole-second times, so a file rewritten to the same size within the same
+        // second cannot be told apart — the same best-effort limit as 01 §5's writes.
+        let both = |why: String| {
+            vec![format!(
+                "{to} is in place, but {from} was not removed ({why}): both names exist — {from} \
+                 and {to}"
+            )]
+        };
+        let now = match self.lstat_opt(from) {
+            Ok(Some(now)) => now,
+            Ok(None) => return Ok(Vec::new()),
+            Err(e) => return Ok(both(format!("it could not be checked again: {e:#}"))),
+        };
+        let kind = |s: &crate::remote::Stat| (s.is_dir, s.is_file, s.is_symlink);
+        if kind(&now) != kind(&own) || now.size != own.size || now.mtime != own.mtime {
+            let how = crate::remote::describe_change(&own.fingerprint(), &now);
+            return Ok(both(format!("another entry has its name now: {how}")));
         }
-        Ok(match self.remove(from) {
-            Ok(()) => Vec::new(),
-            Err(e) => vec![format!(
-                "{to} is in place, but {from} could not be removed ({e:#}): both names exist"
-            )],
-        })
+        if let Some(target) = &target {
+            match self.read_link(from) {
+                Ok(t) if &t == target => {}
+                Ok(t) => {
+                    let how = format!("it is now a link to {t}, not {target}");
+                    return Ok(both(format!("another entry has its name now: {how}")));
+                }
+                Err(e) => return Ok(both(format!("it could not be checked again: {e:#}"))),
+            }
+        }
+        match self.remove(from) {
+            Ok(()) => Ok(Vec::new()),
+            // Did the removal happen (a reply lost) or not? The name says.
+            Err(e) => Ok(match self.lstat_opt(from) {
+                Ok(None) => Vec::new(),
+                Ok(Some(_)) => both(format!("removing it failed: {e:#}")),
+                Err(_) => vec![format!(
+                    "{to} is in place; the removal of {from} could not be confirmed ({e:#})"
+                )],
+            }),
+        }
     }
 
     fn can_rename_dir(&self) -> bool {
@@ -538,7 +584,22 @@ impl FileOps for SftpRemote {
 }
 
 #[cfg(test)]
+thread_local! {
+    static BEFORE_REMOVE: std::cell::RefCell<Option<crate::remote::ops::SeamHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
 impl SftpRemote {
+    /// Test seam on this thread: in a rename, after the new name is made (the hard link, or the
+    /// link made again) and before the old one is checked and removed; the hook gets the old
+    /// name.
+    pub(crate) fn seam_before_remove(
+        hook: impl FnMut(&str) + 'static,
+    ) -> crate::remote::ops::SeamGuard {
+        crate::remote::ops::set_seam(&BEFORE_REMOVE, hook)
+    }
+
     /// Whether the server advertises `copy-data` (OpenSSH 9.0 and later, unless refused by `-P`).
     pub(crate) fn offers_copy_data(&self) -> bool {
         self.sftp.as_ref().is_some_and(|s| s.support_copy())
