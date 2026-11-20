@@ -190,13 +190,16 @@ too, where F3 closes it as ⌘W does.
   Invalid UTF-8 shows as U+FFFD (each maximal bad sequence one, as Rust's lossy decoding has it);
   a control character as its code page 437 glyph.
   - **Wrapped** (the default, msg 13): every line is shown whole, in rows as wide as the window,
-    its number on its first row. A row ends where the next glyph would not fit, measured by the
-    font's glyph widths as egui lays the row out (Hangul, CJK and emoji are wider than a cell) —
-    at a glyph boundary (a combining mark or the rest of a cluster stays with its glyph), after
-    the last space when the word that follows fits on the next row, else where the row is full; a
+    its number on its first row. A row ends where the next grapheme cluster (a letter and its
+    marks, an Indic syllable, an emoji sequence: never split) would not fit, measured by laying
+    the row out as egui paints it (Hangul, CJK and emoji are wider than a cell; Arabic and Hebrew
+    are shaped right to left), in a few layouts per row — after the last space when the word that
+    follows fits on the next row, else where the row is full; a
     space the row is full at is not carried to the next row. A tab goes to the next stop of four
-    cells counted from its row's start. A line is wrapped afresh from the first character start at
-    or after every 16 KiB of it, so a row's end depends only on where the row starts: the rows are
+    cells counted from its row's start. A line is wrapped afresh at every 16 KiB of it — at the
+    first word start (after a space) within 128 bytes, else the first grapheme cluster start, else
+    (a cluster longer than that) the first character start — so a row's end depends only on where
+    the row starts: the rows are
     the same reached going down or back up. The place on screen is a line and the byte of it the
     top row starts at. ↑/↓ move a row, PgUp/PgDn a page of rows (one row of context), the wheel
     by rows; going back up reads at most 16 KiB of a line before the row (never a long line

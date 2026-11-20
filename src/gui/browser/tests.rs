@@ -1395,3 +1395,30 @@ fn only_a_local_text_file_is_followed() {
         assert_eq!(asked, followed, "{label:?}");
     }
 }
+
+/// `at=OFFSET` without `open=`: the first text file opened by hand takes it; the next one opens
+/// at its top.
+#[test]
+fn the_at_state_goes_to_the_first_text_file_opened_by_hand_only() {
+    let mut fx = fixture();
+    let body: String = (0..1000).map(|i| format!("row {i:04}\n")).collect();
+    std::fs::write(format!("{}/rows.txt", fx.root), &body).unwrap();
+    std::fs::write(format!("{}/again.txt", fx.root), &body).unwrap();
+    fx.b.open_at = Some(600 * 9 + 5);
+    // Listed again so the new files are there.
+    fx.key(Key::Backspace);
+    fx.settle();
+    fx.key(Key::Enter);
+    fx.settle();
+    let top = |fx: &Fx| {
+        let rows = fx.drv.texts_starting_with("row ");
+        rows.iter()
+            .min_by(|a, b| a.0.top().total_cmp(&b.0.top()))
+            .map(|(_, t)| t.clone())
+    };
+    fx.open("rows.txt");
+    assert_eq!(top(&fx).as_deref(), Some("row 0600"));
+    fx.key(Key::Escape);
+    fx.open("again.txt");
+    assert_eq!(top(&fx).as_deref(), Some("row 0000"), "taken by the first");
+}

@@ -1852,9 +1852,17 @@ fn hangul_and_emoji_wrap_inside_the_window_with_system_fonts() {
             .then(|| fonts.glyph_width(&f, '한'))
     });
     let Some(han) = han else {
-        eprintln!("skipping: no installed font with Hangul");
+        eprintln!(
+            "SKIPPED: no Hangul font (hangul_and_emoji_wrap_inside_the_window_with_system_fonts)"
+        );
         return;
     };
+    if !drv.ctx.fonts_mut(|fonts| fonts.has_glyph(&f, '😀')) {
+        eprintln!(
+            "SKIPPED: no emoji font (hangul_and_emoji_wrap_inside_the_window_with_system_fonts)"
+        );
+        return;
+    }
     assert!(
         han > chrome::CELL.x,
         "the case: 한 ({han}) wider than a cell"
@@ -2346,4 +2354,287 @@ fn several_tabs_on_a_row_each_go_to_their_stop() {
         .collect();
     assert_eq!(rows, want);
     assert_eq!(rows[0], "        foo bar");
+}
+
+// ---------------------------------------------------------------------------------------------
+// Shaped scripts (review round 2): Arabic and Hebrew come out of egui in visual order, an Indic
+// cluster's glyphs all carry its first character — rows are measured by laying them out, broken
+// only between grapheme clusters, with a bounded number of layouts.
+
+/// The installed fonts a window gets (eframe's system font provider), found for every character
+/// in `need` — laid out once by a probe window first — or why not (the test then skips).
+fn system_fonts(drv: &mut Driver, dir: &Path, need: &str) -> bool {
+    use egui_system_font_provider::SystemFontProvider;
+    drv.ctx
+        .add_font_provider(Arc::new(SystemFontProvider::new()));
+    let mut probe = viewer(dir, "probe.txt", &format!("{need}\n"));
+    drv.idle(&mut probe, 3);
+    let f = chrome::font();
+    let missing: String = need
+        .chars()
+        .filter(|&c| c != ' ' && !drv.ctx.fonts_mut(|fonts| fonts.has_glyph(&f, c)))
+        .collect();
+    if !missing.is_empty() {
+        eprintln!("SKIPPED: no installed font for {missing:?}");
+    }
+    missing.is_empty()
+}
+
+/// Every row of the file as wrapping cuts it at the window's width, from the top (through a memo
+/// of its own), and the row starts found going back up from the last row.
+fn all_rows(drv: &Driver, win: &mut TextWindow) -> (Vec<wrap::Row>, Vec<wrap::Pos>) {
+    let plain = chrome::Palette::of(&drv.ctx.global_style().visuals).text;
+    let font = chrome::font();
+    let cell = drv.ctx.fonts_mut(|f| f.glyph_width(&font, '0'));
+    let room = win.room;
+    let mut memo = wrap::Memo::default();
+    memo.reset(room);
+    let mut w = wrap::Wrapper {
+        doc: &mut win.doc,
+        memo: &mut memo,
+        m: wrap::Measure::new(&drv.ctx, font, plain),
+        width: room,
+        read: wrap::read_cap(room, cell),
+    };
+    let (mut rows, mut p) = (Vec::new(), wrap::Pos::default());
+    loop {
+        rows.extend(w.page(p, 1).unwrap().0);
+        match w.next(p).unwrap() {
+            Some(q) => p = q,
+            None => break,
+        }
+    }
+    let mut back = vec![p];
+    while let Some(q) = w.prev(p).unwrap() {
+        back.push(q);
+        p = q;
+    }
+    back.reverse();
+    (rows, back)
+}
+
+/// The rows of line `line` put back together: each row's text and the space it was full at.
+fn rejoined(rows: &[wrap::Row], line: u64) -> String {
+    rows.iter()
+        .filter(|r| r.line == line)
+        .map(|r| {
+            let skipped = r.cut.taken > r.cut.shown.len();
+            format!("{}{}", r.cut.text(), if skipped { " " } else { "" })
+        })
+        .collect()
+}
+
+/// A long line of `unit` (words shorter than a row) at 480 points: the first page and a page
+/// down take a bounded number of layouts; every row is inside the window, starts between
+/// grapheme clusters and ends after a space (a word that fits is never split); the rows put
+/// together are the line; going back up from the end finds the same rows.
+fn shaped_line_wraps_at_clusters(name: &str, unit: &str) {
+    use unicode_segmentation::UnicodeSegmentation;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut drv = Driver::new(480.0, 300.0);
+    if !system_fonts(&mut drv, tmp.path(), unit) {
+        return;
+    }
+    // Past a restart point (16 KiB).
+    let line = unit.repeat(20 * 1024 / unit.len() + 1);
+    let mut win = viewer(tmp.path(), name, &format!("{line}\nnext\n"));
+    let before = wrap::laid();
+    drv.until(&mut win, 120, |w| w.ready());
+    let rows = win.page.as_ref().unwrap().rows.len();
+    let cols = (win.room / chrome::CELL.x) as usize;
+    let laid = |since: (usize, usize)| {
+        let now = wrap::laid();
+        (now.0 - since.0, now.1 - since.1)
+    };
+    let (layouts, chars) = laid(before);
+    assert!(
+        layouts <= 8 * rows + 16 && chars <= 8 * rows * (2 * cols + 16),
+        "{name}: {layouts} layouts of {chars} characters for a page of {rows} rows"
+    );
+    let x = drv
+        .texts()
+        .into_iter()
+        .filter(|(_, _, t)| !t.is_empty() && line.starts_with(t.as_str()))
+        .map(|(r, _, _)| r.left())
+        .next()
+        .expect("the first row");
+    assert_rows_inside(&drv, x);
+    let before = wrap::laid();
+    drv.key(&mut win, Key::PageDown, Modifiers::NONE);
+    let (layouts, _) = laid(before);
+    assert!(
+        layouts <= 8 * rows + 16,
+        "{name}: {layouts} layouts for PgDn"
+    );
+    assert_rows_inside(&drv, x);
+
+    let (all, back) = all_rows(&drv, &mut win);
+    let starts: std::collections::HashSet<usize> = line
+        .grapheme_indices(true)
+        .map(|(i, _)| i)
+        .chain([line.len()])
+        .collect();
+    let font = chrome::font();
+    let plain = chrome::Palette::of(&drv.ctx.global_style().visuals).text;
+    let of_line: Vec<&wrap::Row> = all.iter().filter(|r| r.line == 0).collect();
+    for (k, row) in of_line.iter().enumerate() {
+        assert!(
+            starts.contains(&(row.start as usize)),
+            "{name}: row {k} starts inside a cluster: {:?}",
+            row.cut.text()
+        );
+        let wide = drv
+            .ctx
+            .fonts_mut(|f| f.layout_no_wrap(row.cut.text(), font.clone(), plain))
+            .size()
+            .x;
+        assert!(
+            wide <= win.room + 0.5,
+            "{name}: row {k} is {wide} wide in {}",
+            win.room
+        );
+        // A restart point (16 KiB) moves on to the next word start too.
+        if k + 1 < of_line.len() {
+            assert!(
+                row.cut.taken > row.cut.shown.len() || row.cut.text().ends_with(' '),
+                "{name}: row {k} splits a word: {:?}",
+                row.cut.text()
+            );
+        }
+    }
+    assert_eq!(rejoined(&all, 0), line, "{name}: the rows are the line");
+    let forward: Vec<wrap::Pos> = all
+        .iter()
+        .map(|r| wrap::Pos {
+            line: r.line,
+            off: r.start,
+        })
+        .collect();
+    assert_eq!(forward, back, "{name}: the same rows going back up");
+}
+
+#[test]
+fn a_long_arabic_line_wraps_at_clusters_with_bounded_layouts() {
+    shaped_line_wraps_at_clusters("arabic.txt", "مرحبا بالعالم هذا نص عربي طويل للاختبار ");
+}
+
+#[test]
+fn a_long_hindi_line_wraps_at_clusters_with_bounded_layouts() {
+    shaped_line_wraps_at_clusters("hindi.txt", "हिन्दी भाषा किताब नमस्ते दुनिया ");
+}
+
+#[test]
+fn a_mixed_rtl_and_ltr_line_wraps_at_clusters_with_bounded_layouts() {
+    shaped_line_wraps_at_clusters(
+        "mixed.txt",
+        "English שלום עולם مرحبا بالعالم mixed עברית text العربية ",
+    );
+}
+
+/// A line well over LINE_MAX (words, a word longer than a row, across a restart point), walked
+/// row by row: the rows put together are the line, byte for byte.
+#[test]
+fn a_long_line_walked_row_by_row_is_the_whole_line() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut line = String::new();
+    let mut i = 0u32;
+    while line.len() < 5 * LINE_MAX {
+        let word = match i % 9 {
+            0 => "x".repeat(150),
+            k => format!("w{i}{}", "o".repeat(k as usize)),
+        };
+        line.push_str(&word);
+        line.push(' ');
+        i += 1;
+    }
+    line.push_str("THE-END");
+    let mut win = viewer(tmp.path(), "whole.txt", &format!("{line}\nnext\n"));
+    let mut drv = Driver::new(600.0, 400.0);
+    drv.until(&mut win, 5, |w| w.ready());
+    let (all, back) = all_rows(&drv, &mut win);
+    assert!(all.iter().filter(|r| r.line == 0).count() > 50);
+    assert_eq!(rejoined(&all, 0), line);
+    assert_eq!(rejoined(&all, 1), "next");
+    assert_eq!(back.len(), all.len());
+}
+
+/// The same with bytes that are not UTF-8 — scattered, at a restart point (stray continuation
+/// bytes, a character cut short) and a character straddling another: the rows put together are
+/// the line as Rust's lossy decoding reads it.
+#[test]
+fn an_invalid_utf8_line_walked_row_by_row_is_the_lossy_line() {
+    let tmp = tempfile::tempdir().unwrap();
+    let restart = wrap::RESTART as usize;
+    let mut bytes = Vec::new();
+    let mut i = 0u32;
+    while bytes.len() < restart - 64 {
+        bytes.extend_from_slice(format!("word{i} ").as_bytes());
+        if i.is_multiple_of(37) {
+            bytes.extend_from_slice(b"\xff\xfe bad \xe2\x82 cut ");
+        }
+        i += 1;
+    }
+    // Up to the first restart point, then stray continuation bytes and a character cut short.
+    bytes.resize(restart - 1, b'a');
+    bytes.extend_from_slice(b"\x80\x80\x80\xe2\x82y ");
+    while bytes.len() < 2 * restart - 64 {
+        bytes.extend_from_slice(format!("more{i} ").as_bytes());
+        i += 1;
+    }
+    // "한" across the second restart point.
+    bytes.resize(2 * restart - 1, b'b');
+    bytes.extend_from_slice("한 tail".as_bytes());
+    let mut body = bytes.clone();
+    body.extend_from_slice(b"\nnext\n");
+    let path = write(tmp.path(), "bad.txt", &body);
+    let mut win = TextWindow::new(
+        TextDoc::open(&path).unwrap(),
+        "bad".into(),
+        "bad.txt",
+        vec![],
+    );
+    let mut drv = Driver::new(600.0, 400.0);
+    drv.until(&mut win, 5, |w| w.ready());
+    let (all, _) = all_rows(&drv, &mut win);
+    assert_eq!(rejoined(&all, 0), String::from_utf8_lossy(&bytes));
+}
+
+/// A restart point (16 KiB into a line) that falls inside a grapheme cluster — here on the vowel
+/// sign of "कि" — moves on to the cluster's end: no row starts inside it.
+#[test]
+fn a_restart_point_inside_a_cluster_moves_past_it() {
+    use unicode_segmentation::UnicodeSegmentation;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut drv = Driver::new(480.0, 300.0);
+    if !system_fonts(&mut drv, tmp.path(), "कि") {
+        return;
+    }
+    let restart = wrap::RESTART as usize;
+    // "क" ends where the restart point is; "ि" starts there.
+    let mut line = "a".repeat(restart - 3);
+    line.push_str("कि");
+    line.push_str(&" कि".repeat(200));
+    assert_eq!(&line.as_bytes()[restart..restart + 3], "ि".as_bytes());
+    let mut win = viewer(tmp.path(), "restart.txt", &format!("{line}\n"));
+    drv.until(&mut win, 10, |w| w.ready());
+    let (all, back) = all_rows(&drv, &mut win);
+    let starts: std::collections::HashSet<usize> =
+        line.grapheme_indices(true).map(|(i, _)| i).collect();
+    for row in &all {
+        assert!(
+            starts.contains(&(row.start as usize)),
+            "a row starts inside a cluster at {}: {:?}",
+            row.start,
+            row.cut.text()
+        );
+    }
+    assert_eq!(rejoined(&all, 0), line);
+    let forward: Vec<wrap::Pos> = all
+        .iter()
+        .map(|r| wrap::Pos {
+            line: r.line,
+            off: r.start,
+        })
+        .collect();
+    assert_eq!(forward, back);
 }

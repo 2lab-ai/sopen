@@ -1704,14 +1704,13 @@ impl TextWindow {
         if self.memo.rewidth(self.room) {
             self.resnap = true;
         }
-        let cell = ctx.fonts_mut(|f| f.glyph_width(font, '0')).max(1.0);
+        let cell = ctx.fonts_mut(|f| f.glyph_width(font, '0'));
         let mut w = Wrapper {
             doc: &mut self.doc,
             memo: &mut self.memo,
             m: Measure::new(ctx, font.clone(), plain),
             width: self.room,
-            // A row is read at most this far (a row of combining marks is cut there).
-            read: 16 * (self.room / cell).ceil().max(1.0) as usize + 256,
+            read: wrap::read_cap(self.room, cell),
         };
         let mut pos = Pos {
             line: self.top.min(lines.saturating_sub(1)),

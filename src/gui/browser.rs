@@ -204,8 +204,9 @@ pub(crate) struct Browser {
     painted: bool,
     /// `SOPEN_STATE` `open=NAME`: opened once the folder is first listed (receipts of a viewer).
     open_first: Option<String>,
-    /// `SOPEN_STATE` `at=OFFSET`: where the first text viewer opened starts (the row that byte
-    /// is in at the top).
+    /// `SOPEN_STATE` `at=OFFSET`: where the first text viewer opened in this browser starts (the
+    /// row that byte is in at the top) — the one `open=` opens, or else the first the owner
+    /// opens; taken by it, so no later viewer gets it.
     open_at: Option<u64>,
 }
 

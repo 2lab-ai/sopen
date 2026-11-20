@@ -180,8 +180,9 @@ pub enum Op {
 /// `SOPEN_STATE=rect=x,y,w,h;t=3.5;in=2;out=6;op=crop|pixelize;block=16` — source pixels and
 /// seconds. `op` may list several, comma-separated, applied in order. The hex window takes
 /// `at=OFFSET;patch=OFFSET:HEXBYTES[,OFFSET:HEXBYTES]` (offsets `0x…` or decimal); the file
-/// browser `open=NAME`, and with it `at=OFFSET` for a text file (the row that byte is in at the
-/// top); the image and hex windows `close=ask`.
+/// browser `open=NAME`, and `at=OFFSET` for the first text file it opens — by `open=NAME` or by
+/// hand, whichever comes first (the row that byte is in at the top); the image and hex windows
+/// `close=ask`.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct State {
     pub rect: Option<[u32; 4]>,
@@ -190,8 +191,8 @@ pub struct State {
     pub out_s: Option<f64>,
     pub ops: Vec<Op>,
     pub block: Option<u32>,
-    /// Hex window: where the cursor starts. The file browser's text viewer: the row this byte
-    /// is in goes to the top.
+    /// Hex window: where the cursor starts. The file browser: the first text file it opens (by
+    /// `open=` or by hand) starts with the row this byte is in at the top; later ones do not.
     pub at: Option<u64>,
     /// Hex window: bytes overwritten at an offset, applied in order (each one an undo step).
     pub patches: Vec<(u64, Vec<u8>)>,
