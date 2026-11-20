@@ -4,7 +4,8 @@
 //! or on another machine's screen — [`config`] holds the default), [`remote`] is the file layer
 //! (SFTP over the system ssh, or the local disk), [`kind`] routes by type, [`zed`] / [`app`] hand
 //! the file to an editor ([`raise`] brings the editor's window to the user on KDE Plasma),
-//! [`ffmpeg`] / [`cut`] cut media, [`cache`] owns local paths, [`usage`] appends the run log.
+//! [`ffmpeg`] / [`cut`] cut media, [`stems`] splits voice from music, [`cache`] owns local paths,
+//! [`usage`] appends the run log.
 
 pub mod app;
 pub mod cache;
@@ -16,6 +17,7 @@ pub mod gui;
 pub mod kind;
 pub mod raise;
 pub mod remote;
+pub mod stems;
 pub mod target;
 pub mod usage;
 pub mod zed;
@@ -41,9 +43,20 @@ pub fn version_text() -> String {
 pub const FONT_CREDIT: &str = "Font: PxPlus IBM VGA 8x16 by VileR (The Ultimate Oldschool PC \
                                Font Pack, https://int10h.org/oldschool-pc-fonts/), CC BY-SA 4.0";
 
-/// `--version`: the version line, then [`FONT_CREDIT`] (`-V` is the version line alone).
+/// `--version`: the version line, then [`credits`] (`-V` is the version line alone).
 pub fn long_version_text() -> String {
-    format!("{}\n{FONT_CREDIT}", version_text())
+    format!("{}\n{}", version_text(), credits())
+}
+
+/// The credits that travel with the binary (`--version`, the long help): the font's, and in a
+/// build that separates voice from music the model's, whose authors ask for it
+/// ([`stems::CREDIT`]).
+pub fn credits() -> String {
+    if stems::AVAILABLE {
+        format!("{FONT_CREDIT}\n{}", stems::CREDIT)
+    } else {
+        FONT_CREDIT.to_string()
+    }
 }
 
 /// A size for people: `999 B`, `1.5 MB` (powers of 1000).

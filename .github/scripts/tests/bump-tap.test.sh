@@ -10,7 +10,9 @@
 # every failure mode below must exit non-zero. Skipping when the repo has no
 # credential is the workflow's `if:`, never the script's. And the formula is
 # rendered from this repo's templates: the tap holds none, and a bump pushes
-# exactly one rendered Formula/*.rb.
+# exactly one rendered Formula/*.rb. Besides the four binaries, a release carries
+# THIRD-PARTY-NOTICES (what the binary links statically), which the formula
+# installs; the voice/music model is a resource with a fixed url and sha256.
 set -euo pipefail
 
 SCRIPT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/bump-tap.sh"
@@ -92,6 +94,16 @@ class $class < Formula
   homepage "https://github.com/2lab-ai/sopen"
   version "@VERSION@"
 
+  resource "stems-model" do
+    url "https://github.com/k2-fsa/sherpa-onnx/releases/download/source-separation-models/UVR-MDX-NET-Voc_FT.onnx"
+    sha256 "e411182ce2c53541fefdcc99a8f46f2fe03978eb22038b9497c1d9d95a00fad4"
+  end
+
+  resource "third-party-notices" do
+    url "https://github.com/2lab-ai/sopen/releases/download/$url_tag/THIRD-PARTY-NOTICES"
+    sha256 "@SHA_NOTICES@"
+  end
+
   on_macos do
     on_arm do
       url "https://github.com/2lab-ai/sopen/releases/download/$url_tag/sopen-macos-aarch64"
@@ -151,7 +163,8 @@ seed_tap() {
   git -C "$work" push --quiet "$origin" HEAD:master
 }
 
-# make_release <dir> <tag> — the four binaries this build published.
+# make_release <dir> <tag> — the four binaries this build published, and its
+# THIRD-PARTY-NOTICES.
 make_release() {
   local dir="$1" tag="$2"
   mkdir -p "$dir"
@@ -159,7 +172,13 @@ make_release() {
   for name in sopen-macos-aarch64 sopen-macos-x86_64 sopen-linux-aarch64 sopen-linux-x86_64; do
     echo "$name binary for $tag" > "$dir/$name"
   done
+  echo "notices for $tag" > "$dir/THIRD-PARTY-NOTICES"
 }
+
+# Every asset the formula downloads from this build, binaries and notices.
+ASSETS="sopen-macos-aarch64 sopen-macos-x86_64 sopen-linux-aarch64 sopen-linux-x86_64 THIRD-PARTY-NOTICES"
+MODEL_URL="https://github.com/k2-fsa/sherpa-onnx/releases/download/source-separation-models/UVR-MDX-NET-Voc_FT.onnx"
+MODEL_SHA="e411182ce2c53541fefdcc99a8f46f2fe03978eb22038b9497c1d9d95a00fad4"
 
 # new_case <name> [current-tag] [formula] — sets CASE_DIR/ORIGIN/WORK/TEMPLATES/FORMULA.
 new_case() {
@@ -220,6 +239,14 @@ run_bump
 expect_nonzero "missing binary asset fails the step"
 expect_out "sopen-linux-aarch64" "missing-binary error names the asset"
 
+new_case no-notices
+rm -f "$WORK/release/THIRD-PARTY-NOTICES"
+before="$(commit_count)"
+run_bump
+expect_nonzero "a missing THIRD-PARTY-NOTICES asset fails the step"
+expect_out "THIRD-PARTY-NOTICES" "missing-notices error names the asset"
+expect_true "the missing-notices case pushes nothing" [ "$before" = "$(commit_count)" ]
+
 # --- case: input validation ----------------------------------------------
 new_case bad-build-id
 run_bump "preview-2026-09-11-0404-nothex123456"
@@ -266,10 +293,12 @@ expect_true "pushed formula carries the brew version" \
 expect_true "pushed formula points at this tag" grep -q "download/$TAG/" <<< "$formula"
 # Per platform, not "somewhere in the file": a swapped pair would still carry
 # all four hashes, but brew would reject (or worse, accept) the wrong binary.
-for asset in sopen-macos-aarch64 sopen-macos-x86_64 sopen-linux-aarch64 sopen-linux-x86_64; do
+for asset in $ASSETS; do
   expect_true "pushed formula pairs the $asset url with its own sha256" \
     [ "$(sha_after_url "$formula" "$asset")" = "$(sha256_of "$WORK/release/$asset")" ]
 done
+expect_true "pushed formula keeps the model's pinned sha256" \
+  [ "$(sha_after_url "$formula" "UVR-MDX-NET-Voc_FT.onnx")" = "$MODEL_SHA" ]
 expect_absent "no unrendered template token reaches the tap" \
   grep -q "@[A-Z0-9_]\+@" <<< "$formula"
 expect_true "the bump commit touches only Formula/sopen-preview.rb" \
@@ -351,7 +380,9 @@ formula="$(pushed_formula)"
 expect_true "stable formula carries version 0.2.0" grep -q 'version "0.2.0"' <<< "$formula"
 expect_true "stable formula downloads from the v0.2.0 tag" \
   grep -q "releases/download/v0.2.0/sopen-linux-x86_64" <<< "$formula"
-for asset in sopen-macos-aarch64 sopen-macos-x86_64 sopen-linux-aarch64 sopen-linux-x86_64; do
+expect_true "stable formula downloads the notices from the v0.2.0 tag" \
+  grep -q "releases/download/v0.2.0/THIRD-PARTY-NOTICES" <<< "$formula"
+for asset in $ASSETS; do
   expect_true "stable formula pairs the $asset url with its own sha256" \
     [ "$(sha_after_url "$formula" "$asset")" = "$(sha256_of "$WORK/release/$asset")" ]
 done
@@ -389,10 +420,22 @@ for f in sopen-preview sopen; do
   expect_zero "the repo's $f template renders and pushes"
   formula="$(pushed_formula)"
   expect_true "rendered $f formula depends on ffmpeg" grep -q 'depends_on "ffmpeg"' <<< "$formula"
-  for asset in sopen-macos-aarch64 sopen-macos-x86_64 sopen-linux-aarch64 sopen-linux-x86_64; do
+  for asset in $ASSETS; do
     expect_true "repo $f template pairs the $asset url with its own sha256" \
       [ "$(sha_after_url "$formula" "$asset")" = "$(sha256_of "$WORK/release/$asset")" ]
   done
+  expect_true "repo $f template downloads the notices from this build's tag" \
+    grep -q "releases/download/$tag/THIRD-PARTY-NOTICES\"" <<< "$formula"
+  # The model is not a release asset: a fixed resource, staged where sopen looks
+  # for it (<keg>/share/<formula>/, next to <keg>/bin/sopen) under its own name.
+  expect_true "repo $f template downloads the model from sherpa-onnx's release" \
+    grep -qF "url \"$MODEL_URL\"" <<< "$formula"
+  expect_true "repo $f template pins the model's sha256" \
+    [ "$(sha_after_url "$formula" "UVR-MDX-NET-Voc_FT.onnx")" = "$MODEL_SHA" ]
+  expect_true "repo $f template stages the model into pkgshare" \
+    grep -qF 'pkgshare.install Dir["*"].first => "UVR-MDX-NET-Voc_FT.onnx"' <<< "$formula"
+  expect_true "repo $f template installs the notices with the binary" \
+    grep -qF 'prefix.install Dir["*"].first => "THIRD-PARTY-NOTICES"' <<< "$formula"
   expect_absent "no unrendered token in the repo $f render" grep -q "@[A-Z0-9_]\+@" <<< "$formula"
 done
 

@@ -66,6 +66,7 @@ is laid out where PC Shell puts things (§3a), and every sopen window wears PC S
 | A9 | `sopen SOURCE` opens here; `sopen --target <host> SOURCE` opens it on `<host>` (msg 7) | `sopen <host-a>:/tmp/a.html` opens on the machine it was typed on, as before. `sopen --target <host-b> <host-a>:/tmp/a.html` opens it on `<host-b>`'s screen: the same window or editor, started by `<host-b>`'s own sopen (on macOS sopen's window floats above the others until it is used; the editor opens behind the active app, §4a); exit code is `<host-b>`'s; `could not reach <host-b>` when ssh cannot get there; `sopen is not installed on <host-b> …` (exit 127) when it has no sopen. A file on `<host-b>` itself opens there as a local file; a local file reaches `<host-b>` as `<this machine>:<path>`. |
 | A10 | Default target in sopen's settings (msg 8) | `sopen config target <host-b>` writes `target = "<host-b>"` to the config file (§4a); from then on `sopen SOURCE` opens on `<host-b>`, `--here` opens on this machine anyway, `--target` picks another; `sopen config` shows the file and the target; `sopen config target --unset` removes it. A config sopen cannot read is an error naming the file, never ignored. |
 | A11 | A folder opens in a Total Commander-like program; Enter on a file runs its default viewer there (msg 12) | `sopen host:/dir` opens sopen's file browser (§3a): two panels on the folder, folders first; Tab switches panels, Enter enters a folder, Backspace goes up, a letter jumps to the next name with it; Enter on a file shows it in the same window — text highlighted with line numbers, an image in the image window, video/audio in the media window, anything else in the hex window — and Esc returns to the list with the bar where it was; F4 opens the entry in VS Code / Zed (A2's choice). An edited image or hex file is never dropped unasked: leaving asks as its own window does. `--app` still opens a file in a named app; a folder with `--app` / `--hex` is an error, as before. |
+| A12 | Split an audio track into voice and music (msg 13) | `sopen stems host:/a.mp3` writes `a.voice.mp3` and `a.music.mp3` next to it — new files, never over anything — and prints both paths; a video gives `.m4a` (AAC) stems; on a 0 dB voice/music mix each stem is ≈ 14 dB SDR (§7a). `brew install` brings the model; a missing or different model is one error naming the path it expected. The window gets its button in a later change; its child-process API is §7a's. |
 
 ## 3. Routing
 
@@ -275,12 +276,12 @@ as it is). When ssh itself fails (its exit code 255) sopen exits 1 with `could n
 reach HOST`; any other status above 128 (sopen itself exits only 0, 1 or 3 — 2 for a usage error — so most likely a
 signal, 128 + n)
 exits 1 with `sopen on HOST ended with status N (signal n?)`. HOST needs sopen installed; the machine holding the file still needs only sshd. Because HOST is always
-told `--here`, it never forwards again, whatever its own default is. `sopen cut` always runs here.
+told `--here`, it never forwards again, whatever its own default is. `sopen cut` and `sopen stems` always run here.
 
 Which machine opens it: `--here` (this machine) or `--target HOST` — one or the other, the command line refuses
 both — else the environment variable `SOPEN_TARGET`, else the `target` key of the config file, else this machine.
 `SOPEN_TARGET` and the config file are read only when they are the ones deciding, so a broken file or an unreadable
-variable does not stop `--here` or `--target`, and `cut` reads neither. HOST is `[user@]host` — an ssh alias or a
+variable does not stop `--here` or `--target`, and `cut` and `stems` read neither. HOST is `[user@]host` — an ssh alias or a
 host name; a port or an IPv6 address goes into `~/.ssh/config` under an alias. Wherever it comes from it must be
 non-empty, without whitespace or `:`, and must not start with `-`. HOST is this machine — opened here, no ssh — only when
 its host part (without `user@`) is loopback (exactly `localhost`, a name under `.localhost`, or one of the
@@ -569,9 +570,64 @@ once the primary button is up, and take rows off the grid's bottom.
   runs on this machine (§4a).
 - Renderer / playback details fixed by the spike (§11).
 
+## 7a. Voice / music separation (A12)
+
+`sopen stems SOURCE [--model PATH]` splits a file's audio into the voice and the music. It has
+`sopen cut`'s shape and rules: SOURCE is local or `[user@]host:path`, a remote file is fetched
+into the cache (claimed while it runs), and it always runs on this machine (§4a).
+
+- **Engine.** sherpa-onnx v2.0.2's C API (Apache-2.0; ONNX Runtime, MIT, inside), linked
+  statically behind the cargo feature `stems` (on by default; every release build has it).
+  build.rs downloads the pinned prebuilt archive for the *target* and checks its SHA-256
+  (`SHERPA_ONNX_LIB_DIR` = an extracted `lib/` for offline builds); `--no-default-features`
+  builds without it and `sopen stems` then says so. sherpa-onnx's Rust crates do not bind source
+  separation, so the few C declarations are sopen's own. CPU, every core.
+- **Model.** UVR-MDX-NET-Voc_FT from Ultimate Vocal Remover (Anjok07 & aufr33, MIT — credited in
+  `--version`, the long help and the README, as its authors ask) in sherpa-onnx's ONNX
+  conversion: `UVR-MDX-NET-Voc_FT.onnx`, 66,762,795 bytes, SHA-256
+  `e411182ce2c53541fefdcc99a8f46f2fe03978eb22038b9497c1d9d95a00fad4`. It is not one of sopen's
+  release assets: the formula's `resource` stages it into `pkgshare`. sopen looks for it at
+  `--model PATH`, else `SOPEN_STEMS_MODEL`, else `<keg>/share/<formula>/UVR-MDX-NET-Voc_FT.onnx`
+  next to the canonical binary's `<keg>/bin/` (`<formula>` = `sopen` for a release build,
+  `sopen-preview` otherwise), and checks size and SHA-256 before anything is fetched. Missing
+  or not exactly that file: one error naming the path it expected. sopen has no network code.
+- **Separation.** ffprobe (an audio stream is required) → ffmpeg decodes the first audio track
+  to stereo f32 at the model's rate (44.1 kHz) on a pipe → the engine separates it in pieces of
+  30 s, each with 1 s of the file's own audio on both sides (silence past its ends) that is cut
+  off its output again — the engine distorts a window's edges, and the context keeps that out
+  (the research spike measured it lossless against one pass) → each stem goes to ffmpeg on a
+  pipe. Memory is one window plus the model, however long the track (measured flat: 6,529 MiB
+  after the first of 8 pieces, 6,535 MiB after the last). The model's music is the window minus
+  its voice, so voice + music give the source back sample for sample (the test).
+- **Output.** Each stem in the source's audio codec, sample rate and channel count (mono stays
+  mono — through the engine as two equal channels, back as their mean, by explicit `pan`s, so
+  the level is kept; more than two channels are separated as stereo and a note says so); a
+  video source
+  gives AAC in `.m4a`. Only the first audio track is separated (a note names the others). Both
+  are published as new siblings the way `sopen cut` publishes (§5: never over anything, `-N`
+  when the name is taken): `<stem>.voice.<ext>`, then `<stem>.music.<ext>`; both paths are
+  printed on stdout, voice first. A music stem that cannot be published after the voice was is
+  an error that names the published voice.
+- **Progress** on stderr, one line per finished piece, parseable:
+  `stems: piece 3/8, 61s elapsed, 102s remaining` (`0/N` with no `remaining` before the first;
+  `N` from ffprobe's duration until the decode ends, then exact; a terminal sees the line
+  updated in place). Exit codes as `sopen cut`: 0, or 1 with one error line.
+- **Cost** (measured on an 18-core Apple M-series CPU, 2026-11-20): a 4-minute track took 198 s
+  while the machine was busy with other work (load average 150–200; the research spike's idle
+  runs: 147–160 s), at 6.4 GiB peak RSS; on the spike's 0 dB voice/music mix both stems scored
+  14.04 dB SDR, the spike's own figure. So the window never separates in its own process: `stems::spawn_child` runs `sopen stems --work-dir
+  DIR --wait-to-publish -- SOURCE` as a child in a process group of its own (its ffmpeg children
+  with it), in a work folder the parent made, and reads its progress lines. Cancel kills the
+  group, removes the folder and publishes nothing. The child does not publish on its own: once
+  both stems are encoded it prints `stems: ready to publish` and waits for `publish` on its
+  stdin; the parent answers under the lock Cancel takes, so a cancel either comes first (nothing
+  reaches the remote — an upload is never cut half-way, leaving a temp there) or after the
+  go-ahead, when it is too late and the stems are published. The window's button is a later
+  change.
+
 ## 8. Usage log
 
-One JSON line per run in `<state>/usage.jsonl`: `ts, host_hash, kind, ext, bytes, fetch_ms, action (open|save|export|cut|discard), conflict, ok, forwarded, target_hash`.
+One JSON line per run in `<state>/usage.jsonl`: `ts, host_hash, kind, ext, bytes, fetch_ms, action (open|save|export|cut|stems|discard), conflict, ok, forwarded, target_hash`.
 Hosts are hashed, never written by name. A run forwarded with `--target` (§4a) is logged on both machines: here with
 `forwarded: true` and the target's hash (its kind is known only there), there as an ordinary open.
 Local only, never sent anywhere. Exists for §10.
