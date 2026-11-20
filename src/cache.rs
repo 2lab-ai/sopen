@@ -1,7 +1,9 @@
 //! Local paths: the fetch cache `<cache>/<host>/<abs path>`, edits kept aside as
 //! `<copy>.conflict-<UTC stamp>`, image and hex backups
 //! `<cache>/.backup/<host>/<abs path>.<UTC stamp>`, image and hex edits under `<cache>/.edits`,
-//! exports under `<cache>/.exports`, session copies under `<cache>/.sessions` (spec §5), and the
+//! exports under `<cache>/.exports`, session copies under `<cache>/.sessions` (spec §5), the file
+//! browser's private preview copies under `<cache>/.preview` (02 §4.4: never claimed, never in
+//! the mirror until a hand-over publishes one by a hard link), and the
 //! state dir (ssh control sockets, `usage.jsonl`). What
 //! sopen knows about a copy lives apart from the mirrored tree, under `<cache>/.meta` (see
 //! [`Claim`]): the record of what the copy held when fetched or saved, and the session lock. `SOPEN_CACHE_DIR` /
@@ -98,6 +100,8 @@ const BACKUP: &str = ".backup";
 const SESSIONS: &str = ".sessions";
 const EDITS: &str = ".edits";
 const EXPORTS: &str = ".exports";
+/// Preview copies: `<cache>/.preview/<window>/<n>` (see [`PreviewSpace`]).
+const PREVIEW: &str = ".preview";
 
 pub fn cache_path(cache: &Path, host: &str, abs: &str) -> PathBuf {
     under(cache, host, abs)
@@ -135,6 +139,122 @@ pub fn backup_path(cache: &Path, host: &str, abs: &str, at: SystemTime) -> PathB
     );
     path.set_file_name(name);
     path
+}
+
+/// A job's lock (a render in `.edits`, a work folder in `.exports`): `<path>.lock`, held
+/// while the job runs. The lock file is removed when the job ends; one whose lock nobody holds
+/// is a job whose sopen died — [`sweep_stale_jobs`] removes what it left.
+pub struct JobLock {
+    path: PathBuf,
+    _file: File,
+}
+
+impl JobLock {
+    /// Takes the lock of the job at `job` (its file or folder; the lock is `<job>.lock`).
+    pub fn take(job: &Path) -> Result<Self> {
+        let path = lock_of(job);
+        if let Some(dir) = path.parent() {
+            private_dir(dir)?;
+        }
+        let file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(&path)
+            .with_context(|| format!("cannot create {}", path.display()))?;
+        file.try_lock()
+            .map_err(|e| anyhow::anyhow!("cannot lock {}: {e}", path.display()))?;
+        Ok(Self { path, _file: file })
+    }
+}
+
+impl Drop for JobLock {
+    /// Removed while still held, so no sweep can take a lock file that is going away.
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// `path` still names the file `file` is open on (device and inode, the link not followed).
+fn same_file(file: &File, path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    match (file.metadata(), std::fs::symlink_metadata(path)) {
+        (Ok(open), Ok(named)) => open.dev() == named.dev() && open.ino() == named.ino(),
+        _ => false,
+    }
+}
+
+fn lock_of(job: &Path) -> PathBuf {
+    let mut name = job.file_name().unwrap_or_default().to_os_string();
+    name.push(".lock");
+    job.with_file_name(name)
+}
+
+/// Removes what jobs left whose sopen died (killed during a Save or an Export): every
+/// `<job>.lock` under `.exports` and `.edits` that nobody holds, with its job — a work folder
+/// in `.exports`, a staged media render (`*.render-*`) in `.edits`. Nothing without a lock file
+/// is touched: a kept edit or render (a refused or failed save names it) has none. Returns what
+/// was removed.
+pub fn sweep_stale_jobs(cache: &Path) -> Vec<PathBuf> {
+    sweep_with(cache, &mut |_| {})
+}
+
+/// [`sweep_stale_jobs`], calling `between` with each lock file it opened before it locks it
+/// (tests pause the sweep there).
+fn sweep_with(cache: &Path, between: &mut dyn FnMut(&Path)) -> Vec<PathBuf> {
+    let mut removed = Vec::new();
+    let mut walk = vec![exports_root(cache), edits_root(cache)];
+    while let Some(dir) = walk.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
+            if kind.is_dir() && dir != exports_root(cache) {
+                walk.push(path);
+                continue;
+            }
+            let Some(job) = path
+                .to_str()
+                .and_then(|p| p.strip_suffix(".lock"))
+                .map(PathBuf::from)
+            else {
+                continue;
+            };
+            let in_edits = job.starts_with(edits_root(cache));
+            let name = job.file_name().map(|n| n.to_string_lossy().into_owned());
+            if in_edits && !name.is_some_and(|n| n.contains(".render-")) {
+                continue;
+            }
+            let Ok(file) = OpenOptions::new().write(true).open(&path) else {
+                continue;
+            };
+            between(&path);
+            if file.try_lock().is_err() {
+                continue; // its job is running
+            }
+            // A job that ends removes its lock file before letting it go: a lock got after
+            // that is of a file no longer at this path (the job ended — a kept render — or a
+            // new one took the name). Only the file still there is a dead job's.
+            if !same_file(&file, &path) {
+                continue;
+            }
+            let gone = if job.is_dir() {
+                std::fs::remove_dir_all(&job)
+            } else {
+                std::fs::remove_file(&job)
+            };
+            if gone.is_ok() || !job.exists() {
+                removed.push(job);
+                let _ = std::fs::remove_file(&path);
+            }
+        }
+    }
+    removed
 }
 
 /// Creates `dir` and its missing parents for the owner only (0700). Directories that already
@@ -332,6 +452,22 @@ pub fn fetch_claimed_cancellable(
     progress: &mut dyn FnMut(u64, u64),
     cancel: &std::sync::atomic::AtomicBool,
 ) -> Result<(Fetched, u64)> {
+    let (claim, notices) = claim_for_fetch(cache, host, abs)?;
+    let started = std::time::Instant::now();
+    let at = fs.fetch_cancellable(abs, &claim.local, progress, cancel)?;
+    if let Some(sha) = &at.sha256 {
+        if let Err(e) = claim.record(sha) {
+            crate::debug!("not recorded: {e:#}");
+        }
+    }
+    let ms = started.elapsed().as_millis() as u64;
+    Ok((Fetched { claim, at, notices }, ms))
+}
+
+/// What every fetch into the cache does before it writes: the claim (a line says when it is a
+/// copy of its own) and an earlier copy's unsaved edits moved aside — said as known, printed,
+/// and returned for a window to repeat.
+fn claim_for_fetch(cache: &Path, host: &str, abs: &str) -> Result<(Claim, Vec<String>)> {
     let claim = claim(cache, host, abs)?;
     if let Some(note) = &claim.note {
         eprintln!("sopen: {note}");
@@ -357,15 +493,211 @@ pub fn fetch_claimed_cancellable(
     for line in &notices {
         eprintln!("sopen: {line}");
     }
-    let started = std::time::Instant::now();
-    let at = fs.fetch_cancellable(abs, &claim.local, progress, cancel)?;
-    if let Some(sha) = &at.sha256 {
+    Ok((claim, notices))
+}
+
+/// A preview's complete private copy published as the cached copy of `abs` on `host` (02 §4.4,
+/// the hand-over; and Enter on an info card whose copy is complete and unchanged): claimed, with
+/// an earlier copy's unsaved edits moved aside, exactly as a fetch does it ([`fetch_claimed`]);
+/// then `copy` linked in under the claimed name — a hard link (the same inode, no byte copied),
+/// made under a new name beside it and renamed over whatever is there, as a fetch renames its
+/// `.part` — and `sha256` recorded as what it holds. `copy` keeps its own name (the viewer reads
+/// it); the claim holds the published one. Returns the claim and the notices a fetch returns.
+pub fn publish_claimed(
+    copy: &Path,
+    host: &str,
+    abs: &str,
+    cache: &Path,
+    sha256: Option<&[u8; 32]>,
+) -> Result<(Claim, Vec<String>)> {
+    let (claim, notices) = claim_for_fetch(cache, host, abs)?;
+    let local = claim.local.clone();
+    let linked = link_beside(copy, &local)?;
+    if let Err(e) = std::fs::rename(&linked, &local) {
+        let _ = std::fs::remove_file(&linked);
+        return Err(e).with_context(|| format!("cannot move into {}", local.display()));
+    }
+    if let Some(sha) = sha256 {
         if let Err(e) = claim.record(sha) {
             crate::debug!("not recorded: {e:#}");
         }
     }
-    let ms = started.elapsed().as_millis() as u64;
-    Ok((Fetched { claim, at, notices }, ms))
+    Ok((claim, notices))
+}
+
+/// A new hard link to `copy` next to `target`, under a name nothing had (`<name>.link-<random>`):
+/// where the link is made, never over anything.
+fn link_beside(copy: &Path, target: &Path) -> Result<PathBuf> {
+    const TRIES: u32 = 32;
+    for _ in 0..TRIES {
+        let mut name = target.file_name().unwrap_or_default().to_os_string();
+        name.push(format!(".link-{}", &crate::remote::random_hex()[..8]));
+        let linked = target.with_file_name(name);
+        match std::fs::hard_link(copy, &linked) {
+            Ok(()) => return Ok(linked),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => {
+                return Err(e).with_context(|| {
+                    format!("cannot link {} to {}", copy.display(), linked.display())
+                })
+            }
+        }
+    }
+    anyhow::bail!(
+        "no free name next to {} after {TRIES} tries",
+        target.display()
+    )
+}
+
+/// Where one browser window keeps its preview copies (02 §4.4): `<cache>/.preview/<window>/`, a
+/// folder of its own (0700) under a random name, with the window's lock `<window>.lock` beside
+/// it, held for as long as this lives. Dropping it removes the folder with whatever is still in
+/// it. Making one first removes the folders of windows that are gone — their lock is free, or
+/// missing (a window makes and locks its lock before its folder) — so a crashed window's copies
+/// do not stay. Where the lock cannot be taken (a filesystem without working locks) there is no
+/// preview space: its folder would look like a crashed window's.
+pub struct PreviewSpace {
+    dir: PathBuf,
+    lock: PathBuf,
+    _held: File,
+    next: std::sync::atomic::AtomicU64,
+}
+
+impl PreviewSpace {
+    pub fn new(cache: &Path) -> Result<Self> {
+        Self::new_with(cache, &mut |file| file.try_lock())
+    }
+
+    /// [`PreviewSpace::new`], with `try_lock` standing in for `File::try_lock` (tests: a
+    /// filesystem whose locks fail).
+    fn new_with(
+        cache: &Path,
+        try_lock: &mut dyn FnMut(&File) -> std::result::Result<(), std::fs::TryLockError>,
+    ) -> Result<Self> {
+        let root = cache.join(PREVIEW);
+        private_dir(&root)?;
+        sweep_previews(&root);
+        let (lock, held) =
+            create_unique(|_| root.join(format!("{}.lock", &crate::remote::random_hex()[..12])))?;
+        // Without its lock held the folder would look like a crashed window's, and the next
+        // window's sweep would remove it under this one: no preview space, then.
+        if let Err(e) = try_lock(&held) {
+            let _ = std::fs::remove_file(&lock);
+            let why = match e {
+                std::fs::TryLockError::Error(e) => e.to_string(),
+                std::fs::TryLockError::WouldBlock => "it is held".to_string(),
+            };
+            anyhow::bail!("{} cannot be locked ({why}): no previews", lock.display());
+        }
+        let dir = lock.with_extension("");
+        if let Err(e) = DirBuilder::new().mode(0o700).create(&dir) {
+            let _ = std::fs::remove_file(&lock);
+            return Err(e).with_context(|| format!("cannot create {}", dir.display()));
+        }
+        Ok(Self {
+            dir,
+            lock,
+            _held: held,
+            next: std::sync::atomic::AtomicU64::new(0),
+        })
+    }
+
+    /// The window's folder.
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    /// A name no preview copy of this window had: `<n>`, with the extension of `file_name` when
+    /// it is a plain one (the programs that read the copy may look at it). Nothing is at it yet.
+    pub fn name(&self, file_name: &str) -> PreviewName {
+        let n = self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let ext = crate::kind::extension(file_name)
+            .filter(|e| e.len() <= 16 && e.bytes().all(|b| b.is_ascii_alphanumeric()))
+            .map(|e| format!(".{e}"))
+            .unwrap_or_default();
+        PreviewName {
+            path: self.dir.join(format!("{n}{ext}")),
+        }
+    }
+}
+
+impl Drop for PreviewSpace {
+    fn drop(&mut self) {
+        // The folder first, while the lock is still held: no sweep takes it meanwhile.
+        let _ = std::fs::remove_dir_all(&self.dir);
+        let _ = std::fs::remove_file(&self.lock);
+    }
+}
+
+/// Removes, under the preview root, the folder of every window that is gone: its lock can be
+/// taken, or it has none. Nothing is waited for; whatever cannot be told is left.
+fn sweep_previews(root: &Path) {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let dir = entry.path();
+        if !entry.file_type().is_ok_and(|t| t.is_dir()) {
+            continue;
+        }
+        let mut lock = dir.clone().into_os_string();
+        lock.push(".lock");
+        let lock = PathBuf::from(lock);
+        match File::open(&lock) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                let _ = std::fs::remove_dir_all(&dir);
+            }
+            Err(_) => {}
+            Ok(file) => {
+                if file.try_lock().is_ok() {
+                    let _ = std::fs::remove_dir_all(&dir);
+                    let _ = std::fs::remove_file(&lock);
+                }
+            }
+        }
+    }
+}
+
+/// A preview's private copy, by name (`<cache>/.preview/<window>/<n>`): whatever is at it is
+/// removed when this is dropped — the preview dropped, or the viewer it was handed over to gone
+/// (02 §4.4).
+#[derive(Debug)]
+pub struct PreviewName {
+    path: PathBuf,
+}
+
+impl PreviewName {
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for PreviewName {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// Tests: an earlier session's cached copy of `abs` on `host`, left as a session leaves it — its
+/// record says it held `fetched`, and it holds `now` — made without taking its lock (a claim
+/// dropped right before another one was seen still holding its lock while the parallel tests
+/// spawn processes). Returns the copy's path.
+#[cfg(test)]
+pub(crate) fn seed_copy(
+    cache: &Path,
+    host: &str,
+    abs: &str,
+    fetched: &[u8],
+    now: &[u8],
+) -> PathBuf {
+    let local = cache_path(cache, host, abs);
+    private_dir(local.parent().unwrap()).unwrap();
+    let record = meta_path(cache, "record", &local).unwrap();
+    private_dir(record.parent().unwrap()).unwrap();
+    use sha2::Digest as _;
+    write_record(&record, &sha2::Sha256::digest(fetched).into()).unwrap();
+    std::fs::write(&local, now).unwrap();
+    local
 }
 
 /// The session lock file of the cached copy `local`, open (created owner-only if new). Never
@@ -516,6 +848,90 @@ pub fn rfc3339(at: SystemTime) -> String {
 }
 
 #[cfg(test)]
+mod job_tests {
+    use super::*;
+
+    /// The sweep removes what a killed sopen's jobs left — a work folder, a staged render whose
+    /// lock nobody holds — and nothing else: a running job (its lock held), a folder or render
+    /// without a lock (a kept render a failed save named), an image's staged edit.
+    #[test]
+    fn the_sweep_removes_only_dead_jobs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = tmp.path();
+        let exports = exports_root(cache);
+        let edits = edits_path(cache, "box", "/srv/clip.mp4");
+        let made = |p: &Path, dir: bool| {
+            std::fs::create_dir_all(if dir { p } else { p.parent().unwrap() }).unwrap();
+            if !dir {
+                std::fs::write(p, b"x").unwrap();
+            }
+        };
+        let lock = |job: &Path| std::fs::write(lock_of(job), b"").unwrap();
+        let dead_work = exports.join("aaaa");
+        made(&dead_work, true);
+        std::fs::write(dead_work.join("partial.mp4"), b"x").unwrap();
+        lock(&dead_work);
+        let live_work = exports.join("bbbb");
+        let _held = JobLock::take(&live_work).unwrap();
+        made(&live_work, true);
+        let old_work = exports.join("cccc");
+        made(&old_work, true);
+        let dead_render = edits.with_file_name("clip.render-20261120T000000Z-1a2b.mp4");
+        made(&dead_render, false);
+        lock(&dead_render);
+        let kept_render = edits.with_file_name("clip.render-20261120T000000Z-3c4d.mp4");
+        made(&kept_render, false);
+        let image_edit = edits.with_file_name("shot.edited-20261120T000000Z-5e6f.png");
+        made(&image_edit, false);
+        lock(&image_edit);
+        let mut gone = sweep_stale_jobs(cache);
+        gone.sort();
+        let mut want = vec![dead_work.clone(), dead_render.clone()];
+        want.sort();
+        assert_eq!(gone, want);
+        assert!(!dead_work.exists() && !lock_of(&dead_work).exists());
+        assert!(!dead_render.exists() && !lock_of(&dead_render).exists());
+        for kept in [&live_work, &old_work, &kept_render, &image_edit] {
+            assert!(kept.exists(), "{} kept", kept.display());
+        }
+        assert!(lock_of(&live_work).exists(), "a running job's lock stays");
+    }
+
+    /// A sweep that opened a job's lock and then paused: meanwhile the job ended and kept its
+    /// render (a failed Save names it for the owner: its lock removed, then let go), or a new
+    /// job took a new lock of the same name. The sweep then gets the lock it opened — a file no
+    /// longer at that path — and leaves the job alone.
+    #[test]
+    fn a_sweep_never_removes_a_job_whose_lock_went_while_it_paused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = tmp.path();
+        let edits = edits_path(cache, "box", "/srv/clip.mp4");
+        let kept = edits.with_file_name("clip.render-20261120T000000Z-1a2b.mp4");
+        let again = edits.with_file_name("clip.render-20261120T000000Z-3c4d.mp4");
+        let mut held = Vec::new();
+        for render in [&kept, &again] {
+            held.push(Some(JobLock::take(render).unwrap()));
+            std::fs::write(render, b"the render").unwrap();
+        }
+        let mut retaken = None;
+        let gone = sweep_with(cache, &mut |lock: &Path| {
+            // Between the sweep's open and its lock.
+            if lock == lock_of(&kept) {
+                held[0].take();
+            } else if lock == lock_of(&again) {
+                held[1].take();
+                retaken = Some(JobLock::take(&again).unwrap());
+            }
+        });
+        assert!(gone.is_empty(), "{gone:?}");
+        assert_eq!(std::fs::read(&kept).unwrap(), b"the render", "kept");
+        assert!(!lock_of(&kept).exists());
+        assert!(again.exists() && lock_of(&again).exists(), "running again");
+        drop(retaken);
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::time::Duration;
@@ -549,17 +965,20 @@ mod tests {
             exports_root(root),
             root.join(META),
             root.join(SESSIONS),
+            root.join(PREVIEW),
         ];
         for host in [
             "backup",
             "edits",
             "exports",
             "sessions",
+            "preview",
             ".meta",
             ".backup",
             ".edits",
             ".exports",
             ".sessions",
+            ".preview",
         ] {
             let mirrored = cache_path(root, host, "/x");
             for r in &fixed {
@@ -883,6 +1302,143 @@ mod tests {
         let mode = std::fs::metadata(&referent).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o644);
         assert_eq!(std::fs::read_to_string(&referent).unwrap(), "referent");
+    }
+
+    /// A window's preview space is a private folder of its own under `.preview`; its names are
+    /// new ones in it (an extension kept when it is a plain one); dropped, the folder goes with
+    /// what is in it, and so does its lock.
+    #[test]
+    fn a_preview_space_is_private_and_goes_with_its_window() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let space = PreviewSpace::new(tmp.path()).unwrap();
+        let dir = space.dir().to_path_buf();
+        assert_eq!(dir.parent(), Some(tmp.path().join(PREVIEW).as_path()));
+        let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700);
+        let (a, b, c) = (
+            space.name("a.rs"),
+            space.name("photo.PNG"),
+            space.name("odd.t x"),
+        );
+        assert_eq!(a.path(), dir.join("0.rs"));
+        assert_eq!(b.path(), dir.join("1.png"));
+        assert_eq!(c.path(), dir.join("2"), "an odd extension is left out");
+        std::fs::write(a.path(), "copy").unwrap();
+        drop(a);
+        assert!(!dir.join("0.rs").exists(), "a dropped name is removed");
+        std::fs::write(b.path(), "still here").unwrap();
+        std::mem::forget(b);
+        drop(space);
+        assert!(!dir.exists(), "the folder goes with the window");
+        let left: Vec<_> = std::fs::read_dir(tmp.path().join(PREVIEW))
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name())
+            .collect();
+        assert!(left.is_empty(), "nothing left: {left:?}");
+    }
+
+    /// A new window removes the preview folders of windows that are gone — a folder whose lock
+    /// is free (its window crashed), or that has none — and leaves a live window's alone.
+    #[test]
+    fn a_new_preview_space_sweeps_the_folders_of_windows_that_are_gone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join(PREVIEW);
+        let live = PreviewSpace::new(tmp.path()).unwrap();
+        let copy = live.name("a.txt");
+        std::fs::write(copy.path(), "live").unwrap();
+        // A crashed window: its folder and its lock, not held.
+        std::fs::create_dir(root.join("dead")).unwrap();
+        std::fs::write(root.join("dead/0.txt"), "left behind").unwrap();
+        std::fs::write(root.join("dead.lock"), "").unwrap();
+        // A folder without a lock (no live window has one).
+        std::fs::create_dir(root.join("orphan")).unwrap();
+        let next = PreviewSpace::new(tmp.path()).unwrap();
+        assert!(!root.join("dead").exists() && !root.join("dead.lock").exists());
+        assert!(!root.join("orphan").exists());
+        assert_eq!(std::fs::read_to_string(copy.path()).unwrap(), "live");
+        assert!(next.dir().exists());
+    }
+
+    /// A window that cannot take its lock makes no folder (02 §4.4): a folder whose lock is free
+    /// looks like a crashed window's, and the next window's sweep would remove it under the live
+    /// one. Its lock file goes too, and nothing is left for a sweep to find.
+    #[test]
+    fn a_preview_space_whose_lock_fails_is_refused_and_leaves_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let unsupported =
+            || std::fs::TryLockError::Error(std::io::Error::from(std::io::ErrorKind::Unsupported));
+        let refused = PreviewSpace::new_with(tmp.path(), &mut |_| Err(unsupported()));
+        let err = format!("{:#}", refused.err().expect("refused"));
+        assert!(err.contains("cannot be locked"), "{err}");
+        let left: Vec<_> = std::fs::read_dir(tmp.path().join(PREVIEW))
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name())
+            .collect();
+        assert!(left.is_empty(), "nothing left: {left:?}");
+        // The next window, locks working, still starts.
+        assert!(PreviewSpace::new(tmp.path()).is_ok());
+    }
+
+    /// The hand-over's publish (02 §4.4, P6): the preview copy becomes the cached copy by a hard
+    /// link — the same inode, the preview name kept — claimed (locked) and recorded as a fetch
+    /// would; an earlier copy holding unsaved edits is moved aside first and said so; with the
+    /// shared copy held by another session, the link lands on a session copy of its own.
+    #[test]
+    fn a_preview_copy_is_published_by_a_hard_link_then_claimed_and_recorded() {
+        use std::os::unix::fs::MetadataExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let space = PreviewSpace::new(tmp.path()).unwrap();
+        let copy = space.name("a.txt");
+        std::fs::write(copy.path(), "fetched for the preview").unwrap();
+        let sha = crate::app::file_hash(copy.path()).unwrap();
+        // An earlier session's copy with an edit it never saved.
+        let cached = seed_copy(
+            tmp.path(),
+            "box",
+            "/d/a.txt",
+            b"fetched",
+            b"an unsaved edit",
+        );
+        let (held, notices) =
+            publish_claimed(copy.path(), "box", "/d/a.txt", tmp.path(), Some(&sha)).unwrap();
+        assert_eq!(held.local, cached);
+        let ino = |p: &Path| std::fs::metadata(p).unwrap().ino();
+        assert_eq!(ino(&cached), ino(copy.path()), "the same inode");
+        assert_eq!(
+            std::fs::read_to_string(copy.path()).unwrap(),
+            "fetched for the preview",
+            "the preview name stays"
+        );
+        assert_eq!(read_record(&held.record), Some(hex(&sha)), "recorded");
+        assert_eq!(notices.len(), 1, "{notices:?}");
+        assert!(notices[0].contains("unsaved edits"), "{notices:?}");
+        let kept = std::fs::read_dir(cached.parent().unwrap())
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .find(|p| p.to_string_lossy().contains(".conflict-"))
+            .expect("the edit was moved aside");
+        assert_eq!(std::fs::read_to_string(kept).unwrap(), "an unsaved edit");
+        let linked: Vec<_> = std::fs::read_dir(cached.parent().unwrap())
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().contains(".link-"))
+            .collect();
+        assert!(linked.is_empty(), "no link name left: {linked:?}");
+        // Held: a second publish (another window, same file) gets a session copy of its own.
+        let other = space.name("a.txt");
+        std::fs::write(other.path(), "another preview").unwrap();
+        let (second, _) =
+            publish_claimed(other.path(), "box", "/d/a.txt", tmp.path(), None).unwrap();
+        assert!(second.local.starts_with(tmp.path().join(SESSIONS)));
+        assert_eq!(ino(&second.local), ino(other.path()));
+        assert_eq!(
+            std::fs::read_to_string(&cached).unwrap(),
+            "fetched for the preview"
+        );
     }
 
     #[test]

@@ -513,7 +513,7 @@ impl Browser {
                 notices,
                 claim,
             } => (
-                super::media::embed(origin, media, &self.cache, notices),
+                super::media::embed(origin, *media, &self.cache, notices),
                 claim,
             ),
             Prepared::Hex { file, notices } => (super::hex::embed(file, notices), None),

@@ -5,6 +5,11 @@
 //! [`Doc`] is the edit model (decode, ops, history, encode) and [`ImageFile`] the write side;
 //! both are window-free, so the tests and the `SOPEN_AUTOSAVE` hook run the exact code the
 //! window's buttons run.
+//!
+//! As the file browser's preview (02 §4.2, [`embed_preview`]) the window shows the picture fitted,
+//! without toolbars, rows or prompt, and takes no input; [`dimensions`] and
+//! [`Doc::decode_checked`] are the preview's budget checks (the header before the decode, a stop
+//! at every read of it), [`fitted`] the picture it shows, made off the window's thread.
 
 pub mod clip;
 
@@ -281,11 +286,104 @@ fn format_name(format: ImageFormat) -> &'static str {
     }
 }
 
+/// The width and height an encoded image says it has, from its header alone (nothing is
+/// decoded): what a preview checks against its budget before decoding (02 §4.3).
+pub fn dimensions(bytes: &[u8]) -> Result<(u32, u32)> {
+    ImageReader::new(Cursor::new(bytes))
+        .with_guessed_format()
+        .context("cannot read the image")?
+        .into_dimensions()
+        .context("cannot read the image's size")
+}
+
+/// The encoded bytes as a decoder reads them, asking `check` before every read: a decode stops
+/// at its next read once `check` says to (a cancel, a preview's deadline). Decoders that read as
+/// they decode (PNG, GIF, BMP, TIFF) stop in the middle of the image; one that takes its input
+/// whole first stops before it decodes.
+struct Checked<'a> {
+    inner: Cursor<&'a [u8]>,
+    check: &'a dyn Fn() -> Result<()>,
+}
+
+impl Checked<'_> {
+    fn asked(&self) -> std::io::Result<()> {
+        (self.check)().map_err(|e| std::io::Error::other(format!("{e:#}")))
+    }
+}
+
+impl std::io::Read for Checked<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.asked()?;
+        self.inner.read(buf)
+    }
+}
+
+impl std::io::BufRead for Checked<'_> {
+    fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+        self.asked()?;
+        self.inner.fill_buf()
+    }
+
+    fn consume(&mut self, n: usize) {
+        self.inner.consume(n);
+    }
+}
+
+impl std::io::Seek for Checked<'_> {
+    fn seek(&mut self, to: std::io::SeekFrom) -> std::io::Result<u64> {
+        self.inner.seek(to)
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static DECODES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Tests: images decoded on this thread so far.
+#[cfg(test)]
+pub(crate) fn decodes() -> usize {
+    DECODES.with(std::cell::Cell::get)
+}
+
+/// The longest side of the picture a preview shows ([`fitted`]): a side of the browser on a
+/// large screen, at two pixels a point.
+pub const PREVIEW_SIDE: u32 = 2048;
+
+/// The picture a preview shows, made where the preview is prepared (off the window's thread):
+/// the image scaled down to fit [`PREVIEW_SIDE`] — `None` when it already fits (it is shown as
+/// it is). A 64-megapixel image made into a texture on the window's thread took over a second
+/// (E3).
+pub fn fitted(doc: &Doc) -> Option<image::RgbaImage> {
+    let (w, h) = doc.size();
+    (w > PREVIEW_SIDE || h > PREVIEW_SIDE)
+        .then(|| doc.img.thumbnail(PREVIEW_SIDE, PREVIEW_SIDE).to_rgba8())
+}
+
 impl Doc {
     /// Decodes `bytes` (format by content, not by name), applies the Exif orientation and keeps
     /// the ICC profile and Exif for the save.
     pub fn decode(bytes: &[u8]) -> Result<Self> {
-        let reader = ImageReader::new(Cursor::new(bytes))
+        Self::decode_checked(bytes, &|| Ok(()))
+    }
+
+    /// [`Doc::decode`], asking `check` before every read of the decoder and after the decode:
+    /// its error stops the decode and is the error returned (a cancel, a preview's deadline).
+    pub fn decode_checked(bytes: &[u8], check: &dyn Fn() -> Result<()>) -> Result<Self> {
+        let decoded = Self::decode_from(bytes, check);
+        // A decode cut short by `check` fails with an I/O error: `check`'s own is the reason.
+        check()?;
+        decoded
+    }
+
+    fn decode_from(bytes: &[u8], check: &dyn Fn() -> Result<()>) -> Result<Self> {
+        #[cfg(test)]
+        DECODES.with(|n| n.set(n.get() + 1));
+        let checked = Checked {
+            inner: Cursor::new(bytes),
+            check,
+        };
+        let reader = ImageReader::new(checked)
             .with_guessed_format()
             .context("cannot read the image")?;
         let format = reader
@@ -1265,6 +1363,12 @@ struct ImageWindow {
     held: Option<Held>,
     /// `SOPEN_STATE` `close=ask`: closing is asked for on the first pass.
     ask_close: bool,
+    /// A preview in the file browser (02 §4.2): the picture fitted in a single-lined frame, no
+    /// toolbars, status row or disclosures, and no input of its own.
+    preview: bool,
+    /// The picture a preview shows when the image is larger ([`fitted`], made off this thread);
+    /// the hand-over shows the image itself again.
+    shown: Option<image::RgbaImage>,
 }
 
 /// A Cut or Paste whose key has not been let go yet. egui-winit 0.37 drops winit's key-repeat
@@ -1342,7 +1446,17 @@ impl ImageWindow {
             text_colour: Color32::BLACK,
             held: None,
             ask_close: false,
+            preview: false,
+            shown: None,
         }
+    }
+
+    /// The window as a preview ([`embed_preview`]).
+    fn previewing(file: ImageFile, doc: Doc, shown: Option<image::RgbaImage>) -> Self {
+        let mut window = Self::new(file, doc, Selection::default(), DEFAULT_BLOCK, Vec::new());
+        window.preview = true;
+        window.shown = shown;
+        window
     }
 
     fn bounds(&self) -> Vec2 {
@@ -1618,7 +1732,7 @@ impl ImageWindow {
         }
         // F5 is PC Shell's Save, as Cmd/Ctrl+S — a plain key: not while a field (the block
         // size) has the typing.
-        if plain_key(ctx, Key::F5) {
+        if !ctx.egui_wants_keyboard_input() && super::hex::bare_key(ctx, Key::F5) {
             self.start(ctx, JobKind::Save { close_after: false });
         }
         if plain_key(ctx, Key::C) {
@@ -1794,8 +1908,11 @@ impl ImageWindow {
             let max = ctx.input(|i| i.max_texture_side) as u32;
             let (w, h) = self.doc.size();
             // A picture bigger than the GPU's texture limit is shown downscaled; edits still
-            // address the full-resolution pixels.
-            let shown = if w > max || h > max {
+            // address the full-resolution pixels. A preview shows the picture made for it.
+            let fitted = self.shown.as_ref().filter(|_| self.preview);
+            let shown = if let Some(fitted) = fitted {
+                fitted.clone()
+            } else if w > max || h > max {
                 self.doc.img.thumbnail(max, max).to_rgba8()
             } else {
                 self.doc.img.to_rgba8()
@@ -1871,11 +1988,20 @@ impl ImageWindow {
         let ctx = ui.ctx().clone();
         // The window's frame; the picture on black inside it.
         let outer = ui.max_rect();
-        let panel = super::chrome::frame(&ui.painter_at(outer), outer, TITLE, true);
+        // Single-lined in a preview: it does not have the keyboard.
+        let panel = super::chrome::frame(&ui.painter_at(outer), outer, TITLE, !self.preview);
         let src = self.bounds();
         let fit_scale = (panel.width() / src.x).min(panel.height() / src.y);
-        let resp = ui.allocate_rect(panel, Sense::click_and_drag());
-        self.navigate(ui, &resp, panel, fit_scale);
+        // A preview takes no click, drag or wheel: it is only looked at.
+        let sense = if self.preview {
+            Sense::hover()
+        } else {
+            Sense::click_and_drag()
+        };
+        let resp = ui.allocate_rect(panel, sense);
+        if !self.preview {
+            self.navigate(ui, &resp, panel, fit_scale);
+        }
         let scale = self.view.scale.unwrap_or(fit_scale);
         let center = self.view.center.unwrap_or((src / 2.0).to_pos2());
         let disp = Rect::from_min_size(panel.center() - center.to_vec2() * scale, src * scale);
@@ -1889,7 +2015,7 @@ impl ImageWindow {
             Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
             Color32::WHITE,
         );
-        if self.doc.read_only.is_none() && !self.prompt {
+        if self.doc.read_only.is_none() && !self.prompt && !self.preview {
             self.sel.handle(ui, &resp, map);
         }
         self.sel.draw(&painter, map);
@@ -1938,6 +2064,13 @@ impl ImageWindow {
 impl super::Window for ImageWindow {
     fn ui(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
+        if self.preview {
+            // The picture alone, fitted (02 §4.2): no keys, clipboard, toolbars, rows or prompt.
+            egui::CentralPanel::default()
+                .frame(egui::Frame::NONE)
+                .show(ui, |ui| self.zoom = self.central(ui));
+            return;
+        }
         if std::mem::take(&mut self.ask_close) {
             // `SOPEN_STATE` `close=ask`: as if closing were asked for (the prompt's receipt).
             self.close_requested();
@@ -2002,8 +2135,19 @@ impl super::Window for ImageWindow {
         super::chrome::IMAGE_KEYS
     }
 
+    /// A preview (02 §4.2) shows the picture fitted, without bars, and takes no input; `false`
+    /// (the hand-over) makes it the image window again, on the picture it already decoded (the
+    /// texture is made again at full size).
+    fn set_preview(&mut self, on: bool) {
+        if self.preview && !on {
+            self.tex_rev = None;
+            self.shown = None;
+        }
+        self.preview = on;
+    }
+
     fn close_requested(&mut self) -> bool {
-        if self.close_ok {
+        if self.close_ok || self.preview {
             return true;
         }
         if self.job.is_some() {
@@ -2040,6 +2184,22 @@ pub fn embed(file: ImageFile, doc: Doc, notices: Vec<String>) -> super::Embedded
     }
 }
 
+/// The image window as a preview in the file browser (02 §4.2): told it is one before its first
+/// pass, showing `shown` ([`fitted`], made where the preview was prepared) when the image is
+/// larger. Its hand-over is [`super::Window::set_preview`] `false`.
+pub fn embed_preview(
+    file: ImageFile,
+    doc: Doc,
+    shown: Option<image::RgbaImage>,
+) -> super::Embedded {
+    let window = ImageWindow::previewing(file, doc, shown);
+    let (outcome, leftover) = (window.outcome.clone(), window.leftover.clone());
+    super::Embedded {
+        window: Box::new(window),
+        settle: Box::new(move |wait| settle(&leftover, &outcome, wait)),
+    }
+}
+
 /// A save the window left running when it went away, as [`open`] waits for it: with `wait`
 /// waited for, else taken only once it has finished; printed and counted either way. The
 /// window's outcome once none runs.
@@ -2068,6 +2228,9 @@ mod input_tests;
 
 #[cfg(test)]
 mod robustness_tests;
+
+#[cfg(test)]
+mod preview_tests;
 
 #[cfg(test)]
 mod tests {

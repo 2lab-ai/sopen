@@ -371,7 +371,7 @@ fn a_folder_opens_in_the_browser_not_the_editor() {
     );
     assert!(out.status.success(), "{}", text(&out.stderr));
     // The CLI is detached (and a new script's first run can be slow); give it a moment.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     while !record.exists() && std::time::Instant::now() < deadline {
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
@@ -408,7 +408,7 @@ fn a_folder_without_a_display_opens_in_the_editor() {
         "{}",
         text(&out.stderr)
     );
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     while !record.exists() && std::time::Instant::now() < deadline {
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
@@ -457,7 +457,7 @@ fn code_takes_priority_over_zed_for_text() {
         "{}",
         text(&out.stdout)
     );
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     while !code_record.exists() && std::time::Instant::now() < deadline {
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
@@ -473,6 +473,9 @@ fn code_takes_priority_over_zed_for_text() {
     assert!(!zed_record.exists());
 }
 
+/// VS Code's CLI failing is the error, and Zed is not tried instead. `SOPEN_EDITOR_WAIT=60`:
+/// the failure is seen even when a loaded machine takes seconds to start the CLI and see it fail
+/// (the usual 3 s once ran out first and the run "succeeded"); the wait ends at its exit.
 #[test]
 fn code_failure_does_not_open_zed() {
     use std::os::unix::fs::PermissionsExt;
@@ -493,11 +496,46 @@ fn code_failure_does_not_open_zed() {
         &[
             ("SOPEN_CODE", code.to_str().unwrap()),
             ("SOPEN_ZED", zed.to_str().unwrap()),
+            ("SOPEN_EDITOR_WAIT", "60"),
         ],
     );
     assert_eq!(out.status.code(), Some(1));
     assert!(text(&out.stderr).contains("42"), "{}", text(&out.stderr));
     assert!(!marker.exists());
+}
+
+/// `SOPEN_EDITOR_WAIT` is a number of seconds, at most 120: no value makes sopen wait for an
+/// editor CLI that never exits (`exit`, once "until it exits", is not a number: the usual 3 s).
+#[test]
+fn an_editor_cli_that_never_exits_is_waited_for_a_bounded_time() {
+    let tmp = tempfile::tempdir().unwrap();
+    // The stand-in runs for as long as this file exists: removed at the end (and with the temp
+    // folder), so it never outlives the test, and no pid is ever signalled.
+    let alive = tmp.path().join("alive");
+    std::fs::write(&alive, b"").unwrap();
+    let code = tmp.path().join("code");
+    executable(
+        &code,
+        &format!(
+            "#!/bin/sh\nwhile [ -e '{}' ]; do sleep 0.1; done\n",
+            alive.display()
+        ),
+    );
+    let file = tmp.path().join("notes.txt");
+    std::fs::write(&file, "text").unwrap();
+    let begun = std::time::Instant::now();
+    let out = sopen(
+        tmp.path(),
+        &[file.to_str().unwrap()],
+        &[
+            ("SOPEN_CODE", code.to_str().unwrap()),
+            ("SOPEN_EDITOR_WAIT", "exit"),
+        ],
+    );
+    let took = begun.elapsed();
+    std::fs::remove_file(&alive).unwrap();
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert!(took < std::time::Duration::from_secs(30), "{took:?}");
 }
 
 #[test]
@@ -528,8 +566,9 @@ fn text_goes_to_the_editor_command() {
         "{}",
         text(&out.stdout)
     );
-    // The CLI is detached; give it a moment to write.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    // The CLI is detached; give it a moment to write (a new script's first run can take long on a
+    // loaded machine; the wait ends as soon as it has written).
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     let mut seen = String::new();
     while std::time::Instant::now() < deadline {
         seen = std::fs::read_to_string(&record).unwrap_or_default();

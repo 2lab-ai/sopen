@@ -11,8 +11,9 @@ editor). Text goes to VS Code when it
 is installed (remote ones only with its Remote - SSH extension), otherwise Zed's remote mode; images, video and
 audio open in sopen's own small window with exactly these edits: rectangle crop, rectangle pixelize and clipboard
 copy / cut / paste (images: cut leaves the background colour; paste lays a picture — stretched, fitted or 1:1 — or
-text into the rectangle), rectangle crop and time cut (video), time cut (audio), and — as a command, `sopen stems` —
-voice / music separation into two new files (spec §7a). Any other file (a zip, any binary) opens a dialog before
+text into the rectangle), rectangle crop, time cut and cut / copy / paste on the timeline (video), time cut,
+cut / copy / paste and Mono → Stereo (audio), and — as a command, `sopen stems` — voice / music separation into
+two new files (spec §7a). Any other file (a zip, any binary) opens a dialog before
 anything is downloaded: sopen's hex window (the default; byte overwrite only) or "Save to…" a chosen path;
 `--hex` opens any file in the hex window. It opens on the machine it was typed on, or — with `--target HOST`,
 `SOPEN_TARGET` or `target` in sopen's config — on HOST's screen, by running HOST's installed sopen with `--here`
@@ -47,22 +48,28 @@ downloaded and checked by build.rs; `SHERPA_ONNX_LIB_DIR` for offline builds); `
 - **Never overwrite silently.** Every write re-checks the remote file first (`lstat`: still a regular file,
   same `(size, mtime)`, same content hash up to 256 MiB) and refuses on change; writes go to a temp name in the
   same directory with the target's owner and mode and are renamed over the target. Spec §5 is the full rule.
-  Image and hex Save keep a local backup of the original first. Media exports always write a new sibling file and
-  never use a replacing rename to publish it. The binary dialog's "Save to…" fills a file in a private staging
-  folder and publishes it complete by a hard link, never over anything (spec §6a). The browser's rename, copy,
-  move and make folder never replace an existing name; a remote rename is SFTP's plain rename, never
+  Image, hex and media Save keep a local backup of the original first. Media exports always write a new sibling
+  file and never use a replacing rename to publish it. The binary dialog's "Save to…" fills a file in a private
+  staging folder and publishes it complete by a hard link, never over anything (spec §6a). The browser's rename,
+  copy, move and make folder never replace an existing name; a remote rename is SFTP's plain rename, never
   `posix-rename@openssh.com` (`.prd/04-file-keys.md` §5).
 - **Edit features come only from owner messages.** The viewers' edits are the list above (owner, 2026-11-11;
-  hex overwrite added by spec §1 message 9; image clipboard copy / cut / paste by message 12; voice / music
-  separation, `sopen stems`, by message 13), and the viewers
-  keep exactly those. The browser's own edits come from spec §1 messages 13–16: rename, copy, move, make folder
-  and delete (message 15, `.prd/04-file-keys.md`) and the git panel's actions on a repository, every history
-  rewrite or destructive one backed up first (message 14, `.prd/03-git-panel.md`). Anything beyond them waits
-  for an owner message.
+  hex overwrite added by spec §1 message 9; image clipboard copy / cut / paste by message 12; media cut / copy /
+  paste, audio Mono → Stereo and voice / music separation, `sopen stems`, by message 13), and the viewers keep
+  exactly those. The browser's own edits come from spec §1 messages 13–16: rename, copy, move, make folder and
+  delete (message 15, `.prd/04-file-keys.md`) and the git panel's actions on a repository, every history rewrite
+  or destructive one backed up first (message 14, `.prd/03-git-panel.md`). Anything beyond them waits for an
+  owner message.
 - **ffmpeg/ffprobe are external programs**, resolved at runtime (`SOPEN_FFMPEG` / `SOPEN_FFPROBE`, then PATH).
   Do not link libav*. The one linked engine is sherpa-onnx (with ONNX Runtime), statically, for `sopen stems`;
   its licences and those of what it brings are `THIRD-PARTY-NOTICES`, which must say what the binary links.
   The separation model is never in the repo or the release assets (the formula's resource; spec §7a).
+  ffmpeg versions differ in how they *decode* AAC trims a file carries: ffmpeg 9 applies an MP4 edit list's end
+  and Matroska's CodecDelay, ffmpeg 8 (Ubuntu 26.04's, the CI Linux runner's) applies neither — both write the
+  same trims. The render tests therefore hold an AAC render to a plain encode of the same sample count by the
+  same ffmpeg (`pcm_as_plain` in `src/cut/edit_tests.rs`) and read what the file declares without a decoder (an
+  MP4's `stts` and edit list must say exactly the timeline's samples; Matroska declares only its priming, as
+  CodecDelay, so there the end may run on by less than one AAC frame), and read frames with `-fps_mode passthrough`.
 - Tests must not need ssh or a network: the remote layer sits behind a trait with a local-filesystem
   implementation used by tests.
 - Public repo hygiene: no machine names, IP addresses, home-directory paths or session scratch paths in
@@ -80,9 +87,9 @@ prompts on close.
 
 | Hook | Effect |
 |---|---|
-| `SOPEN_STATE='rect=x,y,w,h;t=3.5;in=2;out=6;op=crop\|pixelize;block=16'` | Initial state in source pixels and seconds; `op` (images only, comma-separated, applied in order) uses `rect`. The hex window takes `at=OFFSET;patch=OFFSET:HEXBYTES[,OFFSET:HEXBYTES]` (offsets `0x…` or decimal): the cursor, and bytes overwritten in order, each an undo step. The file browser takes `open=NAME`: that entry of the folder is opened, as Enter would, once it is listed (with `SOPEN_SCREENSHOT`, the viewer is shot); and `at=OFFSET`: the first text file it opens — the `open=NAME` one, or else the first opened by hand — starts with the row that byte is in at the top (a place deep in a long line); later text files open at their top. The image and hex windows take `close=ask`: closing is asked for on the first pass, so an edit the state made brings up the unsaved-changes prompt (its receipt). |
+| `SOPEN_STATE='rect=x,y,w,h;t=3.5;in=2;out=6;op=crop\|pixelize;block=16'` | Initial state in source pixels and seconds; `op` (images only, comma-separated, applied in order) uses `rect`. The hex window takes `at=OFFSET;patch=OFFSET:HEXBYTES[,OFFSET:HEXBYTES]` (offsets `0x…` or decimal): the cursor, and bytes overwritten in order, each an undo step. The file browser takes `open=NAME`: that entry of the folder is opened, as Enter would, once it is listed (with `SOPEN_SCREENSHOT`, the viewer is shot); and `at=OFFSET`: the first text file it opens — the `open=NAME` one, or else the first opened by hand — starts with the row that byte is in at the top (a place deep in a long line); later text files open at their top. The image, hex and media windows take `close=ask`: closing is asked for on the first pass, so an edit the state made brings up the unsaved-changes prompt (its receipt). The media window takes `clips=START-END[,START-END]` (its edit list: source seconds in output order) and `stereo=1` (Mono → Stereo, mono audio only). |
 | `SOPEN_SCREENSHOT=<png>` | Open the window, render the state, write a screenshot of the window, exit. Prints `screenshot <png> <w>x<h> title="<host:/abs>" focused=<bool> …`. `SOPEN_WATCHDOG=<s>` (default 30) ends a stalled run. |
-| `SOPEN_AUTOSAVE=1` | Images and the hex window: apply the state and Save without a window (backup, conflict-checked overwrite); exit 0 saved, 3 refused. `SOPEN_AUTOSAVE_DELAY_MS=<ms>` waits before the write so a second process can change the remote (the conflict receipt). |
+| `SOPEN_AUTOSAVE=1` | Images, the hex window and media (an edit from `clips=` / `stereo=1`): apply the state and Save without a window (backup, conflict-checked overwrite); exit 0 saved, 3 refused. `SOPEN_AUTOSAVE_DELAY_MS=<ms>` waits before the write so a second process can change the remote (the conflict receipt). |
 | `SOPEN_CHOICE=hex\|save\|cancel` | Answers the binary-file dialog: `hex` starts the fetch at once in the window, which becomes the hex window, as Enter would (with `SOPEN_SCREENSHOT`, the hex window is shot after the switch; with `SOPEN_AUTOSAVE`, no window: fetched and saved); `save` downloads to `SOPEN_SAVE_TO` without a window and prints `saved <path>` (a taken path is exit 1, naming the next free name); `cancel` downloads nothing. Without it, `SOPEN_SCREENSHOT` shoots the dialog and nothing is downloaded, and `SOPEN_AUTOSAVE` on a binary file is an error (nothing would answer the dialog). |
 | `SOPEN_LIST=1` | A folder: print what the file browser lists (the path, a row per entry — Name, Ext, Size, Date, Time — and the `N Listed = N bytes` foot) instead of opening the window. A scripted save or export (`SOPEN_AUTOSAVE`, `SOPEN_AUTOEXPORT`) on a folder is an error. |
 | `SOPEN_SAVE_TO=<path>` | Where the dialog's "Save to…" saves (the path field's first value; a folder gets the file's name), instead of the download folder — no native dialog. |
@@ -93,6 +100,7 @@ prompts on close.
 | `SOPEN_CODE=<path>` | Use this VS Code CLI for text and for the file browser's F4 (a folder itself opens in the browser); an empty value means VS Code is absent. A local setting, not forwarded by `--target`. |
 | `VSCODE_EXTENSIONS=<dir>` | VS Code's own extensions-dir variable; when non-empty sopen looks there (instead of `~/.vscode/extensions`) for Remote - SSH before opening a remote path in VS Code. Tests point it at a temp dir. Not forwarded by `--target`. |
 | `SOPEN_RAISE=0\|wait` | KDE Plasma (spec §3, msg 11): `0` leaves the editor's window where KWin put it (tests/cli.rs sets it, so a test run in a KDE session never moves a real window); `wait` brings it forward in sopen's own process, about 3 s, instead of a detached `sopen --raise-window`, so a test sees every D-Bus call before sopen exits. HOST's own setting: not forwarded by `--target`. |
+| `SOPEN_EDITOR_WAIT=<seconds>` | How long sopen waits for the editor CLI (VS Code, Zed) to exit before it counts as handed off — default 3, at most 120 (anything else: 3); the wait ends as soon as the CLI exits. tests/cli.rs sets 60 where a stand-in CLI fails, so a loaded machine still sees the failure. Never unbounded. A local setting, not forwarded by `--target`. |
 | `sopen --raise-window code\|zed --raise-caption=<name>` | Hidden, internal: the detached child. It loads one KWin script for the opened `<name>` and runs it once, through `busctl --user` (else `qdbus6`/`qdbus`) on PATH, then unloads it ~3 s later. It prints nothing and always exits 0. Tests run it with a stand-in `busctl` first on PATH. The script's behaviour is tested under node against a stand-in `workspace` with signals (`tests/kwin-script.mjs`). |
 | `SOPEN_TARGET_BIN=<path>` | `--target` runs this sopen binary on HOST (a build not installed there yet) instead of the one on HOST's PATH or in its Homebrew / cargo install paths. A `--target` run carries this and the hooks above, and `SOPEN_LOG`, to HOST; settings naming local paths stay here. |
 | `SOPEN_CONFIG=<file>` | The config file to use instead of `$XDG_CONFIG_HOME/sopen/config.toml` / `~/.config/sopen/config.toml` (tests point it at a temp file, so the owner's default target never forwards a test run). |

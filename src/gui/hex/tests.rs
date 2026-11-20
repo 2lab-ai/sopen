@@ -2549,3 +2549,32 @@ fn close_ask_brings_up_the_prompt_in_the_dialog_look() {
     assert_eq!(fill, cga::BLACK, "hovered: inverted");
     assert_eq!(label, vec![cga::CYAN], "hovered: cyan on black");
 }
+
+/// 04 §3: a viewer's own F-key acts with no modifier at all — Shift+F5 or Alt+F5 saves nothing,
+/// Shift+F6 opens no Go to, Shift+F8 moves no column (egui's `consume_key` ignores an extra Shift
+/// or Alt) — while the bare keys still act.
+#[test]
+fn the_f_keys_act_only_without_modifiers() {
+    let mut fx = fetched("blob.bin", FIXTURE, 1000.0, 600.0);
+    fx.typed("7A");
+    assert!(fx.win.doc.dirty());
+    let starts = fx.win.save_starts;
+    let pane = fx.win.cursor.pane;
+    for mods in [Modifiers::SHIFT, Modifiers::ALT] {
+        for key in [Key::F5, Key::F6, Key::F8] {
+            fx.key(key, mods);
+        }
+    }
+    assert_eq!(fx.win.save_starts, starts, "no save");
+    assert_ne!(
+        fx.drv.ctx.memory(|m| m.focused()),
+        Some(goto_id()),
+        "no Go to"
+    );
+    assert_eq!(fx.win.cursor.pane, pane, "no column");
+    fx.key(Key::F8, Modifiers::NONE);
+    assert_ne!(fx.win.cursor.pane, pane, "F8 alone moves the column");
+    fx.key(Key::F5, Modifiers::NONE);
+    assert_eq!(fx.win.save_starts, starts + 1, "F5 alone saves");
+    fx.wait_for_save();
+}
