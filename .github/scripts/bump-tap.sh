@@ -3,8 +3,10 @@
 #
 # Renders Formula/$FORMULA.rb from THIS repo's packaging/homebrew/$FORMULA.rb.tmpl
 # (the checkout the job runs in) with the sha256s of the assets the release job
-# just uploaded — the same bytes brew will download — and pushes only that
-# rendered file to the tap. The tap carries no templates.
+# just uploaded — the same bytes brew will download: the four binaries and
+# THIRD-PARTY-NOTICES, which the formula installs next to them — and pushes only
+# that rendered file to the tap. The tap carries no templates. (The voice/music
+# model is a resource with its own fixed url and sha256 in the template.)
 #
 #   FORMULA=sopen-preview   TAG=preview-$BUILD_ID   brew version YYYY.MM.DD.HHMM
 #   FORMULA=sopen           TAG=v<X.Y.Z>            brew version X.Y.Z
@@ -24,7 +26,8 @@
 #   TAG           required   preview-$BUILD_ID, or v<X.Y.Z>
 #   BUILD_ID      preview    YYYY-MM-DD-HHMM-<sha12>
 #   GH_TOKEN      required   token with push access to the tap
-#   RELEASE_DIR   optional   dir holding the published assets (default: release)
+#   RELEASE_DIR   optional   dir holding the published assets: sopen-<os>-<arch> ×4
+#                            and THIRD-PARTY-NOTICES (default: release)
 #   TEMPLATE_DIR  optional   default packaging/homebrew
 #   TAP_REPO      optional   default 2lab-ai/homebrew-tap
 #   TAP_REMOTE    optional   default https://github.com/$TAP_REPO.git
@@ -56,6 +59,7 @@ render() {
     -e "s/@SHA_MACOS_X86_64@/$SHA_MACOS_X86_64/" \
     -e "s/@SHA_LINUX_AARCH64@/$SHA_LINUX_AARCH64/" \
     -e "s/@SHA_LINUX_X86_64@/$SHA_LINUX_X86_64/" \
+    -e "s/@SHA_NOTICES@/$SHA_NOTICES/" \
     "$TEMPLATE" > "$TAP_DIR/$OUT"
   ruby -c "$TAP_DIR/$OUT" > /dev/null ||
     fail "rendered formula is not valid ruby"
@@ -152,14 +156,16 @@ main() {
   # Plain variables, not an associative array: this script must also run under
   # the bash 3.2 a macOS contributor gets from `/usr/bin/env bash`.
   local name
-  for name in sopen-macos-aarch64 sopen-macos-x86_64 sopen-linux-aarch64 sopen-linux-x86_64; do
+  for name in sopen-macos-aarch64 sopen-macos-x86_64 sopen-linux-aarch64 sopen-linux-x86_64 \
+    THIRD-PARTY-NOTICES; do
     [ -f "$RELEASE_DIR/$name" ] || fail "missing published asset $RELEASE_DIR/$name"
   done
-  local SHA_MACOS_AARCH64 SHA_MACOS_X86_64 SHA_LINUX_AARCH64 SHA_LINUX_X86_64
+  local SHA_MACOS_AARCH64 SHA_MACOS_X86_64 SHA_LINUX_AARCH64 SHA_LINUX_X86_64 SHA_NOTICES
   SHA_MACOS_AARCH64="$(sha256_of "$RELEASE_DIR/sopen-macos-aarch64")"
   SHA_MACOS_X86_64="$(sha256_of "$RELEASE_DIR/sopen-macos-x86_64")"
   SHA_LINUX_AARCH64="$(sha256_of "$RELEASE_DIR/sopen-linux-aarch64")"
   SHA_LINUX_X86_64="$(sha256_of "$RELEASE_DIR/sopen-linux-x86_64")"
+  SHA_NOTICES="$(sha256_of "$RELEASE_DIR/THIRD-PARTY-NOTICES")"
 
   # Ephemeral credential helper on this runner; the token stays in the env.
   gh auth setup-git --hostname github.com ||

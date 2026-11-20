@@ -16,7 +16,7 @@ pub struct Record {
     pub ext: Option<String>,
     pub bytes: u64,
     pub fetch_ms: u64,
-    /// `open` | `save` | `export` | `cut` | `discard`.
+    /// `open` | `save` | `export` | `cut` | `stems` | `discard`.
     pub action: Option<&'static str>,
     pub conflict: bool,
     /// False when the run ended in an error (§10: a failed write is fixed before anything else).
