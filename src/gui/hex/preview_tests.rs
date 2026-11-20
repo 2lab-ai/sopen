@@ -163,3 +163,62 @@ fn a_handed_over_hex_viewer_takes_input_and_shows_its_bars() {
     fx.drv.idle(&mut fx.win, 1);
     assert_eq!(fx.win.doc.byte(0), Some(0x41), "typing overwrites again");
 }
+
+/// A list beside the preview, as the browser has it: it holds the keyboard and reads its own
+/// keys (↓ counted), then the previewed hex window is drawn — on its own, not disabled.
+struct ListAndPreview {
+    win: HexWindow,
+    downs: usize,
+}
+
+fn list_id() -> egui::Id {
+    egui::Id::unique("the-list-beside")
+}
+
+impl crate::gui::Window for ListAndPreview {
+    fn ui(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
+        let list = ui.interact(
+            egui::Rect::from_min_size(Pos2::ZERO, egui::vec2(10.0, 10.0)),
+            list_id(),
+            egui::Sense::click(),
+        );
+        if !list.has_focus() {
+            list.request_focus();
+        }
+        if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::ArrowDown)) {
+            self.downs += 1;
+        }
+        self.win.ui(ui);
+    }
+    fn ready(&self) -> bool {
+        self.win.ready()
+    }
+}
+
+/// E3's leak: with the list holding the keyboard, a previewed hex window never takes it — after
+/// every pass the list has it — and the list's keys still reach it.
+#[test]
+fn a_previewed_hex_viewer_leaves_the_lists_keyboard_alone() {
+    let fx = previewed();
+    let mut host = ListAndPreview {
+        win: fx.win,
+        downs: 0,
+    };
+    let mut drv = Driver::new(700.0, 500.0);
+    for _ in 0..5 {
+        drv.idle(&mut host, 1);
+        assert_eq!(
+            drv.ctx.memory(|m| m.focused()),
+            Some(list_id()),
+            "the list has it"
+        );
+    }
+    let before = host.win.cursor;
+    for _ in 0..3 {
+        drv.key(&mut host, Key::ArrowDown, Modifiers::NONE);
+        assert_eq!(drv.ctx.memory(|m| m.focused()), Some(list_id()));
+    }
+    assert_eq!(host.downs, 3, "the list got its keys");
+    assert_eq!(host.win.cursor, before, "the preview did not");
+}

@@ -173,6 +173,11 @@ impl TextDoc {
             .with_context(|| format!("cannot stat {}", path.display()))?;
         let opened = identity(&meta);
         let mut scan = Scan::default();
+        if cap().is_some() {
+            // A pass that may stop short hashes what it reads: its resume can then tell the
+            // bytes it indexed are still the file's when the file was written to since.
+            scan.hasher = Some(sha2::Sha256::default());
+        }
         scan.run(&file, path, opened.2, cap, check, on_chunk)?;
         let mut doc = Self::indexed(file, scan, opened, path.to_path_buf());
         doc.indexed_in = started.elapsed();
@@ -238,6 +243,45 @@ impl TextDoc {
         self.resume_counted(cancel, &mut |_| {})
     }
 
+    /// The bytes a stopped pass indexed are still the file's: the open handle and the path show
+    /// the same file, no shorter ([`TextDoc::now`]), and the first and last [`CHECKED`] bytes it
+    /// read read the same now. When the file was written to since (its size or modification
+    /// time moved: appended to, or written over in place — they cannot be told apart), all of
+    /// those bytes are read once more and must hash as they did; they are not indexed again.
+    fn prefix_unchanged(&self, file: &File, scan: &Scan) -> bool {
+        let written = match self.now_since_pass() {
+            Now::Same => false,
+            Now::Grown => true,
+            Now::Changed | Now::Gone => return false,
+        };
+        let same = |at: u64, want: &[u8]| {
+            let mut got = vec![0u8; want.len()];
+            file.read_exact_at(&mut got, at).is_ok() && got == want
+        };
+        let tail_at = scan.at.saturating_sub(scan.tail.len() as u64);
+        if !same(0, &scan.head) || !same(tail_at, &scan.tail) {
+            return false;
+        }
+        if !written {
+            return true;
+        }
+        let Some(want) = scan.hasher.clone().map(sha2::Digest::finalize) else {
+            return false;
+        };
+        let mut hasher = sha2::Sha256::default();
+        let mut buf = vec![0u8; PASS_READ];
+        let mut at = 0u64;
+        while at < scan.at {
+            let n = (scan.at - at).min(buf.len() as u64) as usize;
+            if file.read_exact_at(&mut buf[..n], at).is_err() {
+                return false;
+            }
+            sha2::Digest::update(&mut hasher, &buf[..n]);
+            at += n as u64;
+        }
+        sha2::Digest::finalize(hasher) == want
+    }
+
     /// [`TextDoc::resume`], with `on_chunk(bytes indexed so far)` after every chunk.
     fn resume_counted(
         &self,
@@ -253,6 +297,13 @@ impl TextDoc {
             Some(rest) => rest.clone(),
             None => return self.share(),
         };
+        // The marks found so far describe the bytes as they were read: they are joined to the
+        // rest only if those bytes are still there — the same file, no shorter, and its first and
+        // last bytes read the same. Written over in place (the inode and the size cannot tell),
+        // truncated and written again: Stale, and the file is read again whole.
+        if !self.prefix_unchanged(&file, &scan) {
+            return Err(anyhow::Error::new(Stale));
+        }
         scan.capped = false;
         scan.run(
             &file,
@@ -641,7 +692,16 @@ struct Scan {
     marks: Vec<Mark>,
     /// The pass stopped at its cap, short of the file as opened.
     capped: bool,
+    /// The file's first bytes and the last ones the pass read (up to [`CHECKED`] each): what a
+    /// resume reads again first, to know the bytes it indexed are still there.
+    head: Vec<u8>,
+    tail: Vec<u8>,
+    /// The hash of every byte read, for a pass that may stop short (a preview's).
+    hasher: Option<sha2::Sha256>,
 }
+
+/// Bytes at each end of a stopped pass that its resume checks.
+const CHECKED: usize = 4096;
 
 /// Bytes an index pass reads at a time (the cancel and the cap are looked at between reads).
 const PASS_READ: usize = 1 << 20;
@@ -689,6 +749,16 @@ impl Scan {
             }
             #[cfg(test)]
             log_index_read(path, self.at, n as u64);
+            if self.at == 0 {
+                self.head = buf[..n.min(CHECKED)].to_vec();
+            }
+            if let Some(hasher) = self.hasher.as_mut() {
+                sha2::Digest::update(hasher, &buf[..n]);
+            }
+            let kept = self.tail.len().min(CHECKED.saturating_sub(n));
+            self.tail.drain(..self.tail.len() - kept);
+            self.tail
+                .extend_from_slice(&buf[n.saturating_sub(CHECKED)..n]);
             for (i, &b) in buf[..n].iter().enumerate() {
                 if b != b'\n' {
                     self.line_len += 1;
@@ -1721,6 +1791,11 @@ impl TextWindow {
                 self.waiting = false;
                 self.gone = true;
                 self.status = Status::error("the file was deleted");
+            }
+            Err(e) if resumed && is_stale(&e) => {
+                // Written over since the preview read it: read again whole, after the usual wait.
+                self.waiting = true;
+                self.status = Status::info("the file changed; re-reading it in a moment…");
             }
             Err(e) => {
                 // Tried again after the usual wait — a failed resume too, as a whole re-read.

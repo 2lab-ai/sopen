@@ -16,23 +16,107 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-/// What crossed a connection: bytes of file content read (`read_to`, also inside a fetch), heads
-/// read for the sniff, and every `read_to` asked (path, bytes).
+/// What a test runs after a request: its name and path.
+type After = Box<dyn FnMut(&str, &str) + Send>;
+
+/// What crossed the connections a test opened. `content` counts the bytes a reader accepted;
+/// `responses` is what the server sent, one entry per SFTP read response as it reached the reader
+/// (`read_to`'s sink writes each response once, whole), with its range in the file — the read
+/// boundary, also for bytes the reader then refused. `ops` logs every request made, in order.
 #[derive(Default)]
 struct Counts {
     content: AtomicU64,
     heads: AtomicU64,
     reads: Mutex<Vec<(String, u64)>>,
+    responses: Mutex<Vec<(String, u64, u64)>>,
+    ops: Mutex<Vec<String>>,
+    /// Connections alive now, and the most at once.
+    live: AtomicUsize,
+    peak: AtomicUsize,
+    /// Called after every request, with its name and path (tests: a cancel, a change, a gate).
+    after: Mutex<Option<After>>,
+    /// Every lstat fails with this, the session staying healthy (a path error).
+    lstat_error: Mutex<Option<std::io::ErrorKind>>,
+    /// Called on the first read response, before the reader gets it (tests: hold the read).
+    gate: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
-/// A connection that counts what is read through it.
+impl Counts {
+    fn op(&self, op: &str, path: &str) {
+        self.ops.lock().unwrap().push(format!("{op} {path}"));
+        if let Some(after) = self.after.lock().unwrap().as_mut() {
+            after(op, path);
+        }
+    }
+
+    fn ops(&self) -> Vec<String> {
+        self.ops.lock().unwrap().clone()
+    }
+
+    /// The read responses for `path`, `(offset, bytes)`.
+    fn responses(&self, path: &str) -> Vec<(u64, u64)> {
+        let all = self.responses.lock().unwrap();
+        all.iter()
+            .filter(|(p, _, _)| p == path)
+            .map(|&(_, at, n)| (at, n))
+            .collect()
+    }
+}
+
+/// A connection that counts what is read through it. `dead`: its session is gone (every request
+/// fails).
 struct Counting {
     inner: Box<dyn RemoteFs + Send>,
     counts: Arc<Counts>,
+    dead: bool,
 }
 
+impl Counting {
+    fn new(inner: Box<dyn RemoteFs + Send>, counts: &Arc<Counts>) -> Self {
+        let live = counts.live.fetch_add(1, Ordering::SeqCst) + 1;
+        counts.peak.fetch_max(live, Ordering::SeqCst);
+        Self {
+            inner,
+            counts: counts.clone(),
+            dead: false,
+        }
+    }
+
+    /// A connection whose session is gone.
+    fn dead(mut self) -> Self {
+        self.dead = true;
+        self
+    }
+
+    fn alive(&self) -> Result<()> {
+        if self.dead {
+            bail!("the session was lost");
+        }
+        Ok(())
+    }
+
+    /// `op` on a dead session: logged (it was asked), then failed.
+    fn dead_op(&self, op: &str, p: &str) -> Result<()> {
+        if self.dead {
+            self.counts.op(op, p);
+        }
+        self.alive()
+    }
+}
+
+impl Drop for Counting {
+    fn drop(&mut self) {
+        self.counts.live.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// What a reader gets: each write is one SFTP read response, recorded with its range at the
+/// boundary, held at the gate the first time, then handed on.
 struct CountingWriter<'a> {
     out: &'a mut dyn std::io::Write,
+    counts: &'a Counts,
+    path: &'a str,
+    at: u64,
     n: u64,
 }
 
@@ -42,6 +126,24 @@ impl std::io::Write for CountingWriter<'_> {
         self.n += n as u64;
         Ok(n)
     }
+    fn write_all(&mut self, buf: &[u8]) -> std::io::Result<()> {
+        self.counts.responses.lock().unwrap().push((
+            self.path.to_string(),
+            self.at,
+            buf.len() as u64,
+        ));
+        self.at += buf.len() as u64;
+        let gate = self.counts.gate.lock().unwrap().take();
+        if let Some(gate) = gate {
+            gate();
+        }
+        let mut rest = buf;
+        while !rest.is_empty() {
+            let n = self.write(rest)?;
+            rest = &rest[n..];
+        }
+        Ok(())
+    }
     fn flush(&mut self) -> std::io::Result<()> {
         self.out.flush()
     }
@@ -49,25 +151,44 @@ impl std::io::Write for CountingWriter<'_> {
 
 impl RemoteFs for Counting {
     fn stat_opt(&mut self, p: &str) -> Result<Option<Stat>> {
-        self.inner.stat_opt(p)
+        self.dead_op("stat", p)?;
+        let got = self.inner.stat_opt(p);
+        self.counts.op("stat", p);
+        got
     }
     fn lstat_opt(&mut self, p: &str) -> Result<Option<Stat>> {
-        self.inner.lstat_opt(p)
+        self.dead_op("lstat", p)?;
+        let injected = *self.counts.lstat_error.lock().unwrap();
+        let got =
+            match injected {
+                Some(kind) => Err(anyhow::Error::new(std::io::Error::from(kind))
+                    .context(format!("cannot stat {p}"))),
+                None => self.inner.lstat_opt(p),
+            };
+        self.counts.op("lstat", p);
+        got
     }
     fn realpath(&mut self, p: &str) -> Result<String> {
-        self.inner.realpath(p)
+        self.alive()?;
+        let got = self.inner.realpath(p);
+        self.counts.op("realpath", p);
+        got
     }
     fn read_head(&mut self, p: &str, max: usize) -> Result<Vec<u8>> {
+        self.alive()?;
         let head = self.inner.read_head(p, max)?;
         self.counts
             .heads
             .fetch_add(head.len() as u64, Ordering::Relaxed);
+        self.counts.op("read_head", p);
         Ok(head)
     }
     fn list_dir(&mut self, p: &str) -> Result<Vec<String>> {
+        self.alive()?;
         self.inner.list_dir(p)
     }
     fn list_entries(&mut self, p: &str) -> Result<Vec<crate::remote::Entry>> {
+        self.alive()?;
         self.inner.list_entries(p)
     }
     fn read_to(
@@ -76,14 +197,20 @@ impl RemoteFs for Counting {
         out: &mut dyn std::io::Write,
         progress: &mut dyn FnMut(u64),
     ) -> Result<u64> {
-        let mut counted = CountingWriter { out, n: 0 };
+        self.alive()?;
+        let counts = self.counts.clone();
+        let mut counted = CountingWriter {
+            out,
+            counts: &counts,
+            path: p,
+            at: 0,
+            n: 0,
+        };
         let result = self.inner.read_to(p, &mut counted, progress);
-        self.counts.content.fetch_add(counted.n, Ordering::Relaxed);
-        self.counts
-            .reads
-            .lock()
-            .unwrap()
-            .push((p.to_string(), counted.n));
+        let n = counted.n;
+        self.counts.content.fetch_add(n, Ordering::Relaxed);
+        self.counts.reads.lock().unwrap().push((p.to_string(), n));
+        self.counts.op("read_to", p);
         result
     }
     fn create_from(
@@ -129,6 +256,14 @@ struct Fx {
     label: Option<&'static str>,
 }
 
+/// A session to "host `box`" (this machine's SFTP server), or the local disk.
+fn inner_for(label: Option<&str>) -> Box<dyn RemoteFs + Send> {
+    match label {
+        Some(_) => Box::new(SftpRemote::local_server().expect("sftp-server")),
+        None => Box::new(crate::remote::LocalFs::new()),
+    }
+}
+
 /// `None` (the test skips) where OpenSSH's `sftp-server` is not installed — a failure instead
 /// with `SOPEN_REQUIRE_SFTP_SERVER` (CI).
 fn remote() -> Option<Fx> {
@@ -152,14 +287,8 @@ fn fixture(label: Option<&'static str>) -> Fx {
     let (n, c) = (sessions.clone(), counts.clone());
     let connect: Connect = Arc::new(move || {
         n.fetch_add(1, Ordering::SeqCst);
-        let inner: Box<dyn RemoteFs + Send> = match label {
-            Some(_) => Box::new(SftpRemote::local_server().expect("sftp-server")),
-            None => Box::new(crate::remote::LocalFs::new()),
-        };
-        Ok(Box::new(Counting {
-            inner,
-            counts: c.clone(),
-        }) as Box<dyn RemoteFs + Send>)
+        c.op("connect", "");
+        Ok(Box::new(Counting::new(inner_for(label), &c)) as Box<dyn RemoteFs + Send>)
     });
     Fx {
         _tmp: tmp,
@@ -424,10 +553,33 @@ fn a_remote_read_stops_at_the_budget() {
     .unwrap()
     .show();
     assert_eq!(card_why(&p), "over the preview limit: Enter opens it");
-    // Stopped at the first progress report past the budget: SFTP reads ahead a few chunks.
-    let read = fx.counts.content.load(Ordering::Relaxed);
-    assert!(read <= (100 << 10) + (1 << 20), "read {read} bytes");
+    // At the read boundary: what the server sent, response by response, read once, in order —
+    // and no further than the response that crossed the budget (the SFTP reader asks for the
+    // next response only after the last one was taken: nothing else is in flight).
+    let responses = fx.counts.responses(&abs);
+    assert_ranges_once(&responses);
+    let sent: u64 = responses.iter().map(|r| r.1).sum();
+    assert!(
+        sent <= (100 << 10) + SFTP_RESPONSE,
+        "the server sent {sent} bytes"
+    );
+    assert_eq!(fx.counts.reads.lock().unwrap().len(), 1, "one read");
+    // What the copy took: never past the budget.
+    let taken = fx.counts.content.load(Ordering::Relaxed);
+    assert!(taken <= 100 << 10, "the copy took {taken} bytes");
     assert!(fx.preview_copies().is_empty(), "{:?}", fx.preview_copies());
+}
+
+/// The most one SFTP read response carries: the reader's request size (`sftp.rs` `CHUNK`).
+const SFTP_RESPONSE: u64 = 256 << 10;
+
+/// Read responses that cover the file from its start, each once, in order.
+fn assert_ranges_once(responses: &[(u64, u64)]) {
+    let mut at = 0;
+    for &(offset, n) in responses {
+        assert_eq!(offset, at, "a range read twice or skipped: {responses:?}");
+        at += n;
+    }
 }
 
 /// P3 (local): an image whose header says 30000×30000 shows `image is 30000×30000; Enter opens
@@ -591,6 +743,7 @@ fn a_handed_over_remote_preview_is_published_by_a_hard_link_and_reconnects_on_us
     let Some(mut fx) = remote() else { return };
     let bytes = png(64, 48);
     let abs = fx.file("photo.png", &bytes);
+    let decoded = crate::gui::image::decodes();
     let p = fx.preview(&abs);
     assert!(p.card().is_none(), "{}", card_why(&p));
     assert_eq!(
@@ -601,6 +754,10 @@ fn a_handed_over_remote_preview_is_published_by_a_hard_link_and_reconnects_on_us
     let copy = fx.preview_copies().remove(0);
     let cached = crate::cache::cache_path(&fx.cache, "box", &abs);
     assert!(!cached.exists(), "nothing published before the hand-over");
+    // Before the hand-over the preview holds nothing: another session gets the shared copy.
+    let other = crate::cache::claim(&fx.cache, "box", &abs).unwrap();
+    assert!(other.note.is_none(), "not held by the preview");
+    drop(other);
     let mut handed = p.hand_over().ok().expect("a viewer");
     assert!(handed.notices.is_empty(), "{:?}", handed.notices);
     let hold = handed.hold.take().expect("claimed");
@@ -619,6 +776,11 @@ fn a_handed_over_remote_preview_is_published_by_a_hard_link_and_reconnects_on_us
         "one read, of the whole file"
     );
     assert_eq!(fx.sessions.load(Ordering::SeqCst), 1, "no session yet");
+    // Held from the hand-over on: another session gets a copy of its own.
+    let other = crate::cache::claim(&fx.cache, "box", &abs).unwrap();
+    assert!(other.note.is_some(), "held by the viewer");
+    assert_ne!(other.local, cached);
+    drop(other);
     let mut drv = Driver::new(800.0, 600.0);
     let mut win = Host(&mut handed.embedded.window);
     shown(&mut drv, &mut win);
@@ -645,11 +807,34 @@ fn a_handed_over_remote_preview_is_published_by_a_hard_link_and_reconnects_on_us
         copy.exists(),
         "the viewer's name lives while it may still write"
     );
-    while settle(true).is_none() {}
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while settle(true).is_none() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the viewer never settled"
+        );
+    }
     drop(settle);
     assert!(!copy.exists(), "the preview name goes with the viewer");
     assert!(cached.exists(), "the cached copy stays");
+    assert_eq!(
+        crate::gui::image::decodes(),
+        decoded + 1,
+        "decoded once: for the preview, never again"
+    );
     drop(hold);
+    // Released with the viewer: the next session gets the shared copy again. (A process forked
+    // by a parallel test can hold the lock's descriptor for a moment: asked again until then.)
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let other = crate::cache::claim(&fx.cache, "box", &abs).unwrap();
+        if other.note.is_none() {
+            assert_eq!(other.local, cached);
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "never released");
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }
 
 /// P4: twenty quick moves — each preview cancelled at once, mid-read, or after it is ready and
@@ -815,18 +1000,45 @@ fn enter_on_a_card_reuses_its_complete_unchanged_copy() {
 fn a_lifted_budget_lets_the_preparation_go_on() {
     let Some(mut fx) = remote() else { return };
     let body: String = (0..100_000).map(|i| format!("{i:08} line\n")).collect();
-    let abs = fx.file("long.txt", body.as_bytes());
+    let abs = fx.file("long.txt", b"short at first\n");
+    // Under the read budget at the stat; then the long file it becomes is read.
+    let (path, long) = (abs.clone(), body.clone());
+    let mut armed = true;
+    *fx.counts.after.lock().unwrap() = Some(Box::new(move |op, p| {
+        if op == "stat" && p == path && std::mem::take(&mut armed) {
+            std::fs::write(&path, &long).unwrap();
+        }
+    }));
     let budget = Budget::new(Limits {
         read: 64 << 10,
         text: 64 << 10,
-        time: Duration::ZERO,
+        time: Duration::from_secs(5),
         ..Limits::PREVIEW
     });
-    budget.lift();
+    // Enter comes while the read is under way: after its first response has arrived.
+    let (lift, reached) = (budget.clone(), Arc::new(AtomicBool::new(false)));
+    let seen = reached.clone();
+    *fx.counts.gate.lock().unwrap() = Some(Box::new(move || {
+        seen.store(true, Ordering::SeqCst);
+        lift.lift();
+    }));
     let p = fx
         .preview_with(&abs, &budget, &AtomicBool::new(false))
         .unwrap();
+    assert!(reached.load(Ordering::SeqCst), "lifted mid-read");
     assert!(p.card().is_none(), "{}", card_why(&p));
+    // The same read went on past the budget, from where it was: one read, every range once.
+    let responses = fx.counts.responses(&abs);
+    assert_ranges_once(&responses);
+    assert_eq!(
+        responses.iter().map(|r| r.1).sum::<u64>(),
+        body.len() as u64
+    );
+    assert_eq!(
+        fx.counts.reads.lock().unwrap().len(),
+        1,
+        "not started again"
+    );
     let mut handed = p.hand_over().ok().unwrap();
     let mut drv = Driver::new(600.0, 400.0);
     let mut win = Host(&mut handed.embedded.window);
@@ -890,5 +1102,281 @@ fn a_handed_over_remote_text_resumes_through_its_copy() {
         *fx.counts.reads.lock().unwrap(),
         vec![(abs.clone(), 6 << 20)],
         "one fetch"
+    );
+}
+
+/// A PNG of `w`×`h` that does not compress (its bytes are noise): about 3 bytes a pixel.
+fn noisy_png(w: u32, h: u32) -> Vec<u8> {
+    let mut seed = 0x2545_f491_u32;
+    let img = ::image::DynamicImage::ImageRgb8(::image::RgbImage::from_fn(w, h, |_, _| {
+        seed ^= seed << 13;
+        seed ^= seed >> 17;
+        seed ^= seed << 5;
+        let [a, b, c, _] = seed.to_le_bytes();
+        ::image::Rgb([a, b, c])
+    }));
+    crate::gui::image::encode(&img, ::image::ImageFormat::Png, None, None)
+        .unwrap()
+        .bytes
+}
+
+/// P3 (local image): the encoded budget is checked again on the bytes themselves — an image
+/// grown in place, or replaced by a bigger one, after the stat that checked its size is read
+/// only to its budget and shows the card; lifted (Enter), the same file is read on.
+#[test]
+fn a_local_image_grown_after_its_stat_is_read_only_to_its_budget() {
+    let mut fx = local();
+    let small = png(64, 48);
+    let big = noisy_png(300, 200);
+    let limits = Limits {
+        image_bytes: small.len() as u64 + 100,
+        ..Limits::PREVIEW
+    };
+    assert!(big.len() as u64 > 2 * limits.image_bytes);
+    for replace in [false, true] {
+        let abs = fx.file(&format!("photo-{replace}.png"), &small);
+        let (path, bigger) = (abs.clone(), big.clone());
+        let mut armed = true;
+        *fx.counts.after.lock().unwrap() = Some(Box::new(move |op, p| {
+            if op == "stat" && p == path && std::mem::take(&mut armed) {
+                if replace {
+                    let tmp = format!("{path}.new");
+                    std::fs::write(&tmp, &bigger).unwrap();
+                    std::fs::rename(&tmp, &path).unwrap();
+                } else {
+                    std::fs::write(&path, &bigger).unwrap();
+                }
+            }
+        }));
+        let p = fx.preview_limited(&abs, limits);
+        assert_eq!(card_why(&p), OVER_LIMIT, "replaced: {replace}");
+        *fx.counts.after.lock().unwrap() = None;
+        let budget = Budget::new(limits);
+        budget.lift();
+        let p = fx
+            .preview_with(&abs, &budget, &AtomicBool::new(false))
+            .unwrap();
+        assert!(p.card().is_none(), "lifted: {}", card_why(&p));
+    }
+}
+
+/// A path error on a healthy session (permission denied) is the file's card, never a reconnect:
+/// the window keeps its one preview connection.
+#[test]
+fn a_path_error_on_a_healthy_session_is_a_card_not_a_reconnect() {
+    let Some(mut fx) = remote() else { return };
+    let first = fx.file("first.txt", b"first\n");
+    let locked = fx.file("locked.txt", b"locked\n");
+    assert!(
+        fx.preview(&first).card().is_none(),
+        "the connection is opened"
+    );
+    *fx.counts.lstat_error.lock().unwrap() = Some(std::io::ErrorKind::PermissionDenied);
+    let p = fx.preview(&locked);
+    assert!(
+        card_why(&p).contains("cannot stat"),
+        "the error is the card: {}",
+        card_why(&p)
+    );
+    assert_eq!(fx.sessions.load(Ordering::SeqCst), 1, "no reconnect");
+    assert_eq!(
+        fx.counts.peak.load(Ordering::SeqCst),
+        1,
+        "one session at a time"
+    );
+}
+
+/// A preview connection whose session died is dropped before the next one is opened: never two
+/// at once.
+#[test]
+fn a_dead_session_is_dropped_before_the_next_one_opens() {
+    let Some(mut fx) = remote() else { return };
+    let abs = fx.file("a.txt", b"alive\n");
+    fx.conn = Some(Box::new(
+        Counting::new(inner_for(fx.label), &fx.counts).dead(),
+    ));
+    let p = fx.preview(&abs);
+    assert!(p.card().is_none(), "{}", card_why(&p));
+    assert_eq!(fx.sessions.load(Ordering::SeqCst), 1, "opened again, once");
+    assert_eq!(
+        fx.counts.peak.load(Ordering::SeqCst),
+        1,
+        "never two at once"
+    );
+    assert_eq!(fx.counts.live.load(Ordering::SeqCst), 1);
+}
+
+/// Cancel is looked at between every two requests of a preparation: raised inside any one of
+/// them — opening the connection, the lstat, the link target's stat, realpath, the stat, the
+/// sniff, the read's own stat, the read — no later request is made. On a dead session, a cancel
+/// raised inside the failed lstat leaves it there: no probe, no new connection.
+#[test]
+fn a_cancel_inside_any_step_starts_no_later_one() {
+    let Some(probe) = remote() else { return };
+    drop(probe);
+    let steps = [
+        "connect ",
+        "lstat {link}",
+        "stat {link}",
+        "realpath {link}",
+        "stat {data}",
+        "read_head {data}",
+        "stat {data}",
+        "read_to {data}",
+    ];
+    for k in 0..steps.len() {
+        let mut fx = remote().unwrap();
+        let data = fx.file("data", b"plain text with no extension\n");
+        let link = fx.root.join("link");
+        std::os::unix::fs::symlink(&data, &link).unwrap();
+        let link = link.to_str().unwrap().to_string();
+        let expected: Vec<String> = steps[..=k]
+            .iter()
+            .map(|s| s.replace("{link}", &link).replace("{data}", &data))
+            .collect();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (raise, seen) = (cancel.clone(), Arc::new(AtomicUsize::new(0)));
+        *fx.counts.after.lock().unwrap() = Some(Box::new(move |_, _| {
+            if seen.fetch_add(1, Ordering::SeqCst) == k {
+                raise.store(true, Ordering::SeqCst);
+            }
+        }));
+        let result = fx.preview_with(&link, &Budget::preview(), &cancel);
+        assert!(
+            result.as_ref().is_err_and(crate::remote::is_cancelled),
+            "step {k}: {:?}",
+            result.as_ref().err()
+        );
+        assert_eq!(fx.counts.ops(), expected, "cancelled inside step {k}");
+        assert!(fx.preview_copies().is_empty());
+    }
+    // A dead session: the cancel raised inside its failed lstat ends it.
+    let mut fx = remote().unwrap();
+    let data = fx.file("data", b"x\n");
+    fx.conn = Some(Box::new(
+        Counting::new(inner_for(fx.label), &fx.counts).dead(),
+    ));
+    let cancel = Arc::new(AtomicBool::new(false));
+    let raise = cancel.clone();
+    *fx.counts.after.lock().unwrap() = Some(Box::new(move |_, _| {
+        raise.store(true, Ordering::SeqCst);
+    }));
+    let result = fx.preview_with(&data, &Budget::preview(), &cancel);
+    assert!(result.as_ref().is_err_and(crate::remote::is_cancelled));
+    assert_eq!(fx.counts.ops(), vec![format!("lstat {data}")]);
+    assert_eq!(fx.sessions.load(Ordering::SeqCst), 0, "no new connection");
+}
+
+/// P4: a cancel raised by the window while a read is in flight — after its first response has
+/// arrived — ends the read at that response: the server is asked for nothing more, far less than
+/// the file is sent, the result is a cancel and the partial copy is gone. (That only one worker
+/// runs at a time is the preview host's to show.)
+#[test]
+fn a_cancel_during_a_read_stops_its_requests() {
+    let Some(mut fx) = remote() else { return };
+    let abs = fx.file("big.txt", &vec![b'c'; 4 << 20]);
+    let (reached_tx, reached) = std::sync::mpsc::channel::<()>();
+    let (go, go_rx) = std::sync::mpsc::channel::<()>();
+    *fx.counts.gate.lock().unwrap() = Some(Box::new(move || {
+        reached_tx.send(()).unwrap();
+        go_rx.recv().unwrap();
+    }));
+    let cancel = AtomicBool::new(false);
+    let budget = Budget::preview();
+    let result = std::thread::scope(|scope| {
+        let worker = scope.spawn(|| fx.preview_with(&abs, &budget, &cancel).map(|_| ()));
+        reached
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the read began");
+        cancel.store(true, Ordering::SeqCst);
+        go.send(()).unwrap();
+        worker.join().unwrap()
+    });
+    assert!(
+        result.as_ref().is_err_and(crate::remote::is_cancelled),
+        "{:?}",
+        result.err()
+    );
+    let responses = fx.counts.responses(&abs);
+    assert_eq!(
+        responses.len(),
+        1,
+        "nothing asked after the cancel: {responses:?}"
+    );
+    let sent: u64 = responses.iter().map(|r| r.1).sum();
+    // One response at most, a fraction of the file's 4 MiB.
+    assert!(sent <= SFTP_RESPONSE, "sent {sent}");
+    assert_eq!(
+        fx.counts.content.load(Ordering::Relaxed),
+        0,
+        "the copy took nothing"
+    );
+    assert!(fx.preview_copies().is_empty(), "{:?}", fx.preview_copies());
+}
+
+/// A clock for a budget that the test moves.
+fn moved_clock() -> (
+    Arc<Mutex<std::time::Instant>>,
+    Box<dyn Fn() -> std::time::Instant + Send + Sync>,
+) {
+    let now = Arc::new(Mutex::new(std::time::Instant::now()));
+    let read = now.clone();
+    (now, Box::new(move || *read.lock().unwrap()))
+}
+
+/// The 5 s deadline (02 §4.3) runs out in the middle of a preparation, after the read: a local
+/// text whose index is under way when the clock passes 5 s stops there — part of it indexed,
+/// not all — and shows the card. The clock moves as the preparation looks at it, not by sleeping.
+#[test]
+fn the_deadline_stops_a_preparation_in_the_middle() {
+    let mut fx = local();
+    let abs = fx.file("three.log", &vec![b'x'; 3 << 20]);
+    let (now, clock) = moved_clock();
+    let looked = Arc::new(AtomicUsize::new(0));
+    let (n, moved) = (looked.clone(), now.clone());
+    let clock: Box<dyn Fn() -> std::time::Instant + Send + Sync> = Box::new(move || {
+        // From the fourth look on (the read's end, the check after it, the index starting, its
+        // first MiB), 6 s have passed.
+        if n.fetch_add(1, Ordering::SeqCst) == 3 {
+            *moved.lock().unwrap() += Duration::from_secs(6);
+        }
+        clock()
+    });
+    let budget = Budget::with_clock(Limits::PREVIEW, clock);
+    let p = fx
+        .preview_with(&abs, &budget, &AtomicBool::new(false))
+        .unwrap();
+    assert_eq!(card_why(&p), "the preview took over 5 s: Enter opens it");
+    let indexed: u64 = crate::gui::text::index_reads(Path::new(&abs))
+        .iter()
+        .map(|r| r.1)
+        .sum();
+    assert!(
+        indexed > 0 && indexed < 3 << 20,
+        "stopped in the middle: {indexed} bytes indexed"
+    );
+    drop(now);
+}
+
+/// The 5 s count from the end of the remote read (02 §4.3: the read shows its progress and is
+/// bounded by its bytes): a read that takes a minute leaves the preparation after it its whole
+/// 5 s, and the preview shows.
+#[test]
+fn the_deadline_starts_after_the_read() {
+    let Some(mut fx) = remote() else { return };
+    let abs = fx.file("slow.txt", &vec![b's'; 600 << 10]);
+    let (now, clock) = moved_clock();
+    let budget = Budget::with_clock(Limits::PREVIEW, clock);
+    let moved = now.clone();
+    *fx.counts.gate.lock().unwrap() = Some(Box::new(move || {
+        *moved.lock().unwrap() += Duration::from_secs(60);
+    }));
+    let p = fx
+        .preview_with(&abs, &budget, &AtomicBool::new(false))
+        .unwrap();
+    assert!(p.card().is_none(), "{}", card_why(&p));
+    assert!(
+        fx.counts.responses(&abs).len() > 1,
+        "the read went on after the minute"
     );
 }

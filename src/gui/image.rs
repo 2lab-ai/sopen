@@ -335,6 +335,17 @@ impl std::io::Seek for Checked<'_> {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    static DECODES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Tests: images decoded on this thread so far.
+#[cfg(test)]
+pub(crate) fn decodes() -> usize {
+    DECODES.with(std::cell::Cell::get)
+}
+
 /// The longest side of the picture a preview shows ([`fitted`]): a side of the browser on a
 /// large screen, at two pixels a point.
 pub const PREVIEW_SIDE: u32 = 2048;
@@ -366,6 +377,8 @@ impl Doc {
     }
 
     fn decode_from(bytes: &[u8], check: &dyn Fn() -> Result<()>) -> Result<Self> {
+        #[cfg(test)]
+        DECODES.with(|n| n.set(n.get() + 1));
         let checked = Checked {
             inner: Cursor::new(bytes),
             check,
@@ -1438,6 +1451,14 @@ impl ImageWindow {
         }
     }
 
+    /// The window as a preview ([`embed_preview`]).
+    fn previewing(file: ImageFile, doc: Doc, shown: Option<image::RgbaImage>) -> Self {
+        let mut window = Self::new(file, doc, Selection::default(), DEFAULT_BLOCK, Vec::new());
+        window.preview = true;
+        window.shown = shown;
+        window
+    }
+
     fn bounds(&self) -> Vec2 {
         let (w, h) = self.doc.size();
         Vec2::new(w as f32, h as f32)
@@ -2171,9 +2192,7 @@ pub fn embed_preview(
     doc: Doc,
     shown: Option<image::RgbaImage>,
 ) -> super::Embedded {
-    let mut window = ImageWindow::new(file, doc, Selection::default(), DEFAULT_BLOCK, Vec::new());
-    window.preview = true;
-    window.shown = shown;
+    let window = ImageWindow::previewing(file, doc, shown);
     let (outcome, leftover) = (window.outcome.clone(), window.leftover.clone());
     super::Embedded {
         window: Box::new(window),

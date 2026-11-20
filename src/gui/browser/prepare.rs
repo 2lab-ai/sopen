@@ -26,6 +26,7 @@ use crate::remote::{RemoteFs, Stat};
 use anyhow::{anyhow, bail, Context as _, Result};
 use eframe::egui;
 use sha2::Digest as _;
+use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -294,20 +295,37 @@ impl Limits {
 /// A preview's budget, shared by its preparation and the window's preview host. Lifted — Enter
 /// or F3 on the file while it is still being prepared (02 §4.4) — the preparation goes on under
 /// the viewer's rules from then on: no limit, no deadline.
-#[derive(Debug)]
 pub struct Budget {
     limits: Limits,
     lifted: AtomicBool,
     /// When the read ended: the deadline counts from there.
     read_ended: Mutex<Option<Instant>>,
+    /// The time (tests move it).
+    clock: Box<dyn Fn() -> Instant + Send + Sync>,
+}
+
+impl std::fmt::Debug for Budget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Budget")
+            .field("limits", &self.limits)
+            .field("lifted", &self.lifted())
+            .finish_non_exhaustive()
+    }
 }
 
 impl Budget {
     pub fn new(limits: Limits) -> Arc<Self> {
+        Self::with_clock(limits, Box::new(Instant::now))
+    }
+
+    /// [`Budget::new`] on a clock of the caller's (tests: a deadline reached in the middle of a
+    /// preparation, a read that takes long).
+    fn with_clock(limits: Limits, clock: Box<dyn Fn() -> Instant + Send + Sync>) -> Arc<Self> {
         Arc::new(Self {
             limits,
             lifted: AtomicBool::new(false),
             read_ended: Mutex::new(None),
+            clock,
         })
     }
 
@@ -331,7 +349,7 @@ impl Budget {
     }
 
     fn read_done(&self) {
-        *self.read_ended.lock().unwrap_or_else(|p| p.into_inner()) = Some(Instant::now());
+        *self.read_ended.lock().unwrap_or_else(|p| p.into_inner()) = Some((self.clock)());
     }
 
     /// The preparation may go on: not cancelled, and not past its deadline.
@@ -341,7 +359,7 @@ impl Budget {
         }
         let ended = *self.read_ended.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(at) = ended.filter(|_| !self.lifted()) {
-            if at.elapsed() >= self.limits.time {
+            if (self.clock)().saturating_duration_since(at) >= self.limits.time {
                 return Err(anyhow!(OverBudget(format!(
                     "the preview took over {} s: Enter opens it",
                     self.limits.time.as_secs()
@@ -660,21 +678,32 @@ fn preview_parts(
         cache,
         space,
     } = req;
+    // Cancel is looked at between every two requests: none starts once it is set.
     budget.check(cancel)?;
     let opened_now = conn.is_none();
-    let fs = match conn {
-        Some(fs) => fs,
-        None => conn.insert(connect()?),
-    };
-    let lstat = match fs.lstat_opt(abs) {
+    if opened_now {
+        *conn = Some(connect()?);
+        budget.check(cancel)?;
+    }
+    let lstat = match conn.as_mut().expect("opened above").lstat_opt(abs) {
         Ok(lstat) => lstat,
-        // Its session may have died since the last preview: once more, on a new one.
-        Err(_) if !opened_now => {
-            *fs = connect()?;
-            fs.lstat_opt(abs)?
+        Err(e) => {
+            budget.check(cancel)?;
+            // Its session may have died since the last preview. Only then — a path-free request
+            // fails too — once more, on a new one, the old one closed first: never two at once.
+            // A path error (permission denied) is the file's.
+            let fs = conn.as_mut().expect("opened above");
+            if opened_now || fs.stat_opt("/").is_ok() {
+                return Err(e);
+            }
+            budget.check(cancel)?;
+            drop(conn.take());
+            *conn = Some(connect()?);
+            budget.check(cancel)?;
+            conn.as_mut().expect("opened above").lstat_opt(abs)?
         }
-        Err(e) => return Err(e),
     };
+    let fs = conn.as_mut().expect("opened above");
     let Some(lstat) = lstat else {
         bail!("{abs}: no such file");
     };
@@ -684,6 +713,7 @@ fn preview_parts(
         known.link = Some(Link::Broken);
         bail!("the link points at nothing");
     }
+    budget.check(cancel)?;
     // As Enter opens it: a link as the file it points at.
     let real = fs.realpath(abs)?;
     if lstat.is_symlink {
@@ -752,9 +782,8 @@ fn preview_parts(
     let check = || budget.check(cancel);
     let parts = match kind {
         Kind::Image => {
-            let bytes =
-                std::fs::read(&path).with_context(|| format!("cannot read {}", path.display()))?;
-            check()?;
+            // The stat said it fits; the bytes decide (the file can have grown since).
+            let bytes = read_bounded(&path, budget.limit(limits.image_bytes), &check)?;
             let (w, h) = image::dimensions(&bytes)?;
             if budget
                 .limit(limits.pixels)
@@ -808,10 +837,75 @@ fn show(label: Option<&str>, abs: &str) -> String {
     }
 }
 
-/// Reads the remote file at `real` (named `name`) into a new private copy (02 §4.4), as a fetch
-/// reads it (the stat before and after, a retry when it changed meanwhile), stopped by `cancel`
-/// and — the file grown past its stat — at the read budget, at the first progress report past it
-/// (SFTP reads a few chunks ahead); a partial copy is removed.
+/// The local file at `path`, read whole through a handle of its own — or, while the budget
+/// holds, no further than `limit` bytes: one byte more and it is over the limit (the file grew
+/// since its size was checked, or another took its name). `check` after every read.
+fn read_bounded(
+    path: &Path,
+    limit: Option<u64>,
+    check: &dyn Fn() -> Result<()>,
+) -> Result<Vec<u8>> {
+    use std::io::Read as _;
+    let mut file =
+        std::fs::File::open(path).with_context(|| format!("cannot open {}", path.display()))?;
+    let mut bytes = Vec::new();
+    let mut buf = vec![0u8; 1 << 20];
+    loop {
+        let n = file
+            .read(&mut buf)
+            .with_context(|| format!("cannot read {}", path.display()))?;
+        if n == 0 {
+            break;
+        }
+        bytes.extend_from_slice(&buf[..n]);
+        if limit.is_some_and(|max| bytes.len() as u64 > max) {
+            return Err(over(OVER_LIMIT));
+        }
+        check()?;
+    }
+    check()?;
+    Ok(bytes)
+}
+
+/// Where a preview's read writes its copy, hashing what it writes: every response the server
+/// sends is looked at before it is written — a cancel, or the copy past the read budget while it
+/// holds, refuses it, which ends the read at that response (nothing more is asked of the
+/// server).
+struct Watched<'a, W> {
+    inner: W,
+    written: u64,
+    hasher: sha2::Sha256,
+    cancel: &'a AtomicBool,
+    budget: &'a Budget,
+    past_budget: bool,
+}
+
+impl<W: std::io::Write> std::io::Write for Watched<'_, W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if self.cancel.load(Ordering::Relaxed) {
+            return Err(std::io::Error::other("cancelled"));
+        }
+        let max = self.budget.limit(self.budget.limits.read);
+        if max.is_some_and(|max| self.written + buf.len() as u64 > max) {
+            self.past_budget = true;
+            return Err(std::io::Error::other("over the preview limit"));
+        }
+        let n = self.inner.write(buf)?;
+        self.hasher.update(&buf[..n]);
+        self.written += n as u64;
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+/// Reads the remote file at `real` (named `name`) into a new private copy of the window's (02
+/// §4.4: 0600, removed with its name on every way out), as a fetch reads it — the stat before and
+/// after, read again once when they differ — with cancel looked at between every two requests
+/// and at every response, and the read budget at every response while it holds: a file that grew
+/// past its stat is read no further than the response that crossed the budget.
 fn read_copy(
     fs: &mut dyn RemoteFs,
     real: &str,
@@ -821,33 +915,49 @@ fn read_copy(
     cancel: &AtomicBool,
     progress: &mut dyn FnMut(u64, u64),
 ) -> Result<Copy> {
+    use std::io::Write as _;
     let copy = space.name(name);
-    let past_budget = AtomicBool::new(false);
-    let stop = AtomicBool::new(cancel.load(Ordering::Relaxed));
-    let mut watch = |done: u64, total: u64| {
-        if cancel.load(Ordering::Relaxed) {
-            stop.store(true, Ordering::Relaxed);
+    for attempt in 0..2 {
+        budget.check(cancel)?;
+        let before = fs.stat(real)?;
+        budget.check(cancel)?;
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(attempt == 0)
+            .truncate(attempt > 0)
+            .mode(0o600)
+            .open(copy.path())
+            .with_context(|| format!("cannot create {}", copy.path().display()))?;
+        let mut out = Watched {
+            inner: std::io::BufWriter::with_capacity(1 << 20, file),
+            written: 0,
+            hasher: sha2::Sha256::new(),
+            cancel,
+            budget,
+            past_budget: false,
+        };
+        let read = fs
+            .read_to(real, &mut out, &mut |done| progress(done, before.size))
+            .and_then(|n| out.flush().map(|()| n).map_err(anyhow::Error::from));
+        budget.check(cancel)?;
+        if out.past_budget {
+            return Err(over(OVER_LIMIT));
         }
-        if budget
-            .limit(budget.limits.read)
-            .is_some_and(|max| done > max)
-        {
-            past_budget.store(true, Ordering::Relaxed);
-            stop.store(true, Ordering::Relaxed);
+        read?;
+        let (size, sha256) = (out.written, out.hasher.finalize().into());
+        let after = fs.stat_opt(real)?;
+        let whole = before.missing == Some("size") || size == before.size;
+        if whole && after.is_some_and(|a| unchanged(&before, &a)) {
+            return Ok(Copy {
+                name: copy,
+                at: Stat {
+                    sha256: Some(sha256),
+                    ..before
+                },
+            });
         }
-        progress(done, total);
-    };
-    match fs.fetch_cancellable(real, copy.path(), &mut watch, &stop) {
-        Ok(at) => Ok(Copy { name: copy, at }),
-        Err(e)
-            if crate::remote::is_cancelled(&e)
-                && past_budget.load(Ordering::Relaxed)
-                && !cancel.load(Ordering::Relaxed) =>
-        {
-            Err(over(OVER_LIMIT))
-        }
-        Err(e) => Err(e),
     }
+    bail!("{real} kept changing while it was read; try again when it is quiet")
 }
 
 /// The `Origin` of a previewed remote viewer (02 §4.4): a placeholder connection that fails, so

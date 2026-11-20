@@ -173,3 +173,72 @@ fn a_handed_over_image_takes_input_and_shows_its_bars() {
     assert!(fx.win.rect().is_some(), "a drag selects again");
     assert_eq!(fx.win.doc.rev(), rev, "the same picture, not decoded again");
 }
+
+/// An image wider than a preview shows (3000×300): previewed, its texture is the fitted picture
+/// made for it (no side over [`PREVIEW_SIDE`]); handed over, the texture is made again from the
+/// image itself, and crop, paste and save work on its full-resolution pixels.
+#[test]
+fn a_large_image_is_previewed_fitted_and_handed_over_whole() {
+    let (w, h) = (3000u32, 300u32);
+    let img = DynamicImage::ImageRgb8(ImageBuffer::from_fn(w, h, |x, y| {
+        image::Rgb([(x / 12) as u8, y as u8, 40])
+    }));
+    let bytes = encode(&img, ImageFormat::Png, None, None).unwrap().bytes;
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("wide.png");
+    std::fs::write(&path, &bytes).unwrap();
+    let abs = path.to_str().unwrap().to_string();
+    let mut fs = LocalFs::new();
+    let at = fs.stat(&abs).unwrap();
+    let origin = Origin::new(Box::new(fs), None, None, abs, at);
+    let file = ImageFile::new(origin, bytes, &tmp.path().join("cache"));
+    let doc = Doc::decode(file.original()).unwrap();
+    let shown = fitted(&doc);
+    assert_eq!(
+        shown.as_ref().map(|p| p.dimensions()),
+        Some((PREVIEW_SIDE, 205))
+    );
+    let mut win = ImageWindow::previewing(file, doc, shown);
+    let mut drv = Driver::new(700.0, 400.0);
+    drv.until(&mut win, 5, |w| w.ready());
+    let side = |win: &ImageWindow| win.tex.as_ref().map(|t| t.size());
+    assert_eq!(side(&win), Some([PREVIEW_SIDE as usize, 205]), "fitted");
+    win.set_preview(false);
+    drv.until(&mut win, 5, |w| w.ready());
+    drv.idle(&mut win, 3);
+    assert_eq!(
+        side(&win),
+        Some([w as usize, h as usize]),
+        "the image itself"
+    );
+    // Crop on full-resolution pixels: wider than the preview's picture was.
+    let map = win.map.expect("drawn");
+    let (a, b) = (
+        map.to_disp(Pos2::new(100.0, 50.0)),
+        map.to_disp(Pos2::new(2900.0, 250.0)),
+    );
+    drv.drag(&mut win, PointerButton::Primary, a, b);
+    let rect = win.rect().expect("selected");
+    drv.key(&mut win, Key::C, Modifiers::NONE);
+    let (cw, ch) = win.doc.size();
+    assert_eq!((cw, ch), (rect[2], rect[3]), "cropped to the rectangle");
+    assert!(cw > PREVIEW_SIDE, "full resolution: {cw}×{ch}");
+    // Paste a picture into the whole image, then save.
+    drv.idle(&mut win, 3);
+    let map = win.map.expect("drawn");
+    let (a, b) = (
+        map.to_disp(Pos2::new(0.0, 0.0)),
+        map.to_disp(Pos2::new(cw as f32, ch as f32)),
+    );
+    drv.drag(&mut win, PointerButton::Primary, a, b);
+    let rev = win.doc.rev();
+    let red = egui::ColorImage::new([8, 8], vec![Color32::RED; 64]);
+    drv.paste_image(&mut win, red);
+    assert!(win.doc.rev() > rev, "pasted: {}", win.status.text);
+    drv.key(&mut win, Key::S, command(false));
+    drv.until(&mut win, 20, |w| {
+        w.job.is_none() && w.status.text.starts_with("saved")
+    });
+    let saved = image::open(&path).unwrap();
+    assert_eq!((saved.width(), saved.height()), (cw, ch), "saved whole");
+}

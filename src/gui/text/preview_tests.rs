@@ -309,7 +309,9 @@ fn append(path: &Path, bytes: &[u8]) {
 /// P3 on a log being written: a file appended to after its preview's pass stopped at the budget
 /// reads as grown, not changed — the bytes indexed are still the file's first bytes — so the
 /// preview shows its first page and its last row (it is not left blank, waiting for a re-read it
-/// never does), and the hand-over goes on from where the pass stopped, not from the start.
+/// never does), and the hand-over goes on from where the pass stopped, not from the start: the
+/// bytes before the cut, written to since, are read once more to check them (their hash), never
+/// indexed again.
 #[test]
 fn a_cut_short_preview_of_a_growing_log_shows_and_resumes() {
     let tmp = tempfile::tempdir().unwrap();
@@ -344,7 +346,7 @@ fn a_cut_short_preview_of_a_growing_log_shows_and_resumes() {
     assert_eq!(
         read_runs(&path),
         vec![(0, body.len() as u64)],
-        "resumed, not read again from the start"
+        "resumed: nothing indexed twice"
     );
 }
 
@@ -367,4 +369,94 @@ fn f2_switches_wrapping_only_without_modifiers() {
     }
     drv.key(&mut win, Key::F2, Modifiers::NONE);
     assert!(!win.wrap, "F2 alone switches it");
+}
+
+/// `n` numbered lines of 32 bytes: other newline positions than [`body_of`]'s.
+fn short_lines(n: usize) -> Vec<u8> {
+    (0..n)
+        .flat_map(|i| format!("{i:08} {}\n", "s".repeat(22)).into_bytes())
+        .collect()
+}
+
+/// How a file is rewritten under a preview whose pass stopped at its budget.
+#[derive(Debug, Clone, Copy)]
+enum Rewrite {
+    /// Written over in place at the same size, the newlines elsewhere.
+    SameSize,
+    /// Written over in place, longer.
+    Larger,
+    /// Truncated, then written again, longer.
+    TruncatedAndRegrown,
+    /// Written over in place in the middle of the bytes the preview indexed only — its first
+    /// and last 4 KiB as they were, the size the same — the newlines elsewhere.
+    MiddleOnly,
+}
+
+/// Opens a 3 MiB file capped at 1 MiB as a preview, rewrites it as `how` says (the inode and a
+/// size no shorter than before: it looks grown), and hands it over. Returns the window and the
+/// clock the test moves.
+fn rewritten_under_a_preview(
+    dir: &Path,
+    how: Rewrite,
+) -> (TextWindow, Driver, Arc<Mutex<std::time::Instant>>) {
+    use std::io::{Seek, Write as _};
+    let name = format!("{how:?}.log");
+    let path = write(dir, &name, &body_of(3 * 16_384, false));
+    let doc = TextDoc::open_capped(&path, &|| Some(1 << 20), &|| Ok(())).unwrap();
+    let mut win = TextWindow::new(doc, path.display().to_string(), &name, Vec::new());
+    win.set_preview(true);
+    let clock = Arc::new(Mutex::new(std::time::Instant::now()));
+    let now = clock.clone();
+    win.clock = Box::new(move || *now.lock().unwrap());
+    let mut drv = Driver::new(600.0, 400.0);
+    drv.until(&mut win, 5, |w| w.ready());
+    let mut f = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+    let (at, bytes) = match how {
+        Rewrite::SameSize => (0, short_lines(6 * 16_384)),
+        Rewrite::Larger | Rewrite::TruncatedAndRegrown => (0, short_lines(8 * 16_384)),
+        // 8 KiB in, up to 8 KiB before the cut: 32-byte lines where there were 64-byte ones.
+        Rewrite::MiddleOnly => (8 << 10, short_lines(((1 << 20) - (16 << 10)) / 32)),
+    };
+    if matches!(how, Rewrite::TruncatedAndRegrown) {
+        f.set_len(0).unwrap();
+    }
+    f.seek(std::io::SeekFrom::Start(at)).unwrap();
+    f.write_all(&bytes).unwrap();
+    drop(f);
+    win.set_preview(false);
+    (win, drv, clock)
+}
+
+/// The hand-over never joins the marks the preview found to bytes written since: a file
+/// rewritten in place — at the same size with its newlines elsewhere (also only in the middle of
+/// what the preview read), longer, or truncated and written again — is read again whole (after
+/// the usual wait) instead of resumed; what is installed is the new file's own index.
+#[test]
+fn a_rewritten_file_is_read_again_whole_not_resumed() {
+    let tmp = tempfile::tempdir().unwrap();
+    for how in [
+        Rewrite::SameSize,
+        Rewrite::Larger,
+        Rewrite::TruncatedAndRegrown,
+        Rewrite::MiddleOnly,
+    ] {
+        let (mut win, mut drv, clock) = rewritten_under_a_preview(tmp.path(), how);
+        drv.until(&mut win, 10, |w| {
+            w.reindex.is_none() && (w.waiting || !w.doc.cut_short())
+        });
+        assert!(
+            win.doc.cut_short() && win.waiting,
+            "{how:?}: a resumed index of the rewritten file was installed"
+        );
+        *clock.lock().unwrap() += std::time::Duration::from_secs(60);
+        drv.until(&mut win, 10, |w| {
+            !w.doc.cut_short() && w.reindex.is_none() && !w.waiting && w.ready()
+        });
+        let path = win.doc.path().to_path_buf();
+        assert_eq!(
+            index_of(&win.doc),
+            index_of(&TextDoc::open(&path).unwrap()),
+            "{how:?}: the new file's own index"
+        );
+    }
 }

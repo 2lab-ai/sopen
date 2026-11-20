@@ -438,7 +438,8 @@ fn link_beside(copy: &Path, target: &Path) -> Result<PathBuf> {
 /// it, held for as long as this lives. Dropping it removes the folder with whatever is still in
 /// it. Making one first removes the folders of windows that are gone — their lock is free, or
 /// missing (a window makes and locks its lock before its folder) — so a crashed window's copies
-/// do not stay.
+/// do not stay. Where the lock cannot be taken (a filesystem without working locks) there is no
+/// preview space: its folder would look like a crashed window's.
 pub struct PreviewSpace {
     dir: PathBuf,
     lock: PathBuf,
@@ -448,14 +449,29 @@ pub struct PreviewSpace {
 
 impl PreviewSpace {
     pub fn new(cache: &Path) -> Result<Self> {
+        Self::new_with(cache, &mut |file| file.try_lock())
+    }
+
+    /// [`PreviewSpace::new`], with `try_lock` standing in for `File::try_lock` (tests: a
+    /// filesystem whose locks fail).
+    fn new_with(
+        cache: &Path,
+        try_lock: &mut dyn FnMut(&File) -> std::result::Result<(), std::fs::TryLockError>,
+    ) -> Result<Self> {
         let root = cache.join(PREVIEW);
         private_dir(&root)?;
         sweep_previews(&root);
         let (lock, held) =
             create_unique(|_| root.join(format!("{}.lock", &crate::remote::random_hex()[..12])))?;
-        // Where locks do not work, no one can tell this window is alive: the sweep leaves it.
-        if let Err(e) = held.try_lock() {
-            crate::debug!("{} not locked: {e}", lock.display());
+        // Without its lock held the folder would look like a crashed window's, and the next
+        // window's sweep would remove it under this one: no preview space, then.
+        if let Err(e) = try_lock(&held) {
+            let _ = std::fs::remove_file(&lock);
+            let why = match e {
+                std::fs::TryLockError::Error(e) => e.to_string(),
+                std::fs::TryLockError::WouldBlock => "it is held".to_string(),
+            };
+            anyhow::bail!("{} cannot be locked ({why}): no previews", lock.display());
         }
         let dir = lock.with_extension("");
         if let Err(e) = DirBuilder::new().mode(0o700).create(&dir) {
@@ -1136,13 +1152,34 @@ mod tests {
         std::fs::create_dir(root.join("dead")).unwrap();
         std::fs::write(root.join("dead/0.txt"), "left behind").unwrap();
         std::fs::write(root.join("dead.lock"), "").unwrap();
-        // A folder without a lock (made again by a worker after its window went).
+        // A folder without a lock (no live window has one).
         std::fs::create_dir(root.join("orphan")).unwrap();
         let next = PreviewSpace::new(tmp.path()).unwrap();
         assert!(!root.join("dead").exists() && !root.join("dead.lock").exists());
         assert!(!root.join("orphan").exists());
         assert_eq!(std::fs::read_to_string(copy.path()).unwrap(), "live");
         assert!(next.dir().exists());
+    }
+
+    /// A window that cannot take its lock makes no folder (02 §4.4): a folder whose lock is free
+    /// looks like a crashed window's, and the next window's sweep would remove it under the live
+    /// one. Its lock file goes too, and nothing is left for a sweep to find.
+    #[test]
+    fn a_preview_space_whose_lock_fails_is_refused_and_leaves_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let unsupported =
+            || std::fs::TryLockError::Error(std::io::Error::from(std::io::ErrorKind::Unsupported));
+        let refused = PreviewSpace::new_with(tmp.path(), &mut |_| Err(unsupported()));
+        let err = format!("{:#}", refused.err().expect("refused"));
+        assert!(err.contains("cannot be locked"), "{err}");
+        let left: Vec<_> = std::fs::read_dir(tmp.path().join(PREVIEW))
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name())
+            .collect();
+        assert!(left.is_empty(), "nothing left: {left:?}");
+        // The next window, locks working, still starts.
+        assert!(PreviewSpace::new(tmp.path()).is_ok());
     }
 
     /// The hand-over's publish (02 §4.4, P6): the preview copy becomes the cached copy by a hard
