@@ -12,7 +12,7 @@ pub use local::LocalFs;
 #[cfg(test)]
 pub(crate) use ranged::{
     fake, pattern, pattern_byte, read_to_over, Change, Clock, FakeControl, FakeFile, Fault, Link,
-    SentRecord, STAT_REPLY,
+    SentRecord, PIPE_REQUEST, STAT_REPLY,
 };
 pub use ranged::{Asked, Completion, Ranged, Refused, Reply, Ticket, Wake};
 pub use sftp::{connection_args, SftpRemote};

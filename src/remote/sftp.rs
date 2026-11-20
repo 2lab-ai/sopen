@@ -61,12 +61,19 @@ pub struct SftpRemote {
     stats: u64,
 }
 
+/// How long a failed start waits for the sftp subsystem to exit, to say how it ended.
+const STARTUP_EXIT_WAIT: Duration = Duration::from_secs(2);
+
 /// Starts the SFTP subsystem over `session` and the client on it, its request pipe counted by
 /// `writes`. The same steps as the crate's `Sftp::from_clonable_session`, which keeps the pipe to
 /// itself: the subsystem's stdin and stdout piped, stderr discarded. The child is kept as the
 /// session's auxiliary data, which the crate drops only after its flush and read tasks have
 /// ended — the local `ssh` must outlive every byte written to it. Dropping the `Arc<Session>`
 /// with it never stops the shared master: a resumed session does not `-O exit`.
+///
+/// Until the session is up the child is shared with this function, so that a failed start can
+/// still say how the subsystem ended — no subsystem, a server that exited 127 — as the crate's
+/// own session task does (`openssh_session.rs:106-116`).
 async fn start_sftp(session: Arc<openssh::Session>, writes: Arc<Writes>) -> Result<Sftp> {
     let mut child = openssh::Session::to_subsystem(session, "sftp")
         .stdin(openssh::Stdio::piped())
@@ -82,10 +89,41 @@ async fn start_sftp(session: Arc<openssh::Session>, writes: Arc<Writes>) -> Resu
         .stdout()
         .take()
         .context("the sftp subsystem has no stdout")?;
-    let keep =
-        openssh_sftp_client::SftpAuxiliaryData::Boxed(Box::new(std::sync::Mutex::new(child)));
+    let child = Arc::new(std::sync::Mutex::new(Some(child)));
+    let keep = openssh_sftp_client::SftpAuxiliaryData::Arced(child.clone());
     let stdin = Counted::new(stdin, writes);
-    Ok(Sftp::new_with_auxiliary(stdin, stdout, SftpOptions::default(), keep).await?)
+    match Sftp::new_with_auxiliary(stdin, stdout, SftpOptions::default(), keep).await {
+        // Our share of the child goes here: the session's is the one that keeps it.
+        Ok(sftp) => Ok(sftp),
+        Err(e) => {
+            let child = child.lock().unwrap().take();
+            let exited = child.map(|c| c.wait());
+            Err(startup_failure(e.into(), exited, STARTUP_EXIT_WAIT).await)
+        }
+    }
+}
+
+/// A failed start, with how the subsystem ended when it ends within `limit`: a non-zero exit
+/// status, or what `openssh` says of it (exit 127: "remote command not found"; 255: "the remote
+/// process has terminated", ssh's own failure). A clean exit, or none in time, adds nothing.
+async fn startup_failure<F>(
+    error: anyhow::Error,
+    exited: Option<F>,
+    limit: Duration,
+) -> anyhow::Error
+where
+    F: Future<Output = std::result::Result<std::process::ExitStatus, openssh::Error>>,
+{
+    let Some(exited) = exited else {
+        return error;
+    };
+    match tokio::time::timeout(limit, exited).await {
+        Ok(Ok(status)) if !status.success() => {
+            anyhow!("{error:#} (the sftp subsystem exited with {status})")
+        }
+        Ok(Err(e)) => anyhow!("{error:#} ({:#})", anyhow::Error::from(e)),
+        Ok(Ok(_)) | Err(_) => error,
+    }
 }
 
 /// `Err` = the request got no reply within `limit`.
@@ -136,7 +174,7 @@ impl SftpRemote {
             start_sftp(Arc::new(session), writes.clone()),
         ));
         let sftp = match started {
-            Ok(r) => r.map_err(|e| anyhow!("cannot start sftp on {}: {e}", spec.label()))?,
+            Ok(r) => r.map_err(|e| anyhow!("cannot start sftp on {}: {e:#}", spec.label()))?,
             Err(()) => {
                 return Err(timed_out(
                     &format!("starting sftp on {}", spec.label()),
@@ -1310,6 +1348,77 @@ mod tests {
         let e = timed_out("stat /x", META_TIMEOUT);
         assert_eq!(e.to_string(), "stat /x: no reply from the server in 30s");
         assert!(super::super::is_outcome_unknown(&unknown("rename a to b")));
+    }
+
+    /// A failed start says how the sftp subsystem ended (the crate's session task did): a real
+    /// child that exits non-zero gives its status, `openssh`'s view of an exit (127) its words; a
+    /// clean exit or none in time adds nothing, and the wait ends at its bound.
+    #[test]
+    fn a_failed_start_says_how_the_subsystem_ended() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        // The children are tokio's, spawned within this runtime.
+        let _within = rt.enter();
+        let failed = || anyhow!("cannot start sftp: unexpected end of file");
+        let exits = |code: u32| {
+            let mut child = tokio::process::Command::new("sh")
+                .args(["-c", &format!("exit {code}")])
+                .spawn()
+                .unwrap();
+            async move { child.wait().await.map_err(openssh::Error::Remote) }
+        };
+        let limit = Duration::from_secs(30);
+        let e = rt.block_on(startup_failure(failed(), Some(exits(3)), limit));
+        let msg = format!("{e:#}");
+        assert!(
+            msg.starts_with("cannot start sftp: unexpected end of file"),
+            "{msg}"
+        );
+        assert!(
+            msg.contains("the sftp subsystem exited with exit status: 3"),
+            "{msg}"
+        );
+
+        let not_found = async {
+            Err::<std::process::ExitStatus, _>(openssh::Error::Remote(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "remote command not found",
+            )))
+        };
+        let e = rt.block_on(startup_failure(failed(), Some(not_found), limit));
+        let msg = format!("{e:#}");
+        assert!(
+            msg.contains("the remote command could not be executed"),
+            "{msg}"
+        );
+        assert!(msg.contains("remote command not found"), "{msg}");
+
+        let e = rt.block_on(startup_failure(failed(), Some(exits(0)), limit));
+        assert_eq!(
+            format!("{e:#}"),
+            "cannot start sftp: unexpected end of file"
+        );
+        let none: Option<std::future::Ready<_>> = None;
+        let e = rt.block_on(startup_failure(failed(), none, limit));
+        assert_eq!(
+            format!("{e:#}"),
+            "cannot start sftp: unexpected end of file"
+        );
+
+        // A subsystem that does not exit: the wait ends at its bound, adding nothing.
+        let paused = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .start_paused(true)
+            .build()
+            .unwrap();
+        let never = std::future::pending::<std::result::Result<std::process::ExitStatus, _>>();
+        let e = paused.block_on(startup_failure(failed(), Some(never), STARTUP_EXIT_WAIT));
+        assert_eq!(
+            format!("{e:#}"),
+            "cannot start sftp: unexpected end of file"
+        );
     }
 
     fn lost() -> SftpErr {
