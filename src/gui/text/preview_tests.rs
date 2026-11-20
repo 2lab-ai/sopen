@@ -290,7 +290,15 @@ fn a_handed_over_preview_indexes_the_rest_without_reading_a_byte_twice() {
     }
     drv.until(&mut win, 5, |w| w.ready());
     assert_eq!(win.doc.line_count(), 6 * 16_384);
-    assert_eq!(read_runs(&path), vec![(0, 6 << 20)], "each byte read once");
+    assert_eq!(
+        read_runs(&path),
+        vec![(0, 6 << 20)],
+        "each byte indexed once"
+    );
+    // Apart from the index: the 4 MiB before the cut read again to check them (02 §4.4), before
+    // the rest was indexed and after.
+    let checked: u64 = verify_reads(&path).iter().map(|r| r.1).sum();
+    assert_eq!(checked, 2 * (4 << 20), "verification reads, counted apart");
     assert!(drv.find_text("preview of the first 4 MiB").is_none());
     drv.key(&mut win, Key::End, command(false));
     assert!(
@@ -390,6 +398,9 @@ enum Rewrite {
     /// Written over in place in the middle of the bytes the preview indexed only — its first
     /// and last 4 KiB as they were, the size the same — the newlines elsewhere.
     MiddleOnly,
+    /// As `MiddleOnly`, and its modification time put back as it was: nothing a stat shows
+    /// tells it was written to.
+    MiddleOnlyMtimeKept,
 }
 
 /// Opens a 3 MiB file capped at 1 MiB as a preview, rewrites it as `how` says (the inode and a
@@ -410,18 +421,24 @@ fn rewritten_under_a_preview(
     win.clock = Box::new(move || *now.lock().unwrap());
     let mut drv = Driver::new(600.0, 400.0);
     drv.until(&mut win, 5, |w| w.ready());
+    let mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
     let mut f = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
     let (at, bytes) = match how {
         Rewrite::SameSize => (0, short_lines(6 * 16_384)),
         Rewrite::Larger | Rewrite::TruncatedAndRegrown => (0, short_lines(8 * 16_384)),
         // 8 KiB in, up to 8 KiB before the cut: 32-byte lines where there were 64-byte ones.
-        Rewrite::MiddleOnly => (8 << 10, short_lines(((1 << 20) - (16 << 10)) / 32)),
+        Rewrite::MiddleOnly | Rewrite::MiddleOnlyMtimeKept => {
+            (8 << 10, short_lines(((1 << 20) - (16 << 10)) / 32))
+        }
     };
     if matches!(how, Rewrite::TruncatedAndRegrown) {
         f.set_len(0).unwrap();
     }
     f.seek(std::io::SeekFrom::Start(at)).unwrap();
     f.write_all(&bytes).unwrap();
+    if matches!(how, Rewrite::MiddleOnlyMtimeKept) {
+        f.set_modified(mtime).unwrap();
+    }
     drop(f);
     win.set_preview(false);
     (win, drv, clock)
@@ -439,6 +456,7 @@ fn a_rewritten_file_is_read_again_whole_not_resumed() {
         Rewrite::Larger,
         Rewrite::TruncatedAndRegrown,
         Rewrite::MiddleOnly,
+        Rewrite::MiddleOnlyMtimeKept,
     ] {
         let (mut win, mut drv, clock) = rewritten_under_a_preview(tmp.path(), how);
         drv.until(&mut win, 10, |w| {
@@ -458,5 +476,33 @@ fn a_rewritten_file_is_read_again_whole_not_resumed() {
             index_of(&TextDoc::open(&path).unwrap()),
             "{how:?}: the new file's own index"
         );
+    }
+}
+
+/// The bytes before the cut are checked again after the resumed pass too: written over while
+/// the rest is being indexed, they fail it, and the resume is Stale (the file is read again
+/// whole) — no index joining the old marks to the new bytes comes out of it.
+#[test]
+fn a_prefix_rewritten_during_the_resume_fails_it() {
+    use std::io::{Seek, Write as _};
+    let tmp = tempfile::tempdir().unwrap();
+    let path = write(tmp.path(), "during.log", &body_of(3 * 16_384, false));
+    let cut = TextDoc::open_capped(&path, &|| Some(1 << 20), &|| Ok(())).unwrap();
+    let mut written = false;
+    let resumed = cut.resume_counted(&AtomicBool::new(false), &mut |_| {
+        if !written {
+            written = true;
+            let mut f = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+            f.seek(std::io::SeekFrom::Start(100 << 10)).unwrap();
+            f.write_all(&short_lines(1000)).unwrap();
+        }
+    });
+    assert!(written, "rewritten mid-continuation");
+    match resumed {
+        Err(e) => assert!(is_stale(&e), "{e:#}"),
+        Ok(doc) => panic!(
+            "a resumed index was made of a rewritten prefix ({} lines)",
+            doc.line_count()
+        ),
     }
 }

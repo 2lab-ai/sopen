@@ -302,7 +302,15 @@ pub struct Budget {
     read_ended: Mutex<Option<Instant>>,
     /// The time (tests move it).
     clock: Box<dyn Fn() -> Instant + Send + Sync>,
+    /// Tests: called after every chunk of a local read with the bytes read so far (Enter at a
+    /// chosen point of it).
+    #[cfg(test)]
+    after_chunk: Mutex<Option<AfterChunk>>,
 }
+
+/// Tests: what runs after every chunk of a local read ([`Budget::after_chunk`]).
+#[cfg(test)]
+type AfterChunk = Box<dyn FnMut(u64) + Send>;
 
 impl std::fmt::Debug for Budget {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -326,6 +334,8 @@ impl Budget {
             lifted: AtomicBool::new(false),
             read_ended: Mutex::new(None),
             clock,
+            #[cfg(test)]
+            after_chunk: Mutex::new(None),
         })
     }
 
@@ -783,7 +793,7 @@ fn preview_parts(
     let parts = match kind {
         Kind::Image => {
             // The stat said it fits; the bytes decide (the file can have grown since).
-            let bytes = read_bounded(&path, budget.limit(limits.image_bytes), &check)?;
+            let bytes = read_bounded(&path, budget, &check)?;
             let (w, h) = image::dimensions(&bytes)?;
             if budget
                 .limit(limits.pixels)
@@ -837,27 +847,37 @@ fn show(label: Option<&str>, abs: &str) -> String {
     }
 }
 
-/// The local file at `path`, read whole through a handle of its own — or, while the budget
-/// holds, no further than `limit` bytes: one byte more and it is over the limit (the file grew
-/// since its size was checked, or another took its name). `check` after every read.
-fn read_bounded(
-    path: &Path,
-    limit: Option<u64>,
-    check: &dyn Fn() -> Result<()>,
-) -> Result<Vec<u8>> {
+/// The local image at `path`, read whole through a handle of its own — while the budget holds
+/// (looked at before every read: Enter lifts it in the middle), no further than one byte past its
+/// encoded limit: that byte read and it is over the limit (the file grew since its size was
+/// checked, or another took its name). Each read asks for at most what is left of the limit and
+/// one byte. `check` after every read.
+fn read_bounded(path: &Path, budget: &Budget, check: &dyn Fn() -> Result<()>) -> Result<Vec<u8>> {
     use std::io::Read as _;
     let mut file =
         std::fs::File::open(path).with_context(|| format!("cannot open {}", path.display()))?;
     let mut bytes = Vec::new();
     let mut buf = vec![0u8; 1 << 20];
     loop {
+        let limit = budget.limit(budget.limits.image_bytes);
+        let want = match limit {
+            Some(max) => (max.saturating_sub(bytes.len() as u64) + 1).min(buf.len() as u64),
+            None => buf.len() as u64,
+        } as usize;
         let n = file
-            .read(&mut buf)
+            .read(&mut buf[..want])
             .with_context(|| format!("cannot read {}", path.display()))?;
         if n == 0 {
             break;
         }
+        #[cfg(test)]
+        log_local_read(path, bytes.len() as u64, n as u64);
         bytes.extend_from_slice(&buf[..n]);
+        #[cfg(test)]
+        if let Some(hook) = budget.after_chunk.lock().unwrap().as_mut() {
+            hook(bytes.len() as u64);
+        }
+        let limit = budget.limit(budget.limits.image_bytes);
         if limit.is_some_and(|max| bytes.len() as u64 > max) {
             return Err(over(OVER_LIMIT));
         }
@@ -867,6 +887,29 @@ fn read_bounded(
     Ok(bytes)
 }
 
+#[cfg(test)]
+static LOCAL_READS: Mutex<Vec<(PathBuf, u64, u64)>> = Mutex::new(Vec::new());
+
+#[cfg(test)]
+fn log_local_read(path: &Path, at: u64, n: u64) {
+    LOCAL_READS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .push((path.to_path_buf(), at, n));
+}
+
+/// Tests: every read a preview made of the local file `path`, `(offset, bytes)`, in order.
+#[cfg(test)]
+fn local_reads(path: &Path) -> Vec<(u64, u64)> {
+    LOCAL_READS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .iter()
+        .filter(|(p, _, _)| p == path)
+        .map(|&(_, at, n)| (at, n))
+        .collect()
+}
+
 /// Where a preview's read writes its copy, hashing what it writes: every response the server
 /// sends is looked at before it is written — a cancel, or the copy past the read budget while it
 /// holds, refuses it, which ends the read at that response (nothing more is asked of the
@@ -874,6 +917,8 @@ fn read_bounded(
 struct Watched<'a, W> {
     inner: W,
     written: u64,
+    /// What the attempts before this one took: the read budget is the whole preview's.
+    spent: u64,
     hasher: sha2::Sha256,
     cancel: &'a AtomicBool,
     budget: &'a Budget,
@@ -886,7 +931,7 @@ impl<W: std::io::Write> std::io::Write for Watched<'_, W> {
             return Err(std::io::Error::other("cancelled"));
         }
         let max = self.budget.limit(self.budget.limits.read);
-        if max.is_some_and(|max| self.written + buf.len() as u64 > max) {
+        if max.is_some_and(|max| self.spent + self.written + buf.len() as u64 > max) {
             self.past_budget = true;
             return Err(std::io::Error::other("over the preview limit"));
         }
@@ -904,8 +949,10 @@ impl<W: std::io::Write> std::io::Write for Watched<'_, W> {
 /// Reads the remote file at `real` (named `name`) into a new private copy of the window's (02
 /// §4.4: 0600, removed with its name on every way out), as a fetch reads it — the stat before and
 /// after, read again once when they differ — with cancel looked at between every two requests
-/// and at every response, and the read budget at every response while it holds: a file that grew
-/// past its stat is read no further than the response that crossed the budget.
+/// and at every response. While it holds, the read budget is one for the whole preview: each
+/// attempt's fresh stat must fit in what the attempts before left of it (else the card), and
+/// every response is checked against it — a file that grew past its stat is read no further than
+/// the response that crossed it.
 fn read_copy(
     fs: &mut dyn RemoteFs,
     real: &str,
@@ -917,10 +964,17 @@ fn read_copy(
 ) -> Result<Copy> {
     use std::io::Write as _;
     let copy = space.name(name);
+    let mut spent = 0u64;
     for attempt in 0..2 {
         budget.check(cancel)?;
         let before = fs.stat(real)?;
         budget.check(cancel)?;
+        let left = budget
+            .limit(budget.limits.read)
+            .map(|max| max.saturating_sub(spent));
+        if left.is_some_and(|left| before.size > left) {
+            return Err(over(OVER_LIMIT));
+        }
         let file = std::fs::OpenOptions::new()
             .write(true)
             .create_new(attempt == 0)
@@ -931,6 +985,7 @@ fn read_copy(
         let mut out = Watched {
             inner: std::io::BufWriter::with_capacity(1 << 20, file),
             written: 0,
+            spent,
             hasher: sha2::Sha256::new(),
             cancel,
             budget,
@@ -943,6 +998,7 @@ fn read_copy(
         if out.past_budget {
             return Err(over(OVER_LIMIT));
         }
+        spent += out.written;
         read?;
         let (size, sha256) = (out.written, out.hasher.finalize().into());
         let after = fs.stat_opt(real)?;

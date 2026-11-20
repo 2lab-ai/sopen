@@ -244,26 +244,13 @@ impl TextDoc {
     }
 
     /// The bytes a stopped pass indexed are still the file's: the open handle and the path show
-    /// the same file, no shorter ([`TextDoc::now`]), and the first and last [`CHECKED`] bytes it
-    /// read read the same now. When the file was written to since (its size or modification
-    /// time moved: appended to, or written over in place — they cannot be told apart), all of
-    /// those bytes are read once more and must hash as they did; they are not indexed again.
+    /// the same file, no shorter ([`TextDoc::now`]), and every one of those bytes, read once
+    /// more, hashes as it did when the pass read them. No stat can say they were not written
+    /// over (a write keeps the size; the modification time can be put back), so they are always
+    /// read. This read only checks: it is not an index read, and indexes nothing.
     fn prefix_unchanged(&self, file: &File, scan: &Scan) -> bool {
-        let written = match self.now_since_pass() {
-            Now::Same => false,
-            Now::Grown => true,
-            Now::Changed | Now::Gone => return false,
-        };
-        let same = |at: u64, want: &[u8]| {
-            let mut got = vec![0u8; want.len()];
-            file.read_exact_at(&mut got, at).is_ok() && got == want
-        };
-        let tail_at = scan.at.saturating_sub(scan.tail.len() as u64);
-        if !same(0, &scan.head) || !same(tail_at, &scan.tail) {
+        if matches!(self.now_since_pass(), Now::Changed | Now::Gone) {
             return false;
-        }
-        if !written {
-            return true;
         }
         let Some(want) = scan.hasher.clone().map(sha2::Digest::finalize) else {
             return false;
@@ -276,6 +263,8 @@ impl TextDoc {
             if file.read_exact_at(&mut buf[..n], at).is_err() {
                 return false;
             }
+            #[cfg(test)]
+            log_verify_read(&self.path, at, n as u64);
             sha2::Digest::update(&mut hasher, &buf[..n]);
             at += n as u64;
         }
@@ -298,12 +287,13 @@ impl TextDoc {
             None => return self.share(),
         };
         // The marks found so far describe the bytes as they were read: they are joined to the
-        // rest only if those bytes are still there — the same file, no shorter, and its first and
-        // last bytes read the same. Written over in place (the inode and the size cannot tell),
-        // truncated and written again: Stale, and the file is read again whole.
+        // rest only if those bytes are still there — before the rest is read, and again after
+        // (written over meanwhile). Written over in place, truncated and written again: Stale,
+        // and the file is read again whole.
         if !self.prefix_unchanged(&file, &scan) {
             return Err(anyhow::Error::new(Stale));
         }
+        let before = scan.clone();
         scan.capped = false;
         scan.run(
             &file,
@@ -313,6 +303,9 @@ impl TextDoc {
             &|| stopped(cancel),
             on_chunk,
         )?;
+        if !self.prefix_unchanged(&file, &before) {
+            return Err(anyhow::Error::new(Stale));
+        }
         let mut doc = Self::indexed(file, scan, self.opened, self.path.clone());
         doc.indexed_in = self.indexed_in + started.elapsed();
         doc.after_pass = doc.now();
@@ -692,16 +685,10 @@ struct Scan {
     marks: Vec<Mark>,
     /// The pass stopped at its cap, short of the file as opened.
     capped: bool,
-    /// The file's first bytes and the last ones the pass read (up to [`CHECKED`] each): what a
-    /// resume reads again first, to know the bytes it indexed are still there.
-    head: Vec<u8>,
-    tail: Vec<u8>,
-    /// The hash of every byte read, for a pass that may stop short (a preview's).
+    /// The hash of every byte read, for a pass that may stop short (a preview's): what its
+    /// resume checks the bytes before the cut against.
     hasher: Option<sha2::Sha256>,
 }
-
-/// Bytes at each end of a stopped pass that its resume checks.
-const CHECKED: usize = 4096;
 
 /// Bytes an index pass reads at a time (the cancel and the cap are looked at between reads).
 const PASS_READ: usize = 1 << 20;
@@ -749,16 +736,9 @@ impl Scan {
             }
             #[cfg(test)]
             log_index_read(path, self.at, n as u64);
-            if self.at == 0 {
-                self.head = buf[..n.min(CHECKED)].to_vec();
-            }
             if let Some(hasher) = self.hasher.as_mut() {
                 sha2::Digest::update(hasher, &buf[..n]);
             }
-            let kept = self.tail.len().min(CHECKED.saturating_sub(n));
-            self.tail.drain(..self.tail.len() - kept);
-            self.tail
-                .extend_from_slice(&buf[n.saturating_sub(CHECKED)..n]);
             for (i, &b) in buf[..n].iter().enumerate() {
                 if b != b'\n' {
                     self.line_len += 1;
@@ -798,6 +778,31 @@ fn log_index_read(path: &Path, at: u64, n: u64) {
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .push((path.to_path_buf(), at, n));
+}
+
+#[cfg(test)]
+static VERIFY_READS: std::sync::Mutex<Vec<(std::path::PathBuf, u64, u64)>> =
+    std::sync::Mutex::new(Vec::new());
+
+#[cfg(test)]
+fn log_verify_read(path: &Path, at: u64, n: u64) {
+    VERIFY_READS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .push((path.to_path_buf(), at, n));
+}
+
+/// Tests: every read a resume made of `path` to check the bytes before the cut — not index
+/// reads — as `(offset, bytes)`, in order.
+#[cfg(test)]
+pub(crate) fn verify_reads(path: &Path) -> Vec<(u64, u64)> {
+    VERIFY_READS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .iter()
+        .filter(|(p, _, _)| p == path)
+        .map(|&(_, at, n)| (at, n))
+        .collect()
 }
 
 /// Tests: every read an index pass made of `path` (its first pass, a resume, a re-read), as

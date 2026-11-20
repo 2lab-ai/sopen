@@ -21,14 +21,15 @@ type After = Box<dyn FnMut(&str, &str) + Send>;
 
 /// What crossed the connections a test opened. `content` counts the bytes a reader accepted;
 /// `responses` is what the server sent, one entry per SFTP read response as it reached the reader
-/// (`read_to`'s sink writes each response once, whole), with its range in the file — the read
-/// boundary, also for bytes the reader then refused. `ops` logs every request made, in order.
+/// (`read_to`'s sink writes each response once, whole) — also bytes the reader then refused —
+/// with the range of the file it holds, decoded from its bytes ([`stamped`] files say where every
+/// byte is: never inferred from what came before). `ops` logs every request made, in order.
 #[derive(Default)]
 struct Counts {
     content: AtomicU64,
     heads: AtomicU64,
     reads: Mutex<Vec<(String, u64)>>,
-    responses: Mutex<Vec<(String, u64, u64)>>,
+    responses: Mutex<Vec<(String, Option<u64>, u64)>>,
     ops: Mutex<Vec<String>>,
     /// Connections alive now, and the most at once.
     live: AtomicUsize,
@@ -54,7 +55,7 @@ impl Counts {
     }
 
     /// The read responses for `path`, `(offset, bytes)`.
-    fn responses(&self, path: &str) -> Vec<(u64, u64)> {
+    fn responses(&self, path: &str) -> Vec<(Option<u64>, u64)> {
         let all = self.responses.lock().unwrap();
         all.iter()
             .filter(|(p, _, _)| p == path)
@@ -116,7 +117,6 @@ struct CountingWriter<'a> {
     out: &'a mut dyn std::io::Write,
     counts: &'a Counts,
     path: &'a str,
-    at: u64,
     n: u64,
 }
 
@@ -129,10 +129,9 @@ impl std::io::Write for CountingWriter<'_> {
     fn write_all(&mut self, buf: &[u8]) -> std::io::Result<()> {
         self.counts.responses.lock().unwrap().push((
             self.path.to_string(),
-            self.at,
+            source_of(buf),
             buf.len() as u64,
         ));
-        self.at += buf.len() as u64;
         let gate = self.counts.gate.lock().unwrap().take();
         if let Some(gate) = gate {
             gate();
@@ -140,6 +139,9 @@ impl std::io::Write for CountingWriter<'_> {
         let mut rest = buf;
         while !rest.is_empty() {
             let n = self.write(rest)?;
+            if n == 0 {
+                return Err(std::io::ErrorKind::WriteZero.into());
+            }
             rest = &rest[n..];
         }
         Ok(())
@@ -203,7 +205,6 @@ impl RemoteFs for Counting {
             out,
             counts: &counts,
             path: p,
-            at: 0,
             n: 0,
         };
         let result = self.inner.read_to(p, &mut counted, progress);
@@ -522,14 +523,16 @@ fn a_remote_file_over_the_read_budget_is_a_card_with_nothing_read() {
     assert!(fx.preview_copies().is_empty());
 }
 
-/// P3: a remote file that grows past the budget between the stat and the read is cut at the
-/// budget (plus at most one chunk) and shows the card; its partial copy is gone.
+/// P3: a remote file that grows past the budget while it is read is cut at the budget (plus the
+/// one response that crossed it) and shows the card; its partial copy is gone.
 #[test]
 fn a_remote_read_stops_at_the_budget() {
     let Some(mut fx) = remote() else { return };
-    let abs = fx.file("growing.txt", &vec![b'a'; 64 << 10]);
+    // More than one response at the stat (a short read would make the SFTP client skip what
+    // the file grows by: it moves its offset by what it asked for).
+    let abs = fx.file("growing.txt", &stamped(400 << 10));
     let limits = Limits {
-        read: 100 << 10,
+        read: 500 << 10,
         ..Limits::PREVIEW
     };
     let budget = Budget::new(limits);
@@ -545,8 +548,8 @@ fn a_remote_read_stops_at_the_budget() {
     let mut grown = false;
     let p = preview(req, &budget, &AtomicBool::new(false), &mut |_, _| {
         if !grown {
-            // Grown while being read (the stat said 64 KiB).
-            std::fs::write(&path, vec![b'b'; 8 << 20]).unwrap();
+            // Grown while being read (the stat said 400 KiB).
+            std::fs::write(&path, stamped(8 << 20)).unwrap();
             grown = true;
         }
     })
@@ -560,26 +563,85 @@ fn a_remote_read_stops_at_the_budget() {
     assert_ranges_once(&responses);
     let sent: u64 = responses.iter().map(|r| r.1).sum();
     assert!(
-        sent <= (100 << 10) + SFTP_RESPONSE,
+        sent <= (500 << 10) + SFTP_RESPONSE,
         "the server sent {sent} bytes"
     );
     assert_eq!(fx.counts.reads.lock().unwrap().len(), 1, "one read");
     // What the copy took: never past the budget.
     let taken = fx.counts.content.load(Ordering::Relaxed);
-    assert!(taken <= 100 << 10, "the copy took {taken} bytes");
+    assert!(taken <= 500 << 10, "the copy took {taken} bytes");
     assert!(fx.preview_copies().is_empty(), "{:?}", fx.preview_copies());
 }
 
 /// The most one SFTP read response carries: the reader's request size (`sftp.rs` `CHUNK`).
 const SFTP_RESPONSE: u64 = 256 << 10;
 
-/// Read responses that cover the file from its start, each once, in order.
-fn assert_ranges_once(responses: &[(u64, u64)]) {
-    let mut at = 0;
-    for &(offset, n) in responses {
-        assert_eq!(offset, at, "a range read twice or skipped: {responses:?}");
-        at += n;
+/// A file whose bytes say where they are: 16-byte records `@<offset, 14 hex digits>\n`, so any
+/// run of its bytes holding one whole record tells its own offset (it is text, too).
+fn stamped(len: u64) -> Vec<u8> {
+    let mut out = Vec::with_capacity(len as usize + 16);
+    let mut at = 0u64;
+    while (out.len() as u64) < len {
+        out.extend_from_slice(format!("@{at:014x}\n").as_bytes());
+        at += 16;
     }
+    out.truncate(len as usize);
+    out
+}
+
+/// Where in a [`stamped`] file the bytes `buf` are, from the bytes themselves — `None` when they
+/// are not a run of one (or hold no whole record).
+fn source_of(buf: &[u8]) -> Option<u64> {
+    let first = (0..buf.len().min(16)).find(|&i| {
+        buf.get(i) == Some(&b'@')
+            && buf.get(i + 15) == Some(&b'\n')
+            && buf[i + 1..i + 15].iter().all(u8::is_ascii_hexdigit)
+    })?;
+    let record = std::str::from_utf8(&buf[first + 1..first + 15]).ok()?;
+    let start = u64::from_str_radix(record, 16)
+        .ok()?
+        .checked_sub(first as u64)?;
+    // The whole response must be that run of the file, byte for byte.
+    let whole = stamped(start + buf.len() as u64);
+    (whole[start as usize..] == *buf).then_some(start)
+}
+
+/// The responses' source ranges cover the file from its start, each once, in order: no range
+/// sent twice, none skipped. `Err` names the first that is not.
+fn ranges_once(responses: &[(Option<u64>, u64)]) -> std::result::Result<(), String> {
+    let mut at = 0;
+    for (i, &(source, n)) in responses.iter().enumerate() {
+        match source {
+            Some(source) if source == at => at += n,
+            Some(source) => return Err(format!("response {i} holds {source}.., expected {at}..")),
+            None => return Err(format!("response {i} is not a run of the file")),
+        }
+    }
+    Ok(())
+}
+
+fn assert_ranges_once(responses: &[(Option<u64>, u64)]) {
+    if let Err(why) = ranges_once(responses) {
+        panic!("{why}: {responses:?}");
+    }
+}
+
+/// The range oracle reads the ranges from the bytes, not from their count: a response sent twice,
+/// or one skipped, is seen though the lengths add up the same.
+#[test]
+fn the_range_oracle_sees_a_range_sent_twice_or_skipped() {
+    let file = stamped(1000);
+    let resp = |from: usize, to: usize| (source_of(&file[from..to]), (to - from) as u64);
+    assert_eq!(source_of(&file[37..300]), Some(37));
+    assert_eq!(source_of(b"not stamped at all, not at all"), None);
+    assert!(ranges_once(&[resp(0, 300), resp(300, 700), resp(700, 1000)]).is_ok());
+    let twice = [resp(0, 300), resp(0, 300), resp(600, 1000)];
+    assert!(ranges_once(&twice).is_err(), "sent twice");
+    let skipped = [resp(0, 300), resp(400, 700), resp(700, 1000)];
+    assert!(ranges_once(&skipped).is_err(), "skipped");
+    let mut forged = file[300..700].to_vec();
+    forged[200] = b'#';
+    assert_eq!(source_of(&forged), None, "a byte not the file's");
 }
 
 /// P3 (local): an image whose header says 30000×30000 shows `image is 30000×30000; Enter opens
@@ -994,28 +1056,19 @@ fn enter_on_a_card_reuses_its_complete_unchanged_copy() {
     assert_eq!(doc.size(), (32, 32), "the file as it is now");
 }
 
-/// Lifted (Enter while the preview is still being prepared), the preparation goes on under the
-/// viewer's rules: past the read budget, past the text budget, past the deadline.
+/// Lifted (Enter while the preview is still being prepared, 02 §4.4), the preparation goes on
+/// under the viewer's rules: Enter comes while the read is under way — after its first response
+/// arrived — and that same read goes on to the end (one read, every range once), then the text
+/// is indexed past the text budget, all of it within the preparation; no card.
 #[test]
 fn a_lifted_budget_lets_the_preparation_go_on() {
     let Some(mut fx) = remote() else { return };
-    let body: String = (0..100_000).map(|i| format!("{i:08} line\n")).collect();
-    let abs = fx.file("long.txt", b"short at first\n");
-    // Under the read budget at the stat; then the long file it becomes is read.
-    let (path, long) = (abs.clone(), body.clone());
-    let mut armed = true;
-    *fx.counts.after.lock().unwrap() = Some(Box::new(move |op, p| {
-        if op == "stat" && p == path && std::mem::take(&mut armed) {
-            std::fs::write(&path, &long).unwrap();
-        }
-    }));
+    let body = stamped(1 << 20);
+    let abs = fx.file("long.txt", &body);
     let budget = Budget::new(Limits {
-        read: 64 << 10,
         text: 64 << 10,
-        time: Duration::from_secs(5),
         ..Limits::PREVIEW
     });
-    // Enter comes while the read is under way: after its first response has arrived.
     let (lift, reached) = (budget.clone(), Arc::new(AtomicBool::new(false)));
     let seen = reached.clone();
     *fx.counts.gate.lock().unwrap() = Some(Box::new(move || {
@@ -1027,8 +1080,8 @@ fn a_lifted_budget_lets_the_preparation_go_on() {
         .unwrap();
     assert!(reached.load(Ordering::SeqCst), "lifted mid-read");
     assert!(p.card().is_none(), "{}", card_why(&p));
-    // The same read went on past the budget, from where it was: one read, every range once.
     let responses = fx.counts.responses(&abs);
+    assert!(responses.len() > 1, "lifted with the read under way");
     assert_ranges_once(&responses);
     assert_eq!(
         responses.iter().map(|r| r.1).sum::<u64>(),
@@ -1039,16 +1092,20 @@ fn a_lifted_budget_lets_the_preparation_go_on() {
         1,
         "not started again"
     );
+    let copy = fx.preview_copies().remove(0);
+    let indexed: u64 = crate::gui::text::index_reads(&copy)
+        .iter()
+        .map(|r| r.1)
+        .sum();
+    assert_eq!(indexed, body.len() as u64, "indexed past the text budget");
     let mut handed = p.hand_over().ok().unwrap();
     let mut drv = Driver::new(600.0, 400.0);
     let mut win = Host(&mut handed.embedded.window);
     shown(&mut drv, &mut win);
     drv.key(&mut win, Key::End, command(false));
     drv.idle(&mut win, 2);
-    assert!(
-        drv.text_starting_with("00099999 line").is_some(),
-        "the whole file"
-    );
+    let last = format!("@{:014x}", body.len() as u64 - 16);
+    assert!(drv.find_text(&last).is_some(), "the whole file");
     assert_eq!(fx.counts.content.load(Ordering::Relaxed), body.len() as u64);
 }
 
@@ -1120,9 +1177,10 @@ fn noisy_png(w: u32, h: u32) -> Vec<u8> {
         .bytes
 }
 
-/// P3 (local image): the encoded budget is checked again on the bytes themselves — an image
-/// grown in place, or replaced by a bigger one, after the stat that checked its size is read
-/// only to its budget and shows the card; lifted (Enter), the same file is read on.
+/// P3 (local image): the encoded budget is checked again on the bytes themselves, as they are
+/// read — an image grown in place, or replaced by a bigger one, after the stat that checked its
+/// size is read no further than one byte past its budget, and shows the card; Enter (the budget
+/// lifted) after the first chunk lets that read go on to the end, and the image shows.
 #[test]
 fn a_local_image_grown_after_its_stat_is_read_only_to_its_budget() {
     let mut fx = local();
@@ -1133,8 +1191,9 @@ fn a_local_image_grown_after_its_stat_is_read_only_to_its_budget() {
         ..Limits::PREVIEW
     };
     assert!(big.len() as u64 > 2 * limits.image_bytes);
-    for replace in [false, true] {
-        let abs = fx.file(&format!("photo-{replace}.png"), &small);
+    let read = |abs: &str| crate::gui::browser::prepare::local_reads(Path::new(abs));
+    for (replace, lift) in [(false, false), (true, false), (false, true), (true, true)] {
+        let abs = fx.file(&format!("photo-{replace}-{lift}.png"), &small);
         let (path, bigger) = (abs.clone(), big.clone());
         let mut armed = true;
         *fx.counts.after.lock().unwrap() = Some(Box::new(move |op, p| {
@@ -1148,15 +1207,33 @@ fn a_local_image_grown_after_its_stat_is_read_only_to_its_budget() {
                 }
             }
         }));
-        let p = fx.preview_limited(&abs, limits);
-        assert_eq!(card_why(&p), OVER_LIMIT, "replaced: {replace}");
-        *fx.counts.after.lock().unwrap() = None;
         let budget = Budget::new(limits);
-        budget.lift();
+        if lift {
+            let enter = budget.clone();
+            *budget.after_chunk.lock().unwrap() = Some(Box::new(move |_| enter.lift()));
+        }
         let p = fx
             .preview_with(&abs, &budget, &AtomicBool::new(false))
             .unwrap();
-        assert!(p.card().is_none(), "lifted: {}", card_why(&p));
+        let reads = read(&abs);
+        let total: u64 = reads.iter().map(|r| r.1).sum();
+        let mut at = 0;
+        for &(offset, n) in &reads {
+            assert_eq!(offset, at, "read in order, once: {reads:?}");
+            at += n;
+        }
+        if lift {
+            assert!(p.card().is_none(), "lifted mid-read: {}", card_why(&p));
+            assert!(reads.len() > 1, "lifted after the first chunk: {reads:?}");
+            assert_eq!(total, big.len() as u64, "the whole image");
+        } else {
+            assert_eq!(card_why(&p), OVER_LIMIT, "replaced: {replace}");
+            assert!(
+                total <= limits.image_bytes + 1,
+                "read {total} bytes of a {} byte budget",
+                limits.image_bytes
+            );
+        }
     }
 }
 
@@ -1274,24 +1351,26 @@ fn a_cancel_inside_any_step_starts_no_later_one() {
 #[test]
 fn a_cancel_during_a_read_stops_its_requests() {
     let Some(mut fx) = remote() else { return };
-    let abs = fx.file("big.txt", &vec![b'c'; 4 << 20]);
+    let abs = fx.file("big.txt", &stamped(4 << 20));
     let (reached_tx, reached) = std::sync::mpsc::channel::<()>();
     let (go, go_rx) = std::sync::mpsc::channel::<()>();
+    // The worker waits at the gate a bounded time (a test that failed never leaves it hanging),
+    // and is let go before anything here can panic.
     *fx.counts.gate.lock().unwrap() = Some(Box::new(move || {
-        reached_tx.send(()).unwrap();
-        go_rx.recv().unwrap();
+        let _ = reached_tx.send(());
+        let _ = go_rx.recv_timeout(Duration::from_secs(20));
     }));
     let cancel = AtomicBool::new(false);
     let budget = Budget::preview();
-    let result = std::thread::scope(|scope| {
+    let (began, result) = std::thread::scope(|scope| {
         let worker = scope.spawn(|| fx.preview_with(&abs, &budget, &cancel).map(|_| ()));
-        reached
-            .recv_timeout(Duration::from_secs(10))
-            .expect("the read began");
+        let began = reached.recv_timeout(Duration::from_secs(10)).is_ok();
         cancel.store(true, Ordering::SeqCst);
-        go.send(()).unwrap();
-        worker.join().unwrap()
+        drop(go);
+        (began, worker.join())
     });
+    assert!(began, "the read never began");
+    let result = result.expect("the worker did not panic");
     assert!(
         result.as_ref().is_err_and(crate::remote::is_cancelled),
         "{:?}",
@@ -1379,4 +1458,38 @@ fn the_deadline_starts_after_the_read() {
         fx.counts.responses(&abs).len() > 1,
         "the read went on after the minute"
     );
+}
+
+/// One read budget for the whole preview (02 §4.3), however many times the read starts: a file
+/// that changed during a complete first read is read again only if what is left of the budget
+/// holds it — here it does not, and the card shows, the server having sent no more than the
+/// budget and one response.
+#[test]
+fn a_read_started_again_shares_one_budget() {
+    let Some(mut fx) = remote() else { return };
+    let body = stamped(200 << 10);
+    let abs = fx.file("touched.txt", &body);
+    let limits = Limits {
+        read: 300 << 10,
+        ..Limits::PREVIEW
+    };
+    let path = abs.clone();
+    let mut armed = true;
+    *fx.counts.after.lock().unwrap() = Some(Box::new(move |op, p| {
+        if op == "read_to" && p == path && std::mem::take(&mut armed) {
+            // Written to as the first read ended: its time moves.
+            let f = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+            let then = f.metadata().unwrap().modified().unwrap();
+            f.set_modified(then - Duration::from_secs(3600)).unwrap();
+        }
+    }));
+    let p = fx.preview_limited(&abs, limits);
+    assert_eq!(card_why(&p), OVER_LIMIT);
+    let sent: u64 = fx.counts.responses(&abs).iter().map(|r| r.1).sum();
+    assert!(
+        sent <= limits.read + SFTP_RESPONSE,
+        "the server sent {sent} bytes for a {} byte budget",
+        limits.read
+    );
+    assert!(fx.preview_copies().is_empty(), "{:?}", fx.preview_copies());
 }
