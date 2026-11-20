@@ -109,6 +109,15 @@ its git panel changes repositories, every history rewrite or destructive action 
 | A14 | Function keys act as F1…F12 in sopen (msg 15) | Every F-key row is clickable and Cmd/Ctrl+1…0 act as F1…F10 in every window; on macOS the top row sends F-keys while a sopen window is focused and the Mac's setting comes back on blur, quit and crash; Linux and Windows have the fallback only. Scenarios: 04 §8 (K-F). |
 | A15 | F10 directory tree (msg 16) | F10 (or Alt+F10) shows a tree rooted at the home when the folder is under it, else at `/`; device, virtual, network and mount folders never open by themselves; folders with fewer than 5 subfolders open within a row budget; every row shows its folder and file counts and a growing size at once. Scenarios: 05 §8. |
 
+Owner message 17 (2026-11-20, quoted in [`06-streaming.md`](06-streaming.md)) asks that every viewer
+stream and that edits live locally until saved. Its contract is planned, and this file describes
+what ships until each work unit lands:
+
+| # | Owner intent | Acceptance (observable) |
+|---|---|---|
+| A17a | View any remote file without downloading it first, like a video stream: the first screen first, a buffer around it, a far jump on demand (msg 17) | [06](06-streaming.md) §12: e.g. a remote 24 GB file's first hex screen shows within 1.0 s of Enter having fetched ≤ 64 KiB (plus the 8 KiB kind sniff), and memory grows ≤ 80 MiB and the disk not at all while scrolling it (V1–V3). |
+| A17b | Edits kept locally until saved; Save writes to the remote by default; Save As to a local path (msg 17) | [07](07-streaming-edit.md) §12: e.g. a 4-byte hex edit of a remote 24 GB file saves with ≤ 4 KiB read and 4 bytes written of the file by the save itself (then ≤ 128 KiB as the view reloads), a changed remote is refused with the original untouched, and a crash offers Restore (E1, E3–E6, E10). |
+
 ## 3. Routing
 
 | Kind | Detected by | Opens in |
@@ -217,6 +226,8 @@ too, where F3 closes it as ⌘W does.
   file is decoded, probed or indexed) keeps the viewer from opening; the fetched copy stays in
   the cache, recorded, and the status row says so. An image is always a
   copy (Save needs the bytes as opened); local media, text and other files are read in place.
+  Message 17 replaces this whole-file fetch, and the cached copy the text viewer reads, with a
+  stream for every viewer ([06](06-streaming.md) §7, planned).
   Each viewer gets a connection of its own (its Save and Export use it), and the copy it shows
   stays claimed until it is gone. The viewers keep exactly their edits, keys and Save rules
   (§6, §6a, §7); no new save path.
@@ -518,6 +529,9 @@ Esc do, and — only when something would be downloaded — that nothing is unti
 The exceptions: Enter in the path field saves there (it never opens the hex editor; when that save
 is refused the field keeps the keyboard, so the next Enter saves again); during a transfer Enter and
 Esc do nothing and closing waits for it.
+Message 17 changes the dialog in two ways ([06](06-streaming.md) §7.5, planned). "Open in hex
+editor" opens a remote file as a stream, with nothing fetched first. Esc or closing the window
+cancels a "Save to…", leaving nothing behind.
 
 - Hex: the file is fetched into the cache as every fetch is (claimed, recorded, an earlier copy's
   unsaved edits moved aside first — §5), with the progress in the dialog; then the same window
@@ -665,14 +679,15 @@ Local only, never sent anywhere. Exists for §10.
 Own text editor (the browser's text viewer is read-only; VS Code or Zed edits),
 hex insert / delete or anything that changes a file's size, image edits beyond crop, pixelize and
 clipboard copy / cut / paste (no drawing or text tool, no layers, no filters), frame-accurate
-copy without re-encode, streaming playback before download completes, directory sync / mounts, file watching,
+copy without re-encode, directory sync / mounts, file watching,
 Windows, a `.app` bundle or cask, any agent on the remote, macshot (Swift, macOS-only, GPL-3 — incompatible with A7/A8).
 
 ## 10. Two-week review (from 2026-11-xx first preview)
 
 From `usage.jsonl` across machines: < 5 runs/week, or ≥ 80 % text/dir → archive, keep a `zed ssh://` alias.
-A conflict refusal or failed write → fix before anything else. Large-media waits (≥ 500 MB or fetch ≥ 30 s, 3+ times)
-→ consider streaming. The owner naming the same missing edit 3 times → that one edit, nothing more.
+A conflict refusal or failed write → fix before anything else. Streaming no longer waits on this
+review: owner message 17 asked for it ([06](06-streaming.md), [07](07-streaming-edit.md)). The owner
+naming the same missing edit 3 times → that one edit, nothing more.
 
 ## 11. Spike results (2026-11-11, throwaway spike, ~1.4k LOC)
 
