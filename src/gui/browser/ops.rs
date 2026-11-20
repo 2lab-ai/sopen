@@ -2587,19 +2587,36 @@ mod tests {
     }
 
     /// Esc as an event during an ordinary transfer (no dialog up): the host's dispatch reaches
-    /// [`Ops::stop`]; the status row goes from the progress line to `stopping…`; the engine
-    /// sees it and the report lists what was not reached.
+    /// [`Ops::stop`]; the status line goes from the progress line to `stopping…` — asserted while
+    /// the stand-in engine, having seen the stop, waits on a barrier the test holds, so the end
+    /// cannot overtake the assertion — and once released the report lists what was not reached.
+    /// The engine says it saw the stop (`saw_stop`): a stop that never reached it fails the test
+    /// instead of ending the same way after a timeout.
     #[test]
     fn esc_during_a_transfer_stops_it() {
-        let run: Run = Arc::new(|job, link: &Link| {
+        let (release, barrier) = mpsc::channel::<()>();
+        let barrier = Arc::new(Mutex::new(barrier));
+        let saw_stop = Arc::new(AtomicBool::new(false));
+        let saw = saw_stop.clone();
+        let run: Run = Arc::new(move |job, link: &Link| {
             let Job::Transfer { names, .. } = job else {
                 unreachable!()
             };
             link.progress(progress(1, 2, &names[0], 5, 10));
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-            while !link.stopped() && std::time::Instant::now() < deadline {
+            while !link.stopped() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the stop never reached the engine"
+                );
                 std::thread::sleep(std::time::Duration::from_millis(5));
             }
+            let released = barrier
+                .lock()
+                .unwrap()
+                .recv_timeout(std::time::Duration::from_secs(5));
+            assert!(released.is_ok(), "the test never released the engine");
+            saw.store(true, Ordering::SeqCst);
             Report {
                 items: names
                     .into_iter()
@@ -2629,9 +2646,24 @@ mod tests {
         });
         assert!(!h.ops.holds_keyboard(), "no dialog: Esc is the host's");
         drv.frame(&mut h, vec![key_down(Key::Escape)], Modifiers::NONE);
+        assert!(h.ops.busy(), "the engine is held: the job has not ended");
         assert_eq!(h.ops.status().map(|s| s.text).as_deref(), Some("stopping…"));
+        drv.idle(&mut h, 3);
+        assert_eq!(
+            h.ops.status().map(|s| s.text).as_deref(),
+            Some("stopping…"),
+            "still, until the engine ends"
+        );
+        assert!(h.changed.is_empty());
+        release.send(()).unwrap();
         drv.until(&mut h, 5, |h| !h.changed.is_empty());
         drv.idle(&mut h, 2);
+        assert!(saw_stop.load(Ordering::SeqCst), "the engine saw the stop");
+        assert!(
+            drv.texts_starting_with("the operation stopped without a report")
+                .is_empty(),
+            "the engine ended with its report, not by dying"
+        );
         assert!(drv.find_text("not reached lib.rs").is_some());
         assert!(drv.find_text("not reached main.rs").is_some());
         assert_eq!(
