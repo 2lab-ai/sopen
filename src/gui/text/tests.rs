@@ -329,6 +329,10 @@ fn a_line_cut_for_display_stops_highlighting_there() {
     let mut win = viewer(tmp.path(), "cut.rs", &body);
     let mut drv = Driver::new(800.0, 500.0);
     drv.until(&mut win, 10, |w| w.ready());
+    // One row per line (W), so the line after the long one is on the first page; wrapped, the
+    // same holds (`highlighting_runs_on_across_wrapped_rows_and_never_cuts_a_line`).
+    drv.key(&mut win, Key::W, Modifiers::NONE);
+    drv.until(&mut win, 10, |w| w.ready());
     let plain = chrome::Palette::of(&drv.ctx.global_style().visuals).text;
     let before: std::collections::HashSet<_> = drv
         .colors_of("fn before() {}")
@@ -1296,7 +1300,7 @@ fn a_busy_log_shows_a_page_at_once_and_follows_it() {
     let opened = std::time::Instant::now();
     let mut drv = Driver::new(600.0, 400.0);
     drv.until(&mut win, 1, |w| {
-        w.page.as_ref().is_some_and(|p| !p.runs.is_empty())
+        w.page.as_ref().is_some_and(|p| !p.is_blank())
     });
     assert!(
         drv.find_text("row 1").is_some(),
@@ -1587,6 +1591,8 @@ fn a_long_line_is_laid_out_as_far_as_the_window_shows() {
     let mut win = viewer(tmp.path(), "wide.txt", &format!("{line}\n"));
     let mut drv = Driver::new(600.0, 400.0);
     drv.until(&mut win, 5, |w| w.ready());
+    // One row per line (W): the sideways view.
+    drv.key(&mut win, Key::W, Modifiers::NONE);
     let shown = drv
         .text_starting_with("0000 0001")
         .expect("the start, whole");
@@ -1597,4 +1603,747 @@ fn a_long_line_is_laid_out_as_far_as_the_window_shows() {
         .text_starting_with(&line[8..20])
         .expect("scrolled by eight columns");
     assert!(line[8..].starts_with(&moved));
+}
+
+// ---------------------------------------------------------------------------------------------
+// Word wrap (owner, message 13): on by default, the whole of every line, read a chunk at a time.
+
+/// Where the rows of text start across the window: the left edge of the text drawn that starts
+/// with `prefix` (the line numbers sit to the left of it).
+fn text_x(drv: &Driver, prefix: &str) -> f32 {
+    drv.texts()
+        .into_iter()
+        .find(|(_, _, t)| t.starts_with(prefix))
+        .map(|(r, _, _)| r.left())
+        .unwrap_or_else(|| panic!("no text starts with {prefix:?}"))
+}
+
+/// The rows of text drawn at column `x`, top to bottom — whether or not they fit their clip.
+fn rows_at(drv: &Driver, x: f32) -> Vec<String> {
+    let mut rows: Vec<(f32, String)> = drv
+        .texts()
+        .into_iter()
+        .filter(|(r, _, _)| (r.left() - x).abs() < 0.5)
+        .map(|(r, _, t)| (r.top(), t))
+        .collect();
+    rows.sort_by(|a, b| a.0.total_cmp(&b.0));
+    rows.into_iter().map(|(_, t)| t).collect()
+}
+
+/// Every row drawn at column `x` lies inside the rect it is clipped to: no glyph is cut at the
+/// window's edge.
+fn assert_rows_inside(drv: &Driver, x: f32) {
+    for (bounds, clip, text) in drv.texts() {
+        if (bounds.left() - x).abs() < 0.5 {
+            assert!(
+                clip.expand(0.5).contains_rect(bounds),
+                "{text:?} runs out of the window: {bounds:?} in {clip:?}"
+            );
+        }
+    }
+}
+
+/// The labels of the viewer's own F-keys.
+fn labels(win: &TextWindow) -> Vec<(u8, &'static str)> {
+    Window::keys(win).iter().map(|k| (k.n, k.label)).collect()
+}
+
+/// Lines wrap by default: a line wider than the window goes on in the rows below it, every row
+/// whole inside the window and broken after a space; nothing of the line is lost.
+#[test]
+fn lines_wrap_by_default() {
+    let tmp = tempfile::tempdir().unwrap();
+    let line: String = (0..400).map(|i| format!("{i:04} ")).collect();
+    let mut win = viewer(tmp.path(), "wide.txt", &format!("{line}\nnext\n"));
+    let mut drv = Driver::new(600.0, 400.0);
+    drv.until(&mut win, 5, |w| w.ready());
+    let x = text_x(&drv, "0000 0001");
+    let rows = rows_at(&drv, x);
+    assert!(rows.len() >= 3, "wrapped: {rows:?}");
+    let shown: String = rows.iter().take_while(|r| *r != "next").cloned().collect();
+    assert!(
+        shown.len() > 200 && line.starts_with(&shown),
+        "the rows are the line, in order: {rows:?}"
+    );
+    for row in &rows[..rows.len() - 1] {
+        assert!(row.ends_with(' '), "{row:?} breaks after a space");
+    }
+    assert_rows_inside(&drv, x);
+}
+
+/// W, or F2 — the row says what it does: "Unwrap", then "Wrap" — goes back to the sideways view
+/// (a row per line, ←/→ scroll it) and back again.
+#[test]
+fn w_and_f2_switch_wrapping_off_and_on() {
+    let tmp = tempfile::tempdir().unwrap();
+    let line: String = (0..400).map(|i| format!("{i:04} ")).collect();
+    let mut win = viewer(tmp.path(), "wide.txt", &format!("{line}\nnext\n"));
+    let mut drv = Driver::new(600.0, 400.0);
+    drv.until(&mut win, 5, |w| w.ready());
+    assert_eq!(labels(&win), [(2, "Unwrap")]);
+    let x = text_x(&drv, "0000 0001");
+    assert!(rows_at(&drv, x).len() >= 3);
+    drv.key(&mut win, Key::W, Modifiers::NONE);
+    assert_eq!(labels(&win), [(2, "Wrap")]);
+    let rows = rows_at(&drv, x);
+    assert_eq!(rows.len(), 2, "a row per line: {rows:?}");
+    assert_eq!(rows[1], "next");
+    drv.key(&mut win, Key::ArrowRight, Modifiers::NONE);
+    assert!(
+        drv.text_starting_with(&line[8..20]).is_some(),
+        "→ scrolls the unwrapped line"
+    );
+    drv.key(&mut win, Key::F2, Modifiers::NONE);
+    assert_eq!(labels(&win), [(2, "Unwrap")]);
+    assert!(rows_at(&drv, x).len() >= 3, "wrapped again");
+    assert!(
+        drv.text_starting_with("0000 0001").is_some(),
+        "from the line's start"
+    );
+}
+
+/// A line longer than LINE_MAX is shown whole when wrapped: its end is on screen at the end of
+/// the file, and nothing says it was cut.
+#[test]
+fn a_line_over_line_max_is_shown_whole_across_rows() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut line: String = (0..3 * LINE_MAX / 5).map(|i| format!("{i:04} ")).collect();
+    line.push_str("THE END");
+    let mut win = viewer(tmp.path(), "long.txt", &format!("{line}\n"));
+    let mut drv = Driver::new(600.0, 400.0);
+    drv.until(&mut win, 5, |w| w.ready());
+    let x = text_x(&drv, "0000 0001");
+    drv.key(&mut win, Key::End, Modifiers::NONE);
+    let rows = rows_at(&drv, x);
+    assert!(
+        rows.last().is_some_and(|r| r.ends_with("THE END")),
+        "the end of the line: {rows:?}"
+    );
+    assert!(line.ends_with(&rows.concat()), "{rows:?}");
+    assert!(
+        !drv.texts().iter().any(|(_, _, t)| t.contains("cut")),
+        "nothing is cut"
+    );
+    assert_rows_inside(&drv, x);
+}
+
+/// A line of megabytes, jumped into at its end (no way back remembered): PgUp and ↑ go back
+/// through it a row at a time across its 16 KiB restart points, PgDn and ↓ come forward through
+/// exactly the same rows — and each step reads a bounded number of bytes, wherever it is.
+#[test]
+fn a_huge_line_goes_back_and_forth_through_the_same_rows_with_bounded_reads() {
+    let tmp = tempfile::tempdir().unwrap();
+    // Seven-byte words: the restart points fall inside words.
+    let line: String = (0..700_000u32).map(|i| format!("{i:06} ")).collect();
+    let mut win = viewer(tmp.path(), "huge.txt", &format!("{line}\nafter\n"));
+    let mut drv = Driver::new(600.0, 400.0);
+    drv.until(&mut win, 10, |w| w.ready());
+    let x = text_x(&drv, "000000 000001");
+    let top = |drv: &Driver| rows_at(drv, x).first().cloned().unwrap_or_default();
+    let step = |drv: &mut Driver, win: &mut TextWindow, key: Key| {
+        let before = win.doc.page_reads();
+        drv.key(win, key, Modifiers::NONE);
+        let read = win.doc.page_reads() - before;
+        assert!(read <= 192 * 1024, "{key:?} read {read} bytes");
+    };
+    // Cmd/Ctrl+End: the end of the file (End alone goes to the end of the line first).
+    let before = win.doc.page_reads();
+    drv.key(&mut win, Key::End, crate::gui::testkit::command(false));
+    let read = win.doc.page_reads() - before;
+    assert!(read <= 192 * 1024, "Cmd+End read {read} bytes");
+    assert!(rows_at(&drv, x).last().is_some_and(|r| r == "after"));
+    let mut seen = vec![top(&drv)];
+    let back: Vec<Key> = std::iter::repeat_n(Key::PageUp, 30)
+        .chain(std::iter::repeat_n(Key::ArrowUp, 12))
+        .collect();
+    for &key in &back {
+        step(&mut drv, &mut win, key);
+        let now = top(&drv);
+        assert_ne!(&now, seen.last().unwrap(), "{key:?} moved");
+        seen.push(now);
+    }
+    // Back over more than two restart points: more than 32 KiB of the line.
+    let word = |row: &str| {
+        row.split(' ')
+            .find(|w| w.len() == 6)
+            .map(|w| w.parse::<u64>().unwrap())
+    };
+    let (end, start) = (word(&seen[0]).unwrap(), word(seen.last().unwrap()).unwrap());
+    assert!((end - start) * 7 > 2 * 16 * 1024, "{start}..{end}");
+    for (k, &key) in back.iter().rev().enumerate() {
+        let forward = if key == Key::PageUp {
+            Key::PageDown
+        } else {
+            Key::ArrowDown
+        };
+        step(&mut drv, &mut win, forward);
+        assert_eq!(top(&drv), seen[seen.len() - 2 - k], "step {k} forward");
+    }
+    assert!(
+        win.doc.page_reads() < 8 << 20,
+        "{} bytes read in all",
+        win.doc.page_reads()
+    );
+}
+
+/// A character whose bytes straddle 16 KiB of a wrapped line — a read edge and a restart
+/// point — is shown whole: never split into two U+FFFD.
+#[test]
+fn a_character_across_a_read_edge_is_never_split_in_a_wrapped_line() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut line = "x".repeat(16 * 1024 - 1);
+    line.push_str("한글");
+    line.push_str(&"y".repeat(20_000));
+    let mut win = viewer(tmp.path(), "edge.txt", &format!("{line}\n"));
+    let mut drv = Driver::new(600.0, 400.0);
+    drv.until(&mut win, 5, |w| w.ready());
+    let x = text_x(&drv, "xxxx");
+    drv.key(&mut win, Key::End, Modifiers::NONE);
+    let mut found = None;
+    for _ in 0..100 {
+        let rows = rows_at(&drv, x);
+        assert!(
+            rows.iter().all(|r| !r.contains('\u{FFFD}')),
+            "a character split: {rows:?}"
+        );
+        if rows.iter().any(|r| r.contains('한') || r.contains('글')) {
+            found = Some(rows);
+            break;
+        }
+        drv.key(&mut win, Key::PageUp, Modifiers::NONE);
+    }
+    found.expect("the Hangul is reached going back");
+    // One row more: the restart point falls after 한, so 글 starts the next row.
+    drv.key(&mut win, Key::ArrowUp, Modifiers::NONE);
+    let rows = rows_at(&drv, x);
+    assert!(rows.concat().contains("x한글y"), "{rows:?}");
+    assert!(rows.iter().all(|r| !r.contains('\u{FFFD}')), "{rows:?}");
+}
+
+/// With the system fonts a window gets (Hangul, emoji: wider than a cell), rows are broken by
+/// the measured width of their glyphs: every row inside the window, no glyph cut at its edge,
+/// and the rows are the line.
+#[test]
+fn hangul_and_emoji_wrap_inside_the_window_with_system_fonts() {
+    use egui_system_font_provider::SystemFontProvider;
+    let tmp = tempfile::tempdir().unwrap();
+    let words = [
+        "한국어",
+        "문장을",
+        "줄바꿈해서",
+        "보여준다",
+        "😀",
+        "emoji",
+        "가나다라마바사아자차카타파하",
+    ];
+    let line = (0..50)
+        .map(|i| words[i % words.len()])
+        .collect::<Vec<_>>()
+        .join(" ");
+    let mut win = viewer(tmp.path(), "ko.txt", &format!("{line}\nnext\n"));
+    let mut drv = Driver::new(600.0, 400.0);
+    drv.ctx
+        .add_font_provider(Arc::new(SystemFontProvider::new()));
+    drv.idle(&mut win, 3);
+    let f = chrome::font();
+    let han = drv.ctx.fonts_mut(|fonts| {
+        fonts
+            .has_glyph(&f, '한')
+            .then(|| fonts.glyph_width(&f, '한'))
+    });
+    let Some(han) = han else {
+        eprintln!("skipping: no installed font with Hangul");
+        return;
+    };
+    assert!(
+        han > chrome::CELL.x,
+        "the case: 한 ({han}) wider than a cell"
+    );
+    drv.until(&mut win, 5, |w| w.ready());
+    let x = text_x(&drv, "한국어");
+    let rows = rows_at(&drv, x);
+    assert!(rows.len() >= 4, "wrapped: {rows:?}");
+    assert_eq!(rows.last().map(String::as_str), Some("next"));
+    let shown = rows[..rows.len() - 1].concat();
+    assert_eq!(shown.replace(' ', ""), line.replace(' ', ""), "{rows:?}");
+    assert_rows_inside(&drv, x);
+}
+
+/// A row is broken after a space when the word that follows fits on the next row; a word longer
+/// than a row is cut where the row is full.
+#[test]
+fn rows_break_after_a_space_when_the_word_fits() {
+    let tmp = tempfile::tempdir().unwrap();
+    let words = [
+        "lorem",
+        "ipsum",
+        "dolor",
+        "sit",
+        "amet,",
+        "consectetur",
+        "adipiscing",
+        "elit",
+    ];
+    let line = (0..60)
+        .map(|i| words[i % words.len()])
+        .collect::<Vec<_>>()
+        .join(" ");
+    let long_word = "z".repeat(150);
+    let mut win = viewer(tmp.path(), "words.txt", &format!("{line}\n{long_word}\n"));
+    let mut drv = Driver::new(600.0, 400.0);
+    drv.until(&mut win, 5, |w| w.ready());
+    let x = text_x(&drv, "lorem ipsum");
+    let rows = rows_at(&drv, x);
+    let line_rows: Vec<String> = rows
+        .iter()
+        .take_while(|r| !r.starts_with('z'))
+        .cloned()
+        .collect();
+    assert!(line_rows.len() >= 3, "{rows:?}");
+    assert_eq!(line_rows.concat(), line);
+    for row in &line_rows[..line_rows.len() - 1] {
+        assert!(row.ends_with(' '), "{row:?} ends after a space");
+    }
+    let z_rows: Vec<String> = rows
+        .iter()
+        .filter(|r| r.starts_with('z'))
+        .cloned()
+        .collect();
+    assert!(z_rows.len() >= 2, "{rows:?}");
+    assert_eq!(z_rows.concat(), long_word);
+    assert_rows_inside(&drv, x);
+}
+
+/// A log of long lines, wrapped and viewed at its end: appended to, it is followed to the new
+/// end — the whole of the new last line.
+#[test]
+fn a_wrapped_log_appended_at_its_end_follows_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let body: String = (1..=100)
+        .map(|i| format!("row {i:03} {}\n", "-".repeat(300)))
+        .collect();
+    let mut win = viewer(tmp.path(), "wide.log", &body);
+    let clock = on_clock(&mut win);
+    let mut drv = Driver::new(600.0, 400.0);
+    drv.until(&mut win, 5, |w| w.ready());
+    drv.key(&mut win, Key::End, Modifiers::NONE);
+    append(
+        &tmp.path().join("wide.log"),
+        &format!("{} APPENDED-END\n", "+".repeat(300)),
+    );
+    later(&clock, 2.0);
+    reread(&mut drv, &mut win, 101);
+    assert!(
+        drv.texts()
+            .iter()
+            .any(|(_, _, t)| t.ends_with("APPENDED-END")),
+        "the new end is shown"
+    );
+    assert!(
+        win.status.text.contains("following the end"),
+        "{}",
+        win.status.text
+    );
+}
+
+/// A file of a few long lines, viewed at its top, is not at its end (it is not followed) until
+/// the last row of its last line is on screen.
+#[test]
+fn a_few_long_lines_are_not_at_the_end_until_their_last_row_shows() {
+    let tmp = tempfile::tempdir().unwrap();
+    let body: String = (1..=10)
+        .map(|i| format!("line {i} {}\n", "w ".repeat(1000)))
+        .collect();
+    let mut win = viewer(tmp.path(), "few.txt", &body);
+    let mut drv = Driver::new(600.0, 400.0);
+    drv.until(&mut win, 5, |w| w.ready());
+    let before = follows();
+    drv.idle(&mut win, 1);
+    assert_eq!(follows() - before, 0, "the top is not the end");
+    drv.key(&mut win, Key::End, crate::gui::testkit::command(false));
+    let before = follows();
+    drv.idle(&mut win, 1);
+    assert_eq!(follows() - before, 1, "the end is");
+}
+
+/// Highlighting runs on across the rows of a wrapped line (a string's colour goes on to the
+/// next row); a line too long to highlight stays whole when the highlighted page lands, and
+/// what follows it is plain (a comment it closes past LINE_MAX colours nothing after it).
+#[test]
+fn highlighting_runs_on_across_wrapped_rows_and_never_cuts_a_line() {
+    let tmp = tempfile::tempdir().unwrap();
+    let string = "s".repeat(150);
+    let long = "x".repeat(LINE_MAX + 500);
+    let body = format!(
+        "fn main() {{\n    let text = \"{string}\";\n}}\n/* {long} THE END */ let y = 1;\nfn after() {{}}\n"
+    );
+    let mut win = viewer(tmp.path(), "wrap.rs", &body);
+    let mut drv = Driver::new(600.0, 400.0);
+    drv.until(&mut win, 10, |w| w.ready());
+    let x = text_x(&drv, "fn main()");
+    let rows = rows_at(&drv, x);
+    let i = rows
+        .iter()
+        .position(|r| r.starts_with("    let text"))
+        .expect("the string's line");
+    assert!(rows.len() > i + 1, "{rows:?}");
+    let first = drv.colors_of(&rows[i]).unwrap();
+    let next = drv.colors_of(&rows[i + 1]).unwrap();
+    let plain = chrome::Palette::of(&drv.ctx.global_style().visuals).text;
+    let string_color = *first.last().unwrap();
+    assert!(first.len() >= 2 && string_color != plain, "{first:?}");
+    assert_eq!(next, vec![string_color], "the string goes on");
+    drv.key(&mut win, Key::End, crate::gui::testkit::command(false));
+    drv.until(&mut win, 10, |w| w.ready());
+    assert!(
+        rows_at(&drv, x)
+            .concat()
+            .contains("xxx THE END */ let y = 1;fn after() {}"),
+        "the long line whole after highlighting: {:?}",
+        rows_at(&drv, x)
+    );
+    assert_eq!(drv.colors_of("fn after() {}"), Some(vec![plain]));
+}
+
+/// Home and End inside a line longer than the window go to its first and last rows first, then
+/// to the start and end of the file; Cmd/Ctrl+Home and +End go to the file's straight away.
+#[test]
+fn home_and_end_go_to_a_long_lines_ends_then_the_files() {
+    let tmp = tempfile::tempdir().unwrap();
+    let long: String = (0..3000u32).map(|i| format!("{i:05} ")).collect();
+    let tail: String = (0..200).map(|i| format!("tail {i}\n")).collect();
+    let body = format!("first\n{long}LONG-END\n{tail}");
+    let mut win = viewer(tmp.path(), "ends.txt", &body);
+    let mut drv = Driver::new(600.0, 400.0);
+    drv.until(&mut win, 5, |w| w.ready());
+    let x = text_x(&drv, "first");
+    let rows = |drv: &Driver| rows_at(drv, x);
+    for _ in 0..3 {
+        drv.key(&mut win, Key::PageDown, Modifiers::NONE);
+    }
+    assert!(
+        rows(&drv)
+            .iter()
+            .all(|r| !r.contains("first") && !r.contains("tail")),
+        "inside the long line: {:?}",
+        rows(&drv)
+    );
+    drv.key(&mut win, Key::End, Modifiers::NONE);
+    let at = rows(&drv);
+    assert!(
+        at.last().is_some_and(|r| r.ends_with("LONG-END")),
+        "End: the line's last row at the bottom: {at:?}"
+    );
+    drv.key(&mut win, Key::End, Modifiers::NONE);
+    assert!(
+        rows(&drv).last().is_some_and(|r| r == "tail 199"),
+        "End again: the end of the file"
+    );
+    drv.key(&mut win, Key::Home, Modifiers::NONE);
+    assert_eq!(rows(&drv)[0], "first", "Home at a line start: the file's");
+    for _ in 0..3 {
+        drv.key(&mut win, Key::PageDown, Modifiers::NONE);
+    }
+    drv.key(&mut win, Key::Home, Modifiers::NONE);
+    assert!(
+        rows(&drv)[0].starts_with("00000 00001"),
+        "Home inside the line: its first row: {:?}",
+        rows(&drv)
+    );
+    for _ in 0..3 {
+        drv.key(&mut win, Key::PageDown, Modifiers::NONE);
+    }
+    let command = crate::gui::testkit::command(false);
+    drv.key(&mut win, Key::End, command);
+    assert!(
+        rows(&drv).last().is_some_and(|r| r == "tail 199"),
+        "Cmd/Ctrl+End"
+    );
+    drv.key(&mut win, Key::Home, command);
+    assert_eq!(rows(&drv)[0], "first", "Cmd/Ctrl+Home");
+    drv.key(&mut win, Key::End, Modifiers::CTRL);
+    assert!(
+        rows(&drv).last().is_some_and(|r| r == "tail 199"),
+        "Ctrl+End"
+    );
+}
+
+/// How many columns a wrapped row holds in a `w`×`h` window: the first row of a line of one
+/// long word.
+fn columns(w: f32, h: f32) -> usize {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut win = viewer(tmp.path(), "probe.txt", &format!("{}\n", "y".repeat(500)));
+    let mut drv = Driver::new(w, h);
+    drv.until(&mut win, 5, |w| w.ready());
+    let x = text_x(&drv, "yyy");
+    rows_at(&drv, x)[0].chars().count()
+}
+
+/// A tab goes to the next stop of four cells counted from its row's start — on a row a line
+/// wrapped onto too.
+#[test]
+fn tabs_go_to_stops_counted_from_the_rows_start() {
+    let cols = columns(600.0, 400.0);
+    let tmp = tempfile::tempdir().unwrap();
+    let body = format!("{}\tz\n\tq\n", "y".repeat(cols + 3));
+    let mut win = viewer(tmp.path(), "tabs.txt", &body);
+    let mut drv = Driver::new(600.0, 400.0);
+    drv.until(&mut win, 5, |w| w.ready());
+    let x = text_x(&drv, "yyy");
+    let rows = rows_at(&drv, x);
+    assert_eq!(
+        rows[..3],
+        ["y".repeat(cols), "yyy z".to_string(), "    q".to_string()]
+    );
+}
+
+/// A word that ends exactly at the right edge ends its row; the space after it, which does not
+/// fit, is not carried over: the next row starts with the next word.
+#[test]
+fn a_word_ending_at_the_edge_drops_the_space_after_it() {
+    let cols = columns(600.0, 400.0);
+    let tmp = tempfile::tempdir().unwrap();
+    let body = format!("{} next words\n", "b".repeat(cols));
+    let mut win = viewer(tmp.path(), "edge.txt", &body);
+    let mut drv = Driver::new(600.0, 400.0);
+    drv.until(&mut win, 5, |w| w.ready());
+    let x = text_x(&drv, "bbb");
+    assert_eq!(
+        rows_at(&drv, x),
+        ["b".repeat(cols), "next words".to_string()]
+    );
+}
+
+/// Inside a line longer than the window the status row says how far into the line the top row
+/// is; the scroll bar's thumb goes by bytes (rows cannot be counted without reading it all).
+#[test]
+fn the_status_and_the_thumb_tell_where_in_a_long_line() {
+    let tmp = tempfile::tempdir().unwrap();
+    let long: String = (0..20_000u32).map(|i| format!("{i:05} ")).collect();
+    let mut win = viewer(tmp.path(), "far.txt", &format!("first\n{long}\nlast\n"));
+    let mut drv = Driver::new(600.0, 400.0);
+    drv.until(&mut win, 5, |w| w.ready());
+    // The status row is drawn before the page is read: it shows it on the next pass.
+    drv.idle(&mut win, 1);
+    assert!(
+        drv.find_text("lines 1–2 of 3").is_some(),
+        "{:?}",
+        drv.text_starting_with("line")
+    );
+    assert_eq!(win.thumb(), Some(0.0));
+    for _ in 0..40 {
+        drv.key(&mut win, Key::PageDown, Modifiers::NONE);
+    }
+    let status = drv.text_starting_with("line 2 (").expect("where in line 2");
+    let pct: u64 = status["line 2 (".len()..]
+        .split(' ')
+        .next()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(
+        pct > 0 && pct < 100 && status.ends_with("% of it) of 3"),
+        "{status}"
+    );
+    let thumb = win.thumb().unwrap();
+    assert!(thumb > 0.0 && thumb < 1.0, "{thumb}");
+    drv.key(&mut win, Key::End, crate::gui::testkit::command(false));
+    assert_eq!(win.thumb(), Some(1.0));
+}
+
+/// `SOPEN_STATE` `at=OFFSET` (a receipt): the viewer opens with the row that byte is in at the
+/// top, deep inside a long line too.
+#[test]
+fn a_viewer_can_open_at_a_byte_deep_in_a_long_line() {
+    let tmp = tempfile::tempdir().unwrap();
+    let long: String = (0..100_000u32).map(|i| format!("{i:06} ")).collect();
+    let mut win = viewer(tmp.path(), "deep.txt", &format!("first\n{long}\nlast\n"));
+    win.jump = Some(Jump::Byte(6 + 7 * 50_000 + 3));
+    let mut drv = Driver::new(600.0, 400.0);
+    drv.until(&mut win, 5, |w| w.ready());
+    drv.idle(&mut win, 1);
+    let first = drv
+        .texts()
+        .into_iter()
+        .filter(|(_, _, t)| t.contains("0499") || t.contains("0500"))
+        .min_by(|a, b| a.0.top().total_cmp(&b.0.top()))
+        .map(|(_, _, t)| t)
+        .expect("rows of the long line");
+    assert!(
+        first.contains("050000"),
+        "the top row holds the byte: {first}"
+    );
+    assert_eq!(win.top, 1);
+    let status = drv.text_starting_with("line 2 (").unwrap_or_default();
+    assert!(
+        ["line 2 (49 % of it) of 3", "line 2 (50 % of it) of 3"].contains(&status.as_str()),
+        "{status}"
+    );
+}
+
+/// A deleted file keeps its wrapped page through a resize and W: nothing is read any more, and
+/// the page stays as it was read.
+#[test]
+fn a_deleted_file_keeps_its_wrapped_page_through_a_resize_and_w() {
+    let tmp = tempfile::tempdir().unwrap();
+    let line: String = (0..400).map(|i| format!("{i:04} ")).collect();
+    let mut win = viewer(tmp.path(), "gone.txt", &format!("{line}\n"));
+    let clock = on_clock(&mut win);
+    let mut drv = Driver::new(600.0, 400.0);
+    drv.until(&mut win, 5, |w| w.ready());
+    let x = text_x(&drv, "0000 0001");
+    let rows = rows_at(&drv, x);
+    std::fs::remove_file(tmp.path().join("gone.txt")).unwrap();
+    later(&clock, 2.0);
+    drv.idle(&mut win, 3);
+    assert!(win.status.text.contains("deleted"), "{}", win.status.text);
+    let reads = win.doc.page_reads();
+    drv.resize(420.0, 300.0);
+    drv.idle(&mut win, 2);
+    drv.key(&mut win, Key::W, Modifiers::NONE);
+    drv.key(&mut win, Key::PageDown, Modifiers::NONE);
+    assert_eq!(win.doc.page_reads(), reads, "nothing read");
+    assert_eq!(rows_at(&drv, x), rows, "the page as it was");
+}
+
+/// Narrowed while inside a long line, the top goes back to the start of the row it is in at the
+/// new width: going down and back up again comes back to it.
+#[test]
+fn a_resize_inside_a_long_line_keeps_the_top_on_a_row() {
+    let tmp = tempfile::tempdir().unwrap();
+    let long: String = (0..50_000u32).map(|i| format!("{i:05} ")).collect();
+    let mut win = viewer(tmp.path(), "narrow.txt", &format!("{long}\n"));
+    let mut drv = Driver::new(600.0, 400.0);
+    drv.until(&mut win, 5, |w| w.ready());
+    let x = text_x(&drv, "00000 00001");
+    for _ in 0..50 {
+        drv.key(&mut win, Key::PageDown, Modifiers::NONE);
+    }
+    let wide = rows_at(&drv, x)[0].clone();
+    drv.resize(437.0, 400.0);
+    drv.idle(&mut win, 2);
+    let top = rows_at(&drv, x)[0].clone();
+    assert_ne!(top, wide, "wrapped anew");
+    let word = wide.split(' ').find(|w| w.len() == 5).unwrap();
+    assert!(
+        word.parse::<u32>().unwrap() > 1000,
+        "deep in the line: {wide}"
+    );
+    assert!(
+        rows_at(&drv, x).concat().contains(word),
+        "the same place: {word} in {:?}",
+        rows_at(&drv, x)
+    );
+    for key in [Key::ArrowDown, Key::PageDown, Key::PageUp, Key::ArrowUp] {
+        drv.key(&mut win, key, Modifiers::NONE);
+    }
+    assert_eq!(rows_at(&drv, x)[0], top, "back to the same row");
+}
+
+/// Wrapped, the wheel scrolls by rows: a notch (three lines' worth) moves three rows, inside a
+/// line too.
+#[test]
+fn the_wheel_scrolls_by_rows_when_wrapped() {
+    let tmp = tempfile::tempdir().unwrap();
+    let long: String = (0..2000u32).map(|i| format!("{i:05} ")).collect();
+    let mut win = viewer(tmp.path(), "wheel.txt", &format!("{long}\n"));
+    let mut drv = Driver::new(600.0, 400.0);
+    drv.until(&mut win, 5, |w| w.ready());
+    let x = text_x(&drv, "00000 00001");
+    let before = rows_at(&drv, x);
+    drv.wheel(&mut win, Pos2::new(300.0, 200.0), -1.0);
+    assert_eq!(rows_at(&drv, x)[0], before[3], "three rows down");
+    drv.wheel(&mut win, Pos2::new(300.0, 200.0), 1.0);
+    assert_eq!(rows_at(&drv, x), before, "and back");
+}
+
+/// A line ending in CR LF shows no CR when wrapped (as unwrapped).
+#[test]
+fn a_crlf_line_shows_no_cr_when_wrapped() {
+    let tmp = tempfile::tempdir().unwrap();
+    let long = "w ".repeat(100);
+    let mut win = viewer(tmp.path(), "dos.txt", &format!("{long}end\r\nnext\r\n"));
+    let mut drv = Driver::new(600.0, 400.0);
+    drv.until(&mut win, 5, |w| w.ready());
+    let x = text_x(&drv, "w w");
+    let rows = rows_at(&drv, x);
+    assert!(rows.iter().any(|r| r.ends_with("end")), "{rows:?}");
+    assert_eq!(rows.last().map(String::as_str), Some("next"));
+    assert!(rows.iter().all(|r| !r.contains('♪')), "{rows:?}");
+}
+
+/// Thousands of short lines walked through wrapped (more line places than wrapping remembers at
+/// once): never mistaken for a changed file — no re-read — and the place reached is shown.
+#[test]
+fn walking_past_thousands_of_lines_is_not_a_change() {
+    let tmp = tempfile::tempdir().unwrap();
+    let body: String = (0..6000).map(|i| format!("row {i:04}\n")).collect();
+    let mut win = viewer(tmp.path(), "many.txt", &body);
+    let mut drv = Driver::new(600.0, 400.0);
+    drv.until(&mut win, 5, |w| w.ready());
+    win.moved = 5000;
+    drv.idle(&mut win, 2);
+    assert_eq!(win.reindexes, 0, "{}", win.status.text);
+    assert!(!win.waiting);
+    assert!(drv.find_text("row 5000").is_some(), "{}", win.top);
+}
+
+/// A re-read that lands while lines are not wrapped is what W wraps afterwards: nothing found
+/// through the old index is used for the new one.
+#[test]
+fn a_reread_while_unwrapped_is_what_w_wraps() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = write(
+        tmp.path(),
+        "swap.txt",
+        format!("{}\n", "old ".repeat(200)).as_bytes(),
+    );
+    let mut win = TextWindow::new(
+        TextDoc::open(&path).unwrap(),
+        "swap".into(),
+        "swap.txt",
+        vec![],
+    );
+    let clock = on_clock(&mut win);
+    let mut drv = Driver::new(600.0, 400.0);
+    drv.until(&mut win, 5, |w| w.ready());
+    drv.key(&mut win, Key::W, Modifiers::NONE);
+    let fresh = write(tmp.path(), ".swap.tmp", b"a\nnew line two\n");
+    std::fs::rename(&fresh, &path).unwrap();
+    later(&clock, 2.0);
+    reread(&mut drv, &mut win, 2);
+    drv.key(&mut win, Key::W, Modifiers::NONE);
+    drv.until(&mut win, 5, |w| w.ready());
+    assert!(
+        drv.find_text("new line two").is_some(),
+        "{}",
+        win.status.text
+    );
+    assert!(!drv.texts().iter().any(|(_, _, t)| t.contains("old")));
+}
+
+/// Several tabs on one wrapped row each go to their own stop: a row that fits shows the same
+/// columns as the unwrapped view (nested indentation, tab-separated columns).
+#[test]
+fn several_tabs_on_a_row_each_go_to_their_stop() {
+    let tmp = tempfile::tempdir().unwrap();
+    let lines = ["\t\tfoo\tbar", "a\tb\tc", "ab\t\tcd\te"];
+    let body: String = lines.iter().map(|l| format!("{l}\n")).collect();
+    let mut win = viewer(tmp.path(), "tabs.tsv", &body);
+    let mut drv = Driver::new(600.0, 400.0);
+    drv.until(&mut win, 5, |w| w.ready());
+    let x = text_x(&drv, "a   b");
+    let rows = rows_at(&drv, x);
+    let want: Vec<String> = lines
+        .iter()
+        .map(|l| {
+            let plain = chrome::Palette::of(&drv.ctx.global_style().visuals).text;
+            expand_tabs(vec![(plain, l.to_string())])
+                .into_iter()
+                .map(|(_, t)| t)
+                .collect()
+        })
+        .collect();
+    assert_eq!(rows, want);
+    assert_eq!(rows[0], "        foo bar");
 }

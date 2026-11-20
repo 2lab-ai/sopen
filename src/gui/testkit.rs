@@ -404,6 +404,34 @@ impl Driver {
         })
     }
 
+    /// Every text the last pass drew, wherever it lies: its bounds on screen, the clip rect it was
+    /// drawn under (what runs out of it is cut there on screen) and its text, in drawing order.
+    /// Unlike [`Driver::find_text`] it keeps the texts that run out of their clip.
+    pub fn texts(&self) -> Vec<(Rect, Rect, String)> {
+        fn walk(shape: &egui::Shape, out: &mut Vec<(Rect, String)>) {
+            match shape {
+                egui::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
+                egui::Shape::Text(t) => out.push((
+                    t.galley.rect.translate(t.pos.to_vec2()),
+                    t.galley.text().to_string(),
+                )),
+                _ => {}
+            }
+        }
+        let mut out = Vec::new();
+        for c in &self.shapes {
+            let mut found = Vec::new();
+            walk(&c.shape, &mut found);
+            let moved = c.transform_after_tessellation;
+            out.extend(
+                found
+                    .into_iter()
+                    .map(|(r, t)| (moved.mul_rect(r), c.clip_rect, t)),
+            );
+        }
+        out
+    }
+
     /// Where the last pass drew a picture (a mesh on a texture of the window's own, not the font
     /// atlas) that can be seen.
     pub fn pictures(&self) -> Vec<Rect> {

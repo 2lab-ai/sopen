@@ -265,6 +265,25 @@ fn enter_on_code_shows_it_highlighted_and_esc_comes_back() {
     assert_eq!(fx.current(), "main.rs");
 }
 
+/// The text viewer's F2 joins the row: "Unwrap" while lines wrap (the default), "Wrap" once it
+/// — or W — turned wrapping off; both work in the browser, and Esc still leaves.
+#[test]
+fn a_hosted_text_viewer_lists_its_wrap_key() {
+    let mut fx = fixture();
+    fx.open("notes.txt");
+    for label in ["Exit   ", "Edit   ", "Unwrap "] {
+        assert!(fx.drv.find_text(label).is_some(), "{label:?} in the row");
+    }
+    fx.key(Key::F2);
+    assert!(fx.drv.find_text("Wrap   ").is_some(), "F2 unwrapped");
+    assert!(fx.drv.find_text("Unwrap ").is_none());
+    fx.key(Key::W);
+    assert!(fx.drv.find_text("Unwrap ").is_some(), "W wrapped again");
+    fx.key(Key::Escape);
+    assert!(fx.b.viewer.is_none());
+    assert!(!fx.drv.closed(), "only the viewer went");
+}
+
 /// Drags a rectangle over the image in the viewer and crops to it: an unsaved edit.
 fn edit_image(fx: &mut Fx) {
     let c = Pos2::new(500.0, 350.0);
@@ -956,6 +975,35 @@ fn the_open_state_opens_an_entry_once_listed() {
     drv.until(&mut b, 20, |b| b.ready() && b.viewer.is_some());
     assert!(drv.find_text("fn main() {").is_some());
     assert_eq!(b.panels[0].current().unwrap().name, "main.rs");
+}
+
+/// With `open=NAME`, `SOPEN_STATE` `at=OFFSET` opens the text viewer with the row that byte
+/// is in at the top.
+#[test]
+fn the_at_state_opens_a_text_file_at_that_byte() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = std::fs::canonicalize(tmp.path()).unwrap();
+    let body: String = (0..1000).map(|i| format!("row {i:04}\n")).collect();
+    std::fs::write(root.join("rows.txt"), &body).unwrap();
+    let mut b = Browser::new(Start {
+        fs: Box::new(LocalFs::new()),
+        connect: local_connect(),
+        label: None,
+        abs: root.to_str().unwrap().to_string(),
+        cache: tmp.path().join("cache"),
+        launch: Arc::new(|_: &str, _: bool| Ok(String::new())),
+    });
+    b.open_first = Some("rows.txt".to_string());
+    // Inside "row 0600".
+    b.open_at = Some(600 * 9 + 5);
+    let mut drv = Driver::new(1000.0, 700.0);
+    drv.until(&mut b, 20, |b| b.ready() && b.viewer.is_some());
+    let rows = drv.texts_starting_with("row ");
+    let top = rows
+        .iter()
+        .min_by(|a, b| a.0.top().total_cmp(&b.0.top()))
+        .map(|(_, t)| t.as_str());
+    assert_eq!(top, Some("row 0600"), "{rows:?}");
 }
 
 /// Video in the browser: Enter shows the media window (its first frame decoded), Esc leaves it.
