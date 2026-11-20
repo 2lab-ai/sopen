@@ -51,8 +51,7 @@ The "After" column is authoritative; this is the order it gives.
    the 02 §4.3–§4.4 edits.
 8. ED4, then the browser's S2-E (after W4–W7 and ED4–ED6, or the trait default only), then D1.
 
-**02 §8, to add at this branch's rebase** (this base has no 02): at the end of "Hand-overs between
-slices", add: "S2-E changes the viewer files (`text`, `image`, `hex`, `media`) only after the
+**02 §8 (added in this docs PR):** at the end of "Hand-overs between slices": "S2-E changes the viewer files (`text`, `image`, `hex`, `media`) only after the
 streaming units W4–W7 and ED4–ED6 have merged, or it touches only the `Window` trait's default
 (`.prd/06-streaming.md` §13)."
 
