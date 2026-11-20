@@ -1347,3 +1347,53 @@ fn only_a_local_text_file_is_followed() {
         assert_eq!(asked, followed, "{label:?}");
     }
 }
+
+/// Audio in the browser (message 13): the media viewer's F5 Save joins the row; its edits are
+/// its own keys there (Cmd/Ctrl+X cuts in the viewer, the browser takes none of it); leaving
+/// with an edit asks first, and Discard leaves without writing anything.
+#[test]
+fn a_hosted_media_viewer_lists_f5_and_leaving_with_an_edit_asks() {
+    let tools = match crate::ffmpeg::resolve() {
+        Ok(t) => t,
+        Err(e) if std::env::var_os("SOPEN_REQUIRE_FFMPEG").is_some() => {
+            panic!("SOPEN_REQUIRE_FFMPEG is set but {e}")
+        }
+        Err(e) => {
+            eprintln!("skipping: {e}");
+            return;
+        }
+    };
+    let mut fx = fixture();
+    let wav = format!("{}/tone.wav", fx.root);
+    let ok = std::process::Command::new(&tools.ffmpeg)
+        .args(["-hide_banner", "-loglevel", "error", "-nostdin", "-y"])
+        .args(["-f", "lavfi", "-i", "sine=frequency=440:duration=2"])
+        .arg(&wav)
+        .status()
+        .unwrap()
+        .success();
+    assert!(ok, "fixture");
+    let original = std::fs::read(&wav).unwrap();
+    let root = fx.root.clone();
+    fx.b.list(Some(0), root, None, None);
+    fx.settle();
+    fx.open("tone.wav");
+    for label in ["Exit   ", "Edit   ", "Save   "] {
+        assert!(fx.drv.find_text(label).is_some(), "{label:?} in the row");
+    }
+    // Select the first half with I/O at the playhead and cut it.
+    fx.key(Key::ArrowRight);
+    fx.key(Key::O);
+    fx.drv.cut(&mut fx.b);
+    assert!(
+        fx.drv.text_starting_with("unsaved: ").is_some(),
+        "the cut landed in the viewer"
+    );
+    fx.key(Key::Escape);
+    assert!(fx.b.viewer.is_some(), "still in the viewer");
+    assert!(fx.drv.find_text("Unsaved changes").is_some(), "the prompt");
+    fx.drv.click_text(&mut fx.b, "Discard");
+    fx.drv.idle(&mut fx.b, 2);
+    assert!(fx.b.viewer.is_none(), "Discard leaves");
+    assert_eq!(std::fs::read(&wav).unwrap(), original, "nothing written");
+}

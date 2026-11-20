@@ -118,6 +118,13 @@ pub const IMAGE_KEYS: &[FKey] = &[FKey {
     label: "Save",
 }];
 
+/// The media window's own key: F5 is Save, as in the image and hex windows (message 13 made
+/// video and audio savable).
+pub const MEDIA_KEYS: &[FKey] = &[FKey {
+    n: 5,
+    label: "Save",
+}];
+
 /// `keys` and `more` as one row, by number (a number in both keeps the first).
 pub fn merged(keys: &[FKey], more: &[FKey]) -> Vec<FKey> {
     let mut all: Vec<FKey> = keys.to_vec();

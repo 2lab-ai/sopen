@@ -5,7 +5,7 @@
 
 use anyhow::{anyhow, bail, Context, Result};
 use std::collections::HashSet;
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -41,6 +41,133 @@ pub fn resolve() -> Result<Tools> {
     })
 }
 
+/// What ffmpeg and ffprobe read for a media window: one value — a local path today, and a URL
+/// once remote media is streamed — handed unchanged to every run on the source: the probe,
+/// playback, the paused frame, the waveform, Save and Export. Nothing reads the source any
+/// other way (Save's backup asks for [`Input::local`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Input(OsString);
+
+impl Input {
+    pub fn path(path: &Path) -> Self {
+        Self(path.as_os_str().to_owned())
+    }
+
+    /// As ffmpeg's `-i` (and ffprobe's) argument.
+    pub fn arg(&self) -> &OsStr {
+        &self.0
+    }
+
+    /// A local file's path; `None` for a URL.
+    pub fn local(&self) -> Option<&Path> {
+        let text = self.0.to_string_lossy();
+        (!text.contains("://")).then(|| Path::new(&self.0))
+    }
+
+    /// The extension of its last path segment (a URL's query and fragment left out),
+    /// lowercase.
+    pub fn ext(&self) -> String {
+        let text = self.0.to_string_lossy();
+        let path = text.split(['?', '#']).next().unwrap_or_default();
+        let last = path.rsplit('/').next().unwrap_or_default();
+        match last.rfind('.') {
+            Some(i) if i > 0 => last[i + 1..].to_ascii_lowercase(),
+            _ => String::new(),
+        }
+    }
+
+    pub fn show(&self) -> String {
+        self.0.to_string_lossy().into_owned()
+    }
+}
+
+impl AsRef<OsStr> for Input {
+    fn as_ref(&self) -> &OsStr {
+        &self.0
+    }
+}
+
+/// Starts an ffmpeg or ffprobe run. Every run on a media file goes through here or
+/// [`output`], so the tests can count them per file ([`spawns`]): editing must start none.
+pub fn spawn(cmd: &mut Command) -> std::io::Result<std::process::Child> {
+    #[cfg(test)]
+    spawns::note(cmd);
+    cmd.spawn()
+}
+
+/// [`spawn`], waited for, its output collected.
+pub fn output(cmd: &mut Command) -> std::io::Result<std::process::Output> {
+    #[cfg(test)]
+    spawns::note(cmd);
+    cmd.output()
+}
+
+/// Test-only: how many ffmpeg / ffprobe runs read each file, by what they were for.
+#[cfg(test)]
+pub mod spawns {
+    use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+    use std::sync::{Mutex, OnceLock};
+
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+    pub struct Counts {
+        /// Decodes for the screen: playback, a paused frame, the waveform.
+        pub preview: u64,
+        /// Runs that write a file (Save, Export, `sopen cut`).
+        pub render: u64,
+        /// ffprobe.
+        pub probe: u64,
+    }
+
+    impl Counts {
+        pub fn total(&self) -> u64 {
+            self.preview + self.render + self.probe
+        }
+    }
+
+    fn map() -> &'static Mutex<HashMap<PathBuf, Counts>> {
+        static MAP: OnceLock<Mutex<HashMap<PathBuf, Counts>>> = OnceLock::new();
+        MAP.get_or_init(Mutex::default)
+    }
+
+    /// Records `cmd` against every file it reads (`-i FILE`; ffprobe's last argument). Tests
+    /// run in parallel, each on files of its own, so the count of one file is one test's.
+    pub fn note(cmd: &Command) {
+        let args: Vec<_> = cmd.get_args().collect();
+        let probe = Path::new(cmd.get_program())
+            .file_name()
+            .is_some_and(|n| n.to_string_lossy().contains("ffprobe"));
+        let render = args.iter().any(|a| *a == "-progress");
+        let mut files: Vec<PathBuf> = args
+            .windows(2)
+            .filter(|w| w[0] == "-i")
+            .map(|w| PathBuf::from(w[1]))
+            .collect();
+        if probe {
+            files.extend(args.last().map(PathBuf::from));
+        }
+        files.sort();
+        files.dedup();
+        let mut map = map().lock().unwrap();
+        for file in files {
+            let c = map.entry(file).or_default();
+            if probe {
+                c.probe += 1;
+            } else if render {
+                c.render += 1;
+            } else {
+                c.preview += 1;
+            }
+        }
+    }
+
+    /// The runs that read `file` so far.
+    pub fn of(file: &Path) -> Counts {
+        map().lock().unwrap().get(file).copied().unwrap_or_default()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Probe {
     pub duration: Option<f64>,
@@ -66,27 +193,37 @@ pub struct Probe {
     pub has_audio: bool,
     /// ffprobe `codec_name` of the first audio stream (`aac`, `opus`, `pcm_s24le`, …).
     pub audio_codec: Option<String>,
+    /// The first audio stream's channel count and sample rate, when ffprobe reports them.
+    pub channels: Option<u32>,
+    pub sample_rate: Option<u32>,
+    /// Every audio stream's channels and rate, in order.
+    pub tracks: Vec<Track>,
+    /// Chapters in the file (an edited output does not carry them).
+    pub chapters: usize,
     pub audio_streams: usize,
     /// Streams no export keeps, one entry per stream: `subtitle`, `data`, `attachment`,
     /// `cover art`, `video` (a second picture stream).
     pub dropped: Vec<String>,
 }
 
-/// `ffprobe -v error -print_format json -show_format -show_streams <path>`.
-pub fn probe(tools: &Tools, path: &Path) -> Result<Probe> {
-    let out = Command::new(&tools.ffprobe)
-        .args([
-            "-v",
-            "error",
-            "-print_format",
-            "json",
-            "-show_format",
-            "-show_streams",
-        ])
-        .arg(path)
-        .stdin(Stdio::null())
-        .output()
-        .with_context(|| format!("cannot run {}", tools.ffprobe.display()))?;
+/// `ffprobe -v error -print_format json -show_format -show_streams -show_chapters <input>` (a
+/// path or a URL).
+pub fn probe(tools: &Tools, input: impl AsRef<OsStr>) -> Result<Probe> {
+    let path = Path::new(input.as_ref());
+    let mut cmd = Command::new(&tools.ffprobe);
+    cmd.args([
+        "-v",
+        "error",
+        "-print_format",
+        "json",
+        "-show_format",
+        "-show_streams",
+        "-show_chapters",
+    ])
+    .arg(path)
+    .stdin(Stdio::null());
+    let out =
+        output(&mut cmd).with_context(|| format!("cannot run {}", tools.ffprobe.display()))?;
     if !out.status.success() {
         bail!(
             "ffprobe cannot read {}: {}",
@@ -115,6 +252,8 @@ pub fn parse_probe(json: &str) -> Result<Probe> {
     let mut rotation = 0;
     let mut fps = None;
     let mut audio_codec = None;
+    let (mut channels, mut sample_rate) = (None, None);
+    let mut tracks = Vec::new();
     let mut has_audio = false;
     let (mut video_index, mut videos_seen) = (0, 0);
     let (mut pix_fmt, mut bits, mut color) = (None, None, Vec::new());
@@ -160,9 +299,15 @@ pub fn parse_probe(json: &str) -> Result<Probe> {
                 rotation = quarter_turns(matrix.or_else(|| num(&s["tags"]["rotate"])));
             }
             Some("audio") => {
+                let track = Track {
+                    channels: s["channels"].as_u64().map(|c| c as u32).filter(|c| *c > 0),
+                    rate: num(&s["sample_rate"]).map(|r| r as u32).filter(|r| *r > 0),
+                };
                 if !has_audio {
                     audio_codec = s["codec_name"].as_str().map(str::to_string);
+                    (channels, sample_rate) = (track.channels, track.rate);
                 }
+                tracks.push(track);
                 has_audio = true;
                 audio_streams += 1;
             }
@@ -183,6 +328,10 @@ pub fn parse_probe(json: &str) -> Result<Probe> {
         color,
         has_audio,
         audio_codec,
+        channels,
+        sample_rate,
+        tracks,
+        chapters: v["chapters"].as_array().map_or(0, Vec::len),
         audio_streams,
         dropped,
     })
@@ -283,12 +432,13 @@ pub fn encoder_pix_fmts(tools: &Tools, encoder: &str) -> Result<HashSet<String>>
     if let Some(hit) = cache.lock().unwrap().get(&key) {
         return Ok(hit.clone());
     }
-    let out = Command::new(&tools.ffmpeg)
-        .args(["-hide_banner", "-h"])
-        .arg(format!("encoder={encoder}"))
-        .stdin(Stdio::null())
-        .output()
-        .with_context(|| format!("cannot run {}", tools.ffmpeg.display()))?;
+    let out = output(
+        Command::new(&tools.ffmpeg)
+            .args(["-hide_banner", "-h"])
+            .arg(format!("encoder={encoder}"))
+            .stdin(Stdio::null()),
+    )
+    .with_context(|| format!("cannot run {}", tools.ffmpeg.display()))?;
     let formats = parse_pix_fmts(&String::from_utf8_lossy(&out.stdout));
     cache.lock().unwrap().insert(key, formats.clone());
     Ok(formats)
@@ -310,7 +460,7 @@ pub struct ExportPlan {
 }
 
 /// Containers that hold one audio stream.
-fn single_audio(ext: &str) -> bool {
+pub fn single_audio(ext: &str) -> bool {
     matches!(ext, "mp3" | "wav" | "flac" | "aac")
 }
 
@@ -672,6 +822,454 @@ pub fn export_args(
     Ok(args)
 }
 
+/// One piece of an edited output: `len` seconds of input file `file` from `start`; on video,
+/// exactly `frames` frames (its audio is cut to the same seconds).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Span {
+    pub file: usize,
+    pub start: f64,
+    pub len: f64,
+    pub frames: Option<u64>,
+}
+
+/// An audio track of the source as ffprobe reports it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Track {
+    pub channels: Option<u32>,
+    pub rate: Option<u32>,
+}
+
+/// An edited output (spec §7, message 13): its pieces in order, Mono → Stereo, the crop, and
+/// the audio tracks it carries.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EditSpec {
+    pub spans: Vec<Span>,
+    /// The video's frame rate (cut points are its frame times).
+    pub fps: Option<f64>,
+    /// Mono → Stereo: every mono track becomes stereo, left = right = its channel.
+    pub stereo: bool,
+    pub crop: Option<Rect>,
+    /// The audio tracks rendered, in order (all of the source's, or the first for a container
+    /// that holds one).
+    pub tracks: Vec<Track>,
+}
+
+impl EditSpec {
+    /// The output's length in seconds.
+    pub fn length(&self) -> f64 {
+        self.spans.iter().map(|s| s.len).sum()
+    }
+
+    /// Runs of pieces in file and source order, near enough to share one input.
+    pub fn groups(&self) -> Vec<Vec<usize>> {
+        let mut groups: Vec<Vec<usize>> = Vec::new();
+        for (i, s) in self.spans.iter().enumerate() {
+            let joins = groups.last().is_some_and(|g| {
+                let prev = &self.spans[*g.last().expect("never empty")];
+                let end = prev.start + prev.len;
+                prev.file == s.file && s.start >= end - 1e-9 && s.start - end <= SHARE_GAP_S
+            });
+            match groups.last_mut() {
+                Some(g) if joins => g.push(i),
+                _ => groups.push(vec![i]),
+            }
+        }
+        groups
+    }
+}
+
+/// One render opens at most this many inputs, each a demuxer and decoder of its own (300 of
+/// them took 1.6 GB on a 64×64 source and ran out of file descriptors at `ulimit -n 256`). An
+/// edit that needs more is rendered in passes ([`edit_passes`]).
+pub const MAX_INPUTS: usize = 24;
+/// Pieces that follow each other in the source closer than this share one input: decoded
+/// through, not sought again.
+const SHARE_GAP_S: f64 = 10.0;
+/// A filter graph longer than this goes to a file (one argument may hold 128 KiB on Linux).
+const INLINE_GRAPH: usize = 32 * 1024;
+/// Every input starts this far before its first piece, which is then trimmed from the decoded
+/// stream: right after a seek AAC and MP3 come out a few milliseconds off (154 samples for AAC
+/// at 44.1 kHz, measured); 0.1 s of run-up made both sample-exact.
+const EDIT_PREROLL_S: f64 = 0.2;
+
+/// How an edit render encodes: for the file it makes, or losslessly for a later pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Encode {
+    Final,
+    /// H.264 at `-qp 0` (lossless) in the output pixel format, PCM float, in Matroska.
+    Lossless,
+}
+
+/// An edit render's arguments: the inputs, the filter graph, the maps / encoders / output.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EditArgs {
+    pub inputs: Vec<OsString>,
+    pub graph: String,
+    pub outputs: Vec<OsString>,
+}
+
+/// The ffmpeg arguments that render `spec` from `files` into `dst` (pure). Exact cuts for any
+/// number of pieces without decoding the source once per piece: pieces that follow each other
+/// in the source share one input (`-ss` to just before the first, `-t` past the last, then
+/// `split`), a piece out of order gets an input of its own; every piece is cut from its input
+/// by time — video to half a frame before its first frame, then put on the frame-rate grid from
+/// there (`fps`: a no-op on a constant-rate source, the preview's resampling on a variable one;
+/// before the trim it shifted the grid by a frame) — and then counted out (`trim=end_frame` /
+/// `atrim=end_sample`, padded to the count if the stream is short there), so the output has
+/// exactly the frames and samples the timeline shows, and `concat` joins them.
+/// Input-side `-t` alone is not exact (AAC came out one frame short), nor is a trim that starts
+/// right at the seek point ([`EDIT_PREROLL_S`]). Each audio track is counted at its own rate;
+/// Mono → Stereo pans the mono ones (`pan=stereo|c0=c0|c1=c0`, full level). Chapters are not
+/// carried: an edit moves them.
+pub fn edit_args(
+    files: &[&Input],
+    dst: &Path,
+    spec: &EditSpec,
+    kind: MediaKind,
+    plan: &ExportPlan,
+    encode: Encode,
+) -> Result<EditArgs> {
+    if spec.spans.is_empty()
+        || spec
+            .spans
+            .iter()
+            .any(|s| s.len.is_nan() || s.len <= 0.0 || s.start < 0.0 || s.file >= files.len())
+    {
+        bail!("the edit has nothing to render");
+    }
+    let ext = dst
+        .extension()
+        .map(|e| e.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+    let video = kind == MediaKind::Video;
+    if !video && spec.crop.is_some() {
+        bail!("--crop applies to video only");
+    }
+    let tracks = &spec.tracks;
+    if !video && tracks.is_empty() {
+        bail!("no audio stream to render");
+    }
+    // Half a frame early, so the first frame is the one at the cut whatever the rounding.
+    let half = match (video, spec.fps) {
+        (true, Some(fps)) if fps > 0.0 => 0.5 / fps,
+        _ => 0.0,
+    };
+    let groups = spec.groups();
+    if groups.len() > MAX_INPUTS {
+        bail!(
+            "one render reads at most {MAX_INPUTS} inputs; this edit needs {} (render it in \
+             passes)",
+            groups.len()
+        );
+    }
+    let mut inputs: Vec<OsString> = Vec::new();
+    let mut graph: Vec<String> = Vec::new();
+    // Each piece's labels, in output order.
+    let mut piece_v: Vec<String> = vec![String::new(); spec.spans.len()];
+    let mut piece_a: Vec<Vec<String>> = vec![Vec::new(); spec.spans.len()];
+    for (g, members) in groups.iter().enumerate() {
+        let first = &spec.spans[members[0]];
+        let file = files[first.file];
+        let ts = file.ext() == "ts";
+        let end = members
+            .iter()
+            .map(|&i| spec.spans[i].start + spec.spans[i].len)
+            .fold(0.0, f64::max);
+        let pre = if ts { TS_PRESEEK_S } else { EDIT_PREROLL_S };
+        let seek = (first.start - half - pre).max(0.0);
+        if seek > 0.0 {
+            inputs.extend(["-ss".into(), OsString::from(format!("{seek:.6}"))]);
+        }
+        inputs.extend([
+            "-t".into(),
+            OsString::from(format!("{:.6}", end - seek + 1.0)),
+            "-i".into(),
+            file.arg().to_owned(),
+        ]);
+        let m = members.len();
+        let fan = |graph: &mut Vec<String>, from: String, tag: &str, filter: &str| -> Vec<String> {
+            if m == 1 {
+                return vec![from];
+            }
+            let outs: Vec<String> = (0..m).map(|k| format!("[g{g}{tag}{k}]")).collect();
+            graph.push(format!("{from}{filter}={m}{}", outs.concat()));
+            outs
+        };
+        // Intermediate files hold one picture stream and the rendered tracks, in order.
+        let video_index = if first.file == 0 { plan.video_index } else { 0 };
+        if video {
+            let ins = fan(&mut graph, format!("[{g}:v:{video_index}]"), "v", "split");
+            for (k, &i) in members.iter().enumerate() {
+                let s = &spec.spans[i];
+                // On the frame-rate grid from the piece's first frame (a variable-rate source
+                // too, as the preview shows it), then counted out.
+                let grid = spec
+                    .fps
+                    .map(|fps| format!(",fps={fps:.6}"))
+                    .unwrap_or_default();
+                let count = match s.frames {
+                    Some(n) => format!(
+                        "{grid},trim=end_frame={n},tpad=stop={n}:stop_mode=clone,\
+                         trim=end_frame={n},setpts=PTS-STARTPTS"
+                    ),
+                    None => format!(",trim=duration={:.6},setpts=PTS-STARTPTS", s.len),
+                };
+                let label = format!("[v{i}]");
+                graph.push(format!(
+                    "{}trim=start={:.6},setpts=PTS-STARTPTS{count}{label}",
+                    ins[k],
+                    (s.start - half - seek).max(0.0)
+                ));
+                piece_v[i] = label;
+            }
+        }
+        for (t, track) in tracks.iter().enumerate() {
+            let ins = fan(
+                &mut graph,
+                format!("[{g}:a:{t}]"),
+                &format!("a{t}_"),
+                "asplit",
+            );
+            for (k, &i) in members.iter().enumerate() {
+                let s = &spec.spans[i];
+                let count = match track.rate {
+                    Some(rate) => {
+                        let n = (s.len * f64::from(rate)).round() as u64;
+                        format!(",atrim=end_sample={n},apad=whole_len={n},asetpts=PTS-STARTPTS")
+                    }
+                    None => format!(",atrim=duration={:.6},asetpts=PTS-STARTPTS", s.len),
+                };
+                let label = format!("[a{i}_{t}]");
+                graph.push(format!(
+                    "{}atrim=start={:.6},asetpts=PTS-STARTPTS{count}{label}",
+                    ins[k],
+                    (s.start - seek).max(0.0)
+                ));
+                piece_a[i].push(label);
+            }
+        }
+    }
+    let mut joined = String::new();
+    for i in 0..spec.spans.len() {
+        joined.push_str(&piece_v[i]);
+        joined.push_str(&piece_a[i].concat());
+    }
+    let n_tracks = tracks.len();
+    let outs_a: Vec<String> = (0..n_tracks).map(|t| format!("[ca{t}]")).collect();
+    graph.push(format!(
+        "{joined}concat=n={}:v={}:a={n_tracks}{}{}",
+        spec.spans.len(),
+        u8::from(video),
+        if video { "[cv]" } else { "" },
+        outs_a.concat()
+    ));
+    let last = encode == Encode::Final;
+    let mut v_out = "[cv]".to_string();
+    if let (true, true, Some(r)) = (last, video, spec.crop) {
+        let (w, h) = (r.w & !1, r.h & !1);
+        graph.push(format!("[cv]crop={w}:{h}:{}:{}[vo]", r.x, r.y));
+        v_out = "[vo]".to_string();
+    }
+    let mut a_out = outs_a.clone();
+    if last && spec.stereo {
+        for (t, label) in a_out.iter_mut().enumerate() {
+            if tracks[t].channels == Some(1) {
+                graph.push(format!("{label}pan=stereo|c0=c0|c1=c0[so{t}]"));
+                *label = format!("[so{t}]");
+            }
+        }
+    }
+    let mut outputs: Vec<OsString> = Vec::new();
+    let push = |args: &mut Vec<OsString>, list: &[&str]| {
+        args.extend(list.iter().map(OsString::from));
+    };
+    if video {
+        push(&mut outputs, &["-map", &v_out]);
+    }
+    for label in &a_out {
+        push(&mut outputs, &["-map", label]);
+    }
+    push(&mut outputs, &["-map_chapters", "-1"]);
+    // Each audio track's own tags (language, title) travel with it; a filter's output has none.
+    for t in 0..n_tracks {
+        push(
+            &mut outputs,
+            &[&format!("-map_metadata:s:a:{t}"), &format!("0:s:a:{t}")],
+        );
+    }
+    match (encode, video) {
+        (Encode::Lossless, _) => {
+            if video {
+                push(
+                    &mut outputs,
+                    &[
+                        "-c:v",
+                        "libx264",
+                        "-preset",
+                        "ultrafast",
+                        "-qp",
+                        "0",
+                        "-pix_fmt",
+                        plan.pix_fmt,
+                    ],
+                );
+            }
+            if n_tracks > 0 {
+                push(&mut outputs, &["-c:a", "pcm_f32le"]);
+            }
+            push(&mut outputs, &["-f", "matroska"]);
+        }
+        (Encode::Final, true) => {
+            push(
+                &mut outputs,
+                &[
+                    "-c:v",
+                    "libx264",
+                    "-preset",
+                    "veryfast",
+                    "-crf",
+                    "18",
+                    "-pix_fmt",
+                    plan.pix_fmt,
+                ],
+            );
+            for (option, value) in &plan.color {
+                push(&mut outputs, &[option, value]);
+            }
+            if n_tracks > 0 {
+                push(&mut outputs, &["-c:a", "aac", "-b:a", "192k"]);
+            }
+            if matches!(ext.as_str(), "mp4" | "mov" | "m4v") {
+                push(&mut outputs, &["-movflags", "+faststart"]);
+            }
+        }
+        (Encode::Final, false) => match plan.audio_codec.as_deref().and_then(encoder_for_codec) {
+            Some(codec) => outputs.extend(codec.into_iter().map(OsString::from)),
+            None => match encoder_for_container(&ext) {
+                Some(codec) => push(&mut outputs, codec),
+                None => bail!("no audio export for .{ext} files"),
+            },
+        },
+    }
+    outputs.push(dst.as_os_str().to_owned());
+    Ok(EditArgs {
+        inputs,
+        graph: graph.join(";"),
+        outputs,
+    })
+}
+
+/// How an edit is rendered: passes whose pieces need at most [`MAX_INPUTS`] inputs each, made
+/// losslessly ([`Encode::Lossless`]) into intermediate files 1, 2, … (file 0 is the source),
+/// then the final pass over those files in order. One pass when it fits; more than
+/// [`MAX_INPUTS`]² separate stretches of the source is refused.
+pub fn edit_passes(spec: &EditSpec) -> Result<Vec<EditSpec>> {
+    let groups = spec.groups();
+    if groups.len() <= MAX_INPUTS {
+        return Ok(vec![spec.clone()]);
+    }
+    let chunks: Vec<&[Vec<usize>]> = groups.chunks(MAX_INPUTS).collect();
+    if chunks.len() > MAX_INPUTS {
+        bail!(
+            "this edit takes {} separate stretches of the source; at most {} can be rendered \
+             at once — save part of the edit first",
+            groups.len(),
+            MAX_INPUTS * MAX_INPUTS
+        );
+    }
+    let mut passes: Vec<EditSpec> = chunks
+        .iter()
+        .map(|chunk| EditSpec {
+            spans: chunk.iter().flatten().map(|&i| spec.spans[i]).collect(),
+            ..spec.clone()
+        })
+        .collect();
+    // Each intermediate is one piece of the final pass: the whole file, its frames counted.
+    let last = EditSpec {
+        spans: passes
+            .iter()
+            .enumerate()
+            .map(|(k, p)| Span {
+                file: k + 1,
+                start: 0.0,
+                len: p.length(),
+                frames: p.spans.iter().map(|s| s.frames).sum::<Option<u64>>(),
+            })
+            .collect(),
+        ..spec.clone()
+    };
+    passes.push(last);
+    Ok(passes)
+}
+
+/// This ffmpeg's major version (`ffmpeg version 9.0.2`, `n7.1`, `6.1.1-3ubuntu5`); a git build
+/// (`N-…`) counts as new. Asked once per ffmpeg.
+pub fn major_version(tools: &Tools) -> Option<u32> {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    static CACHE: OnceLock<Mutex<HashMap<PathBuf, Option<u32>>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(Mutex::default);
+    if let Some(hit) = cache.lock().unwrap().get(&tools.ffmpeg) {
+        return *hit;
+    }
+    let out = output(
+        Command::new(&tools.ffmpeg)
+            .arg("-version")
+            .stdin(Stdio::null()),
+    )
+    .ok();
+    let major = out.and_then(|o| parse_major(&String::from_utf8_lossy(&o.stdout)));
+    cache.lock().unwrap().insert(tools.ffmpeg.clone(), major);
+    major
+}
+
+/// The major version in `ffmpeg -version`'s first line.
+pub fn parse_major(text: &str) -> Option<u32> {
+    let rest = text.lines().next()?.split("version ").nth(1)?;
+    if rest.starts_with("N-") {
+        return Some(u32::MAX);
+    }
+    let digits: String = rest
+        .trim_start_matches('n')
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect();
+    digits.parse().ok()
+}
+
+/// The whole argument list for an edit render: the graph inline, or — when long — in a file in
+/// `work` (`-/filter_complex FILE` from ffmpeg 7, which dropped `-filter_complex_script`; that
+/// one before).
+pub fn assemble(tools: &Tools, edit: EditArgs, work: &Path, name: &str) -> Result<Vec<OsString>> {
+    assemble_inline_up_to(tools, edit, work, name, INLINE_GRAPH)
+}
+
+/// [`assemble`] with the longest graph kept inline given (the tests force the file).
+pub fn assemble_inline_up_to(
+    tools: &Tools,
+    edit: EditArgs,
+    work: &Path,
+    name: &str,
+    inline: usize,
+) -> Result<Vec<OsString>> {
+    let mut args = edit.inputs;
+    if edit.graph.len() <= inline {
+        args.extend(["-filter_complex".into(), edit.graph.into()]);
+    } else {
+        let file = work.join(name);
+        std::fs::write(&file, &edit.graph)
+            .with_context(|| format!("cannot write {}", file.display()))?;
+        let option = if major_version(tools).is_some_and(|m| m >= 7) {
+            "-/filter_complex"
+        } else {
+            "-filter_complex_script"
+        };
+        args.extend([option.into(), file.into_os_string()]);
+    }
+    args.extend(edit.outputs);
+    Ok(args)
+}
+
 /// Encoder names (`libx264`, `aac`, …) from `ffmpeg -hide_banner -encoders`.
 pub fn parse_encoders(listing: &str) -> HashSet<String> {
     let mut names = HashSet::new();
@@ -693,11 +1291,12 @@ pub fn parse_encoders(listing: &str) -> HashSet<String> {
 }
 
 pub fn available_encoders(tools: &Tools) -> Result<HashSet<String>> {
-    let out = Command::new(&tools.ffmpeg)
-        .args(["-hide_banner", "-encoders"])
-        .stdin(Stdio::null())
-        .output()
-        .with_context(|| format!("cannot run {}", tools.ffmpeg.display()))?;
+    let out = output(
+        Command::new(&tools.ffmpeg)
+            .args(["-hide_banner", "-encoders"])
+            .stdin(Stdio::null()),
+    )
+    .with_context(|| format!("cannot run {}", tools.ffmpeg.display()))?;
     if !out.status.success() {
         bail!("{} -encoders failed", tools.ffmpeg.display());
     }
@@ -739,14 +1338,113 @@ fn last_line(text: &str) -> String {
         .to_string()
 }
 
+/// How long a save or export may go without its output advancing before ffmpeg is stopped.
+/// ffmpeg 7+ keeps printing progress blocks while it is stuck (the same `out_time` every half
+/// second), so the watchdog watches what they say, not whether they come; a libx264 deadlock
+/// once ran for 44 hours with nothing to stop it.
+pub const STALL_LIMIT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// The stall rule, on explicit instants (the tests drive it without a clock): the time without
+/// progress counts only while ffmpeg is waited for — never while the caller's progress callback
+/// runs (the export-hold receipt hook sleeps there on purpose).
+#[derive(Debug, Clone)]
+pub struct Watchdog {
+    limit: std::time::Duration,
+    /// Time waited since the output last advanced, and since when the current wait runs.
+    idle: std::time::Duration,
+    mark: std::time::Instant,
+    /// The last `out_time_us`, `frame` and `total_size` seen.
+    seen: [Option<String>; 3],
+}
+
+impl Watchdog {
+    pub fn new(limit: std::time::Duration, now: std::time::Instant) -> Self {
+        Self {
+            limit,
+            idle: std::time::Duration::ZERO,
+            mark: now,
+            seen: [None, None, None],
+        }
+    }
+
+    /// One `key=value` line of `-progress` output at `now`; true when it says the output moved
+    /// on.
+    pub fn line(&mut self, line: &str, now: std::time::Instant) -> bool {
+        self.idle += now.saturating_duration_since(self.mark);
+        self.mark = now;
+        let Some((key, value)) = line.split_once('=') else {
+            return false;
+        };
+        let slot = match key {
+            "out_time_us" => 0,
+            "frame" => 1,
+            "total_size" => 2,
+            _ => return false,
+        };
+        let value = value.trim();
+        if value == "N/A" || self.seen[slot].as_deref() == Some(value) {
+            return false;
+        }
+        let first = self.seen[slot].is_none();
+        self.seen[slot] = Some(value.to_string());
+        // A key's first value is a step forward only above zero (`frame=0` is where it starts).
+        let moved = !first || value.parse::<i64>().is_ok_and(|v| v > 0);
+        if moved {
+            self.idle = std::time::Duration::ZERO;
+        }
+        moved
+    }
+
+    /// The caller's own work (the progress callback) ended at `now`: that time does not count.
+    pub fn resume(&mut self, now: std::time::Instant) {
+        self.mark = now;
+    }
+
+    /// Whether ffmpeg has made no progress for longer than the limit, as of `now`.
+    pub fn stalled(&mut self, now: std::time::Instant) -> bool {
+        self.idle += now.saturating_duration_since(self.mark);
+        self.mark = now;
+        self.idle > self.limit
+    }
+}
+
+/// What a run stopped by the watchdog says: how long it stood still, and where its output was.
+pub fn stall_message(limit: std::time::Duration, out_time_us: Option<&str>) -> String {
+    let secs = limit.as_secs_f64();
+    let limit = if secs >= 10.0 {
+        format!("{secs:.0} s")
+    } else {
+        format!("{secs:.1} s")
+    };
+    let at = out_time_us
+        .and_then(|us| us.parse::<f64>().ok())
+        .map(|us| format!(" (stuck at {:.2} s of output)", us / 1e6))
+        .unwrap_or_default();
+    format!("ffmpeg made no progress for {limit}{at} and was stopped")
+}
+
 /// Runs `ffmpeg <globals> <args>` with `-progress pipe:1`; `progress` gets 0.0..=1.0 of
-/// `length_s`. On failure the last line ffmpeg printed is the error.
+/// `length_s`. On failure the last line ffmpeg printed is the error. A run whose output does not
+/// advance for [`STALL_LIMIT`] is stopped ([`Watchdog`]).
 pub fn run_export(
     tools: &Tools,
     args: &[OsString],
     length_s: f64,
     progress: &mut dyn FnMut(f64),
 ) -> Result<()> {
+    run_watched(tools, args, length_s, progress, STALL_LIMIT)
+}
+
+/// [`run_export`] with the stall limit given.
+pub fn run_watched(
+    tools: &Tools,
+    args: &[OsString],
+    length_s: f64,
+    progress: &mut dyn FnMut(f64),
+    limit: std::time::Duration,
+) -> Result<()> {
+    use std::sync::mpsc::{sync_channel, RecvTimeoutError};
+    use std::time::{Duration, Instant};
     let mut cmd = Command::new(&tools.ffmpeg);
     cmd.args([
         "-hide_banner",
@@ -769,29 +1467,76 @@ pub fn run_export(
             &cmd.get_args().map(|a| a.to_os_string()).collect::<Vec<_>>()
         )
     );
-    let mut child = cmd
-        .spawn()
-        .with_context(|| format!("cannot run {}", tools.ffmpeg.display()))?;
+    let mut child =
+        spawn(&mut cmd).with_context(|| format!("cannot run {}", tools.ffmpeg.display()))?;
     let mut stderr = child.stderr.take().expect("piped");
     let errors = std::thread::spawn(move || {
         let mut text = String::new();
         let _ = stderr.read_to_string(&mut text);
         text
     });
+    // A small queue: while the callback runs (the export-hold hook sleeps in it), the reader
+    // stops and ffmpeg blocks on its progress pipe, as it did when this thread read it.
+    let (tx, rx) = sync_channel::<std::io::Result<String>>(16);
     let stdout = child.stdout.take().expect("piped");
-    for line in BufReader::new(stdout).lines() {
-        let line = line?;
-        if let Some(us) = line.strip_prefix("out_time_us=") {
-            if let Ok(us) = us.trim().parse::<f64>() {
-                if length_s > 0.0 {
-                    progress((us / 1e6 / length_s).clamp(0.0, 1.0));
+    std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines() {
+            let failed = line.is_err();
+            if tx.send(line).is_err() || failed {
+                return;
+            }
+        }
+    });
+    let poll = Duration::from_millis(250).min(limit);
+    let mut dog = Watchdog::new(limit, Instant::now());
+    let stall = |child: &mut std::process::Child, dog: &Watchdog| {
+        let _ = child.kill();
+        let _ = child.wait();
+        anyhow!(stall_message(limit, dog.seen[0].as_deref()))
+    };
+    loop {
+        match rx.recv_timeout(poll) {
+            Ok(Ok(line)) => {
+                dog.line(&line, Instant::now());
+                if let Some(us) = line.strip_prefix("out_time_us=") {
+                    if let Ok(us) = us.trim().parse::<f64>() {
+                        if length_s > 0.0 {
+                            progress((us / 1e6 / length_s).clamp(0.0, 1.0));
+                        }
+                    }
+                } else if line == "progress=end" {
+                    progress(1.0);
+                }
+                dog.resume(Instant::now());
+                // Stuck, ffmpeg 7+ still prints a block every half second: checked here too,
+                // not only when nothing comes.
+                if dog.stalled(Instant::now()) {
+                    return Err(stall(&mut child, &dog));
                 }
             }
-        } else if line == "progress=end" {
-            progress(1.0);
+            Ok(Err(e)) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(e).context("reading ffmpeg's progress");
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                if dog.stalled(Instant::now()) {
+                    return Err(stall(&mut child, &dog));
+                }
+            }
+            Err(RecvTimeoutError::Disconnected) => break,
         }
     }
-    let status = child.wait()?;
+    // Its output is closed; it should be exiting. Still waited for under the same rule.
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if dog.stalled(Instant::now()) {
+            return Err(stall(&mut child, &dog));
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
     let errors = errors.join().unwrap_or_default();
     if !status.success() {
         bail!("ffmpeg failed ({status}): {}", last_line(&errors));

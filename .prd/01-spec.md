@@ -58,8 +58,8 @@ is laid out where PC Shell puts things (§3a), and every sopen window wears PC S
 | A1 | `sopen host:/path`, scp syntax, any machine in `~/.ssh/config` | `sopen <alias>:/abs/file`, `sopen <alias>:rel/to/home`, `sopen user@host:/x` all open; aliases, ProxyJump, agent behave exactly as `ssh <alias>` does (system ssh is used). Local paths (`sopen ./x.png`) open too. |
 | A2 | Text edit, syntax highlight; VS Code first (msg 10; folders: msg 12, A11) | Text file → VS Code when `code` is found; a remote one only when VS Code's Remote - SSH extension is installed (`code --folder-uri` / `--file-uri vscode-remote://ssh-remote+[user@]host/<percent-encoded abs>` by the kind sopen detected, since a bare `--remote` path's kind is guessed from its name; the extension is never installed by sopen), else Zed with `VS Code has no Remote - SSH extension; opening in Zed` on stderr. Without VS Code, Zed (`zed ssh://…` on macOS, `zeditor`/`zed` on Linux). A VS Code launch failure is reported, not followed by Zed. The editor owns Save. The file browser's F4 hands a folder or file to the same editor the same way (A11). On Linux under KDE Plasma (msg 11) the editor's window that asked for attention is brought to where the user is — the active window's desktop and screen — and activated (§3). |
 | A3 | Image: view + rectangle crop + rectangle pixelize + clipboard copy / cut / paste (msg 12) | Built-in window shows the image; drag draws a rectangle in image pixels; Crop and Pixelize act on it; Cmd/Ctrl+C copies it (the whole image without one) to the system clipboard as a picture, Cmd/Ctrl+X copies it and leaves it in the background colour, Cmd/Ctrl+V pastes the clipboard's picture (Stretch by default, Fit or 1:1) or text into it; Undo; Save writes back to the remote file. |
-| A4 | Video: view + rectangle crop + time cut | Built-in window plays the video with sound; scrub timeline; set In/Out; drag a crop rectangle; Export writes `<stem>.cut-<in>-<out>.<ext>` next to the original on the remote. |
-| A5 | Audio (mp3/wav): view + time cut | Same window: waveform, play, In/Out, Export. |
+| A4 | Video: view + rectangle crop + time cut; cut / copy / paste on the timeline, previewed at once, rendered only on Save (msg 13) | Built-in window plays the video with sound; scrub timeline; a drag on it selects (`I`/`O` set the selection's edges at the playhead); Cmd/Ctrl+C / X / V, Delete, Cmd/Ctrl+Z / Shift+Cmd/Ctrl+Z edit the timeline and never start ffmpeg — playback and the paused frame show the edited timeline at once; drag a crop rectangle (Export crops its whole output by it); Save (Cmd/Ctrl+S, F5) renders the edit list with ffmpeg and writes it back over the original after a local backup (§5) — the edit list only, never the rectangle; Export writes `<stem>.cut-<in>-<out>.<ext>` of the timeline, cropped, next to the original on the remote. |
+| A5 | Audio (mp3/wav): view + time cut; cut / copy / paste, both channels shown, Mono → Stereo (msg 13) | Same window: waveform (a stereo file in two lanes, L and R), play, the same selection and edits, `M` = Mono → Stereo on a mono file (left = right = its channel, heard in playback and written by Save), Save, Export. |
 | A6 | "아무 파일"; binary files open in a hex editor by default, after a dialog (msg 9) | Any other type (a zip, any binary) opens a small dialog before anything is downloaded — name, size, type when the extension says it: Enter = "Open in hex editor" (the default: fetched to the cache, then sopen's hex window, §6a); "Save to…" downloads it to a path the owner picks (the download folder by default, never over an existing file); Esc or closing it downloads nothing. `sopen --hex SOURCE` opens any file straight in the hex window. `--app <App>` still opens it in a named local app and uploads it back when the user presses Enter in the terminal. With no display (Linux over ssh) the file is fetched and its path printed, and one line says why. |
 | A7 | Rust, macOS + Linux, `brew install …` and use immediately | `brew install 2lab-ai/tap/sopen-preview` on macOS (arm64, x86_64) and Linux (x86_64, aarch64) installs `sopen` and the `ffmpeg` it needs; the first `sopen host:/a.mp3` works with no further setup. |
 | A8 | Developed like llmux | Public repo `2lab-ai/sopen`, MIT; `ci.yml` (macOS + Linux), `preview.yml` (every main push → prerelease + tap bump), `release.yml` (`v*` tag = owner gate); `AGENTS.md` SSOT; `.prd/` spec. |
@@ -389,7 +389,8 @@ symlink keeps its link). A new file is readable by its owner only (0600); a repl
   closed, EOF, garbled reply) is "outcome unknown — check <path>", never "nothing was written", and a temp or export
   that may have been created is named, not removed.
 - Image Save (Cmd/Ctrl+S) overwrites the original **after** copying the fetched original to the local backup
-  `<cache>/.backup/<host>/<abs path>.<UTC stamp>` and printing that path. "Save copy" writes `<stem>.edited.<ext>`
+  `<cache>/.backup/<host>/<abs path>.<UTC stamp>` and printing that path; media Save (§7) does the same with the
+  file it plays, then renders. "Save copy" writes `<stem>.edited.<ext>`
   next to the original instead. Media Export never overwrites (sibling file; `-N` suffix if the name exists): it is
   published by hard link from a temp, or — where links are unavailable — written into a name created exclusively.
 - Live receipts run only on files created under the remote `/tmp` for that purpose.
@@ -555,18 +556,65 @@ once the primary button is up, and take rows off the grid's bottom.
 
 ## 7. Media window (A4, A5)
 
-- Probe with `ffprobe` (duration, streams, size). `ffmpeg`/`ffprobe` are resolved at runtime (`SOPEN_FFMPEG`, then PATH;
-  the brew formula depends on `ffmpeg`).
+- Probe with `ffprobe` (duration, streams, size, each audio track's channels and rate, chapters). `ffmpeg`/`ffprobe`
+  are resolved at runtime (`SOPEN_FFMPEG`, then PATH; the brew formula depends on `ffmpeg`). Every run on the file —
+  probe, playback, the paused frame, the waveform, Save, Export — reads one input value (`ffmpeg::Input`: the local
+  file or cached copy; a URL there is the seam for streaming). Save's backup reads the local file.
 - Video: playback in the window with sound (ffmpeg subprocess decode → frames; audio → `cpal`; audio clock master),
-  timeline scrub, `I`/`O` set In/Out, drag = crop rectangle in source pixels, Space play/pause, Export.
-- Audio: waveform (downsampled PCM), same transport and In/Out, Export.
-- Export: `ffmpeg -ss In -to Out -i src [-vf crop=w:h:x:y] …` → re-encode (H.264 + AAC for video; the source codec for
-  audio) so cuts are exact; progress shown; result uploaded as a sibling (§5).
-- Export maps streams explicitly: the first picture stream and every audio track (one, for one-track containers);
-  >8-bit sources stay 10-bit where libx264 has it; colour tags are carried. What is not kept (subtitles, data,
-  attachments, cover art, alpha, depth) is named in the window before Export and in the result line.
-- `sopen cut <source> <in> <out> [--crop x,y,w,h]` = the same export, headless (scripting + CI receipts); it always
-  runs on this machine (§4a).
+  timeline scrub, drag = crop rectangle in source pixels, Space play/pause, Export.
+- Audio: waveform — min/max peaks per channel from one decode at 8 kHz, at most 100 per second and 2^19 per lane (an
+  hour of stereo is a few MB; the PCM is never held), handed over as they fill; a stereo file shows two lanes, L and
+  R (more channels are mixed down to two); same transport, Export.
+- Editing (msg 13): the timeline is a list of clips, each a range of the source in ticks — video frames (a cut is a
+  frame time, and the sound cut with it cannot drift) or audio samples. A drag on the timeline selects (the playhead
+  follows the pointer, so the frame there shows), a click moves the playhead and clears the selection, `I`/`O` set
+  the selection's edges at the playhead (`←`/`→` 1 s, `⇧` 5 s, `⌥`/Alt one frame or 10 ms). Cmd/Ctrl+C copies the
+  selection, Cmd/Ctrl+X cuts it (removed, the gap closes, kept to paste), Delete/Backspace removes it, Cmd/Ctrl+V
+  inserts what was copied at the playhead or replaces the selection; Cmd/Ctrl+Z / Shift+Cmd/Ctrl+Z undo / redo (the
+  playhead and selection come back with the step). The clipboard holds ranges of this file only — the system
+  clipboard is not used (a Cmd/Ctrl+V whose press egui-winit swallows on an empty system clipboard is taken at its
+  key-up). `M` (audio, mono file only) = Mono → Stereo: left = right = the channel, at its level. Neighbouring
+  pieces that continue each other are one clip, so an edit undone by hand is no edit. Nothing a key does runs ffmpeg
+  or ffprobe; keys follow the image window's gating (none while a text field has the typing or a prompt is up), and
+  hosted in the browser the row shows `5 Save`.
+- Preview: playback plays the clips in order, each piece by an ffmpeg of its own started as soon as the one before it
+  starts, each giving exactly its length in frames and samples (padded if short), so the clock is the timeline's and
+  a boundary costs no wait (measured 2026-11-20: the next piece's first output 0.4–2 ms after the last, against
+  ~240 ms of queued frames; no frame dropped). Paused, the frame at the playhead is the source frame the timeline
+  maps it to; the last decoded frames are kept (64 MB), so the frame an edit brings under the playhead is usually
+  there at once (measured 1–2 ms; a frame not kept: one decode, 70–95 ms). An edit while playing restarts playback at
+  the playhead.
+- Save (Cmd/Ctrl+S, F5): refused before anything is backed up or rendered when the file changed since it was opened
+  (a render can take minutes) or the server cannot replace a file in one step; else the original is copied to the
+  local backup (§5, once per session, path printed), the edit is rendered into a staged file under `.edits`, and
+  that file is written over the original by the conflict-checked overwrite (§5). Then the window plays the saved
+  file, unedited (the clipboard and the history were ranges of the old one); a remote file plays from the staged
+  render, removed when the window goes. Save keeps the file's format: a file whose container cannot take the
+  re-encoded streams (`.webm` video) is not saved — Export writes `.mp4`. Edits make the window unsaved: closing,
+  F3, `close=ask` and leaving it in the browser ask Save / Discard / Cancel as the image window does; a running save
+  closes the window when it is done; a running export keeps the close-again rule.
+- Render (Save and Export): exact for any number of pieces without decoding the source once per piece — pieces that
+  follow each other in the source (within 10 s) share one input (`-ss` 0.2 s before the first, `-t` past the last,
+  `split`), a piece out of order gets its own; each piece is trimmed from its decoded input (video from half a frame
+  before its first frame) and counted out (`trim=end_frame`; `atrim=end_sample` per track at its own rate; padded if
+  short), then `concat`. Input-side `-t` alone is not exact (AAC came out a frame short), nor a trim right at the seek
+  point (AAC 154 samples off, MP3 9); 0.2 s of run-up made both sample-exact. One run opens at most 24 inputs (300
+  took 1.6 GB and ran out of descriptors at `ulimit -n 256`); more are rendered in lossless passes (H.264 `-qp 0` +
+  PCM in Matroska) and a final one; more than 576 separate stretches are refused. A long filter graph goes to a file
+  (`-/filter_complex`, ffmpeg 7+). Export's crop applies once, to its whole output (Save writes the edit list only:
+  a rectangle drawn is said on the status line, not saved); Mono → Stereo pans each mono track
+  `pan=stereo|c0=c0|c1=c0`.
+- Export: In–Out of the timeline (the whole timeline without a selection) and the crop, re-encoded (H.264 + AAC for
+  video; the source codec for audio) by the render above; progress shown; result uploaded as a sibling (§5).
+- Save and Export map streams explicitly: the first picture stream and every audio track (one, for one-track
+  containers); >8-bit sources stay 10-bit where libx264 has it; colour tags are carried. What is not kept (subtitles,
+  data, attachments, cover art, alpha, depth, chapters) is named in the window before Save or Export and in the
+  result line.
+- Every save, export and `sopen cut` run has a progress-stall watchdog: an ffmpeg whose output position, frame count
+  and size have not moved for 120 s is stopped and the error says so (ffmpeg 7+ keeps printing progress blocks while
+  stuck, so it watches what they say, not whether they come; a libx264 deadlock once ran 44 h unstopped).
+- `sopen cut <source> <in> <out> [--crop x,y,w,h]` = the unedited export (`-ss In -to Out -i src`), headless
+  (scripting + CI receipts); it always runs on this machine (§4a).
 - Renderer / playback details fixed by the spike (§11).
 
 ## 8. Usage log
@@ -580,8 +628,10 @@ Local only, never sent anywhere. Exists for §10.
 
 Own text editor (the browser's text viewer is read-only; VS Code or Zed edits), a directory tree,
 file operations in the browser (copy, move, delete, rename, make folder — msg 12 asks for viewing),
-hex insert / delete or anything that changes a file's size, image edits beyond crop, pixelize and
-clipboard copy / cut / paste (no drawing or text tool, no layers, no filters), frame-accurate
+hex insert / delete or anything else that changes a binary file's size, image edits beyond crop, pixelize and
+clipboard copy / cut / paste (no drawing or text tool, no layers, no filters), media edits beyond the time cut,
+cut / copy / paste on the timeline, the video crop and (audio only) Mono → Stereo (msg 13: no fades, gain, mixing,
+effects, transitions or separately edited audio and video), the system clipboard for media, frame-accurate
 copy without re-encode, streaming playback before download completes, directory sync / mounts, file watching,
 Windows, a `.app` bundle or cask, any agent on the remote, macshot (Swift, macOS-only, GPL-3 — incompatible with A7/A8).
 

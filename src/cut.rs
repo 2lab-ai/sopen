@@ -2,7 +2,7 @@
 //! publish it next to the original as `<stem>.cut-<in>-<out>.<ext>` — never over an existing file.
 //! The same function serves remote targets (fetched copy → SFTP) and local ones (LocalFs).
 
-use crate::ffmpeg::{self, ExportPlan, MediaKind, Probe, Rect, Tools};
+use crate::ffmpeg::{self, EditSpec, Encode, ExportPlan, Input, MediaKind, Probe, Rect, Tools};
 use crate::kind::{self, Kind};
 use crate::remote::{random_hex, RemoteFs};
 use anyhow::{bail, Result};
@@ -117,6 +117,111 @@ pub fn cut_and_publish(
     })
 }
 
+/// Renders the edit `spec` of local file `src` into `dst` (spec §7, message 13): one ffmpeg
+/// run, or — for an edit that reads more separate stretches of the source than one run may
+/// open — lossless passes into `work` and a final one ([`ffmpeg::edit_passes`]). `progress`
+/// gets 0.0..=1.0 of all of it; every run has the progress-stall watchdog.
+#[allow(clippy::too_many_arguments)]
+pub fn render_edit(
+    tools: &Tools,
+    src: &Input,
+    dst: &Path,
+    spec: &EditSpec,
+    media: MediaKind,
+    plan: &ExportPlan,
+    work: &Path,
+    progress: &mut dyn FnMut(f64),
+) -> Result<()> {
+    let passes = ffmpeg::edit_passes(spec)?;
+    let total: f64 = passes.iter().map(EditSpec::length).sum::<f64>().max(1e-9);
+    let encoders = ffmpeg::available_encoders(tools)?;
+    let mut files: Vec<Input> = vec![src.clone()];
+    let mut done = 0.0;
+    for (k, pass) in passes.iter().enumerate() {
+        let last = k + 1 == passes.len();
+        let out = if last {
+            dst.to_path_buf()
+        } else {
+            work.join(format!("pass-{k}.mkv"))
+        };
+        let inputs: Vec<&Input> = files.iter().collect();
+        let encode = if last {
+            Encode::Final
+        } else {
+            Encode::Lossless
+        };
+        let args = ffmpeg::edit_args(&inputs, &out, pass, media, plan, encode)?;
+        let args = ffmpeg::assemble(tools, args, work, &format!("graph-{k}.txt"))?;
+        let args = ffmpeg::adapt_to_encoders(args, &encoders)?;
+        let length = pass.length();
+        ffmpeg::run_export(tools, &args, length, &mut |f| {
+            progress(((done + f * length) / total).clamp(0.0, 1.0))
+        })?;
+        done += length;
+        if !last {
+            files.push(Input::path(&out));
+        }
+    }
+    progress(1.0);
+    Ok(())
+}
+
+/// The export of an edited timeline's `[in_s, out_s]` (`spec` already cut to it) as a new
+/// sibling `<stem>.cut-<in>-<out>.<ext>` — the window's Export once there are edits; with none
+/// it is [`cut_and_publish`], `sopen cut`'s own export.
+#[allow(clippy::too_many_arguments)]
+pub fn render_and_publish(
+    fs: &mut dyn RemoteFs,
+    tools: &Tools,
+    src: &Input,
+    dir: &str,
+    src_name: &str,
+    spec: &EditSpec,
+    (in_s, out_s): (f64, f64),
+    work_root: &Path,
+    progress: &mut dyn FnMut(f64),
+) -> Result<Published> {
+    let probe = ffmpeg::probe(tools, src)?;
+    let (media, out_ext, plan) = plan(tools, &probe, src_name)?;
+    let mut spec = spec.clone();
+    spec.crop = match (spec.crop, probe.display, media) {
+        (Some(_), _, MediaKind::Audio) => bail!("--crop needs a video stream; {src_name} has none"),
+        (Some(r), Some((w, h)), MediaKind::Video) => Some(ffmpeg::fit_crop(r, w, h)?),
+        _ => None,
+    };
+    let (stem, _) = stem_ext(src_name);
+    let name = ffmpeg::cut_name(stem, in_s, out_s, &out_ext);
+    let work = work_root.join(random_hex());
+    crate::cache::private_dir(&work)?;
+    let result = (|| -> Result<String> {
+        let dst = work.join(&name);
+        render_edit(tools, src, &dst, &spec, media, &plan, &work, progress)?;
+        fs.write_new_sibling(&dst, dir, &name)
+    })();
+    let _ = std::fs::remove_dir_all(&work);
+    result.map(|name| Published {
+        name,
+        notes: edit_notes(&plan, &probe, &spec),
+    })
+}
+
+/// What an edited output does not keep: the plan's notes, and the chapters (an edit moves them).
+pub fn edit_notes(plan: &ExportPlan, probe: &Probe, spec: &EditSpec) -> Vec<String> {
+    let mut notes = plan.notes.clone();
+    let _ = spec;
+    if probe.chapters > 0 {
+        let n = probe.chapters;
+        notes.push(format!(
+            "{n} chapter{} not kept (the edit moves them)",
+            if n == 1 { "" } else { "s" }
+        ));
+    }
+    notes
+}
+
+#[cfg(test)]
+pub(crate) mod edit_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -180,7 +285,7 @@ mod tests {
         let work = std::fs::metadata(dir.join("work")).unwrap().permissions();
         assert_eq!(work.mode() & 0o777, 0o700);
         let out = out.name;
-        let probe = ffmpeg::probe(tools, &dir.join(&out)).unwrap();
+        let probe = ffmpeg::probe(tools, dir.join(&out)).unwrap();
         let d = probe.duration.unwrap();
         assert!((d - 2.0).abs() <= 0.1, "{out}: duration {d}");
         (out, probe)
@@ -432,7 +537,7 @@ mod tests {
             &mut |_| {},
         )
         .unwrap();
-        let probe = ffmpeg::probe(tools, &dir.join(&published.name)).unwrap();
+        let probe = ffmpeg::probe(tools, dir.join(&published.name)).unwrap();
         (published, probe)
     }
 
