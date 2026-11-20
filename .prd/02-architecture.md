@@ -310,8 +310,10 @@ P1 and the final acceptance run after the text-wrap branch has landed (§4.2).
   reconnects on its first remote call. Press Enter while the preview still reads → the same read
   continues as the viewer's opening.
 - P12. A local text file of 6 MiB and a remote one of 20 MiB: the preview shows the first page and
-  `preview of the first 4 MiB`; Enter → the viewer; End → the file's last line. Each byte is read once
-  (test: a counting reader sees every offset once; remotely, one fetch). Enter on a 100 MiB remote text
+  `preview of the first 4 MiB`; Enter → the viewer; End → the file's last line. On a continuation
+  that succeeds each byte is indexed once, and the 4 MiB before the cut are read twice more only to
+  verify them (§4.4) (test: the index's reads see every offset once, the verification reads are
+  counted apart; remotely, one fetch). Enter on a 100 MiB remote text
   file's info card → the ordinary open, with its fetch progress on the status row. An audio file of
   20 minutes (after S1-M): Enter → the waveform's first 10 minutes stay, the rest is decoded from 10:00.
 - P13. Two histories reach the bar on file X within 150 ms — one from a preview of file W, one from the
