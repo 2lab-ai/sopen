@@ -116,6 +116,22 @@ changes asks first, as its own window does. A remote file is fetched with its pr
 status row; `Esc` stops the fetch. The browser views only: it does not copy, move, delete or
 rename.
 
+Lines wrap by default: every line is shown whole, in rows as wide as the window, its number on its
+first row. A row is broken by the measured width of its characters (Korean, CJK and emoji are
+wider than a cell), after a space when the next word fits on the next row — Chinese and Japanese
+between any two characters, never before closing punctuation such as `。` or `」` — and a tab goes
+to the next stop of four cells. A row starting with a Hebrew or Arabic word still reads left to
+right: its English stays as written, each right-to-left word reads right to left. The file is still read a chunk at a time — a line of hundreds of
+megabytes too, from wherever you are in it. Inside a line longer than the window the status row
+says how far into it you are (`line 7 (12 % of it) of 120`), and the scroll bar goes by bytes.
+
+| Key in the text viewer | |
+|---|---|
+| `W` / `F2` | switch wrapping off (one row per line, `←` / `→` scroll sideways, 4096 bytes of a line shown) and on again; the F-key row says `Unwrap` or `Wrap` |
+| `↑` / `↓`, `PgUp` / `PgDn`, the wheel | wrapped: move by rows (a page keeps one row); unwrapped: by lines |
+| `Home` / `End` | wrapped, inside a long line: its first / last row first, then the start / end of the file; otherwise the start / end of the file |
+| `⌘Home` / `⌘End` (`Ctrl` elsewhere) | the start / end of the file |
+
 ## Images
 
 The window shows the image fitted; the mouse wheel or a pinch zooms, a trackpad scroll or a

@@ -3754,6 +3754,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "toml",
+ "unicode-segmentation",
  "winit",
 ]
 
