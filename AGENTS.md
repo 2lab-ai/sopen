@@ -18,7 +18,8 @@ anything is downloaded: sopen's hex window (the default; byte overwrite only) or
 over ssh: HOST
 is a machine the owner uses sopen on, not a file's remote, which still needs only sshd (spec §4a). Spec and
 scope: [`.prd/01-spec.md`](.prd/01-spec.md) — its §1 owner intent and §9 out-of-scope list decide every "should
-we add X" question.
+we add X" question; the browser workstream (modes, git panel, file keys, directory tree) is
+[`.prd/02-architecture.md`](.prd/02-architecture.md) to [`.prd/05-directory-tree.md`](.prd/05-directory-tree.md).
 
 ## Gate (run before every commit, CI runs the same)
 
@@ -35,17 +36,24 @@ runners, `sftp-server` on macOS) and sets `SOPEN_REQUIRE_FFMPEG=1`, `SOPEN_REQUI
 ## Rules
 
 - **The remote needs only sshd.** Never install, upload or run a helper on the remote. Transport is the system
-  `ssh` binary (so `~/.ssh/config` is honoured); file operations are SFTP over that session.
+  `ssh` binary (so `~/.ssh/config` is honoured); file operations are SFTP over that session. The git panel
+  runs the remote's own `git` over the same master, its words quoted as `--target` quotes them, and uploads
+  nothing (`.prd/03-git-panel.md` §3.2); without a git there, it is not offered.
 - **Never overwrite silently.** Every write re-checks the remote file first (`lstat`: still a regular file,
   same `(size, mtime)`, same content hash up to 256 MiB) and refuses on change; writes go to a temp name in the
   same directory with the target's owner and mode and are renamed over the target. Spec §5 is the full rule.
   Image and hex Save keep a local backup of the original first. Media exports always write a new sibling file and
   never use a replacing rename to publish it. The binary dialog's "Save to…" fills a file in a private staging
-  folder and publishes it complete by a hard link, never over anything (spec §6a).
-- **No new edit features without the owner.** The edit list above is the whole list (owner, 2026-11-11; hex
-  overwrite added by spec §1 message 9; image clipboard copy / cut / paste by message 12). The file browser
-  (message 12) adds viewing, not file operations: no copy, move, delete, rename or new folder, and its viewers
-  keep exactly their own edits.
+  folder and publishes it complete by a hard link, never over anything (spec §6a). The browser's rename, copy,
+  move and make folder never replace an existing name; a remote rename is SFTP's plain rename, never
+  `posix-rename@openssh.com` (`.prd/04-file-keys.md` §5).
+- **Edit features come only from owner messages.** The viewers' edits are the list above (owner, 2026-11-11;
+  hex overwrite added by spec §1 message 9; image clipboard copy / cut / paste by message 12), and the viewers
+  keep exactly those. The browser's own edits come from spec §1 messages 13–16 (message 13 arrives with PR #14, which lands
+  before the browser workstream's first slice): rename, copy, move, make folder
+  and delete (message 15, `.prd/04-file-keys.md`) and the git panel's actions on a repository, every history
+  rewrite or destructive one backed up first (message 14, `.prd/03-git-panel.md`). Anything beyond them waits
+  for an owner message.
 - **ffmpeg/ffprobe are external programs**, resolved at runtime (`SOPEN_FFMPEG` / `SOPEN_FFPROBE`, then PATH).
   Do not link libav*.
 - Tests must not need ssh or a network: the remote layer sits behind a trait with a local-filesystem
