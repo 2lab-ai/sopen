@@ -76,9 +76,22 @@ pub fn valid_name(name: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// `.<name>.sopen-<random>`, within [`NAME_MAX`] (a long name is shortened at a character).
+/// A copy's staging name, `.<name>.sopen-<random>`: what it holds is a copy, partial when left
+/// by a killed sopen — safe to remove (04 §5.1).
 fn temp_name(name: &str) -> String {
-    let tail = format!(".sopen-{}", random_hex());
+    named_aside(name, "sopen")
+}
+
+/// A two-step rename's middle name, `.<name>.sopen-renaming-<random>`: what it holds is the
+/// ORIGINAL, left there only when the steps were cut short — rename it back, never remove it
+/// (04 §5.1).
+fn renaming_name(name: &str) -> String {
+    named_aside(name, "sopen-renaming")
+}
+
+/// `.<name>.<kind>-<random>`, within [`NAME_MAX`] (a long name is shortened at a character).
+fn named_aside(name: &str, kind: &str) -> String {
+    let tail = format!(".{kind}-{}", random_hex());
     let mut keep = NAME_MAX - 1 - tail.len();
     while !name.is_char_boundary(keep.min(name.len())) {
         keep -= 1;
@@ -110,6 +123,8 @@ pub fn run(job: &Job, hosts: Hosts<'_>, ctl: &mut dyn Control) -> Report {
         publish: HashMap::new(),
         wrote: false,
         in_place_said: false,
+        touched: Vec::new(),
+        all_touched: Vec::new(),
     };
     if let Err(why) = engine.check() {
         return refused(&job.names, why);
@@ -117,6 +132,7 @@ pub fn run(job: &Job, hosts: Hosts<'_>, ctl: &mut dyn Control) -> Report {
     for (i, name) in job.names.iter().enumerate() {
         engine.item = i + 1;
         engine.in_place_said = false;
+        engine.touched.clear();
         if engine.stopped() {
             let rest = job.names.len() - i;
             engine.report.notes.push(format!(
@@ -149,7 +165,10 @@ pub fn run(job: &Job, hosts: Hosts<'_>, ctl: &mut dyn Control) -> Report {
     }
     // What was written is made durable once, at the end (04 §5.1).
     if engine.wrote {
-        engine.barrier();
+        let all = std::mem::take(&mut engine.all_touched);
+        if let Err(why) = engine.barrier(all) {
+            engine.report.notes.push(why);
+        }
     }
     engine.report
 }
@@ -341,6 +360,10 @@ struct Engine<'j, 'h, 'c> {
     wrote: bool,
     /// The current item has said it was written in place.
     in_place_said: bool,
+    /// The folders that received an entry for the current item, and for the whole operation:
+    /// what a barrier makes durable.
+    touched: Vec<String>,
+    all_touched: Vec<String>,
 }
 
 impl Engine<'_, '_, '_> {
@@ -448,8 +471,9 @@ impl Engine<'_, '_, '_> {
     }
 
     /// The same over two connections: refused when the target resolves to the folder or below
-    /// it and both report one filesystem id (`statvfs`); where an id is missing the two may still
-    /// be one machine, which the report says (the copy then holds the folder as it was).
+    /// it and both report one filesystem id (`statvfs`), or either reports none (nothing then
+    /// says they are two machines). One id on two machines is possible: it only ever refuses a
+    /// copy that was safe, never lets one through.
     fn refuse_into_itself_between(&mut self) -> Result<(), String> {
         let job = self.job;
         let verb = if job.op == Op::Move { "move" } else { "copy" };
@@ -479,24 +503,45 @@ impl Engine<'_, '_, '_> {
                     ))
                 }
                 (Some(_), Some(_)) => {}
-                _ => self.report.notes.push(format!(
-                    "the two connections may be one machine, and {} may be {name} or inside \
-                     it: {name} is copied as it was when the copy began",
-                    job.dst_dir
-                )),
+                // Safety first: without an id on both sides nothing says they are two machines.
+                _ => {
+                    return Err(format!(
+                        "cannot {verb} {name}: sopen cannot tell whether both sides are the same \
+                         machine, and {} may be {name} or inside it; {verb} it into a folder \
+                         outside {name}",
+                        job.dst_dir
+                    ))
+                }
             }
         }
         Ok(())
     }
 
-    /// The target volume's durability barrier ([`FileOps::barrier`]); a failure is a note.
-    fn barrier(&mut self) {
-        let dir = self.job.dst_dir.clone();
-        if let Err(e) = self.ends.dst().barrier(&dir) {
-            self.report.notes.push(format!(
-                "the copies on {dir}'s volume could not be flushed: {e:#}"
-            ));
+    /// `dir` received an entry (a published file, a link, a folder made).
+    fn touch(&mut self, dir: &str) {
+        self.wrote = true;
+        for list in [&mut self.touched, &mut self.all_touched] {
+            if !list.iter().any(|d| d == dir) {
+                list.push(dir.to_string());
+            }
         }
+    }
+
+    /// The durability barrier ([`FileOps::barrier`]) over `dirs`, deepest first.
+    fn barrier(&mut self, mut dirs: Vec<String>) -> Result<(), String> {
+        dirs.sort_by_key(|d| std::cmp::Reverse(d.matches('/').count()));
+        self.ends
+            .dst()
+            .barrier(&dirs)
+            .map_err(|e| format!("the copies could not be made durable: {e:#}"))
+    }
+
+    /// Before a moved item's sources go: its copies made durable, or none of them goes.
+    fn durable_item(&mut self) -> Result<(), String> {
+        let dirs = self.touched.clone();
+        self.barrier(dirs).map_err(|e| {
+            format!("the copy exists but its durability was not confirmed ({e}); the source stays")
+        })
     }
 
     /// How copies get their names in `dir`, probed once per folder (a failed probe: atomic, the
@@ -505,7 +550,13 @@ impl Engine<'_, '_, '_> {
         if let Some(mode) = self.publish.get(dir) {
             return *mode;
         }
-        let mode = self.ends.dst().publish_mode(dir).unwrap_or(Publish::Atomic);
+        let mode = match self.ends.dst().publish_mode(dir) {
+            Ok((mode, notes)) => {
+                self.report.notes.extend(notes);
+                mode
+            }
+            Err(_) => Publish::Atomic,
+        };
         self.publish.insert(dir.to_string(), mode);
         mode
     }
@@ -613,18 +664,26 @@ impl Engine<'_, '_, '_> {
         let fs = self.ends.src();
         let mut temp = None;
         for _ in 0..8 {
-            let t = join(dir, &temp_name(name));
+            let t = join(dir, &renaming_name(name));
             match fs.rename_new(from, &t) {
                 Ok(Renamed::Moved) => {
                     temp = Some(t);
                     break;
                 }
                 // The first step left the old name: both stay as they are, said.
-                Ok(Renamed::OldRemains(why) | Renamed::Unconfirmed(why)) => {
+                Ok(Renamed::OldRemains(why)) => {
                     self.report.notes.push(why);
                     return ItemOutcome::Failed(format!(
                         "cannot rename {name} to {to}: the first of its two steps left {name} in \
                          place, and {t} names it too (see the note)"
+                    ));
+                }
+                // Only what is known: the original is under one name or the other.
+                Ok(Renamed::Unconfirmed(why)) => {
+                    self.report.notes.push(why);
+                    return ItemOutcome::Failed(format!(
+                        "cannot rename {name} to {to}: its first step could not be confirmed (see \
+                         the note): the original is at {from} or at {t}"
                     ));
                 }
                 Err(e) if is_taken(&e) => continue,
@@ -642,10 +701,21 @@ impl Engine<'_, '_, '_> {
             Err(e) => e,
         };
         match fs.rename_new(&temp, from) {
-            Ok(back) => {
-                self.report.notes.extend(remains(back));
+            Ok(Renamed::Moved) => ItemOutcome::Failed(format!(
+                "cannot rename {name} to {to}: {second:#}; it is back under {name}"
+            )),
+            Ok(Renamed::OldRemains(why)) => {
+                self.report.notes.push(why);
                 ItemOutcome::Failed(format!(
-                    "cannot rename {name} to {to}: {second:#}; it is back under {name}"
+                    "cannot rename {name} to {to}: {second:#}; it is back under {name}, and \
+                     {temp} names it too (see the note)"
+                ))
+            }
+            Ok(Renamed::Unconfirmed(why)) => {
+                self.report.notes.push(why);
+                ItemOutcome::Failed(format!(
+                    "cannot rename {name} to {to}: {second:#}; renaming it back could not be \
+                     confirmed (see the note): the original is at {from} or at {temp}"
                 ))
             }
             Err(back) => ItemOutcome::Failed(format!(
@@ -726,8 +796,10 @@ impl Engine<'_, '_, '_> {
         };
         match placed {
             Placed::At(copied) if mv => {
-                // Durable before its source goes (04 §5.1).
-                self.barrier();
+                // Durable before its source goes (04 §5.1); else it stays.
+                if let Err(why) = self.durable_item() {
+                    return (ItemOutcome::Failed(why), Flow::Go);
+                }
                 (self.remove_moved(name, &from, &copied), Flow::Go)
             }
             Placed::At(copied) => (named(name, &copied.name), Flow::Go),
@@ -928,7 +1000,7 @@ impl Engine<'_, '_, '_> {
                 }
             }
         };
-        self.wrote = true;
+        self.touch(dir);
         // Still the copy under its final name? (The name could change hands between the check
         // above and the rename.) If not, nothing is removed and what is there is left.
         if let Err(why) = self.is_staged(&target, staged.id) {
@@ -1094,8 +1166,16 @@ impl Engine<'_, '_, '_> {
         match e.created {
             Created::No => {}
             Created::Yes => {
-                if let Err(re) = self.ends.dst().remove(temp) {
-                    let left = format!("the temp file {temp} could not be removed: {re:#}");
+                // Removed only while the name is still the file written (this machine: its
+                // inode, by the descriptor); over SFTP, by its name.
+                let left = match self.is_staged(temp, e.id) {
+                    Ok(()) => match self.ends.dst().remove(temp) {
+                        Ok(()) => None,
+                        Err(re) => Some(format!("{temp} could not be removed: {re:#}")),
+                    },
+                    Err(not_ours) => Some(not_ours),
+                };
+                if let Some(left) = left {
                     if stopped {
                         self.report.notes.push(left);
                     } else {
@@ -1255,7 +1335,7 @@ impl Engine<'_, '_, '_> {
             let made = join(dir, &want);
             match self.ends.dst().make_symlink(&target, &made) {
                 Ok(()) => {
-                    self.wrote = true;
+                    self.touch(dir);
                     break made;
                 }
                 Err(e) if is_taken(&e) && top => match self.resolve(dir, &want, false) {
@@ -1384,7 +1464,7 @@ impl Engine<'_, '_, '_> {
                 Err(e) => return (ItemOutcome::Failed(format!("{e:#}")), Flow::Go),
             }
         }
-        self.wrote = true;
+        self.touch(dst_dir);
         let root = join(dst_dir, &want);
         let partial = |root: &str| {
             format!("the copy {root} is partial: it holds only what was copied before the end")
@@ -1421,6 +1501,7 @@ impl Engine<'_, '_, '_> {
             let placed = match node.kind {
                 Kind::Dir => match self.ends.dst().make_dir(&join(&root, &node.rel)) {
                     Ok(()) => {
+                        self.touch(&dir);
                         made.push(node.rel.clone());
                         None
                     }
@@ -1468,8 +1549,13 @@ impl Engine<'_, '_, '_> {
         if !mv {
             return (named(name, &want), Flow::Go);
         }
-        // Durable before any of its sources goes (04 §5.1).
-        self.barrier();
+        // Durable before any of its sources goes (04 §5.1); else they all stay.
+        if let Err(why) = self.durable_item() {
+            return (
+                ItemOutcome::Failed(why.replace("the source stays", "its sources stay")),
+                Flow::Go,
+            );
+        }
         self.remove_tree(name, from, &want, &nodes, &copied)
     }
 

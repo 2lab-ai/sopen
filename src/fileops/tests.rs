@@ -4,7 +4,9 @@
 //! and races come from [`Faulty`], a file layer with hooks — never from sleeps.
 
 use super::*;
-use crate::remote::ops::{taken, FileMeta, NoRename, Opened, Publish, Renamed, Staged, COPY_STEP};
+use crate::remote::ops::{
+    taken, FileMeta, NoRename, Opened, Publish, Renamed, StageFailure, Staged, COPY_STEP,
+};
 use crate::remote::{CreateError, Entry, Like, LocalFs, RemoteFs, SftpRemote, Stat, Uploaded};
 use std::collections::VecDeque;
 use std::io::{Read, Write};
@@ -223,6 +225,12 @@ struct Faulty<'a> {
     host_made: bool,
     /// Barriers asked of this layer ([`FileOps::barrier`]).
     barriers: Arc<AtomicUsize>,
+    /// One ordered record of what reached the disk through this layer: `write:<path>` (a copy
+    /// staged), `rename:<from>-><to>`, `mkdir:`, `symlink:`, `remove:`, `rmdir:`, `list:`, and
+    /// `barrier:<dirs; deepest first>` once a barrier completed (`barrier-failed:` when not).
+    trace: Arc<Mutex<Vec<String>>>,
+    /// A stream read from this layer fails after this many bytes.
+    fail_read_after: Option<usize>,
     /// No filesystem id ([`FileOps::fs_id`]): two connections cannot tell they share one.
     no_fs_id: bool,
     /// The stream a copy from another host writes is corrupted (its first byte flipped) on its
@@ -246,9 +254,17 @@ impl<'a> Faulty<'a> {
             hash_limit: None,
             host_made: false,
             barriers: Arc::default(),
+            trace: Arc::default(),
+            fail_read_after: None,
             no_fs_id: false,
             corrupt: false,
         }
+    }
+}
+
+impl Faulty<'_> {
+    fn log(&self, event: String) {
+        self.trace.lock().unwrap().push(event);
     }
 }
 
@@ -280,6 +296,7 @@ impl RemoteFs for Faulty<'_> {
         if let Some(e) = (self.fault)("list_entries", path) {
             return Err(e);
         }
+        self.log(format!("list:{path}"));
         self.inner.list_entries(path)
     }
     fn free_space(&mut self, path: &str) -> Option<u64> {
@@ -322,7 +339,9 @@ impl RemoteFs for Faulty<'_> {
         if let Some(e) = (self.fault)("remove", path) {
             return Err(e);
         }
-        self.inner.remove(path)
+        self.inner.remove(path)?;
+        self.log(format!("remove:{path}"));
+        Ok(())
     }
     fn hash_check_limit(&self) -> u64 {
         self.hash_limit
@@ -345,18 +364,28 @@ impl FileOps for Faulty<'_> {
             return answer;
         }
         let done = self.inner.rename_new(from, to)?;
+        self.log(format!("rename:{from}->{to}"));
         (self.renamed)(from, to);
         Ok(done)
     }
     fn can_rename_dir(&self) -> bool {
         self.inner.can_rename_dir()
     }
-    fn publish_mode(&mut self, dir: &str) -> anyhow::Result<Publish> {
+    fn publish_mode(&mut self, dir: &str) -> anyhow::Result<(Publish, Vec<String>)> {
         self.inner.publish_mode(dir)
     }
-    fn barrier(&mut self, dir: &str) -> anyhow::Result<()> {
+    fn barrier(&mut self, dirs: &[String]) -> anyhow::Result<()> {
         self.barriers.fetch_add(1, Ordering::Relaxed);
-        self.inner.barrier(dir)
+        let shown = dirs.join(";");
+        let done = match (self.fault)("barrier", &shown) {
+            Some(e) => Err(e),
+            None => self.inner.barrier(dirs),
+        };
+        match &done {
+            Ok(()) => self.log(format!("barrier:{shown}")),
+            Err(_) => self.log(format!("barrier-failed:{shown}")),
+        }
+        done
     }
     fn fs_id(&mut self, path: &str) -> Option<u64> {
         if self.no_fs_id {
@@ -365,19 +394,24 @@ impl FileOps for Faulty<'_> {
         self.inner.fs_id(path)
     }
     fn make_dir(&mut self, path: &str) -> anyhow::Result<()> {
-        self.inner.make_dir(path)
+        self.inner.make_dir(path)?;
+        self.log(format!("mkdir:{path}"));
+        Ok(())
     }
     fn remove_dir(&mut self, path: &str) -> anyhow::Result<()> {
         if let Some(e) = (self.fault)("remove_dir", path) {
             return Err(e);
         }
-        self.inner.remove_dir(path)
+        self.inner.remove_dir(path)?;
+        self.log(format!("rmdir:{path}"));
+        Ok(())
     }
     fn read_link(&mut self, path: &str) -> anyhow::Result<String> {
         self.inner.read_link(path)
     }
     fn make_symlink(&mut self, target: &str, link: &str) -> anyhow::Result<()> {
         self.inner.make_symlink(target, link)?;
+        self.log(format!("symlink:{link}"));
         (self.after)("make_symlink", link);
         Ok(())
     }
@@ -392,14 +426,15 @@ impl FileOps for Faulty<'_> {
         temp: &str,
         cancel: &AtomicBool,
         progress: &mut dyn FnMut(u64),
-    ) -> Result<Staged, CreateError> {
+    ) -> Result<Staged, StageFailure> {
         if let Some(e) = (self.copy)(from) {
-            return Err(CreateError::new(crate::remote::Created::No, e));
+            return Err(StageFailure::not_created(e));
         }
         let mut staged = self.inner.copy_within(from, temp, cancel, progress)?;
         if self.host_made {
             staged.sha256 = None;
         }
+        self.log(format!("write:{temp}"));
         (self.copied)(temp);
         Ok(staged)
     }
@@ -407,8 +442,15 @@ impl FileOps for Faulty<'_> {
         if let Some(e) = (self.copy)(path) {
             return Err(e);
         }
-        let opened = self.inner.open_read(path)?;
+        let fail_after = self.fail_read_after;
+        let mut opened = self.inner.open_read(path)?;
         (self.after)("open_read", path);
+        if let Some(n) = fail_after {
+            opened.read = Box::new(FailAfter {
+                inner: opened.read,
+                left: n,
+            });
+        }
         Ok(opened)
     }
     fn stage_from(
@@ -418,7 +460,7 @@ impl FileOps for Faulty<'_> {
         temp: &str,
         cancel: &AtomicBool,
         progress: &mut dyn FnMut(u64),
-    ) -> Result<Staged, CreateError> {
+    ) -> Result<Staged, StageFailure> {
         let staged = if self.corrupt {
             let mut flipped = Flip {
                 inner: src,
@@ -429,8 +471,29 @@ impl FileOps for Faulty<'_> {
         } else {
             self.inner.stage_from(src, meta, temp, cancel, progress)?
         };
+        self.log(format!("write:{temp}"));
         (self.copied)(temp);
         Ok(staged)
+    }
+}
+
+/// A reader that fails once it has passed `left` bytes on.
+struct FailAfter<'r> {
+    inner: Box<dyn Read + 'r>,
+    left: usize,
+}
+
+impl Read for FailAfter<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.left == 0 {
+            return Err(std::io::Error::other(
+                "injected: the source stopped answering",
+            ));
+        }
+        let want = buf.len().min(self.left);
+        let n = self.inner.read(&mut buf[..want])?;
+        self.left -= n;
+        Ok(n)
     }
 }
 
@@ -1292,7 +1355,7 @@ fn k_n1_a_case_only_rename_on_a_case_insensitive_filesystem() {
     };
     let now = names(&src);
     assert_eq!(now.len(), 1);
-    assert!(now[0].contains(".sopen-"), "{now:?}");
+    assert!(now[0].contains(".sopen-renaming-"), "{now:?}");
     assert!(why.contains(&s(&src.join(&now[0]))), "{why}");
 }
 
@@ -2764,30 +2827,39 @@ fn scribble(temp: &str) {
     f.write_all(b"SCRIBBLE").unwrap();
 }
 
-/// The copy paths a move can take: on one host (this machine; a server's `copy-data`; a server
-/// without it, streamed through sopen) and between two (this machine and a server both ways,
-/// two connections to this machine). `None` where `sftp-server` is missing.
-fn every_path(name: &str) -> Option<(Layer, Option<Layer>)> {
+/// The copy paths a move can take: on one host (this machine; this machine where nothing can
+/// publish atomically, written in place; a server's `copy-data`; a server without it, streamed
+/// through sopen) and between two (this machine and a server both ways, two sessions to one
+/// server, two connections to this machine). `None` where `sftp-server` is missing. The
+/// `copy-data` server logs its requests to `log`, and must offer the extension.
+fn every_path(name: &str, log: &Path) -> Option<(Layer, Option<Layer>)> {
     let sftp = |args: &[&str]| {
         SftpRemote::local_server_with(args, None).map(|f| Box::new(f) as Box<dyn FileOps>)
     };
     Some(match name {
-        "local" => (Box::new(LocalFs::new()), None),
-        "copy-data" => (sftp(&[])?, None),
+        "local" | "in-place" => (Box::new(LocalFs::new()), None),
+        "copy-data" => {
+            let fs = SftpRemote::local_server_with(&["-l", "DEBUG1"], Some(log))?;
+            assert!(fs.offers_copy_data(), "this server must offer copy-data");
+            (Box::new(fs), None)
+        }
         "sftp-streamed" => (sftp(&["-P", "copy-data"])?, None),
         "here-to-remote" => (Box::new(LocalFs::new()), Some(sftp(&[])?)),
         "remote-to-here" => (sftp(&[])?, Some(Box::new(LocalFs::new()))),
+        "remote-to-remote" => (sftp(&[])?, Some(sftp(&[])?)),
         "here-to-here" => (Box::new(LocalFs::new()), Some(Box::new(LocalFs::new()))),
         _ => unreachable!(),
     })
 }
 
-const PATHS: [&str; 6] = [
+const PATHS: [&str; 8] = [
     "local",
+    "in-place",
     "copy-data",
     "sftp-streamed",
     "here-to-remote",
     "remote-to-here",
+    "remote-to-remote",
     "here-to-here",
 ];
 
@@ -2795,10 +2867,17 @@ const PATHS: [&str; 6] = [
 /// lowered to 16 bytes here; `f2_every_path_at_320_mib` runs the real size): a copy scribbled on
 /// after its bytes were sent never lets the source go.
 fn f2_case(path: &str, size: usize) {
-    let Some((mut a, b)) = every_path(path) else {
+    let (_t, src, dst) = scratch();
+    let log = src.parent().unwrap().join("server.log");
+    let _in_place = (path == "in-place").then(|| {
+        (
+            LocalFs::seam_no_exclusive_rename(),
+            LocalFs::seam_no_links(),
+        )
+    });
+    let Some((mut a, b)) = every_path(path, &log) else {
         return;
     };
-    let (_t, src, dst) = scratch();
     let f = src.join("f");
     std::fs::write(&f, (0..size).map(|i| (i % 249) as u8).collect::<Vec<u8>>()).unwrap();
     let before = sha(&f);
@@ -2837,6 +2916,17 @@ fn f2_case(path: &str, size: usize) {
     assert_eq!(sha(&f), before, "{path}: the source survives");
     assert!(!dst.join("f").exists(), "{path}: the bad copy went");
     assert_eq!(temps(&dst), Vec::<String>::new(), "{path}");
+    if path == "in-place" {
+        assert!(
+            r.notes.iter().any(|n| n.contains("written in place")),
+            "{r:?}"
+        );
+    }
+    if path == "copy-data" {
+        drop(a);
+        let text = std::fs::read_to_string(&log).unwrap();
+        assert!(text.contains("copy-data from"), "the server copied: {text}");
+    }
 }
 
 #[test]
@@ -2953,10 +3043,10 @@ fn f4_into_itself_over_two_connections_is_refused() {
     }
 }
 
-/// F4: where two connections cannot tell they share a filesystem, the copy is not refused, but
-/// it walks its source before it makes anything: it holds the folder as it was, once.
+/// F4: where two connections cannot tell whether they share a filesystem (no id on a side) and
+/// the resolved paths nest, the copy is refused — safety first.
 #[test]
-fn f4_the_walk_comes_before_the_new_folder() {
+fn f4_without_a_filesystem_id_nested_paths_are_refused() {
     let (_t, src, _dst) = scratch();
     let d = src.join("F");
     std::fs::create_dir_all(d.join("sub")).unwrap();
@@ -2964,7 +3054,6 @@ fn f4_the_walk_comes_before_the_new_folder() {
     let (mut a, mut b) = (LocalFs::new(), LocalFs::new());
     let mut fs = Faulty::new(&mut b);
     fs.no_fs_id = true;
-    fs.plain_realpath = true;
     let r = run(
         &job(Op::Copy, &src, &["F"], &d.join("sub")),
         Hosts::Two {
@@ -2973,13 +3062,35 @@ fn f4_the_walk_comes_before_the_new_folder() {
         },
         &mut Script::default(),
     );
-    assert_eq!(r.items, vec![item("F", ItemOutcome::Done)], "{r:?}");
-    let copy = d.join("sub/F");
-    assert_eq!(names(&copy), ["sub", "x"]);
-    assert_eq!(
-        names(&copy.join("sub")),
-        Vec::<String>::new(),
-        "never copied into itself"
+    assert!(refusal(&r).contains("cannot tell"), "{r:?}");
+    assert_eq!(names(&d.join("sub")), Vec::<String>::new());
+}
+
+/// F4: a folder is walked before its copy is made (the trace's order).
+#[test]
+fn f4_the_walk_comes_before_the_new_folder() {
+    let (_t, src, dst) = scratch();
+    let d = src.join("F");
+    std::fs::create_dir_all(d.join("sub")).unwrap();
+    std::fs::write(d.join("x"), "x").unwrap();
+    let mut local = LocalFs::new();
+    let mut fs = Faulty::new(&mut local);
+    let trace = fs.trace.clone();
+    let r = run(
+        &job(Op::Copy, &src, &["F"], &dst),
+        Hosts::Same(&mut fs),
+        &mut Script::default(),
+    );
+    assert!(r.all_done(), "{r:?}");
+    let t = trace.lock().unwrap().clone();
+    let at = |e: String| {
+        t.iter()
+            .position(|x| *x == e)
+            .unwrap_or_else(|| panic!("{e}: {t:?}"))
+    };
+    assert!(
+        at(format!("list:{}", s(&d.join("sub")))) < at(format!("mkdir:{}", s(&dst.join("F")))),
+        "{t:?}"
     );
 }
 
@@ -3204,4 +3315,356 @@ fn real_volume_receipt() {
     assert_eq!(std::fs::read(target.join("b.txt")).unwrap(), b"b");
     assert!(!src.join("b.txt").exists());
     std::fs::remove_dir_all(&target).unwrap();
+}
+
+// ---- round 5 ----
+
+/// The trace's index of the first event matching `pred`, and of the last.
+fn first(t: &[String], pred: impl Fn(&str) -> bool) -> Option<usize> {
+    t.iter().position(|e| pred(e))
+}
+
+fn last(t: &[String], pred: impl Fn(&str) -> bool) -> Option<usize> {
+    t.iter().rposition(|e| pred(e))
+}
+
+fn writes(e: &str) -> bool {
+    ["write:", "rename:", "mkdir:", "symlink:"]
+        .iter()
+        .any(|p| e.starts_with(p))
+}
+
+fn removes_under(e: &str, prefix: &str) -> bool {
+    let path = e
+        .strip_prefix("remove:")
+        .or_else(|| e.strip_prefix("rmdir:"));
+    path.is_some_and(|p| p == prefix || p.starts_with(&format!("{prefix}/")))
+}
+
+/// F6 (order): one ordered trace — each moved item's barrier comes after that item's last write
+/// and before any of its source removals, flushes every folder that received an entry, deepest
+/// first; the end's barrier comes after the last write.
+#[test]
+fn f6_each_barrier_comes_after_its_writes_and_before_its_removals() {
+    let (_t, src, dst) = scratch();
+    let d = src.join("d");
+    std::fs::create_dir_all(d.join("sub")).unwrap();
+    std::fs::write(d.join("a"), "a").unwrap();
+    std::fs::write(d.join("sub/b"), "b").unwrap();
+    std::fs::write(src.join("f"), "f").unwrap();
+    let mut local = LocalFs::new();
+    let mut fs = Faulty::new(&mut local);
+    fs.rename = no_rename_from(&[&d, &src.join("f")]);
+    let trace = fs.trace.clone();
+    let r = run(
+        &job(Op::Move, &src, &["d", "f"], &dst),
+        Hosts::Same(&mut fs),
+        &mut Script::default(),
+    );
+    assert!(r.all_done(), "{r:?}");
+    let t = trace.lock().unwrap().clone();
+    let (dd, ds) = (s(&dst.join("d")), s(&dst.join("d/sub")));
+    let cases = [
+        (s(&d), dd.clone(), format!("barrier:{ds};{dd};{}", s(&dst))),
+        (
+            s(&src.join("f")),
+            s(&dst.join("f")),
+            format!("barrier:{}", s(&dst)),
+        ),
+    ];
+    for (source, copy, barrier) in cases {
+        let w = last(&t, |e| writes(e) && e.contains(&copy)).expect("written");
+        let r = first(&t, |e| removes_under(e, &source)).expect("removed");
+        let b = t
+            .iter()
+            .position(|e| *e == barrier)
+            .unwrap_or_else(|| panic!("{barrier}: {t:?}"));
+        assert!(
+            w < b && b < r,
+            "{source}: write {w} < barrier {b} < removal {r}: {t:?}"
+        );
+    }
+    let w = last(&t, writes).unwrap();
+    let b = last(&t, |e| e.starts_with("barrier:")).unwrap();
+    assert!(w < b, "the end's barrier after the last write: {t:?}");
+}
+
+/// F6 / engine 5: a barrier that fails (after a good read-back) removes no source of that item:
+/// it stays, and the report says the copy's durability was not confirmed.
+#[test]
+fn a_failed_barrier_removes_no_source() {
+    let (_t, src, dst) = scratch();
+    let d = three_files(&src);
+    std::fs::write(src.join("f"), "f").unwrap();
+    let mut local = LocalFs::new();
+    let mut fs = Faulty::new(&mut local);
+    fs.rename = no_rename_from(&[&d, &src.join("f")]);
+    fs.fault = Box::new(|op, _| {
+        (op == "barrier").then(|| anyhow::anyhow!("injected: the drive did not flush"))
+    });
+    let trace = fs.trace.clone();
+    let r = run(
+        &job(Op::Move, &src, &["d", "f"], &dst),
+        Hosts::Same(&mut fs),
+        &mut Script::default(),
+    );
+    for name in ["d", "f"] {
+        let line = r.items.iter().find(|i| i.name == name);
+        assert!(
+            matches!(line, Some(Item { outcome: ItemOutcome::Failed(why), .. })
+                if why.contains("durability was not confirmed") && why.contains("stay")),
+            "{name}: {r:?}"
+        );
+    }
+    let t = trace.lock().unwrap().clone();
+    let src_s = s(&src);
+    assert!(
+        first(&t, |e| removes_under(e, &src_s)).is_none(),
+        "no source removal: {t:?}"
+    );
+    assert_eq!(names(&d), ["a.txt", "b.txt", "c.txt"]);
+    assert!(src.join("f").exists() && dst.join("f").exists());
+}
+
+/// Engine 6: an in-place copy whose final name changes hands right after it was made, then
+/// stopped: what is under the name now is not sopen's, so it survives, named in the report.
+#[test]
+fn an_in_place_copy_stopped_after_its_name_changed_hands_leaves_the_newcomer() {
+    let _excl = LocalFs::seam_no_exclusive_rename();
+    let _links = LocalFs::seam_no_links();
+    let (_t, src, dst) = scratch();
+    std::fs::write(src.join("big"), vec![1u8; 4 * 1024 * 1024]).unwrap();
+    let target = dst.join("big");
+    let t2 = target.clone();
+    let _seam = LocalFs::seam_after_create(move |path| {
+        if Path::new(path) == t2 {
+            std::fs::remove_file(path).unwrap();
+            std::fs::write(path, "someone else's").unwrap();
+        }
+    });
+    let mut ctl = Script {
+        stop_at: Some(1),
+        ..Script::default()
+    };
+    let r = run(
+        &job(Op::Copy, &src, &["big"], &dst),
+        Hosts::Same(&mut LocalFs::new()),
+        &mut ctl,
+    );
+    stop_reason(&r.items[0]);
+    assert_eq!(std::fs::read(&target).unwrap(), b"someone else's", "{r:?}");
+    assert!(
+        r.notes
+            .iter()
+            .any(|n| n.contains(&s(&target)) && n.contains("left as it is")),
+        "{r:?}"
+    );
+}
+
+/// Engine 6 / contract: an in-place copy that fails part-way (its source stops answering) is
+/// removed — it is sopen's — and the item says why; Esc part-way says nothing of it is left.
+#[test]
+fn an_in_place_copy_that_fails_part_way_is_removed_and_said() {
+    let _excl = LocalFs::seam_no_exclusive_rename();
+    let _links = LocalFs::seam_no_links();
+    let (_t, src, dst) = scratch();
+    std::fs::write(src.join("big"), vec![1u8; 1024 * 1024]).unwrap();
+    let mut local = LocalFs::new();
+    let mut from = Faulty::new(&mut local);
+    from.fail_read_after = Some(100_000);
+    let r = run(
+        &job(Op::Move, &src, &["big"], &dst),
+        Hosts::Two {
+            src: &mut from,
+            dst: &mut LocalFs::new(),
+        },
+        &mut Script::default(),
+    );
+    assert!(
+        matches!(&r.items[..], [Item { outcome: ItemOutcome::Failed(why), .. }]
+            if why.contains("injected: the source stopped answering")),
+        "{r:?}"
+    );
+    assert!(!dst.join("big").exists(), "the partial copy went");
+    assert!(src.join("big").exists(), "the source stays");
+
+    let mut ctl = Script {
+        stop_at: Some(1),
+        ..Script::default()
+    };
+    std::fs::write(src.join("huge"), vec![2u8; 4 * 1024 * 1024]).unwrap();
+    let r = run(
+        &job(Op::Move, &src, &["huge"], &dst),
+        Hosts::Same(&mut LocalFs::new()),
+        &mut ctl,
+    );
+    assert!(stop_reason(&r.items[0]).contains("nothing of it"), "{r:?}");
+    assert!(!dst.join("huge").exists());
+    assert!(src.join("huge").exists());
+}
+
+/// Contract: an in-place copy replaced at its name before its read-back is left and named; a
+/// move keeps its source.
+#[test]
+fn an_in_place_copy_replaced_before_its_check_is_left_and_named() {
+    let _excl = LocalFs::seam_no_exclusive_rename();
+    let _links = LocalFs::seam_no_links();
+    let (_t, src, dst) = scratch();
+    let f = src.join("f");
+    std::fs::write(&f, vec![4u8; 4096]).unwrap();
+    let mut local = LocalFs::new();
+    let mut fs = Faulty::new(&mut local);
+    fs.rename = no_rename_from(&[&f]);
+    fs.copied = Box::new(|path| {
+        std::fs::remove_file(path).unwrap();
+        std::fs::write(path, "a newcomer").unwrap();
+    });
+    let r = run(
+        &job(Op::Move, &src, &["f"], &dst),
+        Hosts::Same(&mut fs),
+        &mut Script::default(),
+    );
+    assert!(
+        matches!(&r.items[..], [Item { outcome: ItemOutcome::Failed(why), .. }]
+            if why.contains("not the copy") && why.contains(&s(&dst.join("f")))),
+        "{r:?}"
+    );
+    assert_eq!(std::fs::read(dst.join("f")).unwrap(), b"a newcomer");
+    assert!(f.exists(), "the source stays");
+}
+
+/// Engine 8: a two-step rename whose steps cannot be confirmed claims nothing it does not know.
+#[test]
+fn a_two_step_rename_that_cannot_be_confirmed_claims_nothing() {
+    let (_t, src, _dst) = scratch();
+    if !one_name(&src, "probe", "PROBE") {
+        eprintln!("skipping: {} is case-sensitive", src.display());
+        return;
+    }
+    let readme = src.join("readme");
+    std::fs::write(&readme, "r").unwrap();
+    let to_upper = job(
+        Op::Rename {
+            to: "README".into(),
+        },
+        &src,
+        &["readme"],
+        &src,
+    );
+    let failed = |r: &Report| match &r.items[..] {
+        [Item {
+            outcome: ItemOutcome::Failed(why),
+            ..
+        }] => why.clone(),
+        _ => panic!("{r:?}"),
+    };
+    // The first step unconfirmed.
+    let calls = AtomicUsize::new(0);
+    let mut local = LocalFs::new();
+    let mut fs = Faulty::new(&mut local);
+    fs.rename = Box::new(|_, to| match calls.fetch_add(1, Ordering::Relaxed) {
+        0 => Some(Err(taken(to))),
+        _ => Some(Ok(Renamed::Unconfirmed("injected: no answer".into()))),
+    });
+    let why = failed(&run(
+        &to_upper,
+        Hosts::Same(&mut fs),
+        &mut Script::default(),
+    ));
+    assert!(why.contains("could not be confirmed"), "{why}");
+    assert!(
+        !why.contains("in place") && !why.contains("names it too"),
+        "{why}"
+    );
+
+    // The way back unconfirmed.
+    let calls = AtomicUsize::new(0);
+    let mut local = LocalFs::new();
+    let mut fs = Faulty::new(&mut local);
+    fs.rename = Box::new(|_, to| match calls.fetch_add(1, Ordering::Relaxed) {
+        0 => Some(Err(taken(to))),
+        1 => None,
+        2 => Some(Err(anyhow::anyhow!("injected: second step"))),
+        _ => Some(Ok(Renamed::Unconfirmed("injected: no answer".into()))),
+    });
+    let why = failed(&run(
+        &to_upper,
+        Hosts::Same(&mut fs),
+        &mut Script::default(),
+    ));
+    assert!(why.contains("could not be confirmed"), "{why}");
+    assert!(!why.contains("back under"), "{why}");
+    assert!(
+        why.contains(".sopen-renaming-"),
+        "names where it may be: {why}"
+    );
+}
+
+/// Ops 9: the publish probe never touches a name that is not its own: the name it vacated (now
+/// someone else's) and a second name swapped for another file both survive, and the report names
+/// what it left; a cleanup that fails is named too.
+#[test]
+fn the_publish_probe_cleans_up_only_its_own_names() {
+    let (_t, _src, dst) = scratch();
+    let dir = s(&dst);
+    let _seam = LocalFs::seam_after_probe(|names| {
+        let (vacated, second) = names.split_once('\n').unwrap();
+        std::fs::write(vacated, "someone else's, at the vacated name").unwrap();
+        std::fs::remove_file(second).unwrap();
+        std::fs::write(second, "someone else's, swapped in").unwrap();
+    });
+    let (mode, notes) = LocalFs::new().publish_mode(&dir).unwrap();
+    assert_eq!(mode, Publish::Atomic);
+    let left: Vec<String> = names(&dst);
+    assert_eq!(left.len(), 2, "both survive: {left:?}");
+    for name in &left {
+        let body = std::fs::read_to_string(dst.join(name)).unwrap();
+        assert!(body.starts_with("someone else's"), "{name}: {body}");
+    }
+    let second = left
+        .iter()
+        .find(|n| {
+            std::fs::read_to_string(dst.join(n))
+                .unwrap()
+                .contains("swapped")
+        })
+        .unwrap();
+    assert!(
+        notes.iter().any(|n| n.contains(&s(&dst.join(second)))),
+        "{notes:?}"
+    );
+}
+
+#[test]
+fn the_publish_probe_names_a_cleanup_that_fails() {
+    let (_t, _src, dst) = scratch();
+    let folder = dst.clone();
+    let _seam = LocalFs::seam_after_probe(move |_| set_mode(&folder, 0o555));
+    let got = LocalFs::new().publish_mode(&s(&dst));
+    set_mode(&dst, 0o755);
+    let (_, notes) = got.unwrap();
+    let left = names(&dst);
+    assert_eq!(left.len(), 1, "{left:?}");
+    assert!(
+        notes.iter().any(|n| n.contains(&s(&dst.join(&left[0])))),
+        "the leftover named: {notes:?}"
+    );
+}
+
+/// Ops 11: `F_FULLFSYNC` refused as unsupported falls back to `fsync`; a real I/O error fails the
+/// barrier (and so keeps a moved source); an interrupted one is tried again.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_full_fsync_error_falls_back_only_when_unsupported() {
+    let (_t, _src, dst) = scratch();
+    let dirs = [s(&dst)];
+    for (errno, ok) in [
+        (libc::ENOTSUP, true),
+        (libc::EINTR, true),
+        (libc::EIO, false),
+    ] {
+        let _seam = LocalFs::seam_full_fsync_errno(errno);
+        let got = LocalFs::new().barrier(&dirs);
+        assert_eq!(got.is_ok(), ok, "errno {errno}: {got:?}");
+    }
 }

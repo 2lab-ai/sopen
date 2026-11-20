@@ -11,8 +11,10 @@
 //! same volume is still a rename; only a same-volume copy loses the clone's speed.
 
 use super::LocalFs;
-use crate::remote::ops::{taken, FileMeta, FileOps, NoRename, Opened, Publish, Renamed, Staged};
-use crate::remote::{join, random_hex, split_parent, Cancelled, CreateError, Created, Hashing};
+use crate::remote::ops::{
+    taken, FileMeta, FileOps, NoRename, Opened, Publish, Renamed, StageFailure, Staged,
+};
+use crate::remote::{join, random_hex, split_parent, Cancelled, Created, Hashing};
 use anyhow::{anyhow, Context, Result};
 use std::ffi::{CStr, CString};
 use std::fs;
@@ -149,6 +151,37 @@ fn try_rename_excl(from: &CString, to: &CString) -> std::io::Result<()> {
     rename_excl(from, to)
 }
 
+/// [`rename_excl`] of two names in one open folder (the same test seam applies).
+fn rename_excl_at(dir: &fs::File, from: &CStr, to: &CStr) -> std::io::Result<()> {
+    #[cfg(test)]
+    if NO_EXCLUSIVE_RENAME.with(|s| s.get()) {
+        return Err(std::io::Error::from_raw_os_error(libc::ENOTSUP));
+    }
+    let fd = dir.as_raw_fd();
+    #[cfg(target_os = "macos")]
+    // SAFETY: an open descriptor and two NUL-terminated names in it.
+    let r = unsafe { libc::renameatx_np(fd, from.as_ptr(), fd, to.as_ptr(), libc::RENAME_EXCL) };
+    #[cfg(target_os = "linux")]
+    // SAFETY: an open descriptor and two NUL-terminated names in it.
+    let r = unsafe { libc::renameat2(fd, from.as_ptr(), fd, to.as_ptr(), libc::RENAME_NOREPLACE) };
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    let r = {
+        let _ = (fd, from, to);
+        return Err(std::io::Error::from_raw_os_error(libc::ENOTSUP));
+    };
+    zero_ok(r)
+}
+
+/// `link` of two names in one open folder (the same test seam applies).
+fn link_at(dir: &fs::File, from: &CStr, to: &CStr) -> std::io::Result<()> {
+    if no_links() {
+        return Err(std::io::Error::from_raw_os_error(libc::ENOTSUP));
+    }
+    let fd = dir.as_raw_fd();
+    // SAFETY: an open descriptor and two NUL-terminated names in it; flags 0 never follows.
+    zero_ok(unsafe { libc::linkat(fd, from.as_ptr(), fd, to.as_ptr(), 0) })
+}
+
 /// A link refused because this filesystem has none (exFAT, FAT).
 fn no_link_here(e: &std::io::Error) -> bool {
     is_errno(e, &[libc::ENOTSUP, libc::EOPNOTSUPP])
@@ -187,7 +220,7 @@ fn open_source(path: &str) -> Result<(fs::File, fs::Metadata)> {
 /// Creates `temp` exclusively (`O_CREAT|O_EXCL|O_NOFOLLOW`), private until its copy is
 /// complete. Everything after goes through the returned descriptor; the name is used again only
 /// to publish it, after the engine checks that the name is still this file.
-fn create_temp(temp: &str) -> std::result::Result<fs::File, CreateError> {
+fn create_temp(temp: &str) -> std::result::Result<(fs::File, (u64, u64)), StageFailure> {
     let file = fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -200,11 +233,18 @@ fn create_temp(temp: &str) -> std::result::Result<fs::File, CreateError> {
             } else {
                 anyhow!(e).context(format!("cannot create {temp}"))
             };
-            CreateError::new(Created::No, error)
+            StageFailure::not_created(error)
         })?;
+    // Its identity by the descriptor, before anything else can happen to its name.
+    let made = file.metadata().map_err(|e| StageFailure {
+        created: Created::Yes,
+        id: None,
+        error: anyhow!(e).context(format!("cannot stat {temp}")),
+    })?;
+    let id = (made.dev(), made.ino());
     #[cfg(test)]
     crate::remote::ops::fire_seam(&AFTER_CREATE, temp);
-    Ok(file)
+    Ok((file, id))
 }
 
 /// After the content: the source's permission bits and times through the handle (a failure is
@@ -430,69 +470,141 @@ impl FileOps for LocalFs {
         )
     }
 
-    /// Probed once per folder with a file of its own: renamed exclusively, else linked; where
-    /// neither works (exFAT, FAT) copies are written in place. A probe that cannot even be made
-    /// says nothing — the copy's own create will give the reason.
-    fn publish_mode(&mut self, dir: &str) -> Result<Publish> {
-        let probe = join(dir, &format!(".sopen-probe-{}", random_hex()));
-        let other = join(dir, &format!(".sopen-probe-{}", random_hex()));
-        let made = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .custom_flags(libc::O_NOFOLLOW)
-            .mode(0o600)
-            .open(&probe);
-        if made.is_err() {
-            return Ok(Publish::Atomic);
-        }
-        let (p, o) = (c_path(&probe)?, c_path(&other)?);
-        let mode = match try_rename_excl(&p, &o) {
-            Ok(()) => {
-                let _ = fs::remove_file(&other);
-                Publish::Atomic
-            }
-            Err(e) if no_exclusive_rename(&e) => {
-                let linked = if no_links() {
-                    Err(std::io::Error::from_raw_os_error(libc::ENOTSUP))
-                } else {
-                    fs::hard_link(&probe, &other)
-                };
-                match linked {
-                    Ok(()) => {
-                        let _ = fs::remove_file(&other);
-                        Publish::Atomic
-                    }
-                    Err(e) if no_link_here(&e) => Publish::InPlace,
-                    Err(_) => Publish::Atomic,
-                }
-            }
-            Err(_) => Publish::Atomic,
+    /// Probed once per folder with a file of its own, made and cleaned up through the folder
+    /// opened once: renamed exclusively, else linked; where neither works (exFAT, FAT) copies
+    /// are written in place. Only names still the probe's own (its inode) are removed — never
+    /// the name a rename vacated, never one another file has taken since — and what is left is
+    /// named. A probe that cannot even be made says nothing: the copy's own create will.
+    fn publish_mode(&mut self, dir: &str) -> Result<(Publish, Vec<String>)> {
+        use std::os::fd::FromRawFd;
+        let Ok(folder) = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY)
+            .open(dir)
+        else {
+            return Ok((Publish::Atomic, Vec::new()));
         };
-        let _ = fs::remove_file(&probe);
-        Ok(mode)
+        let (first, second) = (
+            format!(".sopen-probe-{}", random_hex()),
+            format!(".sopen-probe-{}", random_hex()),
+        );
+        let (f, o) = (c_path(&first)?, c_path(&second)?);
+        let flags =
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+        // SAFETY: an open descriptor, a NUL-terminated name, and a mode for the new file.
+        let fd =
+            unsafe { libc::openat(folder.as_raw_fd(), f.as_ptr(), flags, 0o600 as libc::c_uint) };
+        if fd < 0 {
+            return Ok((Publish::Atomic, Vec::new()));
+        }
+        // SAFETY: a descriptor just opened, owned by nothing else.
+        let probe = unsafe { fs::File::from_raw_fd(fd) };
+        let Ok(made) = probe.metadata() else {
+            return Ok((Publish::Atomic, Vec::new()));
+        };
+        let id = (made.dev(), made.ino());
+        let both = format!("{}\n{}", join(dir, &first), join(dir, &second));
+        // The names that are still the probe's own.
+        let (mode, ours): (Publish, Vec<(&CStr, &str)>) = match rename_excl_at(&folder, &f, &o) {
+            Ok(()) => {
+                #[cfg(test)]
+                crate::remote::ops::fire_seam(&AFTER_PROBE, &both);
+                (Publish::Atomic, vec![(&o, &second)])
+            }
+            Err(e) if no_exclusive_rename(&e) => match link_at(&folder, &f, &o) {
+                Ok(()) => {
+                    #[cfg(test)]
+                    crate::remote::ops::fire_seam(&AFTER_PROBE, &both);
+                    (Publish::Atomic, vec![(&f, &first), (&o, &second)])
+                }
+                Err(e) if no_link_here(&e) => (Publish::InPlace, vec![(&f, &first)]),
+                Err(_) => (Publish::Atomic, vec![(&f, &first)]),
+            },
+            Err(_) => (Publish::Atomic, vec![(&f, &first)]),
+        };
+        let _ = both;
+        let mut notes = Vec::new();
+        for (name, shown) in ours {
+            let path = join(dir, shown);
+            match stat_at(&folder, name) {
+                Ok(now) if (now.dev, now.ino) == id => {
+                    // SAFETY: an open descriptor and a NUL-terminated name.
+                    let gone =
+                        zero_ok(unsafe { libc::unlinkat(folder.as_raw_fd(), name.as_ptr(), 0) });
+                    if let Err(e) = gone {
+                        notes.push(format!(
+                            "sopen's probe file {path} could not be removed: {e}"
+                        ));
+                    }
+                }
+                Ok(_) => notes.push(format!(
+                    "{path} is no longer sopen's probe file (another file has its name); it was \
+                     left as it is"
+                )),
+                Err(e) if e.kind() == ErrorKind::NotFound => {}
+                Err(e) => notes.push(format!(
+                    "sopen's probe file {path} could not be checked ({e}); it was left as it is"
+                )),
+            }
+        }
+        Ok((mode, notes))
     }
 
-    /// macOS: one `F_FULLFSYNC` through the folder's descriptor flushes the drive's cache for
-    /// the volume (a plain `fsync` where the filesystem refuses it). Linux: each file's `fsync`
-    /// already is the barrier.
-    fn barrier(&mut self, dir: &str) -> Result<()> {
-        #[cfg(target_os = "macos")]
-        {
-            let folder = fs::OpenOptions::new()
+    /// Each folder in `dirs` (deepest first) flushed through its own descriptor (`fsync`: the
+    /// entries it received — a file's `fsync` does not make its new name durable); then on macOS
+    /// one `F_FULLFSYNC` to flush the drive's cache for the volume — a plain `fsync` only where
+    /// the filesystem says it does not support it, interrupted calls tried again, a real I/O
+    /// error returned (it keeps a moved source).
+    fn barrier(&mut self, dirs: &[String]) -> Result<()> {
+        let open = |dir: &str| {
+            fs::OpenOptions::new()
                 .read(true)
                 .custom_flags(libc::O_DIRECTORY)
                 .open(dir)
-                .with_context(|| format!("cannot open {dir} to flush it"))?;
+                .with_context(|| format!("cannot open {dir} to flush it"))
+        };
+        for dir in dirs {
+            let folder = open(dir)?;
             // SAFETY: an open descriptor.
-            let full = unsafe { libc::fcntl(folder.as_raw_fd(), libc::F_FULLFSYNC) };
-            if full != 0 {
-                // SAFETY: an open descriptor.
-                zero_ok(unsafe { libc::fsync(folder.as_raw_fd()) })
-                    .with_context(|| format!("cannot flush the volume of {dir}"))?;
+            match zero_ok(unsafe { libc::fsync(folder.as_raw_fd()) }) {
+                Ok(()) => {}
+                // Some filesystems do not flush folders; their entries go with the data.
+                Err(e) if is_errno(&e, &[libc::EINVAL, libc::ENOTSUP, libc::EOPNOTSUPP]) => {}
+                Err(e) => return Err(e).with_context(|| format!("cannot flush the folder {dir}")),
             }
         }
-        #[cfg(not(target_os = "macos"))]
-        let _ = dir;
+        #[cfg(target_os = "macos")]
+        if let Some(dir) = dirs.last() {
+            let folder = open(dir)?;
+            loop {
+                // SAFETY: an open descriptor.
+                let full = unsafe { libc::fcntl(folder.as_raw_fd(), libc::F_FULLFSYNC) };
+                #[cfg(test)]
+                let full = match FULL_FSYNC_ERRNO.with(|e| e.take()) {
+                    Some(errno) => {
+                        // SAFETY: errno is this thread's.
+                        unsafe { *libc::__error() = errno };
+                        -1
+                    }
+                    None => full,
+                };
+                if full == 0 {
+                    break;
+                }
+                let e = std::io::Error::last_os_error();
+                if e.kind() == ErrorKind::Interrupted {
+                    continue;
+                }
+                let unsupported = [libc::ENOTSUP, libc::EOPNOTSUPP, libc::EINVAL, libc::ENOTTY];
+                if is_errno(&e, &unsupported) {
+                    // SAFETY: an open descriptor.
+                    zero_ok(unsafe { libc::fsync(folder.as_raw_fd()) })
+                        .with_context(|| format!("cannot flush the volume of {dir}"))?;
+                    break;
+                }
+                return Err(e).with_context(|| format!("cannot flush the volume of {dir}"));
+            }
+        }
         Ok(())
     }
 
@@ -569,12 +681,15 @@ impl FileOps for LocalFs {
         temp: &str,
         cancel: &AtomicBool,
         progress: &mut dyn FnMut(u64),
-    ) -> std::result::Result<Staged, CreateError> {
-        let (mut src, src_meta) =
-            open_source(from).map_err(|e| CreateError::new(Created::No, e))?;
+    ) -> std::result::Result<Staged, StageFailure> {
+        let (mut src, src_meta) = open_source(from).map_err(StageFailure::not_created)?;
         let source = meta_of(&src_meta);
-        let ours = |e: anyhow::Error| CreateError::new(Created::Yes, e);
-        let dst = create_temp(temp)?;
+        let (dst, id) = create_temp(temp)?;
+        let ours = |error: anyhow::Error| StageFailure {
+            created: Created::Yes,
+            id: Some(id),
+            error,
+        };
         let mut fill = || -> Result<Staged> {
             #[cfg(target_os = "linux")]
             let copied = kernel_copy(&src, &dst, source.size, cancel, progress)?;
@@ -616,8 +731,8 @@ impl FileOps for LocalFs {
         temp: &str,
         cancel: &AtomicBool,
         progress: &mut dyn FnMut(u64),
-    ) -> std::result::Result<Staged, CreateError> {
-        let dst = create_temp(temp)?;
+    ) -> std::result::Result<Staged, StageFailure> {
+        let (dst, id) = create_temp(temp)?;
         let mut fill = || -> Result<Staged> {
             let sha256 = pump(src, &dst, temp, cancel, progress)?;
             if cancel.load(Ordering::Relaxed) {
@@ -633,7 +748,11 @@ impl FileOps for LocalFs {
                 id: Some((made.dev(), made.ino())),
             })
         };
-        fill().map_err(|e| CreateError::new(Created::Yes, e))
+        fill().map_err(|error| StageFailure {
+            created: Created::Yes,
+            id: Some(id),
+            error,
+        })
     }
 }
 
@@ -656,6 +775,13 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
     static AFTER_CREATE: std::cell::RefCell<Option<crate::remote::ops::SeamHook>> =
         const { std::cell::RefCell::new(None) };
+    static AFTER_PROBE: std::cell::RefCell<Option<crate::remote::ops::SeamHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(all(test, target_os = "macos"))]
+thread_local! {
+    static FULL_FSYNC_ERRNO: std::cell::Cell<Option<i32>> = const { std::cell::Cell::new(None) };
 }
 
 /// Test seams on this thread (04 §8's faults at the exact step), each until its guard drops.
@@ -681,6 +807,21 @@ impl LocalFs {
         hook: impl FnMut(&str) + 'static,
     ) -> crate::remote::ops::SeamGuard {
         crate::remote::ops::set_seam(&BEFORE_UNLINK, hook)
+    }
+
+    /// In the publish probe: after its file was renamed (or linked) to its second name, before
+    /// the cleanup; the hook gets `"<first name>\n<second name>"`.
+    pub(crate) fn seam_after_probe(
+        hook: impl FnMut(&str) + 'static,
+    ) -> crate::remote::ops::SeamGuard {
+        crate::remote::ops::set_seam(&AFTER_PROBE, hook)
+    }
+
+    /// macOS: the next `F_FULLFSYNC` of a barrier fails with this errno (once).
+    #[cfg(target_os = "macos")]
+    pub(crate) fn seam_full_fsync_errno(errno: i32) -> crate::remote::ops::SeamGuard {
+        FULL_FSYNC_ERRNO.with(|e| e.set(Some(errno)));
+        crate::remote::ops::SeamGuard::new(|| FULL_FSYNC_ERRNO.with(|e| e.set(None)))
     }
 
     /// Right after a copy's temp is made (its exclusive create), before any byte or attribute

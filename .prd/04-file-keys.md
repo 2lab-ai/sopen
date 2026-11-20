@@ -120,15 +120,27 @@ contexts where it acts (list, viewer, git panel, tree, a dialog) and its `Comman
 - **Asked first**, the conventional way: every operation opens its dialog; Enter goes, Esc cancels.
 - **Nothing half-made under a final name.** A copied file is complete before it gets its name (§5.6);
   a server that cannot publish that way is refused for copy and move, with the reason. A local volume
-  that can publish nothing atomically — neither an exclusive rename nor links (exFAT) — gets the copy
-  written straight into its final name, created exclusively (still never replacing), and the report
-  says so: an interrupted copy there leaves a partial file under its name.
-- **Temps** are named `.<name>.sopen-<16 hex>` in the target folder (the name part shortened to keep
-  within 255 bytes). One left by a sopen that was killed (`kill -9`, a power cut) stays under that
-  name; it is never taken for a copy, and removing it is safe.
-- **Durable before a source goes**: each copied file is flushed through its own descriptor (`fsync`);
-  on macOS one `F_FULLFSYNC` barrier per operation flushes the drive — before each moved item's
-  sources are removed, and at the end — not one per file (on Linux the `fsync` is the barrier).
+  that can publish nothing atomically — neither an exclusive rename nor links (exFAT; sopen probes
+  each target folder once) — gets the copy written straight into its final name, created
+  exclusively (still never replacing), and the report says so. There a partial file is left under
+  the final name only when sopen is interrupted (killed, a power cut); a copy that sopen stops (Esc)
+  or sees fail is removed while that name is still the file it wrote (its inode, by its
+  descriptor), and otherwise left and named; a move keeps its source until the copy is read back
+  and made durable.
+- **Names sopen puts aside**, in the target folder (the name part shortened to keep within 255
+  bytes); one left by a sopen that was killed (`kill -9`, a power cut) stays under it:
+  - `.<name>.sopen-<16 hex>` — a copy being staged: never taken for a copy; removing it is safe.
+  - `.<name>.sopen-renaming-<16 hex>` — the middle name of a two-step rename (§5.3): it holds the
+    **original**; rename it back to its name, never remove it.
+  - `.sopen-probe-<16 hex>` — sopen's publish probe (an empty file); removing it is safe. sopen
+    removes its own only while they are still its own, and names any it leaves.
+- **Durable before a source goes**: each copied file is flushed through its own descriptor (`fsync`).
+  Before each moved item's sources are removed, and at the operation's end, a barrier flushes every
+  target folder that received an entry, deepest first (`fsync` of the folder: a file's own `fsync`
+  does not make its new name durable), then on macOS the drive (one `F_FULLFSYNC`; a plain `fsync`
+  only where the volume says it does not support it) — once per item and operation, not per file. A
+  barrier that fails keeps that item's sources: the report says the copy exists but its durability
+  was not confirmed.
 - **One connection of its own** per operation (`Connect`, as each viewer has), so the panel's
   listing goes on meanwhile.
 - **Progress and stopping**: an operation on more than one item, or on a file over 8 MiB, shows
@@ -173,9 +185,11 @@ contexts where it acts (list, viewer, git panel, tree, a dialog) and its `Comman
 - **Is the target the source, or inside it?** Decided on resolved paths (`realpath` of both), and
   locally also by device and inode of the target and its ancestors, so a link or an alias cannot lead
   a folder into itself. Refused before anything happens. Over two connections (another host's path,
-  or two sessions to one machine) it is refused when both report one filesystem id (`statvfs`) for
-  nested resolved paths; where an id is missing the report says the two may be one machine. Either
-  way a folder is walked before anything is made, so a copy never copies what it made itself.
+  or two sessions to one machine) it is refused when the resolved paths nest and both report one
+  filesystem id (`statvfs`), or either reports none: sopen cannot tell whether both sides are the
+  same machine, so the dialog asks for a folder outside the source (one id on two machines can only
+  refuse a safe copy, never let one through). A folder is also walked before anything is made, so a
+  copy never copies what it made itself.
 - **Is a name taken?** Decided by the filesystem — an exclusive create or a link failing with "exists"
   — never by comparing strings: two names that look different may be one entry (case-insensitive or
   Unicode-normalising filesystems) and two that look alike may be two.
@@ -205,9 +219,10 @@ contexts where it acts (list, viewer, git panel, tree, a dialog) and its `Comman
   and both spellings stat to one inode, *verified, APFS*). Remotely attributes prove nothing; the proof
   is the folder's listing: only when a fresh listing holds the source's spelling and no entry spelled
   like the new name is the "exists" taken to be the source itself; otherwise it is another entry and an
-  error. sopen then renames in two steps through a free temp name in the same folder, each step never
+  error. sopen then renames in two steps through a free name in the same folder (`.<name>.sopen-renaming-<16 hex>`, §5.1), each step never
   replacing. **When the second step fails**, sopen renames the temp back to the original name, again
-  never replacing; when that fails too, the report names the exact path the file now has.
+  never replacing; when that fails too, the report names the exact path the file now has (or, when
+  a step got no answer it could confirm, the two paths it may have).
 - **Remote folders**: renaming one needs SFTP's plain rename, which the library sopen uses cannot send
   today (§5.6); until slice S6 (02 §8) brings it, F2 on a remote folder says so and does nothing.
 

@@ -11,7 +11,7 @@
 //! [`Taken`]. Two names that look different may be one entry on a case-insensitive or
 //! Unicode-normalising filesystem, and two that look alike may be two.
 
-use super::{CreateError, RemoteFs};
+use super::{CreateError, Created, RemoteFs};
 use anyhow::{anyhow, Result};
 use std::io::Read;
 use std::sync::atomic::AtomicBool;
@@ -72,6 +72,39 @@ pub enum Publish {
     /// written straight into its final name, created exclusively — still never replacing, but
     /// an interrupted copy leaves a partial file under that name.
     InPlace,
+}
+
+/// A copy into a temp (or, written in place, into its final name) that went no further.
+#[derive(Debug)]
+pub struct StageFailure {
+    /// Whether the file had been created ([`Created::Yes`]: it may hold partial content).
+    pub created: Created,
+    /// The created file's device and inode, by the descriptor it was written through (this
+    /// machine): it is removed only while its name is still that file. `None` over SFTP, which
+    /// carries no inode, or when nothing was created.
+    pub id: Option<(u64, u64)>,
+    pub error: anyhow::Error,
+}
+
+impl StageFailure {
+    /// Nothing was created.
+    pub fn not_created(error: anyhow::Error) -> Self {
+        Self {
+            created: Created::No,
+            id: None,
+            error,
+        }
+    }
+}
+
+impl From<CreateError> for StageFailure {
+    fn from(e: CreateError) -> Self {
+        Self {
+            created: e.created,
+            id: None,
+            error: e.error,
+        }
+    }
 }
 
 /// A source file opened for a copy to another host: its bytes, and what its open handle says.
@@ -190,15 +223,16 @@ pub trait FileOps: RemoteFs {
     fn rename_new(&mut self, from: &str, to: &str) -> Result<Renamed>;
 
     /// How finished copies get their names in the folder `dir` (04 §5.6), probed once per folder
-    /// by the engine.
-    fn publish_mode(&mut self, _dir: &str) -> Result<Publish> {
-        Ok(Publish::Atomic)
+    /// by the engine; with what the report must hear about the probe (a name it could not clean
+    /// up).
+    fn publish_mode(&mut self, _dir: &str) -> Result<(Publish, Vec<String>)> {
+        Ok((Publish::Atomic, Vec::new()))
     }
 
-    /// Makes what was written on the volume holding `dir` durable (macOS: one `F_FULLFSYNC`;
-    /// elsewhere each file's own `fsync` already is) — once before a moved source is removed and
-    /// once at an operation's end.
-    fn barrier(&mut self, _dir: &str) -> Result<()> {
+    /// Makes durable what an operation put in the folders `dirs` (deepest first): the entries
+    /// each folder received, and the files' data on the volume (04 §5.1). Called before a moved
+    /// item's source is removed — a failure keeps it — and at an operation's end.
+    fn barrier(&mut self, _dirs: &[String]) -> Result<()> {
         Ok(())
     }
 
@@ -242,7 +276,7 @@ pub trait FileOps: RemoteFs {
         temp: &str,
         cancel: &AtomicBool,
         progress: &mut dyn FnMut(u64),
-    ) -> std::result::Result<Staged, CreateError>;
+    ) -> std::result::Result<Staged, StageFailure>;
 
     /// Opens the regular file `path` for reading by a copy to another host.
     fn open_read(&mut self, path: &str) -> Result<Opened<'_>>;
@@ -257,5 +291,5 @@ pub trait FileOps: RemoteFs {
         temp: &str,
         cancel: &AtomicBool,
         progress: &mut dyn FnMut(u64),
-    ) -> std::result::Result<Staged, CreateError>;
+    ) -> std::result::Result<Staged, StageFailure>;
 }

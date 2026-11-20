@@ -10,7 +10,8 @@ use super::{
     CHUNK, META_TIMEOUT, STALL_TIMEOUT,
 };
 use crate::remote::ops::{
-    taken, FileMeta, FileOps, NoRename, Opened, Renamed, Staged, COPY_STEP, REMOTE_FOLDER_RENAME,
+    taken, FileMeta, FileOps, NoRename, Opened, Renamed, StageFailure, Staged, COPY_STEP,
+    REMOTE_FOLDER_RENAME,
 };
 use crate::remote::{split_parent, Cancelled, CreateError, Created, Hashing, RemoteFs};
 use anyhow::{anyhow, Context, Result};
@@ -504,12 +505,12 @@ impl FileOps for SftpRemote {
         temp: &str,
         cancel: &AtomicBool,
         progress: &mut dyn FnMut(u64),
-    ) -> std::result::Result<Staged, CreateError> {
+    ) -> std::result::Result<Staged, StageFailure> {
         let (rt, sftp, _) = self.parts();
         rt.block_on(async {
             let (mut src, source) = open_source(sftp, from)
                 .await
-                .map_err(|e| CreateError::new(Created::No, e))?;
+                .map_err(StageFailure::not_created)?;
             let mut dst = create_temp(sftp, temp).await?;
             // From here `temp` is ours.
             let fill = async {
@@ -532,7 +533,9 @@ impl FileOps for SftpRemote {
                     id: None,
                 })
             };
-            let staged = fill.await.map_err(|e| CreateError::new(Created::Yes, e));
+            let staged = fill
+                .await
+                .map_err(|e| StageFailure::from(CreateError::new(Created::Yes, e)));
             let _ = within(Duration::from_secs(5), src.close()).await;
             staged
         })
@@ -559,7 +562,7 @@ impl FileOps for SftpRemote {
         temp: &str,
         cancel: &AtomicBool,
         progress: &mut dyn FnMut(u64),
-    ) -> std::result::Result<Staged, CreateError> {
+    ) -> std::result::Result<Staged, StageFailure> {
         let (rt, sftp, _) = self.parts();
         let mut file = rt.block_on(create_temp(sftp, temp))?;
         // From here `temp` is ours. `src` may be another session's reader, so it is read here,
@@ -601,7 +604,7 @@ impl FileOps for SftpRemote {
                 id: None,
             })
         });
-        staged.map_err(|e| CreateError::new(Created::Yes, e))
+        staged.map_err(|e| StageFailure::from(CreateError::new(Created::Yes, e)))
     }
 }
 
@@ -644,14 +647,15 @@ impl SftpRemote {
             .unwrap();
         let sftp = rt.block_on(async {
             let mut cmd = tokio::process::Command::new(server);
-            cmd.args(args)
-                .stdin(Stdio::piped())
+            cmd.stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .kill_on_drop(true);
             if let Some(log) = log {
                 cmd.args(["-e", "-l", "INFO"])
                     .stderr(Stdio::from(std::fs::File::create(log).unwrap()));
             }
+            // After the log's: a test's own `-l DEBUG1` wins.
+            cmd.args(args);
             let mut child = cmd.spawn().unwrap();
             let (stdin, stdout) = (child.stdin.take().unwrap(), child.stdout.take().unwrap());
             let keep = openssh_sftp_client::SftpAuxiliaryData::Boxed(Box::new(
