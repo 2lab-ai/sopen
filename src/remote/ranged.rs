@@ -9,8 +9,8 @@
 //! batch with an `fstat` sent behind it, is the stream's (06 §4, §5); the whole-file reads here
 //! follow short replies themselves.
 
-use super::{RemoteFs, Stat};
-use anyhow::{bail, Result};
+use super::{CreateError, Created, Entry, Like, RemoteFs, Stat, Uploaded};
+use anyhow::{anyhow, bail, Result};
 use bytes::Bytes;
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -139,6 +139,64 @@ pub trait Ranged: Send {
     fn close(self: Box<Self>);
 }
 
+/// The connection a transport gives back when its thread stopped (a bug) and took the session
+/// with it: every call fails with the reason, and nothing is sent anywhere. The owner's
+/// reconnect makes a new one.
+pub(crate) struct Lost(pub(crate) String);
+
+impl RemoteFs for Lost {
+    fn stat_opt(&mut self, _: &str) -> Result<Option<Stat>> {
+        bail!("{}", self.0)
+    }
+    fn lstat_opt(&mut self, _: &str) -> Result<Option<Stat>> {
+        bail!("{}", self.0)
+    }
+    fn realpath(&mut self, _: &str) -> Result<String> {
+        bail!("{}", self.0)
+    }
+    fn read_head(&mut self, _: &str, _: usize) -> Result<Vec<u8>> {
+        bail!("{}", self.0)
+    }
+    fn list_dir(&mut self, _: &str) -> Result<Vec<String>> {
+        bail!("{}", self.0)
+    }
+    fn list_entries(&mut self, _: &str) -> Result<Vec<Entry>> {
+        bail!("{}", self.0)
+    }
+    fn read_to(
+        &mut self,
+        _: &str,
+        _: &mut dyn std::io::Write,
+        _: &mut dyn FnMut(u64),
+    ) -> Result<u64> {
+        bail!("{}", self.0)
+    }
+    fn create_from(
+        &mut self,
+        _: &std::path::Path,
+        _: &str,
+        _: Option<Like>,
+    ) -> std::result::Result<Uploaded, CreateError> {
+        Err(CreateError::new(Created::No, anyhow!("{}", self.0)))
+    }
+    fn set_mode(&mut self, _: &str, _: u32) -> Result<()> {
+        bail!("{}", self.0)
+    }
+    fn rename_over(&mut self, _: &str, _: &str) -> Result<()> {
+        bail!("{}", self.0)
+    }
+    fn link_new(&mut self, _: &str, _: &str) -> Result<()> {
+        bail!("{}", self.0)
+    }
+    fn remove(&mut self, _: &str) -> Result<()> {
+        bail!("{}", self.0)
+    }
+    fn into_ranged(self: Box<Self>, _: &str) -> std::result::Result<Box<dyn Ranged>, Refused> {
+        let error = anyhow!("{}", self.0);
+        Err(Refused { conn: self, error })
+    }
+}
+
 impl std::fmt::Debug for dyn Ranged {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "Ranged({}, {} bytes)", self.path(), self.size())
@@ -196,6 +254,13 @@ impl Pipeline {
         }
     }
 
+    /// Tests: the plan of a read from `off` on, as if everything before it had been delivered.
+    #[cfg(test)]
+    pub(crate) fn starting_at(mut self, off: u64) -> Self {
+        self.next = off;
+        self
+    }
+
     /// The next request to send, `(offset, length)`, if one may go now. The rest of a short
     /// reply goes first, ahead of the window: it replaces bytes of a request already answered.
     pub(crate) fn send(&mut self) -> Option<(u64, u32)> {
@@ -207,14 +272,13 @@ impl Pipeline {
             s.state = SlotState::Sent;
             return Some((s.off, s.len));
         }
-        if self.ended || self.end.is_some_and(|e| self.next >= e) {
+        if self.exhausted() {
             return None;
         }
         let (sent, bytes) = self.in_flight();
-        let len = match self.end {
-            Some(e) => (e - self.next).min(self.ask as u64) as u32,
-            None => self.ask,
-        };
+        // What is left to ask: up to `end`, or up to the last offset there is.
+        let room = self.end.unwrap_or(u64::MAX) - self.next;
+        let len = room.min(self.ask as u64) as u32;
         if sent >= self.window || (sent > 0 && bytes + len as u64 > PIPE_IN_FLIGHT) {
             return None;
         }
@@ -279,11 +343,16 @@ impl Pipeline {
         }
     }
 
+    /// Nothing more to ask: the file ended, `end` was reached, or the offsets ran out.
+    fn exhausted(&self) -> bool {
+        self.ended || self.next >= self.end.unwrap_or(u64::MAX)
+    }
+
     /// Everything up to the end of the file (or `end`) has been delivered.
     pub(crate) fn done(&self) -> bool {
         match self.slots.front() {
             Some(s) => matches!(s.state, SlotState::End),
-            None => self.ended || self.end.is_some_and(|e| self.next >= e),
+            None => self.exhausted(),
         }
     }
 
@@ -312,16 +381,16 @@ mod fake {
 
     use super::*;
     use crate::remote::local::stat_of;
-    use crate::remote::{CreateError, Created, Entry, Like, LocalFs, Uploaded};
-    use anyhow::{anyhow, Context};
+    use crate::remote::LocalFs;
+    use anyhow::Context;
     use std::io::Write;
     use std::os::unix::fs::FileExt;
     use std::path::{Path, PathBuf};
     use std::sync::{Condvar, Mutex};
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    /// What a status reply costs on the link, in bytes (06 §4 counts about 100).
-    const STAT_REPLY: u64 = 100;
+    /// What a status request counts, in bytes (06 §4 counts about 100 of reply).
+    pub(crate) const STAT_REPLY: u64 = 100;
 
     /// The Fake's link. Every reply leaves `latency` after its request (a round trip), then
     /// crosses at `rate` bytes/s behind every reply before it: the server answers in order.
@@ -503,8 +572,13 @@ mod fake {
         pub asked: Asked,
         /// When it was sent, since the Fake was made (simulated or real).
         pub at: Duration,
-        /// Reply bytes of earlier requests still on their way when it was sent.
-        pub ahead: u64,
+        /// Bytes asked by earlier requests on its channel whose completion [`Ranged::next`] had
+        /// not returned when it was sent — a read's length, [`STAT_REPLY`] for a status request.
+        /// What a scheduler admits against (06 §4's `in_flight`).
+        pub outstanding: u64,
+        /// The physical backlog: reply bytes of earlier requests still crossing the link when it
+        /// was sent (a clipped reply counts what was sent, not what was asked).
+        pub backlog: u64,
     }
 
     /// What every open handle on the Fake reads from.
@@ -521,6 +595,8 @@ mod fake {
         sent: Vec<SentRecord>,
         faults: Vec<(usize, Fault)>,
         changes: Vec<(usize, Change)>,
+        /// Fakes blocked in `next` right now.
+        waiting: usize,
     }
 
     impl World {
@@ -533,15 +609,20 @@ mod fake {
 
         fn apply(&mut self, change: Change) {
             assert!(self.disk.is_none(), "change a local file on disk instead");
-            let at = self.at_path.expect("the path was removed");
-            let file = &mut self.files[at];
             let later = |t: SystemTime| t + Duration::from_secs(1);
+            let in_place = matches!(change, Change::Write { .. } | Change::Truncate(_));
+            let at = match (self.at_path, in_place) {
+                (Some(at), _) => at,
+                (None, true) => panic!("nothing at the path to change in place"),
+                (None, false) => usize::MAX,
+            };
             match change {
                 Change::Write {
                     off,
                     bytes,
                     same_second,
                 } => {
+                    let file = &mut self.files[at];
                     if off > file.size {
                         file.zero_from(file.size);
                     }
@@ -552,6 +633,7 @@ mod fake {
                     }
                 }
                 Change::Truncate(len) => {
+                    let file = &mut self.files[at];
                     // What lay past the cut reads as zeros if the file grows again.
                     file.zero_from(len.min(file.size));
                     for (at, bytes) in &mut file.writes {
@@ -566,6 +648,15 @@ mod fake {
                 }
                 Change::Remove => self.at_path = None,
             }
+        }
+    }
+
+    /// What a request counts against what is outstanding: a read's length, about a status
+    /// reply's size for a status request.
+    fn asked_bytes(asked: &Asked) -> u64 {
+        match asked {
+            Asked::Read { len, .. } => *len as u64,
+            Asked::Fstat | Asked::StatPath => STAT_REPLY,
         }
     }
 
@@ -622,6 +713,7 @@ mod fake {
             sent: Vec::new(),
             faults: Vec::new(),
             changes: Vec::new(),
+            waiting: 0,
         }));
         let control = FakeControl { world };
         let ranged = control.open().expect("a fresh Fake opens");
@@ -648,6 +740,7 @@ mod fake {
             sent: Vec::new(),
             faults: Vec::new(),
             changes: Vec::new(),
+            waiting: 0,
         }));
         Ok(Fake::new(world, Handle::Disk(file), path, opened))
     }
@@ -704,6 +797,11 @@ mod fake {
         /// Time since the Fake was made: simulated, or real.
         pub(crate) fn elapsed(&self) -> Duration {
             self.world.lock().unwrap().now()
+        }
+
+        /// Fakes blocked in [`Ranged::next`] right now (a test syncs on a wait having begun).
+        pub(crate) fn waiting(&self) -> usize {
+            self.world.lock().unwrap().waiting
         }
     }
 
@@ -810,12 +908,13 @@ mod fake {
                 Ok(Reply::Data(b)) => b.len() as u64,
                 _ => STAT_REPLY,
             };
-            let ahead = ch
+            let backlog = ch
                 .queue
                 .iter()
                 .filter(|d| d.done > sent)
                 .map(|d| d.bytes)
                 .sum();
+            let outstanding = ch.queue.iter().map(|d| asked_bytes(&d.asked)).sum();
             let done = if ch.lost {
                 last
             } else {
@@ -827,7 +926,8 @@ mod fake {
                 ticket,
                 asked,
                 at: sent,
-                ahead,
+                outstanding,
+                backlog,
             });
             ch.queue.push_back(Due {
                 ticket,
@@ -889,6 +989,10 @@ mod fake {
                 if std::mem::take(&mut ch.woken) {
                     return None;
                 }
+                // Lost, and every completion handed back: nothing more can come.
+                if ch.lost && ch.queue.is_empty() {
+                    return None;
+                }
                 let mut w = self.world.lock().unwrap();
                 let base = w.base;
                 let head = ch.queue.front().map(|d| d.done);
@@ -925,11 +1029,13 @@ mod fake {
                         }
                     }
                 };
+                w.waiting += 1;
                 drop(w);
                 ch = match wait {
                     Some(d) => wakeup.wait_timeout(ch, d).unwrap().0,
                     None => wakeup.wait(ch).unwrap(),
                 };
+                self.world.lock().unwrap().waiting -= 1;
             }
         }
 

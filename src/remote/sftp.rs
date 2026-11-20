@@ -814,14 +814,38 @@ const SFTP_SERVERS: [&str; 4] = [
 
 /// What the test proxy between sopen and the local `sftp-server` does (06 §2, V5): it cuts every
 /// `SSH_FXP_DATA` payload to `clip` bytes, as a server with a lower read limit would answer (and
-/// OpenSSH's own never does), holds every reply back while `stall` is set (a link gone quiet),
-/// and logs each request as it goes out on the wire.
+/// OpenSSH's own never does); holds every reply back while the latch `hold` is set (a link gone
+/// quiet); applies [`Rules`] to the replies of particular requests; and logs every packet it
+/// passes.
 #[cfg(test)]
 #[derive(Default, Clone)]
 pub(crate) struct Proxy {
     pub clip: Option<usize>,
-    pub stall: Arc<std::sync::atomic::AtomicBool>,
+    pub hold: Arc<std::sync::atomic::AtomicBool>,
+    pub rules: Arc<std::sync::Mutex<Rules>>,
     pub wire: Arc<std::sync::Mutex<Vec<Wired>>>,
+    /// Request id → what happens to its reply, marked as the request passes (the proxy's own).
+    pub marked: Arc<std::sync::Mutex<std::collections::HashMap<u32, Rule>>>,
+}
+
+/// Replies the proxy changes, chosen by their requests.
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct Rules {
+    /// The replies to reads at these offsets never pass.
+    pub withhold: Vec<u64>,
+    /// Reads at these offsets are answered with a DATA of zero bytes.
+    pub empty: Vec<u64>,
+    /// The next request of this packet type is answered `SSH_FX_FAILURE`.
+    pub fail: Option<u8>,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum Rule {
+    Withhold,
+    Empty,
+    Fail,
 }
 
 /// One packet as the proxy passed it: a request from sopen or a reply from the server, its SFTP
@@ -836,6 +860,7 @@ pub(crate) struct Wired {
 
 #[cfg(test)]
 impl Wired {
+    pub const OPEN: u8 = 3;
     pub const CLOSE: u8 = 4;
     pub const READ: u8 = 5;
     pub const FSTAT: u8 = 8;
@@ -891,6 +916,18 @@ impl Proxy {
                 kind: body[0],
                 read,
             });
+            let rule = {
+                let mut rules = self.rules.lock().unwrap();
+                match read {
+                    Some((off, _)) if rules.withhold.contains(&off) => Some(Rule::Withhold),
+                    Some((off, _)) if rules.empty.contains(&off) => Some(Rule::Empty),
+                    _ if rules.fail == Some(body[0]) => rules.fail.take().map(|_| Rule::Fail),
+                    _ => None,
+                }
+            };
+            if let Some(rule) = rule {
+                self.marked.lock().unwrap().insert(be32(&body[1..]), rule);
+            }
             if send_packet(&mut to, &body).await.is_none() {
                 return;
             }
@@ -903,9 +940,34 @@ impl Proxy {
         R: tokio::io::AsyncRead + Unpin,
         W: tokio::io::AsyncWrite + Unpin,
     {
+        const VERSION: u8 = 2;
         while let Some(mut body) = packet(&mut from).await {
-            while self.stall.load(std::sync::atomic::Ordering::Relaxed) {
+            while self.hold.load(std::sync::atomic::Ordering::Relaxed) {
                 tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            // Every reply but VERSION carries its request's id.
+            let rule = match body[0] {
+                VERSION => None,
+                _ => self.marked.lock().unwrap().remove(&be32(&body[1..])),
+            };
+            match rule {
+                Some(Rule::Withhold) => continue,
+                Some(Rule::Empty) if body[0] == Wired::DATA => {
+                    body.truncate(9);
+                    body[5..9].copy_from_slice(&0u32.to_be_bytes());
+                }
+                Some(Rule::Fail) => {
+                    // STATUS: type, id, code (4 = SSH_FX_FAILURE), message, language.
+                    let id = body[1..5].to_vec();
+                    let msg = b"failed by the test proxy";
+                    body = vec![Wired::STATUS];
+                    body.extend(id);
+                    body.extend(4u32.to_be_bytes());
+                    body.extend((msg.len() as u32).to_be_bytes());
+                    body.extend(msg);
+                    body.extend(0u32.to_be_bytes());
+                }
+                _ => {}
             }
             self.wire.lock().unwrap().push(Wired {
                 reply: true,
@@ -939,7 +1001,13 @@ impl SftpRemote {
 
     /// [`SftpRemote::local_server`], with the session's bytes passing through `proxy`.
     pub(crate) fn local_server_with(proxy: Option<Proxy>) -> Option<Self> {
-        let Some(server) = SFTP_SERVERS.iter().find(|p| Path::new(p).exists()) else {
+        // `SOPEN_TEST_HIDE_SFTP_SERVER` makes the server look absent: the receipt that every test
+        // needing it fails under `SOPEN_REQUIRE_SFTP_SERVER`, rather than passing as a skip.
+        let hidden = std::env::var_os("SOPEN_TEST_HIDE_SFTP_SERVER").is_some();
+        let found = SFTP_SERVERS
+            .iter()
+            .find(|p| !hidden && Path::new(p).exists());
+        let Some(server) = found else {
             let missing = format!("no sftp-server on this machine ({SFTP_SERVERS:?})");
             if std::env::var_os("SOPEN_REQUIRE_SFTP_SERVER").is_some() {
                 panic!("SOPEN_REQUIRE_SFTP_SERVER is set but {missing}");
@@ -1129,8 +1197,11 @@ mod tests {
     /// answering is.
     #[test]
     fn a_listing_times_out_per_reply_not_as_a_whole() {
+        // Paused time: the clock moves only when every task waits, so the 400 ms reply and the
+        // 150 ms limit are ordered by their deadlines, never by how late this thread runs.
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
+            .start_paused(true)
             .build()
             .unwrap();
         let limit = Duration::from_millis(150);
