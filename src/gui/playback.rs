@@ -17,7 +17,7 @@
 //! the tests run them without a window, a device or ffmpeg; [`Sink::Null`] is the device-free
 //! output for the tests that decode real media.
 
-use crate::ffmpeg::{Input, Tools};
+use crate::ffmpeg::{ErrorTail, Input, Tools};
 use anyhow::{anyhow, bail, Context as _, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use std::io::Read;
@@ -163,8 +163,10 @@ pub trait Consumer {
 }
 
 /// The end of what a decoder printed, for its error (read to its end, kept bounded).
-fn tail_of(stderr: Option<std::process::ChildStderr>) -> Option<std::thread::JoinHandle<String>> {
-    stderr.map(crate::ffmpeg::stderr_tail)
+fn tail_of(
+    stderr: Option<std::process::ChildStderr>,
+) -> Option<std::thread::JoinHandle<ErrorTail>> {
+    stderr.map(ErrorTail::spawn)
 }
 
 /// Decodes `parts` one after another, each by the ffmpeg `start` makes for it, the next one
@@ -184,7 +186,7 @@ fn chain(
     type Running = (
         u32,
         std::process::ChildStdout,
-        Option<std::thread::JoinHandle<String>>,
+        Option<std::thread::JoinHandle<ErrorTail>>,
     );
     let parts: Vec<Part> = parts.into_iter().filter(|p| p.count != Some(0)).collect();
     let mut spawn = |part: &Part| -> Option<Running> {
@@ -253,7 +255,7 @@ fn chain(
                 match status {
                     Some(Some(s)) if !s.success() => {
                         let said = err.and_then(|h| h.join().ok()).unwrap_or_default();
-                        let last = crate::ffmpeg::last_line(&said);
+                        let last = said.last_line();
                         state.fail(format!(
                             "ffmpeg stopped decoding the piece at {:.2} s ({s}): {last}",
                             part.start

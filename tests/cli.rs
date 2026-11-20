@@ -1023,15 +1023,20 @@ fn executable(path: &Path, body: &str) {
 /// 20 ms apart; any other error, or the last busy one, panics. (The lib's tests have the same
 /// helper, tested, in src/testutil.rs.)
 fn run_fresh(cmd: &mut Command) -> Output {
+    retry_busy(|| cmd.output()).unwrap_or_else(|e| panic!("cannot run {cmd:?}: {e}"))
+}
+
+/// `attempt` until it is not refused as busy (ETXTBSY), at most 50 retries 20 ms apart; then
+/// whatever it gave.
+fn retry_busy<T>(mut attempt: impl FnMut() -> std::io::Result<T>) -> std::io::Result<T> {
     let mut retries = 0;
     loop {
-        match cmd.output() {
-            Ok(out) => return out,
+        match attempt() {
             Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy && retries < 50 => {
                 retries += 1;
                 std::thread::sleep(std::time::Duration::from_millis(20));
             }
-            Err(e) => panic!("cannot run {cmd:?}: {e}"),
+            other => return other,
         }
     }
 }
@@ -1542,4 +1547,967 @@ fn a_broken_config_is_an_error_where_it_is_read() {
     );
     assert!(out.status.success(), "{}", text(&out.stderr));
     assert!(text(&out.stdout).trim().ends_with("/a.cut-1-3.wav"));
+}
+
+/// The separation model's credit (its authors ask for it) travels with a binary that separates,
+/// next to the font's, in `--version` and the long help (spec §7a).
+#[test]
+fn version_and_help_credit_the_separation_model() {
+    let tmp = tempfile::tempdir().unwrap();
+    for args in [&["--version"][..], &["--help"][..]] {
+        let said = text(&sopen(tmp.path(), args, &[]).stdout);
+        let credited = said.lines().any(|l| l.trim() == sopen::stems::CREDIT);
+        assert_eq!(credited, cfg!(feature = "stems"), "{args:?}: {said}");
+    }
+}
+
+/// `path` decoded to f32 samples (its own channels and rate), by ffmpeg.
+fn samples(path: &Path) -> Vec<f32> {
+    let ffmpeg = std::env::var("SOPEN_FFMPEG").unwrap_or_else(|_| "ffmpeg".into());
+    let out = Command::new(&ffmpeg)
+        .args(["-v", "error", "-nostdin", "-i"])
+        .arg(path)
+        .args(["-f", "f32le", "-c:a", "pcm_f32le", "-"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "decoding {}", path.display());
+    out.stdout
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|b| f32::from_le_bytes(*b))
+        .collect()
+}
+
+/// How voice + music compare with what they must add up to (the model's music is its window
+/// minus the voice): the source, or for more than two channels its stereo downmix.
+#[derive(Debug)]
+struct StemsCheck {
+    /// The level of voice + music against the reference's, dB.
+    level_db: f64,
+    /// Where voice + music lines up best with the reference, in frames (searched ±32).
+    lag: isize,
+    /// Reference over (reference − voice − music), dB, at lag 0.
+    reconstruction_db: f64,
+}
+
+/// [`StemsCheck`] of `voice` and `music` against `reference` (all interleaved, `channels` per
+/// frame). Each stem must be at least as long as the reference and at most `tail` frames longer:
+/// 0 for PCM, one codec frame for a lossy codec, whose encoder pads the end.
+fn check_stems(
+    reference: &[f32],
+    voice: &[f32],
+    music: &[f32],
+    channels: usize,
+    tail: usize,
+) -> StemsCheck {
+    for (name, stem) in [("voice", voice), ("music", music)] {
+        let (got, want) = (stem.len() / channels, reference.len() / channels);
+        assert!(
+            (want..=want + tail).contains(&got),
+            "the {name} is {got} frames, the reference {want} (allowed: up to {tail} more)"
+        );
+    }
+    let n = reference.len().min(voice.len()).min(music.len());
+    let both: Vec<f64> = (0..n).map(|i| f64::from(voice[i] + music[i])).collect();
+    let r: Vec<f64> = reference[..n].iter().map(|&x| f64::from(x)).collect();
+    let energy = |x: &[f64]| x.iter().map(|v| v * v).sum::<f64>();
+    let window = n.min(96_000 * channels);
+    let lag = (-32isize..=32)
+        .max_by(|&a, &b| {
+            let corr = |l: isize| -> f64 {
+                let shift = l * channels as isize;
+                (0..window)
+                    .filter_map(|i| {
+                        let j = i as isize + shift;
+                        (0..n as isize)
+                            .contains(&j)
+                            .then(|| r[i] * both[j as usize])
+                    })
+                    .sum()
+            };
+            corr(a).total_cmp(&corr(b))
+        })
+        .unwrap();
+    let error: Vec<f64> = r.iter().zip(&both).map(|(a, b)| a - b).collect();
+    StemsCheck {
+        level_db: 10.0 * (energy(&both) / energy(&r)).log10(),
+        lag,
+        reconstruction_db: 10.0 * (energy(&r) / energy(&error).max(1e-30)).log10(),
+    }
+}
+
+/// The length check: a stem may be longer than the reference by up to `tail` frames (a lossy
+/// encoder pads its last frame), never shorter — a short one would be compared on its prefix
+/// alone.
+#[test]
+fn check_stems_takes_a_padded_stem_but_not_a_short_one() {
+    let reference = vec![0.5f32; 2 * 4096];
+    let padded = vec![0.25f32; 2 * (4096 + 1024)];
+    let check = check_stems(&reference, &padded, &padded, 2, 1024);
+    assert_eq!(check.lag, 0, "{check:?}");
+    for (stem, why) in [
+        (vec![0.25f32; 2 * (4096 - 1)], "one frame short"),
+        (
+            vec![0.25f32; 2 * (4096 + 1025)],
+            "a frame and one sample over",
+        ),
+    ] {
+        let refused =
+            std::panic::catch_unwind(|| check_stems(&reference, &stem, &padded, 2, 1024)).is_err();
+        assert!(refused, "{why} was taken");
+    }
+}
+
+/// [`check_stems`] against the source file itself.
+fn check_stems_of(
+    src: &Path,
+    voice: &Path,
+    music: &Path,
+    channels: usize,
+    tail: usize,
+) -> StemsCheck {
+    check_stems(
+        &samples(src),
+        &samples(voice),
+        &samples(music),
+        channels,
+        tail,
+    )
+}
+
+/// One separation at a time in this test binary: each holds 2–4 GB, and CI's macOS runner has 7.
+static SEPARATING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// The model `SOPEN_STEMS_MODEL` names (CI downloads it) and the turn to use it, or `None` with
+/// the reason printed; `SOPEN_REQUIRE_STEMS=1` (CI) makes a missing one a failure.
+fn stems_model() -> Option<(String, std::sync::MutexGuard<'static, ()>)> {
+    match std::env::var("SOPEN_STEMS_MODEL") {
+        Ok(path) if Path::new(&path).is_file() => {
+            Some((path, SEPARATING.lock().unwrap_or_else(|e| e.into_inner())))
+        }
+        _ if std::env::var_os("SOPEN_REQUIRE_STEMS").is_some() => {
+            panic!("SOPEN_REQUIRE_STEMS is set but SOPEN_STEMS_MODEL names no file")
+        }
+        _ => {
+            eprintln!("skipping: SOPEN_STEMS_MODEL names no model");
+            None
+        }
+    }
+}
+
+/// `sopen stems` is `sopen cut`'s shape: SOURCE is required, it never forwards, and a model
+/// that is not there is one line naming where it was looked for — before anything is read.
+#[test]
+fn stems_argument_errors_are_one_line_each() {
+    let tmp = tempfile::tempdir().unwrap();
+    for args in [
+        &["stems"][..],
+        &["stems", "a.mp3", "b.mp3"],
+        &["--target", "box", "stems", "a.mp3"],
+        &["--here", "stems", "a.mp3"],
+        &["stems", "a.mp3", "--no-such-flag"],
+    ] {
+        let out = sopen(tmp.path(), args, &[]);
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "{args:?}: {}",
+            text(&out.stderr)
+        );
+    }
+    let missing = tmp.path().join("no-model.onnx");
+    let wav = tmp.path().join("a.wav");
+    std::fs::write(&wav, b"RIFF").unwrap();
+    let out = sopen(
+        tmp.path(),
+        &["stems", wav.to_str().unwrap()],
+        &[("SOPEN_STEMS_MODEL", missing.to_str().unwrap())],
+    );
+    assert_eq!(out.status.code(), Some(1));
+    let err = text(&out.stderr);
+    assert_eq!(err.lines().count(), 1, "{err}");
+    if cfg!(feature = "stems") {
+        if which("ffmpeg").is_none() && std::env::var_os("SOPEN_FFMPEG").is_none() {
+            return eprintln!("skipping the model error: no ffmpeg");
+        }
+        assert!(err.contains(&missing.display().to_string()), "{err}");
+        assert!(err.contains("SOPEN_STEMS_MODEL"), "{err}");
+    } else {
+        assert!(
+            err.contains("built without voice/music separation"),
+            "{err}"
+        );
+    }
+    let logged = usage_lines(tmp.path());
+    let last = logged.last().unwrap();
+    assert_eq!(last["action"], "stems");
+    assert_eq!(last["ok"], false);
+}
+
+/// The window's child removes its work folder if its parent goes, so the folder must be the
+/// empty one the parent made: anything else is refused before stdin is even read.
+#[test]
+fn the_child_flags_need_an_empty_work_folder() {
+    let tmp = tempfile::tempdir().unwrap();
+    let full = tmp.path().join("full");
+    std::fs::create_dir(&full).unwrap();
+    std::fs::write(full.join("keep.txt"), "mine").unwrap();
+    let file = tmp.path().join("a-file");
+    std::fs::write(&file, "mine").unwrap();
+    for work in [&full, &file, &tmp.path().join("missing")] {
+        let out = sopen(
+            tmp.path(),
+            &[
+                "stems",
+                "--work-dir",
+                work.to_str().unwrap(),
+                "--wait-to-publish",
+                "--",
+                "a.mp3",
+            ],
+            &[],
+        );
+        assert_eq!(out.status.code(), Some(1), "{}", text(&out.stderr));
+        if cfg!(feature = "stems") {
+            assert!(
+                text(&out.stderr).contains("is not an empty folder"),
+                "{}",
+                text(&out.stderr)
+            );
+        }
+    }
+    assert_eq!(
+        std::fs::read_to_string(full.join("keep.txt")).unwrap(),
+        "mine"
+    );
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "mine");
+}
+
+/// With the model: what it refuses (a folder, a text file), then a real separation of a short
+/// local WAV — two new files next to it, their paths printed voice first, progress lines on
+/// stderr — and a second run that never overwrites them.
+#[test]
+fn stems_on_a_local_file_writes_two_siblings_and_never_overwrites() {
+    if !cfg!(feature = "stems") {
+        return;
+    }
+    let Some((model, _turn)) = stems_model() else {
+        return;
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let env = [("SOPEN_STEMS_MODEL", model.as_str())];
+    let notes = tmp.path().join("notes.txt");
+    std::fs::write(&notes, "hello").unwrap();
+    let err = text(&sopen(tmp.path(), &["stems", notes.to_str().unwrap()], &env).stderr);
+    assert!(
+        err.contains("stems works on audio and video files"),
+        "{err}"
+    );
+    let folder = tmp.path().join("music.mp3");
+    std::fs::create_dir(&folder).unwrap();
+    let err = text(&sopen(tmp.path(), &["stems", folder.to_str().unwrap()], &env).stderr);
+    assert!(err.contains("is a directory"), "{err}");
+
+    let wav = tmp.path().join("a.wav");
+    let made = stems_fixture(
+        &[
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:duration=4",
+            wav.to_str().unwrap(),
+        ],
+        "a 4 s mono tone",
+    );
+    if !made {
+        return;
+    }
+    let out = sopen(tmp.path(), &["stems", wav.to_str().unwrap()], &env);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let printed = text(&out.stdout);
+    let lines: Vec<&str> = printed.lines().collect();
+    assert_eq!(lines.len(), 2, "{printed}");
+    assert!(lines[0].ends_with("/a.voice.wav"), "{printed}");
+    assert!(lines[1].ends_with("/a.music.wav"), "{printed}");
+    assert!(lines.iter().all(|l| Path::new(l).is_file()), "{printed}");
+    // A mono 16-bit source: the stems are mono 16-bit, as long as it, at its level.
+    let check = check_stems_of(&wav, Path::new(lines[0]), Path::new(lines[1]), 1, 0);
+    assert!(check.level_db.abs() < 0.1, "{check:?}");
+    assert_eq!(check.lag, 0, "{check:?}");
+    let progress: Vec<_> = text(&out.stderr)
+        .lines()
+        .filter_map(sopen::stems::PieceProgress::parse)
+        .collect();
+    assert_eq!(
+        progress
+            .iter()
+            .map(|p| (p.done, p.total))
+            .collect::<Vec<_>>(),
+        [(0, 1), (1, 1)],
+        "{}",
+        text(&out.stderr)
+    );
+    // The first stems as they are: bytes, inode, modification time.
+    let snapshot = |name: &str| {
+        use std::os::unix::fs::MetadataExt;
+        let path = tmp.path().join(name);
+        let meta = std::fs::symlink_metadata(&path).unwrap();
+        (
+            std::fs::read(&path).unwrap(),
+            meta.ino(),
+            meta.mtime(),
+            meta.mtime_nsec(),
+        )
+    };
+    let first = [snapshot("a.voice.wav"), snapshot("a.music.wav")];
+    // Names taken unevenly: the pair gets the first number free for both, never a mismatched
+    // `a.voice-1` + `a.music-3`.
+    for taken in ["a.music-1.wav", "a.music-2.wav"] {
+        std::fs::write(tmp.path().join(taken), "someone else's").unwrap();
+    }
+    let again = sopen(tmp.path(), &["stems", wav.to_str().unwrap()], &env);
+    assert!(again.status.success(), "{}", text(&again.stderr));
+    let printed = text(&again.stdout);
+    assert!(printed.contains("/a.voice-3.wav\n"), "{printed}");
+    assert!(printed.contains("/a.music-3.wav\n"), "{printed}");
+    assert!(tmp.path().join("a.voice-3.wav").is_file());
+    assert!(tmp.path().join("a.music-3.wav").is_file());
+    assert!(!tmp.path().join("a.voice-1.wav").exists());
+    for taken in ["a.music-1.wav", "a.music-2.wav"] {
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join(taken)).unwrap(),
+            "someone else's"
+        );
+    }
+    assert!(
+        first == [snapshot("a.voice.wav"), snapshot("a.music.wav")],
+        "the first stems were touched"
+    );
+    let logged = usage_lines(tmp.path());
+    let last = logged.last().unwrap();
+    assert_eq!(
+        (last["action"].as_str(), last["ok"].as_bool()),
+        (Some("stems"), Some(true))
+    );
+    assert_eq!(last["kind"], "audio");
+}
+
+/// Makes a separation fixture with `ffmpeg <args>`: `true` when made. When it cannot be made it
+/// is a skip (`false`, the reason printed) — unless the tests are required
+/// (`SOPEN_REQUIRE_FFMPEG` or `SOPEN_REQUIRE_STEMS`, as in CI), where it is a failure that shows
+/// what ffmpeg said.
+fn stems_fixture(args: &[&str], what: &str) -> bool {
+    let ffmpeg = std::env::var("SOPEN_FFMPEG").unwrap_or_else(|_| "ffmpeg".into());
+    let required = ["SOPEN_REQUIRE_FFMPEG", "SOPEN_REQUIRE_STEMS"]
+        .iter()
+        .any(|k| std::env::var_os(k).is_some());
+    fixture_with(&ffmpeg, args, what, required)
+}
+
+fn fixture_with(ffmpeg: &str, args: &[&str], what: &str, required: bool) -> bool {
+    let mut cmd = Command::new(ffmpeg);
+    cmd.args(["-hide_banner", "-loglevel", "error", "-nostdin", "-y"])
+        .args(args);
+    fixture_from(&mut || cmd.output(), ffmpeg, what, required)
+}
+
+/// [`fixture_with`]'s judgement on one way of running ffmpeg: a start refused as busy
+/// (ETXTBSY, a script just written while another test thread forks) is retried; what ffmpeg
+/// printed is kept for the failure.
+fn fixture_from(
+    run: &mut dyn FnMut() -> std::io::Result<Output>,
+    ffmpeg: &str,
+    what: &str,
+    required: bool,
+) -> bool {
+    let out = retry_busy(run);
+    let why = match out {
+        Ok(out) if out.status.success() => return true,
+        Ok(out) => format!(
+            "{ffmpeg} exited with {}: {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim()
+        ),
+        Err(e) => format!("cannot run {ffmpeg}: {e}"),
+    };
+    if required {
+        panic!("cannot make {what} (the separation tests are required): {why}");
+    }
+    eprintln!("skipping: cannot make {what}: {why}");
+    false
+}
+
+/// `path`: `seconds` of a 220 Hz tone, stereo 44.1 kHz WAV ([`stems_fixture`]).
+fn tone_wav(path: &Path, seconds: u32) -> bool {
+    let tone = format!("sine=frequency=220:duration={seconds}");
+    let path = path.to_str().unwrap();
+    stems_fixture(
+        &["-f", "lavfi", "-i", &tone, "-ac", "2", path],
+        &format!("a {seconds} s tone"),
+    )
+}
+
+/// A fixture ffmpeg cannot make fails the required tests with what ffmpeg said, and is a skip
+/// otherwise.
+#[test]
+fn a_fixture_ffmpeg_cannot_make_fails_required_runs_with_its_stderr() {
+    let tmp = tempfile::tempdir().unwrap();
+    let fake = tmp.path().join("ffmpeg");
+    executable(&fake, "#!/bin/sh\necho 'boom: no lavfi here' >&2\nexit 1\n");
+    let fake = fake.to_str().unwrap();
+    // Not required: a skip.
+    assert!(!fixture_with(fake, &["x"], "a tone", false));
+    let required = std::panic::catch_unwind(|| fixture_with(fake, &["x"], "a tone", true));
+    let message = required
+        .unwrap_err()
+        .downcast::<String>()
+        .map(|m| *m)
+        .unwrap_or_default();
+    assert!(message.contains("cannot make a tone"), "{message}");
+    assert!(message.contains("boom: no lavfi here"), "{message}");
+}
+
+/// A start refused as busy (ETXTBSY — on Linux, a script just written while another test
+/// thread forks) is retried inside the helper, required or not, and the failure then reported
+/// is ffmpeg's own, with its stderr.
+#[test]
+fn a_busy_fixture_ffmpeg_is_retried_and_its_own_failure_reported() {
+    use std::os::unix::process::ExitStatusExt;
+    // Two starts refused as busy, then ffmpeg runs and fails with "boom".
+    let calls = std::cell::Cell::new(0);
+    let attempt = || {
+        calls.set(calls.get() + 1);
+        if calls.get() <= 2 {
+            Err(std::io::Error::from(std::io::ErrorKind::ExecutableFileBusy))
+        } else {
+            Ok(Output {
+                status: std::process::ExitStatus::from_raw(1 << 8),
+                stdout: Vec::new(),
+                stderr: b"boom: no lavfi here\n".to_vec(),
+            })
+        }
+    };
+    assert!(!fixture_from(&mut { attempt }, "ffmpeg", "a tone", false));
+    assert_eq!(calls.get(), 3, "two busy starts, then ffmpeg's own failure");
+    calls.set(0);
+    let required = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        fixture_from(&mut { attempt }, "ffmpeg", "a tone", true)
+    }));
+    assert_eq!(calls.get(), 3, "required: retried the same way");
+    let message = required
+        .unwrap_err()
+        .downcast::<String>()
+        .map(|m| *m)
+        .unwrap_or_default();
+    assert!(message.contains("boom: no lavfi here"), "{message}");
+    assert!(!message.contains("busy"), "{message}");
+}
+
+/// The child's stderr, line by line, from a thread that reads it to its end (so the child never
+/// blocks on a full pipe).
+fn stderr_lines(stderr: impl std::io::Read + Send + 'static) -> std::sync::mpsc::Receiver<String> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        use std::io::BufRead;
+        for line in std::io::BufReader::new(stderr)
+            .lines()
+            .map_while(Result::ok)
+        {
+            let _ = tx.send(line);
+        }
+    });
+    rx
+}
+
+/// Every line still to come from `lines`, up to the end of the stream (the reader thread may
+/// still be passing on the last ones when the child has exited); at most 30 s.
+fn rest_of(lines: &std::sync::mpsc::Receiver<String>) -> Vec<String> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let mut rest = Vec::new();
+    loop {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        match lines.recv_timeout(left) {
+            Ok(line) => rest.push(line),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return rest,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                panic!("the child's stderr stayed open; so far: {rest:?}")
+            }
+        }
+    }
+}
+
+/// Kills `child`'s process group (it leads one) and reaps it.
+fn kill_group(child: &mut std::process::Child) {
+    // SAFETY: a plain syscall on our own child's group; it is not reaped yet.
+    unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL) };
+    let _ = child.wait();
+}
+
+/// The first line of `lines` that is `want` — within 120 s, else the child's group is killed
+/// and the test fails with what it said.
+fn wait_for_line(
+    lines: &std::sync::mpsc::Receiver<String>,
+    child: &mut std::process::Child,
+    want: &dyn Fn(&str) -> bool,
+    what: &str,
+) -> String {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    let mut said = Vec::new();
+    loop {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        match lines.recv_timeout(left) {
+            Ok(line) if want(&line) => return line,
+            Ok(line) => said.push(line),
+            Err(_) => {
+                kill_group(child);
+                panic!("no {what} line; the child said: {said:?}");
+            }
+        }
+    }
+}
+
+fn first_progress(
+    lines: &std::sync::mpsc::Receiver<String>,
+    child: &mut std::process::Child,
+) -> sopen::stems::PieceProgress {
+    let line = wait_for_line(
+        lines,
+        child,
+        &|l| sopen::stems::PieceProgress::parse(l).is_some(),
+        "progress",
+    );
+    sopen::stems::PieceProgress::parse(&line).unwrap()
+}
+
+/// No process is left in the group `pgid` (within a few seconds: a killed grandchild is reaped by
+/// init).
+fn group_gone(pgid: u32) -> bool {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        // SAFETY: signal 0 only asks whether the group has a member.
+        let none = unsafe { libc::kill(-(pgid as i32), 0) } == -1
+            && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
+        if none || std::time::Instant::now() > deadline {
+            return none;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+/// The window's way (spec §7a): the real `sopen stems` as a child — progress read back, the
+/// ready line answered with the go-ahead, both stems published — and a second child cancelled
+/// mid-separation: at once, its group (its ffmpeg children) gone, its work folder gone, nothing
+/// published.
+#[test]
+fn the_real_child_publishes_on_the_go_ahead_and_cancels_cleanly() {
+    if !cfg!(feature = "stems") {
+        return;
+    }
+    let Some((model, _turn)) = stems_model() else {
+        return;
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let short = tmp.path().join("short.wav");
+    if !tone_wav(&short, 4) {
+        return;
+    }
+    let work_root = tmp.path().join("cache/.exports");
+    let child = sopen::stems::spawn_child(
+        sopen_command(tmp.path()),
+        short.to_str().unwrap(),
+        Some(Path::new(&model)),
+        &work_root,
+    )
+    .unwrap();
+    let work = child.work_dir().to_path_buf();
+    let published = child.wait().unwrap();
+    assert!(
+        published.voice.ends_with("/short.voice.wav"),
+        "{published:?}"
+    );
+    assert!(
+        published.music.ends_with("/short.music.wav"),
+        "{published:?}"
+    );
+    assert!(Path::new(&published.voice).is_file() && Path::new(&published.music).is_file());
+    assert!(!work.exists());
+
+    let long = tmp.path().join("long.wav");
+    assert!(tone_wav(&long, 65));
+    let mut child = sopen::stems::spawn_child(
+        sopen_command(tmp.path()),
+        long.to_str().unwrap(),
+        Some(Path::new(&model)),
+        &work_root,
+    )
+    .unwrap();
+    let work = child.work_dir().to_path_buf();
+    let pgid = child.id();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    while child.progress().is_none() {
+        assert!(child.poll().is_none(), "ended before separating");
+        assert!(std::time::Instant::now() < deadline, "no progress line");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert_eq!(child.progress().map(|p| (p.done, p.total)), Some((0, 3)));
+    let asked = std::time::Instant::now();
+    assert_eq!(child.cancel(), sopen::stems::Cancel::Cancelled);
+    assert!(asked.elapsed() < std::time::Duration::from_secs(10));
+    assert!(group_gone(pgid), "a process of the child's group survived");
+    assert!(!work.exists());
+    assert!(!tmp.path().join("long.voice.wav").exists());
+    assert!(!tmp.path().join("long.music.wav").exists());
+    assert!(child.wait().unwrap_err().to_string().contains("cancelled"));
+}
+
+/// The window's child whose parent goes away (its stdin ends) mid-separation stops at once: its
+/// group killed, the parent's work folder removed, nothing published.
+#[test]
+fn the_real_child_stops_when_its_parent_goes() {
+    if !cfg!(feature = "stems") {
+        return;
+    }
+    let Some((model, _turn)) = stems_model() else {
+        return;
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let long = tmp.path().join("long.wav");
+    if !tone_wav(&long, 65) {
+        return;
+    }
+    let work = tmp.path().join("work");
+    std::fs::create_dir(&work).unwrap();
+    use std::os::unix::process::CommandExt;
+    let mut child = sopen_command(tmp.path())
+        .args([
+            "stems",
+            "--work-dir",
+            work.to_str().unwrap(),
+            "--wait-to-publish",
+        ])
+        .args(["--model", &model, "--", long.to_str().unwrap()])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .process_group(0)
+        .spawn()
+        .unwrap();
+    // Separating has begun: the first progress line (ONNX Runtime may say things before it).
+    let lines = stderr_lines(child.stderr.take().unwrap());
+    let first = first_progress(&lines, &mut child);
+    assert_eq!((first.done, first.total), (0, 3));
+    drop(child.stdin.take());
+    let asked = std::time::Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        assert!(
+            asked.elapsed() < std::time::Duration::from_secs(10),
+            "the child outlived its parent"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    assert!(!status.success());
+    assert!(
+        group_gone(child.id()),
+        "a process of the child's group survived"
+    );
+    assert!(!work.exists(), "the parent's work folder is removed");
+    assert!(!tmp.path().join("long.voice.wav").exists());
+}
+
+/// A video's stems are audio only, AAC in `.m4a`, at the source's rate and channel count (here
+/// mono 48 kHz; the engine runs at 44.1 kHz stereo).
+#[test]
+fn stems_of_a_mono_48k_video_are_m4a_aac_mono_48k() {
+    if !cfg!(feature = "stems") {
+        return;
+    }
+    let Some((model, _turn)) = stems_model() else {
+        return;
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let clip = tmp.path().join("clip.mp4");
+    let made = stems_fixture(
+        &[
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=160x120:rate=25:duration=4",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=330:duration=4:sample_rate=48000",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "aac",
+            "-ac",
+            "1",
+            "-shortest",
+            clip.to_str().unwrap(),
+        ],
+        "an H.264 + AAC (mono 48 kHz) clip",
+    );
+    if !made {
+        return;
+    }
+    let out = sopen(
+        tmp.path(),
+        &["stems", clip.to_str().unwrap()],
+        &[("SOPEN_STEMS_MODEL", model.as_str())],
+    );
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let printed = text(&out.stdout);
+    assert!(printed.ends_with("/clip.voice.m4a\n") || printed.contains("/clip.voice.m4a\n"));
+    let ffprobe = std::env::var("SOPEN_FFPROBE").unwrap_or_else(|_| "ffprobe".into());
+    for name in ["clip.voice.m4a", "clip.music.m4a"] {
+        let probe = Command::new(&ffprobe)
+            .args(["-v", "error", "-show_entries"])
+            .args([
+                "stream=codec_type,codec_name,channels,sample_rate",
+                "-of",
+                "json",
+            ])
+            .arg(tmp.path().join(name))
+            .output()
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&probe.stdout).unwrap();
+        let streams = v["streams"].as_array().unwrap();
+        assert_eq!(streams.len(), 1, "{name}: {v}");
+        let s = &streams[0];
+        assert_eq!(s["codec_type"], "audio", "{name}");
+        assert_eq!(s["codec_name"], "aac", "{name}");
+        assert_eq!(s["channels"], 1, "{name}");
+        assert_eq!(s["sample_rate"], "48000", "{name}");
+    }
+    // AAC both ways: as long as the source to within one AAC frame (1024 samples; the encoder
+    // pads its end), lined up with it (lag 0), at its level.
+    let check = check_stems_of(
+        &clip,
+        &tmp.path().join("clip.voice.m4a"),
+        &tmp.path().join("clip.music.m4a"),
+        1,
+        1024,
+    );
+    assert_eq!(check.lag, 0, "{check:?}");
+    assert!(check.level_db.abs() < 0.3, "{check:?}");
+}
+
+/// A 48 kHz source goes through the engine at 44.1 kHz and back: the stems still have exactly
+/// the source's sample count at its own rate (a 192,512-frame source came back 192,513 frames
+/// long — and in AAC, a whole frame longer), lined up with it, at its level.
+#[test]
+fn stems_of_a_48k_source_have_its_exact_length() {
+    if !cfg!(feature = "stems") {
+        return;
+    }
+    let Some((model, _turn)) = stems_model() else {
+        return;
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let wav = tmp.path().join("odd.wav");
+    let made = stems_fixture(
+        &[
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=330:sample_rate=48000",
+            "-f",
+            "lavfi",
+            "-i",
+            "anoisesrc=c=pink:a=0.05:r=48000",
+            "-filter_complex",
+            "[0][1]amerge=inputs=2,atrim=end_sample=192512",
+            "-c:a",
+            "pcm_s16le",
+            wav.to_str().unwrap(),
+        ],
+        "a 192,512-frame stereo 48 kHz WAV",
+    );
+    if !made {
+        return;
+    }
+    let out = sopen(
+        tmp.path(),
+        &["stems", wav.to_str().unwrap()],
+        &[("SOPEN_STEMS_MODEL", model.as_str())],
+    );
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert_eq!(samples(&wav).len(), 2 * 192_512, "the fixture");
+    let check = check_stems_of(
+        &wav,
+        &tmp.path().join("odd.voice.wav"),
+        &tmp.path().join("odd.music.wav"),
+        2,
+        0,
+    );
+    eprintln!("48 kHz stems: {check:?}");
+    assert_eq!(check.lag, 0, "{check:?}");
+    assert!(check.level_db.abs() < 0.1, "{check:?}");
+    // The engine runs at 44.1 kHz: what the noise has above 22.05 kHz does not come back
+    // (measured 38.5 dB), so this only guards against gross error.
+    assert!(check.reconstruction_db > 30.0, "{check:?}");
+}
+
+/// A loud 5.1 source (every channel peaking at 0.89) is separated as stereo, downmixed the way
+/// ffmpeg does it for integer output — normalised, so nothing clips: the 16-bit stems have no
+/// full-scale sample and add up to that downmix.
+#[test]
+fn loud_surround_is_downmixed_without_clipping() {
+    if !cfg!(feature = "stems") {
+        return;
+    }
+    let Some((model, _turn)) = stems_model() else {
+        return;
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let six = tmp.path().join("six.wav");
+    let made = stems_fixture(
+        &[
+            "-f",
+            "lavfi",
+            "-i",
+            "aevalsrc=0.89*sin(2*PI*220*t)|0.89*sin(2*PI*330*t)|0.89*sin(2*PI*440*t)|\
+             0.89*sin(2*PI*55*t)|0.89*sin(2*PI*550*t)|0.89*sin(2*PI*660*t):\
+             channel_layout=5.1:sample_rate=44100:duration=4",
+            "-c:a",
+            "pcm_s16le",
+            six.to_str().unwrap(),
+        ],
+        "a loud 5.1 WAV",
+    );
+    if !made {
+        return;
+    }
+    let out = sopen(
+        tmp.path(),
+        &["stems", six.to_str().unwrap()],
+        &[("SOPEN_STEMS_MODEL", model.as_str())],
+    );
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert!(
+        text(&out.stderr).contains("6-channel audio is separated as stereo"),
+        "{}",
+        text(&out.stderr)
+    );
+    let downmix = tmp.path().join("downmix.wav");
+    assert!(stems_fixture(
+        &[
+            "-i",
+            six.to_str().unwrap(),
+            "-ac",
+            "2",
+            "-rematrix_maxval",
+            "1.0",
+            "-c:a",
+            "pcm_f32le",
+            downmix.to_str().unwrap(),
+        ],
+        "the reference downmix",
+    ));
+    let (voice, music) = (
+        samples(&tmp.path().join("six.voice.wav")),
+        samples(&tmp.path().join("six.music.wav")),
+    );
+    for (name, stem) in [("voice", &voice), ("music", &music)] {
+        let full = stem.iter().filter(|x| x.abs() >= 32767.0 / 32768.0).count();
+        assert_eq!(full, 0, "{name}: {full} full-scale samples");
+    }
+    let check = check_stems(&samples(&downmix), &voice, &music, 2, 0);
+    eprintln!("5.1 stems: {check:?}");
+    assert_eq!(check.lag, 0, "{check:?}");
+    assert!(check.level_db.abs() < 0.1, "{check:?}");
+    assert!(check.reconstruction_db > 40.0, "{check:?}");
+}
+
+/// The publish barrier on the real child (spec §7a): with its stdin held open it encodes, says
+/// it is ready, and publishes nothing — however long it waits — until `publish` comes; any other
+/// answer, or the end of its stdin, publishes nothing at all.
+#[test]
+fn the_real_child_publishes_nothing_before_the_go_ahead() {
+    if !cfg!(feature = "stems") {
+        return;
+    }
+    let Some((model, _turn)) = stems_model() else {
+        return;
+    };
+    use std::io::Write;
+    use std::os::unix::process::CommandExt;
+    for answer in [Some("publish"), Some("no"), None] {
+        let tmp = tempfile::tempdir().unwrap();
+        let short = tmp.path().join("short.wav");
+        if !tone_wav(&short, 4) {
+            return;
+        }
+        let work = tmp.path().join("work");
+        std::fs::create_dir(&work).unwrap();
+        let mut child = sopen_command(tmp.path())
+            .args([
+                "stems",
+                "--work-dir",
+                work.to_str().unwrap(),
+                "--wait-to-publish",
+            ])
+            .args(["--model", &model, "--", short.to_str().unwrap()])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let lines = stderr_lines(child.stderr.take().unwrap());
+        wait_for_line(
+            &lines,
+            &mut child,
+            &|l| l == sopen::stems::READY_LINE,
+            "ready",
+        );
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+        let voice = tmp.path().join("short.voice.wav");
+        let music = tmp.path().join("short.music.wav");
+        assert!(
+            !voice.exists() && !music.exists(),
+            "published before the go-ahead"
+        );
+        let mut stdin = child.stdin.take().unwrap();
+        match answer {
+            Some(word) => writeln!(stdin, "{word}").unwrap(),
+            None => drop(stdin),
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            if std::time::Instant::now() > deadline {
+                kill_group(&mut child);
+                panic!("{answer:?}: the child did not end");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+        let said = rest_of(&lines);
+        let mut printed = String::new();
+        std::io::Read::read_to_string(&mut child.stdout.take().unwrap(), &mut printed).unwrap();
+        if answer == Some("publish") {
+            assert!(status.success(), "{said:?}");
+            assert!(voice.is_file() && music.is_file());
+            assert_eq!(printed.lines().count(), 2, "{printed}");
+        } else {
+            assert!(!status.success(), "{answer:?}");
+            assert!(!voice.exists() && !music.exists(), "{answer:?}: published");
+            assert!(printed.is_empty(), "{answer:?}: {printed}");
+            if answer.is_some() {
+                assert!(
+                    said.iter().any(|l| l.contains("nothing was published")),
+                    "{said:?}"
+                );
+            }
+        }
+        assert!(!work.exists(), "{answer:?}: the work folder is left");
+    }
 }

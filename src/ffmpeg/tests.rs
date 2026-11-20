@@ -1044,33 +1044,37 @@ fn frame_origin_is_the_picture_s_offset_within_a_frame() {
     );
 }
 
-/// A child's error output is read to its end — 6 MB of it, the last 3 MB one line that never
-/// ends — and only its end is kept: at most `STDERR_TAIL` bytes, from a character's first byte,
-/// ending where the child's did; the child, never blocked on its pipe, exits.
+/// A child's error output is read to its end — 3 MB of empty lines, then a 3 MB line that never
+/// ends, then its last line — and only a bounded tail is kept: the endless line cut to its first
+/// bytes at a character's edge and marked, the last line whole; the child, never blocked on its
+/// pipe, exits.
 #[test]
-fn stderr_tail_drains_everything_and_keeps_only_the_end() {
+fn an_error_tail_drains_everything_and_keeps_only_a_bounded_end() {
     let mut child = Command::new("sh")
         .arg("-c")
         .arg(
             "head -c 3000000 /dev/zero | tr '\\0' '\\n' >&2; \
-             head -c 3000000 /dev/zero | tr '\\0' x >&2; printf 'é the end' >&2",
+             head -c 3000000 /dev/zero | tr '\\0' x >&2; printf '\\né the end' >&2",
         )
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    let tail = stderr_tail(child.stderr.take().unwrap());
+    let tail = ErrorTail::spawn(child.stderr.take().unwrap());
     assert!(child.wait().unwrap().success(), "it ran to its end");
-    let text = tail.join().unwrap();
-    assert!(text.len() <= STDERR_TAIL, "{} bytes", text.len());
-    assert!(
-        text.ends_with("xxxé the end"),
-        "{}",
-        &text[text.len() - 20..]
-    );
-    // Cut inside a character (two bytes each, then one): from the next whole one.
-    let mut bytes = "é".repeat(STDERR_TAIL).into_bytes();
-    bytes.push(b'!');
-    let text = stderr_tail(std::io::Cursor::new(bytes)).join().unwrap();
-    assert!(text.ends_with("éé!"), "{text}");
-    assert!(!text.starts_with('\u{FFFD}'), "{}", &text[..8]);
+    let tail = tail.join().unwrap();
+    assert!(tail.kept() <= 2048, "{} bytes kept", tail.kept());
+    assert_eq!(tail.last_line(), "é the end");
+    // A last line that never ends: its first bytes, marked.
+    let mut bytes = b"first\n".to_vec();
+    bytes.extend([b'x'; 3000]);
+    let last = ErrorTail::read(std::io::Cursor::new(bytes)).last_line();
+    assert_eq!(last.len(), 2048 + '…'.len_utf8());
+    assert!(last.ends_with("xx…"), "{last}");
+    // A line cut inside a character (two bytes each, then one): at the edge before it.
+    let mut bytes = "é".repeat(2048).into_bytes();
+    bytes.insert(0, b'!');
+    let last = ErrorTail::read(std::io::Cursor::new(bytes)).last_line();
+    assert!(last.starts_with("!éé") && last.ends_with("éé…"), "{last}");
+    assert_eq!(last.len(), 2047 + '…'.len_utf8());
+    assert!(!last.contains('\u{FFFD}'));
 }

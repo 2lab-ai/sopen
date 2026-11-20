@@ -26,7 +26,7 @@ pub fn media_kind_of(name: &str) -> Result<Kind> {
 }
 
 /// Splits `name` into stem and extension (`a.b.mp3` → `a.b`, `mp3`).
-fn stem_ext(name: &str) -> (&str, &str) {
+pub(crate) fn stem_ext(name: &str) -> (&str, &str) {
     match name.rfind('.') {
         Some(i) if i > 0 => (&name[..i], &name[i + 1..]),
         _ => (name, ""),

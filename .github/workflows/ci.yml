@@ -51,14 +51,19 @@ jobs:
           HOMEBREW_NO_INSTALL_CLEANUP: "1"
         run: brew install ffmpeg fish
 
-      # Which ffmpeg the tests run against, and how its decoder treats the AAC trims a file
-      # carries: ffmpeg 9 applies an MP4 edit list's end and Matroska's CodecDelay, ffmpeg 8
-      # leaves both to the player (the render tests hold renders to a plain encode by the same
-      # ffmpeg for that reason).
-      - name: ffmpeg version and AAC trims
+      # Which ffmpeg the tests ran against (Ubuntu's and Homebrew's differ, and the stems' exact
+      # length once depended on it), and how its decoder treats the AAC trims a file carries:
+      # ffmpeg 9 applies an MP4 edit list's end and Matroska's CodecDelay, ffmpeg 8 leaves both to
+      # the player (the render tests hold renders to a plain encode by the same ffmpeg for that
+      # reason). The version print fails the step if ffmpeg is missing; the trims are a receipt.
+      - name: ffmpeg version
+        run: |
+          ffmpeg -hide_banner -version | head -n 3
+          ffprobe -hide_banner -version | head -n 1
+
+      - name: ffmpeg's AAC trims
         continue-on-error: true
         run: |
-          ffmpeg -hide_banner -version
           dir=$(mktemp -d)
           for ext in m4a mkv; do
             ffmpeg -hide_banner -loglevel error -f lavfi -i sine=f=440:r=48000 \
@@ -84,6 +89,32 @@ jobs:
         with:
           key: ci-${{ matrix.os }}
 
+      # `sopen stems` (spec §7a): the separation tests run the real model on a ~10 s fixture.
+      # It is not in the repo or the release assets (the formula installs it): downloaded once
+      # into a cache keyed by its SHA-256, and checked on every run.
+      - name: Restore the voice/music model
+        id: stems-model
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/stems-model
+          key: stems-model-${{ runner.os }}-e411182ce2c53541fefdcc99a8f46f2fe03978eb22038b9497c1d9d95a00fad4
+
+      - name: Download the voice/music model
+        if: steps.stems-model.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/stems-model"
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/stems-model/UVR-MDX-NET-Voc_FT.onnx" \
+            https://github.com/k2-fsa/sherpa-onnx/releases/download/source-separation-models/UVR-MDX-NET-Voc_FT.onnx
+
+      - name: Check the voice/music model
+        shell: bash
+        run: |
+          sum="$(if command -v sha256sum > /dev/null; then sha256sum; else shasum -a 256; fi \
+            < "$RUNNER_TEMP/stems-model/UVR-MDX-NET-Voc_FT.onnx" | cut -d' ' -f1)"
+          [ "$sum" = e411182ce2c53541fefdcc99a8f46f2fe03978eb22038b9497c1d9d95a00fad4 ] ||
+            { echo "::error::the voice/music model has SHA-256 $sum"; exit 1; }
+
       - name: cargo fmt
         run: cargo fmt --check
 
@@ -96,14 +127,19 @@ jobs:
           # fish fails the login-shell lanes, and a missing node fails the KWin script's behaviour
           # test (node is preinstalled on GitHub's runners). A missing OpenSSH `sftp-server` fails the
           # SFTP listing test (a real server over pipes; macOS ships it, Linux installs it above).
+          # A missing voice/music model fails the separation tests (downloaded above).
           SOPEN_REQUIRE_FFMPEG: "1"
+          SOPEN_REQUIRE_STEMS: "1"
+          SOPEN_STEMS_MODEL: ${{ runner.temp }}/stems-model/UVR-MDX-NET-Voc_FT.onnx
           SOPEN_REQUIRE_SHELLS: "1"
           SOPEN_REQUIRE_NODE: "1"
           SOPEN_REQUIRE_SFTP_SERVER: "1"
         run: cargo test --locked
 
-      # The Linux binary loads only libasound and libc at start (X11, Wayland, EGL, Vulkan and
-      # fontconfig are opened at runtime): prove it on a clean system with just the ALSA runtime.
+      # The Linux binary loads libasound and glibc's and GCC's own runtime at start: libc, libm,
+      # libdl, libpthread, libgcc_s, and libstdc++ for sherpa-onnx / ONNX Runtime (`sopen stems`,
+      # linked statically); X11, Wayland, EGL, Vulkan and fontconfig are opened at runtime. Prove
+      # it on a clean system with just the ALSA runtime (the image has libstdc++6: apt needs it).
       # Same Ubuntu release as the runner (read from its /etc/os-release, so a new runner image
       # moves it too): the binary needs the build host's glibc or newer.
       - name: Runtime libraries (Linux)

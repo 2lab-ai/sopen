@@ -63,8 +63,10 @@ fn fixture_with(label: Option<&str>, connect: Connect, launch: Option<Launch>) -
         fs: Box::new(LocalFs::new()),
         connect,
         label: label.map(str::to_string),
+        destination: label.map(str::to_string),
         abs: root.clone(),
         cache: cache.clone(),
+        state_dir: tmp.path().join("state"),
         launch,
     });
     let mut fx = Fx {
@@ -966,8 +968,10 @@ fn the_open_state_opens_an_entry_once_listed() {
         fs: Box::new(LocalFs::new()),
         connect: local_connect(),
         label: None,
+        destination: None,
         abs: root.to_str().unwrap().to_string(),
         cache: tmp.path().join("cache"),
+        state_dir: tmp.path().join("state"),
         launch: Arc::new(|_: &str, _: bool| Ok(String::new())),
     });
     b.open_first = Some("main.rs".to_string());
@@ -989,8 +993,10 @@ fn the_at_state_opens_a_text_file_at_that_byte() {
         fs: Box::new(LocalFs::new()),
         connect: local_connect(),
         label: None,
+        destination: None,
         abs: root.to_str().unwrap().to_string(),
         cache: tmp.path().join("cache"),
+        state_dir: tmp.path().join("state"),
         launch: Arc::new(|_: &str, _: bool| Ok(String::new())),
     });
     b.open_first = Some("rows.txt".to_string());

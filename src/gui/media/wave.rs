@@ -154,14 +154,14 @@ pub fn start(
             Err(e) => failed(format!("cannot run {}: {e}", tools.ffmpeg.display()), None),
             Ok(mut child) => {
                 let mut stdout = child.stdout.take().expect("piped");
-                let said = crate::ffmpeg::stderr_tail(child.stderr.take().expect("piped"));
+                let said = crate::ffmpeg::ErrorTail::spawn(child.stderr.take().expect("piped"));
                 let read = read_peaks(&mut stdout, lanes, duration, &mut |peaks| {
                     *slot.lock().unwrap() = Some(peaks);
                     wake();
                 });
                 drop(stdout);
                 let status = child.wait();
-                let last_line = crate::ffmpeg::last_line(&said.join().unwrap_or_default());
+                let last_line = said.join().unwrap_or_default().last_line();
                 match (read, status) {
                     (Err(e), _) => failed(format!("reading the decoded sound: {e}"), None),
                     (Ok(peaks), Ok(s)) if s.success() => Source {
@@ -364,9 +364,9 @@ mod tests {
         assert!(gone.error.unwrap().contains("cannot run"));
     }
 
-    /// A decoder that prints megabytes of errors — thousands of lines, then one 3 MB line that
-    /// never ends — is read to its end and its failure says the end of what it printed, a few
-    /// kilobytes at most.
+    /// A decoder that prints megabytes of errors — thousands of lines, then a 3 MB line, then
+    /// its last words — is read to its end and its failure says that last line; what is kept is
+    /// bounded ([`crate::ffmpeg::ErrorTail`]).
     #[test]
     fn a_noisy_decoder_s_failure_says_its_last_words_bounded() {
         use std::os::unix::fs::PermissionsExt;
@@ -376,7 +376,7 @@ mod tests {
             &fake,
             "#!/bin/sh\n[ \"$1\" = -version ] && exit 0\nhead -c 8000 /dev/zero\n\
              i=0; while [ $i -lt 2000 ]; do echo \"noise $i\" >&2; i=$((i+1)); done\n\
-             head -c 3000000 /dev/zero | tr '\\0' x >&2\nprintf 'the end' >&2\nexit 1\n",
+             head -c 3000000 /dev/zero | tr '\\0' x >&2\nprintf '\\nthe end' >&2\nexit 1\n",
         )
         .unwrap();
         std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -400,7 +400,7 @@ mod tests {
         };
         let error = got.error.unwrap();
         assert!(
-            error.ends_with("xxxthe end"),
+            error.ends_with(": the end"),
             "{}",
             &error[..80.min(error.len())]
         );

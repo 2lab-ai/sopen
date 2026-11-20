@@ -1628,8 +1628,9 @@ impl MediaWindow {
         } else if command_key(ctx, Key::Z, false) {
             self.undo(ctx);
         }
-        // F5 is PC Shell's Save, as Cmd/Ctrl+S (the image and hex windows' rule).
-        if command_key(ctx, Key::S, false) || plain_key(ctx, Key::F5) {
+        // F5 is PC Shell's Save, as Cmd/Ctrl+S (the image and hex windows' rule) — F5 alone,
+        // never with a modifier (04 §3).
+        if command_key(ctx, Key::S, false) || super::fkey_alone(ctx, Key::F5) {
             self.start_save(ctx, false);
         }
         if plain_key(ctx, Key::Delete) || plain_key(ctx, Key::Backspace) {

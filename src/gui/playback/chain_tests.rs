@@ -295,9 +295,9 @@ fn a_failing_decoder_is_an_error_not_silence() {
     assert!(pcm.is_empty());
 }
 
-/// A decoder that prints megabytes of errors — thousands of lines, then one 3 MB line that
-/// never ends — before failing is read to its end (it never blocks on a full pipe) and the
-/// chain's error is the end of what it printed, a few kilobytes at most.
+/// A decoder that prints megabytes of errors — thousands of lines, then a 3 MB line, then
+/// its last words — before failing is read to its end (it never blocks on a full pipe) and the
+/// chain's error is that last line; what is kept is bounded ([`ErrorTail`]).
 #[test]
 fn a_noisy_decoder_s_error_is_its_last_words_bounded() {
     let tmp = tempfile::tempdir().unwrap();
@@ -305,7 +305,7 @@ fn a_noisy_decoder_s_error_is_its_last_words_bounded() {
         tmp.path(),
         &format!(
             "{ONES}; i=0; while [ $i -lt 2000 ]; do echo \"noise $i\" >&2; i=$((i+1)); done; \
-             head -c 3000000 /dev/zero | tr '\\0' x >&2; printf 'the end' >&2; exit 1"
+             head -c 3000000 /dev/zero | tr '\\0' x >&2; printf '\\nthe end' >&2; exit 1"
         ),
     );
     let piece = [Piece {
@@ -315,7 +315,7 @@ fn a_noisy_decoder_s_error_is_its_last_words_bounded() {
     let (pcm, state, _) = decode_all(&tools, &Input::path(tmp.path()), &piece, 48_000, None);
     let error = state.error().expect("a failure");
     assert!(
-        error.ends_with("xxxthe end"),
+        error.ends_with(": the end"),
         "{}",
         &error[..120.min(error.len())]
     );

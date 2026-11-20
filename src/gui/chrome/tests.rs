@@ -178,18 +178,35 @@ fn cp437_gives_every_byte_a_glyph_of_the_font() {
     }
 }
 
-/// The F-key rows label only keys that work there; a viewer's own keys join the browser's.
+/// The F-key rows label only keys that work there; a viewer's own keys join the browser's. The
+/// browser's two come from its key table (S1's list row, 02 §7; 1 is Help everywhere).
 #[test]
 fn the_f_key_tables() {
+    use crate::gui::browser::keys::{row, Context};
+    use crate::gui::browser::view::Mode;
     let pairs =
         |keys: &[FKey]| -> Vec<(u8, &str)> { keys.iter().map(|k| (k.n, k.label)).collect() };
-    assert_eq!(pairs(LIST_KEYS), [(3, "View"), (4, "Edit")]);
-    assert_eq!(pairs(VIEWER_KEYS), [(3, "Exit"), (4, "Edit")]);
-    assert_eq!(pairs(&[EXIT_KEY]), [(3, "Exit")]);
+    assert_eq!(
+        pairs(LIST_KEYS),
+        [
+            (1, "Help"),
+            (2, "Rename"),
+            (3, "View"),
+            (4, "Edit"),
+            (5, "Copy"),
+            (6, "Move"),
+            (9, "Dual")
+        ]
+    );
+    assert_eq!(LIST_KEYS, row(Context::List, Mode::Preview).as_slice());
+    assert_eq!(pairs(VIEWER_KEYS), [(1, "Help"), (3, "Exit"), (4, "Edit")]);
+    assert_eq!(VIEWER_KEYS, row(Context::Viewer, Mode::Preview).as_slice());
+    assert_eq!(pairs(&[HELP_KEY, EXIT_KEY]), [(1, "Help"), (3, "Exit")]);
     assert_eq!(pairs(HEX_KEYS), [(5, "Save"), (6, "Goto"), (8, "Asc/hx")]);
     assert_eq!(
         pairs(&merged(VIEWER_KEYS, HEX_KEYS)),
         [
+            (1, "Help"),
             (3, "Exit"),
             (4, "Edit"),
             (5, "Save"),
@@ -200,7 +217,15 @@ fn the_f_key_tables() {
     // A number in both keeps the first.
     assert_eq!(
         pairs(&merged(&[EXIT_KEY], LIST_KEYS)),
-        [(3, "Exit"), (4, "Edit")]
+        [
+            (1, "Help"),
+            (2, "Rename"),
+            (3, "Exit"),
+            (4, "Edit"),
+            (5, "Copy"),
+            (6, "Move"),
+            (9, "Dual")
+        ]
     );
     // PC Shell's labels are six characters at most ("Disply", "Locate"); so are these.
     assert_eq!(pairs(TEXT_WRAPPED_KEYS), [(2, "Unwrap")]);
@@ -210,10 +235,78 @@ fn the_f_key_tables() {
         .chain(VIEWER_KEYS)
         .chain(HEX_KEYS)
         .chain(IMAGE_KEYS)
-        .chain(MEDIA_KEYS);
+        .chain(MEDIA_KEYS)
+        .chain([&HELP_KEY, &EXIT_KEY]);
     for key in all.chain(TEXT_WRAPPED_KEYS).chain(TEXT_UNWRAPPED_KEYS) {
         assert!(key.label.chars().count() <= 6, "{key:?}");
     }
+    // Slot n is Fn.
+    for n in 1..=10u8 {
+        let key = fkey(n).unwrap();
+        assert_eq!(fkey_number(key), Some(n));
+        assert_eq!(key.name(), format!("F{n}"));
+    }
+    assert_eq!((fkey(0), fkey(11)), (None, None));
+    assert_eq!(fkey_number(egui::Key::F11), None);
+    assert_eq!(fkey_number(egui::Key::Num5), None);
+}
+
+/// A row of `keys` at the bottom; every F-key press that reaches the window's pass, counted by
+/// its number.
+struct Row {
+    keys: &'static [FKey],
+    presses: [usize; 11],
+}
+
+impl Window for Row {
+    fn ui(&mut self, ui: &mut egui::Ui) {
+        key_panel(ui, "row-keys", self.keys);
+        ui.input_mut(|i| {
+            for n in 1..=10u8 {
+                let key = fkey(n).unwrap();
+                self.presses[usize::from(n)] += i.count_and_consume_key(egui::Modifiers::NONE, key);
+            }
+        });
+    }
+
+    fn ready(&self) -> bool {
+        true
+    }
+}
+
+/// 04 §6.1, K-R2: a click on a slot — its digit or its label — is that F-key pressed once,
+/// as a plain key, in the window's next pass; a slot with an empty label does nothing.
+#[test]
+fn a_click_on_a_slot_presses_its_key() {
+    let mut drv = Driver::new(800.0, 300.0);
+    let mut win = Row {
+        keys: HEX_KEYS,
+        presses: [0; 11],
+    };
+    drv.idle(&mut win, 2);
+    let save = drv.find_text("Save   ").expect("5Save");
+    drv.click(&mut win, save.center());
+    assert_eq!(win.presses[5], 1, "{:?}", win.presses);
+    let digit = drv.find_text("8").expect("the digit 8");
+    drv.click(&mut win, digit.center());
+    assert_eq!(win.presses[8], 1, "{:?}", win.presses);
+    // Slot 7 is empty here: its label block is there, and a click on it is nothing.
+    let (_, seven) = key_slot(0.0, 800.0, 7);
+    drv.click(&mut win, Pos2::new(seven.center().x, 300.0 - CELL.y / 2.0));
+    drv.idle(&mut win, 2);
+    let mut want = [0; 11];
+    want[5] = 1;
+    want[8] = 1;
+    assert_eq!(win.presses, want, "nothing else was pressed");
+}
+
+/// The palette names a selected entry's colour (04 §4: yellow) and the key help's key column.
+#[test]
+fn the_palette_has_the_browsers_new_parts() {
+    assert_eq!(PALETTE.selected, cga::YELLOW);
+    assert_ne!(PALETTE.selected, PALETTE.bar, "readable on the bar");
+    assert_ne!(PALETTE.selected, PALETTE.back);
+    assert_eq!(PALETTE.help_key, cga::WHITE);
 }
 
 /// Ten slots of whole cells across the row, each a digit then its label block; the tenth has

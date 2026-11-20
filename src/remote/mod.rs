@@ -4,6 +4,7 @@
 //! on top of a few primitives, so the tests exercise exactly what runs against a remote.
 
 mod local;
+pub mod ops;
 mod sftp;
 
 pub use local::LocalFs;

@@ -14,8 +14,12 @@
 //! Nothing slow runs on a frame: listing, opening a connection, fetching, decoding and probing
 //! run on workers, and Esc stops a fetch.
 
+pub(crate) mod keys;
+mod ops;
 mod panel;
 mod prepare;
+mod preview;
+pub(crate) mod view;
 
 use super::chrome::{self, FKey};
 use super::{Embedded, Hooks, Outcome, Status, Window};
@@ -50,11 +54,32 @@ pub struct Start {
     pub connect: Connect,
     /// `[user@]host`; `None` on this machine.
     pub label: Option<String>,
+    /// The host as `ssh` takes it (`user@host`, an IPv6 host unbracketed:
+    /// [`RemoteSpec::destination`](crate::target::RemoteSpec::destination), not `label`); `None`
+    /// on this machine. For what runs over the folder's ssh master besides the listing (02 §5);
+    /// nothing reads it yet.
+    pub destination: Option<String>,
     /// The folder (absolute).
     pub abs: String,
     /// sopen's cache root.
     pub cache: PathBuf,
+    /// sopen's state folder, where the ssh master's socket is
+    /// ([`connection_args`](crate::remote::connection_args)); nothing reads it yet.
+    pub state_dir: PathBuf,
     pub launch: Launch,
+}
+
+/// What the browser's features tell it (02 §7). S1-E sends and handles them.
+#[allow(dead_code)] // S1-0 scaffold: S1-E's wiring uses it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum BrowserEvent {
+    /// Files changed in `dirs` (absolute) on `host` (`[user@]host`; `None`: this machine), after
+    /// a file operation (04 §5.1) or, from S2, a git write: the panels showing one of `dirs`
+    /// re-list, a git panel whose top level holds one soft-refreshes.
+    FilesChanged {
+        host: Option<String>,
+        dirs: Vec<String>,
+    },
 }
 
 /// Shows the browser until its window closes; then waits for anything a viewer may still be
@@ -346,6 +371,11 @@ impl Browser {
             worker: Some(worker),
         });
     }
+
+    /// Carries out a key's command (02 §7); S1-E dispatches it to `ops`, `view` and the rest.
+    /// S1-0 scaffold: no command exists yet, so it does nothing.
+    #[allow(dead_code)] // S1-0 scaffold: S1-E's wiring calls it.
+    fn run(&mut self, _command: keys::Command) {}
 
     /// Results from the workers: a listing, a file ready (its viewer shows), an F4 launch; and
     /// writes of viewers already gone.

@@ -1147,3 +1147,30 @@ fn a_last_frame_held_long_shows_the_last_picture() {
         assert!(!fx.win.status.error, "at {t} s: {}", fx.win.status.text);
     }
 }
+
+/// The window's own F-key, F5 (Save), is the key alone (04 §3): Shift, Alt or Cmd/Ctrl with it
+/// does nothing — no save starts, nothing is rendered — and F5 by itself saves.
+#[test]
+fn f5_with_a_modifier_does_nothing() {
+    let Some(mut fx) = audio(true) else { return };
+    fx.drag(0.25, 0.5);
+    fx.key(Key::Delete, Modifiers::NONE);
+    for mods in [
+        Modifiers::SHIFT,
+        Modifiers::ALT,
+        Modifiers::SHIFT | Modifiers::ALT,
+    ] {
+        fx.key(Key::F5, mods);
+        fx.drv.idle(&mut fx.win, 2);
+        assert!(fx.win.save.is_none(), "{mods:?}+F5 started a save");
+    }
+    assert_eq!(fx.spawned().render, 0, "nothing rendered");
+    assert!(fx.win.unsaved());
+    fx.key(Key::F5, Modifiers::NONE);
+    wait_save(&mut fx);
+    assert!(
+        fx.win.status.text.starts_with("saved "),
+        "{}",
+        fx.win.status.text
+    );
+}

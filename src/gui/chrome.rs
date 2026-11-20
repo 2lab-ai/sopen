@@ -65,8 +65,15 @@ pub struct FKey {
     pub label: &'static str,
 }
 
-/// The keys that work on the file list.
+/// The file list's row in slice S1 (02 §7, 04 §2): only the keys that work, F9's label naming
+/// the mode it switches to from the default (preview) mode. It is the browser key table's
+/// (`browser::keys::row`, a test holds them equal); S1-E draws that, by the mode, instead.
 pub const LIST_KEYS: &[FKey] = &[
+    HELP_KEY,
+    FKey {
+        n: 2,
+        label: "Rename",
+    },
     FKey {
         n: 3,
         label: "View",
@@ -75,10 +82,24 @@ pub const LIST_KEYS: &[FKey] = &[
         n: 4,
         label: "Edit",
     },
+    FKey {
+        n: 5,
+        label: "Copy",
+    },
+    FKey {
+        n: 6,
+        label: "Move",
+    },
+    FKey {
+        n: 9,
+        label: "Dual",
+    },
 ];
 
-/// The keys the browser adds while a viewer is open in it (the viewer's own come with them).
+/// The keys the browser adds while a viewer is open in it (the viewer's own come with them):
+/// the key table's viewer row.
 pub const VIEWER_KEYS: &[FKey] = &[
+    HELP_KEY,
     FKey {
         n: 3,
         label: "Exit",
@@ -88,6 +109,12 @@ pub const VIEWER_KEYS: &[FKey] = &[
         label: "Edit",
     },
 ];
+
+/// F1 everywhere: the key help of where the keyboard is (04 §2 slot 1, `gui::help`).
+pub const HELP_KEY: FKey = FKey {
+    n: 1,
+    label: "Help",
+};
 
 /// F3 in a window of its own: it closes, as Cmd/Ctrl+W does (through the unsaved-changes prompt).
 pub const EXIT_KEY: FKey = FKey {
@@ -138,6 +165,19 @@ pub const TEXT_UNWRAPPED_KEYS: &[FKey] = &[FKey {
     label: "Wrap",
 }];
 
+/// The key of slot `n` (1–10): F1…F10.
+pub fn fkey(n: u8) -> Option<egui::Key> {
+    use egui::Key::*;
+    [F1, F2, F3, F4, F5, F6, F7, F8, F9, F10]
+        .get(usize::from(n).wrapping_sub(1))
+        .copied()
+}
+
+/// The slot of F1…F10 (1–10); `None` for any other key.
+pub fn fkey_number(key: egui::Key) -> Option<u8> {
+    (1..=10).find(|&n| fkey(n) == Some(key))
+}
+
 /// `keys` and `more` as one row, by number (a number in both keeps the first).
 pub fn merged(keys: &[FKey], more: &[FKey]) -> Vec<FKey> {
     let mut all: Vec<FKey> = keys.to_vec();
@@ -168,6 +208,8 @@ pub struct Palette {
     pub bar_text: Color32,
     /// The highlight on the panel that is not active.
     pub bar_idle: Color32,
+    /// A selected entry's text, under the bar too: PC Shell draws selected files yellow (04 §4).
+    pub selected: Color32,
     /// The active window's double line, the others' single line.
     pub frame_active: Stroke,
     pub frame_idle: Stroke,
@@ -190,6 +232,8 @@ pub struct Palette {
     pub dialog_error: Color32,
     /// What is typed into a field (a black bar).
     pub field_text: Color32,
+    /// The key column of the key help (F1), beside its words in `text`.
+    pub help_key: Color32,
     /// The scroll bar: the track's cell, its `░` and arrows, the thumb.
     pub track_back: Color32,
     pub track: Color32,
@@ -224,6 +268,7 @@ pub const PALETTE: Palette = Palette {
     bar: LIGHT_RED,
     bar_text: WHITE,
     bar_idle: BLACK,
+    selected: YELLOW,
     frame_active: Stroke {
         width: 1.0,
         color: WHITE,
@@ -246,6 +291,7 @@ pub const PALETTE: Palette = Palette {
     dialog_weak: BLUE,
     dialog_error: RED,
     field_text: WHITE,
+    help_key: WHITE,
     track_back: BLACK,
     track: LIGHT_GRAY,
     thumb: RED,
@@ -371,12 +417,15 @@ pub fn style(s: &mut egui::Style) {
     s.spacing.slider_width = 60.0;
 }
 
-/// Puts the skin into a window's context: the fonts, the dark theme whatever the system's, and
-/// the style of both themes.
+/// Puts the skin into a window's context: the fonts, the dark theme whatever the system's, the
+/// style of both themes — and the F-key row's input and F1's help screen, the shell's input
+/// plugin (`gui::FKeyInput`: a clicked slot and Cmd/Ctrl+1…0 become the F-key, 04 §6.1), so
+/// every window and the test kit's driver run the same hook before every pass.
 pub fn install(ctx: &egui::Context) {
     ctx.set_fonts(fonts());
     ctx.set_theme(egui::ThemePreference::Dark);
     ctx.all_styles_mut(style);
+    ctx.add_plugin(super::FKeyInput::default());
 }
 
 /// A one-line text field: a black bar, what is typed in white (also inside a dialog, whose text
@@ -716,7 +765,10 @@ pub fn key_slot(left: f32, width: f32, n: u8) -> (Rect, Rect) {
 }
 
 /// The bottom row: ten slots, each the key's digit on black and its label black on cyan; a
-/// slot whose key does nothing here has an empty label, as PC Shell shows it.
+/// slot whose key does nothing here has an empty label, as PC Shell shows it. A click on a
+/// slot with a label — its digit or its label — is that F-key pressed (04 §6.1): the shell's
+/// input hook (`gui::FKeyInput`) hands it to the window's next pass as the plain key, so it does
+/// exactly what the key does there.
 pub fn fkey_row(ui: &mut egui::Ui, keys: &[FKey]) {
     let p = PALETTE;
     let rect = row(ui);
@@ -739,16 +791,49 @@ pub fn fkey_row(ui: &mut egui::Ui, keys: &[FKey]) {
             p.key_digit,
         );
         painter.rect_filled(label, 0.0, p.key_back);
-        if let Some(key) = keys.iter().find(|k| k.n == n) {
-            painter.with_clip_rect(label.intersect(rect)).text(
-                label.min,
-                egui::Align2::LEFT_TOP,
-                format!("{:<7}", key.label),
-                font(),
-                p.key_text,
-            );
+        let Some(key) = keys.iter().find(|k| k.n == n && !k.label.is_empty()) else {
+            continue;
+        };
+        painter.with_clip_rect(label.intersect(rect)).text(
+            label.min,
+            egui::Align2::LEFT_TOP,
+            format!("{:<7}", key.label),
+            font(),
+            p.key_text,
+        );
+        // Not focusable: a click on the row leaves the keyboard where it was.
+        let slot = digit.union(label).intersect(rect);
+        if ui
+            .interact(
+                slot,
+                ui.scope_id().with(("sopen-fkey", n)),
+                egui::Sense::CLICK,
+            )
+            .clicked()
+        {
+            press_fkey(ui.ctx(), n);
         }
     }
+}
+
+/// A slot clicked, for the window's next pass.
+#[derive(Debug, Clone, Copy, Default)]
+struct Clicked(u8);
+
+fn clicked_id() -> egui::Id {
+    egui::Id::unique("sopen-fkey-clicked")
+}
+
+/// F`n` is pressed in the window's next pass (a click on its slot).
+pub fn press_fkey(ctx: &egui::Context, n: u8) {
+    ctx.data_mut(|d| d.insert_temp(clicked_id(), Clicked(n)));
+    ctx.request_repaint();
+}
+
+/// The slot clicked since the last pass, taken (the shell's input hook).
+pub(crate) fn take_clicked(ctx: &egui::Context) -> Option<u8> {
+    ctx.data_mut(|d| d.remove_temp::<Clicked>(clicked_id()))
+        .map(|c| c.0)
 }
 
 /// The F-key row as a panel at the bottom of `ui`.

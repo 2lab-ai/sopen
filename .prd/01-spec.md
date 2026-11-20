@@ -108,6 +108,16 @@ its git panel changes repositories, every history rewrite or destructive action 
 | A13 | F2 rename, F5 copy, F6 move, the conventional rest (msg 15) | The list's F-key row reads `1Help 2Rename 3View 4Edit 5Copy 6Move 7MkDir 8Delete 9Dual 10Tree` once every slice has landed (until then a slot not built yet is empty, 02 §8); every file-changing key asks first and never overwrites an existing name, locally and over SFTP. Scenarios: 04 §8 (K-R, K-S, K-C, K-M, K-N, K-K, K-D). |
 | A14 | Function keys act as F1…F12 in sopen (msg 15) | Every F-key row is clickable and Cmd/Ctrl+1…0 act as F1…F10 in every window; on macOS the top row sends F-keys while a sopen window is focused and the Mac's setting comes back on blur, quit and crash; Linux and Windows have the fallback only. Scenarios: 04 §8 (K-F). |
 | A15 | F10 directory tree (msg 16) | F10 (or Alt+F10) shows a tree rooted at the home when the folder is under it, else at `/`; device, virtual, network and mount folders never open by themselves; folders with fewer than 5 subfolders open within a row budget; every row shows its folder and file counts and a growing size at once. Scenarios: 05 §8. |
+| A16 | Split an audio track into voice and music (msg 13) | `sopen stems host:/a.mp3` writes `a.voice.mp3` and `a.music.mp3` next to it — new files, never over anything — and prints both paths; a video gives `.m4a` (AAC) stems; on a 0 dB voice/music mix each stem is ≈ 14 dB SDR (§7a). `brew install` brings the model; a missing or different model is one error naming the path it expected. The window gets its button in a later change; its child-process API is §7a's. |
+
+Owner message 17 (2026-11-20, quoted in [`06-streaming.md`](06-streaming.md)) asks that every viewer
+stream and that edits live locally until saved. Its contract is planned, and this file describes
+what ships until each work unit lands:
+
+| # | Owner intent | Acceptance (observable) |
+|---|---|---|
+| A17a | View any remote file without downloading it first, like a video stream: the first screen first, a buffer around it, a far jump on demand (msg 17) | [06](06-streaming.md) §12: e.g. a remote 24 GB file's first hex screen shows within 1.0 s of Enter having fetched ≤ 64 KiB (plus the 8 KiB kind sniff), and memory grows ≤ 80 MiB and the disk not at all while scrolling it (V1–V3). |
+| A17b | Edits kept locally until saved; Save writes to the remote by default; Save As to a local path (msg 17) | [07](07-streaming-edit.md) §12: e.g. a 4-byte hex edit of a remote 24 GB file saves with ≤ 4 KiB read and 4 bytes written of the file by the save itself (then ≤ 128 KiB as the view reloads), a changed remote is refused with the original untouched, and a crash offers Restore (E1, E3–E6, E10). |
 
 ## 3. Routing
 
@@ -217,6 +227,8 @@ too, where F3 closes it as ⌘W does.
   file is decoded, probed or indexed) keeps the viewer from opening; the fetched copy stays in
   the cache, recorded, and the status row says so. An image is always a
   copy (Save needs the bytes as opened); local media, text and other files are read in place.
+  Message 17 replaces this whole-file fetch, and the cached copy the text viewer reads, with a
+  stream for every viewer ([06](06-streaming.md) §7, planned).
   Each viewer gets a connection of its own (its Save and Export use it), and the copy it shows
   stays claimed until it is gone. The viewers keep exactly their edits, keys and Save rules
   (§6, §6a, §7); no new save path.
@@ -359,12 +371,12 @@ as it is). When ssh itself fails (its exit code 255) sopen exits 1 with `could n
 reach HOST`; any other status above 128 (sopen itself exits only 0, 1 or 3 — 2 for a usage error — so most likely a
 signal, 128 + n)
 exits 1 with `sopen on HOST ended with status N (signal n?)`. HOST needs sopen installed; the machine holding the file still needs only sshd. Because HOST is always
-told `--here`, it never forwards again, whatever its own default is. `sopen cut` always runs here.
+told `--here`, it never forwards again, whatever its own default is. `sopen cut` and `sopen stems` always run here.
 
 Which machine opens it: `--here` (this machine) or `--target HOST` — one or the other, the command line refuses
 both — else the environment variable `SOPEN_TARGET`, else the `target` key of the config file, else this machine.
 `SOPEN_TARGET` and the config file are read only when they are the ones deciding, so a broken file or an unreadable
-variable does not stop `--here` or `--target`, and `cut` reads neither. HOST is `[user@]host` — an ssh alias or a
+variable does not stop `--here` or `--target`, and `cut` and `stems` read neither. HOST is `[user@]host` — an ssh alias or a
 host name; a port or an IPv6 address goes into `~/.ssh/config` under an alias. Wherever it comes from it must be
 non-empty, without whitespace or `:`, and must not start with `-`. HOST is this machine — opened here, no ssh — only when
 its host part (without `user@`) is loopback (exactly `localhost`, a name under `.localhost`, or one of the
@@ -519,6 +531,9 @@ Esc do, and — only when something would be downloaded — that nothing is unti
 The exceptions: Enter in the path field saves there (it never opens the hex editor; when that save
 is refused the field keeps the keyboard, so the next Enter saves again); during a transfer Enter and
 Esc do nothing and closing waits for it.
+Message 17 changes the dialog in two ways ([06](06-streaming.md) §7.5, planned). "Open in hex
+editor" opens a remote file as a stream, with nothing fetched first. Esc or closing the window
+cancels a "Save to…", leaving nothing behind.
 
 - Hex: the file is fetched into the cache as every fetch is (claimed, recorded, an earlier copy's
   unsaved edits moved aside first — §5), with the progress in the dialog; then the same window
@@ -670,8 +685,8 @@ once the primary button is up, and take rows off the grid's bottom.
   that ends early by itself is padded (silence in blocks of at most 8192 samples, the last picture held), never
   after a stop; one that cannot start, whose output cannot be read or that exits with an error ends playback with
   the reason on the status line. A decoder taken out of the running list to be waited for is killed and reaped
-  however its piece ended (stopped, unreadable, short); its error output is read to the end and only its last 2 KB
-  kept. Measured 2026-11-20 (release build, null sink; each wait from the end of the piece before — its padding
+  however its piece ended (stopped, unreadable, short); its error output is read to the end and only its last lines kept
+  (64, at most 2 KB; a line that never ends cut and marked `…`, as `sopen stems` keeps 16 KB). Measured 2026-11-20 (release build, null sink; each wait from the end of the piece before — its padding
   too — to the piece's first output): 64×64 at 25 fps — video 0.02–1.8 ms, audio 0.01–1.5 ms; 1080p long-GOP
   (keyframes 10 s apart, cuts 8–9 s past one, decoded 1280×720) — video 1.1–4.9 ms, audio 0.02–1.6 ms; against
   ~240 ms of queued frames; no frame dropped. Short pieces late in a GOP at the start of a play (0.6 s then 0.4 s,
@@ -697,9 +712,10 @@ once the primary button is up, and take rows off the grid's bottom.
   F3, `close=ask` and leaving it in the browser ask Save / Discard / Cancel as the image window does; a running save
   closes the window when it is done; a running export keeps the close-again rule. A save or export whose worker ends
   without a result (it panicked) is a visible failure; the edits stay and the window is usable.
-- A render's work folder (`.exports/<random>`) and its staged file (`<stem>.render-…` in `.edits`) each have a
-  `<name>.lock` held while the job runs; a sopen killed meanwhile leaves them to the next media window's or `sopen
-  cut`'s start, which removes every one whose lock nobody holds (a kept render — a failed save names it — has no
+- A render's work folder (`.exports/<random>`), its staged file (`<stem>.render-…` in `.edits`) and a `sopen stems`
+  job's work folder (`.exports/<random>` from the command, `.exports/stems-<random>` for the window's child) each have a
+  `<name>.lock` held while the job runs; a sopen killed meanwhile leaves them to the next media window's, `sopen
+  cut`'s or `sopen stems`' start, which removes every one whose lock nobody holds (a kept render — a failed save names it — has no
   lock and stays). A job removes its lock file before letting go of it, and the sweep removes a job only while the
   lock it got is still the file at that path, so a job that ends while the sweep looks keeps what it kept. The render's ffmpeg dies with sopen, SIGKILL included: a small `sh` in a process group of its own
   reads a pipe only sopen writes, and when the pipe closes it kills that ffmpeg if its command line still names the
@@ -737,9 +753,78 @@ once the primary button is up, and take rows off the grid's bottom.
   carry it). Inherent to the containers; the picture and the sound's timing are right.
 - Renderer / playback details fixed by the spike (§11).
 
+## 7a. Voice / music separation (A16)
+
+`sopen stems SOURCE [--model PATH]` splits a file's audio into the voice and the music. It has
+`sopen cut`'s shape and rules: SOURCE is local or `[user@]host:path`, a remote file is fetched
+into the cache (claimed while it runs), and it always runs on this machine (§4a).
+
+- **Engine.** sherpa-onnx v2.0.2's C API (Apache-2.0; ONNX Runtime, MIT, inside), linked
+  statically behind the cargo feature `stems` (on by default; every release build has it).
+  build.rs downloads the pinned prebuilt archive for the *target* and checks its SHA-256
+  (`SHERPA_ONNX_LIB_DIR` = an extracted `lib/` for offline builds; a changed archive there, or
+  one gone from the download, rebuilds; the download's stamp is removed before its extraction
+  changes and written only once every library is there); `--no-default-features`
+  builds without it and `sopen stems` then says so. sherpa-onnx's Rust crates do not bind source
+  separation, so the few C declarations are sopen's own. CPU, every core.
+- **Model.** UVR-MDX-NET-Voc_FT from Ultimate Vocal Remover (Anjok07 & aufr33, MIT — credited in
+  `--version`, the long help and the README, as its authors ask) in sherpa-onnx's ONNX
+  conversion: `UVR-MDX-NET-Voc_FT.onnx`, 66,762,795 bytes, SHA-256
+  `e411182ce2c53541fefdcc99a8f46f2fe03978eb22038b9497c1d9d95a00fad4`. It is not one of sopen's
+  release assets: the formula's `resource` stages it into `pkgshare`. sopen looks for it at
+  `--model PATH`, else `SOPEN_STEMS_MODEL`, else `<keg>/share/<formula>/UVR-MDX-NET-Voc_FT.onnx`
+  next to the canonical binary's `<keg>/bin/` (`<formula>` = `sopen` for a release build,
+  `sopen-preview` otherwise), and checks size and SHA-256 before anything is fetched. Missing
+  or not exactly that file: one error naming the path it expected. sopen has no network code.
+- **Separation.** ffprobe (an audio stream is required) → ffmpeg decodes the first audio track
+  to stereo f32 at the model's rate (44.1 kHz) on a pipe → the engine separates it in pieces of
+  30 s, each with 1 s of the file's own audio on both sides (silence past its ends) that is cut
+  off its output again — the engine distorts a window's edges, and the context keeps that out
+  (the research spike measured it lossless against one pass) → each stem goes to ffmpeg on a
+  pipe; of each ffmpeg's stderr only a bounded tail is kept (64 lines, 16 KiB; an endless line
+  cut), its last line being the error. Memory is one window plus the model, however long the track (measured flat: 6,529 MiB
+  after the first of 8 pieces, 6,535 MiB after the last). The model's music is the window minus
+  its voice, so voice + music give the source back sample for sample (the test).
+- **Output.** Each stem in the source's audio codec, sample rate and channel count (mono stays
+  mono — through the engine as two equal channels, back as their mean, by explicit `pan`s, so
+  the level is kept; more than two channels are separated as stereo, downmixed normalised as
+  ffmpeg downmixes for integer output (`-rematrix_maxval 1.0`: nothing over full scale), and a
+  note says so). At the source's own rate each stem has exactly the source's sample count: the
+  resampling to the engine's rate and back can add a sample at the end (in AAC a whole frame),
+  so when the rates differ the source's count is taken from a decode of its own, run while the
+  first piece is separated, and each stem is padded or cut to it (a lossy codec such as AAC may
+  then decode up to one codec frame longer: its encoder pads the last frame). A video source
+  gives AAC in `.m4a`. Only the first audio track is separated (a note names the others). Both
+  are published as new siblings the way `sopen cut` publishes (§5: never over anything, `-N`
+  when the name is taken — the first number free for both, so the pair carries the same number
+  unless another program takes one of the names between that look and the two publishes, which
+  are each on their own; nothing is overwritten either way): `<stem>.voice.<ext>`, then
+  `<stem>.music.<ext>`; the paths actually published are printed on stdout, voice first. A music stem that cannot be published after the voice was is
+  an error that names the published voice.
+- **Progress** on stderr, one line per finished piece, parseable:
+  `stems: piece 3/8, 61s elapsed, 102s remaining` (`0/N` with no `remaining` before the first;
+  `N` from ffprobe's duration until the decode ends, then exact; a terminal sees the line
+  updated in place). Exit codes as `sopen cut`: 0, or 1 with one error line.
+- **Cost** (measured on an 18-core Apple M-series CPU, 2026-11-20): a 4-minute track took 198 s
+  while the machine was busy with other work (load average 150–200; the research spike's idle
+  runs: 147–160 s), at 6.4 GiB peak RSS; on the spike's 0 dB voice/music mix both stems scored
+  14.04 dB SDR, the spike's own figure. So the window never separates in its own process: `stems::spawn_child` runs `sopen stems --work-dir
+  DIR --wait-to-publish -- SOURCE` as a child in a process group of its own (its ffmpeg children
+  with it), in a work folder the parent made, and reads its progress lines. Cancel kills the
+  group, removes the folder and publishes nothing. The child does not publish on its own: once
+  both stems are encoded it prints `stems: ready to publish` and waits for `publish` on its
+  stdin; the parent answers under the lock Cancel takes, so a cancel either comes first (nothing
+  reaches the remote — an upload is never cut half-way, leaving a temp there) or after the
+  go-ahead, when it is too late and the stems are published. The child's exit and its output are
+  separate: once the child has exited — seen without reaping it, so its id is still its own —
+  whatever it left in its group is killed, then it is reaped and the work folder removed; its
+  result is read only when both pipes are closed, and looking for it never blocks. Nothing
+  signals a reaped child's id again (it may be anyone's by then). The window's button is a later
+  change.
+
 ## 8. Usage log
 
-One JSON line per run in `<state>/usage.jsonl`: `ts, host_hash, kind, ext, bytes, fetch_ms, action (open|save|export|cut|discard), conflict, ok, forwarded, target_hash`.
+One JSON line per run in `<state>/usage.jsonl`: `ts, host_hash, kind, ext, bytes, fetch_ms, action (open|save|export|cut|stems|discard), conflict, ok, forwarded, target_hash`.
 Hosts are hashed, never written by name. A run forwarded with `--target` (§4a) is logged on both machines: here with
 `forwarded: true` and the target's hash (its kind is known only there), there as an ordinary open.
 Local only, never sent anywhere. Exists for §10.
@@ -749,16 +834,17 @@ Local only, never sent anywhere. Exists for §10.
 Own text editor (the browser's text viewer is read-only; VS Code or Zed edits),
 hex insert / delete or anything else that changes a binary file's size, image edits beyond crop, pixelize and
 clipboard copy / cut / paste (no drawing or text tool, no layers, no filters), media edits beyond the time cut,
-cut / copy / paste on the timeline, the video crop and (audio only) Mono → Stereo (msg 13: no fades, gain, mixing,
-effects, transitions or separately edited audio and video), the system clipboard for media, frame-accurate
-copy without re-encode, streaming playback before download completes, directory sync / mounts, file watching,
+cut / copy / paste on the timeline, the video crop, (audio only) Mono → Stereo and `sopen stems`' voice / music
+split into new files (msg 13: no fades, gain, mixing, effects, transitions or separately edited audio and video),
+the system clipboard for media, frame-accurate copy without re-encode, directory sync / mounts, file watching,
 Windows, a `.app` bundle or cask, any agent on the remote, macshot (Swift, macOS-only, GPL-3 — incompatible with A7/A8).
 
 ## 10. Two-week review (from 2026-11-xx first preview)
 
 From `usage.jsonl` across machines: < 5 runs/week, or ≥ 80 % text/dir → archive, keep a `zed ssh://` alias.
-A conflict refusal or failed write → fix before anything else. Large-media waits (≥ 500 MB or fetch ≥ 30 s, 3+ times)
-→ consider streaming. The owner naming the same missing edit 3 times → that one edit, nothing more.
+A conflict refusal or failed write → fix before anything else. Streaming no longer waits on this
+review: owner message 17 asked for it ([06](06-streaming.md), [07](07-streaming-edit.md)). The owner
+naming the same missing edit 3 times → that one edit, nothing more.
 
 ## 11. Spike results (2026-11-11, throwaway spike, ~1.4k LOC)
 

@@ -11,6 +11,7 @@ use sopen::gui;
 use sopen::human;
 use sopen::kind::{self, Kind};
 use sopen::remote::{self, LocalFs, RemoteFs, SftpRemote, Stat, WriteOutcome};
+use sopen::stems;
 use sopen::target::{self, RemoteSpec, Target};
 use sopen::usage::Record;
 use sopen::{app, config, forward, raise, zed};
@@ -27,7 +28,7 @@ const EXIT_CONFLICT: u8 = 3;
     name = "sopen",
     version = sopen::version_text(),
     long_version = sopen::long_version_text(),
-    after_long_help = sopen::FONT_CREDIT,
+    after_long_help = sopen::credits(),
     about = "Open a file or folder on another machine as if it were local",
     long_about = "Open a file or folder on another machine as if it were local.\n\n\
         SOURCE uses scp syntax: [user@]host:path (relative paths are under the remote home) or a \
@@ -111,6 +112,24 @@ enum Cmd {
         #[arg(long, value_name = "X,Y,W,H")]
         crop: Option<String>,
     },
+    /// Split the audio into voice and music: two new files next to it (never overwrites)
+    Stems {
+        /// [user@]host:path, or a local path (audio or video)
+        #[arg(value_name = "SOURCE")]
+        target: String,
+        /// The separation model (UVR-MDX-NET-Voc_FT.onnx) instead of SOPEN_STEMS_MODEL or the
+        /// one installed with sopen
+        #[arg(long, value_name = "PATH")]
+        model: Option<PathBuf>,
+        /// Internal (the window's child, spec §7a): encode into this folder, which the parent
+        /// made (empty) and removes.
+        #[arg(long, hide = true, value_name = "DIR", requires = "wait_to_publish")]
+        work_dir: Option<PathBuf>,
+        /// Internal (the window's child): once encoded, print the ready line and publish only
+        /// when stdin says `publish`; stdin's end before that stops the child.
+        #[arg(long, hide = true, requires = "work_dir")]
+        wait_to_publish: bool,
+    },
     /// Show the config file, or set where `sopen SOURCE` opens by default
     Config {
         #[command(subcommand)]
@@ -178,6 +197,15 @@ fn main() -> ExitCode {
             crop,
         }) => with_dirs().and_then(|dirs| {
             run_cut(&target, &start, &end, crop.as_deref(), dirs, &mut rec).map(|()| 0)
+        }),
+        Some(Cmd::Stems {
+            target,
+            model,
+            work_dir,
+            wait_to_publish,
+        }) => with_dirs().and_then(|dirs| {
+            let child = (work_dir.as_deref(), wait_to_publish);
+            run_stems(&target, model.as_deref(), child, dirs, &mut rec).map(|()| 0)
         }),
         None => with_dirs().and_then(|dirs| {
             run_source(
@@ -556,6 +584,8 @@ fn open_in_browser(mut place: Place, abs: &str, dirs: &Dirs, rec: &mut Record) -
         }
         None => std::sync::Arc::new(|| Ok(Box::new(LocalFs::new()) as Box<dyn RemoteFs + Send>)),
     };
+    // F4's launch takes `remote` with it; the browser's start names the host from this copy.
+    let host = remote.clone();
     let launch: gui::browser::Launch = std::sync::Arc::new(move |path: &str, is_dir: bool| {
         let editor = zed::choose(
             remote.is_some(),
@@ -582,21 +612,37 @@ fn open_in_browser(mut place: Place, abs: &str, dirs: &Dirs, rec: &mut Record) -
         }
         Ok(line)
     });
-    let (fs, _, label) = place.into_parts(dirs);
-    let start = gui::browser::Start {
-        fs,
-        connect,
-        label,
-        abs: abs.to_string(),
-        cache: dirs.cache.clone(),
-        launch,
-    };
+    let (fs, _, _) = place.into_parts(dirs);
+    let start = browser_start(fs, connect, launch, host.as_ref(), abs, dirs);
     let outcome = gui::browser::open(start, &hooks)?;
     rec.action = Some(outcome.action());
     rec.conflict = outcome.conflict;
     match outcome.refused {
         Some(message) => Err(Refused(message).into()),
         None => Ok(()),
+    }
+}
+
+/// What the browser starts from: the folder's connection and how to open more, the host (`None`
+/// on this machine) both as results are printed (`label`, an IPv6 host bracketed) and as `ssh`
+/// takes it (`destination`, unbracketed), the folder, and sopen's cache and state folders.
+fn browser_start(
+    fs: Box<dyn RemoteFs + Send>,
+    connect: gui::browser::Connect,
+    launch: gui::browser::Launch,
+    remote: Option<&RemoteSpec>,
+    abs: &str,
+    dirs: &Dirs,
+) -> gui::browser::Start {
+    gui::browser::Start {
+        fs,
+        connect,
+        label: remote.map(RemoteSpec::label),
+        destination: remote.map(RemoteSpec::destination),
+        abs: abs.to_string(),
+        cache: dirs.cache.clone(),
+        state_dir: dirs.state.clone(),
+        launch,
     }
 }
 
@@ -1000,6 +1046,167 @@ fn run_cut(
     Ok(())
 }
 
+/// `sopen stems SOURCE [--model PATH]` (spec §7a): the shape and rules of `sopen cut` — local or
+/// `host:path`, a remote file fetched into the cache, always on this machine — then the voice
+/// and the music published next to SOURCE as new files, their paths printed voice first.
+/// `(work_dir, wait_to_publish)` = the hidden flags of the window's child
+/// ([`stems::spawn_child`]): the parent's work folder, and the go-ahead before publishing.
+fn run_stems(
+    arg: &str,
+    model: Option<&Path>,
+    (work_dir, wait_to_publish): (Option<&Path>, bool),
+    dirs: &Dirs,
+    rec: &mut Record,
+) -> Result<()> {
+    rec.action = Some("stems");
+    if !stems::AVAILABLE {
+        bail!("this sopen was built without voice/music separation (cargo feature `stems`)");
+    }
+    // The window's child: its parent's work folder must be what the parent made — an empty
+    // folder — since a parent that goes away has it removed whole. From here on, the end of
+    // stdin before the go-ahead stops the child.
+    let parent = match work_dir.filter(|_| wait_to_publish) {
+        Some(work) => {
+            let empty = std::fs::symlink_metadata(work).is_ok_and(|m| m.is_dir())
+                && std::fs::read_dir(work).is_ok_and(|mut d| d.next().is_none());
+            if !empty {
+                bail!("--work-dir {} is not an empty folder", work.display());
+            }
+            let input = std::io::BufReader::new(std::io::stdin());
+            Some(stems::child::watch_parent(input, Some(work.to_path_buf())))
+        }
+        None => None,
+    };
+    let tools = ffmpeg::resolve()?;
+    // Checked before anything is fetched: a missing model wastes no download.
+    let exe = std::env::current_exe().and_then(|e| e.canonicalize()).ok();
+    let model = stems::find_model(model, std::env::var_os(stems::MODEL_ENV), exe.as_deref())?;
+    let target = target::parse(arg).map_err(anyhow::Error::msg)?;
+    let (mut place, path) = Place::connect(&target, dirs, rec)?;
+    let abs = place.fs().realpath(&path)?;
+    let stat = place.fs().stat(&abs)?;
+    let (dir, name) = remote::split_parent(&abs);
+    let (dir, name) = (dir.to_string(), name.to_string());
+    if stat.is_dir {
+        bail!("{} is a directory", place.display(&abs));
+    }
+    rec.kind = Some(stems::media_kind_of(&name)?);
+    rec.ext = kind::extension(&name);
+    rec.bytes = stat.size;
+    // A fetched source stays claimed until both stems are published.
+    let (src, _claim) = match place {
+        Place::Local(_) => (PathBuf::from(&abs), None),
+        Place::Remote(..) => {
+            let fetched = fetch_to_cache(&mut place, &abs, dirs, rec)?;
+            (fetched.claim.local.clone(), Some(fetched.claim))
+        }
+    };
+    // Its own work folder holds a job lock while it runs: a stems run killed (Ctrl-C) leaves the
+    // folder to the next start's sweep, which goes first. A window's child works in the
+    // window's folder, locked by the window.
+    let (work, job) = match work_dir {
+        Some(work) => (work.to_path_buf(), None),
+        None => {
+            cache::sweep_stale_jobs(&dirs.cache);
+            let work = cache::exports_root(&dirs.cache).join(remote::random_hex());
+            let job = cache::JobLock::take(&work)?;
+            cache::private_dir(&work)?;
+            (work, Some(job))
+        }
+    };
+    let owned = job.is_some();
+    let result = separate(
+        &mut place,
+        &tools,
+        &model,
+        &src,
+        &dir,
+        &name,
+        &work,
+        parent.as_ref(),
+    );
+    if owned {
+        let _ = std::fs::remove_dir_all(&work);
+    } else {
+        // The parent's folder, empty again: gone even if the parent is.
+        let _ = std::fs::remove_dir(&work);
+    }
+    drop(job);
+    let published = result?;
+    println!("{}", place.display(&remote::join(&dir, &published.voice)));
+    println!("{}", place.display(&remote::join(&dir, &published.music)));
+    for note in &published.notes {
+        eprintln!("sopen: {note}");
+    }
+    Ok(())
+}
+
+#[cfg(feature = "stems")]
+#[allow(clippy::too_many_arguments)]
+fn separate(
+    place: &mut Place,
+    tools: &ffmpeg::Tools,
+    model: &Path,
+    src: &Path,
+    dir: &str,
+    name: &str,
+    work: &Path,
+    parent: Option<&std::sync::mpsc::Receiver<String>>,
+) -> Result<stems::Published> {
+    // One line per finished piece on stderr, parseable (`stems::PieceProgress`): the window
+    // reads them from its child. A terminal sees one line updated in place.
+    let tty = std::io::stderr().is_terminal();
+    let mut shown = false;
+    let mut progress = |p: &stems::PieceProgress| {
+        if tty {
+            eprint!("\r\x1b[2K{}", p.line());
+            shown = true;
+        } else {
+            eprintln!("{}", p.line());
+        }
+        let _ = std::io::stderr().flush();
+    };
+    let mut before_publish = || -> Result<()> {
+        if let Some(parent) = parent {
+            eprintln!("{}", stems::READY_LINE);
+            let line = parent.recv().unwrap_or_default();
+            stems::child::go_ahead(&line)?;
+        }
+        Ok(())
+    };
+    let result = stems::separate_and_publish(
+        place.fs(),
+        tools,
+        model,
+        src,
+        dir,
+        name,
+        &stems::Options::default(),
+        work,
+        &mut before_publish,
+        &mut progress,
+    );
+    if shown {
+        eprintln!();
+    }
+    result
+}
+
+#[cfg(not(feature = "stems"))]
+#[allow(clippy::too_many_arguments)]
+fn separate(
+    _: &mut Place,
+    _: &ffmpeg::Tools,
+    _: &Path,
+    _: &Path,
+    _: &str,
+    _: &str,
+    _: &Path,
+    _: Option<&std::sync::mpsc::Receiver<String>>,
+) -> Result<stems::Published> {
+    unreachable!("run_stems refuses first without the `stems` feature")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1062,6 +1269,36 @@ mod tests {
         ])
         .unwrap();
         assert!(matches!(cli.cmd, Some(Cmd::Cut { ref end, .. }) if end == "0:03"));
+        let cli =
+            Cli::try_parse_from(["sopen", "stems", "box:/a.mp3", "--model", "/m.onnx"]).unwrap();
+        assert!(matches!(
+            cli.cmd,
+            Some(Cmd::Stems { ref target, model: Some(ref m), work_dir: None, wait_to_publish: false })
+                if target == "box:/a.mp3" && m == Path::new("/m.onnx")
+        ));
+        // As the window starts its child (stems::spawn_child): SOURCE after `--`.
+        let cli = Cli::try_parse_from([
+            "sopen",
+            "stems",
+            "--work-dir",
+            "/c/.exports/stems-1",
+            "--wait-to-publish",
+            "--",
+            "-a.mp3",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.cmd,
+            Some(Cmd::Stems { ref target, work_dir: Some(_), wait_to_publish: true, .. })
+                if target == "-a.mp3"
+        ));
+        assert!(Cli::try_parse_from(["sopen", "stems"]).is_err());
+        assert!(Cli::try_parse_from(["sopen", "stems", "a.mp3", "b.mp3"]).is_err());
+        assert!(Cli::try_parse_from(["sopen", "--target", "box", "stems", "a.mp3"]).is_err());
+        assert!(Cli::try_parse_from(["sopen", "--here", "stems", "a.mp3"]).is_err());
+        // The child's two flags come together.
+        assert!(Cli::try_parse_from(["sopen", "stems", "--work-dir", "/w", "a.mp3"]).is_err());
+        assert!(Cli::try_parse_from(["sopen", "stems", "--wait-to-publish", "a.mp3"]).is_err());
         assert!(Cli::try_parse_from(["sopen"]).is_err());
     }
 
@@ -1094,6 +1331,39 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(folder_run(&shot, true), FolderRun::Browser);
+    }
+
+    /// The browser's start names an IPv6 host unbracketed for ssh (`destination`) and bracketed
+    /// for what it prints (`label`), and carries sopen's state folder, where the ssh master's
+    /// socket is; on this machine it names no host.
+    #[test]
+    fn the_browser_start_carries_the_ssh_destination_and_the_state_dir() {
+        let Target::Remote(spec) = target::parse("me@[::1]:/x").unwrap() else {
+            panic!("a remote target")
+        };
+        let dirs = Dirs {
+            cache: PathBuf::from("/c"),
+            state: PathBuf::from("/s"),
+        };
+        let connect: gui::browser::Connect =
+            std::sync::Arc::new(|| Ok(Box::new(LocalFs::new()) as Box<dyn RemoteFs + Send>));
+        let launch: gui::browser::Launch =
+            std::sync::Arc::new(|_: &str, _: bool| Ok(String::new()));
+        let start = browser_start(
+            Box::new(LocalFs::new()),
+            connect.clone(),
+            launch.clone(),
+            Some(&spec),
+            "/x",
+            &dirs,
+        );
+        assert_eq!(start.destination.as_deref(), Some("me@::1"));
+        assert_eq!(start.label.as_deref(), Some("me@[::1]"));
+        assert_eq!((start.abs.as_str(), &start.cache), ("/x", &dirs.cache));
+        assert_eq!(start.state_dir, dirs.state);
+        let start = browser_start(Box::new(LocalFs::new()), connect, launch, None, "/x", &dirs);
+        assert_eq!((start.label, start.destination), (None, None));
+        assert_eq!(start.state_dir, dirs.state);
     }
 
     #[test]

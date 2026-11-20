@@ -12,7 +12,8 @@ is installed (remote ones only with its Remote - SSH extension), otherwise Zed's
 audio open in sopen's own small window with exactly these edits: rectangle crop, rectangle pixelize and clipboard
 copy / cut / paste (images: cut leaves the background colour; paste lays a picture — stretched, fitted or 1:1 — or
 text into the rectangle), rectangle crop, time cut and cut / copy / paste on the timeline (video), time cut,
-cut / copy / paste and Mono → Stereo (audio). Any other file (a zip, any binary) opens a dialog before
+cut / copy / paste and Mono → Stereo (audio), and — as a command, `sopen stems` — voice / music separation into
+two new files (spec §7a). Any other file (a zip, any binary) opens a dialog before
 anything is downloaded: sopen's hex window (the default; byte overwrite only) or "Save to…" a chosen path;
 `--hex` opens any file in the hex window. It opens on the machine it was typed on, or — with `--target HOST`,
 `SOPEN_TARGET` or `target` in sopen's config — on HOST's screen, by running HOST's installed sopen with `--here`
@@ -32,7 +33,11 @@ A change is done when the gate is green on macOS and Linux (CI) and, for anythin
 exists: a command output or a window screenshot that someone actually looked at. Locally, tests that need ffmpeg,
 zsh, fish, node or OpenSSH's `sftp-server` skip with a note when it is missing; CI installs them (node is on the
 runners, `sftp-server` on macOS) and sets `SOPEN_REQUIRE_FFMPEG=1`, `SOPEN_REQUIRE_SHELLS=1`,
-`SOPEN_REQUIRE_NODE=1` and `SOPEN_REQUIRE_SFTP_SERVER=1`, so there they fail instead.
+`SOPEN_REQUIRE_NODE=1` and `SOPEN_REQUIRE_SFTP_SERVER=1`, so there they fail instead. The separation tests
+(`sopen stems`) need the model: they skip unless `SOPEN_STEMS_MODEL` names it; CI downloads it (cached, its
+SHA-256 checked) and sets `SOPEN_REQUIRE_STEMS=1`. The default build links sherpa-onnx (feature `stems`,
+downloaded and checked by build.rs; `SHERPA_ONNX_LIB_DIR` for offline builds); `cargo build
+--no-default-features` builds without it.
 
 ## Rules
 
@@ -50,15 +55,19 @@ runners, `sftp-server` on macOS) and sets `SOPEN_REQUIRE_FFMPEG=1`, `SOPEN_REQUI
   `posix-rename@openssh.com` (`.prd/04-file-keys.md` §5).
 - **Edit features come only from owner messages.** The viewers' edits are the list above (owner, 2026-11-11;
   hex overwrite added by spec §1 message 9; image clipboard copy / cut / paste by message 12; media cut / copy /
-  paste and audio Mono → Stereo by message 13), and the viewers keep exactly those. The browser's own edits come
-  from spec §1 messages 13–16: rename, copy, move, make folder and delete (message 15, `.prd/04-file-keys.md`)
-  and the git panel's actions on a repository, every history rewrite or destructive one backed up first (message
-  14, `.prd/03-git-panel.md`). Anything beyond them waits for an owner message.
+  paste, audio Mono → Stereo and voice / music separation, `sopen stems`, by message 13), and the viewers keep
+  exactly those. The browser's own edits come from spec §1 messages 13–16: rename, copy, move, make folder and
+  delete (message 15, `.prd/04-file-keys.md`) and the git panel's actions on a repository, every history rewrite
+  or destructive one backed up first (message 14, `.prd/03-git-panel.md`). Anything beyond them waits for an
+  owner message.
 - **ffmpeg/ffprobe are external programs**, resolved at runtime (`SOPEN_FFMPEG` / `SOPEN_FFPROBE`, then PATH).
-  Do not link libav*. Versions differ in how they *decode* AAC trims a file carries: ffmpeg 9 applies an MP4 edit
-  list's end and Matroska's CodecDelay, ffmpeg 8 (Ubuntu 26.04's, the CI Linux runner's) applies neither — both
-  write the same trims. The render tests therefore hold an AAC render to a plain encode of the same sample count by
-  the same ffmpeg (`pcm_as_plain` in `src/cut/edit_tests.rs`), and read frames with `-fps_mode passthrough`.
+  Do not link libav*. The one linked engine is sherpa-onnx (with ONNX Runtime), statically, for `sopen stems`;
+  its licences and those of what it brings are `THIRD-PARTY-NOTICES`, which must say what the binary links.
+  The separation model is never in the repo or the release assets (the formula's resource; spec §7a).
+  ffmpeg versions differ in how they *decode* AAC trims a file carries: ffmpeg 9 applies an MP4 edit list's end
+  and Matroska's CodecDelay, ffmpeg 8 (Ubuntu 26.04's, the CI Linux runner's) applies neither — both write the
+  same trims. The render tests therefore hold an AAC render to a plain encode of the same sample count by the
+  same ffmpeg (`pcm_as_plain` in `src/cut/edit_tests.rs`), and read frames with `-fps_mode passthrough`.
 - Tests must not need ssh or a network: the remote layer sits behind a trait with a local-filesystem
   implementation used by tests.
 - Public repo hygiene: no machine names, IP addresses, home-directory paths or session scratch paths in
@@ -108,15 +117,18 @@ remote `/tmp/sopen-receipts/` directory created for the purpose.
   `.github/scripts/tests/apt-install.test.sh` (no apt, no network), run by `ci.yml` on Linux.
 - `preview.yml` — every main push: gate, then macOS arm64/x86_64 and Linux x86_64/aarch64 binaries (Linux built
   on `ubuntu-22.04` / `ubuntu-22.04-arm` for an older glibc floor), a `preview-<YYYY-MM-DD-HHMM>-<sha12>`
-  prerelease, and the tap's `Formula/sopen-preview.rb`.
+  prerelease (the binaries and `THIRD-PARTY-NOTICES`), and the tap's `Formula/sopen-preview.rb`.
 - `release.yml` — `v*` tag equal to the Cargo version (tagging is the owner's call): gate, the same four
   binaries, a stable release, then the tap's `Formula/sopen.rb`.
 - Tap bump = `.github/scripts/bump-tap.sh` (regression test `.github/scripts/tests/bump-tap.test.sh`): renders
   `Formula/<name>.rb` from this repo's `packaging/homebrew/<name>.rb.tmpl` with the sha256s of the published
-  assets and pushes only that file to `2lab-ai/homebrew-tap`. The tap holds no templates.
+  assets (the four binaries and `THIRD-PARTY-NOTICES`) and pushes only that file to `2lab-ai/homebrew-tap`.
+  The tap holds no templates. The separation model is a `resource` with its own fixed url and sha256 in the
+  templates, staged into the formula's `pkgshare`.
   - With the repo secret `TAP_DISPATCH_TOKEN`: the workflow pushes the formula; a failed bump fails the job.
   - Without it: the bump job only prints a notice and the tap is not touched. The dispatcher then pushes the
     rendered formula to the tap by hand: download the release assets into `release/`, and from a checkout of
     the released commit run `FORMULA=<sopen-preview|sopen> TAG=<tag> [BUILD_ID=<build id>] GH_TOKEN=<token
     that can push the tap> .github/scripts/bump-tap.sh`.
-- Install: `brew install 2lab-ai/tap/sopen-preview`. The formula depends on `ffmpeg`.
+- Install: `brew install 2lab-ai/tap/sopen-preview`. The formula depends on `ffmpeg`, installs the separation
+  model into `pkgshare` and `THIRD-PARTY-NOTICES` into the keg.

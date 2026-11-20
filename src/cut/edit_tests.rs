@@ -693,9 +693,9 @@ fn a_stuck_ffmpeg_is_stopped_by_the_watchdog() {
     assert!(text.ends_with("and was stopped"), "{text}");
 }
 
-/// A render whose ffmpeg prints megabytes of errors — thousands of lines, then one 3 MB line
-/// that never ends — is read to its end and fails saying the end of what it printed, a few
-/// kilobytes at most.
+/// A render whose ffmpeg prints megabytes of errors — thousands of lines, then a 3 MB line, then
+/// its last words — is read to its end and fails saying that last line; what is kept is bounded
+/// ([`ffmpeg::ErrorTail`]).
 #[test]
 fn a_noisy_render_fails_with_its_last_words_bounded() {
     use std::os::unix::fs::PermissionsExt;
@@ -705,7 +705,7 @@ fn a_noisy_render_fails_with_its_last_words_bounded() {
         &fake,
         "#!/bin/sh\n[ \"$1\" = -version ] && exit 0\n\
          i=0; while [ $i -lt 2000 ]; do echo \"noise $i\" >&2; i=$((i+1)); done\n\
-         head -c 3000000 /dev/zero | tr '\\0' x >&2\nprintf 'the end' >&2\nexit 1\n",
+         head -c 3000000 /dev/zero | tr '\\0' x >&2\nprintf '\\nthe end' >&2\nexit 1\n",
     )
     .unwrap();
     std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -717,7 +717,7 @@ fn a_noisy_render_fails_with_its_last_words_bounded() {
     let err = ffmpeg::run_export(&tools, &["out.mp4".into()], 4.0, &mut |_| {}).unwrap_err();
     let text = format!("{err:#}");
     assert!(
-        text.ends_with("xxxthe end"),
+        text.ends_with(": the end"),
         "{}",
         &text[..80.min(text.len())]
     );

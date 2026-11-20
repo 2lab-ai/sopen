@@ -1440,6 +1440,20 @@ pub fn assemble_inline_up_to(
     Ok(args)
 }
 
+/// The encoder arguments an audio export into a `.ext` file uses (as [`export_args`] picks
+/// them): the source's codec (`codec` = its ffprobe `codec_name`), else the container's usual
+/// one. `sopen stems` encodes each stem with them.
+pub fn audio_encoder(codec: Option<&str>, ext: &str) -> Result<Vec<String>> {
+    let ext = ext.to_ascii_lowercase();
+    match codec.and_then(encoder_for_codec) {
+        Some(args) => Ok(args),
+        None => match encoder_for_container(&ext) {
+            Some(args) => Ok(args.iter().map(|a| a.to_string()).collect()),
+            None => bail!("no audio export for .{ext} files"),
+        },
+    }
+}
+
 /// Encoder names (`libx264`, `aac`, …) from `ffmpeg -hide_banner -encoders`.
 pub fn parse_encoders(listing: &str) -> HashSet<String> {
     let mut names = HashSet::new();
@@ -1509,38 +1523,106 @@ pub(crate) fn last_line(text: &str) -> String {
         .to_string()
 }
 
-/// How much of a child's error output is kept: its end, for the error it ends with.
-pub(crate) const STDERR_TAIL: usize = 2048;
+/// The bounded tail of a child's error output: the last `LINES` lines, at most `BYTES` bytes of
+/// them, a line that never ends cut to its first `BYTES` bytes (at a character's edge) and
+/// marked `…`. However much is printed — ffmpeg prints an error per damaged frame for as long as
+/// it runs — the whole stream is read (the child never blocks on a full pipe) and only this
+/// much is kept; only its last line is ever reported.
+#[derive(Debug, Default)]
+pub(crate) struct Tail<const LINES: usize, const BYTES: usize> {
+    pub(crate) lines: std::collections::VecDeque<String>,
+    bytes: usize,
+    partial: Vec<u8>,
+    cut: bool,
+}
 
-/// Reads a child's error output to its end on a thread of its own — all of it, so the child
-/// never blocks on a full pipe — keeping only the last [`STDERR_TAIL`] bytes, however much it
-/// prints (a line that never ends is cut the same way). Joined: that end, as text.
-pub(crate) fn stderr_tail(
-    mut stderr: impl Read + Send + 'static,
-) -> std::thread::JoinHandle<String> {
-    std::thread::spawn(move || {
-        let mut tail: Vec<u8> = Vec::with_capacity(2 * STDERR_TAIL);
-        let mut buf = [0u8; 8192];
+/// What playback, the waveform and a render keep of ffmpeg's error output.
+pub(crate) type ErrorTail = Tail<64, 2048>;
+
+impl<const LINES: usize, const BYTES: usize> Tail<LINES, BYTES> {
+    /// Reads `r` to its end (a read error ends it too), keeping the tail.
+    pub(crate) fn read(mut r: impl Read) -> Self {
+        let mut tail = Self::default();
+        let mut chunk = [0u8; 8192];
         loop {
-            match stderr.read(&mut buf) {
+            match r.read(&mut chunk) {
                 Ok(0) => break,
-                Ok(n) => {
-                    tail.extend_from_slice(&buf[..n]);
-                    if tail.len() > 2 * STDERR_TAIL {
-                        tail.drain(..tail.len() - STDERR_TAIL);
-                    }
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Ok(n) => tail.feed(&chunk[..n]),
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                 Err(_) => break,
             }
         }
-        let mut from = tail.len().saturating_sub(STDERR_TAIL);
-        // From a character's first byte, not the middle of one.
-        while tail.get(from).is_some_and(|b| b & 0xC0 == 0x80) {
-            from += 1;
+        if !tail.partial.is_empty() || tail.cut {
+            tail.end_line();
         }
-        String::from_utf8_lossy(&tail[from..]).trim().to_string()
-    })
+        tail
+    }
+
+    /// [`Tail::read`] on a thread of its own (a child's stderr, read while it runs).
+    pub(crate) fn spawn(r: impl Read + Send + 'static) -> std::thread::JoinHandle<Self> {
+        std::thread::spawn(move || Self::read(r))
+    }
+
+    pub(crate) fn feed(&mut self, mut bytes: &[u8]) {
+        while !bytes.is_empty() {
+            let (part, ended) = match bytes.iter().position(|&b| b == b'\n') {
+                Some(i) => (&bytes[..i], Some(i + 1)),
+                None => (bytes, None),
+            };
+            let room = BYTES.saturating_sub(self.partial.len());
+            self.partial
+                .extend_from_slice(&part[..part.len().min(room)]);
+            self.cut |= part.len() > room;
+            match ended {
+                Some(next) => {
+                    self.end_line();
+                    bytes = &bytes[next..];
+                }
+                None => break,
+            }
+        }
+    }
+
+    pub(crate) fn end_line(&mut self) {
+        if self.cut {
+            // Cut at a character's edge, not inside one.
+            if let Err(e) = std::str::from_utf8(&self.partial) {
+                if e.error_len().is_none() {
+                    self.partial.truncate(e.valid_up_to());
+                }
+            }
+        }
+        let mut line = String::from_utf8_lossy(&self.partial).into_owned();
+        if self.cut {
+            line.push('…');
+        }
+        self.partial.clear();
+        self.cut = false;
+        self.bytes += line.len();
+        self.lines.push_back(line);
+        while self.lines.len() > LINES || (self.bytes > BYTES && self.lines.len() > 1) {
+            if let Some(gone) = self.lines.pop_front() {
+                self.bytes -= gone.len();
+            }
+        }
+    }
+
+    /// The bytes kept (lines and the unfinished one).
+    #[cfg(test)]
+    pub(crate) fn kept(&self) -> usize {
+        self.bytes + self.partial.len()
+    }
+
+    /// The last line with something on it.
+    pub(crate) fn last_line(&self) -> String {
+        self.lines
+            .iter()
+            .rev()
+            .map(|l| l.trim())
+            .find(|l| !l.is_empty())
+            .unwrap_or("no error output")
+            .to_string()
+    }
 }
 
 /// How long a save or export may go without its output advancing before ffmpeg is stopped.
@@ -1721,7 +1803,7 @@ pub fn run_watched(
     // Dies with this run: a sopen killed mid-render (even by SIGKILL) takes its ffmpeg along,
     // instead of leaving it rendering for an hour to a file nobody keeps.
     let _guard = Orphan::guard(&child, &tools.ffmpeg);
-    let errors = stderr_tail(child.stderr.take().expect("piped"));
+    let errors = ErrorTail::spawn(child.stderr.take().expect("piped"));
     // A small queue: while the callback runs (the export-hold hook sleeps in it), the reader
     // stops and ffmpeg blocks on its progress pipe, as it did when this thread read it.
     let (tx, rx) = sync_channel::<std::io::Result<String>>(16);
@@ -1786,7 +1868,7 @@ pub fn run_watched(
     };
     let errors = errors.join().unwrap_or_default();
     if !status.success() {
-        bail!("ffmpeg failed ({status}): {}", last_line(&errors));
+        bail!("ffmpeg failed ({status}): {}", errors.last_line());
     }
     Ok(())
 }

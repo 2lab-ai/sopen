@@ -145,7 +145,10 @@ jobs:
           for asset in sopen-macos-aarch64 sopen-macos-x86_64 sopen-linux-x86_64 sopen-linux-aarch64; do
             cp "artifacts/$asset/$asset" "release/$asset"
           done
-          (cd release && sha256sum sopen-* > SHA256SUMS)
+          # The licences of what the binaries link statically (sherpa-onnx, ONNX Runtime, …);
+          # the formula installs it next to the binary.
+          cp THIRD-PARTY-NOTICES release/THIRD-PARTY-NOTICES
+          (cd release && sha256sum sopen-* THIRD-PARTY-NOTICES > SHA256SUMS)
           cat release/SHA256SUMS
 
       - name: Create release
@@ -159,6 +162,7 @@ jobs:
             release/sopen-macos-x86_64
             release/sopen-linux-x86_64
             release/sopen-linux-aarch64
+            release/THIRD-PARTY-NOTICES
             release/SHA256SUMS
 
   # The tap credential is used only in this job, and only by the bump step.
@@ -186,6 +190,11 @@ jobs:
           pattern: sopen-*
           merge-multiple: true
           path: release
+
+      # The THIRD-PARTY-NOTICES the release job attached: the same commit's file, byte for byte.
+      - name: Add the released notices
+        if: env.HAS_TAP_TOKEN == 'true'
+        run: cp THIRD-PARTY-NOTICES release/THIRD-PARTY-NOTICES
 
       - name: Tap bump skipped (no TAP_DISPATCH_TOKEN)
         if: env.HAS_TAP_TOKEN == 'false'
