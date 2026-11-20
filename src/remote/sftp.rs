@@ -10,9 +10,11 @@
 
 mod ops;
 mod ranged;
+mod writes;
 
 #[cfg(test)]
 pub(crate) use ranged::{SftpRanged, Timing};
+pub(crate) use writes::{Counted, Writes};
 
 use super::ranged::Pipeline;
 use super::{
@@ -52,19 +54,38 @@ pub struct SftpRemote {
     rt: Option<Runtime>,
     sftp: Option<Sftp>,
     fs: Option<Fs>,
+    /// What the session's request pipe has taken (`sftp/writes.rs`).
+    writes: Arc<Writes>,
     /// Stat requests sopen sent (tests: a listing must not stat every name).
     #[cfg(test)]
     stats: u64,
 }
 
-/// How long a queued request waits in the session's write buffer before the flush task writes it:
-/// the crate's own default, named here because the transport waits for it when it hands a
-/// session back with a CLOSE queued (`sftp/ranged.rs`).
-const FLUSH_INTERVAL: Duration = Duration::from_micros(500);
-
-/// Every SFTP session's options.
-fn sftp_options() -> SftpOptions {
-    SftpOptions::default().flush_interval(FLUSH_INTERVAL)
+/// Starts the SFTP subsystem over `session` and the client on it, its request pipe counted by
+/// `writes`. The same steps as the crate's `Sftp::from_clonable_session`, which keeps the pipe to
+/// itself: the subsystem's stdin and stdout piped, stderr discarded. The child is kept as the
+/// session's auxiliary data, which the crate drops only after its flush and read tasks have
+/// ended — the local `ssh` must outlive every byte written to it. Dropping the `Arc<Session>`
+/// with it never stops the shared master: a resumed session does not `-O exit`.
+async fn start_sftp(session: Arc<openssh::Session>, writes: Arc<Writes>) -> Result<Sftp> {
+    let mut child = openssh::Session::to_subsystem(session, "sftp")
+        .stdin(openssh::Stdio::piped())
+        .stdout(openssh::Stdio::piped())
+        .stderr(openssh::Stdio::null())
+        .spawn()
+        .await?;
+    let stdin = child
+        .stdin()
+        .take()
+        .context("the sftp subsystem has no stdin")?;
+    let stdout = child
+        .stdout()
+        .take()
+        .context("the sftp subsystem has no stdout")?;
+    let keep =
+        openssh_sftp_client::SftpAuxiliaryData::Boxed(Box::new(std::sync::Mutex::new(child)));
+    let stdin = Counted::new(stdin, writes);
+    Ok(Sftp::new_with_auxiliary(stdin, stdout, SftpOptions::default(), keep).await?)
 }
 
 /// `Err` = the request got no reply within `limit`.
@@ -106,12 +127,13 @@ impl SftpRemote {
             .enable_all()
             .build()
             .context("cannot start the async runtime")?;
-        // `resume` attaches to our master and never tears it down on drop; `from_clonable_session`
-        // closes only the sftp channel (`from_session` would `-O exit` the shared master).
+        // `resume` attaches to our master and never tears it down on drop; closing the session
+        // closes only the sftp channel (`Session::from_session` would `-O exit` the shared master).
         let session = openssh::Session::resume(config.control_path.into_boxed_path(), None);
+        let writes = Arc::new(Writes::default());
         let started = rt.block_on(within(
             META_TIMEOUT,
-            Sftp::from_clonable_session(Arc::new(session), sftp_options()),
+            start_sftp(Arc::new(session), writes.clone()),
         ));
         let sftp = match started {
             Ok(r) => r.map_err(|e| anyhow!("cannot start sftp on {}: {e}", spec.label()))?,
@@ -135,6 +157,7 @@ impl SftpRemote {
             rt: Some(rt),
             sftp: Some(sftp),
             fs: Some(fs),
+            writes,
             #[cfg(test)]
             stats: 0,
         })
@@ -1055,6 +1078,7 @@ impl SftpRemote {
                 .spawn()
                 .unwrap()
         };
+        let writes = Arc::new(Writes::default());
         let sftp = match proxy {
             None => rt.block_on(async {
                 let mut child = spawn(server);
@@ -1063,7 +1087,8 @@ impl SftpRemote {
                 let keep = openssh_sftp_client::SftpAuxiliaryData::Boxed(Box::new(
                     std::sync::Mutex::new(child),
                 ));
-                Sftp::new_with_auxiliary(stdin, stdout, sftp_options(), keep)
+                let stdin = Counted::new(stdin, writes.clone());
+                Sftp::new_with_auxiliary(stdin, stdout, SftpOptions::default(), keep)
                     .await
                     .unwrap()
             }),
@@ -1090,9 +1115,9 @@ impl SftpRemote {
                     })
                 });
                 rt.block_on(Sftp::new_with_auxiliary(
-                    to_proxy,
+                    Counted::new(to_proxy, writes.clone()),
                     from_proxy,
-                    sftp_options(),
+                    SftpOptions::default(),
                     openssh_sftp_client::SftpAuxiliaryData::None,
                 ))
                 .unwrap()
@@ -1103,8 +1128,14 @@ impl SftpRemote {
             rt: Some(rt),
             sftp: Some(sftp),
             fs: Some(fs),
+            writes,
             stats: 0,
         })
+    }
+
+    /// What this session's request pipe has taken, with its test gate.
+    pub(crate) fn writes(&self) -> Arc<Writes> {
+        self.writes.clone()
     }
 
     /// Stat requests this connection made so far (counted where sopen sends them, in

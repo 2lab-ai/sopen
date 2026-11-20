@@ -1476,7 +1476,7 @@ fn local_names_that_are_not_utf8_list_with_their_own_attributes() {
 // ── Streaming transport (06 §2) ─────────────────────────────────────────────────────────────
 
 use super::ranged::{Pipeline, PIPE_IN_FLIGHT, PIPE_REQUEST};
-use super::sftp::{Proxy, SftpRanged, Timing, Wired};
+use super::sftp::{Proxy, SftpRanged, Timing, Wired, Writes};
 use bytes::Bytes;
 
 /// `len` bytes in which every 8-byte word holds its own offset (the Fake's pattern), so a read
@@ -2135,6 +2135,98 @@ fn giving_the_connection_back_sends_the_close_at_once() {
             "the session works"
         );
     }
+}
+
+/// A transport over the proxy that has read one block, and its session's request pipe.
+fn idle_transport(path: &Path, timing: Timing) -> (SftpRanged, Proxy, std::sync::Arc<Writes>) {
+    let proxy = Proxy::default();
+    let fs = SftpRemote::local_server_with(Some(proxy.clone())).unwrap();
+    let writes = fs.writes();
+    let mut r = Box::new(fs).open_ranged(p(path), timing).unwrap();
+    r.read(0, 65_536);
+    next(&mut r).reply.unwrap();
+    (r, proxy, writes)
+}
+
+/// 06 §2: giving the connection back waits until the handle's CLOSE has been written to the
+/// session's pipe and flushed — observed, not assumed after some scheduler passes. With the pipe
+/// held shut by the test's gate, it returns only after the gate opens (from another thread, 50
+/// ms on), with the CLOSE written; the proxy then sees it. The wait's bound is 60 s here, so
+/// returning at all shows the write, not the bound, ended it.
+#[test]
+fn giving_the_connection_back_waits_for_the_close_to_be_written() {
+    if SftpRemote::local_server().is_none() {
+        return;
+    }
+    let (_tmp, path, _) = four_mib();
+    let timing = Timing {
+        flush: Duration::from_secs(60),
+        ..Timing::default()
+    };
+    let (r, proxy, writes) = idle_transport(&path, timing);
+    let closes = writes.closes();
+    writes.gate.close();
+    let opened = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let opener = {
+        let (writes, opened) = (writes.clone(), opened.clone());
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            opened.store(true, std::sync::atomic::Ordering::SeqCst);
+            writes.gate.open();
+        })
+    };
+    let r: Box<dyn Ranged> = Box::new(r);
+    let conn = watchdog(HANG, move || r.into_connection()).expect("it returned");
+    assert!(
+        opened.load(std::sync::atomic::Ordering::SeqCst),
+        "it returned before the pipe opened"
+    );
+    assert_eq!(
+        writes.closes(),
+        closes + 1,
+        "the CLOSE was written before it returned"
+    );
+    opener.join().unwrap();
+    let seen = eventually(HANG, || {
+        requests_on_the_wire(&proxy).last() == Some(&Wired::CLOSE)
+    });
+    assert!(seen, "the proxy saw the CLOSE");
+    drop(conn);
+}
+
+/// 06 §2: a pipe that stays shut ends the wait at its bound (200 ms) — not before — with the
+/// CLOSE still unwritten; it goes out with the session's next use, ahead of it.
+#[test]
+fn a_shut_pipe_ends_the_wait_at_its_bound() {
+    if SftpRemote::local_server().is_none() {
+        return;
+    }
+    let (_tmp, path, _) = four_mib();
+    let (r, proxy, writes) = idle_transport(&path, Timing::default());
+    let closes = writes.closes();
+    writes.gate.close();
+    let started = std::time::Instant::now();
+    let r: Box<dyn Ranged> = Box::new(r);
+    let conn = watchdog(HANG, move || r.into_connection()).expect("it returned at its bound");
+    assert!(
+        started.elapsed() >= Timing::default().flush,
+        "it returned before its bound: {:?}",
+        started.elapsed()
+    );
+    assert_eq!(
+        writes.closes(),
+        closes,
+        "nothing went through the shut pipe"
+    );
+    let before = requests_on_the_wire(&proxy).len();
+    writes.gate.open();
+    let mut conn = conn;
+    assert_eq!(conn.stat(p(&path)).unwrap().size, 4 << 20);
+    assert_eq!(
+        requests_on_the_wire(&proxy)[before..],
+        [Wired::CLOSE, Wired::STAT],
+        "the CLOSE went out with the next use, ahead of it"
+    );
 }
 
 /// 06 §2: the close drops every clone of the handle before `Sftp::close`, which waits while

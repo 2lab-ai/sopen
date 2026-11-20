@@ -61,10 +61,13 @@ The first two paragraphs are this document. The third is 07.
     caller is as it was: the binary dialog keeps its connection for a retry or "Save to…" (§7.5).
   - **And `Ranged` can give it back.** `into_connection()` closes the handle and returns the
     connection without waiting on the server. What is queued and not yet sent is dropped. The
-    handle's `CLOSE` is written to the session before it returns: the session's runtime is driven
-    for at most 200 ms, for that local write only. Its reply is read by the session's next use, or
-    at `Sftp::close`. `reopen(path)` closes the handle the same way and opens `path` again on the
-    same connection. A cancelled preview uses them to keep the window's preview session (§13).
+    handle's `CLOSE` is written before `into_connection` returns, unless the local pipe stays
+    blocked for 200 ms; then it goes with the session's next use. "Written" is observed, not
+    assumed: the session's request pipe counts the packets it takes, and the wait ends once a
+    whole `CLOSE` has gone in and a flush has completed after it. Its reply is read by the
+    session's next use, or at `Sftp::close`. `reopen(path)` closes the handle the same way and
+    opens `path` again on the same connection. A cancelled preview uses them to keep the window's
+    preview session (§13).
   - The viewer's `Origin` then holds a **placeholder** connection that connects on first use, which
     is 02 §4.4's rule for a previewed window. Save, Save copy, Export and a reconnect are what use it.
   - So viewing costs one SFTP session (§6).
