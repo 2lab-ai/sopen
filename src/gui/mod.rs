@@ -182,8 +182,8 @@ pub enum Op {
 /// seconds. `op` may list several, comma-separated, applied in order. The hex window takes
 /// `at=OFFSET;patch=OFFSET:HEXBYTES[,OFFSET:HEXBYTES]` (offsets `0x…` or decimal); the file
 /// browser `open=NAME`, and `at=OFFSET` for the first text file it opens — by `open=NAME` or by
-/// hand, whichever comes first (the row that byte is in at the top); the image and hex windows
-/// `close=ask`.
+/// hand, whichever comes first (the row that byte is in at the top), `mode=dual|preview` and
+/// `bar=NAME` (02 §9); the image and hex windows `close=ask`; every window `help=1`.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct State {
     pub rect: Option<[u32; 4]>,
@@ -202,6 +202,14 @@ pub struct State {
     /// Image and hex windows: closing is asked for once the state is on screen, so an edit the
     /// state made brings up the unsaved-changes prompt (`close=ask`, the prompt's receipt).
     pub ask_close: bool,
+    /// File browser: the mode it opens in, `mode=dual` or `mode=preview` (the default; 02 §9).
+    pub(crate) mode: browser::view::Mode,
+    /// File browser: the entry of the active panel the bar goes on once it is listed, without
+    /// opening it (`bar=NAME`, a preview's receipt; 02 §9).
+    pub bar: Option<String>,
+    /// Every window: F1 is pressed once what the state asked for is on screen, so the key help
+    /// is what the screenshot shows (`help=1`, F1's receipt).
+    pub help: bool,
 }
 
 impl State {
@@ -243,6 +251,21 @@ impl State {
                 "close" => match value {
                     "ask" => state.ask_close = true,
                     other => bail!("SOPEN_STATE: close must be 'ask' (got '{other}')"),
+                },
+                "mode" => {
+                    state.mode = match value {
+                        "dual" => browser::view::Mode::Dual,
+                        "preview" => browser::view::Mode::Preview,
+                        other => {
+                            bail!("SOPEN_STATE: mode must be 'dual' or 'preview' (got '{other}')")
+                        }
+                    }
+                }
+                "bar" if value.is_empty() => bail!("SOPEN_STATE: bar needs an entry's name"),
+                "bar" => state.bar = Some(value.to_string()),
+                "help" => match value {
+                    "1" => state.help = true,
+                    other => bail!("SOPEN_STATE: help must be 1 (got '{other}')"),
                 },
                 "patch" => {
                     for one in value.split(',').map(str::trim) {
@@ -432,25 +455,127 @@ pub fn hosted(ctx: &egui::Context) -> bool {
     ctx.data(|d| d.get_temp::<Hosted>(hosted_id()).is_some())
 }
 
-/// A window's F-key row at the bottom of `ui` — F3 (closes it, as Cmd/Ctrl+W does) and its own
-/// `keys` — and F3 itself. Nothing while it is hosted: the host's row lists the window's keys
-/// with its own, and its F3 leaves the window. Call it before the window's other bottom panels
-/// (the row is the window's last).
+/// A window's F-key row at the bottom of `ui` — F1 (its key help, [`help`]), F3 (closes it, as
+/// Cmd/Ctrl+W does) and its own `keys` — and F1 and F3 themselves, without modifiers (04 §3
+/// rule 1). Nothing while it is hosted: the host's row lists the window's keys with its own, and
+/// its F1 and F3 are the host's. Call it before the window's other bottom panels (the row is the
+/// window's last).
 pub fn own_keys(ui: &mut egui::Ui, keys: &[chrome::FKey]) {
     let ctx = ui.ctx().clone();
     if hosted(&ctx) {
         return;
     }
-    chrome::key_panel(
-        ui,
-        "sopen-own-keys",
-        &chrome::merged(&[chrome::EXIT_KEY], keys),
-    );
-    // Not while a text field has the keyboard (F3 is not text, but the field is the owner's).
-    if !ctx.text_edit_focused()
-        && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::F3))
-    {
+    let row = chrome::merged(&[chrome::HELP_KEY, chrome::EXIT_KEY], keys);
+    chrome::key_panel(ui, "sopen-own-keys", &row);
+    // Not while a text field has the keyboard (F-keys are not text, but the field is the
+    // owner's).
+    if ctx.text_edit_focused() {
+        return;
+    }
+    let plain = browser::keys::Mods::None;
+    let (help, exit) = ctx.input_mut(|i| {
+        (
+            browser::keys::take(i, egui::Key::F1, plain),
+            browser::keys::take(i, egui::Key::F3, plain),
+        )
+    });
+    if help {
+        help::open(&ctx, help::for_window(&row));
+    }
+    if exit {
         request_close(&ctx);
+    }
+}
+
+/// The shell's raw-input hook (04 §6.1) and the key help's passes, as an egui plugin that
+/// [`chrome::install`] puts into every window's context (the test kit's driver gets it the same
+/// way). Before each pass, once, before any window sees the input: Cmd/Ctrl+1…9, 0 become
+/// F1…F10 and a clicked slot of the F-key row ([`chrome::fkey_row`]) its F-key — plain keys,
+/// so every window and the browser's key table act on them by the F-key's own rules; not while
+/// a text field has the typing (04 §3 rule 4). Then [`help::begin_pass`] before the window's
+/// pass and [`help::end_pass`] after it.
+#[derive(Debug, Default)]
+pub(crate) struct FKeyInput {
+    /// The digits whose press became an F-key and that are still down: their release lets go
+    /// of the F-key, whatever modifiers are still held then.
+    held: [bool; 10],
+}
+
+impl egui::Plugin for FKeyInput {
+    fn debug_name(&self) -> &'static str {
+        "sopen-fkeys"
+    }
+
+    fn input_hook(&mut self, ctx: &egui::Context, input: &mut egui::RawInput) {
+        // The focus as the last pass left it: what has the typing now.
+        let typing = ctx.text_edit_focused();
+        let clicked = chrome::take_clicked(ctx);
+        fkey_events(&mut input.events, &mut self.held, typing, clicked);
+    }
+
+    fn on_begin_pass(&mut self, ui: &mut egui::Ui) {
+        help::begin_pass(ui.ctx());
+    }
+
+    fn on_end_pass(&mut self, ui: &mut egui::Ui) {
+        help::end_pass(ui.ctx());
+    }
+}
+
+/// The F-key events of a pass (see [`FKeyInput`]): each press of a digit with exactly Cmd/Ctrl
+/// is that F-key pressed without modifiers, and its release the F-key's. The digit is the
+/// physical key's first, so on a layout whose digits need Shift, Cmd/Ctrl and the key printed 5
+/// still make F5. `clicked` adds a press and a release of its F-key.
+fn fkey_events(
+    events: &mut Vec<egui::Event>,
+    held: &mut [bool; 10],
+    typing: bool,
+    clicked: Option<u8>,
+) {
+    use egui::Key::*;
+    let digit = |key: egui::Key| -> Option<u8> {
+        let n = [Num1, Num2, Num3, Num4, Num5, Num6, Num7, Num8, Num9, Num0]
+            .iter()
+            .position(|k| *k == key)?;
+        Some(n as u8 + 1)
+    };
+    for event in events.iter_mut() {
+        let egui::Event::Key {
+            key,
+            physical_key,
+            pressed,
+            modifiers,
+            ..
+        } = event
+        else {
+            continue;
+        };
+        let Some(n) = physical_key.and_then(digit).or_else(|| digit(*key)) else {
+            continue;
+        };
+        let slot = usize::from(n - 1);
+        let alias = if *pressed {
+            !typing && browser::keys::Mods::Command.matches(*modifiers)
+        } else {
+            held[slot]
+        };
+        if alias {
+            held[slot] = *pressed;
+            *key = chrome::fkey(n).expect("F1…F10");
+            *physical_key = None;
+            *modifiers = egui::Modifiers::NONE;
+        }
+    }
+    if let Some(key) = clicked.filter(|_| !typing).and_then(chrome::fkey) {
+        for pressed in [true, false] {
+            events.push(egui::Event::Key {
+                key,
+                physical_key: None,
+                pressed,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            });
+        }
     }
 }
 
@@ -507,6 +632,20 @@ struct Shell<W: Window> {
     /// When the first focus request went out.
     focus_asked: Option<Instant>,
     raise: Raise,
+    /// `help=1`: F1 is pressed once the window is ready.
+    press: Press,
+}
+
+/// The `help=1` receipt: F1 pressed once what the state asked for is on screen, then the
+/// screenshot waits for the frames after it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Press {
+    /// Until the window is ready.
+    Waiting,
+    /// In the next pass's input.
+    Now,
+    /// Pressed, or never asked for.
+    Done,
 }
 
 /// How long the window may take to report focus after the first focus request.
@@ -576,7 +715,7 @@ impl<W: Window> Shell<W> {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             return;
         }
-        if !self.inner.ready() {
+        if !self.inner.ready() || self.press != Press::Done {
             shot.ready_frames = 0;
             return;
         }
@@ -632,6 +771,18 @@ impl<W: Window> eframe::App for Shell<W> {
             // the owner is using while a receipt window flashes up must not edit it.
             raw.events.clear();
         }
+        if self.press == Press::Now {
+            self.press = Press::Done;
+            for pressed in [true, false] {
+                raw.events.push(egui::Event::Key {
+                    key: egui::Key::F1,
+                    physical_key: None,
+                    pressed,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                });
+            }
+        }
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
@@ -671,6 +822,10 @@ impl<W: Window> eframe::App for Shell<W> {
         }
         closing(&ctx, &mut self.inner, self.scripted);
         self.inner.ui(ui);
+        if self.press == Press::Waiting && self.inner.ready() {
+            self.press = Press::Now;
+            ctx.request_repaint();
+        }
         self.screenshot_tick(&ctx);
     }
 }
@@ -783,6 +938,11 @@ pub fn run_window_sized<W: Window + 'static>(
         started: Instant::now(),
         focus_asked: None,
         raise: Raise::Waiting,
+        press: if hooks.state.help {
+            Press::Waiting
+        } else {
+            Press::Done
+        },
     };
     // The app moves into whichever renderer starts. A renderer that fails before creating the
     // app leaves it here for the next one.
@@ -974,6 +1134,36 @@ mod tests {
         assert!(Choice::parse("Hex").is_err());
     }
 
+    /// The receipt keys of slice S1 (02 §9): `mode=`, `bar=`, and `help=1`; anything else is
+    /// refused, as every key is.
+    #[test]
+    fn browser_state_keys_parse() {
+        use browser::view::Mode;
+        assert_eq!(State::default().mode, Mode::Preview);
+        assert_eq!(State::parse("mode=dual").unwrap().mode, Mode::Dual);
+        assert_eq!(State::parse("mode=preview").unwrap().mode, Mode::Preview);
+        let s = State::parse("bar=main.rs;mode=dual;help=1").unwrap();
+        assert_eq!(
+            (s.bar.as_deref(), s.mode, s.help),
+            (Some("main.rs"), Mode::Dual, true)
+        );
+        assert_eq!(
+            State::parse("bar=a b=c.txt").unwrap().bar.as_deref(),
+            Some("a b=c.txt")
+        );
+        assert!(!State::parse("bar=x").unwrap().help);
+        for bad in [
+            "mode=tree",
+            "mode=",
+            "mode=Dual",
+            "bar=",
+            "help=0",
+            "help=yes",
+        ] {
+            assert!(State::parse(bad).is_err(), "{bad}");
+        }
+    }
+
     #[test]
     fn edited_name_keeps_the_extension() {
         assert_eq!(edited_name("shot.png"), "shot.edited.png");
@@ -1080,6 +1270,317 @@ mod tests {
             drv.frame(&mut w, Vec::new(), egui::Modifiers::NONE);
             assert_eq!(drv.texts(), before, "set_preview({on})");
         }
+    }
+
+    /// Cmd/Ctrl as this machine's backend reports it: ⌘ (`mac_cmd` + `command`) on macOS, Ctrl
+    /// (`ctrl` + `command`) elsewhere.
+    fn real_command() -> egui::Modifiers {
+        if cfg!(target_os = "macos") {
+            egui::Modifiers {
+                mac_cmd: true,
+                command: true,
+                ..Default::default()
+            }
+        } else {
+            egui::Modifiers {
+                ctrl: true,
+                command: true,
+                ..Default::default()
+            }
+        }
+    }
+
+    /// The real file browser on a folder holding `main.rs` and `notes.txt`, its F4 recorded.
+    struct BrowserFx {
+        _tmp: tempfile::TempDir,
+        root: String,
+        drv: testkit::Driver,
+        b: browser::Browser,
+        launched: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl BrowserFx {
+        fn new() -> Self {
+            let tmp = tempfile::tempdir().unwrap();
+            let root = std::fs::canonicalize(tmp.path()).unwrap().join("root");
+            std::fs::create_dir(&root).unwrap();
+            std::fs::write(root.join("main.rs"), "fn main() {}\n").unwrap();
+            std::fs::write(root.join("notes.txt"), "plain notes\n").unwrap();
+            let root = root.to_str().unwrap().to_string();
+            let launched: Arc<Mutex<Vec<String>>> = Arc::default();
+            let record = launched.clone();
+            let b = browser::Browser::new(browser::Start {
+                fs: Box::new(crate::remote::LocalFs::new()),
+                connect: Arc::new(|| {
+                    Ok(Box::new(crate::remote::LocalFs::new()) as Box<dyn RemoteFs + Send>)
+                }),
+                label: None,
+                destination: None,
+                abs: root.clone(),
+                cache: tmp.path().join("cache"),
+                state_dir: tmp.path().join("state"),
+                launch: Arc::new(move |abs: &str, _is_dir: bool| {
+                    record.lock().unwrap().push(abs.to_string());
+                    Ok(format!("opened {abs}"))
+                }),
+            });
+            let mut fx = Self {
+                _tmp: tmp,
+                root,
+                drv: testkit::Driver::new(1000.0, 700.0),
+                b,
+                launched,
+            };
+            fx.settle();
+            fx
+        }
+
+        /// A pass (the row is drawn before the keys of its pass act: the next one shows what
+        /// they did), then passes until the browser is ready.
+        fn settle(&mut self) {
+            self.drv.idle(&mut self.b, 1);
+            self.drv.until(&mut self.b, 20, |b| b.ready());
+        }
+
+        /// The bar on `main.rs` (the jump letter).
+        fn bar_on_main(&mut self) {
+            self.drv.frame(
+                &mut self.b,
+                vec![egui::Event::Text("m".into())],
+                egui::Modifiers::NONE,
+            );
+            self.drv.idle(&mut self.b, 1);
+        }
+
+        /// Whether the viewer is open: its row has Exit, the list's View is gone.
+        fn viewer(&self) -> bool {
+            let exit = self.drv.find_text("Exit   ").is_some();
+            assert_ne!(exit, self.drv.find_text("View   ").is_some(), "one row");
+            exit
+        }
+
+        fn edited(&mut self) -> Vec<String> {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while self.launched.lock().unwrap().is_empty() && Instant::now() < deadline {
+                self.drv.idle(&mut self.b, 1);
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            self.launched.lock().unwrap().clone()
+        }
+    }
+
+    /// 04 §6.1, K-R2: in the real browser, Cmd/Ctrl+3 is F3 (the viewer opens; in it, F3 leaves)
+    /// and Cmd/Ctrl+4 is F4 (the editor) — the shell turns them into the plain F-key before the
+    /// window's pass. Only exactly Cmd/Ctrl: with Shift or Alt it is nothing.
+    #[test]
+    fn cmd_digits_are_f_keys_in_a_real_window() {
+        let mut fx = BrowserFx::new();
+        fx.bar_on_main();
+        assert!(!fx.viewer());
+        for extra in [egui::Modifiers::SHIFT, egui::Modifiers::ALT] {
+            fx.drv
+                .key(&mut fx.b, egui::Key::Num3, real_command() | extra);
+            fx.settle();
+            assert!(!fx.viewer(), "{extra:?}: no row");
+        }
+        fx.drv.key(&mut fx.b, egui::Key::Num3, real_command());
+        fx.settle();
+        assert!(fx.viewer(), "Cmd/Ctrl+3 = F3 opened main.rs");
+        assert!(fx.drv.find_text("fn main() {}").is_some());
+        // The test kit's own Cmd/Ctrl (`command` alone) is the same key.
+        fx.drv
+            .key(&mut fx.b, egui::Key::Num3, egui::Modifiers::COMMAND);
+        fx.settle();
+        assert!(!fx.viewer(), "F3 in the viewer: back to the list");
+        fx.drv.key(&mut fx.b, egui::Key::Num4, real_command());
+        assert_eq!(fx.edited(), [format!("{}/main.rs", fx.root)]);
+    }
+
+    /// 04 §6.1, K-R2: a click on a slot of the real browser's row is its key: View opens the
+    /// file, Exit leaves the viewer, Edit opens the editor; an empty slot is nothing.
+    #[test]
+    fn a_click_on_a_slot_is_its_key_in_a_real_window() {
+        let mut fx = BrowserFx::new();
+        fx.bar_on_main();
+        let (_, empty) = chrome::key_slot(0.0, 1000.0, 7);
+        fx.drv
+            .click(&mut fx.b, egui::Pos2::new(empty.center().x, 700.0 - 8.0));
+        fx.settle();
+        assert!(!fx.viewer());
+        fx.drv.click_text(&mut fx.b, "View   ");
+        fx.settle();
+        assert!(fx.viewer(), "the View slot opened main.rs");
+        fx.drv.click_text(&mut fx.b, "Exit   ");
+        fx.settle();
+        assert!(!fx.viewer(), "the Exit slot left it");
+        fx.drv.click_text(&mut fx.b, "Edit   ");
+        assert_eq!(fx.edited(), [format!("{}/main.rs", fx.root)]);
+    }
+
+    /// A field with the typing and an F5 handler that counts.
+    struct Field {
+        text: String,
+        focus: bool,
+        f5: usize,
+    }
+
+    impl Window for Field {
+        fn ui(&mut self, ui: &mut egui::Ui) {
+            let resp = ui.add(chrome::field(&mut self.text));
+            if self.focus {
+                resp.request_focus();
+            } else {
+                resp.surrender_focus();
+            }
+            self.f5 +=
+                ui.input_mut(|i| i.count_and_consume_key(egui::Modifiers::NONE, egui::Key::F5));
+        }
+
+        fn ready(&self) -> bool {
+            true
+        }
+    }
+
+    /// 04 §3 rule 4, §6.1: while a field has the typing Cmd/Ctrl+5 is not F5; once it has not,
+    /// it is.
+    #[test]
+    fn cmd_digits_wait_while_a_field_has_the_typing() {
+        let mut drv = testkit::Driver::new(400.0, 200.0);
+        let mut win = Field {
+            text: "name".into(),
+            focus: true,
+            f5: 0,
+        };
+        drv.idle(&mut win, 2);
+        assert!(drv.ctx.text_edit_focused());
+        drv.key(&mut win, egui::Key::Num5, real_command());
+        assert_eq!((win.f5, win.text.as_str()), (0, "name"));
+        win.focus = false;
+        drv.idle(&mut win, 2);
+        assert!(!drv.ctx.text_edit_focused());
+        drv.key(&mut win, egui::Key::Num5, real_command());
+        assert_eq!(win.f5, 1);
+        // Released with Cmd/Ctrl let go first: the F-key is let go too (not left down).
+        drv.frame(
+            &mut win,
+            vec![egui::Event::Key {
+                key: egui::Key::Num5,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: real_command(),
+            }],
+            real_command(),
+        );
+        drv.frame(
+            &mut win,
+            vec![egui::Event::Key {
+                key: egui::Key::Num5,
+                physical_key: None,
+                pressed: false,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            egui::Modifiers::NONE,
+        );
+        assert_eq!(win.f5, 2);
+        assert!(!drv.ctx.input(|i| i.key_down(egui::Key::F5)), "F5 let go");
+    }
+
+    /// A window of its own with the hex window's keys: what reaches its pass is counted.
+    struct Own {
+        f8: usize,
+        typed: String,
+        clicks: usize,
+    }
+
+    impl Window for Own {
+        fn ui(&mut self, ui: &mut egui::Ui) {
+            own_keys(ui, chrome::HEX_KEYS);
+            egui::CentralPanel::default().show(ui, |ui| {
+                if ui.button("press me").clicked() {
+                    self.clicks += 1;
+                }
+            });
+            ui.input_mut(|i| {
+                self.f8 += i.count_and_consume_key(egui::Modifiers::NONE, egui::Key::F8);
+                for e in &i.events {
+                    if let egui::Event::Text(t) = e {
+                        self.typed.push_str(t);
+                    }
+                }
+            });
+        }
+
+        fn ready(&self) -> bool {
+            true
+        }
+    }
+
+    /// 04 §2 slot 1: F1 in a window of its own shows its key help over it — its row's keys,
+    /// described — and the window gets no key, text or click meanwhile; Esc (or F1, F3) closes
+    /// the help, and F3 then closes the window. The Help slot and Cmd/Ctrl+1 open it too.
+    #[test]
+    fn f1_shows_the_key_help_over_a_window_of_its_own() {
+        let cmd = browser::keys::command_name();
+        let save = format!("Save (as {cmd}+S)");
+        let mut drv = testkit::Driver::new(800.0, 400.0);
+        let mut win = Own {
+            f8: 0,
+            typed: String::new(),
+            clicks: 0,
+        };
+        drv.idle(&mut win, 2);
+        assert!(drv.find_text("Help   ").is_some(), "1Help in the row");
+        let button = drv.find_text("press me").unwrap().center();
+        drv.key(&mut win, egui::Key::F1, egui::Modifiers::NONE);
+        assert!(help::is_open(&drv.ctx));
+        assert!(drv.find_text(&save).is_some(), "{:?}", drv.texts());
+        assert!(drv.find_text("Keys").is_some(), "the title");
+        drv.key(&mut win, egui::Key::F8, egui::Modifiers::NONE);
+        drv.frame(
+            &mut win,
+            vec![egui::Event::Text("x".into())],
+            egui::Modifiers::NONE,
+        );
+        drv.click(&mut win, button);
+        assert_eq!((win.f8, win.typed.as_str(), win.clicks), (0, "", 0));
+        drv.key(&mut win, egui::Key::Escape, egui::Modifiers::NONE);
+        assert!(!help::is_open(&drv.ctx));
+        assert!(drv.find_text(&save).is_none());
+        drv.key(&mut win, egui::Key::F8, egui::Modifiers::NONE);
+        drv.click(&mut win, button);
+        assert_eq!((win.f8, win.clicks), (1, 1), "the window has its keys back");
+        // The Help slot, then F3 closes the help, not the window.
+        drv.click_text(&mut win, "Help   ");
+        assert!(help::is_open(&drv.ctx));
+        drv.key(&mut win, egui::Key::F3, egui::Modifiers::NONE);
+        assert!(!help::is_open(&drv.ctx) && !drv.closed());
+        drv.key(&mut win, egui::Key::Num1, real_command());
+        assert!(help::is_open(&drv.ctx), "Cmd/Ctrl+1 = F1");
+        drv.key(&mut win, egui::Key::F1, egui::Modifiers::NONE);
+        assert!(!help::is_open(&drv.ctx));
+        // Shift+F1 and Shift+F3 have no row in a window of its own.
+        drv.key(&mut win, egui::Key::F1, egui::Modifiers::SHIFT);
+        drv.key(&mut win, egui::Key::F3, egui::Modifiers::SHIFT);
+        assert!(!help::is_open(&drv.ctx) && !drv.closed());
+        drv.key(&mut win, egui::Key::F3, egui::Modifiers::NONE);
+        assert!(drv.closed(), "F3 closes the window");
+        // Cmd/Ctrl+W with the help open: the help goes and the close goes on to the window (its
+        // unsaved-changes prompt is not hidden under the help).
+        let mut drv = testkit::Driver::new(800.0, 400.0);
+        drv.as_shell();
+        let mut win = Own {
+            f8: 0,
+            typed: String::new(),
+            clicks: 0,
+        };
+        drv.idle(&mut win, 2);
+        drv.key(&mut win, egui::Key::F1, egui::Modifiers::NONE);
+        assert!(help::is_open(&drv.ctx));
+        drv.key(&mut win, egui::Key::W, real_command());
+        assert!(!help::is_open(&drv.ctx), "the help gave way");
+        assert!(drv.window_closed, "Cmd/Ctrl+W reached the window");
     }
 
     #[test]
