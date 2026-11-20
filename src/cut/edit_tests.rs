@@ -172,8 +172,11 @@ fn declared(file: &Path, track: usize, rate: u32, n: usize, codec: &str) -> Resu
     let bytes = std::fs::read(file).map_err(|e| e.to_string())?;
     match ext {
         "mp4" | "m4a" | "m4v" | "mov" => {
-            let a = mp4_audio(&bytes, track).ok_or_else(|| {
-                format!("{}: no audio track {track} in its boxes", file.display())
+            let a = mp4_audio(&bytes, track).map_err(|why| {
+                format!(
+                    "{}: its length cannot be read from its boxes: {why}",
+                    file.display()
+                )
             })?;
             let rate = u64::from(rate);
             let plays = (a.stts as i64 - a.media_time.max(0)) as u64 * rate / a.track_scale;
@@ -260,16 +263,23 @@ fn child<'a>(b: &'a [u8], path: &[&[u8; 4]]) -> Option<&'a [u8]> {
     Some(here)
 }
 
+/// `b`, or that there is no `what` box.
+fn need<'a>(b: Option<&'a [u8]>, what: &str) -> Result<&'a [u8], String> {
+    b.ok_or_else(|| format!("no {what} box"))
+}
+
 fn be(b: &[u8], at: usize, len: usize) -> u64 {
     b[at..at + len]
         .iter()
         .fold(0, |v, x| v << 8 | u64::from(*x))
 }
 
-/// The `track`-th sound track of an MP4 / MOV file, read from its boxes.
-fn mp4_audio(file: &[u8], track: usize) -> Option<Mp4Audio> {
-    let moov = child(file, &[b"moov"])?;
-    let mvhd = child(moov, &[b"mvhd"])?;
+/// The `track`-th sound track of an MP4 / MOV file, read from its boxes — or why its length
+/// cannot be read from them: an edit list other than at most one empty edit (a late start) and
+/// one media segment at normal speed is refused, not guessed at.
+fn mp4_audio(file: &[u8], track: usize) -> Result<Mp4Audio, String> {
+    let moov = need(child(file, &[b"moov"]), "moov")?;
+    let mvhd = need(child(moov, &[b"mvhd"]), "mvhd")?;
     let movie_scale = if mvhd[0] == 1 {
         be(mvhd, 20, 4)
     } else {
@@ -280,41 +290,127 @@ fn mp4_audio(file: &[u8], track: usize) -> Option<Mp4Audio> {
         .filter(|(t, _)| t == b"trak")
         .map(|(_, c)| c)
         .filter(|c| child(c, &[b"mdia", b"hdlr"]).is_some_and(|h| &h[8..12] == b"soun"))
-        .nth(track)?;
-    let mdhd = child(trak, &[b"mdia", b"mdhd"])?;
+        .nth(track)
+        .ok_or_else(|| format!("no sound track {track}"))?;
+    let mdhd = need(child(trak, &[b"mdia", b"mdhd"]), "mdhd")?;
     let track_scale = if mdhd[0] == 1 {
         be(mdhd, 20, 4)
     } else {
         be(mdhd, 12, 4)
     };
-    let stts = child(trak, &[b"mdia", b"minf", b"stbl", b"stts"])?;
+    let stts = need(child(trak, &[b"mdia", b"minf", b"stbl", b"stts"]), "stts")?;
     let total = (0..be(stts, 4, 4) as usize)
         .map(|k| be(stts, 8 + 8 * k, 4) * be(stts, 12 + 8 * k, 4))
         .sum();
-    // The edit list's media segment (an empty one before it is a late start); none: all of it.
+    // No edit list: all of the track.
     let (mut segment, mut media_time) = (total * movie_scale / track_scale, 0i64);
     if let Some(elst) = child(trak, &[b"edts", b"elst"]) {
         let wide = elst[0] == 1;
         let entry = if wide { 20 } else { 12 };
+        let mut media = 0;
         for k in 0..be(elst, 4, 4) as usize {
             let at = 8 + entry * k;
-            let (duration, time) = if wide {
-                (be(elst, at, 8), be(elst, at + 8, 8) as i64)
+            let (duration, time, rate) = if wide {
+                (
+                    be(elst, at, 8),
+                    be(elst, at + 8, 8) as i64,
+                    be(elst, at + 16, 4),
+                )
             } else {
-                (be(elst, at, 4), be(elst, at + 4, 4) as u32 as i32 as i64)
+                (
+                    be(elst, at, 4),
+                    be(elst, at + 4, 4) as u32 as i32 as i64,
+                    be(elst, at + 8, 4),
+                )
             };
-            if time >= 0 {
-                (segment, media_time) = (duration, time);
+            if time < 0 {
+                continue; // An empty edit: the track starts late.
             }
+            media += 1;
+            if media > 1 {
+                return Err("an edit list with more than one media segment".to_string());
+            }
+            if rate != 0x1_0000 {
+                return Err(format!(
+                    "an edit list segment at rate {}",
+                    rate as f64 / 65536.0
+                ));
+            }
+            (segment, media_time) = (duration, time);
         }
     }
-    Some(Mp4Audio {
+    Ok(Mp4Audio {
         movie_scale,
         track_scale,
         segment,
         media_time,
         stts: total,
     })
+}
+
+/// A box: its size, its type, `body`.
+fn mp4_box(kind: &[u8; 4], body: &[u8]) -> Vec<u8> {
+    let mut b = ((body.len() + 8) as u32).to_be_bytes().to_vec();
+    b.extend_from_slice(kind);
+    b.extend_from_slice(body);
+    b
+}
+
+/// A minimal MP4 with one sound track at 48 kHz (movie timescale 48 000): `stts` totalling
+/// `samples`, and an edit list of `edits` as `(segment, media time, rate × 65536)`.
+fn synthetic_mp4(samples: u32, edits: &[(u32, i32, u32)]) -> Vec<u8> {
+    let scale = |version_flags: [u8; 4]| {
+        let mut b = version_flags.to_vec();
+        b.extend([0u8; 8]); // creation, modification
+        b.extend(48_000u32.to_be_bytes());
+        b.extend(samples.to_be_bytes());
+        b
+    };
+    let mut elst = vec![0u8; 4];
+    elst.extend((edits.len() as u32).to_be_bytes());
+    for (segment, time, rate) in edits {
+        elst.extend(segment.to_be_bytes());
+        elst.extend(time.to_be_bytes());
+        elst.extend(rate.to_be_bytes());
+    }
+    let mut hdlr = vec![0u8; 8];
+    hdlr.extend(b"soun");
+    hdlr.extend([0u8; 13]);
+    let mut stts = vec![0u8; 4];
+    stts.extend(1u32.to_be_bytes());
+    stts.extend(1u32.to_be_bytes());
+    stts.extend(samples.to_be_bytes());
+    let stbl = mp4_box(b"stbl", &mp4_box(b"stts", &stts));
+    let minf = mp4_box(b"minf", &stbl);
+    let mut mdia = mp4_box(b"mdhd", &scale([0; 4]));
+    mdia.extend(mp4_box(b"hdlr", &hdlr));
+    mdia.extend(minf);
+    let mut trak = mp4_box(b"edts", &mp4_box(b"elst", &elst));
+    trak.extend(mp4_box(b"mdia", &mdia));
+    let mut moov = mp4_box(b"mvhd", &scale([0; 4]));
+    moov.extend(mp4_box(b"trak", &trak));
+    mp4_box(b"moov", &moov)
+}
+
+/// The box reader takes only edit lists it can state a length for — an empty edit (a late
+/// start) and one media segment at normal speed — and refuses the rest rather than give a
+/// wrong exact length: two media segments (which one would it be?), a segment at another speed.
+#[test]
+fn the_mp4_reader_refuses_edit_lists_it_cannot_measure() {
+    let one = synthetic_mp4(97_024, &[(96_000, 1024, 0x1_0000)]);
+    let a = mp4_audio(&one, 0).expect("one media segment");
+    assert_eq!((a.segment, a.media_time, a.stts), (96_000, 1024, 97_024));
+    let late = synthetic_mp4(97_024, &[(4_800, -1, 0x1_0000), (96_000, 1024, 0x1_0000)]);
+    assert_eq!(mp4_audio(&late, 0).expect("a late start").segment, 96_000);
+    let two = synthetic_mp4(
+        97_024,
+        &[(48_000, 1024, 0x1_0000), (48_000, 49_024, 0x1_0000)],
+    );
+    let why = mp4_audio(&two, 0).expect_err("two media segments");
+    assert!(why.contains("more than one media segment"), "{why}");
+    let fast = synthetic_mp4(97_024, &[(48_000, 1024, 0x2_0000)]);
+    let why = mp4_audio(&fast, 0).expect_err("a segment at twice the speed");
+    assert!(why.contains("rate 2"), "{why}");
 }
 
 /// The tones of one channel, in order, as `(Hz, seconds)`: the frequency from the spacing of

@@ -1199,16 +1199,20 @@ fn process_state(pid: &str) -> Option<String> {
     (!state.is_empty()).then_some(state)
 }
 
-/// Stand-in decoders left running by a failed test are ended with it.
-struct KillOnDrop(PathBuf);
+/// A file whose removal ends the stand-ins that wait on it ("while it exists"): a failed test
+/// ends them by deleting it, never by signalling a pid that may since be another process's.
+struct Sentinel(PathBuf);
 
-impl Drop for KillOnDrop {
+impl Sentinel {
+    fn new(path: PathBuf) -> Self {
+        std::fs::write(&path, b"").unwrap();
+        Self(path)
+    }
+}
+
+impl Drop for Sentinel {
     fn drop(&mut self) {
-        for pid in std::fs::read_to_string(&self.0).unwrap_or_default().lines() {
-            let _ = std::process::Command::new("kill")
-                .args(["-9", pid])
-                .status();
-        }
+        let _ = std::fs::remove_file(&self.0);
     }
 }
 
@@ -1216,22 +1220,24 @@ impl Drop for KillOnDrop {
 /// together: an ffmpeg that never answers (a seek in an unindexed file, a scan to the end of a
 /// long input) is stopped when it runs out — killed and reaped, no child left — and the frame is
 /// "no frame here". Every decode reads a bounded stretch of its input (`-t` before `-i`). The
-/// stand-in records its pid and arguments, then sleeps without a word.
+/// stand-in records its pid and arguments, then waits without a word for as long as the test's
+/// sentinel file exists (the test ending removes it: nothing it started outlives it).
 #[test]
 fn a_paused_frame_that_never_comes_is_given_up_within_its_budget() {
     use std::os::unix::fs::PermissionsExt;
     let Some(fx) = video() else { return };
     let pids = fx.tmp.path().join("pids");
     let args = fx.tmp.path().join("args");
-    let _cleanup = KillOnDrop(pids.clone());
+    let alive = Sentinel::new(fx.tmp.path().join("alive"));
     let stub = fx.tmp.path().join("ffmpeg");
     std::fs::write(
         &stub,
         format!(
             "#!/bin/sh\n[ \"$1\" = -version ] && exit 0\necho $$ >> '{}'\n\
-             echo \"$*\" >> '{}'\nexec sleep 600\n",
+             echo \"$*\" >> '{}'\nwhile [ -e '{}' ]; do sleep 0.1; done\n",
             pids.display(),
-            args.display()
+            args.display(),
+            alive.0.display()
         ),
     )
     .unwrap();

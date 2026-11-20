@@ -363,11 +363,17 @@ fn the_chain_kills_and_reaps_a_decoder_however_its_piece_ends() {
     }
     let tmp = tempfile::tempdir().unwrap();
     let pids = tmp.path().join("pid");
+    // It runs for as long as this file exists (the temp folder going ends it): a chain that
+    // failed to stop it leaves nothing past the test, and nothing is ever signalled by pid.
+    let alive = tmp.path().join("alive");
+    std::fs::write(&alive, b"").unwrap();
     let tools = stand_in(
         tmp.path(),
         &format!(
-            "trap '' PIPE; echo $$ > '{}.tmp'; mv '{0}.tmp' '{0}'; while :; do sleep 0.05; done",
-            pids.display()
+            "trap '' PIPE; echo $$ > '{}.tmp'; mv '{0}.tmp' '{0}'; \
+             while [ -e '{}' ]; do sleep 0.05; done",
+            pids.display(),
+            alive.display()
         ),
     );
     for fed in [

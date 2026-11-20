@@ -509,11 +509,17 @@ fn code_failure_does_not_open_zed() {
 #[test]
 fn an_editor_cli_that_never_exits_is_waited_for_a_bounded_time() {
     let tmp = tempfile::tempdir().unwrap();
-    let pid = tmp.path().join("code-pid");
+    // The stand-in runs for as long as this file exists: removed at the end (and with the temp
+    // folder), so it never outlives the test, and no pid is ever signalled.
+    let alive = tmp.path().join("alive");
+    std::fs::write(&alive, b"").unwrap();
     let code = tmp.path().join("code");
     executable(
         &code,
-        &format!("#!/bin/sh\necho $$ > '{}'\nexec sleep 600\n", pid.display()),
+        &format!(
+            "#!/bin/sh\nwhile [ -e '{}' ]; do sleep 0.1; done\n",
+            alive.display()
+        ),
     );
     let file = tmp.path().join("notes.txt");
     std::fs::write(&file, "text").unwrap();
@@ -527,9 +533,7 @@ fn an_editor_cli_that_never_exits_is_waited_for_a_bounded_time() {
         ],
     );
     let took = begun.elapsed();
-    if let Ok(pid) = std::fs::read_to_string(&pid) {
-        let _ = Command::new("kill").args(["-9", pid.trim()]).status();
-    }
+    std::fs::remove_file(&alive).unwrap();
     assert!(out.status.success(), "{}", text(&out.stderr));
     assert!(took < std::time::Duration::from_secs(30), "{took:?}");
 }
