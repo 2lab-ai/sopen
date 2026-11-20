@@ -114,8 +114,10 @@ rename.
 
 Lines wrap by default: every line is shown whole, in rows as wide as the window, its number on its
 first row. A row is broken by the measured width of its characters (Korean, CJK and emoji are
-wider than a cell), after a space when the next word fits on the next row, and a tab goes to the
-next stop of four cells. The file is still read a chunk at a time — a line of hundreds of
+wider than a cell), after a space when the next word fits on the next row — Chinese and Japanese
+between any two characters, never before closing punctuation such as `。` or `」` — and a tab goes
+to the next stop of four cells. A row starting with a Hebrew or Arabic word still reads left to
+right: its English stays as written, each right-to-left word reads right to left. The file is still read a chunk at a time — a line of hundreds of
 megabytes too, from wherever you are in it. Inside a line longer than the window the status row
 says how far into it you are (`line 7 (12 % of it) of 120`), and the scroll bar goes by bytes.
 

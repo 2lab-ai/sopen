@@ -1,8 +1,9 @@
 //! Word wrap for the text viewer: where one row of a line ends, from the row's first byte — by
 //! the width egui lays the row out at (Hangul, CJK and emoji are wider than a cell; Arabic and
 //! Hebrew are shaped right to left, an Indic syllable as one), only between grapheme clusters (a
-//! letter and its marks, a syllable, an emoji sequence stay whole), after a space when the word
-//! that follows fits on the next row, else where the row is full. A few layouts per row, however
+//! letter and its marks, a syllable, an emoji sequence stay whole), at the last place a row may
+//! break — after a space, or next to an ideograph or kana ([`Kind`]) — when what follows fits on
+//! the next row, else where the row is full. A few layouts per row, however
 //! the script is shaped: what fits is found by galloping and halving from an estimate.
 //!
 //! A row's end is a function of its first byte alone (and the width and fonts), and a line is
@@ -157,6 +158,59 @@ impl Cut {
     }
 }
 
+/// What a grapheme cluster is to line breaking (after UAX #14, much simplified).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    /// A space or a tab: a row may break after it.
+    Space,
+    /// An ideograph, kana, a fullwidth form: a row may break before and after it (Chinese and
+    /// Japanese are written without spaces). Hangul is not: Korean words are spaced.
+    Wide,
+    /// Closing punctuation and the like (。、」), never at the start of a row; `true`: a
+    /// Chinese / Japanese one, after which a row may break.
+    Close(bool),
+    /// Opening punctuation (「（), never at the end of a row.
+    Open,
+    /// Anything else: part of a word.
+    Other,
+}
+
+impl Kind {
+    fn of(cluster: &str) -> Self {
+        let Some(c) = cluster.chars().next() else {
+            return Kind::Other;
+        };
+        match c {
+            ' ' | '\t' => Kind::Space,
+            '、' | '。' | '〃' | '々' | '〆' | '〉' | '》' | '」' | '』' | '】' | '〕' | '〗'
+            | '〙' | '〛' | '〞' | '〟' | '〻' | 'ゝ' | 'ゞ' | '゛' | '゜' | 'ー' | 'ヽ' | 'ヾ'
+            | '・' | '！' | '）' | '，' | '．' | '：' | '；' | '？' | '］' | '｝' | '｠' | '｡'
+            | '｣' | '､' | '･' | 'ｰ' => Kind::Close(true),
+            // ’ and ” too: "don’t" is one word.
+            ')' | ']' | '}' | ',' | '.' | ';' | ':' | '!' | '?' | '%' | '’' | '”' => {
+                Kind::Close(false)
+            }
+            '〈' | '《' | '「' | '『' | '【' | '〔' | '〖' | '〘' | '〚' | '〝' | '（' | '［'
+            | '｛' | '｟' | '｢' | '‘' | '“' | '(' | '[' | '{' => Kind::Open,
+            '\u{2E80}'..='\u{2FFF}'
+            | '\u{3000}'..='\u{303F}'
+            | '\u{3040}'..='\u{30FF}'
+            | '\u{3100}'..='\u{312F}'
+            | '\u{3190}'..='\u{31FF}'
+            | '\u{3200}'..='\u{4DBF}'
+            | '\u{4E00}'..='\u{9FFF}'
+            | '\u{A000}'..='\u{A4CF}'
+            | '\u{F900}'..='\u{FAFF}'
+            | '\u{FE30}'..='\u{FE4F}'
+            | '\u{FF01}'..='\u{FF60}'
+            | '\u{FF66}'..='\u{FF9F}'
+            | '\u{FFE0}'..='\u{FFE6}'
+            | '\u{20000}'..='\u{3FFFF}' => Kind::Wide,
+            _ => Kind::Other,
+        }
+    }
+}
+
 /// A row's candidates: the grapheme clusters of what is read from the row's first byte, each as
 /// painted (a tab as spaces to the next stop counted from the row's start, by the font's glyph
 /// widths; a control character as its code page 437 glyph).
@@ -165,11 +219,11 @@ struct Clusters {
     text: String,
     /// After each cluster: where it ends in `text`, its characters so far, the estimated width
     /// so far (the font's glyph widths summed — shaping can differ: only to choose what to lay
-    /// out), and whether it is a space or a tab (a row breaks after one).
+    /// out); and what it is to line breaking.
     ends: Vec<usize>,
     chars: Vec<usize>,
     guess: Vec<f32>,
-    space: Vec<bool>,
+    kind: Vec<Kind>,
     /// Each character as painted, with how many times (a tab: spaces).
     shown: Vec<(char, u8)>,
 }
@@ -195,7 +249,7 @@ impl Clusters {
             ends: Vec::new(),
             chars: Vec::new(),
             guess: Vec::new(),
-            space: Vec::new(),
+            kind: Vec::new(),
             shown: Vec::with_capacity(face_chars.len()),
         };
         let (mut x, mut i) = (0f32, 0usize);
@@ -217,9 +271,20 @@ impl Clusters {
             out.ends.push(out.text.len());
             out.chars.push(i);
             out.guess.push(x);
-            out.space.push(g == " " || g == "\t");
+            out.kind.push(Kind::of(g));
         }
         out
+    }
+
+    /// A row may break before cluster `i` (0 < `i` < the clusters read): after a space, or
+    /// next to an ideograph or kana — never before closing punctuation or a space, never after
+    /// opening punctuation.
+    fn breaks_before(&self, i: usize) -> bool {
+        let (before, here) = (self.kind[i - 1], self.kind[i]);
+        if matches!(here, Kind::Close(_) | Kind::Space) || before == Kind::Open {
+            return false;
+        }
+        matches!(before, Kind::Space | Kind::Wide | Kind::Close(true)) || here == Kind::Wide
     }
 
     fn len(&self) -> usize {
@@ -338,11 +403,12 @@ pub(super) fn cut_row(cells: &[Cell], complete: bool, width: f32, m: &Measure) -
             // The space the row is full at is taken, not shown: the next row starts with the
             // next word.
             taken = k + 1;
-        } else if !c.space[k - 1] {
-            // In a word: back to after the last space, if the word fits on the next row (laid
-            // out on its own) and the row up to that space fits.
-            if let Some(j) = (0..k).rev().find(|&j| c.space[j]) {
-                let word_end = (k..n).find(|&e| c.space[e]);
+        } else if !c.breaks_before(k) {
+            // Inside a word (or before a closing mark): back to the last place a row may break,
+            // if what follows it up to the next such place — spaces after it not counted — fits
+            // on the next row (laid out on its own) and the row up to it fits.
+            if let Some(b) = (1..k).rev().find(|&b| c.breaks_before(b)) {
+                let word_end = (k + 1..n).find(|&e| c.breaks_before(e));
                 let word_end = match word_end {
                     Some(e) => Some(e),
                     None if !more && complete => Some(n),
@@ -350,11 +416,15 @@ pub(super) fn cut_row(cells: &[Cell], complete: bool, width: f32, m: &Measure) -
                     None => None,
                 };
                 let fits_next = word_end.is_some_and(|e| {
-                    m.layout(c.part(j + 1, e).to_string()).size().x <= width + 0.01
+                    let e = (b + 1..=e)
+                        .rev()
+                        .find(|&e| c.kind[e - 1] != Kind::Space)
+                        .unwrap_or(e);
+                    m.layout(c.part(b, e).to_string()).size().x <= width + 0.01
                 });
-                if fits_next && wide(j + 1) <= width + 0.01 {
-                    taken = j + 1;
-                    shown = j + 1;
+                if fits_next && wide(b) <= width + 0.01 {
+                    taken = b;
+                    shown = b;
                 }
             }
         }

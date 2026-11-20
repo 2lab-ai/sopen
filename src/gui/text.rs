@@ -2015,18 +2015,37 @@ impl TextWindow {
                         let line = page.colors.get((row.line - page.top) as usize)?;
                         Some((first, line.as_slice()))
                     });
-                    let plain = || {
+                    // As it was measured (one section).
+                    let measured = || {
                         ctx.fonts_mut(|f| f.layout_no_wrap(row.cut.text(), font.clone(), p.text))
+                    };
+                    let rtl = row
+                        .cut
+                        .shown
+                        .iter()
+                        .any(|&(c, _)| direction(c) == Some(true));
+                    let plain = || {
+                        if rtl {
+                            let job = directed_job(row_chars(row, None, p.text), &font);
+                            ctx.fonts_mut(|f| f.layout_job(job))
+                        } else {
+                            measured()
+                        }
                     };
                     let mut galley = match colors {
                         Some(colors) => {
-                            ctx.fonts_mut(|f| f.layout_job(row_job(row, colors, &font, p.text)))
+                            let job = directed_job(row_chars(row, Some(colors), p.text), &font);
+                            ctx.fonts_mut(|f| f.layout_job(job))
                         }
                         None => plain(),
                     };
+                    // Sections are shaped apart and can come out a hair wider than the row was
+                    // measured: plain then, and at worst as measured (never cut at the edge).
                     if galley.size().x > page.width + 0.5 && colors.is_some() {
-                        // Coloured runs are shaped apart and can come out wider: plain then.
                         galley = plain();
+                    }
+                    if galley.size().x > page.width + 0.5 && rtl {
+                        galley = measured();
                     }
                     overflow |= galley.size().x > page.width + 0.5;
                     text_painter.galley(
@@ -2041,7 +2060,7 @@ impl TextWindow {
                 let columns = ((rect.right() - text_x) / cw).floor().max(0.0) as usize;
                 for (k, runs) in page.runs.iter().enumerate() {
                     number(k, page.top + k as u64);
-                    let mut job = LayoutJob::default();
+                    let mut shown: Vec<(char, Color32)> = Vec::new();
                     let (mut skip, mut room) = (self.left, columns);
                     for (color, text) in runs {
                         if room == 0 {
@@ -2052,16 +2071,16 @@ impl TextWindow {
                             skip -= n;
                             continue;
                         }
-                        let part: String = text
+                        let part = text
                             .chars()
                             .skip(std::mem::take(&mut skip))
                             .take(room)
-                            .map(chrome::shown_char)
-                            .collect();
-                        room -= part.chars().count();
-                        job.append(&part, 0.0, egui::TextFormat::simple(font.clone(), *color));
+                            .map(|c| (chrome::shown_char(c), *color));
+                        let before = shown.len();
+                        shown.extend(part);
+                        room -= shown.len() - before;
                     }
-                    let galley = ctx.fonts_mut(|f| f.layout_job(job));
+                    let galley = ctx.fonts_mut(|f| f.layout_job(directed_job(shown, &font)));
                     text_painter.galley(
                         Pos2::new(text_x, rect.top() + k as f32 * row_h),
                         galley,
@@ -2083,27 +2102,88 @@ impl TextWindow {
     }
 }
 
-/// A wrapped row as painted in its line's colours: `colors` holds the line's colour per
-/// character, the row's first character at index `first`.
-fn row_job(
+/// A wrapped row's characters as painted (a tab as its spaces), each in its colour: by
+/// `colors`, the line's colour per character with the row's first at index `first`, else plain.
+fn row_chars(
     row: &wrap::Row,
-    (first, colors): (usize, &[Color32]),
-    font: &FontId,
+    colors: Option<(usize, &[Color32])>,
     plain: Color32,
-) -> LayoutJob {
-    let mut job = LayoutJob::default();
-    let (mut run, mut color) = (String::new(), plain);
+) -> Vec<(char, Color32)> {
+    let mut out = Vec::with_capacity(row.cut.shown.len());
     for (i, &(c, n)) in row.cut.shown.iter().enumerate() {
-        let now = colors.get(first + i).copied().unwrap_or(plain);
-        if now != color && !run.is_empty() {
-            job.append(&run, 0.0, egui::TextFormat::simple(font.clone(), color));
+        let color = colors
+            .and_then(|(first, colors)| colors.get(first + i).copied())
+            .unwrap_or(plain);
+        out.extend(std::iter::repeat_n((c, color), usize::from(n)));
+    }
+    out
+}
+
+/// Whether `c` is written right to left (`Some(true)`: Hebrew, Arabic and the other
+/// right-to-left scripts' letters), left to right (`Some(false)`: any other letter or digit,
+/// Arabic-Indic digits too), or neither (spaces, punctuation, marks).
+fn direction(c: char) -> Option<bool> {
+    match c {
+        '\u{0660}'..='\u{0669}' | '\u{06F0}'..='\u{06F9}' | '\u{07C0}'..='\u{07C9}' => Some(false),
+        '\u{200F}' | '\u{061C}' => Some(true),
+        '\u{0590}'..='\u{08FF}'
+        | '\u{FB1D}'..='\u{FDFF}'
+        | '\u{FE70}'..='\u{FEFF}'
+        | '\u{10800}'..='\u{10FFF}'
+        | '\u{1E800}'..='\u{1EFFF}' => c.is_alphabetic().then_some(true),
+        c if c.is_alphanumeric() => Some(false),
+        _ => None,
+    }
+}
+
+/// A row as painted, laid out left to right: a section per run of one colour and one direction.
+/// egui shapes a section in the direction of its first strong character, so a row starting with a
+/// right-to-left word (Hebrew is in the VGA font, shaped in one run with the English after it)
+/// came out reversed whole, its English too. Here each run of right-to-left letters — with the
+/// spaces and marks between them — is a section of its own (shaped right to left, as it reads),
+/// and everything else is shaped left to right; the runs stay in their order, as in a
+/// left-to-right paragraph. The text and the colours are the row's own: only how egui shapes it
+/// changes.
+fn directed_job(chars: Vec<(char, Color32)>, font: &FontId) -> LayoutJob {
+    let class: Vec<Option<bool>> = chars.iter().map(|&(c, _)| direction(c)).collect();
+    // A neutral character goes right to left only between two right-to-left letters.
+    let mut next_rtl = vec![false; chars.len()];
+    let mut next = None;
+    for i in (0..chars.len()).rev() {
+        next_rtl[i] = next == Some(true);
+        if class[i].is_some() {
+            next = class[i];
+        }
+    }
+    let mut job = LayoutJob::default();
+    // A section of its own for each run, also next to one in the same colour: `append` would
+    // join them, and egui would shape them as one again.
+    let push = |job: &mut LayoutJob, run: &str, color: Color32| {
+        use egui::text::ByteIndex;
+        let start = job.text.len();
+        job.text.push_str(run);
+        job.sections.push(egui::text::LayoutSection {
+            leading_space: 0.0,
+            byte_range: ByteIndex(start)..ByteIndex(job.text.len()),
+            format: egui::TextFormat::simple(font.clone(), color),
+        });
+    };
+    let (mut run, mut key) = (String::new(), None);
+    let mut prev = None;
+    for (i, &(c, color)) in chars.iter().enumerate() {
+        let rtl = class[i].unwrap_or(prev == Some(true) && next_rtl[i]);
+        if class[i].is_some() {
+            prev = class[i];
+        }
+        if let Some((was, _)) = key.filter(|&k| k != (color, rtl)) {
+            push(&mut job, &run, was);
             run.clear();
         }
-        color = now;
-        run.extend(std::iter::repeat_n(c, usize::from(n)));
+        key = Some((color, rtl));
+        run.push(c);
     }
-    if !run.is_empty() {
-        job.append(&run, 0.0, egui::TextFormat::simple(font.clone(), color));
+    if let Some((color, _)) = key {
+        push(&mut job, &run, color);
     }
     job
 }

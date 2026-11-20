@@ -2638,3 +2638,190 @@ fn a_restart_point_inside_a_cluster_moves_past_it() {
         .collect();
     assert_eq!(forward, back);
 }
+
+// ---------------------------------------------------------------------------------------------
+// Review round 3: rows that start right to left, and Chinese / Japanese without spaces.
+
+/// Where each glyph of the painted row holding `needle` sits, left to right: (character, x).
+fn painted(drv: &Driver, needle: &str) -> Vec<(char, f32)> {
+    let (_, galley) = drv
+        .galleys()
+        .into_iter()
+        .find(|(_, g)| g.text().contains(needle))
+        .unwrap_or_else(|| panic!("no row holds {needle:?}"));
+    let mut glyphs: Vec<(char, f32)> = galley
+        .rows
+        .iter()
+        .flat_map(|r| r.glyphs.iter())
+        // Only glyphs with an advance: egui also lists a zero-width one per character it shaped
+        // into a glyph run (in logical order, at the run's end).
+        .filter(|g| g.advance_width > 0.0)
+        .map(|g| (g.chr, g.pos.x))
+        .collect();
+    glyphs.sort_by(|a, b| a.1.total_cmp(&b.1));
+    glyphs
+}
+
+/// The x of each letter of `word` as painted (the first glyph found for each, in reading order).
+fn word_xs(glyphs: &[(char, f32)], word: &str) -> Vec<f32> {
+    // The painted order left to right, as a string: the word must read left to right in it.
+    let order: String = glyphs.iter().map(|g| g.0).collect();
+    let at = order
+        .find(word)
+        .unwrap_or_else(|| panic!("{word:?} does not read left to right in {order:?}"));
+    let start = order[..at].chars().count();
+    glyphs[start..start + word.chars().count()]
+        .iter()
+        .map(|g| g.1)
+        .collect()
+}
+
+/// A row whose first strong character is right to left (a line starting in Hebrew, and a wrapped
+/// row starting mid-line with a Hebrew word) still paints its English words left to right, and
+/// each Hebrew word right to left; the row is as wide as it was measured.
+#[test]
+fn a_row_starting_right_to_left_keeps_english_left_to_right() {
+    let cols = columns(600.0, 400.0);
+    let tmp = tempfile::tempdir().unwrap();
+    let mut drv = Driver::new(600.0, 400.0);
+    if !system_fonts(&mut drv, tmp.path(), "שלום") {
+        return;
+    }
+    // Row 1 starts with Hebrew; the wrapped line has a row starting with "כהן".
+    let filler = "x".repeat(cols - 2);
+    let body = format!("שלום text here and more\n{filler} כהן\", \"email\": \"u0\"\n");
+    let mut win = viewer(tmp.path(), "rtl.txt", &body);
+    drv.until(&mut win, 5, |w| w.ready());
+    let x = text_x(&drv, "xxxx");
+    let rows = rows_at(&drv, x);
+    assert!(
+        rows.iter().any(|r| r.starts_with("כהן")),
+        "a wrapped row starts with Hebrew: {rows:?}"
+    );
+    for (needle, english, hebrew) in [
+        ("text here", ["text", "here"], "שלום"),
+        ("email", ["email", "u0"], "כהן"),
+    ] {
+        let glyphs = painted(&drv, needle);
+        for word in english {
+            let xs = word_xs(&glyphs, word);
+            assert!(xs.windows(2).all(|w| w[0] < w[1]), "{word:?} at {xs:?}");
+        }
+        // The Hebrew word reads right to left: its last letter leftmost.
+        let reversed: String = hebrew.chars().rev().collect();
+        word_xs(&glyphs, &reversed);
+        // As wide as the row was measured (laid out as one run).
+        let (_, galley) = drv
+            .galleys()
+            .into_iter()
+            .find(|(_, g)| g.text().contains(needle))
+            .unwrap();
+        let font = chrome::font();
+        let plain = chrome::Palette::of(&drv.ctx.global_style().visuals).text;
+        let measured = drv
+            .ctx
+            .fonts_mut(|f| f.layout_no_wrap(galley.text().to_string(), font.clone(), plain))
+            .size()
+            .x;
+        assert_eq!(galley.size().x, measured, "{needle:?}");
+    }
+    assert_rows_inside(&drv, x);
+}
+
+/// A Chinese or Japanese paragraph with only a few spaces: a row breaks between any two
+/// ideographs or kana (as UAX #14 allows), so rows fill the window to within a glyph — never
+/// starting with closing punctuation such as 。、」 — while Latin words stay whole; the rows put
+/// together are the paragraph.
+fn cjk_rows_fill_the_width(name: &str, unit: &str) {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut drv = Driver::new(480.0, 300.0);
+    if !system_fonts(&mut drv, tmp.path(), unit) {
+        return;
+    }
+    let line = unit.repeat(30);
+    let mut win = viewer(tmp.path(), name, &format!("{line}\n"));
+    drv.until(&mut win, 10, |w| w.ready());
+    let (all, back) = all_rows(&drv, &mut win);
+    assert_eq!(
+        rejoined(&all, 0),
+        line,
+        "{name}: the rows are the paragraph"
+    );
+    assert_eq!(back.len(), all.len(), "{name}");
+    let font = chrome::font();
+    let plain = chrome::Palette::of(&drv.ctx.global_style().visuals).text;
+    let wide = |t: &str| {
+        drv.ctx
+            .fonts_mut(|f| f.layout_no_wrap(t.to_string(), font.clone(), plain))
+            .size()
+            .x
+    };
+    let closing = "。、，．」』）！？：；";
+    let latin_words: std::collections::HashSet<&str> = unit
+        .split(|c: char| !c.is_ascii_alphabetic())
+        .filter(|w| w.len() > 1)
+        .collect();
+    for (k, pair) in all.windows(2).enumerate() {
+        let (row, next) = (pair[0].cut.text(), pair[1].cut.text());
+        let first: String = next.chars().take(1).collect();
+        assert!(
+            !closing.contains(first.as_str()),
+            "{name}: row {} starts with {first:?}: {next:?}",
+            k + 1
+        );
+        // The next row's first character (and the closing mark it carries) would not fit.
+        let carried: String = next
+            .chars()
+            .take(1)
+            .chain(next.chars().skip(1).take_while(|c| closing.contains(*c)))
+            .collect();
+        // Ideographs and kana break anywhere: a row before one is full (a Latin word may move
+        // whole to the next row instead).
+        let breakable = next.chars().next().is_some_and(|c| {
+            matches!(c, '\u{3040}'..='\u{30FF}' | '\u{3400}'..='\u{9FFF}' | '\u{FF01}'..='\u{FF60}')
+        });
+        if breakable {
+            assert!(
+                wide(&format!("{row}{carried}")) > win.room,
+                "{name}: row {k} ({} of {}) leaves room for {carried:?}: {row:?}",
+                wide(&row),
+                win.room
+            );
+        }
+        // Latin words are not split.
+        let tail: String = row
+            .chars()
+            .rev()
+            .take_while(|c| c.is_ascii_alphabetic())
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+        let head: String = next
+            .chars()
+            .take_while(|c| c.is_ascii_alphabetic())
+            .collect();
+        if !tail.is_empty() && !head.is_empty() {
+            assert!(
+                !latin_words.contains(format!("{tail}{head}").as_str()),
+                "{name}: {tail}|{head} split"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_japanese_paragraph_fills_its_rows() {
+    cjk_rows_fill_the_width(
+        "ja.txt",
+        "日本語の文章を折り返して表示します。「かぎ括弧」と English words を含み、句読点で行を始めない。 ",
+    );
+}
+
+#[test]
+fn a_chinese_paragraph_fills_its_rows() {
+    cjk_rows_fill_the_width(
+        "zh.txt",
+        "中文文本换行显示测试，这是一个很长的段落。其中也有 Mixed English 单词（括号）和标点！ ",
+    );
+}

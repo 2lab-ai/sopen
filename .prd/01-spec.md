@@ -193,9 +193,16 @@ too, where F3 closes it as ⌘W does.
     its number on its first row. A row ends where the next grapheme cluster (a letter and its
     marks, an Indic syllable, an emoji sequence: never split) would not fit, measured by laying
     the row out as egui paints it (Hangul, CJK and emoji are wider than a cell; Arabic and Hebrew
-    are shaped right to left), in a few layouts per row — after the last space when the word that
-    follows fits on the next row, else where the row is full; a
-    space the row is full at is not carried to the next row. A tab goes to the next stop of four
+    are shaped right to left), in a few layouts per row — at the last place a row may break when
+    what follows it fits on the next row, else where the row is full. A row may break after a
+    space, and next to an ideograph, kana or fullwidth form (as UAX #14 allows: Chinese and
+    Japanese have no spaces; Hangul words, which are spaced, and Latin words stay whole), never
+    before closing punctuation (`。、」）！？`…) or a space, never after opening punctuation
+    (`「（`…). A space the row is full at is not carried to the next row. A row is painted left
+    to right: each run of right-to-left letters (Hebrew, Arabic…, with the spaces between them)
+    is shaped as one, right to left, and everything else left to right, in the row's order —
+    egui would otherwise shape a row whose first strong letter is right to left reversed whole,
+    its English too; painting only, never the measured width. A tab goes to the next stop of four
     cells counted from its row's start. A line is wrapped afresh at every 16 KiB of it — at the
     first word start (after a space) within 128 bytes, else the first grapheme cluster start, else
     (a cluster longer than that) the first character start — so a row's end depends only on where
