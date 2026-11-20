@@ -238,3 +238,116 @@ fn lines_end_at_newlines_and_carriage_returns() {
     }
     assert_eq!(got, ["a\r", "bb\n", "\r", "c"]);
 }
+
+/// Signals this thread sent to `pid`'s group after its leader was reaped (whose id may by then
+/// be anyone's).
+fn signals_after_reaping(pid: u32) -> Vec<(i32, bool)> {
+    SIGNALS.with(|s| {
+        s.borrow()
+            .iter()
+            .copied()
+            .filter(|(p, reaped)| *p == pid as i32 && *reaped)
+            .collect()
+    })
+}
+
+/// A child that fails before it is ready, waited for: the error comes back, and nothing — not
+/// the wait, not the drop after it — signals its group once it is reaped.
+#[test]
+fn waiting_for_a_failed_child_never_signals_it_after_reaping() {
+    let tmp = tempfile::tempdir().unwrap();
+    let program = fake(
+        tmp.path(),
+        "echo 'sopen: a.mp3 has no audio stream to separate' >&2\nexit 1",
+    );
+    let child = spawn(&program, &tmp.path().join("exports"));
+    let pid = child.id();
+    let err = child.wait().unwrap_err().to_string();
+    assert_eq!(err, "a.mp3 has no audio stream to separate");
+    assert_eq!(
+        signals_after_reaping(pid),
+        [],
+        "a reaped child's group was signalled"
+    );
+}
+
+/// Cancelled, then waited for: the one kill comes before reaping, never after.
+#[test]
+fn waiting_for_a_cancelled_child_never_signals_it_again() {
+    let tmp = tempfile::tempdir().unwrap();
+    let program = fake(tmp.path(), "sleep 60");
+    let mut child = spawn(&program, &tmp.path().join("exports"));
+    let pid = child.id();
+    assert_eq!(child.cancel(), Cancel::Cancelled);
+    let err = child.wait().unwrap_err().to_string();
+    assert!(err.contains("cancelled"), "{err}");
+    assert_eq!(
+        signals_after_reaping(pid),
+        [],
+        "a reaped child's group was signalled"
+    );
+    let before: Vec<_> = SIGNALS.with(|s| {
+        s.borrow()
+            .iter()
+            .copied()
+            .filter(|(p, _)| *p == pid as i32)
+            .collect()
+    });
+    assert_eq!(
+        before,
+        [(pid as i32, false)],
+        "one kill, while it was not reaped"
+    );
+}
+
+/// The leader exits while a process it started still holds its output open: `poll` never
+/// blocks on that process — it returns at once, the group's survivors are killed, and the
+/// result comes on a later poll.
+#[test]
+fn poll_never_blocks_on_a_descendant_holding_the_output_open() {
+    for (exit, outcome_ok) in [
+        ("exit 1", false),
+        ("echo box:/a.voice.mp3\necho box:/a.music.mp3\nexit 0", true),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        let pid_file = tmp.path().join("descendant.pid");
+        let program = fake(
+            tmp.path(),
+            &format!(
+                "echo 'sopen: it failed' >&2\nsleep 30 &\necho $! > '{}'\n{exit}",
+                pid_file.display()
+            ),
+        );
+        let mut child = spawn(&program, &tmp.path().join("exports"));
+        let work = child.work_dir().to_path_buf();
+        let started = Instant::now();
+        let result = loop {
+            let asked = Instant::now();
+            let done = child.poll().map(|r| {
+                r.as_ref()
+                    .map(|p| p.voice.clone())
+                    .map_err(|e| e.to_string())
+            });
+            assert!(
+                asked.elapsed() < Duration::from_secs(2),
+                "poll blocked for {:?}",
+                asked.elapsed()
+            );
+            if let Some(done) = done {
+                break done;
+            }
+            assert!(started.elapsed() < Duration::from_secs(20), "no result");
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert!(started.elapsed() < Duration::from_secs(20));
+        assert_eq!(result.is_ok(), outcome_ok, "{result:?}");
+        let descendant: i32 = std::fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        until("the descendant to die", || !alive(descendant));
+        assert!(!work.exists());
+        assert_eq!(signals_after_reaping(child.id()), []);
+    }
+}

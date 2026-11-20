@@ -436,6 +436,13 @@ for f in sopen-preview sopen; do
     grep -qF 'pkgshare.install Dir["*"].first => "UVR-MDX-NET-Voc_FT.onnx"' <<< "$formula"
   expect_true "repo $f template installs the notices with the binary" \
     grep -qF 'prefix.install Dir["*"].first => "THIRD-PARTY-NOTICES"' <<< "$formula"
+  # `brew test` separates a tone with nothing set: the model must be found where install put it.
+  test_block="$(sed -n '/^  test do$/,/^  end$/p' <<< "$formula")"
+  expect_true "repo $f template's test unsets SOPEN_STEMS_MODEL" \
+    grep -qF 'ENV.delete "SOPEN_STEMS_MODEL"' <<< "$test_block"
+  expect_true "repo $f template's test runs sopen stems and checks both stems" \
+    bash -c 'grep -qF "system bin/\"sopen\", \"stems\"" <<< "$1" &&
+      grep -qF "tone.voice.wav" <<< "$1" && grep -qF "tone.music.wav" <<< "$1"' _ "$test_block"
   expect_absent "no unrendered token in the repo $f render" grep -q "@[A-Z0-9_]\+@" <<< "$formula"
 done
 

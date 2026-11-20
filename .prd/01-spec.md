@@ -622,7 +622,9 @@ into the cache (claimed while it runs), and it always runs on this machine (§4a
 - **Engine.** sherpa-onnx v2.0.2's C API (Apache-2.0; ONNX Runtime, MIT, inside), linked
   statically behind the cargo feature `stems` (on by default; every release build has it).
   build.rs downloads the pinned prebuilt archive for the *target* and checks its SHA-256
-  (`SHERPA_ONNX_LIB_DIR` = an extracted `lib/` for offline builds); `--no-default-features`
+  (`SHERPA_ONNX_LIB_DIR` = an extracted `lib/` for offline builds; a changed archive there, or
+  one gone from the download, rebuilds; the download's stamp is removed before its extraction
+  changes and written only once every library is there); `--no-default-features`
   builds without it and `sopen stems` then says so. sherpa-onnx's Rust crates do not bind source
   separation, so the few C declarations are sopen's own. CPU, every core.
 - **Model.** UVR-MDX-NET-Voc_FT from Ultimate Vocal Remover (Anjok07 & aufr33, MIT — credited in
@@ -639,7 +641,8 @@ into the cache (claimed while it runs), and it always runs on this machine (§4a
   30 s, each with 1 s of the file's own audio on both sides (silence past its ends) that is cut
   off its output again — the engine distorts a window's edges, and the context keeps that out
   (the research spike measured it lossless against one pass) → each stem goes to ffmpeg on a
-  pipe. Memory is one window plus the model, however long the track (measured flat: 6,529 MiB
+  pipe; of each ffmpeg's stderr only a bounded tail is kept (64 lines, 16 KiB; an endless line
+  cut), its last line being the error. Memory is one window plus the model, however long the track (measured flat: 6,529 MiB
   after the first of 8 pieces, 6,535 MiB after the last). The model's music is the window minus
   its voice, so voice + music give the source back sample for sample (the test).
 - **Output.** Each stem in the source's audio codec, sample rate and channel count (mono stays
@@ -665,7 +668,11 @@ into the cache (claimed while it runs), and it always runs on this machine (§4a
   both stems are encoded it prints `stems: ready to publish` and waits for `publish` on its
   stdin; the parent answers under the lock Cancel takes, so a cancel either comes first (nothing
   reaches the remote — an upload is never cut half-way, leaving a temp there) or after the
-  go-ahead, when it is too late and the stems are published. The window's button is a later
+  go-ahead, when it is too late and the stems are published. The child's exit and its output are
+  separate: once the child has exited — seen without reaping it, so its id is still its own —
+  whatever it left in its group is killed, then it is reaped and the work folder removed; its
+  result is read only when both pipes are closed, and looking for it never blocks. Nothing
+  signals a reaped child's id again (it may be anyone's by then). The window's button is a later
   change.
 
 ## 8. Usage log

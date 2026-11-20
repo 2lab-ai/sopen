@@ -53,7 +53,17 @@ class Sopen < Formula
   end
 
   test do
-    assert_path_exists pkgshare/"UVR-MDX-NET-Voc_FT.onnx"
     assert_match version.to_s, shell_output("#{bin}/sopen --version")
+    # `sopen stems` finds the model where install put it, with nothing pointing at it.
+    ENV.delete "SOPEN_STEMS_MODEL"
+    ENV["SOPEN_FFMPEG"] = Formula["ffmpeg"].opt_bin/"ffmpeg"
+    ENV["SOPEN_FFPROBE"] = Formula["ffmpeg"].opt_bin/"ffprobe"
+    ENV["SOPEN_CACHE_DIR"] = testpath/"cache"
+    ENV["SOPEN_STATE_DIR"] = testpath/"state"
+    system Formula["ffmpeg"].opt_bin/"ffmpeg", "-loglevel", "error", "-f", "lavfi",
+           "-i", "sine=frequency=440:duration=2", testpath/"tone.wav"
+    system bin/"sopen", "stems", testpath/"tone.wav"
+    assert_path_exists testpath/"tone.voice.wav"
+    assert_path_exists testpath/"tone.music.wav"
   end
 end

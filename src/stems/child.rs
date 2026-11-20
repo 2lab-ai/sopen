@@ -18,9 +18,10 @@ use anyhow::{anyhow, bail, Context, Result};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
+use std::time::Duration;
 
 /// Where a child is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -52,6 +53,11 @@ pub enum Cancel {
 }
 
 /// A running `sopen stems` child.
+///
+/// Its exit and its output are two things: the leader is reaped as soon as it has exited (and
+/// what it left running in its group killed first, while its id is still its own), but the
+/// result is read only once both output pipes are closed — never by blocking on them. After
+/// the leader is reaped nothing signals its id again: it may be anyone's by then.
 pub struct StemsChild {
     child: Child,
     work: PathBuf,
@@ -59,6 +65,49 @@ pub struct StemsChild {
     readers: Vec<JoinHandle<()>>,
     stdout: Arc<Mutex<Vec<String>>>,
     result: Option<Result<Published>>,
+    /// The leader has been reaped, with this status (`Err`: waiting for it failed).
+    reaped: Option<std::io::Result<ExitStatus>>,
+    /// What removing the work folder gave, when it was removed.
+    removed: Option<std::io::Result<()>>,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Every group signal this thread sent: `(pid, whether its leader was already reaped)`.
+    pub(crate) static SIGNALS: std::cell::RefCell<Vec<(i32, bool)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// SIGKILL to the group `pid` leads. Only ever called while the leader is not reaped (alive or
+/// a zombie), so `pid` is still its own.
+fn signal_group(pid: u32, reaped: bool) {
+    debug_assert!(!reaped, "a reaped child's id may be anyone's");
+    #[cfg(test)]
+    SIGNALS.with(|s| s.borrow_mut().push((pid as i32, reaped)));
+    if let Ok(pid) = i32::try_from(pid) {
+        // SAFETY: a plain syscall on our own child's process group.
+        unsafe { libc::kill(-pid, libc::SIGKILL) };
+    }
+}
+
+/// Whether the child `pid` has exited, without reaping it (`WNOWAIT`: a zombie keeps its id).
+/// `block` waits for it.
+fn has_exited(pid: u32, block: bool) -> std::io::Result<bool> {
+    let flags = libc::WEXITED | libc::WNOWAIT | if block { 0 } else { libc::WNOHANG };
+    loop {
+        // SAFETY: zeroed is a valid siginfo_t; waitid fills it in or leaves it.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        // SAFETY: a plain syscall on our own child.
+        let r = unsafe { libc::waitid(libc::P_PID, pid as libc::id_t, &mut info, flags) };
+        if r == 0 {
+            // With WNOHANG and nothing to report, waitid returns 0 and leaves it zeroed.
+            return Ok(info.si_signo != 0);
+        }
+        let e = std::io::Error::last_os_error();
+        if e.kind() != std::io::ErrorKind::Interrupted {
+            return Err(e);
+        }
+    }
 }
 
 /// Starts `sopen stems --work-dir <new folder> --wait-to-publish [--model M] -- SOURCE` from
@@ -123,6 +172,8 @@ pub fn spawn_child(
         readers,
         stdout,
         result: None,
+        reaped: None,
+        removed: None,
     })
 }
 
@@ -209,54 +260,111 @@ impl StemsChild {
         self.child.id()
     }
 
-    /// The result once the child has ended, without blocking.
+    /// The result once the child has ended and its output is read; `None` until then. Never
+    /// blocks: not on the child, and not on a pipe something it started still holds open.
     pub fn poll(&mut self) -> Option<&Result<Published>> {
         if self.result.is_none() {
-            match self.child.try_wait() {
-                Ok(Some(_)) | Err(_) => self.collect(),
-                Ok(None) => return None,
-            }
+            self.step(false);
         }
         self.result.as_ref()
     }
 
-    /// Waits for the child and returns its result.
+    /// Waits for the child's exit and its output, and returns its result.
     pub fn wait(mut self) -> Result<Published> {
-        self.collect();
+        while self.result.is_none() {
+            self.step(true);
+            if self.result.is_none() {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
         self.result.take().expect("collected")
     }
 
-    /// Kills the child (and its ffmpeg children) unless it is already publishing; then
-    /// nothing is published and its work folder is removed.
+    /// Kills the child (and its ffmpeg children) unless it is already publishing or has
+    /// already ended; then nothing is published and its work folder is removed. Does not wait
+    /// for the output: the result is the cancel's.
     pub fn cancel(&mut self) -> Cancel {
         {
             let mut s = self.shared.lock().unwrap();
-            if s.phase == Phase::Publishing || self.result.is_some() {
+            if s.phase == Phase::Publishing || self.reaped.is_some() || self.result.is_some() {
                 return Cancel::TooLate;
             }
             s.phase = Phase::Cancelled;
             s.stdin = None;
             // The whole group: the child is its leader (`process_group(0)`), its ffmpeg
-            // children are members. Not waited for yet, so the id is still the child's.
-            if let Ok(pid) = i32::try_from(self.child.id()) {
-                // SAFETY: a plain syscall on our own child's process group.
-                unsafe { libc::kill(-pid, libc::SIGKILL) };
-            }
+            // children are members. Not reaped yet, so the id is still the child's.
+            signal_group(self.child.id(), false);
         }
-        self.collect();
+        self.reap();
+        // Nothing to read: the readers end when the pipes close, on their own.
+        self.readers.clear();
+        self.result = Some(self.with_leftover(Err(anyhow!("cancelled; nothing was published"))));
         Cancel::Cancelled
     }
 
-    /// Waits for the child and its readers, removes the work folder and reads the result.
+    /// Reaps the leader (it has exited, or was just killed) and removes the work folder.
+    fn reap(&mut self) {
+        if self.reaped.is_none() {
+            self.reaped = Some(self.child.wait());
+        }
+        if self.removed.is_none() {
+            self.removed = Some(std::fs::remove_dir_all(&self.work));
+        }
+    }
+
+    /// One look: has the leader exited (then: its group's survivors killed, it reaped, the work
+    /// folder removed), and is its output all read (then: the result). `block` waits for the
+    /// exit, never for the output.
+    fn step(&mut self, block: bool) {
+        if self.reaped.is_none() {
+            let pid = self.child.id();
+            match has_exited(pid, block) {
+                Ok(false) => return,
+                // Exited, a zombie: whatever it left running in its group (a descendant holding
+                // its output open, say) goes now, while the id is still its own.
+                Ok(true) => signal_group(pid, false),
+                // It cannot be looked at without reaping: reap it, and signal nothing.
+                Err(_) => {}
+            }
+            self.reap();
+        }
+        if self.readers.iter().any(|r| !r.is_finished()) {
+            return;
+        }
+        for reader in self.readers.drain(..) {
+            let _ = reader.join();
+        }
+        self.collect();
+    }
+
+    /// The work folder's removal, folded into `result`.
+    fn with_leftover(&self, result: Result<Published>) -> Result<Published> {
+        let leftover = match &self.removed {
+            Some(Err(e)) if e.kind() != std::io::ErrorKind::NotFound => Some(format!(
+                "the work folder {} could not be removed: {e}",
+                self.work.display()
+            )),
+            _ => None,
+        };
+        match (result, leftover) {
+            (r, None) => r,
+            (Ok(mut published), Some(note)) => {
+                published.notes.push(note);
+                Ok(published)
+            }
+            (Err(e), Some(note)) => Err(anyhow!("{e:#}; {note}")),
+        }
+    }
+
+    /// The result, from the reaped leader's status and its (completely read) output.
     fn collect(&mut self) {
         if self.result.is_some() {
             return;
         }
-        let status = self.child.wait();
-        for reader in self.readers.drain(..) {
-            let _ = reader.join();
-        }
-        let removed = std::fs::remove_dir_all(&self.work);
+        let status = match self.reaped.as_ref().expect("reaped before collected") {
+            Ok(status) => Ok(*status),
+            Err(e) => Err(std::io::Error::new(e.kind(), e.to_string())),
+        };
         let shared = self.shared.lock().unwrap();
         let said = &shared.said;
         let error_line = || {
@@ -297,31 +405,22 @@ impl StemsChild {
                 error_line().unwrap_or_else(|| format!("sopen stems ended with {status}"))
             )),
         };
-        let leftover = match removed {
-            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Some(format!(
-                "the work folder {} could not be removed: {e}",
-                self.work.display()
-            )),
-            _ => None,
-        };
-        let result = match (result, leftover) {
-            (r, None) => r,
-            (Ok(mut published), Some(note)) => {
-                published.notes.push(note);
-                Ok(published)
-            }
-            (Err(e), Some(note)) => Err(anyhow!("{e:#}; {note}")),
-        };
         drop(shared);
-        self.result = Some(result);
+        self.result = Some(self.with_leftover(result));
     }
 }
 
 impl Drop for StemsChild {
-    /// A child nobody waits for is cancelled: no orphan holding gigabytes.
+    /// A child nobody waits for is cancelled: no orphan holding gigabytes. One that was already
+    /// reaped (a consumed `wait`, a cancel) is never signalled again; one that is publishing is
+    /// left to finish (an upload is never cut half-way) and reaped.
     fn drop(&mut self) {
-        if self.result.is_none() && self.cancel() == Cancel::TooLate {
-            self.collect();
+        if self.reaped.is_some() {
+            self.reap();
+            return;
+        }
+        if self.cancel() == Cancel::TooLate {
+            self.reap();
         }
     }
 }

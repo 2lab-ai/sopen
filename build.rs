@@ -71,11 +71,16 @@ fn main() {
         Some(dir) => PathBuf::from(dir),
         None => fetch(&os, &arch).unwrap_or_else(|e| fail(&e)),
     };
+    if let Some(missing) = missing(&lib_dir) {
+        fail(&format!("{} is missing", missing.display()));
+    }
+    // The archives themselves: one replaced in SHERPA_ONNX_LIB_DIR (or removed from OUT_DIR)
+    // runs this again and relinks, rather than leaving the binary on the old one.
     for lib in LIBS {
-        let file = lib_dir.join(format!("lib{lib}.a"));
-        if !file.is_file() {
-            fail(&format!("{} is missing", file.display()));
-        }
+        println!(
+            "cargo:rerun-if-changed={}",
+            lib_dir.join(format!("lib{lib}.a")).display()
+        );
     }
     println!("cargo:rustc-link-search=native={}", lib_dir.display());
     for lib in LIBS {
@@ -105,8 +110,17 @@ fn fail(why: &str) -> ! {
     )
 }
 
+/// The first of [`LIBS`] that `dir` does not have.
+fn missing(dir: &Path) -> Option<PathBuf> {
+    LIBS.iter()
+        .map(|lib| dir.join(format!("lib{lib}.a")))
+        .find(|file| !file.is_file())
+}
+
 /// The extracted `lib/` for this target under `OUT_DIR`, downloaded and checked first when it
-/// is not there yet.
+/// is not there yet. The stamp (the archive's SHA-256) says an extraction is complete: it is
+/// removed before anything in the extraction changes and written only once a new one has every
+/// library, so an extraction cut short — or one that lost a file — is never trusted.
 fn fetch(os: &str, arch: &str) -> Result<PathBuf, String> {
     let (platform, sha) = ARCHIVES
         .iter()
@@ -116,10 +130,16 @@ fn fetch(os: &str, arch: &str) -> Result<PathBuf, String> {
     let out = PathBuf::from(std::env::var("OUT_DIR").map_err(|e| format!("OUT_DIR: {e}"))?);
     let stem = format!("sherpa-onnx-v{VERSION}-{platform}-static-lib");
     let lib_dir = out.join(&stem).join("lib");
-    // Written last: an extraction cut short is never taken for a finished one.
     let stamp = out.join(format!("{stem}.sha256"));
-    if std::fs::read_to_string(&stamp).is_ok_and(|s| s.trim() == sha) && lib_dir.is_dir() {
+    if std::fs::read_to_string(&stamp).is_ok_and(|s| s.trim() == sha) && missing(&lib_dir).is_none()
+    {
         return Ok(lib_dir);
+    }
+    match std::fs::remove_file(&stamp) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+            return Err(format!("cannot remove {}: {e}", stamp.display()))
+        }
+        _ => {}
     }
     let archive = out.join(format!("{stem}.tar.bz2"));
     let url = format!(
@@ -146,7 +166,12 @@ fn fetch(os: &str, arch: &str) -> Result<PathBuf, String> {
         return Err(format!("{url} has SHA-256 {got}, not the pinned {sha}"));
     }
     std::fs::rename(&part, &archive).map_err(|e| format!("{}: {e}", archive.display()))?;
-    let _ = std::fs::remove_dir_all(out.join(&stem));
+    match std::fs::remove_dir_all(out.join(&stem)) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+            return Err(format!("cannot remove {}: {e}", out.join(&stem).display()))
+        }
+        _ => {}
+    }
     run(Command::new("tar")
         .arg("-xjf")
         .arg(&archive)
@@ -154,7 +179,13 @@ fn fetch(os: &str, arch: &str) -> Result<PathBuf, String> {
         .arg(&out))
     .map_err(|e| format!("cannot unpack {}: {e}", archive.display()))?;
     let _ = std::fs::remove_file(&archive);
-    std::fs::write(&stamp, sha).map_err(|e| format!("{}: {e}", stamp.display()))?;
+    if let Some(gone) = missing(&lib_dir) {
+        return Err(format!("{url} unpacked without {}", gone.display()));
+    }
+    let fresh = out.join(format!("{stem}.sha256.part"));
+    std::fs::write(&fresh, sha)
+        .and_then(|()| std::fs::rename(&fresh, &stamp))
+        .map_err(|e| format!("{}: {e}", stamp.display()))?;
     Ok(lib_dir)
 }
 

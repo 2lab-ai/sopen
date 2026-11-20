@@ -1721,8 +1721,18 @@ fn stems_on_a_local_file_writes_two_siblings_and_never_overwrites() {
     assert!(err.contains("is a directory"), "{err}");
 
     let wav = tmp.path().join("a.wav");
-    if !sine_wav(&wav) {
-        return eprintln!("skipping the separation: ffmpeg not available");
+    let made = stems_fixture(
+        &[
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:duration=4",
+            wav.to_str().unwrap(),
+        ],
+        "a 4 s mono tone",
+    );
+    if !made {
+        return;
     }
     let out = sopen(tmp.path(), &["stems", wav.to_str().unwrap()], &env);
     assert!(out.status.success(), "{}", text(&out.stderr));
@@ -1751,11 +1761,30 @@ fn stems_on_a_local_file_writes_two_siblings_and_never_overwrites() {
         "{}",
         text(&out.stderr)
     );
+    // The first stems as they are: bytes, inode, modification time.
+    let snapshot = |name: &str| {
+        use std::os::unix::fs::MetadataExt;
+        let path = tmp.path().join(name);
+        let meta = std::fs::symlink_metadata(&path).unwrap();
+        (
+            std::fs::read(&path).unwrap(),
+            meta.ino(),
+            meta.mtime(),
+            meta.mtime_nsec(),
+        )
+    };
+    let first = [snapshot("a.voice.wav"), snapshot("a.music.wav")];
     let again = sopen(tmp.path(), &["stems", wav.to_str().unwrap()], &env);
     assert!(again.status.success(), "{}", text(&again.stderr));
     let printed = text(&again.stdout);
     assert!(printed.contains("/a.voice-1.wav\n"), "{printed}");
     assert!(printed.contains("/a.music-1.wav\n"), "{printed}");
+    assert!(tmp.path().join("a.voice-1.wav").is_file());
+    assert!(tmp.path().join("a.music-1.wav").is_file());
+    assert!(
+        first == [snapshot("a.voice.wav"), snapshot("a.music.wav")],
+        "the first stems were touched"
+    );
     let logged = usage_lines(tmp.path());
     let last = logged.last().unwrap();
     assert_eq!(
@@ -1765,18 +1794,135 @@ fn stems_on_a_local_file_writes_two_siblings_and_never_overwrites() {
     assert_eq!(last["kind"], "audio");
 }
 
-/// `<dir>/<name>`: `seconds` of a tone over noise as a WAV (44.1 kHz stereo), or `false` without
-/// ffmpeg.
-fn tone_wav(path: &Path, seconds: u32) -> bool {
+/// Makes a separation fixture with `ffmpeg <args>`: `true` when made. When it cannot be made it
+/// is a skip (`false`, the reason printed) — unless the tests are required
+/// (`SOPEN_REQUIRE_FFMPEG` or `SOPEN_REQUIRE_STEMS`, as in CI), where it is a failure that shows
+/// what ffmpeg said.
+fn stems_fixture(args: &[&str], what: &str) -> bool {
     let ffmpeg = std::env::var("SOPEN_FFMPEG").unwrap_or_else(|_| "ffmpeg".into());
-    Command::new(&ffmpeg)
+    let required = ["SOPEN_REQUIRE_FFMPEG", "SOPEN_REQUIRE_STEMS"]
+        .iter()
+        .any(|k| std::env::var_os(k).is_some());
+    fixture_with(&ffmpeg, args, what, required)
+}
+
+fn fixture_with(ffmpeg: &str, args: &[&str], what: &str, required: bool) -> bool {
+    let out = Command::new(ffmpeg)
         .args(["-hide_banner", "-loglevel", "error", "-nostdin", "-y"])
-        .args(["-f", "lavfi", "-i"])
-        .arg(format!("sine=frequency=220:duration={seconds}"))
-        .args(["-ac", "2"])
-        .arg(path)
-        .status()
-        .is_ok_and(|s| s.success())
+        .args(args)
+        .output();
+    let why = match out {
+        Ok(out) if out.status.success() => return true,
+        Ok(out) => format!(
+            "{ffmpeg} exited with {}: {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim()
+        ),
+        Err(e) => format!("cannot run {ffmpeg}: {e}"),
+    };
+    if required {
+        panic!("cannot make {what} (the separation tests are required): {why}");
+    }
+    eprintln!("skipping: cannot make {what}: {why}");
+    false
+}
+
+/// `path`: `seconds` of a 220 Hz tone, stereo 44.1 kHz WAV ([`stems_fixture`]).
+fn tone_wav(path: &Path, seconds: u32) -> bool {
+    let tone = format!("sine=frequency=220:duration={seconds}");
+    let path = path.to_str().unwrap();
+    stems_fixture(
+        &["-f", "lavfi", "-i", &tone, "-ac", "2", path],
+        &format!("a {seconds} s tone"),
+    )
+}
+
+/// A fixture ffmpeg cannot make fails the required tests with what ffmpeg said, and is a skip
+/// otherwise.
+#[test]
+fn a_fixture_ffmpeg_cannot_make_fails_required_runs_with_its_stderr() {
+    let tmp = tempfile::tempdir().unwrap();
+    let fake = tmp.path().join("ffmpeg");
+    executable(&fake, "#!/bin/sh\necho 'boom: no lavfi here' >&2\nexit 1\n");
+    let fake = fake.to_str().unwrap();
+    // Not required: a skip. (Retried while a just-written script is busy, as run_fresh does.)
+    let mut made = None;
+    for _ in 0..50 {
+        let caught = std::panic::catch_unwind(|| fixture_with(fake, &["x"], "a tone", false));
+        if let Ok(m) = caught {
+            made = Some(m);
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert_eq!(made, Some(false));
+    let required = std::panic::catch_unwind(|| fixture_with(fake, &["x"], "a tone", true));
+    let message = required
+        .unwrap_err()
+        .downcast::<String>()
+        .map(|m| *m)
+        .unwrap_or_default();
+    assert!(message.contains("cannot make a tone"), "{message}");
+    assert!(message.contains("boom: no lavfi here"), "{message}");
+}
+
+/// The child's stderr, line by line, from a thread that reads it to its end (so the child never
+/// blocks on a full pipe).
+fn stderr_lines(stderr: impl std::io::Read + Send + 'static) -> std::sync::mpsc::Receiver<String> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        use std::io::BufRead;
+        for line in std::io::BufReader::new(stderr)
+            .lines()
+            .map_while(Result::ok)
+        {
+            let _ = tx.send(line);
+        }
+    });
+    rx
+}
+
+/// Kills `child`'s process group (it leads one) and reaps it.
+fn kill_group(child: &mut std::process::Child) {
+    // SAFETY: a plain syscall on our own child's group; it is not reaped yet.
+    unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL) };
+    let _ = child.wait();
+}
+
+/// The first line of `lines` that is `want` — within 120 s, else the child's group is killed
+/// and the test fails with what it said.
+fn wait_for_line(
+    lines: &std::sync::mpsc::Receiver<String>,
+    child: &mut std::process::Child,
+    want: &dyn Fn(&str) -> bool,
+    what: &str,
+) -> String {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    let mut said = Vec::new();
+    loop {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        match lines.recv_timeout(left) {
+            Ok(line) if want(&line) => return line,
+            Ok(line) => said.push(line),
+            Err(_) => {
+                kill_group(child);
+                panic!("no {what} line; the child said: {said:?}");
+            }
+        }
+    }
+}
+
+fn first_progress(
+    lines: &std::sync::mpsc::Receiver<String>,
+    child: &mut std::process::Child,
+) -> sopen::stems::PieceProgress {
+    let line = wait_for_line(
+        lines,
+        child,
+        &|l| sopen::stems::PieceProgress::parse(l).is_some(),
+        "progress",
+    );
+    sopen::stems::PieceProgress::parse(&line).unwrap()
 }
 
 /// No process is left in the group `pgid` (within a few seconds: a killed grandchild is reaped by
@@ -1809,7 +1955,7 @@ fn the_real_child_publishes_on_the_go_ahead_and_cancels_cleanly() {
     let tmp = tempfile::tempdir().unwrap();
     let short = tmp.path().join("short.wav");
     if !tone_wav(&short, 4) {
-        return eprintln!("skipping: ffmpeg not available");
+        return;
     }
     let work_root = tmp.path().join("cache/.exports");
     let child = sopen::stems::spawn_child(
@@ -1873,11 +2019,10 @@ fn the_real_child_stops_when_its_parent_goes() {
     let tmp = tempfile::tempdir().unwrap();
     let long = tmp.path().join("long.wav");
     if !tone_wav(&long, 65) {
-        return eprintln!("skipping: ffmpeg not available");
+        return;
     }
     let work = tmp.path().join("work");
     std::fs::create_dir(&work).unwrap();
-    use std::io::BufRead;
     use std::os::unix::process::CommandExt;
     let mut child = sopen_command(tmp.path())
         .args([
@@ -1894,12 +2039,9 @@ fn the_real_child_stops_when_its_parent_goes() {
         .spawn()
         .unwrap();
     // Separating has begun: the first progress line (ONNX Runtime may say things before it).
-    let stderr = std::io::BufReader::new(child.stderr.take().unwrap());
-    let first = stderr
-        .lines()
-        .map_while(Result::ok)
-        .find_map(|l| sopen::stems::PieceProgress::parse(&l));
-    assert_eq!(first.map(|p| (p.done, p.total)), Some((0, 3)));
+    let lines = stderr_lines(child.stderr.take().unwrap());
+    let first = first_progress(&lines, &mut child);
+    assert_eq!((first.done, first.total), (0, 3));
     drop(child.stdin.take());
     let asked = std::time::Instant::now();
     let status = loop {
@@ -1932,31 +2074,32 @@ fn stems_of_a_mono_48k_video_are_m4a_aac_mono_48k() {
         return;
     };
     let tmp = tempfile::tempdir().unwrap();
-    let ffmpeg = std::env::var("SOPEN_FFMPEG").unwrap_or_else(|_| "ffmpeg".into());
     let clip = tmp.path().join("clip.mp4");
-    let made = Command::new(&ffmpeg)
-        .args(["-hide_banner", "-loglevel", "error", "-nostdin", "-y"])
-        .args([
+    let made = stems_fixture(
+        &[
             "-f",
             "lavfi",
             "-i",
             "testsrc2=size=160x120:rate=25:duration=4",
-        ])
-        .args([
             "-f",
             "lavfi",
             "-i",
             "sine=frequency=330:duration=4:sample_rate=48000",
-        ])
-        .args([
-            "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", "-ac", "1",
-        ])
-        .args(["-shortest"])
-        .arg(&clip)
-        .status()
-        .is_ok_and(|s| s.success());
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "aac",
+            "-ac",
+            "1",
+            "-shortest",
+            clip.to_str().unwrap(),
+        ],
+        "an H.264 + AAC (mono 48 kHz) clip",
+    );
     if !made {
-        return eprintln!("skipping: ffmpeg cannot make an H.264 + AAC fixture");
+        return;
     }
     let out = sopen(
         tmp.path(),
@@ -1996,4 +2139,91 @@ fn stems_of_a_mono_48k_video_are_m4a_aac_mono_48k() {
         level.abs() < 0.3,
         "voice + music is {level:+.2} dB off the source"
     );
+}
+
+/// The publish barrier on the real child (spec §7a): with its stdin held open it encodes, says
+/// it is ready, and publishes nothing — however long it waits — until `publish` comes; any other
+/// answer, or the end of its stdin, publishes nothing at all.
+#[test]
+fn the_real_child_publishes_nothing_before_the_go_ahead() {
+    if !cfg!(feature = "stems") {
+        return;
+    }
+    let Some((model, _turn)) = stems_model() else {
+        return;
+    };
+    use std::io::Write;
+    use std::os::unix::process::CommandExt;
+    for answer in [Some("publish"), Some("no"), None] {
+        let tmp = tempfile::tempdir().unwrap();
+        let short = tmp.path().join("short.wav");
+        if !tone_wav(&short, 4) {
+            return;
+        }
+        let work = tmp.path().join("work");
+        std::fs::create_dir(&work).unwrap();
+        let mut child = sopen_command(tmp.path())
+            .args([
+                "stems",
+                "--work-dir",
+                work.to_str().unwrap(),
+                "--wait-to-publish",
+            ])
+            .args(["--model", &model, "--", short.to_str().unwrap()])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let lines = stderr_lines(child.stderr.take().unwrap());
+        wait_for_line(
+            &lines,
+            &mut child,
+            &|l| l == sopen::stems::READY_LINE,
+            "ready",
+        );
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+        let voice = tmp.path().join("short.voice.wav");
+        let music = tmp.path().join("short.music.wav");
+        assert!(
+            !voice.exists() && !music.exists(),
+            "published before the go-ahead"
+        );
+        let mut stdin = child.stdin.take().unwrap();
+        match answer {
+            Some(word) => writeln!(stdin, "{word}").unwrap(),
+            None => drop(stdin),
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            if std::time::Instant::now() > deadline {
+                kill_group(&mut child);
+                panic!("{answer:?}: the child did not end");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+        let said: Vec<String> = lines.try_iter().collect();
+        let mut printed = String::new();
+        std::io::Read::read_to_string(&mut child.stdout.take().unwrap(), &mut printed).unwrap();
+        if answer == Some("publish") {
+            assert!(status.success(), "{said:?}");
+            assert!(voice.is_file() && music.is_file());
+            assert_eq!(printed.lines().count(), 2, "{printed}");
+        } else {
+            assert!(!status.success(), "{answer:?}");
+            assert!(!voice.exists() && !music.exists(), "{answer:?}: published");
+            assert!(printed.is_empty(), "{answer:?}: {printed}");
+            if answer.is_some() {
+                assert!(
+                    said.iter().any(|l| l.contains("nothing was published")),
+                    "{said:?}"
+                );
+            }
+        }
+        assert!(!work.exists(), "{answer:?}: the work folder is left");
+    }
 }
