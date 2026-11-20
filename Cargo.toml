@@ -43,8 +43,10 @@ cpal = "0.18.2"
 rtrb = "0.4.1"
 # `O_NOFOLLOW` / `O_NONBLOCK`: chmod a cache entry through its own descriptor, never a path.
 libc = "0.2.191"
-# openssh / openssh-sftp-client are async; sopen drives them from a current-thread runtime.
-tokio = { version = "1.54.1", features = ["rt", "time"] }
+# openssh / openssh-sftp-client are async; sopen drives them from a current-thread runtime
+# (`sync`: a stream's transport thread takes its requests through a tokio channel; the SFTP
+# client already turns the feature on).
+tokio = { version = "1.54.1", features = ["rt", "time", "sync"] }
 # The config file (`target = "<host>"`, spec §4a) is TOML; a key sopen does not know is an error.
 serde = { version = "1.0.229", features = ["derive"] }
 toml = "1.2.1"
@@ -74,8 +76,9 @@ unicode-segmentation = "1.13.3"
 
 [dev-dependencies]
 tempfile = "3.27.0"
-# Tests run OpenSSH's own `sftp-server` as a child over pipes (a real server without ssh).
-tokio = { version = "1.54.1", features = ["process"] }
+# Tests run OpenSSH's own `sftp-server` as a child over pipes (a real server without ssh), some
+# through a proxy that clips its replies (`io-util`: the in-memory pipe and packet reads).
+tokio = { version = "1.54.1", features = ["process", "io-util"] }
 
 # macOS: the app menu's Quit item would end the process past the unsaved-changes prompt; sopen
 # turns the default menu off and handles Cmd+Q itself.

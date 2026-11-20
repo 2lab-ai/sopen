@@ -9,12 +9,20 @@
 //! [`OutcomeUnknown`](super::OutcomeUnknown), never as "nothing written".
 
 mod ops;
+mod ranged;
 
-use super::{unknown, CreateError, Created, Entry, Hashing, Like, RemoteFs, Stat, Uploaded};
+#[cfg(test)]
+pub(crate) use ranged::{SftpRanged, Timing};
+
+use super::ranged::Pipeline;
+use super::{
+    unknown, CreateError, Created, Entry, Hashing, Like, Ranged, Refused, RemoteFs, Stat, Uploaded,
+};
 use crate::target::RemoteSpec;
 use anyhow::{anyhow, bail, Context, Result};
 use bytes::BytesMut;
 use openssh_sftp_client::error::{Error as SftpErr, SftpErrorKind};
+use openssh_sftp_client::file::File;
 use openssh_sftp_client::fs::Fs;
 use openssh_sftp_client::metadata::{MetaData, MetaDataBuilder, Permissions};
 use openssh_sftp_client::{Sftp, SftpOptions};
@@ -22,6 +30,7 @@ use std::ffi::OsString;
 use std::future::Future;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
@@ -30,7 +39,7 @@ use tokio::runtime::Runtime;
 /// macOS `sun_path` holds 104 bytes; ssh binds the master at `<ControlPath>.<16 random>` first.
 const MAX_SOCKET_PATH: usize = 103 - 17;
 
-/// Bytes per read request / local read when uploading.
+/// Bytes per local read when uploading (and per request of 3a426b6's read loop, kept for tests).
 const CHUNK: usize = 256 * 1024;
 
 /// One metadata request (stat, open, rename, setstat, …).
@@ -39,7 +48,8 @@ pub const META_TIMEOUT: Duration = Duration::from_secs(30);
 pub const STALL_TIMEOUT: Duration = Duration::from_secs(60);
 
 pub struct SftpRemote {
-    rt: Runtime,
+    /// `None` only while the session is the transport of a stream (`sftp/ranged.rs`).
+    rt: Option<Runtime>,
     sftp: Option<Sftp>,
     fs: Option<Fs>,
     /// Stat requests sopen sent (tests: a listing must not stat every name).
@@ -112,7 +122,7 @@ impl SftpRemote {
         );
         let fs = sftp.fs();
         Ok(Self {
-            rt,
+            rt: Some(rt),
             sftp: Some(sftp),
             fs: Some(fs),
             #[cfg(test)]
@@ -123,7 +133,7 @@ impl SftpRemote {
     fn parts(&mut self) -> (&Runtime, &Sftp, &mut Fs) {
         let Self { rt, sftp, fs, .. } = self;
         (
-            rt,
+            rt.as_ref().expect("open session"),
             sftp.as_ref().expect("open session"),
             fs.as_mut().expect("open session"),
         )
@@ -199,8 +209,8 @@ fn failed_create(path: &str, e: SftpErr) -> CreateError {
 impl Drop for SftpRemote {
     fn drop(&mut self) {
         drop(self.fs.take());
-        if let Some(sftp) = self.sftp.take() {
-            let _ = self.rt.block_on(async {
+        if let (Some(rt), Some(sftp)) = (&self.rt, self.sftp.take()) {
+            let _ = rt.block_on(async {
                 tokio::time::timeout(Duration::from_secs(5), sftp.close()).await
             });
         }
@@ -647,6 +657,47 @@ impl RemoteFs for SftpRemote {
         let got = rt.block_on(within(META_TIMEOUT, fs.remove_file(path)));
         changed(&format!("remove {path}"), got)
     }
+
+    fn into_ranged(self: Box<Self>, path: &str) -> std::result::Result<Box<dyn Ranged>, Refused> {
+        let r = self.open_ranged(path, ranged::Timing::default())?;
+        Ok(Box::new(r))
+    }
+}
+
+/// One request reading `len` bytes at `off` of `file` through a clone of its handle, so the
+/// offset is this request's own, never the crate's cursor — which moves by the length asked,
+/// not by the bytes that came back (`openssh-sftp-client` 0.15.12, `file/mod.rs:403-428`). The
+/// request is written when the future is first polled. `None`: the end of the file.
+type ReadReply = Pin<Box<dyn Future<Output = ReadResult>>>;
+type ReadResult = std::result::Result<Option<BytesMut>, SftpErr>;
+
+fn read_at(file: &File, off: u64, len: u32) -> ReadReply {
+    let mut file = file.clone();
+    Box::pin(async move {
+        use tokio::io::AsyncSeek;
+        Pin::new(&mut file).start_seek(std::io::SeekFrom::Start(off))?;
+        file.read(len, BytesMut::with_capacity(len as usize)).await
+    })
+}
+
+/// Polls every request in `flight` in order — a new one's first poll writes it, so they go out
+/// in the order pushed — and takes out those answered, with their offsets.
+fn poll_replies(
+    flight: &mut Vec<(u64, ReadReply)>,
+    cx: &mut std::task::Context<'_>,
+) -> std::task::Poll<Vec<(u64, ReadResult)>> {
+    let mut ready = Vec::new();
+    flight.retain_mut(|(off, reply)| match reply.as_mut().poll(cx) {
+        std::task::Poll::Ready(r) => {
+            ready.push((*off, r));
+            false
+        }
+        std::task::Poll::Pending => true,
+    });
+    match ready.is_empty() {
+        true => std::task::Poll::Pending,
+        false => std::task::Poll::Ready(ready),
+    }
 }
 
 impl SftpRemote {
@@ -676,7 +727,11 @@ impl SftpRemote {
         })
     }
 
-    /// Reads `path` (up to `max` bytes) into `sink`, failing after [`STALL_TIMEOUT`] without data.
+    /// Reads `path` (up to `max` bytes) into `sink`, pipelined (06 §2): every request carries its
+    /// own offset, a short reply is followed by a request for the rest, the bytes reach `sink`
+    /// in file order, and up to 4 MiB is asked ahead ([`Pipeline`]). Fails after
+    /// [`STALL_TIMEOUT`] with no reply at all. A failing `sink` (a cancel, as `Stoppable`) ends
+    /// it between chunks.
     fn read_with(
         &mut self,
         path: &str,
@@ -686,32 +741,64 @@ impl SftpRemote {
     ) -> Result<u64> {
         let (rt, sftp, _) = self.parts();
         rt.block_on(async {
-            let mut file = within(META_TIMEOUT, sftp.open(path))
+            let file = within(META_TIMEOUT, sftp.open(path))
                 .await
                 .map_err(|()| timed_out(&format!("open {path}"), META_TIMEOUT))?
                 .map_err(|e| anyhow!("cannot open {path}: {e}"))?;
-            let mut done = 0u64;
-            loop {
-                // The client caps each request at the server's read limit.
-                let want = match max {
-                    Some(max) if done as usize >= max => break,
-                    Some(max) => (max - done as usize).min(CHUNK),
-                    None => CHUNK,
-                } as u32;
-                let chunk = within(
-                    STALL_TIMEOUT,
-                    file.read(want, BytesMut::with_capacity(want as usize)),
-                )
-                .await
-                .map_err(|()| timed_out(&format!("read {path}"), STALL_TIMEOUT))?
-                .map_err(|e| anyhow!("cannot read {path}: {e}"))?;
-                let Some(bytes) = chunk else { break };
-                sink(&bytes)?;
-                done += bytes.len() as u64;
-                progress(done);
-            }
+            let mut flight = Vec::new();
+            let read = async {
+                let mut plan = Pipeline::new(max.map(|m| m as u64));
+                let mut done = 0u64;
+                loop {
+                    while let Some((off, len)) = plan.send() {
+                        flight.push((off, read_at(&file, off, len)));
+                    }
+                    if plan.done() {
+                        return Ok(done);
+                    }
+                    let replies = within(
+                        STALL_TIMEOUT,
+                        std::future::poll_fn(|cx| poll_replies(&mut flight, cx)),
+                    )
+                    .await
+                    .map_err(|()| timed_out(&format!("read {path}"), STALL_TIMEOUT))?;
+                    for (off, reply) in replies {
+                        let got = reply.map_err(|e| anyhow!("cannot read {path}: {e}"))?;
+                        plan.reply(off, got.map(BytesMut::freeze))
+                            .with_context(|| format!("cannot read {path}"))?;
+                    }
+                    while let Some(bytes) = plan.take() {
+                        sink(&bytes)?;
+                        done += bytes.len() as u64;
+                        progress(done);
+                    }
+                }
+            };
+            let result = read.await;
+            // Requests still out hold clones of the handle: drop them first, or the close below
+            // (sent only by the last clone) never goes out.
+            drop(flight);
             let _ = within(Duration::from_secs(5), file.close()).await;
-            Ok(done)
+            result
+        })
+    }
+
+    /// 3a426b6's `read_with`, kept to show what V5 fixes: one 256 KiB request at a time through
+    /// the crate's cursor, which moves by the length asked.
+    #[cfg(test)]
+    pub(crate) fn read_through_cursor(&mut self, path: &str) -> Result<Vec<u8>> {
+        let (rt, sftp, _) = self.parts();
+        rt.block_on(async {
+            let mut file = sftp.open(path).await?;
+            let mut out = Vec::new();
+            while let Some(bytes) = file
+                .read(CHUNK as u32, BytesMut::with_capacity(CHUNK))
+                .await?
+            {
+                out.extend_from_slice(&bytes);
+            }
+            let _ = file.close().await;
+            Ok(out)
         })
     }
 }
@@ -725,6 +812,121 @@ const SFTP_SERVERS: [&str; 4] = [
     "/usr/lib/ssh/sftp-server",
 ];
 
+/// What the test proxy between sopen and the local `sftp-server` does (06 §2, V5): it cuts every
+/// `SSH_FXP_DATA` payload to `clip` bytes, as a server with a lower read limit would answer (and
+/// OpenSSH's own never does), holds every reply back while `stall` is set (a link gone quiet),
+/// and logs each request as it goes out on the wire.
+#[cfg(test)]
+#[derive(Default, Clone)]
+pub(crate) struct Proxy {
+    pub clip: Option<usize>,
+    pub stall: Arc<std::sync::atomic::AtomicBool>,
+    pub wire: Arc<std::sync::Mutex<Vec<Wired>>>,
+}
+
+/// One packet as the proxy passed it: a request from sopen or a reply from the server, its SFTP
+/// packet type and, for a read, its offset and length.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Wired {
+    pub reply: bool,
+    pub kind: u8,
+    pub read: Option<(u64, u32)>,
+}
+
+#[cfg(test)]
+impl Wired {
+    pub const CLOSE: u8 = 4;
+    pub const READ: u8 = 5;
+    pub const FSTAT: u8 = 8;
+    pub const STAT: u8 = 17;
+    pub const STATUS: u8 = 101;
+    pub const DATA: u8 = 103;
+}
+
+/// One SFTP packet from `from`, whole: its 4-byte length, then that many bytes. `None` at the end.
+#[cfg(test)]
+async fn packet<R: tokio::io::AsyncRead + Unpin>(from: &mut R) -> Option<Vec<u8>> {
+    use tokio::io::AsyncReadExt;
+    let mut len = [0u8; 4];
+    from.read_exact(&mut len).await.ok()?;
+    let mut body = vec![0u8; u32::from_be_bytes(len) as usize];
+    from.read_exact(&mut body).await.ok()?;
+    Some(body)
+}
+
+#[cfg(test)]
+fn be32(b: &[u8]) -> u32 {
+    u32::from_be_bytes(b[..4].try_into().unwrap())
+}
+
+#[cfg(test)]
+async fn send_packet<W: tokio::io::AsyncWrite + Unpin>(to: &mut W, body: &[u8]) -> Option<()> {
+    use tokio::io::AsyncWriteExt;
+    to.write_all(&(body.len() as u32).to_be_bytes())
+        .await
+        .ok()?;
+    to.write_all(body).await.ok()?;
+    to.flush().await.ok()
+}
+
+#[cfg(test)]
+impl Proxy {
+    /// Requests from sopen to the server, logged and passed on unchanged.
+    async fn requests<R, W>(self, mut from: R, mut to: W)
+    where
+        R: tokio::io::AsyncRead + Unpin,
+        W: tokio::io::AsyncWrite + Unpin,
+    {
+        while let Some(body) = packet(&mut from).await {
+            // READ: type, id, handle (a string), offset, length.
+            let read = (body.first() == Some(&Wired::READ)).then(|| {
+                let handle = be32(&body[5..]) as usize;
+                let at = 9 + handle;
+                let off = u64::from_be_bytes(body[at..at + 8].try_into().unwrap());
+                (off, be32(&body[at + 8..]))
+            });
+            self.wire.lock().unwrap().push(Wired {
+                reply: false,
+                kind: body[0],
+                read,
+            });
+            if send_packet(&mut to, &body).await.is_none() {
+                return;
+            }
+        }
+    }
+
+    /// Replies from the server to sopen: a DATA payload over `clip` is cut to it.
+    async fn replies<R, W>(self, mut from: R, mut to: W)
+    where
+        R: tokio::io::AsyncRead + Unpin,
+        W: tokio::io::AsyncWrite + Unpin,
+    {
+        while let Some(mut body) = packet(&mut from).await {
+            while self.stall.load(std::sync::atomic::Ordering::Relaxed) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            self.wire.lock().unwrap().push(Wired {
+                reply: true,
+                kind: body[0],
+                read: None,
+            });
+            // DATA: type, id, data (a string).
+            if let (Some(&Wired::DATA), Some(clip)) = (body.first(), self.clip) {
+                let len = be32(&body[5..]) as usize;
+                if len > clip {
+                    body.truncate(9 + clip);
+                    body[5..9].copy_from_slice(&(clip as u32).to_be_bytes());
+                }
+            }
+            if send_packet(&mut to, &body).await.is_none() {
+                return;
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 impl SftpRemote {
     /// SFTP to this machine's own `sftp-server`, run as a child over pipes: a real server's
@@ -732,6 +934,11 @@ impl SftpRemote {
     /// where OpenSSH's server is not installed — a failure instead when
     /// `SOPEN_REQUIRE_SFTP_SERVER` is set (CI installs it).
     pub(crate) fn local_server() -> Option<Self> {
+        Self::local_server_with(None)
+    }
+
+    /// [`SftpRemote::local_server`], with the session's bytes passing through `proxy`.
+    pub(crate) fn local_server_with(proxy: Option<Proxy>) -> Option<Self> {
         let Some(server) = SFTP_SERVERS.iter().find(|p| Path::new(p).exists()) else {
             let missing = format!("no sftp-server on this machine ({SFTP_SERVERS:?})");
             if std::env::var_os("SOPEN_REQUIRE_SFTP_SERVER").is_some() {
@@ -756,13 +963,24 @@ impl SftpRemote {
             let keep = openssh_sftp_client::SftpAuxiliaryData::Boxed(Box::new(
                 std::sync::Mutex::new(child),
             ));
-            Sftp::new_with_auxiliary(stdin, stdout, SftpOptions::default(), keep)
+            let Some(proxy) = proxy else {
+                return Sftp::new_with_auxiliary(stdin, stdout, SftpOptions::default(), keep)
+                    .await
+                    .unwrap();
+            };
+            // In-memory pipes between sopen and the proxy; the proxy's tasks live on this
+            // runtime, as the session's own do.
+            let (to_proxy, from_sopen) = tokio::io::duplex(1 << 20);
+            let (to_sopen, from_proxy) = tokio::io::duplex(1 << 20);
+            tokio::spawn(proxy.clone().requests(from_sopen, stdin));
+            tokio::spawn(proxy.replies(stdout, to_sopen));
+            Sftp::new_with_auxiliary(to_proxy, from_proxy, SftpOptions::default(), keep)
                 .await
                 .unwrap()
         });
         let fs = sftp.fs();
         Some(Self {
-            rt,
+            rt: Some(rt),
             sftp: Some(sftp),
             fs: Some(fs),
             stats: 0,
