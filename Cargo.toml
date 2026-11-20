@@ -8,6 +8,14 @@ license = "MIT"
 description = "Open a file or folder on another machine as if it were local (scp syntax, system ssh, SFTP)"
 repository = "https://github.com/2lab-ai/sopen"
 
+[features]
+default = ["stems"]
+# `sopen stems` (spec §7a): voice / music separation in this process through sherpa-onnx's C API,
+# statically linked (ONNX Runtime included). build.rs downloads the pinned prebuilt archive for
+# the target and checks its SHA-256 (`SHERPA_ONNX_LIB_DIR` = an already extracted `lib/` for
+# offline builds). Without it `sopen stems` says this build cannot separate.
+stems = []
+
 [lib]
 name = "sopen"
 path = "src/lib.rs"
@@ -65,14 +73,19 @@ icu_normalizer = { version = "2.4.0", default-features = false, features = ["com
 # no GTK, nothing new linked).
 rfd = { version = "0.18.0", default-features = false, features = ["xdg-portal"] }
 # The file browser's text viewer: Sublime syntaxes, with the pure-Rust regex engine
-# (fancy-regex), not oniguruma — nothing linked, so the binary still loads with libc and
-# libasound alone. No HTML output, plist or YAML loaders: only the bundled syntax dump is read;
-# the theme is the skin's own, built in code (`gui::chrome::syntax_theme`).
+# (fancy-regex), not oniguruma — nothing linked (on Linux the binary loads glibc, libasound and,
+# for `stems`, libstdc++ and nothing else). No HTML output, plist or YAML loaders: only the
+# bundled syntax dump is read; the theme is the skin's own, built in code
+# (`gui::chrome::syntax_theme`).
 syntect = { version = "5.3.0", default-features = false, features = ["default-syntaxes", "regex-fancy"] }
 # The text viewer's word wrap breaks rows only between grapheme clusters (an Indic syllable, a
 # letter and its marks, an emoji sequence stay whole). Already in the tree (eframe → epaint), at
 # the same version.
 unicode-segmentation = "1.13.3"
+
+[build-dependencies]
+# build.rs checks the downloaded sherpa-onnx archive against its pinned SHA-256.
+sha2 = "0.10.9"
 
 [dev-dependencies]
 tempfile = "3.27.0"
