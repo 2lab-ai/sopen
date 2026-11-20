@@ -672,6 +672,20 @@ pub fn export_args(
     Ok(args)
 }
 
+/// The encoder arguments an audio export into a `.ext` file uses (as [`export_args`] picks
+/// them): the source's codec (`codec` = its ffprobe `codec_name`), else the container's usual
+/// one. `sopen stems` encodes each stem with them.
+pub fn audio_encoder(codec: Option<&str>, ext: &str) -> Result<Vec<String>> {
+    let ext = ext.to_ascii_lowercase();
+    match codec.and_then(encoder_for_codec) {
+        Some(args) => Ok(args),
+        None => match encoder_for_container(&ext) {
+            Some(args) => Ok(args.iter().map(|a| a.to_string()).collect()),
+            None => bail!("no audio export for .{ext} files"),
+        },
+    }
+}
+
 /// Encoder names (`libx264`, `aac`, …) from `ffmpeg -hide_banner -encoders`.
 pub fn parse_encoders(listing: &str) -> HashSet<String> {
     let mut names = HashSet::new();
