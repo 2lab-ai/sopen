@@ -69,6 +69,9 @@ pub struct StemsChild {
     reaped: Option<std::io::Result<ExitStatus>>,
     /// What removing the work folder gave, when it was removed.
     removed: Option<std::io::Result<()>>,
+    /// The work folder's job lock, held until the folder is removed: a sopen killed meanwhile
+    /// leaves both to the next start's sweep ([`crate::cache::sweep_stale_jobs`]).
+    lock: Option<crate::cache::JobLock>,
 }
 
 #[cfg(test)]
@@ -101,7 +104,8 @@ fn has_exited(pid: u32, block: bool) -> std::io::Result<bool> {
 /// Starts `sopen stems --work-dir <new folder> --wait-to-publish [--model M] -- SOURCE` from
 /// `sopen` — `Command::new(std::env::current_exe()?)` with whatever environment it needs — in a
 /// process group of its own. The work folder is made here, under `work_root`
-/// (`<cache>/.exports`), owner-only, and removed when the child ends however it ends.
+/// (`<cache>/.exports`), owner-only, its job lock held, and removed when the child ends however
+/// it ends.
 pub fn spawn_child(
     mut cmd: Command,
     source: &str,
@@ -109,6 +113,7 @@ pub fn spawn_child(
     work_root: &Path,
 ) -> Result<StemsChild> {
     let work = work_root.join(format!("stems-{}", crate::remote::random_hex()));
+    let lock = crate::cache::JobLock::take(&work)?;
     crate::cache::private_dir(&work)?;
     let program = PathBuf::from(cmd.get_program());
     cmd.arg("stems")
@@ -162,6 +167,7 @@ pub fn spawn_child(
         result: None,
         reaped: None,
         removed: None,
+        lock: Some(lock),
     })
 }
 
@@ -330,6 +336,7 @@ impl StemsChild {
         }
         if self.removed.is_none() {
             self.removed = Some(std::fs::remove_dir_all(&self.work));
+            self.lock = None;
         }
     }
 

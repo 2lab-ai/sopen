@@ -235,6 +235,7 @@ fn the_f_key_tables() {
         .chain(VIEWER_KEYS)
         .chain(HEX_KEYS)
         .chain(IMAGE_KEYS)
+        .chain(MEDIA_KEYS)
         .chain([&HELP_KEY, &EXIT_KEY]);
     for key in all.chain(TEXT_WRAPPED_KEYS).chain(TEXT_UNWRAPPED_KEYS) {
         assert!(key.label.chars().count() <= 6, "{key:?}");

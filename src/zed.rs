@@ -275,8 +275,9 @@ fn encode_path(path: &str) -> String {
 }
 
 /// Spawns `zed <arg>` in its own process group with no stdio, so it outlives sopen and the
-/// terminal's Ctrl-C. Waits briefly: the CLI hands off to the app and exits; a quick non-zero
-/// exit is reported. Returns the command line that was run (for the debug log and receipts).
+/// terminal's Ctrl-C. Waits briefly ([`editor_wait`]): the CLI hands off to the app and exits;
+/// a quick non-zero exit is reported. Returns the command line that was run (for the debug log
+/// and receipts).
 pub fn open(zed: &Path, arg: &OsStr) -> Result<String> {
     open_args(zed, &[arg.to_os_string()])
 }
@@ -294,7 +295,7 @@ pub fn open_args(editor: &Path, args: &[OsString]) -> Result<String> {
         .process_group(0)
         .spawn()
         .with_context(|| format!("cannot start {}", editor.display()))?;
-    let deadline = Instant::now() + Duration::from_secs(3);
+    let deadline = Instant::now() + editor_wait(std::env::var_os("SOPEN_EDITOR_WAIT").as_deref());
     while Instant::now() < deadline {
         if let Some(status) = child.try_wait()? {
             if !status.success() {
@@ -305,6 +306,23 @@ pub fn open_args(editor: &Path, args: &[OsString]) -> Result<String> {
         std::thread::sleep(Duration::from_millis(50));
     }
     Ok(line)
+}
+
+/// The longest `SOPEN_EDITOR_WAIT` may make the wait for an editor CLI's quick exit.
+const EDITOR_WAIT_MAX_S: f64 = 120.0;
+
+/// How long [`open_args`] waits for the editor CLI's quick exit (it returns as soon as the CLI
+/// exits): `SOPEN_EDITOR_WAIT=<seconds>` (tests: a loaded machine can take longer than the
+/// usual 3 s to start a stand-in and see it fail), at most [`EDITOR_WAIT_MAX_S`]; anything else
+/// — not a positive number — the usual 3 s. Never unbounded: an editor that never exits never
+/// holds sopen.
+fn editor_wait(value: Option<&OsStr>) -> Duration {
+    value
+        .and_then(OsStr::to_str)
+        .and_then(|v| v.trim().parse::<f64>().ok())
+        .filter(|s| s.is_finite() && *s > 0.0)
+        .map(|s| Duration::from_secs_f64(s.min(EDITOR_WAIT_MAX_S)))
+        .unwrap_or(Duration::from_secs(3))
 }
 
 /// `$VISUAL`, then `$EDITOR`, then `vi`.
@@ -338,6 +356,20 @@ pub fn run_terminal_editor(file: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `SOPEN_EDITOR_WAIT` is seconds, capped at 120; anything else is the usual 3 s — never
+    /// "until it exits".
+    #[test]
+    fn the_editor_wait_is_seconds_and_bounded() {
+        let wait = |v: &str| editor_wait(Some(OsStr::new(v)));
+        assert_eq!(editor_wait(None), Duration::from_secs(3));
+        assert_eq!(wait("60"), Duration::from_secs(60));
+        assert_eq!(wait(" 0.5 "), Duration::from_millis(500));
+        assert_eq!(wait("100000"), Duration::from_secs(120));
+        for other in ["exit", "", "0", "-5", "inf", "NaN", "3s"] {
+            assert_eq!(wait(other), Duration::from_secs(3), "{other:?}");
+        }
+    }
 
     #[test]
     fn code_discovery_and_arguments() {
