@@ -199,8 +199,9 @@ too, where F3 closes it as ⌘W does.
     Japanese have no spaces; Hangul words, which are spaced, and Latin words stay whole), never
     before closing punctuation (`。、」）！？`…) or a space, never after opening punctuation
     (`「（`…). A space the row is full at is not carried to the next row. A row is painted left
-    to right: each run of right-to-left letters (Hebrew, Arabic…, with the spaces between them)
-    is shaped as one, right to left, and everything else left to right, in the row's order —
+    to right: each run of right-to-left letters (Hebrew, Arabic…, with the spaces between them;
+    by grapheme cluster, so a mark stays with its letter) is shaped as one, right to left, and
+    everything else left to right, in the row's order —
     egui would otherwise shape a row whose first strong letter is right to left reversed whole,
     its English too; painting only, never the measured width. A tab goes to the next stop of four
     cells counted from its row's start. A line is wrapped afresh at every 16 KiB of it — at the

@@ -2142,17 +2142,28 @@ fn direction(c: char) -> Option<bool> {
 /// came out reversed whole, its English too. Here each run of right-to-left letters — with the
 /// spaces and marks between them — is a section of its own (shaped right to left, as it reads),
 /// and everything else is shaped left to right; the runs stay in their order, as in a
-/// left-to-right paragraph. The text and the colours are the row's own: only how egui shapes it
-/// changes.
+/// left-to-right paragraph. Sections never split a grapheme cluster (a cluster takes its base's
+/// direction and colour). The text is the row's own: only how egui shapes it changes.
 fn directed_job(chars: Vec<(char, Color32)>, font: &FontId) -> LayoutJob {
-    let class: Vec<Option<bool>> = chars.iter().map(|&(c, _)| direction(c)).collect();
-    // A neutral character goes right to left only between two right-to-left letters.
-    let mut next_rtl = vec![false; chars.len()];
+    use unicode_segmentation::UnicodeSegmentation;
+    let text: String = chars.iter().map(|&(c, _)| c).collect();
+    // By grapheme cluster, each with its base's direction and colour: a mark, a ZWJ or a
+    // variation selector goes where its base goes, never into a section of its own (egui would
+    // shape it apart from its base).
+    let mut clusters: Vec<(&str, Option<bool>, Color32)> = Vec::new();
+    let mut at = 0;
+    for g in text.graphemes(true) {
+        let (base, color) = chars[at];
+        clusters.push((g, direction(base), color));
+        at += g.chars().count();
+    }
+    // A neutral cluster goes right to left only between two right-to-left letters.
+    let mut next_rtl = vec![false; clusters.len()];
     let mut next = None;
-    for i in (0..chars.len()).rev() {
+    for i in (0..clusters.len()).rev() {
         next_rtl[i] = next == Some(true);
-        if class[i].is_some() {
-            next = class[i];
+        if clusters[i].1.is_some() {
+            next = clusters[i].1;
         }
     }
     let mut job = LayoutJob::default();
@@ -2170,17 +2181,17 @@ fn directed_job(chars: Vec<(char, Color32)>, font: &FontId) -> LayoutJob {
     };
     let (mut run, mut key) = (String::new(), None);
     let mut prev = None;
-    for (i, &(c, color)) in chars.iter().enumerate() {
-        let rtl = class[i].unwrap_or(prev == Some(true) && next_rtl[i]);
-        if class[i].is_some() {
-            prev = class[i];
+    for (i, &(g, class, color)) in clusters.iter().enumerate() {
+        let rtl = class.unwrap_or(prev == Some(true) && next_rtl[i]);
+        if class.is_some() {
+            prev = class;
         }
         if let Some((was, _)) = key.filter(|&k| k != (color, rtl)) {
             push(&mut job, &run, was);
             run.clear();
         }
         key = Some((color, rtl));
-        run.push(c);
+        run.push_str(g);
     }
     if let Some((color, _)) = key {
         push(&mut job, &run, color);

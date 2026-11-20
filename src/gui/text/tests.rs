@@ -2747,7 +2747,14 @@ fn cjk_rows_fill_the_width(name: &str, unit: &str) {
         line,
         "{name}: the rows are the paragraph"
     );
-    assert_eq!(back.len(), all.len(), "{name}");
+    let forward: Vec<wrap::Pos> = all
+        .iter()
+        .map(|r| wrap::Pos {
+            line: r.line,
+            off: r.start,
+        })
+        .collect();
+    assert_eq!(forward, back, "{name}: the same rows going back up");
     let font = chrome::font();
     let plain = chrome::Palette::of(&drv.ctx.global_style().visuals).text;
     let wide = |t: &str| {
@@ -2824,4 +2831,78 @@ fn a_chinese_paragraph_fills_its_rows() {
         "zh.txt",
         "中文文本换行显示测试，这是一个很长的段落。其中也有 Mixed English 单词（括号）和标点！ ",
     );
+}
+
+/// Sections of a painted row never split a grapheme cluster: a combining mark, a ZWJ or a
+/// variation selector after a right-to-left letter — mid-row or at the row's end — goes in its
+/// base's section (egui would shape it alone, detached from its base).
+#[test]
+fn directed_sections_never_split_a_cluster() {
+    use unicode_segmentation::UnicodeSegmentation;
+    let font = chrome::font();
+    for s in [
+        "\u{05D0}\u{0301} x",
+        "x \u{05D0}\u{0301}",
+        "\u{0628}\u{0301} x",
+        "x \u{0628}\u{0301}",
+        "\u{05D0}\u{0591}\u{05D1} text",
+        "x \u{0628}\u{200D}",
+        "\u{05D0}\u{FE0F} y",
+    ] {
+        let job = directed_job(s.chars().map(|c| (c, Color32::WHITE)).collect(), &font);
+        assert_eq!(job.text, s);
+        let starts: std::collections::HashSet<usize> = s
+            .grapheme_indices(true)
+            .map(|(i, _)| i)
+            .chain([s.len()])
+            .collect();
+        let ranges: Vec<(usize, usize)> = job
+            .sections
+            .iter()
+            .map(|sec| (sec.byte_range.start.0, sec.byte_range.end.0))
+            .collect();
+        for &(from, to) in &ranges {
+            assert!(
+                starts.contains(&from) && starts.contains(&to),
+                "{s:?}: a section boundary inside a cluster: {ranges:?}"
+            );
+        }
+    }
+}
+
+/// On screen such a mark sits over its base — mid-row and at the row's end — and the row is as
+/// wide as it was measured.
+#[test]
+fn a_mark_after_a_right_to_left_letter_stays_on_its_base() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut drv = Driver::new(600.0, 400.0);
+    if !system_fonts(&mut drv, tmp.path(), "\u{0628}") {
+        return;
+    }
+    let font = chrome::font();
+    let plain = chrome::Palette::of(&drv.ctx.global_style().visuals).text;
+    for s in ["\u{0628}\u{0301} x", "x \u{0628}\u{0301}"] {
+        let job = directed_job(s.chars().map(|c| (c, plain)).collect(), &font);
+        let galley = drv.ctx.fonts_mut(|f| f.layout_job(job));
+        let measured = drv
+            .ctx
+            .fonts_mut(|f| f.layout_no_wrap(s.to_string(), font.clone(), plain));
+        assert_eq!(galley.size().x, measured.size().x, "{s:?}");
+        let glyphs = &galley.rows[0].glyphs;
+        let base = glyphs
+            .iter()
+            .position(|g| g.chr == '\u{0628}' && g.advance_width > 0.0)
+            .expect("the base");
+        let (left, right) = (glyphs[base].pos.x, glyphs[base].max_x());
+        for (i, g) in glyphs.iter().enumerate() {
+            if i != base && (g.chr == '\u{0628}' || g.chr == '\u{0301}') {
+                assert!(
+                    g.pos.x >= left - 1.5 && g.max_x() <= right + 0.5,
+                    "{s:?}: the mark at {}..{} is off its base at {left}..{right}",
+                    g.pos.x,
+                    g.max_x()
+                );
+            }
+        }
+    }
 }
