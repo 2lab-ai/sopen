@@ -5,7 +5,8 @@
 //! could overtake each other — and hands the completions back in that order.
 
 use super::{
-    is_not_found, read_at, stat_of, timed_out, within, SftpRemote, META_TIMEOUT, STALL_TIMEOUT,
+    is_not_found, read_at, stat_of, timed_out, within, SftpRemote, FLUSH_INTERVAL, META_TIMEOUT,
+    STALL_TIMEOUT,
 };
 use crate::remote::ranged::{
     clipped, Asked, Completion, Lost, Ranged, Refused, Reply, Ticket, Wake,
@@ -106,6 +107,16 @@ enum Finish {
     /// Close the handle and the session.
     Close,
 }
+
+/// After the last clone of a handle drops, its CLOSE waits in the session's write buffer and the
+/// flush task is waiting out its interval. The transport drives the runtime for a few intervals —
+/// by then the flush task's tick has fired — and then for this many scheduler passes, so the
+/// woken flush task runs: tokio wakes a yielded future only after the ready tasks have run and
+/// the driver has been polled. It waits for the local write alone, never for the server's reply.
+const FLUSH_PASSES: usize = 8;
+/// A bound on all of it: a pipe the server has stopped draining ends it here, and the CLOSE then
+/// goes out with the session's next use.
+const FLUSH_BOUND: Duration = Duration::from_millis(200);
 
 /// The finish flag's values. The driver reads it before every queued request, so what is queued
 /// behind an end is discarded, never sent.
@@ -386,8 +397,8 @@ impl Ranged for SftpRanged {
         self.into_connection().into_ranged(path)
     }
 
-    /// Does not wait for the server: the handle's close is sent, and its reply is taken by the
-    /// session's next use. When the transport's thread stopped (a bug) it took the session with
+    /// Does not wait for the server: the handle's CLOSE is written to the session before this
+    /// returns, and its reply is read by the session's next use. When the transport's thread stopped (a bug) it took the session with
     /// it: the connection given back is [`Lost`], which says so at every call.
     fn into_connection(mut self: Box<Self>) -> Box<dyn RemoteFs + Send> {
         let lost = format!(
@@ -463,10 +474,18 @@ fn transport(
         // they go first.
         drop(flight);
         match finish {
-            // The last clone's drop sends the close and leaves a task on this runtime for its
-            // reply: the session's next use takes it. Nothing here waits for the server.
+            // The last clone's drop queues the CLOSE and leaves a task on this runtime for its
+            // reply. The CLOSE is written now, before the session goes back idle; its reply is
+            // read by the session's next use (or `Sftp::close`). Nothing waits for the server.
             Finish::Keep => {
                 drop(file);
+                let flushed = async {
+                    tokio::time::sleep(FLUSH_INTERVAL * 4).await;
+                    for _ in 0..FLUSH_PASSES {
+                        tokio::task::yield_now().await;
+                    }
+                };
+                let _ = tokio::time::timeout(FLUSH_BOUND, flushed).await;
                 Some((sftp, fs))
             }
             Finish::Close => {

@@ -2086,6 +2086,57 @@ fn closing_returns_while_the_teardown_is_blocked() {
     }
 }
 
+/// The requests the proxy has passed to the server, by packet type, in order.
+fn requests_on_the_wire(proxy: &Proxy) -> Vec<u8> {
+    let wire = proxy.wire.lock().unwrap();
+    wire.iter().filter(|w| !w.reply).map(|w| w.kind).collect()
+}
+
+/// 06 §2: giving the connection back sends the handle's CLOSE before it returns, without
+/// waiting for the reply. The session then sits idle in its owner's hands — nothing drives it —
+/// and the CLOSE still reaches the server, with nothing sent after it. With every reply held
+/// behind the latch, the same: it returns at once and the CLOSE is on the wire.
+#[test]
+fn giving_the_connection_back_sends_the_close_at_once() {
+    if SftpRemote::local_server().is_none() {
+        return;
+    }
+    let (_tmp, path, body) = four_mib();
+    for held in [false, true] {
+        let proxy = Proxy::default();
+        let fs = SftpRemote::local_server_with(Some(proxy.clone())).unwrap();
+        let mut r = Box::new(fs).into_ranged(p(&path)).unwrap();
+        r.read(0, 65_536);
+        assert!(next(r.as_mut()).data().unwrap()[..] == body[..65_536]);
+        if held {
+            proxy.hold.store(true, std::sync::atomic::Ordering::Relaxed);
+            r.read(65_536, 65_536);
+            r.read(131_072, 65_536);
+            assert!(eventually(HANG, || reads_on_the_wire(&proxy) == 3));
+        }
+        let before = requests_on_the_wire(&proxy).len();
+        let conn = watchdog(HANG, move || r.into_connection());
+        let conn = conn.unwrap_or_else(|| panic!("held={held}: into_connection waited"));
+        // Idle from here: nothing uses `conn` until the CLOSE has been seen.
+        let closed = eventually(HANG, || requests_on_the_wire(&proxy).len() > before);
+        assert!(closed, "held={held}: the CLOSE never reached the server");
+        assert_eq!(
+            requests_on_the_wire(&proxy)[before..],
+            [Wired::CLOSE],
+            "held={held}: the CLOSE, and nothing else"
+        );
+        proxy
+            .hold
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        let mut conn = conn;
+        assert_eq!(
+            conn.stat(p(&path)).unwrap().size,
+            4 << 20,
+            "the session works"
+        );
+    }
+}
+
 /// 06 §2: the close drops every clone of the handle before `Sftp::close`, which waits while
 /// any lives. With 64 reads on the wire, their replies held, and a close deadline of 120 s, the
 /// session closes as soon as the replies flow — not at its deadline.

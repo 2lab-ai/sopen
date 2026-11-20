@@ -57,6 +57,16 @@ pub struct SftpRemote {
     stats: u64,
 }
 
+/// How long a queued request waits in the session's write buffer before the flush task writes it:
+/// the crate's own default, named here because the transport waits for it when it hands a
+/// session back with a CLOSE queued (`sftp/ranged.rs`).
+const FLUSH_INTERVAL: Duration = Duration::from_micros(500);
+
+/// Every SFTP session's options.
+fn sftp_options() -> SftpOptions {
+    SftpOptions::default().flush_interval(FLUSH_INTERVAL)
+}
+
 /// `Err` = the request got no reply within `limit`.
 async fn within<F: Future>(limit: Duration, fut: F) -> std::result::Result<F::Output, ()> {
     tokio::time::timeout(limit, fut).await.map_err(|_| ())
@@ -101,7 +111,7 @@ impl SftpRemote {
         let session = openssh::Session::resume(config.control_path.into_boxed_path(), None);
         let started = rt.block_on(within(
             META_TIMEOUT,
-            Sftp::from_clonable_session(Arc::new(session), SftpOptions::default()),
+            Sftp::from_clonable_session(Arc::new(session), sftp_options()),
         ));
         let sftp = match started {
             Ok(r) => r.map_err(|e| anyhow!("cannot start sftp on {}: {e}", spec.label()))?,
@@ -826,6 +836,19 @@ pub(crate) struct Proxy {
     pub wire: Arc<std::sync::Mutex<Vec<Wired>>>,
     /// Request id → what happens to its reply, marked as the request passes (the proxy's own).
     pub marked: Arc<std::sync::Mutex<std::collections::HashMap<u32, Rule>>>,
+    /// The session closed its end (the proxy's own).
+    pub ended: Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// Sets its flag when dropped: the proxy's requests loop has ended.
+#[cfg(test)]
+struct Ended(Arc<std::sync::atomic::AtomicBool>);
+
+#[cfg(test)]
+impl Drop for Ended {
+    fn drop(&mut self) {
+        self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 /// Replies the proxy changes, chosen by their requests.
@@ -903,6 +926,8 @@ impl Proxy {
         R: tokio::io::AsyncRead + Unpin,
         W: tokio::io::AsyncWrite + Unpin,
     {
+        // The session gone: the replies stop waiting behind the latch, and the server ends.
+        let _gone = Ended(self.ended.clone());
         while let Some(body) = packet(&mut from).await {
             // READ: type, id, handle (a string), offset, length.
             let read = (body.first() == Some(&Wired::READ)).then(|| {
@@ -943,6 +968,9 @@ impl Proxy {
         const VERSION: u8 = 2;
         while let Some(mut body) = packet(&mut from).await {
             while self.hold.load(std::sync::atomic::Ordering::Relaxed) {
+                if self.ended.load(std::sync::atomic::Ordering::Relaxed) {
+                    return;
+                }
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
             // Every reply but VERSION carries its request's id.
@@ -1019,33 +1047,57 @@ impl SftpRemote {
             .enable_all()
             .build()
             .unwrap();
-        let sftp = rt.block_on(async {
-            let mut child = tokio::process::Command::new(server)
+        let spawn = |server: &str| {
+            tokio::process::Command::new(server)
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .kill_on_drop(true)
                 .spawn()
-                .unwrap();
-            let (stdin, stdout) = (child.stdin.take().unwrap(), child.stdout.take().unwrap());
-            // The child lives as long as the session (and is killed with it).
-            let keep = openssh_sftp_client::SftpAuxiliaryData::Boxed(Box::new(
-                std::sync::Mutex::new(child),
-            ));
-            let Some(proxy) = proxy else {
-                return Sftp::new_with_auxiliary(stdin, stdout, SftpOptions::default(), keep)
-                    .await
-                    .unwrap();
-            };
-            // In-memory pipes between sopen and the proxy; the proxy's tasks live on this
-            // runtime, as the session's own do.
-            let (to_proxy, from_sopen) = tokio::io::duplex(1 << 20);
-            let (to_sopen, from_proxy) = tokio::io::duplex(1 << 20);
-            tokio::spawn(proxy.clone().requests(from_sopen, stdin));
-            tokio::spawn(proxy.replies(stdout, to_sopen));
-            Sftp::new_with_auxiliary(to_proxy, from_proxy, SftpOptions::default(), keep)
-                .await
                 .unwrap()
-        });
+        };
+        let sftp = match proxy {
+            None => rt.block_on(async {
+                let mut child = spawn(server);
+                let (stdin, stdout) = (child.stdin.take().unwrap(), child.stdout.take().unwrap());
+                // The child lives as long as the session (and is killed with it).
+                let keep = openssh_sftp_client::SftpAuxiliaryData::Boxed(Box::new(
+                    std::sync::Mutex::new(child),
+                ));
+                Sftp::new_with_auxiliary(stdin, stdout, sftp_options(), keep)
+                    .await
+                    .unwrap()
+            }),
+            Some(proxy) => {
+                // The proxy and the server run on a thread and runtime of their own, as a remote
+                // does: what the session writes reaches them whether or not anything drives the
+                // session's runtime. In-memory pipes join the two.
+                let (to_proxy, from_sopen) = tokio::io::duplex(1 << 20);
+                let (to_sopen, from_proxy) = tokio::io::duplex(1 << 20);
+                let server = server.to_string();
+                std::thread::spawn(move || {
+                    let rt = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .unwrap();
+                    rt.block_on(async move {
+                        let mut child = spawn(&server);
+                        let (stdin, stdout) =
+                            (child.stdin.take().unwrap(), child.stdout.take().unwrap());
+                        let requests = tokio::spawn(proxy.clone().requests(from_sopen, stdin));
+                        proxy.replies(stdout, to_sopen).await;
+                        let _ = requests.await;
+                        drop(child);
+                    })
+                });
+                rt.block_on(Sftp::new_with_auxiliary(
+                    to_proxy,
+                    from_proxy,
+                    sftp_options(),
+                    openssh_sftp_client::SftpAuxiliaryData::None,
+                ))
+                .unwrap()
+            }
+        };
         let fs = sftp.fs();
         Some(Self {
             rt: Some(rt),
