@@ -118,6 +118,19 @@ pub const IMAGE_KEYS: &[FKey] = &[FKey {
     label: "Save",
 }];
 
+/// The text viewer's own key while lines wrap: F2 (or W) shows one row per line instead, as
+/// Norton Commander's and Far's viewers name it.
+pub const TEXT_WRAPPED_KEYS: &[FKey] = &[FKey {
+    n: 2,
+    label: "Unwrap",
+}];
+
+/// The text viewer's own key while lines do not wrap: F2 (or W) wraps them again.
+pub const TEXT_UNWRAPPED_KEYS: &[FKey] = &[FKey {
+    n: 2,
+    label: "Wrap",
+}];
+
 /// `keys` and `more` as one row, by number (a number in both keeps the first).
 pub fn merged(keys: &[FKey], more: &[FKey]) -> Vec<FKey> {
     let mut all: Vec<FKey> = keys.to_vec();

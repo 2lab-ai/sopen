@@ -49,8 +49,7 @@ runners, `sftp-server` on macOS) and sets `SOPEN_REQUIRE_FFMPEG=1`, `SOPEN_REQUI
   `posix-rename@openssh.com` (`.prd/04-file-keys.md` §5).
 - **Edit features come only from owner messages.** The viewers' edits are the list above (owner, 2026-11-11;
   hex overwrite added by spec §1 message 9; image clipboard copy / cut / paste by message 12), and the viewers
-  keep exactly those. The browser's own edits come from spec §1 messages 13–16 (message 13 arrives with PR #14, which lands
-  before the browser workstream's first slice): rename, copy, move, make folder
+  keep exactly those. The browser's own edits come from spec §1 messages 13–16: rename, copy, move, make folder
   and delete (message 15, `.prd/04-file-keys.md`) and the git panel's actions on a repository, every history
   rewrite or destructive one backed up first (message 14, `.prd/03-git-panel.md`). Anything beyond them waits
   for an owner message.
@@ -73,7 +72,7 @@ prompts on close.
 
 | Hook | Effect |
 |---|---|
-| `SOPEN_STATE='rect=x,y,w,h;t=3.5;in=2;out=6;op=crop\|pixelize;block=16'` | Initial state in source pixels and seconds; `op` (images only, comma-separated, applied in order) uses `rect`. The hex window takes `at=OFFSET;patch=OFFSET:HEXBYTES[,OFFSET:HEXBYTES]` (offsets `0x…` or decimal): the cursor, and bytes overwritten in order, each an undo step. The file browser takes `open=NAME`: that entry of the folder is opened, as Enter would, once it is listed (with `SOPEN_SCREENSHOT`, the viewer is shot). The image and hex windows take `close=ask`: closing is asked for on the first pass, so an edit the state made brings up the unsaved-changes prompt (its receipt). |
+| `SOPEN_STATE='rect=x,y,w,h;t=3.5;in=2;out=6;op=crop\|pixelize;block=16'` | Initial state in source pixels and seconds; `op` (images only, comma-separated, applied in order) uses `rect`. The hex window takes `at=OFFSET;patch=OFFSET:HEXBYTES[,OFFSET:HEXBYTES]` (offsets `0x…` or decimal): the cursor, and bytes overwritten in order, each an undo step. The file browser takes `open=NAME`: that entry of the folder is opened, as Enter would, once it is listed (with `SOPEN_SCREENSHOT`, the viewer is shot); and `at=OFFSET`: the first text file it opens — the `open=NAME` one, or else the first opened by hand — starts with the row that byte is in at the top (a place deep in a long line); later text files open at their top. The image and hex windows take `close=ask`: closing is asked for on the first pass, so an edit the state made brings up the unsaved-changes prompt (its receipt). |
 | `SOPEN_SCREENSHOT=<png>` | Open the window, render the state, write a screenshot of the window, exit. Prints `screenshot <png> <w>x<h> title="<host:/abs>" focused=<bool> …`. `SOPEN_WATCHDOG=<s>` (default 30) ends a stalled run. |
 | `SOPEN_AUTOSAVE=1` | Images and the hex window: apply the state and Save without a window (backup, conflict-checked overwrite); exit 0 saved, 3 refused. `SOPEN_AUTOSAVE_DELAY_MS=<ms>` waits before the write so a second process can change the remote (the conflict receipt). |
 | `SOPEN_CHOICE=hex\|save\|cancel` | Answers the binary-file dialog: `hex` starts the fetch at once in the window, which becomes the hex window, as Enter would (with `SOPEN_SCREENSHOT`, the hex window is shot after the switch; with `SOPEN_AUTOSAVE`, no window: fetched and saved); `save` downloads to `SOPEN_SAVE_TO` without a window and prints `saved <path>` (a taken path is exit 1, naming the next free name); `cancel` downloads nothing. Without it, `SOPEN_SCREENSHOT` shoots the dialog and nothing is downloaded, and `SOPEN_AUTOSAVE` on a binary file is an error (nothing would answer the dialog). |

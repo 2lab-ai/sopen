@@ -7,7 +7,12 @@
 //! [`BLOCK_LINES`] lines, and at the first line start [`SPAN`] bytes past the last mark. A line
 //! that does not start at a mark starts less than a span past one, so finding any line reads at
 //! most a span; a longer line is followed by a mark, so its end is known without reading it.
-//! Only [`LINE_MAX`] bytes of a line are shown.
+//!
+//! Lines wrap by default ([`wrap`]): every line is shown whole, in rows broken by the measured
+//! width of their glyphs, and a page reads only its rows' bytes — a line of hundreds of megabytes
+//! too, from wherever the page is in it. The place on screen is a line and the byte of it the top
+//! row starts at. W or F2 switch to one row per line, scrolled sideways, where only [`LINE_MAX`]
+//! bytes of a line are shown.
 //!
 //! Highlighting carries state from the top of the file: the state at each mark is computed
 //! once, in order, and a page is highlighted from the mark before it. It runs on a worker of
@@ -18,8 +23,8 @@
 //! the window goes the worker is told to stop and is never waited for. At most [`MAX_WORKERS`]
 //! run in the process, stuck ones included ([`Pool`]); a viewer that gets no slot stays plain. A line is parsed only whole: highlighting stops at the first
 //! line longer than [`LINE_MAX`] (only its start is read, and a comment or string closed past the
-//! cut would colour everything after it), and the rest of the file is plain. Files over
-//! [`HIGHLIGHT_MAX`] are always shown plain.
+//! cut would colour everything after it), and the rest of the file is plain (wrapped, still
+//! whole). Files over [`HIGHLIGHT_MAX`] are always shown plain.
 //!
 //! The file is read live; the index is of the file as opened. A file that differs from it in any
 //! way ([`TextDoc::now`]: written to, grown, truncated, another file renamed over its path) is
@@ -29,9 +34,11 @@
 //! it was at the end). A deleted file keeps its page. Checked before each new page: the window says so and
 //! reads no more. Every offset taken from the index is checked, never trusted.
 
+mod wrap;
+
 use super::{chrome, Embedded, Outcome, Status, Window};
 use anyhow::{Context as _, Result};
-use eframe::egui::{self, text::LayoutJob, Color32, Key, Modifiers, Pos2, Rect};
+use eframe::egui::{self, text::LayoutJob, Color32, FontId, Key, Modifiers, Pos2, Rect};
 use std::fs::File;
 use std::os::unix::fs::FileExt;
 use std::path::Path;
@@ -46,7 +53,8 @@ use syntect::parsing::{ParseState, ScopeStack, SyntaxReference, SyntaxSet};
 const BLOCK_LINES: u64 = 256;
 /// …or at the first line start this far past the last mark, whichever comes first.
 const SPAN: u64 = 64 * 1024;
-/// Bytes of a line that are shown; the rest is cut (the bar says so).
+/// Bytes of a line shown when lines are not wrapped; the rest is cut (the bar says so). Also the
+/// longest line highlighting parses.
 pub const LINE_MAX: usize = 4096;
 /// Files above this are shown without highlighting (its state runs from the top of the file).
 pub const HIGHLIGHT_MAX: u64 = 16 << 20;
@@ -430,6 +438,149 @@ impl TextDoc {
         }
         Ok(out)
     }
+
+    /// Where lines `first..first + count` are (fewer at the end of the file), for showing them
+    /// whole (wrapped). Found as [`TextDoc::read_lines`] finds them — at most a span from the
+    /// mark before `first`, then each line that ends before the next mark (such a line is short:
+    /// it ends within a span of its block's mark), never past where the index says it must end —
+    /// except that a line ending at a mark is not read at all but for its last byte (a `\r`).
+    fn spans(&mut self, first: u64, count: usize) -> Result<Vec<Span>> {
+        let mut out = Vec::new();
+        let last = first.saturating_add(count as u64).min(self.lines);
+        if first >= last {
+            return Ok(out);
+        }
+        let mut idx = self.mark_before(first);
+        let (mut line, mut pos) = (self.marks[idx].line, self.marks[idx].offset);
+        let mut window = Window_::default();
+        while line < last {
+            let next = self.next_mark(idx);
+            let keep = line >= first;
+            if line + 1 == next.line {
+                let newline = u64::from(next.line < self.lines || self.ends_newline);
+                // Checked: a file changed since it was indexed can put `pos` past the mark.
+                let mut len = next
+                    .offset
+                    .checked_sub(pos)
+                    .and_then(|n| n.checked_sub(newline))
+                    .unwrap_or(0);
+                if keep {
+                    if len > 0 && window.take(self, pos + len - 1, 1)?.first() == Some(&b'\r') {
+                        len -= 1;
+                    }
+                    out.push(Span {
+                        line,
+                        start: pos,
+                        len,
+                    });
+                }
+                pos = next.offset;
+                idx += 1;
+            } else {
+                // As in `read_lines`: this line ends before the next mark and within a span of
+                // this block's mark.
+                let end = next.offset.min(self.marks[idx].offset.saturating_add(SPAN));
+                let start = pos;
+                let mut before = None;
+                loop {
+                    let room = end.saturating_sub(pos);
+                    if room == 0 {
+                        return Err(anyhow::Error::new(Stale));
+                    }
+                    let avail = window.at(self, pos, room.min(CHUNK as u64) as usize)?;
+                    let avail = &avail[..avail.len().min(room as usize)];
+                    if avail.is_empty() {
+                        return Err(anyhow::Error::new(Stale));
+                    }
+                    match avail.iter().position(|&b| b == b'\n') {
+                        Some(i) => {
+                            if i > 0 {
+                                before = Some(avail[i - 1]);
+                            }
+                            let len = pos + i as u64 - start;
+                            let cr = u64::from(len > 0 && before == Some(b'\r'));
+                            if keep {
+                                out.push(Span {
+                                    line,
+                                    start,
+                                    len: len - cr,
+                                });
+                            }
+                            pos += i as u64 + 1;
+                            break;
+                        }
+                        None => {
+                            before = avail.last().copied();
+                            pos += avail.len() as u64;
+                        }
+                    }
+                }
+            }
+            line += 1;
+        }
+        Ok(out)
+    }
+
+    /// Up to `n` bytes of `span` from `at` (fewer at its end), through `window`; `ahead`: each
+    /// read fills it as far as [`CHUNK`] — never past the span — so the rows after are in it.
+    /// Fewer bytes than the span has: [`Stale`].
+    fn span_bytes(
+        &mut self,
+        span: Span,
+        at: u64,
+        n: usize,
+        window: &mut Window_,
+        ahead: bool,
+    ) -> Result<Vec<u8>> {
+        let end = span.start.saturating_add(span.len);
+        let want = span.len.saturating_sub(at).min(n as u64) as usize;
+        let mut out = Vec::with_capacity(want);
+        let mut pos = span.start + at;
+        while out.len() < want {
+            let fill = if ahead {
+                end.saturating_sub(pos).min(CHUNK as u64) as usize
+            } else {
+                want - out.len()
+            };
+            let avail = window.at(self, pos, fill)?;
+            if avail.is_empty() {
+                return Err(anyhow::Error::new(Stale));
+            }
+            let n = avail.len().min(want - out.len());
+            out.extend_from_slice(&avail[..n]);
+            pos += n as u64;
+        }
+        Ok(out)
+    }
+
+    /// The line byte `at` of the file is in (the last line for `at` past the end): read from the
+    /// mark before it, as [`TextDoc::spans`] reads.
+    fn span_at(&mut self, at: u64) -> Result<Option<Span>> {
+        if self.lines == 0 {
+            return Ok(None);
+        }
+        let idx = self
+            .marks
+            .partition_point(|m| m.offset <= at)
+            .saturating_sub(1);
+        let (from, to) = (self.marks[idx].line, self.next_mark(idx).line);
+        let spans = self.spans(from, (to - from).max(1) as usize)?;
+        Ok(spans
+            .iter()
+            .rev()
+            .find(|s| s.start <= at)
+            .or(spans.last())
+            .copied())
+    }
+}
+
+/// Where a line is: its first byte in the file, and how many bytes it shows (its newline, and a
+/// `\r` before it, not counted).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Span {
+    line: u64,
+    start: u64,
+    len: u64,
 }
 
 /// What the file is now, against the index.
@@ -945,11 +1096,70 @@ fn expand_tabs(runs: Runs) -> Runs {
 /// The page on screen: its first line, how many, and how its lines are drawn.
 struct Page {
     top: u64,
+    /// Lines on it (asked of the highlighter).
     count: usize,
+    /// Rows it was read for.
+    visible: usize,
+    /// Not wrapped: each line's runs as painted. Wrapped: the highlighter's runs, once they come.
     runs: Vec<Runs>,
     highlighted: bool,
     /// The generation its highlighting was asked under.
     gen: u64,
+    /// Read wrapped: the fields below are its rows.
+    wrapped: bool,
+    /// Wrapped: the byte of line `top` its first row starts at; the line's place in the file and
+    /// length (the scroll bar, the status row).
+    top_off: u64,
+    top_start: u64,
+    top_len: u64,
+    /// Wrapped: the width its rows were laid out for, the rows, whether they reach the end of the
+    /// file, and each line's colours by character once highlighted.
+    width: f32,
+    rows: Vec<wrap::Row>,
+    at_end: bool,
+    colors: Vec<Vec<Color32>>,
+}
+
+impl Page {
+    /// A page of plain lines, not wrapped.
+    fn lines(top: u64, count: usize, runs: Vec<Runs>, highlighted: bool, gen: u64) -> Self {
+        Self {
+            top,
+            count,
+            visible: count,
+            runs,
+            highlighted,
+            gen,
+            wrapped: false,
+            top_off: 0,
+            top_start: 0,
+            top_len: 0,
+            width: 0.0,
+            rows: Vec::new(),
+            at_end: false,
+            colors: Vec::new(),
+        }
+    }
+
+    /// Nothing on it (tests).
+    #[cfg(test)]
+    fn is_blank(&self) -> bool {
+        self.runs.is_empty() && self.rows.is_empty()
+    }
+}
+
+/// Where the keys asked a wrapped view to go (applied when the next page is read).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Jump {
+    /// Home: the first row of the line at the top, or the start of the file when already there.
+    Home,
+    /// End: the last row of the line at the top at the bottom when the line runs past the page,
+    /// else the end of the file.
+    End,
+    FileStart,
+    FileEnd,
+    /// The row byte `n` of the file is in (`SOPEN_STATE` `at=`).
+    Byte(u64),
 }
 
 /// The window's title in its frame, as PC Shell names its text viewer.
@@ -973,11 +1183,29 @@ struct TextWindow {
     #[cfg(test)]
     after_wake: Option<Arc<dyn Fn() + Send + Sync>>,
     pool: Arc<Pool>,
-    /// The first line on screen, and how many fit (the last pass's).
+    /// The first line on screen, and how many rows fit (the last pass's).
     top: u64,
     visible: u64,
-    /// Columns scrolled to the right.
+    /// Columns scrolled to the right (not wrapped).
     left: usize,
+    /// Lines wrap (the default; W or F2 switch it).
+    wrap: bool,
+    /// Wrapped: the byte of line `top` the top row starts at.
+    top_off: u64,
+    /// Wrapped: where the keys asked to go, and how many rows the keys and the wheel moved by —
+    /// applied before the next page is read.
+    jump: Option<Jump>,
+    moved: i64,
+    /// Wrapped: the top is put back on a row start before the next page (the width, the index or
+    /// the mode changed).
+    resnap: bool,
+    /// Wrapped: what wrapping found so far (for this index and width).
+    memo: wrap::Memo,
+    /// The width rows are laid out in (the last pass's).
+    room: f32,
+    /// A plain row was laid out wider than its room (the fonts changed since it was wrapped): the
+    /// page was wrapped again, once.
+    rewrapped: bool,
     wheel_rest: f32,
     page: Option<Page>,
     /// The page on screen is from an index replaced since: it stays up until a page is read
@@ -1101,6 +1329,14 @@ impl TextWindow {
             top: 0,
             visible: 1,
             left: 0,
+            wrap: true,
+            top_off: 0,
+            jump: None,
+            moved: 0,
+            resnap: false,
+            memo: wrap::Memo::default(),
+            room: 0.0,
+            rewrapped: false,
             wheel_rest: 0.0,
             page: None,
             stale_page: false,
@@ -1114,6 +1350,17 @@ impl TextWindow {
     /// it was deleted.
     fn frozen(&self) -> bool {
         self.waiting || self.reindex.is_some() || self.gone
+    }
+
+    /// The end of the file is on screen: a local file is followed there, and a re-read shows the
+    /// new end. Wrapped, the page knows (its last row ends the file); else by lines.
+    fn at_end(&self) -> bool {
+        match &self.page {
+            Some(p) if p.wrapped && self.wrap => p.at_end,
+            // Nothing wrapped on screen yet: no end seen to follow.
+            _ if self.wrap => false,
+            _ => self.top.saturating_add(self.visible) >= self.doc.line_count(),
+        }
     }
 
     /// When the next index pass may start: max(1 s, 4 × the last pass) after it ended.
@@ -1136,7 +1383,7 @@ impl TextWindow {
             ctx.request_repaint_after(due - now);
             return;
         }
-        let at_end = self.top.saturating_add(self.visible) >= self.doc.line_count();
+        let at_end = self.at_end();
         let (tx, rx) = mpsc::channel();
         let cancel = Arc::new(AtomicBool::new(false));
         let exited = Arc::new(AtomicBool::new(false));
@@ -1223,12 +1470,26 @@ impl TextWindow {
                 self.stale_page = true;
                 self.worker = None;
                 self.hl_tried = false;
-                let last_top = self.doc.line_count().saturating_sub(self.visible);
-                self.top = if at_end {
-                    last_top
+                let lines = self.doc.line_count();
+                // What wrapping found was of the old index (also when not wrapped now).
+                self.memo.reset(self.room);
+                if self.wrap {
+                    // Wrapped again through the new index: the new end, or the same place put
+                    // back on a row start (the line may have changed).
+                    if at_end {
+                        self.jump = Some(Jump::FileEnd);
+                    } else {
+                        self.top = self.top.min(lines.saturating_sub(1));
+                        self.resnap = true;
+                    }
                 } else {
-                    self.top.min(last_top)
-                };
+                    let last_top = lines.saturating_sub(self.visible);
+                    self.top = if at_end {
+                        last_top
+                    } else {
+                        self.top.min(last_top)
+                    };
+                }
                 self.status = Status::info(if grew && at_end {
                     "the file grew; following the end"
                 } else {
@@ -1258,7 +1519,49 @@ impl TextWindow {
             return;
         }
         let pressed = |key: Key| ctx.input_mut(|i| i.consume_key(Modifiers::NONE, key));
+        // Cmd on macOS (Ctrl elsewhere), or Ctrl.
+        let command = |key: Key| {
+            ctx.input_mut(|i| {
+                i.consume_key(Modifiers::COMMAND, key) || i.consume_key(Modifiers::CTRL, key)
+            })
+        };
+        if (pressed(Key::W) | pressed(Key::F2)) && !self.gone {
+            // The same line at the top, from its start. (A deleted file keeps its page as it
+            // was read: nothing is read again to show it the other way.)
+            self.wrap = !self.wrap;
+            self.top_off = 0;
+            self.left = 0;
+            self.jump = None;
+            self.moved = 0;
+        }
         let page = self.visible.saturating_sub(1).max(1);
+        let (file_start, file_end) = (command(Key::Home), command(Key::End));
+        if self.wrap {
+            // By rows, from the rows read when the next page is (going back reads only from the
+            // restart point before a row).
+            let page = page as i64;
+            for (key, rows) in [
+                (Key::ArrowDown, 1),
+                (Key::ArrowUp, -1),
+                (Key::PageDown, page),
+                (Key::PageUp, -page),
+            ] {
+                if pressed(key) {
+                    self.moved += rows;
+                }
+            }
+            for (wanted, jump) in [
+                (file_start, Jump::FileStart),
+                (file_end, Jump::FileEnd),
+                (pressed(Key::Home), Jump::Home),
+                (pressed(Key::End), Jump::End),
+            ] {
+                if wanted {
+                    self.jump = Some(jump);
+                }
+            }
+            return;
+        }
         if pressed(Key::ArrowDown) {
             self.top = self.top.saturating_add(1);
         }
@@ -1271,10 +1574,10 @@ impl TextWindow {
         if pressed(Key::PageUp) {
             self.top = self.top.saturating_sub(page);
         }
-        if pressed(Key::Home) {
+        if pressed(Key::Home) | file_start {
             self.top = 0;
         }
-        if pressed(Key::End) {
+        if pressed(Key::End) | file_end {
             // Past the end: the body puts the last page on screen with this pass's row count.
             self.top = self.doc.line_count();
         }
@@ -1287,13 +1590,17 @@ impl TextWindow {
     }
 
     /// The page at `top`, read once and highlighted as soon as the states reach it.
-    fn ensure_page(&mut self, ctx: &egui::Context, plain: Color32) {
+    fn ensure_page(&mut self, ctx: &egui::Context, plain: Color32, font: &FontId) {
         let (top, count) = (self.top, self.visible as usize);
+        let moving = self.jump.is_some() || self.moved != 0 || self.resnap;
         let same = !self.stale_page
-            && self
-                .page
-                .as_ref()
-                .is_some_and(|p| p.top == top && p.count == count);
+            && !moving
+            && self.page.as_ref().is_some_and(|p| {
+                p.wrapped == self.wrap
+                    && p.top == top
+                    && p.visible == count
+                    && (!p.wrapped || (p.top_off == self.top_off && p.width == self.room))
+            });
         let mut due = false;
         if !self.frozen() {
             match self.doc.now_since_pass() {
@@ -1316,13 +1623,7 @@ impl TextWindow {
             // The page on screen stays (from memory); nothing is read through the old index. A
             // file deleted before anything was shown shows an empty page.
             if self.gone && self.page.is_none() {
-                self.page = Some(Page {
-                    top,
-                    count,
-                    runs: Vec::new(),
-                    highlighted: true,
-                    gen: 0,
-                });
+                self.page = Some(Page::lines(top, count, Vec::new(), true, 0));
             }
             if let Some(page) = self.page.as_mut() {
                 page.highlighted = true;
@@ -1330,34 +1631,39 @@ impl TextWindow {
             return;
         }
         if !same {
-            let lines = match self.doc.read_lines(top, count) {
-                Ok(lines) => lines,
+            let read = if self.wrap {
+                self.read_wrapped(ctx, plain, font, count)
+            } else {
+                self.read_unwrapped(count, plain)
+            };
+            let mut page = match read {
+                Ok(page) => page,
                 Err(e) if is_stale(&e) => {
                     // Changed after the check, during the read: read again from the path.
                     self.waiting = true;
-                    return self.ensure_page(ctx, plain);
+                    return self.ensure_page(ctx, plain, font);
                 }
                 Err(e) => {
                     self.status = Status::error(format!("{e:#}"));
-                    Vec::new()
+                    // Not asked again until something moves.
+                    (self.jump, self.moved, self.resnap) = (None, 0, false);
+                    let mut page = Page::lines(self.top, count, Vec::new(), false, 0);
+                    page.wrapped = self.wrap;
+                    page.top_off = self.top_off;
+                    page.width = self.room;
+                    page
                 }
             };
             self.stale_page = false;
-            let runs = lines
-                .iter()
-                .map(|l| expand_tabs(vec![(plain, l.text.clone())]))
-                .collect();
             self.gen += 1;
-            self.page = Some(Page {
-                top,
-                count,
-                runs,
-                highlighted: self.worker.is_none(),
-                gen: self.gen,
-            });
+            page.gen = self.gen;
+            page.highlighted = self.worker.is_none();
             if let Some(worker) = &self.worker {
-                worker.ask(self.gen, top, count);
+                worker.ask(self.gen, page.top, page.count);
             }
+            self.page = Some(page);
+            // The status row above was drawn before this page was read: once more for it.
+            ctx.request_repaint();
         }
         self.worker_results();
         if (self.waiting || due) && self.reindex.is_none() {
@@ -1365,6 +1671,108 @@ impl TextWindow {
             // in this frame, not at the next input.
             self.start_reindex(ctx);
         }
+    }
+
+    /// The page of `count` lines at `top`, one row each, cut at [`LINE_MAX`] (not wrapped).
+    fn read_unwrapped(&mut self, count: usize, plain: Color32) -> Result<Page> {
+        let lines = self.doc.line_count();
+        if let Some(Jump::Byte(at)) = self.jump {
+            if let Some(span) = self.doc.span_at(at)? {
+                self.top = span.line.min(lines.saturating_sub(self.visible));
+            }
+        }
+        (self.jump, self.moved, self.resnap) = (None, 0, false);
+        let read = self.doc.read_lines(self.top, count)?;
+        let runs = read
+            .iter()
+            .map(|l| expand_tabs(vec![(plain, l.text.clone())]))
+            .collect();
+        Ok(Page::lines(self.top, count, runs, false, 0))
+    }
+
+    /// The page of `rows` rows from the top, wrapped — after the moves the keys asked for — and
+    /// the top it ends up at: never past the last page (the file's last row at the bottom).
+    fn read_wrapped(
+        &mut self,
+        ctx: &egui::Context,
+        plain: Color32,
+        font: &FontId,
+        rows: usize,
+    ) -> Result<Page> {
+        use wrap::{Measure, Pos, Wrapper};
+        let lines = self.doc.line_count();
+        if self.memo.rewidth(self.room) {
+            self.resnap = true;
+        }
+        let cell = ctx.fonts_mut(|f| f.glyph_width(font, '0'));
+        let mut w = Wrapper {
+            doc: &mut self.doc,
+            memo: &mut self.memo,
+            m: Measure::new(ctx, font.clone(), plain),
+            width: self.room,
+            read: wrap::read_cap(self.room, cell),
+        };
+        let mut pos = Pos {
+            line: self.top.min(lines.saturating_sub(1)),
+            off: self.top_off,
+        };
+        if lines > 0 {
+            if self.resnap {
+                pos = w.snap(pos)?;
+            }
+            let back = rows.saturating_sub(1) as u64;
+            pos = match self.jump {
+                None => pos,
+                Some(Jump::FileStart) => Pos::default(),
+                Some(Jump::FileEnd) => w.end(rows)?,
+                Some(Jump::Home) if pos.off > 0 => Pos {
+                    line: pos.line,
+                    off: 0,
+                },
+                Some(Jump::Home) => Pos::default(),
+                Some(Jump::End) => {
+                    let line_end = w.last_of(pos.line)?;
+                    let top = w.back(line_end, back)?;
+                    if top > pos {
+                        top
+                    } else {
+                        w.end(rows)?
+                    }
+                }
+                Some(Jump::Byte(at)) => w.at_byte(at)?,
+            };
+            if self.moved > 0 {
+                pos = w.forward(pos, self.moved as u64)?;
+            } else if self.moved < 0 {
+                pos = w.back(pos, self.moved.unsigned_abs())?;
+            }
+        }
+        let (mut got, mut at_end) = w.page(pos, rows)?;
+        if got.len() < rows && pos != Pos::default() {
+            // Short of the window: the last page instead, no blank rows under the end.
+            pos = w.end(rows)?;
+            (got, at_end) = w.page(pos, rows)?;
+        }
+        let (top_start, top_len) = match lines {
+            0 => (0, 0),
+            _ => {
+                let span = w.span(pos.line)?;
+                (span.start, span.len)
+            }
+        };
+        (self.jump, self.moved, self.resnap) = (None, 0, false);
+        (self.top, self.top_off) = (pos.line, pos.off);
+        let count = got.last().map_or(0, |r| (r.line - pos.line + 1) as usize);
+        let mut page = Page::lines(pos.line, count, Vec::new(), false, 0);
+        page.visible = rows;
+        page.wrapped = true;
+        page.top_off = pos.off;
+        page.top_start = top_start;
+        page.top_len = top_len;
+        page.width = self.room;
+        page.rows = got;
+        page.at_end = at_end;
+        Ok(page)
     }
 
     /// What the worker finished meanwhile: the page on screen's lines replace its plain ones.
@@ -1376,7 +1784,19 @@ impl TextWindow {
         loop {
             match worker.done.try_recv() {
                 Ok(Done::Page { gen, runs }) if gen == page.gen => {
-                    page.runs = runs.into_iter().map(expand_tabs).collect();
+                    if page.wrapped {
+                        // Each character's colour: the rows take theirs by index.
+                        page.colors = runs
+                            .iter()
+                            .map(|line| {
+                                line.iter()
+                                    .flat_map(|(c, t)| std::iter::repeat_n(*c, t.chars().count()))
+                                    .collect()
+                            })
+                            .collect();
+                    } else {
+                        page.runs = runs.into_iter().map(expand_tabs).collect();
+                    }
                     page.highlighted = true;
                 }
                 Ok(Done::Page { .. }) => {}
@@ -1418,7 +1838,7 @@ impl TextWindow {
                 .map_or("plain text", |s| s.name.as_str())
                 .to_string(),
         ];
-        if self.doc.long_lines() {
+        if self.doc.long_lines() && !self.wrap {
             parts.push(format!("lines over {LINE_MAX} bytes are cut"));
         }
         ui.horizontal(|ui| {
@@ -1430,11 +1850,25 @@ impl TextWindow {
 
     fn status_bar(&self, ui: &mut egui::Ui) {
         let lines = self.doc.line_count();
-        let shown = if lines == 0 {
-            "empty".to_string()
-        } else {
-            let last = self.top.saturating_add(self.visible).min(lines);
-            format!("lines {}–{last} of {lines}", self.top + 1)
+        let shown = match &self.page {
+            _ if lines == 0 => "empty".to_string(),
+            Some(page) if page.wrapped && !page.rows.is_empty() => {
+                // Lines as on screen; inside a line, how far into it the top row is.
+                let last = page.rows.last().map_or(page.top, |r| r.line) + 1;
+                let mut first = (page.top + 1).to_string();
+                if page.top_off > 0 && page.top_len > 0 {
+                    first.push_str(&format!(" ({} % of it)", page.top_off * 100 / page.top_len));
+                }
+                if last == page.top + 1 {
+                    format!("line {first} of {lines}")
+                } else {
+                    format!("lines {first}–{last} of {lines}")
+                }
+            }
+            _ => {
+                let last = self.top.saturating_add(self.visible).min(lines);
+                format!("lines {}–{last} of {lines}", self.top + 1)
+            }
         };
         ui.horizontal(|ui| {
             ui.monospace(shown);
@@ -1443,6 +1877,25 @@ impl TextWindow {
                 self.status.show(ui);
             }
         });
+    }
+
+    /// Where the scroll bar's thumb is (0 at the top, 1 at the end; `None`: nothing to scroll).
+    /// Wrapped, by bytes: rows cannot be counted without reading every line.
+    fn thumb(&self) -> Option<f32> {
+        match &self.page {
+            Some(p) if p.wrapped => {
+                let at_start = p.top == 0 && p.top_off == 0;
+                match (p.at_end, at_start) {
+                    (true, true) => None,
+                    (true, false) => Some(1.0),
+                    _ => Some((p.top_start + p.top_off) as f32 / self.doc.size().max(1) as f32),
+                }
+            }
+            _ => {
+                let max_top = self.doc.line_count().saturating_sub(self.visible);
+                (max_top > 0).then(|| self.top as f32 / max_top as f32)
+            }
+        }
     }
 
     fn body(&mut self, ui: &mut egui::Ui) {
@@ -1460,6 +1913,10 @@ impl TextWindow {
         let row_h = text_h.ceil();
         let lines = self.doc.line_count();
         self.visible = ((rect.height() / row_h).floor() as u64).max(1);
+        let digits = lines.max(1).to_string().len();
+        let gutter = cw * (digits as f32 + 1.0);
+        let text_x = rect.left() + gutter + cw;
+        self.room = (rect.right() - text_x).max(0.0);
         // Scrolling waits for a re-read, as the keys do.
         if ui.rect_contains_pointer(outer) && !self.waiting && self.reindex.is_none() {
             let mut rows = 0f32;
@@ -1479,14 +1936,20 @@ impl TextWindow {
                 let whole = rows.trunc();
                 self.wheel_rest = rows - whole;
                 let moved = whole as i64;
-                self.top = if moved < 0 {
-                    self.top.saturating_sub(moved.unsigned_abs())
+                if self.wrap {
+                    self.moved += moved;
                 } else {
-                    self.top.saturating_add(moved as u64)
-                };
+                    self.top = if moved < 0 {
+                        self.top.saturating_sub(moved.unsigned_abs())
+                    } else {
+                        self.top.saturating_add(moved as u64)
+                    };
+                }
             }
         }
-        self.top = self.top.min(lines.saturating_sub(self.visible));
+        if !self.wrap {
+            self.top = self.top.min(lines.saturating_sub(self.visible));
+        }
         if !self.hl_tried {
             self.hl_tried = true;
             if self.doc.size() <= HIGHLIGHT_MAX && !self.frozen() {
@@ -1511,8 +1974,8 @@ impl TextWindow {
                 };
             }
         }
-        self.ensure_page(&ctx, p.text);
-        if self.live && !self.frozen() && self.top.saturating_add(self.visible) >= lines {
+        self.ensure_page(&ctx, p.text, &font);
+        if self.live && !self.frozen() && self.at_end() {
             // At the end of a local file: looked at again each second with no input (one stat),
             // so a growing log is followed.
             ctx.request_repaint_after(FOLLOW_EVERY);
@@ -1521,58 +1984,219 @@ impl TextWindow {
         }
         let painter = ui.painter_at(rect);
         // The scroll bar on the right border, beside the lines.
-        let max_top = lines.saturating_sub(self.visible);
         chrome::scroll_bar(
             &ui.painter_at(outer),
             Rect::from_min_max(
                 Pos2::new(rect.right(), rect.top()),
                 Pos2::new(rect.right() + chrome::CELL.x, rect.bottom()),
             ),
-            (max_top > 0).then(|| self.top as f32 / max_top as f32),
+            self.thumb(),
         );
-        let digits = lines.max(1).to_string().len();
-        let gutter = cw * (digits as f32 + 1.0);
-        let text_x = rect.left() + gutter + cw;
         let text_painter =
             ui.painter_at(Rect::from_min_max(Pos2::new(text_x, rect.top()), rect.max));
-        // Only the columns that fit are laid out: a line can be thousands of characters.
-        let columns = ((rect.right() - text_x) / cw).floor().max(0.0) as usize;
-        if let Some(page) = &self.page {
-            for (k, runs) in page.runs.iter().enumerate() {
-                let y = rect.top() + k as f32 * row_h;
-                painter.text(
-                    Pos2::new(rect.left() + gutter, y),
-                    egui::Align2::RIGHT_TOP,
-                    (page.top + k as u64 + 1).to_string(),
-                    font.clone(),
-                    p.dim,
-                );
-                let mut job = LayoutJob::default();
-                let (mut skip, mut room) = (self.left, columns);
-                for (color, text) in runs {
-                    if room == 0 {
-                        break;
+        let number = |k: usize, line: u64| {
+            painter.text(
+                Pos2::new(rect.left() + gutter, rect.top() + k as f32 * row_h),
+                egui::Align2::RIGHT_TOP,
+                (line + 1).to_string(),
+                font.clone(),
+                p.dim,
+            );
+        };
+        let mut overflow = false;
+        match &self.page {
+            Some(page) if page.wrapped => {
+                for (k, row) in page.rows.iter().enumerate() {
+                    // The number on a line's first row only.
+                    if row.start == 0 {
+                        number(k, row.line);
                     }
-                    let n = text.chars().count();
-                    if skip >= n {
-                        skip -= n;
-                        continue;
+                    let colors = row.first_char.and_then(|first| {
+                        let line = page.colors.get((row.line - page.top) as usize)?;
+                        Some((first, line.as_slice()))
+                    });
+                    // As it was measured (one section).
+                    let measured = || {
+                        ctx.fonts_mut(|f| f.layout_no_wrap(row.cut.text(), font.clone(), p.text))
+                    };
+                    let rtl = row
+                        .cut
+                        .shown
+                        .iter()
+                        .any(|&(c, _)| direction(c) == Some(true));
+                    let plain = || {
+                        if rtl {
+                            let job = directed_job(row_chars(row, None, p.text), &font);
+                            ctx.fonts_mut(|f| f.layout_job(job))
+                        } else {
+                            measured()
+                        }
+                    };
+                    let mut galley = match colors {
+                        Some(colors) => {
+                            let job = directed_job(row_chars(row, Some(colors), p.text), &font);
+                            ctx.fonts_mut(|f| f.layout_job(job))
+                        }
+                        None => plain(),
+                    };
+                    // Sections are shaped apart and can come out a hair wider than the row was
+                    // measured: plain then, and at worst as measured (never cut at the edge).
+                    if galley.size().x > page.width + 0.5 && colors.is_some() {
+                        galley = plain();
                     }
-                    let part: String = text
-                        .chars()
-                        .skip(std::mem::take(&mut skip))
-                        .take(room)
-                        .map(chrome::shown_char)
-                        .collect();
-                    room -= part.chars().count();
-                    job.append(&part, 0.0, egui::TextFormat::simple(font.clone(), *color));
+                    if galley.size().x > page.width + 0.5 && rtl {
+                        galley = measured();
+                    }
+                    overflow |= galley.size().x > page.width + 0.5;
+                    text_painter.galley(
+                        Pos2::new(text_x, rect.top() + k as f32 * row_h),
+                        galley,
+                        p.text,
+                    );
                 }
-                let galley = ctx.fonts_mut(|f| f.layout_job(job));
-                text_painter.galley(Pos2::new(text_x, y), galley, p.text);
             }
+            Some(page) => {
+                // Only the columns that fit are laid out: a line can be thousands of characters.
+                let columns = ((rect.right() - text_x) / cw).floor().max(0.0) as usize;
+                for (k, runs) in page.runs.iter().enumerate() {
+                    number(k, page.top + k as u64);
+                    let mut shown: Vec<(char, Color32)> = Vec::new();
+                    let (mut skip, mut room) = (self.left, columns);
+                    for (color, text) in runs {
+                        if room == 0 {
+                            break;
+                        }
+                        let n = text.chars().count();
+                        if skip >= n {
+                            skip -= n;
+                            continue;
+                        }
+                        let part = text
+                            .chars()
+                            .skip(std::mem::take(&mut skip))
+                            .take(room)
+                            .map(|c| (chrome::shown_char(c), *color));
+                        let before = shown.len();
+                        shown.extend(part);
+                        room -= shown.len() - before;
+                    }
+                    let galley = ctx.fonts_mut(|f| f.layout_job(directed_job(shown, &font)));
+                    text_painter.galley(
+                        Pos2::new(text_x, rect.top() + k as f32 * row_h),
+                        galley,
+                        p.text,
+                    );
+                }
+            }
+            None => {}
+        }
+        if overflow && !self.rewrapped && !self.frozen() {
+            // A plain row wider than it was wrapped for: the fonts changed since (a fallback
+            // font came in). Wrapped again from scratch, once.
+            self.rewrapped = true;
+            self.memo.reset(self.room);
+            self.resnap = true;
+            ctx.request_repaint();
         }
         self.painted = true;
     }
+}
+
+/// A wrapped row's characters as painted (a tab as its spaces), each in its colour: by
+/// `colors`, the line's colour per character with the row's first at index `first`, else plain.
+fn row_chars(
+    row: &wrap::Row,
+    colors: Option<(usize, &[Color32])>,
+    plain: Color32,
+) -> Vec<(char, Color32)> {
+    let mut out = Vec::with_capacity(row.cut.shown.len());
+    for (i, &(c, n)) in row.cut.shown.iter().enumerate() {
+        let color = colors
+            .and_then(|(first, colors)| colors.get(first + i).copied())
+            .unwrap_or(plain);
+        out.extend(std::iter::repeat_n((c, color), usize::from(n)));
+    }
+    out
+}
+
+/// Whether `c` is written right to left (`Some(true)`: Hebrew, Arabic and the other
+/// right-to-left scripts' letters), left to right (`Some(false)`: any other letter or digit,
+/// Arabic-Indic digits too), or neither (spaces, punctuation, marks).
+fn direction(c: char) -> Option<bool> {
+    match c {
+        '\u{0660}'..='\u{0669}' | '\u{06F0}'..='\u{06F9}' | '\u{07C0}'..='\u{07C9}' => Some(false),
+        '\u{200F}' | '\u{061C}' => Some(true),
+        '\u{0590}'..='\u{08FF}'
+        | '\u{FB1D}'..='\u{FDFF}'
+        | '\u{FE70}'..='\u{FEFF}'
+        | '\u{10800}'..='\u{10FFF}'
+        | '\u{1E800}'..='\u{1EFFF}' => c.is_alphabetic().then_some(true),
+        c if c.is_alphanumeric() => Some(false),
+        _ => None,
+    }
+}
+
+/// A row as painted, laid out left to right: a section per run of one colour and one direction.
+/// egui shapes a section in the direction of its first strong character, so a row starting with a
+/// right-to-left word (Hebrew is in the VGA font, shaped in one run with the English after it)
+/// came out reversed whole, its English too. Here each run of right-to-left letters — with the
+/// spaces and marks between them — is a section of its own (shaped right to left, as it reads),
+/// and everything else is shaped left to right; the runs stay in their order, as in a
+/// left-to-right paragraph. Sections never split a grapheme cluster (a cluster takes its base's
+/// direction and colour). The text is the row's own: only how egui shapes it changes.
+fn directed_job(chars: Vec<(char, Color32)>, font: &FontId) -> LayoutJob {
+    use unicode_segmentation::UnicodeSegmentation;
+    let text: String = chars.iter().map(|&(c, _)| c).collect();
+    // By grapheme cluster, each with its base's direction and colour: a mark, a ZWJ or a
+    // variation selector goes where its base goes, never into a section of its own (egui would
+    // shape it apart from its base).
+    let mut clusters: Vec<(&str, Option<bool>, Color32)> = Vec::new();
+    let mut at = 0;
+    for g in text.graphemes(true) {
+        let (base, color) = chars[at];
+        clusters.push((g, direction(base), color));
+        at += g.chars().count();
+    }
+    // A neutral cluster goes right to left only between two right-to-left letters.
+    let mut next_rtl = vec![false; clusters.len()];
+    let mut next = None;
+    for i in (0..clusters.len()).rev() {
+        next_rtl[i] = next == Some(true);
+        if clusters[i].1.is_some() {
+            next = clusters[i].1;
+        }
+    }
+    let mut job = LayoutJob::default();
+    // A section of its own for each run, also next to one in the same colour: `append` would
+    // join them, and egui would shape them as one again.
+    let push = |job: &mut LayoutJob, run: &str, color: Color32| {
+        use egui::text::ByteIndex;
+        let start = job.text.len();
+        job.text.push_str(run);
+        job.sections.push(egui::text::LayoutSection {
+            leading_space: 0.0,
+            byte_range: ByteIndex(start)..ByteIndex(job.text.len()),
+            format: egui::TextFormat::simple(font.clone(), color),
+        });
+    };
+    let (mut run, mut key) = (String::new(), None);
+    let mut prev = None;
+    for (i, &(g, class, color)) in clusters.iter().enumerate() {
+        let rtl = class.unwrap_or(prev == Some(true) && next_rtl[i]);
+        if class.is_some() {
+            prev = class;
+        }
+        if let Some((was, _)) = key.filter(|&k| k != (color, rtl)) {
+            push(&mut job, &run, was);
+            run.clear();
+        }
+        key = Some((color, rtl));
+        run.push_str(g);
+    }
+    if let Some((color, _)) = key {
+        push(&mut job, &run, color);
+    }
+    job
 }
 
 impl Window for TextWindow {
@@ -1605,20 +2229,32 @@ impl Window for TextWindow {
                 .as_ref()
                 .is_some_and(|p| p.highlighted || self.worker.is_none())
     }
+
+    /// F2 switches wrapping: the row says what it does now.
+    fn keys(&self) -> &'static [chrome::FKey] {
+        if self.wrap {
+            chrome::TEXT_WRAPPED_KEYS
+        } else {
+            chrome::TEXT_UNWRAPPED_KEYS
+        }
+    }
 }
 
 /// The text viewer inside another window (the file browser). `title` is `host:/abs`, `name` the
 /// file's name (it picks the syntax); `notices` are shown whole in its rows. `live`: the file is
-/// read in place (followed at its end), not a fetched copy.
+/// read in place (followed at its end), not a fetched copy. `at`: the row byte `at` of the file
+/// is in goes to the top (`SOPEN_STATE` `at=`, a receipt).
 pub fn embed(
     doc: TextDoc,
     title: String,
     name: &str,
     notices: Vec<String>,
     live: bool,
+    at: Option<u64>,
 ) -> Embedded {
     let mut window = TextWindow::new(doc, title, name, notices);
     window.live = live;
+    window.jump = at.map(Jump::Byte);
     Embedded {
         window: Box::new(window),
         settle: Box::new(|_| Some(Outcome::default())),
