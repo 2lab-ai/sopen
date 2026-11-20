@@ -15,6 +15,7 @@ pub mod ffmpeg;
 pub mod fileops;
 pub mod forward;
 pub mod gui;
+pub mod journal;
 pub mod kind;
 pub mod raise;
 pub mod remote;
