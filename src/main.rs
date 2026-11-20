@@ -584,6 +584,8 @@ fn open_in_browser(mut place: Place, abs: &str, dirs: &Dirs, rec: &mut Record) -
         }
         None => std::sync::Arc::new(|| Ok(Box::new(LocalFs::new()) as Box<dyn RemoteFs + Send>)),
     };
+    // F4's launch takes `remote` with it; the browser's start names the host from this copy.
+    let host = remote.clone();
     let launch: gui::browser::Launch = std::sync::Arc::new(move |path: &str, is_dir: bool| {
         let editor = zed::choose(
             remote.is_some(),
@@ -610,21 +612,37 @@ fn open_in_browser(mut place: Place, abs: &str, dirs: &Dirs, rec: &mut Record) -
         }
         Ok(line)
     });
-    let (fs, _, label) = place.into_parts(dirs);
-    let start = gui::browser::Start {
-        fs,
-        connect,
-        label,
-        abs: abs.to_string(),
-        cache: dirs.cache.clone(),
-        launch,
-    };
+    let (fs, _, _) = place.into_parts(dirs);
+    let start = browser_start(fs, connect, launch, host.as_ref(), abs, dirs);
     let outcome = gui::browser::open(start, &hooks)?;
     rec.action = Some(outcome.action());
     rec.conflict = outcome.conflict;
     match outcome.refused {
         Some(message) => Err(Refused(message).into()),
         None => Ok(()),
+    }
+}
+
+/// What the browser starts from: the folder's connection and how to open more, the host (`None`
+/// on this machine) both as results are printed (`label`, an IPv6 host bracketed) and as `ssh`
+/// takes it (`destination`, unbracketed), the folder, and sopen's cache and state folders.
+fn browser_start(
+    fs: Box<dyn RemoteFs + Send>,
+    connect: gui::browser::Connect,
+    launch: gui::browser::Launch,
+    remote: Option<&RemoteSpec>,
+    abs: &str,
+    dirs: &Dirs,
+) -> gui::browser::Start {
+    gui::browser::Start {
+        fs,
+        connect,
+        label: remote.map(RemoteSpec::label),
+        destination: remote.map(RemoteSpec::destination),
+        abs: abs.to_string(),
+        cache: dirs.cache.clone(),
+        state_dir: dirs.state.clone(),
+        launch,
     }
 }
 
@@ -1304,6 +1322,39 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(folder_run(&shot, true), FolderRun::Browser);
+    }
+
+    /// The browser's start names an IPv6 host unbracketed for ssh (`destination`) and bracketed
+    /// for what it prints (`label`), and carries sopen's state folder, where the ssh master's
+    /// socket is; on this machine it names no host.
+    #[test]
+    fn the_browser_start_carries_the_ssh_destination_and_the_state_dir() {
+        let Target::Remote(spec) = target::parse("me@[::1]:/x").unwrap() else {
+            panic!("a remote target")
+        };
+        let dirs = Dirs {
+            cache: PathBuf::from("/c"),
+            state: PathBuf::from("/s"),
+        };
+        let connect: gui::browser::Connect =
+            std::sync::Arc::new(|| Ok(Box::new(LocalFs::new()) as Box<dyn RemoteFs + Send>));
+        let launch: gui::browser::Launch =
+            std::sync::Arc::new(|_: &str, _: bool| Ok(String::new()));
+        let start = browser_start(
+            Box::new(LocalFs::new()),
+            connect.clone(),
+            launch.clone(),
+            Some(&spec),
+            "/x",
+            &dirs,
+        );
+        assert_eq!(start.destination.as_deref(), Some("me@::1"));
+        assert_eq!(start.label.as_deref(), Some("me@[::1]"));
+        assert_eq!((start.abs.as_str(), &start.cache), ("/x", &dirs.cache));
+        assert_eq!(start.state_dir, dirs.state);
+        let start = browser_start(Box::new(LocalFs::new()), connect, launch, None, "/x", &dirs);
+        assert_eq!((start.label, start.destination), (None, None));
+        assert_eq!(start.state_dir, dirs.state);
     }
 
     #[test]

@@ -30,6 +30,30 @@ built-in hex editor, or save it where I choose — on the machine I typed it on,
 11. (on KDE Plasma, after `sopen .` printed "opened … in VS Code") "vscode 안나옴", then "해당 앱이 현재 화면으로 이동시켜줘"
 12. (2026-11-19) "다음처럼 개선해줘. 1. 해당 앱이 현재 화면으로 이동시켜줘. 2. 디폴트로 폴더를 고르면 토탈 커맨드 같은 프로그램이 떠야함 거기서 파일별로 엔터 누르면 해당 프로그램에서 디폴트 뷰어가 다 동작해야함 신택스 하이라이트 들어간 파일 뷰어 이미지 뷰어 영상 뷰어 헥스뷰어 모두 3. 이미지 편집은 ctrl+x ctrl+v작동하도록 해줘. 선택은 선택이고 선택하고 ctrl+c나 ctrl+x(자르기-해당부분만 배경색으로 잘리고 그림은 클리보드) ctrl+v(현재 선택된 영역으로 클립보드 내용 붙여넣기. 이미지면 그냥 스트레츠로 붙여넣고(고를수 있음), 텍스트면 텍스트채로 붙여줘). 픽셀라이즈는 ㅇㅋ 4. 디렉토리 뷰어 + 뷰어 + 헥스에디터 이거 pctools 레퍼런스 찾고 pctools 냄새 나게 해줘."
 13. (2026-11-20) "1. 오디오도 구간별로 자르고 붙여넣기 기능 넣어줘 이미지 편집 정도까지 할수 있도록 채널이 2개면 둘다 보여주고 모노를 스테레오로 복사해서 변환할 수 있게 해줘 / 1.1 이거 스템 처리 못하나? 어케함? 리서치해서 간단하게 보이스랑 음악이랑 분리해줄수 있는지 리서치해주고 할수 있으면 해줘 / 2. 영상도 마찬가지로 자르고 붙여넣기만 해줘. 오래 걸리는데 이거 편집할때 실시간으로 빠르게 보여줄수 있게 편집해주고 저장할때 실제로 ffmpeg이용해서 처리해줘 (뭔말인지 알지? 영상이라 실시간으로 자르고 붙여넣으면 너무 오래 걸리니까) / 3. 텍스트 표시할때 기본으로 워드랩 처리해줘. 그리고 당연히 전체를 메모리에 올리지 말고 청크처리해줘"
+14. (2026-11-20)
+    > 그리고 만약 폴드가 git 폴더면 vscode중에 git graph있는데 그거 /zworkflow:using-dotprd 사용해서 해당 git graph 기능 모두 뽑아서 해당 기능처럼 자유롭게 git 작업할 수 있도록해줘.
+    > 전체 커핏이랑 브랜치 그래프 볼수 있고 커밋 편집 최대한 자유롭게 할수 있게 해줘. 이런 폴더는 다른쪽은 뷰가 더블 디렉토리 뷰에서 다른쪽에 git 뷰로 변경됨.
+    >
+    > 이건 sopen 모드를 2개로 해주는 셈이고 디폴트가 미리보기 뷰.
+    > - 이 모드일때는 듀얼 디렉토리로 보여주다가 현재 폴더가 git이면 git 패널이 반대편에 나와야하고, 미리보기가 이미지등을 미리 반대편에 적절하게 현재 선택중인 파일의 내용을 미리 보여주도록 해줘.
+15. (2026-11-20)
+    > 그리고 디폴트로 키
+    > f2 = rename
+    > f5 = copy
+    > f6 = move
+    > ---
+    > 이거 주요 이러한 쉘들 단축키 리서치해주고 가장 일반적인 기준으로 단축키들 제안해줘.
+    >
+    > 그리고 맥북이나 윈도우나 리눅스가 기본적으로 펑션키는 항상 sopen에서 f1 f2 f3.. 펑션키로 동작하도록해줘. (이거 잘 모르겠는데 가능한지 리서치해줘)
+16. (2026-11-20)
+    > 그리도 또 기능
+    > f10인가 누르면 디렉토리 트리뷰
+    > 이거 잘 만들어야함.
+    > 1. 예를들어 디폴트로는 루트가 아니라 홈디렉토리 기준임. 현재 cwd가 홈디렉토리 밑에있으면 홈디렉토리가 루트로 트리로 보여줘야함.
+    > 만약 홈디렉토리가 아니면 그때 "/" 기준으로 보여줘야하고.
+    > 2. 디바이스 폴더는 펼쳐주면 안됨. 즉, 펼쳐주는 폴더랑 안펼쳐주는 폴더를 구분할수 있어야함. 예를들어 어떤 폴더 안에 디렉토리가 5개(예)미만이면 디폴트로 펼쳐서 보여주고 아니면 폴더를 닫은채 보여줘야함. (대신에 안에 어떤 느낌인지 폴더랑 파일이 몇개 있고 용량이 얼마 되는지 예측할수 있는 정보는 즉시 보여줘야함)
+    >
+    > 이거 리서치해서 영리하게 디렉토리 트리 보여주도록 해줘.
 
 Message 6 supersedes 3's "IrfanView 정도" with an exact list. Message 5 is a standing constraint:
 anything not in the table below is out of scope until usage says otherwise (§10). Messages 7–8 add
@@ -55,6 +79,16 @@ browser's text viewer wrap lines by default — every line whole, in rows — st
 chunk at a time, never whole, a line of hundreds of megabytes too (A11, §3a); W or F2 goes back to
 one row per line. It adds no edit. Its items 1 and 2 are about the media window (§7).
 
+Messages 14–16 open the browser workstream, fixed in [`browser/ssot.md`](browser/ssot.md): message 14
+adds the git panel and the browser's two modes, preview (the default) and dual-directory (A12;
+[`02-architecture.md`](02-architecture.md), [`03-git-panel.md`](03-git-panel.md)); message 15 the file
+keys F2 rename, F5 copy, F6 move with the conventional rest, and function keys without fn (A13, A14;
+[`04-file-keys.md`](04-file-keys.md)); message 16 the directory tree (A15;
+[`05-directory-tree.md`](05-directory-tree.md)). They supersede message 12's "the browser views": the
+browser renames, copies, moves, makes folders and deletes — never over an existing name (04 §5) — and
+its git panel changes repositories, every history rewrite or destructive action backed up first (03
+§8). File operations in the browser and a directory tree leave §9.
+
 ## 2. Intent → acceptance
 
 | # | Owner intent | Acceptance (observable) |
@@ -70,7 +104,20 @@ one row per line. It adds no edit. Its items 1 and 2 are about the media window 
 | A9 | `sopen SOURCE` opens here; `sopen --target <host> SOURCE` opens it on `<host>` (msg 7) | `sopen <host-a>:/tmp/a.html` opens on the machine it was typed on, as before. `sopen --target <host-b> <host-a>:/tmp/a.html` opens it on `<host-b>`'s screen: the same window or editor, started by `<host-b>`'s own sopen (on macOS sopen's window floats above the others until it is used; the editor opens behind the active app, §4a); exit code is `<host-b>`'s; `could not reach <host-b>` when ssh cannot get there; `sopen is not installed on <host-b> …` (exit 127) when it has no sopen. A file on `<host-b>` itself opens there as a local file; a local file reaches `<host-b>` as `<this machine>:<path>`. |
 | A10 | Default target in sopen's settings (msg 8) | `sopen config target <host-b>` writes `target = "<host-b>"` to the config file (§4a); from then on `sopen SOURCE` opens on `<host-b>`, `--here` opens on this machine anyway, `--target` picks another; `sopen config` shows the file and the target; `sopen config target --unset` removes it. A config sopen cannot read is an error naming the file, never ignored. |
 | A11 | A folder opens in a Total Commander-like program; Enter on a file runs its default viewer there (msg 12) | `sopen host:/dir` opens sopen's file browser (§3a): two panels on the folder, folders first; Tab switches panels, Enter enters a folder, Backspace goes up, a letter jumps to the next name with it; Enter on a file shows it in the same window — text highlighted with line numbers, its lines wrapped (msg 13; W or F2: one row per line), an image in the image window, video/audio in the media window, anything else in the hex window — and Esc returns to the list with the bar where it was; F4 opens the entry in VS Code / Zed (A2's choice). An edited image or hex file is never dropped unasked: leaving asks as its own window does. `--app` still opens a file in a named app; a folder with `--app` / `--hex` is an error, as before. |
+| A12 | Git panel and browser modes (msg 14) | In a folder inside a git work tree, local or remote, the opposite side shows the git panel: every commit and branch as a graph, commit details and diffs, every Git Graph action and free history editing, each history rewrite or destructive action confirmed and backed up; the browser opens in preview mode (the opposite side previews the file under the bar) and F9 switches to dual-directory mode. Scenarios: 02 §4.5, 03 §11. |
+| A13 | F2 rename, F5 copy, F6 move, the conventional rest (msg 15) | The list's F-key row reads `1Help 2Rename 3View 4Edit 5Copy 6Move 7MkDir 8Delete 9Dual 10Tree` once every slice has landed (until then a slot not built yet is empty, 02 §8); every file-changing key asks first and never overwrites an existing name, locally and over SFTP. Scenarios: 04 §8 (K-R, K-S, K-C, K-M, K-N, K-K, K-D). |
+| A14 | Function keys act as F1…F12 in sopen (msg 15) | Every F-key row is clickable and Cmd/Ctrl+1…0 act as F1…F10 in every window; on macOS the top row sends F-keys while a sopen window is focused and the Mac's setting comes back on blur, quit and crash; Linux and Windows have the fallback only. Scenarios: 04 §8 (K-F). |
+| A15 | F10 directory tree (msg 16) | F10 (or Alt+F10) shows a tree rooted at the home when the folder is under it, else at `/`; device, virtual, network and mount folders never open by themselves; folders with fewer than 5 subfolders open within a row budget; every row shows its folder and file counts and a growing size at once. Scenarios: 05 §8. |
 | A16 | Split an audio track into voice and music (msg 13) | `sopen stems host:/a.mp3` writes `a.voice.mp3` and `a.music.mp3` next to it — new files, never over anything — and prints both paths; a video gives `.m4a` (AAC) stems; on a 0 dB voice/music mix each stem is ≈ 14 dB SDR (§7a). `brew install` brings the model; a missing or different model is one error naming the path it expected. The window gets its button in a later change; its child-process API is §7a's. |
+
+Owner message 17 (2026-11-20, quoted in [`06-streaming.md`](06-streaming.md)) asks that every viewer
+stream and that edits live locally until saved. Its contract is planned, and this file describes
+what ships until each work unit lands:
+
+| # | Owner intent | Acceptance (observable) |
+|---|---|---|
+| A17a | View any remote file without downloading it first, like a video stream: the first screen first, a buffer around it, a far jump on demand (msg 17) | [06](06-streaming.md) §12: e.g. a remote 24 GB file's first hex screen shows within 1.0 s of Enter having fetched ≤ 64 KiB (plus the 8 KiB kind sniff), and memory grows ≤ 80 MiB and the disk not at all while scrolling it (V1–V3). |
+| A17b | Edits kept locally until saved; Save writes to the remote by default; Save As to a local path (msg 17) | [07](07-streaming-edit.md) §12: e.g. a 4-byte hex edit of a remote 24 GB file saves with ≤ 4 KiB read and 4 bytes written of the file by the save itself (then ≤ 128 KiB as the view reloads), a changed remote is refused with the original untouched, and a crash offers Restore (E1, E3–E6, E10). |
 
 ## 3. Routing
 
@@ -180,6 +227,8 @@ too, where F3 closes it as ⌘W does.
   file is decoded, probed or indexed) keeps the viewer from opening; the fetched copy stays in
   the cache, recorded, and the status row says so. An image is always a
   copy (Save needs the bytes as opened); local media, text and other files are read in place.
+  Message 17 replaces this whole-file fetch, and the cached copy the text viewer reads, with a
+  stream for every viewer ([06](06-streaming.md) §7, planned).
   Each viewer gets a connection of its own (its Save and Export use it), and the copy it shows
   stays claimed until it is gone. The viewers keep exactly their edits, keys and Save rules
   (§6, §6a, §7); no new save path.
@@ -308,6 +357,9 @@ too, where F3 closes it as ⌘W does.
 - Nothing is installed on the remote. Only sshd's SFTP subsystem is required. (VS Code Remote - SSH or Zed installs its own server when the
   owner opens folders/text; that is the editor's behaviour, documented in the README.) A `--target` machine (§4a) is not a
   file's remote: it is a machine the owner uses sopen on, and runs the sopen installed there.
+- The git panel (03) runs the `git` already installed on a remote over the same master, as an ssh
+  command whose words are quoted as `--target`'s are (03 §3.2); it uploads and installs nothing, and
+  without git there it is not offered. File operations (04) and the directory tree (05) stay SFTP.
 
 ## 4a. Where it opens
 
@@ -478,6 +530,9 @@ Esc do, and — only when something would be downloaded — that nothing is unti
 The exceptions: Enter in the path field saves there (it never opens the hex editor; when that save
 is refused the field keeps the keyboard, so the next Enter saves again); during a transfer Enter and
 Esc do nothing and closing waits for it.
+Message 17 changes the dialog in two ways ([06](06-streaming.md) §7.5, planned). "Open in hex
+editor" opens a remote file as a stream, with nothing fetched first. Esc or closing the window
+cancels a "Save to…", leaving nothing behind.
 
 - Hex: the file is fetched into the cache as every fetch is (claimed, recorded, an earlier copy's
   unsaved edits moved aside first — §5), with the progress in the dialog; then the same window
@@ -690,18 +745,18 @@ Local only, never sent anywhere. Exists for §10.
 
 ## 9. Out of scope (until §10 says otherwise)
 
-Own text editor (the browser's text viewer is read-only; VS Code or Zed edits), a directory tree,
-file operations in the browser (copy, move, delete, rename, make folder — msg 12 asks for viewing),
+Own text editor (the browser's text viewer is read-only; VS Code or Zed edits),
 hex insert / delete or anything that changes a file's size, image edits beyond crop, pixelize and
 clipboard copy / cut / paste (no drawing or text tool, no layers, no filters), frame-accurate
-copy without re-encode, streaming playback before download completes, directory sync / mounts, file watching,
+copy without re-encode, directory sync / mounts, file watching,
 Windows, a `.app` bundle or cask, any agent on the remote, macshot (Swift, macOS-only, GPL-3 — incompatible with A7/A8).
 
 ## 10. Two-week review (from 2026-11-xx first preview)
 
 From `usage.jsonl` across machines: < 5 runs/week, or ≥ 80 % text/dir → archive, keep a `zed ssh://` alias.
-A conflict refusal or failed write → fix before anything else. Large-media waits (≥ 500 MB or fetch ≥ 30 s, 3+ times)
-→ consider streaming. The owner naming the same missing edit 3 times → that one edit, nothing more.
+A conflict refusal or failed write → fix before anything else. Streaming no longer waits on this
+review: owner message 17 asked for it ([06](06-streaming.md), [07](07-streaming-edit.md)). The owner
+naming the same missing edit 3 times → that one edit, nothing more.
 
 ## 11. Spike results (2026-11-11, throwaway spike, ~1.4k LOC)
 

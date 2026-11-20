@@ -10,6 +10,7 @@ pub mod binary;
 pub mod browser;
 pub mod chrome;
 pub mod fonts;
+mod help;
 pub mod hex;
 pub mod image;
 pub mod media;
@@ -385,6 +386,15 @@ pub trait Window {
     /// there (a window of its own shows them in its own row, see [`own_keys`]).
     fn keys(&self) -> &'static [chrome::FKey] {
         &[]
+    }
+
+    /// The window becomes a preview in the file browser's opposite side (`true`), or a viewer
+    /// again (`false`: the hand-over), 02 §4.2 and §4.4. A preview draws as inactive and without
+    /// its own bars, takes no input, plays nothing, does not follow a growing file and keeps to
+    /// 02 §4.3's budgets; `false` lifts all of that. The default does nothing (S1-B implements it
+    /// for the viewers).
+    fn set_preview(&mut self, on: bool) {
+        let _ = on;
     }
 }
 
@@ -1042,6 +1052,34 @@ mod tests {
             modifiers: egui::Modifiers::NONE,
         };
         assert!(!user_input(&release));
+    }
+
+    /// The trait's default `set_preview` changes nothing: a window that does not implement it
+    /// draws and answers the same after it, called as the browser holds its viewers
+    /// (`dyn Window`).
+    #[test]
+    fn the_default_set_preview_does_nothing() {
+        struct Plain;
+        impl Window for Plain {
+            fn ui(&mut self, ui: &mut egui::Ui) {
+                ui.label("a plain window");
+            }
+            fn ready(&self) -> bool {
+                true
+            }
+        }
+        let mut w = Plain;
+        let mut drv = testkit::Driver::new(400.0, 300.0);
+        drv.frame(&mut w, Vec::new(), egui::Modifiers::NONE);
+        let before = drv.texts();
+        assert!(drv.find_text("a plain window").is_some(), "{before:?}");
+        for on in [true, false] {
+            let dyn_w: &mut dyn Window = &mut w;
+            dyn_w.set_preview(on);
+            assert!(dyn_w.ready() && dyn_w.keys().is_empty() && dyn_w.close_requested());
+            drv.frame(&mut w, Vec::new(), egui::Modifiers::NONE);
+            assert_eq!(drv.texts(), before, "set_preview({on})");
+        }
     }
 
     #[test]
