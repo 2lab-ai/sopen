@@ -523,6 +523,77 @@ impl Fs for NoSync {
     }
 }
 
+/// How long [`free_lock`] waits for a lock whose holder is gone.
+const LOCK_WAIT: Duration = Duration::from_secs(30);
+
+/// Takes a lock that nobody holds any more, on the real disk. There the lock belongs to the open
+/// file, and a process another test starts holds a copy of every file this process has open from
+/// its fork until its exec: for that moment a lock stays taken after the session that held it
+/// was dropped. A session that died took its copies with it; a test that only drops the journal
+/// waits for them here. A lock still held after [`LOCK_WAIT`] was not such a copy: that fails,
+/// under its own name.
+fn free_lock(fs: &dyn Fs, path: &Path) -> io::Result<Held> {
+    let t0 = Instant::now();
+    loop {
+        if let Some(held) = fs.lock(path, false)? {
+            return Ok(held);
+        }
+        assert!(
+            t0.elapsed() < LOCK_WAIT,
+            "{}: still locked {LOCK_WAIT:?} after its holder was dropped",
+            path.display()
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+/// The real disk as the next session finds it after the last one ended in this process: an
+/// existing lock is taken with [`free_lock`]. Only for listings where every lock is free.
+struct Settled(Arc<dyn Fs>);
+
+fn settled_disk() -> Arc<dyn Fs> {
+    Arc::new(Settled(disk()))
+}
+
+impl Fs for Settled {
+    fn create_dir(&self, path: &Path) -> io::Result<()> {
+        self.0.create_dir(path)
+    }
+    fn write_new(&self, path: &Path, bytes: &[u8]) -> io::Result<()> {
+        self.0.write_new(path, bytes)
+    }
+    fn sync_file(&self, path: &Path) -> io::Result<()> {
+        self.0.sync_file(path)
+    }
+    fn sync_dir(&self, path: &Path) -> io::Result<()> {
+        self.0.sync_dir(path)
+    }
+    fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
+        self.0.rename(from, to)
+    }
+    fn remove_file(&self, path: &Path) -> io::Result<()> {
+        self.0.remove_file(path)
+    }
+    fn remove_dir(&self, path: &Path) -> io::Result<()> {
+        self.0.remove_dir(path)
+    }
+    fn read(&self, path: &Path) -> io::Result<Vec<u8>> {
+        self.0.read(path)
+    }
+    fn list(&self, dir: &Path) -> io::Result<Vec<String>> {
+        self.0.list(dir)
+    }
+    fn node(&self, path: &Path, follow: bool) -> io::Result<Option<Node>> {
+        self.0.node(path, follow)
+    }
+    fn lock(&self, path: &Path, create: bool) -> io::Result<Option<Held>> {
+        if create {
+            return self.0.lock(path, true);
+        }
+        free_lock(self.0.as_ref(), path).map(Some)
+    }
+}
+
 type Pick = Box<dyn Fn(&[String], &str) -> bool + Send + Sync>;
 
 /// Fails one step — the first that `pick`, given the steps done so far, chooses — without doing
@@ -1321,9 +1392,9 @@ fn the_crash_matrix_catches_missing_fsyncs() {
     }
 }
 
-/// The same kills on the real disk (fewer: every fsync there is a real one).
-#[test]
-fn a_kill_at_any_step_on_the_real_disk_recovers_a_whole_generation() {
+/// The kills of [`a_kill_at_any_step_on_the_real_disk_recovers_a_whole_generation`], each then
+/// found through `next`, the disk as the next session sees it. Returns the number of steps.
+fn kills_on_the_real_disk(next: &Arc<dyn Fs>) -> usize {
     fn short(fs: &Arc<dyn Fs>, cache: &Path, acks: &mut Vec<Ack>) -> Result<()> {
         let mut j = Journal::create(fs.clone(), cache, HOST, PATH, Kind::Image)?;
         acks.push(Ack::Gen(j.publish(&image_snap(&[1]))?.n));
@@ -1350,9 +1421,41 @@ fn a_kill_at_any_step_on_the_real_disk_recovers_a_whole_generation() {
         let ran = short(&fs, tmp.path(), &mut acks);
         // A kill while a retired journal is emptied is not an error: it is gone already.
         assert!(k < all || ran.is_ok(), "the whole run: {:?}", ran.err());
-        let found = recover(&disk(), tmp.path(), &acks, &gens);
+        let found = recover(next, tmp.path(), &acks, &gens);
         assert!(found.is_ok(), "kill before step {k}: {:?}", found.err());
     }
+    all
+}
+
+/// The same kills on the real disk (fewer: every fsync there is a real one). The "killed" session
+/// is only dropped, in this process, so the listing waits out a copy of its lock in a process
+/// another test is starting ([`free_lock`]); everything the listing then reads is checked as
+/// it is.
+#[test]
+fn a_kill_at_any_step_on_the_real_disk_recovers_a_whole_generation() {
+    kills_on_the_real_disk(&settled_disk());
+}
+
+/// What made that test fail once in a full run, made to happen every time: the dropped session's
+/// lock is still held through another open file (as a starting child holds it) when the listing
+/// comes. The journal is offered once that copy is gone — it was never lost.
+#[test]
+fn a_listing_after_a_kill_waits_out_a_copy_of_the_dead_sessions_lock() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cache = tmp.path();
+    let mut j = Journal::create(disk(), cache, HOST, PATH, Kind::Image).unwrap();
+    let acks = [Ack::Gen(j.publish(&image_snap(&[1])).unwrap().n)];
+    let lock = j.dir().join(LOCK);
+    drop(j);
+    let copy = free_lock(&Disk, &lock).unwrap();
+    let gens: BTreeMap<u64, Snapshot> = [(1, image_snap(&[1]))].into();
+    let child = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(100));
+        drop(copy);
+    });
+    let found = recover(&settled_disk(), cache, &acks, &gens);
+    child.join().unwrap();
+    assert!(found.unwrap().is_some(), "gen-1 is offered");
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1829,7 +1932,8 @@ fn the_lock_keeps_two_sessions_apart() {
         "a live session's journal is not offered"
     );
     drop(live);
-    let first = orphans(&fs, cache, HOST, PATH).unwrap();
+    // The session only ended in this process: see `free_lock`.
+    let first = orphans(&settled_disk(), cache, HOST, PATH).unwrap();
     assert_eq!(first.len(), 1);
     assert!(
         orphans(&fs, cache, HOST, PATH).unwrap().is_empty(),
@@ -1840,7 +1944,7 @@ fn the_lock_keeps_two_sessions_apart() {
     let r = adopted.publish(&hex_snap(2)).unwrap();
     assert_eq!(r.n, 2);
     drop(adopted);
-    let again = orphans(&fs, cache, HOST, PATH).unwrap();
+    let again = orphans(&settled_disk(), cache, HOST, PATH).unwrap();
     assert_eq!(edits_of(&again[0]).at.n, 2);
 }
 
@@ -1976,7 +2080,7 @@ fn conformance(fs: &dyn Fs, root: &Path) {
     );
     assert!(fs.lock(&d.join("lock"), false).unwrap().is_none(), "held");
     drop(held);
-    assert!(fs.lock(&d.join("lock"), false).unwrap().is_some(), "freed");
+    drop(free_lock(fs, &d.join("lock")).expect("freed"));
     assert_eq!(
         fs.lock(&d.join("nolock"), false).err().map(|e| e.kind()),
         Some(io::ErrorKind::NotFound)
