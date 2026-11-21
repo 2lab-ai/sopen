@@ -516,8 +516,9 @@ fn os_error(code: i32) -> std::io::Error {
 }
 
 /// A fill that checks what is on disk while it writes: the final name is absent; the only new
-/// entry in the folder is the private staging folder `.sopen-<16 hex>` (0700), holding only
-/// `part` (0600, one link: the probe's second name is gone) — the very file being written.
+/// entry in the folder is the private staging folder `.sopen-<16 hex>` (0700), holding only its
+/// `lock` and `part` (0600, one link: the probe's second name is gone) — the very file being
+/// written.
 fn watching_fill<'a>(dir: &'a Path, dest: &'a Path) -> impl FnOnce(&mut File) -> Result<u64> + 'a {
     move |f: &mut File| {
         use std::os::unix::fs::MetadataExt;
@@ -536,7 +537,7 @@ fn watching_fill<'a>(dir: &'a Path, dest: &'a Path) -> impl FnOnce(&mut File) ->
             .collect();
         assert!(others.is_empty(), "{others:?}");
         assert_eq!(mode(&private), 0o700, "a private folder");
-        assert_eq!(names(&private), ["part"]);
+        assert_eq!(names(&private), ["lock", "part"]);
         let part = std::fs::symlink_metadata(private.join("part")).unwrap();
         assert!(part.file_type().is_file());
         assert_eq!(part.mode() & 0o777, 0o600, "owner-only while it fills");
@@ -874,6 +875,94 @@ fn a_failed_publish_keeps_the_complete_download_and_says_why() {
     assert!(msg.contains(&os_error(libc::EIO).to_string()), "{msg}");
     assert!(msg.contains(&*part.to_string_lossy()), "{msg}");
     assert!(!msg.contains("an existing file"), "{msg}");
+}
+
+/// A staging folder as a save leaves it when its sopen dies: `.sopen-<16 hex>` (0700) in `dir`
+/// holding `files`, their bodies a few bytes each. Nothing holds its lock.
+fn left_staging(dir: &Path, hex: &str, files: &[&str]) -> PathBuf {
+    let staging = dir.join(format!(".sopen-{hex}"));
+    std::fs::create_dir(&staging).unwrap();
+    std::fs::set_permissions(&staging, std::fs::Permissions::from_mode(0o700)).unwrap();
+    for name in files {
+        std::fs::write(staging.join(name), b"left").unwrap();
+    }
+    staging
+}
+
+fn save_body(dest: &Path) {
+    let fill = |f: &mut File| -> Result<u64> {
+        f.write_all(BODY)?;
+        Ok(BODY.len() as u64)
+    };
+    save_new(dest, fill).unwrap();
+}
+
+/// A save that died (SIGKILL, a crash, the power) leaves its staging folder; the next save
+/// into the folder removes it: nothing holds its lock, and it holds only sopen's own files.
+#[test]
+fn a_save_sweeps_the_staging_a_dead_save_left() {
+    let tmp = tempfile::tempdir().unwrap();
+    left_staging(tmp.path(), "0123456789abcdef", &["lock", "part"]);
+    left_staging(tmp.path(), "fedcba9876543210", &["lock"]);
+    save_body(&tmp.path().join("a.bin"));
+    assert_eq!(names(tmp.path()), ["a.bin"]);
+}
+
+/// …and only then. Left exactly as they are: a staging whose lock is held (its save is
+/// running), one with a file in it that is not sopen's, one without a lock (an older sopen's,
+/// or a complete download kept after a failed publish), and names that only look alike.
+#[test]
+fn a_save_leaves_staging_that_is_not_provably_dead() {
+    let tmp = tempfile::tempdir().unwrap();
+    let live = left_staging(tmp.path(), "0000000000000001", &["lock", "part"]);
+    let held = File::open(live.join("lock")).unwrap();
+    // SAFETY: a descriptor this test owns.
+    assert_eq!(
+        unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+        0
+    );
+    left_staging(
+        tmp.path(),
+        "0000000000000002",
+        &["lock", "notes.txt", "part"],
+    );
+    left_staging(tmp.path(), "0000000000000003", &["part"]);
+    let folder_inside = left_staging(tmp.path(), "0000000000000004", &["lock"]);
+    std::fs::create_dir(folder_inside.join("part")).unwrap();
+    // Not `.sopen-<16 hex>`: 04 §5.1's publish probe (a file), and other lengths and letters.
+    std::fs::write(tmp.path().join(".sopen-probe-0123456789abcdef"), b"").unwrap();
+    left_staging(tmp.path(), "0123456789abcde", &["lock", "part"]);
+    left_staging(tmp.path(), "0123456789ABCDEF", &["lock", "part"]);
+    let before = walk(tmp.path());
+    save_body(&tmp.path().join("a.bin"));
+    let mut want = before;
+    want.push(tmp.path().join("a.bin"));
+    want.sort();
+    let mut after = walk(tmp.path());
+    after.sort();
+    assert_eq!(after, want);
+    assert!(folder_inside.join("part").is_dir());
+    drop(held);
+}
+
+/// The complete download a failed publish keeps (the owner was told where it is) is not swept
+/// by the next save there, though the sopen that kept it is gone: it holds no lock file.
+#[test]
+fn a_kept_download_is_not_swept_by_the_next_save() {
+    let tmp = tempfile::tempdir().unwrap();
+    let fill = |f: &mut File| -> Result<u64> {
+        f.write_all(BODY)?;
+        Ok(BODY.len() as u64)
+    };
+    let mut fails = |step: LinkStep, _: &Path| match step {
+        LinkStep::Probe => Ok(()),
+        LinkStep::Publish => Err(os_error(libc::EIO)),
+    };
+    save_new_with(&tmp.path().join("a.bin"), fill, &mut fails).unwrap_err();
+    let kept = private_folder(tmp.path()).unwrap();
+    assert_eq!(names(&kept), ["part"]);
+    save_body(&tmp.path().join("b.bin"));
+    assert_eq!(std::fs::read(kept.join("part")).unwrap(), BODY);
 }
 
 /// A staging folder that cannot be removed is said, not dropped.
@@ -1982,6 +2071,33 @@ fn a_failed_hex_open_keeps_the_source_for_save_and_a_retry() {
     let opened = source.open_hex(&mut |_, _| {}).unwrap();
     assert_eq!(opened.file.size(), BODY.len() as u64);
     assert!(source.fs.is_none(), "the connection went to the hex window");
+}
+
+/// What fails on a remote file's copy in sopen's cache — the hex open, a Save to… from it — is
+/// said about the file as its owner knows it, `host:/abs`: the copy's path is never named.
+#[test]
+fn a_failure_on_the_cached_copy_names_the_file_as_host_abs() {
+    let route = Route::new();
+    let mut source = route.source();
+    let copy = source.local_path(&mut |_, _| {}).unwrap().0;
+    std::fs::remove_file(&copy).unwrap();
+    std::fs::create_dir(&copy).unwrap();
+    let known = format!("box:{}", route.abs);
+    let hex = source.open_hex(&mut |_, _| {}).err().expect("a folder");
+    let dest = route.tmp.path().join("saved.zip");
+    let save = source
+        .save_to(&dest, &mut |_, _| {}, &Decision::default())
+        .expect_err("a folder");
+    for said in [format!("{hex:#}"), save.to_string()] {
+        assert!(
+            said.contains(&known),
+            "the file as its owner knows it: {said}"
+        );
+        assert!(
+            !said.contains(copy.to_str().unwrap()),
+            "the cache copy is named: {said}"
+        );
+    }
 }
 
 /// A local file read in place: a failure to open it (not a regular file just then) keeps the

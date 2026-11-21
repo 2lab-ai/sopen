@@ -441,6 +441,50 @@ fn a_hosted_hex_viewers_f5_and_f6_work_and_respect_its_prompt() {
     assert_eq!(std::fs::read(&file).unwrap()[16], 0x10);
 }
 
+/// What a hosted hex viewer shows after Go to took `0x10` and Enter: no byte changed, and the
+/// cursor at offset 16 — FF typed now goes over that byte.
+fn went_to_16_with_nothing_changed(fx: &mut Fx) {
+    let said: Vec<String> = fx.drv.texts().into_iter().map(|t| t.2).collect();
+    let changed: Vec<&String> = said.iter().filter(|t| t.contains("changed")).collect();
+    assert_eq!(changed, ["0 bytes changed"], "bytes were typed over");
+    fx.typed("FF");
+    assert!(
+        fx.drv.text_starting_with("FF 11 12").is_some(),
+        "the cursor went to offset 16"
+    );
+    assert!(fx.drv.find_text("1 byte changed").is_some(), "only that FF");
+}
+
+/// Go to in a hosted hex viewer keeps the typing when the platform says the window does not
+/// have the keyboard: `SOPEN_KEYS` played into a window that came up behind another one (the
+/// receipt's own route). The offset goes to the field and Enter goes there; no byte changes.
+#[test]
+fn a_hosted_hex_viewers_go_to_takes_played_keys_in_a_window_without_focus() {
+    let mut fx = fixture();
+    fx.open("data.bin");
+    fx.drv.focused = false;
+    fx.b.script = parse_keys("F6,text:0x10,Enter").unwrap().into();
+    fx.settle();
+    fx.drv.idle(&mut fx.b, 2);
+    fx.drv.focused = true;
+    went_to_16_with_nothing_changed(&mut fx);
+}
+
+/// …and with a real keyboard: F6, the owner away in another application for a pass, back, the
+/// offset, Enter.
+#[test]
+fn a_hosted_hex_viewers_go_to_is_still_open_after_the_window_lost_focus() {
+    let mut fx = fixture();
+    fx.open("data.bin");
+    fx.key(Key::F6);
+    fx.drv.focused = false;
+    fx.drv.idle(&mut fx.b, 1);
+    fx.drv.focused = true;
+    fx.typed("0x10");
+    fx.key(Key::Enter);
+    went_to_16_with_nothing_changed(&mut fx);
+}
+
 /// The image viewer's F5 joins the browser's row beside Exit and Edit.
 #[test]
 fn a_hosted_image_viewer_lists_its_f5() {
@@ -1289,6 +1333,51 @@ fn a_video_opens_in_the_media_window_and_esc_leaves_it() {
     assert!(fx.b.viewer.is_none());
     assert_eq!(fx.current(), "clip.mp4");
     assert!(!fx.drv.closed());
+}
+
+/// Enter on a remote file ffprobe cannot read (an empty `.mp4`): the status row says so about
+/// the file as its owner knows it, `host:/abs` — never about the private copy in sopen's cache
+/// that ffprobe was run on. From the list (dual mode: no preview) and from the preview's card.
+/// Needs ffmpeg (skips without it, unless `SOPEN_REQUIRE_FFMPEG` is set).
+#[test]
+fn a_remote_file_that_fails_to_open_is_named_as_host_abs_never_as_its_cache_copy() {
+    if let Err(e) = crate::ffmpeg::resolve() {
+        if std::env::var_os("SOPEN_REQUIRE_FFMPEG").is_some() {
+            panic!("SOPEN_REQUIRE_FFMPEG is set but {e}");
+        }
+        eprintln!("skipping: {e}");
+        return;
+    }
+    for mode in [view::Mode::Dual, view::Mode::Preview] {
+        let mut fx = fixture_with(Some("box"), local_connect(), None);
+        fx.b.mode = mode;
+        std::fs::write(format!("{}/k_zero.mp4", fx.root), b"").unwrap();
+        let root = fx.root.clone();
+        fx.b.list(None, root, None, None);
+        fx.settle();
+        fx.select("k_zero.mp4");
+        // The bar rests (past the 150 ms commit): in preview mode the card is on screen.
+        fx.drv.idle(&mut fx.b, 12);
+        fx.settle();
+        fx.key(Key::Enter);
+        fx.settle();
+        assert!(fx.b.viewer.is_none(), "{mode:?}: nothing to show");
+        let said = fx.b.status.text.clone();
+        assert!(fx.b.status.error, "{mode:?}: {said}");
+        let known = format!("box:{}/k_zero.mp4", fx.root);
+        assert!(
+            said.starts_with(&format!("ffprobe cannot read {known}")),
+            "{mode:?}: the file as its owner knows it: {said}"
+        );
+        let cache = std::fs::canonicalize(&fx.cache).unwrap_or_else(|_| fx.cache.clone());
+        for copy in [fx.cache.as_path(), cache.as_path()] {
+            assert!(
+                !said.contains(copy.to_str().unwrap()),
+                "{mode:?}: the cache copy is named: {said}"
+            );
+        }
+        assert_eq!(said.matches("k_zero.mp4").count(), 1, "{mode:?}: {said}");
+    }
 }
 
 /// Cmd/Ctrl+C, X and V reach a hosted image as in its own window (the browser takes none of

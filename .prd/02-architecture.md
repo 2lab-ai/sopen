@@ -284,7 +284,9 @@ bar does not have to move).
   bounded by its input (one probe, one frame, at most the file's sound), and a Ctrl+C in the
   terminal reaches it with the rest of the process group. The private preview folder such an end
   leaves is swept by the next window (its lock is free). sopen keeps no list of its children
-  and handles no signal.
+  and handles no signal — but for one: while a "Save to…" runs without a window, SIGINT and
+  SIGTERM cancel it (06 §7.5; a handler that only stores into atomics, there for that save
+  alone).
 
 | Exit | What happens to the preparation (or the prepared preview) |
 |---|---|

@@ -604,8 +604,11 @@ nothing and closing waits for it.
   the last moment is refused like any taken name: the dialog says so and puts the next free
   `<stem>-N<ext>` in the field (the stem gives way, on a character boundary, so the name stays
   within 255 bytes); "Save to…" again saves there. Cleanup only ever removes sopen's own
-  names inside its private folder, then the folder (a failure to remove it is said); an interrupted
-  save leaves only that hidden folder. A download
+  names inside its private folder, then the folder (a failure to remove it is said). Without a
+  window, Ctrl-C and SIGTERM cancel the save and leave nothing; a save killed outright leaves only
+  that hidden folder, which the next save into the same folder removes — each save holds a lock
+  on `lock` inside its private folder, and a folder goes only when that lock is free and it holds
+  nothing but sopen's own staging files (06 §7.5). A download
   whose source changes meanwhile is not saved — a best-effort check: the remote's size and mtime
   after the transfer, and the bytes received, against its stat before. A local file (or the cached
   copy) is copied the same way, checked by its handle: size, mtime, change time and bytes copied.

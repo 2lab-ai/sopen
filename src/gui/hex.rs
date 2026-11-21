@@ -2591,7 +2591,13 @@ impl super::Window for HexWindow {
                 field
             })
             .inner;
-        let goto_owns = cmd_g || field.has_focus() || field.lost_focus() || field.clicked();
+        // Whether the field has the keyboard is asked of egui's memory, not of the response:
+        // `Response::has_focus` is also false whenever the platform says the window itself is
+        // not focused (the owner in another application for a moment, a window that came up
+        // behind another one). The grid would take the keyboard back in such a pass, and the
+        // offset typed next would go over bytes.
+        let goto_has = ctx.memory(|m| m.has_focus(goto_id()));
+        let goto_owns = cmd_g || goto_has || field.lost_focus() || field.clicked();
         // The F-key row, the window's last (on its own: the browser around it has the row).
         super::own_keys(ui, HEX_KEYS);
         // The read-only window's path field (laid out below, with the rows) owns the typing of

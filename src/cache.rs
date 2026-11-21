@@ -415,6 +415,50 @@ fn claim_with(
     })
 }
 
+/// An error about a file's private copy, said about the file as its owner knows it. A remote
+/// file is read from `copy`, in sopen's cache, and what fails on it — ffprobe, a read — names
+/// that path. Where the error is shown (the terminal, the list's status row, a dialog) the copy
+/// is not named: `known` (`host:/abs`) stands in its place. Only the copy's own path is
+/// replaced, never a longer path that begins with it (a backup beside it). An error that does
+/// not name the copy (a stop, the connection's own, a refusal) is passed on as it is, its
+/// kind with it.
+pub fn as_known(e: anyhow::Error, copy: &Path, known: &str) -> anyhow::Error {
+    let copy = copy.display().to_string();
+    let said = format!("{e:#}");
+    if copy == known || crate::remote::is_cancelled(&e) {
+        return e;
+    }
+    match renamed(&said, &copy, known) {
+        Some(renamed) => anyhow::anyhow!(renamed),
+        None => e,
+    }
+}
+
+/// `said` with every `copy` that is a whole path replaced by `known`; `None` when there is none.
+fn renamed(said: &str, copy: &str, known: &str) -> Option<String> {
+    if copy.is_empty() {
+        return None;
+    }
+    let mut out = String::new();
+    let (mut rest, mut found) = (said, false);
+    while let Some(at) = rest.find(copy) {
+        let after = &rest[at + copy.len()..];
+        let mut next = after.chars();
+        // The path goes on: another file's (`<copy>.sopen-backup-…`, `<copy>/…`).
+        let goes_on = match next.next() {
+            Some(c) if c.is_alphanumeric() || matches!(c, '/' | '-' | '_' | '~') => true,
+            Some('.') => next.next().is_some_and(|c| !c.is_whitespace()),
+            _ => false,
+        };
+        out.push_str(&rest[..at]);
+        out.push_str(if goes_on { copy } else { known });
+        found |= !goes_on;
+        rest = after;
+    }
+    out.push_str(rest);
+    found.then_some(out)
+}
+
 /// A remote file fetched into this session's cached copy.
 pub struct Fetched {
     /// The copy, locked for as long as this lives: another session gets a copy of its own.
@@ -969,6 +1013,38 @@ mod job_tests {
 
 #[cfg(test)]
 mod tests {
+    /// [`as_known`]: the copy's own path becomes `host:/abs`; a longer path that begins with it
+    /// stays; an error that does not name the copy keeps its kind.
+    #[test]
+    fn an_error_about_the_copy_is_said_about_the_file() {
+        let copy = Path::new("/c/box/data/a.mp4");
+        let known = "box:/data/a.mp4";
+        let said = |text: &str| format!("{:#}", as_known(anyhow::anyhow!("{text}"), copy, known));
+        assert_eq!(
+            said("ffprobe cannot read /c/box/data/a.mp4: Invalid data"),
+            "ffprobe cannot read box:/data/a.mp4: Invalid data"
+        );
+        assert_eq!(
+            said("/c/box/data/a.mp4 has no audio or video stream"),
+            "box:/data/a.mp4 has no audio or video stream"
+        );
+        assert_eq!(
+            said("cannot read /c/box/data/a.mp4."),
+            "cannot read box:/data/a.mp4."
+        );
+        for other in [
+            "kept at /c/box/data/a.mp4.sopen-backup-1",
+            "kept at /c/box/data/a.mp4-1",
+            "cannot read /c/box/data/a.mp4/part",
+        ] {
+            assert_eq!(said(other), other);
+        }
+        let stopped = as_known(anyhow::anyhow!(crate::remote::Cancelled), copy, known);
+        assert!(crate::remote::is_cancelled(&stopped));
+        let typed = as_known(anyhow::anyhow!(std::fmt::Error), copy, known);
+        assert!(typed.is::<std::fmt::Error>(), "its kind is kept");
+    }
+
     use super::*;
     use std::time::Duration;
 

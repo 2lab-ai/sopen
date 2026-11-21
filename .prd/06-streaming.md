@@ -1008,6 +1008,36 @@ to every run on the file: the probe, playback, the paused frame, the waveform, S
       that came by then wins, whatever step it came in, and nothing is published. One that comes
       after is refused: the file is there, and the dialog and the terminal say `saved`. So what
       is said is always what happened.
+  - **Without a window, Ctrl-C and SIGTERM cancel it** (`SOPEN_CHOICE=save`; before, the signal's
+    default ended sopen mid-way and left `part`, gigabytes of it, hidden in the folder).
+    - While such a save runs — and only then — SIGINT and SIGTERM have a handler. It stores into
+      two atomics, the signal's number and "cancelled" into the save's decision, and does nothing
+      else: no allocation, no lock, no I/O, no process signalled (S1-M removed a process-wide
+      handler that signalled process ids and wrote to a pipe; this is not that one). The
+      dispositions found before the save are put back when it ends; a signal that was ignored
+      stays ignored.
+    - The save sees the cancel between chunks and takes the same cancel path as Esc: `part` and
+      the private folder are removed and nothing is published. The terminal says
+      `sopen: cancelled; nothing was saved` and sopen exits 130 (SIGINT) or 143 (SIGTERM). A
+      signal that comes after the publish has won changes nothing: `saved`, exit 0.
+    - A transfer whose remote has stalled sees no cancel. The handler takes one delivery
+      (`SA_RESETHAND`), so the same signal again has its default and ends sopen at once; what
+      that leaves is swept as below.
+  - **Staging a dead sopen left is swept, when it is provably dead.** SIGKILL, a crash or the
+    power clean nothing up.
+    - Every save holds an `flock` on `lock` inside its private folder for as long as it uses it.
+      A lock dies with its process, so a process id used again cannot pass for the owner.
+    - A save, before it makes its own private folder, looks at the `.sopen-<16 hex>` folders in
+      the same destination folder. One goes when its `lock` can be taken without waiting and it
+      holds nothing but sopen's own staging files as plain files (`part`, `lock`, and `probe` or
+      `mode`, which exist for an instant each): those names are unlinked, the lock last, then the
+      empty folder.
+    - Left exactly as it is: a folder whose lock is held (its save is running), one with no
+      `lock` (an older sopen's; or a complete download kept after a failed publish — keeping it
+      removes its `lock`, since the owner was told where it is), one with anything else in it,
+      another user's, and any name that is not exactly `.sopen-<16 hex>`. On a filesystem
+      without `flock` a save makes no `lock`, so its folder is never swept.
+    - A sweep never fails the save that ran it. It removes only sopen's own temporary files.
   - This replaces 01 §6a's "during a transfer Enter and Esc do nothing and closing waits for it".
     It is **the workstream's decision**, from ssot's fixed scope item 1 ("can be cancelled"), not
     message 17's own words.
@@ -1520,6 +1550,10 @@ stream <event> t=<ms> <host:/abs> fetched=<b> demand=<b> prefetch=<b> bulk=<b> d
 - **V21. "Save to…" of a 24 GB file.** Esc cancels it and leaves no file and no staging folder, and so
   does closing the window (gate on `local_server()` with a throttled read). Qualification: it runs
   at the pipelined rate (V6).
+  - Without a window: SIGINT and SIGTERM to a sopen holding such a save leave no file and no
+    staging folder, and it exits 130 / 143; after a SIGKILL the next save into the folder removes
+    the staging left; a running save's staging, and a folder with a file that is not sopen's,
+    are left alone (gates in `tests/cli.rs` and `src/gui/binary/tests.rs`).
 - **V22. Export cancel and failure** (gates on `local_server()` and a `lavfi` fixture):
   - **During the render:** Cancel kills ffmpeg, leaves no file under `<cache>/.exports`, and creates
     nothing on the remote.

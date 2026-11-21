@@ -453,6 +453,12 @@ pub struct Hooks {
     /// `SOPEN_EXPORT_HOLD_MS`: the media window starts an Export on open and holds it, at its
     /// first progress report at or past 30 %, for this long (a screenshot mid-export).
     pub export_hold: Option<Duration>,
+    /// `SOPEN_SAVE_HOLD_MS`: a "Save to…" without a window (`SOPEN_CHOICE=save`) holds, at its
+    /// first progress report, for this long or until it is cancelled — so a signal reaches it
+    /// mid-way (the interrupt's receipt). `<ms>:stalled` holds for the whole time whatever
+    /// comes, as a transfer whose remote has stalled does: it never looks at a cancel.
+    pub save_hold: Option<Duration>,
+    pub save_stalled: bool,
     /// `SOPEN_WINDOW_SIZE=<w>x<h>`: open the window at this size in points (layout receipts on
     /// a narrow window).
     pub window_size: Option<[f32; 2]>,
@@ -482,6 +488,19 @@ impl Hooks {
         };
         let save_delay = millis("SOPEN_AUTOSAVE_DELAY_MS")?;
         let export_hold = millis("SOPEN_EXPORT_HOLD_MS")?;
+        let (save_hold, save_stalled) = match std::env::var("SOPEN_SAVE_HOLD_MS") {
+            Ok(text) => {
+                let (ms, stalled) = match text.strip_suffix(":stalled") {
+                    Some(ms) => (ms, true),
+                    None => (text.as_str(), false),
+                };
+                let ms = ms.parse().map_err(|_| {
+                    anyhow!("SOPEN_SAVE_HOLD_MS must be <milliseconds> or <milliseconds>:stalled")
+                })?;
+                (Some(Duration::from_millis(ms)), stalled)
+            }
+            Err(_) => (None, false),
+        };
         let window_size = match std::env::var("SOPEN_WINDOW_SIZE") {
             Ok(text) => {
                 let bad = || anyhow!("SOPEN_WINDOW_SIZE must be <width>x<height> (got '{text}')");
@@ -505,6 +524,8 @@ impl Hooks {
             autoexport: flag("SOPEN_AUTOEXPORT"),
             save_delay,
             export_hold,
+            save_hold,
+            save_stalled,
             window_size,
             choice,
             save_to: std::env::var_os("SOPEN_SAVE_TO")

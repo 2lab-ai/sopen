@@ -21,7 +21,7 @@ use eframe::egui::{self, Color32, Key, Pos2, Rect, Vec2};
 use std::ffi::{CStr, CString};
 use std::fs::File;
 use std::io::{Read, Write};
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -29,6 +29,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
+
+mod interrupt;
+
+pub use interrupt::Interrupted;
 
 /// The dialog's size when it opens (its height then follows its content).
 pub const WINDOW: [f32; 2] = [704.0, 240.0];
@@ -269,6 +273,9 @@ pub(super) enum LinkStep {
 const PART: &CStr = c"part";
 const PROBE: &CStr = c"probe";
 const MODE: &CStr = c"mode";
+/// Held locked (`flock`) by the save for as long as its private folder is in use: a private
+/// folder whose lock can be taken belongs to no running sopen ([`sweep_dead`]).
+const LOCK: &CStr = c"lock";
 
 fn sys(ret: libc::c_int) -> std::io::Result<libc::c_int> {
     if ret < 0 {
@@ -315,9 +322,14 @@ fn no_hard_links(e: &std::io::Error) -> bool {
 /// destination folder opened once — never by path again. The folder is the owner's only from
 /// the call that makes it, so no other user can put or swap an entry in it; other processes of
 /// the same user are trusted. Cleanup only ever removes sopen's own names inside it, then it.
+/// For as long as the folder is in use the save holds a lock on `lock` inside it, so a later
+/// save can tell a folder a dead sopen left from one in use ([`sweep_dead`]).
 struct Staging {
     dir: OwnedFd,
     private: OwnedFd,
+    /// The locked `lock` (`None` where the filesystem has no locks: then there is no `lock`
+    /// file either, and the folder is never swept). Closing it lets the lock go.
+    lock: Option<OwnedFd>,
     private_name: CString,
     /// `<destination folder>/.sopen-<16 hex>`, for messages.
     shown: PathBuf,
@@ -361,23 +373,46 @@ impl Staging {
                 libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW,
                 0,
             );
+            let remove = || {
+                // SAFETY: `cname` is NUL-terminated; it names the folder just made.
+                unsafe { libc::unlinkat(dir.as_raw_fd(), cname.as_ptr(), libc::AT_REMOVEDIR) };
+            };
+            let private = match private {
+                Ok(fd) => fd,
+                Err(e) => {
+                    remove();
+                    return Err(e)
+                        .with_context(|| format!("cannot open {}", parent.join(&name).display()));
+                }
+            };
+            let lock = match lock_new(&private) {
+                Ok(Locked::Held(lock)) => Some(lock),
+                Ok(Locked::NoLocks) => None,
+                // Another save's sweep took the lock in the instant between its creation and
+                // its locking, and is removing the folder as a dead one: start under a new name.
+                Ok(Locked::Swept) => {
+                    // SAFETY: `LOCK` is NUL-terminated; the descriptor is this save's.
+                    unsafe { libc::unlinkat(private.as_raw_fd(), LOCK.as_ptr(), 0) };
+                    remove();
+                    continue;
+                }
+                Err(e) => {
+                    remove();
+                    return Err(e).with_context(|| {
+                        format!(
+                            "cannot create {}",
+                            parent.join(&name).join("lock").display()
+                        )
+                    });
+                }
+            };
             let mut staging = Self {
-                private: match private {
-                    Ok(fd) => fd,
-                    Err(e) => {
-                        // SAFETY: `cname` is NUL-terminated; it names the folder just made.
-                        unsafe {
-                            libc::unlinkat(dir.as_raw_fd(), cname.as_ptr(), libc::AT_REMOVEDIR)
-                        };
-                        return Err(e).with_context(|| {
-                            format!("cannot open {}", parent.join(&name).display())
-                        });
-                    }
-                },
+                made: lock.iter().map(|_| LOCK).collect(),
+                private,
+                lock,
                 dir,
                 private_name: cname,
                 shown: parent.join(&name),
-                made: Vec::new(),
                 done: false,
             };
             // SAFETY: a descriptor this save owns.
@@ -478,9 +513,17 @@ impl Staging {
         })
     }
 
-    /// Keeps the folder with the complete `part` in it; returns where that is.
+    /// Keeps the folder with the complete `part` in it; returns where that is. Its `lock` is
+    /// removed: the owner was told the download is kept there, so it must outlive this sopen —
+    /// a folder without a lock is never swept ([`sweep_dead`]).
     fn keep(mut self) -> PathBuf {
         self.done = true;
+        if let Some(held) = self.lock.take() {
+            // Unlinked while it is still held: no sweep can take it in between.
+            // SAFETY: as in `unlink`.
+            unsafe { libc::unlinkat(self.private.as_raw_fd(), LOCK.as_ptr(), 0) };
+            drop(held);
+        }
         self.shown.join("part")
     }
 }
@@ -496,12 +539,206 @@ impl Drop for Staging {
     }
 }
 
+/// What cleanup could not remove ([`Staging::clean`]'s words), on the error it came with.
+#[derive(Debug)]
+struct Left(String);
+
+impl std::fmt::Display for Left {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
 /// `e`, with what cleanup could not remove.
 fn with_left(e: anyhow::Error, left: Option<String>) -> anyhow::Error {
     match left {
-        Some(left) => e.context(left),
+        Some(left) => e.context(Left(left)),
         None => e,
     }
+}
+
+/// What became of a new private folder's `lock` ([`lock_new`]).
+enum Locked {
+    Held(OwnedFd),
+    /// The filesystem has no `flock`: no `lock` file is left, so the folder is never swept.
+    NoLocks,
+    /// A sweep holds or has removed the lock: the folder is going, or gone.
+    Swept,
+}
+
+/// `flock(fd, LOCK_EX | LOCK_NB)`.
+fn lock_now(fd: &OwnedFd) -> std::io::Result<()> {
+    // SAFETY: a descriptor the caller owns.
+    sys(unsafe { libc::flock(fd.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) }).map(|_| ())
+}
+
+fn stat_of(fd: &OwnedFd) -> std::io::Result<libc::stat> {
+    // SAFETY: `st` is written by the call; the descriptor is the caller's.
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    sys(unsafe { libc::fstat(fd.as_raw_fd(), &mut st) })?;
+    Ok(st)
+}
+
+/// Creates `lock` in the private folder just made and locks it. Creating and locking are two
+/// calls, and a sweep ([`sweep_dead`]) may come between them and take the folder for a dead
+/// one: then the lock is busy, or — the sweep already done — taken but no longer in the folder
+/// (no link left), and the caller starts again under a new name.
+fn lock_new(private: &OwnedFd) -> std::io::Result<Locked> {
+    let lock = open_at(
+        private.as_raw_fd(),
+        LOCK,
+        libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW,
+        0o600,
+    )?;
+    match lock_now(&lock) {
+        Ok(()) if stat_of(&lock)?.st_nlink == 0 => Ok(Locked::Swept),
+        Ok(()) => Ok(Locked::Held(lock)),
+        Err(e) if e.raw_os_error() == Some(libc::EWOULDBLOCK) => Ok(Locked::Swept),
+        Err(_) => {
+            // SAFETY: `LOCK` is NUL-terminated; it names the file just made in this folder.
+            unsafe { libc::unlinkat(private.as_raw_fd(), LOCK.as_ptr(), 0) };
+            Ok(Locked::NoLocks)
+        }
+    }
+}
+
+/// `errno`, to tell the end of a folder from a failed read of it.
+fn errno() -> *mut libc::c_int {
+    // SAFETY: both return this thread's `errno`.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    unsafe {
+        libc::__errno_location()
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    unsafe {
+        libc::__error()
+    }
+}
+
+/// The names in the folder `dir` is open on (without `.` and `..`), read through a descriptor
+/// of its own. A read that fails mid-way is an error, never a shorter list.
+fn names_in(dir: &OwnedFd) -> std::io::Result<Vec<CString>> {
+    let again = open_at(dir.as_raw_fd(), c".", libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
+    let raw = again.into_raw_fd();
+    // SAFETY: `raw` is an open folder; on success the stream owns it (`closedir` closes it).
+    let stream = unsafe { libc::fdopendir(raw) };
+    if stream.is_null() {
+        let e = std::io::Error::last_os_error();
+        // SAFETY: the stream did not take the descriptor.
+        unsafe { libc::close(raw) };
+        return Err(e);
+    }
+    let mut names = Vec::new();
+    let read = loop {
+        // SAFETY: `stream` is open; an entry is read before the next call; `errno` is this
+        // thread's.
+        unsafe { *errno() = 0 };
+        let entry = unsafe { libc::readdir(stream) };
+        if entry.is_null() {
+            break match unsafe { *errno() } {
+                0 => Ok(()),
+                code => Err(std::io::Error::from_raw_os_error(code)),
+            };
+        }
+        // SAFETY: `d_name` is NUL-terminated within the entry.
+        let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) };
+        if !matches!(name.to_bytes(), b"." | b"..") {
+            names.push(name.to_owned());
+        }
+    };
+    // SAFETY: opened above, closed once.
+    unsafe { libc::closedir(stream) };
+    read.map(|()| names)
+}
+
+/// `.sopen-<16 lower-case hex>`: a save's private folder, as [`Staging::make`] names it.
+fn staging_name(name: &[u8]) -> bool {
+    name.strip_prefix(b".sopen-").is_some_and(|hex| {
+        hex.len() == 16 && hex.iter().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    })
+}
+
+/// Removes the private folders dead saves left in `dir` — a sopen that was killed outright
+/// (SIGKILL, a crash, the power) cleans nothing up, and its `part` may hold gigabytes. A folder
+/// goes only when it is provably no running save's and holds nothing but sopen's own staging
+/// files; anything else is left exactly as it is. Nothing here fails the save that asked.
+fn sweep_dead(dir: &OwnedFd, parent: &Path) {
+    let Ok(names) = names_in(dir) else {
+        return;
+    };
+    for name in names.iter().filter(|n| staging_name(n.to_bytes())) {
+        if sweep_one(dir, name).is_some() {
+            let gone = parent.join(std::ffi::OsStr::from_bytes(name.to_bytes()));
+            crate::debug!(
+                "removed {} (left by a sopen that was killed)",
+                gone.display()
+            );
+        }
+    }
+}
+
+/// [`sweep_dead`] for one folder: `Some` when it was removed. It is dead when its `lock` can be
+/// taken without waiting — every save holds its own for as long as it runs, and a lock dies
+/// with its process, so a process id used again cannot pass for the owner. No `lock` (a folder
+/// of an older sopen, or a complete download kept after a failed publish), a lock that is held,
+/// another user's folder, or anything inside that is not one of sopen's own names as a plain
+/// file: left alone. Only those names are ever unlinked, the lock last, then the empty folder.
+fn sweep_one(dir: &OwnedFd, name: &CStr) -> Option<()> {
+    let private = open_at(
+        dir.as_raw_fd(),
+        name,
+        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW,
+        0,
+    )
+    .ok()?;
+    // SAFETY: no arguments, no failure.
+    if stat_of(&private).ok()?.st_uid != unsafe { libc::geteuid() } {
+        return None;
+    }
+    let lock = open_at(
+        private.as_raw_fd(),
+        LOCK,
+        libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+        0,
+    )
+    .ok()?;
+    if stat_of(&lock).ok()?.st_mode & libc::S_IFMT != libc::S_IFREG {
+        return None;
+    }
+    // Held: its save is running.
+    lock_now(&lock).ok()?;
+    let inside = names_in(&private).ok()?;
+    for entry in &inside {
+        if ![PART, PROBE, MODE, LOCK].contains(&entry.as_c_str()) {
+            return None;
+        }
+        // SAFETY: `entry` is NUL-terminated; `st` is written by the call.
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        sys(unsafe {
+            libc::fstatat(
+                private.as_raw_fd(),
+                entry.as_ptr(),
+                &mut st,
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        })
+        .ok()?;
+        if st.st_mode & libc::S_IFMT != libc::S_IFREG {
+            return None;
+        }
+    }
+    let lock_last = inside
+        .iter()
+        .filter(|n| n.as_c_str() != LOCK)
+        .map(|n| n.as_c_str())
+        .chain([LOCK]);
+    for entry in lock_last {
+        // SAFETY: `entry` is NUL-terminated and one of sopen's own names in this folder.
+        sys(unsafe { libc::unlinkat(private.as_raw_fd(), entry.as_ptr(), 0) }).ok()?;
+    }
+    // SAFETY: `name` is NUL-terminated; only an empty folder goes.
+    sys(unsafe { libc::unlinkat(dir.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR) }).ok()?;
+    Some(())
 }
 
 /// Opens the destination's folder once, as a folder (a link to a folder is followed here, as
@@ -535,7 +772,9 @@ fn open_folder(parent: &Path) -> Result<OwnedFd> {
 /// new file there gets, and published by a hard link to `dest` — which fails if anything is
 /// there — then the private folder is removed. A publish that fails otherwise keeps the
 /// complete `part` and names it. Cleanup only ever removes sopen's own names in its private
-/// folder, then the folder.
+/// folder, then the folder. A save holds a lock on `lock` in its private folder while it runs;
+/// before it makes its own, it removes the private folders dead saves left in the same folder
+/// ([`sweep_dead`]).
 pub fn save_new(
     dest: &Path,
     fill: impl FnOnce(&mut File) -> Result<u64>,
@@ -604,6 +843,7 @@ pub(super) fn save_new_deciding(
             ))
         }
     }
+    sweep_dead(&dir, &parent);
     let mut staging = Staging::make(dir, &parent).map_err(nothing)?;
     let give_up = |staging: &mut Staging, e: anyhow::Error| {
         let left = staging.clean();
@@ -706,6 +946,10 @@ impl Decision {
     const CANCELLED: u8 = 1;
     const PUBLISHING: u8 = 2;
 
+    pub const fn new() -> Self {
+        Self(std::sync::atomic::AtomicU8::new(Self::OPEN))
+    }
+
     /// Cancels the save, unless it is being published already: whether the cancel won.
     pub fn cancel(&self) -> bool {
         self.settle(Self::CANCELLED)
@@ -720,6 +964,11 @@ impl Decision {
     /// the publish won.
     fn publish(&self) -> bool {
         self.settle(Self::PUBLISHING)
+    }
+
+    /// Open again, for the next save it decides (the one a signal cancels: [`interrupt`]).
+    fn reopen(&self) {
+        self.0.store(Self::OPEN, Ordering::SeqCst);
     }
 
     fn settle(&self, to: u8) -> bool {
@@ -977,6 +1226,15 @@ impl FileSource {
         }
     }
 
+    /// An error about the cached copy, said about the file as its owner knows it
+    /// ([`crate::cache::as_known`]): the copy's path is never what the owner is shown.
+    fn as_known(&self, e: anyhow::Error, copy: &Path) -> anyhow::Error {
+        match &self.label {
+            Some(label) => crate::cache::as_known(e, copy, &format!("{label}:{}", self.abs)),
+            None => e,
+        }
+    }
+
     fn host(&self) -> String {
         self.label
             .clone()
@@ -1030,7 +1288,7 @@ impl Source for FileSource {
                 (PathBuf::from(&self.abs), fs.stat(&self.abs)?, Vec::new())
             }
         };
-        let base = hex::Base::open(&base_path)?;
+        let base = hex::Base::open(&base_path).map_err(|e| self.as_known(e, &base_path))?;
         // Nothing below fails: hand everything over.
         let fs = self.fs.take().expect("checked above");
         let claim = self.fetched.take().map(|f| f.claim);
@@ -1055,7 +1313,11 @@ impl Source for FileSource {
         cancel: &Decision,
     ) -> std::result::Result<SavedTo, SaveError> {
         if let Some(fetched) = &self.fetched {
-            return copy_to(&fetched.claim.local, dest, progress, cancel);
+            let copy = &fetched.claim.local;
+            return copy_to(copy, dest, progress, cancel).map_err(|e| match e {
+                SaveError::Failed(e) => SaveError::Failed(self.as_known(e, copy)),
+                exists => exists,
+            });
         }
         match self.fs.as_mut() {
             Some(_) if self.label.is_none() => {
@@ -1185,10 +1447,38 @@ pub fn open_file(
         }
         Some(Choice::Save) => {
             meter.start(&format!("saving {}", info.name));
-            let saved =
-                save_without_window(&info, &mut source, hooks, &mut |d, t| meter.bytes(d, t));
+            // No window, so no Esc: Ctrl-C and SIGTERM cancel this save while it runs, and
+            // only while it runs ([`interrupt`]).
+            let watch = interrupt::Watch::start();
+            let cancel = watch.decision();
+            let mut hold = hooks.save_hold;
+            let mut progress = |d: u64, t: u64| {
+                meter.bytes(d, t);
+                if let Some(hold) = hold.take() {
+                    // `SOPEN_SAVE_HOLD_MS`: mid-way, until the time is up or a cancel comes
+                    // (`:stalled`: whatever comes, as a stalled remote).
+                    let until = Instant::now() + hold;
+                    while Instant::now() < until && (hooks.save_stalled || !cancel.cancelled()) {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                }
+            };
+            let saved = save_without_window(&info, &mut source, hooks, &mut progress, cancel);
+            let interrupted = watch.end();
             meter.finish();
-            let (dest, saved) = saved?;
+            let (dest, saved) = match (saved, interrupted) {
+                // The cancel won, whatever the transfer said as it stopped (Ctrl-C reaches
+                // ssh too, whose end may be the error): nothing has the name, the part and
+                // its folder are gone, and main ends with 128 + the signal.
+                (Err(e), Some(interrupted)) => {
+                    // …unless cleanup could not remove it: that is still said.
+                    if let Some(left) = e.downcast_ref::<Left>() {
+                        eprintln!("sopen: {left}");
+                    }
+                    return Err(interrupted.into());
+                }
+                (saved, _) => saved?,
+            };
             println!("saved {}", dest.display());
             for note in saved.notes {
                 eprintln!("sopen: {note}");
@@ -1249,12 +1539,14 @@ pub fn cancel_line(local: bool, moved: Moved) -> &'static str {
 
 /// "Save to…" answered without a window (`SOPEN_CHOICE=save`): saves to `SOPEN_SAVE_TO`, else
 /// the download folder (a folder gets the file's name inside it), never over anything — a taken
-/// path is an error naming the next free name. Returns where it saved.
+/// path is an error naming the next free name. Returns where it saved. `cancel` stops it between
+/// chunks: without a window that is a signal's to do ([`interrupt`]).
 pub fn save_without_window(
     info: &Info,
     source: &mut dyn Source,
     hooks: &Hooks,
     progress: &mut dyn FnMut(u64, u64),
+    cancel: &Decision,
 ) -> Result<(PathBuf, SavedTo)> {
     let dest = first_path(&info.name, hooks);
     let dest = if dest.is_dir() {
@@ -1262,8 +1554,7 @@ pub fn save_without_window(
     } else {
         dest
     };
-    // Without a window nothing cancels it but ending the run.
-    match source.save_to(&dest, progress, &Decision::default()) {
+    match source.save_to(&dest, progress, cancel) {
         Ok(saved) => Ok((dest, saved)),
         Err(SaveError::Exists { next }) => bail!(
             "{} exists; not replaced (the next free name is {})",
