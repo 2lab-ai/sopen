@@ -75,7 +75,8 @@ impl Fx {
         self.drv.find_text(&format!("{label:<7}")).is_some()
     }
 
-    /// Passes until `done` (at most 20 s), then two more.
+    /// Passes until `done` (at most 20 s), then two more. After a file operation, wait for the
+    /// panels' re-read too (`listing.is_empty()`): the list takes no key while one is listed.
     fn wait(&mut self, done: impl FnMut(&Browser) -> bool) {
         self.drv.until(&mut self.b, 20, done);
         self.drv.idle(&mut self.b, 2);
@@ -277,9 +278,12 @@ fn preview_copies(cache: &Path) -> Vec<PathBuf> {
         .flatten()
     {
         if window.path().is_dir() {
+            // The folder may go between the look and the read (the window's last preview
+            // worker ending removes it): then it holds no copy.
             out.extend(
                 std::fs::read_dir(window.path())
-                    .unwrap()
+                    .into_iter()
+                    .flatten()
                     .flatten()
                     .map(|e| e.path()),
             );
@@ -1105,7 +1109,7 @@ fn k_c2_a_name_in_the_way_asks_skip_rename_or_cancel() {
     };
     ask(&mut fx);
     fx.drv.click_text(&mut fx.b, "Skip");
-    fx.wait(|b| !b.ops.busy());
+    fx.wait(|b| !b.ops.busy() && b.listing.is_empty());
     let line = fx.drv.text_starting_with("skipped").expect("the report");
     assert!(line.ends_with("notes.txt"), "{line}");
     untouched("Skip");
@@ -1115,7 +1119,7 @@ fn k_c2_a_name_in_the_way_asks_skip_rename_or_cancel() {
     ask(&mut fx);
     assert!(fx.drv.find_text("notes-1.txt").is_some(), "the free name");
     fx.key(Key::Enter);
-    fx.wait(|b| !b.ops.busy());
+    fx.wait(|b| !b.ops.busy() && b.listing.is_empty());
     assert_eq!(
         std::fs::read_to_string(format!("{alpha}/notes-1.txt")).unwrap(),
         "plain notes\n"
@@ -1127,7 +1131,7 @@ fn k_c2_a_name_in_the_way_asks_skip_rename_or_cancel() {
 
     ask(&mut fx);
     fx.key(Key::Escape);
-    fx.wait(|b| !b.ops.busy());
+    fx.wait(|b| !b.ops.busy() && b.listing.is_empty());
     untouched("Cancel");
     assert!(!Path::new(&format!("{alpha}/notes-2.txt")).exists());
     fx.key(Key::Enter);
@@ -1157,7 +1161,7 @@ fn k_c3_a_folder_copy_keeps_its_link_and_reports_the_fifo() {
     fx.select("alpha");
     fx.key(Key::F5);
     fx.key(Key::Enter);
-    fx.wait(|b| !b.ops.busy());
+    fx.wait(|b| !b.ops.busy() && b.listing.is_empty());
     assert_eq!(
         tree_state(Path::new(&alpha)),
         source_was,
@@ -1247,7 +1251,7 @@ fn k_c4_esc_stops_a_running_operation() {
         fx.status()
     );
     fx.key(Key::Escape);
-    fx.wait(|b| !b.ops.busy());
+    fx.wait(|b| !b.ops.busy() && b.listing.is_empty());
     assert!(stopped.load(Ordering::Relaxed), "Esc reached the engine");
     let line = fx
         .drv
@@ -1295,7 +1299,7 @@ fn k_c5_the_target_field_takes_another_host() {
     fx.typed(&format!("box:{alpha}"));
     assert!(fx.laid_out(&format!("box:{alpha}")));
     fx.key(Key::Enter);
-    fx.wait(|b| !b.ops.busy());
+    fx.wait(|b| !b.ops.busy() && b.listing.is_empty());
     assert_eq!(
         std::fs::read(format!("{alpha}/photo.png")).unwrap(),
         std::fs::read(format!("{}/photo.png", fx.root)).unwrap()
@@ -1395,7 +1399,7 @@ fn k_n1_f2_renames_in_place() {
     fx.with(Key::A, command(false));
     fx.typed("notes.txt");
     fx.key(Key::Enter);
-    fx.wait(|b| !b.ops.busy());
+    fx.wait(|b| !b.ops.busy() && b.listing.is_empty());
     assert_eq!(fx.b.ops.renaming(), Some("main.rs"), "the field stays");
     let said = fx.b.status_line();
     assert!(
@@ -1450,7 +1454,7 @@ fn k_e1_a_folder_into_itself_is_refused_and_reported() {
     fx.select("alpha");
     fx.key(Key::F5);
     fx.key(Key::Enter);
-    fx.wait(|b| !b.ops.busy());
+    fx.wait(|b| !b.ops.busy() && b.listing.is_empty());
     assert!(fx.b.ops.holds_keyboard(), "the report is up");
     assert!(fx.drv.text_starting_with("not reached").is_some());
     assert_eq!(
@@ -1546,7 +1550,7 @@ fn k_c4_esc_reaches_the_real_engine() {
     fx.key(Key::Escape);
     assert_eq!(fx.status(), "stopping…");
     gate.release();
-    fx.wait(|b| !b.ops.busy());
+    fx.wait(|b| !b.ops.busy() && b.listing.is_empty());
     assert_eq!(
         files_under(Path::new(&alpha)),
         ["inner.txt"],
@@ -1599,7 +1603,7 @@ fn the_status_row_names_the_item_a_question_is_about() {
         "copying 2/2 · notes.txt · waiting for an answer"
     );
     fx.drv.click_text(&mut fx.b, "Skip");
-    fx.wait(|b| !b.ops.busy());
+    fx.wait(|b| !b.ops.busy() && b.listing.is_empty());
     fx.key(Key::Enter);
 }
 
@@ -1684,7 +1688,7 @@ fn a_question_waits_for_the_list_while_a_viewer_is_open() {
         "asked in the list"
     );
     fx.drv.click_text(&mut fx.b, "Skip");
-    fx.wait(|b| !b.ops.busy());
+    fx.wait(|b| !b.ops.busy() && b.listing.is_empty());
     assert!(fx.drv.text_starting_with("skipped").is_some(), "the report");
     fx.key(Key::Enter);
 }
@@ -1961,14 +1965,20 @@ fn k_c4_esc_mid_transfer_leaves_nothing_half_made() {
     assert_eq!(staged.len(), 1, "the copy is being staged: {staged:?}");
     fx.key(Key::Escape);
     gate.release();
-    fx.wait(|b| !b.ops.busy());
+    fx.wait(|b| !b.ops.busy() && b.listing.is_empty());
     // Independently of the report: what is on disk.
     let after = std::fs::metadata(&src).unwrap();
     assert_eq!(
         (after.ino(), after.len(), after.mtime()),
         (before.ino(), size, before.mtime())
     );
-    assert!(Path::new(&format!("{}/next.txt", fx.root)).exists());
+    // Both sources hold what the fixture wrote: the large one all zeros, the next one whole.
+    let large = std::fs::read(&src).unwrap();
+    assert!(large.len() as u64 == size && large.iter().all(|b| *b == 0));
+    assert_eq!(
+        std::fs::read_to_string(format!("{}/next.txt", fx.root)).unwrap(),
+        "after\n"
+    );
     assert_eq!(
         files_under(Path::new(&alpha)),
         ["inner.txt"],
@@ -2148,14 +2158,18 @@ fn p5_text_and_hex_previews_take_no_input() {
         assert_eq!(fx.current(), lands_on, "{name}: the bar stayed");
         assert_eq!(shown(&fx), before, "{name}: the preview is as it was");
         assert!(fx.b.viewer.is_none() && fx.b.active == 0, "{name}");
-        // The typing is the list's: a letter jumps.
-        fx.typed("z");
-        assert_eq!(fx.current(), "zeta.md", "{name}: the list has the keys");
-        // Nothing was edited: handed over, it leaves without a prompt.
-        fx.bar_on(name);
+        // Nothing was edited: this very preview — the window that was given all of that, not
+        // one prepared anew — is handed over at once, and leaves without a prompt.
+        let previewed = fx.b.preview.shown_window().expect("the preview's window");
+        let prepared = fx.b.preview.spawned();
         fx.key(Key::Enter);
+        let viewer = fx.b.viewer.as_ref().expect("handed over at once");
+        assert_eq!(
+            &*viewer.embedded.window as *const dyn Window as *const () as usize, previewed,
+            "{name}: the viewer is the preview's own window"
+        );
+        assert_eq!(fx.b.preview.spawned(), prepared, "{name}: nothing new");
         fx.settle();
-        assert!(fx.b.viewer.is_some(), "{name}");
         fx.key(Key::Escape);
         assert!(fx.drv.find_text("Unsaved changes").is_none(), "{name}");
         assert!(fx.b.viewer.is_none(), "{name}: left without a prompt");
@@ -2168,4 +2182,53 @@ fn p5_text_and_hex_previews_take_no_input() {
         std::fs::read_to_string(format!("{}/main.rs", fx.root)).unwrap(),
         RUST
     );
+}
+
+/// The list's keys act while a preview shows: a typed letter jumps (the preview takes none).
+#[test]
+fn a_letter_jumps_while_a_preview_shows() {
+    let mut fx = fixture();
+    for name in ["data.bin", "main.rs"] {
+        fx.bar_on(name);
+        assert!(fx.b.preview.shown_window().is_some(), "{name}: previewed");
+        fx.typed("z");
+        assert_eq!(fx.current(), "zeta.md", "{name}: the list has the keys");
+    }
+}
+
+/// The window closes while a name-in-the-way question is open: the wait answers it Cancel, and
+/// the report printed after the window says the item was cancelled and not copied — never
+/// "skipped", which nobody chose.
+#[test]
+fn closing_at_a_question_reports_the_item_as_cancelled() {
+    let mut fx = fixture();
+    let alpha = fx.other_into("alpha");
+    std::fs::write(format!("{alpha}/notes.txt"), "there\n").unwrap();
+    fx.select("notes.txt");
+    fx.key(Key::Space);
+    fx.key(Key::Space);
+    fx.key(Key::F5);
+    fx.key(Key::Enter);
+    fx.wait(|b| b.ops.holds_keyboard());
+    assert!(fx.drv.find_text("Name exists").is_some());
+    assert!(Window::close_requested(&mut fx.b));
+    let leftover = fx.b.leftover.clone();
+    let Fx { b, _tmp, .. } = fx;
+    drop(b);
+    let waited = leftover.borrow_mut().ops.take().and_then(ops::Ops::wait);
+    let lines = report_lines(&waited.expect("the operation was waited for"));
+    assert!(
+        lines.contains(&"notes.txt: cancelled: nothing of it was copied".to_string()),
+        "{lines:?}"
+    );
+    assert!(lines.iter().all(|l| !l.contains("skipped")), "{lines:?}");
+    assert!(
+        lines.contains(&"photo.png: not reached".to_string()),
+        "{lines:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(format!("{alpha}/notes.txt")).unwrap(),
+        "there\n"
+    );
+    drop(_tmp);
 }

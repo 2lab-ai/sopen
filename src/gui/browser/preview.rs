@@ -21,6 +21,8 @@ use super::prepare::{self, Budget, HandedOver, Preview, PreviewRequest, Previewe
 use super::Connect;
 use crate::cache::PreviewSpace;
 use crate::gui::chrome;
+#[cfg(test)]
+use crate::gui::Window;
 use crate::remote::RemoteFs;
 use anyhow::Result;
 use eframe::egui::{self, Pos2, Rect, Vec2};
@@ -160,6 +162,18 @@ impl Host {
     pub fn worker_ended(&self) -> bool {
         let worker = self.prep.as_ref().and_then(|p| p.worker.as_ref());
         worker.is_none_or(|w| w.is_finished())
+    }
+
+    /// Tests: which window the side shows — the address of the finished preview's window (it
+    /// stays the same window through the hand-over).
+    #[cfg(test)]
+    pub fn shown_window(&self) -> Option<usize> {
+        match &self.shown {
+            Some(Shown::Ready(preview)) => {
+                Some(&*preview.embedded.window as *const dyn Window as *const () as usize)
+            }
+            _ => None,
+        }
     }
 
     /// Tests: a preparation is there and was told to stop.
