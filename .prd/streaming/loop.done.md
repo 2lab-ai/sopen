@@ -30,3 +30,25 @@ changes. Rows here are snapshots taken when they were moved.
   the cache root and fails closed below it; one intent validator for writer and reader.
 - X2, X4, X5: scratch experiments; their numbers and the decisions taken from them are in the
   numbered documents, not here.
+
+## R1 (part 2) — closed 2026-11-21
+
+- measured W2 ✅ ED1 ✅ W3 ✅ X3 ✅ · result: the stream core, the edit patch path and the byte
+  server merged; X3's measurements written into 06 §7.2 and §10 · closed rows: X3, W2, W3, ED1 ·
+  PRs: #28, #30, #31, and the docs PR that carries this block
+
+### Closed rows
+
+| ID | Status | Branch | Worktree | Scope | Owns | After | Gate |
+|---|---|---|---|---|---|---|---|
+| X3 | ✅ | — (scratch) | — | A fake slow `Bytes` returning Pending, carried like `Stale`; count frames to the first screen; then jump into a 1 GB single-line file (06 §7.2). About half a day. | none | before W5a | Done (X3), 2026-11-21, on 41956b9 with a scratch patch: with any latency the first screen is the 4th pass, one round trip plus one frame after open; a jump into a 1 GiB line with no newline is one round trip of at most 3 blocks and read at most 49,741 bytes; five defects for W5a; text in 06 §7.2 and §10 (this docs PR) |
+| W2 | ✅ | `feat/stream-core` | `.worktrees/feat-stream-core` | 06 §3–§6: `Source`, cache and floors, admission, validation and generations, change, MaxSessions, the stats events | `src/stream/{mod,cache,prefetch,source}.rs`, `src/stream/tests.rs`, `src/lib.rs` | W1 | Merged PR #28 (41956b9), 2026-11-21 |
+| W3 | ✅ | `feat/stream-http` | `.worktrees/feat-stream-http` | 06 §9: the byte server, reader-kind paths, range table, limits, shutdown, cut account | `src/stream/http.rs`, `src/stream/http/tests.rs` | W2 | Merged PR #31 (5f4e6b3), 2026-11-21 |
+| ED1 | ✅ | `feat/stream-edit-patch` | `.worktrees/feat-stream-edit-patch` | 07 §4–§5.1: `PatchFs`, S1-C's `copy-data` loop at about 1 s per request, fresh-read rewrite, write in place, undo file, baseline page hashes, step hooks | `src/remote/patch.rs`, `src/remote/patch/tests.rs`, `src/remote/sftp/patch.rs`, `src/remote/local/patch.rs`, `src/remote/sftp/ops.rs` (chunk size), `mod` lines in `src/remote/{mod,sftp,local}.rs` | W1; S1-C merged; X2 | Merged PR #30 (adb036e), 2026-11-21 |
+
+### Round section
+
+- W2 (PR #28, merged 2026-11-21, 41956b9), ED1 (PR #30, merged 2026-11-21, adb036e) and W3 (PR #31,
+  merged 2026-11-21, 5f4e6b3).
+- X3: a scratch experiment on 41956b9. Its numbers, the rules taken from them and the five defects
+  W5a must fix are in 06 §7.2 and §10, not here.
