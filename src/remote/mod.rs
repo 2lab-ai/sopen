@@ -5,6 +5,7 @@
 
 mod local;
 pub mod ops;
+pub mod patch;
 mod ranged;
 mod sftp;
 
@@ -446,6 +447,12 @@ pub trait RemoteFs: IntoBoxed {
             conn: self.into_boxed(),
             error: anyhow!("{path}: this connection does not stream"),
         })
+    }
+
+    /// The connection as one a hex Save can run on (07 §4): files by handle, positional writes
+    /// and the server's copy. `None` where the connection has none of that (the default).
+    fn patcher(&mut self) -> Option<&mut dyn patch::PatchFs> {
+        None
     }
 
     fn stat(&mut self, path: &str) -> Result<Stat> {

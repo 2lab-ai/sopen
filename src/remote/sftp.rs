@@ -9,6 +9,7 @@
 //! [`OutcomeUnknown`](super::OutcomeUnknown), never as "nothing written".
 
 mod ops;
+mod patch;
 mod ranged;
 mod writes;
 
@@ -729,6 +730,10 @@ impl RemoteFs for SftpRemote {
         changed(&format!("remove {path}"), got)
     }
 
+    fn patcher(&mut self) -> Option<&mut dyn super::patch::PatchFs> {
+        Some(self)
+    }
+
     fn into_ranged(self: Box<Self>, path: &str) -> std::result::Result<Box<dyn Ranged>, Refused> {
         let r = self.open_ranged(path, ranged::Timing::default())?;
         Ok(Box::new(r))
@@ -899,6 +904,10 @@ pub(crate) struct Proxy {
     pub marked: Arc<std::sync::Mutex<std::collections::HashMap<u32, Rule>>>,
     /// The session closed its end (the proxy's own).
     pub ended: Arc<std::sync::atomic::AtomicBool>,
+    /// File bytes that crossed the wire: the payloads of the `SSH_FXP_DATA` replies passed to
+    /// sopen, and of the `SSH_FXP_WRITE` requests passed to the server (07 §12's byte counts).
+    pub data: Arc<std::sync::atomic::AtomicU64>,
+    pub written: Arc<std::sync::atomic::AtomicU64>,
 }
 
 /// Sets its flag when dropped: the proxy's requests loop has ended.
@@ -947,6 +956,7 @@ impl Wired {
     pub const OPEN: u8 = 3;
     pub const CLOSE: u8 = 4;
     pub const READ: u8 = 5;
+    pub const WRITE: u8 = 6;
     pub const FSTAT: u8 = 8;
     pub const STAT: u8 = 17;
     pub const STATUS: u8 = 101;
@@ -1002,6 +1012,13 @@ impl Proxy {
                 kind: body[0],
                 read,
             });
+            // WRITE: type, id, handle (a string), offset, data (a string).
+            if body.first() == Some(&Wired::WRITE) {
+                let at = 9 + be32(&body[5..]) as usize;
+                let len = be32(&body[at + 8..]) as u64;
+                self.written
+                    .fetch_add(len, std::sync::atomic::Ordering::Relaxed);
+            }
             let rule = {
                 let mut rules = self.rules.lock().unwrap();
                 match read {
@@ -1071,6 +1088,11 @@ impl Proxy {
                     body[5..9].copy_from_slice(&(clip as u32).to_be_bytes());
                 }
             }
+            if body.first() == Some(&Wired::DATA) {
+                let len = be32(&body[5..]) as u64;
+                self.data
+                    .fetch_add(len, std::sync::atomic::Ordering::Relaxed);
+            }
             if send_packet(&mut to, &body).await.is_none() {
                 return;
             }
@@ -1090,6 +1112,19 @@ impl SftpRemote {
 
     /// [`SftpRemote::local_server`], with the session's bytes passing through `proxy`.
     pub(crate) fn local_server_with(proxy: Option<Proxy>) -> Option<Self> {
+        Self::local_server_run(proxy, &[], None)
+    }
+
+    /// [`SftpRemote::local_server`] with `args` for the server (`-P copy-data` to refuse a
+    /// request) and, with `log`, its log (`-e -l INFO`: one line per request, as OpenSSH words
+    /// it) written to that file — the request log 04 §8 checks for `posix-rename`.
+    pub(crate) fn local_server_args(args: &[&str], log: Option<&Path>) -> Option<Self> {
+        Self::local_server_run(None, args, log)
+    }
+
+    /// The one way a test's server is started: see [`SftpRemote::local_server`],
+    /// [`SftpRemote::local_server_with`] and [`SftpRemote::local_server_args`].
+    fn local_server_run(proxy: Option<Proxy>, args: &[&str], log: Option<&Path>) -> Option<Self> {
         // `SOPEN_TEST_HIDE_SFTP_SERVER` makes the server look absent: the receipt that every test
         // needing it fails under `SOPEN_REQUIRE_SFTP_SERVER`, rather than passing as a skip.
         let hidden = std::env::var_os("SOPEN_TEST_HIDE_SFTP_SERVER").is_some();
@@ -1108,13 +1143,20 @@ impl SftpRemote {
             .enable_all()
             .build()
             .unwrap();
-        let spawn = |server: &str| {
-            tokio::process::Command::new(server)
-                .stdin(Stdio::piped())
+        let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+        let log = log.map(Path::to_path_buf);
+        let spawn = move |server: &str| {
+            let mut cmd = tokio::process::Command::new(server);
+            cmd.stdin(Stdio::piped())
                 .stdout(Stdio::piped())
-                .kill_on_drop(true)
-                .spawn()
-                .unwrap()
+                .kill_on_drop(true);
+            if let Some(log) = &log {
+                cmd.args(["-e", "-l", "INFO"])
+                    .stderr(Stdio::from(std::fs::File::create(log).unwrap()));
+            }
+            // After the log's: a test's own `-l DEBUG1` wins.
+            cmd.args(&args);
+            cmd.spawn().unwrap()
         };
         let writes = Arc::new(Writes::default());
         let sftp = match proxy {
