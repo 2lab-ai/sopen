@@ -524,8 +524,9 @@ large files.
       the first read is normally the only one. A built phone-style file (Exif with a 60 KB
       thumbnail, XMP, extended XMP, ICC, MPF) needs 303,964 bytes; a file with more than about
       1 MB of metadata ahead of its frame passes the cap.
-    - A plain search for the first SOF code is wrong: on all five camera files it returns the
-      Exif thumbnail's size (for example 160×106). The walk skips whole segments by their lengths.
+    - A plain search for the first SOF code is wrong: it gives a wrong size on all five camera
+      files (the Exif thumbnail's on four, for example 160×106, and 0×3361 on the fifth). The walk
+      skips whole segments by their lengths.
     - The rules of the walk:
       - The file must start `FF D8`. Otherwise the format is guessed from content, as today.
       - A marker is `FF`, any further `FF` bytes (fill), then the code. A segment is skipped by its
@@ -543,7 +544,8 @@ large files.
     - The Exif kept for the thumbnail is the first APP1 that starts `Exif\0\0`. Its orientation
       (5–8 swap the sides) gives the upright `W×H` to show.
     - The memory a decode needs is width × height × 1 for one component and × 3 for three or
-      four (the decoder turns CMYK into RGB).
+      four (the decoder turns CMYK into RGB). Two components were not seen in X4; they count as
+      × 3, the upper bound.
     - A header found does not promise a decode: a file cut after its SOF, or one with a DAC
       segment, still fails in the decoder.
     - A SOF that zune-jpeg cannot decode (any type but C0, C1, C2, or a precision other than 8:
@@ -620,10 +622,12 @@ to every run on the file: the probe, playback, the paused frame, the waveform, S
 - **The `.ts` refine** (`kind::refine_local`) probes the `play` URL.
 - **`Input` carries its own input options.** Each `Input` holds the options that must precede its
   `-i`, and emits them there. So every remote input, each group input of PR #15's `edit_args`
-  included, gets `-protocol_whitelist http,tcp`. mp3 `play` inputs also get `-fflags +fastseek`.
+  included, gets `-protocol_whitelist http,tcp`. mp3 `play` inputs with a LAME `Info` tag (below) also get
+  `-fflags +fastseek`.
   - Without it an mp3 seek reads the file up to the target: the share of the file before it (6–8 %
-    at 30 s, 81–84 % at 480 s of a 600 s file; 82–91 % in *view* §2.3). With it a seek reads a fixed
-    65–115 kB wherever the target is.
+    at 30 s, 81–84 % at 480 s of a 600 s file; 82–91 % in *view* §2.3). With it, a target past
+    about the first 400 kB costs ffmpeg 65–115 kB (190–246 kB sent by the server, the rest being
+    read-ahead), wherever it is; a target nearer the start is read through (221–393 kB).
   - Save and Export keep exact seeking: 01 §7 promises exact cuts.
   - **Measured precision** (X5, 2026-11-21, ffmpeg 9.0.2, 600 s test files, 60 seeks each; without
     the flag every seek landed within 2 ms):
@@ -632,16 +636,29 @@ to every run on the file: the probe, playback, the paused frame, the waveform, S
       the file's length: in a 1-hour file, 21.8 s early to 9.0 s late (median 3.9 s). ffmpeg seeks
       on a grid of 1/256 of the file's size.
     - VBR with no header: up to 161 s off. ffmpeg also misjudges the length (437.8 s for a 600 s
-      file, with or without the flag), and a seek past that length reads the whole file anyway.
+      file, with or without the flag), and a seek past that length reads through anyway (83–102 %
+      of the file).
     - The flag saves bytes only on a server with ranges, which the byte server is (§9).
-  - **So `+fastseek` is used only where it is exact: an mp3 whose first frame carries a LAME `Info`
-    tag (constant bitrate).** sopen reads that frame itself: the ID3v2 tag's size from its 10-byte
-    header, then the first frame after it, where `Info`, `Xing` or neither sits after the side
-    information. A `Xing` (VBR) file or one with no tag seeks exactly. **This is the workstream's
-    decision:** the media window places cuts at the play position, so a play position seconds off
-    would put the user's cuts in the wrong place. The cost is that a far seek in a long VBR mp3
-    first reads the file up to the target, once (the blocks stay in the cache, §3); the window
-    shows that read's progress.
+  - **So `+fastseek` is used only where its error is one mp3 frame (26 ms at 44.1 kHz), the
+    tolerance accepted: an mp3 whose first frame carries a LAME `Info` tag (constant bitrate).**
+    Every other mp3 seeks exactly. **This is the workstream's decision:** the media window places
+    cuts at the play position, so a play position seconds off would put the user's cuts in the
+    wrong place. The cost is that a far seek in a long VBR mp3 first reads the file up to the
+    target; blocks already fetched are served from the cache while they stay in it (§3), and the
+    window shows that read's progress.
+  - **Finding the tag.** sopen reads it itself, through the `play` reader:
+    - **ID3v2 tags:** while the file starts `ID3`, skip a tag: 10 bytes of header, then the size
+      from header bytes 6–9 as a synchsafe integer (7 bits per byte), plus 10 more when the
+      footer flag (bit 4 of byte 5) is set. A large tag (cover art) costs one more ranged read.
+    - **The first frame:** an 11-bit sync, layer III, a valid bitrate and sample-rate index. The
+      tag sits after the 4-byte header, 2 bytes of CRC when the protection bit is 0, and the side
+      information: 32 bytes (MPEG-1 stereo), 17 (MPEG-1 mono, MPEG-2 and 2.5 stereo) or 9 (MPEG-2
+      and 2.5 mono).
+    - `Info` there means constant bitrate. `Xing`, anything else, a frame that does not validate, or
+      a file that ends first means an exact seek.
+    - W7's fixtures: a footer ID3v2 tag, a tag of several MB, MPEG-1 and MPEG-2 in mono and
+      stereo, a CRC-protected frame, `Info`, `Xing`, no tag, and a file cut inside the frame.
+      X5 measured only mono 44.1 kHz files with small tags.
 - **ffmpeg's reconnect options stay off.** The server ends a connection only on an error the window
   already shows from its Source, so a reconnect would only repeat it.
 - **ffmpeg's exit status cannot be trusted for a cut-short input** (verified with ffmpeg 9.0.2,
