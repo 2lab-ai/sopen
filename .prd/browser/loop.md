@@ -1,18 +1,18 @@
 # browser — loop (open items only)
 
-Status: round 1 in progress (2026-11-21); S1-M in review. Target: [`ssot.md`](ssot.md). Contracts: `../02-architecture.md` (§8 the
+Status: round 1 merged (2026-11-22; S1-M, PR #36, was its last unit). Target: [`ssot.md`](ssot.md). Contracts: `../02-architecture.md` (§8 the
 slices and their order), `../03-git-panel.md`, `../04-file-keys.md`, `../05-directory-tree.md`. Closed rows move to
 `loop.done.md` in the commit that closes their round.
 
 ## Round 1 — slice S1 (preview mode, F9, F2/F5/F6, F-key row, F1 help)
 
-S1-0 and S1-A to S1-E are merged, with PR #14 and PR #15 (rows in [`loop.done.md`](loop.done.md)). What is left of
-S1 is S1-M.
+S1-0 and S1-A to S1-E are merged, with PR #14 and PR #15 (rows in [`loop.done.md`](loop.done.md)). S1-M merged
+on 2026-11-22 (PR #36, bdb6166), so all of S1 is merged; its row below moves to `loop.done.md` in a later change.
 One slice at a time (02 §8.1). Worktree = `.worktrees/<branch with / as ->`.
 
 | ID | Status | Branch | Scope | Owner files (02 §5) | After |
 |---|---|---|---|---|---|
-| S1-M | 🟡 in review (this PR) | `feat/browser-s1-media-preview` | the media preview: video frame, audio waveform, their budgets and hand-over; reruns P1, P5, P6, P12 for media | `src/gui/media.rs` and tests, the preview host's media row | S1-E, G-WAVE |
+| S1-M | ✅ merged: PR #36 (bdb6166), 2026-11-22 | `feat/browser-s1-media-preview` | the media preview: video frame, audio waveform, their budgets and hand-over; reruns P1, P5, P6, P12 for media | `src/gui/media.rs` and tests, the preview host's media row | S1-E, G-WAVE |
 
 ## Experiments for later slices (open; each runs before its slice)
 
@@ -35,10 +35,10 @@ One slice at a time (02 §8.1). Worktree = `.worktrees/<branch with / as ->`.
 
 ## Next
 
-- 2026-11-21: S1-E merged (PR #29, 0120d40) and is deployed as preview 0120d40813a0. S1-M is ready to start, and so
-  are the streaming units that waited on S1: W4 and W5a are in progress, W6 and ED3 are ready
-  ([`../streaming/loop.md`](../streaming/loop.md)).
-- 2026-11-21: S1-M is in review in this PR: the media preview, its budgets and hand-over, with E3's media rerun
-  written into 02 §8.2.
+- 2026-11-21: S1-E merged (PR #29, 0120d40) and is deployed as preview 0120d40813a0. S1-M and the streaming units
+  that waited on S1 were then ready to start: S1-M (PR #36) and W6 merged on 2026-11-22, W4 and
+  W5a on 2026-11-21, and ED3 is in progress ([`../streaming/loop.md`](../streaming/loop.md)).
+- 2026-11-22: S1-M merged (PR #36, bdb6166): the media preview, its budgets and hand-over, with E3's media rerun
+  written into 02 §8.2. Its row moves to [`loop.done.md`](loop.done.md) in a later change.
 - E3 is closed (2026-11-21): its result is in 02 §8.2 and its row in [`loop.done.md`](loop.done.md). S1-M reruns
   it for media previews.

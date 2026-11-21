@@ -92,3 +92,34 @@ changes. Rows here are snapshots taken when they were moved.
 
 - W4 (PR #35, merged 2026-11-21, 64b8443) and W5a (PR #34, merged 2026-11-21, 7f3d414).
 - W8 was split on 2026-11-21 into W8a and W8b (06 §13): W8a needs only these two.
+
+## R1 (part 5) — closed 2026-11-22
+
+- merged W8a ✅ W6 ✅ W5b ✅ · result: remote hex of any size opens as a Source from `--hex`, the
+  dialog, the browser's Enter and its preview, and remote text of at most 16 MiB from the browser's
+  Enter and preview; the image viewer reads the header first and the text viewer reads past 16 MiB
+  by byte position, but no route opens either one over a Source yet (W8b does) · closed rows: W8a,
+  W6, W5b · PRs: #37 (09cafaf), #39 (b75c392), #40 (bd49904)
+
+### Closed rows
+
+| ID | Status | Branch | Worktree | Scope | Owns | After | Gate |
+|---|---|---|---|---|---|---|---|
+| W8a | ✅ | `feat/stream-routing-a` | `.worktrees/feat-stream-routing-a` | 06 §7.1, §7.2, §7.5, §11, §13: hex of any size opens a Source on the browser's Enter, the standalone dialog and `--hex`; remote text of at most 16 MiB on the browser's Enter and preview only (standalone text stays with the editor; larger text and local files keep today's route); a placeholder `Origin`, the preview change for text and hex with 02 §4.3–§4.5 and S1's P3/P4/P6/P12, `Window::set_shown`, one preview-index constant, Save to… cancel, hooks forwarded, `bytes_fetched`, ssh's stderr on a failed start | `src/gui/streamed.rs` (new), `src/gui/browser/prepare.rs`, `src/gui/browser/prepare/tests.rs`, `src/gui/browser/preview.rs`, `src/gui/browser.rs`, `src/gui/browser/tests.rs`, `src/gui/browser/tests/s1.rs`, `src/gui/binary.rs`, `src/gui/binary/tests.rs`, `src/main.rs`, `src/kind.rs`, `src/usage.rs`, `src/forward.rs`, `src/gui/mod.rs` (`Origin`, `Window`), `src/gui/hex.rs` and `src/gui/text.rs` (`set_shown`, the preview index) with their stream tests, `src/remote/sftp.rs` (`start_sftp`'s stderr), `tests/cli.rs`, `.prd/02-architecture.md` (§4.3–§4.5) | — (W4 and W5a merged: PR #35, PR #34; S1 merged) | Merged PR #37 (09cafaf), 2026-11-22 |
+| W6 | ✅ | `feat/stream-image` | `.worktrees/feat-stream-image` | 06 §7.3: header walk (SOF read directly), memory line, reserved buffer, streamed read, partial pictures | `src/gui/image.rs`, `src/gui/image/probe.rs`, `src/gui/image/robustness_tests.rs`, `Cargo.toml` / `Cargo.lock` (`png`) | — (browser S1 merged: S1-E, PR #29, 0120d40) | Merged PR #39 (b75c392), 2026-11-22 |
+| W5b | ✅ | `feat/stream-text-large` | `.worktrees/feat-stream-text-large` | 06 §7.2 W5b: prefix index, byte-offset keys (with wrap), unknown line starts, Go to, index bound | `src/gui/text.rs`, `src/gui/text/wrap.rs`, `src/gui/text/tests.rs` | W5a | Merged PR #40 (bd49904), 2026-11-22 |
+
+### Round section
+
+- W8a (PR #37, merged 2026-11-22, 09cafaf; preview 09cafaf4da9f), W6 (PR #39, merged 2026-11-22,
+  b75c392; preview b75c39212ccf) and W5b (PR #40, merged 2026-11-22, bd49904; preview bd49904eec9f).
+- PR #38 (merged 2026-11-22, d7f9000) is not a work unit: it fixes what a live probe of W8a's
+  preview found. A cancelled windowless Save to… leaves nothing behind, Go to keeps its typing in an
+  unfocused window, and errors name a remote file as `host:/abs`.
+- PR #41 (merged 2026-11-22, 622e843) is not a work unit: a race in the media window's paused-frame
+  decoder, found as a one-off Linux test failure. A paused frame is never replaced by an older
+  decode.
+- PR #42 (merged 2026-11-22, 7544dd8) is not a work unit: highlighting is no longer quadratic on
+  long runs of word characters.
+- Dates in this block are the merge commits' dates in +0900. In UTC (GitHub's times), all six
+  merges fell on 2026-11-21.
