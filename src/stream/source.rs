@@ -296,12 +296,6 @@ impl Core {
         (self.partial.len() + self.inflight.len(), self.batches.len())
     }
 
-    /// Tests: whether the engine was told it has work since its last pump.
-    #[cfg(test)]
-    pub(crate) fn kicked(&self) -> bool {
-        self.kicked
-    }
-
     /// Tests: whether anything waits to be sent.
     #[cfg(test)]
     pub(crate) fn queued(&mut self) -> bool {
@@ -515,10 +509,10 @@ impl Core {
 
     fn protect_and_insert(&mut self, block: u64, part: Partial) {
         let protect = self.pf.protect();
-        // Not kept only when everything cached is waited for and this block is not: the
-        // waits being served fit the cache together (`Prefetcher::held`).
-        self.cache
-            .insert(block, Bytes::from(part.buf), part.cold, &protect);
+        let bytes = Bytes::from(part.buf);
+        self.cache.insert(block, bytes.clone(), part.cold, &protect);
+        // Every reader waiting for it holds it from here, whatever the cache keeps.
+        self.pf.deliver(block, &bytes);
         self.notify = true;
     }
 
@@ -760,7 +754,11 @@ impl Core {
         let have =
             |b: u64| cache.contains(b) || inflight.contains_key(&b) || partial.contains_key(&b);
         let size = self.opened.size;
-        let Some(touch) = self.pf.access(id, off, end, size, now, &cached, &have) else {
+        let grab = |b: u64| cache.peek(b);
+        let Some(touch) = self
+            .pf
+            .access(id, off, end, size, now, &grab, &cached, &have)
+        else {
             return false;
         };
         match touch.access {
@@ -771,26 +769,37 @@ impl Core {
         touch.queued
     }
 
-    /// `[off, end)` when every block of it is visible.
+    /// Whether reader `id` can read `block` now: it holds it, or the cache has it.
+    fn there(&self, id: u64, block: u64) -> bool {
+        self.pf.holds(id, block).is_some() || self.cache.contains(block)
+    }
+
+    /// `[off, end)` when every block of it is there: from what the reader holds first, then
+    /// from the cache.
     fn serve(&mut self, id: u64, off: u64, end: u64) -> Option<Bytes> {
         let (first, last) = (off / BLOCK, (end - 1) / BLOCK);
-        if !(first..=last).all(|b| self.cache.contains(b)) {
+        if !(first..=last).all(|b| self.there(id, b)) {
             return None;
         }
         let touch = !matches!(self.pf.kind(id), Some(ReaderKind::Bulk));
-        let piece = |cache: &mut BlockCache, b: u64| {
-            let block = cache.get(b, touch).expect("a block just seen");
+        let mut piece = |b: u64| {
+            // A read makes the block recent in the cache too, when it is still there.
+            let cached = self.cache.get(b, touch);
+            let block = match self.pf.holds(id, b) {
+                Some(held) => held.clone(),
+                None => cached.expect("a block just seen"),
+            };
             let base = b * BLOCK;
             let from = (off.max(base) - base) as usize;
             let to = ((end.min(base + BLOCK) - base) as usize).min(block.len());
             block.slice(from.min(to)..to)
         };
         let bytes = if first == last {
-            piece(&mut self.cache, first)
+            piece(first)
         } else {
             let mut all = Vec::with_capacity((end - off) as usize);
             for b in first..=last {
-                all.extend_from_slice(&piece(&mut self.cache, b));
+                all.extend_from_slice(&piece(b));
             }
             all.into()
         };
@@ -1409,12 +1418,7 @@ pub struct Reader {
 
 impl Drop for Reader {
     fn drop(&mut self) {
-        let mut core = self.shared.lock();
-        let waited = core.pf.waiting(self.id).is_some();
-        core.pf.close(self.id);
-        // Its wait is over: one that did not fit beside it may be served now.
-        let next = waited && core.pf.waiting_readers() > 0;
-        self.shared.release(core, next);
+        self.shared.lock().pf.close(self.id);
     }
 }
 
@@ -1438,14 +1442,11 @@ impl Reader {
     /// made before it reads nothing (`ReadError::Reloaded`) until this is called.
     pub fn renew(&mut self) {
         let mut core = self.shared.lock();
-        let waited = core.pf.waiting(self.id).is_some();
         if let Some(kind) = core.pf.kind(self.id) {
             core.pf.close(self.id);
             self.id = core.pf.open(kind);
         }
         self.epoch = core.epoch;
-        let next = waited && core.pf.waiting_readers() > 0;
-        self.shared.release(core, next);
     }
 
     /// What this reader has been waiting for, and for how long.
@@ -1483,17 +1484,11 @@ impl Reader {
                 }
             },
             State::Live | State::Replaced => {
-                let before = core.pf.waiting(self.id).map(|(span, _)| span);
                 let kick = core.want(self.id, off, end, (self.shared.clock)());
-                let got = match core.serve(self.id, off, end) {
-                    Some(bytes) => Got::Bytes(bytes),
-                    None => Got::Pending,
-                };
-                // A wait ended — read, or left for another place: one that did not fit
-                // beside it may be served now.
-                let after = core.pf.waiting(self.id).map(|(span, _)| span);
-                let next = before.is_some() && before != after && core.pf.waiting_readers() > 0;
-                Ok((got, kick || next))
+                match core.serve(self.id, off, end) {
+                    Some(bytes) => Ok((Got::Bytes(bytes), kick)),
+                    None => Ok((Got::Pending, kick)),
+                }
             }
         };
         match got {
@@ -1546,7 +1541,7 @@ impl Reader {
                         (off + (done + ask) as u64 - 1) / BLOCK,
                     );
                     // Nothing came between the look and this lock: wait for a block or a wake.
-                    let ready = !core.live() || (first..=last).all(|b| core.cache.contains(b));
+                    let ready = !core.live() || (first..=last).all(|b| core.there(self.id, b));
                     if cancel.load(Ordering::SeqCst) {
                         return Err(ReadError::Cancelled);
                     }

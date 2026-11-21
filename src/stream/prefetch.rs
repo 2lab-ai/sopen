@@ -1,19 +1,15 @@
 //! What a stream sends next (06 §4), with no I/O: each reader's readahead window, the queue by
 //! class, and the cap on what is sent and not yet answered.
 
-use super::cache::{shares, Protect, BLOCK, CACHE_BYTES};
-use super::{ReaderKind, MAX_READ};
-use std::collections::{BTreeMap, VecDeque};
+use super::cache::{shares, Protect, BLOCK};
+use super::ReaderKind;
+use bytes::Bytes;
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
 /// The cap's bounds (06 §4).
 pub const CAP_MIN: u64 = 256 << 10;
 pub const CAP_MAX: u64 = 4 << 20;
-/// The blocks of every wait being served, together: what the cache holds.
-pub const HELD_BLOCKS: u64 = CACHE_BYTES / BLOCK;
-/// What the Bulk waits being served may hold of that: all but one maximum read, so a
-/// foreground wait always has room beside them.
-pub const BULK_HELD_BLOCKS: u64 = HELD_BLOCKS - MAX_READ as u64 / BLOCK;
 /// What a status request (a fence, half a poll) counts against what is in flight.
 pub const STATUS_BYTES: u64 = 100;
 
@@ -203,6 +199,10 @@ struct ReaderState {
     span: Option<(u64, u64)>,
     since: Option<Instant>,
     span_seq: u64,
+    /// The blocks of its wait that are there: its own references, so the wait depends on
+    /// nothing the cache keeps (06 §3). At most one read's worth; gone when the read
+    /// completes, the reader moves, or the stream fails, changes or reloads.
+    got: HashMap<u64, Bytes>,
     prefetch: VecDeque<u64>,
     prefetch_seq: u64,
 }
@@ -251,6 +251,7 @@ impl Prefetcher {
                 span: None,
                 since: None,
                 span_seq: 0,
+                got: HashMap::new(),
                 prefetch: VecDeque::new(),
                 prefetch_seq: 0,
             },
@@ -279,7 +280,6 @@ impl Prefetcher {
         let wants: Vec<(u64, u64)> = self.readers.values().map(|r| limits(r.kind)).collect();
         let scaled = shares(&wants);
         Protect {
-            waiting: self.held().into_iter().map(|(_, span)| span).collect(),
             windows: self
                 .readers
                 .values()
@@ -292,37 +292,6 @@ impl Prefetcher {
                 })
                 .collect(),
         }
-    }
-
-    /// The waits that are being served, and their blocks: as many as fit the cache together
-    /// ([`HELD_BLOCKS`]), in the queue's order — foreground waits first, then Bulk's, oldest
-    /// first within each — and of Bulk's no more than [`BULK_HELD_BLOCKS`], so that older
-    /// Bulk waits never keep a foreground one out (06 §4). Their blocks are held until read
-    /// (06 §3), so what is held never passes the cache — a held block arriving always finds
-    /// one to evict that is not — and a wait beyond that is served, in its turn, once one
-    /// before it has been read.
-    fn held(&self) -> Vec<(u64, (u64, u64))> {
-        let mut waits: Vec<(bool, u64, u64, (u64, u64))> = self
-            .readers
-            .iter()
-            .filter_map(|(id, r)| Some((r.bulk(), r.span_seq, *id, r.span?)))
-            .collect();
-        waits.sort_unstable();
-        let (mut all, mut of_bulk) = (0, 0);
-        let mut held = Vec::new();
-        for bulk in [false, true] {
-            for (_, _, id, (first, last)) in waits.iter().filter(|w| w.0 == bulk) {
-                let blocks = last - first + 1;
-                // The first that does not fit ends its class: a later one does not pass it.
-                if all + blocks > HELD_BLOCKS || (bulk && of_bulk + blocks > BULK_HELD_BLOCKS) {
-                    break;
-                }
-                all += blocks;
-                of_bulk += if bulk { blocks } else { 0 };
-                held.push((*id, (*first, *last)));
-            }
-        }
-        held
     }
 
     /// Whether a reader is waiting for `block`.
@@ -343,9 +312,10 @@ impl Prefetcher {
         Some((r.span?, r.since?))
     }
 
-    /// Reader `id` reads `[off, end)` (clipped to `size`). `cached` says what is visible, and
-    /// `have` what is visible or on its way. Its waiting blocks replace its older unsent ones;
-    /// a move resets or grows its window and replaces its queued prefetch (06 §4).
+    /// Reader `id` reads `[off, end)` (clipped to `size`). `grab` gives a block the cache has,
+    /// `cached` says what is visible, and `have` what is visible or on its way. The reader
+    /// takes hold of what is there of its span; its waiting blocks replace its older unsent
+    /// ones; a move resets or grows its window and replaces its queued prefetch (06 §4).
     #[allow(clippy::too_many_arguments)]
     pub fn access(
         &mut self,
@@ -354,6 +324,7 @@ impl Prefetcher {
         end: u64,
         size: u64,
         now: Instant,
+        grab: &dyn Fn(u64) -> Option<Bytes>,
         cached: &dyn Fn(u64) -> bool,
         have: &dyn Fn(u64) -> bool,
     ) -> Option<Touch> {
@@ -362,7 +333,18 @@ impl Prefetcher {
         let r = self.readers.get_mut(&id)?;
         let before = r.ra.window();
         let access = r.ra.access(off, end, ahead);
-        let need: Vec<u64> = blocks_of(off, end).filter(|b| !cached(*b)).collect();
+        // What it held of another place goes; what the cache has of this one is held from
+        // now, whatever the cache does with it since.
+        let wanted = blocks_of(off, end);
+        r.got.retain(|b, _| wanted.contains(b));
+        for b in wanted.clone() {
+            if let std::collections::hash_map::Entry::Vacant(slot) = r.got.entry(b) {
+                if let Some(bytes) = grab(b) {
+                    slot.insert(bytes);
+                }
+            }
+        }
+        let need: Vec<u64> = wanted.filter(|b| !r.got.contains_key(b)).collect();
         let mut queued = false;
         if need.is_empty() {
             r.span = None;
@@ -419,7 +401,27 @@ impl Prefetcher {
         if let Some(r) = self.readers.get_mut(&id) {
             r.span = None;
             r.since = None;
+            r.got.clear();
         }
+    }
+
+    /// A validated block arrived: every reader waiting for it takes a reference of its own.
+    pub fn deliver(&mut self, block: u64, bytes: &Bytes) {
+        for r in self.readers.values_mut() {
+            if r.span.is_some_and(|(a, b)| (a..=b).contains(&block)) {
+                r.got.insert(block, bytes.clone());
+            }
+        }
+    }
+
+    /// How many blocks the readers hold for their waits, together.
+    pub fn holding(&self) -> usize {
+        self.readers.values().map(|r| r.got.len()).sum()
+    }
+
+    /// The block as reader `id` holds it.
+    pub fn holds(&self, id: u64, block: u64) -> Option<&Bytes> {
+        self.readers.get(&id)?.got.get(&block)
     }
 
     pub fn push_rest(&mut self, rest: Rest) {
@@ -444,6 +446,8 @@ impl Prefetcher {
             r.prefetch.clear();
             r.span = None;
             r.since = None;
+            // Nothing held is served after a change or a reload.
+            r.got.clear();
             if forget_places {
                 r.ra = Readahead::default();
             }
@@ -459,7 +463,6 @@ impl Prefetcher {
                 r.prefetch.pop_front();
             }
         }
-        let held = self.held();
         let rest = |rests: &VecDeque<Rest>, class: Class| {
             rests.iter().find(|r| r.class == class).map(|r| Cand {
                 class: Some(class),
@@ -468,19 +471,26 @@ impl Prefetcher {
                 waiting: false,
             })
         };
-        // The oldest wait being served that still lacks a block, and that block.
+        // The oldest wait of the class that still lacks a block, and that block. Every wait
+        // is in the queue: the class order alone decides (06 §4).
         let waiting = |readers: &BTreeMap<u64, ReaderState>, bulk: bool| {
-            held.iter()
-                .filter(|(id, _)| readers[id].bulk() == bulk)
-                .find_map(|(id, (first, last))| {
-                    let block = (*first..=*last).find(|b| !have(*b))?;
-                    Some(Cand {
-                        class: Some(if bulk { Class::Bulk } else { Class::Demand }),
-                        reader: Some(*id),
-                        item: Item::Block(block),
-                        waiting: true,
-                    })
+            let mut waits: Vec<(u64, u64)> = readers
+                .iter()
+                .filter(|(_, r)| r.bulk() == bulk && r.span.is_some())
+                .map(|(id, r)| (r.span_seq, *id))
+                .collect();
+            waits.sort_unstable();
+            waits.into_iter().find_map(|(_, id)| {
+                let r = &readers[&id];
+                let (first, last) = r.span?;
+                let block = (first..=last).find(|b| !r.got.contains_key(b) && !have(*b))?;
+                Some(Cand {
+                    class: Some(if bulk { Class::Bulk } else { Class::Demand }),
+                    reader: Some(id),
+                    item: Item::Block(block),
+                    waiting: true,
                 })
+            })
         };
         let ahead = |readers: &BTreeMap<u64, ReaderState>, bulk: bool| {
             readers

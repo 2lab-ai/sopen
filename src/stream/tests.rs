@@ -302,33 +302,18 @@ fn the_cache_keeps_its_bound_and_spares_what_readers_need() {
     assert!(cache.contains(1) && !cache.contains(2));
     // A block inside a reader's window is spared while another can go.
     let window = Protect {
-        waiting: vec![],
         windows: vec![(3, 3)],
     };
     cache.insert(6, block(6), false, &window);
     assert!(cache.contains(3) && !cache.contains(4));
-    // The bound is hard: with every block protected, a window's block goes before one a
-    // reader is waiting for.
+    // The bound is hard: with every block inside a window, the least recently used goes.
     let all = Protect {
-        waiting: vec![(3, 3)],
         windows: vec![(0, 100)],
     };
-    assert!(cache.insert(7, block(7), false, &all));
-    assert!(cache.contains(3) && !cache.contains(1) && cache.len() == 4);
-    // A block a reader waits for is never evicted: with nothing else to evict, the new
-    // block is not kept, and the bound holds.
-    let waited = Protect {
-        waiting: vec![(0, 100)],
-        windows: vec![],
-    };
-    let before: Vec<bool> = (0..9).map(|b| cache.contains(b)).collect();
-    assert!(!cache.insert(8, block(8), false, &waited), "not kept");
-    let after: Vec<bool> = (0..9).map(|b| cache.contains(b)).collect();
-    assert_eq!(
-        (before, cache.len()),
-        (after, 4),
-        "and nothing waited for went"
-    );
+    cache.insert(7, block(7), false, &all);
+    assert!(!cache.contains(3) && cache.contains(1) && cache.len() == 4);
+    assert_eq!(cache.peek(1).unwrap()[0], 1);
+    assert!(cache.peek(3).is_none());
     // A Bulk reader's block goes in at the cold end: the next to go.
     cache.insert(9, block(9), true, &none);
     cache.insert(10, block(10), false, &none);
@@ -444,6 +429,7 @@ fn a_bulk_readers_waiting_block_goes_before_older_bulk_readahead() {
     let mut pf = Prefetcher::default();
     let now = Instant::now();
     let none = |_: u64| false;
+    let nothing = |_: u64| None;
     let block_of = |pf: &mut Prefetcher| match pf.candidate(&none) {
         Some(cand) => (cand.class, cand.item),
         None => panic!("nothing queued"),
@@ -451,8 +437,8 @@ fn a_bulk_readers_waiting_block_goes_before_older_bulk_readahead() {
     // An older pass, two sequential reads in: readahead queued, and it waits for nothing
     // once its own block is in.
     let old = pf.open(ReaderKind::Bulk);
-    pf.access(old, 0, BLOCK, GIB, now, &none, &none);
-    pf.access(old, BLOCK, 2 * BLOCK, GIB, now, &none, &none);
+    pf.access(old, 0, BLOCK, GIB, now, &nothing, &none, &none);
+    pf.access(old, BLOCK, 2 * BLOCK, GIB, now, &nothing, &none, &none);
     pf.satisfied(old);
     assert_eq!(
         block_of(&mut pf),
@@ -461,17 +447,28 @@ fn a_bulk_readers_waiting_block_goes_before_older_bulk_readahead() {
     );
     // A newer pass waits for a block: that goes first.
     let new = pf.open(ReaderKind::Bulk);
-    pf.access(new, 500 * BLOCK, 501 * BLOCK, GIB, now, &none, &none);
+    pf.access(
+        new,
+        500 * BLOCK,
+        501 * BLOCK,
+        GIB,
+        now,
+        &nothing,
+        &none,
+        &none,
+    );
     assert_eq!(block_of(&mut pf), (Some(Class::Bulk), Item::Block(500)));
     // A viewer's readahead, newer than both, goes before either.
     let viewer = pf.open(ReaderKind::Interactive);
     let seen = |b: u64| b == 900;
+    let grab = |b: u64| seen(b).then(bytes::Bytes::new);
     pf.access(
         viewer,
         900 * BLOCK,
         900 * BLOCK + 480,
         GIB,
         now,
+        &grab,
         &seen,
         &seen,
     );
@@ -481,6 +478,7 @@ fn a_bulk_readers_waiting_block_goes_before_older_bulk_readahead() {
         900 * BLOCK + 960,
         GIB,
         now,
+        &grab,
         &seen,
         &seen,
     );
@@ -1953,10 +1951,10 @@ fn a_local_read_at_is_cancelled_between_its_reads() {
     }
 }
 
-/// 06 §3, a block a reader waits for is never evicted: six readers each wait for 16 MiB,
-/// half again what the cache holds. The oldest waits are served first and hold their blocks
-/// until read; the others' turn comes as those complete. Every read completes, with its own
-/// bytes, and the cache never passes its bound.
+/// 06 §3, a wait depends on nothing the cache keeps: six readers each wait for 16 MiB, half
+/// again what the cache holds, and nobody looks while it all arrives. Each waiter holds the
+/// blocks that came for it, so every read completes, with its own bytes and without a block
+/// fetched twice, while the cache stays at its bound.
 #[test]
 fn readers_waiting_for_more_than_the_cache_holds_all_complete() {
     let mut rig = rig(MODEL, sim(1, 1_000_000_000));
@@ -1964,33 +1962,17 @@ fn readers_waiting_for_more_than_the_cache_holds_all_complete() {
     let mut readers: Vec<(u64, Reader, bool)> = (0..6)
         .map(|i| (place(i), rig.reader(media()), false))
         .collect();
-    // Nobody looks while everything asked for arrives: only the waits that fit the cache
-    // together are served — three of 257 blocks — and the fourth's blocks are not asked for.
+    // Nobody looks while everything asked for arrives: all of it is fetched, once.
     for (at, r, _) in readers.iter_mut() {
         assert!(r.try_read(*at, MAX_READ).is_pending());
     }
-    // Bounded well above the turns three waits take (a read and a fence a block), so a
-    // stream that fetches without end fails here.
-    let mut settled = false;
-    for _ in 0..20_000 {
-        rig.engine.pump();
-        settled = rig.pending() == 0;
-        if settled {
-            break;
-        }
-        rig.engine.step(None);
-    }
-    assert!(
-        settled,
-        "the stream goes on fetching with no reader looking"
-    );
+    settle(&mut rig);
     let span = (MAX_READ as u64 + 1000).div_ceil(BLOCK);
-    assert_eq!(rig.source().core().cache.len() as u64, 3 * span);
-    assert!(
-        rig.trace()
-            .iter()
-            .all(|t| t.block != Some(place(3) / BLOCK)),
-        "a fourth wait was served beside three that all but fill the cache"
+    assert_eq!(read_offsets(&rig).len() as u64, 6 * span);
+    assert_eq!(
+        rig.source().core().cache.len() as u64,
+        CACHE_BYTES / BLOCK,
+        "the cache dropped a third of it"
     );
     let mut order = Vec::new();
     // As frames do, the readers look again only when the waker fired.
@@ -2046,64 +2028,6 @@ fn readers_waiting_for_more_than_the_cache_holds_all_complete() {
     assert_eq!(distinct.len(), offsets.len(), "a block was fetched twice");
     let blocks = (MAX_READ as u64 + 1000).div_ceil(BLOCK);
     assert!(offsets.len() as u64 >= 6 * blocks);
-}
-
-/// A wait that did not fit beside the older ones is served when one of them ends — and the
-/// engine is told at once, however it ends: read, moved elsewhere, renewed, or its reader
-/// dropped. Otherwise it would sit unserved until something else woke the engine.
-#[test]
-fn the_engine_is_told_when_a_held_wait_ends() {
-    let mut rig = rig(MODEL, sim(1, 1_000_000_000));
-    let mut seen = rig.reader(ReaderKind::Interactive);
-    rig.read(&mut seen, 0, 480);
-    rig.drain();
-    let place = |i: u64| (i + 1) * GIB;
-    let mut held: Vec<Reader> = (0..4)
-        .map(|_| rig.reader(ReaderKind::Interactive))
-        .collect();
-    for (i, r) in held.iter_mut().enumerate() {
-        assert!(r.try_read(place(i as u64), MAX_READ).is_pending());
-    }
-    // Four waits of 16 MiB are the cache; a fifth is not served yet.
-    let mut fifth = rig.reader(ReaderKind::Interactive);
-    assert!(fifth.try_read(place(9), 480).is_pending());
-    let told = |rig: &mut Rig| {
-        rig.engine.pump();
-        assert!(!rig.source().core().kicked());
-        assert!(
-            rig.trace()
-                .iter()
-                .all(|t| t.block != Some(place(9) / BLOCK)),
-            "the fifth wait was served beside four that fill the cache"
-        );
-    };
-    told(&mut rig);
-    // Moved to a place already cached: its wait ends without a read of what it waited for.
-    assert!(held[0].try_read(0, 480).is_ready());
-    assert!(rig.source().core().kicked(), "a wait ended by moving away");
-    let got = rig.read(&mut fifth, place(9), 480);
-    assert!(
-        got[..] == pattern(place(9), 480)[..],
-        "and the fifth is served"
-    );
-    // The same for a reader dropped and one renewed, each with a new wait behind four.
-    for end in 0..2 {
-        assert!(held[0].try_read(place(4 + end), MAX_READ).is_pending());
-        let mut sixth = rig.reader(ReaderKind::Interactive);
-        assert!(sixth.try_read(place(11 + end), MAX_READ).is_pending());
-        rig.engine.pump();
-        assert!(!rig.source().core().kicked());
-        if end == 0 {
-            drop(held.remove(1));
-            held.push(rig.reader(ReaderKind::Interactive));
-        } else {
-            held[1].renew();
-        }
-        assert!(rig.source().core().kicked(), "a wait ended (case {end})");
-        drop(sixth);
-        let last = held.len() - 1;
-        assert!(held[last].try_read(place(20 + end), MAX_READ).is_pending());
-    }
 }
 
 /// `shares` adds in 128 bits: a window, or their sum, past 64 bits does not overflow.
@@ -2296,11 +2220,10 @@ fn an_interrupt_between_the_cancel_check_and_the_wait_is_not_lost() {
     );
 }
 
-/// 06 §4 and V4 under cache pressure: older Bulk waits take what Bulk may hold, and a
-/// foreground miss that comes after them is still the next thing sent — no Bulk read goes
-/// while it waits. Bulk holds at most the cache less one maximum read.
+/// 06 §4 and V4 under cache pressure: older Bulk waits are out, and a foreground miss that
+/// comes after them is still the next thing sent — no Bulk read goes while it waits.
 #[test]
-fn a_foreground_miss_is_served_while_bulk_waits_fill_what_they_may_hold() {
+fn a_foreground_miss_is_served_ahead_of_older_bulk_waits() {
     let mut rig = rig(MODEL, sim(20, 500_000));
     let place = |i: u64| (i + 1) * GIB;
     let mut passes: Vec<Reader> = (0..4).map(|_| rig.reader(ReaderKind::Bulk)).collect();
@@ -2323,15 +2246,12 @@ fn a_foreground_miss_is_served_while_bulk_waits_fill_what_they_may_hold() {
         "the next read sent is the foreground miss"
     );
     assert_eq!(rig.sent()[first + 1].asked, Asked::Fstat);
-    // With nobody reading, three passes of 256 blocks are all Bulk may hold: the fourth's
-    // blocks are not asked for.
-    rig.drain();
-    let fourth = place(3) / BLOCK;
-    assert!(
-        rig.trace().iter().all(|t| t.block != Some(fourth)),
-        "a fourth pass was served beside three that hold all Bulk may"
-    );
-    assert_eq!(rig.source().core().cache.len(), 3 * 256 + 1);
+    // The passes go on behind it, each read to its end and none refetched.
+    settle(&mut rig);
+    for (i, pass) in passes.iter_mut().enumerate() {
+        take_whole(pass, place(i as u64), 256, "a bulk pass");
+    }
+    assert_none_fetched_twice(&rig);
     rig.check_admission();
 }
 
@@ -2440,6 +2360,227 @@ fn a_queued_remainder_of_a_failed_fence_is_never_sent() {
     assert!(!rig.source().core().cache.contains(3));
     assert_eq!(rig.source().core().held(), (0, 0));
     assert_eq!(rig.state(), State::Live);
+}
+
+// ---- review round 3: a waited block is held by its waiter ----
+
+/// Steps the engine until nothing is out and nothing more goes, with no reader looking.
+/// Bounded well above what any test here fetches, so a stream that fetches without end fails.
+fn settle(rig: &mut Rig) {
+    for _ in 0..40_000 {
+        rig.engine.pump();
+        if rig.pending() == 0 {
+            return;
+        }
+        rig.engine.step(None);
+    }
+    panic!("the stream goes on fetching with no reader looking");
+}
+
+fn read_offsets(rig: &Rig) -> Vec<u64> {
+    rig.sent()
+        .iter()
+        .filter_map(|s| match s.asked {
+            Asked::Read { off, .. } => Some(off),
+            _ => None,
+        })
+        .collect()
+}
+
+fn assert_none_fetched_twice(rig: &Rig) {
+    let offsets = read_offsets(rig);
+    let distinct: std::collections::BTreeSet<u64> = offsets.iter().copied().collect();
+    assert_eq!(distinct.len(), offsets.len(), "a block was fetched twice");
+}
+
+/// `blocks` whole blocks at `at`, which must be there now, with the pattern's bytes.
+fn take_whole(r: &mut Reader, at: u64, blocks: u64, who: &str) {
+    let len = (blocks * BLOCK) as usize;
+    match r.try_read(at, len) {
+        Poll::Ready(Ok(got)) => {
+            assert_eq!(got.len(), len, "{who}");
+            assert!(got[..] == pattern(at, len)[..], "{who}'s bytes");
+        }
+        other => panic!("{who}: its blocks came and are not there to read: {other:?}"),
+    }
+}
+
+/// A wait keeps the blocks that came for it, whatever the cache does since: three Bulk waits
+/// of 256 blocks have their blocks in, unread, when two foreground waits of 256 blocks come.
+/// The foreground demands go; the cache, past its bound, drops Bulk's blocks; every Bulk read
+/// still completes, and nothing is fetched twice.
+#[test]
+fn bulk_waits_keep_their_blocks_when_foreground_waits_fill_the_cache() {
+    let mut rig = rig(MODEL, sim(1, 1_000_000_000));
+    let place = |i: u64| (i + 1) * GIB;
+    let mut passes: Vec<Reader> = (0..3).map(|_| rig.reader(ReaderKind::Bulk)).collect();
+    for (i, pass) in passes.iter_mut().enumerate() {
+        assert!(pass.try_read(place(i as u64), MAX_READ).is_pending());
+    }
+    settle(&mut rig);
+    assert_eq!(
+        read_offsets(&rig).len(),
+        3 * 256,
+        "the passes' blocks are in"
+    );
+    let n = rig.trace().len();
+    let mut viewers: Vec<Reader> = (0..2).map(|_| rig.reader(media())).collect();
+    for (i, viewer) in viewers.iter_mut().enumerate() {
+        assert!(viewer.try_read(place(10 + i as u64), MAX_READ).is_pending());
+    }
+    settle(&mut rig);
+    let reads: Vec<Option<Class>> = rig.trace()[n..]
+        .iter()
+        .filter_map(|t| t.class.map(Some))
+        .collect();
+    assert_eq!(reads.len(), 2 * 256);
+    assert!(
+        reads.iter().all(|c| *c == Some(Class::Demand)),
+        "the foreground demands went"
+    );
+    assert_eq!(
+        rig.source().core().cache.len(),
+        1024,
+        "the cache is at its bound"
+    );
+    for (i, viewer) in viewers.iter_mut().enumerate() {
+        take_whole(viewer, place(10 + i as u64), 256, "a viewer");
+    }
+    for (i, pass) in passes.iter_mut().enumerate() {
+        take_whole(pass, place(i as u64), 256, "a bulk pass");
+    }
+    settle(&mut rig);
+    assert_none_fetched_twice(&rig);
+    assert_eq!(read_offsets(&rig).len(), 5 * 256);
+    rig.check_admission();
+}
+
+/// Priority is the queue's class order alone: foreground waits of mixed sizes, more together
+/// than the cache holds, and a small Bulk wait older than all of them. No Bulk read is sent
+/// while any foreground demand is unsent, and every read completes without a refetch.
+#[test]
+fn no_bulk_read_goes_while_any_foreground_demand_is_unsent() {
+    let mut rig = rig(MODEL, sim(1, 1_000_000_000));
+    let place = |i: u64| (i + 1) * GIB;
+    let mut pass = rig.reader(ReaderKind::Bulk);
+    assert!(pass.try_read(place(20), BLOCK as usize).is_pending());
+    let sizes = [256u64, 256, 256, 255, 100];
+    let mut viewers: Vec<Reader> = sizes.iter().map(|_| rig.reader(media())).collect();
+    for (i, viewer) in viewers.iter_mut().enumerate() {
+        let len = (sizes[i] * BLOCK) as usize;
+        assert!(viewer.try_read(place(i as u64), len).is_pending());
+    }
+    settle(&mut rig);
+    let trace = rig.trace();
+    let demands = trace
+        .iter()
+        .filter(|t| t.class == Some(Class::Demand))
+        .count() as u64;
+    assert_eq!(
+        demands,
+        sizes.iter().sum::<u64>(),
+        "every foreground demand was sent"
+    );
+    let bulk = trace
+        .iter()
+        .position(|t| t.class == Some(Class::Bulk))
+        .expect("the bulk read, in its turn");
+    let last_demand = trace
+        .iter()
+        .rposition(|t| t.class == Some(Class::Demand))
+        .unwrap();
+    assert!(
+        bulk > last_demand,
+        "a bulk read went with foreground demand unsent"
+    );
+    for (i, viewer) in viewers.iter_mut().enumerate() {
+        take_whole(viewer, place(i as u64), sizes[i], "a viewer");
+    }
+    take_whole(&mut pass, place(20), 1, "the bulk pass");
+    settle(&mut rig);
+    assert_none_fetched_twice(&rig);
+    rig.check_admission();
+}
+
+/// A wait takes hold, when it registers, of the blocks of its span the cache has then: one
+/// evicted afterwards — here by four older waits filling the cache first — is not fetched
+/// again.
+#[test]
+fn a_wait_keeps_the_blocks_cached_when_it_registered() {
+    let mut rig = rig(MODEL, sim(1, 1_000_000_000));
+    let place = |i: u64| (i + 1) * GIB;
+    // The last block of what will be waited for, cached by a reader long gone.
+    let last = 15 * GIB + 255 * BLOCK;
+    let mut gone = rig.reader(ReaderKind::Bulk);
+    rig.read(&mut gone, last, BLOCK as usize);
+    drop(gone);
+    settle(&mut rig);
+    let mut older: Vec<Reader> = (0..4).map(|_| rig.reader(media())).collect();
+    for (i, r) in older.iter_mut().enumerate() {
+        assert!(r.try_read(place(i as u64), MAX_READ).is_pending());
+    }
+    let mut waiter = rig.reader(media());
+    assert!(waiter.try_read(15 * GIB, MAX_READ).is_pending());
+    settle(&mut rig);
+    assert!(
+        !rig.source().core().cache.contains(last / BLOCK),
+        "the older waits' blocks pushed it out of the cache"
+    );
+    take_whole(&mut waiter, 15 * GIB, 256, "the waiter");
+    let fetched = read_offsets(&rig)
+        .iter()
+        .filter(|off| **off == last)
+        .count();
+    assert_eq!(fetched, 1, "the block it held was fetched again");
+    for (i, r) in older.iter_mut().enumerate() {
+        take_whole(r, place(i as u64), 256, "an older wait");
+    }
+    assert_none_fetched_twice(&rig);
+}
+
+/// The memory bound (06 §3): a reader holds blocks only for its one wait — at most one read's
+/// worth — and lets go of them when the read completes, when it moves to another place, when
+/// it is renewed or dropped, and when the Source changes.
+#[test]
+fn a_reader_holds_blocks_only_for_its_one_wait() {
+    let mut rig = rig(MODEL, sim(1, 1_000_000_000));
+    let holding = |rig: &Rig| rig.source().core().pf.holding();
+    let mut r = rig.reader(media());
+    assert!(r.try_read(GIB, MAX_READ).is_pending());
+    settle(&mut rig);
+    assert_eq!(holding(&rig), 256, "what came for its wait");
+    // Moved: what it held of the old place goes.
+    assert!(r.try_read(5 * GIB, 100 * BLOCK as usize).is_pending());
+    assert_eq!(holding(&rig), 0);
+    settle(&mut rig);
+    assert_eq!(holding(&rig), 100);
+    // Read: nothing is held.
+    take_whole(&mut r, 5 * GIB, 100, "the reader");
+    assert_eq!(holding(&rig), 0);
+    // Renewed, and dropped.
+    assert!(r.try_read(7 * GIB, MAX_READ).is_pending());
+    let mut other = rig.reader(media());
+    assert!(other.try_read(7 * GIB, MAX_READ).is_pending());
+    settle(&mut rig);
+    assert_eq!(holding(&rig), 512, "each waiter its own references");
+    r.renew();
+    assert_eq!(holding(&rig), 256);
+    drop(other);
+    assert_eq!(holding(&rig), 0);
+    // A change: nothing held is served, or kept.
+    assert!(r.try_read(9 * GIB, 300 * BLOCK as usize / 2).is_pending());
+    settle(&mut rig);
+    assert_eq!(holding(&rig), 150);
+    rig.control.change(write(0, false));
+    let mut miss = rig.reader(ReaderKind::Interactive);
+    assert!(miss.try_read(11 * GIB + 1000, 480).is_pending());
+    settle(&mut rig);
+    assert_eq!(rig.state(), State::Changed);
+    assert_eq!(holding(&rig), 0);
+    assert_eq!(
+        r.try_read(9 * GIB, 300 * BLOCK as usize / 2),
+        Poll::Ready(Err(ReadError::Changed))
+    );
 }
 
 // ---- the cache under a Source ----

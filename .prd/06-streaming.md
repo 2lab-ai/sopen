@@ -149,12 +149,18 @@ The first two paragraphs are this document. The third is 07.
   - When the readers' protected windows together would pass 48 MiB, every reader's `ahead` and
     `behind` are scaled down to an equal share of that 48 MiB, but never below a floor of 256 KiB
     ahead and 64 KiB behind.
-  - A block a reader is waiting for is held until that reader has read it, and is never
-    evicted. So the waits served at one time are those whose blocks fit the cache together, in
-    the queue's order (§4): foreground waits first, then Bulk's, oldest first within each. Bulk
-    waits hold at most the cache less one maximum read (768 blocks), so a foreground wait always
-    has room beside them. A wait beyond that is served once one before it has been read. One read
-    asks at most 16 MiB.
+  - **A block a reader is waiting for is held by that reader, not by the cache.** A reader's
+    wait is one span of at most 16 MiB (one read). The reader keeps its own reference to each
+    block of the span that is there: those the cache has when the wait begins, and each one that
+    arrives and is validated after. A read is served from what the reader holds first, then from
+    the cache.
+  - So a wait never depends on what the cache keeps, and the cache evicts freely: by window,
+    then by age. Nothing limits which waits are served; priority is §4's class order alone.
+  - The references are dropped when the read completes, when the reader moves, is renewed or is
+    dropped, and when the Source fails, changes or reloads. Nothing held is served after a
+    change or a reload.
+  - **Memory:** the cache's 64 MiB, plus at most 16 MiB for each reader with a wait outstanding.
+    A held block that is also in the cache is one buffer, counted once.
 - **Bulk readers insert at the cold end.** Their blocks are the next to go, so a pass over the whole
   file (an index pass, the waveform, Save As) does not evict what the screen or playback needs.
 - **No disk spill in v1.** The measured patterns fit in 64 MiB: open + 10 s of play + a far seek
@@ -897,7 +903,7 @@ Left as whole fetches, with the fetch now pipelined (§2):
 
 | Resource | Bound |
 |---|---|
-| RAM per Source | 64 MiB of blocks + at most 4 MiB in flight |
+| RAM per Source | 64 MiB of blocks + at most 16 MiB per reader with a wait outstanding (§3) + at most 4 MiB in flight |
 | RAM, the hex window | + its page cache, 64 × 4 KiB |
 | RAM, the text viewer | + its index, at most 16 MiB up to 64 GiB of indexed text (§7.2) |
 | RAM, the image window | the encoded bytes + the decoded pixels, as today; above 512 MiB decoded only after Continue (§7.3) |
