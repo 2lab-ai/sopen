@@ -518,7 +518,37 @@ large files.
     - image 0.25.10's `JpegDecoder::new` calls `read_to_end` and then `decode_headers`.
     - zune-jpeg reads markers up to SOS and fails at the end of its input. So bytes that stop at
       the SOF cannot be handed to it, and the stream never can (it would pull the whole file).
-    - X4 (loop.md) checks the walk on camera-style JPEGs with large MPF and XMP segments.
+    - The walk reads 64 KiB first and then 64 KiB at a time, up to the 1 MiB cap. Measured (X4,
+      2026-11-21): the SOF ends within 42,662 bytes in all 894 JPEGs shipped with macOS and its
+      apps on one Mac (median 2,942), and within 19,170 in the five camera files among them, so
+      the first read is normally the only one. A built phone-style file (Exif with a 60 KB
+      thumbnail, XMP, extended XMP, ICC, MPF) needs 303,964 bytes; a file with more than about
+      1 MB of metadata ahead of its frame passes the cap.
+    - A plain search for the first SOF code is wrong: on all five camera files it returns the
+      Exif thumbnail's size (for example 160×106). The walk skips whole segments by their lengths.
+    - The rules of the walk:
+      - The file must start `FF D8`. Otherwise the format is guessed from content, as today.
+      - A marker is `FF`, any further `FF` bytes (fill), then the code. A segment is skipped by its
+        2-byte length and nothing inside it is read. That is what keeps the Exif thumbnail's own
+        SOF and a second image after the first EOI (MPF) out of the answer.
+      - The SOF is the first code in C0–CF other than C4, C8 and CC. Its whole segment is read
+        (at most 775 bytes) and accepted only if its length is 8 + 3 × components, the width and
+        height are not 0, and it has 1 to 4 components.
+      - The walk gives up, with no header, on anything else before the SOF: a byte that is not
+        `FF` where a marker must be, `FF 00`, a marker with no length (01, D0–D7), a second SOI,
+        EOI, SOS, a length below 2, or a height of 0 (a height set later by DNL is not supported).
+        It never searches forward for a marker.
+      - No header is not an error. The window shows the size line and streams the file, and the
+        decoder decides. The same holds when the file ends before the SOF does.
+    - The Exif kept for the thumbnail is the first APP1 that starts `Exif\0\0`. Its orientation
+      (5–8 swap the sides) gives the upright `W×H` to show.
+    - The memory a decode needs is width × height × 1 for one component and × 3 for three or
+      four (the decoder turns CMYK into RGB).
+    - A header found does not promise a decode: a file cut after its SOF, or one with a DAC
+      segment, still fails in the decoder.
+    - A SOF that zune-jpeg cannot decode (any type but C0, C1, C2, or a precision other than 8:
+      arithmetic, 12-bit, lossless) is reported at once with its type and size, and the file is
+      not streamed for a decode. Hex view stays offered once W8 brings it.
   - **PNG, GIF, BMP, WebP:** the header is at the start (PNG's IHDR at byte 16; WebP's
     VP8/VP8L/VP8X chunk first). `ImageReader::into_dimensions` runs on the bytes up to it.
   - **TIFF:** follow the first-IFD offset, one more read wherever it points.
@@ -591,10 +621,27 @@ to every run on the file: the probe, playback, the paused frame, the waveform, S
 - **`Input` carries its own input options.** Each `Input` holds the options that must precede its
   `-i`, and emits them there. So every remote input, each group input of PR #15's `edit_args`
   included, gets `-protocol_whitelist http,tcp`. mp3 `play` inputs also get `-fflags +fastseek`.
-  - Without it an mp3 seek reads the file through: 82–91 % of it. With it a seek took 0.14 s and
-    8.7 % (*view* §2.3).
+  - Without it an mp3 seek reads the file up to the target: the share of the file before it (6–8 %
+    at 30 s, 81–84 % at 480 s of a 600 s file; 82–91 % in *view* §2.3). With it a seek reads a fixed
+    65–115 kB wherever the target is.
   - Save and Export keep exact seeking: 01 §7 promises exact cuts.
-  - How precise `+fastseek` is on VBR files is unmeasured; X5 (loop.md) measures it before W7.
+  - **Measured precision** (X5, 2026-11-21, ffmpeg 9.0.2, 600 s test files, 60 seeks each; without
+    the flag every seek landed within 2 ms):
+    - CBR: within one mp3 frame (0.026 s).
+    - VBR with a Xing header: from 4.3 s early to 1.1 s late (median 0.9 s). The error grows with
+      the file's length: in a 1-hour file, 21.8 s early to 9.0 s late (median 3.9 s). ffmpeg seeks
+      on a grid of 1/256 of the file's size.
+    - VBR with no header: up to 161 s off. ffmpeg also misjudges the length (437.8 s for a 600 s
+      file, with or without the flag), and a seek past that length reads the whole file anyway.
+    - The flag saves bytes only on a server with ranges, which the byte server is (§9).
+  - **So `+fastseek` is used only where it is exact: an mp3 whose first frame carries a LAME `Info`
+    tag (constant bitrate).** sopen reads that frame itself: the ID3v2 tag's size from its 10-byte
+    header, then the first frame after it, where `Info`, `Xing` or neither sits after the side
+    information. A `Xing` (VBR) file or one with no tag seeks exactly. **This is the workstream's
+    decision:** the media window places cuts at the play position, so a play position seconds off
+    would put the user's cuts in the wrong place. The cost is that a far seek in a long VBR mp3
+    first reads the file up to the target, once (the blocks stay in the cache, §3); the window
+    shows that read's progress.
 - **ffmpeg's reconnect options stay off.** The server ends a connection only on an error the window
   already shows from its Source, so a reconnect would only repeat it.
 - **ffmpeg's exit status cannot be trusted for a cut-short input** (verified with ffmpeg 9.0.2,

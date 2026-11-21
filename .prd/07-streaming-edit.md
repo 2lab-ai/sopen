@@ -36,7 +36,9 @@ The measurements are in [`research/streaming-edit.md`](research/streaming-edit.m
     first large Save.
 - **A small edit to a huge file moves bytes, not the file.** Hex Save copies the file on the server
   (`copy-data`) into the temp, patches the changed ranges, and renames. Measured on a 24 GB remote
-  file with a 4-byte patch: **6.3 s**, with 8 bytes of file content on the wire. Today the same Save
+  file with a 4-byte patch: **6.3 s** with the file in memory (tmpfs), of which the copy was
+  3.4 s, with 8 bytes of file content on the wire. On a real disk the copy alone takes about 17 s on
+  the Linux laptop and 5–14 s on the Mac (X2, §4.2). Today the same Save
   costs 48 GB over the network and 48 GB of local disk: about 4.8 h at the measured 1.39 MB/s each
   way (*edit* §2.3–§2.4).
 - **Save As writes the edited result to a local path** (Alt+Cmd/Ctrl+S, F7), streaming the unchanged
@@ -283,10 +285,24 @@ check, the undo file, the streamed rewrite and Save As.
    for both uses:
    - The first request is 64 MiB. Each next one is sized to take about 1 s at the last one's rate,
      clamped to 16 MiB–1 GiB. A slow server disk then never turns one request into a 30 s
-     `META_TIMEOUT`, which would be an unknown outcome. Disk-backed copy rates were not measured;
-     tmpfs ran at 4 GB/s.
+     `META_TIMEOUT`, which would be an unknown outcome.
+   - Measured (X2, 2026-11-21: 4 GiB and 24 GiB files of random bytes, source evicted from the page
+     cache): the Linux laptop (btrfs on NVMe) copies at 2.2 GB/s for 4 GiB and 1.5–1.6 GB/s across
+     24 GiB; the Mac (APFS, internal SSD) at 1.8–5.4 GB/s, usually about 5. With the source cached,
+     3.7 and 5.4 GB/s. A 64 MiB request takes 11–32 ms, so the rule reaches the 1 GiB cap on its
+     second request; a 1 GiB request takes 0.4–0.5 s on the laptop and 0.2–0.3 s on the Mac. When
+     the laptop's disk slowed to about 0.6 GiB/s, a request took up to 1.7 s and the rule cut the
+     next ones to 370–950 MiB. Two or four requests outstanding gain only the network round trip,
+     which 1 GiB requests already amortise, so the loop keeps one outstanding. A slow disk was not
+     measured; the 16 MiB floor and the time-sized rule are for it.
    - Every 2 GiB copied, sopen sends `fsync@openssh.com` on the temp, so the final fsync never meets
-     a whole file of dirty pages. sopen's fsync bound is the 60 s `STALL_TIMEOUT`.
+     a whole file of dirty pages. sopen's fsync bound is the 60 s `STALL_TIMEOUT`. Measured (X2):
+     10–46 ms per fsync on the laptop's disk, up to 0.41 s late in a 24 GiB copy; 1–7 ms on the Mac,
+     where `fsync` does not ask the drive to flush.
+   - A server whose dirty-page limit is large can answer requests at memory speed and leave the disk
+     time to the fsync. So the fsync's time counts in the rate the next request is sized from, and
+     sopen also sends an fsync after 10 s of copying since the last one, whichever of 2 GiB or 10 s
+     comes first. This guard is the workstream's decision; X2 did not measure such a server.
    - Progress is `saving — copying on <host> 37 % (8.9 of 24.0 GB)`. Cancel is checked between
      requests; the temp is then removed and the target is untouched. A request already sent finishes
      on the server first (SFTP has no cancel), and time-sized requests bound that wait to about 1 s.
