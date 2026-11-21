@@ -3,7 +3,7 @@
 //! `close_requested`, F4 through the real editor launch, a fetch stopped by Esc.
 
 use super::*;
-use crate::gui::testkit::Driver;
+use crate::gui::testkit::{Driver, Meter};
 use crate::remote::{LocalFs, Stat};
 use eframe::egui::{Event, PointerButton};
 use std::io::Write;
@@ -669,10 +669,17 @@ fn a_viewer_holds_its_cached_copy_only_while_it_shows_it() {
     assert!(fx.b.viewer.is_none());
 }
 
-/// Every file under `dir`.
+/// Every file under `dir`: a `dir` that is not there has none, and anything else that keeps
+/// it from being read fails the test (an empty answer would pass for "nothing was written").
 fn files_in(dir: &Path) -> Vec<PathBuf> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+        Err(e) => panic!("cannot list {}: {e}", dir.display()),
+    };
     let mut out = Vec::new();
-    for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+    for entry in entries {
+        let entry = entry.unwrap_or_else(|e| panic!("cannot list {}: {e}", dir.display()));
         let path = entry.path();
         if path.is_dir() {
             out.extend(files_in(&path));
@@ -708,6 +715,125 @@ fn w8a_enter_on_remote_text_and_binaries_views_them_through_streams() {
     fx.key(Key::Escape);
     assert!(fx.b.viewer.is_none());
     assert_eq!(fx.current(), "data.bin");
+}
+
+/// The browser "on host box" over real SFTP (this machine's `sftp-server`), every connection
+/// metered by the fixture ([`Meter`]) with these budgets, `name` holding `size` bytes (sparse)
+/// — or `body` — and listed. `None` (the test skips) where there is no `sftp-server`.
+fn metered(
+    stream_budget: u64,
+    whole_budget: u64,
+    name: &str,
+    body: Result<&[u8], u64>,
+) -> Option<(Fx, Arc<Meter>, String)> {
+    crate::remote::SftpRemote::local_server()?;
+    let meter = Meter::new(stream_budget, whole_budget);
+    let connect = meter.connect(|| {
+        let server = crate::remote::SftpRemote::local_server().expect("sftp-server");
+        Ok(Box::new(server) as Box<dyn RemoteFs + Send>)
+    });
+    let mut fx = fixture_with(Some("box"), connect, None);
+    let abs = format!("{}/{name}", fx.root);
+    match body {
+        Ok(bytes) => std::fs::write(&abs, bytes).unwrap(),
+        Err(size) => std::fs::File::create(&abs).unwrap().set_len(size).unwrap(),
+    }
+    let root = fx.root.clone();
+    fx.b.list(Some(0), root, None, None);
+    fx.settle();
+    // Dual mode: Enter opens from the start (in preview mode it hands the preview over).
+    fx.key(Key::F9);
+    Some((fx, meter, abs))
+}
+
+/// 06 §12 V1 at the browser's Enter, over real SFTP, by the fixture's own count: a remote
+/// binary of the owner's size (24 GB, sparse) is on screen after one read of one block — the
+/// sniff's 8 KiB before it, nothing read whole, nothing in the cache. The budget (that block
+/// and 4 MiB) is not passed: a route that fetched the file would have failed at once.
+#[test]
+fn w8a_enter_on_a_24_gb_remote_binary_transfers_one_block() {
+    const SIZE: u64 = 24_000_000_000;
+    let block = crate::stream::BLOCK;
+    let Some((mut fx, meter, abs)) = metered(block + (4 << 20), 0, "model.safetensors", Err(SIZE))
+    else {
+        return;
+    };
+    fx.open("model.safetensors");
+    assert!(
+        fx.drv
+            .find_text("00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00")
+            .is_some(),
+        "the first rows"
+    );
+    assert_eq!(meter.reads_of(&abs), vec![(0, block as u32)], "one block");
+    assert_eq!(meter.totals(), (block, 1, 0, 0), "what crossed");
+    assert_eq!(meter.heads.load(Ordering::SeqCst), 8 << 10, "the sniff");
+    assert!(!meter.tripped());
+    assert_eq!(meter.connects.load(Ordering::SeqCst), 1, "one session");
+    assert_eq!(files_in(&fx.cache), Vec::<PathBuf>::new());
+}
+
+/// A text body of exactly `size` bytes, in lines.
+fn lines_of(size: usize) -> Vec<u8> {
+    let mut body = Vec::with_capacity(size + 64);
+    let mut n = 0;
+    while body.len() < size {
+        body.extend_from_slice(
+            format!("line {n:08} of a remote text file, padded out\n").as_bytes(),
+        );
+        n += 1;
+    }
+    body.truncate(size - 1);
+    body.push(b'\n');
+    body
+}
+
+/// The browser's Enter on remote text at the limit, over real SFTP, by the fixture's count.
+/// Exactly 16 MiB streams: the first screen's block is the first read, nothing is read whole,
+/// and when the index pass is done the file has crossed once — the budget is the file's size,
+/// so a byte read twice would have passed it. One byte more is fetched whole, once, into the
+/// cache, and no stream is opened for it (its budget is nothing).
+#[test]
+fn w8a_enter_on_remote_text_at_16_mib_streams_and_one_byte_more_is_fetched() {
+    let cap = crate::gui::text::HIGHLIGHT_MAX;
+    let block = crate::stream::BLOCK;
+    let body = lines_of(cap as usize);
+    let Some((mut fx, meter, abs)) = metered(cap, 0, "at-limit.log", Ok(&body)) else {
+        return;
+    };
+    fx.open("at-limit.log");
+    assert!(fx.drv.find_text("Text Viewer").is_some());
+    assert_eq!(meter.reads_of(&abs).first(), Some(&(0, block as u32)));
+    let (bytes, _, whole_bytes, whole_reads) = meter.totals();
+    assert!(
+        bytes >= block && bytes <= cap,
+        "{bytes} at the first screen"
+    );
+    assert_eq!((whole_bytes, whole_reads), (0, 0), "nothing read whole");
+    fx.drv.until(&mut fx.b, 60, |_| {
+        meter.stream_bytes.load(Ordering::SeqCst) >= cap
+    });
+    fx.drv.idle(&mut fx.b, 20);
+    assert_eq!(
+        meter.totals(),
+        (cap, meter.totals().1, 0, 0),
+        "crossed once"
+    );
+    assert!(!meter.tripped(), "no byte was asked for twice");
+    assert_eq!(meter.connects.load(Ordering::SeqCst), 1);
+    assert_eq!(files_in(&fx.cache), Vec::<PathBuf>::new());
+
+    let body = lines_of(cap as usize + 1);
+    let Some((mut fx, meter, abs)) = metered(0, cap + 1, "over-limit.log", Ok(&body)) else {
+        return;
+    };
+    fx.open("over-limit.log");
+    assert!(fx.drv.find_text("Text Viewer").is_some());
+    assert_eq!(meter.totals(), (0, 0, cap + 1, 1), "fetched whole, once");
+    assert!(meter.opened.lock().unwrap().is_empty(), "no stream");
+    assert!(!meter.tripped());
+    let copy = crate::cache::cache_path(&fx.cache, "box", &abs);
+    assert_eq!(std::fs::metadata(copy).unwrap().len(), cap + 1);
 }
 
 /// 06 §12 V10 at open, in the browser: the open's own connection is refused as sshd refuses a

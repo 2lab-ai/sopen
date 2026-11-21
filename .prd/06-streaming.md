@@ -440,8 +440,8 @@ nothing else is affected:
 the run's own master, sshd refuses the eleventh. `ssh` says so only on its stderr
 (`mux_client_request_session: session request failed: Session open refused by peer`), which
 `start_sftp` sent to null: the error was `unexpected end of file (the remote process has
-terminated)`, and no window could say why. W8a reads that stderr to its end on the session's
-runtime, keeps its last 4 KiB, and adds it to a failed start's error (`src/remote/sftp.rs`, W1's
+terminated)`, and no window could say why. W8a reads that stderr to its end on a thread of its
+own (so the pipe drains whether or not anything drives the session's runtime), keeps its last 4 KiB, and adds it to a failed start's error (`src/remote/sftp.rs`, W1's
 file). `stream::session_refused` then matches, and the route says the line. ED4 uses the same
 words at the `Origin`'s first use.
 
@@ -624,8 +624,10 @@ large files.
 - **Stats events.** W5a emits `first` (§11) only. `input` and `ready` for jumps (End, a place
   opened at, Go to) are W5b's, with V12's `ready − input` qualification.
 - **W8a routes remote text of at most 16 MiB through a Source** (§13), where W5a's index is
-  whole. A remote text file over 16 MiB is still fetched whole, as today, until W5b: W8b routes it
-  through a Source then.
+  whole — in the browser, on Enter and in the preview: those are the text viewer's only routes.
+  `sopen host:/file.txt` on its own still hands the file to VS Code or Zed (01 §3, §1's last
+  bullet). A remote text file over 16 MiB is still fetched whole, as today, until W5b: W8b
+  routes it through a Source then.
 
 **W5a must fix (found in X3, 2026-11-21).** Five defects in today's text viewer, each answered by a
 rule above:
@@ -1001,6 +1003,11 @@ to every run on the file: the probe, playback, the paused frame, the waveform, S
   publish, never over anything). Its read is pipelined (§2).
   - **New: Esc and closing the window cancel it.** The transfer stops between chunks, `part` and the
     private folder are removed, nothing is published, and the terminal says `nothing was saved`.
+    - **Cancel and publish are decided once**, at one point: right before the complete file gets
+      its name, after its last byte, the source's final stat, the sync and the mode. A cancel
+      that came by then wins, whatever step it came in, and nothing is published. One that comes
+      after is refused: the file is there, and the dialog and the terminal say `saved`. So what
+      is said is always what happened.
   - This replaces 01 §6a's "during a transfer Enter and Esc do nothing and closing waits for it".
     It is **the workstream's decision**, from ssot's fixed scope item 1 ("can be cancelled"), not
     message 17's own words.
@@ -1539,7 +1546,7 @@ that shows something on screen also brings a screenshot receipt someone looked a
 | W5b | **Large text files by byte position.** The prefix index, byte-offset keys in `TextWindow` and wrap, unknown line starts, Go to, the index memory bound (§7.2) | `src/gui/text.rs`, `src/gui/text/wrap.rs`, `src/gui/text/tests.rs` | W5a |
 | W6 | **Image streams.** Header walk with the SOF read directly, thumbnail, the memory line with Continue, the reserved buffer, the streamed read, partial pictures for the four measured formats (plain PNG included) | `src/gui/image.rs`, `src/gui/image/probe.rs` (new), `src/gui/image/robustness_tests.rs`; `Cargo.toml` and `Cargo.lock` (the direct `png` dependency) | W2; S1 merged; X4 |
 | W7 | **Media streams.** URL `Input`s with their own input options and reader kinds, the progressive waveform on a `bulk` connection, Export through the URL and its Cancel, runs failed on a cut response | `src/gui/media.rs`, `src/gui/media/*`, `src/gui/playback.rs`, `src/ffmpeg.rs`, `src/cut.rs` | W3; S1, PR #15 and S1-M merged; X5 |
-| W8a | **Routing, hex and text.** The browser's Enter, the standalone route, the dialog and `--hex` open a Source instead of fetching, for what the hex window shows (any size) and for remote text of at most 16 MiB (a larger one keeps today's whole fetch until W5b; local files keep today's route), with the placeholder `Origin`, which answers `can_replace` without connecting at open (§2); the preview change below for text and hex, with its 02 §4.3–§4.4 text and S1's tests it changes; "Save to…" cancel; `bytes_fetched`; forwarding §11's hooks; ssh's stderr kept for a failed start (§6, V10 at open); the `Window` trait gains a shown / hidden call (`set_shown`) and the browser calls `Source::set_visible` through it, so a preview it holds but does not draw does not poll (§5); one preview-index constant for text — the route passes `prepare.rs`'s `text: 4 << 20` to the viewer, and `text.rs`'s own `PREVIEW_INDEX` (W5a's copy of it) goes | `src/gui/streamed.rs` (new: the route's open, its transport's count and give-back), `src/gui/browser/prepare.rs`, `src/gui/browser/prepare/tests.rs` (P3, P4, P6 and P12's remote parts), `src/gui/browser/preview.rs` (the hand-over, the give-back, shown / hidden), `src/gui/browser.rs` (the refusal line, a stream is not followed), `src/gui/browser/tests.rs`, `src/gui/browser/tests/s1.rs`, `src/gui/binary.rs`, `src/gui/binary/tests.rs`, `src/main.rs`, `src/kind.rs` (the sniff's bytes), `src/usage.rs`, `src/forward.rs`, `src/gui/mod.rs` (`Origin::placeholder`, `Window::set_shown`), `src/gui/hex.rs` and `src/gui/text.rs` (`set_shown`; `text.rs` also the preview index), their stream tests, `src/remote/sftp.rs` (`start_sftp`'s stderr), `tests/cli.rs`, `.prd/02-architecture.md` (§4.3–§4.5) | W4 and W5a; S1 merged |
+| W8a | **Routing, hex and text.** The hex window opens a Source instead of fetching, for a remote file of any size, on all four routes: the browser's Enter, the standalone route's dialog, the dialog's preset answer and `--hex`. The text viewer opens a Source for remote text of at most 16 MiB on the browser's Enter and preview only — standalone text still goes to the editor (01 §3), and a larger file keeps today's whole fetch until W5b; local files keep today's route (the table under "W8 is split" has every route). Both with the placeholder `Origin`, which answers `can_replace` without connecting at open (§2); the preview change below for text and hex, with its 02 §4.3–§4.4 text and S1's tests it changes; "Save to…" cancel; `bytes_fetched`; forwarding §11's hooks; ssh's stderr kept for a failed start (§6, V10 at open); the `Window` trait gains a shown / hidden call (`set_shown`) and the browser calls `Source::set_visible` through it, so a preview it holds but does not draw does not poll (§5); one preview-index constant for text — the route passes `prepare.rs`'s `text: 4 << 20` to the viewer, and `text.rs`'s own `PREVIEW_INDEX` (W5a's copy of it) goes | `src/gui/streamed.rs` (new: the route's open, its transport's count and give-back), `src/gui/browser/prepare.rs`, `src/gui/browser/prepare/tests.rs` (P3, P4, P6 and P12's remote parts), `src/gui/browser/preview.rs` (the hand-over, the give-back, shown / hidden), `src/gui/browser.rs` (the refusal line, a stream is not followed), `src/gui/browser/tests.rs`, `src/gui/browser/tests/s1.rs`, `src/gui/binary.rs`, `src/gui/binary/tests.rs`, `src/main.rs`, `src/kind.rs` (the sniff's bytes), `src/usage.rs`, `src/forward.rs`, `src/gui/mod.rs` (`Origin::placeholder`, `Window::set_shown`), `src/gui/hex.rs` and `src/gui/text.rs` (`set_shown`; `text.rs` also the preview index), their stream tests, `src/remote/sftp.rs` (`start_sftp`'s stderr), `tests/cli.rs`, `.prd/02-architecture.md` (§4.3–§4.5) | W4 and W5a; S1 merged |
 | W8b | **Routing, the rest.** Remote text over 16 MiB through a Source; the image → hex switch (§7.3: Hex view on the memory line, and a file that does not decode opens in the hex window); the image and media routes and their previews through a Source, with 02 §4.3–§4.4's text for them and P6's image part; the `.ts` refine over the URL; the `.preview` root removed once nothing uses it | `src/gui/browser/prepare.rs`, `src/gui/browser/preview.rs`, `src/gui/browser.rs` (the hex switch), `src/gui/browser/tests.rs` and `src/gui/browser/prepare/tests.rs` (P6's image part), `src/cache.rs` (the `.preview` root, if unused), `src/main.rs`, `src/kind.rs`, `.prd/02-architecture.md` (§4.3–§4.4) | W8a, W5b, W6, W7 and ED6; S1-M merged |
 
 07 §14 has the edit units (ED1–ED6) and the docs unit (D1), which rewrites 01, AGENTS.md and the
@@ -1558,6 +1565,18 @@ are in [`streaming/loop.md`](streaming/loop.md).
 **W8 is split (decided 2026-11-21).** W8 waited for W5b, W6, W7 and ED6, and none of them is
 needed for hex or for text that fits W5a's index: so W8a routes those now, and W8b keeps what
 needs the later units.
+
+**Which route opens what as a stream (W8a).**
+
+| Route | What the hex window shows (any size) | Text of at most 16 MiB | Text over 16 MiB | Image, video, audio |
+|---|---|---|---|---|
+| the browser's Enter or F3 on a remote file | stream | stream | fetched whole (until W5b) | fetched whole (W8b) |
+| the browser's preview of a remote file | stream | stream | private copy up to 32 MiB, else the info card | image: private copy; media: the info card (S1-M, W8b) |
+| standalone `sopen host:/file` | the dialog; its "Open in hex editor" streams | VS Code or Zed, which read it their own way (01 §3): sopen streams nothing | the same | fetched whole (W8b) |
+| the binary dialog's Enter, `SOPEN_CHOICE=hex` | stream | — (the dialog is for files of no other kind) | — | — |
+| `--hex SOURCE`, any kind of file | stream | stream, as bytes in the hex window | stream, as bytes in the hex window | stream, as bytes in the hex window |
+
+A local file is read in place by every route and never gets a stream.
 
 Why ED6 comes before W8b: PR #15's Save refuses a URL input (`media/file.rs`), and its background hash
 skips remote files. If W8b routed remote media through a Source first, remote media Save would break
@@ -1627,7 +1646,8 @@ are not disjoint, and are sequenced instead.
      - Nothing is published into the cache, so 02 §4.4's hard-link publish no longer happens for a
        streamed file.
      - The window opens a new preview session at its next remote preview. There is still at most one
-       preview session at a time; the one handed over now counts as the viewer's.
+       preview session at a time (with item 3's one exception); the one handed over now counts as
+       the viewer's, and closing that viewer closes it — it is not given back to the window.
      - 02 §4.4's placeholder `Origin` stays for a viewer that read a copy, with its preview
        connection's answers; a streamed viewer's answers yes until its first use (§2).
      - The `.preview` root goes when nothing uses it (W8b: images use it until then).
@@ -1639,8 +1659,11 @@ are not disjoint, and are sequenced instead.
        stream core. The route wraps the `Ranged` it gives the Source (`gui::streamed`): when the
        Source closes its transport, a preview's wrapper sends the connection to the window instead
        of closing it. The hand-over ends that, and the viewer's Source closes its session itself.
-     - The next preparation waits for the connection at most 2 s, then opens a session of its own;
-       a late one is closed when it comes.
+     - **The one exception to "one preview session".** The next preparation waits for the
+       connection at most 2 s, then opens a session of its own. While the slow one is still
+       shutting down there are two preview sessions, never more; the late one is closed when it
+       comes, not kept, and the window is back to one. (OpenSSH gives a session back at once:
+       the handle's close is written, not waited for, §2.)
      - Its in-flight bytes (≤ the cap) delay the next preview by at most `cap / rate`.
      - 02's rule of one preparation at a time is unchanged.
 

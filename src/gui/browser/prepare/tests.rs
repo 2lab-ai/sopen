@@ -40,6 +40,8 @@ struct Counts {
     ranged: Mutex<Vec<(String, u64, u32)>>,
     /// Bytes those reads' replies carried.
     streamed: AtomicU64,
+    /// How long a stream's transport takes to give its session back (a slow shutdown).
+    return_delay: Mutex<Duration>,
     /// Connections alive now, and the most at once.
     live: AtomicUsize,
     peak: AtomicUsize,
@@ -76,20 +78,45 @@ impl Counts {
 /// A connection that counts what is read through it. `dead`: its session is gone (every request
 /// fails).
 struct Counting {
-    /// `None` only once the session has gone to a stream ([`CountingRanged`] counts it then).
+    /// `None` only once the session has gone to a stream ([`CountingRanged`] has it then).
     inner: Option<Box<dyn RemoteFs + Send>>,
     counts: Arc<Counts>,
     dead: bool,
+    /// The session, counted alive: handed on when it becomes a stream's transport.
+    alive: Option<Alive>,
+}
+
+/// One session counted alive, from its connect until whoever has it last lets go — the
+/// connection, the transport it became, the connection that gave back: the count never dips
+/// in between.
+struct Alive(Arc<Counts>);
+
+impl Alive {
+    fn new(counts: &Arc<Counts>) -> Self {
+        let live = counts.live.fetch_add(1, Ordering::SeqCst) + 1;
+        counts.peak.fetch_max(live, Ordering::SeqCst);
+        Self(counts.clone())
+    }
+}
+
+impl Drop for Alive {
+    fn drop(&mut self) {
+        self.0.live.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 impl Counting {
     fn new(inner: Box<dyn RemoteFs + Send>, counts: &Arc<Counts>) -> Self {
-        let live = counts.live.fetch_add(1, Ordering::SeqCst) + 1;
-        counts.peak.fetch_max(live, Ordering::SeqCst);
+        Self::carried(inner, counts, Alive::new(counts))
+    }
+
+    /// A session already counted, as a connection again.
+    fn carried(inner: Box<dyn RemoteFs + Send>, counts: &Arc<Counts>, alive: Alive) -> Self {
         Self {
             inner: Some(inner),
             counts: counts.clone(),
             dead: false,
+            alive: Some(alive),
         }
     }
 
@@ -116,12 +143,6 @@ impl Counting {
             self.counts.op(op, p);
         }
         self.alive()
-    }
-}
-
-impl Drop for Counting {
-    fn drop(&mut self) {
-        self.counts.live.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -267,18 +288,19 @@ impl RemoteFs for Counting {
     ) -> std::result::Result<Box<dyn crate::remote::Ranged>, crate::remote::Refused> {
         let counts = self.counts.clone();
         let inner = self.inner.take().expect("a live session");
+        let alive = self.alive.take().expect("a live session");
         if self.dead {
             return Err(crate::remote::Refused {
-                conn: Box::new(Counting::new(inner, &counts).dead()),
+                conn: Box::new(Counting::carried(inner, &counts, alive).dead()),
                 error: anyhow!("the session was lost"),
             });
         }
         drop(self);
         counts.op("into_ranged", path);
         match inner.into_ranged(path) {
-            Ok(ranged) => Ok(CountingRanged::wrap(ranged, &counts)),
+            Ok(ranged) => Ok(CountingRanged::wrap(ranged, &counts, alive)),
             Err(refused) => Err(crate::remote::Refused {
-                conn: Box::new(Counting::new(refused.conn, &counts)),
+                conn: Box::new(Counting::carried(refused.conn, &counts, alive)),
                 error: refused.error,
             }),
         }
@@ -290,18 +312,19 @@ impl RemoteFs for Counting {
 struct CountingRanged {
     inner: Option<Box<dyn crate::remote::Ranged>>,
     counts: Arc<Counts>,
+    alive: Option<Alive>,
 }
 
 impl CountingRanged {
     fn wrap(
         inner: Box<dyn crate::remote::Ranged>,
         counts: &Arc<Counts>,
+        alive: Alive,
     ) -> Box<dyn crate::remote::Ranged> {
-        let live = counts.live.fetch_add(1, Ordering::SeqCst) + 1;
-        counts.peak.fetch_max(live, Ordering::SeqCst);
         Box::new(Self {
             inner: Some(inner),
             counts: counts.clone(),
+            alive: Some(alive),
         })
     }
 
@@ -311,12 +334,6 @@ impl CountingRanged {
 
     fn inner_mut(&mut self) -> &mut Box<dyn crate::remote::Ranged> {
         self.inner.as_mut().expect("a live transport")
-    }
-}
-
-impl Drop for CountingRanged {
-    fn drop(&mut self) {
-        self.counts.live.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -359,25 +376,34 @@ impl crate::remote::Ranged for CountingRanged {
     ) -> std::result::Result<Box<dyn crate::remote::Ranged>, crate::remote::Refused> {
         let counts = self.counts.clone();
         let inner = self.inner.take().expect("a live transport");
+        let alive = self.alive.take().expect("a live transport");
         drop(self);
         counts.op("reopen", path);
         match inner.reopen(path) {
-            Ok(ranged) => Ok(CountingRanged::wrap(ranged, &counts)),
+            Ok(ranged) => Ok(CountingRanged::wrap(ranged, &counts, alive)),
             Err(refused) => Err(crate::remote::Refused {
-                conn: Box::new(Counting::new(refused.conn, &counts)),
+                conn: Box::new(Counting::carried(refused.conn, &counts, alive)),
                 error: refused.error,
             }),
         }
     }
+    /// The session given back: after the shutdown's delay, alive throughout.
     fn into_connection(mut self: Box<Self>) -> Box<dyn RemoteFs + Send> {
-        let counts = self.counts.clone();
+        let (counts, path) = (self.counts.clone(), self.path().to_string());
+        let delay = *counts.return_delay.lock().unwrap();
+        if !delay.is_zero() {
+            std::thread::sleep(delay);
+        }
+        // The same session, counted once throughout.
         let inner = self.inner.take().expect("a live transport");
+        let alive = self.alive.take().expect("a live transport");
         drop(self);
-        counts.op("into_connection", "");
-        Box::new(Counting::new(inner.into_connection(), &counts))
+        counts.op("into_connection", &path);
+        Box::new(Counting::carried(inner.into_connection(), &counts, alive))
     }
     fn close(mut self: Box<Self>) {
-        self.counts.op("close", "");
+        let path = self.path().to_string();
+        self.counts.op("close", &path);
         if let Some(inner) = self.inner.take() {
             inner.close();
         }
@@ -1489,10 +1515,222 @@ fn w8a_a_handed_over_stream_takes_its_session_and_reads_nothing_twice() {
     assert_eq!(fx.counts.live.load(Ordering::SeqCst), 2);
     drop(p2);
     drop(handed);
-    wait_for("both streams closed", || {
-        fx.counts.live.load(Ordering::SeqCst) <= 1
+    // By transport: the handed-over viewer's was closed for good, never given back to the
+    // window; the dropped preview's was given back. (Each ends on its stream's own thread.)
+    let did_in = |ops: &[String], what: &str, path: &str| ops.contains(&format!("{what} {path}"));
+    wait_for("both streams to end", || {
+        let ops = fx.counts.ops();
+        did_in(&ops, "close", &abs) && did_in(&ops, "into_connection", &other)
     });
+    wait_for("one session left", || {
+        fx.counts.live.load(Ordering::SeqCst) == 1
+    });
+    let ops = fx.counts.ops();
+    let did = |what: &str, path: &str| did_in(&ops, what, path);
+    assert!(
+        did("close", &abs),
+        "the viewer's transport is closed: {ops:?}"
+    );
+    assert!(!did("into_connection", &abs), "and not returned: {ops:?}");
+    assert!(did("into_connection", &other), "the preview's is: {ops:?}");
+    assert!(!did("close", &other), "{ops:?}");
     assert!(fx.cache_files().is_empty());
+}
+
+/// 06 §13, the one exception to "one preview session": a dropped preview's stream whose
+/// shutdown takes longer than the next preparation waits (2 s). That preparation then opens a
+/// session of its own, so for that moment there are two — never more — and the late one is
+/// closed when it comes, not kept: the window is back to one, and the preview after it uses
+/// that one.
+#[test]
+fn w8a_a_shutdown_slower_than_the_wait_makes_two_sessions_and_the_late_one_is_closed() {
+    let Some(mut fx) = remote() else { return };
+    let a = fx.file("a.txt", b"the first\n");
+    let b = fx.file("b.txt", b"the second\n");
+    let mut drv = Driver::new(500.0, 300.0);
+    let mut p = fx.preview(&a);
+    shown(&mut drv, &mut Host(&mut p.embedded.window));
+    *fx.counts.return_delay.lock().unwrap() = BACK_WAIT + Duration::from_secs(1);
+    drop(p);
+    let waited = std::time::Instant::now();
+    let mut p = fx.preview(&b);
+    assert!(waited.elapsed() >= BACK_WAIT, "it waited for the session");
+    assert!(p.card().is_none(), "{}", card_why(&p));
+    shown(&mut drv, &mut Host(&mut p.embedded.window));
+    assert!(drv.find_text("the second").is_some());
+    assert_eq!(
+        fx.sessions.load(Ordering::SeqCst),
+        2,
+        "a session of its own"
+    );
+    assert_eq!(
+        fx.counts.peak.load(Ordering::SeqCst),
+        2,
+        "two, for a moment"
+    );
+    wait_for("the late session to be closed", || {
+        fx.counts.live.load(Ordering::SeqCst) == 1
+    });
+    assert!(fx.counts.ops().contains(&format!("into_connection {a}")));
+    // Back to one: the next preview takes the session this one gives back.
+    *fx.counts.return_delay.lock().unwrap() = Duration::ZERO;
+    drop(p);
+    let p = fx.preview(&a);
+    assert!(p.card().is_none(), "{}", card_why(&p));
+    assert_eq!(fx.sessions.load(Ordering::SeqCst), 2, "no third session");
+    assert_eq!(fx.counts.peak.load(Ordering::SeqCst), 2);
+    assert_eq!(fx.counts.live.load(Ordering::SeqCst), 1);
+}
+
+/// Text that grows past 16 MiB between its stat and its open is not shown through a capped
+/// index (06 §7.2): the handle's size decides too. As a preview it is the card, nothing of it
+/// read — and its stream gave the session back: the next preview uses it. By Enter it is
+/// fetched whole, on a connection of its own.
+#[test]
+fn w8a_text_grown_past_16_mib_between_stat_and_open_is_not_streamed() {
+    let Some(mut fx) = remote() else { return };
+    let grown = TEXT_STREAM_MAX + 1;
+    let grows_after_its_stat = |fx: &Fx, abs: &str| {
+        let (path, mut armed) = (abs.to_string(), true);
+        *fx.counts.after.lock().unwrap() = Some(Box::new(move |op, p| {
+            if op == "stat" && p == path && std::mem::take(&mut armed) {
+                let file = std::fs::File::options().write(true).open(&path).unwrap();
+                file.set_len(grown).unwrap();
+            }
+        }));
+    };
+    let abs = fx.file("grows.txt", b"small when it was stat'ed\n");
+    let other = fx.file("small.txt", b"another file\n");
+    grows_after_its_stat(&fx, &abs);
+    let p = fx.preview(&abs);
+    assert_eq!(card_why(&p), OVER_LIMIT);
+    assert!(fx.counts.ops().contains(&format!("into_ranged {abs}")));
+    assert!(stream_reads(&fx, &abs).is_empty(), "nothing of it was read");
+    assert_eq!(whole_reads(&fx), Vec::<String>::new());
+    drop(p);
+    let mut p = fx.preview(&other);
+    assert!(p.card().is_none(), "{}", card_why(&p));
+    let mut drv = Driver::new(500.0, 300.0);
+    shown(&mut drv, &mut Host(&mut p.embedded.window));
+    assert!(drv.find_text("another file").is_some());
+    assert_eq!(
+        fx.sessions.load(Ordering::SeqCst),
+        1,
+        "the rejected stream gave the preview session back"
+    );
+    assert_eq!(fx.counts.peak.load(Ordering::SeqCst), 1);
+    assert!(fx.counts.ops().contains(&format!("into_connection {abs}")));
+    drop(p);
+    // Enter on such a file: the whole fetch.
+    let abs = fx.file("grows-too.txt", b"small when it was stat'ed\n");
+    grows_after_its_stat(&fx, &abs);
+    let sessions = fx.sessions.load(Ordering::SeqCst);
+    let prepared = prepare(&fx.request(&abs), &AtomicBool::new(false), &mut |_, _| {}).unwrap();
+    let Prepared::Text { doc, claim, .. } = prepared else {
+        panic!("not the text viewer")
+    };
+    assert!(!doc.is_stream(), "not through a capped index");
+    assert_eq!(doc.size(), grown, "indexed whole");
+    assert_eq!(
+        std::fs::metadata(&claim.expect("fetched").local)
+            .unwrap()
+            .len(),
+        grown
+    );
+    assert_eq!(whole_reads(&fx), vec![format!("read_to {abs}")]);
+    assert_eq!(
+        fx.sessions.load(Ordering::SeqCst),
+        sessions + 2,
+        "the stream's connection, then the fetch's own"
+    );
+    assert!(stream_reads(&fx, &abs).is_empty());
+}
+
+/// P12 for remote text over 16 MiB, which is still read into a copy (06 §7.2, until W5b): a
+/// 17 MiB file is fetched once, into the preview's copy, which the preview indexes to 4 MiB;
+/// handed over, the copy is the cached one (claimed by its hard link: the same inode) and the
+/// index goes on through the copy's name from 4 MiB — the remote is not read again, no byte is
+/// indexed twice — and End shows the last line.
+#[test]
+fn a_handed_over_remote_text_over_16_mib_resumes_through_its_copy() {
+    let Some(mut fx) = remote() else { return };
+    let lines = 17 * 16_384;
+    let body: String = (0..lines)
+        .map(|i| format!("{i:08} {}\n", "r".repeat(54)))
+        .collect();
+    let size = body.len() as u64;
+    assert_eq!(size, 17 << 20);
+    let abs = fx.file("big.log", body.as_bytes());
+    let p = fx.preview(&abs);
+    assert!(p.card().is_none(), "{}", card_why(&p));
+    assert!(stream_reads(&fx, &abs).is_empty(), "not a stream");
+    let copy = fx.preview_copies().remove(0);
+    let indexed = |path: &Path| {
+        crate::gui::text::index_reads(path)
+            .iter()
+            .map(|r| r.1)
+            .sum::<u64>()
+    };
+    assert_eq!(indexed(&copy), 4 << 20, "the preview indexed 4 MiB");
+    let mut handed = p.hand_over().ok().expect("a viewer");
+    let hold = handed.hold.take().expect("claimed");
+    assert_eq!(
+        std::fs::metadata(&hold.local).unwrap().ino(),
+        std::fs::metadata(&copy).unwrap().ino(),
+        "published by a hard link"
+    );
+    let mut drv = Driver::new(600.0, 400.0);
+    let mut win = Host(&mut handed.embedded.window);
+    drv.until(&mut win, 30, |_| indexed(&copy) >= size);
+    shown(&mut drv, &mut win);
+    drv.key(&mut win, Key::End, command(false));
+    drv.idle(&mut win, 2);
+    assert!(drv
+        .text_starting_with(&format!("{:08} ", lines - 1))
+        .is_some());
+    let mut at = 0;
+    for (offset, n) in crate::gui::text::index_reads(&copy) {
+        assert_eq!(offset, at, "in order, nothing twice");
+        at += n;
+    }
+    assert_eq!(at, size);
+    assert_eq!(
+        *fx.counts.reads.lock().unwrap(),
+        vec![(abs.clone(), size)],
+        "one fetch"
+    );
+}
+
+/// A remote file over the read budget whose name says nothing and whose bytes are text: the
+/// sniff (at most 8 KiB) says so, text over 16 MiB does not stream, and it is the card —
+/// nothing more of its 33 MiB read, whole or by range.
+#[test]
+fn w8a_a_nameless_text_file_over_the_read_budget_is_its_card_after_the_sniff() {
+    let Some(mut fx) = remote() else { return };
+    let body = "a printable line of a file with no extension\n".repeat(1 << 20);
+    let bytes = &body.as_bytes()[..(33 << 20)];
+    let abs = fx.file("README", bytes);
+    let p = fx.preview(&abs);
+    assert_eq!(card_why(&p), OVER_LIMIT);
+    assert_eq!(
+        p.card().unwrap().kind,
+        Some(Kind::Text),
+        "the sniff said text"
+    );
+    let sniffed = fx.counts.heads.load(Ordering::Relaxed);
+    assert!(sniffed > 0 && sniffed <= 8 << 10, "{sniffed}");
+    assert_eq!(whole_reads(&fx), Vec::<String>::new());
+    assert!(
+        fx.counts.ranged.lock().unwrap().is_empty(),
+        "no stream read"
+    );
+    assert!(!fx
+        .counts
+        .ops()
+        .iter()
+        .any(|op| op.starts_with("into_ranged")));
+    assert!(fx.preview_copies().is_empty());
+    assert_eq!(fx.sessions.load(Ordering::SeqCst), 1);
 }
 
 /// Waits (at most 10 s) for what a stream's own thread does after its viewer is gone.

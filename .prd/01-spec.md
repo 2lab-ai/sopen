@@ -254,7 +254,8 @@ too, where F3 closes it as ⌘W does.
   hex window (the binary dialog's "ask first" is not needed here: the hex view is the default).
   The path is resolved first (a link opens, and saves, as the file it points at: §5). A remote
   file the hex window shows, of any size, and remote text of at most 16 MiB are viewed as a
-  stream ([06](06-streaming.md) §7.1, §7.2, §13): the viewer opens at once, shows its first
+  stream ([06](06-streaming.md) §7.1, §7.2, §13; the text viewer is the browser's alone —
+  `sopen host:/file.txt` on its own still opens the editor, §3): the viewer opens at once, shows its first
   64 KiB block when it arrives and reads on as the view moves; nothing is fetched whole and
   nothing is written to the cache. Any other remote file — an image, video, audio, and text over
   16 MiB until 06's W5b — is fetched into the cache exactly as the standalone routes fetch it
@@ -570,7 +571,8 @@ The exceptions: Enter in the path field saves there (it never opens the hex edit
 is refused the field keeps the keyboard, so the next Enter saves again); during a "Save to…" Enter
 does nothing, and Esc, Cancel or closing the window cancels it: the transfer stops between two
 responses, nothing is left behind, and the terminal says `cancelled; nothing was saved`
-(message 17, [06](06-streaming.md) §7.5). While the hex window is being opened Enter and Esc do
+(message 17, [06](06-streaming.md) §7.5). A cancel that comes once the complete file has its
+name is too late, and the save is reported as saved. While the hex window is being opened Enter and Esc do
 nothing and closing waits for it.
 
 - Hex: a remote file is opened as a stream on the dialog's own connection (message 17,

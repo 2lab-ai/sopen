@@ -246,8 +246,9 @@ bar does not have to move).
   aside or creates a session copy (01 §5's machinery is for files that are opened).
 - **A streamed preview that is dropped gives the connection back** (the bar moved on, F9, Tab, a
   cancel): its stream closes the file's handle and returns the session, and the next preparation
-  takes it — waiting for it at most 2 s, then opening one of its own. So the window still has one
-  preview session, never two.
+  takes it. So the window still has one preview session. The one exception: a session whose
+  shutdown takes over 2 s. The next preparation waits that long, then opens a session of its own —
+  two for that moment, never more — and the late one is closed when it comes (06 §13).
 - **A preview held but not drawn** (a viewer covers the panels) is told so
   (`Window::set_shown(false)`), and a streamed one does not poll its file meanwhile (06 §5).
 - **Cancel** = the preparation's stop flag (the flag Esc sets for Enter today); the worker checks it at
@@ -325,7 +326,7 @@ P1 and the final acceptance run after the text-wrap branch has landed (§4.2).
   starts only after the first worker ended (test with a slow fake worker: peak live preview workers =
   1, peak preview SFTP sessions = 1, across 20 quick moves). The same 20 moves over remote text and
   binaries, which stream: one session, never two at once — each dropped preview gave it back —
-  and nothing on disk. Sweep the bar over 50 files of every kind
+  and nothing on disk. (A shutdown slower than 2 s: two for that moment, the late one closed.) Sweep the bar over 50 files of every kind
   → no ffmpeg process outlives its preview, and the cache's mirror and session folders are unchanged.
 - P5. For each kind (text, image, video, audio, hex), previewed: real clicks (the media window's
   Play button included), drags, the wheel, `C`, `P`, Space, Cmd/Ctrl+V and typing over it → nothing

@@ -104,6 +104,8 @@ struct Seen {
     streams: Vec<String>,
     streamed: u64,
     given_back: usize,
+    /// Streams that closed their transport for good.
+    closed: usize,
 }
 
 type Shared = Arc<Mutex<Seen>>;
@@ -203,13 +205,21 @@ impl RemoteFs for Watching {
         } = *self;
         seen.lock().unwrap().streams.push(path.to_string());
         match Box::new(fs).into_ranged(path) {
-            Ok(ranged) => Ok(Box::new(WatchedStream {
-                inner: ranged,
-                seen,
-                gate,
-                hold,
-                id,
-            })),
+            Ok(ranged) => {
+                // An open stream is activity on the session, as a read under way is.
+                {
+                    let mut seen = seen.lock().unwrap();
+                    seen.live += 1;
+                    seen.peak = seen.peak.max(seen.live);
+                }
+                Ok(Box::new(WatchedStream {
+                    inner: Some(ranged),
+                    seen,
+                    gate,
+                    hold,
+                    id,
+                }))
+            }
             Err(refused) => Err(crate::remote::Refused {
                 conn: Box::new(Watching {
                     fs: LocalFs::new(),
@@ -228,43 +238,75 @@ impl RemoteFs for Watching {
 /// ([`Seen::streamed`]), and it is the same watched connection again when the stream gives it
 /// back.
 struct WatchedStream {
-    inner: Box<dyn crate::remote::Ranged>,
+    inner: Option<Box<dyn crate::remote::Ranged>>,
     seen: Shared,
     gate: Gate,
     hold: &'static str,
     id: usize,
 }
 
+impl Drop for WatchedStream {
+    fn drop(&mut self) {
+        self.seen.lock().unwrap().live -= 1;
+    }
+}
+
+impl WatchedStream {
+    fn inner(&self) -> &dyn crate::remote::Ranged {
+        self.inner.as_ref().expect("a live transport").as_ref()
+    }
+
+    fn inner_mut(&mut self) -> &mut Box<dyn crate::remote::Ranged> {
+        self.inner.as_mut().expect("a live transport")
+    }
+
+    fn into_watching(mut self) -> Watching {
+        drop(
+            self.inner
+                .take()
+                .expect("a live transport")
+                .into_connection(),
+        );
+        Watching {
+            fs: LocalFs::new(),
+            seen: self.seen.clone(),
+            gate: self.gate.clone(),
+            hold: self.hold,
+            id: self.id,
+        }
+    }
+}
+
 impl crate::remote::Ranged for WatchedStream {
     fn path(&self) -> &str {
-        self.inner.path()
+        self.inner().path()
     }
     fn opened(&self) -> Stat {
-        self.inner.opened()
+        self.inner().opened()
     }
     fn read(&mut self, off: u64, len: u32) -> crate::remote::Ticket {
-        self.inner.read(off, len)
+        self.inner_mut().read(off, len)
     }
     fn fstat(&mut self) -> crate::remote::Ticket {
-        self.inner.fstat()
+        self.inner_mut().fstat()
     }
     fn stat_path(&mut self) -> crate::remote::Ticket {
-        self.inner.stat_path()
+        self.inner_mut().stat_path()
     }
     fn pending(&self) -> usize {
-        self.inner.pending()
+        self.inner().pending()
     }
     fn next(&mut self, timeout: Option<Duration>) -> Option<crate::remote::Completion> {
-        let c = self.inner.next(timeout)?;
+        let c = self.inner_mut().next(timeout)?;
         let n = c.data().map_or(0, |b| b.len() as u64);
         self.seen.lock().unwrap().streamed += n;
         Some(c)
     }
     fn waker(&self) -> crate::remote::Wake {
-        self.inner.waker()
+        self.inner().waker()
     }
     fn now(&self) -> std::time::Instant {
-        self.inner.now()
+        self.inner().now()
     }
     fn reopen(
         self: Box<Self>,
@@ -276,20 +318,10 @@ impl crate::remote::Ranged for WatchedStream {
         self.seen.lock().unwrap().given_back += 1;
         Box::new(self.into_watching())
     }
-    fn close(self: Box<Self>) {
-        self.inner.close()
-    }
-}
-
-impl WatchedStream {
-    fn into_watching(self) -> Watching {
-        drop(self.inner.into_connection());
-        Watching {
-            fs: LocalFs::new(),
-            seen: self.seen,
-            gate: self.gate,
-            hold: self.hold,
-            id: self.id,
+    fn close(mut self: Box<Self>) {
+        self.seen.lock().unwrap().closed += 1;
+        if let Some(inner) = self.inner.take() {
+            inner.close();
         }
     }
 }
@@ -659,6 +691,70 @@ fn p6_enter_during_a_previews_read_continues_that_read_as_the_opening() {
     assert_eq!(fx.b.preview.spawned(), 1, "the same worker");
     assert!(fx.label("Exit"), "the viewer's row");
     assert_eq!(fx.drv.pictures().len(), 1, "the file's viewer");
+}
+
+/// P6 for streamed previews (06 §13): Enter on a previewed remote text file, and on a remote
+/// binary, hands the preview's own Source to the viewer. Across the Enter the window is the
+/// same one, no stream is opened, no connection is made, no byte crosses and nothing is given
+/// back: the viewer reads on what the preview had. The session went with it — closing the
+/// viewer closes that transport for good, it is not returned to the window — so the next
+/// preview opens a new preview session.
+#[test]
+fn p6_enter_on_a_streamed_preview_hands_its_source_over() {
+    for (name, shows) in [
+        ("notes.txt", "plain notes"),
+        ("data.bin", "00 01 02 03 04 05 06 07"),
+    ] {
+        let (mut fx, seen, _gate) = watched("");
+        fx.bar_on(name);
+        assert!(fx.on_right(shows), "{name}: its preview");
+        let previewed = fx.b.preview.shown_window().expect("a preview shows");
+        let state = |seen: &Shared| {
+            let seen = seen.lock().unwrap();
+            (
+                seen.connects,
+                seen.streams.clone(),
+                seen.streamed,
+                seen.given_back,
+                seen.closed,
+                seen.reads.len(),
+            )
+        };
+        let before = state(&seen);
+        assert_eq!(before.0, 1, "{name}: the preview session");
+        assert_eq!(before.1, vec![format!("{}/{name}", fx.root)]);
+        assert!(before.2 > 0, "{name}: the preview read its bytes");
+        fx.key(Key::Enter);
+        assert!(fx.b.viewer.is_some(), "{name}: the viewer is there at once");
+        fx.settle();
+        fx.drv.idle(&mut fx.b, 5);
+        assert!(fx.label("Exit"), "{name}: a viewer now, its row");
+        let viewer = fx.b.viewer.as_ref().unwrap();
+        let window = &*viewer.embedded.window as *const dyn Window as *const () as usize;
+        assert_eq!(window, previewed, "{name}: the preview's own window");
+        assert_eq!(
+            state(&seen),
+            before,
+            "{name}: no stream opened, no connection, no byte, nothing given back"
+        );
+        assert_eq!(seen.lock().unwrap().peak, 1, "{name}: one session active");
+        // The viewer closes: its transport closes with it, and is not given back.
+        fx.key(Key::Escape);
+        assert!(fx.b.viewer.is_none());
+        until("the viewer's stream to close", || {
+            seen.lock().unwrap().closed == 1
+        });
+        fx.rest();
+        let after = state(&seen);
+        assert_eq!(after.3, 0, "{name}: closed, not returned to the window");
+        assert_eq!(
+            after.0, 2,
+            "{name}: the next preview opened a new preview session"
+        );
+        assert!(files_under(&fx.cache)
+            .iter()
+            .all(|f| f.starts_with(".preview")));
+    }
 }
 
 /// P7 and 04 K-R1: F9 switches to dual mode at once — both sides lists, slot 9 `Prevw` — and

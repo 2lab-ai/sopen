@@ -1,9 +1,11 @@
 //! Binary files (spec §6a): a file sopen has no window for (a zip, any binary) opens a small
 //! dialog first — from the stat alone, nothing downloaded yet — that offers the hex window (the
 //! default, Enter) or "Save to…" a chosen path; Esc or closing it downloads nothing. Choosing hex
-//! fetches into the cache with the progress in the dialog, then the same window becomes the hex
-//! window. Choosing save downloads straight to the chosen path, created exclusively: an existing
-//! file is never replaced — the dialog says so and offers the next free `<stem>-N<ext>`.
+//! opens a remote file as a stream on the dialog's connection (06 §7.5: nothing is fetched), and
+//! the same window becomes the hex window; a local file is read in place. Choosing save downloads
+//! straight to the chosen path, created exclusively: an existing file is never replaced — the
+//! dialog says so and offers the next free `<stem>-N<ext>` — and Esc, Cancel or closing the
+//! window cancels it, leaving nothing ([`Decision`]).
 //!
 //! [`open_file`] is the whole route main takes for such a file — the dialog, `--hex`, the
 //! `SOPEN_CHOICE` answers, no display — over [`FileSource`], which carries the answers out on the
@@ -23,7 +25,7 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
@@ -548,6 +550,20 @@ pub(super) fn save_new_with(
     fill: impl FnOnce(&mut File) -> Result<u64>,
     link: &mut dyn FnMut(LinkStep, &Path) -> std::io::Result<()>,
 ) -> std::result::Result<SavedTo, SaveError> {
+    save_new_deciding(dest, fill, link, &Decision::default())
+}
+
+/// [`save_new_with`] for a save that can be cancelled: `decision` is asked once, right before
+/// the complete file gets its name — after the fill, its sync and its mode, and after `link`'s
+/// stand-in for that step. Cancelled by then, nothing is published: the part and the private
+/// folder are removed and the error is [`Cancelled`](crate::remote::Cancelled). Otherwise the
+/// publish has won, and a cancel coming later is refused ([`Decision::cancel`]).
+pub(super) fn save_new_deciding(
+    dest: &Path,
+    fill: impl FnOnce(&mut File) -> Result<u64>,
+    link: &mut dyn FnMut(LinkStep, &Path) -> std::io::Result<()>,
+    decision: &Decision,
+) -> std::result::Result<SavedTo, SaveError> {
     let nothing = |e: anyhow::Error| {
         SaveError::Failed(e.context(format!(
             "{} was not saved; nothing was transferred",
@@ -648,7 +664,13 @@ pub(super) fn save_new_with(
         }
     };
     drop(file);
-    match link(LinkStep::Publish, &staging.shown).and_then(|()| staging.link(Some(&cname))) {
+    let stood_in = link(LinkStep::Publish, &staging.shown);
+    // The one decision (06 §7.5): the complete file gets its name now, or the cancel won.
+    if stood_in.is_ok() && !decision.publish() {
+        let e = anyhow!(crate::remote::Cancelled);
+        return Err(SaveError::Failed(give_up(&mut staging, e)));
+    }
+    match stood_in.and_then(|()| staging.link(Some(&cname))) {
         Ok(()) => Ok(SavedTo {
             bytes,
             notes: staging.clean().into_iter().collect(),
@@ -671,16 +693,56 @@ pub(super) fn save_new_with(
     }
 }
 
-/// What a transfer writes through until `stop` is set: from then on every write fails, which
-/// ends the read feeding it at its next response (06 §7.5: between chunks).
+/// Whether a "Save to…" is cancelled or published (06 §7.5): decided once, at one point. A
+/// cancel wins until the moment right before the complete file gets its name; from then on the
+/// publish has won, the cancel is refused, and the save is reported as saved. So what the
+/// owner is told is always what happened: `cancelled; nothing was saved` never comes with a
+/// file under the name, and a file under the name is never called cancelled.
+#[derive(Debug, Default)]
+pub struct Decision(std::sync::atomic::AtomicU8);
+
+impl Decision {
+    const OPEN: u8 = 0;
+    const CANCELLED: u8 = 1;
+    const PUBLISHING: u8 = 2;
+
+    /// Cancels the save, unless it is being published already: whether the cancel won.
+    pub fn cancel(&self) -> bool {
+        self.settle(Self::CANCELLED)
+    }
+
+    /// The save was cancelled (looked at between chunks, to stop the transfer early).
+    pub fn cancelled(&self) -> bool {
+        self.0.load(Ordering::SeqCst) == Self::CANCELLED
+    }
+
+    /// The complete file is about to get its name, unless the save was cancelled: whether
+    /// the publish won.
+    fn publish(&self) -> bool {
+        self.settle(Self::PUBLISHING)
+    }
+
+    fn settle(&self, to: u8) -> bool {
+        match self
+            .0
+            .compare_exchange(Self::OPEN, to, Ordering::SeqCst, Ordering::SeqCst)
+        {
+            Ok(_) => true,
+            Err(now) => now == to,
+        }
+    }
+}
+
+/// What a transfer writes through until `stop` is cancelled: from then on every write fails,
+/// which ends the read feeding it at its next response (06 §7.5: between chunks).
 struct Stopping<'a, W> {
     inner: W,
-    stop: &'a AtomicBool,
+    stop: &'a Decision,
 }
 
 impl<W: Write> Write for Stopping<'_, W> {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        if self.stop.load(Ordering::Relaxed) {
+        if self.stop.cancelled() {
             return Err(std::io::Error::other("cancelled"));
         }
         self.inner.write(buf)
@@ -707,13 +769,13 @@ pub fn download_to(
     abs: &str,
     dest: &Path,
     progress: &mut dyn FnMut(u64, u64),
-    cancel: &AtomicBool,
+    cancel: &Decision,
 ) -> std::result::Result<SavedTo, SaveError> {
     let before = fs.stat(abs).map_err(SaveError::Failed)?;
     if before.is_dir {
         return Err(SaveError::Failed(anyhow!("{abs} is a directory")));
     }
-    save_new(dest, |file| {
+    let filled = |file: &mut File| {
         let mut out = Stopping {
             inner: std::io::BufWriter::with_capacity(1 << 20, &mut *file),
             stop: cancel,
@@ -721,7 +783,7 @@ pub fn download_to(
         let read = fs
             .read_to(abs, &mut out, &mut |done| progress(done, before.size))
             .and_then(|n| out.flush().map(|()| n).map_err(anyhow::Error::from));
-        if cancel.load(Ordering::Relaxed) {
+        if cancel.cancelled() {
             return Err(anyhow!(crate::remote::Cancelled));
         }
         let n = read?;
@@ -732,7 +794,8 @@ pub fn download_to(
             bail!("{abs} changed while it was downloaded; try again when it is quiet");
         }
         Ok(n)
-    })
+    };
+    save_new_deciding(dest, filled, &mut |_, _| Ok(()), cancel)
 }
 
 /// What a file's handle says about its bytes: size, mtime, change time.
@@ -750,7 +813,7 @@ pub fn copy_to(
     src: &Path,
     dest: &Path,
     progress: &mut dyn FnMut(u64, u64),
-    cancel: &AtomicBool,
+    cancel: &Decision,
 ) -> std::result::Result<SavedTo, SaveError> {
     let failed = |e: anyhow::Error| SaveError::Failed(e);
     let mut input = File::open(src)
@@ -759,7 +822,7 @@ pub fn copy_to(
     let before = handle_stamp(&input)
         .with_context(|| format!("cannot stat {}", src.display()))
         .map_err(failed)?;
-    save_new(dest, |file| {
+    let filled = |file: &mut File| {
         let mut buf = vec![0u8; 1 << 20];
         let mut done = 0u64;
         loop {
@@ -769,7 +832,7 @@ pub fn copy_to(
             if n == 0 {
                 break;
             }
-            if cancel.load(Ordering::Relaxed) {
+            if cancel.cancelled() {
                 return Err(anyhow!(crate::remote::Cancelled));
             }
             file.write_all(&buf[..n])?;
@@ -787,14 +850,16 @@ pub fn copy_to(
             );
         }
         Ok(done)
-    })
+    };
+    save_new_deciding(dest, filled, &mut |_, _| Ok(()), cancel)
 }
 
 // ---------------------------------------------------------------------------------------------
 // Carrying the answers out.
 
-/// What the hex window opens: the file made local, where earlier copies' unsaved edits went,
-/// and how long a fetch took (`None`: nothing was fetched).
+/// What the hex window opens: the file — a remote one as a stream, a local one read in place,
+/// or the cached copy already there — what must be said whole in its rows, and how long a
+/// fetch took (`None`: nothing was fetched, which is every open the production source makes).
 pub struct Opened {
     pub file: HexFile,
     pub notices: Vec<String>,
@@ -805,7 +870,8 @@ pub struct Opened {
 /// runs on a worker thread; `progress` gets `(bytes done, total)`. A failure leaves the source
 /// as it was: the owner may try again, or choose the other answer.
 pub trait Source: Send {
-    /// Hex: the file made local (fetched into the cache, or the local file itself).
+    /// Hex: the file ready for the hex window — a remote one opened as a stream (06 §7.5:
+    /// nothing fetched), a local one in place. A failure leaves the source as it was.
     fn open_hex(&mut self, progress: &mut dyn FnMut(u64, u64)) -> Result<Opened>;
     /// Save: the file's bytes in a new file at `dest` ([`save_new`]). `cancel` stops it
     /// between chunks (06 §7.5): nothing is saved, and the source is as it was.
@@ -813,7 +879,7 @@ pub trait Source: Send {
         &mut self,
         dest: &Path,
         progress: &mut dyn FnMut(u64, u64),
-        cancel: &AtomicBool,
+        cancel: &Decision,
     ) -> std::result::Result<SavedTo, SaveError>;
 }
 
@@ -986,7 +1052,7 @@ impl Source for FileSource {
         &mut self,
         dest: &Path,
         progress: &mut dyn FnMut(u64, u64),
-        cancel: &AtomicBool,
+        cancel: &Decision,
     ) -> std::result::Result<SavedTo, SaveError> {
         if let Some(fetched) = &self.fetched {
             return copy_to(&fetched.claim.local, dest, progress, cancel);
@@ -1197,7 +1263,7 @@ pub fn save_without_window(
         dest
     };
     // Without a window nothing cancels it but ending the run.
-    match source.save_to(&dest, progress, &AtomicBool::new(false)) {
+    match source.save_to(&dest, progress, &Decision::default()) {
         Ok(saved) => Ok((dest, saved)),
         Err(SaveError::Exists { next }) => bail!(
             "{} exists; not replaced (the next free name is {})",
@@ -1311,7 +1377,7 @@ enum Stage {
         dest: Option<PathBuf>,
         done: Arc<AtomicU64>,
         total: Arc<AtomicU64>,
-        cancel: Arc<AtomicBool>,
+        cancel: Arc<Decision>,
         rx: Receiver<Landed>,
     },
     /// Saved: the line stays a moment, then the window closes — unless there are notes to read.
@@ -1472,7 +1538,7 @@ impl BinaryWindow {
         let (done, total) = (Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)));
         let (tx, rx) = mpsc::channel();
         let (d, t, ctx2, to) = (done.clone(), total.clone(), ctx.clone(), dest.clone());
-        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel = Arc::new(Decision::default());
         let stop = cancel.clone();
         std::thread::spawn(move || {
             let result = source.save_to(
@@ -1731,7 +1797,7 @@ impl BinaryWindow {
                 .on_hover_text("Esc");
             if cancel.clicked() {
                 match saving {
-                    Some(stop) => stop.store(true, Ordering::Relaxed),
+                    Some(stop) => drop(stop.cancel()),
                     None => self.close(&ctx),
                 }
             }
@@ -1821,7 +1887,7 @@ impl BinaryWindow {
         } = &self.stage
         {
             if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Escape)) {
-                cancel.store(true, Ordering::Relaxed);
+                cancel.cancel();
             }
         }
         // Keys while asking: Enter in the path field saves; Enter with nothing focused opens
@@ -1959,7 +2025,7 @@ impl Window for BinaryWindow {
                 // A "Save to…" is cancelled (06 §7.5): it stops between chunks and leaves
                 // nothing, then the window closes. Opening the hex window is waited for.
                 if dest.is_some() {
-                    cancel.store(true, Ordering::Relaxed);
+                    cancel.cancel();
                 }
                 self.close_when_done = true;
                 false

@@ -21,9 +21,30 @@ use std::time::{Duration, Instant};
 /// The bytes every stream of this run has received.
 static FETCHED: AtomicU64 = AtomicU64::new(0);
 
-/// 06 §11's `bytes_fetched`: the bytes every `Source` of the run received from its remote.
+/// 06 §11's `bytes_fetched`: the bytes every `Source` of the run received from its remote —
+/// every byte of every read reply that arrived, whether or not the `Source` still wanted it
+/// (a reply to a read asked before a reload arrives and is counted; one that never arrives
+/// is not).
 pub fn bytes_fetched() -> u64 {
     FETCHED.load(Ordering::Relaxed)
+}
+
+/// Where a transport counts what it receives: the run's count, or a test's own.
+#[derive(Clone)]
+enum Count {
+    Run,
+    #[cfg(test)]
+    Own(Arc<AtomicU64>),
+}
+
+impl Count {
+    fn add(&self, n: u64) {
+        match self {
+            Count::Run => FETCHED.fetch_add(n, Ordering::Relaxed),
+            #[cfg(test)]
+            Count::Own(count) => count.fetch_add(n, Ordering::Relaxed),
+        };
+    }
 }
 
 /// Where a preview's stream gives its connection back when it closes: the window's preview
@@ -108,11 +129,20 @@ pub fn open(
 struct Routed {
     inner: Box<dyn Ranged>,
     lease: Option<Lease>,
+    count: Count,
 }
 
 impl Routed {
     fn wrap(inner: Box<dyn Ranged>, lease: Option<Lease>) -> Box<dyn Ranged> {
-        Box::new(Self { inner, lease })
+        Self::counting(inner, lease, Count::Run)
+    }
+
+    fn counting(inner: Box<dyn Ranged>, lease: Option<Lease>, count: Count) -> Box<dyn Ranged> {
+        Box::new(Self {
+            inner,
+            lease,
+            count,
+        })
     }
 }
 
@@ -144,7 +174,7 @@ impl Ranged for Routed {
     fn next(&mut self, timeout: Option<Duration>) -> Option<Completion> {
         let c = self.inner.next(timeout)?;
         if let Some(data) = c.data() {
-            FETCHED.fetch_add(data.len() as u64, Ordering::Relaxed);
+            self.count.add(data.len() as u64);
         }
         Some(c)
     }
@@ -158,8 +188,8 @@ impl Ranged for Routed {
     }
 
     fn reopen(self: Box<Self>, path: &str) -> Result<Box<dyn Ranged>, Refused> {
-        let lease = self.lease;
-        Ok(Self::wrap(self.inner.reopen(path)?, lease))
+        let (lease, count) = (self.lease, self.count);
+        Ok(Self::counting(self.inner.reopen(path)?, lease, count))
     }
 
     fn into_connection(self: Box<Self>) -> Box<dyn RemoteFs + Send> {
@@ -237,6 +267,69 @@ mod tests {
             "{} counted for {fetched} fetched",
             bytes_fetched() - before
         );
+    }
+
+    /// 06 §11, exactly, on a count of the test's own (not the run's, which every test of the
+    /// process shares): what the route's transport counts is what the transport under it
+    /// delivered — byte for byte, by the fixture's meter below it — through a reload asked
+    /// while a read's reply was still on its way, and the reads after it. The `Source`'s own
+    /// `fetched` can be less (it drops a reply of the version before unread), never more.
+    #[test]
+    fn the_count_is_exactly_what_arrived_through_a_reload_with_a_reply_outstanding() {
+        use crate::gui::testkit::Meter;
+        use crate::remote::{fake, FakeFile, Link};
+        use crate::stream::{Settings, Source};
+        use std::task::Poll;
+
+        let (transport, _control) = fake("/m.bin", FakeFile::pattern(4 << 20), Link::gate());
+        let meter = Meter::new(u64::MAX, 0);
+        let own = Arc::new(AtomicU64::new(0));
+        let routed = Routed::counting(meter.transport(transport), None, Count::Own(own.clone()));
+        let opening = Opening {
+            label: "box:/m.bin".into(),
+            began: Instant::now(),
+            sniff: 0,
+        };
+        let reopen: Reopen = Box::new(|| Err(anyhow!("no second connection in this test")));
+        let (source, mut engine) =
+            Source::build(routed, reopen, Arc::new(|| {}), opening, Settings::plain());
+        let settle = |engine: &mut crate::stream::Engine| {
+            for _ in 0..10_000 {
+                engine.pump();
+                if engine.transport().map_or(0, |r| r.pending()) == 0 {
+                    return;
+                }
+                engine.step(None);
+            }
+            panic!("the stream did not settle");
+        };
+        let counted = || own.load(Ordering::Relaxed);
+        let arrived = || meter.stream_bytes.load(Ordering::SeqCst);
+        // A first block, read whole.
+        let mut reader = source.reader(ReaderKind::Interactive);
+        assert!(reader.try_read(0, 16).is_pending());
+        settle(&mut engine);
+        assert!(matches!(reader.try_read(0, 16), Poll::Ready(Ok(_))));
+        assert_eq!((counted(), arrived()), (BLOCK, BLOCK));
+        // A read is sent; the reload is asked with its reply outstanding.
+        assert!(reader.try_read(2 << 20, 16).is_pending());
+        engine.pump();
+        assert!(
+            engine.transport().is_some_and(|r| r.pending() > 0),
+            "a reply is on its way"
+        );
+        source.request_reload();
+        settle(&mut engine);
+        assert_eq!(counted(), arrived(), "through the reload");
+        // The version after it, read on.
+        reader.renew();
+        assert!(reader.try_read(3 << 20, 16).is_pending());
+        settle(&mut engine);
+        assert!(matches!(reader.try_read(3 << 20, 16), Poll::Ready(Ok(_))));
+        assert_eq!(counted(), arrived(), "and after it");
+        assert!(counted() >= 2 * BLOCK, "{}", counted());
+        assert!(source.fetched().total <= counted());
+        assert_eq!(meter.returned.lock().unwrap().len(), 1, "one re-open");
     }
 
     /// 06 §13: a preview's stream gives its connection back when it closes — the session is
