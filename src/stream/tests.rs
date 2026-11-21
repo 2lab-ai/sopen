@@ -1118,9 +1118,9 @@ fn v7_a_change_while_nothing_is_read_is_seen_by_the_poll() {
 }
 
 /// V7's generations, fed to the Source directly — on the Fake a fence sent after a change can
-/// never match again, so only this shows the generation is what drops them: completions sent
-/// before a detected change are dropped unread even when their fence returns the fingerprint,
-/// and a late error does not turn `Changed` into `Failed`.
+/// never match again, so only this shows it: completions sent before a detected change are
+/// dropped unread even when their fence returns the fingerprint, and a late error does not
+/// turn `Changed` into `Failed`.
 #[test]
 fn v7_completions_of_an_older_generation_are_dropped_unread() {
     let mut rig = rig(MODEL, Link::gate());
@@ -2158,6 +2158,288 @@ fn the_rigs_stream_refuses_a_short_read() {
     let mut r = rig.reader(ReaderKind::Interactive);
     // The last read ends past the file: it comes back 100 bytes long.
     rig.stream_exact(&mut r, MIB - 580, 480, 2);
+}
+
+// ---- review round 2 ----
+
+/// V8's boundary: a reconnect that saw the Source open and went to the network is an operation
+/// under way. A close then does not wait for it; when it returns, what it opened is closed
+/// unused — no read, no fence, no poll — and the engine ends. Both ways to the network: a
+/// retry's new connection, and a reload's re-open on the connection it has.
+#[test]
+fn v8_a_close_after_the_reconnect_guard_closes_what_it_opened_unused() {
+    for reload in [false, true] {
+        let mut rig = rig(MIB, Link::gate());
+        let mut r = rig.reader(ReaderKind::Interactive);
+        if reload {
+            rig.read(&mut r, 1000, 480);
+            rig.drain();
+            rig.source().request_reload();
+        } else {
+            rig.control.fault(0, Fault::Lost);
+            assert!(r.try_read(1000, 480).is_pending());
+            rig.drain();
+            assert!(matches!(r.try_read(1000, 480), Poll::Ready(Err(_))));
+        }
+        let n = rig.sent().len();
+        let closing = Arc::new(Mutex::new(rig.source.take()));
+        let closed = Arc::new(AtomicBool::new(false));
+        let returned = closed.clone();
+        rig.engine.at_reopen = Some(Box::new(move || {
+            // The last handle drops here, past the guard — and returns, the reconnect still
+            // to come.
+            drop(closing.lock().unwrap().take());
+            returned.store(true, Ordering::SeqCst);
+        }));
+        assert!(matches!(rig.engine.pump(), Flow::Closed), "the engine ends");
+        assert!(
+            closed.load(Ordering::SeqCst),
+            "the close returned inside the hook"
+        );
+        assert_eq!(
+            rig.reopens(),
+            if reload { 0 } else { 1 },
+            "the open under way happened, and no other"
+        );
+        assert_eq!(rig.sent().len(), n, "nothing was requested on it");
+        assert!(rig.engine.transport().is_none(), "and it was closed");
+        assert_eq!(
+            r.try_read(1000, 480),
+            Poll::Ready(Err(ReadError::Closed)),
+            "the Source stays closed (reload: {reload})"
+        );
+        assert!(matches!(rig.engine.pump(), Flow::Closed));
+        assert_eq!(rig.sent().len(), n);
+    }
+}
+
+/// Two callers blocked in `reload()`, the second asking while the first is in progress: each
+/// gets its own result. The first finds the path gone and fails; the path is back for the
+/// second, which succeeds.
+#[test]
+fn overlapping_blocking_reloads_each_get_their_own_result() {
+    let mut rig = rig(MIB, Link::gate());
+    rig.control.change(Change::Remove);
+    let (first_tx, first) = mpsc::channel();
+    let (second_tx, second) = mpsc::channel();
+    let caller = rig.source().clone();
+    let a = std::thread::spawn(move || {
+        let _ = first_tx.send(caller.reload().map_err(|e| format!("{e:#}")));
+    });
+    eventually("the first reload is queued", || {
+        rig.source().core().reloads_queued() == 1
+    });
+    let (watched, control) = (rig.source().clone(), rig.control.clone());
+    let mut calls = 0;
+    let mut second_tx = Some(second_tx);
+    rig.engine.at_handoff = Some(Box::new(move || {
+        calls += 1;
+        if calls == 1 {
+            // The first reload is in progress: the second caller asks now.
+            let (caller, tx) = (watched.clone(), second_tx.take().unwrap());
+            std::thread::spawn(move || {
+                let _ = tx.send(caller.reload().map_err(|e| format!("{e:#}")));
+            });
+            eventually("the second reload is queued", || {
+                watched.core().reloads_queued() == 1
+            });
+        } else {
+            control.change(Change::Replace(FakeFile::bytes(vec![9; 5000])));
+        }
+    }));
+    let (mut one, mut two) = (None, None);
+    eventually("both reloads return", || {
+        rig.engine.pump();
+        one = one.take().or_else(|| first.try_recv().ok());
+        two = two.take().or_else(|| second.try_recv().ok());
+        one.is_some() && two.is_some()
+    });
+    a.join().unwrap();
+    let failed = one.unwrap().unwrap_err();
+    assert!(
+        failed.contains("no such file"),
+        "the first caller's own: {failed}"
+    );
+    assert_eq!(two, Some(Ok(())), "the second caller's own");
+    assert_eq!((rig.state(), rig.source().size()), (State::Live, 5000));
+}
+
+/// An interrupt that lands between a blocked `read_at`'s cancel check and its wait is not
+/// lost: the flag is looked at again under the lock the wait releases, and `interrupt`
+/// notifies under that lock. The wait here would last 60 s, so ending on its timeout cannot
+/// pass for having heard the interrupt.
+#[test]
+fn an_interrupt_between_the_cancel_check_and_the_wait_is_not_lost() {
+    let rig = rig(MIB, Link::gate());
+    let cancel = Arc::new(AtomicBool::new(false));
+    let (flag, interrupter) = (cancel.clone(), rig.source().clone());
+    {
+        let mut probe = rig.source().probe();
+        probe.wait = Some(Duration::from_secs(60));
+        probe.seam = Some(Box::new(move || {
+            flag.store(true, Ordering::SeqCst);
+            interrupter.interrupt();
+        }));
+    }
+    let mut r = rig.reader(ReaderKind::Bulk);
+    let flag = cancel.clone();
+    // The engine is never stepped: the block never comes.
+    let got = bounded("the interrupted read", move || {
+        r.read_at(0, &mut [0; 64], &flag)
+    });
+    assert_eq!(got, Err(ReadError::Cancelled));
+    let probe = rig.source().probe();
+    assert!(probe.seam.is_none(), "the seam ran");
+    assert_eq!(
+        probe.timed_out, 0,
+        "it ended on a timeout: the interrupt was lost"
+    );
+}
+
+/// 06 §4 and V4 under cache pressure: older Bulk waits take what Bulk may hold, and a
+/// foreground miss that comes after them is still the next thing sent — no Bulk read goes
+/// while it waits. Bulk holds at most the cache less one maximum read.
+#[test]
+fn a_foreground_miss_is_served_while_bulk_waits_fill_what_they_may_hold() {
+    let mut rig = rig(MODEL, sim(20, 500_000));
+    let place = |i: u64| (i + 1) * GIB;
+    let mut passes: Vec<Reader> = (0..4).map(|_| rig.reader(ReaderKind::Bulk)).collect();
+    for (i, pass) in passes.iter_mut().enumerate() {
+        assert!(pass.try_read(place(i as u64), MAX_READ).is_pending());
+    }
+    rig.engine.pump();
+    assert!(!rig.room(), "bulk reads fill the cap");
+    let n = rig.trace().len();
+    let mut viewer = rig.reader(ReaderKind::Interactive);
+    let at = 20 * GIB + 1000;
+    assert!(viewer.try_read(at, 480).is_pending());
+    let got = rig.read(&mut viewer, at, 480);
+    assert!(got[..] == pattern(at, 480)[..]);
+    let trace = rig.trace();
+    let first = trace[n..].iter().position(|t| t.class.is_some()).unwrap() + n;
+    assert_eq!(
+        (trace[first].class, trace[first].block),
+        (Some(Class::Demand), Some(at / BLOCK)),
+        "the next read sent is the foreground miss"
+    );
+    assert_eq!(rig.sent()[first + 1].asked, Asked::Fstat);
+    // With nobody reading, three passes of 256 blocks are all Bulk may hold: the fourth's
+    // blocks are not asked for.
+    rig.drain();
+    let fourth = place(3) / BLOCK;
+    assert!(
+        rig.trace().iter().all(|t| t.block != Some(fourth)),
+        "a fourth pass was served beside three that hold all Bulk may"
+    );
+    assert_eq!(rig.source().core().cache.len(), 3 * 256 + 1);
+    rig.check_admission();
+}
+
+/// The first four completions of a short prefetch whose fence fails, with its rest already
+/// sent: requests 0 the screen's block (short), 1 its fence, 2 block 3 as prefetch (short),
+/// 3 its fence — which fails — 4 the screen's rest, 5 that fence, 6 block 3's rest, 7 the
+/// rest's fence. Leaves completions 0–3 applied.
+fn abandoned_remainder(rest: Option<Fault>) -> (Rig, Reader) {
+    let mut rig = rig_with(FakeFile::pattern(MODEL), clipped(40_000), NEVER, None);
+    let mut r = rig.reader(ReaderKind::Interactive);
+    rig.control.fault(3, Fault::Status("Failure"));
+    if let Some(fault) = rest {
+        rig.control.fault(6, fault);
+    }
+    assert!(r.try_read(3 * BLOCK - 480, 480).is_pending());
+    for _ in 0..4 {
+        rig.one();
+    }
+    assert_eq!(rig.sent().len(), 8, "block 3's rest is out");
+    assert_eq!(rig.state(), State::Live);
+    (rig, r)
+}
+
+/// A reply of a fetch given up is dropped before it is read: while a reader waits for a new
+/// fetch of the block, the old remainder coming back as an error does not fail the Source,
+/// coming back empty does not mark it `Changed`, and coming back with bytes adds nothing to
+/// the new fetch.
+#[test]
+fn a_stale_remainder_reply_is_dropped_before_it_is_read() {
+    let at = 3 * BLOCK + 1000;
+    for case in ["error", "empty", "bytes"] {
+        let fault = (case == "error").then_some(Fault::Status("Failure"));
+        let (mut rig, _r) = abandoned_remainder(fault);
+        let mut other = rig.reader(ReaderKind::Interactive);
+        assert!(other.try_read(at, 100).is_pending());
+        rig.engine.pump();
+        assert_eq!(
+            rig.sent()[8].asked,
+            read_of(3),
+            "a new fetch, from its start"
+        );
+        if case == "empty" {
+            // The old remainder answered with no bytes (fed directly: on the Fake only a
+            // real cut gives that, and a real cut is a change).
+            let old = rig.sent()[6];
+            let now = rig.engine.transport().unwrap().now();
+            rig.source().core().apply(Completion {
+                ticket: old.ticket,
+                asked: old.asked,
+                reply: Ok(Reply::Data(bytes::Bytes::new())),
+                took: Duration::from_millis(30),
+                at: now,
+            });
+            assert_eq!(rig.state(), State::Live, "not Changed");
+        }
+        let got = rig.read(&mut other, at, 100);
+        assert!(got[..] == pattern(at, 100)[..], "{case}");
+        rig.drain();
+        assert_eq!(rig.state(), State::Live, "{case}");
+        let whole = rig.read(&mut other, 3 * BLOCK, BLOCK as usize);
+        assert!(
+            whole[..] == pattern(3 * BLOCK, BLOCK as usize)[..],
+            "{case}"
+        );
+        let fetches = rig.sent().iter().filter(|s| s.asked == read_of(3)).count();
+        assert_eq!(fetches, 2, "the one given up and the new one ({case})");
+    }
+}
+
+/// The fence fails while the block's rest is queued and not sent: the rest is never sent.
+#[test]
+fn a_queued_remainder_of_a_failed_fence_is_never_sent() {
+    let mut rig = rig_with(FakeFile::pattern(MODEL), clipped(40_000), NEVER, None);
+    let mut r = rig.reader(ReaderKind::Interactive);
+    rig.control.fault(3, Fault::Status("Failure"));
+    let at = 3 * BLOCK - 480;
+    assert!(r.try_read(at, 480).is_pending());
+    rig.engine.pump();
+    assert_eq!(rig.sent().len(), 4);
+    // The four replies with no turn of the engine between them: nothing more is sent.
+    for i in 0..4 {
+        // A wake left over from the read ends a wait early: until the reply.
+        let c = (0..1000)
+            .find_map(|_| rig.engine.transport().unwrap().next(None))
+            .expect("a reply");
+        rig.source().core().apply(c);
+        if i == 2 {
+            assert!(rig.source().core().pf.rest_queued(3), "the rest is queued");
+        }
+    }
+    assert!(
+        !rig.source().core().pf.rest_queued(3),
+        "and dropped with its fetch"
+    );
+    let got = rig.read(&mut r, at, 480);
+    assert!(got[..] == pattern(at, 480)[..]);
+    rig.drain();
+    let rest = Asked::Read {
+        off: 3 * BLOCK + 40_000,
+        len: (BLOCK - 40_000) as u32,
+    };
+    assert!(
+        rig.sent().iter().all(|s| s.asked != rest),
+        "the rest was sent"
+    );
+    assert!(!rig.source().core().cache.contains(3));
+    assert_eq!(rig.source().core().held(), (0, 0));
+    assert_eq!(rig.state(), State::Live);
 }
 
 // ---- the cache under a Source ----

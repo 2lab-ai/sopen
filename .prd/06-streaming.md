@@ -150,8 +150,11 @@ The first two paragraphs are this document. The third is 07.
     `behind` are scaled down to an equal share of that 48 MiB, but never below a floor of 256 KiB
     ahead and 64 KiB behind.
   - A block a reader is waiting for is held until that reader has read it, and is never
-    evicted. So the waits served at one time are the oldest whose blocks fit the cache together;
-    a wait beyond that is served once an older one has been read. One read asks at most 16 MiB.
+    evicted. So the waits served at one time are those whose blocks fit the cache together, in
+    the queue's order (§4): foreground waits first, then Bulk's, oldest first within each. Bulk
+    waits hold at most the cache less one maximum read (768 blocks), so a foreground wait always
+    has room beside them. A wait beyond that is served once one before it has been read. One read
+    asks at most 16 MiB.
 - **Bulk readers insert at the cold end.** Their blocks are the next to go, so a pass over the whole
   file (an index pass, the waveform, Save As) does not evict what the screen or playback needs.
 - **No disk spill in v1.** The measured patterns fit in 64 MiB: open + 10 s of play + a far seek
@@ -293,7 +296,10 @@ is the limit below, for the poll.
 
 **A detected change invalidates what is in flight.** Every request carries the Source's generation,
 which a change or a reload increments. A completion of an older generation is dropped unread, so
-nothing sent before the change can refill the cleared cache.
+nothing sent before the change can refill the cleared cache. The attempt id of a block's fetch
+does the same within a generation: a reply whose fetch was given up (its fence failed) is
+dropped before it is read, so its error, its emptiness or its bytes cannot touch the fetch that
+replaced it.
 
 | State | Meaning | What the viewer does |
 |---|---|---|
@@ -311,6 +317,10 @@ nothing sent before the change can refill the cleared cache.
 - **Retry** reconnects through the viewer's existing `Reconnect` (`src/gui/mod.rs:34`), re-opens and
   `fstat`s. The same `(size, mtime)` gives `Live` and the cache is kept; anything else is `Changed`.
   SFTP v3 attributes carry no inode, so after a reconnect only `(size, mtime)` can be compared.
+- **A close during a retry or a reload.** One not yet at the network opens nothing. One already
+  there is an operation under way: the close does not wait for it, and when it returns, what it
+  opened is closed at once, unused. So nothing is requested after the close, except the open of a
+  reconnect already under way, which is closed on return unused.
 - **sopen's own writes are not changes.** When one of sopen's own writes to the file lands (07's
   Save, or §7.1's interim Save), the window reloads its Source at once. The new fingerprint must
   equal the write's own baseline: the staged temp's stat (01 §5), or for 07's write in place the
@@ -953,7 +963,8 @@ stream <event> t=<ms> <host:/abs> fetched=<b> demand=<b> prefetch=<b> bulk=<b> d
   - The one documented gap: a same-size write within the same second as the file's mtime is not
     seen (V7 pins that the `Fake` shows it as unchanged, so the limit stays stated, not hidden).
 - **V8. Close during prefetch.** Close a window while 4 MiB of prefetch is in flight. The window goes
-  at once, and on the `Fake` nothing is requested after the close. Qualification: the process exits
+  at once, and on the `Fake` nothing is requested after the close, except the open of a reconnect
+  already under way, which is closed on return unused (§5). Qualification: the process exits
   within 5 s.
 - **V9. Lost connection.** Kill the transport while scrolling (the `Fake`'s channel closes; live, the
   ssh master is killed).

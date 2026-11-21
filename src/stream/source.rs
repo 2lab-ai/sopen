@@ -7,7 +7,8 @@
 //! fence. A block enters the cache only when all of it has arrived and the fence behind its
 //! last part returned the fingerprint taken at open. Every request carries the generation it
 //! was sent in; a change, a failure or a reload starts a new one, and a completion of an older
-//! one is dropped unread.
+//! one is dropped unread. Each fetch of a block carries an attempt id besides, which does the
+//! same for a fetch given up within a generation (its fence failed).
 
 use super::cache::{BlockCache, BLOCK};
 use super::prefetch::{Access, Cand, Class, Item, Prefetcher, Rest, STATUS_BYTES};
@@ -477,6 +478,7 @@ impl Core {
         }
     }
 
+    /// Every fetch out is given up: its reply, when it comes, finds nothing to add to.
     fn drop_everything_out(&mut self) {
         self.gen += 1;
         self.batches.clear();
@@ -563,7 +565,9 @@ impl Core {
             _ if c.reply.is_ok() => self.pf.adm.small_reply(c.took),
             _ => {}
         }
-        // Sent before a change, a failure or a reload: dropped unread.
+        // Sent before a change, a failure or a reload: dropped unread. Defense in depth:
+        // attempt ids drop stale block replies, and `out` is cleared on reconnect, so no
+        // reply of an older generation can reach here today.
         if out.gen != self.gen {
             return;
         }
@@ -577,11 +581,13 @@ impl Core {
                 first,
                 attempt,
             } => {
-                // Of a fetch given up since (its earlier part's fence failed): dropped.
-                let current = self.inflight.get(&block) == Some(&attempt);
-                if current {
-                    self.inflight.remove(&block);
+                // Of a fetch given up since (its earlier part's fence failed): dropped before
+                // it is read — its error, its emptiness or its bytes say nothing of the
+                // fetch that may have replaced it.
+                if self.inflight.get(&block) != Some(&attempt) {
+                    return;
                 }
+                self.inflight.remove(&block);
                 let data = match c.reply {
                     Ok(Reply::Data(data)) => data,
                     Ok(Reply::Stat(_)) => {
@@ -606,9 +612,6 @@ impl Core {
                 if n == 0 {
                     // The file ends before the size it had at open (06 §2).
                     return self.changed();
-                }
-                if !current {
-                    return;
                 }
                 if first {
                     let part = Partial {
@@ -807,6 +810,22 @@ pub(crate) struct Shared {
     clock: Clock,
     #[cfg(test)]
     thread: Mutex<Option<std::thread::JoinHandle<()>>>,
+    #[cfg(test)]
+    probe: Mutex<Probe>,
+}
+
+/// Tests: a blocked `read_at`'s wait, watched.
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct Probe {
+    /// Runs once, after a `read_at` found its bytes missing and before it takes the lock to
+    /// wait for them.
+    pub seam: Option<Box<dyn FnOnce() + Send>>,
+    /// How long a wait lasts instead of [`CANCEL_CHECK`].
+    pub wait: Option<Duration>,
+    /// Waits that ended on a notification, and on their timeout.
+    pub notified: usize,
+    pub timed_out: usize,
 }
 
 impl Shared {
@@ -856,6 +875,10 @@ pub(crate) struct Engine {
     /// reconnect looks at anything.
     #[cfg(test)]
     pub(crate) at_handoff: Option<Box<dyn FnMut() + Send>>,
+    /// Tests: runs once a reconnect has seen the Source open and let go of the lock, right
+    /// before it goes to the network.
+    #[cfg(test)]
+    pub(crate) at_reopen: Option<Box<dyn FnMut() + Send>>,
 }
 
 impl Engine {
@@ -881,6 +904,10 @@ impl Engine {
         }
         let path = core.path.clone();
         drop(core);
+        #[cfg(test)]
+        if let Some(hook) = self.at_reopen.as_mut() {
+            hook();
+        }
         let got = match (reload.is_some(), self.ranged.take()) {
             // A reload re-opens the path on the connection it has.
             (true, Some(r)) => r.reopen(&path).map_err(|refused| refused.error),
@@ -1205,6 +1232,8 @@ impl Source {
             clock: settings.clock,
             #[cfg(test)]
             thread: Mutex::new(None),
+            #[cfg(test)]
+            probe: Mutex::new(Probe::default()),
         });
         let engine = Engine {
             shared: shared.clone(),
@@ -1213,6 +1242,8 @@ impl Source {
             throttle: settings.throttle,
             #[cfg(test)]
             at_handoff: None,
+            #[cfg(test)]
+            at_reopen: None,
         };
         let source = Source {
             _handle: Arc::new(Handle(shared.clone())),
@@ -1353,6 +1384,11 @@ impl Source {
     #[cfg(test)]
     pub(crate) fn core(&self) -> MutexGuard<'_, Core> {
         self.shared.lock()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn probe(&self) -> MutexGuard<'_, Probe> {
+        self.shared.probe.lock().unwrap()
     }
 
     /// Tests: waits for the engine's thread to end.
@@ -1498,6 +1534,12 @@ impl Reader {
                     done += bytes.len();
                 }
                 Got::Pending => {
+                    #[cfg(test)]
+                    let seam = self.shared.probe.lock().unwrap().seam.take();
+                    #[cfg(test)]
+                    if let Some(seam) = seam {
+                        seam();
+                    }
                     let core = self.shared.lock();
                     let (first, last) = (
                         (off + done as u64) / BLOCK,
@@ -1509,11 +1551,29 @@ impl Reader {
                         return Err(ReadError::Cancelled);
                     }
                     if !ready {
-                        let _unused = self
+                        #[cfg(not(test))]
+                        let limit = CANCEL_CHECK;
+                        #[cfg(test)]
+                        let limit = self
+                            .shared
+                            .probe
+                            .lock()
+                            .unwrap()
+                            .wait
+                            .unwrap_or(CANCEL_CHECK);
+                        let (_core, _ended) = self
                             .shared
                             .readers
-                            .wait_timeout(core, CANCEL_CHECK)
+                            .wait_timeout(core, limit)
                             .unwrap_or_else(|e| e.into_inner());
+                        #[cfg(test)]
+                        {
+                            let mut probe = self.shared.probe.lock().unwrap();
+                            match _ended.timed_out() {
+                                true => probe.timed_out += 1,
+                                false => probe.notified += 1,
+                            }
+                        }
                     }
                 }
             }

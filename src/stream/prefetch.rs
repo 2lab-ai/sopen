@@ -2,7 +2,7 @@
 //! class, and the cap on what is sent and not yet answered.
 
 use super::cache::{shares, Protect, BLOCK, CACHE_BYTES};
-use super::ReaderKind;
+use super::{ReaderKind, MAX_READ};
 use std::collections::{BTreeMap, VecDeque};
 use std::time::{Duration, Instant};
 
@@ -11,6 +11,9 @@ pub const CAP_MIN: u64 = 256 << 10;
 pub const CAP_MAX: u64 = 4 << 20;
 /// The blocks of every wait being served, together: what the cache holds.
 pub const HELD_BLOCKS: u64 = CACHE_BYTES / BLOCK;
+/// What the Bulk waits being served may hold of that: all but one maximum read, so a
+/// foreground wait always has room beside them.
+pub const BULK_HELD_BLOCKS: u64 = HELD_BLOCKS - MAX_READ as u64 / BLOCK;
 /// What a status request (a fence, half a poll) counts against what is in flight.
 pub const STATUS_BYTES: u64 = 100;
 
@@ -291,26 +294,35 @@ impl Prefetcher {
         }
     }
 
-    /// The waits that are being served, oldest first, and their blocks: as many as fit the
-    /// cache together ([`HELD_BLOCKS`]). Their blocks are held until read (06 §3), so what is
-    /// held never passes the cache — a held block arriving always finds one to evict that is
-    /// not — and a wait beyond that is served, in its turn, once an older one has been read.
+    /// The waits that are being served, and their blocks: as many as fit the cache together
+    /// ([`HELD_BLOCKS`]), in the queue's order — foreground waits first, then Bulk's, oldest
+    /// first within each — and of Bulk's no more than [`BULK_HELD_BLOCKS`], so that older
+    /// Bulk waits never keep a foreground one out (06 §4). Their blocks are held until read
+    /// (06 §3), so what is held never passes the cache — a held block arriving always finds
+    /// one to evict that is not — and a wait beyond that is served, in its turn, once one
+    /// before it has been read.
     fn held(&self) -> Vec<(u64, (u64, u64))> {
-        let mut waits: Vec<(u64, u64, (u64, u64))> = self
+        let mut waits: Vec<(bool, u64, u64, (u64, u64))> = self
             .readers
             .iter()
-            .filter_map(|(id, r)| Some((r.span_seq, *id, r.span?)))
+            .filter_map(|(id, r)| Some((r.bulk(), r.span_seq, *id, r.span?)))
             .collect();
         waits.sort_unstable();
-        let mut blocks = 0;
-        waits
-            .into_iter()
-            .take_while(|(_, _, (first, last))| {
-                blocks += last - first + 1;
-                blocks <= HELD_BLOCKS
-            })
-            .map(|(_, id, span)| (id, span))
-            .collect()
+        let (mut all, mut of_bulk) = (0, 0);
+        let mut held = Vec::new();
+        for bulk in [false, true] {
+            for (_, _, id, (first, last)) in waits.iter().filter(|w| w.0 == bulk) {
+                let blocks = last - first + 1;
+                // The first that does not fit ends its class: a later one does not pass it.
+                if all + blocks > HELD_BLOCKS || (bulk && of_bulk + blocks > BULK_HELD_BLOCKS) {
+                    break;
+                }
+                all += blocks;
+                of_bulk += if bulk { blocks } else { 0 };
+                held.push((*id, (*first, *last)));
+            }
+        }
+        held
     }
 
     /// Whether a reader is waiting for `block`.
