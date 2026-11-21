@@ -98,7 +98,7 @@ its git panel changes repositories, every history rewrite or destructive action 
 | A3 | Image: view + rectangle crop + rectangle pixelize + clipboard copy / cut / paste (msg 12) | Built-in window shows the image; drag draws a rectangle in image pixels; Crop and Pixelize act on it; Cmd/Ctrl+C copies it (the whole image without one) to the system clipboard as a picture, Cmd/Ctrl+X copies it and leaves it in the background colour, Cmd/Ctrl+V pastes the clipboard's picture (Stretch by default, Fit or 1:1) or text into it; Undo; Save writes back to the remote file. |
 | A4 | Video: view + rectangle crop + time cut; cut / copy / paste on the timeline, previewed at once, rendered only on Save (msg 13) | Built-in window plays the video with sound; scrub timeline; a drag on it selects (`I`/`O` set the selection's edges at the playhead); Cmd/Ctrl+C / X / V, Delete, Cmd/Ctrl+Z / Shift+Cmd/Ctrl+Z edit the timeline and never start ffmpeg — playback and the paused frame show the edited timeline at once; drag a crop rectangle (Export crops its whole output by it); Save (Cmd/Ctrl+S, F5) renders the edit list with ffmpeg and writes it back over the original after a local backup (§5) — the edit list only, never the rectangle; Export writes `<stem>.cut-<in>-<out>.<ext>` of the timeline, cropped, next to the original on the remote. |
 | A5 | Audio (mp3/wav): view + time cut; cut / copy / paste, both channels shown, Mono → Stereo (msg 13) | Same window: waveform (a stereo file in two lanes, L and R), play, the same selection and edits, `M` = Mono → Stereo on a mono file (left = right = its channel, heard in playback and written by Save), Save, Export. |
-| A6 | "아무 파일"; binary files open in a hex editor by default, after a dialog (msg 9) | Any other type (a zip, any binary) opens a small dialog before anything is downloaded — name, size, type when the extension says it: Enter = "Open in hex editor" (the default: fetched to the cache, then sopen's hex window, §6a); "Save to…" downloads it to a path the owner picks (the download folder by default, never over an existing file); Esc or closing it downloads nothing. `sopen --hex SOURCE` opens any file straight in the hex window. `--app <App>` still opens it in a named local app and uploads it back when the user presses Enter in the terminal. With no display (Linux over ssh) the file is fetched and its path printed, and one line says why. |
+| A6 | "아무 파일"; binary files open in a hex editor by default, after a dialog (msg 9) | Any other type (a zip, any binary) opens a small dialog before anything is downloaded — name, size, type when the extension says it: Enter = "Open in hex editor" (the default: sopen's hex window, §6a — a remote file is viewed as a stream, with nothing fetched first, [06](06-streaming.md) §7.1); "Save to…" downloads it to a path the owner picks (the download folder by default, never over an existing file); Esc or closing it downloads nothing. `sopen --hex SOURCE` opens any file straight in the hex window. `--app <App>` still opens it in a named local app and uploads it back when the user presses Enter in the terminal. With no display (Linux over ssh) the file is fetched and its path printed, and one line says why. |
 | A7 | Rust, macOS + Linux, `brew install …` and use immediately | `brew install 2lab-ai/tap/sopen-preview` on macOS (arm64, x86_64) and Linux (x86_64, aarch64) installs `sopen` and the `ffmpeg` it needs; the first `sopen host:/a.mp3` works with no further setup. |
 | A8 | Developed like llmux | Public repo `2lab-ai/sopen`, MIT; `ci.yml` (macOS + Linux), `preview.yml` (every main push → prerelease + tap bump), `release.yml` (`v*` tag = owner gate); `AGENTS.md` SSOT; `.prd/` spec. |
 | A9 | `sopen SOURCE` opens here; `sopen --target <host> SOURCE` opens it on `<host>` (msg 7) | `sopen <host-a>:/tmp/a.html` opens on the machine it was typed on, as before. `sopen --target <host-b> <host-a>:/tmp/a.html` opens it on `<host-b>`'s screen: the same window or editor, started by `<host-b>`'s own sopen (on macOS sopen's window floats above the others until it is used; the editor opens behind the active app, §4a); exit code is `<host-b>`'s; `could not reach <host-b>` when ssh cannot get there; `sopen is not installed on <host-b> …` (exit 127) when it has no sopen. A file on `<host-b>` itself opens there as a local file; a local file reaches `<host-b>` as `<this machine>:<path>`. |
@@ -253,8 +253,13 @@ too, where F3 closes it as ⌘W does.
   and audio → the media window (a `.ts` ffprobe cannot read as media → hex); anything else → the
   hex window (the binary dialog's "ask first" is not needed here: the hex view is the default).
   The path is resolved first (a link opens, and saves, as the file it points at: §5). A remote
-  file is fetched into the cache exactly as the standalone routes fetch it (claimed, recorded, an
-  earlier copy's unsaved edits moved aside), with its progress on the status row; Esc stops the
+  file the hex window shows, of any size, and remote text of at most 16 MiB are viewed as a
+  stream ([06](06-streaming.md) §7.1, §7.2, §13): the viewer opens at once, shows its first
+  64 KiB block when it arrives and reads on as the view moves; nothing is fetched whole and
+  nothing is written to the cache. Any other remote file — an image, video, audio, and text over
+  16 MiB until 06's W5b — is fetched into the cache exactly as the standalone routes fetch it
+  (claimed, recorded, an earlier copy's unsaved edits moved aside), with its progress on the
+  status row; Esc stops the
   fetch (and the indexing of a text file, checked every MiB): the partial copy is removed and the cached copy left as it was, also when Esc comes
   after the last byte but before the copy is in place. Esc once the copy is in place (while the
   file is decoded, probed or indexed) keeps the viewer from opening; the fetched copy stays in
@@ -562,17 +567,20 @@ nothing linked); choosing a path there saves to it. When it gives no path — ca
 dialog available — one line says the path field still works. A one-line hint says what Enter and
 Esc do, and — only when something would be downloaded — that nothing is until a choice is made.
 The exceptions: Enter in the path field saves there (it never opens the hex editor; when that save
-is refused the field keeps the keyboard, so the next Enter saves again); during a transfer Enter and
-Esc do nothing and closing waits for it.
-Message 17 changes the dialog in two ways ([06](06-streaming.md) §7.5, planned). "Open in hex
-editor" opens a remote file as a stream, with nothing fetched first. Esc or closing the window
-cancels a "Save to…", leaving nothing behind.
+is refused the field keeps the keyboard, so the next Enter saves again); during a "Save to…" Enter
+does nothing, and Esc, Cancel or closing the window cancels it: the transfer stops between two
+responses, nothing is left behind, and the terminal says `cancelled; nothing was saved`
+(message 17, [06](06-streaming.md) §7.5). While the hex window is being opened Enter and Esc do
+nothing and closing waits for it.
 
-- Hex: the file is fetched into the cache as every fetch is (claimed, recorded, an earlier copy's
-  unsaved edits moved aside first — §5), with the progress in the dialog; then the same window
-  becomes the hex window. A local file is read in place. Every step that can fail (the fetch,
-  opening the copy) comes before the connection is handed to the hex window: after a failure the
-  dialog is as it was, for a retry or "Save to…" (from the copy already fetched).
+- Hex: a remote file is opened as a stream on the dialog's own connection (message 17,
+  [06](06-streaming.md) §7.1, §7.5): nothing is fetched, the same window becomes the hex window,
+  and it reads the blocks its screen needs. A local file is read in place, and a copy already in
+  the cache (a `.ts` that turned out not to be media) is opened as it is. Every step that can fail
+  (opening the file, its handle's stat) comes before the connection is handed to the hex window:
+  after a failure the dialog is as it was, with its connection, for a retry or "Save to…". The
+  hex window's first Save connects again and fetches the whole file then (06 §7.1, until 07's
+  Save).
 - Save to…: bytes are never put under the chosen name before they are complete, and never over, or
   through, anything already there (a file, a link). The chosen path's folder is opened once (a link
   to a folder is followed at that moment) and everything after goes through that descriptor, never

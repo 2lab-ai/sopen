@@ -65,9 +65,62 @@ pub struct SftpRemote {
 /// How long a failed start waits for the sftp subsystem to exit, to say how it ended.
 const STARTUP_EXIT_WAIT: Duration = Duration::from_secs(2);
 
+/// How much of what the local `ssh` said on its stderr is kept: its last bytes.
+const SAID_MAX: usize = 4096;
+/// How long a failed start waits, once `ssh` has exited, for the rest of what it said.
+const SAID_WAIT: Duration = Duration::from_millis(500);
+
+/// What the local `ssh` of a session said on its stderr, bounded to its last [`SAID_MAX`]
+/// bytes. `ssh` reports there that the server would not open a session (sshd's `MaxSessions`,
+/// 06 §6): only with these words in the error can a window say why.
+#[derive(Default)]
+struct Said(std::sync::Mutex<Vec<u8>>);
+
+impl Said {
+    fn add(&self, bytes: &[u8]) {
+        let mut kept = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        kept.extend_from_slice(bytes);
+        let over = kept.len().saturating_sub(SAID_MAX);
+        kept.drain(..over);
+    }
+
+    /// The words, on one line; `None` when it said nothing.
+    fn text(&self) -> Option<String> {
+        let kept = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        let text = String::from_utf8_lossy(&kept);
+        let line = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        (!line.is_empty()).then_some(line)
+    }
+}
+
+/// Reads `from` to its end into `said`, so the pipe never fills (whatever `ssh` writes there,
+/// for as long as the session lives) and only its last bytes are held.
+async fn drain<R: tokio::io::AsyncRead + Unpin>(mut from: R, said: Arc<Said>) {
+    let mut buf = [0u8; 1024];
+    loop {
+        let mut read = tokio::io::ReadBuf::new(&mut buf);
+        let got =
+            std::future::poll_fn(|cx| std::pin::Pin::new(&mut from).poll_read(cx, &mut read)).await;
+        if got.is_err() || read.filled().is_empty() {
+            return;
+        }
+        said.add(read.filled());
+    }
+}
+
+/// `error`, with what `ssh` said about it.
+fn with_said(error: anyhow::Error, said: &Said) -> anyhow::Error {
+    match said.text() {
+        Some(text) => anyhow!("{error:#}: ssh said: {text}"),
+        None => error,
+    }
+}
+
 /// Starts the SFTP subsystem over `session` and the client on it, its request pipe counted by
 /// `writes`. The same steps as the crate's `Sftp::from_clonable_session`, which keeps the pipe to
-/// itself: the subsystem's stdin and stdout piped, stderr discarded. The child is kept as the
+/// itself: the subsystem's stdin and stdout piped; its stderr is read to its end by a task of the
+/// session's runtime ([`drain`]), which keeps only its last bytes — a failed start says them
+/// (06 §6: a session the server refused is reported there, and nowhere else). The child is kept as the
 /// session's auxiliary data, which the crate drops only after its flush and read tasks have
 /// ended — the local `ssh` must outlive every byte written to it. Dropping the `Arc<Session>`
 /// with it never stops the shared master: a resumed session does not `-O exit`.
@@ -79,9 +132,14 @@ async fn start_sftp(session: Arc<openssh::Session>, writes: Arc<Writes>) -> Resu
     let mut child = openssh::Session::to_subsystem(session, "sftp")
         .stdin(openssh::Stdio::piped())
         .stdout(openssh::Stdio::piped())
-        .stderr(openssh::Stdio::null())
+        .stderr(openssh::Stdio::piped())
         .spawn()
         .await?;
+    let said = Arc::new(Said::default());
+    let draining = child
+        .stderr()
+        .take()
+        .map(|stderr| tokio::spawn(drain(stderr, said.clone())));
     let stdin = child
         .stdin()
         .take()
@@ -99,7 +157,12 @@ async fn start_sftp(session: Arc<openssh::Session>, writes: Arc<Writes>) -> Resu
         Err(e) => {
             let child = child.lock().unwrap().take();
             let exited = child.map(|c| c.wait());
-            Err(startup_failure(e.into(), exited, STARTUP_EXIT_WAIT).await)
+            let failure = startup_failure(e.into(), exited, STARTUP_EXIT_WAIT).await;
+            // `ssh` has exited (or the wait ran out): the rest of what it said, then its words.
+            if let Some(draining) = draining {
+                let _ = tokio::time::timeout(SAID_WAIT, draining).await;
+            }
+            Err(with_said(failure, &said))
         }
     }
 }
@@ -1390,6 +1453,51 @@ mod tests {
         let e = timed_out("stat /x", META_TIMEOUT);
         assert_eq!(e.to_string(), "stat /x: no reply from the server in 30s");
         assert!(super::super::is_outcome_unknown(&unknown("rename a to b")));
+    }
+
+    /// 06 §6: what the local `ssh` said on its stderr reaches a failed start's error — a real
+    /// child's words, read to its end — so a session sshd refused is recognised; only its last
+    /// bytes are kept, on one line, and an `ssh` that said nothing adds nothing.
+    #[test]
+    fn a_failed_start_says_what_ssh_said() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _within = rt.enter();
+        let failed = || anyhow!("cannot start sftp: unexpected end of file");
+        let quiet = Said::default();
+        assert_eq!(
+            with_said(failed(), &quiet).to_string(),
+            failed().to_string()
+        );
+        let mut child = tokio::process::Command::new("sh")
+            .args([
+                "-c",
+                "echo 'mux_client_request_session: session request failed: Session open \
+                 refused by peer' >&2; echo 'ControlSocket already exists' >&2; exit 255",
+            ])
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let said = Arc::new(Said::default());
+        rt.block_on(drain(child.stderr.take().unwrap(), said.clone()));
+        let e = with_said(failed(), &said);
+        let text = format!("{e:#}");
+        assert!(crate::stream::session_refused(&text), "{text}");
+        assert_eq!(
+            crate::stream::explain(&e),
+            crate::stream::SESSION_REFUSED,
+            "{text}"
+        );
+        assert!(!text.contains('\n'), "one line: {text:?}");
+        assert!(text.starts_with("cannot start sftp: unexpected end of file: ssh said: "));
+        // Bounded: the last bytes stay.
+        said.add(&vec![b'x'; 3 * SAID_MAX]);
+        said.add(b" the end");
+        let kept = said.text().unwrap();
+        assert_eq!(kept.len(), SAID_MAX);
+        assert!(kept.ends_with("x the end"), "{}", &kept[kept.len() - 20..]);
     }
 
     /// A failed start says how the sftp subsystem ended (the crate's session task did): a real

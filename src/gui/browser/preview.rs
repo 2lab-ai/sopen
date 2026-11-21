@@ -13,9 +13,12 @@
 //!   has ended — its result came, or its channel closed — and was joined; a cancel flag alone
 //!   frees nothing. So the window has at most one preview worker and one preview session.
 //! - **The exits**: the bar on another file, a folder or `..`, F9, Tab — the display changes,
-//!   the preparation is cancelled and the preview dropped (its private copy with it); F4
-//!   changes nothing; Enter or F3 takes the preview away as a viewer ([`Host::take`]); the
-//!   window closing cancels and does not wait ([`Host::cancel`]).
+//!   the preparation is cancelled and the preview dropped (its private copy with it; a
+//!   streamed one's connection comes back for the next preparation, 06 §13); F4 changes
+//!   nothing; Enter or F3 takes the preview away as a viewer ([`Host::take`]); the window
+//!   closing cancels and does not wait ([`Host::cancel`]).
+//! - **Held, not drawn** (a viewer covers the panels): the preview is told
+//!   (`Window::set_shown(false)`), so a streamed one does not poll its file (06 §5).
 
 use super::prepare::{self, Budget, HandedOver, Preview, PreviewRequest, Previewed, Reuse};
 use super::Connect;
@@ -118,6 +121,10 @@ pub(super) struct Host {
     /// The window's one preview connection (02 §4.4): opened by the first preparation, kept
     /// until the window closes. Only the one worker ever holds the lock.
     conn: Arc<Mutex<Option<Box<dyn RemoteFs + Send>>>>,
+    /// Where that connection comes back from while a preview's stream reads on it (06 §13).
+    back: Arc<prepare::Back>,
+    /// The preview was drawn this pass ([`Host::ui`]); looked at by the next [`Host::sync`].
+    drawn: bool,
     /// The window's preview copies, made at the first preview.
     space: Option<Arc<PreviewSpace>>,
     /// The file the committed display shows a preview of.
@@ -140,6 +147,8 @@ impl Host {
             label,
             cache,
             conn: Arc::default(),
+            back: Arc::default(),
+            drawn: false,
             space: None,
             display: None,
             shown: None,
@@ -203,6 +212,12 @@ impl Host {
     /// Each pass: `display` is the file the committed display shows a preview of (`None`: the
     /// side shows something else), `bar` the file the bar is on right now.
     pub fn sync(&mut self, ctx: &egui::Context, display: Option<Want>, bar: Option<&str>) {
+        // A preview held but not drawn last pass (a viewer covers the panels) is told so, and
+        // told again when it is back: hidden, a streamed one does not poll its file (06 §5).
+        let drawn = std::mem::take(&mut self.drawn);
+        if let Some(Shown::Ready(preview)) = &mut self.shown {
+            preview.set_shown(drawn);
+        }
         // The bar left the file being prepared, or the display stopped showing its preview
         // (F9, Tab, a pin: 02 §4.4): cancelled at once, whatever the side still draws.
         if let Some(prep) = &self.prep {
@@ -224,7 +239,9 @@ impl Host {
             let ours = self.display.as_ref() == Some(&prep.want) && !prep.cancelled();
             match ended {
                 Ended::Ready(previewed) if ours => {
-                    self.shown = Some(Shown::Ready(Box::new(previewed.show())))
+                    self.shown = Some(Shown::Ready(Box::new(previewed.show())));
+                    // On screen until a pass goes by without drawing it.
+                    self.drawn = true;
                 }
                 // Another file's: dropped, its copy removed.
                 Ended::Ready(_) | Ended::Cancelled => {}
@@ -260,12 +277,14 @@ impl Host {
         let (done, total) = (Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)));
         let (cancel, budget) = (Arc::new(AtomicBool::new(false)), (self.budget)());
         let (tx, rx) = mpsc::channel();
-        let (conn, connect, label, cache) = (
+        let (conn, back, connect, label, cache) = (
             self.conn.clone(),
+            self.back.clone(),
             self.connect.clone(),
             self.label.clone(),
             self.cache.clone(),
         );
+        let began = std::time::Instant::now();
         let (d, t, stop, limits, waker, path) = (
             done.clone(),
             total.clone(),
@@ -276,6 +295,8 @@ impl Host {
         );
         let worker = std::thread::spawn(move || {
             let mut conn = conn.lock().unwrap_or_else(|p| p.into_inner());
+            let repaint = waker.clone();
+            let wake: crate::stream::Waker = Arc::new(move || repaint.request_repaint());
             let req = PreviewRequest {
                 conn: &mut conn,
                 connect: &connect,
@@ -283,6 +304,9 @@ impl Host {
                 abs: &path,
                 cache: &cache,
                 space: &space,
+                back: &back,
+                wake: &wake,
+                began,
             };
             let result = prepare::preview(req, &limits, &stop, &mut |now, all| {
                 d.store(now, Ordering::Relaxed);
@@ -398,6 +422,7 @@ impl Host {
                     preview.embedded.window.ui(ui);
                 });
                 ctx.input_mut(|i| *i = saved);
+                self.drawn = true;
             }
             Some(Shown::Failed(why)) => {
                 let why = why.clone();
@@ -530,6 +555,90 @@ mod tests {
         fn ready(&self) -> bool {
             true
         }
+    }
+
+    /// What a stand-in was told of being on screen, in order.
+    struct Told(Arc<Mutex<Vec<bool>>>);
+
+    impl Window for Told {
+        fn ui(&mut self, _: &mut egui::Ui) {}
+
+        fn ready(&self) -> bool {
+            true
+        }
+
+        fn set_shown(&mut self, shown: bool) {
+            self.0.lock().unwrap().push(shown);
+        }
+    }
+
+    /// The host's passes as the browser makes them: `sync` every pass, the side drawn only
+    /// while the panels show (not while a viewer covers them).
+    struct Covered {
+        host: Host,
+        want: Want,
+        panels: bool,
+    }
+
+    impl Window for Covered {
+        fn ui(&mut self, ui: &mut egui::Ui) {
+            let ctx = ui.ctx().clone();
+            self.host
+                .sync(&ctx, Some(self.want.clone()), Some(&self.want.path));
+            if self.panels {
+                let rect = ui.max_rect();
+                self.host.ui(ui, rect);
+            }
+        }
+
+        fn ready(&self) -> bool {
+            true
+        }
+    }
+
+    /// 06 §5 (W8a): a preview the host holds but does not draw — a viewer covers the panels —
+    /// is told it is hidden (`Window::set_shown(false)`: a streamed one then stops polling),
+    /// once; drawn again, it is told so; and the hand-over makes it shown, whatever it was.
+    #[test]
+    fn a_preview_held_but_not_drawn_is_told_it_is_hidden() {
+        let told = Arc::new(Mutex::new(Vec::new()));
+        let want = Want {
+            path: "/d/a.txt".to_string(),
+            name: "a.txt".to_string(),
+        };
+        let connect: Connect = Arc::new(|| anyhow::bail!("no connection in this test"));
+        let mut host = Host::new(connect, None, PathBuf::from("/nonexistent"));
+        host.display = Some(want.clone());
+        host.shown = Some(Shown::Ready(Box::new(Preview::standing_in(Embedded {
+            window: Box::new(Told(told.clone())),
+            settle: Box::new(|_| Some(Outcome::default())),
+        }))));
+        // As `sync` leaves it when a preparation's preview comes ready.
+        host.drawn = true;
+        let mut side = Covered {
+            host,
+            want,
+            panels: true,
+        };
+        let mut drv = Driver::new(500.0, 400.0);
+        let said = || told.lock().unwrap().clone();
+        drv.idle(&mut side, 5);
+        assert_eq!(said(), [] as [bool; 0], "on screen: nothing to tell");
+        side.panels = false;
+        drv.idle(&mut side, 5);
+        assert_eq!(said(), [false], "hidden, told once");
+        side.panels = true;
+        drv.idle(&mut side, 5);
+        assert_eq!(said(), [false, true], "back on screen");
+        // Enter while it is hidden: the viewer it becomes is on screen.
+        side.panels = false;
+        drv.idle(&mut side, 3);
+        assert_eq!(said(), [false, true, false]);
+        let Taken::Viewer(_viewer) = side.host.take("/d/a.txt") else {
+            panic!("not handed over")
+        };
+        assert_eq!(said(), [false, true, false, true], "a viewer is shown");
+        assert_eq!(side.host.spawned(), 0, "nothing was prepared");
     }
 
     /// No key, typed text, click, drag or wheel reaches a previewed window, and its widgets

@@ -74,3 +74,21 @@ changes. Rows here are snapshots taken when they were moved.
   is in `src/stream/http.rs`, in the same PR.
 - One question it left open is in 06's Tensions, for W7: an mp3 render reads the file once per
   input.
+
+## R1 (part 4) — closed 2026-11-21
+
+- merged W4 ✅ W5a ✅ · result: the hex window and the text viewer read through `Bytes`, tested
+  over a Source; no route opened one yet (W8a does) · closed rows: W4, W5a · PRs: #35 (64b8443),
+  #34 (7f3d414)
+
+### Closed rows
+
+| ID | Status | Branch | Worktree | Scope | Owns | After | Gate |
+|---|---|---|---|---|---|---|---|
+| W4 | ✅ | `feat/stream-hex` | `.worktrees/feat-stream-hex` | 06 §7.1: hex over `Bytes`, Pending rows, patches keep their byte, interim Save | `src/gui/hex.rs`, `src/gui/hex/file.rs`, `src/gui/hex/tests.rs`, `src/gui/mod.rs` (`State`'s `loading` field) | — (browser S1 merged: S1-E, PR #29, 0120d40) | Merged PR #35 (64b8443), 2026-11-21 |
+| W5a | ✅ | `feat/stream-text-reads` | `.worktrees/feat-stream-text-reads` | 06 §7.2 W5a: reads through `Bytes`, Pending like `Stale`, first screen first, 16 MiB pass for a Source continuing S1-B's (a local file keeps its whole-file pass), highlighting over the prefix, the five defects X3 found | `src/gui/text.rs`, `src/gui/text/tests.rs` | — (browser S1 merged: S1-E, PR #29, 0120d40) | Merged PR #34 (7f3d414), 2026-11-21 |
+
+### Round section
+
+- W4 (PR #35, merged 2026-11-21, 64b8443) and W5a (PR #34, merged 2026-11-21, 7f3d414).
+- W8 was split on 2026-11-21 into W8a and W8b (06 §13): W8a needs only these two.

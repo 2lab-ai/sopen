@@ -205,16 +205,23 @@ bar does not have to move).
 
 | Resource | Budget |
 |---|---|
-| bytes a preview may read from a remote | 32 MiB (decided from the stat, before anything is read); with streaming (another workstream), only the byte ranges the preview shows, never more than 32 MiB |
+| bytes a preview may read from a remote | a file read whole to be previewed (an image): 32 MiB, decided from the stat before anything is read. A file previewed through a stream (06 §13: text of at most 16 MiB and what the hex window shows): only the byte ranges the preview shows — one 64 KiB block for hex rows, the first block and the 4 MiB index pass for text — whatever the file's size |
 | image | 64 MiB encoded, and **64 megapixels** decoded (≤ 256 MiB of RGBA), checked from the image header before decoding |
 | text | the index pass stops after the first **4 MiB** of the file; the preview shows those lines and its last row says `preview of the first 4 MiB` |
 | video | `ffprobe` and the first frame: 5 s each |
 | audio | the waveform decodes at most the first 10 minutes, and 10 s |
 | hex | the rows on screen (the hex window reads pages only) |
-| time, all kinds | 5 s of preparation after the read (a read shows its progress and is bounded by the 32 MiB) |
+| time, all kinds | 5 s of preparation after the read (a read shows its progress and is bounded by the 32 MiB; a streamed preview has no read before it shows) |
 
 - A remote video over 32 MiB therefore shows the info card: its frame comes from `ffmpeg` on a local
-  copy today. Lifting that limit belongs to the streaming workstream, which reads byte ranges.
+  copy today. Lifting that limit belongs to the streaming workstream, which reads byte ranges (06
+  §13's W8b; W8a lifted it for what the hex window shows).
+- **Which remote files stream** is decided from the stat and the kind. The kind comes from the
+  name where the name says it, and then a file over 32 MiB that does not stream is its card with
+  nothing read. A file over 32 MiB whose name does not say its kind is sniffed first (at most
+  8 KiB): a binary then previews its first rows.
+- **Remote text over 16 MiB does not stream yet** (06 §7.2, until W5b): up to 32 MiB it is read
+  into the private copy as before, and over that it is the info card.
 
 ### 4.4 Lifecycle: one preparation at a time, every exit defined
 
@@ -228,10 +235,21 @@ bar does not have to move).
   `MaxSessions`): the listing 1, a viewer 1, the preview 1, the tree 1, a file operation 1, git ≤ 3
   (03 §3.2) — 8, and 9 for the moment a git stop runs (03 §3.5). A cancelled preview never holds a
   second one.
-- **A preview reads without claiming the cache.** A remote file is read into a private preview copy
-  (`<cache>/.preview/<window>/<n>`, 0600, removed when the preview is dropped); a local file is read in
-  place, an image included. A preview never claims a cached copy, publishes into the mirror, moves
-  earlier edits aside or creates a session copy (01 §5's machinery is for files that are opened).
+- **A preview reads without claiming the cache.** A local file is read in place, an image
+  included. A remote file is read one of two ways:
+  - **through a stream** (06 §5, §13: text of at most 16 MiB and what the hex window shows): the
+    preview connection becomes the stream's transport, and nothing is written to disk;
+  - **into a private preview copy** (`<cache>/.preview/<window>/<n>`, 0600, removed when the preview
+    is dropped): an image, and text over 16 MiB.
+
+  Either way a preview never claims a cached copy, publishes into the mirror, moves earlier edits
+  aside or creates a session copy (01 §5's machinery is for files that are opened).
+- **A streamed preview that is dropped gives the connection back** (the bar moved on, F9, Tab, a
+  cancel): its stream closes the file's handle and returns the session, and the next preparation
+  takes it — waiting for it at most 2 s, then opening one of its own. So the window still has one
+  preview session, never two.
+- **A preview held but not drawn** (a viewer covers the panels) is told so
+  (`Window::set_shown(false)`), and a streamed one does not poll its file meanwhile (06 §5).
 - **Cancel** = the preparation's stop flag (the flag Esc sets for Enter today); the worker checks it at
   every read, between decode steps, at every MiB of the text index, and before handing over.
 
@@ -242,7 +260,7 @@ bar does not have to move).
 | F9, pin (Cmd/Ctrl+G), Tab | cancel |
 | the tree opens | kept as it is, inside `tree_snapshot` (O4); cancelled when the tree closes if the rules no longer show it |
 | Enter or F3 on the previewed file | **handed over** (below) |
-| Enter or F3 on a file showing an info card | the preview is dropped (its preparation cancelled) and the file opens as Enter opens it in the list (01 §3a), from the start; a private preview copy that is complete and whose file is unchanged since (size, mtime) is published into the cache as below instead of read again |
+| Enter or F3 on a file showing an info card | the preview is dropped (its preparation cancelled) and the file opens as Enter opens it in the list (01 §3a; 06 §13: through a stream where it streams), from the start; a private preview copy that is complete and whose file is unchanged since (size, mtime) is published into the cache as below instead of read again |
 | Enter on another entry, F4 | cancel / kept (F4 does not change the bar) |
 | the window closes | cancel; the window does not wait for a cancelled preview (its worker only reads and removes its own private copy) |
 
@@ -258,15 +276,22 @@ bar does not have to move).
   - **A preparation still running** becomes the viewer's opening task: its read or decode continues
     under the viewer's rules (no preview budget, no 5 s deadline), its progress moves to the status row,
     Esc stops it as Enter's does.
-  - **The cache**: a remote file's private preview copy is **published into the cache by a hard link**
-    and claimed and recorded as Enter's fetch would be (01 §5); the viewer keeps the path it opened
-    (the text viewer, the hex window and the media window each re-check or reuse their opened path),
-    and the preview name is removed when the viewer closes. A local file was read in place and stays
-    so.
+  - **A streamed preview** (06 §13) **moves its stream to the viewer**, with its cache, its readers
+    and its session: no byte is read twice, nothing is published into the cache, and the text
+    index goes on from where the preview's 4 MiB pass stopped. The session is the viewer's from
+    then on (it counts as the viewer's one), and the window opens a new preview session at its
+    next remote preview.
+  - **The cache**, for a preview that read a copy: the private preview copy is **published into the
+    cache by a hard link** and claimed and recorded as Enter's fetch would be (01 §5); the viewer
+    keeps the path it opened (the text viewer and the media window each re-check or reuse their
+    opened path), and the preview name is removed when the viewer closes. A local file was read in
+    place and stays so.
   - **The connection**: a previewed window's `Origin` holds a placeholder connection that fails; the
     viewer's first remote call fails its stat, and `Origin::fs()` reconnects (`gui/mod.rs`), so the
-    viewer opens its own session on first use and the preview connection stays the window's one
-    preview session (§4.4's budget).
+    viewer opens its own session on first use. For a preview that read a copy, the preview
+    connection stays the window's one preview session (§4.4's budget), and the placeholder answers
+    what the server can do from that connection. A streamed viewer's placeholder answers yes until
+    its first Save asks (06 §2).
 - **A previewed viewer gets no input.** The requirement: no key, click, drag or wheel changes a
   previewed viewer; it never holds unsaved changes; dropping it never asks anything or waits for a
   write; it never takes a key the list needs (so 02 §3.2's keys hold while a preview shows). The
@@ -290,14 +315,17 @@ P1 and the final acceptance run after the text-wrap branch has landed (§4.2).
   input of its state table.)
 - P2. Press ↓ quickly through ten files → nothing is fetched for the files passed (test: a counting
   `RemoteFs` sees one preparation, for the file the bar rested on).
-- P3. Put the bar on a 100 MiB remote file → the info card `over the preview limit`; nothing is
-  read. Put it on a local 30000×30000 PNG, a local 2 GB log, a two-hour MP3 and a video whose probe
+- P3. Put the bar on a 100 MiB remote image → the info card `over the preview limit`; nothing is
+  read. Put it on a 24 GB remote binary → its first hex rows, one 64 KiB block fetched after a sniff
+  of at most 8 KiB (06 §13; test: the reads' ranges). Put it on a local 30000×30000 PNG, a local 2 GB log, a two-hour MP3 and a video whose probe
   hangs (a stand-in `ffprobe` that sleeps) and leave the bar there → each shows its card or its bounded
   preview (`first 4 MiB`, `first 10 minutes`) within its budget, and no worker is left running.
-- P4. Put the bar on a 30 MiB remote file and move away at 40 % → its requests stop, nothing is
+- P4. Put the bar on a 30 MiB remote image and move away at 40 % → its requests stop, nothing is
   published under any name in the cache (the private preview copy is removed), and the next preview
   starts only after the first worker ended (test with a slow fake worker: peak live preview workers =
-  1, peak preview SFTP sessions = 1, across 20 quick moves). Sweep the bar over 50 files of every kind
+  1, peak preview SFTP sessions = 1, across 20 quick moves). The same 20 moves over remote text and
+  binaries, which stream: one session, never two at once — each dropped preview gave it back —
+  and nothing on disk. Sweep the bar over 50 files of every kind
   → no ffmpeg process outlives its preview, and the cache's mirror and session folders are unchanged.
 - P5. For each kind (text, image, video, audio, hex), previewed: real clicks (the media window's
   Play button included), drags, the wheel, `C`, `P`, Space, Cmd/Ctrl+V and typing over it → nothing
@@ -308,12 +336,18 @@ P1 and the final acceptance run after the text-wrap branch has landed (§4.2).
   twice and nothing is decoded twice (test: the reads' ranges, one decode), and the cached copy is
   claimed and recorded only now, by a hard link to the preview copy (same inode); the viewer's Save
   reconnects on its first remote call. Press Enter while the preview still reads → the same read
-  continues as the viewer's opening.
+  continues as the viewer's opening. Press Enter on a previewed remote binary or text file (06 §13)
+  → its stream is the viewer's: the block the preview read is not read again (test: the reads'
+  ranges do not overlap), nothing is in the cache, the session went with it, and the next remote
+  preview opens a new one.
 - P12. A local text file of 6 MiB and a remote one of 20 MiB: the preview shows the first page and
   `preview of the first 4 MiB`; Enter → the viewer; End → the file's last line. On a continuation
   that succeeds each byte is indexed once, and the 4 MiB before the cut are read twice more only to
   verify them (§4.4) (test: the index's reads see every offset once, the verification reads are
-  counted apart; remotely, one fetch). Enter on a 100 MiB remote text
+  counted apart). The remote one, being over 16 MiB, is read into the private copy once (one
+  fetch). A remote text file of 6 MiB streams (06 §13): the preview fetches its 4 MiB and no more,
+  and after Enter the rest — every byte range asked for once over preview and viewer together,
+  `fetched` equal to the file's size, one session, nothing on disk. Enter on a 100 MiB remote text
   file's info card → the ordinary open, with its fetch progress on the status row. An audio file of
   20 minutes (after S1-M): Enter → the waveform's first 10 minutes stay, the rest is decoded from 10:00.
 - P13. Two histories reach the bar on file X within 150 ms — one from a preview of file W, one from the

@@ -23,7 +23,7 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
@@ -42,8 +42,12 @@ const SAVED_LINGER: Duration = Duration::from_millis(1200);
 /// the same for both).
 pub const BROWSE_NONE: &str =
     "Browse… gave no path (cancelled, or no system save dialog here) — the path field still works";
-/// Closing was asked for during a download or a fetch.
+/// Closing was asked for while the hex window was being opened.
 pub const CLOSES_AFTER: &str = "the window closes when the transfer is done";
+/// A "Save to…" stopped by Esc or by closing the window (06 §7.5): in the dialog, and on the
+/// terminal.
+pub const SAVE_CANCELLED: &str = "cancelled; nothing was saved";
+const SAVE_CANCELLED_LINE: &str = "sopen: cancelled; nothing was saved";
 
 /// What the dialog shows before anything is downloaded: from the stat alone.
 #[derive(Debug, Clone)]
@@ -667,23 +671,60 @@ pub(super) fn save_new_with(
     }
 }
 
+/// What a transfer writes through until `stop` is set: from then on every write fails, which
+/// ends the read feeding it at its next response (06 §7.5: between chunks).
+struct Stopping<'a, W> {
+    inner: W,
+    stop: &'a AtomicBool,
+}
+
+impl<W: Write> Write for Stopping<'_, W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if self.stop.load(Ordering::Relaxed) {
+            return Err(std::io::Error::other("cancelled"));
+        }
+        self.inner.write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+/// Whether a save ended because it was cancelled ([`download_to`], [`copy_to`]): nothing was
+/// saved, and nothing is left of it.
+pub fn save_cancelled(e: &SaveError) -> bool {
+    matches!(e, SaveError::Failed(e) if crate::remote::is_cancelled(e))
+}
+
 /// Downloads `abs` into a new file at `dest` ([`save_new`]). Best-effort change check: a file
 /// whose size or mtime differs after the transfer, or that gave a different number of bytes,
-/// is not saved.
+/// is not saved. `cancel` stops it between two responses (06 §7.5): the part and its private
+/// folder are removed, nothing is published, and the error is
+/// [`Cancelled`](crate::remote::Cancelled) ([`save_cancelled`]).
 pub fn download_to(
     fs: &mut dyn RemoteFs,
     abs: &str,
     dest: &Path,
     progress: &mut dyn FnMut(u64, u64),
+    cancel: &AtomicBool,
 ) -> std::result::Result<SavedTo, SaveError> {
     let before = fs.stat(abs).map_err(SaveError::Failed)?;
     if before.is_dir {
         return Err(SaveError::Failed(anyhow!("{abs} is a directory")));
     }
     save_new(dest, |file| {
-        let mut out = std::io::BufWriter::with_capacity(1 << 20, &mut *file);
-        let n = fs.read_to(abs, &mut out, &mut |done| progress(done, before.size))?;
-        out.flush()?;
+        let mut out = Stopping {
+            inner: std::io::BufWriter::with_capacity(1 << 20, &mut *file),
+            stop: cancel,
+        };
+        let read = fs
+            .read_to(abs, &mut out, &mut |done| progress(done, before.size))
+            .and_then(|n| out.flush().map(|()| n).map_err(anyhow::Error::from));
+        if cancel.load(Ordering::Relaxed) {
+            return Err(anyhow!(crate::remote::Cancelled));
+        }
+        let n = read?;
         drop(out);
         let after = fs.stat_opt(abs)?;
         let same = after.is_some_and(|a| a.size == before.size && a.mtime == before.mtime);
@@ -704,10 +745,12 @@ fn handle_stamp(file: &File) -> std::io::Result<(u64, Option<SystemTime>, i64, i
 /// Copies the local file `src` (the local file itself, or the cached copy) into a new file at
 /// `dest` ([`save_new`]). Its handle's size, mtime and change time are compared before and
 /// after the copy, and the bytes copied with its size: any difference and nothing is saved.
+/// `cancel` stops it between two chunks, as [`download_to`]'s.
 pub fn copy_to(
     src: &Path,
     dest: &Path,
     progress: &mut dyn FnMut(u64, u64),
+    cancel: &AtomicBool,
 ) -> std::result::Result<SavedTo, SaveError> {
     let failed = |e: anyhow::Error| SaveError::Failed(e);
     let mut input = File::open(src)
@@ -725,6 +768,9 @@ pub fn copy_to(
                 .with_context(|| format!("cannot read {}", src.display()))?;
             if n == 0 {
                 break;
+            }
+            if cancel.load(Ordering::Relaxed) {
+                return Err(anyhow!(crate::remote::Cancelled));
             }
             file.write_all(&buf[..n])?;
             done += n as u64;
@@ -761,21 +807,29 @@ pub struct Opened {
 pub trait Source: Send {
     /// Hex: the file made local (fetched into the cache, or the local file itself).
     fn open_hex(&mut self, progress: &mut dyn FnMut(u64, u64)) -> Result<Opened>;
-    /// Save: the file's bytes in a new file at `dest` ([`save_new`]).
+    /// Save: the file's bytes in a new file at `dest` ([`save_new`]). `cancel` stops it
+    /// between chunks (06 §7.5): nothing is saved, and the source is as it was.
     fn save_to(
         &mut self,
         dest: &Path,
         progress: &mut dyn FnMut(u64, u64),
+        cancel: &AtomicBool,
     ) -> std::result::Result<SavedTo, SaveError>;
 }
 
-/// The [`Source`] main uses: the file on its host (or the local disk). Hex fetches into the
-/// cache as every fetch does (claimed, recorded) and hands the connection to the hex window;
-/// a local file is read in place. Save downloads (or copies a local or cached file).
+/// The [`Source`] main uses: the file on its host (or the local disk). Hex opens a remote file
+/// as a stream on this connection (06 §7.5: nothing is fetched); a local file is read in
+/// place, and a copy already in the cache is opened as it is. Save downloads (or copies a
+/// local or cached file).
 pub struct FileSource {
-    /// Taken when the hex window opens (it holds the connection from then on).
+    /// Taken when the hex window opens (it holds the connection from then on: a stream's
+    /// transport, or a file read in place's `Origin`).
     fs: Option<Box<dyn RemoteFs + Send>>,
-    reconnect: Option<super::Reconnect>,
+    /// Opens another connection to the file's host: a stream's retry, and its `Origin`'s
+    /// first use.
+    dial: Option<super::browser::Connect>,
+    /// The kind sniff's bytes (06 §11), read on this connection before the dialog.
+    sniff: u64,
     /// `[user@]host` for a remote file; `None` for a local one.
     label: Option<String>,
     abs: String,
@@ -793,13 +847,67 @@ impl FileSource {
         cache: &Path,
         fetched: Option<crate::cache::Fetched>,
     ) -> Self {
+        let dial = reconnect.map(|reconnect| {
+            let reconnect = Mutex::new(reconnect);
+            Arc::new(move || (reconnect.lock().unwrap_or_else(|p| p.into_inner()))())
+                as super::browser::Connect
+        });
         Self {
             fs: Some(fs),
-            reconnect,
+            dial,
+            sniff: 0,
             label,
             abs: abs.to_string(),
             cache: cache.to_path_buf(),
             fetched,
+        }
+    }
+
+    /// The bytes the kind sniff read of the file before the dialog (06 §11's `sniff`).
+    pub fn sniffed(mut self, bytes: u64) -> Self {
+        self.sniff = bytes;
+        self
+    }
+
+    /// How the viewer's `Origin` connects again.
+    fn reconnect(&self) -> Option<super::Reconnect> {
+        let dial = self.dial.clone()?;
+        Some(Box::new(move || dial()))
+    }
+
+    /// A remote file not in the cache yet opens through a stream (06 §7.1, §7.5): the
+    /// connection becomes the stream's transport, nothing is fetched, and the hex window's
+    /// `Origin` connects on its first use. Every step that can fail — the open, the handle's
+    /// `fstat` — comes before the connection is handed over: a failure gives it back, and
+    /// the source is as it was (never a quiet whole fetch instead).
+    fn open_stream(&mut self, label: String) -> Result<Opened> {
+        let fs = self.fs.take().context("the file was already opened")?;
+        let repaint = hex::Repaint::default();
+        let opening = crate::stream::Opening {
+            label: format!("{label}:{}", self.abs),
+            began: Instant::now(),
+            sniff: self.sniff,
+        };
+        let dial = self.dial.clone();
+        match super::streamed::open(fs, &self.abs, opening, dial, repaint.waker(), None) {
+            Ok(opened) => {
+                let origin = Origin::placeholder(
+                    self.reconnect(),
+                    label,
+                    self.abs.clone(),
+                    opened.at,
+                    super::Placeholder::YES,
+                );
+                Ok(Opened {
+                    file: HexFile::streamed(origin, opened.source, repaint, &self.cache),
+                    notices: Vec::new(),
+                    fetch_ms: None,
+                })
+            }
+            Err(not) => {
+                self.fs = not.conn;
+                Err(anyhow!(crate::stream::explain(&not.error)))
+            }
         }
     }
 
@@ -845,6 +953,9 @@ impl Source for FileSource {
         if self.fs.is_none() {
             bail!("the file was already opened");
         }
+        if let (Some(label), None) = (self.label.clone(), &self.fetched) {
+            return self.open_stream(label);
+        }
         let fetch_ms = self.make_local(progress)?;
         let (base_path, at, notices) = match &self.fetched {
             Some(f) => (f.claim.local.clone(), f.at, f.notices.clone()),
@@ -859,7 +970,7 @@ impl Source for FileSource {
         let claim = self.fetched.take().map(|f| f.claim);
         let origin = Origin::new(
             fs,
-            self.reconnect.take(),
+            self.reconnect(),
             self.label.clone(),
             self.abs.clone(),
             at,
@@ -875,13 +986,16 @@ impl Source for FileSource {
         &mut self,
         dest: &Path,
         progress: &mut dyn FnMut(u64, u64),
+        cancel: &AtomicBool,
     ) -> std::result::Result<SavedTo, SaveError> {
         if let Some(fetched) = &self.fetched {
-            return copy_to(&fetched.claim.local, dest, progress);
+            return copy_to(&fetched.claim.local, dest, progress, cancel);
         }
         match self.fs.as_mut() {
-            Some(_) if self.label.is_none() => copy_to(Path::new(&self.abs), dest, progress),
-            Some(fs) => download_to(fs.as_mut(), &self.abs, dest, progress),
+            Some(_) if self.label.is_none() => {
+                copy_to(Path::new(&self.abs), dest, progress, cancel)
+            }
+            Some(fs) => download_to(fs.as_mut(), &self.abs, dest, progress, cancel),
             None => Err(SaveError::Failed(anyhow!("the file was already opened"))),
         }
     }
@@ -1053,19 +1167,15 @@ pub enum Moved {
     Nothing,
     /// One was started and did not land (it may have moved some bytes).
     Started,
-    /// The hex fetch landed in the cache, and the window was closed before the hex editor
-    /// opened.
-    Fetched,
+    /// A "Save to…" was cancelled (06 §7.5): its part and private folder are gone.
+    Stopped,
 }
 
 /// The line said when a binary file's run ends without opening or saving it: it claims nothing
 /// was downloaded only when that is so.
 pub fn cancel_line(local: bool, moved: Moved) -> &'static str {
     match (local, moved) {
-        (_, Moved::Fetched) => {
-            "sopen: cancelled; the file was fetched into sopen's cache, but the hex editor did \
-             not open"
-        }
+        (_, Moved::Stopped) => SAVE_CANCELLED_LINE,
         (true, _) | (false, Moved::Started) => "sopen: cancelled",
         (false, Moved::Nothing) => "sopen: cancelled; nothing was downloaded",
     }
@@ -1086,7 +1196,8 @@ pub fn save_without_window(
     } else {
         dest
     };
-    match source.save_to(&dest, progress) {
+    // Without a window nothing cancels it but ending the run.
+    match source.save_to(&dest, progress, &AtomicBool::new(false)) {
         Ok(saved) => Ok((dest, saved)),
         Err(SaveError::Exists { next }) => bail!(
             "{} exists; not replaced (the next free name is {})",
@@ -1136,6 +1247,10 @@ pub fn dialog(
                 ended.lock().unwrap().saved_to = Some(dest);
             }
             Ok(Landed {
+                result: MovedResult::Saved(_, Err(e)),
+                ..
+            }) if save_cancelled(&e) => ended.lock().unwrap().moved = Moved::Stopped,
+            Ok(Landed {
                 result: MovedResult::Saved(dest, Err(e)),
                 ..
             }) => eprintln!("sopen: {} not saved: {e}", dest.display()),
@@ -1144,14 +1259,8 @@ pub fn dialog(
                 ..
             }) => match *result {
                 Ok(opened) => {
-                    eprintln!(
-                        "sopen: fetched; the window was closed, so the hex editor did not open"
-                    );
-                    let mut ended = ended.lock().unwrap();
-                    ended.fetch_ms = opened.fetch_ms;
-                    if opened.fetch_ms.is_some() {
-                        ended.moved = Moved::Fetched;
-                    }
+                    eprintln!("sopen: the window was closed, so the hex editor did not open");
+                    ended.lock().unwrap().fetch_ms = opened.fetch_ms;
                 }
                 Err(e) => eprintln!("sopen: {e:#}"),
             },
@@ -1196,11 +1305,13 @@ enum Stage {
     Ask,
     /// The system's save dialog is open.
     Choosing(Receiver<Option<PathBuf>>),
-    /// Fetching for the hex window (`dest` = `None`) or saving to `dest`.
+    /// Opening the hex window (`dest` = `None`) or saving to `dest`. `cancel` stops a save
+    /// between chunks (06 §7.5: Esc, or closing the window).
     Moving {
         dest: Option<PathBuf>,
         done: Arc<AtomicU64>,
         total: Arc<AtomicU64>,
+        cancel: Arc<AtomicBool>,
         rx: Receiver<Landed>,
     },
     /// Saved: the line stays a moment, then the window closes — unless there are notes to read.
@@ -1333,6 +1444,7 @@ impl BinaryWindow {
             dest: None,
             done,
             total,
+            cancel: Arc::default(),
             rx,
         };
     }
@@ -1360,12 +1472,18 @@ impl BinaryWindow {
         let (done, total) = (Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)));
         let (tx, rx) = mpsc::channel();
         let (d, t, ctx2, to) = (done.clone(), total.clone(), ctx.clone(), dest.clone());
+        let cancel = Arc::new(AtomicBool::new(false));
+        let stop = cancel.clone();
         std::thread::spawn(move || {
-            let result = source.save_to(&to, &mut |now, all| {
-                d.store(now, Ordering::Relaxed);
-                t.store(all, Ordering::Relaxed);
-                ctx2.request_repaint();
-            });
+            let result = source.save_to(
+                &to,
+                &mut |now, all| {
+                    d.store(now, Ordering::Relaxed);
+                    t.store(all, Ordering::Relaxed);
+                    ctx2.request_repaint();
+                },
+                &stop,
+            );
             let _ = tx.send(Landed {
                 source,
                 result: MovedResult::Saved(to, result),
@@ -1376,6 +1494,7 @@ impl BinaryWindow {
             dest: Some(dest),
             done,
             total,
+            cancel,
             rx,
         };
     }
@@ -1474,6 +1593,16 @@ impl BinaryWindow {
                 self.path = tilde(&next);
                 self.after_failure(ctx);
             }
+            // Esc or closing stopped it (06 §7.5): nothing was saved and nothing is left of
+            // it; the dialog asks again — or the window closes, and the run's last line says it.
+            MovedResult::Saved(_, Err(e)) if save_cancelled(&e) => {
+                self.ended.lock().unwrap().moved = Moved::Stopped;
+                if !self.close_when_done {
+                    eprintln!("{SAVE_CANCELLED_LINE}");
+                }
+                self.notes = vec![(SAVE_CANCELLED.to_string(), false)];
+                self.after_failure(ctx);
+            }
             MovedResult::Saved(_, Err(SaveError::Failed(e))) => {
                 eprintln!("sopen: {e:#}");
                 self.notes = vec![(format!("{e:#}"), true)];
@@ -1487,17 +1616,11 @@ impl BinaryWindow {
     fn opened(&mut self, ctx: &egui::Context, result: Result<Opened>) {
         match result {
             Ok(opened) => {
-                {
-                    let mut ended = self.ended.lock().unwrap();
-                    ended.fetch_ms = opened.fetch_ms;
-                    if opened.fetch_ms.is_some() {
-                        ended.moved = Moved::Fetched;
-                    }
-                }
+                self.ended.lock().unwrap().fetch_ms = opened.fetch_ms;
                 if self.close_when_done {
                     eprintln!(
-                        "sopen: the window was closed during the fetch; the hex editor did not \
-                         open"
+                        "sopen: the window was closed while the file was being opened; the hex \
+                         editor did not open"
                     );
                     self.close(ctx);
                     return;
@@ -1580,11 +1703,7 @@ impl BinaryWindow {
                     egui::Button::new(egui::RichText::new("Open in hex editor").strong())
                         .fill(fill),
                 )
-                .on_hover_text(if local {
-                    "Enter — opens it in sopen's hex editor"
-                } else {
-                    "Enter — fetches it into sopen's cache and opens the hex editor"
-                });
+                .on_hover_text("Enter — opens it in sopen's hex editor");
             if hex.clicked() {
                 self.start_hex(&ctx);
             }
@@ -1598,11 +1717,23 @@ impl BinaryWindow {
             if save.clicked() {
                 self.start_save(&ctx, false);
             }
+            // While "Save to…" runs it stops that (06 §7.5), as Esc does; else it closes.
+            let saving = match &self.stage {
+                Stage::Moving {
+                    dest: Some(_),
+                    cancel,
+                    ..
+                } => Some(cancel.clone()),
+                _ => None,
+            };
             let cancel = ui
-                .add_enabled(asking, egui::Button::new("Cancel"))
+                .add_enabled(asking || saving.is_some(), egui::Button::new("Cancel"))
                 .on_hover_text("Esc");
             if cancel.clicked() {
-                self.close(&ctx);
+                match saving {
+                    Some(stop) => stop.store(true, Ordering::Relaxed),
+                    None => self.close(&ctx),
+                }
             }
         });
         ui.add_space(8.0);
@@ -1636,9 +1767,9 @@ impl BinaryWindow {
                 let (d, t) = (done.load(Ordering::Relaxed), total.load(Ordering::Relaxed));
                 let frac = if t > 0 { d as f32 / t as f32 } else { 0.0 };
                 ui.label(match (dest, local) {
-                    (Some(dest), _) => format!("saving to {}…", tilde(dest)),
-                    (None, true) => "opening it in the hex editor…".to_string(),
-                    (None, false) => "fetching for the hex editor…".to_string(),
+                    (Some(dest), _) => format!("saving to {}… Esc cancels", tilde(dest)),
+                    // A remote file opens as a stream (06 §7.5): nothing is fetched for it.
+                    (None, _) => "opening it in the hex editor…".to_string(),
                 });
                 let label = format!(
                     "{:.0}% · {} / {}",
@@ -1681,9 +1812,20 @@ impl BinaryWindow {
         if self.close_when_done {
             super::disclosures(ui, &[(CLOSES_AFTER.to_string(), plain)]);
         }
-        // Keys, only while asking: Enter in the path field saves; Enter with nothing focused
-        // opens the hex editor (a focused button takes Enter as its own click); Esc cancels.
-        // During a transfer neither does anything (closing waits for it).
+        // Esc during "Save to…" cancels it (06 §7.5); Enter does nothing then, and neither does
+        // anything while the hex window is being opened.
+        if let Stage::Moving {
+            dest: Some(_),
+            cancel,
+            ..
+        } = &self.stage
+        {
+            if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Escape)) {
+                cancel.store(true, Ordering::Relaxed);
+            }
+        }
+        // Keys while asking: Enter in the path field saves; Enter with nothing focused opens
+        // the hex editor (a focused button takes Enter as its own click); Esc cancels.
         if self.asking() {
             if path_enter {
                 self.start_save(&ctx, true);
@@ -1813,9 +1955,12 @@ impl Window for BinaryWindow {
         }
         match &mut self.stage {
             Stage::Hex(window) => window.close_requested(),
-            Stage::Moving { .. } => {
-                // Never close mid-transfer: a download into the chosen path is the owner's
-                // file; a fetch is the cache's. Both finish, then the window closes.
+            Stage::Moving { dest, cancel, .. } => {
+                // A "Save to…" is cancelled (06 §7.5): it stops between chunks and leaves
+                // nothing, then the window closes. Opening the hex window is waited for.
+                if dest.is_some() {
+                    cancel.store(true, Ordering::Relaxed);
+                }
                 self.close_when_done = true;
                 false
             }

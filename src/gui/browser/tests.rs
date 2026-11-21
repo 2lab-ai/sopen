@@ -646,24 +646,104 @@ fn f4_opens_the_entry_in_the_editor() {
     assert!(fx.b.viewer.is_some(), "F4 leaves the viewer open");
 }
 
-/// A folder "on host box": files are fetched into the cache as the standalone routes fetch
-/// them, and the copy is released with the viewer — opening it again uses the same copy, not a
-/// session copy of its own.
+/// A folder "on host box": a file that is still fetched (an image) goes into the cache as the
+/// standalone routes fetch it, and the copy is released with the viewer — opening it again
+/// uses the same copy, not a session copy of its own.
 #[test]
 fn a_viewer_holds_its_cached_copy_only_while_it_shows_it() {
     let mut fx = fixture_with(Some("box"), local_connect(), None);
-    fx.open("notes.txt");
-    let copy = crate::cache::cache_path(&fx.cache, "box", &format!("{}/notes.txt", fx.root));
-    assert_eq!(std::fs::read_to_string(&copy).unwrap(), "plain notes\n");
-    assert!(fx.drv.find_text("plain notes").is_some());
+    fx.open("photo.png");
+    let copy = crate::cache::cache_path(&fx.cache, "box", &format!("{}/photo.png", fx.root));
+    assert_eq!(
+        std::fs::read(&copy).unwrap(),
+        std::fs::read(format!("{}/photo.png", fx.root)).unwrap()
+    );
+    assert_eq!(fx.drv.pictures().len(), 1);
     fx.key(Key::Escape);
-    fx.open("notes.txt");
+    fx.open("photo.png");
     assert!(
         !fx.cache.join(".sessions").exists(),
         "the second open got a session copy: the first one's claim was still held"
     );
     fx.key(Key::Escape);
     assert!(fx.b.viewer.is_none());
+}
+
+/// Every file under `dir`.
+fn files_in(dir: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            out.extend(files_in(&path));
+        } else {
+            out.push(path);
+        }
+    }
+    out
+}
+
+/// 06 §13 W8a, the browser's Enter in the window: remote text and a remote binary open in
+/// their viewers through a stream — the text is not followed as a local file is, nothing
+/// reaches the cache — and Esc is back in the list. In preview mode the same Enter hands the
+/// preview's stream over; here (`dual`) each opens from the start.
+#[test]
+fn w8a_enter_on_remote_text_and_binaries_views_them_through_streams() {
+    let mut fx = fixture_with(Some("box"), local_connect(), None);
+    fx.key(Key::F9);
+    fx.open("notes.txt");
+    assert!(fx.drv.find_text("Text Viewer").is_some());
+    assert!(fx.drv.find_text("plain notes").is_some());
+    assert_eq!(files_in(&fx.cache), Vec::<PathBuf>::new(), "text");
+    fx.key(Key::Escape);
+    assert!(fx.b.viewer.is_none());
+    fx.open("data.bin");
+    assert!(
+        fx.drv
+            .find_text("00 01 02 03 04 05 06 07  08 09 0A 0B 0C 0D 0E 0F")
+            .is_some(),
+        "the hex rows"
+    );
+    assert_eq!(files_in(&fx.cache), Vec::<PathBuf>::new(), "hex");
+    fx.key(Key::Escape);
+    assert!(fx.b.viewer.is_none());
+    assert_eq!(fx.current(), "data.bin");
+}
+
+/// 06 §12 V10 at open, in the browser: the open's own connection is refused as sshd refuses a
+/// session. The status row says 06 §6's line — not ssh's words — nothing opens, and the list is
+/// as it was; once sessions are free again the same Enter opens the file.
+#[test]
+fn w8a_v10_a_refused_session_at_open_is_said_on_the_status_row() {
+    let refused = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let flag = refused.clone();
+    let connect: Connect = Arc::new(move || {
+        if flag.load(Ordering::SeqCst) {
+            anyhow::bail!(
+                "cannot start sftp on box: mux_client_request_session: session request failed: \
+                 Session open refused by peer"
+            );
+        }
+        Ok(Box::new(LocalFs::new()) as Box<dyn RemoteFs + Send>)
+    });
+    let mut fx = fixture_with(Some("box"), connect, None);
+    fx.key(Key::F9);
+    fx.select("data.bin");
+    fx.key(Key::Enter);
+    fx.drv.until(&mut fx.b, 10, |b| b.opening.is_none());
+    assert!(fx.b.viewer.is_none(), "nothing opened");
+    assert_eq!(fx.b.status.text, crate::stream::SESSION_REFUSED);
+    assert_eq!(fx.current(), "data.bin", "the list is as it was");
+    refused.store(false, Ordering::SeqCst);
+    fx.key(Key::Enter);
+    fx.drv.until(&mut fx.b, 10, |b| b.viewer.is_some());
+    fx.settle();
+    assert!(
+        fx.drv
+            .find_text("00 01 02 03 04 05 06 07  08 09 0A 0B 0C 0D 0E 0F")
+            .is_some(),
+        "the hex rows"
+    );
 }
 
 /// A worker held at a known point until the test lets it go: `hold` (on the worker) says it
@@ -773,6 +853,13 @@ impl RemoteFs for Gated {
     fn remove(&mut self, p: &str) -> Result<()> {
         self.fs.remove(p)
     }
+    /// A stream reads on the local disk, ungated (06 §2).
+    fn into_ranged(
+        self: Box<Self>,
+        path: &str,
+    ) -> std::result::Result<Box<dyn crate::remote::Ranged>, crate::remote::Refused> {
+        Box::new(self.fs).into_ranged(path)
+    }
 }
 
 /// A `Connect` whose connections stop at `gate` in `at`.
@@ -793,18 +880,19 @@ fn gated(gate: &Gate, at: &'static str) -> Connect {
 fn esc_stops_a_fetch() {
     let gate = Gate::default();
     let mut fx = fixture_with(Some("box"), gated(&gate, "read_to"), None);
-    std::fs::write(format!("{}/big.bin", fx.root), vec![1u8; 2 << 20]).unwrap();
+    // An image: a file that is still fetched whole (a binary would open as a stream, 06 §7.1).
+    std::fs::write(format!("{}/big.png", fx.root), vec![1u8; 2 << 20]).unwrap();
     let root = fx.root.clone();
     fx.b.list(Some(0), root, None, None);
     fx.settle();
-    fx.select("big.bin");
+    fx.select("big.png");
     fx.key(Key::Enter);
     // The worker is held inside the fetch, a chunk in.
     gate.reached();
     fx.drv.idle(&mut fx.b, 1);
     let shown = fx.b.status_line().text;
     assert!(
-        shown.starts_with("fetching big.bin ") && shown.ends_with("Esc cancels"),
+        shown.starts_with("fetching big.png ") && shown.ends_with("Esc cancels"),
         "{shown}"
     );
     fx.key(Key::Escape);
@@ -816,11 +904,11 @@ fn esc_stops_a_fetch() {
         "{}",
         fx.b.status.text
     );
-    let copy = crate::cache::cache_path(&fx.cache, "box", &format!("{}/big.bin", fx.root));
+    let copy = crate::cache::cache_path(&fx.cache, "box", &format!("{}/big.png", fx.root));
     let left: Vec<String> = std::fs::read_dir(copy.parent().unwrap())
         .unwrap()
         .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
-        .filter(|n| n.starts_with("big.bin"))
+        .filter(|n| n.starts_with("big.png"))
         .collect();
     assert!(left.is_empty(), "nothing of the fetch is kept: {left:?}");
 }

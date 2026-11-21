@@ -220,6 +220,8 @@ fn main() -> ExitCode {
         }),
     };
     rec.ok = matches!(result, Ok(0));
+    // 06 §11: what every stream of the run received.
+    rec.bytes_fetched = gui::streamed::bytes_fetched();
     if let Ok(dirs) = &dirs {
         if let Err(e) = sopen::usage::append(&dirs.state, &rec) {
             sopen::debug!("usage log not written: {e:#}");
@@ -306,7 +308,7 @@ impl Place {
         match target {
             Target::Remote(spec) => {
                 rec.host = Some(spec.label());
-                let fs = SftpRemote::connect(spec, &dirs.state)?;
+                let fs = SftpRemote::connect(spec, &dirs.state).map_err(refusal_said)?;
                 Ok((Place::Remote(spec.clone(), Box::new(fs)), spec.path.clone()))
             }
             Target::Local(path) => {
@@ -369,6 +371,17 @@ impl Place {
     fn into_origin(self, abs: &str, at: Stat, dirs: &Dirs) -> gui::Origin {
         let (fs, reconnect, label) = self.into_parts(dirs);
         gui::Origin::new(fs, reconnect, label, abs.to_string(), at)
+    }
+}
+
+/// 06 §6: a session sshd refused at open is said in the window's words (nothing is open yet);
+/// any other error is as it was.
+fn refusal_said(e: anyhow::Error) -> anyhow::Error {
+    if sopen::stream::session_refused(&format!("{e:#}")) {
+        sopen::debug!("{e:#}");
+        anyhow::anyhow!(sopen::stream::SESSION_REFUSED)
+    } else {
+        e
     }
 }
 
@@ -464,7 +477,7 @@ fn run_open(
     let (mut place, path) = Place::connect(&target, dirs, rec)?;
     let abs = place.fs().realpath(&path)?;
     let stat = place.fs().stat(&abs)?;
-    let kind = kind::detect(place.fs(), &abs, &stat)?;
+    let (kind, sniff) = kind::detect_sniffed(place.fs(), &abs, &stat)?;
     rec.kind = Some(kind);
     rec.ext = kind::extension(remote::split_parent(&abs).1);
     rec.bytes = stat.size;
@@ -481,13 +494,13 @@ fn run_open(
         if stat.is_dir {
             bail!("--hex opens files; {} is a directory", place.display(&abs));
         }
-        return open_binary(place, &abs, stat.size, None, true, dirs, rec);
+        return open_binary(place, &abs, stat.size, sniff, None, true, dirs, rec);
     }
     match route(kind) {
         Route::Browser => open_in_browser(place, &abs, dirs, rec),
         Route::Editor => open_in_editor(&mut place, &abs, kind, dirs, rec),
         Route::Window => open_in_window(place, &abs, kind, dirs, rec),
-        Route::Binary => open_binary(place, &abs, stat.size, None, false, dirs, rec),
+        Route::Binary => open_binary(place, &abs, stat.size, sniff, None, false, dirs, rec),
     }
 }
 
@@ -678,12 +691,15 @@ impl gui::binary::Meter for Meter {
 }
 
 /// A file sopen has no window for, or any file with `--hex` (spec §6a): the library's route
-/// ([`gui::binary::open_file`]) over this file's connection. `fetched` = already in the cache
-/// (a `.ts` that turned out not to be media).
+/// ([`gui::binary::open_file`]) over this file's connection, which becomes the hex window's
+/// stream for a remote file (06 §7.5). `sniff` = the bytes the kind sniff read of it; `fetched`
+/// = already in the cache (a `.ts` that turned out not to be media).
+#[allow(clippy::too_many_arguments)]
 fn open_binary(
     place: Place,
     abs: &str,
     size: u64,
+    sniff: u64,
     fetched: Option<Fetched>,
     hex: bool,
     dirs: &Dirs,
@@ -698,7 +714,8 @@ fn open_binary(
         local: fetched.is_some() || matches!(place, Place::Local(_)),
     };
     let (fs, reconnect, label) = place.into_parts(dirs);
-    let source = gui::binary::FileSource::new(fs, reconnect, label, abs, &dirs.cache, fetched);
+    let source = gui::binary::FileSource::new(fs, reconnect, label, abs, &dirs.cache, fetched)
+        .sniffed(sniff);
     let out = gui::binary::open_file(
         info,
         source,
@@ -753,7 +770,7 @@ fn open_in_window(
     rec.kind = Some(kind);
     if kind == Kind::Other {
         // A `.ts` ffprobe cannot read as media: the binary dialog, on the copy already here.
-        return open_binary(place, abs, at.size, fetched, false, dirs, rec);
+        return open_binary(place, abs, at.size, 0, fetched, false, dirs, rec);
     }
     let notices = fetched
         .as_ref()

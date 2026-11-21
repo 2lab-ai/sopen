@@ -583,7 +583,7 @@ size rule. Image and media upload their output, as today.
     remote files. ED6 lets Save take the URL. The baseline for a remote file of at most 256 MiB
     comes from §4.5's baseline pass, through the `bulk` URL; above that, from the first and last
     1 MiB (§3).
-  - ED6 lands **before** W8, so remote media Save never breaks between them (06 §13).
+  - ED6 lands **before** W8b, which routes remote media through a Source, so remote media Save never breaks between them (06 §13).
 - **After a remote Save lands**, PR #15 plays the staged render, which now equals the remote file.
   ED6 keeps that, and **closes the window's Source and its byte server**. The window's `Input`
   becomes the staged render's path, so the window never shows `Replaced` for its own save. The next
@@ -817,9 +817,9 @@ browser's experiments are its own E1–E5 (02 §8.2).
 | ED1 | **Patch primitives and the save algorithms.** A `PatchFs` trait (open by handle, positional writes, `fstat`, `fsync`, `statvfs`); the one `copy-data` loop, S1-C's, extended to about 1 s per request; §4.2–§4.5 as window-free functions, reading fresh; the undo-file writer; a hook at every step to stop there or lose the reply (E18) | `src/remote/patch.rs`, `src/remote/patch/tests.rs`, `src/remote/sftp/patch.rs` (SFTP), `src/remote/local/patch.rs` (`LocalFs`: a plain copy and `pwrite`, the trait's local half for tests) — all new; one `mod` line each in `src/remote/{mod,sftp,local}.rs`; `src/remote/sftp/ops.rs` (the copy loop's chunk size); a provided method `RemoteFs::patcher()` returning `None` | W1; S1-C merged; X2 |
 | ED2 | **Journal.** Its durable creation, immutable generations published through `CURRENT` (§3), the 250 ms scheduling, the lock, listing a file's orphans, kinds, `seen` evidence, the `save` intent for every kind and route, temp ownership, and reconciliation (§3.1) | `src/journal.rs`, `src/journal/tests.rs` (new); `src/lib.rs` (`mod journal`) | — |
 | ED3 | **Save As modal and F7.** The shared modal (path, Browse, the expected time, progress, cancel) over `binary::save_new`; F7 "SaveAs" in the three F-key rows | `src/gui/save_as.rs`, `src/gui/save_as/tests.rs` (new); `src/gui/mod.rs` (`mod save_as`); `src/gui/chrome.rs` (the F7 entries of the hex, image and media key rows only) | browser S1 merged (S1-A owns `chrome.rs`'s body) |
-| ED4 | **Hex edit.** Save by ED1, no edits or undo while it runs, Save copy, Save As by ED3, the journal, Restore's checks, reconciliation on open, recovery and undo-file rows, the one-time confirmation, the prompt, the `Origin` refused at Save (E21); removes 06 §7.1's interim Save | `src/gui/hex/file.rs`, `src/gui/hex.rs`, `src/gui/hex/tests.rs` | W4, W8, ED1, ED2, ED3 |
+| ED4 | **Hex edit.** Save by ED1, no edits or undo while it runs, Save copy, Save As by ED3, the journal, Restore's checks, reconciliation on open, recovery and undo-file rows, the one-time confirmation, the prompt, the `Origin` refused at Save (E21); removes 06 §7.1's interim Save | `src/gui/hex/file.rs`, `src/gui/hex.rs`, `src/gui/hex/tests.rs` | W4, W8a, ED1, ED2, ED3 |
 | ED5 | **Image edit.** First a pure move of the write side (`ImageFile`) into `src/gui/image/file.rs`; then the operation journal, the whole-hash next baseline at every size, no edits or undo while a Save runs, and Save As | `src/gui/image/file.rs` (new), `src/gui/image.rs`, `src/gui/image/robustness_tests.rs` | W6, ED2, ED3 |
-| ED6 | **Media edit on streams.** Save taking a URL `Input`; the baseline pass for remote files; Save, Save As and Export through the URL, failed on a cut response; the hard-link backup through the existing `link_new` (no remote-layer change) and its disclosure; closing the Source after a remote Save; the journal and its evidence | `src/gui/media/file.rs`, `src/gui/media.rs`, `src/gui/media/edit_tests.rs` | W7, ED2, ED3; **before W8** |
+| ED6 | **Media edit on streams.** Save taking a URL `Input`; the baseline pass for remote files; Save, Save As and Export through the URL, failed on a cut response; the hard-link backup through the existing `link_new` (no remote-layer change) and its disclosure; closing the Source after a remote Save; the journal and its evidence | `src/gui/media/file.rs`, `src/gui/media.rs`, `src/gui/media/edit_tests.rs` | W7, ED2, ED3; **before W8b** |
 | D1 | **Docs.** 01 rewritten to the shipped contract (06 §14, §13 above); AGENTS.md rules and the 06 §11 hooks; README; 06 and 07 marked shipped | `.prd/01-spec.md`, `AGENTS.md`, `README.md`, `.prd/06-streaming.md`, `.prd/07-streaming-edit.md` | every unit of 06 and 07 |
 
 **Order.**
@@ -827,8 +827,8 @@ browser's experiments are its own E1–E5 (02 §8.2).
 2. ED1 after W1 and S1-C.
 3. ED3 once S1 has merged.
 4. ED5 after W6.
-5. ED6 after W7, then W8.
-6. ED4 after W8.
+5. ED6 after W7, then W8b.
+6. ED4 after W8a.
 7. D1 last.
 
 loop.md has the merge order across both workstreams.

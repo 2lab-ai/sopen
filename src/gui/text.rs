@@ -42,7 +42,7 @@
 //! [`Bytes`] and is not indexed at open. Its first 64 KiB block is its first screen: until it
 //! arrives the window says `loading…`, and nothing else is fetched before that screen is drawn.
 //! The index then grows from byte 0 on the frames, through a Bulk reader, as far as
-//! [`HIGHLIGHT_MAX`] (a preview: [`PREVIEW_INDEX`]); the top bar says how far the lines are
+//! [`HIGHLIGHT_MAX`] (a preview: the budget its route gives it, 02 §4.3); the top bar says how far the lines are
 //! known, and the gutter is sized once, for the most lines that index can hold. A read whose
 //! bytes are not here yet is [`Pending`]: it travels up as [`Stale`] does, in an arm of its own
 //! — the page on screen stays, where the keys asked to go is kept, and the Source's waker
@@ -51,8 +51,9 @@
 //! reads through a reader of its own with the blocking read, so it waits for its bytes and
 //! never sees `Pending`; it highlights over the indexed lines as they grow. A file that
 //! changed on the remote freezes the page until Cmd/Ctrl+R, which re-opens it and indexes it
-//! again from its first block. Until the routes open a Source (06 §13: W8, after W5b), remote
-//! text is still fetched whole and read as a local file.
+//! again from its first block. The browser's route opens one for remote text of at most
+//! [`HIGHLIGHT_MAX`] (06 §13 W8a); a larger remote file is still fetched whole and read as a
+//! local file until W5b.
 
 mod wrap;
 
@@ -1782,10 +1783,6 @@ enum Jump {
     Line(u64),
 }
 
-/// A preview of a remote file indexes this much of it (02 §4.3's budget for text); the
-/// hand-over goes on from there (06 §7.2).
-pub const PREVIEW_INDEX: u64 = 4 << 20;
-
 /// The window's title in its frame, as PC Shell names its text viewer.
 const TITLE: &str = "Text Viewer";
 
@@ -1867,6 +1864,10 @@ struct TextWindow {
     /// input of its own, no following and no re-read. Its index may stop short of the file (the
     /// preview's 4 MiB); the hand-over ([`Window::set_preview`] `false`) resumes it.
     preview: bool,
+    /// How much of a stream its index pass reads while the window is a preview: 02 §4.3's
+    /// budget for text, given by the route that opened it ([`embed_source`]). `None`: no
+    /// budget was given, and a preview's pass goes as far as a viewer's.
+    preview_index: Option<u64>,
     /// A page read is on its way (06 §7.2): the page on screen is the one before it, and where
     /// the keys asked to go is kept until its bytes arrive. Also before a stream's first block,
     /// and while a place past the indexed lines waits for the index pass.
@@ -1994,6 +1995,7 @@ impl TextWindow {
             index_took,
             reindexes: 0,
             preview: false,
+            preview_index: None,
             #[cfg(test)]
             reindex_hook: None,
             #[cfg(test)]
@@ -2034,12 +2036,12 @@ impl TextWindow {
         }
     }
 
-    /// How far a stream's index pass goes: a preview's budget, else 16 MiB.
+    /// How far a stream's index pass goes: a preview's budget (the one its route gave it), else
+    /// 16 MiB.
     fn pass_cap(&self) -> u64 {
-        if self.preview {
-            PREVIEW_INDEX
-        } else {
-            HIGHLIGHT_MAX
+        match self.preview_index {
+            Some(budget) if self.preview => budget.min(HIGHLIGHT_MAX),
+            _ => HIGHLIGHT_MAX,
         }
     }
 
@@ -3066,7 +3068,9 @@ impl TextWindow {
         // A preview that shows only the start of its file says so on its last row (02 §4.3).
         // (A stream's pass stops at the preview's budget; a local file's was stopped there.)
         let short = self.doc.cut_short()
-            || (self.doc.is_stream() && !self.doc.whole() && self.doc.size() >= PREVIEW_INDEX);
+            || (self.doc.is_stream()
+                && !self.doc.whole()
+                && self.preview_index.is_some_and(|b| self.doc.size() >= b));
         let note = (self.preview && short && framed.height() >= 2.0 * row_h)
             .then(|| format!("preview of the first {}", amount(self.doc.size())));
         let rect = match note {
@@ -3515,6 +3519,13 @@ impl Window for TextWindow {
         self.preview = on;
     }
 
+    /// Held without being drawn, a streamed viewer does not poll its file (06 §5).
+    fn set_shown(&mut self, shown: bool) {
+        if let Some(source) = self.doc.source() {
+            source.set_visible(shown);
+        }
+    }
+
     /// F2 switches wrapping: the row says what it does now.
     fn keys(&self) -> &'static [chrome::FKey] {
         if self.wrap {
@@ -3573,15 +3584,19 @@ pub fn embed(
 
 /// The text viewer on a remote file read through `source` (06 §7.2): the window opens at once,
 /// shows the first block when it arrives and indexes on from there. `title`, `name`, `notices`
-/// and `at` as [`embed`]'s; it is never followed at its end.
+/// and `at` as [`embed`]'s; it is never followed at its end. `preview_index`: how much of the
+/// file its index pass reads while the window is a preview (02 §4.3's budget for text, given
+/// by the route: the one constant is the route's); the hand-over goes on from there.
 pub fn embed_source(
     source: Source,
     title: String,
     name: &str,
     notices: Vec<String>,
     at: Option<u64>,
+    preview_index: Option<u64>,
 ) -> Embedded {
     let mut window = TextWindow::new(TextDoc::streamed(source), title, name, notices);
+    window.preview_index = preview_index;
     window.jump = at.map(Jump::Byte);
     Embedded {
         window: Box::new(window),

@@ -699,12 +699,17 @@ impl Browser {
             ctx.clone(),
             abs.clone(),
         );
+        let began = std::time::Instant::now();
         let worker = std::thread::spawn(move || {
+            let repaint = waker.clone();
+            let wake: crate::stream::Waker = Arc::new(move || repaint.request_repaint());
             let req = prepare::Request {
                 connect: &connect,
                 label: label.as_deref(),
                 abs: &path,
                 cache: &cache,
+                wake: &wake,
+                began,
             };
             let mut progress = |now, all| {
                 d.store(now, Ordering::Relaxed);
@@ -1074,8 +1079,9 @@ impl Browser {
                 self.status = Status::info("cancelled; nothing was kept");
                 return;
             }
+            // 06 §6: a session sshd refused is said in its own words; the list is as it was.
             Err(e) => {
-                self.status = Status::error(format!("{e:#}"));
+                self.status = Status::error(crate::stream::explain(&e));
                 return;
             }
         };
@@ -1102,8 +1108,8 @@ impl Browser {
                 notices,
                 claim,
             } => {
-                // A file read in place (no fetched copy) is followed at its end.
-                let live = claim.is_none();
+                // A file read in place (no fetched copy, no stream) is followed at its end.
+                let live = claim.is_none() && !doc.is_stream();
                 let at = self.open_at.take();
                 (
                     super::text::embed(doc, title, &name, notices, live, at),

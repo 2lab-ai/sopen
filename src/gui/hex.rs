@@ -2663,6 +2663,13 @@ impl super::Window for HexWindow {
         self.preview = on;
     }
 
+    /// Held without being drawn, a streamed window does not poll its file (06 §5).
+    fn set_shown(&mut self, shown: bool) {
+        if let Some(stream) = &self.stream {
+            stream.set_visible(shown);
+        }
+    }
+
     fn close_requested(&mut self) -> bool {
         if self.close_ok || self.preview {
             return true;
