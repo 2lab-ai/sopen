@@ -1,7 +1,7 @@
 //! What a stream sends next (06 §4), with no I/O: each reader's readahead window, the queue by
 //! class, and the cap on what is sent and not yet answered.
 
-use super::cache::{shares, Protect, BLOCK};
+use super::cache::{shares, Protect, BLOCK, CACHE_BYTES};
 use super::ReaderKind;
 use std::collections::{BTreeMap, VecDeque};
 use std::time::{Duration, Instant};
@@ -9,6 +9,8 @@ use std::time::{Duration, Instant};
 /// The cap's bounds (06 §4).
 pub const CAP_MIN: u64 = 256 << 10;
 pub const CAP_MAX: u64 = 4 << 20;
+/// The blocks of every wait being served, together: what the cache holds.
+pub const HELD_BLOCKS: u64 = CACHE_BYTES / BLOCK;
 /// What a status request (a fence, half a poll) counts against what is in flight.
 pub const STATUS_BYTES: u64 = 100;
 
@@ -90,6 +92,9 @@ pub struct Admission {
     rate: Option<f64>,
     rtt_min: Option<Duration>,
     last_at: Option<Instant>,
+    /// Bytes of replies that came with no time since the one before: they count in the next
+    /// interval that has a length.
+    carried: u64,
 }
 
 impl Admission {
@@ -140,10 +145,11 @@ impl Admission {
         let from = self.last_at.map_or(own, |last| last.max(own));
         self.last_at = Some(at);
         let dt = at.saturating_duration_since(from).as_secs_f64();
-        if bytes == 0 || dt <= 0.0 {
+        self.carried += bytes;
+        if self.carried == 0 || dt <= 0.0 {
             return;
         }
-        let sample = bytes as f64 / dt;
+        let sample = std::mem::take(&mut self.carried) as f64 / dt;
         self.rate = Some(match self.rate {
             None => sample,
             Some(rate) => rate + (1.0 - (-dt).exp()) * (sample - rate),
@@ -163,6 +169,8 @@ pub struct Rest {
     pub off: u64,
     pub len: u32,
     pub class: Class,
+    /// Which fetch of the block it continues: one given up meanwhile is not continued.
+    pub attempt: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -187,12 +195,11 @@ struct ReaderState {
     kind: ReaderKind,
     ra: Readahead,
     cursor: u64,
-    /// The blocks it is waiting for, inclusive, and since when.
+    /// The blocks it is waiting for, inclusive, and since when. This is its demand: what of
+    /// it is neither visible nor on its way is what goes next, and a newer place replaces it.
     span: Option<(u64, u64)>,
     since: Option<Instant>,
-    /// Its waiting blocks not sent yet: a newer place replaces them.
-    demand: VecDeque<u64>,
-    demand_seq: u64,
+    span_seq: u64,
     prefetch: VecDeque<u64>,
     prefetch_seq: u64,
 }
@@ -240,8 +247,7 @@ impl Prefetcher {
                 cursor: 0,
                 span: None,
                 since: None,
-                demand: VecDeque::new(),
-                demand_seq: 0,
+                span_seq: 0,
                 prefetch: VecDeque::new(),
                 prefetch_seq: 0,
             },
@@ -270,7 +276,7 @@ impl Prefetcher {
         let wants: Vec<(u64, u64)> = self.readers.values().map(|r| limits(r.kind)).collect();
         let scaled = shares(&wants);
         Protect {
-            waiting: self.readers.values().filter_map(|r| r.span).collect(),
+            waiting: self.held().into_iter().map(|(_, span)| span).collect(),
             windows: self
                 .readers
                 .values()
@@ -285,11 +291,38 @@ impl Prefetcher {
         }
     }
 
+    /// The waits that are being served, oldest first, and their blocks: as many as fit the
+    /// cache together ([`HELD_BLOCKS`]). Their blocks are held until read (06 §3), so what is
+    /// held never passes the cache — a held block arriving always finds one to evict that is
+    /// not — and a wait beyond that is served, in its turn, once an older one has been read.
+    fn held(&self) -> Vec<(u64, (u64, u64))> {
+        let mut waits: Vec<(u64, u64, (u64, u64))> = self
+            .readers
+            .iter()
+            .filter_map(|(id, r)| Some((r.span_seq, *id, r.span?)))
+            .collect();
+        waits.sort_unstable();
+        let mut blocks = 0;
+        waits
+            .into_iter()
+            .take_while(|(_, _, (first, last))| {
+                blocks += last - first + 1;
+                blocks <= HELD_BLOCKS
+            })
+            .map(|(_, id, span)| (id, span))
+            .collect()
+    }
+
     /// Whether a reader is waiting for `block`.
     pub fn waits(&self, block: u64) -> bool {
         self.readers
             .values()
             .any(|r| r.span.is_some_and(|(a, b)| (a..=b).contains(&block)))
+    }
+
+    /// How many readers are waiting for blocks.
+    pub fn waiting_readers(&self) -> usize {
+        self.readers.values().filter(|r| r.span.is_some()).count()
     }
 
     /// Since when reader `id` has been waiting, and for which blocks.
@@ -317,9 +350,8 @@ impl Prefetcher {
         let r = self.readers.get_mut(&id)?;
         let before = r.ra.window();
         let access = r.ra.access(off, end, ahead);
-        let mut queued = false;
         let need: Vec<u64> = blocks_of(off, end).filter(|b| !cached(*b)).collect();
-        let unsent: VecDeque<u64> = need.iter().copied().filter(|b| !have(*b)).collect();
+        let mut queued = false;
         if need.is_empty() {
             r.span = None;
             r.since = None;
@@ -327,13 +359,11 @@ impl Prefetcher {
             let span = (*blocks_of(off, end).start(), *blocks_of(off, end).end());
             if r.span != Some(span) {
                 r.since = Some(now);
+                r.span_seq = seq;
+                // A new wait: the engine hears of it once, not at every look.
+                queued = need.iter().any(|b| !have(*b));
             }
             r.span = Some(span);
-        }
-        if r.demand != unsent {
-            queued |= !unsent.is_empty();
-            r.demand = unsent;
-            r.demand_seq = seq;
         }
         if access != Access::Same {
             r.cursor = off;
@@ -377,7 +407,6 @@ impl Prefetcher {
         if let Some(r) = self.readers.get_mut(&id) {
             r.span = None;
             r.since = None;
-            r.demand.clear();
         }
     }
 
@@ -394,17 +423,17 @@ impl Prefetcher {
         self.rests.iter().any(|r| r.block == block)
     }
 
-    /// Everything queued is dropped (a change, a failure, a reload); the readers stay.
+    /// Everything queued is dropped (a change, a failure, a reload), every wait with it: a
+    /// reader asks again. The readers stay.
     pub fn clear(&mut self, forget_places: bool) {
         self.rests.clear();
         self.poll_due = false;
         for r in self.readers.values_mut() {
-            r.demand.clear();
             r.prefetch.clear();
+            r.span = None;
+            r.since = None;
             if forget_places {
                 r.ra = Readahead::default();
-                r.span = None;
-                r.since = None;
             }
         }
     }
@@ -412,10 +441,13 @@ impl Prefetcher {
     /// The next thing to send, by class and oldest first within a class (06 §4), or `None`.
     /// `have` says which blocks are visible or on their way: those are dropped from the queue.
     pub fn candidate(&mut self, have: &dyn Fn(u64) -> bool) -> Option<Cand> {
+        // Only the front of each queue is looked at: what is there already goes as it comes up.
         for r in self.readers.values_mut() {
-            r.demand.retain(|b| !have(*b));
-            r.prefetch.retain(|b| !have(*b));
+            while r.prefetch.front().is_some_and(|b| have(*b)) {
+                r.prefetch.pop_front();
+            }
         }
+        let held = self.held();
         let rest = |rests: &VecDeque<Rest>, class: Class| {
             rests.iter().find(|r| r.class == class).map(|r| Cand {
                 class: Some(class),
@@ -424,16 +456,18 @@ impl Prefetcher {
                 waiting: false,
             })
         };
+        // The oldest wait being served that still lacks a block, and that block.
         let waiting = |readers: &BTreeMap<u64, ReaderState>, bulk: bool| {
-            readers
-                .iter()
-                .filter(|(_, r)| r.bulk() == bulk && !r.demand.is_empty())
-                .min_by_key(|(_, r)| r.demand_seq)
-                .map(|(id, r)| Cand {
-                    class: Some(if bulk { Class::Bulk } else { Class::Demand }),
-                    reader: Some(*id),
-                    item: Item::Block(r.demand[0]),
-                    waiting: true,
+            held.iter()
+                .filter(|(id, _)| readers[id].bulk() == bulk)
+                .find_map(|(id, (first, last))| {
+                    let block = (*first..=*last).find(|b| !have(*b))?;
+                    Some(Cand {
+                        class: Some(if bulk { Class::Bulk } else { Class::Demand }),
+                        reader: Some(*id),
+                        item: Item::Block(block),
+                        waiting: true,
+                    })
                 })
         };
         let ahead = |readers: &BTreeMap<u64, ReaderState>, bulk: bool| {
@@ -470,14 +504,11 @@ impl Prefetcher {
         match cand.item {
             Item::Poll => self.poll_due = false,
             Item::Rest(rest) => self.drop_rest(rest.block),
+            // A waited block needs nothing taken: once sent it is on its way.
+            Item::Block(_) if cand.waiting => {}
             Item::Block(block) => {
                 if let Some(r) = cand.reader.and_then(|id| self.readers.get_mut(&id)) {
-                    let queue = if cand.waiting {
-                        &mut r.demand
-                    } else {
-                        &mut r.prefetch
-                    };
-                    queue.retain(|b| *b != block);
+                    r.prefetch.retain(|b| *b != block);
                 }
             }
         }

@@ -145,14 +145,26 @@ pub trait Bytes {
     fn try_read(&mut self, off: u64, len: usize) -> Poll<Result<bytes::Bytes>>;
 
     /// Workers and HTTP connections: blocks until `buf` is full or the file ends, and returns
-    /// the count. `Err(Cancelled)` once `cancel` is set.
+    /// the count. `Err(Cancelled)` once `cancel` is set: it is looked at between reads, and a
+    /// read already in the system is not interrupted.
     fn read_at(&mut self, off: u64, buf: &mut [u8], cancel: &AtomicBool) -> Result<usize>;
 }
 
-fn local_read(file: &std::fs::File, off: u64, buf: &mut [u8]) -> Result<usize> {
+/// Fills `buf` from `off` through `read` (a positioned read), until it is full or the file ends.
+pub(crate) fn fill(
+    mut read: impl FnMut(&mut [u8], u64) -> std::io::Result<usize>,
+    off: u64,
+    buf: &mut [u8],
+    cancel: Option<&AtomicBool>,
+) -> Result<usize> {
     let mut got = 0;
     while got < buf.len() {
-        match file.read_at(&mut buf[got..], off + got as u64) {
+        // Between reads, a retry after an interrupted one included; a read already in the
+        // system is not interrupted.
+        if cancel.is_some_and(|c| c.load(Ordering::SeqCst)) {
+            return Err(ReadError::Cancelled);
+        }
+        match read(&mut buf[got..], off + got as u64) {
             Ok(0) => break,
             Ok(n) => got += n,
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
@@ -169,17 +181,18 @@ impl Bytes for std::fs::File {
 
     fn try_read(&mut self, off: u64, len: usize) -> Poll<Result<bytes::Bytes>> {
         let mut buf = vec![0; len.min(MAX_READ)];
-        Poll::Ready(local_read(self, off, &mut buf).map(|n| {
-            buf.truncate(n);
-            buf.into()
-        }))
+        let file = &*self;
+        Poll::Ready(
+            fill(|b, at| file.read_at(b, at), off, &mut buf, None).map(|n| {
+                buf.truncate(n);
+                buf.into()
+            }),
+        )
     }
 
     fn read_at(&mut self, off: u64, buf: &mut [u8], cancel: &AtomicBool) -> Result<usize> {
-        if cancel.load(Ordering::SeqCst) {
-            return Err(ReadError::Cancelled);
-        }
-        local_read(self, off, buf)
+        let file = &*self;
+        fill(|b, at| file.read_at(b, at), off, buf, Some(cancel))
     }
 }
 

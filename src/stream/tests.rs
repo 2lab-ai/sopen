@@ -4,7 +4,7 @@
 //! read and what was sent.
 
 use super::cache::Protect;
-use super::prefetch::{Access, Admission, Readahead, STATUS_BYTES};
+use super::prefetch::{Access, Admission, Item, Readahead, STATUS_BYTES};
 use super::source::{Engine, Flow, Settings, Traced};
 use super::*;
 use crate::remote::{
@@ -206,13 +206,24 @@ impl Rig {
         panic!("{len} bytes at {off} never came");
     }
 
-    /// Reads `[from, to)` in `chunk`s, checking every byte against the pattern.
+    /// Reads `count` chunks of `chunk` bytes from `from`: each must come whole, with the
+    /// pattern's bytes.
+    fn stream_exact(&mut self, r: &mut Reader, from: u64, chunk: usize, count: u64) {
+        for i in 0..count {
+            let off = from + i * chunk as u64;
+            let got = self.read(r, off, chunk);
+            assert_eq!(got.len(), chunk, "a read of {chunk} bytes at {off}");
+            assert!(got[..] == pattern(off, chunk)[..], "bytes at {off}");
+        }
+    }
+
+    /// Reads `[from, to)` in `chunk`s (the last one what is left), each held to its length.
     fn stream(&mut self, r: &mut Reader, from: u64, to: u64, chunk: usize) {
         let mut off = from;
         while off < to {
-            let got = self.read(r, off, chunk);
-            assert!(got[..] == pattern(off, got.len())[..], "bytes at {off}");
-            off += chunk as u64;
+            let want = chunk.min((to - off) as usize);
+            self.stream_exact(r, off, want, 1);
+            off += want as u64;
         }
     }
 
@@ -302,14 +313,22 @@ fn the_cache_keeps_its_bound_and_spares_what_readers_need() {
         waiting: vec![(3, 3)],
         windows: vec![(0, 100)],
     };
-    cache.insert(7, block(7), false, &all);
+    assert!(cache.insert(7, block(7), false, &all));
     assert!(cache.contains(3) && !cache.contains(1) && cache.len() == 4);
+    // A block a reader waits for is never evicted: with nothing else to evict, the new
+    // block is not kept, and the bound holds.
     let waited = Protect {
         waiting: vec![(0, 100)],
         windows: vec![],
     };
-    cache.insert(8, block(8), false, &waited);
-    assert_eq!(cache.len(), 4, "the bound holds over everything");
+    let before: Vec<bool> = (0..9).map(|b| cache.contains(b)).collect();
+    assert!(!cache.insert(8, block(8), false, &waited), "not kept");
+    let after: Vec<bool> = (0..9).map(|b| cache.contains(b)).collect();
+    assert_eq!(
+        (before, cache.len()),
+        (after, 4),
+        "and nothing waited for went"
+    );
     // A Bulk reader's block goes in at the cold end: the next to go.
     cache.insert(9, block(9), true, &none);
     cache.insert(10, block(10), false, &none);
@@ -415,6 +434,62 @@ fn the_cap_follows_rate_and_round_trip_within_its_clamp() {
     adm.answered(BLOCK);
     assert!(adm.admits(BLOCK) && !adm.admits(BLOCK + 1));
     assert_eq!(adm.max_in_flight(), CAP_MAX);
+}
+
+/// 06 §4: within the bulk class a waiting block goes before readahead, whatever their ages —
+/// a pass is stalled on the one, and only ahead of itself with the other. Both go behind
+/// every foreground item.
+#[test]
+fn a_bulk_readers_waiting_block_goes_before_older_bulk_readahead() {
+    let mut pf = Prefetcher::default();
+    let now = Instant::now();
+    let none = |_: u64| false;
+    let block_of = |pf: &mut Prefetcher| match pf.candidate(&none) {
+        Some(cand) => (cand.class, cand.item),
+        None => panic!("nothing queued"),
+    };
+    // An older pass, two sequential reads in: readahead queued, and it waits for nothing
+    // once its own block is in.
+    let old = pf.open(ReaderKind::Bulk);
+    pf.access(old, 0, BLOCK, GIB, now, &none, &none);
+    pf.access(old, BLOCK, 2 * BLOCK, GIB, now, &none, &none);
+    pf.satisfied(old);
+    assert_eq!(
+        block_of(&mut pf),
+        (Some(Class::Bulk), Item::Block(2)),
+        "its readahead"
+    );
+    // A newer pass waits for a block: that goes first.
+    let new = pf.open(ReaderKind::Bulk);
+    pf.access(new, 500 * BLOCK, 501 * BLOCK, GIB, now, &none, &none);
+    assert_eq!(block_of(&mut pf), (Some(Class::Bulk), Item::Block(500)));
+    // A viewer's readahead, newer than both, goes before either.
+    let viewer = pf.open(ReaderKind::Interactive);
+    let seen = |b: u64| b == 900;
+    pf.access(
+        viewer,
+        900 * BLOCK,
+        900 * BLOCK + 480,
+        GIB,
+        now,
+        &seen,
+        &seen,
+    );
+    pf.access(
+        viewer,
+        900 * BLOCK + 480,
+        900 * BLOCK + 960,
+        GIB,
+        now,
+        &seen,
+        &seen,
+    );
+    assert_eq!(pf.waiting_readers(), 1, "only the newer pass waits");
+    assert_eq!(
+        block_of(&mut pf),
+        (Some(Class::Prefetch), Item::Block(901)),
+        "foreground readahead before any bulk"
+    );
 }
 
 // ---- the first screen ----
@@ -542,7 +617,17 @@ fn v4_one_reader_streaming_stays_within_the_cap() {
     assert!(stats.fetched.prefetch > 6 * MIB, "readahead carried it");
     // 06 §12 V2's bound: what was fetched beyond what was read is one run's window.
     assert!(stats.fetched.total <= stats.delivered + MIB + BLOCK);
-    assert_eq!(stats.fetched.total, reads * BLOCK, "no block fetched twice");
+    assert_eq!(stats.fetched.total, reads * BLOCK);
+    let offsets: Vec<u64> = sent
+        .iter()
+        .filter_map(|s| match s.asked {
+            Asked::Read { off, .. } => Some(off),
+            _ => None,
+        })
+        .collect();
+    let distinct: std::collections::BTreeSet<u64> = offsets.iter().copied().collect();
+    assert_eq!(distinct.len(), offsets.len(), "no block fetched twice");
+    assert!(offsets.iter().all(|off| off % BLOCK == 0));
     assert!(stats.max_in_flight <= CAP_MAX + STATUS_BYTES);
 }
 
@@ -805,7 +890,29 @@ fn v4_when_the_cap_falls_nothing_is_sent_until_it_fits() {
     assert!(out > CAP_MIN, "more is out than the floor admits: {out}");
     let n = rig.trace().len();
     rig.control.set_link(|l| l.rate = 500_000);
-    rig.stream(&mut player, 40 * MIB, 46 * MIB, BLOCK as usize);
+    // The checkpoint: work is queued, and more is out than the lowered cap itself — which only
+    // a fallen cap allows. A pump there sends no read; nothing sent is recalled either.
+    let mut held = 0;
+    let mut off = 40 * MIB;
+    while off < 46 * MIB {
+        rig.stream(&mut player, off, off + BLOCK, BLOCK as usize);
+        off += BLOCK;
+        let (queued, flying, cap) = {
+            let mut core = rig.source().core();
+            (core.queued(), core.pf.adm.in_flight(), core.pf.adm.cap())
+        };
+        if queued && flying > cap {
+            let before = rig.trace().len();
+            rig.engine.pump();
+            assert_eq!(
+                rig.trace().len(),
+                before,
+                "sent with {flying} out against a cap of {cap}"
+            );
+            held += 1;
+        }
+    }
+    assert!(held > 0, "the lowered cap never held queued work back");
     let low = rig.source().core().pf.adm.cap();
     assert!(low < high / 2, "the cap fell: {high} to {low}");
     // Every read after the drop went only when what was out plus its block fit the cap of
@@ -823,6 +930,13 @@ fn v4_when_the_cap_falls_nothing_is_sent_until_it_fits() {
             assert!(t.in_flight + t.bytes <= t.cap, "{t:?}");
         }
     }
+    // And admission resumes once what is out fits again.
+    let before = rig.trace().len();
+    rig.drain();
+    assert!(
+        rig.trace()[before..].iter().any(|t| t.class.is_some()),
+        "reads go again"
+    );
     rig.check_admission();
 }
 
@@ -1320,38 +1434,46 @@ fn no_reopen() -> Reopen {
 /// holds — and once the engine goes on, it sends nothing.
 #[test]
 fn v8_dropping_the_source_does_not_wait_for_the_engine() {
-    let (entered_tx, entered) = mpsc::channel();
-    let (release, held) = mpsc::channel::<()>();
-    let (transport, control) = fake("/m.bin", FakeFile::pattern(MIB), Link::instant());
-    let again = control.clone();
-    control.fault(0, Fault::Lost);
-    let reopen: Reopen = Box::new(move || {
-        entered_tx.send(()).unwrap();
-        let _ = held.recv();
-        again.open()
-    });
-    let source = Source::open(transport, reopen, Arc::new(|| {})).unwrap();
-    let mut r = source.reader(ReaderKind::Interactive);
-    let cancel = AtomicBool::new(false);
-    let lost = r.read_at(0, &mut [0; 16], &cancel);
-    assert!(matches!(lost, Err(ReadError::Failed(_))), "{lost:?}");
-    // The next read of something not cached asks for the retry.
-    assert!(matches!(
-        r.try_read(0, 16),
-        Poll::Ready(Err(ReadError::Failed(_)))
-    ));
-    entered.recv_timeout(HANG).expect("the engine reconnects");
-    let thread = source.thread().unwrap();
-    let n = control.sent().len();
-    drop(source);
-    assert!(
-        !thread.is_finished(),
-        "the engine is still inside the reconnect"
+    bounded(
+        "v8_dropping_the_source_does_not_wait_for_the_engine",
+        || {
+            let (entered_tx, entered) = mpsc::channel();
+            let (release, held) = mpsc::channel::<()>();
+            let (transport, control) = fake("/m.bin", FakeFile::pattern(MIB), Link::instant());
+            let again = control.clone();
+            control.fault(0, Fault::Lost);
+            let reopen: Reopen = Box::new(move || {
+                entered_tx.send(()).unwrap();
+                let _ = held.recv();
+                again.open()
+            });
+            let source = Source::open(transport, reopen, Arc::new(|| {})).unwrap();
+            let mut r = source.reader(ReaderKind::Interactive);
+            let cancel = AtomicBool::new(false);
+            let lost = r.read_at(0, &mut [0; 16], &cancel);
+            assert!(matches!(lost, Err(ReadError::Failed(_))), "{lost:?}");
+            // The next read of something not cached asks for the retry.
+            assert!(matches!(
+                r.try_read(0, 16),
+                Poll::Ready(Err(ReadError::Failed(_)))
+            ));
+            entered.recv_timeout(HANG).expect("the engine reconnects");
+            let thread = source.thread().unwrap();
+            let n = control.sent().len();
+            // The drop must return while the engine is held inside the reconnect. Should it wait for
+            // the engine instead, the bound fails this test, and the unwinding lets go of the
+            // reconnect (`release` drops), so nothing stays blocked behind it.
+            bounded("dropping the source", move || drop(source));
+            assert!(
+                !thread.is_finished(),
+                "the engine is still inside the reconnect"
+            );
+            assert_eq!(r.try_read(0, 16), Poll::Ready(Err(ReadError::Closed)));
+            drop(release);
+            bounded("the engine's thread ending", move || thread.join()).unwrap();
+            assert_eq!(control.sent().len(), n, "nothing requested after the close");
+        },
     );
-    assert_eq!(r.try_read(0, 16), Poll::Ready(Err(ReadError::Closed)));
-    release.send(()).unwrap();
-    thread.join().unwrap();
-    assert_eq!(control.sent().len(), n, "nothing requested after the close");
 }
 
 // ---- V9: the connection is lost ----
@@ -1530,6 +1652,512 @@ fn a_refused_session_is_said_in_words() {
     assert!(matches!(r.try_read(0, 480), Poll::Ready(Err(_))));
     rig.engine.pump();
     assert_eq!(rig.state(), State::Failed(SESSION_REFUSED.to_string()));
+}
+
+// ---- review round 1 ----
+
+/// Runs `f` on a thread of its own and fails, with `what`, when it has not ended within
+/// `HANG`: a blocking call under test can only fail, never hang the run.
+fn bounded<T: Send + 'static>(what: &str, f: impl FnOnce() -> T + Send + 'static) -> T {
+    let (done_tx, done) = mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        let _ = done_tx.send(f());
+    });
+    match done.recv_timeout(HANG) {
+        Ok(got) => got,
+        Err(mpsc::RecvTimeoutError::Timeout) => panic!("{what}: not done in {HANG:?}"),
+        // It ended without a result: it panicked, and this is its panic.
+        Err(mpsc::RecvTimeoutError::Disconnected) => match worker.join() {
+            Err(panic) => std::panic::resume_unwind(panic),
+            Ok(()) => unreachable!("it ended without a result or a panic"),
+        },
+    }
+}
+
+/// Spins until `cond`, failing with `what` after `HANG`.
+fn eventually(what: &str, mut cond: impl FnMut() -> bool) {
+    let started = Instant::now();
+    while !cond() {
+        assert!(started.elapsed() < HANG, "{what}: not in {HANG:?}");
+        std::thread::yield_now();
+    }
+}
+
+/// 06 §5, every part of a block needs a fence that returned the fingerprint: a prefetched
+/// block whose first part came short, and whose fence then failed, is given up — its bytes,
+/// its queued rest, and the rest already sent, whose own fence succeeds. Nothing of it is
+/// cached or served, and a later demand reads the block again from its start.
+#[test]
+fn a_prefetch_part_whose_fence_failed_is_never_shown() {
+    let mut rig = rig_with(FakeFile::pattern(MODEL), clipped(40_000), NEVER, None);
+    let mut r = rig.reader(ReaderKind::Interactive);
+    // Requests: 0 the screen's block (short), 1 its fence, 2 the margin's block 3 as prefetch
+    // (short), 3 its fence — which fails — 4 the screen's rest, 5 that fence, 6 block 3's
+    // rest, already sent when the failure arrives, 7 the rest's fence, which succeeds.
+    rig.control.fault(3, Fault::Status("Failure"));
+    let at = 3 * BLOCK - 480;
+    let got = rig.read(&mut r, at, 480);
+    assert!(got[..] == pattern(at, 480)[..]);
+    rig.drain();
+    let part = |off: u64, len: u64| Asked::Read {
+        off,
+        len: len as u32,
+    };
+    let asked: Vec<Asked> = rig.sent().iter().map(|s| s.asked).collect();
+    assert_eq!(asked[2..4], [read_of(3), Asked::Fstat]);
+    assert_eq!(
+        asked[6..],
+        [part(3 * BLOCK + 40_000, BLOCK - 40_000), Asked::Fstat]
+    );
+    assert_eq!(rig.state(), State::Live, "a failed prefetch is not shown");
+    assert!(
+        !rig.source().core().cache.contains(3),
+        "a block with a part no fence vouched for was cached"
+    );
+    assert_eq!(rig.source().core().held(), (0, 0), "nothing of it is kept");
+    // A demand reads it again, whole, and cleanly.
+    let mut other = rig.reader(ReaderKind::Interactive);
+    assert!(other.try_read(3 * BLOCK + 1000, 100).is_pending());
+    let got = rig.read(&mut other, 3 * BLOCK + 1000, 100);
+    assert!(got[..] == pattern(3 * BLOCK + 1000, 100)[..]);
+    assert_eq!(rig.sent()[8].asked, read_of(3), "from its start");
+    assert_eq!(rig.trace()[8].class, Some(Class::Demand));
+    rig.check_admission();
+}
+
+/// Overlapping reloads: each request is its own, and they run in the order asked. A reload
+/// that carries a save's baseline is never merged away by a plain one asked while it waits.
+#[test]
+fn a_saved_reload_is_not_replaced_by_a_plain_one_asked_while_it_waits() {
+    let mut rig = rig(MIB, Link::gate());
+    let states = Arc::new(Mutex::new(Vec::new()));
+    let (seen, watched) = (states.clone(), rig.source().clone());
+    rig.engine.at_handoff = Some(Box::new(move || {
+        seen.lock().unwrap().push(watched.state());
+    }));
+    // Not the file there: the saved reload must end `Changed`.
+    let wrong = Fingerprint {
+        size: 5,
+        mtime: UNIX_EPOCH,
+        sha256: None,
+    };
+    let saved = rig.source().clone();
+    let (done_tx, done) = mpsc::channel();
+    let caller = std::thread::spawn(move || {
+        let _ = done_tx.send(saved.reload_saved(wrong).map_err(|e| format!("{e:#}")));
+    });
+    eventually("the saved reload is queued", || {
+        rig.source().core().reloads_queued() == 1
+    });
+    rig.source().request_reload();
+    let mut result = None;
+    eventually("the saved reload returns", || {
+        rig.engine.pump();
+        result = done.try_recv().ok();
+        result.is_some()
+    });
+    caller.join().unwrap();
+    assert_eq!(result, Some(Ok(())));
+    assert_eq!(
+        *states.lock().unwrap(),
+        [State::Live, State::Changed],
+        "the saved reload ran, with its baseline, before the plain one"
+    );
+    assert_eq!(rig.source().core().channel, 3, "two reloads");
+    assert_eq!(rig.state(), State::Live);
+}
+
+/// The other order: a plain reload asked first, then a saved one. Both run.
+#[test]
+fn a_saved_reload_asked_behind_a_plain_one_still_runs_with_its_baseline() {
+    let mut rig = rig(MIB, Link::gate());
+    rig.source().request_reload();
+    let wrong = Fingerprint {
+        size: 5,
+        mtime: UNIX_EPOCH,
+        sha256: None,
+    };
+    let saved = rig.source().clone();
+    let (done_tx, done) = mpsc::channel();
+    let caller = std::thread::spawn(move || {
+        let _ = done_tx.send(saved.reload_saved(wrong).map_err(|e| format!("{e:#}")));
+    });
+    eventually("both reloads are queued", || {
+        rig.source().core().reloads_queued() == 2
+    });
+    let mut result = None;
+    eventually("the saved reload returns", || {
+        rig.engine.pump();
+        result = done.try_recv().ok();
+        result.is_some()
+    });
+    caller.join().unwrap();
+    assert_eq!(result, Some(Ok(())));
+    assert_eq!(rig.source().core().channel, 3, "two reloads");
+    assert_eq!(rig.state(), State::Changed, "the saved one ran last");
+}
+
+/// Two plain reloads asked before either starts are one reload; one asked while a reload is
+/// running is another.
+#[test]
+fn plain_reloads_merge_only_while_none_has_started() {
+    let mut rig = rig(MIB, Link::gate());
+    rig.source().request_reload();
+    rig.source().request_reload();
+    assert_eq!(rig.source().core().reloads_queued(), 1);
+    rig.engine.pump();
+    assert_eq!(rig.source().core().channel, 2, "merged");
+    let (again, mut asked) = (rig.source().clone(), false);
+    rig.engine.at_handoff = Some(Box::new(move || {
+        if !std::mem::replace(&mut asked, true) {
+            again.request_reload();
+        }
+    }));
+    rig.source().request_reload();
+    rig.engine.pump();
+    assert_eq!(
+        rig.source().core().channel,
+        4,
+        "the one in progress, then the one asked"
+    );
+    assert_eq!(rig.source().core().reloads_queued(), 0);
+    assert_eq!(rig.state(), State::Live);
+}
+
+/// A worker reading only through `read_at` recovers a failed stream by itself: its failed
+/// miss asks for the same rate-limited retry `try_read`'s does, and still returns the error.
+#[test]
+fn read_at_alone_asks_a_failed_stream_to_retry() {
+    let mut rig = rig(MIB, Link::gate());
+    let mut r = rig.reader(ReaderKind::Bulk);
+    rig.control.fault(0, Fault::Lost);
+    assert!(r.try_read(1000, 480).is_pending());
+    rig.drain();
+    assert!(matches!(rig.state(), State::Failed(_)));
+    let cancel = AtomicBool::new(false);
+    let mut buf = [0; 480];
+    let failed = r.read_at(1000, &mut buf, &cancel);
+    assert!(matches!(failed, Err(ReadError::Failed(_))), "{failed:?}");
+    rig.engine.pump();
+    assert_eq!(rig.reopens(), 1, "the read asked for a retry");
+    assert_eq!(rig.state(), State::Live);
+    // Within the same second another failure retries nothing.
+    rig.control.fault(rig.sent().len(), Fault::Lost);
+    assert!(r.try_read(1000, 480).is_pending());
+    rig.drain();
+    assert!(matches!(
+        r.read_at(1000, &mut buf, &cancel),
+        Err(ReadError::Failed(_))
+    ));
+    rig.engine.pump();
+    assert_eq!(rig.reopens(), 1, "at most once a second");
+    rig.advance(RETRY_EVERY);
+    assert!(r.read_at(1000, &mut buf, &cancel).is_err());
+    rig.engine.pump();
+    assert_eq!((rig.reopens(), rig.state()), (2, State::Live));
+    let got = rig.read(&mut r, 1000, 480);
+    assert!(got[..] == pattern(1000, 480)[..]);
+}
+
+/// V8, a close racing a reconnect: the engine has taken the retry and let go of the lock when
+/// the Source closes. Nothing is opened and nothing is requested after the close.
+#[test]
+fn v8_a_close_at_the_reconnect_handoff_opens_nothing() {
+    for reload in [false, true] {
+        let mut rig = rig(MIB, Link::gate());
+        let mut r = rig.reader(ReaderKind::Interactive);
+        rig.control.fault(0, Fault::Lost);
+        assert!(r.try_read(1000, 480).is_pending());
+        rig.drain();
+        assert!(matches!(r.try_read(1000, 480), Poll::Ready(Err(_))));
+        if reload {
+            rig.source().request_reload();
+        }
+        let n = rig.sent().len();
+        let closing = Arc::new(Mutex::new(rig.source.take()));
+        rig.engine.at_handoff = Some(Box::new(move || {
+            drop(closing.lock().unwrap().take());
+        }));
+        assert!(matches!(rig.engine.pump(), Flow::Closed));
+        assert_eq!(rig.reopens(), 0, "a connection opened after the close");
+        assert_eq!(rig.sent().len(), n);
+        assert_eq!(r.try_read(1000, 480), Poll::Ready(Err(ReadError::Closed)));
+    }
+}
+
+/// A local file's `read_at` looks at its cancel flag between the reads that fill the buffer,
+/// retries after an interrupted read included.
+#[test]
+fn a_local_read_at_is_cancelled_between_its_reads() {
+    use std::io::{Error, ErrorKind};
+    let cancel = AtomicBool::new(false);
+    let mut calls = 0;
+    let mut buf = [0u8; 100];
+    // A short read, during which the cancel is set: the fill stops there.
+    let got = fill(
+        |b, _| {
+            calls += 1;
+            match calls {
+                1 => {
+                    cancel.store(true, Ordering::SeqCst);
+                    b[..10].fill(7);
+                    Ok(10)
+                }
+                _ => Ok(0),
+            }
+        },
+        0,
+        &mut buf,
+        Some(&cancel),
+    );
+    assert_eq!((got, calls), (Err(ReadError::Cancelled), 1));
+    // An interrupted read, then the cancel: no retry.
+    cancel.store(false, Ordering::SeqCst);
+    let mut calls = 0;
+    let got = fill(
+        |_, _| {
+            calls += 1;
+            if calls == 1 {
+                cancel.store(true, Ordering::SeqCst);
+                return Err(Error::from(ErrorKind::Interrupted));
+            }
+            Ok(0)
+        },
+        0,
+        &mut buf,
+        Some(&cancel),
+    );
+    assert_eq!((got, calls), (Err(ReadError::Cancelled), 1));
+    // No flag (a frame's read), or a flag not set: interrupted reads are retried to the end.
+    cancel.store(false, Ordering::SeqCst);
+    for flag in [None, Some(&cancel)] {
+        let mut calls = 0;
+        let got = fill(
+            |b, at| {
+                calls += 1;
+                match calls {
+                    2 => Err(Error::from(ErrorKind::Interrupted)),
+                    4 => Ok(0),
+                    _ => {
+                        b[..30].fill(at as u8);
+                        Ok(30)
+                    }
+                }
+            },
+            5,
+            &mut buf,
+            flag,
+        );
+        assert_eq!((got, calls), (Ok(60), 4));
+        assert!(buf[..30] == [5; 30] && buf[30..60] == [35; 30]);
+    }
+}
+
+/// 06 §3, a block a reader waits for is never evicted: six readers each wait for 16 MiB,
+/// half again what the cache holds. The oldest waits are served first and hold their blocks
+/// until read; the others' turn comes as those complete. Every read completes, with its own
+/// bytes, and the cache never passes its bound.
+#[test]
+fn readers_waiting_for_more_than_the_cache_holds_all_complete() {
+    let mut rig = rig(MODEL, sim(1, 1_000_000_000));
+    let place = |i: u64| (i + 1) * GIB + 1000;
+    let mut readers: Vec<(u64, Reader, bool)> = (0..6)
+        .map(|i| (place(i), rig.reader(media()), false))
+        .collect();
+    // Nobody looks while everything asked for arrives: only the waits that fit the cache
+    // together are served — three of 257 blocks — and the fourth's blocks are not asked for.
+    for (at, r, _) in readers.iter_mut() {
+        assert!(r.try_read(*at, MAX_READ).is_pending());
+    }
+    // Bounded well above the turns three waits take (a read and a fence a block), so a
+    // stream that fetches without end fails here.
+    let mut settled = false;
+    for _ in 0..20_000 {
+        rig.engine.pump();
+        settled = rig.pending() == 0;
+        if settled {
+            break;
+        }
+        rig.engine.step(None);
+    }
+    assert!(
+        settled,
+        "the stream goes on fetching with no reader looking"
+    );
+    let span = (MAX_READ as u64 + 1000).div_ceil(BLOCK);
+    assert_eq!(rig.source().core().cache.len() as u64, 3 * span);
+    assert!(
+        rig.trace()
+            .iter()
+            .all(|t| t.block != Some(place(3) / BLOCK)),
+        "a fourth wait was served beside three that all but fill the cache"
+    );
+    let mut order = Vec::new();
+    // As frames do, the readers look again only when the waker fired.
+    let mut woken = usize::MAX;
+    for _ in 0..200_000 {
+        let wakes = rig.wakes();
+        for (i, (at, r, done)) in readers.iter_mut().enumerate() {
+            if *done || wakes == woken {
+                continue;
+            }
+            if let Poll::Ready(got) = r.try_read(*at, MAX_READ) {
+                let got = got.expect("a read");
+                assert_eq!(got.len(), MAX_READ);
+                assert!(got[..] == pattern(*at, MAX_READ)[..], "reader {i}'s bytes");
+                *done = true;
+                order.push(i);
+            }
+        }
+        woken = wakes;
+        assert!(rig.source().core().cache.len() as u64 <= CACHE_BYTES / BLOCK);
+        if order.len() == readers.len() {
+            break;
+        }
+        rig.engine.pump();
+        if rig.pending() > 0 {
+            rig.engine.step(None);
+        } else {
+            // Nothing is out: a reader must have something to read.
+            assert!(
+                rig.wakes() != woken || wakes != woken,
+                "stalled with {order:?} done"
+            );
+            woken = usize::MAX;
+        }
+    }
+    assert_eq!(
+        order,
+        [0, 1, 2, 3, 4, 5],
+        "every read completes, oldest first"
+    );
+    rig.drain();
+    rig.check_admission();
+    // No block was fetched twice: nothing a reader waited for was evicted under it.
+    let offsets: Vec<u64> = rig
+        .sent()
+        .iter()
+        .filter_map(|s| match s.asked {
+            Asked::Read { off, .. } => Some(off),
+            _ => None,
+        })
+        .collect();
+    let distinct: std::collections::BTreeSet<u64> = offsets.iter().copied().collect();
+    assert_eq!(distinct.len(), offsets.len(), "a block was fetched twice");
+    let blocks = (MAX_READ as u64 + 1000).div_ceil(BLOCK);
+    assert!(offsets.len() as u64 >= 6 * blocks);
+}
+
+/// A wait that did not fit beside the older ones is served when one of them ends — and the
+/// engine is told at once, however it ends: read, moved elsewhere, renewed, or its reader
+/// dropped. Otherwise it would sit unserved until something else woke the engine.
+#[test]
+fn the_engine_is_told_when_a_held_wait_ends() {
+    let mut rig = rig(MODEL, sim(1, 1_000_000_000));
+    let mut seen = rig.reader(ReaderKind::Interactive);
+    rig.read(&mut seen, 0, 480);
+    rig.drain();
+    let place = |i: u64| (i + 1) * GIB;
+    let mut held: Vec<Reader> = (0..4)
+        .map(|_| rig.reader(ReaderKind::Interactive))
+        .collect();
+    for (i, r) in held.iter_mut().enumerate() {
+        assert!(r.try_read(place(i as u64), MAX_READ).is_pending());
+    }
+    // Four waits of 16 MiB are the cache; a fifth is not served yet.
+    let mut fifth = rig.reader(ReaderKind::Interactive);
+    assert!(fifth.try_read(place(9), 480).is_pending());
+    let told = |rig: &mut Rig| {
+        rig.engine.pump();
+        assert!(!rig.source().core().kicked());
+        assert!(
+            rig.trace()
+                .iter()
+                .all(|t| t.block != Some(place(9) / BLOCK)),
+            "the fifth wait was served beside four that fill the cache"
+        );
+    };
+    told(&mut rig);
+    // Moved to a place already cached: its wait ends without a read of what it waited for.
+    assert!(held[0].try_read(0, 480).is_ready());
+    assert!(rig.source().core().kicked(), "a wait ended by moving away");
+    let got = rig.read(&mut fifth, place(9), 480);
+    assert!(
+        got[..] == pattern(place(9), 480)[..],
+        "and the fifth is served"
+    );
+    // The same for a reader dropped and one renewed, each with a new wait behind four.
+    for end in 0..2 {
+        assert!(held[0].try_read(place(4 + end), MAX_READ).is_pending());
+        let mut sixth = rig.reader(ReaderKind::Interactive);
+        assert!(sixth.try_read(place(11 + end), MAX_READ).is_pending());
+        rig.engine.pump();
+        assert!(!rig.source().core().kicked());
+        if end == 0 {
+            drop(held.remove(1));
+            held.push(rig.reader(ReaderKind::Interactive));
+        } else {
+            held[1].renew();
+        }
+        assert!(rig.source().core().kicked(), "a wait ended (case {end})");
+        drop(sixth);
+        let last = held.len() - 1;
+        assert!(held[last].try_read(place(20 + end), MAX_READ).is_pending());
+    }
+}
+
+/// `shares` adds in 128 bits: a window, or their sum, past 64 bits does not overflow.
+#[test]
+fn shares_do_not_overflow() {
+    let huge = limits(ReaderKind::Media {
+        bytes_per_s: u64::MAX,
+    });
+    assert_eq!(huge, (32 * MIB, u64::MAX));
+    let one = shares(&[huge]);
+    assert_eq!(
+        one,
+        [(FLOOR_AHEAD, PROTECTED_BYTES)],
+        "all but nothing of it is behind"
+    );
+    let many = shares(&[(u64::MAX / 2, 0); 4]);
+    assert_eq!(many, [(PROTECTED_BYTES / 4, 0); 4]);
+    let max = shares(&[(u64::MAX, u64::MAX), (MIB, 0)]);
+    assert_eq!(max[1], (MIB, 0));
+    assert!(max[0].0 + max[0].1 <= PROTECTED_BYTES / 2 + FLOOR_AHEAD);
+}
+
+/// Replies that arrive at one timestamp (a batch handed over together) all count toward the
+/// rate: their bytes are carried into the next interval that has a length.
+#[test]
+fn completions_at_one_timestamp_count_toward_the_rate() {
+    let ms = Duration::from_millis;
+    let t0 = Instant::now();
+    let mut adm = Admission::default();
+    // The first completion has no interval of its own, and two more share its instant.
+    adm.delivered(1000, Duration::ZERO, t0);
+    adm.delivered(1000, ms(5), t0);
+    adm.delivered(1000, ms(5), t0);
+    assert_eq!(adm.rate(), None, "no interval yet");
+    adm.delivered(1000, ms(10), t0 + ms(10));
+    assert_eq!(adm.rate(), Some(400_000.0), "4000 bytes in 10 ms");
+    // Later ones too: three at one instant, then the interval.
+    let mut one = adm.clone();
+    for _ in 0..3 {
+        adm.delivered(2000, ms(1), t0 + ms(10));
+    }
+    adm.delivered(2000, ms(10), t0 + ms(20));
+    one.delivered(8000, ms(10), t0 + ms(20));
+    assert_eq!(adm.rate(), one.rate(), "as one reply of their bytes");
+}
+
+/// `Rig::stream` holds every read to its length: a short result fails it.
+#[test]
+#[should_panic(expected = "a read of 480 bytes")]
+fn the_rigs_stream_refuses_a_short_read() {
+    let mut rig = rig(MIB, Link::gate());
+    let mut r = rig.reader(ReaderKind::Interactive);
+    // The last read ends past the file: it comes back 100 bytes long.
+    rig.stream_exact(&mut r, MIB - 580, 480, 2);
 }
 
 // ---- the cache under a Source ----
@@ -1727,68 +2355,81 @@ fn a_hidden_viewer_does_not_poll() {
 /// of the file, and a local `File` reads the same way through `Bytes`.
 #[test]
 fn read_at_blocks_until_the_bytes_come() {
-    let (source, _control) = threaded(FakeFile::pattern(3 * MIB + 5), Link::instant(), no_reopen());
-    let cancel = AtomicBool::new(false);
-    let mut r = source.reader(ReaderKind::Bulk);
-    let mut buf = vec![0; 2 * MIB as usize + 300];
-    assert_eq!(r.read_at(1000, &mut buf, &cancel), Ok(buf.len()));
-    assert!(buf[..] == pattern(1000, buf.len())[..]);
-    let mut tail = vec![0; 1000];
-    assert_eq!(r.read_at(3 * MIB - 10, &mut tail, &cancel), Ok(15));
-    assert!(tail[..15] == pattern(3 * MIB - 10, 15)[..]);
-    assert_eq!(r.read_at(3 * MIB + 5, &mut tail, &cancel), Ok(0));
-    assert_eq!(r.read_at(u64::MAX - 5, &mut tail, &cancel), Ok(0));
-    assert!(source.fetched().bulk <= 3 * MIB + 5, "no block twice");
-    assert_eq!(source.fetched().demand, 0);
-    // `Bytes`, for a stream and for a local file.
-    let tmp = tempfile::tempdir().unwrap();
-    let path = tmp.path().join("local.bin");
-    std::fs::write(&path, pattern(0, 100_000)).unwrap();
-    let mut local = std::fs::File::open(&path).unwrap();
-    let mut both: [(&mut dyn Bytes, u64); 2] = [(&mut r, 3 * MIB + 5), (&mut local, 100_000)];
-    for (bytes, size) in both.iter_mut() {
-        assert_eq!((bytes.len(), bytes.is_empty()), (*size, false));
-        let mut got = [0; 64];
-        assert_eq!(bytes.read_at(70_000, &mut got, &cancel), Ok(64));
-        assert!(got[..] == pattern(70_000, 64)[..]);
-        match bytes.try_read(70_000, 64) {
-            Poll::Ready(Ok(b)) => assert!(b[..] == got[..]),
-            other => panic!("{other:?}"),
+    bounded("read_at_blocks_until_the_bytes_come", || {
+        let (source, _control) =
+            threaded(FakeFile::pattern(3 * MIB + 5), Link::instant(), no_reopen());
+        let cancel = AtomicBool::new(false);
+        let mut r = source.reader(ReaderKind::Bulk);
+        let mut buf = vec![0; 2 * MIB as usize + 300];
+        assert_eq!(r.read_at(1000, &mut buf, &cancel), Ok(buf.len()));
+        assert!(buf[..] == pattern(1000, buf.len())[..]);
+        let mut tail = vec![0; 1000];
+        assert_eq!(r.read_at(3 * MIB - 10, &mut tail, &cancel), Ok(15));
+        assert!(tail[..15] == pattern(3 * MIB - 10, 15)[..]);
+        assert_eq!(r.read_at(3 * MIB + 5, &mut tail, &cancel), Ok(0));
+        assert_eq!(r.read_at(u64::MAX - 5, &mut tail, &cancel), Ok(0));
+        assert!(source.fetched().bulk <= 3 * MIB + 5, "no block twice");
+        assert_eq!(source.fetched().demand, 0);
+        // `Bytes`, for a stream and for a local file.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("local.bin");
+        std::fs::write(&path, pattern(0, 100_000)).unwrap();
+        let mut local = std::fs::File::open(&path).unwrap();
+        let mut both: [(&mut dyn Bytes, u64); 2] = [(&mut r, 3 * MIB + 5), (&mut local, 100_000)];
+        for (bytes, size) in both.iter_mut() {
+            assert_eq!((bytes.len(), bytes.is_empty()), (*size, false));
+            let mut got = [0; 64];
+            assert_eq!(bytes.read_at(70_000, &mut got, &cancel), Ok(64));
+            assert!(got[..] == pattern(70_000, 64)[..]);
+            match bytes.try_read(70_000, 64) {
+                Poll::Ready(Ok(b)) => assert!(b[..] == got[..]),
+                other => panic!("{other:?}"),
+            }
+            assert_eq!(bytes.read_at(*size - 3, &mut got, &cancel), Ok(3));
+            cancel.store(true, Ordering::SeqCst);
+            assert_eq!(
+                bytes.read_at(0, &mut got, &cancel),
+                Err(ReadError::Cancelled)
+            );
+            cancel.store(false, Ordering::SeqCst);
         }
-        assert_eq!(bytes.read_at(*size - 3, &mut got, &cancel), Ok(3));
-        cancel.store(true, Ordering::SeqCst);
-        assert_eq!(
-            bytes.read_at(0, &mut got, &cancel),
-            Err(ReadError::Cancelled)
-        );
-        cancel.store(false, Ordering::SeqCst);
-    }
-    assert!(matches!(
-        r.try_read(0, MAX_READ + 1),
-        Poll::Ready(Err(ReadError::Failed(_)))
-    ));
+        assert!(matches!(
+            r.try_read(0, MAX_READ + 1),
+            Poll::Ready(Err(ReadError::Failed(_)))
+        ));
+    });
 }
 
-/// A blocked `read_at` returns once its cancel flag is set (06 §9's shutdown).
+/// A blocked `read_at` returns once its cancel flag is set (06 §9's shutdown). The cancel
+/// comes only after the read is seen waiting — its block asked for on a link that never
+/// answers — and it returns with nothing read.
 #[test]
 fn a_blocked_read_at_is_cancelled() {
-    let slow = Link {
-        latency: Duration::from_secs(100_000),
-        clock: Clock::Real,
-        ..Link::gate()
-    };
-    let (source, _control) = threaded(FakeFile::pattern(MIB), slow, no_reopen());
-    let cancel = Arc::new(AtomicBool::new(false));
-    let (flag, mut r) = (cancel.clone(), source.reader(media()));
-    let (started_tx, started) = mpsc::channel();
-    let worker = std::thread::spawn(move || {
-        started_tx.send(()).unwrap();
-        r.read_at(0, &mut [0; 64], &flag)
+    bounded("a_blocked_read_at_is_cancelled", || {
+        let slow = Link {
+            latency: Duration::from_secs(100_000),
+            clock: Clock::Real,
+            ..Link::gate()
+        };
+        let (source, control) = threaded(FakeFile::pattern(MIB), slow, no_reopen());
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (flag, mut r) = (cancel.clone(), source.reader(media()));
+        let worker = std::thread::spawn(move || {
+            let mut buf = [0u8; 64];
+            let got = r.read_at(0, &mut buf, &flag);
+            (got, buf)
+        });
+        eventually("the read waits for its block", || {
+            source.core().pf.waiting_readers() == 1 && control.sent().len() >= 2
+        });
+        assert!(!worker.is_finished(), "it returned with nothing to return");
+        cancel.store(true, Ordering::SeqCst);
+        source.interrupt();
+        let (got, buf) = worker.join().unwrap();
+        assert_eq!(got, Err(ReadError::Cancelled));
+        assert_eq!(buf, [0; 64], "no bytes came");
+        assert_eq!(source.fetched().total, 0);
     });
-    started.recv_timeout(HANG).unwrap();
-    cancel.store(true, Ordering::SeqCst);
-    source.interrupt();
-    assert_eq!(worker.join().unwrap(), Err(ReadError::Cancelled));
 }
 
 /// V7: after one of sopen's own saves no change is reported — the reload finds the save's
@@ -1796,42 +2437,44 @@ fn a_blocked_read_at_is_cancelled() {
 /// saved is `Changed`. `reload` waits for the new file.
 #[test]
 fn v7_after_sopens_own_save_no_change_is_reported() {
-    let (source, control) = threaded(FakeFile::pattern(MIB), Link::instant(), no_reopen());
-    let cancel = AtomicBool::new(false);
-    let mut r = source.reader(ReaderKind::Interactive);
-    let mut got = [0; 32];
-    assert_eq!(r.read_at(1000, &mut got, &cancel), Ok(32));
-    assert!(got[..] == pattern(1000, 32)[..]);
-    // The save renamed its staged temp over the target.
-    let saved = FakeFile::bytes(vec![7; 300_000]);
-    let baseline = saved.stat().fingerprint();
-    control.change(Change::Replace(saved));
-    source.reload_saved(baseline).unwrap();
-    assert_eq!((source.state(), source.size()), (State::Live, 300_000));
-    assert_eq!(source.opened().mtime, baseline.mtime);
-    assert_eq!(
-        r.read_at(1000, &mut got, &cancel),
-        Err(ReadError::Reloaded),
-        "a reader of the file before the save"
-    );
-    r.renew();
-    assert_eq!(r.read_at(1000, &mut got, &cancel), Ok(32));
-    assert!(got[..] == [7; 32], "the saved file, not the old cache");
-    assert_eq!(r.read_at(299_990, &mut got, &cancel), Ok(10));
-    // A file that is not the one saved: `Changed`.
-    let other = Fingerprint {
-        size: 300_001,
-        ..baseline
-    };
-    source.reload_saved(other).unwrap();
-    assert_eq!(source.state(), State::Changed);
-    source.reload().unwrap();
-    assert_eq!(source.state(), State::Live);
-    // The path gone: the reload says why, and the Source is Failed.
-    control.change(Change::Remove);
-    let gone = source.reload().unwrap_err();
-    assert!(format!("{gone:#}").contains("no such file"), "{gone:#}");
-    assert!(matches!(source.state(), State::Failed(_)));
+    bounded("v7_after_sopens_own_save_no_change_is_reported", || {
+        let (source, control) = threaded(FakeFile::pattern(MIB), Link::instant(), no_reopen());
+        let cancel = AtomicBool::new(false);
+        let mut r = source.reader(ReaderKind::Interactive);
+        let mut got = [0; 32];
+        assert_eq!(r.read_at(1000, &mut got, &cancel), Ok(32));
+        assert!(got[..] == pattern(1000, 32)[..]);
+        // The save renamed its staged temp over the target.
+        let saved = FakeFile::bytes(vec![7; 300_000]);
+        let baseline = saved.stat().fingerprint();
+        control.change(Change::Replace(saved));
+        source.reload_saved(baseline).unwrap();
+        assert_eq!((source.state(), source.size()), (State::Live, 300_000));
+        assert_eq!(source.opened().mtime, baseline.mtime);
+        assert_eq!(
+            r.read_at(1000, &mut got, &cancel),
+            Err(ReadError::Reloaded),
+            "a reader of the file before the save"
+        );
+        r.renew();
+        assert_eq!(r.read_at(1000, &mut got, &cancel), Ok(32));
+        assert!(got[..] == [7; 32], "the saved file, not the old cache");
+        assert_eq!(r.read_at(299_990, &mut got, &cancel), Ok(10));
+        // A file that is not the one saved: `Changed`.
+        let other = Fingerprint {
+            size: 300_001,
+            ..baseline
+        };
+        source.reload_saved(other).unwrap();
+        assert_eq!(source.state(), State::Changed);
+        source.reload().unwrap();
+        assert_eq!(source.state(), State::Live);
+        // The path gone: the reload says why, and the Source is Failed.
+        control.change(Change::Remove);
+        let gone = source.reload().unwrap_err();
+        assert!(format!("{gone:#}").contains("no such file"), "{gone:#}");
+        assert!(matches!(source.state(), State::Failed(_)));
+    });
 }
 
 /// A transport that is gone with nothing out on it — here a channel lost at a prefetch nobody
@@ -1840,49 +2483,52 @@ fn v7_after_sopens_own_save_no_change_is_reported() {
 /// instead of spinning. The next read retries.
 #[test]
 fn a_dead_idle_transport_is_noticed_without_a_read() {
-    let (transport, control) = fake("/m.bin", FakeFile::pattern(MIB), Link::instant());
-    let again = control.clone();
-    // Requests: 0 the screen's block, 1 its fence, 2 the margin's block (prefetch).
-    control.fault(2, Fault::Lost);
-    let source = Source::open(transport, Box::new(move || again.open()), Arc::new(|| {})).unwrap();
-    let cancel = AtomicBool::new(false);
-    let mut r = source.reader(ReaderKind::Interactive);
-    let mut got = [0; 480];
-    assert_eq!(r.read_at(3 * BLOCK - 480, &mut got, &cancel), Ok(480));
-    let started = Instant::now();
-    while source.state() == State::Live {
-        assert!(
-            started.elapsed() < HANG,
-            "the dead transport was never noticed"
-        );
-        std::thread::yield_now();
-    }
-    let State::Failed(reason) = source.state() else {
-        panic!("{:?}", source.state())
-    };
-    assert!(reason.contains("the connection closed"), "{reason}");
-    let asked: Vec<Asked> = control.sent().iter().map(|s| s.asked).collect();
-    assert_eq!(
-        asked[..4],
-        [read_of(2), Asked::Fstat, read_of(3), Asked::Fstat]
-    );
-    assert!(
-        asked[4..].iter().all(|a| !matches!(a, Asked::Read { .. })),
-        "it asked the transport, it read nothing: {asked:?}"
-    );
-    // The screen stays, and a read of anything else retries on a new channel.
-    assert_eq!(r.read_at(3 * BLOCK - 480, &mut got, &cancel), Ok(480));
-    loop {
-        match r.try_read(9 * BLOCK + 1000, 32) {
-            Poll::Ready(Ok(b)) => {
-                assert!(b[..] == pattern(9 * BLOCK + 1000, 32)[..]);
-                break;
-            }
-            _ => assert!(started.elapsed() < HANG, "the retry never came"),
+    bounded("a_dead_idle_transport_is_noticed_without_a_read", || {
+        let (transport, control) = fake("/m.bin", FakeFile::pattern(MIB), Link::instant());
+        let again = control.clone();
+        // Requests: 0 the screen's block, 1 its fence, 2 the margin's block (prefetch).
+        control.fault(2, Fault::Lost);
+        let source =
+            Source::open(transport, Box::new(move || again.open()), Arc::new(|| {})).unwrap();
+        let cancel = AtomicBool::new(false);
+        let mut r = source.reader(ReaderKind::Interactive);
+        let mut got = [0; 480];
+        assert_eq!(r.read_at(3 * BLOCK - 480, &mut got, &cancel), Ok(480));
+        let started = Instant::now();
+        while source.state() == State::Live {
+            assert!(
+                started.elapsed() < HANG,
+                "the dead transport was never noticed"
+            );
+            std::thread::yield_now();
         }
-        std::thread::yield_now();
-    }
-    assert_eq!(source.state(), State::Live);
+        let State::Failed(reason) = source.state() else {
+            panic!("{:?}", source.state())
+        };
+        assert!(reason.contains("the connection closed"), "{reason}");
+        let asked: Vec<Asked> = control.sent().iter().map(|s| s.asked).collect();
+        assert_eq!(
+            asked[..4],
+            [read_of(2), Asked::Fstat, read_of(3), Asked::Fstat]
+        );
+        assert!(
+            asked[4..].iter().all(|a| !matches!(a, Asked::Read { .. })),
+            "it asked the transport, it read nothing: {asked:?}"
+        );
+        // The screen stays, and a read of anything else retries on a new channel.
+        assert_eq!(r.read_at(3 * BLOCK - 480, &mut got, &cancel), Ok(480));
+        loop {
+            match r.try_read(9 * BLOCK + 1000, 32) {
+                Poll::Ready(Ok(b)) => {
+                    assert!(b[..] == pattern(9 * BLOCK + 1000, 32)[..]);
+                    break;
+                }
+                _ => assert!(started.elapsed() < HANG, "the retry never came"),
+            }
+            std::thread::yield_now();
+        }
+        assert_eq!(source.state(), State::Live);
+    });
 }
 
 // ---- the real server ----
@@ -1928,31 +2574,36 @@ fn until(engine: &mut Engine, mut done: impl FnMut() -> bool) {
 /// a pass over a 4 MiB file gives bytes whose SHA-256 is the file's.
 #[test]
 fn v5_a_source_through_the_clipping_proxy_reads_the_files_bytes() {
-    if SftpRemote::local_server().is_none() {
-        return;
-    }
-    let (_tmp, path, body) = local_file(4 << 20);
-    let mut proxy = proxy_of(SftpRemote::local_server_with);
-    proxy.clip = Some(20_000);
-    let fs = SftpRemote::local_server_with(Some(proxy)).unwrap();
-    let transport = Box::new(fs).into_ranged(path.to_str().unwrap()).unwrap();
-    let source = Source::open(transport, no_reopen(), Arc::new(|| {})).unwrap();
-    let mut r = source.reader(ReaderKind::Bulk);
-    let cancel = AtomicBool::new(false);
-    let mut hash = Sha256::new();
-    let mut buf = vec![0; 300_000];
-    let mut off = 0;
-    loop {
-        let n = r.read_at(off, &mut buf, &cancel).unwrap();
-        hash.update(&buf[..n]);
-        off += n as u64;
-        if n < buf.len() {
-            break;
-        }
-    }
-    assert_eq!(off, body.len() as u64);
-    assert!(hash.finalize()[..] == Sha256::digest(&body)[..]);
-    assert_eq!(source.state(), State::Live);
+    bounded(
+        "v5_a_source_through_the_clipping_proxy_reads_the_files_bytes",
+        || {
+            if SftpRemote::local_server().is_none() {
+                return;
+            }
+            let (_tmp, path, body) = local_file(4 << 20);
+            let mut proxy = proxy_of(SftpRemote::local_server_with);
+            proxy.clip = Some(20_000);
+            let fs = SftpRemote::local_server_with(Some(proxy)).unwrap();
+            let transport = Box::new(fs).into_ranged(path.to_str().unwrap()).unwrap();
+            let source = Source::open(transport, no_reopen(), Arc::new(|| {})).unwrap();
+            let mut r = source.reader(ReaderKind::Bulk);
+            let cancel = AtomicBool::new(false);
+            let mut hash = Sha256::new();
+            let mut buf = vec![0; 300_000];
+            let mut off = 0;
+            loop {
+                let n = r.read_at(off, &mut buf, &cancel).unwrap();
+                hash.update(&buf[..n]);
+                off += n as u64;
+                if n < buf.len() {
+                    break;
+                }
+            }
+            assert_eq!(off, body.len() as u64);
+            assert!(hash.finalize()[..] == Sha256::digest(&body)[..]);
+            assert_eq!(source.state(), State::Live);
+        },
+    );
 }
 
 /// V5 on the real server: a truncate between the two halves of a block. The block is not

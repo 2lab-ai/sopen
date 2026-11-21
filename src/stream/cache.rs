@@ -1,6 +1,8 @@
 //! The block cache of one stream (06 §3): 64 KiB blocks, 64 MiB of RAM, least recently used
 //! first. Blocks inside a live reader's window are spared while anything else can go; the bound
-//! itself is hard, and protection yields to it.
+//! itself is hard, and a window yields to it. A block a reader is waiting for does not: it is
+//! never evicted, and the stream keeps what is waited for within the cache
+//! (`prefetch::HELD_BLOCKS`).
 
 use bytes::Bytes;
 use std::collections::{BTreeMap, HashMap};
@@ -41,19 +43,20 @@ impl Protect {
 /// they would pass it, a window larger than an equal share is scaled down to that share, never
 /// below the floors (or the reader's own smaller maximum).
 pub fn shares(wants: &[(u64, u64)]) -> Vec<(u64, u64)> {
-    let total: u64 = wants.iter().map(|(a, b)| a + b).sum();
-    if total <= PROTECTED_BYTES {
+    // In 128 bits: a window, or their sum, may pass 64.
+    let total: u128 = wants.iter().map(|(a, b)| *a as u128 + *b as u128).sum();
+    if total <= PROTECTED_BYTES as u128 {
         return wants.to_vec();
     }
     let share = PROTECTED_BYTES / wants.len() as u64;
     wants
         .iter()
         .map(|&(ahead, behind)| {
-            let window = ahead + behind;
-            if window <= share {
+            let window = ahead as u128 + behind as u128;
+            if window <= share as u128 {
                 return (ahead, behind);
             }
-            let a = (ahead as u128 * share as u128 / window as u128) as u64;
+            let a = (ahead as u128 * share as u128 / window) as u64;
             let b = share - a;
             (
                 a.max(FLOOR_AHEAD.min(ahead)),
@@ -120,14 +123,24 @@ impl BlockCache {
         Some(bytes.clone())
     }
 
-    /// Adds a block, evicting to stay within the bound. `cold` (a Bulk reader's block) puts it at
-    /// the cold end: the next to go.
-    pub fn insert(&mut self, block: u64, bytes: Bytes, cold: bool, protect: &Protect) {
+    /// Adds a block of at most [`BLOCK`] bytes, evicting to stay within the bound. `cold` (a
+    /// Bulk reader's block) puts it at the cold end: the next to go. A block a reader is
+    /// waiting for is never evicted: when nothing else is left to evict, the new block is not
+    /// kept, and `false` says so. The stream serves no more waits at once than the cache
+    /// holds (`prefetch::HELD_BLOCKS`), so that never happens to a block being waited for.
+    pub fn insert(&mut self, block: u64, bytes: Bytes, cold: bool, protect: &Protect) -> bool {
+        debug_assert!(
+            bytes.len() as u64 <= BLOCK,
+            "a block of {} bytes",
+            bytes.len()
+        );
         if let Some((_, age)) = self.blocks.remove(&block) {
             self.order.remove(&age);
         }
         while self.blocks.len() >= self.limit {
-            self.evict(protect);
+            if !self.evict(protect) {
+                return false;
+            }
         }
         let age = if cold {
             self.cold -= 1;
@@ -138,25 +151,28 @@ impl BlockCache {
         };
         self.blocks.insert(block, (bytes, age));
         self.order.insert(age, block);
+        true
     }
 
-    /// Drops the least recently used block nothing protects; then one inside a window; then,
-    /// the bound being hard, one a reader waits for.
-    fn evict(&mut self, protect: &Protect) {
+    /// Drops the least recently used block nothing protects, or else one inside a window —
+    /// never one a reader waits for. Whether one went.
+    fn evict(&mut self, protect: &Protect) -> bool {
         let mut pick: Option<(u8, i64, u64)> = None;
         for (&age, &block) in &self.order {
             let rank = protect.rank(block);
-            if pick.is_none_or(|(best, _, _)| rank < best) {
+            if rank < 2 && pick.is_none_or(|(best, _, _)| rank < best) {
                 pick = Some((rank, age, block));
             }
             if rank == 0 {
                 break;
             }
         }
-        if let Some((_, age, block)) = pick {
-            self.order.remove(&age);
-            self.blocks.remove(&block);
-        }
+        let Some((_, age, block)) = pick else {
+            return false;
+        };
+        self.order.remove(&age);
+        self.blocks.remove(&block);
+        true
     }
 
     pub fn clear(&mut self) {

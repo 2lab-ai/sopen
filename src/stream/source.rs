@@ -17,7 +17,7 @@ use super::{
 };
 use crate::remote::{Completion, Fingerprint, Ranged, Reply, Stat, Wake};
 use bytes::Bytes;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::task::Poll;
@@ -160,6 +160,8 @@ enum OutKind {
         class: Class,
         /// The block's first read (not the rest of a short reply).
         first: bool,
+        /// Which fetch of the block it belongs to.
+        attempt: u64,
     },
     Fence {
         batch: u64,
@@ -179,8 +181,11 @@ struct Out {
 /// The reads admitted together for one reader, and the fence sent right behind them.
 struct Batch {
     waited: bool,
-    /// Blocks whose last byte this batch brought: visible once its fence returns the fingerprint.
-    complete: Vec<u64>,
+    /// Every block this batch brought bytes of, with the fetch they belong to: when its fence
+    /// fails, each of those fetches is given up — a part no fence vouched for is never shown.
+    touched: Vec<(u64, u64)>,
+    /// Those whose last byte it brought: visible once its fence returns the fingerprint.
+    complete: Vec<(u64, u64)>,
 }
 
 /// A block not yet visible: its bytes so far.
@@ -188,6 +193,18 @@ struct Partial {
     buf: Vec<u8>,
     want: usize,
     cold: bool,
+    /// The fetch these bytes are of. A reply of another fetch of the block — one given up
+    /// since it was sent — adds nothing to them.
+    attempt: u64,
+}
+
+/// A reload asked for and not started.
+struct ReloadReq {
+    id: u64,
+    /// The fingerprint a save expects to find.
+    expect: Option<Fingerprint>,
+    /// A caller waits for its result.
+    wanted: bool,
 }
 
 /// One request as the engine sent it (tests).
@@ -215,9 +232,11 @@ pub(crate) struct Core {
     out: HashMap<u64, Out>,
     batches: HashMap<u64, Batch>,
     next_batch: u64,
-    /// Blocks with a read out, and blocks whose bytes have come in part or wait for a fence.
-    inflight: HashSet<u64>,
+    /// Blocks with a read out (and which fetch it is of), and blocks whose bytes have come in
+    /// part or wait for a fence.
+    inflight: HashMap<u64, u64>,
     partial: HashMap<u64, Partial>,
+    next_attempt: u64,
     visible: bool,
     poll_out: bool,
     poll_at: Instant,
@@ -231,11 +250,14 @@ pub(crate) struct Core {
     /// `first` was marked and the engine has not stamped it yet; then when it did.
     first_marked: bool,
     idle_at: Option<Instant>,
-    reload: Option<Option<Fingerprint>>,
-    reloads: u64,
+    /// Reloads asked for, in order: each is run, and none replaces another. Only two plain
+    /// ones, neither started, are one.
+    reload_queue: VecDeque<ReloadReq>,
+    next_reload: u64,
+    /// How the reloads a caller waits for went, until it takes its own.
+    reload_results: HashMap<u64, std::result::Result<(), String>>,
     /// Which version is open: +1 at each reload that opened one. A reader reads only its own.
     epoch: u64,
-    reload_result: std::result::Result<(), String>,
     retry: bool,
     last_retry: Option<Instant>,
     drop_transport: bool,
@@ -271,6 +293,42 @@ impl Core {
     #[cfg(test)]
     pub(crate) fn held(&self) -> (usize, usize) {
         (self.partial.len() + self.inflight.len(), self.batches.len())
+    }
+
+    /// Tests: whether the engine was told it has work since its last pump.
+    #[cfg(test)]
+    pub(crate) fn kicked(&self) -> bool {
+        self.kicked
+    }
+
+    /// Tests: whether anything waits to be sent.
+    #[cfg(test)]
+    pub(crate) fn queued(&mut self) -> bool {
+        self.candidate().is_some()
+    }
+
+    /// Tests: reloads asked for and not started.
+    #[cfg(test)]
+    pub(crate) fn reloads_queued(&self) -> usize {
+        self.reload_queue.len()
+    }
+
+    /// Queues a reload and gives its id. A plain one joins a plain one that waits at the back
+    /// of the queue; one that carries a save's baseline is always its own.
+    fn ask_reload(&mut self, expect: Option<Fingerprint>, wanted: bool) -> u64 {
+        if let Some(back) = self.reload_queue.back_mut() {
+            if expect.is_none() && back.expect.is_none() && !(wanted && back.wanted) {
+                back.wanted |= wanted;
+                return back.id;
+            }
+        }
+        self.next_reload += 1;
+        self.reload_queue.push_back(ReloadReq {
+            id: self.next_reload,
+            expect,
+            wanted,
+        });
+        self.next_reload
     }
 
     pub(crate) fn stats(&self) -> Stats {
@@ -310,7 +368,8 @@ impl Core {
 
     fn candidate(&mut self) -> Option<Cand> {
         let (cache, inflight, partial) = (&self.cache, &self.inflight, &self.partial);
-        let have = |b: u64| cache.contains(b) || inflight.contains(&b) || partial.contains_key(&b);
+        let have =
+            |b: u64| cache.contains(b) || inflight.contains_key(&b) || partial.contains_key(&b);
         self.pf.candidate(&have)
     }
 
@@ -339,13 +398,13 @@ impl Core {
 
     /// Sends `cand`'s read in `batch` if the cap admits it.
     fn send_read(&mut self, r: &mut dyn Ranged, cand: &Cand, batch: u64) -> bool {
-        let (block, off, len, first) = match cand.item {
+        let (block, off, len, rest) = match cand.item {
             Item::Block(b) => {
                 let off = b * BLOCK;
                 let len = BLOCK.min(self.opened.size.saturating_sub(off)) as u32;
-                (b, off, len, true)
+                (b, off, len, None)
             }
-            Item::Rest(rest) => (rest.block, rest.off, rest.len, false),
+            Item::Rest(rest) => (rest.block, rest.off, rest.len, Some(rest.attempt)),
             Item::Poll => return false,
         };
         if !self.pf.adm.admits(len as u64) {
@@ -354,14 +413,20 @@ impl Core {
         self.pf.take(cand);
         let class = cand.class.unwrap_or(Class::Prefetch);
         let ticket = r.read(off, len);
-        self.inflight.insert(block);
+        // A block's first read begins a new fetch of it; a rest continues its own.
+        let attempt = rest.unwrap_or_else(|| {
+            self.next_attempt += 1;
+            self.next_attempt
+        });
+        self.inflight.insert(block, attempt);
         let kind = OutKind::Read {
             batch,
             block,
             off,
             len,
             class,
-            first,
+            first: rest.is_none(),
+            attempt,
         };
         self.record(ticket.0, len as u64, kind);
         true
@@ -397,6 +462,7 @@ impl Core {
                 batch,
                 Batch {
                     waited,
+                    touched: Vec::new(),
                     complete: Vec::new(),
                 },
             );
@@ -447,9 +513,28 @@ impl Core {
 
     fn protect_and_insert(&mut self, block: u64, part: Partial) {
         let protect = self.pf.protect();
+        // Not kept only when everything cached is waited for and this block is not: the
+        // waits being served fit the cache together (`Prefetcher::held`).
         self.cache
             .insert(block, Bytes::from(part.buf), part.cold, &protect);
         self.notify = true;
+    }
+
+    /// Gives up fetch `attempt` of `block`: its bytes so far, its rest if queued, and — its
+    /// rest already sent — the claim that the block is on its way. The reply still to come
+    /// finds no fetch to add to.
+    fn give_up(&mut self, block: u64, attempt: u64) {
+        if self
+            .partial
+            .get(&block)
+            .is_some_and(|p| p.attempt == attempt)
+        {
+            self.partial.remove(&block);
+            self.pf.drop_rest(block);
+        }
+        if self.inflight.get(&block) == Some(&attempt) {
+            self.inflight.remove(&block);
+        }
     }
 
     /// One completion, in the order the transport sent the requests.
@@ -490,15 +575,20 @@ impl Core {
                 len,
                 class,
                 first,
+                attempt,
             } => {
-                self.inflight.remove(&block);
+                // Of a fetch given up since (its earlier part's fence failed): dropped.
+                let current = self.inflight.get(&block) == Some(&attempt);
+                if current {
+                    self.inflight.remove(&block);
+                }
                 let data = match c.reply {
                     Ok(Reply::Data(data)) => data,
                     Ok(Reply::Stat(_)) => {
                         return self.fail(format!("{}: a read was answered with a stat", self.path))
                     }
                     Err(e) => {
-                        self.partial.remove(&block);
+                        self.give_up(block, attempt);
                         // A failed prefetch is never shown; it is only retried as demand.
                         if self.pf.waits(block) {
                             self.fail(format!("{e:#}"));
@@ -517,18 +607,29 @@ impl Core {
                     // The file ends before the size it had at open (06 §2).
                     return self.changed();
                 }
+                if !current {
+                    return;
+                }
                 if first {
                     let part = Partial {
                         buf: Vec::with_capacity(len as usize),
                         want: len as usize,
                         cold: class == Class::Bulk,
+                        attempt,
                     };
                     self.partial.insert(block, part);
                 }
-                let Some(part) = self.partial.get_mut(&block) else {
+                let Some(part) = self
+                    .partial
+                    .get_mut(&block)
+                    .filter(|p| p.attempt == attempt)
+                else {
                     return;
                 };
                 part.buf.extend_from_slice(&data);
+                if let Some(b) = self.batches.get_mut(&batch) {
+                    b.touched.push((block, attempt));
+                }
                 if part.buf.len() < part.want {
                     // A short reply: the rest is read at its own offset, with its own fence.
                     self.pf.push_rest(Rest {
@@ -540,9 +641,10 @@ impl Core {
                         } else {
                             class
                         },
+                        attempt,
                     });
                 } else if let Some(b) = self.batches.get_mut(&batch) {
-                    b.complete.push(block);
+                    b.complete.push((block, attempt));
                 }
             }
             OutKind::Fence { batch } => {
@@ -551,19 +653,27 @@ impl Core {
                 };
                 match c.reply {
                     Ok(Reply::Stat(Some(stat))) if self.same(&stat) => {
-                        for block in batch.complete {
-                            if let Some(part) = self.partial.remove(&block) {
-                                self.protect_and_insert(block, part);
+                        for (block, attempt) in batch.complete {
+                            if self
+                                .partial
+                                .get(&block)
+                                .is_some_and(|p| p.attempt == attempt)
+                            {
+                                if let Some(part) = self.partial.remove(&block) {
+                                    self.protect_and_insert(block, part);
+                                }
                             }
                         }
                     }
                     Ok(Reply::Stat(Some(_))) => self.changed(),
                     Ok(_) => self.fail(format!("{}: a fence was not answered", self.path)),
                     Err(e) => {
+                        // No fence vouches for what this batch brought: every fetch it
+                        // brought a part of is given up, the short ones with a rest to come too.
                         let waited = batch.waited
-                            || batch.complete.iter().any(|block| self.pf.waits(*block));
-                        for block in &batch.complete {
-                            self.partial.remove(block);
+                            || batch.touched.iter().any(|(block, _)| self.pf.waits(*block));
+                        for (block, attempt) in &batch.touched {
+                            self.give_up(*block, *attempt);
                         }
                         if waited {
                             self.fail(format!("{e:#}"));
@@ -602,6 +712,7 @@ impl Core {
     /// A new transport is in place: a reload takes its fingerprint and drops the cache; a
     /// retry keeps the cache when the fingerprint is the one opened, and is `Changed` otherwise.
     fn install(&mut self, r: &dyn Ranged, reload: Option<Option<Fingerprint>>, now: Instant) {
+        // `reload`: `Some` for a reload, with the fingerprint a save expects, if any.
         self.out.clear();
         self.drop_everything_out();
         self.pf.adm.idle();
@@ -643,7 +754,8 @@ impl Core {
     fn want(&mut self, id: u64, off: u64, end: u64, now: Instant) -> bool {
         let (cache, inflight, partial) = (&self.cache, &self.inflight, &self.partial);
         let cached = |b: u64| cache.contains(b);
-        let have = |b: u64| cache.contains(b) || inflight.contains(&b) || partial.contains_key(&b);
+        let have =
+            |b: u64| cache.contains(b) || inflight.contains_key(&b) || partial.contains_key(&b);
         let size = self.opened.size;
         let Some(touch) = self.pf.access(id, off, end, size, now, &cached, &have) else {
             return false;
@@ -740,6 +852,10 @@ pub(crate) struct Engine {
     ranged: Option<Box<dyn Ranged>>,
     reopen: Reopen,
     throttle: Option<Throttle>,
+    /// Tests: runs once a retry or reload has been taken and the lock released, before the
+    /// reconnect looks at anything.
+    #[cfg(test)]
+    pub(crate) at_handoff: Option<Box<dyn FnMut() + Send>>,
 }
 
 impl Engine {
@@ -750,10 +866,21 @@ impl Engine {
         }
     }
 
-    /// A reload (`Some`: with the fingerprint a save expects, if any) or a retry (`None`),
-    /// with no lock held: it waits on the network.
-    fn reconnect(&mut self, reload: Option<Option<Fingerprint>>) {
-        let path = self.shared.lock().path.clone();
+    /// A reload (`Some`) or a retry (`None`), with no lock held: it waits on the network.
+    /// A Source closed since the command was taken opens nothing, and one closed while the
+    /// network answered sends nothing on what was opened.
+    fn reconnect(&mut self, request: Option<ReloadReq>) {
+        #[cfg(test)]
+        if let Some(hook) = self.at_handoff.as_mut() {
+            hook();
+        }
+        let reload = request.as_ref().map(|req| req.expect);
+        let core = self.shared.lock();
+        if core.closed {
+            return;
+        }
+        let path = core.path.clone();
+        drop(core);
         let got = match (reload.is_some(), self.ranged.take()) {
             // A reload re-opens the path on the connection it has.
             (true, Some(r)) => r.reopen(&path).map_err(|refused| refused.error),
@@ -769,19 +896,19 @@ impl Engine {
             }
         };
         let mut core = self.shared.lock();
-        match got {
+        let result = match got {
             Ok(r) if !core.closed => {
                 core.install(r.as_ref(), reload, r.now());
-                if reload.is_some() {
-                    core.reload_result = Ok(());
-                }
                 self.ranged = Some(r);
+                Ok(())
             }
-            Ok(r) => r.close(),
+            Ok(r) => {
+                r.close();
+                Err("the stream is closed".to_string())
+            }
             Err(e) => {
                 let reason = explain(&e);
                 if reload.is_some() {
-                    core.reload_result = Err(reason.clone());
                     // The version that was open is given up; a retry opens whatever is there.
                     core.epoch += 1;
                     core.cache.clear();
@@ -792,13 +919,16 @@ impl Engine {
                     core.pf.adm.idle();
                     core.pf.clear(false);
                     core.wake = None;
-                    core.state = State::Failed(reason);
+                    core.state = State::Failed(reason.clone());
                     core.notify = true;
                 }
+                Err(reason)
             }
-        }
-        if reload.is_some() {
-            core.reloads += 1;
+        };
+        if let Some(req) = request {
+            if req.wanted {
+                core.reload_results.insert(req.id, result);
+            }
             core.notify = true;
         }
         self.shared.release(core, false);
@@ -827,9 +957,9 @@ impl Engine {
                 }
                 continue;
             }
-            if let Some(reload) = core.reload.take() {
+            if let Some(request) = core.reload_queue.pop_front() {
                 drop(core);
-                self.reconnect(Some(reload));
+                self.reconnect(Some(request));
                 continue;
             }
             if std::mem::take(&mut core.retry) && matches!(core.state, State::Failed(_)) {
@@ -880,7 +1010,14 @@ impl Engine {
             (Some(a), Some(b)) => Some(a.min(b)),
             (a, b) => a.or(b),
         };
-        let Some(c) = self.ranged.as_mut().and_then(|r| r.next(wait)) else {
+        // With no bound and nothing out, nothing can come: a stepped test never waits on that.
+        let idle = wait.is_none() && self.ranged.as_ref().is_some_and(|r| r.pending() == 0);
+        let Some(c) = self
+            .ranged
+            .as_mut()
+            .filter(|_| !idle)
+            .and_then(|r| r.next(wait))
+        else {
             return false;
         };
         self.apply(c);
@@ -1024,8 +1161,9 @@ impl Source {
             out: HashMap::new(),
             batches: HashMap::new(),
             next_batch: 0,
-            inflight: HashSet::new(),
+            inflight: HashMap::new(),
             partial: HashMap::new(),
+            next_attempt: 0,
             visible: true,
             poll_out: false,
             poll_at: transport.now() + settings.poll_every,
@@ -1041,10 +1179,10 @@ impl Source {
             sink: settings.stats,
             first_marked: false,
             idle_at: None,
-            reload: None,
-            reloads: 0,
+            reload_queue: VecDeque::new(),
+            next_reload: 0,
+            reload_results: HashMap::new(),
             epoch: 0,
-            reload_result: Ok(()),
             retry: false,
             last_retry: None,
             drop_transport: false,
@@ -1073,6 +1211,8 @@ impl Source {
             ranged: Some(transport),
             reopen,
             throttle: settings.throttle,
+            #[cfg(test)]
+            at_handoff: None,
         };
         let source = Source {
             _handle: Arc::new(Handle(shared.clone())),
@@ -1136,28 +1276,26 @@ impl Source {
 
     fn reload_with(&self, expect: Option<Fingerprint>) -> anyhow::Result<()> {
         let mut core = self.shared.lock();
-        let before = core.reloads;
-        core.reload = Some(expect);
+        let id = core.ask_reload(expect, true);
         self.shared.release(core, true);
         let core = self.shared.lock();
-        let core = self
+        let mut core = self
             .shared
             .readers
-            .wait_while(core, |c| c.reloads == before && !c.closed)
+            .wait_while(core, |c| !c.reload_results.contains_key(&id) && !c.closed)
             .unwrap_or_else(|e| e.into_inner());
-        if core.reloads == before {
-            anyhow::bail!("the stream is closed");
+        // Its own result, whatever other reloads ran before or after it.
+        match core.reload_results.remove(&id) {
+            Some(result) => result.map_err(|reason| anyhow::anyhow!(reason)),
+            None => anyhow::bail!("the stream is closed"),
         }
-        core.reload_result
-            .clone()
-            .map_err(|reason| anyhow::anyhow!(reason))
     }
 
     /// Starts a reload and returns: the waker is called when it is done, and
     /// [`Source::state`] says how it went.
     pub fn request_reload(&self) {
         let mut core = self.shared.lock();
-        core.reload = Some(None);
+        core.ask_reload(None, false);
         self.shared.release(core, true);
     }
 
@@ -1179,6 +1317,8 @@ impl Source {
     /// Makes every blocked `read_at` look at its cancel flag now (the byte server's shutdown,
     /// 06 §9).
     pub fn interrupt(&self) {
+        // Under the lock a reader checks its flag and waits under: none is missed between.
+        let _core = self.shared.lock();
         self.shared.readers.notify_all();
     }
 
@@ -1233,7 +1373,12 @@ pub struct Reader {
 
 impl Drop for Reader {
     fn drop(&mut self) {
-        self.shared.lock().pf.close(self.id);
+        let mut core = self.shared.lock();
+        let waited = core.pf.waiting(self.id).is_some();
+        core.pf.close(self.id);
+        // Its wait is over: one that did not fit beside it may be served now.
+        let next = waited && core.pf.waiting_readers() > 0;
+        self.shared.release(core, next);
     }
 }
 
@@ -1257,11 +1402,14 @@ impl Reader {
     /// made before it reads nothing (`ReadError::Reloaded`) until this is called.
     pub fn renew(&mut self) {
         let mut core = self.shared.lock();
+        let waited = core.pf.waiting(self.id).is_some();
         if let Some(kind) = core.pf.kind(self.id) {
             core.pf.close(self.id);
             self.id = core.pf.open(kind);
         }
         self.epoch = core.epoch;
+        let next = waited && core.pf.waiting_readers() > 0;
+        self.shared.release(core, next);
     }
 
     /// What this reader has been waiting for, and for how long.
@@ -1299,11 +1447,17 @@ impl Reader {
                 }
             },
             State::Live | State::Replaced => {
+                let before = core.pf.waiting(self.id).map(|(span, _)| span);
                 let kick = core.want(self.id, off, end, (self.shared.clock)());
-                match core.serve(self.id, off, end) {
-                    Some(bytes) => Ok((Got::Bytes(bytes), kick)),
-                    None => Ok((Got::Pending, kick)),
-                }
+                let got = match core.serve(self.id, off, end) {
+                    Some(bytes) => Got::Bytes(bytes),
+                    None => Got::Pending,
+                };
+                // A wait ended — read, or left for another place: one that did not fit
+                // beside it may be served now.
+                let after = core.pf.waiting(self.id).map(|(span, _)| span);
+                let next = before.is_some() && before != after && core.pf.waiting_readers() > 0;
+                Ok((got, kick || next))
             }
         };
         match got {
@@ -1328,7 +1482,8 @@ impl Reader {
 
     /// Workers and HTTP connections: blocks until `buf` is full or the file ends, and returns
     /// the count. `Err(Cancelled)` once `cancel` is set, `Err(Changed)` when the source changed,
-    /// `Err(Failed)` when it failed, `Err(Closed)` when it closed.
+    /// `Err(Failed)` when it failed, `Err(Closed)` when it closed. A failed stream is asked to
+    /// retry, as `try_read` asks, so the caller's next call may find it back.
     pub fn read_at(&mut self, off: u64, buf: &mut [u8], cancel: &AtomicBool) -> Result<usize> {
         let mut done = 0;
         while done < buf.len() {
@@ -1336,7 +1491,7 @@ impl Reader {
                 return Err(ReadError::Cancelled);
             }
             let ask = (buf.len() - done).min(READ_CHUNK);
-            match self.look(off + done as u64, ask, false)? {
+            match self.look(off + done as u64, ask, true)? {
                 Got::Bytes(bytes) if bytes.is_empty() => break,
                 Got::Bytes(bytes) => {
                     buf[done..done + bytes.len()].copy_from_slice(&bytes);
@@ -1350,6 +1505,9 @@ impl Reader {
                     );
                     // Nothing came between the look and this lock: wait for a block or a wake.
                     let ready = !core.live() || (first..=last).all(|b| core.cache.contains(b));
+                    if cancel.load(Ordering::SeqCst) {
+                        return Err(ReadError::Cancelled);
+                    }
                     if !ready {
                         let _unused = self
                             .shared

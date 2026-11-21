@@ -145,11 +145,13 @@ The first two paragraphs are this document. The third is 07.
   holds a hex screen 136 times over.
 - **64 MiB of RAM per stream** (1024 blocks). The least recently used block goes first.
 - **Protected from eviction:** the blocks inside any live reader's `[cursor − behind, cursor + ahead]`
-  (§4). The 64 MiB is a hard bound, and protection yields to it.
+  (§4). The 64 MiB is a hard bound, and a window's protection yields to it.
   - When the readers' protected windows together would pass 48 MiB, every reader's `ahead` and
     `behind` are scaled down to an equal share of that 48 MiB, but never below a floor of 256 KiB
     ahead and 64 KiB behind.
-  - A block a reader is waiting for is held until that reader has read it.
+  - A block a reader is waiting for is held until that reader has read it, and is never
+    evicted. So the waits served at one time are the oldest whose blocks fit the cache together;
+    a wait beyond that is served once an older one has been read. One read asks at most 16 MiB.
 - **Bulk readers insert at the cold end.** Their blocks are the next to go, so a pass over the whole
   file (an index pass, the waveform, Save As) does not evict what the screen or playback needs.
 - **No disk spill in v1.** The measured patterns fit in 64 MiB: open + 10 s of play + a far seek
@@ -218,8 +220,11 @@ channel, and the Source bounds those bytes.
      shows as loading;
   2. **foreground prefetch**: those readers' margin and readahead;
   3. **bulk**: what a Bulk reader asks for, its readahead included. A Bulk reader's waiting block is
-     not demand. Bulk goes out only while nothing of classes 1–2 is queued. A foreground reader's
-     readahead stops at its `ahead`, so bulk always gets the link once those windows are full.
+     not demand. Within the class a waiting block goes before readahead, whatever their ages: a
+     pass is stalled on the one. Bulk goes out only while nothing of classes 1–2 is queued. The
+     priority is strict, so bulk progresses whenever the foreground windows are full or idle, and
+     not while a foreground reader keeps moving. A foreground reader's readahead stops at its
+     `ahead`.
 - **A newer demand from the same reader replaces its older one** that has not been sent yet. So
   repeated jumps queue only the latest place.
 - **The bound.** A foreground demand waits behind at most `cap` bytes already sent, plus the older
@@ -269,7 +274,8 @@ after the reads before it.
   file's last change (01 §5's limit). Viewing is best effort there, and blocks of two versions can
   mix until a change is seen.
 - **A block read in parts** (a short reply, then its remainder, §2) becomes visible only after the
-  remainder's own fence. A write between the first reply and the remainder moves the mtime that
+  remainder's own fence, and only if every part's fence returned the fingerprint. A part whose
+  fence failed gives the whole fetch up, its remainder included, even one already sent. A write between the first reply and the remainder moves the mtime that
   fence sees, so the whole block is discarded and the Source turns `Changed`.
 - **The cost** is one `fstat` request (about 50 bytes of reply) per batch. On the fast path, where
   every reply is full, it is sent with the reads and adds no round trip: the fence's reply follows
@@ -298,7 +304,8 @@ nothing sent before the change can refill the cleared cache.
 | `Closed` | the viewer is gone | — |
 
 - **Reload** (Cmd/Ctrl+R in every viewer) re-opens the path, takes a new fingerprint and drops the
-  cache. The text viewer indexes again, the media window probes again, and the hex window keeps its
+  cache. Reloads run in the order asked. Two plain ones not yet started are one; a reload after a
+  save (below) is never merged away. The text viewer indexes again, the media window probes again, and the hex window keeps its
   offset. The key is Cmd/Ctrl+R and not R alone, because in the hex window's ASCII column R types a
   byte.
 - **Retry** reconnects through the viewer's existing `Reconnect` (`src/gui/mod.rs:34`), re-opens and
