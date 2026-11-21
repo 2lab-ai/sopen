@@ -216,11 +216,15 @@ fn keys_page_through_the_file() {
     assert!(drv.find_text("row 1").is_some(), "Home shows the first");
     let visible = win.visible;
     drv.key(&mut win, Key::PageDown, Modifiers::NONE);
-    assert_eq!(win.top, visible - 1, "a page keeps one line of context");
+    assert_eq!(
+        win.line,
+        Some(visible - 1),
+        "a page keeps one line of context"
+    );
     drv.key(&mut win, Key::ArrowDown, Modifiers::NONE);
-    assert_eq!(win.top, visible);
+    assert_eq!(win.line, Some(visible));
     drv.key(&mut win, Key::PageUp, Modifiers::NONE);
-    assert_eq!(win.top, 1);
+    assert_eq!(win.line, Some(1));
 }
 
 /// A parser hook that stops on any line holding `MARKER` until released: it says when it got
@@ -2181,7 +2185,7 @@ fn a_viewer_can_open_at_a_byte_deep_in_a_long_line() {
         first.contains("050000"),
         "the top row holds the byte: {first}"
     );
-    assert_eq!(win.top, 1);
+    assert_eq!(win.line, Some(1));
     let status = drv.text_starting_with("line 2 (").unwrap_or_default();
     assert!(
         ["line 2 (49 % of it) of 3", "line 2 (50 % of it) of 3"].contains(&status.as_str()),
@@ -2345,11 +2349,18 @@ fn several_tabs_on_a_row_each_go_to_their_stop() {
     let want: Vec<String> = lines
         .iter()
         .map(|l| {
-            let plain = chrome::Palette::of(&drv.ctx.global_style().visuals).text;
-            expand_tabs(vec![(plain, l.to_string())])
-                .into_iter()
-                .map(|(_, t)| t)
-                .collect()
+            // Each tab as spaces up to the next stop.
+            let mut out = String::new();
+            for c in l.chars() {
+                match c {
+                    '\t' => {
+                        let n = TAB - out.chars().count() % TAB;
+                        out.extend(std::iter::repeat_n(' ', n));
+                    }
+                    c => out.push(c),
+                }
+            }
+            out
         })
         .collect();
     assert_eq!(rows, want);
@@ -2416,7 +2427,7 @@ fn all_rows(drv: &Driver, win: &mut TextWindow) -> (Vec<wrap::Row>, Vec<wrap::Po
 /// The rows of line `line` put back together: each row's text and the space it was full at.
 fn rejoined(rows: &[wrap::Row], line: u64) -> String {
     rows.iter()
-        .filter(|r| r.line == line)
+        .filter(|r| r.line == Some(line))
         .map(|r| {
             let skipped = r.cut.taken > r.cut.shown.len();
             format!("{}{}", r.cut.text(), if skipped { " " } else { "" })
@@ -2476,7 +2487,7 @@ fn shaped_line_wraps_at_clusters(name: &str, unit: &str) {
         .collect();
     let font = chrome::font();
     let plain = chrome::Palette::of(&drv.ctx.global_style().visuals).text;
-    let of_line: Vec<&wrap::Row> = all.iter().filter(|r| r.line == 0).collect();
+    let of_line: Vec<&wrap::Row> = all.iter().filter(|r| r.line == Some(0)).collect();
     for (k, row) in of_line.iter().enumerate() {
         assert!(
             starts.contains(&(row.start as usize)),
@@ -2506,8 +2517,9 @@ fn shaped_line_wraps_at_clusters(name: &str, unit: &str) {
     let forward: Vec<wrap::Pos> = all
         .iter()
         .map(|r| wrap::Pos {
-            line: r.line,
+            at: r.at,
             off: r.start,
+            loose: false,
         })
         .collect();
     assert_eq!(forward, back, "{name}: the same rows going back up");
@@ -2552,7 +2564,7 @@ fn a_long_line_walked_row_by_row_is_the_whole_line() {
     let mut drv = Driver::new(600.0, 400.0);
     drv.until(&mut win, 5, |w| w.ready());
     let (all, back) = all_rows(&drv, &mut win);
-    assert!(all.iter().filter(|r| r.line == 0).count() > 50);
+    assert!(all.iter().filter(|r| r.line == Some(0)).count() > 50);
     assert_eq!(rejoined(&all, 0), line);
     assert_eq!(rejoined(&all, 1), "next");
     assert_eq!(back.len(), all.len());
@@ -2632,8 +2644,9 @@ fn a_restart_point_inside_a_cluster_moves_past_it() {
     let forward: Vec<wrap::Pos> = all
         .iter()
         .map(|r| wrap::Pos {
-            line: r.line,
+            at: r.at,
             off: r.start,
+            loose: false,
         })
         .collect();
     assert_eq!(forward, back);
@@ -2750,8 +2763,9 @@ fn cjk_rows_fill_the_width(name: &str, unit: &str) {
     let forward: Vec<wrap::Pos> = all
         .iter()
         .map(|r| wrap::Pos {
-            line: r.line,
+            at: r.at,
             off: r.start,
+            loose: false,
         })
         .collect();
     assert_eq!(forward, back, "{name}: the same rows going back up");

@@ -1272,6 +1272,42 @@ fn the_at_state_opens_a_text_file_at_that_byte() {
     assert_eq!(top, Some("row 0600"), "{rows:?}");
 }
 
+/// `SOPEN_STATE` `loading=1` as the browser parsed it reaches the text viewer it opens (06
+/// §11), with no environment variable read on the way; without the key the viewer is told no.
+#[test]
+fn the_loading_state_reaches_the_text_viewer_the_browser_opens() {
+    assert!(
+        std::env::var_os("SOPEN_STATE").is_none(),
+        "the test reads no env"
+    );
+    for (text, want) in [("open=rows.txt;loading=1", true), ("open=rows.txt", false)] {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        std::fs::write(root.join("rows.txt"), "row 0\nrow 1\n").unwrap();
+        let mut b = Browser::new(Start {
+            fs: Box::new(LocalFs::new()),
+            connect: local_connect(),
+            label: None,
+            destination: None,
+            abs: root.to_str().unwrap().to_string(),
+            cache: tmp.path().join("cache"),
+            state_dir: tmp.path().join("state"),
+            launch: Arc::new(|_: &str, _: bool| Ok(String::new())),
+        });
+        let state = crate::gui::State::parse(text).unwrap();
+        b.scripted(&state);
+        assert_eq!(b.open_loading, want, "{text}");
+        let mut drv = Driver::new(1000.0, 700.0);
+        drv.until(&mut b, 20, |b| b.ready() && b.viewer.is_some());
+        assert!(drv.find_text("row 1").is_some(), "{text}: the viewer is up");
+        assert_eq!(
+            crate::gui::text::embedded_loading(),
+            Some(want),
+            "{text}: what the viewer was handed"
+        );
+    }
+}
+
 /// Video in the browser: Enter shows the media window (its first frame decoded), Esc leaves it.
 /// Needs ffmpeg (skips without it, unless `SOPEN_REQUIRE_FFMPEG` is set).
 #[test]

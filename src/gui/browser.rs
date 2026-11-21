@@ -106,10 +106,7 @@ pub fn open(start: Start, hooks: &Hooks) -> Result<Outcome> {
         Err(_) => Vec::new(),
     };
     let mut browser = Browser::new(start);
-    browser.open_first = hooks.state.open.clone();
-    browser.open_at = hooks.state.at;
-    browser.mode = hooks.state.mode;
-    browser.bar_first = hooks.state.bar.clone();
+    browser.scripted(&hooks.state);
     browser.script = script.into();
     let leftover = browser.leftover.clone();
     let run = super::run_window(&title, WINDOW, browser, hooks);
@@ -517,6 +514,9 @@ pub(crate) struct Browser {
     /// row that byte is in at the top) — the one `open=` opens, or else the first the owner
     /// opens; taken by it, so no later viewer gets it.
     open_at: Option<u64>,
+    /// `SOPEN_STATE` `loading=1` (06 §11): handed to the text viewers this browser opens, as
+    /// `at=` is. A viewer on a stream is then shot at its first frame with rows.
+    open_loading: bool,
     /// `SOPEN_KEYS`: the keys still to play, one per settled window, and the passes to let go
     /// by before the next (a field opened by one takes the typing on the pass after).
     script: VecDeque<Play>,
@@ -595,6 +595,7 @@ impl Browser {
             open_first: None,
             bar_first: None,
             open_at: None,
+            open_loading: false,
             script: VecDeque::new(),
             script_gap: 0,
         };
@@ -1111,14 +1112,25 @@ impl Browser {
                 // A file read in place (no fetched copy, no stream) is followed at its end.
                 let live = claim.is_none() && !doc.is_stream();
                 let at = self.open_at.take();
+                let loading = self.open_loading;
                 (
-                    super::text::embed(doc, title, &name, notices, live, at),
+                    super::text::embed_scripted(doc, title, &name, notices, live, at, loading),
                     claim,
                 )
             }
         };
         self.status = Status::default();
         self.view(ctx, embedded, hold, abs);
+    }
+
+    /// What `SOPEN_STATE` asks of the browser (a scripted run): the entry to open or to put
+    /// the bar on, the mode, and what the text viewer it opens is handed (`at=`, `loading=1`).
+    fn scripted(&mut self, state: &super::State) {
+        self.open_first = state.open.clone();
+        self.open_at = state.at;
+        self.open_loading = state.loading;
+        self.mode = state.mode;
+        self.bar_first = state.bar.clone();
     }
 
     /// A preview handed over (02 §4.4): the live window is the viewer.
@@ -1226,9 +1238,11 @@ impl Browser {
                 }
             }
             EntryKind::File | EntryKind::Unknown => {
-                // `at=OFFSET` is for a text file opened from its start.
+                // `at=OFFSET` is for a text file opened from its start; `loading=1` for a
+                // viewer that is told so when it is made (a preview handed over was not).
                 let taken = match self.open_at {
                     Some(_) => preview::Taken::Nothing,
+                    None if self.open_loading => preview::Taken::Nothing,
                     None => self.preview.take(&path),
                 };
                 match taken {
