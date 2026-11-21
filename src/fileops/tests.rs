@@ -4501,3 +4501,159 @@ fn a_local_temp_without_an_identity_is_left_and_named() {
     );
     assert!(src.join("f").exists());
 }
+
+// ---- round 8 ----
+
+/// The link + unlink fallback (no exclusive rename) never links an entry that is not the one
+/// it looked at: a file put under the name between that look and the pin's open — here the
+/// same device and inode with another status-change time, as a reused inode number gives — is
+/// "changed", not "no descriptor at hand": nothing is linked and the name stays. The same
+/// where no descriptor can be held at all: the name is looked at again before the link.
+#[test]
+fn the_fallback_links_nothing_when_the_entry_changed_before_its_pin() {
+    for no_pins in [false, true] {
+        let (_t, src, dst) = scratch();
+        let a = src.join("a");
+        std::fs::write(&a, "a replacement").unwrap();
+        let _excl = LocalFs::seam_no_exclusive_rename();
+        let _pins = no_pins.then(LocalFs::seam_no_pins);
+        let (at, once) = (a.clone(), AtomicBool::new(false));
+        let _seam = LocalFs::seam_before_pin_open(move |_| {
+            if !once.swap(true, Ordering::Relaxed) {
+                bump_ctime(&at);
+            }
+        });
+        let r = run(
+            &job(Op::Move, &src, &["a"], &dst),
+            Hosts::Same(&mut LocalFs::new()),
+            &mut Script::default(),
+        );
+        assert!(
+            matches!(&r.items[..], [Item { outcome: ItemOutcome::Failed(why), .. }]
+                if why.contains("changed while it was being renamed")),
+            "no_pins {no_pins}: {r:?}"
+        );
+        assert_eq!(
+            std::fs::read(&a).unwrap(),
+            b"a replacement",
+            "no_pins {no_pins}: its name survives"
+        );
+        assert_eq!(names(&dst), Vec::<String>::new(), "no_pins {no_pins}");
+    }
+}
+
+/// Without a descriptor the fallback still moves a file, and still keeps a replacement put
+/// under the old name after the link: the old name must be the very entry the new name is.
+#[test]
+fn the_fallback_without_a_pin_moves_and_keeps_a_replacement() {
+    let _excl = LocalFs::seam_no_exclusive_rename();
+    let _pins = LocalFs::seam_no_pins();
+    let (_t, src, dst) = scratch();
+    std::fs::write(src.join("a"), "original").unwrap();
+    let r = run(
+        &job(Op::Move, &src, &["a"], &dst),
+        Hosts::Same(&mut LocalFs::new()),
+        &mut Script::default(),
+    );
+    assert!(r.all_done(), "{r:?}");
+    assert_eq!(std::fs::read(dst.join("a")).unwrap(), b"original");
+    assert!(!src.join("a").exists());
+
+    std::fs::write(src.join("b"), "original").unwrap();
+    let _seam = LocalFs::seam_before_unlink(replace_entry);
+    let r = run(
+        &job(Op::Move, &src, &["b"], &dst),
+        Hosts::Same(&mut LocalFs::new()),
+        &mut Script::default(),
+    );
+    assert!(
+        matches!(&r.items[..], [Item { outcome: ItemOutcome::Failed(why), .. }]
+            if why.contains("old name remains")),
+        "{r:?}"
+    );
+    assert_eq!(std::fs::read(dst.join("b")).unwrap(), b"original");
+    assert_eq!(
+        std::fs::read(src.join("b")).unwrap(),
+        b"a replacement, longer than the original"
+    );
+}
+
+/// A copy written into, in place, right after its read-back succeeded (here while the source
+/// is checked again) is not what was checked: its mark was taken before the read-back and is
+/// never renewed, so the source stays.
+#[test]
+fn a_copy_overwritten_right_after_its_read_back_keeps_the_source() {
+    both(|inner, how| {
+        let (_t, src, dst) = scratch();
+        let f = src.join("f");
+        std::fs::write(&f, "the right bytes").unwrap();
+        let mut fs = Faulty::new(inner);
+        fs.rename = no_rename_from(&[&f]);
+        let armed = Arc::new(AtomicBool::new(false));
+        let (arm, fire) = (armed.clone(), armed.clone());
+        let (copy, source, target) = (dst.join("f"), s(&f), s(&dst.join("f")));
+        fs.after = Box::new(move |op, p| {
+            if op == "read_to" && p == target {
+                arm.store(true, Ordering::Relaxed);
+            }
+        });
+        fs.fault = Box::new(move |op, p| {
+            if op == "lstat" && p == source && fire.swap(false, Ordering::Relaxed) {
+                let mut file = std::fs::OpenOptions::new().write(true).open(&copy).unwrap();
+                file.write_all(b"OTHER bytes, and more of them").unwrap();
+            }
+            None
+        });
+        let r = run(
+            &job(Op::Move, &src, &["f"], &dst),
+            Hosts::Same(&mut fs),
+            &mut Script::default(),
+        );
+        assert!(
+            matches!(&r.items[..], [Item { outcome: ItemOutcome::Failed(why), .. }]
+                if why.contains("changed while it was checked; the source stays")),
+            "{how}: {r:?}"
+        );
+        assert_eq!(std::fs::read(&f).unwrap(), b"the right bytes", "{how}");
+    });
+}
+
+/// A link just made that is replaced before it is marked — here by a regular file — is not
+/// the copy: the source link stays.
+#[test]
+fn a_link_replaced_before_its_mark_keeps_the_source() {
+    both(|inner, how| {
+        let (_t, src, dst) = scratch();
+        let l = src.join("l");
+        std::os::unix::fs::symlink("target", &l).unwrap();
+        let mut fs = Faulty::new(inner);
+        fs.rename = no_rename_from(&[&l]);
+        let made = s(&dst.join("l"));
+        fs.after = Box::new(move |op, p| {
+            if op == "make_symlink" && p == made {
+                std::fs::remove_file(p).unwrap();
+                std::fs::write(p, "a file in its place").unwrap();
+            }
+        });
+        let r = run(
+            &job(Op::Move, &src, &["l"], &dst),
+            Hosts::Same(&mut fs),
+            &mut Script::default(),
+        );
+        assert!(
+            matches!(&r.items[..], [Item { outcome: ItemOutcome::Failed(why), .. }]
+                if why.contains("is not the link that was made any more") && why.contains("stays")),
+            "{how}: {r:?}"
+        );
+        assert_eq!(
+            std::fs::read_link(&l).unwrap(),
+            PathBuf::from("target"),
+            "{how}: the source link stays"
+        );
+        assert_eq!(
+            std::fs::read(dst.join("l")).unwrap(),
+            b"a file in its place",
+            "{how}"
+        );
+    });
+}

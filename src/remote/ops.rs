@@ -68,6 +68,17 @@ impl Pin {
         let m = self.0.metadata().ok()?;
         Some((m.dev(), m.ino()))
     }
+
+    /// The identity of what the descriptor holds, as it is now (`fstat`).
+    pub fn ident(&self) -> Option<Ident> {
+        use std::os::unix::fs::MetadataExt;
+        let m = self.0.metadata().ok()?;
+        Some(Ident {
+            dev: m.dev(),
+            ino: m.ino(),
+            ctime: (m.ctime(), m.ctime_nsec()),
+        })
+    }
 }
 
 impl std::fmt::Debug for Pin {

@@ -335,16 +335,12 @@ struct Copied {
     copy: Option<Box<CopyMark>>,
 }
 
-/// A published, checked copy and what its name is known by: on this machine its device, inode
-/// and status-change time; over SFTP, with no inode, its type, size and mtime.
+/// A published copy and what its name is known by: its type, size and mtime, and on this
+/// machine (SFTP carries no inode) its device, inode and status-change time too.
 struct CopyMark {
     path: String,
-    seen: Seen,
-}
-
-enum Seen {
-    Ident(Ident),
-    Stat(Stat),
+    ident: Option<Ident>,
+    stat: Stat,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1186,6 +1182,13 @@ impl Engine<'_, '_, '_> {
             copy: None,
         };
         if mv {
+            // What the copy is known by from here to its source's removal, taken before the
+            // read-back: bytes written into it during or after the check change it, and are
+            // never taken for what was checked.
+            let mark = match self.mark_file(&target, &staged) {
+                Ok(mark) => mark,
+                Err(why) => return Placed::Keep(format!("{why}; {shown} stays")),
+            };
             let sent = read.or(staged.sha256);
             match self.verify(from, &target, shown, before.size, sent) {
                 // Verified only while the source is still the entry that was read.
@@ -1228,54 +1231,92 @@ impl Engine<'_, '_, '_> {
                     return Placed::Failed(format!("{why}; {what}"));
                 }
             }
-            match self.mark_copy(&target, staged.id_now()) {
-                Ok(mark) => copied.copy = Some(Box::new(mark)),
-                Err(why) => return Placed::Keep(format!("{why}; {shown} stays")),
+            // Still what the read-back began on? The mark stays the one taken before it.
+            if !self.mark_still(&mark) {
+                return Placed::Keep(format!(
+                    "{shown}: its copy at {target} changed while it was checked; the source stays"
+                ));
             }
+            copied.copy = Some(Box::new(mark));
         }
         Placed::At(copied)
     }
 
-    /// What the checked copy at `path` is known by until its source goes ([`CopyMark`]); `own`
-    /// is the inode it was written through, where there is one.
-    fn mark_copy(&mut self, path: &str, own: Option<(u64, u64)>) -> Result<CopyMark, String> {
-        let changed = || format!("the copy at {path} changed right after it was checked");
-        let seen = match self.ends.dst().identity(path, false) {
-            Ok(Some(now)) if own.is_none_or(|own| own == now.inode()) => Seen::Ident(now),
-            Ok(Some(_)) | Err(_) => return Err(changed()),
-            Ok(None) => match self.ends.dst().lstat_opt(path) {
-                Ok(Some(now)) => Seen::Stat(now),
-                _ => return Err(changed()),
-            },
+    /// What a published file's copy at `path` is known by ([`CopyMark`]), taken before its
+    /// read-back. On this machine the identity the descriptor it was written through reports
+    /// now — and the name must carry exactly that; over SFTP, with no inode, the name's type
+    /// (a regular file), size and mtime.
+    fn mark_file(&mut self, path: &str, staged: &Staged) -> Result<CopyMark, String> {
+        let changed = || format!("the copy at {path} changed before it could be checked");
+        let held = staged.pin.as_ref().and_then(Pin::ident);
+        let ident = match (self.ends.dst().identity(path, false), held) {
+            (Ok(Some(now)), Some(held)) if now == held => Some(held),
+            (Ok(Some(now)), None) if staged.id == Some(now.inode()) => Some(now),
+            (Ok(None), None) if staged.id.is_none() => None,
+            _ => return Err(changed()),
         };
-        Ok(CopyMark {
-            path: path.to_string(),
-            seen,
-        })
+        match self.ends.dst().lstat_opt(path) {
+            Ok(Some(stat)) if Kind::of(&stat) == Kind::File => Ok(CopyMark {
+                path: path.to_string(),
+                ident,
+                stat,
+            }),
+            _ => Err(changed()),
+        }
     }
 
-    /// Is a moved item's copy still what was checked? Asked right before its source goes. On
-    /// this machine by device, inode and status-change time (best effort, as every comparison
-    /// without a held descriptor: a change of its metadata keeps the source too — the safe
-    /// side); over SFTP by type, size and mtime. Why not, if not.
+    /// What a link just made at `path` is known by — only while it is that link: a symlink
+    /// whose text is `target`. Anything else there (a file put in its place too) is not the
+    /// copy.
+    fn mark_link(&mut self, path: &str, target: &str) -> Result<CopyMark, String> {
+        let changed = || format!("{path} is not the link that was made any more");
+        let Ok(ident) = self.ends.dst().identity(path, false) else {
+            return Err(changed());
+        };
+        let stat = match self.ends.dst().lstat_opt(path) {
+            Ok(Some(stat)) if stat.is_symlink => stat,
+            _ => return Err(changed()),
+        };
+        let mark = CopyMark {
+            path: path.to_string(),
+            ident,
+            stat,
+        };
+        let same_text = matches!(self.ends.dst().read_link(path), Ok(text) if text == target);
+        // And still the entry the mark was taken of, now that its text was read.
+        if same_text && self.mark_still(&mark) {
+            Ok(mark)
+        } else {
+            Err(changed())
+        }
+    }
+
+    /// Does the name of `mark` still carry what the mark was taken of: the same type, size and
+    /// mtime, and on this machine the same device, inode and status-change time? Best effort,
+    /// as every comparison of metadata: bytes written into the file without changing its size,
+    /// within one tick of the filesystem's clock, are not seen (the kernel stamps both times
+    /// from that clock; over SFTP mtime has whole seconds). A change of its metadata alone is
+    /// a change too — the safe side.
+    fn mark_still(&mut self, mark: &CopyMark) -> bool {
+        if let Some(was) = &mark.ident {
+            let same =
+                matches!(self.ends.dst().identity(&mark.path, false), Ok(Some(now)) if now == *was);
+            if !same {
+                return false;
+            }
+        }
+        let was = &mark.stat;
+        matches!(self.ends.dst().lstat_opt(&mark.path), Ok(Some(now))
+            if Kind::of(&now) == Kind::of(was) && now.size == was.size && now.mtime == was.mtime)
+    }
+
+    /// Is a moved item's copy still what was marked before its check ([`Engine::mark_still`])?
+    /// Asked right before its source goes. Why not, if not.
     fn copy_still(&mut self, copied: &Copied) -> Result<(), String> {
         let Some(mark) = &copied.copy else {
             return Ok(());
         };
-        let same = match &mark.seen {
-            Seen::Ident(was) => {
-                matches!(self.ends.dst().identity(&mark.path, false), Ok(Some(now)) if now == *was)
-            }
-            Seen::Stat(was) => match self.ends.dst().lstat_opt(&mark.path) {
-                Ok(Some(now)) => {
-                    Kind::of(&now) == Kind::of(was)
-                        && now.size == was.size
-                        && now.mtime == was.mtime
-                }
-                _ => false,
-            },
-        };
-        if same {
+        if self.mark_still(mark) {
             return Ok(());
         }
         Err(format!(
@@ -1601,7 +1642,7 @@ impl Engine<'_, '_, '_> {
         let how = match self.still(from, &copied) {
             Still::Same => {
                 if self.job.op == Op::Move {
-                    match self.mark_copy(&made, None) {
+                    match self.mark_link(&made, &target) {
                         Ok(mark) => copied.copy = Some(Box::new(mark)),
                         Err(why) => return Placed::Keep(format!("{why}; {shown} stays")),
                     }

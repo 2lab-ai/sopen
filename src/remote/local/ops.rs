@@ -75,14 +75,15 @@ fn stat_at(dir: &fs::File, name: &CStr) -> std::io::Result<At> {
 /// Linux; on macOS a read-only open (`O_SYMLINK` for a link). Only a regular file or a link is
 /// ever opened: opening a device, a fifo or a socket can have effects of its own that
 /// `O_NONBLOCK` does not prevent, so those are known by device, inode and status-change time
-/// instead. `None` for those, where no descriptor can be held (too many open files; on macOS
-/// an entry this account cannot read), and where what opened is not `own` in full — device,
-/// inode and status-change time: an entry put there since `own` was read, on the same inode
-/// number or not, is never pinned as if it were `own`.
-fn pin_at(dir: &fs::File, name: &CStr, own: &At) -> Option<fs::File> {
+/// instead. [`Pinned::Unavailable`] for those and where no descriptor can be held (too many
+/// open files; on macOS an entry this account cannot read); [`Pinned::Changed`] where what
+/// opened is not `own` in full — device, inode and status-change time: an entry put there since
+/// `own` was read, on the same inode number or not, is never pinned as if it were `own`, and
+/// the caller must not go on as if no descriptor had merely been at hand.
+fn pin_at(dir: &fs::File, name: &CStr, own: &At) -> Pinned {
     use std::os::fd::FromRawFd;
     if !own.file && !own.link {
-        return None;
+        return Pinned::Unavailable;
     }
     #[cfg(target_os = "linux")]
     let flags = libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC;
@@ -98,14 +99,44 @@ fn pin_at(dir: &fs::File, name: &CStr, own: &At) -> Option<fs::File> {
     crate::remote::ops::fire_seam(&BEFORE_PIN_OPEN, &name.to_string_lossy());
     // SAFETY: an open descriptor and a NUL-terminated name.
     let fd = unsafe { libc::openat(dir.as_raw_fd(), name.as_ptr(), flags) };
+    #[cfg(test)]
+    let fd = if fd >= 0 && NO_PINS.with(|f| f.get()) {
+        // SAFETY: a descriptor just opened, owned by nothing else.
+        unsafe { libc::close(fd) };
+        -1
+    } else {
+        fd
+    };
     if fd < 0 {
-        return None;
+        return Pinned::Unavailable;
     }
     // SAFETY: a descriptor just opened, owned by nothing else.
     let file = unsafe { fs::File::from_raw_fd(fd) };
-    let m = file.metadata().ok()?;
+    let Ok(m) = file.metadata() else {
+        return Pinned::Unavailable;
+    };
     let opened = (m.dev(), m.ino(), (m.ctime(), m.ctime_nsec()));
-    (opened == (own.dev, own.ino, own.ctime)).then_some(file)
+    if opened == (own.dev, own.ino, own.ctime) {
+        Pinned::Held(file)
+    } else {
+        Pinned::Changed
+    }
+}
+
+/// What [`pin_at`] found.
+enum Pinned {
+    /// The entry that was looked at, held open.
+    Held(fs::File),
+    /// Another entry has the name now (another device, inode or status-change time).
+    Changed,
+    /// No descriptor is to be had for it: nothing is known about the name either way.
+    Unavailable,
+}
+
+/// `path` itself (`lstat`), as [`stat_at`] gives an entry.
+fn stat_at_path(path: &str) -> std::io::Result<At> {
+    let (folder, name) = open_folder(path).map_err(|e| std::io::Error::other(format!("{e:#}")))?;
+    stat_at(&folder, &name)
 }
 
 /// The folder holding `path`, opened once: what is done to its entry goes through this
@@ -430,7 +461,11 @@ impl FileOps for LocalFs {
         if (own.dev, own.ino, own.ctime) != (id.dev, id.ino, id.ctime) {
             return None;
         }
-        pin_at(&folder, &name, &own).map(Pin::new)
+        match pin_at(&folder, &name, &own) {
+            Pinned::Held(file) => Some(Pin::new(file)),
+            // The engine then compares the identity it read, in full: a changed entry is kept.
+            Pinned::Changed | Pinned::Unavailable => None,
+        }
     }
 
     fn meta(&mut self, path: &str) -> Result<FileMeta> {
@@ -467,7 +502,23 @@ impl FileOps for LocalFs {
         }
         // The old entry's inode, held until the check before its unlink: while it is open, no
         // other file can be given its number (ext4 reuses a freed one at once).
-        let pin = pin_at(&folder, &name, &own);
+        let changed = || {
+            anyhow!(
+                "{from} changed while it was being renamed (another entry has its name now); \
+                 nothing was changed"
+            )
+        };
+        let pin = match pin_at(&folder, &name, &own) {
+            Pinned::Held(file) => Some(file),
+            // Not the entry that was looked at: nothing is linked, nothing removed.
+            Pinned::Changed => return Err(changed()),
+            // No descriptor: the name is looked at once more right before the link. Best
+            // effort — it can still be swapped between this look and the link.
+            Pinned::Unavailable => match stat_at(&folder, &name) {
+                Ok(now) if now == own => None,
+                _ => return Err(changed()),
+            },
+        };
         let made = if own.link {
             read_link_at(&folder, &name).and_then(|target| {
                 // SAFETY: two NUL-terminated paths; the new link's is relative to the working
@@ -507,6 +558,9 @@ impl FileOps for LocalFs {
             }
             Err(e) => return Err(e).with_context(|| format!("cannot rename {from} to {to}")),
         }
+        // The new name as it is now (the link changed its inode's status-change time): what the
+        // old name is compared with where no descriptor is held.
+        let linked = stat_at_path(to);
         #[cfg(test)]
         crate::remote::ops::fire_seam(&BEFORE_UNLINK, from);
         // Right before the unlink: is the old name still the entry that was linked (its device
@@ -532,15 +586,18 @@ impl FileOps for LocalFs {
                     Some(pin) => pin
                         .metadata()
                         .is_ok_and(|m| (m.dev(), m.ino()) == (now.dev, now.ino)),
-                    // No descriptor could be held: the device and inode — kept alive by the
-                    // hard link just made — and for a link (made again elsewhere, so its old
-                    // inode may be freed and reused) its status-change time too. That last is
-                    // best effort: a new entry on the reused number within the timestamp's
-                    // precision would compare equal.
-                    None => {
-                        (now.dev, now.ino) == (own.dev, own.ino)
-                            && (!own.link || now.ctime == own.ctime)
+                    // No descriptor could be held. A link was made again elsewhere, so its old
+                    // inode may be freed and reused: its device, inode and status-change time
+                    // as first read. A file: the old name must be the very entry the new name
+                    // is — device, inode (kept alive by the hard link just made) and
+                    // status-change time. Best effort both: as fine as the timestamps.
+                    None if own.link => {
+                        (now.dev, now.ino, now.ctime) == (own.dev, own.ino, own.ctime)
                     }
+                    None => linked.as_ref().is_ok_and(|new| {
+                        (now.dev, now.ino, now.ctime) == (new.dev, new.ino, new.ctime)
+                            && (now.dev, now.ino) == (own.dev, own.ino)
+                    }),
                 };
                 if !same {
                     return Ok(both("another entry has its name now".into()));
@@ -911,6 +968,7 @@ thread_local! {
     static BEFORE_PIN_OPEN: std::cell::RefCell<Option<crate::remote::ops::SeamHook>> =
         const { std::cell::RefCell::new(None) };
     static TEMP_STAT_FAILS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static NO_PINS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static AFTER_CREATE: std::cell::RefCell<Option<crate::remote::ops::SeamHook>> =
         const { std::cell::RefCell::new(None) };
     static AFTER_PROBE: std::cell::RefCell<Option<crate::remote::ops::SeamHook>> =
@@ -962,6 +1020,12 @@ impl LocalFs {
         hook: impl FnMut(&str) + 'static,
     ) -> crate::remote::ops::SeamGuard {
         crate::remote::ops::set_seam(&BEFORE_PIN_OPEN, hook)
+    }
+
+    /// No descriptor can be held for a pin (as when too many files are open).
+    pub(crate) fn seam_no_pins() -> crate::remote::ops::SeamGuard {
+        NO_PINS.with(|f| f.set(true));
+        crate::remote::ops::SeamGuard::new(|| NO_PINS.with(|f| f.set(false)))
     }
 
     /// A copy's temp cannot be stat'ed through its descriptor right after its create.
