@@ -16,7 +16,7 @@ browser's experiments are its own E1–E5 (02 §8.2).
 |---|---|---|---|---|---|---|---|
 | X1 | 🔴 | — (scratch) | — | Spike: PR #15's real `edit_args` (10 spans, up to 24 inputs) and playback command lines against the real `stream::http::Server` (W3, merged) with its 64 KiB blocks, 64 MiB cache and the cap; log bytes fetched against bytes sent (06 §7.4). About half a day. | none | before W7 (PR #15 and W3 are merged) | numbers written into 06 §7.4 |
 | W4 | 🚪 | `feat/stream-hex` | `.worktrees/feat-stream-hex` | 06 §7.1: hex over `Bytes`, Pending rows, patches keep their byte, interim Save | `src/gui/hex.rs`, `src/gui/hex/file.rs`, `src/gui/hex/tests.rs`, `src/gui/mod.rs` (`State`'s `loading` field) | browser S1 merged (S1-E, PR #29, in review) | V1–V3, V11; screenshot with `loading=1` |
-| W5a | 🚪 | `feat/stream-text-reads` | `.worktrees/feat-stream-text-reads` | 06 §7.2 W5a: reads through `Bytes`, Pending like `Stale`, first screen first, 16 MiB pass for a Source continuing S1-B's (a local file keeps its whole-file pass), highlighting over the prefix, the five defects X3 found | `src/gui/text.rs`, `src/gui/text/tests.rs` | browser S1 merged (S1-E, PR #29, in review) | V13 |
+| W5a | 🚪 | `feat/stream-text-reads` | `.worktrees/feat-stream-text-reads` | 06 §7.2 W5a: reads through `Bytes`, Pending like `Stale`, first screen first, 16 MiB pass for a Source continuing S1-B's (a local file keeps its whole-file pass), highlighting over the prefix, the five defects X3 found | `src/gui/text.rs`, `src/gui/text/tests.rs` | browser S1 merged (S1-E, PR #29, in review) | V13, V13a |
 | W5b | 🚪 | `feat/stream-text-large` | `.worktrees/feat-stream-text-large` | 06 §7.2 W5b: prefix index, byte-offset keys (with wrap), unknown line starts, Go to, index bound | `src/gui/text.rs`, `src/gui/text/wrap.rs`, `src/gui/text/tests.rs` | W5a | V12 |
 | W6 | 🚪 | `feat/stream-image` | `.worktrees/feat-stream-image` | 06 §7.3: header walk (SOF read directly), memory line, reserved buffer, streamed read, partial pictures | `src/gui/image.rs`, `src/gui/image/probe.rs`, `src/gui/image/robustness_tests.rs`, `Cargo.toml` / `Cargo.lock` (`png`) | browser S1 merged (S1-E, PR #29, in review) | V14, V15; screenshots of a partial progressive JPEG and a partial plain PNG |
 | W7 | 🚪 | `feat/stream-media` | `.worktrees/feat-stream-media` | 06 §7.4: URL inputs with their own options and reader kinds, progressive waveform, Export cancel, cut runs failed | `src/gui/media.rs`, `src/gui/media/*`, `src/gui/playback.rs`, `src/ffmpeg.rs`, `src/cut.rs` | S1-M merged (it waits on S1-E); X1 | V16, V18, V19, V22 |
@@ -32,8 +32,8 @@ browser's experiments are its own E1–E5 (02 §8.2).
 The "After" column is authoritative; this is the order it gives. Steps 1–4 are done as of
 2026-11-21; step 5 waits on S1-E (PR #29, in review).
 
-1. PR #15 (media edit) and PR #16 (stems), in flight now. PR #16 shares only `Cargo.toml` with W1
-   (other sections): whichever merges second rebases.
+1. PR #15 (media edit) and PR #16 (stems): both merged on 2026-11-20. PR #16 shared only
+   `Cargo.toml` with W1 (other sections).
 2. This docs branch, rebased on `main` (S1-0 is merged), with the 02 §8 sentence below.
 3. In parallel with the browser's S1-A…D: W1 and ED2; then W2, then W3 (new files).
 4. ED1 after W1 and S1-C.
