@@ -196,7 +196,9 @@ channel, and the Source bounds those bytes.
 - **The cap:** `cap = clamp(2 × rate × rtt_min, 256 KiB, 4 MiB)`.
   - `rate` is the delivered byte rate, an EWMA over the last second of completions. Until there is
     one, the cap is 256 KiB.
-  - `rtt_min` is the fastest small reply seen: the open's `fstat`, or a one-block read.
+  - `rtt_min` is the fastest small reply seen: a status reply, or a one-block read. It starts at
+    the first reply, not at the open's `fstat`, which `Ranged` does not time. The cap is 256 KiB
+    until then.
 - **Reads are admitted against the cap.** A read goes out only if `in_flight + its size ≤ cap`. The
   one exception is a read on an idle channel (`in_flight` = 0), which always goes, so that a read
   larger than the cap still makes progress.
@@ -279,6 +281,10 @@ viewer is on screen, scheduled as §4 says: ahead of queued prefetch and bulk, b
 never held back by the cap. A viewer that is hidden, such as a browser viewer behind the list, does
 not poll.
 
+`Replaced` is found by comparing `stat(path)` with the fingerprint. A file of the same size and the
+same whole-second mtime renamed over the path is therefore not seen: SFTP v3 carries no inode. It
+is the limit below, for the poll.
+
 **A detected change invalidates what is in flight.** Every request carries the Source's generation,
 which a change or a reload increments. A completion of an older generation is dropped unread, so
 nothing sent before the change can refill the cleared cache.
@@ -309,8 +315,9 @@ nothing sent before the change can refill the cleared cache.
   second cannot be seen without reading every byte, and is not (verified, above).
 
 **Timeouts.** A demand block pending over 1 s shows `loading 0x… (N KiB)`, and over 10 s
-`the remote is slow`. 01 §5's 30 s per request and 60 s without progress make it `Failed`. A failed
-prefetch is never shown; it is only retried as demand.
+`the remote is slow`. The transport fails a request that has no reply 60 s after it was sent (W1),
+and that failure makes the Source `Failed`. This is the one bound: the Source has no stall timer of
+its own. A failed prefetch is never shown; it is only retried as demand.
 
 **Interface** (`src/stream/mod.rs`; every viewer builds on it, and 07 reads through it):
 
@@ -332,13 +339,21 @@ pub struct Reader { /* a position with its own readahead window (§4) */ }
 impl Reader {
     /// Frames: the bytes when every block is cached, else Pending (fetch queued; `wake` on arrival).
     pub fn try_read(&mut self, off: u64, len: usize) -> Poll<Result<bytes::Bytes>>;
+    /// Moves the reader to the version open now, at no position.
+    pub fn renew(&mut self);
     /// Workers and HTTP connections: blocks. Err(Cancelled) once `cancel` is set,
-    /// Err(Changed) when the source changed, Err(reason) when it failed.
+    /// Err(Changed) when the source changed, Err(Reloaded) when it was reloaded,
+    /// Err(reason) when it failed.
     pub fn read_at(&mut self, off: u64, buf: &mut [u8], cancel: &AtomicBool) -> Result<usize>;
 }
 /// What a viewer reads: implemented by `std::fs::File` (local, in place; always Ready) and `Reader`.
 pub trait Bytes { /* len, try_read, read_at — as above */ }
 ```
+
+**A reader reads one version.** After any reload, every reader made before it gets
+`ReadError::Reloaded` for every read, cached or not, until `renew()`. So a worker never continues
+into the new file. A viewer renews its readers after a reload. The byte server treats `Reloaded`
+as it treats `Changed`: it cuts the response (§9).
 
 `Waker` is egui's `request_repaint` for the viewer's context. `Reopen` opens a new connection on the
 viewer's `Reconnect` and makes it a `Ranged`.
@@ -385,6 +400,10 @@ nothing else is affected:
    The action fails with the line, and the edits stay in the window and in the journal (07 §4.2).
    Nothing on the remote was touched, because no request was sent. The next Save tries to connect
    again.
+
+**Not verified yet.** `stream::session_refused` matches ssh's words for a refused session, but
+`start_sftp` sends ssh's stderr to null (`src/remote/sftp.rs:81`), so those words never reach the
+error today. W8 and ED4 must capture that stderr, a change to W1's file, before V10 can pass.
 
 ## 7. Per viewer
 
@@ -889,7 +908,11 @@ stream <event> t=<ms> <host:/abs> fetched=<b> demand=<b> prefetch=<b> bulk=<b> d
   - Two Interactive readers and one Bulk reader on one Source: the bytes ahead of a demand are ≤ the
     cap + one block per other reader with demand queued. No bulk request is sent while foreground
     demand is queued.
-  - Ten jumps within 100 ms: only the last place's demand is sent beyond what was in flight.
+  - Ten jumps within 100 ms: nothing queues. Every demand sent was the reader's latest place when
+    it went, and a place passed while the cap was full is never sent
+    (`v4_ten_jumps_on_an_idle_link_never_queue_a_passed_place`: on the gate link from an idle
+    start, 9 of the 10 places find room and go). While the cap is full, only the last place is sent
+    (`v4_ten_jumps_send_only_the_last_place`).
   - **Fences with the cap full:** prefetch fills the cap and more prefetch is queued. A demand batch
     is admitted when room frees. Its fence is sent right behind its read, ahead of the queued
     prefetch, and the block is visible once that fence returns. It does not wait for the queued
