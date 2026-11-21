@@ -1,6 +1,7 @@
 //! [`RemoteFs`] on the local disk: local targets, and the implementation every test runs against.
 
 mod ops;
+mod patch;
 
 use super::{CreateError, Created, Entry, Hashing, Like, RemoteFs, Stat, Uploaded};
 use anyhow::{anyhow, Context, Result};
@@ -204,6 +205,10 @@ impl RemoteFs for LocalFs {
 
     fn remove(&mut self, path: &str) -> Result<()> {
         fs::remove_file(path).with_context(|| format!("cannot remove {path}"))
+    }
+
+    fn patcher(&mut self) -> Option<&mut dyn super::patch::PatchFs> {
+        Some(self)
     }
 
     /// Tests only (06 §2): outside them a local file never gets a stream, so the default

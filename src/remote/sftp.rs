@@ -9,6 +9,7 @@
 //! [`OutcomeUnknown`](super::OutcomeUnknown), never as "nothing written".
 
 mod ops;
+mod patch;
 mod ranged;
 mod writes;
 
@@ -727,6 +728,10 @@ impl RemoteFs for SftpRemote {
         let (rt, _, fs) = self.parts();
         let got = rt.block_on(within(META_TIMEOUT, fs.remove_file(path)));
         changed(&format!("remove {path}"), got)
+    }
+
+    fn patcher(&mut self) -> Option<&mut dyn super::patch::PatchFs> {
+        Some(self)
     }
 
     fn into_ranged(self: Box<Self>, path: &str) -> std::result::Result<Box<dyn Ranged>, Refused> {
