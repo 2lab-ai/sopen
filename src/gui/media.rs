@@ -28,7 +28,7 @@ use file::{MediaFile, Saved};
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering::SeqCst};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering::SeqCst};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
@@ -428,8 +428,10 @@ enum Miss {
     Spent,
 }
 
-/// The frame asked for next: timeline time and source frame (the latest request wins).
-type Request = Arc<(Mutex<Option<(f64, Tick)>>, Condvar)>;
+/// A request: its number, timeline time and source frame.
+type Ask = (u64, f64, Tick);
+/// The frame asked for next (the latest request wins).
+type Request = Arc<(Mutex<Option<Ask>>, Condvar)>;
 /// Decoded frames kept, by source frame, oldest first.
 type Kept = Arc<Mutex<VecDeque<(Tick, Arc<Vec<u8>>)>>>;
 /// The waveform's columns, per lane, for (timeline revision, peaks version, columns, lanes).
@@ -440,7 +442,11 @@ type Columns = Option<((u64, u64, usize, usize), Vec<Vec<[f32; 2]>>)>;
 /// at once.
 struct Scrubber {
     req: Request,
-    result: Arc<Mutex<Option<Result<Scrubbed, String>>>>,
+    /// The request being decoded; changed only with `req` held.
+    running: Arc<Mutex<Option<Ask>>>,
+    result: Arc<Mutex<Reply>>,
+    /// The requests made so far: the last one's number.
+    asked: AtomicU64,
     quit: Arc<AtomicBool>,
     cache: Kept,
 }
@@ -450,6 +456,41 @@ struct Scrubbed {
     t: f64,
     key: Tick,
     rgba: Arc<Vec<u8>>,
+}
+
+/// The answer for the window to take, to the latest request answered so far. A decode that
+/// ends after the playhead has moved on (a drag) is still shown until the later frame comes,
+/// but never once a later request has been answered (a kept frame answers at once, while a
+/// decode runs): its frame, at a time the playhead has left, would stay on screen, with nothing
+/// to ask again.
+#[derive(Default)]
+struct Reply {
+    /// The number of the latest request answered (0: none yet).
+    of: u64,
+    frame: Option<Result<Scrubbed, String>>,
+}
+
+impl Reply {
+    /// `frame` as the answer to request `n`, unless a later request is answered already.
+    fn give(&mut self, n: u64, frame: Result<Scrubbed, String>) -> bool {
+        if n <= self.of {
+            return false;
+        }
+        self.of = n;
+        self.frame = Some(frame);
+        true
+    }
+
+    /// The answer not taken yet.
+    fn take(&mut self) -> Option<Result<Scrubbed, String>> {
+        self.frame.take()
+    }
+
+    /// No answer to request `n` or one before it: none waiting, none to come.
+    fn drop_up_to(&mut self, n: u64) {
+        self.of = self.of.max(n);
+        self.frame = None;
+    }
 }
 
 impl Scrubber {
@@ -474,16 +515,18 @@ impl Scrubber {
     ) -> Option<Self> {
         let (w, h) = media.decode_size()?;
         let req: Request = Arc::default();
-        let result: Arc<Mutex<Option<Result<Scrubbed, String>>>> = Arc::default();
+        let running: Arc<Mutex<Option<Ask>>> = Arc::default();
+        let result: Arc<Mutex<Reply>> = Arc::default();
         let quit = Arc::new(AtomicBool::new(false));
         let cache: Kept = Arc::new(Mutex::new(seed.into_iter().collect()));
-        let (rq, res, q, store) = (req.clone(), result.clone(), quit.clone(), cache.clone());
+        let (rq, run, res, q) = (req.clone(), running.clone(), result.clone(), quit.clone());
+        let store = cache.clone();
         let (tools, path, fps) = (media.tools.clone(), media.input.clone(), media.fps.max(1.0));
         let origin = media.origin();
         let last_frame = media.last_frame();
         let keep = (FRAME_CACHE_BYTES / (w * h * 4) as usize).max(2);
         std::thread::spawn(move || loop {
-            let (t, key) = {
+            let key = {
                 let mut g = rq.0.lock().unwrap();
                 while g.is_none() && !q.load(SeqCst) {
                     g = rq.1.wait(g).unwrap();
@@ -491,7 +534,9 @@ impl Scrubber {
                 if q.load(SeqCst) {
                     return;
                 }
-                g.take().expect("checked")
+                let ask = g.take().expect("checked");
+                *run.lock().unwrap() = Some(ask);
+                ask.2
             };
             // Half a frame early, as Save renders a cut: the frame shown is frame `key` (keys
             // are clamped to the picture's last frame where they are made, [`MediaWindow::
@@ -561,6 +606,7 @@ impl Scrubber {
                     None => Err(no_frame()),
                 }
             };
+            let n;
             let frame = {
                 let read = grab(at, slot_end - at + LOOK_PAST_S, true).or_else(|e| {
                     if matches!(e, Miss::Spent) {
@@ -578,6 +624,12 @@ impl Scrubber {
                     let from = (at - 2.0).max(0.0);
                     grab(from, slot_end - from, false)
                 });
+                // The request it answers: the latest one for this frame (one asked while it ran
+                // took it over). Its picture is kept in the same step, so a request sees this
+                // decode running or its frame kept, never neither.
+                let _asks = rq.0.lock().unwrap();
+                let t;
+                (n, t, _) = run.lock().unwrap().take().expect("set when taken");
                 read.map(|rgba| {
                     let rgba = Arc::new(rgba);
                     let mut c = store.lock().unwrap();
@@ -596,20 +648,26 @@ impl Scrubber {
                     ),
                 })
             };
-            *res.lock().unwrap() = Some(frame);
-            ctx.request_repaint();
+            if res.lock().unwrap().give(n, frame) {
+                ctx.request_repaint();
+            }
         });
         Some(Self {
             req,
+            running,
             result,
+            asked: AtomicU64::new(0),
             quit,
             cache,
         })
     }
 
-    /// The frame of source frame `key` for timeline time `t`: from the kept frames at once, or
-    /// decoded.
+    /// The frame of source frame `key` for timeline time `t`: from the kept frames at once, by
+    /// the decode of that frame already running (a drag's release asks again for the frame its
+    /// last move asked for), or decoded.
     fn request(&self, t: f64, key: Tick) {
+        let n = self.asked.fetch_add(1, SeqCst) + 1;
+        let mut next = self.req.0.lock().unwrap();
         let hit = self
             .cache
             .lock()
@@ -617,16 +675,36 @@ impl Scrubber {
             .iter()
             .find(|(k, _)| *k == key)
             .map(|(_, f)| f.clone());
-        match hit {
-            Some(rgba) => {
-                *self.req.0.lock().unwrap() = None;
-                *self.result.lock().unwrap() = Some(Ok(Scrubbed { t, key, rgba }));
+        if let Some(rgba) = hit {
+            *next = None;
+            drop(next);
+            self.result
+                .lock()
+                .unwrap()
+                .give(n, Ok(Scrubbed { t, key, rgba }));
+            return;
+        }
+        match self.running.lock().unwrap().as_mut() {
+            Some(ask) if ask.2 == key => {
+                *ask = (n, t, key);
+                *next = None;
             }
-            None => {
-                *self.req.0.lock().unwrap() = Some((t, key));
+            _ => {
+                *next = Some((n, t, key));
                 self.req.1.notify_one();
             }
         }
+    }
+
+    /// Playback started: nothing asked before it is shown — the player draws the frames, and a
+    /// decode still running would otherwise be taken when playback ends, a frame of where it
+    /// started.
+    fn supersede(&self) {
+        *self.req.0.lock().unwrap() = None;
+        self.result
+            .lock()
+            .unwrap()
+            .drop_up_to(self.asked.load(SeqCst));
     }
 }
 
@@ -1511,6 +1589,9 @@ impl MediaWindow {
             Ok(player) => {
                 self.player = Some(player);
                 self.status = Status::default();
+                if let Some(scrub) = &self.scrub {
+                    scrub.supersede();
+                }
             }
             Err(e) => self.status = Status::error(format!("cannot play: {e:#}")),
         }
@@ -1548,6 +1629,8 @@ impl MediaWindow {
         if pump.ended {
             self.player = None;
             self.marks.t = pump.position;
+            // The frame at the end on screen, asked for as a pause asks.
+            self.seek(ctx, self.marks.t);
         } else {
             ctx.request_repaint_after(pump.wake_in);
         }
