@@ -1855,7 +1855,7 @@ fn killed(fs: &mut Probe, stop: Step) -> (Rig, Vec<u8>, PathBuf) {
 
 /// E18, a Save killed mid-copy. Its temp is no longer the file the record describes — it grew
 /// — and its name, owner, mode and size prove nothing once the process is gone: it is kept and
-/// named as a partial copy, for the user to remove. Killed right after the record was brought
+/// named, without a claim that it is sopen's, for the user to remove. Killed right after the record was brought
 /// up to the temp's owner and mode, before the first copy request, the recorded stat fits
 /// exactly and the temp is removed.
 #[test]
@@ -1891,8 +1891,8 @@ fn a_temp_left_by_a_kill_is_removed_only_on_an_exact_match() {
             };
             assert_eq!(Path::new(&path), temp_path, "{tag}");
             let want = format!(
-                "a partial copy sopen left ({copied} bytes); it was not removed because sopen \
-                 cannot prove it is its own"
+                "a file at the interrupted save's temporary path {path} ({copied} bytes); sopen \
+                 could not verify it is its own partial copy, so it was not removed"
             );
             assert_eq!(why, want, "{tag}");
             assert!(line.contains(&path) && line.contains(&why), "{line}");

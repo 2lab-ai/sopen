@@ -2919,20 +2919,22 @@ fn created_or_staged_removes_only_a_temp_that_still_matches() {
         assert_eq!(r.outcome, Outcome::NotLanded, "{route:?}");
         assert_eq!(r.temp, Temp::Remove(TEMP.into()), "{route:?}");
         // Cut off mid-copy: the temp grew since its stat was recorded. Nothing proves it is this
-        // Save's, so it is kept, named, and said to be a partial copy.
+        // Save's, so it is kept and named, without a claim that it is sopen's.
         let mut grown = c.created_temp();
         grown.size = 4096;
         grown.mtime = at(1_794_389_550);
         let mut remote = FakeRemote::with(&[(PATH, &c.orig), (TEMP, &grown)]);
         let r = reconcile(&created, HOST, &mut remote);
-        let why = "a partial copy sopen left (4096 bytes); it was not removed because sopen \
-                   cannot prove it is its own";
+        let why = format!(
+            "a file at the interrupted save's temporary path {TEMP} (4096 bytes); sopen could \
+             not verify it is its own partial copy, so it was not removed"
+        );
         let kept = Temp::Keep {
             path: TEMP.into(),
-            why: why.into(),
+            why: why.clone(),
         };
         assert_eq!(r.temp, kept, "{route:?}");
-        assert!(r.line.contains(TEMP) && r.line.contains(why), "{}", r.line);
+        assert!(r.line.contains(&why), "{}", r.line);
         // Anything but the exact recorded stat is kept: another size, time, mode or owner —
         // and so is another file of the same owner and mode, smaller than the target, that took
         // the name since.

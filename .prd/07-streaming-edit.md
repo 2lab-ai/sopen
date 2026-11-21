@@ -236,10 +236,12 @@ offered:
   - **On reconcile**, a temp is removed only if the phase reached `created`, its `lstat` equals the
     recorded stat exactly (a regular file of that size, mtime, owner and mode), and, from `staged`
     on, its post-save evidence matches.
-    - **Anything else is kept, named, and offered to the user for removal**: `a partial copy
-      sopen left at <path> (N bytes); it was not removed because sopen can't prove it is its
-      own — remove it?`. That is a temp a Save was cut off filling, one whose mode had just been
-      set, and one already given a set-id target's full mode.
+    - **Anything else is kept, named, and offered to the user for removal**: `a file at the
+      interrupted save's temporary path <path> (N bytes); sopen could not verify it is its own
+      partial copy, so it was not removed — remove it?`. That is a temp a Save was cut off
+      filling, one whose mode had just been set, and one already given a set-id target's full
+      mode — or another file that took the name since. The words claim no ownership, and the
+      prompt the hex window shows (ED4) carries the same uncertainty.
     - **Why not less.** A random name, an owner, a mode and a size below the target's do not
       prove a file is sopen's: any number of files share them, and after the process has died
       another file can take the name. Removing on those would delete someone else's file.
@@ -737,8 +739,8 @@ Gates and qualification are as in 06 §12. The live receipt is a file under a re
     - stopped in `created` or `staged`: on reopen the temp, whose stat (and evidence) match, is
       removed, and the edits are offered;
     - killed mid-copy (`created`, the temp at some size up to the target's): on reopen the temp is
-      kept and named as a partial copy sopen cannot prove is its own, and its removal is offered
-      to the user; killed after the temp's owner and mode were recorded and before the first copy
+      kept and named as a file sopen could not verify is its own partial copy, and its removal is
+      offered to the user; killed after the temp's owner and mode were recorded and before the first copy
       request, it still equals the record and is removed;
     - **another file under the temp's name** after the kill (same owner and mode, smaller than
       the target, other bytes and mtime): kept, and its bytes are untouched;

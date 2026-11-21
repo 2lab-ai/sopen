@@ -2205,9 +2205,10 @@ fn temp_verdict(
             if created.matches(&now) {
                 Temp::Remove(temp.to_string())
             } else {
+                // It may be someone else's file by now: the words claim nothing more.
                 keep(&format!(
-                    "a partial copy sopen left ({} bytes); it was not removed because sopen \
-                     cannot prove it is its own",
+                    "a file at the interrupted save's temporary path {temp} ({} bytes); sopen \
+                     could not verify it is its own partial copy, so it was not removed",
                     now.size
                 ))
             }
