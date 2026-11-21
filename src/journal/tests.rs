@@ -2792,22 +2792,44 @@ fn created_or_staged_removes_only_a_temp_that_still_matches() {
         let r = reconcile(&created, HOST, &mut remote);
         assert_eq!(r.outcome, Outcome::NotLanded, "{route:?}");
         assert_eq!(r.temp, Temp::Remove(TEMP.into()), "{route:?}");
-        // Cut off mid-copy: the temp grew since its stat was recorded. At its recorded name, a
-        // regular file with the recorded mode and owner, no larger than the target: removed.
+        // Cut off mid-copy: the temp grew since its stat was recorded. Nothing proves it is this
+        // Save's, so it is kept, named, and said to be a partial copy.
         let mut grown = c.created_temp();
         grown.size = 4096;
         grown.mtime = at(1_794_389_550);
         let mut remote = FakeRemote::with(&[(PATH, &c.orig), (TEMP, &grown)]);
         let r = reconcile(&created, HOST, &mut remote);
-        assert_eq!(r.temp, Temp::Remove(TEMP.into()), "{route:?}");
-        // Another mode, another owner, or larger than the target at open: kept and named.
-        let mut chmodded = grown.clone();
+        let why = "a partial copy sopen left (4096 bytes); it was not removed because sopen \
+                   cannot prove it is its own";
+        let kept = Temp::Keep {
+            path: TEMP.into(),
+            why: why.into(),
+        };
+        assert_eq!(r.temp, kept, "{route:?}");
+        assert!(r.line.contains(TEMP) && r.line.contains(why), "{}", r.line);
+        // Anything but the exact recorded stat is kept: another size, time, mode or owner —
+        // and so is another file of the same owner and mode, smaller than the target, that took
+        // the name since.
+        let mut later = c.created_temp();
+        later.mtime = at(1_794_389_551);
+        let mut chmodded = c.created_temp();
         chmodded.mode ^= 0o020;
-        let mut chowned = grown.clone();
+        let mut chowned = c.created_temp();
         chowned.uid += 1;
-        let mut larger = grown.clone();
-        larger.size = c.orig.size + 1;
-        for (what, temp) in [("mode", chmodded), ("owner", chowned), ("size", larger)] {
+        let mut theirs = FakeFile::new(b"someone else's file", 1_794_389_999);
+        (theirs.uid, theirs.gid, theirs.mode) = (
+            c.created.uid.unwrap(),
+            c.created.gid.unwrap(),
+            c.created.mode,
+        );
+        assert!(theirs.size < c.orig.size);
+        let others = [
+            ("mtime", later),
+            ("mode", chmodded),
+            ("owner", chowned),
+            ("another file", theirs),
+        ];
+        for (what, temp) in others {
             let mut remote = FakeRemote::with(&[(PATH, &c.orig), (TEMP, &temp)]);
             let r = reconcile(&created, HOST, &mut remote);
             assert!(

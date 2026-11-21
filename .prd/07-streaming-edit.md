@@ -229,14 +229,21 @@ offered:
   but it is never assumed to be sopen's. A crash there leaves it named in the row, never removed.
 - SFTP v3 attributes carry no inode (verified: the server returned size, owner, permissions and
   times, nothing more). So a temp's identity is checked by what can be compared.
-  - **On reconcile**, a temp is removed only if the phase reached `created` and it is still the
-    file sopen left. Anything else is kept and named.
-    - In `created`: it is at the recorded random name, a regular file with the recorded mode and
-      owner, and no larger than the target was at open. Its size and mtime are not compared: a
-      Save cut off mid-copy leaves the temp wherever the last request got to, and a Save never
-      writes past the target's size.
-    - From `staged` on: its `lstat` equals the recorded stat (size, mtime, owner, mode) and its
-      post-save evidence matches.
+  - **On reconcile**, a temp is removed only if the phase reached `created`, its `lstat` equals the
+    recorded stat exactly (a regular file of that size, mtime, owner and mode), and, from `staged`
+    on, its post-save evidence matches.
+    - **Anything else is kept, named, and offered to the user for removal**: `a partial copy
+      sopen left at <path> (N bytes); it was not removed because sopen can't prove it is its
+      own — remove it?`. That is a temp a Save was cut off filling, one whose mode had just been
+      set, and one already given a set-id target's full mode.
+    - **Why not less.** A random name, an owner, a mode and a size below the target's do not
+      prove a file is sopen's: any number of files share them, and after the process has died
+      another file can take the name. Removing on those would delete someone else's file.
+    - **Best effort still.** SFTP carries no inode, so a file equal to the recorded stat in every
+      attribute, put under the name since, is not told apart (in `created`, an empty one).
+    - **What `created` records.** The temp's stat at creation, and again once the temp has its
+      owner and mode (§4.2 step 4). So a Save cut off between that and its first copy request
+      leaves a temp that still matches, and it is removed.
   - **During a live Save**, sopen compares `fstat(handle)` with `lstat(path)` right before removing
     its own temp; a difference keeps it and names it. A swap of the name between that check and the
     remove cannot be seen, since SFTP has no remove by handle. That is a stated residual.
@@ -286,8 +293,9 @@ check, the undo file, the streamed rewrite and Save As.
    and the saved generation (§3.1). Then sopen creates `.<name>.sopen-<random>` exclusively. On the
    create's reply it records phase `created` and the temp's stat. Through the handle it gives the
    temp the target's owner, then its mode without set-id bits (`create_from`'s rule). It then
-   `fstat`s the temp and records that stat in `created`, before the first copy request: a temp
-   left by a kill mid-copy is then known by its mode and owner (§3.1).
+   `fstat`s the temp and records that stat in `created`, before the first copy request: a Save
+   cut off before that request leaves a temp that equals the record and is removed on reopen. Once
+   the copy has started the temp no longer equals it, and is kept and named (§3.1).
 5. **Copy on the server.** `copy-data` from the source to the temp, in requests sized by time. There
    is **one `copy-data` loop** in sopen: the browser's S1-C builds it in `src/remote/sftp/ops.rs`
    for copying files, and ED1 gives it a pace. File copies keep their 8 MiB steps through the same
@@ -724,9 +732,12 @@ Gates and qualification are as in 06 §12. The live receipt is a file under a re
     - stopped in `naming`: the temp, if any, is named and kept, never removed;
     - stopped in `created` or `staged`: on reopen the temp, whose stat (and evidence) match, is
       removed, and the edits are offered;
-    - killed mid-copy (`created`, the temp at any size up to the target's): on reopen the temp,
-      at its recorded name with its recorded mode and owner, is removed; one whose mode changed
-      after the kill is kept and named;
+    - killed mid-copy (`created`, the temp at some size up to the target's): on reopen the temp is
+      kept and named as a partial copy sopen cannot prove is its own, and its removal is offered
+      to the user; killed after the temp's owner and mode were recorded and before the first copy
+      request, it still equals the record and is removed;
+    - **another file under the temp's name** after the kill (same owner and mode, smaller than
+      the target, other bytes and mtime): kept, and its bytes are untouched;
     - the rename landed but its reply was lost: on reopen, "landed (found on reopen)", the journal
       retired, nothing offered twice.
   - **Image crop Save:** landed but the reply was lost. On reopen the output's hash identifies the

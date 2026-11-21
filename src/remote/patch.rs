@@ -888,7 +888,7 @@ pub enum Step {
     SetOwner,
     SetMode,
     /// The temp's `fstat` with its owner and mode set (after it the journal's `created` record
-    /// holds that stat: a temp left by a kill from here on can be told to be this Save's).
+    /// holds that stat, which the temp equals until the first copy request).
     StatReady,
     /// Step 5: the copy request of this number, from 0.
     Copy(u32),
@@ -1778,8 +1778,9 @@ fn stage(
     ask(&mut ctl.hook, Step::SetMode, true, "set the mode", || {
         fs.set_handle_mode(temp, like.mode & 0o777)
     })?;
-    // The record takes the temp as it is filled: a reopen then knows a temp left mid-copy by
-    // its mode and owner (§3.1).
+    // The record takes the temp as it is about to be filled: a Save cut off before its first
+    // copy request then leaves a temp that equals the record exactly, and a reopen removes it
+    // (§3.1). Once it is filled, nothing proves whose it is.
     let ready = ask(&mut ctl.hook, Step::StatReady, false, "stat", || {
         fs.fstat(temp)
     })?;

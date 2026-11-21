@@ -1617,9 +1617,13 @@ fn a_streamed_rewrite_stopped_or_unanswered_at_any_step() {
                 };
                 let want = match (at, step) {
                     (At::Stop, Step::Create | Step::StatAfter) => "gone",
-                    // The create's reply, or the temp's new mode, not yet in the record.
-                    (At::Stop, Step::StatCreated | Step::StatReady) => "keep",
-                    (At::Stop, _) => "remove",
+                    // Exactly as recorded: private as created, ready to be filled, or staged.
+                    (At::Stop, Step::SetOwner | Step::SetMode | Step::Rewrite | Step::Rename) => {
+                        "remove"
+                    }
+                    // The create's reply or the temp's new mode not yet in the record, or the
+                    // temp filled since: nothing proves whose it is.
+                    (At::Stop, _) => "keep",
                     (_, Step::Create) => "keep",
                     _ => "gone",
                 };
@@ -1811,15 +1815,18 @@ fn a_save_stopped_at_any_step_leaves_the_target_whole_and_the_record_true() {
                     assert_eq!(left.len(), 1, "{tag}");
                     assert!(matches!(temp, Temp::Keep { .. }), "{tag}: {temp:?}");
                 }
-                // Its mode set, the record not yet brought up to it: kept and named.
-                Step::StatReady => {
-                    assert!(matches!(temp, Temp::Keep { .. }), "{tag}: {temp:?}");
+                // Private as created, or its owner and mode set and the record brought up to
+                // them: the recorded stat still fits exactly, so it is this Save's.
+                Step::SetOwner | Step::SetMode | Step::Copy(0) => {
+                    assert!(matches!(temp, Temp::Remove(_)), "{tag}: {temp:?}");
                 }
+                // Staged and checked, the rename not sent: removed on reopen.
+                Step::Rename => assert!(matches!(temp, Temp::Remove(_)), "{tag}: {temp:?}"),
                 Step::StatAfter => assert!(matches!(temp, Temp::Gone(_)), "{tag}: {temp:?}"),
-                // Everywhere else — as created, mid-copy, patched, staged — the temp is at its
-                // recorded name with its recorded mode and owner: provably this Save's, removed
-                // on reopen.
-                _ => assert!(matches!(temp, Temp::Remove(_)), "{tag}: {temp:?}"),
+                // Everywhere else the temp is no longer exactly as recorded — its mode just
+                // set, or filled in part or whole: nothing proves it is this Save's, so it is
+                // kept and named.
+                _ => assert!(matches!(temp, Temp::Keep { .. }), "{tag}: {temp:?}"),
             }
             let want = match landed {
                 true => Outcome::Landed,
@@ -1830,52 +1837,108 @@ fn a_save_stopped_at_any_step_leaves_the_target_whole_and_the_record_true() {
     }
 }
 
-/// E18, a Save killed mid-copy: on reopen its temp — at the recorded name, a regular file with
-/// the recorded mode and owner, no larger than the target — is removed. One whose mode changed
-/// after the kill is kept and named.
+/// A Save killed and reopened, with `stop` the step it was killed before.
+fn killed(fs: &mut Probe, stop: Step) -> (Rig, Vec<u8>, PathBuf) {
+    let (mut rig, body) = small(fs);
+    let e = hooked(fs, &mut rig, &mut |step| match step == stop {
+        true => At::Stop,
+        false => At::Go,
+    })
+    .unwrap_err();
+    assert!(is_stopped(&e), "killed before {stop:?}: {e:#}");
+    let left = temps(rig.folder());
+    assert_eq!(left.len(), 1, "killed before {stop:?}");
+    assert_eq!(rig.phase(), "created", "killed before {stop:?}");
+    let temp = rig.folder().join(&left[0]);
+    (rig, body, temp)
+}
+
+/// E18, a Save killed mid-copy. Its temp is no longer the file the record describes — it grew
+/// — and its name, owner, mode and size prove nothing once the process is gone: it is kept and
+/// named as a partial copy, for the user to remove. Killed right after the record was brought
+/// up to the temp's owner and mode, before the first copy request, the recorded stat fits
+/// exactly and the temp is removed.
 #[test]
-fn a_temp_left_by_a_kill_mid_copy_is_removed_on_reopen() {
+fn a_temp_left_by_a_kill_is_removed_only_on_an_exact_match() {
     for (side, mut fs) in sides() {
+        // Right after `StatReady`, before the first copy request: exactly as recorded.
+        let (rig, body, temp_path) = killed(&mut fs, Step::Copy(0));
+        let (outcome, temp, _) = rig.reconciled(&mut fs);
+        assert_eq!(outcome, Outcome::NotLanded, "{side}");
+        assert_eq!(
+            temp,
+            Temp::Remove(temp_path.to_str().unwrap().into()),
+            "{side}"
+        );
+        fs.remove(temp_path.to_str().unwrap()).unwrap();
+        assert_eq!(temps(rig.folder()), none(), "{side}");
+        assert_eq!(std::fs::read(&rig.path).unwrap(), body, "{side}");
+
+        // Mid-copy, after one request and after the last: kept, named, and said to be a partial
+        // copy that could not be proved sopen's.
         for (stop, copied) in [(Step::Copy(1), 128 * KIB), (Step::Copy(2), 256 * KIB)] {
-            for chmod in [false, true] {
-                let (mut rig, body) = small(&mut fs);
-                let e = hooked(&mut fs, &mut rig, &mut |step| match step == stop {
-                    true => At::Stop,
-                    false => At::Go,
-                })
-                .unwrap_err();
-                let tag = format!("{side}, killed before {stop:?}, chmod {chmod}");
-                assert!(is_stopped(&e), "{tag}: {e:#}");
-                let left = temps(rig.folder());
-                assert_eq!(left.len(), 1, "{tag}");
-                let temp_path = rig.folder().join(&left[0]);
-                assert_eq!(
-                    std::fs::metadata(&temp_path).unwrap().len(),
-                    copied,
-                    "{tag}"
-                );
-                if chmod {
-                    let other = std::fs::Permissions::from_mode(0o644);
-                    std::fs::set_permissions(&temp_path, other).unwrap();
-                }
-                assert_eq!(rig.phase(), "created", "{tag}");
-                let (outcome, temp, line) = rig.reconciled(&mut fs);
-                assert_eq!(outcome, Outcome::NotLanded, "{tag}");
-                match (chmod, temp) {
-                    (false, Temp::Remove(path)) => {
-                        assert_eq!(Path::new(&path), temp_path, "{tag}");
-                        fs.remove(&path).unwrap();
-                        assert_eq!(temps(rig.folder()), none(), "{tag}");
-                    }
-                    (true, Temp::Keep { path, .. }) => {
-                        assert_eq!(Path::new(&path), temp_path, "{tag}");
-                        assert!(line.contains(&left[0]), "{line}");
-                        assert!(temp_path.exists(), "{tag}");
-                    }
-                    (_, other) => panic!("{tag}: {other:?}"),
-                }
-                assert_eq!(std::fs::read(&rig.path).unwrap(), body, "{tag}");
-            }
+            let (rig, body, temp_path) = killed(&mut fs, stop);
+            let tag = format!("{side}, killed before {stop:?}");
+            assert_eq!(
+                std::fs::metadata(&temp_path).unwrap().len(),
+                copied,
+                "{tag}"
+            );
+            let (outcome, temp, line) = rig.reconciled(&mut fs);
+            assert_eq!(outcome, Outcome::NotLanded, "{tag}");
+            let Temp::Keep { path, why } = temp else {
+                panic!("{tag}: {temp:?}");
+            };
+            assert_eq!(Path::new(&path), temp_path, "{tag}");
+            let want = format!(
+                "a partial copy sopen left ({copied} bytes); it was not removed because sopen \
+                 cannot prove it is its own"
+            );
+            assert_eq!(why, want, "{tag}");
+            assert!(line.contains(&path) && line.contains(&why), "{line}");
+            assert!(temp_path.exists(), "{tag}");
+            assert_eq!(std::fs::read(&rig.path).unwrap(), body, "{tag}");
+        }
+    }
+}
+
+/// The adversarial reopen: after the kill, another file takes the temp's name — a regular file
+/// of the same owner and mode, smaller than the target, with other bytes and another
+/// modification time. Nothing but an exact match of the recorded stat removes a temp, so it is
+/// kept, and its bytes are as its owner wrote them.
+#[test]
+fn a_file_put_under_the_temps_name_after_a_kill_is_never_removed() {
+    for (side, mut fs) in sides() {
+        for stop in [Step::Copy(0), Step::Copy(1), Step::Copy(2), Step::Patch(0)] {
+            let (rig, body, temp_path) = killed(&mut fs, stop);
+            let tag = format!("{side}, killed before {stop:?}");
+            let was = std::fs::metadata(&temp_path).unwrap();
+            // Someone else's file, under that name: same owner, same mode, smaller than the
+            // target, other bytes, another time.
+            std::fs::remove_file(&temp_path).unwrap();
+            let theirs = b"someone else's file, not a byte of the target".repeat(100);
+            assert!((theirs.len() as u64) < rig.snap.baseline.size);
+            std::fs::write(&temp_path, &theirs).unwrap();
+            let mode = std::fs::Permissions::from_mode(was.mode() & 0o7777);
+            std::fs::set_permissions(&temp_path, mode).unwrap();
+            set_mtime(&temp_path, OLD + 777);
+            let now = std::fs::metadata(&temp_path).unwrap();
+            assert_eq!((now.uid(), now.gid()), (was.uid(), was.gid()), "{tag}");
+            assert_eq!(now.mode(), was.mode(), "{tag}");
+
+            let (outcome, temp, line) = rig.reconciled(&mut fs);
+            assert_eq!(outcome, Outcome::NotLanded, "{tag}");
+            let Temp::Keep { path, .. } = temp else {
+                panic!("{tag}: someone else's file would be removed: {temp:?}");
+            };
+            assert_eq!(Path::new(&path), temp_path, "{tag}");
+            assert!(line.contains(&path), "{line}");
+            assert_eq!(
+                std::fs::read(&temp_path).unwrap(),
+                theirs,
+                "{tag}: untouched"
+            );
+            assert_eq!(std::fs::read(&rig.path).unwrap(), body, "{tag}");
         }
     }
 }
