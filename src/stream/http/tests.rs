@@ -2043,13 +2043,30 @@ fn the_peer_check_finds_the_clients_end_by_the_reversed_tuple() {
         !peer_allowed(PROC_NET_TCP.as_bytes(), server, end(50002), 1000),
         "no such port"
     );
-    // Two entries for the one tuple.
+    // Two sockets for the one tuple: the same row but for its inode.
     let line = PROC_NET_TCP.lines().nth(3).unwrap();
-    let doubled = format!("{PROC_NET_TCP}{line}\n");
+    let other = line.replace(" 31279 ", " 31300 ");
+    assert_ne!(other, line);
+    let doubled = format!("{PROC_NET_TCP}{other}\n");
     assert!(
         !peer_allowed(doubled.as_bytes(), server, client, 1000),
         "doubled"
     );
+    // The kernel's table is not a snapshot: read while sockets come and go, it can print
+    // one socket more than once (seen on Linux 7.2: the same row, inode and all, two and
+    // three times in one read of the table). That is one socket, not two.
+    let renumbered = line.replace("   2: ", " 117: ");
+    assert_ne!(renumbered, line);
+    let repeated = format!("{PROC_NET_TCP}{line}\n{renumbered}\n");
+    assert!(
+        peer_allowed(repeated.as_bytes(), server, client, 1000),
+        "one socket printed three times"
+    );
+    assert!(!peer_allowed(repeated.as_bytes(), server, client, 1001));
+    // A row with no inode of its own (0: a socket being closed) is nobody's twin.
+    let anonymous = line.replace(" 31279 ", " 0 ");
+    let twice = format!("{anonymous}\n{anonymous}\n");
+    assert!(!peer_allowed(twice.as_bytes(), server, client, 1000));
     // An entry whose uid is not a number is nobody's.
     let odd = PROC_NET_TCP.replace(
         "00000000  1000        0 31279",

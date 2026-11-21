@@ -910,6 +910,11 @@ Left as whole fetches, with the fetch now pipelined (§2):
   - That entry's `uid` column must equal sopen's uid.
   - No such entry, or more than one, is a rejection: the connection is closed unanswered, as for any
     other uid.
+  - The table is not a snapshot (measured, Linux 7.2, 32 threads opening connections): read while
+    sockets come and go, the kernel printed one socket two and three times in one read, same inode
+    and all. So rows of the tuple with the same inode and uid are one socket; another inode,
+    another uid or inode 0 is a second one. The table is read 1 MiB at a time, and a pass that
+    finds no entry is made again, three in all.
   - Only IPv4 loopback clients are served. The server binds 127.0.0.1, and a socket whose ends are
     not both IPv4 (an IPv6 socket on a mapped address is in `/proc/net/tcp6`) is refused.
   - The format (hex addresses with the IPv4 address in host byte order, the port big-endian, and

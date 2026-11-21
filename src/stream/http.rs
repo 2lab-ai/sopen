@@ -808,13 +808,31 @@ fn peer_ok(stream: &TcpStream) -> bool {
     else {
         return false;
     };
-    let Ok(table) = std::fs::File::open("/proc/net/tcp") else {
-        return false;
-    };
     // SAFETY: `getuid` cannot fail and touches no memory.
     let uid = unsafe { libc::getuid() };
-    peer_allowed(std::io::BufReader::new(table), server_end, client_end, uid)
+    // The table is no snapshot (see `peer_found`): a pass that misses the client's socket
+    // is made again, and a third time. A client found is judged by the pass that found it.
+    for _ in 0..PEER_PASSES {
+        let Ok(table) = std::fs::File::open("/proc/net/tcp") else {
+            return false;
+        };
+        // One large read at a time: the kernel repeats and misses rows where a read of
+        // the table ends and the next begins.
+        let table = std::io::BufReader::with_capacity(PEER_TABLE_READ, table);
+        match peer_found(table, server_end, client_end) {
+            Found::None => {}
+            Found::One(owner) => return owner == Some(uid),
+            Found::Several => return false,
+        }
+    }
+    false
 }
+
+/// How often `/proc/net/tcp` is read for a client not found in it, and how much at a time.
+#[cfg(target_os = "linux")]
+const PEER_PASSES: usize = 3;
+#[cfg(target_os = "linux")]
+const PEER_TABLE_READ: usize = 1 << 20;
 
 /// Elsewhere there is no such table (06 §9's residual on macOS).
 #[cfg(not(target_os = "linux"))]
@@ -822,19 +840,46 @@ fn peer_ok(_stream: &TcpStream) -> bool {
     true
 }
 
-/// Whether `/proc/net/tcp` (`table`) has exactly one socket that is the client's end of the
-/// connection — local address `client_end`, remote address `server_end`: the server's tuple
-/// reversed — and `uid` owns it. The kernel's layout: addresses as `%08X:%04X`, the IPv4
-/// address in host byte order and the port as a number; `uid` the eighth column, in decimal.
-/// Read a line at a time, and no further than a second match; a table that cannot be read
-/// to its end allows nobody.
+/// The client's end of a connection, as `/proc/net/tcp` has it.
 #[cfg(any(target_os = "linux", test))]
+#[derive(Debug, PartialEq, Eq)]
+enum Found {
+    /// No socket with that tuple.
+    None,
+    /// One socket, and its uid (`None`: one that does not read as a uid).
+    One(Option<u32>),
+    /// More than one socket, or a table that cannot be read to its end.
+    Several,
+}
+
+/// Whether `/proc/net/tcp` (`table`) has exactly one socket that is the client's end of the
+/// connection and `uid` owns it.
+#[cfg(test)]
 fn peer_allowed(
     table: impl std::io::BufRead,
     server_end: std::net::SocketAddrV4,
     client_end: std::net::SocketAddrV4,
     uid: u32,
 ) -> bool {
+    peer_found(table, server_end, client_end) == Found::One(Some(uid))
+}
+
+/// The socket in `/proc/net/tcp` (`table`) that is the client's end of the connection: local
+/// address `client_end`, remote address `server_end` — the server's tuple reversed. The
+/// kernel's layout: addresses as `%08X:%04X`, the IPv4 address in host byte order and the
+/// port as a number; `uid` the eighth column and the socket's inode the tenth, in decimal.
+///
+/// The table is not a snapshot. Read while sockets come and go, the kernel prints one socket
+/// more than once (seen on Linux 7.2 under 32 threads of connections: the same row, state
+/// and inode and all, two and three times in one read of the table). Rows of one tuple with
+/// the same inode and uid are therefore one socket; another inode, another uid, or no inode
+/// (0) is a second socket, and a rejection. Read a line at a time, and no further than that.
+#[cfg(any(target_os = "linux", test))]
+fn peer_found(
+    table: impl std::io::BufRead,
+    server_end: std::net::SocketAddrV4,
+    client_end: std::net::SocketAddrV4,
+) -> Found {
     let hex = |end: std::net::SocketAddrV4| {
         format!(
             "{:08X}:{:04X}",
@@ -843,10 +888,10 @@ fn peer_allowed(
         )
     };
     let (local, remote) = (hex(client_end), hex(server_end));
-    let mut owner = None;
+    let mut found: Option<(Option<u32>, Option<u64>)> = None;
     for line in table.lines() {
         let Ok(line) = line else {
-            return false;
+            return Found::Several;
         };
         let mut cols = line.split_ascii_whitespace();
         let (Some(l), Some(r)) = (cols.nth(1), cols.next()) else {
@@ -855,14 +900,21 @@ fn peer_allowed(
         if !(l.eq_ignore_ascii_case(&local) && r.eq_ignore_ascii_case(&remote)) {
             continue;
         }
-        if owner.is_some() {
-            return false;
-        }
         // Columns 4 to 7 (state, queues, timer, retransmits) lie between; a uid that does
-        // not read as one is nobody's.
-        owner = Some(cols.nth(4).and_then(|uid| uid.parse::<u32>().ok()));
+        // not read as one is nobody's. Then the timeout, then the inode.
+        let owner = cols.nth(4).and_then(|uid| uid.parse::<u32>().ok());
+        let inode = cols.nth(1).and_then(|inode| inode.parse::<u64>().ok());
+        let row = (owner, inode.filter(|inode| *inode != 0));
+        match &found {
+            None => found = Some(row),
+            Some(first) if *first == row && row.1.is_some() => {}
+            Some(_) => return Found::Several,
+        }
     }
-    owner == Some(Some(uid))
+    match found {
+        None => Found::None,
+        Some((owner, _)) => Found::One(owner),
+    }
 }
 
 /// What a request asked of the range table (06 §9).
