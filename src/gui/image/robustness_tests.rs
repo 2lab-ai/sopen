@@ -1,7 +1,17 @@
-//! Malformed files never panic or hang the open path: the metadata scanners and
-//! `Doc::decode` (decode + metadata + the trial encode) get every truncation of each fixture
-//! and every single-byte flip of its first 256 bytes, and must return — Ok or Err — quickly.
+//! Malformed files never panic or hang the open path: the metadata scanners, `Doc::decode`
+//! (decode + metadata + the trial encode), the header read a streamed open starts with and the
+//! picture it makes of a file's first bytes (06 §7.3) get every truncation of each fixture and
+//! every single-byte flip of its first 256 bytes, and must return — Ok or Err — quickly. A
+//! header never promises less memory than the decode then takes.
+//!
+//! Which cases reach the picture of the first bytes: every one whose header read gives a
+//! header. A frame of up to 1 MiB decoded gets three pictures (of a quarter, a half and all of
+//! its bytes); a larger one — a flipped size byte makes a frame of 65 000 rows — gets one, of
+//! the shortest cut, up to 64 MiB decoded, and its case is allowed the time a decode of that
+//! size costs on top of the limit. Above 64 MiB only the header is read.
 
+use super::probe::{self, Head, Probe};
+use super::stream_tests::{baseline, exif, png as raw_png, progressive, with_segments};
 use super::*;
 use image::Rgb;
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -129,16 +139,85 @@ fn one(bytes: &[u8], format: ImageFormat) -> Result<(), String> {
     let result = catch_unwind(AssertUnwindSafe(|| {
         let _ = foreign_metadata(bytes, format);
         let _ = tiff_pages(bytes, 1000);
-        let _ = Doc::decode(bytes);
+        let decoded = Doc::decode(bytes);
+        header_case(bytes, decoded.as_ref().ok())
     }));
-    if result.is_err() {
-        return Err("panicked".to_string());
-    }
+    let more = match result {
+        Err(_) => return Err("panicked".to_string()),
+        Ok(Err(why)) => return Err(why),
+        Ok(Ok(more)) => more,
+    };
     let took = started.elapsed();
-    if took > CASE_LIMIT {
+    if took > CASE_LIMIT + more {
         return Err(format!("took {took:?}"));
     }
     Ok(())
+}
+
+/// A frame up to this size decoded gets every picture of the first bytes.
+const SMALL_FRAME: u64 = 1 << 20;
+/// A frame up to this size decoded gets one, of its shortest cut.
+const LARGE_FRAME: u64 = 64 << 20;
+
+/// The header read and the picture of the first bytes on one malformed input; the time a
+/// large frame's picture is allowed on top of the case limit. Where the header
+/// read gives a header and the file does decode, the header told the truth: the size shown,
+/// and at least the memory the decode took.
+fn header_case(bytes: &[u8], decoded: Option<&Doc>) -> Result<Duration, String> {
+    // Capped as a streamed open caps it, and whole.
+    let capped = {
+        let mut head = Head::new(bytes.len() as u64, probe::BLOCK, |off, buf: &mut [u8]| {
+            let at = (off as usize).min(bytes.len());
+            let n = buf.len().min(bytes.len() - at);
+            buf[..n].copy_from_slice(&bytes[at..at + n]);
+            Ok(n)
+        });
+        probe::probe(&mut head)
+    };
+    if capped.is_err() {
+        return Err("the header read failed on a read that did not".to_string());
+    }
+    let Ok(Probe::Header(header)) = probe::probe(&mut Head::of(bytes)) else {
+        return Ok(Duration::ZERO);
+    };
+    let cuts = [bytes.len() / 4, bytes.len() / 2, bytes.len()];
+    let cuts = if header.need <= SMALL_FRAME {
+        &cuts[..]
+    } else if header.need <= LARGE_FRAME {
+        &cuts[..1]
+    } else {
+        &[]
+    };
+    for cut in cuts {
+        if let Some(picture) = probe::partial(Cursor::new(&bytes[..*cut]), &header, 64) {
+            if picture.width() > 64 || picture.height() > 64 {
+                return Err(format!(
+                    "a picture of {:?} for a side of 64",
+                    picture.dimensions()
+                ));
+            }
+        }
+    }
+    // What a thumbnail is held as is bounded, whatever its own header claims.
+    if let Some(thumb) = &header.thumb {
+        if thumb.as_raw().len() as u64 > probe::THUMB_RGBA {
+            return Err(format!("a thumbnail of {:?}", thumb.dimensions()));
+        }
+    }
+    if let Some(doc) = decoded {
+        let took = doc.img.as_bytes().len() as u64;
+        if header.upright() != doc.size() || header.need < took {
+            return Err(format!(
+                "the header says {:?} and {} bytes, the decode gave {:?} and {took}",
+                header.upright(),
+                header.need,
+                doc.size()
+            ));
+        }
+    }
+    // A large frame's one picture costs what its size costs: time on top of the limit.
+    let megabytes = header.need.min(LARGE_FRAME) >> 20;
+    Ok(Duration::from_millis(500 * megabytes))
 }
 
 /// The intact fixture, every truncation and every flip of the first 256 bytes — all of it on
@@ -211,4 +290,152 @@ fn malformed_tiff_never_panics() {
     );
     sweep("tiff", real, ImageFormat::Tiff);
     sweep("tiff-tags", tagged, ImageFormat::Tiff);
+}
+
+/// [`sweep`] for the header read and the picture of the first bytes alone, on fixtures the
+/// metadata sweeps do not cover: `flips` bytes from the start are flipped, and the file is cut
+/// at every length up to `cuts` and at 64 lengths spread over the rest.
+fn header_sweep(name: &'static str, bytes: Vec<u8>, flips: usize, cuts: usize) {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut failures = Vec::new();
+        let mut case = |what: String, bytes: &[u8]| {
+            let started = Instant::now();
+            match catch_unwind(AssertUnwindSafe(|| header_case(bytes, None))) {
+                Err(_) => failures.push(format!("{what}: panicked")),
+                Ok(Err(why)) => failures.push(format!("{what}: {why}")),
+                Ok(Ok(more)) if started.elapsed() > CASE_LIMIT + more => {
+                    failures.push(format!("{what}: took {:?}", started.elapsed()))
+                }
+                Ok(Ok(_)) => {}
+            }
+        };
+        case("intact".into(), &bytes);
+        let spread = (cuts..bytes.len()).step_by((bytes.len() / 64).max(1));
+        for n in (0..cuts.min(bytes.len())).chain(spread) {
+            case(format!("truncated to {n}"), &bytes[..n]);
+        }
+        for i in 0..bytes.len().min(flips) {
+            let mut flipped = bytes.clone();
+            flipped[i] ^= 0xFF;
+            case(format!("byte {i} flipped"), &flipped);
+        }
+        let _ = tx.send(failures);
+    });
+    let failures = rx
+        .recv_timeout(SWEEP_LIMIT)
+        .unwrap_or_else(|_| panic!("{name}: sweep did not finish in {SWEEP_LIMIT:?} (a hang)"));
+    assert!(
+        failures.is_empty(),
+        "{name}: {} malformed cases failed, first: {:?}",
+        failures.len(),
+        &failures[..failures.len().min(5)]
+    );
+}
+
+fn encoded(format: ImageFormat) -> Vec<u8> {
+    encode(&small(), format, None, None).unwrap().bytes
+}
+
+#[test]
+fn malformed_headers_never_panic_the_header_read() {
+    header_sweep("gif", encoded(ImageFormat::Gif), 256, usize::MAX);
+    header_sweep("bmp", encoded(ImageFormat::Bmp), 256, usize::MAX);
+    header_sweep("progressive jpeg", progressive(64, 48, 6), 512, 1024);
+    header_sweep("interlaced png", raw_png(40, 30, true), 256, 512);
+    // A JPEG whose Exif carries a thumbnail: every byte of the Exif's own structure flipped.
+    let thumb = baseline(32, 24);
+    let with_thumb = with_segments(&baseline(48, 32), &[(0xE1, exif(&thumb, 6, 2000))]);
+    assert!(matches!(
+        probe::probe(&mut Head::of(&with_thumb)),
+        Ok(Probe::Header(h)) if h.thumb.is_some()
+    ));
+    header_sweep("jpeg with a thumbnail", with_thumb, 1024, 1024);
+}
+
+/// An Exif block is as untrusted as the file: offsets and counts that point anywhere give no
+/// thumbnail, and a thumbnail whose own header claims a huge picture is not decoded.
+#[test]
+fn a_hostile_exif_gives_no_thumbnail_and_costs_nothing() {
+    let thumb_of = |exif: Vec<u8>| -> Option<(u32, u32)> {
+        let file = with_segments(&baseline(48, 32), &[(0xE1, exif)]);
+        let started = Instant::now();
+        let found = std::thread::spawn(move || {
+            let found = probe::probe(&mut Head::of(&file)).unwrap();
+            (found, probe::largest_reserved())
+        })
+        .join()
+        .expect("the header read panicked");
+        assert!(started.elapsed() < CASE_LIMIT);
+        match found {
+            (Probe::Header(header), reserved) => {
+                assert_eq!(
+                    (header.width, header.height),
+                    (48, 32),
+                    "the frame stays right"
+                );
+                assert!(reserved <= 1 << 20, "{reserved} reserved for a thumbnail");
+                if let Some(thumb) = &header.thumb {
+                    assert!(thumb.as_raw().len() as u64 <= probe::THUMB_RGBA);
+                }
+                header.thumb.map(|t| t.dimensions())
+            }
+            (other, _) => panic!("{other:?}"),
+        }
+    };
+    let good = exif(&baseline(32, 24), 1, 2000);
+    assert_eq!(thumb_of(good.clone()), Some((32, 24)));
+    // The fields of the block, by where `exif` puts them (after `Exif\0\0`).
+    let at = |field: usize| 6 + field;
+    let with = |field: usize, value: &[u8]| {
+        let mut bad = good.clone();
+        bad[at(field)..at(field) + value.len()].copy_from_slice(value);
+        bad
+    };
+    for (what, bad) in [
+        ("IFD0 far past the end", with(4, &[0xFF, 0xFF, 0xFF, 0xF0])),
+        ("IFD0 with 65535 entries", with(8, &[0xFF, 0xFF])),
+        ("IFD1 far past the end", with(22, &[0x7F, 0xFF, 0xFF, 0xFF])),
+        ("IFD1 with 65535 entries", with(26, &[0xFF, 0xFF])),
+        (
+            "the thumbnail far past the end",
+            with(36, &[0xFF, 0xFF, 0xFF, 0xFF]),
+        ),
+        (
+            "a thumbnail longer than the block",
+            with(48, &[0xFF, 0xFF, 0xFF, 0xFF]),
+        ),
+        ("a thumbnail of no length", with(48, &[0, 0, 0, 0])),
+        ("not a TIFF", with(0, b"XX")),
+        ("a thumbnail that is no JPEG", with(56, &[0x89, 0x50])),
+    ] {
+        assert_eq!(thumb_of(bad), None, "{what}");
+    }
+    // A thumbnail's own frame is read first, and one that would be held as more than 1 MiB
+    // of RGBA is no thumbnail: at the boundary, 512×512 is shown and 513×512 is not — and a
+    // tall narrow one (the frame a flipped size byte makes) is not decoded either.
+    let real = baseline(32, 24);
+    let frame = real.windows(2).position(|w| w == [0xFF, 0xC0]).unwrap();
+    let claiming = |w: u16, h: u16| {
+        let mut liar = real.clone();
+        liar[frame + 5..frame + 7].copy_from_slice(&h.to_be_bytes());
+        liar[frame + 7..frame + 9].copy_from_slice(&w.to_be_bytes());
+        exif(&liar, 1, 2000)
+    };
+    assert_eq!(thumb_of(claiming(512, 512)), Some((512, 512)));
+    assert_eq!(thumb_of(claiming(513, 512)), None);
+    assert_eq!(thumb_of(claiming(32, 65_304)), None);
+    assert_eq!(thumb_of(claiming(8000, 8000)), None);
+    // An Exif in the thumbnail, with a thumbnail of its own, and so on down: the frame is
+    // found and nothing nested is decoded.
+    let mut nested = baseline(8, 8);
+    for _ in 0..40 {
+        let len = nested.len() + 100;
+        nested = with_segments(&baseline(8, 8), &[(0xE1, exif(&nested, 1, len))]);
+    }
+    assert_eq!(thumb_of(exif(&nested, 1, 60_000)), Some((8, 8)));
+    // A block cut anywhere.
+    for cut in 0..120 {
+        thumb_of(good[..cut.min(good.len())].to_vec());
+    }
 }

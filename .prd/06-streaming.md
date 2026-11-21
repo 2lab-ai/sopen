@@ -754,7 +754,10 @@ the page and drop the queued keys.
       arithmetic, 12-bit, lossless) is reported at once with its type and size, and the file is
       not streamed for a decode. Hex view stays offered once W8b brings it.
   - **PNG, GIF, BMP, WebP:** the header is at the start (PNG's IHDR at byte 16; WebP's
-    VP8/VP8L/VP8X chunk first). `ImageReader::into_dimensions` runs on the bytes up to it.
+    VP8/VP8L/VP8X chunk first). The decoder from `ImageReader::into_decoder` reads it, a 64 KiB
+    block at a time, and gives the dimensions and the colour type it produces. A PNG's header
+    read can run past byte 16, up to the first IDAT (the decoder reads the chunks before it),
+    within the 1 MiB cap.
   - **TIFF:** follow the first-IFD offset, one more read wherever it points.
   - Past 1 MiB without a header, the window shows the size line and streams the file as below.
   - With a header, the window shows the Exif thumbnail scaled up (else the dimensions alone) with
@@ -769,17 +772,39 @@ the page and drop the queued keys.
   - **Continue proceeds.** sopen does not refuse an image for its size. Until the owner continues,
     nothing past the header is fetched. A need above the physical memory is said in the error
     colour, and Continue is still offered.
+  - Memory is said in 1024-based units, as RAM is labelled ("this machine has 128 GB"). File
+    sizes are said in 1000-based units, as the file managers show them.
+  - **A file over 512 MiB asks before it is read whole into memory**, whatever its header says
+    (a small picture's, or none), because the stream holds the encoded bytes in memory:
+
+    > reading this image needs 22.4 GB of memory (the file itself); this machine has 16 GB —
+    > Continue (Enter) · Close (Esc)
+
+    Continue and Close are the decode line's. A decode over the budget still asks when a
+    header that was not known before the read turns out to need it.
+  - **When both the file and its decode are over 512 MiB, one line says what is held at once**,
+    the file and the decoded pixels together, and its colour goes by that sum:
+
+    > reading and decoding this image needs 24.9 GB of memory (30000×30000; the file itself
+    > 22.4 GB); this machine has 16 GB — Continue (Enter) · Close (Esc)
   - This is one of **the workstream's decisions told to the owner** ([`streaming/ssot.md`](streaming/ssot.md)).
     It applies to local images too, which goes beyond streaming.
-  - **The buffer is reserved before decoding:** `Vec::try_reserve_exact` for the decoded size, then
-    `ImageDecoder::read_image` into it, in place of `DynamicImage::from_decoder`, which allocates
-    with no check.
+  - **The buffer is asked for with a check before decoding:** a zeroed allocation of the decoded
+    size (`alloc_zeroed`, a null return checked), then `ImageDecoder::read_image` into it, in
+    place of `DynamicImage::from_decoder`, which allocates with no check. Reserving and then
+    zero-filling would touch every page before the decoder runs; a zeroed allocation leaves the
+    pages the decoder never writes uncommitted.
     - An allocation the system refuses is then an error line, not an abort.
     - On systems that overcommit memory (Linux by default, macOS) a refusal is rare: the
       allocation succeeds, and the cost shows later as memory pressure. The memory line is the real
       guard.
-  - Today no limit applies at all: sopen's path skips the image crate's 512 MiB reservation, and a
-    14000² RGB image decodes to 588 MB (*edit* §2.8).
+  - Before W6, sopen's path skipped the image crate's 512 MiB reservation for every format
+    except TIFF: a 14000² RGB image decoded to 560.8 MB (588 × 10⁶ bytes, *edit* §2.8), while
+    the TIFF decoder holds its buffer to the crate's `max_alloc`, so a 14000² TIFF failed
+    (`Memory limit exceeded`).
+    - The asking path (`Doc::decode_asking`: the memory line and Continue) raises that limit to
+      the need + 512 MiB once the owner continues.
+    - `Doc::decode` and `Doc::decode_checked` ask nothing and keep the crate's limit.
 - **Hex view, and the hex view for a file that does not decode**, are new. Today a decode error is a
   status-row error in the browser (`prepare`, then `browser.rs`). The standalone route opens the hex
   window only for `--hex`, the binary dialog and a `.ts` file (`main.rs`).

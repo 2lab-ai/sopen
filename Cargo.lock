@@ -3745,6 +3745,7 @@ dependencies = [
  "num-traits",
  "openssh",
  "openssh-sftp-client",
+ "png",
  "rfd",
  "rtrb",
  "serde",
