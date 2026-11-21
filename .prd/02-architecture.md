@@ -505,6 +505,19 @@ a slice depends on runs before it (§8.2).
 | E4 | S2 | five git reads over the ssh master, timed |
 | E5 | S3 | remote stop: `exec sh -c 'echo $$ >&2; exec sleep 300'`, then `kill -TERM -- -<pid>`, under zsh, fish and bash login shells; an SFTP listing on the same master working while a parked `git log` stream is open |
 
+**E3's result** (measured 2026-11-21 on preview 0120d40813a0):
+
+- **Run:** 50 files (10 txt, 10 rs, 8 png, 7 jpg, 5 mp4, 3 wav, 2 mp3, 5 bin; 3 MB in total) on a
+  remote host over SFTP, in preview mode, with the bar moved down 49 times through the browser's
+  key hook (`SOPEN_KEYS`). Each step waits for the preview to settle.
+- **Time:** 13.4 s for the 50 settled previews.
+- **ffmpeg:** 0 ffmpeg or ffprobe processes spawned by sopen. Video and audio show a file card
+  until S1-M (§4.2).
+- **Cache:** the preview cache peaked at 196 KB and held 0 bytes after exit.
+- **Input isolation:** not part of this run. S1-E's P5 tests cover it: the host withholds the
+  frame's input, and a stand-in window that reacts to everything stays untouched.
+- **S1-M reruns E3** for media previews.
+
 ## 9. Receipts and test hooks
 
 Added to AGENTS.md "Receipts" by the slice that brings them (the hooks travel with `--target` as

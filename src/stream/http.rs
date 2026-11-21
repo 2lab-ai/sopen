@@ -19,18 +19,24 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-/// Connections served at once; the next one gets 503 (06 §9).
-pub const MAX_CONNECTIONS: usize = 32;
+/// Connections served at once; the next one gets 503 (06 §9). A render of 24 inputs
+/// (`ffmpeg::MAX_INPUTS`) holds two seats an input for a moment: ffmpeg opens each input's
+/// connection at its seek before the server has seen the one before it go (06 §7.4, X1: at
+/// 32, three of nine such renders had an input refused, and ffmpeg exited 0 on a short
+/// output).
+pub const MAX_CONNECTIONS: usize = 64;
 /// The request line and headers together, at most; a longer head gets 431.
 pub const MAX_HEAD: usize = 8 << 10;
 /// The whole head must arrive within this of the accept, else the connection closes unanswered.
 pub const HEAD_WITHIN: Duration = Duration::from_secs(5);
-/// A response whose client takes no bytes for this long is closed (01 §5's no-progress bound).
+/// An answer whose client takes no bytes for this long is closed (01 §5's no-progress bound):
+/// every head and refusal, and the body of a `bulk` response. It does not run on the body of
+/// a `render` or `play` response ([`Kind::stalls`]).
 pub const NO_PROGRESS: Duration = Duration::from_secs(60);
 
 /// Connections past [`MAX_CONNECTIONS`] whose head is still read so that they get their 503;
 /// past these too, a connection is closed unanswered.
-const TURNED_AWAY: usize = 32;
+const TURNED_AWAY: usize = 64;
 /// After an answer the server waits this long, and for this many bytes, for the client to
 /// close: closing over bytes the client still sends would reset the connection under the
 /// answer.
@@ -79,6 +85,27 @@ impl Kind {
             Kind::Bulk | Kind::Render => ReaderKind::Bulk,
         }
     }
+
+    /// Whether [`NO_PROGRESS`] runs on the body of a response of this kind. Only on `bulk`.
+    /// An answer's head, and a refusal, keep it for every kind: the exemption begins once the
+    /// head has been written.
+    ///
+    /// A `render` or a `play` client that takes nothing is waiting its turn (06 §7.4, X1):
+    /// ffmpeg opens every input of a render at the start and reads each when its piece comes
+    /// up, and playback starts the next piece's decoder with the current one. With the rule
+    /// on, a two-input render lost its second input at 66 s and playback lost the next
+    /// piece's decoders at 65 s, and ffmpeg exited 0 both times. Their owners end them
+    /// instead: an export is stopped once its output has not advanced for 120 s
+    /// (`ffmpeg::STALL_LIMIT`), and dropping the player kills its decoders. The watch still
+    /// finds a client that has gone, and the shutdown still ends every connection. A client
+    /// that neither reads nor closes keeps its seat until its owner kills it: every run on a
+    /// `play` or `render` URL must have an owner that does (06 §7.4, W7's rule).
+    fn stalls(self) -> bool {
+        match self {
+            Kind::Bulk => true,
+            Kind::Play | Kind::Render => false,
+        }
+    }
 }
 
 /// Why the server ended a response before its `Content-Length`.
@@ -94,7 +121,7 @@ pub enum CutReason {
     Failed(String),
     /// The Source closed under the response.
     Closed,
-    /// The client took no bytes for [`NO_PROGRESS`].
+    /// The client took no bytes for [`NO_PROGRESS`]: of a `bulk` body, or of any answer's head.
     Stalled,
     /// No body was begun: the server was serving [`MAX_CONNECTIONS`] already (503).
     Busy,
@@ -764,6 +791,7 @@ fn admit(shared: &Arc<Shared>, stream: TcpStream) {
         cancel,
         idle: Duration::ZERO,
         progress: 0,
+        stalls: true,
     };
     let spawned = std::thread::Builder::new()
         .name("sopen-http-conn".into())
@@ -1163,6 +1191,9 @@ struct Conn {
     /// and how many bytes went meanwhile.
     idle: Duration,
     progress: u64,
+    /// The no-progress timer runs: on every answer but a `render` or `play` body
+    /// ([`Kind::stalls`]).
+    stalls: bool,
 }
 
 impl Conn {
@@ -1259,7 +1290,8 @@ impl Conn {
 
     /// Writes `bytes`, calling `sent` with each count the socket took. The time its writes
     /// wait on the client adds up, over the whole response, until [`PROGRESS_BYTES`] have
-    /// gone since it last started at 0: [`NO_PROGRESS`] of it is a stall. So a trickle does
+    /// gone since it last started at 0: [`NO_PROGRESS`] of it is a stall, where the timer runs
+    /// (`stalls`: not on a `render` or `play` body, whose wait never adds up). So a trickle does
     /// not keep a response open, and the time a read waits for the remote is not the client's.
     fn send(&mut self, mut bytes: &[u8], mut sent: impl FnMut(usize)) -> Result<(), Stop> {
         let mut mark = self.shared.now();
@@ -1305,7 +1337,9 @@ impl Conn {
             #[cfg(not(test))]
             let wrote = self.stream.write(bytes);
             let now = self.shared.now();
-            self.idle += now.saturating_duration_since(mark);
+            if self.stalls {
+                self.idle += now.saturating_duration_since(mark);
+            }
             mark = now;
             match wrote {
                 Ok(0) => return Err(Stop::Failed("the socket took no bytes".into())),
@@ -1396,6 +1430,9 @@ impl Conn {
             start + length
         };
         let mut stop = self.send(head.as_bytes(), |_| {}).err().map(Stop::reason);
+        // The head has gone, under the 60 s like every answer's. Only the body of a `render`
+        // or `play` response is exempt from here on ([`Kind::stalls`]).
+        self.stalls = request.kind.stalls();
         let mut buf = vec![0u8; BLOCK as usize];
         if stop.is_none() && at < end {
             // From here the thread may wait for a block, where it does not see its socket.

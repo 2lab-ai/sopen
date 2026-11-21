@@ -52,3 +52,25 @@ changes. Rows here are snapshots taken when they were moved.
   merged 2026-11-21, 5f4e6b3).
 - X3: a scratch experiment on 41956b9. Its numbers, the rules taken from them and the five defects
   W5a must fix are in 06 §7.2 and §10, not here.
+
+## R1 (part 3) — closed 2026-11-21
+
+- measured X1 ✅ · result: the editor's real render and playback runs measured through the byte
+  server; the server's limit raised to 64 and its 60 s rule kept to `bulk`; the numbers and W7's
+  rules written into 06 §7.4, §9, §10 and §12 · closed rows: X1 · PRs: the PR that carries this
+  block
+
+### Closed rows
+
+| ID | Status | Branch | Worktree | Scope | Owns | After | Gate |
+|---|---|---|---|---|---|---|---|
+| X1 | ✅ | — (scratch) | — | Spike: PR #15's real `edit_args` (10 spans, up to 24 inputs) and playback command lines against the real `stream::http::Server` (W3, merged) with its 64 KiB blocks, 64 MiB cache and the cap; log bytes fetched against bytes sent (06 §7.4). About half a day. | none | before W7 (PR #15 and W3 are merged) | Done (X1), 2026-11-21, on 5f4e6b3 with a scratch harness, ffmpeg 9.0.2: at 32 connections 3 of 9 24-input mp4 renders had an input refused and ffmpeg exited 0 on a short output, at 64 none of 19; the 60 s rule cut a waiting render input at 66 s and playback's next piece at 65 s; an mp4 or wav input fetched at most 1.18 MiB beyond what was sent and no block twice; a 144 MB mp3 with 10 inputs fetched 304 MB to keep 4 MB; text in 06 §7.4, §9, §10, §12 V16 and Tensions (this PR) |
+
+### Round section
+
+- X1: a scratch experiment on 5f4e6b3, with the limit, the cap and the 60 s rule each changed in
+  the scratch copy for an A/B run. Its numbers and the rules taken from them are in 06 §7.4, §9 and
+  §12 V16, not here. The code change it led to (`MAX_CONNECTIONS` 64, `Stalled` on `bulk` only)
+  is in `src/stream/http.rs`, in the same PR.
+- One question it left open is in 06's Tensions, for W7: an mp3 render reads the file once per
+  input.
