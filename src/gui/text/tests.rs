@@ -711,6 +711,12 @@ fn a_long_run_that_shortens_like_a_heredoc_delimiter_ends_it() {
         "parsed whole, the 216 `x`s are the heredoc's body"
     );
     assert!(
+        got[1].iter().map(|&(ch, _)| ch).eq(lines[1].chars()),
+        "the body line is shown whole: {} characters of {}",
+        got[1].len(),
+        lines[1].chars().count()
+    );
+    assert!(
         got[1].iter().all(|&(_, c)| c == end),
         "in the viewer they end it, coloured as its delimiter: {:?}",
         got[1][0]
