@@ -1174,18 +1174,21 @@ fn a_render_or_play_client_that_waits_is_not_cut() {
 }
 
 /// The exemption is the body's alone: an answer's head keeps the 60 s for every kind. A
-/// `play` and a `render` client that never take the head — not a byte of the answer goes —
-/// are closed at 60 s, and counted, as a `bulk` one is; at 59 s they are open.
+/// head whose write is still blocked at 60 s — not a byte of the answer has gone — is closed,
+/// and counted, for `play` and `render` as for `bulk`; at 59 s it is open. The boundary is
+/// the server's write, not the client's read: a real socket would buffer so small a head for
+/// a client that never reads it, so the write is held by the write gate, on the server's
+/// clock moved by hand.
 #[test]
-fn a_client_that_never_takes_the_head_is_closed_after_60_s() {
+fn a_head_whose_write_is_still_blocked_at_60_s_is_closed() {
     bounded(
-        "a_client_that_never_takes_the_head_is_closed_after_60_s",
+        "a_head_whose_write_is_still_blocked_at_60_s_is_closed",
         || {
             for kind in Kind::ALL {
                 let size = 256 * MIB;
                 let (source, _control) = threaded(size);
                 let hand = Hand::new();
-                // No write to the client takes a byte: each is a wait that ran out.
+                // The gate: no write to the client takes a byte, each is a wait that ran out.
                 let seams = Seams {
                     before_write: Some(Arc::new(|_, _| {
                         std::thread::sleep(Duration::from_millis(1));

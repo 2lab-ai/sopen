@@ -840,7 +840,9 @@ to every run on the file: the probe, playback, the paused frame, the waveform, S
     - **A probe** has no deadline today: `ffmpeg::probe` waits for ffprobe to exit. W7 adds one,
       **30 s**, after which ffprobe is killed and reaped and the probe fails with the Source's
       state. This covers the window's probe and the `.ts` refine. The 30 s are a choice, not a
-      measurement: X1's probes took 0.3–1.8 s, the slowest on a link throttled to 0.7 MB/s.
+      measurement. X1's 73 probe phases took 0.33–0.55 s unthrottled and 0.57–1.84 s
+      throttled, the slowest at 0.7 MB/s; each figure includes about 0.3 s the harness waits
+      for the stream to go idle.
     - The waveform reads a `bulk` URL, which keeps the 60 s rule.
     - A run W7 adds on a `play` or `render` URL gets an owner of one of these kinds.
   - **The cut account is what catches a missing piece.** In every damaged output above ffmpeg
@@ -1013,8 +1015,9 @@ Left as whole fetches, with the fetch now pipelined (§2):
     write to the client that failed for a reason other than the client leaving; a connection
     thread that panicked), and two the server adds itself:
     - `Stalled`: the client took too little for 60 s (below): of a `bulk` body, or of any
-      answer's head. The body of a `render` or `play` response never gets it. A paused player is not a client that stops reading: pause drops the
-      player, which kills its decoders, and Play starts ffmpeg again at its position.
+      answer's head while the head's write is still blocked. The body of a `render` or `play`
+      response never gets it. A paused player is not a client that stops reading: pause drops
+      the player, which kills its decoders, and Play starts ffmpeg again at its position.
     - `Busy`: a request with a valid token and kind was refused with 503 (below). No body was
       begun, but a run refused an input must not pass.
   - A connection closed unanswered for want of a seat or a thread counts against every kind: whose
@@ -1043,8 +1046,11 @@ Left as whole fetches, with the fetch now pipelined (§2):
   waits for the remote is not counted here: the Source's own reads are bounded by §5's timeouts.
   - **On a body, the 60 s run for `bulk` only.** The body of a `render` or `play` response whose
     client is connected and not reading is waiting its turn (§7.4, X1), and is never `Stalled`.
-    The exemption begins once the answer's head has been written: every head, and every refusal,
-    keeps the 60 s, whatever the kind.
+    The exemption begins once the answer's head has been written to the socket. So a head whose
+    write is still blocked at 60 s is closed, for every kind, and so is a refusal. This is about
+    the server's write, not about what the client's program reads: the kernel buffers a head of
+    a few hundred bytes for a client that never reads it, and the response is then in its body,
+    where a `render` or `play` one waits without a deadline.
   - **Such a body ends with its owner.** A client that neither reads nor closes keeps its seat
     until it is killed, so every ffmpeg or ffprobe run on a `play` or `render` URL has an owner
     that kills and reaps it (§7.4, W7's rule): the 120 s progress watchdog for an export or a
@@ -1333,19 +1339,24 @@ stream <event> t=<ms> <host:/abs> fetched=<b> demand=<b> prefetch=<b> bulk=<b> d
     start's own: the counters' growth from `Player::start` to the drop):
     - `fetched − refetched ≤ http_sent + (play readers opened during that start) × their ahead +
       cap`;
-    - `refetched ≤ 1 block` per start at the default cap.
+    - `refetched ≤ 1 block` per start, as a regression threshold for X1's own fixture and not
+      a promise about playback in general. The fixture: the 600 s, 310 MB 1080p mp4 at
+      4 Mbit/s, either layout; the edit of 10 pieces of 10 s reordered; 12 s of play from
+      timeline positions 5 s, 45 s and 85 s, one after another on one Source; the cap left
+      alone, where it stayed at its 256 KiB floor.
     - `refetched` is the bytes of blocks fetched again after eviction. `Stats` has no such
       counter today: W7 adds it.
     - It is not a bound "at every step": `fetched` is cumulative and counts refetches,
       `http_sent` is a union, and a reader's allowance goes when it closes.
-    - X1: with the cap left alone, 1 block was fetched again in nine mp4 starts. With the cap
-      pinned at 4 MiB one start fetched 60 blocks again (34 throttled), so the second line is
-      for the default cap only. At the first start `fetched` was 18.0 MB over `http_sent`.
+    - X1 on that fixture: 1 block was fetched again in nine starts. With the cap pinned at
+      4 MiB one start fetched 60 blocks again (34 throttled), so the threshold holds only with
+      the cap at its floor. At the first start `fetched` was 18.0 MB over `http_sent`.
       Counting only the four readers that stayed open, at 5.2 MB `ahead` each, 20.9 MB was
       allowed (arithmetic, not measured); that start opened 24 `play` connections in all, so
       the gate's own allowance is larger.
-    - This form is for playback only. It missed on a render of many inputs (123.9 MB against
-      122.1 MB for 10 inputs), which has its own bound below.
+    - This gate is for playback only. A render has its own bound below. What X1 saw miss on
+      a render was the earlier formula, `fetched ≤ http_sent + Σ live readers' ahead + cap`
+      (123.9 MB against 122.1 MB for 10 inputs), not this one, which no render was held to.
   - **Owner gate** (W7, §7.4's rule): after an owner stops its run, the seats that run held are
     back to 0. Three cases: a dropped player, an export stopped by the 120 s watchdog, and a
     probe that ran past its 30 s. Each is against a client that neither reads nor closes.
@@ -1399,7 +1410,8 @@ stream <event> t=<ms> <host:/abs> fetched=<b> demand=<b> prefetch=<b> bulk=<b> d
     - a `bulk` client that stops reading is closed after 60 s (simulated time);
     - a `render` and a `play` client that take nothing for 61 s, and for an hour, are open and
       uncounted, and get the file's bytes from where they stopped when they read on;
-    - a client of any kind that never takes the answer's head is closed after 60 s;
+    - a head whose write is still blocked at 60 s is closed, for every kind (the write held by
+      the test's write gate, on the simulated clock);
     - after the window closes, the port refuses connections, and a thread blocked in a write
       returns;
     - a source that changes during a response already started cuts it short, sends no byte of the
