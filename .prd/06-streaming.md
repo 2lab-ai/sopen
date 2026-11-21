@@ -145,11 +145,24 @@ The first two paragraphs are this document. The third is 07.
   holds a hex screen 136 times over.
 - **64 MiB of RAM per stream** (1024 blocks). The least recently used block goes first.
 - **Protected from eviction:** the blocks inside any live reader's `[cursor − behind, cursor + ahead]`
-  (§4). The 64 MiB is a hard bound, and protection yields to it.
+  (§4). The 64 MiB is a hard bound, and a window's protection yields to it.
   - When the readers' protected windows together would pass 48 MiB, every reader's `ahead` and
     `behind` are scaled down to an equal share of that 48 MiB, but never below a floor of 256 KiB
     ahead and 64 KiB behind.
-  - A block a reader is waiting for is held until that reader has read it.
+  - **A block a reader is waiting for is held by that reader, not by the cache.** A reader's
+    wait is one span of at most 16 MiB (one read). The reader keeps its own reference to each
+    block of the span that is there: those the cache has when the wait begins, and each one that
+    arrives and is validated after. A read is served from what the reader holds first, then from
+    the cache.
+  - So a wait never depends on what the cache keeps, and the cache evicts freely: by window,
+    then by age. Nothing limits which waits are served; priority is §4's class order alone.
+  - The references are dropped when the read completes or is cancelled, when the reader moves
+    (a read at the end of the file or of no length counts), is renewed or is dropped, and when
+    the Source fails, changes or reloads. Nothing held is served after a
+    change or a reload.
+  - **Memory:** the cache's 64 MiB, plus at most 16 MiB and one block (257 blocks: a 16 MiB
+    span that starts inside a block) for each reader with a wait outstanding.
+    A held block that is also in the cache is one buffer, counted once.
 - **Bulk readers insert at the cold end.** Their blocks are the next to go, so a pass over the whole
   file (an index pass, the waveform, Save As) does not evict what the screen or playback needs.
 - **No disk spill in v1.** The measured patterns fit in 64 MiB: open + 10 s of play + a far seek
@@ -196,7 +209,9 @@ channel, and the Source bounds those bytes.
 - **The cap:** `cap = clamp(2 × rate × rtt_min, 256 KiB, 4 MiB)`.
   - `rate` is the delivered byte rate, an EWMA over the last second of completions. Until there is
     one, the cap is 256 KiB.
-  - `rtt_min` is the fastest small reply seen: the open's `fstat`, or a one-block read.
+  - `rtt_min` is the fastest small reply seen: a status reply, or a one-block read. It starts at
+    the first reply, not at the open's `fstat`, which `Ranged` does not time. The cap is 256 KiB
+    until then.
 - **Reads are admitted against the cap.** A read goes out only if `in_flight + its size ≤ cap`. The
   one exception is a read on an idle channel (`in_flight` = 0), which always goes, so that a read
   larger than the cap still makes progress.
@@ -216,8 +231,11 @@ channel, and the Source bounds those bytes.
      shows as loading;
   2. **foreground prefetch**: those readers' margin and readahead;
   3. **bulk**: what a Bulk reader asks for, its readahead included. A Bulk reader's waiting block is
-     not demand. Bulk goes out only while nothing of classes 1–2 is queued. A foreground reader's
-     readahead stops at its `ahead`, so bulk always gets the link once those windows are full.
+     not demand. Within the class a waiting block goes before readahead, whatever their ages: a
+     pass is stalled on the one. Bulk goes out only while nothing of classes 1–2 is queued. The
+     priority is strict, so bulk progresses whenever the foreground windows are full or idle, and
+     not while a foreground reader keeps moving. A foreground reader's readahead stops at its
+     `ahead`.
 - **A newer demand from the same reader replaces its older one** that has not been sent yet. So
   repeated jumps queue only the latest place.
 - **The bound.** A foreground demand waits behind at most `cap` bytes already sent, plus the older
@@ -267,7 +285,8 @@ after the reads before it.
   file's last change (01 §5's limit). Viewing is best effort there, and blocks of two versions can
   mix until a change is seen.
 - **A block read in parts** (a short reply, then its remainder, §2) becomes visible only after the
-  remainder's own fence. A write between the first reply and the remainder moves the mtime that
+  remainder's own fence, and only if every part's fence returned the fingerprint. A part whose
+  fence failed gives the whole fetch up, its remainder included, even one already sent. A write between the first reply and the remainder moves the mtime that
   fence sees, so the whole block is discarded and the Source turns `Changed`.
 - **The cost** is one `fstat` request (about 50 bytes of reply) per batch. On the fast path, where
   every reply is full, it is sent with the reads and adds no round trip: the fence's reply follows
@@ -279,9 +298,16 @@ viewer is on screen, scheduled as §4 says: ahead of queued prefetch and bulk, b
 never held back by the cap. A viewer that is hidden, such as a browser viewer behind the list, does
 not poll.
 
+`Replaced` is found by comparing `stat(path)` with the fingerprint. A file of the same size and the
+same whole-second mtime renamed over the path is therefore not seen: SFTP v3 carries no inode. It
+is the limit below, for the poll.
+
 **A detected change invalidates what is in flight.** Every request carries the Source's generation,
 which a change or a reload increments. A completion of an older generation is dropped unread, so
-nothing sent before the change can refill the cleared cache.
+nothing sent before the change can refill the cleared cache. The attempt id of a block's fetch
+does the same within a generation: a reply whose fetch was given up (its fence failed) is
+dropped before it is read, so its error, its emptiness or its bytes cannot touch the fetch that
+replaced it.
 
 | State | Meaning | What the viewer does |
 |---|---|---|
@@ -292,12 +318,17 @@ nothing sent before the change can refill the cleared cache.
 | `Closed` | the viewer is gone | — |
 
 - **Reload** (Cmd/Ctrl+R in every viewer) re-opens the path, takes a new fingerprint and drops the
-  cache. The text viewer indexes again, the media window probes again, and the hex window keeps its
+  cache. Reloads run in the order asked. Two plain ones not yet started are one; a reload after a
+  save (below) is never merged away. The text viewer indexes again, the media window probes again, and the hex window keeps its
   offset. The key is Cmd/Ctrl+R and not R alone, because in the hex window's ASCII column R types a
   byte.
 - **Retry** reconnects through the viewer's existing `Reconnect` (`src/gui/mod.rs:34`), re-opens and
   `fstat`s. The same `(size, mtime)` gives `Live` and the cache is kept; anything else is `Changed`.
   SFTP v3 attributes carry no inode, so after a reconnect only `(size, mtime)` can be compared.
+- **A close during a retry or a reload.** One not yet at the network opens nothing. One already
+  there is an operation under way: the close does not wait for it, and when it returns, what it
+  opened is closed at once, unused. So nothing is requested after the close, except the open of a
+  reconnect already under way, which is closed on return unused.
 - **sopen's own writes are not changes.** When one of sopen's own writes to the file lands (07's
   Save, or §7.1's interim Save), the window reloads its Source at once. The new fingerprint must
   equal the write's own baseline: the staged temp's stat (01 §5), or for 07's write in place the
@@ -309,8 +340,9 @@ nothing sent before the change can refill the cleared cache.
   second cannot be seen without reading every byte, and is not (verified, above).
 
 **Timeouts.** A demand block pending over 1 s shows `loading 0x… (N KiB)`, and over 10 s
-`the remote is slow`. 01 §5's 30 s per request and 60 s without progress make it `Failed`. A failed
-prefetch is never shown; it is only retried as demand.
+`the remote is slow`. The transport fails a request that has no reply 60 s after it was sent (W1),
+and that failure makes the Source `Failed`. This is the one bound: the Source has no stall timer of
+its own. A failed prefetch is never shown; it is only retried as demand.
 
 **Interface** (`src/stream/mod.rs`; every viewer builds on it, and 07 reads through it):
 
@@ -332,13 +364,21 @@ pub struct Reader { /* a position with its own readahead window (§4) */ }
 impl Reader {
     /// Frames: the bytes when every block is cached, else Pending (fetch queued; `wake` on arrival).
     pub fn try_read(&mut self, off: u64, len: usize) -> Poll<Result<bytes::Bytes>>;
+    /// Moves the reader to the version open now, at no position.
+    pub fn renew(&mut self);
     /// Workers and HTTP connections: blocks. Err(Cancelled) once `cancel` is set,
-    /// Err(Changed) when the source changed, Err(reason) when it failed.
+    /// Err(Changed) when the source changed, Err(Reloaded) when it was reloaded,
+    /// Err(reason) when it failed.
     pub fn read_at(&mut self, off: u64, buf: &mut [u8], cancel: &AtomicBool) -> Result<usize>;
 }
 /// What a viewer reads: implemented by `std::fs::File` (local, in place; always Ready) and `Reader`.
 pub trait Bytes { /* len, try_read, read_at — as above */ }
 ```
+
+**A reader reads one version.** After any reload, every reader made before it gets
+`ReadError::Reloaded` for every read, cached or not, until `renew()`. So a worker never continues
+into the new file. A viewer renews its readers after a reload. The byte server treats `Reloaded`
+as it treats `Changed`: it cuts the response (§9).
 
 `Waker` is egui's `request_repaint` for the viewer's context. `Reopen` opens a new connection on the
 viewer's `Reconnect` and makes it a `Ranged`.
@@ -385,6 +425,10 @@ nothing else is affected:
    The action fails with the line, and the edits stay in the window and in the journal (07 §4.2).
    Nothing on the remote was touched, because no request was sent. The next Save tries to connect
    again.
+
+**Not verified yet.** `stream::session_refused` matches ssh's words for a refused session, but
+`start_sftp` sends ssh's stderr to null (`src/remote/sftp.rs:81`), so those words never reach the
+error today. W8 and ED4 must capture that stderr, a change to W1's file, before V10 can pass.
 
 ## 7. Per viewer
 
@@ -861,7 +905,7 @@ Left as whole fetches, with the fetch now pipelined (§2):
 
 | Resource | Bound |
 |---|---|
-| RAM per Source | 64 MiB of blocks + at most 4 MiB in flight |
+| RAM per Source | 64 MiB of blocks + at most 16 MiB and one block per reader with a wait outstanding (§3) + at most 4 MiB in flight |
 | RAM, the hex window | + its page cache, 64 × 4 KiB |
 | RAM, the text viewer | + its index, at most 16 MiB up to 64 GiB of indexed text (§7.2) |
 | RAM, the image window | the encoded bytes + the decoded pixels, as today; above 512 MiB decoded only after Continue (§7.3) |
@@ -963,7 +1007,11 @@ stream <event> t=<ms> <host:/abs> fetched=<b> demand=<b> prefetch=<b> bulk=<b> d
   - Two Interactive readers and one Bulk reader on one Source: the bytes ahead of a demand are ≤ the
     cap + one block per other reader with demand queued. No bulk request is sent while foreground
     demand is queued.
-  - Ten jumps within 100 ms: only the last place's demand is sent beyond what was in flight.
+  - Ten jumps within 100 ms: nothing queues. Every demand sent was the reader's latest place when
+    it went, and a place passed while the cap was full is never sent
+    (`v4_ten_jumps_on_an_idle_link_never_queue_a_passed_place`: on the gate link from an idle
+    start, 9 of the 10 places find room and go). While the cap is full, only the last place is sent
+    (`v4_ten_jumps_send_only_the_last_place`).
   - **Fences with the cap full:** prefetch fills the cap and more prefetch is queued. A demand batch
     is admitted when room frees. Its fence is sent right behind its read, ahead of the queued
     prefetch, and the block is visible once that fence returns. It does not wait for the queued
@@ -997,7 +1045,8 @@ stream <event> t=<ms> <host:/abs> fetched=<b> demand=<b> prefetch=<b> bulk=<b> d
   - The one documented gap: a same-size write within the same second as the file's mtime is not
     seen (V7 pins that the `Fake` shows it as unchanged, so the limit stays stated, not hidden).
 - **V8. Close during prefetch.** Close a window while 4 MiB of prefetch is in flight. The window goes
-  at once, and on the `Fake` nothing is requested after the close. Qualification: the process exits
+  at once, and on the `Fake` nothing is requested after the close, except the open of a reconnect
+  already under way, which is closed on return unused (§5). Qualification: the process exits
   within 5 s.
 - **V9. Lost connection.** Kill the transport while scrolling (the `Fake`'s channel closes; live, the
   ssh master is killed).

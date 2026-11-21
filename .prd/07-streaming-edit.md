@@ -129,7 +129,11 @@ The journal and §3.1's save reconciliation are **the workstream's reading** of 
 - **When it is kept.** On any other ending (a crash, a kill, a power loss). The lock is then free.
 
 **Recovery.** On open, sopen looks for `<abs path>.journal-*` directories of the same host and path
-whose lock it can take. Each one gets a row:
+whose lock it can take. A lock found taken is tried again for up to 500 ms before the journal counts
+as another live session's: the lock belongs to the open file, and a child that another thread is
+starting (ssh, ffmpeg) holds a copy of every open descriptor from its fork until its exec, so the
+lock of a journal this process has just let go can look taken for that moment. The viewers' open
+path does the retrying (ED4–ED6); `orphans` itself tries once. Each one gets a row:
 
 > unsaved edits from 2026-11-20 11:42 (4 bytes changed) kept at ~/…/model.bin.journal-… — [Restore] [Later] [Discard]
 
@@ -184,7 +188,7 @@ before the request that moves the Save to it.
 
 | Route | Phases, in order |
 |---|---|
-| A temp, then a rename: hex server copy (§4.2), hex streamed rewrite (§4.3), image and media upload (`write_atomic`, §8, §9) | `naming` (the temp's name, before the exclusive create) → `created` (after the create's reply: the temp's stat at creation) → `staged` (after the last write and fsync: the temp's stat and the post-save evidence) → `renaming` (just before the rename) → removed once the outcome is recorded |
+| A temp, then a rename: hex server copy (§4.2), hex streamed rewrite (§4.3), image and media upload (`write_atomic`, §8, §9) | `naming` (the temp's name, before the exclusive create) → `created` (after the create's reply: the temp's stat at creation; a hex Save records it again once the temp has its owner and mode, before it is filled) → `staged` (after the last write, the fsync and the check right before the replace, §4.2 step 9: the temp's stat and the post-save evidence) → `renaming` (just before the rename, so `staged` and `renaming` are recorded back to back) → removed once the outcome is recorded |
 | Write in place (§4.4) | `writing` (before the first write: each run's offset, old bytes and new bytes; the undo file is already durable) → removed once the fsync's reply and the `lstat` are recorded |
 
 **Post-save evidence by kind.** There are two kinds of evidence, and they are kept apart:
@@ -230,8 +234,22 @@ offered:
 - SFTP v3 attributes carry no inode (verified: the server returned size, owner, permissions and
   times, nothing more). So a temp's identity is checked by what can be compared.
   - **On reconcile**, a temp is removed only if the phase reached `created`, its `lstat` equals the
-    recorded stat (size, mtime, owner, mode), and, from `staged` on, its post-save evidence
-    matches. Anything else is kept and named.
+    recorded stat exactly (a regular file of that size, mtime, owner and mode), and, from `staged`
+    on, its post-save evidence matches.
+    - **Anything else is kept, named, and offered to the user for removal**: `a file at the
+      interrupted save's temporary path <path> (N bytes); sopen could not verify it is its own
+      partial copy, so it was not removed — remove it?`. That is a temp a Save was cut off
+      filling, one whose mode had just been set, and one already given a set-id target's full
+      mode — or another file that took the name since. The words claim no ownership, and the
+      prompt the hex window shows (ED4) carries the same uncertainty.
+    - **Why not less.** A random name, an owner, a mode and a size below the target's do not
+      prove a file is sopen's: any number of files share them, and after the process has died
+      another file can take the name. Removing on those would delete someone else's file.
+    - **Best effort still.** SFTP carries no inode, so a file equal to the recorded stat in every
+      attribute, put under the name since, is not told apart (in `created`, an empty one).
+    - **What `created` records.** The temp's stat at creation, and again once the temp has its
+      owner and mode (§4.2 step 4). So a Save cut off between that and its first copy request
+      leaves a temp that still matches, and it is removed.
   - **During a live Save**, sopen compares `fstat(handle)` with `lstat(path)` right before removing
     its own temp; a difference keeps it and names it. A swap of the name between that check and the
     remove cannot be seen, since SFTP has no remove by handle. That is a stated residual.
@@ -260,6 +278,8 @@ offered:
   `write_atomic`, and the re-bind. Message 17 is about streamed files, and a local file has no
   Source to reload. The journal (§3), Save As (§7) and the close prompt (§10) apply to it as to a
   remote file.
+  - `LocalFs::patcher()` exists for the tests and for parity with SFTP (ED1's algorithms run on
+    both). ED4 never routes a local file through it.
 
 ### 4.2 Server copy, then patch, then rename
 
@@ -278,11 +298,15 @@ check, the undo file, the streamed rewrite and Save As.
 4. **Create the temp.** The journal's `save` file first records phase `naming`, with the temp's name
    and the saved generation (§3.1). Then sopen creates `.<name>.sopen-<random>` exclusively. On the
    create's reply it records phase `created` and the temp's stat. Through the handle it gives the
-   temp the target's owner, then its mode without set-id bits (`create_from`'s rule).
+   temp the target's owner, then its mode without set-id bits (`create_from`'s rule). It then
+   `fstat`s the temp and records that stat in `created`, before the first copy request: a Save
+   cut off before that request leaves a temp that equals the record and is removed on reopen. Once
+   the copy has started the temp no longer equals it, and is kept and named (§3.1).
 5. **Copy on the server.** `copy-data` from the source to the temp, in requests sized by time. There
    is **one `copy-data` loop** in sopen: the browser's S1-C builds it in `src/remote/sftp/ops.rs`
-   for copying files (04 §5, 8 MiB chunks), and ED1 extends it to requests of about 1 s of copying,
-   for both uses:
+   for copying files, and ED1 gives it a pace. File copies keep their 8 MiB steps through the same
+   loop (04 §5.1: progress and Esc per step). Only a Save is paced by time, in requests of about
+   1 s of copying:
    - The first request is 64 MiB. Each next one is sized to take about 1 s at the last one's rate,
      clamped to 16 MiB–1 GiB. A slow server disk then never turns one request into a 30 s
      `META_TIMEOUT`, which would be an unknown outcome.
@@ -291,8 +315,9 @@ check, the undo file, the streamed rewrite and Save As.
      24 GiB; the Mac (APFS, internal SSD) at 1.8–5.4 GB/s, usually about 5. With the source cached,
      3.7 and 5.4 GB/s. A 64 MiB request takes 18–70 ms on the laptop (one network round trip
      included) and usually 11–19 ms on the Mac (at most 294 ms); every measured run of the rule
-     reached the 1 GiB cap on its second request. A 1 GiB request typically takes 0.4–0.5 s on the laptop and 0.2–0.3 s on
-     the Mac; the worst seen was 1.73 s on the laptop, when its disk slowed to about 0.6 GiB/s (the
+     reached the 1 GiB cap on its second request (their first requests took 16–25 ms); at the slow
+     end of the 64 MiB range (70 ms) the rule sizes the second request at 914 MiB. A 1 GiB request
+     typically takes 0.4–0.5 s on the laptop and 0.2–0.3 s on the Mac; the worst seen was 1.73 s on the laptop, when its disk slowed to about 0.6 GiB/s (the
      rule then cut the next requests to 370–950 MiB), and 1.07 s on the Mac. Two or four requests outstanding gain only the network round trip,
      which 1 GiB requests already amortise, so the loop keeps one outstanding. A slow disk was not
      measured; the 16 MiB floor and the time-sized rule are for it.
@@ -313,10 +338,15 @@ check, the undo file, the streamed rewrite and Save As.
    post-save evidence for §3.1.
 7. **Write the backup** (§5.1). The bytes each run will replace, from those same reads, go into the
    local undo file. It is fsynced **before** the temp is patched, and its path is printed, as
-   today's `backup of … at …` is.
+   today's `backup of … at …` is. (In the streamed rewrite the pass has already written the
+   patched bytes into the temp; §4.3 says when the undo file is durable there.)
 8. **Patch.** Write each run at its offset (positional writes). Restore the full mode, send
    `fsync@openssh.com`, and `fstat` the temp. Its size must equal the size as opened, and its owner
    and mode must be as wanted (`prepare_swap`'s checks).
+   - **A server without `fsync@openssh.com`** cannot flush. A Save never reports a flush it did not
+     make: it goes ahead, and says so before it starts and in its result — `this server cannot
+     flush to disk; the save is not guaranteed to survive a power cut on <host>`. The copy's
+     flushes on the way (step 5) are then not sent either.
 9. **Check again, right before the replace.** `fstat` the source handle and `lstat` the target, both
    against the baseline. Any difference is refused and the temp is removed. The journal's `save`
    file then records phase `staged` (the temp's stat from step 8, and the post-save evidence), then
@@ -348,6 +378,10 @@ The same steps, except that steps 3–6 become one pass through this machine.
   same-mtime change.
 - It applies the patches on the way, writes the temp, and hashes what it read.
 - That hash must equal the baseline (§4.5) before the rename.
+- **Step 7 here.** The pass writes the patched bytes into the temp as it reads, so the undo file
+  cannot come before them. It is made durable after the pass and before the temp's fsync, the
+  check before the replace and the rename: before anything can replace the target. In the server
+  copy it is durable before the patch.
 - The upload is at most the file's size.
 
 ### 4.4 Write in place… (only from an explicit dialog)
@@ -704,6 +738,12 @@ Gates and qualification are as in 06 §12. The live receipt is a file under a re
     - stopped in `naming`: the temp, if any, is named and kept, never removed;
     - stopped in `created` or `staged`: on reopen the temp, whose stat (and evidence) match, is
       removed, and the edits are offered;
+    - killed mid-copy (`created`, the temp at some size up to the target's): on reopen the temp is
+      kept and named as a file sopen could not verify is its own partial copy, and its removal is
+      offered to the user; killed after the temp's owner and mode were recorded and before the first copy
+      request, it still equals the record and is removed;
+    - **another file under the temp's name** after the kill (same owner and mode, smaller than
+      the target, other bytes and mtime): kept, and its bytes are untouched;
     - the rename landed but its reply was lost: on reopen, "landed (found on reopen)", the journal
       retired, nothing offered twice.
   - **Image crop Save:** landed but the reply was lost. On reopen the output's hash identifies the
