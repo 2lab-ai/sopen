@@ -7,7 +7,7 @@ use super::*;
 use crate::remote::{
     fake, pattern, Change, Clock, FakeControl, FakeFile, Fault, Link, RemoteFs, SftpRemote,
 };
-use crate::stream::{Class, Engine, Opening, Reopen, Settings, State, Traced};
+use crate::stream::{limits, Class, Engine, Opening, Reopen, Settings, State, Traced, CAP_MAX};
 use std::os::unix::fs::FileExt;
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
@@ -123,10 +123,15 @@ impl Hand {
     }
 
     fn config(&self) -> Config {
+        self.with(Seams::default())
+    }
+
+    fn with(&self, seams: Seams) -> Config {
         let at = self.0.clone();
         Config {
             clock: Arc::new(move || *at.lock().unwrap()),
             tick: Some(Duration::from_millis(5)),
+            seams,
         }
     }
 
@@ -144,6 +149,19 @@ fn checks(watch: &Watch, n: u64) {
         assert!(watch.open() > 0, "the connection was closed meanwhile");
         watch.checks() >= from + n
     });
+}
+
+/// The server has filled the client's socket and waits on it: three waits in a row with
+/// nothing more sent. What it has sent.
+fn settled(watch: &Watch, source: &Source) -> u64 {
+    let mut sent = source.stats().http_sent;
+    loop {
+        checks(watch, 3);
+        let now = std::mem::replace(&mut sent, source.stats().http_sent);
+        if now == sent {
+            return sent;
+        }
+    }
 }
 
 fn connect(server: &Server) -> TcpStream {
@@ -421,28 +439,76 @@ fn head_gives_the_gets_headers_and_no_body() {
     bounded("head_gives_the_gets_headers_and_no_body", || {
         let (source, _control) = threaded(SIZE);
         let server = Server::start(source.clone()).unwrap();
+        // The status and the headers of each row, written out: `SIZE` is 300 000. An empty
+        // string is a header that must not be there.
+        struct Row {
+            range: &'static str,
+            status: u16,
+            length: &'static str,
+            content_range: &'static str,
+            accept_ranges: &'static str,
+        }
+        let row = |range, status, length, content_range, accept_ranges| Row {
+            range,
+            status,
+            length,
+            content_range,
+            accept_ranges,
+        };
         let rows = [
-            (String::new(), 200),
-            (range("bytes=5-"), 206),
-            (range("bytes=5-9"), 206),
-            (range("bytes=5-999999"), 206),
-            (range("bytes=999999-"), 416),
-            (range("bytes=-5"), 416),
+            row("", 200, "300000", "", "bytes"),
+            row("bytes=5-", 206, "299995", "bytes 5-299999/300000", "bytes"),
+            row("bytes=5-9", 206, "5", "bytes 5-9/300000", "bytes"),
+            // Clamped to the file's end.
+            row(
+                "bytes=5-999999",
+                206,
+                "299995",
+                "bytes 5-299999/300000",
+                "bytes",
+            ),
+            row(
+                "bytes=299990-300000",
+                206,
+                "10",
+                "bytes 299990-299999/300000",
+                "bytes",
+            ),
+            row("bytes=999999-", 416, "0", "bytes */300000", ""),
+            row("bytes=-5", 416, "0", "bytes */300000", ""),
         ];
+        let extra = |row: &Row| match row.range {
+            "" => String::new(),
+            spec => range(spec),
+        };
         let heads: Vec<Reply> = rows
             .iter()
-            .map(|(extra, _)| exchange(&server, &request(&server, "HEAD", Kind::Play, extra)))
+            .map(|row| exchange(&server, &request(&server, "HEAD", Kind::Play, &extra(row))))
             .collect();
         assert_eq!(source.stats().http_sent, 0, "a HEAD is sent no byte");
-        for ((extra, status), head) in rows.iter().zip(&heads) {
-            assert_eq!(head.status, *status, "{extra:?}");
-            assert!(head.body.is_empty(), "{extra:?}: a HEAD has no body");
-            let got = get(&server, Kind::Play, extra);
+        let there = |value: &'static str| Some(value).filter(|v| !v.is_empty());
+        for (row, head) in rows.iter().zip(&heads) {
+            let asked = row.range;
+            assert_eq!(head.status, row.status, "{asked:?}");
+            assert_eq!(head.header("Content-Length"), Some(row.length), "{asked:?}");
+            assert_eq!(
+                head.header("Content-Range"),
+                there(row.content_range),
+                "{asked:?}"
+            );
+            assert_eq!(
+                head.header("Accept-Ranges"),
+                there(row.accept_ranges),
+                "{asked:?}"
+            );
+            assert_eq!(head.header("Connection"), Some("close"), "{asked:?}");
+            assert!(head.body.is_empty(), "{asked:?}: a HEAD has no body");
+            let got = get(&server, Kind::Play, &extra(row));
             assert_eq!(
                 head.head, got.head,
-                "{extra:?}: the GET's status and headers"
+                "{asked:?}: the GET's status and headers"
             );
-            assert_eq!(got.body.is_empty(), *status == 416);
+            assert_eq!(got.body.len().to_string(), row.length, "{asked:?}");
         }
         assert_eq!(server.cuts(Kind::Play), 0, "a HEAD is whole without a body");
     });
@@ -728,9 +794,10 @@ fn a_head_over_8_kib_is_431() {
             assert_eq!(head.len(), len);
             head
         };
-        assert_partial(&exchange(&server, &head_of(MAX_HEAD)), 0, 9, SIZE);
-        assert_refused(&exchange(&server, &head_of(MAX_HEAD + 1)), 431);
-        assert_refused(&exchange(&server, &head_of(9 << 10)), 431);
+        // The test's own numbers, not the server's constant: 8 KiB is 8 × 1024 bytes.
+        assert_partial(&exchange(&server, &head_of(8 * 1024)), 0, 9, SIZE);
+        assert_refused(&exchange(&server, &head_of(8 * 1024 + 1)), 431);
+        assert_refused(&exchange(&server, &head_of(9 * 1024)), 431);
         // A head that never ends is answered once it is too long, not read on.
         let endless = vec![b'a'; 12 << 10];
         assert_refused(&exchange(&server, &endless), 431);
@@ -777,6 +844,88 @@ fn a_head_trickled_past_5_s_is_closed_unanswered() {
         let _ = trickle.write_all(&whole[3 * quarter..]);
         assert!(read_all(&mut trickle).is_empty(), "closed unanswered");
         assert_eq!(source.stats().http_sent, 10, "only the first was served");
+    });
+}
+
+/// A head whose last bytes come after the 5 s is not accepted, however soon they are read:
+/// the server's thread is waiting in its read when the clock passes the deadline, and the
+/// rest of the head arrives in that same wait.
+#[test]
+fn a_head_completed_after_5_s_is_closed_unanswered() {
+    bounded("a_head_completed_after_5_s_is_closed_unanswered", || {
+        let (source, _control) = threaded(SIZE);
+        let hand = Hand::new();
+        // A long tick: the thread looks at the clock only when a read has waited this long.
+        let config = Config {
+            tick: Some(Duration::from_millis(500)),
+            ..hand.config()
+        };
+        let server = Server::start_with(source.clone(), config).unwrap();
+        let watch = server.watch();
+        let whole = request(&server, "GET", Kind::Play, &range("bytes=0-9"));
+        let (first, rest) = whole.split_at(whole.len() / 2);
+        let mut late = connect(&server);
+        late.write_all(first).unwrap();
+        eventually("the connection is seated", || watch.open() == 1);
+        // Two waits ran out since the first half was there: it is read, and the thread is
+        // in a read again.
+        checks(&watch, 2);
+        hand.advance(Duration::from_secs(6));
+        late.write_all(rest).unwrap();
+        assert!(read_all(&mut late).is_empty(), "closed unanswered");
+        eventually("its thread ends", || watch.open() == 0);
+        assert_eq!(source.stats().http_sent, 0);
+    });
+}
+
+/// A head that is not HTTP's syntax gets 400: a field name that is not a token, and a NUL or
+/// a bare CR or LF in a field value or in the request target.
+#[test]
+fn a_head_that_is_not_http_syntax_is_400() {
+    bounded("a_head_that_is_not_http_syntax_is_400", || {
+        let (source, _control) = threaded(SIZE);
+        let server = Server::start(source.clone()).unwrap();
+        let (path, port) = (target(&server, Kind::Play), server.port());
+        let host = format!("Host: 127.0.0.1:{port}\r\n");
+        // Every character a field name may have besides letters and digits.
+        let fine = format!(
+            "GET {path} HTTP/1.1\r\n{host}X-!#$%&'*+.^_`|~9: v\r\nRange: bytes=0-9\r\n\r\n"
+        );
+        assert_partial(&exchange(&server, fine.as_bytes()), 0, 9, SIZE);
+        for line in [
+            // Field names that are not tokens.
+            "X(a): v",
+            "X@a: v",
+            "X/a: v",
+            "X\"a\": v",
+            "X a: v",
+            "Range : bytes=0-9",
+            "X\ta: v",
+            "X[]: v",
+            "Ünï: v",
+            // A NUL, a bare CR and a bare LF in a field value.
+            "X: a\0b",
+            "X: a\rb",
+            "X: a\nb",
+            "X: a\nHost: evil.example",
+            // And in a field name.
+            "X\0a: v",
+            "X\ra: v",
+            "X\na: v",
+        ] {
+            let head = format!("GET {path} HTTP/1.1\r\n{host}{line}\r\nRange: bytes=0-9\r\n\r\n");
+            let reply = exchange(&server, head.as_bytes());
+            assert_eq!(reply.status, 400, "{line:?}: {:?}", reply.head);
+            assert_refused(&reply, 400);
+        }
+        // In the request target.
+        for bad in ["\0", "\r", "\n"] {
+            let head = format!("GET {path}{bad}x HTTP/1.1\r\n{host}Range: bytes=0-9\r\n\r\n");
+            let reply = exchange(&server, head.as_bytes());
+            assert_eq!(reply.status, 400, "{bad:?} in the target: {:?}", reply.head);
+            assert_refused(&reply, 400);
+        }
+        assert_eq!(source.stats().http_sent, 10, "only the well-formed one");
     });
 }
 
@@ -868,14 +1017,7 @@ fn a_client_that_stops_reading_is_closed_after_60_s() {
         client.read_exact(&mut some).unwrap();
         // It reads no more. The server fills the socket and then waits on it: three waits
         // in a row with nothing more sent.
-        let mut sent = source.stats().http_sent;
-        loop {
-            checks(&watch, 3);
-            let now = std::mem::replace(&mut sent, source.stats().http_sent);
-            if now == sent {
-                break;
-            }
-        }
+        let sent = settled(&watch, &source);
         assert!(sent < size);
         hand.advance(Duration::from_secs(59));
         checks(&watch, 3);
@@ -901,6 +1043,451 @@ fn a_client_that_stops_reading_is_closed_after_60_s() {
     });
 }
 
+/// A client that takes exactly what the test grants: the server's writes go through a gate
+/// that lets `grant`ed bytes through, and is a wait that ran out while none are left. The
+/// client itself reads everything that comes.
+struct Paced {
+    hand: Hand,
+    server: Server,
+    watch: Watch,
+    left: Arc<AtomicU64>,
+    /// Reads until the server closes; what it got.
+    client: std::thread::JoinHandle<usize>,
+}
+
+fn paced(first: u64) -> Paced {
+    let (source, _control) = threaded(256 * MIB);
+    let hand = Hand::new();
+    let left = Arc::new(AtomicU64::new(first));
+    let budget = left.clone();
+    let seams = Seams {
+        before_write: Some(Arc::new(move |_, offered| {
+            let take = budget.load(Ordering::SeqCst).min(offered as u64);
+            if take == 0 {
+                std::thread::sleep(Duration::from_millis(1));
+                return Gate::Fail(ErrorKind::WouldBlock.into());
+            }
+            budget.fetch_sub(take, Ordering::SeqCst);
+            Gate::AtMost(take as usize)
+        })),
+        ..Seams::default()
+    };
+    let server = Server::start_with(source, hand.with(seams)).unwrap();
+    let watch = server.watch();
+    let mut stream = connect(&server);
+    stream
+        .write_all(&request(&server, "GET", Kind::Play, ""))
+        .unwrap();
+    let client = std::thread::spawn(move || read_all(&mut stream).len());
+    let paced = Paced {
+        hand,
+        server,
+        watch,
+        left,
+        client,
+    };
+    paced.taken();
+    paced
+}
+
+impl Paced {
+    /// Everything granted has gone, and the server waits on the client again.
+    fn taken(&self) {
+        eventually("the client takes what it was granted", || {
+            self.left.load(Ordering::SeqCst) == 0
+        });
+        checks(&self.watch, 3);
+    }
+
+    /// `bytes` more go to the client.
+    fn grant(&self, bytes: u64) {
+        self.left.fetch_add(bytes, Ordering::SeqCst);
+        self.taken();
+    }
+
+    /// `secs` pass on the server's clock, and the server has seen them.
+    fn pass(&self, secs: u64) {
+        self.hand.advance(Duration::from_secs(secs));
+        checks(&self.watch, 3);
+    }
+
+    fn open(&self) -> bool {
+        (self.watch.open(), self.server.cuts(Kind::Play)) == (1, 0)
+    }
+
+    /// One more second, and the response is closed as stalled. What the client got.
+    fn closes_after_a_second(self) -> usize {
+        self.hand.advance(Duration::from_secs(1));
+        eventually("the response is closed", || {
+            self.server.cuts(Kind::Play) == 1
+        });
+        let cut = self.server.last_cut(Kind::Play).unwrap();
+        assert_eq!(cut.reason, CutReason::Stalled);
+        let got = self.client.join().unwrap();
+        assert_eq!(cut.sent + content_head(), got as u64);
+        got
+    }
+}
+
+/// The length of a 200's head for the 256 MiB file.
+fn content_head() -> u64 {
+    "HTTP/1.1 200 OK\r\nAccept-Ranges: bytes\r\nContent-Length: 268435456\r\nConnection: close\r\n\r\n"
+        .len() as u64
+}
+
+/// The 60 s are not started again by a trickle: only once 64 KiB have gone since they last
+/// started. A client that takes 1 KiB every 50 s is closed at 60 s — and so is one that takes
+/// 32 KiB, or one byte short of what starts the timer again.
+#[test]
+fn a_trickle_does_not_keep_a_response_open() {
+    bounded("a_trickle_does_not_keep_a_response_open", || {
+        // The first 1000 bytes go at once: the head and the body's start.
+        for chunk in [1024, 32 * 1024, 64 * 1024 - 1001] {
+            let paced = paced(1000);
+            let resets = paced.watch.resets();
+            paced.pass(50);
+            assert!(paced.open(), "{chunk}: open at 50 s");
+            paced.grant(chunk);
+            assert_eq!(paced.watch.resets(), resets, "{chunk}: the timer runs on");
+            paced.pass(9);
+            assert!(paced.open(), "{chunk}: open at 59 s");
+            let got = paced.closes_after_a_second();
+            assert_eq!(got as u64, 1000 + chunk, "{chunk}");
+        }
+    });
+}
+
+/// A client that takes 64 KiB every 50 s is slow, not stalled: the 60 s start again at each
+/// take, and the response stays open — until it takes nothing for 60 s.
+#[test]
+fn a_client_taking_64_kib_per_50_s_stays_open() {
+    bounded("a_client_taking_64_kib_per_50_s_stays_open", || {
+        let paced = paced(1000);
+        for round in 1..=4 {
+            let resets = paced.watch.resets();
+            paced.pass(50);
+            paced.grant(64 * 1024);
+            assert_eq!(paced.watch.resets(), resets + 1, "at {} s", 50 * round);
+            assert!(paced.open(), "open at {} s", 50 * round);
+        }
+        paced.pass(59);
+        assert!(paced.open(), "open 59 s after its last take");
+        let got = paced.closes_after_a_second();
+        assert_eq!(got, 1000 + 4 * 64 * 1024);
+    });
+}
+
+/// A client that leaves while its response waits for a block — ffmpeg closes its connection
+/// at every seek — is found gone: the thread returns, its reader's wait is retired with
+/// nothing sent for it, and the seat is free. The client left: no cut.
+#[test]
+fn a_client_that_leaves_a_waiting_response_frees_its_seat() {
+    bounded(
+        "a_client_that_leaves_a_waiting_response_frees_its_seat",
+        || {
+            let slow = Link {
+                latency: Duration::from_millis(20),
+                rate: 500_000,
+                clip: None,
+                clock: Clock::Simulated,
+            };
+            let mut rig = stepped(24_000_000_000, slow);
+            let server = Server::start_with(rig.source.clone(), Hand::new().config()).unwrap();
+            let watch = server.watch();
+            let at = 10 * GIB + 1000;
+            let mut client = connect(&server);
+            client
+                .write_all(&request(
+                    &server,
+                    "GET",
+                    Kind::Play,
+                    &range(&format!("bytes={at}-")),
+                ))
+                .unwrap();
+            let head = read_head(&mut client);
+            assert!(head.starts_with("HTTP/1.1 206 "), "{head:?}");
+            // The engine is not stepped: the block it waits for does not arrive.
+            eventually("the response waits for its block", || rig.waiting() == 1);
+            assert!(rig.trace().is_empty());
+            assert_eq!((watch.open(), watch.left()), (1, 0));
+            drop(client);
+            eventually("the seat is free", || watch.open() == 0);
+            assert_eq!(watch.left(), 1);
+            assert_eq!(rig.waiting(), 0, "its wait is retired");
+            // The engine runs now, and has nothing to send for the reader that went.
+            rig.engine.pump();
+            assert!(
+                rig.trace().iter().all(|t| t.block.is_none()),
+                "a read was sent for a client that left: {:?}",
+                rig.trace()
+            );
+            // A client that stays is served, and is not found gone.
+            let mut stays = connect(&server);
+            stays
+                .write_all(&request(
+                    &server,
+                    "GET",
+                    Kind::Play,
+                    &range(&format!("bytes={at}-")),
+                ))
+                .unwrap();
+            let (got_tx, got) = mpsc::channel();
+            let reading = std::thread::spawn(move || {
+                read_head(&mut stays);
+                let mut bytes = vec![0u8; 480];
+                stays.read_exact(&mut bytes).unwrap();
+                got_tx.send(()).unwrap();
+                (bytes, stays)
+            });
+            rig.until("the client that stays gets its bytes", |_| {
+                got.try_recv().is_ok()
+            });
+            let (bytes, stays) = reading.join().unwrap();
+            assert!(bytes[..] == pattern(at, 480)[..]);
+            assert_eq!((watch.open(), watch.left()), (1, 1));
+            for kind in Kind::ALL {
+                assert_eq!(server.cuts(kind), 0, "a client that left is no cut");
+            }
+            assert_eq!(rig.source.stats().cuts, 0);
+            drop(stays);
+            eventually("its seat is free too", || watch.open() == 0);
+            assert_eq!(server.cuts(Kind::Play), 0);
+        },
+    );
+}
+
+/// A write that fails once `at` bytes have gone on the connection.
+fn failing_at(at: u64, error: impl Fn() -> std::io::Error + Send + Sync + 'static) -> Config {
+    let seams = Seams {
+        before_write: Some(Arc::new(move |written, _| match written >= at {
+            true => Gate::Fail(error()),
+            false => Gate::Go,
+        })),
+        ..Seams::default()
+    };
+    Config {
+        seams,
+        ..Config::real()
+    }
+}
+
+/// A write that fails for a reason that is not the client leaving ends the body short, and
+/// is a cut — in the account by the time the client sees the end.
+#[test]
+fn a_write_that_fails_is_a_cut_counted_before_the_client_sees_the_end() {
+    bounded(
+        "a_write_that_fails_is_a_cut_counted_before_the_client_sees_the_end",
+        || {
+            let size = 64 * MIB;
+            let (source, _control) = threaded(size);
+            let config = failing_at(200_000, || std::io::Error::other("injected write failure"));
+            let server = Server::start_with(source.clone(), config).unwrap();
+            let mut client = connect(&server);
+            client
+                .write_all(&request(
+                    &server,
+                    "GET",
+                    Kind::Render,
+                    &range("bytes=1000-"),
+                ))
+                .unwrap();
+            let head = read_head(&mut client);
+            let body = read_all(&mut client);
+            // The client has seen the end: no wait before the account is read.
+            assert_eq!(server.cuts(Kind::Render), 1, "counted before the close");
+            let length = content_length(&head);
+            assert_eq!(length, size - 1000);
+            assert!(body.len() + head.len() >= 200_000 && (body.len() as u64) < length);
+            assert!(body[..] == pattern(1000, body.len())[..]);
+            let cut = server.last_cut(Kind::Render).expect("the cut");
+            assert_eq!(
+                (cut.kind, cut.start, cut.sent, cut.length),
+                (Kind::Render, 1000, body.len() as u64, length)
+            );
+            match &cut.reason {
+                CutReason::Failed(why) => assert!(why.contains("injected write failure"), "{why}"),
+                other => panic!("{other:?}"),
+            }
+            assert_eq!(source.stats().cuts, 1);
+            assert_eq!((server.cuts(Kind::Play), server.cuts(Kind::Bulk)), (0, 0));
+        },
+    );
+}
+
+/// Only an error that clearly means the client left is nobody's cut.
+#[test]
+fn a_write_error_that_means_the_client_left_is_not_a_cut() {
+    bounded(
+        "a_write_error_that_means_the_client_left_is_not_a_cut",
+        || {
+            for kind in [
+                ErrorKind::BrokenPipe,
+                ErrorKind::ConnectionReset,
+                ErrorKind::ConnectionAborted,
+            ] {
+                let (source, _control) = threaded(64 * MIB);
+                let config = failing_at(200_000, move || std::io::Error::from(kind));
+                let server = Server::start_with(source.clone(), config).unwrap();
+                let watch = server.watch();
+                let mut client = connect(&server);
+                client
+                    .write_all(&request(&server, "GET", Kind::Render, ""))
+                    .unwrap();
+                let head = read_head(&mut client);
+                let body = read_all(&mut client);
+                assert!((body.len() as u64) < content_length(&head));
+                eventually("its thread ends", || watch.open() == 0);
+                assert_eq!(server.cuts(Kind::Render), 0, "{kind:?}");
+                assert_eq!(source.stats().cuts, 0, "{kind:?}");
+            }
+        },
+    );
+}
+
+/// A connection thread that panics mid-body leaves a body short of its length: the cut is in
+/// the account by the time the client sees the end, and the server goes on serving.
+#[test]
+fn a_panic_mid_body_is_a_cut_counted_before_the_client_sees_the_end() {
+    bounded(
+        "a_panic_mid_body_is_a_cut_counted_before_the_client_sees_the_end",
+        || {
+            let size = 64 * MIB;
+            let (source, _control) = threaded(size);
+            let seams = Seams {
+                before_write: Some(Arc::new(|written, _| {
+                    assert!(written < 200_000, "injected panic in a connection thread");
+                    Gate::Go
+                })),
+                ..Seams::default()
+            };
+            let config = Config {
+                seams,
+                ..Config::real()
+            };
+            let server = Server::start_with(source.clone(), config).unwrap();
+            let watch = server.watch();
+            let mut client = connect(&server);
+            client
+                .write_all(&request(&server, "GET", Kind::Play, &range("bytes=1000-")))
+                .unwrap();
+            let head = read_head(&mut client);
+            let body = read_all(&mut client);
+            // The client has seen the end: no wait before the account is read.
+            assert_eq!(server.cuts(Kind::Play), 1, "counted before the close");
+            let length = content_length(&head);
+            assert!(body.len() + head.len() >= 200_000 && (body.len() as u64) < length);
+            assert!(body[..] == pattern(1000, body.len())[..]);
+            let cut = server.last_cut(Kind::Play).expect("the cut");
+            assert_eq!(
+                (cut.kind, cut.start, cut.sent, cut.length),
+                (Kind::Play, 1000, body.len() as u64, length)
+            );
+            assert_eq!(
+                cut.reason,
+                CutReason::Failed("connection thread panicked".into())
+            );
+            assert_eq!(source.stats().cuts, 1);
+            // Its seat came back, and the next connection is served.
+            eventually("the seat is free", || watch.open() == 0);
+            assert_partial(&get(&server, Kind::Play, &range("bytes=0-9")), 0, 9, size);
+            assert_eq!(server.cuts(Kind::Play), 1);
+        },
+    );
+}
+
+/// The drop cancels every connection before it waits for the accept thread, and the accept
+/// thread accepts nothing after the stop: held right after an accept, with more connections
+/// waiting, it keeps no connection alive and takes none of those that wait.
+#[test]
+fn the_drop_cancels_before_it_waits_for_the_accept_thread() {
+    bounded(
+        "the_drop_cancels_before_it_waits_for_the_accept_thread",
+        || {
+            let (source, _control) = threaded(256 * MIB);
+            let (entered_tx, entered) = mpsc::channel();
+            let (release, held) = mpsc::channel::<()>();
+            let held = Mutex::new(held);
+            let armed = Arc::new(AtomicBool::new(false));
+            let accepts = Arc::new(AtomicU64::new(0));
+            let (arm, count) = (armed.clone(), accepts.clone());
+            let seams = Seams {
+                accepted: Some(Arc::new(move || {
+                    count.fetch_add(1, Ordering::SeqCst);
+                    if arm.swap(false, Ordering::SeqCst) {
+                        entered_tx.send(()).unwrap();
+                        let _ = held.lock().unwrap().recv();
+                    }
+                })),
+                ..Seams::default()
+            };
+            let server = Server::start_with(source.clone(), Hand::new().with(seams)).unwrap();
+            let (watch, port) = (server.watch(), server.port());
+            // A response under way, its client not reading.
+            let mut stuck = connect(&server);
+            stuck
+                .write_all(&request(&server, "GET", Kind::Play, ""))
+                .unwrap();
+            read_head(&mut stuck);
+            settled(&watch, &source);
+            // The accept thread is held right after its next accept, and more wait behind it.
+            armed.store(true, Ordering::SeqCst);
+            let _second = connect(&server);
+            entered
+                .recv_timeout(HANG)
+                .expect("the accept thread is held");
+            let _backlog: Vec<TcpStream> = (0..3).map(|_| connect(&server)).collect();
+            let dropping = std::thread::spawn(move || drop(server));
+            eventually(
+                "every connection is cancelled, the accept thread still held",
+                || watch.open() == 0,
+            );
+            assert!(
+                !dropping.is_finished(),
+                "the drop waits for the accept thread"
+            );
+            release.send(()).unwrap();
+            dropping.join().unwrap();
+            assert_eq!(
+                accepts.load(Ordering::SeqCst),
+                2,
+                "nothing is accepted after the stop"
+            );
+            assert!(TcpStream::connect(("127.0.0.1", port)).is_err());
+            for kind in Kind::ALL {
+                assert_eq!(watch.cuts(kind), 0);
+            }
+        },
+    );
+}
+
+/// The drop returns while connections keep coming, and every thread ends.
+#[test]
+fn the_drop_returns_while_connections_keep_coming() {
+    bounded("the_drop_returns_while_connections_keep_coming", || {
+        let (source, _control) = threaded(SIZE);
+        let server = Server::start(source).unwrap();
+        let (watch, port) = (server.watch(), server.port());
+        let made = Arc::new(AtomicU64::new(0));
+        let counter = made.clone();
+        // A few hundred at most, one after the other, ending at the first that fails.
+        let storm = std::thread::spawn(move || {
+            for _ in 0..300 {
+                if TcpStream::connect(("127.0.0.1", port)).is_err() {
+                    break;
+                }
+                counter.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+        eventually("connections are coming", || {
+            made.load(Ordering::SeqCst) >= 20 || storm.is_finished()
+        });
+        drop(server);
+        storm.join().unwrap();
+        eventually("every thread ends", || watch.open() == 0);
+        assert!(TcpStream::connect(("127.0.0.1", port)).is_err());
+    });
+}
+
 /// After the window closes the port refuses connections, and every thread returns: one
 /// blocked in a socket write, one blocked in `read_at`, one still waiting for its head. None
 /// of them is a cut.
@@ -911,26 +1498,29 @@ fn after_the_drop_the_port_refuses_and_blocked_threads_return() {
         || {
             // As a window's server waits: on the socket for all that is left of a deadline,
             // with no tick to look at the cancel flag between. The clock stands still.
-            let untimed = || Config {
+            let untimed = |seams: Seams| Config {
                 tick: None,
-                ..Hand::new().config()
+                ..Hand::new().with(seams)
             };
-            // A client that does not read: its thread blocks in the write, once the socket
-            // is full — nothing more is sent, look after look.
+            // A client that does not read: its thread says when it is about to write to a
+            // socket that takes nothing more, and blocks in that write.
+            let (blocking_tx, blocking) = mpsc::channel();
+            let seams = Seams {
+                blocking: Some(Arc::new(move || {
+                    let _ = blocking_tx.send(());
+                })),
+                ..Seams::default()
+            };
             let (fast, _fast_control) = threaded(256 * MIB);
-            let writing = Server::start_with(fast.clone(), untimed()).unwrap();
+            let writing = Server::start_with(fast.clone(), untimed(seams)).unwrap();
             let mut stuck = connect(&writing);
             stuck
                 .write_all(&request(&writing, "GET", Kind::Play, ""))
                 .unwrap();
             let head = read_head(&mut stuck);
-            let (mut sent, mut same) = (0, 0);
-            eventually("the write blocks on the full socket", || {
-                let now = fast.stats().http_sent;
-                same = if now == sent && now > 0 { same + 1 } else { 0 };
-                sent = now;
-                same >= 100
-            });
+            blocking
+                .recv_timeout(HANG)
+                .expect("the write blocks on the full socket");
             // A link that never answers: its thread blocks in `read_at`. And a connection
             // that sends nothing: its thread waits for the head.
             let never = Link {
@@ -940,7 +1530,7 @@ fn after_the_drop_the_port_refuses_and_blocked_threads_return() {
             };
             let (transport, control) = fake("/m.mp4", FakeFile::pattern(MIB), never);
             let slow = Source::open(transport, no_reopen(), Arc::new(|| {})).unwrap();
-            let reading = Server::start_with(slow.clone(), untimed()).unwrap();
+            let reading = Server::start_with(slow.clone(), untimed(Seams::default())).unwrap();
             let mut waiting = connect(&reading);
             waiting
                 .write_all(&request(&reading, "GET", Kind::Render, ""))
@@ -982,14 +1572,15 @@ fn after_the_drop_the_port_refuses_and_blocked_threads_return() {
 
 /// A client of a response under way, so that the test can act in the middle: it takes the
 /// head and `first` bytes of the body, says so (`there`), waits for the word (`go`), and then
-/// reads to the end. Its result is the head and the whole body it got.
+/// reads to the end. Its result is the head, the whole body it got, and the account's count
+/// for `kind` read the moment it saw the end.
 struct Midway {
     there: mpsc::Receiver<()>,
     go: mpsc::Sender<()>,
-    client: std::thread::JoinHandle<(String, Vec<u8>)>,
+    client: std::thread::JoinHandle<(String, Vec<u8>, u64)>,
 }
 
-fn midway(mut stream: TcpStream, first: usize) -> Midway {
+fn midway(mut stream: TcpStream, first: usize, watch: Watch, kind: Kind) -> Midway {
     let (there_tx, there) = mpsc::channel();
     let (go, gone) = mpsc::channel::<()>();
     let client = std::thread::spawn(move || {
@@ -999,14 +1590,16 @@ fn midway(mut stream: TcpStream, first: usize) -> Midway {
         there_tx.send(()).unwrap();
         let _ = gone.recv();
         body.extend_from_slice(&read_all(&mut stream));
-        (head, body)
+        let counted = watch.cuts(kind);
+        (head, body, counted)
     });
     Midway { there, go, client }
 }
 
 /// A response already started that cannot finish — the source changed, a read failed, the
 /// source was reloaded — is closed short of its `Content-Length`, with no byte of a newer
-/// version, and counted: by the server's account for its kind and on the stats line.
+/// version, and counted: by the server's account for its kind and on the stats line. The
+/// count is there when the client reads the end of the body: it is taken first.
 #[test]
 fn a_source_that_changes_during_a_response_cuts_it_short() {
     bounded(
@@ -1031,7 +1624,7 @@ fn a_source_that_changes_during_a_response_cuts_it_short() {
                 stream
                     .write_all(&request(&server, "GET", kind, &range("bytes=1000-")))
                     .unwrap();
-                let Midway { there, go, client } = midway(stream, first);
+                let Midway { there, go, client } = midway(stream, first, server.watch(), kind);
                 rig.until("the response is under way", |_| there.try_recv().is_ok());
                 assert_eq!(server.cuts(kind), 0);
                 // The engine is not stepped here: nothing more is fetched before the change.
@@ -1051,8 +1644,13 @@ fn a_source_that_changes_during_a_response_cuts_it_short() {
                     Ends::Reloaded => rig.source.request_reload(),
                 }
                 go.send(()).unwrap();
-                rig.until("the response is cut", |_| server.cuts(kind) == 1);
-                let (head, body) = client.join().unwrap();
+                // Until the client has seen the end — not until the count: that is the claim.
+                rig.until("the client sees the end", |_| client.is_finished());
+                let (head, body, counted) = client.join().unwrap();
+                assert_eq!(
+                    counted, 1,
+                    "{ends:?}: counted before the client saw the end"
+                );
                 assert!(head.starts_with("HTTP/1.1 206 "), "{head:?}");
                 let length = content_length(&head);
                 assert_eq!(length, size - 1000);
@@ -1221,11 +1819,21 @@ fn the_peer_check_finds_the_clients_end_by_the_reversed_tuple() {
     use std::net::SocketAddrV4;
     let end = |port| SocketAddrV4::new(Ipv4Addr::LOCALHOST, port);
     let (server, client) = (end(8080), end(50000));
-    assert!(peer_allowed(PROC_NET_TCP, server, client, 1000));
+    assert!(peer_allowed(PROC_NET_TCP.as_bytes(), server, client, 1000));
     // Another uid owns the client's end.
-    assert!(!peer_allowed(PROC_NET_TCP, server, client, 1001));
-    assert!(!peer_allowed(PROC_NET_TCP, end(8081), end(50001), 1000));
-    assert!(peer_allowed(PROC_NET_TCP, end(8081), end(50001), 65534));
+    assert!(!peer_allowed(PROC_NET_TCP.as_bytes(), server, client, 1001));
+    assert!(!peer_allowed(
+        PROC_NET_TCP.as_bytes(),
+        end(8081),
+        end(50001),
+        1000
+    ));
+    assert!(peer_allowed(
+        PROC_NET_TCP.as_bytes(),
+        end(8081),
+        end(50001),
+        65534
+    ));
     // The server's own end (same tuple, not reversed) proves nothing: with only it in the
     // table there is no entry.
     let without: String = PROC_NET_TCP
@@ -1233,26 +1841,35 @@ fn the_peer_check_finds_the_clients_end_by_the_reversed_tuple() {
         .filter(|line| !line.trim_start().starts_with("2:"))
         .map(|line| format!("{line}\n"))
         .collect();
-    assert!(!peer_allowed(&without, server, client, 1000), "absent");
-    assert!(!peer_allowed("", server, client, 1000), "an empty table");
     assert!(
-        !peer_allowed(PROC_NET_TCP, server, end(50002), 1000),
+        !peer_allowed(without.as_bytes(), server, client, 1000),
+        "absent"
+    );
+    assert!(
+        !peer_allowed("".as_bytes(), server, client, 1000),
+        "an empty table"
+    );
+    assert!(
+        !peer_allowed(PROC_NET_TCP.as_bytes(), server, end(50002), 1000),
         "no such port"
     );
     // Two entries for the one tuple.
     let line = PROC_NET_TCP.lines().nth(3).unwrap();
     let doubled = format!("{PROC_NET_TCP}{line}\n");
-    assert!(!peer_allowed(&doubled, server, client, 1000), "doubled");
+    assert!(
+        !peer_allowed(doubled.as_bytes(), server, client, 1000),
+        "doubled"
+    );
     // An entry whose uid is not a number is nobody's.
     let odd = PROC_NET_TCP.replace(
         "00000000  1000        0 31279",
         "00000000     x        0 31279",
     );
     assert_ne!(odd, PROC_NET_TCP);
-    assert!(!peer_allowed(&odd, server, client, 1000));
+    assert!(!peer_allowed(odd.as_bytes(), server, client, 1000));
     // An entry cut short of its uid.
     let short = "   2: 0100007F:C350 0100007F:1F90 01 00000000:00000000\n";
-    assert!(!peer_allowed(short, server, client, 1000));
+    assert!(!peer_allowed(short.as_bytes(), server, client, 1000));
 }
 
 /// On Linux, live: a client of sopen's own uid is served, and one run as another uid
@@ -1263,20 +1880,44 @@ fn a_client_of_another_uid_is_closed_unanswered() {
     bounded("a_client_of_another_uid_is_closed_unanswered", || {
         let (source, _control) = threaded(SIZE);
         let server = Server::start(source.clone()).unwrap();
-        // bash's own TCP client: the request, then everything that comes back.
+        // bash's own TCP client: it connects, sends the request, says who it is and that it
+        // did, and then prints everything that comes back. A send into a connection already
+        // closed must not end it before it has spoken.
         let script = format!(
-            "exec 3<>/dev/tcp/127.0.0.1/{} || exit 7; \
+            "trap '' PIPE; exec 3<>/dev/tcp/127.0.0.1/{} || exit 7; \
              printf 'GET {} HTTP/1.1\\r\\nHost: 127.0.0.1:{}\\r\\nRange: bytes=0-9\\r\\n\\r\\n' >&3; \
-             cat <&3",
+             echo \"uid=$(id -u) connected\"; cat <&3",
             server.port(),
             target(&server, Kind::Play),
             server.port()
         );
+        // SAFETY: `getuid` cannot fail and touches no memory.
+        let own_uid = unsafe { libc::getuid() };
+        // The client's uid, as it said it after connecting and sending, and what it got.
+        let spoke = |out: &std::process::Output| -> (u32, Vec<u8>) {
+            let text = String::from_utf8_lossy(&out.stdout).into_owned();
+            let said = text
+                .strip_prefix("uid=")
+                .and_then(|rest| rest.split_once(" connected\n"))
+                .and_then(|(uid, _)| uid.parse::<u32>().ok());
+            let Some(uid) = said else {
+                panic!(
+                    "the client did not say it connected: {:?} {:?} {:?}",
+                    out.status,
+                    text,
+                    String::from_utf8_lossy(&out.stderr)
+                );
+            };
+            let line = format!("uid={uid} connected\n");
+            (uid, out.stdout[line.len()..].to_vec())
+        };
         let own = Command::new("bash").args(["-c", &script]).output().unwrap();
+        let (uid, answer) = spoke(&own);
+        assert_eq!(uid, own_uid);
         assert!(
-            own.stdout.starts_with(b"HTTP/1.1 206 "),
+            answer.starts_with(b"HTTP/1.1 206 "),
             "sopen's own uid is served: {:?} {:?}",
-            String::from_utf8_lossy(&own.stdout),
+            String::from_utf8_lossy(&answer),
             String::from_utf8_lossy(&own.stderr)
         );
         let sudo = |args: &[&str]| {
@@ -1291,12 +1932,15 @@ fn a_client_of_another_uid_is_closed_unanswered() {
             return;
         }
         let sent = source.stats().http_sent;
+        // Its exit status is not looked at: reading a connection the server reset is an
+        // error to `cat`.
         let other = sudo(&["bash", "-c", &script]).unwrap();
-        assert_ne!(other.status.code(), Some(7), "it connected");
+        let (uid, answer) = spoke(&other);
+        assert_ne!(uid, own_uid, "the other client ran as another uid");
         assert!(
-            other.stdout.is_empty(),
+            answer.is_empty(),
             "another uid got an answer: {:?}",
-            String::from_utf8_lossy(&other.stdout)
+            String::from_utf8_lossy(&answer)
         );
         assert_eq!(source.stats().http_sent, sent);
     });
@@ -1364,24 +2008,29 @@ impl Run {
     }
 
     /// `(status, stdout, stderr)`.
-    fn wait(mut self, mut step: impl FnMut()) -> (std::process::ExitStatus, String, String) {
+    fn wait(&mut self, mut step: impl FnMut()) -> (std::process::ExitStatus, String, String) {
         let started = Instant::now();
         let status = loop {
             if let Some(status) = self.child.try_wait().unwrap() {
                 break status;
             }
-            if started.elapsed() >= HANG {
-                let _ = self.child.kill();
-                let _ = self.child.wait();
-                panic!(
-                    "the run did not end in {HANG:?}: {}",
-                    std::fs::read_to_string(&self.err).unwrap_or_default()
-                );
-            }
+            assert!(
+                started.elapsed() < HANG,
+                "the run did not end in {HANG:?}: {}",
+                std::fs::read_to_string(&self.err).unwrap_or_default()
+            );
             step();
         };
         let read = |p: &std::path::Path| std::fs::read_to_string(p).unwrap_or_default();
         (status, read(&self.out), read(&self.err))
+    }
+}
+
+/// A failed assertion leaves no ffmpeg running: the child is killed and reaped.
+impl Drop for Run {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
     }
 }
 
@@ -1393,7 +2042,7 @@ fn duration_of(tools: &crate::ffmpeg::Tools, input: &str, dir: &std::path::Path)
         args.extend(WHITELIST);
     }
     args.extend(["-show_entries", "format=duration", "-of", "csv=p=0", input]);
-    let run = Run::start(&tools.ffprobe, &args, dir, "probe");
+    let mut run = Run::start(&tools.ffprobe, &args, dir, "probe");
     let (status, out, err) = run.wait(|| std::thread::sleep(Duration::from_millis(10)));
     assert!(status.success(), "ffprobe {input}: {err}");
     out.trim()
@@ -1401,33 +2050,87 @@ fn duration_of(tools: &crate::ffmpeg::Tools, input: &str, dir: &std::path::Path)
         .unwrap_or_else(|_| panic!("a duration from ffprobe: {out:?} {err:?}"))
 }
 
+/// The reads the `sftp-server` was asked for, in order, as `(offset, length)`: its own log at
+/// `DEBUG1` has a line per request (`… read "<path>" (handle 0) off N len M`).
+fn reads_logged(log: &std::path::Path) -> Vec<(u64, u64)> {
+    std::fs::read_to_string(log)
+        .unwrap()
+        .lines()
+        .filter(|line| line.contains(": read \""))
+        .filter_map(|line| {
+            let (off, len) = line.rsplit_once(" off ")?.1.split_once(" len ")?;
+            Some((off.trim().parse().ok()?, len.trim().parse().ok()?))
+        })
+        .collect()
+}
+
+/// Nothing of the stream is on its way or waits to go: what was asked for is in the log.
+fn idle(source: &Source) {
+    eventually("the stream is idle", || {
+        let mut core = source.core();
+        !core.queued() && core.pf.adm.in_flight() == 0
+    });
+}
+
 /// ffmpeg and ffprobe read a file on the local `sftp-server` through the server: the probe
-/// gets the file's duration having read a small part of it, and a seek reads only around its
-/// target. Neither is a cut, though ffmpeg closes connections early at every seek.
+/// gets the file's duration having read its head and its `moov` at the end, and a seek reads
+/// only around its target — by the ranges the `sftp-server` itself logged, each phase apart.
+/// Neither is a cut, though ffmpeg closes connections early at every seek.
 #[test]
 fn ffmpeg_probes_and_seeks_through_the_server() {
     bounded("ffmpeg_probes_and_seeks_through_the_server", || {
         let Some(tools) = tools_or_skip() else { return };
-        let Some(fs) = SftpRemote::local_server() else {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = tmp.path().join("sftp-server.log");
+        let Some(fs) = SftpRemote::local_server_args(&["-l", "DEBUG1"], Some(&log)) else {
             return;
         };
-        let tmp = tempfile::tempdir().unwrap();
         let path = tone(&tools, tmp.path());
         let size = std::fs::metadata(&path).unwrap().len();
         let local = duration_of(&tools, path.to_str().unwrap(), tmp.path());
         assert!((local - TONE_S).abs() < 0.01, "{local}");
+        // The file's layout, read from the file: `mdat` first, the `moov` after it.
+        let front = std::fs::read(&path).unwrap()[..4096].to_vec();
+        let tag = front
+            .windows(4)
+            .position(|w| w == b"mdat")
+            .expect("an mdat atom at the front");
+        let mdat_size = u32::from_be_bytes(front[tag - 4..tag].try_into().unwrap()) as u64;
+        let (data, moov) = (tag as u64 + 4, tag as u64 - 4 + mdat_size);
+        assert!(moov > size - MIB && moov < size, "the moov is at the end");
+        // 48 kHz, stereo, 16 bits: 192 000 bytes a second.
+        let second = 192_000;
+        let target = data + 240 * second;
         let transport = Box::new(fs).into_ranged(path.to_str().unwrap()).unwrap();
         let source = Source::open(transport, no_reopen(), Arc::new(|| {})).unwrap();
         assert_eq!(source.size(), size);
         let server = Server::start(source.clone()).unwrap();
         let url = server.url(Kind::Play, "tone.mov");
+        // A `play` connection's reader, before any rate is set (06 §4).
+        let (ahead, behind) = limits(ReaderKind::Media { bytes_per_s: 0 });
+        // What may be fetched past a place when `demand` bytes from it were sent: the
+        // reader's window, what was in flight, and the blocks' edges.
+        let reach = |demand: u64| demand + ahead + CAP_MAX + 2 * BLOCK;
         // The probe: the head, then the `moov` at the end.
         let remote = duration_of(&tools, &url, tmp.path());
         assert!(
             (remote - local).abs() < 1e-6,
             "the duration through the server {remote}, of the file {local}"
         );
+        idle(&source);
         let probed = source.stats();
+        let probe_reads = reads_logged(&log);
+        assert!(!probe_reads.is_empty(), "the server's log has the reads");
+        let tail = moov.saturating_sub(behind + BLOCK);
+        for &(off, len) in &probe_reads {
+            assert!(
+                off + len <= reach(probed.http_sent) || off >= tail,
+                "the probe read {len} bytes at {off}: neither the head (to {}) nor the \
+                 moov (from {tail})",
+                reach(probed.http_sent)
+            );
+        }
+        assert!(probe_reads.iter().any(|&(off, _)| off >= tail));
         assert!(probed.http_sent > 0);
         assert!(
             probed.http_sent <= size / 8,
@@ -1438,19 +2141,55 @@ fn ffmpeg_probes_and_seeks_through_the_server() {
         let mut args = vec!["-hide_banner", "-loglevel", "error", "-nostdin"];
         args.extend(WHITELIST);
         args.extend(["-ss", "240", "-i", &url, "-t", "1", "-f", "null", "-"]);
-        let run = Run::start(&tools.ffmpeg, &args, tmp.path(), "seek");
+        let mut run = Run::start(&tools.ffmpeg, &args, tmp.path(), "seek");
         let (status, _out, err) = run.wait(|| std::thread::sleep(Duration::from_millis(10)));
         assert!(status.success(), "ffmpeg -ss 240: {err}");
+        idle(&source);
         let sought = source.stats();
+        let seek_reads = reads_logged(&log)[probe_reads.len()..].to_vec();
+        let seek_sent = sought.http_sent - probed.http_sent;
+        // ffmpeg starts at the chunk its sample is in: less than a second before it.
+        let (from, to) = (
+            target.saturating_sub(second + behind + BLOCK),
+            target + reach(seek_sent),
+        );
+        let span = |reads: &[(u64, u64)]| {
+            let low = reads.iter().map(|r| r.0).min().unwrap_or(0);
+            let high = reads.iter().map(|r| r.0 + r.1).max().unwrap_or(0);
+            (low, high, reads.iter().map(|r| r.1).sum::<u64>())
+        };
         eprintln!(
-            "byte server, ffmpeg on {size} bytes: probe sent {} (fetched {}), \
-             probe + seek sent {} (fetched {})",
-            probed.http_sent, probed.fetched.total, sought.http_sent, sought.fetched.total
+            "byte server, ffmpeg on {size} bytes: probe sent {} in {} reads {:?}; \
+             seek to byte {target} sent {seek_sent} in {} reads {:?}, window {from}..{to}",
+            probed.http_sent,
+            probe_reads.len(),
+            span(&probe_reads),
+            seek_reads.len(),
+            span(&seek_reads)
         );
+        assert!(!seek_reads.is_empty(), "the seek read its place");
+        // The run is a new ffmpeg: it reads the head again on a new connection, whose own
+        // readahead may pass what the probe's fetched, and the `moov`. Everything else it
+        // fetches lies around the target.
+        let mut around = 0;
+        for &(off, len) in &seek_reads {
+            let at_target = off >= from && off + len <= to;
+            assert!(
+                at_target || off + len <= reach(seek_sent) || off >= tail,
+                "the seek to byte {target} read {len} bytes at {off}: outside {from}..{to}, \
+                 the head (to {}) and the moov (from {tail})",
+                reach(seek_sent)
+            );
+            around += u64::from(at_target) * len;
+        }
+        assert!(around > 0, "nothing was fetched around the target");
         assert!(
-            sought.http_sent > probed.http_sent,
-            "the seek read its place"
+            seek_reads
+                .iter()
+                .any(|&(off, len)| off <= target && target < off + len + second),
+            "nothing was read at the target"
         );
+        // The coarse ceilings, as smoke checks.
         assert!(
             sought.http_sent <= size / 4,
             "probe and seek were sent {} of {size} bytes",
@@ -1521,14 +2260,16 @@ fn a_change_under_ffmpeg_is_a_cut_the_account_records() {
         let opened = source.opened().mtime.duration_since(UNIX_EPOCH).unwrap();
         file.set_modified(UNIX_EPOCH + Duration::from_secs(opened.as_secs() + 10))
             .unwrap();
-        let started = Instant::now();
-        while server.cuts(Kind::Render) == 0 {
-            assert!(started.elapsed() < HANG, "the change cuts nothing");
-            engine.step(Some(Duration::from_millis(50)));
-        }
+        // ffmpeg ends first, and the account is read the moment it has: nothing waits for
+        // the count in between.
         let (status, _out, err) = run.wait(|| {
             engine.step(Some(Duration::from_millis(50)));
         });
+        let counted = server.cuts(Kind::Render);
+        assert!(
+            counted >= 1,
+            "ffmpeg ended ({status}) and the account has no cut"
+        );
         let cut = server.last_cut(Kind::Render).expect("the cut");
         eprintln!(
             "byte server, a change under ffmpeg: {status}, stderr {:?}; cut {cut:?}",
@@ -1538,7 +2279,7 @@ fn a_change_under_ffmpeg_is_a_cut_the_account_records() {
         assert!(cut.sent < cut.length, "{cut:?}");
         assert_eq!(source.state(), State::Changed);
         let after = source.stats();
-        assert!(after.cuts >= 1 && after.cuts == server.cuts(Kind::Render));
+        assert_eq!(after.cuts, counted);
         assert!(after.http_sent < size, "ffmpeg was not sent the whole file");
         assert_eq!((server.cuts(Kind::Play), server.cuts(Kind::Bulk)), (0, 0));
     });
