@@ -154,8 +154,11 @@ contexts where it acts (list, viewer, git panel, tree, a dialog) and its `Comman
   `EOPNOTSUPP` included): the barrier fails, the batch's sources stay, and the report says the copy
   exists but this filesystem cannot confirm it is on disk. A copy has no source to keep: its end
   barrier's failure is a note.
-- **One connection of its own** per operation (`Connect`, as each viewer has), so the panel's
-  listing goes on meanwhile.
+- **Connections of its own** per operation, so the panel's listing goes on meanwhile: one when
+  source and target are on one host, one per host otherwise. They come from a per-host connector
+  of the file operations' own (`browser::OpsConnect`: this machine's file layer, or SFTP to the
+  host named in the target over its ssh master) — not the viewers' `Connect`, which opens only
+  the window's own host and has no file-operation primitives (`remote::ops::FileOps`).
 - **Progress and stopping**: an operation on more than one item, or on a file over 8 MiB, shows
   `copying 3/12 · name 45% · 12 MB / 30 MB · Esc stops` on the status row. A same-host copy runs the
   `copy-data` request in chunks of 8 MiB (`copy_to(n)`, not one `copy_all_to`), so progress moves and

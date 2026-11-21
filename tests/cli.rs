@@ -379,8 +379,35 @@ fn a_folder_opens_in_the_browser_not_the_editor() {
     assert_eq!(seen.trim(), real.join("a.txt").to_str().unwrap());
 }
 
+/// Runs sopen and waits at most 20 s for it: a run that is still there then (it opened a
+/// window and waits for its owner) is killed and reaped, and `None` is returned.
+fn sopen_within_20s(home: &Path, args: &[&str], env: &[(&str, &str)]) -> Option<Output> {
+    let mut cmd = sopen_command(home);
+    cmd.args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    let mut child = cmd.spawn().unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        if child.try_wait().unwrap().is_some() {
+            return Some(child.wait_with_output().unwrap());
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
 /// The browser's receipt hooks are read before its window opens: a `SOPEN_KEYS` step that names
 /// no key, and a `SOPEN_STATE` mode that is neither, end the run with the reason and no window.
+/// A run that does not end (it went on to open the window) is killed after 20 s and fails here.
 #[test]
 fn the_browsers_hooks_are_checked_before_its_window() {
     let tmp = tempfile::tempdir().unwrap();
@@ -389,37 +416,31 @@ fn the_browsers_hooks_are_checked_before_its_window() {
     // A display's name is enough to take the browser's route: the hooks are read before any
     // window is made.
     let display = ("DISPLAY", ":77");
-    let out = sopen(
-        tmp.path(),
-        &[dir.to_str().unwrap()],
-        &[display, ("SOPEN_KEYS", "F5,F99")],
-    );
-    assert!(!out.status.success());
-    let err = text(&out.stderr);
-    assert!(
-        err.contains("SOPEN_KEYS: 'F99': unknown key 'F99'"),
-        "{err}"
-    );
-    let out = sopen(
-        tmp.path(),
-        &[dir.to_str().unwrap()],
-        &[display, ("SOPEN_KEYS", "Hyper+F5")],
-    );
-    let err = text(&out.stderr);
-    assert!(
-        !out.status.success() && err.contains("unknown modifier 'Hyper'"),
-        "{err}"
-    );
-    let out = sopen(
-        tmp.path(),
-        &[dir.to_str().unwrap()],
-        &[display, ("SOPEN_STATE", "mode=both")],
-    );
-    let err = text(&out.stderr);
-    assert!(
-        !out.status.success() && err.contains("mode must be 'dual' or 'preview'"),
-        "{err}"
-    );
+    for (hook, value, want) in [
+        (
+            "SOPEN_KEYS",
+            "F5,F99",
+            "SOPEN_KEYS: 'F99': unknown key 'F99'",
+        ),
+        ("SOPEN_KEYS", "Hyper+F5", "unknown modifier 'Hyper'"),
+        (
+            "SOPEN_STATE",
+            "mode=both",
+            "mode must be 'dual' or 'preview'",
+        ),
+    ] {
+        let out = sopen_within_20s(
+            tmp.path(),
+            &[dir.to_str().unwrap()],
+            &[display, (hook, value)],
+        )
+        .unwrap_or_else(|| panic!("{hook}={value}: sopen went on to its window (killed)"));
+        let err = text(&out.stderr);
+        assert!(
+            !out.status.success() && err.contains(want),
+            "{hook}={value}: {err}"
+        );
+    }
 }
 
 /// No display (Linux over ssh): a folder cannot show the browser; it opens in the editor as

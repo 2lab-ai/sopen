@@ -90,8 +90,11 @@ impl Fx {
 #[derive(Default)]
 struct Seen {
     connects: usize,
-    /// The files `read_to` was started on, in order.
+    /// The files `read_to` was started on, in order, and the connection each was on.
     reads: Vec<String>,
+    read_on: Vec<usize>,
+    /// Bytes the reads handed on, over all of them.
+    bytes: u64,
     live: usize,
     peak: usize,
 }
@@ -105,6 +108,8 @@ struct Watching {
     seen: Shared,
     gate: Gate,
     hold: &'static str,
+    /// Which connection this is, counted from 1.
+    id: usize,
 }
 
 impl RemoteFs for Watching {
@@ -135,6 +140,7 @@ impl RemoteFs for Watching {
         {
             let mut seen = self.seen.lock().unwrap();
             seen.reads.push(p.to_string());
+            seen.read_on.push(self.id);
             seen.live += 1;
             seen.peak = seen.peak.max(seen.live);
         }
@@ -145,6 +151,7 @@ impl RemoteFs for Watching {
             for (i, chunk) in bytes.chunks(64 * 1024).enumerate() {
                 out.write_all(chunk)?;
                 done += chunk.len() as u64;
+                self.seen.lock().unwrap().bytes += chunk.len() as u64;
                 progress(done);
                 if i == 0 && held {
                     self.gate.hold();
@@ -180,12 +187,17 @@ impl RemoteFs for Watching {
 fn watching(seen: &Shared, gate: &Gate, hold: &'static str) -> Connect {
     let (seen, gate) = (seen.clone(), gate.clone());
     Arc::new(move || {
-        seen.lock().unwrap().connects += 1;
+        let id = {
+            let mut seen = seen.lock().unwrap();
+            seen.connects += 1;
+            seen.connects
+        };
         Ok(Box::new(Watching {
             fs: LocalFs::new(),
             seen: seen.clone(),
             gate: gate.clone(),
             hold,
+            id,
         }) as Box<dyn RemoteFs + Send>)
     })
 }
@@ -206,6 +218,47 @@ fn files_under(dir: &Path) -> Vec<String> {
                 walk(&path, base, out);
             } else {
                 out.push(path.strip_prefix(base).unwrap().display().to_string());
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(dir, dir, &mut out);
+    out.sort();
+    out
+}
+
+/// What is at `path` itself (never what a link points at): its type, inode, mode, size and
+/// time, and its bytes (a file) or its target (a link).
+fn entry_state(path: &Path) -> String {
+    let m = std::fs::symlink_metadata(path).unwrap();
+    let t = m.file_type();
+    let what = if t.is_symlink() {
+        format!("link to {}", std::fs::read_link(path).unwrap().display())
+    } else if t.is_dir() {
+        "folder".to_string()
+    } else if t.is_file() {
+        format!("file {:?}", std::fs::read(path).unwrap())
+    } else {
+        "special".to_string()
+    };
+    format!(
+        "{what} ino={} mode={:o} size={} mtime={}.{}",
+        m.ino(),
+        m.mode(),
+        m.len(),
+        m.mtime(),
+        m.mtime_nsec()
+    )
+}
+
+/// [`entry_state`] of `dir` and of everything under it, by path.
+fn tree_state(dir: &Path) -> Vec<(String, String)> {
+    fn walk(at: &Path, base: &Path, out: &mut Vec<(String, String)>) {
+        let name = at.strip_prefix(base).unwrap().display().to_string();
+        out.push((name, entry_state(at)));
+        if std::fs::symlink_metadata(at).unwrap().is_dir() {
+            for entry in std::fs::read_dir(at).unwrap().flatten() {
+                walk(&entry.path(), base, out);
             }
         }
     }
@@ -366,6 +419,14 @@ fn p4_leaving_a_preview_mid_read_cancels_it_and_the_next_waits_its_turn() {
     assert_eq!(seen.peak, 1, "never two reads at once");
     assert_eq!(seen.connects, 1, "one preview session");
     assert_eq!(fx.b.preview.spawned(), 2);
+    // The abandoned read stopped where it was let go: far short of the file's end (the 12
+    // bytes of notes.txt are in the count).
+    assert!(
+        seen.bytes < 256 * 1024,
+        "the cancelled read went on: {} of {} bytes handed on",
+        seen.bytes,
+        2 << 20
+    );
     let copies = preview_copies(&fx.cache);
     assert_eq!(copies.len(), 1, "only the shown preview's copy: {copies:?}");
     let kept: Vec<String> = files_under(&fx.cache)
@@ -630,49 +691,66 @@ fn enter_on_an_info_card_opens_the_file() {
         fx.right_text("image is").as_deref(),
         Some("image is 30000×30000; Enter opens it")
     );
+    let copies = preview_copies(&fx.cache);
+    assert_eq!(copies.len(), 1, "the card's private copy: {copies:?}");
+    let private = std::fs::metadata(&copies[0]).unwrap().ino();
     fx.key(Key::Enter);
     fx.wait(|b| b.opening.is_none());
     // The ordinary open: it fails as Enter on it fails in the list (the image does not decode),
     // said on the status row; the card's copy was published, not fetched again.
     assert!(fx.b.viewer.is_none());
     assert!(fx.b.status.error, "{}", fx.b.status.text);
-    // The preview is back once the opening is over (the bar is still on the file): its read is
-    // the second; the opening itself read nothing.
-    fx.rest();
-    assert_eq!(
-        seen.lock().unwrap().reads.len(),
-        2,
-        "the opening read nothing"
-    );
     let cached = crate::cache::cache_path(&fx.cache, "box", &format!("{}/wide.png", fx.root));
-    assert!(cached.exists(), "the card's copy was published");
+    assert_eq!(
+        std::fs::metadata(&cached).expect("published").ino(),
+        private,
+        "what is in the cache is the card's own copy, linked"
+    );
+    // The preview comes back once the opening is over (the bar is still on the file) and reads
+    // again, on the preview connection. The opening had a connection of its own: nothing was
+    // read on it.
+    fx.rest();
+    let seen = seen.lock().unwrap();
+    assert!(
+        seen.connects >= 2,
+        "the opening connected: {}",
+        seen.connects
+    );
+    assert!(
+        seen.read_on.iter().all(|id| *id == seen.read_on[0]),
+        "every read was the preview connection's: {:?}",
+        seen.read_on
+    );
 }
 
 /// 02 §4.4: the window closes while a preview reads: the read is cancelled and the window does
 /// not wait for its worker.
 #[test]
 fn closing_the_window_does_not_wait_for_a_preview() {
-    let (mut fx, _seen, gate) = watched("big.bin");
-    std::fs::write(format!("{}/big.bin", fx.root), vec![7u8; 2 << 20]).unwrap();
-    fx.relist();
-    fx.select("big.bin");
-    fx.drv.idle(&mut fx.b, REST);
-    gate.reached();
-    assert!(Window::close_requested(&mut fx.b));
-    let leftover = fx.b.leftover.clone();
-    let cache = fx.cache.clone();
-    let Fx { b, _tmp, .. } = fx;
-    drop(b);
-    // The worker is still held in its read: this returns all the same.
-    leftover.borrow_mut().finish();
-    gate.release();
-    // Its copy goes with the worker's end.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
-    while !preview_copies(&cache).is_empty() {
-        assert!(std::time::Instant::now() < deadline, "the copy was left");
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
-    drop(_tmp);
+    // Bounded from outside: a `finish` that waited for the held worker would never return.
+    bounded(30, || {
+        let (mut fx, _seen, gate) = watched("big.bin");
+        std::fs::write(format!("{}/big.bin", fx.root), vec![7u8; 2 << 20]).unwrap();
+        fx.relist();
+        fx.select("big.bin");
+        fx.drv.idle(&mut fx.b, REST);
+        gate.reached();
+        assert!(Window::close_requested(&mut fx.b));
+        let leftover = fx.b.leftover.clone();
+        let cache = fx.cache.clone();
+        let Fx { b, _tmp, .. } = fx;
+        drop(b);
+        // The worker is still held in its read: this returns all the same.
+        leftover.borrow_mut().finish();
+        gate.release();
+        // Its copy goes with the worker's end.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while !preview_copies(&cache).is_empty() {
+            assert!(std::time::Instant::now() < deadline, "the copy was left");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        drop(_tmp);
+    });
 }
 
 /// A cache that cannot hold the preview folder: the side says why, in place of the preview —
@@ -692,6 +770,12 @@ fn a_preview_space_that_cannot_be_made_is_said_in_the_side() {
         "the side is the preview's, not the list"
     );
     assert!(fx.b.viewer.is_none());
+    // Enter still opens the file (a local file is read in place: no cache is needed).
+    fx.key(Key::Enter);
+    fx.settle();
+    assert!(fx.b.viewer.is_some(), "{}", fx.b.status.text);
+    assert!(fx.drv.find_text("plain notes").is_some());
+    assert!(fx.label("Exit"), "the viewer's row");
 }
 
 /// 02 §9: `mode=dual` opens the browser in dual mode and `bar=NAME` puts the bar on an entry
@@ -1000,6 +1084,8 @@ fn k_c2_a_name_in_the_way_asks_skip_rename_or_cancel() {
     let there = format!("{alpha}/notes.txt");
     std::fs::write(&there, "what was there\n").unwrap();
     let before = std::fs::metadata(&there).unwrap().ino();
+    let source = PathBuf::from(format!("{}/notes.txt", fx.root));
+    let source_was = entry_state(&source);
     let untouched = |why: &str| {
         assert_eq!(
             std::fs::read_to_string(&there).unwrap(),
@@ -1007,6 +1093,7 @@ fn k_c2_a_name_in_the_way_asks_skip_rename_or_cancel() {
             "{why}"
         );
         assert_eq!(std::fs::metadata(&there).unwrap().ino(), before, "{why}");
+        assert_eq!(entry_state(&source), source_was, "the source, after {why}");
     };
     fx.select("notes.txt");
     let ask = |fx: &mut Fx| {
@@ -1060,10 +1147,22 @@ fn k_c3_a_folder_copy_keeps_its_link_and_reports_the_fifo() {
     std::os::unix::fs::symlink("inner.txt", format!("{alpha}/link")).unwrap();
     let fifo = std::ffi::CString::new(format!("{alpha}/pipe")).unwrap();
     assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+    let source_was = tree_state(Path::new(&alpha));
+    assert!(source_was
+        .iter()
+        .any(|(n, s)| n == "link" && s.starts_with("link to inner.txt")));
+    assert!(source_was
+        .iter()
+        .any(|(n, s)| n == "pipe" && s.starts_with("special")));
     fx.select("alpha");
     fx.key(Key::F5);
     fx.key(Key::Enter);
     fx.wait(|b| !b.ops.busy());
+    assert_eq!(
+        tree_state(Path::new(&alpha)),
+        source_was,
+        "the source folder is as it was: every file, the link and the fifo"
+    );
     let copy = format!("{beta}/alpha");
     assert_eq!(
         std::fs::read_to_string(format!("{copy}/inner.txt")).unwrap(),
@@ -1109,12 +1208,14 @@ fn k_c4_esc_stops_a_running_operation() {
             done: 0,
             total: 0,
         });
-        // Held until Esc reaches the engine's end of the stop flag.
+        // Held until Esc reaches the engine's end of the stop flag — or, a test gone wrong, for
+        // 20 s: the worker then ends by itself, and the test fails on what it never saw.
         let flag = link.stop_flag();
-        while !flag.load(Ordering::Relaxed) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        while !flag.load(Ordering::Relaxed) && std::time::Instant::now() < deadline {
             std::thread::yield_now();
         }
-        saw.store(true, Ordering::Relaxed);
+        saw.store(flag.load(Ordering::Relaxed), Ordering::Relaxed);
         Report {
             items: names
                 .into_iter()
@@ -1461,29 +1562,610 @@ fn k_c4_esc_reaches_the_real_engine() {
     assert!(!fx.b.ops.holds_keyboard());
 }
 
-/// 02 §6: closing the window during a file operation waits for it — it is not stopped: the
-/// copy is there once [`open`]'s wait is over.
+// ---------------------------------------------------------------------------------------------
+// Round A.
+
+/// The hex preview in the browser's half: no path row under the side's frame (which names the
+/// file), and rows of eight bytes with their ASCII column whole.
 #[test]
-fn closing_the_window_waits_for_a_running_operation() {
+fn the_hex_preview_fits_the_side() {
+    let mut fx = fixture();
+    fx.bar_on("data.bin");
+    assert!(fx.on_right("00 01 02 03 04 05 06 07"), "eight bytes a row");
+    assert!(fx.on_right("0008(0008)"));
+    let ascii: String = (0x30..0x38u8).map(chrome::cp437).collect();
+    assert!(fx.on_right(&ascii), "the ASCII column is whole");
+    let title = fx.framed(&format!("{}/data.bin", fx.root));
+    let named = fx.drv.texts_starting_with(&title).len();
+    assert_eq!(named, 1, "the file is named once, in the side's frame");
+}
+
+/// While a name-in-the-way question is open the status row names the item it asks about, not
+/// the one before it.
+#[test]
+fn the_status_row_names_the_item_a_question_is_about() {
     let mut fx = fixture();
     let alpha = fx.other_into("alpha");
+    std::fs::write(format!("{alpha}/notes.txt"), "there\n").unwrap();
+    fx.select("main.rs");
+    fx.key(Key::Space);
+    fx.key(Key::Space);
+    fx.key(Key::F5);
+    fx.key(Key::Enter);
+    fx.wait(|b| b.ops.holds_keyboard());
+    assert!(fx.drv.find_text("Name exists").is_some());
+    assert_eq!(
+        fx.status(),
+        "copying 2/2 · notes.txt · waiting for an answer"
+    );
+    fx.drv.click_text(&mut fx.b, "Skip");
+    fx.wait(|b| !b.ops.busy());
+    fx.key(Key::Enter);
+}
+
+/// S1's key help says what Esc does in S1: nothing of the pin (S2).
+#[test]
+fn the_key_help_names_no_key_of_a_later_slice() {
+    let page = help::for_context(Context::List, view::Mode::Preview, &[]);
+    let esc = page.lines.iter().find(|l| l.keys == "Esc").expect("Esc");
+    assert_eq!(esc.what, "Stop a fetch or a file operation");
+    assert!(
+        page.lines.iter().all(|l| !l.what.contains("pin")),
+        "{page:?}"
+    );
+}
+
+/// A stand-in engine held at `gate`, then — `ask` — asking about its first name, and done.
+fn held_engine(gate: &Gate, ask: bool) -> ops::Run {
+    let gate = gate.clone();
+    Arc::new(move |job: ops::Job, link: &ops::Link| {
+        let ops::Job::Transfer { names, .. } = job else {
+            return Report::default();
+        };
+        gate.hold();
+        let name = names[0].clone();
+        let outcome = if ask {
+            let reply = link.ask(crate::fileops::Clash {
+                name: name.clone(),
+                free: "free.txt".to_string(),
+            });
+            match reply.answer {
+                crate::fileops::Answer::Skip => ItemOutcome::Skipped,
+                crate::fileops::Answer::Rename(to) => ItemOutcome::Renamed(to),
+                crate::fileops::Answer::Cancel => ItemOutcome::NotReached,
+            }
+        } else {
+            ItemOutcome::Done
+        };
+        Report {
+            items: vec![Item { name, outcome }],
+            notes: Vec::new(),
+        }
+    })
+}
+
+/// A file operation is polled whatever the window shows: its question arriving while a viewer
+/// is open is said on the status row — the viewer is left as it is, no dialog over it — and is
+/// asked once the list shows again.
+#[test]
+fn a_question_waits_for_the_list_while_a_viewer_is_open() {
+    let mut fx = fixture();
+    fx.other_into("alpha");
     let gate = Gate::default();
-    fx.b.set_ops_connect(gated_ops(&gate));
+    fx.b.set_ops_run(held_engine(&gate, true));
     fx.select("main.rs");
     fx.key(Key::F5);
     fx.key(Key::Enter);
     gate.reached();
-    assert!(Window::close_requested(&mut fx.b));
-    let leftover = fx.b.leftover.clone();
-    let Fx { b, _tmp, .. } = fx;
-    drop(b);
-    assert!(!Path::new(&format!("{alpha}/main.rs")).exists());
+    // (Not `open`: the window is not settled while the operation runs.)
+    fx.select("notes.txt");
+    fx.key(Key::Enter);
+    fx.wait(|b| b.viewer.as_ref().is_some_and(|v| v.embedded.window.ready()));
     gate.release();
-    leftover.borrow_mut().finish();
+    fx.wait(|b| b.ops.holds_keyboard());
+    assert!(fx.b.viewer.is_some());
     assert_eq!(
-        std::fs::read_to_string(format!("{alpha}/main.rs")).unwrap(),
-        RUST,
-        "the operation ran to its end"
+        fx.status(),
+        "copy waiting for an answer — F3 back to the list"
     );
-    drop(_tmp);
+    assert!(
+        fx.drv.find_text("Name exists").is_none(),
+        "no dialog over it"
+    );
+    assert!(
+        fx.drv.find_text("plain notes").is_some(),
+        "the viewer as it was"
+    );
+    fx.key(Key::F3);
+    fx.drv.idle(&mut fx.b, 2);
+    assert!(fx.b.viewer.is_none());
+    assert!(
+        fx.drv.find_text("Name exists").is_some(),
+        "asked in the list"
+    );
+    fx.drv.click_text(&mut fx.b, "Skip");
+    fx.wait(|b| !b.ops.busy());
+    assert!(fx.drv.text_starting_with("skipped").is_some(), "the report");
+    fx.key(Key::Enter);
+}
+
+/// An operation that ends while a viewer is open is told when the list shows again, and the
+/// panels are re-read meanwhile.
+#[test]
+fn an_operation_ending_under_a_viewer_is_told_in_the_list() {
+    let mut fx = fixture();
+    let alpha = fx.other_into("alpha");
+    let gate = Gate::default();
+    fx.b.set_ops_run(held_engine(&gate, false));
+    fx.select("main.rs");
+    fx.key(Key::F5);
+    fx.key(Key::Enter);
+    gate.reached();
+    // (Not `open`: the window is not settled while the operation runs.)
+    fx.select("notes.txt");
+    fx.key(Key::Enter);
+    fx.wait(|b| b.viewer.as_ref().is_some_and(|v| v.embedded.window.ready()));
+    std::fs::write(format!("{alpha}/main.rs"), RUST).unwrap();
+    gate.release();
+    fx.wait(|b| !b.ops.busy() && b.listing.is_empty());
+    assert!(fx.b.viewer.is_some(), "the viewer stays");
+    assert!(
+        fx.names(1).contains(&"main.rs".to_string()),
+        "re-read under it"
+    );
+    fx.key(Key::Escape);
+    fx.drv.idle(&mut fx.b, 2);
+    assert!(fx.b.viewer.is_none());
+    assert_eq!(fx.status(), format!("copied main.rs to {alpha}"));
+}
+
+/// A re-read that finds the file under the bar changed (size or time) prepares its preview
+/// again, the bar unmoved.
+#[test]
+fn a_reread_refreshes_the_preview_of_a_changed_file() {
+    let mut fx = fixture();
+    fx.bar_on("notes.txt");
+    assert!(fx.on_right("plain notes"));
+    let before = fx.b.preview.spawned();
+    // Unchanged: a re-read prepares nothing.
+    fx.with(Key::R, command(false));
+    fx.rest();
+    assert_eq!(fx.b.preview.spawned(), before, "unchanged: kept");
+    std::fs::write(format!("{}/notes.txt", fx.root), "other words now\n").unwrap();
+    fx.with(Key::R, command(false));
+    fx.rest();
+    assert_eq!(fx.current(), "notes.txt");
+    assert!(fx.on_right("other words now"), "prepared again");
+    assert!(!fx.on_right("plain notes"));
+    assert_eq!(fx.b.preview.spawned(), before + 1);
+}
+
+/// 02 §4.3's deadline in the browser's own preview, on a clock of the test's (each look at it
+/// is three seconds later): the preparation stops at five seconds after its read and the side
+/// shows the card — no wall clock is waited for.
+#[test]
+fn the_previews_deadline_runs_on_an_injected_clock() {
+    let mut fx = fixture();
+    let start = std::time::Instant::now();
+    let looks = Arc::new(AtomicU64::new(0));
+    fx.b.preview.set_budget(Box::new(move || {
+        let looks = looks.clone();
+        prepare::Budget::with_clock(
+            prepare::Limits::PREVIEW,
+            Box::new(move || start + Duration::from_secs(3 * looks.fetch_add(1, Ordering::SeqCst))),
+        )
+    }));
+    fx.bar_on("notes.txt");
+    assert!(fx.on_right("File Info"), "the card");
+    assert_eq!(
+        fx.right_text("the preview took over").as_deref(),
+        Some("the preview took over 5 s: Enter opens it")
+    );
+    assert!(!fx.on_right("plain notes"));
+}
+
+// ---------------------------------------------------------------------------------------------
+// Round B (review round 1).
+
+/// Runs `body` on a thread of its own and fails when it has not ended in `secs`: a test of
+/// something that must not block (or must end) cannot hang the run.
+fn bounded(secs: u64, body: impl FnOnce() + Send + 'static) {
+    let (tx, rx) = mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        body();
+        let _ = tx.send(());
+    });
+    match rx.recv_timeout(Duration::from_secs(secs)) {
+        Ok(()) => worker.join().unwrap(),
+        // The body panicked: its own message.
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            std::panic::resume_unwind(worker.join().unwrap_err())
+        }
+        Err(mpsc::RecvTimeoutError::Timeout) => panic!("not over in {secs} s"),
+    }
+}
+
+/// Waits (bounded, without a pass of the window) until `done`.
+fn until(what: &str, mut done: impl FnMut() -> bool) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while !done() {
+        assert!(std::time::Instant::now() < deadline, "{what}: not in 20 s");
+        std::thread::yield_now();
+    }
+}
+
+/// A listing for `panel` that stays running until the test answers it.
+fn held_listing(fx: &mut Fx, panel: usize, dir: &str) -> mpsc::Sender<Result<Listed>> {
+    let (tx, rx) = mpsc::channel();
+    fx.b.listing.push(Listing {
+        panel: Some(panel),
+        dir: dir.to_string(),
+        select: None,
+        keep: None,
+        rx,
+    });
+    tx
+}
+
+/// B1: Esc stops a running file operation while a listing is still on its way: a slow or stuck
+/// listing never makes a copy unstoppable.
+#[test]
+fn esc_stops_an_operation_while_a_listing_is_pending() {
+    let mut fx = fixture();
+    let alpha = fx.other_into("alpha");
+    let gate = Gate::default();
+    fx.b.set_ops_run(held_engine(&gate, false));
+    fx.select("main.rs");
+    fx.key(Key::F5);
+    fx.key(Key::Enter);
+    gate.reached();
+    let listing = held_listing(&mut fx, 1, &alpha);
+    fx.key(Key::Escape);
+    assert_eq!(
+        fx.b.ops.status().map(|s| s.text).as_deref(),
+        Some("stopping…"),
+        "Esc reached the operation, the listing still pending"
+    );
+    assert_eq!(fx.b.listing.len(), 1);
+    // The list's other keys still wait for the listing.
+    let at = fx.current();
+    fx.key(Key::ArrowDown);
+    assert_eq!(fx.current(), at);
+    gate.release();
+    drop(listing);
+    fx.wait(|b| !b.ops.busy() && b.listing.is_empty());
+}
+
+/// B2: a listing's failure stays said until that panel lists again — another panel's good
+/// listing does not clear it, in either order of completion.
+#[test]
+fn a_panels_listing_error_outlives_another_panels_success() {
+    let entries = || -> Result<Listed> { Ok((LocalFs::new().list_entries("/")?, None)) };
+    for failure_first in [true, false] {
+        let mut fx = fixture();
+        let root = fx.root.clone();
+        let bad = held_listing(&mut fx, 0, &root);
+        let good = held_listing(&mut fx, 1, "/");
+        let fail = || {
+            bad.send(Err(anyhow::anyhow!("the left one failed")))
+                .unwrap()
+        };
+        if failure_first {
+            fail();
+            fx.drv.idle(&mut fx.b, 1);
+            good.send(entries()).unwrap();
+        } else {
+            good.send(entries()).unwrap();
+            fx.drv.idle(&mut fx.b, 1);
+            fail();
+        }
+        fx.drv.idle(&mut fx.b, 2);
+        assert_eq!(fx.b.panels[1].dir, "/", "the good one is shown");
+        let said = fx.b.status_line();
+        assert!(
+            said.error && said.text.contains("the left one failed"),
+            "failure first {failure_first}: {}",
+            said.text
+        );
+        // Both in one pass, too.
+        let bad = held_listing(&mut fx, 0, &root);
+        let good = held_listing(&mut fx, 1, "/");
+        bad.send(Err(anyhow::anyhow!("failed again"))).unwrap();
+        good.send(entries()).unwrap();
+        fx.drv.idle(&mut fx.b, 2);
+        let said = fx.b.status_line();
+        assert!(
+            said.error && said.text.contains("failed again"),
+            "{}",
+            said.text
+        );
+        // Its own panel's good listing clears it.
+        fx.b.list(Some(0), root, None, None);
+        fx.settle();
+        let said = fx.b.status_line();
+        assert!(!said.error, "{}", said.text);
+    }
+}
+
+/// B3: a rename's new name gets the bar in the panel the rename was made in, whichever panel
+/// has the keyboard when it completes. (No key moves the keyboard while the rename field is
+/// open; the test moves it directly.)
+#[test]
+fn a_renames_bar_goes_to_the_panel_it_was_made_in() {
+    let mut fx = fixture();
+    let gate = Gate::default();
+    fx.b.set_ops_connect(gated_ops(&gate));
+    fx.select("main.rs");
+    fx.key(Key::F2);
+    fx.with(Key::A, command(false));
+    fx.typed("prog.rs");
+    fx.key(Key::Enter);
+    gate.reached();
+    fx.b.active = 1;
+    gate.release();
+    fx.wait(|b| !b.ops.busy() && b.listing.is_empty());
+    let bar = |fx: &Fx, i: usize| fx.b.panels[i].current().unwrap().name.clone();
+    assert_eq!(bar(&fx, 0), "prog.rs", "the panel the rename was made in");
+    assert_eq!(bar(&fx, 1), "..", "the other panel's bar stays");
+    assert_eq!(fx.b.ops.renaming(), None);
+}
+
+/// B7: Esc in the middle of a transfer, with the real engine: the worker is held after bytes
+/// were written; Esc, then on — the source is as it was, nothing is under the target name, no
+/// staging temp is left, and the report says it stopped.
+#[test]
+fn k_c4_esc_mid_transfer_leaves_nothing_half_made() {
+    let mut fx = fixture();
+    // Three steps of the engine's copy: progress comes between them.
+    let size = 3 * crate::remote::ops::COPY_STEP;
+    let src = format!("{}/large.bin", fx.root);
+    std::fs::File::create(&src).unwrap().set_len(size).unwrap();
+    std::fs::write(format!("{}/next.txt", fx.root), "after\n").unwrap();
+    fx.relist();
+    let alpha = fx.other_into("alpha");
+    let before = std::fs::metadata(&src).unwrap();
+    let gate = Gate::default();
+    let (held, once) = (gate.clone(), Arc::new(AtomicBool::new(false)));
+    let wrote = Arc::new(AtomicU64::new(0));
+    let saw = wrote.clone();
+    let local: OpsConnect = Arc::new(|_: Option<&str>| {
+        Ok(Box::new(LocalFs::new()) as Box<dyn crate::remote::ops::FileOps + Send>)
+    });
+    fx.b.set_ops_seen(
+        local,
+        Arc::new(move |p: &Progress| {
+            let mid = p.name == "large.bin" && p.done > 0 && p.done < p.total;
+            if mid && !once.swap(true, Ordering::SeqCst) {
+                saw.store(p.done, Ordering::SeqCst);
+                held.hold();
+            }
+        }),
+    );
+    fx.select("large.bin");
+    fx.key(Key::Space);
+    fx.select("next.txt");
+    fx.key(Key::Space);
+    fx.key(Key::F5);
+    assert!(fx.drv.find_text("Copy 2 items").is_some());
+    fx.key(Key::Enter);
+    gate.reached();
+    let done = wrote.load(Ordering::SeqCst);
+    assert!(
+        done > 0 && done < size,
+        "held mid-file, {done} of {size} written"
+    );
+    let staged: Vec<String> = files_under(Path::new(&alpha))
+        .into_iter()
+        .filter(|f| f.contains(".sopen-"))
+        .collect();
+    assert_eq!(staged.len(), 1, "the copy is being staged: {staged:?}");
+    fx.key(Key::Escape);
+    gate.release();
+    fx.wait(|b| !b.ops.busy());
+    // Independently of the report: what is on disk.
+    let after = std::fs::metadata(&src).unwrap();
+    assert_eq!(
+        (after.ino(), after.len(), after.mtime()),
+        (before.ino(), size, before.mtime())
+    );
+    assert!(Path::new(&format!("{}/next.txt", fx.root)).exists());
+    assert_eq!(
+        files_under(Path::new(&alpha)),
+        ["inner.txt"],
+        "no target, no staging temp, nothing of the item not reached"
+    );
+    let line = fx
+        .drv
+        .text_starting_with("failed")
+        .expect("the stopped item");
+    assert!(
+        line.contains("large.bin") && line.contains("stopped"),
+        "{line}"
+    );
+    assert!(fx
+        .drv
+        .text_starting_with("not reached")
+        .is_some_and(|l| l.ends_with("next.txt")));
+    fx.key(Key::Enter);
+}
+
+/// B8: closing the window during a file operation: [`Leftover::finish`] waits for it. The
+/// operation asks about a name once the window is gone; only the wait answers that (a dropped
+/// operation is told to stop instead), so an answer without the stop flag is the proof that
+/// `finish` was waiting while the worker still ran — it then copies, and `finish` returns only
+/// after that.
+#[test]
+fn closing_the_window_waits_for_a_running_operation() {
+    bounded(60, || {
+        let mut fx = fixture();
+        let alpha = fx.other_into("alpha");
+        let gate = Gate::default();
+        let held = gate.clone();
+        let answered_by_wait = Arc::new(Mutex::new(None));
+        let (answered, returned) = (answered_by_wait.clone(), Arc::new(AtomicBool::new(false)));
+        let finish_returned = returned.clone();
+        let local: OpsConnect = Arc::new(|_: Option<&str>| {
+            Ok(Box::new(LocalFs::new()) as Box<dyn crate::remote::ops::FileOps + Send>)
+        });
+        let real = engine(local);
+        fx.b.set_ops_run(Arc::new(move |job: ops::Job, link: &ops::Link| {
+            held.hold();
+            let reply = link.ask(crate::fileops::Clash {
+                name: "main.rs".to_string(),
+                free: "main-1.rs".to_string(),
+            });
+            let by_wait = !link.stopped() && reply.answer == crate::fileops::Answer::Cancel;
+            *answered.lock().unwrap() = Some((by_wait, finish_returned.load(Ordering::SeqCst)));
+            real(job, link)
+        }));
+        fx.select("main.rs");
+        fx.key(Key::F5);
+        fx.key(Key::Enter);
+        gate.reached();
+        assert!(Window::close_requested(&mut fx.b));
+        let (leftover, root) = (fx.b.leftover.clone(), fx.root.clone());
+        let Fx { b, _tmp, .. } = fx;
+        drop(b);
+        assert!(!Path::new(&format!("{alpha}/main.rs")).exists());
+        gate.release();
+        leftover.borrow_mut().finish();
+        returned.store(true, Ordering::SeqCst);
+        assert_eq!(
+            *answered_by_wait.lock().unwrap(),
+            Some((true, false)),
+            "the wait answered the worker's question, before finish returned"
+        );
+        assert_eq!(
+            std::fs::read_to_string(format!("{alpha}/main.rs")).unwrap(),
+            RUST
+        );
+        assert_eq!(
+            std::fs::read_to_string(format!("{root}/main.rs")).unwrap(),
+            RUST
+        );
+        drop(_tmp);
+    });
+}
+
+/// B14: a preparation that finished just before the bar left its file is not shown: the side
+/// stays frozen on its last progress frame until the display commits (02 §3.1).
+#[test]
+fn a_cancelled_previews_queued_result_does_not_replace_the_frozen_side() {
+    let (mut fx, _seen, gate) = watched("big.bin");
+    std::fs::write(format!("{}/big.bin", fx.root), vec![7u8; 2 << 20]).unwrap();
+    fx.relist();
+    fx.select("big.bin");
+    fx.drv.idle(&mut fx.b, REST);
+    gate.reached();
+    fx.drv.idle(&mut fx.b, 2);
+    let frame = fx
+        .right_text("reading big.bin")
+        .expect("the progress frame");
+    // The worker runs to its end with no pass of the window: its result waits in the channel.
+    gate.release();
+    until("the worker's end", || fx.b.preview.worker_ended());
+    // The bar leaves: this pass cancels the preparation and finds its result.
+    fx.key(Key::ArrowDown);
+    assert_ne!(fx.current(), "big.bin");
+    let frozen = fx
+        .right_text("reading big.bin")
+        .expect("the side stays frozen");
+    assert_eq!(frozen, format!("{} …", frame.trim_end_matches('…')));
+    assert!(
+        fx.drv.find_text("Text Viewer").is_none(),
+        "its viewer is not shown"
+    );
+    fx.rest();
+    assert!(fx.right_text("reading big.bin").is_none(), "committed");
+}
+
+/// B15, and B5's proof for F9: F9 during a preview's read — the bar unmoved — cancels the
+/// preparation: its read stops before the file's end.
+#[test]
+fn f9_cancels_a_running_preview() {
+    let (mut fx, seen, gate) = watched("big.bin");
+    let size = 2u64 << 20;
+    std::fs::write(format!("{}/big.bin", fx.root), vec![7u8; size as usize]).unwrap();
+    fx.relist();
+    fx.select("big.bin");
+    fx.drv.idle(&mut fx.b, REST);
+    gate.reached();
+    fx.key(Key::F9);
+    assert_eq!(fx.current(), "big.bin", "the bar did not move");
+    assert!(fx.b.preview.cancelling(), "F9 told the preparation to stop");
+    gate.release();
+    fx.wait(|b| !b.preview.busy());
+    let read = seen.lock().unwrap().bytes;
+    assert!(
+        read < size,
+        "the read stopped before the end: {read} of {size}"
+    );
+    assert!(preview_copies(&fx.cache).is_empty(), "its copy is gone");
+}
+
+/// B10, P5 for text and hex: a click, a drag, the wheel, typing, an editing key and a paste
+/// over a text preview and over a hex preview change neither — the same rows, nothing edited
+/// (handed over, each leaves without an unsaved-changes prompt) — and the typing reached the
+/// list.
+#[test]
+fn p5_text_and_hex_previews_take_no_input() {
+    let mut fx = fixture();
+    let centre = Pos2::new(750.0, 300.0);
+    let inputs = |fx: &mut Fx| {
+        fx.drv.click(&mut fx.b, centre);
+        fx.drv.drag(
+            &mut fx.b,
+            PointerButton::Primary,
+            centre - Vec2::new(60.0, 40.0),
+            centre + Vec2::new(60.0, 40.0),
+        );
+        fx.drv.wheel(&mut fx.b, centre, -6.0);
+        fx.drv.paste_text(&mut fx.b, "pasted");
+        fx.with(Key::Delete, Modifiers::NONE);
+        fx.with(Key::W, Modifiers::NONE);
+        fx.drv.idle(&mut fx.b, 2);
+    };
+    let shown = |fx: &Fx| -> Vec<String> {
+        fx.drv
+            .texts()
+            .into_iter()
+            .filter(|(r, _, _)| r.left() >= 500.0 && r.top() < 650.0)
+            .map(|(_, _, t)| t)
+            .collect()
+    };
+    for (name, first, typed, lands_on) in [
+        ("data.bin", "00 01 02 03 04 05 06 07", "4", "data.bin"),
+        ("main.rs", "// a comment", "9", "main.rs"),
+    ] {
+        fx.bar_on(name);
+        assert!(fx.on_right(first), "{name}: {first}");
+        let before = shown(&fx);
+        inputs(&mut fx);
+        // A digit is a hex digit to the hex window and text to an editor; here it is the
+        // list's jump letter, with no name to jump to. `W` (the text viewer's wrap key) is the
+        // list's too: no name starts with it.
+        fx.typed(typed);
+        assert_eq!(fx.current(), lands_on, "{name}: the bar stayed");
+        assert_eq!(shown(&fx), before, "{name}: the preview is as it was");
+        assert!(fx.b.viewer.is_none() && fx.b.active == 0, "{name}");
+        // The typing is the list's: a letter jumps.
+        fx.typed("z");
+        assert_eq!(fx.current(), "zeta.md", "{name}: the list has the keys");
+        // Nothing was edited: handed over, it leaves without a prompt.
+        fx.bar_on(name);
+        fx.key(Key::Enter);
+        fx.settle();
+        assert!(fx.b.viewer.is_some(), "{name}");
+        fx.key(Key::Escape);
+        assert!(fx.drv.find_text("Unsaved changes").is_none(), "{name}");
+        assert!(fx.b.viewer.is_none(), "{name}: left without a prompt");
+    }
+    assert_eq!(
+        std::fs::read(format!("{}/data.bin", fx.root)).unwrap()[..4],
+        [0, 1, 2, 3]
+    );
+    assert_eq!(
+        std::fs::read_to_string(format!("{}/main.rs", fx.root)).unwrap(),
+        RUST
+    );
 }

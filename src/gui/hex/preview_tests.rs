@@ -222,3 +222,44 @@ fn a_previewed_hex_viewer_leaves_the_lists_keyboard_alone() {
     assert_eq!(host.downs, 3, "the list got its keys");
     assert_eq!(host.win.cursor, before, "the preview did not");
 }
+
+/// 02 §4.2: a preview has no bars — no path row of its own (the side's frame names the file) —
+/// and its rows fit the side: sixteen bytes a row where they fit, else eight, the ASCII column
+/// whole either way. The full window keeps its path row and sixteen bytes at any width.
+#[test]
+fn a_previewed_hex_viewer_fits_its_rows_and_draws_no_path_row() {
+    let mut fx = previewed();
+    let path = fx.win.title.clone();
+    let whole = |drv: &Driver, text: &str| drv.find_text(text).is_some();
+    // 700 points: sixteen bytes fit.
+    assert!(whole(
+        &fx.drv,
+        "00 01 02 03 04 05 06 07  08 09 0A 0B 0C 0D 0E 0F"
+    ));
+    assert!(whole(&fx.drv, "00016(0010)"), "the second row starts at 16");
+    assert!(fx.drv.text_starting_with(&path).is_none(), "no path row");
+    // Half of the browser's default window: eight bytes a row, the ASCII column whole.
+    fx.drv.resize(496.0, 500.0);
+    fx.drv.idle(&mut fx.win, 2);
+    assert!(
+        whole(&fx.drv, "00 01 02 03 04 05 06 07"),
+        "eight bytes a row"
+    );
+    assert!(whole(&fx.drv, "00008(0008)"), "the second row starts at 8");
+    assert!(whole(&fx.drv, "08 09 0A 0B 0C 0D 0E 0F"));
+    let ascii: String = (0x30..0x38u8).map(chrome::cp437).collect();
+    assert!(whole(&fx.drv, &ascii), "the ASCII column is whole: {ascii}");
+    assert!(fx.drv.text_starting_with(&path).is_none(), "no path row");
+    // Handed over, it is the hex window: its path row, sixteen bytes, cut where it must be.
+    fx.win.set_preview(false);
+    fx.drv.idle(&mut fx.win, 2);
+    assert!(fx.drv.text_starting_with("00016(0010)").is_some());
+    assert!(!whole(&fx.drv, "00008(0008)"));
+    fx.drv.resize(900.0, 500.0);
+    fx.drv.idle(&mut fx.win, 2);
+    assert!(fx
+        .drv
+        .galleys()
+        .iter()
+        .any(|(_, g)| path.ends_with(g.text().trim_start_matches('…'))));
+}

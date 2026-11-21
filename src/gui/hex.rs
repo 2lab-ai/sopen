@@ -129,8 +129,12 @@ fn hex_col(i: u64) -> u64 {
     3 * i + u64::from(i >= 8)
 }
 
-/// Characters in a full row's hex column.
-const HEX_CHARS: u64 = 16 * 3;
+/// Whether a row of `per` bytes — the offset, the hex column, the ASCII column — fits in
+/// `width` points at `cw` points a character.
+fn row_fits(width: f32, cw: f32, offset_chars: usize, per: u64) -> bool {
+    let chars = offset_chars as u64 + 1 + per * 3 + 2 + per;
+    cw * chars as f32 <= width
+}
 
 // ---------------------------------------------------------------------------------------------
 // The edit model.
@@ -2104,16 +2108,23 @@ impl HexWindow {
             Pos2::new(panel.right(), panel.top()),
             Pos2::new(panel.right() + chrome::CELL.x, panel.bottom()),
         );
-        // The file's name on the first line, a blank line, then the rows.
+        let size = self.doc.size();
+        let offset_chars = offset_text(0, size).chars().count();
+        // Bytes a row: sixteen. A preview (02 §4.2) fits its rows to the side it is in: sixteen
+        // where the ASCII column still fits, else eight.
+        let per = if self.preview && !row_fits(panel.width(), cw, offset_chars, ROW) {
+            ROW / 2
+        } else {
+            ROW
+        };
+        // The file's name on the first line, a blank line, then the rows. A preview has no
+        // bars: the side's frame names the file.
+        let head = if self.preview { 0.0 } else { 2.0 * row_h };
         let rows_rect = Rect::from_min_max(
-            Pos2::new(
-                panel.left(),
-                (panel.top() + 2.0 * row_h).min(panel.bottom()),
-            ),
+            Pos2::new(panel.left(), (panel.top() + head).min(panel.bottom())),
             panel.max,
         );
-        let size = self.doc.size();
-        let total = self.doc.rows();
+        let total = size.div_ceil(per);
         let visible = ((rows_rect.height() / row_h).floor() as u64).max(1);
         self.visible = visible;
         let max_top = total.saturating_sub(visible);
@@ -2183,9 +2194,8 @@ impl HexWindow {
             }
         }
 
-        let offset_chars = offset_text(0, size).chars().count();
         let hex_x = rows_rect.left() + cw * (offset_chars + 1) as f32;
-        let ascii_x = hex_x + cw * (HEX_CHARS + 2) as f32;
+        let ascii_x = hex_x + cw * (per * 3 + 2) as f32;
         // A click places the cursor on the byte under it, in that column.
         if resp.clicked() || resp.drag_started_by(egui::PointerButton::Primary) {
             if let Some(p) = resp.interact_pointer_pos() {
@@ -2222,14 +2232,16 @@ impl HexWindow {
         let visuals = ui.visuals().clone();
         // The rows never run under the scroll bar (on a narrow window the ASCII column is cut).
         let painter = ui.painter_at(panel);
-        let title = chrome::fit_left(&ctx, &self.title, &font, panel.width());
-        painter.text(
-            panel.min,
-            egui::Align2::LEFT_TOP,
-            title,
-            font.clone(),
-            p.text,
-        );
+        if !self.preview {
+            let title = chrome::fit_left(&ctx, &self.title, &font, panel.width());
+            painter.text(
+                panel.min,
+                egui::Align2::LEFT_TOP,
+                title,
+                font.clone(),
+                p.text,
+            );
+        }
         if size == 0 {
             painter.text(
                 rows_rect.center(),
@@ -2249,8 +2261,8 @@ impl HexWindow {
         for k in 0..rows {
             let row = self.top_row + k;
             let y = rows_rect.top() + k as f32 * row_h;
-            let off = row * ROW;
-            let n = (size - off).min(ROW);
+            let off = row * per;
+            let n = (size - off).min(per);
             painter.text(
                 Pos2::new(rows_rect.left(), y),
                 egui::Align2::LEFT_TOP,

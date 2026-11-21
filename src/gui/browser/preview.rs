@@ -125,6 +125,8 @@ pub(super) struct Host {
     prep: Option<Prep>,
     /// What the frozen side says of a preparation that was cancelled.
     last_progress: String,
+    /// Makes a preparation's budget (02 §4.3's; tests give one on a clock of their own).
+    budget: Box<dyn Fn() -> Arc<Budget>>,
     #[cfg(test)]
     spawned: usize,
 }
@@ -141,8 +143,40 @@ impl Host {
             shown: None,
             prep: None,
             last_progress: String::new(),
+            budget: Box::new(Budget::preview),
             #[cfg(test)]
             spawned: 0,
+        }
+    }
+
+    /// Tests: the budget each preparation gets.
+    #[cfg(test)]
+    pub fn set_budget(&mut self, budget: Box<dyn Fn() -> Arc<Budget>>) {
+        self.budget = budget;
+    }
+
+    /// Tests: the preparation's worker has ended (its result, if any, is in the channel).
+    #[cfg(test)]
+    pub fn worker_ended(&self) -> bool {
+        let worker = self.prep.as_ref().and_then(|p| p.worker.as_ref());
+        worker.is_none_or(|w| w.is_finished())
+    }
+
+    /// Tests: a preparation is there and was told to stop.
+    #[cfg(test)]
+    pub fn cancelling(&self) -> bool {
+        self.prep.as_ref().is_some_and(Prep::cancelled)
+    }
+
+    /// The file at `path` changed (a re-read found another size or time): a preview of it is
+    /// prepared again — what is shown is dropped, a preparation of it cancelled.
+    pub fn refresh(&mut self, path: &str) {
+        if self.display.as_ref().is_some_and(|w| w.path == path) {
+            self.shown = None;
+            self.last_progress.clear();
+        }
+        if let Some(prep) = self.prep.as_ref().filter(|p| p.want.path == path) {
+            prep.cancel.store(true, Ordering::Relaxed);
         }
     }
 
@@ -155,9 +189,11 @@ impl Host {
     /// Each pass: `display` is the file the committed display shows a preview of (`None`: the
     /// side shows something else), `bar` the file the bar is on right now.
     pub fn sync(&mut self, ctx: &egui::Context, display: Option<Want>, bar: Option<&str>) {
-        // The bar left the file being prepared: cancelled at once, whatever the side shows.
+        // The bar left the file being prepared, or the display stopped showing its preview
+        // (F9, Tab, a pin: 02 §4.4): cancelled at once, whatever the side still draws.
         if let Some(prep) = &self.prep {
-            if bar != Some(prep.want.path.as_str()) {
+            let path = Some(prep.want.path.as_str());
+            if bar != path || display.as_ref().map(|w| w.path.as_str()) != path {
                 prep.cancel.store(true, Ordering::Relaxed);
             }
         }
@@ -169,14 +205,16 @@ impl Host {
         }
         if let Some(ended) = self.prep.as_mut().and_then(Prep::poll) {
             let prep = self.prep.take().expect("polled above");
-            let ours = self.display.as_ref() == Some(&prep.want);
+            // A cancelled preparation's result is never shown, its file still on display or
+            // not: the side stays frozen until the display commits (02 §3.1).
+            let ours = self.display.as_ref() == Some(&prep.want) && !prep.cancelled();
             match ended {
                 Ended::Ready(previewed) if ours => {
                     self.shown = Some(Shown::Ready(Box::new(previewed.show())))
                 }
                 // Another file's: dropped, its copy removed.
                 Ended::Ready(_) | Ended::Cancelled => {}
-                Ended::Died if ours && !prep.cancelled() => {
+                Ended::Died if ours => {
                     let why = "no preview: its preparation stopped without a result";
                     self.shown = Some(Shown::Failed(why.to_string()));
                 }
@@ -206,7 +244,7 @@ impl Host {
             },
         };
         let (done, total) = (Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)));
-        let (cancel, budget) = (Arc::new(AtomicBool::new(false)), Budget::preview());
+        let (cancel, budget) = (Arc::new(AtomicBool::new(false)), (self.budget)());
         let (tx, rx) = mpsc::channel();
         let (conn, connect, label, cache) = (
             self.conn.clone(),
@@ -404,5 +442,129 @@ impl Drop for Host {
     /// The window is gone: a running preparation is told to stop; nothing waits for it.
     fn drop(&mut self) {
         self.cancel();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! The host's own isolation (02 §4.4), on a stand-in window that reacts to everything it is
+    //! given: the merged viewers refuse input themselves once told they are previews, so only a
+    //! window that does not can show what the host withholds.
+
+    use super::*;
+    use crate::gui::testkit::Driver;
+    use crate::gui::{Embedded, Outcome, Window};
+    use eframe::egui::{Event, Key, Modifiers};
+
+    /// What the stand-in was given, over all its passes.
+    #[derive(Default, Debug, PartialEq)]
+    struct Got {
+        events: usize,
+        pointer_seen: bool,
+        scrolled: bool,
+        button_clicks: usize,
+        enabled: bool,
+    }
+
+    struct Eager(Arc<Mutex<Got>>);
+
+    impl Window for Eager {
+        fn ui(&mut self, ui: &mut egui::Ui) {
+            let mut got = self.0.lock().unwrap();
+            ui.ctx().input(|i| {
+                got.events += i
+                    .events
+                    .iter()
+                    .filter(|e| !matches!(e, Event::ModifiersChanged(_)))
+                    .count();
+                got.pointer_seen |= i.pointer.any_down() || i.pointer.any_click();
+                got.scrolled |= i.smooth_scroll_delta != Vec2::ZERO;
+            });
+            got.enabled |= ui.is_enabled();
+            let button = ui.put(ui.max_rect(), egui::Button::new("press me"));
+            got.button_clicks += usize::from(button.clicked());
+        }
+
+        fn ready(&self) -> bool {
+            true
+        }
+    }
+
+    /// The host around the stand-in, as the browser draws a side; what the rest of the pass
+    /// still sees of the frame's input after the preview's pass.
+    struct Side {
+        host: Host,
+        want: Want,
+        after: usize,
+    }
+
+    impl Window for Side {
+        fn ui(&mut self, ui: &mut egui::Ui) {
+            let ctx = ui.ctx().clone();
+            self.host
+                .sync(&ctx, Some(self.want.clone()), Some(&self.want.path));
+            let rect = ui.max_rect();
+            self.host.ui(ui, rect);
+            self.after += ctx.input(|i| {
+                i.events
+                    .iter()
+                    .filter(|e| !matches!(e, Event::ModifiersChanged(_)))
+                    .count()
+            });
+        }
+
+        fn ready(&self) -> bool {
+            true
+        }
+    }
+
+    /// No key, typed text, click, drag or wheel reaches a previewed window, and its widgets
+    /// are disabled — whatever the window itself would do with them; the frame's input is
+    /// whole again after its pass (the list's keys are read from it).
+    #[test]
+    fn the_host_withholds_the_frames_input_from_a_preview() {
+        let got = Arc::new(Mutex::new(Got::default()));
+        let want = Want {
+            path: "/d/a.txt".to_string(),
+            name: "a.txt".to_string(),
+        };
+        let connect: Connect = Arc::new(|| anyhow::bail!("no connection in this test"));
+        let mut host = Host::new(connect, None, PathBuf::from("/nonexistent"));
+        host.display = Some(want.clone());
+        host.shown = Some(Shown::Ready(Box::new(Preview::standing_in(Embedded {
+            window: Box::new(Eager(got.clone())),
+            settle: Box::new(|_| Some(Outcome::default())),
+        }))));
+        let mut side = Side {
+            host,
+            want,
+            after: 0,
+        };
+        let mut drv = Driver::new(500.0, 400.0);
+        let centre = Pos2::new(250.0, 200.0);
+        drv.idle(&mut side, 2);
+        drv.key(&mut side, Key::Space, Modifiers::NONE);
+        drv.frame(&mut side, vec![Event::Text("abc".into())], Modifiers::NONE);
+        drv.click(&mut side, centre);
+        drv.drag(
+            &mut side,
+            egui::PointerButton::Primary,
+            centre - Vec2::new(50.0, 50.0),
+            centre + Vec2::new(50.0, 50.0),
+        );
+        drv.wheel(&mut side, centre, -4.0);
+        drv.paste_text(&mut side, "pasted");
+        assert_eq!(
+            *got.lock().unwrap(),
+            Got::default(),
+            "the preview was given nothing, and was never enabled"
+        );
+        assert!(drv.find_text("press me").is_some(), "it was drawn");
+        assert!(
+            side.after >= 8,
+            "the frame's input is whole after it: {}",
+            side.after
+        );
+        assert_eq!(side.host.spawned(), 0, "nothing was prepared");
     }
 }

@@ -324,7 +324,10 @@ impl Budget {
 
     /// [`Budget::new`] on a clock of the caller's (tests: a deadline reached in the middle of a
     /// preparation, a read that takes long).
-    fn with_clock(limits: Limits, clock: Box<dyn Fn() -> Instant + Send + Sync>) -> Arc<Self> {
+    pub(crate) fn with_clock(
+        limits: Limits,
+        clock: Box<dyn Fn() -> Instant + Send + Sync>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             limits,
             lifted: AtomicBool::new(false),
@@ -546,6 +549,20 @@ pub struct Reuse {
 }
 
 impl Preview {
+    /// Tests: a preview around a window of the test's own (the preview host's input isolation,
+    /// shown on a window that would react).
+    #[cfg(test)]
+    pub(crate) fn standing_in(embedded: Embedded) -> Self {
+        Self {
+            embedded,
+            card: None,
+            copy: None,
+            host: cache::LOCAL_HOST.to_string(),
+            abs: String::new(),
+            cache: PathBuf::new(),
+        }
+    }
+
     /// The info card, when the file is not previewed.
     #[cfg_attr(not(test), allow(dead_code))] // Only the tests use it.
     pub fn card(&self) -> Option<&Card> {

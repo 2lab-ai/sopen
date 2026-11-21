@@ -67,7 +67,8 @@ pub struct FKey {
 
 /// The file list's row in slice S1 (02 §7, 04 §2): only the keys that work, F9's label naming
 /// the mode it switches to from the default (preview) mode. It is the browser key table's
-/// (`browser::keys::row`, a test holds them equal); S1-E draws that, by the mode, instead.
+/// (`browser::keys::row`, a test holds them equal). The browser draws the table's row, by its
+/// mode; this constant is what the tests hold it to.
 pub const LIST_KEYS: &[FKey] = &[
     HELP_KEY,
     FKey {

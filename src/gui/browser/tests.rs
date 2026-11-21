@@ -1335,15 +1335,17 @@ fn a_good_listing_clears_an_earlier_listing_error() {
     let gone = format!("{}/gone", fx.root);
     fx.b.list(Some(0), gone, None, None);
     fx.settle();
-    assert!(fx.b.status.error, "{}", fx.b.status.text);
+    let said = fx.b.status_line();
+    assert!(
+        said.error && said.text.starts_with("left panel: "),
+        "{}",
+        said.text
+    );
     let root = fx.root.clone();
     fx.b.list(Some(0), root, None, None);
     fx.settle();
-    assert!(
-        !fx.b.status.error && fx.b.status.text.is_empty(),
-        "{}",
-        fx.b.status.text
-    );
+    let said = fx.b.status_line();
+    assert!(!said.error && fx.b.status.text.is_empty(), "{}", said.text);
 }
 
 /// X1: a running save is never cut off. The upload is held at a gate; Esc and closing the window

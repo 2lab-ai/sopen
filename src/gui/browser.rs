@@ -177,6 +177,16 @@ fn ops_connect(state_dir: PathBuf) -> OpsConnect {
 /// host — and tells the window through the job's [`ops::Link`]: progress, a name in the way,
 /// and Esc through the link's own stop flag.
 fn engine(connect: OpsConnect) -> ops::Run {
+    engine_seen(connect, None)
+}
+
+/// What a test watches the engine's progress with, on the operation's worker (a gate in the
+/// middle of a transfer).
+type ProgressSeen = Arc<dyn Fn(&fileops::Progress) + Send + Sync>;
+
+/// [`engine`]; `seen` is called with every progress the engine reports, before the window
+/// hears of it.
+fn engine_seen(connect: OpsConnect, seen: Option<ProgressSeen>) -> ops::Run {
     Arc::new(move |job: ops::Job, link: &ops::Link| -> Report {
         let (op, from, names, to) = match job {
             ops::Job::Transfer {
@@ -216,7 +226,11 @@ fn engine(connect: OpsConnect) -> ops::Run {
                 None => format!("cannot open this machine's files: {e:#}"),
             }],
         };
-        let mut ctl = Ctl { link, last: None };
+        let mut ctl = Ctl {
+            link,
+            last: None,
+            seen: seen.clone(),
+        };
         let mut src = match connect(from.host.as_deref()) {
             Ok(fs) => fs,
             Err(e) => return refused(&from, e),
@@ -240,6 +254,7 @@ fn engine(connect: OpsConnect) -> ops::Run {
 struct Ctl<'a> {
     link: &'a ops::Link,
     last: Option<fileops::Progress>,
+    seen: Option<ProgressSeen>,
 }
 
 /// A progress event goes to the window when the item or file changes, when a file ends, and
@@ -253,6 +268,9 @@ impl fileops::Control for Ctl<'_> {
     }
 
     fn progress(&mut self, p: &fileops::Progress) {
+        if let Some(seen) = &self.seen {
+            seen(p);
+        }
         let due = match &self.last {
             None => true,
             Some(last) => {
@@ -469,8 +487,16 @@ pub(crate) struct Browser {
     preview: preview::Host,
     /// The file operations (04 §4–§5): the dialogs, the rename field, the running job.
     ops: ops::Ops,
-    /// The entry the active panel's bar goes on after its re-read (a rename's new name).
-    bar_next: Option<(String, String)>,
+    /// The panel F2 was last pressed in: its row shows the rename field, and its bar goes on
+    /// the new name.
+    rename_panel: usize,
+    /// After a rename: the panel it was made in, its folder, and the new name its bar goes on
+    /// at the re-read.
+    bar_next: Option<(usize, String, String)>,
+    /// Each panel's last listing, when it failed: said until that panel lists again.
+    list_errors: [Option<String>; 2],
+    /// What an operation that ended under a viewer has to say, for when the list shows again.
+    told_later: Option<Status>,
     viewer: Option<Viewer>,
     exit: Exit,
     status: Status,
@@ -554,7 +580,10 @@ impl Browser {
             opening: None,
             preview,
             ops: ops::Ops::new(engine(ops_connect(start.state_dir))),
+            rename_panel: 0,
             bar_next: None,
+            list_errors: [None, None],
+            told_later: None,
             viewer: None,
             exit: Exit::List,
             status: Status::default(),
@@ -577,6 +606,12 @@ impl Browser {
     #[cfg(test)]
     fn set_ops_connect(&mut self, connect: OpsConnect) {
         self.ops = ops::Ops::new(engine(connect));
+    }
+
+    /// Tests: the real engine over `connect`, its progress watched by `seen`.
+    #[cfg(test)]
+    fn set_ops_seen(&mut self, connect: OpsConnect, seen: ProgressSeen) {
+        self.ops = ops::Ops::new(engine_seen(connect, Some(seen)));
     }
 
     /// Tests: a stand-in engine.
@@ -703,10 +738,13 @@ impl Browser {
     /// made ready only Esc acts (it stops the fetch); while a folder is listed, none (it takes
     /// a moment).
     fn run(&mut self, ctx: &egui::Context, command: Command) {
+        // Esc acts whatever else is on its way: a pending listing never makes a fetch or a
+        // file operation unstoppable.
+        if command == Command::Stop {
+            self.stop();
+            return;
+        }
         if self.opening.is_some() {
-            if command == Command::Stop {
-                self.stop();
-            }
             return;
         }
         if !self.listing.is_empty() {
@@ -754,6 +792,7 @@ impl Browser {
             Command::SelectGroup => self.ops.open_group(true),
             Command::UnselectGroup => self.ops.open_group(false),
             Command::Rename => {
+                self.rename_panel = active;
                 let refused = self.ops.open_rename(panel, self.label.as_deref());
                 self.status = refused.unwrap_or_default();
             }
@@ -779,7 +818,6 @@ impl Browser {
                     self.list(Some(to), dir, None, Some(ctx));
                 }
             }
-            Command::Stop => self.stop(),
             // Rows of other contexts and of slices that have not landed: nothing to do here.
             _ => {}
         }
@@ -823,8 +861,8 @@ impl Browser {
                     }
                     let renamed = self
                         .bar_next
-                        .take_if(|(dir, _)| i == self.active && *dir == panel.dir)
-                        .map(|(_, name)| name);
+                        .take_if(|(origin, dir, _)| i == *origin && *dir == panel.dir)
+                        .map(|(_, _, name)| name);
                     let name = renamed.or_else(|| panel.current().map(|e| e.name.clone()));
                     let (dir, at) = (panel.dir.clone(), panel.highlight);
                     self.relist(Some(i), dir, name, Some(at), Some(ctx));
@@ -837,10 +875,16 @@ impl Browser {
     /// [`BrowserEvent::FilesChanged`] for the folders it changed, a host at a time.
     fn after_operation(&mut self, ctx: &egui::Context, changed: ops::Changed) {
         if let Some(said) = changed.said {
-            self.status = said;
+            if self.viewer.is_some() {
+                // Told when the list shows again: the viewer's row stays the viewer's.
+                self.told_later = Some(said);
+            } else {
+                self.status = said;
+            }
         }
         if let (Some(name), Some(first)) = (changed.bar, changed.dirs.first()) {
-            self.bar_next = Some((first.dir.clone(), name));
+            // The panel the rename was made in, whichever has the keyboard now.
+            self.bar_next = Some((self.rename_panel, first.dir.clone(), name));
         }
         let mut hosts: Vec<Option<String>> = Vec::new();
         for dir in &changed.dirs {
@@ -903,20 +947,32 @@ impl Browser {
             keep,
             ..
         } = listing;
+        let panels = panel.map_or(vec![0, 1], |p| vec![p]);
         let (entries, free) = match result {
             Ok(listed) => listed,
             Err(e) => {
-                self.status = Status::error(format!("{e:#}"));
+                for i in panels {
+                    self.list_errors[i] = Some(format!("{e:#}"));
+                }
                 return;
             }
         };
-        if self.status.error {
-            // An earlier listing's failure is over.
-            self.status = Status::default();
-        }
-        for i in panel.map_or(vec![0, 1], |p| vec![p]) {
+        for i in panels {
+            // This panel's earlier failure is over; the other panel's is its own.
+            self.list_errors[i] = None;
             let panel = &mut self.panels[i];
+            // The entry under the bar, as it was listed before: changed (size or time) under
+            // an unmoved bar, its preview is prepared again.
+            let was = panel
+                .current()
+                .filter(|_| panel.dir == dir)
+                .map(|e| (e.name.clone(), e.size, e.mtime));
             panel.fill(dir.clone(), entries.clone(), free, select.as_deref());
+            if let (Some((name, size, mtime)), Some(now)) = (was, panel.current()) {
+                if now.name == name && (now.size, now.mtime) != (size, mtime) {
+                    self.preview.refresh(&panel.path_of(now));
+                }
+            }
             let found = select
                 .as_deref()
                 .is_some_and(|name| panel.current().is_some_and(|e| e.name == name));
@@ -1118,7 +1174,7 @@ impl Browser {
 
     /// Where the closed viewer's exit leads: the list as it was, or the window closing.
     fn after_viewer(&mut self, ctx: &egui::Context) {
-        self.status = Status::default();
+        self.status = self.told_later.take().unwrap_or_default();
         if std::mem::replace(&mut self.exit, Exit::List) == Exit::Quit {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
@@ -1473,8 +1529,8 @@ impl Browser {
         if i == self.active {
             self.visible = visible;
         }
-        // The entry being renamed (F2), in the panel with the keyboard: its row is the field.
-        let renaming = (i == self.active)
+        // The entry being renamed (F2), in the panel it was pressed in: its row is the field.
+        let renaming = (i == self.rename_panel)
             .then(|| self.ops.renaming().map(str::to_string))
             .flatten();
         let mut field = None;
@@ -1646,20 +1702,37 @@ impl Browser {
                 Status::info(format!("opening {name}…"))
             };
         }
+        if self.viewer.is_some() {
+            // The viewer's row: only a question an operation waits with is said over it.
+            return match self.ops.waiting() {
+                Some(what) => Status::info(format!(
+                    "{what} waiting for an answer — F3 back to the list"
+                )),
+                None if !self.status.text.is_empty() => self.status.clone(),
+                None => Status::info(VIEWER_HINT),
+            };
+        }
         if let Some(listing) = self.listing.first() {
             return Status::info(format!("listing {}…", listing.dir));
         }
         if let Some(said) = self.ops.status() {
             return said;
         }
+        match &self.list_errors {
+            [None, None] => {}
+            [Some(left), Some(right)] if left == right => return Status::error(left.clone()),
+            [left, right] => {
+                let said: Vec<String> = [("left panel", left), ("right panel", right)]
+                    .into_iter()
+                    .filter_map(|(side, e)| e.as_ref().map(|e| format!("{side}: {e}")))
+                    .collect();
+                return Status::error(said.join(" · "));
+            }
+        }
         if !self.status.text.is_empty() {
             return self.status.clone();
         }
-        if self.viewer.is_some() {
-            Status::info(VIEWER_HINT)
-        } else {
-            Status::info(LIST_HINT)
-        }
+        Status::info(LIST_HINT)
     }
 
     /// Nothing is on its way: no listing, no opening, the display committed and its preview
@@ -1709,12 +1782,15 @@ impl Window for Browser {
                     self.panels_ui(ui);
                 }
             });
+        // A running file operation is heard on every pass, whatever the window shows; its
+        // dialogs — a question, the report — are the list's, over the panels.
+        let active = &mut self.panels[self.active];
+        let changed = self.ops.poll(active);
         if self.viewer.is_none() {
-            // The file operations' dialogs, over the panels; what a job that ended changed.
-            let active = &mut self.panels[self.active];
-            if let Some(changed) = self.ops.ui(&ctx, active) {
-                self.after_operation(&ctx, changed);
-            }
+            self.ops.dialogs(&ctx, active);
+        }
+        if let Some(changed) = changed {
+            self.after_operation(&ctx, changed);
         }
         let working = !self.listing.is_empty()
             || self.opening.is_some()

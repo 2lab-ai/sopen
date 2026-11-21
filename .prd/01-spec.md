@@ -211,7 +211,8 @@ too, where F3 closes it as ⌘W does.
 - **Two modes** (msg 14; [02](02-architecture.md) §2–§4, landed with slice S1). The window opens
   in **preview mode**: the side opposite the active list follows its bar — on a file, once the bar
   has rested 150 ms, it shows that file's preview in a single-lined frame titled with the file
-  (text wrapped and highlighted, an image fitted, the hex rows of anything else; video and audio
+  (text wrapped and highlighted, an image fitted, the hex rows of anything else — sixteen bytes
+  a row where the side is wide enough, else eight, without the hex window's path row; video and audio
   as an info card until slice S1-M; a file over a preview budget, 02 §4.3, or one that cannot be
   read as an info card saying why); on a folder or `..` it shows its own list (the git panel
   comes with S2). A preview takes no key, click, drag or wheel, claims nothing in the cache (a
@@ -229,7 +230,11 @@ too, where F3 closes it as ⌘W does.
   the way asks Skip / Rename / Cancel, never Overwrite. An operation runs on a worker with
   connections of its own, shows its progress on the status row, stops on Esc, and reports what
   it did (one line for one item done, else a dialog); the panels showing a changed folder
-  re-read. Closing the window waits for a running operation. A remote folder cannot be renamed
+  re-read. An operation goes on whatever the window shows: while a viewer is open its question
+  waits (the status row says `copy waiting for an answer — F3 back to the list`) and its end is
+  told when the list shows again; Esc stops it also while a folder is still being listed.
+  Closing the window waits for a running operation. A panel whose listing failed says so on
+  the status row until that panel lists again. A remote folder cannot be renamed
   until slice S6 (F2 says so); make folder and delete come with S6.
 - **Keys** (the list; the one key table, `gui::browser::keys`, matches modifiers exactly, and
   Cmd/Ctrl+1…0 and a click on an F-key slot act as that F-key): F1 lists the keys; Cmd/Ctrl+R
