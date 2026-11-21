@@ -2631,6 +2631,42 @@ fn cmd_r_is_left_alone_without_a_stream() {
     assert!(fx.win.reloading.is_none());
 }
 
+/// `SOPEN_STATE` `at=`: the cursor's row is wholly on screen once the window has settled — the
+/// first pass lays the grid out taller than it stays (the rows below it have no height yet).
+#[test]
+fn a_cursor_from_the_state_is_wholly_on_screen() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("deep.bin");
+    std::fs::write(&path, vec![0x5a; 1 << 16]).unwrap();
+    let abs = path.to_str().unwrap().to_string();
+    let mut fs = LocalFs::new();
+    let at = fs.stat(&abs).unwrap();
+    let origin = Origin::new(Box::new(fs), None, None, abs, at);
+    let file = HexFile::open(origin, &path, None, &tmp.path().join("cache")).unwrap();
+    let hooks = Hooks {
+        state: crate::gui::State::parse("at=0x8000").unwrap(),
+        ..Hooks::default()
+    };
+    let mut win = embedded(file, &hooks, Vec::new(), Arc::default(), Arc::default()).unwrap();
+    let mut drv = Driver::new(760.0, 560.0);
+    drv.idle(&mut win, 4);
+    let row = win.cursor.at / ROW;
+    assert!(
+        win.top_row <= row && row < win.top_row + win.visible,
+        "row {row} with rows {}..{} on screen",
+        win.top_row,
+        win.top_row + win.visible
+    );
+    // Scrolling away from the cursor afterwards is not undone.
+    let over = win.layout.unwrap().rows.center();
+    drv.wheel(&mut win, over, 30.0);
+    drv.idle(&mut win, 2);
+    assert!(
+        win.top_row + win.visible <= row,
+        "the wheel was followed back"
+    );
+}
+
 // ---------------------------------------------------------------------------------------------
 // Over a stream (06 §7.1; §12 V1–V3, V11): the window on a Source over the Fake, its engine
 // stepped by hand on simulated time, so every bound is in bytes and requests, never in seconds.
@@ -2640,7 +2676,7 @@ mod stream {
     use crate::gui::{Hooks, State};
     use crate::remote::{
         fake, pattern, Asked, Cancelled, Change, FakeControl, FakeFile, Fault, Link, SftpRemote,
-        Stat, STAT_REPLY,
+        Stat,
     };
     use crate::stream::{Engine, Opening, Settings, Source, State as Flow, BLOCK};
     use eframe::egui::PointerButton;
@@ -2665,6 +2701,10 @@ mod stream {
         fetches: Arc<AtomicUsize>,
         /// A fetch waits here until it is cancelled (a fetch slow enough to be stopped).
         hold: Arc<AtomicBool>,
+        /// A fetch waits at its first progress report, its `.part` begun, until it is cancelled.
+        midway: Arc<AtomicBool>,
+        /// A fetch fails once it is asked for (the link dropped).
+        fail: Arc<AtomicBool>,
     }
 
     struct Counting(LocalFs, Counts);
@@ -2741,8 +2781,18 @@ mod stream {
                 }
                 std::thread::sleep(Duration::from_millis(2));
             }
+            if self.1.fail.load(Ordering::SeqCst) {
+                bail!("the link dropped");
+            }
+            let midway = self.1.midway.clone();
+            let mut report = |done: u64, total: u64| {
+                progress(done, total);
+                while midway.load(Ordering::SeqCst) && done > 0 && !cancel.load(Ordering::SeqCst) {
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+            };
             self.hit()
-                .fetch_cancellable(remote, local, progress, cancel)
+                .fetch_cancellable(remote, local, &mut report, cancel)
         }
     }
 
@@ -2979,6 +3029,17 @@ mod stream {
             self.drv.find_text(text).is_some()
         }
 
+        /// How many texts the last pass drew that read exactly `text`, cut by a clip or not.
+        fn drawn(&self, text: &str) -> usize {
+            let all = self.drv.galleys();
+            all.iter().filter(|(_, g)| g.text() == text).count()
+        }
+
+        /// Bytes of reads asked and not yet answered (status requests left out).
+        fn reads_out(&self) -> u64 {
+            self.in_flight() / BLOCK * BLOCK
+        }
+
         /// The offset column's text for the row at `off`.
         fn offset(&self, off: u64) -> String {
             offset_text(off, self.win.doc.size())
@@ -3039,7 +3100,27 @@ mod stream {
         assert_eq!(cells, vec![cga::CYAN; 16], "pending cells are dim");
         assert_eq!(sx.status(), "loading 0x0");
         assert!(!sx.win.ready(), "not shot before the screen's bytes came");
+        // Every row painted — the last, cut by the frame, included — has its offset and is
+        // pending; none is blank.
+        let painted = sx.win.rows_painted;
+        assert!(painted >= 20, "{painted} rows");
+        assert_eq!(sx.drawn(&pending_row()), painted as usize, "pending rows");
+        for row in 0..painted {
+            assert_eq!(sx.drawn(&sx.offset(row * ROW)), 1, "row {row}'s offset");
+        }
         sx.settle();
+        // And once the block is here, every one of them shows the file's bytes at its offset.
+        assert_eq!(sx.win.rows_painted, painted);
+        for row in 0..painted {
+            assert_eq!(sx.drawn(&sx.offset(row * ROW)), 1, "row {row}'s offset");
+            assert_eq!(sx.drawn(&pattern_row(row * ROW)), 1, "row {row}'s bytes");
+            let ascii: String = pattern(row * ROW, 16)
+                .into_iter()
+                .map(|b| ascii_char(Some(b)))
+                .collect();
+            assert!(sx.drawn(&ascii) >= 1, "row {row}'s ASCII column");
+        }
+        assert_eq!(sx.drawn(&pending_row()), 0);
         for row in 0..3 {
             assert!(sx.shows(&pattern_row(row * ROW)), "row {row}'s bytes");
         }
@@ -3194,13 +3275,22 @@ mod stream {
             sx.key(Key::PageDown, Modifiers::NONE);
             sx.turn();
         }
-        let (sent, cap) = (sx.sent(), sx.cap());
+        // Reads for the old place are out when the jump comes: keys go on with the link
+        // stalled until some are.
+        for pass in 0.. {
+            assert!(pass < 400, "no read of the old place was left out");
+            sx.key(Key::PageDown, Modifiers::NONE);
+            sx.engine.pump();
+            if sx.reads_out() >= 2 * BLOCK {
+                break;
+            }
+        }
+        let (sent, cap, before) = (sx.sent(), sx.cap(), sx.fetched());
+        let old = sx.reads_out();
+        assert!(old >= 2 * BLOCK, "{old} bytes of the old place out");
         sx.goto(FAR);
         assert_eq!(sx.win.cursor.at, FAR);
-        // What was out for the old place when the jump came still arrives: at most the cap.
-        // (A fence and a poll pair are status replies, which the cap never holds back.)
-        let out = sx.in_flight();
-        assert!(out <= cap + 3 * STAT_REPLY, "{out} out, cap {cap}");
+        assert_eq!(sx.sent(), sent, "nothing is sent by a frame");
         let off = sx.offset(FAR);
         assert!(sx.shows(&off), "the place is on screen before its bytes");
         assert!(sx.shows(&pending_row()));
@@ -3208,8 +3298,13 @@ mod stream {
         let top = sx.win.top_row * ROW;
         assert!(top < FAR && FAR - top < 64 * ROW);
         assert_eq!(sx.status(), format!("loading 0x{top:X}"));
+        // What was out for the old place when the jump came is at most the cap.
+        assert!(old <= cap, "{old} out for the old place, cap {cap}");
         sx.settle();
         assert!(sx.shows(&pattern_row(FAR)), "the bytes at 20 GiB");
+        // It all arrived, and with the new place's two blocks it is everything that came since
+        // the jump: nothing more was sent for the old place (the list of reads below).
+        assert_eq!(sx.fetched() - before, old + 2 * BLOCK, "{old} was out");
         assert_eq!(sx.status(), format!("at 0x{FAR:X} ({FAR})"));
         // Everything sent since the jump is the new place's: its block and the one before it
         // (its margin, and the rows above the cursor) — 128 KiB.
@@ -3321,11 +3416,10 @@ mod stream {
         let Flow::Failed(reason) = sx.source.state() else {
             panic!("{:?}", sx.source.state())
         };
-        let status = sx.status_now();
-        assert_eq!(
-            (status.text.as_str(), status.error),
-            (reason.as_str(), true)
-        );
+        // Said whole, in the rows below the grid, for as long as the stream is failed.
+        assert_eq!(sx.win.stream_warning(), Some(reason.clone()));
+        assert_eq!(sx.drawn(&reason), 1, "the reason is drawn whole");
+        // The warning's row comes off the grid's bottom, and the cursor's row stays on screen.
         let off = sx.offset(FAR);
         assert!(sx.shows(&off), "the screen stays where it is");
         assert_eq!(sx.win.doc.cell(FAR), Cell::Unreadable);
@@ -3340,6 +3434,11 @@ mod stream {
         assert_eq!(sx.source.state(), Flow::Live);
         assert!(sx.shows(&pattern_row(FAR)), "not held as an empty page");
         assert!(!sx.status_now().error);
+        assert_eq!(
+            sx.win.stream_warning(),
+            None,
+            "the warning goes with the state"
+        );
     }
 
     /// V11: a key on a byte whose page is Pending changes nothing and says so; once the bytes
@@ -3634,6 +3733,91 @@ mod stream {
         assert_eq!(sx.win.doc.byte(0), Some(0xFF));
     }
 
+    /// The cursor stays on screen when the grid gets shorter. A warning row appears with the
+    /// cursor on the last row: the grid scrolls down by just the rows it lost. With the cursor
+    /// in the middle the grid does not move. The same when the window is made smaller.
+    #[test]
+    fn a_shorter_grid_never_hides_the_cursor() {
+        let changed = |sx: &mut Sx| {
+            sx.control.change(Change::Write {
+                off: 0x20_0000,
+                bytes: vec![0xEE; 16],
+                same_second: false,
+            });
+            sx.run_for(Duration::from_secs(5));
+            sx.frames(3);
+            assert_eq!(sx.source.state(), Flow::Changed);
+            assert!(sx.win.stream_warning().is_some());
+        };
+        let open = || {
+            let mut sx = sx_with(
+                FakeFile::pattern(4 * MIB),
+                Link::gate(),
+                Duration::from_secs(2),
+                &Hooks::default(),
+            )
+            .unwrap();
+            sx.settle();
+            sx.goto(0x1000);
+            sx.settle();
+            sx
+        };
+        // On the last row.
+        let mut sx = open();
+        let (top, rows, row) = (sx.win.top_row, sx.win.visible, 0x1000 / ROW);
+        assert_eq!(row, top + rows - 1, "the cursor is on the last whole row");
+        changed(&mut sx);
+        let lost = rows - sx.win.visible;
+        assert!(lost >= 1, "the warning took no row");
+        assert_eq!(
+            sx.win.top_row,
+            top + lost,
+            "scrolled by the rows lost, no more"
+        );
+        assert_eq!(
+            row,
+            sx.win.top_row + sx.win.visible - 1,
+            "still the last whole row"
+        );
+        assert!(
+            sx.shows(&pattern_row(0x1000)),
+            "the cursor's row is wholly on screen"
+        );
+        assert!(sx.shows(&sx.offset(0x1000)));
+        // A smaller window: again by the rows lost.
+        let (top, rows) = (sx.win.top_row, sx.win.visible);
+        sx.drv.resize(760.0, 400.0);
+        sx.frames(3);
+        let lost = rows - sx.win.visible;
+        assert!(lost >= 3, "{lost} rows lost");
+        assert_eq!(sx.win.top_row, top + lost);
+        assert!(sx.shows(&pattern_row(0x1000)), "after the window shrank");
+        // In the middle of the screen: the grid's top does not move.
+        let mut sx = open();
+        for _ in 0..8 {
+            sx.key(Key::ArrowUp, Modifiers::NONE);
+        }
+        let (top, rows) = (sx.win.top_row, sx.win.visible);
+        changed(&mut sx);
+        assert!(sx.win.visible < rows);
+        assert_eq!(
+            sx.win.top_row, top,
+            "the grid moved with the cursor in view"
+        );
+        // Scrolled away from the cursor by hand: it is not pulled back.
+        let mut sx = open();
+        let over = sx.win.layout.unwrap().rows.center();
+        sx.drv.wheel(&mut sx.win, over, 30.0);
+        sx.frames(2);
+        let top = sx.win.top_row;
+        assert!(
+            top + sx.win.visible <= 0x1000 / ROW,
+            "the cursor is below the screen"
+        );
+        changed(&mut sx);
+        assert_eq!(sx.win.top_row, top, "a cursor off screen was followed");
+    }
+
     /// Cmd/Ctrl+R (06 §5): after the file changed on the remote the window says so, keeps its
     /// rows, and a reload shows the new version at the same offset. With unsaved edits it is
     /// refused: they were made over the old bytes.
@@ -3657,13 +3841,14 @@ mod stream {
         sx.run_for(Duration::from_secs(5));
         sx.frames(2);
         assert_eq!(sx.source.state(), Flow::Changed);
-        let status = sx.status_now();
-        assert_eq!(
-            status.text,
-            "the file changed on the remote — Cmd/Ctrl+R reloads"
-        );
-        assert!(status.error);
+        // The warning and its reload hint, whole, in the rows below the grid.
+        const CHANGED: &str = "the file changed on the remote — Cmd/Ctrl+R reloads";
+        assert_eq!(sx.win.stream_warning().as_deref(), Some(CHANGED));
+        assert_eq!(sx.drawn(CHANGED), 1, "drawn whole");
+        // Its row comes off the grid's bottom, and the cursor's row — the last — stays on
+        // screen with its bytes.
         assert!(sx.shows(&pattern_row(0x1000)), "the screen it had stays");
+        assert_eq!(sx.win.doc.byte(0x1000), Some(pattern(0x1000, 1)[0]));
         // An edit made over the old bytes: the reload is refused, the edit stays.
         let other = format!("{:02X}", !pattern(0x1000, 1)[0]);
         sx.typed(&other[..1]);
@@ -3671,7 +3856,20 @@ mod stream {
         assert!(sx.win.doc.dirty());
         sx.key(Key::R, command(false));
         assert_eq!(sx.source.state(), Flow::Changed);
-        assert!(sx.status().starts_with("not reloaded"), "{}", sx.status());
+        // The window's own error is on the status row and the stream's warning stays where it
+        // is, whole — now, and at every later pass while the file stays changed.
+        for _ in 0..3 {
+            let status = sx.status_now();
+            assert!(status.error, "{}", status.text);
+            assert!(status.text.starts_with("not reloaded"), "{}", status.text);
+            assert_eq!(sx.drawn(CHANGED), 1, "the warning and its reload hint");
+            sx.frames(2);
+        }
+        // Nor does any later line of the window's take it off.
+        sx.goto(0x30_0000);
+        sx.typed("A");
+        assert_eq!(sx.drawn(CHANGED), 1);
+        sx.goto(0x1000);
         sx.key(Key::Z, command(false));
         assert!(!sx.win.doc.dirty());
         assert!(
@@ -3808,6 +4006,185 @@ mod stream {
         assert_eq!(sx.events()[4..], [input.as_str(), "ready"]);
     }
 
+    /// A jump made before the one before it has arrived is an `input` of its own, and the
+    /// `ready` that follows is its; a jump away to rows already held ends the wait with no
+    /// `ready` for a place that was never shown. A frame that changes nothing marks nothing.
+    #[test]
+    fn each_jump_is_its_own_input() {
+        let mut sx = sx(MODEL);
+        sx.settle();
+        let (a, b) = (FAR, FAR / 2);
+        sx.goto(a);
+        sx.frames(3);
+        sx.goto(b);
+        sx.frames(3);
+        let (to_a, to_b) = (format!("input {a:#x}"), format!("input {b:#x}"));
+        assert_eq!(sx.events()[2..], [to_a.as_str(), to_b.as_str()]);
+        sx.settle();
+        assert_eq!(sx.events()[2..], [to_a.as_str(), to_b.as_str(), "ready"]);
+        sx.frames(5);
+        assert_eq!(sx.events().len(), 5, "a frame at rest marks nothing");
+        // To a place not here, then back to rows that are: no `ready` — A never showed.
+        let c = FAR / 4;
+        sx.goto(c);
+        sx.frames(2);
+        sx.goto(b);
+        sx.settle();
+        let to_c = format!("input {c:#x}");
+        assert_eq!(sx.events()[5..], [to_c.as_str()], "{:?}", sx.events());
+    }
+
+    /// 06 §4: the latest place wins. A far screen asked for while the cap is full is not sent;
+    /// the view then goes back to rows it holds, which reads nothing — and the far place's
+    /// demand is withdrawn, so it never goes out when the link has room again.
+    #[test]
+    fn a_demand_left_behind_is_never_sent() {
+        let mut sx = sx(MODEL);
+        sx.settle();
+        // Fill the cap: scroll on with the link stalled until no block more may go.
+        for pass in 0.. {
+            assert!(pass < 2000, "the cap never filled");
+            sx.key(Key::PageDown, Modifiers::NONE);
+            sx.engine.pump();
+            if !sx.source.core().pf.adm.admits(BLOCK) {
+                break;
+            }
+        }
+        sx.goto(FAR);
+        sx.frames(2);
+        sx.engine.pump();
+        let far = [FAR / BLOCK - 1, FAR / BLOCK];
+        let asked = sx.blocks_read(0);
+        assert!(
+            !asked.iter().any(|b| far.contains(b)),
+            "sent over a full cap"
+        );
+        assert!(sx.shows(&pending_row()), "the far place is waited for");
+        // Back to the top, whose rows are held: nothing is read for it.
+        let asks = sx.win.doc.asks();
+        sx.key(Key::Home, command(false));
+        sx.frames(2);
+        assert!(sx.shows(&pattern_row(0)) && !sx.shows(&pending_row()));
+        assert_eq!(sx.win.doc.asks(), asks, "a held screen was read");
+        // The link has room again: what the old scroll had out arrives, and nothing is asked
+        // for the place left behind.
+        sx.settle();
+        let asked = sx.blocks_read(0);
+        assert!(
+            !asked.iter().any(|b| far.contains(b)),
+            "the abandoned place was fetched: {asked:?}"
+        );
+        // The same for a place the scroll bar's thumb passes on from.
+        sx.goto(FAR);
+        sx.frames(2);
+        let at = sx.bar(0.3);
+        sx.drv.move_to(&mut sx.win, at);
+        sx.drv.press(&mut sx.win, PointerButton::Primary);
+        sx.engine.pump();
+        let asked = sx.blocks_read(0);
+        assert!(
+            !asked.iter().any(|b| far.contains(b)),
+            "the place the thumb left was fetched: {asked:?}"
+        );
+        sx.drv.release(&mut sx.win, PointerButton::Primary);
+    }
+
+    /// Every read the window asks of its stream, with its place and length.
+    struct Spy {
+        inner: Box<dyn Feed>,
+        log: Arc<Mutex<Vec<(u64, usize)>>>,
+    }
+
+    impl crate::stream::Bytes for Spy {
+        fn len(&self) -> u64 {
+            self.inner.len()
+        }
+        fn try_read(
+            &mut self,
+            off: u64,
+            len: usize,
+        ) -> std::task::Poll<crate::stream::Result<bytes::Bytes>> {
+            self.log.lock().unwrap().push((off, len));
+            self.inner.try_read(off, len)
+        }
+        fn read_at(
+            &mut self,
+            off: u64,
+            buf: &mut [u8],
+            cancel: &AtomicBool,
+        ) -> crate::stream::Result<usize> {
+            self.inner.read_at(off, buf, cancel)
+        }
+    }
+
+    impl Feed for Spy {
+        fn waiting(&self) -> Option<crate::stream::Waiting> {
+            self.inner.waiting()
+        }
+        fn renew(&mut self) {
+            self.inner.renew()
+        }
+    }
+
+    /// V2's `delivered` is a union, so it cannot see the same bytes read twice. Here every read
+    /// is seen: a frame asks its stream at most once, for whole pages of the screen it shows —
+    /// never more than the screen's pages, and never for a page it holds.
+    #[test]
+    fn a_frame_reads_one_span_of_the_screens_pages() {
+        let mut sx = sx(MODEL);
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let null = Arc::new(File::open("/dev/null").unwrap());
+        let inner = std::mem::replace(&mut sx.win.doc.pages.feed, Box::new(InPlace(null)));
+        sx.win.doc.pages.feed = Box::new(Spy {
+            inner,
+            log: log.clone(),
+        });
+        sx.settle();
+        let over = sx.win.layout.unwrap().rows.center();
+        sx.drv.move_to(&mut sx.win, over);
+        let mut read = std::collections::HashSet::new();
+        let mut seen = log.lock().unwrap().len();
+        for pass in 0..600 {
+            // Down by a few rows, by a screen, or not at all; the link answers now and then.
+            let lines = [-2.0, 0.0, -11.0, 0.0, 0.0, -40.0][pass % 6];
+            let wheel = Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Line,
+                delta: egui::Vec2::new(0.0, lines),
+                phase: egui::TouchPhase::Move,
+                source: egui::MouseWheelSource::Unknown,
+                modifiers: Modifiers::NONE,
+            };
+            sx.drv.frame(&mut sx.win, vec![wheel], Modifiers::NONE);
+            if pass % 3 == 0 {
+                sx.turn();
+            }
+            let all = log.lock().unwrap().clone();
+            let asked: Vec<(u64, usize)> =
+                all[seen..].iter().copied().filter(|r| r.1 > 0).collect();
+            seen = all.len();
+            assert!(asked.len() <= 1, "pass {pass}: {asked:?}");
+            let Some(&(off, len)) = asked.first() else {
+                continue;
+            };
+            let (top, rows) = (sx.win.top_row * ROW, sx.win.rows_painted * ROW);
+            let (first, last) = (top / PAGE, (top + rows - 1) / PAGE);
+            assert_eq!(off % PAGE, 0, "pass {pass}");
+            assert_eq!(len as u64 % PAGE, 0, "pass {pass}");
+            let pages = off / PAGE..(off + len as u64) / PAGE;
+            assert!(
+                pages.start >= first && pages.end <= last + 1,
+                "pass {pass}: pages {pages:?} for a screen on {first}..={last}"
+            );
+            // A page that came is not asked for again while it is held.
+            if sx.win.doc.pending_at().is_none() {
+                for page in pages {
+                    assert!(read.insert(page), "pass {pass}: page {page} read twice");
+                }
+            }
+        }
+        assert!(read.len() > 20, "{} pages read", read.len());
+    }
+
     // ---- the interim Save (06 §7.1, until 07's lands): on a real file, the engine running ----
 
     /// The hex window on a Source over a real local file, the `Origin` on the same file.
@@ -3876,7 +4253,23 @@ mod stream {
         live
     }
 
+    /// The folder part of a path.
+    fn parent_of(path: &str) -> &str {
+        path.rsplit_once('/').map_or("", |(dir, _)| dir)
+    }
+
     impl Live {
+        /// Every file under the test's folder, relative to it, sorted.
+        fn inventory(&self) -> Vec<String> {
+            let root = self.tmp.path();
+            let mut all: Vec<String> = walk(root)
+                .into_iter()
+                .map(|p| p.strip_prefix(root).unwrap().to_string_lossy().into_owned())
+                .collect();
+            all.sort();
+            all
+        }
+
         fn typed(&mut self, text: &str) {
             for c in text.chars() {
                 self.drv.frame(
@@ -4001,6 +4394,25 @@ mod stream {
             let list = std::fs::read_to_string(&lists[0]).unwrap();
             assert!(list.ends_with("0x0: AB\n"), "{why}: {list}");
             assert!(fx.win.doc.dirty(), "{why}: the edit stays in the window");
+            // Everything on disk, by name: the remote file, the fetched copy with its record
+            // and lock (the cache's, as any fetch leaves them), and the list of the edits.
+            // No `.part`, no staged copy, nothing beside the remote.
+            let list = lists[0].file_name().unwrap().to_string_lossy().into_owned();
+            let abs = fx
+                .remote
+                .to_str()
+                .unwrap()
+                .trim_start_matches('/')
+                .to_string();
+            let mut want = vec![
+                "remote/model.bin".to_string(),
+                format!("cache/host/{abs}"),
+                format!("cache/.meta/record/host/{abs}"),
+                format!("cache/.meta/lock/host/{abs}"),
+                format!("cache/.edits/host/{}/{list}", parent_of(&abs)),
+            ];
+            want.sort();
+            assert_eq!(fx.inventory(), want, "{why}");
         }
     }
 
@@ -4028,6 +4440,20 @@ mod stream {
         assert_eq!(fx.win.status.text, "stopped: nothing was written");
         assert_eq!(std::fs::read(&fx.remote).unwrap(), body);
         assert!(fx.win.doc.dirty() && fx.backups().is_empty());
+        // Nothing is left of the stopped fetch but the claim's lock: no copy, no `.part`, no
+        // staged file, no list.
+        let abs = fx
+            .remote
+            .to_str()
+            .unwrap()
+            .trim_start_matches('/')
+            .to_string();
+        let mut stopped = vec![
+            "remote/model.bin".to_string(),
+            format!("cache/.meta/lock/host/{abs}"),
+        ];
+        stopped.sort();
+        assert_eq!(fx.inventory(), stopped, "after Esc");
         // Closing while it fetches: it is stopped, not waited for, and the edit is asked about.
         fx.drv.key(&mut fx.win, Key::S, command(false));
         fx.drv.until(&mut fx.win, 60, |w| {
@@ -4039,6 +4465,147 @@ mod stream {
         assert!(fx.win.prompt, "the unsaved edit is asked about");
         assert_eq!(std::fs::read(&fx.remote).unwrap(), body);
         assert_eq!(fx.fetches(), 2);
+        assert_eq!(fx.inventory(), stopped, "after closing");
+    }
+
+    /// A fetch that is really under way when it is stopped — bytes read, its `.part` being
+    /// filled — leaves no `.part` and no copy either.
+    #[test]
+    fn a_fetch_stopped_midway_leaves_no_part_file() {
+        let body: Vec<u8> = (0..(8u32 << 20)).map(|i| (i % 251) as u8).collect();
+        let mut fx = live(&body);
+        fx.typed("AB");
+        fx.counts.midway.store(true, Ordering::SeqCst);
+        fx.drv.key(&mut fx.win, Key::S, command(false));
+        fx.drv.until(&mut fx.win, 60, |w| {
+            w.fetching.active.load(Ordering::SeqCst) && w.fetching.done.load(Ordering::SeqCst) > 0
+        });
+        let parts = |fx: &Live| -> usize {
+            let all = fx.inventory();
+            all.iter().filter(|p| p.contains(".part-")).count()
+        };
+        assert_eq!(
+            parts(&fx),
+            1,
+            "the fetch is under way: {:?}",
+            fx.inventory()
+        );
+        fx.drv.key(&mut fx.win, Key::Escape, Modifiers::NONE);
+        fx.drv.until(&mut fx.win, 60, |w| w.job.is_none());
+        fx.drv.idle(&mut fx.win, 1);
+        assert_eq!(fx.win.status.text, "stopped: nothing was written");
+        assert!(std::fs::read(&fx.remote).unwrap() == body, "the remote");
+        let abs = fx
+            .remote
+            .to_str()
+            .unwrap()
+            .trim_start_matches('/')
+            .to_string();
+        let mut want = vec![
+            "remote/model.bin".to_string(),
+            format!("cache/.meta/lock/host/{abs}"),
+        ];
+        want.sort();
+        assert_eq!(fx.inventory(), want);
+    }
+
+    /// The same when the fetch itself fails, and when it is stopped: the claim set the earlier
+    /// copy aside before a byte was asked for, so its place is said whatever the fetch did.
+    #[test]
+    fn a_failed_or_stopped_fetch_still_says_where_an_earlier_copy_went() {
+        for stopped in [false, true] {
+            let body = body();
+            let mut fx = live(&body);
+            fx.typed("AB");
+            let cache = fx.tmp.path().join("cache");
+            let cached = crate::cache::cache_path(&cache, "host", fx.remote.to_str().unwrap());
+            crate::cache::private_dir(cached.parent().unwrap()).unwrap();
+            std::fs::write(&cached, b"an earlier session's edits").unwrap();
+            let flag = if stopped {
+                &fx.counts.hold
+            } else {
+                &fx.counts.fail
+            };
+            flag.store(true, Ordering::SeqCst);
+            fx.drv.key(&mut fx.win, Key::S, command(false));
+            if stopped {
+                fx.drv.until(&mut fx.win, 60, |w| {
+                    w.fetching.active.load(Ordering::SeqCst)
+                });
+                fx.drv.key(&mut fx.win, Key::Escape, Modifiers::NONE);
+            }
+            fx.drv.until(&mut fx.win, 60, |w| w.job.is_none());
+            fx.drv.idle(&mut fx.win, 2);
+            let want = if stopped {
+                "stopped: nothing was written"
+            } else {
+                "save failed"
+            };
+            assert_eq!(fx.win.status.text, want);
+            assert!(std::fs::read(&fx.remote).unwrap() == body, "the remote");
+            let said = fx.win.opened.join("\n");
+            let kept: Vec<String> = fx
+                .inventory()
+                .into_iter()
+                .filter(|p| {
+                    std::fs::read(fx.tmp.path().join(p)).unwrap() == b"an earlier session's edits"
+                })
+                .collect();
+            assert_eq!(kept.len(), 1, "{want}: {kept:?}");
+            assert!(
+                said.contains("kept it at ") && said.contains(&kept[0]),
+                "{want}: the earlier copy's place is not said: {said:?}"
+            );
+            // Said once, however often the Save is tried again.
+            fx.drv.key(&mut fx.win, Key::S, command(false));
+            if stopped {
+                fx.drv.until(&mut fx.win, 60, |w| {
+                    w.fetching.active.load(Ordering::SeqCst)
+                });
+                fx.drv.key(&mut fx.win, Key::Escape, Modifiers::NONE);
+            }
+            fx.drv.until(&mut fx.win, 60, |w| w.job.is_none());
+            fx.drv.idle(&mut fx.win, 2);
+            let again = fx.win.opened.join("\n");
+            assert_eq!(again.matches("kept it at ").count(), 1, "{want}: {again}");
+        }
+    }
+
+    /// What the whole fetch set aside is said even when the Save is then refused — the
+    /// earlier copy's place reaches the owner whatever the fingerprint check says.
+    #[test]
+    fn a_refused_fetch_still_says_where_an_earlier_copy_went() {
+        let body = body();
+        let mut fx = live(&body);
+        fx.typed("AB");
+        // An earlier session's copy, with no record of what it held, where the fetch goes.
+        let cache = fx.tmp.path().join("cache");
+        let cached = crate::cache::cache_path(&cache, "host", fx.remote.to_str().unwrap());
+        crate::cache::private_dir(cached.parent().unwrap()).unwrap();
+        std::fs::write(&cached, b"an earlier session's edits").unwrap();
+        let mut longer = body.clone();
+        longer.extend_from_slice(b"appended by someone else");
+        std::fs::write(&fx.remote, &longer).unwrap();
+        fx.drv.key(&mut fx.win, Key::S, command(false));
+        fx.drv.until(&mut fx.win, 60, |w| w.job.is_none());
+        fx.drv.idle(&mut fx.win, 2);
+        assert_eq!(fx.win.status.text, "not saved: the file changed");
+        let said = fx.win.opened.join("\n");
+        assert!(
+            said.contains("kept it at "),
+            "the earlier copy's place: {said:?}"
+        );
+        let kept: Vec<String> = fx
+            .inventory()
+            .into_iter()
+            .filter(|p| {
+                std::fs::read(fx.tmp.path().join(p)).unwrap() == b"an earlier session's edits"
+            })
+            .collect();
+        assert_eq!(kept.len(), 1, "{kept:?}");
+        assert!(said.contains(&kept[0]), "{said} names {kept:?}");
+        let refusal = fx.win.notices.join("\n");
+        assert!(refusal.contains("changed since it was opened"), "{refusal}");
     }
 
     /// Save copy of a streamed file runs on the same one fetch and writes a new sibling.
@@ -4137,7 +4704,11 @@ mod stream {
         assert_eq!(counts.fetches.load(Ordering::SeqCst), 1);
         // The patches read their own pages through the stream: two blocks, not the file.
         let stats = source.stats();
-        assert!(stats.delivered >= 2 * PAGE, "{stats:?}");
+        assert_eq!(
+            stats.delivered,
+            2 * PAGE,
+            "the two patches' pages and nothing else through the stream: {stats:?}"
+        );
         // A patch past the end, and one with nothing to change: no save, nothing fetched.
         let (_tmp, remote, _source, counts, file) = live_file(&body);
         let same = format!("patch=0:{:02X}", body[0]);

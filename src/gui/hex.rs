@@ -386,6 +386,9 @@ impl Pages {
             (None, _) => None,
         };
         let Some((a, b)) = span else {
+            // Every page of the screen is here: what was asked for another place is no longer
+            // waited for (06 §4: the latest place wins).
+            self.withdraw(off);
             return;
         };
         match ask {
@@ -393,6 +396,8 @@ impl Pages {
             Ask::Wait => {
                 self.failed = false;
                 self.pending_at = Some((a * PAGE).max(off));
+                // The thumb moved on: the place it left is not fetched.
+                self.withdraw(off);
                 return;
             }
             Ask::Failed => return self.failed = true,
@@ -418,6 +423,14 @@ impl Pages {
             Poll::Ready(Err(ReadError::Reloaded)) => self.renew(off),
             // What is shown stays (06 §5); only what is not here cannot be read.
             Poll::Ready(_) => self.failed = true,
+        }
+    }
+
+    /// The stream's wait for another place ends, unsent: a read of no length there is the
+    /// reader's move away (nothing is fetched for it).
+    fn withdraw(&mut self, off: u64) {
+        if self.feed.waiting().is_some() {
+            let _ = self.feed.try_read(off, 0);
         }
     }
 
@@ -1289,17 +1302,14 @@ pub(super) struct HexWindow {
     /// Cmd/Ctrl+R was pressed and the reload has not landed: nothing is edited or saved. Its
     /// worker waits for the stream (an open and an `fstat` on its connection), not a frame.
     reloading: Option<Receiver<std::result::Result<(), String>>>,
-    /// What the stream's state last said on the status row: when it says something new, that
-    /// shows, whatever the window said before.
-    stream_said: Option<String>,
     /// The first row the scroll bar's thumb last put on top, and since when (the window's
     /// clock): a place is fetched once the thumb has rested there (06 §7.1).
     thumb: Option<(u64, f64)>,
     /// The stats line's `first` was marked (06 §11): a frame drew bytes from the stream.
     marked_first: bool,
-    /// The screen has rows on their way, marked as an `input` (or the open's own first rows):
-    /// the frame that shows them marks `ready` (or `first`).
-    awaiting: bool,
+    /// The screen (its first offset) whose rows are on their way, marked as an `input` (or the
+    /// open's own first rows): the frame that shows that screen marks `ready` (or `first`).
+    awaiting: Option<u64>,
     /// A preview in the file browser (02 §4.2): its first rows in a single-lined frame, no
     /// toolbar, status row, cursor or disclosures, no input of its own, and it never takes the
     /// keyboard.
@@ -1408,10 +1418,9 @@ impl HexWindow {
             state_patches: VecDeque::new(),
             blocked: None,
             reloading: None,
-            stream_said: None,
             thumb: None,
             marked_first: false,
-            awaiting: false,
+            awaiting: None,
             preview: false,
             #[cfg(test)]
             save_starts: 0,
@@ -1578,8 +1587,11 @@ impl HexWindow {
         }
         let here = self.doc.pending_at().is_none() && self.doc.cell(off) != Cell::Unreadable;
         let on_their_way = self.doc.pending_at().is_some();
-        if on_their_way && !self.awaiting {
-            self.awaiting = true;
+        // Each place asked for is an input of its own: a second jump before the first has
+        // arrived is marked too, and a frame that stays where it is marks nothing. A place the
+        // thumb only passes is not asked for, so it is not one.
+        if on_their_way && ask == Ask::Read && self.awaiting != Some(off) {
+            self.awaiting = Some(off);
             if self.marked_first {
                 let place = match self.cursor.at {
                     at if (off..off + len).contains(&at) => at,
@@ -1590,9 +1602,11 @@ impl HexWindow {
         }
         if here && !self.marked_first {
             self.marked_first = true;
-            self.awaiting = false;
+            self.awaiting = None;
             source.mark(Mark::First);
-        } else if here && std::mem::take(&mut self.awaiting) {
+        } else if here && self.awaiting.take() == Some(off) {
+            // The screen waited for is the one shown. Rows that were held all along (the view
+            // went back to them) end the wait without a `ready`: the place never showed.
             source.mark(Mark::Ready);
         }
     }
@@ -2146,9 +2160,10 @@ impl HexWindow {
         format!("0x{at:X} ({at}) · {byte}")
     }
 
-    /// What the status row says now. A whole fetch's progress comes first, then a key that did
-    /// nothing because its byte is loading, then an error already there; then the stream's
-    /// state (06 §5), rows on their way, and last what the window said itself.
+    /// What the status row says now: a whole fetch's progress, else a reload under way, else a
+    /// key that did nothing because its byte is loading, else an error already there, else
+    /// rows on their way, else what the window last said. The stream's own warning is not
+    /// here: see [`HexWindow::stream_warning`].
     pub(super) fn status_text(&mut self, ctx: &egui::Context) -> Status {
         if self.fetching.active.load(Ordering::SeqCst) {
             let done = self.fetching.done.load(Ordering::SeqCst);
@@ -2166,24 +2181,20 @@ impl HexWindow {
         if let Some(at) = self.blocked {
             return Status::info(format!("0x{at:X} is still loading"));
         }
-        let said = self.stream.as_ref().and_then(|s| s.state().status());
-        if said != self.stream_said {
-            // The stream says something new: an error the window said before does not hide it.
-            self.stream_said.clone_from(&said);
-            if said.is_some() {
-                self.status = Status::default();
-            }
-        }
         if self.status.error {
             return self.status.clone();
         }
-        if let Some(text) = said {
-            return Status::error(text);
+        match self.loading_line(ctx) {
+            Some(line) => Status::info(line),
+            None => self.status.clone(),
         }
-        if let Some(line) = self.loading_line(ctx) {
-            return Status::info(line);
-        }
-        self.status.clone()
+    }
+
+    /// The stream's warning (06 §5: replaced, changed, failed), for as long as that is its
+    /// state. It is shown whole in the rows below the grid, where no line of the status row can
+    /// take it off or cut its reload hint short.
+    pub(super) fn stream_warning(&self) -> Option<String> {
+        self.stream.as_ref().and_then(|s| s.state().status())
     }
 
     /// One line whatever it says (see [`super::one_line`]): the grid above must not move.
@@ -2257,7 +2268,17 @@ impl HexWindow {
         );
         let total = size.div_ceil(per);
         let visible = ((rows_rect.height() / row_h).floor() as u64).max(1);
-        self.visible = visible;
+        // The grid got shorter (a warning or a notice took rows off its bottom, the window
+        // shrank) and the cursor's row, on screen until now, would fall off: the grid scrolls
+        // down by just the rows that keep it whole. A cursor already in view moves nothing, and
+        // one scrolled away from is not pulled back.
+        let was = std::mem::replace(&mut self.visible, visible);
+        if !self.preview && self.painted && visible < was && size > 0 {
+            let row = self.cursor.at / ROW;
+            if (self.top_row..self.top_row + was).contains(&row) && row >= self.top_row + visible {
+                self.top_row = row + 1 - visible;
+            }
+        }
         let max_top = total.saturating_sub(visible);
 
         // A preview takes no click, drag or wheel, and never the keyboard (it belongs to the
@@ -2350,7 +2371,11 @@ impl HexWindow {
                 }
             }
         }
-        if std::mem::take(&mut self.follow) && size > 0 {
+        // On the window's first pass the rows below the grid have not taken their height yet:
+        // the cursor is followed again on the next one, or `at=` would leave its row half cut.
+        let follow = self.follow;
+        self.follow &= !self.painted;
+        if follow && size > 0 {
             let row = self.cursor.at / ROW;
             if row < self.top_row {
                 self.top_row = row;
@@ -2586,9 +2611,10 @@ impl super::Window for HexWindow {
             ui.add_space(2.0);
         });
         let error = ui.visuals().error_fg_color;
-        let lines: Vec<(String, Color32)> = self
-            .opened
+        let warning = self.stream_warning();
+        let lines: Vec<(String, Color32)> = warning
             .iter()
+            .chain(&self.opened)
             .chain(&self.read_only)
             .chain(&self.notices)
             .map(|n| (n.clone(), error))

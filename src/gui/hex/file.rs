@@ -425,7 +425,10 @@ impl HexFile {
         let abs = self.origin.abs.clone();
         let fs = self.origin.fs()?;
         self.connected = true;
-        let (fetched, _ms) = crate::cache::fetch_claimed_cancellable(
+        // What the claim set aside is said whatever comes next — a fetch that fails or is
+        // stopped, a refusal below: the owner is told where an earlier copy's edits went.
+        let mut said = Vec::new();
+        let result = crate::cache::fetch_claimed_said(
             fs,
             &host,
             &abs,
@@ -435,7 +438,10 @@ impl HexFile {
                 fetching.total.store(total, Ordering::SeqCst);
             },
             &fetching.cancel,
-        )?;
+            &mut said,
+        );
+        self.fetch_notices.extend(said);
+        let (fetched, _ms) = result?;
         if fetched.at.size != opened.size {
             return Ok(Some(format!(
                 "{} bytes then, {} now",
@@ -454,7 +460,6 @@ impl HexFile {
             opened: base.opened,
         });
         self.claim = Some(fetched.claim);
-        self.fetch_notices = fetched.notices;
         Ok(None)
     }
 

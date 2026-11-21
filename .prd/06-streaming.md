@@ -70,6 +70,10 @@ The first two paragraphs are this document. The third is 07.
     preview session (§13).
   - The viewer's `Origin` then holds a **placeholder** connection that connects on first use, which
     is 02 §4.4's rule for a previewed window. Save, Save copy, Export and a reconnect are what use it.
+  - **Whether the server can replace a file is asked at the first Save, not at open.** The
+    placeholder answers `can_replace` without connecting: until its first use the window takes the
+    answer as yes, and the first Save connects and asks before it fetches or writes anything
+    (§7.1).
   - So viewing costs one SFTP session (§6).
 - **Every read carries its own offset.** A read of `len` bytes at `off` goes out with that offset
   (`start_seek(Start(off))` on a `File` clone), never through a shared cursor. Each read is clipped
@@ -314,7 +318,7 @@ replaced it.
 | `Live` | unchanged | normal |
 | `Replaced` | the path names another file; the handle's file is unchanged | keeps showing the version opened, consistently; status row: `the remote file was replaced; showing the version opened — Cmd/Ctrl+R reloads` |
 | `Changed` | the handle's size or mtime moved | **drops the whole cache** (blocks from before and after must not mix), keeps the screen it has and reads no more; `the file changed on the remote — Cmd/Ctrl+R reloads` |
-| `Failed(reason)` | a read got an SFTP status error, or the channel closed | the screen stays; the reason is on the status row; the next key, click or scroll retries, at most once per second |
+| `Failed(reason)` | a read got an SFTP status error, or the channel closed | the screen stays; the reason is on the status row; the next key, click or scroll retries, at most once per second. The viewer holds its own reads back until then: `Reader::try_read` asks for a retry on every read of something not cached, so a frame the stream itself woke reads nothing that is missing |
 | `Closed` | the viewer is gone | — |
 
 - **Reload** (Cmd/Ctrl+R in every viewer) re-opens the path, takes a new fingerprint and drops the
@@ -322,6 +326,10 @@ replaced it.
   save (below) is never merged away. The text viewer indexes again, the media window probes again, and the hex window keeps its
   offset. The key is Cmd/Ctrl+R and not R alone, because in the hex window's ASCII column R types a
   byte.
+  - **Not over edits saved nowhere.** While the hex window has edits that are in neither the file
+    nor a Save copy, Cmd/Ctrl+R is refused and the status row says so: they were made over the
+    version shown. Otherwise the reload drops the edits and every undo and redo step, and keeps the
+    offset within the new size (§7.1).
 - **Retry** reconnects through the viewer's existing `Reconnect` (`src/gui/mod.rs:34`), re-opens and
   `fstat`s. The same `(size, mtime)` gives `Live` and the cache is kept; anything else is `Changed`.
   SFTP v3 attributes carry no inode, so after a reconnect only `(size, mtime)` can be compared.
@@ -444,29 +452,53 @@ The owner's 24 GB model file lands here: `.safetensors`, `.gguf` and `.bin` are 
     colour, the status row says `loading 0x…`, and the frame repaints when it arrives.
   - A page that failed is the status row's `Failed` text and is retried. Today a failed read is held
     as an empty page (`Pages::byte`) and shows as nothing.
+  - **The stream's warning stays on screen** for as long as its state is `Replaced`, `Changed` or
+    `Failed` (§5): whole, with its reload hint, in the rows below the grid, where the window's
+    notices go. The status row is one line and is cut to the window's width; it keeps the
+    window's own line (a key that did nothing, an error of the window's, `loading 0x…`), so
+    neither takes the other off.
+  - **The cursor stays on screen when the grid gets shorter** — the warning's row or a notice
+    appears, or the window shrinks. If the cursor's row was on screen and would fall off the
+    bottom, the grid scrolls down by the fewest rows that keep it whole. A cursor still in view
+    moves nothing, and one the owner scrolled away from is not pulled back.
 - **Prefetch.** One Interactive reader at the screen, with its margin (§4). Scrolling down grows the
   readahead to 1 MiB.
 - **Jumps.** Cmd/Ctrl+G, Cmd/Ctrl+Home and Cmd/Ctrl+End are jumps. So is a scroll-bar drag, which
   fetches only where the thumb rests: no demand is sent for a position the thumb passes, only after
   it has rested 100 ms or is released. Demand queued for a position passed, and not yet sent, is
   dropped.
+  - **A demand left behind is withdrawn.** When the view goes back to rows it holds, the frame reads
+    nothing, so it tells the reader it has moved (a read of no length): the far place's demand, if
+    it was not sent yet, never goes out. The same when the thumb moves on from a place.
 - **Edits keep the byte they replaced.** Each patch holds the byte the file had there, read when
-  the edit was typed. Its page is on screen, so it is present.
+  the edit was typed. So an edit is made only where the page is present.
   - So `changed`, `differ`, `changed_count`, `dirty` and `unsaved` compare a patch with its own
     replaced byte and never read the file.
   - This fixes a bug in today's code. Those functions read the file's byte for every patch, through
     a synchronous `read_exact_at` on the frame thread, and count a byte that cannot be read as
     changed. Over a stream that would block a frame or misreport.
-  - A byte whose page is Pending cannot be typed over. The keystroke does nothing, and the status
-    row says `0x… is still loading`.
-  - A `SOPEN_STATE` patch waits for its bytes.
+  - **A key on a byte whose page is not present changes nothing**, and the status row says
+    `0x… is still loading`. The page need not be the screen's: the cursor can be left behind by the
+    wheel on a page since dropped from the page cache. The key brings the cursor's row back on
+    screen, which fetches it.
+  - A `SOPEN_STATE` patch names any offset, so it waits for its bytes: the window is not ready, and
+    `close=ask` does not ask, until every patch has landed.
+- **Reload** (Cmd/Ctrl+R, §5) is refused while edits are saved nowhere. Otherwise it drops the
+  edits and the undo and redo steps, and clamps the offset to the new size. The key is the window's
+  only when it reads through a stream; a file read in place leaves it to the browser.
 - **Save until 07 lands (interim).** Save and Save copy of a streamed file first fetch the whole
   file into the cache exactly as today's fetch does: claimed, recorded, pipelined (§2), with
   progress on the status row and Esc to stop. Today's Save then runs on that copy.
   - The fetch must equal `Source::opened()`. A different `(size, mtime)` is refused as a change.
   - Its SHA-256 is 01 §5's baseline, as today.
+  - **Whether the server can replace a file** is asked here, at the `Origin`'s first use (§2),
+    before the fetch.
+  - **Closing during the fetch stops it.** Nothing has been written yet, so the window does not
+    wait for the fetch as it waits for a write: the fetch is stopped, and closing then asks about
+    the edits as it would with no save running.
   - 07 replaces this with its Save, which fetches nothing. It is the only whole fetch the hex window
-    ever makes.
+    makes of a version it opened: after Cmd/Ctrl+R the copy fetched is of the version before, so
+    the next Save fetches the reloaded one and backs it up first.
 
 ### 7.2 Text (the browser's text viewer)
 
@@ -934,7 +966,7 @@ None blocks a window before it shows.
 | Action | Reads | Progress | Cancel |
 |---|---|---|---|
 | Image decode (§7.3) | the whole file, Bulk reader, into memory | bytes / size, with previews | Esc, or closing: the reader stops, nothing is kept |
-| Interim hex Save (§7.1, until 07) | the whole file into the cache, as today | the status row | Esc (`fetch_claimed_cancellable`) |
+| Interim hex Save (§7.1, until 07) | the whole file into the cache, as today | the status row | Esc (`fetch_claimed_cancellable`), or closing: the fetch stops, then closing asks about the edits |
 | "Save to…" (§7.5) | the whole file into the private staging file | the dialog's bytes / size | **new:** Esc and closing |
 | Waveform (§7.4) | every byte of an audio-only file, Bulk reader | the waveform fills in | closing kills the decoder and drops its reader |
 | Text Go to past the prefix (§7.2) | from the last mark to the line | `indexing… X of Y` | Esc |
@@ -1157,7 +1189,7 @@ Left as whole fetches, with the fetch now pipelined (§2):
 |---|---|
 | `SOPEN_STREAM_STATS=1` | One line on stderr at each event, per Source (format below). Every live byte bound of §12 is read from these lines. |
 | `SOPEN_STREAM_THROTTLE=<ms>,<bytes/s>` | Every `Ranged` read is delayed by `<ms>` and paced to `<bytes/s>`, as the `Fake` does in tests, so a screenshot can catch rows still loading or a partial picture. |
-| `SOPEN_STATE=…;loading=1` | Hex, text and image: a scripted `SOPEN_SCREENSHOT` is taken at the first frame drawn with content from the stream: rows, or a thumbnail or partial picture. Pending rows are shot as they are. Without it, a streamed viewer is ready, and shot, once the screen's bytes have arrived or failed. |
+| `SOPEN_STATE=…;loading=1` | Hex, text and image: a scripted `SOPEN_SCREENSHOT` is taken at the first frame drawn with content from the stream: rows, or a thumbnail or partial picture. Pending rows are shot as they are: the hex window is ready at its first painted frame, before any byte has come (the `first` event is later, below). Without it, a streamed viewer is ready, and shot, once the screen's bytes have arrived or failed. |
 
 **The stats line:**
 
@@ -1168,10 +1200,15 @@ stream <event> t=<ms> <host:/abs> fetched=<b> demand=<b> prefetch=<b> bulk=<b> d
 
 - **The events**, each with `t` in ms since the open began:
   - `open`: the open began (the Enter, the dialog's button, or `--hex`);
-  - `first`: the first frame drawn with content from the stream;
+  - `first`: the first frame drawn with content from the stream: bytes, not rows that are only
+    pending;
   - `idle`: 2 s after `first` with no input in between;
   - `input`: a key, click or drag that moves the view to a place not yet shown (a jump, End, Go to,
-    a scrub or a seek), with that place;
+    a scrub or a seek), with that place. The hex window marks it only when rows of the new place
+    are not held: a jump back to rows in its page cache gives no `input` and no `ready`. Each
+    place asked for is an `input` of its own, so a second jump made before the first has arrived
+    is marked too, and the `ready` that follows is the last one's. A frame that stays where it is
+    marks nothing, and a place the thumb only passes is not an `input`;
   - `ready`: the first frame showing content for the last `input`'s place: rows, a video frame, or
     the first PCM given to the audio output;
   - `close`: the Source closed.
@@ -1220,6 +1257,9 @@ stream <event> t=<ms> <host:/abs> fetched=<b> demand=<b> prefetch=<b> bulk=<b> d
   back to the top, then hold PgUp for 10 s.
   - Gate (`Fake`, the same key and drag script):
     `fetched ≤ delivered + runs × 1 MiB + jumps × (128 KiB + cap)`.
+  - Gate, absolute: the inequality cannot catch a viewer that reads more than it shows, because
+    what it reads counts as delivered. So for the gate's script (400 PgDn, the drag, 150 PgUp: 552
+    screens shown) `delivered ≤ 2 × the bytes shown + 64 KiB`, and `fetched ≤ 3 MiB`.
   - Qualification: the same inequality on the `close` line, and resident memory at most **80 MiB**
     above the window's at `first` (64 MiB of blocks, 4 MiB in flight, the page cache and slack).
   - Both: the cache directory is unchanged.
@@ -1448,7 +1488,7 @@ that shows something on screen also brings a screenshot receipt someone looked a
 | W5b | **Large text files by byte position.** The prefix index, byte-offset keys in `TextWindow` and wrap, unknown line starts, Go to, the index memory bound (§7.2) | `src/gui/text.rs`, `src/gui/text/wrap.rs`, `src/gui/text/tests.rs` | W5a |
 | W6 | **Image streams.** Header walk with the SOF read directly, thumbnail, the memory line with Continue, the reserved buffer, the streamed read, partial pictures for the four measured formats (plain PNG included) | `src/gui/image.rs`, `src/gui/image/probe.rs` (new), `src/gui/image/robustness_tests.rs`; `Cargo.toml` and `Cargo.lock` (the direct `png` dependency) | W2; S1 merged; X4 |
 | W7 | **Media streams.** URL `Input`s with their own input options and reader kinds, the progressive waveform on a `bulk` connection, Export through the URL and its Cancel, runs failed on a cut response | `src/gui/media.rs`, `src/gui/media/*`, `src/gui/playback.rs`, `src/ffmpeg.rs`, `src/cut.rs` | W3; S1, PR #15 and S1-M merged; X5 |
-| W8 | **Routing.** The browser's Enter, the standalone route, the dialog and `--hex` open a Source instead of fetching, with the placeholder `Origin`; the image → hex switch (§7.3); the preview change below, with its 02 §4.3–§4.4 text and S1's tests it changes; the `.ts` refine over the URL; "Save to…" cancel; `bytes_fetched`; forwarding §11's hooks | `src/gui/browser/prepare.rs`, `src/gui/browser/preview.rs` (the hand-over only), `src/gui/browser.rs` (the hex switch), `src/gui/browser/tests.rs` (P6 and P12's remote parts), `src/cache.rs` (the `.preview` root, if unused), `src/gui/binary.rs`, `src/gui/binary/tests.rs`, `src/main.rs`, `src/kind.rs`, `src/usage.rs`, `src/forward.rs`, `src/gui/mod.rs` (`Origin`), `tests/cli.rs`, `.prd/02-architecture.md` (§4.3–§4.4) | W4, W5a, W5b, W6, W7 and ED6; S1 and S1-M merged |
+| W8 | **Routing.** The browser's Enter, the standalone route, the dialog and `--hex` open a Source instead of fetching, with the placeholder `Origin`; the image → hex switch (§7.3); the preview change below, with its 02 §4.3–§4.4 text and S1's tests it changes; the `.ts` refine over the URL; "Save to…" cancel; `bytes_fetched`; forwarding §11's hooks; the placeholder `Origin` answers `can_replace` without connecting at open (§2); the `Window` trait gains a shown / hidden call and the browser calls `Source::set_visible` through it, so a viewer behind the list does not poll (§5) | `src/gui/browser/prepare.rs`, `src/gui/browser/preview.rs` (the hand-over only), `src/gui/browser.rs` (the hex switch), `src/gui/browser/tests.rs` (P6 and P12's remote parts), `src/cache.rs` (the `.preview` root, if unused), `src/gui/binary.rs`, `src/gui/binary/tests.rs`, `src/main.rs`, `src/kind.rs`, `src/usage.rs`, `src/forward.rs`, `src/gui/mod.rs` (`Origin`), `tests/cli.rs`, `.prd/02-architecture.md` (§4.3–§4.4) | W4, W5a, W5b, W6, W7 and ED6; S1 and S1-M merged |
 
 07 §14 has the edit units (ED1–ED6) and the docs unit (D1), which rewrites 01, AGENTS.md and the
 README once the code has landed. The experiments X1–X5 and the merge order across both workstreams
