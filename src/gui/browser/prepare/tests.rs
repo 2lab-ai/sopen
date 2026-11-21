@@ -704,14 +704,19 @@ fn budgets_hit_show_the_info_card() {
             "the preview took over 0 s: Enter opens it"
         );
     }
-    // A video or a sound ffprobe cannot read is its card, saying so.
+    // A video or a sound ffprobe cannot read is its card: the reason first, as ffprobe gives
+    // it without the path, then what could not be done to which file — named once.
     if media_tools().is_some() {
         for (name, kind) in [("clip.mp4", "video"), ("song.mp3", "audio")] {
             let abs = fx.file(name, b"not really media");
             let p = fx.preview(&abs);
-            let why = card_why(&p);
-            assert!(why.starts_with("ffprobe cannot read "), "{name}: {why}");
-            assert_eq!(p.card().unwrap().kind.map(Kind::as_str), Some(kind));
+            assert_eq!(card_why(&p), "Invalid data found when processing input");
+            let card = p.card().unwrap();
+            assert_eq!(
+                card.what.as_deref(),
+                Some(format!("ffprobe cannot read {abs}").as_str())
+            );
+            assert_eq!(card.kind.map(Kind::as_str), Some(kind));
         }
     }
     let gone = fx.root.join("vanished.txt");
@@ -1567,7 +1572,7 @@ fn a_read_lifted_mid_way_goes_past_its_read_budget() {
 use crate::ffmpeg::{spawns, Tools};
 use crate::gui::media::fixtures::{
     bounded, clip, make as make_media, none_left, stand_in, started_under, still_running, tone,
-    tools as media_tools, until, Hand, Hold,
+    tools as media_tools, until, Hand,
 };
 use crate::gui::media::wave;
 
@@ -1757,16 +1762,17 @@ fn a_handed_over_remote_sound_decodes_on_from_its_copy() {
 /// stand-in is killed and reaped. The time is the test's clock: nothing is waited for.
 #[test]
 fn a_stalled_ffprobe_is_a_card_when_its_time_is_over_and_no_process_is_left() {
-    bounded(60, || {
+    bounded(60, |t| {
         let mut fx = local();
-        let hold = Hold::new(&base(&fx), "hold");
+        t.also(&base(&fx));
+        let hold = t.hold(&base(&fx), "hold");
         let stalls = stand_in(&base(&fx), "stalls", &hold.stalls());
         let tools = Tools {
             ffmpeg: stalls.clone(),
             ffprobe: stalls,
         };
         let abs = fx.file("hangs.mp4", b"whatever is in it");
-        let hand = Hand::new();
+        let hand = t.hand();
         let budget = budget_on(&hand, tools);
         let root = fx.root.clone();
         let p = std::thread::scope(|scope| {
@@ -1793,9 +1799,10 @@ fn a_stalled_ffprobe_is_a_card_when_its_time_is_over_and_no_process_is_left() {
 /// The real clock: a stalled probe held to 300 ms is its card about then.
 #[test]
 fn on_the_real_clock_a_stalled_ffprobe_is_a_card_in_time() {
-    bounded(60, || {
+    bounded(60, |t| {
         let mut fx = local();
-        let hold = Hold::new(&base(&fx), "hold");
+        t.also(&base(&fx));
+        let hold = t.hold(&base(&fx), "hold");
         let stalls = stand_in(&base(&fx), "stalls", &hold.stalls());
         let tools = Tools {
             ffmpeg: stalls.clone(),
@@ -1826,17 +1833,18 @@ fn a_cancel_during_the_first_frame_stops_its_ffmpeg() {
     if SftpRemote::local_server().is_none() {
         return;
     }
-    bounded(60, move || {
+    bounded(60, move |t| {
         let mut fx = remote().unwrap();
+        t.also(&base(&fx));
         let video = fx.root.join("clip.mp4");
         clip(&real, &video, (160, 120));
         let abs = video.to_str().unwrap().to_string();
-        let hold = Hold::new(&base(&fx), "hold");
+        let hold = t.hold(&base(&fx), "hold");
         let tools = Tools {
             ffmpeg: stand_in(&base(&fx), "stalls", &hold.stalls()),
             ffprobe: real.ffprobe,
         };
-        let budget = budget_on(&Hand::new(), tools);
+        let budget = budget_on(&t.hand(), tools);
         let cancel = AtomicBool::new(false);
         let cache = fx.cache.clone();
         let result = std::thread::scope(|scope| {
@@ -1871,17 +1879,19 @@ fn a_lifted_budget_lets_a_probe_go_on_past_its_time() {
     let Some(real) = media_tools() else { return };
     for lifted in [false, true] {
         let real = real.clone();
-        bounded(60, move || {
+        bounded(60, move |t| {
             let mut fx = local();
+            t.also(&base(&fx));
+            t.also(&base(&fx));
             let video = fx.root.join("clip.mp4");
             clip(&real, &video, (160, 120));
-            let hold = Hold::new(&base(&fx), "hold");
+            let hold = t.hold(&base(&fx), "hold");
             let tools = Tools {
                 ffmpeg: real.ffmpeg,
                 ffprobe: stand_in(&base(&fx), "held-ffprobe", &hold.then(&real.ffprobe)),
             };
             let abs = video.to_str().unwrap().to_string();
-            let hand = Hand::new();
+            let hand = t.hand();
             let budget = budget_on(&hand, tools);
             if lifted {
                 budget.lift();
@@ -1912,4 +1922,92 @@ fn a_lifted_budget_lets_a_probe_go_on_past_its_time() {
             assert_none_left(&base(&fx));
         });
     }
+}
+
+/// A card in a small side (a 480×320 window's): the reason is whole inside the side — it comes
+/// before what it is about, and that part gives way first.
+#[test]
+fn a_cards_reason_is_never_cut_in_a_small_side() {
+    if media_tools().is_none() {
+        return;
+    }
+    let mut fx = local();
+    let deep = fx
+        .root
+        .join("a folder with a long name/and another one inside it");
+    std::fs::create_dir_all(&deep).unwrap();
+    let file = deep.join("a clip with a long name.mp4");
+    std::fs::write(&file, b"not really media").unwrap();
+    let mut p = fx.preview(file.to_str().unwrap());
+    let why = card_why(&p);
+    assert_eq!(why, "Invalid data found when processing input");
+    let mut drv = Driver::new(236.0, 230.0);
+    shown(&mut drv, &mut Host(&mut p.embedded.window));
+    assert!(
+        drv.find_text(&why).is_some(),
+        "the reason, whole, inside the side"
+    );
+    // In a side with room, what it is about is there too, under it.
+    let mut drv = Driver::new(500.0, 420.0);
+    shown(&mut drv, &mut Host(&mut p.embedded.window));
+    let reason = drv.find_text(&why).expect("the reason");
+    let about = drv
+        .texts_starting_with("ffprobe cannot read ")
+        .into_iter()
+        .next()
+        .expect("what it is about");
+    assert!(about.0.top() >= reason.bottom() - 1.0, "under the reason");
+    assert!(
+        about.1.ends_with("a clip with a long name.mp4"),
+        "{}",
+        about.1
+    );
+}
+
+/// A remote file's card names the file as the owner knows it — `host:/abs` — never the private
+/// copy the preview read; and a remote file over the read limit, of which nothing is read,
+/// still says its kind (by its name).
+#[test]
+fn a_remote_card_names_the_remote_file_and_says_its_kind() {
+    let Some(mut fx) = remote() else { return };
+    if media_tools().is_some() {
+        let abs = fx.file("broken.mp4", b"not really media");
+        let p = fx.preview(&abs);
+        let card = p.card().expect("a card");
+        assert_eq!(card.why, "Invalid data found when processing input");
+        assert_eq!(
+            card.what.as_deref(),
+            Some(format!("ffprobe cannot read box:{abs}").as_str())
+        );
+    }
+    let big = fx.file("big.mp4", &vec![7u8; 200 << 10]);
+    let limits = Limits {
+        read: 100 << 10,
+        ..Limits::PREVIEW
+    };
+    let p = fx.preview_limited(&big, limits);
+    assert_eq!(card_why(&p), "over the preview limit: Enter opens it");
+    assert_eq!(p.card().unwrap().kind, Some(Kind::Video), "by its name");
+    assert_eq!(fx.counts.heads.load(Ordering::Relaxed), 0, "nothing read");
+    let mut p = p;
+    let mut drv = Driver::new(500.0, 400.0);
+    shown(&mut drv, &mut Host(&mut p.embedded.window));
+    assert!(drv.find_text("Kind").is_some(), "the card's Kind row");
+}
+
+/// Enter on a remote file that then cannot be opened (an empty `.mp4`) leaves no copy of it in
+/// the cache: what was fetched for the failed open is removed.
+#[test]
+fn a_remote_open_that_fails_leaves_no_cached_copy() {
+    if media_tools().is_none() {
+        return;
+    }
+    let Some(fx) = remote() else { return };
+    let abs = fx.file("empty.mp4", b"");
+    let result = prepare(&fx.request(&abs), &AtomicBool::new(false), &mut |_, _| {});
+    assert!(result.is_err(), "it cannot be opened");
+    let cached = crate::cache::cache_path(&fx.cache, "box", &abs);
+    assert!(!cached.exists(), "its copy was left in the cache");
+    let left: Vec<_> = fx.cache_files().into_keys().collect();
+    assert!(left.is_empty(), "{left:?}");
 }

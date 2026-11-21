@@ -6,7 +6,7 @@
 //! its window goes ([`Decode`]); one that follows a preview goes on from where the preview's
 //! stopped ([`resume`], 02 §4.4).
 
-use super::child::Slot;
+use super::child::{Ending, Slot};
 use super::timeline::{Clip, Timeline};
 use crate::ffmpeg::{Input, Tools};
 use std::io::{BufReader, Read};
@@ -154,9 +154,15 @@ pub fn command(tools: &Tools, input: &Input, lanes: usize, from: f64, len: Optio
     if let Some(len) = len {
         cmd.arg("-t").arg(format!("{len:.6}"));
     }
-    cmd.arg("-i")
-        .arg(input.arg())
-        .args(["-vn", "-ac", &lanes.to_string(), "-ar"])
+    cmd.arg("-i").arg(input.arg()).arg("-vn");
+    if lanes >= 2 {
+        // The source's first two channels as they are — of a sound in more than two, not a
+        // mix of them all (its lanes are named after those two channels).
+        cmd.args(["-af", "pan=stereo|c0=c0|c1=c1"]);
+    } else {
+        cmd.args(["-ac", "1"]);
+    }
+    cmd.arg("-ar")
         .arg(format!("{RATE}"))
         .args(["-f", "f32le", "-"])
         .stdin(Stdio::null())
@@ -244,7 +250,20 @@ pub fn start(
     duration: f64,
     wake: impl Fn() + Send + 'static,
 ) -> Decode {
-    start_onto(tools, input, lanes, duration, None, wake)
+    start_onto(tools, input, lanes, duration, None, Arc::default(), wake)
+}
+
+/// Tests: [`start`] with its child in `slot` (a start the test holds).
+#[cfg(test)]
+pub(crate) fn start_in(
+    slot: Arc<Slot>,
+    tools: &Tools,
+    input: &Input,
+    lanes: usize,
+    duration: f64,
+    wake: impl Fn() + Send + 'static,
+) -> Decode {
+    start_onto(tools, input, lanes, duration, None, slot, wake)
 }
 
 /// [`start`] for a file whose first `secs` seconds a preview has read (`before`: their peaks):
@@ -257,7 +276,15 @@ pub fn resume(
     (before, secs): (Source, f64),
     wake: impl Fn() + Send + 'static,
 ) -> Decode {
-    start_onto(tools, input, lanes, duration, Some((before, secs)), wake)
+    start_onto(
+        tools,
+        input,
+        lanes,
+        duration,
+        Some((before, secs)),
+        Arc::default(),
+        wake,
+    )
 }
 
 fn start_onto(
@@ -266,12 +293,13 @@ fn start_onto(
     lanes: usize,
     duration: f64,
     onto: Option<(Source, f64)>,
+    child: Arc<Slot>,
     wake: impl Fn() + Send + 'static,
 ) -> Decode {
     let decode = Decode {
         // What was read before shows from the start.
         peaks: Arc::new(Mutex::new(onto.as_ref().map(|(before, _)| before.clone()))),
-        child: Arc::default(),
+        child,
         #[cfg(test)]
         waiting: Arc::default(),
     };
@@ -306,25 +334,43 @@ fn start_onto(
         let done = match started {
             Err(e) => failed(format!("cannot run {}: {e}", tools.ffmpeg.display()), None),
             Ok((mut stdout, stderr)) => {
+                // From here on, every way out of this thread — unwinding too — kills and reaps
+                // what is still in the slot: the owner's drop only signals.
+                let _ending = Ending(&running);
                 let said = crate::ffmpeg::ErrorTail::spawn(stderr);
                 let onto = onto.as_ref().map(|(before, secs)| (before, *secs));
-                let read = read_onto(&mut stdout, lanes, duration, onto, &mut |peaks| {
-                    // Nothing is handed over once the decode was stopped.
-                    if !running.stopped() {
-                        *slot.lock().unwrap() = Some(peaks);
-                        wake();
-                    }
+                // Read with the child watched from a thread of its own: a stop is applied
+                // whatever this read blocks on, and the child's end is waited for with the
+                // child still in its slot (an ffmpeg that closed its output and lives on is
+                // there for the drop to kill).
+                let watched = running.watched(|| {
+                    let read = read_onto(&mut stdout, lanes, duration, onto, &mut |peaks| {
+                        // Nothing is handed over once the decode was stopped.
+                        if !running.stopped() {
+                            *slot.lock().unwrap() = Some(peaks);
+                            wake();
+                        }
+                    });
+                    drop(stdout);
+                    #[cfg(test)]
+                    waiting.store(true, SeqCst);
+                    read
                 });
-                drop(stdout);
-                #[cfg(test)]
-                waiting.store(true, SeqCst);
-                // Its end is waited for with the child still in its slot: an ffmpeg that closed
-                // its output and lives on is there for the drop to kill.
-                let status = running.wait_end();
                 if running.stopped() {
                     return;
                 }
-                let status = status.ok_or_else(|| std::io::Error::other("it is gone"));
+                let (read, status) = match watched {
+                    Ok((read, status)) => (
+                        read,
+                        status.ok_or_else(|| std::io::Error::other("it is gone")),
+                    ),
+                    // Not watched, so not read: ended here, before its last words are waited
+                    // for (they end only with it).
+                    Err(e) => {
+                        running.end();
+                        (Err(e), Err(std::io::Error::other("not watched")))
+                    }
+                };
                 let last_line = said.join().unwrap_or_default().last_line();
                 match (read, status) {
                     (Err(e), _) => failed(format!("reading the decoded sound: {e}"), None),

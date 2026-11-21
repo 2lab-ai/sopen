@@ -732,15 +732,15 @@ fn enter_on_an_info_card_opens_the_file() {
     fx.key(Key::Enter);
     fx.wait(|b| b.opening.is_none());
     // The ordinary open: it fails as Enter on it fails in the list (the image does not decode),
-    // said on the status row; the card's copy was published, not fetched again.
+    // said on the status row; the card's copy was published, not fetched again — and, the open
+    // having failed, it is not left in the cache.
     assert!(fx.b.viewer.is_none());
     assert!(fx.b.status.error, "{}", fx.b.status.text);
     let cached = crate::cache::cache_path(&fx.cache, "box", &format!("{}/wide.png", fx.root));
-    assert_eq!(
-        std::fs::metadata(&cached).expect("published").ino(),
-        private,
-        "what is in the cache is the card's own copy, linked"
-    );
+    assert!(!cached.exists(), "a failed open leaves no cached copy");
+    // (That the opening read nothing — it had the card's copy — is shown below: every read
+    // was the preview connection's.)
+    let _ = private;
     // The preview comes back once the opening is over (the bar is still on the file) and reads
     // again, on the preview connection. The opening had a connection of its own: nothing was
     // read on it.
@@ -2275,14 +2275,19 @@ fn closing_at_a_question_reports_the_item_as_cancelled() {
 
 use crate::ffmpeg::{spawns, Tools};
 use crate::gui::media::fixtures::{
-    clip, most_at_once, none_left, stand_in, started_under, still_running, tone,
-    tools as media_tools, Census, Hand, Hold,
+    bounded as watched_over, clip, index_only, median, most_at_once, none_left, quiet_then_loud,
+    stand_in, started_under, still_running, tone, tools as media_tools, Census, Hand,
 };
 use crate::gui::media::wave;
 
+/// Nothing is left under `dir` — by its name as given and as the system resolves it (the tree
+/// is listed by its resolved path, the cache by the given one).
 fn assert_none_left(dir: &Path) {
-    if let Err(left) = none_left(dir) {
-        panic!("{left}");
+    let resolved = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+    for dir in [dir, resolved.as_path()] {
+        if let Err(left) = none_left(dir) {
+            panic!("{left}");
+        }
     }
 }
 
@@ -2311,8 +2316,9 @@ fn previews_run(fx: &mut Fx, tools: Tools, hand: &Hand) {
 #[test]
 fn p4_a_sweep_over_fifty_files_leaves_no_ffmpeg_and_nothing_in_the_cache() {
     let Some(tools) = media_tools() else { return };
-    bounded(120, move || {
+    watched_over(120, move |t| {
         let (mut fx, seen, _gate) = watched("");
+        t.also(&base(&fx));
         let root = PathBuf::from(&fx.root);
         clip(&tools, &root.join("v00.mp4"), (160, 120));
         tone(&tools, &root.join("s00.wav"), 3);
@@ -2369,12 +2375,12 @@ fn p4_a_sweep_over_fifty_files_leaves_no_ffmpeg_and_nothing_in_the_cache() {
 
         // Back up, with every probe held where it starts: each video and each sound has a
         // process alive when the bar leaves it.
-        let hold = Hold::new(&base(&fx), "hold");
+        let hold = t.hold(&base(&fx), "hold");
         let held = Tools {
             ffmpeg: tools.ffmpeg.clone(),
             ffprobe: stand_in(&base(&fx), "held-ffprobe", &hold.stalls()),
         };
-        previews_run(&mut fx, held, &Hand::new());
+        previews_run(&mut fx, held, &t.hand());
         let mut cancelled = 0;
         for name in files.iter().rev().skip(1) {
             let before = started_under(&cache).len();
@@ -2548,7 +2554,8 @@ fn p12_a_long_sound_previews_ten_minutes_and_enter_decodes_on_from_there() {
     let Some(tools) = media_tools() else { return };
     let mut fx = fixture();
     let path = PathBuf::from(format!("{}/long.wav", fx.root));
-    tone(&tools, &path, 1200);
+    // Quiet for its first 10 minutes — all the preview reads — and loud from 10:00.
+    quiet_then_loud(&tools, &path, 1200, 600);
     fx.relist();
     fx.bar_on("long.wav");
     let said = fx.right_text("audio · mono").expect("the sound's line");
@@ -2569,6 +2576,37 @@ fn p12_a_long_sound_previews_ten_minutes_and_enter_decodes_on_from_there() {
     );
     let runs = spawns::of(&path);
     assert_eq!((runs.probe, runs.preview), (1, 2), "{runs:?}");
+    // Painted, in the viewer: up to the 10:00 mark — half its width — the quiet the preview
+    // read; past it the loud part, decoded after the hand-over.
+    fx.drv.idle(&mut fx.b, 2);
+    let wave_colour = chrome::PALETTE.wave;
+    let mut painted: Vec<(f32, f32)> = fx
+        .drv
+        .segments()
+        .into_iter()
+        .filter(|([a, b], c)| *c == wave_colour && a.x == b.x)
+        .map(|([a, b], _)| (a.x, (a.y - b.y).abs()))
+        .collect();
+    painted.sort_by(|a, b| a.0.total_cmp(&b.0));
+    assert!(
+        painted.len() > 600,
+        "the waveform: {} columns",
+        painted.len()
+    );
+    let (left, right) = (painted[0].0, painted[painted.len() - 1].0);
+    let mark = (left + right) / 2.0;
+    let heights = |from: f32, to: f32| -> Vec<f32> {
+        let within = painted.iter().filter(|(x, _)| *x >= from && *x <= to);
+        within.map(|(_, h)| *h).collect()
+    };
+    let before_mark = median(heights(left, mark - 8.0));
+    let past_mark = heights(mark + 8.0, right);
+    assert!(before_mark > 1.0, "the first 10 minutes: {before_mark}");
+    assert!(
+        past_mark.iter().all(|h| *h > before_mark * 5.0),
+        "past the 10:00 mark every column shows the loud part: {} against {before_mark}",
+        median(past_mark.clone())
+    );
     fx.key(Key::Escape);
     fx.rest();
     assert_none_left(&base(&fx));
@@ -2590,9 +2628,10 @@ impl Drop for LetGo {
 /// time) — and closing does not wait for anything.
 #[test]
 fn closing_the_window_kills_a_previews_ffprobe_at_once() {
-    bounded(60, || {
+    watched_over(60, |t| {
         let mut fx = fixture();
-        let hold = Hold::new(&base(&fx), "hold");
+        t.also(&base(&fx));
+        let hold = t.hold(&base(&fx), "hold");
         let stalls = stand_in(&base(&fx), "ffprobe", &hold.stalls());
         let tools = Tools {
             ffmpeg: stalls.clone(),
@@ -2624,14 +2663,10 @@ fn closing_the_window_kills_a_previews_ffprobe_at_once() {
         assert_eq!(still_running(&pids), 1, "the probe runs: {pids:?}");
         assert!(Window::close_requested(&mut fx.b), "nothing is asked");
         let Fx { b, _tmp, .. } = fx;
-        let closing = std::time::Instant::now();
+        // The worker is held where it reads the time: that this returns at all, with the
+        // probe stopped, is the window not waiting for it.
         drop(b);
-        let took = closing.elapsed();
         assert_eq!(still_running(&pids), 0, "stopped with the window");
-        assert!(
-            took < Duration::from_millis(100),
-            "closing waited: {took:?}"
-        );
         // Its worker, let go, reaps it.
         drop(_let_go);
         assert_none_left(_tmp.path());
@@ -2645,16 +2680,17 @@ fn closing_the_window_kills_a_previews_ffprobe_at_once() {
 #[test]
 fn p6_enter_during_a_videos_probe_continues_it_as_the_opening() {
     let Some(real) = media_tools() else { return };
-    bounded(60, move || {
+    watched_over(60, move |t| {
         let mut fx = fixture();
+        t.also(&base(&fx));
         let path = PathBuf::from(format!("{}/clip.mp4", fx.root));
         clip(&real, &path, (160, 120));
-        let hold = Hold::new(&base(&fx), "hold");
+        let hold = t.hold(&base(&fx), "hold");
         let tools = Tools {
             ffmpeg: real.ffmpeg.clone(),
             ffprobe: stand_in(&base(&fx), "ffprobe", &hold.then(&real.ffprobe)),
         };
-        let hand = Hand::new();
+        let hand = t.hand();
         previews_run(&mut fx, tools, &hand);
         fx.relist();
         fx.select("clip.mp4");
@@ -2685,15 +2721,16 @@ fn p6_enter_during_a_videos_probe_continues_it_as_the_opening() {
 /// the worker after the window returns.
 #[test]
 fn closing_during_a_taken_over_probe_leaves_no_process() {
-    bounded(60, || {
+    watched_over(60, |t| {
         let mut fx = fixture();
-        let hold = Hold::new(&base(&fx), "hold");
+        t.also(&base(&fx));
+        let hold = t.hold(&base(&fx), "hold");
         let stalls = stand_in(&base(&fx), "ffprobe", &hold.stalls());
         let tools = Tools {
             ffmpeg: stalls.clone(),
             ffprobe: stalls,
         };
-        previews_run(&mut fx, tools, &Hand::new());
+        previews_run(&mut fx, tools, &t.hand());
         let root = PathBuf::from(&fx.root);
         std::fs::write(root.join("hangs.mp4"), b"whatever is in it").unwrap();
         fx.relist();
@@ -2711,5 +2748,29 @@ fn closing_during_a_taken_over_probe_leaves_no_process() {
         // killed and reaped, when that returns.
         leftover.borrow_mut().finish();
         assert_none_left(_tmp.path());
+    });
+}
+
+/// A video whose index is whole and whose pictures are missing (the live probe's `head -c` of a
+/// faststart MP4): its preview is a card saying there is no frame, and Enter on it does not
+/// leave a media window decoding for ever — the open fails, the list is back, and the status
+/// row says why, in red.
+#[test]
+fn enter_on_a_video_with_no_frame_comes_back_to_the_list_with_the_reason() {
+    let Some(tools) = media_tools() else { return };
+    watched_over(60, move |t| {
+        let mut fx = fixture();
+        t.also(&base(&fx));
+        index_only(&tools, Path::new(&format!("{}/cut.mp4", fx.root)));
+        fx.relist();
+        fx.bar_on("cut.mp4");
+        assert!(fx.on_right("File Info"), "its card");
+        let why = fx.right_text("no frame at 0:00.00").expect("why");
+        assert!(!why.contains("0x") && !why.contains('['), "{why}");
+        fx.key(Key::Enter);
+        fx.wait(|b| b.opening.is_none() && b.viewer.is_none() && b.status.error);
+        assert!(fx.status().contains("no frame"), "{}", fx.status());
+        assert_eq!(fx.current(), "cut.mp4", "back in the list");
+        assert_none_left(&base(&fx));
     });
 }

@@ -195,6 +195,12 @@ pub struct Probe {
     /// timestamp is counted from): 0 for most files; a transport stream or a file whose sound
     /// starts first puts it later.
     pub video_start: Option<f64>,
+    /// That stream's pixels' shape, width to height (`sample_aspect_ratio`), when they are not
+    /// square: the picture is shown that much wider (or narrower) than its pixels count.
+    pub pixel_aspect: Option<(u32, u32)>,
+    /// The first audio stream's channel layout as ffprobe names it (`stereo`, `5.1`), if it
+    /// does.
+    pub channel_layout: Option<String>,
     /// That stream's pixel format and bits per sample, when ffprobe reports them.
     pub pix_fmt: Option<String>,
     pub bits: Option<u32>,
@@ -253,6 +259,9 @@ pub fn probe_command(tools: &Tools, input: &OsStr) -> Command {
 
 /// What is said when ffprobe ended badly on `input` (`said`: its last line).
 pub fn probe_refusal(input: &Path, said: &str) -> String {
+    // ffprobe names the file in front of its reason: said once here.
+    let named = format!("{}: ", input.display());
+    let said = said.strip_prefix(&named).unwrap_or(said);
     format!("ffprobe cannot read {}: {said}", input.display())
 }
 
@@ -281,6 +290,7 @@ pub fn parse_probe(json: &str) -> Result<Probe> {
     let mut video_duration = None;
     let mut video_start_abs = None;
     let (mut pix_fmt, mut bits, mut color) = (None, None, Vec::new());
+    let (mut pixel_aspect, mut channel_layout) = (None, None);
     let mut audio_streams = 0;
     let mut dropped = Vec::new();
     let text = |x: &serde_json::Value| x.as_str().map(str::to_string);
@@ -311,6 +321,11 @@ pub fn parse_probe(json: &str) -> Result<Probe> {
                     })
                     .filter(|d| *d > 0.0);
                 pix_fmt = text(&s["pix_fmt"]);
+                pixel_aspect = s["sample_aspect_ratio"].as_str().and_then(|sar| {
+                    let (n, d) = sar.split_once(':')?;
+                    let (n, d): (u32, u32) = (n.parse().ok()?, d.parse().ok()?);
+                    (n > 0 && d > 0 && n != d).then_some((n, d))
+                });
                 bits = num(&s["bits_per_raw_sample"]).map(|b| b as u32);
                 for (key, option) in [
                     ("color_primaries", "-color_primaries"),
@@ -339,6 +354,7 @@ pub fn parse_probe(json: &str) -> Result<Probe> {
                     format: text(&s["sample_fmt"]),
                 };
                 if !has_audio {
+                    channel_layout = text(&s["channel_layout"]);
                     audio_codec = s["codec_name"].as_str().map(str::to_string);
                     (channels, sample_rate) = (track.channels, track.rate);
                 }
@@ -361,6 +377,8 @@ pub fn parse_probe(json: &str) -> Result<Probe> {
         video_duration,
         video_start: video_start_abs
             .map(|t| (t - num(&v["format"]["start_time"]).unwrap_or(0.0)).max(0.0)),
+        pixel_aspect,
+        channel_layout,
         pix_fmt,
         bits,
         color,

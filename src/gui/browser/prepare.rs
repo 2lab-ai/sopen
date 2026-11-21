@@ -141,6 +141,8 @@ fn prepare_with(
     }
     let kind = kind::detect(fs.as_mut(), req.abs, &stat)?;
     let host = req.label.unwrap_or(cache::LOCAL_HOST).to_string();
+    // The copy this open put in the cache, if it did: removed again if the open fails.
+    let cached = std::cell::RefCell::new(None::<PathBuf>);
     let mut reuse = reuse.filter(|r| r.abs == req.abs && unchanged(&r.copy.at, &stat));
     let mut fetch = |fs: &mut Box<dyn RemoteFs + Send>| -> Result<Fetched> {
         if let Some(r) = reuse.take() {
@@ -154,11 +156,12 @@ fn prepare_with(
             // The copy is the cached one now; its preview name goes with `r`.
             match published {
                 Ok((claim, notices)) => {
+                    *cached.borrow_mut() = Some(claim.local.clone());
                     return Ok(Fetched {
                         claim,
                         at: r.copy.at,
                         notices,
-                    })
+                    });
                 }
                 Err(e) => crate::debug!("the preview copy was not published: {e:#}"),
             }
@@ -171,69 +174,80 @@ fn prepare_with(
             progress,
             cancel,
         )?;
+        *cached.borrow_mut() = Some(fetched.claim.local.clone());
         Ok(fetched)
     };
     let local = req.label.is_none();
-    match kind {
-        Kind::Image => {
-            // Always a copy, as the standalone route makes it: Save needs the bytes as opened.
-            let fetched = fetch(&mut fs)?;
-            let bytes = std::fs::read(&fetched.claim.local)
-                .with_context(|| format!("cannot read {}", fetched.claim.local.display()))?;
-            let doc = Doc::decode(&bytes)?;
-            let file = ImageFile::new(req.origin(fs, fetched.at), bytes, req.cache);
-            Ok(Prepared::Image {
-                file,
-                doc,
-                notices: fetched.notices,
-                claim: Some(fetched.claim),
-            })
-        }
-        Kind::Video | Kind::Audio => {
-            let fetched = if local { None } else { Some(fetch(&mut fs)?) };
-            let (path, at) = match &fetched {
-                Some(f) => (f.claim.local.clone(), f.at),
-                None => (PathBuf::from(req.abs), stat),
-            };
-            if kind::refine_local(&path, req.abs, kind) == Kind::Other {
-                // A `.ts` ffprobe cannot read as media: the hex view, on the copy already here.
-                return hex_of(req, fs, stat, fetched);
+    let cache_root = req.cache;
+    let opened = (move || -> Result<Prepared> {
+        match kind {
+            Kind::Image => {
+                // Always a copy, as the standalone route makes it: Save needs the bytes as opened.
+                let fetched = fetch(&mut fs)?;
+                let bytes = std::fs::read(&fetched.claim.local)
+                    .with_context(|| format!("cannot read {}", fetched.claim.local.display()))?;
+                let doc = Doc::decode(&bytes)?;
+                let file = ImageFile::new(req.origin(fs, fetched.at), bytes, req.cache);
+                Ok(Prepared::Image {
+                    file,
+                    doc,
+                    notices: fetched.notices,
+                    claim: Some(fetched.claim),
+                })
             }
-            let media = Media::probe(&path)?;
-            let (notices, claim) = match fetched {
-                Some(f) => (f.notices, Some(f.claim)),
-                None => (Vec::new(), None),
-            };
-            Ok(Prepared::Media {
-                origin: req.origin(fs, at),
-                media: Box::new(media),
-                notices,
-                claim,
-            })
+            Kind::Video | Kind::Audio => {
+                let fetched = if local { None } else { Some(fetch(&mut fs)?) };
+                let (path, at) = match &fetched {
+                    Some(f) => (f.claim.local.clone(), f.at),
+                    None => (PathBuf::from(req.abs), stat),
+                };
+                if kind::refine_local(&path, req.abs, kind) == Kind::Other {
+                    // A `.ts` ffprobe cannot read as media: the hex view, on the copy already here.
+                    return hex_of(req, fs, stat, fetched);
+                }
+                let media = Media::probe(&path)?;
+                let (notices, claim) = match fetched {
+                    Some(f) => (f.notices, Some(f.claim)),
+                    None => (Vec::new(), None),
+                };
+                Ok(Prepared::Media {
+                    origin: req.origin(fs, at),
+                    media: Box::new(media),
+                    notices,
+                    claim,
+                })
+            }
+            Kind::Text => {
+                let fetched = if local { None } else { Some(fetch(&mut fs)?) };
+                let path = match &fetched {
+                    Some(f) => f.claim.local.clone(),
+                    None => PathBuf::from(req.abs),
+                };
+                text::warm();
+                let doc = TextDoc::open_cancellable(&path, cancel)?;
+                let (notices, claim) = match fetched {
+                    Some(f) => (f.notices, Some(f.claim)),
+                    None => (Vec::new(), None),
+                };
+                Ok(Prepared::Text {
+                    doc,
+                    notices,
+                    claim,
+                })
+            }
+            Kind::Other | Kind::Directory => {
+                let fetched = if local { None } else { Some(fetch(&mut fs)?) };
+                hex_of(req, fs, stat, fetched)
+            }
         }
-        Kind::Text => {
-            let fetched = if local { None } else { Some(fetch(&mut fs)?) };
-            let path = match &fetched {
-                Some(f) => f.claim.local.clone(),
-                None => PathBuf::from(req.abs),
-            };
-            text::warm();
-            let doc = TextDoc::open_cancellable(&path, cancel)?;
-            let (notices, claim) = match fetched {
-                Some(f) => (f.notices, Some(f.claim)),
-                None => (Vec::new(), None),
-            };
-            Ok(Prepared::Text {
-                doc,
-                notices,
-                claim,
-            })
-        }
-        Kind::Other | Kind::Directory => {
-            let fetched = if local { None } else { Some(fetch(&mut fs)?) };
-            hex_of(req, fs, stat, fetched)
+    })();
+    if opened.is_err() {
+        // Its claim went with the error: the copy is nobody's.
+        if let Some(copy) = cached.borrow_mut().take() {
+            cache::discard(cache_root, &copy);
         }
     }
+    opened
 }
 
 /// The hex view of the file: the copy fetched, or a local file read in place (as the binary
@@ -505,12 +519,31 @@ fn over(why: impl Into<String>) -> anyhow::Error {
     anyhow!(OverBudget(why.into()))
 }
 
-/// The card's last line for why the preparation stopped.
+/// The card's line for why the preparation stopped: the reason itself, first.
 fn why(e: &anyhow::Error) -> String {
-    match e.chain().find_map(|c| c.downcast_ref::<OverBudget>()) {
-        Some(OverBudget(why)) => why.clone(),
-        None => format!("{e:#}"),
+    if let Some(OverBudget(why)) = e.chain().find_map(|c| c.downcast_ref::<OverBudget>()) {
+        return why.clone();
     }
+    if let Some(unreadable) = unreadable(e) {
+        return unreadable.0.clone();
+    }
+    format!("{e:#}")
+}
+
+fn unreadable(e: &anyhow::Error) -> Option<&media::preview::Unreadable> {
+    e.chain().find_map(|c| c.downcast_ref())
+}
+
+/// Under the reason, what could not be done to which file — the file named once, as its owner
+/// knows it (`host:/abs`; a remote one was read from a private copy, which is never named).
+fn what(e: &anyhow::Error, host: &str, abs: &str) -> Option<String> {
+    unreadable(e)?;
+    let file = if host == cache::LOCAL_HOST {
+        abs.to_string()
+    } else {
+        format!("{host}:{abs}")
+    };
+    Some(format!("ffprobe cannot read {file}"))
 }
 
 /// The file a preview shows, and where its copies go.
@@ -549,6 +582,9 @@ pub struct Card {
     /// The last line: `over the preview limit: Enter opens it`, `image is W×H; Enter opens it`,
     /// the error.
     pub why: String,
+    /// Under it, what could not be done to which file (`ffprobe cannot read host:/abs`): the
+    /// part that gives way when the side is small — the reason above it is never cut.
+    pub what: Option<String>,
 }
 
 /// A preview's private copy of a remote file, complete: its name (the copy goes when it does)
@@ -791,6 +827,7 @@ pub fn preview(
                 mtime: known.stat.map(|s| s.mtime),
                 link: known.link,
                 why: why(&e),
+                what: what(&e, &host, &known.abs),
             };
             Ok(Previewed {
                 parts: Parts::Card(card),
@@ -871,8 +908,10 @@ fn preview_parts(
     }
     let remote = label.is_some();
     let limits = budget.limits;
-    // Decided from the stat, before anything is read — the sniff's head included.
+    // Decided from the stat, before anything is read — the sniff's head included: the card
+    // says the kind its name gives it.
     if remote && budget.limit(limits.read).is_some_and(|max| stat.size > max) {
+        known.kind = kind::by_extension(&real);
         return Err(over(OVER_LIMIT));
     }
     budget.check(cancel)?;
@@ -1360,9 +1399,17 @@ impl Window for CardWindow {
                     y += h;
                 }
                 y += row_h;
-                let galley =
-                    painter.layout(self.card.why.clone(), font, p.text, inside.width().max(1.0));
+                // The reason first, whole; what it is about under it — that is what the
+                // side's edge cuts when there is no room for both.
+                let wide = inside.width().max(1.0);
+                let galley = painter.layout(self.card.why.clone(), font.clone(), p.text, wide);
+                let h = galley.size().y.max(row_h);
                 painter.galley(egui::Pos2::new(inside.left(), y), galley, p.text);
+                if let Some(what) = &self.card.what {
+                    y += h;
+                    let galley = painter.layout(what.clone(), font, p.dim, wide);
+                    painter.galley(egui::Pos2::new(inside.left(), y), galley, p.dim);
+                }
             });
         self.painted = true;
     }

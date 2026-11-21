@@ -8,7 +8,7 @@
 //! stopped, and how Save and Export render the file is already worked out (the one ffmpeg run
 //! that takes, for a video above 8 bits, is made here too).
 
-use super::child::{Ending, Polled, POLL};
+use super::child::{Ending, Polled, StopOnUnwind, POLL};
 use super::{frame_command, wave, Media};
 use crate::cut;
 use crate::ffmpeg::{self, ErrorTail, Input, Probe, Tools};
@@ -101,6 +101,16 @@ fn run<T>(
         let watcher = std::thread::Builder::new()
             .spawn_scoped(scope, watching)
             .with_context(|| format!("cannot start the thread that watches {program}"))?;
+        // A reader that unwinds stops the child: the watcher then ends, instead of being waited
+        // for while it watches a child nobody reads.
+        let _unwinding = StopOnUnwind(children);
+        #[cfg(test)]
+        if children
+            .panic_in_read
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            panic!("reading {program}'s output");
+        }
         let got = read(&mut out);
         // Whatever was not read: the child ends at its next write.
         drop(out);
@@ -194,6 +204,38 @@ pub fn ask_encoder(
     Ok(ffmpeg::parse_pix_fmts(&String::from_utf8_lossy(&help)))
 }
 
+/// `said` (a line ffprobe or ffmpeg printed) without what changes from run to run or names the
+/// file a second time.
+pub(crate) fn plain(said: &str, input: &Input) -> String {
+    let mut said = said.trim();
+    // `[component @ 0x…] `, as often as it leads the line: the address is another every run.
+    while let Some(rest) = said.strip_prefix('[') {
+        let Some((tag, rest)) = rest.split_once("] ") else {
+            break;
+        };
+        if !tag.contains(" @ 0x") {
+            break;
+        }
+        said = rest.trim_start();
+    }
+    let named = format!("{}: ", input.show());
+    said.strip_prefix(&named).unwrap_or(said).to_string()
+}
+
+/// ffprobe cannot read the file as media: its own reason, without the file's path (whoever
+/// shows it names the file as its owner knows it — a remote one is read here from a private
+/// copy).
+#[derive(Debug)]
+pub struct Unreadable(pub String);
+
+impl std::fmt::Display for Unreadable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "ffprobe cannot read it: {}", self.0)
+    }
+}
+
+impl std::error::Error for Unreadable {}
+
 /// ffprobe's view of `input`, by a run that can be stopped. The outer error is a stop (or
 /// ffprobe not starting); the inner one is ffprobe's own: it cannot read the file as media.
 fn probe(
@@ -210,8 +252,7 @@ fn probe(
         json
     })?;
     if !status.success() {
-        let path = std::path::Path::new(input.arg());
-        return Ok(Err(anyhow!("{}", ffmpeg::probe_refusal(path, &last))));
+        return Ok(Err(anyhow!(Unreadable(plain(&last, input)))));
     }
     Ok(ffmpeg::parse_probe(&String::from_utf8_lossy(&json)))
 }
@@ -276,7 +317,11 @@ pub fn prepare(
             match rgba {
                 Ok(rgba) => frame = Some(Arc::new(rgba)),
                 Err(_) if last.is_empty() => bail!("no frame at {}", super::clock_text(0.0)),
-                Err(_) => bail!("no frame at {}: {last}", super::clock_text(0.0)),
+                Err(_) => bail!(
+                    "no frame at {}: {}",
+                    super::clock_text(0.0),
+                    plain(&last, input)
+                ),
             }
         }
         None => {
@@ -292,7 +337,10 @@ pub fn prepare(
             })?;
             let read = read.context("reading the decoded sound")?;
             if !status.success() {
-                bail!("cannot read the waveform: ffmpeg {status}: {last}");
+                bail!(
+                    "cannot read the waveform: ffmpeg {status}: {}",
+                    plain(&last, input)
+                );
             }
             peaks = Some(wave::Source {
                 complete: upto.is_none(),

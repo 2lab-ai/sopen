@@ -243,6 +243,34 @@ impl Media {
         self.video.is_none() && self.channels == 1
     }
 
+    /// The picture's shape on screen: its size in its own pixels, made as much wider (or
+    /// narrower) as those pixels are ([`Probe::pixel_aspect`]; of a picture turned on its side,
+    /// taller). Only where it is drawn: a crop is in the picture's own pixels.
+    fn shape(&self) -> Option<Vec2> {
+        let size = self.source_size()?;
+        let Some((n, d)) = self.probe.pixel_aspect else {
+            return Some(size);
+        };
+        let wider = n as f32 / d as f32;
+        Some(if self.rotation % 180 == 90 {
+            Vec2::new(size.x, size.y * wider)
+        } else {
+            Vec2::new(size.x * wider, size.y)
+        })
+    }
+
+    /// The names of the waveform's lanes: `L` and `R` of a stereo sound; of a sound in more
+    /// channels, its first two by their own names (ffmpeg's: every layout it knows by name
+    /// begins front left, front right, but the `downmix` pair).
+    fn lane_names(&self) -> [&'static str; 2] {
+        match (self.channels, self.probe.channel_layout.as_deref()) {
+            (0..=2, _) => ["L", "R"],
+            (_, Some("downmix")) => ["DL", "DR"],
+            (_, Some(layout)) if !layout.is_empty() && !layout.contains("channels") => ["FL", "FR"],
+            _ => ["1", "2"],
+        }
+    }
+
     /// Waveform lanes: one for mono, two for anything with more channels.
     fn lanes(&self) -> usize {
         match self.channels {
@@ -598,7 +626,13 @@ impl Drop for Scrubber {
 
 /// The waveform's lanes (`columns`: per lane, each column's min and max) drawn over `rect`, one
 /// under the other; two lanes are named `L` and `R`.
-fn paint_wave(painter: &egui::Painter, rect: Rect, columns: &[Vec<[f32; 2]>], font: &egui::FontId) {
+fn paint_wave(
+    painter: &egui::Painter,
+    rect: Rect,
+    columns: &[Vec<[f32; 2]>],
+    names: [&str; 2],
+    font: &egui::FontId,
+) {
     let p = super::chrome::PALETTE;
     let lanes = columns.len().max(1);
     let lane_h = rect.height() / lanes as f32;
@@ -618,7 +652,7 @@ fn paint_wave(painter: &egui::Painter, rect: Rect, columns: &[Vec<[f32; 2]>], fo
             painter.text(
                 Pos2::new(rect.left() + 3.0, top + 2.0),
                 egui::Align2::LEFT_TOP,
-                if lane == 0 { "L" } else { "R" },
+                names[lane.min(1)],
                 font.clone(),
                 p.dim,
             );
@@ -884,6 +918,11 @@ pub fn open(
     }
     run?;
     let outcome = outcome.lock().unwrap().clone();
+    // The window found it cannot show the file: the open failed, as a file ffprobe cannot read
+    // fails it.
+    if let Some(why) = &outcome.failed {
+        bail!("{why}");
+    }
     Ok(outcome)
 }
 
@@ -1211,6 +1250,9 @@ struct MediaWindow {
     clock: preview::Clock,
     /// The receipt hook's Export ([`MediaWindow::export_hold`]) was started.
     hold_started: bool,
+    /// The file cannot be shown after all (no frame of it decodes): why. The window has asked
+    /// to be closed ([`super::Window::failure`]).
+    failed: Option<String>,
     /// Tests: how often playback was started (the audio output is opened there).
     #[cfg(test)]
     plays: usize,
@@ -1293,6 +1335,7 @@ impl MediaWindow {
             planning: None,
             clock: Arc::new(Instant::now),
             hold_started: false,
+            failed: None,
             #[cfg(test)]
             plays: 0,
         }
@@ -1719,9 +1762,17 @@ impl MediaWindow {
             Answer::Takes(takes) => media.plan_with(Some(&takes)),
             Answer::Nothing => media.plan_with(None),
             // No answer in its time: planned for what every H.264 encoder takes, and said.
+            // Said as what it is: nothing is claimed about what this ffmpeg's encoder can do
+            // (the plan's own line for an encoder without 10-bit is taken out).
             Answer::TimedOut => {
                 media.plan_with(Some(&std::collections::HashSet::new()));
+                let claim = |note: &String| note.contains("libx264");
+                media.notes.retain(|note| !claim(note));
                 media.notes.push(ENCODER_TIMED_OUT.to_string());
+                if let Some((_, _, plan)) = &mut media.plan {
+                    plan.notes.retain(|note| !claim(note));
+                    plan.notes.push(ENCODER_TIMED_OUT.to_string());
+                }
             }
         }
         if self.status.text == CHECKING_ENCODER {
@@ -2105,7 +2156,7 @@ impl MediaWindow {
             };
             let width = rect.width().max(1.0) as usize;
             if let Some(cols) = self.wave_columns(width, lanes) {
-                paint_wave(&painter, rect, &cols, &font);
+                paint_wave(&painter, rect, &cols, self.media.lane_names(), &font);
             } else {
                 painter.text(
                     rect.center(),
@@ -2441,7 +2492,7 @@ impl MediaWindow {
             );
             return;
         };
-        let disp = super::fit(panel.shrink(4.0), src);
+        let disp = super::fit(panel.shrink(4.0), self.media.shape().unwrap_or(src));
         let map = Map { disp, src };
         let resp = ui.allocate_rect(disp, Sense::click_and_drag());
         painter.image(
@@ -2548,7 +2599,7 @@ impl MediaWindow {
                 match m.channels {
                     1 => "mono".to_string(),
                     2 => "stereo".to_string(),
-                    n => format!("{n} channels"),
+                    n => format!("{n} channels · first 2 shown"),
                 },
                 m.sample_rate
                     .map(|r| format!(" · {r} Hz"))
@@ -2600,14 +2651,14 @@ impl MediaWindow {
                     painter.rect_filled(room, 0.0, p.timeline);
                     let columns = room.width().max(1.0) as usize;
                     if let Some(cols) = self.preview_columns(columns, lanes) {
-                        paint_wave(&painter, room, &cols, &font);
+                        paint_wave(&painter, room, &cols, self.media.lane_names(), &font);
                     }
                 } else {
                     painter.rect_filled(room, 0.0, p.picture_back);
                     if let (Some(tex), Some(src)) = (&self.tex, self.media.source_size()) {
                         painter.image(
                             tex.id(),
-                            super::fit(room.shrink(4.0), src),
+                            super::fit(room.shrink(4.0), self.media.shape().unwrap_or(src)),
                             Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
                             Color32::WHITE,
                         );
@@ -2686,6 +2737,17 @@ impl super::Window for MediaWindow {
                 Some(Ok(frame)) => {
                     let rgba = frame.rgba.clone();
                     self.show_frame(&ctx, &rgba, frame.t, Some(frame.key));
+                }
+                // No frame, and none was ever on screen: the file cannot be shown after all.
+                // The window does not sit there for ever: the open has failed — it says why
+                // and asks to be closed (its opener says it: back in the list, or the error
+                // `sopen` ends with).
+                Some(Err(e)) if self.tex.is_none() && self.failed.is_none() => {
+                    let why = format!("cannot show {}: {e}", self.title);
+                    self.outcome.lock().unwrap().failed = Some(why.clone());
+                    self.failed = Some(why);
+                    self.status = Status::error(e);
+                    super::request_close(&ctx);
                 }
                 Some(Err(e)) => self.status = Status::error(e),
                 None => {}
@@ -2770,9 +2832,16 @@ impl super::Window for MediaWindow {
         self.close_prompt(&ctx);
     }
 
+    fn failure(&self) -> Option<String> {
+        self.failed.clone()
+    }
+
     fn ready(&self) -> bool {
         if self.preview {
             return self.painted;
+        }
+        if self.failed.is_some() {
+            return true;
         }
         let frame_ok = self.audio_only() || self.frame_ready();
         // With the export hook, the shot is taken while the export is held mid-way.
@@ -2815,7 +2884,8 @@ impl super::Window for MediaWindow {
 
     fn close_requested(&mut self) -> bool {
         // A preview holds nothing unsaved and writes nothing: dropping it asks nothing.
-        if self.close_ok || self.preview {
+        // Nor does one that failed to show its file: it goes.
+        if self.close_ok || self.preview || self.failed.is_some() {
             return true;
         }
         if self.save.is_some() {
@@ -2861,6 +2931,7 @@ impl super::Window for MediaWindow {
 mod file;
 
 mod child;
+pub use child::end_all as end_children;
 #[cfg(test)]
 pub(crate) mod fixtures;
 pub mod preview;

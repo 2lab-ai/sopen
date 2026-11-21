@@ -180,8 +180,8 @@ frame single-lined), and the text viewer does not follow a growing file.
 |---|---|
 | text | the first page, **wrapped** at the side's width, with highlighting as the text viewer does it |
 | image | the image fitted into the side |
-| video | one frame: the frame at 0 s (the media window's first frame), fitted, with a line under it saying its size, frame rate and duration |
-| audio | the waveform, with a line under it saying its channels, sample rate and whole duration; of a sound longer than 10 minutes, the waveform of the first 10 minutes **drawn over the side's whole width**, the line ending `preview of the first 10 minutes` |
+| video | one frame: the frame at 0 s (the media window's first frame), fitted in the picture's own shape (pixels that are not square are shown as wide as they are), with a line under it saying its size, frame rate and duration |
+| audio | the waveform, with a line under it saying its channels, sample rate and whole duration; of a sound longer than 10 minutes, the waveform of the first 10 minutes **drawn over the side's whole width**, the line ending `preview of the first 10 minutes`. A sound in more than two channels shows its first two, the lanes named as the channels are (`FL`, `FR`), the line saying `6 channels · first 2 shown` |
 | anything else | the hex view of the first rows |
 
 - **Wrapped text** needs the text viewer's wrap mode, which the text-wrap branch adds (PR #14,
@@ -199,7 +199,12 @@ frame single-lined), and the text viewer does not follow a growing file.
 - **A file that cannot be previewed** — unreadable, vanished, a read error, a decode error, a budget
   hit (§4.3) — shows an **info card**: name, kind, size (exact and in units), date and time, `<LINK>`
   and the target when it is a link, and a last line saying why (`over the preview limit: Enter opens
-  it`, `image is 30000×30000; Enter opens it`, the error). The status row stays the list's.
+  it`, `image is 30000×30000; Enter opens it`, the error). The kind is there also when nothing of
+  the file was read (a remote file over the limit: by its name). The reason comes first and is
+  never cut; where it is about a file a program could not read, that is said under it, the file
+  named once and as its owner knows it (`ffprobe cannot read host:/abs` — never the private copy),
+  and that line is what a small side cuts. What `ffprobe` or `ffmpeg` said is shown without its
+  `[component @ 0x…]` tags and without the path it puts in front. The status row stays the list's.
 - **A link** is previewed as the file it points at (01 §3a: a link opens as its target); a broken
   link shows the info card with `<BROKEN>`.
 
@@ -241,7 +246,8 @@ bar does not have to move).
   (03 §3.2) — 8, and 9 for the moment a git stop runs (03 §3.5). A cancelled preview never holds a
   second one.
 - **A preview reads without claiming the cache.** A remote file is read into a private preview copy
-  (`<cache>/.preview/<window>/<n>`, 0600, removed when the preview is dropped); a local file is read in
+  (`<cache>/.preview/<window>/<n>`, 0600, removed when the preview is dropped; the window's folder
+  goes with the window, and `.preview` itself with the last window's folder); a local file is read in
   place, an image included. A preview never claims a cached copy, publishes into the mirror, moves
   earlier edits aside or creates a session copy (01 §5's machinery is for files that are opened).
 - **Cancel** = the preparation's stop flag (the flag Esc sets for Enter today); the worker checks it at
@@ -250,7 +256,10 @@ bar does not have to move).
   every few milliseconds; a child starts only after a look at it, and on every way out — cancelled,
   over its time, ended, or the worker itself failing — it is killed and reaped. A child stays in
   its slot (`media/child.rs`) until it has exited, so a program that closed its output and lives
-  on is still there to be stopped. No process outlives its preview.
+  on is still there to be stopped; a stop that comes while a child is being started is applied
+  as soon as it is in its slot; and a child is never read from without a thread watching it. No
+  process outlives its preview — nor sopen itself: a signal that ends sopen (SIGTERM, SIGHUP)
+  and the screenshot hook's watchdog end every such child first.
 
 | Exit | What happens to the preparation (or the prepared preview) |
 |---|---|
@@ -259,7 +268,7 @@ bar does not have to move).
 | F9, pin (Cmd/Ctrl+G), Tab | cancel |
 | the tree opens | kept as it is, inside `tree_snapshot` (O4); cancelled when the tree closes if the rules no longer show it |
 | Enter or F3 on the previewed file | **handed over** (below) |
-| Enter or F3 on a file showing an info card | the preview is dropped (its preparation cancelled) and the file opens as Enter opens it in the list (01 §3a), from the start; a private preview copy that is complete and whose file is unchanged since (size, mtime) is published into the cache as below instead of read again |
+| Enter or F3 on a file showing an info card | the preview is dropped (its preparation cancelled) and the file opens as Enter opens it in the list (01 §3a), from the start; a private preview copy that is complete and whose file is unchanged since (size, mtime) is published into the cache as below instead of read again. An open that fails leaves no copy in the cache (the one it fetched or published is removed). A video that `ffprobe` reads but none of whose frames decode fails the open too: the media window gives up at its first frame, and the list is back with the reason on its status row |
 | Enter on another entry, F4 | cancel / kept (F4 does not change the bar) |
 | the window closes | cancel; the window does not wait for a cancelled preview. Its worker reads, removes its own private copy, and for a video or a sound may hold one `ffprobe` or `ffmpeg`: the window sends that process its kill itself as it goes (`Host::cancel`), since sopen may end before the worker has looked at its stop flag. That call is on a frame, so it only signals — it waits neither for the process nor for the worker; the worker reaps |
 
@@ -282,7 +291,8 @@ bar does not have to move).
     way. That question is the window's own task: it has 5 s, and it is stopped — its `ffmpeg`
     killed — when the window goes. Without an answer in its time, Save and Export are planned
     for 8-bit `yuv420p` (which every H.264 encoder takes), become available, and say so:
-    `encoder check timed out; Export converts to 8-bit`.
+    `encoder check timed out; Export converts to 8-bit` — and nothing else about the encoder,
+    which never answered.
   - **A preparation still running** becomes the viewer's opening task: its read or decode continues
     under the viewer's rules (no preview budget, no 5 s deadline), its progress moves to the status row,
     Esc stops it as Enter's does.
