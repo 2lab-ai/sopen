@@ -40,7 +40,12 @@
 //! line longer than [`LINE_MAX`] (only its start is read, and a comment or string closed past the
 //! cut would colour everything after it), and the rest of the file is plain (wrapped, still
 //! whole). A file over [`HIGHLIGHT_MAX`] is highlighted over its first 16 MiB and plain past
-//! them, read through a stream or in place (06 Tensions, settled by W5b).
+//! them, read through a stream or in place (06 Tensions, settled by W5b). A run of more than
+//! [`RUN_MAX`] word characters (a hex blob, a long name) reaches the parser shortened — the
+//! grammars' patterns cost the square of a run's length — to pieces of itself that keep its
+//! ends, its characters and their order, and is coloured as the whole run, but for the
+//! differences known, which [`Shortened`] lists (most in a varied run: the left-out part where a
+//! grammar colours inside a word; a back-reference between two long runs that shorten alike).
 //!
 //! The file is read live; the index is of the file as opened. A file that differs from it in any
 //! way ([`TextDoc::now`]: written to, grown, truncated, another file renamed over its path) is
@@ -107,6 +112,19 @@ pub const LINE_MAX: usize = 4096;
 /// Highlighting covers this much of a file, from its start (its state runs from the top of the
 /// file); the rest is plain. Also how far a stream's index pass reads without being asked.
 pub const HIGHLIGHT_MAX: u64 = 16 << 20;
+/// The longest run of word characters the parser is handed as it is. A longer one is shortened
+/// ([`Shortened`]) — to more than this, so it never reads as a shorter run, and less than twice it.
+const RUN_MAX: usize = 2 * RUN_END + RUN_MIDDLE;
+/// Characters a shortened run keeps at each end: twice the longest counted repeat in the bundled
+/// grammars that can match word characters (16, C++'s raw-string delimiter), so a prefix or
+/// suffix (`0x`, `u64`, `_t`) is seen as it is.
+const RUN_END: usize = 32;
+/// A shortened run's middle is longer than this: room for every ASCII word character, so a test
+/// over the whole run (all capitals, all hex digits) answers as it does on the run itself.
+const RUN_MIDDLE: usize = 64;
+/// A stretch of one repeated character in a shortened run's middle keeps its length modulo this
+/// (and two characters at least), so runs that differ only in a stretch's length mostly differ.
+const RUN_STRETCH: usize = 16;
 /// Reads while looking for the end of a line.
 const CHUNK: usize = 16 * 1024;
 /// The most marks the index holds before it thins them (06 §7.2): 16 MiB of them.
@@ -2031,10 +2049,156 @@ fn syntax_of(name: &str, doc: &mut TextDoc) -> Result<Option<&'static SyntaxRefe
 /// A highlighted line: runs of text and their colour.
 type Runs = Vec<(Color32, String)>;
 
+/// A character of a word run: what the grammars' identifier, number and keyword patterns are
+/// made of, and never a delimiter (a quote, a bracket, a comment's start).
+fn word(c: char) -> bool {
+    c == '_' || c.is_ascii_digit() || c.is_alphabetic()
+}
+
+/// A line as the parser is handed it: each run of more than [`RUN_MAX`] word characters
+/// shortened, the rest as it is. A grammar pattern that fancy-regex runs on its own engine (one
+/// with a lookaround) costs the square of a run's length, until the backtrack limit, 1,000,000
+/// steps, ends the search as no match: 1,000 `x`s in a Rust comment cost 20 ms, ordinary code
+/// 1.5 µs a byte.
+///
+/// A shortened run is pieces of the run itself, in order, nothing added: its first and last
+/// [`RUN_END`] characters and, between them, the middle's stretches of one character — one
+/// that stands alone kept alone (an exponent's `e`), a repeated one kept repeated, its length
+/// modulo [`RUN_STRETCH`] — grown, while all of them fit, until the run is longer than
+/// [`RUN_MAX`]; a middle of more stretches than fit (a hex blob) keeps its first ones, up to a
+/// point a hash of the run picks, then each character the rest holds that they do not, once,
+/// up to [`RUN_MIDDLE`] different ones. Every two characters side by side in it are side by
+/// side in the run, but where such a middle is cut. So the parser sees the run's ends, its
+/// characters, their order and everything around it, and the scopes it finds, put back on the
+/// line ([`Self::place`]), are those of the line itself — on a run long enough for the limit,
+/// those its patterns mean rather than no match. The differences known, all of runs over
+/// [`RUN_MAX`] with a middle of many stretches but the last:
+/// - The part of a run its shortened form leaves out takes the colour of the character kept
+///   before it: in a grammar that colours inside a word (CSS colours digits in one), not the
+///   colour it has.
+/// - Where such a middle is cut, two characters that are not neighbours in the run meet, and a
+///   pattern that reads them together may read the kept ones otherwise.
+/// - A middle with more than [`RUN_MIDDLE`] different characters keeps the first of them only,
+///   so a test over the whole run (all of one script) may answer otherwise.
+/// - A back-reference (a heredoc's delimiter) compares shortened runs: two runs that agree in
+///   their ends and in the stretches of their middle, each the same length modulo
+///   [`RUN_STRETCH`] (200 and 216 `x`s), or in a middle of many stretches up to where the hash
+///   cuts it and in what its rest holds, read as the same.
+struct Shortened {
+    text: String,
+    /// Where each piece of `text` starts: in `text`, and in the line it was copied from.
+    pieces: Vec<(usize, usize)>,
+}
+
+impl Shortened {
+    /// `None` when the line has no run that long (it is parsed as it is).
+    fn of(line: &str) -> Option<Self> {
+        let mut short: Option<Self> = None;
+        // The line is copied up to here.
+        let mut copied = 0;
+        let (mut start, mut chars) = (0, 0);
+        // A space after the last character ends a run the line ends in.
+        for (at, c) in line.char_indices().chain([(line.len(), ' ')]) {
+            if word(c) {
+                if chars == 0 {
+                    start = at;
+                }
+                chars += 1;
+                continue;
+            }
+            if chars > RUN_MAX {
+                let short = short.get_or_insert_with(|| Self {
+                    text: String::with_capacity(line.len().min(4 * RUN_MAX)),
+                    pieces: Vec::new(),
+                });
+                copied = short.shorten(line, copied, start..at);
+            }
+            chars = 0;
+        }
+        let mut short = short?;
+        short.copy(line, copied..line.len());
+        Some(short)
+    }
+
+    /// Copies the line from `from` to the end of the run's head, then the run's middle
+    /// shortened, and says where its tail starts (copied with what follows it).
+    fn shorten(&mut self, line: &str, from: usize, run: std::ops::Range<usize>) -> usize {
+        let chars: Vec<(usize, char)> = line[run.clone()]
+            .char_indices()
+            .map(|(i, c)| (run.start + i, c))
+            .collect();
+        let tail = chars.len() - RUN_END;
+        let middle = &chars[RUN_END..tail];
+        // Where the middle's `i`th character starts in the line (the tail's start past its end).
+        let at = |i: usize| middle.get(i).map_or(chars[tail].0, |c| c.0);
+        // The run's FNV-1a hash: the same on every build (std's hasher may change between them).
+        let hash = line[run].bytes().fold(0xcbf2_9ce4_8422_2325_u64, |h, b| {
+            (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
+        });
+        let cut = RUN_MIDDLE + (hash % RUN_STRETCH as u64) as usize;
+        // The middle's stretches of one character, in order, while they fit: where each starts,
+        // how long it is and how much of it is kept.
+        let mut stretches: Vec<(usize, usize, usize)> = Vec::new();
+        let (mut next, mut kept) = (0, 0);
+        while next < middle.len() && kept <= cut {
+            let c = middle[next].1;
+            let len = middle[next..].iter().take_while(|m| m.1 == c).count();
+            let keep = if len == 1 {
+                1
+            } else {
+                2 + (len - 2) % RUN_STRETCH
+            };
+            stretches.push((next, len, keep));
+            kept += keep;
+            next += len;
+        }
+        // All of them fit: they grow, a whole number of times RUN_STRETCH, no longer than they are
+        // (their kept length is theirs modulo it), until the middle is long enough.
+        for (_, len, keep) in &mut stretches {
+            while kept <= RUN_MIDDLE && *keep < *len {
+                *keep += RUN_STRETCH;
+                kept += RUN_STRETCH;
+            }
+        }
+        self.copy(line, from..chars[RUN_END].0);
+        let mut seen: Vec<char> = Vec::with_capacity(RUN_MIDDLE);
+        for &(start, _, keep) in &stretches {
+            self.copy(line, at(start)..at(start + keep));
+            if !seen.contains(&middle[start].1) {
+                seen.push(middle[start].1);
+            }
+        }
+        // The rest of a middle of many stretches: each character not kept yet, once, in order.
+        for &(place, c) in &middle[next..] {
+            if seen.len() >= RUN_MIDDLE {
+                break;
+            }
+            if !seen.contains(&c) {
+                seen.push(c);
+                self.copy(line, place..place + c.len_utf8());
+            }
+        }
+        chars[tail].0
+    }
+
+    fn copy(&mut self, line: &str, part: std::ops::Range<usize>) {
+        self.pieces.push((self.text.len(), part.start));
+        self.text.push_str(&line[part]);
+    }
+
+    /// Where byte `at` of the text (one of its character starts, or its end) is in the line.
+    fn place(&self, at: usize) -> usize {
+        let i = self.pieces.partition_point(|&(text, _)| text <= at) - 1;
+        let (text, line) = self.pieces[i];
+        line + (at - text)
+    }
+}
+
 /// Parser and highlighter state after some line.
 type State = (ParseState, HighlightState);
 
-/// Called with each line before it is parsed (tests: a parser that blocks on a line).
+/// Called with each line as the parser is handed it, before it is parsed (tests: a parser that
+/// blocks on a line).
 #[cfg(test)]
 pub(crate) type ParseHook = Arc<dyn Fn(&str) + Send + Sync>;
 
@@ -2080,14 +2244,21 @@ impl Highlight {
     }
 
     fn run(&self, state: &mut State, line: &str) -> Runs {
+        let short = Shortened::of(line);
+        let parsed = short.as_ref().map_or(line, |s| s.text.as_str());
         #[cfg(test)]
         if let Some(hook) = &self.hook {
-            hook(line);
+            hook(parsed);
         }
         self.parsed.fetch_add(1, Ordering::Relaxed);
-        let Ok(ops) = state.0.parse_line(line, syntaxes()) else {
+        let Ok(mut ops) = state.0.parse_line(parsed, syntaxes()) else {
             return vec![(self.plain, line.to_string())];
         };
+        if let Some(short) = &short {
+            for op in &mut ops {
+                op.0 = short.place(op.0);
+            }
+        }
         HighlightIterator::new(&mut state.1, &ops, line, &self.highlighter)
             .map(|(style, text)| {
                 let c = style.foreground;
