@@ -195,7 +195,7 @@ frame single-lined), and the text viewer does not follow a growing file.
   the file. A file named as a video that holds only sound is previewed as the sound it is; a `.ts`
   `ffprobe` cannot read as media shows its hex rows, as Enter does; any other file `ffprobe`
   cannot read shows the info card with ffprobe's words. The media window's own waveform decode
-  stops when its window goes.
+  stops when its window goes (the window signals; the decoder's thread reaps).
 - **A file that cannot be previewed** — unreadable, vanished, a read error, a decode error, a budget
   hit (§4.3) — shows an **info card**: name, kind, size (exact and in units), date and time, `<LINK>`
   and the target when it is a link, and a last line saying why (`over the preview limit: Enter opens
@@ -248,7 +248,9 @@ bar does not have to move).
   every read, between decode steps, at every MiB of the text index, and before handing over. While
   an `ffprobe` or `ffmpeg` of a media preview runs, the flag (and the step's time) is looked at
   every few milliseconds; a child starts only after a look at it, and on every way out — cancelled,
-  over its time, ended — it is killed and reaped. No process outlives its preview.
+  over its time, ended, or the worker itself failing — it is killed and reaped. A child stays in
+  its slot (`media/child.rs`) until it has exited, so a program that closed its output and lives
+  on is still there to be stopped. No process outlives its preview.
 
 | Exit | What happens to the preparation (or the prepared preview) |
 |---|---|
@@ -259,7 +261,7 @@ bar does not have to move).
 | Enter or F3 on the previewed file | **handed over** (below) |
 | Enter or F3 on a file showing an info card | the preview is dropped (its preparation cancelled) and the file opens as Enter opens it in the list (01 §3a), from the start; a private preview copy that is complete and whose file is unchanged since (size, mtime) is published into the cache as below instead of read again |
 | Enter on another entry, F4 | cancel / kept (F4 does not change the bar) |
-| the window closes | cancel; the window does not wait for a cancelled preview. Its worker reads, removes its own private copy, and for a video or a sound may hold one `ffprobe` or `ffmpeg`: the window kills and reaps that process itself as it goes (`Host::cancel`), since the process may end before the worker has looked at its stop flag |
+| the window closes | cancel; the window does not wait for a cancelled preview. Its worker reads, removes its own private copy, and for a video or a sound may hold one `ffprobe` or `ffmpeg`: the window sends that process its kill itself as it goes (`Host::cancel`), since sopen may end before the worker has looked at its stop flag. That call is on a frame, so it only signals — it waits neither for the process nor for the worker; the worker reaps |
 
 - **The hand-over** (Enter or F3 on a previewed file). The live preview window becomes the viewer:
   - `Window::set_preview(false)`: the preview's budgets are lifted from that moment, its frame and bars
@@ -277,7 +279,10 @@ bar does not have to move).
     encoder question ran out of time is it asked again — on a thread of its own, Save and Export
     unavailable and the status row saying `checking the encoder…` until the answer lands (§6:
     nothing slow on a frame). A media window opened by itself (`sopen file.mov`) asks the same
-    way.
+    way. That question is the window's own task: it has 5 s, and it is stopped — its `ffmpeg`
+    killed — when the window goes. Without an answer in its time, Save and Export are planned
+    for 8-bit `yuv420p` (which every H.264 encoder takes), become available, and say so:
+    `encoder check timed out; Export converts to 8-bit`.
   - **A preparation still running** becomes the viewer's opening task: its read or decode continues
     under the viewer's rules (no preview budget, no 5 s deadline), its progress moves to the status row,
     Esc stops it as Enter's does.

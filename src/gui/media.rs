@@ -40,6 +40,37 @@ const CLOSE_AGAIN: &str = "the window closes when the export is done — close i
      it now; sopen still waits for the export and prints the result in the terminal";
 /// Save and Export wait for ffmpeg to say what its H.264 encoder takes (a video above 8 bits).
 const CHECKING_ENCODER: &str = "checking the encoder…";
+/// The encoder gave no answer in [`ENCODER_TIME`]: Save and Export render 8-bit `yuv420p`,
+/// which every H.264 encoder takes.
+const ENCODER_TIMED_OUT: &str = "encoder check timed out; Export converts to 8-bit";
+/// How long a window waits for the encoder's answer (the preview's time for it, 02 §4.3).
+const ENCODER_TIME: Duration = Duration::from_secs(5);
+
+/// The media window's own encoder question, running: its answer, and what stops it. Dropped —
+/// the answer came, or the window went — its ffmpeg is stopped (killed; its thread reaps it).
+struct Planning {
+    rx: Receiver<Answer>,
+    children: Arc<preview::Children>,
+    cancel: Arc<AtomicBool>,
+}
+
+impl Drop for Planning {
+    fn drop(&mut self) {
+        self.cancel.store(true, SeqCst);
+        self.children.stop();
+    }
+}
+
+/// What came of the encoder question.
+enum Answer {
+    /// The pixel formats ffmpeg's H.264 encoder takes.
+    Takes(std::collections::HashSet<String>),
+    /// None in its time.
+    TimedOut,
+    /// ffmpeg did not run, or the question was stopped.
+    Nothing,
+}
+
 /// Closing was asked for while a save runs.
 const CLOSES_AFTER_SAVE: &str = "the window closes when the save is done";
 
@@ -1175,7 +1206,9 @@ struct MediaWindow {
     unplanned: bool,
     /// What ffmpeg's H.264 encoder takes, being asked on a thread of its own (a video above 8
     /// bits): until it answers, Save and Export are not available and the status says so.
-    planning: Option<Receiver<Option<std::collections::HashSet<String>>>>,
+    planning: Option<Planning>,
+    /// The time the encoder question is held to (tests move it).
+    clock: preview::Clock,
     /// The receipt hook's Export ([`MediaWindow::export_hold`]) was started.
     hold_started: bool,
     /// Tests: how often playback was started (the audio output is opened there).
@@ -1258,6 +1291,7 @@ impl MediaWindow {
             cache_root: None,
             unplanned: false,
             planning: None,
+            clock: Arc::new(Instant::now),
             hold_started: false,
             #[cfg(test)]
             plays: 0,
@@ -1628,7 +1662,9 @@ impl MediaWindow {
     /// Works out how Save and Export render the file, when the window starts without that
     /// (opened by itself, or a preview whose encoder check ran out of time): at once where
     /// nothing has to run; for a video above 8 bits ffmpeg is asked on a thread of its own —
-    /// nothing slow runs on a frame (02 §6).
+    /// nothing slow runs on a frame (02 §6) — by a run that is stopped when the window goes
+    /// and held to [`ENCODER_TIME`]: without an answer by then, Save and Export are planned for
+    /// 8-bit output and say so ([`ENCODER_TIMED_OUT`]).
     fn start_planning(&mut self, ctx: &egui::Context) {
         if !std::mem::take(&mut self.unplanned) {
             return;
@@ -1638,31 +1674,56 @@ impl MediaWindow {
             return;
         }
         let (tx, rx) = mpsc::channel();
-        let (tools, waker) = (self.media.tools.clone(), ctx.clone());
+        let (children, cancel) = (Arc::new(preview::Children::default()), Arc::default());
+        let (tools, input, waker) = (
+            self.media.tools.clone(),
+            self.media.input.clone(),
+            ctx.clone(),
+        );
+        let timed = preview::Timed::new(Arc::clone(&cancel), self.clock.clone(), ENCODER_TIME);
+        let slot = children.clone();
         std::thread::spawn(move || {
-            let _ = tx.send(ffmpeg::encoder_pix_fmts(&tools, cut::PLAN_ENCODER).ok());
+            let answer = match preview::ask_encoder(&tools, &input, &slot, &timed) {
+                Ok(takes) => Answer::Takes(takes),
+                Err(e) if e.is::<preview::OverTime>() => Answer::TimedOut,
+                Err(_) => Answer::Nothing,
+            };
+            let _ = tx.send(answer);
             waker.request_repaint();
         });
-        self.planning = Some(rx);
+        self.planning = Some(Planning {
+            rx,
+            children,
+            cancel,
+        });
     }
 
     /// The encoder's answer, once it is there: Save and Export are available from then on.
     fn poll_planning(&mut self) {
-        let Some(rx) = &self.planning else {
+        let Some(planning) = &self.planning else {
             return;
         };
-        let takes = match rx.try_recv() {
-            Ok(takes) => takes,
+        let answer = match planning.rx.try_recv() {
+            Ok(answer) => answer,
             Err(mpsc::TryRecvError::Empty) => {
                 if self.status.text.is_empty() {
                     self.status = Status::info(CHECKING_ENCODER);
                 }
                 return;
             }
-            Err(mpsc::TryRecvError::Disconnected) => None,
+            Err(mpsc::TryRecvError::Disconnected) => Answer::Nothing,
         };
         self.planning = None;
-        Arc::make_mut(&mut self.media).plan_with(takes.as_ref());
+        let media = Arc::make_mut(&mut self.media);
+        match answer {
+            Answer::Takes(takes) => media.plan_with(Some(&takes)),
+            Answer::Nothing => media.plan_with(None),
+            // No answer in its time: planned for what every H.264 encoder takes, and said.
+            Answer::TimedOut => {
+                media.plan_with(Some(&std::collections::HashSet::new()));
+                media.notes.push(ENCODER_TIMED_OUT.to_string());
+            }
+        }
         if self.status.text == CHECKING_ENCODER {
             self.status = Status::default();
         }
@@ -2799,6 +2860,9 @@ impl super::Window for MediaWindow {
 
 mod file;
 
+mod child;
+#[cfg(test)]
+pub(crate) mod fixtures;
 pub mod preview;
 pub mod timeline;
 pub mod wave;

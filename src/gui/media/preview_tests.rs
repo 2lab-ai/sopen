@@ -1,125 +1,91 @@
 //! The media window as a preview (02 §4.2–§4.4, slice S1-M): what its preparation makes — the
 //! probe, one frame, the waveform of the first minutes — within each step's time, with every
-//! ffprobe and ffmpeg it starts killed and reaped on every way out (counted with `ps`); the
-//! previewed window, which shows that and nothing else — no bars, no input, no playback, no
-//! process of its own; and the hand-over, which decodes nothing again. Real files need ffmpeg
-//! (skipped without it, unless `SOPEN_REQUIRE_FFMPEG` is set); the stalls are stand-in programs.
+//! ffprobe and ffmpeg it starts killed and reaped on every way out; the previewed window, which
+//! shows that and nothing else — no bars, no input, no sound, no process of its own; and the
+//! hand-over, which decodes nothing again.
+//!
+//! - **Time** is a clock the test moves ([`Hand`]): a step is over its time when the test says
+//!   so, never because a test machine was slow. The two tests of the real clock say so in their
+//!   names.
+//! - **Programs that stall** are stand-ins held at a named pipe ([`Hold`]): one process each,
+//!   let go (or not) by the test — never a `sleep`.
+//! - **Processes** are counted as the system lists them: the children the code started, by
+//!   their ids, and anything that names the test's folder ([`none_left`]).
+//! - **Sound** goes to a recording output ([`Recorder`]): what a test hears of a preview is
+//!   that no output was opened and nothing was written to one.
+//! - Anything that could block runs under [`bounded`].
+//!
+//! Real files need ffmpeg (skipped without it, unless `SOPEN_REQUIRE_FFMPEG` is set).
 
-use super::preview::{self, started_under, still_processes, Children, Found, Step, Watch};
+use super::fixtures::{
+    bounded, clip, deep_clip, make, none_left, stand_in, started_under, still_processes,
+    still_running, timed, tone, tools as tools_or_skip, until, Hand, Hold, NEVER_ENDS,
+};
+use super::preview::{self, Children, Found, Step, Watch};
 use super::*;
 use crate::ffmpeg::spawns;
+use crate::gui::playback::Recorder;
 use crate::gui::testkit::{command, Driver};
 use crate::gui::Window as _;
 use crate::kind::Kind;
 use crate::remote::{LocalFs, RemoteFs};
 use eframe::egui::{Key, Modifiers, PointerButton};
-use std::os::unix::fs::PermissionsExt;
 
-fn tools_or_skip() -> Option<Tools> {
-    match ffmpeg::resolve() {
-        Ok(t) => Some(t),
-        Err(e) if std::env::var_os("SOPEN_REQUIRE_FFMPEG").is_some() => {
-            panic!("SOPEN_REQUIRE_FFMPEG is set but {e}")
-        }
-        Err(e) => {
-            eprintln!("skipping media preview test: {e}");
-            None
-        }
-    }
-}
+/// A frame's time, generously: nothing a pass does may take longer.
+const FRAME: Duration = Duration::from_millis(250);
 
-fn make(tools: &Tools, args: &[&str], dst: &Path) {
-    let ok = std::process::Command::new(&tools.ffmpeg)
-        .args(["-hide_banner", "-loglevel", "error", "-nostdin", "-y"])
-        .args(args)
-        .arg(dst)
-        .status()
-        .unwrap()
-        .success();
-    assert!(ok, "fixture {}", dst.display());
-}
-
-/// 2 s of 320×240 at 25 fps with a sound track.
-fn clip(tools: &Tools, dst: &Path) {
-    make(
-        tools,
-        &[
-            "-f",
-            "lavfi",
-            "-i",
-            "testsrc2=size=320x240:rate=25:duration=2",
-            "-f",
-            "lavfi",
-            "-i",
-            "sine=frequency=440:sample_rate=48000:duration=2",
-            "-c:v",
-            "libx264",
-            "-pix_fmt",
-            "yuv420p",
-            "-c:a",
-            "aac",
-        ],
-        dst,
-    );
-}
-
-/// `secs` of a 440 Hz tone, mono, 8 kHz (a WAV: its samples are where its time says).
-fn tone(tools: &Tools, dst: &Path, secs: u32) {
-    let source = format!("sine=frequency=440:sample_rate=8000:duration={secs}");
-    make(tools, &["-f", "lavfi", "-i", &source, "-ac", "1"], dst);
-}
-
-/// A program standing in for ffmpeg or ffprobe: `body` after the `-version` answer (asked once
-/// here, so a start that finds the new file busy is retried before the test's own).
-fn stand_in(dir: &Path, name: &str, body: &str) -> PathBuf {
-    let path = dir.join(name);
-    let script = format!("#!/bin/sh\n[ \"$1\" = -version ] && exit 0\n{body}\n");
-    std::fs::write(&path, script).unwrap();
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-    crate::testutil::run_fresh(std::process::Command::new(&path).arg("-version"));
-    path
-}
-
-/// Never answers, never ends (one process: the shell becomes it).
-const STALLS: &str = "exec sleep 600";
-/// Sound without end.
-const NEVER_ENDS: &str = "exec cat /dev/zero";
-
-/// What a test's preparation is held to: each step's time, how much sound, and its cancel.
+/// What a test's preparation is held to: each step's time on the test's clock (or the real
+/// one), how much sound, and its cancel. It notes when each step began (the real time).
 struct Held {
     cancel: AtomicBool,
+    /// ffprobe's, the frame's, the waveform's, the encoder question's.
     times: [Duration; 4],
     sound: Option<f64>,
     step: Mutex<Option<(Step, Instant)>>,
+    /// `None`: the real clock.
+    hand: Option<Hand>,
+    began: Mutex<Vec<(Step, Instant)>>,
 }
 
 impl Held {
-    /// 02 §4.3's: 5 s for ffprobe and for the frame, the first 10 minutes of sound in 10 s.
-    fn budget() -> Self {
-        Self::with(
-            [
-                Duration::from_secs(5),
-                Duration::from_secs(5),
-                Duration::from_secs(10),
-            ],
-            Some(600.0),
-        )
+    /// 02 §4.3's: 5 s for ffprobe, for the frame and for the encoder question, the first 10
+    /// minutes of sound in 10 s — on `hand`.
+    fn budget(hand: &Hand) -> Self {
+        Self {
+            hand: Some(hand.clone()),
+            ..Self::real([5, 5, 10, 5].map(Duration::from_secs))
+        }
     }
 
-    /// `times`: ffprobe's, the frame's and the waveform's; the encoder check has ffprobe's.
-    fn with(times: [Duration; 3], sound: Option<f64>) -> Self {
+    /// `times` on the real clock.
+    fn real(times: [Duration; 4]) -> Self {
         Self {
             cancel: AtomicBool::new(false),
-            times: [times[0], times[1], times[2], times[0]],
-            sound,
+            times,
+            sound: Some(600.0),
             step: Mutex::new(None),
+            hand: None,
+            began: Mutex::default(),
         }
+    }
+
+    fn now(&self) -> Instant {
+        self.hand.as_ref().map_or_else(Instant::now, Hand::now)
+    }
+
+    /// How long `step` took on the real clock: from its beginning to the next step's (or now).
+    fn took(&self, step: Step) -> Duration {
+        let began = self.began.lock().unwrap();
+        let at = began.iter().position(|(s, _)| *s == step).expect("begun");
+        let end = began.get(at + 1).map_or_else(Instant::now, |(_, t)| *t);
+        end - began[at].1
     }
 }
 
 impl Watch for Held {
     fn begin(&self, step: Step) {
-        *self.step.lock().unwrap() = Some((step, Instant::now()));
+        *self.step.lock().unwrap() = Some((step, self.now()));
+        self.began.lock().unwrap().push((step, Instant::now()));
     }
 
     fn check(&self) -> Result<()> {
@@ -128,7 +94,7 @@ impl Watch for Held {
         }
         if let Some((step, since)) = *self.step.lock().unwrap() {
             let time = self.times[step as usize];
-            if since.elapsed() >= time {
+            if self.now().saturating_duration_since(since) >= time {
                 bail!("{step:?} took over {} ms", time.as_millis());
             }
         }
@@ -144,16 +110,20 @@ fn kind_of(path: &Path) -> Kind {
     crate::kind::by_extension(&path.to_string_lossy()).unwrap_or(Kind::Video)
 }
 
-fn prepare(tools: &Tools, path: &Path, held: &Held) -> Result<Found> {
+fn prepare_in(tools: &Tools, path: &Path, held: &Held, children: &Children) -> Result<Found> {
     let name = path.file_name().unwrap().to_string_lossy().into_owned();
     preview::prepare(
         tools,
         &Input::path(path),
         &name,
         kind_of(path),
-        &Children::default(),
+        children,
         held,
     )
+}
+
+fn prepare(tools: &Tools, path: &Path, held: &Held) -> Result<Found> {
+    prepare_in(tools, path, held, &Children::default())
 }
 
 fn made(tools: &Tools, path: &Path, held: &Held) -> preview::Prepared {
@@ -164,41 +134,87 @@ fn made(tools: &Tools, path: &Path, held: &Held) -> preview::Prepared {
     }
 }
 
-/// A previewed media window on a local file, in a side of the browser's size.
+/// A media window on a local file, and what its sound reached.
 struct Fx {
     tmp: tempfile::TempDir,
     path: PathBuf,
     win: MediaWindow,
     drv: Driver,
+    heard: &'static Recorder,
+}
+
+impl Fx {
+    fn origin(path: &Path) -> Origin {
+        let abs = path.to_str().unwrap().to_string();
+        let mut fs = LocalFs::new();
+        let at = fs.stat(&abs).unwrap();
+        Origin::new(Box::new(fs), None, None, abs, at)
+    }
+
+    /// `win` in a side of the browser's size, its sound recorded (never the device).
+    fn around(tmp: tempfile::TempDir, path: PathBuf, mut win: MediaWindow) -> Self {
+        let heard = Recorder::new();
+        win.sink = Sink::Recording(heard);
+        Self {
+            tmp,
+            path,
+            win,
+            drv: Driver::new(500.0, 420.0),
+            heard,
+        }
+    }
+
+    /// What reached an audio output: outputs opened, buffers written.
+    fn heard(&self) -> (u64, u64) {
+        (
+            self.heard.opens.load(SeqCst),
+            self.heard.writes.load(SeqCst),
+        )
+    }
+
+    /// One pass of the window, timed.
+    fn pass(&mut self) -> Duration {
+        timed(|| self.drv.idle(&mut self.win, 1)).1
+    }
+
+    /// The waveform as painted: each column's x and height, left to right.
+    fn wave(&self) -> Vec<(f32, f32)> {
+        let colour = super::super::chrome::PALETTE.wave;
+        let mut lines: Vec<(f32, f32)> = self
+            .drv
+            .segments()
+            .into_iter()
+            .filter(|([a, b], c)| *c == colour && a.x == b.x)
+            .map(|([a, b], _)| (a.x, (a.y - b.y).abs()))
+            .collect();
+        lines.sort_by(|a, b| a.0.total_cmp(&b.0));
+        lines
+    }
+}
+
+/// The preview of `path`, made by `made`, in its window.
+fn shown(tmp: tempfile::TempDir, path: PathBuf, made: preview::Prepared) -> Fx {
+    let cache = tmp.path().join("cache");
+    let mut win = MediaWindow::previewing(Fx::origin(&path), made, &cache);
+    win.set_preview(true);
+    let mut fx = Fx::around(tmp, path, win);
+    fx.drv.until(&mut fx.win, 10, |w| w.ready());
+    fx.drv.idle(&mut fx.win, 2);
+    fx
 }
 
 fn previewed(tmp: tempfile::TempDir, path: PathBuf, tools: &Tools, held: &Held) -> Fx {
     let made = made(tools, &path, held);
-    let abs = path.to_str().unwrap().to_string();
-    let mut fs = LocalFs::new();
-    let at = fs.stat(&abs).unwrap();
-    let origin = Origin::new(Box::new(fs), None, None, abs, at);
-    let mut win = MediaWindow::previewing(origin, made, &tmp.path().join("cache"));
-    win.set_preview(true);
-    // Never the device: whatever a test finds, it is not heard.
-    win.sink = Sink::Null;
-    let mut fx = Fx {
-        tmp,
-        path,
-        win,
-        drv: Driver::new(500.0, 420.0),
-    };
-    fx.drv.until(&mut fx.win, 10, |w| w.ready());
-    fx.drv.idle(&mut fx.win, 2);
-    fx
+    shown(tmp, path, made)
 }
 
 fn video() -> Option<(Fx, Tools)> {
     let tools = tools_or_skip()?;
     let tmp = tempfile::tempdir().unwrap();
     let path = tmp.path().join("clip.mp4");
-    clip(&tools, &path);
-    Some((previewed(tmp, path, &tools, &Held::budget()), tools))
+    clip(&tools, &path, (320, 240));
+    let held = Held::budget(&Hand::new());
+    Some((previewed(tmp, path, &tools, &held), tools))
 }
 
 /// A `secs`-second tone, its preview reading at most `sound` seconds of it.
@@ -209,7 +225,7 @@ fn sound(secs: u32, sound: Option<f64>) -> Option<(Fx, Tools)> {
     tone(&tools, &path, secs);
     let held = Held {
         sound,
-        ..Held::budget()
+        ..Held::budget(&Hand::new())
     };
     Some((previewed(tmp, path, &tools, &held), tools))
 }
@@ -285,6 +301,15 @@ fn everything(fx: &mut Fx) {
     fx.drv.idle(&mut fx.win, 3);
 }
 
+fn assert_none_left(dir: &Path) {
+    if let Err(left) = none_left(dir) {
+        panic!("{left}");
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// What a preview shows.
+
 /// P1 (video): one frame — the frame at 0 s — fitted in a single-lined frame, with the video's
 /// size and duration; none of the media window's bars.
 #[test]
@@ -311,7 +336,8 @@ fn a_previewed_video_is_its_first_frame_with_its_size_and_duration() {
     assert_eq!(fx.win.tex_pts(), Some(0.0), "the frame at 0 s");
 }
 
-/// P1 (audio): the waveform, with the whole duration; no bars.
+/// P1 (audio): the waveform — painted, column by column across the side — with the whole
+/// duration; no bars.
 #[test]
 fn a_previewed_sound_is_its_waveform_with_its_duration() {
     let Some((fx, _tools)) = sound(3, Some(600.0)) else {
@@ -320,12 +346,18 @@ fn a_previewed_sound_is_its_waveform_with_its_duration() {
     let said = fx.drv.text_starting_with("audio · mono").expect("the line");
     assert!(said.contains("0:03.00"), "the whole duration: {said}");
     assert!(!said.contains("preview of the first"), "all of it: {said}");
-    let (_, columns) = fx.win.columns.as_ref().expect("the waveform is drawn");
-    let loud = columns[0].iter().filter(|[lo, hi]| hi - lo > 0.1).count();
+    let wave = fx.wave();
+    assert!(wave.len() > 400, "a column a point: {}", wave.len());
+    let (left, right) = (wave[0].0, wave[wave.len() - 1].0);
     assert!(
-        loud * 10 >= columns[0].len() * 9,
-        "the tone, over the whole width: {loud} of {} columns",
-        columns[0].len()
+        left < 30.0 && right > 470.0,
+        "over the side's width: {left}..{right}"
+    );
+    let tall = wave.iter().filter(|(_, h)| *h > 20.0).count();
+    assert!(
+        tall * 10 >= wave.len() * 9,
+        "the tone, painted tall over the whole width: {tall} of {}",
+        wave.len()
     );
     assert!(fx.drv.find_text("reading the waveform…").is_none());
     for bar in ["Play", "In  I", "Export  E", "Save"] {
@@ -338,11 +370,11 @@ fn a_previewed_sound_is_its_waveform_with_its_duration() {
 }
 
 /// P5: real clicks (where the Play button is, too), drags, the wheel, `C`, `P`, Space,
-/// Cmd/Ctrl+V, typing — nothing changes in a previewed video or sound, playback never starts
-/// (no audio output is opened), no ffmpeg runs for it after its preparation, and dropping it
-/// asks nothing.
+/// Cmd/Ctrl+V, typing — nothing changes in a previewed video or sound, what it paints stays the
+/// same, no audio output is opened and nothing is written to one, no ffmpeg runs for it after
+/// its preparation, and dropping it asks nothing.
 #[test]
-fn a_previewed_medium_takes_no_input_never_plays_and_runs_nothing() {
+fn a_previewed_medium_takes_no_input_makes_no_sound_and_runs_nothing() {
     for which in ["video", "sound"] {
         let Some((mut fx, _tools)) = (match which {
             "video" => video(),
@@ -350,7 +382,7 @@ fn a_previewed_medium_takes_no_input_never_plays_and_runs_nothing() {
         }) else {
             return;
         };
-        let before = state(&fx.win);
+        let before = (state(&fx.win), fx.drv.pictures(), fx.wave());
         let runs = spawns::of(&fx.path);
         let pids = started_under(fx.tmp.path());
         assert_eq!(
@@ -358,9 +390,15 @@ fn a_previewed_medium_takes_no_input_never_plays_and_runs_nothing() {
             pids.len() as u64,
             "{which}: every run on the file was the preparation's own: {runs:?}"
         );
-        assert_eq!(still_processes(&pids), 0, "{which}: none of them is left");
+        assert_none_left(fx.tmp.path());
         everything(&mut fx);
-        assert_eq!(state(&fx.win), before, "{which}: the preview changed");
+        let after = (state(&fx.win), fx.drv.pictures(), fx.wave());
+        assert_eq!(after, before, "{which}: the preview changed");
+        assert_eq!(
+            fx.heard(),
+            (0, 0),
+            "{which}: an audio output was opened, or written to"
+        );
         assert_eq!(fx.win.plays, 0, "{which}: playback was started");
         assert!(
             fx.drv.take_commands().is_empty(),
@@ -371,6 +409,7 @@ fn a_previewed_medium_takes_no_input_never_plays_and_runs_nothing() {
             runs,
             "{which}: a previewed window runs no ffmpeg"
         );
+        assert_eq!(started_under(fx.tmp.path()), pids, "{which}");
         assert!(
             fx.win.close_requested(),
             "{which}: dropping it asks nothing"
@@ -382,8 +421,12 @@ fn a_previewed_medium_takes_no_input_never_plays_and_runs_nothing() {
     }
 }
 
+// ---------------------------------------------------------------------------------------------
+// The hand-over.
+
 /// P6 (video): handed over, the window is the media window — its bars and the double frame back,
-/// Space plays — and the frame the preview decoded is the one on screen: nothing ran again.
+/// Space plays (now an output is opened and written to) — and the frame the preview decoded is
+/// the one on screen: nothing ran again.
 #[test]
 fn a_handed_over_video_keeps_its_frame_and_plays() {
     let Some((mut fx, _tools)) = video() else {
@@ -423,9 +466,13 @@ fn a_handed_over_video_keeps_its_frame_and_plays() {
         Some(vec![super::super::chrome::PALETTE.frame_active.color])
     );
     assert_eq!(fx.win.tex_pts(), Some(0.0));
+    assert_eq!(fx.heard(), (0, 0), "silent until it is played");
     fx.drv.key(&mut fx.win, Key::Space, Modifiers::NONE);
-    assert_eq!(fx.win.plays, 1, "Space plays again");
-    assert!(fx.win.player.is_some());
+    assert!(fx.win.player.is_some(), "Space plays again");
+    let heard = fx.heard;
+    fx.drv
+        .until(&mut fx.win, 10, |_| heard.writes.load(SeqCst) > 0);
+    assert_eq!(fx.heard().0, 1, "one output, opened by Play");
     fx.drv.key(&mut fx.win, Key::Space, Modifiers::NONE);
     // A drag on the picture draws the crop rectangle again.
     fx.drv.until(&mut fx.win, 10, |w| w.frame_ready());
@@ -453,11 +500,14 @@ fn a_handed_over_short_sound_keeps_its_waveform() {
     assert_eq!(wave::starts(&fx.path), [(0.0, None)]);
     assert!(fx.drv.find_text("Play").is_some(), "the viewer's bars");
     assert!(fx.drv.find_text("reading the waveform…").is_none());
+    let tall = fx.wave().iter().filter(|(_, h)| *h > 20.0).count();
+    assert!(tall > 300, "its waveform, painted: {tall} columns");
 }
 
 /// P12 (audio): a sound longer than the preview reads shows the waveform of its first stretch
-/// and says so; handed over, those peaks stay as they are and the rest is decoded from where
-/// the preview stopped — one more run, starting there.
+/// — painted over the side's whole width — and says so; handed over, those peaks stay as they
+/// are and the rest is decoded from where the preview stopped — one more run, starting there —
+/// and the viewer paints the whole sound.
 #[test]
 fn a_handed_over_long_sound_decodes_on_from_where_the_preview_stopped() {
     let Some((mut fx, _tools)) = sound(6, Some(2.0)) else {
@@ -469,6 +519,14 @@ fn a_handed_over_long_sound_decodes_on_from_where_the_preview_stopped() {
         "{said}"
     );
     assert_eq!(wave::starts(&fx.path), [(0.0, Some(2.0))]);
+    // The first 2 s, over the whole width: tall columns from edge to edge.
+    let painted = fx.wave();
+    let tall = painted.iter().filter(|(_, h)| *h > 20.0).count();
+    assert!(
+        tall * 10 >= painted.len() * 9 && painted.len() > 400,
+        "{tall} of {}",
+        painted.len()
+    );
     let (before, cut) = fx.win.peaks.clone().expect("the preview's peaks");
     assert_eq!(cut, Some(2.0));
     assert!(!before.complete);
@@ -502,64 +560,212 @@ fn a_handed_over_long_sound_decodes_on_from_where_the_preview_stopped() {
         before.lanes[0][..at(2.0) - 1],
         "the first 2 s stay as the preview read them"
     );
-    let rest = &after.lanes[0][at(2.0) + 1..at(5.9)];
+    // Painted: the whole sound now, the part decoded after the hand-over too.
+    let painted = fx.wave();
+    let (left, right) = (painted[0].0, painted[painted.len() - 1].0);
+    let past_cut: Vec<_> = painted
+        .iter()
+        .filter(|(x, _)| *x > left + (right - left) * 0.4)
+        .collect();
     assert!(
-        rest.iter().all(|[lo, hi]| hi - lo > 0.1),
-        "the rest is the tone"
+        past_cut.iter().filter(|(_, h)| *h > 20.0).count() * 10 >= past_cut.len() * 9,
+        "the rest of the sound is painted"
     );
 }
 
-/// P3: a video whose probe hangs (a stand-in `ffprobe` that never answers) is stopped at the
-/// probe's time — its card's line is the error — and the stand-in is killed and reaped.
+/// The waveform of a sound read in two runs — its first stretch, then from there on — is the
+/// waveform of one run over the whole sound, within a column: the second run's samples land
+/// where they are in the source. (Loudness that rises and falls, also in a compressed file: a
+/// wrong place would show.)
 #[test]
-fn a_stalled_ffprobe_is_stopped_at_its_time_and_reaped() {
+fn a_waveform_read_in_two_runs_is_the_waveform_of_one() {
+    let Some(tools) = tools_or_skip() else { return };
     let tmp = tempfile::tempdir().unwrap();
-    let stalls = stand_in(tmp.path(), "ffprobe", STALLS);
-    let tools = Tools {
-        ffmpeg: stalls.clone(),
-        ffprobe: stalls,
-    };
-    let path = tmp.path().join("hangs.mp4");
-    std::fs::write(&path, b"whatever").unwrap();
-    let ms = Duration::from_millis;
-    let held = Held::with([ms(300), ms(300), ms(300)], Some(600.0));
-    let started = Instant::now();
-    let error = prepare(&tools, &path, &held).err().expect("stopped");
-    let took = started.elapsed();
-    assert_eq!(format!("{error:#}"), "Probe took over 300 ms");
-    assert!(
-        took >= ms(300) && took < Duration::from_secs(5),
-        "within its time: {took:?}"
-    );
-    let pids = started_under(tmp.path());
-    assert_eq!(pids.len(), 1, "the probe: {pids:?}");
-    assert_eq!(still_processes(&pids), 0, "killed and reaped");
+    for (name, codec) in [
+        ("sweep.wav", &[][..]),
+        ("sweep.mp3", &["-c:a", "libmp3lame", "-b:a", "64k"][..]),
+    ] {
+        let path = tmp.path().join(name);
+        let mut args = vec![
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=300:sample_rate=22050:duration=20",
+            "-af",
+            "volume='0.1+0.9*abs(sin(t/1.7*PI))':eval=frame",
+            "-ac",
+            "1",
+        ];
+        args.extend_from_slice(codec);
+        make(&tools, &args, &path);
+        let input = Input::path(&path);
+        let duration = ffmpeg::probe(&tools, &input).unwrap().duration.unwrap();
+        let read = |from: f64, len: Option<f64>, onto: Option<(&wave::Source, f64)>| {
+            let out = wave::command(&tools, &input, 1, from, len)
+                .stderr(Stdio::null())
+                .output()
+                .unwrap();
+            assert!(out.status.success());
+            wave::read_onto(&mut &out.stdout[..], 1, duration, onto, &mut |_| {}).unwrap()
+        };
+        let one = read(0.0, None, None);
+        let cut = 7.0;
+        let first = read(0.0, Some(cut), None);
+        let two = read(cut, None, Some((&first, cut)));
+        let shown = Timeline::new(8000.0, (duration * 8000.0) as Tick);
+        let (a, b) = (
+            wave::columns(&one, &shown, 800, 1).remove(0),
+            wave::columns(&two, &shown, 800, 1).remove(0),
+        );
+        let close =
+            |x: [f32; 2], y: [f32; 2]| (x[0] - y[0]).abs() < 0.04 && (x[1] - y[1]).abs() < 0.04;
+        let off: Vec<usize> = (1..799)
+            .filter(|&k| !(close(b[k], a[k]) || close(b[k], a[k - 1]) || close(b[k], a[k + 1])))
+            .collect();
+        assert!(off.is_empty(), "{name}: columns {off:?} differ");
+    }
 }
 
-/// P3: the first frame has its own time: an ffmpeg that never gives one is stopped there.
+// ---------------------------------------------------------------------------------------------
+// Budgets (02 §4.3), on a clock the test moves.
+
+/// Runs `prepare` on a thread, waits until its `nth` child runs, then gives the test the moment
+/// (with a look at whether the preparation has ended): the preparation's result comes back.
+fn while_child_runs(
+    tools: Tools,
+    path: PathBuf,
+    held: Arc<Held>,
+    children: Arc<Children>,
+    nth: usize,
+    moment: impl FnOnce(&dyn Fn() -> bool),
+) -> Result<Found> {
+    let dir = path.parent().unwrap().to_path_buf();
+    let worker = std::thread::spawn(move || prepare_in(&tools, &path, &held, &children));
+    until("the child starts", || started_under(&dir).len() >= nth);
+    assert_eq!(still_running(&started_under(&dir)), 1, "it runs");
+    moment(&|| worker.is_finished());
+    until("the preparation ends", || worker.is_finished());
+    worker.join().unwrap()
+}
+
+/// P3: a video whose probe hangs (a stand-in `ffprobe` that never answers) goes on for as long
+/// as its time is not over — the real clock is not what decides — and is stopped when it is:
+/// the error names the step, and the stand-in is killed and reaped.
 #[test]
-fn a_stalled_first_frame_is_stopped_at_its_time_and_reaped() {
+fn a_stalled_ffprobe_is_stopped_when_its_time_is_over() {
+    bounded(60, || {
+        let tmp = tempfile::tempdir().unwrap();
+        let hold = Hold::new(tmp.path(), "hold");
+        let stalls = stand_in(tmp.path(), "ffprobe", &hold.stalls());
+        let tools = Tools {
+            ffmpeg: stalls.clone(),
+            ffprobe: stalls,
+        };
+        let path = tmp.path().join("hangs.mp4");
+        std::fs::write(&path, b"whatever").unwrap();
+        let hand = Hand::new();
+        let held = Arc::new(Held::budget(&hand));
+        let ended = while_child_runs(tools, path, held, Arc::default(), 1, |finished| {
+            hand.advance(Duration::from_millis(4900));
+            std::thread::sleep(Duration::from_millis(100));
+            assert!(!finished(), "4.9 s of its 5 s: it goes on");
+            hand.advance(Duration::from_millis(100));
+        });
+        let error = ended.err().expect("stopped");
+        assert_eq!(format!("{error:#}"), "Probe took over 5000 ms");
+        assert_eq!(started_under(tmp.path()).len(), 1, "the probe");
+        assert_none_left(tmp.path());
+    });
+}
+
+/// P3: the first frame has its own time, counted from its own start: an ffmpeg that never gives
+/// one is stopped when that is over.
+#[test]
+fn a_stalled_first_frame_is_stopped_when_its_own_time_is_over() {
     let Some(real) = tools_or_skip() else { return };
-    let tmp = tempfile::tempdir().unwrap();
-    let path = tmp.path().join("clip.mp4");
-    clip(&real, &path);
-    let tools = Tools {
-        ffmpeg: stand_in(tmp.path(), "ffmpeg", STALLS),
-        ffprobe: real.ffprobe,
-    };
-    let ms = Duration::from_millis;
-    let held = Held::with([Duration::from_secs(20), ms(300), ms(300)], Some(600.0));
-    let error = prepare(&tools, &path, &held).err().expect("stopped");
-    assert_eq!(format!("{error:#}"), "Frame took over 300 ms");
-    let pids = started_under(tmp.path());
-    assert_eq!(pids.len(), 2, "the probe and the frame: {pids:?}");
-    assert_eq!(still_processes(&pids), 0, "killed and reaped");
+    bounded(60, move || {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("clip.mp4");
+        clip(&real, &path, (320, 240));
+        let hold = Hold::new(tmp.path(), "hold");
+        let tools = Tools {
+            ffmpeg: stand_in(tmp.path(), "ffmpeg", &hold.stalls()),
+            ffprobe: real.ffprobe,
+        };
+        let hand = Hand::new();
+        let held = Arc::new(Held::budget(&hand));
+        let ended = while_child_runs(tools, path, held, Arc::default(), 2, |finished| {
+            hand.advance(Duration::from_millis(4900));
+            std::thread::sleep(Duration::from_millis(100));
+            assert!(!finished(), "4.9 s of the frame's 5 s: it goes on");
+            hand.advance(Duration::from_millis(100));
+        });
+        let error = ended.err().expect("stopped");
+        assert_eq!(format!("{error:#}"), "Frame took over 5000 ms");
+        assert_eq!(started_under(tmp.path()).len(), 2, "the probe, the frame");
+        assert_none_left(tmp.path());
+    });
 }
 
-/// P3: a two-hour sound shows the waveform of its first 10 minutes — said, with the whole
-/// duration — within the waveform's 10 s, and nothing is left running.
+/// P3: the waveform's time is 10 s, its own: a decode that gives sound for ever is stopped
+/// when the clock says 10 s — not at ffprobe's 5.
 #[test]
-fn a_two_hour_sound_previews_its_first_ten_minutes_in_time() {
+fn a_waveform_that_never_ends_is_stopped_when_its_time_is_over() {
+    let Some(real) = tools_or_skip() else { return };
+    bounded(60, move || {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("tone.wav");
+        tone(&real, &path, 3);
+        let tools = Tools {
+            ffmpeg: stand_in(tmp.path(), "ffmpeg", NEVER_ENDS),
+            ffprobe: real.ffprobe,
+        };
+        let hand = Hand::new();
+        let held = Arc::new(Held::budget(&hand));
+        let ended = while_child_runs(tools, path, held, Arc::default(), 2, |finished| {
+            hand.advance(Duration::from_millis(9900));
+            std::thread::sleep(Duration::from_millis(100));
+            assert!(!finished(), "9.9 s of the waveform's 10 s: it goes on");
+            hand.advance(Duration::from_millis(100));
+        });
+        let error = ended.err().expect("stopped");
+        assert_eq!(format!("{error:#}"), "Wave took over 10000 ms");
+        assert_none_left(tmp.path());
+    });
+}
+
+/// The real clock: a stalled probe held to 300 ms is stopped about then.
+#[test]
+fn on_the_real_clock_a_stalled_ffprobe_is_stopped_in_time() {
+    bounded(60, || {
+        let tmp = tempfile::tempdir().unwrap();
+        let hold = Hold::new(tmp.path(), "hold");
+        let stalls = stand_in(tmp.path(), "ffprobe", &hold.stalls());
+        let tools = Tools {
+            ffmpeg: stalls.clone(),
+            ffprobe: stalls,
+        };
+        let path = tmp.path().join("hangs.mp4");
+        std::fs::write(&path, b"whatever").unwrap();
+        let held = Held::real([300, 300, 300, 300].map(Duration::from_millis));
+        let (ended, took) = timed(|| prepare(&tools, &path, &held));
+        assert_eq!(
+            format!("{:#}", ended.err().expect("stopped")),
+            "Probe took over 300 ms"
+        );
+        assert!(
+            took >= Duration::from_millis(300) && took < Duration::from_secs(5),
+            "{took:?}"
+        );
+        assert_none_left(tmp.path());
+    });
+}
+
+/// P3, on the real clock: a two-hour sound shows the waveform of its first 10 minutes — said,
+/// with the whole duration — its probe within ffprobe's 5 s and its waveform within the
+/// waveform's 10 s, each measured by itself; nothing is left running.
+#[test]
+fn on_the_real_clock_a_two_hour_sound_previews_ten_minutes_within_each_budget() {
     let Some(tools) = tools_or_skip() else { return };
     let tmp = tempfile::tempdir().unwrap();
     let path = tmp.path().join("long.mp3");
@@ -579,10 +785,12 @@ fn a_two_hour_sound_previews_its_first_ten_minutes_in_time() {
         ],
         &path,
     );
-    let started = Instant::now();
-    let fx = previewed(tmp, path, &tools, &Held::budget());
-    let took = started.elapsed();
-    assert!(took < Duration::from_secs(10), "{took:?}");
+    let held = Held::real([5, 5, 10, 5].map(Duration::from_secs));
+    let made = made(&tools, &path, &held);
+    let (probe, waveform) = (held.took(Step::Probe), held.took(Step::Wave));
+    assert!(probe < Duration::from_secs(5), "ffprobe: {probe:?}");
+    assert!(waveform < Duration::from_secs(10), "waveform: {waveform:?}");
+    let fx = shown(tmp, path, made);
     assert_eq!(wave::starts(&fx.path), [(0.0, Some(600.0))]);
     let said = fx.drv.text_starting_with("audio · mono").expect("the line");
     assert!(
@@ -602,130 +810,179 @@ fn a_two_hour_sound_previews_its_first_ten_minutes_in_time() {
         peaks.lanes[0][at(601.0)..].iter().all(|b| *b == [0.0, 0.0]),
         "and no further"
     );
-    // The preview shows those 10 minutes over its whole width.
-    let (_, columns) = fx.win.columns.as_ref().expect("drawn");
-    let loud = columns[0].iter().filter(|[lo, hi]| hi - lo > 0.05).count();
-    assert!(loud * 10 >= columns[0].len() * 9, "{loud}");
-    let pids = started_under(fx.tmp.path());
-    assert_eq!(pids.len(), 2, "the probe and the waveform: {pids:?}");
-    assert_eq!(still_processes(&pids), 0, "no worker is left");
+    // The preview paints those 10 minutes over its whole width.
+    let painted = fx.wave();
+    let tall = painted.iter().filter(|(_, h)| *h > 10.0).count();
+    assert!(
+        tall * 10 >= painted.len() * 9 && painted.len() > 400,
+        "{tall} of {}",
+        painted.len()
+    );
+    assert_eq!(started_under(fx.tmp.path()).len(), 2, "probe, waveform");
+    assert_none_left(fx.tmp.path());
 }
+
+// ---------------------------------------------------------------------------------------------
+// Stops: no process outlives its preview.
 
 /// P4: a waveform decode that is cancelled stops: its ffmpeg (here one that would give sound
 /// for ever) is killed and reaped, and the preparation ends cancelled.
 #[test]
 fn a_cancelled_waveform_decode_stops() {
     let Some(real) = tools_or_skip() else { return };
-    let tmp = tempfile::tempdir().unwrap();
-    let path = tmp.path().join("tone.wav");
-    tone(&real, &path, 3);
-    let tools = Tools {
-        ffmpeg: stand_in(tmp.path(), "ffmpeg", NEVER_ENDS),
-        ffprobe: real.ffprobe,
-    };
-    let long = Duration::from_secs(60);
-    let held = Held::with([long, long, long], Some(600.0));
-    let dir = tmp.path().to_path_buf();
-    let ended = std::thread::scope(|scope| {
-        let worker = scope.spawn(|| prepare(&tools, &path, &held));
-        // The probe, then the decode: once it runs, the preview is left.
-        let deadline = Instant::now() + Duration::from_secs(20);
-        while started_under(&dir).len() < 2 {
-            assert!(Instant::now() < deadline, "the decode never started");
-            std::thread::sleep(Duration::from_millis(5));
-        }
-        assert_eq!(still_processes(&started_under(&dir)), 1, "it runs");
-        held.cancel.store(true, SeqCst);
-        let left = Instant::now();
-        let ended = worker.join().unwrap();
-        assert!(
-            left.elapsed() < Duration::from_secs(5),
-            "stopped at once: {:?}",
-            left.elapsed()
-        );
-        ended
+    bounded(60, move || {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("tone.wav");
+        tone(&real, &path, 3);
+        let tools = Tools {
+            ffmpeg: stand_in(tmp.path(), "ffmpeg", NEVER_ENDS),
+            ffprobe: real.ffprobe,
+        };
+        let held = Arc::new(Held::budget(&Hand::new()));
+        let h = held.clone();
+        let ended = while_child_runs(tools, path, held, Arc::default(), 2, |_| {
+            h.cancel.store(true, SeqCst);
+        });
+        let error = ended.err().expect("cancelled");
+        assert!(crate::remote::is_cancelled(&error), "{error:#}");
+        assert_none_left(tmp.path());
     });
-    let error = ended.err().expect("cancelled");
-    assert!(crate::remote::is_cancelled(&error), "{error:#}");
-    assert_eq!(
-        still_processes(&started_under(&dir)),
-        0,
-        "killed and reaped"
-    );
 }
 
 /// 02 §4.4, the window closing: whoever stops a preparation without waiting for its worker
-/// kills its ffprobe at once — the process is gone when the kill returns, not when the worker
-/// next looks.
+/// stops its ffprobe at once — it no longer runs when the stop returns — and the stop never
+/// waits: not for the process, and not for a worker that holds the slot (it is called on a
+/// frame). The worker reaps, and a stop that came first lets nothing start.
 #[test]
-fn a_stop_from_outside_kills_the_running_child_at_once() {
-    let tmp = tempfile::tempdir().unwrap();
-    let stalls = stand_in(tmp.path(), "ffprobe", STALLS);
-    let tools = Tools {
-        ffmpeg: stalls.clone(),
-        ffprobe: stalls,
-    };
-    let path = tmp.path().join("hangs.mp4");
-    std::fs::write(&path, b"whatever").unwrap();
-    // No stop of its own: no cancel, a minute for each step.
-    let long = Duration::from_secs(60);
-    let held = Held::with([long, long, long], Some(600.0));
-    let children = Children::default();
-    let dir = tmp.path().to_path_buf();
-    let ended = std::thread::scope(|scope| {
-        let worker = scope.spawn(|| {
-            let input = Input::path(&path);
-            preview::prepare(&tools, &input, "hangs.mp4", Kind::Video, &children, &held)
+fn a_stop_from_outside_kills_the_running_child_and_never_waits() {
+    bounded(60, || {
+        let tmp = tempfile::tempdir().unwrap();
+        let hold = Hold::new(tmp.path(), "hold");
+        let stalls = stand_in(tmp.path(), "ffprobe", &hold.stalls());
+        let tools = Tools {
+            ffmpeg: stalls.clone(),
+            ffprobe: stalls,
+        };
+        let path = tmp.path().join("hangs.mp4");
+        std::fs::write(&path, b"whatever").unwrap();
+        // No stop of its own: no cancel, a clock that stands still.
+        let held = Arc::new(Held::budget(&Hand::new()));
+        let children = Arc::new(Children::default());
+        let (c, dir) = (children.clone(), tmp.path().to_path_buf());
+        let ended = while_child_runs(tools.clone(), path.clone(), held, children, 1, |_| {
+            let ((), took) = timed(|| c.stop());
+            assert!(
+                took < Duration::from_millis(50),
+                "the stop waited: {took:?}"
+            );
+            assert_eq!(
+                still_running(&started_under(&dir)),
+                0,
+                "it no longer runs when the stop returns"
+            );
         });
-        let deadline = Instant::now() + Duration::from_secs(20);
-        while started_under(&dir).is_empty() {
-            assert!(Instant::now() < deadline, "the probe never started");
-            std::thread::sleep(Duration::from_millis(5));
-        }
-        assert_eq!(still_processes(&started_under(&dir)), 1, "it runs");
-        children.kill();
-        assert_eq!(
-            still_processes(&started_under(&dir)),
-            0,
-            "gone when the kill returns"
-        );
-        worker.join().unwrap()
+        let error = ended.err().expect("stopped");
+        assert!(crate::remote::is_cancelled(&error), "{error:#}");
+        assert_none_left(tmp.path());
+
+        // A worker that holds the slot (it is starting a child): the stop does not wait for it.
+        let children = Arc::new(Children::default());
+        let held_slot = children.hold();
+        let c = children.clone();
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(timed(|| c.stop()).1);
+        });
+        let took = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the stop waited for the slot's holder");
+        assert!(took < Duration::from_millis(50), "{took:?}");
+        drop(held_slot);
+        // Stopped first: nothing starts at all.
+        let held = Held::budget(&Hand::new());
+        let error = prepare_in(&tools, &path, &held, &children)
+            .err()
+            .expect("cancelled");
+        assert!(crate::remote::is_cancelled(&error), "{error:#}");
+        assert_eq!(started_under(tmp.path()).len(), 1, "no second child");
     });
-    let error = ended.err().expect("stopped");
-    assert!(crate::remote::is_cancelled(&error), "{error:#}");
-    // Stopped before it starts: nothing runs at all.
-    held.cancel.store(true, SeqCst);
-    let error = prepare(&tools, &path, &held).err().expect("cancelled");
-    assert!(crate::remote::is_cancelled(&error), "{error:#}");
-    assert_eq!(started_under(&dir).len(), 1, "no second child was started");
+}
+
+/// A run that cannot start the thread that watches its child leaves no child: the one already
+/// started is killed and reaped on the way out.
+#[test]
+fn a_run_that_cannot_watch_its_child_leaves_none() {
+    bounded(60, || {
+        let tmp = tempfile::tempdir().unwrap();
+        let hold = Hold::new(tmp.path(), "hold");
+        let stalls = stand_in(tmp.path(), "ffprobe", &hold.stalls());
+        let tools = Tools {
+            ffmpeg: stalls.clone(),
+            ffprobe: stalls,
+        };
+        let path = tmp.path().join("hangs.mp4");
+        std::fs::write(&path, b"whatever").unwrap();
+        let children = Arc::new(Children::default());
+        children.fail_watcher.store(true, SeqCst);
+        let held = Arc::new(Held::budget(&Hand::new()));
+        let (c, h, p) = (children.clone(), held.clone(), path.clone());
+        // Whether it returns an error or unwinds.
+        let ended = std::thread::spawn(move || prepare_in(&tools, &p, &h, &c)).join();
+        assert!(!matches!(ended, Ok(Ok(_))), "it cannot have worked");
+        assert_eq!(started_under(tmp.path()).len(), 1, "the child was started");
+        assert_none_left(tmp.path());
+    });
 }
 
 /// The media window's own waveform decode stops with its window: dropped, its ffmpeg is killed
-/// and reaped (it ran on to the end of the file before).
+/// and reaped (it ran on to the end of the file before) — and the drop does not wait.
 #[test]
 fn a_dropped_waveform_decode_is_killed() {
-    let tmp = tempfile::tempdir().unwrap();
-    let fake = stand_in(tmp.path(), "ffmpeg", NEVER_ENDS);
-    let tools = Tools {
-        ffmpeg: fake.clone(),
-        ffprobe: fake,
-    };
-    let decode = wave::start(&tools, &Input::path(tmp.path()), 1, 3600.0, || {});
-    let deadline = Instant::now() + Duration::from_secs(20);
-    let pid = loop {
-        if let Some(pid) = decode.pid() {
-            break pid;
-        }
-        assert!(Instant::now() < deadline, "the decode never started");
-        std::thread::sleep(Duration::from_millis(5));
-    };
-    assert_eq!(still_processes(&[pid]), 1, "it runs");
-    drop(decode);
-    assert_eq!(
-        still_processes(&[pid]),
-        0,
-        "killed and reaped with its window"
-    );
+    bounded(60, || {
+        let tmp = tempfile::tempdir().unwrap();
+        let fake = stand_in(tmp.path(), "ffmpeg", NEVER_ENDS);
+        let tools = Tools {
+            ffmpeg: fake.clone(),
+            ffprobe: fake,
+        };
+        let decode = wave::start(&tools, &Input::path(tmp.path()), 1, 3600.0, || {});
+        until("the decode starts", || decode.pid().is_some());
+        let pid = decode.pid().unwrap();
+        assert_eq!(still_running(&[pid]), 1, "it runs");
+        let ((), took) = timed(|| drop(decode));
+        assert!(
+            took < Duration::from_millis(50),
+            "the drop waited: {took:?}"
+        );
+        assert_eq!(still_running(&[pid]), 0, "killed with its window");
+        until("it is reaped", || still_processes(&[pid]) == 0);
+        assert_none_left(tmp.path());
+    });
+}
+
+/// An ffmpeg that has closed its output and lives on is still the decode's to stop: the decode
+/// has read to the end and waits for the exit when its window goes — and the child is killed
+/// and reaped.
+#[test]
+fn a_decoder_that_closed_its_output_and_lives_on_is_killed_with_its_window() {
+    bounded(60, || {
+        let tmp = tempfile::tempdir().unwrap();
+        let hold = Hold::new(tmp.path(), "hold");
+        let lingers = format!("exec >&- 2>&-\n{}\nexit 0", hold.line());
+        let fake = stand_in(tmp.path(), "ffmpeg", &lingers);
+        let tools = Tools {
+            ffmpeg: fake.clone(),
+            ffprobe: fake,
+        };
+        let decode = wave::start(&tools, &Input::path(tmp.path()), 1, 60.0, || {});
+        until("the decode starts", || decode.pid().is_some());
+        let pid = decode.pid().unwrap();
+        until("its output is read to the end", || decode.waiting());
+        assert_eq!(still_running(&[pid]), 1, "it lives on");
+        drop(decode);
+        until("it is killed and reaped", || still_processes(&[pid]) == 0);
+        assert_none_left(tmp.path());
+    });
 }
 
 /// A `.ts` ffprobe cannot read as media is not a medium (the browser shows its hex view, as
@@ -734,7 +991,7 @@ fn a_dropped_waveform_decode_is_killed() {
 fn a_file_ffprobe_cannot_read_is_said_and_a_ts_is_not_media() {
     let Some(tools) = tools_or_skip() else { return };
     let tmp = tempfile::tempdir().unwrap();
-    let held = Held::budget();
+    let held = Held::budget(&Hand::new());
     let ts = tmp.path().join("stream.ts");
     std::fs::write(&ts, [0x47u8; 4096]).unwrap();
     assert!(matches!(
@@ -753,33 +1010,18 @@ fn a_file_ffprobe_cannot_read_is_said_and_a_ts_is_not_media() {
     let error = prepare(&tools, &mp4, &held).err().expect("unreadable");
     let said = format!("{error:#}");
     assert!(said.starts_with("ffprobe cannot read "), "{said}");
-    assert_eq!(still_processes(&started_under(tmp.path())), 0);
+    assert_none_left(tmp.path());
 }
 
-/// 3 s of 160×120 above 8 bits (10-bit ProRes, an encoder every ffmpeg has): a video whose
-/// Save and Export plan asks ffmpeg what its H.264 encoder takes.
-fn deep_clip(tools: &Tools, dst: &Path) {
-    make(
-        tools,
-        &[
-            "-f",
-            "lavfi",
-            "-i",
-            "testsrc2=size=160x120:rate=25:duration=3",
-            "-c:v",
-            "prores_ks",
-            "-pix_fmt",
-            "yuv422p10le",
-        ],
-        dst,
-    );
-}
+// ---------------------------------------------------------------------------------------------
+// The encoder question (02 §6: nothing slow on a frame).
 
-/// ffmpeg, slow to say what an encoder takes (`-h encoder=…` answers after 2 s) and itself in
-/// everything else.
-fn slow_encoder_answer(dir: &Path, real: &Tools) -> Tools {
+/// ffmpeg that answers `-h encoder=…` only once let go at `hold`, and is itself in everything
+/// else.
+fn held_encoder_answer(dir: &Path, real: &Tools, hold: &Hold) -> Tools {
     let body = format!(
-        "case \"$*\" in *'-h encoder='*) sleep 2 ;; esac\nexec '{}' \"$@\"",
+        "case \"$*\" in *'-h encoder='*) {} ;; esac\nexec '{}' \"$@\"",
+        hold.line(),
         real.ffmpeg.display()
     );
     Tools {
@@ -788,152 +1030,248 @@ fn slow_encoder_answer(dir: &Path, real: &Tools) -> Tools {
     }
 }
 
-/// One pass of the window, timed.
-fn pass(fx: &mut Fx) -> Duration {
-    let started = Instant::now();
-    fx.drv.idle(&mut fx.win, 1);
-    started.elapsed()
+/// A window on `path` as `open` makes it: probed, nothing asked of the encoder yet, its clock
+/// the test's.
+fn opened(tmp: tempfile::TempDir, path: PathBuf, tools: &Tools, hand: &Hand) -> Fx {
+    let name = path.file_name().unwrap().to_string_lossy().into_owned();
+    let media = Media::unplanned(tools, &Input::path(&path), &name).unwrap();
+    let file = MediaFile::new(Fx::origin(&path), &tmp.path().join("cache"));
+    let mut win = MediaWindow::new(
+        media,
+        file,
+        tmp.path().join("work"),
+        Marks::default(),
+        Selection::default(),
+        Vec::new(),
+    );
+    win.unplanned = true;
+    win.clock = hand.clock();
+    let mut fx = Fx::around(tmp, path, win);
+    // Wide enough for the status row to say its line whole.
+    fx.drv.resize(900.0, 520.0);
+    fx
 }
 
-/// A frame's time, generously: far under the encoder's 2 s.
-const FRAME: Duration = Duration::from_millis(250);
+/// Neither Export nor Save starts, by key or by button, and the window says why.
+fn save_and_export_wait(fx: &mut Fx, which: &str) {
+    fx.drv.idle(&mut fx.win, 2);
+    assert!(
+        fx.drv.find_text("checking the encoder…").is_some(),
+        "{which}: said while it is asked"
+    );
+    assert!(fx.win.media.plan.is_none(), "{which}");
+    assert!(!fx.win.ready(), "{which}: not settled before the answer");
+    fx.drv.key(&mut fx.win, Key::E, Modifiers::NONE);
+    fx.drv.click_text(&mut fx.win, "Export  E");
+    fx.drv.key(&mut fx.win, Key::S, command(false));
+    assert!(fx.win.job.is_none() && fx.win.save.is_none(), "{which}");
+    for _ in 0..5 {
+        let took = fx.pass();
+        assert!(took < FRAME, "{which}: a pass waited: {took:?}");
+    }
+}
 
-/// 02 §6, nothing slow on a frame: for a video above 8 bits the encoder is asked on the
-/// preview's worker, where it can be stopped, and its answer travels with the hand-over — Enter
-/// finds Save and Export planned and runs nothing for it.
+/// 02 §6: for a video above 8 bits the encoder is asked on the preview's worker — the
+/// preparation waits for the answer for as long as the test holds it — and its answer travels
+/// with the hand-over: Enter finds Save and Export planned and runs nothing, no encoder
+/// question and no ffmpeg at all.
 #[test]
 fn the_encoder_is_asked_while_the_preview_is_prepared() {
     let Some(real) = tools_or_skip() else { return };
-    let tmp = tempfile::tempdir().unwrap();
-    let path = tmp.path().join("deep.mov");
-    deep_clip(&real, &path);
-    let tools = slow_encoder_answer(tmp.path(), &real);
-    let started = Instant::now();
-    let mut fx = previewed(tmp, path, &tools, &Held::budget());
-    assert!(
-        started.elapsed() >= Duration::from_secs(2),
-        "the preparation waited for the encoder's answer"
-    );
-    assert!(!fx.win.unplanned, "planned on the worker");
-    let pids = started_under(fx.tmp.path());
-    assert_eq!(pids.len(), 3, "the probe, the frame, the encoder: {pids:?}");
-    assert_eq!(still_processes(&pids), 0);
-    let handed = Instant::now();
-    fx.win.set_preview(false);
-    let took = handed.elapsed() + pass(&mut fx);
-    assert!(took < FRAME, "the hand-over ran something slow: {took:?}");
-    fx.drv.until(&mut fx.win, 10, |w| w.ready());
-    assert!(fx.drv.find_text("checking the encoder…").is_none());
-    let opened = Media::probe(&fx.path).unwrap();
-    assert!(opened.plan.is_some());
-    assert_eq!(
-        format!("{:?}", fx.win.media.plan),
-        format!("{:?}", opened.plan),
-        "as for a file opened from the list"
-    );
-    assert_eq!(fx.win.media.notes, opened.notes);
-    fx.drv.key(&mut fx.win, Key::E, Modifiers::NONE);
-    assert!(fx.win.job.is_some(), "Export runs");
-}
-
-/// 02 §6: an encoder that does not answer within its time on the preview's worker is stopped
-/// there — the preview shows all the same — and a window opened without a preview has asked
-/// nothing yet. In both, the window asks off its frames: no pass waits for the answer, Save and
-/// Export are unavailable and say `checking the encoder…` until it lands, then they work.
-#[test]
-fn a_slow_encoder_answer_never_holds_a_frame() {
-    let Some(real) = tools_or_skip() else { return };
-    for through_preview in [true, false] {
+    bounded(60, move || {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("deep.mov");
         deep_clip(&real, &path);
-        let tools = slow_encoder_answer(tmp.path(), &real);
-        let mut fx = if through_preview {
-            // The encoder check has ffprobe's time: here 300 ms.
-            let ms = Duration::from_millis;
-            let held = Held::with([ms(300), Duration::from_secs(5), ms(300)], Some(600.0));
-            let mut fx = previewed(tmp, path, &tools, &held);
-            assert!(fx.win.unplanned, "stopped at its time: not planned");
-            assert_eq!(fx.drv.pictures().len(), 1, "the preview shows all the same");
-            let pids = started_under(fx.tmp.path());
-            assert_eq!(still_processes(&pids), 0, "the encoder check was reaped");
-            let handed = Instant::now();
-            fx.win.set_preview(false);
-            let took = handed.elapsed() + pass(&mut fx);
+        let hold = Hold::new(tmp.path(), "hold");
+        let tools = held_encoder_answer(tmp.path(), &real, &hold);
+        let held = Arc::new(Held::budget(&Hand::new()));
+        let found = while_child_runs(tools, path.clone(), held, Arc::default(), 3, |finished| {
+            std::thread::sleep(Duration::from_millis(100));
             assert!(
-                took < FRAME,
-                "the hand-over waited for the encoder: {took:?}"
+                !finished(),
+                "the preparation waits for the encoder's answer"
             );
-            fx
-        } else {
-            // As `open` makes the window: probed, nothing asked of the encoder.
-            let media = Media::unplanned(&tools, &Input::path(&path), "deep.mov").unwrap();
-            let abs = path.to_str().unwrap().to_string();
-            let mut fs = LocalFs::new();
-            let at = fs.stat(&abs).unwrap();
-            let origin = Origin::new(Box::new(fs), None, None, abs, at);
-            let file = MediaFile::new(origin, &tmp.path().join("cache"));
-            let mut win = MediaWindow::new(
-                media,
-                file,
-                tmp.path().join("work"),
-                Marks::default(),
-                Selection::default(),
-                Vec::new(),
-            );
-            win.unplanned = true;
-            win.sink = Sink::Null;
-            let mut fx = Fx {
-                tmp,
-                path,
-                win,
-                drv: Driver::new(700.0, 500.0),
-            };
-            let took = pass(&mut fx);
-            assert!(
-                took < FRAME,
-                "the first pass waited for the encoder: {took:?}"
-            );
-            fx
+            hold.release();
+        });
+        let Ok(Found::Media(made)) = found else {
+            panic!("not prepared");
         };
-        let which = if through_preview {
-            "handed over"
-        } else {
-            "opened"
-        };
-        // Wide enough for the status row to say it whole.
-        fx.drv.resize(900.0, 520.0);
-        fx.drv.idle(&mut fx.win, 2);
-        assert!(
-            fx.drv.find_text("checking the encoder…").is_some(),
-            "{which}: said while it is asked"
-        );
-        assert!(fx.win.media.plan.is_none(), "{which}");
-        assert!(!fx.win.ready(), "{which}: not settled before the answer");
-        // Neither Export nor Save starts before the answer.
-        fx.drv.key(&mut fx.win, Key::E, Modifiers::NONE);
-        fx.drv.click_text(&mut fx.win, "Export  E");
-        fx.drv.key(&mut fx.win, Key::S, command(false));
-        assert!(fx.win.job.is_none() && fx.win.save.is_none(), "{which}");
-        for _ in 0..5 {
-            let took = pass(&mut fx);
-            assert!(took < FRAME, "{which}: a pass waited: {took:?}");
-        }
-        fx.drv.until(&mut fx.win, 20, |w| w.media.plan.is_some());
+        let mut fx = shown(tmp, path, *made);
+        assert!(!fx.win.unplanned, "planned on the worker");
+        let asked = started_under(fx.tmp.path());
+        assert_eq!(asked.len(), 3, "the probe, the frame, the encoder");
+        assert_none_left(fx.tmp.path());
+        let runs = spawns::of(&fx.path);
+        let ((), handed) = timed(|| fx.win.set_preview(false));
+        let took = handed + fx.pass();
+        assert!(took < FRAME, "the hand-over ran something slow: {took:?}");
         fx.drv.until(&mut fx.win, 10, |w| w.ready());
-        fx.drv.idle(&mut fx.win, 2);
-        assert!(
-            fx.drv.find_text("checking the encoder…").is_none(),
-            "{which}: the answer landed"
+        fx.drv.idle(&mut fx.win, 3);
+        assert!(fx.drv.find_text("checking the encoder…").is_none());
+        assert_eq!(
+            started_under(fx.tmp.path()),
+            asked,
+            "the hand-over asked the encoder nothing"
         );
-        let opened = Media::probe(&fx.path).unwrap();
+        assert_eq!(spawns::of(&fx.path), runs, "and ran no ffmpeg on the file");
+        let probe = ffmpeg::probe(&real, Input::path(&fx.path)).unwrap();
+        let takes = ffmpeg::encoder_pix_fmts(&real, cut::PLAN_ENCODER).unwrap();
+        let as_opened = cut::plan_with(&probe, "deep.mov", Some(&takes)).ok();
+        assert!(as_opened.is_some());
         assert_eq!(
             format!("{:?}", fx.win.media.plan),
-            format!("{:?}", opened.plan),
-            "{which}"
+            format!("{as_opened:?}"),
+            "as for a file opened from the list"
         );
-        assert_eq!(fx.win.media.notes, opened.notes, "{which}");
         fx.drv.key(&mut fx.win, Key::E, Modifiers::NONE);
-        assert!(fx.win.job.is_some(), "{which}: Export is available now");
+        assert!(fx.win.job.is_some(), "Export runs");
+    });
+}
+
+/// 02 §6: an encoder that does not answer in its time on the preview's worker is stopped there
+/// — the preview shows all the same — and a window opened without a preview has asked nothing
+/// yet. In both, the window asks off its frames: no pass waits for the answer, Save and Export
+/// are unavailable and say `checking the encoder…` until it lands, then they work.
+#[test]
+fn a_held_encoder_answer_never_holds_a_frame() {
+    let Some(real) = tools_or_skip() else { return };
+    for through_preview in [true, false] {
+        let real = real.clone();
+        bounded(60, move || {
+            let which = if through_preview {
+                "handed over"
+            } else {
+                "opened"
+            };
+            let tmp = tempfile::tempdir().unwrap();
+            let path = tmp.path().join("deep.mov");
+            deep_clip(&real, &path);
+            let hold = Hold::new(tmp.path(), "hold");
+            let tools = held_encoder_answer(tmp.path(), &real, &hold);
+            let hand = Hand::new();
+            let mut fx = if through_preview {
+                // The worker's question runs out of its 5 s (the test's clock).
+                let worker_hand = Hand::new();
+                let held = Arc::new(Held::budget(&worker_hand));
+                let found =
+                    while_child_runs(tools.clone(), path.clone(), held, Arc::default(), 3, |_| {
+                        worker_hand.advance(Duration::from_secs(5))
+                    });
+                let Ok(Found::Media(made)) = found else {
+                    panic!("the preview shows all the same");
+                };
+                assert_none_left(tmp.path());
+                let mut fx = shown(tmp, path, *made);
+                assert!(fx.win.unplanned, "stopped at its time: not planned");
+                assert_eq!(fx.drv.pictures().len(), 1, "its frame");
+                fx.win.clock = hand.clock();
+                fx.drv.resize(900.0, 520.0);
+                let ((), handed) = timed(|| fx.win.set_preview(false));
+                let took = handed + fx.pass();
+                assert!(took < FRAME, "the hand-over waited: {took:?}");
+                fx
+            } else {
+                let mut fx = opened(tmp, path, &tools, &hand);
+                let took = fx.pass();
+                assert!(took < FRAME, "the first pass waited: {took:?}");
+                fx
+            };
+            save_and_export_wait(&mut fx, which);
+            hold.release();
+            fx.drv.until(&mut fx.win, 20, |w| w.media.plan.is_some());
+            fx.drv.until(&mut fx.win, 10, |w| w.ready());
+            fx.drv.idle(&mut fx.win, 2);
+            assert!(
+                fx.drv.find_text("checking the encoder…").is_none(),
+                "{which}: the answer landed"
+            );
+            let probe = ffmpeg::probe(&real, Input::path(&fx.path)).unwrap();
+            let takes = ffmpeg::encoder_pix_fmts(&real, cut::PLAN_ENCODER).unwrap();
+            let as_opened = cut::plan_with(&probe, "deep.mov", Some(&takes)).ok();
+            assert_eq!(
+                format!("{:?}", fx.win.media.plan),
+                format!("{as_opened:?}"),
+                "{which}"
+            );
+            assert!(
+                !fx.win.media.notes.iter().any(|n| n.contains("timed out")),
+                "{which}: {:?}",
+                fx.win.media.notes
+            );
+            fx.drv.key(&mut fx.win, Key::E, Modifiers::NONE);
+            assert!(fx.win.job.is_some(), "{which}: Export is available now");
+        });
     }
+}
+
+/// The window's own encoder question has 5 s: an ffmpeg that never answers is stopped — killed
+/// and reaped — when the clock says so, and Save and Export become available all the same,
+/// planned for 8-bit output (which every H.264 encoder takes), with a line that says so.
+#[test]
+fn an_encoder_that_never_answers_is_stopped_and_export_falls_back_to_8_bit() {
+    let Some(real) = tools_or_skip() else { return };
+    bounded(60, move || {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("deep.mov");
+        deep_clip(&real, &path);
+        let hold = Hold::new(tmp.path(), "hold");
+        let tools = held_encoder_answer(tmp.path(), &real, &hold);
+        let hand = Hand::new();
+        let mut fx = opened(tmp, path, &tools, &hand);
+        fx.pass();
+        let dir = fx.tmp.path().to_path_buf();
+        until("the encoder is asked", || !started_under(&dir).is_empty());
+        save_and_export_wait(&mut fx, "opened");
+        hand.advance(Duration::from_millis(4900));
+        std::thread::sleep(Duration::from_millis(100));
+        fx.drv.idle(&mut fx.win, 2);
+        assert!(fx.win.planning.is_some(), "4.9 s of its 5 s: still asked");
+        hand.advance(Duration::from_millis(100));
+        fx.drv.until(&mut fx.win, 20, |w| w.planning.is_none());
+        fx.drv.until(&mut fx.win, 10, |w| w.ready());
+        fx.drv.idle(&mut fx.win, 2);
+        assert_none_left(&dir);
+        assert!(fx.drv.find_text("checking the encoder…").is_none());
+        let note = "encoder check timed out; Export converts to 8-bit";
+        assert!(
+            fx.win.media.notes.iter().any(|n| n == note),
+            "{:?}",
+            fx.win.media.notes
+        );
+        assert!(
+            fx.drv
+                .text_starting_with("Save / Export: ")
+                .is_some_and(|t| t.contains(note)),
+            "said in the window"
+        );
+        let (_, _, plan) = fx.win.media.plan.as_ref().expect("planned");
+        assert_eq!(plan.pix_fmt, "yuv420p", "8 bits");
+        fx.drv.key(&mut fx.win, Key::E, Modifiers::NONE);
+        assert!(fx.win.job.is_some(), "Export is available");
+    });
+}
+
+/// The window closes before the encoder has answered: its question is stopped with it — no
+/// ffmpeg is left — and closing does not wait.
+#[test]
+fn closing_the_window_stops_its_encoder_question() {
+    let Some(real) = tools_or_skip() else { return };
+    bounded(60, move || {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("deep.mov");
+        deep_clip(&real, &path);
+        let hold = Hold::new(tmp.path(), "hold");
+        let tools = held_encoder_answer(tmp.path(), &real, &hold);
+        let mut fx = opened(tmp, path, &tools, &Hand::new());
+        fx.pass();
+        let dir = fx.tmp.path().to_path_buf();
+        until("the encoder is asked", || !started_under(&dir).is_empty());
+        let asked = started_under(&dir);
+        assert_eq!(still_running(&asked), 1, "it waits for its answer");
+        let Fx { tmp, win, .. } = fx;
+        let ((), took) = timed(|| drop(win));
+        assert!(took < Duration::from_millis(50), "closing waited: {took:?}");
+        assert_eq!(still_running(&asked), 0, "stopped with the window");
+        assert_none_left(tmp.path());
+    });
 }

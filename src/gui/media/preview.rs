@@ -8,18 +8,16 @@
 //! stopped, and how Save and Export render the file is already worked out (the one ffmpeg run
 //! that takes, for a video above 8 bits, is made here too).
 
+use super::child::{Ending, Polled, POLL};
 use super::{frame_command, wave, Media};
 use crate::cut;
 use crate::ffmpeg::{self, ErrorTail, Input, Probe, Tools};
 use crate::kind::{self, Kind};
 use anyhow::{anyhow, bail, Context as _, Result};
 use std::io::Read;
-use std::process::{Child, Command, ExitStatus, Stdio};
+use std::process::{Command, ExitStatus};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-
-/// How often a running child is looked at: its end, a cancel, its step's time.
-const POLL: Duration = Duration::from_millis(5);
 
 /// A step of the preparation with a time of its own (02 §4.3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -48,63 +46,15 @@ pub trait Watch: Sync {
     fn sound(&self) -> Option<f64>;
 }
 
-/// The child a preview's preparation runs right now (one at a time). Whoever stops the
-/// preparation kills it here, at once ([`Children::kill`]: the window closing does not wait for
-/// the worker to notice); the worker reaps it otherwise. A child starts only under this lock
-/// and after a look at [`Watch::check`], so a stop either comes before it (and it never starts)
-/// or finds it here.
-#[derive(Default)]
-pub struct Children {
-    live: Mutex<Option<Child>>,
-}
-
-impl Children {
-    /// Kills and reaps the running child, if there is one.
-    pub fn kill(&self) {
-        let mut live = self.live.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some(mut child) = live.take() {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
-    }
-}
-
-/// Tests: every child a preview's preparation started, by the file it read.
-#[cfg(test)]
-static STARTED: Mutex<Vec<(std::path::PathBuf, u32)>> = Mutex::new(Vec::new());
-
-/// Tests: the process ids of every child started to read a file under `dir`.
-#[cfg(test)]
-pub(crate) fn started_under(dir: &std::path::Path) -> Vec<u32> {
-    let started = STARTED.lock().unwrap_or_else(|p| p.into_inner());
-    started
-        .iter()
-        .filter(|(file, _)| file.starts_with(dir))
-        .map(|&(_, pid)| pid)
-        .collect()
-}
-
-/// Tests: how many of `pids` are still processes — running, or ended and not reaped (`ps`
-/// lists both).
-#[cfg(test)]
-pub(crate) fn still_processes(pids: &[u32]) -> usize {
-    if pids.is_empty() {
-        return 0;
-    }
-    let list: Vec<String> = pids.iter().map(u32::to_string).collect();
-    let out = Command::new("ps")
-        .args(["-o", "pid=", "-p", &list.join(",")])
-        .output()
-        .expect("ps");
-    String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .filter(|l| !l.trim().is_empty())
-        .count()
-}
+/// The child a preview's preparation runs right now (one at a time): see [`Slot`]. Whoever
+/// stops the preparation stops it here, at once ([`Slot::stop`]: the window closing does not
+/// wait for the worker to notice); the worker reaps it.
+pub use super::child::Slot as Children;
 
 /// Runs `cmd` (which reads `input`) to its end, `read` taking its output; stopped — killed and
-/// reaped — as soon as `watch` says so, which is then the error. Returns what `read` made, how
-/// the child ended and the last line it said.
+/// reaped — as soon as `watch` says so (which is then the error) or `children` is stopped from
+/// outside (a cancel). Returns what `read` made, how the child ended and the last line it said.
+/// However it returns — unwinding too — no child is left ([`Ending`]).
 fn run<T>(
     cmd: &mut Command,
     input: &Input,
@@ -112,71 +62,136 @@ fn run<T>(
     watch: &dyn Watch,
     read: impl FnOnce(&mut dyn Read) -> T,
 ) -> Result<(T, ExitStatus, String)> {
-    cmd.stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
     let program = cmd.get_program().to_string_lossy().into_owned();
-    let (mut out, err) = {
-        let mut live = children.live.lock().unwrap_or_else(|p| p.into_inner());
-        // Under the lock a stop kills under: stopped before, nothing starts.
-        watch.check()?;
-        let mut child = ffmpeg::spawn(cmd).with_context(|| format!("cannot run {program}"))?;
-        #[cfg(test)]
-        if let Some(file) = input.local() {
-            let mut started = STARTED.lock().unwrap_or_else(|p| p.into_inner());
-            started.push((file.to_path_buf(), child.id()));
-        }
-        let _ = input;
-        let pipes = (
-            child.stdout.take().expect("piped"),
-            child.stderr.take().expect("piped"),
-        );
-        *live = Some(child);
-        pipes
+    watch.check()?;
+    let started = children
+        .start(cmd, input.local())
+        .with_context(|| format!("cannot run {program}"))?;
+    let Some((mut out, err)) = started else {
+        return Err(anyhow!(crate::remote::Cancelled));
     };
+    // From here on, every way out kills and reaps what is still in the slot.
+    let _ending = Ending(children);
     let said = ErrorTail::spawn(err);
     let stopped: Mutex<Option<anyhow::Error>> = Mutex::new(None);
-    let (got, status) = std::thread::scope(|scope| {
-        // Looks at the child until it has ended: by itself, by a stop from here, or by one from
-        // whoever holds `children` (the window closing).
-        let watcher = scope.spawn(|| loop {
-            if let Err(e) = watch.check() {
-                children.kill();
-                *stopped.lock().unwrap() = Some(e);
-                return None;
-            }
-            {
-                let mut live = children.live.lock().unwrap_or_else(|p| p.into_inner());
-                match live.as_mut().map(Child::try_wait) {
-                    // Killed and reaped from outside.
-                    None => return None,
-                    Some(Ok(Some(status))) => {
-                        live.take();
-                        return Some(status);
-                    }
-                    Some(Ok(None)) => {}
-                    Some(Err(_)) => {
-                        drop(live);
-                        children.kill();
-                        return None;
-                    }
+    let (got, status) = std::thread::scope(|scope| -> Result<(T, Option<ExitStatus>)> {
+        // Looks at the child until it has ended: by itself, by a stop from here (the watch),
+        // or by one from whoever holds `children` (the window closing). A child told to stop
+        // is looked at until it is reaped; the watch is not asked again.
+        let watching = || loop {
+            if !children.stopped() {
+                if let Err(e) = watch.check() {
+                    *stopped.lock().unwrap() = Some(e);
+                    children.stop();
                 }
             }
-            std::thread::sleep(POLL);
-        });
+            match children.poll() {
+                Polled::Running => std::thread::sleep(POLL),
+                Polled::Ended(status) => return Some(status),
+                Polled::Gone => return None,
+            }
+        };
+        #[cfg(test)]
+        if children
+            .fail_watcher
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(anyhow!("cannot start the thread that watches {program}"));
+        }
+        let watcher = std::thread::Builder::new()
+            .spawn_scoped(scope, watching)
+            .with_context(|| format!("cannot start the thread that watches {program}"))?;
         let got = read(&mut out);
         // Whatever was not read: the child ends at its next write.
         drop(out);
-        (got, watcher.join().expect("the watcher"))
-    });
+        Ok((got, watcher.join().expect("the watcher")))
+    })?;
     let last = said.join().unwrap_or_default().last_line();
     if let Some(e) = stopped.into_inner().unwrap() {
         return Err(e);
     }
     match status {
-        Some(status) => Ok((got, status, last)),
-        None => Err(anyhow!(crate::remote::Cancelled)),
+        Some(status) if !children.stopped() => Ok((got, status, last)),
+        _ => Err(anyhow!(crate::remote::Cancelled)),
     }
+}
+
+/// A [`Watch`] with one time for one step, on a clock of its holder's: the media window's own
+/// encoder question (a window opened by itself asks it; 02 §4.4).
+pub struct Timed {
+    pub cancel: Arc<std::sync::atomic::AtomicBool>,
+    pub clock: Clock,
+    pub time: Duration,
+    since: Mutex<Option<std::time::Instant>>,
+}
+
+/// The time, as whoever times a step reads it (tests move it).
+pub type Clock = Arc<dyn Fn() -> std::time::Instant + Send + Sync>;
+
+/// A step was stopped because it ran over its time ([`Timed`]).
+#[derive(Debug)]
+pub struct OverTime;
+
+impl std::fmt::Display for OverTime {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("over its time")
+    }
+}
+
+impl std::error::Error for OverTime {}
+
+impl Timed {
+    pub fn new(cancel: Arc<std::sync::atomic::AtomicBool>, clock: Clock, time: Duration) -> Self {
+        Self {
+            cancel,
+            clock,
+            time,
+            since: Mutex::new(None),
+        }
+    }
+}
+
+impl Watch for Timed {
+    fn begin(&self, _: Step) {
+        *self.since.lock().unwrap() = Some((self.clock)());
+    }
+
+    fn check(&self) -> Result<()> {
+        let since = *self.since.lock().unwrap();
+        let now = (self.clock)();
+        if self.cancel.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(anyhow!(crate::remote::Cancelled));
+        }
+        match since {
+            Some(since) if now.saturating_duration_since(since) >= self.time => {
+                Err(anyhow!(OverTime))
+            }
+            _ => Ok(()),
+        }
+    }
+
+    fn sound(&self) -> Option<f64> {
+        None
+    }
+}
+
+/// What ffmpeg's H.264 encoder takes ([`cut::PLAN_ENCODER`]'s pixel formats), asked by a run
+/// that can be stopped: the question a video above 8 bits needs answered before Save and Export
+/// are planned.
+pub fn ask_encoder(
+    tools: &Tools,
+    input: &Input,
+    children: &Children,
+    watch: &dyn Watch,
+) -> Result<std::collections::HashSet<String>> {
+    watch.begin(Step::Encoder);
+    let mut cmd = ffmpeg::encoder_help_command(tools, cut::PLAN_ENCODER);
+    let (help, _, _) = run(&mut cmd, input, children, watch, |out| {
+        let mut help = Vec::new();
+        let _ = out.read_to_end(&mut help);
+        help
+    })?;
+    Ok(ffmpeg::parse_pix_fmts(&String::from_utf8_lossy(&help)))
 }
 
 /// ffprobe's view of `input`, by a run that can be stopped. The outer error is a stop (or
@@ -293,18 +308,8 @@ pub fn prepare(
     let mut media = media;
     let mut planned = true;
     if cut::plan_asks_encoder(&media.probe, name) {
-        watch.begin(Step::Encoder);
-        let mut cmd = ffmpeg::encoder_help_command(tools, cut::PLAN_ENCODER);
-        let asked = run(&mut cmd, input, children, watch, |out| {
-            let mut help = Vec::new();
-            let _ = out.read_to_end(&mut help);
-            help
-        });
-        match asked {
-            Ok((help, _, _)) => {
-                let takes = ffmpeg::parse_pix_fmts(&String::from_utf8_lossy(&help));
-                media.plan_with(Some(&takes));
-            }
+        match ask_encoder(tools, input, children, watch) {
+            Ok(takes) => media.plan_with(Some(&takes)),
             Err(e) if crate::remote::is_cancelled(&e) => return Err(e),
             Err(_) => planned = false,
         }

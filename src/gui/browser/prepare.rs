@@ -379,10 +379,11 @@ impl Budget {
         (!self.lifted()).then_some(value)
     }
 
-    /// Kills and reaps the ffprobe or ffmpeg the preparation runs, if one runs now: called with
-    /// its stop flag set, by whoever does not wait for its worker (the window closing).
+    /// Stops the ffprobe or ffmpeg the preparation runs, if one runs now, and lets none start:
+    /// called with its stop flag set, by whoever does not wait for its worker (the window
+    /// closing). Only the signal is sent here — it is called on a frame; the worker reaps.
     pub fn stop_children(&self) {
-        self.children.kill();
+        self.children.stop();
     }
 
     /// The ffmpeg and ffprobe a preparation runs.

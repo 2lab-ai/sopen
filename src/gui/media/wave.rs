@@ -6,10 +6,12 @@
 //! its window goes ([`Decode`]); one that follows a preview goes on from where the preview's
 //! stopped ([`resume`], 02 §4.4).
 
+use super::child::Slot;
 use super::timeline::{Clip, Timeline};
 use crate::ffmpeg::{Input, Tools};
 use std::io::{BufReader, Read};
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
+#[cfg(test)]
 use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
 use std::sync::{Arc, Mutex};
 
@@ -164,13 +166,15 @@ pub fn command(tools: &Tools, input: &Input, lanes: usize, from: f64, len: Optio
 }
 
 /// A waveform decode and the peaks it fills. Dropped — its window went, or plays another file
-/// — the decode stops: its ffmpeg is killed and reaped, and nothing more is handed over.
+/// — the decode stops: its ffmpeg is killed (the decoder's thread reaps it) and nothing more is
+/// handed over.
 pub struct Decode {
     pub peaks: Shared,
-    /// The running ffmpeg, taken by whoever ends it: the decoder thread at its end, or the
-    /// drop.
-    child: Arc<Mutex<Option<Child>>>,
-    stop: Arc<AtomicBool>,
+    /// The running ffmpeg: in its slot until it has exited, so the drop can always reach it.
+    child: Arc<Slot>,
+    /// Tests: the decoder has read its ffmpeg's output to the end and waits for its exit.
+    #[cfg(test)]
+    waiting: Arc<AtomicBool>,
 }
 
 impl Decode {
@@ -179,7 +183,8 @@ impl Decode {
         Self {
             peaks: Arc::new(Mutex::new(Some(peaks))),
             child: Arc::default(),
-            stop: Arc::default(),
+            #[cfg(test)]
+            waiting: Arc::default(),
         }
     }
 }
@@ -188,20 +193,19 @@ impl Decode {
 impl Decode {
     /// Tests: the process id of the ffmpeg that runs now.
     pub(crate) fn pid(&self) -> Option<u32> {
-        self.child.lock().unwrap().as_ref().map(Child::id)
+        self.child.pid()
+    }
+
+    /// Tests: its output was read to the end; its exit is waited for.
+    pub(crate) fn waiting(&self) -> bool {
+        self.waiting.load(SeqCst)
     }
 }
 
 impl Drop for Decode {
+    /// Only signals (it runs on the window's frame): the decoder's thread reaps.
     fn drop(&mut self) {
-        // Under the lock the decoder thread starts its ffmpeg under: either it sees the stop
-        // and starts none, or its ffmpeg is here to be killed.
-        let mut child = self.child.lock().unwrap();
-        self.stop.store(true, SeqCst);
-        if let Some(mut child) = child.take() {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
+        self.child.stop();
     }
 }
 
@@ -268,13 +272,12 @@ fn start_onto(
         // What was read before shows from the start.
         peaks: Arc::new(Mutex::new(onto.as_ref().map(|(before, _)| before.clone()))),
         child: Arc::default(),
-        stop: Arc::default(),
+        #[cfg(test)]
+        waiting: Arc::default(),
     };
-    let (slot, running, stop) = (
-        decode.peaks.clone(),
-        decode.child.clone(),
-        decode.stop.clone(),
-    );
+    let (slot, running) = (decode.peaks.clone(), decode.child.clone());
+    #[cfg(test)]
+    let waiting = decode.waiting.clone();
     let (tools, input) = (tools.clone(), input.clone());
     std::thread::spawn(move || {
         let from = onto.as_ref().map_or(0.0, |(_, secs)| *secs);
@@ -292,19 +295,13 @@ fn start_onto(
             peaks.error = Some(why);
             peaks
         };
-        let started = {
-            let mut running = running.lock().unwrap();
-            if stop.load(SeqCst) {
-                return;
-            }
-            #[cfg(test)]
-            note_start(&input, from, None);
-            crate::ffmpeg::spawn(&mut cmd).map(|mut child| {
-                let stdout = child.stdout.take().expect("piped");
-                let stderr = child.stderr.take().expect("piped");
-                *running = Some(child);
-                (stdout, stderr)
-            })
+        #[cfg(test)]
+        note_start(&input, from, None);
+        let started = match running.start(&mut cmd, input.local()) {
+            // Stopped before it started.
+            Ok(None) => return,
+            Ok(Some(pipes)) => Ok(pipes),
+            Err(e) => Err(e),
         };
         let done = match started {
             Err(e) => failed(format!("cannot run {}: {e}", tools.ffmpeg.display()), None),
@@ -313,18 +310,21 @@ fn start_onto(
                 let onto = onto.as_ref().map(|(before, secs)| (before, *secs));
                 let read = read_onto(&mut stdout, lanes, duration, onto, &mut |peaks| {
                     // Nothing is handed over once the decode was stopped.
-                    if !stop.load(SeqCst) {
+                    if !running.stopped() {
                         *slot.lock().unwrap() = Some(peaks);
                         wake();
                     }
                 });
                 drop(stdout);
-                // The drop took it: stopped, nothing more to say.
-                let Some(mut child) = running.lock().unwrap().take() else {
-                    let _ = said.join();
+                #[cfg(test)]
+                waiting.store(true, SeqCst);
+                // Its end is waited for with the child still in its slot: an ffmpeg that closed
+                // its output and lives on is there for the drop to kill.
+                let status = running.wait_end();
+                if running.stopped() {
                     return;
-                };
-                let status = child.wait();
+                }
+                let status = status.ok_or_else(|| std::io::Error::other("it is gone"));
                 let last_line = said.join().unwrap_or_default().last_line();
                 match (read, status) {
                     (Err(e), _) => failed(format!("reading the decoded sound: {e}"), None),
@@ -337,7 +337,7 @@ fn start_onto(
                 }
             }
         };
-        if stop.load(SeqCst) {
+        if running.stopped() {
             return;
         }
         let mut slot = slot.lock().unwrap();

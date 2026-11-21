@@ -306,7 +306,11 @@ fn p1_the_other_side_previews_the_file_under_the_bar() {
     let tools = media_tools();
     std::fs::write(format!("{}/broken.mp4", fx.root), b"not really a video").unwrap();
     if let Some(tools) = &tools {
-        clip(tools, Path::new(&format!("{}/clip.mp4", fx.root)));
+        clip(
+            tools,
+            Path::new(&format!("{}/clip.mp4", fx.root)),
+            (160, 120),
+        );
         tone(tools, Path::new(&format!("{}/tone.wav", fx.root)), 3);
     }
     fx.relist();
@@ -2265,153 +2269,162 @@ fn closing_at_a_question_reports_the_item_as_cancelled() {
 
 // ---------------------------------------------------------------------------------------------
 // Slice S1-M: the media preview through the browser's own window (02 P4, P5, P6 and P12 for
-// video and audio).
+// video and audio). Time is a clock the test moves, a program that stalls is a stand-in held at
+// a named pipe, and processes are counted as the system lists them
+// (`crate::gui::media::fixtures`).
 
 use crate::ffmpeg::{spawns, Tools};
-use crate::gui::media::preview::{started_under, still_processes};
+use crate::gui::media::fixtures::{
+    clip, most_at_once, none_left, stand_in, started_under, still_running, tone,
+    tools as media_tools, Census, Hand, Hold,
+};
 use crate::gui::media::wave;
 
-/// ffmpeg and ffprobe, or `None` (the test skips) where they are not installed — a failure
-/// instead with `SOPEN_REQUIRE_FFMPEG` (CI).
-fn media_tools() -> Option<Tools> {
-    match crate::ffmpeg::resolve() {
-        Ok(tools) => Some(tools),
-        Err(e) if std::env::var_os("SOPEN_REQUIRE_FFMPEG").is_some() => {
-            panic!("SOPEN_REQUIRE_FFMPEG is set but {e}")
-        }
-        Err(e) => {
-            eprintln!("skipping media preview test: {e}");
-            None
-        }
+fn assert_none_left(dir: &Path) {
+    if let Err(left) = none_left(dir) {
+        panic!("{left}");
     }
 }
 
-fn make_media(tools: &Tools, args: &[&str], dst: &Path) {
-    let ok = std::process::Command::new(&tools.ffmpeg)
-        .args(["-hide_banner", "-loglevel", "error", "-nostdin", "-y"])
-        .args(args)
-        .arg(dst)
-        .status()
-        .unwrap()
-        .success();
-    assert!(ok, "fixture {}", dst.display());
+/// The folder a fixture's tree and cache are under.
+fn base(fx: &Fx) -> PathBuf {
+    fx.cache.parent().unwrap().to_path_buf()
 }
 
-/// 2 s of 160×120 at 25 fps with a sound track, at `dst`.
-fn clip(tools: &Tools, dst: &Path) {
-    make_media(
-        tools,
-        &[
-            "-f",
-            "lavfi",
-            "-i",
-            "testsrc2=size=160x120:rate=25:duration=2",
-            "-f",
-            "lavfi",
-            "-i",
-            "sine=frequency=440:sample_rate=48000:duration=2",
-            "-c:v",
-            "libx264",
-            "-pix_fmt",
-            "yuv420p",
-            "-c:a",
-            "aac",
-        ],
-        dst,
-    );
+/// Each preparation of the browser's previews runs `tools`, within 02 §4.3's limits on `hand`.
+fn previews_run(fx: &mut Fx, tools: Tools, hand: &Hand) {
+    let hand = hand.clone();
+    fx.b.preview.set_budget(Box::new(move || {
+        let hand = hand.clone();
+        prepare::Budget::with_clock(prepare::Limits::PREVIEW, Box::new(move || hand.now()))
+            .with_tools(tools.clone())
+    }));
 }
 
-/// `secs` of a 440 Hz tone, mono, 8 kHz, at `dst`.
-fn tone(tools: &Tools, dst: &Path, secs: u32) {
-    let source = format!("sine=frequency=440:sample_rate=8000:duration={secs}");
-    make_media(tools, &["-f", "lavfi", "-i", &source, "-ac", "1"], dst);
-}
-
-/// P4: the bar swept over 50 files of every kind on a remote — each preview shown and left,
-/// then back over them faster than a video or a sound is made ready — never has two
-/// preparations at once, and no ffmpeg or ffprobe outlives its preview: after every step that
-/// settled, and at the end, none of the processes the previews started is left (`ps`); the
-/// cache's mirror and session folders are unchanged, and the last preview's copy is the only
-/// one.
+/// P4: the bar swept over 50 files of every kind on a remote, twice. Down, each preview is
+/// shown and left. Back up, every video's and every sound's preparation is held alive (its
+/// `ffprobe` waits where the test holds it) when the bar moves on, so each of them is really
+/// cancelled with a process running. Through all of it at most one child is alive at any
+/// moment — by the children's own start and end, and by the system's process list, looked at
+/// throughout — none outlives its preview, the cache's mirror and session folders are
+/// unchanged, and the last preview's copy is the only one.
 #[test]
 fn p4_a_sweep_over_fifty_files_leaves_no_ffmpeg_and_nothing_in_the_cache() {
     let Some(tools) = media_tools() else { return };
-    let (mut fx, seen, _gate) = watched("");
-    let root = PathBuf::from(&fx.root);
-    clip(&tools, &root.join("v00.mp4"));
-    tone(&tools, &root.join("s00.wav"), 3);
-    for i in 1..12 {
-        std::fs::copy(root.join("v00.mp4"), root.join(format!("v{i:02}.mp4"))).unwrap();
-        std::fs::copy(root.join("s00.wav"), root.join(format!("s{i:02}.wav"))).unwrap();
-    }
-    for i in 0..10 {
-        std::fs::write(root.join(format!("t{i:02}.txt")), format!("text {i}\n")).unwrap();
-        std::fs::copy(root.join("photo.png"), root.join(format!("p{i:02}.png"))).unwrap();
-    }
-    fx.relist();
-    let files: Vec<String> = fx
-        .names(0)
-        .into_iter()
-        .filter(|n| !["..", "alpha", "beta"].contains(&n.as_str()))
-        .collect();
-    assert_eq!(files.len(), 50, "{files:?}");
-    // Onto the first file, then down through all of them, each preview shown.
-    fx.select(&files[0]);
-    for (i, name) in files.iter().enumerate() {
-        assert_eq!(&fx.current(), name);
-        fx.rest();
-        assert!(!fx.b.preview.busy(), "{name}: settled");
-        let pids = started_under(&fx.cache);
-        assert_eq!(
-            still_processes(&pids),
-            0,
-            "{name}: a process outlived its preparation ({} started so far)",
-            pids.len()
-        );
-        if name.ends_with(".mp4") {
-            assert!(fx.right_text("160×120").is_some(), "{name}: its frame");
+    bounded(120, move || {
+        let (mut fx, seen, _gate) = watched("");
+        let root = PathBuf::from(&fx.root);
+        clip(&tools, &root.join("v00.mp4"), (160, 120));
+        tone(&tools, &root.join("s00.wav"), 3);
+        for i in 1..12 {
+            std::fs::copy(root.join("v00.mp4"), root.join(format!("v{i:02}.mp4"))).unwrap();
+            std::fs::copy(root.join("s00.wav"), root.join(format!("s{i:02}.wav"))).unwrap();
         }
-        if name.ends_with(".wav") {
-            assert!(
-                fx.right_text("audio · mono").is_some(),
-                "{name}: its waveform"
+        for i in 0..10 {
+            std::fs::write(root.join(format!("t{i:02}.txt")), format!("text {i}\n")).unwrap();
+            std::fs::copy(root.join("photo.png"), root.join(format!("p{i:02}.png"))).unwrap();
+        }
+        fx.relist();
+        let files: Vec<String> = fx
+            .names(0)
+            .into_iter()
+            .filter(|n| !["..", "alpha", "beta"].contains(&n.as_str()))
+            .collect();
+        assert_eq!(files.len(), 50, "{files:?}");
+        let media = |name: &str| name.ends_with(".mp4") || name.ends_with(".wav");
+        let cache = fx.cache.clone();
+        let census = Census::start(&cache);
+
+        // Down through all of them, each preview shown.
+        fx.select(&files[0]);
+        for (i, name) in files.iter().enumerate() {
+            assert_eq!(&fx.current(), name);
+            fx.rest();
+            assert!(!fx.b.preview.busy(), "{name}: settled");
+            assert_eq!(
+                still_running(&started_under(&cache)),
+                0,
+                "{name}: a process outlived its preparation"
             );
+            if name.ends_with(".mp4") {
+                assert!(fx.right_text("160×120").is_some(), "{name}: its frame");
+            }
+            if name.ends_with(".wav") {
+                assert!(
+                    fx.right_text("audio · mono").is_some(),
+                    "{name}: its waveform"
+                );
+            }
+            if i + 1 < files.len() {
+                fx.key(Key::ArrowDown);
+            }
         }
-        if i + 1 < files.len() {
-            fx.key(Key::ArrowDown);
+        let shown = started_under(&cache).len();
+        assert_eq!(
+            shown,
+            12 * 2 + 12 * 2,
+            "each video and each sound: its probe, and its frame or its waveform"
+        );
+        assert_none_left(&cache);
+
+        // Back up, with every probe held where it starts: each video and each sound has a
+        // process alive when the bar leaves it.
+        let hold = Hold::new(&base(&fx), "hold");
+        let held = Tools {
+            ffmpeg: tools.ffmpeg.clone(),
+            ffprobe: stand_in(&base(&fx), "held-ffprobe", &hold.stalls()),
+        };
+        previews_run(&mut fx, held, &Hand::new());
+        let mut cancelled = 0;
+        for name in files.iter().rev().skip(1) {
+            let before = started_under(&cache).len();
+            fx.key(Key::ArrowUp);
+            assert_eq!(&fx.current(), name);
+            fx.drv.idle(&mut fx.b, REST);
+            if media(name) {
+                fx.wait(|_| started_under(&cache).len() > before);
+                let started = started_under(&cache);
+                assert_eq!(started.len(), before + 1, "{name}: its probe, held");
+                assert_eq!(
+                    still_running(&started),
+                    1,
+                    "{name}: alive as the bar leaves"
+                );
+                cancelled += 1;
+            }
         }
-    }
-    let shown = started_under(&fx.cache).len();
-    assert_eq!(
-        shown,
-        12 * 2 + 12 * 2,
-        "each video and each sound: its probe, and its frame or its waveform"
-    );
-    // Back up, leaving each as soon as the display has committed: preparations are cancelled
-    // wherever they are.
-    for _ in 1..files.len() {
+        // The last held one is left by the bar too: onto `..`.
         fx.key(Key::ArrowUp);
-        fx.drv.idle(&mut fx.b, REST);
-    }
-    fx.rest();
-    fx.wait(|b| !b.preview.busy());
-    let pids = started_under(&fx.cache);
-    assert!(
-        pids.len() > shown,
-        "the way back started some: {}",
-        pids.len()
-    );
-    assert_eq!(still_processes(&pids), 0, "none outlives its preview");
-    let seen = seen.lock().unwrap();
-    assert_eq!(seen.peak, 1, "never two reads at once");
-    assert_eq!(seen.connects, 1, "one preview session");
-    let kept: Vec<String> = files_under(&fx.cache)
-        .into_iter()
-        .filter(|f| !f.starts_with(".preview"))
-        .collect();
-    assert!(kept.is_empty(), "the mirror and the sessions: {kept:?}");
-    let copies = preview_copies(&fx.cache);
-    assert_eq!(copies.len(), 1, "only the shown preview's copy: {copies:?}");
+        fx.rest();
+        fx.wait(|b| !b.preview.busy());
+        assert_eq!(cancelled, 24, "every video and every sound");
+        assert_eq!(
+            started_under(&cache).len(),
+            shown + cancelled,
+            "each cancelled at its probe: no frame, no waveform was started for it"
+        );
+        assert_none_left(&cache);
+        assert_eq!(
+            most_at_once(&cache),
+            1,
+            "never two children alive at once, by their own start and end"
+        );
+        let (most, looks) = census.end();
+        assert!(looks > 20, "the process list was looked at: {looks} times");
+        assert_eq!(most, 1, "never two in the system's process list");
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.peak, 1, "never two reads at once");
+        assert_eq!(seen.connects, 1, "one preview session");
+        let kept: Vec<String> = files_under(&fx.cache)
+            .into_iter()
+            .filter(|f| !f.starts_with(".preview"))
+            .collect();
+        assert!(kept.is_empty(), "the mirror and the sessions: {kept:?}");
+        assert!(
+            preview_copies(&fx.cache).is_empty(),
+            "on `..` no preview is shown: no copy is left"
+        );
+    });
 }
 
 /// P5 (video and audio, in the browser): clicks, a drag, the wheel and Space over a previewed
@@ -2422,20 +2435,37 @@ fn p5_a_media_preview_takes_no_input_and_the_list_keeps_its_keys() {
     let Some(tools) = media_tools() else { return };
     let mut fx = fixture();
     let root = PathBuf::from(&fx.root);
-    clip(&tools, &root.join("clip.mp4"));
+    clip(&tools, &root.join("clip.mp4"), (160, 120));
     tone(&tools, &root.join("tone.wav"), 3);
     fx.relist();
+    let wave_colour = chrome::PALETTE.wave;
     for name in ["clip.mp4", "tone.wav"] {
         fx.bar_on(name);
         let runs = spawns::of(&root.join(name));
-        let before = (
-            fx.drv.pictures(),
-            fx.right_text("audio · "),
-            fx.right_text("160×120"),
+        let started = started_under(&root);
+        let painted = |fx: &Fx| {
+            let wave: Vec<_> = fx
+                .drv
+                .segments()
+                .into_iter()
+                .filter(|(_, c)| *c == wave_colour)
+                .map(|(line, _)| line)
+                .collect();
+            (
+                fx.drv.pictures(),
+                wave,
+                fx.right_text("audio · "),
+                fx.right_text("160×120"),
+            )
+        };
+        let before = painted(&fx);
+        assert!(
+            before.2.is_some() || before.3.is_some(),
+            "{name}: its preview shows"
         );
         assert!(
-            before.1.is_some() || before.2.is_some(),
-            "{name}: its preview shows"
+            !before.0.is_empty() || before.1.len() > 300,
+            "{name}: its frame or its waveform is painted"
         );
         for at in [
             Pos2::new(750.0, 350.0),
@@ -2456,20 +2486,16 @@ fn p5_a_media_preview_takes_no_input_and_the_list_keeps_its_keys() {
         // Space is the list's (it selects the entry), not the preview's Play.
         fx.key(Key::Space);
         fx.drv.idle(&mut fx.b, 3);
-        let after = (
-            fx.drv.pictures(),
-            fx.right_text("audio · "),
-            fx.right_text("160×120"),
-        );
-        assert_eq!(after, before, "{name}: the preview changed");
+        assert_eq!(painted(&fx), before, "{name}: the preview changed");
         assert!(fx.b.viewer.is_none(), "{name}");
         assert_eq!(fx.b.active, 0, "{name}: the keyboard stays in the list");
         assert_eq!(spawns::of(&root.join(name)), runs, "{name}: nothing ran");
+        assert_eq!(started_under(&root), started, "{name}: nothing started");
         assert!(fx.drv.find_text("Pause").is_none(), "{name}: not playing");
         fx.key(Key::Space);
     }
     assert!(Window::close_requested(&mut fx.b), "nothing is asked");
-    assert_eq!(still_processes(&started_under(&root)), 0);
+    assert_none_left(&base(&fx));
 }
 
 /// P6 (video): Enter on a previewed video hands the live preview over — the media window is
@@ -2479,12 +2505,13 @@ fn p6_enter_on_a_previewed_video_hands_it_over_without_decoding_again() {
     let Some(tools) = media_tools() else { return };
     let mut fx = fixture();
     let path = PathBuf::from(format!("{}/clip.mp4", fx.root));
-    clip(&tools, &path);
+    clip(&tools, &path, (160, 120));
     fx.relist();
     fx.bar_on("clip.mp4");
     let window = fx.b.preview.shown_window().expect("the preview");
     let runs = spawns::of(&path);
     assert_eq!((runs.probe, runs.preview), (1, 1), "one probe, one frame");
+    let started = started_under(Path::new(&fx.root));
     fx.key(Key::Enter);
     let viewer = fx.b.viewer.as_ref().expect("the viewer is there at once");
     assert_eq!(
@@ -2507,6 +2534,7 @@ fn p6_enter_on_a_previewed_video_hands_it_over_without_decoding_again() {
         runs,
         "nothing was probed or decoded again"
     );
+    assert_eq!(started_under(Path::new(&fx.root)), started);
     fx.key(Key::Escape);
     assert!(fx.b.viewer.is_none());
     assert_eq!(fx.current(), "clip.mp4");
@@ -2543,112 +2571,113 @@ fn p12_a_long_sound_previews_ten_minutes_and_enter_decodes_on_from_there() {
     assert_eq!((runs.probe, runs.preview), (1, 2), "{runs:?}");
     fx.key(Key::Escape);
     fx.rest();
-    assert_eq!(still_processes(&started_under(Path::new(&fx.root))), 0);
+    assert_none_left(&base(&fx));
+}
+
+/// Lets a held clock go when it is dropped: a test that fails leaves no worker waiting at it.
+struct LetGo(Gate, Arc<AtomicBool>);
+
+impl Drop for LetGo {
+    fn drop(&mut self) {
+        self.1.store(false, Ordering::SeqCst);
+        self.0.release();
+    }
 }
 
 /// 02 §4.4, the window closing while a video is probed (a stand-in `ffprobe` that never
-/// answers): nothing waits for the preview's worker, so its ffprobe is killed and reaped as
-/// the window goes — not when the worker would next have looked.
+/// answers): nothing waits for the preview's worker, so its ffprobe is stopped as the window
+/// goes — by the window, not by the worker's next look (the worker is held where it reads the
+/// time) — and closing does not wait for anything.
 #[test]
 fn closing_the_window_kills_a_previews_ffprobe_at_once() {
-    use std::os::unix::fs::PermissionsExt;
-    let mut fx = fixture();
-    let tools_dir = tempfile::tempdir().unwrap();
-    let stalls = tools_dir.path().join("ffprobe");
-    std::fs::write(
-        &stalls,
-        "#!/bin/sh\n[ \"$1\" = -version ] && exit 0\nexec sleep 600\n",
-    )
-    .unwrap();
-    std::fs::set_permissions(&stalls, std::fs::Permissions::from_mode(0o755)).unwrap();
-    crate::testutil::run_fresh(std::process::Command::new(&stalls).arg("-version"));
-    let tools = Tools {
-        ffmpeg: stalls.clone(),
-        ffprobe: stalls,
-    };
-    // The worker's own look at its stop flag is held (it reads the time first, and the test's
-    // clock stops there): what kills the probe below is the window, not the worker.
-    let gate = Gate::default();
-    let hold = Arc::new(AtomicBool::new(false));
-    let (g, h) = (gate.clone(), hold.clone());
-    fx.b.preview.set_budget(Box::new(move || {
-        let (g, h) = (g.clone(), h.clone());
-        let clock = Box::new(move || {
-            if h.load(Ordering::SeqCst) {
-                g.hold();
-            }
-            std::time::Instant::now()
-        });
-        prepare::Budget::with_clock(prepare::Limits::PREVIEW, clock).with_tools(tools.clone())
-    }));
-    let root = PathBuf::from(&fx.root);
-    std::fs::write(root.join("hangs.mp4"), b"whatever is in it").unwrap();
-    fx.relist();
-    fx.select("hangs.mp4");
-    fx.drv.idle(&mut fx.b, REST);
-    until("the probe starts", || !started_under(&root).is_empty());
-    hold.store(true, Ordering::SeqCst);
-    gate.reached();
-    let pids = started_under(&root);
-    assert_eq!(still_processes(&pids), 1, "the probe runs: {pids:?}");
-    assert!(Window::close_requested(&mut fx.b), "nothing is asked");
-    let Fx { b, _tmp, .. } = fx;
-    drop(b);
-    assert_eq!(still_processes(&pids), 0, "gone with the window");
-    hold.store(false, Ordering::SeqCst);
-    gate.release();
-    drop(_tmp);
+    bounded(60, || {
+        let mut fx = fixture();
+        let hold = Hold::new(&base(&fx), "hold");
+        let stalls = stand_in(&base(&fx), "ffprobe", &hold.stalls());
+        let tools = Tools {
+            ffmpeg: stalls.clone(),
+            ffprobe: stalls,
+        };
+        let gate = Gate::default();
+        let held = Arc::new(AtomicBool::new(false));
+        let _let_go = LetGo(gate.clone(), held.clone());
+        let (g, h) = (gate.clone(), held.clone());
+        fx.b.preview.set_budget(Box::new(move || {
+            let (g, h) = (g.clone(), h.clone());
+            let clock = Box::new(move || {
+                if h.load(Ordering::SeqCst) {
+                    g.hold();
+                }
+                std::time::Instant::now()
+            });
+            prepare::Budget::with_clock(prepare::Limits::PREVIEW, clock).with_tools(tools.clone())
+        }));
+        let root = PathBuf::from(&fx.root);
+        std::fs::write(root.join("hangs.mp4"), b"whatever is in it").unwrap();
+        fx.relist();
+        fx.select("hangs.mp4");
+        fx.drv.idle(&mut fx.b, REST);
+        until("the probe starts", || !started_under(&root).is_empty());
+        held.store(true, Ordering::SeqCst);
+        gate.reached();
+        let pids = started_under(&root);
+        assert_eq!(still_running(&pids), 1, "the probe runs: {pids:?}");
+        assert!(Window::close_requested(&mut fx.b), "nothing is asked");
+        let Fx { b, _tmp, .. } = fx;
+        let closing = std::time::Instant::now();
+        drop(b);
+        let took = closing.elapsed();
+        assert_eq!(still_running(&pids), 0, "stopped with the window");
+        assert!(
+            took < Duration::from_millis(100),
+            "closing waited: {took:?}"
+        );
+        // Its worker, let go, reaps it.
+        drop(_let_go);
+        assert_none_left(_tmp.path());
+    });
 }
 
-/// A program standing in for ffmpeg or ffprobe (`body`, after the `-version` answer: asked once
-/// here, so a start that finds the new file busy is retried before the test's own).
-fn stand_in(dir: &Path, name: &str, body: &str) -> PathBuf {
-    use std::os::unix::fs::PermissionsExt;
-    let path = dir.join(name);
-    let script = format!("#!/bin/sh\n[ \"$1\" = -version ] && exit 0\n{body}\n");
-    std::fs::write(&path, script).unwrap();
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-    crate::testutil::run_fresh(std::process::Command::new(&path).arg("-version"));
-    path
-}
-
-/// P6 (video): Enter while a video is still being probed (an `ffprobe` slower than a preview
-/// allows): the same preparation goes on as the viewer's opening, past the probe's time — one
-/// worker, one probe — and the media window shows when it ends.
+/// P6 (video): Enter while a video is still being probed (an `ffprobe` the test holds): the
+/// same preparation goes on as the viewer's opening — past the probe's time, which the test's
+/// clock says is long over — one worker, one probe, and the media window shows when the probe
+/// answers.
 #[test]
 fn p6_enter_during_a_videos_probe_continues_it_as_the_opening() {
     let Some(real) = media_tools() else { return };
-    let mut fx = fixture();
-    let tools_dir = tempfile::tempdir().unwrap();
-    let path = PathBuf::from(format!("{}/clip.mp4", fx.root));
-    clip(&real, &path);
-    let slow = format!("sleep 0.8\nexec '{}' \"$@\"", real.ffprobe.display());
-    let tools = Tools {
-        ffmpeg: real.ffmpeg,
-        ffprobe: stand_in(tools_dir.path(), "ffprobe", &slow),
-    };
-    fx.b.preview.set_budget(Box::new(move || {
-        let short = prepare::Limits {
-            probe: Duration::from_millis(300),
-            ..prepare::Limits::PREVIEW
+    bounded(60, move || {
+        let mut fx = fixture();
+        let path = PathBuf::from(format!("{}/clip.mp4", fx.root));
+        clip(&real, &path, (160, 120));
+        let hold = Hold::new(&base(&fx), "hold");
+        let tools = Tools {
+            ffmpeg: real.ffmpeg.clone(),
+            ffprobe: stand_in(&base(&fx), "ffprobe", &hold.then(&real.ffprobe)),
         };
-        prepare::Budget::new(short).with_tools(tools.clone())
-    }));
-    fx.relist();
-    fx.select("clip.mp4");
-    fx.drv.idle(&mut fx.b, REST);
-    until("the probe starts", || {
-        !started_under(Path::new(&fx.root)).is_empty()
+        let hand = Hand::new();
+        previews_run(&mut fx, tools, &hand);
+        fx.relist();
+        fx.select("clip.mp4");
+        fx.drv.idle(&mut fx.b, REST);
+        let root = PathBuf::from(&fx.root);
+        until("the probe starts", || !started_under(&root).is_empty());
+        fx.key(Key::Enter);
+        assert!(fx.b.opening.is_some(), "the preparation is the opening now");
+        // Long past a preview's 5 s: the opening has no such time.
+        hand.advance(Duration::from_secs(60));
+        std::thread::sleep(Duration::from_millis(100));
+        fx.drv.idle(&mut fx.b, 3);
+        assert!(fx.b.opening.is_some(), "still opening");
+        assert_eq!(still_running(&started_under(&root)), 1, "the same probe");
+        hold.release();
+        fx.wait(|b| b.viewer.is_some());
+        fx.settle();
+        assert!(fx.drv.find_text("Play").is_some(), "the media window");
+        assert_eq!(fx.b.preview.spawned(), 1, "the same worker");
+        let runs = spawns::of(&path);
+        assert_eq!((runs.probe, runs.preview), (1, 1), "one probe, one frame");
+        assert_none_left(&base(&fx));
     });
-    fx.key(Key::Enter);
-    assert!(fx.b.opening.is_some(), "the preparation is the opening now");
-    fx.wait(|b| b.viewer.is_some());
-    fx.settle();
-    assert!(fx.drv.find_text("Play").is_some(), "the media window");
-    assert_eq!(fx.b.preview.spawned(), 1, "the same worker");
-    let runs = spawns::of(&path);
-    assert_eq!((runs.probe, runs.preview), (1, 1), "one probe, one frame");
-    assert_eq!(still_processes(&started_under(Path::new(&fx.root))), 0);
 }
 
 /// The window closes while a preparation taken over by Enter still probes (an `ffprobe` that
@@ -2656,17 +2685,15 @@ fn p6_enter_during_a_videos_probe_continues_it_as_the_opening() {
 /// the worker after the window returns.
 #[test]
 fn closing_during_a_taken_over_probe_leaves_no_process() {
-    bounded(30, || {
+    bounded(60, || {
         let mut fx = fixture();
-        let tools_dir = tempfile::tempdir().unwrap();
-        let stalls = stand_in(tools_dir.path(), "ffprobe", "exec sleep 600");
+        let hold = Hold::new(&base(&fx), "hold");
+        let stalls = stand_in(&base(&fx), "ffprobe", &hold.stalls());
         let tools = Tools {
             ffmpeg: stalls.clone(),
             ffprobe: stalls,
         };
-        fx.b.preview.set_budget(Box::new(move || {
-            prepare::Budget::preview().with_tools(tools.clone())
-        }));
+        previews_run(&mut fx, tools, &Hand::new());
         let root = PathBuf::from(&fx.root);
         std::fs::write(root.join("hangs.mp4"), b"whatever is in it").unwrap();
         fx.relist();
@@ -2676,14 +2703,13 @@ fn closing_during_a_taken_over_probe_leaves_no_process() {
         fx.key(Key::Enter);
         assert!(fx.b.opening.is_some(), "the preparation is the opening now");
         let pids = started_under(&root);
-        assert_eq!(still_processes(&pids), 1, "still probing");
+        assert_eq!(still_running(&pids), 1, "still probing");
         let leftover = fx.b.leftover.clone();
         let Fx { b, _tmp, .. } = fx;
         drop(b);
         // The opening's worker is waited for after the window: it has ended, its ffprobe
         // killed and reaped, when that returns.
         leftover.borrow_mut().finish();
-        assert_eq!(still_processes(&pids), 0, "none left after the window");
-        drop(_tmp);
+        assert_none_left(_tmp.path());
     });
 }
