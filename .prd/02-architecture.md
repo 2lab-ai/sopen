@@ -287,6 +287,16 @@ bar does not have to move).
   and handles no signal — but for one: while a "Save to…" runs without a window, SIGINT and
   SIGTERM cancel it (06 §7.5; a handler that only stores into atomics, there for that save
   alone).
+  - **A cache claim waits a moment for a lock it finds held.** Because every such child is
+    started with a `pre_exec` (the `PR_SET_PDEATHSIG` above), Linux forks it, and between its
+    fork and its exec the child holds a copy of every descriptor of the sopen that started it —
+    the `flock` of a cache claim (01 §5) that sopen has just released included; close-on-exec
+    takes it away only at the exec. A claim of the same cached copy made in that instant found
+    the lock held by no session at all and fell back to a session copy: lossless, but for
+    nothing. So a claim that finds its lock held asks again every 5 ms for up to 100 ms before
+    it takes the copy for another session's (`cache::claim_with`). A descriptor held between
+    fork and exec is free within milliseconds; another session holds its lock for as long as it
+    lives, so that path — and only that one — costs up to 100 ms.
 
 | Exit | What happens to the preparation (or the prepared preview) |
 |---|---|

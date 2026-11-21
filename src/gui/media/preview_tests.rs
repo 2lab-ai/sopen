@@ -1101,7 +1101,7 @@ fn export_ends(fx: &mut Fx, hold: &Hold) {
 /// the test's.
 fn opened(tmp: Dir, path: PathBuf, tools: &Tools, hand: &Hand) -> Fx {
     let name = path.file_name().unwrap().to_string_lossy().into_owned();
-    let media = Media::unplanned(tools, &Input::path(&path), &name).unwrap();
+    let media = Media::unplanned(tools, &Input::path(&path), &name, &name).unwrap();
     let file = MediaFile::new(Fx::origin(&path), &tmp.path().join("cache"));
     let mut win = MediaWindow::new(
         media,

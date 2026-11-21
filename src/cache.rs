@@ -359,8 +359,22 @@ pub fn claim(cache: &Path, host: &str, abs: &str) -> Result<Claim> {
     })
 }
 
+/// How long a claim goes on asking for a lock it found held, and how often, before it takes the
+/// copy for another session's ([`claim_with`]).
+const HELD_RETRY: std::time::Duration = std::time::Duration::from_millis(100);
+const HELD_RETRY_EVERY: std::time::Duration = std::time::Duration::from_millis(5);
+
 /// [`claim`] of the cached copy `cached`, with `try_lock` standing in for `File::try_lock`
 /// (tests: a filesystem whose locks fail).
+///
+/// A lock found held is asked for again, every [`HELD_RETRY_EVERY`] for up to [`HELD_RETRY`],
+/// before this session takes a copy of its own. The reason is sopen's own children: on Linux
+/// each is started with a `pre_exec` (`PR_SET_PDEATHSIG`, S1-M), so it is forked, and between
+/// its fork and its exec it holds a copy of every descriptor of this process — the lock of a
+/// claim this process has just let go included (close-on-exec only takes it away at the exec).
+/// A claim of the same copy made in that instant would find the lock held by no session at
+/// all, and fall back for nothing. Such a lock is free within milliseconds; another session's
+/// is held for as long as it lives, so that one costs the wait once and then gets its copy.
 fn claim_with(
     cache: &Path,
     cached: &Path,
@@ -372,7 +386,16 @@ fn claim_with(
     let (file, lock) = open_lock(cache, cached)?;
     // Held by another session, or not lockable here at all: either way this session must not
     // work on the shared copy.
-    let why = match try_lock(&file) {
+    let asked = std::time::Instant::now();
+    let tried = loop {
+        match try_lock(&file) {
+            Err(std::fs::TryLockError::WouldBlock) if asked.elapsed() < HELD_RETRY => {
+                std::thread::sleep(HELD_RETRY_EVERY);
+            }
+            tried => break tried,
+        }
+    };
+    let why = match tried {
         Ok(()) => {
             return Ok(Claim {
                 local: cached.to_path_buf(),
@@ -413,50 +436,6 @@ fn claim_with(
         fresh: true,
         _lock: None,
     })
-}
-
-/// An error about a file's private copy, said about the file as its owner knows it. A remote
-/// file is read from `copy`, in sopen's cache, and what fails on it — ffprobe, a read — names
-/// that path. Where the error is shown (the terminal, the list's status row, a dialog) the copy
-/// is not named: `known` (`host:/abs`) stands in its place. Only the copy's own path is
-/// replaced, never a longer path that begins with it (a backup beside it). An error that does
-/// not name the copy (a stop, the connection's own, a refusal) is passed on as it is, its
-/// kind with it.
-pub fn as_known(e: anyhow::Error, copy: &Path, known: &str) -> anyhow::Error {
-    let copy = copy.display().to_string();
-    let said = format!("{e:#}");
-    if copy == known || crate::remote::is_cancelled(&e) {
-        return e;
-    }
-    match renamed(&said, &copy, known) {
-        Some(renamed) => anyhow::anyhow!(renamed),
-        None => e,
-    }
-}
-
-/// `said` with every `copy` that is a whole path replaced by `known`; `None` when there is none.
-fn renamed(said: &str, copy: &str, known: &str) -> Option<String> {
-    if copy.is_empty() {
-        return None;
-    }
-    let mut out = String::new();
-    let (mut rest, mut found) = (said, false);
-    while let Some(at) = rest.find(copy) {
-        let after = &rest[at + copy.len()..];
-        let mut next = after.chars();
-        // The path goes on: another file's (`<copy>.sopen-backup-…`, `<copy>/…`).
-        let goes_on = match next.next() {
-            Some(c) if c.is_alphanumeric() || matches!(c, '/' | '-' | '_' | '~') => true,
-            Some('.') => next.next().is_some_and(|c| !c.is_whitespace()),
-            _ => false,
-        };
-        out.push_str(&rest[..at]);
-        out.push_str(if goes_on { copy } else { known });
-        found |= !goes_on;
-        rest = after;
-    }
-    out.push_str(rest);
-    found.then_some(out)
 }
 
 /// A remote file fetched into this session's cached copy.
@@ -1013,36 +992,40 @@ mod job_tests {
 
 #[cfg(test)]
 mod tests {
-    /// [`as_known`]: the copy's own path becomes `host:/abs`; a longer path that begins with it
-    /// stays; an error that does not name the copy keeps its kind.
+    /// A lock found held is asked for again for a moment before the claim takes the copy for
+    /// another session's: one let go within that moment (a child of sopen's, between its fork
+    /// and its exec, holds a copy of a lock this process has just released) gives the shared
+    /// copy, with no session copy made; one held past it is another session's, as before.
     #[test]
-    fn an_error_about_the_copy_is_said_about_the_file() {
-        let copy = Path::new("/c/box/data/a.mp4");
-        let known = "box:/data/a.mp4";
-        let said = |text: &str| format!("{:#}", as_known(anyhow::anyhow!("{text}"), copy, known));
-        assert_eq!(
-            said("ffprobe cannot read /c/box/data/a.mp4: Invalid data"),
-            "ffprobe cannot read box:/data/a.mp4: Invalid data"
+    fn a_claim_waits_a_moment_for_a_lock_it_found_held() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cached = cache_path(tmp.path(), "box", "/data/a.bin");
+        let (held, _) = open_lock(tmp.path(), &cached).unwrap();
+        held.try_lock().unwrap();
+        // Let go well inside the window.
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            drop(held);
+        });
+        let claim = claim(tmp.path(), "box", "/data/a.bin").unwrap();
+        release.join().unwrap();
+        assert_eq!(claim.note, None, "the shared copy, not a session copy");
+        assert_eq!(claim.local, cached);
+        assert!(
+            !tmp.path().join(SESSIONS).exists(),
+            "no session copy was made"
         );
-        assert_eq!(
-            said("/c/box/data/a.mp4 has no audio or video stream"),
-            "box:/data/a.mp4 has no audio or video stream"
+        // `claim` holds it now, for as long as it lives: another session.
+        let asked = std::time::Instant::now();
+        let second = super::claim(tmp.path(), "box", "/data/a.bin").unwrap();
+        assert!(
+            asked.elapsed() >= HELD_RETRY,
+            "it asked for the whole window"
         );
-        assert_eq!(
-            said("cannot read /c/box/data/a.mp4."),
-            "cannot read box:/data/a.mp4."
-        );
-        for other in [
-            "kept at /c/box/data/a.mp4.sopen-backup-1",
-            "kept at /c/box/data/a.mp4-1",
-            "cannot read /c/box/data/a.mp4/part",
-        ] {
-            assert_eq!(said(other), other);
-        }
-        let stopped = as_known(anyhow::anyhow!(crate::remote::Cancelled), copy, known);
-        assert!(crate::remote::is_cancelled(&stopped));
-        let typed = as_known(anyhow::anyhow!(std::fmt::Error), copy, known);
-        assert!(typed.is::<std::fmt::Error>(), "its kind is kept");
+        assert!(second
+            .note
+            .is_some_and(|n| n.contains("another sopen session has")));
+        assert!(second.local.starts_with(tmp.path().join(SESSIONS)));
     }
 
     use super::*;

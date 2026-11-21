@@ -75,7 +75,13 @@ impl Source for Fake {
         if self.panics {
             panic!("the transfer worker dies (test)");
         }
-        copy_to(&self.file, dest, progress, cancel)
+        copy_to(
+            &self.file,
+            &self.file.display().to_string(),
+            dest,
+            progress,
+            cancel,
+        )
     }
 }
 
@@ -878,13 +884,15 @@ fn a_failed_publish_keeps_the_complete_download_and_says_why() {
 }
 
 /// A staging folder as a save leaves it when its sopen dies: `.sopen-<16 hex>` (0700) in `dir`
-/// holding `files`, their bodies a few bytes each. Nothing holds its lock.
-fn left_staging(dir: &Path, hex: &str, files: &[&str]) -> PathBuf {
+/// holding `files`, four bytes each — but `lock`, which holds `lock` (what the save recorded
+/// as the size it expects). Nothing holds its lock.
+fn left_staging(dir: &Path, hex: &str, lock: &str, files: &[&str]) -> PathBuf {
     let staging = dir.join(format!(".sopen-{hex}"));
     std::fs::create_dir(&staging).unwrap();
     std::fs::set_permissions(&staging, std::fs::Permissions::from_mode(0o700)).unwrap();
     for name in files {
-        std::fs::write(staging.join(name), b"left").unwrap();
+        let body = if *name == "lock" { lock } else { "left" };
+        std::fs::write(staging.join(name), body).unwrap();
     }
     staging
 }
@@ -897,24 +905,33 @@ fn save_body(dest: &Path) {
     save_new(dest, fill).unwrap();
 }
 
-/// A save that died (SIGKILL, a crash, the power) leaves its staging folder; the next save
-/// into the folder removes it: nothing holds its lock, and it holds only sopen's own files.
+/// A save that died mid-way (SIGKILL, a crash, the power) leaves its staging folder; the next
+/// save into the folder removes it: nothing holds its lock, it holds only sopen's own files,
+/// and its `part` is shorter than the size the lock recorded — a partial, or none yet.
 #[test]
-fn a_save_sweeps_the_staging_a_dead_save_left() {
+fn a_save_sweeps_the_partial_a_dead_save_left() {
     let tmp = tempfile::tempdir().unwrap();
-    left_staging(tmp.path(), "0123456789abcdef", &["lock", "part"]);
-    left_staging(tmp.path(), "fedcba9876543210", &["lock"]);
+    left_staging(tmp.path(), "0123456789abcdef", "100\n", &["lock", "part"]);
+    left_staging(tmp.path(), "fedcba9876543210", "5\n", &["lock"]);
+    left_staging(
+        tmp.path(),
+        "00000000000000aa",
+        "5\n",
+        &["lock", "mode", "part", "probe"],
+    );
     save_body(&tmp.path().join("a.bin"));
     assert_eq!(names(tmp.path()), ["a.bin"]);
 }
 
 /// …and only then. Left exactly as they are: a staging whose lock is held (its save is
-/// running), one with a file in it that is not sopen's, one without a lock (an older sopen's,
-/// or a complete download kept after a failed publish), and names that only look alike.
+/// running), one with a file in it that is not sopen's, one without a lock (an older sopen's),
+/// one whose `part` is not a plain file, and names that only look alike — each of them a
+/// partial by its lock, so it is that one thing that keeps it.
 #[test]
 fn a_save_leaves_staging_that_is_not_provably_dead() {
     let tmp = tempfile::tempdir().unwrap();
-    let live = left_staging(tmp.path(), "0000000000000001", &["lock", "part"]);
+    let partial = "100\n";
+    let live = left_staging(tmp.path(), "0000000000000001", partial, &["lock", "part"]);
     let held = File::open(live.join("lock")).unwrap();
     // SAFETY: a descriptor this test owns.
     assert_eq!(
@@ -924,15 +941,16 @@ fn a_save_leaves_staging_that_is_not_provably_dead() {
     left_staging(
         tmp.path(),
         "0000000000000002",
+        partial,
         &["lock", "notes.txt", "part"],
     );
-    left_staging(tmp.path(), "0000000000000003", &["part"]);
-    let folder_inside = left_staging(tmp.path(), "0000000000000004", &["lock"]);
+    left_staging(tmp.path(), "0000000000000003", partial, &["part"]);
+    let folder_inside = left_staging(tmp.path(), "0000000000000004", partial, &["lock"]);
     std::fs::create_dir(folder_inside.join("part")).unwrap();
     // Not `.sopen-<16 hex>`: 04 §5.1's publish probe (a file), and other lengths and letters.
     std::fs::write(tmp.path().join(".sopen-probe-0123456789abcdef"), b"").unwrap();
-    left_staging(tmp.path(), "0123456789abcde", &["lock", "part"]);
-    left_staging(tmp.path(), "0123456789ABCDEF", &["lock", "part"]);
+    left_staging(tmp.path(), "0123456789abcde", partial, &["lock", "part"]);
+    left_staging(tmp.path(), "0123456789ABCDEF", partial, &["lock", "part"]);
     let before = walk(tmp.path());
     save_body(&tmp.path().join("a.bin"));
     let mut want = before;
@@ -943,6 +961,73 @@ fn a_save_leaves_staging_that_is_not_provably_dead() {
     assert_eq!(after, want);
     assert!(folder_inside.join("part").is_dir());
     drop(held);
+}
+
+/// Only a provable partial is swept. A dead staging whose `part` is as long as the size its
+/// lock recorded is a complete download (kept after a failed publish, or killed an instant
+/// before its name): never swept. Nor is one whose lock records no readable size — empty, cut
+/// short, not a number: it says nothing, and the safe direction is to keep.
+#[test]
+fn a_save_never_sweeps_a_complete_part_or_a_lock_without_a_size() {
+    let tmp = tempfile::tempdir().unwrap();
+    // `part` is four bytes ("left").
+    for (hex, lock) in [
+        ("0000000000000001", "4\n"),
+        ("0000000000000002", "3\n"),
+        ("0000000000000003", ""),
+        ("0000000000000004", "100"),
+        ("0000000000000005", "100 \n"),
+        ("0000000000000006", "-1\n"),
+        ("0000000000000007", "0x64\n"),
+        ("0000000000000008", "100\n100\n"),
+        ("0000000000000009", "99999999999999999999999999\n"),
+    ] {
+        left_staging(tmp.path(), hex, lock, &["lock", "part"]);
+    }
+    // An empty file is complete at no bytes, with or without its `part`.
+    left_staging(tmp.path(), "000000000000000a", "0\n", &["lock"]);
+    let mut want = walk(tmp.path());
+    save_body(&tmp.path().join("a.bin"));
+    want.push(tmp.path().join("a.bin"));
+    want.sort();
+    let mut after = walk(tmp.path());
+    after.sort();
+    assert_eq!(after, want);
+}
+
+/// What a save records in its lock: the bytes it expects, when it knows them before it starts
+/// — a copy's source size — and nothing for bytes made here.
+#[test]
+fn a_save_records_the_size_it_expects_in_its_lock() {
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("src.bin");
+    std::fs::write(&src, BODY).unwrap();
+    let out = tmp.path().join("out");
+    std::fs::create_dir(&out).unwrap();
+    let recorded = std::cell::RefCell::new(Vec::new());
+    let mut seen = |_: u64, _: u64| {
+        let lock = private_folder(&out).unwrap().join("lock");
+        recorded
+            .borrow_mut()
+            .push(std::fs::read_to_string(lock).unwrap());
+    };
+    let shown = src.display().to_string();
+    copy_to(
+        &src,
+        &shown,
+        &out.join("a.bin"),
+        &mut seen,
+        &Decision::default(),
+    )
+    .unwrap();
+    assert_eq!(*recorded.borrow(), [format!("{}\n", BODY.len())]);
+    let fill = |f: &mut File| -> Result<u64> {
+        let lock = private_folder(&out).unwrap().join("lock");
+        assert_eq!(std::fs::read_to_string(lock).unwrap(), "", "no size known");
+        f.write_all(BODY)?;
+        Ok(BODY.len() as u64)
+    };
+    save_new(&out.join("b.bin"), fill).unwrap();
 }
 
 /// The complete download a failed publish keeps (the owner was told where it is) is not swept
@@ -963,6 +1048,57 @@ fn a_kept_download_is_not_swept_by_the_next_save() {
     assert_eq!(names(&kept), ["part"]);
     save_body(&tmp.path().join("b.bin"));
     assert_eq!(std::fs::read(kept.join("part")).unwrap(), BODY);
+}
+
+/// A kept download whose `lock` could not be removed (the folder went read-only as the publish
+/// failed) is still never swept — it is complete, by the size its lock recorded — and the
+/// error says the lock was left.
+#[test]
+fn a_kept_download_whose_lock_could_not_be_removed_is_not_swept() {
+    // SAFETY: no arguments, no failure.
+    if unsafe { libc::geteuid() } == 0 {
+        eprintln!("skipping: root removes from a read-only folder");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let fill = |f: &mut File| -> Result<u64> {
+        f.write_all(BODY)?;
+        Ok(BODY.len() as u64)
+    };
+    let mut fails = |step: LinkStep, staging: &Path| match step {
+        LinkStep::Probe => Ok(()),
+        LinkStep::Publish => {
+            std::fs::set_permissions(staging, std::fs::Permissions::from_mode(0o500)).unwrap();
+            Err(os_error(libc::EIO))
+        }
+    };
+    let said = save_new_deciding(
+        &tmp.path().join("a.bin"),
+        Some(BODY.len() as u64),
+        fill,
+        &mut fails,
+        &Decision::default(),
+    )
+    .unwrap_err()
+    .to_string();
+    let kept = private_folder(tmp.path()).unwrap();
+    std::fs::set_permissions(&kept, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(names(&kept), ["lock", "part"], "the lock could not go");
+    assert_eq!(
+        std::fs::read_to_string(kept.join("lock")).unwrap(),
+        format!("{}\n", BODY.len())
+    );
+    let lock = kept.join("lock");
+    assert!(
+        said.contains(&format!(
+            "its lock file {} could not be removed (",
+            lock.display()
+        )),
+        "{said}"
+    );
+    save_body(&tmp.path().join("b.bin"));
+    assert_eq!(std::fs::read(kept.join("part")).unwrap(), BODY);
+    assert_eq!(names(&kept), ["lock", "part"]);
 }
 
 /// A staging folder that cannot be removed is said, not dropped.
@@ -1020,6 +1156,7 @@ fn copy_to_refuses_a_source_that_changes_mid_copy() {
         let mut once = true;
         let result = copy_to(
             &src,
+            &src.display().to_string(),
             &dest,
             &mut |_, _| {
                 if std::mem::take(&mut once) {
@@ -1135,6 +1272,7 @@ fn w8a_a_cancel_at_the_end_of_a_local_copy_publishes_nothing() {
     let decision = Decision::default();
     let result = copy_to(
         &src,
+        &src.display().to_string(),
         &dest,
         &mut |done, total| {
             if done == total {
@@ -1153,7 +1291,7 @@ fn w8a_a_cancel_at_the_end_of_a_local_copy_publishes_nothing() {
     std::fs::write(&empty, b"").unwrap();
     let decision = Decision::default();
     assert!(decision.cancel());
-    let result = copy_to(&empty, &dest, &mut |_, _| {}, &decision);
+    let result = copy_to(&empty, "empty", &dest, &mut |_, _| {}, &decision);
     assert!(result.as_ref().is_err_and(save_cancelled), "an empty file");
     assert!(!dest.exists());
     assert_eq!(
@@ -1178,6 +1316,7 @@ fn w8a_cancel_and_publish_are_decided_once_right_before_the_link() {
     let decision = Decision::default();
     let result = save_new_deciding(
         &dest,
+        None,
         fill,
         &mut |step, staging| {
             if step == LinkStep::Publish {
@@ -1194,7 +1333,7 @@ fn w8a_cancel_and_publish_are_decided_once_right_before_the_link() {
     assert_eq!(names(tmp.path()), Vec::<String>::new(), "no staging left");
     // After it: the publish has won, and the cancel is told so.
     let decision = Decision::default();
-    let saved = save_new_deciding(&dest, fill, &mut |_, _| Ok(()), &decision).unwrap();
+    let saved = save_new_deciding(&dest, None, fill, &mut |_, _| Ok(()), &decision).unwrap();
     assert_eq!(saved.bytes, BODY.len() as u64);
     assert!(!decision.cancel(), "too late: the file has its name");
     assert!(!decision.cancelled());
@@ -1214,6 +1353,7 @@ fn taken_at_the_last_moment(
     };
     save_new_deciding(
         dest,
+        None,
         fill,
         &mut |step, _| {
             if step == LinkStep::Publish {

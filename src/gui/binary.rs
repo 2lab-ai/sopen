@@ -342,7 +342,7 @@ struct Staging {
 impl Staging {
     /// Makes the private folder in `dir` (the destination folder's descriptor; `parent` is how
     /// it is shown).
-    fn make(dir: OwnedFd, parent: &Path) -> Result<Self> {
+    fn make(dir: OwnedFd, parent: &Path, expected: Option<u64>) -> Result<Self> {
         // A setgid folder (a shared one) gives what is made in it its group — on Linux only while
         // the private folder keeps the bit, so owner-only keeps it too.
         // SAFETY: `st` is written by the call; the descriptor is ours.
@@ -385,7 +385,7 @@ impl Staging {
                         .with_context(|| format!("cannot open {}", parent.join(&name).display()));
                 }
             };
-            let lock = match lock_new(&private) {
+            let lock = match lock_new(&private, expected) {
                 Ok(Locked::Held(lock)) => Some(lock),
                 Ok(Locked::NoLocks) => None,
                 // Another save's sweep took the lock in the instant between its creation and
@@ -513,18 +513,27 @@ impl Staging {
         })
     }
 
-    /// Keeps the folder with the complete `part` in it; returns where that is. Its `lock` is
-    /// removed: the owner was told the download is kept there, so it must outlive this sopen —
-    /// a folder without a lock is never swept ([`sweep_dead`]).
-    fn keep(mut self) -> PathBuf {
+    /// Keeps the folder with the complete `part` in it; returns where that is, and what must
+    /// be said about its `lock`. The lock is removed, best effort: the folder is no longer a
+    /// save's. A sweep never needs that — a complete `part` is never swept ([`sweep_one`]) —
+    /// so a lock that could not be removed costs only a stray file, which is said.
+    fn keep(mut self) -> (PathBuf, Option<String>) {
         self.done = true;
+        let mut note = None;
         if let Some(held) = self.lock.take() {
-            // Unlinked while it is still held: no sweep can take it in between.
+            // Unlinked while it is still held: no sweep looks at the folder in between.
             // SAFETY: as in `unlink`.
-            unsafe { libc::unlinkat(self.private.as_raw_fd(), LOCK.as_ptr(), 0) };
+            if let Err(e) =
+                sys(unsafe { libc::unlinkat(self.private.as_raw_fd(), LOCK.as_ptr(), 0) })
+            {
+                note = Some(format!(
+                    "its lock file {} could not be removed ({e}); the download stays",
+                    self.shown.join("lock").display()
+                ));
+            }
             drop(held);
         }
-        self.shown.join("part")
+        (self.shown.join("part"), note)
     }
 }
 
@@ -583,7 +592,12 @@ fn stat_of(fd: &OwnedFd) -> std::io::Result<libc::stat> {
 /// calls, and a sweep ([`sweep_dead`]) may come between them and take the folder for a dead
 /// one: then the lock is busy, or — the sweep already done — taken but no longer in the folder
 /// (no link left), and the caller starts again under a new name.
-fn lock_new(private: &OwnedFd) -> std::io::Result<Locked> {
+///
+/// Once held, the lock records how many bytes the save expects (`expected`: the source's size
+/// by its stat, in decimal, then a newline) — what a sweep needs to tell a partial `part` from
+/// a complete one. Without it (a save of bytes made here, a source whose size is unknown, a
+/// write that failed) the file stays empty and the folder is never swept.
+fn lock_new(private: &OwnedFd, expected: Option<u64>) -> std::io::Result<Locked> {
     let lock = open_at(
         private.as_raw_fd(),
         LOCK,
@@ -592,7 +606,16 @@ fn lock_new(private: &OwnedFd) -> std::io::Result<Locked> {
     )?;
     match lock_now(&lock) {
         Ok(()) if stat_of(&lock)?.st_nlink == 0 => Ok(Locked::Swept),
-        Ok(()) => Ok(Locked::Held(lock)),
+        Ok(()) => {
+            let mut lock = File::from(lock);
+            if let Some(expected) = expected {
+                if lock.write_all(format!("{expected}\n").as_bytes()).is_err() {
+                    // Half a number must not pass for a smaller one.
+                    let _ = lock.set_len(0);
+                }
+            }
+            Ok(Locked::Held(lock.into()))
+        }
         Err(e) if e.raw_os_error() == Some(libc::EWOULDBLOCK) => Ok(Locked::Swept),
         Err(_) => {
             // SAFETY: `LOCK` is NUL-terminated; it names the file just made in this folder.
@@ -660,8 +683,9 @@ fn staging_name(name: &[u8]) -> bool {
 
 /// Removes the private folders dead saves left in `dir` — a sopen that was killed outright
 /// (SIGKILL, a crash, the power) cleans nothing up, and its `part` may hold gigabytes. A folder
-/// goes only when it is provably no running save's and holds nothing but sopen's own staging
-/// files; anything else is left exactly as it is. Nothing here fails the save that asked.
+/// goes only when it is provably no running save's, holds nothing but sopen's own staging
+/// files, and its `part` is provably incomplete; anything else is left exactly as it is.
+/// Nothing here fails the save that asked.
 fn sweep_dead(dir: &OwnedFd, parent: &Path) {
     let Ok(names) = names_in(dir) else {
         return;
@@ -679,10 +703,12 @@ fn sweep_dead(dir: &OwnedFd, parent: &Path) {
 
 /// [`sweep_dead`] for one folder: `Some` when it was removed. It is dead when its `lock` can be
 /// taken without waiting — every save holds its own for as long as it runs, and a lock dies
-/// with its process, so a process id used again cannot pass for the owner. No `lock` (a folder
-/// of an older sopen, or a complete download kept after a failed publish), a lock that is held,
-/// another user's folder, or anything inside that is not one of sopen's own names as a plain
-/// file: left alone. Only those names are ever unlinked, the lock last, then the empty folder.
+/// with its process, so a process id used again cannot pass for the owner. And it is a partial
+/// when its `part` is shorter than the size its lock recorded. No `lock` (a folder of an older
+/// sopen), a lock that is held, a lock without a readable size, a `part` as long as that size
+/// (a complete download: kept after a failed publish, or about to get its name), another
+/// user's folder, or anything inside that is not one of sopen's own names as a plain file:
+/// left alone. Only those names are ever unlinked, the lock last, then the empty folder.
 fn sweep_one(dir: &OwnedFd, name: &CStr) -> Option<()> {
     let private = open_at(
         dir.as_raw_fd(),
@@ -707,6 +733,13 @@ fn sweep_one(dir: &OwnedFd, name: &CStr) -> Option<()> {
     }
     // Held: its save is running.
     lock_now(&lock).ok()?;
+    // Only a partial goes: `part` shorter than the size the lock recorded. A complete `part`
+    // is the owner's download — kept after a failed publish, or killed an instant before its
+    // name — and a lock that records no readable size says nothing: both stay.
+    let expected = recorded_size(&lock)?;
+    if part_len(&private)? >= expected {
+        return None;
+    }
     let inside = names_in(&private).ok()?;
     for entry in &inside {
         if ![PART, PROBE, MODE, LOCK].contains(&entry.as_c_str()) {
@@ -739,6 +772,40 @@ fn sweep_one(dir: &OwnedFd, name: &CStr) -> Option<()> {
     // SAFETY: `name` is NUL-terminated; only an empty folder goes.
     sys(unsafe { libc::unlinkat(dir.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR) }).ok()?;
     Some(())
+}
+
+/// The size a save recorded in its `lock` ([`lock_new`]): decimal digits and a newline,
+/// nothing else. Anything else — empty, cut short, not a number — is `None`.
+fn recorded_size(lock: &OwnedFd) -> Option<u64> {
+    let mut text = [0u8; 32];
+    // SAFETY: the buffer is ours, its length passed with it; the descriptor is the caller's.
+    let n = unsafe { libc::pread(lock.as_raw_fd(), text.as_mut_ptr().cast(), text.len(), 0) };
+    let n = usize::try_from(n).ok()?;
+    let digits = text[..n].strip_suffix(b"\n")?;
+    if digits.is_empty() || !digits.iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    std::str::from_utf8(digits).ok()?.parse().ok()
+}
+
+/// How long `part` is in the private folder: 0 when there is none (the save died before it
+/// made it); `None` when it cannot be looked at, or is not a plain file.
+fn part_len(private: &OwnedFd) -> Option<u64> {
+    // SAFETY: `PART` is NUL-terminated; `st` is written by the call.
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    match sys(unsafe {
+        libc::fstatat(
+            private.as_raw_fd(),
+            PART.as_ptr(),
+            &mut st,
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    }) {
+        Ok(_) if st.st_mode & libc::S_IFMT == libc::S_IFREG => u64::try_from(st.st_size).ok(),
+        Ok(_) => None,
+        Err(e) if e.raw_os_error() == Some(libc::ENOENT) => Some(0),
+        Err(_) => None,
+    }
 }
 
 /// Opens the destination's folder once, as a folder (a link to a folder is followed here, as
@@ -789,16 +856,20 @@ pub(super) fn save_new_with(
     fill: impl FnOnce(&mut File) -> Result<u64>,
     link: &mut dyn FnMut(LinkStep, &Path) -> std::io::Result<()>,
 ) -> std::result::Result<SavedTo, SaveError> {
-    save_new_deciding(dest, fill, link, &Decision::default())
+    save_new_deciding(dest, None, fill, link, &Decision::default())
 }
 
 /// [`save_new_with`] for a save that can be cancelled: `decision` is asked once, right before
 /// the complete file gets its name — after the fill, its sync and its mode, and after `link`'s
 /// stand-in for that step. Cancelled by then, nothing is published: the part and the private
 /// folder are removed and the error is [`Cancelled`](crate::remote::Cancelled). Otherwise the
-/// publish has won, and a cancel coming later is refused ([`Decision::cancel`]).
+/// publish has won, and a cancel coming later is refused ([`Decision::cancel`]). `expected` is
+/// how many bytes the fill is to write, when that is known before it starts (a download's or a
+/// copy's source size): recorded in the private folder's lock, it is what lets a later save
+/// tell a partial a dead sopen left from a complete download ([`sweep_dead`]).
 pub(super) fn save_new_deciding(
     dest: &Path,
+    expected: Option<u64>,
     fill: impl FnOnce(&mut File) -> Result<u64>,
     link: &mut dyn FnMut(LinkStep, &Path) -> std::io::Result<()>,
     decision: &Decision,
@@ -844,7 +915,7 @@ pub(super) fn save_new_deciding(
         }
     }
     sweep_dead(&dir, &parent);
-    let mut staging = Staging::make(dir, &parent).map_err(nothing)?;
+    let mut staging = Staging::make(dir, &parent, expected).map_err(nothing)?;
     let give_up = |staging: &mut Staging, e: anyhow::Error| {
         let left = staging.clean();
         with_left(e, left)
@@ -922,10 +993,11 @@ pub(super) fn save_new_deciding(
             Err(exists(dest))
         }
         Err(e) => {
-            let part = staging.keep();
+            let (part, lock_left) = staging.keep();
+            let lock_left = lock_left.map(|l| format!(" ({l})")).unwrap_or_default();
             Err(SaveError::Failed(anyhow!(
                 "cannot publish {} ({e}); nothing was put under that name — the complete \
-                 download is kept at {}",
+                 download is kept at {}{lock_left}",
                 dest.display(),
                 part.display()
             )))
@@ -1044,7 +1116,8 @@ pub fn download_to(
         }
         Ok(n)
     };
-    save_new_deciding(dest, filled, &mut |_, _| Ok(()), cancel)
+    let expected = (before.missing != Some("size")).then_some(before.size);
+    save_new_deciding(dest, expected, filled, &mut |_, _| Ok(()), cancel)
 }
 
 /// What a file's handle says about its bytes: size, mtime, change time.
@@ -1057,19 +1130,22 @@ fn handle_stamp(file: &File) -> std::io::Result<(u64, Option<SystemTime>, i64, i
 /// Copies the local file `src` (the local file itself, or the cached copy) into a new file at
 /// `dest` ([`save_new`]). Its handle's size, mtime and change time are compared before and
 /// after the copy, and the bytes copied with its size: any difference and nothing is saved.
-/// `cancel` stops it between two chunks, as [`download_to`]'s.
+/// `cancel` stops it between two chunks, as [`download_to`]'s. `shown` is how the file is named
+/// in what is said: the path itself for a local file, `host:/abs` when `src` is a remote file's
+/// copy in sopen's cache — that path is never the owner's to see.
 pub fn copy_to(
     src: &Path,
+    shown: &str,
     dest: &Path,
     progress: &mut dyn FnMut(u64, u64),
     cancel: &Decision,
 ) -> std::result::Result<SavedTo, SaveError> {
     let failed = |e: anyhow::Error| SaveError::Failed(e);
     let mut input = File::open(src)
-        .with_context(|| format!("cannot open {}", src.display()))
+        .with_context(|| format!("cannot open {shown}"))
         .map_err(failed)?;
     let before = handle_stamp(&input)
-        .with_context(|| format!("cannot stat {}", src.display()))
+        .with_context(|| format!("cannot stat {shown}"))
         .map_err(failed)?;
     let filled = |file: &mut File| {
         let mut buf = vec![0u8; 1 << 20];
@@ -1077,7 +1153,7 @@ pub fn copy_to(
         loop {
             let n = input
                 .read(&mut buf)
-                .with_context(|| format!("cannot read {}", src.display()))?;
+                .with_context(|| format!("cannot read {shown}"))?;
             if n == 0 {
                 break;
             }
@@ -1088,19 +1164,17 @@ pub fn copy_to(
             done += n as u64;
             progress(done, before.0);
         }
-        let after =
-            handle_stamp(&input).with_context(|| format!("cannot stat {}", src.display()))?;
+        let after = handle_stamp(&input).with_context(|| format!("cannot stat {shown}"))?;
         if after != before || done != before.0 {
             bail!(
-                "{} changed while it was copied ({} bytes copied of {}); try again when it is quiet",
-                src.display(),
-                done,
+                "{shown} changed while it was copied ({done} bytes copied of {}); try again when it is quiet",
                 before.0
             );
         }
         Ok(done)
     };
-    save_new_deciding(dest, filled, &mut |_, _| Ok(()), cancel)
+    let expected = Some(before.0);
+    save_new_deciding(dest, expected, filled, &mut |_, _| Ok(()), cancel)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1226,12 +1300,12 @@ impl FileSource {
         }
     }
 
-    /// An error about the cached copy, said about the file as its owner knows it
-    /// ([`crate::cache::as_known`]): the copy's path is never what the owner is shown.
-    fn as_known(&self, e: anyhow::Error, copy: &Path) -> anyhow::Error {
+    /// The file as its owner knows it: `host:/abs`, or the local path. What fails on its copy
+    /// in sopen's cache is said about this, never about the copy's path.
+    fn shown(&self) -> String {
         match &self.label {
-            Some(label) => crate::cache::as_known(e, copy, &format!("{label}:{}", self.abs)),
-            None => e,
+            Some(label) => format!("{label}:{}", self.abs),
+            None => self.abs.clone(),
         }
     }
 
@@ -1288,7 +1362,7 @@ impl Source for FileSource {
                 (PathBuf::from(&self.abs), fs.stat(&self.abs)?, Vec::new())
             }
         };
-        let base = hex::Base::open(&base_path).map_err(|e| self.as_known(e, &base_path))?;
+        let base = hex::Base::open_as(&base_path, &self.shown())?;
         // Nothing below fails: hand everything over.
         let fs = self.fs.take().expect("checked above");
         let claim = self.fetched.take().map(|f| f.claim);
@@ -1313,15 +1387,12 @@ impl Source for FileSource {
         cancel: &Decision,
     ) -> std::result::Result<SavedTo, SaveError> {
         if let Some(fetched) = &self.fetched {
-            let copy = &fetched.claim.local;
-            return copy_to(copy, dest, progress, cancel).map_err(|e| match e {
-                SaveError::Failed(e) => SaveError::Failed(self.as_known(e, copy)),
-                exists => exists,
-            });
+            // From the cached copy, said about the file: the copy's path is not the owner's.
+            return copy_to(&fetched.claim.local, &self.shown(), dest, progress, cancel);
         }
         match self.fs.as_mut() {
             Some(_) if self.label.is_none() => {
-                copy_to(Path::new(&self.abs), dest, progress, cancel)
+                copy_to(Path::new(&self.abs), &self.abs, dest, progress, cancel)
             }
             Some(fs) => download_to(fs.as_mut(), &self.abs, dest, progress, cancel),
             None => Err(SaveError::Failed(anyhow!("the file was already opened"))),

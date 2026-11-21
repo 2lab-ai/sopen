@@ -29,10 +29,15 @@ struct Ident {
 
 impl Ident {
     fn of(file: &File, path: &Path) -> Result<Self> {
+        Self::of_as(file, &path.display().to_string())
+    }
+
+    /// [`Ident::of`], the file named `shown` in what is said.
+    fn of_as(file: &File, shown: &str) -> Result<Self> {
         use std::os::unix::fs::MetadataExt;
         let meta = file
             .metadata()
-            .with_context(|| format!("cannot stat {}", path.display()))?;
+            .with_context(|| format!("cannot stat {shown}"))?;
         Ok(Self {
             len: meta.len(),
             mtime: meta.modified().ok(),
@@ -64,14 +69,20 @@ pub struct Base {
 
 impl Base {
     pub fn open(path: &Path) -> Result<Self> {
-        let file = File::open(path).with_context(|| format!("cannot open {}", path.display()))?;
+        Self::open_as(path, &path.display().to_string())
+    }
+
+    /// [`Base::open`] of a remote file's copy in sopen's cache: what fails is said about
+    /// `shown`, the file as its owner knows it (`host:/abs`) — never about the copy's path.
+    pub fn open_as(path: &Path, shown: &str) -> Result<Self> {
+        let file = File::open(path).with_context(|| format!("cannot open {shown}"))?;
         let meta = file
             .metadata()
-            .with_context(|| format!("cannot stat {}", path.display()))?;
+            .with_context(|| format!("cannot stat {shown}"))?;
         if !meta.is_file() {
-            bail!("{} is not a regular file", path.display());
+            bail!("{shown} is not a regular file");
         }
-        let opened = Ident::of(&file, path)?;
+        let opened = Ident::of_as(&file, shown)?;
         Ok(Self {
             file,
             path: path.to_path_buf(),

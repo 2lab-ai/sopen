@@ -123,29 +123,42 @@ impl Media {
     /// `input` of the original named `name` (a saved remote file plays from a staged copy
     /// whose name is not the original's; a streamed one from a URL).
     pub fn probe_as(input: &Input, name: &str) -> Result<Self> {
+        Self::probe_shown(input, name, &input.show())
+    }
+
+    /// [`Media::probe_as`] of a remote file's copy in sopen's cache: what fails is said about
+    /// `shown`, the file as its owner knows it (`host:/abs`) — never about the copy's path.
+    pub fn probe_shown(input: &Input, name: &str, shown: &str) -> Result<Self> {
         let tools = ffmpeg::resolve()?;
-        let probe = ffmpeg::probe(&tools, input)?;
-        let mut media = Self::of_probe(tools, input, name, probe)?;
+        let probe = ffmpeg::probe_shown(&tools, input, shown)?;
+        let mut media = Self::of_probe(tools, input, name, shown, probe)?;
         media.plan();
         Ok(media)
     }
 
     /// The file as ffprobe sees it, with no word yet on how Save and Export render it: what a
     /// window opens with (it works that out itself, off its frames: [`Planning`]).
-    fn unplanned(tools: &Tools, input: &Input, name: &str) -> Result<Self> {
-        let probe = ffmpeg::probe(tools, input)?;
-        Self::of_probe(tools.clone(), input, name, probe)
+    /// `shown` is how the file is named in what is said ([`Media::probe_shown`]).
+    fn unplanned(tools: &Tools, input: &Input, name: &str, shown: &str) -> Result<Self> {
+        let probe = ffmpeg::probe_shown(tools, input, shown)?;
+        Self::of_probe(tools.clone(), input, name, shown, probe)
     }
 
     /// The file as `probe` (ffprobe's view of `input`, the original named `name`) describes it,
     /// with no word yet on how Save and Export render it ([`Media::plan`]).
-    fn of_probe(tools: Tools, input: &Input, name: &str, probe: Probe) -> Result<Self> {
+    fn of_probe(
+        tools: Tools,
+        input: &Input,
+        name: &str,
+        shown: &str,
+        probe: Probe,
+    ) -> Result<Self> {
         let duration = probe
             .duration
             .filter(|d| *d > 0.0)
-            .with_context(|| format!("ffprobe reports no duration for {}", input.show()))?;
+            .with_context(|| format!("ffprobe reports no duration for {shown}"))?;
         if probe.video.is_none() && !probe.has_audio {
-            bail!("{} has no audio or video stream", input.show());
+            bail!("{shown} has no audio or video stream");
         }
         Ok(Self {
             tools,
@@ -844,7 +857,9 @@ pub fn open(
     sweep(cache);
     // A window works out how Save and Export render the file itself, off its frames (02 §6:
     // for a video above 8 bits that asks ffmpeg); the windowless runs need it now.
-    let mut media = Media::unplanned(&ffmpeg::resolve()?, &Input::path(local), &name)?;
+    // The file as its owner knows it: `local` may be its copy in sopen's cache.
+    let shown = origin.display();
+    let mut media = Media::unplanned(&ffmpeg::resolve()?, &Input::path(local), &name, &shown)?;
     if hooks.autosave || hooks.autoexport {
         media.plan();
     }

@@ -301,7 +301,7 @@ pub fn prepare(
     if kind::refine_after_fetch(name, kind, streams) == Kind::Other {
         return Ok(Found::NotMedia);
     }
-    let media = Media::of_probe(tools.clone(), input, name, probed?)?;
+    let media = Media::of_probe(tools.clone(), input, name, &input.show(), probed?)?;
     let (mut frame, mut peaks, mut cut) = (None, None, None);
     match media.decode_size() {
         Some((w, h)) => {

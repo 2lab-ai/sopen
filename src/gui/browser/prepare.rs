@@ -223,8 +223,8 @@ fn prepare_with(
             // Always a copy, as the standalone route makes it: Save needs the bytes as opened.
             let fetched = fetch(&mut fs)?;
             let bytes = std::fs::read(&fetched.claim.local)
-                .with_context(|| format!("cannot read {}", fetched.claim.local.display()))
-                .map_err(|e| as_known(e, &fetched.claim.local, req))?;
+                // Read from the private copy, said about the file: the copy is never named.
+                .with_context(|| format!("cannot read {}", req.show()))?;
             let doc = Doc::decode(&bytes)?;
             let file = ImageFile::new(req.origin(fs, fetched.at), bytes, req.cache);
             Ok(Prepared::Image {
@@ -244,7 +244,10 @@ fn prepare_with(
                 // A `.ts` ffprobe cannot read as media: the hex view, on the copy already here.
                 return hex_of(req, fs, stat, fetched);
             }
-            let media = Media::probe(&path).map_err(|e| as_known(e, &path, req))?;
+            // From here on the file is named as its owner knows it (`host:/abs`), whichever
+            // path it is read from: the private copy's is never said.
+            let (_, name) = crate::remote::split_parent(req.abs);
+            let media = Media::probe_shown(&Input::path(&path), name, &req.show())?;
             let (notices, claim) = match fetched {
                 Some(f) => (f.notices, Some(f.claim)),
                 None => (Vec::new(), None),
@@ -278,8 +281,7 @@ fn prepare_with(
                 None => PathBuf::from(req.abs),
             };
             text::warm();
-            let doc =
-                TextDoc::open_cancellable(&path, cancel).map_err(|e| as_known(e, &path, req))?;
+            let doc = TextDoc::open_cancellable_as(&path, &req.show(), cancel)?;
             let (notices, claim) = match fetched {
                 Some(f) => (f.notices, Some(f.claim)),
                 None => (Vec::new(), None),
@@ -305,13 +307,6 @@ fn prepare_with(
     }
 }
 
-/// Why the file could not be made ready, said about the file as its owner knows it
-/// ([`cache::as_known`]): the list's status row is where this ends up, and there the private
-/// copy a remote file was read from is never named.
-fn as_known(e: anyhow::Error, copy: &Path, req: &Request) -> anyhow::Error {
-    cache::as_known(e, copy, &req.show())
-}
-
 /// The hex view of the file: the copy fetched, or a local file read in place (as the binary
 /// route's hex window opens it).
 fn hex_of(
@@ -324,7 +319,7 @@ fn hex_of(
         Some(f) => (f.claim.local.clone(), f.at, f.notices, Some(f.claim)),
         None => (PathBuf::from(req.abs), stat, Vec::new(), None),
     };
-    let base = hex::Base::open(&path).map_err(|e| as_known(e, &path, req))?;
+    let base = hex::Base::open_as(&path, &req.show())?;
     Ok(Prepared::Hex {
         file: HexFile::new(req.origin(fs, at), base, claim, req.cache),
         notices,

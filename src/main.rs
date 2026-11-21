@@ -718,10 +718,6 @@ fn open_binary(
         size,
         local: fetched.is_some() || matches!(place, Place::Local(_)),
     };
-    let (known, copy) = (
-        info.title.clone(),
-        fetched.as_ref().map(|f| f.claim.local.clone()),
-    );
     let (fs, reconnect, label) = place.into_parts(dirs);
     let source = gui::binary::FileSource::new(fs, reconnect, label, abs, &dirs.cache, fetched)
         .sniffed(sniff);
@@ -734,12 +730,7 @@ fn open_binary(
         &mut Meter::default(),
         Box::new(gui::binary::NativeChooser),
         &mut |window| gui::binary::run_on_screen(window, &hooks),
-    )
-    // The copy already here (a `.ts` that is not media) is not named: the file is.
-    .map_err(|e| match &copy {
-        Some(copy) => cache::as_known(e, copy, &known),
-        None => e,
-    })?;
+    )?;
     if let Some(ms) = out.fetch_ms {
         rec.fetch_ms = ms;
     }
@@ -812,7 +803,7 @@ fn open_in_window(
 
 /// The image or media window on `local` — the file itself, or its copy in sopen's cache — of
 /// the file its owner knows as `known` (`host:/abs`, or the local path), which is how every
-/// error from here names it ([`cache::as_known`]).
+/// error from here names it: each message is built with that name, never with the copy's path.
 fn open_copy(
     kind: Kind,
     origin: gui::Origin,
@@ -822,18 +813,14 @@ fn open_copy(
     hooks: &gui::Hooks,
     notices: Vec<String>,
 ) -> Result<gui::Outcome> {
-    let opened = if kind == Kind::Image {
-        std::fs::read(local)
-            .with_context(|| format!("cannot read {}", local.display()))
-            .and_then(|bytes| {
-                let file = gui::image::ImageFile::new(origin, bytes, cache);
-                gui::image::open(file, hooks, notices)
-            })
+    if kind == Kind::Image {
+        let bytes = std::fs::read(local).with_context(|| format!("cannot read {known}"))?;
+        let file = gui::image::ImageFile::new(origin, bytes, cache);
+        gui::image::open(file, hooks, notices)
     } else {
+        // Names the file by its origin, which is `known`.
         gui::media::open(origin, local, cache, hooks, notices)
-    };
-    // What failed on the copy is said about the file: the copy's path is not the owner's.
-    opened.map_err(|e| cache::as_known(e, local, known))
+    }
 }
 
 fn open_in_editor(

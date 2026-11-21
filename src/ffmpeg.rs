@@ -226,15 +226,20 @@ pub struct Probe {
 /// `ffprobe -v error -print_format json -show_format -show_streams -show_chapters <input>` (a
 /// path or a URL).
 pub fn probe(tools: &Tools, input: impl AsRef<OsStr>) -> Result<Probe> {
+    let shown = Path::new(input.as_ref()).display().to_string();
+    probe_shown(tools, input, &shown)
+}
+
+/// [`probe`] of a remote file's copy in sopen's cache: a refusal is said about `shown`, the
+/// file as its owner knows it (`host:/abs`) — never about the copy's path.
+pub fn probe_shown(tools: &Tools, input: impl AsRef<OsStr>, shown: &str) -> Result<Probe> {
     let path = Path::new(input.as_ref());
     let mut cmd = probe_command(tools, input.as_ref());
     let out =
         output(&mut cmd).with_context(|| format!("cannot run {}", tools.ffprobe.display()))?;
     if !out.status.success() {
-        bail!(
-            "{}",
-            probe_refusal(path, &last_line(&String::from_utf8_lossy(&out.stderr)))
-        );
+        let said = last_line(&String::from_utf8_lossy(&out.stderr));
+        bail!("{}", probe_refusal_shown(path, shown, &said));
     }
     parse_probe(&String::from_utf8_lossy(&out.stdout))
 }
@@ -259,10 +264,53 @@ pub fn probe_command(tools: &Tools, input: &OsStr) -> Command {
 
 /// What is said when ffprobe ended badly on `input` (`said`: its last line).
 pub fn probe_refusal(input: &Path, said: &str) -> String {
+    probe_refusal_shown(input, &input.display().to_string(), said)
+}
+
+/// [`probe_refusal`] with the file named `shown`. sopen's own words name it directly; `said`
+/// is ffprobe's, and where it names `input` again as a whole path, that becomes `shown` too
+/// ([`whole_path_as`]).
+pub fn probe_refusal_shown(input: &Path, shown: &str, said: &str) -> String {
+    let input = input.display().to_string();
     // ffprobe names the file in front of its reason: said once here.
-    let named = format!("{}: ", input.display());
+    let named = format!("{input}: ");
     let said = said.strip_prefix(&named).unwrap_or(said);
-    format!("ffprobe cannot read {}: {said}", input.display())
+    format!(
+        "ffprobe cannot read {shown}: {}",
+        whole_path_as(said, &input, shown)
+    )
+}
+
+/// `said` — a line another program printed (ffprobe, ffmpeg) — with `path` replaced by `shown`
+/// wherever it stands as a whole path: after the start of the text, white space, a quote or
+/// `(`, and before the end of the text, `:`, a quote, `)` or `,` (ffprobe's own form is
+/// `<path>: <reason>`). Anything else that merely holds `path` — a longer path that ends or
+/// begins with it, another file's name — is left as it was printed. sopen's own messages are
+/// never put through this: they are built with the name they are to show.
+pub fn whole_path_as(said: &str, path: &str, shown: &str) -> String {
+    if path.is_empty() || path == shown {
+        return said.to_string();
+    }
+    let mut out = String::with_capacity(said.len());
+    let mut rest = said;
+    while let Some(at) = rest.find(path) {
+        let (before, after) = (&rest[..at], &rest[at + path.len()..]);
+        // What stands before it in the whole text, not only in what is left of it.
+        let lead = before
+            .chars()
+            .next_back()
+            .or_else(|| out.chars().next_back());
+        let starts = lead.is_none_or(|c| c.is_whitespace() || matches!(c, '"' | '\'' | '('));
+        let ends = after
+            .chars()
+            .next()
+            .is_none_or(|c| matches!(c, ':' | '"' | '\'' | ')' | ','));
+        out.push_str(before);
+        out.push_str(if starts && ends { shown } else { path });
+        rest = after;
+    }
+    out.push_str(rest);
+    out
 }
 
 pub fn parse_probe(json: &str) -> Result<Probe> {

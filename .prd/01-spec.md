@@ -519,6 +519,8 @@ symlink keeps its link). A new file is readable by its owner only (0600); a repl
   fetches into a copy of its own outside the mirror, `<cache>/.sessions/<host>/<abs path>.<random><ext>` (created
   exclusively, owner-only; no lock — only that session uses it), and says so in one line naming its path. Session
   copies stay in the cache until the cache is cleared: sopen never deletes them. Lock files are never deleted.
+  A lock found held is asked for again, every 5 ms for up to 100 ms, before the session takes a copy of its own
+  (02 §4.4: a child of sopen's may hold a just-released lock for an instant).
   Records and edits moved aside are never written or chmodded through a symlink.
 - Nothing waits forever: ssh keepalives (10 s × 3), 30 s per SFTP request, 60 s without transfer progress. Only an
   SFTP status reply proves a rename, link or exclusive create did not happen; a timeout or a lost reply (connection
@@ -606,9 +608,11 @@ nothing and closing waits for it.
   within 255 bytes); "Save to…" again saves there. Cleanup only ever removes sopen's own
   names inside its private folder, then the folder (a failure to remove it is said). Without a
   window, Ctrl-C and SIGTERM cancel the save and leave nothing; a save killed outright leaves only
-  that hidden folder, which the next save into the same folder removes — each save holds a lock
-  on `lock` inside its private folder, and a folder goes only when that lock is free and it holds
-  nothing but sopen's own staging files (06 §7.5). A download
+  that hidden folder, which the next save into the same folder removes when it is a partial —
+  each save holds a lock on `lock` inside its private folder and records there the size it
+  expects, and a folder goes only when that lock is free, `part` is shorter than the recorded
+  size and nothing but sopen's own staging files is in it; a complete `part` is never removed
+  (06 §7.5). A download
   whose source changes meanwhile is not saved — a best-effort check: the remote's size and mtime
   after the transfer, and the bytes received, against its stat before. A local file (or the cached
   copy) is copied the same way, checked by its handle: size, mtime, change time and bytes copied.

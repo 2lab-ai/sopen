@@ -228,10 +228,18 @@ impl TextDoc {
         Self::open_with(path, cancel, &mut |_| {})
     }
 
+    /// [`TextDoc::open_cancellable`] of a remote file's copy in sopen's cache: what fails is
+    /// said about `shown`, the file as its owner knows it (`host:/abs`) — never about the
+    /// copy's path.
+    pub fn open_cancellable_as(path: &Path, shown: &str, cancel: &AtomicBool) -> Result<Self> {
+        Self::open_scan(path, shown, &|| None, &|| stopped(cancel), &mut |_| {})
+    }
+
     /// [`TextDoc::open_cancellable`], with `on_chunk(bytes indexed so far)` after every chunk
     /// (tests: a cancel, or a writer, in the middle of the pass).
     fn open_with(path: &Path, cancel: &AtomicBool, on_chunk: &mut dyn FnMut(u64)) -> Result<Self> {
-        Self::open_scan(path, &|| None, &|| stopped(cancel), on_chunk)
+        let shown = path.display().to_string();
+        Self::open_scan(path, &shown, &|| None, &|| stopped(cancel), on_chunk)
     }
 
     /// Opens `path` and indexes its lines as far as `cap()` says (asked again after every
@@ -244,21 +252,22 @@ impl TextDoc {
         cap: &dyn Fn() -> Option<u64>,
         check: &dyn Fn() -> Result<()>,
     ) -> Result<Self> {
-        Self::open_scan(path, cap, check, &mut |_| {})
+        Self::open_scan(path, &path.display().to_string(), cap, check, &mut |_| {})
     }
 
     fn open_scan(
         path: &Path,
+        shown: &str,
         cap: &dyn Fn() -> Option<u64>,
         check: &dyn Fn() -> Result<()>,
         on_chunk: &mut dyn FnMut(u64),
     ) -> Result<Self> {
         check()?;
         let started = std::time::Instant::now();
-        let file = File::open(path).with_context(|| format!("cannot open {}", path.display()))?;
+        let file = File::open(path).with_context(|| format!("cannot open {shown}"))?;
         let meta = file
             .metadata()
-            .with_context(|| format!("cannot stat {}", path.display()))?;
+            .with_context(|| format!("cannot stat {shown}"))?;
         let opened = identity(&meta);
         let mut scan = Scan::default();
         if cap().is_some() {
@@ -266,7 +275,7 @@ impl TextDoc {
             // bytes it indexed are still the file's when the file was written to since.
             scan.hasher = Some(sha2::Sha256::default());
         }
-        scan.run(&file, path, opened.2, cap, check, on_chunk)?;
+        scan.run(&file, path, shown, opened.2, cap, check, on_chunk)?;
         let mut doc = Self::indexed(file, scan, opened, path.to_path_buf());
         doc.indexed_in = started.elapsed();
         // Checked here, right after the pass (on the opener's or re-read's worker), as well as
@@ -588,6 +597,7 @@ impl TextDoc {
         scan.run(
             &file,
             &self.path,
+            &self.path.display().to_string(),
             self.opened.2,
             &|| None,
             &|| stopped(cancel),
@@ -1047,19 +1057,24 @@ impl Scan {
         self.at += bytes.len() as u64;
     }
 
-    /// The pass over `file` (opened at `path`, `size` bytes as opened) from where it is, to the
+    /// The pass over `file` (opened at `path`, named `shown` in what is said, `size` bytes as opened) from where it is, to the
     /// end of those bytes or to `cap()` (asked before every read); `check()` after every read.
     /// Stops early, not capped, where the file ends sooner (it shrank meanwhile: the change is
     /// noticed later).
+    #[allow(clippy::too_many_arguments)]
     fn run(
         &mut self,
         file: &File,
         path: &Path,
+        shown: &str,
         size: u64,
         cap: &dyn Fn() -> Option<u64>,
         check: &dyn Fn() -> Result<()>,
         on_chunk: &mut dyn FnMut(u64),
     ) -> Result<()> {
+        // Only the tests' read log names the path.
+        #[cfg(not(test))]
+        let _ = path;
         if self.marks.is_empty() {
             self.marks.push(Mark { line: 0, offset: 0 });
         }
@@ -1083,7 +1098,7 @@ impl Scan {
             }
             let n = file
                 .read_at(&mut buf[..want], self.at)
-                .with_context(|| format!("cannot read {}", path.display()))?;
+                .with_context(|| format!("cannot read {shown}"))?;
             if n == 0 {
                 return Ok(());
             }

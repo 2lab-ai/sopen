@@ -22,13 +22,50 @@ fn sopen_command(home: &Path) -> Command {
     cmd
 }
 
+/// How long a run that should end by itself may take before the test gives up on it.
+const RUN_LIMIT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Runs sopen to its end and returns what it printed. A run that has not ended in
+/// [`RUN_LIMIT`] is killed and reaped, and the test fails — it never hangs the suite.
 fn sopen(home: &Path, args: &[&str], env: &[(&str, &str)]) -> Output {
     let mut cmd = sopen_command(home);
-    cmd.args(args);
+    cmd.args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
     for (k, v) in env {
         cmd.env(k, v);
     }
-    cmd.output().unwrap()
+    let mut child = cmd.spawn().unwrap();
+    // Read both pipes while it runs, so a run that prints a lot is never stuck on a full pipe.
+    let read = |pipe: Option<Box<dyn std::io::Read + Send>>| {
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            if let Some(mut pipe) = pipe {
+                let _ = pipe.read_to_end(&mut bytes);
+            }
+            bytes
+        })
+    };
+    let stdout = read(child.stdout.take().map(|p| Box::new(p) as _));
+    let stderr = read(child.stderr.take().map(|p| Box::new(p) as _));
+    let deadline = std::time::Instant::now() + RUN_LIMIT;
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("sopen {args:?} did not end within {RUN_LIMIT:?}; killed");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    };
+    Output {
+        status,
+        stdout: stdout.join().unwrap(),
+        stderr: stderr.join().unwrap(),
+    }
 }
 
 fn text(bytes: &[u8]) -> String {
@@ -216,18 +253,20 @@ impl HeldSave {
     }
 
     /// Sends `signal` to the sopen alone (not its group) and waits at most 20 s for its end.
+    /// The child stays under this guard until its exit has been seen: a panic on the way
+    /// (the 20 s, a failed wait) still kills and reaps it.
     fn signalled(mut self, signal: i32) -> Output {
         self.signal(signal);
-        let mut child = self.child.take().unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
-        while child.try_wait().unwrap().is_none() {
-            if std::time::Instant::now() >= deadline {
-                let _ = child.kill();
-                let _ = child.wait();
-                panic!("sopen did not end within 20 s of signal {signal}");
-            }
+        while self.running() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "sopen did not end within 20 s of signal {signal}"
+            );
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
+        // It has exited: only its output is left to collect.
+        let child = self.child.take().unwrap();
         child.wait_with_output().unwrap()
     }
 }
