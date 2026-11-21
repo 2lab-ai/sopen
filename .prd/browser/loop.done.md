@@ -26,3 +26,25 @@ changes. Rows here are snapshots taken when they were moved.
 - Merge dates are GitHub's, in UTC. S1-A and S1-D merged before S1-B; S1-C merged last, on
   2026-11-21.
 - E3 is not in this block: 02 §8.2 records no result for it, so its row stays in `loop.md`.
+
+## R1 (part 2) — closed 2026-11-21
+
+- measured S1-E ✅ E3 ✅ · result: S1's integration merged and deployed (preview 0120d40813a0); the
+  preview sweep run on that preview and written into 02 §8.2; S1-M reruns it for media previews ·
+  closed rows: S1-E, E3 · PRs: #29, and the PR that carries this block
+
+### Closed rows
+
+| ID | Status | Branch | Scope | Owner files (02 §5) | After |
+|---|---|---|---|---|---|
+| S1-E | ✅ merged: PR #29 (0120d40), 2026-11-21; deployed as preview 0120d40813a0 | `feat/browser-s1-integration` | modes, `view::resolve` (O2, O5, O7) with the committed display, the preview host and its lifecycle (02 §3–§4), per-feature job state, wiring of S1-A to S1-D (`panel_ui` calls S1-D's helpers); S1's scenarios (02 §8.1's table), receipts, AGENTS.md and 01 §3a for S1 | `src/gui/browser.rs`, `src/gui/browser/{view,preview,tests}.rs`, `tests/cli.rs`, `AGENTS.md`, `README.md`, `.prd/01-spec.md` | S1-A, S1-B, S1-C, S1-D |
+| E3 | ✅ done: 2026-11-21, result in 02 §8.2 | `exp/browser-e3-preview` | 02 §8.2 E3: viewers embedded at half width, disabled, events withheld; a 50-file sweep counting ffmpeg processes, cache growth, clicks and drags | scratch only | — |
+
+### Round section
+
+- S1-E (PR #29, merge commit 0120d40, 2026-11-21): deployed as preview 0120d40813a0 the same day.
+  S1-M is the one unit of S1 left.
+- E3: 50 files over SFTP in preview mode, the bar moved down 49 times through the key hook; 13.4 s
+  for the 50 settled previews, 0 ffmpeg or ffprobe processes, the preview cache at most 196 KB and
+  0 bytes after exit. Clicks and drags were not part of the run: S1-E's P5 tests cover input
+  isolation.
