@@ -218,6 +218,9 @@ pub struct State {
     /// Every window: F1 is pressed once what the state asked for is on screen, so the key help
     /// is what the screenshot shows (`help=1`, F1's receipt).
     pub help: bool,
+    /// Hex, text and image over a stream: the screenshot is taken at the first frame drawn with
+    /// content from the stream, rows still loading shot as they are (`loading=1`, 06 §11).
+    pub loading: bool,
 }
 
 impl State {
@@ -291,6 +294,10 @@ impl State {
                 "help" => match value {
                     "1" => state.help = true,
                     other => bail!("SOPEN_STATE: help must be 1 (got '{other}')"),
+                },
+                "loading" => match value {
+                    "1" => state.loading = true,
+                    other => bail!("SOPEN_STATE: loading must be 1 (got '{other}')"),
                 },
                 "patch" => {
                     for one in value.split(',').map(str::trim) {

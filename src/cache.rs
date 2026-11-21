@@ -452,7 +452,23 @@ pub fn fetch_claimed_cancellable(
     progress: &mut dyn FnMut(u64, u64),
     cancel: &std::sync::atomic::AtomicBool,
 ) -> Result<(Fetched, u64)> {
+    fetch_claimed_said(fs, host, abs, cache, progress, cancel, &mut Vec::new())
+}
+
+/// [`fetch_claimed_cancellable`], with the notices also put into `said` as soon as the claim has
+/// made them — before the fetch, so a fetch that then fails or is stopped still leaves its
+/// caller the place an earlier copy's edits went (on success they are in [`Fetched`] too).
+pub fn fetch_claimed_said(
+    fs: &mut dyn crate::remote::RemoteFs,
+    host: &str,
+    abs: &str,
+    cache: &Path,
+    progress: &mut dyn FnMut(u64, u64),
+    cancel: &std::sync::atomic::AtomicBool,
+    said: &mut Vec<String>,
+) -> Result<(Fetched, u64)> {
     let (claim, notices) = claim_for_fetch(cache, host, abs)?;
+    said.extend(notices.iter().cloned());
     let started = std::time::Instant::now();
     let at = fs.fetch_cancellable(abs, &claim.local, progress, cancel)?;
     if let Some(sha) = &at.sha256 {
