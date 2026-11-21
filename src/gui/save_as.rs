@@ -196,11 +196,21 @@ pub fn expected_line(size: Size, rate: Option<f64>) -> String {
     };
     match usable(rate).filter(|_| size.bytes() > 0) {
         Some(rate) => format!(
-            "{shown} — {} at {}/s",
+            "{shown} — {} at {}",
             about(size.bytes() as f64 / rate),
-            crate::human(rate as u64)
+            rate_text(rate)
         ),
         None => shown,
+    }
+}
+
+/// `3.6 MB/s`; a rate under 1 B/s (a stalled link still moving a little) as `less than 1 B/s`,
+/// never `0 B/s`.
+fn rate_text(rate: f64) -> String {
+    if rate < 1.0 {
+        "less than 1 B/s".to_string()
+    } else {
+        format!("{}/s", crate::human(rate as u64))
     }
 }
 
@@ -284,24 +294,38 @@ fn left_notes(e: &anyhow::Error, dest: &Path) -> Vec<String> {
 /// wins, and the check is not asked; a cancel after the publish has begun is refused
 /// ([`Decision::cancel`]), and the file is saved. Never over anything, nor through a link.
 pub fn write(dest: &Path, size: Size, producer: &mut dyn Producer, ctl: &Ctl<'_>) -> Outcome {
-    write_with(dest, size, producer, ctl, &mut free_space)
+    let seams = Seams {
+        free: &mut free_space,
+        staging: &mut || {},
+    };
+    write_with(dest, size, producer, ctl, seams)
 }
 
-/// [`write`] with `free` measuring the folder's free space (tests: a small disk).
+/// What [`write`] measures, and where its staging begins: the tests' stand-ins (a small disk;
+/// whether a refusal ever reached the staging).
+struct Seams<'a> {
+    /// The folder's free space.
+    free: &'a mut dyn FnMut(&Path) -> Option<u64>,
+    /// Called right before `save_new` is entered — before which nothing is made.
+    staging: &'a mut dyn FnMut(),
+}
+
+/// [`write`] over `seams`.
 fn write_with(
     dest: &Path,
     size: Size,
     producer: &mut dyn Producer,
     ctl: &Ctl<'_>,
-    free: &mut dyn FnMut(&Path) -> Option<u64>,
+    seams: Seams<'_>,
 ) -> Outcome {
     let dir = folder_of(dest);
     // What killed saves left here goes first (`save_new` sweeps again: nothing left by then),
     // so a dead partial never counts against the room.
     binary::sweep_dead_in(&dir);
-    if let Some(refused) = room(size, free(&dir), &dir) {
+    if let Some(refused) = room(size, (seams.free)(&dir), &dir) {
         return refused;
     }
+    (seams.staging)();
     let fill = |part: &mut File| -> Result<u64> {
         let wrote = producer.fill(part, ctl);
         if ctl.cancelled() {
@@ -634,7 +658,11 @@ impl SaveAs {
         let on_button = focused.is_some_and(|f| f != field && self.buttons.contains(&f));
         let escape = ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape));
         let enter = !on_button && ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Enter));
-        if std::mem::take(&mut self.focus) {
+        // The field has the keyboard while the modal asks, unless one of its buttons has it.
+        // Asked again every pass: a disabled widget gives the focus up, and the modal's first
+        // pass is an invisible sizing pass, so a request made once at open is lost.
+        let take_back = self.can_save() && !on_button && focused != Some(field);
+        if std::mem::take(&mut self.focus) || take_back {
             ctx.memory_mut(|m| m.request_focus(field));
         }
         let (mut save, mut stop, mut browse) = (enter, escape, false);
@@ -644,6 +672,8 @@ impl SaveAs {
         let width = (64.0 * chrome::CELL.x)
             .min(ctx.content_rect().width() - 8.0 * chrome::CELL.x)
             .max(20.0 * chrome::CELL.x);
+        // Every button laid out this pass: one with the focus keeps Enter as its own click.
+        let mut buttons = Vec::new();
         chrome::dialog(ctx, egui::Id::unique("sopen-save-as"), "Save As", |ui| {
             ui.set_width(width);
             ui.label(format!(
@@ -658,10 +688,11 @@ impl SaveAs {
                     can,
                     chrome::field(&mut self.path).id(field).desired_width(room),
                 );
-                browse |= ui
+                let chooser = ui
                     .add_enabled(can, egui::Button::new("Browse…"))
-                    .on_hover_text("the system's save dialog")
-                    .clicked();
+                    .on_hover_text("the system's save dialog");
+                buttons.push(chooser.id);
+                browse |= chooser.clicked();
             });
             ui.label(expected);
             ui.label(
@@ -701,11 +732,12 @@ impl SaveAs {
                 } else {
                     "Esc"
                 });
-                self.buttons = vec![ok.id, no.id];
+                buttons.extend([ok.id, no.id]);
                 save |= ok.clicked();
                 stop |= no.clicked();
             });
         });
+        self.buttons = buttons;
         if stop {
             match &self.stage {
                 Stage::Writing { decision, .. } => drop(decision.cancel()),

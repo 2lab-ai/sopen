@@ -175,6 +175,11 @@ fn the_expected_time_is_at_the_viewers_rate() {
         "0 B",
         "nothing to move"
     );
+    // A positive rate under 1 B/s is said as such, never as "0 B/s"; the time is at the rate.
+    assert_eq!(
+        expected_line(Size::Exact(64), Some(0.5)),
+        "64 B — about 2 min at less than 1 B/s"
+    );
 }
 
 /// Progress is the bytes and the time left: at the transfer's own rate once it has run a
@@ -270,13 +275,19 @@ fn a_save_as_publishes_the_producers_bytes_complete() {
         (fills.load(Ordering::SeqCst), checks.load(Ordering::SeqCst)),
         (1, 1)
     );
-    let mode = std::fs::metadata(&dest).unwrap().permissions().mode() & 0o777;
-    assert_ne!(mode & 0o600, 0, "the owner can read and write it: {mode:o}");
+    // The mode a file made the usual way in the same folder gets (the umask, any default ACL).
+    let control = tmp.path().join("control");
+    std::fs::write(&control, b"").unwrap();
+    let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o7777;
+    assert_eq!(mode(&dest), mode(&control), "{:o}", mode(&dest));
+    assert_eq!(mode(&dest) & 0o600, 0o600, "the owner reads and writes it");
     assert_eq!(outcome.line(), format!("saved {}", binary::tilde(&dest)));
 }
 
-/// Too little room: refused before anything is made — no staging folder, no fill — by the
-/// folder's real free space (no disk has an exbibyte free), naming both numbers.
+/// Too little room: refused before anything is made — by the folder's real free space (no disk
+/// has an exbibyte free), naming both numbers. At the boundary: the free space is measured
+/// once, while the folder holds nothing of this save, and the staging is never entered; after:
+/// no fill, no progress, nothing in the folder but what was there.
 #[test]
 fn too_little_room_refuses_before_anything_is_written() {
     let tmp = tempfile::tempdir().unwrap();
@@ -284,7 +295,29 @@ fn too_little_room_refuses_before_anything_is_written() {
     let dest = tmp.path().join("huge.edited.bin");
     let mut fake = Fake::new();
     let fills = fake.fills.clone();
-    let (outcome, progress) = write_now(&dest, Size::Exact(1 << 60), &mut fake);
+    let mut measured = Vec::new();
+    let mut real = |dir: &Path| {
+        measured.push(names(dir));
+        free_space(dir)
+    };
+    let mut entered = 0;
+    let mut staging = || entered += 1;
+    let decision = Decision::new();
+    let seen = Mutex::new(Vec::new());
+    let report = |done: u64| seen.lock().unwrap().push(done);
+    let seams = Seams {
+        free: &mut real,
+        staging: &mut staging,
+    };
+    let ctl = Ctl::new(&decision, &report);
+    let outcome = write_with(&dest, Size::Exact(1 << 60), &mut fake, &ctl, seams);
+    let progress = seen.into_inner().unwrap();
+    assert_eq!(
+        measured,
+        [vec!["keep.txt".to_string()]],
+        "measured once, with nothing of this save in the folder"
+    );
+    assert_eq!(entered, 0, "the staging was never entered");
     match &outcome {
         Outcome::NoRoom { dir, need, free } => {
             assert_eq!(dir, tmp.path());
@@ -306,13 +339,22 @@ fn too_little_room_refuses_before_anything_is_written() {
     assert!(line.ends_with("; nothing was written"), "{line}");
 }
 
+/// Which file is at `path` (not followed): its device and inode. Equal bytes under the name do
+/// not prove it is the same file; this does.
+fn identity(path: &Path) -> (u64, u64) {
+    use std::os::unix::fs::MetadataExt as _;
+    let meta = std::fs::symlink_metadata(path).unwrap();
+    (meta.dev(), meta.ino())
+}
+
 /// A name already taken when the save starts is refused with the next free `-N`, before any
-/// transfer; what is there is untouched.
+/// transfer; what is there is untouched — the same file, with the same bytes.
 #[test]
 fn a_taken_name_is_refused_with_the_next_free_one_and_untouched() {
     let tmp = tempfile::tempdir().unwrap();
     let dest = tmp.path().join("model.edited.bin");
     std::fs::write(&dest, b"the owner's earlier file").unwrap();
+    let theirs = identity(&dest);
     let mut fake = Fake::new();
     let fills = fake.fills.clone();
     let (outcome, _) = write_now(&dest, exact(), &mut fake);
@@ -324,6 +366,7 @@ fn a_taken_name_is_refused_with_the_next_free_one_and_untouched() {
         }
     );
     assert_eq!(fills.load(Ordering::SeqCst), 0);
+    assert_eq!(identity(&dest), theirs, "the same file, not a replacement");
     assert_eq!(std::fs::read(&dest).unwrap(), b"the owner's earlier file");
     assert_eq!(names(tmp.path()), ["model.edited.bin"]);
     let line = outcome.line();
@@ -332,15 +375,18 @@ fn a_taken_name_is_refused_with_the_next_free_one_and_untouched() {
 }
 
 /// The publish never overwrites: a name taken between the start and the publish (another
-/// program writes it mid-transfer) is refused with the next free name, never replaced, and the
-/// staging folder is gone.
+/// program writes it mid-transfer) is refused with the next free name, never replaced — the
+/// same file, with the same bytes — and the staging folder is gone.
 #[test]
 fn a_name_taken_during_the_transfer_is_never_overwritten() {
     let tmp = tempfile::tempdir().unwrap();
     let dest = tmp.path().join("model.edited.bin");
     let d2 = dest.clone();
+    let theirs = Arc::new(Mutex::new(None));
+    let theirs2 = theirs.clone();
     let mut fake = Fake::new().mid(move |_, _| {
         std::fs::write(&d2, b"someone else's, just now").unwrap();
+        *theirs2.lock().unwrap() = Some(identity(&d2));
     });
     let (outcome, _) = write_now(&dest, exact(), &mut fake);
     assert_eq!(
@@ -350,6 +396,8 @@ fn a_name_taken_during_the_transfer_is_never_overwritten() {
             next: tmp.path().join("model.edited-1.bin")
         }
     );
+    let theirs = theirs.lock().unwrap().expect("the fill ran");
+    assert_eq!(identity(&dest), theirs, "the same file, not a replacement");
     assert_eq!(std::fs::read(&dest).unwrap(), b"someone else's, just now");
     assert_eq!(names(tmp.path()), ["model.edited.bin"], "no staging left");
 }
@@ -506,9 +554,12 @@ fn a_staging_folder_that_cannot_be_removed_after_a_cancel_is_said() {
     let decision = Arc::new(Decision::new());
     let stop = decision.clone();
     let dir2 = tmp.path().to_path_buf();
+    let kept = Arc::new(Mutex::new(None));
+    let kept2 = kept.clone();
     let mut fake = Fake::new().mid(move |_, _| {
         let staging = staging_in(&dir2).unwrap();
         std::fs::write(staging.join("stray"), b"not sopen's").unwrap();
+        *kept2.lock().unwrap() = Some(staging);
         stop.cancel();
     });
     let report = |_: u64| {};
@@ -521,6 +572,11 @@ fn a_staging_folder_that_cannot_be_removed_after_a_cancel_is_said() {
         other => panic!("{other:?}"),
     }
     assert!(!dest.exists());
+    // The folder stays for the stray alone: it is unchanged, and the save's own `part` and
+    // `lock` are gone.
+    let kept = kept.lock().unwrap().clone().expect("the fill ran");
+    assert_eq!(names(&kept), ["stray"]);
+    assert_eq!(std::fs::read(kept.join("stray")).unwrap(), b"not sopen's");
 }
 
 /// The staging lock records the size only when it is exact: an estimate that the render runs
@@ -590,12 +646,16 @@ fn a_dead_partial_is_swept_before_the_room_is_measured() {
     let report = |_: u64| {};
     let dest = tmp.path().join("model.edited.bin");
     let mut fake = Fake::new();
+    let seams = Seams {
+        free: &mut small_disk,
+        staging: &mut || {},
+    };
     let outcome = write_with(
         &dest,
         exact(),
         &mut fake,
         &Ctl::new(&decision, &report),
-        &mut small_disk,
+        seams,
     );
     assert!(matches!(outcome, Outcome::Saved { .. }), "{outcome:?}");
     assert!(!dead.exists(), "the dead partial was swept");
@@ -686,7 +746,12 @@ struct Fx {
     said: Arc<Mutex<Vec<String>>>,
 }
 
-fn modal_with(fake: Fake, size: Size, rate: Option<f64>, chooser: Answers) -> Fx {
+fn modal_with(
+    fake: Fake,
+    size: Size,
+    rate: Option<f64>,
+    chooser: impl binary::Chooser + 'static,
+) -> Fx {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path().to_path_buf();
     let said = Arc::new(Mutex::new(Vec::new()));
@@ -783,20 +848,45 @@ fn enter_saves_and_the_result_line_is_also_on_stdout() {
     );
 }
 
+/// A held fill's hold on the test: `go` lets it go on. Ten seconds with neither that nor a
+/// cancel is a failure, never a release: the fill dies there (its worker is gone), and the test
+/// fails when this is dropped.
+struct Held {
+    go: std::sync::mpsc::Sender<()>,
+    expired: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        if !std::thread::panicking() {
+            assert!(
+                !self.expired.load(Ordering::SeqCst),
+                "a held fill waited 10 s with neither a release nor a cancel"
+            );
+        }
+    }
+}
+
 /// A fill that waits mid-way until the test lets it go — or until the save is cancelled.
-fn held() -> (Fake, std::sync::mpsc::Sender<()>) {
+fn held() -> (Fake, Held) {
     let (go, wait) = std::sync::mpsc::channel::<()>();
     let wait = Mutex::new(wait);
+    let expired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let expired2 = expired.clone();
     let fake = Fake::new().mid(move |ctl, _| {
         let until = Instant::now() + Duration::from_secs(10);
-        while !ctl.cancelled() && Instant::now() < until {
+        while !ctl.cancelled() {
             if wait.lock().unwrap().try_recv().is_ok() {
                 return;
+            }
+            if Instant::now() >= until {
+                expired2.store(true, Ordering::SeqCst);
+                panic!("a held fill waited 10 s with neither a release nor a cancel");
             }
             std::thread::sleep(Duration::from_millis(2));
         }
     });
-    (fake, go)
+    (fake, Held { go, expired })
 }
 
 /// While it writes, the modal shows the bytes and the time left and where it writes; Esc stops
@@ -804,7 +894,7 @@ fn held() -> (Fake, std::sync::mpsc::Sender<()>) {
 /// saves again from the start.
 #[test]
 fn esc_mid_transfer_cancels_and_the_same_producer_saves_again() {
-    let (fake, go) = held();
+    let (fake, held) = held();
     let fills = fake.fills.clone();
     let mut fx = modal(fake);
     let other = neighbours(&fx.dir);
@@ -835,7 +925,7 @@ fn esc_mid_transfer_cancels_and_the_same_producer_saves_again() {
     );
     // Again: the fill starts over on a new part and lands.
     fx.key(Key::Enter);
-    go.send(()).unwrap();
+    held.go.send(()).unwrap();
     fx.landed();
     assert_eq!(fills.load(Ordering::SeqCst), 2);
     assert_eq!(
@@ -848,7 +938,7 @@ fn esc_mid_transfer_cancels_and_the_same_producer_saves_again() {
 /// The Cancel button stops a running save as Esc does.
 #[test]
 fn the_cancel_button_stops_a_running_save() {
-    let (fake, _go) = held();
+    let (fake, _held) = held();
     let mut fx = modal(fake);
     fx.key(Key::Enter);
     fx.drv.until(&mut fx.host, 10, |h| {
@@ -951,6 +1041,69 @@ fn browse_saves_where_the_system_dialog_says() {
     assert!(fx.host.ended.is_empty());
 }
 
+/// The system's save dialog, counting its calls, answered only when the test sends `answer`.
+struct Pending {
+    calls: Arc<AtomicUsize>,
+    answer: Arc<Mutex<Option<std::sync::mpsc::Sender<Option<PathBuf>>>>>,
+}
+
+impl binary::Chooser for Pending {
+    fn choose(&mut self, _suggested: &Path) -> std::sync::mpsc::Receiver<Option<PathBuf>> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let (tx, rx) = std::sync::mpsc::channel();
+        *self.answer.lock().unwrap() = Some(tx);
+        rx
+    }
+}
+
+/// Enter on a focused Browse… browses — every button keeps its own activation: Tab from the
+/// field to Browse…, Enter, and the system's dialog is asked while nothing is written; the save
+/// starts only on its answer, and goes where it says.
+#[test]
+fn enter_on_a_focused_browse_browses_and_writes_nothing_until_it_answers() {
+    let (calls, answer) = (Arc::new(AtomicUsize::new(0)), Arc::new(Mutex::new(None)));
+    let fake = Fake::new();
+    let fills = fake.fills.clone();
+    let chooser = Pending {
+        calls: calls.clone(),
+        answer: answer.clone(),
+    };
+    let mut fx = modal_with(fake, exact(), None, chooser);
+    let focused = |fx: &Fx| fx.drv.ctx.memory(|m| m.focused());
+    assert_eq!(focused(&fx), Some(field_id()), "the field has the keyboard");
+    fx.key(Key::Tab);
+    assert!(
+        focused(&fx).is_some_and(|f| f != field_id()),
+        "Tab moved the keyboard to Browse…"
+    );
+    fx.key(Key::Enter);
+    fx.drv.idle(&mut fx.host, 3);
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "the system dialog was asked"
+    );
+    assert_eq!(
+        fills.load(Ordering::SeqCst),
+        0,
+        "nothing written before it answers"
+    );
+    assert!(!fx.host.busy());
+    assert!(fx.says("waiting for the system's save dialog…"));
+    assert!(names(&fx.dir).is_empty());
+    let chosen = fx.dir.join("chosen.bin");
+    let tx = answer
+        .lock()
+        .unwrap()
+        .take()
+        .expect("the dialog's answer channel");
+    tx.send(Some(chosen.clone())).unwrap();
+    fx.drv.until(&mut fx.host, 10, |h| !h.ended.is_empty());
+    assert_eq!(fills.load(Ordering::SeqCst), 1);
+    assert_eq!(std::fs::read(&chosen).unwrap(), BODY);
+    assert!(matches!(fx.host.ended.as_slice(), [Ended::Saved { path, .. }] if *path == chosen));
+}
+
 /// A folder typed in the field gets the edited name inside it.
 #[test]
 fn a_folder_in_the_field_gets_the_edited_name() {
@@ -985,17 +1138,27 @@ fn a_dead_worker_is_a_visible_failure() {
 }
 
 /// Dropping the modal mid-transfer (its window went away) cancels the save and waits for it:
-/// nothing is left.
+/// nothing is left. Mid-transfer is proved: half of the bytes are reported, and the staging
+/// `part` holds that half, when the modal goes.
 #[test]
 fn dropping_the_modal_mid_transfer_cancels_and_leaves_nothing() {
-    let (fake, _go) = held();
+    let (fake, _held) = held();
     let mut fx = modal(fake);
     fx.key(Key::Enter);
+    let half = BODY.len() / 2;
+    let reported = format!("50 % ({half} of {} B)", BODY.len());
     fx.drv.until(&mut fx.host, 10, |h| {
         h.modal
             .as_ref()
-            .is_some_and(|m| m.progress_text().is_some())
+            .and_then(SaveAs::progress_text)
+            .is_some_and(|t| t.starts_with(&reported))
     });
+    let staging = staging_in(&fx.dir).expect("the save's staging folder");
+    assert_eq!(
+        std::fs::read(staging.join("part")).unwrap(),
+        &BODY[..half],
+        "half of it is in `part`"
+    );
     fx.host.modal = None;
     assert!(names(&fx.dir).is_empty(), "{:?}", names(&fx.dir));
     assert!(fx.said.lock().unwrap().is_empty(), "nothing said saved");
