@@ -2666,7 +2666,9 @@ fn closing_the_window_kills_a_previews_ffprobe_at_once() {
         // The worker is held where it reads the time: that this returns at all, with the
         // probe stopped, is the window not waiting for it.
         drop(b);
-        assert_eq!(still_running(&pids), 0, "stopped with the window");
+        // (The window only signals: the kill lands a moment after it — waited for, not
+        // assumed. The worker is still held: nothing but the window's signal ends the probe.)
+        until("stopped with the window", || still_running(&pids) == 0);
         // Its worker, let go, reaps it.
         drop(_let_go);
         assert_none_left(_tmp.path());

@@ -913,11 +913,11 @@ fn a_stop_from_outside_kills_the_running_child_and_never_waits() {
                 took < Duration::from_millis(500),
                 "the stop waited: {took:?}"
             );
-            assert_eq!(
-                still_running(&started_under(&dir)),
-                0,
-                "it no longer runs when the stop returns"
-            );
+            // (A stop only signals: the kill lands a moment after it. Waited for, not
+            // assumed.)
+            until("it no longer runs once the stop has returned", || {
+                still_running(&started_under(&dir)) == 0
+            });
         });
         let error = ended.err().expect("stopped");
         assert!(crate::remote::is_cancelled(&error), "{error:#}");
@@ -998,7 +998,8 @@ fn a_dropped_waveform_decode_is_killed() {
             took < Duration::from_millis(500),
             "the drop waited: {took:?}"
         );
-        assert_eq!(still_running(&[pid]), 0, "killed with its window");
+        // (The drop only signals: the kill lands a moment after it. Waited for, not assumed.)
+        until("killed with its window", || still_running(&[pid]) == 0);
         until("it is reaped", || still_processes(&[pid]) == 0);
         assert_none_left(tmp.path());
     });
@@ -1359,7 +1360,8 @@ fn closing_the_window_stops_its_encoder_question() {
             took < Duration::from_millis(500),
             "closing waited: {took:?}"
         );
-        assert_eq!(still_running(&asked), 0, "stopped with the window");
+        // (The drop only signals: the kill lands a moment after it. Waited for, not assumed.)
+        until("stopped with the window", || still_running(&asked) == 0);
         assert_none_left(tmp.path());
     });
 }
