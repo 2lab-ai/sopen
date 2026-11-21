@@ -10,6 +10,14 @@
 //! wrapped afresh from every [`RESTART`] bytes (the next word start, else cluster start): the rows of a
 //! line are the same whether they are reached going down or going back up, and going back up
 //! reads only from the restart point before the row — never the whole of a long line.
+//!
+//! Everything is keyed by byte offset (06 §7.2): a place ([`Pos`]) is where its line starts in
+//! the file and the byte of it a row starts at, and the memos are keyed the same way, so rows
+//! are found alike inside the line index and past it — where a line's start is found by
+//! looking back from a place, or is not known and the line is cut in pieces on the same
+//! [`RESTART`] grid ([`Span::loose`]). The `\r` before a line's end is dropped by the row that
+//! holds the end ([`Wrapper::cut`]), not looked for when the line is placed: its last byte may
+//! be far away and not fetched.
 
 use super::{chrome, Span, Stale, TextDoc, Window_, LINE_MAX, TAB};
 use anyhow::Result;
@@ -438,18 +446,36 @@ pub(super) fn cut_row(cells: &[Cell], complete: bool, width: f32, m: &Measure) -
     }
 }
 
-/// A place in the file: a line, and the byte of it a row starts at.
+/// A place in the file, by bytes (06 §7.2): where its line starts — or, for a line whose start
+/// is not known, the piece of it that begins on the 16 KiB grid (`loose`) — and the byte of
+/// that a row starts at.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
 pub(super) struct Pos {
-    pub line: u64,
+    pub at: u64,
     pub off: u64,
+    pub loose: bool,
 }
 
-/// A row on screen: its line, its bytes of it, what it shows, and — for a line short enough to
-/// be highlighted — the index of its first character in the line (colours are per character).
+impl Pos {
+    /// The first row of `span`.
+    pub fn of(span: &Span) -> Self {
+        Self {
+            at: span.start,
+            off: 0,
+            loose: span.loose,
+        }
+    }
+}
+
+/// A row on screen: where its line starts in the file (`loose`: only a piece of a line whose
+/// start is not known), the line's number when the index reaches it, its bytes of it, what it
+/// shows, and — for a line short enough to be highlighted — the index of its first character
+/// in the line (colours are per character).
 #[derive(Debug, Clone)]
 pub(super) struct Row {
-    pub line: u64,
+    pub at: u64,
+    pub line: Option<u64>,
+    pub loose: bool,
     pub start: u64,
     pub cut: Rc<Cut>,
     pub first_char: Option<usize>,
@@ -458,8 +484,9 @@ pub(super) struct Row {
 /// Entries of each kind [`Memo`] keeps before it forgets them all (memory stays bounded).
 const MEMO_MAX: usize = 4096;
 
-/// What wrapping found so far, for one index and one width: line places, restart points, rows
-/// and each restart segment's row starts. Forgotten when the width or the index changes.
+/// What wrapping found so far, for one index and one width, keyed by where a line starts in the
+/// file: line places, restart points, rows and each restart segment's row starts. Forgotten
+/// when the width or the index changes.
 #[derive(Default)]
 pub(super) struct Memo {
     width: f32,
@@ -497,8 +524,9 @@ fn remember<K: std::hash::Hash + Eq, V>(map: &mut HashMap<K, V>, key: K, value: 
     map.insert(key, value);
 }
 
-/// Rows of the file at one width: reads through the index (bounded, [`Stale`] when the file is
-/// not what was indexed), measures with [`Measure`], remembers in [`Memo`].
+/// Rows of the file at one width: reads through the index, or past it by bytes (bounded,
+/// [`Stale`] when the file is not what was indexed), measures with [`Measure`], remembers in
+/// [`Memo`].
 pub(super) struct Wrapper<'a> {
     pub doc: &'a mut TextDoc,
     pub memo: &'a mut Memo,
@@ -509,20 +537,60 @@ pub(super) struct Wrapper<'a> {
 }
 
 impl Wrapper<'_> {
-    /// Where line `line` is (read a few lines around it at a time).
-    pub fn span(&mut self, line: u64) -> Result<Span> {
-        if let Some(span) = self.memo.spans.get(&line) {
+    /// The line (or piece) `p` is in: where it is in the file.
+    pub fn span(&mut self, p: Pos) -> Result<Span> {
+        if let Some(span) = self.memo.spans.get(&p.at) {
             return Ok(*span);
         }
-        let first = line.saturating_sub(15);
-        let found = self.doc.spans(first, 32)?;
+        let span = self
+            .doc
+            .span_starting(p.at, p.loose, &mut self.memo.window)?;
+        if let Some(line) = span.line {
+            // A few lines around it at a time, through the index.
+            for near in self.doc.spans(line.saturating_sub(15), 32)? {
+                remember(&mut self.memo.spans, near.start, near);
+            }
+        }
+        remember(&mut self.memo.spans, span.start, span);
+        Ok(span)
+    }
+
+    /// Where line `line` of the index is.
+    pub fn line(&mut self, line: u64) -> Result<Span> {
+        let found = self.doc.spans(line.saturating_sub(15), 32)?;
         // Taken from what was read, not the memo: remembering may have forgotten it already.
-        let wanted = found.iter().find(|s| s.line == line).copied();
+        let wanted = found.iter().find(|s| s.line == Some(line)).copied();
         for span in found {
-            remember(&mut self.memo.spans, span.line, span);
+            remember(&mut self.memo.spans, span.start, span);
         }
         // The index said the line is there.
         wanted.ok_or_else(|| anyhow::Error::new(Stale))
+    }
+
+    /// What follows `span` in the file, if anything does.
+    fn after(&mut self, span: Span) -> Result<Option<Span>> {
+        if let Some(next) = self
+            .memo
+            .spans
+            .get(&span.next)
+            .filter(|_| span.next > span.start)
+        {
+            return Ok(Some(*next));
+        }
+        let next = self.doc.span_after(&span, &mut self.memo.window)?;
+        if let Some(next) = next {
+            remember(&mut self.memo.spans, next.start, next);
+        }
+        Ok(next)
+    }
+
+    /// What comes before `span` in the file, if anything does.
+    fn before(&mut self, span: Span) -> Result<Option<Span>> {
+        let prev = self.doc.span_before(&span, &mut self.memo.window)?;
+        if let Some(prev) = prev {
+            remember(&mut self.memo.spans, prev.start, prev);
+        }
+        Ok(prev)
     }
 
     /// Restart point `k` of `span`: the first word start (after a space) at or after `k` ×
@@ -536,7 +604,7 @@ impl Wrapper<'_> {
         if k == 0 || at >= span.len {
             return Ok(at.min(span.len));
         }
-        if let Some(r) = self.memo.restarts.get(&(span.line, k)) {
+        if let Some(r) = self.memo.restarts.get(&(span.start, k)) {
             return Ok(*r);
         }
         let from = at - RESTART_BEHIND;
@@ -585,7 +653,7 @@ impl Wrapper<'_> {
             }
         };
         let r = r.min(span.len);
-        remember(&mut self.memo.restarts, (span.line, k), r);
+        remember(&mut self.memo.restarts, (span.start, k), r);
         Ok(r)
     }
 
@@ -613,40 +681,58 @@ impl Wrapper<'_> {
         }
     }
 
-    /// The row of `span` that starts at byte `s`.
+    /// The row of `span` that starts at byte `s`. The `\r` before a line's end is looked for
+    /// here, in the row that holds the end, when the index did not read it (06 §7.2): it is
+    /// taken by the row and not shown.
     fn cut(&mut self, span: Span, s: u64) -> Result<Rc<Cut>> {
-        if let Some(cut) = self.memo.rows.get(&(span.line, s)) {
+        if let Some(cut) = self.memo.rows.get(&(span.start, s)) {
             return Ok(cut.clone());
         }
         let limit = self.restart_after(span, s)?.min(span.len);
         let want = limit.saturating_sub(s).min(self.read as u64) as usize;
-        let bytes = self
+        let mut bytes = self
             .doc
             .span_bytes(span, s, want, &mut self.memo.window, true)?;
         let complete = s + want as u64 == limit;
+        let cr = span.cr && s + want as u64 == span.len && bytes.last() == Some(&b'\r');
+        if cr {
+            bytes.pop();
+        }
         let (cells, _) = decode(&bytes, complete);
-        let cut = Rc::new(cut_row(&cells, complete, self.width, &self.m));
-        remember(&mut self.memo.rows, (span.line, s), cut.clone());
+        let mut cut = cut_row(&cells, complete, self.width, &self.m);
+        if cr && cut.bytes == bytes.len() {
+            cut.bytes += 1;
+        }
+        let cut = Rc::new(cut);
+        remember(&mut self.memo.rows, (span.start, s), cut.clone());
         Ok(cut)
+    }
+
+    /// `e` is where the rows of `span` end: its end, or the `\r` before it alone.
+    fn ended(&mut self, span: Span, e: u64) -> Result<bool> {
+        if e >= span.len {
+            return Ok(true);
+        }
+        Ok(span.cr && e + 1 == span.len && self.cut(span, e)?.shown.is_empty())
     }
 
     /// The row starts of `span` from restart point `a` to the next one (or the line's end).
     fn segment(&mut self, span: Span, a: u64) -> Result<Rc<Vec<u64>>> {
-        if let Some(starts) = self.memo.segments.get(&(span.line, a)) {
+        if let Some(starts) = self.memo.segments.get(&(span.start, a)) {
             return Ok(starts.clone());
         }
         let end = self.restart_after(span, a)?.min(span.len);
         let (mut starts, mut s) = (vec![a], a);
         loop {
             let e = s + self.cut(span, s)?.bytes as u64;
-            if e >= end || e == s {
+            if e >= end || e == s || self.ended(span, e)? {
                 break;
             }
             starts.push(e);
             s = e;
         }
         let starts = Rc::new(starts);
-        remember(&mut self.memo.segments, (span.line, a), starts.clone());
+        remember(&mut self.memo.segments, (span.start, a), starts.clone());
         Ok(starts)
     }
 
@@ -655,16 +741,20 @@ impl Wrapper<'_> {
         if span.len == 0 {
             return Ok(0);
         }
-        let a = self.restart_before(span, span.len)?;
+        let mut a = self.restart_before(span, span.len)?;
+        if a > 0 && self.ended(span, a)? {
+            // The restart point is on the `\r` before the line's end: no row starts there
+            // (going down never makes one), so the last row is of the segment before.
+            a = self.restart_before(span, a)?;
+        }
         Ok(*self.segment(span, a)?.last().unwrap_or(&a))
     }
 
-    /// The last row of line `line`.
-    pub fn last_of(&mut self, line: u64) -> Result<Pos> {
-        let span = self.span(line)?;
+    /// The last row of `span`.
+    pub fn last_of(&mut self, span: Span) -> Result<Pos> {
         Ok(Pos {
-            line,
             off: self.last_start(span)?,
+            ..Pos::of(&span)
         })
     }
 
@@ -674,55 +764,47 @@ impl Wrapper<'_> {
         if p.off == 0 {
             return Ok(p);
         }
-        let span = self.span(p.line)?;
-        if p.off >= span.len {
-            return self.last_of(p.line);
+        let span = self.span(p)?;
+        if p.off >= span.len || self.ended(span, p.off)? {
+            // Past the line's rows, or on the `\r` before its end: its last row.
+            return self.last_of(span);
         }
         let a = self.restart_before(span, p.off + 1)?;
         let starts = self.segment(span, a)?;
         let off = starts.iter().rev().find(|&&s| s <= p.off).copied();
         Ok(Pos {
-            line: p.line,
             off: off.unwrap_or(a),
+            ..p
         })
     }
 
     /// The row after the one at `p`, if there is one.
     pub fn next(&mut self, p: Pos) -> Result<Option<Pos>> {
-        let span = self.span(p.line)?;
+        let span = self.span(p)?;
         let end = p.off + self.cut(span, p.off)?.bytes as u64;
-        if end < span.len {
-            Ok(Some(Pos {
-                line: p.line,
-                off: end,
-            }))
-        } else if p.line + 1 < self.doc.line_count() {
-            Ok(Some(Pos {
-                line: p.line + 1,
-                off: 0,
-            }))
-        } else {
-            Ok(None)
+        if !self.ended(span, end)? {
+            return Ok(Some(Pos { off: end, ..p }));
         }
+        Ok(self.after(span)?.map(|next| Pos::of(&next)))
     }
 
     /// The row before the one at `p`, if there is one: wrapped from the restart point before it
     /// (or, at a line's start, the previous line's last), never from further back.
     pub fn prev(&mut self, p: Pos) -> Result<Option<Pos>> {
+        let span = self.span(p)?;
         if p.off > 0 {
-            let span = self.span(p.line)?;
             let a = self.restart_before(span, p.off)?;
             let starts = self.segment(span, a)?;
             let off = starts.iter().rev().find(|&&s| s < p.off).copied();
             return Ok(Some(Pos {
-                line: p.line,
                 off: off.unwrap_or(a),
+                ..p
             }));
         }
-        if p.line == 0 {
-            return Ok(None);
+        match self.before(span)? {
+            Some(prev) => self.last_of(prev).map(Some),
+            None => Ok(None),
         }
-        self.last_of(p.line - 1).map(Some)
     }
 
     /// `n` rows on from `p` (fewer at the end of the file).
@@ -747,74 +829,241 @@ impl Wrapper<'_> {
         Ok(p)
     }
 
-    /// The top of the last page of `rows` rows: the file's last row at the bottom.
-    pub fn end(&mut self, rows: usize) -> Result<Pos> {
-        let lines = self.doc.line_count();
-        if lines == 0 {
-            return Ok(Pos::default());
+    /// `n` lines on from the line `p` is in (fewer at the end of the file), at its start.
+    pub fn lines_on(&mut self, p: Pos, n: u64) -> Result<Pos> {
+        let mut span = self.span(p)?;
+        for _ in 0..n {
+            match self.after(span)? {
+                Some(next) => span = next,
+                None => break,
+            }
         }
-        let last = self.last_of(lines - 1)?;
+        Ok(Pos::of(&span))
+    }
+
+    /// `n` lines back from the line `p` is in (fewer at the start of the file), at its start.
+    pub fn lines_back(&mut self, p: Pos, n: u64) -> Result<Pos> {
+        let mut span = self.span(p)?;
+        for _ in 0..n {
+            match self.before(span)? {
+                Some(prev) => span = prev,
+                None => break,
+            }
+        }
+        Ok(Pos::of(&span))
+    }
+
+    /// Not wrapped: the byte of `span` a row starts at for the line's end to be at its right
+    /// edge. 0 for a line that fits, as it paints from its first byte. Else as many of
+    /// its last characters as are painted in `columns` columns and in the row's width, a tab
+    /// counted as wide as it can be (where it stops depends on where the row starts).
+    pub fn end_left(&mut self, span: Span, columns: usize) -> Result<u64> {
+        let n = span.len.min(self.read as u64);
+        let from = span.len - n;
+        let window = &mut self.memo.window;
+        let mut bytes = self.doc.span_bytes(span, from, n as usize, window, true)?;
+        let mut end = span.len;
+        if span.cr && bytes.last() == Some(&b'\r') {
+            bytes.pop();
+            end -= 1;
+        }
+        // From a character's start.
+        let lead = match from {
+            0 => 0,
+            _ => bytes
+                .iter()
+                .take(3)
+                .take_while(|&&b| b & 0xC0 == 0x80)
+                .count(),
+        };
+        let (cells, _) = decode(&bytes[lead..], true);
+        let faces: Vec<char> = cells.iter().map(|c| chrome::shown_char(c.ch)).collect();
+        let widths = self.m.estimate(&faces);
+        if from == 0 {
+            // The whole line is here: as it paints from its first byte, each tab to its
+            // stop. A line that fits is shown from its start.
+            let (mut cols, mut wide) = (0usize, 0f32);
+            for (cell, width) in cells.iter().zip(&widths) {
+                let (c, w) = match cell.ch {
+                    '\t' => (TAB - cols % TAB, (TAB - cols % TAB) as f32 * self.m.space),
+                    _ => (1, *width),
+                };
+                (cols, wide) = (cols + c, wide + w);
+            }
+            if cols <= columns && wide <= self.width + 0.01 {
+                return Ok(0);
+            }
+        }
+        let (mut left, mut cols, mut wide) = (end, 0usize, 0f32);
+        for (cell, width) in cells.iter().zip(widths).rev() {
+            let (c, w) = match cell.ch {
+                '\t' => (TAB, TAB as f32 * self.m.space),
+                _ => (1, width),
+            };
+            if cols + c > columns || wide + w > self.width + 0.01 {
+                break;
+            }
+            (cols, wide) = (cols + c, wide + w);
+            left -= u64::from(cell.len);
+        }
+        // (All of a line that fits was taken: 0.)
+        Ok(left)
+    }
+
+    /// The top of the last page of `rows` rows: the file's last row at the bottom — `known`:
+    /// the last row known, while the index pass is on its way.
+    pub fn end(&mut self, rows: usize, known: bool) -> Result<Pos> {
+        let Some(last) = self.doc.last_span(known, &mut self.memo.window)? else {
+            return Ok(Pos::default());
+        };
+        remember(&mut self.memo.spans, last.start, last);
+        let last = self.last_of(last)?;
         self.back(last, rows.saturating_sub(1) as u64)
+    }
+
+    /// The top of the last page of `rows` lines, one row each: the file's last line at the
+    /// bottom (`known` as [`Wrapper::end`]'s).
+    pub fn end_lines(&mut self, rows: usize, known: bool) -> Result<Pos> {
+        let Some(last) = self.doc.last_span(known, &mut self.memo.window)? else {
+            return Ok(Pos::default());
+        };
+        remember(&mut self.memo.spans, last.start, last);
+        self.lines_back(Pos::of(&last), rows.saturating_sub(1) as u64)
+    }
+
+    /// The line (or piece) byte `at` of the file is in, and the byte of it that is.
+    pub fn holding(&mut self, at: u64) -> Result<Option<Pos>> {
+        let Some(span) = self.doc.span_holding(at, &mut self.memo.window)? else {
+            return Ok(None);
+        };
+        remember(&mut self.memo.spans, span.start, span);
+        Ok(Some(Pos {
+            off: at.saturating_sub(span.start).min(span.len),
+            ..Pos::of(&span)
+        }))
     }
 
     /// The row byte `at` of the file is in.
     pub fn at_byte(&mut self, at: u64) -> Result<Pos> {
-        let Some(span) = self.doc.span_at(at)? else {
-            return Ok(Pos::default());
-        };
-        remember(&mut self.memo.spans, span.line, span);
-        self.snap(Pos {
-            line: span.line,
-            off: at.saturating_sub(span.start).min(span.len),
-        })
+        match self.holding(at)? {
+            Some(p) => self.snap(p),
+            None => Ok(Pos::default()),
+        }
+    }
+
+    /// Characters of `span` before its byte `off`, for a line short enough to be highlighted
+    /// and numbered by the index.
+    fn chars_before(&mut self, span: Span, off: u64) -> Result<Option<usize>> {
+        if span.len > LINE_MAX as u64 || span.line.is_none() {
+            return Ok(None);
+        }
+        if off == 0 {
+            return Ok(Some(0));
+        }
+        let window = &mut self.memo.window;
+        let before = self.doc.span_bytes(span, 0, off as usize, window, true)?;
+        Ok(Some(decode(&before, true).0.len()))
     }
 
     /// Up to `rows` rows from `p`, and whether they reach the end of the file.
     pub fn page(&mut self, p: Pos, rows: usize) -> Result<(Vec<Row>, bool)> {
-        let lines = self.doc.line_count();
         let mut out: Vec<Row> = Vec::new();
-        if lines == 0 {
+        if self.doc.total() == 0 || self.doc.line_count() == 0 {
             return Ok((out, true));
         }
         let mut p = p;
         loop {
-            let span = self.span(p.line)?;
-            // Characters before the first row, for a line short enough to be highlighted.
-            let mut chars = if span.len > LINE_MAX as u64 {
-                None
-            } else if p.off == 0 {
-                Some(0)
-            } else {
-                let window = &mut self.memo.window;
-                let before = self.doc.span_bytes(span, 0, p.off as usize, window, true)?;
-                Some(decode(&before, true).0.len())
-            };
+            let span = self.span(p)?;
+            let mut chars = self.chars_before(span, p.off)?;
             let mut s = p.off;
-            loop {
+            let ended = loop {
                 let cut = self.cut(span, s)?;
                 out.push(Row {
+                    at: span.start,
                     line: span.line,
+                    loose: span.loose,
                     start: s,
                     cut: cut.clone(),
                     first_char: chars,
                 });
                 chars = chars.map(|c| c + cut.taken);
                 s += cut.bytes as u64;
-                if s >= span.len || out.len() >= rows || cut.bytes == 0 {
-                    break;
+                let ended = self.ended(span, s)?;
+                if ended || out.len() >= rows || cut.bytes == 0 {
+                    break ended;
+                }
+            };
+            if out.len() >= rows {
+                let last = ended && self.after(span)?.is_none();
+                return Ok((out, last));
+            }
+            match self.after(span)? {
+                Some(next) => p = Pos::of(&next),
+                None => return Ok((out, true)),
+            }
+        }
+    }
+
+    /// Up to `rows` lines from the one `p` is in, one row each (not wrapped), each from its
+    /// byte `left` on — a row is read under the same bound as a wrapped one, so a line of any
+    /// length is shown from any byte of it (06 §7.2) — and whether they reach the end of the
+    /// file.
+    pub fn flat(&mut self, p: Pos, left: u64, rows: usize) -> Result<(Vec<Row>, bool)> {
+        let mut out: Vec<Row> = Vec::new();
+        if self.doc.total() == 0 || self.doc.line_count() == 0 {
+            return Ok((out, true));
+        }
+        let mut span = self.span(p)?;
+        loop {
+            let want = span.len.saturating_sub(left).min(self.read as u64) as usize;
+            let window = &mut self.memo.window;
+            let mut bytes = self.doc.span_bytes(span, left, want, window, true)?;
+            let whole = left + want as u64 >= span.len;
+            if span.cr && whole && bytes.last() == Some(&b'\r') {
+                bytes.pop();
+            }
+            // From a character's start (the place within a line is a byte of it).
+            let lead = match left {
+                0 => 0,
+                _ => bytes
+                    .iter()
+                    .take(3)
+                    .take_while(|&&b| b & 0xC0 == 0x80)
+                    .count(),
+            };
+            let start = left.min(span.len) + lead as u64;
+            let (cells, used) = decode(&bytes[lead..], whole);
+            let mut shown = Vec::with_capacity(cells.len());
+            let mut col = 0usize;
+            for cell in &cells {
+                if cell.ch == '\t' {
+                    let wide = TAB - col % TAB;
+                    shown.push((' ', wide as u8));
+                    col += wide;
+                } else {
+                    shown.push((chrome::shown_char(cell.ch), 1));
+                    col += 1;
                 }
             }
-            let last_line = span.line + 1 >= lines;
-            if out.len() >= rows {
-                return Ok((out, last_line && s >= span.len));
+            let first_char = self.chars_before(span, start)?;
+            out.push(Row {
+                at: span.start,
+                line: span.line,
+                loose: span.loose,
+                start,
+                cut: Rc::new(Cut {
+                    taken: cells.len(),
+                    bytes: used,
+                    shown,
+                }),
+                first_char,
+            });
+            let next = self.after(span)?;
+            match next {
+                Some(next) if out.len() < rows => span = next,
+                Some(_) => return Ok((out, false)),
+                None => return Ok((out, true)),
             }
-            if last_line {
-                return Ok((out, true));
-            }
-            p = Pos {
-                line: span.line + 1,
-                off: 0,
-            };
         }
     }
 }

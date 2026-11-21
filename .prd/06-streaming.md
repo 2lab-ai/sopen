@@ -530,10 +530,13 @@ large files.
     keys.
     - This holds before the first page too, wrapped or not: with block 0 still on its way, ↓ ×3 and
       PgDn open the page that far down when it arrives.
-    - **W5a's stop-gap at the index frontier, which W5b lifts.** While the pass runs, End, a place
+    - **W5a's stop-gap at the index frontier, which W5b lifted.** While the pass runs, End, a place
       opened at (`at=`) and a reload's place wait for the index to reach them. Relative moves do
       not: scrolling down stops at the end of the indexed prefix, wrapped or not, and is not held
       there until the pass catches up.
+      - Since W5b this holds only for a place the pass will reach, which is inside the first
+        16 MiB: it then lands on numbered lines, after at most the 2–8 s the pass takes. A place
+        past what the pass reads is a jump by bytes (below) and waits for no pass.
   - **The status row describes the page on screen** and adds `loading…`; it never shows where the
     keys asked to go. The window's `ready()` (the screenshot hook's test) is false while a page read
     is Pending.
@@ -553,8 +556,8 @@ large files.
   - **The gutter is sized once.** The width does not change while the index grows. Without this the
     text moved right twice and wrapped rows re-wrapped.
     - A file read through a Source that fits the first block uses its line count. Any other file
-      read through a Source uses the digits of min(size, 16 MiB), at most 8, because its index can
-      never hold more lines than bytes.
+      of at most 16 MiB read through a Source uses the digits of its size, at most 8, because
+      its index can never hold more lines than bytes. A larger one uses W5b's width (below).
     - A local file uses its line count, however many digits that is. Its whole-file pass runs
       before its first screen, as today, so the count is known when the gutter is sized.
     - So the same bytes can wrap differently read through a Source and opened locally: a wider
@@ -656,13 +659,19 @@ the page and drop the queued keys.
   prefix reaches it. `TextWindow`'s top, wrap's `Pos` and `Row` and its memos are keyed by byte
   offset.
   - The gutter shows line numbers inside the prefix. Past it, the gutter shows the line's byte
-    offset (`0x4B0000000`) in the skin's dim colour. W5a's width (at most 8 digits) covers line
-    numbers only; the width for byte offsets is W5b's to set.
+    offset (`0x4B0000000`) in the skin's dim colour.
+    - **The gutter's width** for a file over 16 MiB read through a Source is `…0x` and the hex
+      digits of the file's last byte: 12 cells for 24 GB. It is sized once, as W5a's is. A line
+      number never needs more: a file has fewer lines than bytes.
   - The top bar says `lines known to 3.1 MB of 24 GB`, where W5a put it.
+  - The status row names the page by its lines where the prefix reaches all of them (`lines
+    262144–262169`), else by its bytes (`bytes 0x81FF920F–0x81FF9AF1`).
 - **The scroll bar** is by bytes while the line count is unknown, and by lines once the whole file
-  is indexed.
-- **A jump** (the scroll bar, End, Go to) reads around the target and looks back for the line that
-  holds it.
+  is indexed (wrapped, it is by bytes always, as before: rows cannot be counted without reading
+  every line). A click on it is a jump. While the thumb is dragged only the thumb moves, and the
+  jump is made where it is let go: a place the thumb only passes is not fetched (§11).
+- **A jump** (the scroll bar, End, Go to, a place opened at) reads around the target and looks back
+  for the line that holds it.
   - **A jump asks once.** It asks for the 64 KiB before the 16 KiB grid point and the 64 KiB after
     it in one read: at most 3 blocks, and one round trip when the replies are full. A short reply
     costs its remainder's round trip (§2, §5); the block count does not change. Asked row by row,
@@ -670,9 +679,19 @@ the page and drop the queued keys.
     - End is the 2-block case. Its target is the end of the file, so it asks for the 64 KiB before
       the grid point and the rest up to the end, with nothing after: at most 2 blocks, 128 KiB
       (V12).
+    - Each block is a demand of its own (one byte of it, through a reader of its own), so no
+      margin block comes with the jump (§4: an Interactive reader's margin reaches as far as a
+      read is long). The page is then read from those blocks.
   - It looks at most **64 KiB back** (`SPAN`) from that grid point. That bounds the read, not the
     line: SPAN only says where marks fall, and a line can be any length. A line whose start is not
     found within those 64 KiB has an **unknown start**.
+    - A line whose start is found is laid out from its start as one piece up to 64 KiB past
+      the grid point at or before that start. What is left of a longer line follows in pieces
+      that begin on the grid, as an unknown start's do. So the rows are the same going down
+      and going back up, from any byte of the first piece the start is found again, and the
+      piece lies inside the blocks the jump asked for: placing the line is never a second ask
+      (found in review: a piece that ran a grid cell further was).
+    - A piece is cut at the start of the character a grid point falls in.
   - **A line is never read or laid out whole.** A row reads at most 16 bytes per column plus 256,
     and wrapping restarts every 16 KiB. A jump into a 1 GiB line with no newline read at most
     49,741 bytes and laid out at most 51,484 characters; the first screen read 16,577 bytes. Peak
@@ -682,10 +701,21 @@ the page and drop the queued keys.
     `line start not known`.
   - **Unwrapped:** that line shows as one row from the same 16 KiB grid point, read under the row
     bound above. The gutter shows its byte offset with `…` before it.
-    - **Unwrapped, a long line can be scrolled through.** Today the row is cut at 4,096 bytes and
-      nothing past that can be reached. The place within an unwrapped line is a byte offset in that
-      line. →, ←, Home, End-of-line and the horizontal scroll move that offset, and the row is read
-      under the same row bound around it. So a long line can be scrolled to any byte.
+    - **Unwrapped, a long line can be scrolled through.** Before W5b the row was cut at 4,096
+      bytes and nothing past that could be reached. The place within an unwrapped line is a byte
+      offset in that line. →, ←, Home, End-of-line and the horizontal scroll move that offset,
+      and the row is read under the same row bound around it. So a long line can be scrolled to
+      any byte. Home is the line's start, and the file's start when already there; End is the
+      line's end at the right edge, and the file's end when the line already ends on screen.
+      The line's end is placed by what its last characters paint as — a tab as its columns,
+      a character of several bytes as one — not by counting bytes. A jump (End of file, Go
+      to, the scroll bar) lands on its line from the line's start. A file read again after it
+      changed, and a reload, put the view back where it was, sideways too. A line that fits
+      the window as it paints from its first byte counts as on screen whole. The wheel sideways keeps
+      what is less than a byte for the next frame, as it does for rows.
+      - Past the prefix a line longer than its first piece shows its next pieces as rows of
+        their own, each from its grid point. Inside the prefix, and in a local file, a line is
+        one row whatever its length.
     - **Up and down move by line starts, with one exception: the unknown-start grid step.** It is
       the exception wrapped mode already has, and the offset within the line does not change it.
       - ↑ and PgUp land on the previous line start when it is already known, or when it is found
@@ -693,22 +723,48 @@ the page and drop the queued keys.
         gutter marks that row as an unknown line start (its byte offset with `…` before it).
       - ↓ and PgDn work the same way forward: the next line start when it is known or found within
         one ask, otherwise one 16 KiB grid point forward, marked the same way.
-  - With a known start, PgUp reads the block before and splits it at newlines, and a partial first
-    line is joined when its own block arrives.
+  - With a known start, PgUp reads back from the top line for the newline before it, a little at
+    a time (1 KiB, then up to 16 KiB): a page of short lines costs at most the block before.
 - **Go to: Cmd/Ctrl+G** opens a field in the status row, as in the hex window. It takes a line
-  number, or `0x…` for a byte offset.
-  - A line inside the prefix goes there at once.
+  number, or `0x…` for a byte offset. Enter goes there, Esc leaves the field, and while the field
+  has the typing no key is the window's.
+  - A line inside the prefix goes there at once. So does a line that has begun and not ended (the
+    prefix's last): its start is known. A byte offset is a jump.
   - A line past the prefix runs the Bulk index pass from the last mark to that line, with progress
-    (`indexing… 1.2 GB of 24 GB`). Esc stops it: nothing more is sent, and only what was already in
-    flight (≤ the cap) arrives.
+    (`indexing… 1.2 GB of 24 GB · Esc stops`). Esc stops it: nothing more is sent, and only what
+    was already in flight (≤ the cap) arrives. Another jump stops it too. The pass stops where
+    the line begins, and the lines stay known as far as it got.
   - It is the only thing that reads a large file through, and only when asked.
-- **Index memory is bounded.** Line marks come at most one per 256 lines. 64 KiB marks are at least
-  64 KiB apart, so they cost at most 16 bytes per 64 KiB of the file. When the index would pass
-  1 Mi marks (16 MiB), it drops every other line mark and doubles the line spacing; a 64 KiB mark is
-  never dropped. So it stays within 16 MiB up to 64 GiB of indexed text, and 16 bytes per 64 KiB
-  beyond.
+  - A file with fewer lines shows its last one, and the status row says how many it has.
+- **Index memory is bounded.** Line marks come at most one per 256 lines. When the index would
+  pass 1 Mi marks (16 MiB), the line spacing doubles and the marks no longer due are dropped —
+  except a mark whose going would leave a line start 64 KiB or more past the mark before it.
+  The spacing stops doubling at 65,536 lines: lines that far apart are 64 KiB apart too.
+  - **The bound: 16 MiB, or 48 bytes per 64 KiB of indexed text where that is more.** That is
+    16 MiB up to 21.3 GiB of any text, 17.6 MB for 24 GB, and 50.3 MB for 64 GiB. A test pins it
+    over empty lines, logs, and the shapes that keep the most marks.
+    - Text whose marks end up 64 KiB apart costs 16 bytes per 64 KiB — a log of lines under
+      64 bytes does once thinned — and stays within 16 MiB up to 64 GiB.
+    - **Why not "a 64 KiB mark is never dropped, every other line mark is"** (this section before
+      W5b): it does not keep the rule every read through the index relies on, that a line which
+      does not start at a mark starts less than 64 KiB past one. Take a mark at byte 0, a line
+      mark at byte 60,000 and line starts up to byte 120,000 before the next mark. Dropping the
+      line mark leaves those starts up to 120,000 bytes past their mark. The mark that would
+      have stood at the first line start past 65,536 was never made, and making it would mean
+      reading the file again. So a mark is dropped only when every line start up to the next
+      mark stays within 64 KiB of the mark before. That keeps at most three marks per 64 KiB
+      (two line marks and the one that ends a long line) where the old text counted one.
+  - **The bound is of what is allocated, not of what is used.** Room for marks is made by the
+    index itself, doubling up to 1 Mi marks and stopping there exactly, and thinning compacts
+    the marks where they are: no second set is allocated beside the first. (Past 1 Mi marks —
+    only where no mark can be dropped any more — room grows a sixteenth at a time.) What the
+    allocator does while it makes that room larger is its own: a move then holds the old room
+    and the new for a moment.
+  - **One copy.** The document holds the marks, and the pass adds to them in place. The
+    highlighter's copy is of the first 16 MiB only. A local file's re-read builds the new index
+    beside the old one until it is swapped in.
   - Applying this to local files too is **the workstream's decision**, beyond message 17's words.
-    Today a local file of empty lines gets a mark every 256 bytes: 1.5 GB of index for 24 GB.
+    Before W5b a local file of empty lines got a mark every 256 bytes: 1.5 GB of index for 24 GB.
 
 ### 7.3 Image
 
@@ -1287,7 +1343,7 @@ Left as whole fetches, with the fetch now pipelined (§2):
 |---|---|
 | RAM per Source | 64 MiB of blocks + at most 16 MiB and one block per reader with a wait outstanding (§3) + at most 4 MiB in flight |
 | RAM, the hex window | + its page cache, 64 × 4 KiB |
-| RAM, the text viewer | + its index, at most 16 MiB up to 64 GiB of indexed text (§7.2) |
+| RAM, the text viewer | + its index, at most 16 MiB or 48 bytes per 64 KiB of indexed text, whichever is more: 17.6 MB for 24 GB (§7.2) |
 | RAM, the image window | the encoded bytes + the decoded pixels, as today; above 512 MiB decoded only after Continue (§7.3) |
 | Disk for viewing | **0 bytes**: nothing is created or grows under the cache directory |
 | Disk for whole-file actions | as today: the interim hex Save's cache copy (§7.1), "Save to…"'s staging file |
@@ -1308,7 +1364,7 @@ Left as whole fetches, with the fetch now pipelined (§2):
 |---|---|
 | `SOPEN_STREAM_STATS=1` | One line on stderr at each event, per Source (format below). Every live byte bound of §12 is read from these lines. |
 | `SOPEN_STREAM_THROTTLE=<ms>,<bytes/s>` | Every `Ranged` read is delayed by `<ms>` and paced to `<bytes/s>`, as the `Fake` does in tests, so a screenshot can catch rows still loading or a partial picture. |
-| `SOPEN_STATE=…;loading=1` | Hex, text and image: a scripted `SOPEN_SCREENSHOT` is taken at the first frame drawn with content from the stream: rows, or a thumbnail or partial picture. Pending rows are shot as they are: the hex window is ready at its first painted frame, before any byte has come (the `first` event is later, below). Without it, a streamed viewer is ready, and shot, once the screen's bytes have arrived or failed. |
+| `SOPEN_STATE=…;loading=1` | Hex, text and image: a scripted `SOPEN_SCREENSHOT` is taken at the first frame drawn with content from the stream: rows, or a thumbnail or partial picture. Pending rows are shot as they are: the hex window is ready at its first painted frame, before any byte has come (the `first` event is later, below). Without it, a streamed viewer is ready, and shot, once the screen's bytes have arrived or failed. The text viewer is ready at its first frame with rows from the stream, never before a row came: a page read still on its way, rows that say `loading…`, highlighting not here yet and Go to's pass are shot as they are (W5b). The browser hands it to the viewer it opens as it hands `at=`, from the state it parsed. |
 
 **The stats line:**
 
@@ -1462,7 +1518,8 @@ stream <event> t=<ms> <host:/abs> fetched=<b> demand=<b> prefetch=<b> bulk=<b> d
     bar says `lines known to …`;
   - PgUp from there adds at most 64 KiB of demand per page;
   - Go to line 10 000 000 shows progress, and after Esc only what was in flight (≤ the cap) arrives;
-  - the index stays within 16 MiB on a 4 GiB file of empty lines.
+  - the index stays within 16 MiB on a 4 GiB file of empty lines, and within §7.2's bound
+    (17.6 MB) on a 24 GB file whatever its lines.
 
   Qualification: `first − open ≤ 1.0 s`, and End's `ready − input ≤ 1.0 s`.
 - **V13. Text, small file.** A remote file of at most 16 MiB shows its first screen before its index
@@ -1750,6 +1807,10 @@ contract.
   fetch it …" (W8a for hex and for text of at most 16 MiB; W8b for the rest). "A remote file is viewed from its cached copy, which does not change under the
   viewer and is not followed" (W5a, §7.2). "Opening indexes the lines in one pass" for remote files
   (W5a, W5b).
+  - Also §3a, for every file, local ones too (W5b, §7.2): "4096 bytes of a line are shown (the
+    bar says when lines are cut …)" — not wrapped, a row now scrolls to any byte of its line and
+    the bar says nothing; and "files over 16 MiB are shown plain" — they are highlighted over
+    their first 16 MiB (Tensions). New there: Go to (Cmd/Ctrl+G) and the scroll bar as a jump.
 - **§6a, the hex window.** "whether a byte is changed is a comparison with the file" becomes a
   comparison with the byte the patch replaced (W4).
 - **§7.** Media reads its `Input` as a URL for remote files (W7).
@@ -1764,24 +1825,35 @@ contract.
 
 ## Tensions
 
-Open questions X3 (2026-11-21) raised and did not measure. Neither is decided here. W5b settles
-both, with the evidence named.
+Two questions X3 (2026-11-21) raised and did not measure. **W5b settled both (2026-11-22).**
 
-- **A local file after W5b: whole-file pass or prefix index.**
+- **A local file after W5b: whole-file pass or prefix index.** **Settled: Reading A, with §7.2's
+  memory bound.**
   - Reading A: a local file keeps today's whole-file index pass for good. §7.2's W5a text says it
     keeps that pass, and says only that no file over 16 MiB is read through a capped index *before*
     W5b.
   - Reading B: from W5b on, a local file goes through the prefix index like a remote one. §7.2's
     W5b text applies the index memory bound to local files too.
-  - Evidence W5b collects: whether a local file goes through the prefix index, shown by what the
-    index pass reads of a local file over 16 MiB.
-- **Highlighting past 16 MiB for a local file.**
+  - The decision: a local file's pass reads every byte before its first screen, so every line of
+    it has its number, `of N` is the file's, and the end is followed as before. The prefix index
+    exists to save round trips, and a local read has none. The index memory bound applies all
+    the same: the pass thins its marks as a stream's does (§7.2).
+  - Evidence: the index pass of a 17 MB local file reads exactly its size, once, before the
+    window is made, and End shows the last line with its number
+    (`a_local_file_over_16_mib_is_indexed_whole_and_highlighted_over_its_first_16_mib`).
+- **Highlighting past 16 MiB for a local file.** **Settled: Reading B.**
   - Reading A: a local file over 16 MiB is plain throughout, as today's rule (`HIGHLIGHT_MAX`) says
     for the whole file.
   - Reading B: it is highlighted over its first 16 MiB and plain past that, as §7.2 says for
     "files over 16 MiB" without naming local or remote.
-  - Evidence W5b collects: what is highlighted past 16 MiB, and before it, in a local file over
-    16 MiB.
+  - The decision: one rule for both. Once W8b routes remote text over 16 MiB through a Source,
+    Reading A would show the same file highlighted when read remotely and plain when read from
+    a local path. The highlighter's state runs from the top of the file either way, so its copy
+    of the index is of the first 16 MiB and no more. The status row says `highlighted over its
+    first 16.8 MB`.
+  - Evidence: in the same test the first page of the local file is coloured and its last page is
+    not; `a_stream_over_16_mib_is_highlighted_over_its_first_16_mib` shows the same through a
+    Source. 01 §3a still says such a file is plain: D1 brings it to this.
 
 An open question X1 (2026-11-21) measured and did not settle. It is not decided here. W7 settles
 it.

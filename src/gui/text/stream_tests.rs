@@ -264,12 +264,7 @@ fn says(drv: &Driver, needle: &str) -> bool {
 /// The rows of the page on screen, as text.
 fn rows(win: &TextWindow) -> Vec<String> {
     match &win.page {
-        Some(p) if p.wrapped => p.rows.iter().map(|r| r.cut.text()).collect(),
-        Some(p) => p
-            .runs
-            .iter()
-            .map(|r| r.iter().map(|(_, t)| t.as_str()).collect())
-            .collect(),
+        Some(p) => p.rows.iter().map(|r| r.cut.text()).collect(),
         None => Vec::new(),
     }
 }
@@ -280,16 +275,7 @@ fn has_rows(win: &TextWindow) -> bool {
 
 /// Each line's colours on the page on screen, once highlighted.
 fn colors(win: &TextWindow) -> Vec<Vec<Color32>> {
-    win.page.as_ref().map_or(Vec::new(), |p| {
-        if p.wrapped {
-            p.colors.clone()
-        } else {
-            p.runs
-                .iter()
-                .map(|r| r.iter().map(|(c, _)| *c).collect())
-                .collect()
-        }
-    })
+    win.page.as_ref().map_or(Vec::new(), |p| p.colors.clone())
 }
 
 /// Where the text painted with `prefix` at its start begins across the window.
@@ -301,14 +287,15 @@ fn text_x(drv: &Driver, prefix: &str) -> f32 {
         .unwrap_or_else(|| panic!("no text starts with {prefix:?}: {:?}", painted(drv)))
 }
 
-/// The status row's words for the page: the lowest text painted that says lines, `loading…`
-/// or `empty` (the rows of the body, which may say the same, are above it).
+/// The status row's words for the page: the lowest text painted that says lines, bytes,
+/// `loading…` or `empty` (the rows of the body, which may say the same, are above it).
 fn status(drv: &Driver) -> String {
     drv.texts()
         .into_iter()
         .filter(|(_, _, t)| {
             t.starts_with("line ")
                 || t.starts_with("lines ")
+                || t.starts_with("bytes 0x")
                 || t.starts_with("loading…")
                 || t == "empty"
         })
@@ -568,13 +555,14 @@ fn the_first_screen_costs_one_block_whatever_the_lines() {
                         let block = &body.as_bytes()[..BLOCK as usize];
                         let in_block = block.iter().filter(|b| **b == b'\n').count()
                             + usize::from(block.last() != Some(&b'\n'));
-                        let cut = |l: &str| l[..l.len().min(LINE_MAX)].to_string();
                         if !wrap {
-                            let want: Vec<String> = lines[..visible.min(in_block)]
-                                .iter()
-                                .map(|l| cut(l))
-                                .collect();
-                            assert_eq!(shown, want, "{at}");
+                            // One row to a line: the line whole, or — a row is read under
+                            // a bound of its own (06 §7.2) — its first bytes, past the edge.
+                            assert_eq!(shown.len(), visible.min(in_block), "{at}");
+                            for (row, line) in shown.iter().zip(&lines) {
+                                assert!(line.starts_with(row.as_str()), "{at}: {row}");
+                                assert!(row == line || row.len() >= 90, "{at}: {row}");
+                            }
                         } else if in_block >= visible {
                             assert_eq!(shown, lines[..visible], "{at}");
                         } else {
@@ -594,11 +582,12 @@ fn the_first_screen_costs_one_block_whatever_the_lines() {
                         });
                         drv.idle(&mut win, 1);
                         assert_eq!(loading_rows(&drv), 0, "{at}: {:?}", painted(&drv));
-                        let want: Vec<String> = lines[..visible.min(lines.len())]
-                            .iter()
-                            .map(|l| cut(l))
-                            .collect();
-                        assert_eq!(rows(&win), want, "{at}: once indexed");
+                        let shown = rows(&win);
+                        assert_eq!(shown.len(), visible.min(lines.len()), "{at}");
+                        for (row, line) in shown.iter().zip(&lines) {
+                            assert!(line.starts_with(row.as_str()), "{at}: once indexed");
+                            assert!(row == line || row.len() >= 90, "{at}: {row}");
+                        }
                     }
                 }
             }
@@ -1205,7 +1194,12 @@ fn unwrapped_rows_below_a_first_line_longer_than_the_block_fill_in() {
             run(&mut drv, &mut win, &mut net, "the first screen", |w, _| {
                 has_rows(w)
             });
-            assert_eq!(rows(&win), ["x".repeat(LINE_MAX)]);
+            // The row the block supplies: the line's first bytes, read under a row's bound
+            // (06 §7.2: no longer its first 4,096 — the row scrolls to any byte of it).
+            let shown = rows(&win);
+            assert_eq!(shown.len(), 1);
+            assert!(shown[0].len() >= 80 && shown[0].bytes().all(|b| b == b'x'));
+            assert!(shown[0].len() <= 4096, "{}", shown[0].len());
             assert_eq!(net.reads(), [(0, BLOCK as u32)]);
             drv.idle(&mut win, 1);
             assert_eq!(status(&drv), "line 1");
@@ -1317,24 +1311,23 @@ fn the_pass_stops_at_16_mib_for_a_source_and_never_for_a_local_file() {
                 net.reads().len(),
                 "a block was fetched twice"
             );
-            // W5a's stop-gap (W5b's to lift, 06 §13): the keys go as far as the lines are known, and
-            // the status row does not call that the file's line count.
+            // W5b lifted W5a's stop-gap (06 §7.2): End is the file's end, past the lines known —
+            // a jump by bytes, for two blocks — and the status row does not call the lines
+            // known the file's line count.
             drv.key(&mut win, Key::End, command(false));
-            run(
-                &mut drv,
-                &mut win,
-                &mut net,
-                "the last known page",
-                |w, _| w.ready(),
-            );
+            run(&mut drv, &mut win, &mut net, "the last page", |w, _| {
+                w.ready() && rows(w).last().is_some_and(|r| r.starts_with("line 969999"))
+            });
             drv.idle(&mut win, 1);
-            let last = rows(&win).last().cloned().unwrap();
-            assert!(last.starts_with("line 645277"), "{last}");
             assert!(!status(&drv).contains(" of "), "{}", status(&drv));
             assert!(!status(&drv).contains("loading"), "{}", status(&drv));
+            assert!(says(&drv, "bytes 0x"), "{:?}", painted(&drv));
             net.settle();
-            // (The screen's own margin, 06 §4: at most the block after the page.)
-            assert!(net.fetched() <= HIGHLIGHT_MAX + BLOCK, "{}", net.fetched());
+            assert!(
+                net.fetched() <= HIGHLIGHT_MAX + 2 * BLOCK,
+                "{}",
+                net.fetched()
+            );
             // The same bytes as a local file: indexed whole before its window is made.
             let tmp = tempfile::tempdir().unwrap();
             let path = tmp.path().join("big.log");
@@ -2308,8 +2301,8 @@ fn a_reload_inside_a_long_wrapped_line_comes_back_to_its_rows() {
                 drv.key(&mut win, Key::PageDown, Modifiers::NONE);
             }
             let before = rows(&win);
-            let (top, off) = (win.top, win.top_off as usize);
-            assert_eq!(top, 1, "inside the long line");
+            let (top, off) = (win.line, win.top_off as usize);
+            assert_eq!(top, Some(1), "inside the long line");
             assert!(off > 1_000, "at byte {off} of it");
             // The rows are the line's own bytes from there.
             let all = before.concat();
@@ -2320,7 +2313,7 @@ fn a_reload_inside_a_long_wrapped_line_comes_back_to_its_rows() {
             run(&mut drv, &mut win, &mut net, "the reload", |w, _| {
                 w.doc.whole() && w.ready()
             });
-            assert_eq!((win.top, win.top_off as usize), (top, off));
+            assert_eq!((win.line, win.top_off as usize), (top, off));
             assert_eq!(rows(&win), before);
         },
     );
@@ -2558,3 +2551,5 @@ fn a_reload_that_fails_within_its_own_pass_is_not_followed_by_a_retry() {
         },
     );
 }
+
+mod large;

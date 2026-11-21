@@ -811,6 +811,40 @@ fn p7_f9_switches_between_preview_and_dual() {
     assert!(fx.on_right("plain notes"), "preview mode again");
 }
 
+/// `SOPEN_STATE` `loading=1` and a preview that has settled (06 §11): Enter opens a viewer of
+/// its own, which is handed `loading` — the preview's window was made before anyone could
+/// tell it. Without the key, Enter makes the preview's own window the viewer, as ever.
+#[test]
+fn enter_on_a_settled_preview_hands_loading_to_a_fresh_viewer() {
+    for loading in [false, true] {
+        let mut fx = fixture();
+        fx.b.open_loading = loading;
+        fx.bar_on("main.rs");
+        assert!(fx.on_right("// a comment"), "loading {loading}: previewed");
+        let previewed = fx.b.preview.shown_window().expect("the preview's window");
+        assert_eq!(crate::gui::text::embedded_loading(), Some(false));
+        fx.key(Key::Enter);
+        fx.drv
+            .until(&mut fx.b, 20, |b| b.viewer.is_some() && b.ready());
+        let viewer = fx.b.viewer.as_ref().expect("the viewer");
+        let window = &*viewer.embedded.window as *const dyn Window as *const () as usize;
+        assert_eq!(
+            window != previewed,
+            loading,
+            "loading {loading}: a viewer of its own only with loading=1"
+        );
+        assert_eq!(
+            crate::gui::text::embedded_loading(),
+            Some(loading),
+            "loading {loading}: what the viewer was handed"
+        );
+        assert!(
+            fx.drv.find_text("// a comment").is_some(),
+            "loading {loading}"
+        );
+    }
+}
+
 /// P12 (text): a text file past the 4 MiB budget previews its start and says so; Enter makes the
 /// preview the viewer, which reads on: End is the file's last line.
 #[test]
