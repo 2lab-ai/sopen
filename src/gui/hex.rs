@@ -12,23 +12,26 @@
 
 mod file;
 
-pub use file::{Base, HexFile, Rebind, Saved};
+pub use file::{Base, Fetching, HexFile, Rebind, Repaint, Saved};
 
 use super::chrome::{self, HEX_KEYS};
 use super::image::CANNOT_REPLACE;
 use super::{Hooks, Outcome, Status};
-// What the tests beside this file name through `super::*`, as before the write side moved.
+use crate::stream::{Bytes, Mark, ReadError, Reader, Source, Waiting};
 use anyhow::{anyhow, bail, Result};
 use eframe::egui::{self, Color32, Key, Pos2, Rect, Sense, Vec2};
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs::File;
 use std::io::Write as _;
 use std::os::unix::fs::FileExt;
 #[cfg(test)]
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex};
+use std::task::Poll;
+// What the tests beside this file name through `super::*`, as before the write side moved.
 #[cfg(test)]
 #[allow(unused_imports)]
 use {
@@ -150,48 +153,302 @@ fn row_fits(width: f32, cw: f32, offset_chars: usize, per: u64) -> bool {
 // ---------------------------------------------------------------------------------------------
 // The edit model.
 
-/// Reads a file through a small page cache: only pages that are asked for are read, at most
-/// [`PAGES`] are held (the least recently used one goes first).
+/// What the hex window reads its bytes through (06 §7.1): a stream's [`Reader`] at the screen,
+/// or a local file in place.
+pub trait Feed: Bytes + Send {
+    /// What it has been waiting for, and for how long. A file read in place never waits.
+    fn waiting(&self) -> Option<Waiting> {
+        None
+    }
+
+    /// After a reload: it reads the version open now (06 §5).
+    fn renew(&mut self) {}
+
+    /// A local file read in place: every read is answered at once, by the file itself.
+    fn in_place(&self) -> bool {
+        false
+    }
+}
+
+impl Feed for Reader {
+    fn waiting(&self) -> Option<Waiting> {
+        Reader::waiting(self)
+    }
+
+    fn renew(&mut self) {
+        Reader::renew(self)
+    }
+}
+
+/// A local file read in place, through its handle.
+pub struct InPlace(pub Arc<File>);
+
+impl InPlace {
+    /// Fills `buf` from `off` until it is full or the file ends.
+    fn fill(
+        &self,
+        off: u64,
+        buf: &mut [u8],
+        cancel: Option<&AtomicBool>,
+    ) -> crate::stream::Result<usize> {
+        let mut got = 0;
+        while got < buf.len() {
+            if cancel.is_some_and(|c| c.load(Ordering::SeqCst)) {
+                return Err(ReadError::Cancelled);
+            }
+            match self.0.read_at(&mut buf[got..], off + got as u64) {
+                Ok(0) => break,
+                Ok(n) => got += n,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(ReadError::Failed(e.to_string())),
+            }
+        }
+        Ok(got)
+    }
+}
+
+impl Bytes for InPlace {
+    fn len(&self) -> u64 {
+        self.0.metadata().map_or(0, |m| m.len())
+    }
+
+    fn try_read(&mut self, off: u64, len: usize) -> Poll<crate::stream::Result<bytes::Bytes>> {
+        let mut buf = vec![0; len];
+        Poll::Ready(self.fill(off, &mut buf, None).map(|n| {
+            buf.truncate(n);
+            buf.into()
+        }))
+    }
+
+    fn read_at(
+        &mut self,
+        off: u64,
+        buf: &mut [u8],
+        cancel: &AtomicBool,
+    ) -> crate::stream::Result<usize> {
+        self.fill(off, buf, Some(cancel))
+    }
+}
+
+impl Feed for InPlace {
+    fn in_place(&self) -> bool {
+        true
+    }
+}
+
+/// What a place in the grid shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Cell {
+    Byte(u8),
+    /// Its bytes are on their way (06 §7.1): `··`, in the skin's dim colour.
+    Pending,
+    /// It cannot be read: `??`.
+    Unreadable,
+}
+
+impl Cell {
+    pub fn byte(self) -> Option<u8> {
+        match self {
+            Cell::Byte(b) => Some(b),
+            Cell::Pending | Cell::Unreadable => None,
+        }
+    }
+}
+
+/// What a frame does about the pages of its screen that are not here (a stream's only).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Ask {
+    /// Reads them: the fetch is queued, and they show as pending until it arrives.
+    Read,
+    /// Asks for nothing and shows them as pending: a place the scroll bar's thumb passes.
+    Wait,
+    /// Asks for nothing and shows them as unreadable: a failed stream, until the next input
+    /// retries.
+    Failed,
+}
+
+/// Reads a file through a small page cache, at most [`PAGES`] pages held (the least recently
+/// used one goes first). A local file is read in place, a page when a byte of it is asked for.
+/// A stream is read once a frame, for the pages of the screen that are not here
+/// ([`Pages::view`]): a page that has not arrived is pending, never empty (06 §7.1).
 struct Pages {
-    file: Arc<File>,
+    feed: Box<dyn Feed>,
+    in_place: bool,
     size: u64,
-    /// Page number → (bytes, last use). An unreadable page is held empty.
+    /// Page number → (bytes, last use): only pages that were read.
     held: HashMap<u64, (Vec<u8>, u64)>,
     tick: u64,
-    /// The first read error, for the status line.
+    /// A local file: the first read error, for the status line.
     error: Option<String>,
+    /// A local file: pages whose read failed since the last frame (not tried again within it).
+    bad: HashSet<u64>,
+    /// A stream: the pages not held cannot be read (its last read failed), rather than being
+    /// on their way.
+    failed: bool,
+    /// A stream: where the pages of the last view that are not here begin, while they are on
+    /// their way.
+    pending_at: Option<u64>,
+    /// A stream: a read found the version open now to be another one, and the reader was moved
+    /// to it (06 §5); taken by the window.
+    renewed: bool,
     /// Pages read so far (each read is one page).
     reads: u64,
+    /// Reads asked of the feed so far.
+    asks: u64,
 }
 
 impl Pages {
-    fn byte(&mut self, at: u64) -> Option<u8> {
+    fn page_len(&self, page: u64) -> usize {
+        (self.size - page * PAGE).min(PAGE) as usize
+    }
+
+    /// Holds `bytes` as `page`; the least recently used pages outside `spare` go first.
+    fn keep(&mut self, page: u64, bytes: Vec<u8>, spare: (u64, u64)) {
+        self.tick += 1;
+        while self.held.len() >= PAGES {
+            let oldest = self
+                .held
+                .iter()
+                .filter(|(k, _)| **k < spare.0 || **k > spare.1)
+                .min_by_key(|(_, (_, used))| *used)
+                .map(|(k, _)| *k);
+            match oldest {
+                Some(old) => self.held.remove(&old),
+                None => break,
+            };
+        }
+        self.reads += 1;
+        self.held.insert(page, (bytes, self.tick));
+    }
+
+    /// A local file's page, read now.
+    fn load(&mut self, page: u64) {
+        let (start, len) = (page * PAGE, self.page_len(page));
+        self.asks += 1;
+        let why = match self.feed.try_read(start, len) {
+            Poll::Ready(Ok(got)) if got.len() == len => {
+                return self.keep(page, got.to_vec(), (page, page))
+            }
+            Poll::Ready(Ok(got)) => format!("the file ends at 0x{:X}", start + got.len() as u64),
+            Poll::Ready(Err(e)) => e.to_string(),
+            Poll::Pending => "not there yet".to_string(),
+        };
+        self.reads += 1;
+        self.error
+            .get_or_insert_with(|| format!("cannot read at 0x{start:X}: {why}"));
+        self.bad.insert(page);
+    }
+
+    fn cell(&mut self, at: u64) -> Cell {
         if at >= self.size {
-            return None;
+            return Cell::Unreadable;
         }
         let page = at / PAGE;
+        if !self.held.contains_key(&page) {
+            if !self.in_place {
+                return if self.failed {
+                    Cell::Unreadable
+                } else {
+                    Cell::Pending
+                };
+            }
+            if !self.bad.contains(&page) {
+                self.load(page);
+            }
+        }
         self.tick += 1;
         let tick = self.tick;
-        if !self.held.contains_key(&page) {
-            if self.held.len() >= PAGES {
-                let oldest = self.held.iter().min_by_key(|(_, (_, used))| *used);
-                if let Some(old) = oldest.map(|(k, _)| *k) {
-                    self.held.remove(&old);
-                }
+        match self.held.get_mut(&page) {
+            Some((buf, used)) => {
+                *used = tick;
+                buf.get((at - page * PAGE) as usize)
+                    .map_or(Cell::Unreadable, |b| Cell::Byte(*b))
             }
-            let start = page * PAGE;
-            let mut buf = vec![0; (self.size - start).min(PAGE) as usize];
-            self.reads += 1;
-            if let Err(e) = self.file.read_exact_at(&mut buf, start) {
-                self.error
-                    .get_or_insert_with(|| format!("cannot read at 0x{start:X}: {e}"));
-                buf.clear();
-            }
-            self.held.insert(page, (buf, tick));
+            None => Cell::Unreadable,
         }
-        let (buf, used) = self.held.get_mut(&page)?;
-        *used = tick;
-        buf.get((at - page * PAGE) as usize).copied()
+    }
+
+    /// One frame's read (06 §7.1: one reader at the screen): the screen shows `len` bytes at
+    /// `off`. A stream is asked once, for the span of the screen's pages that are not here —
+    /// so while it waits the reader sees the same read again, and scrolling down reads on from
+    /// the one before (06 §4). A local file is read where a byte is asked for; this only lets a
+    /// page that failed be tried again.
+    fn view(&mut self, off: u64, len: u64, ask: Ask) {
+        self.bad.clear();
+        self.pending_at = None;
+        if self.in_place || len == 0 || off >= self.size {
+            return;
+        }
+        let (first, last) = (off / PAGE, (off + len - 1).min(self.size - 1) / PAGE);
+        let mut missing = (first..=last).filter(|p| !self.held.contains_key(p));
+        let span = match (missing.next(), missing.next_back()) {
+            (Some(a), b) => Some((a, b.unwrap_or(a))),
+            (None, _) => None,
+        };
+        let Some((a, b)) = span else {
+            return;
+        };
+        match ask {
+            Ask::Read => {}
+            Ask::Wait => {
+                self.failed = false;
+                self.pending_at = Some((a * PAGE).max(off));
+                return;
+            }
+            Ask::Failed => return self.failed = true,
+        }
+        let start = a * PAGE;
+        let len = ((b + 1) * PAGE).min(self.size) - start;
+        self.asks += 1;
+        match self.feed.try_read(start, len as usize) {
+            Poll::Pending => {
+                self.failed = false;
+                self.pending_at = Some(start.max(off));
+            }
+            Poll::Ready(Ok(got)) if got.len() as u64 == len => {
+                for page in a..=b {
+                    let from = ((page - a) * PAGE) as usize;
+                    let to = from + self.page_len(page);
+                    self.keep(page, got[from..to].to_vec(), (first, last));
+                }
+                self.failed = false;
+            }
+            // The version open now is another one (06 §5): nothing held is of it, and its
+            // size may be another. The next frame reads it.
+            Poll::Ready(Err(ReadError::Reloaded)) => self.renew(off),
+            // What is shown stays (06 §5); only what is not here cannot be read.
+            Poll::Ready(_) => self.failed = true,
+        }
+    }
+
+    /// The reader reads the version open now: nothing held is of it. The rows at `off` are on
+    /// their way until the next view has read them.
+    fn renew(&mut self, off: u64) {
+        self.feed.renew();
+        self.held.clear();
+        self.size = self.feed.len();
+        self.renewed = true;
+        self.failed = false;
+        self.pending_at = (self.size > 0).then(|| off.min(self.size - 1));
+    }
+
+    /// A page read now, however long it takes: the windowless Save's `SOPEN_STATE` patches.
+    fn fetch(&mut self, page: u64) -> Result<()> {
+        if self.held.contains_key(&page) {
+            return Ok(());
+        }
+        let mut buf = vec![0; self.page_len(page)];
+        self.asks += 1;
+        let never = AtomicBool::new(false);
+        let got = self
+            .feed
+            .read_at(page * PAGE, &mut buf, &never)
+            .map_err(|e| anyhow!("cannot read at 0x{:X}: {e}", page * PAGE))?;
+        if got != buf.len() {
+            bail!("cannot read at 0x{:X}: the file ends there", page * PAGE);
+        }
+        self.keep(page, buf, (page, page));
+        Ok(())
     }
 
     fn resident(&self) -> usize {
@@ -229,12 +486,16 @@ struct Step {
 /// The bytes as opened (never written: read through [`Pages`]) and the edits made to them: a
 /// sparse map offset → byte holding the byte wanted at every offset set — absolute values, as
 /// shown, never said relative to the file under them. An entry may equal the file's byte (an
-/// edit undone, a byte typed back); whether a byte is changed is a comparison with the file, so
-/// when the file under the edits is replaced (a Save in place) nothing about the edits has to
-/// be read from the old one.
+/// edit undone, a byte typed back); whether a byte is changed is a comparison with the byte the
+/// file had there, which the edit keeps (06 §7.1): read when the edit was typed, so nothing
+/// about the edits is ever read from the file again — over a stream that would block a frame,
+/// or count a byte not here as changed.
 pub struct HexDoc {
     pages: Pages,
     patches: BTreeMap<u64, u8>,
+    /// The byte the file as opened has at every offset `patches`, `saved`, `copied` or an undo
+    /// or redo step names (after a rebase: the file read from then on).
+    replaced: HashMap<u64, u8>,
     undo: VecDeque<Step>,
     redo: Vec<Step>,
     /// Undo steps kept (the oldest goes first).
@@ -256,39 +517,57 @@ pub struct HexDoc {
     answers: Option<(u64, bool, bool)>,
 }
 
-/// Whether the bytes shown with `a` and with `b` over the file differ anywhere (a byte the file
-/// cannot give counts as different). Walks both maps; reads the file only where one has an
-/// entry and the other does not.
-fn differ(pages: &mut Pages, a: &BTreeMap<u64, u8>, b: &BTreeMap<u64, u8>) -> bool {
+/// Whether the bytes shown with `a` and with `b` over the file differ anywhere. Walks both
+/// maps; where one has an entry and the other does not, the file's byte there is the one the
+/// edit kept (`replaced`) — the file is not read. An offset no edit was made at has no kept
+/// byte and counts as different.
+fn differ(replaced: &HashMap<u64, u8>, a: &BTreeMap<u64, u8>, b: &BTreeMap<u64, u8>) -> bool {
     for (&at, &x) in a {
         match b.get(&at) {
             Some(&y) if x != y => return true,
             Some(_) => {}
-            None if pages.byte(at) != Some(x) => return true,
+            None if replaced.get(&at) != Some(&x) => return true,
             None => {}
         }
     }
     b.iter()
-        .any(|(&at, &y)| !a.contains_key(&at) && pages.byte(at) != Some(y))
+        .any(|(&at, &y)| !a.contains_key(&at) && replaced.get(&at) != Some(&y))
 }
 
-fn pages(file: Arc<File>, size: u64) -> Pages {
+fn pages(feed: Box<dyn Feed>, size: u64) -> Pages {
     Pages {
-        file,
+        in_place: feed.in_place(),
+        feed,
         size,
         held: HashMap::new(),
         tick: 0,
         error: None,
+        bad: HashSet::new(),
+        failed: false,
+        pending_at: None,
+        renewed: false,
         reads: 0,
+        asks: 0,
     }
 }
 
 impl HexDoc {
     /// The document over `file`, whose first `size` bytes are shown.
     pub fn new(file: Arc<File>, size: u64) -> Self {
+        Self::over(Box::new(InPlace(file)), size)
+    }
+
+    /// The document over what `file` is read through: its stream, or the local file in place.
+    pub fn of(file: &HexFile) -> Self {
+        Self::over(file.feed(), file.size())
+    }
+
+    /// The document over `feed`, whose first `size` bytes are shown.
+    pub fn over(feed: Box<dyn Feed>, size: u64) -> Self {
         Self {
-            pages: pages(file, size),
+            pages: pages(feed, size),
             patches: BTreeMap::new(),
+            replaced: HashMap::new(),
             undo: VecDeque::new(),
             redo: Vec::new(),
             undo_cap: UNDO_STEPS,
@@ -322,27 +601,32 @@ impl HexDoc {
         self.size().div_ceil(ROW)
     }
 
-    /// The byte at `at` as edited (`None` past the end, or where the file cannot be read).
+    /// The byte at `at` as edited (`None` past the end, where the file cannot be read, or where
+    /// its bytes are not here yet).
     pub fn byte(&mut self, at: u64) -> Option<u8> {
+        self.cell(at).byte()
+    }
+
+    /// What the grid shows at `at`.
+    pub fn cell(&mut self, at: u64) -> Cell {
         if at >= self.size() {
-            return None;
+            return Cell::Unreadable;
         }
         match self.patches.get(&at) {
-            Some(&b) => Some(b),
-            None => self.pages.byte(at),
+            Some(&b) => Cell::Byte(b),
+            None => self.pages.cell(at),
         }
     }
 
-    /// The byte the file holds.
+    /// The byte the file holds, where it is here.
     pub fn original(&mut self, at: u64) -> Option<u8> {
-        self.pages.byte(at)
+        self.pages.cell(at).byte()
     }
 
-    /// Whether the byte at `at` differs from the file (one that cannot be read counts as
-    /// different).
+    /// Whether the byte at `at` differs from the file's: from the byte the edit replaced.
     pub fn changed(&mut self, at: u64) -> bool {
-        match self.patches.get(&at).copied() {
-            Some(b) => self.pages.byte(at) != Some(b),
+        match self.patches.get(&at) {
+            Some(b) => self.replaced.get(&at) != Some(b),
             None => false,
         }
     }
@@ -354,10 +638,10 @@ impl HexDoc {
                 return n;
             }
         }
-        let entries: Vec<(u64, u8)> = self.patches.iter().map(|(&a, &b)| (a, b)).collect();
-        let n = entries
-            .into_iter()
-            .filter(|&(at, b)| self.pages.byte(at) != Some(b))
+        let n = self
+            .patches
+            .iter()
+            .filter(|(at, b)| self.replaced.get(at) != Some(b))
             .count();
         self.counted = Some((self.rev, n));
         n
@@ -383,6 +667,57 @@ impl HexDoc {
         self.pages.reads
     }
 
+    /// Reads asked of the feed so far.
+    pub fn asks(&self) -> u64 {
+        self.pages.asks
+    }
+
+    /// One frame's read: the screen shows `len` bytes at `off` ([`Pages::view`]).
+    pub(super) fn view(&mut self, off: u64, len: u64, ask: Ask) {
+        self.pages.view(off, len, ask);
+    }
+
+    /// Where the bytes of the last view that are on their way begin, if any are.
+    pub fn pending_at(&self) -> Option<u64> {
+        self.pages.pending_at
+    }
+
+    /// What the stream has been waiting for, and for how long.
+    pub fn waiting(&self) -> Option<Waiting> {
+        self.pages.feed.waiting()
+    }
+
+    /// The pages held are dropped and the next view reads them again, from the version of the
+    /// stream open now (after a reload: one of sopen's own writes, or Cmd/Ctrl+R; 06 §5).
+    pub(super) fn refresh(&mut self) {
+        let shown = self.pages.held.keys().min().copied().unwrap_or(0);
+        self.pages.renew(shown * PAGE);
+    }
+
+    /// Whether a read found the stream reloaded since this was last asked: the reader reads
+    /// the version open now, and nothing held is of the one before.
+    pub(super) fn take_renewed(&mut self) -> bool {
+        std::mem::take(&mut self.pages.renewed)
+    }
+
+    /// Every edit, undo and redo step goes: they were made over a version of the file that is
+    /// no longer the one read (a reload).
+    pub(super) fn reset(&mut self) {
+        self.patches.clear();
+        self.replaced.clear();
+        self.undo.clear();
+        self.redo.clear();
+        self.saved.clear();
+        self.copied = None;
+        self.open_step = None;
+        self.bump();
+    }
+
+    /// Reads the page of `at` now, however long it takes (no window: `SOPEN_AUTOSAVE`).
+    fn fetch(&mut self, at: u64) -> Result<()> {
+        self.pages.fetch(at / PAGE)
+    }
+
     /// Overwrites the byte at `at` with `value`, one undo step (`cursor` = where the cursor is,
     /// for the undo). Writing the byte already shown is no step. `false` past the end or where
     /// the file cannot be read.
@@ -397,6 +732,10 @@ impl HexDoc {
         let before = self.byte(at)?;
         if before == value {
             return Some(false);
+        }
+        // The first edit here: `before` is the file's byte, kept from now on.
+        if !self.patches.contains_key(&at) {
+            self.replaced.insert(at, before);
         }
         self.patches.insert(at, value);
         self.undo.push_back(Step {
@@ -524,10 +863,10 @@ impl HexDoc {
                 return (dirty, unsaved);
             }
         }
-        let dirty = differ(&mut self.pages, &self.patches, &self.saved);
+        let dirty = differ(&self.replaced, &self.patches, &self.saved);
         let unsaved = dirty
             && match &self.copied {
-                Some(copied) => differ(&mut self.pages, &self.patches, copied),
+                Some(copied) => differ(&self.replaced, &self.patches, copied),
                 None => true,
             };
         self.answers = Some((self.generation, dirty, unsaved));
@@ -561,17 +900,19 @@ impl HexDoc {
     /// The file was saved in place and is read through `file` from now on — it holds what was
     /// saved (checked by its hash before this). The edits, and every undo and redo step, are
     /// absolute bytes: they stay as they are. An entry is dropped only where it equals the new
-    /// file's byte, read from `file`; nothing is read from the old one. What the last Save copy
-    /// holds is forgotten, not translated: it was remembered against the old file (an offset
-    /// left out meant the old byte), so it no longer says what the copy holds — closing asks
-    /// unless the bytes equal the saved file. All or nothing: a byte `file` cannot give is an
-    /// error and nothing is changed.
+    /// file's byte, read from `file` and kept as the byte an edit there replaces; nothing is
+    /// read from the old one. What the last Save copy holds is forgotten, not translated: it
+    /// was remembered against the old file (an offset left out meant the old byte), so it no
+    /// longer says what the copy holds — closing asks unless the bytes equal the saved file.
+    /// All or nothing: a byte `file` cannot give is an error and nothing is changed.
     pub fn rebase(&mut self, file: Arc<File>) -> Result<()> {
-        let mut new = pages(file, self.pages.size);
+        let mut new = pages(Box::new(InPlace(file)), self.pages.size);
+        // The new file's byte at every offset looked at: what an edit there replaces from now.
+        let mut there_now = HashMap::new();
         let mut keep = |m: &BTreeMap<u64, u8>| -> Result<BTreeMap<u64, u8>> {
             let mut out = BTreeMap::new();
             for (&at, &b) in m {
-                let there = new.byte(at).ok_or_else(|| {
+                let there = new.cell(at).byte().ok_or_else(|| {
                     anyhow!(
                         "the saved file cannot be read at 0x{at:X} ({})",
                         new.error
@@ -579,6 +920,7 @@ impl HexDoc {
                             .unwrap_or_else(|| "no byte there".to_string())
                     )
                 })?;
+                there_now.insert(at, there);
                 if there != b {
                     out.insert(at, b);
                 }
@@ -587,6 +929,8 @@ impl HexDoc {
         };
         let patches = keep(&self.patches)?;
         let saved = keep(&self.saved)?;
+        // An offset not looked at holds what it held: the save wrote only the edits.
+        self.replaced.extend(there_now);
         new.reads += self.pages.reads;
         self.pages = new;
         self.patches = patches;
@@ -598,10 +942,13 @@ impl HexDoc {
 }
 
 /// `SOPEN_STATE` for the hex window: the patches (each byte one undo step), then the cursor.
-fn apply_state(doc: &mut HexDoc, hooks: &Hooks) -> Result<Cursor> {
+/// A patch waits for its bytes (06 §7.1): from the first byte that is not here yet, the rest
+/// are returned in order, for the window to land as their pages arrive.
+fn apply_state(doc: &mut HexDoc, hooks: &Hooks) -> Result<(Cursor, VecDeque<(u64, u8)>)> {
     let state = &hooks.state;
     let size = doc.size();
     let mut cursor = Cursor::default();
+    let mut waiting = VecDeque::new();
     for (at, bytes) in &state.patches {
         let end = at.checked_add(bytes.len() as u64).unwrap_or(u64::MAX);
         if end > size {
@@ -611,11 +958,11 @@ fn apply_state(doc: &mut HexDoc, hooks: &Hooks) -> Result<Cursor> {
             );
         }
         for (i, &b) in bytes.iter().enumerate() {
-            if !doc.set(at + i as u64, b, cursor) {
-                bail!(
-                    "SOPEN_STATE patch: cannot read the byte at 0x{:X}",
-                    at + i as u64
-                );
+            let at = at + i as u64;
+            if !waiting.is_empty() || doc.cell(at) == Cell::Pending {
+                waiting.push_back((at, b));
+            } else if !doc.set(at, b, cursor) {
+                bail!("SOPEN_STATE patch: cannot read the byte at 0x{at:X}");
             }
         }
     }
@@ -628,15 +975,22 @@ fn apply_state(doc: &mut HexDoc, hooks: &Hooks) -> Result<Cursor> {
         }
         cursor.at = at;
     }
-    Ok(cursor)
+    Ok((cursor, waiting))
 }
 
 /// Opens the hex window, or the windowless `SOPEN_AUTOSAVE` run. `notices` (where earlier
 /// copies' unsaved edits went) are shown whole in the window's rows.
 pub fn open(file: HexFile, hooks: &Hooks, notices: Vec<String>) -> Result<Outcome> {
-    let mut doc = HexDoc::new(file.base(), file.size());
-    let cursor = apply_state(&mut doc, hooks)?;
+    let mut doc = HexDoc::of(&file);
+    let (cursor, waiting) = apply_state(&mut doc, hooks)?;
     if hooks.autosave {
+        // No window, so no frame to wait in: each patch's page is read now.
+        for (at, b) in waiting {
+            doc.fetch(at)?;
+            if !doc.set(at, b, Cursor::default()) {
+                bail!("SOPEN_STATE patch: cannot read the byte at 0x{at:X}");
+            }
+        }
         return autosave(file, &mut doc, hooks);
     }
     let title = file.origin.display();
@@ -653,7 +1007,9 @@ pub fn open(file: HexFile, hooks: &Hooks, notices: Vec<String>) -> Result<Outcom
         outcome.clone(),
         leftover.clone(),
     );
+    window.state_patches = waiting;
     window.ask_close = hooks.state.ask_close;
+    window.shoot_loading = hooks.state.loading;
     let run = super::run_window(&title, WINDOW, window, hooks);
     finish(&leftover, &outcome);
     run?;
@@ -669,10 +1025,12 @@ pub(super) fn embedded(
     outcome: Arc<Mutex<Outcome>>,
     leftover: Arc<Mutex<Option<Job>>>,
 ) -> Result<HexWindow> {
-    let mut doc = HexDoc::new(file.base(), file.size());
-    let cursor = apply_state(&mut doc, hooks)?;
+    let mut doc = HexDoc::of(&file);
+    let (cursor, waiting) = apply_state(&mut doc, hooks)?;
     let mut window = HexWindow::new(file, doc, cursor, notices, outcome, leftover);
+    window.state_patches = waiting;
     window.ask_close = hooks.state.ask_close;
+    window.shoot_loading = hooks.state.loading;
     Ok(window)
 }
 
@@ -681,7 +1039,7 @@ pub(super) fn embedded(
 pub fn embed(file: HexFile, notices: Vec<String>) -> super::Embedded {
     let outcome: Arc<Mutex<Outcome>> = Arc::default();
     let leftover: Arc<Mutex<Option<Job>>> = Arc::default();
-    let doc = HexDoc::new(file.base(), file.size());
+    let doc = HexDoc::of(&file);
     let window = HexWindow::new(
         file,
         doc,
@@ -808,12 +1166,27 @@ fn report(result: &Result<JobDone>, outcome: &mut Outcome) -> (Status, Vec<Strin
             println!("saved a copy at {path}");
             (Status::info(format!("saved a copy at {path}")), Vec::new())
         }
+        // The whole fetch before a streamed file's Save was stopped (Esc, or closing).
+        Err(e) if stopped(e) => (Status::info(STOPPED), Vec::new()),
         Err(e) => {
             eprintln!("sopen: {e:#}");
             (Status::error("save failed"), vec![format!("{e:#}")])
         }
     }
 }
+
+/// A stopped fetch wrote nothing, anywhere but the cache.
+const STOPPED: &str = "stopped: nothing was written";
+
+/// Whether a save ended because its whole fetch was stopped.
+fn stopped(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<crate::remote::Cancelled>().is_some()
+}
+
+/// A reload is on its way: nothing is edited or saved until it has landed.
+const RELOADING: &str = "reloading…";
+/// How long the scroll bar's thumb rests on a place before it is fetched, in seconds (06 §7.1).
+const THUMB_REST: f64 = 0.1;
 
 /// Closing was asked for while a save runs.
 const CLOSES_AFTER_SAVE: &str = "the window closes when the save is done";
@@ -853,6 +1226,9 @@ pub(super) struct HexWindow {
     can_replace: bool,
     doc: HexDoc,
     file: Arc<Mutex<HexFile>>,
+    /// The interim Save's whole fetch (06 §7.1), read without the file's lock: its worker
+    /// holds that for as long as it runs.
+    fetching: Arc<Fetching>,
     cursor: Cursor,
     /// The first row on screen.
     top_row: u64,
@@ -898,6 +1274,32 @@ pub(super) struct HexWindow {
     pending_notices: Option<Vec<String>>,
     /// `SOPEN_STATE` `close=ask`: closing is asked for on the first pass.
     ask_close: bool,
+    /// `SOPEN_STATE` `loading=1` (06 §11): the window is ready to be shot at its first frame
+    /// with rows, those still loading as they are.
+    pub(super) shoot_loading: bool,
+    /// The stream the file is viewed through (06 §7.1); `None` for a file read in place.
+    stream: Option<Source>,
+    /// What the stream wakes: this window, from its first pass on.
+    repaint: Repaint,
+    /// `SOPEN_STATE` patches whose bytes have not arrived, in order.
+    state_patches: VecDeque<(u64, u8)>,
+    /// A byte typed over while its page was on its way: the status row says so until it is
+    /// here or the cursor moves on.
+    blocked: Option<u64>,
+    /// Cmd/Ctrl+R was pressed and the reload has not landed: nothing is edited or saved. Its
+    /// worker waits for the stream (an open and an `fstat` on its connection), not a frame.
+    reloading: Option<Receiver<std::result::Result<(), String>>>,
+    /// What the stream's state last said on the status row: when it says something new, that
+    /// shows, whatever the window said before.
+    stream_said: Option<String>,
+    /// The first row the scroll bar's thumb last put on top, and since when (the window's
+    /// clock): a place is fetched once the thumb has rested there (06 §7.1).
+    thumb: Option<(u64, f64)>,
+    /// The stats line's `first` was marked (06 §11): a frame drew bytes from the stream.
+    marked_first: bool,
+    /// The screen has rows on their way, marked as an `input` (or the open's own first rows):
+    /// the frame that shows them marks `ready` (or `first`).
+    awaiting: bool,
     /// A preview in the file browser (02 §4.2): its first rows in a single-lined frame, no
     /// toolbar, status row, cursor or disclosures, no input of its own, and it never takes the
     /// keyboard.
@@ -909,6 +1311,10 @@ pub(super) struct HexWindow {
 
 impl Drop for HexWindow {
     fn drop(&mut self) {
+        // A whole fetch still running has written nothing: it is stopped, not waited for.
+        if self.fetching.active.load(Ordering::SeqCst) {
+            self.fetching.cancel.store(true, Ordering::SeqCst);
+        }
         if let Some(job) = self.job.take() {
             *self.leftover.lock().unwrap() = Some(job);
         }
@@ -959,6 +1365,7 @@ impl HexWindow {
         leftover: Arc<Mutex<Option<Job>>>,
     ) -> Self {
         let can_replace = file.can_replace();
+        let (stream, repaint) = (file.stream(), file.repaint());
         let opened = notices
             .into_iter()
             .chain((!can_replace).then(|| CANNOT_REPLACE.to_string()))
@@ -967,6 +1374,7 @@ impl HexWindow {
             title: file.origin.display(),
             can_replace,
             doc,
+            fetching: file.fetching.clone(),
             file: Arc::new(Mutex::new(file)),
             cursor,
             top_row: 0,
@@ -994,6 +1402,16 @@ impl HexWindow {
             notices: Vec::new(),
             pending_notices: None,
             ask_close: false,
+            shoot_loading: false,
+            stream,
+            repaint,
+            state_patches: VecDeque::new(),
+            blocked: None,
+            reloading: None,
+            stream_said: None,
+            thumb: None,
+            marked_first: false,
+            awaiting: false,
             preview: false,
             #[cfg(test)]
             save_starts: 0,
@@ -1023,6 +1441,182 @@ impl HexWindow {
             self.cursor.at.saturating_add_signed(delta),
             self.cursor.pane,
         );
+    }
+
+    /// Cmd/Ctrl+R (06 §5): the stream re-opens the path and the window shows that version at
+    /// the same offset. Not with edits written nowhere: they were made over the version shown.
+    fn reload(&mut self, ctx: &egui::Context) {
+        let Some(source) = self.stream.clone() else {
+            return;
+        };
+        if self.job.is_some() {
+            return self.status = Status::info("a save is running");
+        }
+        if self.reloading.is_some() {
+            return;
+        }
+        if self.doc.unsaved() {
+            return self.status = Status::error(
+                "not reloaded: your edits are saved nowhere, and a reload drops them — save a \
+                 copy or undo them first",
+            );
+        }
+        let (tx, rx) = mpsc::channel();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(source.reload().map_err(|e| format!("{e:#}")));
+            ctx.request_repaint();
+        });
+        self.reloading = Some(rx);
+        self.status = Status::info(RELOADING);
+    }
+
+    /// A reload that has ended: the version open now is shown at the same offset (within its
+    /// size). Edits and steps over the one before are gone — none was unsaved — and so is the
+    /// copy a Save fetched of it.
+    fn poll_reload(&mut self) {
+        let Some(rx) = &self.reloading else {
+            return;
+        };
+        let result = match rx.try_recv() {
+            Ok(result) => result,
+            Err(mpsc::TryRecvError::Empty) => return,
+            Err(mpsc::TryRecvError::Disconnected) => Err("its worker ended".to_string()),
+        };
+        self.reloading = None;
+        match result {
+            Ok(()) => {
+                self.doc.refresh();
+                self.doc.take_renewed();
+                self.doc.reset();
+                self.file
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .forget_fetched();
+                self.cursor.at = self.cursor.at.min(self.doc.size().saturating_sub(1));
+                self.cursor.low = false;
+                self.status = Status::info("reloaded");
+            }
+            Err(e) => self.status = Status::error(format!("not reloaded: {e}")),
+        }
+    }
+
+    /// The frame's one read of the stream (06 §7.1), for the `len` bytes at `off` the screen
+    /// shows; `on_bar` while the button is down on the scroll bar. Then what arrived is used:
+    /// `SOPEN_STATE` patches land, a reload that landed is taken, and the stats line's events
+    /// are marked.
+    fn read_screen(&mut self, ctx: &egui::Context, off: u64, len: u64, on_bar: bool) {
+        let Some(source) = self.stream.clone() else {
+            return self.doc.view(off, len, Ask::Read);
+        };
+        self.repaint.bind(ctx);
+        self.poll_reload();
+        let state = source.state();
+        let failed = matches!(state, crate::stream::State::Failed(_));
+        let ask = if on_bar {
+            // A place the thumb passes is not fetched: only where it has rested 100 ms, or
+            // where it is let go (the next frame, off the bar).
+            let now = ctx.input(|i| i.time);
+            let since = match self.thumb {
+                Some((row, since)) if row == self.top_row => since,
+                _ => now,
+            };
+            self.thumb = Some((self.top_row, since));
+            let rested = now - since;
+            if rested >= THUMB_REST {
+                Ask::Read
+            } else {
+                ctx.request_repaint_after(std::time::Duration::from_secs_f64(THUMB_REST - rested));
+                Ask::Wait
+            }
+        } else {
+            self.thumb = None;
+            // A failed stream is retried by the next key, click or scroll (06 §5), not by a
+            // frame the stream itself woke.
+            let input = ctx.input(|i| i.events.iter().any(super::user_input));
+            if failed && !input {
+                Ask::Failed
+            } else {
+                Ask::Read
+            }
+        };
+        let before = (self.doc.pending_at(), self.blocked);
+        // A `SOPEN_STATE` patch waiting for its byte has the frame's read; the screen's rows
+        // come once the patches are in.
+        if let Some(&(at, _)) = self.state_patches.front() {
+            self.doc.view(at, 1, ask);
+            while let Some(&(at, b)) = self.state_patches.front() {
+                if !self.doc.set(at, b, Cursor::default()) {
+                    break;
+                }
+                self.state_patches.pop_front();
+            }
+        }
+        if self.state_patches.is_empty() {
+            self.doc.view(off, len, ask);
+        }
+        if self.doc.take_renewed() {
+            // A read found the stream reloaded (a Save's own reload, ahead of its report): the
+            // version open now is read from here on, and the frame after this one shows it.
+            ctx.request_repaint();
+        }
+        if self
+            .blocked
+            .is_some_and(|at| at != self.cursor.at || self.doc.cell(at) != Cell::Pending)
+        {
+            self.blocked = None;
+        }
+        // The status row was laid out before this read: when what it says changed, the frame
+        // is painted once more.
+        if before != (self.doc.pending_at(), self.blocked) {
+            ctx.request_repaint();
+        }
+        // The stats line's events (06 §11): `first` at the first frame that draws bytes of the
+        // stream, `input` when the view moves to rows not here yet, `ready` when they show.
+        if len == 0 || !self.state_patches.is_empty() {
+            return;
+        }
+        let here = self.doc.pending_at().is_none() && self.doc.cell(off) != Cell::Unreadable;
+        let on_their_way = self.doc.pending_at().is_some();
+        if on_their_way && !self.awaiting {
+            self.awaiting = true;
+            if self.marked_first {
+                let place = match self.cursor.at {
+                    at if (off..off + len).contains(&at) => at,
+                    _ => off,
+                };
+                source.mark(Mark::Input(place));
+            }
+        }
+        if here && !self.marked_first {
+            self.marked_first = true;
+            self.awaiting = false;
+            source.mark(Mark::First);
+        } else if here && std::mem::take(&mut self.awaiting) {
+            source.mark(Mark::Ready);
+        }
+    }
+
+    /// What the stream says on the status row while rows are on their way (06 §5, §7.1):
+    /// `loading 0x…`, with its size once it has waited a second, `the remote is slow` after
+    /// ten. The frame is painted again when the line is due to change.
+    fn loading_line(&self, ctx: &egui::Context) -> Option<String> {
+        use std::time::Duration;
+        let at = self.doc.pending_at()?;
+        let Some(wait) = self.doc.waiting() else {
+            return Some(format!("loading 0x{at:X}"));
+        };
+        let (named, slow) = (Duration::from_secs(1), Duration::from_secs(10));
+        if wait.waited >= slow {
+            return Some("the remote is slow".to_string());
+        }
+        let next = if wait.waited >= named { slow } else { named };
+        ctx.request_repaint_after(next - wait.waited + Duration::from_millis(10));
+        Some(if wait.waited >= named {
+            format!("loading 0x{at:X} ({} KiB)", wait.len.div_ceil(1024))
+        } else {
+            format!("loading 0x{at:X}")
+        })
     }
 
     fn undo(&mut self) {
@@ -1064,6 +1658,9 @@ impl HexWindow {
         }
         if let Some(why) = &self.read_only {
             return self.status = Status::error(why.clone());
+        }
+        if self.reloading.is_some() {
+            return self.status = Status::info(RELOADING);
         }
         if matches!(kind, JobKind::Save { .. }) {
             if !self.can_replace {
@@ -1122,11 +1719,28 @@ impl HexWindow {
         let job = self.job.take().expect("checked above");
         let (status, shown) = report(&result, &mut self.outcome.lock().unwrap());
         self.status = status;
+        if self.stream.is_some() {
+            let mut file = self.file.lock().unwrap_or_else(|p| p.into_inner());
+            // What the whole fetch set aside stays on screen, as an open's notices do.
+            self.opened.extend(file.take_fetch_notices());
+            // Once the `Origin` has connected, whether this server can replace a file is known.
+            let can = file.can_replace();
+            if self.can_replace && !can {
+                self.opened.push(CANNOT_REPLACE.to_string());
+            }
+            self.can_replace = can;
+        }
         // An edit made while the save ran is not in what it wrote.
         let newer = *self.doc.patches() != job.snapshot;
         let landed = match &result {
             Ok(JobDone::Saved(Saved::Written { .. })) => {
                 self.doc.mark_saved(job.snapshot.clone());
+                if self.stream.is_some() {
+                    // The save reloaded the stream onto the saved file (06 §5): what is held
+                    // is of the file before.
+                    self.doc.refresh();
+                    ctx.request_repaint();
+                }
                 let rebind = self
                     .file
                     .lock()
@@ -1159,6 +1773,17 @@ impl HexWindow {
                 job.kind,
                 JobKind::Save { close_after: true } | JobKind::SaveCopy { close_after: true }
             );
+        // Closing stopped the whole fetch: nothing was saved, so closing asks, as it would
+        // have without a save running.
+        if waited && matches!(&result, Err(e) if stopped(e)) {
+            if self.doc.unsaved() {
+                self.prompt = true;
+            } else {
+                self.close_ok = true;
+                super::request_close(ctx);
+            }
+            return;
+        }
         if !asked || !landed {
             return;
         }
@@ -1319,8 +1944,19 @@ impl HexWindow {
     /// byte is typed and no key moves the cursor.
     fn keys(&mut self, ctx: &egui::Context, goto_owns: bool) {
         use super::command_key;
+        // Esc stops a streamed file's whole fetch (06 §8): nothing was written yet.
+        if self.fetching.active.load(Ordering::SeqCst)
+            && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Escape))
+        {
+            self.fetching.cancel.store(true, Ordering::SeqCst);
+        }
         if self.locked() {
             return;
+        }
+        // Only a streamed file reloads: without a stream the key is not this window's to take
+        // (the file browser around it has its own Cmd/Ctrl+R).
+        if self.stream.is_some() && command_key(ctx, Key::R, false) {
+            self.reload(ctx);
         }
         if command_key(ctx, Key::S, true) {
             self.start(ctx, JobKind::SaveCopy { close_after: false });
@@ -1335,7 +1971,9 @@ impl HexWindow {
         if bare_key(ctx, Key::F5) {
             self.start(ctx, JobKind::Save { close_after: false });
         }
-        if command_key(ctx, Key::Z, true) {
+        if self.reloading.is_some() {
+            // Nothing is edited until the reload has landed; the cursor still moves.
+        } else if command_key(ctx, Key::Z, true) {
             self.redo();
         } else if command_key(ctx, Key::Z, false) {
             self.undo();
@@ -1400,6 +2038,19 @@ impl HexWindow {
                 .collect()
         });
         for c in typed {
+            if self.reloading.is_some() {
+                self.status = Status::info(RELOADING);
+                break;
+            }
+            // A byte whose page is on its way cannot be typed over (06 §7.1): the key does
+            // nothing, the status row says so, and the cursor's row comes on screen, which
+            // is what fetches it.
+            let at = self.cursor.at.min(last);
+            if self.doc.cell(at) == Cell::Pending {
+                self.blocked = Some(at);
+                self.follow = true;
+                break;
+            }
             match self.doc.type_char(self.cursor, c) {
                 Some(next) => {
                     self.cursor = next;
@@ -1417,8 +2068,9 @@ impl HexWindow {
 
     fn toolbar(&mut self, ui: &mut egui::Ui) -> egui::Response {
         let ctx = ui.ctx().clone();
-        let busy = self.job.is_some();
-        let free = !self.locked();
+        // A save or a reload under way: no other one, and (a reload) no edit, starts.
+        let busy = self.job.is_some() || self.reloading.is_some();
+        let free = !self.locked() && self.reloading.is_none();
         // One row, whatever the state: nothing in it comes, goes or changes its label.
         ui.horizontal(|ui| {
             ui.label("Go to");
@@ -1457,6 +2109,8 @@ impl HexWindow {
                 .on_hover_text("⌘/Ctrl+S — overwrites the original after a local backup")
                 .on_disabled_hover_text(if !self.can_replace {
                     CANNOT_REPLACE
+                } else if self.reloading.is_some() {
+                    RELOADING
                 } else if busy {
                     "a save is running"
                 } else {
@@ -1483,12 +2137,53 @@ impl HexWindow {
             return "empty file".to_string();
         }
         let at = self.cursor.at;
-        let byte = match self.doc.byte(at) {
-            Some(b @ 0x20..=0x7e) => format!("0x{b:02X} {b} '{}'", b as char),
-            Some(b) => format!("0x{b:02X} {b}"),
-            None => "unreadable".to_string(),
+        let byte = match self.doc.cell(at) {
+            Cell::Byte(b @ 0x20..=0x7e) => format!("0x{b:02X} {b} '{}'", b as char),
+            Cell::Byte(b) => format!("0x{b:02X} {b}"),
+            Cell::Pending => "··".to_string(),
+            Cell::Unreadable => "unreadable".to_string(),
         };
         format!("0x{at:X} ({at}) · {byte}")
+    }
+
+    /// What the status row says now. A whole fetch's progress comes first, then a key that did
+    /// nothing because its byte is loading, then an error already there; then the stream's
+    /// state (06 §5), rows on their way, and last what the window said itself.
+    pub(super) fn status_text(&mut self, ctx: &egui::Context) -> Status {
+        if self.fetching.active.load(Ordering::SeqCst) {
+            let done = self.fetching.done.load(Ordering::SeqCst);
+            let total = self.fetching.total.load(Ordering::SeqCst);
+            let percent = (done.saturating_mul(100)).checked_div(total).unwrap_or(0);
+            return Status::info(format!(
+                "fetching the file to save it — {percent} % ({} of {}) · Esc stops",
+                crate::human(done),
+                crate::human(total)
+            ));
+        }
+        if self.reloading.is_some() {
+            return Status::info(RELOADING);
+        }
+        if let Some(at) = self.blocked {
+            return Status::info(format!("0x{at:X} is still loading"));
+        }
+        let said = self.stream.as_ref().and_then(|s| s.state().status());
+        if said != self.stream_said {
+            // The stream says something new: an error the window said before does not hide it.
+            self.stream_said.clone_from(&said);
+            if said.is_some() {
+                self.status = Status::default();
+            }
+        }
+        if self.status.error {
+            return self.status.clone();
+        }
+        if let Some(text) = said {
+            return Status::error(text);
+        }
+        if let Some(line) = self.loading_line(ctx) {
+            return Status::info(line);
+        }
+        self.status.clone()
     }
 
     /// One line whatever it says (see [`super::one_line`]): the grid above must not move.
@@ -1502,6 +2197,8 @@ impl HexWindow {
                 self.status = Status::error(e.to_string());
             }
         }
+        let status = self.status_text(ui.ctx());
+        let shown = self.job.is_some() || !status.text.is_empty();
         ui.horizontal(|ui| {
             ui.add(egui::Label::new(egui::RichText::new(cursor).monospace()).extend());
             ui.separator();
@@ -1513,7 +2210,7 @@ impl HexWindow {
                 ui.separator();
                 ui.add(egui::Label::new("unsaved").extend());
             }
-            if self.job.is_some() || !self.status.text.is_empty() {
+            if shown {
                 ui.separator();
             }
             if self.job.is_some() {
@@ -1521,7 +2218,7 @@ impl HexWindow {
                 let size = ui.text_style_height(&egui::TextStyle::Body);
                 ui.add(egui::Spinner::new().size(size));
             }
-            self.status.show(ui);
+            status.show(ui);
         });
     }
 
@@ -1663,6 +2360,12 @@ impl HexWindow {
         }
         self.top_row = self.top_row.min(max_top);
 
+        let rows = ((rows_rect.height() / row_h).ceil() as u64).min(total - self.top_row);
+        // The frame's one read, now that the rows on screen are known.
+        let screen = self.top_row * per;
+        let on_bar = bar_resp.is_pointer_button_down_on();
+        self.read_screen(&ctx, screen, (rows * per).min(size - screen), on_bar);
+
         let visuals = ui.visuals().clone();
         // The rows never run under the scroll bar (on a narrow window the ASCII column is cut).
         let painter = ui.painter_at(panel);
@@ -1691,7 +2394,6 @@ impl HexWindow {
         // No cursor in a preview: nothing there is being edited.
         let cursor_at = (!self.preview).then_some(self.cursor.at);
         let cursor_line = egui::Stroke::new(1.0, visuals.selection.stroke.color);
-        let rows = ((rows_rect.height() / row_h).ceil() as u64).min(total - self.top_row);
         for k in 0..rows {
             let row = self.top_row + k;
             let y = rows_rect.top() + k as f32 * row_h;
@@ -1710,19 +2412,20 @@ impl HexWindow {
                     Vec2::new(cw * chars + 2.0, row_h),
                 )
             };
-            let mut bytes = Vec::with_capacity(n as usize);
             let mut hex_job = egui::text::LayoutJob::default();
             let mut ascii_job = egui::text::LayoutJob::default();
             let fmt = |color: Color32| egui::TextFormat::simple(font.clone(), color);
             for i in 0..n {
                 let at = off + i;
-                let b = self.doc.byte(at);
-                bytes.push(b);
+                let shown = self.doc.cell(at);
                 let changed = self.doc.changed(at);
                 let color = if Some(at) == cursor_at {
                     p.bar_text
                 } else if changed {
                     changed_fg
+                } else if shown == Cell::Pending {
+                    // On its way (06 §7.1): `··` in the skin's dim colour, never a blank.
+                    p.dim
                 } else {
                     text
                 };
@@ -1754,12 +2457,13 @@ impl HexWindow {
                 if i > 0 {
                     hex_job.append(if i == 8 { "  " } else { " " }, 0.0, fmt(text));
                 }
-                let digits_text = match b {
-                    Some(b) => format!("{b:02X}"),
-                    None => "??".to_string(),
+                let (digits_text, glyph) = match shown {
+                    Cell::Byte(b) => (format!("{b:02X}"), ascii_char(Some(b))),
+                    Cell::Pending => ("··".to_string(), '·'),
+                    Cell::Unreadable => ("??".to_string(), ascii_char(None)),
                 };
                 hex_job.append(&digits_text, 0.0, fmt(color));
-                ascii_job.append(&ascii_char(b).to_string(), 0.0, fmt(color));
+                ascii_job.append(&glyph.to_string(), 0.0, fmt(color));
             }
             let hex_galley = ctx.fonts_mut(|f| f.layout_job(hex_job));
             let ascii_galley = ctx.fonts_mut(|f| f.layout_job(ascii_job));
@@ -1840,8 +2544,9 @@ impl super::Window for HexWindow {
                 .show(ui, |ui| self.grid(ui, false));
             return;
         }
-        if std::mem::take(&mut self.ask_close) {
-            // `SOPEN_STATE` `close=ask`: as if closing were asked for (the prompt's receipt).
+        if self.state_patches.is_empty() && std::mem::take(&mut self.ask_close) {
+            // `SOPEN_STATE` `close=ask`: as if closing were asked for (the prompt's receipt),
+            // once the state's patches are in.
             self.close_requested();
         }
         // F6 is PC Shell's Goto, as Cmd/Ctrl+G — but a plain key: not while a field (Go to,
@@ -1911,8 +2616,15 @@ impl super::Window for HexWindow {
         self.close_prompt(&ctx);
     }
 
+    /// Over a stream (06 §11): once the state's patches are in and the screen's bytes have
+    /// arrived or failed — or, with `loading=1`, at the first frame with rows, those still
+    /// loading shot as they are.
     fn ready(&self) -> bool {
-        self.painted && self.job.is_none()
+        self.painted
+            && self.job.is_none()
+            && self.state_patches.is_empty()
+            && self.reloading.is_none()
+            && (self.shoot_loading || self.doc.pending_at().is_none())
     }
 
     fn keys(&self) -> &'static [chrome::FKey] {
@@ -1935,6 +2647,13 @@ impl super::Window for HexWindow {
                 return true;
             }
             self.prompt = true;
+            return false;
+        }
+        if self.job.is_some() && self.fetching.active.load(Ordering::SeqCst) {
+            // The save is still fetching the whole file and has written nothing: the fetch is
+            // stopped, not waited for, and its report decides (it asks about the edits).
+            self.fetching.cancel.store(true, Ordering::SeqCst);
+            self.close_when_done = true;
             return false;
         }
         if self.job.is_some() {

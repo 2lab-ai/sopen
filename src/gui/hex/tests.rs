@@ -817,7 +817,8 @@ fn the_state_hook_and_autosave() {
     };
     let (file, hooks) = open("at=0x10;patch=1:4142,0x13:ff");
     let mut doc = HexDoc::new(file.base(), file.size());
-    let cursor = apply_state(&mut doc, &hooks).unwrap();
+    let (cursor, waiting) = apply_state(&mut doc, &hooks).unwrap();
+    assert!(waiting.is_empty(), "a file read in place has every byte");
     assert_eq!(cursor.at, 16);
     assert_eq!(doc.changed_count(), 3);
     assert_eq!(doc.undo().map(|c| c.at), Some(0x13), "a step per byte");
@@ -2577,4 +2578,1644 @@ fn the_f_keys_act_only_without_modifiers() {
     fx.key(Key::F5, Modifiers::NONE);
     assert_eq!(fx.win.save_starts, starts + 1, "F5 alone saves");
     fx.wait_for_save();
+}
+
+/// A window whose pass says whether a pressed Cmd/Ctrl+R is still in the input after it.
+struct KeepsR<'a> {
+    win: &'a mut HexWindow,
+    left: Option<bool>,
+}
+
+impl Window for KeepsR<'_> {
+    fn ui(&mut self, ui: &mut egui::Ui) {
+        self.win.ui(ui);
+        let pressed = |e: &Event| {
+            matches!(
+                e,
+                Event::Key {
+                    key: Key::R,
+                    pressed: true,
+                    ..
+                }
+            )
+        };
+        let (any, left) = ui.ctx().input(|i| {
+            let left = i.events.iter().any(pressed);
+            (left || i.modifiers.command, left)
+        });
+        if any {
+            self.left = Some(self.left.unwrap_or(false) || left);
+        }
+    }
+
+    fn ready(&self) -> bool {
+        self.win.ready()
+    }
+}
+
+/// Whether a Cmd/Ctrl+R pressed in `win` is still there for whoever reads keys after it.
+fn cmd_r_is_left(win: &mut HexWindow, drv: &mut Driver) -> bool {
+    let mut probe = KeepsR { win, left: None };
+    drv.key(&mut probe, Key::R, command(false));
+    probe.left.expect("the key was delivered")
+}
+
+/// Cmd/Ctrl+R is the file browser's too: a hex window without a stream (a local file, a fetched
+/// copy — every one before the routes change) leaves the key alone.
+#[test]
+fn cmd_r_is_left_alone_without_a_stream() {
+    let mut fx = fetched("a.bin", FIXTURE, 760.0, 560.0);
+    let status = fx.win.status.text.clone();
+    assert!(cmd_r_is_left(&mut fx.win, &mut fx.drv), "the key was taken");
+    assert_eq!(fx.win.status.text, status);
+    assert!(fx.win.reloading.is_none());
+}
+
+// ---------------------------------------------------------------------------------------------
+// Over a stream (06 §7.1; §12 V1–V3, V11): the window on a Source over the Fake, its engine
+// stepped by hand on simulated time, so every bound is in bytes and requests, never in seconds.
+
+mod stream {
+    use super::*;
+    use crate::gui::{Hooks, State};
+    use crate::remote::{
+        fake, pattern, Asked, Cancelled, Change, FakeControl, FakeFile, Fault, Link, SftpRemote,
+        Stat, STAT_REPLY,
+    };
+    use crate::stream::{Engine, Opening, Settings, Source, State as Flow, BLOCK};
+    use eframe::egui::PointerButton;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
+
+    const KIB: u64 = 1024;
+    const MIB: u64 = 1024 * KIB;
+    /// The owner's file (06 §12 V1).
+    const MODEL: u64 = 24_000_000_000;
+    /// 20 GiB (06 §12 V3).
+    const FAR: u64 = 0x5_0000_0000;
+    /// No poll within a test that does not ask for one.
+    const NEVER: Duration = Duration::from_secs(1_000_000);
+
+    /// The `Origin`'s connection, counted: viewing must never use it (06 §2: it connects on
+    /// first use, which is a Save), and a Save's whole fetch is counted apart.
+    #[derive(Default, Clone)]
+    struct Counts {
+        calls: Arc<AtomicUsize>,
+        fetches: Arc<AtomicUsize>,
+        /// A fetch waits here until it is cancelled (a fetch slow enough to be stopped).
+        hold: Arc<AtomicBool>,
+    }
+
+    struct Counting(LocalFs, Counts);
+
+    impl Counting {
+        fn hit(&mut self) -> &mut LocalFs {
+            self.1.calls.fetch_add(1, Ordering::SeqCst);
+            &mut self.0
+        }
+    }
+
+    impl RemoteFs for Counting {
+        fn stat_opt(&mut self, p: &str) -> Result<Option<Stat>> {
+            self.hit().stat_opt(p)
+        }
+        fn lstat_opt(&mut self, p: &str) -> Result<Option<Stat>> {
+            self.hit().lstat_opt(p)
+        }
+        fn realpath(&mut self, p: &str) -> Result<String> {
+            self.hit().realpath(p)
+        }
+        fn read_head(&mut self, p: &str, max: usize) -> Result<Vec<u8>> {
+            self.hit().read_head(p, max)
+        }
+        fn list_dir(&mut self, p: &str) -> Result<Vec<String>> {
+            self.hit().list_dir(p)
+        }
+        fn list_entries(&mut self, p: &str) -> Result<Vec<crate::remote::Entry>> {
+            self.hit().list_entries(p)
+        }
+        fn read_to(
+            &mut self,
+            p: &str,
+            out: &mut dyn std::io::Write,
+            progress: &mut dyn FnMut(u64),
+        ) -> Result<u64> {
+            self.hit().read_to(p, out, progress)
+        }
+        fn create_from(
+            &mut self,
+            local: &Path,
+            p: &str,
+            like: Option<crate::remote::Like>,
+        ) -> std::result::Result<crate::remote::Uploaded, crate::remote::CreateError> {
+            self.hit().create_from(local, p, like)
+        }
+        fn set_mode(&mut self, p: &str, mode: u32) -> Result<()> {
+            self.hit().set_mode(p, mode)
+        }
+        fn rename_over(&mut self, from: &str, to: &str) -> Result<()> {
+            self.hit().rename_over(from, to)
+        }
+        fn link_new(&mut self, from: &str, to: &str) -> Result<()> {
+            self.hit().link_new(from, to)
+        }
+        fn remove(&mut self, p: &str) -> Result<()> {
+            self.hit().remove(p)
+        }
+        fn can_replace(&self) -> bool {
+            self.1.calls.fetch_add(1, Ordering::SeqCst);
+            true
+        }
+        fn fetch_cancellable(
+            &mut self,
+            remote: &str,
+            local: &Path,
+            progress: &mut dyn FnMut(u64, u64),
+            cancel: &AtomicBool,
+        ) -> Result<Stat> {
+            self.1.fetches.fetch_add(1, Ordering::SeqCst);
+            while self.1.hold.load(Ordering::SeqCst) {
+                if cancel.load(Ordering::SeqCst) {
+                    return Err(anyhow!(Cancelled));
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            self.hit()
+                .fetch_cancellable(remote, local, progress, cancel)
+        }
+    }
+
+    /// The hex window on a Source over the Fake.
+    struct Sx {
+        tmp: tempfile::TempDir,
+        source: Source,
+        engine: Engine,
+        control: FakeControl,
+        counts: Counts,
+        /// The stats lines (06 §11), by their event.
+        lines: Arc<Mutex<Vec<String>>>,
+        /// What the stream wakes, and how often it did.
+        repaint: Repaint,
+        wakes: Arc<AtomicUsize>,
+        win: HexWindow,
+        drv: Driver,
+    }
+
+    fn sx_with(file: FakeFile, link: Link, poll_every: Duration, hooks: &Hooks) -> Result<Sx> {
+        let tmp = tempfile::tempdir().unwrap();
+        let at = Stat {
+            size: file.size,
+            mtime: file.mtime,
+            ..LocalFs::new().stat(tmp.path().to_str().unwrap()).unwrap()
+        };
+        let (transport, control) = fake("/m.bin", file, link);
+        let base = transport.now() - control.elapsed();
+        let (clock, again) = (control.clone(), control.clone());
+        let lines = Arc::new(Mutex::new(Vec::new()));
+        let sink = lines.clone();
+        let repaint = Repaint::default();
+        let wakes = Arc::new(AtomicUsize::new(0));
+        let settings = Settings {
+            poll_every,
+            stats: Some(Arc::new(move |line: &str| {
+                sink.lock().unwrap().push(line.to_string())
+            })),
+            throttle: None,
+            clock: Arc::new(move || base + clock.elapsed()),
+        };
+        let opening = Opening {
+            label: "host:/m.bin".into(),
+            began: Instant::now(),
+            sniff: 0,
+        };
+        let (source, engine) = Source::build(
+            transport,
+            Box::new(move || again.open()),
+            {
+                let (wakes, wake) = (wakes.clone(), repaint.waker());
+                Arc::new(move || {
+                    wakes.fetch_add(1, Ordering::SeqCst);
+                    wake();
+                })
+            },
+            opening,
+            settings,
+        );
+        let counts = Counts::default();
+        let origin = Origin::new(
+            Box::new(Counting(LocalFs::new(), counts.clone())),
+            None,
+            Some("host".into()),
+            "/m.bin".into(),
+            at,
+        );
+        let cache = tmp.path().join("cache");
+        let file = HexFile::streamed(origin, source.clone(), repaint.clone(), &cache);
+        let win = embedded(file, hooks, Vec::new(), Arc::default(), Arc::default())?;
+        Ok(Sx {
+            tmp,
+            source,
+            engine,
+            control,
+            counts,
+            lines,
+            repaint,
+            wakes,
+            win,
+            drv: Driver::new(760.0, 560.0),
+        })
+    }
+
+    fn sx(size: u64) -> Sx {
+        sx_with(
+            FakeFile::pattern(size),
+            Link::gate(),
+            NEVER,
+            &Hooks::default(),
+        )
+        .unwrap()
+    }
+
+    /// A row of 16 bytes none of which is here yet.
+    fn pending_row() -> String {
+        let mut out = String::new();
+        for i in 0..16 {
+            if i > 0 {
+                out.push_str(if i == 8 { "  " } else { " " });
+            }
+            out.push_str("··");
+        }
+        out
+    }
+
+    /// The row at `off` as the hex column shows the pattern's bytes.
+    fn pattern_row(off: u64) -> String {
+        let bytes: Vec<Option<u8>> = pattern(off, 16).into_iter().map(Some).collect();
+        hex_cells(&bytes)
+    }
+
+    impl Sx {
+        fn frames(&mut self, n: usize) {
+            self.drv.idle(&mut self.win, n);
+        }
+
+        fn out(&mut self) -> usize {
+            self.engine.transport().map_or(0, |r| r.pending())
+        }
+
+        /// The link works for one step: what is queued goes, one completion comes.
+        fn turn(&mut self) {
+            self.engine.pump();
+            if self.out() > 0 {
+                self.engine.step(None);
+            }
+        }
+
+        /// Exactly one completion (a wake left over from a read ends a wait early).
+        fn one(&mut self) {
+            for _ in 0..1000 {
+                if self.engine.step(None) {
+                    return;
+                }
+            }
+            panic!("no completion came");
+        }
+
+        /// Frames and link steps until nothing is on its way and nothing more is asked.
+        fn settle(&mut self) {
+            let mut quiet = 0;
+            for _ in 0..100_000 {
+                self.frames(1);
+                self.engine.pump();
+                if self.out() == 0 {
+                    // Longer than the scroll bar's thumb rests before its place is asked for.
+                    quiet += 1;
+                    if quiet >= 10 {
+                        return;
+                    }
+                } else {
+                    quiet = 0;
+                    self.engine.step(None);
+                }
+            }
+            panic!("the stream did not settle");
+        }
+
+        /// `d` of simulated time, the engine stepped through it.
+        fn run_for(&mut self, d: Duration) {
+            let until = self.control.elapsed() + d;
+            for _ in 0..1_000_000 {
+                let left = until.saturating_sub(self.control.elapsed());
+                if left.is_zero() {
+                    return;
+                }
+                self.engine.step(Some(left));
+            }
+            panic!("simulated time did not pass");
+        }
+
+        fn key(&mut self, key: Key, modifiers: Modifiers) {
+            self.drv.key(&mut self.win, key, modifiers);
+        }
+
+        fn typed(&mut self, text: &str) {
+            self.drv.frame(
+                &mut self.win,
+                vec![Event::Text(text.into())],
+                Modifiers::NONE,
+            );
+            self.frames(1);
+        }
+
+        fn goto(&mut self, at: u64) {
+            self.key(Key::G, command(false));
+            self.typed(&format!("0x{at:X}"));
+            self.key(Key::Enter, Modifiers::NONE);
+        }
+
+        fn sent(&self) -> usize {
+            self.control.sent().len()
+        }
+
+        /// The events of the stats lines so far, with the place of an `input`.
+        fn events(&self) -> Vec<String> {
+            let lines = self.lines.lock().unwrap();
+            lines
+                .iter()
+                .map(|l| {
+                    let event = l.split(' ').nth(1).unwrap_or_default();
+                    match l.rsplit_once(" place=") {
+                        Some((_, place)) => format!("{event} {place}"),
+                        None => event.to_string(),
+                    }
+                })
+                .collect()
+        }
+
+        /// Bytes asked and not yet answered.
+        fn in_flight(&self) -> u64 {
+            self.source.core().pf.adm.in_flight()
+        }
+
+        fn fetched(&self) -> u64 {
+            self.source.fetched().total
+        }
+
+        fn cap(&self) -> u64 {
+            self.source.core().pf.adm.cap()
+        }
+
+        fn status_now(&mut self) -> Status {
+            let ctx = self.drv.ctx.clone();
+            self.win.status_text(&ctx)
+        }
+
+        fn status(&mut self) -> String {
+            self.status_now().text
+        }
+
+        fn shows(&self, text: &str) -> bool {
+            self.drv.find_text(text).is_some()
+        }
+
+        /// The offset column's text for the row at `off`.
+        fn offset(&self, off: u64) -> String {
+            offset_text(off, self.win.doc.size())
+        }
+
+        /// The scroll bar: its x, and the y of the thumb's place at `frac` of the file.
+        fn bar(&self, frac: f32) -> Pos2 {
+            let l = self.win.layout.expect("drawn");
+            let cell = crate::gui::chrome::CELL;
+            let (top, bottom) = (l.rows.top() - 2.0 * l.row_h, l.rows.bottom());
+            let room = (bottom - top - 3.0 * cell.y).max(1.0);
+            Pos2::new(
+                l.rows.right() + cell.x / 2.0,
+                top + 1.5 * cell.y + frac * room,
+            )
+        }
+
+        /// The reads sent from request `from` on, as block numbers.
+        fn blocks_read(&self, from: usize) -> Vec<u64> {
+            self.control.sent()[from..]
+                .iter()
+                .filter_map(|s| match s.asked {
+                    Asked::Read { off, .. } => Some(off / BLOCK),
+                    _ => None,
+                })
+                .collect()
+        }
+    }
+
+    /// V1: the owner's 24 GB file. The window is there before any byte — its frame, its offsets,
+    /// its rows as pending — and the first screen costs one 64 KiB block; then nothing more is
+    /// sent, the `Origin`'s connection is never used and nothing is created in the cache.
+    #[test]
+    fn v1_the_first_screen_of_a_24_gb_file_costs_one_block() {
+        let mut sx = sx(MODEL);
+        sx.frames(2);
+        assert_eq!(sx.sent(), 0, "the frame asks; the engine sends");
+        for row in 0..3 {
+            let off = sx.offset(row * ROW);
+            assert!(sx.shows(&off), "row {row}'s offset is drawn");
+        }
+        assert!(sx.shows(&pending_row()), "the rows show as pending");
+        // The second row (the cursor is in the first): every cell in the skin's dim colour.
+        let rows = sx.drv.galleys();
+        let row: Vec<_> = rows
+            .iter()
+            .filter(|(_, g)| g.text() == pending_row())
+            .collect();
+        assert!(row.len() >= 2, "{} pending rows", row.len());
+        let cells: Vec<_> = row[1]
+            .1
+            .job
+            .sections
+            .iter()
+            .step_by(2)
+            .map(|s| s.format.color)
+            .collect();
+        assert_eq!(cells, vec![cga::CYAN; 16], "pending cells are dim");
+        assert_eq!(sx.status(), "loading 0x0");
+        assert!(!sx.win.ready(), "not shot before the screen's bytes came");
+        sx.settle();
+        for row in 0..3 {
+            assert!(sx.shows(&pattern_row(row * ROW)), "row {row}'s bytes");
+        }
+        assert!(!sx.shows(&pending_row()));
+        assert_eq!(sx.status(), "");
+        assert!(sx.win.ready());
+        let fetched = sx.source.fetched();
+        assert_eq!(fetched.total, BLOCK, "one 64 KiB block");
+        let sent = sx.sent();
+        // No input for 2 s and more: nothing more is sent.
+        for _ in 0..5 {
+            sx.run_for(Duration::from_secs(1));
+            sx.frames(2);
+            sx.engine.pump();
+        }
+        assert_eq!(sx.sent(), sent, "nothing more is sent");
+        assert_eq!(sx.fetched(), BLOCK);
+        assert_eq!(
+            sx.counts.calls.load(Ordering::SeqCst),
+            0,
+            "viewing used the Origin's connection"
+        );
+        assert_eq!(sx.counts.fetches.load(Ordering::SeqCst), 0, "a whole fetch");
+        let made = walk(sx.tmp.path());
+        assert!(made.is_empty(), "viewing wrote to disk: {made:?}");
+    }
+
+    /// `SOPEN_STATE` `loading=1` (06 §11): the window is ready to be shot at its first frame
+    /// with rows, those still loading as they are; without it, once they came.
+    #[test]
+    fn loading_1_shoots_the_rows_as_they_are() {
+        assert!(State::parse("loading=1").unwrap().loading);
+        assert!(!State::parse("at=1").unwrap().loading);
+        assert!(State::parse("loading=yes").is_err());
+        let hooks = Hooks {
+            state: State::parse("loading=1").unwrap(),
+            ..Hooks::default()
+        };
+        let mut sx = sx_with(FakeFile::pattern(MODEL), Link::gate(), NEVER, &hooks).unwrap();
+        sx.frames(2);
+        assert!(sx.shows(&pending_row()));
+        assert!(
+            sx.win.ready(),
+            "loading=1: shot with its rows still loading"
+        );
+        let mut plain = sx_with(
+            FakeFile::pattern(MODEL),
+            Link::gate(),
+            NEVER,
+            &Hooks::default(),
+        )
+        .unwrap();
+        plain.frames(2);
+        assert!(!plain.win.ready());
+        plain.settle();
+        assert!(plain.win.ready());
+    }
+
+    /// V2: PgDn held, the scroll bar dragged to the middle and back, PgUp held. No key waits
+    /// for a row, and what was fetched stays within what was shown plus the readahead of each
+    /// run and the margin and cap of each jump.
+    #[test]
+    fn v2_scrolling_a_24_gb_file_stays_bounded() {
+        let mut sx = sx(MODEL);
+        sx.settle();
+        let page = sx.win.visible * ROW;
+        for _ in 0..400 {
+            sx.key(Key::PageDown, Modifiers::NONE);
+            sx.turn();
+        }
+        assert_eq!(
+            sx.win.cursor.at,
+            400 * page,
+            "a key was lost to a loading row"
+        );
+        sx.settle();
+        assert!(sx.shows(&pattern_row(sx.win.top_row * ROW)), "after PgDn");
+        assert!(!sx.shows(&pending_row()));
+        let (top, middle) = (sx.bar(0.0), sx.bar(0.5));
+        let from = sx.bar(sx.win.top_row as f32 / (MODEL / ROW) as f32);
+        sx.drv.move_to(&mut sx.win, from);
+        sx.drv.press(&mut sx.win, PointerButton::Primary);
+        for k in 1..=8 {
+            let at = from + (middle - from) * (k as f32 / 8.0);
+            sx.drv.move_to(&mut sx.win, at);
+            sx.turn();
+        }
+        sx.settle();
+        assert!(
+            sx.win.top_row > MODEL / ROW / 3,
+            "the drag went to the middle"
+        );
+        assert!(
+            sx.shows(&pattern_row(sx.win.top_row * ROW)),
+            "in the middle"
+        );
+        for k in 1..=8 {
+            let at = middle + (top - middle) * (k as f32 / 8.0);
+            sx.drv.move_to(&mut sx.win, at);
+            sx.turn();
+        }
+        sx.drv.release(&mut sx.win, PointerButton::Primary);
+        sx.settle();
+        assert_eq!(sx.win.top_row, 0, "and back to the top");
+        assert!(sx.shows(&pattern_row(0)), "at the top");
+        sx.key(Key::End, command(false));
+        for _ in 0..150 {
+            sx.key(Key::PageUp, Modifiers::NONE);
+            sx.turn();
+        }
+        sx.settle();
+        assert_eq!(sx.win.cursor.at, MODEL - 1 - 150 * page);
+        assert!(sx.shows(&pattern_row(sx.win.top_row * ROW)), "after PgUp");
+        assert!(!sx.shows(&pending_row()));
+        let stats = sx.source.stats();
+        let bound = stats.delivered + stats.runs * MIB + stats.jumps * (128 * KIB + sx.cap());
+        assert!(
+            stats.fetched.total <= bound,
+            "fetched {} of {bound} allowed: {stats:?}",
+            stats.fetched.total
+        );
+        // The inequality cannot see a viewer that reads more than it shows (what it reads
+        // counts as delivered), so the script's own cost is bounded too: the 550 screens it
+        // showed, and the readahead of the one run down.
+        let shown = 552 * page;
+        assert!(
+            stats.delivered <= 2 * shown + 64 * KIB,
+            "read {} to show {shown}",
+            stats.delivered
+        );
+        assert!(
+            stats.fetched.total <= 3 * MIB,
+            "fetched {}",
+            stats.fetched.total
+        );
+        assert!(sx.win.doc.resident() <= PAGES * PAGE as usize);
+        assert_eq!(sx.counts.calls.load(Ordering::SeqCst), 0);
+        assert!(
+            walk(sx.tmp.path()).is_empty(),
+            "the cache directory changed"
+        );
+    }
+
+    /// V3: Cmd/Ctrl+G to 20 GiB. The place shows at once as loading, costs its block and its
+    /// margin, and what still arrives for the old place is within the cap.
+    #[test]
+    fn v3_a_far_jump_costs_its_block_and_its_margin() {
+        let mut sx = sx(MODEL);
+        sx.settle();
+        // Scrolling first: readahead is running when the jump comes.
+        for _ in 0..40 {
+            sx.key(Key::PageDown, Modifiers::NONE);
+            sx.turn();
+        }
+        let (sent, cap) = (sx.sent(), sx.cap());
+        sx.goto(FAR);
+        assert_eq!(sx.win.cursor.at, FAR);
+        // What was out for the old place when the jump came still arrives: at most the cap.
+        // (A fence and a poll pair are status replies, which the cap never holds back.)
+        let out = sx.in_flight();
+        assert!(out <= cap + 3 * STAT_REPLY, "{out} out, cap {cap}");
+        let off = sx.offset(FAR);
+        assert!(sx.shows(&off), "the place is on screen before its bytes");
+        assert!(sx.shows(&pending_row()));
+        // The cursor's row came on screen at the bottom: the rows above it load too.
+        let top = sx.win.top_row * ROW;
+        assert!(top < FAR && FAR - top < 64 * ROW);
+        assert_eq!(sx.status(), format!("loading 0x{top:X}"));
+        sx.settle();
+        assert!(sx.shows(&pattern_row(FAR)), "the bytes at 20 GiB");
+        assert_eq!(sx.status(), format!("at 0x{FAR:X} ({FAR})"));
+        // Everything sent since the jump is the new place's: its block and the one before it
+        // (its margin, and the rows above the cursor) — 128 KiB.
+        let asked = sx.blocks_read(sent);
+        assert_eq!(asked, [FAR / BLOCK - 1, FAR / BLOCK], "{asked:?}");
+        // From a quiet link the bound is exact: the block, and at a block's start the one
+        // before it for the margin.
+        let before = sx.fetched();
+        sx.goto(3 * FAR / 5 + 0x8000);
+        sx.settle();
+        assert_eq!(sx.fetched() - before, BLOCK, "the block alone");
+        let before = sx.fetched();
+        sx.goto(2 * FAR / 5);
+        sx.settle();
+        assert_eq!(sx.fetched() - before, 2 * BLOCK, "the block and its margin");
+    }
+
+    /// 06 §7.1: a page that has not arrived is Pending, not empty. The rows whose bytes are here
+    /// stay as they are beside the pending ones, the frame and the offsets are drawn, and every
+    /// key still moves — with the link stalled the whole time.
+    #[test]
+    fn pending_rows_never_blank_the_screen_or_drop_a_key() {
+        let mut sx = sx(MODEL);
+        sx.settle();
+        // The last rows of block 0, from the cache: nothing is sent for them.
+        sx.goto(BLOCK - PAGE);
+        sx.frames(2);
+        let sent = sx.sent();
+        assert!(sx.shows(&pattern_row(BLOCK - PAGE)), "block 0 is cached");
+        // Down until the screen straddles into block 1, which is not here. The link is stalled:
+        // the engine is never stepped from here on.
+        let rows = sx.win.visible;
+        for _ in 0..rows + PAGE / ROW - 8 {
+            sx.key(Key::ArrowDown, Modifiers::NONE);
+        }
+        assert!(sx.win.top_row * ROW < BLOCK && (sx.win.top_row + rows) * ROW > BLOCK);
+        let top = sx.win.top_row * ROW;
+        assert!(sx.shows(&pattern_row(top)), "a row that is here stays");
+        assert!(sx.shows(&pattern_row(BLOCK - ROW)), "up to the last one");
+        let (first, second) = (sx.offset(BLOCK), sx.offset(BLOCK + ROW));
+        assert!(
+            sx.shows(&first) && sx.shows(&second),
+            "offsets of rows on their way"
+        );
+        assert!(sx.shows(&pending_row()), "which show as pending");
+        assert!(sx.shows("File Edit"), "the frame");
+        assert_eq!(sx.status(), format!("loading 0x{BLOCK:X}"));
+        assert_eq!(sx.sent(), sent, "the link is stalled");
+        // Keys: the cursor moves through rows that are not here, and far away.
+        let at = sx.win.cursor.at;
+        sx.key(Key::ArrowDown, Modifiers::NONE);
+        sx.key(Key::ArrowRight, Modifiers::NONE);
+        assert_eq!(sx.win.cursor.at, at + ROW + 1);
+        sx.key(Key::PageDown, Modifiers::NONE);
+        assert_eq!(sx.win.cursor.at, at + ROW + 1 + rows * ROW);
+        sx.key(Key::End, command(false));
+        assert_eq!(sx.win.cursor.at, MODEL - 1);
+        let last = sx.offset((MODEL - 1) / ROW * ROW);
+        assert!(sx.shows(&last), "the end of the file, loading");
+        sx.goto(FAR);
+        assert_eq!(sx.win.cursor.at, FAR);
+        // Back at the top: its rows were kept, and show without the link.
+        sx.key(Key::Home, command(false));
+        assert_eq!(sx.win.cursor.at, 0);
+        assert!(
+            sx.shows(&pattern_row(0)),
+            "rows read before are still shown"
+        );
+        assert!(!sx.shows(&pending_row()));
+        // The link comes back: the place asked for last fills in.
+        sx.goto(FAR);
+        sx.settle();
+        assert!(sx.shows(&pattern_row(FAR)));
+    }
+
+    /// A demand pending over 1 s names its size, over 10 s the status row says the remote is
+    /// slow (06 §5) — and the rows are still the pending ones.
+    #[test]
+    fn a_slow_demand_says_so_on_the_status_row() {
+        let link = Link {
+            latency: Duration::from_secs(12),
+            ..Link::gate()
+        };
+        let mut sx = sx_with(FakeFile::pattern(MODEL), link, NEVER, &Hooks::default()).unwrap();
+        sx.frames(2);
+        sx.engine.pump();
+        assert_eq!(sx.status(), "loading 0x0");
+        sx.run_for(Duration::from_millis(1500));
+        sx.frames(1);
+        assert_eq!(sx.status(), "loading 0x0 (64 KiB)");
+        sx.run_for(Duration::from_secs(9));
+        sx.frames(1);
+        assert_eq!(sx.status(), "the remote is slow");
+        assert!(sx.shows(&pending_row()));
+        sx.settle();
+        assert!(sx.shows(&pattern_row(0)));
+        assert_eq!(sx.status(), "");
+    }
+
+    /// A read that failed is the status row's text, not an empty page: the rows read before
+    /// stay, and the next key retries (06 §7.1, §5).
+    #[test]
+    fn a_failed_read_is_said_and_retried() {
+        let mut sx = sx(MODEL);
+        sx.settle();
+        sx.control.fault(sx.sent(), Fault::Lost);
+        sx.goto(FAR);
+        sx.settle();
+        let Flow::Failed(reason) = sx.source.state() else {
+            panic!("{:?}", sx.source.state())
+        };
+        let status = sx.status_now();
+        assert_eq!(
+            (status.text.as_str(), status.error),
+            (reason.as_str(), true)
+        );
+        let off = sx.offset(FAR);
+        assert!(sx.shows(&off), "the screen stays where it is");
+        assert_eq!(sx.win.doc.cell(FAR), Cell::Unreadable);
+        // What was read before still shows.
+        sx.key(Key::Home, command(false));
+        assert!(sx.shows(&pattern_row(0)));
+        // A second later a key retries: the connection is back, and the rows come.
+        let mut idle = sx.control.open().unwrap();
+        assert!(idle.next(Some(Duration::from_millis(1100))).is_none());
+        sx.goto(FAR);
+        sx.settle();
+        assert_eq!(sx.source.state(), Flow::Live);
+        assert!(sx.shows(&pattern_row(FAR)), "not held as an empty page");
+        assert!(!sx.status_now().error);
+    }
+
+    /// V11: a key on a byte whose page is Pending changes nothing and says so; once the bytes
+    /// are here the same keys land.
+    #[test]
+    fn v11_a_key_on_a_pending_byte_changes_nothing() {
+        let mut sx = sx(MODEL);
+        sx.settle();
+        sx.goto(FAR);
+        let cursor = sx.win.cursor;
+        sx.typed("A");
+        assert!(
+            sx.win.doc.patches().is_empty(),
+            "typed over a byte not here"
+        );
+        assert_eq!(sx.win.cursor, cursor, "the cursor did not move on");
+        assert_eq!(sx.win.doc.undo_len(), 0);
+        let status = sx.status_now();
+        assert_eq!(status.text, format!("0x{FAR:X} is still loading"));
+        assert!(!sx.win.doc.dirty());
+        sx.settle();
+        sx.typed("A");
+        sx.typed("B");
+        assert_eq!(sx.win.doc.byte(FAR), Some(0xAB));
+        assert_eq!(sx.win.cursor.at, FAR + 1);
+        assert!(sx.win.doc.dirty());
+        assert_eq!(
+            sx.status(),
+            format!("at 0x{FAR:X} ({FAR})"),
+            "said no longer"
+        );
+    }
+
+    /// The bytes of a document over a stream, each set once its page is here.
+    fn set_when_here(sx: &mut Sx, doc: &mut HexDoc, at: u64, value: u8) {
+        for _ in 0..100_000 {
+            doc.view(at, 1, Ask::Read);
+            if doc.set(at, value, Cursor::default()) {
+                return;
+            }
+            sx.turn();
+        }
+        panic!("the byte at {at} never came");
+    }
+
+    /// V11: `changed`, `changed_count`, `dirty` and `unsaved` with 1 000 patches send no
+    /// request and ask the stream for nothing — each patch holds the byte it replaced.
+    #[test]
+    fn v11_a_thousand_patches_are_compared_without_a_request() {
+        let mut sx = sx_with(
+            FakeFile::pattern(MODEL),
+            Link::gate(),
+            Duration::from_secs(2),
+            &Hooks::default(),
+        )
+        .unwrap();
+        let file = sx.win.file.clone();
+        let mut doc = HexDoc::of(&file.lock().unwrap());
+        // Far more pages than the page cache holds: most are dropped again.
+        let place = |i: u64| i * 3 * PAGE + 5;
+        for i in 0..1000 {
+            let at = place(i);
+            let was = pattern(at, 1)[0];
+            set_when_here(&mut sx, &mut doc, at, !was);
+        }
+        for _ in 0..1_000 {
+            sx.engine.pump();
+            if sx.out() == 0 {
+                break;
+            }
+            sx.engine.step(None);
+        }
+        let (sent, asks) = (sx.sent(), doc.asks());
+        assert!(doc.dirty() && doc.unsaved());
+        assert_eq!(doc.changed_count(), 1000);
+        for i in 0..1000 {
+            assert!(doc.changed(place(i)));
+        }
+        doc.mark_copied(doc.patches().clone());
+        assert!(doc.dirty() && !doc.unsaved());
+        for _ in 0..1000 {
+            doc.undo();
+        }
+        assert!(!doc.dirty() && !doc.unsaved());
+        assert_eq!(doc.changed_count(), 0);
+        for i in 0..1000 {
+            assert!(!doc.changed(place(i)));
+        }
+        sx.engine.pump();
+        assert_eq!(doc.asks(), asks, "the stream was asked for a patch's byte");
+        assert_eq!(sx.sent(), sent, "a request was sent");
+        // And where the file can no longer be read at all, the answers are the same: the
+        // remote changes, and the stream reads no more.
+        sx.control.change(Change::Truncate(MODEL - 1));
+        sx.run_for(Duration::from_secs(5));
+        assert_eq!(sx.source.state(), Flow::Changed);
+        doc.redo();
+        assert!(doc.dirty());
+        assert_eq!(doc.changed_count(), 1);
+        doc.undo();
+        assert!(!doc.dirty() && !doc.unsaved());
+        assert_eq!(
+            doc.changed_count(),
+            0,
+            "an unreadable byte counted as changed"
+        );
+    }
+
+    /// A patch keeps the byte it replaced (06 §7.1): the edit, its undo and what counts as
+    /// changed never need the file again — here it is gone from the page cache and the stream
+    /// has failed.
+    #[test]
+    fn a_patch_keeps_the_byte_it_replaced() {
+        let mut sx = sx(MODEL);
+        sx.settle();
+        let was = pattern(0x21, 1)[0];
+        sx.goto(0x21);
+        sx.typed("F");
+        sx.typed("F");
+        assert_eq!(sx.win.doc.byte(0x21), Some(0xFF));
+        // Typed back by hand in the ASCII column of another byte: an entry equal to the file.
+        sx.goto(0x30);
+        let same = pattern(0x30, 1)[0];
+        assert!(sx.win.doc.set(0x30, same ^ 1, Cursor::default()));
+        assert!(sx.win.doc.set(0x30, same, Cursor::default()));
+        // Far away, through more pages than are held; then the connection is lost for good.
+        for i in 1..=(PAGES as u64 + 4) {
+            sx.goto(FAR + i * PAGE);
+            sx.settle();
+        }
+        sx.control.fault(sx.sent(), Fault::Lost);
+        sx.goto(2 * FAR / 5);
+        sx.settle();
+        assert!(matches!(sx.source.state(), Flow::Failed(_)));
+        let asks = sx.win.doc.asks();
+        assert!(sx.win.doc.changed(0x21));
+        assert!(!sx.win.doc.changed(0x30), "typed back: no change");
+        assert_eq!(sx.win.doc.changed_count(), 1);
+        assert!(sx.win.doc.dirty());
+        assert_eq!(sx.win.doc.asks(), asks, "the file was read for a patch");
+        // Undo puts the kept byte back.
+        while sx.win.doc.can_undo() {
+            sx.win.doc.undo();
+        }
+        assert_eq!(sx.win.doc.byte(0x21), Some(was));
+        assert!(!sx.win.doc.changed(0x21));
+        assert_eq!(sx.win.doc.changed_count(), 0);
+        assert!(!sx.win.doc.dirty() && !sx.win.doc.unsaved());
+        assert!(
+            sx.win.close_requested(),
+            "nothing unsaved: closes without asking"
+        );
+    }
+
+    /// V11: a `SOPEN_STATE` patch waits for its bytes, in order, each an undo step; the window
+    /// is not ready — and `close=ask` does not ask — before they landed.
+    #[test]
+    fn v11_a_state_patch_lands_once_its_bytes_arrive() {
+        let hooks = Hooks {
+            state: State::parse(&format!(
+                "at=0x{FAR:X};patch=0x{FAR:X}:DEAD,0x10:7f;close=ask"
+            ))
+            .unwrap(),
+            ..Hooks::default()
+        };
+        let mut sx = sx_with(FakeFile::pattern(MODEL), Link::gate(), NEVER, &hooks).unwrap();
+        assert_eq!(sx.win.cursor.at, FAR);
+        sx.frames(3);
+        assert!(
+            sx.win.doc.patches().is_empty(),
+            "patched before its bytes came"
+        );
+        assert!(!sx.win.ready() && !sx.win.prompt);
+        // Whenever it says it is ready, the screen has its rows.
+        for _ in 0..200 {
+            sx.frames(1);
+            assert!(
+                !sx.win.ready() || !sx.shows(&pending_row()),
+                "shot too early"
+            );
+            sx.turn();
+        }
+        sx.settle();
+        assert_eq!(sx.win.doc.byte(FAR), Some(0xDE));
+        assert_eq!(sx.win.doc.byte(FAR + 1), Some(0xAD));
+        assert_eq!(sx.win.doc.byte(0x10), Some(0x7F));
+        assert_eq!(sx.win.doc.undo_len(), 3, "each byte an undo step");
+        assert_eq!(sx.win.doc.changed_count(), 3);
+        assert!(sx.win.ready());
+        assert!(sx.win.prompt, "close=ask asks once the patches are in");
+        // Ready means the screen too: the cursor's rows are there, with the patch in them.
+        let mut row: Vec<Option<u8>> = pattern(FAR, 16).into_iter().map(Some).collect();
+        (row[0], row[1]) = (Some(0xDE), Some(0xAD));
+        // (Drawn under the close prompt, which the kit's `find_text` does not look through.)
+        let drawn = sx.drv.galleys();
+        assert!(
+            drawn.iter().any(|(_, g)| g.text() == hex_cells(&row)),
+            "the patched row is drawn"
+        );
+        let line = sx.win.cursor_line();
+        assert!(
+            line.starts_with(&format!("0x{FAR:X} ({FAR}) · 0xDE 222")),
+            "{line}"
+        );
+        // A patch past the end is refused at once, as before.
+        let hooks = Hooks {
+            state: State::parse(&format!("patch=0x{:X}:0000", MODEL - 1)).unwrap(),
+            ..Hooks::default()
+        };
+        let err = sx_with(FakeFile::pattern(MODEL), Link::gate(), NEVER, &hooks)
+            .err()
+            .expect("past the end");
+        assert!(format!("{err:#}").contains("runs past the end"), "{err:#}");
+    }
+
+    /// 06 §7.1: a scroll-bar drag fetches only where the thumb rests — nothing for a place it
+    /// passes, the place once it has rested 100 ms, and at once when it is let go.
+    #[test]
+    fn a_scroll_bar_drag_fetches_only_where_the_thumb_rests() {
+        let mut sx = sx(MODEL);
+        sx.settle();
+        let sent = sx.sent();
+        let at = sx.bar(0.1);
+        sx.drv.move_to(&mut sx.win, at);
+        sx.drv.press(&mut sx.win, PointerButton::Primary);
+        sx.engine.pump();
+        let mut passed = vec![sx.win.top_row * ROW / BLOCK];
+        for k in 2..=6 {
+            let at = sx.bar(k as f32 / 10.0);
+            sx.drv.move_to(&mut sx.win, at);
+            sx.engine.pump();
+            assert_eq!(sx.sent(), sent, "a place the thumb passed was asked for");
+            passed.push(sx.win.top_row * ROW / BLOCK);
+        }
+        let rest = passed.pop().unwrap();
+        let off = sx.offset(sx.win.top_row * ROW);
+        assert!(sx.shows(&off), "the rows under the thumb are drawn");
+        assert!(sx.shows(&pending_row()), "as pending");
+        // Four passes (under 100 ms of the window's clock): still nothing.
+        for _ in 0..4 {
+            sx.frames(1);
+            sx.engine.pump();
+        }
+        assert_eq!(sx.sent(), sent, "asked before the thumb rested 100 ms");
+        sx.frames(4);
+        sx.engine.pump();
+        let asked = sx.blocks_read(sent);
+        assert_eq!(asked.first(), Some(&rest), "where it rests: {asked:?}");
+        assert!(asked.iter().all(|b| !passed.contains(b)), "{asked:?}");
+        sx.settle();
+        assert!(sx.shows(&pattern_row(sx.win.top_row * ROW)));
+        // Moved again and let go: asked at once.
+        let sent = sx.sent();
+        let at = sx.bar(0.8);
+        sx.drv.move_to(&mut sx.win, at);
+        sx.engine.pump();
+        assert_eq!(sx.sent(), sent);
+        sx.drv.release(&mut sx.win, PointerButton::Primary);
+        sx.frames(1);
+        sx.engine.pump();
+        let block = sx.win.top_row * ROW / BLOCK;
+        assert_eq!(sx.blocks_read(sent).first(), Some(&block));
+        sx.settle();
+        assert!(sx.shows(&pattern_row(sx.win.top_row * ROW)));
+    }
+
+    /// One reader, one read a frame: scrolling on with the wheel leaves the cursor behind, and
+    /// its byte — long gone from the page cache — is never asked for again. Every read of the
+    /// screen runs on from the one before: no jump.
+    #[test]
+    fn the_cursor_left_behind_is_not_read_again() {
+        let mut sx = sx(MODEL);
+        sx.settle();
+        let over = sx.win.layout.unwrap().rows.center();
+        for _ in 0..PAGES + 8 {
+            // 84 lines a turn: 252 rows, a little under a page.
+            sx.drv.wheel(&mut sx.win, over, -84.0);
+            sx.settle();
+        }
+        assert_eq!(sx.win.cursor.at, 0);
+        assert!(sx.win.top_row * ROW > PAGES as u64 * PAGE);
+        let asks = sx.win.doc.asks();
+        sx.frames(5);
+        assert!(sx.win.cursor_line().starts_with("0x0 (0)"));
+        assert_eq!(sx.win.doc.asks(), asks, "an idle frame read");
+        assert_eq!(sx.source.stats().jumps, 0, "{:?}", sx.source.stats());
+        // Typing there is a deliberate read of that place: the byte, then the edit.
+        sx.typed("F");
+        sx.settle();
+        sx.typed("F");
+        sx.typed("F");
+        assert_eq!(sx.win.doc.byte(0), Some(0xFF));
+    }
+
+    /// Cmd/Ctrl+R (06 §5): after the file changed on the remote the window says so, keeps its
+    /// rows, and a reload shows the new version at the same offset. With unsaved edits it is
+    /// refused: they were made over the old bytes.
+    #[test]
+    fn a_changed_file_is_said_and_reloaded() {
+        let mut sx = sx_with(
+            FakeFile::pattern(4 * MIB),
+            Link::gate(),
+            Duration::from_secs(2),
+            &Hooks::default(),
+        )
+        .unwrap();
+        sx.settle();
+        sx.goto(0x1000);
+        sx.settle();
+        sx.control.change(Change::Write {
+            off: 0x1000,
+            bytes: vec![0xEE; 16],
+            same_second: false,
+        });
+        sx.run_for(Duration::from_secs(5));
+        sx.frames(2);
+        assert_eq!(sx.source.state(), Flow::Changed);
+        let status = sx.status_now();
+        assert_eq!(
+            status.text,
+            "the file changed on the remote — Cmd/Ctrl+R reloads"
+        );
+        assert!(status.error);
+        assert!(sx.shows(&pattern_row(0x1000)), "the screen it had stays");
+        // An edit made over the old bytes: the reload is refused, the edit stays.
+        let other = format!("{:02X}", !pattern(0x1000, 1)[0]);
+        sx.typed(&other[..1]);
+        sx.typed(&other[1..]);
+        assert!(sx.win.doc.dirty());
+        sx.key(Key::R, command(false));
+        assert_eq!(sx.source.state(), Flow::Changed);
+        assert!(sx.status().starts_with("not reloaded"), "{}", sx.status());
+        sx.key(Key::Z, command(false));
+        assert!(!sx.win.doc.dirty());
+        assert!(
+            !cmd_r_is_left(&mut sx.win, &mut sx.drv),
+            "over a stream the key is the window's"
+        );
+        assert!(!sx.win.ready(), "not shot while it reloads");
+        // The reload waits on its own thread for the stream, which this test steps.
+        let started = Instant::now();
+        while sx.source.core().reloads_queued() == 0 {
+            assert!(
+                started.elapsed() < Duration::from_secs(60),
+                "no reload asked"
+            );
+            std::thread::yield_now();
+        }
+        let rev = sx.win.doc.rev();
+        sx.typed("F");
+        assert_eq!(sx.win.doc.rev(), rev, "edited while it reloads");
+        assert_eq!(sx.status(), "reloading…");
+        sx.settle();
+        let ctx = sx.drv.ctx.clone();
+        sx.drv.until(&mut sx.win, 60, |w| w.reloading.is_none());
+        sx.win.status_text(&ctx);
+        sx.settle();
+        assert_eq!(sx.source.state(), Flow::Live);
+        assert_eq!(sx.win.cursor.at, 0x1000, "the offset is kept");
+        let row: Vec<Option<u8>> = vec![Some(0xEE); 16];
+        assert!(sx.shows(&hex_cells(&row)), "the new version's bytes");
+        assert_eq!(sx.status(), "reloaded");
+        assert!(!sx.win.doc.can_undo(), "steps over the old bytes are gone");
+    }
+
+    /// The Source is opened before the window exists: its waker repaints the window from the
+    /// window's first pass on, so a row fills in without a key. And what no arrival wakes — the
+    /// status row's change after 1 s and 10 s — is asked for by the frame that shows it.
+    #[test]
+    fn a_block_that_arrives_repaints_the_window() {
+        let mut sx = sx(MODEL);
+        sx.frames(3);
+        // Asked of a context of its own, where nothing else asks for a repaint.
+        let later = |sx: &mut Sx| -> Vec<Duration> {
+            let ctx = egui::Context::default();
+            let asked = Arc::new(Mutex::new(Vec::new()));
+            let seen = asked.clone();
+            ctx.set_request_repaint_callback(move |info| seen.lock().unwrap().push(info.delay));
+            sx.win.status_text(&ctx);
+            let asked = asked.lock().unwrap().clone();
+            asked
+        };
+        let waits = later(&mut sx);
+        assert!(
+            matches!(waits[..], [d] if d > Duration::from_millis(900) && d <= Duration::from_millis(1010)),
+            "painted again when `loading 0x…` gains its size: {waits:?}"
+        );
+        // What the stream wakes repaints a window once one is bound to it — and this window
+        // bound itself on its first pass.
+        let (lone, ctx) = (Repaint::default(), egui::Context::default());
+        let asked = Arc::new(Mutex::new(Vec::new()));
+        let seen = asked.clone();
+        ctx.set_request_repaint_callback(move |info| seen.lock().unwrap().push(info.delay));
+        (lone.waker())();
+        assert_eq!(
+            *asked.lock().unwrap(),
+            [],
+            "no window yet: nothing to repaint"
+        );
+        lone.bind(&ctx);
+        (lone.waker())();
+        assert_eq!(
+            *asked.lock().unwrap(),
+            [Duration::ZERO],
+            "a repaint at once"
+        );
+        assert!(sx.repaint.bound_to(&sx.drv.ctx), "the window's own context");
+        // The read's reply, then its fence: the block is shown only after that, and that is
+        // when the stream wakes the window. No frame runs here.
+        let wakes = |sx: &Sx| sx.wakes.load(Ordering::SeqCst);
+        assert_eq!(wakes(&sx), 0);
+        sx.engine.pump();
+        sx.one();
+        assert_eq!(wakes(&sx), 0, "woken before the block was validated");
+        sx.one();
+        assert_eq!(
+            wakes(&sx),
+            1,
+            "the block arrived and the window was not woken"
+        );
+        sx.frames(1);
+        assert!(sx.shows(&pattern_row(0)));
+        // A slow place: after a second the line names its size, and the next change is at 10 s.
+        sx.control.set_link(|l| l.latency = Duration::from_secs(12));
+        sx.goto(FAR);
+        sx.engine.pump();
+        sx.run_for(Duration::from_millis(1500));
+        let waits = later(&mut sx);
+        assert!(
+            matches!(waits[..], [d] if d > Duration::from_secs(8) && d < Duration::from_secs(9)),
+            "painted again when the remote is slow: {waits:?}"
+        );
+        sx.run_for(Duration::from_secs(9));
+        assert_eq!(later(&mut sx), [], "nothing more to wait for");
+    }
+
+    /// The stats lines' events (06 §11): `first` at the first frame that draws bytes from the
+    /// stream — not one with pending rows only — then `input` with its place at a jump and
+    /// `ready` at the first frame showing that place's bytes.
+    #[test]
+    fn the_window_marks_first_input_and_ready() {
+        let mut sx = sx(MODEL);
+        sx.frames(3);
+        assert_eq!(sx.events(), ["open"], "pending rows are not content");
+        sx.settle();
+        assert_eq!(sx.events(), ["open", "first"]);
+        sx.frames(5);
+        assert_eq!(sx.events(), ["open", "first"], "once");
+        sx.goto(FAR);
+        sx.frames(2);
+        let input = format!("input {FAR:#x}");
+        assert_eq!(sx.events(), ["open", "first", input.as_str()]);
+        sx.settle();
+        assert_eq!(sx.events(), ["open", "first", input.as_str(), "ready"]);
+        // A key that stays on the screen shown is not an input.
+        sx.key(Key::ArrowRight, Modifiers::NONE);
+        sx.settle();
+        assert_eq!(sx.events().len(), 4);
+        // Nor one that goes back to rows still held.
+        sx.key(Key::Home, command(false));
+        sx.settle();
+        assert_eq!(sx.events().len(), 4);
+        sx.goto(FAR / 2);
+        sx.settle();
+        let input = format!("input {:#x}", FAR / 2);
+        assert_eq!(sx.events()[4..], [input.as_str(), "ready"]);
+    }
+
+    // ---- the interim Save (06 §7.1, until 07's lands): on a real file, the engine running ----
+
+    /// The hex window on a Source over a real local file, the `Origin` on the same file.
+    struct Live {
+        tmp: tempfile::TempDir,
+        remote: PathBuf,
+        source: Source,
+        counts: Counts,
+        win: HexWindow,
+        drv: Driver,
+    }
+
+    /// `body` as a "remote" file, a stream open on it and the hex file over that stream.
+    fn live_file(body: &[u8]) -> (tempfile::TempDir, PathBuf, Source, Counts, HexFile) {
+        let tmp = tempfile::tempdir().unwrap();
+        let remote = tmp.path().join("remote/model.bin");
+        std::fs::create_dir_all(remote.parent().unwrap()).unwrap();
+        std::fs::write(&remote, body).unwrap();
+        let abs = remote.to_str().unwrap().to_string();
+        let transport = Box::new(LocalFs::new()).into_ranged(&abs).unwrap();
+        let again = abs.clone();
+        let repaint = Repaint::default();
+        let source = Source::open(
+            transport,
+            Box::new(move || {
+                Box::new(LocalFs::new())
+                    .into_ranged(&again)
+                    .map_err(|refused| refused.error)
+            }),
+            repaint.waker(),
+        )
+        .unwrap();
+        let counts = Counts::default();
+        let at = LocalFs::new().stat(&abs).unwrap();
+        let origin = Origin::new(
+            Box::new(Counting(LocalFs::new(), counts.clone())),
+            None,
+            Some("host".into()),
+            abs,
+            at,
+        );
+        let cache = tmp.path().join("cache");
+        let file = HexFile::streamed(origin, source.clone(), repaint, &cache);
+        (tmp, remote, source, counts, file)
+    }
+
+    fn live(body: &[u8]) -> Live {
+        let (tmp, remote, source, counts, file) = live_file(body);
+        let win = embedded(
+            file,
+            &Hooks::default(),
+            Vec::new(),
+            Arc::default(),
+            Arc::default(),
+        )
+        .unwrap();
+        let mut live = Live {
+            tmp,
+            remote,
+            source,
+            counts,
+            win,
+            drv: Driver::new(760.0, 560.0),
+        };
+        live.drv.until(&mut live.win, 60, |w| w.ready());
+        live
+    }
+
+    impl Live {
+        fn typed(&mut self, text: &str) {
+            for c in text.chars() {
+                self.drv.frame(
+                    &mut self.win,
+                    vec![Event::Text(c.to_string())],
+                    Modifiers::NONE,
+                );
+            }
+            self.drv.idle(&mut self.win, 1);
+        }
+
+        fn save(&mut self) {
+            self.drv.key(&mut self.win, Key::S, command(false));
+            self.drv.until(&mut self.win, 60, |w| w.job.is_none());
+            self.drv.until(&mut self.win, 60, |w| w.ready());
+        }
+
+        fn fetches(&self) -> usize {
+            self.counts.fetches.load(Ordering::SeqCst)
+        }
+
+        fn backups(&self) -> Vec<PathBuf> {
+            walk(&self.tmp.path().join("cache/.backup"))
+        }
+    }
+
+    fn body() -> Vec<u8> {
+        (0..200_000u32).map(|i| (i % 251) as u8).collect()
+    }
+
+    /// Save of a streamed file: only now is the whole file fetched, once, into the cache; the
+    /// Save runs on that copy (backup, conflict-checked overwrite); the Source is reloaded onto
+    /// the saved file and stays `Live`; a second Save fetches nothing more.
+    #[test]
+    fn the_interim_save_fetches_once_saves_and_reloads() {
+        let body = body();
+        let mut fx = live(&body);
+        assert_eq!(fx.counts.calls.load(Ordering::SeqCst), 0, "viewing");
+        assert!(walk(&fx.tmp.path().join("cache")).is_empty(), "viewing");
+        fx.typed("AB");
+        assert_eq!(fx.fetches(), 0, "an edit fetches nothing");
+        fx.save();
+        assert!(
+            fx.win.status.text.starts_with("saved "),
+            "{}",
+            fx.win.status.text
+        );
+        assert_eq!(fx.fetches(), 1, "the one whole fetch");
+        let mut want = body.clone();
+        want[0] = 0xAB;
+        assert_eq!(std::fs::read(&fx.remote).unwrap(), want);
+        let backups = fx.backups();
+        assert_eq!(backups.len(), 1, "{backups:?}");
+        assert_eq!(std::fs::read(&backups[0]).unwrap(), body);
+        // The view is the saved file's, and nothing counts as changed against it.
+        assert_eq!(fx.source.state(), Flow::Live);
+        fx.drv.until(&mut fx.win, 60, |w| w.ready());
+        assert_eq!(
+            fx.win.doc.original(0),
+            Some(0xAB),
+            "read from the saved file"
+        );
+        assert_eq!(fx.win.doc.byte(0), Some(0xAB));
+        assert!(!fx.win.doc.dirty() && !fx.win.doc.unsaved());
+        assert!(fx.win.close_requested());
+        // A second Save: no second fetch, and both edits are in the file.
+        fx.drv.key(&mut fx.win, Key::ArrowRight, Modifiers::NONE);
+        fx.typed("CD");
+        assert!(fx.win.doc.dirty());
+        fx.save();
+        assert_eq!(fx.fetches(), 1, "fetched again");
+        want[2] = 0xCD;
+        assert_eq!(std::fs::read(&fx.remote).unwrap(), want);
+        assert_eq!(fx.backups().len(), 1, "one backup a session");
+        assert_eq!(fx.source.state(), Flow::Live);
+        assert!(!fx.win.doc.dirty());
+    }
+
+    /// The whole fetch must be the file the stream opened (06 §7.1): another size, or another
+    /// mtime, is refused as a change — nothing written, the edits listed. Each alone is enough.
+    #[test]
+    fn the_interim_save_refuses_a_file_that_changed_since_it_was_opened() {
+        let body = body();
+        let mut longer = body.clone();
+        longer.extend_from_slice(b"appended by someone else");
+        let mut rewritten = body.clone();
+        rewritten[100] ^= 0xff;
+        let later = Duration::from_secs(5);
+        for (other, moved, why) in [
+            (longer, Duration::ZERO, "bytes then,"),
+            (rewritten, later, "its modification time changed"),
+        ] {
+            let mut fx = live(&body);
+            fx.typed("AB");
+            let opened = std::fs::metadata(&fx.remote).unwrap().modified().unwrap();
+            std::fs::write(&fx.remote, &other).unwrap();
+            let file = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&fx.remote)
+                .unwrap();
+            file.set_modified(opened + moved).unwrap();
+            drop(file);
+            fx.drv.key(&mut fx.win, Key::S, command(false));
+            fx.drv.until(&mut fx.win, 60, |w| w.job.is_none());
+            fx.drv.idle(&mut fx.win, 2);
+            assert_eq!(fx.win.status.text, "not saved: the file changed", "{why}");
+            assert!(
+                std::fs::read(&fx.remote).unwrap() == other,
+                "{why}: written over"
+            );
+            assert!(fx.backups().is_empty(), "{why}");
+            let notice = fx.win.notices.join("\n");
+            assert!(
+                notice.contains("changed since it was opened") && notice.contains(why),
+                "{why}: {notice}"
+            );
+            let lists: Vec<PathBuf> = walk(fx.tmp.path())
+                .into_iter()
+                .filter(|p| p.to_string_lossy().contains(".hexpatch-"))
+                .collect();
+            assert_eq!(lists.len(), 1, "{why}: {lists:?}");
+            let list = std::fs::read_to_string(&lists[0]).unwrap();
+            assert!(list.ends_with("0x0: AB\n"), "{why}: {list}");
+            assert!(fx.win.doc.dirty(), "{why}: the edit stays in the window");
+        }
+    }
+
+    /// The whole fetch says its progress on the status row and Esc stops it: nothing is
+    /// written and the edit stays. Closing during it stops it too, and then asks.
+    #[test]
+    fn the_interim_fetch_is_stopped_by_esc_and_by_closing() {
+        let body = body();
+        let mut fx = live(&body);
+        fx.typed("AB");
+        fx.counts.hold.store(true, Ordering::SeqCst);
+        fx.drv.key(&mut fx.win, Key::S, command(false));
+        fx.drv.until(&mut fx.win, 60, |w| {
+            w.fetching.active.load(Ordering::SeqCst)
+        });
+        fx.drv.idle(&mut fx.win, 1);
+        let status = fx.win.status_text(&fx.drv.ctx.clone()).text;
+        assert!(
+            status.starts_with("fetching the file to save it") && status.ends_with("Esc stops"),
+            "{status}"
+        );
+        fx.drv.key(&mut fx.win, Key::Escape, Modifiers::NONE);
+        fx.drv.until(&mut fx.win, 60, |w| w.job.is_none());
+        fx.drv.idle(&mut fx.win, 1);
+        assert_eq!(fx.win.status.text, "stopped: nothing was written");
+        assert_eq!(std::fs::read(&fx.remote).unwrap(), body);
+        assert!(fx.win.doc.dirty() && fx.backups().is_empty());
+        // Closing while it fetches: it is stopped, not waited for, and the edit is asked about.
+        fx.drv.key(&mut fx.win, Key::S, command(false));
+        fx.drv.until(&mut fx.win, 60, |w| {
+            w.fetching.active.load(Ordering::SeqCst)
+        });
+        assert!(!fx.win.close_requested(), "closed with an edit unsaved");
+        fx.drv.until(&mut fx.win, 60, |w| w.job.is_none());
+        fx.drv.idle(&mut fx.win, 1);
+        assert!(fx.win.prompt, "the unsaved edit is asked about");
+        assert_eq!(std::fs::read(&fx.remote).unwrap(), body);
+        assert_eq!(fx.fetches(), 2);
+    }
+
+    /// Save copy of a streamed file runs on the same one fetch and writes a new sibling.
+    #[test]
+    fn the_interim_save_copy_writes_a_sibling() {
+        let body = body();
+        let mut fx = live(&body);
+        fx.typed("AB");
+        fx.drv.key(&mut fx.win, Key::S, command(true));
+        fx.drv.until(&mut fx.win, 60, |w| w.job.is_none());
+        fx.drv.idle(&mut fx.win, 2);
+        let copy = fx.remote.with_file_name("model.edited.bin");
+        let mut want = body.clone();
+        want[0] = 0xAB;
+        assert_eq!(std::fs::read(&copy).unwrap(), want);
+        assert_eq!(std::fs::read(&fx.remote).unwrap(), body, "the original");
+        assert_eq!(fx.fetches(), 1);
+        assert_eq!(fx.source.state(), Flow::Live);
+        assert!(fx.win.doc.dirty() && !fx.win.doc.unsaved());
+    }
+
+    /// After Cmd/Ctrl+R the file read is another version: the next Save fetches that one and
+    /// backs it up first — the backup of the version before does not stand in for it.
+    #[test]
+    fn a_save_after_a_reload_backs_up_the_reloaded_version() {
+        let body = body();
+        let mut fx = live(&body);
+        fx.typed("AB");
+        fx.save();
+        assert_eq!((fx.fetches(), fx.backups().len()), (1, 1));
+        // Someone else rewrites the file; the owner reloads.
+        let mut other: Vec<u8> = body.iter().map(|b| b ^ 0x55).collect();
+        other.extend_from_slice(b"and more");
+        std::fs::write(&fx.remote, &other).unwrap();
+        fx.drv.key(&mut fx.win, Key::R, command(false));
+        fx.drv
+            .until(&mut fx.win, 60, |w| w.reloading.is_none() && w.ready());
+        assert_eq!(fx.win.status.text, "reloaded");
+        assert_eq!(
+            fx.win.doc.size(),
+            other.len() as u64,
+            "the new version's size"
+        );
+        assert_eq!(fx.win.doc.byte(1), Some(other[1]));
+        assert!(!fx.win.doc.dirty() && fx.win.doc.patches().is_empty());
+        // An edit over the reloaded version, saved.
+        assert_eq!(fx.win.cursor.at, 1);
+        fx.typed("CD");
+        fx.save();
+        assert!(
+            fx.win.status.text.starts_with("saved "),
+            "{} {:?}",
+            fx.win.status.text,
+            fx.win.notices
+        );
+        assert_eq!(
+            fx.fetches(),
+            2,
+            "the reloaded version was fetched for the Save"
+        );
+        // (The cursor moved on to byte 1 when the first edit was typed.)
+        let mut want = other.clone();
+        want[1] = 0xCD;
+        assert!(
+            std::fs::read(&fx.remote).unwrap() == want,
+            "the saved bytes"
+        );
+        let backups: Vec<Vec<u8>> = fx
+            .backups()
+            .iter()
+            .map(|p| std::fs::read(p).unwrap())
+            .collect();
+        assert_eq!(backups.len(), 2, "no backup of the reloaded version");
+        assert!(backups.contains(&body) && backups.contains(&other));
+    }
+
+    /// `SOPEN_AUTOSAVE` over a stream, no window: a state patch far from the start reads its
+    /// page (and only that), then the interim Save fetches, backs up and writes.
+    #[test]
+    fn autosave_over_a_stream_patches_and_saves() {
+        let body = body();
+        let (tmp, remote, source, counts, file) = live_file(&body);
+        let hooks = Hooks {
+            state: State::parse("patch=0x20000:BEEF,3:00").unwrap(),
+            autosave: true,
+            ..Hooks::default()
+        };
+        let outcome = open(file, &hooks, Vec::new()).unwrap();
+        assert!(outcome.saved && outcome.refused.is_none());
+        let mut want = body.clone();
+        (want[0x20000], want[0x20001], want[3]) = (0xBE, 0xEF, 0x00);
+        assert_eq!(std::fs::read(&remote).unwrap(), want);
+        let backups = walk(&tmp.path().join("cache/.backup"));
+        assert_eq!(backups.len(), 1, "{backups:?}");
+        assert_eq!(std::fs::read(&backups[0]).unwrap(), body);
+        assert_eq!(counts.fetches.load(Ordering::SeqCst), 1);
+        // The patches read their own pages through the stream: two blocks, not the file.
+        let stats = source.stats();
+        assert!(stats.delivered >= 2 * PAGE, "{stats:?}");
+        // A patch past the end, and one with nothing to change: no save, nothing fetched.
+        let (_tmp, remote, _source, counts, file) = live_file(&body);
+        let same = format!("patch=0:{:02X}", body[0]);
+        let hooks = Hooks {
+            state: State::parse(&same).unwrap(),
+            autosave: true,
+            ..Hooks::default()
+        };
+        let outcome = open(file, &hooks, Vec::new()).unwrap();
+        assert!(!outcome.saved);
+        assert_eq!(counts.fetches.load(Ordering::SeqCst), 0, "nothing to save");
+        assert_eq!(std::fs::read(&remote).unwrap(), body);
+    }
+
+    /// Over OpenSSH's own `sftp-server` (06 §13), a session for the stream and one for the
+    /// `Origin`: the first rows come through SFTP reads, and the interim Save fetches, checks
+    /// the fetch against what the stream opened (both stats carry SFTP's whole seconds), backs
+    /// up, writes and reloads the stream onto the saved file.
+    #[test]
+    fn the_window_streams_and_saves_over_a_real_sftp_server() {
+        let (Some(view), Some(mut write)) =
+            (SftpRemote::local_server(), SftpRemote::local_server())
+        else {
+            return;
+        };
+        let body = body();
+        let tmp = tempfile::tempdir().unwrap();
+        let remote = tmp.path().join("remote/model.bin");
+        std::fs::create_dir_all(remote.parent().unwrap()).unwrap();
+        std::fs::write(&remote, &body).unwrap();
+        let abs = remote.to_str().unwrap().to_string();
+        let at = write.stat(&abs).unwrap();
+        let transport = Box::new(view)
+            .into_ranged(&abs)
+            .map_err(|refused| refused.error)
+            .unwrap();
+        let repaint = Repaint::default();
+        let source = Source::open(
+            transport,
+            Box::new(|| Err(anyhow!("this test has no second connection"))),
+            repaint.waker(),
+        )
+        .unwrap();
+        let origin = Origin::new(Box::new(write), None, Some("host".into()), abs, at);
+        let cache = tmp.path().join("cache");
+        let file = HexFile::streamed(origin, source.clone(), repaint, &cache);
+        let hooks = Hooks::default();
+        let mut win = embedded(file, &hooks, Vec::new(), Arc::default(), Arc::default()).unwrap();
+        let mut drv = Driver::new(760.0, 560.0);
+        drv.until(&mut win, 60, |w| w.ready());
+        let row: Vec<Option<u8>> = body[..16].iter().copied().map(Some).collect();
+        assert!(drv.find_text(&hex_cells(&row)).is_some(), "the first row");
+        assert_eq!(
+            source.fetched().total,
+            BLOCK,
+            "one block for the first screen"
+        );
+        assert!(walk(&cache).is_empty(), "viewing wrote to disk");
+        for c in ["A", "B"] {
+            drv.frame(&mut win, vec![Event::Text(c.into())], Modifiers::NONE);
+        }
+        drv.key(&mut win, Key::S, command(false));
+        drv.until(&mut win, 60, |w| w.job.is_none());
+        drv.until(&mut win, 60, |w| w.ready());
+        assert!(
+            win.status.text.starts_with("saved "),
+            "{} {:?}",
+            win.status.text,
+            win.notices
+        );
+        let mut want = body.clone();
+        want[0] = 0xAB;
+        assert!(std::fs::read(&remote).unwrap() == want, "the saved bytes");
+        let backups = walk(&cache.join(".backup"));
+        assert_eq!(backups.len(), 1, "{backups:?}");
+        assert!(std::fs::read(&backups[0]).unwrap() == body, "the backup");
+        assert_eq!(source.state(), Flow::Live, "sopen's own write is no change");
+        assert_eq!(win.doc.original(0), Some(0xAB), "read from the saved file");
+        assert!(!win.doc.dirty() && win.close_requested());
+    }
 }
