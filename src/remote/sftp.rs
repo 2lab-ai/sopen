@@ -9,6 +9,7 @@
 //! [`OutcomeUnknown`](super::OutcomeUnknown), never as "nothing written".
 
 mod ops;
+mod patch;
 mod ranged;
 mod writes;
 
@@ -729,6 +730,10 @@ impl RemoteFs for SftpRemote {
         changed(&format!("remove {path}"), got)
     }
 
+    fn patcher(&mut self) -> Option<&mut dyn super::patch::PatchFs> {
+        Some(self)
+    }
+
     fn into_ranged(self: Box<Self>, path: &str) -> std::result::Result<Box<dyn Ranged>, Refused> {
         let r = self.open_ranged(path, ranged::Timing::default())?;
         Ok(Box::new(r))
@@ -899,6 +904,10 @@ pub(crate) struct Proxy {
     pub marked: Arc<std::sync::Mutex<std::collections::HashMap<u32, Rule>>>,
     /// The session closed its end (the proxy's own).
     pub ended: Arc<std::sync::atomic::AtomicBool>,
+    /// File bytes that crossed the wire: the payloads of the `SSH_FXP_DATA` replies passed to
+    /// sopen, and of the `SSH_FXP_WRITE` requests passed to the server (07 §12's byte counts).
+    pub data: Arc<std::sync::atomic::AtomicU64>,
+    pub written: Arc<std::sync::atomic::AtomicU64>,
 }
 
 /// Sets its flag when dropped: the proxy's requests loop has ended.
@@ -947,6 +956,7 @@ impl Wired {
     pub const OPEN: u8 = 3;
     pub const CLOSE: u8 = 4;
     pub const READ: u8 = 5;
+    pub const WRITE: u8 = 6;
     pub const FSTAT: u8 = 8;
     pub const STAT: u8 = 17;
     pub const STATUS: u8 = 101;
@@ -1002,6 +1012,13 @@ impl Proxy {
                 kind: body[0],
                 read,
             });
+            // WRITE: type, id, handle (a string), offset, data (a string).
+            if body.first() == Some(&Wired::WRITE) {
+                let at = 9 + be32(&body[5..]) as usize;
+                let len = be32(&body[at + 8..]) as u64;
+                self.written
+                    .fetch_add(len, std::sync::atomic::Ordering::Relaxed);
+            }
             let rule = {
                 let mut rules = self.rules.lock().unwrap();
                 match read {
@@ -1070,6 +1087,11 @@ impl Proxy {
                     body.truncate(9 + clip);
                     body[5..9].copy_from_slice(&(clip as u32).to_be_bytes());
                 }
+            }
+            if body.first() == Some(&Wired::DATA) {
+                let len = be32(&body[5..]) as u64;
+                self.data
+                    .fetch_add(len, std::sync::atomic::Ordering::Relaxed);
             }
             if send_packet(&mut to, &body).await.is_none() {
                 return;

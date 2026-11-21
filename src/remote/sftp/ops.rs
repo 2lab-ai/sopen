@@ -1,6 +1,8 @@
 //! [`FileOps`] over SFTP (04 §5.6): a file renamed by `hardlink@openssh.com` then `REMOVE`
 //! (never `posix-rename@openssh.com`, which replaces), `MKDIR`, `RMDIR`, `Fs::symlink(target,
 //! link)`, `copy-data` in 8 MiB chunks into a temp created `CREAT|EXCL`, published by a hard link.
+//! The `copy-data` loop here is sopen's only one: a hex Save's server copy (07 §4.2 step 5,
+//! `sftp/patch.rs`) runs it too, paced by time instead of in fixed steps ([`Pace`]).
 //!
 //! Every call is one `block_on` of this session's runtime, never one inside another: a copy from
 //! another session reads its source (that session's `block_on`) between this one's writes.
@@ -13,6 +15,7 @@ use crate::remote::ops::{
     taken, FileMeta, FileOps, NoRename, Opened, Renamed, StageFailure, Staged, COPY_STEP,
     REMOTE_FOLDER_RENAME,
 };
+use crate::remote::patch::{CopyCtl, CopyEvent, Pace};
 use crate::remote::{split_parent, Cancelled, CreateError, Created, Hashing, RemoteFs};
 use anyhow::{anyhow, Context, Result};
 use bytes::BytesMut;
@@ -55,7 +58,7 @@ async fn open_source(sftp: &Sftp, path: &str) -> Result<(File, FileMeta)> {
 /// content; a server that refuses that leaves its default mode until the copy's own is set after
 /// the content. Opened for reading too: the library sends `fstat` (the size checked after the
 /// copy) only on a readable handle.
-async fn create_temp(sftp: &Sftp, temp: &str) -> std::result::Result<File, CreateError> {
+pub(super) async fn create_temp(sftp: &Sftp, temp: &str) -> std::result::Result<File, CreateError> {
     let opened = within(
         META_TIMEOUT,
         sftp.options()
@@ -182,34 +185,51 @@ async fn pump(
     Ok(out.finish().sha256)
 }
 
-/// The server's `copy-data`, [`COPY_STEP`] at a time. `Ok(false)`: the server refused the first
-/// step (it advertises the extension but will not run it) — nothing was copied.
-async fn copy_data(
+/// The server's `copy-data`, one request outstanding, each sized by `ctl.pace`: [`COPY_STEP`]s
+/// for a file copy (04 §5.1), requests of about a second for a hex Save (07 §4.2 step 5), which
+/// also sends `fsync@openssh.com` on `dst` whenever the pace says one is due (`fsync`: the server
+/// offers it) and counts its time in the rate. Every request has `limit` to be answered.
+/// `ctl.cancel` is asked before each request; `ctl.progress` hears of each one answered.
+/// `Ok(false)`: the server refused the first request (it advertises the extension but will not
+/// run it) — nothing was copied.
+pub(super) async fn copy_data(
     src: &mut File,
     dst: &mut File,
     size: u64,
     path: &str,
-    cancel: &AtomicBool,
-    progress: &mut dyn FnMut(u64),
+    limit: Duration,
+    fsync: bool,
+    ctl: &mut CopyCtl<'_>,
 ) -> Result<bool> {
     let mut done = 0u64;
     while done < size {
-        if cancel.load(Ordering::Relaxed) {
+        if (ctl.cancel)() {
             return Err(anyhow!(Cancelled));
         }
-        let n = (size - done).min(COPY_STEP);
+        let n = ctl.pace.next(size - done);
         let step = NonZeroU64::new(n).expect("a step of at least one byte");
-        match within(STALL_TIMEOUT, src.copy_to(dst, step)).await {
+        let began = (ctl.clock)();
+        match within(limit, src.copy_to(dst, step)).await {
             Ok(Ok(())) => {}
             Ok(Err(e)) if done == 0 && answered(&e) => {
-                crate::debug!("copy-data into {path} refused ({e}); copying through sopen");
+                crate::debug!("the server refused copy-data into {path} ({e})");
                 return Ok(false);
             }
             Ok(Err(e)) => return Err(anyhow!("cannot copy into {path}: {e}")),
-            Err(()) => return Err(timed_out(&format!("copy into {path}"), STALL_TIMEOUT)),
+            Err(()) => return Err(timed_out(&format!("copy into {path}"), limit)),
         }
+        ctl.pace.copied(n, (ctl.clock)().saturating_sub(began));
         done += n;
-        progress(done);
+        (ctl.progress)(CopyEvent::Copied(done));
+        if fsync && done < size && ctl.pace.sync_due() {
+            let began = (ctl.clock)();
+            within(STALL_TIMEOUT, dst.sync_all())
+                .await
+                .map_err(|()| timed_out(&format!("fsync {path}"), STALL_TIMEOUT))?
+                .map_err(|e| anyhow!("cannot fsync {path}: {e}"))?;
+            ctl.pace.synced((ctl.clock)().saturating_sub(began));
+            (ctl.progress)(CopyEvent::Synced(done));
+        }
     }
     Ok(true)
 }
@@ -518,11 +538,36 @@ impl FileOps for SftpRemote {
             let mut dst = create_temp(sftp, temp).await?;
             // From here `temp` is ours.
             let fill = async {
+                // A file copy keeps 04 §5.1's fixed steps, and no fsync until the content is in.
+                let started = std::time::Instant::now();
+                let mut ctl = CopyCtl {
+                    pace: Pace::steps(COPY_STEP),
+                    clock: &mut || started.elapsed(),
+                    cancel: &|| cancel.load(Ordering::Relaxed),
+                    progress: &mut |event| {
+                        if let CopyEvent::Copied(done) = event {
+                            progress(done)
+                        }
+                    },
+                };
+                let size = source.size;
                 let copied = sftp.support_copy()
-                    && copy_data(&mut src, &mut dst, source.size, temp, cancel, progress).await?;
+                    && copy_data(
+                        &mut src,
+                        &mut dst,
+                        size,
+                        temp,
+                        STALL_TIMEOUT,
+                        false,
+                        &mut ctl,
+                    )
+                    .await?;
                 let sha256 = if copied {
                     None
                 } else {
+                    if sftp.support_copy() {
+                        crate::debug!("copying into {temp} through sopen instead");
+                    }
                     Some(pump(&mut src, &mut dst, temp, cancel, progress).await?)
                 };
                 if cancel.load(Ordering::Relaxed) {

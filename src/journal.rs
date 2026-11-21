@@ -1342,6 +1342,21 @@ impl Journal {
         self.advance(Phase::Created { temp, created })
     }
 
+    /// Still phase `created`: the record takes the temp's stat again, once the Save has given
+    /// the temp its owner and mode and before it fills it. A Save cut off between this and its
+    /// first copy request then leaves a temp that still equals the record, and a reopen removes
+    /// it ([`reconcile`]); once the temp is being filled it no longer does, and it is kept.
+    pub fn save_ready(&mut self, ready: FileStat) -> Result<()> {
+        let temp = match self.save.as_ref().map(|s| &s.phase) {
+            Some(Phase::Created { temp, .. }) => temp.clone(),
+            _ => bail!("the temp is made ready in phase created"),
+        };
+        self.advance(Phase::Created {
+            temp,
+            created: ready,
+        })
+    }
+
     /// Phase `staged`: after the last write and fsync, with the temp's stat and the post-save
     /// evidence (of this journal's kind, for that stat).
     pub fn save_staged(&mut self, staged: FileStat, post: PostEvidence) -> Result<()> {
@@ -2069,7 +2084,10 @@ fn when(t: SystemTime) -> String {
 /// landed when the target matches the reconciliation evidence, not landed when it still matches
 /// the pre-save evidence, unknown otherwise; a write in place run by run. A temp is removed only
 /// when the Save did not land, the phase reached `created`, its `lstat` equals the recorded stat
-/// and, from `staged` on, its post-save evidence matches. Reads nothing it does not need.
+/// exactly (size, modification time, owner, mode, a regular file) and, from `staged` on, its
+/// post-save evidence matches. Anything else — a temp a Save was cut off filling — is kept and
+/// named: its name, owner, mode and size do not prove whose it is. Reads nothing it does not
+/// need.
 pub fn reconcile(intent: &SaveIntent, host: &str, inspect: &mut dyn Inspect) -> Reconciled {
     if let Phase::Writing { undo, runs } = &intent.phase {
         return reconcile_in_place(intent, host, undo, runs, inspect);
@@ -2178,11 +2196,21 @@ fn temp_verdict(
         Phase::Naming { .. } => {
             keep("the create's reply was never recorded, so it may not be sopen's")
         }
+        // Only the exact recorded stat — a regular file of that size, modification time,
+        // owner and mode — shows the temp to be the one this Save made. A random name, an
+        // owner, a mode and a size below the target's are shared by any number of files, and
+        // once the process is gone another file may have taken the name: a temp that grew
+        // (cut off mid-copy) or whose mode moved on is kept and named, for the user to remove.
         Phase::Created { created, .. } => {
             if created.matches(&now) {
                 Temp::Remove(temp.to_string())
             } else {
-                keep("it changed since sopen created it")
+                // It may be someone else's file by now: the words claim nothing more.
+                keep(&format!(
+                    "a file at the interrupted save's temporary path {temp} ({} bytes); sopen \
+                     could not verify it is its own partial copy, so it was not removed",
+                    now.size
+                ))
             }
         }
         Phase::Staged { staged, post, .. } | Phase::Renaming { staged, post, .. } => {
