@@ -2067,6 +2067,43 @@ fn the_peer_check_finds_the_clients_end_by_the_reversed_tuple() {
     let anonymous = line.replace(" 31279 ", " 0 ");
     let twice = format!("{anonymous}\n{anonymous}\n");
     assert!(!peer_allowed(twice.as_bytes(), server, client, 1000));
+    // Nor is it anybody's alone: a row whose inode is 0, is not a number, or is not there
+    // names no socket, and is a rejection as the only row too.
+    let malformed = line.replace(" 31279 ", " 3x279 ");
+    let cut = line.split(" 31279 ").next().unwrap().to_string();
+    assert!(cut.ends_with("1000        0"), "{cut:?}");
+    for (what, row) in [
+        ("a zero inode", &anonymous),
+        ("a malformed inode", &malformed),
+        ("a missing inode", &cut),
+    ] {
+        assert_ne!(row.as_str(), line);
+        assert!(
+            !peer_allowed(format!("{row}\n").as_bytes(), server, client, 1000),
+            "{what}, alone"
+        );
+        // And beside the socket's real row, in either order.
+        for both in [format!("{line}\n{row}\n"), format!("{row}\n{line}\n")] {
+            assert!(
+                !peer_allowed(both.as_bytes(), server, client, 1000),
+                "{what}, beside the real row"
+            );
+        }
+    }
+    // One inode under two uids is not one socket, whichever row comes first.
+    let other_uid = line.replace("  1000        0 31279", "  1001        0 31279");
+    assert_ne!(other_uid, line);
+    for both in [
+        format!("{line}\n{other_uid}\n"),
+        format!("{other_uid}\n{line}\n"),
+    ] {
+        for uid in [1000, 1001] {
+            assert!(
+                !peer_allowed(both.as_bytes(), server, client, uid),
+                "one inode, two uids, for {uid}"
+            );
+        }
+    }
     // An entry whose uid is not a number is nobody's.
     let odd = PROC_NET_TCP.replace(
         "00000000  1000        0 31279",

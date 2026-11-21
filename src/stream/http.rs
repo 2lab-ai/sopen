@@ -848,7 +848,8 @@ enum Found {
     None,
     /// One socket, and its uid (`None`: one that does not read as a uid).
     One(Option<u32>),
-    /// More than one socket, or a table that cannot be read to its end.
+    /// Nothing to trust: more than one socket, a row that names no socket (no inode, or
+    /// 0), or a table that cannot be read to its end.
     Several,
 }
 
@@ -872,8 +873,9 @@ fn peer_allowed(
 /// The table is not a snapshot. Read while sockets come and go, the kernel prints one socket
 /// more than once (seen on Linux 7.2 under 32 threads of connections: the same row, state
 /// and inode and all, two and three times in one read of the table). Rows of one tuple with
-/// the same inode and uid are therefore one socket; another inode, another uid, or no inode
-/// (0) is a second socket, and a rejection. Read a line at a time, and no further than that.
+/// the same inode and uid are therefore one socket; another inode or another uid is a second
+/// socket, and a rejection. So is any row of the tuple without an inode of its own (missing,
+/// not a number, or 0), alone or not. Read a line at a time, and no further than that.
 #[cfg(any(target_os = "linux", test))]
 fn peer_found(
     table: impl std::io::BufRead,
@@ -888,7 +890,7 @@ fn peer_found(
         )
     };
     let (local, remote) = (hex(client_end), hex(server_end));
-    let mut found: Option<(Option<u32>, Option<u64>)> = None;
+    let mut found: Option<(Option<u32>, u64)> = None;
     for line in table.lines() {
         let Ok(line) = line else {
             return Found::Several;
@@ -903,11 +905,15 @@ fn peer_found(
         // Columns 4 to 7 (state, queues, timer, retransmits) lie between; a uid that does
         // not read as one is nobody's. Then the timeout, then the inode.
         let owner = cols.nth(4).and_then(|uid| uid.parse::<u32>().ok());
+        // A row whose inode is not there, is not a number or is 0 names no socket: it is
+        // a rejection, alone or beside others.
         let inode = cols.nth(1).and_then(|inode| inode.parse::<u64>().ok());
-        let row = (owner, inode.filter(|inode| *inode != 0));
-        match &found {
-            None => found = Some(row),
-            Some(first) if *first == row && row.1.is_some() => {}
+        let Some(inode) = inode.filter(|inode| *inode != 0) else {
+            return Found::Several;
+        };
+        match found {
+            None => found = Some((owner, inode)),
+            Some(first) if first == (owner, inode) => {}
             Some(_) => return Found::Several,
         }
     }
