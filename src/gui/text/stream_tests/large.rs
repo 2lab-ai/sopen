@@ -876,7 +876,9 @@ fn a_local_file_over_16_mib_is_indexed_whole_and_highlighted_over_its_first_16_m
     assert_eq!(win.doc.line_count(), lines);
     assert!(win.doc.whole());
     let mut drv = Driver::new(800.0, 500.0);
-    drv.until(&mut win, 120, |w| w.ready());
+    // (Ready means the page asked of the highlighter has come back; the colours are waited
+    // for all the same, so that a slow machine fails on the assertion that names them.)
+    drv.until(&mut win, 120, |w| w.ready() && coloured(w));
     assert!(coloured(&win), "the first page is plain");
     assert!(
         !says(&drv, "shown without highlighting"),
@@ -891,7 +893,9 @@ fn a_local_file_over_16_mib_is_indexed_whole_and_highlighted_over_its_first_16_m
     for at in [5 << 20, HIGHLIGHT_MAX - 3 * SPAN] {
         let line = line_from(&starts, at);
         go_to(&mut drv, &mut win, &(line + 1).to_string());
-        drv.until(&mut win, 300, |w| w.ready() && w.line == Some(line));
+        drv.until(&mut win, 300, |w| {
+            w.ready() && w.line == Some(line) && coloured(w)
+        });
         assert!(rows(&win)[0].starts_with(&format!("+k{line:06} ")));
         assert!(coloured(&win), "plain at byte {at}, below 16 MiB");
     }
@@ -1975,4 +1979,153 @@ fn thinning_compacts_the_index_in_place_within_its_bound() {
     let taken = std::mem::take(&mut scan.marks);
     assert_eq!(scan.marks.capacity(), 0);
     assert!(taken.capacity() <= limit);
+}
+
+/// A place in the piece after a character that a grid point falls in (06 §7.2): the line's
+/// first piece ends on a grid point, the piece from there ends three bytes short of the next
+/// one — at the start of a four-byte character — and a byte past that start is in the piece
+/// that begins with the character, found by going on piece by piece, not one step only.
+#[test]
+fn a_byte_past_a_character_on_a_grid_point_is_in_the_piece_that_starts_with_it() {
+    bounded("a character across a grid point", || {
+        let g = 4 * SPAN;
+        let mut body = Vec::new();
+        while (body.len() as u64) < g - REACH - 40 {
+            body.extend_from_slice(b"a short line\n");
+        }
+        body.resize((g - REACH) as usize, b'.');
+        body.push(b'\n');
+        // The long line: from G - REACH + 1, plain up to three bytes before G + GRID.
+        let start = body.len() as u64;
+        assert_eq!(start, g - REACH + 1);
+        let crossing = g + GRID - 3;
+        body.resize(crossing as usize, b'a');
+        body.extend_from_slice("😀".as_bytes());
+        body.extend(std::iter::repeat_n(b'b', 2 * GRID as usize));
+        body.extend_from_slice(b"\nthe line after\n");
+        let mut net = net(&body, gate());
+        let mut doc = TextDoc::streamed(net.source.clone());
+        doc.set_cap(BLOCK);
+        loop {
+            match doc.grow(BLOCK, BLOCK) {
+                Ok(Some(_)) if doc.size() >= BLOCK => break,
+                Ok(_) => {}
+                Err(e) if is_pending(&e) => net.settle(),
+                Err(e) => panic!("{e:#}"),
+            }
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let mut any = twin(tmp.path(), "any.txt", b"any\n");
+        let mut drv = Driver::new(800.0, 500.0);
+        drv.idle(&mut any, 1);
+        let plain = chrome::Palette::of(&drv.ctx.global_style().visuals).text;
+        let font = chrome::font();
+        let cell = drv.ctx.fonts_mut(|f| f.glyph_width(&font, '0'));
+        let room = 640.0;
+        let mut memo = wrap::Memo::default();
+        memo.reset(room);
+        let mut w = wrap::Wrapper {
+            doc: &mut doc,
+            memo: &mut memo,
+            m: wrap::Measure::new(&drv.ctx, font, plain),
+            width: room,
+            read: wrap::read_cap(room, cell),
+        };
+        macro_rules! got {
+            ($op:expr) => {
+                loop {
+                    match $op {
+                        Ok(v) => break v,
+                        Err(e) if is_pending(&e) => net.settle(),
+                        Err(e) => panic!("{e:#}"),
+                    }
+                }
+            };
+        }
+        // The pieces of the long line, going down from its start.
+        let first = got!(w.holding(start)).expect("the line");
+        assert_eq!((first.at, first.loose), (start, false));
+        let (mut down, mut p) = (Vec::new(), first);
+        loop {
+            down.push(p);
+            match got!(w.next(p)) {
+                Some(q) => p = q,
+                None => break,
+            }
+        }
+        let pieces: Vec<u64> = {
+            let mut at: Vec<u64> = down.iter().map(|p| p.at).collect();
+            at.dedup();
+            at
+        };
+        assert_eq!(pieces[..3], [start, g, crossing], "{pieces:?}");
+        // The byte before the next grid point: in the piece that starts with the character.
+        for x in [crossing, g + GRID - 1, g + GRID, g + GRID + 100] {
+            let held = got!(w.holding(x)).expect("a piece");
+            assert_eq!((held.at, held.loose), (crossing, true), "byte {x:#x}");
+            assert_eq!(held.off, x - crossing);
+        }
+        let top = got!(w.at_byte(g + GRID - 1));
+        let row = got!(w.page(top, 1)).0.remove(0);
+        assert!(row.cut.text().starts_with("😀bbbb"), "{:?}", row.cut.text());
+        let slice = &body[crossing as usize..crossing as usize + row.cut.bytes];
+        assert_eq!(row.cut.text(), String::from_utf8_lossy(slice));
+        // The byte before the character is still the piece before it.
+        assert_eq!(got!(w.holding(crossing - 1)).unwrap().at, g);
+        // Up from the end agrees with down.
+        let mut up = vec![p];
+        while let Some(q) = got!(w.prev(p)) {
+            if q.at < start {
+                break;
+            }
+            up.push(q);
+            p = q;
+        }
+        up.reverse();
+        assert_eq!(up, down, "the same rows going back up");
+    });
+}
+
+/// Unwrapped, End on a line that is on screen whole is the end of the file — also a line with
+/// a tab that fills the window to its last column: its width is what it paints as from
+/// column 0, not a tab at its widest.
+#[test]
+fn unwrapped_end_on_a_tabbed_line_that_fits_is_the_end_of_the_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    // `a`, a tab to column 4, then letters to column `columns`; and sixty lines after it.
+    let body = |columns: usize| {
+        let mut body = format!("a\t{}\n", "a".repeat(columns - TAB));
+        for i in 0..60 {
+            body.push_str(&format!("row {i}\n"));
+        }
+        body
+    };
+    // (A file of as many lines first: how many columns its window has.)
+    let mut win = twin(tmp.path(), "probe.txt", body(2 * TAB).as_bytes());
+    let mut drv = Driver::new(800.0, 500.0);
+    drv.until(&mut win, 60, |w| w.ready());
+    let cw = drv.ctx.fonts_mut(|f| f.glyph_width(&chrome::font(), '0'));
+    let (room, columns) = (win.room, (win.room / cw).floor() as usize);
+    assert!(columns > 2 * TAB, "{columns}");
+    // Exactly the window's width.
+    let mut win = twin(tmp.path(), "tabs.txt", body(columns).as_bytes());
+    drv.until(&mut win, 60, |w| w.ready());
+    assert_eq!(win.room, room, "the same window");
+    drv.key(&mut win, Key::W, Modifiers::NONE);
+    drv.until(&mut win, 60, |w| w.ready());
+    assert_eq!(
+        rows(&win)[0].chars().count(),
+        columns,
+        "the line fills the row"
+    );
+    drv.key(&mut win, Key::End, Modifiers::NONE);
+    drv.until(&mut win, 60, |w| w.ready());
+    drv.idle(&mut win, 1);
+    assert_eq!(win.left, 0, "End scrolled a line that fits");
+    assert_eq!(rows(&win).last().map(String::as_str), Some("row 59"));
+    assert!(
+        rows(&win).iter().all(|r| !r.starts_with('a')),
+        "{:?}",
+        rows(&win)[0]
+    );
 }

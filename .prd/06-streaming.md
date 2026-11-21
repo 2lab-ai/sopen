@@ -709,7 +709,9 @@ the page and drop the queued keys.
       line's end at the right edge, and the file's end when the line already ends on screen.
       The line's end is placed by what its last characters paint as — a tab as its columns,
       a character of several bytes as one — not by counting bytes. A jump (End of file, Go
-      to, the scroll bar) lands on its line from the line's start. The wheel sideways keeps
+      to, the scroll bar) lands on its line from the line's start. A file read again after it
+      changed, and a reload, put the view back where it was, sideways too. A line that fits
+      the window as it paints from its first byte counts as on screen whole. The wheel sideways keeps
       what is less than a byte for the next frame, as it does for rows.
       - Past the prefix a line longer than its first piece shows its next pieces as rows of
         their own, each from its grid point. Inside the prefix, and in a local file, a line is

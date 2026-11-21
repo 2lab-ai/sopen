@@ -854,9 +854,9 @@ impl Wrapper<'_> {
     }
 
     /// Not wrapped: the byte of `span` a row starts at for the line's end to be at its right
-    /// edge — as many of its last characters as are painted in `columns` columns and in the
-    /// row's width, a tab counted as wide as it can be (where it stops depends on where the
-    /// row starts). 0 for a line that fits.
+    /// edge. 0 for a line that fits, as it paints from its first byte. Else as many of
+    /// its last characters as are painted in `columns` columns and in the row's width, a tab
+    /// counted as wide as it can be (where it stops depends on where the row starts).
     pub fn end_left(&mut self, span: Span, columns: usize) -> Result<u64> {
         let n = span.len.min(self.read as u64);
         let from = span.len - n;
@@ -879,6 +879,21 @@ impl Wrapper<'_> {
         let (cells, _) = decode(&bytes[lead..], true);
         let faces: Vec<char> = cells.iter().map(|c| chrome::shown_char(c.ch)).collect();
         let widths = self.m.estimate(&faces);
+        if from == 0 {
+            // The whole line is here: as it paints from its first byte, each tab to its
+            // stop. A line that fits is shown from its start.
+            let (mut cols, mut wide) = (0usize, 0f32);
+            for (cell, width) in cells.iter().zip(&widths) {
+                let (c, w) = match cell.ch {
+                    '\t' => (TAB - cols % TAB, (TAB - cols % TAB) as f32 * self.m.space),
+                    _ => (1, *width),
+                };
+                (cols, wide) = (cols + c, wide + w);
+            }
+            if cols <= columns && wide <= self.width + 0.01 {
+                return Ok(0);
+            }
+        }
         let (mut left, mut cols, mut wide) = (end, 0usize, 0f32);
         for (cell, width) in cells.iter().zip(widths).rev() {
             let (c, w) = match cell.ch {

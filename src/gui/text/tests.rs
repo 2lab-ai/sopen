@@ -2965,3 +2965,78 @@ fn a_first_line_that_could_not_be_read_at_once_still_picks_the_syntax() {
     let distinct: std::collections::HashSet<_> = colors.iter().collect();
     assert!(distinct.len() >= 2, "highlighted: {colors:?}");
 }
+
+/// A re-read keeps the place sideways too: not wrapped and scrolled along a long line, a file
+/// that is appended to is read again and shows the same line from the same byte — nobody
+/// navigated. A jump the owner makes (Go to, the end of the file) still lands on its line
+/// from the line's start.
+#[test]
+fn a_reread_keeps_the_sideways_place_of_an_unwrapped_view() {
+    let tmp = tempfile::tempdir().unwrap();
+    let line = |i: usize| format!("line {i:03} {}", "word ".repeat(120));
+    let body: String = (0..80).map(|i| format!("{}\n", line(i))).collect();
+    let path = write(tmp.path(), "wide.log", body.as_bytes());
+    let mut win = TextWindow::new(
+        TextDoc::open(&path).unwrap(),
+        "wide".into(),
+        "wide.log",
+        vec![],
+    );
+    let clock = on_clock(&mut win);
+    let mut drv = Driver::new(600.0, 400.0);
+    drv.until(&mut win, 5, |w| w.ready());
+    drv.key(&mut win, Key::W, Modifiers::NONE);
+    for _ in 0..5 {
+        drv.key(&mut win, Key::ArrowDown, Modifiers::NONE);
+    }
+    for _ in 0..4 {
+        drv.key(&mut win, Key::ArrowRight, Modifiers::NONE);
+    }
+    drv.until(&mut win, 5, |w| w.ready());
+    let top = |w: &TextWindow| w.page.as_ref().unwrap().rows[0].cut.text();
+    assert_eq!((win.line, win.left), (Some(5), 32));
+    let before = top(&win);
+    assert!(before.starts_with(&line(5)[32..60]), "{before}");
+    // Appended to by someone else: read again, in the same place.
+    use std::io::Write as _;
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .unwrap();
+    file.write_all(b"appended\n").unwrap();
+    drop(file);
+    later(&clock, 2.0);
+    reread(&mut drv, &mut win, 81);
+    drv.until(&mut win, 5, |w| w.ready());
+    assert_eq!(
+        (win.line, win.left),
+        (Some(5), 32),
+        "the re-read moved the view"
+    );
+    assert_eq!(top(&win), before);
+    // Go to a line: from its start.
+    drv.key(&mut win, Key::G, crate::gui::testkit::command(false));
+    drv.frame(
+        &mut win,
+        vec![egui::Event::Text("11".into())],
+        Modifiers::NONE,
+    );
+    drv.key(&mut win, Key::Enter, Modifiers::NONE);
+    drv.until(&mut win, 5, |w| w.ready());
+    assert_eq!((win.line, win.left), (Some(10), 0), "Go to");
+    assert!(top(&win).starts_with("line 010 "));
+    // The end of the file: from its lines' starts.
+    for _ in 0..4 {
+        drv.key(&mut win, Key::ArrowRight, Modifiers::NONE);
+    }
+    drv.key(&mut win, Key::End, crate::gui::testkit::command(false));
+    drv.until(&mut win, 5, |w| w.ready());
+    assert_eq!(win.left, 0, "the end of the file");
+    let last = win.page.as_ref().unwrap().rows.last().unwrap().cut.text();
+    assert_eq!(last, "appended");
+    // Home within a line, then the start of the file.
+    drv.key(&mut win, Key::ArrowRight, Modifiers::NONE);
+    drv.key(&mut win, Key::Home, crate::gui::testkit::command(false));
+    drv.until(&mut win, 5, |w| w.ready());
+    assert_eq!((win.line, win.left), (Some(0), 0), "the start of the file");
+}

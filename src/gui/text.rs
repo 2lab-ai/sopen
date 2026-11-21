@@ -1366,9 +1366,12 @@ impl TextDoc {
                 self.scan_span(cut, true, window)?
             }
         };
-        if x >= span.next && span.next < self.total() {
-            // In the character a grid point falls in: the piece that begins with it.
-            return self.scan_span(span.next, !span.ends, window);
+        let mut span = span;
+        while x >= span.next && span.next < self.total() {
+            // Past the piece that was found — it ends on the grid, or a few bytes before a
+            // grid point, at the start of the character that falls on it: the pieces after
+            // it, as far as the one `x` is in.
+            span = self.scan_span(span.next, !span.ends, window)?;
         }
         Ok(span)
     }
@@ -2549,6 +2552,9 @@ struct TextWindow {
     /// The top is put back on a row start before the next page (the width, the index or the
     /// mode changed).
     resnap: bool,
+    /// The jump waiting is one that puts the view back where it was (a file read again, a
+    /// stream reloaded), not one the owner made: it keeps the place sideways too.
+    restoring: bool,
     /// The Go to field (Cmd/Ctrl+G), while it is open: what was typed.
     goto: Option<String>,
     /// Go to asked for a line past the lines known (0-based): the index pass runs on to it,
@@ -2762,6 +2768,7 @@ impl TextWindow {
             jump: None,
             moved: 0,
             resnap: false,
+            restoring: false,
             goto: None,
             seeking: None,
             asked: false,
@@ -2797,6 +2804,7 @@ impl TextWindow {
             // Another place was asked for: Go to's pass is not waited for.
             self.stop_seek();
         }
+        self.restoring = false;
         self.jump = Some(jump);
         let place = match jump {
             Jump::FileStart | Jump::Home | Jump::End => return,
@@ -2921,6 +2929,7 @@ impl TextWindow {
                 Some(line) if !page.wrapped => Jump::Line(line, 0),
                 _ => Jump::Byte(page.top + page.top_off),
             });
+            self.restoring = true;
         }
         (self.top, self.top_off, self.top_loose, self.line) = (0, 0, false, None);
         self.seeking = None;
@@ -3279,10 +3288,10 @@ impl TextWindow {
                 // Read again through the new index: the new end, or the same line put back on
                 // a row start (the line may have changed).
                 if at_end {
-                    self.jump = Some(Jump::FileEnd);
+                    (self.jump, self.restoring) = (Some(Jump::FileEnd), true);
                 } else if self.jump.is_none() {
                     let line = self.line.unwrap_or(0).min(lines.saturating_sub(1));
-                    self.jump = Some(Jump::Line(line, self.top_off));
+                    (self.jump, self.restoring) = (Some(Jump::Line(line, self.top_off)), true);
                 }
                 (self.top, self.top_loose) = (0, false);
                 self.status = if resumed {
@@ -3617,8 +3626,9 @@ impl TextWindow {
                     None => Pos::default(),
                 };
             }
-            if !wrap && !kept {
-                // A jump lands on a line from its start.
+            if !wrap && !kept && !self.restoring {
+                // A jump the owner made lands on a line from its start. (One that puts the
+                // view back after a re-read keeps the place within the line.)
                 left = 0;
             }
             let back = rows.saturating_sub(1) as u64;
@@ -3708,6 +3718,7 @@ impl TextWindow {
             false => None,
         };
         (self.jump, self.moved, self.resnap) = (None, 0, false);
+        self.restoring = false;
         (self.top, self.top_off, self.top_loose) = (pos.at, pos.off, pos.loose);
         self.line = top.and_then(|span| span.line);
         self.left = left;
