@@ -173,8 +173,9 @@ A folder opens in a sopen window titled `host:/abs` (the local path for a local 
 are where PC Shell puts them: the program's name on the top row; two file panels side by side,
 each in a frame with its folder (`host:/abs`) centred in the top border and the active panel's
 frame drawn heavier; the status row (a fetch's progress, the last result, else what the keys do);
-the bottom row lists the F-keys that work there and nothing else (the list: 3 View, 4 Edit; a
-viewer: 3 Exit, 4 Edit and the viewer's own — the text viewer's 2 Unwrap (Wrap once unwrapped),
+the bottom row lists the F-keys that work there and nothing else (the list, since slice S1 of the
+browser workstream: 1 Help, 2 Rename, 3 View, 4 Edit, 5 Copy, 6 Move, 9 Dual — `Prevw` in dual
+mode; a viewer: 1 Help, 3 Exit, 4 Edit and the viewer's own — the text viewer's 2 Unwrap (Wrap once unwrapped),
 an alias of W; the hex window's 5 Save, 6 Goto, 8 Asc/hx, aliases of ⌘S, ⌘G and Tab; and the
 image window's 5 Save; a plain F-key never acts while a text field has the typing). The foot shows `N Listed = N bytes` whole inside the frame whatever the width: the
 free space gives way first, then the end of the total. Every cell fits its column at a glyph
@@ -207,14 +208,41 @@ too, where F3 closes it as ⌘W does.
   so a big folder on a slow link lists as long as the server answers. Locally: `read_dir` and an
   `lstat` per name. The free space is `statvfs@openssh.com` when
   the server offers it, `statvfs` locally.
-- **Keys** (the list): ↑/↓, PgUp/PgDn, Home/End move the bar; Tab (or Shift+Tab) switches the
+- **Two modes** (msg 14; [02](02-architecture.md) §2–§4, landed with slice S1). The window opens
+  in **preview mode**: the side opposite the active list follows its bar — on a file, once the bar
+  has rested 150 ms, it shows that file's preview in a single-lined frame titled with the file
+  (text wrapped and highlighted, an image fitted, the hex rows of anything else; video and audio
+  as an info card until slice S1-M; a file over a preview budget, 02 §4.3, or one that cannot be
+  read as an info card saying why); on a folder or `..` it shows its own list (the git panel
+  comes with S2). A preview takes no key, click, drag or wheel, claims nothing in the cache (a
+  remote file is read into a private copy under `<cache>/.preview/`, removed with the preview)
+  and is prepared one at a time on one connection; Enter or F3 on the file makes the live
+  preview the viewer (a remote copy is published into the cache by a hard link; a preview still
+  reading goes on as the opening). **F9** switches to **dual mode** — two lists, as before — and
+  back; slot 9 names the mode it switches to. The mode is the window's and is not saved.
+- **Selection and file operations** (msg 15; [04](04-file-keys.md) §3–§5, S1's part). Space or
+  Ins selects the bar's entry and steps down; `+` and `-` select and unselect by a pattern, `*`
+  inverts, Cmd/Ctrl+A selects all; selected entries are yellow and the foot counts them first.
+  **F2** (or Shift+F6) renames the bar's entry in a field in its row; **F5** copies and **F6**
+  moves the selection, or the bar's entry, to the other panel's folder — a dialog first, its
+  target editable to any folder on any host (`host:/abs`). Nothing is ever replaced: a name in
+  the way asks Skip / Rename / Cancel, never Overwrite. An operation runs on a worker with
+  connections of its own, shows its progress on the status row, stops on Esc, and reports what
+  it did (one line for one item done, else a dialog); the panels showing a changed folder
+  re-read. Closing the window waits for a running operation. A remote folder cannot be renamed
+  until slice S6 (F2 says so); make folder and delete come with S6.
+- **Keys** (the list; the one key table, `gui::browser::keys`, matches modifiers exactly, and
+  Cmd/Ctrl+1…0 and a click on an F-key slot act as that F-key): F1 lists the keys; Cmd/Ctrl+R
+  re-reads the panel, Cmd/Ctrl+U swaps the panels, Cmd/Ctrl+← / → show this folder in the left /
+  right panel, Cmd/Ctrl+PgUp goes up; ↑/↓, PgUp/PgDn, Home/End move the bar; Tab (or Shift+Tab) switches the
   active panel; Enter on a folder enters it; Backspace, or Enter on `..`, goes up with the bar on
   the folder just left; a typed letter puts the bar on the next name starting with it (any case,
   around the end); Enter or F3 on a file opens its viewer (F3 leaves folders alone); F4 opens the
   entry — folder or file — in the external editor, VS Code then Zed, chosen as A2 chooses (§3);
   a click puts the bar on a row, a double click opens it; the wheel scrolls the rows, and the
   next key brings them back to the bar. While a file is being made ready only Esc works (it
-  stops a fetch); while a folder is listed, no key.
+  stops a fetch); while a folder is listed, no key; a preview being prepared holds no key, and a
+  running file operation only a second operation (02 §6).
 - **Enter on a file** opens the viewer for its kind (§3: extension, then the sniff) in the same
   window, in place of the two panels: text → the text viewer; image → the image window; video
   and audio → the media window (a `.ts` ffprobe cannot read as media → hex); anything else → the

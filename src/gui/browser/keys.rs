@@ -17,9 +17,8 @@
 //! - **Cmd/Ctrl+1…9, 0 and a click on an F-key slot** are not rows: the shell turns them into the
 //!   plain F-key before any window's pass (`gui::FKeyInput`, 04 §6.1), so the F-key's row acts.
 //!
-//! Nothing outside the tests calls it until the integration (S1-E); the `dead_code` allowance
-//! below goes then, as a hand-over declared with it (this file is S1-A's).
-#![allow(dead_code)]
+//! The browser's passes call it from the integration (S1-E) on: `Browser::list_keys` and
+//! `viewer_ui` loop [`lookup`], `Browser::run` carries the command out, the F-key row is [`row`].
 
 use super::view::Mode;
 use crate::gui::chrome::{self, FKey};
@@ -29,6 +28,7 @@ use eframe::egui::{self, Event, Key, Modifiers};
 pub const LANDED: u8 = 1;
 
 /// The last slice: every row of the table.
+#[cfg_attr(not(test), allow(dead_code))] // Only the tests use it.
 pub const ALL_SLICES: u8 = 7;
 
 /// Where the keyboard is: a row acts only in the context it names (04 §3 rule 4).
@@ -47,6 +47,7 @@ pub enum Context {
 }
 
 impl Context {
+    #[cfg_attr(not(test), allow(dead_code))] // Only the tests use it.
     pub const ALL: [Context; 5] = [
         Context::List,
         Context::Viewer,

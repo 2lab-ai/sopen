@@ -92,6 +92,12 @@ A folder opens in sopen's own window: two file panels side by side, each listing
 folders, then the files (Name · Ext · Size · Date · Time; hidden files dimmed), with
 `N Listed = N bytes` and `N Bytes Free` at the foot.
 
+The window opens in **preview mode**: rest the bar on a file and the other side shows it — text
+(wrapped, highlighted), an image, or the hex rows of anything else; video and audio show a card
+with their size and date for now. On a folder the other side is its own list again. `F9` switches
+to two plain lists (**dual mode**) and back. A preview is only looked at: `Enter` makes it the
+viewer.
+
 Every sopen window looks like PC Shell from the DOS PC Tools 5.5 / 6: the VGA text font, blue
 windows framed in box lines (a double line around the active one) with their title in the frame,
 the light-red highlight bar, the title row with the clock, the F-key row at the bottom (only the
@@ -104,8 +110,15 @@ keys that work there are labelled), cyan dialogs with a shadow.
 | `Enter` | a folder: go in; `..`: go up; a file: show it in the viewer for its kind, in the same window |
 | `Backspace` | up one folder |
 | a letter | the next name starting with it |
+| `Space` / `Ins` | select the entry and step down (`+` / `-`: by a pattern, `*`: invert, `⌘A`: all) |
+| `F1` | the keys of where you are |
+| `F2` (or `Shift+F6`) | rename the entry, in its row |
 | `F3` | view the file (as Enter) |
 | `F4` | open the folder or file in VS Code / Zed |
+| `F5` / `F6` | copy / move the selection (or the entry) to the other panel's folder — asks first; the target can be any folder, `host:/path` too |
+| `F9` | preview mode ↔ dual mode |
+| `⌘R` · `⌘U` · `⌘←` / `⌘→` | re-read · swap the panels · this folder in the left / right panel |
+| `⌘1`…`⌘0`, or a click on the bottom row | `F1`…`F10` (Ctrl on Linux) |
 | `Esc` / `F3` in a viewer | back to the list, the bar where it was |
 | `F3` in a window of its own | close it, as `⌘W` (asks first when there are unsaved changes) |
 
@@ -113,8 +126,12 @@ Text shows read-only with syntax highlighting and line numbers, a page at a time
 size opens alike); images open in the image window, video and audio in the media window, anything
 else in the hex editor — each with its own edits and Save, as below. Leaving a viewer with unsaved
 changes asks first, as its own window does. A remote file is fetched with its progress in the
-status row; `Esc` stops the fetch. The browser views only: it does not copy, move, delete or
-rename.
+status row; `Esc` stops the fetch.
+
+Rename, copy and move never replace anything: a name already there asks **Skip**, **Rename** (a
+free name is proposed) or **Cancel**. A copy shows its progress in the status row, `Esc` stops
+it, and a report lists what was done, skipped and not reached. Renaming a folder on a remote,
+making folders and deleting are not there yet.
 
 Lines wrap by default: every line is shown whole, in rows as wide as the window, its number on its
 first row. A row is broken by the measured width of its characters (Korean, CJK and emoji are

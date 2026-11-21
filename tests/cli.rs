@@ -379,6 +379,49 @@ fn a_folder_opens_in_the_browser_not_the_editor() {
     assert_eq!(seen.trim(), real.join("a.txt").to_str().unwrap());
 }
 
+/// The browser's receipt hooks are read before its window opens: a `SOPEN_KEYS` step that names
+/// no key, and a `SOPEN_STATE` mode that is neither, end the run with the reason and no window.
+#[test]
+fn the_browsers_hooks_are_checked_before_its_window() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("project");
+    std::fs::create_dir(&dir).unwrap();
+    // A display's name is enough to take the browser's route: the hooks are read before any
+    // window is made.
+    let display = ("DISPLAY", ":77");
+    let out = sopen(
+        tmp.path(),
+        &[dir.to_str().unwrap()],
+        &[display, ("SOPEN_KEYS", "F5,F99")],
+    );
+    assert!(!out.status.success());
+    let err = text(&out.stderr);
+    assert!(
+        err.contains("SOPEN_KEYS: 'F99': unknown key 'F99'"),
+        "{err}"
+    );
+    let out = sopen(
+        tmp.path(),
+        &[dir.to_str().unwrap()],
+        &[display, ("SOPEN_KEYS", "Hyper+F5")],
+    );
+    let err = text(&out.stderr);
+    assert!(
+        !out.status.success() && err.contains("unknown modifier 'Hyper'"),
+        "{err}"
+    );
+    let out = sopen(
+        tmp.path(),
+        &[dir.to_str().unwrap()],
+        &[display, ("SOPEN_STATE", "mode=both")],
+    );
+    let err = text(&out.stderr);
+    assert!(
+        !out.status.success() && err.contains("mode must be 'dual' or 'preview'"),
+        "{err}"
+    );
+}
+
 /// No display (Linux over ssh): a folder cannot show the browser; it opens in the editor as
 /// before message 12, and one line says why.
 #[cfg(target_os = "linux")]

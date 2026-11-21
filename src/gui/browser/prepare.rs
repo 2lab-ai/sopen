@@ -10,10 +10,6 @@
 //! place — and told they are previews; the hand-over ([`Preview::hand_over`]) makes the viewer a
 //! viewer again and publishes the copy into the cache by a hard link.
 
-// The preview form is for the preview host (02 §4, S1-E), which is not wired up yet: until then
-// only the tests call it. S1-E removes this allowance.
-#![cfg_attr(not(test), allow(dead_code))]
-
 use super::Connect;
 use crate::cache::{self, Claim, Fetched, PreviewName, PreviewSpace};
 use crate::gui::hex::{self, HexFile};
@@ -483,6 +479,7 @@ pub struct Previewed {
 
 impl Previewed {
     /// The info card, when the file is not previewed.
+    #[cfg_attr(not(test), allow(dead_code))] // Only the tests use it.
     pub fn card(&self) -> Option<&Card> {
         match &self.parts {
             Parts::Card(card) => Some(card),
@@ -550,6 +547,7 @@ pub struct Reuse {
 
 impl Preview {
     /// The info card, when the file is not previewed.
+    #[cfg_attr(not(test), allow(dead_code))] // Only the tests use it.
     pub fn card(&self) -> Option<&Card> {
         self.card.as_ref()
     }
