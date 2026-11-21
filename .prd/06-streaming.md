@@ -656,16 +656,19 @@ to every run on the file: the probe, playback, the paused frame, the waveform, S
       not, and junk means an exact seek): an 11-bit sync, layer III, a valid bitrate and
       sample-rate index. The tag is read where ffmpeg's mp3 demuxer reads it, 4 + 32 bytes in
       (MPEG-1 stereo), 4 + 17 (MPEG-1 mono, MPEG-2 and 2.5 stereo) or 4 + 9 (MPEG-2 and 2.5 mono),
-      with no adjustment for a CRC (`xing_offtbl` in libavformat/mp3dec.c). So sopen and ffmpeg
-      agree on which files are `Info`.
+      with no adjustment for a CRC (`xing_offtbl` in libavformat/mp3dec.c). So on a file whose
+      first frame follows valid tags directly, sopen and ffmpeg agree on which files are `Info`.
     - `Info` there means constant bitrate (ffmpeg's `is_cbr`). `Xing`, anything else, a frame that
       does not validate, or a file that ends first means an exact seek. Every misreading therefore
       costs bytes, never precision.
-    - W7's fixtures: a version-4 tag with a footer, a tag of several MB, two tags in a row, an
-      invalid synchsafe byte, MPEG-1 and MPEG-2 in mono and stereo, `Info`, `Xing`, no tag, junk
-      before the first frame, and a file cut inside the frame. Each fixture's expected answer is
-      what ffmpeg reports for it (`is_cbr` shows as an exact byte-proportional seek), not what this
-      text says. X5 measured only mono 44.1 kHz files with small tags.
+    - W7's fixtures, in two groups:
+      - **Reference fixtures**, whose expected answer is what ffmpeg reports (its `is_cbr`), not
+        what this text says: a version-4 tag with a footer, a tag of several MB, two tags in a row,
+        MPEG-1 and MPEG-2 in mono and stereo, a CRC-protected frame, `Info`, `Xing`, and no tag.
+      - **Fallback fixtures**, whose expected answer is an exact seek even where ffmpeg recovers:
+        an invalid synchsafe byte, an unsupported tag version, junk before the first frame, and a
+        file cut inside the frame.
+      - X5 measured only mono 44.1 kHz files with small tags.
 - **ffmpeg's reconnect options stay off.** The server ends a connection only on an error the window
   already shows from its Source, so a reconnect would only repeat it.
 - **ffmpeg's exit status cannot be trusted for a cut-short input** (verified with ffmpeg 9.0.2,
