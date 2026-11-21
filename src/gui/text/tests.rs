@@ -442,10 +442,10 @@ fn kept_characters(line: &str) -> Vec<bool> {
     line.char_indices().map(|(i, _)| kept[i]).collect()
 }
 
-/// The viewer highlights `lines` (a file named `*.ext`, each line ended by `end`) with every
-/// character coloured as the lines parsed whole give it — when `only_kept`, every character the
-/// shortened lines keep.
-fn assert_colours(ext: &str, lines: &[String], end: &str, only_kept: bool) {
+/// Each character of `lines` and its colour as the viewer's highlighter gives it (a file named
+/// `*.ext`, each line ended by `end`), its long runs shortened: handed over at fewer than twice
+/// [`RUN_MAX`] characters, and over [`RUN_MAX`] just when a line has a run that long.
+fn highlighted(ext: &str, lines: &[String], end: &str) -> Vec<Vec<(char, Color32)>> {
     let tmp = tempfile::tempdir().unwrap();
     let body: String = lines.iter().map(|l| format!("{l}{end}")).collect();
     let path = write(tmp.path(), &format!("runs.{ext}"), body.as_bytes());
@@ -461,26 +461,30 @@ fn assert_colours(ext: &str, lines: &[String], end: &str, only_kept: bool) {
         longest < 2 * RUN_MAX && (longest > RUN_MAX) == long,
         "{ext}: handed a run of {longest}"
     );
+    assert_eq!(runs.len(), lines.len());
+    runs.iter()
+        .map(|line| {
+            line.iter()
+                .flat_map(|(c, text)| text.chars().map(move |ch| (ch, *c)))
+                .collect()
+        })
+        .collect()
+}
+
+/// The viewer highlights `lines` (a file named `*.ext`, each line ended by `end`) with every
+/// character coloured as the lines parsed whole give it.
+fn assert_colours_of_whole_lines(ext: &str, lines: &[String], end: &str) {
+    let got = highlighted(ext, lines, end);
     let whole = whole_line_colours(ext, lines);
-    assert_eq!(runs.len(), whole.len());
-    for (i, ((got, want), line)) in runs.iter().zip(&whole).zip(lines).enumerate() {
-        let got: Vec<(char, Color32)> = got
-            .iter()
-            .flat_map(|(c, text)| text.chars().map(move |ch| (ch, *c)))
-            .collect();
+    for (i, (got, want)) in got.iter().zip(&whole).enumerate() {
         assert_eq!(got.len(), want.len(), "{ext} line {i}: its characters");
-        let kept = kept_characters(line);
-        if let Some(at) = (0..got.len()).find(|&k| (kept[k] || !only_kept) && got[k] != want[k]) {
+        if let Some(at) = (0..got.len()).find(|&k| got[k] != want[k]) {
             panic!(
                 "{ext} line {i}, character {at}: {:?}, parsed whole {:?}",
                 got[at], want[at]
             );
         }
     }
-}
-
-fn assert_colours_of_whole_lines(ext: &str, lines: &[String], end: &str) {
-    assert_colours(ext, lines, end, false);
 }
 
 /// A shortened run is coloured as the whole one: every character of every line — the run, what
@@ -589,9 +593,10 @@ fn shortening_at_its_edges_keeps_the_colours_of_the_whole_line() {
 }
 
 /// A grammar that colours inside a word: CSS colours the digits in one, so its scope changes
-/// inside the part of a varied run the shortened form leaves out. That part takes the colour of
-/// the character kept before it — the one difference in colour — while every kept character,
-/// the token after the run and the next line are coloured as parsed whole.
+/// inside the part of a varied run the shortened form leaves out. As the `Shortened` doc says,
+/// each left-out character takes the colour of the character kept before it — there the colours
+/// differ from the line parsed whole — while every kept character, the token after the run and
+/// the next line are coloured as parsed whole.
 #[test]
 fn inside_a_word_only_the_left_out_part_of_a_run_differs() {
     let hex: String = (0..150)
@@ -601,13 +606,34 @@ fn inside_a_word_only_the_left_out_part_of_a_run_differs() {
         format!("a {{ color: #{hex}g{}; }}", "a".repeat(59)),
         "b { margin: 10px; }".to_string(),
     ];
+    let got = highlighted("css", &lines, "\n");
     let whole = whole_line_colours("css", &lines);
     let kept = kept_characters(&lines[0]);
     assert!(
         (1..kept.len()).any(|k| !kept[k] && whole[0][k].1 != whole[0][k - 1].1),
         "parsed whole, the colour changes inside the part left out"
     );
-    assert_colours("css", &lines, "\n", true);
+    let (line, want) = (&got[0], &whole[0]);
+    assert_eq!(line.len(), want.len());
+    let mut before = None;
+    for (k, (&(ch, colour), &whole)) in line.iter().zip(want).enumerate() {
+        assert_eq!(ch, whole.0, "character {k}");
+        if kept[k] {
+            assert_eq!(colour, whole.1, "kept character {k}: as parsed whole");
+            before = Some(colour);
+        } else {
+            let before = before.expect("a run starts with kept characters");
+            assert_eq!(
+                colour, before,
+                "left-out character {k}: the kept one's before it"
+            );
+        }
+    }
+    assert_ne!(
+        line, want,
+        "the left-out part differs from the line parsed whole"
+    );
+    assert_eq!(got[1], whole[1], "the next line is as parsed whole");
 }
 
 /// A heredoc ends only on its own delimiter. A run shortened to the length of a real, shorter
@@ -648,6 +674,56 @@ fn a_shortened_run_never_ends_a_heredoc_it_is_not_the_delimiter_of() {
         ];
         assert_colours_of_whole_lines("sh", &lines, "\n");
     }
+}
+
+/// The known difference the `Shortened` doc names last — a back-reference compares shortened
+/// runs, so two runs over [`RUN_MAX`] with the same ends and stretches, each the same length
+/// modulo [`RUN_STRETCH`], read as one — end to end. A heredoc opened by 200 `x`s, with a body
+/// line of 216: parsed whole, that line, the next and the real 200 `x`s are the heredoc's; in
+/// the viewer the 216 end it — coloured as its delimiter is —, the next line is shell code, and
+/// so are the 200 `x`s (a command of that name); the line after them is as parsed whole again.
+/// A body line of 201 or 300 `x`s shortens otherwise, and the file is as parsed whole.
+#[test]
+fn a_long_run_that_shortens_like_a_heredoc_delimiter_ends_it() {
+    let delimiter = "x".repeat(200);
+    let lines = |body: usize| {
+        [
+            format!("cat <<'{delimiter}'"),
+            "x".repeat(body),
+            "echo still_heredoc \"$HOME\"".to_string(),
+            delimiter.clone(),
+            "echo after \"$HOME\"".to_string(),
+        ]
+    };
+    for body in [201, 300] {
+        assert_colours_of_whole_lines("sh", &lines(body), "\n");
+    }
+    let lines = lines(216);
+    let got = highlighted("sh", &lines, "\n");
+    let whole = whole_line_colours("sh", &lines);
+    // As code, each line on its own.
+    let code = |line: &String| whole_line_colours("sh", std::slice::from_ref(line)).remove(0);
+    assert_eq!(got[0], whole[0], "the opener: as parsed whole");
+    let end = whole[3][0].1;
+    assert!(whole[3].iter().all(|&(_, c)| c == end));
+    assert!(
+        whole[1].iter().all(|&(_, c)| c != end),
+        "parsed whole, the 216 `x`s are the heredoc's body"
+    );
+    assert!(
+        got[1].iter().all(|&(_, c)| c == end),
+        "in the viewer they end it, coloured as its delimiter: {:?}",
+        got[1][0]
+    );
+    assert_ne!(
+        whole[2],
+        code(&lines[2]),
+        "parsed whole, still in the heredoc"
+    );
+    assert_eq!(got[2], code(&lines[2]), "in the viewer, shell code");
+    assert_ne!(whole[3], code(&lines[3]), "parsed whole, the delimiter");
+    assert_eq!(got[3], code(&lines[3]), "in the viewer, a command");
+    assert_eq!(got[4], whole[4], "after them: as parsed whole");
 }
 
 /// Shortened runs: each one longer than [`RUN_MAX`] — longer than any run handed over as it is —
