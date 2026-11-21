@@ -230,14 +230,19 @@ fn main() -> ExitCode {
     exit(result)
 }
 
-/// The exit code: a forwarded run's own, else 0, or 1 / 3 with the error on one stderr line.
+/// The exit code: a forwarded run's own, else 0, or 1 / 3 with the error on one stderr line —
+/// or 128 + the signal (130, 143) when Ctrl-C or SIGTERM cancelled a save without a window.
 fn exit(result: Result<u8>) -> ExitCode {
     match result {
         Ok(code) => ExitCode::from(code),
         Err(e) => {
             let line = format!("{e:#}").replace('\n', " ");
             eprintln!("sopen: {line}");
-            if e.chain().any(|c| c.is::<Refused>()) {
+            let interrupted = e.chain().find_map(|c| c.downcast_ref());
+            if let Some(interrupted) = interrupted {
+                let interrupted: &gui::binary::Interrupted = interrupted;
+                ExitCode::from(interrupted.exit_code())
+            } else if e.chain().any(|c| c.is::<Refused>()) {
                 ExitCode::from(EXIT_CONFLICT)
             } else {
                 ExitCode::from(EXIT_ERROR)
@@ -785,20 +790,36 @@ fn open_in_window(
         );
         return Ok(());
     }
+    let known = place.display(abs);
     let origin = place.into_origin(abs, at, dirs);
-    let outcome = if kind == Kind::Image {
-        let bytes =
-            std::fs::read(&local).with_context(|| format!("cannot read {}", local.display()))?;
-        let file = gui::image::ImageFile::new(origin, bytes, &dirs.cache);
-        gui::image::open(file, &hooks, notices)?
-    } else {
-        gui::media::open(origin, &local, &dirs.cache, &hooks, notices)?
-    };
+    let outcome = open_copy(kind, origin, &local, &known, &dirs.cache, &hooks, notices)?;
     rec.action = Some(outcome.action());
     rec.conflict = outcome.conflict;
     match outcome.refused {
         Some(message) => Err(Refused(message).into()),
         None => Ok(()),
+    }
+}
+
+/// The image or media window on `local` — the file itself, or its copy in sopen's cache — of
+/// the file its owner knows as `known` (`host:/abs`, or the local path), which is how every
+/// error from here names it: each message is built with that name, never with the copy's path.
+fn open_copy(
+    kind: Kind,
+    origin: gui::Origin,
+    local: &Path,
+    known: &str,
+    cache: &Path,
+    hooks: &gui::Hooks,
+    notices: Vec<String>,
+) -> Result<gui::Outcome> {
+    if kind == Kind::Image {
+        let bytes = std::fs::read(local).with_context(|| format!("cannot read {known}"))?;
+        let file = gui::image::ImageFile::new(origin, bytes, cache);
+        gui::image::open(file, hooks, notices)
+    } else {
+        // Names the file by its origin, which is `known`.
+        gui::media::open(origin, local, cache, hooks, notices)
     }
 }
 
@@ -1227,6 +1248,65 @@ fn separate(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The origin of `abs` posing as host `box`, and the hooks of a run without a window.
+    fn boxed(abs: &str) -> (gui::Origin, gui::Hooks) {
+        use remote::RemoteFs as _;
+        let mut fs = LocalFs::new();
+        // Any file's stat: nothing here gets as far as comparing it.
+        let at = fs.stat(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let fs: Box<dyn remote::RemoteFs + Send> = Box::new(fs);
+        let origin = gui::Origin::new(fs, None, Some("box".to_string()), abs.to_string(), at);
+        let hooks = gui::Hooks {
+            autosave: true,
+            ..Default::default()
+        };
+        (origin, hooks)
+    }
+
+    /// A remote file opened from the command line is read from its copy in sopen's cache; what
+    /// fails on the copy is said about the file as its owner knows it, `host:/abs`, and the
+    /// copy's path is not on the terminal. An image whose copy cannot be read; a video ffprobe
+    /// cannot read (needs ffmpeg: skipped without it, unless `SOPEN_REQUIRE_FFMPEG` is set).
+    #[test]
+    fn a_failed_open_names_the_file_as_host_abs_never_its_cache_copy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = tmp.path().join("cache");
+        std::fs::create_dir_all(cache.join("box/data")).unwrap();
+        let said = |kind: Kind, name: &str| -> String {
+            let copy = cache.join("box/data").join(name);
+            let abs = format!("/data/{name}");
+            let (origin, hooks) = boxed(&abs);
+            let known = format!("box:{abs}");
+            let e = open_copy(kind, origin, &copy, &known, &cache, &hooks, Vec::new())
+                .expect_err("nothing to open");
+            let said = format!("{e:#}");
+            assert!(
+                !said.contains(cache.to_str().unwrap()),
+                "the cache copy is named: {said}"
+            );
+            said
+        };
+        // No copy there: the read fails.
+        let image = said(Kind::Image, "gone.png");
+        assert!(
+            image.starts_with("cannot read box:/data/gone.png: "),
+            "{image}"
+        );
+        match sopen::ffmpeg::resolve() {
+            Ok(_) => {}
+            Err(e) if std::env::var_os("SOPEN_REQUIRE_FFMPEG").is_some() => {
+                panic!("SOPEN_REQUIRE_FFMPEG is set but {e}")
+            }
+            Err(e) => return eprintln!("skipping: {e}"),
+        }
+        std::fs::write(cache.join("box/data/k_zero.mp4"), b"").unwrap();
+        let video = said(Kind::Video, "k_zero.mp4");
+        assert!(
+            video.starts_with("ffprobe cannot read box:/data/k_zero.mp4: "),
+            "{video}"
+        );
+    }
 
     #[test]
     fn cli_shapes() {

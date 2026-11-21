@@ -2310,6 +2310,82 @@ fn offsets_read_decimal_then_hex_and_widen_with_the_file() {
     }
 }
 
+/// Go to is the field's until it is left, whether or not the platform says the window has the
+/// keyboard: an offset typed after F6 or Cmd/Ctrl+G never lands on bytes. Here the window is
+/// without the keyboard throughout (a receipt window that came up behind another one).
+#[test]
+fn go_to_takes_the_typing_in_a_window_without_focus() {
+    for (opener, modifiers) in [(Key::F6, Modifiers::NONE), (Key::G, command(false))] {
+        let mut fx = fetched("blob.bin", FIXTURE, 1000.0, 600.0);
+        fx.drv.focused = false;
+        fx.key(opener, modifiers);
+        fx.drv.idle(&mut fx.win, 2);
+        fx.typed("0x10");
+        assert_eq!(fx.win.doc.changed_count(), 0, "no byte was typed");
+        assert_eq!(fx.win.goto, "0x10", "the typing went to the field");
+        fx.key(Key::Enter, Modifiers::NONE);
+        assert_eq!(fx.at(), 0x10);
+        assert_eq!(fx.win.doc.changed_count(), 0);
+    }
+}
+
+/// …and with a real keyboard: Go to opened, the owner away in another application for a pass,
+/// back, the offset, Enter.
+#[test]
+fn go_to_is_still_open_after_the_window_lost_focus() {
+    for (opener, modifiers) in [(Key::F6, Modifiers::NONE), (Key::G, command(false))] {
+        let mut fx = fetched("blob.bin", FIXTURE, 1000.0, 600.0);
+        fx.key(opener, modifiers);
+        fx.drv.focused = false;
+        fx.drv.idle(&mut fx.win, 1);
+        fx.drv.focused = true;
+        fx.typed("0x10");
+        assert_eq!(fx.win.doc.changed_count(), 0, "no byte was typed");
+        assert_eq!(fx.win.goto, "0x10", "the typing went to the field");
+        fx.key(Key::Enter, Modifiers::NONE);
+        assert_eq!(fx.at(), 0x10);
+        assert_eq!(fx.win.doc.changed_count(), 0);
+    }
+}
+
+/// After that round trip Go to is left as ever — by Esc, or by a click on the grid — and the
+/// grid has the typing again: a byte typed then lands at the cursor, not in the field.
+#[test]
+fn leaving_go_to_after_the_window_lost_focus_gives_the_grid_the_typing() {
+    for click in [false, true] {
+        let mut fx = fetched("blob.bin", FIXTURE, 1000.0, 600.0);
+        fx.key(Key::F6, Modifiers::NONE);
+        fx.drv.focused = false;
+        fx.drv.idle(&mut fx.win, 1);
+        fx.drv.focused = true;
+        fx.drv.idle(&mut fx.win, 1);
+        assert_eq!(
+            fx.drv.ctx.memory(|m| m.focused()),
+            Some(goto_id()),
+            "still open"
+        );
+        let at = if click {
+            let at = fx.pos(3, Pane::Hex);
+            fx.drv.click(&mut fx.win, at);
+            3
+        } else {
+            fx.key(Key::Escape, Modifiers::NONE);
+            0
+        };
+        fx.drv.idle(&mut fx.win, 1);
+        assert_ne!(
+            fx.drv.ctx.memory(|m| m.focused()),
+            Some(goto_id()),
+            "click={click}: Go to was left"
+        );
+        assert_eq!(fx.at(), at, "click={click}");
+        fx.typed("7A");
+        assert_eq!(fx.win.goto, "", "click={click}: nothing went to the field");
+        assert_eq!(fx.win.doc.cell(at), Cell::Byte(0x7A), "click={click}");
+        assert_eq!(fx.win.doc.changed_count(), 1, "click={click}");
+    }
+}
+
 /// On its own the window's bottom row is PC Shell's F-key row with what works here: F3 Exit,
 /// F5 Save, F6 Goto, F8 Asc/hx — each the same as the key it stands for.
 #[test]

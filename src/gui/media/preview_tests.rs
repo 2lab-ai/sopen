@@ -117,6 +117,7 @@ fn prepare_in(tools: &Tools, path: &Path, held: &Held, children: &Children) -> R
         tools,
         &Input::path(path),
         &name,
+        &path.display().to_string(),
         kind_of(path),
         children,
         held,
@@ -491,6 +492,8 @@ fn a_handed_over_video_keeps_its_frame_and_plays() {
         );
         fx.drv.drag(&mut fx.win, PointerButton::Primary, a, b);
         assert_eq!(fx.win.crop(), Some([20, 30, 180, 120]));
+        // Whatever it started has ended before it returns.
+        assert_none_left(fx.tmp.path());
     });
 }
 
@@ -512,6 +515,8 @@ fn a_handed_over_short_sound_keeps_its_waveform() {
         assert!(fx.drv.find_text("reading the waveform…").is_none());
         let tall = fx.wave().iter().filter(|(_, h)| *h > 20.0).count();
         assert!(tall > 300, "its waveform, painted: {tall} columns");
+        // Whatever it started has ended before it returns.
+        assert_none_left(fx.tmp.path());
     });
 }
 
@@ -601,6 +606,8 @@ fn a_handed_over_long_sound_decodes_on_from_where_the_preview_stopped() {
             .filter(|h| **h < kept * 5.0)
             .count();
         assert_eq!(low, 0, "every column past the mark shows it");
+        // Whatever it started has ended before it returns.
+        assert_none_left(fx.tmp.path());
     });
 }
 
@@ -1045,6 +1052,7 @@ fn a_file_ffprobe_cannot_read_is_said_and_a_ts_is_not_media() {
                 &tools,
                 &Input::path(&ts),
                 "stream.ts",
+                "stream.ts",
                 Kind::Video,
                 &Children::default(),
                 &held
@@ -1101,7 +1109,7 @@ fn export_ends(fx: &mut Fx, hold: &Hold) {
 /// the test's.
 fn opened(tmp: Dir, path: PathBuf, tools: &Tools, hand: &Hand) -> Fx {
     let name = path.file_name().unwrap().to_string_lossy().into_owned();
-    let media = Media::unplanned(tools, &Input::path(&path), &name).unwrap();
+    let media = Media::unplanned(tools, &Input::path(&path), &name, &name).unwrap();
     let file = MediaFile::new(Fx::origin(&path), &tmp.path().join("cache"));
     let mut win = MediaWindow::new(
         media,
@@ -1734,6 +1742,8 @@ fn a_video_of_wide_pixels_is_shown_in_its_shape() {
         );
         fx.drv.drag(&mut fx.win, PointerButton::Primary, a, b);
         assert_eq!(fx.win.crop(), Some([100, 100, 400, 300]));
+        // Whatever it started has ended before it returns.
+        assert_none_left(fx.tmp.path());
     });
 }
 
@@ -1779,12 +1789,14 @@ fn a_six_channel_sound_shows_its_first_two_channels_by_name() {
         fx.drv.idle(&mut fx.win, 3);
         let (front_left, front_right) = lanes(&fx);
         assert!(front_left > 20.0 && front_right < 2.0, "opened");
+        // Whatever it started has ended before it returns.
+        assert_none_left(fx.tmp.path());
     });
 }
 
 /// A window whose first frame is still being looked for (its ffmpeg held by the test; an
 /// Export's ffmpeg held apart, and never let go) on a real clip.
-fn opened_with_a_stalled_first_frame(t: &Test, real: &Tools) -> (Fx, Hold) {
+fn opened_with_a_stalled_first_frame(t: &Test, real: &Tools) -> (Fx, Hold, [Hold; 2]) {
     let tmp = t.tmp();
     let path = tmp.path().join("clip.mp4");
     clip(real, &path, (320, 240));
@@ -1806,7 +1818,29 @@ fn opened_with_a_stalled_first_frame(t: &Test, real: &Tools) -> (Fx, Hold) {
     let mut fx = opened(tmp, path, &tools, &t.hand());
     fx.drv.idle(&mut fx.win, 3);
     assert!(fx.win.tex.is_none(), "no frame yet");
-    (fx, frame)
+    let held = [frame.clone(), export];
+    (fx, frame, held)
+}
+
+/// The last thing such a test does: whatever of it still waits at a hold — an Export's ffmpeg
+/// (the window does not kill a write), a frame's decode asked for by the test's last key — is
+/// let go until the window writes nothing and no process of the test is there; then nothing is
+/// left. (A test that returned with one still waiting would leave it to its supervisor, which
+/// counts what it has to kill.)
+fn nothing_stays_held(fx: &mut Fx, held: &[Hold; 2]) {
+    let give_up = Instant::now() + Duration::from_secs(120);
+    while fx.win.job.is_some() || fx.win.save.is_some() || naming(fx.tmp.path()) > 0 {
+        assert!(
+            Instant::now() < give_up,
+            "something of the test never ended"
+        );
+        for hold in held {
+            hold.let_go();
+        }
+        fx.drv.idle(&mut fx.win, 1);
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_none_left(fx.tmp.path());
 }
 
 /// Lets the held frame decodes fail, one after the other, until `done`.
@@ -1829,7 +1863,7 @@ fn until_the_frame_has_failed(fx: &mut Fx, frame: &Hold, done: impl Fn(&MediaWin
 fn a_first_frame_that_fails_does_not_close_an_edited_window() {
     let Some(real) = tools_or_skip() else { return };
     bounded(180, move |t| {
-        let (mut fx, frame) = opened_with_a_stalled_first_frame(t, &real);
+        let (mut fx, frame, held) = opened_with_a_stalled_first_frame(t, &real);
         // In at 0, the playhead on to 1 s, Out, Delete: a second cut out.
         for key in [Key::I, Key::ArrowRight, Key::O, Key::Delete] {
             fx.drv.key(&mut fx.win, key, Modifiers::NONE);
@@ -1862,6 +1896,7 @@ fn a_first_frame_that_fails_does_not_close_an_edited_window() {
         assert_eq!(fx.win.failure(), None, "it has a history");
         assert!(!fx.drv.closed(), "the window stays");
         assert!(fx.win.timeline.can_redo(), "the history is intact");
+        nothing_stays_held(&mut fx, &held);
     });
 }
 
@@ -1871,7 +1906,7 @@ fn a_first_frame_that_fails_does_not_close_an_edited_window() {
 fn a_first_frame_that_fails_does_not_close_a_window_that_is_writing() {
     let Some(real) = tools_or_skip() else { return };
     bounded(180, move |t| {
-        let (mut fx, frame) = opened_with_a_stalled_first_frame(t, &real);
+        let (mut fx, frame, held) = opened_with_a_stalled_first_frame(t, &real);
         fx.drv.key(&mut fx.win, Key::E, Modifiers::NONE);
         assert!(
             fx.win.job.is_some(),
@@ -1889,6 +1924,7 @@ fn a_first_frame_that_fails_does_not_close_a_window_that_is_writing() {
         assert!(fx.win.job.is_some(), "the export goes on");
         assert!(!fx.win.close_requested(), "closing waits for the export");
         assert!(fx.win.close_when_done);
+        nothing_stays_held(&mut fx, &held);
     });
 }
 
@@ -1897,10 +1933,11 @@ fn a_first_frame_that_fails_does_not_close_a_window_that_is_writing() {
 fn a_first_frame_that_fails_closes_a_window_as_it_was_opened() {
     let Some(real) = tools_or_skip() else { return };
     bounded(180, move |t| {
-        let (mut fx, frame) = opened_with_a_stalled_first_frame(t, &real);
+        let (mut fx, frame, held) = opened_with_a_stalled_first_frame(t, &real);
         until_the_frame_has_failed(&mut fx, &frame, |w| w.failure().is_some());
         assert!(fx.win.failure().unwrap().contains("no frame"));
         assert!(fx.win.close_requested(), "it goes without a question");
+        nothing_stays_held(&mut fx, &held);
     });
 }
 
@@ -1969,7 +2006,7 @@ fn an_edit_or_an_export_after_the_failure_keeps_the_window() {
     for exporting in [false, true] {
         let real = real.clone();
         bounded(180, move |t| {
-            let (mut fx, frame) = opened_with_a_stalled_first_frame(t, &real);
+            let (mut fx, frame, held) = opened_with_a_stalled_first_frame(t, &real);
             until_the_frame_has_failed(&mut fx, &frame, |w| w.failed.is_some());
             assert!(fx.win.outcome.lock().unwrap().failed.is_some(), "recorded");
             // Before the close it asked for is asked of it.
@@ -1992,6 +2029,7 @@ fn an_edit_or_an_export_after_the_failure_keeps_the_window() {
             }
             assert_eq!(fx.win.failure(), None, "no longer a failed open");
             assert!(fx.win.outcome.lock().unwrap().failed.is_none());
+            nothing_stays_held(&mut fx, &held);
         });
     }
 }

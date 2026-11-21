@@ -223,7 +223,8 @@ fn prepare_with(
             // Always a copy, as the standalone route makes it: Save needs the bytes as opened.
             let fetched = fetch(&mut fs)?;
             let bytes = std::fs::read(&fetched.claim.local)
-                .with_context(|| format!("cannot read {}", fetched.claim.local.display()))?;
+                // Read from the private copy, said about the file: the copy is never named.
+                .with_context(|| format!("cannot read {}", req.show()))?;
             let doc = Doc::decode(&bytes)?;
             let file = ImageFile::new(req.origin(fs, fetched.at), bytes, req.cache);
             Ok(Prepared::Image {
@@ -243,7 +244,10 @@ fn prepare_with(
                 // A `.ts` ffprobe cannot read as media: the hex view, on the copy already here.
                 return hex_of(req, fs, stat, fetched);
             }
-            let media = Media::probe(&path)?;
+            // From here on the file is named as its owner knows it (`host:/abs`), whichever
+            // path it is read from: the private copy's is never said.
+            let (_, name) = crate::remote::split_parent(req.abs);
+            let media = Media::probe_shown(&Input::path(&path), name, &req.show())?;
             let (notices, claim) = match fetched {
                 Some(f) => (f.notices, Some(f.claim)),
                 None => (Vec::new(), None),
@@ -277,7 +281,7 @@ fn prepare_with(
                 None => PathBuf::from(req.abs),
             };
             text::warm();
-            let doc = TextDoc::open_cancellable(&path, cancel)?;
+            let doc = TextDoc::open_cancellable_as(&path, &req.show(), cancel)?;
             let (notices, claim) = match fetched {
                 Some(f) => (f.notices, Some(f.claim)),
                 None => (Vec::new(), None),
@@ -315,7 +319,7 @@ fn hex_of(
         Some(f) => (f.claim.local.clone(), f.at, f.notices, Some(f.claim)),
         None => (PathBuf::from(req.abs), stat, Vec::new(), None),
     };
-    let base = hex::Base::open(&path)?;
+    let base = hex::Base::open_as(&path, &req.show())?;
     Ok(Prepared::Hex {
         file: HexFile::new(req.origin(fs, at), base, claim, req.cache),
         notices,
@@ -1198,7 +1202,10 @@ fn preview_parts(
         let input = Input::path(&path);
         // The file's own name (a link's target's): its extension says how it is rendered.
         let name = crate::remote::split_parent(&real).1;
-        let found = media::preview::prepare(&tools, &input, name, kind, &budget.children, &watch)?;
+        // Named as its owner knows it: `path` may be the private preview copy.
+        let shown = show(label, &real);
+        let found =
+            media::preview::prepare(&tools, &input, name, &shown, kind, &budget.children, &watch)?;
         let parts = match found {
             media::preview::Found::Media(made) => {
                 if made.media.video.is_none() {
@@ -1211,7 +1218,12 @@ fn preview_parts(
             }
             // A `.ts` ffprobe cannot read as media: the hex view, as Enter shows it.
             media::preview::Found::NotMedia => Parts::Hex {
-                file: HexFile::new(origin(at)?, hex::Base::open(&path)?, None, cache),
+                file: HexFile::new(
+                    origin(at)?,
+                    hex::Base::open_as(&path, &show(label, &real))?,
+                    None,
+                    cache,
+                ),
             },
         };
         // Once more before handing the preview over: a cancel meanwhile drops it here.
@@ -1246,7 +1258,9 @@ fn preview_parts(
         }
         Kind::Text => {
             text::warm();
-            let doc = TextDoc::open_capped(&path, &|| budget.limit(limits.text), &check)?;
+            let shown = show(label, &real);
+            let doc =
+                TextDoc::open_capped_as(&path, &shown, &|| budget.limit(limits.text), &check)?;
             Parts::Text {
                 doc,
                 title: show(label, &real),
@@ -1255,7 +1269,7 @@ fn preview_parts(
             }
         }
         Kind::Other | Kind::Directory => {
-            let base = hex::Base::open(&path)?;
+            let base = hex::Base::open_as(&path, &show(label, &real))?;
             Parts::Hex {
                 file: HexFile::new(origin(at)?, base, None, cache),
             }

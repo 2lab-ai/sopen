@@ -354,16 +354,35 @@ fn split_ext(name: &str) -> (&str, &str) {
 /// nor moves aside the copy another session is editing. Session copies stay until the cache is
 /// cleared: sopen never deletes them.
 pub fn claim(cache: &Path, host: &str, abs: &str) -> Result<Claim> {
-    claim_with(cache, &cache_path(cache, host, abs), &mut |file| {
-        file.try_lock()
-    })
+    claim_with(
+        cache,
+        &cache_path(cache, host, abs),
+        HELD_RETRY,
+        &mut |file| file.try_lock(),
+    )
 }
 
+/// How long a claim goes on asking for a lock it found held, and how often, before it takes the
+/// copy for another session's ([`claim_with`]).
+const HELD_RETRY: std::time::Duration = std::time::Duration::from_millis(100);
+const HELD_RETRY_EVERY: std::time::Duration = std::time::Duration::from_millis(5);
+
 /// [`claim`] of the cached copy `cached`, with `try_lock` standing in for `File::try_lock`
-/// (tests: a filesystem whose locks fail).
+/// (tests: a filesystem whose locks fail) and `held_retry` for [`HELD_RETRY`] (tests: a window
+/// long or short enough that no clock decides them).
+///
+/// A lock found held is asked for again, every [`HELD_RETRY_EVERY`] for up to `held_retry`,
+/// before this session takes a copy of its own. The reason is sopen's own children: on Linux
+/// each is started with a `pre_exec` (`PR_SET_PDEATHSIG`, S1-M), so it is forked, and between
+/// its fork and its exec it holds a copy of every descriptor of this process — the lock of a
+/// claim this process has just let go included (close-on-exec only takes it away at the exec).
+/// A claim of the same copy made in that instant would find the lock held by no session at
+/// all, and fall back for nothing. Such a lock is free within milliseconds; another session's
+/// is held for as long as it lives, so that one costs the wait once and then gets its copy.
 fn claim_with(
     cache: &Path,
     cached: &Path,
+    held_retry: std::time::Duration,
     try_lock: &mut dyn FnMut(&File) -> std::result::Result<(), std::fs::TryLockError>,
 ) -> Result<Claim> {
     if let Some(dir) = cached.parent() {
@@ -372,7 +391,16 @@ fn claim_with(
     let (file, lock) = open_lock(cache, cached)?;
     // Held by another session, or not lockable here at all: either way this session must not
     // work on the shared copy.
-    let why = match try_lock(&file) {
+    let asked = std::time::Instant::now();
+    let tried = loop {
+        match try_lock(&file) {
+            Err(std::fs::TryLockError::WouldBlock) if asked.elapsed() < held_retry => {
+                std::thread::sleep(HELD_RETRY_EVERY);
+            }
+            tried => break tried,
+        }
+    };
+    let why = match tried {
         Ok(()) => {
             return Ok(Claim {
                 local: cached.to_path_buf(),
@@ -969,6 +997,57 @@ mod job_tests {
 
 #[cfg(test)]
 mod tests {
+    /// A lock found held is asked for again for a moment before the claim takes the copy for
+    /// another session's: one let go within that moment (a child of sopen's, between its fork
+    /// and its exec, holds a copy of a lock this process has just released) gives the shared
+    /// copy, with no session copy made; one held past it is another session's, as before.
+    /// No clock decides either half: the first has a window far longer than the test and lets
+    /// the lock go only once the claim has found it held; the second holds it for good.
+    #[test]
+    fn a_claim_waits_a_moment_for_a_lock_it_found_held() {
+        use std::time::Duration;
+        let tmp = tempfile::tempdir().unwrap();
+        let cached = cache_path(tmp.path(), "box", "/data/a.bin");
+        let (held, _) = open_lock(tmp.path(), &cached).unwrap();
+        held.try_lock().unwrap();
+        // Let go when the claim says it found the lock held — not after some time.
+        let (found_held, told) = std::sync::mpsc::channel::<()>();
+        let release = std::thread::spawn(move || {
+            told.recv().expect("the claim found the lock held");
+            drop(held);
+        });
+        let mut found = 0;
+        let claim = claim_with(tmp.path(), &cached, Duration::from_secs(30), &mut |file| {
+            let tried = file.try_lock();
+            if matches!(tried, Err(std::fs::TryLockError::WouldBlock)) {
+                found += 1;
+                if found == 1 {
+                    found_held.send(()).unwrap();
+                }
+            }
+            tried
+        })
+        .unwrap();
+        release.join().unwrap();
+        assert!(found >= 1, "it was held when the claim first asked");
+        assert_eq!(claim.note, None, "the shared copy, not a session copy");
+        assert_eq!(claim.local, cached);
+        assert!(
+            !tmp.path().join(SESSIONS).exists(),
+            "no session copy was made"
+        );
+        // `claim` holds it now, for as long as it lives: another session. A short window, and
+        // the whole of it is waited before the fallback.
+        let window = Duration::from_millis(50);
+        let asked = std::time::Instant::now();
+        let second = claim_with(tmp.path(), &cached, window, &mut |file| file.try_lock()).unwrap();
+        assert!(asked.elapsed() >= window, "it asked for the whole window");
+        assert!(second
+            .note
+            .is_some_and(|n| n.contains("another sopen session has")));
+        assert!(second.local.starts_with(tmp.path().join(SESSIONS)));
+    }
+
     use super::*;
     use std::time::Duration;
 
@@ -1298,8 +1377,8 @@ mod tests {
         let cached = cache_path(tmp.path(), "box", "/a.txt");
         let unsupported =
             || std::fs::TryLockError::Error(std::io::Error::from(std::io::ErrorKind::Unsupported));
-        let one = claim_with(tmp.path(), &cached, &mut |_| Err(unsupported())).unwrap();
-        let two = claim_with(tmp.path(), &cached, &mut |_| Err(unsupported())).unwrap();
+        let one = claim_with(tmp.path(), &cached, HELD_RETRY, &mut |_| Err(unsupported())).unwrap();
+        let two = claim_with(tmp.path(), &cached, HELD_RETRY, &mut |_| Err(unsupported())).unwrap();
         for c in [&one, &two] {
             assert_ne!(c.local, cached);
             let name = c.local.file_name().unwrap().to_string_lossy().into_owned();

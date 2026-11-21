@@ -280,13 +280,15 @@ pub enum Found {
     NotMedia,
 }
 
-/// Makes the preview of the media file `input` (named `name`; `kind` by its name and first
-/// bytes): the probe, then the first frame (video) or the waveform (sound) — each a step with
+/// Makes the preview of the media file `input` (named `name`, and `shown` in what is said of
+/// it: the file as its owner knows it — `input` may be a private preview copy, whose path is
+/// never said; `kind` by its name and first bytes): the probe, then the first frame (video) or the waveform (sound) — each a step with
 /// its own time, and all of it stopped as soon as `watch` says so.
 pub fn prepare(
     tools: &Tools,
     input: &Input,
     name: &str,
+    shown: &str,
     kind: Kind,
     children: &Children,
     watch: &dyn Watch,
@@ -301,7 +303,7 @@ pub fn prepare(
     if kind::refine_after_fetch(name, kind, streams) == Kind::Other {
         return Ok(Found::NotMedia);
     }
-    let media = Media::of_probe(tools.clone(), input, name, probed?)?;
+    let media = Media::of_probe(tools.clone(), input, name, shown, probed?)?;
     let (mut frame, mut peaks, mut cut) = (None, None, None);
     match media.decode_size() {
         Some((w, h)) => {

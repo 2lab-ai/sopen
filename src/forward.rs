@@ -17,7 +17,7 @@ use std::process::{Command, ExitStatus};
 /// Receipt hooks (AGENTS.md "Receipts") a forwarded run carries to HOST. Settings that name local
 /// paths — `SOPEN_CODE`, `SOPEN_ZED`, `SOPEN_FFMPEG`, `SOPEN_FFPROBE`, `SOPEN_CACHE_DIR`, `SOPEN_STATE_DIR`,
 /// `SOPEN_CONFIG` — mean nothing on HOST and stay here.
-pub const FORWARDED_ENV: [&str; 16] = [
+pub const FORWARDED_ENV: [&str; 17] = [
     "SOPEN_STATE",
     "SOPEN_SCREENSHOT",
     "SOPEN_WATCHDOG",
@@ -29,6 +29,7 @@ pub const FORWARDED_ENV: [&str; 16] = [
     "SOPEN_WINDOW_SIZE",
     "SOPEN_CHOICE",
     "SOPEN_SAVE_TO",
+    "SOPEN_SAVE_HOLD_MS",
     "SOPEN_LIST",
     "SOPEN_LOG",
     "SOPEN_TARGET_BIN",

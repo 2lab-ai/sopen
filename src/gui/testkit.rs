@@ -34,6 +34,10 @@ pub struct Driver {
     /// Closes the window refused (the shell cancelled them) and whether one went through.
     pub refused_closes: usize,
     pub window_closed: bool,
+    /// Whether the platform says the window has the keyboard (`RawInput::focused`): `false` is
+    /// a window behind another one — a receipt window that came up without focus, or the owner
+    /// in another application for a moment.
+    pub focused: bool,
 }
 
 impl Driver {
@@ -57,6 +61,7 @@ impl Driver {
             close_pending: false,
             refused_closes: 0,
             window_closed: false,
+            focused: true,
         }
     }
 
@@ -88,7 +93,7 @@ impl Driver {
             time: Some(self.time),
             max_texture_side: Some(8192),
             events: all,
-            focused: true,
+            focused: self.focused,
             ..Default::default()
         };
         let delivered = self.shell && std::mem::take(&mut self.close_pending);

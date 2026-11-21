@@ -121,6 +121,10 @@ pub struct TextDoc {
     after_pass: Now,
     /// The path it was opened by (the local file, or the session's cached copy).
     path: std::path::PathBuf,
+    /// The file as its owner knows it — `host:/abs` when `path` is a remote file's copy, else
+    /// the path itself: how every message about a read of it names it, in the first pass and
+    /// in any later one. The copy's path is never said.
+    shown: String,
     /// Bytes read for lines (not the index pass) — what paging costs.
     page_reads: u64,
     /// The index pass stopped short of the file, at a preview's budget (02 §4.3): where it
@@ -228,10 +232,18 @@ impl TextDoc {
         Self::open_with(path, cancel, &mut |_| {})
     }
 
+    /// [`TextDoc::open_cancellable`] of a remote file's copy in sopen's cache: what fails is
+    /// said about `shown`, the file as its owner knows it (`host:/abs`) — never about the
+    /// copy's path.
+    pub fn open_cancellable_as(path: &Path, shown: &str, cancel: &AtomicBool) -> Result<Self> {
+        Self::open_scan(path, shown, &|| None, &|| stopped(cancel), &mut |_| {})
+    }
+
     /// [`TextDoc::open_cancellable`], with `on_chunk(bytes indexed so far)` after every chunk
     /// (tests: a cancel, or a writer, in the middle of the pass).
     fn open_with(path: &Path, cancel: &AtomicBool, on_chunk: &mut dyn FnMut(u64)) -> Result<Self> {
-        Self::open_scan(path, &|| None, &|| stopped(cancel), on_chunk)
+        let shown = path.display().to_string();
+        Self::open_scan(path, &shown, &|| None, &|| stopped(cancel), on_chunk)
     }
 
     /// Opens `path` and indexes its lines as far as `cap()` says (asked again after every
@@ -244,21 +256,34 @@ impl TextDoc {
         cap: &dyn Fn() -> Option<u64>,
         check: &dyn Fn() -> Result<()>,
     ) -> Result<Self> {
-        Self::open_scan(path, cap, check, &mut |_| {})
+        Self::open_capped_as(path, &path.display().to_string(), cap, check)
+    }
+
+    /// [`TextDoc::open_capped`] of a remote file's private copy: what fails — now, and in every
+    /// later pass over the copy — is said about `shown`, the file as its owner knows it
+    /// (`host:/abs`), never about the copy's path.
+    pub fn open_capped_as(
+        path: &Path,
+        shown: &str,
+        cap: &dyn Fn() -> Option<u64>,
+        check: &dyn Fn() -> Result<()>,
+    ) -> Result<Self> {
+        Self::open_scan(path, shown, cap, check, &mut |_| {})
     }
 
     fn open_scan(
         path: &Path,
+        shown: &str,
         cap: &dyn Fn() -> Option<u64>,
         check: &dyn Fn() -> Result<()>,
         on_chunk: &mut dyn FnMut(u64),
     ) -> Result<Self> {
         check()?;
         let started = std::time::Instant::now();
-        let file = File::open(path).with_context(|| format!("cannot open {}", path.display()))?;
+        let file = File::open(path).with_context(|| format!("cannot open {shown}"))?;
         let meta = file
             .metadata()
-            .with_context(|| format!("cannot stat {}", path.display()))?;
+            .with_context(|| format!("cannot stat {shown}"))?;
         let opened = identity(&meta);
         let mut scan = Scan::default();
         if cap().is_some() {
@@ -266,8 +291,8 @@ impl TextDoc {
             // bytes it indexed are still the file's when the file was written to since.
             scan.hasher = Some(sha2::Sha256::default());
         }
-        scan.run(&file, path, opened.2, cap, check, on_chunk)?;
-        let mut doc = Self::indexed(file, scan, opened, path.to_path_buf());
+        scan.run(&file, path, shown, opened.2, cap, check, on_chunk)?;
+        let mut doc = Self::indexed(file, scan, opened, path.to_path_buf(), shown.to_string());
         doc.indexed_in = started.elapsed();
         // Checked here, right after the pass (on the opener's or re-read's worker), as well as
         // when the viewer takes the index: a change between the two is caught by one of them.
@@ -277,7 +302,13 @@ impl TextDoc {
 
     /// The index a pass found (`scan`), for the file as `opened`: of the bytes it read, and no
     /// mark at or past their end. A pass the cap stopped keeps what it found, to go on from.
-    fn indexed(file: File, scan: Scan, opened: Identity, path: std::path::PathBuf) -> Self {
+    fn indexed(
+        file: File,
+        scan: Scan,
+        opened: Identity,
+        path: std::path::PathBuf,
+        shown: String,
+    ) -> Self {
         // The bytes actually indexed (fewer than the size as opened if it shrank meanwhile: the
         // change is noticed later).
         let mut doc = Self {
@@ -291,6 +322,7 @@ impl TextDoc {
             indexed_in: std::time::Duration::ZERO,
             after_pass: Now::Same,
             path,
+            shown,
             page_reads: 0,
             rest: None,
             #[cfg(test)]
@@ -336,6 +368,7 @@ impl TextDoc {
             indexed_in: std::time::Duration::ZERO,
             after_pass: Now::Same,
             path: std::path::PathBuf::new(),
+            shown: String::new(),
             page_reads: 0,
             rest: None,
             #[cfg(test)]
@@ -588,6 +621,7 @@ impl TextDoc {
         scan.run(
             &file,
             &self.path,
+            &self.shown,
             self.opened.2,
             &|| None,
             &|| stopped(cancel),
@@ -596,7 +630,13 @@ impl TextDoc {
         if !self.prefix_unchanged(&file, &before) {
             return Err(anyhow::Error::new(Stale));
         }
-        let mut doc = Self::indexed(file, scan, self.opened, self.path.clone());
+        let mut doc = Self::indexed(
+            file,
+            scan,
+            self.opened,
+            self.path.clone(),
+            self.shown.clone(),
+        );
         doc.indexed_in = self.indexed_in + started.elapsed();
         doc.after_pass = doc.now();
         Ok(doc)
@@ -694,6 +734,7 @@ impl TextDoc {
             indexed_in: self.indexed_in,
             after_pass: self.after_pass,
             path: self.path.clone(),
+            shown: self.shown.clone(),
             page_reads: 0,
             rest: self.rest.clone(),
             #[cfg(test)]
@@ -1047,19 +1088,24 @@ impl Scan {
         self.at += bytes.len() as u64;
     }
 
-    /// The pass over `file` (opened at `path`, `size` bytes as opened) from where it is, to the
+    /// The pass over `file` (opened at `path`, named `shown` in what is said, `size` bytes as opened) from where it is, to the
     /// end of those bytes or to `cap()` (asked before every read); `check()` after every read.
     /// Stops early, not capped, where the file ends sooner (it shrank meanwhile: the change is
     /// noticed later).
+    #[allow(clippy::too_many_arguments)]
     fn run(
         &mut self,
         file: &File,
         path: &Path,
+        shown: &str,
         size: u64,
         cap: &dyn Fn() -> Option<u64>,
         check: &dyn Fn() -> Result<()>,
         on_chunk: &mut dyn FnMut(u64),
     ) -> Result<()> {
+        // Only the tests' read log and their failing reads name the path.
+        #[cfg(not(test))]
+        let _ = path;
         if self.marks.is_empty() {
             self.marks.push(Mark { line: 0, offset: 0 });
         }
@@ -1081,9 +1127,16 @@ impl Scan {
             if want == 0 {
                 return Ok(());
             }
-            let n = file
-                .read_at(&mut buf[..want], self.at)
-                .with_context(|| format!("cannot read {}", path.display()))?;
+            #[cfg(test)]
+            let failing = fails_index_reads(path);
+            #[cfg(not(test))]
+            let failing = false;
+            let read = if failing {
+                Err(std::io::Error::other("the read was made to fail"))
+            } else {
+                file.read_at(&mut buf[..want], self.at)
+            };
+            let n = read.with_context(|| format!("cannot read {shown}"))?;
             if n == 0 {
                 return Ok(());
             }
@@ -1102,6 +1155,28 @@ impl Scan {
 #[cfg(test)]
 static INDEX_READS: std::sync::Mutex<Vec<(std::path::PathBuf, u64, u64)>> =
     std::sync::Mutex::new(Vec::new());
+
+/// Tests: the files whose index pass fails its next read (a disk that gives out mid-way).
+#[cfg(test)]
+static FAILING_INDEX_READS: std::sync::Mutex<Vec<std::path::PathBuf>> =
+    std::sync::Mutex::new(Vec::new());
+
+#[cfg(test)]
+pub(crate) fn fail_index_reads(path: &Path) {
+    FAILING_INDEX_READS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .push(path.to_path_buf());
+}
+
+#[cfg(test)]
+fn fails_index_reads(path: &Path) -> bool {
+    FAILING_INDEX_READS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .iter()
+        .any(|p| p == path)
+}
 
 #[cfg(test)]
 fn log_index_read(path: &Path, at: u64, n: u64) {

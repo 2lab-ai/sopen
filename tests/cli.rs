@@ -22,13 +22,82 @@ fn sopen_command(home: &Path) -> Command {
     cmd
 }
 
+/// How long a run that should end by itself may take — its exit and the end of its output
+/// together — before the test gives up on it.
+const RUN_LIMIT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// A child that is killed and reaped when this goes, whatever way the test leaves (a panic
+/// included), unless its exit was already seen.
+struct Reaped(Option<std::process::Child>);
+
+impl Drop for Reaped {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.0.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+/// Everything `pipe` gives until its end, sent when the end comes. A pipe some descendant
+/// keeps open never ends: then nothing is sent, and the receiver's deadline says so.
+fn collected(
+    pipe: Option<impl std::io::Read + Send + 'static>,
+) -> std::sync::mpsc::Receiver<Vec<u8>> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        if let Some(mut pipe) = pipe {
+            let _ = pipe.read_to_end(&mut bytes);
+        }
+        let _ = tx.send(bytes);
+    });
+    rx
+}
+
+/// Runs sopen to its end and returns what it printed. One deadline, [`RUN_LIMIT`], covers the
+/// child's exit and the end of both its outputs: a run that is still there, or whose output
+/// never ends (a descendant holding a pipe open), fails the test within it instead of hanging
+/// the suite. The child is under a kill-and-reap guard from the moment it is spawned.
 fn sopen(home: &Path, args: &[&str], env: &[(&str, &str)]) -> Output {
     let mut cmd = sopen_command(home);
-    cmd.args(args);
+    cmd.args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
     for (k, v) in env {
         cmd.env(k, v);
     }
-    cmd.output().unwrap()
+    let mut guard = Reaped(Some(cmd.spawn().unwrap()));
+    let child = guard.0.as_mut().unwrap();
+    // Both pipes are read while it runs, so a run that prints a lot is never stuck on a full
+    // pipe.
+    let stdout = collected(child.stdout.take());
+    let stderr = collected(child.stderr.take());
+    let deadline = std::time::Instant::now() + RUN_LIMIT;
+    let status = loop {
+        if let Some(status) = guard.0.as_mut().unwrap().try_wait().unwrap() {
+            break status;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "sopen {args:?} did not end within {RUN_LIMIT:?}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    };
+    // Exited and reaped: nothing is left for the guard to kill.
+    guard.0 = None;
+    let until_end = |rx: std::sync::mpsc::Receiver<Vec<u8>>, what: &str| {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        rx.recv_timeout(left).unwrap_or_else(|_| {
+            panic!("sopen {args:?} exited, but its {what} did not end within {RUN_LIMIT:?}")
+        })
+    };
+    Output {
+        status,
+        stdout: until_end(stdout, "stdout"),
+        stderr: until_end(stderr, "stderr"),
+    }
 }
 
 fn text(bytes: &[u8]) -> String {
@@ -153,6 +222,277 @@ fn other_files_save_to_a_path_or_cancel_and_log_usage() {
         &[("SOPEN_CHOICE", "maybe")],
     );
     assert_eq!(out.status.code(), Some(1));
+}
+
+/// A windowless "Save to…" (`SOPEN_CHOICE=save` into `out`) of a 3 MiB file, held at its first
+/// megabyte by `SOPEN_SAVE_HOLD_MS`: the running sopen, and its private staging folder in `out`
+/// once `part` holds bytes. The child is killed and reaped when this goes.
+struct HeldSave {
+    child: Option<std::process::Child>,
+    staging: PathBuf,
+}
+
+impl HeldSave {
+    fn start(home: &Path, out: &Path) -> Self {
+        Self::start_held(home, out, "60000")
+    }
+
+    /// [`HeldSave::start`] with `hold` for `SOPEN_SAVE_HOLD_MS` (`<ms>:stalled`: a hold that
+    /// no cancel ends).
+    fn start_held(home: &Path, out: &Path, hold: &str) -> Self {
+        let big = home.join("big.bin");
+        let bytes: Vec<u8> = (0..=255u8).cycle().take(3 << 20).collect();
+        std::fs::write(&big, bytes).unwrap();
+        let mut cmd = sopen_command(home);
+        cmd.arg(&big)
+            .env("SOPEN_CHOICE", "save")
+            .env("SOPEN_SAVE_TO", out)
+            .env("SOPEN_SAVE_HOLD_MS", hold)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        let mut held = Self {
+            child: Some(cmd.spawn().unwrap()),
+            staging: PathBuf::new(),
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            let filling = staging_in(out)
+                .into_iter()
+                .find(|s| std::fs::metadata(s.join("part")).is_ok_and(|m| m.len() > 0));
+            if let Some(staging) = filling {
+                held.staging = staging;
+                return held;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the save did not start filling its part in 20 s"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    /// Sends `signal` to the sopen alone (not its group).
+    fn signal(&self, signal: i32) {
+        let child = self.child.as_ref().unwrap();
+        // SAFETY: the child is ours and not reaped yet, so the id is still its own.
+        assert_eq!(unsafe { libc::kill(child.id() as i32, signal) }, 0);
+    }
+
+    /// Whether the sopen is still running.
+    fn running(&mut self) -> bool {
+        self.child.as_mut().unwrap().try_wait().unwrap().is_none()
+    }
+
+    /// Sends `signal` to the sopen alone (not its group) and waits at most 20 s for its end.
+    /// The child stays under this guard until its exit has been seen: a panic on the way
+    /// (the 20 s, a failed wait) still kills and reaps it.
+    fn signalled(mut self, signal: i32) -> Output {
+        self.signal(signal);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while self.running() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "sopen did not end within 20 s of signal {signal}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        // It has exited: only its output is left to collect.
+        let child = self.child.take().unwrap();
+        child.wait_with_output().unwrap()
+    }
+}
+
+impl Drop for HeldSave {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+/// The names in `dir`, sorted.
+fn names_in(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    names
+}
+
+/// The private staging folders (`.sopen-<16 hex>`) in `dir`.
+fn staging_in(dir: &Path) -> Vec<PathBuf> {
+    names_in(dir)
+        .into_iter()
+        .filter(|n| n.starts_with(".sopen-"))
+        .map(|n| dir.join(n))
+        .collect()
+}
+
+/// Ctrl-C (SIGINT) or SIGTERM during a "Save to…" without a window cancels it: the part and
+/// its private folder are removed, nothing is saved, the terminal says so, and sopen ends with
+/// 130 or 143 — it does not die mid-way with gigabytes left hidden in the folder.
+#[test]
+fn a_signal_cancels_a_windowless_save_and_leaves_nothing() {
+    for (signal, code) in [(libc::SIGINT, 130), (libc::SIGTERM, 143)] {
+        let tmp = tempfile::tempdir().unwrap();
+        let out_dir = tmp.path().join("out");
+        std::fs::create_dir(&out_dir).unwrap();
+        let out = HeldSave::start(tmp.path(), &out_dir).signalled(signal);
+        let err = text(&out.stderr);
+        assert_eq!(out.status.code(), Some(code), "signal {signal}: {err}");
+        assert!(
+            err.lines()
+                .any(|l| l == "sopen: cancelled; nothing was saved"),
+            "signal {signal}: {err}"
+        );
+        assert_eq!(text(&out.stdout), "", "signal {signal}");
+        assert_eq!(
+            names_in(&out_dir),
+            Vec::<String>::new(),
+            "signal {signal}: nothing saved, no staging left"
+        );
+    }
+}
+
+/// A transfer whose remote has stalled never gets to look at a cancel, so the first SIGTERM
+/// changes nothing that can be seen — and must not make sopen unkillable: the same signal again
+/// has its default disposition and ends sopen at once. What that leaves is what a SIGKILL
+/// leaves, and the next save into the folder removes it.
+#[test]
+fn a_second_signal_ends_a_stalled_windowless_save_and_the_next_save_sweeps_it() {
+    use std::os::unix::process::ExitStatusExt as _;
+    let tmp = tempfile::tempdir().unwrap();
+    let out_dir = tmp.path().join("out");
+    std::fs::create_dir(&out_dir).unwrap();
+    let mut held = HeldSave::start_held(tmp.path(), &out_dir, "60000:stalled");
+    let staging = held.staging.clone();
+    held.signal(libc::SIGTERM);
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    assert!(held.running(), "the first signal only asks for a cancel");
+    assert!(staging.join("part").exists());
+    let out = held.signalled(libc::SIGTERM);
+    assert_eq!(
+        (out.status.code(), out.status.signal()),
+        (None, Some(libc::SIGTERM)),
+        "the second signal ends it: {}",
+        text(&out.stderr)
+    );
+    assert!(
+        staging.join("part").exists(),
+        "ended mid-way: nothing cleaned"
+    );
+
+    let blob = tmp.path().join("blob.bin");
+    std::fs::write(&blob, [0u8, 1, 2, 3, 0xff]).unwrap();
+    let out = sopen(
+        tmp.path(),
+        &[blob.to_str().unwrap()],
+        &[
+            ("SOPEN_CHOICE", "save"),
+            ("SOPEN_SAVE_TO", out_dir.to_str().unwrap()),
+        ],
+    );
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert_eq!(names_in(&out_dir), ["blob.bin"], "the staging left is gone");
+}
+
+/// A cancelled save whose staging cannot be removed (here its private folder was made
+/// read-only meanwhile) still says so, with the cancel: the folder left is named, never
+/// dropped in silence.
+#[test]
+fn a_cancelled_save_that_cannot_remove_its_staging_says_so() {
+    use std::os::unix::fs::PermissionsExt as _;
+    // SAFETY: no arguments, no failure.
+    if unsafe { libc::geteuid() } == 0 {
+        eprintln!("skipping: root removes from a read-only folder");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let out_dir = tmp.path().join("out");
+    std::fs::create_dir(&out_dir).unwrap();
+    let held = HeldSave::start(tmp.path(), &out_dir);
+    let staging = held.staging.clone();
+    std::fs::set_permissions(&staging, std::fs::Permissions::from_mode(0o500)).unwrap();
+    let out = held.signalled(libc::SIGINT);
+    std::fs::set_permissions(&staging, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let err = text(&out.stderr);
+    assert_eq!(out.status.code(), Some(130), "{err}");
+    let lines: Vec<&str> = err.lines().filter(|l| l.starts_with("sopen: ")).collect();
+    assert_eq!(lines.len(), 2, "{err}");
+    assert!(
+        lines[0].starts_with(&format!(
+            "sopen: the staging folder {} could not be removed (",
+            staging.display()
+        )) && lines[0].ends_with("; it is safe to delete"),
+        "{err}"
+    );
+    assert_eq!(lines[1], "sopen: cancelled; nothing was saved");
+    assert!(!out_dir.join("big.bin").exists(), "nothing was saved");
+    assert!(staging.join("part").exists(), "what could not be removed");
+}
+
+/// A save that was killed outright (SIGKILL: nothing can clean up) leaves its staging folder;
+/// the next save into the same folder removes it — its owner is dead, and it holds only sopen's
+/// own staging files.
+#[test]
+fn the_next_save_sweeps_the_staging_a_killed_save_left() {
+    let tmp = tempfile::tempdir().unwrap();
+    let out_dir = tmp.path().join("out");
+    std::fs::create_dir(&out_dir).unwrap();
+    let held = HeldSave::start(tmp.path(), &out_dir);
+    let staging = held.staging.clone();
+    let out = held.signalled(libc::SIGKILL);
+    assert_eq!(out.status.code(), None, "killed");
+    assert!(staging.join("part").exists(), "a kill cleans nothing up");
+
+    let blob = tmp.path().join("blob.bin");
+    std::fs::write(&blob, [0u8, 1, 2, 3, 0xff]).unwrap();
+    let out = sopen(
+        tmp.path(),
+        &[blob.to_str().unwrap()],
+        &[
+            ("SOPEN_CHOICE", "save"),
+            ("SOPEN_SAVE_TO", out_dir.to_str().unwrap()),
+        ],
+    );
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert_eq!(names_in(&out_dir), ["blob.bin"], "the dead staging is gone");
+}
+
+/// The staging of a save that is still running belongs to it: another save into the same
+/// folder leaves it alone (its lock is held), and the running one still ends cleanly.
+#[test]
+fn a_running_saves_staging_is_left_alone_by_another_save_there() {
+    let tmp = tempfile::tempdir().unwrap();
+    let out_dir = tmp.path().join("out");
+    std::fs::create_dir(&out_dir).unwrap();
+    let held = HeldSave::start(tmp.path(), &out_dir);
+    let staging = held.staging.clone();
+
+    let blob = tmp.path().join("blob.bin");
+    std::fs::write(&blob, [0u8, 1, 2, 3, 0xff]).unwrap();
+    let out = sopen(
+        tmp.path(),
+        &[blob.to_str().unwrap()],
+        &[
+            ("SOPEN_CHOICE", "save"),
+            ("SOPEN_SAVE_TO", out_dir.to_str().unwrap()),
+        ],
+    );
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let part = std::fs::metadata(staging.join("part"));
+    assert!(
+        part.is_ok_and(|m| m.len() > 0),
+        "the running save's part was taken from under it: {:?}",
+        names_in(&out_dir)
+    );
+
+    let out = held.signalled(libc::SIGINT);
+    assert_eq!(out.status.code(), Some(130), "{}", text(&out.stderr));
+    assert_eq!(names_in(&out_dir), ["blob.bin"]);
 }
 
 /// No display (Linux over ssh): the binary file is not asked about; its local path is printed

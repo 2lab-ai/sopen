@@ -1080,3 +1080,101 @@ fn an_error_tail_drains_everything_and_keeps_only_a_bounded_end() {
     assert_eq!(last.len(), 2047 + '…'.len_utf8());
     assert!(!last.contains('\u{FFFD}'));
 }
+
+/// [`whole_path_as`], the one place another program's text is rewritten: the copy's path
+/// becomes the name the owner knows only where it stands as a whole path — after the start,
+/// white space, a quote or `(`, and before the end, `:`, a quote, `)` or `,`.
+#[test]
+fn another_programs_text_names_the_file_only_where_the_whole_path_stands() {
+    let (copy, known) = ("/c/box/data/a.mp4", "box:/data/a.mp4");
+    let as_known = |said: &str| whole_path_as(said, copy, known);
+    for (said, want) in [
+        ("/c/box/data/a.mp4", "box:/data/a.mp4"),
+        (
+            "/c/box/data/a.mp4: Invalid data found",
+            "box:/data/a.mp4: Invalid data found",
+        ),
+        (
+            "Error opening input file /c/box/data/a.mp4.",
+            "Error opening input file /c/box/data/a.mp4.",
+        ),
+        (
+            "moov atom not found in '/c/box/data/a.mp4', giving up",
+            "moov atom not found in 'box:/data/a.mp4', giving up",
+        ),
+        (
+            "cannot open \"/c/box/data/a.mp4\" (/c/box/data/a.mp4)",
+            "cannot open \"box:/data/a.mp4\" (box:/data/a.mp4)",
+        ),
+        // Twice in one line: both.
+        (
+            "/c/box/data/a.mp4: bad header, /c/box/data/a.mp4: giving up",
+            "box:/data/a.mp4: bad header, box:/data/a.mp4: giving up",
+        ),
+        // Twice with nothing between them is not two whole paths.
+        (
+            "/c/box/data/a.mp4/c/box/data/a.mp4",
+            "/c/box/data/a.mp4/c/box/data/a.mp4",
+        ),
+    ] {
+        assert_eq!(as_known(said), want, "{said}");
+    }
+    // A different, longer path: more components before it, or more of a name after it.
+    for other in [
+        "cannot read /backup/c/box/data/a.mp4: gone",
+        "cannot read ../c/box/data/a.mp4: gone",
+        "cannot read /c/box/data/a.mp4+1: gone",
+        "cannot read /c/box/data/a.mp4@2: gone",
+        "cannot read /c/box/data/a.mp4 2: gone",
+        "cannot read /c/box/data/a.mp4.sopen-backup-1: gone",
+        "cannot read /c/box/data/a.mp4-1: gone",
+        "cannot read /c/box/data/a.mp4/part: gone",
+        "cannot read /c/box/data/a.mp4~: gone",
+    ] {
+        assert_eq!(as_known(other), other);
+    }
+    // Nothing in either name is a pattern: they are text.
+    let (copy, known) = (
+        "/c/b.x/[a]+(1)*$^?/a|b{2}.mp4",
+        "b.x:/[a]+(1)*$^?/$0 \\1 a|b{2}.mp4",
+    );
+    assert_eq!(
+        whole_path_as(&format!("{copy}: Invalid data, see '{copy}'"), copy, known),
+        format!("{known}: Invalid data, see '{known}'")
+    );
+    assert_eq!(
+        whole_path_as("/c/bXx/[a]+(1)*$^?/a|b{2}.mp4: no", copy, known),
+        "/c/bXx/[a]+(1)*$^?/a|b{2}.mp4: no",
+        "the dot is a dot"
+    );
+    // The same name, or no path: as printed.
+    assert_eq!(whole_path_as("/x: no", "/x", "/x"), "/x: no");
+    assert_eq!(whole_path_as("/x: no", "", "box:/x"), "/x: no");
+}
+
+/// ffprobe's refusal of a remote file's copy: sopen's own words name the file as its owner
+/// knows it, directly, and ffprobe's line loses the copy's path wherever it stood whole.
+#[test]
+fn a_probe_refusal_of_a_copy_names_the_file() {
+    let copy = Path::new("/c/box/data/a.mp4");
+    assert_eq!(
+        probe_refusal_shown(
+            copy,
+            "box:/data/a.mp4",
+            "/c/box/data/a.mp4: Invalid data found"
+        ),
+        "ffprobe cannot read box:/data/a.mp4: Invalid data found"
+    );
+    assert_eq!(
+        probe_refusal_shown(
+            copy,
+            "box:/data/a.mp4",
+            "'/c/box/data/a.mp4': no such stream"
+        ),
+        "ffprobe cannot read box:/data/a.mp4: 'box:/data/a.mp4': no such stream"
+    );
+    assert_eq!(
+        probe_refusal(copy, "/c/box/data/a.mp4: Invalid data found"),
+        "ffprobe cannot read /c/box/data/a.mp4: Invalid data found"
+    );
+}
