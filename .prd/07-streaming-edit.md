@@ -290,8 +290,8 @@ check, the undo file, the streamed rewrite and Save As.
      cache): the Linux laptop (btrfs on NVMe) copies at 2.2 GB/s for 4 GiB and 1.5–1.6 GB/s across
      24 GiB; the Mac (APFS, internal SSD) at 1.8–5.4 GB/s, usually about 5. With the source cached,
      3.7 and 5.4 GB/s. A 64 MiB request takes 18–70 ms on the laptop (one network round trip
-     included) and usually 11–19 ms on the Mac (at most 294 ms), so the rule reaches the 1 GiB cap
-     on its second request. A 1 GiB request typically takes 0.4–0.5 s on the laptop and 0.2–0.3 s on
+     included) and usually 11–19 ms on the Mac (at most 294 ms); every measured run of the rule
+     reached the 1 GiB cap on its second request. A 1 GiB request typically takes 0.4–0.5 s on the laptop and 0.2–0.3 s on
      the Mac; the worst seen was 1.73 s on the laptop, when its disk slowed to about 0.6 GiB/s (the
      rule then cut the next requests to 370–950 MiB), and 1.07 s on the Mac. Two or four requests outstanding gain only the network round trip,
      which 1 GiB requests already amortise, so the loop keeps one outstanding. A slow disk was not

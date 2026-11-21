@@ -647,18 +647,25 @@ to every run on the file: the probe, playback, the paused frame, the waveform, S
     target; blocks already fetched are served from the cache while they stay in it (§3), and the
     window shows that read's progress.
   - **Finding the tag.** sopen reads it itself, through the `play` reader:
-    - **ID3v2 tags:** while the file starts `ID3`, skip a tag: 10 bytes of header, then the size
-      from header bytes 6–9 as a synchsafe integer (7 bits per byte), plus 10 more when the
-      footer flag (bit 4 of byte 5) is set. A large tag (cover art) costs one more ranged read.
-    - **The first frame:** an 11-bit sync, layer III, a valid bitrate and sample-rate index. The
-      tag sits after the 4-byte header, 2 bytes of CRC when the protection bit is 0, and the side
-      information: 32 bytes (MPEG-1 stereo), 17 (MPEG-1 mono, MPEG-2 and 2.5 stereo) or 9 (MPEG-2
-      and 2.5 mono).
-    - `Info` there means constant bitrate. `Xing`, anything else, a frame that does not validate, or
-      a file that ends first means an exact seek.
-    - W7's fixtures: a footer ID3v2 tag, a tag of several MB, MPEG-1 and MPEG-2 in mono and
-      stereo, a CRC-protected frame, `Info`, `Xing`, no tag, and a file cut inside the frame.
-      X5 measured only mono 44.1 kHz files with small tags.
+    - **ID3v2 tags:** while the bytes at the current offset start `ID3` with major version 3 or 4,
+      skip that tag: 10 bytes of header plus the size in header bytes 6–9, a synchsafe integer
+      (each byte below 0x80, 7 bits each), plus 10 more when a version-4 tag sets its footer flag
+      (bit 4 of byte 5). Any other version or a size byte of 0x80 or more is an invalid tag, and
+      the seek is exact. A large tag (cover art) costs one more ranged read.
+    - **The first frame** must start right after the tags (ffmpeg resyncs over junk; sopen does
+      not, and junk means an exact seek): an 11-bit sync, layer III, a valid bitrate and
+      sample-rate index. The tag is read where ffmpeg's mp3 demuxer reads it, 4 + 32 bytes in
+      (MPEG-1 stereo), 4 + 17 (MPEG-1 mono, MPEG-2 and 2.5 stereo) or 4 + 9 (MPEG-2 and 2.5 mono),
+      with no adjustment for a CRC (`xing_offtbl` in libavformat/mp3dec.c). So sopen and ffmpeg
+      agree on which files are `Info`.
+    - `Info` there means constant bitrate (ffmpeg's `is_cbr`). `Xing`, anything else, a frame that
+      does not validate, or a file that ends first means an exact seek. Every misreading therefore
+      costs bytes, never precision.
+    - W7's fixtures: a version-4 tag with a footer, a tag of several MB, two tags in a row, an
+      invalid synchsafe byte, MPEG-1 and MPEG-2 in mono and stereo, `Info`, `Xing`, no tag, junk
+      before the first frame, and a file cut inside the frame. Each fixture's expected answer is
+      what ffmpeg reports for it (`is_cbr` shows as an exact byte-proportional seek), not what this
+      text says. X5 measured only mono 44.1 kHz files with small tags.
 - **ffmpeg's reconnect options stay off.** The server ends a connection only on an error the window
   already shows from its Source, so a reconnect would only repeat it.
 - **ffmpeg's exit status cannot be trusted for a cut-short input** (verified with ffmpeg 9.0.2,
