@@ -41,21 +41,46 @@ pub fn plan(
     probe: &Probe,
     src_name: &str,
 ) -> Result<(MediaKind, String, ExportPlan)> {
-    let by_ext = media_kind_of(src_name)?;
-    let media = match kind::refine_with_probe(by_ext, probe.video.is_some()) {
-        Kind::Video => MediaKind::Video,
-        _ if probe.has_audio => MediaKind::Audio,
-        _ => bail!("{src_name} has no audio or video stream"),
-    };
-    let (_, ext) = stem_ext(src_name);
-    let out_ext = ffmpeg::output_ext(ext, media, probe.audio_codec.as_deref());
     // Only a source above 8 bits needs to know whether libx264 here does 10-bit.
-    let x264 = if media == MediaKind::Video && ffmpeg::high_depth(probe) {
-        ffmpeg::encoder_pix_fmts(tools, "libx264").ok()
+    let x264 = if plan_asks_encoder(probe, src_name) {
+        ffmpeg::encoder_pix_fmts(tools, PLAN_ENCODER).ok()
     } else {
         None
     };
-    let plan = ExportPlan::new(probe, media, &out_ext, x264.as_ref());
+    plan_with(probe, src_name, x264.as_ref())
+}
+
+/// The encoder [`plan`] asks ffmpeg about ([`plan_asks_encoder`]).
+pub const PLAN_ENCODER: &str = "libx264";
+
+/// The kind an export of `src_name` (probed as `probe`) is.
+fn export_kind(probe: &Probe, src_name: &str) -> Result<MediaKind> {
+    let by_ext = media_kind_of(src_name)?;
+    match kind::refine_with_probe(by_ext, probe.video.is_some()) {
+        Kind::Video => Ok(MediaKind::Video),
+        _ if probe.has_audio => Ok(MediaKind::Audio),
+        _ => bail!("{src_name} has no audio or video stream"),
+    }
+}
+
+/// [`plan`] runs ffmpeg for this file (it asks which pixel formats [`PLAN_ENCODER`] takes): a
+/// video above 8 bits. For any other file the plan is worked out without running anything.
+pub fn plan_asks_encoder(probe: &Probe, src_name: &str) -> bool {
+    export_kind(probe, src_name).is_ok_and(|kind| kind == MediaKind::Video)
+        && ffmpeg::high_depth(probe)
+}
+
+/// [`plan`] from an answer already there, running nothing: `x264` is what
+/// [`ffmpeg::encoder_pix_fmts`] said of [`PLAN_ENCODER`] (`None`: not asked, or no answer).
+pub fn plan_with(
+    probe: &Probe,
+    src_name: &str,
+    x264: Option<&std::collections::HashSet<String>>,
+) -> Result<(MediaKind, String, ExportPlan)> {
+    let media = export_kind(probe, src_name)?;
+    let (_, ext) = stem_ext(src_name);
+    let out_ext = ffmpeg::output_ext(ext, media, probe.audio_codec.as_deref());
+    let plan = ExportPlan::new(probe, media, &out_ext, x264);
     Ok((media, out_ext, plan))
 }
 

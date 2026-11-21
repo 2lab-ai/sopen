@@ -221,6 +221,21 @@ pub struct Probe {
 /// path or a URL).
 pub fn probe(tools: &Tools, input: impl AsRef<OsStr>) -> Result<Probe> {
     let path = Path::new(input.as_ref());
+    let mut cmd = probe_command(tools, input.as_ref());
+    let out =
+        output(&mut cmd).with_context(|| format!("cannot run {}", tools.ffprobe.display()))?;
+    if !out.status.success() {
+        bail!(
+            "{}",
+            probe_refusal(path, &last_line(&String::from_utf8_lossy(&out.stderr)))
+        );
+    }
+    parse_probe(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// The ffprobe run [`probe`] makes on `input`, not started: a preview runs the same one where it
+/// can be stopped ([`crate::gui::media::preview`]). Its stdout is what [`parse_probe`] reads.
+pub fn probe_command(tools: &Tools, input: &OsStr) -> Command {
     let mut cmd = Command::new(&tools.ffprobe);
     cmd.args([
         "-v",
@@ -231,18 +246,14 @@ pub fn probe(tools: &Tools, input: impl AsRef<OsStr>) -> Result<Probe> {
         "-show_streams",
         "-show_chapters",
     ])
-    .arg(path)
+    .arg(input)
     .stdin(Stdio::null());
-    let out =
-        output(&mut cmd).with_context(|| format!("cannot run {}", tools.ffprobe.display()))?;
-    if !out.status.success() {
-        bail!(
-            "ffprobe cannot read {}: {}",
-            path.display(),
-            last_line(&String::from_utf8_lossy(&out.stderr))
-        );
-    }
-    parse_probe(&String::from_utf8_lossy(&out.stdout))
+    cmd
+}
+
+/// What is said when ffprobe ended badly on `input` (`said`: its last line).
+pub fn probe_refusal(input: &Path, said: &str) -> String {
+    format!("ffprobe cannot read {}: {said}", input.display())
 }
 
 pub fn parse_probe(json: &str) -> Result<Probe> {
@@ -478,16 +489,22 @@ pub fn encoder_pix_fmts(tools: &Tools, encoder: &str) -> Result<HashSet<String>>
     if let Some(hit) = cache.lock().unwrap().get(&key) {
         return Ok(hit.clone());
     }
-    let out = output(
-        Command::new(&tools.ffmpeg)
-            .args(["-hide_banner", "-h"])
-            .arg(format!("encoder={encoder}"))
-            .stdin(Stdio::null()),
-    )
-    .with_context(|| format!("cannot run {}", tools.ffmpeg.display()))?;
+    let out = output(&mut encoder_help_command(tools, encoder))
+        .with_context(|| format!("cannot run {}", tools.ffmpeg.display()))?;
     let formats = parse_pix_fmts(&String::from_utf8_lossy(&out.stdout));
     cache.lock().unwrap().insert(key, formats.clone());
     Ok(formats)
+}
+
+/// The ffmpeg run [`encoder_pix_fmts`] makes (`ffmpeg -h encoder=<encoder>`), not started: a
+/// preview runs the same one where it can be stopped. Its stdout is what [`parse_pix_fmts`]
+/// reads.
+pub fn encoder_help_command(tools: &Tools, encoder: &str) -> Command {
+    let mut cmd = Command::new(&tools.ffmpeg);
+    cmd.args(["-hide_banner", "-h"])
+        .arg(format!("encoder={encoder}"))
+        .stdin(Stdio::null());
+    cmd
 }
 
 /// How one export maps and encodes the source, and what it does not keep (spec §7: never lose

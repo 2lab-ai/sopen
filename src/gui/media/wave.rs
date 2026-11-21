@@ -2,12 +2,15 @@
 //! channel — two lanes for stereo (more channels are mixed down to two), one for mono — at a
 //! fixed resolution of the source, never the PCM itself. The peaks are handed over as they
 //! fill (a streamed file arrives over time), and the timeline on screen is drawn from them
-//! through the edit list, so an edit redraws it at once, with no decode.
+//! through the edit list, so an edit redraws it at once, with no decode. The decode stops when
+//! its window goes ([`Decode`]); one that follows a preview goes on from where the preview's
+//! stopped ([`resume`], 02 §4.4).
 
 use super::timeline::{Clip, Timeline};
 use crate::ffmpeg::{Input, Tools};
 use std::io::{BufReader, Read};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
 use std::sync::{Arc, Mutex};
 
 /// Decode rate for the peaks, per channel.
@@ -78,14 +81,37 @@ pub fn read_peaks(
     duration: f64,
     publish: &mut dyn FnMut(Source),
 ) -> std::io::Result<Source> {
+    read_onto(input, lanes, duration, None, publish)
+}
+
+/// [`read_peaks`], going on from peaks read before (`onto`: the peaks of the source's first
+/// seconds and how many seconds they cover — a preview's, 02 §4.4): `input` is the sound from
+/// there on, and its samples land where they are in the source. The peaks before stay as they
+/// are (the bin the two meet in takes both).
+pub fn read_onto(
+    input: &mut dyn Read,
+    lanes: usize,
+    duration: f64,
+    onto: Option<(&Source, f64)>,
+    publish: &mut dyn FnMut(Source),
+) -> std::io::Result<Source> {
     let lanes = lanes.max(1);
     let bins = bins_for(duration);
     let expected = (duration * RATE).ceil() as usize;
     let mut peaks: Vec<Peaks> = (0..lanes).map(|_| Peaks::new(expected, bins)).collect();
+    let mut version = 0;
+    if let Some((before, secs)) = onto {
+        for (lane, peaks) in peaks.iter_mut().enumerate() {
+            if let Some(read) = before.lanes.get(lane).filter(|l| l.len() == bins) {
+                peaks.bins.clone_from(read);
+            }
+            peaks.seen = (secs * RATE).round().max(0.0) as usize;
+        }
+        version = before.version;
+    }
     let mut reader = BufReader::with_capacity(64 * 1024, input);
     let step = (expected * lanes / HANDOVERS).max(1);
     let per_bin = peaks[0].per_bin;
-    let mut version = 0;
     let mut snapshot = |peaks: &[Peaks]| {
         version += 1;
         Source {
@@ -114,29 +140,145 @@ pub fn read_peaks(
     Ok(snapshot(&peaks))
 }
 
-/// Starts the one decode of `input` into `lanes` (1 or 2) lanes of peaks, handed to `out` as
-/// they fill: complete once the whole file was read and ffmpeg ended well, else with the error
-/// (a read error, ffmpeg's exit and its last words, or a start that failed). `wake` is called on
-/// each hand-over.
+/// The ffmpeg run that decodes `input`'s sound into `lanes` lanes of f32le at [`RATE`] on its
+/// stdout: from `from` seconds of the source, `len` seconds of it (`None`: to its end). Not
+/// started.
+pub fn command(tools: &Tools, input: &Input, lanes: usize, from: f64, len: Option<f64>) -> Command {
+    let mut cmd = Command::new(&tools.ffmpeg);
+    cmd.args(["-nostdin", "-hide_banner", "-loglevel", "error"]);
+    if from > 0.0 {
+        cmd.arg("-ss").arg(format!("{from:.6}"));
+    }
+    if let Some(len) = len {
+        cmd.arg("-t").arg(format!("{len:.6}"));
+    }
+    cmd.arg("-i")
+        .arg(input.arg())
+        .args(["-vn", "-ac", &lanes.to_string(), "-ar"])
+        .arg(format!("{RATE}"))
+        .args(["-f", "f32le", "-"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    cmd
+}
+
+/// A waveform decode and the peaks it fills. Dropped — its window went, or plays another file
+/// — the decode stops: its ffmpeg is killed and reaped, and nothing more is handed over.
+pub struct Decode {
+    pub peaks: Shared,
+    /// The running ffmpeg, taken by whoever ends it: the decoder thread at its end, or the
+    /// drop.
+    child: Arc<Mutex<Option<Child>>>,
+    stop: Arc<AtomicBool>,
+}
+
+impl Decode {
+    /// Peaks that need no decode (a preview read the whole file's, 02 §4.4).
+    pub fn done(peaks: Source) -> Self {
+        Self {
+            peaks: Arc::new(Mutex::new(Some(peaks))),
+            child: Arc::default(),
+            stop: Arc::default(),
+        }
+    }
+}
+
+#[cfg(test)]
+impl Decode {
+    /// Tests: the process id of the ffmpeg that runs now.
+    pub(crate) fn pid(&self) -> Option<u32> {
+        self.child.lock().unwrap().as_ref().map(Child::id)
+    }
+}
+
+impl Drop for Decode {
+    fn drop(&mut self) {
+        // Under the lock the decoder thread starts its ffmpeg under: either it sees the stop
+        // and starts none, or its ffmpeg is here to be killed.
+        let mut child = self.child.lock().unwrap();
+        self.stop.store(true, SeqCst);
+        if let Some(mut child) = child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+/// Tests: every waveform decode started on a file — where in the source it started and how many
+/// seconds it was to read — in order.
+#[cfg(test)]
+static STARTS: Mutex<Vec<(std::path::PathBuf, f64, Option<f64>)>> = Mutex::new(Vec::new());
+
+#[cfg(test)]
+pub(crate) fn note_start(input: &Input, from: f64, len: Option<f64>) {
+    if let Some(path) = input.local() {
+        let mut starts = STARTS.lock().unwrap_or_else(|p| p.into_inner());
+        starts.push((path.to_path_buf(), from, len));
+    }
+}
+
+/// Tests: the waveform decodes started on `file`, `(from, len)` in seconds, in order.
+#[cfg(test)]
+pub(crate) fn starts(file: &std::path::Path) -> Vec<(f64, Option<f64>)> {
+    let starts = STARTS.lock().unwrap_or_else(|p| p.into_inner());
+    starts
+        .iter()
+        .filter(|(p, _, _)| p == file)
+        .map(|&(_, from, len)| (from, len))
+        .collect()
+}
+
+/// Starts the one decode of `input` into `lanes` (1 or 2) lanes of peaks, handed over as they
+/// fill: complete once the whole file was read and ffmpeg ended well, else with the error (a
+/// read error, ffmpeg's exit and its last words, or a start that failed). `wake` is called on
+/// each hand-over. Dropping what it returns stops it.
 pub fn start(
     tools: &Tools,
     input: &Input,
     lanes: usize,
     duration: f64,
     wake: impl Fn() + Send + 'static,
-) -> Shared {
-    let out: Shared = Arc::default();
-    let (slot, tools, input) = (out.clone(), tools.clone(), input.clone());
+) -> Decode {
+    start_onto(tools, input, lanes, duration, None, wake)
+}
+
+/// [`start`] for a file whose first `secs` seconds a preview has read (`before`: their peaks):
+/// the decode goes on from there — nothing before it is decoded again — into the same peaks.
+pub fn resume(
+    tools: &Tools,
+    input: &Input,
+    lanes: usize,
+    duration: f64,
+    (before, secs): (Source, f64),
+    wake: impl Fn() + Send + 'static,
+) -> Decode {
+    start_onto(tools, input, lanes, duration, Some((before, secs)), wake)
+}
+
+fn start_onto(
+    tools: &Tools,
+    input: &Input,
+    lanes: usize,
+    duration: f64,
+    onto: Option<(Source, f64)>,
+    wake: impl Fn() + Send + 'static,
+) -> Decode {
+    let decode = Decode {
+        // What was read before shows from the start.
+        peaks: Arc::new(Mutex::new(onto.as_ref().map(|(before, _)| before.clone()))),
+        child: Arc::default(),
+        stop: Arc::default(),
+    };
+    let (slot, running, stop) = (
+        decode.peaks.clone(),
+        decode.child.clone(),
+        decode.stop.clone(),
+    );
+    let (tools, input) = (tools.clone(), input.clone());
     std::thread::spawn(move || {
-        let mut cmd = Command::new(&tools.ffmpeg);
-        cmd.args(["-nostdin", "-hide_banner", "-loglevel", "error", "-i"])
-            .arg(input.arg())
-            .args(["-vn", "-ac", &lanes.to_string(), "-ar"])
-            .arg(format!("{RATE}"))
-            .args(["-f", "f32le", "-"])
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+        let from = onto.as_ref().map_or(0.0, |(_, secs)| *secs);
+        let mut cmd = command(&tools, &input, lanes, from, None);
         let failed = |why: String, last: Option<Source>| {
             let mut peaks = last.unwrap_or(Source {
                 bin_secs: 1.0,
@@ -150,16 +292,38 @@ pub fn start(
             peaks.error = Some(why);
             peaks
         };
-        let done = match crate::ffmpeg::spawn(&mut cmd) {
+        let started = {
+            let mut running = running.lock().unwrap();
+            if stop.load(SeqCst) {
+                return;
+            }
+            #[cfg(test)]
+            note_start(&input, from, None);
+            crate::ffmpeg::spawn(&mut cmd).map(|mut child| {
+                let stdout = child.stdout.take().expect("piped");
+                let stderr = child.stderr.take().expect("piped");
+                *running = Some(child);
+                (stdout, stderr)
+            })
+        };
+        let done = match started {
             Err(e) => failed(format!("cannot run {}: {e}", tools.ffmpeg.display()), None),
-            Ok(mut child) => {
-                let mut stdout = child.stdout.take().expect("piped");
-                let said = crate::ffmpeg::ErrorTail::spawn(child.stderr.take().expect("piped"));
-                let read = read_peaks(&mut stdout, lanes, duration, &mut |peaks| {
-                    *slot.lock().unwrap() = Some(peaks);
-                    wake();
+            Ok((mut stdout, stderr)) => {
+                let said = crate::ffmpeg::ErrorTail::spawn(stderr);
+                let onto = onto.as_ref().map(|(before, secs)| (before, *secs));
+                let read = read_onto(&mut stdout, lanes, duration, onto, &mut |peaks| {
+                    // Nothing is handed over once the decode was stopped.
+                    if !stop.load(SeqCst) {
+                        *slot.lock().unwrap() = Some(peaks);
+                        wake();
+                    }
                 });
                 drop(stdout);
+                // The drop took it: stopped, nothing more to say.
+                let Some(mut child) = running.lock().unwrap().take() else {
+                    let _ = said.join();
+                    return;
+                };
                 let status = child.wait();
                 let last_line = said.join().unwrap_or_default().last_line();
                 match (read, status) {
@@ -173,6 +337,9 @@ pub fn start(
                 }
             }
         };
+        if stop.load(SeqCst) {
+            return;
+        }
         let mut slot = slot.lock().unwrap();
         // A failed read keeps what was handed over before it.
         let done = match (slot.take(), done) {
@@ -188,7 +355,7 @@ pub fn start(
         drop(slot);
         wake();
     });
-    out
+    decode
 }
 
 /// The timeline's lanes as `columns` columns: each column's min/max over the source ranges the
@@ -342,7 +509,7 @@ mod tests {
             loop {
                 rx.recv_timeout(std::time::Duration::from_secs(20))
                     .expect("the decode ends");
-                if let Some(s) = shared.lock().unwrap().clone() {
+                if let Some(s) = shared.peaks.lock().unwrap().clone() {
                     if s.complete || s.error.is_some() {
                         return s;
                     }
@@ -392,7 +559,7 @@ mod tests {
         let got = loop {
             rx.recv_timeout(std::time::Duration::from_secs(20))
                 .expect("the decode ends");
-            if let Some(s) = shared.lock().unwrap().clone() {
+            if let Some(s) = shared.peaks.lock().unwrap().clone() {
                 if s.complete || s.error.is_some() {
                     break s;
                 }
