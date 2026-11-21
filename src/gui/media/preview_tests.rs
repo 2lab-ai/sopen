@@ -905,6 +905,9 @@ fn a_stop_from_outside_kills_the_running_child_and_never_waits() {
         let children = Arc::new(Children::default());
         let (c, dir) = (children.clone(), tmp.path().to_path_buf());
         let ended = while_child_runs(tools.clone(), path.clone(), held, children, 1, |_| {
+            // A coarse look for a long block (a loaded runner takes its time): not a receipt of
+            // what a frame costs. That a stop waits for nothing is shown by the held-lock order
+            // in `a_stop_from_outside_kills_the_running_child_and_never_waits`.
             let ((), took) = timed(|| c.stop());
             assert!(
                 took < Duration::from_millis(500),
@@ -928,6 +931,9 @@ fn a_stop_from_outside_kills_the_running_child_and_never_waits() {
         std::thread::spawn(move || {
             let _ = tx.send(timed(|| c.stop()).1);
         });
+        // The no-wait test proper: the slot's lock is held here, and the stop returns all the
+        // same (one that waited for it would not come back in the 5 s). The 500 ms after it
+        // is only the coarse look for a long block, not a receipt of what a frame costs.
         let took = rx
             .recv_timeout(Duration::from_secs(5))
             .expect("the stop waited for the slot's holder");
@@ -984,6 +990,9 @@ fn a_dropped_waveform_decode_is_killed() {
         until("the decode starts", || decode.pid().is_some());
         let pid = decode.pid().unwrap();
         assert_eq!(still_running(&[pid]), 1, "it runs");
+        // A coarse look for a long block (a loaded runner takes its time): not a receipt of
+        // what a frame costs. That a stop waits for nothing is shown by the held-lock order
+        // in `a_stop_from_outside_kills_the_running_child_and_never_waits`.
         let ((), took) = timed(|| drop(decode));
         assert!(
             took < Duration::from_millis(500),
@@ -1342,6 +1351,9 @@ fn closing_the_window_stops_its_encoder_question() {
         let asked = started_under(&dir);
         assert_eq!(still_running(&asked), 1, "it waits for its answer");
         let Fx { tmp, win, .. } = fx;
+        // A coarse look for a long block (a loaded runner takes its time): not a receipt of
+        // what a frame costs. That a stop waits for nothing is shown by the held-lock order
+        // in `a_stop_from_outside_kills_the_running_child_and_never_waits`.
         let ((), took) = timed(|| drop(win));
         assert!(
             took < Duration::from_millis(500),

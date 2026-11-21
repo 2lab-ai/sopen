@@ -413,6 +413,13 @@ impl Test {
 /// tells how it ended. A body that has not ended in `secs` is abandoned — but not what it
 /// started: its clocks are moved on, its holds let go, and every process of its folders killed
 /// and reaped ([`Test::clean_up`]) before this returns the failure.
+///
+/// **A body that this lets pass was cleaned up after, not verified.** The cleaning up lets go
+/// every hold and moves every clock on, then gives what was waiting two seconds to end by
+/// itself: a child the code under test left held can end there, with nothing to kill and
+/// nothing counted. So the rule for every test of a child's life: it asserts, itself and before
+/// its body returns, that no process is left ([`none_left`], as `export_ends` does in the
+/// preview's tests) — never leaving that to this supervisor.
 pub(crate) fn supervised(
     secs: u64,
     body: impl FnOnce(&Test) + Send + 'static,
