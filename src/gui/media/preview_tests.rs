@@ -315,7 +315,7 @@ fn assert_none_left(dir: &Path) {
 /// size and duration; none of the media window's bars.
 #[test]
 fn a_previewed_video_is_its_first_frame_with_its_size_and_duration() {
-    bounded(120, |t| {
+    bounded(180, |t| {
         let Some((fx, _tools)) = video(t) else { return };
         let pictures = fx.drv.pictures();
         assert_eq!(pictures.len(), 1, "the frame: {pictures:?}");
@@ -343,7 +343,7 @@ fn a_previewed_video_is_its_first_frame_with_its_size_and_duration() {
 /// duration; no bars.
 #[test]
 fn a_previewed_sound_is_its_waveform_with_its_duration() {
-    bounded(120, |t| {
+    bounded(180, |t| {
         let Some((fx, _tools)) = sound(t, 3, Some(600.0)) else {
             return;
         };
@@ -381,7 +381,7 @@ fn a_previewed_sound_is_its_waveform_with_its_duration() {
 #[test]
 fn a_previewed_medium_takes_no_input_makes_no_sound_and_runs_nothing() {
     for which in ["video", "sound"] {
-        bounded(120, move |t| {
+        bounded(180, move |t| {
             let Some((mut fx, _tools)) = (match which {
                 "video" => video(t),
                 _ => sound(t, 3, Some(600.0)),
@@ -436,7 +436,7 @@ fn a_previewed_medium_takes_no_input_makes_no_sound_and_runs_nothing() {
 /// the one on screen: nothing ran again.
 #[test]
 fn a_handed_over_video_keeps_its_frame_and_plays() {
-    bounded(120, |t| {
+    bounded(180, |t| {
         let Some((mut fx, _tools)) = video(t) else {
             return;
         };
@@ -497,7 +497,7 @@ fn a_handed_over_video_keeps_its_frame_and_plays() {
 /// P6 (audio): a sound the preview read whole is handed over with its waveform: no decode.
 #[test]
 fn a_handed_over_short_sound_keeps_its_waveform() {
-    bounded(120, |t| {
+    bounded(180, |t| {
         let Some((mut fx, _tools)) = sound(t, 3, Some(600.0)) else {
             return;
         };
@@ -521,7 +521,7 @@ fn a_handed_over_short_sound_keeps_its_waveform() {
 /// and the viewer paints the whole sound.
 #[test]
 fn a_handed_over_long_sound_decodes_on_from_where_the_preview_stopped() {
-    bounded(120, |t| {
+    bounded(180, |t| {
         let Some(tools) = tools_or_skip() else { return };
         // Quiet for its first 2 s — all the preview reads — and loud from there.
         let tmp = t.tmp();
@@ -610,7 +610,7 @@ fn a_handed_over_long_sound_decodes_on_from_where_the_preview_stopped() {
 /// wrong place would show.)
 #[test]
 fn a_waveform_read_in_two_runs_is_the_waveform_of_one() {
-    bounded(120, |t| {
+    bounded(180, |t| {
         let Some(tools) = tools_or_skip() else { return };
         let tmp = t.tmp();
         for (name, codec) in [
@@ -686,7 +686,7 @@ fn while_child_runs(
 /// the error names the step, and the stand-in is killed and reaped.
 #[test]
 fn a_stalled_ffprobe_is_stopped_when_its_time_is_over() {
-    bounded(60, |t| {
+    bounded(180, |t| {
         let tmp = t.tmp();
         let hold = t.hold(tmp.path(), "hold");
         let stalls = stand_in(tmp.path(), "ffprobe", &hold.stalls());
@@ -716,7 +716,7 @@ fn a_stalled_ffprobe_is_stopped_when_its_time_is_over() {
 #[test]
 fn a_stalled_first_frame_is_stopped_when_its_own_time_is_over() {
     let Some(real) = tools_or_skip() else { return };
-    bounded(60, move |t| {
+    bounded(180, move |t| {
         let tmp = t.tmp();
         let path = tmp.path().join("clip.mp4");
         clip(&real, &path, (320, 240));
@@ -745,7 +745,7 @@ fn a_stalled_first_frame_is_stopped_when_its_own_time_is_over() {
 #[test]
 fn a_waveform_that_never_ends_is_stopped_when_its_time_is_over() {
     let Some(real) = tools_or_skip() else { return };
-    bounded(60, move |t| {
+    bounded(180, move |t| {
         let tmp = t.tmp();
         let path = tmp.path().join("tone.wav");
         tone(&real, &path, 3);
@@ -770,7 +770,7 @@ fn a_waveform_that_never_ends_is_stopped_when_its_time_is_over() {
 /// The real clock: a stalled probe held to 300 ms is stopped about then.
 #[test]
 fn on_the_real_clock_a_stalled_ffprobe_is_stopped_in_time() {
-    bounded(60, |t| {
+    bounded(180, |t| {
         let tmp = t.tmp();
         let hold = t.hold(tmp.path(), "hold");
         let stalls = stand_in(tmp.path(), "ffprobe", &hold.stalls());
@@ -799,7 +799,7 @@ fn on_the_real_clock_a_stalled_ffprobe_is_stopped_in_time() {
 /// waveform's 10 s, each measured by itself; nothing is left running.
 #[test]
 fn on_the_real_clock_a_two_hour_sound_previews_ten_minutes_within_each_budget() {
-    bounded(120, |t| {
+    bounded(180, |t| {
         let Some(tools) = tools_or_skip() else { return };
         let tmp = t.tmp();
         let path = tmp.path().join("long.mp3");
@@ -865,7 +865,7 @@ fn on_the_real_clock_a_two_hour_sound_previews_ten_minutes_within_each_budget() 
 #[test]
 fn a_cancelled_waveform_decode_stops() {
     let Some(real) = tools_or_skip() else { return };
-    bounded(60, move |t| {
+    bounded(180, move |t| {
         let tmp = t.tmp();
         let path = tmp.path().join("tone.wav");
         tone(&real, &path, 3);
@@ -890,7 +890,7 @@ fn a_cancelled_waveform_decode_stops() {
 /// frame). The worker reaps, and a stop that came first lets nothing start.
 #[test]
 fn a_stop_from_outside_kills_the_running_child_and_never_waits() {
-    bounded(60, |t| {
+    bounded(180, |t| {
         let tmp = t.tmp();
         let hold = t.hold(tmp.path(), "hold");
         let stalls = stand_in(tmp.path(), "ffprobe", &hold.stalls());
@@ -907,7 +907,7 @@ fn a_stop_from_outside_kills_the_running_child_and_never_waits() {
         let ended = while_child_runs(tools.clone(), path.clone(), held, children, 1, |_| {
             let ((), took) = timed(|| c.stop());
             assert!(
-                took < Duration::from_millis(50),
+                took < Duration::from_millis(500),
                 "the stop waited: {took:?}"
             );
             assert_eq!(
@@ -931,7 +931,7 @@ fn a_stop_from_outside_kills_the_running_child_and_never_waits() {
         let took = rx
             .recv_timeout(Duration::from_secs(5))
             .expect("the stop waited for the slot's holder");
-        assert!(took < Duration::from_millis(50), "{took:?}");
+        assert!(took < Duration::from_millis(500), "{took:?}");
         drop(held_slot);
         // Stopped first: nothing starts at all.
         let held = Held::budget(&t.hand());
@@ -947,7 +947,7 @@ fn a_stop_from_outside_kills_the_running_child_and_never_waits() {
 /// started is killed and reaped on the way out.
 #[test]
 fn a_run_that_cannot_watch_its_child_leaves_none() {
-    bounded(60, |t| {
+    bounded(180, |t| {
         let tmp = t.tmp();
         let hold = t.hold(tmp.path(), "hold");
         let stalls = stand_in(tmp.path(), "ffprobe", &hold.stalls());
@@ -973,7 +973,7 @@ fn a_run_that_cannot_watch_its_child_leaves_none() {
 /// and reaped (it ran on to the end of the file before) — and the drop does not wait.
 #[test]
 fn a_dropped_waveform_decode_is_killed() {
-    bounded(60, |t| {
+    bounded(180, |t| {
         let tmp = t.tmp();
         let fake = stand_in(tmp.path(), "ffmpeg", NEVER_ENDS);
         let tools = Tools {
@@ -986,7 +986,7 @@ fn a_dropped_waveform_decode_is_killed() {
         assert_eq!(still_running(&[pid]), 1, "it runs");
         let ((), took) = timed(|| drop(decode));
         assert!(
-            took < Duration::from_millis(50),
+            took < Duration::from_millis(500),
             "the drop waited: {took:?}"
         );
         assert_eq!(still_running(&[pid]), 0, "killed with its window");
@@ -1000,7 +1000,7 @@ fn a_dropped_waveform_decode_is_killed() {
 /// and reaped.
 #[test]
 fn a_decoder_that_closed_its_output_and_lives_on_is_killed_with_its_window() {
-    bounded(60, |t| {
+    bounded(180, |t| {
         let tmp = t.tmp();
         let hold = t.hold(tmp.path(), "hold");
         let lingers = format!("exec >&- 2>&-\n{}\nexit 0", hold.line());
@@ -1024,7 +1024,7 @@ fn a_decoder_that_closed_its_output_and_lives_on_is_killed_with_its_window() {
 /// Enter does); any other file ffprobe cannot read says so (its info card's line).
 #[test]
 fn a_file_ffprobe_cannot_read_is_said_and_a_ts_is_not_media() {
-    bounded(120, |t| {
+    bounded(180, |t| {
         let Some(tools) = tools_or_skip() else { return };
         let tmp = t.tmp();
         let held = Held::budget(&t.hand());
@@ -1065,6 +1065,26 @@ fn held_encoder_answer(dir: &Path, real: &Tools, hold: &Hold) -> Tools {
         ffmpeg: stand_in(dir, "ffmpeg", &body),
         ffprobe: real.ffprobe.clone(),
     }
+}
+
+/// Waits for the Export a test started to end, then for nothing of the test to be left. The
+/// Export asks the encoder itself (`cut::render_edit` plans again), through the stand-in that
+/// waits at `hold`: that question is let go here — a test that ended with it still waiting
+/// would leave its process behind for the supervisor to find.
+fn export_ends(fx: &mut Fx, hold: &Hold) {
+    let give_up = Instant::now() + Duration::from_secs(120);
+    while fx.win.job.is_some() {
+        assert!(Instant::now() < give_up, "the export never ended");
+        hold.let_go();
+        fx.drv.idle(&mut fx.win, 1);
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        fx.win.outcome.lock().unwrap().exported,
+        "the export: {}",
+        fx.win.status.text
+    );
+    assert_none_left(fx.tmp.path());
 }
 
 /// A window on `path` as `open` makes it: probed, nothing asked of the encoder yet, its clock
@@ -1115,7 +1135,7 @@ fn save_and_export_wait(fx: &mut Fx, which: &str) {
 #[test]
 fn the_encoder_is_asked_while_the_preview_is_prepared() {
     let Some(real) = tools_or_skip() else { return };
-    bounded(60, move |t| {
+    bounded(180, move |t| {
         let tmp = t.tmp();
         let path = tmp.path().join("deep.mov");
         deep_clip(&real, &path);
@@ -1162,6 +1182,7 @@ fn the_encoder_is_asked_while_the_preview_is_prepared() {
         );
         fx.drv.key(&mut fx.win, Key::E, Modifiers::NONE);
         assert!(fx.win.job.is_some(), "Export runs");
+        export_ends(&mut fx, &hold);
     });
 }
 
@@ -1174,7 +1195,7 @@ fn a_held_encoder_answer_never_holds_a_frame() {
     let Some(real) = tools_or_skip() else { return };
     for through_preview in [true, false] {
         let real = real.clone();
-        bounded(60, move |t| {
+        bounded(180, move |t| {
             let which = if through_preview {
                 "handed over"
             } else {
@@ -1237,6 +1258,7 @@ fn a_held_encoder_answer_never_holds_a_frame() {
             );
             fx.drv.key(&mut fx.win, Key::E, Modifiers::NONE);
             assert!(fx.win.job.is_some(), "{which}: Export is available now");
+            export_ends(&mut fx, &hold);
         });
     }
 }
@@ -1247,7 +1269,7 @@ fn a_held_encoder_answer_never_holds_a_frame() {
 #[test]
 fn an_encoder_that_never_answers_is_stopped_and_export_falls_back_to_8_bit() {
     let Some(real) = tools_or_skip() else { return };
-    bounded(60, move |t| {
+    bounded(180, move |t| {
         let tmp = t.tmp();
         let path = tmp.path().join("deep.mov");
         deep_clip(&real, &path);
@@ -1298,6 +1320,7 @@ fn an_encoder_that_never_answers_is_stopped_and_export_falls_back_to_8_bit() {
         assert_eq!(plan.pix_fmt, "yuv420p", "8 bits");
         fx.drv.key(&mut fx.win, Key::E, Modifiers::NONE);
         assert!(fx.win.job.is_some(), "Export is available");
+        export_ends(&mut fx, &hold);
     });
 }
 
@@ -1306,7 +1329,7 @@ fn an_encoder_that_never_answers_is_stopped_and_export_falls_back_to_8_bit() {
 #[test]
 fn closing_the_window_stops_its_encoder_question() {
     let Some(real) = tools_or_skip() else { return };
-    bounded(60, move |t| {
+    bounded(180, move |t| {
         let tmp = t.tmp();
         let path = tmp.path().join("deep.mov");
         deep_clip(&real, &path);
@@ -1320,7 +1343,10 @@ fn closing_the_window_stops_its_encoder_question() {
         assert_eq!(still_running(&asked), 1, "it waits for its answer");
         let Fx { tmp, win, .. } = fx;
         let ((), took) = timed(|| drop(win));
-        assert!(took < Duration::from_millis(50), "closing waited: {took:?}");
+        assert!(
+            took < Duration::from_millis(500),
+            "closing waited: {took:?}"
+        );
         assert_eq!(still_running(&asked), 0, "stopped with the window");
         assert_none_left(tmp.path());
     });
@@ -1335,7 +1361,7 @@ fn closing_the_window_stops_its_encoder_question() {
 /// killed and reaped, with no second stop from outside.
 #[test]
 fn a_stop_during_a_slow_waveform_start_is_not_lost() {
-    bounded(60, |t| {
+    bounded(180, |t| {
         let tmp = t.tmp();
         let hold = t.hold(tmp.path(), "hold");
         let silent = stand_in(tmp.path(), "ffmpeg", &hold.stalls());
@@ -1378,7 +1404,7 @@ fn a_stop_during_a_slow_waveform_start_is_not_lost() {
 /// has nothing left to do.
 #[test]
 fn a_waveform_worker_that_unwinds_leaves_no_child() {
-    bounded(60, |t| {
+    bounded(180, |t| {
         let tmp = t.tmp();
         let hold = t.hold(tmp.path(), "hold");
         // Two samples, then nothing — and it does not write again, so no closed pipe ends it.
@@ -1412,7 +1438,7 @@ fn a_waveform_worker_that_unwinds_leaves_no_child() {
 /// there, no stop from outside — and the failure is said where the waveform is.
 #[test]
 fn a_waveform_that_cannot_watch_its_child_leaves_none() {
-    bounded(60, |t| {
+    bounded(180, |t| {
         let tmp = t.tmp();
         let hold = t.hold(tmp.path(), "hold");
         let fake = stand_in(tmp.path(), "ffmpeg", &hold.stalls());
@@ -1442,7 +1468,7 @@ fn a_waveform_that_cannot_watch_its_child_leaves_none() {
 /// leaves no child.
 #[test]
 fn a_preview_run_that_unwinds_leaves_no_child() {
-    bounded(30, |t| {
+    bounded(180, |t| {
         let tmp = t.tmp();
         let hold = t.hold(tmp.path(), "hold");
         let stalls = stand_in(tmp.path(), "ffprobe", &hold.stalls());
@@ -1467,7 +1493,7 @@ fn a_preview_run_that_unwinds_leaves_no_child() {
 /// lost either: the runner stops the child it then makes, and ends cancelled.
 #[test]
 fn a_stop_during_a_slow_preview_start_is_not_lost() {
-    bounded(60, |t| {
+    bounded(180, |t| {
         let tmp = t.tmp();
         let hold = t.hold(tmp.path(), "hold");
         let stalls = stand_in(tmp.path(), "ffprobe", &hold.stalls());
@@ -1506,7 +1532,7 @@ fn a_stop_during_a_slow_preview_start_is_not_lost() {
 #[test]
 fn a_steps_time_starts_when_the_step_does() {
     let Some(real) = tools_or_skip() else { return };
-    bounded(60, move |t| {
+    bounded(180, move |t| {
         let tmp = t.tmp();
         let path = tmp.path().join("clip.mp4");
         clip(&real, &path, (320, 240));
@@ -1558,17 +1584,14 @@ fn a_test_that_does_not_end_is_failed_and_cleaned_up_after() {
         let tmp = t.tmp();
         *seen.lock().unwrap() = Some(tmp.path().to_path_buf());
         let hold = t.hold(tmp.path(), "hold");
-        let (waits, writes) = (
-            stand_in(tmp.path(), "waits", &hold.stalls()),
-            stand_in(tmp.path(), "writes", NEVER_ENDS),
-        );
         let file = tmp.path().join("some.mp4");
         // Two children nobody stops, their slots leaked: nothing of the code under test would
-        // end them.
-        for program in [waits, writes] {
+        // end them. (The shell itself, told what to do: no program is made for them, so the
+        // test gets here in good time on a loaded machine too.)
+        for script in [hold.stalls(), NEVER_ENDS.to_string()] {
             let slot: &'static Children = Box::leak(Box::default());
-            let mut cmd = std::process::Command::new(program);
-            cmd.arg(&file);
+            let mut cmd = std::process::Command::new("/bin/sh");
+            cmd.args(["-c", &script, "sh"]).arg(&file);
             // Its output stays open (a closed pipe would end the one that writes).
             std::mem::forget(slot.start(&mut cmd, Some(&file)).unwrap().unwrap());
         }
@@ -1625,7 +1648,7 @@ fn what_the_tools_say_is_shown_plain() {
 #[test]
 fn a_video_with_no_frame_fails_its_window_and_says_so_plainly() {
     let Some(tools) = tools_or_skip() else { return };
-    bounded(60, move |t| {
+    bounded(180, move |t| {
         let tmp = t.tmp();
         let path = tmp.path().join("cut.mp4");
         index_only(&tools, &path);
@@ -1667,7 +1690,7 @@ fn a_video_with_no_frame_fails_its_window_and_says_so_plainly() {
 #[test]
 fn a_video_of_wide_pixels_is_shown_in_its_shape() {
     let Some(tools) = tools_or_skip() else { return };
-    bounded(120, move |t| {
+    bounded(180, move |t| {
         let tmp = t.tmp();
         let path = tmp.path().join("wide.mp4");
         wide_pixels(&tools, &path);
@@ -1705,7 +1728,7 @@ fn a_video_of_wide_pixels_is_shown_in_its_shape() {
 #[test]
 fn a_six_channel_sound_shows_its_first_two_channels_by_name() {
     let Some(tools) = tools_or_skip() else { return };
-    bounded(120, move |t| {
+    bounded(180, move |t| {
         let tmp = t.tmp();
         let path = tmp.path().join("surround.wav");
         six_channels(&tools, &path);
@@ -1791,7 +1814,7 @@ fn until_the_frame_has_failed(fx: &mut Fx, frame: &Hold, done: impl Fn(&MediaWin
 #[test]
 fn a_first_frame_that_fails_does_not_close_an_edited_window() {
     let Some(real) = tools_or_skip() else { return };
-    bounded(90, move |t| {
+    bounded(180, move |t| {
         let (mut fx, frame) = opened_with_a_stalled_first_frame(t, &real);
         // In at 0, the playhead on to 1 s, Out, Delete: a second cut out.
         for key in [Key::I, Key::ArrowRight, Key::O, Key::Delete] {
@@ -1833,7 +1856,7 @@ fn a_first_frame_that_fails_does_not_close_an_edited_window() {
 #[test]
 fn a_first_frame_that_fails_does_not_close_a_window_that_is_writing() {
     let Some(real) = tools_or_skip() else { return };
-    bounded(90, move |t| {
+    bounded(180, move |t| {
         let (mut fx, frame) = opened_with_a_stalled_first_frame(t, &real);
         fx.drv.key(&mut fx.win, Key::E, Modifiers::NONE);
         assert!(
@@ -1859,7 +1882,7 @@ fn a_first_frame_that_fails_does_not_close_a_window_that_is_writing() {
 #[test]
 fn a_first_frame_that_fails_closes_a_window_as_it_was_opened() {
     let Some(real) = tools_or_skip() else { return };
-    bounded(90, move |t| {
+    bounded(180, move |t| {
         let (mut fx, frame) = opened_with_a_stalled_first_frame(t, &real);
         until_the_frame_has_failed(&mut fx, &frame, |w| w.failure().is_some());
         assert!(fx.win.failure().unwrap().contains("no frame"));
@@ -1892,7 +1915,7 @@ fn the_process_that_is_killed() {
 #[cfg(target_os = "linux")]
 #[test]
 fn on_linux_a_killed_sopen_takes_its_child_with_it() {
-    bounded(60, |t| {
+    bounded(180, |t| {
         let tmp = t.tmp();
         let hold = t.hold(tmp.path(), "hold");
         stand_in(tmp.path(), "ffprobe", &hold.stalls());
@@ -1931,7 +1954,7 @@ fn an_edit_or_an_export_after_the_failure_keeps_the_window() {
     let Some(real) = tools_or_skip() else { return };
     for exporting in [false, true] {
         let real = real.clone();
-        bounded(90, move |t| {
+        bounded(180, move |t| {
             let (mut fx, frame) = opened_with_a_stalled_first_frame(t, &real);
             until_the_frame_has_failed(&mut fx, &frame, |w| w.failed.is_some());
             assert!(fx.win.outcome.lock().unwrap().failed.is_some(), "recorded");

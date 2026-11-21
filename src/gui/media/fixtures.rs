@@ -361,13 +361,26 @@ impl Test {
         for hold in self.holds.lock().unwrap().iter() {
             hold.let_go();
         }
+        // What was only waiting at a hold or for its time ends by itself now: given a moment
+        // to, before anything is killed and counted (its runner reaps at its next look; a
+        // stand-in let go still has to run to its end).
+        let patient = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < patient && !live(&dirs).is_empty() {
+            for hold in self.holds.lock().unwrap().iter() {
+                hold.let_go();
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
         let mut killed = std::collections::BTreeSet::new();
         let give_up = Instant::now() + Duration::from_secs(5);
         loop {
+            // Whatever is found is killed before the time is looked at: a look that took long
+            // (a loaded machine) never leaves what it found.
             let live = live(&dirs);
-            if live.is_empty() || Instant::now() >= give_up {
+            if live.is_empty() {
                 return killed.len();
             }
+            let last = Instant::now() >= give_up;
             for pid in live {
                 if killed.insert(pid) && std::env::var_os("SOPEN_TEST_SHOW_KILLED").is_some() {
                     let out = std::process::Command::new("ps")
@@ -387,6 +400,9 @@ impl Test {
                     let mut status = 0;
                     libc::waitpid(pid as libc::pid_t, &mut status, libc::WNOHANG);
                 }
+            }
+            if last {
+                return killed.len();
             }
             std::thread::sleep(Duration::from_millis(20));
         }

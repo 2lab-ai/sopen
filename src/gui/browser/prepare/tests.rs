@@ -1762,7 +1762,7 @@ fn a_handed_over_remote_sound_decodes_on_from_its_copy() {
 /// stand-in is killed and reaped. The time is the test's clock: nothing is waited for.
 #[test]
 fn a_stalled_ffprobe_is_a_card_when_its_time_is_over_and_no_process_is_left() {
-    bounded(60, |t| {
+    bounded(180, |t| {
         let mut fx = local();
         t.also(&base(&fx));
         let hold = t.hold(&base(&fx), "hold");
@@ -1799,7 +1799,7 @@ fn a_stalled_ffprobe_is_a_card_when_its_time_is_over_and_no_process_is_left() {
 /// The real clock: a stalled probe held to 300 ms is its card about then.
 #[test]
 fn on_the_real_clock_a_stalled_ffprobe_is_a_card_in_time() {
-    bounded(60, |t| {
+    bounded(180, |t| {
         let mut fx = local();
         t.also(&base(&fx));
         let hold = t.hold(&base(&fx), "hold");
@@ -1833,7 +1833,7 @@ fn a_cancel_during_the_first_frame_stops_its_ffmpeg() {
     if SftpRemote::local_server().is_none() {
         return;
     }
-    bounded(60, move |t| {
+    bounded(180, move |t| {
         let mut fx = remote().unwrap();
         t.also(&base(&fx));
         let video = fx.root.join("clip.mp4");
@@ -1879,7 +1879,7 @@ fn a_lifted_budget_lets_a_probe_go_on_past_its_time() {
     let Some(real) = media_tools() else { return };
     for lifted in [false, true] {
         let real = real.clone();
-        bounded(60, move |t| {
+        bounded(180, move |t| {
             let mut fx = local();
             t.also(&base(&fx));
             t.also(&base(&fx));

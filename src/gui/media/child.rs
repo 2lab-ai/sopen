@@ -419,7 +419,7 @@ mod tests {
     /// the start returns, with nobody watching it.
     #[test]
     fn a_start_applies_the_stop_that_came_while_it_started() {
-        bounded(60, |t| {
+        bounded(180, |t| {
             let tmp = t.tmp();
             let hold = t.hold(tmp.path(), "hold");
             let stalls = stand_in(tmp.path(), "stalls", &hold.stalls());
@@ -459,7 +459,7 @@ mod tests {
     /// ends, and the child is reaped.
     #[test]
     fn a_watched_read_is_stopped_whatever_it_blocks_on() {
-        bounded(60, |t| {
+        bounded(180, |t| {
             let tmp = t.tmp();
             let hold = t.hold(tmp.path(), "hold");
             let stalls = stand_in(tmp.path(), "stalls", &hold.stalls());

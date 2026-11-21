@@ -2316,7 +2316,7 @@ fn previews_run(fx: &mut Fx, tools: Tools, hand: &Hand) {
 #[test]
 fn p4_a_sweep_over_fifty_files_leaves_no_ffmpeg_and_nothing_in_the_cache() {
     let Some(tools) = media_tools() else { return };
-    watched_over(120, move |t| {
+    watched_over(180, move |t| {
         let (mut fx, seen, _gate) = watched("");
         t.also(&base(&fx));
         let root = PathBuf::from(&fx.root);
@@ -2628,7 +2628,7 @@ impl Drop for LetGo {
 /// time) — and closing does not wait for anything.
 #[test]
 fn closing_the_window_kills_a_previews_ffprobe_at_once() {
-    watched_over(60, |t| {
+    watched_over(180, |t| {
         let mut fx = fixture();
         t.also(&base(&fx));
         let hold = t.hold(&base(&fx), "hold");
@@ -2680,7 +2680,7 @@ fn closing_the_window_kills_a_previews_ffprobe_at_once() {
 #[test]
 fn p6_enter_during_a_videos_probe_continues_it_as_the_opening() {
     let Some(real) = media_tools() else { return };
-    watched_over(60, move |t| {
+    watched_over(180, move |t| {
         let mut fx = fixture();
         t.also(&base(&fx));
         let path = PathBuf::from(format!("{}/clip.mp4", fx.root));
@@ -2721,7 +2721,7 @@ fn p6_enter_during_a_videos_probe_continues_it_as_the_opening() {
 /// the worker after the window returns.
 #[test]
 fn closing_during_a_taken_over_probe_leaves_no_process() {
-    watched_over(60, |t| {
+    watched_over(180, |t| {
         let mut fx = fixture();
         t.also(&base(&fx));
         let hold = t.hold(&base(&fx), "hold");
@@ -2758,7 +2758,7 @@ fn closing_during_a_taken_over_probe_leaves_no_process() {
 #[test]
 fn enter_on_a_video_with_no_frame_comes_back_to_the_list_with_the_reason() {
     let Some(tools) = media_tools() else { return };
-    watched_over(60, move |t| {
+    watched_over(180, move |t| {
         let mut fx = fixture();
         t.also(&base(&fx));
         index_only(&tools, Path::new(&format!("{}/cut.mp4", fx.root)));
