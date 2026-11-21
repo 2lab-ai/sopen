@@ -37,10 +37,27 @@
 //! ended — keeps the page on screen meanwhile, and swaps the new index in (following the end if
 //! it was at the end). A deleted file keeps its page. Checked before each new page: the window says so and
 //! reads no more. Every offset taken from the index is checked, never trusted.
+//!
+//! A remote file read through a [`Source`] (06 §7.2, [`TextDoc::streamed`]) reads through
+//! [`Bytes`] and is not indexed at open. Its first 64 KiB block is its first screen: until it
+//! arrives the window says `loading…`, and nothing else is fetched before that screen is drawn.
+//! The index then grows from byte 0 on the frames, through a Bulk reader, as far as
+//! [`HIGHLIGHT_MAX`] (a preview: [`PREVIEW_INDEX`]); the top bar says how far the lines are
+//! known, and the gutter is sized once, for the most lines that index can hold. A read whose
+//! bytes are not here yet is [`Pending`]: it travels up as [`Stale`] does, in an arm of its own
+//! — the page on screen stays, where the keys asked to go is kept, and the Source's waker
+//! brings the pass that reads again. A read that failed keeps the screen and the keys too, with
+//! the reason on the status row; the next key, click or scroll retries. The highlighting worker
+//! reads through a reader of its own with the blocking read, so it waits for its bytes and
+//! never sees `Pending`; it highlights over the indexed lines as they grow. A file that
+//! changed on the remote freezes the page until Cmd/Ctrl+R, which re-opens it and indexes it
+//! again from its first block. Until the routes open a Source (06 §13: W8, after W5b), remote
+//! text is still fetched whole and read as a local file.
 
 mod wrap;
 
 use super::{chrome, Embedded, Outcome, Status, Window};
+use crate::stream::{Bytes, ReadError, ReaderKind, Source};
 use anyhow::{Context as _, Result};
 use eframe::egui::{self, text::LayoutJob, Color32, FontId, Key, Modifiers, Pos2, Rect};
 use std::fs::File;
@@ -50,6 +67,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
 use std::sync::OnceLock;
+use std::task::Poll;
 use syntect::highlighting::{HighlightIterator, HighlightState, Highlighter};
 use syntect::parsing::{ParseState, ScopeStack, SyntaxReference, SyntaxSet};
 
@@ -85,7 +103,8 @@ pub struct Line {
 
 /// A text file opened for viewing: the handle it is read through, and the line index.
 pub struct TextDoc {
-    file: File,
+    backing: Backing,
+    /// The bytes the index covers: the file's, or the prefix a stopped or growing pass read.
     size: u64,
     marks: Vec<Mark>,
     lines: u64,
@@ -117,6 +136,74 @@ pub struct TextDoc {
     pub(crate) stale_worker_reads: bool,
     #[cfg(test)]
     stale_reads: bool,
+}
+
+/// What a document reads through (06 §5's `Bytes`): a local file in place, or a remote one's
+/// stream.
+enum Backing {
+    Local(File),
+    Stream(Box<Stream>),
+}
+
+/// A remote file read through a [`Source`] (06 §7.2): the index is not made at open but grows
+/// from byte 0 — the first block when it arrives, then a pass of its own.
+struct Stream {
+    /// The window's document keeps the Source (it makes the readers); a worker's copy has only
+    /// its reader, so a worker never keeps the stream open.
+    source: Option<Source>,
+    /// What lines are read through: the screen's reader, or a worker's own.
+    reader: Box<dyn Bytes + Send>,
+    /// The index pass's reader (the window's document only).
+    pass: Option<Box<dyn Bytes + Send>>,
+    /// The pass's last stretch before a cap that is not the file's end: read in one piece
+    /// through a reader of its own, which has no readahead (the pass's own, running in
+    /// sequence, would fetch up to a megabyte past the cap).
+    tail: Option<Box<dyn Bytes + Send>>,
+    /// The file's size as the Source opened it.
+    total: u64,
+    /// The pass so far.
+    scan: Scan,
+    /// A worker's copy: reads wait for their bytes (the blocking `read_at`) until this is set.
+    /// A frame's never waits: it gets [`Pending`].
+    blocking: Option<Arc<AtomicBool>>,
+}
+
+/// A read whose bytes are not here yet (06 §7.2): the fetch is queued and the Source's waker
+/// brings the next pass. Carried up as [`Stale`] is; never an error to show.
+#[derive(Debug)]
+pub struct Pending;
+
+impl std::fmt::Display for Pending {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the bytes have not arrived yet")
+    }
+}
+
+impl std::error::Error for Pending {}
+
+/// Whether `e` says the bytes are still on their way ([`Pending`]).
+pub fn is_pending(e: &anyhow::Error) -> bool {
+    e.chain().any(|c| c.is::<Pending>())
+}
+
+/// Why a stream's read gave no bytes, if `e` is one ([`ReadError`]).
+fn read_error(e: &anyhow::Error) -> Option<&ReadError> {
+    e.chain().find_map(|c| c.downcast_ref::<ReadError>())
+}
+
+/// What a step of a stream's index pass added ([`TextDoc::grow`]): the worker's copy of the
+/// index takes the same ([`TextDoc::apply`]).
+#[derive(Debug, Clone)]
+struct Growth {
+    size: u64,
+    lines: u64,
+    ends_newline: bool,
+    first_long: Option<u64>,
+    /// How many marks the index had before, and the ones added.
+    marks_before: usize,
+    marks: Vec<Mark>,
+    /// The index's last line had no end yet (it may be longer now), and which line that was.
+    open_line: Option<u64>,
 }
 
 /// What [`TextDoc::changed`] compares: device, inode, size and modification time.
@@ -192,31 +279,19 @@ impl TextDoc {
     fn indexed(file: File, scan: Scan, opened: Identity, path: std::path::PathBuf) -> Self {
         // The bytes actually indexed (fewer than the size as opened if it shrank meanwhile: the
         // change is noticed later).
-        let size = scan.at;
-        let mut marks = scan.marks.clone();
-        marks.retain(|m| m.line == 0 || m.offset < size);
-        let mut first_long = scan.first_long;
-        if scan.line_len > LINE_MAX as u64 && first_long.is_none() {
-            first_long = Some(scan.line);
-        }
-        let ends_newline = scan.last_byte == Some(b'\n');
-        let mut lines = scan.line;
-        if scan.last_byte.is_some() && !ends_newline {
-            lines += 1;
-        }
-        Self {
-            file,
-            size,
-            marks,
-            lines,
-            ends_newline,
-            first_long,
+        let mut doc = Self {
+            backing: Backing::Local(file),
+            size: 0,
+            marks: Vec::new(),
+            lines: 0,
+            ends_newline: false,
+            first_long: None,
             opened,
             indexed_in: std::time::Duration::ZERO,
             after_pass: Now::Same,
             path,
             page_reads: 0,
-            rest: scan.capped.then_some(scan),
+            rest: None,
             #[cfg(test)]
             fail_worker_reads: false,
             #[cfg(test)]
@@ -225,7 +300,220 @@ impl TextDoc {
             stale_worker_reads: false,
             #[cfg(test)]
             stale_reads: false,
+        };
+        doc.install(&scan);
+        doc.rest = scan.capped.then_some(scan);
+        doc
+    }
+
+    /// A remote file read through `source` (06 §7.2), nothing of it read yet: its index grows
+    /// from byte 0 ([`TextDoc::grow`]) — the first block through the screen's reader, the rest
+    /// through a Bulk reader of its own.
+    pub fn streamed(source: Source) -> Self {
+        let total = source.size();
+        let scan = Scan {
+            marks: vec![Mark { line: 0, offset: 0 }],
+            ..Scan::default()
+        };
+        let stream = Stream {
+            reader: Box::new(source.reader(ReaderKind::Interactive)),
+            pass: Some(Box::new(source.reader(ReaderKind::Bulk))),
+            tail: None,
+            source: Some(source),
+            total,
+            scan: scan.clone(),
+            blocking: None,
+        };
+        let mut doc = Self {
+            backing: Backing::Stream(Box::new(stream)),
+            size: 0,
+            marks: Vec::new(),
+            lines: 0,
+            ends_newline: false,
+            first_long: None,
+            opened: (0, 0, total, None),
+            indexed_in: std::time::Duration::ZERO,
+            after_pass: Now::Same,
+            path: std::path::PathBuf::new(),
+            page_reads: 0,
+            rest: None,
+            #[cfg(test)]
+            fail_worker_reads: false,
+            #[cfg(test)]
+            fail_reads: false,
+            #[cfg(test)]
+            stale_worker_reads: false,
+            #[cfg(test)]
+            stale_reads: false,
+        };
+        doc.install(&scan);
+        doc
+    }
+
+    fn stream(&self) -> Option<&Stream> {
+        match &self.backing {
+            Backing::Stream(stream) => Some(stream),
+            Backing::Local(_) => None,
         }
+    }
+
+    /// Read through a [`Source`], not a local file in place.
+    pub fn is_stream(&self) -> bool {
+        self.stream().is_some()
+    }
+
+    /// The Source a stream is read through (the window's document; a worker's copy has none).
+    pub fn source(&self) -> Option<&Source> {
+        self.stream().and_then(|s| s.source.as_ref())
+    }
+
+    /// The file's size: a stream's as its Source opened it, else what the index covers.
+    pub fn total(&self) -> u64 {
+        self.stream().map_or(self.size, |s| s.total)
+    }
+
+    /// The index covers the whole file (always, for a local file's: a preview's stopped pass
+    /// is [`TextDoc::cut_short`]).
+    pub fn whole(&self) -> bool {
+        self.size >= self.total()
+    }
+
+    /// A stream's index pass has more to read below `cap` bytes.
+    pub fn growing(&self, cap: u64) -> bool {
+        self.stream().is_some_and(|s| s.scan.at < s.total.min(cap))
+    }
+
+    /// One step of a stream's index pass (06 §7.2): up to `budget` more bytes, a block at a
+    /// time, as far as `cap` — the first block alone (the first screen needs it and nothing
+    /// else), asked for by the screen's reader; the rest through the pass's own. `Ok(None)`:
+    /// nothing more to index below the cap. [`Pending`]: the next block is on its way and
+    /// nothing was added.
+    fn grow(&mut self, cap: u64, budget: u64) -> Result<Option<Growth>> {
+        let (before, lines, ends_newline) = (self.marks.len(), self.lines, self.ends_newline);
+        let Backing::Stream(stream) = &mut self.backing else {
+            return Ok(None);
+        };
+        let end = stream.total.min(cap);
+        let from = stream.scan.at;
+        if from >= end {
+            return Ok(None);
+        }
+        // How far past a read a Bulk reader's readahead goes.
+        let (ahead, _) = crate::stream::limits(ReaderKind::Bulk);
+        let mut failed = None;
+        while stream.scan.at < end && stream.scan.at - from < budget {
+            let at = stream.scan.at;
+            let block = crate::stream::BLOCK;
+            let mut want = (end - at).min(block - at % block) as usize;
+            if at == 0 {
+                // The screen asks for the file's first byte: its block is a demand, and
+                // nothing beside it is fetched (a longer read would bring its margin, 06 §4).
+                match stream.reader.try_read(0, 1) {
+                    Poll::Ready(Ok(_)) => {}
+                    Poll::Ready(Err(e)) => return Err(anyhow::Error::new(e)),
+                    Poll::Pending => return Err(anyhow::Error::new(Pending)),
+                }
+            }
+            let last_stretch = end < stream.total && at > 0 && end - at < ahead + block;
+            if last_stretch && at > from {
+                // Read in one piece (below), up to a block more than a pass's budget: in a
+                // pass of its own, not on top of what this one has fed.
+                break;
+            }
+            if !last_stretch {
+                stream.tail = None;
+            } else if stream.tail.is_none() {
+                stream.tail = stream
+                    .source
+                    .as_ref()
+                    .map(|s| Box::new(s.reader(ReaderKind::Bulk)) as Box<dyn Bytes + Send>);
+            }
+            let reader = match (stream.tail.as_mut(), stream.pass.as_mut()) {
+                (Some(tail), _) => {
+                    want = (end - at) as usize;
+                    tail
+                }
+                (None, Some(pass)) => pass,
+                (None, None) => &mut stream.reader,
+            };
+            match reader.try_read(at, want) {
+                Poll::Ready(Ok(bytes)) if bytes.is_empty() => break,
+                Poll::Ready(Ok(bytes)) => stream.scan.feed(&bytes, stream.total),
+                Poll::Ready(Err(e)) => {
+                    failed = Some(anyhow::Error::new(e));
+                    break;
+                }
+                Poll::Pending => {
+                    failed = Some(anyhow::Error::new(Pending));
+                    break;
+                }
+            }
+            if at == 0 {
+                // The first screen first: the pass goes on once it is up.
+                break;
+            }
+        }
+        if stream.scan.at == from {
+            return match failed {
+                Some(e) => Err(e),
+                None => Ok(None),
+            };
+        }
+        let scan = stream.scan.clone();
+        self.install(&scan);
+        Ok(Some(Growth {
+            size: self.size,
+            lines: self.lines,
+            ends_newline: self.ends_newline,
+            first_long: self.first_long,
+            marks_before: before,
+            marks: self.marks[before.min(self.marks.len())..].to_vec(),
+            open_line: (lines > 0 && !ends_newline).then(|| lines - 1),
+        }))
+    }
+
+    /// A worker's copy: its reads wait for their bytes, until `cancel` is set (06 §7.2: the
+    /// blocking `read_at`, so [`Pending`] never reaches a worker). A local file's never wait.
+    fn block_until(&mut self, cancel: Arc<AtomicBool>) {
+        if let Backing::Stream(stream) = &mut self.backing {
+            stream.blocking = Some(cancel);
+        }
+    }
+
+    /// A stream's reader was made before a reload (06 §5): it reads nothing more.
+    fn reloaded(&mut self) -> bool {
+        match &mut self.backing {
+            Backing::Stream(stream) => matches!(
+                stream.reader.try_read(0, 0),
+                Poll::Ready(Err(ReadError::Reloaded))
+            ),
+            Backing::Local(_) => false,
+        }
+    }
+
+    /// A worker's copy of a stream's index takes what the window's pass added.
+    fn apply(&mut self, growth: &Growth) {
+        self.marks.truncate(growth.marks_before);
+        self.marks.extend_from_slice(&growth.marks);
+        self.size = growth.size;
+        self.lines = growth.lines;
+        self.ends_newline = growth.ends_newline;
+        self.first_long = growth.first_long;
+    }
+
+    /// The index is what `scan` found so far: of the bytes it read, and no mark at or past
+    /// their end.
+    fn install(&mut self, scan: &Scan) {
+        let size = scan.at;
+        self.marks.clone_from(&scan.marks);
+        self.marks.retain(|m| m.line == 0 || m.offset < size);
+        self.first_long = scan.first_long;
+        if scan.line_len > LINE_MAX as u64 && self.first_long.is_none() {
+            self.first_long = Some(scan.line);
+        }
+        self.ends_newline = scan.last_byte == Some(b'\n');
+        self.lines = scan.line + u64::from(scan.last_byte.is_some() && !self.ends_newline);
+        self.size = size;
     }
 
     /// The index stopped short of the file (a preview's budget): it covers [`TextDoc::size`]
@@ -279,10 +567,10 @@ impl TextDoc {
         on_chunk: &mut dyn FnMut(u64),
     ) -> Result<TextDoc> {
         let started = std::time::Instant::now();
-        let file = self
-            .file
-            .try_clone()
-            .context("cannot open the file again")?;
+        let Backing::Local(file) = &self.backing else {
+            return self.share();
+        };
+        let file = file.try_clone().context("cannot open the file again")?;
         let mut scan = match &self.rest {
             Some(rest) => rest.clone(),
             None => return self.share(),
@@ -324,12 +612,16 @@ impl TextDoc {
     /// file through its index (bounded reads, [`Stale`] the net) and indexes it again soon; a
     /// changed one is never read through it.
     pub fn now(&self) -> Now {
+        let Backing::Local(file) = &self.backing else {
+            // A stream's changes are its Source's to say (06 §5), not a stat's.
+            return Now::Same;
+        };
         let named = match std::fs::metadata(&self.path) {
             Ok(meta) => meta,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Now::Gone,
             Err(_) => return Now::Changed,
         };
-        let Ok(handle) = self.file.metadata() else {
+        let Ok(handle) = file.metadata() else {
             return Now::Changed;
         };
         let same = |m: &std::fs::Metadata| identity(m) == self.opened;
@@ -373,11 +665,25 @@ impl TextDoc {
 
     /// The same file and index on a handle of its own (the highlighting worker's).
     fn share(&self) -> Result<TextDoc> {
+        let backing = match &self.backing {
+            Backing::Local(file) => {
+                Backing::Local(file.try_clone().context("cannot open the file again")?)
+            }
+            Backing::Stream(stream) => {
+                let source = stream.source.as_ref().context("the stream is closed")?;
+                Backing::Stream(Box::new(Stream {
+                    source: None,
+                    reader: Box::new(source.reader(ReaderKind::Bulk)),
+                    pass: None,
+                    tail: None,
+                    total: stream.total,
+                    scan: Scan::default(),
+                    blocking: None,
+                }))
+            }
+        };
         Ok(TextDoc {
-            file: self
-                .file
-                .try_clone()
-                .context("cannot open the file again")?,
+            backing,
             size: self.size,
             marks: self.marks.clone(),
             lines: self.lines,
@@ -447,9 +753,24 @@ impl TextDoc {
         if self.stale_reads {
             return Err(anyhow::Error::new(Stale));
         }
-        let n = self.file.read_at(buf, at).context("cannot read the file")?;
-        self.page_reads += n as u64;
-        Ok(n)
+        let bytes: &mut dyn Bytes = match &mut self.backing {
+            Backing::Local(file) => file,
+            Backing::Stream(stream) => {
+                if let Some(cancel) = &stream.blocking {
+                    let n = stream.reader.read_at(at, buf, cancel)?;
+                    self.page_reads += n as u64;
+                    return Ok(n);
+                }
+                stream.reader.as_mut()
+            }
+        };
+        let got = match bytes.try_read(at, buf.len()) {
+            Poll::Ready(got) => got?,
+            Poll::Pending => return Err(anyhow::Error::new(Pending)),
+        };
+        buf[..got.len()].copy_from_slice(&got);
+        self.page_reads += got.len() as u64;
+        Ok(got.len())
     }
 
     /// Lines `first ..first + count` (fewer at the end of the file), each cut at [`LINE_MAX`]
@@ -555,6 +876,8 @@ impl TextDoc {
                     .and_then(|n| n.checked_sub(newline))
                     .unwrap_or(0);
                 if keep {
+                    // (Through a stream's growing index this byte is one the pass has read:
+                    // every offset the index names lies in the bytes already fetched.)
                     if len > 0 && window.take(self, pos + len - 1, 1)?.first() == Some(&b'\r') {
                         len -= 1;
                     }
@@ -695,6 +1018,34 @@ struct Scan {
 const PASS_READ: usize = 1 << 20;
 
 impl Scan {
+    /// The next bytes of the file (`bytes`, at where the pass is), of a file of `size` bytes.
+    fn feed(&mut self, bytes: &[u8], size: u64) {
+        for (i, &b) in bytes.iter().enumerate() {
+            if b != b'\n' {
+                self.line_len += 1;
+                continue;
+            }
+            if self.line_len > LINE_MAX as u64 && self.first_long.is_none() {
+                self.first_long = Some(self.line);
+            }
+            self.line_len = 0;
+            self.line += 1;
+            let start = self.at + i as u64 + 1;
+            let last = self.marks[self.marks.len() - 1];
+            if start < size && (self.line - last.line >= BLOCK_LINES || start - last.offset >= SPAN)
+            {
+                self.marks.push(Mark {
+                    line: self.line,
+                    offset: start,
+                });
+            }
+        }
+        if let Some(&b) = bytes.last() {
+            self.last_byte = Some(b);
+        }
+        self.at += bytes.len() as u64;
+    }
+
     /// The pass over `file` (opened at `path`, `size` bytes as opened) from where it is, to the
     /// end of those bytes or to `cap()` (asked before every read); `check()` after every read.
     /// Stops early, not capped, where the file ends sooner (it shrank meanwhile: the change is
@@ -740,29 +1091,7 @@ impl Scan {
             if let Some(hasher) = self.hasher.as_mut() {
                 sha2::Digest::update(hasher, &buf[..n]);
             }
-            for (i, &b) in buf[..n].iter().enumerate() {
-                if b != b'\n' {
-                    self.line_len += 1;
-                    continue;
-                }
-                if self.line_len > LINE_MAX as u64 && self.first_long.is_none() {
-                    self.first_long = Some(self.line);
-                }
-                self.line_len = 0;
-                self.line += 1;
-                let start = self.at + i as u64 + 1;
-                let last = self.marks[self.marks.len() - 1];
-                if start < size
-                    && (self.line - last.line >= BLOCK_LINES || start - last.offset >= SPAN)
-                {
-                    self.marks.push(Mark {
-                        line: self.line,
-                        offset: start,
-                    });
-                }
-            }
-            self.last_byte = Some(buf[n - 1]);
-            self.at += n as u64;
+            self.feed(&buf[..n], size);
             on_chunk(self.at);
             check()?;
         }
@@ -872,9 +1201,12 @@ impl Window_ {
     fn at(&mut self, doc: &mut TextDoc, pos: u64, want: usize) -> Result<&[u8]> {
         let end = self.start + self.bytes.len() as u64;
         if pos < self.start || pos >= end {
-            self.bytes.resize(want.clamp(1, CHUNK), 0);
-            let n = doc.read_at(&mut self.bytes, pos)?;
-            self.bytes.truncate(n);
+            // Into a buffer of its own: a read that fails, or is not here yet, leaves the
+            // window as it was — never a buffer made ready for bytes that did not come.
+            let mut bytes = vec![0; want.clamp(1, CHUNK)];
+            let n = doc.read_at(&mut bytes, pos)?;
+            bytes.truncate(n);
+            self.bytes = bytes;
             self.start = pos;
         }
         Ok(&self.bytes[(pos - self.start) as usize..])
@@ -939,28 +1271,32 @@ pub fn warm() {
     chrome::syntax_theme();
 }
 
-/// The syntax for a file named `name`: by extension, by the whole name (`Makefile`), and only
-/// when the name does not decide, by the first line (`#!/bin/sh`) read through `doc` — an index
-/// that may be read (`None`: the name alone). `None` for plain text.
-fn syntax_of(name: &str, doc: Option<&mut TextDoc>) -> Option<&'static SyntaxReference> {
+/// The syntax a file's name picks: by extension, or by the whole name (`Makefile`). `None`
+/// when the name does not decide.
+fn syntax_by_name(name: &str) -> Option<&'static SyntaxReference> {
     let set = syntaxes();
-    let by_name = crate::kind::extension(name)
+    crate::kind::extension(name)
         .and_then(|ext| set.find_syntax_by_extension(&ext))
-        .or_else(|| set.find_syntax_by_extension(name));
-    let found = match (by_name, doc) {
-        (Some(found), _) => found,
-        (None, Some(doc)) => {
-            let first = doc
-                .read_lines(0, 1)
-                .ok()
-                .and_then(|l| l.into_iter().next())
-                .map(|l| l.text)
-                .unwrap_or_default();
-            set.find_syntax_by_first_line(&first)?
+        .or_else(|| set.find_syntax_by_extension(name))
+}
+
+/// The syntax for a file named `name`: by its name ([`syntax_by_name`]), and only when the name
+/// does not decide, by the first line (`#!/bin/sh`) read through `doc`. `Ok(None)` for plain
+/// text. An error when that line could not be read — it is [`Pending`], or the read failed:
+/// the choice is still open, and the caller asks again (never plain text for good).
+fn syntax_of(name: &str, doc: &mut TextDoc) -> Result<Option<&'static SyntaxReference>> {
+    let found = match syntax_by_name(name) {
+        Some(found) => found,
+        None => {
+            let first = doc.read_lines(0, 1)?.into_iter().next();
+            let first = first.map(|l| l.text).unwrap_or_default();
+            match syntaxes().find_syntax_by_first_line(&first) {
+                Some(found) => found,
+                None => return Ok(None),
+            }
         }
-        (None, None) => return None,
     };
-    (found.name != "Plain Text").then_some(found)
+    Ok((found.name != "Plain Text").then_some(found))
 }
 
 /// A highlighted line: runs of text and their colour.
@@ -1176,6 +1512,13 @@ struct Ask {
     count: usize,
 }
 
+/// What the window sends its worker.
+enum Msg {
+    Page(Ask),
+    /// A stream's index grew: the worker's copy takes the same, in order.
+    Grown(Growth),
+}
+
 /// What the worker sends back.
 enum Done {
     Page {
@@ -1186,12 +1529,15 @@ enum Done {
     Stale,
     /// The worker stopped for another reason (a read error): why.
     Failed(String),
+    /// A stream's read gave no bytes (it failed, changed or was reloaded, 06 §5): the worker
+    /// stopped, and highlighting starts again once the stream reads again.
+    Stream,
 }
 
 /// The highlighting worker, from the window's side. Dropping it tells the worker to stop; it is
 /// never joined (a syntect call in progress finishes on its own, its result unused).
 struct Worker {
-    asks: Sender<Ask>,
+    asks: Sender<Msg>,
     done: Receiver<Done>,
     /// The newest generation asked: the worker drops older work (checked between lines).
     latest: Arc<AtomicU64>,
@@ -1249,10 +1595,12 @@ impl Worker {
         pool: &Arc<Pool>,
     ) -> Option<Self> {
         let slot = pool.admit()?;
-        let (asks, rx) = mpsc::channel::<Ask>();
+        let (asks, rx) = mpsc::channel::<Msg>();
         let (tx, done) = mpsc::channel();
         let latest = Arc::new(AtomicU64::new(0));
         let stop = Arc::new(AtomicBool::new(false));
+        // A stream's worker waits for its bytes, and no longer than its window lives.
+        doc.block_until(stop.clone());
         let exited = Arc::new(AtomicBool::new(false));
         let parsed = hl.parsed.clone();
         let (l, st, ex) = (latest.clone(), stop.clone(), exited.clone());
@@ -1266,14 +1614,25 @@ impl Worker {
                 after_wake: hl.after_wake.clone(),
             };
             let work = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                while let Ok(mut ask) = rx.recv() {
-                    // Only the newest request matters.
-                    while let Ok(newer) = rx.try_recv() {
-                        ask = newer;
+                while let Ok(first) = rx.recv() {
+                    // Only the newest request matters; what the index grew by, all of it.
+                    let (mut ask, mut next) = (None, Some(first));
+                    while let Some(msg) = next {
+                        match msg {
+                            Msg::Page(newer) => ask = Some(newer),
+                            Msg::Grown(growth) => {
+                                doc.apply(&growth);
+                                hl.stop = doc.first_long.unwrap_or(u64::MAX);
+                            }
+                        }
+                        next = rx.try_recv().ok();
                     }
                     if st.load(Ordering::Relaxed) {
                         break;
                     }
+                    let Some(ask) = ask else {
+                        continue;
+                    };
                     let gen = ask.gen;
                     let dropped = || st.load(Ordering::Relaxed) || l.load(Ordering::Relaxed) != gen;
                     match hl.page(&mut doc, ask.top, ask.count, &dropped) {
@@ -1282,10 +1641,14 @@ impl Worker {
                             ctx.request_repaint();
                         }
                         Ok(None) => {}
+                        // The window went while a read waited: nobody to tell.
+                        Err(e) if matches!(read_error(&e), Some(ReadError::Cancelled)) => break,
                         Err(e) => {
                             crate::debug!("highlighting stopped: {e:#}");
                             end.send(if is_stale(&e) {
                                 Done::Stale
+                            } else if read_error(&e).is_some() {
+                                Done::Stream
                             } else {
                                 Done::Failed(format!("{e:#}"))
                             });
@@ -1313,7 +1676,12 @@ impl Worker {
 
     fn ask(&self, gen: u64, top: u64, count: usize) {
         self.latest.store(gen, Ordering::Relaxed);
-        let _ = self.asks.send(Ask { gen, top, count });
+        let _ = self.asks.send(Msg::Page(Ask { gen, top, count }));
+    }
+
+    /// The index grew: the worker's copy grows the same before its next page.
+    fn grown(&self, growth: Growth) {
+        let _ = self.asks.send(Msg::Grown(growth));
     }
 }
 
@@ -1389,6 +1757,11 @@ impl Page {
     /// Nothing on it (tests).
     #[cfg(test)]
     fn is_blank(&self) -> bool {
+        self.is_empty()
+    }
+
+    /// No row on it.
+    fn is_empty(&self) -> bool {
         self.runs.is_empty() && self.rows.is_empty()
     }
 }
@@ -1405,10 +1778,26 @@ enum Jump {
     FileEnd,
     /// The row byte `n` of the file is in (`SOPEN_STATE` `at=`).
     Byte(u64),
+    /// Line `n` at the top (a stream indexed again after a reload: the place it was at).
+    Line(u64),
 }
+
+/// A preview of a remote file indexes this much of it (02 §4.3's budget for text); the
+/// hand-over goes on from there (06 §7.2).
+pub const PREVIEW_INDEX: u64 = 4 << 20;
 
 /// The window's title in its frame, as PC Shell names its text viewer.
 const TITLE: &str = "Text Viewer";
+
+/// What stands where bytes are still on their way (06 §7.2).
+const LOADING: &str = "loading…";
+
+/// A read on its way for this long says so (06 §5; the 1 s `loading 0x…` form is the hex
+/// window's, which has an offset to name).
+const SLOW_AFTER: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// What the status row adds then.
+const SLOW: &str = "the remote is slow";
 
 struct TextWindow {
     /// `host:/abs`.
@@ -1478,6 +1867,35 @@ struct TextWindow {
     /// input of its own, no following and no re-read. Its index may stop short of the file (the
     /// preview's 4 MiB); the hand-over ([`Window::set_preview`] `false`) resumes it.
     preview: bool,
+    /// A page read is on its way (06 §7.2): the page on screen is the one before it, and where
+    /// the keys asked to go is kept until its bytes arrive. Also before a stream's first block,
+    /// and while a place past the indexed lines waits for the index pass.
+    pending: bool,
+    /// Since when (06 §5: after [`SLOW_AFTER`] the status row says the remote is slow).
+    pending_since: Option<std::time::Instant>,
+    /// Why a stream's last read failed (06 §5): the screen and the keys stay, the status row
+    /// says it, and the next pass reads again.
+    failure: Option<String>,
+    /// A stream's state, looked at once a pass (06 §5).
+    streamed: Option<crate::stream::State>,
+    /// A stream's reload was asked for (Cmd/Ctrl+R), or met: it is indexed again from its
+    /// first block once the Source has re-opened it.
+    reloading: bool,
+    /// The first line picks the syntax and has not been read yet (a stream's first block is on
+    /// its way; a read failed).
+    syntax_due: bool,
+    /// A stream's gutter width in digits, sized once when its first block arrived — and again
+    /// for the first block of a reload (`true`; the page of before keeps its width until then).
+    gutter: Option<usize>,
+    regutter: bool,
+    /// A stream's first screen was drawn (`first`, 06 §11): its index pass goes on from here.
+    first: bool,
+    /// A stream's highlighter ended on a failed read: it starts again when the stream is back.
+    hl_retry: bool,
+    /// A highlighter started with a page already on screen: that page is asked of it.
+    reask: bool,
+    /// This pass has a key, a click or a scroll in it (06 §5: what retries a failed stream).
+    input: bool,
     /// Called as a re-read's worker starts (tests: hold it).
     #[cfg(test)]
     reindex_hook: Option<Arc<dyn Fn() + Send + Sync>>,
@@ -1487,6 +1905,10 @@ struct TextWindow {
     /// Called right after a re-read's index is installed (tests: write to the file there).
     #[cfg(test)]
     after_install: Option<Box<dyn FnMut()>>,
+    /// Called in a pass after its keys and before the stream is looked at (tests: what the
+    /// stream's own thread may do in between, as a reload that ends there).
+    #[cfg(test)]
+    before_poll: Option<Box<dyn FnMut()>>,
 }
 
 /// A re-read of the file from its path, on a worker. Dropping it (the viewer gone) cancels it;
@@ -1534,15 +1956,24 @@ impl TextWindow {
         // Changed since it was indexed (between the opener's worker and now): nothing is read
         // through that index; the first pass re-reads it.
         let now = doc.now_since_pass();
-        // The first line refines the choice only through an index that may be read.
-        let readable = matches!(now, Now::Same | Now::Grown);
-        let syntax = syntax_of(name, readable.then_some(&mut doc));
+        // The first line refines the choice only through an index that may be read — and for a
+        // stream, once its first block is here: asked again then, and after a read that failed.
+        let readable = matches!(now, Now::Same | Now::Grown) && !doc.is_stream();
+        let (syntax, syntax_due) = match readable.then(|| syntax_of(name, &mut doc)) {
+            Some(Ok(syntax)) => (syntax, false),
+            Some(Err(_)) => (None, true),
+            None => {
+                let by_name = syntax_by_name(name).filter(|s| s.name != "Plain Text");
+                (by_name, doc.is_stream() && syntax_by_name(name).is_none())
+            }
+        };
         let index_took = doc.indexed_in;
         let status = match now {
             Now::Gone => Status::error("the file was deleted"),
             _ => opening_status(syntax, &doc),
         };
         Self {
+            live: !doc.is_stream(),
             title,
             name: name.to_string(),
             doc,
@@ -1562,7 +1993,6 @@ impl TextWindow {
             index_done: std::time::Instant::now(),
             index_took,
             reindexes: 0,
-            live: true,
             preview: false,
             #[cfg(test)]
             reindex_hook: None,
@@ -1570,6 +2000,20 @@ impl TextWindow {
             reindex_chunk_hook: None,
             #[cfg(test)]
             after_install: None,
+            #[cfg(test)]
+            before_poll: None,
+            pending: false,
+            pending_since: None,
+            failure: None,
+            streamed: None,
+            reloading: false,
+            syntax_due,
+            gutter: None,
+            regutter: false,
+            first: false,
+            hl_retry: false,
+            reask: false,
+            input: false,
             top: 0,
             visible: 1,
             left: 0,
@@ -1590,10 +2034,181 @@ impl TextWindow {
         }
     }
 
+    /// How far a stream's index pass goes: a preview's budget, else 16 MiB.
+    fn pass_cap(&self) -> u64 {
+        if self.preview {
+            PREVIEW_INDEX
+        } else {
+            HIGHLIGHT_MAX
+        }
+    }
+
+    /// A stream's index pass has more to index (it runs on the frames).
+    fn growing(&self) -> bool {
+        self.doc.growing(self.pass_cap())
+    }
+
+    /// A stream's state, once a pass; and a reload that has re-opened the file: it is indexed
+    /// again from its first block, the page on screen staying up until the new one is read.
+    fn poll_stream(&mut self, ctx: &egui::Context) {
+        self.streamed = self.doc.source().map(Source::state);
+        // Asked for (Cmd/Ctrl+R), or met by a read; not done yet: the Source's waker brings
+        // the pass that sees it.
+        if !self.reloading || !self.doc.reloaded() {
+            return;
+        }
+        let Some(source) = self.doc.source().cloned() else {
+            return;
+        };
+        self.reloading = false;
+        // The place it was at, kept until the new index has reached it.
+        if let Some(page) = self.page.as_ref().filter(|p| p.top > 0 || p.top_off > 0) {
+            self.jump = Some(if page.wrapped {
+                Jump::Byte(page.top_start + page.top_off)
+            } else {
+                Jump::Line(page.top)
+            });
+        }
+        self.doc = TextDoc::streamed(source);
+        self.syntax_due = syntax_by_name(&self.name).is_none();
+        if self.syntax_due {
+            self.syntax = None;
+        }
+        self.worker = None;
+        self.hl_tried = false;
+        self.hl_retry = false;
+        self.memo.reset(self.room);
+        self.regutter = true;
+        self.stale_page = true;
+        self.failure = None;
+        self.status = Status::default();
+        self.streamed = self.doc.source().map(Source::state);
+        ctx.request_repaint();
+    }
+
+    /// The first line picks the syntax, once it can be read (06 §7.2: in the pass that shows
+    /// the first screen; a read that failed is asked again, not taken for plain text).
+    fn pick_syntax(&mut self) {
+        if !self.syntax_due || self.frozen() || self.doc.line_count() == 0 {
+            return;
+        }
+        if let Ok(syntax) = syntax_of(&self.name, &mut self.doc) {
+            self.syntax = syntax;
+            self.syntax_due = false;
+            // The highlighter starts on it (none ran: there was no syntax).
+            self.hl_tried = false;
+            if self.status.text.is_empty() {
+                self.status = opening_status(self.syntax, &self.doc);
+            }
+        }
+    }
+
+    /// One step of a stream's index pass (06 §7.2), on the frame: the first block when it
+    /// arrives, then — once the first screen is up — what is here of the next megabyte. The
+    /// page on screen is read again only if it shows the line the index ended in.
+    fn grow_index(&mut self, ctx: &egui::Context) {
+        if !self.doc.is_stream() || self.frozen() {
+            return;
+        }
+        if self.stream_down() && !self.input {
+            // A failed stream is asked again by a key, a click or a scroll, not by a pass.
+            return;
+        }
+        if self.doc.size() > 0 && !self.first && self.jump.is_none() {
+            // The first screen first (unless it is to be a place the index has to reach).
+            return;
+        }
+        let long = self.doc.long_lines();
+        let growth = match self.doc.grow(self.pass_cap(), PASS_READ as u64) {
+            Ok(Some(growth)) => growth,
+            Ok(None) => return,
+            // On its way: the Source's waker brings the next pass.
+            Err(e) if is_pending(&e) => return,
+            Err(e) => return self.read_failed(&e),
+        };
+        self.failure = None;
+        if growth.open_line.is_some() {
+            // The line the index ended in may go on now: what wrapping found is of the index
+            // before. (The page on screen is not read again for that, below.)
+            self.memo.reset(self.room);
+        }
+        // The page is read again only if a line on it got longer — the line the index ended
+        // in, with no line end yet — or it was short of the window and may gain rows.
+        let grew = self.page.as_ref().is_some_and(|p| {
+            if p.wrapped {
+                // (`at_end`: its last row ended the last line indexed.)
+                p.rows.len() < p.visible || (p.at_end && growth.open_line.is_some())
+            } else {
+                let shown = p.top..p.top + p.runs.len() as u64;
+                p.runs.len() < p.visible
+                    || growth.open_line.is_some_and(|line| shown.contains(&line))
+            }
+        });
+        if grew {
+            self.stale_page = true;
+        }
+        if !long && self.doc.long_lines() && !self.status.error {
+            self.status = opening_status(self.syntax, &self.doc);
+        }
+        if let Some(worker) = &self.worker {
+            worker.grown(growth);
+        }
+        // More may be here already.
+        ctx.request_repaint();
+    }
+
+    /// The gutter's width in digits. A local file's line count is known before its first
+    /// screen. A stream's grows with its index, so its gutter is sized once, when its first
+    /// block arrives (06 §7.2): by its line count when that block is the whole file, else by
+    /// the digits of min(size, 16 MiB), at most 8 — an index never holds more lines than
+    /// bytes. A width that followed the count moved the text and wrapped its rows again.
+    fn digits(&mut self, lines: u64) -> usize {
+        let digits = |n: u64| n.max(1).to_string().len();
+        if !self.doc.is_stream() {
+            return digits(lines);
+        }
+        if (self.gutter.is_none() || self.regutter) && lines > 0 {
+            self.regutter = false;
+            self.gutter = Some(if self.doc.whole() {
+                digits(lines)
+            } else {
+                digits(self.doc.total().min(HIGHLIGHT_MAX)).min(8)
+            });
+        }
+        self.gutter.unwrap_or(1)
+    }
+
+    /// A stream's read failed (06 §5): the screen and the keys stay, and the status row says
+    /// why. A reader left behind by a reload starts the index again instead.
+    fn read_failed(&mut self, e: &anyhow::Error) {
+        match read_error(e) {
+            Some(ReadError::Reloaded) => self.reloading = true,
+            // The Source's state says these (frozen from the next pass on).
+            Some(ReadError::Changed | ReadError::Closed) => {}
+            _ => self.failure = Some(format!("{e:#}")),
+        }
+    }
+
     /// Nothing is read now: the file differs from its index (a re-read is due or under way), or
     /// it was deleted.
     fn frozen(&self) -> bool {
-        self.waiting || self.reindex.is_some() || self.gone
+        self.waiting || self.reindex.is_some() || self.gone || self.stream_frozen()
+    }
+
+    /// A stream that failed (06 §5): what is cached still reads, and the next key, click or
+    /// scroll retries.
+    fn stream_down(&self) -> bool {
+        matches!(self.streamed, Some(crate::stream::State::Failed(_)))
+    }
+
+    /// A stream that changed on the remote, or is being reloaded: the page stays and nothing
+    /// is read until it has been re-opened (06 §5).
+    fn stream_frozen(&self) -> bool {
+        self.reloading
+            || matches!(
+                self.streamed,
+                Some(crate::stream::State::Changed | crate::stream::State::Closed)
+            )
     }
 
     /// The end of the file is on screen: a local file is followed there, and a re-read shows the
@@ -1616,7 +2231,7 @@ impl TextWindow {
     /// ago, else a repaint is asked for when it will be. Only a viewer's very first attempt with
     /// nothing ever shown starts at once; every later one waits (a page on screen or not).
     fn start_reindex(&mut self, ctx: &egui::Context) {
-        if self.reindex.is_some() {
+        if self.reindex.is_some() || self.doc.is_stream() {
             return;
         }
         let now = (self.clock)();
@@ -1751,8 +2366,11 @@ impl TextWindow {
                 let grew = doc.size() > self.doc.size();
                 self.index_took = doc.indexed_in;
                 self.doc = doc;
-                // The first line may have changed (another shebang): the grammar follows it.
-                self.syntax = syntax_of(&self.name, Some(&mut self.doc));
+                // The first line may have changed (another shebang): the grammar follows it
+                // (asked again on the next pass if it could not be read now).
+                let picked = syntax_of(&self.name, &mut self.doc);
+                self.syntax_due = picked.is_err();
+                self.syntax = picked.unwrap_or(None);
                 self.waiting = false;
                 // The old page stays up until one is read through the new index (a write
                 // landing first leaves it up).
@@ -1813,8 +2431,7 @@ impl TextWindow {
     }
 
     fn keys(&mut self, ctx: &egui::Context) {
-        if self.preview || self.waiting || self.reindex.is_some() {
-            // Scrolling waits for the new index (the page on screen stays meanwhile).
+        if self.preview {
             return;
         }
         let pressed = |key: Key| ctx.input_mut(|i| i.consume_key(Modifiers::NONE, key));
@@ -1824,6 +2441,20 @@ impl TextWindow {
                 i.consume_key(Modifiers::COMMAND, key) || i.consume_key(Modifiers::CTRL, key)
             })
         };
+        if let Some(source) = self.doc.source() {
+            // Cmd/Ctrl+R (06 §5): the Source re-opens the path — not waited for on a frame;
+            // its waker brings the pass that indexes the file again.
+            if command(Key::R) && !self.reloading {
+                source.request_reload();
+                self.reloading = true;
+                // This pass's input is the reload: it retries nothing besides (below).
+                self.input = false;
+            }
+        }
+        if self.waiting || self.reindex.is_some() || self.stream_frozen() {
+            // Scrolling waits for the new index (the page on screen stays meanwhile).
+            return;
+        }
         if (pressed(Key::W) | super::hex::bare_key(ctx, Key::F2)) && !self.gone {
             // The same line at the top, from its start. (A deleted file keeps its page as it
             // was read: nothing is read again to show it the other way.)
@@ -1861,24 +2492,42 @@ impl TextWindow {
             }
             return;
         }
-        if pressed(Key::ArrowDown) {
-            self.top = self.top.saturating_add(1);
-        }
-        if pressed(Key::ArrowUp) {
-            self.top = self.top.saturating_sub(1);
-        }
-        if pressed(Key::PageDown) {
-            self.top = self.top.saturating_add(page);
-        }
-        if pressed(Key::PageUp) {
-            self.top = self.top.saturating_sub(page);
+        let page = page as i64;
+        for (key, lines) in [
+            (Key::ArrowDown, 1),
+            (Key::ArrowUp, -1),
+            (Key::PageDown, page),
+            (Key::PageUp, -page),
+        ] {
+            if !pressed(key) {
+                continue;
+            }
+            let no_page_yet =
+                self.doc.is_stream() && self.doc.line_count() == 0 && self.doc.total() > 0;
+            if self.jump.is_some() || no_page_yet {
+                // A place asked for and not shown yet (a stream's index has to reach it), or
+                // no page at all yet (its first block is on its way): these lines are
+                // counted from there, once it is.
+                self.moved += lines;
+            } else if lines < 0 {
+                self.top = self.top.saturating_sub(lines.unsigned_abs());
+            } else {
+                self.top = self.top.saturating_add(lines as u64);
+            }
         }
         if pressed(Key::Home) | file_start {
             self.top = 0;
+            (self.jump, self.moved) = (None, 0);
         }
         if pressed(Key::End) | file_end {
-            // Past the end: the body puts the last page on screen with this pass's row count.
-            self.top = self.doc.line_count();
+            if self.growing() {
+                // The end is not indexed yet: kept until the pass has reached it.
+                (self.jump, self.moved) = (Some(Jump::FileEnd), 0);
+            } else {
+                // Past the end: the body puts the last page on screen with this pass's row
+                // count.
+                self.top = self.doc.line_count();
+            }
         }
         if pressed(Key::ArrowRight) {
             self.left += SIDEWAYS;
@@ -1929,6 +2578,20 @@ impl TextWindow {
             }
             return;
         }
+        if self.doc.is_stream() && self.doc.line_count() == 0 && self.doc.total() > 0 {
+            // A stream's first block is on its way, or failed (the status row says why): no
+            // page yet — never an empty one.
+            self.pending = self.failure.is_none() && !self.stream_down();
+            return;
+        }
+        if !same && self.stream_down() && !self.input {
+            // A failed stream (06 §5): the screen stays, and the next key, click or scroll
+            // reads again — which asks the Source to retry, at most once a second. No pass
+            // retries by itself.
+            self.pending = false;
+            self.worker_results();
+            return;
+        }
         if !same {
             let read = if self.wrap {
                 self.read_wrapped(ctx, plain, font, count)
@@ -1937,6 +2600,27 @@ impl TextWindow {
             };
             let mut page = match read {
                 Ok(page) => page,
+                Err(e) if is_pending(&e) => {
+                    // On its way (06 §7.2): the page on screen stays, and where the keys asked
+                    // to go is kept for the pass the Source's waker brings. Never the error
+                    // arm below, which blanks the page and drops the keys.
+                    self.pending = true;
+                    self.worker_results();
+                    return;
+                }
+                Err(e) if self.doc.is_stream() => {
+                    // A stream's read failed (06 §5), or its bytes are not what was indexed:
+                    // the screen and the keys stay, the status row says why, and the next
+                    // pass — a key, or the stream coming back — reads again.
+                    self.pending = false;
+                    if is_stale(&e) {
+                        self.failure = Some(format!("{Stale} — Cmd/Ctrl+R reloads"));
+                    } else {
+                        self.read_failed(&e);
+                    }
+                    self.worker_results();
+                    return;
+                }
                 Err(e) if is_stale(&e) => {
                     // Changed after the check, during the read: read again from the path.
                     self.waiting = true;
@@ -1954,6 +2638,7 @@ impl TextWindow {
                 }
             };
             self.stale_page = false;
+            (self.pending, self.failure, self.reask) = (false, None, false);
             self.gen += 1;
             page.gen = self.gen;
             page.highlighted = self.worker.is_none();
@@ -1963,6 +2648,17 @@ impl TextWindow {
             self.page = Some(page);
             // The status row above was drawn before this page was read: once more for it.
             ctx.request_repaint();
+        } else {
+            self.pending = false;
+            if std::mem::take(&mut self.reask) {
+                // A highlighter that started after this page was read.
+                if let (Some(worker), Some(page)) = (&self.worker, self.page.as_mut()) {
+                    self.gen += 1;
+                    page.gen = self.gen;
+                    page.highlighted = false;
+                    worker.ask(self.gen, page.top, page.count);
+                }
+            }
         }
         self.worker_results();
         if (self.waiting || due) && self.reindex.is_none() && !self.preview {
@@ -1975,18 +2671,40 @@ impl TextWindow {
     /// The page of `count` lines at `top`, one row each, cut at [`LINE_MAX`] (not wrapped).
     fn read_unwrapped(&mut self, count: usize, plain: Color32) -> Result<Page> {
         let lines = self.doc.line_count();
-        if let Some(Jump::Byte(at)) = self.jump {
-            if let Some(span) = self.doc.span_at(at)? {
-                self.top = span.line.min(lines.saturating_sub(self.visible));
+        let last_top = lines.saturating_sub(self.visible);
+        // A place past what a stream has indexed so far waits for the pass to reach it.
+        let growing = self.growing();
+        let top = match self.jump {
+            Some(Jump::Byte(at)) if growing && at >= self.doc.size() => {
+                return Err(anyhow::Error::new(Pending));
             }
-        }
+            Some(Jump::Byte(at)) => match self.doc.span_at(at)? {
+                Some(span) => span.line.min(last_top),
+                None => self.top,
+            },
+            Some(Jump::FileEnd) if growing => return Err(anyhow::Error::new(Pending)),
+            Some(Jump::FileEnd) => last_top,
+            Some(Jump::Line(line)) if growing && line > last_top => {
+                return Err(anyhow::Error::new(Pending));
+            }
+            Some(Jump::Line(line)) => line.min(last_top),
+            _ => self.top,
+        };
+        // The lines the keys moved by since that place was asked for.
+        let top = if self.moved < 0 {
+            top.saturating_sub(self.moved.unsigned_abs())
+        } else {
+            top.saturating_add(self.moved as u64).min(last_top)
+        };
+        let read = self.doc.read_lines(top, count)?;
+        // Only now: a read that is on its way keeps where the keys asked to go.
         (self.jump, self.moved, self.resnap) = (None, 0, false);
-        let read = self.doc.read_lines(self.top, count)?;
+        self.top = top;
         let runs = read
             .iter()
             .map(|l| expand_tabs(vec![(plain, l.text.clone())]))
             .collect();
-        Ok(Page::lines(self.top, count, runs, false, 0))
+        Ok(Page::lines(top, count, runs, false, 0))
     }
 
     /// The page of `rows` rows from the top, wrapped — after the moves the keys asked for — and
@@ -2000,6 +2718,10 @@ impl TextWindow {
     ) -> Result<Page> {
         use wrap::{Measure, Pos, Wrapper};
         let lines = self.doc.line_count();
+        // A place past what a stream has indexed so far waits for the pass to reach it.
+        let growing = self.growing();
+        let indexed = self.doc.size();
+        let waits = || Err(anyhow::Error::new(Pending));
         if self.memo.rewidth(self.room) {
             self.resnap = true;
         }
@@ -2023,22 +2745,33 @@ impl TextWindow {
             pos = match self.jump {
                 None => pos,
                 Some(Jump::FileStart) => Pos::default(),
+                Some(Jump::FileEnd) if growing => return waits(),
                 Some(Jump::FileEnd) => w.end(rows)?,
                 Some(Jump::Home) if pos.off > 0 => Pos {
                     line: pos.line,
                     off: 0,
                 },
                 Some(Jump::Home) => Pos::default(),
+                // The index's last line may go on, and the file's end is not known yet.
+                Some(Jump::End) if growing && pos.line + 1 >= lines => return waits(),
                 Some(Jump::End) => {
                     let line_end = w.last_of(pos.line)?;
                     let top = w.back(line_end, back)?;
                     if top > pos {
                         top
+                    } else if growing {
+                        return waits();
                     } else {
                         w.end(rows)?
                     }
                 }
+                Some(Jump::Byte(at)) if growing && at >= indexed => return waits(),
                 Some(Jump::Byte(at)) => w.at_byte(at)?,
+                Some(Jump::Line(line)) if growing && line >= lines => return waits(),
+                Some(Jump::Line(line)) => Pos {
+                    line: line.min(lines - 1),
+                    off: 0,
+                },
             };
             if self.moved > 0 {
                 pos = w.forward(pos, self.moved as u64)?;
@@ -2099,9 +2832,26 @@ impl TextWindow {
                     page.highlighted = true;
                 }
                 Ok(Done::Page { .. }) => {}
+                Ok(Done::Stale) if self.doc.is_stream() => {
+                    // A stream is not read again from a path: said, and Cmd/Ctrl+R reloads.
+                    self.failure = Some(format!("{Stale} — Cmd/Ctrl+R reloads"));
+                    gone = Some(None);
+                    break;
+                }
                 Ok(Done::Stale) => {
                     // The file changed under the worker: read again from the path.
                     self.waiting = true;
+                    gone = Some(None);
+                    break;
+                }
+                Ok(Done::Stream) => {
+                    // The stream failed under it (the Source's state is the status row's
+                    // text, 06 §5): highlighting starts again when the stream is back. One
+                    // Pending or failed read never ends it for good.
+                    self.hl_retry = true;
+                    if self.doc.reloaded() {
+                        self.reloading = true;
+                    }
                     gone = Some(None);
                     break;
                 }
@@ -2130,13 +2880,26 @@ impl TextWindow {
 
     fn bar(&self, ui: &mut egui::Ui) {
         let p = chrome::Palette::of(ui.visuals());
-        let mut parts = vec![
-            format!("{} lines", super::hex::grouped(self.doc.line_count())),
-            crate::human(self.doc.size()),
-            self.syntax
-                .map_or("plain text", |s| s.name.as_str())
-                .to_string(),
-        ];
+        let syntax = self
+            .syntax
+            .map_or("plain text", |s| s.name.as_str())
+            .to_string();
+        let mut parts = if self.doc.is_stream() && !self.doc.whole() {
+            // Not `N lines` while more may come: how far the lines are known, of the file's
+            // size as the Source has it (06 §7.2).
+            let known = format!(
+                "lines known to {} of {}",
+                crate::human(self.doc.size()),
+                crate::human(self.doc.total())
+            );
+            vec![known, syntax]
+        } else {
+            vec![
+                format!("{} lines", super::hex::grouped(self.doc.line_count())),
+                crate::human(self.doc.size()),
+                syntax,
+            ]
+        };
         if self.doc.long_lines() && !self.wrap {
             parts.push(format!("lines over {LINE_MAX} bytes are cut"));
         }
@@ -2147,9 +2910,54 @@ impl TextWindow {
         });
     }
 
+    /// `loading…`, and after [`SLOW_AFTER`] of waiting that the remote is slow.
+    fn loading(&self) -> String {
+        let slow = self
+            .pending_since
+            .is_some_and(|since| (self.clock)().saturating_duration_since(since) >= SLOW_AFTER);
+        if slow {
+            format!("{LOADING} · {SLOW}")
+        } else {
+            LOADING.to_string()
+        }
+    }
+
     fn status_bar(&self, ui: &mut egui::Ui) {
         let lines = self.doc.line_count();
+        // A stream describes the page on screen — never where the keys asked to go — and says
+        // `of N` only once N is the file's (06 §7.2).
+        let stream = self.doc.is_stream();
         let shown = match &self.page {
+            Some(page) if stream && !page.is_empty() => {
+                let (first, last) = match page.rows.last() {
+                    Some(row) if page.wrapped => (page.top + 1, row.line + 1),
+                    _ => (page.top + 1, page.top + page.runs.len() as u64),
+                };
+                let mut first_text = first.to_string();
+                if page.wrapped && page.top_off > 0 && page.top_len > 0 {
+                    first_text
+                        .push_str(&format!(" ({} % of it)", page.top_off * 100 / page.top_len));
+                }
+                let mut shown = if last == first {
+                    format!("line {first_text}")
+                } else {
+                    format!("lines {first_text}–{last}")
+                };
+                if self.doc.whole() {
+                    shown.push_str(&format!(" of {lines}"));
+                }
+                if self.pending {
+                    shown.push_str(" · ");
+                    shown.push_str(&self.loading());
+                }
+                shown
+            }
+            // Before a stream's first block: not `empty`, for a file that is not.
+            // Its first block failed: only the reason, beside this.
+            _ if stream && lines == 0 && (self.failure.is_some() || self.stream_down()) => {
+                String::new()
+            }
+            _ if stream && self.doc.total() > 0 && (lines == 0 || self.pending) => self.loading(),
             _ if lines == 0 => "empty".to_string(),
             Some(page) if page.wrapped && !page.rows.is_empty() => {
                 // Lines as on screen; inside a line, how far into it the top row is.
@@ -2175,12 +2983,24 @@ impl TextWindow {
                 crate::human(done.load(Ordering::Relaxed)),
                 crate::human(*total)
             )),
-            None => self.status.clone(),
+            // A stream's own state first (06 §5), then why its last read failed.
+            None => match self.streamed.as_ref().and_then(|s| s.status()) {
+                Some(text) => Status::error(text),
+                None => match &self.failure {
+                    Some(text) => Status::error(text.clone()),
+                    None => self.status.clone(),
+                },
+            },
         };
         ui.horizontal(|ui| {
-            ui.monospace(shown);
+            let place = !shown.is_empty();
+            if place {
+                ui.monospace(shown);
+            }
             if !status.text.is_empty() {
-                ui.separator();
+                if place {
+                    ui.separator();
+                }
                 status.show(ui);
             }
         });
@@ -2192,15 +3012,25 @@ impl TextWindow {
         match &self.page {
             Some(p) if p.wrapped => {
                 let at_start = p.top == 0 && p.top_off == 0;
-                match (p.at_end, at_start) {
+                // The end of what is indexed is the file's end only once the index is whole.
+                match (p.at_end && self.doc.whole(), at_start) {
                     (true, true) => None,
                     (true, false) => Some(1.0),
-                    _ => Some((p.top_start + p.top_off) as f32 / self.doc.size().max(1) as f32),
+                    _ => Some((p.top_start + p.top_off) as f32 / self.doc.total().max(1) as f32),
                 }
             }
             _ => {
                 let max_top = self.doc.line_count().saturating_sub(self.visible);
-                (max_top > 0).then(|| self.top as f32 / max_top as f32)
+                // A stream's thumb is where the page on screen is, of the file: the lines
+                // known so far are this share of it.
+                let (top, known) = match &self.page {
+                    Some(p) if self.doc.is_stream() => (
+                        p.top,
+                        self.doc.size() as f32 / self.doc.total().max(1) as f32,
+                    ),
+                    _ => (self.top, 1.0),
+                };
+                (max_top > 0).then(|| top.min(max_top) as f32 / max_top as f32 * known)
             }
         }
     }
@@ -2210,6 +3040,20 @@ impl TextWindow {
         // A re-read that landed is swapped in before anything reads or is measured (the
         // highlighter below starts on the new index).
         self.poll_reindex();
+        #[cfg(test)]
+        if let Some(hook) = self.before_poll.as_mut() {
+            hook();
+        }
+        self.poll_stream(&ctx);
+        if self.input && self.stream_down() {
+            // A key, a click or a scroll retries a failed stream (06 §5) — also one whose page
+            // is cached, which reads without asking. At most one attempt a second is made.
+            // Not beside a reload (`input` is off for that pass: Cmd/Ctrl+R is its own
+            // attempt, and a retry queued with it would follow a failed reload with no key).
+            if let Some(source) = self.doc.source() {
+                source.retry();
+            }
+        }
         let outer = ui.max_rect();
         let p = chrome::Palette::of(ui.visuals());
         // The window: its frame, titled as PC Shell's (single-lined in a preview: it does not
@@ -2220,7 +3064,10 @@ impl TextWindow {
         // Rows touch, a cell apart, as on a text screen.
         let row_h = text_h.ceil();
         // A preview that shows only the start of its file says so on its last row (02 §4.3).
-        let note = (self.preview && self.doc.cut_short() && framed.height() >= 2.0 * row_h)
+        // (A stream's pass stops at the preview's budget; a local file's was stopped there.)
+        let short = self.doc.cut_short()
+            || (self.doc.is_stream() && !self.doc.whole() && self.doc.size() >= PREVIEW_INDEX);
+        let note = (self.preview && short && framed.height() >= 2.0 * row_h)
             .then(|| format!("preview of the first {}", amount(self.doc.size())));
         let rect = match note {
             Some(_) => Rect::from_min_max(
@@ -2233,9 +3080,11 @@ impl TextWindow {
             // Handed over: the index goes on from where the preview's pass stopped.
             self.start_resume(&ctx);
         }
+        self.grow_index(&ctx);
+        self.pick_syntax();
         let lines = self.doc.line_count();
         self.visible = ((rect.height() / row_h).floor() as u64).max(1);
-        let digits = lines.max(1).to_string().len();
+        let digits = self.digits(lines);
         let gutter = cw * (digits as f32 + 1.0);
         let text_x = rect.left() + gutter + cw;
         self.room = (rect.right() - text_x).max(0.0);
@@ -2244,6 +3093,7 @@ impl TextWindow {
             && ui.rect_contains_pointer(outer)
             && !self.waiting
             && self.reindex.is_none()
+            && !self.stream_frozen()
         {
             let mut rows = 0f32;
             ctx.input(|i| {
@@ -2276,8 +3126,22 @@ impl TextWindow {
         if !self.wrap {
             self.top = self.top.min(lines.saturating_sub(self.visible));
         }
-        if !self.hl_tried {
+        if self.hl_retry && !self.frozen() && self.failure.is_none() {
+            // The stream is back (or was never down for what the page needs): once more.
+            if matches!(
+                self.streamed,
+                Some(crate::stream::State::Live | crate::stream::State::Replaced)
+            ) {
+                (self.hl_retry, self.hl_tried) = (false, false);
+            }
+        }
+        // A stream's highlighter starts once its first block is indexed and the first line
+        // has had its say; it then runs over the indexed lines as they grow (06 §7.2).
+        let indexed = !self.doc.is_stream() || (lines > 0 && !self.syntax_due);
+        if !self.hl_tried && indexed {
             self.hl_tried = true;
+            // (A stream's index never passes 16 MiB: its lines are highlighted as far as it
+            // goes. A local file over that is plain, as it always was.)
             if self.doc.size() <= HIGHLIGHT_MAX && !self.frozen() {
                 let stop = self.doc.first_long.unwrap_or(u64::MAX);
                 let hl = self.syntax.and_then(|s| Highlight::new(s, p.text, stop));
@@ -2294,6 +3158,8 @@ impl TextWindow {
                             self.status =
                                 Status::info("highlighting is busy in other viewers; shown plain");
                         }
+                        // The page on screen, if one is, is asked of it.
+                        self.reask = started.is_some();
                         started
                     }
                     _ => None,
@@ -2413,8 +3279,52 @@ impl TextWindow {
                         p.text,
                     );
                 }
+                if self.growing() {
+                    // The rows below the last line indexed so far (a line that runs past
+                    // what is indexed): their starts are not known yet. They fill in as the
+                    // index pass reaches them (06 §7.2).
+                    for k in page.runs.len()..self.visible as usize {
+                        text_painter.text(
+                            Pos2::new(text_x, rect.top() + k as f32 * row_h),
+                            egui::Align2::LEFT_TOP,
+                            LOADING,
+                            font.clone(),
+                            p.dim,
+                        );
+                    }
+                }
             }
             None => {}
+        }
+        if self.pending && self.page.as_ref().is_none_or(Page::is_empty) {
+            // Nothing to show yet (a stream's first block is on its way): one dim row.
+            painter.text(
+                Pos2::new(rect.left() + cw, rect.top()),
+                egui::Align2::LEFT_TOP,
+                LOADING,
+                font.clone(),
+                p.dim,
+            );
+        }
+        if self.pending {
+            // How long this read has been on its way; a pass when the status row says more.
+            let now = (self.clock)();
+            let since = *self.pending_since.get_or_insert(now);
+            let waited = now.saturating_duration_since(since);
+            if waited < SLOW_AFTER {
+                ctx.request_repaint_after(SLOW_AFTER - waited);
+            }
+        } else {
+            self.pending_since = None;
+        }
+        if !self.first && self.page.as_ref().is_some_and(|p| !p.is_empty()) {
+            // The first screen is drawn: `first` on the stats line (06 §11). The index pass
+            // goes on from the next pass.
+            self.first = true;
+            if let Some(source) = self.doc.source() {
+                source.mark(crate::stream::Mark::First);
+                ctx.request_repaint();
+            }
         }
         if let Some(note) = &note {
             ui.painter_at(framed).text(
@@ -2543,6 +3453,22 @@ impl Window for TextWindow {
                 .show(ui, |ui| self.body(ui));
             return;
         }
+        // Whether this pass's input may retry a failed stream is settled here, from how the
+        // pass began: one that began with a reload under way, or whose input starts one
+        // (`keys`), retries nothing — whenever in the pass that reload ends. One gesture is
+        // one attempt.
+        let reloading = self.reloading;
+        self.input = !reloading
+            && ui.ctx().input(|i| {
+                i.events.iter().any(|e| {
+                    matches!(
+                        e,
+                        egui::Event::Key { pressed: true, .. }
+                            | egui::Event::PointerButton { pressed: true, .. }
+                            | egui::Event::MouseWheel { .. }
+                    )
+                })
+            });
         self.keys(&ui.ctx().clone());
         chrome::bar_panel(egui::Panel::top("sopen-text-bar")).show(ui, |ui| self.bar(ui));
         chrome::bar_panel(egui::Panel::bottom("sopen-text-status"))
@@ -2563,15 +3489,23 @@ impl Window for TextWindow {
     }
 
     fn ready(&self) -> bool {
-        let page = self
-            .page
-            .as_ref()
-            .is_some_and(|p| p.highlighted || self.worker.is_none());
+        if self.pending {
+            // A page read is on its way (06 §7.2): what was asked for is not on screen yet.
+            return false;
+        }
+        // A stream whose first block failed has no page to wait for: the status row has the
+        // reason (06 §11: ready once the screen's bytes have arrived or failed).
+        let failed = self.page.is_none() && (self.failure.is_some() || self.stream_down());
+        let page = failed
+            || self
+                .page
+                .as_ref()
+                .is_some_and(|p| p.highlighted || self.worker.is_none());
         if self.preview {
             // A preview whose file changed keeps what it shows: it is not re-read.
             return self.painted && (page || self.frozen());
         }
-        self.painted && !self.waiting && self.reindex.is_none() && page
+        self.painted && !self.waiting && self.reindex.is_none() && !self.reloading && page
     }
 
     /// A preview (02 §4.2): no bars, a single-lined frame, no keys or wheel, no following and no
@@ -2637,8 +3571,29 @@ pub fn embed(
     }
 }
 
+/// The text viewer on a remote file read through `source` (06 §7.2): the window opens at once,
+/// shows the first block when it arrives and indexes on from there. `title`, `name`, `notices`
+/// and `at` as [`embed`]'s; it is never followed at its end.
+pub fn embed_source(
+    source: Source,
+    title: String,
+    name: &str,
+    notices: Vec<String>,
+    at: Option<u64>,
+) -> Embedded {
+    let mut window = TextWindow::new(TextDoc::streamed(source), title, name, notices);
+    window.jump = at.map(Jump::Byte);
+    Embedded {
+        window: Box::new(window),
+        settle: Box::new(|_| Some(Outcome::default())),
+    }
+}
+
 #[cfg(test)]
 mod preview_tests;
+
+#[cfg(test)]
+mod stream_tests;
 
 #[cfg(test)]
 mod tests;

@@ -348,7 +348,8 @@ replaced it.
   second cannot be seen without reading every byte, and is not (verified, above).
 
 **Timeouts.** A demand block pending over 1 s shows `loading 0x… (N KiB)`, and over 10 s
-`the remote is slow`. The transport fails a request that has no reply 60 s after it was sent (W1),
+`the remote is slow`. (The text viewer has only the 10 s notice, beside its `loading…`: it has no
+offset to name, §7.2.) The transport fails a request that has no reply 60 s after it was sent (W1),
 and that failure makes the Source `Failed`. This is the one bound: the Source has no stall timer of
 its own. A failed prefetch is never shown; it is only retried as demand.
 
@@ -521,9 +522,24 @@ large files.
   - **While Pending, the page on screen stays.** Where the keys asked to go is kept and applied when
     the block arrives. Pending never takes the error path, which would blank the page and drop the
     keys.
+    - This holds before the first page too, wrapped or not: with block 0 still on its way, ↓ ×3 and
+      PgDn open the page that far down when it arrives.
+    - **W5a's stop-gap at the index frontier, which W5b lifts.** While the pass runs, End, a place
+      opened at (`at=`) and a reload's place wait for the index to reach them. Relative moves do
+      not: scrolling down stops at the end of the indexed prefix, wrapped or not, and is not held
+      there until the pass catches up.
   - **The status row describes the page on screen** and adds `loading…`; it never shows where the
     keys asked to go. The window's `ready()` (the screenshot hook's test) is false while a page read
     is Pending.
+    - **`of N` is left off until the index is whole.** While the pass runs, and for good past the
+      16 MiB cap, the row says `lines 1–26`, not `lines 1–26 of N`: N would be the lines known so
+      far, not the file's.
+    - **After 10 s of Pending the row says `loading… · the remote is slow`** (§5). The text viewer
+      has no 1 s `loading 0x… (N KiB)` form: that one is the hex window's, which has an offset to
+      name. One pass is scheduled for the 10 s mark; no other pass runs while the viewer waits.
+    - **`ready()` is true when the first block failed** and no page was ever shown, matching §11
+      ("arrived or failed"): the status row has the reason and no bare `loading…`. The next key,
+      click or scroll retries (§5); no pass retries by itself.
   - **Before the first block,** the body shows one dim row, `loading…`, and the status row says
     `loading…`. The viewer never says `empty` or `0 lines` for a file whose size is not 0. The top
     bar shows the file's size from the Source, and `lines known to 65.5 KB of 7.8 MB` until the
@@ -535,6 +551,9 @@ large files.
       never hold more lines than bytes.
     - A local file uses its line count, however many digits that is. Its whole-file pass runs
       before its first screen, as today, so the count is known when the gutter is sized.
+    - So the same bytes can wrap differently read through a Source and opened locally: a wider
+      gutter leaves fewer columns. 12,000 lines of 312 KB get 6 digits through a Source and 5
+      locally. Rows compare one for one only where no line wraps.
   - **A failed read leaves no bytes behind.** The read window is filled into a fresh buffer; a
     Pending or failed read keeps the old window. Today's code resizes first, and showed zeros as
     file bytes.
@@ -545,11 +564,25 @@ large files.
     Pending stopped highlighting for good in X3.
   - **Growing the index does not re-read the page** unless a line on screen got longer. In X3 each
     1 MiB step re-wrapped an unchanged screen.
+    - "Got longer" is the line the index ended in, when it had no line end yet and is on the page;
+      or a page short of the window, which may gain rows. A full page whose last line is the last
+      one indexed and already ends with its newline is not read again.
 - **The first screen from byte 0 comes first.** It needs the first 64 KiB block and nothing else:
   one round trip when the reply is full (a short reply costs its remainder's round trip, §2). The
-  background index pass starts only once that screen is up. A line's last byte is not read to look
+  background index pass starts only once that screen is up — also when block 0 has arrived and the
+  first page's own read is still Pending or fails. A line's last byte is not read to look
   for a `\r` before the row that holds the line's end is on screen; that probe cost a second round
   trip to the file's last block in X3.
+  - **The first read is a 1-byte demand at offset 0.** An Interactive reader's margin reaches as
+    far past a read as the read is long (`src/stream/prefetch.rs:367`, `reach = window.max(len)`),
+    so asking for the whole block also fetched block 1: `[(0, 65536), (65536, 65536)]` before
+    `first`. The screen's reader asks for byte 0, which makes block 0 the demand and brings
+    nothing beside it; the index then takes the block from the cache through its own reader.
+  - **The `\r` probe is deferred in W5b, not W5a.** Deferring it means the row that holds a
+    line's end drops the `\r`, which is `wrap.rs`'s work, and `wrap.rs` is W5b's (§13). In W5a
+    the probe costs no round trip as it is: the index grows from byte 0, so every byte it names
+    has been fetched. Through an index that names bytes not yet fetched — W5b's — it is a far
+    read: `[(262144, 38648), (0, 65536)]` before the first screen of a 300 KB CRLF line.
   - **The first screen is the rows the first block supplies.** `first` (§11) and the window's
     `ready()` mean those rows are drawn.
   - Wrapped, the one block fills the screen whatever the line lengths, because rows restart every
@@ -558,6 +591,13 @@ large files.
     start. Each such row shows a dim `loading…` and fills in as the index pass reaches it.
 - **The background pass**, a Bulk reader, indexes at most the first **16 MiB** (`HIGHLIGHT_MAX`) of
   a file read through a Source. On the rig that is 2–8 s.
+  - **It runs on the frames, at most 1 MiB and one block a pass**, with `try_read`: a block not
+    here yet ends the pass's step, and the Source's waker brings the next.
+  - **A tail reader makes the cap exact.** A Bulk reader in sequence reads up to 1 MiB ahead (§4),
+    so the pass's own reader fetched 17,825,792 bytes for the 16 MiB cap and 5,242,880 for a
+    preview's 4 MiB. The last stretch before a cap that is not the file's end (under 1 MiB and one
+    block) is therefore read in one piece through a second Bulk reader, which has no readahead:
+    16,777,216 and 4,194,304 bytes fetched. That piece takes a pass of its own.
   - It continues S1-B's preview pass, which stops at 4 MiB and resumes from there on hand-over (02
     §4.4).
   - A file of at most 16 MiB is then indexed whole. Line numbers, the line count and highlighting
@@ -575,6 +615,8 @@ large files.
 - **Change.** A remote file follows §5. `Changed` freezes the page and offers Cmd/Ctrl+R. `Replaced`
   keeps showing the version opened. A remote file is still not followed like `tail -f`. Local files
   keep `TextDoc::now`'s rules (01 §3a).
+- **Stats events.** W5a emits `first` (§11) only. `input` and `ready` for jumps (End, a place
+  opened at, Go to) are W5b's, with V12's `ready − input` qualification.
 - W5a alone never reaches users for remote text: W8, which routes remote text through a Source,
   waits for W5b (§13). Until W8, remote text is still fetched whole, as today.
 
@@ -1174,7 +1216,7 @@ Left as whole fetches, with the fetch now pipelined (§2):
 | Disk for whole-file actions | as today: the interim hex Save's cache copy (§7.1), "Save to…"'s staging file |
 | SFTP channels | 1 per remote viewer; 2 from its first Save, Save copy or Export (§6) |
 | Bytes before a hex first screen | the blocks covering the screen and its margin: one 64 KiB block at offset 0 for any window under 1 300 rows, at most two elsewhere |
-| Bytes before a text first screen | one 64 KiB block at offset 0, for any file read through a Source, wrapped or not: the first screen is the rows that block supplies (§7.2); after a jump, at most 3 blocks, in one round trip when the replies are full; the background index pass comes after it |
+| Bytes before a text first screen | one 64 KiB block at offset 0, asked as a 1-byte demand so that no margin block comes with it (§7.2), for any file read through a Source, wrapped or not: the first screen is the rows that block supplies (§7.2); after a jump, at most 3 blocks, in one round trip when the replies are full; the background index pass comes after it |
 | A demand's wait behind what was sent | `(cap + one block per other waiting reader) / rate`, cap ≤ 4 MiB (§4) |
 | The byte server | 64 connections, an 8 KiB request head, 5 s to send it, 60 s without progress on a `bulk` response (§9) |
 
@@ -1484,11 +1526,11 @@ that shows something on screen also brings a screenshot receipt someone looked a
 | W2 | **Stream core.** `Source`, `BlockCache` with its floors, `Prefetcher` with §4's admission, `Reader`, `Bytes`, validation and generations, polling, reload, the MaxSessions line; the counters and events of `SOPEN_STREAM_STATS`, and `SOPEN_STREAM_THROTTLE` (§11) | `src/stream/{mod,cache,prefetch,source}.rs`, `src/stream/tests.rs` (all new); `src/lib.rs` (`pub mod stream`) | W1 |
 | W3 | **Byte server.** §9 whole: token, the three reader-kind paths, head limits and deadlines, the Host rules, the range table, one request per connection, the 64-connection bound, shutdown, the cut account, the Linux peer check | `src/stream/http.rs`, `src/stream/http/tests.rs` (new) | W2 |
 | W4 | **Hex streams.** `Pages` over `Bytes`, Pending and Failed rows, the drag debounce, patches keeping their byte (fixes the hex bug, §7.1), the interim Save. Its first commit is a pure move of the write side (`Ident` … `HexFile::save_copy`) into `src/gui/hex/file.rs`. Adds `SOPEN_STATE`'s `loading=1` (§11) | `src/gui/hex.rs`, `src/gui/hex/file.rs` (new), `src/gui/hex/tests.rs`; `src/gui/mod.rs` (`State`'s `loading` field only) | W2; browser S1 merged |
-| W5a | **Text reads through `Bytes`.** Pending travels like `Stale`, in an arm of its own; the first screen first, from one block; the background pass capped at 16 MiB for a file read through a Source, continuing S1-B's 4 MiB preview pass, while a local file keeps its whole-file pass; highlighting over the indexed prefix; the five defects X3 found (§7.2) | `src/gui/text.rs`, `src/gui/text/tests.rs` | W2; S1 merged (X3 is done: 2026-11-21, §7.2) |
+| W5a | **Text reads through `Bytes`.** Pending travels like `Stale`, in an arm of its own; the first screen first, from one block; the background pass capped at 16 MiB for a file read through a Source, continuing S1-B's 4 MiB preview pass, while a local file keeps its whole-file pass; highlighting over the indexed prefix; the five defects X3 found (§7.2) | `src/gui/text.rs`, `src/gui/text/tests.rs`, `src/gui/text/stream_tests.rs` (new) | W2; S1 merged (X3 is done: 2026-11-21, §7.2) |
 | W5b | **Large text files by byte position.** The prefix index, byte-offset keys in `TextWindow` and wrap, unknown line starts, Go to, the index memory bound (§7.2) | `src/gui/text.rs`, `src/gui/text/wrap.rs`, `src/gui/text/tests.rs` | W5a |
 | W6 | **Image streams.** Header walk with the SOF read directly, thumbnail, the memory line with Continue, the reserved buffer, the streamed read, partial pictures for the four measured formats (plain PNG included) | `src/gui/image.rs`, `src/gui/image/probe.rs` (new), `src/gui/image/robustness_tests.rs`; `Cargo.toml` and `Cargo.lock` (the direct `png` dependency) | W2; S1 merged; X4 |
 | W7 | **Media streams.** URL `Input`s with their own input options and reader kinds, the progressive waveform on a `bulk` connection, Export through the URL and its Cancel, runs failed on a cut response | `src/gui/media.rs`, `src/gui/media/*`, `src/gui/playback.rs`, `src/ffmpeg.rs`, `src/cut.rs` | W3; S1, PR #15 and S1-M merged; X5 |
-| W8 | **Routing.** The browser's Enter, the standalone route, the dialog and `--hex` open a Source instead of fetching, with the placeholder `Origin`; the image → hex switch (§7.3); the preview change below, with its 02 §4.3–§4.4 text and S1's tests it changes; the `.ts` refine over the URL; "Save to…" cancel; `bytes_fetched`; forwarding §11's hooks; the placeholder `Origin` answers `can_replace` without connecting at open (§2); the `Window` trait gains a shown / hidden call and the browser calls `Source::set_visible` through it, so a viewer behind the list does not poll (§5) | `src/gui/browser/prepare.rs`, `src/gui/browser/preview.rs` (the hand-over only), `src/gui/browser.rs` (the hex switch), `src/gui/browser/tests.rs` (P6 and P12's remote parts), `src/cache.rs` (the `.preview` root, if unused), `src/gui/binary.rs`, `src/gui/binary/tests.rs`, `src/main.rs`, `src/kind.rs`, `src/usage.rs`, `src/forward.rs`, `src/gui/mod.rs` (`Origin`), `tests/cli.rs`, `.prd/02-architecture.md` (§4.3–§4.4) | W4, W5a, W5b, W6, W7 and ED6; S1 and S1-M merged |
+| W8 | **Routing.** The browser's Enter, the standalone route, the dialog and `--hex` open a Source instead of fetching, with the placeholder `Origin`; the image → hex switch (§7.3); the preview change below, with its 02 §4.3–§4.4 text and S1's tests it changes; the `.ts` refine over the URL; "Save to…" cancel; `bytes_fetched`; forwarding §11's hooks; the placeholder `Origin` answers `can_replace` without connecting at open (§2); the `Window` trait gains a shown / hidden call and the browser calls `Source::set_visible` through it, so a viewer behind the list does not poll (§5); one preview-index constant for text — the route passes `prepare.rs`'s `text: 4 << 20` to the viewer, and `text.rs`'s own `PREVIEW_INDEX` (W5a's copy of it) goes | `src/gui/browser/prepare.rs`, `src/gui/browser/preview.rs` (the hand-over only), `src/gui/browser.rs` (the hex switch), `src/gui/browser/tests.rs` (P6 and P12's remote parts), `src/cache.rs` (the `.preview` root, if unused), `src/gui/binary.rs`, `src/gui/binary/tests.rs`, `src/main.rs`, `src/kind.rs`, `src/usage.rs`, `src/forward.rs`, `src/gui/mod.rs` (`Origin`), `tests/cli.rs`, `.prd/02-architecture.md` (§4.3–§4.4) | W4, W5a, W5b, W6, W7 and ED6; S1 and S1-M merged |
 
 07 §14 has the edit units (ED1–ED6) and the docs unit (D1), which rewrites 01, AGENTS.md and the
 README once the code has landed. The experiments X1–X5 and the merge order across both workstreams

@@ -2906,3 +2906,48 @@ fn a_mark_after_a_right_to_left_letter_stays_on_its_base() {
         }
     }
 }
+
+/// 06 §7.2 (X3's defect 1): a read that fails leaves the read window as it was — what it holds
+/// afterwards is still the file's bytes, never a buffer made ready for the read that failed.
+#[test]
+fn a_failed_read_leaves_the_read_window_as_it_was() {
+    let tmp = tempfile::tempdir().unwrap();
+    let body: Vec<u8> = (0..40_000u32).map(|i| b'a' + (i % 26) as u8).collect();
+    let path = write(tmp.path(), "letters.txt", &body);
+    let mut doc = TextDoc::open(&path).unwrap();
+    let mut window = Window_::default();
+    assert_eq!(window.at(&mut doc, 0, 10).unwrap(), &body[..10]);
+    let held = window.bytes.clone();
+    assert!(!held.is_empty());
+    doc.fail_reads = true;
+    assert!(window.at(&mut doc, 30_000, 100).is_err());
+    // Looked at while reads still fail: the window itself, not what a later read refills.
+    assert_eq!(window.start, 0);
+    assert_eq!(window.bytes, held, "the window was not left as it was");
+    assert_eq!(window.bytes, &body[..held.len()]);
+    doc.fail_reads = false;
+    // Inside what the window held before the failure: served from it, and the file's bytes.
+    let got = window.at(&mut doc, 5, 100).unwrap().to_vec();
+    assert!(!got.is_empty());
+    assert_eq!(got, &body[5..5 + got.len()], "bytes the file does not hold");
+}
+
+/// 06 §7.2 (X3's defect 3): a first line that could not be read when the window was made is
+/// read again; the syntax it names is not lost with the failed read.
+#[test]
+fn a_first_line_that_could_not_be_read_at_once_still_picks_the_syntax() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = write(tmp.path(), "run", b"#!/bin/sh\necho hello\n");
+    let mut doc = TextDoc::open(&path).unwrap();
+    doc.fail_reads = true;
+    let mut win = TextWindow::new(doc, "run".into(), "run", vec![]);
+    assert_eq!(grammar(&win), None, "not read yet");
+    win.doc.fail_reads = false;
+    let mut drv = Driver::new(600.0, 400.0);
+    drv.until(&mut win, 5, |w| w.ready());
+    assert_eq!(grammar(&win), Some("Bourne Again Shell (bash)"));
+    drv.until(&mut win, 5, |w| w.ready() && w.worker.is_some());
+    let colors = drv.colors_of("echo hello").expect("shown");
+    let distinct: std::collections::HashSet<_> = colors.iter().collect();
+    assert!(distinct.len() >= 2, "highlighted: {colors:?}");
+}
