@@ -1,0 +1,1365 @@
+//! [`Source`] (06 §5): one remote file open for viewing. The state lives behind one lock
+//! ([`Core`]); the [`Engine`] owns the transport and is the only one that sends: each turn it
+//! plans what may go (06 §4's admission), waits for the next completion and applies it. In a
+//! window the engine runs on a thread of its own; tests step it by hand on the `Fake`'s clock.
+//!
+//! Validation (06 §5): every batch of reads is followed at once by an `fstat` of the handle, its
+//! fence. A block enters the cache only when all of it has arrived and the fence behind its
+//! last part returned the fingerprint taken at open. Every request carries the generation it
+//! was sent in; a change, a failure or a reload starts a new one, and a completion of an older
+//! one is dropped unread.
+
+use super::cache::{BlockCache, BLOCK};
+use super::prefetch::{Access, Cand, Class, Item, Prefetcher, Rest, STATUS_BYTES};
+use super::{
+    explain, Fetched, ReadError, ReaderKind, Reopen, Result, State, Throttle, Throttled, Waker,
+    MAX_READ, POLL_EVERY, RETRY_EVERY,
+};
+use crate::remote::{Completion, Fingerprint, Ranged, Reply, Stat, Wake};
+use bytes::Bytes;
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::task::Poll;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+/// How a blocked `read_at` looks at its cancel flag when nothing wakes it.
+const CANCEL_CHECK: Duration = Duration::from_millis(100);
+/// `idle` (06 §11): this long after `first` with no input in between.
+const IDLE_AFTER: Duration = Duration::from_secs(2);
+/// One `read_at` asks at most this much at a time, so a long read is a sequential run.
+const READ_CHUNK: usize = 1 << 20;
+
+/// Where a stats line goes.
+pub(crate) type Sink = Arc<dyn Fn(&str) + Send + Sync>;
+pub(crate) type Clock = Arc<dyn Fn() -> Instant + Send + Sync>;
+
+/// What the open that led to a Source knows (06 §11): the stats lines carry it.
+#[derive(Debug, Clone)]
+pub struct Opening {
+    /// `host:/abs`, as the window's title has it.
+    pub label: String,
+    /// When the open began: the Enter, the dialog's button, or `--hex`.
+    pub began: Instant,
+    /// The kind sniff's bytes, read on the open's connection before it became the transport.
+    pub sniff: u64,
+}
+
+/// What `Source::open` reads from the environment; tests pass their own.
+#[derive(Clone)]
+pub(crate) struct Settings {
+    pub poll_every: Duration,
+    pub stats: Option<Sink>,
+    pub throttle: Option<Throttle>,
+    /// The clock where there is no transport to ask (a failed stream waiting to retry).
+    pub clock: Clock,
+}
+
+impl Settings {
+    pub(crate) fn plain() -> Self {
+        Self {
+            poll_every: POLL_EVERY,
+            stats: None,
+            throttle: None,
+            clock: Arc::new(Instant::now),
+        }
+    }
+
+    /// `SOPEN_STREAM_STATS=1` and `SOPEN_STREAM_THROTTLE=<ms>,<bytes/s>` (06 §11).
+    fn from_env() -> Self {
+        let stats: Option<Sink> = std::env::var("SOPEN_STREAM_STATS")
+            .is_ok_and(|v| v == "1")
+            .then(|| Arc::new(|line: &str| eprintln!("{line}")) as Sink);
+        let throttle = std::env::var("SOPEN_STREAM_THROTTLE")
+            .ok()
+            .and_then(|v| Throttle::parse(&v));
+        Self {
+            stats,
+            throttle,
+            ..Self::plain()
+        }
+    }
+}
+
+/// The counters of 06 §11's stats line; every one is cumulative.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Stats {
+    /// What arrived from the remote, by the class it was sent in.
+    pub fetched: Fetched,
+    /// The union of the byte ranges readers consumed.
+    pub delivered: u64,
+    /// The union of the byte ranges the byte server sent.
+    pub http_sent: u64,
+    pub sniff: u64,
+    /// Requests sent: reads, fences and polls.
+    pub requests: u64,
+    pub max_in_flight: u64,
+    /// Sequential runs begun (06 §4).
+    pub runs: u64,
+    pub jumps: u64,
+    /// Responses the byte server ended early (06 §9).
+    pub cuts: u64,
+}
+
+/// A viewer's events on the stats line (06 §11). `open`, `idle` and `close` are the Source's own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mark {
+    /// The first frame drawn with content from the stream.
+    First,
+    /// A key, click or drag moved the view to this offset, not yet shown.
+    Input(u64),
+    /// The first frame showing content for the last input's place.
+    Ready,
+}
+
+/// What a reader is waiting for (06 §5: over 1 s a viewer says `loading 0x… (N KiB)`, over 10 s
+/// `the remote is slow`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Waiting {
+    pub off: u64,
+    pub len: u64,
+    pub waited: Duration,
+}
+
+/// A union of byte ranges.
+#[derive(Default)]
+struct Ranges {
+    map: BTreeMap<u64, u64>,
+    total: u64,
+}
+
+impl Ranges {
+    fn add(&mut self, mut a: u64, mut b: u64) {
+        if b <= a {
+            return;
+        }
+        let touching: Vec<u64> = self
+            .map
+            .range(..=b)
+            .rev()
+            .take_while(|(_, end)| **end >= a)
+            .map(|(start, _)| *start)
+            .collect();
+        for start in touching {
+            let end = self.map.remove(&start).expect("a range just found");
+            self.total -= end - start;
+            a = a.min(start);
+            b = b.max(end);
+        }
+        self.map.insert(a, b);
+        self.total += b - a;
+    }
+}
+
+enum OutKind {
+    Read {
+        batch: u64,
+        block: u64,
+        off: u64,
+        len: u32,
+        class: Class,
+        /// The block's first read (not the rest of a short reply).
+        first: bool,
+    },
+    Fence {
+        batch: u64,
+    },
+    PollHandle,
+    PollPath,
+}
+
+/// A request sent and not yet answered.
+struct Out {
+    gen: u64,
+    /// What it counts against what is in flight.
+    bytes: u64,
+    kind: OutKind,
+}
+
+/// The reads admitted together for one reader, and the fence sent right behind them.
+struct Batch {
+    waited: bool,
+    /// Blocks whose last byte this batch brought: visible once its fence returns the fingerprint.
+    complete: Vec<u64>,
+}
+
+/// A block not yet visible: its bytes so far.
+struct Partial {
+    buf: Vec<u8>,
+    want: usize,
+    cold: bool,
+}
+
+/// One request as the engine sent it (tests).
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Traced {
+    /// Which transport (1 at open, +1 at each reload or retry) and which ticket on it.
+    pub channel: u64,
+    pub ticket: u64,
+    pub class: Option<Class>,
+    pub block: Option<u64>,
+    pub bytes: u64,
+    /// What was in flight, and the cap, when it was sent.
+    pub in_flight: u64,
+    pub cap: u64,
+}
+
+pub(crate) struct Core {
+    pub(crate) state: State,
+    pub(crate) gen: u64,
+    path: String,
+    pub(crate) opened: Stat,
+    pub(crate) cache: BlockCache,
+    pub(crate) pf: Prefetcher,
+    out: HashMap<u64, Out>,
+    batches: HashMap<u64, Batch>,
+    next_batch: u64,
+    /// Blocks with a read out, and blocks whose bytes have come in part or wait for a fence.
+    inflight: HashSet<u64>,
+    partial: HashMap<u64, Partial>,
+    visible: bool,
+    poll_out: bool,
+    poll_at: Instant,
+    poll_every: Duration,
+    stats: Stats,
+    delivered: Ranges,
+    http_sent: Ranges,
+    label: String,
+    began: Instant,
+    sink: Option<Sink>,
+    /// `first` was marked and the engine has not stamped it yet; then when it did.
+    first_marked: bool,
+    idle_at: Option<Instant>,
+    reload: Option<Option<Fingerprint>>,
+    reloads: u64,
+    /// Which version is open: +1 at each reload that opened one. A reader reads only its own.
+    epoch: u64,
+    reload_result: std::result::Result<(), String>,
+    retry: bool,
+    last_retry: Option<Instant>,
+    drop_transport: bool,
+    closed: bool,
+    kicked: bool,
+    /// A wake was sent to the transport and the engine's wait has not ended on it yet.
+    woke: bool,
+    wake: Option<Wake>,
+    /// Something a viewer shows changed: the waker is called once the lock is released.
+    notify: bool,
+    #[cfg(test)]
+    pub(crate) channel: u64,
+    #[cfg(test)]
+    pub(crate) trace: Vec<Traced>,
+}
+
+fn secs(t: SystemTime) -> u64 {
+    t.duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs())
+}
+
+impl Core {
+    /// Whether `stat` is the fingerprint: the size, and the mtime in whole seconds (all SFTP
+    /// carries, 06 §5).
+    fn same(&self, stat: &Stat) -> bool {
+        stat.size == self.opened.size && secs(stat.mtime) == secs(self.opened.mtime)
+    }
+
+    fn live(&self) -> bool {
+        matches!(self.state, State::Live | State::Replaced)
+    }
+
+    /// Tests: blocks whose bytes are held and not visible, and batches awaiting a fence.
+    #[cfg(test)]
+    pub(crate) fn held(&self) -> (usize, usize) {
+        (self.partial.len() + self.inflight.len(), self.batches.len())
+    }
+
+    pub(crate) fn stats(&self) -> Stats {
+        Stats {
+            delivered: self.delivered.total,
+            http_sent: self.http_sent.total,
+            max_in_flight: self.pf.adm.max_in_flight(),
+            ..self.stats
+        }
+    }
+
+    /// 06 §11's line for `event`, to the sink.
+    fn line(&self, event: &str, extra: &str) {
+        let Some(sink) = &self.sink else {
+            return;
+        };
+        let s = self.stats();
+        sink(&format!(
+            "stream {event} t={} {} fetched={} demand={} prefetch={} bulk={} delivered={} \
+             http_sent={} sniff={} requests={} max_in_flight={} runs={} jumps={} cuts={}{extra}",
+            self.began.elapsed().as_millis(),
+            self.label,
+            s.fetched.total,
+            s.fetched.demand,
+            s.fetched.prefetch,
+            s.fetched.bulk,
+            s.delivered,
+            s.http_sent,
+            s.sniff,
+            s.requests,
+            s.max_in_flight,
+            s.runs,
+            s.jumps,
+            s.cuts,
+        ));
+    }
+
+    fn candidate(&mut self) -> Option<Cand> {
+        let (cache, inflight, partial) = (&self.cache, &self.inflight, &self.partial);
+        let have = |b: u64| cache.contains(b) || inflight.contains(&b) || partial.contains_key(&b);
+        self.pf.candidate(&have)
+    }
+
+    fn record(&mut self, ticket: u64, bytes: u64, kind: OutKind) {
+        #[cfg(test)]
+        {
+            let (class, block) = match &kind {
+                OutKind::Read { class, block, .. } => (Some(*class), Some(*block)),
+                _ => (None, None),
+            };
+            self.trace.push(Traced {
+                channel: self.channel,
+                ticket,
+                class,
+                block,
+                bytes,
+                in_flight: self.pf.adm.in_flight(),
+                cap: self.pf.adm.cap(),
+            });
+        }
+        self.pf.adm.sent(bytes);
+        self.stats.requests += 1;
+        let gen = self.gen;
+        self.out.insert(ticket, Out { gen, bytes, kind });
+    }
+
+    /// Sends `cand`'s read in `batch` if the cap admits it.
+    fn send_read(&mut self, r: &mut dyn Ranged, cand: &Cand, batch: u64) -> bool {
+        let (block, off, len, first) = match cand.item {
+            Item::Block(b) => {
+                let off = b * BLOCK;
+                let len = BLOCK.min(self.opened.size.saturating_sub(off)) as u32;
+                (b, off, len, true)
+            }
+            Item::Rest(rest) => (rest.block, rest.off, rest.len, false),
+            Item::Poll => return false,
+        };
+        if !self.pf.adm.admits(len as u64) {
+            return false;
+        }
+        self.pf.take(cand);
+        let class = cand.class.unwrap_or(Class::Prefetch);
+        let ticket = r.read(off, len);
+        self.inflight.insert(block);
+        let kind = OutKind::Read {
+            batch,
+            block,
+            off,
+            len,
+            class,
+            first,
+        };
+        self.record(ticket.0, len as u64, kind);
+        true
+    }
+
+    /// Sends everything that may go now (06 §4): by class, a batch's reads and at once its
+    /// fence, the poll behind queued demand and ahead of the rest.
+    fn plan(&mut self, r: &mut dyn Ranged) {
+        if !self.live() {
+            return;
+        }
+        if self.visible && !self.poll_out && r.now() >= self.poll_at {
+            self.pf.poll_due = true;
+        }
+        while let Some(cand) = self.candidate() {
+            if cand.item == Item::Poll {
+                self.pf.take(&cand);
+                let ticket = r.fstat();
+                self.record(ticket.0, STATUS_BYTES, OutKind::PollHandle);
+                let ticket = r.stat_path();
+                self.record(ticket.0, STATUS_BYTES, OutKind::PollPath);
+                self.poll_out = true;
+                self.poll_at = r.now() + self.poll_every;
+                continue;
+            }
+            let batch = self.next_batch;
+            if !self.send_read(r, &cand, batch) {
+                break;
+            }
+            self.next_batch += 1;
+            let waited = cand.class == Some(Class::Demand);
+            self.batches.insert(
+                batch,
+                Batch {
+                    waited,
+                    complete: Vec::new(),
+                },
+            );
+            while let Some(more) = self.candidate() {
+                if !Prefetcher::same_batch(&cand, &more) || !self.send_read(r, &more, batch) {
+                    break;
+                }
+            }
+            // The fence travels with its batch: nothing queued gets between them.
+            let ticket = r.fstat();
+            self.record(ticket.0, STATUS_BYTES, OutKind::Fence { batch });
+        }
+    }
+
+    fn drop_everything_out(&mut self) {
+        self.gen += 1;
+        self.batches.clear();
+        self.inflight.clear();
+        self.partial.clear();
+        self.poll_out = false;
+    }
+
+    /// The handle's file is not the one opened any more (06 §5): the cache goes, and nothing
+    /// is read until a reload.
+    fn changed(&mut self) {
+        if !self.live() {
+            return;
+        }
+        self.state = State::Changed;
+        self.drop_everything_out();
+        self.cache.clear();
+        self.pf.clear(false);
+        self.notify = true;
+    }
+
+    /// A read failed or the channel closed: the cache stays, the transport goes, and the next
+    /// read retries.
+    fn fail(&mut self, reason: String) {
+        if !self.live() {
+            return;
+        }
+        self.state = State::Failed(reason);
+        self.drop_everything_out();
+        self.pf.clear(false);
+        self.drop_transport = true;
+        self.notify = true;
+    }
+
+    fn protect_and_insert(&mut self, block: u64, part: Partial) {
+        let protect = self.pf.protect();
+        self.cache
+            .insert(block, Bytes::from(part.buf), part.cold, &protect);
+        self.notify = true;
+    }
+
+    /// One completion, in the order the transport sent the requests.
+    pub(crate) fn apply(&mut self, c: Completion) {
+        let Some(out) = self.out.remove(&c.ticket.0) else {
+            return;
+        };
+        self.pf.adm.answered(out.bytes);
+        // The link is measured whatever the reply is for.
+        match (&out.kind, c.data()) {
+            (OutKind::Read { len, class, .. }, Some(data)) => {
+                let n = data.len() as u64;
+                self.pf.adm.delivered(n, c.took, c.at);
+                // What arrived counts as fetched, shown or not.
+                self.stats.fetched.total += n;
+                match class {
+                    Class::Demand => self.stats.fetched.demand += n,
+                    Class::Prefetch => self.stats.fetched.prefetch += n,
+                    Class::Bulk => self.stats.fetched.bulk += n,
+                }
+                if *len as u64 <= BLOCK && data.len() == *len as usize {
+                    self.pf.adm.small_reply(c.took);
+                }
+            }
+            (OutKind::Read { .. }, None) => {}
+            _ if c.reply.is_ok() => self.pf.adm.small_reply(c.took),
+            _ => {}
+        }
+        // Sent before a change, a failure or a reload: dropped unread.
+        if out.gen != self.gen {
+            return;
+        }
+        match out.kind {
+            OutKind::Read {
+                batch,
+                block,
+                off,
+                len,
+                class,
+                first,
+            } => {
+                self.inflight.remove(&block);
+                let data = match c.reply {
+                    Ok(Reply::Data(data)) => data,
+                    Ok(Reply::Stat(_)) => {
+                        return self.fail(format!("{}: a read was answered with a stat", self.path))
+                    }
+                    Err(e) => {
+                        self.partial.remove(&block);
+                        // A failed prefetch is never shown; it is only retried as demand.
+                        if self.pf.waits(block) {
+                            self.fail(format!("{e:#}"));
+                        }
+                        return;
+                    }
+                };
+                let n = data.len();
+                if n > len as usize {
+                    let path = &self.path;
+                    return self.fail(format!(
+                        "{path}: the server sent {n} bytes for a read of {len}"
+                    ));
+                }
+                if n == 0 {
+                    // The file ends before the size it had at open (06 §2).
+                    return self.changed();
+                }
+                if first {
+                    let part = Partial {
+                        buf: Vec::with_capacity(len as usize),
+                        want: len as usize,
+                        cold: class == Class::Bulk,
+                    };
+                    self.partial.insert(block, part);
+                }
+                let Some(part) = self.partial.get_mut(&block) else {
+                    return;
+                };
+                part.buf.extend_from_slice(&data);
+                if part.buf.len() < part.want {
+                    // A short reply: the rest is read at its own offset, with its own fence.
+                    self.pf.push_rest(Rest {
+                        block,
+                        off: off + n as u64,
+                        len: len - n as u32,
+                        class: if self.pf.waits(block) && class != Class::Bulk {
+                            Class::Demand
+                        } else {
+                            class
+                        },
+                    });
+                } else if let Some(b) = self.batches.get_mut(&batch) {
+                    b.complete.push(block);
+                }
+            }
+            OutKind::Fence { batch } => {
+                let Some(batch) = self.batches.remove(&batch) else {
+                    return;
+                };
+                match c.reply {
+                    Ok(Reply::Stat(Some(stat))) if self.same(&stat) => {
+                        for block in batch.complete {
+                            if let Some(part) = self.partial.remove(&block) {
+                                self.protect_and_insert(block, part);
+                            }
+                        }
+                    }
+                    Ok(Reply::Stat(Some(_))) => self.changed(),
+                    Ok(_) => self.fail(format!("{}: a fence was not answered", self.path)),
+                    Err(e) => {
+                        let waited = batch.waited
+                            || batch.complete.iter().any(|block| self.pf.waits(*block));
+                        for block in &batch.complete {
+                            self.partial.remove(block);
+                        }
+                        if waited {
+                            self.fail(format!("{e:#}"));
+                        }
+                    }
+                }
+            }
+            OutKind::PollHandle => match c.reply {
+                Ok(Reply::Stat(Some(stat))) if self.same(&stat) => {}
+                Ok(Reply::Stat(Some(_))) => self.changed(),
+                Ok(_) => self.fail(format!("{}: a poll was not answered", self.path)),
+                Err(e) => self.fail(format!("{e:#}")),
+            },
+            OutKind::PollPath => {
+                self.poll_out = false;
+                match c.reply {
+                    Ok(Reply::Stat(at_path)) => {
+                        let replaced = !at_path.is_some_and(|s| s.is_file && self.same(&s));
+                        let state = if replaced {
+                            State::Replaced
+                        } else {
+                            State::Live
+                        };
+                        if self.live() && self.state != state {
+                            self.state = state;
+                            self.notify = true;
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(e) => self.fail(format!("{e:#}")),
+                }
+            }
+        }
+    }
+
+    /// A new transport is in place: a reload takes its fingerprint and drops the cache; a
+    /// retry keeps the cache when the fingerprint is the one opened, and is `Changed` otherwise.
+    fn install(&mut self, r: &dyn Ranged, reload: Option<Option<Fingerprint>>, now: Instant) {
+        self.out.clear();
+        self.drop_everything_out();
+        self.pf.adm.idle();
+        self.wake = Some(r.waker());
+        #[cfg(test)]
+        {
+            self.channel += 1;
+        }
+        let new = r.opened();
+        match reload {
+            Some(expect) => {
+                self.cache.clear();
+                self.pf.clear(true);
+                self.opened = new;
+                self.epoch += 1;
+                let as_saved =
+                    expect.is_none_or(|e| e.size == new.size && secs(e.mtime) == secs(new.mtime));
+                self.state = if as_saved {
+                    State::Live
+                } else {
+                    State::Changed
+                };
+            }
+            None if self.same(&new) => {
+                self.pf.clear(false);
+                self.state = State::Live;
+            }
+            None => {
+                self.cache.clear();
+                self.pf.clear(false);
+                self.state = State::Changed;
+            }
+        }
+        self.poll_at = now + self.poll_every;
+        self.notify = true;
+    }
+
+    /// Reader `id` wants `[off, end)`: queues what is missing. Whether the engine has work.
+    fn want(&mut self, id: u64, off: u64, end: u64, now: Instant) -> bool {
+        let (cache, inflight, partial) = (&self.cache, &self.inflight, &self.partial);
+        let cached = |b: u64| cache.contains(b);
+        let have = |b: u64| cache.contains(b) || inflight.contains(&b) || partial.contains_key(&b);
+        let size = self.opened.size;
+        let Some(touch) = self.pf.access(id, off, end, size, now, &cached, &have) else {
+            return false;
+        };
+        match touch.access {
+            Access::Jump => self.stats.jumps += 1,
+            Access::Hit if touch.run => self.stats.runs += 1,
+            _ => {}
+        }
+        touch.queued
+    }
+
+    /// `[off, end)` when every block of it is visible.
+    fn serve(&mut self, id: u64, off: u64, end: u64) -> Option<Bytes> {
+        let (first, last) = (off / BLOCK, (end - 1) / BLOCK);
+        if !(first..=last).all(|b| self.cache.contains(b)) {
+            return None;
+        }
+        let touch = !matches!(self.pf.kind(id), Some(ReaderKind::Bulk));
+        let piece = |cache: &mut BlockCache, b: u64| {
+            let block = cache.get(b, touch).expect("a block just seen");
+            let base = b * BLOCK;
+            let from = (off.max(base) - base) as usize;
+            let to = ((end.min(base + BLOCK) - base) as usize).min(block.len());
+            block.slice(from.min(to)..to)
+        };
+        let bytes = if first == last {
+            piece(&mut self.cache, first)
+        } else {
+            let mut all = Vec::with_capacity((end - off) as usize);
+            for b in first..=last {
+                all.extend_from_slice(&piece(&mut self.cache, b));
+            }
+            all.into()
+        };
+        self.delivered.add(off, off + bytes.len() as u64);
+        self.pf.satisfied(id);
+        Some(bytes)
+    }
+}
+
+pub(crate) struct Shared {
+    core: Mutex<Core>,
+    /// Blocked `read_at`s and `reload`s wait here.
+    readers: Condvar,
+    /// The engine waits here while it has no transport.
+    engine: Condvar,
+    waker: Waker,
+    clock: Clock,
+    #[cfg(test)]
+    thread: Mutex<Option<std::thread::JoinHandle<()>>>,
+}
+
+impl Shared {
+    fn lock(&self) -> MutexGuard<'_, Core> {
+        self.core.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Releases the lock, then tells whoever waits: the engine (when `kick`), blocked readers,
+    /// and the viewer when something it shows changed.
+    fn release(&self, mut core: MutexGuard<'_, Core>, kick: bool) {
+        let notify = std::mem::take(&mut core.notify);
+        let wake = if kick {
+            core.kicked = true;
+            core.woke = core.wake.is_some();
+            core.wake.clone()
+        } else {
+            None
+        };
+        drop(core);
+        if kick {
+            if let Some(wake) = wake {
+                wake.wake();
+            }
+            self.engine.notify_all();
+        }
+        if notify {
+            self.readers.notify_all();
+            (self.waker)();
+        }
+    }
+}
+
+/// What the engine does next.
+pub(crate) enum Flow {
+    /// Wait for a completion this long (`None`: until one comes, or a wake).
+    Wait(Option<Duration>),
+    Closed,
+}
+
+/// The one sender of a Source: it owns the transport.
+pub(crate) struct Engine {
+    shared: Arc<Shared>,
+    ranged: Option<Box<dyn Ranged>>,
+    reopen: Reopen,
+    throttle: Option<Throttle>,
+}
+
+impl Engine {
+    fn now(&self) -> Instant {
+        match &self.ranged {
+            Some(r) => r.now(),
+            None => (self.shared.clock)(),
+        }
+    }
+
+    /// A reload (`Some`: with the fingerprint a save expects, if any) or a retry (`None`),
+    /// with no lock held: it waits on the network.
+    fn reconnect(&mut self, reload: Option<Option<Fingerprint>>) {
+        let path = self.shared.lock().path.clone();
+        let got = match (reload.is_some(), self.ranged.take()) {
+            // A reload re-opens the path on the connection it has.
+            (true, Some(r)) => r.reopen(&path).map_err(|refused| refused.error),
+            (_, old) => {
+                if let Some(old) = old {
+                    old.close();
+                }
+                let throttle = self.throttle;
+                (self.reopen)().map(|r| match throttle {
+                    Some(t) => Throttled::wrap(r, t),
+                    None => r,
+                })
+            }
+        };
+        let mut core = self.shared.lock();
+        match got {
+            Ok(r) if !core.closed => {
+                core.install(r.as_ref(), reload, r.now());
+                if reload.is_some() {
+                    core.reload_result = Ok(());
+                }
+                self.ranged = Some(r);
+            }
+            Ok(r) => r.close(),
+            Err(e) => {
+                let reason = explain(&e);
+                if reload.is_some() {
+                    core.reload_result = Err(reason.clone());
+                    // The version that was open is given up; a retry opens whatever is there.
+                    core.epoch += 1;
+                    core.cache.clear();
+                }
+                if !core.closed {
+                    core.out.clear();
+                    core.drop_everything_out();
+                    core.pf.adm.idle();
+                    core.pf.clear(false);
+                    core.wake = None;
+                    core.state = State::Failed(reason);
+                    core.notify = true;
+                }
+            }
+        }
+        if reload.is_some() {
+            core.reloads += 1;
+            core.notify = true;
+        }
+        self.shared.release(core, false);
+    }
+
+    /// Everything that needs no completion: commands, timers, and what may be sent now.
+    pub(crate) fn pump(&mut self) -> Flow {
+        loop {
+            let now = self.now();
+            let mut core = self.shared.lock();
+            core.kicked = false;
+            if core.closed {
+                drop(core);
+                if let Some(r) = self.ranged.take() {
+                    r.close();
+                }
+                return Flow::Closed;
+            }
+            if std::mem::take(&mut core.drop_transport) {
+                core.out.clear();
+                core.pf.adm.idle();
+                core.wake = None;
+                drop(core);
+                if let Some(r) = self.ranged.take() {
+                    r.close();
+                }
+                continue;
+            }
+            if let Some(reload) = core.reload.take() {
+                drop(core);
+                self.reconnect(Some(reload));
+                continue;
+            }
+            if std::mem::take(&mut core.retry) && matches!(core.state, State::Failed(_)) {
+                let due = core
+                    .last_retry
+                    .is_none_or(|last| now.saturating_duration_since(last) >= RETRY_EVERY);
+                if due {
+                    core.last_retry = Some(now);
+                    drop(core);
+                    self.reconnect(None);
+                    continue;
+                }
+            }
+            if std::mem::take(&mut core.first_marked) {
+                core.idle_at = Some(now + IDLE_AFTER);
+            }
+            if core.idle_at.is_some_and(|at| now >= at) {
+                core.idle_at = None;
+                core.line("idle", "");
+            }
+            let mut wait = core.idle_at.map(|at| at - now);
+            if let Some(r) = self.ranged.as_mut() {
+                core.plan(r.as_mut());
+                let polls = core.live() && core.visible && !core.poll_out && core.poll_at > now;
+                if polls {
+                    let until = core.poll_at - now;
+                    wait = Some(wait.map_or(until, |w| w.min(until)));
+                }
+            }
+            self.shared.release(core, false);
+            return Flow::Wait(wait);
+        }
+    }
+
+    fn apply(&mut self, c: Completion) {
+        let mut core = self.shared.lock();
+        core.apply(c);
+        self.shared.release(core, false);
+    }
+
+    /// One turn: pump, wait up to `limit` for a completion, apply it. Whether one came.
+    #[cfg(test)]
+    pub(crate) fn step(&mut self, limit: Option<Duration>) -> bool {
+        let Flow::Wait(wait) = self.pump() else {
+            return false;
+        };
+        let wait = match (wait, limit) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        let Some(c) = self.ranged.as_mut().and_then(|r| r.next(wait)) else {
+            return false;
+        };
+        self.apply(c);
+        true
+    }
+
+    #[cfg(test)]
+    pub(crate) fn transport(&mut self) -> Option<&mut Box<dyn Ranged>> {
+        self.ranged.as_mut()
+    }
+
+    /// The engine's thread.
+    fn run(mut self) {
+        // `next` returning nothing, unasked and early, twice running: the transport may be gone.
+        let mut unasked = 0;
+        loop {
+            let Flow::Wait(wait) = self.pump() else {
+                return;
+            };
+            let Some(r) = self.ranged.as_mut() else {
+                let core = self.shared.lock();
+                let parked = |c: &mut Core| !c.kicked && !c.closed;
+                let _unused = match wait {
+                    Some(d) => {
+                        self.shared
+                            .engine
+                            .wait_timeout_while(core, d, parked)
+                            .unwrap_or_else(|e| e.into_inner())
+                            .0
+                    }
+                    None => self
+                        .shared
+                        .engine
+                        .wait_while(core, parked)
+                        .unwrap_or_else(|e| e.into_inner()),
+                };
+                continue;
+            };
+            let asked = r.now();
+            if let Some(c) = r.next(wait) {
+                unasked = 0;
+                self.apply(c);
+                continue;
+            }
+            let early = wait.is_none_or(|w| r.now().saturating_duration_since(asked) < w);
+            let mut core = self.shared.lock();
+            // A wake ends one wait: that one was asked for.
+            if std::mem::take(&mut core.woke) || core.kicked || !early {
+                unasked = 0;
+                continue;
+            }
+            unasked += 1;
+            if unasked >= 2 {
+                unasked = 0;
+                // Ask it something: a transport that is gone answers with its error.
+                if core.live() {
+                    core.poll_out = false;
+                    core.pf.poll_due = true;
+                } else {
+                    core.drop_transport = true;
+                }
+            }
+        }
+    }
+}
+
+/// Closes the Source when its last handle drops.
+struct Handle(Arc<Shared>);
+
+impl Drop for Handle {
+    fn drop(&mut self) {
+        let mut core = self.0.lock();
+        core.closed = true;
+        core.state = State::Closed;
+        core.notify = true;
+        core.line("close", "");
+        self.0.release(core, true);
+    }
+}
+
+/// One remote file opened for viewing. Cheap to clone; the last drop closes it, without
+/// waiting for the network (06 §9). Readers do not keep it open: they see `Closed`.
+#[derive(Clone)]
+pub struct Source {
+    shared: Arc<Shared>,
+    _handle: Arc<Handle>,
+}
+
+impl Source {
+    /// `transport` is the file already open (`RemoteFs::into_ranged`); `reopen` makes a new one
+    /// after a failure; `wake` is called when something shown may have changed.
+    pub fn open(transport: Box<dyn Ranged>, reopen: Reopen, wake: Waker) -> anyhow::Result<Source> {
+        let opening = Opening {
+            label: transport.path().to_string(),
+            began: Instant::now(),
+            sniff: 0,
+        };
+        Self::open_as(transport, reopen, wake, opening)
+    }
+
+    /// [`Source::open`], with what the stats lines say of the open (06 §11).
+    pub fn open_as(
+        transport: Box<dyn Ranged>,
+        reopen: Reopen,
+        wake: Waker,
+        opening: Opening,
+    ) -> anyhow::Result<Source> {
+        let (source, engine) = Self::build(transport, reopen, wake, opening, Settings::from_env());
+        let thread = std::thread::Builder::new()
+            .name("sopen-stream-core".into())
+            .spawn(move || engine.run())
+            .map_err(|e| anyhow::anyhow!("cannot start the stream's thread: {e}"))?;
+        #[cfg(test)]
+        {
+            *source.shared.thread.lock().unwrap() = Some(thread);
+        }
+        #[cfg(not(test))]
+        drop(thread);
+        Ok(source)
+    }
+
+    /// The Source and its engine, not yet running.
+    pub(crate) fn build(
+        transport: Box<dyn Ranged>,
+        reopen: Reopen,
+        wake: Waker,
+        opening: Opening,
+        settings: Settings,
+    ) -> (Source, Engine) {
+        let transport = match settings.throttle {
+            Some(t) => Throttled::wrap(transport, t),
+            None => transport,
+        };
+        let core = Core {
+            state: State::Live,
+            gen: 0,
+            path: transport.path().to_string(),
+            opened: transport.opened(),
+            cache: BlockCache::default(),
+            pf: Prefetcher::default(),
+            out: HashMap::new(),
+            batches: HashMap::new(),
+            next_batch: 0,
+            inflight: HashSet::new(),
+            partial: HashMap::new(),
+            visible: true,
+            poll_out: false,
+            poll_at: transport.now() + settings.poll_every,
+            poll_every: settings.poll_every,
+            stats: Stats {
+                sniff: opening.sniff,
+                ..Stats::default()
+            },
+            delivered: Ranges::default(),
+            http_sent: Ranges::default(),
+            label: opening.label,
+            began: opening.began,
+            sink: settings.stats,
+            first_marked: false,
+            idle_at: None,
+            reload: None,
+            reloads: 0,
+            epoch: 0,
+            reload_result: Ok(()),
+            retry: false,
+            last_retry: None,
+            drop_transport: false,
+            closed: false,
+            kicked: false,
+            woke: false,
+            wake: Some(transport.waker()),
+            notify: false,
+            #[cfg(test)]
+            channel: 1,
+            #[cfg(test)]
+            trace: Vec::new(),
+        };
+        core.line("open", "");
+        let shared = Arc::new(Shared {
+            core: Mutex::new(core),
+            readers: Condvar::new(),
+            engine: Condvar::new(),
+            waker: wake,
+            clock: settings.clock,
+            #[cfg(test)]
+            thread: Mutex::new(None),
+        });
+        let engine = Engine {
+            shared: shared.clone(),
+            ranged: Some(transport),
+            reopen,
+            throttle: settings.throttle,
+        };
+        let source = Source {
+            _handle: Arc::new(Handle(shared.clone())),
+            shared,
+        };
+        (source, engine)
+    }
+
+    /// The handle's size at open (or at the last reload).
+    pub fn size(&self) -> u64 {
+        self.shared.lock().opened.size
+    }
+
+    /// `(size, mtime)` at open; no hash.
+    pub fn opened(&self) -> Fingerprint {
+        let opened = self.shared.lock().opened;
+        Fingerprint {
+            size: opened.size,
+            mtime: opened.mtime,
+            sha256: None,
+        }
+    }
+
+    pub fn state(&self) -> State {
+        self.shared.lock().state.clone()
+    }
+
+    /// A new reader at no position: its window is 0 until it reads in sequence (06 §4).
+    pub fn reader(&self, kind: ReaderKind) -> Reader {
+        let mut core = self.shared.lock();
+        let (id, epoch) = (core.pf.open(kind), core.epoch);
+        drop(core);
+        Reader {
+            shared: self.shared.clone(),
+            id,
+            epoch,
+        }
+    }
+
+    pub fn fetched(&self) -> Fetched {
+        self.shared.lock().stats.fetched
+    }
+
+    /// The counters of the stats line.
+    pub fn stats(&self) -> Stats {
+        self.shared.lock().stats()
+    }
+
+    /// Re-opens the path, takes a new fingerprint and drops the cache (Cmd/Ctrl+R). Waits for
+    /// it — an open and an `fstat` on the stream's connection — so not for a frame:
+    /// [`Source::request_reload`] does not wait.
+    pub fn reload(&self) -> anyhow::Result<()> {
+        self.reload_with(None)
+    }
+
+    /// A reload after one of sopen's own writes landed (06 §5): `Live` on the saved file when the
+    /// new fingerprint is `baseline`'s `(size, mtime)`, `Changed` when it is not.
+    pub fn reload_saved(&self, baseline: Fingerprint) -> anyhow::Result<()> {
+        self.reload_with(Some(baseline))
+    }
+
+    fn reload_with(&self, expect: Option<Fingerprint>) -> anyhow::Result<()> {
+        let mut core = self.shared.lock();
+        let before = core.reloads;
+        core.reload = Some(expect);
+        self.shared.release(core, true);
+        let core = self.shared.lock();
+        let core = self
+            .shared
+            .readers
+            .wait_while(core, |c| c.reloads == before && !c.closed)
+            .unwrap_or_else(|e| e.into_inner());
+        if core.reloads == before {
+            anyhow::bail!("the stream is closed");
+        }
+        core.reload_result
+            .clone()
+            .map_err(|reason| anyhow::anyhow!(reason))
+    }
+
+    /// Starts a reload and returns: the waker is called when it is done, and
+    /// [`Source::state`] says how it went.
+    pub fn request_reload(&self) {
+        let mut core = self.shared.lock();
+        core.reload = Some(None);
+        self.shared.release(core, true);
+    }
+
+    /// Asks a failed stream to reconnect now (a read of something not cached asks by itself);
+    /// at most one attempt per second is made.
+    pub fn retry(&self) {
+        let mut core = self.shared.lock();
+        core.retry = true;
+        self.shared.release(core, true);
+    }
+
+    /// Whether the viewer is on screen: a hidden one does not poll (06 §5). On by default.
+    pub fn set_visible(&self, visible: bool) {
+        let mut core = self.shared.lock();
+        core.visible = visible;
+        self.shared.release(core, true);
+    }
+
+    /// Makes every blocked `read_at` look at its cancel flag now (the byte server's shutdown,
+    /// 06 §9).
+    pub fn interrupt(&self) {
+        self.shared.readers.notify_all();
+    }
+
+    /// A viewer's event on the stats line (06 §11).
+    pub fn mark(&self, mark: Mark) {
+        let mut core = self.shared.lock();
+        match mark {
+            Mark::First => {
+                core.line("first", "");
+                core.first_marked = true;
+            }
+            Mark::Input(place) => {
+                core.first_marked = false;
+                core.idle_at = None;
+                core.line("input", &format!(" place={place:#x}"));
+            }
+            Mark::Ready => core.line("ready", ""),
+        }
+        self.shared.release(core, mark == Mark::First);
+    }
+
+    /// The byte server sent `[off, off + len)` to its client (06 §11's `http_sent`).
+    pub fn sent_http(&self, off: u64, len: u64) {
+        self.shared.lock().http_sent.add(off, off + len);
+    }
+
+    /// The byte server ended a response early (06 §9).
+    pub fn cut(&self) {
+        self.shared.lock().stats.cuts += 1;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn core(&self) -> MutexGuard<'_, Core> {
+        self.shared.lock()
+    }
+
+    /// Tests: waits for the engine's thread to end.
+    #[cfg(test)]
+    pub(crate) fn thread(&self) -> Option<std::thread::JoinHandle<()>> {
+        self.shared.thread.lock().unwrap().take()
+    }
+}
+
+/// A position in a Source with its own readahead window (06 §4).
+pub struct Reader {
+    shared: Arc<Shared>,
+    id: u64,
+    /// The version it reads (06 §5: blocks of two versions never mix, in a cache or in a
+    /// reader's hands).
+    epoch: u64,
+}
+
+impl Drop for Reader {
+    fn drop(&mut self) {
+        self.shared.lock().pf.close(self.id);
+    }
+}
+
+/// What a read finds under the lock.
+enum Got {
+    Bytes(Bytes),
+    Pending,
+}
+
+impl Reader {
+    /// The file's size at open (or at the last reload).
+    pub fn len(&self) -> u64 {
+        self.shared.lock().opened.size
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Moves the reader to the version open now, at no position: after a reload, a reader
+    /// made before it reads nothing (`ReadError::Reloaded`) until this is called.
+    pub fn renew(&mut self) {
+        let mut core = self.shared.lock();
+        if let Some(kind) = core.pf.kind(self.id) {
+            core.pf.close(self.id);
+            self.id = core.pf.open(kind);
+        }
+        self.epoch = core.epoch;
+    }
+
+    /// What this reader has been waiting for, and for how long.
+    pub fn waiting(&self) -> Option<Waiting> {
+        let core = self.shared.lock();
+        let ((first, last), since) = core.pf.waiting(self.id)?;
+        let off = first * BLOCK;
+        Some(Waiting {
+            off,
+            len: ((last + 1) * BLOCK)
+                .min(core.opened.size)
+                .saturating_sub(off),
+            waited: (self.shared.clock)().saturating_duration_since(since),
+        })
+    }
+
+    /// One look under the lock: the bytes, or the fetch queued.
+    fn look(&self, off: u64, len: usize, retry: bool) -> Result<Got> {
+        let mut core = self.shared.lock();
+        let end = off.saturating_add(len as u64).min(core.opened.size);
+        let got = match core.state.clone() {
+            State::Closed => Err(ReadError::Closed),
+            _ if core.epoch != self.epoch => Err(ReadError::Reloaded),
+            State::Changed => Err(ReadError::Changed),
+            _ if len > MAX_READ => Err(ReadError::Failed(format!(
+                "a read of {len} bytes is longer than one read may be ({MAX_READ})"
+            ))),
+            _ if off >= end => Ok((Got::Bytes(Bytes::new()), false)),
+            State::Failed(reason) => match core.serve(self.id, off, end) {
+                Some(bytes) => Ok((Got::Bytes(bytes), false)),
+                None => {
+                    core.retry |= retry;
+                    self.shared.release(core, retry);
+                    return Err(ReadError::Failed(reason));
+                }
+            },
+            State::Live | State::Replaced => {
+                let kick = core.want(self.id, off, end, (self.shared.clock)());
+                match core.serve(self.id, off, end) {
+                    Some(bytes) => Ok((Got::Bytes(bytes), kick)),
+                    None => Ok((Got::Pending, kick)),
+                }
+            }
+        };
+        match got {
+            Ok((got, kick)) => {
+                self.shared.release(core, kick);
+                Ok(got)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Frames: up to `len` bytes at `off` (fewer at the end of the file) when every block is
+    /// cached, else `Pending`: the fetch is queued and the waker is called on arrival. A failed
+    /// stream still gives what it has cached; a read of anything else asks for a retry.
+    pub fn try_read(&mut self, off: u64, len: usize) -> Poll<Result<Bytes>> {
+        match self.look(off, len, true) {
+            Ok(Got::Bytes(bytes)) => Poll::Ready(Ok(bytes)),
+            Ok(Got::Pending) => Poll::Pending,
+            Err(e) => Poll::Ready(Err(e)),
+        }
+    }
+
+    /// Workers and HTTP connections: blocks until `buf` is full or the file ends, and returns
+    /// the count. `Err(Cancelled)` once `cancel` is set, `Err(Changed)` when the source changed,
+    /// `Err(Failed)` when it failed, `Err(Closed)` when it closed.
+    pub fn read_at(&mut self, off: u64, buf: &mut [u8], cancel: &AtomicBool) -> Result<usize> {
+        let mut done = 0;
+        while done < buf.len() {
+            if cancel.load(Ordering::SeqCst) {
+                return Err(ReadError::Cancelled);
+            }
+            let ask = (buf.len() - done).min(READ_CHUNK);
+            match self.look(off + done as u64, ask, false)? {
+                Got::Bytes(bytes) if bytes.is_empty() => break,
+                Got::Bytes(bytes) => {
+                    buf[done..done + bytes.len()].copy_from_slice(&bytes);
+                    done += bytes.len();
+                }
+                Got::Pending => {
+                    let core = self.shared.lock();
+                    let (first, last) = (
+                        (off + done as u64) / BLOCK,
+                        (off + (done + ask) as u64 - 1) / BLOCK,
+                    );
+                    // Nothing came between the look and this lock: wait for a block or a wake.
+                    let ready = !core.live() || (first..=last).all(|b| core.cache.contains(b));
+                    if !ready {
+                        let _unused = self
+                            .shared
+                            .readers
+                            .wait_timeout(core, CANCEL_CHECK)
+                            .unwrap_or_else(|e| e.into_inner());
+                    }
+                }
+            }
+        }
+        Ok(done)
+    }
+}
