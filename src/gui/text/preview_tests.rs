@@ -506,3 +506,27 @@ fn a_prefix_rewritten_during_the_resume_fails_it() {
         ),
     }
 }
+
+/// A remote file's text is indexed from a private copy, and the pass that goes on from a cut
+/// index (the hand-over, 02 §4.4) reads that copy again. What fails then is said about the file
+/// as its owner knows it, `host:/abs` — as the first pass says it — never about the copy.
+#[test]
+fn a_continuation_read_that_fails_names_the_file_not_its_copy() {
+    let tmp = tempfile::tempdir().unwrap();
+    let body = vec![b'x'; 3 << 20];
+    let copy = write(tmp.path(), "copy-of-big.log", &body);
+    let known = "box:/var/log/big.log";
+    let cut = TextDoc::open_capped_as(&copy, known, &|| Some(1 << 20), &|| Ok(())).unwrap();
+    assert!(cut.cut_short());
+    super::fail_index_reads(&copy);
+    let e = cut
+        .resume(&AtomicBool::new(false))
+        .err()
+        .expect("the read fails");
+    let said = format!("{e:#}");
+    assert!(
+        said.starts_with("cannot read box:/var/log/big.log: "),
+        "{said}"
+    );
+    assert!(!said.contains(copy.to_str().unwrap()), "{said}");
+}

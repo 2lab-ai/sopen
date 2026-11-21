@@ -117,6 +117,7 @@ fn prepare_in(tools: &Tools, path: &Path, held: &Held, children: &Children) -> R
         tools,
         &Input::path(path),
         &name,
+        &path.display().to_string(),
         kind_of(path),
         children,
         held,
@@ -1044,6 +1045,7 @@ fn a_file_ffprobe_cannot_read_is_said_and_a_ts_is_not_media() {
             preview::prepare(
                 &tools,
                 &Input::path(&ts),
+                "stream.ts",
                 "stream.ts",
                 Kind::Video,
                 &Children::default(),

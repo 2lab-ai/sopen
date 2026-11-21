@@ -1202,7 +1202,10 @@ fn preview_parts(
         let input = Input::path(&path);
         // The file's own name (a link's target's): its extension says how it is rendered.
         let name = crate::remote::split_parent(&real).1;
-        let found = media::preview::prepare(&tools, &input, name, kind, &budget.children, &watch)?;
+        // Named as its owner knows it: `path` may be the private preview copy.
+        let shown = show(label, &real);
+        let found =
+            media::preview::prepare(&tools, &input, name, &shown, kind, &budget.children, &watch)?;
         let parts = match found {
             media::preview::Found::Media(made) => {
                 if made.media.video.is_none() {
@@ -1215,7 +1218,12 @@ fn preview_parts(
             }
             // A `.ts` ffprobe cannot read as media: the hex view, as Enter shows it.
             media::preview::Found::NotMedia => Parts::Hex {
-                file: HexFile::new(origin(at)?, hex::Base::open(&path)?, None, cache),
+                file: HexFile::new(
+                    origin(at)?,
+                    hex::Base::open_as(&path, &show(label, &real))?,
+                    None,
+                    cache,
+                ),
             },
         };
         // Once more before handing the preview over: a cancel meanwhile drops it here.
@@ -1250,7 +1258,9 @@ fn preview_parts(
         }
         Kind::Text => {
             text::warm();
-            let doc = TextDoc::open_capped(&path, &|| budget.limit(limits.text), &check)?;
+            let shown = show(label, &real);
+            let doc =
+                TextDoc::open_capped_as(&path, &shown, &|| budget.limit(limits.text), &check)?;
             Parts::Text {
                 doc,
                 title: show(label, &real),
@@ -1259,7 +1269,7 @@ fn preview_parts(
             }
         }
         Kind::Other | Kind::Directory => {
-            let base = hex::Base::open(&path)?;
+            let base = hex::Base::open_as(&path, &show(label, &real))?;
             Parts::Hex {
                 file: HexFile::new(origin(at)?, base, None, cache),
             }

@@ -22,11 +22,43 @@ fn sopen_command(home: &Path) -> Command {
     cmd
 }
 
-/// How long a run that should end by itself may take before the test gives up on it.
+/// How long a run that should end by itself may take — its exit and the end of its output
+/// together — before the test gives up on it.
 const RUN_LIMIT: std::time::Duration = std::time::Duration::from_secs(120);
 
-/// Runs sopen to its end and returns what it printed. A run that has not ended in
-/// [`RUN_LIMIT`] is killed and reaped, and the test fails — it never hangs the suite.
+/// A child that is killed and reaped when this goes, whatever way the test leaves (a panic
+/// included), unless its exit was already seen.
+struct Reaped(Option<std::process::Child>);
+
+impl Drop for Reaped {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.0.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+/// Everything `pipe` gives until its end, sent when the end comes. A pipe some descendant
+/// keeps open never ends: then nothing is sent, and the receiver's deadline says so.
+fn collected(
+    pipe: Option<impl std::io::Read + Send + 'static>,
+) -> std::sync::mpsc::Receiver<Vec<u8>> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        if let Some(mut pipe) = pipe {
+            let _ = pipe.read_to_end(&mut bytes);
+        }
+        let _ = tx.send(bytes);
+    });
+    rx
+}
+
+/// Runs sopen to its end and returns what it printed. One deadline, [`RUN_LIMIT`], covers the
+/// child's exit and the end of both its outputs: a run that is still there, or whose output
+/// never ends (a descendant holding a pipe open), fails the test within it instead of hanging
+/// the suite. The child is under a kill-and-reap guard from the moment it is spawned.
 fn sopen(home: &Path, args: &[&str], env: &[(&str, &str)]) -> Output {
     let mut cmd = sopen_command(home);
     cmd.args(args)
@@ -36,35 +68,35 @@ fn sopen(home: &Path, args: &[&str], env: &[(&str, &str)]) -> Output {
     for (k, v) in env {
         cmd.env(k, v);
     }
-    let mut child = cmd.spawn().unwrap();
-    // Read both pipes while it runs, so a run that prints a lot is never stuck on a full pipe.
-    let read = |pipe: Option<Box<dyn std::io::Read + Send>>| {
-        std::thread::spawn(move || {
-            let mut bytes = Vec::new();
-            if let Some(mut pipe) = pipe {
-                let _ = pipe.read_to_end(&mut bytes);
-            }
-            bytes
-        })
-    };
-    let stdout = read(child.stdout.take().map(|p| Box::new(p) as _));
-    let stderr = read(child.stderr.take().map(|p| Box::new(p) as _));
+    let mut guard = Reaped(Some(cmd.spawn().unwrap()));
+    let child = guard.0.as_mut().unwrap();
+    // Both pipes are read while it runs, so a run that prints a lot is never stuck on a full
+    // pipe.
+    let stdout = collected(child.stdout.take());
+    let stderr = collected(child.stderr.take());
     let deadline = std::time::Instant::now() + RUN_LIMIT;
     let status = loop {
-        if let Some(status) = child.try_wait().unwrap() {
+        if let Some(status) = guard.0.as_mut().unwrap().try_wait().unwrap() {
             break status;
         }
-        if std::time::Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            panic!("sopen {args:?} did not end within {RUN_LIMIT:?}; killed");
-        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "sopen {args:?} did not end within {RUN_LIMIT:?}"
+        );
         std::thread::sleep(std::time::Duration::from_millis(5));
+    };
+    // Exited and reaped: nothing is left for the guard to kill.
+    guard.0 = None;
+    let until_end = |rx: std::sync::mpsc::Receiver<Vec<u8>>, what: &str| {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        rx.recv_timeout(left).unwrap_or_else(|_| {
+            panic!("sopen {args:?} exited, but its {what} did not end within {RUN_LIMIT:?}")
+        })
     };
     Output {
         status,
-        stdout: stdout.join().unwrap(),
-        stderr: stderr.join().unwrap(),
+        stdout: until_end(stdout, "stdout"),
+        stderr: until_end(stderr, "stderr"),
     }
 }
 

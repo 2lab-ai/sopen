@@ -1380,6 +1380,48 @@ fn a_remote_file_that_fails_to_open_is_named_as_host_abs_never_as_its_cache_copy
     }
 }
 
+/// The preview of a remote file ffprobe reads but that holds no picture and no sound (a
+/// Matroska file with only subtitles): the card says so about the file as its owner knows it,
+/// `host:/abs` — never about the private preview copy ffprobe was run on.
+/// Needs ffmpeg (skips without it, unless `SOPEN_REQUIRE_FFMPEG` is set).
+#[test]
+fn a_remote_preview_without_a_stream_is_named_as_host_abs_never_as_its_preview_copy() {
+    let tools = match crate::ffmpeg::resolve() {
+        Ok(t) => t,
+        Err(e) if std::env::var_os("SOPEN_REQUIRE_FFMPEG").is_some() => {
+            panic!("SOPEN_REQUIRE_FFMPEG is set but {e}")
+        }
+        Err(e) => return eprintln!("skipping: {e}"),
+    };
+    let mut fx = fixture_with(Some("box"), local_connect(), None);
+    let srt = fx._tmp.path().join("a.srt");
+    std::fs::write(&srt, "1\n00:00:00,000 --> 00:00:01,000\nhello\n").unwrap();
+    let made = std::process::Command::new(&tools.ffmpeg)
+        .args(["-hide_banner", "-loglevel", "error", "-nostdin", "-y", "-i"])
+        .arg(&srt)
+        .args(["-c:s", "srt"])
+        .arg(format!("{}/subs.mkv", fx.root))
+        .status()
+        .unwrap();
+    assert!(made.success(), "fixture");
+    let root = fx.root.clone();
+    fx.b.list(None, root, None, None);
+    fx.settle();
+    fx.select("subs.mkv");
+    // The bar rests (past the 150 ms commit): the card is on screen.
+    fx.drv.idle(&mut fx.b, 12);
+    fx.settle();
+    fx.drv.idle(&mut fx.b, 2);
+    let said: Vec<String> = fx.drv.texts().into_iter().map(|t| t.2).collect();
+    let known = format!("box:{}/subs.mkv has no audio or video stream", fx.root);
+    let about: Vec<&String> = said.iter().filter(|t| t.contains("no audio")).collect();
+    assert_eq!(about, [&known], "the card's reason");
+    assert!(
+        !said.iter().any(|t| t.contains(".preview")),
+        "the preview copy is named: {about:?}"
+    );
+}
+
 /// Cmd/Ctrl+C, X and V reach a hosted image as in its own window (the browser takes none of
 /// them): Copy and Cut put pictures on the clipboard, a paste lands, and leaving asks before
 /// the edits go.
