@@ -981,7 +981,10 @@ fn event_loop_hook() -> Option<eframe::EventLoopBuilderHook> {
     None
 }
 
-/// sopen gives up (`why`) and exits 1 without unwinding: nothing of it is left running.
+/// sopen gives up (`why`) and exits 1 without unwinding (the screenshot hook's watchdog: a
+/// receipt hook). Nothing is stopped here: on Linux an ffprobe or ffmpeg a preview runs dies
+/// with sopen (the kernel ends it: `PR_SET_PDEATHSIG`); on macOS the one that runs may be left
+/// to end by itself — it is bounded by its input.
 pub(crate) fn give_up(why: &str) -> ! {
     eprintln!("sopen: {why}; giving up");
     std::process::exit(1);

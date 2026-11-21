@@ -1913,8 +1913,48 @@ fn on_linux_a_killed_sopen_takes_its_child_with_it() {
             .unwrap();
         // The process itself, and its ffprobe.
         until("its ffprobe runs", || naming(tmp.path()) == 2);
-        unsafe { libc::kill(process.id() as libc::pid_t, libc::SIGKILL) };
-        let _ = process.wait();
+        use std::os::unix::process::ExitStatusExt as _;
+        let sent = unsafe { libc::kill(process.id() as libc::pid_t, libc::SIGKILL) };
+        assert_eq!(sent, 0, "the kill was delivered");
+        let status = process.wait().unwrap();
+        assert_eq!(status.signal(), Some(libc::SIGKILL), "it died of it");
         until("its ffprobe is gone with it", || naming(tmp.path()) == 0);
     });
+}
+
+/// The failure is recorded — the window, as it was opened, has asked to be closed — and before
+/// that close is asked of it the owner edits, or (apart) starts an Export: the window stays,
+/// closing is handled as for any edited or writing window, and the open is no longer failed
+/// (neither for the window nor for whoever opened it).
+#[test]
+fn an_edit_or_an_export_after_the_failure_keeps_the_window() {
+    let Some(real) = tools_or_skip() else { return };
+    for exporting in [false, true] {
+        let real = real.clone();
+        bounded(90, move |t| {
+            let (mut fx, frame) = opened_with_a_stalled_first_frame(t, &real);
+            until_the_frame_has_failed(&mut fx, &frame, |w| w.failed.is_some());
+            assert!(fx.win.outcome.lock().unwrap().failed.is_some(), "recorded");
+            // Before the close it asked for is asked of it.
+            if exporting {
+                fx.win.start_export(&fx.drv.ctx.clone());
+                assert!(fx.win.job.is_some(), "the export runs");
+            } else {
+                fx.win.marks.in_s = Some(0.0);
+                fx.win.marks.out_s = Some(1.0);
+                fx.win.remove(&fx.drv.ctx.clone(), false);
+                assert!(fx.win.unsaved(), "edited");
+            }
+            assert!(!fx.win.close_requested(), "it stays");
+            if exporting {
+                assert!(fx.win.close_when_done, "closing waits for the export");
+                assert!(fx.win.job.is_some());
+            } else {
+                assert!(fx.win.prompt, "the unsaved-changes question");
+                assert!(fx.win.unsaved(), "the edit is intact");
+            }
+            assert_eq!(fx.win.failure(), None, "no longer a failed open");
+            assert!(fx.win.outcome.lock().unwrap().failed.is_none());
+        });
+    }
 }
