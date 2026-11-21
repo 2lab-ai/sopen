@@ -2201,34 +2201,37 @@ fn a_letter_jumps_while_a_preview_shows() {
 /// "skipped", which nobody chose.
 #[test]
 fn closing_at_a_question_reports_the_item_as_cancelled() {
-    let mut fx = fixture();
-    let alpha = fx.other_into("alpha");
-    std::fs::write(format!("{alpha}/notes.txt"), "there\n").unwrap();
-    fx.select("notes.txt");
-    fx.key(Key::Space);
-    fx.key(Key::Space);
-    fx.key(Key::F5);
-    fx.key(Key::Enter);
-    fx.wait(|b| b.ops.holds_keyboard());
-    assert!(fx.drv.find_text("Name exists").is_some());
-    assert!(Window::close_requested(&mut fx.b));
-    let leftover = fx.b.leftover.clone();
-    let Fx { b, _tmp, .. } = fx;
-    drop(b);
-    let waited = leftover.borrow_mut().ops.take().and_then(ops::Ops::wait);
-    let lines = report_lines(&waited.expect("the operation was waited for"));
-    assert!(
-        lines.contains(&"notes.txt: cancelled: nothing of it was copied".to_string()),
-        "{lines:?}"
-    );
-    assert!(lines.iter().all(|l| !l.contains("skipped")), "{lines:?}");
-    assert!(
-        lines.contains(&"photo.png: not reached".to_string()),
-        "{lines:?}"
-    );
-    assert_eq!(
-        std::fs::read_to_string(format!("{alpha}/notes.txt")).unwrap(),
-        "there\n"
-    );
-    drop(_tmp);
+    // Bounded: a wait that never answered the question would block for ever.
+    bounded(60, || {
+        let mut fx = fixture();
+        let alpha = fx.other_into("alpha");
+        std::fs::write(format!("{alpha}/notes.txt"), "there\n").unwrap();
+        fx.select("notes.txt");
+        fx.key(Key::Space);
+        fx.key(Key::Space);
+        fx.key(Key::F5);
+        fx.key(Key::Enter);
+        fx.wait(|b| b.ops.holds_keyboard());
+        assert!(fx.drv.find_text("Name exists").is_some());
+        assert!(Window::close_requested(&mut fx.b));
+        let leftover = fx.b.leftover.clone();
+        let Fx { b, _tmp, .. } = fx;
+        drop(b);
+        let waited = leftover.borrow_mut().ops.take().and_then(ops::Ops::wait);
+        let lines = report_lines(&waited.expect("the operation was waited for"));
+        assert!(
+            lines.contains(&"notes.txt: cancelled: nothing of it was copied".to_string()),
+            "{lines:?}"
+        );
+        assert!(lines.iter().all(|l| !l.contains("skipped")), "{lines:?}");
+        assert!(
+            lines.contains(&"photo.png: not reached".to_string()),
+            "{lines:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(format!("{alpha}/notes.txt")).unwrap(),
+            "there\n"
+        );
+        drop(_tmp);
+    });
 }
