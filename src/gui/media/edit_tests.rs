@@ -699,12 +699,17 @@ fn a_drag_ending_on_a_frame_decodes_it_once() {
     fx.drv
         .drag_watching(&mut fx.win, PointerButton::Primary, a, b, |_| {
             calls += 1;
-            // After the press and the last of 8 moves: the first move's decode ends and the
-            // decoder takes the last move's ask, held, before the release asks again.
-            if calls == 9 {
-                wait_runs(&runs, 1);
-                drop(first.take());
-                wait_runs(&runs, 2);
+            match calls {
+                // After the press and the first move: the only ask yet is decoding, held
+                // through the other moves (however late the decoder took it).
+                2 => wait_runs(&runs, 1),
+                // After the last of 8 moves: that decode ends and the decoder takes the last
+                // move's ask, held, before the release asks again.
+                9 => {
+                    drop(first.take());
+                    wait_runs(&runs, 2);
+                }
+                _ => {}
             }
         });
     let end = fx.win.frame_at(fx.win.marks.t);
@@ -728,6 +733,7 @@ fn a_drag_ending_on_a_frame_decodes_it_once() {
     let at = format!("{:.6}", frame_slot(media.origin(), media.fps, end).0);
     let ran = std::fs::read_to_string(&runs).unwrap();
     let ran: Vec<&str> = ran.lines().collect();
+    assert_ne!(ran[0], at, "the first run is the first move's frame");
     assert_eq!(
         ran.iter().filter(|l| **l == at).count(),
         1,
@@ -841,6 +847,71 @@ fn a_frame_decoded_while_playing_is_not_shown_when_playback_ends() {
 #[test]
 fn a_frame_decoded_after_playback_ends_is_not_shown_at_its_end() {
     playback_over_a_decode(false);
+}
+
+/// One pass as a backend runs it: only `events` (without the modifier event every testkit
+/// pass starts with), the clock moved on by egui itself — so no testkit pass may follow.
+fn bare_pass(fx: &mut Fx, events: Vec<Event>) {
+    let raw = egui::RawInput {
+        screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(900.0, 520.0))),
+        events,
+        focused: true,
+        ..Default::default()
+    };
+    let win = &mut fx.win;
+    let mut out = fx.drv.ctx.run_ui(raw, |ui| crate::gui::Window::ui(win, ui));
+    // No renderer: the texture uploads are dropped on purpose, as the testkit's passes do.
+    out.textures_delta.clear();
+}
+
+/// A kept frame asked for by an edit or a click is on screen by the pass a real loop runs
+/// next, with nothing else asking for it. Cmd/Ctrl+X is handled before the window takes the
+/// pass's answer: the frame is on screen in that pass. A click on the timeline seeks at the end
+/// of its pass, after the take, so its answer waits for the next one — which egui runs after
+/// any pass with input (`InputState::wants_repaint_after`).
+#[test]
+fn a_kept_frame_asked_for_by_a_cut_or_a_click_is_shown_by_the_next_pass() {
+    let Some(mut fx) = video() else { return };
+    // Frames 0 (opened there) and 50 (the drag's end) are kept.
+    fx.drag(0.25, 0.5);
+    fx.settle();
+    // Cmd/Ctrl goes down (its own pass), then X: the cut alone.
+    fx.drv.frame(&mut fx.win, Vec::new(), command(false));
+    bare_pass(&mut fx, vec![Event::Cut]);
+    assert_eq!(fx.win.want, Some((1.0, 50)));
+    assert!(fx.win.frame_ready(), "cut: {:?}", fx.win.tex_at);
+    // From here every pass is bare (the testkit's clock is behind egui's now).
+    bare_pass(&mut fx, vec![key_up(Key::X)]);
+    bare_pass(&mut fx, vec![Event::ModifiersChanged(Modifiers::NONE)]);
+    let p = fx.at(0.0);
+    let button = |pressed| Event::PointerButton {
+        pos: p,
+        button: PointerButton::Primary,
+        pressed,
+        modifiers: Modifiers::NONE,
+    };
+    bare_pass(&mut fx, vec![Event::PointerMoved(p)]);
+    bare_pass(&mut fx, vec![button(true)]);
+    bare_pass(&mut fx, vec![button(false)]);
+    assert_eq!(fx.win.want, Some((0.0, 0)));
+    let waiting = fx
+        .win
+        .scrub
+        .as_ref()
+        .unwrap()
+        .result
+        .lock()
+        .unwrap()
+        .frame
+        .is_some();
+    assert!(
+        waiting && !fx.win.frame_ready(),
+        "answered after the take: {:?}",
+        fx.win.tex_at
+    );
+    assert!(fx.drv.ctx.has_requested_repaint(), "no pass is asked for");
+    bare_pass(&mut fx, Vec::new());
+    assert!(fx.win.frame_ready(), "click: {:?}", fx.win.tex_at);
 }
 
 /// At 30000/1001 fps (a frame time that is no round number), the paused frame at tick `k` and
