@@ -26,6 +26,8 @@ struct Net {
     lines: Arc<Mutex<Vec<String>>>,
     /// Why a new connection is refused, while one is.
     down: Arc<Mutex<Option<String>>>,
+    /// How often the Source asked for a new connection.
+    reopens: Arc<AtomicUsize>,
 }
 
 /// 06 §12's gate link: 20 ms and 5 MB/s, in simulated time.
@@ -67,11 +69,16 @@ fn net_polling(bytes: &[u8], link: Link, poll_every: Duration) -> Net {
         began: Instant::now(),
         sniff: 0,
     };
+    let reopens = Arc::new(AtomicUsize::new(0));
+    let opens = reopens.clone();
     let (source, engine) = Source::build(
         transport,
-        Box::new(move || match refused.lock().unwrap().clone() {
-            Some(why) => Err(anyhow::anyhow!(why)),
-            None => again.open(),
+        Box::new(move || {
+            opens.fetch_add(1, Ordering::SeqCst);
+            match refused.lock().unwrap().clone() {
+                Some(why) => Err(anyhow::anyhow!(why)),
+                None => again.open(),
+            }
         }),
         Arc::new(|| {}),
         opening,
@@ -83,6 +90,7 @@ fn net_polling(bytes: &[u8], link: Link, poll_every: Duration) -> Net {
         control,
         lines,
         down,
+        reopens,
     }
 }
 
@@ -159,6 +167,11 @@ impl Net {
                 _ => None,
             })
             .collect()
+    }
+
+    /// New connections the Source has asked for so far.
+    fn reopens(&self) -> usize {
+        self.reopens.load(Ordering::SeqCst)
     }
 
     fn requests(&self) -> usize {
@@ -1051,19 +1064,41 @@ fn highlighting_comes_back_after_the_stream_failed_under_the_worker() {
                 "{reason}"
             );
             assert!(says(&drv, &reason), "{:?}", painted(&drv));
-            // A key while the line is still down: it retries — its page is cached, so no read
-            // of its own asks — and the refusal is the reason shown.
+            // Whatever retry the worker's read left asked for is made now, with no input: the
+            // attempts counted from here on are the keys' own.
             net.advance(Duration::from_secs(2));
+            for _ in 0..3 {
+                drv.idle(&mut win, 1);
+                net.settle();
+            }
+            let attempts = net.reopens();
+            net.advance(Duration::from_secs(2));
+            for _ in 0..3 {
+                drv.idle(&mut win, 1);
+                net.settle();
+            }
+            assert_eq!(net.reopens(), attempts, "a pass retried by itself");
+            // A key while the line is still down: it retries — its page is cached, so no read
+            // of its own asks — once, and the refusal is the reason shown.
             drv.key(&mut win, Key::ArrowUp, Modifiers::NONE);
-            run(&mut drv, &mut win, &mut net, "the refusal", |_, d| {
-                says(d, "Connection refused")
-            });
+            net.settle();
+            assert_eq!(net.reopens(), attempts + 1, "the key's own attempt");
+            drv.idle(&mut win, 2);
             assert!(failed(&net).contains("Connection refused"));
+            assert!(says(&drv, "Connection refused"), "{:?}", painted(&drv));
             assert!(win.worker.is_none());
-            // The line is back; the next key retries.
+            // The line is back. Nothing retries until the next key, which makes a fresh attempt.
             *net.down.lock().unwrap() = None;
             net.advance(Duration::from_secs(2));
+            for _ in 0..3 {
+                drv.idle(&mut win, 1);
+                net.settle();
+            }
+            assert_eq!(net.reopens(), attempts + 1, "a pass retried by itself");
+            assert!(win.stream_down());
             drv.key(&mut win, Key::ArrowUp, Modifiers::NONE);
+            net.settle();
+            assert_eq!(net.reopens(), attempts + 2, "the second key's own attempt");
             run(
                 &mut drv,
                 &mut win,
@@ -2315,6 +2350,75 @@ fn a_plain_key_retries_after_a_failed_reload_and_shows_the_replacement() {
                 "{:?}",
                 painted(&drv)
             );
+        },
+    );
+}
+
+/// 06 §5: Cmd/Ctrl+R on a stream that has already failed is one reload, not a reload and a
+/// retry: when that reload fails, no reconnect attempt follows it until the next key.
+#[test]
+fn a_reload_of_a_failed_stream_that_fails_is_not_followed_by_a_retry() {
+    bounded(
+        "a_reload_of_a_failed_stream_that_fails_is_not_followed_by_a_retry",
+        || {
+            let body = numbered(40_000);
+            let mut net = net(body.as_bytes(), gate());
+            let mut win = TextWindow::new(
+                indexed(&net, body.as_bytes()),
+                "box:/remote/file".into(),
+                "big.log",
+                Vec::new(),
+            );
+            let mut drv = Driver::new(800.0, 500.0);
+            run(&mut drv, &mut win, &mut net, "the first screen", |w, _| {
+                w.ready()
+            });
+            net.settle();
+            let before = rows(&win);
+            // The line goes down under a read of the file's end.
+            *net.down.lock().unwrap() = Some("ssh: connect to host: Connection refused".into());
+            net.control.fault(net.requests(), Fault::Lost);
+            drv.key(&mut win, Key::End, command(false));
+            run(&mut drv, &mut win, &mut net, "the failure", |w, _| {
+                w.stream_down()
+            });
+            // What the failed read itself asked for is made, and refused.
+            net.advance(Duration::from_secs(2));
+            for _ in 0..3 {
+                drv.idle(&mut win, 1);
+                net.settle();
+            }
+            assert!(win.stream_down());
+            let attempts = net.reopens();
+            // Cmd/Ctrl+R: one attempt, refused.
+            net.advance(Duration::from_secs(2));
+            drv.key(&mut win, Key::R, command(false));
+            run(&mut drv, &mut win, &mut net, "the failed reload", |w, _| {
+                w.stream_down() && !w.reloading
+            });
+            let after_reload = net.reopens();
+            assert!(
+                after_reload <= attempts + 1,
+                "{attempts} then {after_reload}"
+            );
+            // Time passes, passes run: nothing more is attempted.
+            for _ in 0..3 {
+                net.advance(Duration::from_secs(2));
+                for _ in 0..3 {
+                    drv.idle(&mut win, 1);
+                    net.settle();
+                }
+            }
+            assert_eq!(
+                net.reopens(),
+                after_reload,
+                "a reconnect followed the failed reload with no key"
+            );
+            assert_eq!(rows(&win), before, "the page stays");
+            // The next key retries.
+            drv.key(&mut win, Key::ArrowDown, Modifiers::NONE);
+            net.settle();
+            assert_eq!(net.reopens(), after_reload + 1, "the key's own attempt");
         },
     );
 }

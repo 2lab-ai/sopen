@@ -3033,9 +3033,11 @@ impl TextWindow {
         // highlighter below starts on the new index).
         self.poll_reindex();
         self.poll_stream(&ctx);
-        if self.input && self.stream_down() {
+        if self.input && self.stream_down() && !self.reloading {
             // A key, a click or a scroll retries a failed stream (06 §5) — also one whose page
             // is cached, which reads without asking. At most one attempt a second is made.
+            // Not beside a reload (Cmd/Ctrl+R is its own attempt: a retry queued with it would
+            // follow a failed reload with no key pressed).
             if let Some(source) = self.doc.source() {
                 source.retry();
             }
