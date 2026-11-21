@@ -31,10 +31,36 @@ const BATCH_ITEMS: usize = 64;
 /// … this long after its first item, before any question, on Esc or Cancel, and at the end.
 const BATCH_AGE: std::time::Duration = std::time::Duration::from_secs(1);
 
-/// The most descriptors (pins) one operation holds at once on moved sources — a batch's items
-/// — so the copy itself never runs out of them; a source past it is known by its device, inode
-/// and status-change time instead.
+/// The most descriptors (pins) one operation holds at once on moved sources — a batch's items.
+/// A bound on what the operation itself holds, not a guarantee that the process never runs out
+/// of descriptors. A source past it, or one whose pin cannot be taken, is known by its device,
+/// inode and status-change time instead — best effort (the timestamp's precision, the clock).
 const PIN_BUDGET: usize = 64;
+
+/// The monotonic time a batch's age is measured on.
+#[cfg(not(test))]
+fn now() -> std::time::Instant {
+    std::time::Instant::now()
+}
+
+/// In tests the clock of a thread stands still until the test moves it ([`advance_clock`]): no
+/// test's batches depend on how long the filesystem took.
+#[cfg(test)]
+fn now() -> std::time::Instant {
+    CLOCK.with(|c| c.0 + c.1.get())
+}
+
+#[cfg(test)]
+thread_local! {
+    static CLOCK: (std::time::Instant, std::cell::Cell<std::time::Duration>) =
+        (std::time::Instant::now(), std::cell::Cell::new(std::time::Duration::ZERO));
+}
+
+/// Moves this thread's clock forward.
+#[cfg(test)]
+pub(super) fn advance_clock(by: std::time::Duration) {
+    CLOCK.with(|c| c.1.set(c.1.get() + by));
+}
 
 /// Highest `-N` suffix tried for a free name.
 const MAX_SUFFIX: u32 = 10_000;
@@ -298,11 +324,27 @@ struct Copied {
     /// inode cannot be freed and its number reused (ext4 does at once), so the name is the same
     /// file while it stays on that inode — whatever happens to the file's metadata, and to its
     /// other names (an unlink of one bumps the ctime of the rest). `None` past [`PIN_BUDGET`] or
-    /// where none can be had: then `id` in full is compared, the ctime included — a hard-linked
+    /// where none can be had: then `id` in full is compared, the ctime included (best effort:
+    /// as fine as the filesystem's timestamps) — a hard-linked
     /// sibling whose other name went first is kept, both copies said to exist (never lost).
     pin: Option<SourcePin>,
     /// A link's target text, as copied.
     target: Option<String>,
+    /// A move's copy as it was when it was checked: looked at again right before the source
+    /// goes, which a batch puts as much as [`BATCH_AGE`] later.
+    copy: Option<Box<CopyMark>>,
+}
+
+/// A published, checked copy and what its name is known by: on this machine its device, inode
+/// and status-change time; over SFTP, with no inode, its type, size and mtime.
+struct CopyMark {
+    path: String,
+    seen: Seen,
+}
+
+enum Seen {
+    Ident(Ident),
+    Stat(Stat),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -610,13 +652,15 @@ impl Engine<'_, '_, '_> {
             removal,
             touched: self.touched.clone(),
         });
-        self.batch_since.get_or_insert_with(std::time::Instant::now);
+        self.batch_since.get_or_insert_with(now);
     }
 
     fn batch_due(&self) -> bool {
         !self.pending.is_empty()
             && (self.pending.len() >= BATCH_ITEMS
-                || self.batch_since.is_some_and(|t| t.elapsed() >= BATCH_AGE))
+                || self
+                    .batch_since
+                    .is_some_and(|t| now().duration_since(t) >= BATCH_AGE))
     }
 
     /// The batch: one barrier over every folder its items' copies went into — failing, none of
@@ -1133,12 +1177,13 @@ impl Engine<'_, '_, '_> {
         if let Err(why) = self.is_staged(&target, staged.id_now()) {
             return Placed::Failed(why);
         }
-        let copied = Copied {
+        let mut copied = Copied {
             name: want,
             before,
             id,
             pin,
             target: None,
+            copy: None,
         };
         if mv {
             let sent = read.or(staged.sha256);
@@ -1183,19 +1228,82 @@ impl Engine<'_, '_, '_> {
                     return Placed::Failed(format!("{why}; {what}"));
                 }
             }
+            match self.mark_copy(&target, staged.id_now()) {
+                Ok(mark) => copied.copy = Some(Box::new(mark)),
+                Err(why) => return Placed::Keep(format!("{why}; {shown} stays")),
+            }
         }
         Placed::At(copied)
+    }
+
+    /// What the checked copy at `path` is known by until its source goes ([`CopyMark`]); `own`
+    /// is the inode it was written through, where there is one.
+    fn mark_copy(&mut self, path: &str, own: Option<(u64, u64)>) -> Result<CopyMark, String> {
+        let changed = || format!("the copy at {path} changed right after it was checked");
+        let seen = match self.ends.dst().identity(path, false) {
+            Ok(Some(now)) if own.is_none_or(|own| own == now.inode()) => Seen::Ident(now),
+            Ok(Some(_)) | Err(_) => return Err(changed()),
+            Ok(None) => match self.ends.dst().lstat_opt(path) {
+                Ok(Some(now)) => Seen::Stat(now),
+                _ => return Err(changed()),
+            },
+        };
+        Ok(CopyMark {
+            path: path.to_string(),
+            seen,
+        })
+    }
+
+    /// Is a moved item's copy still what was checked? Asked right before its source goes. On
+    /// this machine by device, inode and status-change time (best effort, as every comparison
+    /// without a held descriptor: a change of its metadata keeps the source too — the safe
+    /// side); over SFTP by type, size and mtime. Why not, if not.
+    fn copy_still(&mut self, copied: &Copied) -> Result<(), String> {
+        let Some(mark) = &copied.copy else {
+            return Ok(());
+        };
+        let same = match &mark.seen {
+            Seen::Ident(was) => {
+                matches!(self.ends.dst().identity(&mark.path, false), Ok(Some(now)) if now == *was)
+            }
+            Seen::Stat(was) => match self.ends.dst().lstat_opt(&mark.path) {
+                Ok(Some(now)) => {
+                    Kind::of(&now) == Kind::of(was)
+                        && now.size == was.size
+                        && now.mtime == was.mtime
+                }
+                _ => false,
+            },
+        };
+        if same {
+            return Ok(());
+        }
+        Err(format!(
+            "its copy at {} changed before the source was removed; the source stays",
+            mark.path
+        ))
     }
 
     /// Is `path` still the file the copy was written through? On this machine by its inode, as
     /// the held descriptor reports it now ([`Staged::id_now`]): sound while the descriptor is open
     /// (its inode cannot be freed and its number reused), and right on a volume whose inode
     /// numbers follow a rename (an empty file on FAT or exFAT); a failure to read it is a no (fail
-    /// closed). Over SFTP there is no inode (`id` is `None`): taken to be, as for every SFTP
-    /// name.
+    /// closed). Over SFTP there is no inode (`id` is `None`, and the host has none to give):
+    /// taken to be, as for every SFTP name. On this machine a copy whose identity was never read
+    /// (its `fstat` failed) is not known again: it is left and named, never removed by its name.
     fn is_staged(&mut self, path: &str, id: Option<(u64, u64)>) -> Result<(), String> {
         let Some(id) = id else {
-            return Ok(());
+            return match self.ends.dst().identity(path, false) {
+                Ok(None) => Ok(()),
+                Ok(Some(_)) => Err(format!(
+                    "{path} cannot be confirmed as the copy sopen made (its identity could not \
+                     be read when it was created); it is left as it is"
+                )),
+                Err(e) => Err(format!(
+                    "{path} cannot be confirmed as the copy sopen made ({e:#}); it is left as \
+                     it is"
+                )),
+            };
         };
         match self.ends.dst().identity(path, false) {
             Ok(Some(now)) if now.inode() == id => Ok(()),
@@ -1482,15 +1590,24 @@ impl Engine<'_, '_, '_> {
                 Err(e) => return Placed::Failed(format!("{e:#}")),
             }
         };
-        let copied = Copied {
+        let mut copied = Copied {
             name: want,
             before,
             id,
             pin,
             target: Some(target.clone()),
+            copy: None,
         };
         let how = match self.still(from, &copied) {
-            Still::Same => return Placed::At(copied),
+            Still::Same => {
+                if self.job.op == Op::Move {
+                    match self.mark_copy(&made, None) {
+                        Ok(mark) => copied.copy = Some(Box::new(mark)),
+                        Err(why) => return Placed::Keep(format!("{why}; {shown} stays")),
+                    }
+                }
+                return Placed::At(copied);
+            }
             Still::Gone => "it was removed".to_string(),
             Still::Changed(how) => how,
         };
@@ -1566,6 +1683,9 @@ impl Engine<'_, '_, '_> {
         } else {
             format!(" (copied as {})", copied.name)
         };
+        if let Err(why) = self.copy_still(copied) {
+            return ItemOutcome::Failed(format!("{name}: {why}"));
+        }
         match self.still(from, copied) {
             Still::Same => {}
             // Nothing to remove: the move is done.
@@ -1803,17 +1923,20 @@ impl Engine<'_, '_, '_> {
                 (Kind::Dir, _) if blocked.contains(&node.rel) => Some(None),
                 (Kind::Dir, _) => match self.ends.src().remove_dir(&path) {
                     Ok(()) => None,
-                    Err(e) => Some(Some(format!("{e:#}"))),
+                    Err(e) => Some(Some(format!("{e:#}; both copies exist"))),
                 },
-                (Kind::File | Kind::Link, Some(c)) => match self.still(&path, c) {
-                    Still::Same => match self.ends.src().remove(&path) {
-                        Ok(()) => None,
-                        Err(e) => Some(Some(format!("{e:#}"))),
+                (Kind::File | Kind::Link, Some(c)) => match self.copy_still(c) {
+                    Err(why) => Some(Some(why)),
+                    Ok(()) => match self.still(&path, c) {
+                        Still::Same => match self.ends.src().remove(&path) {
+                            Ok(()) => None,
+                            Err(e) => Some(Some(format!("{e:#}; both copies exist"))),
+                        },
+                        Still::Gone => None,
+                        Still::Changed(how) => Some(Some(format!(
+                            "changed after it was copied ({how}); both copies exist"
+                        ))),
                     },
-                    Still::Gone => None,
-                    Still::Changed(how) => {
-                        Some(Some(format!("changed after it was copied ({how})")))
-                    }
                 },
                 // Skipped entries were never copied: they stay, listed already.
                 _ => Some(None),
@@ -1824,7 +1947,7 @@ impl Engine<'_, '_, '_> {
                 blocked.insert(up.to_string());
             }
             if let Some(why) = why {
-                let line = ItemOutcome::Failed(format!("{why}; both copies exist"));
+                let line = ItemOutcome::Failed(why);
                 self.line(format!("{name}/{}", node.rel), line);
             }
         }

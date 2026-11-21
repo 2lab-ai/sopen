@@ -177,11 +177,23 @@ contexts where it acts (list, viewer, git panel, tree, a dialog) and its `Comman
   file at once (ext4 does), so a number alone proves nothing: **the source's descriptor is held open
   from the moment it was read until its removal** — on the entry itself, never what a link points at
   (`O_PATH|O_NOFOLLOW` on Linux; a read-only `O_NOFOLLOW|O_NONBLOCK` open, `O_SYMLINK` for a link,
-  on macOS) — and the name is compared with `fstat` of that descriptor. An operation holds at most 64 at
-  once, so the copy itself never runs out of descriptors. Past that, or where none can be had (too many
-  open files, an entry the account cannot open), the device, inode and status-change time (ctime)
-  are compared instead: unlinking one hard link of a file changes the ctime of the others, so a
-  hard-linked sibling is then kept with both copies said to exist — never lost. The same holds for a
+  on macOS) — and the name is compared with `fstat` of that descriptor. The descriptor is taken only
+  of the entry whose identity was read, in full (device, inode and ctime, compared when the name is
+  looked at again and once more on the opened descriptor): an entry put under the name in between,
+  on the same inode number or not, is not held as if it were the one read, and the source is then
+  kept with "another file has its name now". Only a regular file or a link is ever opened for this:
+  opening a device, a fifo or a socket can have effects of its own. An operation holds at most 64
+  such descriptors at once — a bound on what it holds itself, not a promise that the process never
+  runs out of descriptors. Past that, or where none can be had (too many open files, an entry the
+  account cannot open, another type of entry), the device, inode and status-change time (ctime) are
+  compared instead. That comparison is best effort — as fine as the filesystem's timestamps and as
+  true as its clock — and errs to keeping: unlinking one hard link of a file changes the ctime of
+  the others, so a hard-linked sibling is then kept with both copies said to exist — never lost.
+  **The copy is looked at again too**, right before its source goes (a batch puts that as much as
+  1 s after the check): its name must still be the file that was checked — locally the same device,
+  inode and ctime, over SFTP the same type, size and mtime. A copy that is gone or replaced keeps
+  its source: "its copy at <path> changed before the source was removed; the source stays". The
+  same holds for a
   copy's own temp (the descriptor it was written through stays open through the read-back and any
   cleanup) and for the old name of a link-and-unlink rename (§5.6). What is compared is what the
   descriptor reports at that moment, never a number noted earlier: on FAT and exFAT an empty file's
@@ -233,10 +245,14 @@ contexts where it acts (list, viewer, git panel, tree, a dialog) and its `Comman
   copied and checked**: for a selected folder, every file below it first, then the source removed
   bottom-up.
   A stop or a failure during the copy removes no source at all (committed copies stay and the report
-  says the target folder is partial). Esc after an item was copied and checked does not cut its
-  removal short: the batch's barrier ran, and those items finish moving (the sources are removed
-  bottom-up, each checked again); Esc then stops what was not yet copied. A source that cannot be
-  removed after its copy stays, and the report says both copies exist.
+  says the target folder is partial). **Esc and the batch**: Esc flushes the batch — its barrier
+  runs, and then the removals of that flushed batch run to their end; **Esc during those removals
+  does not stop them**, because every item in the batch was already copied, read back and made
+  durable by that barrier (each source and each copy is still checked again right before the
+  removal, and a folder's sources go bottom-up). **An item that is not in a flushed batch keeps its
+  source**: the one Esc interrupted (its copy, if published, is reported with both copies in place)
+  and every item not reached. A source that cannot be removed after its copy stays, and the report
+  says both copies exist.
 
 ### 5.3 Rename (F2, Shift+F6)
 

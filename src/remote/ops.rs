@@ -33,7 +33,9 @@ pub struct FileMeta {
 }
 
 /// An entry's identity on this machine: its device and inode — and its status-change time, which
-/// a new file given a freed inode's number (ext4 reuses one at once) does not share.
+/// a new file given a freed inode's number (ext4 reuses one at once) will as a rule not share.
+/// Compared without a held descriptor ([`Pin`]) this is best effort: it is as fine as the
+/// filesystem's timestamps and as true as its clock.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Ident {
     pub dev: u64,

@@ -635,50 +635,6 @@ impl SftpRemote {
     pub(crate) fn offers_copy_data(&self) -> bool {
         self.sftp.as_ref().is_some_and(|s| s.support_copy())
     }
-
-    /// [`SftpRemote::local_server`] with `args` for the server (`-P copy-data` to refuse a
-    /// request) and, with `log`, its log (`-e -l INFO`: one line per request, as OpenSSH words
-    /// it) written to that file — the request log 04 §8 checks for `posix-rename`.
-    pub(crate) fn local_server_with(args: &[&str], log: Option<&std::path::Path>) -> Option<Self> {
-        use std::process::Stdio;
-        let Some(server) = super::SFTP_SERVERS
-            .iter()
-            .find(|p| std::path::Path::new(p).exists())
-        else {
-            return Self::local_server();
-        };
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        let sftp = rt.block_on(async {
-            let mut cmd = tokio::process::Command::new(server);
-            cmd.stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .kill_on_drop(true);
-            if let Some(log) = log {
-                cmd.args(["-e", "-l", "INFO"])
-                    .stderr(Stdio::from(std::fs::File::create(log).unwrap()));
-            }
-            // After the log's: a test's own `-l DEBUG1` wins.
-            cmd.args(args);
-            let mut child = cmd.spawn().unwrap();
-            let (stdin, stdout) = (child.stdin.take().unwrap(), child.stdout.take().unwrap());
-            let keep = openssh_sftp_client::SftpAuxiliaryData::Boxed(Box::new(
-                std::sync::Mutex::new(child),
-            ));
-            Sftp::new_with_auxiliary(stdin, stdout, Default::default(), keep)
-                .await
-                .unwrap()
-        });
-        let fs = sftp.fs();
-        Some(Self {
-            rt,
-            sftp: Some(sftp),
-            fs: Some(fs),
-            stats: 0,
-        })
-    }
 }
 
 #[cfg(test)]

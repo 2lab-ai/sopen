@@ -183,44 +183,44 @@ impl Control for Script {
 }
 
 /// Answers a rename before it reaches the disk (`None`: let it through).
-type RenameHook<'a> = Box<dyn FnMut(&str, &str) -> Option<anyhow::Result<Renamed>> + 'a>;
+type RenameHook<'a> = Box<dyn FnMut(&str, &str) -> Option<anyhow::Result<Renamed>> + Send + 'a>;
 /// Runs right after a rename that went through.
-type RenamedHook<'a> = Box<dyn FnMut(&str, &str) + 'a>;
+type RenamedHook<'a> = Box<dyn FnMut(&str, &str) + Send + 'a>;
 /// Fails a file's copy, by its source path (`None`: let it through).
-type CopyHook<'a> = Box<dyn FnMut(&str) -> Option<anyhow::Error> + 'a>;
+type CopyHook<'a> = Box<dyn FnMut(&str) -> Option<anyhow::Error> + Send + 'a>;
 /// Edits a folder's listing.
-type ListHook<'a> = Box<dyn FnMut(&str, &mut Vec<String>) + 'a>;
+type ListHook<'a> = Box<dyn FnMut(&str, &mut Vec<String>) + Send + 'a>;
 /// Runs right after a same-host copy into its temp succeeded, with the temp's path.
-type CopiedHook<'a> = Box<dyn FnMut(&str) + 'a>;
+type CopiedHook<'a> = Box<dyn FnMut(&str) + Send + 'a>;
 /// Fails a call before it reaches the disk, by the call's name and its first path (`None`: let
 /// it through) — also where a test does something at that exact step.
-type FaultHook<'a> = Box<dyn FnMut(&str, &str) -> Option<anyhow::Error> + 'a>;
+type FaultHook<'a> = Box<dyn FnMut(&str, &str) -> Option<anyhow::Error> + Send + 'a>;
 /// Runs right after a call went through, by the call's name and its first path.
-type AfterHook<'a> = Box<dyn FnMut(&str, &str) + 'a>;
+type AfterHook<'a> = Box<dyn FnMut(&str, &str) + Send + 'a>;
 /// A file's inode and SHA-256: what proves it untouched.
 type Ident = (u64, [u8; 32]);
 /// A change made to a file at a test's step.
-type Change = dyn Fn(&Path);
+type Change = fn(&Path);
 /// One file layer, owned.
-type Layer = Box<dyn FileOps>;
+type Layer = Box<dyn FileOps + Send>;
 /// Opens a file layer, or `None` where it is missing (no `sftp-server`).
-type Opener = Box<dyn FnMut() -> Option<Box<dyn FileOps>>>;
+type Opener = Box<dyn FnMut() -> Option<Layer>>;
 
 /// A file layer that hands every call to `inner`, with faults and hooks (04 §8's "fault-injecting
 /// file layer"): a rename answered or failed before it reaches the disk, something done right
 /// after a rename (a publish, a move), a file's copy failed, a listing edited, a `realpath` that
 /// resolves nothing, a server without `hardlink@openssh.com`.
-struct Faulty<'a> {
-    inner: &'a mut dyn FileOps,
-    rename: RenameHook<'a>,
-    renamed: RenamedHook<'a>,
-    copy: CopyHook<'a>,
-    copied: CopiedHook<'a>,
-    list: ListHook<'a>,
+struct Faulty {
+    inner: Layer,
+    rename: RenameHook<'static>,
+    renamed: RenamedHook<'static>,
+    copy: CopyHook<'static>,
+    copied: CopiedHook<'static>,
+    list: ListHook<'static>,
     /// `identity`, `lstat`, `remove`, `remove_dir`, `list_entries`.
-    fault: FaultHook<'a>,
+    fault: FaultHook<'static>,
     /// `make_symlink` (its link), `set_meta`, `read_to`, `open_read`.
-    after: AfterHook<'a>,
+    after: AfterHook<'static>,
     plain_realpath: bool,
     no_link: bool,
     /// A lower [`RemoteFs::hash_check_limit`].
@@ -247,8 +247,13 @@ struct Faulty<'a> {
     pinned: Arc<AtomicUsize>,
 }
 
-impl<'a> Faulty<'a> {
-    fn new(inner: &'a mut dyn FileOps) -> Self {
+impl Faulty {
+    /// The layer back, for the next step of a test.
+    fn into_inner(self) -> Layer {
+        self.inner
+    }
+
+    fn new(inner: Layer) -> Self {
         Self {
             inner,
             rename: Box::new(|_, _| None),
@@ -273,13 +278,13 @@ impl<'a> Faulty<'a> {
     }
 }
 
-impl Faulty<'_> {
+impl Faulty {
     fn log(&self, event: String) {
         self.trace.lock().unwrap().push(event);
     }
 }
 
-impl RemoteFs for Faulty<'_> {
+impl RemoteFs for Faulty {
     fn stat_opt(&mut self, path: &str) -> anyhow::Result<Option<Stat>> {
         self.inner.stat_opt(path)
     }
@@ -320,6 +325,7 @@ impl RemoteFs for Faulty<'_> {
         progress: &mut dyn FnMut(u64),
     ) -> anyhow::Result<u64> {
         let read = self.inner.read_to(path, out, progress)?;
+        self.log(format!("read:{path}"));
         (self.after)("read_to", path);
         Ok(read)
     }
@@ -360,7 +366,7 @@ impl RemoteFs for Faulty<'_> {
     }
 }
 
-impl FileOps for Faulty<'_> {
+impl FileOps for Faulty {
     fn identity(
         &mut self,
         path: &str,
@@ -583,10 +589,10 @@ fn payloads(dir: &Path, files: &[&str]) -> Vec<[u8; 32]> {
 }
 
 /// Runs `test` on this machine's file layer, then through a local `sftp-server`.
-fn both(test: impl Fn(&mut dyn FileOps, &str)) {
-    test(&mut LocalFs::new(), "local");
-    if let Some(mut sftp) = SftpRemote::local_server() {
-        test(&mut sftp, "sftp");
+fn both(test: impl Fn(Layer, &str)) {
+    test(Box::new(LocalFs::new()), "local");
+    if let Some(sftp) = SftpRemote::local_server() {
+        test(Box::new(sftp), "sftp");
     }
 }
 
@@ -620,7 +626,7 @@ fn valid_names() {
 /// K-C1: the copy has the same bytes, mode and mtime; the source is unchanged; no temp is left.
 #[test]
 fn k_c1_a_copied_file_keeps_bytes_mode_and_mtime() {
-    both(|fs, how| {
+    both(|mut fs, how| {
         let (_t, src, dst) = scratch();
         let a = src.join("a.txt");
         std::fs::write(&a, b"hello copy").unwrap();
@@ -630,7 +636,7 @@ fn k_c1_a_copied_file_keeps_bytes_mode_and_mtime() {
         let mut ctl = Script::default();
         let report = run(
             &job(Op::Copy, &src, &["a.txt"], &dst),
-            Hosts::Same(fs),
+            Hosts::Same(&mut *fs),
             &mut ctl,
         );
         assert_eq!(
@@ -652,7 +658,7 @@ fn k_c1_a_copied_file_keeps_bytes_mode_and_mtime() {
 /// file's inode and content never change. "The same for the rest" answers every later clash.
 #[test]
 fn k_c2_a_name_in_the_way_is_never_overwritten() {
-    both(|fs, how| {
+    both(|mut fs, how| {
         let (_t, src, dst) = scratch();
         std::fs::write(src.join("a.txt"), "new a").unwrap();
         std::fs::write(src.join("b.txt"), "new b").unwrap();
@@ -736,7 +742,7 @@ fn k_c2_a_name_in_the_way_is_never_overwritten() {
 /// is skipped and listed under its path.
 #[test]
 fn k_c3_a_folder_copies_files_subfolders_and_links_and_skips_a_fifo() {
-    both(|fs, how| {
+    both(|mut fs, how| {
         let (_t, src, dst) = scratch();
         let d = src.join("d");
         std::fs::create_dir_all(d.join("sub")).unwrap();
@@ -749,7 +755,7 @@ fn k_c3_a_folder_copies_files_subfolders_and_links_and_skips_a_fifo() {
         let mut ctl = Script::default();
         let r = run(
             &job(Op::Copy, &src, &["d"], &dst),
-            Hosts::Same(fs),
+            Hosts::Same(&mut *fs),
             &mut ctl,
         );
         assert_eq!(
@@ -877,9 +883,8 @@ fn k_c4_a_local_copy_stopped_leaves_no_file_and_no_temp() {
 fn k_c4_without_hardlink_copy_and_move_are_refused() {
     let (_t, src, dst) = scratch();
     std::fs::write(src.join("a"), "a").unwrap();
-    let mut local = LocalFs::new();
     for op in [Op::Copy, Op::Move] {
-        let mut fs = Faulty::new(&mut local);
+        let mut fs = Faulty::new(Box::new(LocalFs::new()));
         fs.no_link = true;
         let r = run(
             &job(op, &src, &["a"], &dst),
@@ -959,7 +964,7 @@ fn an_empty_file_copies_on_every_path() {
         (
             "streamed",
             Box::new(|| {
-                SftpRemote::local_server_with(&["-P", "copy-data"], None).map(|f| Box::new(f) as _)
+                SftpRemote::local_server_args(&["-P", "copy-data"], None).map(|f| Box::new(f) as _)
             }),
         ),
     ];
@@ -1013,7 +1018,7 @@ fn k_m1_a_local_move_within_a_filesystem_keeps_the_inode() {
 
 /// The request log of a local `sftp-server` (`-e -l INFO`).
 fn logged_server(log: &Path, args: &[&str]) -> Option<SftpRemote> {
-    SftpRemote::local_server_with(args, Some(log))
+    SftpRemote::local_server_args(args, Some(log))
 }
 
 /// K-M1 through `sftp-server`: a regular file moves by `hardlink@openssh.com` then `REMOVE` (the
@@ -1339,14 +1344,13 @@ fn k_n1_a_case_only_rename_on_a_case_insensitive_filesystem() {
 
     // "Exists" for the other spelling, then the second step fails.
     let readme_s = s(&readme);
-    let calls = AtomicUsize::new(0);
-    let fail_back = AtomicBool::new(false);
-    let mut local = LocalFs::new();
-    let mut run_with_faults = |back_fails: bool| {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let fail_back = Arc::new(AtomicBool::new(false));
+    let run_with_faults = |back_fails: bool| {
         calls.store(0, Ordering::Relaxed);
         fail_back.store(back_fails, Ordering::Relaxed);
-        let mut fs = Faulty::new(&mut local);
-        let (calls, fail_back, readme) = (&calls, &fail_back, readme_s.clone());
+        let mut fs = Faulty::new(Box::new(LocalFs::new()));
+        let (calls, fail_back, readme) = (calls.clone(), fail_back.clone(), readme_s.clone());
         fs.rename = Box::new(
             move |from, to| match calls.fetch_add(1, Ordering::Relaxed) {
                 0 => Some(Err(taken(to))),
@@ -1444,7 +1448,7 @@ fn k_n1_a_remote_rename() {
         assert!(names(&src).contains(&"README".to_string()), "{r:?}");
         std::fs::rename(src.join("README"), src.join("readme")).unwrap();
         // A listing that also holds the new spelling: another entry, so an error.
-        let mut fs = Faulty::new(&mut sftp);
+        let mut fs = Faulty::new(Box::new(sftp));
         fs.list = Box::new(|_, names| names.push("README".into()));
         let r = run(
             &rename("readme", "README"),
@@ -1453,6 +1457,8 @@ fn k_n1_a_remote_rename() {
         );
         assert!(failed(&r).contains("exists"), "{r:?}");
         assert!(names(&src).contains(&"readme".to_string()));
+        // The server ends with its session: its log is complete.
+        drop(fs);
     } else {
         // A case-sensitive server: README beside readme is another entry.
         std::fs::write(src.join("readme"), "r").unwrap();
@@ -1464,8 +1470,8 @@ fn k_n1_a_remote_rename() {
         );
         assert!(failed(&r).contains("exists"), "{r:?}");
         assert_eq!(std::fs::read(src.join("README")).unwrap(), b"R");
+        drop(sftp);
     }
-    drop(sftp);
     let text = std::fs::read_to_string(&log).unwrap();
     assert!(text.contains("hardlink old"), "{text}");
     assert!(text.contains("remove name"), "{text}");
@@ -1477,7 +1483,7 @@ fn k_n1_a_remote_rename() {
 /// it, or (locally) where only the device and inode tell — is refused before anything happens.
 #[test]
 fn k_e1_a_folder_into_itself_is_refused() {
-    both(|inner, how| {
+    both(|mut inner, how| {
         let (_t, src, dst) = scratch();
         let d = src.join("d");
         std::fs::create_dir_all(d.join("sub")).unwrap();
@@ -1511,8 +1517,7 @@ fn k_e1_a_folder_into_itself_is_refused() {
     let d = src.join("d");
     std::fs::create_dir_all(d.join("sub")).unwrap();
     std::os::unix::fs::symlink(&d, dst.join("alias")).unwrap();
-    let mut local = LocalFs::new();
-    let mut fs = Faulty::new(&mut local);
+    let mut fs = Faulty::new(Box::new(LocalFs::new()));
     fs.plain_realpath = true;
     let r = run(
         &job(Op::Copy, &src, &["d"], &dst.join("alias/sub")),
@@ -1527,7 +1532,7 @@ fn k_e1_a_folder_into_itself_is_refused() {
 #[test]
 fn k_e1_unicode_equivalent_names_are_decided_by_the_filesystem() {
     let (nfc, nfd) = ("\u{e9}.txt", "e\u{301}.txt");
-    both(|fs, how| {
+    both(|mut fs, how| {
         let (_t, src, dst) = scratch();
         std::fs::write(src.join(nfc), "nfc").unwrap();
         std::fs::write(dst.join(nfd), "nfd").unwrap();
@@ -1535,7 +1540,7 @@ fn k_e1_unicode_equivalent_names_are_decided_by_the_filesystem() {
         let mut ctl = Script::answers([reply(Answer::Skip)]);
         let r = run(
             &job(Op::Copy, &src, &[nfc], &dst),
-            Hosts::Same(fs),
+            Hosts::Same(&mut *fs),
             &mut ctl,
         );
         if normalising {
@@ -1555,7 +1560,7 @@ fn k_e1_unicode_equivalent_names_are_decided_by_the_filesystem() {
 /// contents; a read-only target folder fails the item with the server's reason.
 #[test]
 fn k_e1_read_only_folders() {
-    both(|fs, how| {
+    both(|mut fs, how| {
         let (_t, src, dst) = scratch();
         let ro = src.join("ro");
         std::fs::create_dir(&ro).unwrap();
@@ -1597,7 +1602,7 @@ fn k_e1_read_only_folders() {
 /// K-E1: a server refusing to set times (and modes) still copies; each refusal is a note.
 #[test]
 fn k_e1_a_server_refusing_to_set_times_still_copies_with_a_note() {
-    let Some(mut fs) = SftpRemote::local_server_with(&["-P", "setstat,fsetstat"], None) else {
+    let Some(mut fs) = SftpRemote::local_server_args(&["-P", "setstat,fsetstat"], None) else {
         return;
     };
     let (_t, src, dst) = scratch();
@@ -1777,7 +1782,7 @@ fn a_name_taken_at_the_publish_asks_and_never_overwrites() {
 /// appears between the look and the rename is the filesystem's "exists" — never replaced.
 #[test]
 fn a_move_never_replaces_a_name_in_the_way() {
-    both(|inner, how| {
+    both(|mut inner, how| {
         let (_t, src, dst) = scratch();
         std::fs::write(src.join("a"), "mine").unwrap();
         std::fs::write(dst.join("a"), "theirs").unwrap();
@@ -1801,7 +1806,7 @@ fn a_move_never_replaces_a_name_in_the_way() {
         // The racer: `b` appears at the target right before the rename reaches the disk.
         std::fs::write(src.join("b"), "mine").unwrap();
         let racer = dst.join("b");
-        let mut fs = Faulty::new(&mut *inner);
+        let mut fs = Faulty::new(inner);
         let (from, at) = (s(&src.join("b")), racer.clone());
         fs.rename = Box::new(move |f, _| {
             if f == from && !at.exists() {
@@ -1829,8 +1834,7 @@ fn a_local_source_replaced_by_a_lookalike_is_kept() {
     let (_t, src, dst) = scratch();
     let f = src.join("f");
     std::fs::write(&f, "same").unwrap();
-    let mut local = LocalFs::new();
-    let mut fs = Faulty::new(&mut local);
+    let mut fs = Faulty::new(Box::new(LocalFs::new()));
     let (path, twin) = (f.clone(), src.join("twin"));
     fs.renamed = Box::new(move |_, _| {
         let mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
@@ -1868,8 +1872,7 @@ fn a_moved_source_gone_before_its_check_is_no_verified_move() {
     let (_t, src, dst) = scratch();
     let f = src.join("f");
     std::fs::write(&f, "x").unwrap();
-    let mut local = LocalFs::new();
-    let mut fs = Faulty::new(&mut local);
+    let mut fs = Faulty::new(Box::new(LocalFs::new()));
     let path = f.clone();
     fs.renamed = Box::new(move |_, _| std::fs::remove_file(&path).unwrap());
     // Streamed: a host-made copy is read back first, and a source gone then is no verified move
@@ -1899,7 +1902,7 @@ fn a_moved_source_gone_before_its_check_is_no_verified_move() {
 /// with the reason.
 #[test]
 fn k_c4_a_server_hiding_hardlink_refuses_copy_and_move() {
-    let Some(mut fs) = SftpRemote::local_server_with(&["-P", "hardlink"], None) else {
+    let Some(mut fs) = SftpRemote::local_server_args(&["-P", "hardlink"], None) else {
         return;
     };
     assert!(!fs.can_link(), "-P hides the extension");
@@ -1952,7 +1955,7 @@ fn k_m1_a_remote_link_refused_for_permission_leaves_the_file_with_the_reason() {
 /// [`an_empty_file_copies_on_every_path`] is the copy through sopen of a server without it.
 #[test]
 fn a_server_refusing_copy_data_does_not_advertise_it() {
-    let Some(fs) = SftpRemote::local_server_with(&["-P", "copy-data"], None) else {
+    let Some(fs) = SftpRemote::local_server_args(&["-P", "copy-data"], None) else {
         return;
     };
     assert!(!fs.offers_copy_data());
@@ -2183,8 +2186,7 @@ fn r3_a_local_source_without_an_identity_is_not_moved() {
     let (_t, src, dst) = scratch();
     std::fs::write(src.join("f"), "f").unwrap();
     std::os::unix::fs::symlink("f", src.join("l")).unwrap();
-    let mut local = LocalFs::new();
-    let mut fs = Faulty::new(&mut local);
+    let mut fs = Faulty::new(Box::new(LocalFs::new()));
     fs.rename = no_rename_from(&[&src.join("f"), &src.join("l")]);
     let blind = [s(&src.join("f")), s(&src.join("l"))];
     fs.fault = Box::new(move |op, path| {
@@ -2209,7 +2211,7 @@ fn r3_a_local_source_without_an_identity_is_not_moved() {
 
 /// A moved file whose host-made copy (`copy_file_range`, `copy-data`) is corrupted
 /// in its temp: the size check passes, the bytes do not.
-fn corrupt_the_copy(fs: &mut Faulty<'_>, f: &Path) {
+fn corrupt_the_copy(fs: &mut Faulty, f: &Path) {
     fs.rename = no_rename_from(&[f]);
     fs.copied = Box::new(|temp| {
         let len = std::fs::metadata(temp).unwrap().len() as usize;
@@ -2293,8 +2295,7 @@ fn r5_a_rename_onto_another_hard_link_of_it_changes_nothing() {
         std::fs::write(src.join(from), "one file").unwrap();
         std::fs::hard_link(src.join(from), src.join(to)).unwrap();
         let calls = Arc::new(AtomicUsize::new(0));
-        let mut local = LocalFs::new();
-        let mut fs = Faulty::new(&mut local);
+        let mut fs = Faulty::new(Box::new(LocalFs::new()));
         let counted = calls.clone();
         fs.rename = Box::new(move |_, _| {
             counted.fetch_add(1, Ordering::Relaxed);
@@ -2355,7 +2356,7 @@ fn r6_a_local_folder_without_the_exclusive_rename_moves_by_copy() {
 /// Finding 7: Esc while the name-in-the-way dialog is open (its answer Rename) moves nothing.
 #[test]
 fn r7_esc_at_a_clash_moves_nothing() {
-    both(|fs, how| {
+    both(|mut fs, how| {
         let (_t, src, dst) = scratch();
         std::fs::write(src.join("a"), "mine").unwrap();
         std::fs::write(dst.join("a"), "theirs").unwrap();
@@ -2365,7 +2366,7 @@ fn r7_esc_at_a_clash_moves_nothing() {
         };
         let r = run(
             &job(Op::Move, &src, &["a"], &dst),
-            Hosts::Same(fs),
+            Hosts::Same(&mut *fs),
             &mut ctl,
         );
         assert_eq!(r.items.len(), 1, "{how}: {r:?}");
@@ -2415,20 +2416,20 @@ fn r10_a_hard_link_refused_for_permission_tries_no_copy() {
 /// item with the reason; no final name and no temp are left, and a move keeps the source.
 #[test]
 fn r11_a_source_changed_during_its_copy_fails_the_item() {
-    both(|inner, how| {
+    both(|mut inner, how| {
         let grow = |f: &Path| {
             let mut file = std::fs::OpenOptions::new().append(true).open(f).unwrap();
             file.write_all(b" and more").unwrap();
         };
         let touch = |f: &Path| set_mtime(f, 1_700_000_000);
-        let changes: [(&str, &Change); 2] = [("size", &grow), ("mtime", &touch)];
+        let changes: [(&str, Change); 2] = [("size", grow), ("mtime", touch)];
         for (what, change) in changes {
             for op in [Op::Copy, Op::Move] {
                 let (_t, src, dst) = scratch();
                 let f = src.join("f");
                 std::fs::write(&f, "before").unwrap();
                 set_mtime(&f, 1_600_000_000);
-                let mut fs = Faulty::new(&mut *inner);
+                let mut fs = Faulty::new(inner);
                 fs.rename = no_rename_from(&[&f]);
                 let source = f.clone();
                 fs.copied = Box::new(move |_| change(&source));
@@ -2437,6 +2438,7 @@ fn r11_a_source_changed_during_its_copy_fails_the_item() {
                     Hosts::Same(&mut fs),
                     &mut Script::default(),
                 );
+                inner = fs.into_inner();
                 assert!(
                     matches!(&r.items[..], [Item { outcome: ItemOutcome::Failed(why), .. }]
                         if why.contains("changed while it was copied")),
@@ -2453,15 +2455,15 @@ fn r11_a_source_changed_during_its_copy_fails_the_item() {
 /// the bytes read kept): the move fails with the reason and the source stays.
 #[test]
 fn a_corrupted_stream_fails_the_move_and_keeps_the_source() {
-    let mut targets: Vec<(&str, Box<dyn FileOps>)> = vec![("local", Box::new(LocalFs::new()))];
+    let mut targets: Vec<(&str, Layer)> = vec![("local", Box::new(LocalFs::new()))];
     if let Some(sftp) = SftpRemote::local_server() {
         targets.push(("sftp", Box::new(sftp)));
     }
-    for (how, mut target) in targets {
+    for (how, target) in targets {
         let (_t, src, dst) = scratch();
         std::fs::write(src.join("f"), "the right bytes").unwrap();
         let before = sha(&src.join("f"));
-        let mut fs = Faulty::new(target.as_mut());
+        let mut fs = Faulty::new(target);
         fs.corrupt = true;
         let r = run(
             &job(Op::Move, &src, &["f"], &dst),
@@ -2526,7 +2528,7 @@ fn esc_during_a_batchs_removals_lets_them_finish() {
 /// a note.
 #[test]
 fn a_remote_source_that_cannot_be_removed_keeps_both_names() {
-    let Some(mut fs) = SftpRemote::local_server_with(&["-P", "remove"], None) else {
+    let Some(mut fs) = SftpRemote::local_server_args(&["-P", "remove"], None) else {
         return;
     };
     let (_t, src, dst) = scratch();
@@ -2554,8 +2556,7 @@ fn a_remote_source_that_cannot_be_removed_keeps_both_names() {
 fn a_failed_walk_makes_no_folder() {
     let (_t, src, dst) = scratch();
     std::fs::create_dir(src.join("d")).unwrap();
-    let mut local = LocalFs::new();
-    let mut fs = Faulty::new(&mut local);
+    let mut fs = Faulty::new(Box::new(LocalFs::new()));
     let walked = s(&src.join("d"));
     fs.fault = Box::new(move |op, path| {
         (op == "list_entries" && path == walked).then(|| anyhow::anyhow!("injected: no listing"))
@@ -2596,8 +2597,7 @@ fn r12_a_temp_name_replaced_after_its_create_redirects_nothing() {
             std::fs::remove_file(temp).unwrap();
             std::fs::hard_link(&v, temp).unwrap();
         });
-        let mut local = LocalFs::new();
-        let mut fs = Faulty::new(&mut local);
+        let mut fs = Faulty::new(Box::new(LocalFs::new()));
         fs.rename = no_rename_from(&[&f]);
         let r = run(
             &job(op.clone(), &src, &["f"], &dst),
@@ -2664,14 +2664,14 @@ fn r13_sftp_a_name_that_cannot_be_checked_before_remove_is_unconfirmed() {
 /// verify.
 #[test]
 fn r14_a_failed_check_never_removes_the_source() {
-    both(|inner, how| {
+    both(|mut inner, how| {
         // A corrupt copy, and one transient stat failure of the source after the check's read.
         {
             let (_t, src, dst) = scratch();
             let f = src.join("f");
             std::fs::write(&f, vec![9u8; 4096]).unwrap();
             let before = sha(&f);
-            let mut fs = Faulty::new(&mut *inner);
+            let mut fs = Faulty::new(inner);
             fs.host_made = true;
             corrupt_the_copy(&mut fs, &f);
             let armed = Arc::new(AtomicBool::new(false));
@@ -2697,13 +2697,14 @@ fn r14_a_failed_check_never_removes_the_source() {
                 "{how}: {r:?}"
             );
             assert_eq!(sha(&f), before, "{how}: the source survives");
+            inner = fs.into_inner();
         }
 
         // A good copy whose source goes right after the check read it: not a verified move.
         let (_t, src, dst) = scratch();
         let f = src.join("f");
         std::fs::write(&f, "good bytes").unwrap();
-        let mut fs = Faulty::new(&mut *inner);
+        let mut fs = Faulty::new(inner);
         fs.host_made = true;
         fs.rename = no_rename_from(&[&f]);
         let (path, gone) = (s(&f), f.clone());
@@ -2738,8 +2739,7 @@ fn r15_a_copy_whose_identity_cannot_be_read_is_not_published() {
     let f = src.join("f");
     std::fs::write(&f, vec![5u8; 2048]).unwrap();
     let before = sha(&f);
-    let mut local = LocalFs::new();
-    let mut fs = Faulty::new(&mut local);
+    let mut fs = Faulty::new(Box::new(LocalFs::new()));
     fs.host_made = true;
     corrupt_the_copy(&mut fs, &f);
     let inside = format!("{}/.f.sopen-", s(&dst));
@@ -2779,8 +2779,7 @@ fn r15_a_replacement_at_the_published_name_survives() {
     let f = src.join("f");
     std::fs::write(&f, vec![5u8; 2048]).unwrap();
     let before = sha(&f);
-    let mut local = LocalFs::new();
-    let mut fs = Faulty::new(&mut local);
+    let mut fs = Faulty::new(Box::new(LocalFs::new()));
     fs.host_made = true;
     corrupt_the_copy(&mut fs, &f);
     let replaced: Arc<Mutex<Option<u64>>> = Arc::default();
@@ -2842,8 +2841,7 @@ fn r16_esc_between_items_and_cancel_are_explained() {
     // Esc right after `a` was published.
     let mut ctl = Script::default();
     let stop = ctl.cancel.clone();
-    let mut local = LocalFs::new();
-    let mut fs = Faulty::new(&mut local);
+    let mut fs = Faulty::new(Box::new(LocalFs::new()));
     fs.renamed = Box::new(move |_, to| {
         if to.ends_with("/a") {
             stop.store(true, Ordering::Relaxed);
@@ -2909,13 +2907,12 @@ fn scribble(temp: &str) {
 /// server, two connections to this machine). `None` where `sftp-server` is missing. The
 /// `copy-data` server logs its requests to `log`, and must offer the extension.
 fn every_path(name: &str, log: &Path) -> Option<(Layer, Option<Layer>)> {
-    let sftp = |args: &[&str]| {
-        SftpRemote::local_server_with(args, None).map(|f| Box::new(f) as Box<dyn FileOps>)
-    };
+    let sftp =
+        |args: &[&str]| SftpRemote::local_server_args(args, None).map(|f| Box::new(f) as Layer);
     Some(match name {
         "local" | "in-place" => (Box::new(LocalFs::new()), None),
         "copy-data" => {
-            let fs = SftpRemote::local_server_with(&["-l", "DEBUG1"], Some(log))?;
+            let fs = SftpRemote::local_server_args(&["-l", "DEBUG1"], Some(log))?;
             assert!(fs.offers_copy_data(), "this server must offer copy-data");
             (Box::new(fs), None)
         }
@@ -2959,7 +2956,7 @@ fn f2_case(path: &str, size: usize) {
     let before = sha(&f);
     let r = match b {
         None => {
-            let mut fs = Faulty::new(a.as_mut());
+            let mut fs = Faulty::new(a);
             fs.hash_limit = Some(16);
             fs.rename = no_rename_from(&[&f]);
             fs.copied = Box::new(scribble);
@@ -2969,8 +2966,8 @@ fn f2_case(path: &str, size: usize) {
                 &mut Script::default(),
             )
         }
-        Some(mut b) => {
-            let mut fs = Faulty::new(b.as_mut());
+        Some(b) => {
+            let mut fs = Faulty::new(b);
             fs.hash_limit = Some(16);
             fs.copied = Box::new(scribble);
             let hosts = Hosts::Two {
@@ -2999,7 +2996,7 @@ fn f2_case(path: &str, size: usize) {
         );
     }
     if path == "copy-data" {
-        drop(a);
+        // Its server ended with the layer (dropped with `fs` above): the log is complete.
         let text = std::fs::read_to_string(&log).unwrap();
         assert!(text.contains("copy-data from"), "the server copied: {text}");
     }
@@ -3127,8 +3124,8 @@ fn f4_without_a_filesystem_id_nested_paths_are_refused() {
     let d = src.join("F");
     std::fs::create_dir_all(d.join("sub")).unwrap();
     std::fs::write(d.join("x"), "x").unwrap();
-    let (mut a, mut b) = (LocalFs::new(), LocalFs::new());
-    let mut fs = Faulty::new(&mut b);
+    let (mut a, b) = (LocalFs::new(), LocalFs::new());
+    let mut fs = Faulty::new(Box::new(b));
     fs.no_fs_id = true;
     let r = run(
         &job(Op::Copy, &src, &["F"], &d.join("sub")),
@@ -3149,8 +3146,7 @@ fn f4_the_walk_comes_before_the_new_folder() {
     let d = src.join("F");
     std::fs::create_dir_all(d.join("sub")).unwrap();
     std::fs::write(d.join("x"), "x").unwrap();
-    let mut local = LocalFs::new();
-    let mut fs = Faulty::new(&mut local);
+    let mut fs = Faulty::new(Box::new(LocalFs::new()));
     let trace = fs.trace.clone();
     let r = run(
         &job(Op::Copy, &src, &["F"], &dst),
@@ -3186,7 +3182,7 @@ fn f5_an_old_name_that_remains_is_one_outcome() {
             "{how}: the reason in a note: {r:?}"
         );
     };
-    if let Some(mut fs) = SftpRemote::local_server_with(&["-P", "remove"], None) {
+    if let Some(mut fs) = SftpRemote::local_server_args(&["-P", "remove"], None) {
         let (_t, src, dst) = scratch();
         std::fs::write(src.join("a"), "a").unwrap();
         let r = run(
@@ -3214,12 +3210,11 @@ fn f5_an_old_name_that_remains_is_one_outcome() {
 /// F6: one durability barrier before each moved item's source is removed and one at the end —
 /// not one per file.
 #[test]
-fn f6_one_barrier_per_moved_item_and_one_at_the_end() {
+fn f6_one_barrier_per_batch_of_moved_items_and_one_at_the_end() {
     let (_t, src, dst) = scratch();
     let d = three_files(&src);
     std::fs::write(src.join("f"), "f").unwrap();
-    let mut local = LocalFs::new();
-    let mut fs = Faulty::new(&mut local);
+    let mut fs = Faulty::new(Box::new(LocalFs::new()));
     fs.rename = no_rename_from(&[&d, &src.join("f")]);
     let barriers = fs.barriers.clone();
     let r = run(
@@ -3234,8 +3229,7 @@ fn f6_one_barrier_per_moved_item_and_one_at_the_end() {
         "one batch for d and f, and the end"
     );
 
-    let mut local = LocalFs::new();
-    let mut fs = Faulty::new(&mut local);
+    let mut fs = Faulty::new(Box::new(LocalFs::new()));
     let barriers = fs.barriers.clone();
     let to = dst.join("copies");
     std::fs::create_dir(&to).unwrap();
@@ -3254,8 +3248,7 @@ fn a_source_growing_during_its_stream_is_changed() {
     let (_t, src, dst) = scratch();
     let f = src.join("f");
     std::fs::write(&f, "before").unwrap();
-    let mut local = LocalFs::new();
-    let mut from = Faulty::new(&mut local);
+    let mut from = Faulty::new(Box::new(LocalFs::new()));
     let grown = f.clone();
     from.after = Box::new(move |op, _| {
         if op == "open_read" {
@@ -3290,8 +3283,7 @@ fn a_partial_folder_gets_its_source_mode() {
     let (_t, src, dst) = scratch();
     let d = three_files(&src);
     set_mode(&d, 0o750);
-    let mut local = LocalFs::new();
-    let mut fs = Faulty::new(&mut local);
+    let mut fs = Faulty::new(Box::new(LocalFs::new()));
     fs.copy = Box::new(|from| {
         from.ends_with("b.txt")
             .then(|| anyhow::anyhow!("injected read error"))
@@ -3330,8 +3322,7 @@ fn f6_timing_of_500_small_files() {
     eprintln!("f6: copy of 500 x 1 KiB in {:?}", t.elapsed());
     let other = dst.join("moved");
     std::fs::create_dir(&other).unwrap();
-    let mut local = LocalFs::new();
-    let mut fs = Faulty::new(&mut local);
+    let mut fs = Faulty::new(Box::new(LocalFs::new()));
     fs.rename = no_rename_from(&[&dst.join("many")]);
     let t = std::time::Instant::now();
     let r = run(
@@ -3448,8 +3439,7 @@ fn f6_each_barrier_comes_after_its_writes_and_before_its_removals() {
     std::fs::write(d.join("a"), "a").unwrap();
     std::fs::write(d.join("sub/b"), "b").unwrap();
     std::fs::write(src.join("f"), "f").unwrap();
-    let mut local = LocalFs::new();
-    let mut fs = Faulty::new(&mut local);
+    let mut fs = Faulty::new(Box::new(LocalFs::new()));
     fs.rename = no_rename_from(&[&d, &src.join("f")]);
     let trace = fs.trace.clone();
     let r = run(
@@ -3493,8 +3483,7 @@ fn a_failed_barrier_removes_no_source() {
     let (_t, src, dst) = scratch();
     let d = three_files(&src);
     std::fs::write(src.join("f"), "f").unwrap();
-    let mut local = LocalFs::new();
-    let mut fs = Faulty::new(&mut local);
+    let mut fs = Faulty::new(Box::new(LocalFs::new()));
     fs.rename = no_rename_from(&[&d, &src.join("f")]);
     fs.fault = Box::new(|op, _| {
         (op == "barrier").then(|| anyhow::anyhow!("injected: the drive did not flush"))
@@ -3566,8 +3555,7 @@ fn an_in_place_copy_that_fails_part_way_is_removed_and_said() {
     let _links = LocalFs::seam_no_links();
     let (_t, src, dst) = scratch();
     std::fs::write(src.join("big"), vec![1u8; 1024 * 1024]).unwrap();
-    let mut local = LocalFs::new();
-    let mut from = Faulty::new(&mut local);
+    let mut from = Faulty::new(Box::new(LocalFs::new()));
     from.fail_read_after = Some(100_000);
     let r = run(
         &job(Op::Move, &src, &["big"], &dst),
@@ -3609,8 +3597,7 @@ fn an_in_place_copy_replaced_before_its_check_is_left_and_named() {
     let (_t, src, dst) = scratch();
     let f = src.join("f");
     std::fs::write(&f, vec![4u8; 4096]).unwrap();
-    let mut local = LocalFs::new();
-    let mut fs = Faulty::new(&mut local);
+    let mut fs = Faulty::new(Box::new(LocalFs::new()));
     fs.rename = no_rename_from(&[&f]);
     fs.copied = Box::new(|path| {
         std::fs::remove_file(path).unwrap();
@@ -3657,9 +3644,8 @@ fn a_two_step_rename_that_cannot_be_confirmed_claims_nothing() {
     };
     // The first step unconfirmed.
     let calls = AtomicUsize::new(0);
-    let mut local = LocalFs::new();
-    let mut fs = Faulty::new(&mut local);
-    fs.rename = Box::new(|_, to| match calls.fetch_add(1, Ordering::Relaxed) {
+    let mut fs = Faulty::new(Box::new(LocalFs::new()));
+    fs.rename = Box::new(move |_, to| match calls.fetch_add(1, Ordering::Relaxed) {
         0 => Some(Err(taken(to))),
         _ => Some(Ok(Renamed::Unconfirmed("injected: no answer".into()))),
     });
@@ -3676,9 +3662,8 @@ fn a_two_step_rename_that_cannot_be_confirmed_claims_nothing() {
 
     // The way back unconfirmed.
     let calls = AtomicUsize::new(0);
-    let mut local = LocalFs::new();
-    let mut fs = Faulty::new(&mut local);
-    fs.rename = Box::new(|_, to| match calls.fetch_add(1, Ordering::Relaxed) {
+    let mut fs = Faulty::new(Box::new(LocalFs::new()));
+    fs.rename = Box::new(move |_, to| match calls.fetch_add(1, Ordering::Relaxed) {
         0 => Some(Err(taken(to))),
         1 => None,
         2 => Some(Err(anyhow::anyhow!("injected: second step"))),
@@ -3777,8 +3762,7 @@ fn batched_moves_share_one_barrier() {
     for n in names_ {
         std::fs::write(src.join(n), n).unwrap();
     }
-    let mut local = LocalFs::new();
-    let mut fs = Faulty::new(&mut local);
+    let mut fs = Faulty::new(Box::new(LocalFs::new()));
     let sources: Vec<PathBuf> = names_.iter().map(|n| src.join(n)).collect();
     fs.rename = no_rename_from(&sources.iter().map(|p| p.as_path()).collect::<Vec<_>>());
     let (trace, barriers) = (fs.trace.clone(), fs.barriers.clone());
@@ -3799,7 +3783,10 @@ fn batched_moves_share_one_barrier() {
     );
 }
 
-/// Batches: 64 moved items at most, then the batch is flushed.
+/// Batches: 64 moved items at most, then the batch is flushed — by the trace's order: its
+/// barrier comes after the 64th item's copy was published and read back and before anything of
+/// the 65th, and the 64 removals come between that barrier and the 65th item. (The clock stands
+/// still: only the count flushes.)
 #[test]
 fn a_batch_is_flushed_at_64_items() {
     let (_t, src, dst) = scratch();
@@ -3807,12 +3794,11 @@ fn a_batch_is_flushed_at_64_items() {
     for n in &all {
         std::fs::write(src.join(n), n).unwrap();
     }
-    let mut local = LocalFs::new();
-    let mut fs = Faulty::new(&mut local);
+    let mut fs = Faulty::new(Box::new(LocalFs::new()));
     fs.rename = Box::new(|from, _| {
         (!from.contains(".sopen-")).then(|| Err(anyhow::anyhow!(NoRename("elsewhere".into()))))
     });
-    let barriers = fs.barriers.clone();
+    let (trace, barriers) = (fs.trace.clone(), fs.barriers.clone());
     let refs: Vec<&str> = all.iter().map(String::as_str).collect();
     let r = run(
         &job(Op::Move, &src, &refs, &dst),
@@ -3820,12 +3806,46 @@ fn a_batch_is_flushed_at_64_items() {
         &mut Script::default(),
     );
     assert!(r.all_done(), "{r:?}");
-    assert_eq!(
-        barriers.load(Ordering::Relaxed),
-        3,
-        "64, then 1, then the end"
-    );
     assert_eq!(names(&src), Vec::<String>::new());
+    let t = trace.lock().unwrap().clone();
+    let is_barrier = |e: &str| e.starts_with("barrier:");
+    let published = |n: &str| {
+        let to = format!("->{}", s(&dst.join(n)));
+        first(&t, |e| e.starts_with("rename:") && e.ends_with(&to)).expect("published")
+    };
+    let checked = |n: &str| {
+        let read = format!("read:{}", s(&dst.join(n)));
+        last(&t, |e| e == read).expect("read back")
+    };
+    let removed = |n: &str| {
+        let gone = format!("remove:{}", s(&src.join(n)));
+        first(&t, |e| e == gone).expect("removed")
+    };
+    let batch = first(&t, is_barrier).unwrap();
+    // By its full paths: a temp's random suffix can spell any name.
+    let of_65th = [
+        s(&src.join("f64")),
+        s(&dst.join("f64")),
+        s(&dst.join(".f64.sopen-")),
+    ];
+    let the_65th = first(&t, |e| of_65th.iter().any(|p| e.contains(p.as_str()))).unwrap();
+    assert!(
+        published("f63") < batch && checked("f63") < batch,
+        "the barrier after the 64th item's copy and check: {t:?}"
+    );
+    assert!(batch < the_65th, "and before anything of the 65th: {t:?}");
+    for n in &all[..64] {
+        let gone = removed(n);
+        assert!(batch < gone && gone < the_65th, "{n}: {t:?}");
+    }
+    let rest: Vec<usize> = (0..t.len())
+        .filter(|&i| i > batch && is_barrier(&t[i]))
+        .collect();
+    let [second, end] = rest[..] else {
+        panic!("three barriers — 64 items, 1 item, the end: {t:?}")
+    };
+    assert!(checked("f64") < second && second < removed("f64") && removed("f64") < end);
+    assert_eq!(barriers.load(Ordering::Relaxed), 3);
 }
 
 /// Batches: a name-in-the-way question flushes the batch first — no verified item waits for an
@@ -3836,8 +3856,7 @@ fn a_batch_is_flushed_before_a_question() {
     std::fs::write(src.join("a"), "a").unwrap();
     std::fs::write(src.join("b"), "b").unwrap();
     std::fs::write(dst.join("b"), "theirs").unwrap();
-    let mut local = LocalFs::new();
-    let mut fs = Faulty::new(&mut local);
+    let mut fs = Faulty::new(Box::new(LocalFs::new()));
     fs.rename = no_rename_from(&[&src.join("a"), &src.join("b")]);
     let seen = Arc::new(AtomicBool::new(true));
     let (gone, a) = (seen.clone(), src.join("a"));
@@ -3873,8 +3892,7 @@ fn esc_flushes_the_batch_of_checked_items() {
     }
     let mut ctl = Script::default();
     let stop = ctl.cancel.clone();
-    let mut local = LocalFs::new();
-    let mut fs = Faulty::new(&mut local);
+    let mut fs = Faulty::new(Box::new(LocalFs::new()));
     let target = s(&dst.join("b"));
     fs.rename = Box::new(|from, _| {
         (!from.contains(".sopen-")).then(|| Err(anyhow::anyhow!(NoRename("elsewhere".into()))))
@@ -3912,8 +3930,7 @@ fn a_kill_mid_batch_loses_nothing() {
         let root = PathBuf::from(root);
         let (src, dst) = (root.join("src"), root.join("dst"));
         let items = ["a", "b", "c", "d", "e"];
-        let mut local = LocalFs::new();
-        let mut fs = Faulty::new(&mut local);
+        let mut fs = Faulty::new(Box::new(LocalFs::new()));
         fs.rename = Box::new(|from, _| {
             (!from.contains(".sopen-")).then(|| Err(anyhow::anyhow!(NoRename("elsewhere".into()))))
         });
@@ -3936,35 +3953,48 @@ fn a_kill_mid_batch_loses_nothing() {
     for n in items {
         std::fs::write(src.join(n), format!("the bytes of {n}")).unwrap();
     }
-    let out = std::process::Command::new(std::env::current_exe().unwrap())
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
         .args([
             "fileops::tests::a_kill_mid_batch_loses_nothing",
             "--exact",
             "--test-threads=1",
         ])
         .env(CHILD, &root)
-        .output()
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
         .unwrap();
-    assert!(!out.status.success(), "the child was to die at the barrier");
+    // A child that neither dies nor ends is killed and reaped: the test fails, it never hangs.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let status = loop {
+        match child.try_wait().unwrap() {
+            Some(status) => break status,
+            None if std::time::Instant::now() >= deadline => {
+                child.kill().unwrap();
+                child.wait().unwrap();
+                panic!("the child did not end within its deadline");
+            }
+            None => std::thread::sleep(std::time::Duration::from_millis(10)),
+        }
+    };
+    assert_eq!(
+        std::os::unix::process::ExitStatusExt::signal(&status),
+        Some(libc::SIGABRT),
+        "the child was to die of its abort at the barrier: {status:?}"
+    );
     for n in items {
         let want = format!("the bytes of {n}");
         assert_eq!(
             std::fs::read_to_string(src.join(n)).unwrap(),
             want,
-            "{n}: source"
+            "{n}: the source"
         );
-        if let Ok(copy) = std::fs::read_to_string(dst.join(n)) {
-            assert_eq!(copy, want, "{n}: a published copy is whole");
-        }
+        assert_eq!(
+            std::fs::read_to_string(dst.join(n)).unwrap(),
+            want,
+            "{n}: the copy, published before the batch's barrier"
+        );
     }
-    let copies = names(&dst)
-        .into_iter()
-        .filter(|n| !n.starts_with('.'))
-        .count();
-    assert_eq!(
-        copies, 5,
-        "the batch's items were all copied before its barrier"
-    );
 }
 
 /// The in-place note is said once per target folder in an operation.
@@ -3997,8 +4027,7 @@ fn a_folder_that_cannot_be_flushed_keeps_the_source() {
     let (_t, src, dst) = scratch();
     let f = src.join("f");
     std::fs::write(&f, "f").unwrap();
-    let mut local = LocalFs::new();
-    let mut fs = Faulty::new(&mut local);
+    let mut fs = Faulty::new(Box::new(LocalFs::new()));
     fs.rename = no_rename_from(&[&f]);
     let r = run(
         &job(Op::Move, &src, &["f"], &dst),
@@ -4049,8 +4078,7 @@ fn hard_links_of_one_file_all_move() {
     std::fs::create_dir(&d).unwrap();
     std::fs::write(d.join("x"), "inside").unwrap();
     std::fs::hard_link(d.join("x"), d.join("y")).unwrap();
-    let mut local = LocalFs::new();
-    let mut fs = Faulty::new(&mut local);
+    let mut fs = Faulty::new(Box::new(LocalFs::new()));
     fs.rename = no_rename_from(&[&src.join("a"), &src.join("b"), &d]);
     let r = run(
         &job(Op::Move, &src, &["a", "b", "d"], &dst),
@@ -4071,8 +4099,7 @@ fn without_pins_a_hard_linked_sibling_is_kept_not_lost() {
     let (_t, src, dst) = scratch();
     std::fs::write(src.join("a"), "linked").unwrap();
     std::fs::hard_link(src.join("a"), src.join("b")).unwrap();
-    let mut local = LocalFs::new();
-    let mut fs = Faulty::new(&mut local);
+    let mut fs = Faulty::new(Box::new(LocalFs::new()));
     fs.no_pins = true;
     fs.rename = no_rename_from(&[&src.join("a"), &src.join("b")]);
     let r = run(
@@ -4098,8 +4125,7 @@ fn a_moved_source_whose_mode_changed_after_its_copy_still_moves() {
     let (_t, src, dst) = scratch();
     let f = src.join("f");
     std::fs::write(&f, "f").unwrap();
-    let mut local = LocalFs::new();
-    let mut fs = Faulty::new(&mut local);
+    let mut fs = Faulty::new(Box::new(LocalFs::new()));
     fs.rename = no_rename_from(&[&f]);
     let source = f.clone();
     fs.renamed = Box::new(move |from, _| {
@@ -4124,8 +4150,7 @@ fn a_batch_is_flushed_a_second_after_it_began() {
     for n in ["a", "b", "c"] {
         std::fs::write(src.join(n), n).unwrap();
     }
-    let mut local = LocalFs::new();
-    let mut fs = Faulty::new(&mut local);
+    let mut fs = Faulty::new(Box::new(LocalFs::new()));
     fs.rename = Box::new(|from, _| {
         (!from.contains(".sopen-")).then(|| Err(anyhow::anyhow!(NoRename("elsewhere".into()))))
     });
@@ -4138,7 +4163,7 @@ fn a_batch_is_flushed_a_second_after_it_began() {
             return;
         }
         if to == slow {
-            std::thread::sleep(std::time::Duration::from_millis(1100));
+            super::engine::advance_clock(std::time::Duration::from_millis(1000));
         }
         if to == last {
             *seen.lock().unwrap() = Some((a.exists(), b.exists()));
@@ -4168,8 +4193,7 @@ fn a_batch_is_flushed_between_the_entries_of_a_long_folder() {
     std::fs::create_dir(&d).unwrap();
     std::fs::write(d.join("x"), "x").unwrap();
     std::fs::write(d.join("y"), "y").unwrap();
-    let mut local = LocalFs::new();
-    let mut fs = Faulty::new(&mut local);
+    let mut fs = Faulty::new(Box::new(LocalFs::new()));
     fs.rename = no_rename_from(&[&src.join("a"), &d]);
     let inside = format!("{}/", s(&dst.join("d")));
     let (n, a_was_there) = (AtomicUsize::new(0), Arc::new(AtomicBool::new(true)));
@@ -4179,7 +4203,7 @@ fn a_batch_is_flushed_between_the_entries_of_a_long_folder() {
             return;
         }
         match n.fetch_add(1, Ordering::Relaxed) {
-            0 => std::thread::sleep(std::time::Duration::from_millis(1100)),
+            0 => super::engine::advance_clock(std::time::Duration::from_millis(1000)),
             _ => seen.store(a.exists(), Ordering::Relaxed),
         }
     });
@@ -4195,9 +4219,9 @@ fn a_batch_is_flushed_between_the_entries_of_a_long_folder() {
     );
 }
 
-/// One operation holds 64 source descriptors at most (its own count: another operation's do not
-/// use it up): the sources past that are known by device, inode and status-change time, and
-/// move all the same.
+/// One operation holds 64 source descriptors at most: the sources past that are known by
+/// device, inode and status-change time, and move all the same. The count is the operation's
+/// own: another operation, run while this one holds all 64, pins its sources.
 #[test]
 fn an_operation_pins_64_sources_at_most() {
     let (_t, src, dst) = scratch();
@@ -4206,10 +4230,31 @@ fn an_operation_pins_64_sources_at_most() {
     for i in 0..70 {
         std::fs::write(d.join(format!("f{i:02}")), "x").unwrap();
     }
-    let mut local = LocalFs::new();
-    let mut fs = Faulty::new(&mut local);
+    let mut fs = Faulty::new(Box::new(LocalFs::new()));
     fs.rename = no_rename_from(&[&d]);
     let pinned = fs.pinned.clone();
+    // The other operation: started when this one publishes its last file, all 64 pins held.
+    let (others, held) = (Arc::new(AtomicUsize::new(0)), pinned.clone());
+    let (seen, last) = (others.clone(), s(&dst.join("d/f69")));
+    fs.renamed = Box::new(move |_, to| {
+        if to != last {
+            return;
+        }
+        assert_eq!(held.load(Ordering::Relaxed), 64);
+        let (_t2, src2, dst2) = scratch();
+        std::fs::write(src2.join("a"), "a").unwrap();
+        std::fs::write(src2.join("b"), "b").unwrap();
+        let mut other = Faulty::new(Box::new(LocalFs::new()));
+        other.rename = no_rename_from(&[&src2.join("a"), &src2.join("b")]);
+        let count = other.pinned.clone();
+        let r = run(
+            &job(Op::Move, &src2, &["a", "b"], &dst2),
+            Hosts::Same(&mut other),
+            &mut Script::default(),
+        );
+        assert!(r.all_done(), "{r:?}");
+        seen.store(count.load(Ordering::Relaxed), Ordering::Relaxed);
+    });
     let r = run(
         &job(Op::Move, &src, &["d"], &dst),
         Hosts::Same(&mut fs),
@@ -4217,6 +4262,7 @@ fn an_operation_pins_64_sources_at_most() {
     );
     assert!(r.all_done(), "{r:?}");
     assert_eq!(pinned.load(Ordering::Relaxed), 64);
+    assert_eq!(others.load(Ordering::Relaxed), 2, "the other operation's");
     assert!(!d.exists());
     assert_eq!(names(&dst.join("d")).len(), 70);
 }
@@ -4232,8 +4278,7 @@ fn batch_timing_of_500_selected_files() {
     for (i, n) in all.iter().enumerate() {
         std::fs::write(src.join(n), vec![(i % 256) as u8; 1024]).unwrap();
     }
-    let mut local = LocalFs::new();
-    let mut fs = Faulty::new(&mut local);
+    let mut fs = Faulty::new(Box::new(LocalFs::new()));
     fs.rename = Box::new(|from, _| {
         (!from.contains(".sopen-")).then(|| Err(anyhow::anyhow!(NoRename("elsewhere".into()))))
     });
@@ -4250,4 +4295,209 @@ fn batch_timing_of_500_selected_files() {
         t.elapsed(),
         fs.barriers.load(Ordering::Relaxed)
     );
+}
+
+// ---- round 7 ----
+
+/// The status-change time of `path` moved on with its device and inode unchanged: what a new
+/// entry on a reused inode number looks like to a comparison of numbers alone.
+fn bump_ctime(path: &Path) {
+    let was = std::fs::symlink_metadata(path).unwrap();
+    let mode = was.mode() & 0o777;
+    for _ in 0..200 {
+        set_mode(path, mode ^ 0o100);
+        set_mode(path, mode);
+        let now = std::fs::symlink_metadata(path).unwrap();
+        if (now.ctime(), now.ctime_nsec()) != (was.ctime(), was.ctime_nsec()) {
+            assert_eq!((now.dev(), now.ino()), (was.dev(), was.ino()));
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    panic!("the status-change time of {path:?} never moved");
+}
+
+/// A pin is taken only of the entry whose identity was read, in full: the same device and
+/// inode with another status-change time — an entry put there since, on the reused number —
+/// is not pinned, whether it came before the pin looked at the name or between that look and
+/// the open.
+#[test]
+fn a_pin_is_refused_when_the_entry_changed_since_its_identity() {
+    let (_t, src, _dst) = scratch();
+    let f = src.join("f");
+    std::fs::write(&f, "f").unwrap();
+    let mut fs = LocalFs::new();
+    let id = fs.identity(&s(&f), false).unwrap().unwrap();
+    assert!(fs.pin(&s(&f), &id).is_some(), "unchanged: pinned");
+    {
+        let at = f.clone();
+        let _seam = LocalFs::seam_before_pin(move |_| bump_ctime(&at));
+        assert!(fs.pin(&s(&f), &id).is_none(), "changed before the pin");
+    }
+    let id = fs.identity(&s(&f), false).unwrap().unwrap();
+    let at = f.clone();
+    let _seam = LocalFs::seam_before_pin_open(move |_| bump_ctime(&at));
+    assert!(
+        fs.pin(&s(&f), &id).is_none(),
+        "changed between the look and the open"
+    );
+}
+
+/// A moved source that changed between its identity and its pin is not pinned as if it were
+/// the entry read: it is kept, and the report says another file has its name.
+#[test]
+fn a_source_changed_before_its_pin_is_kept() {
+    let (_t, src, dst) = scratch();
+    let f = src.join("f");
+    std::fs::write(&f, "f").unwrap();
+    let mut fs = Faulty::new(Box::new(LocalFs::new()));
+    fs.rename = no_rename_from(&[&f]);
+    let at = f.clone();
+    let _seam = LocalFs::seam_before_pin(move |_| bump_ctime(&at));
+    let r = run(
+        &job(Op::Move, &src, &["f"], &dst),
+        Hosts::Same(&mut fs),
+        &mut Script::default(),
+    );
+    assert!(
+        matches!(&r.items[..], [Item { outcome: ItemOutcome::Failed(why), .. }]
+            if why.contains("another file has its name now") && why.contains("both copies exist")),
+        "{r:?}"
+    );
+    assert_eq!(std::fs::read(&f).unwrap(), b"f", "kept");
+    assert_eq!(std::fs::read(dst.join("f")).unwrap(), b"f", "copied");
+}
+
+/// Only a regular file or a link is ever opened for a pin: a fifo (as a device or a socket) is
+/// not — the open is never reached.
+#[test]
+fn a_fifo_is_never_opened_for_a_pin() {
+    let (_t, src, _dst) = scratch();
+    let fifo = src.join("fifo");
+    let c = std::ffi::CString::new(s(&fifo)).unwrap();
+    // SAFETY: a NUL-terminated path.
+    assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o644) }, 0);
+    let opened = Arc::new(AtomicBool::new(false));
+    let seen = opened.clone();
+    let _seam = LocalFs::seam_before_pin_open(move |_| seen.store(true, Ordering::Relaxed));
+    let mut fs = LocalFs::new();
+    let id = fs.identity(&s(&fifo), false).unwrap().unwrap();
+    assert!(fs.pin(&s(&fifo), &id).is_none());
+    assert!(!opened.load(Ordering::Relaxed), "the open was reached");
+    let f = src.join("f");
+    std::fs::write(&f, "f").unwrap();
+    let id = fs.identity(&s(&f), false).unwrap().unwrap();
+    assert!(fs.pin(&s(&f), &id).is_some());
+    assert!(opened.load(Ordering::Relaxed), "a file is opened");
+}
+
+/// A checked copy that is gone or replaced when its batch is flushed (here at the batch's
+/// barrier, between the check and the removal) keeps its source: a file, and a file below a
+/// moved folder; the report names the copy.
+#[test]
+fn a_copy_changed_before_the_flush_keeps_its_source() {
+    type Harm = fn(&Path);
+    let delete: Harm = |p| std::fs::remove_file(p).unwrap();
+    let replace: Harm = |p| {
+        std::fs::remove_file(p).unwrap();
+        std::fs::write(p, "theirs").unwrap();
+    };
+    for (what, harm) in [("deleted", delete), ("replaced", replace)] {
+        let (_t, src, dst) = scratch();
+        std::fs::write(src.join("a"), "mine a").unwrap();
+        std::fs::write(src.join("b"), "mine b").unwrap();
+        let d = src.join("d");
+        std::fs::create_dir(&d).unwrap();
+        std::fs::write(d.join("x"), "mine x").unwrap();
+        std::fs::write(d.join("y"), "mine y").unwrap();
+        let mut fs = Faulty::new(Box::new(LocalFs::new()));
+        fs.rename = no_rename_from(&[&src.join("a"), &src.join("b"), &d]);
+        let (copies, once) = ([dst.join("a"), dst.join("d/x")], AtomicBool::new(false));
+        fs.fault = Box::new(move |op, _| {
+            if op == "barrier" && !once.swap(true, Ordering::Relaxed) {
+                copies.iter().for_each(|c| harm(c));
+            }
+            None
+        });
+        let r = run(
+            &job(Op::Move, &src, &["a", "b", "d"], &dst),
+            Hosts::Same(&mut fs),
+            &mut Script::default(),
+        );
+        let said = |name: &str, copy: &Path| {
+            let line = r.items.iter().find(|i| i.name == name).expect("a line");
+            let want = format!(
+                "its copy at {} changed before the source was removed; the source stays",
+                s(copy)
+            );
+            assert!(
+                matches!(&line.outcome, ItemOutcome::Failed(why) if why.contains(&want)),
+                "{what}: {name}: {r:?}"
+            );
+        };
+        said("a", &dst.join("a"));
+        said("d/x", &dst.join("d/x"));
+        assert_eq!(std::fs::read(src.join("a")).unwrap(), b"mine a", "{what}");
+        assert_eq!(std::fs::read(d.join("x")).unwrap(), b"mine x", "{what}");
+        // The untouched copies' sources went.
+        assert!(!src.join("b").exists() && !d.join("y").exists(), "{what}");
+        assert_eq!(std::fs::read(dst.join("b")).unwrap(), b"mine b", "{what}");
+        assert_eq!(std::fs::read(dst.join("d/y")).unwrap(), b"mine y", "{what}");
+        if what == "replaced" {
+            assert_eq!(std::fs::read(dst.join("a")).unwrap(), b"theirs");
+        }
+    }
+}
+
+/// The same over SFTP, where a copy is known by its type, size and mtime.
+#[test]
+fn a_remote_copy_gone_before_the_flush_keeps_its_source() {
+    let Some(sftp) = SftpRemote::local_server() else {
+        return;
+    };
+    let (_t, src, dst) = scratch();
+    std::fs::write(src.join("a"), "mine a").unwrap();
+    let mut fs = Faulty::new(Box::new(sftp));
+    fs.rename = no_rename_from(&[&src.join("a")]);
+    let (copy, once) = (dst.join("a"), AtomicBool::new(false));
+    fs.fault = Box::new(move |op, _| {
+        if op == "barrier" && !once.swap(true, Ordering::Relaxed) {
+            std::fs::remove_file(&copy).unwrap();
+        }
+        None
+    });
+    let r = run(
+        &job(Op::Move, &src, &["a"], &dst),
+        Hosts::Same(&mut fs),
+        &mut Script::default(),
+    );
+    assert!(
+        matches!(&r.items[..], [Item { outcome: ItemOutcome::Failed(why), .. }]
+            if why.contains("changed before the source was removed; the source stays")),
+        "{r:?}"
+    );
+    assert_eq!(std::fs::read(src.join("a")).unwrap(), b"mine a");
+}
+
+/// On this machine a temp whose identity could not be read when it was created is never taken
+/// for an SFTP copy (which has none) and removed by its name: it is left, and named.
+#[test]
+fn a_local_temp_without_an_identity_is_left_and_named() {
+    let _seam = LocalFs::seam_temp_stat_fails();
+    let (_t, src, dst) = scratch();
+    std::fs::write(src.join("f"), "f").unwrap();
+    let r = run(
+        &job(Op::Copy, &src, &["f"], &dst),
+        Hosts::Same(&mut LocalFs::new()),
+        &mut Script::default(),
+    );
+    let left = names(&dst);
+    assert_eq!(left.len(), 1, "the temp is left: {left:?}");
+    assert!(left[0].contains(".sopen-"), "{left:?}");
+    assert!(
+        matches!(&r.items[..], [Item { outcome: ItemOutcome::Failed(why), .. }]
+            if why.contains(&s(&dst.join(&left[0]))) && why.contains("left as it is")),
+        "{r:?}"
+    );
+    assert!(src.join("f").exists());
 }
