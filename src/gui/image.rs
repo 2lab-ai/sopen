@@ -12,10 +12,12 @@
 //! at every read of it), [`fitted`] the picture it shows, made off the window's thread.
 
 pub mod clip;
+pub mod probe;
 
 use super::fonts::{self, Face};
 use super::{Hooks, Map, Op, Origin, Outcome, Selection, Status};
 use crate::remote::WriteOutcome;
+use crate::stream::{Mark, ReadError, Reader, ReaderKind, Source};
 use anyhow::{anyhow, bail, Context as _, Result};
 use eframe::egui::{self, Color32, Key, Pos2, Rect, Sense, TextureHandle, Vec2};
 use image::{
@@ -23,11 +25,13 @@ use image::{
     ImageReader, Pixel, Primitive,
 };
 use num_traits::ToPrimitive;
+use sha2::{Digest as _, Sha256};
 use std::io::{Cursor, Write as _};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver};
-use std::sync::{Arc, Mutex};
-use std::time::SystemTime;
+use std::sync::{Arc, Condvar, Mutex, RwLock};
+use std::time::{Duration, SystemTime};
 
 /// Default pixelize block, in image pixels.
 pub const DEFAULT_BLOCK: u32 = 16;
@@ -335,6 +339,10 @@ impl std::io::Seek for Checked<'_> {
     }
 }
 
+/// What a decode asks before it takes memory for the pixels ([`Doc::decode_asking`]): the
+/// bytes it needs and the image's size as stored.
+pub type Allow<'a> = &'a dyn Fn(u64, (u32, u32)) -> Result<()>;
+
 #[cfg(test)]
 thread_local! {
     static DECODES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -370,13 +378,31 @@ impl Doc {
     /// [`Doc::decode`], asking `check` before every read of the decoder and after the decode:
     /// its error stops the decode and is the error returned (a cancel, a preview's deadline).
     pub fn decode_checked(bytes: &[u8], check: &dyn Fn() -> Result<()>) -> Result<Self> {
-        let decoded = Self::decode_from(bytes, check);
+        let decoded = Self::decode_from(bytes, check, None);
         // A decode cut short by `check` fails with an I/O error: `check`'s own is the reason.
         check()?;
         decoded
     }
 
-    fn decode_from(bytes: &[u8], check: &dyn Fn() -> Result<()>) -> Result<Self> {
+    /// [`Doc::decode_checked`], asking `allow` once the decoder has read the header and before
+    /// any memory is reserved for the pixels (06 §7.3): the bytes the decode needs and the
+    /// image's size as stored. Its error stops the decode and is the error returned.
+    pub fn decode_asking(
+        bytes: &[u8],
+        check: &dyn Fn() -> Result<()>,
+        allow: Allow,
+    ) -> Result<Self> {
+        let decoded = Self::decode_from(bytes, check, Some(allow));
+        // As in `decode_checked`.
+        check()?;
+        decoded
+    }
+
+    fn decode_from(
+        bytes: &[u8],
+        check: &dyn Fn() -> Result<()>,
+        allow: Option<Allow>,
+    ) -> Result<Self> {
         #[cfg(test)]
         DECODES.with(|n| n.set(n.get() + 1));
         let checked = Checked {
@@ -389,15 +415,7 @@ impl Doc {
         let format = reader
             .format()
             .context("not an image format sopen can read")?;
-        if !matches!(
-            format,
-            ImageFormat::Png
-                | ImageFormat::Jpeg
-                | ImageFormat::WebP
-                | ImageFormat::Bmp
-                | ImageFormat::Tiff
-                | ImageFormat::Gif
-        ) {
+        if !probe::supported(format) {
             bail!("{format:?} images are not supported");
         }
         let mut decoder = reader.into_decoder().context("cannot decode the image")?;
@@ -413,7 +431,24 @@ impl Doc {
         let orientation = decoder
             .orientation()
             .unwrap_or(image::metadata::Orientation::NoTransforms);
-        let mut img = DynamicImage::from_decoder(decoder).context("cannot decode the image")?;
+        if let Some(allow) = allow {
+            let need = decoder.total_bytes();
+            allow(need, decoder.dimensions())?;
+            if need > probe::BUDGET {
+                // Continued (06 §7.3): the image crate's own allocation limit — 512 MiB, which
+                // the TIFF decoder holds its buffers to ("Memory limit exceeded" on a 14000²
+                // page) — would refuse what was just allowed. It becomes the decode and that
+                // much again for what a decoder needs beside it. A decode nobody was asked
+                // about keeps the crate's limit, as before.
+                let mut limits = image::Limits::default();
+                limits.max_alloc = Some(need.saturating_add(probe::BUDGET));
+                decoder
+                    .set_limits(limits)
+                    .context("cannot decode the image")?;
+            }
+        }
+        // The buffer is reserved first: `DynamicImage::from_decoder` allocates with no check.
+        let mut img = probe::decode_reserved(decoder)?;
         img.apply_orientation(orientation);
         if let Some(chunk) = exif.as_mut() {
             let reset = image::metadata::Orientation::remove_from_exif_chunk(chunk);
@@ -1143,10 +1178,54 @@ fn apply_state(doc: &mut Doc, sel: &mut Selection, block: &mut u32, hooks: &Hook
     Ok(())
 }
 
+/// How [`open`] starts on a file it has whole.
+enum Start {
+    /// Decoded: the image window's parts.
+    Decoded(Box<(ImageFile, Doc, Vec<String>)>),
+    /// The decode is over the budget: the window that asks first (06 §7.3).
+    Asking(Box<Streaming>),
+}
+
+/// The decoded image, or — its decode over `budget` — the window that shows the memory line
+/// before any pixel buffer is asked for (06 §7.3: local images too). A run without a window
+/// (`SOPEN_AUTOSAVE`) has nobody to ask and was told to save: it decodes.
+fn decoded_or_asking(
+    file: ImageFile,
+    hooks: &Hooks,
+    notices: Vec<String>,
+    budget: u64,
+) -> Result<Start> {
+    let asks = |need: u64, size: (u32, u32)| -> Result<()> {
+        match probe::ask_decode(need, size, budget) {
+            Some(_) if !hooks.autosave => Err(anyhow!(Asks)),
+            _ => Ok(()),
+        }
+    };
+    match Doc::decode_asking(file.original(), &|| Ok(()), &asks) {
+        Ok(doc) => Ok(Start::Decoded(Box::new((file, doc, notices)))),
+        Err(e) if e.is::<Asks>() => {
+            let ImageFile {
+                origin,
+                original,
+                cache_root,
+                ..
+            } = file;
+            let bytes = Arc::try_unwrap(original).unwrap_or_else(|shared| (*shared).clone());
+            let input = Input::Bytes(bytes);
+            let window = Streaming::new(input, origin, &cache_root, hooks, notices, budget)?;
+            Ok(Start::Asking(Box::new(window)))
+        }
+        Err(e) => Err(e),
+    }
+}
+
 /// Opens the image: the window, or the windowless `SOPEN_AUTOSAVE` run.
 /// `notices` (where earlier copies' unsaved edits went) are shown whole in the window's rows.
 pub fn open(file: ImageFile, hooks: &Hooks, notices: Vec<String>) -> Result<Outcome> {
-    let mut doc = Doc::decode(file.original())?;
+    let (file, mut doc, notices) = match decoded_or_asking(file, hooks, notices, probe::BUDGET)? {
+        Start::Decoded(parts) => *parts,
+        Start::Asking(window) => return run_streaming(*window, hooks),
+    };
     let mut sel = Selection::default();
     let mut block = DEFAULT_BLOCK;
     apply_state(&mut doc, &mut sel, &mut block, hooks)?;
@@ -2223,8 +2302,905 @@ fn settle(leftover: &Mutex<Option<Job>>, outcome: &Mutex<Outcome>, wait: bool) -
     Some(outcome.lock().unwrap().clone())
 }
 
+// ---------------------------------------------------------------------------------------------
+// Through a stream (06 §7.3): the window before the image is whole.
+
+/// How much of the file a whole read asks for at a time: progress and Esc are this fine.
+const READ_STEP: usize = 256 << 10;
+/// Where a picture of the bytes so far is made: at about these shares of the file, in percent.
+const PREVIEW_MARKS: [u64; 3] = [25, 50, 75];
+/// How often a read looks again at a stream that failed (the stream itself reconnects at most
+/// once a second, 06 §5).
+const RETRY_LOOK: Duration = Duration::from_millis(100);
+/// The window before the image's size is known.
+const LOADING_SIZE: [f32; 2] = [960.0, 700.0];
+
+/// What the loading window reads.
+enum Input {
+    /// A remote file, through its stream.
+    Stream(Source),
+    /// A file already in memory (a local one) whose decode must be asked about first.
+    Bytes(Vec<u8>),
+}
+
+/// The image, whole: what the image window is made of.
+struct Loaded {
+    doc: Doc,
+    bytes: Vec<u8>,
+    /// SHA-256 of the bytes read through the stream (01 §5's baseline).
+    sha256: Option<[u8; 32]>,
+    /// The picture a preview shows ([`fitted`]), when the window was one as the decode ended.
+    shown: Option<image::RgbaImage>,
+}
+
+/// The loader was stopped (Esc, or the window closing): not a failure to report.
+#[derive(Debug)]
+struct Stopped;
+
+impl std::fmt::Display for Stopped {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("cancelled")
+    }
+}
+
+impl std::error::Error for Stopped {}
+
+/// A decode that must be asked about first ([`open`] on a local file: the window asks).
+#[derive(Debug)]
+struct Asks;
+
+impl std::fmt::Display for Asks {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("decoding this image needs more memory than sopen takes without asking")
+    }
+}
+
+impl std::error::Error for Asks {}
+
+/// Which picture of an image still loading is on screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Sketch {
+    /// The Exif thumbnail.
+    Thumb,
+    /// A decode of the first `at` bytes.
+    Partial { at: u64 },
+}
+
+/// What the loader has found so far: what the loading window shows.
+#[derive(Default)]
+struct Progress {
+    /// The header read ended (with a header or without).
+    probed: bool,
+    header: Option<probe::Header>,
+    /// The memory line is up: the loader waits for Continue.
+    ask: Option<probe::Ask>,
+    /// The largest decode Continue was given for.
+    allowed: u64,
+    /// Bytes of the file read so far.
+    loaded: u64,
+    /// The picture to show, newest last made.
+    sketch: Option<(Sketch, Arc<image::RgbaImage>)>,
+    /// Pictures of the bytes so far made up to now.
+    partials: usize,
+    /// One is being made: a mark reached meanwhile is skipped.
+    previewing: bool,
+    /// The stream failed, and the read waits for it to come back: its words.
+    warning: Option<String>,
+    decoding: bool,
+    done: Option<Result<Loaded>>,
+    /// Tests: the largest buffer asked of the allocator for this image (its bytes, a decode).
+    #[cfg(test)]
+    reserved: u64,
+}
+
+/// What the loading window and its workers share.
+struct Load {
+    /// Up to this much memory nothing is asked.
+    budget: u64,
+    cancel: AtomicBool,
+    progress: Mutex<Progress>,
+    /// Continue, a stop, a picture made.
+    moved: Condvar,
+    /// The window to repaint, once it has drawn.
+    ctx: Mutex<Option<egui::Context>>,
+    /// The window is a preview: its picture is fitted where it is decoded.
+    preview: AtomicBool,
+    /// A window shows the wait for a stream that failed, and Esc ends it. Without one
+    /// (`SOPEN_AUTOSAVE`) nobody could: the failure ends the run.
+    waits: bool,
+    /// Tests: a picture of the bytes so far waits here before it is made.
+    #[cfg(test)]
+    hold_sketch: AtomicBool,
+}
+
+impl Load {
+    fn new(budget: u64) -> Arc<Self> {
+        Self::made(budget, true)
+    }
+
+    /// For a run without a window: nothing is asked, and a failed stream is not waited for.
+    fn windowless() -> Arc<Self> {
+        Self::made(u64::MAX, false)
+    }
+
+    fn made(budget: u64, waits: bool) -> Arc<Self> {
+        Arc::new(Self {
+            budget,
+            waits,
+            cancel: AtomicBool::new(false),
+            progress: Mutex::default(),
+            moved: Condvar::new(),
+            ctx: Mutex::default(),
+            preview: AtomicBool::new(false),
+            #[cfg(test)]
+            hold_sketch: AtomicBool::new(false),
+        })
+    }
+
+    fn progress(&self) -> std::sync::MutexGuard<'_, Progress> {
+        self.progress.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// The window shows something new.
+    fn wake(&self) {
+        let ctx = self.ctx.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        if let Some(ctx) = ctx {
+            ctx.request_repaint();
+        }
+    }
+
+    fn stopped(&self) -> Result<()> {
+        if self.cancel.load(Ordering::SeqCst) {
+            bail!(Stopped);
+        }
+        Ok(())
+    }
+
+    /// Shows the memory line and waits for Continue (06 §7.3): until then nothing more is
+    /// fetched and nothing is reserved. A decode no larger than one already continued is not
+    /// asked about again.
+    fn ask(&self, ask: probe::Ask) -> Result<()> {
+        let mut progress = self.progress();
+        if matches!(ask, probe::Ask::Decode { need, .. } if need <= progress.allowed) {
+            return Ok(());
+        }
+        progress.ask = Some(ask);
+        self.wake();
+        while progress.ask.is_some() && !self.cancel.load(Ordering::SeqCst) {
+            progress = self
+                .moved
+                .wait_timeout(progress, RETRY_LOOK)
+                .unwrap_or_else(|p| p.into_inner())
+                .0;
+        }
+        drop(progress);
+        self.stopped()
+    }
+
+    /// Continue: the loader goes on.
+    fn go(&self) {
+        let mut progress = self.progress();
+        if let Some(probe::Ask::Decode { need, .. }) = progress.ask.take() {
+            progress.allowed = progress.allowed.max(need);
+        }
+        drop(progress);
+        self.moved.notify_all();
+    }
+
+    /// Whether a decode of `need` bytes goes on without asking: within the budget, or continued.
+    fn within(&self, need: u64) -> bool {
+        need <= self.budget || need <= self.progress().allowed
+    }
+
+    fn warn(&self, warning: Option<String>) {
+        let mut progress = self.progress();
+        if progress.warning != warning {
+            progress.warning = warning;
+            drop(progress);
+            self.wake();
+        }
+    }
+
+    #[cfg(test)]
+    fn note_reserved(&self, bytes: u64) {
+        let mut progress = self.progress();
+        progress.reserved = progress.reserved.max(bytes);
+    }
+}
+
+/// `buf.len()` bytes at `off` through the stream (fewer at the end of the file). A stream that
+/// failed is waited for, its words shown meanwhile (06 §5); a stop ends the wait.
+fn read_through(reader: &mut Reader, off: u64, buf: &mut [u8], load: &Load) -> Result<usize> {
+    loop {
+        match reader.read_at(off, buf, &load.cancel) {
+            Ok(n) => {
+                load.warn(None);
+                return Ok(n);
+            }
+            Err(ReadError::Cancelled) => bail!(Stopped),
+            Err(ReadError::Failed(reason)) if load.waits => {
+                load.warn(Some(reason));
+                std::thread::sleep(RETRY_LOOK);
+                load.stopped()?;
+            }
+            Err(e) => return Err(anyhow!(e)),
+        }
+    }
+}
+
+/// The loader: the header, the memory line where one is due, the whole file with pictures of
+/// it on the way, the decode. Runs on a worker; `Err(Stopped)` when it was stopped.
+fn load_input(input: Input, load: &Arc<Load>) -> Result<Loaded> {
+    let source = match input {
+        Input::Bytes(bytes) => {
+            // The size and the thumbnail, as a stream's window has them while it asks.
+            if let Ok(probe::Probe::Header(header)) = probe::probe(&mut probe::Head::of(&bytes)) {
+                let mut progress = load.progress();
+                progress.sketch = header
+                    .thumb
+                    .clone()
+                    .map(|thumb| (Sketch::Thumb, Arc::new(thumb)));
+                progress.header = Some(header);
+            }
+            {
+                let mut progress = load.progress();
+                progress.probed = true;
+                progress.loaded = bytes.len() as u64;
+            }
+            return decode_loaded(bytes, None, load);
+        }
+        Input::Stream(source) => source,
+    };
+    let size = source.size();
+    let found = {
+        let mut head = probe::Head::new(size, probe::HEADER_CAP, |off, buf| {
+            // A reader of its own for each block: one at no position reads nothing ahead of
+            // what it is asked for (06 §4), so the header costs its own blocks and no more.
+            let mut reader = source.reader(ReaderKind::Bulk);
+            read_through(&mut reader, off, buf, load).map_err(|e| {
+                if e.is::<Stopped>() {
+                    std::io::Error::other(Stopped)
+                } else {
+                    std::io::Error::other(format!("{e:#}"))
+                }
+            })
+        });
+        probe::probe(&mut head)
+    };
+    load.stopped()?;
+    let header = match found.map_err(|e| anyhow!("{e}"))? {
+        probe::Probe::Header(header) => Some(header),
+        probe::Probe::Unknown => None,
+        probe::Probe::Refused(why) => bail!(why),
+    };
+    {
+        let mut progress = load.progress();
+        progress.probed = true;
+        progress.sketch = header
+            .as_ref()
+            .and_then(|h| h.thumb.clone())
+            .map(|thumb| (Sketch::Thumb, Arc::new(thumb)));
+        progress.header = header.clone();
+    }
+    load.wake();
+    // Before any pixel data: what the decode will hold, or — nothing known of the picture, or
+    // the file itself this large — what reading it will.
+    let asked = header
+        .as_ref()
+        .and_then(|h| probe::ask_decode(h.need, h.upright(), load.budget))
+        .or_else(|| probe::ask_read(size, load.budget));
+    if let Some(ask) = asked {
+        load.ask(ask)?;
+    }
+    let len = usize::try_from(size).context("the file is larger than this machine can address")?;
+    let bytes = Arc::new(RwLock::new(Vec::<u8>::new()));
+    {
+        let mut buf = bytes.write().unwrap_or_else(|p| p.into_inner());
+        #[cfg(test)]
+        load.note_reserved(size);
+        buf.try_reserve_exact(len).map_err(|_| {
+            anyhow!(
+                "not enough memory: the system refused {} for this file",
+                probe::memory_text(size)
+            )
+        })?;
+    }
+    let mut reader = source.reader(ReaderKind::Bulk);
+    let mut hasher = Sha256::new();
+    let mut step = vec![0u8; READ_STEP];
+    let (mut at, mut mark) = (0u64, 0usize);
+    while at < size {
+        let want = READ_STEP.min((size - at) as usize);
+        let n = read_through(&mut reader, at, &mut step[..want], load)?;
+        if n == 0 {
+            bail!("the file ended after {at} of its {size} bytes");
+        }
+        hasher.update(&step[..n]);
+        bytes
+            .write()
+            .unwrap_or_else(|p| p.into_inner())
+            .extend_from_slice(&step[..n]);
+        at += n as u64;
+        load.progress().loaded = at;
+        load.wake();
+        let mut reached = false;
+        while mark < PREVIEW_MARKS.len() && at < size && at * 100 >= size * PREVIEW_MARKS[mark] {
+            mark += 1;
+            reached = true;
+        }
+        if let Some(header) = header.as_ref().filter(|h| reached && h.has_partials()) {
+            sketch(header, at, &bytes, load);
+        }
+    }
+    drop(reader);
+    drop(source);
+    // A picture still being made reads the bytes: it ends first.
+    let mut progress = load.progress();
+    while progress.previewing {
+        progress = load.moved.wait(progress).unwrap_or_else(|p| p.into_inner());
+    }
+    drop(progress);
+    load.stopped()?;
+    let bytes = std::mem::take(&mut *bytes.write().unwrap_or_else(|p| p.into_inner()));
+    decode_loaded(bytes, Some(hasher.finalize().into()), load)
+}
+
+/// The first `end` bytes of a file still arriving, as a decoder reads them: each read looks at
+/// the buffer only for as long as it copies from it, so the read of the file goes on while a
+/// picture of its first part is decoded (06 §7.3: a mark reached meanwhile is skipped — the
+/// read does not wait).
+struct Arrived {
+    bytes: Arc<RwLock<Vec<u8>>>,
+    end: u64,
+    pos: u64,
+}
+
+impl std::io::Read for Arrived {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let bytes = self.bytes.read().unwrap_or_else(|p| p.into_inner());
+        let end = (self.end as usize).min(bytes.len());
+        let at = (self.pos as usize).min(end);
+        let n = buf.len().min(end - at);
+        buf[..n].copy_from_slice(&bytes[at..at + n]);
+        self.pos += n as u64;
+        Ok(n)
+    }
+}
+
+impl std::io::Seek for Arrived {
+    fn seek(&mut self, to: std::io::SeekFrom) -> std::io::Result<u64> {
+        let next = match to {
+            std::io::SeekFrom::Start(at) => Some(at),
+            std::io::SeekFrom::End(by) => self.end.checked_add_signed(by),
+            std::io::SeekFrom::Current(by) => self.pos.checked_add_signed(by),
+        };
+        self.pos = next.ok_or_else(|| std::io::Error::other("a seek before the start"))?;
+        Ok(self.pos)
+    }
+}
+
+/// Starts a picture of the first `at` bytes on a worker of its own, unless one is being made
+/// (the mark is skipped) or the decode it needs was not continued.
+fn sketch(header: &probe::Header, at: u64, bytes: &Arc<RwLock<Vec<u8>>>, load: &Arc<Load>) {
+    if !load.within(header.need) {
+        return;
+    }
+    {
+        let mut progress = load.progress();
+        if progress.previewing {
+            return;
+        }
+        progress.previewing = true;
+    }
+    /// Whatever happens to the decode, the loader is not left waiting for it.
+    struct Ends(Arc<Load>);
+    impl Drop for Ends {
+        fn drop(&mut self) {
+            self.0.progress().previewing = false;
+            self.0.moved.notify_all();
+            self.0.wake();
+        }
+    }
+    let (header, bytes, load) = (header.clone(), bytes.clone(), load.clone());
+    let ends = Ends(load.clone());
+    let made = std::thread::Builder::new()
+        .name("image-partial".into())
+        .spawn(move || {
+            let _ends = ends;
+            #[cfg(test)]
+            while load.hold_sketch.load(Ordering::SeqCst) && load.stopped().is_ok() {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            let prefix = Arrived {
+                bytes,
+                end: at,
+                pos: 0,
+            };
+            let picture = probe::partial(prefix, &header, PREVIEW_SIDE);
+            #[cfg(test)]
+            load.note_reserved(probe::largest_reserved());
+            if let Some(picture) = picture {
+                let mut progress = load.progress();
+                progress.sketch = Some((Sketch::Partial { at }, Arc::new(picture)));
+                progress.partials += 1;
+            }
+        });
+    // No thread to make it on: no picture this time (the guard went with the closure).
+    drop(made);
+}
+
+/// The decode of the whole file, asked about first where the header could not be (06 §7.3).
+fn decode_loaded(bytes: Vec<u8>, sha256: Option<[u8; 32]>, load: &Arc<Load>) -> Result<Loaded> {
+    load.progress().decoding = true;
+    load.wake();
+    let doc = Doc::decode_asking(
+        &bytes,
+        &|| load.stopped(),
+        &|need, size| match probe::ask_decode(need, size, load.budget) {
+            Some(ask) => load.ask(ask),
+            None => Ok(()),
+        },
+    );
+    #[cfg(test)]
+    load.note_reserved(probe::largest_reserved());
+    let doc = doc?;
+    let shown = load
+        .preview
+        .load(Ordering::SeqCst)
+        .then(|| fitted(&doc))
+        .flatten();
+    load.progress().decoding = false;
+    Ok(Loaded {
+        doc,
+        bytes,
+        sha256,
+        shown,
+    })
+}
+
+/// What the loading window's last pass drew.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Drawn {
+    Nothing,
+    /// The size line alone.
+    Lines,
+    Sketch(Sketch),
+}
+
+/// The image window on a file it does not have yet (06 §7.3): the header's size and the Exif
+/// thumbnail first, the memory line where the decode is large, then the file streaming in with
+/// pictures of what has arrived, and — once it is whole — the image window itself.
+struct Streaming {
+    title: String,
+    /// What the image window is made of once the image is whole.
+    parts: Option<(Origin, PathBuf, Vec<String>)>,
+    /// The stream, until the image is whole.
+    source: Option<Source>,
+    size: u64,
+    load: Arc<Load>,
+    hooks: Hooks,
+    /// A window of its own ([`open_stream`]): what Save will not keep is said on the terminal
+    /// too, and the window takes the image's size once it is known.
+    standalone: bool,
+    image: Option<Box<ImageWindow>>,
+    outcome: Arc<Mutex<Outcome>>,
+    leftover: Arc<Mutex<Option<Job>>>,
+    /// Why the file cannot be shown after all ([`super::Window::failure`]).
+    failed: Arc<Mutex<Option<String>>>,
+    tex: Option<(Sketch, TextureHandle)>,
+    preview: bool,
+    drawn: Drawn,
+    /// The memory line was on screen in the last pass.
+    asked: bool,
+    /// `first` went to the stats line (06 §11).
+    first: bool,
+    /// The window was given the image's size.
+    sized: bool,
+    /// This machine's physical memory, for the memory line.
+    physical: Option<u64>,
+}
+
+impl Drop for Streaming {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+impl Streaming {
+    fn new(
+        input: Input,
+        origin: Origin,
+        cache_root: &Path,
+        hooks: &Hooks,
+        notices: Vec<String>,
+        budget: u64,
+    ) -> Result<Self> {
+        let (source, size) = match &input {
+            Input::Stream(source) => (Some(source.clone()), source.size()),
+            Input::Bytes(bytes) => (None, bytes.len() as u64),
+        };
+        let load = Load::new(budget);
+        let worker = load.clone();
+        std::thread::Builder::new()
+            .name("image-load".into())
+            .spawn(move || {
+                let done = load_input(input, &worker);
+                worker.progress().done = Some(done);
+                worker.wake();
+            })
+            .context("cannot start reading the image")?;
+        Ok(Self {
+            title: origin.display(),
+            parts: Some((origin, cache_root.to_path_buf(), notices)),
+            source,
+            size,
+            load,
+            hooks: hooks.clone(),
+            standalone: false,
+            image: None,
+            outcome: Arc::default(),
+            leftover: Arc::default(),
+            failed: Arc::default(),
+            tex: None,
+            preview: false,
+            drawn: Drawn::Nothing,
+            asked: false,
+            first: false,
+            sized: false,
+            physical: probe::physical_memory(),
+        })
+    }
+
+    /// Stops the loader: nothing more is asked of the stream, and nothing read is kept.
+    fn stop(&self) {
+        self.load.cancel.store(true, Ordering::SeqCst);
+        self.load.moved.notify_all();
+        if let Some(source) = &self.source {
+            source.interrupt();
+        }
+    }
+
+    fn fail(&mut self, ctx: &egui::Context, why: String) {
+        *self.failed.lock().unwrap_or_else(|p| p.into_inner()) = Some(why);
+        self.source = None;
+        super::request_close(ctx);
+    }
+
+    /// The loader's result, once it has one: the image window, or why there is none.
+    fn finish(&mut self, ctx: &egui::Context) {
+        let Some(done) = self.load.progress().done.take() else {
+            return;
+        };
+        if let Some(source) = self.source.take() {
+            if !self.first {
+                source.mark(Mark::First);
+                self.first = true;
+            }
+        }
+        let loaded = match done {
+            Ok(loaded) => loaded,
+            Err(e) if e.is::<Stopped>() => return,
+            Err(e) => return self.fail(ctx, format!("{e:#}")),
+        };
+        let Some((mut origin, cache_root, notices)) = self.parts.take() else {
+            return;
+        };
+        if loaded.sha256.is_some() {
+            origin.at.sha256 = loaded.sha256;
+        }
+        let file = ImageFile::new(origin, loaded.bytes, &cache_root);
+        let (mut doc, mut sel, mut block) = (loaded.doc, Selection::default(), DEFAULT_BLOCK);
+        if let Err(e) = apply_state(&mut doc, &mut sel, &mut block, &self.hooks) {
+            return self.fail(ctx, format!("{e:#}"));
+        }
+        if self.standalone {
+            if let Some(line) = doc.not_kept_line() {
+                eprintln!("sopen: {line}");
+            }
+            if !file.can_replace() {
+                eprintln!("sopen: {CANNOT_REPLACE}");
+            }
+        }
+        let mut window = ImageWindow::new(file, doc, sel, block, notices);
+        window.ask_close = self.hooks.state.ask_close;
+        window.outcome = self.outcome.clone();
+        window.leftover = self.leftover.clone();
+        window.preview = self.preview;
+        window.shown = loaded.shown.filter(|_| self.preview);
+        self.tex = None;
+        self.image = Some(Box::new(window));
+    }
+
+    /// `W×H, N MB, loading N %` (06 §7.3); the size alone while nothing is known of the picture.
+    fn line(&self, progress: &Progress) -> String {
+        let mut parts = Vec::new();
+        if let Some(header) = &progress.header {
+            let (w, h) = header.upright();
+            parts.push(format!("{w}×{h}"));
+        }
+        parts.push(probe::size_text(self.size));
+        if progress.ask.is_some() {
+            // It waits for an answer: nothing loads and nothing decodes.
+        } else if progress.decoding {
+            parts.push("decoding…".into());
+        } else if !progress.probed {
+            parts.push("loading…".into());
+        } else {
+            let percent = progress.loaded * 100 / self.size.max(1);
+            parts.push(format!("loading {percent} %"));
+        }
+        parts.join(", ")
+    }
+
+    fn loading(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
+        let (line, ask, warning, sketch, upright) = {
+            let progress = self.load.progress();
+            (
+                self.line(&progress),
+                progress.ask,
+                progress.warning.clone(),
+                progress.sketch.clone(),
+                progress.header.as_ref().map(probe::Header::upright),
+            )
+        };
+        let probed = self.load.progress().probed;
+        if self.standalone && !self.sized && self.hooks.window_size.is_none() {
+            if let Some((w, h)) = upright {
+                // The size `open` gives the window of an image it has whole.
+                self.sized = true;
+                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(Vec2::new(
+                    (w as f32 + 2.0 * super::chrome::CELL.x).clamp(640.0, 1400.0),
+                    (h as f32 + 121.0).clamp(420.0, 940.0),
+                )));
+            }
+        }
+        let physical = self.physical;
+        let mut lines: Vec<(String, Color32)> = Vec::new();
+        if let Some(ask) = ask {
+            let color = if ask.exceeds(physical) {
+                ui.visuals().error_fg_color
+            } else {
+                ui.visuals().warn_fg_color
+            };
+            lines.push((
+                format!("{} — Continue (Enter) · Close (Esc)", ask.line(physical)),
+                color,
+            ));
+        }
+        if let Some(warning) = warning {
+            lines.push((warning, ui.visuals().error_fg_color));
+        }
+        if !self.preview {
+            if ask.is_some() && super::plain_key(&ctx, Key::Enter) {
+                self.load.go();
+            }
+            if super::plain_key(&ctx, Key::Escape) {
+                // Esc stops the read and keeps nothing (06 §8).
+                self.stop();
+                super::request_close(&ctx);
+            }
+            super::own_keys(ui, &[]);
+            egui::Panel::bottom("status").show(ui, |ui| {
+                ui.add_space(2.0);
+                ui.horizontal(|ui| Status::info(line.clone()).show(ui));
+                ui.add_space(2.0);
+            });
+            if !lines.is_empty() {
+                egui::Panel::bottom("disclosures").show(ui, |ui| {
+                    ui.add_space(2.0);
+                    super::disclosures(ui, &lines);
+                    ui.add_space(2.0);
+                });
+            }
+        }
+        egui::CentralPanel::default()
+            .frame(egui::Frame::NONE)
+            .show(ui, |ui| {
+                let outer = ui.max_rect();
+                let panel =
+                    super::chrome::frame(&ui.painter_at(outer), outer, TITLE, !self.preview);
+                ui.allocate_rect(panel, Sense::hover());
+                let painter = ui.painter_at(panel);
+                painter.rect_filled(panel, 0.0, super::chrome::PALETTE.picture_back);
+                self.drawn = if probed { Drawn::Lines } else { Drawn::Nothing };
+                if let (Some((which, picture)), Some((w, h))) = (sketch, upright) {
+                    let src = Vec2::new(w as f32, h as f32);
+                    let scale = (panel.width() / src.x).min(panel.height() / src.y);
+                    let disp = Rect::from_center_size(panel.center(), src * scale);
+                    if self.tex.as_ref().is_none_or(|(of, _)| *of != which) {
+                        let tex = ctx.load_texture(
+                            "image-loading",
+                            color_image(&picture),
+                            egui::TextureOptions::LINEAR,
+                        );
+                        self.tex = Some((which, tex));
+                    }
+                    if let Some((_, tex)) = &self.tex {
+                        painter.image(
+                            tex.id(),
+                            disp,
+                            Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+                            Color32::WHITE,
+                        );
+                        self.drawn = Drawn::Sketch(which);
+                    }
+                }
+                if self.preview {
+                    // A preview has no rows of its own: its lines are over the picture.
+                    let mut at = panel.left_top() + Vec2::splat(6.0);
+                    for (text, color) in std::iter::once((line.clone(), ui.visuals().text_color()))
+                        .chain(lines.iter().cloned())
+                    {
+                        let galley = painter.layout(
+                            text,
+                            egui::TextStyle::Monospace.resolve(ui.style()),
+                            color,
+                            panel.width() - 12.0,
+                        );
+                        let height = galley.size().y;
+                        painter.galley(at, galley, color);
+                        at.y += height + 2.0;
+                    }
+                }
+            });
+        self.asked = ask.is_some();
+        if probed && !self.first {
+            if let Some(source) = &self.source {
+                source.mark(Mark::First);
+            }
+            self.first = true;
+        }
+    }
+}
+
+impl super::Window for Streaming {
+    fn ui(&mut self, ui: &mut egui::Ui) {
+        if self.image.is_none() {
+            let ctx = ui.ctx().clone();
+            let mut slot = self.load.ctx.lock().unwrap_or_else(|p| p.into_inner());
+            if slot.is_none() {
+                *slot = Some(ctx.clone());
+            }
+            drop(slot);
+            self.finish(&ctx);
+        }
+        match &mut self.image {
+            Some(image) => image.ui(ui),
+            None => self.loading(ui),
+        }
+    }
+
+    /// The complete image; with `loading=1` (06 §11) the first frame with a picture from the
+    /// stream — the thumbnail, else a picture of the bytes so far where the format gives one —
+    /// or the size line where it gives none; and the memory line, which a scripted run cannot
+    /// answer.
+    fn ready(&self) -> bool {
+        if let Some(image) = &self.image {
+            return image.ready();
+        }
+        if self.asked {
+            return true;
+        }
+        if !self.hooks.state.loading {
+            return false;
+        }
+        let progress = self.load.progress();
+        let sketches = progress
+            .header
+            .as_ref()
+            .is_some_and(|h| h.thumb.is_some() || (h.has_partials() && self.load.budget >= h.need));
+        match self.drawn {
+            Drawn::Nothing => false,
+            Drawn::Lines => !sketches,
+            Drawn::Sketch(_) => true,
+        }
+    }
+
+    fn keys(&self) -> &'static [super::chrome::FKey] {
+        match &self.image {
+            Some(image) => super::Window::keys(image.as_ref()),
+            None => &[],
+        }
+    }
+
+    fn set_preview(&mut self, on: bool) {
+        self.preview = on;
+        self.load.preview.store(on, Ordering::SeqCst);
+        if let Some(image) = &mut self.image {
+            image.set_preview(on);
+        }
+    }
+
+    fn set_shown(&mut self, shown: bool) {
+        if let Some(source) = &self.source {
+            source.set_visible(shown);
+        }
+    }
+
+    fn close_requested(&mut self) -> bool {
+        match &mut self.image {
+            Some(image) => image.close_requested(),
+            None => {
+                self.stop();
+                true
+            }
+        }
+    }
+
+    fn failure(&self) -> Option<String> {
+        self.failed
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+    }
+}
+
+/// Opens the image at `origin` through `source` (06 §7.3): the window shows the header's size
+/// and thumbnail before the file is read, and nothing is fetched to open it. With
+/// `SOPEN_AUTOSAVE` there is no window: the file is read, the state applied and saved.
+/// `notices` are shown whole in the window's rows, as [`open`] shows them.
+pub fn open_stream(
+    mut origin: Origin,
+    source: Source,
+    cache_root: &Path,
+    hooks: &Hooks,
+    notices: Vec<String>,
+) -> Result<Outcome> {
+    if hooks.autosave {
+        // No window, and nobody to ask: the run was told to save.
+        let loaded = load_input(Input::Stream(source), &Load::windowless())?;
+        origin.at.sha256 = loaded.sha256;
+        let file = ImageFile::new(origin, loaded.bytes, cache_root);
+        let (mut doc, mut sel, mut block) = (loaded.doc, Selection::default(), DEFAULT_BLOCK);
+        apply_state(&mut doc, &mut sel, &mut block, hooks)?;
+        return autosave(file, &doc, hooks);
+    }
+    let input = Input::Stream(source);
+    let window = Streaming::new(input, origin, cache_root, hooks, notices, probe::BUDGET)?;
+    run_streaming(window, hooks)
+}
+
+/// The loading window in a window of its own, as [`open`] runs the image window.
+fn run_streaming(mut window: Streaming, hooks: &Hooks) -> Result<Outcome> {
+    window.standalone = true;
+    let title = window.title.clone();
+    let (outcome, leftover) = (window.outcome.clone(), window.leftover.clone());
+    let failed = window.failed.clone();
+    let run = super::run_window(&title, LOADING_SIZE, window, hooks);
+    // Never exit with a write in flight without its outcome on the terminal.
+    let outcome = settle(&leftover, &outcome, true).unwrap_or_default();
+    run?;
+    if let Some(why) = failed.lock().unwrap_or_else(|p| p.into_inner()).take() {
+        bail!(why);
+    }
+    Ok(outcome)
+}
+
+/// [`embed`] for an image read through `source` (06 §7.3): the window to host while the file
+/// streams in, which becomes the image window once it is whole. A file that cannot be shown
+/// asks to be closed and says why ([`super::Window::failure`]).
+pub fn embed_stream(
+    origin: Origin,
+    source: Source,
+    cache_root: &Path,
+    notices: Vec<String>,
+) -> Result<super::Embedded> {
+    let hooks = Hooks::default();
+    let input = Input::Stream(source);
+    let window = Streaming::new(input, origin, cache_root, &hooks, notices, probe::BUDGET)?;
+    let (outcome, leftover) = (window.outcome.clone(), window.leftover.clone());
+    Ok(super::Embedded {
+        window: Box::new(window),
+        settle: Box::new(move |wait| settle(&leftover, &outcome, wait)),
+    })
+}
+
 #[cfg(test)]
 mod input_tests;
+
+#[cfg(test)]
+mod stream_tests;
 
 #[cfg(test)]
 mod robustness_tests;
