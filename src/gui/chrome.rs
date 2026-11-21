@@ -123,6 +123,15 @@ pub const EXIT_KEY: FKey = FKey {
     label: "Exit",
 };
 
+/// F7 in the hex, image and media windows: Save As, the same as Alt+Cmd/Ctrl+S — the edited
+/// result to a new local file (07 §7, `gui::save_as`). No row lists it yet: each of those
+/// windows adds it to its row, with its help line, in the change that wires the modal (ED4–ED6),
+/// so a slot never names a key that does nothing. The text viewer is read-only and has none.
+pub const SAVE_AS_KEY: FKey = FKey {
+    n: 7,
+    label: "SaveAs",
+};
+
 /// The hex window's own keys — PC Shell's Sector Edit row (`5Save`, `8Asc/hx`) with File Edit's
 /// `6` for going somewhere: F5 is Cmd/Ctrl+S, F6 is Cmd/Ctrl+G, F8 is Tab (the typing column).
 pub const HEX_KEYS: &[FKey] = &[

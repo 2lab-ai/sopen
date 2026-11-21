@@ -970,8 +970,8 @@ fn percent(done: u64, total: u64) -> u64 {
     }
 }
 
-/// `8.9 of 24.0 GB`, in the unit of the whole.
-fn part_of(done: u64, total: u64) -> String {
+/// `8.9 of 24.0 GB`, in the unit of the whole (also Save As's progress, `gui::save_as`).
+pub(crate) fn part_of(done: u64, total: u64) -> String {
     const UNITS: [(&str, f64); 4] = [("GB", 1e9), ("MB", 1e6), ("KB", 1e3), ("B", 1.0)];
     let (unit, per) = UNITS
         .into_iter()
@@ -1086,8 +1086,8 @@ impl Refusal {
     }
 }
 
-/// `about 3 h 40 min`, `about 12 min`, `about 40 s`.
-fn about(secs: f64) -> String {
+/// `about 3 h 40 min`, `about 12 min`, `about 40 s` (also Save As's times, `gui::save_as`).
+pub(crate) fn about(secs: f64) -> String {
     let secs = secs.max(0.0);
     if secs >= 3600.0 {
         let tens = (secs / 600.0).round() as u64;

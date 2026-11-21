@@ -17,6 +17,21 @@ impl LocalFs {
     pub fn new() -> Self {
         Self
     }
+
+    /// The bytes free to this user on the filesystem holding `path` (`statvfs`), by the path's
+    /// bytes as they are — a name that is not UTF-8 too; `None` when it cannot be read.
+    #[allow(clippy::unnecessary_cast)] // the field types differ between macOS and Linux
+    pub fn free_space_at(path: &Path) -> Option<u64> {
+        use std::os::unix::ffi::OsStrExt as _;
+        let c = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+        // SAFETY: an all-zero statvfs is a valid value to be overwritten.
+        let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+        // SAFETY: `c` is a NUL-terminated path and `st` a valid place for the result.
+        if unsafe { libc::statvfs(c.as_ptr(), &mut st) } != 0 {
+            return None;
+        }
+        Some((st.f_bavail as u64).saturating_mul(st.f_frsize as u64))
+    }
 }
 
 pub(crate) fn stat_of(meta: &fs::Metadata) -> Stat {
@@ -109,16 +124,8 @@ impl RemoteFs for LocalFs {
         }))
     }
 
-    #[allow(clippy::unnecessary_cast)] // the field types differ between macOS and Linux
     fn free_space(&mut self, path: &str) -> Option<u64> {
-        let c = std::ffi::CString::new(path).ok()?;
-        // SAFETY: an all-zero statvfs is a valid value to be overwritten.
-        let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
-        // SAFETY: `c` is a NUL-terminated path and `st` a valid place for the result.
-        if unsafe { libc::statvfs(c.as_ptr(), &mut st) } != 0 {
-            return None;
-        }
-        Some((st.f_bavail as u64).saturating_mul(st.f_frsize as u64))
+        LocalFs::free_space_at(Path::new(path))
     }
 
     fn read_to(

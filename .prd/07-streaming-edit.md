@@ -530,17 +530,41 @@ size rule. Image and media upload their output, as today.
 
 ## 7. Save As (local)
 
-- **Keys.** Alt+Cmd/Ctrl+S, and **F7 "SaveAs"** in the hex, image and media windows' F-key rows. F7
-  is unused in every viewer row today. The text viewer is read-only and gets no Save As.
-- **The modal.** One path field, prefilled with `<download folder>/<stem>.edited<ext>`; the next free
-  `-N` name when that one is taken (`binary::suggest`, `binary::next_free`). Browse… opens the
-  system's save dialog (`binary::NativeChooser`). It shows the size and the time expected at the rate
-  the viewer is getting: `24.0 GB — about 1 h 50 min at 3.6 MB/s`.
+- **Keys.** Alt+Cmd/Ctrl+S, and **F7 "SaveAs"** in the hex, image and media windows' F-key rows
+  (`chrome::SAVE_AS_KEY`). The text viewer is read-only and gets no Save As.
+  - The key and the chord are the windows' to add as ED4, ED5 and ED6 wire Save As, each in its
+    own change. That change adds F7 to its row and its help line, and calls `save_as::pressed`
+    before its Cmd/Ctrl+S checks. F7 stays unused in every viewer row until then, so no slot
+    names a key that does nothing.
+  - The chord is Alt with Cmd/Ctrl and nothing else; F7 is F7 alone, and not while a text field
+    has the typing. egui's own shortcut check ignores an extra Alt, so a window that has not
+    wired Save As takes Alt+Cmd/Ctrl+S as its Cmd/Ctrl+S.
+- **The modal** (`gui::save_as`, ED3; each window opens it from its Save path, ED4–ED6). One path
+  field, prefilled with `<download folder>/<stem>.edited<ext>`; the next free `-N` name when that
+  one is taken (`binary::suggest`, `binary::next_free`). A folder typed in the field gets that name
+  inside it. Browse… opens the system's save dialog (`binary::NativeChooser`). It shows the size and
+  the time expected at the rate the viewer is getting: `24.0 GB — about 1 h 50 min at 3.6 MB/s`. A
+  media render's size is its estimate, shown as `24.0 GB (estimated) — …`. With no measured rate (a
+  local file) it shows the size alone.
 - **How it writes:**
-  1. It refuses early when the chosen folder has less free space than the output.
-  2. It writes through `binary::save_new` unchanged: a private staging folder, `part` created
-     exclusively, and a hard-link publish that fails if anything is at the name. It never writes over
-     anything, nor through a link.
+  1. It refuses early when the chosen folder has less free space than the output (its estimate, for
+     a render), by the folder's `statvfs`: `needs 24.0 GB free in ~/Downloads, has 3.1 GB; nothing
+     was written`.
+     - Nothing is made before this check.
+     - The dead partials that killed saves left in the folder are removed first (`sweep_dead`, as
+       `save_new` does), so they never count against the room.
+     - The folder is measured by its path's bytes, a name that is not UTF-8 included.
+     - A folder whose free space cannot be read is not refused here; the save says what is wrong
+       with it.
+  2. It writes through `binary::save_new` unchanged (`save_new_deciding`, the same routine with the
+     cancel's decision): a private staging folder, `part` created exclusively, and a hard-link
+     publish that fails if anything is at the name. It never writes over anything, nor through a
+     link.
+     - A name taken at the start, or by another program during the transfer, is refused, and the
+       field then holds the next free `-N`. The transferred `part` was removed with the staging
+       folder, so Save again transfers again.
+     - The staging lock records the output's size for `sweep_dead` only when it is exact (hex, an
+       encoded image), never a render's estimate.
   3. The fill applies the edits on the way.
      - Hex: it reads the source fresh on the `Origin` (never the view's cache, §4.2) through a handle
        opened at the start, with up to 4 MiB in flight, and applies the patches.
@@ -553,9 +577,16 @@ size rule. Image and media upload their output, as today.
      download whose source changes meanwhile is not saved").
      - For media, a response cut short during the render fails it (06 §7.4: ffmpeg exits 0 even
        then).
-- **Progress, cancel, result.** Progress shows the bytes and the time left. Esc or Cancel stops it,
-  and only sopen's own staging folder is removed. The result line is `saved <local path>`, also on
-  stdout.
+     - The fill (step 3) and this check are the window's producer (`save_as::Producer`). A refusal
+       says its reason, then `; nothing was saved`.
+- **Progress, cancel, result.** Progress shows the bytes and the time left: `37 % (8.9 of 24.0 GB)
+  — about 1 h 10 min left`, at the transfer's own rate after its first second and at the viewer's
+  rate before that. Esc or Cancel stops it, and only sopen's own staging folder is removed. The
+  result line is `saved <local path>`, also on stdout.
+  - After a cancel the modal stays open and says `cancelled; nothing was saved`. Save again starts
+    a new fill from the beginning. Esc with no save running closes the modal.
+  - A cancel that comes once the complete file is getting its name is refused (`binary::Decision`):
+    the file is saved, and said to be saved.
 - **What it counts as.** A completed Save As puts the edits somewhere, so for the close prompt it
   counts as Save copy does (`HexDoc::mark_copied`), and the journal goes when nothing else is
   unsaved.
