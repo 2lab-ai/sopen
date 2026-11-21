@@ -3792,6 +3792,30 @@ mod stream {
         assert!(lost >= 3, "{lost} rows lost");
         assert_eq!(sx.win.top_row, top + lost);
         assert!(sx.shows(&pattern_row(0x1000)), "after the window shrank");
+        // A narrow window: the warning with its reload hint wraps onto more rows and lies
+        // wholly inside its clip and the window — seen, not only drawn — and the cursor's row
+        // is still on screen above it.
+        const CHANGED: &str = "the file changed on the remote — Cmd/Ctrl+R reloads";
+        assert_eq!(
+            sx.drv.rows_of(CHANGED),
+            Some(1),
+            "one row at the full width"
+        );
+        sx.drv.resize(400.0, 400.0);
+        sx.frames(4);
+        let seen = sx
+            .drv
+            .find_text(CHANGED)
+            .expect("the warning is cut or out of sight");
+        assert!(seen.left() >= 0.0 && seen.right() <= 400.0, "{seen:?}");
+        let rows = sx.drv.rows_of(CHANGED).unwrap();
+        assert!(rows >= 2, "{rows} row at 400 points");
+        let row = 0x1000 / ROW;
+        assert!(
+            (sx.win.top_row..sx.win.top_row + sx.win.visible).contains(&row),
+            "the cursor's row under the wrapped warning"
+        );
+        assert!(sx.shows(&sx.offset(0x1000)));
         // In the middle of the screen: the grid's top does not move.
         let mut sx = open();
         for _ in 0..8 {
