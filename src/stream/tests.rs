@@ -2549,6 +2549,15 @@ fn a_reader_holds_blocks_only_for_its_one_wait() {
     assert!(r.try_read(GIB, MAX_READ).is_pending());
     settle(&mut rig);
     assert_eq!(holding(&rig), 256, "what came for its wait");
+    // A maximum read that starts inside a block touches 257: 16 MiB and one block.
+    assert!(r.try_read(3 * GIB + 1000, MAX_READ).is_pending());
+    settle(&mut rig);
+    assert_eq!(holding(&rig), 257);
+    assert_eq!(
+        257 * BLOCK,
+        MAX_READ as u64 + BLOCK,
+        "the most one waiter holds"
+    );
     // Moved: what it held of the old place goes.
     assert!(r.try_read(5 * GIB, 100 * BLOCK as usize).is_pending());
     assert_eq!(holding(&rig), 0);
@@ -2581,6 +2590,167 @@ fn a_reader_holds_blocks_only_for_its_one_wait() {
         r.try_read(9 * GIB, 300 * BLOCK as usize / 2),
         Poll::Ready(Err(ReadError::Changed))
     );
+}
+
+/// A read that is answered with nothing — at or past the end of the file, or of no length —
+/// ends the reader's previous wait as a move does: what it held is let go, and its unsent
+/// demand is not sent.
+#[test]
+fn an_empty_read_retires_the_wait_before_it() {
+    let holding = |rig: &Rig| rig.source().core().pf.holding();
+    for case in ["at the end", "of no length"] {
+        let empty = |r: &mut Reader| match case {
+            "at the end" => r.try_read(MODEL, 100),
+            _ => r.try_read(9 * GIB, 0),
+        };
+        // Its blocks arrived, unread.
+        let mut rig = rig(MODEL, sim(1, 1_000_000_000));
+        let mut r = rig.reader(media());
+        assert!(r.try_read(GIB, MAX_READ).is_pending());
+        settle(&mut rig);
+        assert_eq!(holding(&rig), 256);
+        assert!(
+            matches!(empty(&mut r), Poll::Ready(Ok(b)) if b.is_empty()),
+            "{case}"
+        );
+        assert_eq!(holding(&rig), 0, "an empty read {case} let go of nothing");
+        assert_eq!(r.waiting(), None);
+        // Most of its demand unsent, on a slow link.
+        let mut rig = rig_with(FakeFile::pattern(MODEL), sim(20, 500_000), NEVER, None);
+        let mut r = rig.reader(media());
+        assert!(r.try_read(GIB, MAX_READ).is_pending());
+        rig.engine.pump();
+        let sent = read_offsets(&rig).len();
+        assert!((1..16).contains(&sent), "the cap let a few go: {sent}");
+        assert!(
+            matches!(empty(&mut r), Poll::Ready(Ok(b)) if b.is_empty()),
+            "{case}"
+        );
+        settle(&mut rig);
+        assert_eq!(
+            read_offsets(&rig).len(),
+            sent,
+            "an obsolete read was sent after an empty read {case}"
+        );
+        assert_eq!(holding(&rig), 0);
+    }
+}
+
+/// A cancelled `read_at` ends its wait too: a Reader kept after the cancel holds nothing,
+/// what was in flight for it arrives and fills nothing, and nothing more of it is sent. Both
+/// places the flag is looked at: before a look, and under the lock before the wait.
+#[test]
+fn a_cancelled_read_at_retires_its_wait() {
+    let holding = |rig: &Rig| rig.source().core().pf.holding();
+    for at_the_wait in [false, true] {
+        let mut rig = rig_with(FakeFile::pattern(MODEL), sim(20, 500_000), NEVER, None);
+        let mut r = rig.reader(media());
+        assert!(r.try_read(GIB, MAX_READ).is_pending());
+        rig.engine.pump();
+        let sent = read_offsets(&rig).len();
+        assert!((1..16).contains(&sent), "the cap let a few go: {sent}");
+        let cancel = Arc::new(AtomicBool::new(!at_the_wait));
+        if at_the_wait {
+            let flag = cancel.clone();
+            rig.source().probe().seam = Some(Box::new(move || flag.store(true, Ordering::SeqCst)));
+        }
+        let mut buf = vec![0; MAX_READ];
+        assert_eq!(r.read_at(GIB, &mut buf, &cancel), Err(ReadError::Cancelled));
+        assert_eq!(
+            r.waiting(),
+            None,
+            "the wait outlived the cancel ({at_the_wait})"
+        );
+        // What was in flight arrives: it fills nothing, and nothing more is sent.
+        settle(&mut rig);
+        assert_eq!(
+            holding(&rig),
+            0,
+            "the cancelled wait was filled ({at_the_wait})"
+        );
+        assert_eq!(read_offsets(&rig).len(), sent, "an obsolete read was sent");
+    }
+}
+
+/// What a reader holds does not outlive a failure or a reload, with the cache long past the
+/// blocks it held: none is kept, the reader gets the state's own error, and after the stream
+/// is back (and the reader renewed) it reads the bytes that are there now.
+#[test]
+fn held_blocks_do_not_outlive_a_failure_or_a_reload() {
+    let mut rig = rig(MODEL, sim(1, 1_000_000_000));
+    let holding = |rig: &Rig| rig.source().core().pf.holding();
+    let whole = MAX_READ;
+    // `r` waits at `at`, its blocks arrive unread, and another reader's reading pushes them
+    // out of the cache.
+    fn hold_and_evict(rig: &mut Rig, r: &mut Reader, at: u64, far: u64) {
+        assert!(r.try_read(at, MAX_READ).is_pending());
+        settle(rig);
+        let mut other = rig.reader(ReaderKind::Interactive);
+        rig.stream(&mut other, far, far + 1100 * BLOCK, BLOCK as usize);
+        drop(other);
+        settle(rig);
+        assert_eq!(rig.source().core().pf.holding(), 256);
+        assert!(
+            !rig.source().core().cache.contains(at / BLOCK + 100),
+            "what it holds is no longer in the cache"
+        );
+    }
+    let mut r = rig.reader(ReaderKind::Bulk);
+
+    // Failed.
+    hold_and_evict(&mut rig, &mut r, GIB, 2 * GIB);
+    rig.control.fault(rig.sent().len(), Fault::Lost);
+    let mut miss = rig.reader(ReaderKind::Interactive);
+    assert!(miss.try_read(3 * GIB + 1000, 480).is_pending());
+    rig.drain();
+    assert!(matches!(rig.state(), State::Failed(_)));
+    assert_eq!(holding(&rig), 0, "kept through a failure");
+    assert!(matches!(
+        r.try_read(GIB, whole),
+        Poll::Ready(Err(ReadError::Failed(_)))
+    ));
+    rig.engine.pump();
+    assert_eq!(rig.state(), State::Live, "the read asked for the retry");
+    let got = rig.read(&mut r, GIB, whole);
+    assert!(got[..] == pattern(GIB, whole)[..]);
+    assert_eq!(holding(&rig), 0);
+
+    // A reload that succeeds, on a file written since.
+    hold_and_evict(&mut rig, &mut r, 4 * GIB, 5 * GIB);
+    rig.control.change(write(4 * GIB, false));
+    rig.source().request_reload();
+    rig.engine.pump();
+    assert_eq!(rig.state(), State::Live);
+    assert_eq!(holding(&rig), 0, "kept through a reload");
+    assert_eq!(
+        r.try_read(4 * GIB, whole),
+        Poll::Ready(Err(ReadError::Reloaded))
+    );
+    r.renew();
+    let got = rig.read(&mut r, 4 * GIB, whole);
+    assert!(got[..4096] == [0xEE; 4096], "the file as it is now");
+    assert!(got[4096..] == pattern(4 * GIB + 4096, whole - 4096)[..]);
+
+    // A reload that fails.
+    hold_and_evict(&mut rig, &mut r, 6 * GIB, 7 * GIB);
+    let now = rig.control.file().unwrap();
+    rig.control.change(Change::Remove);
+    rig.source().request_reload();
+    rig.engine.pump();
+    assert!(matches!(rig.state(), State::Failed(_)));
+    assert_eq!(holding(&rig), 0, "kept through a failed reload");
+    assert_eq!(
+        r.try_read(6 * GIB, whole),
+        Poll::Ready(Err(ReadError::Reloaded))
+    );
+    rig.control.change(Change::Replace(now));
+    rig.source().request_reload();
+    rig.engine.pump();
+    assert_eq!(rig.state(), State::Live);
+    r.renew();
+    let got = rig.read(&mut r, 6 * GIB, whole);
+    assert!(got[..] == pattern(6 * GIB, whole)[..]);
+    assert_eq!(holding(&rig), 0);
 }
 
 // ---- the cache under a Source ----

@@ -156,10 +156,12 @@ The first two paragraphs are this document. The third is 07.
     the cache.
   - So a wait never depends on what the cache keeps, and the cache evicts freely: by window,
     then by age. Nothing limits which waits are served; priority is §4's class order alone.
-  - The references are dropped when the read completes, when the reader moves, is renewed or is
-    dropped, and when the Source fails, changes or reloads. Nothing held is served after a
+  - The references are dropped when the read completes or is cancelled, when the reader moves
+    (a read at the end of the file or of no length counts), is renewed or is dropped, and when
+    the Source fails, changes or reloads. Nothing held is served after a
     change or a reload.
-  - **Memory:** the cache's 64 MiB, plus at most 16 MiB for each reader with a wait outstanding.
+  - **Memory:** the cache's 64 MiB, plus at most 16 MiB and one block (257 blocks: a 16 MiB
+    span that starts inside a block) for each reader with a wait outstanding.
     A held block that is also in the cache is one buffer, counted once.
 - **Bulk readers insert at the cold end.** Their blocks are the next to go, so a pass over the whole
   file (an index pass, the waveform, Save As) does not evict what the screen or playback needs.
@@ -903,7 +905,7 @@ Left as whole fetches, with the fetch now pipelined (§2):
 
 | Resource | Bound |
 |---|---|
-| RAM per Source | 64 MiB of blocks + at most 16 MiB per reader with a wait outstanding (§3) + at most 4 MiB in flight |
+| RAM per Source | 64 MiB of blocks + at most 16 MiB and one block per reader with a wait outstanding (§3) + at most 4 MiB in flight |
 | RAM, the hex window | + its page cache, 64 × 4 KiB |
 | RAM, the text viewer | + its index, at most 16 MiB up to 64 GiB of indexed text (§7.2) |
 | RAM, the image window | the encoded bytes + the decoded pixels, as today; above 512 MiB decoded only after Continue (§7.3) |

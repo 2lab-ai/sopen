@@ -1474,7 +1474,12 @@ impl Reader {
             _ if len > MAX_READ => Err(ReadError::Failed(format!(
                 "a read of {len} bytes is longer than one read may be ({MAX_READ})"
             ))),
-            _ if off >= end => Ok((Got::Bytes(Bytes::new()), false)),
+            // Nothing to read, at the end of the file or of no length: the wait before it is
+            // over, as when the reader moves.
+            _ if off >= end => {
+                core.pf.retire(self.id);
+                Ok((Got::Bytes(Bytes::new()), false))
+            }
             State::Failed(reason) => match core.serve(self.id, off, end) {
                 Some(bytes) => Ok((Got::Bytes(bytes), false)),
                 None => {
@@ -1519,6 +1524,8 @@ impl Reader {
         let mut done = 0;
         while done < buf.len() {
             if cancel.load(Ordering::SeqCst) {
+                // A cancelled read waits for nothing: a Reader kept after it holds nothing.
+                self.shared.lock().pf.retire(self.id);
                 return Err(ReadError::Cancelled);
             }
             let ask = (buf.len() - done).min(READ_CHUNK);
@@ -1535,7 +1542,7 @@ impl Reader {
                     if let Some(seam) = seam {
                         seam();
                     }
-                    let core = self.shared.lock();
+                    let mut core = self.shared.lock();
                     let (first, last) = (
                         (off + done as u64) / BLOCK,
                         (off + (done + ask) as u64 - 1) / BLOCK,
@@ -1543,6 +1550,7 @@ impl Reader {
                     // Nothing came between the look and this lock: wait for a block or a wake.
                     let ready = !core.live() || (first..=last).all(|b| core.there(self.id, b));
                     if cancel.load(Ordering::SeqCst) {
+                        core.pf.retire(self.id);
                         return Err(ReadError::Cancelled);
                     }
                     if !ready {

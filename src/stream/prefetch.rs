@@ -405,6 +405,17 @@ impl Prefetcher {
         }
     }
 
+    /// Reader `id` waits for nothing any more (an empty read, a cancel): as a move does, what
+    /// it held is let go, and what it had queued is not sent.
+    pub fn retire(&mut self, id: u64) {
+        if let Some(r) = self.readers.get_mut(&id) {
+            r.span = None;
+            r.since = None;
+            r.got.clear();
+            r.prefetch.clear();
+        }
+    }
+
     /// A validated block arrived: every reader waiting for it takes a reference of its own.
     pub fn deliver(&mut self, block: u64, bytes: &Bytes) {
         for r in self.readers.values_mut() {
