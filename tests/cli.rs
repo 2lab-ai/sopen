@@ -230,6 +230,36 @@ fn hex_flag_saves_patches_to_a_text_file() {
     );
 }
 
+/// 06 §12 V17: a local file is untouched by streaming. It is read in place, so no stream is
+/// made — `SOPEN_STREAM_STATS` prints no line — and the usage line says so: `bytes_fetched` 0
+/// beside the file's size (06 §11).
+#[test]
+fn a_local_file_makes_no_stream() {
+    let tmp = tempfile::tempdir().unwrap();
+    let file = tmp.path().join("blob.bin");
+    std::fs::write(&file, [0u8, 1, 2, 3, 0xff, 0xfe, 0, 0]).unwrap();
+    let out = sopen(
+        tmp.path(),
+        &["--hex", file.to_str().unwrap()],
+        &[
+            ("SOPEN_STREAM_STATS", "1"),
+            ("SOPEN_STATE", "patch=1:AA"),
+            ("SOPEN_AUTOSAVE", "1"),
+        ],
+    );
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert_eq!(std::fs::read(&file).unwrap()[..2], [0, 0xAA]);
+    let said = text(&out.stderr);
+    assert!(
+        !said.lines().any(|line| line.starts_with("stream ")),
+        "a local file got a stream: {said}"
+    );
+    let log = usage_lines(tmp.path());
+    assert_eq!(log[0]["bytes_fetched"], 0, "{}", log[0]);
+    assert_eq!(log[0]["bytes"], 8);
+    assert_eq!(log[0]["fetch_ms"], 0);
+}
+
 /// A scripted save on a binary file must say what to open: the dialog would wait for an answer
 /// no one gives (a scripted run ignores input). An error, not a window.
 #[test]

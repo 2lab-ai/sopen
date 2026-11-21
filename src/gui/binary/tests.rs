@@ -3,7 +3,7 @@
 //! counting file layer on the route main takes ([`open_file`]) — plus Save to…'s file rules.
 
 use super::*;
-use crate::gui::testkit::Driver;
+use crate::gui::testkit::{Driver, Meter as Metered};
 use crate::remote::{LocalFs, Stat};
 use eframe::egui::{Modifiers, Pos2};
 use std::os::unix::fs::FileExt;
@@ -66,6 +66,7 @@ impl Source for Fake {
         &mut self,
         dest: &Path,
         progress: &mut dyn FnMut(u64, u64),
+        cancel: &Decision,
     ) -> std::result::Result<SavedTo, SaveError> {
         self.saves.fetch_add(1, Ordering::SeqCst);
         if let Some(hold) = &self.hold {
@@ -74,7 +75,7 @@ impl Source for Fake {
         if self.panics {
             panic!("the transfer worker dies (test)");
         }
-        copy_to(&self.file, dest, progress)
+        copy_to(&self.file, dest, progress, cancel)
     }
 }
 
@@ -429,10 +430,11 @@ fn browse_without_an_answer_says_the_path_field_still_works() {
     assert!(fx.out_files().is_empty());
 }
 
-/// Closing during a download never cuts it: the window says it closes when the transfer is
-/// done, and does then; Enter and Esc do nothing meanwhile.
+/// Closing during a download cancels it (06 §7.5, replacing 01 §6a's "closing waits for it"):
+/// the transfer stops, nothing is saved, and the window closes then; Enter does nothing
+/// meanwhile.
 #[test]
-fn closing_during_a_download_waits_for_it() {
+fn closing_during_a_download_cancels_it() {
     let (release, hold) = mpsc::channel();
     let mut fx = dialog_with(Opts {
         hold: Some(hold),
@@ -442,14 +444,12 @@ fn closing_during_a_download_waits_for_it() {
     assert!(matches!(fx.win.stage, Stage::Moving { .. }));
     assert!(!fx.win.ready(), "no screenshot mid-transfer");
     fx.drv.key(&mut fx.win, Key::Enter, Modifiers::NONE);
-    fx.drv.key(&mut fx.win, Key::Escape, Modifiers::NONE);
     assert!(!fx.win.close_ok);
-    assert!(!fx.win.close_requested());
-    fx.drv.idle(&mut fx.win, 2);
-    assert!(fx.drv.find_text(CLOSES_AFTER).is_some());
+    assert!(!fx.win.close_requested(), "until the transfer has stopped");
     release.send(()).unwrap();
     fx.drv.until(&mut fx.win, 20, |w| w.close_ok);
-    assert_eq!(std::fs::read(fx.out.join("blob.zip")).unwrap(), BODY);
+    assert!(fx.out_files().is_empty(), "{:?}", fx.out_files());
+    assert_eq!(fx.win.ended.lock().unwrap().moved, Moved::Stopped);
     assert_eq!(fx.calls(), (0, 1));
 }
 
@@ -929,16 +929,21 @@ fn copy_to_refuses_a_source_that_changes_mid_copy() {
             .unwrap();
         let dest = tmp.path().join(format!("{case}.bin"));
         let mut once = true;
-        let result = copy_to(&src, &dest, &mut |_, _| {
-            if std::mem::take(&mut once) {
-                let f = File::options().write(true).open(&src).unwrap();
-                if case == "truncated" {
-                    f.set_len(1 << 20).unwrap();
-                } else {
-                    f.write_all_at(&[0xEE; 4096], 2 << 20).unwrap();
+        let result = copy_to(
+            &src,
+            &dest,
+            &mut |_, _| {
+                if std::mem::take(&mut once) {
+                    let f = File::options().write(true).open(&src).unwrap();
+                    if case == "truncated" {
+                        f.set_len(1 << 20).unwrap();
+                    } else {
+                        f.write_all_at(&[0xEE; 4096], 2 << 20).unwrap();
+                    }
                 }
-            }
-        });
+            },
+            &Decision::default(),
+        );
         match result {
             Err(SaveError::Failed(e)) => assert!(
                 format!("{e:#}").contains("changed while it was copied"),
@@ -968,6 +973,7 @@ fn a_download_of_a_file_that_changes_meanwhile_is_not_saved() {
                 std::fs::write(&src, b"a different, longer body than before").unwrap();
             }
         },
+        &Decision::default(),
     );
     match result {
         Err(SaveError::Failed(e)) => assert!(format!("{e:#}").contains("changed"), "{e:#}"),
@@ -981,9 +987,231 @@ fn a_download_of_a_file_that_changes_meanwhile_is_not_saved() {
         src.to_str().unwrap(),
         &dest,
         &mut |_, _| {},
+        &Decision::default(),
     )
     .unwrap();
     assert_eq!(std::fs::read(&dest).unwrap().len() as u64, saved.bytes);
+}
+
+/// 06 §7.5, the one decision: a cancel that comes during the download's final stat — after the
+/// last byte, before the publish — still wins. Nothing is under the name, nothing is left of the
+/// staging, and the error is the cancel's.
+#[test]
+fn w8a_a_cancel_during_the_final_remote_stat_publishes_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("src.bin");
+    std::fs::write(&src, BODY).unwrap();
+    let dest = tmp.path().join("dest.bin");
+    let decision = Arc::new(Decision::default());
+    let cancel = decision.clone();
+    let mut fs = Counting {
+        fs: Box::new(LocalFs::new()),
+        reads: Arc::default(),
+        hold: None,
+        refuse: Arc::default(),
+        // The stat before the read is the first; the one after it the second.
+        at_stat: Some(Arc::new(move |n| {
+            if n == 2 {
+                assert!(cancel.cancel(), "nothing is published yet");
+            }
+        })),
+        stats: 0,
+    };
+    let result = download_to(
+        &mut fs,
+        src.to_str().unwrap(),
+        &dest,
+        &mut |_, _| {},
+        &decision,
+    );
+    assert_eq!(fs.stats, 2, "the cancel came inside the final stat");
+    assert!(
+        result.as_ref().is_err_and(save_cancelled),
+        "{:?}",
+        result.map(|s| s.bytes)
+    );
+    assert!(!dest.exists(), "nothing is published");
+    assert_eq!(names(tmp.path()), ["src.bin"], "no staging folder left");
+}
+
+/// The same decision for a local copy: a cancel from the last progress report (the whole file
+/// copied, the read at its end) wins, and so does one made before an empty file is copied —
+/// which has no chunk to stop between.
+#[test]
+fn w8a_a_cancel_at_the_end_of_a_local_copy_publishes_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("src.bin");
+    std::fs::write(&src, BODY).unwrap();
+    let dest = tmp.path().join("dest.bin");
+    let decision = Decision::default();
+    let result = copy_to(
+        &src,
+        &dest,
+        &mut |done, total| {
+            if done == total {
+                assert!(decision.cancel());
+            }
+        },
+        &decision,
+    );
+    assert!(decision.cancelled(), "the last report came");
+    assert!(
+        result.as_ref().is_err_and(save_cancelled),
+        "the last report"
+    );
+    assert!(!dest.exists());
+    let empty = tmp.path().join("empty.bin");
+    std::fs::write(&empty, b"").unwrap();
+    let decision = Decision::default();
+    assert!(decision.cancel());
+    let result = copy_to(&empty, &dest, &mut |_, _| {}, &decision);
+    assert!(result.as_ref().is_err_and(save_cancelled), "an empty file");
+    assert!(!dest.exists());
+    assert_eq!(
+        names(tmp.path()),
+        ["empty.bin", "src.bin"],
+        "no staging left"
+    );
+}
+
+/// The decision is taken right before the complete file gets its name — after the fill, its
+/// sync and its mode. A cancel that comes just before that publishes nothing and leaves nothing;
+/// one that comes after is refused, and the save is reported as what it is: saved.
+#[test]
+fn w8a_cancel_and_publish_are_decided_once_right_before_the_link() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dest = tmp.path().join("dest.bin");
+    let fill = |file: &mut File| -> Result<u64> {
+        file.write_all(BODY)?;
+        Ok(BODY.len() as u64)
+    };
+    // Just before publication: the part is complete, synced, and has its mode.
+    let decision = Decision::default();
+    let result = save_new_deciding(
+        &dest,
+        fill,
+        &mut |step, staging| {
+            if step == LinkStep::Publish {
+                let part = std::fs::read(staging.join("part")).unwrap();
+                assert_eq!(part, BODY, "the complete file is staged");
+                assert!(decision.cancel());
+            }
+            Ok(())
+        },
+        &decision,
+    );
+    assert!(result.as_ref().is_err_and(save_cancelled), "cancel won");
+    assert!(!dest.exists(), "nothing is published");
+    assert_eq!(names(tmp.path()), Vec::<String>::new(), "no staging left");
+    // After it: the publish has won, and the cancel is told so.
+    let decision = Decision::default();
+    let saved = save_new_deciding(&dest, fill, &mut |_, _| Ok(()), &decision).unwrap();
+    assert_eq!(saved.bytes, BODY.len() as u64);
+    assert!(!decision.cancel(), "too late: the file has its name");
+    assert!(!decision.cancelled());
+    assert_eq!(std::fs::read(&dest).unwrap(), BODY);
+    assert_eq!(names(tmp.path()), ["dest.bin"]);
+}
+
+/// A save whose publication wins the decision and then loses the name: something takes the
+/// destination between the decision and the link.
+fn taken_at_the_last_moment(
+    dest: &Path,
+    decision: &Decision,
+) -> std::result::Result<SavedTo, SaveError> {
+    let fill = |file: &mut File| -> Result<u64> {
+        file.write_all(BODY)?;
+        Ok(BODY.len() as u64)
+    };
+    save_new_deciding(
+        dest,
+        fill,
+        &mut |step, _| {
+            if step == LinkStep::Publish {
+                std::fs::write(dest, b"someone else's file").unwrap();
+            }
+            Ok(())
+        },
+        decision,
+    )
+}
+
+/// Publication wins the decision, then the link itself fails: the name was taken at the last
+/// moment. The save is refused as `Exists` — not as cancelled, not as saved — the file there
+/// keeps its contents, the staging is cleaned, and a cancel that comes after is still told it
+/// was too late (the decision was the publish's, whatever the link then did).
+#[test]
+fn w8a_a_publish_that_won_and_then_lost_the_name_is_exists_not_cancelled() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dest = tmp.path().join("dest.bin");
+    let decision = Decision::default();
+    let result = taken_at_the_last_moment(&dest, &decision);
+    match &result {
+        Err(SaveError::Exists { next }) => assert_eq!(next, &tmp.path().join("dest-1.bin")),
+        other => panic!("{other:?}"),
+    }
+    assert!(!result.as_ref().is_err_and(save_cancelled));
+    assert_eq!(std::fs::read(&dest).unwrap(), b"someone else's file");
+    assert_eq!(names(tmp.path()), ["dest.bin"], "the staging is cleaned");
+    assert!(!decision.cancel(), "too late: the publish had won");
+    assert!(!decision.cancelled());
+}
+
+/// The dialog's own source, for the test above in the window: its save loses the name at the
+/// last moment, with the window's own decision.
+struct Taken;
+
+impl Source for Taken {
+    fn open_hex(&mut self, _: &mut dyn FnMut(u64, u64)) -> Result<Opened> {
+        bail!("not in this test")
+    }
+
+    fn save_to(
+        &mut self,
+        dest: &Path,
+        _: &mut dyn FnMut(u64, u64),
+        cancel: &Decision,
+    ) -> std::result::Result<SavedTo, SaveError> {
+        taken_at_the_last_moment(dest, cancel)
+    }
+}
+
+/// The same in the dialog: it says the name exists and was not replaced, and offers the next
+/// one — it never says `saved`, and never `cancelled`; nothing is recorded as saved.
+#[test]
+fn w8a_the_dialog_does_not_say_saved_when_the_name_was_taken_at_the_last_moment() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dest = tmp.path().join("blob.zip");
+    let hooks = Hooks {
+        save_to: Some(dest.clone()),
+        ..Hooks::default()
+    };
+    let info = Info {
+        title: "box:/remote/blob.zip".into(),
+        name: "blob.zip".into(),
+        size: BODY.len() as u64,
+        local: false,
+    };
+    let mut win = BinaryWindow::new(
+        info,
+        Box::new(Taken),
+        Box::new(Picks(None, Arc::default())),
+        &hooks,
+    );
+    let mut drv = Driver::new(WINDOW[0], 320.0);
+    drv.idle(&mut win, 3);
+    drv.click_text(&mut win, "Save to…");
+    drv.until(&mut win, 20, |w| w.asking() && !w.notes.is_empty());
+    drv.idle(&mut win, 3);
+    let shown: Vec<String> = drv.texts().into_iter().map(|(_, _, text)| text).collect();
+    let said = |what: &str| shown.iter().any(|text| text.contains(what));
+    assert!(said("exists — not replaced"), "{shown:?}");
+    assert!(said("blob-1.zip"), "the next free name: {shown:?}");
+    assert!(!said("saved "), "{shown:?}");
+    assert!(!said("cancelled"), "{shown:?}");
+    assert!(win.ended.lock().unwrap().saved_to.is_none());
+    assert_eq!(std::fs::read(&dest).unwrap(), b"someone else's file");
+    assert_eq!(names(tmp.path()), ["blob.zip"], "the staging is cleaned");
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -992,12 +1220,53 @@ fn a_download_of_a_file_that_changes_meanwhile_is_not_saved() {
 /// The local disk posing as a remote host, counting full reads (a fetch or a download is one)
 /// and head reads.
 struct Counting {
-    fs: LocalFs,
+    fs: Box<dyn RemoteFs + Send>,
     reads: Arc<AtomicUsize>,
+    /// A full read stops here once, at its first response, until the test lets it go.
+    hold: Option<Hold>,
+    /// Why the file is not opened for a stream, while it is not.
+    refuse: Arc<Mutex<Option<String>>>,
+    /// Called at every stat, with how many there have been (tests: a cancel inside one).
+    at_stat: Option<AtStat>,
+    stats: usize,
+}
+
+type AtStat = Arc<dyn Fn(usize) + Send + Sync>;
+
+/// Where a held read says it is there, and waits to be let go (at most 20 s: a failed test
+/// never leaves a worker hanging).
+struct Hold {
+    reached: mpsc::Sender<()>,
+    go: Receiver<()>,
+}
+
+/// What a held read writes through: its first response stops at the gate, after it was taken.
+struct HoldWriter<'a> {
+    out: &'a mut dyn Write,
+    hold: Option<Hold>,
+}
+
+impl Write for HoldWriter<'_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let n = self.out.write(buf)?;
+        if let Some(hold) = self.hold.take() {
+            let _ = hold.reached.send(());
+            let _ = hold.go.recv_timeout(Duration::from_secs(20));
+        }
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.out.flush()
+    }
 }
 
 impl RemoteFs for Counting {
     fn stat_opt(&mut self, p: &str) -> Result<Option<Stat>> {
+        self.stats += 1;
+        if let Some(at_stat) = &self.at_stat {
+            at_stat(self.stats);
+        }
         self.fs.stat_opt(p)
     }
     fn lstat_opt(&mut self, p: &str) -> Result<Option<Stat>> {
@@ -1023,7 +1292,11 @@ impl RemoteFs for Counting {
         progress: &mut dyn FnMut(u64),
     ) -> Result<u64> {
         self.reads.fetch_add(1, Ordering::SeqCst);
-        self.fs.read_to(p, out, progress)
+        let mut held = HoldWriter {
+            out,
+            hold: self.hold.take(),
+        };
+        self.fs.read_to(p, &mut held, progress)
     }
     fn create_from(
         &mut self,
@@ -1045,6 +1318,42 @@ impl RemoteFs for Counting {
     fn remove(&mut self, p: &str) -> Result<()> {
         self.fs.remove(p)
     }
+    /// The connection becomes the stream's transport (06 §2); a failure gives it back.
+    fn into_ranged(
+        self: Box<Self>,
+        path: &str,
+    ) -> std::result::Result<Box<dyn crate::remote::Ranged>, crate::remote::Refused> {
+        let Counting {
+            fs,
+            reads,
+            hold,
+            refuse,
+            ..
+        } = *self;
+        let back = |fs| -> Box<dyn RemoteFs + Send> {
+            Box::new(Counting {
+                fs,
+                reads: Arc::clone(&reads),
+                hold: None,
+                refuse: Arc::clone(&refuse),
+                at_stat: None,
+                stats: 0,
+            })
+        };
+        drop(hold);
+        let refused = refuse.lock().unwrap().clone();
+        if let Some(why) = refused {
+            return Err(crate::remote::Refused {
+                conn: back(fs),
+                error: anyhow!(why),
+            });
+        }
+        fs.into_ranged(path)
+            .map_err(|refused| crate::remote::Refused {
+                conn: back(refused.conn),
+                error: refused.error,
+            })
+    }
 }
 
 struct NoMeter;
@@ -1060,7 +1369,18 @@ struct Route {
     tmp: tempfile::TempDir,
     abs: String,
     reads: Arc<AtomicUsize>,
+    /// Connections opened after the open's own (the `Origin`'s, a stream's retry).
+    dials: Arc<AtomicUsize>,
+    /// Why the file is not opened for a stream, while it is not.
+    refuse: Arc<Mutex<Option<String>>>,
+    /// What crossed the route's connections, counted below the `Source` ([`Metered`]): a stream
+    /// may ask a first screen's block and 4 MiB more, a whole read may deliver 8 MiB — a route
+    /// that reads the owner's 24 GB whole fails at once, not after the file.
+    meter: Arc<Metered>,
 }
+
+/// What the first screen costs.
+const BLOCK: u64 = crate::stream::BLOCK;
 
 impl Route {
     fn new() -> Self {
@@ -1072,7 +1392,22 @@ impl Route {
             abs: file.to_str().unwrap().to_string(),
             tmp,
             reads: Arc::default(),
+            dials: Arc::default(),
+            refuse: Arc::default(),
+            meter: Metered::new(BLOCK + (4 << 20), 8 << 20),
         }
+    }
+
+    /// The route on a file of `size` bytes that holds nothing (sparse: no disk is used).
+    fn sized(size: u64) -> Self {
+        let route = Self::new();
+        let file = std::fs::File::create(&route.abs).unwrap();
+        file.set_len(size).unwrap();
+        route
+    }
+
+    fn dials(&self) -> usize {
+        self.dials.load(Ordering::SeqCst)
     }
 
     fn cache(&self) -> PathBuf {
@@ -1080,13 +1415,40 @@ impl Route {
     }
 
     fn source(&self) -> FileSource {
+        self.source_over(Box::new(LocalFs::new()), None)
+    }
+
+    /// The production source over `fs` posing as host `box`; `hold` stops its first full read
+    /// at its first response.
+    fn source_over(&self, fs: Box<dyn RemoteFs + Send>, hold: Option<Hold>) -> FileSource {
         let fs = Counting {
-            fs: LocalFs::new(),
+            fs: self.meter.connection(fs),
             reads: Arc::clone(&self.reads),
+            hold,
+            refuse: Arc::clone(&self.refuse),
+            at_stat: None,
+            stats: 0,
         };
+        let (reads, dials, refuse, meter) = (
+            Arc::clone(&self.reads),
+            Arc::clone(&self.dials),
+            Arc::clone(&self.refuse),
+            Arc::clone(&self.meter),
+        );
+        let reconnect: crate::gui::Reconnect = Box::new(move || {
+            dials.fetch_add(1, Ordering::SeqCst);
+            Ok(Box::new(Counting {
+                fs: meter.connection(Box::new(LocalFs::new())),
+                reads: Arc::clone(&reads),
+                hold: None,
+                refuse: Arc::clone(&refuse),
+                at_stat: None,
+                stats: 0,
+            }) as Box<dyn RemoteFs + Send>)
+        });
         FileSource::new(
             Box::new(fs),
-            None,
+            Some(reconnect),
             Some("box".to_string()),
             &self.abs,
             &self.cache(),
@@ -1171,41 +1533,399 @@ fn the_route_main_takes_downloads_nothing_before_the_choice() {
     assert!(!route.tmp.path().join("out.zip").exists());
 }
 
-/// Closed while the hex fetch ran: the fetch finishes and the window closes, and the closing
-/// line does not claim that nothing was downloaded — the file is in the cache.
+/// Closed while the hex window was being opened: the open ends, its stream is dropped unused
+/// and the window closes. Nothing was fetched (06 §7.5), so nothing is in the cache and the
+/// closing line claims no download.
 #[test]
-fn a_fetch_finished_during_close_is_not_called_nothing_downloaded() {
+fn a_close_while_the_hex_window_opens_closes_without_it() {
     let route = Route::new();
     let out = route.open(&route.hooks(), |drv, win| {
         drv.idle(win, 3);
         let ctx = drv.ctx.clone();
         win.start_hex(&ctx);
-        assert!(!win.close_requested(), "waits for the fetch");
+        assert!(!win.close_requested(), "waits for the open");
         drv.until(win, 20, |w| w.close_ok);
     });
-    assert_eq!(route.reads(), 1, "the fetch happened");
+    assert_eq!(route.reads(), 0, "nothing was read whole");
     assert!(out.action.is_none(), "the hex window did not open");
-    assert!(out.fetch_ms.is_some(), "the fetch is in the usage log");
-    let line = out.cancelled.expect("a closing line");
-    assert!(!line.contains("nothing was downloaded"), "{line}");
-    assert!(line.contains("cache"), "{line}");
+    assert!(out.fetch_ms.is_none(), "nothing was fetched");
+    assert_eq!(out.cancelled.as_deref(), Some("sopen: cancelled"));
+    assert!(walk(&route.cache()).is_empty());
 }
 
-/// The same route, answered: Enter fetches once (into the cache, claimed and recorded) and the
-/// window becomes the hex window; "Save to…" downloads once to the path, not into the cache.
+// ---------------------------------------------------------------------------------------------
+// 06 §13 W8a: the routes open a stream.
+
+const FIRST_ROW: &str = "50 4B 03 04 20 61 20 7A  69 70 2C 20 61 73 20 66";
+
+/// 06 §12 V1 at the hex answer — the step the dialog's Enter, `SOPEN_CHOICE=hex` and `--hex`
+/// all run: a remote file of the owner's size (24 GB, here sparse) opens through a stream.
+/// Nothing of it is read whole or reaches the cache, the open's connection is the stream's and
+/// no other is made — whether the server can replace a file is not asked at open (06 §2) — and
+/// the first screen costs one block.
 #[test]
-fn the_route_main_takes_fetches_once_on_the_choice() {
+fn w8a_the_hex_answer_opens_a_stream_and_fetches_one_block() {
+    const SIZE: u64 = 24_000_000_000;
+    let route = Route::sized(SIZE);
+    let mut source = route.source();
+    let opened = source.open_hex(&mut |_, _| {}).unwrap();
+    let stream = opened
+        .file
+        .stream()
+        .expect("a remote file is viewed through a stream");
+    assert_eq!(stream.size(), SIZE);
+    assert_eq!(opened.fetch_ms, None, "nothing was fetched to open it");
+    assert_eq!(route.reads(), 0, "no whole read");
+    assert!(
+        opened.file.can_replace(),
+        "taken as yes until the first Save"
+    );
+    assert_eq!(route.dials(), 0, "the Origin connects on its first use");
+    let mut win = hex::embedded(
+        opened.file,
+        &Hooks::default(),
+        opened.notices,
+        Arc::default(),
+        Arc::default(),
+    )
+    .unwrap();
+    let mut drv = Driver::new(760.0, 560.0);
+    drv.until(&mut win, 60, |w| w.ready());
+    assert!(
+        drv.find_text("00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00")
+            .is_some(),
+        "the first rows"
+    );
+    // What crossed the connection, by the fixture's own count below the Source: one read, of
+    // block 0, answered once; nothing read whole; no budget passed.
+    assert_eq!(
+        route.meter.reads_of(&route.abs),
+        vec![(0, BLOCK as u32)],
+        "one block before the first screen"
+    );
+    assert_eq!(route.meter.totals(), (BLOCK, 1, 0, 0));
+    assert!(!route.meter.tripped());
+    assert!(route.meter.heads.load(Ordering::SeqCst) <= 8 << 10);
+    // And the product's own statistic says the same.
+    assert_eq!(stream.fetched().total, BLOCK);
+    assert_eq!(route.reads(), 0, "no whole read");
+    assert_eq!(route.dials(), 0, "no second connection for viewing");
+    assert!(
+        walk(&route.cache()).is_empty(),
+        "viewing writes nothing to disk: {:?}",
+        walk(&route.cache())
+    );
+}
+
+/// The standalone route (`sopen host:/file`, the dialog and Enter) and the dialog with its
+/// answer preset (`SOPEN_CHOICE=hex`): the window becomes the hex window over a stream — no
+/// whole read, nothing in the cache, no fetch time.
+#[test]
+fn w8a_the_dialog_streams_on_enter_and_on_a_preset_answer() {
+    for preset in [false, true] {
+        let route = Route::new();
+        let hooks = Hooks {
+            choice: preset.then_some(Choice::Hex),
+            ..route.hooks()
+        };
+        let out = route.open(&hooks, |drv, win| {
+            drv.idle(win, 3);
+            if !preset {
+                drv.key(win, Key::Enter, Modifiers::NONE);
+            }
+            drv.until(win, 20, |w| matches!(w.stage, Stage::Hex(_)));
+            drv.until(win, 20, |w| w.ready());
+            assert!(drv.find_text(FIRST_ROW).is_some(), "the hex grid");
+        });
+        assert_eq!(route.reads(), 0, "preset {preset}: no whole read");
+        // The fixture's count: the 41-byte file crossed once, as one stream reply.
+        assert_eq!(
+            route.meter.totals(),
+            (BODY.len() as u64, 1, 0, 0),
+            "preset {preset}"
+        );
+        assert_eq!(route.dials(), 0, "preset {preset}: one connection");
+        assert_eq!(out.action, Some("open"));
+        assert_eq!(out.fetch_ms, None, "a streamed open has no fetch time");
+        assert!(
+            walk(&route.cache()).is_empty(),
+            "preset {preset}: {:?}",
+            walk(&route.cache())
+        );
+    }
+}
+
+/// `--hex` (06 §7.5) opens a stream; with `SOPEN_AUTOSAVE` its Save runs without a window. The
+/// open's connection is the stream's, so the Save is the `Origin`'s first use: it connects
+/// then, once, and fetches the whole file for the interim Save (06 §7.1) — the one whole read.
+#[test]
+fn w8a_the_hex_flag_streams_and_its_save_is_the_origins_first_use() {
     let route = Route::new();
+    let hooks = Hooks {
+        autosave: true,
+        state: crate::gui::State {
+            patches: vec![(0, vec![0xAA])],
+            ..Default::default()
+        },
+        ..route.hooks()
+    };
+    let out = open_file(
+        route.info(),
+        route.source(),
+        &hooks,
+        true,
+        true,
+        &mut NoMeter,
+        Box::new(Picks(None, Arc::default())),
+        &mut |_| panic!("no window with SOPEN_AUTOSAVE"),
+    )
+    .unwrap();
+    assert_eq!(out.action, Some("save"));
+    assert_eq!(out.fetch_ms, None, "a streamed open has no fetch time");
+    let now = std::fs::read(&route.abs).unwrap();
+    assert_eq!(now[0], 0xAA);
+    assert_eq!(now[1..], BODY[1..]);
+    assert_eq!(route.dials(), 1, "the Origin connected at its first Save");
+    assert_eq!(
+        route.reads(),
+        2,
+        "the interim Save's whole fetch, and the overwrite's re-read of the target (01 §5)"
+    );
+}
+
+/// The words `ssh` has for a session the server refused, as a failed start carries them
+/// (`remote::sftp`'s `a_refused_session_reaches_the_starts_error` shows they get there).
+const REFUSED: &str = "cannot start sftp on box: unexpected end of file: ssh said: \
+     mux_client_request_session: session request failed: Session open refused by peer";
+
+/// 06 §12 V10 at open, in the dialog: Enter while the hex answer fails as sshd's refusal of a
+/// session does. The dialog shows 06 §6's line — not ssh's words — and asks again, as it was:
+/// it kept its connection, so Enter once sessions are free opens the stream on it, with no
+/// second connection, and nothing was fetched whole meanwhile.
+#[test]
+fn w8a_v10_a_refused_session_is_said_in_the_dialog_which_recovers() {
+    let route = Route::new();
+    *route.refuse.lock().unwrap() = Some(REFUSED.into());
     let out = route.open(&route.hooks(), |drv, win| {
         drv.idle(win, 3);
         drv.key(win, Key::Enter, Modifiers::NONE);
+        drv.until(win, 20, |w| w.asking() && !w.notes.is_empty());
+        drv.idle(win, 3);
+        let shown: String = drv
+            .texts()
+            .iter()
+            .map(|(_, _, text)| text.replace('\n', " "))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let shown = shown.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            shown.contains(crate::stream::SESSION_REFUSED),
+            "the dialog shows the line: {shown}"
+        );
+        assert!(!shown.contains("mux_client"), "not ssh's words: {shown}");
+        assert!(drv.find_text("Open in hex editor").is_some(), "as it was");
+        assert_eq!(route.reads(), 0, "never a quiet whole fetch instead");
+        assert_eq!(route.meter.totals(), (0, 0, 0, 0), "nothing crossed");
+        // Sessions are free again: the same Enter opens it, on the connection it kept.
+        *route.refuse.lock().unwrap() = None;
+        drv.key(win, Key::Enter, Modifiers::NONE);
         drv.until(win, 20, |w| matches!(w.stage, Stage::Hex(_)));
+        drv.until(win, 20, |w| w.ready());
+        assert!(drv.find_text(FIRST_ROW).is_some(), "the hex grid");
     });
-    assert_eq!(route.reads(), 1, "one fetch");
     assert_eq!(out.action, Some("open"));
-    let copy = crate::cache::cache_path(&route.cache(), "box", &route.abs);
-    assert_eq!(std::fs::read(copy).unwrap(), BODY);
+    assert_eq!(route.dials(), 0, "on the connection it kept");
+    assert_eq!(route.meter.totals(), (BODY.len() as u64, 1, 0, 0));
+}
 
+/// The same refusal under the dialog's other answer: the source keeps its connection, so
+/// "Save to…" still downloads.
+#[test]
+fn w8a_v10_a_refused_hex_open_leaves_save_to_working() {
+    let route = Route::new();
+    *route.refuse.lock().unwrap() = Some(REFUSED.into());
+    let mut source = route.source();
+    let err = source
+        .open_hex(&mut |_, _| {})
+        .err()
+        .expect("the session was refused");
+    assert_eq!(format!("{err:#}"), crate::stream::SESSION_REFUSED);
+    assert!(source.fs.is_some(), "the connection stays with the dialog");
+    let dest = route.tmp.path().join("saved.zip");
+    source
+        .save_to(&dest, &mut |_, _| {}, &Decision::default())
+        .unwrap();
+    assert_eq!(std::fs::read(&dest).unwrap(), BODY);
+}
+
+/// "Any size" includes none: an empty remote file opens through a stream, and the hex window
+/// comes ready.
+#[test]
+fn w8a_an_empty_remote_file_opens_in_the_hex_window() {
+    let route = Route::sized(0);
+    let opened = route.source().open_hex(&mut |_, _| {}).unwrap();
+    assert!(opened.file.stream().is_some());
+    let mut win = hex::embedded(
+        opened.file,
+        &Hooks::default(),
+        opened.notices,
+        Arc::default(),
+        Arc::default(),
+    )
+    .unwrap();
+    let mut drv = Driver::new(760.0, 560.0);
+    drv.until(&mut win, 20, |w| w.ready());
+    assert_eq!(route.reads(), 0);
+}
+
+/// 06 §12 V17: a local file is read in place — no stream — by the same step.
+#[test]
+fn w8a_v17_a_local_file_gets_no_stream() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("blob.bin");
+    std::fs::write(&path, BODY).unwrap();
+    let mut source = FileSource::new(
+        Box::new(LocalFs::new()),
+        None,
+        None,
+        path.to_str().unwrap(),
+        &tmp.path().join("cache"),
+        None,
+    );
+    let opened = source.open_hex(&mut |_, _| {}).unwrap();
+    assert!(opened.file.stream().is_none(), "read in place");
+    assert!(walk(&tmp.path().join("cache")).is_empty());
+}
+
+/// A dialog on a 4 MiB file "on host box" (this machine's SFTP server) whose download stops at
+/// its first response until the test lets it go.
+fn held_download() -> Option<(Route, FileSource, Receiver<()>, mpsc::Sender<()>)> {
+    let server = crate::remote::SftpRemote::local_server()?;
+    let route = Route::new();
+    std::fs::write(&route.abs, vec![0x5A; 4 << 20]).unwrap();
+    let (reached_tx, reached) = mpsc::channel();
+    let (go, go_rx) = mpsc::channel();
+    let hold = Hold {
+        reached: reached_tx,
+        go: go_rx,
+    };
+    let source = route.source_over(Box::new(server), Some(hold));
+    Some((route, source, reached, go))
+}
+
+/// A cancelled download took its first response and no other: by the fixture's count, the
+/// one after the cancel was offered and refused, none came after it, and of the file's 4 MiB
+/// at most one response's bytes were written. Nothing reached the cache either.
+fn assert_stopped_at_its_first_response(route: &Route) {
+    let (_, _, bytes, reads) = route.meter.totals();
+    let responses = route.meter.whole_responses.load(Ordering::SeqCst);
+    assert_eq!(reads, 1, "one download");
+    assert_eq!(responses, 2, "the response after the cancel ended it");
+    assert!(
+        bytes > 0 && bytes <= u64::from(crate::remote::PIPE_REQUEST),
+        "{bytes} bytes taken of {}",
+        4 << 20
+    );
+    assert!(!route.meter.tripped());
+    assert!(
+        walk(&route.cache()).is_empty(),
+        "nothing in the cache: {:?}",
+        walk(&route.cache())
+    );
+}
+
+/// What "Save to…" left beside its target: nothing — no file, no private staging folder.
+fn left_in(dir: &Path) -> Vec<String> {
+    names(dir)
+        .into_iter()
+        .filter(|n| n != "remote" && n != "cache")
+        .collect()
+}
+
+/// 06 §12 V21: Esc during "Save to…" cancels it. The transfer stops between its responses, the
+/// part and the private folder are removed, nothing is published, the dialog asks again and
+/// says so — and the next "Save to…" saves.
+#[test]
+fn w8a_v21_esc_cancels_a_save_to_and_leaves_nothing() {
+    let Some((route, source, reached, go)) = held_download() else {
+        return;
+    };
+    let hooks = route.hooks();
+    let mut win = BinaryWindow::new(
+        route.info(),
+        Box::new(source),
+        Box::new(Picks(None, Arc::default())),
+        &hooks,
+    );
+    let mut drv = Driver::new(WINDOW[0], 320.0);
+    drv.idle(&mut win, 3);
+    drv.click_text(&mut win, "Save to…");
+    assert!(matches!(win.stage, Stage::Moving { .. }));
+    reached
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the download began");
+    drv.key(&mut win, Key::Escape, Modifiers::NONE);
+    drop(go);
+    drv.until(&mut win, 20, |w| !matches!(w.stage, Stage::Moving { .. }));
+    assert!(win.asking(), "the dialog asks again");
+    drv.idle(&mut win, 2);
+    assert!(
+        drv.find_text("cancelled; nothing was saved").is_some(),
+        "the dialog says so"
+    );
+    assert_eq!(left_in(route.tmp.path()), Vec::<String>::new());
+    assert!(win.ended.lock().unwrap().saved_to.is_none());
+    assert_stopped_at_its_first_response(&route);
+    // The source came back whole: the next Save to… downloads.
+    drv.click_text(&mut win, "Save to…");
+    drv.until(&mut win, 20, |w| matches!(w.stage, Stage::Saved { .. }));
+    let saved = std::fs::read(route.tmp.path().join("out.zip")).unwrap();
+    assert_eq!(saved.len(), 4 << 20);
+}
+
+/// 06 §12 V21: closing the window during "Save to…" cancels it the same way — the window does
+/// not wait for the rest of the file — and the run's closing line says nothing was saved.
+#[test]
+fn w8a_v21_closing_cancels_a_save_to_and_leaves_nothing() {
+    let Some((route, source, reached, go)) = held_download() else {
+        return;
+    };
+    let hooks = route.hooks();
+    let mut go = Some(go);
+    let ended = super::dialog(
+        route.info(),
+        Box::new(source),
+        Box::new(Picks(None, Arc::default())),
+        &hooks,
+        &mut |mut win| {
+            let mut drv = Driver::new(WINDOW[0], 320.0);
+            drv.idle(&mut win, 3);
+            drv.click_text(&mut win, "Save to…");
+            reached
+                .recv_timeout(Duration::from_secs(10))
+                .expect("the download began");
+            assert!(!win.close_requested(), "until the transfer has stopped");
+            drop(go.take());
+            drv.until(&mut win, 20, |w| w.close_ok);
+            assert!(win.close_requested());
+            Ok(())
+        },
+    )
+    .unwrap();
+    assert!(ended.saved_to.is_none() && ended.hex.is_none());
+    assert_eq!(
+        cancel_line(false, ended.moved),
+        "sopen: cancelled; nothing was saved"
+    );
+    assert_eq!(left_in(route.tmp.path()), Vec::<String>::new());
+    assert_eq!(route.reads(), 1, "one download, stopped");
+    assert_stopped_at_its_first_response(&route);
+}
+
+/// The same route, answered "Save to…": one download to the path, not into the cache. (The hex
+/// answer is `w8a_the_dialog_streams_on_enter_and_on_a_preset_answer`.)
+#[test]
+fn the_route_main_takes_downloads_once_on_save_to() {
     let route = Route::new();
     let out = route.open(&route.hooks(), |drv, win| {
         drv.idle(win, 3);
@@ -1250,7 +1970,9 @@ fn a_failed_hex_open_keeps_the_source_for_save_and_a_retry() {
     std::fs::remove_dir(&copy).unwrap();
     std::fs::write(&copy, BODY).unwrap();
     let dest = route.tmp.path().join("saved.zip");
-    source.save_to(&dest, &mut |_, _| {}).unwrap();
+    source
+        .save_to(&dest, &mut |_, _| {}, &Decision::default())
+        .unwrap();
     assert_eq!(std::fs::read(&dest).unwrap(), BODY);
     assert_eq!(
         route.reads(),
@@ -1283,7 +2005,9 @@ fn a_failed_local_hex_open_keeps_the_source() {
     std::fs::remove_dir(&path).unwrap();
     std::fs::write(&path, BODY).unwrap();
     let dest = tmp.path().join("copy.bin");
-    source.save_to(&dest, &mut |_, _| {}).unwrap();
+    source
+        .save_to(&dest, &mut |_, _| {}, &Decision::default())
+        .unwrap();
     assert_eq!(std::fs::read(&dest).unwrap(), BODY);
     assert!(source.open_hex(&mut |_, _| {}).is_ok());
     assert!(walk(&tmp.path().join("cache")).is_empty(), "read in place");

@@ -16,6 +16,9 @@ pub struct Record {
     pub ext: Option<String>,
     pub bytes: u64,
     pub fetch_ms: u64,
+    /// The bytes every stream of the run received (06 §11). A streamed open keeps `bytes` (the
+    /// file's size) and has `fetch_ms` 0.
+    pub bytes_fetched: u64,
     /// `open` | `save` | `export` | `cut` | `stems` | `discard`.
     pub action: Option<&'static str>,
     pub conflict: bool,
@@ -40,6 +43,7 @@ pub fn line(rec: &Record, at: SystemTime) -> String {
         "ext": rec.ext,
         "bytes": rec.bytes,
         "fetch_ms": rec.fetch_ms,
+        "bytes_fetched": rec.bytes_fetched,
         "action": rec.action,
         "conflict": rec.conflict,
         "ok": rec.ok,
@@ -75,6 +79,7 @@ mod tests {
             ext: Some("mp3".into()),
             bytes: 1234,
             fetch_ms: 56,
+            bytes_fetched: 65_536,
             action: Some("cut"),
             conflict: false,
             ok: true,
@@ -91,6 +96,7 @@ mod tests {
         assert_eq!(v["ext"], "mp3");
         assert_eq!(v["bytes"], 1234);
         assert_eq!(v["fetch_ms"], 56);
+        assert_eq!(v["bytes_fetched"], 65_536);
         assert_eq!(v["action"], "cut");
         assert_eq!(v["conflict"], false);
         assert_eq!(v["forwarded"], true);

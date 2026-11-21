@@ -3484,6 +3484,36 @@ mod stream {
         panic!("the byte at {at} never came");
     }
 
+    /// 06 §5 through the window (W8a): told it is held without being drawn
+    /// (`Window::set_shown(false)`: a browser preview behind a viewer), the hex window's stream
+    /// does not poll — nothing is asked of the remote; shown again, it polls every 2 s.
+    #[test]
+    fn a_window_held_without_being_drawn_does_not_poll() {
+        let mut sx = sx_with(
+            FakeFile::pattern(MODEL),
+            Link::gate(),
+            Duration::from_secs(2),
+            &Hooks::default(),
+        )
+        .unwrap();
+        sx.settle();
+        assert!(sx.win.ready());
+        Window::set_shown(&mut sx.win, false);
+        let sent = sx.sent();
+        sx.run_for(Duration::from_secs(9));
+        assert_eq!(sx.sent(), sent, "a hidden window asks nothing");
+        Window::set_shown(&mut sx.win, true);
+        sx.run_for(Duration::from_secs(5));
+        let asked: Vec<Asked> = sx.control.sent()[sent..].iter().map(|s| s.asked).collect();
+        assert!(asked.len() >= 4, "it polls again: {asked:?}");
+        assert!(
+            asked
+                .iter()
+                .all(|a| matches!(a, Asked::Fstat | Asked::StatPath)),
+            "{asked:?}"
+        );
+    }
+
     /// V11: `changed`, `changed_count`, `dirty` and `unsaved` with 1 000 patches send no
     /// request and ask the stream for nothing — each patch holds the byte it replaced.
     #[test]

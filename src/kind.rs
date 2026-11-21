@@ -221,15 +221,26 @@ pub fn detect(
     abs: &str,
     stat: &crate::remote::Stat,
 ) -> anyhow::Result<Kind> {
+    detect_sniffed(fs, abs, stat).map(|(kind, _)| kind)
+}
+
+/// [`detect`], with the bytes its sniff read (0 when the stat or the extension decided): what
+/// a stream's stats line counts apart as `sniff` (06 §11).
+pub fn detect_sniffed(
+    fs: &mut dyn crate::remote::RemoteFs,
+    abs: &str,
+    stat: &crate::remote::Stat,
+) -> anyhow::Result<(Kind, u64)> {
     if stat.is_dir {
-        return Ok(Kind::Directory);
+        return Ok((Kind::Directory, 0));
     }
     let (_, name) = crate::remote::split_parent(abs);
     if let Some(kind) = by_extension(name) {
-        return Ok(kind);
+        return Ok((kind, 0));
     }
     let head = fs.read_head(abs, SNIFF_BYTES)?;
-    Ok(classify(name, || head, stat.size))
+    let sniffed = head.len() as u64;
+    Ok((classify(name, || head, stat.size), sniffed))
 }
 
 /// The kind once the file is local at `local` (`name` = its name): video by extension but with

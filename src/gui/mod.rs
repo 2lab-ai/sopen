@@ -16,6 +16,7 @@ pub mod image;
 pub mod media;
 pub mod playback;
 mod select;
+pub mod streamed;
 #[cfg(test)]
 pub(crate) mod testkit;
 pub mod text;
@@ -64,6 +65,23 @@ impl Origin {
         }
     }
 
+    /// The `Origin` of a remote viewer whose connection is not made yet (06 §2, 02 §4.4): it
+    /// holds a placeholder that fails every call, so its first use — [`Origin::fs`]'s probe, at
+    /// a Save, a Save copy or an Export — connects through `reconnect`, and the viewer works on
+    /// that session from then on. Until then nothing is asked of the server: what it can do is
+    /// answered as given — yes for a streamed viewer, whose first Save asks before it fetches
+    /// or writes anything (06 §2); a preview's own connection's answers for a viewer that read
+    /// a copy (the same server).
+    pub fn placeholder(
+        reconnect: Option<Reconnect>,
+        label: String,
+        abs: String,
+        at: Stat,
+        can: Placeholder,
+    ) -> Self {
+        Self::new(Box::new(can), reconnect, Some(label), abs, at)
+    }
+
     /// `host:/abs` (or the local path) — the window title and how results are printed.
     pub fn display(&self) -> String {
         self.show(&self.abs)
@@ -109,6 +127,84 @@ impl Origin {
             self.fs = reconnect().context("the connection was lost and could not be reopened")?;
         }
         Ok(self.fs.as_mut())
+    }
+}
+
+/// A connection that is not there yet ([`Origin::placeholder`]): every call fails, and what
+/// the server can do is answered from here, without a request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Placeholder {
+    pub can_replace: bool,
+    pub can_link: bool,
+}
+
+impl Placeholder {
+    /// A streamed viewer's (06 §2): the answer is taken as yes until the first use connects.
+    pub const YES: Placeholder = Placeholder {
+        can_replace: true,
+        can_link: true,
+    };
+}
+
+fn not_connected() -> anyhow::Error {
+    anyhow!("not connected yet")
+}
+
+impl RemoteFs for Placeholder {
+    fn stat_opt(&mut self, _: &str) -> Result<Option<Stat>> {
+        Err(not_connected())
+    }
+    fn lstat_opt(&mut self, _: &str) -> Result<Option<Stat>> {
+        Err(not_connected())
+    }
+    fn realpath(&mut self, _: &str) -> Result<String> {
+        Err(not_connected())
+    }
+    fn read_head(&mut self, _: &str, _: usize) -> Result<Vec<u8>> {
+        Err(not_connected())
+    }
+    fn list_dir(&mut self, _: &str) -> Result<Vec<String>> {
+        Err(not_connected())
+    }
+    fn list_entries(&mut self, _: &str) -> Result<Vec<crate::remote::Entry>> {
+        Err(not_connected())
+    }
+    fn read_to(
+        &mut self,
+        _: &str,
+        _: &mut dyn std::io::Write,
+        _: &mut dyn FnMut(u64),
+    ) -> Result<u64> {
+        Err(not_connected())
+    }
+    fn create_from(
+        &mut self,
+        _: &Path,
+        _: &str,
+        _: Option<crate::remote::Like>,
+    ) -> std::result::Result<crate::remote::Uploaded, crate::remote::CreateError> {
+        Err(crate::remote::CreateError::new(
+            crate::remote::Created::No,
+            not_connected(),
+        ))
+    }
+    fn set_mode(&mut self, _: &str, _: u32) -> Result<()> {
+        Err(not_connected())
+    }
+    fn rename_over(&mut self, _: &str, _: &str) -> Result<()> {
+        Err(not_connected())
+    }
+    fn link_new(&mut self, _: &str, _: &str) -> Result<()> {
+        Err(not_connected())
+    }
+    fn can_link(&self) -> bool {
+        self.can_link
+    }
+    fn can_replace(&self) -> bool {
+        self.can_replace
+    }
+    fn remove(&mut self, _: &str) -> Result<()> {
+        Err(not_connected())
     }
 }
 
@@ -452,6 +548,14 @@ pub trait Window {
     /// for the viewers).
     fn set_preview(&mut self, on: bool) {
         let _ = on;
+    }
+
+    /// The window is on screen (`true`), or held without being drawn (`false`: the file
+    /// browser keeps a preview it does not show while a viewer covers the panels). A window
+    /// that reads through a stream passes it on (`Source::set_visible`): a hidden one does
+    /// not poll its file for changes (06 §5). On screen by default; the default does nothing.
+    fn set_shown(&mut self, shown: bool) {
+        let _ = shown;
     }
 
     /// Why the window cannot show its file after all (it found out once it was on screen — a

@@ -12,6 +12,7 @@ use crate::fileops::{Item, ItemOutcome, Progress, Report};
 use crate::gui::testkit::command;
 use crate::remote::SftpRemote;
 use std::os::unix::fs::MetadataExt;
+use std::time::Duration;
 
 /// Passes past the 150 ms commit (200 ms of the test kit's clock).
 const REST: usize = 12;
@@ -98,6 +99,13 @@ struct Seen {
     bytes: u64,
     live: usize,
     peak: usize,
+    /// The files opened as a stream on a watched connection (06 §13), in order; the bytes
+    /// their reads brought; and how often a stream gave its connection back.
+    streams: Vec<String>,
+    streamed: u64,
+    given_back: usize,
+    /// Streams that closed their transport for good.
+    closed: usize,
 }
 
 type Shared = Arc<Mutex<Seen>>;
@@ -183,6 +191,139 @@ impl RemoteFs for Watching {
     fn remove(&mut self, p: &str) -> Result<()> {
         self.fs.remove(p)
     }
+    /// The connection becomes a stream's transport (06 §2), and comes back as a watched one.
+    fn into_ranged(
+        self: Box<Self>,
+        path: &str,
+    ) -> std::result::Result<Box<dyn crate::remote::Ranged>, crate::remote::Refused> {
+        let Watching {
+            fs,
+            seen,
+            gate,
+            hold,
+            id,
+        } = *self;
+        seen.lock().unwrap().streams.push(path.to_string());
+        match Box::new(fs).into_ranged(path) {
+            Ok(ranged) => {
+                // An open stream is activity on the session, as a read under way is.
+                {
+                    let mut seen = seen.lock().unwrap();
+                    seen.live += 1;
+                    seen.peak = seen.peak.max(seen.live);
+                }
+                Ok(Box::new(WatchedStream {
+                    inner: Some(ranged),
+                    seen,
+                    gate,
+                    hold,
+                    id,
+                }))
+            }
+            Err(refused) => Err(crate::remote::Refused {
+                conn: Box::new(Watching {
+                    fs: LocalFs::new(),
+                    seen,
+                    gate,
+                    hold,
+                    id,
+                }),
+                error: refused.error,
+            }),
+        }
+    }
+}
+
+/// A watched connection while a stream reads on it: its reads' bytes are counted
+/// ([`Seen::streamed`]), and it is the same watched connection again when the stream gives it
+/// back.
+struct WatchedStream {
+    inner: Option<Box<dyn crate::remote::Ranged>>,
+    seen: Shared,
+    gate: Gate,
+    hold: &'static str,
+    id: usize,
+}
+
+impl Drop for WatchedStream {
+    fn drop(&mut self) {
+        self.seen.lock().unwrap().live -= 1;
+    }
+}
+
+impl WatchedStream {
+    fn inner(&self) -> &dyn crate::remote::Ranged {
+        self.inner.as_ref().expect("a live transport").as_ref()
+    }
+
+    fn inner_mut(&mut self) -> &mut Box<dyn crate::remote::Ranged> {
+        self.inner.as_mut().expect("a live transport")
+    }
+
+    fn into_watching(mut self) -> Watching {
+        drop(
+            self.inner
+                .take()
+                .expect("a live transport")
+                .into_connection(),
+        );
+        Watching {
+            fs: LocalFs::new(),
+            seen: self.seen.clone(),
+            gate: self.gate.clone(),
+            hold: self.hold,
+            id: self.id,
+        }
+    }
+}
+
+impl crate::remote::Ranged for WatchedStream {
+    fn path(&self) -> &str {
+        self.inner().path()
+    }
+    fn opened(&self) -> Stat {
+        self.inner().opened()
+    }
+    fn read(&mut self, off: u64, len: u32) -> crate::remote::Ticket {
+        self.inner_mut().read(off, len)
+    }
+    fn fstat(&mut self) -> crate::remote::Ticket {
+        self.inner_mut().fstat()
+    }
+    fn stat_path(&mut self) -> crate::remote::Ticket {
+        self.inner_mut().stat_path()
+    }
+    fn pending(&self) -> usize {
+        self.inner().pending()
+    }
+    fn next(&mut self, timeout: Option<Duration>) -> Option<crate::remote::Completion> {
+        let c = self.inner_mut().next(timeout)?;
+        let n = c.data().map_or(0, |b| b.len() as u64);
+        self.seen.lock().unwrap().streamed += n;
+        Some(c)
+    }
+    fn waker(&self) -> crate::remote::Wake {
+        self.inner().waker()
+    }
+    fn now(&self) -> std::time::Instant {
+        self.inner().now()
+    }
+    fn reopen(
+        self: Box<Self>,
+        path: &str,
+    ) -> std::result::Result<Box<dyn crate::remote::Ranged>, crate::remote::Refused> {
+        Box::new(self.into_watching()).into_ranged(path)
+    }
+    fn into_connection(self: Box<Self>) -> Box<dyn RemoteFs + Send> {
+        self.seen.lock().unwrap().given_back += 1;
+        Box::new(self.into_watching())
+    }
+    fn close(mut self: Box<Self>) {
+        self.seen.lock().unwrap().closed += 1;
+        if let Some(inner) = self.inner.take() {
+            inner.close();
+        }
+    }
 }
 
 fn watching(seen: &Shared, gate: &Gate, hold: &'static str) -> Connect {
@@ -267,6 +408,24 @@ fn tree_state(dir: &Path) -> Vec<(String, String)> {
     walk(dir, dir, &mut out);
     out.sort();
     out
+}
+
+/// A picture of about 2 MiB at `big.png` (noise: it does not compress) — a file a preview still
+/// reads whole, into a private copy (text and binaries stream, 06 §13). Its size.
+fn big_picture(fx: &Fx) -> u64 {
+    let mut seed = 0x2545_f491_u32;
+    let img = image::RgbImage::from_fn(900, 800, |_, _| {
+        seed ^= seed << 13;
+        seed ^= seed >> 17;
+        seed ^= seed << 5;
+        let [a, b, c, _] = seed.to_le_bytes();
+        image::Rgb([a, b, c])
+    });
+    let path = format!("{}/big.png", fx.root);
+    img.save(&path).unwrap();
+    let size = std::fs::metadata(&path).unwrap().len();
+    assert!(size > 1 << 20, "{size}");
+    size
 }
 
 /// The window's preview copies: the files under `<cache>/.preview/<window>/`.
@@ -404,21 +563,31 @@ fn p2_a_quick_sweep_prepares_only_the_file_the_bar_rests_on() {
     assert_eq!(fx.b.preview.spawned(), 1, "one preparation");
 }
 
-/// P3: a remote file over the read budget is its info card, decided from the stat: nothing of
-/// it is read.
+/// P3: a remote file over the read budget that would be read whole (an image) is its info card,
+/// decided from the stat: nothing of it is read. With streaming (06 §13) the budget is no gate
+/// on a file the hex window shows: a binary over it previews its first rows, one block read.
 #[test]
 fn p3_a_file_over_the_preview_limit_is_its_card_and_nothing_is_read() {
     let (mut fx, seen, _gate) = watched("");
-    let big = std::fs::File::create(format!("{}/huge.bin", fx.root)).unwrap();
-    big.set_len(33 << 20).unwrap();
+    for name in ["huge.png", "huge.bin"] {
+        let big = std::fs::File::create(format!("{}/{name}", fx.root)).unwrap();
+        big.set_len(33 << 20).unwrap();
+    }
     fx.relist();
-    fx.bar_on("huge.bin");
+    fx.bar_on("huge.png");
     assert!(fx.on_right("File Info"));
     assert_eq!(
         fx.right_text("over the preview limit").as_deref(),
         Some("over the preview limit: Enter opens it")
     );
     assert!(seen.lock().unwrap().reads.is_empty(), "nothing was read");
+    assert!(seen.lock().unwrap().streams.is_empty());
+    fx.bar_on("huge.bin");
+    assert!(fx.on_right("00 00 00 00 00 00 00 00"), "its first rows");
+    let seen = seen.lock().unwrap();
+    assert!(seen.reads.is_empty(), "never read whole");
+    assert_eq!(seen.streamed, crate::stream::BLOCK, "one block");
+    assert!(preview_copies(&fx.cache).is_empty());
 }
 
 /// P4: the bar leaves a preview in the middle of its read: the read is cancelled, the side
@@ -427,15 +596,15 @@ fn p3_a_file_over_the_preview_limit_is_its_card_and_nothing_is_read() {
 /// in the cache.
 #[test]
 fn p4_leaving_a_preview_mid_read_cancels_it_and_the_next_waits_its_turn() {
-    let (mut fx, seen, gate) = watched("big.bin");
-    std::fs::write(format!("{}/big.bin", fx.root), vec![7u8; 2 << 20]).unwrap();
+    let (mut fx, seen, gate) = watched("big.png");
+    big_picture(&fx);
     fx.relist();
-    fx.select("big.bin");
+    fx.select("big.png");
     fx.drv.idle(&mut fx.b, REST);
     gate.reached();
     fx.drv.idle(&mut fx.b, 2);
     assert!(
-        fx.right_text("reading big.bin").is_some(),
+        fx.right_text("reading big.png").is_some(),
         "the read's progress shows in the side"
     );
     // Away, and resting on another file while the first worker is still held in its read.
@@ -454,16 +623,17 @@ fn p4_leaving_a_preview_mid_read_cancels_it_and_the_next_waits_its_turn() {
     assert_eq!(seen.peak, 1, "never two reads at once");
     assert_eq!(seen.connects, 1, "one preview session");
     assert_eq!(fx.b.preview.spawned(), 2);
-    // The abandoned read stopped where it was let go: far short of the file's end (the 12
-    // bytes of notes.txt are in the count).
+    // The abandoned read stopped where it was let go: far short of the file's end.
     assert!(
         seen.bytes < 256 * 1024,
         "the cancelled read went on: {} of {} bytes handed on",
         seen.bytes,
         2 << 20
     );
+    // notes.txt is read through a stream, on the same session (06 §13): it has no copy.
+    assert_eq!(seen.streams.len(), 1, "{:?}", seen.streams);
     let copies = preview_copies(&fx.cache);
-    assert_eq!(copies.len(), 1, "only the shown preview's copy: {copies:?}");
+    assert!(copies.is_empty(), "no copy is left: {copies:?}");
     let kept: Vec<String> = files_under(&fx.cache)
         .into_iter()
         .filter(|f| !f.starts_with(".preview"))
@@ -533,16 +703,16 @@ fn p6_enter_on_a_previewed_file_hands_the_preview_over() {
 /// progress on the status row, no second read — and the viewer shows when it ends.
 #[test]
 fn p6_enter_during_a_previews_read_continues_that_read_as_the_opening() {
-    let (mut fx, seen, gate) = watched("big.bin");
-    std::fs::write(format!("{}/big.bin", fx.root), vec![7u8; 2 << 20]).unwrap();
+    let (mut fx, seen, gate) = watched("big.png");
+    big_picture(&fx);
     fx.relist();
-    fx.select("big.bin");
+    fx.select("big.png");
     fx.drv.idle(&mut fx.b, REST);
     gate.reached();
     fx.key(Key::Enter);
     let shown = fx.status();
     assert!(
-        shown.starts_with("fetching big.bin ") && shown.ends_with("Esc cancels"),
+        shown.starts_with("fetching big.png ") && shown.ends_with("Esc cancels"),
         "{shown}"
     );
     gate.release();
@@ -551,10 +721,71 @@ fn p6_enter_during_a_previews_read_continues_that_read_as_the_opening() {
     assert_eq!(seen.lock().unwrap().reads.len(), 1, "the same read");
     assert_eq!(fx.b.preview.spawned(), 1, "the same worker");
     assert!(fx.label("Exit"), "the viewer's row");
-    assert!(
-        fx.drv.find_text("Text Viewer").is_some(),
-        "the file's viewer"
-    );
+    assert_eq!(fx.drv.pictures().len(), 1, "the file's viewer");
+}
+
+/// P6 for streamed previews (06 §13): Enter on a previewed remote text file, and on a remote
+/// binary, hands the preview's own Source to the viewer. Across the Enter the window is the
+/// same one, no stream is opened, no connection is made, no byte crosses and nothing is given
+/// back: the viewer reads on what the preview had. The session went with it — closing the
+/// viewer closes that transport for good, it is not returned to the window — so the next
+/// preview opens a new preview session.
+#[test]
+fn p6_enter_on_a_streamed_preview_hands_its_source_over() {
+    for (name, shows) in [
+        ("notes.txt", "plain notes"),
+        ("data.bin", "00 01 02 03 04 05 06 07"),
+    ] {
+        let (mut fx, seen, _gate) = watched("");
+        fx.bar_on(name);
+        assert!(fx.on_right(shows), "{name}: its preview");
+        let previewed = fx.b.preview.shown_window().expect("a preview shows");
+        let state = |seen: &Shared| {
+            let seen = seen.lock().unwrap();
+            (
+                seen.connects,
+                seen.streams.clone(),
+                seen.streamed,
+                seen.given_back,
+                seen.closed,
+                seen.reads.len(),
+            )
+        };
+        let before = state(&seen);
+        assert_eq!(before.0, 1, "{name}: the preview session");
+        assert_eq!(before.1, vec![format!("{}/{name}", fx.root)]);
+        assert!(before.2 > 0, "{name}: the preview read its bytes");
+        fx.key(Key::Enter);
+        assert!(fx.b.viewer.is_some(), "{name}: the viewer is there at once");
+        fx.settle();
+        fx.drv.idle(&mut fx.b, 5);
+        assert!(fx.label("Exit"), "{name}: a viewer now, its row");
+        let viewer = fx.b.viewer.as_ref().unwrap();
+        let window = &*viewer.embedded.window as *const dyn Window as *const () as usize;
+        assert_eq!(window, previewed, "{name}: the preview's own window");
+        assert_eq!(
+            state(&seen),
+            before,
+            "{name}: no stream opened, no connection, no byte, nothing given back"
+        );
+        assert_eq!(seen.lock().unwrap().peak, 1, "{name}: one session active");
+        // The viewer closes: its transport closes with it, and is not given back.
+        fx.key(Key::Escape);
+        assert!(fx.b.viewer.is_none());
+        until("the viewer's stream to close", || {
+            seen.lock().unwrap().closed == 1
+        });
+        fx.rest();
+        let after = state(&seen);
+        assert_eq!(after.3, 0, "{name}: closed, not returned to the window");
+        assert_eq!(
+            after.0, 2,
+            "{name}: the next preview opened a new preview session"
+        );
+        assert!(files_under(&fx.cache)
+            .iter()
+            .all(|f| f.starts_with(".preview")));
+    }
 }
 
 /// P7 and 04 K-R1: F9 switches to dual mode at once — both sides lists, slot 9 `Prevw` — and
@@ -764,10 +995,10 @@ fn enter_on_an_info_card_opens_the_file() {
 fn closing_the_window_does_not_wait_for_a_preview() {
     // Bounded from outside: a `finish` that waited for the held worker would never return.
     bounded(30, || {
-        let (mut fx, _seen, gate) = watched("big.bin");
-        std::fs::write(format!("{}/big.bin", fx.root), vec![7u8; 2 << 20]).unwrap();
+        let (mut fx, _seen, gate) = watched("big.png");
+        big_picture(&fx);
         fx.relist();
-        fx.select("big.bin");
+        fx.select("big.png");
         fx.drv.idle(&mut fx.b, REST);
         gate.reached();
         assert!(Window::close_requested(&mut fx.b));
@@ -2092,47 +2323,43 @@ fn closing_the_window_waits_for_a_running_operation() {
 /// stays frozen on its last progress frame until the display commits (02 §3.1).
 #[test]
 fn a_cancelled_previews_queued_result_does_not_replace_the_frozen_side() {
-    let (mut fx, _seen, gate) = watched("big.bin");
-    std::fs::write(format!("{}/big.bin", fx.root), vec![7u8; 2 << 20]).unwrap();
+    let (mut fx, _seen, gate) = watched("big.png");
+    big_picture(&fx);
     fx.relist();
-    fx.select("big.bin");
+    fx.select("big.png");
     fx.drv.idle(&mut fx.b, REST);
     gate.reached();
     fx.drv.idle(&mut fx.b, 2);
     let frame = fx
-        .right_text("reading big.bin")
+        .right_text("reading big.png")
         .expect("the progress frame");
     // The worker runs to its end with no pass of the window: its result waits in the channel.
     gate.release();
     until("the worker's end", || fx.b.preview.worker_ended());
     // The bar leaves: this pass cancels the preparation and finds its result.
     fx.key(Key::ArrowDown);
-    assert_ne!(fx.current(), "big.bin");
+    assert_ne!(fx.current(), "big.png");
     let frozen = fx
-        .right_text("reading big.bin")
+        .right_text("reading big.png")
         .expect("the side stays frozen");
     assert_eq!(frozen, format!("{} …", frame.trim_end_matches('…')));
-    assert!(
-        fx.drv.find_text("Text Viewer").is_none(),
-        "its viewer is not shown"
-    );
+    assert!(fx.drv.pictures().is_empty(), "its viewer is not shown");
     fx.rest();
-    assert!(fx.right_text("reading big.bin").is_none(), "committed");
+    assert!(fx.right_text("reading big.png").is_none(), "committed");
 }
 
 /// B15, and B5's proof for F9: F9 during a preview's read — the bar unmoved — cancels the
 /// preparation: its read stops before the file's end.
 #[test]
 fn f9_cancels_a_running_preview() {
-    let (mut fx, seen, gate) = watched("big.bin");
-    let size = 2u64 << 20;
-    std::fs::write(format!("{}/big.bin", fx.root), vec![7u8; size as usize]).unwrap();
+    let (mut fx, seen, gate) = watched("big.png");
+    let size = big_picture(&fx);
     fx.relist();
-    fx.select("big.bin");
+    fx.select("big.png");
     fx.drv.idle(&mut fx.b, REST);
     gate.reached();
     fx.key(Key::F9);
-    assert_eq!(fx.current(), "big.bin", "the bar did not move");
+    assert_eq!(fx.current(), "big.png", "the bar did not move");
     assert!(fx.b.preview.cancelling(), "F9 told the preparation to stop");
     gate.release();
     fx.wait(|b| !b.preview.busy());

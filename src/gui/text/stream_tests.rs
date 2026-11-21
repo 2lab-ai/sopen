@@ -1361,6 +1361,8 @@ fn a_previews_pass_stops_at_4_mib_and_the_hand_over_goes_on_from_there() {
             assert!(total > (5 << 20));
             let mut net = net(body.as_bytes(), gate());
             let mut win = net.window("big.log");
+            // The budget is the route's to give (02 §4.3): the viewer has none of its own.
+            win.preview_index = Some(4 << 20);
             Window::set_preview(&mut win, true);
             let mut drv = Driver::new(800.0, 500.0);
             run(
@@ -1395,6 +1397,37 @@ fn a_previews_pass_stops_at_4_mib_and_the_hand_over_goes_on_from_there() {
             assert_eq!(net.fetched(), total);
         },
     );
+}
+
+/// 06 §5 through the window (W8a): told it is held without being drawn
+/// (`Window::set_shown(false)`: a browser preview behind a viewer), the text viewer's stream
+/// does not poll — nothing is asked of the remote; shown again, it polls every 2 s.
+#[test]
+fn a_viewer_held_without_being_drawn_does_not_poll() {
+    bounded("a_viewer_held_without_being_drawn_does_not_poll", || {
+        let body = numbered(2_000);
+        let mut net = net_polling(body.as_bytes(), gate(), Duration::from_secs(2));
+        let mut win = net.window("small.log");
+        let mut drv = Driver::new(800.0, 500.0);
+        run(&mut drv, &mut win, &mut net, "the index", |w, _| {
+            w.doc.whole() && w.ready()
+        });
+        net.settle();
+        Window::set_shown(&mut win, false);
+        let sent = net.requests();
+        net.pass_time(Duration::from_secs(9));
+        assert_eq!(net.requests(), sent, "a hidden viewer asks nothing");
+        Window::set_shown(&mut win, true);
+        net.pass_time(Duration::from_secs(5));
+        let asked: Vec<Asked> = net.control.sent()[sent..].iter().map(|s| s.asked).collect();
+        assert!(asked.len() >= 4, "it polls again: {asked:?}");
+        assert!(
+            asked
+                .iter()
+                .all(|a| matches!(a, Asked::Fstat | Asked::StatPath)),
+            "{asked:?}"
+        );
+    });
 }
 
 /// 06 §5 / §7.2: a remote file that changed freezes the page — the screen stays, nothing more

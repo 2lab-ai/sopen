@@ -2,6 +2,10 @@
 //! wheel events, keys with modifiers — through a plain `egui::Context`, one pass per call, as
 //! eframe would. No renderer: shapes are inspected instead (to find a button by its label).
 
+mod meter;
+
+pub use meter::Meter;
+
 use super::Window;
 use eframe::egui::{
     self, Event, Key, Modifiers, MouseWheelSource, MouseWheelUnit, PointerButton, Pos2, RawInput,

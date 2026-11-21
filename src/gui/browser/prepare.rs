@@ -1,6 +1,8 @@
 //! What Enter on a file does before the viewer shows, on a worker: a connection of the viewer's
-//! own, the kind (spec §3: extension, then a sniff), the file made local exactly as the
-//! standalone routes do it (fetched into the cache, claimed and recorded —
+//! own and the kind (spec §3: extension, then a sniff). A remote file the hex window shows,
+//! and remote text of at most [`TEXT_STREAM_MAX`], then open as a stream on that connection
+//! (06 §7.1, §7.2): nothing is fetched. Anything else is made local exactly as the standalone
+//! routes do it (fetched into the cache, claimed and recorded —
 //! [`cache::fetch_claimed_cancellable`]; a local file read in place, an image copied), then
 //! whatever is slow: decoding the image, probing the media, indexing the text.
 //!
@@ -16,16 +18,19 @@ use crate::ffmpeg::Input;
 use crate::gui::hex::{self, HexFile};
 use crate::gui::image::{self, Doc, ImageFile};
 use crate::gui::media::{self, Media};
+use crate::gui::streamed::{self, Lease};
 use crate::gui::text::{self, TextDoc};
-use crate::gui::{chrome, Embedded, Origin, Outcome, Reconnect, Window};
+use crate::gui::{chrome, Embedded, Origin, Outcome, Placeholder, Reconnect, Window};
 use crate::kind::{self, Kind};
 use crate::remote::{RemoteFs, Stat};
+use crate::stream::{Opening, Source, Waker};
 use anyhow::{anyhow, bail, Context as _, Result};
 use eframe::egui;
 use sha2::Digest as _;
 use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -62,6 +67,10 @@ pub struct Request<'a> {
     pub label: Option<&'a str>,
     pub abs: &'a str,
     pub cache: &'a Path,
+    /// Repaints the window: what a stream opened here wakes (06 §5).
+    pub wake: &'a Waker,
+    /// When the open began — the Enter (06 §11's `open`).
+    pub began: Instant,
 }
 
 impl Request<'_> {
@@ -89,6 +98,46 @@ impl Request<'_> {
             at,
         )
     }
+
+    /// The remote file as a stream on `fs`, the connection that resolved, stat'ed and sniffed
+    /// it (06 §2): nothing is fetched, and `fs` is the stream's from here on. Its `Origin` is a
+    /// placeholder that connects on its first use and until then takes the server as able to
+    /// replace a file. A failure is the error: never a quiet whole fetch instead.
+    fn stream(
+        &self,
+        label: &str,
+        fs: Box<dyn RemoteFs + Send>,
+        sniff: u64,
+        wake: Waker,
+    ) -> Result<(Source, Origin)> {
+        let opening = Opening {
+            label: self.show(),
+            began: self.began,
+            sniff,
+        };
+        let dial = Some(self.connect.clone());
+        let opened =
+            streamed::open(fs, self.abs, opening, dial, wake, None).map_err(|not| not.error)?;
+        let origin = Origin::placeholder(
+            self.reconnect(),
+            label.to_string(),
+            self.abs.to_string(),
+            opened.at,
+            Placeholder::YES,
+        );
+        Ok((opened.source, origin))
+    }
+}
+
+/// Remote text of at most this size is read through a stream (06 §7.2 W5a: its index pass
+/// then covers the whole file, so line numbers, End and highlighting are as today). A larger
+/// one keeps the whole fetch until W5b: a capped index would show its first 16 MiB as the
+/// whole file.
+pub const TEXT_STREAM_MAX: u64 = text::HIGHLIGHT_MAX;
+
+/// Whether a remote text file of `size` bytes is read through a stream.
+pub fn text_streams(size: u64) -> bool {
+    size <= TEXT_STREAM_MAX
 }
 
 /// Makes the file at `req.abs` ready for its viewer. `progress` gets a fetch's `(done, total)`;
@@ -123,12 +172,7 @@ fn prepare_with(
 ) -> Result<Prepared> {
     let mut fs = (req.connect)()?;
     let abs = fs.realpath(req.abs)?;
-    let req = &Request {
-        connect: req.connect,
-        label: req.label,
-        abs: &abs,
-        cache: req.cache,
-    };
+    let req = &Request { abs: &abs, ..*req };
     let stat = fs.stat(req.abs)?;
     if stat.is_dir {
         bail!("{} is a folder", req.show());
@@ -139,7 +183,7 @@ fn prepare_with(
             req.show()
         );
     }
-    let kind = kind::detect(fs.as_mut(), req.abs, &stat)?;
+    let (kind, sniff) = kind::detect_sniffed(fs.as_mut(), req.abs, &stat)?;
     let host = req.label.unwrap_or(cache::LOCAL_HOST).to_string();
     let mut reuse = reuse.filter(|r| r.abs == req.abs && unchanged(&r.copy.at, &stat));
     let mut fetch = |fs: &mut Box<dyn RemoteFs + Send>| -> Result<Fetched> {
@@ -212,6 +256,21 @@ fn prepare_with(
             })
         }
         Kind::Text => {
+            if let Some(label) = req.label.filter(|_| text_streams(stat.size)) {
+                text::warm();
+                let (source, _origin) = req.stream(label, fs, sniff, req.wake.clone())?;
+                // The handle decides: a file that grew past the limit since its stat is
+                // fetched, on a connection of its own (this one is the stream's, closed here).
+                if text_streams(source.size()) {
+                    return Ok(Prepared::Text {
+                        doc: TextDoc::streamed(source),
+                        notices: Vec::new(),
+                        claim: None,
+                    });
+                }
+                drop(source);
+                fs = (req.connect)()?;
+            }
             let fetched = if local { None } else { Some(fetch(&mut fs)?) };
             let path = match &fetched {
                 Some(f) => f.claim.local.clone(),
@@ -229,10 +288,18 @@ fn prepare_with(
                 claim,
             })
         }
-        Kind::Other | Kind::Directory => {
-            let fetched = if local { None } else { Some(fetch(&mut fs)?) };
-            hex_of(req, fs, stat, fetched)
-        }
+        Kind::Other | Kind::Directory => match req.label {
+            // 06 §7.1: no fetch, whatever the size.
+            Some(label) => {
+                let repaint = hex::Repaint::default();
+                let (source, origin) = req.stream(label, fs, sniff, repaint.waker())?;
+                Ok(Prepared::Hex {
+                    file: HexFile::streamed(origin, source, repaint, req.cache),
+                    notices: Vec::new(),
+                })
+            }
+            None => hex_of(req, fs, stat, None),
+        },
     }
 }
 
@@ -253,6 +320,17 @@ fn hex_of(
         file: HexFile::new(req.origin(fs, at), base, claim, req.cache),
         notices,
     })
+}
+
+/// Whether a remote file of this kind and size is viewed through a stream (06 §13 W8a): what
+/// the hex window shows, whatever its size, and text of at most [`TEXT_STREAM_MAX`]. An image
+/// and a medium are still read whole.
+fn streams(kind: Kind, size: u64) -> bool {
+    match kind {
+        Kind::Other | Kind::Directory => true,
+        Kind::Text => text_streams(size),
+        Kind::Image | Kind::Video | Kind::Audio => false,
+    }
 }
 
 /// The file has not changed since `then` as far as a stat tells (size and modification time).
@@ -547,6 +625,46 @@ pub struct PreviewRequest<'a> {
     pub cache: &'a Path,
     /// The window's preview copies.
     pub space: &'a PreviewSpace,
+    /// Where the preview connection comes back from while a preview's stream has it.
+    pub back: &'a Back,
+    /// Repaints the window: what a stream opened here wakes (06 §5).
+    pub wake: &'a Waker,
+    /// When the bar came to rest on the file (06 §11's `open`).
+    pub began: Instant,
+}
+
+/// The window's preview connection while a preview's stream has it (06 §13): the stream reads
+/// on it — it is its transport — and gives it back when it closes without having become a
+/// viewer ([`streamed::Lease`]). The next preparation takes it from here, so the window keeps
+/// its one preview session; a stream handed over keeps it for good, and nothing comes back.
+pub type Back = Mutex<Option<Receiver<Box<dyn RemoteFs + Send>>>>;
+
+/// How long a preparation waits for the preview connection to come back from the stream
+/// before it. The stream gives it back as soon as it closes (its handle's close is written,
+/// not waited for: 06 §2); past this, the preparation opens a session of its own and the
+/// late one is closed when it comes.
+const BACK_WAIT: Duration = Duration::from_secs(2);
+
+/// The preview connection a closed stream gave back, if one had it.
+fn returned(back: &Back, cancel: &AtomicBool) -> Result<Option<Box<dyn RemoteFs + Send>>> {
+    let Some(rx) = back.lock().unwrap_or_else(|p| p.into_inner()).take() else {
+        return Ok(None);
+    };
+    let started = Instant::now();
+    loop {
+        match rx.recv_timeout(Duration::from_millis(20)) {
+            Ok(conn) => return Ok(Some(conn)),
+            // Handed over (the viewer has it), or its stream's thread is gone.
+            Err(RecvTimeoutError::Disconnected) => return Ok(None),
+            Err(RecvTimeoutError::Timeout) if cancel.load(Ordering::Relaxed) => {
+                // Still on its way: the next preparation waits for it.
+                *back.lock().unwrap_or_else(|p| p.into_inner()) = Some(rx);
+                return Err(anyhow!(crate::remote::Cancelled));
+            }
+            Err(RecvTimeoutError::Timeout) if started.elapsed() >= BACK_WAIT => return Ok(None),
+            Err(RecvTimeoutError::Timeout) => {}
+        }
+    }
 }
 
 /// A link, on the info card: what it points at, or nothing.
@@ -596,6 +714,14 @@ enum Parts {
     Hex {
         file: HexFile,
     },
+    /// Remote text read through a stream (06 §7.2): its index grows on the window's frames,
+    /// as far as `index` while it is a preview.
+    TextStream {
+        source: Source,
+        title: String,
+        name: String,
+        index: u64,
+    },
     Media {
         origin: Origin,
         made: Box<media::preview::Prepared>,
@@ -608,6 +734,8 @@ enum Parts {
 pub struct Previewed {
     parts: Parts,
     copy: Option<Copy>,
+    /// A streamed preview's hold on the window's preview connection.
+    lease: Option<Lease>,
     host: String,
     /// The file, resolved (a link's target).
     abs: String,
@@ -637,6 +765,16 @@ impl Previewed {
             } => (text::embed(doc, title, &name, Vec::new(), live, None), None),
             Parts::Image { file, doc, shown } => (image::embed_preview(file, doc, shown), None),
             Parts::Hex { file } => (hex::embed(file, Vec::new()), None),
+            // The one preview-index constant is this route's (02 §4.3): the viewer is told.
+            Parts::TextStream {
+                source,
+                title,
+                name,
+                index,
+            } => (
+                text::embed_source(source, title, &name, Vec::new(), None, Some(index)),
+                None,
+            ),
             Parts::Media { origin, made } => (media::embed_preview(origin, *made, cache), None),
             Parts::Card(card) => (card_window(card.clone()), Some(card)),
         };
@@ -645,7 +783,9 @@ impl Previewed {
         Preview {
             embedded,
             card,
+            shown: true,
             copy: self.copy,
+            lease: self.lease,
             host: self.host,
             abs: self.abs,
             cache: self.cache,
@@ -658,7 +798,12 @@ impl Previewed {
 pub struct Preview {
     pub embedded: Embedded,
     card: Option<Card>,
+    /// Whether its window was last told it is on screen ([`Preview::set_shown`]).
+    shown: bool,
     copy: Option<Copy>,
+    /// A streamed preview's hold on the window's preview connection: dropped as a preview,
+    /// its stream gives the connection back; handed over, the viewer keeps it.
+    lease: Option<Lease>,
     host: String,
     abs: String,
     cache: PathBuf,
@@ -692,7 +837,9 @@ impl Preview {
         Self {
             embedded,
             card: None,
+            shown: true,
             copy: None,
+            lease: None,
             host: cache::LOCAL_HOST.to_string(),
             abs: String::new(),
             cache: PathBuf::new(),
@@ -705,16 +852,36 @@ impl Preview {
         self.card.as_ref()
     }
 
-    /// The hand-over (02 §4.4): the live window becomes the viewer (`set_preview(false)`), and a
-    /// remote file's private copy is published into the cache by a hard link — the same inode,
-    /// nothing read again — then claimed and recorded as Enter's fetch would be; the copy's own
-    /// name stays until the viewer is gone. A local file was read in place and stays so. An info
-    /// card is not handed over: it comes back (Enter opens the file: [`Preview::into_reuse`]).
+    /// The window is drawn this pass, or held without being drawn (the browser shows a viewer
+    /// over the panels): told to the window when it changes ([`Window::set_shown`]), so a
+    /// streamed preview nobody sees does not poll its file (06 §5).
+    pub fn set_shown(&mut self, shown: bool) {
+        if std::mem::replace(&mut self.shown, shown) != shown {
+            self.embedded.window.set_shown(shown);
+        }
+    }
+
+    /// The hand-over (02 §4.4): the live window becomes the viewer (`set_preview(false)`).
+    /// - A streamed preview (remote text and hex, 06 §13) moves its stream to the viewer, with
+    ///   its cache, its readers and its session: no byte is read twice, nothing is published
+    ///   into the cache, and the window's next remote preview opens a new preview session.
+    /// - A remote file read into a private copy (an image) has that copy published into the
+    ///   cache by a hard link — the same inode, nothing read again — then claimed and recorded
+    ///   as Enter's fetch would be; the copy's own name stays until the viewer is gone.
+    /// - A local file was read in place and stays so.
+    ///
+    /// An info card is not handed over: it comes back (Enter opens the file:
+    /// [`Preview::into_reuse`]).
     pub fn hand_over(mut self) -> std::result::Result<HandedOver, Box<Preview>> {
         if self.card.is_some() {
             return Err(Box::new(self));
         }
         self.embedded.window.set_preview(false);
+        // The viewer is on screen, whatever the preview was; its stream's session is its own.
+        self.set_shown(true);
+        if let Some(lease) = self.lease.take() {
+            lease.keep();
+        }
         let (mut hold, mut notices) = (None, Vec::new());
         if let Some(copy) = self.copy.take() {
             let published = cache::publish_claimed(
@@ -770,6 +937,7 @@ struct Known {
     kind: Option<Kind>,
     link: Option<Link>,
     copy: Option<Copy>,
+    lease: Option<Lease>,
 }
 
 /// Prepares the preview of the file at `req.abs` (02 §4.2–§4.4), on the window's preview
@@ -793,6 +961,7 @@ pub fn preview(
         kind: None,
         link: None,
         copy: None,
+        lease: None,
     };
     let host = req.label.unwrap_or(cache::LOCAL_HOST).to_string();
     let cache = req.cache.to_path_buf();
@@ -800,6 +969,7 @@ pub fn preview(
         Ok(parts) => Ok(Previewed {
             parts,
             copy: known.copy,
+            lease: known.lease,
             host,
             abs: known.abs,
             cache,
@@ -818,6 +988,7 @@ pub fn preview(
             Ok(Previewed {
                 parts: Parts::Card(card),
                 copy: known.copy,
+                lease: None,
                 host,
                 abs: known.abs,
                 cache,
@@ -840,9 +1011,16 @@ fn preview_parts(
         abs,
         cache,
         space,
+        back,
+        wake,
+        began,
     } = req;
     // Cancel is looked at between every two requests: none starts once it is set.
     budget.check(cancel)?;
+    // The stream of the preview before had the connection: it comes back as that one closes.
+    if conn.is_none() {
+        *conn = returned(back, cancel)?;
+    }
     let opened_now = conn.is_none();
     if opened_now {
         *conn = Some(connect()?);
@@ -894,15 +1072,23 @@ fn preview_parts(
     }
     let remote = label.is_some();
     let limits = budget.limits;
-    // Decided from the stat, before anything is read — the sniff's head included: the card
-    // says the kind its name gives it.
-    if remote && budget.limit(limits.read).is_some_and(|max| stat.size > max) {
-        known.kind = kind::by_extension(&real);
+    // A remote file over the read budget is previewed only through a stream, which reads the
+    // ranges it shows and no more (02 §4.3). Whether it is one is decided from the stat and
+    // the name where the name says the kind — then nothing is read, the sniff's head included,
+    // and the card says the kind its name gives it.
+    let over_read = remote && budget.limit(limits.read).is_some_and(|max| stat.size > max);
+    let name_says = kind::by_extension(crate::remote::split_parent(&real).1);
+    if over_read && name_says.is_some_and(|kind| !streams(kind, stat.size)) {
+        known.kind = name_says;
         return Err(over(OVER_LIMIT));
     }
     budget.check(cancel)?;
-    let kind = kind::detect(fs.as_mut(), &real, &stat)?;
+    let (kind, sniff) = kind::detect_sniffed(fs.as_mut(), &real, &stat)?;
     known.kind = Some(kind);
+    let streamed = remote && streams(kind, stat.size);
+    if over_read && !streamed {
+        return Err(over(OVER_LIMIT));
+    }
     if kind == Kind::Image
         && budget
             .limit(limits.image_bytes)
@@ -911,6 +1097,70 @@ fn preview_parts(
         return Err(over(OVER_LIMIT));
     }
     budget.check(cancel)?;
+    if let Some(label) = label.filter(|_| streamed) {
+        // 06 §13: the preview reads through a stream on the window's one preview session,
+        // which becomes that stream's transport. Nothing is written to disk.
+        let conn_taken = conn.take().expect("opened above");
+        let (tx, rx) = std::sync::mpsc::channel();
+        *back.lock().unwrap_or_else(|p| p.into_inner()) = Some(rx);
+        let lease = Lease::new(tx);
+        let opening = Opening {
+            label: show(Some(label), &real),
+            began,
+            sniff,
+        };
+        let repaint = hex::Repaint::default();
+        let waker = match kind {
+            Kind::Text => wake.clone(),
+            _ => repaint.waker(),
+        };
+        let dial = Some(connect.clone());
+        let opened =
+            match streamed::open(conn_taken, &real, opening, dial, waker, Some(lease.clone())) {
+                Ok(opened) => opened,
+                Err(not) => {
+                    // The preview connection is the window's again, as it was.
+                    lease.keep();
+                    back.lock().unwrap_or_else(|p| p.into_inner()).take();
+                    *conn = not.conn;
+                    return Err(not.error);
+                }
+            };
+        known.lease = Some(lease);
+        budget.read_done();
+        let source = opened.source;
+        let parts = match kind {
+            // The handle decides too: text that grew past the limit since its stat would be
+            // shown short by a capped index (06 §7.2), so it is the card.
+            Kind::Text if !text_streams(source.size()) => return Err(over(OVER_LIMIT)),
+            Kind::Text => {
+                text::warm();
+                Parts::TextStream {
+                    source,
+                    title: show(Some(label), &real),
+                    name: known.name.clone(),
+                    index: limits.text,
+                }
+            }
+            _ => {
+                let connect = connect.clone();
+                let origin = Origin::placeholder(
+                    Some(Box::new(move || connect()) as Reconnect),
+                    label.to_string(),
+                    real.clone(),
+                    opened.at,
+                    Placeholder::YES,
+                );
+                Parts::Hex {
+                    file: HexFile::streamed(origin, source, repaint, cache),
+                }
+            }
+        };
+        // Once more before handing the preview over: a cancel meanwhile drops it here (its
+        // stream closes, and the connection comes back).
+        budget.check(cancel)?;
+        return Ok(parts);
+    }
     if remote {
         known.copy = Some(read_copy(
             fs.as_mut(),
@@ -1197,10 +1447,10 @@ fn read_copy(
     bail!("{real} kept changing while it was read; try again when it is quiet")
 }
 
-/// The `Origin` of a previewed remote viewer (02 §4.4): a placeholder connection that fails, so
-/// the viewer's first remote call — `Origin::fs`'s probe — reconnects through `connect` and the
-/// viewer works on a session of its own from then on, never on the window's preview connection.
-/// What the server can do is the preview connection's (the same server).
+/// The `Origin` of a previewed remote viewer that read a copy (02 §4.4): a placeholder
+/// connection ([`Origin::placeholder`]), so the viewer's first remote call reconnects through
+/// `connect` and the viewer works on a session of its own from then on, never on the window's
+/// preview connection. What the server can do is the preview connection's (the same server).
 fn placeholder_origin(
     connect: &Connect,
     label: &str,
@@ -1209,84 +1459,16 @@ fn placeholder_origin(
     at: Stat,
 ) -> Origin {
     let connect = connect.clone();
-    Origin::new(
-        Box::new(Placeholder {
-            can_replace: fs.can_replace(),
-            can_link: fs.can_link(),
-        }),
+    Origin::placeholder(
         Some(Box::new(move || connect()) as Reconnect),
-        Some(label.to_string()),
+        label.to_string(),
         abs,
         at,
+        Placeholder {
+            can_replace: fs.can_replace(),
+            can_link: fs.can_link(),
+        },
     )
-}
-
-/// A connection that is not there yet: every call fails (see [`placeholder_origin`]).
-struct Placeholder {
-    can_replace: bool,
-    can_link: bool,
-}
-
-fn not_connected() -> anyhow::Error {
-    anyhow!("not connected yet (a preview)")
-}
-
-impl RemoteFs for Placeholder {
-    fn stat_opt(&mut self, _: &str) -> Result<Option<Stat>> {
-        Err(not_connected())
-    }
-    fn lstat_opt(&mut self, _: &str) -> Result<Option<Stat>> {
-        Err(not_connected())
-    }
-    fn realpath(&mut self, _: &str) -> Result<String> {
-        Err(not_connected())
-    }
-    fn read_head(&mut self, _: &str, _: usize) -> Result<Vec<u8>> {
-        Err(not_connected())
-    }
-    fn list_dir(&mut self, _: &str) -> Result<Vec<String>> {
-        Err(not_connected())
-    }
-    fn list_entries(&mut self, _: &str) -> Result<Vec<crate::remote::Entry>> {
-        Err(not_connected())
-    }
-    fn read_to(
-        &mut self,
-        _: &str,
-        _: &mut dyn std::io::Write,
-        _: &mut dyn FnMut(u64),
-    ) -> Result<u64> {
-        Err(not_connected())
-    }
-    fn create_from(
-        &mut self,
-        _: &Path,
-        _: &str,
-        _: Option<crate::remote::Like>,
-    ) -> std::result::Result<crate::remote::Uploaded, crate::remote::CreateError> {
-        Err(crate::remote::CreateError::new(
-            crate::remote::Created::No,
-            not_connected(),
-        ))
-    }
-    fn set_mode(&mut self, _: &str, _: u32) -> Result<()> {
-        Err(not_connected())
-    }
-    fn rename_over(&mut self, _: &str, _: &str) -> Result<()> {
-        Err(not_connected())
-    }
-    fn link_new(&mut self, _: &str, _: &str) -> Result<()> {
-        Err(not_connected())
-    }
-    fn can_link(&self) -> bool {
-        self.can_link
-    }
-    fn can_replace(&self) -> bool {
-        self.can_replace
-    }
-    fn remove(&mut self, _: &str) -> Result<()> {
-        Err(not_connected())
-    }
 }
 
 // ---------------------------------------------------------------------------------------------
