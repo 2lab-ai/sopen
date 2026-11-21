@@ -435,7 +435,7 @@ feature has not landed has no row in the deployed table and its F-key slot shows
 |---|---|---|
 | `keys::Command` and `keys::lookup(input, context) -> Option<Command>` | `browser/keys.rs` | every key of 02–05; one table, exact modifiers (04 §3) |
 | `Browser::run(Command)` | `browser.rs` | dispatches to `ops`, `tree`, `git_panel`, `view` |
-| `view::resolve(&Inputs) -> [Content; 2]` | `browser/view.rs` | the browser's drawing and focus |
+| `view::resolve(&Inputs) -> Resolved { show: [Content; 2], pending: Option<Duration> }` | `browser/view.rs` | the browser's drawing and focus: `show` is the new committed display; `pending` is how long a side still keeps what it shows because the bar has not rested (the browser asks again then) |
 | `Window::set_preview(bool)` | `gui/mod.rs` trait, each viewer | a preview, and its hand-over to a full viewer (§4.4) |
 | `BrowserEvent::FilesChanged { host, dirs }` | `browser.rs` | sent by file operations (04) and git writes (03); panels showing one of `dirs` re-list, a git panel whose top level holds one soft-refreshes |
 | `GitEvent::WorkTreeChanged { host, top }` | `git_panel` → `browser.rs` | after a git write that can change files (checkout, reset, merge, rebase, stash, clean, discard) |
@@ -514,6 +514,7 @@ Added to AGENTS.md "Receipts" by the slice that brings them (the hooks travel wi
 |---|---|---|
 | `SOPEN_STATE='mode=dual'` | The browser opens in dual mode (default preview). | S1 |
 | `SOPEN_STATE='bar=NAME'` | The active panel's bar goes on NAME once listed, without opening it (a preview receipt). | S1 |
+| `SOPEN_KEYS='F5,Enter'` | The browser plays these keys as the owner's, one each time the window has settled, so a screenshot shows what they lead to (a dialog, the rename field, a report); `text:…` types text. A local setting: **not** forwarded by `--target`. It waits for the window to settle, so it cannot press a key in the middle of a running operation. | S1 |
 | `SOPEN_STATE='git=pin'` | The git panel is pinned once the folder's detection answers. | S2 |
 | `SOPEN_STATE='git=pin;select=REV;details=1;dialog=ACTION;label=N'` | With the pin: the bar on REV (any revision git accepts) once it is loaded, its details open, the label cursor on the row's Nth label, and ACTION's dialog open (03 §7's action ids) — a confirmation's receipt. | S2 (`dialog=` S3) |
 | `SOPEN_LIST=git` | A folder in a work tree: print the git panel's first page as text — one line per row: lane glyphs in ASCII, labels, subject, author, date, hash — then the paging line, instead of opening a window (local and remote). | S2 |

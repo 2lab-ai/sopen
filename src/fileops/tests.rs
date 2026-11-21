@@ -693,7 +693,10 @@ fn k_c2_a_name_in_the_way_is_never_overwritten() {
         assert_eq!(
             r.items,
             vec![
-                item("a.txt", ItemOutcome::Skipped),
+                item(
+                    "a.txt",
+                    ItemOutcome::Failed("cancelled: nothing of it was copied".to_string())
+                ),
                 item("b.txt", ItemOutcome::NotReached)
             ],
             "{how}"
@@ -1692,7 +1695,13 @@ fn a_spawned_operation_asks_over_its_channel_and_reports() {
     };
     running.join();
     assert!(running.finished());
-    assert_eq!(report.items, vec![item("a", ItemOutcome::Skipped)]);
+    assert_eq!(
+        report.items,
+        vec![item(
+            "a",
+            ItemOutcome::Failed("cancelled: nothing of it was copied".to_string())
+        )]
+    );
     assert_eq!(names(&dst), ["a", "a-1"]);
 }
 
@@ -2875,10 +2884,15 @@ fn r16_esc_between_items_and_cancel_are_explained() {
         Hosts::Same(&mut LocalFs::new()),
         &mut ctl,
     );
+    // The item Cancel was answered at is not "skipped" (nobody chose Skip): it failed, the
+    // reason saying it was cancelled and that nothing of it was copied.
     assert_eq!(
         r.items,
         vec![
-            item("b", ItemOutcome::Skipped),
+            item(
+                "b",
+                ItemOutcome::Failed("cancelled: nothing of it was copied".to_string())
+            ),
             item("c", ItemOutcome::NotReached)
         ]
     );

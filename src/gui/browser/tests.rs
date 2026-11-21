@@ -9,6 +9,8 @@ use eframe::egui::{Event, PointerButton};
 use std::io::Write;
 use std::path::Path;
 
+mod s1;
+
 const RUST: &str = "// a comment\nfn main() {\n    let answer = 42;\n}\n";
 
 /// The folder every test lists: two folders, a hidden file, a binary, code, text, an image.
@@ -807,7 +809,7 @@ fn esc_stops_a_fetch() {
     );
     fx.key(Key::Escape);
     gate.release();
-    fx.drv.until(&mut fx.b, 10, |b| b.task.is_none());
+    fx.drv.until(&mut fx.b, 10, |b| b.opening.is_none());
     assert!(fx.b.viewer.is_none());
     assert!(
         fx.b.status.text.starts_with("cancelled"),
@@ -943,11 +945,11 @@ fn esc_while_opening_keeps_the_viewer_from_appearing() {
     fx.select("main.rs");
     fx.key(Key::Enter);
     gate.reached();
-    assert!(matches!(fx.b.task, Some(Task::Opening { .. })));
+    assert!(fx.b.opening.is_some());
     // Esc while the worker is held before it has read anything; then it goes on to the end.
     fx.key(Key::Escape);
     gate.release();
-    fx.drv.until(&mut fx.b, 10, |b| b.task.is_none());
+    fx.drv.until(&mut fx.b, 10, |b| b.opening.is_none());
     fx.drv.idle(&mut fx.b, 2);
     assert!(fx.b.viewer.is_none(), "the viewer appeared after Esc");
     assert!(
@@ -1164,7 +1166,7 @@ fn an_entry_named_in_bad_utf8_is_not_opened() {
     fx.b.panels[0].fill(dir, entries, None, None);
     fx.select("q\u{FFFD}.txt");
     fx.key(Key::Enter);
-    assert!(fx.b.task.is_none() && fx.b.viewer.is_none());
+    assert!(fx.b.opening.is_none() && fx.b.viewer.is_none());
     assert!(
         fx.b.status.text.contains("not valid UTF-8"),
         "{}",
@@ -1333,15 +1335,17 @@ fn a_good_listing_clears_an_earlier_listing_error() {
     let gone = format!("{}/gone", fx.root);
     fx.b.list(Some(0), gone, None, None);
     fx.settle();
-    assert!(fx.b.status.error, "{}", fx.b.status.text);
+    let said = fx.b.status_line();
+    assert!(
+        said.error && said.text.starts_with("left panel: "),
+        "{}",
+        said.text
+    );
     let root = fx.root.clone();
     fx.b.list(Some(0), root, None, None);
     fx.settle();
-    assert!(
-        !fx.b.status.error && fx.b.status.text.is_empty(),
-        "{}",
-        fx.b.status.text
-    );
+    let said = fx.b.status_line();
+    assert!(!said.error && fx.b.status.text.is_empty(), "{}", said.text);
 }
 
 /// X1: a running save is never cut off. The upload is held at a gate; Esc and closing the window

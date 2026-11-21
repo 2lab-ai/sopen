@@ -90,6 +90,12 @@ fn stopped(what: &str) -> ItemOutcome {
     ItemOutcome::Failed(format!("{STOPPED}: {what}"))
 }
 
+/// The outcome of the item Cancel was answered at (a name in the way): nobody chose Skip, so it
+/// is not "skipped" — it was not copied because the operation was cancelled there.
+fn cancelled() -> ItemOutcome {
+    ItemOutcome::Failed("cancelled: nothing of it was copied".to_string())
+}
+
 /// Whether `name` can be a name in a folder (04 §5.1 "Names"): not empty, not `.` or `..`, no
 /// `/` (nor NUL), at most 255 bytes. The error says why, for the dialog.
 pub fn valid_name(name: &str) -> Result<(), String> {
@@ -916,7 +922,7 @@ impl Engine<'_, '_, '_> {
         let mut want = match self.resolve(&dst_dir, name, true) {
             Ok(Resolved::Name(n)) => n,
             Ok(Resolved::Skip) => return (ItemOutcome::Skipped, Flow::Go),
-            Ok(Resolved::Cancel) => return (ItemOutcome::Skipped, Flow::Cancel),
+            Ok(Resolved::Cancel) => return (cancelled(), Flow::Cancel),
             Err(e) => return (ItemOutcome::Failed(e), Flow::Go),
         };
         let nothing = if mv {
@@ -941,7 +947,7 @@ impl Engine<'_, '_, '_> {
                     Err(e) if is_taken(&e) => match self.resolve(&dst_dir, &want, false) {
                         Ok(Resolved::Name(n)) => want = n,
                         Ok(Resolved::Skip) => return (ItemOutcome::Skipped, Flow::Go),
-                        Ok(Resolved::Cancel) => return (ItemOutcome::Skipped, Flow::Cancel),
+                        Ok(Resolved::Cancel) => return (cancelled(), Flow::Cancel),
                         Err(e) => return (ItemOutcome::Failed(e), Flow::Go),
                     },
                     Err(e) if is_no_rename(&e) => break,
@@ -970,7 +976,7 @@ impl Engine<'_, '_, '_> {
             Placed::At(copied) => (named(name, &copied.name), Flow::Go),
             Placed::Keep(why) => (ItemOutcome::Failed(why), Flow::Go),
             Placed::Skipped => (ItemOutcome::Skipped, Flow::Go),
-            Placed::Cancelled => (ItemOutcome::Skipped, Flow::Cancel),
+            Placed::Cancelled => (cancelled(), Flow::Cancel),
             Placed::Stopped(what) => (stopped(&what), Flow::Stop),
             Placed::Failed(why) => (ItemOutcome::Failed(why), Flow::Go),
         }
@@ -1773,7 +1779,7 @@ impl Engine<'_, '_, '_> {
                     }
                     Ok(Resolved::Name(n)) => want = n,
                     Ok(Resolved::Skip) => return (ItemOutcome::Skipped, Flow::Go),
-                    Ok(Resolved::Cancel) => return (ItemOutcome::Skipped, Flow::Cancel),
+                    Ok(Resolved::Cancel) => return (cancelled(), Flow::Cancel),
                     Err(why) => return (ItemOutcome::Failed(why), Flow::Go),
                 },
                 Err(e) => return (ItemOutcome::Failed(format!("{e:#}")), Flow::Go),

@@ -11,9 +11,8 @@
 //! (04 §3 rule 4). Every dialog takes the keyboard back to its field on each pass while the focus
 //! is outside it, and consumes the Enter and Esc it acts on.
 //!
-//! S1-0 scaffold: the hook 02 §7 names. Nothing uses it until the integration (S1-E); the
-//! `dead_code` allowance below goes then, as a hand-over declared with it (this file is S1-D's).
-#![allow(dead_code)]
+//! The integration (S1-E) wired it in: `browser.rs` holds the [`Ops`], and its [`Run`] is
+//! [`crate::fileops::run`] on the worker [`start`] makes.
 
 use super::panel::{self, Panel};
 use crate::fileops::{Answer, Clash, Item, ItemOutcome, Progress, Reply, Report};
@@ -86,12 +85,9 @@ impl OpsTarget {
 
 /// The text of a selected entry, on the highlight bar too: yellow, as PC Shell draws it (04 §4).
 ///
-/// Placeholder for the palette's own entry, which S1-A adds to `chrome.rs` in parallel: until
-/// then the colour is chrome's CGA yellow, taken here and nowhere else. When S1-A's
-/// `Palette::selected` lands, this body becomes `p.selected` (one line, at the merge).
+/// The palette's own entry (`Palette::selected`, S1-A's).
 pub fn selected_color(p: &chrome::Palette) -> Color32 {
-    let _ = p;
-    chrome::cga::YELLOW
+    p.selected
 }
 
 /// The colour of a panel row's text: a selected entry's is [`selected_color`] (on the bar too);
@@ -351,6 +347,7 @@ fn pair(job: Job, ctx: &egui::Context) -> (Running, Link) {
 }
 
 impl Running {
+    #[allow(dead_code)] // Not used since the integration: `Ops` keeps the job itself.
     pub fn job(&self) -> &Job {
         &self.job
     }
@@ -380,6 +377,20 @@ impl Running {
     pub fn status(&self) -> Status {
         if self.stopping() {
             return Status::info("stopping…");
+        }
+        if let Some(asked) = &self.clash {
+            // The question's own item, not the one the last progress named.
+            let name = &asked.clash.name;
+            let names = self.job.names();
+            let verb = match &self.job {
+                Job::Transfer { kind, .. } => kind.verb(),
+                Job::Rename { .. } => "renaming",
+            };
+            let at = match names.iter().position(|n| n == name) {
+                Some(i) => format!(" {}/{}", i + 1, names.len()),
+                None => String::new(),
+            };
+            return Status::info(format!("{verb}{at} · {name} · waiting for an answer"));
         }
         if let Some(p) = &self.progress {
             return Status::info(progress_line(p));
@@ -438,6 +449,7 @@ impl Running {
 
     /// Each pass: [`Running::poll`], and the name-in-the-way dialog while one is asked (its
     /// answer goes to the engine).
+    #[allow(dead_code)] // Not used since the integration: `Ops::ui` polls and draws apart.
     pub fn ui(&mut self, ctx: &egui::Context) -> Option<Report> {
         let report = self.poll();
         if report.is_none() {
@@ -637,6 +649,7 @@ impl ReportView {
     }
 
     /// Its rows as text, the order shown: the head, an item a row, the notes.
+    #[cfg_attr(not(test), allow(dead_code))] // Only the tests use it.
     pub fn lines(&self) -> Vec<String> {
         let mut lines = vec![self.head.clone()];
         lines.extend(self.report.items.iter().map(item_line));
@@ -818,6 +831,7 @@ impl CopyDialog {
         }
     }
 
+    #[cfg_attr(not(test), allow(dead_code))] // Only the tests use it.
     pub fn error(&self) -> Option<&str> {
         self.error.as_deref()
     }
@@ -1143,6 +1157,7 @@ impl Rename {
         self.error.as_deref()
     }
 
+    #[allow(dead_code)] // Not used since the integration: the field itself shows it.
     pub fn pending(&self) -> bool {
         self.pending
     }
@@ -1348,12 +1363,40 @@ impl Ops {
     /// one owner of the keyboard). `active` is the panel the select-group dialog acts on, and the
     /// one a transfer started from (what it did is unselected there: what stays selected is what
     /// is left to do). Returns what a job that just ended changed.
+    #[cfg_attr(not(test), allow(dead_code))] // The browser calls `poll` and `dialogs` apart.
     pub fn ui(&mut self, ctx: &egui::Context, active: &mut Panel) -> Option<Changed> {
-        let mut changed = None;
-        if let Some(report) = self.running.as_mut().and_then(Running::poll) {
-            let job = self.running.take().map(|r| r.job.clone());
-            changed = job.and_then(|job| self.ended(job, report, active));
-        }
+        let changed = self.poll(active);
+        self.dialogs(ctx, active);
+        changed
+    }
+
+    /// The running job's news, without drawing: its progress, a question (kept until
+    /// [`Ops::dialogs`] can ask it), its end. The browser calls it on every pass, whatever the
+    /// window shows; `active` as for [`Ops::ui`].
+    pub fn poll(&mut self, active: &mut Panel) -> Option<Changed> {
+        let report = self.running.as_mut().and_then(Running::poll)?;
+        let job = self.running.take().map(|r| r.job.clone())?;
+        self.ended(job, report, active)
+    }
+
+    /// The running job waits for an answer to its question: what it is (`copy`, `move`).
+    pub fn waiting(&self) -> Option<&'static str> {
+        let running = self.running.as_ref().filter(|r| r.asking())?;
+        Some(match &running.job {
+            Job::Transfer {
+                kind: Transfer::Copy,
+                ..
+            } => "copy",
+            Job::Transfer {
+                kind: Transfer::Move,
+                ..
+            } => "move",
+            Job::Rename { .. } => "rename",
+        })
+    }
+
+    /// One dialog over the panels (see [`Ops::ui`]).
+    pub fn dialogs(&mut self, ctx: &egui::Context, active: &mut Panel) {
         if let Some(running) = self.running.as_mut().filter(|r| r.asking()) {
             running.dialog(ctx);
         } else if let Some(view) = &mut self.report {
@@ -1363,7 +1406,6 @@ impl Ops {
         } else {
             self.owners_dialogs(ctx, active);
         }
-        changed
     }
 
     /// The select-group and Copy / Move dialogs (one is open at a time in practice: each holds

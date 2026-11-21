@@ -17,9 +17,8 @@
 //! - **Cmd/Ctrl+1…9, 0 and a click on an F-key slot** are not rows: the shell turns them into the
 //!   plain F-key before any window's pass (`gui::FKeyInput`, 04 §6.1), so the F-key's row acts.
 //!
-//! Nothing outside the tests calls it until the integration (S1-E); the `dead_code` allowance
-//! below goes then, as a hand-over declared with it (this file is S1-A's).
-#![allow(dead_code)]
+//! The browser's passes call it from the integration (S1-E) on: `Browser::list_keys` and
+//! `viewer_ui` loop [`lookup`], `Browser::run` carries the command out, the F-key row is [`row`].
 
 use super::view::Mode;
 use crate::gui::chrome::{self, FKey};
@@ -29,6 +28,7 @@ use eframe::egui::{self, Event, Key, Modifiers};
 pub const LANDED: u8 = 1;
 
 /// The last slice: every row of the table.
+#[cfg_attr(not(test), allow(dead_code))] // Only the tests use it.
 pub const ALL_SLICES: u8 = 7;
 
 /// Where the keyboard is: a row acts only in the context it names (04 §3 rule 4).
@@ -47,6 +47,7 @@ pub enum Context {
 }
 
 impl Context {
+    #[cfg_attr(not(test), allow(dead_code))] // Only the tests use it.
     pub const ALL: [Context; 5] = [
         Context::List,
         Context::Viewer,
@@ -141,7 +142,7 @@ pub enum Command {
     Pin,
     /// A typed letter (list, tree): the bar to the next name starting with it.
     Jump(char),
-    /// Esc in the list: stop a fetch or a file operation, else unpin (02 §3.2).
+    /// Esc in the list: stop a fetch or a file operation (02 §3.2; from S2, else unpin).
     Stop,
     // The viewer (01 §3a).
     /// F3, Esc: back to the list (through the viewer's own `close_requested`).
@@ -443,7 +444,7 @@ pub const TABLE: &[Row] = &[
     key(List, K::ArrowRight, Cmd, C::SameFolder(Side::Right), "", "The right panel to this folder", 1),
     key(List, K::G, Cmd, C::Pin, "", "Pin the git panel to the other side; again: unpin", 2),
     letter(List, C::Jump(' '), "The next name starting with it", 1),
-    key(List, K::Escape, Plain, C::Stop, "", "Stop a fetch or a file operation, else unpin", 1),
+    key(List, K::Escape, Plain, C::Stop, "", "Stop a fetch or a file operation", 1),
     // A viewer over both sides (01 §3a); its own keys come with its F-key slots.
     key(Viewer, K::F1, Plain, C::Help, "Help", HELP, 1),
     key(Viewer, K::F3, Plain, C::CloseViewer, "Exit", CLOSE_VIEWER, 1),

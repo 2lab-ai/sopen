@@ -39,8 +39,7 @@ pub(crate) struct Page {
 /// The browser's keys in `context` (its landed rows, 02 §7), then the F-key slots of `own` that
 /// the table has no row for there (a hosted viewer's own keys: the hex window's 5 Save, …), then
 /// the aliases. F9's words name the mode it switches to in `mode`. The browser opens it on
-/// `keys::Command::Help` from S1-E on; the allowance goes then, as a declared hand-over.
-#[allow(dead_code)]
+/// `keys::Command::Help`.
 pub(crate) fn for_context(context: Context, mode: Mode, own: &[FKey]) -> Page {
     page_upto(context, mode, own, keys::LANDED)
 }

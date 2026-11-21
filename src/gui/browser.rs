@@ -4,15 +4,25 @@
 //! bottom — [`super::chrome`] draws all of it). Enter on a file shows the viewer for its kind in
 //! the same window: text in the text viewer, an image in the image window, video and audio in
 //! the media window, anything else in the hex window. F4 opens the highlighted file or folder in
-//! VS Code or Zed. The browser views; it never copies, moves, deletes or renames.
+//! VS Code or Zed.
+//!
+//! The window has two modes (02 §2, F9): in preview mode, the default, the side opposite the
+//! active list previews the file under its bar ([`view`] decides what each side shows,
+//! [`preview`] hosts the preview); in dual mode both sides are lists. F2 renames the entry under
+//! the bar, F5 copies and F6 moves the selection or that entry to the other panel's folder,
+//! never over anything ([`ops`], on [`crate::fileops`]'s engine; 04 §5). Every key is a row of
+//! the one key table ([`keys`]).
 //!
 //! Every way out of a viewer — Esc, F3, closing the window — goes through the viewer's own
 //! [`Window::close_requested`], so its unsaved-changes prompt and its running saves are honoured
 //! exactly as in its own window: a viewer is dropped only once it said yes, and what it may still
 //! be writing is waited for before sopen exits ([`open`]).
 //!
-//! Nothing slow runs on a frame: listing, opening a connection, fetching, decoding and probing
-//! run on workers, and Esc stops a fetch.
+//! Nothing slow runs on a frame: listing, opening a connection, fetching, decoding, probing,
+//! preparing a preview and file operations run on workers, each feature with its own state and
+//! its own rule for the keys it holds back (02 §6): a listing holds the list's keys, an opening
+//! all but Esc, a preview none, a file operation none but a second operation. Esc stops a fetch
+//! or a file operation.
 
 pub(crate) mod keys;
 mod ops;
@@ -22,19 +32,24 @@ mod preview;
 pub(crate) mod view;
 
 use super::chrome::{self, FKey};
-use super::{Embedded, Hooks, Outcome, Status, Window};
-use crate::remote::{EntryKind, RemoteFs};
-use anyhow::Result;
+use super::{help, Embedded, Hooks, Outcome, Status, Window};
+use crate::fileops::{self, Item, ItemOutcome, Report};
+use crate::remote::ops::FileOps;
+use crate::remote::{EntryKind, LocalFs, RemoteFs, SftpRemote};
+use anyhow::{bail, Result};
 use eframe::egui::{self, Key, Modifiers, Pos2, Rect, Sense, Vec2};
+use keys::{Command, Context, Step};
 pub use panel::Panel;
 use prepare::Prepared;
 use std::cell::RefCell;
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
+use std::time::Duration;
 
 /// The window's size when it opens.
 pub const WINDOW: [f32; 2] = [1100.0, 700.0];
@@ -56,21 +71,21 @@ pub struct Start {
     pub label: Option<String>,
     /// The host as `ssh` takes it (`user@host`, an IPv6 host unbracketed:
     /// [`RemoteSpec::destination`](crate::target::RemoteSpec::destination), not `label`); `None`
-    /// on this machine. For what runs over the folder's ssh master besides the listing (02 §5);
-    /// nothing reads it yet.
+    /// on this machine. For what runs over the folder's ssh master besides the listing (02 §5:
+    /// git, from S2); nothing reads it yet.
     pub destination: Option<String>,
     /// The folder (absolute).
     pub abs: String,
     /// sopen's cache root.
     pub cache: PathBuf,
     /// sopen's state folder, where the ssh master's socket is
-    /// ([`connection_args`](crate::remote::connection_args)); nothing reads it yet.
+    /// ([`connection_args`](crate::remote::connection_args)): the file operations' connections
+    /// go over it.
     pub state_dir: PathBuf,
     pub launch: Launch,
 }
 
-/// What the browser's features tell it (02 §7). S1-E sends and handles them.
-#[allow(dead_code)] // S1-0 scaffold: S1-E's wiring uses it.
+/// What the browser's features tell it (02 §7): [`Browser::event`] handles them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum BrowserEvent {
     /// Files changed in `dirs` (absolute) on `host` (`[user@]host`; `None`: this machine), after
@@ -86,9 +101,16 @@ pub(crate) enum BrowserEvent {
 /// writing (printed as the viewer's own window prints it) and returns what the viewers did.
 pub fn open(start: Start, hooks: &Hooks) -> Result<Outcome> {
     let title = show(start.label.as_deref(), &start.abs);
+    let script = match std::env::var("SOPEN_KEYS") {
+        Ok(text) => parse_keys(&text).map_err(|e| anyhow::anyhow!("SOPEN_KEYS: {e}"))?,
+        Err(_) => Vec::new(),
+    };
     let mut browser = Browser::new(start);
     browser.open_first = hooks.state.open.clone();
     browser.open_at = hooks.state.at;
+    browser.mode = hooks.state.mode;
+    browser.bar_first = hooks.state.bar.clone();
+    browser.script = script.into();
     let leftover = browser.leftover.clone();
     let run = super::run_window(&title, WINDOW, browser, hooks);
     let outcome = leftover.borrow_mut().finish();
@@ -122,31 +144,228 @@ fn not_utf8(shown: &str) -> String {
     format!("{shown}: the name is not valid UTF-8; sopen cannot open it")
 }
 
-/// What the browser is doing on a worker.
-enum Task {
-    /// Listing `dir` for one panel (`None`: both, at the start); `select` = the entry to put
-    /// the bar on.
-    Listing {
-        panel: Option<usize>,
-        dir: String,
-        select: Option<String>,
-        rx: Receiver<Result<Listed>>,
-    },
-    /// Making the file at `abs` ready for its viewer.
-    Opening {
-        abs: String,
-        name: String,
-        remote: bool,
-        done: Arc<AtomicU64>,
-        total: Arc<AtomicU64>,
-        cancel: Arc<AtomicBool>,
-        rx: Receiver<Result<Prepared>>,
-        worker: Option<JoinHandle<()>>,
-    },
+/// Opens a connection for a file operation on a host (`[user@]host` as the browser prints it;
+/// `None`: this machine). Each operation has connections of its own (04 §5.1).
+pub(crate) type OpsConnect =
+    Arc<dyn Fn(Option<&str>) -> Result<Box<dyn FileOps + Send>> + Send + Sync>;
+
+/// The host `label` names (`[user@]host`, an IPv6 host bracketed), read as sopen reads its
+/// command line.
+fn host_spec(label: &str) -> Result<crate::target::RemoteSpec> {
+    match crate::target::parse(&format!("{label}:/")) {
+        Ok(crate::target::Target::Remote(spec)) => Ok(spec),
+        Ok(crate::target::Target::Local(_)) => bail!("{label} is not a host"),
+        Err(why) => bail!(why),
+    }
+}
+
+/// File-operation connections as the window's own are made: this machine's file layer, or
+/// SFTP to the host over its ssh master (`state_dir` holds the socket).
+fn ops_connect(state_dir: PathBuf) -> OpsConnect {
+    Arc::new(move |host: Option<&str>| match host {
+        None => Ok(Box::new(LocalFs::new()) as Box<dyn FileOps + Send>),
+        Some(label) => Ok(Box::new(SftpRemote::connect(
+            &host_spec(label)?,
+            &state_dir,
+        )?)),
+    })
+}
+
+/// The browser's dialogs on [`fileops`]' engine: an [`ops::Run`] that runs the job on the
+/// worker `ops` made for it — over one connection when both folders are on one host (a move is
+/// then a rename where one is possible, a remote copy runs on the server), else over one per
+/// host — and tells the window through the job's [`ops::Link`]: progress, a name in the way,
+/// and Esc through the link's own stop flag.
+fn engine(connect: OpsConnect) -> ops::Run {
+    engine_seen(connect, None)
+}
+
+/// What a test watches the engine's progress with, on the operation's worker (a gate in the
+/// middle of a transfer).
+type ProgressSeen = Arc<dyn Fn(&fileops::Progress) + Send + Sync>;
+
+/// [`engine`]; `seen` is called with every progress the engine reports, before the window
+/// hears of it.
+fn engine_seen(connect: OpsConnect, seen: Option<ProgressSeen>) -> ops::Run {
+    Arc::new(move |job: ops::Job, link: &ops::Link| -> Report {
+        let (op, from, names, to) = match job {
+            ops::Job::Transfer {
+                kind,
+                from,
+                names,
+                to,
+            } => {
+                let op = match kind {
+                    ops::Transfer::Copy => fileops::Op::Copy,
+                    ops::Transfer::Move => fileops::Op::Move,
+                };
+                (op, from, names, to)
+            }
+            ops::Job::Rename { dir, from, to } => {
+                (fileops::Op::Rename { to }, dir.clone(), vec![from], dir)
+            }
+        };
+        let job = fileops::Job {
+            op,
+            src_dir: from.dir.clone(),
+            names,
+            dst_dir: to.dir.clone(),
+        };
+        // Refused before anything happened: every item not reached, the reason the note.
+        let refused = |host: &ops::OpsTarget, e: anyhow::Error| Report {
+            items: job
+                .names
+                .iter()
+                .map(|name| Item {
+                    name: name.clone(),
+                    outcome: ItemOutcome::NotReached,
+                })
+                .collect(),
+            notes: vec![match &host.host {
+                Some(host) => format!("cannot connect to {host}: {e:#}"),
+                None => format!("cannot open this machine's files: {e:#}"),
+            }],
+        };
+        let mut ctl = Ctl {
+            link,
+            last: None,
+            seen: seen.clone(),
+        };
+        let mut src = match connect(from.host.as_deref()) {
+            Ok(fs) => fs,
+            Err(e) => return refused(&from, e),
+        };
+        if from.host == to.host {
+            return fileops::run(&job, fileops::Hosts::Same(src.as_mut()), &mut ctl);
+        }
+        let mut dst = match connect(to.host.as_deref()) {
+            Ok(fs) => fs,
+            Err(e) => return refused(&to, e),
+        };
+        let hosts = fileops::Hosts::Two {
+            src: src.as_mut(),
+            dst: dst.as_mut(),
+        };
+        fileops::run(&job, hosts, &mut ctl)
+    })
+}
+
+/// The engine's [`fileops::Control`] over a job's [`ops::Link`].
+struct Ctl<'a> {
+    link: &'a ops::Link,
+    last: Option<fileops::Progress>,
+    seen: Option<ProgressSeen>,
+}
+
+/// A progress event goes to the window when the item or file changes, when a file ends, and
+/// every this many bytes in between (the engine reports every chunk).
+const PROGRESS_EVERY: u64 = 1024 * 1024;
+
+impl fileops::Control for Ctl<'_> {
+    /// Esc: the link's own flag, which [`ops::Ops::stop`] sets.
+    fn cancel(&self) -> Arc<AtomicBool> {
+        self.link.stop_flag()
+    }
+
+    fn progress(&mut self, p: &fileops::Progress) {
+        if let Some(seen) = &self.seen {
+            seen(p);
+        }
+        let due = match &self.last {
+            None => true,
+            Some(last) => {
+                (last.verb, last.item, &last.name) != (p.verb, p.item, &p.name)
+                    || p.done == p.total
+                    || p.done.saturating_sub(last.done) >= PROGRESS_EVERY
+            }
+        };
+        if due {
+            self.last = Some(p.clone());
+            self.link.progress(p.clone());
+        }
+    }
+
+    fn ask(&mut self, clash: &fileops::Clash) -> fileops::Reply {
+        self.link.ask(clash.clone())
+    }
+}
+
+/// An engine that does nothing: what a browser that is going away holds in place of its own.
+fn no_engine() -> ops::Run {
+    Arc::new(|_: ops::Job, _: &ops::Link| Report::default())
+}
+
+/// One step of `SOPEN_KEYS`.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum Play {
+    Key(Key, Modifiers),
+    Text(String),
+}
+
+/// `SOPEN_KEYS`, read: steps separated by commas — a key by egui's name (`F5`, `Enter`, `Esc`,
+/// `Down`, `Space`, `Tab`, a letter), with `Shift+`, `Alt+` or `Cmd+` / `Ctrl+` before it, or
+/// `text:…` for typed text. The browser plays them, one per settled window, as the owner's
+/// keys (a receipt of a dialog, a selection, a rename).
+pub(crate) fn parse_keys(text: &str) -> std::result::Result<Vec<Play>, String> {
+    let mut out = Vec::new();
+    for step in text.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        if let Some(typed) = step.strip_prefix("text:") {
+            out.push(Play::Text(typed.to_string()));
+            continue;
+        }
+        let mut modifiers = Modifiers::NONE;
+        let mut parts: Vec<&str> = step.split('+').collect();
+        let name = parts.pop().unwrap_or_default();
+        for part in parts {
+            modifiers |= match part {
+                "Shift" => Modifiers::SHIFT,
+                "Alt" => Modifiers::ALT,
+                "Cmd" | "Ctrl" => Modifiers::COMMAND,
+                other => return Err(format!("'{step}': unknown modifier '{other}'")),
+            };
+        }
+        let key = Key::from_name(name).ok_or_else(|| format!("'{step}': unknown key '{name}'"))?;
+        out.push(Play::Key(key, modifiers));
+    }
+    Ok(out)
+}
+
+/// A listing running on a worker.
+struct Listing {
+    /// The panel it is for (`None`: both, at the start).
+    panel: Option<usize>,
+    dir: String,
+    /// The entry to put the bar on; when it is not there, the bar stays on its row (`keep`).
+    select: Option<String>,
+    keep: Option<usize>,
+    rx: Receiver<Result<Listed>>,
 }
 
 /// A listing: the entries and the free space.
 type Listed = (Vec<crate::remote::Entry>, Option<u64>);
+
+/// A file being made ready for its viewer.
+struct Opening {
+    abs: String,
+    name: String,
+    remote: bool,
+    done: Arc<AtomicU64>,
+    total: Arc<AtomicU64>,
+    cancel: Arc<AtomicBool>,
+    source: Source,
+}
+
+/// Where an opening's file comes from.
+enum Source {
+    /// Enter on it in the list: [`prepare::prepare`] on a worker.
+    Fresh {
+        rx: Receiver<Result<Prepared>>,
+        worker: Option<JoinHandle<()>>,
+    },
+    /// Enter on a file whose preview was still being prepared (02 §4.4): that preparation,
+    /// its budget lifted, goes on as the opening.
+    Preview(preview::Prep),
+}
 
 /// The viewer on screen.
 struct Viewer {
@@ -170,11 +389,14 @@ struct Closing {
     hold: Option<crate::cache::Claim>,
 }
 
-/// What outlives the window: fetches stopping, viewers' writes, the viewers' outcome.
+/// What outlives the window: fetches stopping, viewers' writes, a file operation, the viewers'
+/// outcome.
 #[derive(Default)]
 struct Leftover {
     workers: Vec<JoinHandle<()>>,
     closing: Vec<Closing>,
+    /// The window's file operations, with a job that may still run.
+    ops: Option<ops::Ops>,
     outcome: Outcome,
 }
 
@@ -194,28 +416,87 @@ impl Leftover {
         self.closing = still;
     }
 
-    /// After the window: stopped fetches end, every write is waited for.
+    /// After the window: stopped fetches end, every write is waited for — a running file
+    /// operation too (02 §6), and what it did is printed.
     fn finish(&mut self) -> Outcome {
         for worker in self.workers.drain(..) {
             let _ = worker.join();
+        }
+        if let Some(report) = self.ops.take().and_then(ops::Ops::wait) {
+            for line in report_lines(&report) {
+                eprintln!("sopen: {line}");
+            }
         }
         self.settle(true);
         self.outcome.clone()
     }
 }
 
+/// What a file operation did, for the terminal: it ended after its window closed.
+fn report_lines(report: &Report) -> Vec<String> {
+    let done = report
+        .items
+        .iter()
+        .filter(|i| matches!(i.outcome, ItemOutcome::Done | ItemOutcome::Renamed(_)))
+        .count();
+    let mut lines = vec![format!(
+        "the file operation ended after the window closed: {done} of {} done",
+        report.items.len()
+    )];
+    for item in &report.items {
+        match &item.outcome {
+            ItemOutcome::Done => {}
+            ItemOutcome::Renamed(to) => lines.push(format!("{} → {to}", item.name)),
+            ItemOutcome::Skipped => lines.push(format!("{}: skipped", item.name)),
+            ItemOutcome::Failed(why) => lines.push(format!("{}: {why}", item.name)),
+            ItemOutcome::NotReached => lines.push(format!("{}: not reached", item.name)),
+        }
+    }
+    lines.extend(report.notes.iter().cloned());
+    lines
+}
+
 pub(crate) struct Browser {
     /// `host:/abs` of the folder opened.
     title: String,
     label: Option<String>,
-    /// The browser's own connection (listing), shared with its listing worker.
+    /// The browser's own connection (listing), shared with its listing workers.
     conn: Arc<Mutex<Box<dyn RemoteFs + Send>>>,
     connect: Connect,
     launch: Launch,
     cache: PathBuf,
     panels: [Panel; 2],
     active: usize,
-    task: Option<Task>,
+    /// The browser's mode (02 §2): preview (the default) or dual; F9 switches it.
+    mode: view::Mode,
+    /// The committed display (02 §3.1): what each side shows now.
+    shown: Option<[view::Content; 2]>,
+    /// The active list's bar as the last pass saw it — the side, its folder, the entry — and
+    /// when it last moved within that folder (egui's clock; `None`: the last change was
+    /// something else, which commits at once).
+    bar_was: (usize, String, Option<String>),
+    moved_at: Option<f64>,
+    /// The bar has not rested yet: a side keeps what it shows a little longer.
+    uncommitted: bool,
+    // One job state per feature (02 §6).
+    /// Listings running (the panels re-read after a file operation, one each).
+    listing: Vec<Listing>,
+    /// The file being made ready for its viewer.
+    opening: Option<Opening>,
+    /// The preview host (02 §4): its own preparation, its own connection.
+    preview: preview::Host,
+    /// The file operations (04 §4–§5): the dialogs, the rename field, the running job.
+    ops: ops::Ops,
+    /// The panel F2 was last pressed in: its row shows the rename field, and its bar goes on
+    /// the new name.
+    rename_panel: usize,
+    /// After a rename: the panel it was made in, its folder, and the new name its bar goes on
+    /// at the re-read.
+    bar_next: Option<(usize, String, String)>,
+    /// Each panel's last listing, when it failed: said until that panel lists again.
+    list_errors: [Option<String>; 2],
+    /// What an operation that ended under a viewer has to say, for when the list shows again.
+    told_later: Option<Status>,
     viewer: Option<Viewer>,
     exit: Exit,
     status: Status,
@@ -224,15 +505,22 @@ pub(crate) struct Browser {
     /// A widget had the keyboard at the end of the last pass: an Esc that took it away was that
     /// widget's (a text field's), not a request to leave the viewer.
     focused_before: bool,
-    /// Rows each panel shows (the last pass's).
+    /// Rows the active panel shows (the last pass's).
     visible: usize,
     painted: bool,
     /// `SOPEN_STATE` `open=NAME`: opened once the folder is first listed (receipts of a viewer).
     open_first: Option<String>,
+    /// `SOPEN_STATE` `bar=NAME`: the bar goes on it once the folder is first listed, without
+    /// opening it (a preview's receipt; 02 §9).
+    bar_first: Option<String>,
     /// `SOPEN_STATE` `at=OFFSET`: where the first text viewer opened in this browser starts (the
     /// row that byte is in at the top) — the one `open=` opens, or else the first the owner
     /// opens; taken by it, so no later viewer gets it.
     open_at: Option<u64>,
+    /// `SOPEN_KEYS`: the keys still to play, one per settled window, and the passes to let go
+    /// by before the next (a field opened by one takes the typing on the pass after).
+    script: VecDeque<Play>,
+    script_gap: u8,
 }
 
 impl Drop for Browser {
@@ -245,10 +533,16 @@ impl Drop for Browser {
                 hold: viewer.hold,
             });
         }
-        if let Some(Task::Opening { cancel, worker, .. }) = self.task.take() {
-            cancel.store(true, Ordering::Relaxed);
-            leftover.workers.extend(worker);
+        if let Some(opening) = self.opening.take() {
+            opening.cancel.store(true, Ordering::Relaxed);
+            leftover.workers.extend(match opening.source {
+                Source::Fresh { worker, .. } => worker,
+                Source::Preview(prep) => prep.into_worker(),
+            });
         }
+        // A running file operation is waited for, not stopped (02 §6); a preview's
+        // preparation is cancelled and not waited for (02 §4.4: the host's own drop).
+        leftover.ops = Some(std::mem::replace(&mut self.ops, ops::Ops::new(no_engine())));
     }
 }
 
@@ -258,11 +552,16 @@ fn list_id() -> egui::Id {
 
 /// The keys the status row names when nothing else is to be said.
 const LIST_HINT: &str =
-    "Enter open · Tab other panel · Backspace up · a letter jumps to a name · F4 VS Code / Zed";
+    "Enter open · Tab other panel · Backspace up · a letter jumps to a name · F1 the keys";
 const VIEWER_HINT: &str = "Esc or F3 back to the list · F4 VS Code / Zed";
 
 impl Browser {
     pub(crate) fn new(start: Start) -> Self {
+        let preview = preview::Host::new(
+            start.connect.clone(),
+            start.label.clone(),
+            start.cache.clone(),
+        );
         let mut browser = Self {
             title: show(start.label.as_deref(), &start.abs),
             label: start.label,
@@ -272,7 +571,19 @@ impl Browser {
             cache: start.cache,
             panels: [Panel::new(&start.abs), Panel::new(&start.abs)],
             active: 0,
-            task: None,
+            mode: view::Mode::default(),
+            shown: None,
+            bar_was: (0, start.abs.clone(), None),
+            moved_at: None,
+            uncommitted: false,
+            listing: Vec::new(),
+            opening: None,
+            preview,
+            ops: ops::Ops::new(engine(ops_connect(start.state_dir))),
+            rename_panel: 0,
+            bar_next: None,
+            list_errors: [None, None],
+            told_later: None,
             viewer: None,
             exit: Exit::List,
             status: Status::default(),
@@ -282,18 +593,51 @@ impl Browser {
             visible: 1,
             painted: false,
             open_first: None,
+            bar_first: None,
             open_at: None,
+            script: VecDeque::new(),
+            script_gap: 0,
         };
         browser.list(None, start.abs, None, None);
         browser
     }
 
-    /// Lists `dir` on a worker for `panel` (`None`: both).
+    /// Tests: the connections file operations run over.
+    #[cfg(test)]
+    fn set_ops_connect(&mut self, connect: OpsConnect) {
+        self.ops = ops::Ops::new(engine(connect));
+    }
+
+    /// Tests: the real engine over `connect`, its progress watched by `seen`.
+    #[cfg(test)]
+    fn set_ops_seen(&mut self, connect: OpsConnect, seen: ProgressSeen) {
+        self.ops = ops::Ops::new(engine_seen(connect, Some(seen)));
+    }
+
+    /// Tests: a stand-in engine.
+    #[cfg(test)]
+    fn set_ops_run(&mut self, run: ops::Run) {
+        self.ops = ops::Ops::new(run);
+    }
+
+    /// Lists `dir` on a worker for `panel` (`None`: both), the bar then on `select`.
     fn list(
         &mut self,
         panel: Option<usize>,
         dir: String,
         select: Option<String>,
+        ctx: Option<&egui::Context>,
+    ) {
+        self.relist(panel, dir, select, None, ctx);
+    }
+
+    /// [`Browser::list`]; where `select` is not listed any more the bar stays on row `keep`.
+    fn relist(
+        &mut self,
+        panel: Option<usize>,
+        dir: String,
+        select: Option<String>,
+        keep: Option<usize>,
         ctx: Option<&egui::Context>,
     ) {
         let (tx, rx) = mpsc::channel();
@@ -322,16 +666,27 @@ impl Browser {
                 ctx.request_repaint();
             }
         });
-        self.task = Some(Task::Listing {
+        // A newer listing for a panel replaces an older one still running for it.
+        self.listing
+            .retain(|l| l.panel.is_some() && panel.is_some() && l.panel != panel);
+        self.listing.push(Listing {
             panel,
             dir,
             select,
+            keep,
             rx,
         });
     }
 
-    /// Makes the file at `abs` ready for its viewer, on a worker.
-    fn start_open(&mut self, ctx: &egui::Context, abs: String, name: String) {
+    /// Makes the file at `abs` ready for its viewer, on a worker; `reuse`: a preview card's
+    /// complete private copy, published instead of read again (02 §4.4).
+    fn start_open(
+        &mut self,
+        ctx: &egui::Context,
+        abs: String,
+        name: String,
+        reuse: Option<prepare::Reuse>,
+    ) {
         let (done, total) = (Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)));
         let cancel = Arc::new(AtomicBool::new(false));
         let (tx, rx) = mpsc::channel();
@@ -351,107 +706,223 @@ impl Browser {
                 abs: &path,
                 cache: &cache,
             };
-            let result = prepare::prepare(&req, &stop, &mut |now, all| {
+            let mut progress = |now, all| {
                 d.store(now, Ordering::Relaxed);
                 t.store(all, Ordering::Relaxed);
                 waker.request_repaint();
-            });
+            };
+            let result = match reuse {
+                Some(reuse) => prepare::prepare_reusing(&req, reuse, &stop, &mut progress),
+                None => prepare::prepare(&req, &stop, &mut progress),
+            };
             let _ = tx.send(result);
             waker.request_repaint();
         });
         self.status = Status::default();
-        self.task = Some(Task::Opening {
+        self.opening = Some(Opening {
             abs,
             name,
             remote: self.label.is_some(),
             done,
             total,
             cancel,
-            rx,
-            worker: Some(worker),
+            source: Source::Fresh {
+                rx,
+                worker: Some(worker),
+            },
         });
     }
 
-    /// Carries out a key's command (02 §7); S1-E dispatches it to `ops`, `view` and the rest.
-    /// S1-0 scaffold: no command exists yet, so it does nothing.
-    #[allow(dead_code)] // S1-0 scaffold: S1-E's wiring calls it.
-    fn run(&mut self, _command: keys::Command) {}
+    /// Carries out a key's command in the list (02 §7): the bar, the sides and the mode
+    /// ([`view`]), viewers, the editor, the file operations ([`ops`]). While a file is being
+    /// made ready only Esc acts (it stops the fetch); while a folder is listed, none (it takes
+    /// a moment).
+    fn run(&mut self, ctx: &egui::Context, command: Command) {
+        // Esc acts whatever else is on its way: a pending listing never makes a fetch or a
+        // file operation unstoppable.
+        if command == Command::Stop {
+            self.stop();
+            return;
+        }
+        if self.opening.is_some() {
+            return;
+        }
+        if !self.listing.is_empty() {
+            return;
+        }
+        let page = self.visible.saturating_sub(1).max(1) as isize;
+        let active = self.active;
+        let panel = &mut self.panels[active];
+        match command {
+            Command::Help => {
+                help::open(ctx, help::for_context(Context::List, self.mode, &[]));
+            }
+            Command::Bar(step) => match step {
+                Step::Up => panel.step(-1),
+                Step::Down => panel.step(1),
+                Step::PageUp => panel.step(-page),
+                Step::PageDown => panel.step(page),
+                Step::Home => panel.home(),
+                Step::End => panel.end(),
+            },
+            Command::Jump(c) => {
+                panel.jump(c);
+            }
+            Command::Open => self.enter(ctx, false),
+            Command::View => self.enter(ctx, true),
+            Command::Up => self.up(ctx),
+            Command::Edit => match panel.current() {
+                Some(entry) if entry.lossy => self.status = Status::error(not_utf8(&entry.name)),
+                Some(entry) => {
+                    let is_dir = entry.kind == EntryKind::Dir;
+                    let path = panel.path_of(entry);
+                    self.edit(ctx, path, is_dir);
+                }
+                None => {}
+            },
+            Command::OtherSide => self.active = 1 - active,
+            Command::SwitchMode => {
+                self.mode = self.mode.other();
+                // A mode change commits at once (02 §3.1).
+                self.moved_at = None;
+            }
+            Command::Select => panel.toggle(),
+            Command::SelectAll => panel.select_all(),
+            Command::InvertSelection => panel.invert(),
+            Command::SelectGroup => self.ops.open_group(true),
+            Command::UnselectGroup => self.ops.open_group(false),
+            Command::Rename => {
+                self.rename_panel = active;
+                let refused = self.ops.open_rename(panel, self.label.as_deref());
+                self.status = refused.unwrap_or_default();
+            }
+            Command::Copy => self.transfer(ops::Transfer::Copy),
+            Command::Move => self.transfer(ops::Transfer::Move),
+            Command::Reread => {
+                let (dir, at) = (panel.dir.clone(), panel.highlight);
+                let name = panel.current().map(|e| e.name.clone());
+                self.relist(Some(active), dir, name, Some(at), Some(ctx));
+            }
+            Command::SwapPanels => {
+                self.panels.swap(0, 1);
+                // The keyboard goes with its list.
+                self.active = 1 - active;
+            }
+            Command::SameFolder(side) => {
+                let to = match side {
+                    keys::Side::Left => 0,
+                    keys::Side::Right => 1,
+                };
+                if to != active {
+                    let dir = panel.dir.clone();
+                    self.list(Some(to), dir, None, Some(ctx));
+                }
+            }
+            // Rows of other contexts and of slices that have not landed: nothing to do here.
+            _ => {}
+        }
+    }
 
-    /// Results from the workers: a listing, a file ready (its viewer shows), an F4 launch; and
+    /// Esc in the list (02 §3.2): stops a running fetch, else a running file operation —
+    /// the engine stops at its next check and reports what it did (04 §5.1, §5.2).
+    fn stop(&mut self) {
+        if let Some(opening) = &self.opening {
+            opening.cancel.store(true, Ordering::Relaxed);
+        } else if self.ops.busy() {
+            self.ops.stop();
+        }
+    }
+
+    /// F5 / F6: the dialog for the selection or the bar's entry, to the other panel's own
+    /// folder — whatever that side shows (02 §7 `OpsTarget`).
+    fn transfer(&mut self, kind: ops::Transfer) {
+        let to = ops::OpsTarget {
+            host: self.label.clone(),
+            dir: self.panels[1 - self.active].dir.clone(),
+        };
+        let (panel, host) = (&self.panels[self.active], self.label.as_deref());
+        let refused = self.ops.open_copy(kind, panel, host, &to);
+        self.status = refused.unwrap_or_default();
+    }
+
+    /// What a feature tells the browser (02 §7).
+    fn event(&mut self, ctx: &egui::Context, event: BrowserEvent) {
+        match event {
+            // Files changed in `dirs`: the panels showing one re-list, the bar kept on its name
+            // (a rename's new name in the panel it was made in), else on its row.
+            BrowserEvent::FilesChanged { host, dirs } => {
+                if host != self.label {
+                    return;
+                }
+                for i in 0..2 {
+                    let panel = &self.panels[i];
+                    if !dirs.contains(&panel.dir) {
+                        continue;
+                    }
+                    let renamed = self
+                        .bar_next
+                        .take_if(|(origin, dir, _)| i == *origin && *dir == panel.dir)
+                        .map(|(_, _, name)| name);
+                    let name = renamed.or_else(|| panel.current().map(|e| e.name.clone()));
+                    let (dir, at) = (panel.dir.clone(), panel.highlight);
+                    self.relist(Some(i), dir, name, Some(at), Some(ctx));
+                }
+            }
+        }
+    }
+
+    /// A file operation ended (04 §5.1 "After"): its line on the status row, and
+    /// [`BrowserEvent::FilesChanged`] for the folders it changed, a host at a time.
+    fn after_operation(&mut self, ctx: &egui::Context, changed: ops::Changed) {
+        if let Some(said) = changed.said {
+            if self.viewer.is_some() {
+                // Told when the list shows again: the viewer's row stays the viewer's.
+                self.told_later = Some(said);
+            } else {
+                self.status = said;
+            }
+        }
+        if let (Some(name), Some(first)) = (changed.bar, changed.dirs.first()) {
+            // The panel the rename was made in, whichever has the keyboard now.
+            self.bar_next = Some((self.rename_panel, first.dir.clone(), name));
+        }
+        let mut hosts: Vec<Option<String>> = Vec::new();
+        for dir in &changed.dirs {
+            if !hosts.contains(&dir.host) {
+                hosts.push(dir.host.clone());
+            }
+        }
+        for host in hosts {
+            let dirs = changed
+                .dirs
+                .iter()
+                .filter(|d| d.host == host)
+                .map(|d| d.dir.clone())
+                .collect();
+            self.event(ctx, BrowserEvent::FilesChanged { host, dirs });
+        }
+        self.bar_next = None;
+    }
+
+    /// Results from the workers: listings, a file ready (its viewer shows), an F4 launch; and
     /// writes of viewers already gone.
     fn poll(&mut self, ctx: &egui::Context) {
-        match &mut self.task {
-            Some(Task::Listing {
-                panel,
-                dir,
-                select,
-                rx,
-            }) => match rx.try_recv() {
-                Ok(result) => {
-                    let (panel, dir, select) = (*panel, dir.clone(), select.take());
-                    self.task = None;
-                    match result {
-                        Ok((entries, free)) => {
-                            if self.status.error {
-                                // An earlier listing's failure is over.
-                                self.status = Status::default();
-                            }
-                            for i in panel.map_or(vec![0, 1], |p| vec![p]) {
-                                let (e, s) = (entries.clone(), select.as_deref());
-                                self.panels[i].fill(dir.clone(), e, free, s);
-                            }
-                            if let Some(name) = self.open_first.take() {
-                                let panel = &mut self.panels[self.active];
-                                match panel.entries.iter().position(|e| e.name == name) {
-                                    Some(i) => {
-                                        panel.highlight = i;
-                                        self.enter(ctx, false);
-                                    }
-                                    None => {
-                                        self.status = Status::error(format!(
-                                            "SOPEN_STATE open: no {name} in {dir}"
-                                        ))
-                                    }
-                                }
-                            }
-                        }
-                        Err(e) => self.status = Status::error(format!("{e:#}")),
-                    }
+        let mut at = 0;
+        while at < self.listing.len() {
+            let result = match self.listing[at].rx.try_recv() {
+                Ok(result) => result,
+                Err(TryRecvError::Empty) => {
+                    at += 1;
+                    continue;
                 }
-                Err(TryRecvError::Empty) => {}
                 Err(TryRecvError::Disconnected) => {
-                    self.task = None;
-                    self.status = Status::error("the listing stopped without a result");
+                    Err(anyhow::anyhow!("the listing stopped without a result"))
                 }
-            },
-            Some(Task::Opening { rx, .. }) => match rx.try_recv() {
-                Ok(result) => {
-                    if let Some((abs, name, cancelled)) = self.end_opening() {
-                        if cancelled && result.is_ok() {
-                            // Esc came after the last byte (or there was none to fetch): the
-                            // file is ready but was not wanted any more. Dropping it releases
-                            // its copy and its connection.
-                            drop(result);
-                            let kept = if self.label.is_some() {
-                                " (its copy is in sopen's cache)"
-                            } else {
-                                ""
-                            };
-                            self.status =
-                                Status::info(format!("cancelled; {name} was not opened{kept}"));
-                        } else {
-                            self.opened(ctx, result, abs, name);
-                        }
-                    }
-                }
-                Err(TryRecvError::Empty) => {}
-                Err(TryRecvError::Disconnected) => {
-                    self.end_opening();
-                    self.status = Status::error("opening stopped without a result");
-                }
-            },
-            None => {}
+            };
+            let listing = self.listing.remove(at);
+            self.listed(ctx, listing, result);
         }
+        self.poll_opening(ctx);
         self.launches.retain(|rx| match rx.try_recv() {
             Ok(Ok(line)) => {
                 self.status = Status::info(line);
@@ -467,23 +938,132 @@ impl Browser {
         self.leftover.borrow_mut().settle(false);
     }
 
-    /// The opening task is over: its worker is done (it sent its result). The file it opened,
-    /// and whether Esc asked to stop it.
-    fn end_opening(&mut self) -> Option<(String, String, bool)> {
-        let Some(Task::Opening {
-            abs,
-            name,
-            worker,
-            cancel,
+    /// A listing came back: its panels show it.
+    fn listed(&mut self, ctx: &egui::Context, listing: Listing, result: Result<Listed>) {
+        let Listing {
+            panel,
+            dir,
+            select,
+            keep,
             ..
-        }) = self.task.take()
-        else {
-            return None;
+        } = listing;
+        let panels = panel.map_or(vec![0, 1], |p| vec![p]);
+        let (entries, free) = match result {
+            Ok(listed) => listed,
+            Err(e) => {
+                for i in panels {
+                    self.list_errors[i] = Some(format!("{e:#}"));
+                }
+                return;
+            }
         };
-        if let Some(worker) = worker {
+        for i in panels {
+            // This panel's earlier failure is over; the other panel's is its own.
+            self.list_errors[i] = None;
+            let panel = &mut self.panels[i];
+            // The entry under the bar, as it was listed before: changed (size or time) under
+            // an unmoved bar, its preview is prepared again.
+            let was = panel
+                .current()
+                .filter(|_| panel.dir == dir)
+                .map(|e| (e.name.clone(), e.size, e.mtime));
+            panel.fill(dir.clone(), entries.clone(), free, select.as_deref());
+            if let (Some((name, size, mtime)), Some(now)) = (was, panel.current()) {
+                if now.name == name && (now.size, now.mtime) != (size, mtime) {
+                    self.preview.refresh(&panel.path_of(now));
+                }
+            }
+            let found = select
+                .as_deref()
+                .is_some_and(|name| panel.current().is_some_and(|e| e.name == name));
+            if let (false, Some(row)) = (found, keep) {
+                // The entry is gone (moved away, renamed elsewhere): the bar stays on its row.
+                panel.highlight = row.min(panel.entries.len().saturating_sub(1));
+            }
+        }
+        // A listing is not a bar move: what it changes commits at once (02 §3.1).
+        self.moved_at = None;
+        let first = self.open_first.take().map(|name| (name, true));
+        let first = first.or_else(|| self.bar_first.take().map(|name| (name, false)));
+        if let Some((name, open)) = first {
+            let panel = &mut self.panels[self.active];
+            match panel.entries.iter().position(|e| e.name == name) {
+                Some(i) => {
+                    panel.highlight = i;
+                    if open {
+                        self.enter(ctx, false);
+                    }
+                }
+                None => {
+                    let key = if open { "open" } else { "bar" };
+                    self.status = Status::error(format!("SOPEN_STATE {key}: no {name} in {dir}"));
+                }
+            }
+        }
+    }
+
+    /// The opening task's news: a file ready, by Enter's own preparation or by a preview's
+    /// that Enter took over.
+    fn poll_opening(&mut self, ctx: &egui::Context) {
+        let ended = match self.opening.as_mut().map(|o| &mut o.source) {
+            None => return,
+            Some(Source::Fresh { rx, .. }) => match rx.try_recv() {
+                Ok(result) => Ok(result),
+                Err(TryRecvError::Empty) => return,
+                Err(TryRecvError::Disconnected) => {
+                    Ok(Err(anyhow::anyhow!("opening stopped without a result")))
+                }
+            },
+            Some(Source::Preview(prep)) => match prep.poll() {
+                None => return,
+                Some(ended) => Err(ended),
+            },
+        };
+        // The task is over: its worker is done (it sent its result, or the preparation was
+        // joined).
+        let Some(opening) = self.opening.take() else {
+            return;
+        };
+        let cancelled = opening.cancel.load(Ordering::Relaxed);
+        let (abs, name) = (opening.abs, opening.name);
+        if let Source::Fresh {
+            worker: Some(worker),
+            ..
+        } = opening.source
+        {
             let _ = worker.join();
         }
-        Some((abs, name, cancel.load(Ordering::Relaxed)))
+        let not_opened = |name: &str, kept: bool| {
+            let kept = if kept {
+                " (its copy is in sopen's cache)"
+            } else {
+                ""
+            };
+            Status::info(format!("cancelled; {name} was not opened{kept}"))
+        };
+        match ended {
+            Ok(result) if cancelled && result.is_ok() => {
+                // Esc came after the last byte (or there was none to fetch): the file is ready
+                // but was not wanted any more. Dropping it releases its copy and its connection.
+                drop(result);
+                self.status = not_opened(&name, self.label.is_some());
+            }
+            Ok(result) => self.opened(ctx, result, abs, name),
+            // The preview's preparation, taken over, came to its end: the live preview becomes
+            // the viewer — or it is an info card (a video, an error), and the file opens as
+            // from the list, a complete private copy published instead of read again.
+            Err(preview::Ended::Ready(_)) if cancelled => self.status = not_opened(&name, false),
+            Err(preview::Ended::Ready(previewed)) => match previewed.show().hand_over() {
+                Ok(viewer) => self.handed_over(ctx, viewer, abs),
+                Err(card) => self.start_open(ctx, abs, name, card.into_reuse()),
+            },
+            Err(preview::Ended::Cancelled) => {
+                self.status = Status::info("cancelled; nothing was kept")
+            }
+            Err(preview::Ended::Died) => {
+                self.status = Status::error("opening stopped without a result")
+            }
+        }
     }
 
     /// The file at `abs` came back ready: its viewer shows, in this window.
@@ -531,9 +1111,29 @@ impl Browser {
                 )
             }
         };
+        self.status = Status::default();
+        self.view(ctx, embedded, hold, abs);
+    }
+
+    /// A preview handed over (02 §4.4): the live window is the viewer.
+    fn handed_over(&mut self, ctx: &egui::Context, viewer: prepare::HandedOver, abs: String) {
+        self.status = match viewer.notices.as_slice() {
+            [] => Status::default(),
+            said => Status::info(said.join(" · ")),
+        };
+        self.view(ctx, viewer.embedded, viewer.hold, abs);
+    }
+
+    /// `embedded` is the viewer on screen from now on.
+    fn view(
+        &mut self,
+        ctx: &egui::Context,
+        embedded: Embedded,
+        hold: Option<crate::cache::Claim>,
+        abs: String,
+    ) {
         // The list gave up the keyboard: the viewer's keys are its own now.
         ctx.memory_mut(|m| m.surrender_focus(list_id()));
-        self.status = Status::default();
         self.exit = Exit::List;
         // One viewer at a time, and never one replaced without its own say (it leaves through
         // `leave` / `close_requested` first): nothing opens while one shows.
@@ -543,6 +1143,7 @@ impl Browser {
             hold,
             abs,
         });
+        self.moved_at = None;
     }
 
     /// Leaves the viewer — for the list or for good — if it agrees; else it shows its own
@@ -567,11 +1168,13 @@ impl Browser {
                 hold: viewer.hold,
             });
         }
+        // A viewer closing commits at once (02 §3.1).
+        self.moved_at = None;
     }
 
     /// Where the closed viewer's exit leads: the list as it was, or the window closing.
     fn after_viewer(&mut self, ctx: &egui::Context) {
-        self.status = Status::default();
+        self.status = self.told_later.take().unwrap_or_default();
         if std::mem::replace(&mut self.exit, Exit::List) == Exit::Quit {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
@@ -592,7 +1195,8 @@ impl Browser {
     }
 
     /// Enter / F3 on the entry under the bar: a folder is entered (`..` goes up); a file opens
-    /// in its viewer (`files_only`: F3 leaves folders alone).
+    /// in its viewer (`files_only`: F3 leaves folders alone) — what the preview host has of it
+    /// is taken over (02 §4.4), else it is made ready from the start.
     fn enter(&mut self, ctx: &egui::Context, files_only: bool) {
         let panel = &self.panels[self.active];
         let Some(entry) = panel.current().cloned() else {
@@ -615,7 +1219,30 @@ impl Browser {
                     self.list(Some(self.active), path, None, Some(ctx));
                 }
             }
-            EntryKind::File | EntryKind::Unknown => self.start_open(ctx, path, entry.name),
+            EntryKind::File | EntryKind::Unknown => {
+                // `at=OFFSET` is for a text file opened from its start.
+                let taken = match self.open_at {
+                    Some(_) => preview::Taken::Nothing,
+                    None => self.preview.take(&path),
+                };
+                match taken {
+                    preview::Taken::Viewer(viewer) => self.handed_over(ctx, viewer, path),
+                    preview::Taken::Card(reuse) => self.start_open(ctx, path, entry.name, reuse),
+                    preview::Taken::Running(prep) => {
+                        self.status = Status::default();
+                        self.opening = Some(Opening {
+                            abs: path,
+                            name: entry.name,
+                            remote: self.label.is_some(),
+                            done: prep.done.clone(),
+                            total: prep.total.clone(),
+                            cancel: prep.cancel.clone(),
+                            source: Source::Preview(prep),
+                        });
+                    }
+                    preview::Taken::Nothing => self.start_open(ctx, path, entry.name, None),
+                }
+            }
             EntryKind::Special => {
                 self.status = Status::error(format!(
                     "{shown} is not a regular file (a fifo, socket or device); sopen does not open it"
@@ -638,80 +1265,125 @@ impl Browser {
         self.list(Some(self.active), parent, Some(name), Some(ctx));
     }
 
-    /// The list's keys. While a file is being made ready only Esc works (it stops a fetch);
-    /// while a folder is listed, none (it takes a moment).
-    fn list_keys(&mut self, ctx: &egui::Context) {
-        let pressed = |key: Key| ctx.input_mut(|i| i.consume_key(Modifiers::NONE, key));
-        match &self.task {
-            Some(Task::Opening { cancel, .. }) => {
-                if pressed(Key::Escape) {
-                    cancel.store(true, Ordering::Relaxed);
+    /// `SOPEN_KEYS`: the next step, once the window has settled — as the owner's own key or
+    /// typing in this pass.
+    fn play(&mut self, ctx: &egui::Context) {
+        if self.script_gap > 0 {
+            self.script_gap -= 1;
+            ctx.request_repaint();
+            return;
+        }
+        if self.script.is_empty() || !self.settled() {
+            return;
+        }
+        let Some(step) = self.script.pop_front() else {
+            return;
+        };
+        self.script_gap = 2;
+        ctx.input_mut(|i| match step {
+            Play::Text(text) => i.events.push(egui::Event::Text(text)),
+            Play::Key(key, modifiers) => {
+                for pressed in [true, false] {
+                    i.events.push(egui::Event::Key {
+                        key,
+                        physical_key: None,
+                        pressed,
+                        repeat: false,
+                        modifiers,
+                    });
                 }
-                return;
             }
-            Some(Task::Listing { .. }) => return,
-            None => {}
-        }
-        let shift_tab = ctx.input_mut(|i| i.consume_key(Modifiers::SHIFT, Key::Tab));
-        if pressed(Key::Tab) || shift_tab {
-            self.active = 1 - self.active;
-        }
-        let page = self.visible.saturating_sub(1).max(1) as isize;
-        let panel = &mut self.panels[self.active];
-        if pressed(Key::ArrowDown) {
-            panel.step(1);
-        }
-        if pressed(Key::ArrowUp) {
-            panel.step(-1);
-        }
-        if pressed(Key::PageDown) {
-            panel.step(page);
-        }
-        if pressed(Key::PageUp) {
-            panel.step(-page);
-        }
-        if pressed(Key::Home) {
-            panel.home();
-        }
-        if pressed(Key::End) {
-            panel.end();
-        }
-        let typed: Vec<char> = ctx.input(|i| {
-            i.events
-                .iter()
-                .filter_map(|e| match e {
-                    egui::Event::Text(t) => Some(t.chars().collect::<Vec<_>>()),
-                    _ => None,
-                })
-                .flatten()
-                .collect()
         });
-        for c in typed.into_iter().filter(|c| !c.is_whitespace()) {
-            panel.jump(c);
-        }
-        if pressed(Key::Enter) {
-            self.enter(ctx, false);
-        } else if pressed(Key::F3) {
-            self.enter(ctx, true);
-        } else if pressed(Key::Backspace) {
-            self.up(ctx);
-        } else if pressed(Key::F4) {
-            let panel = &self.panels[self.active];
-            match panel.current() {
-                Some(entry) if entry.lossy => self.status = Status::error(not_utf8(&entry.name)),
-                Some(entry) => {
-                    let is_dir = entry.kind == EntryKind::Dir;
-                    let path = panel.path_of(entry);
-                    self.edit(ctx, path, is_dir);
-                }
-                None => {}
-            }
+        ctx.request_repaint();
+    }
+
+    /// The list's keys, through the key table (04 §3): each command the frame's key events and
+    /// typed text ask for, in order. Not while a dialog or the rename field has the keyboard
+    /// (04 §3 rule 4: its typing and its Enter and Esc are its own).
+    fn list_keys(&mut self, ctx: &egui::Context) {
+        while !self.ops.holds_keyboard() && self.viewer.is_none() {
+            let Some(command) = ctx.input_mut(|i| keys::lookup(i, Context::List)) else {
+                break;
+            };
+            self.run(ctx, command);
         }
     }
 
-    /// The viewer's pass, then the browser's keys it left unused: Esc and F3 leave it, F4 opens
-    /// its file in the editor. `esc_was_a_fields`: this frame's Esc took the keyboard from a
-    /// text field (the viewer's Go to field): it does not leave.
+    /// What each side shows now (02 §3.1): [`view::resolve`] over the state, the bar's rest
+    /// measured on egui's clock, and the preview host told what the committed display is.
+    fn resolve(&mut self, ctx: &egui::Context) {
+        let now = ctx.input(|i| i.time);
+        let panel = &self.panels[self.active];
+        let entry = panel.current();
+        let bar_is = (
+            self.active,
+            panel.dir.clone(),
+            entry.map(|e| e.name.clone()),
+        );
+        if (bar_is.0, &bar_is.1) != (self.bar_was.0, &self.bar_was.1) {
+            // Another side or another folder: at once.
+            self.moved_at = None;
+        } else if bar_is.2 != self.bar_was.2 {
+            self.moved_at = Some(now);
+        }
+        self.bar_was = bar_is;
+        // O5: a regular file or a link to one (an entry of unknown kind is tried as a file, as
+        // Enter tries it).
+        let file = entry
+            .filter(|e| {
+                !e.lossy
+                    && e.name != panel::UP
+                    && matches!(e.kind, EntryKind::File | EntryKind::Unknown)
+            })
+            .map(|e| preview::Want {
+                path: panel.path_of(e),
+                name: e.name.clone(),
+            });
+        let bar = match &file {
+            Some(want) => view::Bar::File(want.path.clone()),
+            None => view::Bar::Other,
+        };
+        let resolved = view::resolve(&view::Inputs {
+            mode: self.mode,
+            focus: self.active,
+            bar,
+            rest: self
+                .moved_at
+                .map(|at| Duration::from_secs_f64((now - at).max(0.0))),
+            shown: self.shown.take(),
+            viewer: self.viewer.is_some(),
+        });
+        self.uncommitted = resolved.pending.is_some();
+        if let Some(wait) = resolved.pending {
+            // An idle window commits all the same.
+            ctx.request_repaint_after(wait);
+        }
+        // The preview the display shows: the file under the bar when the bar has rested on it,
+        // else the one before it, by its path.
+        let display = resolved.show.iter().find_map(|c| match c {
+            view::Content::Preview(path) => Some(match &file {
+                Some(want) if want.path == *path => want.clone(),
+                _ => preview::Want {
+                    path: path.clone(),
+                    name: crate::remote::split_parent(path).1.to_string(),
+                },
+            }),
+            _ => None,
+        });
+        // While a file is being opened nothing new is prepared: an opening taken over from the
+        // preview is still that preparation's worker.
+        let bar = file
+            .as_ref()
+            .filter(|_| self.opening.is_none() && self.viewer.is_none())
+            .map(|w| w.path.as_str());
+        self.preview.sync(ctx, display, bar);
+        self.shown = Some(resolved.show);
+    }
+
+    /// The viewer's pass, then the browser's keys it left unused, through the key table: Esc
+    /// and F3 leave it, F4 opens its file in the editor, F1 lists its keys. `esc_was_a_fields`:
+    /// this frame's Esc took the keyboard from a text field (the viewer's Go to field): it does
+    /// not leave.
     fn viewer_ui(&mut self, ui: &mut egui::Ui, esc_was_a_fields: bool) {
         let ctx = ui.ctx().clone();
         let Some(viewer) = self.viewer.as_mut() else {
@@ -726,27 +1398,47 @@ impl Browser {
             }
             return;
         }
-        let pressed = |key: Key| ctx.input_mut(|i| i.consume_key(Modifiers::NONE, key));
-        if pressed(Key::F4) {
-            let abs = viewer.abs.clone();
-            self.edit(&ctx, abs, false);
+        // A text field with the typing (the hex window's Go to) is the owner's: no key of the
+        // table acts from there but Esc (04 §3 rule 4) — and not an Esc that was the field's.
+        let typing = ctx.text_edit_focused();
+        let withheld: Vec<egui::Event> = ctx.input_mut(|i| {
+            let (held, kept) = std::mem::take(&mut i.events).into_iter().partition(|e| {
+                matches!(e, egui::Event::Key { key, pressed: true, .. }
+                    if (*key == Key::Escape && esc_was_a_fields)
+                        || (*key != Key::Escape && typing))
+            });
+            i.events = kept;
+            held
+        });
+        while let Some(command) = ctx.input_mut(|i| keys::lookup(i, Context::Viewer)) {
+            let Some(viewer) = self.viewer.as_ref() else {
+                break;
+            };
+            match command {
+                Command::Edit => {
+                    let abs = viewer.abs.clone();
+                    self.edit(&ctx, abs, false);
+                }
+                Command::Help => {
+                    let own = viewer.embedded.window.keys();
+                    help::open(&ctx, help::for_context(Context::Viewer, self.mode, own));
+                }
+                Command::CloseViewer => self.leave(&ctx, Exit::List),
+                _ => {}
+            }
         }
-        let esc = !esc_was_a_fields && pressed(Key::Escape);
-        // F3 is not text, but a text field with the typing (the hex window's Go to) is the
-        // owner's: it does not leave the viewer from there.
-        let f3 = !ctx.text_edit_focused() && pressed(Key::F3);
-        if esc || f3 {
-            self.leave(&ctx, Exit::List);
-        }
+        ctx.input_mut(|i| i.events.extend(withheld));
     }
 
-    /// The two panels, side by side.
+    /// The two sides, side by side: each its list, or — the side opposite the active list, in
+    /// preview mode — the preview of the file under the bar ([`view`]).
     fn panels_ui(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         let area = ui.max_rect();
         // The list holds the keyboard: Tab, the arrows and Esc are its keys, not focus moves.
+        // A dialog or the rename field holds it instead while it is open.
         let resp = ui.interact(area, list_id(), Sense::click());
-        if ctx.memory(|m| m.focused()) != Some(list_id()) {
+        if !self.ops.holds_keyboard() && ctx.memory(|m| m.focused()) != Some(list_id()) {
             resp.request_focus();
         }
         ctx.memory_mut(|m| {
@@ -767,13 +1459,22 @@ impl Browser {
                 Vec2::new(half, area.height()),
             )
             .shrink(2.0);
-            self.panel_ui(ui, i, rect);
+            let preview = matches!(
+                self.shown.as_ref().map(|s| &s[i]),
+                Some(view::Content::Preview(_))
+            );
+            if preview {
+                self.preview.ui(ui, rect);
+            } else {
+                self.panel_ui(ui, i, rect);
+            }
         }
     }
 
-    /// One panel: its frame with the path in the top border, the column heads, the rows, the
-    /// footer. A click puts the bar on a row (and makes the panel active); a double click
-    /// opens it.
+    /// One panel: its frame with the path in the top border, the column heads, the rows — a
+    /// selected entry in the selection's colour, the entry being renamed as a field in its row
+    /// (S1-D's helpers, [`ops::entry_color`] and [`ops::Ops::rename_field`]) — and the footer. A
+    /// click puts the bar on a row (and makes the panel active); a double click opens it.
     fn panel_ui(&mut self, ui: &mut egui::Ui, i: usize, rect: Rect) {
         let ctx = ui.ctx().clone();
         let painter = ui.painter_at(rect);
@@ -825,7 +1526,14 @@ impl Browser {
         let foot_y = inner.bottom() - row_h;
         let rule_y = foot_y - row_h;
         let visible = (((rule_y - rows_top) / row_h).floor() as usize).max(1);
-        self.visible = visible;
+        if i == self.active {
+            self.visible = visible;
+        }
+        // The entry being renamed (F2), in the panel it was pressed in: its row is the field.
+        let renaming = (i == self.rename_panel)
+            .then(|| self.ops.renaming().map(str::to_string))
+            .flatten();
+        let mut field = None;
         let panel = &mut self.panels[i];
         // The wheel scrolls the rows (the bar stays where it is).
         if ui.rect_contains_pointer(rect) {
@@ -858,31 +1566,32 @@ impl Browser {
             if idx == panel.highlight {
                 chrome::bar(&painter, row_rect, active);
             }
-            let color = if idx == panel.highlight && active {
-                p.bar_text
-            } else if panel::hidden(entry) {
-                p.dim
-            } else if entry.kind == EntryKind::Dir {
-                p.folder
-            } else {
-                p.text
-            };
+            let on_bar = idx == panel.highlight && active;
+            let color = ops::entry_color(&p, entry, panel.is_selected(entry), on_bar);
             // Each cell fits its column at a glyph boundary, "…" where it is cut: never a
             // sliver of a glyph (a wide Hangul one included). A size too long for its column
             // is said in a larger unit, never cut.
             let (name, ext) = panel::split_name(entry);
             let name_rect =
                 Rect::from_min_max(row_rect.min, Pos2::new(x_ext - cw, row_rect.bottom()));
-            let name = chrome::fit_start(&ctx, name, &font, name_rect.width());
-            let ext = chrome::fit_start(&ctx, ext, &font, cw * ext_w as f32);
-            cell(
-                &painter.with_clip_rect(name_rect),
-                inner.left(),
-                y,
-                &name,
-                color,
-            );
-            cell(&painter, x_ext, y, &ext, color);
+            if idx == panel.highlight && renaming.as_deref() == Some(entry.name.as_str()) {
+                // The name is a field over the Name and Ext columns, drawn after the rows.
+                field = Some(Rect::from_min_max(
+                    row_rect.min,
+                    Pos2::new(x_ext + cw * ext_w as f32, row_rect.bottom()),
+                ));
+            } else {
+                let name = chrome::fit_start(&ctx, name, &font, name_rect.width());
+                let ext = chrome::fit_start(&ctx, ext, &font, cw * ext_w as f32);
+                cell(
+                    &painter.with_clip_rect(name_rect),
+                    inner.left(),
+                    y,
+                    &name,
+                    color,
+                );
+                cell(&painter, x_ext, y, &ext, color);
+            }
             painter.text(
                 Pos2::new(x_size_end, y),
                 egui::Align2::RIGHT_TOP,
@@ -901,6 +1610,9 @@ impl Browser {
             } else if resp.clicked() {
                 clicked = Some((idx, false));
             }
+        }
+        if let Some(rect) = field {
+            self.ops.rename_field(ui, rect);
         }
         // The scroll bar on the right border, beside the rows.
         let max_top = panel.entries.len().saturating_sub(visible);
@@ -956,7 +1668,8 @@ impl Browser {
             p.text,
         );
         if let Some((idx, open)) = clicked {
-            if self.task.is_none() && self.viewer.is_none() {
+            let free = self.listing.is_empty() && self.opening.is_none();
+            if free && self.viewer.is_none() && !self.ops.holds_keyboard() {
                 self.active = i;
                 self.panels[i].highlight = idx;
                 if open {
@@ -966,37 +1679,75 @@ impl Browser {
         }
     }
 
-    /// The status row: a running fetch with its progress, else the last result, else the keys.
+    /// The status row: a running fetch with its progress, a listing, a running file operation
+    /// (or a refused rename's reason), else the last result, else the keys.
     fn status_line(&self) -> Status {
-        match &self.task {
-            Some(Task::Opening {
-                name,
-                remote,
-                done,
-                total,
-                cancel,
-                ..
-            }) => {
-                if cancel.load(Ordering::Relaxed) {
-                    return Status::info(format!("cancelling {name}…"));
-                }
-                let (d, t) = (done.load(Ordering::Relaxed), total.load(Ordering::Relaxed));
-                if *remote && t > 0 {
-                    let pct = (d * 100).checked_div(t).unwrap_or(100);
-                    Status::info(format!(
-                        "fetching {name} {pct}% · {} / {} · Esc cancels",
-                        crate::human(d),
-                        crate::human(t)
-                    ))
-                } else {
-                    Status::info(format!("opening {name}…"))
-                }
+        if let Some(opening) = &self.opening {
+            let name = &opening.name;
+            if opening.cancel.load(Ordering::Relaxed) {
+                return Status::info(format!("cancelling {name}…"));
             }
-            Some(Task::Listing { dir, .. }) => Status::info(format!("listing {dir}…")),
-            None if !self.status.text.is_empty() => self.status.clone(),
-            None if self.viewer.is_some() => Status::info(VIEWER_HINT),
-            None => Status::info(LIST_HINT),
+            let (d, t) = (
+                opening.done.load(Ordering::Relaxed),
+                opening.total.load(Ordering::Relaxed),
+            );
+            return if opening.remote && t > 0 {
+                let pct = (d * 100).checked_div(t).unwrap_or(100);
+                Status::info(format!(
+                    "fetching {name} {pct}% · {} / {} · Esc cancels",
+                    crate::human(d),
+                    crate::human(t)
+                ))
+            } else {
+                Status::info(format!("opening {name}…"))
+            };
         }
+        if self.viewer.is_some() {
+            // The viewer's row: only a question an operation waits with is said over it.
+            return match self.ops.waiting() {
+                Some(what) => Status::info(format!(
+                    "{what} waiting for an answer — F3 back to the list"
+                )),
+                None if !self.status.text.is_empty() => self.status.clone(),
+                None => Status::info(VIEWER_HINT),
+            };
+        }
+        if let Some(listing) = self.listing.first() {
+            return Status::info(format!("listing {}…", listing.dir));
+        }
+        if let Some(said) = self.ops.status() {
+            return said;
+        }
+        match &self.list_errors {
+            [None, None] => {}
+            [Some(left), Some(right)] if left == right => return Status::error(left.clone()),
+            [left, right] => {
+                let said: Vec<String> = [("left panel", left), ("right panel", right)]
+                    .into_iter()
+                    .filter_map(|(side, e)| e.as_ref().map(|e| format!("{side}: {e}")))
+                    .collect();
+                return Status::error(said.join(" · "));
+            }
+        }
+        if !self.status.text.is_empty() {
+            return self.status.clone();
+        }
+        Status::info(LIST_HINT)
+    }
+
+    /// Nothing is on its way: no listing, no opening, the display committed and its preview
+    /// on screen, the viewer ready, no file operation running unasked (one waiting at its
+    /// name-in-the-way question has settled: only an answer moves it).
+    fn settled(&self) -> bool {
+        self.painted
+            && self.listing.is_empty()
+            && self.opening.is_none()
+            && !self.uncommitted
+            && match &self.viewer {
+                Some(viewer) => viewer.embedded.window.ready(),
+                None => self.preview.settled(),
+            }
+            && (!self.ops.busy() || self.ops.holds_keyboard())
     }
 }
 
@@ -1005,10 +1756,17 @@ impl Window for Browser {
         let ctx = ui.ctx().clone();
         // Before anything else this pass: did this frame's Esc take the keyboard from a field?
         let esc_was_a_fields = self.focused_before && ctx.memory(|m| m.focused()).is_none();
+        self.play(&ctx);
         self.poll(&ctx);
+        self.list_keys(&ctx);
+        self.resolve(&ctx);
+        // The F-key row is the key table's, by the context and the mode (04 §2).
         let keys: Vec<FKey> = match &self.viewer {
-            Some(v) => chrome::merged(chrome::VIEWER_KEYS, v.embedded.window.keys()),
-            None => chrome::LIST_KEYS.to_vec(),
+            Some(v) => chrome::merged(
+                &keys::row(Context::Viewer, self.mode),
+                v.embedded.window.keys(),
+            ),
+            None => keys::row(Context::List, self.mode),
         };
         chrome::title_panel(ui, "sopen-browser-title", &self.title);
         chrome::key_panel(ui, "sopen-browser-keys", &keys);
@@ -1021,28 +1779,38 @@ impl Window for Browser {
                 if self.viewer.is_some() {
                     self.viewer_ui(ui, esc_was_a_fields);
                 } else {
-                    self.list_keys(&ctx);
                     self.panels_ui(ui);
                 }
             });
-        if self.task.is_some() || !self.launches.is_empty() {
-            ctx.request_repaint_after(std::time::Duration::from_millis(100));
+        // A running file operation is heard on every pass, whatever the window shows; its
+        // dialogs — a question, the report — are the list's, over the panels.
+        let active = &mut self.panels[self.active];
+        let changed = self.ops.poll(active);
+        if self.viewer.is_none() {
+            self.ops.dialogs(&ctx, active);
+        }
+        if let Some(changed) = changed {
+            self.after_operation(&ctx, changed);
+        }
+        let working = !self.listing.is_empty()
+            || self.opening.is_some()
+            || !self.launches.is_empty()
+            || self.preview.busy()
+            || self.ops.busy();
+        if working {
+            ctx.request_repaint_after(Duration::from_millis(100));
         }
         self.focused_before = ctx.memory(|m| m.focused()).is_some();
         self.painted = true;
     }
 
     fn ready(&self) -> bool {
-        self.painted
-            && self.task.is_none()
-            && self
-                .viewer
-                .as_ref()
-                .is_none_or(|v| v.embedded.window.ready())
+        self.settled() && self.script.is_empty() && self.script_gap == 0
     }
 
     /// Closing the window: a viewer on screen is asked first (its prompt, its running save);
-    /// a fetch is stopped.
+    /// a fetch is stopped, a preview's preparation cancelled (nothing waits for it); a running
+    /// file operation is waited for after the window ([`open`]).
     fn close_requested(&mut self) -> bool {
         if let Some(viewer) = self.viewer.as_mut() {
             self.exit = Exit::Quit;
@@ -1052,9 +1820,10 @@ impl Window for Browser {
             self.exit = Exit::List;
             self.drop_viewer();
         }
-        if let Some(Task::Opening { cancel, .. }) = &self.task {
-            cancel.store(true, Ordering::Relaxed);
+        if let Some(opening) = &self.opening {
+            opening.cancel.store(true, Ordering::Relaxed);
         }
+        self.preview.cancel();
         true
     }
 }
