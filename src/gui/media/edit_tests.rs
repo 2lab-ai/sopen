@@ -594,6 +594,255 @@ fn video_edits_preview_at_once_without_running_ffmpeg() {
     );
 }
 
+/// The window's paused-frame decoder with a stand-in ffmpeg whose `n`-th run (from 1) waits
+/// while `gate-n` exists in the fixture's folder, then gives one picture (bytes `x`); `seed` is
+/// kept from the start. Returns it and the file a line is written to as each run starts: where
+/// it reads from (its `-ss`).
+fn held_decoder(fx: &Fx, seed: Option<(Tick, Arc<Vec<u8>>)>) -> (Scrubber, PathBuf) {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = fx.tmp.path();
+    let runs = dir.join("runs");
+    let (w, h) = fx.win.media.decode_size().unwrap();
+    let stub = dir.join("ffmpeg");
+    std::fs::write(
+        &stub,
+        format!(
+            "#!/bin/sh\n[ \"$1\" = -version ] && exit 0\necho \"$6\" >> '{runs}'\n\
+             n=$(wc -l < '{runs}' | tr -d ' ')\n\
+             while [ -e '{dir}/gate-'\"$n\" ]; do sleep 0.02; done\n\
+             head -c {} /dev/zero | tr '\\0' x\n",
+            w * h * 4,
+            runs = runs.display(),
+            dir = dir.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+    crate::testutil::run_fresh(std::process::Command::new(&stub).arg("-version"));
+    let mut media = (*fx.win.media).clone();
+    media.tools = Tools {
+        ffmpeg: stub.clone(),
+        ffprobe: stub,
+    };
+    // A budget no held run reaches: each ends with its picture.
+    let budget = std::time::Duration::from_secs(60);
+    let scrub = Scrubber::start_seeded(&media, fx.drv.ctx.clone(), budget, seed).unwrap();
+    (scrub, runs)
+}
+
+/// Until the stand-in's `n`-th run has started (no passes meanwhile). The decoder runs one
+/// request at a time, so run `n` started means every earlier request's answer was given or
+/// dropped.
+fn wait_runs(runs: &Path, n: usize) {
+    let deadline = Instant::now() + std::time::Duration::from_secs(20);
+    while std::fs::read_to_string(runs).map_or(0, |s| s.lines().count()) < n {
+        assert!(Instant::now() < deadline, "run {n} never started");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
+/// A cut while a decode for a time before it still runs (a drag passed that frame). The cut
+/// shows the frame now at the playhead, kept, at once; the decode ending after it must not take
+/// its place: on screen for a time the playhead has left, the frame would never be ready, and
+/// nothing would ask again. (The order behind a rare failure of the test above, where the late
+/// decode was frame 50's own — asked again by the drag's release — which now runs once:
+/// `a_drag_ending_on_a_frame_decodes_it_once`.)
+#[test]
+fn a_decode_for_the_time_before_a_cut_ending_after_it_leaves_the_kept_frame() {
+    let Some(mut fx) = video() else { return };
+    let ctx = fx.drv.ctx.clone();
+    let (w, h) = fx.win.media.decode_size().unwrap();
+    let kept = Arc::new(vec![0u8; (w * h * 4) as usize]);
+    let (scrub, runs) = held_decoder(&fx, Some((50, kept)));
+    let gate = |n: usize| Sentinel::new(fx.tmp.path().join(format!("gate-{n}")));
+    let (first, _later) = (gate(1), gate(2));
+    fx.win.scrub = Some(scrub);
+    fx.win.marks.in_s = Some(1.0);
+    fx.win.marks.out_s = Some(2.0);
+    // The drag passed 1.5 s (still decoding) and ended on 2 s: frame 50, kept.
+    fx.win.seek(&ctx, 1.5);
+    wait_runs(&runs, 1);
+    fx.win.seek(&ctx, 2.0);
+    fx.drv.idle(&mut fx.win, 1);
+    assert_eq!(fx.win.tex_at, Some((2.0, Some(50))));
+    fx.drv.cut(&mut fx.win);
+    assert_eq!(fx.clips(), [(0.0, 1.0), (2.0, 4.0)]);
+    assert!(fx.win.frame_ready(), "kept: {:?}", fx.win.tex_at);
+    // A later ask, held: once its run starts, the passed frame's answer is given or dropped.
+    fx.win.scrub.as_ref().unwrap().request(3.0, 75);
+    drop(first);
+    wait_runs(&runs, 2);
+    fx.drv.idle(&mut fx.win, 2);
+    assert!(
+        fx.win.frame_ready(),
+        "the frame never came: want {:?}, on screen {:?}, status {:?}",
+        fx.win.want,
+        fx.win.tex_at,
+        fx.win.status.text
+    );
+}
+
+/// A drag's last move and its release both ask for the frame under the pointer. When the
+/// decoder took the last move's ask before the release, the release's ask is the frame already
+/// decoding: it waits for that decode instead of starting a second one (one ffmpeg run, and no
+/// decode still running once the frame is on screen).
+#[test]
+fn a_drag_ending_on_a_frame_decodes_it_once() {
+    let Some(mut fx) = video() else { return };
+    let (scrub, runs) = held_decoder(&fx, None);
+    let gate = |n: usize| Sentinel::new(fx.tmp.path().join(format!("gate-{n}")));
+    let (first, second) = (gate(1), gate(2));
+    fx.win.scrub = Some(scrub);
+    let (a, b) = (fx.at(0.25), fx.at(0.5));
+    let mut first = Some(first);
+    let mut calls = 0;
+    fx.drv
+        .drag_watching(&mut fx.win, PointerButton::Primary, a, b, |_| {
+            calls += 1;
+            // After the press and the last of 8 moves: the first move's decode ends and the
+            // decoder takes the last move's ask, held, before the release asks again.
+            if calls == 9 {
+                wait_runs(&runs, 1);
+                drop(first.take());
+                wait_runs(&runs, 2);
+            }
+        });
+    let end = fx.win.frame_at(fx.win.marks.t);
+    // What the release left waiting to be decoded: once taken, it would run.
+    let again = fx
+        .win
+        .scrub
+        .as_ref()
+        .unwrap()
+        .req
+        .0
+        .lock()
+        .unwrap()
+        .is_some();
+    drop(second);
+    if again {
+        wait_runs(&runs, 3);
+    }
+    fx.drv.until(&mut fx.win, 20, |w| w.frame_ready());
+    let media = &fx.win.media;
+    let at = format!("{:.6}", frame_slot(media.origin(), media.fps, end).0);
+    let ran = std::fs::read_to_string(&runs).unwrap();
+    let ran: Vec<&str> = ran.lines().collect();
+    assert_eq!(
+        ran.iter().filter(|l| **l == at).count(),
+        1,
+        "frame {end} (from {at}) decoded more than once: {ran:?}"
+    );
+}
+
+/// The other order, and another frame. A drag passes a frame that is still decoding and ends on
+/// a kept one, whose answer waits for the next pass (a seek from the timeline runs at the end of
+/// one). The passed frame's decode ends before that pass: it must not take the kept frame's
+/// place, or the playhead shows a frame it is not on, for good.
+#[test]
+fn a_frame_still_decoding_when_the_playhead_lands_on_a_kept_one_never_replaces_it() {
+    let Some(mut fx) = video() else { return };
+    let ctx = fx.drv.ctx.clone();
+    let (w, h) = fx.win.media.decode_size().unwrap();
+    let kept = Arc::new(vec![0u8; (w * h * 4) as usize]);
+    let (scrub, runs) = held_decoder(&fx, Some((50, kept)));
+    let gate = |n: usize| Sentinel::new(fx.tmp.path().join(format!("gate-{n}")));
+    let (first, _later) = (gate(1), gate(2));
+    fx.win.scrub = Some(scrub);
+    let passed = fx.win.frame_at(1.2);
+    assert_ne!(passed, 50);
+    fx.win.seek(&ctx, 1.2);
+    wait_runs(&runs, 1);
+    fx.win.seek(&ctx, 2.0);
+    // A later ask, held: once its run starts, the passed frame's answer is given or dropped.
+    fx.win.scrub.as_ref().unwrap().request(3.0, 75);
+    drop(first);
+    wait_runs(&runs, 2);
+    fx.drv.idle(&mut fx.win, 2);
+    assert!(
+        fx.win.frame_ready(),
+        "want {:?} (frame {passed} passed), on screen {:?}",
+        fx.win.want,
+        fx.win.tex_at
+    );
+}
+
+/// Playback started while a paused frame was still decoding (a drag, then Space at once). The
+/// player draws the frames, so that decode's answer — the frame of where playback started — is
+/// not taken while it plays; it must not be taken when playback ends either, whether the decode
+/// ended while it played (`during`) or after. The end shows the frame at the end, asked for as a
+/// pause asks.
+fn playback_over_a_decode(during: bool) {
+    let Some(mut fx) = video() else { return };
+    let ctx = fx.drv.ctx.clone();
+    let (scrub, runs) = held_decoder(&fx, None);
+    let gate = |n: usize| Sentinel::new(fx.tmp.path().join(format!("gate-{n}")));
+    let (mut first, second) = (Some(gate(1)), gate(2));
+    fx.win.scrub = Some(scrub);
+    let start = fx.win.frame_at(3.0);
+    fx.win.seek(&ctx, 3.0);
+    wait_runs(&runs, 1);
+    // As Space does. No pass until the decode is dealt with: playback cannot end before.
+    fx.win.play(&ctx);
+    assert!(fx.win.player.is_some(), "playing");
+    if during {
+        drop(first.take());
+        let deadline = Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            let scrub = fx.win.scrub.as_ref().unwrap();
+            let kept = scrub
+                .cache
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|(k, _)| *k == start)
+                .map(|(_, f)| f.clone());
+            // Its picture kept, and its answer given (waiting to be taken) or dropped (no one
+            // but the kept frames and this check holds the picture).
+            if kept.is_some_and(|f| {
+                scrub.result.lock().unwrap().frame.is_some() || Arc::strong_count(&f) == 2
+            }) {
+                break;
+            }
+            assert!(Instant::now() < deadline, "frame {start} never decoded");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+    fx.drv.until(&mut fx.win, 20, |w| w.player.is_none());
+    let end = fx.win.marks.t;
+    assert_eq!(
+        fx.win.want,
+        Some((end, fx.win.frame_at(end))),
+        "the frame at the end is asked for"
+    );
+    // The end frame's decode starting (held) means the earlier one's answer was given or
+    // dropped.
+    drop(first);
+    wait_runs(&runs, 2);
+    fx.drv.idle(&mut fx.win, 2);
+    assert_ne!(
+        fx.win.tex_at.and_then(|(_, k)| k),
+        Some(start),
+        "the frame of where playback started on screen at its end ({end} s): {:?}",
+        fx.win.tex_at
+    );
+    drop(second);
+    fx.drv.until(&mut fx.win, 20, |w| w.frame_ready());
+    assert_eq!(fx.win.tex_at, Some((end, Some(fx.win.frame_at(end)))));
+}
+
+/// [`playback_over_a_decode`], the decode ending while it plays.
+#[test]
+fn a_frame_decoded_while_playing_is_not_shown_when_playback_ends() {
+    playback_over_a_decode(true);
+}
+
+/// [`playback_over_a_decode`], the decode ending after playback has.
+#[test]
+fn a_frame_decoded_after_playback_ends_is_not_shown_at_its_end() {
+    playback_over_a_decode(false);
+}
+
 /// At 30000/1001 fps (a frame time that is no round number), the paused frame at tick `k` and
 /// the first frame played from a piece that starts at `k` are frame `k` — the same frame Save
 /// renders there (the cut tests check that side).
