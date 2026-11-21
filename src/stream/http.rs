@@ -29,8 +29,9 @@ pub const MAX_CONNECTIONS: usize = 64;
 pub const MAX_HEAD: usize = 8 << 10;
 /// The whole head must arrive within this of the accept, else the connection closes unanswered.
 pub const HEAD_WITHIN: Duration = Duration::from_secs(5);
-/// A `bulk` response whose client takes no bytes for this long is closed (01 §5's no-progress
-/// bound). It does not run on `render` and `play` ([`Kind::stalls`]).
+/// An answer whose client takes no bytes for this long is closed (01 §5's no-progress bound):
+/// every head and refusal, and the body of a `bulk` response. It does not run on the body of
+/// a `render` or `play` response ([`Kind::stalls`]).
 pub const NO_PROGRESS: Duration = Duration::from_secs(60);
 
 /// Connections past [`MAX_CONNECTIONS`] whose head is still read so that they get their 503;
@@ -85,7 +86,9 @@ impl Kind {
         }
     }
 
-    /// Whether [`NO_PROGRESS`] runs on a response of this kind. Only on `bulk`.
+    /// Whether [`NO_PROGRESS`] runs on the body of a response of this kind. Only on `bulk`.
+    /// An answer's head, and a refusal, keep it for every kind: the exemption begins once the
+    /// head has been written.
     ///
     /// A `render` or a `play` client that takes nothing is waiting its turn (06 §7.4, X1):
     /// ffmpeg opens every input of a render at the start and reads each when its piece comes
@@ -94,7 +97,9 @@ impl Kind {
     /// piece's decoders at 65 s, and ffmpeg exited 0 both times. Their owners end them
     /// instead: an export is stopped once its output has not advanced for 120 s
     /// (`ffmpeg::STALL_LIMIT`), and dropping the player kills its decoders. The watch still
-    /// finds a client that has gone, and the shutdown still ends every connection.
+    /// finds a client that has gone, and the shutdown still ends every connection. A client
+    /// that neither reads nor closes keeps its seat until its owner kills it: every run on a
+    /// `play` or `render` URL must have an owner that does (06 §7.4, W7's rule).
     fn stalls(self) -> bool {
         match self {
             Kind::Bulk => true,
@@ -116,7 +121,7 @@ pub enum CutReason {
     Failed(String),
     /// The Source closed under the response.
     Closed,
-    /// The client of a `bulk` response took no bytes for [`NO_PROGRESS`].
+    /// The client took no bytes for [`NO_PROGRESS`]: of a `bulk` body, or of any answer's head.
     Stalled,
     /// No body was begun: the server was serving [`MAX_CONNECTIONS`] already (503).
     Busy,
@@ -1390,7 +1395,6 @@ impl Conn {
 
     fn serve(mut self, request: Request) {
         let shared = self.shared.clone();
-        self.stalls = request.kind.stalls();
         let rate = shared.rate.load(Ordering::SeqCst);
         // The reader first, then the size: a reload between them gives the reader `Reloaded`
         // for every read, so a head of the new size is never followed by bytes.
@@ -1426,6 +1430,9 @@ impl Conn {
             start + length
         };
         let mut stop = self.send(head.as_bytes(), |_| {}).err().map(Stop::reason);
+        // The head has gone, under the 60 s like every answer's. Only the body of a `render`
+        // or `play` response is exempt from here on ([`Kind::stalls`]).
+        self.stalls = request.kind.stalls();
         let mut buf = vec![0u8; BLOCK as usize];
         if stop.is_none() && at < end {
             // From here the thread may wait for a block, where it does not see its socket.
