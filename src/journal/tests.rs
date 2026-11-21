@@ -2792,17 +2792,30 @@ fn created_or_staged_removes_only_a_temp_that_still_matches() {
         let r = reconcile(&created, HOST, &mut remote);
         assert_eq!(r.outcome, Outcome::NotLanded, "{route:?}");
         assert_eq!(r.temp, Temp::Remove(TEMP.into()), "{route:?}");
-        // Cut off mid-copy: the temp grew since its creation was recorded.
+        // Cut off mid-copy: the temp grew since its stat was recorded. At its recorded name, a
+        // regular file with the recorded mode and owner, no larger than the target: removed.
         let mut grown = c.created_temp();
         grown.size = 4096;
         grown.mtime = at(1_794_389_550);
         let mut remote = FakeRemote::with(&[(PATH, &c.orig), (TEMP, &grown)]);
         let r = reconcile(&created, HOST, &mut remote);
-        assert!(
-            matches!(r.temp, Temp::Keep { .. }),
-            "{route:?} {:?}",
-            r.temp
-        );
+        assert_eq!(r.temp, Temp::Remove(TEMP.into()), "{route:?}");
+        // Another mode, another owner, or larger than the target at open: kept and named.
+        let mut chmodded = grown.clone();
+        chmodded.mode ^= 0o020;
+        let mut chowned = grown.clone();
+        chowned.uid += 1;
+        let mut larger = grown.clone();
+        larger.size = c.orig.size + 1;
+        for (what, temp) in [("mode", chmodded), ("owner", chowned), ("size", larger)] {
+            let mut remote = FakeRemote::with(&[(PATH, &c.orig), (TEMP, &temp)]);
+            let r = reconcile(&created, HOST, &mut remote);
+            assert!(
+                matches!(r.temp, Temp::Keep { .. }),
+                "{route:?} {what} {:?}",
+                r.temp
+            );
+        }
 
         for phase in [c.staged(), c.renaming()] {
             let staged = c.intent(route, phase);

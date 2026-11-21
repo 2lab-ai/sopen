@@ -212,7 +212,7 @@ pub(super) async fn copy_data(
         match within(limit, src.copy_to(dst, step)).await {
             Ok(Ok(())) => {}
             Ok(Err(e)) if done == 0 && answered(&e) => {
-                crate::debug!("copy-data into {path} refused ({e}); copying through sopen");
+                crate::debug!("the server refused copy-data into {path} ({e})");
                 return Ok(false);
             }
             Ok(Err(e)) => return Err(anyhow!("cannot copy into {path}: {e}")),
@@ -565,6 +565,9 @@ impl FileOps for SftpRemote {
                 let sha256 = if copied {
                     None
                 } else {
+                    if sftp.support_copy() {
+                        crate::debug!("copying into {temp} through sopen instead");
+                    }
                     Some(pump(&mut src, &mut dst, temp, cancel, progress).await?)
                 };
                 if cancel.load(Ordering::Relaxed) {

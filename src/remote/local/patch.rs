@@ -13,6 +13,46 @@ use std::os::unix::fs::{FileExt, OpenOptionsExt, PermissionsExt};
 /// Bytes per read of a copy and of a whole read.
 const BUF: usize = 1 << 20;
 
+/// What this backend moved on this thread, counted where it reads and writes (07 §12: "at the
+/// client's read and write payloads"): the bytes a Save's own requests read and wrote, and —
+/// apart — the bytes [`PatchFs::copy`] copied, which over SFTP the server moves and no request
+/// carries.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct Moved {
+    pub read: u64,
+    pub written: u64,
+    pub copied: u64,
+}
+
+#[cfg(test)]
+thread_local! {
+    static MOVED: std::cell::Cell<Moved> = const {
+        std::cell::Cell::new(Moved { read: 0, written: 0, copied: 0 })
+    };
+}
+
+#[cfg(test)]
+impl LocalFs {
+    /// What [`PatchFs`] on the local disk has moved on this thread so far.
+    pub(crate) fn moved() -> Moved {
+        MOVED.with(|m| m.get())
+    }
+}
+
+/// Accounts `read` and `written` payload bytes and `copied` bytes of a copy.
+fn moved(read: usize, written: usize, copied: usize) {
+    #[cfg(test)]
+    MOVED.with(|m| {
+        let mut now = m.get();
+        now.read += read as u64;
+        now.written += written as u64;
+        now.copied += copied as u64;
+        m.set(now);
+    });
+    let _ = (read, written, copied);
+}
+
 /// Up to `buf.len()` bytes at `offset`; fewer only at the end of the file.
 fn read_full(file: &fs::File, offset: u64, buf: &mut [u8]) -> std::io::Result<usize> {
     let mut got = 0;
@@ -78,6 +118,7 @@ impl PatchFs for LocalFs {
         let mut buf = vec![0u8; len];
         let got = read_full(file.get::<fs::File>()?, offset, &mut buf)
             .with_context(|| format!("cannot read {path}"))?;
+        moved(got, 0, 0);
         buf.truncate(got);
         Ok(buf)
     }
@@ -104,9 +145,11 @@ impl PatchFs for LocalFs {
             if got == 0 {
                 break;
             }
+            moved(got, 0, 0);
             if let (Some(write), Some(out)) = (each(done, &buf[..got])?, out) {
                 out.write_all_at(&write, done)
                     .with_context(|| format!("cannot write {to}"))?;
+                moved(0, write.len(), 0);
             }
             done += got as u64;
         }
@@ -117,7 +160,9 @@ impl PatchFs for LocalFs {
         let path = file.path().to_string();
         file.get::<fs::File>()?
             .write_all_at(bytes, offset)
-            .with_context(|| format!("cannot write {path}"))
+            .with_context(|| format!("cannot write {path}"))?;
+        moved(0, bytes.len(), 0);
+        Ok(())
     }
 
     fn set_owner(&mut self, file: &mut Handle, uid: u32, gid: u32) -> Result<()> {
@@ -163,19 +208,25 @@ impl PatchFs for LocalFs {
                 let got = read_full(src, done + copied, &mut buf[..want])
                     .with_context(|| format!("cannot read {from}"))?;
                 if got == 0 {
-                    // The source ended early: the size check after the copy says so.
                     break;
                 }
                 dst.write_all_at(&buf[..got], done + copied)
                     .with_context(|| format!("cannot write {to}"))?;
+                moved(0, 0, got);
                 copied += got as u64;
             }
-            ctl.pace.copied(n, (ctl.clock)().saturating_sub(began));
-            done += n;
-            (ctl.progress)(CopyEvent::Copied(done));
             if copied < n {
-                break;
+                // Only what was copied counts: a source shorter than asked is an error here,
+                // never a request reported whole.
+                let short = std::io::Error::from(ErrorKind::UnexpectedEof);
+                return Err(anyhow!(short).context(format!(
+                    "{from} ended after {} of {size} bytes",
+                    done + copied
+                )));
             }
+            ctl.pace.copied(copied, (ctl.clock)().saturating_sub(began));
+            done += copied;
+            (ctl.progress)(CopyEvent::Copied(done));
             if done < size && ctl.pace.sync_due() {
                 let began = (ctl.clock)();
                 sync(dst).with_context(|| format!("cannot sync {to}"))?;

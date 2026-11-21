@@ -1342,6 +1342,21 @@ impl Journal {
         self.advance(Phase::Created { temp, created })
     }
 
+    /// Still phase `created`: the record takes the temp's stat again, once the Save has given
+    /// the temp its owner and mode and before it fills it. From then on a reopen can tell a temp
+    /// left mid-copy to be this Save's by its mode and owner ([`reconcile`]), although its size
+    /// and modification time move with every request.
+    pub fn save_ready(&mut self, ready: FileStat) -> Result<()> {
+        let temp = match self.save.as_ref().map(|s| &s.phase) {
+            Some(Phase::Created { temp, .. }) => temp.clone(),
+            _ => bail!("the temp is made ready in phase created"),
+        };
+        self.advance(Phase::Created {
+            temp,
+            created: ready,
+        })
+    }
+
     /// Phase `staged`: after the last write and fsync, with the temp's stat and the post-save
     /// evidence (of this journal's kind, for that stat).
     pub fn save_staged(&mut self, staged: FileStat, post: PostEvidence) -> Result<()> {
@@ -2065,8 +2080,10 @@ fn when(t: SystemTime) -> String {
 /// Decides whether the Save `intent` records landed, from fresh reads of the remote (§3.1):
 /// landed when the target matches the reconciliation evidence, not landed when it still matches
 /// the pre-save evidence, unknown otherwise; a write in place run by run. A temp is removed only
-/// when the Save did not land, the phase reached `created`, its `lstat` equals the recorded stat
-/// and, from `staged` on, its post-save evidence matches. Reads nothing it does not need.
+/// when the Save did not land and the phase reached `created`. In `created` it must be a regular
+/// file with the recorded mode and owner, no larger than the target was at open (a Save cut off
+/// mid-copy leaves it at any size up to that); from `staged` on its `lstat` equals the recorded
+/// stat and its post-save evidence matches. Reads nothing it does not need.
 pub fn reconcile(intent: &SaveIntent, host: &str, inspect: &mut dyn Inspect) -> Reconciled {
     if let Phase::Writing { undo, runs } = &intent.phase {
         return reconcile_in_place(intent, host, undo, runs, inspect);
@@ -2175,11 +2192,20 @@ fn temp_verdict(
         Phase::Naming { .. } => {
             keep("the create's reply was never recorded, so it may not be sopen's")
         }
+        // The Save was cut off while it filled the temp, so its size and modification time
+        // are wherever the last request left them. It is this Save's when it is a regular file
+        // at the recorded (random) name with the recorded mode and owner, and no larger than
+        // the target was at open — a Save never writes past that.
         Phase::Created { created, .. } => {
-            if created.matches(&now) {
+            let ours = now.is_file
+                && !now.is_symlink
+                && now.mode == created.mode
+                && (now.uid, now.gid) == (created.uid, created.gid)
+                && now.size <= intent.baseline.size;
+            if ours {
                 Temp::Remove(temp.to_string())
             } else {
-                keep("it changed since sopen created it")
+                keep("it is not as sopen left it (its mode, owner or size)")
             }
         }
         Phase::Staged { staged, post, .. } | Phase::Renaming { staged, post, .. } => {

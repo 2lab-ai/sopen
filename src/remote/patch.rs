@@ -284,12 +284,23 @@ pub trait PatchFs: RemoteFs {
     /// Sets the open file's permission bits (`fsetstat`), never by path.
     fn set_handle_mode(&mut self, file: &mut Handle, mode: u32) -> Result<()>;
 
-    /// Flushes the open file to disk (SFTP: `fsync@openssh.com`; nothing where the server does
-    /// not offer it).
+    /// Whether [`PatchFs::fsync`] can flush (SFTP: the server offers `fsync@openssh.com`).
+    fn can_fsync(&self) -> bool {
+        true
+    }
+
+    /// Flushes the open file to disk (SFTP: `fsync@openssh.com`). Where the server cannot, the
+    /// error is [`NoFsync`] and nothing was sent — never `Ok` for a flush that was not made.
     fn fsync(&mut self, file: &mut Handle) -> Result<()>;
 
     /// Copies the first `size` bytes of `src` into `dst` on the server, both from their start,
-    /// in requests sized by `ctl.pace`.
+    /// in requests sized by `ctl.pace`. An implementation must, for every request: ask
+    /// `ctl.cancel` before sending it ([`Cancelled`] when it says so); size it by
+    /// `ctl.pace.next`; time it with `ctl.clock` and account it with `ctl.pace.copied` once it
+    /// is answered — the bytes really copied; tell `ctl.progress` ([`CopyEvent::Copied`]); and,
+    /// when `ctl.pace.sync_due()` and the server can flush, flush `dst`, account the flush's
+    /// time with `ctl.pace.synced` and tell `ctl.progress` ([`CopyEvent::Synced`]). A source
+    /// that ends before `size` is an error. None of the file's bytes pass through this machine.
     fn copy(
         &mut self,
         src: &mut Handle,
@@ -300,6 +311,47 @@ pub trait PatchFs: RemoteFs {
 
     /// Closes the handle. Never fails: a close that got no reply is the session's to drop.
     fn close(&mut self, file: Handle);
+}
+
+/// The server cannot flush a file to disk ([`PatchFs::fsync`]): nothing was sent.
+#[derive(Debug)]
+pub struct NoFsync;
+
+impl std::fmt::Display for NoFsync {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("this server does not offer fsync@openssh.com")
+    }
+}
+
+impl std::error::Error for NoFsync {}
+
+pub fn is_no_fsync(e: &anyhow::Error) -> bool {
+    e.chain().any(|c| c.is::<NoFsync>())
+}
+
+/// What a Save on a server that cannot flush says, before it starts ([`flush_warning`]) and in
+/// its result ([`Saved::notes`]).
+pub fn unflushed_note(host: &str) -> String {
+    format!(
+        "this server cannot flush to disk; the save is not guaranteed to survive a power cut on \
+         {host}"
+    )
+}
+
+/// Asked with [`route`], before a Save: the note a Save on this connection will carry because
+/// the server cannot flush (`None`: it can). The Save goes ahead with it.
+pub fn flush_warning(fs: &dyn PatchFs, host: &str) -> Option<String> {
+    (!fs.can_fsync()).then(|| unflushed_note(host))
+}
+
+/// One flush of a Save: `Ok(false)` when the server cannot flush (said in the result, never
+/// passed over); any other failure is the Save's.
+fn flush(fs: &mut dyn PatchFs, file: &mut Handle, hook: &mut Hook<'_>) -> Result<bool> {
+    match ask(hook, Step::Fsync, true, "fsync", || fs.fsync(file)) {
+        Ok(()) => Ok(true),
+        Err(e) if is_no_fsync(&e) => Ok(false),
+        Err(e) => Err(e),
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -359,7 +411,8 @@ fn hex(bytes: &[u8]) -> String {
 /// modification time as opened; then one `0xOFF: OLD` line per run. One per editing session:
 /// each Save adds the offsets it changes for the first time, and an offset already there keeps
 /// the byte recorded first, so the file always holds the file as opened. It is rewritten
-/// through a temp and a rename, fsynced, never in place.
+/// through a temp and a rename, fsynced, never in place. The source is written escaped (`\\`,
+/// `\n`, `\r`): a file name is any bytes, and no name can start a line of its own.
 ///
 /// Writing it back needs sopen ([`UndoFile::parse`], "Load as edits"): it is not a file `cp`
 /// restores.
@@ -370,7 +423,75 @@ pub struct UndoFile {
     reserved: bool,
     source: String,
     opened: Fingerprint,
+    /// What the file on disk holds, durably: changed only once a rewrite is published.
     bytes: BTreeMap<u64, u8>,
+    /// The file has been published at least once.
+    published: bool,
+}
+
+/// The stages of an undo file's publication (tests fail each).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UndoStage {
+    Reserve,
+    Write,
+    Sync,
+    Rename,
+    SyncDir,
+}
+
+#[cfg(test)]
+thread_local! {
+    static UNDO_FAILS: Cell<Option<UndoStage>> = const { Cell::new(None) };
+}
+
+/// Tests: the next publications fail at `stage` (`None`: none does), on this thread.
+#[cfg(test)]
+pub(crate) fn undo_fails_at(stage: Option<UndoStage>) {
+    UNDO_FAILS.with(|f| f.set(stage));
+}
+
+fn undo_stage(stage: UndoStage) -> std::io::Result<()> {
+    #[cfg(test)]
+    if UNDO_FAILS.with(|f| f.get()) == Some(stage) {
+        return Err(std::io::Error::other(format!("injected at {stage:?}")));
+    }
+    let _ = stage;
+    Ok(())
+}
+
+/// A source as one header line holds it.
+fn escape(source: &str) -> String {
+    let mut out = String::with_capacity(source.len());
+    for c in source.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+fn unescape(line: &str) -> Result<String> {
+    let mut out = String::with_capacity(line.len());
+    let mut chars = line.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('\\') => out.push('\\'),
+            Some('n') => out.push('\n'),
+            Some('r') => out.push('\r'),
+            other => bail!(
+                "`\\{}` is not an escape",
+                other.map_or(String::new(), String::from)
+            ),
+        }
+    }
+    Ok(out)
 }
 
 /// An undo file read back.
@@ -396,6 +517,7 @@ impl UndoFile {
             source: format!("{host}:{abs}"),
             opened,
             bytes: BTreeMap::new(),
+            published: false,
         }
     }
 
@@ -417,20 +539,39 @@ impl UndoFile {
     /// the file durable: written to a temp, fsynced, renamed into place, the folder fsynced. An
     /// offset already recorded keeps its first byte. Returns only once that is done — the Save
     /// patches nothing before.
+    ///
+    /// What this holds changes only when the publication succeeded. After a failure at any
+    /// stage [`UndoFile::len`] and [`UndoFile::text`] are as before, and the same call again
+    /// writes the file again — it is never taken for done. The file on disk is then as it was
+    /// too, unless only the folder's flush failed: it may already hold the new runs, not yet
+    /// durably.
     pub fn add(&mut self, replaced: &[Patch]) -> Result<()> {
+        let mut next = self.bytes.clone();
         let mut fresh = false;
         for run in replaced {
             for (i, &byte) in run.bytes.iter().enumerate() {
-                self.bytes.entry(run.offset + i as u64).or_insert_with(|| {
+                next.entry(run.offset + i as u64).or_insert_with(|| {
                     fresh = true;
                     byte
                 });
             }
         }
-        if !fresh && self.reserved {
+        if !fresh && self.published {
             return Ok(());
         }
+        let text = Self::render(&self.source, &self.opened, &next);
+        self.publish(&text)
+            .with_context(|| format!("cannot write the undo file {}", self.path.display()))?;
+        self.bytes = next;
+        self.published = true;
+        Ok(())
+    }
+
+    /// The name reserved (once), then `text` through a temp, fsynced, renamed, the folder
+    /// fsynced.
+    fn publish(&mut self, text: &str) -> Result<()> {
         if !self.reserved {
+            undo_stage(UndoStage::Reserve)?;
             let wanted = self.path.clone();
             let (path, _) = crate::cache::create_unique(|attempt| match attempt {
                 0 => wanted.clone(),
@@ -453,32 +594,39 @@ impl UndoFile {
             Err(e) => return Err(e).with_context(|| format!("cannot remove {}", tmp.display())),
         }
         let written = (|| -> std::io::Result<()> {
+            undo_stage(UndoStage::Write)?;
             let mut file = std::fs::OpenOptions::new()
                 .write(true)
                 .create_new(true)
                 .mode(0o600)
                 .open(&tmp)?;
-            file.write_all(self.text().as_bytes())?;
+            file.write_all(text.as_bytes())?;
+            undo_stage(UndoStage::Sync)?;
             file.sync_all()?;
+            undo_stage(UndoStage::Rename)?;
             std::fs::rename(&tmp, &self.path)?;
+            undo_stage(UndoStage::SyncDir)?;
             journal::Fs::sync_dir(&journal::Disk, dir)
         })();
-        written.with_context(|| format!("cannot write the undo file {}", self.path.display()))
+        Ok(written?)
     }
 
-    /// The file's text.
+    /// The file's text, as last published.
     pub fn text(&self) -> String {
+        Self::render(&self.source, &self.opened, &self.bytes)
+    }
+
+    fn render(source: &str, opened: &Fingerprint, bytes: &BTreeMap<u64, u8>) -> String {
+        let source = escape(source);
         let mut text = format!(
-            "# sopen undo file: the bytes its saves replaced in {}\n\
-             # source: {}\n\
+            "# sopen undo file: the bytes its saves replaced in {source}\n\
+             # source: {source}\n\
              # as opened: {} bytes, modified {}\n\
              # one line per run of replaced bytes — offset: the bytes before the save (hex)\n",
-            self.source,
-            self.source,
-            self.opened.size,
-            crate::cache::rfc3339(self.opened.mtime)
+            opened.size,
+            crate::cache::rfc3339(opened.mtime)
         );
-        for run in runs_of(&self.bytes) {
+        for run in runs_of(bytes) {
             text.push_str(&format!("0x{:X}: {}\n", run.offset, hex(&run.bytes)));
         }
         text
@@ -490,10 +638,15 @@ impl UndoFile {
         let mut size = None;
         let mut bytes = BTreeMap::new();
         for line in text.lines() {
+            // The first of each: the header sopen wrote.
             if let Some(rest) = line.strip_prefix("# source: ") {
-                source = Some(rest.to_string());
+                if source.is_none() {
+                    source = Some(unescape(rest).context("the undo file's source")?);
+                }
             } else if let Some(rest) = line.strip_prefix("# as opened: ") {
-                size = rest.split(' ').next().and_then(|n| n.parse::<u64>().ok());
+                if size.is_none() {
+                    size = rest.split(' ').next().and_then(|n| n.parse::<u64>().ok());
+                }
             }
             if line.starts_with('#') || line.trim().is_empty() {
                 continue;
@@ -551,7 +704,9 @@ impl UndoFile {
                     Some((stamp, n)) => (stamp, n.parse().ok()?),
                     None => (id, 0),
                 };
-                (!stamp.contains('.')).then(|| ((stamp.to_string(), n), e.path()))
+                // A name reserved whose first publication failed holds nothing.
+                let holds = e.metadata().is_ok_and(|m| m.len() > 0);
+                (holds && !stamp.contains('.')).then(|| ((stamp.to_string(), n), e.path()))
             })
             .collect();
         found.sort();
@@ -674,6 +829,7 @@ pub fn baseline_pass(
         opened.size <= HASH_CHECK_MAX,
         "{path} is over 256 MiB: its saves check the pages under the edits, not a whole hash"
     );
+    cancelled(cancel)?;
     let mut file = fs.open(path, OpenFor::Read)?;
     let run = (|| -> Result<Baseline> {
         let before = fs.fstat(&mut file)?;
@@ -698,6 +854,8 @@ pub fn baseline_pass(
             read == size,
             "{path} changed while it was checked (it ended after {read} of {size} bytes)"
         );
+        // A cancel after the last chunk (or of an empty file) is still a cancel.
+        cancelled(cancel)?;
         Ok(pass.finish())
     })();
     fs.close(file);
@@ -723,11 +881,15 @@ pub enum Step {
     OpenSource,
     StatSource,
     /// Step 4: the exclusive create (the journal already says `naming`); then the temp's
-    /// `fstat` (after it the journal says `created`), its owner and its mode.
+    /// `fstat` (after it the journal says `created`), its owner, its mode, and its `fstat`
+    /// again.
     Create,
     StatCreated,
     SetOwner,
     SetMode,
+    /// The temp's `fstat` with its owner and mode set (after it the journal's `created` record
+    /// holds that stat: a temp left by a kill from here on can be told to be this Save's).
+    StatReady,
     /// Step 5: the copy request of this number, from 0.
     Copy(u32),
     /// §4.3: the one pass through this machine.
@@ -1335,7 +1497,11 @@ fn staging_route(
 // Save: a temp, then a rename.
 
 /// Saves `job.runs` into `job.target` by a temp and a rename (§4.2; §4.3 where the server has no
-/// `copy-data` and the file is at most 256 MiB), or refuses having created nothing.
+/// `copy-data` and the file is at most 256 MiB), or refuses. A refusal before the temp is
+/// created (the target changed, no room, no route, a baseline that disagrees with the window)
+/// has created nothing on the remote. A later one (the content check, the check before the
+/// replace) leaves the target untouched and removes this Save's temp, or names it in `notes`
+/// when it cannot.
 ///
 /// - `snap` is the generation this Save writes: its baseline and `seen` are what every check
 ///   compares, and `journal` records it with the `save` intent before the temp is created, then
@@ -1562,6 +1728,8 @@ fn drop_temp(
 struct Staged {
     stat: Stat,
     scanned: Scanned,
+    /// The server flushed it to disk.
+    flushed: bool,
 }
 
 /// What the temp takes of the target.
@@ -1577,7 +1745,7 @@ struct Like {
 fn stage(
     fs: &mut dyn PatchFs,
     job: &Job<'_>,
-    journal: Option<&mut Journal>,
+    mut journal: Option<&mut Journal>,
     base: &Fingerprint,
     seen: &BTreeMap<u64, Sha>,
     undo: Option<&mut UndoFile>,
@@ -1592,7 +1760,7 @@ fn stage(
     let made = ask(&mut ctl.hook, Step::StatCreated, false, "stat", || {
         fs.fstat(temp)
     })?;
-    if let Some(journal) = journal {
+    if let Some(journal) = journal.as_deref_mut() {
         journal.save_created(FileStat::of(&made))?;
     }
     // The target's owner, then its mode without set-id bits, through the handle (`create_from`'s
@@ -1610,6 +1778,14 @@ fn stage(
     ask(&mut ctl.hook, Step::SetMode, true, "set the mode", || {
         fs.set_handle_mode(temp, like.mode & 0o777)
     })?;
+    // The record takes the temp as it is filled: a reopen then knows a temp left mid-copy by
+    // its mode and owner (§3.1).
+    let ready = ask(&mut ctl.hook, Step::StatReady, false, "stat", || {
+        fs.fstat(temp)
+    })?;
+    if let Some(journal) = journal {
+        journal.save_ready(FileStat::of(&ready))?;
+    }
     // Steps 5 and 6, or §4.3's one pass.
     let scanned = match route {
         Route::ServerCopy => {
@@ -1641,7 +1817,7 @@ fn stage(
     ask(&mut ctl.hook, Step::FullMode, true, "set the mode", || {
         fs.set_handle_mode(temp, mode)
     })?;
-    ask(&mut ctl.hook, Step::Fsync, true, "fsync", || fs.fsync(temp))?;
+    let flushed = flush(fs, temp, &mut ctl.hook)?;
     let stat = ask(&mut ctl.hook, Step::StatTemp, false, "stat", || {
         fs.fstat(temp)
     })?;
@@ -1669,7 +1845,11 @@ fn stage(
          permissions",
         describe_stat(&stat)
     );
-    Ok(Ok(Staged { stat, scanned }))
+    Ok(Ok(Staged {
+        stat,
+        scanned,
+        flushed,
+    }))
 }
 
 /// Steps 4 (after the create) to 10. `Ok(Err(_))`: refused, the temp still to be removed.
@@ -1714,6 +1894,7 @@ fn stage_and_swap(
     let Staged {
         stat: staged,
         scanned,
+        flushed,
     } = match staged {
         Ok(staged) => staged,
         Err(why) => return Ok(Err(why)),
@@ -1743,6 +1924,9 @@ fn stage_and_swap(
         fs.rename_over(&temp_path, target)
     })?;
     let mut notes = Vec::new();
+    if !flushed {
+        notes.push(unflushed_note(job.host));
+    }
     let after = ask(&mut ctl.hook, Step::StatAfter, false, "stat", || {
         fs.lstat_opt(target)
     });
@@ -2070,11 +2254,14 @@ fn copy_from(
     let staged = stage(
         fs, job, None, base, seen, None, ctl, &like, route, src, &mut temp,
     );
-    let mut at_link = false;
+    // The name a link was sent for, once one was.
+    let mut tried = None;
+    let mut unflushed = None;
     let published = match staged {
         Ok(Ok(staged)) => {
             let pages = staged.scanned.new_pages.len();
-            let linked = link_copy(fs, base, ctl, src, &temp_path, dir, &wanted, &mut at_link);
+            unflushed = (!staged.flushed).then(|| unflushed_note(job.host));
+            let linked = link_copy(fs, base, ctl, src, &temp_path, dir, &wanted, &mut tried);
             linked.map(|name| name.map(|name| (name, pages)))
         }
         Ok(Err(why)) => Ok(Err(why)),
@@ -2091,21 +2278,18 @@ fn copy_from(
         Ok(Ok((name, pages))) => Ok(CopyOutcome::Saved {
             path: join(dir, &name),
             checked: checked_line(base.size, pages),
-            notes: left.into_iter().collect(),
+            notes: unflushed.into_iter().chain(left).collect(),
         }),
         Ok(Err(why)) => Ok(CopyOutcome::Refused {
             why,
             notes: left.into_iter().collect(),
         }),
         Err(e) => {
-            let e = match at_link && super::is_outcome_unknown(&e) {
-                // The link may have happened.
-                true => e.context(format!(
-                    "the copy may be in place — check {}",
-                    join(dir, &wanted)
-                )),
+            let e = match tried.filter(|_| super::is_outcome_unknown(&e)) {
+                // The link may have happened, under the name it was sent for.
+                Some(path) => e.context(format!("the copy may be in place — check {path}")),
                 // Every other request was on the temp: no name was published.
-                false => on_the_temp(e).context("no copy saved"),
+                None => on_the_temp(e).context("no copy saved"),
             };
             Err(match left {
                 Some(left) => e.context(left),
@@ -2116,8 +2300,8 @@ fn copy_from(
 }
 
 /// A Save copy's last steps: the source's `fstat` once more, then the temp linked to the first
-/// free name — a link fails where a name exists. `at_link` is set once the link may have been
-/// sent.
+/// free name, `<wanted>` then `-N` — a link fails where a name exists, so nothing is replaced.
+/// `tried` is the path a link was sent for: on an unknown outcome, the one to check.
 #[allow(clippy::too_many_arguments)]
 fn link_copy(
     fs: &mut dyn PatchFs,
@@ -2127,7 +2311,7 @@ fn link_copy(
     temp_path: &str,
     dir: &str,
     wanted: &str,
-    at_link: &mut bool,
+    tried: &mut Option<String>,
 ) -> Result<std::result::Result<String, Refusal>> {
     let again = ask(&mut ctl.hook, Step::Recheck, false, "stat", || {
         fs.fstat(src)
@@ -2138,14 +2322,33 @@ fn link_copy(
             reason,
         }));
     }
-    let name = ask(&mut ctl.hook, Step::Link, true, "link", || {
-        *at_link = true;
-        match super::publish_linked(fs, temp_path, dir, wanted)? {
-            super::Linked::As(name) => Ok(name),
-            super::Linked::Unsupported(_) => bail!("hard links failed in {dir}"),
+    for n in 0..super::MAX_SUFFIX {
+        let name = super::candidate(wanted, n);
+        let path = join(dir, &name);
+        if fs.lstat_opt(&path)?.is_some() {
+            continue;
         }
-    })?;
-    Ok(Ok(name))
+        let lose = fire(&mut ctl.hook, Step::Link)?;
+        *tried = Some(path.clone());
+        let linked = fs.link_new(temp_path, &path);
+        if lose {
+            return Err(unknown(format!(
+                "link {temp_path} to {path}: request sent, no reply — it may or may not have \
+                 happened"
+            )));
+        }
+        match linked {
+            Ok(()) => return Ok(Ok(name)),
+            Err(e) if super::is_outcome_unknown(&e) => return Err(e),
+            // Taken since the look: answered, so nothing was linked. The next name.
+            Err(_) if fs.lstat_opt(&path)?.is_some() => *tried = None,
+            Err(e) => {
+                *tried = None;
+                return Err(e.context(format!("cannot link {temp_path} to {path}")));
+            }
+        }
+    }
+    bail!("no free name for {wanted} in {dir}")
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -2340,7 +2543,7 @@ fn in_place(
     }
     (ctl.progress)(Progress::Patching);
     let mut written = false;
-    let wrote = (|| -> Result<()> {
+    let wrote = (|| -> Result<bool> {
         for (i, run) in job.runs.iter().enumerate() {
             ask(&mut ctl.hook, Step::Write(i), true, "write", || {
                 fs.write_at(file, run.offset, &run.bytes)
@@ -2352,10 +2555,10 @@ fn in_place(
             })?;
             written = true;
         }
-        ask(&mut ctl.hook, Step::Fsync, true, "fsync", || fs.fsync(file))
+        flush(fs, file, &mut ctl.hook)
     })();
-    match wrote {
-        Ok(()) => {}
+    let flushed = match wrote {
+        Ok(flushed) => flushed,
         Err(e) if is_stopped(&e) => return Err(e),
         Err(e) if !written => {
             // The first write was answered with a refusal: the target holds nothing of it.
@@ -2369,8 +2572,11 @@ fn in_place(
             journal.save_unknown();
             return Err(e.context(super::OutcomeUnknown(may_hold(job, undo))));
         }
-    }
+    };
     let mut notes = Vec::new();
+    if !flushed {
+        notes.push(unflushed_note(job.host));
+    }
     let after = ask(&mut ctl.hook, Step::StatAfter, false, "stat", || {
         fs.lstat_opt(target)
     });
@@ -2412,16 +2618,20 @@ fn in_place(
 // Fresh reads for the journal.
 
 /// The journal's [`Inspect`](journal::Inspect) over a connection: what Restore's checks and the
-/// reconciliation of a cut-off Save read (07 §3, §3.1) comes from the remote, through a handle
-/// opened for it — never from a view's cache.
+/// reconciliation of a cut-off Save read (07 §3, §3.1) comes from the remote, never from a
+/// view's cache.
+///
+/// Nothing is kept between two calls: every read opens the path as it is then, reads and
+/// closes. So an `lstat` and the reads after it are of the same name, whatever became of the
+/// file an earlier read saw — a path replaced between two reads is read as the new file, never
+/// the new file's attributes with the old one's bytes.
 pub struct Fresh<'a> {
     fs: &'a mut dyn PatchFs,
-    open: Option<Handle>,
 }
 
 impl<'a> Fresh<'a> {
     pub fn new(fs: &'a mut dyn PatchFs) -> Self {
-        Fresh { fs, open: None }
+        Fresh { fs }
     }
 }
 
@@ -2431,24 +2641,10 @@ impl journal::Inspect for Fresh<'_> {
     }
 
     fn read_at(&mut self, path: &str, offset: u64, len: usize) -> Result<Vec<u8>> {
-        if self.open.as_ref().is_some_and(|h| h.path() != path) {
-            if let Some(other) = self.open.take() {
-                self.fs.close(other);
-            }
-        }
-        let file = match &mut self.open {
-            Some(file) => file,
-            none => none.insert(self.fs.open(path, OpenFor::Read)?),
-        };
-        self.fs.read_at(file, offset, len)
-    }
-}
-
-impl Drop for Fresh<'_> {
-    fn drop(&mut self) {
-        if let Some(file) = self.open.take() {
-            self.fs.close(file);
-        }
+        let mut file = self.fs.open(path, OpenFor::Read)?;
+        let got = self.fs.read_at(&mut file, offset, len);
+        self.fs.close(file);
+        got
     }
 }
 

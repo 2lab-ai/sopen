@@ -14,7 +14,7 @@ use super::{
     answered, failed_change, perms, poll_replies, read_at, stat_of, timed_out, within, SftpRemote,
     META_TIMEOUT, STALL_TIMEOUT,
 };
-use crate::remote::patch::{CopyCtl, Each, Handle, OpenFor, PatchFs};
+use crate::remote::patch::{CopyCtl, Each, Handle, NoFsync, OpenFor, PatchFs};
 use crate::remote::ranged::Pipeline;
 use crate::remote::{unknown, CreateError, Stat};
 use anyhow::{anyhow, Context, Result};
@@ -186,10 +186,15 @@ impl PatchFs for SftpRemote {
         sent(&format!("set mode on {path}"), META_TIMEOUT, got)
     }
 
+    fn can_fsync(&self) -> bool {
+        self.sftp.as_ref().is_some_and(|s| s.support_fsync())
+    }
+
     fn fsync(&mut self, file: &mut Handle) -> Result<()> {
         let (rt, sftp, _) = self.parts();
         if !sftp.support_fsync() {
-            return Ok(());
+            // Nothing is sent, and nothing is claimed: the Save says so in its result.
+            return Err(anyhow!(NoFsync));
         }
         let path = file.path().to_string();
         let file = file.get::<File>()?;

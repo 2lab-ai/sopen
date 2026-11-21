@@ -4,8 +4,10 @@
 
 use super::*;
 use crate::journal::{reconcile, Kind, Outcome, Phase, Temp};
+use crate::remote::sftp::Proxy;
 use crate::remote::{is_cancelled, is_outcome_unknown, Entry, Like, LocalFs, SftpRemote, Uploaded};
-use std::os::unix::fs::{FileExt, PermissionsExt};
+use std::os::unix::fs::{FileExt, MetadataExt, PermissionsExt};
+use std::sync::atomic::Ordering::Relaxed;
 use std::time::UNIX_EPOCH;
 
 const KIB: u64 = 1024;
@@ -27,6 +29,21 @@ struct Probe {
     no_replace: bool,
     free: Option<Option<u64>>,
     squat: bool,
+    /// The server has no `fsync@openssh.com`.
+    no_fsync: bool,
+    /// Where the file's bytes are counted below this wrapper, at the backend's own boundary:
+    /// the SFTP session's wire, or the local backend's reads and writes.
+    wire: Option<Proxy>,
+    local: Option<(u64, u64, u64)>,
+}
+
+/// File bytes as the backend itself moved them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Boundary {
+    /// Read by the Save's requests (SFTP: `SSH_FXP_DATA` payload on the wire).
+    read: u64,
+    /// Written by them (SFTP: `SSH_FXP_WRITE` payload on the wire).
+    written: u64,
 }
 
 impl Probe {
@@ -41,6 +58,58 @@ impl Probe {
             // Not this machine's disk: only E7 says how much room there is.
             free: Some(None),
             squat: false,
+            no_fsync: false,
+            wire: None,
+            local: None,
+        }
+    }
+
+    /// The local disk, counted in the backend.
+    fn local() -> Self {
+        let mut probe = Probe::new(LocalFs::new());
+        let base = LocalFs::moved();
+        probe.local = Some((base.read, base.written, base.copied));
+        probe
+    }
+
+    /// The real `sftp-server`, its session's bytes counted on the wire by a proxy.
+    fn server() -> Option<Self> {
+        let proxy = Proxy::default();
+        let fs = SftpRemote::local_server_with(Some(proxy.clone()))?;
+        let mut probe = Probe::new(fs);
+        probe.wire = Some(proxy);
+        Some(probe)
+    }
+
+    /// What crossed the backend's boundary since this probe was made; `None` where nothing
+    /// counts there (a server started without the proxy).
+    fn boundary(&self) -> Option<Boundary> {
+        if let Some(proxy) = &self.wire {
+            return Some(Boundary {
+                read: proxy.data.load(Relaxed),
+                written: proxy.written.load(Relaxed),
+            });
+        }
+        let (read, written, _) = self.local?;
+        let now = LocalFs::moved();
+        Some(Boundary {
+            read: now.read - read,
+            written: now.written - written,
+        })
+    }
+
+    /// The bytes the local backend's copy moved (the server's part, over SFTP).
+    fn copied_locally(&self) -> Option<u64> {
+        Some(LocalFs::moved().copied - self.local?.2)
+    }
+
+    /// The Save's own requests read `read` and wrote `written` file bytes: by this wrapper's
+    /// count and, where it is counted, at the backend's boundary.
+    #[track_caller]
+    fn moved(&self, read: u64, written: u64, tag: &str) {
+        assert_eq!((self.read, self.written), (read, written), "{tag}");
+        if let Some(at) = self.boundary() {
+            assert_eq!(at, Boundary { read, written }, "{tag}: at the backend");
         }
     }
 }
@@ -163,9 +232,17 @@ impl PatchFs for Probe {
         self.changes.push("fsetstat");
         self.inner.set_handle_mode(f, mode)
     }
+    fn can_fsync(&self) -> bool {
+        !self.no_fsync && self.inner.can_fsync()
+    }
     fn fsync(&mut self, f: &mut Handle) -> Result<()> {
+        if self.no_fsync {
+            return Err(anyhow!(NoFsync));
+        }
+        // Logged only when one was sent: a backend that cannot flush sends nothing.
+        self.inner.fsync(f)?;
         self.changes.push("fsync");
-        self.inner.fsync(f)
+        Ok(())
     }
     fn copy(
         &mut self,
@@ -184,13 +261,11 @@ impl PatchFs for Probe {
 
 /// The local disk, and the real `sftp-server` where it is installed (CI requires it).
 fn sides() -> Vec<(&'static str, Probe)> {
-    let mut out = vec![("LocalFs", Probe::new(LocalFs::new()))];
-    if let Some(fs) = SftpRemote::local_server() {
-        assert!(
-            PatchFs::can_copy(&fs),
-            "this sftp-server must offer copy-data"
-        );
-        out.push(("local_server()", Probe::new(fs)));
+    let mut out = vec![("LocalFs", Probe::local())];
+    if let Some(fs) = Probe::server() {
+        assert!(fs.can_copy(), "this sftp-server must offer copy-data");
+        assert!(fs.can_fsync(), "this sftp-server must offer fsync");
+        out.push(("local_server()", fs));
     }
     out
 }
@@ -198,7 +273,7 @@ fn sides() -> Vec<(&'static str, Probe)> {
 /// The same two without `copy-data`: a wrapper reporting it absent, and the real server told to
 /// refuse it (`-P copy-data`), which then does not advertise it.
 fn sides_without_copy() -> Vec<(&'static str, Probe)> {
-    let mut local = Probe::new(LocalFs::new());
+    let mut local = Probe::local();
     local.no_copy = true;
     let mut out = vec![("LocalFs, copy-data reported absent", local)];
     if let Some(fs) = SftpRemote::local_server_args(&["-P", "copy-data"], None) {
@@ -305,6 +380,8 @@ enum Body {
     Bytes(Vec<u8>),
     /// A file of this size with nothing written (a hole).
     Sparse(u64),
+    /// A sparse file of this size with these bytes written into it.
+    Seeded(u64, Vec<(u64, Vec<u8>)>),
 }
 
 /// One editing session on one remote file: the file, the window's evidence, its journal and its
@@ -330,6 +407,12 @@ impl Rig {
         match body {
             Body::Bytes(bytes) => std::fs::write(&path, bytes).unwrap(),
             Body::Sparse(size) => std::fs::File::create(&path).unwrap().set_len(size).unwrap(),
+            Body::Seeded(size, seeds) => {
+                std::fs::File::create(&path).unwrap().set_len(size).unwrap();
+                for (offset, bytes) in seeds {
+                    plain_write(&path, offset, &bytes);
+                }
+            }
         }
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
         set_mtime(&path, OLD);
@@ -646,17 +729,66 @@ fn x2_the_copy_loops_follow_a_scripted_clock() {
 // ---------------------------------------------------------------------------------------------
 // E1, E5, E19 (first row): files above 256 MiB, by the server copy.
 
-/// A sparse file one MiB over the content-check limit, with 4 bytes typed over one page.
+const BIG: u64 = HASH_CHECK_MAX + MIB;
+
+/// Distinct bytes in the big file apart from the 4 edited: at its start, across the start of the
+/// edited page (so that page is not all zeros either), right after it, in the middle, and in the
+/// file's last bytes.
+fn seeds() -> Vec<(u64, Vec<u8>)> {
+    let edited = 200 * MIB;
+    [
+        0,
+        MIB + 17,
+        edited - 9,
+        edited + PAGE,
+        130 * MIB + 5,
+        BIG - 4096,
+        BIG - 100,
+    ]
+    .into_iter()
+    .enumerate()
+    .map(|(i, offset)| {
+        let bytes = (0..100u8).map(|b| b.wrapping_mul(7).wrapping_add(i as u8 * 31 + 1));
+        (offset, bytes.collect())
+    })
+    .collect()
+}
+
+/// A sparse file one MiB over the content-check limit holding [`seeds`], with 4 bytes typed over
+/// one page.
 fn big(fs: &mut Probe) -> Rig {
-    let size = HASH_CHECK_MAX + MIB;
     let offset = 200 * MIB + 0xC35;
     let patch = vec![run(offset, b"\xDE\xAD\xBE\xEF")];
-    let rig = Rig::new(fs, Body::Sparse(size), patch);
+    let rig = Rig::new(fs, Body::Seeded(BIG, seeds()), patch);
     assert_eq!(
         rig.snap.baseline.sha256, None,
         "no whole hash above 256 MiB"
     );
     rig
+}
+
+/// The seeded regions are in `path` as they were written.
+#[track_caller]
+fn seeds_hold(path: &Path, tag: &str) {
+    for (offset, bytes) in seeds() {
+        assert_eq!(
+            at(path, offset, bytes.len()),
+            bytes,
+            "{tag}: at 0x{offset:x}"
+        );
+    }
+}
+
+/// A file's identity and attributes by its path on this machine: device and inode, size,
+/// modification time, mode.
+fn ident(path: &Path) -> ((u64, u64), u64, SystemTime, u32) {
+    let m = std::fs::symlink_metadata(path).unwrap();
+    (
+        (m.dev(), m.ino()),
+        m.len(),
+        m.modified().unwrap(),
+        m.mode() & 0o7777,
+    )
 }
 
 /// E1: a 4-byte patch to a file above 256 MiB moves one page read back and the 4 bytes — the
@@ -679,11 +811,19 @@ fn e1_a_small_patch_to_a_huge_file_moves_one_page_and_the_patch() {
             },
         ));
         assert_eq!(saved.route, Route::ServerCopy, "{side}");
-        assert_eq!(
-            (fs.read, fs.written),
-            (PAGE, 4),
-            "{side}: the page check and the patch, nothing else"
+        // Counted where the backend itself reads and writes — on the SFTP session's wire, in
+        // the local backend — so a copy that moved the file through this machine would show.
+        assert!(fs.boundary().is_some(), "{side}: counted at the backend");
+        fs.moved(
+            PAGE,
+            4,
+            &format!("{side}: the page check and the patch, nothing else"),
         );
+        if let Some(copied) = fs.copied_locally() {
+            assert_eq!(copied, BIG, "{side}: the copy is the backend's own");
+        }
+        // The copy kept every byte away from the edit.
+        seeds_hold(&rig.path, side);
         assert_eq!(at(&rig.path, offset, 4), b"\xDE\xAD\xBE\xEF", "{side}");
         assert_eq!(temps(rig.folder()), none(), "{side}");
         let local = rig.local_bytes();
@@ -733,7 +873,16 @@ fn e5_a_change_under_the_edits_is_refused_at_the_page_check() {
         // The window showed the page; then another writer changed a byte of it.
         other_writer(&rig.path, offset + 100, b"\x99");
         let before = shown(&rig.path, offset / PAGE * PAGE);
+        // The whole file and its identity, taken outside the Save's own traffic.
+        let (whole, same) = (file_sha(&rig.path), ident(&rig.path));
         let why = refusal(go(&mut fs, &mut rig, Opts::default()));
+        assert_eq!(file_sha(&rig.path), whole, "{side}: no byte of it changed");
+        assert_eq!(ident(&rig.path), same, "{side}: the same file");
+        fs.moved(
+            PAGE,
+            0,
+            &format!("{side}: one page read back, nothing written"),
+        );
         let Refusal::Page { offset: page, .. } = why else {
             panic!("{side}: {why:?}");
         };
@@ -838,10 +987,10 @@ fn a_small_file_is_saved_by_the_server_copy_with_its_whole_hash() {
         assert_eq!(std::fs::read(&rig.path).unwrap(), want, "{side}");
         assert_eq!(saved.next.sha256, Some(sha_of(&want)), "{side}");
         assert_eq!(saved.checked, None, "{side}: the whole content was checked");
-        assert_eq!(
-            (fs.read, fs.written),
-            (300 * KIB, 5),
-            "{side}: the temp read back once, and the patch"
+        fs.moved(
+            300 * KIB,
+            5,
+            &format!("{side}: the temp read back once, and the patch"),
         );
         for (&page, sha) in &saved.seen {
             assert_eq!(*sha, shown(&rig.path, page), "{side}");
@@ -881,7 +1030,7 @@ fn e3_a_file_changed_since_open_is_refused_having_created_nothing() {
             Vec::<&str>::new(),
             "{side}: no request that writes"
         );
-        assert_eq!((fs.read, fs.written), (0, 0), "{side}");
+        fs.moved(0, 0, side);
         assert_eq!(std::fs::read(&rig.path).unwrap(), body);
         assert_eq!(rig.phase(), "none");
         assert!(rig.journal().dir().exists(), "the journal keeps the edits");
@@ -1179,7 +1328,7 @@ fn e8_without_copy_data_a_big_file_is_refused_and_can_be_written_in_place() {
             "{side}"
         );
         assert!(why.offers_other_ways());
-        assert_eq!((fs.read, fs.written), (0, 0), "{side}: before any transfer");
+        fs.moved(0, 0, &format!("{side}: before any transfer"));
         assert_eq!(fs.changes, Vec::<&str>::new(), "{side}");
         assert_eq!(rig.phase(), "none");
         assert!(!rig.undo.path().exists());
@@ -1201,11 +1350,7 @@ fn e8_without_copy_data_a_big_file_is_refused_and_can_be_written_in_place() {
         assert_eq!(saved.route, Route::InPlace, "{side}");
         assert_eq!(at(&rig.path, 200 * MIB + 7, 2), b"\x11\x22", "{side}");
         assert_eq!(at(&rig.path, 299 * MIB, 1), b"\x33", "{side}");
-        assert_eq!(
-            (fs.read, fs.written),
-            (2 * PAGE, 3),
-            "{side}: two pages, three bytes"
-        );
+        fs.moved(2 * PAGE, 3, &format!("{side}: two pages, three bytes"));
         assert_eq!(
             fs.changes,
             ["write", "write", "fsync"],
@@ -1258,11 +1403,7 @@ fn e9_without_copy_data_a_small_file_is_rewritten_through_this_machine() {
         assert_eq!(saved.route, Route::StreamedRewrite, "{side}");
         assert_eq!(std::fs::read(&rig.path).unwrap(), want, "{side}");
         assert_eq!(saved.next.sha256, Some(sha_of(&want)), "{side}");
-        assert_eq!(
-            (fs.read, fs.written),
-            (MIB, MIB),
-            "{side}: one pass, the file's size up"
-        );
+        fs.moved(MIB, MIB, &format!("{side}: one pass, the file's size up"));
         assert!(
             !fs.changes.contains(&"copy") && !fs.changes.contains(&"write"),
             "{side}"
@@ -1281,11 +1422,36 @@ fn e9_without_copy_data_a_small_file_is_rewritten_through_this_machine() {
     }
 }
 
-/// The streamed rewrite stopped, or its reply lost: the target is untouched either way; a lost
-/// reply removes the Save's own temp, a stop leaves it for the reopen, kept and named.
+/// The `save` record as it is on the disk, read back: `None` when there is none.
+fn persisted(rig: &Rig) -> Option<journal::SaveIntent> {
+    let file = rig.journal().dir().join("save");
+    let bytes = match std::fs::read(&file) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(e) => panic!("{}: {e}", file.display()),
+    };
+    Some(journal::parse_save(&bytes).unwrap())
+}
+
+/// A record's phase by name, and the temp it names.
+fn phase_of(intent: &journal::SaveIntent) -> (&'static str, Option<&str>) {
+    match &intent.phase {
+        Phase::Naming { temp } => ("naming", Some(temp)),
+        Phase::Created { temp, .. } => ("created", Some(temp)),
+        Phase::Staged { temp, .. } => ("staged", Some(temp)),
+        Phase::Renaming { temp, .. } => ("renaming", Some(temp)),
+        Phase::Writing { .. } => ("writing", None),
+    }
+}
+
+/// The streamed rewrite with every step stopped and every step's reply lost. For each, three
+/// things are held to what 07 says, each on its own and before anything is reconciled: the
+/// target (its bytes and that it is the same file), the temp (whether one is left, and that the
+/// record names it), and the `save` record as it is on the disk. Then, apart, what a reopen
+/// makes of it.
 #[test]
-fn a_streamed_rewrite_stopped_or_unanswered_leaves_the_target_whole() {
-    const REWRITE: [Step; 15] = [
+fn a_streamed_rewrite_stopped_or_unanswered_at_any_step() {
+    const REWRITE: [Step; 17] = [
         Step::CheckTarget,
         Step::Room,
         Step::OpenSource,
@@ -1294,6 +1460,7 @@ fn a_streamed_rewrite_stopped_or_unanswered_leaves_the_target_whole() {
         Step::StatCreated,
         Step::SetOwner,
         Step::SetMode,
+        Step::StatReady,
         Step::Rewrite,
         Step::Undo,
         Step::FullMode,
@@ -1301,7 +1468,9 @@ fn a_streamed_rewrite_stopped_or_unanswered_leaves_the_target_whole() {
         Step::StatTemp,
         Step::Recheck,
         Step::Rename,
+        Step::StatAfter,
     ];
+    let number = |step: Step| REWRITE.iter().position(|s| *s == step).unwrap();
     for (side, mut fs) in sides_without_copy() {
         let (mut rig, _) = small(&mut fs);
         let mut seen = Vec::new();
@@ -1309,46 +1478,152 @@ fn a_streamed_rewrite_stopped_or_unanswered_leaves_the_target_whole() {
             seen.push(step);
             At::Go
         }));
-        assert_eq!(seen[..15], REWRITE, "{side}");
-        assert_eq!(seen[15..], [Step::StatAfter], "{side}");
+        assert_eq!(seen, REWRITE, "{side}");
 
         for at in [At::Stop, At::LoseReply] {
             for step in REWRITE {
                 let (mut rig, body) = small(&mut fs);
+                let same = ident(&rig.path);
+                let after = patched(body.clone(), &rig.runs);
                 let got = hooked(&mut fs, &mut rig, &mut |s| match s == step {
                     true => at,
                     false => At::Go,
                 });
                 let tag = format!("{side}, {at:?} at {step:?}");
-                let advisory = matches!(step, Step::Room | Step::Undo);
-                let lost_rename = at == At::LoseReply && step == Step::Rename;
-                if at == At::LoseReply && advisory {
-                    saved(got);
-                    continue;
+                let n = number(step);
+
+                // What 07 says of this step: is the Save reported saved, is the target
+                // replaced, is a temp left, and what the record says.
+                let (ok, replaced, temp_left, phase) = match (at, step) {
+                    (At::Stop, _) => {
+                        let phase = if n < number(Step::Create) {
+                            "none"
+                        } else if n <= number(Step::StatCreated) {
+                            "naming"
+                        } else if n <= number(Step::Recheck) {
+                            "created"
+                        } else {
+                            "renaming"
+                        };
+                        let left = n > number(Step::Create) && step != Step::StatAfter;
+                        (false, step == Step::StatAfter, left, phase)
+                    }
+                    // Nothing of their own is sent (`statvfs` is advisory; the undo file is
+                    // local), or the rename was already answered: saved.
+                    (_, Step::Room | Step::Undo | Step::StatAfter) => {
+                        (true, true, false, "renaming")
+                    }
+                    // It landed, unanswered.
+                    (_, Step::Rename) => (false, true, false, "renaming"),
+                    // Made by the server, never known to be this Save's.
+                    (_, Step::Create) => (false, false, true, "naming"),
+                    // Every other lost reply: the Save's own temp removed, the record ended.
+                    _ => (false, false, false, "none"),
+                };
+
+                // 1. What the Save said.
+                match (&got, at) {
+                    (Ok(SaveOutcome::Saved(saved)), _) => {
+                        assert!(ok, "{tag}: {saved:?}");
+                        let unchecked = step == Step::StatAfter;
+                        assert_eq!(saved.notes.len(), unchecked as usize, "{tag}: {saved:?}");
+                    }
+                    (Err(e), At::Stop) => {
+                        assert!(!ok && is_stopped(e), "{tag}: {e:#}");
+                    }
+                    (Err(e), _) => {
+                        let unknown = matches!(step, Step::Create | Step::Rename);
+                        assert!(!ok, "{tag}: {e:#}");
+                        assert_eq!(is_outcome_unknown(e), unknown, "{tag}: {e:#}");
+                    }
+                    (other, _) => panic!("{tag}: {other:?}"),
                 }
-                let e = got.unwrap_err();
+
+                // 2. The target: its bytes, and whether it is still the same file.
                 let now = std::fs::read(&rig.path).unwrap();
-                if lost_rename {
-                    assert!(is_outcome_unknown(&e), "{tag}: {e:#}");
-                    assert_eq!(now, patched(body, &rig.runs), "{tag}");
-                    continue;
+                let want = if replaced { &after } else { &body };
+                assert!(now == *want, "{tag}: the target's bytes");
+                assert_eq!(ident(&rig.path) == same, !replaced, "{tag}: the same file");
+                let mode = std::fs::metadata(&rig.path).unwrap().mode() & 0o7777;
+                assert_eq!(mode, 0o640, "{tag}");
+
+                // 3. The temp: whether one is left, and as far as it got.
+                let left = temps(rig.folder());
+                assert_eq!(left.len(), temp_left as usize, "{tag}: {left:?}");
+                if let Some(name) = left.first() {
+                    let meta = std::fs::metadata(rig.folder().join(name)).unwrap();
+                    let private = n <= number(Step::SetMode);
+                    let mode = if private { 0o600 } else { 0o640 };
+                    assert_eq!(meta.mode() & 0o7777, mode, "{tag}");
+                    let filled = n > number(Step::Rewrite);
+                    let size = if filled { body.len() as u64 } else { 0 };
+                    assert_eq!(meta.len(), size, "{tag}");
                 }
-                assert_eq!(now, body, "{tag}: {e:#}");
-                assert!(
-                    !is_outcome_unknown(&e) || step == Step::Create,
-                    "{tag}: {e:#}"
+
+                // 4. The record, as it is on the disk — and as the journal holds it.
+                let record = persisted(&rig);
+                assert_eq!(record.as_ref(), rig.journal().pending_save(), "{tag}");
+                assert_eq!(
+                    record.as_ref().map_or("none", |r| phase_of(r).0),
+                    phase,
+                    "{tag}"
                 );
-                match at {
-                    At::Stop => assert!(is_stopped(&e), "{tag}: {e:#}"),
-                    _ if step == Step::Create => {}
-                    _ => {
-                        assert_eq!(temps(rig.folder()), none(), "{tag}");
-                        assert_eq!(rig.phase(), "none", "{tag}");
+                if let Some(record) = &record {
+                    assert_eq!(record.route, Route::StreamedRewrite, "{tag}");
+                    assert_eq!(record.kind, Kind::Hex, "{tag}");
+                    assert_eq!(record.target, rig.target, "{tag}");
+                    assert_eq!(record.baseline, rig.snap.baseline, "{tag}");
+                    assert_eq!(record.seen, rig.snap.seen, "{tag}");
+                    // It names the temp that is there; with none left, a name nothing has.
+                    let named = Path::new(phase_of(record).1.unwrap());
+                    assert_eq!(named.parent(), Some(rig.folder()), "{tag}");
+                    match left.first() {
+                        Some(name) => assert_eq!(named, rig.folder().join(name), "{tag}"),
+                        None => assert!(!named.exists(), "{tag}"),
+                    }
+                    let Seen::Known(pre) = &rig.snap.seen else {
+                        unreachable!()
+                    };
+                    if let Phase::Renaming { staged, post, .. } = &record.phase {
+                        assert_eq!(staged.size, body.len() as u64, "{tag}");
+                        assert_eq!(post.next_baseline.sha256, Some(sha_of(&after)), "{tag}");
+                        let pages: Vec<_> = post.check.pages.keys().collect();
+                        assert_eq!(pages, pre.pages.keys().collect::<Vec<_>>(), "{tag}");
                     }
                 }
-                // Before the pass has read and checked everything, no undo file is written.
-                let after_pass = REWRITE.iter().position(|s| *s == step).unwrap() > 9;
-                assert_eq!(rig.undo.path().exists(), after_pass, "{tag}");
+
+                // The undo file: only once the pass has read and checked everything.
+                let passed = match at {
+                    At::Stop => n > number(Step::Undo),
+                    _ => ok || n >= number(Step::Undo),
+                };
+                assert_eq!(rig.undo.path().exists(), passed, "{tag}");
+
+                // 5. Apart from all that: what a reopen makes of the record.
+                if record.is_none() || ok {
+                    continue;
+                }
+                let (outcome, temp, _) = rig.reconciled(&mut fs);
+                let landed = match replaced {
+                    true => Outcome::Landed,
+                    false => Outcome::NotLanded,
+                };
+                assert_eq!(outcome, landed, "{tag}");
+                let verdict = match temp {
+                    Temp::Gone(_) => "gone",
+                    Temp::Remove(_) => "remove",
+                    Temp::Keep { .. } => "keep",
+                    Temp::None => "none",
+                };
+                let want = match (at, step) {
+                    (At::Stop, Step::Create | Step::StatAfter) => "gone",
+                    // The create's reply, or the temp's new mode, not yet in the record.
+                    (At::Stop, Step::StatCreated | Step::StatReady) => "keep",
+                    (At::Stop, _) => "remove",
+                    (_, Step::Create) => "keep",
+                    _ => "gone",
+                };
+                assert_eq!(verdict, want, "{tag}");
             }
         }
     }
@@ -1357,7 +1632,7 @@ fn a_streamed_rewrite_stopped_or_unanswered_leaves_the_target_whole() {
 /// Without `posix-rename@openssh.com` Save is off, as today, before anything is sent.
 #[test]
 fn a_server_that_cannot_replace_is_refused() {
-    let mut fs = Probe::new(LocalFs::new());
+    let mut fs = Probe::local();
     fs.no_replace = true;
     let (mut rig, _) = small(&mut fs);
     let why = refusal(go(&mut fs, &mut rig, Opts::default()));
@@ -1406,7 +1681,7 @@ fn cancel_between_copy_requests_removes_the_temp() {
 }
 
 /// The steps of a server-copy Save of [`small`] in 128 KiB requests, in order.
-const STEPS: [Step; 21] = [
+const STEPS: [Step; 22] = [
     Step::CheckTarget,
     Step::Room,
     Step::OpenSource,
@@ -1415,6 +1690,7 @@ const STEPS: [Step; 21] = [
     Step::StatCreated,
     Step::SetOwner,
     Step::SetMode,
+    Step::StatReady,
     Step::Copy(0),
     Step::Copy(1),
     Step::Copy(2),
@@ -1476,6 +1752,7 @@ fn a_save_stopped_at_any_step_leaves_the_target_whole_and_the_record_true() {
     for (side, mut fs) in sides() {
         for stop in STEPS {
             let (mut rig, body) = small(&mut fs);
+            let same = ident(&rig.path);
             let e = hooked(&mut fs, &mut rig, &mut |step| match step == stop {
                 true => At::Stop,
                 false => At::Go,
@@ -1484,6 +1761,8 @@ fn a_save_stopped_at_any_step_leaves_the_target_whole_and_the_record_true() {
             let tag = format!("{side}, stopped before {stop:?}");
             assert!(is_stopped(&e), "{tag}: {e:#}");
             let landed = stop == Step::StatAfter;
+            // The same file, not only the same bytes — until the rename has been sent.
+            assert_eq!(ident(&rig.path) == same, !landed, "{tag}");
             let want = match landed {
                 true => patched(body, &rig.runs),
                 false => body,
@@ -1532,22 +1811,71 @@ fn a_save_stopped_at_any_step_leaves_the_target_whole_and_the_record_true() {
                     assert_eq!(left.len(), 1, "{tag}");
                     assert!(matches!(temp, Temp::Keep { .. }), "{tag}: {temp:?}");
                 }
-                // As created: provably this Save's, removed on reopen.
-                Step::SetOwner | Step::SetMode => {
-                    assert!(matches!(temp, Temp::Remove(_)), "{tag}: {temp:?}");
+                // Its mode set, the record not yet brought up to it: kept and named.
+                Step::StatReady => {
+                    assert!(matches!(temp, Temp::Keep { .. }), "{tag}: {temp:?}");
                 }
-                // Staged and checked, the rename not sent: removed on reopen.
-                Step::Rename => assert!(matches!(temp, Temp::Remove(_)), "{tag}: {temp:?}"),
                 Step::StatAfter => assert!(matches!(temp, Temp::Gone(_)), "{tag}: {temp:?}"),
-                // Between `created` and `staged` the temp no longer has the stat recorded at
-                // its creation: it is kept and named, never removed.
-                _ => assert!(matches!(temp, Temp::Keep { .. }), "{tag}: {temp:?}"),
+                // Everywhere else — as created, mid-copy, patched, staged — the temp is at its
+                // recorded name with its recorded mode and owner: provably this Save's, removed
+                // on reopen.
+                _ => assert!(matches!(temp, Temp::Remove(_)), "{tag}: {temp:?}"),
             }
             let want = match landed {
                 true => Outcome::Landed,
                 false => Outcome::NotLanded,
             };
             assert_eq!(outcome, want, "{tag}");
+        }
+    }
+}
+
+/// E18, a Save killed mid-copy: on reopen its temp — at the recorded name, a regular file with
+/// the recorded mode and owner, no larger than the target — is removed. One whose mode changed
+/// after the kill is kept and named.
+#[test]
+fn a_temp_left_by_a_kill_mid_copy_is_removed_on_reopen() {
+    for (side, mut fs) in sides() {
+        for (stop, copied) in [(Step::Copy(1), 128 * KIB), (Step::Copy(2), 256 * KIB)] {
+            for chmod in [false, true] {
+                let (mut rig, body) = small(&mut fs);
+                let e = hooked(&mut fs, &mut rig, &mut |step| match step == stop {
+                    true => At::Stop,
+                    false => At::Go,
+                })
+                .unwrap_err();
+                let tag = format!("{side}, killed before {stop:?}, chmod {chmod}");
+                assert!(is_stopped(&e), "{tag}: {e:#}");
+                let left = temps(rig.folder());
+                assert_eq!(left.len(), 1, "{tag}");
+                let temp_path = rig.folder().join(&left[0]);
+                assert_eq!(
+                    std::fs::metadata(&temp_path).unwrap().len(),
+                    copied,
+                    "{tag}"
+                );
+                if chmod {
+                    let other = std::fs::Permissions::from_mode(0o644);
+                    std::fs::set_permissions(&temp_path, other).unwrap();
+                }
+                assert_eq!(rig.phase(), "created", "{tag}");
+                let (outcome, temp, line) = rig.reconciled(&mut fs);
+                assert_eq!(outcome, Outcome::NotLanded, "{tag}");
+                match (chmod, temp) {
+                    (false, Temp::Remove(path)) => {
+                        assert_eq!(Path::new(&path), temp_path, "{tag}");
+                        fs.remove(&path).unwrap();
+                        assert_eq!(temps(rig.folder()), none(), "{tag}");
+                    }
+                    (true, Temp::Keep { path, .. }) => {
+                        assert_eq!(Path::new(&path), temp_path, "{tag}");
+                        assert!(line.contains(&left[0]), "{line}");
+                        assert!(temp_path.exists(), "{tag}");
+                    }
+                    (_, other) => panic!("{tag}: {other:?}"),
+                }
+                assert_eq!(std::fs::read(&rig.path).unwrap(), body, "{tag}");
+            }
         }
     }
 }
@@ -1560,6 +1888,7 @@ fn a_lost_reply_at_any_step_is_what_07_says() {
     for (side, mut fs) in sides() {
         for lost in STEPS {
             let (mut rig, body) = small(&mut fs);
+            let same = ident(&rig.path);
             let got = hooked(&mut fs, &mut rig, &mut |step| match step == lost {
                 true => At::LoseReply,
                 false => At::Go,
@@ -1568,6 +1897,11 @@ fn a_lost_reply_at_any_step_is_what_07_says() {
             let after = patched(body.clone(), &rig.runs);
             let now = std::fs::read(&rig.path).unwrap();
             let left = temps(rig.folder());
+            let replaced = matches!(
+                lost,
+                Step::Room | Step::Undo | Step::Rename | Step::StatAfter
+            );
+            assert_eq!(ident(&rig.path) == same, !replaced, "{tag}");
             match lost {
                 // Steps that send nothing of their own (`statvfs` is advisory; the undo file is
                 // local): the Save goes on.
@@ -1894,6 +2228,7 @@ fn a_write_in_place_stopped_at_any_step_is_judged_run_by_run() {
 
         for stop in IN_PLACE {
             let (mut rig, body) = two_runs_in_a_page(&mut fs);
+            let same = ident(&rig.path);
             let e = in_place_hooked(&mut fs, &mut rig, &mut |step| match step == stop {
                 true => At::Stop,
                 false => At::Go,
@@ -1903,6 +2238,15 @@ fn a_write_in_place_stopped_at_any_step_is_judged_run_by_run() {
             assert!(is_stopped(&e), "{tag}: {e:#}");
             let now = std::fs::read(&rig.path).unwrap();
             let n = IN_PLACE.iter().position(|s| *s == stop).unwrap();
+            // The whole file at every stop: unchanged before the first write, only the first
+            // run before the second, both after that — and always the same file.
+            let whole = match stop {
+                Step::Write(1) => patched(body.clone(), &rig.runs[..1]),
+                Step::Fsync | Step::StatAfter => patched(body.clone(), &rig.runs),
+                _ => body.clone(),
+            };
+            assert!(now == whole, "{tag}: the whole file");
+            assert_eq!(ident(&rig.path).0, same.0, "{tag}: the same file");
             // The undo file is durable before the runs are recorded, and both before a write.
             let recorded = n >= 5;
             assert_eq!(rig.undo.path().exists(), recorded, "{tag}");
@@ -1976,6 +2320,366 @@ fn a_write_in_place_with_a_lost_reply_says_the_file_may_hold_some_changes() {
         assert_eq!(fs.changes, Vec::<&str>::new(), "{side}");
         assert!(!rig.undo.path().exists(), "{side}");
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Round 1: flushes, fresh reads, the copy's end, the link's name, cancels.
+
+/// A server without `fsync@openssh.com`: the wrapper hiding it, and the real server told to
+/// refuse it (`-P fsync`), which then does not advertise it.
+fn sides_without_fsync() -> Vec<(&'static str, Probe)> {
+    let mut local = Probe::local();
+    local.no_fsync = true;
+    let mut out = vec![("LocalFs, fsync hidden", local)];
+    if let Some(fs) = SftpRemote::local_server_args(&["-P", "fsync"], None) {
+        assert!(!PatchFs::can_fsync(&fs), "-P fsync hides the extension");
+        assert!(PatchFs::can_copy(&fs));
+        out.push(("local_server() -P fsync", Probe::new(fs)));
+    }
+    out
+}
+
+/// A Save never reports a flush it did not make: on a server that cannot flush, `fsync` is an
+/// error of its own and sends nothing; the Save goes ahead and says so, before and after.
+#[test]
+fn a_server_that_cannot_flush_is_said_never_passed_over() {
+    const NOTE: &str = "this server cannot flush to disk; the save is not guaranteed to survive \
+                        a power cut on box";
+    for (side, mut fs) in sides_without_fsync() {
+        // The primitive: an error of its own, never Ok.
+        let (mut rig, body) = small(&mut fs);
+        let mut file = fs.open(&rig.target, OpenFor::Read).unwrap();
+        let e = fs.fsync(&mut file).unwrap_err();
+        assert!(is_no_fsync(&e), "{side}: {e:#}");
+        fs.close(file);
+        // Up front, with the route.
+        assert_eq!(flush_warning(&fs, "box").as_deref(), Some(NOTE), "{side}");
+        assert_eq!(
+            route(&mut fs, &rig.target, 300 * KIB, None),
+            Ok(Route::ServerCopy)
+        );
+        // The Save lands, and its result says it.
+        let saved = saved(go(&mut fs, &mut rig, Opts::default()));
+        assert_eq!(saved.notes, [NOTE], "{side}");
+        assert!(!fs.changes.contains(&"fsync"), "{side}: none was sent");
+        let want = patched(body, &rig.runs);
+        assert_eq!(std::fs::read(&rig.path).unwrap(), want, "{side}");
+
+        // Write in place, and Save copy: the same note.
+        let (mut rig, _) = two_runs_in_a_page(&mut fs);
+        let in_place = Opts {
+            in_place: true,
+            ..Opts::default()
+        };
+        assert_eq!(
+            saved_notes(go(&mut fs, &mut rig, in_place)),
+            [NOTE],
+            "{side}"
+        );
+        let (rig, _) = small(&mut fs);
+        let CopyOutcome::Saved { notes, .. } = go_copy(&mut fs, &rig, None).unwrap() else {
+            panic!("{side}: no copy");
+        };
+        assert_eq!(notes, [NOTE], "{side}");
+    }
+    // A server that can: no warning, no note, and the flush is sent.
+    for (side, mut fs) in sides() {
+        assert_eq!(flush_warning(&fs, "box"), None, "{side}");
+        let (mut rig, _) = small(&mut fs);
+        assert_eq!(saved_notes(go(&mut fs, &mut rig, Opts::default())), none());
+        assert!(fs.changes.contains(&"fsync"), "{side}");
+    }
+}
+
+fn saved_notes(outcome: Result<SaveOutcome>) -> Vec<String> {
+    saved(outcome).notes
+}
+
+/// `Fresh` never mixes two files: with the path replaced between two reads, the attributes and
+/// the bytes it gives afterwards are both the new file's.
+#[test]
+fn fresh_reads_follow_the_path_not_an_old_handle() {
+    use crate::journal::Inspect;
+    for (side, mut fs) in sides() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f");
+        let name = path.to_str().unwrap();
+        std::fs::write(&path, b"AAAAAAAA the first file").unwrap();
+        let mut fresh = Fresh::new(&mut fs);
+        assert_eq!(fresh.read_at(name, 0, 8).unwrap(), b"AAAAAAAA", "{side}");
+        // Another file takes the name (a rename over it, as a Save does).
+        let other = dir.path().join("other");
+        std::fs::write(&other, b"BBBBBBBB the second, longer file").unwrap();
+        std::fs::rename(&other, &path).unwrap();
+        let now = fresh.lstat(name).unwrap().unwrap();
+        assert_eq!(now.size, 32, "{side}: the new file's attributes");
+        assert_eq!(fresh.read_at(name, 0, 8).unwrap(), b"BBBBBBBB", "{side}");
+        let sha = fresh.whole_sha256(name, now.size).unwrap();
+        assert_eq!(
+            sha,
+            Some(sha_of(b"BBBBBBBB the second, longer file")),
+            "{side}"
+        );
+        // And again without an `lstat` between.
+        std::fs::write(&other, b"CCCCCCCC").unwrap();
+        std::fs::rename(&other, &path).unwrap();
+        assert_eq!(fresh.read_at(name, 0, 8).unwrap(), b"CCCCCCCC", "{side}");
+        assert_eq!(
+            fresh.page_sha256(name, 0).unwrap(),
+            Some(sha_of(b"CCCCCCCC"))
+        );
+    }
+}
+
+/// The local copy counts what it copied: a source that ends before the size asked is an error,
+/// never a request reported whole.
+#[test]
+fn a_local_copy_of_a_source_that_ends_early_fails() {
+    let mut fs = LocalFs::new();
+    let dir = tempfile::tempdir().unwrap();
+    let (src, dst) = (dir.path().join("src"), dir.path().join(".src.sopen-test"));
+    std::fs::write(&src, patterned(100 * KIB)).unwrap();
+    let mut from = fs.open(src.to_str().unwrap(), OpenFor::Read).unwrap();
+    let mut to = fs.create_temp(dst.to_str().unwrap()).unwrap();
+    let mut events = Vec::new();
+    let mut clock = stopwatch();
+    let mut ctl = CopyCtl {
+        pace: Pace::steps(64 * KIB),
+        clock: &mut clock,
+        cancel: &|| false,
+        progress: &mut |e| events.push(e),
+    };
+    let e = fs
+        .copy(&mut from, &mut to, 200 * KIB, &mut ctl)
+        .unwrap_err();
+    let text = format!("{e:#}");
+    assert!(
+        text.contains("ended after 102400 of 204800 bytes"),
+        "{text}"
+    );
+    let eof = e.chain().any(|c| {
+        c.downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == std::io::ErrorKind::UnexpectedEof)
+    });
+    assert!(eof, "{text}");
+    assert_eq!(
+        events,
+        [CopyEvent::Copied(64 * KIB)],
+        "only what was copied"
+    );
+}
+
+/// A Save copy whose link got no reply names the name the link was sent for: with
+/// `model.edited.bin` taken, that is `model.edited-1.bin`.
+#[test]
+fn save_copy_with_a_lost_link_reply_names_the_name_it_tried() {
+    for (side, mut fs) in sides() {
+        let (rig, body) = small(&mut fs);
+        let taken = rig.folder().join("model.edited.bin");
+        std::fs::write(&taken, "theirs").unwrap();
+        let e = go_copy(
+            &mut fs,
+            &rig,
+            Some(&mut |step| match step {
+                Step::Link => At::LoseReply,
+                _ => At::Go,
+            }),
+        )
+        .unwrap_err();
+        assert!(is_outcome_unknown(&e), "{side}: {e:#}");
+        let tried = rig.folder().join("model.edited-1.bin");
+        let want = format!("the copy may be in place — check {}", tried.display());
+        assert_eq!(e.to_string(), want, "{side}: {e:#}");
+        assert_eq!(std::fs::read(&tried).unwrap(), patched(body, &rig.runs));
+        assert_eq!(std::fs::read(&taken).unwrap(), b"theirs", "{side}");
+        assert_eq!(temps(rig.folder()), none(), "{side}");
+    }
+}
+
+/// A cancel is a cancel wherever it comes: during the pass's last progress report, and of an
+/// empty file, which has no chunk to stop at.
+#[test]
+fn a_cancelled_baseline_pass_never_succeeds() {
+    for (side, mut fs) in sides() {
+        let (rig, _) = small(&mut fs);
+        let cancel = AtomicBool::new(false);
+        let base = rig.snap.baseline;
+        let got = baseline_pass(&mut fs, &rig.target, &base, &cancel, &mut |done, size| {
+            cancel.store(done == size, Ordering::Relaxed)
+        });
+        let e = got.expect_err("cancelled during the last report");
+        assert!(is_cancelled(&e), "{side}: {e:#}");
+
+        let empty = rig.folder().join("empty");
+        std::fs::write(&empty, b"").unwrap();
+        let name = empty.to_str().unwrap();
+        let stat = fs.lstat_opt(name).unwrap().unwrap();
+        let cancel = AtomicBool::new(true);
+        let before = fs.changes.len();
+        let got = baseline_pass(&mut fs, name, &stat.fingerprint(), &cancel, &mut |_, _| {});
+        let e = got.expect_err("a cancelled empty file");
+        assert!(is_cancelled(&e), "{side}: {e:#}");
+        assert_eq!(fs.changes.len(), before);
+        // Not cancelled, an empty file passes.
+        let never = AtomicBool::new(false);
+        let pass = baseline_pass(&mut fs, name, &stat.fingerprint(), &never, &mut |_, _| {});
+        assert_eq!(pass.unwrap().sha256, sha_of(b""), "{side}");
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// The undo file's publication, and its source.
+
+const STAGES: [UndoStage; 5] = [
+    UndoStage::Reserve,
+    UndoStage::Write,
+    UndoStage::Sync,
+    UndoStage::Rename,
+    UndoStage::SyncDir,
+];
+
+/// The undo file's injected failures end with the test, pass or fail.
+struct NoUndoFault;
+
+impl Drop for NoUndoFault {
+    fn drop(&mut self) {
+        undo_fails_at(None);
+    }
+}
+
+fn undo_runs(path: &Path) -> Vec<Patch> {
+    UndoFile::parse(&std::fs::read_to_string(path).unwrap())
+        .unwrap()
+        .runs
+}
+
+/// A publication that failed is never taken for done: at every stage, of a first publication and
+/// of an update to a file that already holds runs, the same call again writes the file — and
+/// until it does, the undo file holds what it held.
+#[test]
+fn a_failed_undo_publication_is_retried_not_accepted() {
+    let _guard = NoUndoFault;
+    let opened = Fingerprint {
+        size: 1 << 20,
+        mtime: UNIX_EPOCH + Duration::from_secs(OLD),
+        sha256: None,
+    };
+    let first = [run(0x10, b"\x01\x02")];
+    let second = [run(0x11, b"\xEE\x03"), run(0x900, b"\x09")];
+    let both = [run(0x10, b"\x01\x02\x03"), run(0x900, b"\x09")];
+    for stage in STAGES {
+        // The first publication fails.
+        let cache = tempfile::tempdir().unwrap();
+        let at = UNIX_EPOCH + Duration::from_secs(OLD);
+        let mut undo = UndoFile::new(cache.path(), "box", "/d/f", opened, at);
+        undo_fails_at(Some(stage));
+        let e = undo.add(&first).unwrap_err();
+        assert!(format!("{e:#}").contains("injected"), "{stage:?}: {e:#}");
+        assert_eq!(undo.len(), 0, "{stage:?}: nothing is held");
+        let listed = UndoFile::list(cache.path(), "box", "/d/f");
+        if stage != UndoStage::SyncDir {
+            assert_eq!(listed, Vec::<PathBuf>::new(), "{stage:?}: nothing to load");
+        }
+        // Still failing: still an error, never Ok.
+        assert!(undo.add(&first).is_err(), "{stage:?}: the retry fails too");
+        undo_fails_at(None);
+        undo.add(&first).unwrap();
+        assert_eq!(undo_runs(undo.path()), first, "{stage:?}");
+        assert_eq!(undo.len(), 2, "{stage:?}");
+
+        // An update to a file that already holds runs fails.
+        undo_fails_at(Some(stage));
+        if stage == UndoStage::Reserve {
+            // The name is this session's already: nothing is reserved again.
+            undo.add(&second).unwrap();
+            assert_eq!(undo_runs(undo.path()), both, "{stage:?}");
+            continue;
+        }
+        let e = undo.add(&second).unwrap_err();
+        assert!(format!("{e:#}").contains("injected"), "{stage:?}: {e:#}");
+        assert_eq!(undo.len(), 2, "{stage:?}: it holds what was published");
+        let held = UndoFile::parse(&undo.text()).unwrap().runs;
+        assert_eq!(held, first, "{stage:?}");
+        let on_disk = undo_runs(undo.path());
+        match stage {
+            // Renamed into place, its folder not yet flushed: either may be there.
+            UndoStage::SyncDir => assert!(on_disk == first || on_disk == both, "{on_disk:?}"),
+            _ => assert_eq!(on_disk, first, "{stage:?}: the file is as it was"),
+        }
+        assert!(undo.add(&second).is_err(), "{stage:?}: the retry fails too");
+        undo_fails_at(None);
+        undo.add(&second).unwrap();
+        assert_eq!(undo_runs(undo.path()), both, "{stage:?}");
+        assert_eq!(undo.len(), 4, "{stage:?}");
+        // Nothing new: nothing is written, whatever would fail.
+        undo_fails_at(Some(UndoStage::Write));
+        undo.add(&first).unwrap();
+        undo_fails_at(None);
+    }
+}
+
+/// A Save whose undo file cannot be published patches nothing, and the next Save does not take
+/// the undo file for written.
+#[test]
+fn a_save_whose_undo_file_fails_patches_nothing_and_the_next_writes_it() {
+    let _guard = NoUndoFault;
+    for (side, mut fs) in sides() {
+        let (mut rig, body) = small(&mut fs);
+        undo_fails_at(Some(UndoStage::Sync));
+        let e = go(&mut fs, &mut rig, Opts::default()).unwrap_err();
+        undo_fails_at(None);
+        assert!(
+            format!("{e:#}").contains("cannot write the undo file"),
+            "{e:#}"
+        );
+        assert!(!fs.changes.contains(&"write"), "{side}: nothing patched");
+        assert_eq!(std::fs::read(&rig.path).unwrap(), body, "{side}");
+        assert_eq!(temps(rig.folder()), none(), "{side}");
+        assert_eq!(rig.phase(), "none", "{side}");
+        // The same Save again: the undo file is written before the patch, and gives it back.
+        let saved = saved(go(&mut fs, &mut rig, Opts::default()));
+        assert_eq!(undo_runs(&saved.undo).len(), 2, "{side}");
+        rig.write_undo_back();
+        assert_eq!(std::fs::read(&rig.path).unwrap(), body, "{side}");
+    }
+}
+
+/// A file name is any bytes: one holding a newline, a carriage return, a backslash, or text that
+/// reads as a header or as an undo line comes back exactly, and adds no byte to restore.
+#[test]
+fn the_undo_files_source_cannot_add_or_change_a_record() {
+    let opened = Fingerprint {
+        size: 4096,
+        mtime: UNIX_EPOCH + Duration::from_secs(OLD),
+        sha256: None,
+    };
+    let names = [
+        "/d/plain.bin",
+        "/d/new\nline",
+        "/d/evil\n0x0: FF",
+        "/d/evil\n0x0: FF\n# as opened: 1 bytes, modified never\n# source: other:/x",
+        "/d/cr\rreturn\r\n0x1: AA",
+        "/d/back\\slash\\n not a newline",
+        "/d/trailing\\",
+        "/d/# source: other:/etc/passwd",
+        "\n",
+    ];
+    for (i, name) in names.into_iter().enumerate() {
+        let cache = tempfile::tempdir().unwrap();
+        let at = UNIX_EPOCH + Duration::from_secs(OLD + i as u64);
+        let mut undo = UndoFile::new(cache.path(), "box", name, opened, at);
+        let runs = [run(0x20, b"\x01\x02"), run(0x800, b"\x7F")];
+        undo.add(&runs).unwrap();
+        let text = std::fs::read_to_string(undo.path()).unwrap();
+        let read = UndoFile::parse(&text).unwrap();
+        assert_eq!(read.source, format!("box:{name}"), "{name:?}");
+        assert_eq!(read.runs, runs, "{name:?}: exactly the bytes replaced");
+        assert_eq!(read.size, 4096, "{name:?}");
+        // Four header lines and one line per run, whatever the name holds.
+        assert_eq!(text.lines().count(), 6, "{name:?}: {text}");
+        assert!(!text.contains('\r'), "{name:?}");
+    }
+    assert!(UndoFile::parse("# source: a\\x\n# as opened: 1 bytes\n").is_err());
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -2088,7 +2792,7 @@ fn two_saves_in_a_session_share_one_undo_file() {
 /// What a Save is told must hold before anything is sent.
 #[test]
 fn a_save_without_its_evidence_sends_nothing() {
-    let mut fs = Probe::new(LocalFs::new());
+    let mut fs = Probe::local();
     let check = |fs: &mut Probe, change: &dyn Fn(&mut Rig), want: &str| {
         let (mut rig, _) = small(fs);
         change(&mut rig);
