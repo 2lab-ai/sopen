@@ -1113,6 +1113,107 @@ fn w8a_cancel_and_publish_are_decided_once_right_before_the_link() {
     assert_eq!(names(tmp.path()), ["dest.bin"]);
 }
 
+/// A save whose publication wins the decision and then loses the name: something takes the
+/// destination between the decision and the link.
+fn taken_at_the_last_moment(
+    dest: &Path,
+    decision: &Decision,
+) -> std::result::Result<SavedTo, SaveError> {
+    let fill = |file: &mut File| -> Result<u64> {
+        file.write_all(BODY)?;
+        Ok(BODY.len() as u64)
+    };
+    save_new_deciding(
+        dest,
+        fill,
+        &mut |step, _| {
+            if step == LinkStep::Publish {
+                std::fs::write(dest, b"someone else's file").unwrap();
+            }
+            Ok(())
+        },
+        decision,
+    )
+}
+
+/// Publication wins the decision, then the link itself fails: the name was taken at the last
+/// moment. The save is refused as `Exists` — not as cancelled, not as saved — the file there
+/// keeps its contents, the staging is cleaned, and a cancel that comes after is still told it
+/// was too late (the decision was the publish's, whatever the link then did).
+#[test]
+fn w8a_a_publish_that_won_and_then_lost_the_name_is_exists_not_cancelled() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dest = tmp.path().join("dest.bin");
+    let decision = Decision::default();
+    let result = taken_at_the_last_moment(&dest, &decision);
+    match &result {
+        Err(SaveError::Exists { next }) => assert_eq!(next, &tmp.path().join("dest-1.bin")),
+        other => panic!("{other:?}"),
+    }
+    assert!(!result.as_ref().is_err_and(save_cancelled));
+    assert_eq!(std::fs::read(&dest).unwrap(), b"someone else's file");
+    assert_eq!(names(tmp.path()), ["dest.bin"], "the staging is cleaned");
+    assert!(!decision.cancel(), "too late: the publish had won");
+    assert!(!decision.cancelled());
+}
+
+/// The dialog's own source, for the test above in the window: its save loses the name at the
+/// last moment, with the window's own decision.
+struct Taken;
+
+impl Source for Taken {
+    fn open_hex(&mut self, _: &mut dyn FnMut(u64, u64)) -> Result<Opened> {
+        bail!("not in this test")
+    }
+
+    fn save_to(
+        &mut self,
+        dest: &Path,
+        _: &mut dyn FnMut(u64, u64),
+        cancel: &Decision,
+    ) -> std::result::Result<SavedTo, SaveError> {
+        taken_at_the_last_moment(dest, cancel)
+    }
+}
+
+/// The same in the dialog: it says the name exists and was not replaced, and offers the next
+/// one — it never says `saved`, and never `cancelled`; nothing is recorded as saved.
+#[test]
+fn w8a_the_dialog_does_not_say_saved_when_the_name_was_taken_at_the_last_moment() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dest = tmp.path().join("blob.zip");
+    let hooks = Hooks {
+        save_to: Some(dest.clone()),
+        ..Hooks::default()
+    };
+    let info = Info {
+        title: "box:/remote/blob.zip".into(),
+        name: "blob.zip".into(),
+        size: BODY.len() as u64,
+        local: false,
+    };
+    let mut win = BinaryWindow::new(
+        info,
+        Box::new(Taken),
+        Box::new(Picks(None, Arc::default())),
+        &hooks,
+    );
+    let mut drv = Driver::new(WINDOW[0], 320.0);
+    drv.idle(&mut win, 3);
+    drv.click_text(&mut win, "Save to…");
+    drv.until(&mut win, 20, |w| w.asking() && !w.notes.is_empty());
+    drv.idle(&mut win, 3);
+    let shown: Vec<String> = drv.texts().into_iter().map(|(_, _, text)| text).collect();
+    let said = |what: &str| shown.iter().any(|text| text.contains(what));
+    assert!(said("exists — not replaced"), "{shown:?}");
+    assert!(said("blob-1.zip"), "the next free name: {shown:?}");
+    assert!(!said("saved "), "{shown:?}");
+    assert!(!said("cancelled"), "{shown:?}");
+    assert!(win.ended.lock().unwrap().saved_to.is_none());
+    assert_eq!(std::fs::read(&dest).unwrap(), b"someone else's file");
+    assert_eq!(names(tmp.path()), ["blob.zip"], "the staging is cleaned");
+}
+
 // ---------------------------------------------------------------------------------------------
 // The production source and the route main takes.
 

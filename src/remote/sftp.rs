@@ -1566,6 +1566,68 @@ mod tests {
         assert_eq!(crate::stream::explain(&e), crate::stream::SESSION_REFUSED);
     }
 
+    /// The listener does not outlive its session: a real session (this machine's
+    /// `sftp-server`, started as production starts one — through [`start_on`], its stderr
+    /// listened to, the child kept as the session's own and not killed on drop) is used, then
+    /// dropped, and the listener's thread has ended within the close's own bound (5 s): the
+    /// session's close ends the child, which closes the pipe the thread reads.
+    #[test]
+    fn the_stderr_listener_ends_when_its_session_is_dropped() {
+        // The skip, or the failure under SOPEN_REQUIRE_SFTP_SERVER, is `local_server`'s.
+        if SftpRemote::local_server().is_none() {
+            return;
+        }
+        let server = SFTP_SERVERS
+            .iter()
+            .find(|p| Path::new(p).exists())
+            .expect("found above");
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let writes = Arc::new(Writes::default());
+        let (sftp, ended) = rt.block_on(async {
+            let mut child = tokio::process::Command::new(server)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            let (stdin, stdout) = (child.stdin.take().unwrap(), child.stdout.take().unwrap());
+            let listening = listen(child.stderr.take().unwrap()).expect("listened to");
+            // What the test keeps of the listener: whether its thread has ended.
+            let alive = Arc::downgrade(&listening.said);
+            let ended = move || alive.strong_count() == 0;
+            let keep = openssh_sftp_client::SftpAuxiliaryData::Boxed(Box::new(
+                std::sync::Mutex::new(child),
+            ));
+            let none = || None::<std::future::Ready<_>>;
+            let sftp = start_on(stdin, stdout, Some(listening), keep, none, writes.clone())
+                .await
+                .unwrap();
+            (sftp, ended)
+        });
+        let fs = sftp.fs();
+        let mut session = SftpRemote {
+            rt: Some(rt),
+            sftp: Some(sftp),
+            fs: Some(fs),
+            writes,
+            stats: 0,
+        };
+        assert!(session.stat("/").unwrap().is_dir, "a working session");
+        assert!(!ended(), "listening while the session lives");
+        let dropped = std::time::Instant::now();
+        drop(session);
+        while !ended() {
+            assert!(
+                dropped.elapsed() < Duration::from_secs(5),
+                "the listener outlived its session"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
     /// The stderr is drained whatever the session's runtime does: a child that writes far more
     /// than a pipe holds (1 MiB; a pipe takes 64 KiB) while nothing drives any runtime is not
     /// held up by it — it runs to its end — and only the last bytes are kept, on one line. An
