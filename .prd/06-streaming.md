@@ -782,6 +782,11 @@ the page and drop the queued keys.
 
     Continue and Close are the decode line's. A decode over the budget still asks when a
     header that was not known before the read turns out to need it.
+  - **When both the file and its decode are over 512 MiB, one line says what is held at once**,
+    the file and the decoded pixels together, and its colour goes by that sum:
+
+    > reading and decoding this image needs 24.9 GB of memory (30000×30000; the file itself
+    > 22.4 GB); this machine has 16 GB — Continue (Enter) · Close (Esc)
   - This is one of **the workstream's decisions told to the owner** ([`streaming/ssot.md`](streaming/ssot.md)).
     It applies to local images too, which goes beyond streaming.
   - **The buffer is asked for with a check before decoding:** a zeroed allocation of the decoded

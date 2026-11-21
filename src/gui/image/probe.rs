@@ -19,9 +19,10 @@ pub const BLOCK: u64 = crate::stream::BLOCK;
 pub const HEADER_CAP: u64 = 1 << 20;
 /// Up to this much memory the window goes on without asking (06 §7.3).
 pub const BUDGET: u64 = 512 << 20;
-/// The most an Exif thumbnail may decode to: one is 160×120 or so, and its own header is as
+/// The most an Exif thumbnail may be held as (RGBA, upright): 1 MiB, 512×512 or the like. One
+/// is 160×120 or so — the whole APP1 it comes in is at most 64 KiB — and its own header is as
 /// untrusted as the file's.
-const THUMB_NEED: u64 = 16 << 20;
+pub const THUMB_RGBA: u64 = 1 << 20;
 
 /// Reads `buf.len()` bytes at an offset (fewer at the end of the file).
 pub type ReadAt<'a> = dyn FnMut(u64, &mut [u8]) -> io::Result<usize> + 'a;
@@ -410,13 +411,13 @@ fn thumbnail(exif: &[u8], orientation: Orientation) -> Option<RgbaImage> {
     }
     let offset = offset?;
     let bytes = exif.get(offset..offset.checked_add(length?)?)?;
-    // Its own header first: a thumbnail claiming 65535² is not decoded.
+    // Its own header first: a thumbnail whose frame is larger than a thumbnail is not decoded.
     if bytes.get(..2)? != [0xFF, 0xD8] {
         return None;
     }
     // (And not its own thumbnail: an Exif nested in an Exif is not followed.)
     match jpeg(&mut Head::of(bytes), false)? {
-        Probe::Header(own) if own.need <= THUMB_NEED => {}
+        Probe::Header(own) if u64::from(own.width) * u64::from(own.height) * 4 <= THUMB_RGBA => {}
         _ => return None,
     }
     let mut thumb = image::load_from_memory_with_format(bytes, ImageFormat::Jpeg).ok()?;
@@ -456,6 +457,12 @@ pub enum Ask {
     /// The file's own bytes: a file this large is read into memory whole before its header
     /// can promise anything about the picture in it.
     Read { bytes: u64 },
+    /// Both over the budget: the file's bytes and the decoded pixels are held at once.
+    Both {
+        file: u64,
+        need: u64,
+        size: (u32, u32),
+    },
 }
 
 impl Ask {
@@ -463,6 +470,7 @@ impl Ask {
         match self {
             Ask::Decode { need, .. } => need,
             Ask::Read { bytes } => bytes,
+            Ask::Both { file, need, .. } => file.saturating_add(need),
         }
     }
 
@@ -482,6 +490,13 @@ impl Ask {
                 "reading this image needs {} of memory (the file itself)",
                 memory_text(bytes)
             ),
+            Ask::Both {
+                file, size: (w, h), ..
+            } => format!(
+                "reading and decoding this image needs {} of memory ({w}×{h}; the file itself {})",
+                memory_text(self.need()),
+                memory_text(file)
+            ),
         };
         match physical {
             Some(p) => format!("{what}; this machine has {}", memory_text(p)),
@@ -500,12 +515,25 @@ pub fn ask_read(bytes: u64, budget: u64) -> Option<Ask> {
     (bytes > budget).then_some(Ask::Read { bytes })
 }
 
-/// A file's size as the loading line says it: `16.6 MB`, `74 bytes`.
+/// What must be asked before a file of `file` bytes is read and decoded (`decode`: the bytes
+/// its header says the pixels need, and its size; `None` when no header was found): the
+/// decode, the file itself, or — both over the budget — the two together, which is what is
+/// then held at once.
+pub fn ask_open(file: u64, decode: Option<(u64, (u32, u32))>, budget: u64) -> Option<Ask> {
+    let decode = decode.and_then(|(need, size)| ask_decode(need, size, budget));
+    match (decode, ask_read(file, budget)) {
+        (Some(Ask::Decode { need, size }), Some(_)) => Some(Ask::Both { file, need, size }),
+        (decode, read) => decode.or(read),
+    }
+}
+
+/// A file's size as the loading line says it: `24.0 GB`, `16.6 MB`, `74 bytes`.
 pub fn size_text(bytes: u64) -> String {
     match bytes {
         0..1_000 => format!("{bytes} bytes"),
         1_000..1_000_000 => format!("{:.1} kB", bytes as f64 / 1e3),
-        _ => format!("{:.1} MB", bytes as f64 / 1e6),
+        1_000_000..1_000_000_000 => format!("{:.1} MB", bytes as f64 / 1e6),
+        _ => format!("{:.1} GB", bytes as f64 / 1e9),
     }
 }
 
@@ -520,8 +548,18 @@ pub(crate) fn largest_reserved() -> u64 {
     RESERVED.with(std::cell::Cell::get)
 }
 
-/// The numbers a decoder writes pixels as.
-pub trait Sample: Copy {}
+mod sealed {
+    /// Only this module names it: nothing outside can add a [`super::Sample`].
+    pub trait Sealed {}
+    impl Sealed for u8 {}
+    impl Sealed for u16 {}
+    impl Sealed for f32 {}
+}
+
+/// The numbers a decoder writes pixels as: `u8`, `u16` and `f32`, and — sealed — nothing
+/// else. The unsafe code below relies on exactly these: no padding, any bit pattern valid,
+/// all-zero bits a value.
+pub trait Sample: Copy + sealed::Sealed {}
 impl Sample for u8 {}
 impl Sample for u16 {}
 impl Sample for f32 {}
@@ -653,20 +691,59 @@ pub fn partial<R: Read + Seek>(prefix: R, header: &Header, side: u32) -> Option<
     Some(picture.to_rgba8())
 }
 
-/// Adam7's passes: where each starts and how far apart its samples are, across and down.
-const ADAM7: [(u32, u32, u32, u32); 7] = [
-    (0, 8, 0, 8),
-    (4, 8, 0, 8),
-    (0, 4, 4, 8),
-    (2, 4, 0, 4),
-    (0, 2, 2, 4),
-    (1, 2, 0, 2),
-    (0, 1, 1, 2),
+/// Adam7's passes: where each starts and how far apart its samples are, across and down, and
+/// the block a sample stands for until later passes refine it (its footprint).
+const ADAM7: [Pass; 7] = [
+    Pass::new(0, 8, 0, 8, 8, 8),
+    Pass::new(4, 8, 0, 8, 4, 8),
+    Pass::new(0, 4, 4, 8, 4, 4),
+    Pass::new(2, 4, 0, 4, 2, 4),
+    Pass::new(0, 2, 2, 4, 2, 2),
+    Pass::new(1, 2, 0, 2, 1, 2),
+    Pass::new(0, 1, 1, 2, 1, 1),
 ];
 
+/// One pass over an image: every `dx`-th column from `x0` of every `dy`-th row from `y0`.
+#[derive(Clone, Copy)]
+struct Pass {
+    x0: u32,
+    dx: u32,
+    y0: u32,
+    dy: u32,
+    /// The footprint of a sample.
+    fw: u32,
+    fh: u32,
+}
+
+impl Pass {
+    const fn new(x0: u32, dx: u32, y0: u32, dy: u32, fw: u32, fh: u32) -> Self {
+        Self {
+            x0,
+            dx,
+            y0,
+            dy,
+            fw,
+            fh,
+        }
+    }
+
+    /// A plain image: every pixel, once.
+    const WHOLE: Pass = Pass::new(0, 1, 0, 1, 1, 1);
+
+    /// The pass's sample whose footprint covers column `x`, if one does.
+    fn sample(self, x: u32, width: u32) -> Option<u32> {
+        let from = x.checked_sub(self.x0)?;
+        (from % self.dx < self.fw)
+            .then_some(from / self.dx)
+            .filter(|i| *i < width)
+    }
+}
+
 /// A PNG's rows so far through the `png` crate's row reader, sampled down as they come (no
-/// full-size buffer): a plain one's rows from the top, the rest left clear; an interlaced
-/// one's last complete pass, which is the whole frame at that pass's resolution.
+/// full-size buffer). A plain one's rows from the top, the rest left clear. An interlaced
+/// one's passes laid over one another as a progressive display lays them — each sample over
+/// its footprint, so a later pass refines what the earlier ones drew — as of the last pass
+/// that is complete: the whole frame, finer with each pass.
 fn png_rows<R: io::BufRead + Seek>(prefix: R, side: u32) -> Option<RgbaImage> {
     let mut decoder = png::Decoder::new(prefix);
     decoder.set_transformations(png::Transformations::normalize_to_color8());
@@ -686,49 +763,46 @@ fn png_rows<R: io::BufRead + Seek>(prefix: R, side: u32) -> Option<RgbaImage> {
         return None;
     }
     let (out_w, out_h) = fit(w, h, side);
-    let blank = || RgbaImage::new(out_w, out_h);
-    // The passes that have samples at all, with their sizes: a plain PNG is one pass, the
-    // image itself.
-    let passes: Vec<(u32, u32)> = if interlaced {
-        ADAM7
-            .iter()
-            .map(|&(x0, dx, y0, dy)| {
-                (
-                    w.saturating_sub(x0).div_ceil(dx),
-                    h.saturating_sub(y0).div_ceil(dy),
-                )
-            })
-            .filter(|&(pw, ph)| pw > 0 && ph > 0)
-            .collect()
-    } else {
-        vec![(w, h)]
-    };
-    let mut done: Option<RgbaImage> = None;
-    let mut rows_shown = 0u32;
-    for &(pass_w, pass_h) in &passes {
-        let mut picture = blank();
-        // The pass's row each row of the picture is taken from, in order.
-        let mut next_out = 0u32;
+    // The pixel of the image each pixel of the picture shows.
+    let source_x = |x: u32| (u64::from(x) * u64::from(w) / u64::from(out_w)) as u32;
+    let source_y = |y: u32| (u64::from(y) * u64::from(h) / u64::from(out_h)) as u32;
+    let passes: &[Pass] = if interlaced { &ADAM7 } else { &[Pass::WHOLE] };
+    // What is being drawn, and — interlaced — the picture as of the last complete pass.
+    let mut work = RgbaImage::new(out_w, out_h);
+    let mut shown: Option<RgbaImage> = None;
+    let mut drawn = false;
+    for pass in passes {
+        let pass_w = w.saturating_sub(pass.x0).div_ceil(pass.dx);
+        let pass_h = h.saturating_sub(pass.y0).div_ceil(pass.dy);
+        if pass_w == 0 || pass_h == 0 {
+            // A pass with no samples in an image this small: the stream has none of it.
+            continue;
+        }
         for line in 0..pass_h {
             let row = match reader.next_row() {
                 Ok(Some(row)) => row.data(),
                 // The bytes end here (or are wrong from here): what came before is the picture.
                 Ok(None) | Err(_) => {
                     return if interlaced {
-                        done
+                        shown
                     } else {
-                        (rows_shown > 0).then_some(picture)
+                        drawn.then_some(work)
                     };
                 }
             };
             if row.len() != pass_w as usize * channels {
-                return done;
+                return shown;
             }
-            while next_out < out_h
-                && (u64::from(next_out) * u64::from(pass_h) / u64::from(out_h)) as u32 == line
-            {
+            // The rows of the image this row stands for, and the picture's rows that show them.
+            let top = pass.y0 + line * pass.dy;
+            let below = top.saturating_add(pass.fh);
+            let first = (u64::from(top) * u64::from(out_h)).div_ceil(u64::from(h)) as u32;
+            for y in (first..out_h).take_while(|y| source_y(*y) < below) {
                 for x in 0..out_w {
-                    let from = (u64::from(x) * u64::from(pass_w) / u64::from(out_w)) as usize;
+                    let Some(from) = pass.sample(source_x(x), pass_w) else {
+                        continue;
+                    };
+                    let from = from as usize;
                     let p = &row[from * channels..(from + 1) * channels];
                     let rgba = match channels {
                         1 => [p[0], p[0], p[0], 255],
@@ -736,13 +810,21 @@ fn png_rows<R: io::BufRead + Seek>(prefix: R, side: u32) -> Option<RgbaImage> {
                         3 => [p[0], p[1], p[2], 255],
                         _ => [p[0], p[1], p[2], p[3]],
                     };
-                    picture.put_pixel(x, next_out, image::Rgba(rgba));
+                    work.put_pixel(x, y, image::Rgba(rgba));
                 }
-                next_out += 1;
-                rows_shown += 1;
+                drawn = true;
             }
         }
-        done = Some(picture);
+        if interlaced {
+            match &mut shown {
+                Some(shown) => shown.copy_from_slice(&work),
+                None => shown = Some(work.clone()),
+            }
+        }
     }
-    done
+    if interlaced {
+        shown
+    } else {
+        Some(work)
+    }
 }

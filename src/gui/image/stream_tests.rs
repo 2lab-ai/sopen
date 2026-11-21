@@ -8,7 +8,9 @@ use super::probe::{self, Ask, Head, Probe};
 use super::*;
 use crate::gui::testkit::Driver;
 use crate::gui::Window as _;
-use crate::remote::{fake, Change, FakeControl, FakeFile, Fault, Link, LocalFs, RemoteFs, Stat};
+use crate::remote::{
+    fake, Asked, Change, FakeControl, FakeFile, Fault, Link, LocalFs, RemoteFs, Stat,
+};
 use crate::stream::{Engine, Opening, Settings, BLOCK};
 use eframe::egui::Modifiers;
 use std::time::Instant;
@@ -350,6 +352,9 @@ struct Fx {
     lines: Arc<Mutex<Vec<String>>>,
     win: Streaming,
     drv: Driver,
+    /// Replies taken so far: the link answers in the order it was asked, so the next reply is
+    /// to request number `taken`.
+    taken: usize,
 }
 
 fn fx_of(file: FakeFile, hooks: &Hooks, budget: u64) -> Fx {
@@ -402,6 +407,7 @@ fn fx_of(file: FakeFile, hooks: &Hooks, budget: u64) -> Fx {
         lines,
         win,
         drv: Driver::new(900.0, 700.0),
+        taken: 0,
     }
 }
 
@@ -423,10 +429,22 @@ impl Fx {
         }
         for _ in 0..1000 {
             if self.engine.step(None) {
+                self.taken += 1;
                 return true;
             }
         }
         panic!("no reply came");
+    }
+
+    /// What the next reply answers, if a request waits for one.
+    fn next(&self) -> Option<Asked> {
+        self.control.sent().get(self.taken).map(|sent| sent.asked)
+    }
+
+    /// Whether the next reply brings no byte of the file at or past `stop`: the link serves
+    /// the file up to there and no further (a status reply is always let through).
+    fn serves_below(&self, stop: u64) -> bool {
+        !matches!(self.next(), Some(Asked::Read { off, len }) if off + u64::from(len) > stop)
     }
 
     /// Passes and replies in turn until `done`; a reply is taken only while `feed` says so.
@@ -442,7 +460,7 @@ impl Fx {
             if done(self) {
                 return;
             }
-            if !(feed(self) && self.reply()) {
+            if !(self.out() > 0 && feed(self) && self.reply()) {
                 // Nothing is on its way: a worker may be about to ask, or to answer.
                 std::thread::sleep(Duration::from_millis(1));
             }
@@ -454,23 +472,57 @@ impl Fx {
         self.run(what, |_| true, done);
     }
 
-    /// Replies and passes until nothing is on its way and nothing more is asked for a while:
-    /// what the window fetches when it is left alone.
-    fn settle(&mut self) {
-        let mut quiet = 0;
+    /// Takes every reply on its way, a pass after each. Only for a loader that is known to ask
+    /// for nothing more by itself — it waits at the memory line, or it has ended — so that
+    /// what is on its way is all there will be.
+    fn drain(&mut self) {
+        assert!(
+            self.asking() || self.loader_ended(),
+            "the loader may still ask: nothing can be said of what it will fetch"
+        );
         for _ in 0..1_000_000 {
             self.drv.idle(&mut self.win, 1);
-            if self.reply() {
-                quiet = 0;
-            } else {
-                quiet += 1;
-                if quiet >= 40 {
-                    return;
-                }
-                std::thread::sleep(Duration::from_millis(1));
+            if !self.reply() {
+                return;
             }
         }
-        panic!("the stream did not settle");
+        panic!("the stream did not run dry");
+    }
+
+    /// The loader waits at the memory line: it asks the stream for nothing until an answer.
+    fn asking(&self) -> bool {
+        self.win.load.progress().ask.is_some()
+    }
+
+    /// The loader and its workers have ended, or the loader has handed in its result.
+    fn loader_ended(&self) -> bool {
+        self.workers_ended() || self.win.failure().is_some() || self.win.image.is_some()
+    }
+
+    /// Where the link stops for V14's "by 25 % fetched": a quarter of the file, up to the end
+    /// of the read step it falls in (the loader reads the file a step at a time).
+    fn quarter(&self) -> u64 {
+        let step = READ_STEP as u64;
+        self.source.size().div_ceil(4).div_ceil(step) * step
+    }
+
+    /// Serves the file up to [`Fx::quarter`] and no further, until a picture of those bytes
+    /// exists; what was fetched by then.
+    fn picture_by_a_quarter(&mut self) -> (u64, Arc<image::RgbaImage>) {
+        let (size, stop) = (self.source.size(), self.quarter());
+        self.run(
+            "a picture by a quarter",
+            |fx| fx.serves_below(stop),
+            |fx| fx.partial().is_some(),
+        );
+        let fetched = self.fetched();
+        assert!(
+            fetched <= size / 4 + READ_STEP as u64,
+            "{fetched} fetched of {size} by the first picture"
+        );
+        let (at, picture) = self.partial().unwrap();
+        assert!(at <= fetched, "made of {at} bytes, {fetched} fetched");
+        (fetched, picture)
     }
 
     fn fetched(&self) -> u64 {
@@ -593,21 +645,8 @@ fn v14_a_progressive_jpeg_shows_its_thumbnail_then_the_whole_frame_coarse_and_es
     // 06 §11: `first` is that frame's, with what had been fetched by then.
     let first = fx.line("first").expect("the first line");
     assert_eq!(stat(&first, "fetched"), at_header, "{first}");
-    // A quarter of the file and no more: the whole frame is there, coarse.
-    let quarter = size / 4 + READ_STEP as u64;
-    fx.run(
-        "a picture by a quarter",
-        |fx| fx.loaded() < quarter,
-        |fx| fx.partial().is_some(),
-    );
-    let (at, picture) = fx.partial().unwrap();
-    assert!(at <= quarter, "made of {at} bytes of {size}");
-    // What is in flight is at most the cap (06 §4), past what was read.
-    assert!(
-        fx.fetched() <= quarter + crate::stream::CAP_MAX + 2 * BLOCK,
-        "{} fetched by the first picture of {size}",
-        fx.fetched()
-    );
+    // The link serves a quarter of the file and no more: the whole frame is there, coarse.
+    let (fetched, picture) = fx.picture_by_a_quarter();
     // Blocks far below the rows whose detail has come: each is its own coarse value, not the
     // flat grey of a row that is not there.
     for (near, by) in [(20, 250), (400, 380), (740, 498), (3, 499)] {
@@ -623,19 +662,30 @@ fn v14_a_progressive_jpeg_shows_its_thumbnail_then_the_whole_frame_coarse_and_es
         Drawn::Sketch(Sketch::Partial { .. })
     ));
     // Esc: the window asks to close, the read stops and nothing of it is kept.
-    let fetched = fx.fetched();
+    let buffer = fx.win.load.progress().buffer.clone();
+    assert!(buffer.upgrade().is_some(), "the file is being read");
     fx.key(Key::Escape);
     assert!(fx.drv.closed(), "Esc closes the window");
     fx.until("the workers end", |fx| fx.workers_ended());
     let requests = fx.requests();
-    fx.settle();
+    fx.drain();
     assert!(fx.win.image.is_none() && fx.win.failure().is_none());
     assert_eq!(fx.requests(), requests, "nothing is asked after Esc");
+    // What was on its way when Esc came is at most the cap (06 §4).
     assert!(
         fx.fetched() <= fetched + crate::stream::CAP_MAX && fx.fetched() < size / 2,
         "{} fetched of {size} after Esc at {fetched}",
         fx.fetched()
     );
+    // Nothing is kept: the buffer the file was read into is gone with the loader, the result
+    // was never made, and — the window gone too — nothing was written under the cache root
+    // (06 §7.3: no cache copy is made) or anywhere beside it.
+    assert!(buffer.upgrade().is_none(), "the bytes read are still held");
+    assert!(fx.win.load.progress().done.is_none());
+    let Fx { _tmp: tmp, win, .. } = fx;
+    drop(win);
+    let left: Vec<_> = std::fs::read_dir(tmp.path()).unwrap().flatten().collect();
+    assert!(left.is_empty(), "left behind: {left:?}");
 }
 
 /// V14: a 3000×2000 plain PNG shows at least 10 % of its rows by 25 % fetched.
@@ -643,18 +693,10 @@ fn v14_a_progressive_jpeg_shows_its_thumbnail_then_the_whole_frame_coarse_and_es
 fn v14_a_plain_png_shows_its_rows_so_far() {
     let (w, h) = (3000, 2000);
     let file = png(w, h, false);
-    let size = file.len() as u64;
     let mut fx = fx(file);
-    let quarter = size / 4 + READ_STEP as u64;
-    fx.run(
-        "rows by a quarter",
-        |fx| fx.loaded() < quarter,
-        |fx| fx.partial().is_some(),
-    );
+    let (_, picture) = fx.picture_by_a_quarter();
     fx.drv.idle(&mut fx.win, 2);
     assert!(fx.says("3000×2000"), "{:?}", fx.painted());
-    let (at, picture) = fx.partial().unwrap();
-    assert!(at <= quarter, "made of {at} bytes of {size}");
     // Rows from the top, as the file has them; the rest is not there yet.
     let rows = (0..picture.height())
         .take_while(|y| picture.get_pixel(picture.width() / 2, *y).0[3] == 255)
@@ -677,17 +719,9 @@ fn v14_a_plain_png_shows_its_rows_so_far() {
 fn v14_a_baseline_jpeg_shows_its_top_rows() {
     let (w, h) = (1600, 1200);
     let file = baseline(w, h);
-    let size = file.len() as u64;
     let whole = Doc::decode(&file).unwrap().img.to_rgba8();
     let mut fx = fx(file);
-    let quarter = size / 4 + READ_STEP as u64;
-    fx.run(
-        "top rows by a quarter",
-        |fx| fx.loaded() < quarter,
-        |fx| fx.partial().is_some(),
-    );
-    let (at, picture) = fx.partial().unwrap();
-    assert!(at <= quarter, "made of {at} bytes of {size}");
+    let (_, picture) = fx.picture_by_a_quarter();
     assert_eq!(picture.dimensions(), (w, h));
     let same = |y: u32| {
         (0..w)
@@ -700,22 +734,97 @@ fn v14_a_baseline_jpeg_shows_its_top_rows() {
     assert!(flat && !same(h - 1), "the bottom is not there yet");
 }
 
-/// 06 §7.3: an interlaced PNG shows each completed pass as the whole frame.
+/// An image as a progressive display shows an Adam7 file after its first `passes` passes:
+/// each sample painted over its footprint, in file order, so a later pass refines what the
+/// earlier ones drew. Written out the plain way, pass by pass, as a reference.
+fn adam7_after(w: u32, h: u32, passes: usize) -> image::RgbImage {
+    // Where a pass starts, how far apart its samples are, and the block a sample stands for.
+    const PASSES: [[u32; 6]; 7] = [
+        [0, 8, 0, 8, 8, 8],
+        [4, 8, 0, 8, 4, 8],
+        [0, 4, 4, 8, 4, 4],
+        [2, 4, 0, 4, 2, 4],
+        [0, 2, 2, 4, 2, 2],
+        [1, 2, 0, 2, 1, 2],
+        [0, 1, 1, 2, 1, 1],
+    ];
+    let mut out = image::RgbImage::new(w, h);
+    for [x0, dx, y0, dy, fw, fh] in PASSES.into_iter().take(passes) {
+        for y in (y0..h).step_by(dy as usize) {
+            for x in (x0..w).step_by(dx as usize) {
+                for yy in y..(y + fh).min(h) {
+                    for xx in x..(x + fw).min(w) {
+                        out.put_pixel(xx, yy, image::Rgb(shade(x, y)));
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Where pass `passes` of [`png`]`(w, h, true)` ends in the file: its raw rows, and room for
+/// what the file wraps them in (far less than the pass after it).
+fn adam7_cut(w: u32, h: u32, passes: usize) -> usize {
+    const PASSES: [[u32; 4]; 7] = [
+        [0, 8, 0, 8],
+        [4, 8, 0, 8],
+        [0, 4, 4, 8],
+        [2, 4, 0, 4],
+        [0, 2, 2, 4],
+        [1, 2, 0, 2],
+        [0, 1, 1, 2],
+    ];
+    let raw: usize = PASSES[..passes]
+        .iter()
+        .map(|[x0, dx, y0, dy]| {
+            let (pw, ph) = ((w - x0).div_ceil(*dx), (h - y0).div_ceil(*dy));
+            (ph * (1 + 3 * pw)) as usize
+        })
+        .sum();
+    raw + 2000
+}
+
+/// 06 §7.3: an interlaced PNG shows the whole frame from its first pass on, each completed
+/// pass laid over the ones before — a later pass refines the picture, it does not replace
+/// it with its own samples alone. The fixture's colour differs in every row and column, so a
+/// sample in the wrong place, or one pass shown alone, is another picture.
 #[test]
 fn an_interlaced_png_shows_a_whole_coarse_frame_from_its_first_passes() {
     let (w, h) = (1024, 768);
     let file = png(w, h, true);
     let header = header_of(&file);
-    // A seventh of the bytes is past pass 4 of 7 (1/64 + 1/64 + 1/32 + 1/16 of the pixels).
-    let cut = |n: usize| Cursor::new(&file[..n]);
-    let picture = probe::partial(cut(file.len() / 7), &header, 2048).expect("a pass");
-    assert_eq!(picture.dimensions(), (w, h));
-    for (x, y) in [(0, 0), (w - 1, h - 1), (w / 2, h / 2), (17, h - 3)] {
-        // Pass 4's sample for this place: every fourth column from 2, every fourth row.
-        let (px, py) = (x * (w / 4) / w, y * (h / 4) / h);
-        let from = shade(2 + 4 * px, 4 * py);
-        assert_eq!(picture.get_pixel(x, y).0, [from[0], from[1], from[2], 255]);
+    let cut = |n: usize| Cursor::new(&file[..n.min(file.len())]);
+    for passes in 1..=7 {
+        let expected = adam7_after(w, h, passes);
+        // At its own size, and sampled down as a large image's picture is.
+        for side in [2048, 256] {
+            let end = adam7_cut(w, h, passes);
+            let picture = probe::partial(cut(end), &header, side).expect("a pass");
+            let (pw, ph) = picture.dimensions();
+            assert_eq!((pw, ph), if side == 2048 { (w, h) } else { (256, 192) });
+            for y in 0..ph {
+                for x in 0..pw {
+                    let from = expected.get_pixel(x * w / pw, y * h / ph).0;
+                    assert_eq!(
+                        picture.get_pixel(x, y).0,
+                        [from[0], from[1], from[2], 255],
+                        "({x}, {y}) after pass {passes}, side {side}"
+                    );
+                }
+            }
+        }
     }
+    // An unfinished pass is not shown: just short of pass 5's end, the picture is pass 4's.
+    let short = adam7_cut(w, h, 5) - 2000 - 4000;
+    let picture = probe::partial(cut(short), &header, 2048).unwrap();
+    assert_eq!(
+        image::DynamicImage::ImageRgba8(picture).to_rgb8(),
+        adam7_after(w, h, 4)
+    );
+    // The whole file is the image itself, as the full decode gives it.
+    let whole = probe::partial(cut(file.len()), &header, 2048).unwrap();
+    assert_eq!(whole, Doc::decode(&file).unwrap().img.to_rgba8());
     // A picture never takes more memory than the header said (what the memory line was
     // about): a header of a smaller frame than the bytes hold gives none.
     let jpeg = baseline(320, 240);
@@ -728,11 +837,6 @@ fn an_interlaced_png_shows_a_whole_coarse_frame_from_its_first_passes() {
     assert!(probe::partial(Cursor::new(&jpeg[..]), &smaller, 2048).is_none());
     // Before its first pass is whole there is no picture.
     assert!(probe::partial(cut(2000), &header, 2048).is_none());
-    // The whole file is the image itself.
-    let whole = probe::partial(cut(file.len()), &header, 2048).unwrap();
-    for (x, y) in [(1, 1), (w - 1, h - 1), (511, 383)] {
-        assert_eq!(whole.get_pixel(x, y).0[..3], shade(x, y));
-    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -769,11 +873,20 @@ fn v15_a_jpeg_with_large_metadata_before_its_frame_shows_size_and_thumbnail_with
 /// proceeds.
 #[test]
 fn v15_a_huge_header_shows_the_memory_line_and_continue_proceeds() {
-    let file = png_claiming(100_000, 100_000);
+    // The header's few bytes, and megabytes of file behind them: a read that went on past the
+    // header would show in what is fetched.
+    let mut file = FakeFile::bytes(png_claiming(100_000, 100_000));
+    file.size = 8 * MIB;
     let need = 30_000_000_000u64;
-    let mut fx = fx(file);
+    let mut fx = fx_of(file, &Hooks::default(), probe::BUDGET);
     fx.until("the memory line", |fx| fx.says("Continue (Enter)"));
-    fx.settle();
+    fx.drain();
+    // With Continue unpressed: 64 KiB at most, and no request more however long it waits.
+    let (fetched, requests) = (fx.fetched(), fx.requests());
+    assert!(fetched <= 64 << 10, "{fetched} fetched before Continue");
+    fx.drv.idle(&mut fx.win, 50);
+    fx.drain();
+    assert_eq!((fx.fetched(), fx.requests()), (fetched, requests));
     let line = fx
         .painted()
         .into_iter()
@@ -815,11 +928,12 @@ fn v15_a_huge_header_shows_the_memory_line_and_continue_proceeds() {
     );
     // A scripted run cannot answer: the line is what its screenshot shows.
     assert!(fx.win.ready());
-    // Continue: the decode is asked of the allocator, whole. Either the system refuses it —
-    // an error line, not an abort — or the file's few bytes fail to fill it.
+    // Continue: the file is read, and the decode is asked of the allocator, whole. Either the
+    // system refuses it — an error line, not an abort — or the file's bytes fail to fill it.
     fx.key(Key::Enter);
     fx.until("the decode", |fx| fx.win.failure().is_some());
     assert_eq!(fx.reserved(), need, "Continue asks for the decode's memory");
+    assert!(fx.fetched() >= 8 * MIB, "Continue reads the file");
     let why = fx.win.failure().unwrap();
     assert!(
         why.contains("cannot decode the image") || why.contains("not enough memory"),
@@ -858,21 +972,44 @@ fn a_24_gb_file_or_a_huge_image_takes_no_memory_before_continue() {
             .collect::<Vec<_>>(),
     ));
     blind.size = MODEL;
+    // 24 GB whose header is a 30000×30000 frame, 2.5 GB decoded: both are held at once, and
+    // the line says their sum — not the decode alone, which is the smaller part.
+    let mut both = vec![0xFF, 0xD8];
+    segment(
+        &mut both,
+        0xC0,
+        &[
+            8, 0x75, 0x30, 0x75, 0x30, 3, 1, 0x11, 0, 2, 0x11, 0, 3, 0x11, 0,
+        ],
+    );
+    let mut both = FakeFile::bytes(both);
+    both.size = MODEL;
     let read = "reading this image needs 22.4 GB of memory (the file itself)";
     let decode = "decoding this image needs 12 GB of memory (65535×65535)";
+    let sum = "reading and decoding this image needs 24.9 GB of memory (30000×30000; the file \
+               itself 22.4 GB)";
+    assert_eq!(
+        probe::memory_text(MODEL + 30_000 * 30_000 * 3),
+        "24.9 GB",
+        "the file and the decode together"
+    );
     for (file, words, cap) in [
         (small, read, BLOCK),
         (FakeFile::bytes(huge), decode, BLOCK),
         (blind, read, probe::HEADER_CAP),
+        (both, sum, BLOCK),
     ] {
         let mut fx = fx_of(file, &Hooks::default(), probe::BUDGET);
         fx.until(words, |fx| fx.says("Continue (Enter)"));
-        fx.settle();
+        fx.drain();
         assert!(fx.says(words), "{:?}", fx.painted());
+        if fx.source.size() == MODEL {
+            assert!(fx.says("24.0 GB"), "the file's size: {:?}", fx.painted());
+        }
         let (fetched, requests) = (fx.fetched(), fx.requests());
         assert!(fetched <= cap, "{words}: {fetched} fetched");
         fx.drv.idle(&mut fx.win, 50);
-        fx.settle();
+        fx.drain();
         assert_eq!(
             (fx.fetched(), fx.requests()),
             (fetched, requests),
@@ -899,8 +1036,16 @@ fn continue_reads_the_file_and_the_window_becomes_the_image_window() {
     // A budget this picture's 180 000 bytes are over.
     let mut fx = fx_of(FakeFile::bytes(file.clone()), &Hooks::default(), 100_000);
     fx.until("the memory line", |fx| fx.says("Continue (Enter)"));
-    fx.settle();
-    assert!(fx.says("decoding this image needs 0.2 MB of memory (300×200)"));
+    fx.drain();
+    // (The file is over this small budget too: the line is for both.)
+    assert!(
+        fx.says(
+            "reading and decoding this image needs 0.3 MB of memory (300×200; the file itself \
+             0.2 MB)"
+        ),
+        "{:?}",
+        fx.painted()
+    );
     assert_eq!((fx.reserved(), fx.loaded()), (0, 0));
     assert!(!fx.says("loading 0 %"), "nothing loads while it asks");
     fx.key(Key::Enter);
@@ -1019,7 +1164,7 @@ fn a_file_that_cannot_be_a_picture_is_refused_from_its_header() {
         fx.until(why, |fx| fx.win.failure().is_some());
         assert_eq!(fx.win.failure().as_deref(), Some(why));
         assert!(fx.drv.closed());
-        fx.settle();
+        fx.drain();
         assert!(fx.fetched() <= BLOCK, "{why}: {}", fx.fetched());
     }
 }
@@ -1122,7 +1267,10 @@ fn a_preview_shows_its_lines_and_takes_no_keys() {
     assert!(fx.says("300×200"), "{:?}", fx.painted());
     fx.key(Key::Enter);
     fx.key(Key::Escape);
-    fx.settle();
+    // Neither key was the preview's: it still asks (Continue answers in the pass that takes
+    // the key), and it was not stopped.
+    assert!(fx.asking() && !fx.win.load.cancel.load(Ordering::SeqCst));
+    fx.drain();
     assert!(!fx.drv.closed() && fx.win.image.is_none());
     assert_eq!((fx.reserved(), fx.loaded()), (0, 0));
     // The hand-over: the keys are the window's again.
@@ -1497,12 +1645,34 @@ fn the_memory_line_says_what_is_needed_and_what_the_machine_has() {
             size: (2, 3)
         })
     );
+    // Both over the budget: one line for what is held at once, and its colour by the sum.
+    let both = probe::ask_open(3 << 30, Some((2 << 30, (9, 9))), probe::BUDGET).unwrap();
+    assert_eq!(
+        both.line(Some(4 << 30)),
+        "reading and decoding this image needs 5 GB of memory (9×9; the file itself 3 GB); this \
+         machine has 4 GB"
+    );
+    assert!(both.exceeds(Some(4 << 30)) && !both.exceeds(Some(5 << 30)));
+    // One of them over it: that one's line.
+    let decode = probe::ask_open(1 << 20, Some((2 << 30, (9, 9))), probe::BUDGET);
+    assert!(matches!(decode, Some(Ask::Decode { .. })));
+    let read = probe::ask_open(3 << 30, Some((1 << 20, (9, 9))), probe::BUDGET);
+    assert!(matches!(read, Some(Ask::Read { .. })));
+    assert!(matches!(
+        probe::ask_open(3 << 30, None, probe::BUDGET),
+        Some(Ask::Read { .. })
+    ));
+    assert_eq!(
+        probe::ask_open(1 << 20, Some((1 << 20, (9, 9))), probe::BUDGET),
+        None
+    );
     assert_eq!(probe::ask_read(512 << 20, probe::BUDGET), None);
     assert!(probe::ask_read((512 << 20) + 1, probe::BUDGET).is_some());
     // This machine says how much it has.
     assert!(probe::physical_memory().is_some_and(|bytes| bytes >= 1 << 30));
     assert_eq!(probe::size_text(16_600_000), "16.6 MB");
     assert_eq!(probe::size_text(74), "74 bytes");
+    assert_eq!(probe::size_text(24_000_000_000), "24.0 GB");
 }
 
 /// 06 §7.3: the decode's buffer is asked for with a check, in one piece of exactly the decoded
@@ -1546,7 +1716,7 @@ fn the_decode_reserves_its_buffer_and_gives_what_from_decoder_gives() {
         assert_eq!(ours, theirs, "{:?}", image.color());
         assert_eq!(ours.as_bytes(), image.as_bytes(), "{:?}", image.color());
     }
-    // `Doc::decode` goes through it: one buffer of exactly the decoded size.
+    // `Doc::decode` goes through it: the largest reservation is the decoded size.
     std::thread::spawn(|| {
         let doc = Doc::decode(&png(300, 200, false)).unwrap();
         assert_eq!(doc.size(), (300, 200));
@@ -1595,30 +1765,40 @@ fn the_read_does_not_wait_for_a_picture_and_marks_reached_meanwhile_are_skipped(
         "50 % and 75 % were skipped"
     );
     assert_eq!(fx.image().file.lock().unwrap().original(), file.as_slice());
-    // Left alone, each mark gets its picture: three of them.
+    // One at a time, each mark gets its picture: the link serves the file up to the next
+    // mark only once the picture of the mark before is counted and its worker is done.
     let mut fx = fx_of(FakeFile::bytes(file), &Hooks::default(), probe::BUDGET);
-    let mut seen = 0;
+    let step = READ_STEP as u64;
+    let marks: Vec<u64> = PREVIEW_MARKS
+        .iter()
+        .map(|percent| (size * percent).div_ceil(100).div_ceil(step) * step)
+        .collect();
     fx.run(
         "the image",
-        |fx| !fx.win.load.progress().previewing,
+        |fx| {
+            let progress = fx.win.load.progress();
+            let stop = marks.get(progress.partials).copied().unwrap_or(u64::MAX);
+            !progress.previewing && fx.serves_below(stop)
+        },
         |fx| fx.win.image.is_some(),
     );
-    seen += fx.win.load.progress().partials;
-    assert_eq!(seen, 3);
+    assert_eq!(fx.win.load.progress().partials, 3);
 }
 
 /// `SOPEN_AUTOSAVE` has no window to show a wait in and nobody to end it: a stream that fails
 /// ends the run with the stream's words, instead of waiting for a connection that may never
 /// come back.
 #[test]
-fn a_run_without_a_window_fails_on_a_lost_connection_instead_of_waiting() {
+fn a_run_without_a_window_fails_on_a_failed_stream_instead_of_waiting() {
     let file = png(1200, 900, false);
     let mut fx = fx(file);
     // The window's own loader is not what is tested: it is stopped.
     fx.win.stop();
     fx.until("the window's loader ends", |fx| fx.workers_ended());
-    // The read's second request finds the channel closed.
-    fx.control.fault(fx.requests() + 1, Fault::Lost);
+    // The read's second request is answered with an error.
+    let faulted = fx.requests() + 1;
+    fx.control
+        .fault(faulted, Fault::Status("the disk is on fire"));
     let (tx, rx) = mpsc::channel();
     let source = fx.source.clone();
     std::thread::spawn(move || {
@@ -1634,27 +1814,42 @@ fn a_run_without_a_window_fails_on_a_lost_connection_instead_of_waiting() {
         }
     };
     let why = done.expect_err("the read failed");
-    assert!(!why.is_empty() && why != "cancelled", "{why}");
+    assert!(fx.requests() > faulted, "the faulted request was sent");
+    assert!(why.contains("the disk is on fire"), "{why}");
 }
 
 /// A decode nobody is asked about keeps the image crate's own allocation limit, as before:
-/// only the asking path — the one with the memory line and Continue — lifts it.
+/// only the asking path — the one with the memory line and Continue — lifts it. The TIFF
+/// decoder is the one that holds its buffer to that limit; here the limit is a small one, and
+/// a small TIFF crosses it (the real one is 512 MiB, and a 14000² page).
 #[test]
 fn only_a_decode_that_asks_lifts_the_crates_limit() {
-    let bytes = png(40, 30, false);
+    // The budget is the crate's own default: what `decode` and `decode_checked` are held to.
+    assert_eq!(image::Limits::default().max_alloc, Some(probe::BUDGET));
+    let mut tiff = Vec::new();
+    busy(1200, 1200)
+        .write_to(&mut Cursor::new(&mut tiff), ImageFormat::Tiff)
+        .unwrap();
+    // A limit the page is over, with room for what the decoder reads a strip into.
+    let (need, limit) = (1200 * 1200 * 3, 2 << 20);
+    let free = || Ok(());
+    // Nobody asked (`Doc::decode`, `Doc::decode_checked`): refused at the limit.
+    let unasked = Doc::decode_from(&tiff, &free, None, limit)
+        .map(|doc| doc.size())
+        .expect_err("over the limit");
+    assert!(
+        format!("{unasked:#}").contains("Memory limit exceeded"),
+        "{unasked:#}"
+    );
+    // Asked and allowed: decoded.
     let asked = std::cell::Cell::new(0);
-    Doc::decode_asking(&bytes, &|| Ok(()), &|need, _| {
+    let allow = |need: u64, _: (u32, u32)| {
         asked.set(need);
         Ok(())
-    })
-    .unwrap();
-    assert_eq!(asked.get(), 40 * 30 * 3);
-    // `decode` and `decode_checked` ask nothing.
-    assert_eq!(Doc::decode(&bytes).unwrap().size(), (40, 30));
-    let checks = std::cell::Cell::new(0);
-    let doc = Doc::decode_checked(&bytes, &|| {
-        checks.set(checks.get() + 1);
-        Ok(())
-    });
-    assert!(doc.is_ok() && checks.get() > 1);
+    };
+    let doc = Doc::decode_from(&tiff, &free, Some(&allow), limit).unwrap();
+    assert_eq!((doc.size(), asked.get()), ((1200, 1200), need));
+    // Within the limit nothing changes either way.
+    assert!(Doc::decode_from(&tiff, &free, None, 2 * need).is_ok());
+    assert!(Doc::decode(&tiff).is_ok() && Doc::decode_checked(&tiff, &free).is_ok());
 }

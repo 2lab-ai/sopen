@@ -3,6 +3,12 @@
 //! picture it makes of a file's first bytes (06 §7.3) get every truncation of each fixture and
 //! every single-byte flip of its first 256 bytes, and must return — Ok or Err — quickly. A
 //! header never promises less memory than the decode then takes.
+//!
+//! Which cases reach the picture of the first bytes: every one whose header read gives a
+//! header. A frame of up to 1 MiB decoded gets three pictures (of a quarter, a half and all of
+//! its bytes); a larger one — a flipped size byte makes a frame of 65 000 rows — gets one, of
+//! the shortest cut, up to 64 MiB decoded, and its case is allowed the time a decode of that
+//! size costs on top of the limit. Above 64 MiB only the header is read.
 
 use super::probe::{self, Head, Probe};
 use super::stream_tests::{baseline, exif, png as raw_png, progressive, with_segments};
@@ -136,22 +142,28 @@ fn one(bytes: &[u8], format: ImageFormat) -> Result<(), String> {
         let decoded = Doc::decode(bytes);
         header_case(bytes, decoded.as_ref().ok())
     }));
-    match result {
+    let more = match result {
         Err(_) => return Err("panicked".to_string()),
         Ok(Err(why)) => return Err(why),
-        Ok(Ok(())) => {}
-    }
+        Ok(Ok(more)) => more,
+    };
     let took = started.elapsed();
-    if took > CASE_LIMIT {
+    if took > CASE_LIMIT + more {
         return Err(format!("took {took:?}"));
     }
     Ok(())
 }
 
-/// The header read and the picture of the first bytes on one malformed input. Where the header
+/// A frame up to this size decoded gets every picture of the first bytes.
+const SMALL_FRAME: u64 = 1 << 20;
+/// A frame up to this size decoded gets one, of its shortest cut.
+const LARGE_FRAME: u64 = 64 << 20;
+
+/// The header read and the picture of the first bytes on one malformed input; the time a
+/// large frame's picture is allowed on top of the case limit. Where the header
 /// read gives a header and the file does decode, the header told the truth: the size shown,
 /// and at least the memory the decode took.
-fn header_case(bytes: &[u8], decoded: Option<&Doc>) -> Result<(), String> {
+fn header_case(bytes: &[u8], decoded: Option<&Doc>) -> Result<Duration, String> {
     // Capped as a streamed open caps it, and whole.
     let capped = {
         let mut head = Head::new(bytes.len() as u64, probe::BLOCK, |off, buf: &mut [u8]| {
@@ -166,20 +178,30 @@ fn header_case(bytes: &[u8], decoded: Option<&Doc>) -> Result<(), String> {
         return Err("the header read failed on a read that did not".to_string());
     }
     let Ok(Probe::Header(header)) = probe::probe(&mut Head::of(bytes)) else {
-        return Ok(());
+        return Ok(Duration::ZERO);
     };
-    // A flipped size byte makes a frame of 65 000 rows: decoding that costs what its size
-    // costs, three times over here, and is not what the limit is for. The pictures are made
-    // of frames up to a megabyte.
     let cuts = [bytes.len() / 4, bytes.len() / 2, bytes.len()];
-    for cut in cuts.into_iter().filter(|_| header.need <= 1 << 20) {
-        if let Some(picture) = probe::partial(Cursor::new(&bytes[..cut]), &header, 64) {
+    let cuts = if header.need <= SMALL_FRAME {
+        &cuts[..]
+    } else if header.need <= LARGE_FRAME {
+        &cuts[..1]
+    } else {
+        &[]
+    };
+    for cut in cuts {
+        if let Some(picture) = probe::partial(Cursor::new(&bytes[..*cut]), &header, 64) {
             if picture.width() > 64 || picture.height() > 64 {
                 return Err(format!(
                     "a picture of {:?} for a side of 64",
                     picture.dimensions()
                 ));
             }
+        }
+    }
+    // What a thumbnail is held as is bounded, whatever its own header claims.
+    if let Some(thumb) = &header.thumb {
+        if thumb.as_raw().len() as u64 > probe::THUMB_RGBA {
+            return Err(format!("a thumbnail of {:?}", thumb.dimensions()));
         }
     }
     if let Some(doc) = decoded {
@@ -193,7 +215,9 @@ fn header_case(bytes: &[u8], decoded: Option<&Doc>) -> Result<(), String> {
             ));
         }
     }
-    Ok(())
+    // A large frame's one picture costs what its size costs: time on top of the limit.
+    let megabytes = header.need.min(LARGE_FRAME) >> 20;
+    Ok(Duration::from_millis(500 * megabytes))
 }
 
 /// The intact fixture, every truncation and every flip of the first 256 bytes — all of it on
@@ -280,10 +304,10 @@ fn header_sweep(name: &'static str, bytes: Vec<u8>, flips: usize, cuts: usize) {
             match catch_unwind(AssertUnwindSafe(|| header_case(bytes, None))) {
                 Err(_) => failures.push(format!("{what}: panicked")),
                 Ok(Err(why)) => failures.push(format!("{what}: {why}")),
-                Ok(Ok(())) if started.elapsed() > CASE_LIMIT => {
+                Ok(Ok(more)) if started.elapsed() > CASE_LIMIT + more => {
                     failures.push(format!("{what}: took {:?}", started.elapsed()))
                 }
-                Ok(Ok(())) => {}
+                Ok(Ok(_)) => {}
             }
         };
         case("intact".into(), &bytes);
@@ -351,6 +375,9 @@ fn a_hostile_exif_gives_no_thumbnail_and_costs_nothing() {
                     "the frame stays right"
                 );
                 assert!(reserved <= 1 << 20, "{reserved} reserved for a thumbnail");
+                if let Some(thumb) = &header.thumb {
+                    assert!(thumb.as_raw().len() as u64 <= probe::THUMB_RGBA);
+                }
                 header.thumb.map(|t| t.dimensions())
             }
             (other, _) => panic!("{other:?}"),
@@ -384,13 +411,21 @@ fn a_hostile_exif_gives_no_thumbnail_and_costs_nothing() {
     ] {
         assert_eq!(thumb_of(bad), None, "{what}");
     }
-    // A thumbnail that says it is 8000×8000 — 192 MB, were it decoded — over a real one's
-    // data: its own frame is read first, and a frame that large is no thumbnail.
+    // A thumbnail's own frame is read first, and one that would be held as more than 1 MiB
+    // of RGBA is no thumbnail: at the boundary, 512×512 is shown and 513×512 is not — and a
+    // tall narrow one (the frame a flipped size byte makes) is not decoded either.
     let real = baseline(32, 24);
     let frame = real.windows(2).position(|w| w == [0xFF, 0xC0]).unwrap();
-    let mut liar = real.clone();
-    liar[frame + 5..frame + 9].copy_from_slice(&[0x1F, 0x40, 0x1F, 0x40]);
-    assert_eq!(thumb_of(exif(&liar, 1, 2000)), None);
+    let claiming = |w: u16, h: u16| {
+        let mut liar = real.clone();
+        liar[frame + 5..frame + 7].copy_from_slice(&h.to_be_bytes());
+        liar[frame + 7..frame + 9].copy_from_slice(&w.to_be_bytes());
+        exif(&liar, 1, 2000)
+    };
+    assert_eq!(thumb_of(claiming(512, 512)), Some((512, 512)));
+    assert_eq!(thumb_of(claiming(513, 512)), None);
+    assert_eq!(thumb_of(claiming(32, 65_304)), None);
+    assert_eq!(thumb_of(claiming(8000, 8000)), None);
     // An Exif in the thumbnail, with a thumbnail of its own, and so on down: the frame is
     // found and nothing nested is decoded.
     let mut nested = baseline(8, 8);

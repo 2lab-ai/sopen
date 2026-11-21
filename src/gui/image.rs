@@ -378,7 +378,7 @@ impl Doc {
     /// [`Doc::decode`], asking `check` before every read of the decoder and after the decode:
     /// its error stops the decode and is the error returned (a cancel, a preview's deadline).
     pub fn decode_checked(bytes: &[u8], check: &dyn Fn() -> Result<()>) -> Result<Self> {
-        let decoded = Self::decode_from(bytes, check, None);
+        let decoded = Self::decode_from(bytes, check, None, probe::BUDGET);
         // A decode cut short by `check` fails with an I/O error: `check`'s own is the reason.
         check()?;
         decoded
@@ -392,16 +392,20 @@ impl Doc {
         check: &dyn Fn() -> Result<()>,
         allow: Allow,
     ) -> Result<Self> {
-        let decoded = Self::decode_from(bytes, check, Some(allow));
+        let decoded = Self::decode_from(bytes, check, Some(allow), probe::BUDGET);
         // As in `decode_checked`.
         check()?;
         decoded
     }
 
+    /// `limit`: the image crate's allocation limit for this decode — its own default, 512 MiB
+    /// ([`probe::BUDGET`]), everywhere but in tests. A decode `allow` let through is not held
+    /// to it; one nobody was asked about is.
     fn decode_from(
         bytes: &[u8],
         check: &dyn Fn() -> Result<()>,
         allow: Option<Allow>,
+        limit: u64,
     ) -> Result<Self> {
         #[cfg(test)]
         DECODES.with(|n| n.set(n.get() + 1));
@@ -409,7 +413,7 @@ impl Doc {
             inner: Cursor::new(bytes),
             check,
         };
-        let reader = ImageReader::new(checked)
+        let mut reader = ImageReader::new(checked)
             .with_guessed_format()
             .context("cannot read the image")?;
         let format = reader
@@ -418,6 +422,9 @@ impl Doc {
         if !probe::supported(format) {
             bail!("{format:?} images are not supported");
         }
+        let mut limits = image::Limits::default();
+        limits.max_alloc = Some(limit);
+        reader.limits(limits.clone());
         let mut decoder = reader.into_decoder().context("cannot decode the image")?;
         let mut lost = Vec::new();
         let icc = decoder.icc_profile().unwrap_or_else(|e| {
@@ -434,14 +441,13 @@ impl Doc {
         if let Some(allow) = allow {
             let need = decoder.total_bytes();
             allow(need, decoder.dimensions())?;
-            if need > probe::BUDGET {
+            if need > limit {
                 // Continued (06 §7.3): the image crate's own allocation limit — 512 MiB, which
                 // the TIFF decoder holds its buffers to ("Memory limit exceeded" on a 14000²
                 // page) — would refuse what was just allowed. It becomes the decode and that
                 // much again for what a decoder needs beside it. A decode nobody was asked
                 // about keeps the crate's limit, as before.
-                let mut limits = image::Limits::default();
-                limits.max_alloc = Some(need.saturating_add(probe::BUDGET));
+                limits.max_alloc = Some(need.saturating_add(limit));
                 decoder
                     .set_limits(limits)
                     .context("cannot decode the image")?;
@@ -2391,6 +2397,9 @@ struct Progress {
     /// Tests: the largest buffer asked of the allocator for this image (its bytes, a decode).
     #[cfg(test)]
     reserved: u64,
+    /// Tests: the buffer the file is read into, while anything holds it.
+    #[cfg(test)]
+    buffer: std::sync::Weak<RwLock<Vec<u8>>>,
 }
 
 /// What the loading window and its workers share.
@@ -2480,7 +2489,9 @@ impl Load {
     /// Continue: the loader goes on.
     fn go(&self) {
         let mut progress = self.progress();
-        if let Some(probe::Ask::Decode { need, .. }) = progress.ask.take() {
+        if let Some(probe::Ask::Decode { need, .. } | probe::Ask::Both { need, .. }) =
+            progress.ask.take()
+        {
             progress.allowed = progress.allowed.max(need);
         }
         drop(progress);
@@ -2583,17 +2594,17 @@ fn load_input(input: Input, load: &Arc<Load>) -> Result<Loaded> {
         progress.header = header.clone();
     }
     load.wake();
-    // Before any pixel data: what the decode will hold, or — nothing known of the picture, or
-    // the file itself this large — what reading it will.
-    let asked = header
-        .as_ref()
-        .and_then(|h| probe::ask_decode(h.need, h.upright(), load.budget))
-        .or_else(|| probe::ask_read(size, load.budget));
-    if let Some(ask) = asked {
+    // Before any pixel data: what going on will hold in memory.
+    let decode = header.as_ref().map(|h| (h.need, h.upright()));
+    if let Some(ask) = probe::ask_open(size, decode, load.budget) {
         load.ask(ask)?;
     }
     let len = usize::try_from(size).context("the file is larger than this machine can address")?;
     let bytes = Arc::new(RwLock::new(Vec::<u8>::new()));
+    #[cfg(test)]
+    {
+        load.progress().buffer = Arc::downgrade(&bytes);
+    }
     {
         let mut buf = bytes.write().unwrap_or_else(|p| p.into_inner());
         #[cfg(test)]
@@ -2711,6 +2722,10 @@ fn sketch(header: &probe::Header, at: u64, bytes: &Arc<RwLock<Vec<u8>>>, load: &
             while load.hold_sketch.load(Ordering::SeqCst) && load.stopped().is_ok() {
                 std::thread::sleep(Duration::from_millis(1));
             }
+            // Stopped (Esc, the window closing): no picture is started, and none is shown.
+            if load.stopped().is_err() {
+                return;
+            }
             let prefix = Arrived {
                 bytes,
                 end: at,
@@ -2719,7 +2734,7 @@ fn sketch(header: &probe::Header, at: u64, bytes: &Arc<RwLock<Vec<u8>>>, load: &
             let picture = probe::partial(prefix, &header, PREVIEW_SIDE);
             #[cfg(test)]
             load.note_reserved(probe::largest_reserved());
-            if let Some(picture) = picture {
+            if let Some(picture) = picture.filter(|_| load.stopped().is_ok()) {
                 let mut progress = load.progress();
                 progress.sketch = Some((Sketch::Partial { at }, Arc::new(picture)));
                 progress.partials += 1;
