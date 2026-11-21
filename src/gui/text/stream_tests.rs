@@ -2171,17 +2171,21 @@ fn dropping_the_viewer_ends_its_highlighter_waiting_for_a_block() {
                 rows(w).last().map(String::as_str) == Some("}")
             });
             let worker = win.worker.as_ref().expect("the highlighter");
-            let (exited, parsed) = (worker.exited.clone(), worker.parsed.clone());
+            let exited = worker.exited.clone();
+            // The handshake: only the highlighter reads with the blocking `read_at`, and the
+            // Source counts each time such a read's wait runs out with its block still missing.
+            // Two more of those, with waits of 10 ms: a read of its is blocked right now.
+            net.source.probe().wait = Some(Duration::from_millis(10));
+            let waits = net.source.probe().timed_out;
             let started = Instant::now();
-            loop {
-                // Blocked: something of its is out, and it parses no further.
-                let before = parsed.load(Ordering::Relaxed);
-                std::thread::sleep(Duration::from_millis(100));
-                if net.out() > 0 && parsed.load(Ordering::Relaxed) == before {
-                    break;
-                }
-                assert!(started.elapsed() < HANG, "the highlighter never waited");
+            while net.source.probe().timed_out < waits + 2 {
+                assert!(
+                    started.elapsed() < HANG,
+                    "the highlighter never reached a blocking read"
+                );
+                std::thread::sleep(Duration::from_millis(5));
             }
+            assert!(net.out() > 0, "its block is asked for, and not answered");
             assert!(!exited.load(Ordering::Relaxed), "it stopped by itself");
             assert_eq!(pool.live(), 1);
             assert!(!win.ready(), "the page is not highlighted yet");
@@ -2227,6 +2231,67 @@ fn a_reload_inside_a_long_wrapped_line_comes_back_to_its_rows() {
             });
             assert_eq!((win.top, win.top_off as usize), (top, off));
             assert_eq!(rows(&win), before);
+        },
+    );
+}
+
+/// 06 §5: after a reload that could not re-open the file, a plain key — not Cmd/Ctrl+R —
+/// retries the failed stream, and what the path holds now is shown.
+#[test]
+fn a_plain_key_retries_after_a_failed_reload_and_shows_the_replacement() {
+    bounded(
+        "a_plain_key_retries_after_a_failed_reload_and_shows_the_replacement",
+        || {
+            let body = numbered(12_000);
+            let mut net = net(body.as_bytes(), gate());
+            let mut win = net.window("big.log");
+            let mut drv = Driver::new(800.0, 500.0);
+            run(&mut drv, &mut win, &mut net, "the index", |w, _| {
+                w.doc.whole() && w.ready()
+            });
+            let before = rows(&win);
+            net.control.change(Change::Remove);
+            drv.key(&mut win, Key::R, command(false));
+            run(&mut drv, &mut win, &mut net, "the failed reload", |w, _| {
+                w.stream_down() && !w.reloading
+            });
+            drv.idle(&mut win, 2);
+            assert_eq!(rows(&win), before, "the page stays");
+            assert!(
+                says(&drv, "no such file or directory"),
+                "{:?}",
+                painted(&drv)
+            );
+            // The file is back, with another first line. No pass retries by itself.
+            let mut now = body.clone();
+            now.replace_range(0..4, "LINE");
+            net.control
+                .change(Change::Replace(FakeFile::bytes(now.clone().into_bytes())));
+            net.advance(Duration::from_secs(2));
+            for _ in 0..3 {
+                drv.idle(&mut win, 1);
+                net.settle();
+            }
+            assert!(win.stream_down(), "a pass retried by itself");
+            assert_eq!(rows(&win), before);
+            // A plain key.
+            drv.key(&mut win, Key::ArrowDown, Modifiers::NONE);
+            run(&mut drv, &mut win, &mut net, "the retry", |w, _| {
+                w.doc.whole() && w.ready() && !w.stream_down() && rows(w) != before
+            });
+            drv.idle(&mut win, 1);
+            assert_eq!(net.source.state(), Streamed::Live);
+            let visible = win.visible as usize;
+            assert_eq!(
+                rows(&win),
+                lines_of(&now)[1..=visible],
+                "the replacement, a row down"
+            );
+            assert!(
+                !says(&drv, "no such file or directory"),
+                "{:?}",
+                painted(&drv)
+            );
         },
     );
 }
