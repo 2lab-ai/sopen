@@ -1090,6 +1090,19 @@ impl SftpRemote {
 
     /// [`SftpRemote::local_server`], with the session's bytes passing through `proxy`.
     pub(crate) fn local_server_with(proxy: Option<Proxy>) -> Option<Self> {
+        Self::local_server_run(proxy, &[], None)
+    }
+
+    /// [`SftpRemote::local_server`] with `args` for the server (`-P copy-data` to refuse a
+    /// request) and, with `log`, its log (`-e -l INFO`: one line per request, as OpenSSH words
+    /// it) written to that file — the request log 04 §8 checks for `posix-rename`.
+    pub(crate) fn local_server_args(args: &[&str], log: Option<&Path>) -> Option<Self> {
+        Self::local_server_run(None, args, log)
+    }
+
+    /// The one way a test's server is started: see [`SftpRemote::local_server`],
+    /// [`SftpRemote::local_server_with`] and [`SftpRemote::local_server_args`].
+    fn local_server_run(proxy: Option<Proxy>, args: &[&str], log: Option<&Path>) -> Option<Self> {
         // `SOPEN_TEST_HIDE_SFTP_SERVER` makes the server look absent: the receipt that every test
         // needing it fails under `SOPEN_REQUIRE_SFTP_SERVER`, rather than passing as a skip.
         let hidden = std::env::var_os("SOPEN_TEST_HIDE_SFTP_SERVER").is_some();
@@ -1108,13 +1121,20 @@ impl SftpRemote {
             .enable_all()
             .build()
             .unwrap();
-        let spawn = |server: &str| {
-            tokio::process::Command::new(server)
-                .stdin(Stdio::piped())
+        let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+        let log = log.map(Path::to_path_buf);
+        let spawn = move |server: &str| {
+            let mut cmd = tokio::process::Command::new(server);
+            cmd.stdin(Stdio::piped())
                 .stdout(Stdio::piped())
-                .kill_on_drop(true)
-                .spawn()
-                .unwrap()
+                .kill_on_drop(true);
+            if let Some(log) = &log {
+                cmd.args(["-e", "-l", "INFO"])
+                    .stderr(Stdio::from(std::fs::File::create(log).unwrap()));
+            }
+            // After the log's: a test's own `-l DEBUG1` wins.
+            cmd.args(&args);
+            cmd.spawn().unwrap()
         };
         let writes = Arc::new(Writes::default());
         let sftp = match proxy {

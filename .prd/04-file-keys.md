@@ -119,7 +119,41 @@ contexts where it acts (list, viewer, git panel, tree, a dialog) and its `Comman
   A name in the way stops that item and asks (§5.2).
 - **Asked first**, the conventional way: every operation opens its dialog; Enter goes, Esc cancels.
 - **Nothing half-made under a final name.** A copied file is complete before it gets its name (§5.6);
-  a server that cannot publish that way is refused for copy and move, with the reason.
+  a server that cannot publish that way is refused for copy and move, with the reason. A local volume
+  that can publish nothing atomically — neither an exclusive rename nor links (exFAT; sopen probes
+  each target folder once) — gets the copy written straight into its final name, created
+  exclusively (still never replacing), and the report says so. There a partial file is left under
+  the final name only when sopen is interrupted (killed, a power cut); a copy that sopen stops (Esc)
+  or sees fail is removed while that name is still the file it wrote (its inode, by its
+  descriptor), and otherwise left and named; a move keeps its source until the copy is read back
+  and made durable. **After a kill, that partial file is unmarked**: it sits under the final name
+  with no `.sopen-` mark (unlike a staged temp), so the next operation counts it as a name in the
+  way and asks Skip / Rename like for any other file; nothing in the listing says it is partial —
+  a size or content that looks wrong is the only sign.
+- **Names sopen puts aside**, in the target folder (the name part shortened to keep within 255
+  bytes); one left by a sopen that was killed (`kill -9`, a power cut) stays under it:
+  - `.<name>.sopen-<16 hex>` — a copy being staged: never taken for a copy; removing it is safe.
+  - `.<name>.sopen-renaming-<16 hex>` — the middle name of a two-step rename (§5.3): it holds the
+    **original**; rename it back to its name, never remove it.
+  - `.sopen-probe-<16 hex>` — sopen's publish probe (an empty file); removing it is safe. sopen
+    removes its own only while they are still its own, and names any it leaves.
+- **Durable before a source goes**: each copied file is flushed through its own descriptor (`fsync`).
+  A moved item is copied and read back (§5.2) and its sources then wait, with those of the items
+  before it, in a **batch** — instead of one barrier per item, which made 500 selected small files
+  cost 10.8 ms each (5.4 s against 0.13 s for `mv`). The batch's barrier flushes every target
+  folder that received an entry, deepest first (`fsync` of the folder: a file's own `fsync` does not
+  make its new name durable), then on macOS the drive (one `F_FULLFSYNC`; a plain `fsync` only where
+  the volume says it does not support it), and only then are the batch's sources removed. A batch
+  is flushed at 64 items; 1 s after its first item (looked at between items and between a folder's
+  entries — one large file delays it); before any name-in-the-way question (no checked item waits
+  on an answer with both copies in place); on Esc (the barrier first, then the sources of the items
+  already checked go, and nothing new starts); and at the end, where one more barrier over
+  everything the operation wrote runs after the last removal. A kill at any moment therefore finds
+  each moved item either still whole at its source or copied, read back and durable. **A folder
+  `fsync` that is refused is not durability, whatever the error** (`EINVAL`, `ENOTSUP` and
+  `EOPNOTSUPP` included): the barrier fails, the batch's sources stay, and the report says the copy
+  exists but this filesystem cannot confirm it is on disk. A copy has no source to keep: its end
+  barrier's failure is a note.
 - **One connection of its own** per operation (`Connect`, as each viewer has), so the panel's
   listing goes on meanwhile.
 - **Progress and stopping**: an operation on more than one item, or on a file over 8 MiB, shows
@@ -138,10 +172,41 @@ contexts where it acts (list, viewer, git panel, tree, a dialog) and its `Comman
   sockets and devices are skipped and listed.
 - **A source that changes during its copy** (size or mtime differs after the read) fails that item,
   named; its partial copy is removed.
-- **Before removing a source** (Move), sopen checks it again: same type, size and mtime as when it was
-  read, and locally the same device and inode. Anything else keeps the source and reports both
-  copies. Over SFTP there is no inode and mtime has whole seconds, so a writer that rewrites a file
-  to the same size within the same second is not seen; this is the same best-effort limit as 01 §5's.
+- **Before removing a source** (Move), sopen checks it again: same type, size and mtime as when it
+  was read, and locally the same device and inode. A freed inode's number can be given to the next
+  file at once (ext4 does), so a number alone proves nothing: **the source's descriptor is held open
+  from the moment it was read until its removal** — on the entry itself, never what a link points at
+  (`O_PATH|O_NOFOLLOW` on Linux; a read-only `O_NOFOLLOW|O_NONBLOCK` open, `O_SYMLINK` for a link,
+  on macOS) — and the name is compared with `fstat` of that descriptor. The descriptor is taken only
+  of the entry whose identity was read, in full (device, inode and ctime, compared when the name is
+  looked at again and once more on the opened descriptor): an entry put under the name in between,
+  on the same inode number or not, is not held as if it were the one read, and the source is then
+  kept with "another file has its name now". Only a regular file or a link is ever opened for this:
+  opening a device, a fifo or a socket can have effects of its own. An operation holds at most 64
+  such descriptors at once — a bound on what it holds itself, not a promise that the process never
+  runs out of descriptors. Past that, or where none can be had (too many open files, an entry the
+  account cannot open, another type of entry), the device, inode and status-change time (ctime) are
+  compared instead. That comparison is best effort — as fine as the filesystem's timestamps and as
+  true as its clock — and errs to keeping: unlinking one hard link of a file changes the ctime of
+  the others, so a hard-linked sibling is then kept with both copies said to exist — never lost.
+  **The copy is looked at again too.** What it is known by is noted **before its read-back
+  begins** — its type, size and mtime, and locally the device, inode and ctime its own descriptor
+  reports (best effort: bytes written into it without changing its size, within one tick of the
+  filesystem's clock — or over SFTP within the same second — are not seen) — and never renewed: the name must carry exactly that when the read-back and the
+  source's check are over (else "its copy at <path> changed while it was checked; the source
+  stays") and again right before its source goes (a batch puts that as much as 1 s later). A link
+  that was made is the copy only while it is a symlink with the text that was copied; a file put in
+  its place keeps the source. A copy that is gone or replaced keeps
+  its source: "its copy at <path> changed before the source was removed; the source stays". The
+  same holds for a
+  copy's own temp (the descriptor it was written through stays open through the read-back and any
+  cleanup) and for the old name of a link-and-unlink rename (§5.6). What is compared is what the
+  descriptor reports at that moment, never a number noted earlier: on FAT and exFAT an empty file's
+  inode number changes with its name (*verified, macOS, 2026-11-20*: `fstat` of the descriptor
+  followed the file through a rename; a file with data kept its number). Anything else keeps the
+  source and reports both copies. Over SFTP there is no inode and mtime has whole seconds, so a
+  writer that rewrites a file to the same size within the same second is not seen; this is the same
+  best-effort limit as 01 §5's.
 - **Metadata**: a copy keeps the file's permission bits and times, and a folder's bits and times are
   set after its contents (so a read-only folder can still be filled). A failure to set metadata is a
   note in the report, not a failure of the copy; a read-only target folder fails the item with the
@@ -163,19 +228,36 @@ contexts where it acts (list, viewer, git panel, tree, a dialog) and its `Comman
   itself or below itself is refused before anything happens.
 - **Is the target the source, or inside it?** Decided on resolved paths (`realpath` of both), and
   locally also by device and inode of the target and its ancestors, so a link or an alias cannot lead
-  a folder into itself. Refused before anything happens.
+  a folder into itself. Refused before anything happens. Over two connections (another host's path,
+  or two sessions to one machine) it is refused when the resolved paths nest and both report one
+  filesystem id (`statvfs`), or either reports none: sopen cannot tell whether both sides are the
+  same machine, so the dialog asks for a folder outside the source (one id on two machines can only
+  refuse a safe copy, never let one through). A folder is also walked before anything is made, so a
+  copy never copies what it made itself.
 - **Is a name taken?** Decided by the filesystem — an exclusive create or a link failing with "exists"
   — never by comparing strings: two names that look different may be one entry (case-insensitive or
   Unicode-normalising filesystems) and two that look alike may be two.
 - **Move** is a rename where one is possible (same host and filesystem, §5.6) — for a remote folder
   on the same host only from slice S6; before S6, F6 of a remote folder moves it by copy, check and
-  remove, with the rules below. Otherwise it is a copy, then a check (each file's size and SHA-256 of the bytes read against the bytes written),
-  then the removal of the source. **No source is removed before its whole item is copied and
-  checked**: for a selected folder, every file below it first, then the source removed bottom-up.
+  remove, with the rules below. Otherwise it is a copy, then a check, then the removal of the source.
+  **The check reads the published copy back from the target**, in full, on every path and at any
+  size, and compares its SHA-256 with that of the bytes read from the source (where the host copied
+  them itself — `copy-data`, `copy_file_range` — the source is read again); a remote target so costs
+  a move a second transfer, accepted for data safety: a **remote folder** moved by copy (every
+  remote folder until S6) downloads the source as well as the copy, about twice its size, where
+  `copy-data` alone moved nothing through this machine. A copy that differs goes and its source stays;
+  Esc while checking stops with both copies there. **No source is removed before its whole item is
+  copied and checked**: for a selected folder, every file below it first, then the source removed
+  bottom-up.
   A stop or a failure during the copy removes no source at all (committed copies stay and the report
-  says the target folder is partial); a stop during the removal leaves what was not removed yet, both
-  copies listed. A source that cannot be removed after its copy stays, and the report says both
-  copies exist.
+  says the target folder is partial). **Esc and the batch**: Esc flushes the batch — its barrier
+  runs, and then the removals of that flushed batch run to their end; **Esc during those removals
+  does not stop them**, because every item in the batch was already copied, read back and made
+  durable by that barrier (each source and each copy is still checked again right before the
+  removal, and a folder's sources go bottom-up). **An item that is not in a flushed batch keeps its
+  source**: the one Esc interrupted (its copy, if published, is reported with both copies in place)
+  and every item not reached. A source that cannot be removed after its copy stays, and the report
+  says both copies exist.
 
 ### 5.3 Rename (F2, Shift+F6)
 
@@ -188,9 +270,10 @@ contexts where it acts (list, viewer, git panel, tree, a dialog) and its `Comman
   and both spellings stat to one inode, *verified, APFS*). Remotely attributes prove nothing; the proof
   is the folder's listing: only when a fresh listing holds the source's spelling and no entry spelled
   like the new name is the "exists" taken to be the source itself; otherwise it is another entry and an
-  error. sopen then renames in two steps through a free temp name in the same folder, each step never
+  error. sopen then renames in two steps through a free name in the same folder (`.<name>.sopen-renaming-<16 hex>`, §5.1), each step never
   replacing. **When the second step fails**, sopen renames the temp back to the original name, again
-  never replacing; when that fails too, the report names the exact path the file now has.
+  never replacing; when that fails too, the report names the exact path the file now has (or, when
+  a step got no answer it could confirm, the two paths it may have).
 - **Remote folders**: renaming one needs SFTP's plain rename, which the library sopen uses cannot send
   today (§5.6); until slice S6 (02 §8) brings it, F2 on a remote folder says so and does nothing.
 
@@ -218,9 +301,9 @@ contexts where it acts (list, viewer, git panel, tree, a dialog) and its `Comman
 
 | Operation | Remote (SFTP over the window's ssh master) | Local |
 |---|---|---|
-| rename, move within a filesystem: a file | **`hardlink@openssh.com` to the new name, then `REMOVE` of the old** (both already used by sopen's writes): the link fails when the name exists, so nothing is replaced; a stop between the two leaves both names on the same file, which the report says. On Linux with `fs.protected_hardlinks=1` the link fails with a permission error for a file the account does not own; the report gives that reason (and the file stays where it was). Never `posix-rename@openssh.com` (POSIX `rename()`, which replaces; the library's `Fs::rename` prefers it whenever the server offers it) | `renameat2(RENAME_NOREPLACE)` on Linux, `renamex_np(RENAME_EXCL)` on macOS; where the filesystem refuses those, `link` + `unlink` |
+| rename, move within a filesystem: a file | **`hardlink@openssh.com` to the new name, then `REMOVE` of the old** (both already used by sopen's writes): the link fails when the name exists, so nothing is replaced; a stop between the two, or an old name that cannot be removed, leaves both names on the same file: the item fails, "both copies exist", with the reason (the same outcome as a moved copy whose source stays). The old name is checked again right before its removal; another entry found there is left. On Linux with `fs.protected_hardlinks=1` the link fails with a permission error for a file the account does not own; the report gives that reason (and the file stays where it was). Never `posix-rename@openssh.com` (POSIX `rename()`, which replaces; the library's `Fs::rename` prefers it whenever the server offers it) | `renameat2(RENAME_NOREPLACE)` on Linux, `renamex_np(RENAME_EXCL)` on macOS; where the filesystem refuses those, `link` + `unlink` through the old name's folder (the old entry's descriptor held open meanwhile and compared with `fstat` before the unlink: its inode cannot be reused; an entry found changed when that descriptor is taken — another device, inode or ctime — is not linked at all: the rename fails, nothing changed; where no descriptor can be had, the name is looked at once more before the link, and before the unlink it must be the entry the new name is — device, inode, kept alive by the new hard link, and ctime; for a link its device, inode and ctime as first read); with neither (exFAT), no rename: a move copies, checks and removes |
 | rename, move within a filesystem: a folder | **plain `SSH_FXP_RENAME`**, which draft-ietf-secsh-filexfer-02 §6.5 makes an error when the new name exists and OpenSSH's server refuses so (*verified, OpenSSH's `sftp-server`, 2026-11-20*: a plain rename onto an existing file failed and left both; the posix-rename extension replaced it). The library keeps the plain request private, so slice S6 sends it on a second, low-level channel (`openssh-sftp-client-lowlevel`'s rename request; its experiment E2 decides between that and an auxiliary channel without the extension). Until then: F2 on a remote folder is refused with the reason, and F6 of a remote folder moves it by copy, check and remove (§5.2) | as for a file |
-| copy within one host | `copy-data` extension, in 8 MiB chunks, into a temp `.<name>.sopen-<random>` created `CREAT\|EXCL` in the target folder, then mode and times set through the handle, then published by `hardlink@openssh.com` (fails if the name exists) and the temp removed. Without `copy-data`: read and write through this machine, same publish. **Without `hardlink@`** (not a recent OpenSSH server): copy and move are refused until S6, whose plain rename then publishes the temp instead — never a write straight into the final name | temp file created exclusively, `copy_file_range` / `clonefile` where available, published by `link` (fails if the name exists) |
+| copy within one host | `copy-data` extension, in 8 MiB chunks, into a temp `.<name>.sopen-<random>` created `CREAT\|EXCL` in the target folder, then mode and times set through the handle, then published by `hardlink@openssh.com` (fails if the name exists) and the temp removed. Without `copy-data`: read and write through this machine, same publish. **Without `hardlink@`** (not a recent OpenSSH server): copy and move are refused until S6, whose plain rename then publishes the temp instead — never a write straight into the final name | temp file created exclusively (`O_CREAT\|O_EXCL\|O_NOFOLLOW`) and filled, given its mode and times and flushed through that descriptor — `copy_file_range` where available (Linux), else read and write; never `clonefile` (a clone is made by name, and another process of the account can put an unrelated file at that name before it is opened) — published by the exclusive rename, else `link` (fails if the name exists); on a volume with neither (exFAT), written in place (§5.1) |
 | copy between hosts, or between this machine and a host | streamed through this machine (fetch side as 01 §5's fetch, write side as above) | the same, one side local |
 | make folder | `MKDIR` (fails if it exists) | `mkdir` |
 | delete | `REMOVE`, `RMDIR`, bottom-up | Trash (§5.5), else `unlink` / `rmdir` bottom-up |
