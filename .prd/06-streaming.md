@@ -862,16 +862,24 @@ Left as whole fetches, with the fetch now pipelined (§2):
       begun, but a run refused an input must not pass.
   - A connection closed unanswered for want of a seat or a thread counts against every kind: whose
     it was is not known.
-  - **Not counted: the client left.** A connection the client closed, a write that failed with
-    `EPIPE`, `ECONNRESET` or `ECONNABORTED` (or on a socket that reads as closed), and the server's
-    own shutdown.
+  - **Not counted: the client left.** The evidence is exactly this: a receive on the socket
+    returns 0, or the socket's error (a write's, a receive's, or the pending `SO_ERROR`) is
+    `EPIPE`, `ECONNRESET` or `ECONNABORTED`. The server's own shutdown is not counted either.
+    Every other socket error is `Failed` and counted, whoever sees it first. On macOS a socket
+    its client reset refuses a timeout option with `EINVAL`: that is the client leaving only when
+    the socket gives the evidence above.
 - **A client that leaves while its response waits for a block** (ffmpeg closes its connection at
   every seek). While a body is under way the server looks at its socket every 100 ms, the stream's
-  own cancel check: `poll` for input or a hang-up (`POLLRDHUP` too on Linux), and a socket that
-  reads 0 bytes has lost its client. The connection's cancel flag is set and the Source's blocked
-  reads are woken, so `read_at` returns, the reader and what it had queued go, and the seat is
-  free. This is not a cut. A client that half-closes its sending side counts as gone; ffmpeg does
-  not.
+  own cancel check: `poll` for input or a hang-up (`POLLRDHUP` too on Linux), then the evidence
+  above. The connection's cancel flag is set and the Source's blocked reads are woken, so `read_at`
+  returns, the reader and what it had queued go, and the seat is free. This is not a cut. A client
+  that half-closes its sending side counts as gone; ffmpeg does not.
+  - What the client sends under its response is read and dropped. Past 64 KiB of it the server ends
+    the response itself, as `Failed` and counted, and frees the seat: ffmpeg sends nothing after its
+    request, and a connection is never left unwatched.
+  - A socket that fails there for any other reason ends the response the same way, as `Failed`.
+- **A server that fails to start** stops and joins the thread it had started (the watch), so it
+  holds no Source.
 - **Deadlines.** A response is closed (`Stalled`) once its writes have waited on the client for
   **60 s** (01 §5's no-progress bound) without **64 KiB** going. The 60 s start again only when
   64 KiB have gone since they last started, so a trickle does not keep a response open. Time a read

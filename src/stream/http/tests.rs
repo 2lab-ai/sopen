@@ -1252,6 +1252,162 @@ fn a_client_that_leaves_a_waiting_response_frees_its_seat() {
             drop(stays);
             eventually("its seat is free too", || watch.open() == 0);
             assert_eq!(server.cuts(Kind::Play), 0);
+            // A client that sends on under its response — more than 64 KiB — is not read
+            // for ever and not left unwatched: the server ends the response itself, and
+            // counts it. The engine stays unstepped: the response waits for a block the
+            // whole time.
+            let far = 20 * GIB + 1000;
+            let sent = rig.trace().len();
+            let mut talks = connect(&server);
+            talks
+                .write_all(&request(
+                    &server,
+                    "GET",
+                    Kind::Play,
+                    &range(&format!("bytes={far}-")),
+                ))
+                .unwrap();
+            read_head(&mut talks);
+            eventually("the response waits for its block", || rig.waiting() == 1);
+            talks.write_all(&vec![b'x'; 80 * 1024]).unwrap();
+            // The server closes: the client reads the end, and the account has the cut.
+            assert!(read_all(&mut talks).is_empty(), "no byte of the body came");
+            assert_eq!(server.cuts(Kind::Play), 1, "counted before the close");
+            assert_eq!(
+                server.last_cut(Kind::Play).unwrap().reason,
+                CutReason::Failed("the client sent more than 65536 bytes after its request".into())
+            );
+            drop(talks);
+            eventually("its seat is free", || watch.open() == 0);
+            assert_eq!(rig.waiting(), 0, "its wait is retired");
+            // The two before it were found gone; this one the server ended.
+            assert_eq!(watch.left(), 2, "found gone, though the server ended it");
+            rig.engine.pump();
+            assert!(
+                rig.trace()[sent..]
+                    .iter()
+                    .all(|t| t.block != Some(far / BLOCK)),
+                "a read was sent for a response the server ended: {:?}",
+                &rig.trace()[sent..]
+            );
+            assert_eq!(rig.source.stats().cuts, 1);
+        },
+    );
+}
+
+/// A socket that fails under a response for a reason that is not the client leaving is a
+/// cut, whoever sees it first — here the watch, while the response waits for a block. The
+/// cut is in the account when the client sees the end.
+#[test]
+fn a_socket_fault_the_watch_sees_is_a_cut_counted_before_the_close() {
+    bounded(
+        "a_socket_fault_the_watch_sees_is_a_cut_counted_before_the_close",
+        || {
+            let slow = Link {
+                latency: Duration::from_millis(20),
+                rate: 500_000,
+                clip: None,
+                clock: Clock::Simulated,
+            };
+            for (kind, cut) in [
+                (ErrorKind::InvalidInput, true),
+                (ErrorKind::PermissionDenied, true),
+                // The disconnect errors are the client leaving.
+                (ErrorKind::ConnectionReset, false),
+                (ErrorKind::BrokenPipe, false),
+                (ErrorKind::ConnectionAborted, false),
+            ] {
+                let rig = stepped(24_000_000_000, slow);
+                let armed = Arc::new(AtomicBool::new(false));
+                let arm = armed.clone();
+                let seams = Seams {
+                    look: Some(Arc::new(move || {
+                        arm.load(Ordering::SeqCst)
+                            .then(|| std::io::Error::new(kind, "injected receive failure"))
+                    })),
+                    ..Seams::default()
+                };
+                let server =
+                    Server::start_with(rig.source.clone(), Hand::new().with(seams)).unwrap();
+                let watch = server.watch();
+                let mut client = connect(&server);
+                client
+                    .write_all(&request(
+                        &server,
+                        "GET",
+                        Kind::Render,
+                        &range("bytes=5000-"),
+                    ))
+                    .unwrap();
+                read_head(&mut client);
+                eventually("the response waits for its block", || rig.waiting() == 1);
+                armed.store(true, Ordering::SeqCst);
+                // The server lets go of the connection: the client reads the end.
+                assert!(read_all(&mut client).is_empty());
+                assert_eq!(
+                    server.cuts(Kind::Render),
+                    u64::from(cut),
+                    "{kind:?}: in the account when the client sees the end"
+                );
+                eventually("the seat is free", || watch.open() == 0);
+                assert_eq!(rig.waiting(), 0, "{kind:?}");
+                assert_eq!(rig.source.stats().cuts, u64::from(cut), "{kind:?}");
+                assert_eq!(watch.left(), u64::from(!cut), "{kind:?}");
+                match server.last_cut(Kind::Render).map(|cut| cut.reason) {
+                    Some(CutReason::Failed(why)) if cut => {
+                        assert!(why.contains("injected receive failure"), "{why}")
+                    }
+                    None if !cut => {}
+                    other => panic!("{kind:?}: {other:?}"),
+                }
+            }
+        },
+    );
+}
+
+/// A write that fails with an error that is not a disconnect, on a socket that gives no
+/// evidence of one either — its own look fails too, with another such error — is a cut.
+#[test]
+fn a_write_failure_on_a_socket_that_gives_no_evidence_is_a_cut() {
+    bounded(
+        "a_write_failure_on_a_socket_that_gives_no_evidence_is_a_cut",
+        || {
+            let size = 64 * MIB;
+            let (source, _control) = threaded(size);
+            let failing = Arc::new(AtomicBool::new(false));
+            let (fail, look) = (failing.clone(), failing.clone());
+            let seams = Seams {
+                // macOS's answer to an option set on a socket that was shut down.
+                before_write: Some(Arc::new(move |written, _| match written >= 200_000 {
+                    true => {
+                        fail.store(true, Ordering::SeqCst);
+                        Gate::Fail(ErrorKind::InvalidInput.into())
+                    }
+                    false => Gate::Go,
+                })),
+                look: Some(Arc::new(move || {
+                    look.load(Ordering::SeqCst)
+                        .then(|| std::io::Error::other("injected receive failure"))
+                })),
+                ..Seams::default()
+            };
+            let config = Config {
+                seams,
+                ..Config::real()
+            };
+            let server = Server::start_with(source.clone(), config).unwrap();
+            let mut client = connect(&server);
+            client
+                .write_all(&request(&server, "GET", Kind::Bulk, ""))
+                .unwrap();
+            let head = read_head(&mut client);
+            let body = read_all(&mut client);
+            assert_eq!(server.cuts(Kind::Bulk), 1, "counted before the close");
+            assert!((body.len() as u64) < content_length(&head));
+            let cut = server.last_cut(Kind::Bulk).expect("the cut");
+            assert_eq!(cut.sent, body.len() as u64);
+            assert!(matches!(cut.reason, CutReason::Failed(_)), "{cut:?}");
+            assert_eq!(source.stats().cuts, 1);
         },
     );
 }
@@ -1456,6 +1612,40 @@ fn the_drop_cancels_before_it_waits_for_the_accept_thread() {
             for kind in Kind::ALL {
                 assert_eq!(watch.cuts(kind), 0);
             }
+        },
+    );
+}
+
+/// A start that fails after the watch is running leaves nothing behind: the watch is
+/// stopped and waited for, and the Source — the server held its last handle — is closed by
+/// the time the start returns.
+#[test]
+fn a_start_that_fails_stops_its_watch_and_lets_the_source_go() {
+    bounded(
+        "a_start_that_fails_stops_its_watch_and_lets_the_source_go",
+        || {
+            let (source, _control) = threaded(SIZE);
+            let mut reader = source.reader(ReaderKind::Bulk);
+            let seams = Seams {
+                no_accept_thread: true,
+                ..Seams::default()
+            };
+            let config = Config {
+                seams,
+                ..Config::real()
+            };
+            // The only handle of the Source goes to the server.
+            let Err(error) = Server::start_with(source, config) else {
+                panic!("the start succeeded without its accept thread");
+            };
+            assert!(format!("{error:#}").contains("cannot start the byte server's thread"));
+            // No wait: a reader sees the Source closed once its last handle is dropped, and the
+            // watch held one.
+            assert_eq!(
+                reader.try_read(0, 10),
+                std::task::Poll::Ready(Err(ReadError::Closed)),
+                "the watch still holds the Source"
+            );
         },
     );
 }

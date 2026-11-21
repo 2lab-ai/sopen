@@ -145,6 +145,11 @@ pub(crate) struct Seams {
     pub before_write: Option<Arc<dyn Fn(u64, usize) -> Gate + Send + Sync>>,
     /// Called when a write to a client would take nothing now, before it is made to block.
     pub blocking: Option<Arc<dyn Fn() + Send + Sync>>,
+    /// The accept thread cannot be started: the start fails after the watch is running.
+    pub no_accept_thread: bool,
+    /// Called at each look at a response's socket: an error it returns is what the look's
+    /// receive fails with.
+    pub look: Option<Arc<dyn Fn() -> Option<std::io::Error> + Send + Sync>>,
 }
 
 impl Config {
@@ -209,6 +214,8 @@ struct Open {
     watched: bool,
     /// Bytes the client sent under the body, read and dropped.
     dropped: usize,
+    /// Why the watch ended the response: its thread counts the cut, before it closes.
+    fault: Option<String>,
 }
 
 /// The accepted sockets, and how many of each seat are taken.
@@ -292,56 +299,97 @@ enum Peer {
     Quiet,
     /// It sent this many bytes, now read and dropped.
     Sent(usize),
-    /// It closed, or the connection broke.
+    /// The client left: a receive returned 0, or the socket's error is a disconnect.
     Gone,
+    /// Anything else that is wrong with the socket: a fault here, not the client leaving.
+    Broken(String),
 }
 
-/// Looks at a socket without waiting. The client of a response sends nothing more, so a
-/// socket that reads 0 bytes, or reports a hang-up, has lost its client.
-fn look(stream: &TcpStream) -> Peer {
+/// Whether an error on a socket says that its peer disconnected: `EPIPE`, `ECONNRESET`,
+/// `ECONNABORTED`. No other error does.
+fn disconnected(e: &std::io::Error) -> bool {
+    matches!(
+        e.kind(),
+        ErrorKind::BrokenPipe | ErrorKind::ConnectionReset | ErrorKind::ConnectionAborted
+    )
+}
+
+/// Looks at a response's socket without waiting. The client of a response sends nothing
+/// more. It has left on exactly this evidence: a receive returns 0, or the socket's error —
+/// pending (`SO_ERROR`), or handed out by the receive, which takes the pending one — is a
+/// disconnect. Every other error, and a descriptor `poll` calls invalid, is a fault.
+fn look(shared: &Shared, stream: &TcpStream) -> Peer {
     #[cfg(target_os = "linux")]
     const HANG_UP: libc::c_short = libc::POLLHUP | libc::POLLERR | libc::POLLRDHUP;
     #[cfg(not(target_os = "linux"))]
     const HANG_UP: libc::c_short = libc::POLLHUP | libc::POLLERR;
+    let failed = |what: &str, e: std::io::Error| match disconnected(&e) {
+        true => Peer::Gone,
+        false => Peer::Broken(format!("{what}: {e}")),
+    };
+    #[cfg(test)]
+    if let Some(e) = shared.config.seams.look.as_ref().and_then(|look| look()) {
+        return failed("cannot read the client's socket", e);
+    }
+    #[cfg(not(test))]
+    let _ = shared;
     let mut fd = libc::pollfd {
         fd: stream.as_raw_fd(),
         events: libc::POLLIN | HANG_UP,
         revents: 0,
     };
     // SAFETY: `fd` is one valid `pollfd`, its descriptor open for the call.
-    if unsafe { libc::poll(&mut fd, 1, 0) } <= 0 {
-        return Peer::Quiet;
+    match unsafe { libc::poll(&mut fd, 1, 0) } {
+        0 => return Peer::Quiet,
+        n if n < 0 => {
+            let e = std::io::Error::last_os_error();
+            return match e.kind() {
+                ErrorKind::Interrupted => Peer::Quiet,
+                _ => Peer::Broken(format!("cannot poll the client's socket: {e}")),
+            };
+        }
+        _ => {}
     }
-    if fd.revents & libc::POLLIN != 0 {
-        let mut buf = [0u8; 2048];
-        // SAFETY: `buf` is 2048 writable bytes, and the descriptor is open for the call.
-        let n = unsafe {
-            libc::recv(
-                fd.fd,
-                buf.as_mut_ptr().cast(),
-                buf.len(),
-                libc::MSG_DONTWAIT,
-            )
-        };
-        return match n {
-            0 => Peer::Gone,
-            n if n > 0 => Peer::Sent(n as usize),
-            _ => match std::io::Error::last_os_error().kind() {
+    if fd.revents & libc::POLLNVAL != 0 {
+        return Peer::Broken("the client's socket is not open".into());
+    }
+    match stream.take_error() {
+        Ok(None) => {}
+        Ok(Some(e)) => return failed("the client's socket failed", e),
+        Err(e) => return Peer::Broken(format!("cannot read the socket's error: {e}")),
+    }
+    let mut buf = [0u8; 2048];
+    // SAFETY: `buf` is 2048 writable bytes, and the descriptor is open for the call.
+    let n = unsafe {
+        libc::recv(
+            fd.fd,
+            buf.as_mut_ptr().cast(),
+            buf.len(),
+            libc::MSG_DONTWAIT,
+        )
+    };
+    match n {
+        0 => Peer::Gone,
+        n if n > 0 => Peer::Sent(n as usize),
+        _ => {
+            let e = std::io::Error::last_os_error();
+            match e.kind() {
+                // A hang-up with nothing to read yet: the next look reads the end.
                 ErrorKind::WouldBlock | ErrorKind::Interrupted => Peer::Quiet,
-                _ => Peer::Gone,
-            },
-        };
+                _ => failed("cannot read the client's socket", e),
+            }
+        }
     }
-    if fd.revents & (HANG_UP | libc::POLLNVAL) != 0 {
-        return Peer::Gone;
-    }
-    Peer::Quiet
 }
 
-/// The watch: while a body is under way, its socket is looked at every [`GONE_CHECK`]. A
-/// connection whose client has gone gets its cancel flag set and the Source's blocked reads
-/// woken — so a thread waiting for a block (ffmpeg closes at every seek) returns, its reader
-/// and what it had queued go, and its seat is free. The client left: that is no cut.
+/// The watch: while a body is under way, its socket is looked at every [`GONE_CHECK`], and
+/// a response that has to end gets its cancel flag set and the Source's blocked reads woken,
+/// so a thread waiting for a block returns.
+/// - Its client has gone (ffmpeg closes at every seek): the reader and what it had queued
+///   go, and the seat is free. The client left: that is no cut.
+/// - Its socket is broken, or its client sent more than [`LINGER_BYTES`] under the body:
+///   the server ends the response itself. The connection's thread finds the reason here and
+///   counts the cut before it closes.
 fn watch_loop(shared: Arc<Shared>) {
     let every = shared.config.tick.unwrap_or(GONE_CHECK);
     let mut conns = shared.conns();
@@ -361,25 +409,34 @@ fn watch_loop(shared: Arc<Shared>) {
         if shared.cancelled() {
             return;
         }
-        let mut gone = false;
+        let mut ended = false;
         for open in conns.open.values_mut().filter(|open| open.watched) {
-            match look(&open.stream) {
-                Peer::Quiet => {}
+            let fault = match look(&shared, &open.stream) {
+                Peer::Quiet => continue,
                 Peer::Sent(n) => {
                     open.dropped += n;
-                    // A client that keeps sending is not read for ever.
-                    open.watched = open.dropped <= LINGER_BYTES;
+                    if open.dropped <= LINGER_BYTES {
+                        continue;
+                    }
+                    // A client that keeps sending is not read for ever, and not left
+                    // unwatched either: ffmpeg sends nothing after its request.
+                    Some(format!(
+                        "the client sent more than {LINGER_BYTES} bytes after its request"
+                    ))
                 }
                 Peer::Gone => {
-                    open.cancel.store(true, Ordering::SeqCst);
-                    open.watched = false;
-                    gone = true;
                     #[cfg(test)]
                     shared.left.fetch_add(1, Ordering::SeqCst);
+                    None
                 }
-            }
+                Peer::Broken(why) => Some(why),
+            };
+            open.fault = fault;
+            open.cancel.store(true, Ordering::SeqCst);
+            open.watched = false;
+            ended = true;
         }
-        if gone {
+        if ended {
             drop(conns);
             shared.source.interrupt();
             conns = shared.conns();
@@ -394,6 +451,31 @@ pub struct Server {
     /// Dropped to wake the accept thread, which then closes the listener.
     wake: Option<UnixStream>,
     accept: Option<std::thread::JoinHandle<()>>,
+    watch: Option<std::thread::JoinHandle<()>>,
+}
+
+/// A server being started, its watch already running. Dropped with the watch still its own
+/// — the start failed — it stops the watch and waits for it.
+struct Starting {
+    shared: Arc<Shared>,
+    watch: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for Starting {
+    fn drop(&mut self) {
+        if let Some(watch) = self.watch.take() {
+            stop_watch(&self.shared, watch);
+        }
+    }
+}
+
+/// Stops the watch and waits for it: it looks at the stop under the lock it waits on, so the
+/// wake cannot come between its look and its wait; it waits for no client and no read.
+fn stop_watch(shared: &Shared, watch: std::thread::JoinHandle<()>) {
+    shared.cancel.store(true, Ordering::SeqCst);
+    drop(shared.conns());
+    shared.watching.notify_all();
+    let _ = watch.join();
 }
 
 impl Server {
@@ -427,17 +509,27 @@ impl Server {
             left: AtomicU64::new(0),
         });
         let theirs = shared.clone();
-        // Never joined: it ends when the drop wakes it.
-        std::thread::Builder::new()
+        let watch = std::thread::Builder::new()
             .name("sopen-http-watch".into())
             .spawn(move || watch_loop(theirs))
             .context("cannot start the byte server's watch")?;
+        // From here a start that fails stops the watch and waits for it: nothing of a
+        // server that never was keeps the Source open.
+        let mut starting = Starting {
+            shared: shared.clone(),
+            watch: Some(watch),
+        };
         let theirs = shared.clone();
-        let accept = std::thread::Builder::new()
-            .name("sopen-http-accept".into())
+        let accept = std::thread::Builder::new().name("sopen-http-accept".into());
+        #[cfg(test)]
+        if shared.config.seams.no_accept_thread {
+            anyhow::bail!("cannot start the byte server's thread: injected");
+        }
+        let accept = accept
             .spawn(move || accept_loop(listener, woken, theirs))
             .context("cannot start the byte server's thread")?;
         Ok(Server {
+            watch: starting.watch.take(),
             shared,
             wake: Some(wake),
             accept: Some(accept),
@@ -511,6 +603,9 @@ impl Drop for Server {
         if let Some(accept) = self.accept.take() {
             let _ = accept.join();
         }
+        if let Some(watch) = self.watch.take() {
+            stop_watch(&self.shared, watch);
+        }
     }
 }
 
@@ -555,9 +650,10 @@ fn token() -> std::io::Result<String> {
     Ok(raw.iter().map(|b| format!("{b:02x}")).collect())
 }
 
-/// Whether two tokens are the same. No early exit at source level: every byte is compared
-/// whatever the ones before it were, and `black_box` keeps the optimizer from cutting the
-/// loop short.
+/// Whether two tokens are the same. The source has no early exit: every byte is compared
+/// whatever the ones before it were. That is all that is guaranteed — `black_box` only
+/// discourages the optimizer from cutting the loop short, and nothing here promises
+/// constant time.
 fn same_token(a: &str, b: &str) -> bool {
     use std::hint::black_box;
     if a.len() != b.len() {
@@ -649,6 +745,7 @@ fn admit(shared: &Arc<Shared>, stream: TcpStream) {
         cancel: cancel.clone(),
         watched: false,
         dropped: 0,
+        fault: None,
     };
     conns.open.insert(id, open);
     drop(conns);
@@ -1078,21 +1175,28 @@ impl Conn {
         }
     }
 
-    /// A write, or the setting of its timeout, failed with `e`. Only what clearly means
-    /// that the client left is nobody's cut: the error says so, or the socket does. Anything
-    /// else is counted — a cut fails the run, which is the safe side.
+    /// A write, or the setting of its timeout, failed with `e`. It is nobody's cut only when
+    /// the server is going, the watch has ended the response (its reason is counted at the
+    /// end), or the client left: `e` is a disconnect, or the socket itself gives that
+    /// evidence ([`look`]) — on macOS a socket its client reset refuses an option with
+    /// `EINVAL`. Anything else is counted: a cut fails the run, which is the safe side.
     fn write_failed(&self, e: std::io::Error) -> Stop {
-        let left = matches!(
-            e.kind(),
-            ErrorKind::BrokenPipe | ErrorKind::ConnectionReset | ErrorKind::ConnectionAborted
-        );
-        // A socket whose client reset it can refuse the next call with another error
-        // (macOS: `EINVAL` for an option set on a socket shut down both ways).
-        if left || self.cancelled() || matches!(look(&self.stream), Peer::Gone) {
-            Stop::Gone
-        } else {
-            Stop::Failed(format!("cannot write to the client: {e}"))
+        if disconnected(&e) || self.cancelled() {
+            return Stop::Gone;
         }
+        match look(&self.shared, &self.stream) {
+            Peer::Gone => Stop::Gone,
+            _ => Stop::Failed(format!("cannot write to the client: {e}")),
+        }
+    }
+
+    /// Why the watch ended this response, if it did.
+    fn fault(&self) -> Option<String> {
+        let mut conns = self.shared.conns();
+        conns
+            .open
+            .get_mut(&self.id)
+            .and_then(|open| open.fault.take())
     }
 
     /// Writes `bytes`, calling `sent` with each count the socket took. The time its writes
@@ -1272,12 +1376,21 @@ impl Conn {
                 response.owed = false;
                 self.finish();
             }
-            // The client's own end — it closed, or was found gone — or the shutdown.
-            Some(None) => response.owed = false,
-            Some(Some(_)) if self.cancelled() => response.owed = false,
-            Some(Some(reason)) => {
-                response.cut(reason);
-                let _ = self.stream.shutdown(Shutdown::Both);
+            Some(found) => {
+                // The server's own end of it: what stopped the body, unless the connection
+                // was cancelled under it; then what the watch ended it for. Else the client
+                // closed or was found gone, or the server is going: nobody's cut.
+                let reason = match found.filter(|_| !self.cancelled()) {
+                    Some(reason) => Some(reason),
+                    None => self.fault().map(CutReason::Failed),
+                };
+                match reason {
+                    Some(reason) => {
+                        response.cut(reason);
+                        let _ = self.stream.shutdown(Shutdown::Both);
+                    }
+                    None => response.owed = false,
+                }
             }
         }
     }
