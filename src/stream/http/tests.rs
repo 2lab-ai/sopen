@@ -961,19 +961,17 @@ fn a_second_request_on_the_connection_is_never_answered() {
     );
 }
 
-/// At most 32 connections are served at once: the 33rd gets 503, and the account has it
+/// At most 64 connections are served at once: the 65th gets 503, and the account has it
 /// against its kind — a run refused an input must not pass. A seat given back is served.
 #[test]
-fn a_33rd_connection_gets_503() {
-    bounded("a_33rd_connection_gets_503", || {
+fn a_65th_connection_gets_503() {
+    bounded("a_65th_connection_gets_503", || {
         let (source, _control) = threaded(SIZE);
         // The clock stands still: no idle connection runs into the head's deadline.
         let server = Server::start_with(source.clone(), Hand::new().config()).unwrap();
         let watch = server.watch();
         let idle: Vec<TcpStream> = (0..MAX_CONNECTIONS).map(|_| connect(&server)).collect();
-        eventually("32 connections are seated", || {
-            watch.open() == MAX_CONNECTIONS
-        });
+        eventually("every seat is taken", || watch.open() == MAX_CONNECTIONS);
         let reply = get(&server, Kind::Render, &range("bytes=0-9"));
         assert_refused(&reply, 503);
         assert_eq!(server.cuts(Kind::Render), 1);
@@ -995,55 +993,160 @@ fn a_33rd_connection_gets_503() {
     });
 }
 
-// ---- lifetime ----
-
-/// A response whose client takes no bytes for 60 s is closed, and counted: the server ended
-/// it. On the server's clock, moved by hand: at 59 s it is still open.
+/// The seeks of a 24-input render (06 §7.4, X1): ffmpeg opens every input's second
+/// connection within a few milliseconds, before the server has seen the first one go, so 48
+/// bodies are under way for a moment. None is refused, and the 24 that then go are nobody's
+/// cut.
 #[test]
-fn a_client_that_stops_reading_is_closed_after_60_s() {
-    bounded("a_client_that_stops_reading_is_closed_after_60_s", || {
-        let size = 256 * MIB;
-        let (source, _control) = threaded(size);
-        let hand = Hand::new();
-        let server = Server::start_with(source.clone(), hand.config()).unwrap();
+fn the_seeks_of_a_24_input_render_are_all_seated() {
+    bounded("the_seeks_of_a_24_input_render_are_all_seated", || {
+        const INPUTS: usize = 24;
+        let (source, _control) = threaded(256 * MIB);
+        // The clock stands still: nothing here runs into a deadline.
+        let server = Server::start_with(source.clone(), Hand::new().config()).unwrap();
         let watch = server.watch();
-        let mut client = connect(&server);
-        client
-            .write_all(&request(&server, "GET", Kind::Play, ""))
-            .unwrap();
-        let head = read_head(&mut client);
-        assert_eq!(content_length(&head), size);
-        let mut some = vec![0u8; 1000];
-        client.read_exact(&mut some).unwrap();
-        // It reads no more. The server fills the socket and then waits on it: three waits
-        // in a row with nothing more sent.
-        let sent = settled(&watch, &source);
-        assert!(sent < size);
-        hand.advance(Duration::from_secs(59));
-        checks(&watch, 3);
-        assert_eq!(
-            (watch.open(), server.cuts(Kind::Play)),
-            (1, 0),
-            "open at 59 s"
-        );
-        hand.advance(Duration::from_secs(1));
-        eventually("the stalled response is closed", || {
-            server.cuts(Kind::Play) == 1
+        let ask = request(&server, "GET", Kind::Render, "");
+        // Two connections an input, all opened and asked before any answer is read.
+        let mut burst: Vec<TcpStream> = (0..2 * INPUTS).map(|_| connect(&server)).collect();
+        for client in &mut burst {
+            client.write_all(&ask).unwrap();
+        }
+        for (nth, client) in burst.iter_mut().enumerate() {
+            let head = read_head(client);
+            assert!(
+                head.starts_with("HTTP/1.1 200 "),
+                "connection {nth} of {}: {head:?}",
+                2 * INPUTS
+            );
+        }
+        assert_eq!(watch.open(), 2 * INPUTS);
+        // Each input's first connection goes, as ffmpeg closes it at its seek.
+        let seeking = burst.split_off(INPUTS);
+        drop(burst);
+        eventually("the connections that went are found gone", || {
+            watch.open() == INPUTS
         });
-        let cut = server.last_cut(Kind::Play).unwrap();
-        assert_eq!(
-            (cut.kind, cut.start, cut.sent, cut.length, cut.reason),
-            (Kind::Play, 0, sent, size, CutReason::Stalled)
-        );
-        assert_eq!(source.stats().cuts, 1);
-        // What was sent is all that comes.
-        let rest = read_all(&mut client);
-        assert_eq!(1000 + rest.len() as u64, sent);
-        eventually("its thread ends", || watch.open() == 0);
+        drop(seeking);
+        eventually("the seats are given back", || watch.open() == 0);
+        for kind in Kind::ALL {
+            assert_eq!(
+                server.cuts(kind),
+                0,
+                "{kind:?}: {:?}",
+                server.last_cut(kind)
+            );
+        }
+        assert_eq!(source.stats().cuts, 0);
     });
 }
 
-/// A client that takes exactly what the test grants: the server's writes go through a gate
+// ---- lifetime ----
+
+/// A `bulk` response whose client takes no bytes for 60 s is closed, and counted: the server
+/// ended it. On the server's clock, moved by hand: at 59 s it is still open.
+#[test]
+fn a_bulk_client_that_stops_reading_is_closed_after_60_s() {
+    bounded(
+        "a_bulk_client_that_stops_reading_is_closed_after_60_s",
+        || {
+            let size = 256 * MIB;
+            let (source, _control) = threaded(size);
+            let hand = Hand::new();
+            let server = Server::start_with(source.clone(), hand.config()).unwrap();
+            let watch = server.watch();
+            let mut client = connect(&server);
+            client
+                .write_all(&request(&server, "GET", Kind::Bulk, ""))
+                .unwrap();
+            let head = read_head(&mut client);
+            assert_eq!(content_length(&head), size);
+            let mut some = vec![0u8; 1000];
+            client.read_exact(&mut some).unwrap();
+            // It reads no more. The server fills the socket and then waits on it: three waits
+            // in a row with nothing more sent.
+            let sent = settled(&watch, &source);
+            assert!(sent < size);
+            hand.advance(Duration::from_secs(59));
+            checks(&watch, 3);
+            assert_eq!(
+                (watch.open(), server.cuts(Kind::Bulk)),
+                (1, 0),
+                "open at 59 s"
+            );
+            hand.advance(Duration::from_secs(1));
+            eventually("the stalled response is closed", || {
+                server.cuts(Kind::Bulk) == 1
+            });
+            let cut = server.last_cut(Kind::Bulk).unwrap();
+            assert_eq!(
+                (cut.kind, cut.start, cut.sent, cut.length, cut.reason),
+                (Kind::Bulk, 0, sent, size, CutReason::Stalled)
+            );
+            assert_eq!(source.stats().cuts, 1);
+            // What was sent is all that comes.
+            let rest = read_all(&mut client);
+            assert_eq!(1000 + rest.len() as u64, sent);
+            eventually("its thread ends", || watch.open() == 0);
+        },
+    );
+}
+
+/// A `render` or a `play` connection whose client takes nothing is waiting its turn, not
+/// stalled (06 §7.4, X1): ffmpeg reads a render's input when its piece comes up, and playback
+/// starts the next piece's decoder with the current one. The 60 s do not run on it: past them
+/// it is open and uncounted, and when its client reads on, the body goes on from where it
+/// stopped.
+#[test]
+fn a_render_or_play_client_that_waits_is_not_cut() {
+    bounded("a_render_or_play_client_that_waits_is_not_cut", || {
+        for kind in [Kind::Render, Kind::Play] {
+            let size = 256 * MIB;
+            let (source, _control) = threaded(size);
+            let hand = Hand::new();
+            let server = Server::start_with(source.clone(), hand.config()).unwrap();
+            let watch = server.watch();
+            let mut client = connect(&server);
+            client
+                .write_all(&request(&server, "GET", kind, ""))
+                .unwrap();
+            let head = read_head(&mut client);
+            assert_eq!(content_length(&head), size);
+            let mut some = vec![0u8; 1000];
+            client.read_exact(&mut some).unwrap();
+            // It reads no more: the server fills the socket and waits on it.
+            let sent = settled(&watch, &source);
+            assert!(sent < size);
+            // A minute, then an hour: `checks` fails at once if the connection is closed.
+            for (pass, at) in [(59, "59 s"), (2, "61 s"), (3600, "an hour")] {
+                hand.advance(Duration::from_secs(pass));
+                checks(&watch, 3);
+                assert_eq!(
+                    (watch.open(), server.cuts(kind)),
+                    (1, 0),
+                    "{kind:?}: open and uncounted at {at}: {:?}",
+                    server.last_cut(kind)
+                );
+            }
+            assert_eq!(
+                source.stats().http_sent,
+                sent,
+                "{kind:?}: nothing went meanwhile"
+            );
+            // Its turn comes: it takes what waited in the socket, and more follows.
+            let mut waited = vec![0u8; (sent - 1000) as usize + 4 * BLOCK as usize];
+            client.read_exact(&mut waited).unwrap();
+            eventually("the body goes on", || source.stats().http_sent > sent);
+            drop(client);
+            eventually("its thread ends", || watch.open() == 0);
+            for each in Kind::ALL {
+                assert_eq!(server.cuts(each), 0, "{kind:?}: the client left");
+            }
+            assert_eq!(source.stats().cuts, 0);
+        }
+    });
+}
+
+/// A `bulk` client that takes exactly what the test grants: the server's writes go through a gate
 /// that lets `grant`ed bytes through, and is a wait that ran out while none are left. The
 /// client itself reads everything that comes.
 struct Paced {
@@ -1076,7 +1179,7 @@ fn paced(first: u64) -> Paced {
     let watch = server.watch();
     let mut stream = connect(&server);
     stream
-        .write_all(&request(&server, "GET", Kind::Play, ""))
+        .write_all(&request(&server, "GET", Kind::Bulk, ""))
         .unwrap();
     let client = std::thread::spawn(move || read_all(&mut stream).len());
     let paced = Paced {
@@ -1112,16 +1215,16 @@ impl Paced {
     }
 
     fn open(&self) -> bool {
-        (self.watch.open(), self.server.cuts(Kind::Play)) == (1, 0)
+        (self.watch.open(), self.server.cuts(Kind::Bulk)) == (1, 0)
     }
 
     /// One more second, and the response is closed as stalled. What the client got.
     fn closes_after_a_second(self) -> usize {
         self.hand.advance(Duration::from_secs(1));
         eventually("the response is closed", || {
-            self.server.cuts(Kind::Play) == 1
+            self.server.cuts(Kind::Bulk) == 1
         });
-        let cut = self.server.last_cut(Kind::Play).unwrap();
+        let cut = self.server.last_cut(Kind::Bulk).unwrap();
         assert_eq!(cut.reason, CutReason::Stalled);
         let got = self.client.join().unwrap();
         assert_eq!(cut.sent + content_head(), got as u64);
