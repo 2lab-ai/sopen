@@ -2422,3 +2422,106 @@ fn a_reload_of_a_failed_stream_that_fails_is_not_followed_by_a_retry() {
         },
     );
 }
+
+/// 06 §5: one gesture is one operation, whenever the stream's thread ends it. A Cmd/Ctrl+R
+/// whose reload has already failed by the time the same pass looks at the stream — between
+/// its keys and its poll — is still not followed by a retry: no reconnect attempt after the
+/// reload's own until the next key.
+#[test]
+fn a_reload_that_fails_within_its_own_pass_is_not_followed_by_a_retry() {
+    bounded(
+        "a_reload_that_fails_within_its_own_pass_is_not_followed_by_a_retry",
+        || {
+            use std::cell::RefCell;
+            use std::rc::Rc;
+            let body = numbered(40_000);
+            for was_down in [true, false] {
+                let at = format!("down before the reload: {was_down}");
+                let net = Rc::new(RefCell::new(net(body.as_bytes(), gate())));
+                let mut win = TextWindow::new(
+                    indexed(&net.borrow(), body.as_bytes()),
+                    "box:/remote/file".into(),
+                    "big.log",
+                    Vec::new(),
+                );
+                let mut drv = Driver::new(800.0, 500.0);
+                run(
+                    &mut drv,
+                    &mut win,
+                    &mut net.borrow_mut(),
+                    "the first screen",
+                    |w, _| w.ready(),
+                );
+                net.borrow_mut().settle();
+                let before = rows(&win);
+                *net.borrow().down.lock().unwrap() =
+                    Some("ssh: connect to host: Connection refused".into());
+                if was_down {
+                    // The line goes down under a read of the file's end, and what that read
+                    // asked for is made, and refused.
+                    let next = net.borrow().requests();
+                    net.borrow().control.fault(next, Fault::Lost);
+                    drv.key(&mut win, Key::End, command(false));
+                    run(
+                        &mut drv,
+                        &mut win,
+                        &mut net.borrow_mut(),
+                        "the failure",
+                        |w, _| w.stream_down(),
+                    );
+                    net.borrow().advance(Duration::from_secs(2));
+                    for _ in 0..3 {
+                        drv.idle(&mut win, 1);
+                        net.borrow_mut().settle();
+                    }
+                }
+                let attempts = net.borrow().reopens();
+                net.borrow().advance(Duration::from_secs(2));
+                if !was_down {
+                    // The path is gone: the reload's re-open on the live connection fails.
+                    net.borrow().control.change(Change::Remove);
+                }
+                // Cmd/Ctrl+R, the reload ending — failed — inside the pass that asked for it.
+                let engine = net.clone();
+                win.before_poll = Some(Box::new(move || engine.borrow_mut().settle()));
+                drv.key(&mut win, Key::R, command(false));
+                win.before_poll = None;
+                assert!(win.stream_down() && !win.reloading, "{at}");
+                let after_reload = net.borrow().reopens();
+                assert!(
+                    after_reload <= attempts + 1,
+                    "{at}: {attempts} then {after_reload}"
+                );
+                if !was_down {
+                    // Something is at the path again (time is moved through it); the line
+                    // stays down.
+                    let again = FakeFile::bytes(body.clone().into_bytes());
+                    net.borrow().control.change(Change::Replace(again));
+                }
+                let sent = net.borrow().requests();
+                for _ in 0..3 {
+                    net.borrow().advance(Duration::from_secs(2));
+                    for _ in 0..3 {
+                        drv.idle(&mut win, 1);
+                        net.borrow_mut().settle();
+                    }
+                }
+                assert_eq!(
+                    net.borrow().reopens(),
+                    after_reload,
+                    "{at}: a reconnect followed the failed reload with no key"
+                );
+                assert_eq!(net.borrow().requests(), sent, "{at}: nothing was asked for");
+                assert_eq!(rows(&win), before, "{at}: the page stays");
+                // The next key retries.
+                drv.key(&mut win, Key::ArrowDown, Modifiers::NONE);
+                net.borrow_mut().settle();
+                assert_eq!(
+                    net.borrow().reopens(),
+                    after_reload + 1,
+                    "{at}: the key's own"
+                );
+            }
+        },
+    );
+}

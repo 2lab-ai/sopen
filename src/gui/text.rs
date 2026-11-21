@@ -1905,6 +1905,10 @@ struct TextWindow {
     /// Called right after a re-read's index is installed (tests: write to the file there).
     #[cfg(test)]
     after_install: Option<Box<dyn FnMut()>>,
+    /// Called in a pass after its keys and before the stream is looked at (tests: what the
+    /// stream's own thread may do in between, as a reload that ends there).
+    #[cfg(test)]
+    before_poll: Option<Box<dyn FnMut()>>,
 }
 
 /// A re-read of the file from its path, on a worker. Dropping it (the viewer gone) cancels it;
@@ -1996,6 +2000,8 @@ impl TextWindow {
             reindex_chunk_hook: None,
             #[cfg(test)]
             after_install: None,
+            #[cfg(test)]
+            before_poll: None,
             pending: false,
             pending_since: None,
             failure: None,
@@ -2441,6 +2447,8 @@ impl TextWindow {
             if command(Key::R) && !self.reloading {
                 source.request_reload();
                 self.reloading = true;
+                // This pass's input is the reload: it retries nothing besides (below).
+                self.input = false;
             }
         }
         if self.waiting || self.reindex.is_some() || self.stream_frozen() {
@@ -3032,12 +3040,16 @@ impl TextWindow {
         // A re-read that landed is swapped in before anything reads or is measured (the
         // highlighter below starts on the new index).
         self.poll_reindex();
+        #[cfg(test)]
+        if let Some(hook) = self.before_poll.as_mut() {
+            hook();
+        }
         self.poll_stream(&ctx);
-        if self.input && self.stream_down() && !self.reloading {
+        if self.input && self.stream_down() {
             // A key, a click or a scroll retries a failed stream (06 §5) — also one whose page
             // is cached, which reads without asking. At most one attempt a second is made.
-            // Not beside a reload (Cmd/Ctrl+R is its own attempt: a retry queued with it would
-            // follow a failed reload with no key pressed).
+            // Not beside a reload (`input` is off for that pass: Cmd/Ctrl+R is its own
+            // attempt, and a retry queued with it would follow a failed reload with no key).
             if let Some(source) = self.doc.source() {
                 source.retry();
             }
@@ -3441,16 +3453,22 @@ impl Window for TextWindow {
                 .show(ui, |ui| self.body(ui));
             return;
         }
-        self.input = ui.ctx().input(|i| {
-            i.events.iter().any(|e| {
-                matches!(
-                    e,
-                    egui::Event::Key { pressed: true, .. }
-                        | egui::Event::PointerButton { pressed: true, .. }
-                        | egui::Event::MouseWheel { .. }
-                )
-            })
-        });
+        // Whether this pass's input may retry a failed stream is settled here, from how the
+        // pass began: one that began with a reload under way, or whose input starts one
+        // (`keys`), retries nothing — whenever in the pass that reload ends. One gesture is
+        // one attempt.
+        let reloading = self.reloading;
+        self.input = !reloading
+            && ui.ctx().input(|i| {
+                i.events.iter().any(|e| {
+                    matches!(
+                        e,
+                        egui::Event::Key { pressed: true, .. }
+                            | egui::Event::PointerButton { pressed: true, .. }
+                            | egui::Event::MouseWheel { .. }
+                    )
+                })
+            });
         self.keys(&ui.ctx().clone());
         chrome::bar_panel(egui::Panel::top("sopen-text-bar")).show(ui, |ui| self.bar(ui));
         chrome::bar_panel(egui::Panel::bottom("sopen-text-status"))
