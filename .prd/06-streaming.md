@@ -1571,7 +1571,7 @@ needs the later units.
 | Route | What the hex window shows (any size) | Text of at most 16 MiB | Text over 16 MiB | Image, video, audio |
 |---|---|---|---|---|
 | the browser's Enter or F3 on a remote file | stream | stream | fetched whole (until W5b) | fetched whole (W8b) |
-| the browser's preview of a remote file | stream | stream | private copy up to 32 MiB, else the info card | image: private copy; media: the info card (S1-M, W8b) |
+| the browser's preview of a remote file | stream | stream | private copy up to 32 MiB, else the info card | image, video, audio: private copy up to 32 MiB, else the info card (W8b lifts it) |
 | standalone `sopen host:/file` | the dialog; its "Open in hex editor" streams | VS Code or Zed, which read it their own way (01 §3): sopen streams nothing | the same | fetched whole (W8b) |
 | the binary dialog's Enter, `SOPEN_CHOICE=hex` | stream | — (the dialog is for files of no other kind) | — | — |
 | `--hex SOURCE`, any kind of file | stream | stream, as bytes in the hex window | stream, as bytes in the hex window | stream, as bytes in the hex window |
@@ -1621,7 +1621,7 @@ are not disjoint, and are sequenced instead.
 - **The preview** (02 §4, merged with PR #17) stays the browser's contract. Streaming changes three
   things in it, written into 02 §4.3–§4.5 in the same PR as the code, with S1's tests they change.
   **W8a does this for text and for what the hex window shows; W8b for images and media**, whose
-  previews read a private copy (an image) or show the info card (media, until S1-M) until then.
+  previews read a private copy until then (an image; a video or a sound, since S1-M).
   02 §4.3 already foresaw the first: "with streaming (another workstream), only the byte ranges
   the preview shows, never more than 32 MiB".
   1. **The read.** A remote preview read into a private copy, `<cache>/.preview/<window>/<n>`.

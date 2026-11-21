@@ -1397,10 +1397,16 @@ impl Browser {
         };
         let ((), asked) = super::host_pass(&ctx, || viewer.embedded.window.ui(ui));
         if asked {
-            // Its prompt was answered, or a write it waited for landed: ask it again.
+            // Its prompt was answered, or a write it waited for landed — or it found it cannot
+            // show its file after all: ask it again.
             if viewer.embedded.window.close_requested() {
+                let failed = viewer.embedded.window.failure();
                 self.drop_viewer();
                 self.after_viewer(&ctx);
+                // The open failed after all: said as a failed open is, in the list.
+                if let Some(why) = failed {
+                    self.status = Status::error(why);
+                }
             }
             return;
         }

@@ -376,6 +376,8 @@ fn probe_json() {
             video_index: 0,
             video_duration: None,
             video_start: None,
+            pixel_aspect: None,
+            channel_layout: None,
             pix_fmt: None,
             bits: None,
             color: Vec::new(),

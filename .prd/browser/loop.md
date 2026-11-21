@@ -1,6 +1,6 @@
 # browser — loop (open items only)
 
-Status: round 1 in progress (2026-11-21). Target: [`ssot.md`](ssot.md). Contracts: `../02-architecture.md` (§8 the
+Status: round 1 in progress (2026-11-21); S1-M in review. Target: [`ssot.md`](ssot.md). Contracts: `../02-architecture.md` (§8 the
 slices and their order), `../03-git-panel.md`, `../04-file-keys.md`, `../05-directory-tree.md`. Closed rows move to
 `loop.done.md` in the commit that closes their round.
 
@@ -12,7 +12,7 @@ One slice at a time (02 §8.1). Worktree = `.worktrees/<branch with / as ->`.
 
 | ID | Status | Branch | Scope | Owner files (02 §5) | After |
 |---|---|---|---|---|---|
-| S1-M | 🔴 ready (S1-E merged) | `feat/browser-s1-media-preview` | the media preview: video frame, audio waveform, their budgets and hand-over; reruns P1, P5, P6, P12 for media | `src/gui/media.rs` and tests, the preview host's media row | S1-E, G-WAVE |
+| S1-M | 🟡 in review (this PR) | `feat/browser-s1-media-preview` | the media preview: video frame, audio waveform, their budgets and hand-over; reruns P1, P5, P6, P12 for media | `src/gui/media.rs` and tests, the preview host's media row | S1-E, G-WAVE |
 
 ## Experiments for later slices (open; each runs before its slice)
 
@@ -38,5 +38,7 @@ One slice at a time (02 §8.1). Worktree = `.worktrees/<branch with / as ->`.
 - 2026-11-21: S1-E merged (PR #29, 0120d40) and is deployed as preview 0120d40813a0. S1-M is ready to start, and so
   are the streaming units that waited on S1: W4 and W5a are in progress, W6 and ED3 are ready
   ([`../streaming/loop.md`](../streaming/loop.md)).
+- 2026-11-21: S1-M is in review in this PR: the media preview, its budgets and hand-over, with E3's media rerun
+  written into 02 §8.2.
 - E3 is closed (2026-11-21): its result is in 02 §8.2 and its row in [`loop.done.md`](loop.done.md). S1-M reruns
   it for media previews.

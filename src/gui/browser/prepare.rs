@@ -14,9 +14,10 @@
 
 use super::Connect;
 use crate::cache::{self, Claim, Fetched, PreviewName, PreviewSpace};
+use crate::ffmpeg::Input;
 use crate::gui::hex::{self, HexFile};
 use crate::gui::image::{self, Doc, ImageFile};
-use crate::gui::media::Media;
+use crate::gui::media::{self, Media};
 use crate::gui::streamed::{self, Lease};
 use crate::gui::text::{self, TextDoc};
 use crate::gui::{chrome, Embedded, Origin, Outcome, Placeholder, Reconnect, Window};
@@ -201,7 +202,7 @@ fn prepare_with(
                         claim,
                         at: r.copy.at,
                         notices,
-                    })
+                    });
                 }
                 Err(e) => crate::debug!("the preview copy was not published: {e:#}"),
             }
@@ -350,19 +351,30 @@ pub struct Limits {
     pub pixels: u64,
     /// The bytes of a text file its index reads; the preview shows their lines.
     pub text: u64,
-    /// Preparation after the read.
+    /// Preparation after the read (text, an image, hex rows).
     pub time: Duration,
+    /// A video's or a sound's `ffprobe`, and a video's first frame: each its own time.
+    pub probe: Duration,
+    pub frame: Duration,
+    /// A sound's waveform: how much of the sound it reads, and its time.
+    pub sound: Duration,
+    pub waveform: Duration,
 }
 
 impl Limits {
     /// 02 §4.3: 32 MiB read, images 64 MiB and 64 megapixels (256 MiB of RGBA), text indexed to
-    /// 4 MiB, 5 s.
+    /// 4 MiB, 5 s; a video's `ffprobe` and first frame 5 s each; a sound's `ffprobe` 5 s, then
+    /// the waveform of its first 10 minutes in 10 s.
     pub const PREVIEW: Limits = Limits {
         read: 32 << 20,
         image_bytes: 64 << 20,
         pixels: 64 << 20,
         text: 4 << 20,
         time: Duration::from_secs(5),
+        probe: Duration::from_secs(5),
+        frame: Duration::from_secs(5),
+        sound: Duration::from_secs(600),
+        waveform: Duration::from_secs(10),
     };
 }
 
@@ -376,6 +388,13 @@ pub struct Budget {
     read_ended: Mutex<Option<Instant>>,
     /// The time (tests move it).
     clock: Box<dyn Fn() -> Instant + Send + Sync>,
+    /// The ffprobe or ffmpeg a video's or a sound's preparation runs right now: whoever stops
+    /// the preparation kills it here ([`Budget::stop_children`]).
+    children: media::preview::Children,
+    /// Tests: the ffmpeg and ffprobe a preparation runs (a stand-in that stalls), instead of
+    /// the installed ones.
+    #[cfg(test)]
+    tools: Mutex<Option<crate::ffmpeg::Tools>>,
     /// Tests: called after every chunk of a local read with the bytes read so far (Enter at a
     /// chosen point of it).
     #[cfg(test)]
@@ -411,6 +430,9 @@ impl Budget {
             lifted: AtomicBool::new(false),
             read_ended: Mutex::new(None),
             clock,
+            children: Default::default(),
+            #[cfg(test)]
+            tools: Mutex::new(None),
             #[cfg(test)]
             after_chunk: Mutex::new(None),
         })
@@ -435,6 +457,29 @@ impl Budget {
         (!self.lifted()).then_some(value)
     }
 
+    /// Stops the ffprobe or ffmpeg the preparation runs, if one runs now, and lets none start:
+    /// called with its stop flag set, by whoever does not wait for its worker (the window
+    /// closing). Only the signal is sent here — it is called on a frame; the worker reaps.
+    pub fn stop_children(&self) {
+        self.children.stop();
+    }
+
+    /// The ffmpeg and ffprobe a preparation runs.
+    fn tools(&self) -> Result<crate::ffmpeg::Tools> {
+        #[cfg(test)]
+        if let Some(tools) = self.tools.lock().unwrap().clone() {
+            return Ok(tools);
+        }
+        crate::ffmpeg::resolve()
+    }
+
+    /// Tests: the preparation runs `tools` instead of the installed ffmpeg and ffprobe.
+    #[cfg(test)]
+    pub(crate) fn with_tools(self: Arc<Self>, tools: crate::ffmpeg::Tools) -> Arc<Self> {
+        *self.tools.lock().unwrap() = Some(tools);
+        self
+    }
+
     fn read_done(&self) {
         *self.read_ended.lock().unwrap_or_else(|p| p.into_inner()) = Some((self.clock)());
     }
@@ -457,6 +502,69 @@ impl Budget {
     }
 }
 
+/// A video's or a sound's preparation, watched ([`media::preview::Watch`]): stopped by the
+/// preview's cancel, and — while the budget holds — by the time of the step it is in (02 §4.3:
+/// `ffprobe`, the first frame and the waveform each have their own, in place of the one time
+/// the other kinds have).
+struct MediaWatch<'a> {
+    budget: &'a Budget,
+    cancel: &'a AtomicBool,
+    step: Mutex<Option<(media::preview::Step, Instant)>>,
+}
+
+impl MediaWatch<'_> {
+    /// Cancelled or not: no step's time is looked at.
+    fn cancelled(&self) -> Result<()> {
+        if self.cancel.load(Ordering::Relaxed) {
+            return Err(anyhow!(crate::remote::Cancelled));
+        }
+        Ok(())
+    }
+}
+
+/// `2 s`, `0.3 s`: a step's time on the info card.
+fn secs_text(time: Duration) -> String {
+    if time.subsec_nanos() == 0 {
+        format!("{} s", time.as_secs())
+    } else {
+        format!("{:.1} s", time.as_secs_f64())
+    }
+}
+
+impl media::preview::Watch for MediaWatch<'_> {
+    fn begin(&self, step: media::preview::Step) {
+        *self.step.lock().unwrap_or_else(|p| p.into_inner()) = Some((step, (self.budget.clock)()));
+    }
+
+    fn check(&self) -> Result<()> {
+        use media::preview::Step;
+        let step = *self.step.lock().unwrap_or_else(|p| p.into_inner());
+        let now = (self.budget.clock)();
+        self.cancelled()?;
+        let Some((step, since)) = step.filter(|_| !self.budget.lifted()) else {
+            return Ok(());
+        };
+        let limits = &self.budget.limits;
+        let (what, time) = match step {
+            Step::Probe => ("ffprobe", limits.probe),
+            Step::Frame => ("the first frame", limits.frame),
+            Step::Wave => ("the waveform", limits.waveform),
+            Step::Encoder => ("the encoder check", limits.probe),
+        };
+        if now.saturating_duration_since(since) >= time {
+            return Err(over(format!(
+                "{what} took over {}: Enter opens it",
+                secs_text(time)
+            )));
+        }
+        Ok(())
+    }
+
+    fn sound(&self) -> Option<f64> {
+        (!self.budget.lifted()).then_some(self.budget.limits.sound.as_secs_f64())
+    }
+}
+
 /// A preview stopped at its budget, or at what it does not show: the info card's last line.
 #[derive(Debug)]
 struct OverBudget(String);
@@ -475,12 +583,31 @@ fn over(why: impl Into<String>) -> anyhow::Error {
     anyhow!(OverBudget(why.into()))
 }
 
-/// The card's last line for why the preparation stopped.
+/// The card's line for why the preparation stopped: the reason itself, first.
 fn why(e: &anyhow::Error) -> String {
-    match e.chain().find_map(|c| c.downcast_ref::<OverBudget>()) {
-        Some(OverBudget(why)) => why.clone(),
-        None => format!("{e:#}"),
+    if let Some(OverBudget(why)) = e.chain().find_map(|c| c.downcast_ref::<OverBudget>()) {
+        return why.clone();
     }
+    if let Some(unreadable) = unreadable(e) {
+        return unreadable.0.clone();
+    }
+    format!("{e:#}")
+}
+
+fn unreadable(e: &anyhow::Error) -> Option<&media::preview::Unreadable> {
+    e.chain().find_map(|c| c.downcast_ref())
+}
+
+/// Under the reason, what could not be done to which file — the file named once, as its owner
+/// knows it (`host:/abs`; a remote one was read from a private copy, which is never named).
+fn what(e: &anyhow::Error, host: &str, abs: &str) -> Option<String> {
+    unreadable(e)?;
+    let file = if host == cache::LOCAL_HOST {
+        abs.to_string()
+    } else {
+        format!("{host}:{abs}")
+    };
+    Some(format!("ffprobe cannot read {file}"))
 }
 
 /// The file a preview shows, and where its copies go.
@@ -559,6 +686,9 @@ pub struct Card {
     /// The last line: `over the preview limit: Enter opens it`, `image is W×H; Enter opens it`,
     /// the error.
     pub why: String,
+    /// Under it, what could not be done to which file (`ffprobe cannot read host:/abs`): the
+    /// part that gives way when the side is small — the reason above it is never cut.
+    pub what: Option<String>,
 }
 
 /// A preview's private copy of a remote file, complete: its name (the copy goes when it does)
@@ -592,6 +722,10 @@ enum Parts {
         name: String,
         index: u64,
     },
+    Media {
+        origin: Origin,
+        made: Box<media::preview::Prepared>,
+    },
     Card(Card),
 }
 
@@ -621,6 +755,7 @@ impl Previewed {
     /// The preview, on the window's thread: its viewer, told it is a preview
     /// ([`Window::set_preview`]), or the info card.
     pub fn show(self) -> Preview {
+        let cache = &self.cache;
         let (embedded, card) = match self.parts {
             Parts::Text {
                 doc,
@@ -640,6 +775,7 @@ impl Previewed {
                 text::embed_source(source, title, &name, Vec::new(), None, Some(index)),
                 None,
             ),
+            Parts::Media { origin, made } => (media::embed_preview(origin, *made, cache), None),
             Parts::Card(card) => (card_window(card.clone()), Some(card)),
         };
         let mut embedded = embedded;
@@ -808,8 +944,9 @@ struct Known {
 /// connection, within `budget`: stops are checked between every step, at every read and every
 /// MiB of the text index (`cancel`, the deadline). Nothing is claimed in the cache: a remote
 /// file is read into a private copy (`<cache>/.preview/<window>/<n>`, 0600), a local one read in
-/// place. A file that cannot be previewed — unreadable, vanished, a budget hit, video and audio
-/// in S1 — is the info card. `Err` only when cancelled ([`crate::remote::Cancelled`]).
+/// place; a video's frame and a sound's waveform come from ffprobe and ffmpeg runs the same
+/// stops reach ([`media::preview`]). A file that cannot be previewed — unreadable, vanished, a
+/// budget hit — is the info card. `Err` only when cancelled ([`crate::remote::Cancelled`]).
 pub fn preview(
     req: PreviewRequest,
     budget: &Budget,
@@ -846,6 +983,7 @@ pub fn preview(
                 mtime: known.stat.map(|s| s.mtime),
                 link: known.link,
                 why: why(&e),
+                what: what(&e, &host, &known.abs),
             };
             Ok(Previewed {
                 parts: Parts::Card(card),
@@ -936,10 +1074,12 @@ fn preview_parts(
     let limits = budget.limits;
     // A remote file over the read budget is previewed only through a stream, which reads the
     // ranges it shows and no more (02 §4.3). Whether it is one is decided from the stat and
-    // the name where the name says the kind — then nothing is read, the sniff's head included.
+    // the name where the name says the kind — then nothing is read, the sniff's head included,
+    // and the card says the kind its name gives it.
     let over_read = remote && budget.limit(limits.read).is_some_and(|max| stat.size > max);
     let name_says = kind::by_extension(crate::remote::split_parent(&real).1);
     if over_read && name_says.is_some_and(|kind| !streams(kind, stat.size)) {
+        known.kind = name_says;
         return Err(over(OVER_LIMIT));
     }
     budget.check(cancel)?;
@@ -949,22 +1089,12 @@ fn preview_parts(
     if over_read && !streamed {
         return Err(over(OVER_LIMIT));
     }
-    match kind {
-        // Their previews come with S1-M (02 §4.2): the info card until then.
-        Kind::Video | Kind::Audio => {
-            return Err(over(format!(
-                "no preview of {} yet: Enter opens it",
-                kind.as_str()
-            )))
-        }
-        Kind::Image
-            if budget
-                .limit(limits.image_bytes)
-                .is_some_and(|max| stat.size > max) =>
-        {
-            return Err(over(OVER_LIMIT));
-        }
-        _ => {}
+    if kind == Kind::Image
+        && budget
+            .limit(limits.image_bytes)
+            .is_some_and(|max| stat.size > max)
+    {
+        return Err(over(OVER_LIMIT));
     }
     budget.check(cancel)?;
     if let Some(label) = label.filter(|_| streamed) {
@@ -1055,6 +1185,39 @@ fn preview_parts(
         })
     };
     let check = || budget.check(cancel);
+    if matches!(kind, Kind::Video | Kind::Audio) {
+        // Each of its steps has a time of its own (02 §4.3), and every ffprobe and ffmpeg it
+        // runs is stopped — killed and reaped — the moment the preview is left or the step is
+        // over its time.
+        let watch = MediaWatch {
+            budget,
+            cancel,
+            step: Mutex::new(None),
+        };
+        let tools = budget.tools()?;
+        let input = Input::path(&path);
+        // The file's own name (a link's target's): its extension says how it is rendered.
+        let name = crate::remote::split_parent(&real).1;
+        let found = media::preview::prepare(&tools, &input, name, kind, &budget.children, &watch)?;
+        let parts = match found {
+            media::preview::Found::Media(made) => {
+                if made.media.video.is_none() {
+                    known.kind = Some(Kind::Audio);
+                }
+                Parts::Media {
+                    origin: origin(at)?,
+                    made,
+                }
+            }
+            // A `.ts` ffprobe cannot read as media: the hex view, as Enter shows it.
+            media::preview::Found::NotMedia => Parts::Hex {
+                file: HexFile::new(origin(at)?, hex::Base::open(&path)?, None, cache),
+            },
+        };
+        // Once more before handing the preview over: a cancel meanwhile drops it here.
+        watch.cancelled()?;
+        return Ok(parts);
+    }
     let parts = match kind {
         Kind::Image => {
             // The stat said it fits; the bytes decide (the file can have grown since).
@@ -1097,7 +1260,7 @@ fn preview_parts(
                 file: HexFile::new(origin(at)?, base, None, cache),
             }
         }
-        Kind::Video | Kind::Audio => unreachable!("an info card above"),
+        Kind::Video | Kind::Audio => unreachable!("made above"),
     };
     // Once more before handing the preview over: a cancel meanwhile drops it here.
     check()?;
@@ -1404,9 +1567,17 @@ impl Window for CardWindow {
                     y += h;
                 }
                 y += row_h;
-                let galley =
-                    painter.layout(self.card.why.clone(), font, p.text, inside.width().max(1.0));
+                // The reason first, whole; what it is about under it — that is what the
+                // side's edge cuts when there is no room for both.
+                let wide = inside.width().max(1.0);
+                let galley = painter.layout(self.card.why.clone(), font.clone(), p.text, wide);
+                let h = galley.size().y.max(row_h);
                 painter.galley(egui::Pos2::new(inside.left(), y), galley, p.text);
+                if let Some(what) = &self.card.what {
+                    y += h;
+                    let galley = painter.layout(what.clone(), font, p.dim, wide);
+                    painter.galley(egui::Pos2::new(inside.left(), y), galley, p.dim);
+                }
             });
         self.painted = true;
     }
