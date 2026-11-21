@@ -819,8 +819,11 @@ Left as whole fetches, with the fetch now pipelined (§2):
   - The request line and headers together are at most **8 KiB**. A longer head gets 431, and the
     connection closes.
   - The whole head must arrive within **5 s** of the accept, else the connection closes unanswered.
+  - A head whose last bytes arrive after the 5 s is not accepted, however soon they are read.
   - Header names are matched case-insensitively. `Icy-MetaData` and every header not named here are
     ignored.
+  - A field name that is not an HTTP token, and a NUL or a bare CR or LF in a field value or in
+    the request target, get 400.
 - **Accepted:** `GET` or `HEAD`, one of the three paths, and **exactly one**
   `Host: 127.0.0.1:<port>`.
   - A page in a browser cannot reach the server by DNS rebinding (the fix of Transmission's
@@ -844,17 +847,56 @@ Left as whole fetches, with the fetch now pipelined (§2):
 - **A response already started that cannot finish.** A read error or a `Changed` source mid-body
   closes the connection short of its `Content-Length`. No byte of a newer version is ever sent:
   blocks are validated (§5). The server records the cut, and the run that used it is failed (§7.4).
-- **Deadlines.** A response whose client takes no bytes for **60 s** (01 §5's no-progress bound) is
-  closed. The Source's own reads are bounded by §5's timeouts.
-- **Connections.** Each connection is one Media reader, served by blocking `read_at` on a std thread.
-  TCP backpressure from ffmpeg paces it.
+- **The cut account.** The server counts, per reader kind, every response it ended before its
+  `Content-Length`, and keeps the last one's reason. The count is taken before the socket closes,
+  so a client never sees the end of a cut body before the account has it.
+  - **The rule for a caller:** read `cuts(kind)` before starting ffmpeg and again when ffmpeg has
+    exited. A higher count fails the run, whatever ffmpeg's status. The count is per kind, not per
+    run: one cut fails every run of that kind that was under way.
+  - **The reasons:** `Changed`, `Reloaded`, `Closed` and `Failed` (a read error from the Source; a
+    write to the client that failed for a reason other than the client leaving; a connection
+    thread that panicked), and two the server adds itself:
+    - `Stalled`: the client took too little for 60 s (below). A player that pauses by no longer
+      reading ffmpeg's output gets this after 60 s, and starts ffmpeg again at its position.
+    - `Busy`: a request with a valid token and kind was refused with 503 (below). No body was
+      begun, but a run refused an input must not pass.
+  - A connection closed unanswered for want of a seat or a thread counts against every kind: whose
+    it was is not known.
+  - **Not counted: the client left.** The evidence is exactly this: a receive on the socket
+    returns 0, or the socket's error (a write's, a receive's, or the pending `SO_ERROR`) is
+    `EPIPE`, `ECONNRESET` or `ECONNABORTED`. The server's own shutdown is not counted either.
+    Every other socket error is `Failed` and counted, whoever sees it first. On macOS a socket
+    its client reset refuses a timeout option with `EINVAL`: that is the client leaving only when
+    the socket gives the evidence above.
+- **A client that leaves while its response waits for a block** (ffmpeg closes its connection at
+  every seek). While a body is under way the server looks at its socket every 100 ms, the stream's
+  own cancel check: `poll` for input or a hang-up (`POLLRDHUP` too on Linux), then the evidence
+  above. The connection's cancel flag is set and the Source's blocked reads are woken, so `read_at`
+  returns, the reader and what it had queued go, and the seat is free. This is not a cut. A client
+  that half-closes its sending side counts as gone; ffmpeg does not.
+  - What the client sends under its response is read and dropped. Past 64 KiB of it the server ends
+    the response itself, as `Failed` and counted, and frees the seat: ffmpeg sends nothing after its
+    request, and a connection is never left unwatched.
+  - A socket that fails there for any other reason ends the response the same way, as `Failed`.
+- **A server that fails to start** stops and joins the thread it had started (the watch), so it
+  holds no Source.
+- **Deadlines.** A response is closed (`Stalled`) once its writes have waited on the client for
+  **60 s** (01 §5's no-progress bound) without **64 KiB** going. The 60 s start again only when
+  64 KiB have gone since they last started, so a trickle does not keep a response open. Time a read
+  waits for the remote is not counted here: the Source's own reads are bounded by §5's timeouts.
+- **Connections.** The path's kind decides the connection's reader: `play` is a Media reader
+  (`ReaderKind::Media`, at the probed byte rate once the window has set it), `bulk` and `render`
+  are Bulk readers, which yield to playback's demand (§4). Each is served by blocking `read_at` on
+  a std thread. TCP backpressure from ffmpeg paces it.
   - At most **32** are served at once, and a 33rd gets 503.
   - PR #15 needs up to 31 at once: a render opens at most 24 inputs (`ffmpeg::MAX_INPUTS`), playback
     runs two pieces at a boundary (video and audio each, 4), and the paused frame, the waveform and
     a probe take one each.
-- **Shutdown.** Dropping the server closes the listener, then shuts down every accepted socket
-  (`shutdown` of both directions) and sets every connection's cancel flag. A thread blocked in
-  `read_at` or a socket write then returns at once. The window never joins those threads.
+- **Shutdown.** Dropping the server sets the stop and every connection's cancel flag and shuts
+  down every accepted socket (`shutdown` of both directions), and only then closes the listener. A
+  thread blocked in `read_at` or a socket write returns at once. The accept thread takes at most
+  16 connections between two looks at its wake and checks the stop between accepts, so a backlog
+  that keeps filling cannot hold the drop. The window never joins the connections' threads.
 - **Errors.** A read error or a `Changed` source ends the connection. ffmpeg sees EOF, and the window
   shows the Source's own state; it never parses ffmpeg's stderr for it.
 - **ffmpeg's inputs.** Every remote ffmpeg and ffprobe input has `-protocol_whitelist http,tcp`. The
@@ -868,6 +910,13 @@ Left as whole fetches, with the fetch now pipelined (§2):
   - That entry's `uid` column must equal sopen's uid.
   - No such entry, or more than one, is a rejection: the connection is closed unanswered, as for any
     other uid.
+  - The table is not a snapshot (measured, Linux 7.2, 32 threads opening connections): read while
+    sockets come and go, the kernel printed one socket two and three times in one read, same inode
+    and all. So rows of the tuple with the same inode and uid are one socket; another inode,
+    another uid is a second one, and a row with no inode of its own (missing, not a number, or 0) is a rejection even alone. The table is read 1 MiB at a time, and a pass that
+    finds no entry is made again, three in all.
+  - Only IPv4 loopback clients are served. The server binds 127.0.0.1, and a socket whose ends are
+    not both IPv4 (an IPv6 socket on a mapped address is in `/proc/net/tcp6`) is refused.
   - The format (hex addresses with the IPv4 address in host byte order, the port big-endian, and
     `uid` as the eighth column) is the kernel's `/proc/net/tcp` layout. It is not run here (the Mac
     has no `/proc`); the parser's unit test pins it with fixture lines.

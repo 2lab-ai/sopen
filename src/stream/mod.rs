@@ -7,6 +7,7 @@
 //! one, which is read in place and never gets a stream (06 §1).
 
 mod cache;
+pub mod http;
 mod prefetch;
 mod source;
 #[cfg(test)]
