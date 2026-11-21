@@ -732,15 +732,15 @@ fn enter_on_an_info_card_opens_the_file() {
     fx.key(Key::Enter);
     fx.wait(|b| b.opening.is_none());
     // The ordinary open: it fails as Enter on it fails in the list (the image does not decode),
-    // said on the status row; the card's copy was published, not fetched again — and, the open
-    // having failed, it is not left in the cache.
+    // said on the status row; the card's copy was published, not fetched again.
     assert!(fx.b.viewer.is_none());
     assert!(fx.b.status.error, "{}", fx.b.status.text);
     let cached = crate::cache::cache_path(&fx.cache, "box", &format!("{}/wide.png", fx.root));
-    assert!(!cached.exists(), "a failed open leaves no cached copy");
-    // (That the opening read nothing — it had the card's copy — is shown below: every read
-    // was the preview connection's.)
-    let _ = private;
+    assert_eq!(
+        std::fs::metadata(&cached).expect("published").ino(),
+        private,
+        "what is in the cache is the card's own copy, linked"
+    );
     // The preview comes back once the opening is over (the bar is still on the file) and reads
     // again, on the preview connection. The opening had a connection of its own: nothing was
     // read on it.

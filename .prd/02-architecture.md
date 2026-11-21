@@ -247,7 +247,7 @@ bar does not have to move).
   second one.
 - **A preview reads without claiming the cache.** A remote file is read into a private preview copy
   (`<cache>/.preview/<window>/<n>`, 0600, removed when the preview is dropped; the window's folder
-  goes with the window, and `.preview` itself with the last window's folder); a local file is read in
+  goes with the window, and `.preview` itself with the last window's folder — by `rmdir`, which only ever removes it empty); a local file is read in
   place, an image included. A preview never claims a cached copy, publishes into the mirror, moves
   earlier edits aside or creates a session copy (01 §5's machinery is for files that are opened).
 - **Cancel** = the preparation's stop flag (the flag Esc sets for Enter today); the worker checks it at
@@ -258,8 +258,13 @@ bar does not have to move).
   its slot (`media/child.rs`) until it has exited, so a program that closed its output and lives
   on is still there to be stopped; a stop that comes while a child is being started is applied
   as soon as it is in its slot; and a child is never read from without a thread watching it. No
-  process outlives its preview — nor sopen itself: a signal that ends sopen (SIGTERM, SIGHUP)
-  and the screenshot hook's watchdog end every such child first.
+  process outlives its preview. **When sopen itself is killed** (a signal, `kill -9`): on Linux
+  the kernel kills every such child with it (each sets `PR_SET_PDEATHSIG`); on macOS there is
+  no such thing, and the one `ffprobe` or `ffmpeg` that ran is left to end by itself — each is
+  bounded by its input (one probe, one frame, at most the file's sound), and a Ctrl+C in the
+  terminal reaches it with the rest of the process group. The private preview folder such an end
+  leaves is swept by the next window (its lock is free). sopen keeps no list of its children
+  and handles no signal.
 
 | Exit | What happens to the preparation (or the prepared preview) |
 |---|---|
@@ -268,7 +273,7 @@ bar does not have to move).
 | F9, pin (Cmd/Ctrl+G), Tab | cancel |
 | the tree opens | kept as it is, inside `tree_snapshot` (O4); cancelled when the tree closes if the rules no longer show it |
 | Enter or F3 on the previewed file | **handed over** (below) |
-| Enter or F3 on a file showing an info card | the preview is dropped (its preparation cancelled) and the file opens as Enter opens it in the list (01 §3a), from the start; a private preview copy that is complete and whose file is unchanged since (size, mtime) is published into the cache as below instead of read again. An open that fails leaves no copy in the cache (the one it fetched or published is removed). A video that `ffprobe` reads but none of whose frames decode fails the open too: the media window gives up at its first frame, and the list is back with the reason on its status row |
+| Enter or F3 on a file showing an info card | the preview is dropped (its preparation cancelled) and the file opens as Enter opens it in the list (01 §3a), from the start; a private preview copy that is complete and whose file is unchanged since (size, mtime) is published into the cache as below instead of read again. A video that `ffprobe` reads but none of whose frames decode fails the open too — after it was made ready: the media window, still as it was opened (nothing edited, nothing being written), gives up at its first frame, and the list is back with the reason on its status row. An open that fails, at either point, removes nothing from the cache: the copy it fetched or published is ordinary cache content, kept or replaced by the cache's own rules (01 §5) |
 | Enter on another entry, F4 | cancel / kept (F4 does not change the bar) |
 | the window closes | cancel; the window does not wait for a cancelled preview. Its worker reads, removes its own private copy, and for a video or a sound may hold one `ffprobe` or `ffmpeg`: the window sends that process its kill itself as it goes (`Host::cancel`), since sopen may end before the worker has looked at its stop flag. That call is on a frame, so it only signals — it waits neither for the process nor for the worker; the worker reaps |
 

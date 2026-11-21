@@ -89,9 +89,8 @@ impl Slot {
         if let Some(pause) = self.while_starting.lock().unwrap().take() {
             pause();
         }
-        end_children_on_signals();
+        die_with_sopen(cmd);
         let mut child = crate::ffmpeg::spawn(cmd)?;
-        running().insert(child.id());
         #[cfg(test)]
         log::started(file, child.id());
         let _ = file;
@@ -167,7 +166,6 @@ impl Slot {
         match child.try_wait() {
             Ok(None) => Polled::Running,
             Ok(Some(status)) => {
-                running().remove(&child.id());
                 #[cfg(test)]
                 log::ended(child.id());
                 live.take();
@@ -176,7 +174,6 @@ impl Slot {
             // It cannot be waited for: killed, and let go.
             Err(_) => {
                 let _ = child.kill();
-                running().remove(&child.id());
                 #[cfg(test)]
                 log::ended(child.id());
                 live.take();
@@ -202,7 +199,6 @@ impl Slot {
         if let Some(mut child) = self.lock().take() {
             let _ = child.kill();
             let _ = child.wait();
-            running().remove(&child.id());
             #[cfg(test)]
             log::ended(child.id());
         }
@@ -215,92 +211,32 @@ impl Slot {
     }
 }
 
-/// The process ids of every child that runs in a [`Slot`] of this process: from its start to
-/// the moment its end is taken.
-static LIVE: Mutex<std::collections::BTreeSet<u32>> = Mutex::new(std::collections::BTreeSet::new());
-
-fn running() -> MutexGuard<'static, std::collections::BTreeSet<u32>> {
-    LIVE.lock().unwrap_or_else(|p| p.into_inner())
-}
-
-/// Stops and reaps every child that runs in any [`Slot`] of this process: what sopen does
-/// before it ends without unwinding (a signal, the screenshot hook's watchdog) — a child left
-/// to itself would go on under another parent.
-pub fn end_all() {
-    let pids: Vec<u32> = running().iter().copied().collect();
-    for pid in &pids {
-        // Our own children, not yet reaped by their runners (those take them out of the
-        // list under its lock first).
-        unsafe { libc::kill(*pid as libc::pid_t, libc::SIGKILL) };
-    }
-    for pid in pids {
-        let mut status = 0;
-        // Reaped here unless its runner was faster (then there is no such child: fine).
-        unsafe { libc::waitpid(pid as libc::pid_t, &mut status, 0) };
-        running().remove(&pid);
-    }
-}
-
-/// Where the signal handler writes the signal's number: the thread that ends the children
-/// reads it (a handler may do nothing but write).
-static SIGNALLED: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
-
-extern "C" fn signalled(signal: libc::c_int) {
-    let byte = [signal as u8];
-    let to = SIGNALLED.load(SeqCst);
-    unsafe { libc::write(to, byte.as_ptr().cast(), 1) };
-}
-
-/// From the first child on, a signal that ends sopen (SIGTERM, SIGHUP) ends its children
-/// first ([`end_all`]); sopen then dies of that signal as it would have. A signal that is
-/// ignored (a `nohup` run's SIGHUP) stays ignored.
-fn end_children_on_signals() {
-    static ONCE: std::sync::Once = std::sync::Once::new();
-    ONCE.call_once(|| {
-        let mut ends = [0 as libc::c_int; 2];
-        if unsafe { libc::pipe(ends.as_mut_ptr()) } != 0 {
-            return;
-        }
-        let (from, to) = (ends[0], ends[1]);
+/// Makes the child `cmd` starts die when sopen does — however sopen ends, a `kill -9` too.
+/// Linux: the kernel sends it SIGKILL when its parent goes (`PR_SET_PDEATHSIG`); a parent that
+/// went between the fork and that call is seen by the look at the parent's id after it. There
+/// is no such thing on macOS: there a child of a sopen that was killed ends by itself (it is
+/// bounded by its input). No list of children is kept and no process id is ever signalled from
+/// one.
+fn die_with_sopen(cmd: &mut Command) {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::process::CommandExt as _;
+        let sopen = unsafe { libc::getpid() };
+        // Only async-signal-safe calls between fork and exec.
         unsafe {
-            libc::fcntl(from, libc::F_SETFD, libc::FD_CLOEXEC);
-            libc::fcntl(to, libc::F_SETFD, libc::FD_CLOEXEC);
-        }
-        SIGNALLED.store(to, SeqCst);
-        let waits = std::thread::Builder::new()
-            .name("sopen-signals".to_string())
-            .spawn(move || {
-                let mut byte = [0u8; 1];
-                loop {
-                    let read = unsafe { libc::read(from, byte.as_mut_ptr().cast(), 1) };
-                    if read == 1 {
-                        break;
-                    }
-                    if read == 0 {
-                        return;
-                    }
+            cmd.pre_exec(move || {
+                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
+                    return Err(std::io::Error::last_os_error());
                 }
-                end_all();
-                // And what its previews keep in the cache (nothing unwinds from here).
-                crate::cache::remove_preview_spaces();
-                let signal = libc::c_int::from(byte[0]);
-                unsafe {
-                    libc::signal(signal, libc::SIG_DFL);
-                    libc::raise(signal);
+                if libc::getppid() != sopen {
+                    libc::_exit(1);
                 }
+                Ok(())
             });
-        if waits.is_err() {
-            return;
         }
-        let handler = signalled as extern "C" fn(libc::c_int) as libc::sighandler_t;
-        for signal in [libc::SIGTERM, libc::SIGHUP] {
-            unsafe {
-                if libc::signal(signal, handler) == libc::SIG_IGN {
-                    libc::signal(signal, libc::SIG_IGN);
-                }
-            }
-        }
-    });
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = cmd;
 }
 
 /// A run's hold on its slot: dropped — the run returned, or unwound — whatever child is still

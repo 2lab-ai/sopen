@@ -141,8 +141,6 @@ fn prepare_with(
     }
     let kind = kind::detect(fs.as_mut(), req.abs, &stat)?;
     let host = req.label.unwrap_or(cache::LOCAL_HOST).to_string();
-    // The copy this open put in the cache, if it did: removed again if the open fails.
-    let cached = std::cell::RefCell::new(None::<PathBuf>);
     let mut reuse = reuse.filter(|r| r.abs == req.abs && unchanged(&r.copy.at, &stat));
     let mut fetch = |fs: &mut Box<dyn RemoteFs + Send>| -> Result<Fetched> {
         if let Some(r) = reuse.take() {
@@ -156,7 +154,6 @@ fn prepare_with(
             // The copy is the cached one now; its preview name goes with `r`.
             match published {
                 Ok((claim, notices)) => {
-                    *cached.borrow_mut() = Some(claim.local.clone());
                     return Ok(Fetched {
                         claim,
                         at: r.copy.at,
@@ -174,80 +171,69 @@ fn prepare_with(
             progress,
             cancel,
         )?;
-        *cached.borrow_mut() = Some(fetched.claim.local.clone());
         Ok(fetched)
     };
     let local = req.label.is_none();
-    let cache_root = req.cache;
-    let opened = (move || -> Result<Prepared> {
-        match kind {
-            Kind::Image => {
-                // Always a copy, as the standalone route makes it: Save needs the bytes as opened.
-                let fetched = fetch(&mut fs)?;
-                let bytes = std::fs::read(&fetched.claim.local)
-                    .with_context(|| format!("cannot read {}", fetched.claim.local.display()))?;
-                let doc = Doc::decode(&bytes)?;
-                let file = ImageFile::new(req.origin(fs, fetched.at), bytes, req.cache);
-                Ok(Prepared::Image {
-                    file,
-                    doc,
-                    notices: fetched.notices,
-                    claim: Some(fetched.claim),
-                })
-            }
-            Kind::Video | Kind::Audio => {
-                let fetched = if local { None } else { Some(fetch(&mut fs)?) };
-                let (path, at) = match &fetched {
-                    Some(f) => (f.claim.local.clone(), f.at),
-                    None => (PathBuf::from(req.abs), stat),
-                };
-                if kind::refine_local(&path, req.abs, kind) == Kind::Other {
-                    // A `.ts` ffprobe cannot read as media: the hex view, on the copy already here.
-                    return hex_of(req, fs, stat, fetched);
-                }
-                let media = Media::probe(&path)?;
-                let (notices, claim) = match fetched {
-                    Some(f) => (f.notices, Some(f.claim)),
-                    None => (Vec::new(), None),
-                };
-                Ok(Prepared::Media {
-                    origin: req.origin(fs, at),
-                    media: Box::new(media),
-                    notices,
-                    claim,
-                })
-            }
-            Kind::Text => {
-                let fetched = if local { None } else { Some(fetch(&mut fs)?) };
-                let path = match &fetched {
-                    Some(f) => f.claim.local.clone(),
-                    None => PathBuf::from(req.abs),
-                };
-                text::warm();
-                let doc = TextDoc::open_cancellable(&path, cancel)?;
-                let (notices, claim) = match fetched {
-                    Some(f) => (f.notices, Some(f.claim)),
-                    None => (Vec::new(), None),
-                };
-                Ok(Prepared::Text {
-                    doc,
-                    notices,
-                    claim,
-                })
-            }
-            Kind::Other | Kind::Directory => {
-                let fetched = if local { None } else { Some(fetch(&mut fs)?) };
-                hex_of(req, fs, stat, fetched)
-            }
+    match kind {
+        Kind::Image => {
+            // Always a copy, as the standalone route makes it: Save needs the bytes as opened.
+            let fetched = fetch(&mut fs)?;
+            let bytes = std::fs::read(&fetched.claim.local)
+                .with_context(|| format!("cannot read {}", fetched.claim.local.display()))?;
+            let doc = Doc::decode(&bytes)?;
+            let file = ImageFile::new(req.origin(fs, fetched.at), bytes, req.cache);
+            Ok(Prepared::Image {
+                file,
+                doc,
+                notices: fetched.notices,
+                claim: Some(fetched.claim),
+            })
         }
-    })();
-    if opened.is_err() {
-        // Its claim went with the error: the copy is nobody's.
-        if let Some(copy) = cached.borrow_mut().take() {
-            cache::discard(cache_root, &copy);
+        Kind::Video | Kind::Audio => {
+            let fetched = if local { None } else { Some(fetch(&mut fs)?) };
+            let (path, at) = match &fetched {
+                Some(f) => (f.claim.local.clone(), f.at),
+                None => (PathBuf::from(req.abs), stat),
+            };
+            if kind::refine_local(&path, req.abs, kind) == Kind::Other {
+                // A `.ts` ffprobe cannot read as media: the hex view, on the copy already here.
+                return hex_of(req, fs, stat, fetched);
+            }
+            let media = Media::probe(&path)?;
+            let (notices, claim) = match fetched {
+                Some(f) => (f.notices, Some(f.claim)),
+                None => (Vec::new(), None),
+            };
+            Ok(Prepared::Media {
+                origin: req.origin(fs, at),
+                media: Box::new(media),
+                notices,
+                claim,
+            })
+        }
+        Kind::Text => {
+            let fetched = if local { None } else { Some(fetch(&mut fs)?) };
+            let path = match &fetched {
+                Some(f) => f.claim.local.clone(),
+                None => PathBuf::from(req.abs),
+            };
+            text::warm();
+            let doc = TextDoc::open_cancellable(&path, cancel)?;
+            let (notices, claim) = match fetched {
+                Some(f) => (f.notices, Some(f.claim)),
+                None => (Vec::new(), None),
+            };
+            Ok(Prepared::Text {
+                doc,
+                notices,
+                claim,
+            })
+        }
+        Kind::Other | Kind::Directory => {
+            let fetched = if local { None } else { Some(fetch(&mut fs)?) };
+            hex_of(req, fs, stat, fetched)
         }
     }
-    opened
 }
 
 /// The hex view of the file: the copy fetched, or a local file read in place (as the binary

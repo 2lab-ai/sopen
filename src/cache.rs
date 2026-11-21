@@ -541,17 +541,6 @@ pub fn publish_claimed(
     Ok((claim, notices))
 }
 
-/// Removes the cached copy `local` (under `cache`) and what sopen recorded of it: a copy made
-/// for an open that then failed is not left behind. Called once its claim is dropped.
-pub fn discard(cache: &Path, local: &Path) {
-    let _ = std::fs::remove_file(local);
-    for kind in ["record", "lock"] {
-        if let Ok(meta) = meta_path(cache, kind, local) {
-            let _ = std::fs::remove_file(meta);
-        }
-    }
-}
-
 /// A new hard link to `copy` next to `target`, under a name nothing had (`<name>.link-<random>`):
 /// where the link is made, never over anything.
 fn link_beside(copy: &Path, target: &Path) -> Result<PathBuf> {
@@ -636,9 +625,6 @@ impl PreviewSpace {
             let _ = std::fs::remove_file(&lock);
             return Err(e).with_context(|| format!("cannot create {}", dir.display()));
         }
-        let mut spaces = SPACES.lock().unwrap_or_else(|p| p.into_inner());
-        spaces.push((dir.clone(), lock.clone()));
-        drop(spaces);
         Ok(Self {
             dir,
             lock,
@@ -666,28 +652,8 @@ impl PreviewSpace {
     }
 }
 
-/// The folders and locks of this process's windows' preview spaces, for as long as they live.
-static SPACES: std::sync::Mutex<Vec<(PathBuf, PathBuf)>> = std::sync::Mutex::new(Vec::new());
-
-/// Removes this process's preview folders, their locks and the preview root left empty: what
-/// sopen does before it ends without unwinding (a signal, the screenshot hook's watchdog), so
-/// that nothing of its previews stays in the cache.
-pub fn remove_preview_spaces() {
-    let spaces = std::mem::take(&mut *SPACES.lock().unwrap_or_else(|p| p.into_inner()));
-    for (dir, lock) in spaces {
-        let _ = std::fs::remove_dir_all(&dir);
-        let _ = std::fs::remove_file(&lock);
-        if let Some(root) = dir.parent() {
-            let _ = std::fs::remove_dir(root);
-        }
-    }
-}
-
 impl Drop for PreviewSpace {
     fn drop(&mut self) {
-        let mut spaces = SPACES.lock().unwrap_or_else(|p| p.into_inner());
-        spaces.retain(|(dir, _)| *dir != self.dir);
-        drop(spaces);
         // The folder first, while the lock is still held: no sweep takes it meanwhile.
         let _ = std::fs::remove_dir_all(&self.dir);
         let _ = std::fs::remove_file(&self.lock);

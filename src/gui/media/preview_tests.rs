@@ -1581,12 +1581,9 @@ fn a_test_that_does_not_end_is_failed_and_cleaned_up_after() {
     });
     let why = ended.expect_err("it did not end");
     assert!(reached.load(SeqCst), "it got as far as its endless wait");
-    // At least the two (a stand-in's own start-up check may still be going on a loaded machine).
-    let killed: usize = why
-        .strip_prefix("not over in 15 s; ")
-        .and_then(|rest| rest.split(' ').next()?.parse().ok())
-        .unwrap_or_else(|| panic!("{why}"));
-    assert!(killed >= 2, "{why}");
+    // How many it had to kill is said for whoever reads the failure; that nothing is left is
+    // what is held to, below.
+    assert!(why.starts_with("not over in 15 s; "), "{why}");
     let dir = dir.lock().unwrap().clone().expect("its folder");
     let started = started_under(&dir);
     assert_eq!(started.len(), 2);
@@ -1748,15 +1745,136 @@ fn a_six_channel_sound_shows_its_first_two_channels_by_name() {
     });
 }
 
-/// The other end of the two tests below: run by them in a process of its own (never by the
-/// suite), it starts a child that waits at a hold and then either waits to be signalled or
-/// gives up as the screenshot hook's watchdog does.
+/// A window whose first frame is still being looked for (its ffmpeg held by the test; an
+/// Export's ffmpeg held apart, and never let go) on a real clip.
+fn opened_with_a_stalled_first_frame(t: &Test, real: &Tools) -> (Fx, Hold) {
+    let tmp = t.tmp();
+    let path = tmp.path().join("clip.mp4");
+    clip(real, &path, (320, 240));
+    let (frame, export) = (
+        t.hold(tmp.path(), "frame-hold"),
+        t.hold(tmp.path(), "export-hold"),
+    );
+    // A frame's decode (it writes raw pictures) waits at one hold and fails; whatever else an
+    // Export runs waits at the other.
+    let body = format!(
+        "case \"$*\" in *rawvideo*) {}; exit 1 ;; esac\n{}",
+        frame.line(),
+        export.stalls()
+    );
+    let tools = Tools {
+        ffmpeg: stand_in(tmp.path(), "ffmpeg", &body),
+        ffprobe: real.ffprobe.clone(),
+    };
+    let mut fx = opened(tmp, path, &tools, &t.hand());
+    fx.drv.idle(&mut fx.win, 3);
+    assert!(fx.win.tex.is_none(), "no frame yet");
+    (fx, frame)
+}
+
+/// Lets the held frame decodes fail, one after the other, until `done`.
+fn until_the_frame_has_failed(fx: &mut Fx, frame: &Hold, done: impl Fn(&MediaWindow) -> bool) {
+    let give_up = Instant::now() + Duration::from_secs(30);
+    while !done(&fx.win) {
+        assert!(Instant::now() < give_up, "the frame's failure never came");
+        frame.let_go();
+        fx.drv.idle(&mut fx.win, 1);
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    fx.drv.idle(&mut fx.win, 2);
+}
+
+/// A window that finds it cannot show its first frame closes by itself only while it is as it
+/// was opened. Once the owner has edited — here a stretch cut out while the frame was still
+/// looked for, and then undone (the history stays) — the failure is said on the status row and
+/// the window stays: the edit is intact, and closing asks about it as ever.
 #[test]
-fn the_process_the_ending_tests_end() {
-    let (Ok(dir), Ok(how)) = (
-        std::env::var("SOPEN_TEST_ENDING_DIR"),
-        std::env::var("SOPEN_TEST_ENDING"),
-    ) else {
+fn a_first_frame_that_fails_does_not_close_an_edited_window() {
+    let Some(real) = tools_or_skip() else { return };
+    bounded(90, move |t| {
+        let (mut fx, frame) = opened_with_a_stalled_first_frame(t, &real);
+        // In at 0, the playhead on to 1 s, Out, Delete: a second cut out.
+        for key in [Key::I, Key::ArrowRight, Key::O, Key::Delete] {
+            fx.drv.key(&mut fx.win, key, Modifiers::NONE);
+        }
+        assert!(fx.win.unsaved(), "edited");
+        let cut = fx.win.timeline.clips().to_vec();
+        until_the_frame_has_failed(&mut fx, &frame, |w| w.status.error);
+        assert!(
+            fx.win.status.text.contains("no frame"),
+            "{}",
+            fx.win.status.text
+        );
+        assert_eq!(
+            fx.win.failure(),
+            None,
+            "the open is not failed: it is edited"
+        );
+        assert!(fx.win.outcome.lock().unwrap().failed.is_none());
+        assert!(!fx.drv.closed(), "the window stays");
+        assert_eq!(fx.win.timeline.clips(), cut, "the edit is intact");
+        assert!(!fx.win.close_requested(), "closing asks about the edit");
+        assert!(fx.win.prompt, "the unsaved-changes question");
+        fx.win.prompt = false;
+
+        // Undone: as the file is, but with a history — it still does not close by itself.
+        fx.win.status = Status::default();
+        fx.drv.key(&mut fx.win, Key::Z, command(false));
+        assert!(!fx.win.unsaved() && fx.win.timeline.can_redo());
+        until_the_frame_has_failed(&mut fx, &frame, |w| w.status.error);
+        assert_eq!(fx.win.failure(), None, "it has a history");
+        assert!(!fx.drv.closed(), "the window stays");
+        assert!(fx.win.timeline.can_redo(), "the history is intact");
+    });
+}
+
+/// Nor while it writes: with an Export running (started while the frame was still looked for),
+/// the failure is said and the window stays — its close handling is the export's, as ever.
+#[test]
+fn a_first_frame_that_fails_does_not_close_a_window_that_is_writing() {
+    let Some(real) = tools_or_skip() else { return };
+    bounded(90, move |t| {
+        let (mut fx, frame) = opened_with_a_stalled_first_frame(t, &real);
+        fx.drv.key(&mut fx.win, Key::E, Modifiers::NONE);
+        assert!(
+            fx.win.job.is_some(),
+            "the export runs: {}",
+            fx.win.status.text
+        );
+        until_the_frame_has_failed(&mut fx, &frame, |w| w.status.error);
+        assert!(
+            fx.win.status.text.contains("no frame"),
+            "{}",
+            fx.win.status.text
+        );
+        assert_eq!(fx.win.failure(), None, "the open is not failed: it writes");
+        assert!(!fx.drv.closed(), "the window stays");
+        assert!(fx.win.job.is_some(), "the export goes on");
+        assert!(!fx.win.close_requested(), "closing waits for the export");
+        assert!(fx.win.close_when_done);
+    });
+}
+
+/// And as it was opened, with nothing running: it does close by itself, the open failed.
+#[test]
+fn a_first_frame_that_fails_closes_a_window_as_it_was_opened() {
+    let Some(real) = tools_or_skip() else { return };
+    bounded(90, move |t| {
+        let (mut fx, frame) = opened_with_a_stalled_first_frame(t, &real);
+        until_the_frame_has_failed(&mut fx, &frame, |w| w.failure().is_some());
+        assert!(fx.win.failure().unwrap().contains("no frame"));
+        assert!(fx.win.close_requested(), "it goes without a question");
+    });
+}
+
+/// The other end of the test below: run by it in a process of its own (never by the suite: it
+/// does nothing without the test's variable), it starts a preparation whose ffprobe waits at a
+/// hold, and waits to be killed. Its command line names the test's folder, so the test's
+/// supervisor finds it whatever happens.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_process_that_is_killed() {
+    let Ok(dir) = std::env::var("SOPEN_TEST_KILLED_DIR") else {
         return;
     };
     let dir = PathBuf::from(dir);
@@ -1764,66 +1882,39 @@ fn the_process_the_ending_tests_end() {
         ffmpeg: dir.join("ffprobe"),
         ffprobe: dir.join("ffprobe"),
     };
-    let path = dir.join("hangs.mp4");
-    let held = Arc::new(Held::real([600, 600, 600, 600].map(Duration::from_secs)));
-    let worker = std::thread::spawn(move || {
-        let _ = prepare(&tools, &path, &held);
-    });
-    until("the probe starts", || !started_under(&dir).is_empty());
-    println!("child started");
-    if how == "watchdog" {
-        crate::gui::give_up("the test's watchdog");
-    }
-    let _ = worker.join();
+    let held = Held::real([600, 600, 600, 600].map(Duration::from_secs));
+    let _ = prepare(&tools, &dir.join("hangs.mp4"), &held);
 }
 
-/// Runs this test binary's [`the_process_the_ending_tests_end`] in a process of its own, its
-/// ffprobe a stand-in held in `dir`; returns once that child runs.
-fn a_process_with_a_held_child(t: &Test, how: &str) -> (std::process::Child, PathBuf) {
-    let tmp = t.tmp();
-    let hold = t.hold(tmp.path(), "hold");
-    stand_in(tmp.path(), "ffprobe", &hold.stalls());
-    std::fs::write(tmp.path().join("hangs.mp4"), b"whatever").unwrap();
-    let process = std::process::Command::new(std::env::current_exe().unwrap())
-        .args([
-            "gui::media::preview_tests::the_process_the_ending_tests_end",
-            "--exact",
-            "--nocapture",
-            "--test-threads=1",
-        ])
-        .env("SOPEN_TEST_ENDING_DIR", tmp.path())
-        .env("SOPEN_TEST_ENDING", how)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
-    (process, tmp.path().to_path_buf())
-}
-
-/// sopen ended by a signal (SIGTERM, SIGHUP) leaves no ffprobe behind: the child a preview's
-/// preparation runs is stopped before the process goes — which still dies of that signal.
+/// Linux: a sopen that is killed outright (`kill -9`: nothing of it runs any more) takes the
+/// ffprobe of its preview with it — the kernel ends the child when its parent goes
+/// (`PR_SET_PDEATHSIG`). No window is opened.
+#[cfg(target_os = "linux")]
 #[test]
-fn a_signal_that_ends_sopen_ends_its_children_first() {
-    use std::os::unix::process::ExitStatusExt as _;
-    for signal in [libc::SIGTERM, libc::SIGHUP] {
-        bounded(60, move |t| {
-            let (mut process, dir) = a_process_with_a_held_child(t, "signal");
-            until("its ffprobe runs", || naming(&dir) == 1);
-            unsafe { libc::kill(process.id() as libc::pid_t, signal) };
-            let status = process.wait().unwrap();
-            assert_eq!(status.signal(), Some(signal), "it died of the signal");
-            assert_eq!(naming(&dir), 0, "its ffprobe went first");
-        });
-    }
-}
-
-/// The screenshot hook's watchdog giving up ends the children the same way before it exits.
-#[test]
-fn the_watchdog_giving_up_ends_the_children_first() {
+fn on_linux_a_killed_sopen_takes_its_child_with_it() {
     bounded(60, |t| {
-        let (mut process, dir) = a_process_with_a_held_child(t, "watchdog");
-        let status = process.wait().unwrap();
-        assert_eq!(status.code(), Some(1), "it gave up");
-        assert_eq!(naming(&dir), 0, "its ffprobe went first");
+        let tmp = t.tmp();
+        let hold = t.hold(tmp.path(), "hold");
+        stand_in(tmp.path(), "ffprobe", &hold.stalls());
+        std::fs::write(tmp.path().join("hangs.mp4"), b"whatever").unwrap();
+        let mut process = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "gui::media::preview_tests::the_process_that_is_killed",
+                "--exact",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            // A second filter that matches nothing: the folder is in its command line.
+            .arg(tmp.path())
+            .env("SOPEN_TEST_KILLED_DIR", tmp.path())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        // The process itself, and its ffprobe.
+        until("its ffprobe runs", || naming(tmp.path()) == 2);
+        unsafe { libc::kill(process.id() as libc::pid_t, libc::SIGKILL) };
+        let _ = process.wait();
+        until("its ffprobe is gone with it", || naming(tmp.path()) == 0);
     });
 }

@@ -1391,6 +1391,13 @@ impl MediaWindow {
             .is_some_and(|(t, key)| self.tex_at == Some((t, Some(key))))
     }
 
+    /// As it was opened, and idle: nothing edited — no edit to undo or redo either — and no
+    /// Save or Export running. Only such a window may close by itself.
+    fn as_opened(&self) -> bool {
+        let tl = &self.timeline;
+        tl.is_identity() && !tl.can_undo() && !tl.can_redo() && !self.busy() && !self.sel.is_set()
+    }
+
     /// Unsaved edits: the output is not the file as it is.
     fn unsaved(&self) -> bool {
         !self.timeline.is_identity()
@@ -2742,7 +2749,10 @@ impl super::Window for MediaWindow {
                 // The window does not sit there for ever: the open has failed — it says why
                 // and asks to be closed (its opener says it: back in the list, or the error
                 // `sopen` ends with).
-                Some(Err(e)) if self.tex.is_none() && self.failed.is_none() => {
+                // Only a window still as it was opened: once its owner has edited (or the edit
+                // was undone: the history is theirs), or a Save or an Export runs, it stays —
+                // the failure is said below and closing is handled as ever.
+                Some(Err(e)) if self.tex.is_none() && self.failed.is_none() && self.as_opened() => {
                     let why = format!("cannot show {}: {e}", self.title);
                     self.outcome.lock().unwrap().failed = Some(why.clone());
                     self.failed = Some(why);
@@ -2884,9 +2894,17 @@ impl super::Window for MediaWindow {
 
     fn close_requested(&mut self) -> bool {
         // A preview holds nothing unsaved and writes nothing: dropping it asks nothing.
-        // Nor does one that failed to show its file: it goes.
-        if self.close_ok || self.preview || self.failed.is_some() {
+        if self.close_ok || self.preview {
             return true;
+        }
+        // Nor does one that failed to show its file, still as it was opened: it goes. (One
+        // edited or writing since then is asked as any other, and its open did not fail.)
+        if self.failed.is_some() {
+            if self.as_opened() {
+                return true;
+            }
+            self.failed = None;
+            self.outcome.lock().unwrap().failed = None;
         }
         if self.save.is_some() {
             // Never close mid-write: the window closes once the save has reported. Said in the
@@ -2931,7 +2949,6 @@ impl super::Window for MediaWindow {
 mod file;
 
 mod child;
-pub use child::end_all as end_children;
 #[cfg(test)]
 pub(crate) mod fixtures;
 pub mod preview;

@@ -984,9 +984,6 @@ fn event_loop_hook() -> Option<eframe::EventLoopBuilderHook> {
 /// sopen gives up (`why`) and exits 1 without unwinding: nothing of it is left running.
 pub(crate) fn give_up(why: &str) -> ! {
     eprintln!("sopen: {why}; giving up");
-    // An ffprobe or ffmpeg a preview runs would outlive this exit (nothing unwinds).
-    media::end_children();
-    crate::cache::remove_preview_spaces();
     std::process::exit(1);
 }
 

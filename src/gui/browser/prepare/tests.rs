@@ -1994,20 +1994,3 @@ fn a_remote_card_names_the_remote_file_and_says_its_kind() {
     shown(&mut drv, &mut Host(&mut p.embedded.window));
     assert!(drv.find_text("Kind").is_some(), "the card's Kind row");
 }
-
-/// Enter on a remote file that then cannot be opened (an empty `.mp4`) leaves no copy of it in
-/// the cache: what was fetched for the failed open is removed.
-#[test]
-fn a_remote_open_that_fails_leaves_no_cached_copy() {
-    if media_tools().is_none() {
-        return;
-    }
-    let Some(fx) = remote() else { return };
-    let abs = fx.file("empty.mp4", b"");
-    let result = prepare(&fx.request(&abs), &AtomicBool::new(false), &mut |_, _| {});
-    assert!(result.is_err(), "it cannot be opened");
-    let cached = crate::cache::cache_path(&fx.cache, "box", &abs);
-    assert!(!cached.exists(), "its copy was left in the cache");
-    let left: Vec<_> = fx.cache_files().into_keys().collect();
-    assert!(left.is_empty(), "{left:?}");
-}

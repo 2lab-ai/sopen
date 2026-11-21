@@ -221,7 +221,8 @@ impl Hold {
         format!("{}\nexec '{}' \"$@\"", self.line(), program.display())
     }
 
-    fn let_go(&self) -> bool {
+    /// Lets go what waits here now, if anything does (`false`: nothing waited).
+    pub(crate) fn let_go(&self) -> bool {
         use std::io::Write as _;
         let pipe = std::fs::OpenOptions::new()
             .write(true)
@@ -417,7 +418,7 @@ pub(crate) fn supervised(
         Err(mpsc::RecvTimeoutError::Timeout) => {
             let killed = test.clean_up(Duration::ZERO);
             return Err(format!(
-                "not over in {secs} s; {killed} processes it left were killed"
+                "not over in {secs} s; {killed} cleanup targets (processes it left) were killed"
             ));
         }
     };
@@ -425,7 +426,9 @@ pub(crate) fn supervised(
     let killed = test.clean_up(Duration::from_secs(5));
     match ended {
         Ok(()) if killed == 0 => Ok(()),
-        Ok(()) => Err(format!("it ended and left {killed} processes (killed)")),
+        Ok(()) => Err(format!(
+            "it ended and left {killed} cleanup targets (processes, killed)"
+        )),
         Err(panic) => std::panic::resume_unwind(panic),
     }
 }
