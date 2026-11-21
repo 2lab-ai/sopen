@@ -36,7 +36,7 @@ fn previewed(dir: &Path, name: &str, body: &str) -> TextWindow {
 }
 
 /// What input could change in a text viewer.
-fn place(win: &TextWindow) -> (u64, u64, bool, usize) {
+fn place(win: &TextWindow) -> (u64, u64, bool, u64) {
     (win.top, win.top_off, win.wrap, win.left)
 }
 

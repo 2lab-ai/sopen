@@ -12,11 +12,22 @@
 //! indexed twice. A preview draws without its bars, takes no input and neither follows nor re-reads
 //! its file ([`Window::set_preview`]).
 //!
+//! The index's memory is bounded (06 §7.2): at [`MARKS_MAX`] marks, 16 MiB, the line spacing
+//! doubles and the marks no longer due are dropped ([`Scan::thin`]) — never one whose going
+//! would leave a line start a span past its mark — so it holds at most 16 MiB, or three marks
+//! to each 64 KiB of the file where that is more (17.6 MB for 24 GB of any text). The document
+//! holds the one copy of it; the highlighter's copy is of the first [`HIGHLIGHT_MAX`] only.
+//!
+//! The place on screen is a byte offset (06 §7.2): where the top line starts in the file, with
+//! its line number where the index reaches it, and the byte of it the top row starts at.
 //! Lines wrap by default ([`wrap`]): every line is shown whole, in rows broken by the measured
 //! width of their glyphs, and a page reads only its rows' bytes — a line of hundreds of megabytes
-//! too, from wherever the page is in it. The place on screen is a line and the byte of it the top
-//! row starts at. W or F2 switch to one row per line, scrolled sideways, where only [`LINE_MAX`]
-//! bytes of a line are shown.
+//! too, from wherever the page is in it. W or F2 switch to one row per line, where the place
+//! within a line is a byte of it: → and ←, Home, End and the wheel sideways move it, and a row
+//! is read under the same bound as a wrapped one, so a line of any length can be scrolled to
+//! any byte. Cmd/Ctrl+G opens Go to in the status row: a line number, or `0x…` for a byte
+//! offset. The scroll bar is clicked or dragged: by lines when the lines are all known and not
+//! wrapped, else by bytes.
 //!
 //! Highlighting carries state from the top of the file: the state at each mark is computed
 //! once, in order, and a page is highlighted from the mark before it. It runs on a worker of
@@ -28,7 +39,8 @@
 //! run in the process, stuck ones included ([`Pool`]); a viewer that gets no slot stays plain. A line is parsed only whole: highlighting stops at the first
 //! line longer than [`LINE_MAX`] (only its start is read, and a comment or string closed past the
 //! cut would colour everything after it), and the rest of the file is plain (wrapped, still
-//! whole). Files over [`HIGHLIGHT_MAX`] are always shown plain.
+//! whole). A file over [`HIGHLIGHT_MAX`] is highlighted over its first 16 MiB and plain past
+//! them, read through a stream or in place (06 Tensions, settled by W5b).
 //!
 //! The file is read live; the index is of the file as opened. A file that differs from it in any
 //! way ([`TextDoc::now`]: written to, grown, truncated, another file renamed over its path) is
@@ -43,7 +55,7 @@
 //! arrives the window says `loading…`, and nothing else is fetched before that screen is drawn.
 //! The index then grows from byte 0 on the frames, through a Bulk reader, as far as
 //! [`HIGHLIGHT_MAX`] (a preview: the budget its route gives it, 02 §4.3); the top bar says how far the lines are
-//! known, and the gutter is sized once, for the most lines that index can hold. A read whose
+//! known, and the gutter is sized once. A read whose
 //! bytes are not here yet is [`Pending`]: it travels up as [`Stale`] does, in an arm of its own
 //! — the page on screen stays, where the keys asked to go is kept, and the Source's waker
 //! brings the pass that reads again. A read that failed keeps the screen and the keys too, with
@@ -51,9 +63,22 @@
 //! reads through a reader of its own with the blocking read, so it waits for its bytes and
 //! never sees `Pending`; it highlights over the indexed lines as they grow. A file that
 //! changed on the remote freezes the page until Cmd/Ctrl+R, which re-opens it and indexes it
-//! again from its first block. The browser's route opens one for remote text of at most
-//! [`HIGHLIGHT_MAX`] (06 §13 W8a); a larger remote file is still fetched whole and read as a
-//! local file until W5b.
+//! again from its first block.
+//!
+//! Past the lines known — a stream over 16 MiB (06 §7.2, W5b) — the file is read by byte
+//! position. The index is a prefix that only grows from byte 0: by the pass, by what the
+//! screen reads at its end ([`TextDoc::grow_from_screen`]), and — only when Go to asks for a
+//! line past it — by the pass run on to that line, with progress, until Esc. A jump (End, Go
+//! to an offset, the scroll bar, a place opened at) asks once for the blocks around its place
+//! ([`TextDoc::bring`]: at most three, the file's end two) and looks back for the line start
+//! from the 16 KiB grid point at or before it ([`TextDoc::piece_holding`]), within 64 KiB of
+//! that cell's end. A line found so has its byte offset in the gutter in place of a number. A
+//! line whose start is not in reach is shown in pieces that begin on the grid, `…` before
+//! their offset, and the status row says `line start not known`; up and down then step a grid
+//! point. No line is read or laid out whole. A local file keeps its whole-file pass, which
+//! runs before its first screen: every line of it has its number (06 Tensions, settled by
+//! W5b). The browser's route still opens a stream only for remote text of at most
+//! [`HIGHLIGHT_MAX`] (06 §13 W8a); W8b routes the larger ones here.
 
 mod wrap;
 
@@ -76,17 +101,29 @@ use syntect::parsing::{ParseState, ScopeStack, SyntaxReference, SyntaxSet};
 const BLOCK_LINES: u64 = 256;
 /// …or at the first line start this far past the last mark, whichever comes first.
 const SPAN: u64 = 64 * 1024;
-/// Bytes of a line shown when lines are not wrapped; the rest is cut (the bar says so). Also the
-/// longest line highlighting parses.
+/// The longest line highlighting parses, and the most of a line [`TextDoc::read_lines`] gives.
+/// (On screen a line is shown whole: wrapped in rows, or — not wrapped — from any byte of it.)
 pub const LINE_MAX: usize = 4096;
-/// Files above this are shown without highlighting (its state runs from the top of the file).
+/// Highlighting covers this much of a file, from its start (its state runs from the top of the
+/// file); the rest is plain. Also how far a stream's index pass reads without being asked.
 pub const HIGHLIGHT_MAX: u64 = 16 << 20;
 /// Reads while looking for the end of a line.
 const CHUNK: usize = 16 * 1024;
+/// The most marks the index holds before it thins them (06 §7.2): 16 MiB of them.
+const MARKS_MAX: usize = 1 << 20;
+/// The widest the line spacing of marks gets. Lines that far apart are a span apart too, so
+/// from there on every mark is a span past the one before: 16 bytes per 64 KiB.
+const SPACING_MAX: u64 = SPAN;
+/// The grid a line whose start is not known is cut on, and wrapping restarts on (06 §7.2).
+const GRID: u64 = wrap::RESTART;
+/// How far before a place's grid point its line's start is looked for (06 §7.2: at most a
+/// span back — what a jump's one ask brings). A line that starts further back has no known
+/// start there, and is shown in pieces from the grid.
+const REACH: u64 = SPAN;
 /// Columns a tab advances to.
 const TAB: usize = 4;
-/// Columns Left / Right scroll by.
-const SIDEWAYS: usize = 8;
+/// Bytes of a line Left / Right scroll by (not wrapped).
+const SIDEWAYS: u64 = 8;
 
 /// Where line `line` starts: byte `offset`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -111,6 +148,8 @@ pub struct TextDoc {
     lines: u64,
     /// The last line ends with a newline.
     ends_newline: bool,
+    /// Where the last line indexed starts (`size` when it ended with its newline).
+    open_at: u64,
     /// The first line longer than [`LINE_MAX`] bytes (0-based), if any.
     first_long: Option<u64>,
     /// The file as indexed: size, modification time and inode.
@@ -171,6 +210,19 @@ struct Stream {
     /// A worker's copy: reads wait for their bytes (the blocking `read_at`) until this is set.
     /// A frame's never waits: it gets [`Pending`].
     blocking: Option<Arc<AtomicBool>>,
+    /// How far the index pass goes now (the window's to say: 16 MiB, a preview's budget, or
+    /// the whole file while Go to looks for a line).
+    cap: u64,
+    /// A jump's readers (06 §7.2): one for each block it asks for, each asking for one byte
+    /// of its block — a demand with no margin beside it — so the jump is one ask.
+    pins: Vec<Box<dyn Bytes + Send>>,
+    /// What reads a jump's blocks once they are here: a Bulk reader out of sequence, which
+    /// fetches nothing beside what it is asked.
+    quiet: Option<Box<dyn Bytes + Send>>,
+    /// The blocks the last jump brought, and where they start: its page is read from them.
+    near: Option<(u64, bytes::Bytes)>,
+    /// The last bytes the screen read at the end of the lines known: the index grows by them.
+    seen: Option<(u64, bytes::Bytes)>,
 }
 
 /// A read whose bytes are not here yet (06 §7.2): the fetch is queued and the Source's waker
@@ -317,6 +369,7 @@ impl TextDoc {
             marks: Vec::new(),
             lines: 0,
             ends_newline: false,
+            open_at: 0,
             first_long: None,
             opened,
             indexed_in: std::time::Duration::ZERO,
@@ -334,7 +387,15 @@ impl TextDoc {
             #[cfg(test)]
             stale_reads: false,
         };
-        doc.install(&scan);
+        let mut scan = scan;
+        if scan.capped {
+            // A preview's stopped pass keeps its marks to go on from (a few megabytes' worth).
+            doc.marks.clone_from(&scan.marks);
+        } else {
+            // The one copy of the index (06 §7.2: its memory is bounded, and counted once).
+            doc.marks = std::mem::take(&mut scan.marks);
+        }
+        doc.adopt(&scan);
         doc.rest = scan.capped.then_some(scan);
         doc
     }
@@ -354,8 +415,13 @@ impl TextDoc {
             tail: None,
             source: Some(source),
             total,
-            scan: scan.clone(),
+            scan: Scan::default(),
             blocking: None,
+            cap: HIGHLIGHT_MAX,
+            pins: Vec::new(),
+            quiet: None,
+            near: None,
+            seen: None,
         };
         let mut doc = Self {
             backing: Backing::Stream(Box::new(stream)),
@@ -363,6 +429,7 @@ impl TextDoc {
             marks: Vec::new(),
             lines: 0,
             ends_newline: false,
+            open_at: 0,
             first_long: None,
             opened: (0, 0, total, None),
             indexed_in: std::time::Duration::ZERO,
@@ -427,10 +494,43 @@ impl TextDoc {
         let Backing::Stream(stream) = &mut self.backing else {
             return Ok(None);
         };
+        // The index has one copy of its marks, the document's: the pass has them for its step.
+        std::mem::swap(&mut stream.scan.marks, &mut self.marks);
+        let stepped = Self::step(stream, cap, budget);
+        std::mem::swap(&mut stream.scan.marks, &mut self.marks);
+        if !stepped? {
+            return Ok(None);
+        }
+        let scan = std::mem::take(&mut stream.scan);
+        self.adopt(&scan);
+        if let Backing::Stream(stream) = &mut self.backing {
+            stream.scan = scan;
+        }
+        Ok(Some(self.growth(before, lines, ends_newline)))
+    }
+
+    /// What the index gained since it had `before` marks and `lines` lines.
+    fn growth(&self, before: usize, lines: u64, ends_newline: bool) -> Growth {
+        // (Thinned meanwhile: the marks are all new to a copy. A worker's copy is of the
+        // first 16 MiB, where the index is never thinned.)
+        let before = before.min(self.marks.len());
+        Growth {
+            size: self.size,
+            lines: self.lines,
+            ends_newline: self.ends_newline,
+            first_long: self.first_long,
+            marks_before: before,
+            marks: self.marks[before..].to_vec(),
+            open_line: (lines > 0 && !ends_newline).then(|| lines - 1),
+        }
+    }
+
+    /// [`TextDoc::grow`]'s reads: whether the pass moved on.
+    fn step(stream: &mut Stream, cap: u64, budget: u64) -> Result<bool> {
         let end = stream.total.min(cap);
         let from = stream.scan.at;
         if from >= end {
-            return Ok(None);
+            return Ok(false);
         }
         // How far past a read a Bulk reader's readahead goes.
         let (ahead, _) = crate::stream::limits(ReaderKind::Bulk);
@@ -490,20 +590,80 @@ impl TextDoc {
         if stream.scan.at == from {
             return match failed {
                 Some(e) => Err(e),
-                None => Ok(None),
+                None => Ok(false),
             };
         }
-        let scan = stream.scan.clone();
-        self.install(&scan);
-        Ok(Some(Growth {
-            size: self.size,
-            lines: self.lines,
-            ends_newline: self.ends_newline,
-            first_long: self.first_long,
-            marks_before: before,
-            marks: self.marks[before.min(self.marks.len())..].to_vec(),
-            open_line: (lines > 0 && !ends_newline).then(|| lines - 1),
-        }))
+        Ok(true)
+    }
+
+    /// The index grows by what the screen read at its end (06 §7.2): past the pass's cap the
+    /// lines known go on only through blocks the screen brought in, while those are contiguous
+    /// with them. `None`: nothing of the kind is here.
+    fn grow_from_screen(&mut self) -> Option<Growth> {
+        let (before, lines, ends_newline) = (self.marks.len(), self.lines, self.ends_newline);
+        let Backing::Stream(stream) = &mut self.backing else {
+            return None;
+        };
+        if stream.source.is_none() || stream.scan.at < stream.total.min(stream.cap) {
+            // A worker's copy; or the pass is still on its way here.
+            return None;
+        }
+        let from = stream.scan.at;
+        std::mem::swap(&mut stream.scan.marks, &mut self.marks);
+        loop {
+            let at = stream.scan.at;
+            let piece = [&stream.seen, &stream.near]
+                .into_iter()
+                .flatten()
+                .find(|(lo, bytes)| *lo <= at && at < lo + bytes.len() as u64)
+                .map(|(lo, bytes)| bytes.slice((at - lo) as usize..));
+            match piece {
+                Some(piece) if at < stream.total => stream.scan.feed(&piece, stream.total),
+                _ => break,
+            }
+        }
+        std::mem::swap(&mut stream.scan.marks, &mut self.marks);
+        if stream.scan.at == from {
+            return None;
+        }
+        let scan = std::mem::take(&mut stream.scan);
+        self.adopt(&scan);
+        if let Backing::Stream(stream) = &mut self.backing {
+            stream.scan = scan;
+        }
+        Some(self.growth(before, lines, ends_newline))
+    }
+
+    /// How far a stream's index pass goes (a local file's index is whole).
+    fn cap(&self) -> u64 {
+        self.stream().map_or(u64::MAX, |s| s.cap)
+    }
+
+    /// How far a stream's index pass goes from now on.
+    fn set_cap(&mut self, cap: u64) {
+        if let Backing::Stream(stream) = &mut self.backing {
+            stream.cap = cap;
+        }
+    }
+
+    /// A stream's index pass is on its way to its cap: the lines are known as far as it has
+    /// read, the last of them maybe not to its end, and what lies past them waits for it.
+    fn passing(&self) -> bool {
+        self.stream()
+            .is_some_and(|s| s.scan.at < s.total.min(s.cap))
+    }
+
+    /// The pass asks for nothing more (Go to was stopped, or found its line): what it had
+    /// queued is not sent, and only what was on its way arrives.
+    fn stop_pass(&mut self) {
+        if let Backing::Stream(stream) = &mut self.backing {
+            for reader in [stream.pass.as_mut(), stream.tail.as_mut()]
+                .into_iter()
+                .flatten()
+            {
+                let _ = reader.try_read(0, 0);
+            }
+        }
     }
 
     /// A worker's copy: its reads wait for their bytes, until `cancel` is set (06 §7.2: the
@@ -538,9 +698,18 @@ impl TextDoc {
     /// The index is what `scan` found so far: of the bytes it read, and no mark at or past
     /// their end.
     fn install(&mut self, scan: &Scan) {
-        let size = scan.at;
         self.marks.clone_from(&scan.marks);
+        self.adopt(scan);
+    }
+
+    /// [`TextDoc::install`] without the marks (the document has them already).
+    fn adopt(&mut self, scan: &Scan) {
+        let size = scan.at;
         self.marks.retain(|m| m.line == 0 || m.offset < size);
+        self.open_at = match scan.last_byte {
+            Some(b'\n') | None => size,
+            Some(_) => size - scan.line_len.min(size),
+        };
         self.first_long = scan.first_long;
         if scan.line_len > LINE_MAX as u64 && self.first_long.is_none() {
             self.first_long = Some(scan.line);
@@ -704,8 +873,31 @@ impl TextDoc {
         &self.path
     }
 
-    /// The same file and index on a handle of its own (the highlighting worker's).
+    /// The file on a handle of its own with the index of its first `cap` bytes — the
+    /// highlighting worker's: its state runs from the top of the file, so it goes no further
+    /// than [`HIGHLIGHT_MAX`], and its copy of the index is of that much and no more (06
+    /// §7.2). The copy ends at a mark: at a line start.
+    fn share_first(&self, cap: u64) -> Result<TextDoc> {
+        if self.size <= cap {
+            return self.share();
+        }
+        let keep = self.marks.partition_point(|m| m.offset <= cap).max(1);
+        let end = self.marks[keep - 1];
+        let mut doc = self.share_with(self.marks[..(keep - 1).max(1)].to_vec())?;
+        doc.size = end.offset;
+        doc.lines = end.line;
+        doc.ends_newline = true;
+        doc.open_at = end.offset;
+        doc.rest = None;
+        Ok(doc)
+    }
+
+    /// The same file and index on a handle of its own.
     fn share(&self) -> Result<TextDoc> {
+        self.share_with(self.marks.clone())
+    }
+
+    fn share_with(&self, marks: Vec<Mark>) -> Result<TextDoc> {
         let backing = match &self.backing {
             Backing::Local(file) => {
                 Backing::Local(file.try_clone().context("cannot open the file again")?)
@@ -720,15 +912,21 @@ impl TextDoc {
                     total: stream.total,
                     scan: Scan::default(),
                     blocking: None,
+                    cap: stream.cap,
+                    pins: Vec::new(),
+                    quiet: None,
+                    near: None,
+                    seen: None,
                 }))
             }
         };
         Ok(TextDoc {
             backing,
             size: self.size,
-            marks: self.marks.clone(),
+            marks,
             lines: self.lines,
             ends_newline: self.ends_newline,
+            open_at: self.open_at,
             first_long: self.first_long,
             opened: self.opened,
             indexed_in: self.indexed_in,
@@ -803,6 +1001,19 @@ impl TextDoc {
                     self.page_reads += n as u64;
                     return Ok(n);
                 }
+                // From the blocks the last jump brought, when they hold all of it: no reader
+                // is asked, so nothing beside them is fetched.
+                if let Some((lo, near)) = &stream.near {
+                    let end = lo + near.len() as u64;
+                    let want = at.saturating_add(buf.len() as u64).min(stream.total);
+                    if *lo <= at && at < end && want <= end {
+                        let n = (want - at) as usize;
+                        let from = (at - lo) as usize;
+                        buf[..n].copy_from_slice(&near[from..from + n]);
+                        self.page_reads += n as u64;
+                        return Ok(n);
+                    }
+                }
                 stream.reader.as_mut()
             }
         };
@@ -812,6 +1023,13 @@ impl TextDoc {
         };
         buf[..got.len()].copy_from_slice(&got);
         self.page_reads += got.len() as u64;
+        if let Backing::Stream(stream) = &mut self.backing {
+            // Read at the end of the lines known: the index grows by it (06 §7.2).
+            let end = stream.scan.at;
+            if stream.source.is_some() && at <= end && end < at + got.len() as u64 {
+                stream.seen = Some((at, got.clone()));
+            }
+        }
         Ok(got.len())
     }
 
@@ -892,11 +1110,13 @@ impl TextDoc {
         Ok(out)
     }
 
-    /// Where lines `first..first + count` are (fewer at the end of the file), for showing them
+    /// Where lines `first..first + count` of the index are (fewer at its end), for showing them
     /// whole (wrapped). Found as [`TextDoc::read_lines`] finds them — at most a span from the
     /// mark before `first`, then each line that ends before the next mark (such a line is short:
-    /// it ends within a span of its block's mark), never past where the index says it must end —
-    /// except that a line ending at a mark is not read at all but for its last byte (a `\r`).
+    /// it ends within a span of its block's mark), never past where the index says it must end.
+    /// A line ending at a mark is not read at all: not its last byte either, which may be far
+    /// away and not fetched (06 §7.2) — the row that holds its end looks for the `\r`
+    /// ([`Span::cr`]).
     fn spans(&mut self, first: u64, count: usize) -> Result<Vec<Span>> {
         let mut out = Vec::new();
         let last = first.saturating_add(count as u64).min(self.lines);
@@ -912,21 +1132,20 @@ impl TextDoc {
             if line + 1 == next.line {
                 let newline = u64::from(next.line < self.lines || self.ends_newline);
                 // Checked: a file changed since it was indexed can put `pos` past the mark.
-                let mut len = next
+                let len = next
                     .offset
                     .checked_sub(pos)
                     .and_then(|n| n.checked_sub(newline))
                     .unwrap_or(0);
                 if keep {
-                    // (Through a stream's growing index this byte is one the pass has read:
-                    // every offset the index names lies in the bytes already fetched.)
-                    if len > 0 && window.take(self, pos + len - 1, 1)?.first() == Some(&b'\r') {
-                        len -= 1;
-                    }
                     out.push(Span {
-                        line,
+                        line: Some(line),
                         start: pos,
                         len,
+                        next: next.offset,
+                        loose: false,
+                        ends: true,
+                        cr: len > 0,
                     });
                 }
                 pos = next.offset;
@@ -954,14 +1173,18 @@ impl TextDoc {
                             }
                             let len = pos + i as u64 - start;
                             let cr = u64::from(len > 0 && before == Some(b'\r'));
+                            pos += i as u64 + 1;
                             if keep {
                                 out.push(Span {
-                                    line,
+                                    line: Some(line),
                                     start,
                                     len: len - cr,
+                                    next: pos,
+                                    loose: false,
+                                    ends: true,
+                                    cr: false,
                                 });
                             }
-                            pos += i as u64 + 1;
                             break;
                         }
                         None => {
@@ -1008,8 +1231,8 @@ impl TextDoc {
         Ok(out)
     }
 
-    /// The line byte `at` of the file is in (the last line for `at` past the end): read from the
-    /// mark before it, as [`TextDoc::spans`] reads.
+    /// The line of the index byte `at` of the file is in (its last line for `at` past them):
+    /// read from the mark before it, as [`TextDoc::spans`] reads.
     fn span_at(&mut self, at: u64) -> Result<Option<Span>> {
         if self.lines == 0 {
             return Ok(None);
@@ -1026,6 +1249,279 @@ impl TextDoc {
             .find(|s| s.start <= at)
             .or(spans.last())
             .copied())
+    }
+
+    /// The lines the index gives whole, and the byte they end at: all of them once the file is
+    /// indexed whole, and while the pass is on its way (the last maybe short: it grows with
+    /// the pass); else the lines that end with their newline. From that byte on a place is
+    /// found by its bytes ([`TextDoc::piece_holding`]).
+    fn known(&self) -> (u64, u64) {
+        if self.whole() || self.passing() || self.ends_newline || self.lines == 0 {
+            (self.lines, self.size)
+        } else {
+            (self.lines - 1, self.open_at)
+        }
+    }
+
+    /// The last newline in `[lo, x)`, read backwards a little at a time: a short line's start
+    /// costs a short read.
+    fn newline_before(&mut self, x: u64, lo: u64, window: &mut Window_) -> Result<Option<u64>> {
+        let (mut hi, mut step) = (x, 1024u64);
+        while hi > lo {
+            let from = hi.saturating_sub(step).max(lo);
+            let bytes = window.take(self, from, (hi - from) as usize)?;
+            if bytes.len() < (hi - from) as usize {
+                return Err(anyhow::Error::new(Stale));
+            }
+            if let Some(i) = bytes.iter().rposition(|&b| b == b'\n') {
+                return Ok(Some(from + i as u64));
+            }
+            hi = from;
+            step = (step * 4).min(CHUNK as u64);
+        }
+        Ok(None)
+    }
+
+    /// Where a piece cut at grid point `g` begins: at `g`, or up to three bytes before it, at
+    /// the start of the character `g` falls in.
+    fn grid_cut(&mut self, g: u64, lo: u64, window: &mut Window_) -> Result<u64> {
+        let from = g.saturating_sub(4).max(lo);
+        let bytes = window.take(self, from, (g - from) as usize)?;
+        Ok(from + cut_char_start(&bytes) as u64)
+    }
+
+    /// The line that starts at byte `start`, past the index — or, `loose`, the piece that
+    /// starts there of a line whose start is not known: read on to its newline, and no further
+    /// than the grid point that ends it (06 §7.2: a line is never read whole). A line with a
+    /// known start is one piece as far as [`REACH`] past the grid point at or before its
+    /// start: from every byte of that piece its start is found again, and the piece lies in
+    /// the blocks a jump to any byte of it asks for ([`TextDoc::bring`]) — placing a line is
+    /// never a second ask. A piece from the grid runs to the next grid point.
+    fn scan_span(&mut self, start: u64, loose: bool, window: &mut Window_) -> Result<Span> {
+        let total = self.total();
+        let bound = if loose {
+            ((start + 3) / GRID + 1) * GRID
+        } else {
+            start / GRID * GRID + REACH
+        };
+        let bound = bound.min(total);
+        let piece = |len: u64, next: u64, ends: bool, cr: bool| Span {
+            line: None,
+            start,
+            len,
+            next,
+            loose,
+            ends,
+            cr,
+        };
+        let (mut pos, mut before) = (start, None);
+        while pos < bound {
+            let room = bound - pos;
+            let avail = window.at(self, pos, room.min(CHUNK as u64) as usize)?;
+            let avail = &avail[..avail.len().min(room as usize)];
+            if avail.is_empty() {
+                return Err(anyhow::Error::new(Stale));
+            }
+            if let Some(i) = avail.iter().position(|&b| b == b'\n') {
+                if i > 0 {
+                    before = Some(avail[i - 1]);
+                }
+                let len = pos + i as u64 - start;
+                let cr = u64::from(len > 0 && before == Some(b'\r'));
+                return Ok(piece(len - cr, pos + i as u64 + 1, true, false));
+            }
+            before = avail.last().copied();
+            pos += avail.len() as u64;
+        }
+        if bound >= total {
+            return Ok(piece(total - start, total, true, total > start));
+        }
+        let cut = self.grid_cut(bound, start, window)?;
+        Ok(piece(cut - start, cut, false, false))
+    }
+
+    /// The line byte `x` (past the index) is in, when its start is within reach — after the
+    /// last newline less than [`REACH`] before `x`'s grid point, or at the end of the index —
+    /// else the piece from that grid point (06 §7.2: an unknown line start).
+    fn piece_holding(&mut self, x: u64, window: &mut Window_) -> Result<Span> {
+        let (_, known) = self.known();
+        let grid = x / GRID * GRID;
+        let lo = grid.saturating_sub(REACH).max(known);
+        let start = match self.newline_before(x, lo, window)? {
+            Some(newline) => Some(newline + 1),
+            // No newline since the index's end: its last line goes on. While the pass is on
+            // its way that line is the pass's to place.
+            None if lo == known && self.passing() && !self.ends_newline && known > 0 => {
+                return Err(anyhow::Error::new(Pending));
+            }
+            None if lo == known => Some(known),
+            None => None,
+        };
+        // (A start found is less than a span before the grid point — or it is the end of the
+        // index, whose piece ends at that grid point at the latest: what follows it, below.)
+        let span = match start {
+            Some(start) => self.scan_span(start, false, window)?,
+            None => {
+                let cut = self.grid_cut(grid, lo, window)?;
+                self.scan_span(cut, true, window)?
+            }
+        };
+        let mut span = span;
+        while x >= span.next && span.next < self.total() {
+            // Past the piece that was found — it ends on the grid, or a few bytes before a
+            // grid point, at the start of the character that falls on it: the pieces after
+            // it, as far as the one `x` is in.
+            span = self.scan_span(span.next, !span.ends, window)?;
+        }
+        Ok(span)
+    }
+
+    /// The line (or piece) byte `x` of the file is in; `None` for a file with no line.
+    fn span_holding(&mut self, x: u64, window: &mut Window_) -> Result<Option<Span>> {
+        let (_, known) = self.known();
+        let total = self.total();
+        if total == 0 || self.lines == 0 {
+            return Ok(None);
+        }
+        let x = x.min(total - 1);
+        if x < known || self.whole() {
+            return self.span_at(x);
+        }
+        self.piece_holding(x, window).map(Some)
+    }
+
+    /// The line that starts at byte `start` (`loose`: the piece that does). A place that is no
+    /// line start of the index any more — the index grew over a piece, or changed — gives the
+    /// line that holds it.
+    fn span_starting(&mut self, start: u64, loose: bool, window: &mut Window_) -> Result<Span> {
+        let (_, known) = self.known();
+        if start < known || self.whole() {
+            return self
+                .span_at(start)?
+                .ok_or_else(|| anyhow::Error::new(Stale));
+        }
+        if start >= self.total() {
+            return Err(anyhow::Error::new(Stale));
+        }
+        self.scan_span(start, loose, window)
+    }
+
+    /// What follows `span` in the file: the next line of the index, or past it the line (or
+    /// piece) that starts where `span` ends. `None` at the end of the file — and at the end of
+    /// the lines known while the pass is on its way (06 §7.2: scrolling stops there, and is
+    /// not held).
+    fn span_after(&mut self, span: &Span, window: &mut Window_) -> Result<Option<Span>> {
+        let (lines, known) = self.known();
+        if let Some(line) = span.line {
+            if line + 1 < lines {
+                return Ok(self.spans(line + 1, 1)?.into_iter().next());
+            }
+            if self.whole() || self.passing() {
+                return Ok(None);
+            }
+        }
+        if span.next >= self.total() {
+            return Ok(None);
+        }
+        if span.next < known {
+            return self.span_at(span.next);
+        }
+        self.scan_span(span.next, !span.ends, window).map(Some)
+    }
+
+    /// What comes before `span` in the file: the line before it in the index, or past the
+    /// index the line whose start is within reach of `span`'s start, else the piece from the
+    /// grid point before it.
+    fn span_before(&mut self, span: &Span, window: &mut Window_) -> Result<Option<Span>> {
+        if span.start == 0 {
+            return Ok(None);
+        }
+        if let Some(line) = span.line {
+            return Ok(match line {
+                0 => None,
+                line => self.spans(line - 1, 1)?.into_iter().next(),
+            });
+        }
+        let (_, known) = self.known();
+        // The byte before it: its line's newline, or — a piece — the last of the piece before.
+        let x = span.start - 1;
+        if x < known {
+            return self.span_at(x);
+        }
+        self.piece_holding(x, window).map(Some)
+    }
+
+    /// The file's last line (or piece); `None` for a file with no line. `known`: the last
+    /// line known, while the pass is on its way (where scrolling stops meanwhile).
+    fn last_span(&mut self, known: bool, window: &mut Window_) -> Result<Option<Span>> {
+        let (lines, _) = self.known();
+        if self.lines == 0 {
+            return Ok(None);
+        }
+        if self.whole() || (known && self.passing()) {
+            return Ok(self.spans(lines.saturating_sub(1), 1)?.into_iter().next());
+        }
+        let total = self.total();
+        self.span_holding(total - 1, window)
+    }
+
+    /// The blocks around byte `x` (06 §7.2: a jump asks once): the 64 KiB before the 16 KiB
+    /// grid point at or before `x` and the 64 KiB after it — at most three blocks; the file's
+    /// end is two — each asked for by a reader of its own, as one byte of it: a demand, with
+    /// no margin beside it. [`Pending`] until all of them are here; then the jump's page is
+    /// read from them ([`Stream::near`]), through no reader.
+    fn bring(&mut self, x: u64) -> Result<()> {
+        #[cfg(test)]
+        if self.fail_reads {
+            anyhow::bail!("an injected read error");
+        }
+        let Backing::Stream(stream) = &mut self.backing else {
+            return Ok(());
+        };
+        let total = stream.total;
+        let Some(source) = stream.source.as_ref().filter(|_| total > 0) else {
+            return Ok(());
+        };
+        let block = crate::stream::BLOCK;
+        let grid = x.min(total - 1) / GRID * GRID;
+        let (first, last) = (
+            grid.saturating_sub(SPAN) / block,
+            ((grid + SPAN).min(total) - 1) / block,
+        );
+        let (from, to) = (first * block, ((last + 1) * block).min(total));
+        if let Some((lo, bytes)) = &stream.near {
+            if *lo <= from && to <= lo + bytes.len() as u64 {
+                return Ok(());
+            }
+        }
+        while stream.pins.len() < (last - first + 1) as usize {
+            stream
+                .pins
+                .push(Box::new(source.reader(ReaderKind::Interactive)));
+        }
+        let mut waits = false;
+        for (pin, b) in stream.pins.iter_mut().zip(first..=last) {
+            // Not the block's first byte: a reader's margin reaches a read's length back.
+            match pin.try_read((b * block + 1).min(total - 1), 1) {
+                Poll::Ready(Ok(_)) => {}
+                Poll::Ready(Err(e)) => return Err(anyhow::Error::new(e)),
+                Poll::Pending => waits = true,
+            }
+        }
+        if waits {
+            return Err(anyhow::Error::new(Pending));
+        }
+        let quiet = stream
+            .quiet
+            .get_or_insert_with(|| Box::new(source.reader(ReaderKind::Bulk)));
+        match quiet.try_read(from, (to - from) as usize) {
+            Poll::Ready(Ok(bytes)) => {
+                stream.near = Some((from, bytes));
+                Ok(())
+            }
+            Poll::Ready(Err(e)) => Err(anyhow::Error::new(e)),
+            Poll::Pending => Err(anyhow::Error::new(Pending)),
+        }
     }
 }
 
@@ -1049,6 +1545,22 @@ struct Scan {
     first_long: Option<u64>,
     last_byte: Option<u8>,
     marks: Vec<Mark>,
+    /// Lines between marks now: [`BLOCK_LINES`] (0 stands for it) until the marks were
+    /// thinned, doubled each time they were.
+    spacing: u64,
+    /// The most marks before they are thinned ([`MARKS_MAX`]; 0 stands for it).
+    limit: usize,
+    /// A mark due at the very end of what was read: it is the index's once a byte follows it.
+    held: Option<Mark>,
+    /// Tests: the most marks the index ever had room allocated for, and how often it was
+    /// thinned.
+    #[cfg(test)]
+    peak: usize,
+    #[cfg(test)]
+    thinned: usize,
+    /// Tests: where the marks were, and the room they had, as the last thinning left them.
+    #[cfg(test)]
+    after_thin: (usize, usize),
     /// The pass stopped at its cap, short of the file as opened.
     capped: bool,
     /// The hash of every byte read, for a pass that may stop short (a preview's): what its
@@ -1062,6 +1574,13 @@ const PASS_READ: usize = 1 << 20;
 impl Scan {
     /// The next bytes of the file (`bytes`, at where the pass is), of a file of `size` bytes.
     fn feed(&mut self, bytes: &[u8], size: u64) {
+        if bytes.is_empty() {
+            return;
+        }
+        if let Some(mark) = self.held.take() {
+            self.push(mark);
+        }
+        let end = self.at + bytes.len() as u64;
         for (i, &b) in bytes.iter().enumerate() {
             if b != b'\n' {
                 self.line_len += 1;
@@ -1072,20 +1591,142 @@ impl Scan {
             }
             self.line_len = 0;
             self.line += 1;
-            let start = self.at + i as u64 + 1;
-            let last = self.marks[self.marks.len() - 1];
-            if start < size && (self.line - last.line >= BLOCK_LINES || start - last.offset >= SPAN)
-            {
-                self.marks.push(Mark {
-                    line: self.line,
-                    offset: start,
-                });
-            }
+            self.line_start(self.at + i as u64 + 1, end, size);
         }
         if let Some(&b) = bytes.last() {
             self.last_byte = Some(b);
         }
-        self.at += bytes.len() as u64;
+        self.at = end;
+    }
+
+    /// Line `self.line` starts at byte `start`, of a file of `size` bytes read as far as `end`:
+    /// a mark, if one is due there.
+    fn line_start(&mut self, start: u64, end: u64, size: u64) {
+        let last = self.marks[self.marks.len() - 1];
+        if start >= size || !self.due(last, self.line, start) {
+            return;
+        }
+        let mark = Mark {
+            line: self.line,
+            offset: start,
+        };
+        if start >= end {
+            // No byte of this line is read yet: the index is of the bytes read, and has no
+            // mark at their end.
+            self.held = Some(mark);
+        } else {
+            self.push(mark);
+        }
+    }
+
+    /// A line start `line`, at `offset`, is a mark after `last`: [`Scan::spacing`] lines on,
+    /// or a span on.
+    fn due(&self, last: Mark, line: u64, offset: u64) -> bool {
+        line - last.line >= self.spacing() || offset - last.offset >= SPAN
+    }
+
+    fn spacing(&self) -> u64 {
+        self.spacing.max(BLOCK_LINES)
+    }
+
+    fn limit(&self) -> usize {
+        match self.limit {
+            0 => MARKS_MAX,
+            limit => limit,
+        }
+    }
+
+    /// Adds a mark; the index is thinned first when it is full (06 §7.2: its memory is
+    /// bounded).
+    fn push(&mut self, mark: Mark) {
+        while self.marks.len() >= self.limit() && self.spacing() < SPACING_MAX {
+            self.thin();
+        }
+        let len = self.marks.len();
+        if len == self.marks.capacity() {
+            // Room is made by the index itself, never by `Vec`'s doubling: up to the bound it
+            // doubles and stops there exactly; past it — only where no mark can be dropped
+            // any more — it grows a sixteenth at a time.
+            let more = match self.limit().checked_sub(len) {
+                Some(left) if left > 0 => len.max(64).min(left),
+                _ => (len / 16).max(4096),
+            };
+            self.marks.reserve_exact(more);
+        }
+        self.marks.push(mark);
+        #[cfg(test)]
+        {
+            self.peak = self.peak.max(self.marks.capacity());
+        }
+    }
+
+    /// Doubles the line spacing and drops the marks that are no longer due — but never one
+    /// whose going would leave a line start a span or more past the mark before it: every line
+    /// that does not start at a mark still starts less than a span past one, so finding a line
+    /// still reads at most a span. What stays is at most a mark each [`Scan::spacing`] lines
+    /// and two each 64 KiB.
+    fn thin(&mut self) {
+        #[cfg(test)]
+        {
+            self.thinned += 1;
+        }
+        self.spacing = self.spacing() * 2;
+        // Where they are: no second set of marks is allocated beside the first, and the room
+        // stays as it is (the index fills it again).
+        let len = self.marks.len();
+        let mut kept = 0usize;
+        for i in 0..len {
+            let mark = self.marks[i];
+            // The line starts after this mark lie before the next one (the last mark's: not
+            // known, so it stays). The first mark stays.
+            let stays = match (kept.checked_sub(1), self.marks.get(i + 1)) {
+                (None, _) | (_, None) => true,
+                (Some(last), Some(next)) => {
+                    let last = self.marks[last];
+                    mark.line - last.line >= self.spacing() || next.offset - last.offset > SPAN
+                }
+            };
+            if stays {
+                self.marks[kept] = mark;
+                kept += 1;
+            }
+        }
+        self.marks.truncate(kept);
+        #[cfg(test)]
+        {
+            self.after_thin = (self.marks.as_ptr() as usize, self.marks.capacity());
+        }
+    }
+
+    /// Tests: `count` lines of `width` bytes each (their newline counted) follow, of a file of
+    /// `size` bytes — the marks they give, as [`Scan::feed`] gives them, without their bytes.
+    #[cfg(test)]
+    fn lines_of(&mut self, count: u64, width: u64, size: u64) {
+        assert!(width > 0 && self.line_len == 0);
+        let (first, from) = (self.line, self.at);
+        let end = from + count * width;
+        if count > 0 {
+            if let Some(mark) = self.held.take() {
+                self.push(mark);
+            }
+        }
+        let mut k = 0u64;
+        while k < count {
+            // The next line start that is a mark: lines on from the last one.
+            let last = self.held.unwrap_or(self.marks[self.marks.len() - 1]);
+            let by_lines = last.line + self.spacing() - (first + k);
+            let by_bytes = (last.offset + SPAN).saturating_sub(from + k * width);
+            let step = by_lines.min(by_bytes.div_ceil(width)).max(1);
+            k += step;
+            if k > count {
+                break;
+            }
+            self.line = first + k;
+            self.line_start(from + k * width, end, size);
+        }
+        self.line = first + count;
+        self.at = end;
+        self.last_byte = Some(b'\n');
     }
 
     /// The pass over `file` (opened at `path`, named `shown` in what is said, `size` bytes as opened) from where it is, to the
@@ -1224,13 +1865,25 @@ pub(crate) fn index_reads(path: &Path) -> Vec<(u64, u64)> {
         .collect()
 }
 
-/// Where a line is: its first byte in the file, and how many bytes it shows (its newline, and a
-/// `\r` before it, not counted).
+/// Where a line is, by bytes (06 §7.2): its first byte in the file and how many bytes it shows
+/// (its newline, and a `\r` before it, not counted). Past the index a line whose start is not
+/// within reach is given in pieces from the 16 KiB grid (`loose`), and a long one is cut at a
+/// grid point (`ends` is false: what follows is the same line's next piece).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Span {
-    line: u64,
+    /// The line's number, where the index reaches it.
+    line: Option<u64>,
     start: u64,
     len: u64,
+    /// Where what follows it starts (the file's size: nothing does).
+    next: u64,
+    /// Its start is not known to be a line's.
+    loose: bool,
+    /// It ends where its line does.
+    ends: bool,
+    /// Its last byte was not looked at and may be the `\r` before its newline: the row that
+    /// holds its end takes it and does not show it.
+    cr: bool,
 }
 
 /// What the file is now, against the index.
@@ -1761,47 +2414,29 @@ impl Worker {
     }
 }
 
-/// `runs` with tabs turned into spaces up to the next tab stop.
-fn expand_tabs(runs: Runs) -> Runs {
-    let mut col = 0;
-    runs.into_iter()
-        .map(|(color, text)| {
-            let mut out = String::with_capacity(text.len());
-            for c in text.chars() {
-                if c == '\t' {
-                    let n = TAB - col % TAB;
-                    out.extend(std::iter::repeat_n(' ', n));
-                    col += n;
-                } else {
-                    out.push(c);
-                    col += 1;
-                }
-            }
-            (color, out)
-        })
-        .collect()
-}
-
-/// The page on screen: its first line, how many, and how its lines are drawn.
+/// The page on screen: where it starts in the file, and its rows.
 struct Page {
+    /// Where its first line starts in the file — a piece of a line, when `top_loose` — and
+    /// that line's number where the index reaches it.
     top: u64,
-    /// Lines on it (asked of the highlighter).
+    top_line: Option<u64>,
+    top_loose: bool,
+    /// Lines on it, from `top_line` (asked of the highlighter; 0 when their numbers are not
+    /// known).
     count: usize,
     /// Rows it was read for.
     visible: usize,
-    /// Not wrapped: each line's runs as painted. Wrapped: the highlighter's runs, once they come.
-    runs: Vec<Runs>,
     highlighted: bool,
     /// The generation its highlighting was asked under.
     gen: u64,
-    /// Read wrapped: the fields below are its rows.
+    /// Read wrapped: several rows to a line. Else one row to a line, from byte `left` of it.
     wrapped: bool,
-    /// Wrapped: the byte of line `top` its first row starts at; the line's place in the file and
-    /// length (the scroll bar, the status row).
+    /// Wrapped: the byte of the top line its first row starts at.
     top_off: u64,
-    top_start: u64,
+    left: u64,
+    /// The top line's length (the status row).
     top_len: u64,
-    /// Wrapped: the width its rows were laid out for, the rows, whether they reach the end of the
+    /// The width its rows were laid out for, the rows, whether they reach the end of the
     /// file, and each line's colours by character once highlighted.
     width: f32,
     rows: Vec<wrap::Row>,
@@ -1810,18 +2445,19 @@ struct Page {
 }
 
 impl Page {
-    /// A page of plain lines, not wrapped.
-    fn lines(top: u64, count: usize, runs: Vec<Runs>, highlighted: bool, gen: u64) -> Self {
+    /// A page with no row on it, at `top`.
+    fn blank(top: u64, visible: usize, wrapped: bool) -> Self {
         Self {
             top,
-            count,
-            visible: count,
-            runs,
-            highlighted,
-            gen,
-            wrapped: false,
+            top_line: None,
+            top_loose: false,
+            count: 0,
+            visible,
+            highlighted: false,
+            gen: 0,
+            wrapped,
             top_off: 0,
-            top_start: 0,
+            left: 0,
             top_len: 0,
             width: 0.0,
             rows: Vec::new(),
@@ -1838,24 +2474,31 @@ impl Page {
 
     /// No row on it.
     fn is_empty(&self) -> bool {
-        self.runs.is_empty() && self.rows.is_empty()
+        self.rows.is_empty()
     }
 }
 
-/// Where the keys asked a wrapped view to go (applied when the next page is read).
+/// Where the keys asked the view to go (applied when the next page is read).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Jump {
-    /// Home: the first row of the line at the top, or the start of the file when already there.
+    /// Home: the start of the line at the top (its first row; not wrapped, its first byte), or
+    /// the start of the file when already there.
     Home,
-    /// End: the last row of the line at the top at the bottom when the line runs past the page,
-    /// else the end of the file.
+    /// End: the end of the line at the top when it runs past the page (its last row at the
+    /// bottom; not wrapped, its last bytes at the right edge), else the end of the file.
     End,
     FileStart,
     FileEnd,
-    /// The row byte `n` of the file is in (`SOPEN_STATE` `at=`).
+    /// The row byte `n` of the file is in (`SOPEN_STATE` `at=`, Go to `0x…`, the scroll bar).
     Byte(u64),
-    /// Line `n` at the top (a stream indexed again after a reload: the place it was at).
-    Line(u64),
+    /// Line `n` of the index at the top, from the row its byte `off` is in (Go to; a file
+    /// indexed again: the place it was at).
+    Line(u64, u64),
+}
+
+/// The Go to field's id (it has the keyboard while it is open).
+fn goto_id() -> egui::Id {
+    egui::Id::unique("sopen-text-goto")
 }
 
 /// The window's title in its frame, as PC Shell names its text viewer.
@@ -1889,22 +2532,44 @@ struct TextWindow {
     #[cfg(test)]
     after_wake: Option<Arc<dyn Fn() + Send + Sync>>,
     pool: Arc<Pool>,
-    /// The first line on screen, and how many rows fit (the last pass's).
+    /// The place on screen, by bytes (06 §7.2): where the first line on screen starts in the
+    /// file — `top_loose`: a piece from the grid of a line whose start is not known — and
+    /// that line's number where the index reaches it. And how many rows fit (the last pass's).
     top: u64,
+    top_loose: bool,
+    line: Option<u64>,
     visible: u64,
-    /// Columns scrolled to the right (not wrapped).
-    left: usize,
+    /// Not wrapped: the byte of each line its row starts at (→ and ← move it).
+    left: u64,
     /// Lines wrap (the default; W or F2 switch it).
     wrap: bool,
-    /// Wrapped: the byte of line `top` the top row starts at.
+    /// Wrapped: the byte of the top line the top row starts at.
     top_off: u64,
-    /// Wrapped: where the keys asked to go, and how many rows the keys and the wheel moved by —
-    /// applied before the next page is read.
+    /// Where the keys asked to go, and how many rows (not wrapped: lines) the keys and the
+    /// wheel moved by — applied before the next page is read.
     jump: Option<Jump>,
     moved: i64,
-    /// Wrapped: the top is put back on a row start before the next page (the width, the index or
-    /// the mode changed).
+    /// The top is put back on a row start before the next page (the width, the index or the
+    /// mode changed).
     resnap: bool,
+    /// The jump waiting is one that puts the view back where it was (a file read again, a
+    /// stream reloaded), not one the owner made: it keeps the place sideways too.
+    restoring: bool,
+    /// The Go to field (Cmd/Ctrl+G), while it is open: what was typed.
+    goto: Option<String>,
+    /// Go to asked for a line past the lines known (0-based): the index pass runs on to it,
+    /// the status row counts, and Esc stops it (06 §7.2).
+    seeking: Option<u64>,
+    /// A jump was marked on the stats line (`input`, 06 §11): its page is a `ready`.
+    asked: bool,
+    /// Lines the highlighter's copy of the index has: a page past them is shown plain.
+    hl_lines: u64,
+    /// The scroll bar's thumb is being dragged: where to (0 to 1). The jump is made when it
+    /// is let go (a place the thumb only passes is not fetched).
+    drag: Option<f32>,
+    /// `SOPEN_STATE` `loading=1` (06 §11): a streamed window is ready to be shot at its first
+    /// frame drawn with rows from the stream, what is still on its way shot as it is.
+    shoot_loading: bool,
     /// Wrapped: what wrapping found so far (for this index and width).
     memo: wrap::Memo,
     /// The width rows are laid out in (the last pass's).
@@ -1913,6 +2578,8 @@ struct TextWindow {
     /// page was wrapped again, once.
     rewrapped: bool,
     wheel_rest: f32,
+    /// Not wrapped: the part of a byte the wheel sideways has moved by and not yet moved.
+    wheel_across: f32,
     page: Option<Page>,
     /// The page on screen is from an index replaced since: it stays up until a page is read
     /// through the new one.
@@ -2092,6 +2759,8 @@ impl TextWindow {
             reask: false,
             input: false,
             top: 0,
+            top_loose: false,
+            line: None,
             visible: 1,
             left: 0,
             wrap: true,
@@ -2099,10 +2768,18 @@ impl TextWindow {
             jump: None,
             moved: 0,
             resnap: false,
+            restoring: false,
+            goto: None,
+            seeking: None,
+            asked: false,
+            hl_lines: 0,
+            drag: None,
+            shoot_loading: false,
             memo: wrap::Memo::default(),
             room: 0.0,
             rewrapped: false,
             wheel_rest: 0.0,
+            wheel_across: 0.0,
             page: None,
             stale_page: false,
             notices,
@@ -2120,9 +2797,117 @@ impl TextWindow {
         }
     }
 
-    /// A stream's index pass has more to index (it runs on the frames).
-    fn growing(&self) -> bool {
-        self.doc.growing(self.pass_cap())
+    /// A jump to `jump` (the keys', Go to's, the scroll bar's): where the next page is read,
+    /// and — on a stream — an `input` on the stats line with its place (06 §11).
+    fn jump_to(&mut self, jump: Jump) {
+        if self.seeking.is_some() {
+            // Another place was asked for: Go to's pass is not waited for.
+            self.stop_seek();
+        }
+        self.restoring = false;
+        self.jump = Some(jump);
+        let place = match jump {
+            Jump::FileStart | Jump::Home | Jump::End => return,
+            Jump::FileEnd => self.doc.total(),
+            Jump::Byte(at) => at,
+            Jump::Line(line, off) => {
+                let mark = self.doc.marks[self.doc.mark_before(line)];
+                mark.offset + off
+            }
+        };
+        if let Some(source) = self.doc.source() {
+            source.mark(crate::stream::Mark::Input(place));
+            self.asked = true;
+        }
+    }
+
+    /// Go to (06 §7.2): a line number, or `0x…` for a byte offset. A line the index has, and
+    /// any offset, is a jump. A line past the lines known runs the index pass on to it.
+    fn go(&mut self, text: &str) {
+        let text = text.trim();
+        if text.is_empty() {
+            return;
+        }
+        let total = self.doc.total();
+        let hex = text.strip_prefix("0x").or_else(|| text.strip_prefix("0X"));
+        let wanted = match hex {
+            Some(hex) => u64::from_str_radix(hex, 16).ok().map(Jump::Byte),
+            None => match text.replace(',', "").parse::<u64>() {
+                Ok(n) if n > 0 => Some(Jump::Line(n - 1, 0)),
+                _ => None,
+            },
+        };
+        self.status = Status::default();
+        match wanted {
+            None => {
+                self.status = Status::error(format!(
+                    "Go to: '{text}' is not a line number or a 0x… offset"
+                ));
+            }
+            Some(_) if total == 0 => {}
+            Some(Jump::Line(line, _)) => {
+                if line < self.doc.line_count() || self.doc.whole() {
+                    self.go_to_line(line, true);
+                } else {
+                    // Past the lines known: the pass goes on from where it stopped.
+                    self.seeking = Some(line);
+                    if let Some(source) = self.doc.source() {
+                        source.mark(crate::stream::Mark::Input(self.doc.size()));
+                        self.asked = true;
+                    }
+                }
+            }
+            Some(Jump::Byte(at)) => self.jump_to(Jump::Byte(at.min(total - 1))),
+            Some(_) => {}
+        }
+        self.moved = 0;
+    }
+
+    /// Line `line` (0-based), which the index has, at the top — the file's last line when it
+    /// has fewer. The last line known may have no end yet: its start is known all the same.
+    /// `input`: the jump is marked on the stats line (not again, when Go to's pass marked it).
+    fn go_to_line(&mut self, line: u64, input: bool) {
+        let (lines, end) = self.doc.known();
+        let count = self.doc.line_count();
+        if line >= count {
+            self.status =
+                Status::info(format!("the file has {} lines", super::hex::grouped(count)));
+        }
+        let line = line.min(count.saturating_sub(1));
+        self.moved = 0;
+        let jump = if line < lines {
+            Jump::Line(line, 0)
+        } else {
+            Jump::Byte(end)
+        };
+        if input {
+            self.jump_to(jump);
+        } else {
+            self.jump = Some(jump);
+        }
+    }
+
+    /// Go to's pass is over: the pass asks for nothing more, and stops where the viewer's
+    /// stops again.
+    fn stop_seek(&mut self) {
+        self.seeking = None;
+        self.doc.stop_pass();
+        let cap = self.pass_cap();
+        self.doc.set_cap(cap);
+    }
+
+    /// Go to's pass (06 §7.2), after a step of it: the line it looks for is known — it is at
+    /// the top from the next page — or the file ended before it.
+    fn seek(&mut self, ctx: &egui::Context) {
+        let Some(line) = self.seeking else {
+            return;
+        };
+        if self.doc.line_count() > line || self.doc.whole() {
+            // The line has begun (its end is not looked for), or the file ended before it.
+            self.stop_seek();
+            self.go_to_line(line, false);
+        }
+        ctx.request_repaint();
     }
 
     /// A stream's state, once a pass; and a reload that has re-opened the file: it is indexed
@@ -2140,12 +2925,14 @@ impl TextWindow {
         self.reloading = false;
         // The place it was at, kept until the new index has reached it.
         if let Some(page) = self.page.as_ref().filter(|p| p.top > 0 || p.top_off > 0) {
-            self.jump = Some(if page.wrapped {
-                Jump::Byte(page.top_start + page.top_off)
-            } else {
-                Jump::Line(page.top)
+            self.jump = Some(match page.top_line {
+                Some(line) if !page.wrapped => Jump::Line(line, 0),
+                _ => Jump::Byte(page.top + page.top_off),
             });
+            self.restoring = true;
         }
+        (self.top, self.top_off, self.top_loose, self.line) = (0, 0, false, None);
+        self.seeking = None;
         self.doc = TextDoc::streamed(source);
         self.syntax_due = syntax_by_name(&self.name).is_none();
         if self.syntax_due {
@@ -2181,55 +2968,91 @@ impl TextWindow {
     }
 
     /// One step of a stream's index pass (06 §7.2), on the frame: the first block when it
-    /// arrives, then — once the first screen is up — what is here of the next megabyte. The
-    /// page on screen is read again only if it shows the line the index ended in.
+    /// arrives, then — once the first screen is up — what is here of the next megabyte, as far
+    /// as the pass goes (16 MiB; the whole file while Go to looks for a line). Past that the
+    /// index grows by what the screen read at its end. The page on screen is read again only
+    /// if it shows the line the index ended in, or lines the index has only now.
     fn grow_index(&mut self, ctx: &egui::Context) {
-        if !self.doc.is_stream() || self.frozen() {
+        if !self.doc.is_stream() {
+            return;
+        }
+        let cap = match self.seeking {
+            Some(_) => self.doc.total(),
+            None => self.pass_cap(),
+        };
+        self.doc.set_cap(cap);
+        if self.frozen() {
             return;
         }
         if self.stream_down() && !self.input {
             // A failed stream is asked again by a key, a click or a scroll, not by a pass.
             return;
         }
-        if self.doc.size() > 0 && !self.first && self.jump.is_none() {
-            // The first screen first (unless it is to be a place the index has to reach).
+        // The first screen first — unless it is to be a place the pass has to reach: one
+        // inside what the pass reads (a place past that is a jump by bytes, and waits for no
+        // pass).
+        let reach = self.doc.total().min(cap);
+        let waits = match self.jump {
+            Some(Jump::FileEnd) => reach >= self.doc.total(),
+            Some(Jump::Byte(at)) => at < reach,
+            Some(Jump::Line(..)) => true,
+            _ => false,
+        };
+        if self.doc.size() > 0 && !self.first && !waits && self.seeking.is_none() {
             return;
         }
         let long = self.doc.long_lines();
-        let growth = match self.doc.grow(self.pass_cap(), PASS_READ as u64) {
+        let (_, known) = self.doc.known();
+        let growth = match self.doc.grow(cap, PASS_READ as u64) {
             Ok(Some(growth)) => growth,
-            Ok(None) => return,
+            Ok(None) => match self.doc.grow_from_screen() {
+                Some(growth) => growth,
+                None => return self.seek(ctx),
+            },
             // On its way: the Source's waker brings the next pass.
             Err(e) if is_pending(&e) => return,
-            Err(e) => return self.read_failed(&e),
+            Err(e) => {
+                if self.seeking.is_some() {
+                    self.stop_seek();
+                }
+                return self.read_failed(&e);
+            }
         };
         self.failure = None;
-        if growth.open_line.is_some() {
-            // The line the index ended in may go on now: what wrapping found is of the index
-            // before. (The page on screen is not read again for that, below.)
+        // The page is read again only if a line on it got longer — the line the index ended
+        // in, with no line end yet — or it was short of the window and may gain rows; or it
+        // shows lines by their bytes that the index has now (they get their numbers).
+        let (_, now_known) = self.doc.known();
+        let numbered = self.page.as_ref().is_some_and(|p| {
+            p.rows
+                .iter()
+                .any(|r| r.line.is_none() && r.at < now_known && now_known > known)
+        });
+        if growth.open_line.is_some() || now_known > known {
+            // The line the index ended in may go on now, and lines found by their bytes have
+            // numbers now: what wrapping found is of the index before. (The page on screen is
+            // not read again for that, below.)
             self.memo.reset(self.room);
         }
-        // The page is read again only if a line on it got longer — the line the index ended
-        // in, with no line end yet — or it was short of the window and may gain rows.
         let grew = self.page.as_ref().is_some_and(|p| {
-            if p.wrapped {
-                // (`at_end`: its last row ended the last line indexed.)
-                p.rows.len() < p.visible || (p.at_end && growth.open_line.is_some())
-            } else {
-                let shown = p.top..p.top + p.runs.len() as u64;
-                p.runs.len() < p.visible
-                    || growth.open_line.is_some_and(|line| shown.contains(&line))
-            }
+            // (`at_end`: its last row ended the last line indexed.)
+            p.rows.len() < p.visible || (p.at_end && growth.open_line.is_some())
         });
-        if grew {
+        if grew || numbered {
             self.stale_page = true;
+            self.resnap |= numbered;
         }
         if !long && self.doc.long_lines() && !self.status.error {
             self.status = opening_status(self.syntax, &self.doc);
         }
-        if let Some(worker) = &self.worker {
-            worker.grown(growth);
+        if growth.size <= HIGHLIGHT_MAX {
+            // The highlighter's copy of the index is of the first 16 MiB (06 §7.2).
+            if let Some(worker) = &self.worker {
+                self.hl_lines = growth.lines;
+                worker.grown(growth);
+            }
         }
+        self.seek(ctx);
         // More may be here already.
         ctx.request_repaint();
     }
@@ -2246,10 +3069,15 @@ impl TextWindow {
         }
         if (self.gutter.is_none() || self.regutter) && lines > 0 {
             self.regutter = false;
+            let total = self.doc.total();
             self.gutter = Some(if self.doc.whole() {
                 digits(lines)
+            } else if total <= HIGHLIGHT_MAX {
+                digits(total).min(8)
             } else {
-                digits(self.doc.total().min(HIGHLIGHT_MAX)).min(8)
+                // Past the lines known the gutter shows byte offsets (06 §7.2): `…0x` and the
+                // hex digits of the file's last byte — never fewer than its lines need.
+                3 + format!("{:X}", total - 1).len()
             });
         }
         self.gutter.unwrap_or(1)
@@ -2292,10 +3120,10 @@ impl TextWindow {
     /// new end. Wrapped, the page knows (its last row ends the file); else by lines.
     fn at_end(&self) -> bool {
         match &self.page {
-            Some(p) if p.wrapped && self.wrap => p.at_end,
+            Some(p) if p.wrapped == self.wrap => p.at_end,
             // Nothing wrapped on screen yet: no end seen to follow.
             _ if self.wrap => false,
-            _ => self.top.saturating_add(self.visible) >= self.doc.line_count(),
+            _ => self.line.unwrap_or(0).saturating_add(self.visible) >= self.doc.line_count(),
         }
     }
 
@@ -2457,23 +3285,15 @@ impl TextWindow {
                 let lines = self.doc.line_count();
                 // What wrapping found was of the old index (also when not wrapped now).
                 self.memo.reset(self.room);
-                if self.wrap {
-                    // Wrapped again through the new index: the new end, or the same place put
-                    // back on a row start (the line may have changed).
-                    if at_end {
-                        self.jump = Some(Jump::FileEnd);
-                    } else {
-                        self.top = self.top.min(lines.saturating_sub(1));
-                        self.resnap = true;
-                    }
-                } else {
-                    let last_top = lines.saturating_sub(self.visible);
-                    self.top = if at_end {
-                        last_top
-                    } else {
-                        self.top.min(last_top)
-                    };
+                // Read again through the new index: the new end, or the same line put back on
+                // a row start (the line may have changed).
+                if at_end {
+                    (self.jump, self.restoring) = (Some(Jump::FileEnd), true);
+                } else if self.jump.is_none() {
+                    let line = self.line.unwrap_or(0).min(lines.saturating_sub(1));
+                    (self.jump, self.restoring) = (Some(Jump::Line(line, self.top_off)), true);
                 }
+                (self.top, self.top_loose) = (0, false);
                 self.status = if resumed {
                     opening_status(self.syntax, &self.doc)
                 } else {
@@ -2507,8 +3327,9 @@ impl TextWindow {
         }
     }
 
-    fn keys(&mut self, ctx: &egui::Context) {
-        if self.preview {
+    /// The window's keys. `typing`: the Go to field has this pass's typing.
+    fn keys(&mut self, ctx: &egui::Context, typing: bool) {
+        if self.preview || typing {
             return;
         }
         let pressed = |key: Key| ctx.input_mut(|i| i.consume_key(Modifiers::NONE, key));
@@ -2518,6 +3339,11 @@ impl TextWindow {
                 i.consume_key(Modifiers::COMMAND, key) || i.consume_key(Modifiers::CTRL, key)
             })
         };
+        if self.seeking.is_some() && pressed(Key::Escape) {
+            // Esc stops Go to's pass (06 §7.2): nothing more is sent.
+            self.stop_seek();
+            self.asked = false;
+        }
         if let Some(source) = self.doc.source() {
             // Cmd/Ctrl+R (06 §5): the Source re-opens the path — not waited for on a frame;
             // its waker brings the pass that indexes the file again.
@@ -2541,76 +3367,43 @@ impl TextWindow {
             self.jump = None;
             self.moved = 0;
         }
-        let page = self.visible.saturating_sub(1).max(1);
+        // By rows — not wrapped: by lines — from the rows read when the next page is (going
+        // back reads only from the restart point before a row).
+        let page = self.visible.saturating_sub(1).max(1) as i64;
         let (file_start, file_end) = (command(Key::Home), command(Key::End));
-        if self.wrap {
-            // By rows, from the rows read when the next page is (going back reads only from the
-            // restart point before a row).
-            let page = page as i64;
-            for (key, rows) in [
-                (Key::ArrowDown, 1),
-                (Key::ArrowUp, -1),
-                (Key::PageDown, page),
-                (Key::PageUp, -page),
-            ] {
-                if pressed(key) {
-                    self.moved += rows;
-                }
-            }
-            for (wanted, jump) in [
-                (file_start, Jump::FileStart),
-                (file_end, Jump::FileEnd),
-                (pressed(Key::Home), Jump::Home),
-                (pressed(Key::End), Jump::End),
-            ] {
-                if wanted {
-                    self.jump = Some(jump);
-                }
-            }
-            return;
-        }
-        let page = page as i64;
-        for (key, lines) in [
+        for (key, rows) in [
             (Key::ArrowDown, 1),
             (Key::ArrowUp, -1),
             (Key::PageDown, page),
             (Key::PageUp, -page),
         ] {
-            if !pressed(key) {
-                continue;
-            }
-            let no_page_yet =
-                self.doc.is_stream() && self.doc.line_count() == 0 && self.doc.total() > 0;
-            if self.jump.is_some() || no_page_yet {
-                // A place asked for and not shown yet (a stream's index has to reach it), or
-                // no page at all yet (its first block is on its way): these lines are
-                // counted from there, once it is.
-                self.moved += lines;
-            } else if lines < 0 {
-                self.top = self.top.saturating_sub(lines.unsigned_abs());
-            } else {
-                self.top = self.top.saturating_add(lines as u64);
+            if pressed(key) {
+                self.moved += rows;
             }
         }
-        if pressed(Key::Home) | file_start {
-            self.top = 0;
-            (self.jump, self.moved) = (None, 0);
-        }
-        if pressed(Key::End) | file_end {
-            if self.growing() {
-                // The end is not indexed yet: kept until the pass has reached it.
-                (self.jump, self.moved) = (Some(Jump::FileEnd), 0);
-            } else {
-                // Past the end: the body puts the last page on screen with this pass's row
-                // count.
-                self.top = self.doc.line_count();
+        for (wanted, jump) in [
+            (file_start, Jump::FileStart),
+            (file_end, Jump::FileEnd),
+            (pressed(Key::Home), Jump::Home),
+            (pressed(Key::End), Jump::End),
+        ] {
+            if wanted {
+                if !self.wrap {
+                    // (Not wrapped, a jump is from where it lands: the lines moved by before
+                    // it are not counted on.)
+                    self.moved = 0;
+                }
+                self.jump_to(jump);
             }
         }
-        if pressed(Key::ArrowRight) {
-            self.left += SIDEWAYS;
-        }
-        if pressed(Key::ArrowLeft) {
-            self.left = self.left.saturating_sub(SIDEWAYS);
+        if !self.wrap {
+            // The place within a line is a byte of it (06 §7.2).
+            if pressed(Key::ArrowRight) {
+                self.left += SIDEWAYS;
+            }
+            if pressed(Key::ArrowLeft) {
+                self.left = self.left.saturating_sub(SIDEWAYS);
+            }
         }
     }
 
@@ -2624,7 +3417,12 @@ impl TextWindow {
                 p.wrapped == self.wrap
                     && p.top == top
                     && p.visible == count
-                    && (!p.wrapped || (p.top_off == self.top_off && p.width == self.room))
+                    && p.width == self.room
+                    && (if p.wrapped {
+                        p.top_off == self.top_off
+                    } else {
+                        p.left == self.left
+                    })
             });
         let mut due = false;
         if !self.frozen() {
@@ -2648,7 +3446,7 @@ impl TextWindow {
             // The page on screen stays (from memory); nothing is read through the old index. A
             // file deleted before anything was shown shows an empty page.
             if self.gone && self.page.is_none() {
-                self.page = Some(Page::lines(top, count, Vec::new(), true, 0));
+                self.page = Some(Page::blank(top, count, self.wrap));
             }
             if let Some(page) = self.page.as_mut() {
                 page.highlighted = true;
@@ -2670,12 +3468,7 @@ impl TextWindow {
             return;
         }
         if !same {
-            let read = if self.wrap {
-                self.read_wrapped(ctx, plain, font, count)
-            } else {
-                self.read_unwrapped(count, plain)
-            };
-            let mut page = match read {
+            let mut page = match self.read_page(ctx, plain, font, count) {
                 Ok(page) => page,
                 Err(e) if is_pending(&e) => {
                     // On its way (06 §7.2): the page on screen stays, and where the keys asked
@@ -2707,9 +3500,9 @@ impl TextWindow {
                     self.status = Status::error(format!("{e:#}"));
                     // Not asked again until something moves.
                     (self.jump, self.moved, self.resnap) = (None, 0, false);
-                    let mut page = Page::lines(self.top, count, Vec::new(), false, 0);
-                    page.wrapped = self.wrap;
+                    let mut page = Page::blank(self.top, count, self.wrap);
                     page.top_off = self.top_off;
+                    page.left = self.left;
                     page.width = self.room;
                     page
                 }
@@ -2718,23 +3511,19 @@ impl TextWindow {
             (self.pending, self.failure, self.reask) = (false, None, false);
             self.gen += 1;
             page.gen = self.gen;
-            page.highlighted = self.worker.is_none();
-            if let Some(worker) = &self.worker {
-                worker.ask(self.gen, page.top, page.count);
-            }
             self.page = Some(page);
+            self.ask_highlight();
             // The status row above was drawn before this page was read: once more for it.
             ctx.request_repaint();
         } else {
             self.pending = false;
             if std::mem::take(&mut self.reask) {
                 // A highlighter that started after this page was read.
-                if let (Some(worker), Some(page)) = (&self.worker, self.page.as_mut()) {
-                    self.gen += 1;
+                self.gen += 1;
+                if let Some(page) = self.page.as_mut() {
                     page.gen = self.gen;
-                    page.highlighted = false;
-                    worker.ask(self.gen, page.top, page.count);
                 }
+                self.ask_highlight();
             }
         }
         self.worker_results();
@@ -2745,48 +3534,28 @@ impl TextWindow {
         }
     }
 
-    /// The page of `count` lines at `top`, one row each, cut at [`LINE_MAX`] (not wrapped).
-    fn read_unwrapped(&mut self, count: usize, plain: Color32) -> Result<Page> {
-        let lines = self.doc.line_count();
-        let last_top = lines.saturating_sub(self.visible);
-        // A place past what a stream has indexed so far waits for the pass to reach it.
-        let growing = self.growing();
-        let top = match self.jump {
-            Some(Jump::Byte(at)) if growing && at >= self.doc.size() => {
-                return Err(anyhow::Error::new(Pending));
-            }
-            Some(Jump::Byte(at)) => match self.doc.span_at(at)? {
-                Some(span) => span.line.min(last_top),
-                None => self.top,
-            },
-            Some(Jump::FileEnd) if growing => return Err(anyhow::Error::new(Pending)),
-            Some(Jump::FileEnd) => last_top,
-            Some(Jump::Line(line)) if growing && line > last_top => {
-                return Err(anyhow::Error::new(Pending));
-            }
-            Some(Jump::Line(line)) => line.min(last_top),
-            _ => self.top,
+    /// The page on screen is asked of the highlighter, when its copy of the index has all of
+    /// its lines (06 §7.2: plain past the first 16 MiB, and where lines have no number).
+    fn ask_highlight(&mut self) {
+        let Some(page) = self.page.as_mut() else {
+            return;
         };
-        // The lines the keys moved by since that place was asked for.
-        let top = if self.moved < 0 {
-            top.saturating_sub(self.moved.unsigned_abs())
-        } else {
-            top.saturating_add(self.moved as u64).min(last_top)
-        };
-        let read = self.doc.read_lines(top, count)?;
-        // Only now: a read that is on its way keeps where the keys asked to go.
-        (self.jump, self.moved, self.resnap) = (None, 0, false);
-        self.top = top;
-        let runs = read
-            .iter()
-            .map(|l| expand_tabs(vec![(plain, l.text.clone())]))
-            .collect();
-        Ok(Page::lines(top, count, runs, false, 0))
+        let top = page
+            .top_line
+            .filter(|top| page.count > 0 && top + page.count as u64 <= self.hl_lines);
+        match (&self.worker, top) {
+            (Some(worker), Some(top)) => {
+                page.highlighted = false;
+                worker.ask(self.gen, top, page.count);
+            }
+            _ => page.highlighted = true,
+        }
     }
 
-    /// The page of `rows` rows from the top, wrapped — after the moves the keys asked for — and
-    /// the top it ends up at: never past the last page (the file's last row at the bottom).
-    fn read_wrapped(
+    /// The page of `rows` rows from the top — wrapped, or one row to a line — after the jump
+    /// and the moves the keys asked for, and the top it ends up at: never past the last page
+    /// (the file's last row at the bottom).
+    fn read_page(
         &mut self,
         ctx: &egui::Context,
         plain: Color32,
@@ -2794,15 +3563,38 @@ impl TextWindow {
         rows: usize,
     ) -> Result<Page> {
         use wrap::{Measure, Pos, Wrapper};
-        let lines = self.doc.line_count();
-        // A place past what a stream has indexed so far waits for the pass to reach it.
-        let growing = self.growing();
-        let indexed = self.doc.size();
+        let total = self.doc.total();
+        // While the pass is on its way, a place it will reach waits for it (06 §7.2: the
+        // lines there get their numbers); a place past where it stops is a jump by bytes.
+        let passing = self.doc.passing();
+        let pass_end = total.min(self.doc.cap());
+        let whole = self.doc.whole();
+        let (lines, known) = self.doc.known();
         let waits = || Err(anyhow::Error::new(Pending));
         if self.memo.rewidth(self.room) {
             self.resnap = true;
         }
+        // A jump past the lines known brings the blocks around its place first, in one ask.
+        match self.jump {
+            Some(Jump::FileEnd) if !whole && total > 0 => {
+                if passing && pass_end >= total {
+                    return waits();
+                }
+                self.doc.bring(total - 1)?;
+            }
+            Some(Jump::Byte(at)) if !whole && at >= known => {
+                if passing && at < pass_end {
+                    return waits();
+                }
+                self.doc.bring(at)?;
+            }
+            Some(Jump::Line(line, _)) if line >= lines && passing => return waits(),
+            _ => {}
+        }
         let cell = ctx.fonts_mut(|f| f.glyph_width(font, '0'));
+        let columns = (self.room / cell.max(1.0)).floor().max(1.0) as u64;
+        let wrap = self.wrap;
+        let mut left = self.left;
         let mut w = Wrapper {
             doc: &mut self.doc,
             memo: &mut self.memo,
@@ -2811,73 +3603,137 @@ impl TextWindow {
             read: wrap::read_cap(self.room, cell),
         };
         let mut pos = Pos {
-            line: self.top.min(lines.saturating_sub(1)),
-            off: self.top_off,
+            at: self.top,
+            off: if wrap { self.top_off } else { 0 },
+            loose: self.top_loose,
         };
-        if lines > 0 {
-            if self.resnap {
-                pos = w.snap(pos)?;
+        let any = total > 0 && w.doc.line_count() > 0;
+        if !any {
+            pos = Pos::default();
+        }
+        // Not wrapped, a place is a line's start.
+        let line_start = |p: Pos| if wrap { p } else { Pos { off: 0, ..p } };
+        if any {
+            // (A line's start stays one, and a place the jump replaces is not looked for:
+            // neither is read.)
+            let kept = matches!(self.jump, None | Some(Jump::Home | Jump::End));
+            if self.resnap && kept && (pos.off > 0 || pos.loose) {
+                // The row that holds the place now (the width, the mode or the index changed:
+                // a piece the index has grown over is in a line of its own now).
+                pos = match w.holding(pos.at.saturating_add(pos.off))? {
+                    Some(p) if wrap => w.snap(p)?,
+                    Some(p) => line_start(p),
+                    None => Pos::default(),
+                };
+            }
+            if !wrap && !kept && !self.restoring {
+                // A jump the owner made lands on a line from its start. (One that puts the
+                // view back after a re-read keeps the place within the line.)
+                left = 0;
             }
             let back = rows.saturating_sub(1) as u64;
             pos = match self.jump {
                 None => pos,
                 Some(Jump::FileStart) => Pos::default(),
-                Some(Jump::FileEnd) if growing => return waits(),
-                Some(Jump::FileEnd) => w.end(rows)?,
-                Some(Jump::Home) if pos.off > 0 => Pos {
-                    line: pos.line,
-                    off: 0,
-                },
+                Some(Jump::FileEnd) if wrap => w.end(rows, false)?,
+                Some(Jump::FileEnd) => w.end_lines(rows, false)?,
+                Some(Jump::Home) if wrap && pos.off > 0 => Pos { off: 0, ..pos },
+                Some(Jump::Home) if !wrap && left > 0 => {
+                    left = 0;
+                    pos
+                }
                 Some(Jump::Home) => Pos::default(),
-                // The index's last line may go on, and the file's end is not known yet.
-                Some(Jump::End) if growing && pos.line + 1 >= lines => return waits(),
                 Some(Jump::End) => {
-                    let line_end = w.last_of(pos.line)?;
-                    let top = w.back(line_end, back)?;
-                    if top > pos {
-                        top
-                    } else if growing {
+                    let span = w.span(pos)?;
+                    // The index's last line may go on, and the file's end is not known yet.
+                    if passing && span.line.is_some_and(|line| line + 1 >= lines) {
                         return waits();
+                    }
+                    let within = if wrap {
+                        let line_end = w.last_of(span)?;
+                        let top = w.back(line_end, back)?;
+                        (top > pos).then_some(top)
                     } else {
-                        w.end(rows)?
+                        // The line's last characters at the right edge, when they are not
+                        // there already.
+                        let end = w.end_left(span, columns as usize)?;
+                        (end > left).then(|| {
+                            left = end;
+                            pos
+                        })
+                    };
+                    match within {
+                        Some(top) => top,
+                        None => {
+                            // Already at the line's end: the end of the file.
+                            self.jump_to(Jump::FileEnd);
+                            return self.read_page(ctx, plain, font, rows);
+                        }
                     }
                 }
-                Some(Jump::Byte(at)) if growing && at >= indexed => return waits(),
-                Some(Jump::Byte(at)) => w.at_byte(at)?,
-                Some(Jump::Line(line)) if growing && line >= lines => return waits(),
-                Some(Jump::Line(line)) => Pos {
-                    line: line.min(lines - 1),
-                    off: 0,
-                },
+                Some(Jump::Byte(at)) if wrap => w.at_byte(at)?,
+                Some(Jump::Byte(at)) => w.holding(at)?.map(line_start).unwrap_or_default(),
+                Some(Jump::Line(line, off)) => {
+                    let span = w.line(line.min(lines.saturating_sub(1)))?;
+                    let p = Pos {
+                        off,
+                        ..Pos::of(&span)
+                    };
+                    if wrap {
+                        w.snap(p)?
+                    } else {
+                        line_start(p)
+                    }
+                }
             };
-            if self.moved > 0 {
-                pos = w.forward(pos, self.moved as u64)?;
-            } else if self.moved < 0 {
-                pos = w.back(pos, self.moved.unsigned_abs())?;
-            }
+            let n = self.moved.unsigned_abs();
+            pos = match (self.moved.signum(), wrap) {
+                (1, true) => w.forward(pos, n)?,
+                (1, false) => w.lines_on(pos, n)?,
+                (-1, true) => w.back(pos, n)?,
+                (-1, false) => w.lines_back(pos, n)?,
+                _ => pos,
+            };
         }
-        let (mut got, mut at_end) = w.page(pos, rows)?;
-        if got.len() < rows && pos != Pos::default() {
-            // Short of the window: the last page instead, no blank rows under the end.
-            pos = w.end(rows)?;
-            (got, at_end) = w.page(pos, rows)?;
-        }
-        let (top_start, top_len) = match lines {
-            0 => (0, 0),
-            _ => {
-                let span = w.span(pos.line)?;
-                (span.start, span.len)
+        let read = |w: &mut Wrapper, pos: Pos| {
+            if wrap {
+                w.page(pos, rows)
+            } else {
+                w.flat(pos, left, rows)
             }
         };
+        let (mut got, mut at_end) = read(&mut w, pos)?;
+        if got.len() < rows && pos != Pos::default() {
+            // Short of the window: the last page instead, no blank rows under the end — the
+            // end of the lines known, while the pass is on its way.
+            pos = if wrap {
+                w.end(rows, true)?
+            } else {
+                w.end_lines(rows, true)?
+            };
+            (got, at_end) = read(&mut w, pos)?;
+        }
+        let top = match any {
+            true => Some(w.span(pos)?),
+            false => None,
+        };
         (self.jump, self.moved, self.resnap) = (None, 0, false);
-        (self.top, self.top_off) = (pos.line, pos.off);
-        let count = got.last().map_or(0, |r| (r.line - pos.line + 1) as usize);
-        let mut page = Page::lines(pos.line, count, Vec::new(), false, 0);
-        page.visible = rows;
-        page.wrapped = true;
+        self.restoring = false;
+        (self.top, self.top_off, self.top_loose) = (pos.at, pos.off, pos.loose);
+        self.line = top.and_then(|span| span.line);
+        self.left = left;
+        // The lines on it the index numbers: all of them, or none is asked of the highlighter.
+        let count = match (self.line, got.last().and_then(|r| r.line)) {
+            (Some(first), Some(last)) => (last - first + 1) as usize,
+            _ => 0,
+        };
+        let mut page = Page::blank(pos.at, rows, wrap);
+        page.top_line = self.line;
+        page.top_loose = pos.loose;
+        page.count = count;
         page.top_off = pos.off;
-        page.top_start = top_start;
-        page.top_len = top_len;
+        page.left = left;
+        page.top_len = top.map_or(0, |span| span.len);
         page.width = self.room;
         page.rows = got;
         page.at_end = at_end;
@@ -2893,19 +3749,15 @@ impl TextWindow {
         loop {
             match worker.done.try_recv() {
                 Ok(Done::Page { gen, runs }) if gen == page.gen => {
-                    if page.wrapped {
-                        // Each character's colour: the rows take theirs by index.
-                        page.colors = runs
-                            .iter()
-                            .map(|line| {
-                                line.iter()
-                                    .flat_map(|(c, t)| std::iter::repeat_n(*c, t.chars().count()))
-                                    .collect()
-                            })
-                            .collect();
-                    } else {
-                        page.runs = runs.into_iter().map(expand_tabs).collect();
-                    }
+                    // Each character's colour: the rows take theirs by index.
+                    page.colors = runs
+                        .iter()
+                        .map(|line| {
+                            line.iter()
+                                .flat_map(|(c, t)| std::iter::repeat_n(*c, t.chars().count()))
+                                .collect()
+                        })
+                        .collect();
                     page.highlighted = true;
                 }
                 Ok(Done::Page { .. }) => {}
@@ -2961,7 +3813,7 @@ impl TextWindow {
             .syntax
             .map_or("plain text", |s| s.name.as_str())
             .to_string();
-        let mut parts = if self.doc.is_stream() && !self.doc.whole() {
+        let parts = if self.doc.is_stream() && !self.doc.whole() {
             // Not `N lines` while more may come: how far the lines are known, of the file's
             // size as the Source has it (06 §7.2).
             let known = format!(
@@ -2977,9 +3829,6 @@ impl TextWindow {
                 syntax,
             ]
         };
-        if self.doc.long_lines() && !self.wrap {
-            parts.push(format!("lines over {LINE_MAX} bytes are cut"));
-        }
         ui.horizontal(|ui| {
             super::one_line(ui, &self.title, p.text);
             ui.separator();
@@ -2999,31 +3848,49 @@ impl TextWindow {
         }
     }
 
-    fn status_bar(&self, ui: &mut egui::Ui) {
+    /// Where the page on screen is: its lines by number where the index reaches all of them,
+    /// else its bytes — and that a line's start is not known, when the top one's is not.
+    fn place(&self, page: &Page) -> String {
+        let last = page.rows.last();
+        match (page.top_line, last.and_then(|r| r.line)) {
+            (Some(top), Some(last)) => {
+                let mut first = (top + 1).to_string();
+                if page.wrapped && page.top_off > 0 && page.top_len > 0 {
+                    first.push_str(&format!(" ({} % of it)", page.top_off * 100 / page.top_len));
+                }
+                // (A local file's lines, not wrapped, are `lines 1–1` too, as they were.)
+                let one = last == top && (page.wrapped || self.doc.is_stream());
+                let mut shown = if one {
+                    format!("line {first}")
+                } else {
+                    format!("lines {first}–{}", last + 1)
+                };
+                if self.doc.whole() {
+                    shown.push_str(&format!(" of {}", self.doc.line_count()));
+                }
+                shown
+            }
+            _ => {
+                let from = page.top + if page.wrapped { page.top_off } else { 0 };
+                let to = last.map_or(from, |r| r.at + r.start + r.cut.bytes as u64);
+                let mut shown = format!("bytes 0x{from:X}–0x{to:X}");
+                if page.top_loose {
+                    shown.push_str(" · line start not known");
+                }
+                shown
+            }
+        }
+    }
+
+    fn status_bar(&mut self, ui: &mut egui::Ui) {
         let lines = self.doc.line_count();
         // A stream describes the page on screen — never where the keys asked to go — and says
         // `of N` only once N is the file's (06 §7.2).
         let stream = self.doc.is_stream();
         let shown = match &self.page {
-            Some(page) if stream && !page.is_empty() => {
-                let (first, last) = match page.rows.last() {
-                    Some(row) if page.wrapped => (page.top + 1, row.line + 1),
-                    _ => (page.top + 1, page.top + page.runs.len() as u64),
-                };
-                let mut first_text = first.to_string();
-                if page.wrapped && page.top_off > 0 && page.top_len > 0 {
-                    first_text
-                        .push_str(&format!(" ({} % of it)", page.top_off * 100 / page.top_len));
-                }
-                let mut shown = if last == first {
-                    format!("line {first_text}")
-                } else {
-                    format!("lines {first_text}–{last}")
-                };
-                if self.doc.whole() {
-                    shown.push_str(&format!(" of {lines}"));
-                }
-                if self.pending {
+            Some(page) if !page.is_empty() && (stream || lines > 0) => {
+                let mut shown = self.place(page);
+                if stream && self.pending {
                     shown.push_str(" · ");
                     shown.push_str(&self.loading());
                 }
@@ -3036,22 +3903,10 @@ impl TextWindow {
             }
             _ if stream && self.doc.total() > 0 && (lines == 0 || self.pending) => self.loading(),
             _ if lines == 0 => "empty".to_string(),
-            Some(page) if page.wrapped && !page.rows.is_empty() => {
-                // Lines as on screen; inside a line, how far into it the top row is.
-                let last = page.rows.last().map_or(page.top, |r| r.line) + 1;
-                let mut first = (page.top + 1).to_string();
-                if page.top_off > 0 && page.top_len > 0 {
-                    first.push_str(&format!(" ({} % of it)", page.top_off * 100 / page.top_len));
-                }
-                if last == page.top + 1 {
-                    format!("line {first} of {lines}")
-                } else {
-                    format!("lines {first}–{last} of {lines}")
-                }
-            }
             _ => {
-                let last = self.top.saturating_add(self.visible).min(lines);
-                format!("lines {}–{last} of {lines}", self.top + 1)
+                let top = self.line.unwrap_or(0);
+                let last = top.saturating_add(self.visible).min(lines);
+                format!("lines {}–{last} of {lines}", top + 1)
             }
         };
         let status = match self.reindex.as_ref().and_then(|r| r.resume.as_ref()) {
@@ -3065,14 +3920,41 @@ impl TextWindow {
                 Some(text) => Status::error(text),
                 None => match &self.failure {
                     Some(text) => Status::error(text.clone()),
+                    // Go to's pass (06 §7.2): how far the lines are known, and how to stop.
+                    None if self.seeking.is_some() => Status::info(format!(
+                        "indexing… {} of {} · Esc stops",
+                        crate::human(self.doc.size()),
+                        crate::human(self.doc.total())
+                    )),
                     None => self.status.clone(),
                 },
             },
         };
+        let mut go = None;
         ui.horizontal(|ui| {
             let place = !shown.is_empty();
             if place {
                 ui.monospace(shown);
+            }
+            if let Some(text) = self.goto.as_mut() {
+                // Go to (Cmd/Ctrl+G), as the hex window's: Enter goes there, Esc leaves.
+                if place {
+                    ui.separator();
+                }
+                ui.label("Go to");
+                let field = ui.add(
+                    chrome::field(text)
+                        .id(goto_id())
+                        .hint_text("line, or 0x… offset")
+                        .desired_width(150.0),
+                );
+                if field.lost_focus() {
+                    if ui.input(|i| i.key_pressed(Key::Enter)) {
+                        go = Some(text.clone());
+                    }
+                    self.goto = None;
+                }
+                return;
             }
             if !status.text.is_empty() {
                 if place {
@@ -3081,35 +3963,57 @@ impl TextWindow {
                 status.show(ui);
             }
         });
+        if let Some(text) = go {
+            self.go(&text);
+        }
     }
 
     /// Where the scroll bar's thumb is (0 at the top, 1 at the end; `None`: nothing to scroll).
-    /// Wrapped, by bytes: rows cannot be counted without reading every line.
+    /// By bytes while the line count is not known — and wrapped, always: rows cannot be counted
+    /// without reading every line — else by lines (06 §7.2).
     fn thumb(&self) -> Option<f32> {
+        if let Some(at) = self.drag {
+            return Some(at);
+        }
+        let whole = self.doc.whole();
         match &self.page {
-            Some(p) if p.wrapped => {
+            Some(p) if p.wrapped || !whole => {
                 let at_start = p.top == 0 && p.top_off == 0;
                 // The end of what is indexed is the file's end only once the index is whole.
-                match (p.at_end && self.doc.whole(), at_start) {
+                match (p.at_end && whole, at_start) {
                     (true, true) => None,
                     (true, false) => Some(1.0),
-                    _ => Some((p.top_start + p.top_off) as f32 / self.doc.total().max(1) as f32),
+                    _ if p.is_empty() => None,
+                    _ => Some((p.top + p.top_off) as f32 / self.doc.total().max(1) as f32),
                 }
             }
-            _ => {
+            page => {
                 let max_top = self.doc.line_count().saturating_sub(self.visible);
-                // A stream's thumb is where the page on screen is, of the file: the lines
-                // known so far are this share of it.
-                let (top, known) = match &self.page {
-                    Some(p) if self.doc.is_stream() => (
-                        p.top,
-                        self.doc.size() as f32 / self.doc.total().max(1) as f32,
-                    ),
-                    _ => (self.top, 1.0),
-                };
-                (max_top > 0).then(|| top.min(max_top) as f32 / max_top as f32 * known)
+                let top = page.as_ref().and_then(|p| p.top_line).or(self.line);
+                let top = top.unwrap_or(0);
+                (max_top > 0).then(|| top.min(max_top) as f32 / max_top as f32)
             }
         }
+    }
+
+    /// The scroll bar was clicked, or its thumb let go, at `at` (0 to 1): a jump (06 §7.2) —
+    /// by lines when the thumb is by lines, else to that share of the file's bytes.
+    fn scroll_to(&mut self, at: f32) {
+        let at = f64::from(at.clamp(0.0, 1.0));
+        let total = self.doc.total();
+        if total == 0 {
+            return;
+        }
+        let jump = if self.doc.whole() && !self.wrap {
+            let max_top = self.doc.line_count().saturating_sub(self.visible);
+            Jump::Line((max_top as f64 * at).round() as u64, 0)
+        } else if at >= 1.0 {
+            Jump::FileEnd
+        } else {
+            Jump::Byte(((total as f64 * at) as u64).min(total - 1))
+        };
+        self.moved = 0;
+        self.jump_to(jump);
     }
 
     fn body(&mut self, ui: &mut egui::Ui) {
@@ -3174,7 +4078,7 @@ impl TextWindow {
             && self.reindex.is_none()
             && !self.stream_frozen()
         {
-            let mut rows = 0f32;
+            let (mut rows, mut across) = (0f32, 0f32);
             ctx.input(|i| {
                 for event in &i.events {
                     if let egui::Event::MouseWheel { unit, delta, .. } = event {
@@ -3183,27 +4087,29 @@ impl TextWindow {
                             egui::MouseWheelUnit::Page => delta.y * self.visible as f32,
                             egui::MouseWheelUnit::Point => delta.y / row_h,
                         };
+                        across -= match unit {
+                            egui::MouseWheelUnit::Line => delta.x * 3.0,
+                            egui::MouseWheelUnit::Page => delta.x * 16.0,
+                            egui::MouseWheelUnit::Point => delta.x / cw,
+                        };
                     }
                 }
             });
+            if !self.wrap && across != 0.0 {
+                // Not wrapped, the wheel sideways moves the place within the lines (06 §7.2).
+                // What is less than a byte is kept for the next frame, as the rows' is: a slow
+                // swipe is many frames of less than one each.
+                let across = across + self.wheel_across;
+                let whole = across.trunc();
+                self.wheel_across = across - whole;
+                self.left = self.left.saturating_add_signed(whole as i64);
+            }
             if rows != 0.0 {
                 let rows = rows + self.wheel_rest;
                 let whole = rows.trunc();
                 self.wheel_rest = rows - whole;
-                let moved = whole as i64;
-                if self.wrap {
-                    self.moved += moved;
-                } else {
-                    self.top = if moved < 0 {
-                        self.top.saturating_sub(moved.unsigned_abs())
-                    } else {
-                        self.top.saturating_add(moved as u64)
-                    };
-                }
+                self.moved += whole as i64;
             }
-        }
-        if !self.wrap {
-            self.top = self.top.min(lines.saturating_sub(self.visible));
         }
         if self.hl_retry && !self.frozen() && self.failure.is_none() {
             // The stream is back (or was never down for what the page needs): once more.
@@ -3219,9 +4125,10 @@ impl TextWindow {
         let indexed = !self.doc.is_stream() || (lines > 0 && !self.syntax_due);
         if !self.hl_tried && indexed {
             self.hl_tried = true;
-            // (A stream's index never passes 16 MiB: its lines are highlighted as far as it
-            // goes. A local file over that is plain, as it always was.)
-            if self.doc.size() <= HIGHLIGHT_MAX && !self.frozen() {
+            // (Its state runs from the top of the file, so it goes over the first 16 MiB and
+            // no further, whatever the file is read through: its copy of the index is of that
+            // much, 06 §7.2.)
+            if !self.frozen() {
                 let stop = self.doc.first_long.unwrap_or(u64::MAX);
                 let hl = self.syntax.and_then(|s| Highlight::new(s, p.text, stop));
                 #[cfg(test)]
@@ -3230,8 +4137,9 @@ impl TextWindow {
                     h.after_wake = self.after_wake.clone();
                     h
                 });
-                self.worker = match (hl, self.doc.share()) {
+                self.worker = match (hl, self.doc.share_first(HIGHLIGHT_MAX)) {
                     (Some(hl), Ok(doc)) => {
+                        self.hl_lines = doc.line_count();
                         let started = Worker::start(doc, hl, ctx.clone(), &self.pool);
                         if started.is_none() {
                             self.status =
@@ -3255,21 +4163,45 @@ impl TextWindow {
         }
         let painter = ui.painter_at(rect);
         // The scroll bar on the right border, beside the lines.
-        chrome::scroll_bar(
-            &ui.painter_at(outer),
-            Rect::from_min_max(
-                Pos2::new(rect.right(), rect.top()),
-                Pos2::new(rect.right() + chrome::CELL.x, rect.bottom()),
-            ),
-            self.thumb(),
+        let bar = Rect::from_min_max(
+            Pos2::new(rect.right(), rect.top()),
+            Pos2::new(rect.right() + chrome::CELL.x, rect.bottom()),
         );
+        let track = chrome::scroll_bar(&ui.painter_at(outer), bar, self.thumb());
+        if !self.preview && !self.waiting && self.reindex.is_none() && !self.stream_frozen() {
+            // A click on it, or its thumb let go, is a jump (06 §7.2). While the thumb is
+            // dragged only the thumb moves: a place it passes is not read.
+            let id = ui.scope_id().with("sopen-text-scroll");
+            let response = ui.interact(bar, id, egui::Sense::click_and_drag());
+            let room = (track.height() - chrome::CELL.y).max(1.0);
+            let at = response
+                .interact_pointer_pos()
+                .map(|pos| ((pos.y - track.top() - chrome::CELL.y / 2.0) / room).clamp(0.0, 1.0));
+            if response.dragged() {
+                self.drag = at.or(self.drag);
+            }
+            if response.clicked() || response.drag_stopped() {
+                if let Some(at) = at.or(self.drag) {
+                    self.scroll_to(at);
+                }
+                self.drag = None;
+                ctx.request_repaint();
+            }
+        }
         let text_painter =
             ui.painter_at(Rect::from_min_max(Pos2::new(text_x, rect.top()), rect.max));
-        let number = |k: usize, line: u64| {
+        // The gutter: a line's number where the index reaches it; past that its byte offset
+        // (06 §7.2), with `…` before it when it is not known to be a line's start.
+        let number = |k: usize, row: &wrap::Row| {
+            let label = match row.line {
+                Some(line) => (line + 1).to_string(),
+                None if row.loose => format!("…0x{:X}", row.at),
+                None => format!("0x{:X}", row.at),
+            };
             painter.text(
                 Pos2::new(rect.left() + gutter, rect.top() + k as f32 * row_h),
                 egui::Align2::RIGHT_TOP,
-                (line + 1).to_string(),
+                label,
                 font.clone(),
                 p.dim,
             );
@@ -3280,10 +4212,10 @@ impl TextWindow {
                 for (k, row) in page.rows.iter().enumerate() {
                     // The number on a line's first row only.
                     if row.start == 0 {
-                        number(k, row.line);
+                        number(k, row);
                     }
-                    let colors = row.first_char.and_then(|first| {
-                        let line = page.colors.get((row.line - page.top) as usize)?;
+                    let colors = row.first_char.zip(row.line).and_then(|(first, n)| {
+                        let line = page.colors.get(n.checked_sub(page.top_line?)? as usize)?;
                         Some((first, line.as_slice()))
                     });
                     // As it was measured (one section).
@@ -3327,30 +4259,16 @@ impl TextWindow {
                 }
             }
             Some(page) => {
-                // Only the columns that fit are laid out: a line can be thousands of characters.
+                // Only the columns that fit are laid out: a row is read wider than it shows.
                 let columns = ((rect.right() - text_x) / cw).floor().max(0.0) as usize;
-                for (k, runs) in page.runs.iter().enumerate() {
-                    number(k, page.top + k as u64);
-                    let mut shown: Vec<(char, Color32)> = Vec::new();
-                    let (mut skip, mut room) = (self.left, columns);
-                    for (color, text) in runs {
-                        if room == 0 {
-                            break;
-                        }
-                        let n = text.chars().count();
-                        if skip >= n {
-                            skip -= n;
-                            continue;
-                        }
-                        let part = text
-                            .chars()
-                            .skip(std::mem::take(&mut skip))
-                            .take(room)
-                            .map(|c| (chrome::shown_char(c), *color));
-                        let before = shown.len();
-                        shown.extend(part);
-                        room -= shown.len() - before;
-                    }
+                for (k, row) in page.rows.iter().enumerate() {
+                    number(k, row);
+                    let colors = row.first_char.zip(row.line).and_then(|(first, n)| {
+                        let line = page.colors.get(n.checked_sub(page.top_line?)? as usize)?;
+                        Some((first, line.as_slice()))
+                    });
+                    let mut shown = row_chars(row, colors, p.text);
+                    shown.truncate(columns);
                     let galley = ctx.fonts_mut(|f| f.layout_job(directed_job(shown, &font)));
                     text_painter.galley(
                         Pos2::new(text_x, rect.top() + k as f32 * row_h),
@@ -3358,11 +4276,11 @@ impl TextWindow {
                         p.text,
                     );
                 }
-                if self.growing() {
+                if self.doc.passing() {
                     // The rows below the last line indexed so far (a line that runs past
                     // what is indexed): their starts are not known yet. They fill in as the
                     // index pass reaches them (06 §7.2).
-                    for k in page.runs.len()..self.visible as usize {
+                    for k in page.rows.len()..self.visible as usize {
                         text_painter.text(
                             Pos2::new(text_x, rect.top() + k as f32 * row_h),
                             egui::Align2::LEFT_TOP,
@@ -3403,6 +4321,13 @@ impl TextWindow {
             if let Some(source) = self.doc.source() {
                 source.mark(crate::stream::Mark::First);
                 ctx.request_repaint();
+            }
+        }
+        if self.asked && !self.pending && self.jump.is_none() && self.seeking.is_none() {
+            // The page of the last jump is drawn: `ready` on the stats line (06 §11).
+            self.asked = false;
+            if let Some(source) = self.doc.source() {
+                source.mark(crate::stream::Mark::Ready);
             }
         }
         if let Some(note) = &note {
@@ -3548,7 +4473,16 @@ impl Window for TextWindow {
                     )
                 })
             });
-        self.keys(&ui.ctx().clone());
+        // Cmd/Ctrl+G opens the Go to field in the status row (06 §7.2), which then has the
+        // typing: no key of the window acts from there.
+        let ctx = ui.ctx().clone();
+        let open = super::command_key(&ctx, Key::G, false);
+        if open {
+            self.goto = Some(String::new());
+            ctx.memory_mut(|m| m.request_focus(goto_id()));
+        }
+        let typing = self.goto.is_some() && (open || ctx.memory(|m| m.has_focus(goto_id())));
+        self.keys(&ctx, typing);
         chrome::bar_panel(egui::Panel::top("sopen-text-bar")).show(ui, |ui| self.bar(ui));
         chrome::bar_panel(egui::Panel::bottom("sopen-text-status"))
             .show(ui, |ui| self.status_bar(ui));
@@ -3568,6 +4502,13 @@ impl Window for TextWindow {
     }
 
     fn ready(&self) -> bool {
+        if self.shoot_loading && self.doc.is_stream() {
+            // `loading=1` (06 §11): the first frame drawn with rows from the stream, and every
+            // one after it — a page read on its way, rows that say `loading…`, highlighting
+            // not here yet and Go to's pass are shot as they are. Never before a row came.
+            let rows = self.page.as_ref().is_some_and(|p| !p.is_empty());
+            return self.painted && self.first && rows;
+        }
         if self.pending {
             // A page read is on its way (06 §7.2): what was asked for is not on screen yet.
             return false;
@@ -3584,7 +4525,9 @@ impl Window for TextWindow {
             // A preview whose file changed keeps what it shows: it is not re-read.
             return self.painted && (page || self.frozen());
         }
-        self.painted && !self.waiting && self.reindex.is_none() && !self.reloading && page
+        let still = !self.waiting && self.reindex.is_none() && !self.reloading;
+        // (Go to's pass is a jump on its way.)
+        self.painted && still && self.seeking.is_none() && page
     }
 
     /// A preview (02 §4.2): no bars, a single-lined frame, no keys or wheel, no following and no
@@ -3615,8 +4558,8 @@ impl Window for TextWindow {
 fn opening_status(syntax: Option<&SyntaxReference>, doc: &TextDoc) -> Status {
     match (syntax, doc.first_long) {
         (None, _) => Status::default(),
-        _ if doc.size() > HIGHLIGHT_MAX => Status::info(format!(
-            "over {}: shown without highlighting",
+        _ if doc.total() > HIGHLIGHT_MAX => Status::info(format!(
+            "highlighted over its first {}",
             crate::human(HIGHLIGHT_MAX)
         )),
         (Some(_), Some(line)) => Status::info(format!(
@@ -3636,6 +4579,18 @@ fn amount(bytes: u64) -> String {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    static EMBEDDED_LOADING: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Tests: the `loading` the last viewer embedded on this thread was given ([`embed_scripted`]);
+/// `None` when none was.
+#[cfg(test)]
+pub(crate) fn embedded_loading() -> Option<bool> {
+    EMBEDDED_LOADING.with(std::cell::Cell::get)
+}
+
 /// The text viewer inside another window (the file browser). `title` is `host:/abs`, `name` the
 /// file's name (it picks the syntax); `notices` are shown whole in its rows. `live`: the file is
 /// read in place (followed at its end), not a fetched copy. `at`: the row byte `at` of the file
@@ -3648,9 +4603,29 @@ pub fn embed(
     live: bool,
     at: Option<u64>,
 ) -> Embedded {
+    embed_scripted(doc, title, name, notices, live, at, false)
+}
+
+/// [`embed`] for the viewer a scripted run opens: `loading` is `SOPEN_STATE`'s `loading=1`
+/// (06 §11), as the window that hosts the viewer parsed it — a viewer on a stream is then
+/// ready to be shot at its first frame drawn with rows, what is still on its way shot as it is.
+pub fn embed_scripted(
+    doc: TextDoc,
+    title: String,
+    name: &str,
+    notices: Vec<String>,
+    live: bool,
+    at: Option<u64>,
+    loading: bool,
+) -> Embedded {
     let mut window = TextWindow::new(doc, title, name, notices);
     window.live = live;
-    window.jump = at.map(Jump::Byte);
+    window.shoot_loading = loading;
+    #[cfg(test)]
+    EMBEDDED_LOADING.with(|l| l.set(Some(loading)));
+    if let Some(at) = at {
+        window.jump_to(Jump::Byte(at));
+    }
     Embedded {
         window: Box::new(window),
         settle: Box::new(|_| Some(Outcome::default())),
@@ -3672,7 +4647,10 @@ pub fn embed_source(
 ) -> Embedded {
     let mut window = TextWindow::new(TextDoc::streamed(source), title, name, notices);
     window.preview_index = preview_index;
-    window.jump = at.map(Jump::Byte);
+    if let Some(at) = at {
+        // A place opened at is a jump (06 §11: an `input`, and its page a `ready`).
+        window.jump_to(Jump::Byte(at));
+    }
     Embedded {
         window: Box::new(window),
         settle: Box::new(|_| Some(Outcome::default())),
