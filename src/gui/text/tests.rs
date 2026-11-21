@@ -2917,8 +2917,14 @@ fn a_failed_read_leaves_the_read_window_as_it_was() {
     let mut doc = TextDoc::open(&path).unwrap();
     let mut window = Window_::default();
     assert_eq!(window.at(&mut doc, 0, 10).unwrap(), &body[..10]);
+    let held = window.bytes.clone();
+    assert!(!held.is_empty());
     doc.fail_reads = true;
     assert!(window.at(&mut doc, 30_000, 100).is_err());
+    // Looked at while reads still fail: the window itself, not what a later read refills.
+    assert_eq!(window.start, 0);
+    assert_eq!(window.bytes, held, "the window was not left as it was");
+    assert_eq!(window.bytes, &body[..held.len()]);
     doc.fail_reads = false;
     // Inside what the window held before the failure: served from it, and the file's bytes.
     let got = window.at(&mut doc, 5, 100).unwrap().to_vec();

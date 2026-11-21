@@ -415,6 +415,11 @@ impl TextDoc {
                 }
             }
             let last_stretch = end < stream.total && at > 0 && end - at < ahead + block;
+            if last_stretch && at > from {
+                // Read in one piece (below), up to a block more than a pass's budget: in a
+                // pass of its own, not on top of what this one has fed.
+                break;
+            }
             if !last_stretch {
                 stream.tail = None;
             } else if stream.tail.is_none() {
@@ -1787,6 +1792,13 @@ const TITLE: &str = "Text Viewer";
 /// What stands where bytes are still on their way (06 §7.2).
 const LOADING: &str = "loading…";
 
+/// A read on its way for this long says so (06 §5; the 1 s `loading 0x…` form is the hex
+/// window's, which has an offset to name).
+const SLOW_AFTER: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// What the status row adds then.
+const SLOW: &str = "the remote is slow";
+
 struct TextWindow {
     /// `host:/abs`.
     title: String,
@@ -1859,6 +1871,8 @@ struct TextWindow {
     /// the keys asked to go is kept until its bytes arrive. Also before a stream's first block,
     /// and while a place past the indexed lines waits for the index pass.
     pending: bool,
+    /// Since when (06 §5: after [`SLOW_AFTER`] the status row says the remote is slow).
+    pending_since: Option<std::time::Instant>,
     /// Why a stream's last read failed (06 §5): the screen and the keys stay, the status row
     /// says it, and the next pass reads again.
     failure: Option<String>,
@@ -1983,6 +1997,7 @@ impl TextWindow {
             #[cfg(test)]
             after_install: None,
             pending: false,
+            pending_since: None,
             failure: None,
             streamed: None,
             reloading: false,
@@ -2097,7 +2112,6 @@ impl TextWindow {
             // The first screen first (unless it is to be a place the index has to reach).
             return;
         }
-        let lines = self.doc.line_count();
         let long = self.doc.long_lines();
         let growth = match self.doc.grow(self.pass_cap(), PASS_READ as u64) {
             Ok(Some(growth)) => growth,
@@ -2112,14 +2126,19 @@ impl TextWindow {
             // before. (The page on screen is not read again for that, below.)
             self.memo.reset(self.room);
         }
-        let shows_the_end = self.page.as_ref().is_some_and(|p| {
-            let last = match p.rows.last() {
-                Some(row) if p.wrapped => row.line + 1,
-                _ => p.top + p.runs.len() as u64,
-            };
-            last >= lines
+        // The page is read again only if a line on it got longer — the line the index ended
+        // in, with no line end yet — or it was short of the window and may gain rows.
+        let grew = self.page.as_ref().is_some_and(|p| {
+            if p.wrapped {
+                // (`at_end`: its last row ended the last line indexed.)
+                p.rows.len() < p.visible || (p.at_end && growth.open_line.is_some())
+            } else {
+                let shown = p.top..p.top + p.runs.len() as u64;
+                p.runs.len() < p.visible
+                    || growth.open_line.is_some_and(|line| shown.contains(&line))
+            }
         });
-        if shows_the_end {
+        if grew {
             self.stale_page = true;
         }
         if !long && self.doc.long_lines() && !self.status.error {
@@ -2475,9 +2494,12 @@ impl TextWindow {
             if !pressed(key) {
                 continue;
             }
-            if self.jump.is_some() {
-                // A place asked for and not shown yet (a stream's index has to reach it):
-                // these lines are counted from there, once it is.
+            let no_page_yet =
+                self.doc.is_stream() && self.doc.line_count() == 0 && self.doc.total() > 0;
+            if self.jump.is_some() || no_page_yet {
+                // A place asked for and not shown yet (a stream's index has to reach it), or
+                // no page at all yet (its first block is on its way): these lines are
+                // counted from there, once it is.
                 self.moved += lines;
             } else if lines < 0 {
                 self.top = self.top.saturating_sub(lines.unsigned_abs());
@@ -2880,6 +2902,18 @@ impl TextWindow {
         });
     }
 
+    /// `loading…`, and after [`SLOW_AFTER`] of waiting that the remote is slow.
+    fn loading(&self) -> String {
+        let slow = self
+            .pending_since
+            .is_some_and(|since| (self.clock)().saturating_duration_since(since) >= SLOW_AFTER);
+        if slow {
+            format!("{LOADING} · {SLOW}")
+        } else {
+            LOADING.to_string()
+        }
+    }
+
     fn status_bar(&self, ui: &mut egui::Ui) {
         let lines = self.doc.line_count();
         // A stream describes the page on screen — never where the keys asked to go — and says
@@ -2906,7 +2940,7 @@ impl TextWindow {
                 }
                 if self.pending {
                     shown.push_str(" · ");
-                    shown.push_str(LOADING);
+                    shown.push_str(&self.loading());
                 }
                 shown
             }
@@ -2915,9 +2949,7 @@ impl TextWindow {
             _ if stream && lines == 0 && (self.failure.is_some() || self.stream_down()) => {
                 String::new()
             }
-            _ if stream && self.doc.total() > 0 && (lines == 0 || self.pending) => {
-                LOADING.to_string()
-            }
+            _ if stream && self.doc.total() > 0 && (lines == 0 || self.pending) => self.loading(),
             _ if lines == 0 => "empty".to_string(),
             Some(page) if page.wrapped && !page.rows.is_empty() => {
                 // Lines as on screen; inside a line, how far into it the top row is.
@@ -3252,6 +3284,17 @@ impl TextWindow {
                 font.clone(),
                 p.dim,
             );
+        }
+        if self.pending {
+            // How long this read has been on its way; a pass when the status row says more.
+            let now = (self.clock)();
+            let since = *self.pending_since.get_or_insert(now);
+            let waited = now.saturating_duration_since(since);
+            if waited < SLOW_AFTER {
+                ctx.request_repaint_after(SLOW_AFTER - waited);
+            }
+        } else {
+            self.pending_since = None;
         }
         if !self.first && self.page.as_ref().is_some_and(|p| !p.is_empty()) {
             // The first screen is drawn: `first` on the stats line (06 §11). The index pass
