@@ -38,6 +38,39 @@ use timeline::{Clip, Tick, Timeline, View};
 /// row: read whole on a narrow window).
 const CLOSE_AGAIN: &str = "the window closes when the export is done — close it again to close \
      it now; sopen still waits for the export and prints the result in the terminal";
+/// Save and Export wait for ffmpeg to say what its H.264 encoder takes (a video above 8 bits).
+const CHECKING_ENCODER: &str = "checking the encoder…";
+/// The encoder gave no answer in [`ENCODER_TIME`]: Save and Export render 8-bit `yuv420p`,
+/// which every H.264 encoder takes.
+const ENCODER_TIMED_OUT: &str = "encoder check timed out; Export converts to 8-bit";
+/// How long a window waits for the encoder's answer (the preview's time for it, 02 §4.3).
+const ENCODER_TIME: Duration = Duration::from_secs(5);
+
+/// The media window's own encoder question, running: its answer, and what stops it. Dropped —
+/// the answer came, or the window went — its ffmpeg is stopped (killed; its thread reaps it).
+struct Planning {
+    rx: Receiver<Answer>,
+    children: Arc<preview::Children>,
+    cancel: Arc<AtomicBool>,
+}
+
+impl Drop for Planning {
+    fn drop(&mut self) {
+        self.cancel.store(true, SeqCst);
+        self.children.stop();
+    }
+}
+
+/// What came of the encoder question.
+enum Answer {
+    /// The pixel formats ffmpeg's H.264 encoder takes.
+    Takes(std::collections::HashSet<String>),
+    /// None in its time.
+    TimedOut,
+    /// ffmpeg did not run, or the question was stopped.
+    Nothing,
+}
+
 /// Closing was asked for while a save runs.
 const CLOSES_AFTER_SAVE: &str = "the window closes when the save is done";
 
@@ -92,24 +125,27 @@ impl Media {
     pub fn probe_as(input: &Input, name: &str) -> Result<Self> {
         let tools = ffmpeg::resolve()?;
         let probe = ffmpeg::probe(&tools, input)?;
+        let mut media = Self::of_probe(tools, input, name, probe)?;
+        media.plan();
+        Ok(media)
+    }
+
+    /// The file as ffprobe sees it, with no word yet on how Save and Export render it: what a
+    /// window opens with (it works that out itself, off its frames: [`Planning`]).
+    fn unplanned(tools: &Tools, input: &Input, name: &str) -> Result<Self> {
+        let probe = ffmpeg::probe(tools, input)?;
+        Self::of_probe(tools.clone(), input, name, probe)
+    }
+
+    /// The file as `probe` (ffprobe's view of `input`, the original named `name`) describes it,
+    /// with no word yet on how Save and Export render it ([`Media::plan`]).
+    fn of_probe(tools: Tools, input: &Input, name: &str, probe: Probe) -> Result<Self> {
         let duration = probe
             .duration
             .filter(|d| *d > 0.0)
             .with_context(|| format!("ffprobe reports no duration for {}", input.show()))?;
         if probe.video.is_none() && !probe.has_audio {
             bail!("{} has no audio or video stream", input.show());
-        }
-        let plan = cut::plan(&tools, &probe, name).ok();
-        let mut notes = plan
-            .as_ref()
-            .map(|(_, _, plan)| plan.notes.clone())
-            .unwrap_or_default();
-        if probe.chapters > 0 {
-            notes.push(format!(
-                "{} chapter{} not kept by an edited Save or Export (the edit moves them)",
-                probe.chapters,
-                if probe.chapters == 1 { "" } else { "s" }
-            ));
         }
         Ok(Self {
             tools,
@@ -125,11 +161,42 @@ impl Media {
                 0
             },
             sample_rate: probe.sample_rate,
-            notes,
-            plan,
+            notes: Vec::new(),
+            plan: None,
             probe,
             name: name.to_string(),
         })
+    }
+
+    /// Works out how Save and Export render the file, and what they do not keep. For a picture
+    /// above 8 bits this asks ffmpeg what its H.264 encoder takes (once per ffmpeg) — a run
+    /// nothing stops: never called on a frame of a window ([`MediaWindow::start_planning`]).
+    fn plan(&mut self) {
+        let plan = cut::plan(&self.tools, &self.probe, &self.name).ok();
+        self.planned(plan);
+    }
+
+    /// [`Media::plan`] from an answer already there, running nothing: `x264` is what ffmpeg's
+    /// H.264 encoder takes (`None`: not asked — the file needs no answer — or none came).
+    fn plan_with(&mut self, x264: Option<&std::collections::HashSet<String>>) {
+        let plan = cut::plan_with(&self.probe, &self.name, x264).ok();
+        self.planned(plan);
+    }
+
+    fn planned(&mut self, plan: Option<(MediaKind, String, ExportPlan)>) {
+        self.plan = plan;
+        self.notes = self
+            .plan
+            .as_ref()
+            .map(|(_, _, plan)| plan.notes.clone())
+            .unwrap_or_default();
+        if self.probe.chapters > 0 {
+            self.notes.push(format!(
+                "{} chapter{} not kept by an edited Save or Export (the edit moves them)",
+                self.probe.chapters,
+                if self.probe.chapters == 1 { "" } else { "s" }
+            ));
+        }
     }
 
     fn source_size(&self) -> Option<Vec2> {
@@ -174,6 +241,34 @@ impl Media {
     /// A mono audio file: Mono → Stereo is offered (video gets cut and paste only, message 13).
     pub fn mono_audio(&self) -> bool {
         self.video.is_none() && self.channels == 1
+    }
+
+    /// The picture's shape on screen: its size in its own pixels, made as much wider (or
+    /// narrower) as those pixels are ([`Probe::pixel_aspect`]; of a picture turned on its side,
+    /// taller). Only where it is drawn: a crop is in the picture's own pixels.
+    fn shape(&self) -> Option<Vec2> {
+        let size = self.source_size()?;
+        let Some((n, d)) = self.probe.pixel_aspect else {
+            return Some(size);
+        };
+        let wider = n as f32 / d as f32;
+        Some(if self.rotation % 180 == 90 {
+            Vec2::new(size.x, size.y * wider)
+        } else {
+            Vec2::new(size.x * wider, size.y)
+        })
+    }
+
+    /// The names of the waveform's lanes: `L` and `R` of a stereo sound; of a sound in more
+    /// channels, its first two by their own names (ffmpeg's: every layout it knows by name
+    /// begins front left, front right, but the `downmix` pair).
+    fn lane_names(&self) -> [&'static str; 2] {
+        match (self.channels, self.probe.channel_layout.as_deref()) {
+            (0..=2, _) => ["L", "R"],
+            (_, Some("downmix")) => ["DL", "DR"],
+            (_, Some(layout)) if !layout.is_empty() && !layout.contains("channels") => ["FL", "FR"],
+            _ => ["1", "2"],
+        }
     }
 
     /// Waveform lanes: one for mono, two for anything with more channels.
@@ -264,6 +359,54 @@ const SCRUB_BUDGET: Duration = Duration::from_secs(5);
 /// there (a picture further on is another slot's).
 const LOOK_PAST_S: f64 = 3.0;
 
+/// The ffmpeg run that reads pictures of `input` from `span` seconds of it starting at `from`,
+/// as raw RGBA of `size` on its stdout: the first one (`before` `None`), or every one earlier
+/// than `before` seconds after `from` (the last of them is the latest picture there). Not
+/// started. The paused frame's decode, and a preview's one frame ([`preview`]).
+fn frame_command(
+    tools: &Tools,
+    input: &Input,
+    (from, span): (f64, f64),
+    (w, h): (u32, u32),
+    before: Option<f64>,
+) -> std::process::Command {
+    let mut cmd = std::process::Command::new(&tools.ffmpeg);
+    cmd.args(["-nostdin", "-hide_banner", "-loglevel", "error", "-ss"])
+        .arg(format!("{from:.6}"))
+        .arg("-t")
+        .arg(format!("{span:.6}"))
+        .arg("-i")
+        .arg(input.arg())
+        .args(["-an", "-sn", "-vf"]);
+    match before {
+        None => {
+            cmd.arg(format!("scale={w}:{h},format=rgba"))
+                .args(["-frames:v", "1"]);
+        }
+        // Only pictures from inside the slot's two seconds (times from `from`), each once, on
+        // the file's own clock (no two collide on a coarser one).
+        Some(before) => {
+            cmd.arg(format!(
+                "select='lt(t\\,{before:.6})',scale={w}:{h},format=rgba"
+            ))
+            .args(["-fps_mode", "passthrough", "-enc_time_base:v", "demux"]);
+        }
+    }
+    cmd.args(["-f", "rawvideo", "-"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped());
+    cmd
+}
+
+/// Where the decode of source frame `key` starts and where its slot ends, in source seconds:
+/// half a frame early, as Save renders a cut.
+fn frame_slot(origin: f64, fps: f64, key: Tick) -> (f64, f64) {
+    (
+        (origin + key as f64 / fps - 0.5 / fps).max(0.0),
+        origin + (key as f64 + 0.5) / fps,
+    )
+}
+
 /// Why a paused frame's decode gave no picture.
 enum Miss {
     /// Nothing there (or ffmpeg could not run): what to say.
@@ -297,17 +440,30 @@ struct Scrubbed {
 }
 
 impl Scrubber {
+    #[cfg(test)]
     fn start(media: &Media, ctx: egui::Context) -> Option<Self> {
         Self::start_with(media, ctx, SCRUB_BUDGET)
     }
 
     /// [`Scrubber::start`] with `budget` for each frame (tests shorten it).
+    #[cfg(test)]
     fn start_with(media: &Media, ctx: egui::Context, budget: Duration) -> Option<Self> {
+        Self::start_seeded(media, ctx, budget, None)
+    }
+
+    /// [`Scrubber::start_with`], a frame already kept (`seed`: its source frame and picture — a
+    /// preview decoded it, 02 §4.4): asked for, it shows at once, with no decode.
+    fn start_seeded(
+        media: &Media,
+        ctx: egui::Context,
+        budget: Duration,
+        seed: Option<(Tick, Arc<Vec<u8>>)>,
+    ) -> Option<Self> {
         let (w, h) = media.decode_size()?;
         let req: Request = Arc::default();
         let result: Arc<Mutex<Option<Result<Scrubbed, String>>>> = Arc::default();
         let quit = Arc::new(AtomicBool::new(false));
-        let cache: Kept = Arc::default();
+        let cache: Kept = Arc::new(Mutex::new(seed.into_iter().collect()));
         let (rq, res, q, store) = (req.clone(), result.clone(), quit.clone(), cache.clone());
         let (tools, path, fps) = (media.tools.clone(), media.input.clone(), media.fps.max(1.0));
         let origin = media.origin();
@@ -332,8 +488,7 @@ impl Scrubber {
             // end of its slot is the one — as the frame grid puts there. Anywhere else, nothing
             // is no frame. Each decode reads a bounded stretch of the input, and all of them
             // together have `budget`.
-            let at = (origin + key as f64 / fps - 0.5 / fps).max(0.0);
-            let slot_end = origin + (key as f64 + 0.5) / fps;
+            let (at, slot_end) = frame_slot(origin, fps, key);
             let deadline = Instant::now() + budget;
             let no_frame =
                 || Miss::Nothing(format!("no frame at {}", clock_text(key as f64 / fps)));
@@ -343,35 +498,9 @@ impl Scrubber {
                 if Instant::now() >= deadline {
                     return Err(Miss::Spent);
                 }
-                let mut cmd = std::process::Command::new(&tools.ffmpeg);
-                cmd.args(["-nostdin", "-hide_banner", "-loglevel", "error", "-ss"])
-                    .arg(format!("{from:.6}"))
-                    .arg("-t")
-                    .arg(format!("{span:.6}"))
-                    .arg("-i")
-                    .arg(path.arg())
-                    .args(["-an", "-sn", "-vf"]);
-                if one {
-                    cmd.arg(format!("scale={w}:{h},format=rgba"))
-                        .args(["-frames:v", "1"]);
-                } else {
-                    // Only pictures from inside the slot's two seconds (times from `from`), each
-                    // once, on the file's own clock (no two collide on a coarser one).
-                    cmd.arg(format!(
-                        "select='lt(t\\,{:.6})',scale={w}:{h},format=rgba",
-                        slot_end - from
-                    ))
-                    .args([
-                        "-fps_mode",
-                        "passthrough",
-                        "-enc_time_base:v",
-                        "demux",
-                    ]);
-                }
-                cmd.args(["-f", "rawvideo", "-"])
-                    .stdin(Stdio::null())
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::null());
+                let before = (!one).then_some(slot_end - from);
+                let mut cmd = frame_command(&tools, &path, (from, span), (w, h), before);
+                cmd.stderr(Stdio::null());
                 let mut child = ffmpeg::spawn(&mut cmd).map_err(|e| {
                     Miss::Nothing(format!("cannot run {}: {e}", tools.ffmpeg.display()))
                 })?;
@@ -492,6 +621,53 @@ impl Drop for Scrubber {
     fn drop(&mut self) {
         self.quit.store(true, SeqCst);
         self.req.1.notify_one();
+    }
+}
+
+/// The waveform's lanes (`columns`: per lane, each column's min and max) drawn over `rect`, one
+/// under the other; two lanes are named `L` and `R`.
+fn paint_wave(
+    painter: &egui::Painter,
+    rect: Rect,
+    columns: &[Vec<[f32; 2]>],
+    names: [&str; 2],
+    font: &egui::FontId,
+) {
+    let p = super::chrome::PALETTE;
+    let lanes = columns.len().max(1);
+    let lane_h = rect.height() / lanes as f32;
+    for (lane, column) in columns.iter().enumerate() {
+        let top = rect.top() + lane as f32 * lane_h;
+        let mid = top + lane_h / 2.0;
+        let amp = lane_h * 0.45;
+        let n = column.len() as f32;
+        for (k, [lo, hi]) in column.iter().enumerate() {
+            let x = rect.left() + (k as f32 + 0.5) / n * rect.width();
+            painter.line_segment(
+                [Pos2::new(x, mid - hi * amp), Pos2::new(x, mid - lo * amp)],
+                Stroke::new(1.0, p.wave),
+            );
+        }
+        if lanes == 2 {
+            painter.text(
+                Pos2::new(rect.left() + 3.0, top + 2.0),
+                egui::Align2::LEFT_TOP,
+                names[lane.min(1)],
+                font.clone(),
+                p.dim,
+            );
+        }
+    }
+}
+
+/// `10 minutes`, `1 minute`, `2 s`: how much of a sound a preview's waveform covers.
+fn span_text(secs: f64) -> String {
+    let whole = secs.round() as u64;
+    match (whole / 60, whole % 60) {
+        (1, 0) => "1 minute".to_string(),
+        (minutes, 0) if minutes > 1 => format!("{minutes} minutes"),
+        _ if secs.fract() == 0.0 => format!("{whole} s"),
+        _ => format!("{secs:.1} s"),
     }
 }
 
@@ -666,7 +842,12 @@ pub fn open(
 ) -> Result<Outcome> {
     let (_, name) = origin.parent();
     sweep(cache);
-    let media = Media::probe_as(&Input::path(local), &name)?;
+    // A window works out how Save and Export render the file itself, off its frames (02 §6:
+    // for a video above 8 bits that asks ffmpeg); the windowless runs need it now.
+    let mut media = Media::unplanned(&ffmpeg::resolve()?, &Input::path(local), &name)?;
+    if hooks.autosave || hooks.autoexport {
+        media.plan();
+    }
     let state = &hooks.state;
     if !state.ops.is_empty() {
         bail!("SOPEN_STATE op applies to images; media takes rect, t, in, out, clips and stereo");
@@ -725,6 +906,7 @@ pub fn open(
     };
     let mut window = MediaWindow::new(media, file, work_root, marks, sel, notices);
     window.timeline = timeline;
+    window.unplanned = true;
     window.export_hold = hooks.export_hold;
     window.ask_close = state.ask_close;
     let outcome = window.outcome.clone();
@@ -736,6 +918,11 @@ pub fn open(
     }
     run?;
     let outcome = outcome.lock().unwrap().clone();
+    // The window found it cannot show the file: the open failed, as a file ffprobe cannot read
+    // fails it.
+    if let Some(why) = &outcome.failed {
+        bail!("{why}");
+    }
     Ok(outcome)
 }
 
@@ -807,6 +994,27 @@ pub fn embed(origin: Origin, media: Media, cache: &Path, notices: Vec<String>) -
         Selection::default(),
         notices,
     );
+    let (outcome, leftover) = (window.outcome.clone(), window.leftover.clone());
+    super::Embedded {
+        window: Box::new(window),
+        settle: Box::new(move |wait| {
+            let mut slot = leftover.lock().unwrap();
+            if let Some(job) = slot.as_ref() {
+                if !job.settle(wait, &mut outcome.lock().unwrap()) {
+                    return None;
+                }
+                *slot = None;
+            }
+            Some(outcome.lock().unwrap().clone())
+        }),
+    }
+}
+
+/// The media window as a preview in the file browser (02 §4.2): told it is one before its first
+/// pass, showing what the preview's preparation made ([`preview::prepare`]). Its hand-over is
+/// [`super::Window::set_preview`] `false`.
+pub fn embed_preview(origin: Origin, made: preview::Prepared, cache: &Path) -> super::Embedded {
+    let window = MediaWindow::previewing(origin, made, cache);
     let (outcome, leftover) = (window.outcome.clone(), window.leftover.clone());
     super::Embedded {
         window: Box::new(window),
@@ -974,7 +1182,7 @@ struct MediaWindow {
     tex_at: Option<(f64, Option<Tick>)>,
     want: Option<(f64, Tick)>,
     scrub: Option<Scrubber>,
-    wave: Option<wave::Shared>,
+    wave: Option<wave::Decode>,
     /// The waveform's columns for (timeline revision, columns, lanes).
     columns: Columns,
     player: Option<Player>,
@@ -1020,6 +1228,34 @@ struct MediaWindow {
     /// while the button is down.
     notices: Vec<String>,
     pending_notices: Option<Vec<String>>,
+    /// A preview in the file browser (02 §4.2): the frame or the waveform its preparation made
+    /// ([`preview`]) in a single-lined frame, with its size and duration, no bars, no input —
+    /// and nothing running: no decoder, no playback, no hash of the file. The hand-over
+    /// ([`super::Window::set_preview`] `false`) starts the window from what the preview has.
+    preview: bool,
+    /// The preview's frame, the source's frame 0: the paused-frame decoder starts with it kept.
+    first: Option<Arc<Vec<u8>>>,
+    /// The preview's peaks, and how many seconds of the sound they cover (`None`: all of it):
+    /// the waveform's decode goes on from there.
+    peaks: Option<(wave::Source, Option<f64>)>,
+    /// sopen's cache: swept of dead jobs when the window starts (a preview's at its hand-over).
+    cache_root: Option<PathBuf>,
+    /// How Save and Export render the file is not worked out yet (`media.plan`): the window
+    /// does it when it starts ([`MediaWindow::start_planning`]).
+    unplanned: bool,
+    /// What ffmpeg's H.264 encoder takes, being asked on a thread of its own (a video above 8
+    /// bits): until it answers, Save and Export are not available and the status says so.
+    planning: Option<Planning>,
+    /// The time the encoder question is held to (tests move it).
+    clock: preview::Clock,
+    /// The receipt hook's Export ([`MediaWindow::export_hold`]) was started.
+    hold_started: bool,
+    /// The file cannot be shown after all (no frame of it decodes): why. The window has asked
+    /// to be closed ([`super::Window::failure`]).
+    failed: Option<String>,
+    /// Tests: how often playback was started (the audio output is opened there).
+    #[cfg(test)]
+    plays: usize,
 }
 
 impl MediaWindow {
@@ -1033,9 +1269,21 @@ impl MediaWindow {
         sel: Selection,
         notices: Vec<String>,
     ) -> Self {
-        let timeline = Timeline::new(media.rate(), media.ticks());
         let mut file = file;
         file.hash_in_background();
+        Self::unstarted(media, file, work_root, marks, sel, notices)
+    }
+
+    /// [`MediaWindow::new`] before anything of it runs: the file as opened is not hashed yet.
+    fn unstarted(
+        media: Media,
+        file: MediaFile,
+        work_root: PathBuf,
+        marks: Marks,
+        sel: Selection,
+        notices: Vec<String>,
+    ) -> Self {
+        let timeline = Timeline::new(media.rate(), media.ticks());
         let can_replace = file.origin.can_replace();
         Self {
             title: file.origin.display(),
@@ -1079,7 +1327,43 @@ impl MediaWindow {
             opened: notices,
             notices: Vec::new(),
             pending_notices: None,
+            preview: false,
+            first: None,
+            peaks: None,
+            cache_root: None,
+            unplanned: false,
+            planning: None,
+            clock: Arc::new(Instant::now),
+            hold_started: false,
+            failed: None,
+            #[cfg(test)]
+            plays: 0,
         }
+    }
+
+    /// The window as a preview ([`embed_preview`]): what `made` holds is all it shows.
+    fn previewing(origin: Origin, made: preview::Prepared, cache: &Path) -> Self {
+        let preview::Prepared {
+            media,
+            frame,
+            wave,
+            cut,
+            planned,
+        } = made;
+        let mut window = Self::unstarted(
+            media,
+            MediaFile::new(origin, cache),
+            crate::cache::exports_root(cache),
+            Marks::default(),
+            Selection::default(),
+            Vec::new(),
+        );
+        window.preview = true;
+        window.unplanned = !planned;
+        window.first = frame;
+        window.peaks = wave.map(|peaks| (peaks, cut));
+        window.cache_root = Some(cache.to_path_buf());
+        window
     }
 
     fn audio_only(&self) -> bool {
@@ -1105,6 +1389,13 @@ impl MediaWindow {
     fn frame_ready(&self) -> bool {
         self.want
             .is_some_and(|(t, key)| self.tex_at == Some((t, Some(key))))
+    }
+
+    /// As it was opened, and idle: nothing edited — no edit to undo or redo either — and no
+    /// Save or Export running. Only such a window may close by itself.
+    fn as_opened(&self) -> bool {
+        let tl = &self.timeline;
+        tl.is_identity() && !tl.can_undo() && !tl.can_redo() && !self.busy() && !self.sel.is_set()
     }
 
     /// Unsaved edits: the output is not the file as it is.
@@ -1170,6 +1461,10 @@ impl MediaWindow {
     }
 
     fn play(&mut self, ctx: &egui::Context) {
+        #[cfg(test)]
+        {
+            self.plays += 1;
+        }
         let tl = &self.timeline;
         let length = self.length();
         let from = if self.marks.t >= length - 0.05 {
@@ -1414,7 +1709,88 @@ impl MediaWindow {
         }
     }
 
+    /// Works out how Save and Export render the file, when the window starts without that
+    /// (opened by itself, or a preview whose encoder check ran out of time): at once where
+    /// nothing has to run; for a video above 8 bits ffmpeg is asked on a thread of its own —
+    /// nothing slow runs on a frame (02 §6) — by a run that is stopped when the window goes
+    /// and held to [`ENCODER_TIME`]: without an answer by then, Save and Export are planned for
+    /// 8-bit output and say so ([`ENCODER_TIMED_OUT`]).
+    fn start_planning(&mut self, ctx: &egui::Context) {
+        if !std::mem::take(&mut self.unplanned) {
+            return;
+        }
+        if !cut::plan_asks_encoder(&self.media.probe, &self.media.name) {
+            Arc::make_mut(&mut self.media).plan_with(None);
+            return;
+        }
+        let (tx, rx) = mpsc::channel();
+        let (children, cancel) = (Arc::new(preview::Children::default()), Arc::default());
+        let (tools, input, waker) = (
+            self.media.tools.clone(),
+            self.media.input.clone(),
+            ctx.clone(),
+        );
+        let timed = preview::Timed::new(Arc::clone(&cancel), self.clock.clone(), ENCODER_TIME);
+        let slot = children.clone();
+        std::thread::spawn(move || {
+            let answer = match preview::ask_encoder(&tools, &input, &slot, &timed) {
+                Ok(takes) => Answer::Takes(takes),
+                Err(e) if e.is::<preview::OverTime>() => Answer::TimedOut,
+                Err(_) => Answer::Nothing,
+            };
+            let _ = tx.send(answer);
+            waker.request_repaint();
+        });
+        self.planning = Some(Planning {
+            rx,
+            children,
+            cancel,
+        });
+    }
+
+    /// The encoder's answer, once it is there: Save and Export are available from then on.
+    fn poll_planning(&mut self) {
+        let Some(planning) = &self.planning else {
+            return;
+        };
+        let answer = match planning.rx.try_recv() {
+            Ok(answer) => answer,
+            Err(mpsc::TryRecvError::Empty) => {
+                if self.status.text.is_empty() {
+                    self.status = Status::info(CHECKING_ENCODER);
+                }
+                return;
+            }
+            Err(mpsc::TryRecvError::Disconnected) => Answer::Nothing,
+        };
+        self.planning = None;
+        let media = Arc::make_mut(&mut self.media);
+        match answer {
+            Answer::Takes(takes) => media.plan_with(Some(&takes)),
+            Answer::Nothing => media.plan_with(None),
+            // No answer in its time: planned for what every H.264 encoder takes, and said.
+            // Said as what it is: nothing is claimed about what this ffmpeg's encoder can do
+            // (the plan's own line for an encoder without 10-bit is taken out).
+            Answer::TimedOut => {
+                media.plan_with(Some(&std::collections::HashSet::new()));
+                let claim = |note: &String| note.contains("libx264");
+                media.notes.retain(|note| !claim(note));
+                media.notes.push(ENCODER_TIMED_OUT.to_string());
+                if let Some((_, _, plan)) = &mut media.plan {
+                    plan.notes.retain(|note| !claim(note));
+                    plan.notes.push(ENCODER_TIMED_OUT.to_string());
+                }
+            }
+        }
+        if self.status.text == CHECKING_ENCODER {
+            self.status = Status::default();
+        }
+    }
+
     fn start_export(&mut self, ctx: &egui::Context) {
+        if self.planning.is_some() {
+            return self.status = Status::info(CHECKING_ENCODER);
+        }
         if self.busy() {
             return;
         }
@@ -1455,6 +1831,9 @@ impl MediaWindow {
     }
 
     fn start_save(&mut self, ctx: &egui::Context, close_after: bool) {
+        if self.planning.is_some() {
+            return self.status = Status::info(CHECKING_ENCODER);
+        }
         if self.busy() {
             return;
         }
@@ -1740,7 +2119,7 @@ impl MediaWindow {
 
     /// The waveform's columns for the timeline as it is now (from the peaks so far; no decode).
     fn wave_columns(&mut self, width: usize, lanes: usize) -> Option<Vec<Vec<[f32; 2]>>> {
-        let shared = self.wave.as_ref()?.clone();
+        let shared = self.wave.as_ref()?.peaks.clone();
         let guard = shared.lock().unwrap();
         let peaks = guard.as_ref()?;
         let key = (self.timeline.rev(), peaks.version, width, lanes);
@@ -1784,29 +2163,7 @@ impl MediaWindow {
             };
             let width = rect.width().max(1.0) as usize;
             if let Some(cols) = self.wave_columns(width, lanes) {
-                let lane_h = rect.height() / lanes as f32;
-                for (lane, column) in cols.iter().enumerate() {
-                    let top = rect.top() + lane as f32 * lane_h;
-                    let mid = top + lane_h / 2.0;
-                    let amp = lane_h * 0.45;
-                    let n = column.len() as f32;
-                    for (k, [lo, hi]) in column.iter().enumerate() {
-                        let x = rect.left() + (k as f32 + 0.5) / n * rect.width();
-                        painter.line_segment(
-                            [Pos2::new(x, mid - hi * amp), Pos2::new(x, mid - lo * amp)],
-                            Stroke::new(1.0, p.wave),
-                        );
-                    }
-                    if lanes == 2 {
-                        painter.text(
-                            Pos2::new(rect.left() + 3.0, top + 2.0),
-                            egui::Align2::LEFT_TOP,
-                            if lane == 0 { "L" } else { "R" },
-                            font.clone(),
-                            p.dim,
-                        );
-                    }
-                }
+                paint_wave(&painter, rect, &cols, self.media.lane_names(), &font);
             } else {
                 painter.text(
                     rect.center(),
@@ -1817,10 +2174,13 @@ impl MediaWindow {
                 );
             }
             // A decode that failed is said where the waveform is, not drawn as silence.
-            let failed = self
-                .wave
-                .as_ref()
-                .and_then(|w| w.lock().unwrap().as_ref().and_then(|p| p.error.clone()));
+            let failed = self.wave.as_ref().and_then(|w| {
+                w.peaks
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .and_then(|p| p.error.clone())
+            });
             if let Some(why) = failed {
                 painter.text(
                     rect.center(),
@@ -2012,13 +2372,16 @@ impl MediaWindow {
                 }
             }
             ui.separator();
-            let busy = self.busy();
+            let planning = self.planning.is_some();
+            let busy = self.busy() || planning;
             let save_ok = editable
                 && !busy
                 && self.unsaved()
                 && self.can_replace
                 && self.media.save_block().is_none();
-            let why = if !self.can_replace {
+            let why = if planning {
+                CHECKING_ENCODER.to_string()
+            } else if !self.can_replace {
                 CANNOT_REPLACE.to_string()
             } else if let Some(why) = self.media.save_block() {
                 why
@@ -2045,6 +2408,11 @@ impl MediaWindow {
                     "re-encode In–Out of the timeline (and the crop) into a new file next to \
                      the original",
                 )
+                .on_disabled_hover_text(if planning {
+                    CHECKING_ENCODER
+                } else {
+                    "a save or export is running"
+                })
                 .clicked()
             {
                 self.start_export(&ctx);
@@ -2079,37 +2447,8 @@ impl MediaWindow {
 
     /// One line whatever it says (see [`super::one_line`]): the frame below must not move.
     fn info(&self, ui: &mut egui::Ui) {
-        let m = &self.media;
         ui.horizontal(|ui| {
-            match m.video {
-                Some((w, h)) => ui.monospace(format!(
-                    "{w}×{h}{} · {:.2} fps · {}{}",
-                    if m.rotation == 0 {
-                        String::new()
-                    } else {
-                        format!(" (rotated {}°)", m.rotation)
-                    },
-                    m.fps,
-                    clock_text(m.duration),
-                    if m.has_audio {
-                        " · audio"
-                    } else {
-                        " · no audio"
-                    }
-                )),
-                None => ui.monospace(format!(
-                    "audio · {}{} · {}",
-                    match m.channels {
-                        1 => "mono".to_string(),
-                        2 => "stereo".to_string(),
-                        n => format!("{n} channels"),
-                    },
-                    m.sample_rate
-                        .map(|r| format!(" · {r} Hz"))
-                        .unwrap_or_default(),
-                    clock_text(m.duration)
-                )),
-            };
+            ui.monospace(self.about());
             if let Some([x, y, w, h]) = self.crop() {
                 ui.separator();
                 let even = if w % 2 + h % 2 > 0 {
@@ -2160,7 +2499,7 @@ impl MediaWindow {
             );
             return;
         };
-        let disp = super::fit(panel.shrink(4.0), src);
+        let disp = super::fit(panel.shrink(4.0), self.media.shape().unwrap_or(src));
         let map = Map { disp, src };
         let resp = ui.allocate_rect(disp, Sense::click_and_drag());
         painter.image(
@@ -2221,18 +2560,137 @@ impl MediaWindow {
 
     /// The decoders the window keeps for its file: the paused-frame scrubber (video) and the
     /// waveform (audio).
+    /// A window that was a preview starts from what the preview made (02 §4.4): its frame is
+    /// kept, not decoded again; its peaks stay, and the waveform's decode goes on from where
+    /// they end.
     fn start_decoders(&mut self, ctx: &egui::Context) {
-        self.scrub = Scrubber::start(&self.media, ctx.clone());
+        let kept = self.first.take().map(|rgba| (0, rgba));
+        self.scrub = Scrubber::start_seeded(&self.media, ctx.clone(), SCRUB_BUDGET, kept);
         if self.audio_only() {
             let waker = ctx.clone();
-            self.wave = Some(wave::start(
-                &self.media.tools,
-                &self.media.input,
-                self.media.lanes().max(1),
-                self.media.duration,
-                move || waker.request_repaint(),
-            ));
+            let wake = move || waker.request_repaint();
+            let m = &self.media;
+            let lanes = m.lanes().max(1);
+            self.wave = Some(match self.peaks.take() {
+                Some((peaks, None)) => wave::Decode::done(peaks),
+                Some((peaks, Some(upto))) => {
+                    wave::resume(&m.tools, &m.input, lanes, m.duration, (peaks, upto), wake)
+                }
+                None => wave::start(&m.tools, &m.input, lanes, m.duration, wake),
+            });
         }
+    }
+
+    /// What the file is, in one line: the picture's size, rate and length, or the sound's
+    /// channels, rate and length.
+    fn about(&self) -> String {
+        let m = &self.media;
+        match m.video {
+            Some((w, h)) => format!(
+                "{w}×{h}{} · {:.2} fps · {}{}",
+                if m.rotation == 0 {
+                    String::new()
+                } else {
+                    format!(" (rotated {}°)", m.rotation)
+                },
+                m.fps,
+                clock_text(m.duration),
+                if m.has_audio {
+                    " · audio"
+                } else {
+                    " · no audio"
+                }
+            ),
+            None => format!(
+                "audio · {}{} · {}",
+                match m.channels {
+                    1 => "mono".to_string(),
+                    2 => "stereo".to_string(),
+                    n => format!("{n} channels · first 2 shown"),
+                },
+                m.sample_rate
+                    .map(|r| format!(" · {r} Hz"))
+                    .unwrap_or_default(),
+                clock_text(m.duration)
+            ),
+        }
+    }
+
+    /// The window as a preview (02 §4.2): in a single-lined frame — the side does not have the
+    /// keyboard — the frame its preparation decoded, fitted, or the waveform it read, and under
+    /// it what the file is ([`MediaWindow::about`]; a waveform that covers only the sound's
+    /// start says so). Nothing in it takes input, and it runs nothing.
+    fn preview_ui(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
+        if self.tex.is_none() {
+            if let Some(rgba) = self.first.clone() {
+                self.show_frame(&ctx, &rgba, 0.0, Some(0));
+            }
+        }
+        let p = super::chrome::PALETTE;
+        let mut line = self.about();
+        if let Some((_, Some(upto))) = &self.peaks {
+            line.push_str(&format!(" · preview of the first {}", span_text(*upto)));
+        }
+        egui::CentralPanel::default()
+            .frame(egui::Frame::NONE)
+            .show(ui, |ui| {
+                let outer = ui.max_rect();
+                let title = if self.audio_only() {
+                    AUDIO_TITLE
+                } else {
+                    VIDEO_TITLE
+                };
+                let inner = super::chrome::frame(&ui.painter_at(outer), outer, title, false);
+                let painter = ui.painter_at(inner);
+                let font = super::chrome::font();
+                let width = inner.width().max(super::chrome::CELL.x);
+                let said = painter.layout(line, font.clone(), p.text, width);
+                let said_h = said.size().y.min(inner.height());
+                let room = Rect::from_min_max(
+                    inner.min,
+                    Pos2::new(inner.right(), inner.bottom() - said_h),
+                );
+                painter.galley(Pos2::new(inner.left(), room.bottom()), said, p.text);
+                if self.audio_only() {
+                    let lanes = self.media.lanes().max(1);
+                    let room = room.shrink(4.0);
+                    painter.rect_filled(room, 0.0, p.timeline);
+                    let columns = room.width().max(1.0) as usize;
+                    if let Some(cols) = self.preview_columns(columns, lanes) {
+                        paint_wave(&painter, room, &cols, self.media.lane_names(), &font);
+                    }
+                } else {
+                    painter.rect_filled(room, 0.0, p.picture_back);
+                    if let (Some(tex), Some(src)) = (&self.tex, self.media.source_size()) {
+                        painter.image(
+                            tex.id(),
+                            super::fit(room.shrink(4.0), self.media.shape().unwrap_or(src)),
+                            Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+                            Color32::WHITE,
+                        );
+                    }
+                }
+            });
+        self.painted = true;
+    }
+
+    /// A previewed sound's columns: the peaks its preparation read, over the whole width —
+    /// when they cover only the sound's start, that start.
+    fn preview_columns(&mut self, width: usize, lanes: usize) -> Option<Vec<Vec<[f32; 2]>>> {
+        let (peaks, upto) = self.peaks.as_ref()?;
+        let key = (0, peaks.version, width, lanes);
+        if let Some((k, cols)) = &self.columns {
+            if *k == key {
+                return Some(cols.clone());
+            }
+        }
+        let rate = self.media.rate();
+        let secs = upto.unwrap_or(self.media.duration);
+        let shown = Timeline::new(rate, ((secs * rate).round() as Tick).max(1));
+        let cols = wave::columns(peaks, &shown, width, lanes);
+        self.columns = Some((key, cols.clone()));
+        Some(cols)
     }
 }
 
@@ -2251,14 +2709,22 @@ impl Drop for MediaWindow {
 
 impl super::Window for MediaWindow {
     fn ui(&mut self, ui: &mut egui::Ui) {
+        if self.preview {
+            // Only what its preparation made: no decoder, no playback, no bars, no input.
+            self.preview_ui(ui);
+            return;
+        }
         let ctx = ui.ctx().clone();
         if !self.started {
             self.started = true;
+            self.start_planning(&ctx);
             self.start_decoders(&ctx);
             self.seek(&ctx, self.marks.t);
-            if self.export_hold.is_some() {
-                self.start_export(&ctx);
-            }
+        }
+        self.poll_planning();
+        if self.export_hold.is_some() && self.planning.is_none() && !self.hold_started {
+            self.hold_started = true;
+            self.start_export(&ctx);
         }
         if std::mem::take(&mut self.ask_close) {
             // `SOPEN_STATE` `close=ask`: as if closing were asked for (the prompt's receipt).
@@ -2278,6 +2744,20 @@ impl super::Window for MediaWindow {
                 Some(Ok(frame)) => {
                     let rgba = frame.rgba.clone();
                     self.show_frame(&ctx, &rgba, frame.t, Some(frame.key));
+                }
+                // No frame, and none was ever on screen: the file cannot be shown after all.
+                // The window does not sit there for ever: the open has failed — it says why
+                // and asks to be closed (its opener says it: back in the list, or the error
+                // `sopen` ends with).
+                // Only a window still as it was opened: once its owner has edited (or the edit
+                // was undone: the history is theirs), or a Save or an Export runs, it stays —
+                // the failure is said below and closing is handled as ever.
+                Some(Err(e)) if self.tex.is_none() && self.failed.is_none() && self.as_opened() => {
+                    let why = format!("cannot show {}: {e}", self.title);
+                    self.outcome.lock().unwrap().failed = Some(why.clone());
+                    self.failed = Some(why);
+                    self.status = Status::error(e);
+                    super::request_close(&ctx);
                 }
                 Some(Err(e)) => self.status = Status::error(e),
                 None => {}
@@ -2346,7 +2826,8 @@ impl super::Window for MediaWindow {
                         seek = self.timeline(ui, h, true).or(seek);
                     });
                     self.painted = self.wave.as_ref().is_some_and(|w| {
-                        w.lock()
+                        w.peaks
+                            .lock()
                             .unwrap()
                             .as_ref()
                             .is_some_and(|p| p.complete || p.error.is_some())
@@ -2361,7 +2842,17 @@ impl super::Window for MediaWindow {
         self.close_prompt(&ctx);
     }
 
+    fn failure(&self) -> Option<String> {
+        self.failed.clone()
+    }
+
     fn ready(&self) -> bool {
+        if self.preview {
+            return self.painted;
+        }
+        if self.failed.is_some() {
+            return true;
+        }
         let frame_ok = self.audio_only() || self.frame_ready();
         // With the export hook, the shot is taken while the export is held mid-way.
         let export_ok = self.export_hold.is_none()
@@ -2369,16 +2860,51 @@ impl super::Window for MediaWindow {
                 .job
                 .as_ref()
                 .is_some_and(|j| j.progress.load(SeqCst) >= 300);
-        self.painted && frame_ok && self.player.is_none() && export_ok && self.save.is_none()
+        let planned = self.planning.is_none() && !self.unplanned;
+        self.painted
+            && frame_ok
+            && self.player.is_none()
+            && export_ok
+            && self.save.is_none()
+            && planned
     }
 
     fn keys(&self) -> &'static [super::chrome::FKey] {
         super::chrome::MEDIA_KEYS
     }
 
+    /// A preview (02 §4.2) shows what its preparation made, without bars, takes no input and
+    /// never plays; `false` is the hand-over (02 §4.4): the media window from here on — its
+    /// decoders start from the preview's frame and peaks, and the file as opened is hashed for
+    /// Save (left undone while it was only looked at). How Save and Export render it came with
+    /// the preview.
+    fn set_preview(&mut self, on: bool) {
+        if on {
+            self.player = None;
+        } else if self.preview {
+            self.columns = None;
+            self.painted = false;
+            if let Some(cache) = self.cache_root.take() {
+                sweep(&cache);
+            }
+            self.file.lock().unwrap().hash_in_background();
+        }
+        self.preview = on;
+    }
+
     fn close_requested(&mut self) -> bool {
-        if self.close_ok {
+        // A preview holds nothing unsaved and writes nothing: dropping it asks nothing.
+        if self.close_ok || self.preview {
             return true;
+        }
+        // Nor does one that failed to show its file, still as it was opened: it goes. (One
+        // edited or writing since then is asked as any other, and its open did not fail.)
+        if self.failed.is_some() {
+            if self.as_opened() {
+                return true;
+            }
+            self.failed = None;
+            self.outcome.lock().unwrap().failed = None;
         }
         if self.save.is_some() {
             // Never close mid-write: the window closes once the save has reported. Said in the
@@ -2422,6 +2948,10 @@ impl super::Window for MediaWindow {
 
 mod file;
 
+mod child;
+#[cfg(test)]
+pub(crate) mod fixtures;
+pub mod preview;
 pub mod timeline;
 pub mod wave;
 
@@ -2430,6 +2960,9 @@ mod edit_tests;
 
 #[cfg(test)]
 mod input_tests;
+
+#[cfg(test)]
+mod preview_tests;
 
 #[cfg(test)]
 mod tests {

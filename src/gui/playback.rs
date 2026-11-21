@@ -412,7 +412,38 @@ pub enum Sink {
     Device,
     /// No device: a thread asks for 512-frame buffers at real-time pace (48 kHz stereo).
     Null,
+    /// Tests: [`Sink::Null`], counting every output opened and every buffer written to it.
+    #[cfg(test)]
+    Recording(&'static Recorder),
 }
+
+/// Tests: what reached an audio output ([`Sink::Recording`]).
+#[cfg(test)]
+#[derive(Debug, Default)]
+pub struct Recorder {
+    /// Outputs opened.
+    pub opens: AtomicU64,
+    /// Buffers written.
+    pub writes: AtomicU64,
+}
+
+#[cfg(test)]
+impl Recorder {
+    /// A recorder for one test (it lives as long as the test process).
+    pub fn new() -> &'static Self {
+        Box::leak(Box::default())
+    }
+}
+
+#[cfg(test)]
+impl PartialEq for Recorder {
+    fn eq(&self, other: &Self) -> bool {
+        std::ptr::eq(self, other)
+    }
+}
+
+#[cfg(test)]
+impl Eq for Recorder {}
 
 enum Output {
     /// Kept alive for as long as playback runs; dropping it stops the device.
@@ -638,9 +669,17 @@ impl Audio {
     pub fn start(decode: Decode<'_>, gain: f32, sink: Sink) -> Result<Self> {
         let shared = Arc::new(Shared::new(Instant::now()));
         let stop = Arc::new(AtomicBool::new(false));
+        #[cfg(test)]
+        let mut recorder = None;
         let device = match sink {
             Sink::Device => Some(open_device()?),
             Sink::Null => None,
+            #[cfg(test)]
+            Sink::Recording(to) => {
+                to.opens.fetch_add(1, SeqCst);
+                recorder = Some(to);
+                None
+            }
         };
         let (rate, channels) = device
             .as_ref()
@@ -686,6 +725,10 @@ impl Audio {
                     let mut k = 0u32;
                     while !quit.load(SeqCst) {
                         mixer.render(&mut buf, 0, pace.ns(Instant::now()));
+                        #[cfg(test)]
+                        if let Some(to) = recorder {
+                            to.writes.fetch_add(1, SeqCst);
+                        }
                         k += 1;
                         if let Some(d) = (begin + period * k).checked_duration_since(Instant::now())
                         {

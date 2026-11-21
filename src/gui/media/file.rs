@@ -128,6 +128,12 @@ impl MediaFile {
             .is_none_or(|b| b.result.lock().unwrap().is_some())
     }
 
+    /// The file as opened has a hash to check a Save against, or one is being made (tests).
+    #[cfg(test)]
+    pub fn has_baseline(&self) -> bool {
+        self.baseline.is_some() || self.origin.at.sha256.is_some()
+    }
+
     /// As if hashing the file as opened had failed for `why` (tests: a failure that leaves the
     /// file's size and time as they were, such as a read error).
     #[cfg(test)]

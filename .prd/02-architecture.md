@@ -180,21 +180,31 @@ frame single-lined), and the text viewer does not follow a growing file.
 |---|---|
 | text | the first page, **wrapped** at the side's width, with highlighting as the text viewer does it |
 | image | the image fitted into the side |
-| video | one frame: the frame at 0 s (the media window's first frame), with its duration and size |
-| audio | the waveform of the first 10 minutes, with the whole duration |
+| video | one frame: the frame at 0 s (the media window's first frame), fitted in the picture's own shape (pixels that are not square are shown as wide as they are), with a line under it saying its size, frame rate and duration |
+| audio | the waveform, with a line under it saying its channels, sample rate and whole duration; of a sound longer than 10 minutes, the waveform of the first 10 minutes **drawn over the side's whole width**, the line ending `preview of the first 10 minutes`. A sound in more than two channels shows its first two, the lanes named as the channels are (`FL`, `FR`), the line saying `6 channels · first 2 shown` |
 | anything else | the hex view of the first rows |
 
 - **Wrapped text** needs the text viewer's wrap mode, which the text-wrap branch adds (PR #14,
   `feat/text-wrap`). **It lands before slice S1** (§8), and P1 and the browser workstream's final
   acceptance require it; S1-B builds the preview's text on the wrap mode, never on a stop-gap.
-- **Media** (video and audio) previews need a waveform decode that can be stopped: today the media
-  window starts a whole-file ffmpeg decode for the waveform that nothing stops (`media.rs`), and PR #15
-  rewrites that code. In S1, video and audio show the info card. The media preview proper is the work
-  unit **S1-M "media preview"**, run after PR #15 has merged (§8.1); it reruns P1's media rows.
+- **Media** (video and audio, work unit S1-M). Everything a media preview needs from `ffprobe` and
+  `ffmpeg` — the probe, the one frame, the waveform, and for a video above 8 bits the question which
+  pixel formats ffmpeg's H.264 encoder takes (how Save and Export will render it) — is run by the
+  preview's worker (`media/preview.rs`), one process at a time, each one stopped by the same cancel
+  as a read (§4.4). The previewed window itself runs nothing: no decoder, no playback, no hash of
+  the file. A file named as a video that holds only sound is previewed as the sound it is; a `.ts`
+  `ffprobe` cannot read as media shows its hex rows, as Enter does; any other file `ffprobe`
+  cannot read shows the info card with ffprobe's words. The media window's own waveform decode
+  stops when its window goes (the window signals; the decoder's thread reaps).
 - **A file that cannot be previewed** — unreadable, vanished, a read error, a decode error, a budget
   hit (§4.3) — shows an **info card**: name, kind, size (exact and in units), date and time, `<LINK>`
   and the target when it is a link, and a last line saying why (`over the preview limit: Enter opens
-  it`, `image is 30000×30000; Enter opens it`, the error). The status row stays the list's.
+  it`, `image is 30000×30000; Enter opens it`, the error). The kind is there also when nothing of
+  the file was read (a remote file over the limit: by its name). The reason comes first and is
+  never cut; where it is about a file a program could not read, that is said under it, the file
+  named once and as its owner knows it (`ffprobe cannot read host:/abs` — never the private copy),
+  and that line is what a small side cuts. What `ffprobe` or `ffmpeg` said is shown without its
+  `[component @ 0x…]` tags and without the path it puts in front. The status row stays the list's.
 - **A link** is previewed as the file it points at (01 §3a: a link opens as its target); a broken
   link shows the info card with `<BROKEN>`.
 
@@ -208,13 +218,20 @@ bar does not have to move).
 | bytes a preview may read from a remote | 32 MiB (decided from the stat, before anything is read); with streaming (another workstream), only the byte ranges the preview shows, never more than 32 MiB |
 | image | 64 MiB encoded, and **64 megapixels** decoded (≤ 256 MiB of RGBA), checked from the image header before decoding |
 | text | the index pass stops after the first **4 MiB** of the file; the preview shows those lines and its last row says `preview of the first 4 MiB` |
-| video | `ffprobe` and the first frame: 5 s each |
-| audio | the waveform decodes at most the first 10 minutes, and 10 s |
+| video | `ffprobe` 5 s, then the first frame 5 s; above 8 bits, then the encoder question 5 s — each step its own time |
+| audio | `ffprobe` 5 s; then the waveform, which decodes at most the first 10 minutes, in 10 s |
 | hex | the rows on screen (the hex window reads pages only) |
-| time, all kinds | 5 s of preparation after the read (a read shows its progress and is bounded by the 32 MiB) |
+| time, text, image and hex | 5 s of preparation after the read (a read shows its progress and is bounded by the 32 MiB) |
 
 - A remote video over 32 MiB therefore shows the info card: its frame comes from `ffmpeg` on a local
   copy today. Lifting that limit belongs to the streaming workstream, which reads byte ranges.
+- **Media has a time per step, not the one 5 s**: a video may take 5 s for `ffprobe` and 5 s more
+  for its frame; a sound 5 s and 10 s. A step over its time is stopped — its process killed and
+  reaped — and the file shows the info card, its last line naming the step (`ffprobe took over
+  5 s: Enter opens it`, `the first frame took over 5 s: …`, `the waveform took over 10 s: …`); no
+  partial waveform is shown. The one exception is the encoder question: over its time it is
+  stopped the same way, but the preview shows all the same, and the media window asks again at
+  the hand-over, off its frames (§4.4).
 
 ### 4.4 Lifecycle: one preparation at a time, every exit defined
 
@@ -229,11 +246,25 @@ bar does not have to move).
   (03 §3.2) — 8, and 9 for the moment a git stop runs (03 §3.5). A cancelled preview never holds a
   second one.
 - **A preview reads without claiming the cache.** A remote file is read into a private preview copy
-  (`<cache>/.preview/<window>/<n>`, 0600, removed when the preview is dropped); a local file is read in
+  (`<cache>/.preview/<window>/<n>`, 0600, removed when the preview is dropped; the window's folder
+  goes with the window, and `.preview` itself with the last window's folder — by `rmdir`, which only ever removes it empty); a local file is read in
   place, an image included. A preview never claims a cached copy, publishes into the mirror, moves
   earlier edits aside or creates a session copy (01 §5's machinery is for files that are opened).
 - **Cancel** = the preparation's stop flag (the flag Esc sets for Enter today); the worker checks it at
-  every read, between decode steps, at every MiB of the text index, and before handing over.
+  every read, between decode steps, at every MiB of the text index, and before handing over. While
+  an `ffprobe` or `ffmpeg` of a media preview runs, the flag (and the step's time) is looked at
+  every few milliseconds; a child starts only after a look at it, and on every way out — cancelled,
+  over its time, ended, or the worker itself failing — it is killed and reaped. A child stays in
+  its slot (`media/child.rs`) until it has exited, so a program that closed its output and lives
+  on is still there to be stopped; a stop that comes while a child is being started is applied
+  as soon as it is in its slot; and a child is never read from without a thread watching it. No
+  process outlives its preview. **When sopen itself is killed** (a signal, `kill -9`): on Linux
+  the kernel kills every such child with it (each sets `PR_SET_PDEATHSIG`); on macOS there is
+  no such thing, and the one `ffprobe` or `ffmpeg` that ran is left to end by itself — each is
+  bounded by its input (one probe, one frame, at most the file's sound), and a Ctrl+C in the
+  terminal reaches it with the rest of the process group. The private preview folder such an end
+  leaves is swept by the next window (its lock is free). sopen keeps no list of its children
+  and handles no signal.
 
 | Exit | What happens to the preparation (or the prepared preview) |
 |---|---|
@@ -242,19 +273,31 @@ bar does not have to move).
 | F9, pin (Cmd/Ctrl+G), Tab | cancel |
 | the tree opens | kept as it is, inside `tree_snapshot` (O4); cancelled when the tree closes if the rules no longer show it |
 | Enter or F3 on the previewed file | **handed over** (below) |
-| Enter or F3 on a file showing an info card | the preview is dropped (its preparation cancelled) and the file opens as Enter opens it in the list (01 §3a), from the start; a private preview copy that is complete and whose file is unchanged since (size, mtime) is published into the cache as below instead of read again |
+| Enter or F3 on a file showing an info card | the preview is dropped (its preparation cancelled) and the file opens as Enter opens it in the list (01 §3a), from the start; a private preview copy that is complete and whose file is unchanged since (size, mtime) is published into the cache as below instead of read again. A video that `ffprobe` reads but none of whose frames decode fails the open too — after it was made ready: the media window, still as it was opened (nothing edited, nothing being written), gives up at its first frame, and the list is back with the reason on its status row. An open that fails, at either point, removes nothing from the cache: the copy it fetched or published is ordinary cache content, kept or replaced by the cache's own rules (01 §5) |
 | Enter on another entry, F4 | cancel / kept (F4 does not change the bar) |
-| the window closes | cancel; the window does not wait for a cancelled preview (its worker only reads and removes its own private copy) |
+| the window closes | cancel; the window does not wait for a cancelled preview. Its worker reads, removes its own private copy, and for a video or a sound may hold one `ffprobe` or `ffmpeg`: the window sends that process its kill itself as it goes (`Host::cancel`), since sopen may end before the worker has looked at its stop flag. That call is on a frame, so it only signals — it waits neither for the process nor for the worker; the worker reaps |
 
 - **The hand-over** (Enter or F3 on a previewed file). The live preview window becomes the viewer:
   - `Window::set_preview(false)`: the preview's budgets are lifted from that moment, its frame and bars
     are drawn as a viewer's, input reaches it.
   - **Work the preview stopped at its budget continues where it stopped** — the text index resumes at
     the offset where the 4 MiB pass stopped and keeps its marks; the audio waveform keeps its first 10
-    minutes and decodes on from there. For the text index the guarantee is exactly this: during a
+    minutes and decodes on from there (one more `ffmpeg`, started at 10:00), and a video's frame is
+    the one the preview decoded, not decoded again. For the text index the guarantee is exactly this: during a
     continuation that succeeds, each byte is indexed once; the bytes before the cut are also read
     twice more to verify them (hashed before and after the continuation); a mismatch re-indexes
     the whole file.
+  - **What a media preview left undone starts now**: the file as opened is hashed for Save's check
+    (a local file; a remote copy's hash came with its read), and the cache is swept of dead Save
+    and Export jobs. How Save and Export render the file came with the preview; only where the
+    encoder question ran out of time is it asked again — on a thread of its own, Save and Export
+    unavailable and the status row saying `checking the encoder…` until the answer lands (§6:
+    nothing slow on a frame). A media window opened by itself (`sopen file.mov`) asks the same
+    way. That question is the window's own task: it has 5 s, and it is stopped — its `ffmpeg`
+    killed — when the window goes. Without an answer in its time, Save and Export are planned
+    for 8-bit `yuv420p` (which every H.264 encoder takes), become available, and say so:
+    `encoder check timed out; Export converts to 8-bit` — and nothing else about the encoder,
+    which never answered.
   - **A preparation still running** becomes the viewer's opening task: its read or decode continues
     under the viewer's rules (no preview budget, no 5 s deadline), its progress moves to the status row,
     Esc stops it as Enter's does.
@@ -371,7 +414,9 @@ slice named here (§8); a file that exists today changes owner only from one sli
 
 ## 6. Threading and data flow
 
-- **Nothing slow runs on a frame** (01 §3a's rule, kept). Every git command, listing, preview
+- **Nothing slow runs on a frame** (01 §3a's rule, kept). The media window's one such run — asking
+  ffmpeg what its H.264 encoder takes, for a video above 8 bits — is made by the preview's worker,
+  or on a thread of the window's own (§4.4). Every git command, listing, preview
   preparation, file operation and tree scan runs on a worker thread; results come back over an
   `mpsc` channel and the worker calls `ctx.request_repaint()` (the browser's existing pattern,
   `browser.rs` `list` / `start_open`).
@@ -458,7 +503,7 @@ a slice depends on runs before it (§8.2).
 
 | Slice | What the owner gets | WUs (owner files: §5) | Needs first |
 |---|---|---|---|
-| **S1** | Preview mode (text, image, hex; video and audio as info cards, §4.2), F9 and rules O2 / O5 / O7, F2 rename, F5 copy, F6 move — local, and remote: files through `hardlink@` + `REMOVE`, folders by copy, check and remove (04 §5.6) — selection, the clickable F-key row with Cmd/Ctrl+digit aliases, F1 key help | S1-0 scaffold (touches no viewer file) · S1-A keys, aliases, row, help · S1-B viewer preview flags, preview read path, `.preview` cache root · S1-C file-operations engine · S1-D selection and file-operation dialogs, with drawing helpers for the inline rename field and selection colours · S1-E view, preview host, integration (calls S1-D's helpers in `panel_ui`) | E3; for S1-B (and P1) the text-wrap branch (PR #14) merged; S1-B changes `media.rs` only after PR #15 has merged, and then only for the `set_preview` default |
+| **S1** | Preview mode (text, image, hex; video and audio came with S1-M), F9 and rules O2 / O5 / O7, F2 rename, F5 copy, F6 move — local, and remote: files through `hardlink@` + `REMOVE`, folders by copy, check and remove (04 §5.6) — selection, the clickable F-key row with Cmd/Ctrl+digit aliases, F1 key help | S1-0 scaffold (touches no viewer file) · S1-A keys, aliases, row, help · S1-B viewer preview flags, preview read path, `.preview` cache root · S1-C file-operations engine · S1-D selection and file-operation dialogs, with drawing helpers for the inline rename field and selection colours · S1-E view, preview host, integration (calls S1-D's helpers in `panel_ui`) | E3; for S1-B (and P1) the text-wrap branch (PR #14) merged; S1-B changes `media.rs` only after PR #15 has merged, and then only for the `set_preview` default |
 | **S1-M** | The media preview: video frame and audio waveform previews, their budgets and hand-over (§4.2–§4.4) | S1-M (one WU: `media.rs`, its tests, the preview host's media row) | S1; PR #15 merged |
 | **S2** | The read-only git panel: detection, the log stream, the graph, details, diffs, files at a revision, find and filters, pin, refresh, `SOPEN_LIST=git` | S2-0 scaffold · S2-A runner · S2-B read model · S2-C lane layout · S2-D panel UI · S2-E viewers' read-only flag, `.revisions` root · S2-F O6, pin, integration | S1; E4 |
 | **S3** | Every Git Graph action, staging and commit, backups, restore and undo, the banner, the command log | S3-0 · S3-A actions and backups (logic) · S3-B menu, dialogs, backups list, log, banner · S3-C integration | S2; E5 |
@@ -471,7 +516,7 @@ a slice depends on runs before it (§8.2).
 
 | Slice | Scenarios |
 |---|---|
-| S1 | 02 P1–P7, P12 (text), P13 (P1 and P5: text, image and hex in full; video and audio as info cards), 04 K-R1 (S1's row), K-R2, K-R3 (Shift+F6, F6, exact modifiers), K-S1, K-C1–K-C5, K-M1 and K-M2 (S1 rows), K-N1 (files; remote folders after S6), K-E1 |
+| S1 | 02 P1–P7, P12 (text), P13 (P1 and P5: text, image and hex in full; video and audio with S1-M), 04 K-R1 (S1's row), K-R2, K-R3 (Shift+F6, F6, exact modifiers), K-S1, K-C1–K-C5, K-M1 and K-M2 (S1 rows), K-N1 (files; remote folders after S6), K-E1 |
 | S1-M | 02 P1, P5, P6 and P12 for video and audio; P3's media parts (a stalled `ffprobe`, a two-hour audio file: each within its budget, no worker left) and P4's (no ffmpeg process outlives its preview across a 50-file sweep, a cancelled waveform decode stops) |
 | S2 | 02 P8–P10; 03 G-D1, G-D2, G-R1–G-R4, G-R6, G-G1, G-G2, G-P1–G-P4, G-F1, G-F2, G-T1–G-T5, G-W1 (graph, details, diff) |
 | S3 | 03 G-R5, G-A1–G-A9, G-S1–G-S8, G-K1, G-K2, G-W1 (banner, backups, log) |
@@ -511,12 +556,23 @@ a slice depends on runs before it (§8.2).
   remote host over SFTP, in preview mode, with the bar moved down 49 times through the browser's
   key hook (`SOPEN_KEYS`). Each step waits for the preview to settle.
 - **Time:** 13.4 s for the 50 settled previews.
-- **ffmpeg:** 0 ffmpeg or ffprobe processes spawned by sopen. Video and audio show a file card
-  until S1-M (§4.2).
+- **ffmpeg:** 0 ffmpeg or ffprobe processes spawned by sopen (video and audio showed a file card
+  before S1-M).
 - **Cache:** the preview cache peaked at 196 KB and held 0 bytes after exit.
 - **Input isolation:** not part of this run. S1-E's P5 tests cover it: the host withholds the
   frame's input, and a stand-in window that reacts to everything stays untouched.
-- **S1-M reruns E3** for media previews.
+
+**E3's media rerun** (S1-M, measured 2026-11-21 on the branch's dev build):
+
+- **Run:** 50 files (10 txt, 10 rs, 8 png, 7 jpg, 5 mp4, 3 wav, 2 mp3 of 15 minutes, 5 bin; 19 MB
+  in total), the bar moved down 50 times through `SOPEN_KEYS`, once in a local folder and once
+  over ssh to the same machine (`localhost:`), not another host.
+- **Time:** 13.7 s local, 12.4 s over ssh.
+- **ffmpeg:** 20 processes per sweep — 10 `ffprobe` and 10 `ffmpeg`, one probe and one frame or
+  waveform for each of the 10 media files — counted by stand-in tools that log and `exec` the
+  real ones. At most 1 at a time; 0 alive after the window closed.
+- **Cache:** the preview cache peaked at 0 bytes locally (files are read in place) and at 7.2 MB
+  over ssh (one mp3's private copy); 0 bytes after exit in both; nothing outside `.preview`.
 
 ## 9. Receipts and test hooks
 

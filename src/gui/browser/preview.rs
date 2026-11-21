@@ -3,7 +3,8 @@
 //! (`Window::set_preview(true)`), drawn disabled with the frame's events withheld, prepared one at
 //! a time on the window's one preview connection, and handed over in place to a full viewer by
 //! Enter or F3 (`set_preview(false)`). Every exit of 02 §4.4's table is defined here. S1-E wrote
-//! it (S1-M adds its media row).
+//! it; S1-M added the media row: a video's or a sound's preparation runs ffprobe and ffmpeg,
+//! which a cancel stops — killed and reaped — as it stops a read.
 //!
 //! - **What the side shows** is the browser's committed display ([`super::view`]): [`Host::sync`]
 //!   is told it on every pass, with the file the bar is on right now. The bar leaving a file
@@ -84,6 +85,7 @@ impl Prep {
     /// The worker, for whoever waits for it after the window (a handed-over opening).
     pub fn into_worker(mut self) -> Option<JoinHandle<()>> {
         self.cancel.store(true, Ordering::Relaxed);
+        self.budget.stop_children();
         self.worker.take()
     }
 }
@@ -341,10 +343,13 @@ impl Host {
     }
 
     /// The window closes: the preparation is cancelled; nothing waits for its worker (it only
-    /// reads, and removes its own private copy).
+    /// reads, and removes its own private copy) — so an ffprobe or ffmpeg it runs for a video
+    /// or a sound is killed and reaped here, at once: the process may end before the worker
+    /// would have looked at its stop flag.
     pub fn cancel(&mut self) {
         if let Some(prep) = &self.prep {
             prep.cancel.store(true, Ordering::Relaxed);
+            prep.budget.stop_children();
         }
     }
 

@@ -142,10 +142,9 @@ impl Fx {
                 && w.save.is_none()
                 && w.job.is_none()
                 && if w.audio_only() {
-                    w.wave
-                        .as_ref()
-                        .is_some_and(|s| s.lock().unwrap().as_ref().is_some_and(|p| p.complete))
-                        && w.painted
+                    w.wave.as_ref().is_some_and(|s| {
+                        s.peaks.lock().unwrap().as_ref().is_some_and(|p| p.complete)
+                    }) && w.painted
                 } else {
                     w.frame_ready()
                 }
@@ -797,7 +796,7 @@ fn a_failed_waveform_is_said_where_the_waveform_is() {
         complete: false,
         error: Some("ffmpeg exit status: 1: Invalid data".to_string()),
     };
-    *fx.win.wave.as_ref().unwrap().lock().unwrap() = Some(failed);
+    *fx.win.wave.as_ref().unwrap().peaks.lock().unwrap() = Some(failed);
     fx.drv.idle(&mut fx.win, 2);
     assert!(fx
         .drv

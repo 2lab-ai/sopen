@@ -212,8 +212,9 @@ too, where F3 closes it as ⌘W does.
   in **preview mode**: the side opposite the active list follows its bar — on a file, once the bar
   has rested 150 ms, it shows that file's preview in a single-lined frame titled with the file
   (text wrapped and highlighted, an image fitted, the hex rows of anything else — sixteen bytes
-  a row where the side is wide enough, else eight, without the hex window's path row; video and audio
-  as an info card until slice S1-M; a file over a preview budget, 02 §4.3, or one that cannot be
+  a row where the side is wide enough, else eight, without the hex window's path row; a video's
+  first frame with its size and duration, a sound's waveform — of its first 10 minutes when it is
+  longer — with its whole duration; a file over a preview budget, 02 §4.3, or one that cannot be
   read as an info card saying why); on a folder or `..` it shows its own list (the git panel
   comes with S2). A preview takes no key, click, drag or wheel, claims nothing in the cache (a
   remote file is read into a private copy under `<cache>/.preview/`, removed with the preview)

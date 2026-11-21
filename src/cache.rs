@@ -591,10 +591,25 @@ impl PreviewSpace {
         try_lock: &mut dyn FnMut(&File) -> std::result::Result<(), std::fs::TryLockError>,
     ) -> Result<Self> {
         let root = cache.join(PREVIEW);
-        private_dir(&root)?;
-        sweep_previews(&root);
-        let (lock, held) =
-            create_unique(|_| root.join(format!("{}.lock", &crate::remote::random_hex()[..12])))?;
+        let lock_name = || root.join(format!("{}.lock", &crate::remote::random_hex()[..12]));
+        let mut made = None;
+        // The root goes with its last window's folder: one that went between the root being
+        // made here and the lock being made in it took the root along — made again, then.
+        for _ in 0..3 {
+            private_dir(&root)?;
+            sweep_previews(&root);
+            match create_unique(|_| lock_name()) {
+                Err(_) if !root.exists() => continue,
+                done => {
+                    made = Some(done?);
+                    break;
+                }
+            }
+        }
+        let (lock, held) = match made {
+            Some(made) => made,
+            None => create_unique(|_| lock_name())?,
+        };
         // Without its lock held the folder would look like a crashed window's, and the next
         // window's sweep would remove it under this one: no preview space, then.
         if let Err(e) = try_lock(&held) {
@@ -642,6 +657,11 @@ impl Drop for PreviewSpace {
         // The folder first, while the lock is still held: no sweep takes it meanwhile.
         let _ = std::fs::remove_dir_all(&self.dir);
         let _ = std::fs::remove_file(&self.lock);
+        // The root too, when this was the last window's folder in it (it is removed only
+        // empty): a run leaves nothing of its previews in the cache.
+        if let Some(root) = self.dir.parent() {
+            let _ = std::fs::remove_dir(root);
+        }
     }
 }
 
@@ -1347,12 +1367,31 @@ mod tests {
         std::mem::forget(b);
         drop(space);
         assert!(!dir.exists(), "the folder goes with the window");
-        let left: Vec<_> = std::fs::read_dir(tmp.path().join(PREVIEW))
-            .unwrap()
-            .flatten()
-            .map(|e| e.file_name())
-            .collect();
-        assert!(left.is_empty(), "nothing left: {left:?}");
+        assert!(
+            !tmp.path().join(PREVIEW).exists(),
+            "and the preview root with the last window's folder: nothing is left in the cache"
+        );
+    }
+
+    /// The preview root stays for as long as another window's folder is in it, and goes with
+    /// the last one; a window that comes after makes it again.
+    #[test]
+    fn the_preview_root_goes_with_the_last_windows_folder() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join(PREVIEW);
+        let (one, two) = (
+            PreviewSpace::new(tmp.path()).unwrap(),
+            PreviewSpace::new(tmp.path()).unwrap(),
+        );
+        drop(one);
+        assert!(
+            two.dir().exists() && root.exists(),
+            "another window's stays"
+        );
+        drop(two);
+        assert!(!root.exists(), "empty: removed");
+        let again = PreviewSpace::new(tmp.path()).unwrap();
+        assert!(again.dir().exists());
     }
 
     /// A new window removes the preview folders of windows that are gone — a folder whose lock

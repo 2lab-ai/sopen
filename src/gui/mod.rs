@@ -121,6 +121,8 @@ pub struct Outcome {
     pub conflict: bool,
     /// The last save attempt was refused and nothing was saved after it (exit 3).
     pub refused: Option<String>,
+    /// The window could not show its file after all ([`Window::failure`]): the open failed.
+    pub failed: Option<String>,
 }
 
 impl Outcome {
@@ -451,6 +453,13 @@ pub trait Window {
     fn set_preview(&mut self, on: bool) {
         let _ = on;
     }
+
+    /// Why the window cannot show its file after all (it found out once it was on screen — a
+    /// video none of whose frames decode): it has asked to be closed, and whoever opened it
+    /// says this. `None`: nothing failed.
+    fn failure(&self) -> Option<String> {
+        None
+    }
 }
 
 /// While a window is hosted inside another (the file browser shows a viewer in its own
@@ -692,6 +701,9 @@ impl Outcome {
         self.conflict |= next.conflict;
         if next.refused.is_some() {
             self.refused = next.refused;
+        }
+        if next.failed.is_some() {
+            self.failed = next.failed;
         }
     }
 }
@@ -969,6 +981,15 @@ fn event_loop_hook() -> Option<eframe::EventLoopBuilderHook> {
     None
 }
 
+/// sopen gives up (`why`) and exits 1 without unwinding (the screenshot hook's watchdog: a
+/// receipt hook). Nothing is stopped here: on Linux an ffprobe or ffmpeg a preview runs dies
+/// with sopen (the kernel ends it: `PR_SET_PDEATHSIG`); on macOS the one that runs may be left
+/// to end by itself — it is bounded by its input.
+pub(crate) fn give_up(why: &str) -> ! {
+    eprintln!("sopen: {why}; giving up");
+    std::process::exit(1);
+}
+
 /// Runs `window` until it closes. With the screenshot hook a watchdog ends a stalled run after
 /// `SOPEN_WATCHDOG` seconds (default 30).
 pub fn run_window<W: Window + 'static>(
@@ -1000,8 +1021,7 @@ pub fn run_window_sized<W: Window + 'static>(
         std::thread::spawn(move || {
             std::thread::sleep(Duration::from_secs(secs));
             if !done.load(Ordering::SeqCst) {
-                eprintln!("sopen: the screenshot hook stalled for {secs} s; giving up");
-                std::process::exit(1);
+                give_up(&format!("the screenshot hook stalled for {secs} s"));
             }
         });
     }

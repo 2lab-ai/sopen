@@ -486,6 +486,19 @@ impl Driver {
         found.into_iter().map(|(r, ())| r).collect()
     }
 
+    /// Every straight line the last pass drew where it can be seen (as for
+    /// [`Driver::find_text`]): its two ends and its colour — a waveform's columns are such lines.
+    pub fn segments(&self) -> Vec<([Pos2; 2], egui::Color32)> {
+        let found = self.shown(|s| match s {
+            egui::Shape::LineSegment { points, stroke } if stroke.width > 0.0 => Some((
+                Rect::from_two_pos(points[0], points[1]),
+                (*points, stroke.color),
+            )),
+            _ => None,
+        });
+        found.into_iter().map(|(_, line)| line).collect()
+    }
+
     /// Every rectangle the last pass drew where it can be seen (as for [`Driver::find_text`]):
     /// its bounds, fill colour and stroke width.
     pub fn rects(&self) -> Vec<(Rect, egui::Color32, f32)> {
