@@ -741,7 +741,12 @@ impl Wrapper<'_> {
         if span.len == 0 {
             return Ok(0);
         }
-        let a = self.restart_before(span, span.len)?;
+        let mut a = self.restart_before(span, span.len)?;
+        if a > 0 && self.ended(span, a)? {
+            // The restart point is on the `\r` before the line's end: no row starts there
+            // (going down never makes one), so the last row is of the segment before.
+            a = self.restart_before(span, a)?;
+        }
         Ok(*self.segment(span, a)?.last().unwrap_or(&a))
     }
 
@@ -760,7 +765,8 @@ impl Wrapper<'_> {
             return Ok(p);
         }
         let span = self.span(p)?;
-        if p.off >= span.len {
+        if p.off >= span.len || self.ended(span, p.off)? {
+            // Past the line's rows, or on the `\r` before its end: its last row.
             return self.last_of(span);
         }
         let a = self.restart_before(span, p.off + 1)?;
@@ -845,6 +851,48 @@ impl Wrapper<'_> {
             }
         }
         Ok(Pos::of(&span))
+    }
+
+    /// Not wrapped: the byte of `span` a row starts at for the line's end to be at its right
+    /// edge — as many of its last characters as are painted in `columns` columns and in the
+    /// row's width, a tab counted as wide as it can be (where it stops depends on where the
+    /// row starts). 0 for a line that fits.
+    pub fn end_left(&mut self, span: Span, columns: usize) -> Result<u64> {
+        let n = span.len.min(self.read as u64);
+        let from = span.len - n;
+        let window = &mut self.memo.window;
+        let mut bytes = self.doc.span_bytes(span, from, n as usize, window, true)?;
+        let mut end = span.len;
+        if span.cr && bytes.last() == Some(&b'\r') {
+            bytes.pop();
+            end -= 1;
+        }
+        // From a character's start.
+        let lead = match from {
+            0 => 0,
+            _ => bytes
+                .iter()
+                .take(3)
+                .take_while(|&&b| b & 0xC0 == 0x80)
+                .count(),
+        };
+        let (cells, _) = decode(&bytes[lead..], true);
+        let faces: Vec<char> = cells.iter().map(|c| chrome::shown_char(c.ch)).collect();
+        let widths = self.m.estimate(&faces);
+        let (mut left, mut cols, mut wide) = (end, 0usize, 0f32);
+        for (cell, width) in cells.iter().zip(widths).rev() {
+            let (c, w) = match cell.ch {
+                '\t' => (TAB, TAB as f32 * self.m.space),
+                _ => (1, width),
+            };
+            if cols + c > columns || wide + w > self.width + 0.01 {
+                break;
+            }
+            (cols, wide) = (cols + c, wide + w);
+            left -= u64::from(cell.len);
+        }
+        // (All of a line that fits was taken: 0.)
+        Ok(left)
     }
 
     /// The top of the last page of `rows` rows: the file's last row at the bottom — `known`:

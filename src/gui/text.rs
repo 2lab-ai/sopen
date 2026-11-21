@@ -1293,15 +1293,16 @@ impl TextDoc {
     /// The line that starts at byte `start`, past the index — or, `loose`, the piece that
     /// starts there of a line whose start is not known: read on to its newline, and no further
     /// than the grid point that ends it (06 §7.2: a line is never read whole). A line with a
-    /// known start is one piece as far as the first grid point [`REACH`] or more past it —
-    /// from every byte of that piece its start is found again — and a piece from the grid
-    /// runs to the next grid point.
+    /// known start is one piece as far as [`REACH`] past the grid point at or before its
+    /// start: from every byte of that piece its start is found again, and the piece lies in
+    /// the blocks a jump to any byte of it asks for ([`TextDoc::bring`]) — placing a line is
+    /// never a second ask. A piece from the grid runs to the next grid point.
     fn scan_span(&mut self, start: u64, loose: bool, window: &mut Window_) -> Result<Span> {
         let total = self.total();
         let bound = if loose {
             ((start + 3) / GRID + 1) * GRID
         } else {
-            (start + REACH).div_ceil(GRID) * GRID
+            start / GRID * GRID + REACH
         };
         let bound = bound.min(total);
         let piece = |len: u64, next: u64, ends: bool, cr: bool| Span {
@@ -1548,6 +1549,15 @@ struct Scan {
     limit: usize,
     /// A mark due at the very end of what was read: it is the index's once a byte follows it.
     held: Option<Mark>,
+    /// Tests: the most marks the index ever had room allocated for, and how often it was
+    /// thinned.
+    #[cfg(test)]
+    peak: usize,
+    #[cfg(test)]
+    thinned: usize,
+    /// Tests: where the marks were, and the room they had, as the last thinning left them.
+    #[cfg(test)]
+    after_thin: (usize, usize),
     /// The pass stopped at its cap, short of the file as opened.
     capped: bool,
     /// The hash of every byte read, for a pass that may stop short (a preview's): what its
@@ -1629,7 +1639,22 @@ impl Scan {
         while self.marks.len() >= self.limit() && self.spacing() < SPACING_MAX {
             self.thin();
         }
+        let len = self.marks.len();
+        if len == self.marks.capacity() {
+            // Room is made by the index itself, never by `Vec`'s doubling: up to the bound it
+            // doubles and stops there exactly; past it — only where no mark can be dropped
+            // any more — it grows a sixteenth at a time.
+            let more = match self.limit().checked_sub(len) {
+                Some(left) if left > 0 => len.max(64).min(left),
+                _ => (len / 16).max(4096),
+            };
+            self.marks.reserve_exact(more);
+        }
         self.marks.push(mark);
+        #[cfg(test)]
+        {
+            self.peak = self.peak.max(self.marks.capacity());
+        }
     }
 
     /// Doubles the line spacing and drops the marks that are no longer due — but never one
@@ -1638,27 +1663,36 @@ impl Scan {
     /// still reads at most a span. What stays is at most a mark each [`Scan::spacing`] lines
     /// and two each 64 KiB.
     fn thin(&mut self) {
+        #[cfg(test)]
+        {
+            self.thinned += 1;
+        }
         self.spacing = self.spacing() * 2;
-        let marks = std::mem::take(&mut self.marks);
-        let mut kept: Vec<Mark> = Vec::with_capacity(marks.len() / 2 + 1);
-        for (i, &mark) in marks.iter().enumerate() {
-            let Some(&last) = kept.last() else {
-                kept.push(mark);
-                continue;
-            };
+        // Where they are: no second set of marks is allocated beside the first, and the room
+        // stays as it is (the index fills it again).
+        let len = self.marks.len();
+        let mut kept = 0usize;
+        for i in 0..len {
+            let mark = self.marks[i];
             // The line starts after this mark lie before the next one (the last mark's: not
-            // known, so it stays).
-            let stays = match marks.get(i + 1) {
-                Some(next) => {
+            // known, so it stays). The first mark stays.
+            let stays = match (kept.checked_sub(1), self.marks.get(i + 1)) {
+                (None, _) | (_, None) => true,
+                (Some(last), Some(next)) => {
+                    let last = self.marks[last];
                     mark.line - last.line >= self.spacing() || next.offset - last.offset > SPAN
                 }
-                None => true,
             };
             if stays {
-                kept.push(mark);
+                self.marks[kept] = mark;
+                kept += 1;
             }
         }
-        self.marks = kept;
+        self.marks.truncate(kept);
+        #[cfg(test)]
+        {
+            self.after_thin = (self.marks.as_ptr() as usize, self.marks.capacity());
+        }
     }
 
     /// Tests: `count` lines of `width` bytes each (their newline counted) follow, of a file of
@@ -2538,6 +2572,8 @@ struct TextWindow {
     /// page was wrapped again, once.
     rewrapped: bool,
     wheel_rest: f32,
+    /// Not wrapped: the part of a byte the wheel sideways has moved by and not yet moved.
+    wheel_across: f32,
     page: Option<Page>,
     /// The page on screen is from an index replaced since: it stays up until a page is read
     /// through the new one.
@@ -2736,6 +2772,7 @@ impl TextWindow {
             room: 0.0,
             rewrapped: false,
             wheel_rest: 0.0,
+            wheel_across: 0.0,
             page: None,
             stale_page: false,
             notices,
@@ -3580,6 +3617,10 @@ impl TextWindow {
                     None => Pos::default(),
                 };
             }
+            if !wrap && !kept {
+                // A jump lands on a line from its start.
+                left = 0;
+            }
             let back = rows.saturating_sub(1) as u64;
             pos = match self.jump {
                 None => pos,
@@ -3602,12 +3643,14 @@ impl TextWindow {
                         let line_end = w.last_of(span)?;
                         let top = w.back(line_end, back)?;
                         (top > pos).then_some(top)
-                    } else if span.len > left.saturating_add(columns) {
-                        // The line's last bytes at the right edge.
-                        left = span.len - columns;
-                        Some(pos)
                     } else {
-                        None
+                        // The line's last characters at the right edge, when they are not
+                        // there already.
+                        let end = w.end_left(span, columns as usize)?;
+                        (end > left).then(|| {
+                            left = end;
+                            pos
+                        })
                     };
                     match within {
                         Some(top) => top,
@@ -4041,10 +4084,14 @@ impl TextWindow {
                     }
                 }
             });
-            if !self.wrap && across.abs() >= 1.0 {
+            if !self.wrap && across != 0.0 {
                 // Not wrapped, the wheel sideways moves the place within the lines (06 §7.2).
-                let bytes = across.trunc() as i64;
-                self.left = self.left.saturating_add_signed(bytes);
+                // What is less than a byte is kept for the next frame, as the rows' is: a slow
+                // swipe is many frames of less than one each.
+                let across = across + self.wheel_across;
+                let whole = across.trunc();
+                self.wheel_across = across - whole;
+                self.left = self.left.saturating_add_signed(whole as i64);
             }
             if rows != 0.0 {
                 let rows = rows + self.wheel_rest;

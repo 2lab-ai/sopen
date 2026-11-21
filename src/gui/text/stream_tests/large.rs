@@ -166,8 +166,14 @@ fn fetched(net: &Net) -> Fetched {
     net.source.stats().fetched
 }
 
-/// Passes and replies until nothing is on its way, nothing more goes and the window is ready
-/// (or `passes` went by: the assertions after it say what is missing).
+/// Nothing is on its way and nothing waits to be sent.
+fn idle(net: &mut Net) -> bool {
+    net.out() == 0 && !net.source.core().queued()
+}
+
+/// Passes and replies until the stream is idle — no request out, none queued — and the window
+/// is ready, over several passes in a row (a worker may ask in between). Fails when that has
+/// not come within `passes`.
 fn quiesce(drv: &mut Driver, win: &mut TextWindow, net: &mut Net, passes: usize) {
     let mut calm = 0;
     for _ in 0..passes {
@@ -176,12 +182,22 @@ fn quiesce(drv: &mut Driver, win: &mut TextWindow, net: &mut Net, passes: usize)
             calm = 0;
             continue;
         }
-        calm += 1;
-        if calm >= 4 && win.ready() {
-            return;
+        if idle(net) && win.ready() {
+            calm += 1;
+            if calm >= 4 {
+                return;
+            }
+        } else {
+            calm = 0;
         }
         std::thread::sleep(Duration::from_millis(1));
     }
+    panic!(
+        "not idle and ready within {passes} passes: {} out, queued {}, ready {}",
+        net.out(),
+        net.source.core().queued(),
+        win.ready()
+    );
 }
 
 /// The viewer on `net` with its first screen up and its 16 MiB pass done.
@@ -309,11 +325,15 @@ fn v12_end_costs_two_blocks_and_shows_byte_offsets_and_pgup_one_block_a_page() {
         let input = net.line("input").expect("the jump is an `input`");
         assert!(input.contains(" place=0x"), "{input}");
         assert!(net.line("ready").is_some(), "its page is a `ready`");
-        // PgUp, page after page: the lines before, a block of demand at most for each.
+        // PgUp, page after page: the lines before, a block of demand at most for each — on
+        // past the two blocks End brought, so that pages do cost a block: the one before.
         let page = visible - 1;
         let mut top = lines - visible;
-        for n in 1..=40u64 {
-            let demand = fetched(&net).demand;
+        let (mut paid, mut n) = (Vec::new(), 0u64);
+        while paid.len() < 3 {
+            n += 1;
+            assert!(n < 400, "no page asked for a block before End's: {paid:?}");
+            let (demand, sent) = (fetched(&net).demand, net.reads().len());
             drv.key(&mut win, Key::PageUp, Modifiers::NONE);
             quiesce(&mut drv, &mut win, &mut net, 400);
             top -= page;
@@ -321,6 +341,16 @@ fn v12_end_costs_two_blocks_and_shows_byte_offsets_and_pgup_one_block_a_page() {
             assert_eq!(rows(&win), want, "PgUp {n}");
             let cost = fetched(&net).demand - demand;
             assert!(cost <= BLOCK, "PgUp {n} cost {cost} of demand");
+            if cost > 0 {
+                // The block before the page's first byte, and no other.
+                let block = (top * LINE) / BLOCK * BLOCK;
+                assert_eq!(net.reads()[sent..], [(block, BLOCK as u32)], "PgUp {n}");
+                assert!(
+                    block < size - 2 * BLOCK,
+                    "a block End had brought was asked again"
+                );
+                paid.push(n);
+            }
         }
         assert!(fetched(&net).bulk == before.bulk);
     });
@@ -475,7 +505,7 @@ fn a_jump_into_a_line_with_no_start_in_reach_begins_on_the_grid() {
         let before = fetched(&net);
         let grid = 512u64 << 20;
         go_to(&mut drv, &mut win, &format!("0x{:X}", grid + 5000));
-        quiesce(&mut drv, &mut win, &mut net, 400);
+        quiesce(&mut drv, &mut win, &mut net, 4000);
         // Wrapped: rows from the grid point, and the row the target is in at the top.
         let all = rows(&win).join(" ");
         let target = word((grid + 5000) / 16);
@@ -498,7 +528,7 @@ fn a_jump_into_a_line_with_no_start_in_reach_begins_on_the_grid() {
         );
         // Unwrapped: one row, from the grid point.
         drv.key(&mut win, Key::W, Modifiers::NONE);
-        quiesce(&mut drv, &mut win, &mut net, 400);
+        quiesce(&mut drv, &mut win, &mut net, 4000);
         let row = rows(&win)[0].clone();
         assert!(row.starts_with(&word(grid / 16)), "{row}");
         let x = text_x(&drv, &row[..31]);
@@ -511,12 +541,12 @@ fn a_jump_into_a_line_with_no_start_in_reach_begins_on_the_grid() {
         // ↓: no line start within reach, so one grid point on; ↑ back, and one more back.
         let step = 16 * 1024;
         drv.key(&mut win, Key::ArrowDown, Modifiers::NONE);
-        quiesce(&mut drv, &mut win, &mut net, 400);
+        quiesce(&mut drv, &mut win, &mut net, 4000);
         assert!(rows(&win)[0].starts_with(&word((grid + step) / 16)));
         assert!(gutter(&drv, x).contains(&mark(grid + step)));
         for back in [grid, grid - step] {
             drv.key(&mut win, Key::ArrowUp, Modifiers::NONE);
-            quiesce(&mut drv, &mut win, &mut net, 400);
+            quiesce(&mut drv, &mut win, &mut net, 4000);
             assert!(
                 rows(&win)[0].starts_with(&word(back / 16)),
                 "{}",
@@ -618,32 +648,133 @@ fn the_lines_known_grow_with_the_screen_past_16_mib() {
     });
 }
 
+/// Bytes in a line of the first half of [`lopsided`], and of its second half.
+const LONG: u64 = 4096;
+
+/// Line `j` of the second half of [`lopsided`], without its newline.
+fn short_line(j: u64) -> String {
+    format!("B line {j:012} {}", ".".repeat(43))
+}
+
+/// A file whose bytes and lines are far apart: its first half is lines of [`LONG`] bytes, its
+/// second half lines of [`LINE`] bytes. Half way through its bytes is 1.5 % of the way through
+/// its lines, so a place found by lines is nowhere near the same place found by bytes.
+fn lopsided(size: u64) -> Text {
+    let half = size / 2;
+    assert!(half.is_multiple_of(LONG) && half.is_multiple_of(LINE));
+    Arc::new(move |off, len| {
+        let end = off + len as u64;
+        let mut out = Vec::with_capacity(len);
+        if off < half {
+            let n = (end.min(half) - off) as usize;
+            out.extend(pieces(off, n, LONG, |i| {
+                let mut line = format!("A line {i:012} ").into_bytes();
+                line.resize(LONG as usize - 1, b'a');
+                line.push(b'\n');
+                line
+            }));
+        }
+        if end > half {
+            let from = off.max(half);
+            out.extend(pieces(from - half, (end - from) as usize, LINE, |j| {
+                let mut line = short_line(j).into_bytes();
+                line.push(b'\n');
+                line
+            }));
+        }
+        out
+    })
+}
+
+/// The scroll bar's column as the last pass painted it, and the share of the file (0 to 1) a
+/// pointer at `y` on it stands for: the thumb's cell, centred on the pointer, along the track
+/// between the two arrows.
+fn bar_share(drv: &Driver, y: f32) -> (egui::Rect, f32) {
+    let (column, text) = drv
+        .texts()
+        .into_iter()
+        .find(|(_, _, t)| t.starts_with('↑'))
+        .map(|(r, _, t)| (r, t))
+        .expect("the scroll bar");
+    let cell = crate::gui::chrome::CELL.y;
+    let cells = text.lines().count() as f32;
+    let (top, room) = (column.top() + cell, cell * (cells - 2.0) - cell);
+    (column, ((y - top - cell / 2.0) / room).clamp(0.0, 1.0))
+}
+
+/// The byte of a file of `size` bytes that share `at` of it is, as a jump takes it.
+fn byte_at(size: u64, at: f32) -> u64 {
+    ((size as f64 * f64::from(at)) as u64).min(size - 1)
+}
+
+/// The blocks a jump to byte `x` asks for: those the 64 KiB before the grid point at or
+/// before `x` and the 64 KiB after it lie in.
+fn jump_blocks(x: u64, size: u64) -> Vec<(u64, u32)> {
+    let grid = x / GRID * GRID;
+    let (first, last) = (
+        grid.saturating_sub(SPAN) / BLOCK,
+        ((grid + SPAN).min(size) - 1) / BLOCK,
+    );
+    (first..=last).map(|b| (b * BLOCK, BLOCK as u32)).collect()
+}
+
+/// The `input` lines on the stats line so far.
+fn inputs(net: &Net) -> Vec<String> {
+    let lines = net.lines.lock().unwrap();
+    lines
+        .iter()
+        .filter(|l| l.starts_with("stream input "))
+        .cloned()
+        .collect()
+}
+
 /// The scroll bar is by bytes while the line count is not known (06 §7.2), and a click on it
-/// is a jump: the page is the one at that share of the file's bytes.
+/// is a jump: the page is the one at that share of the file's bytes — in a file where that is
+/// nowhere near the same share of its lines — for one ask of the blocks around that byte.
 #[test]
 fn the_scroll_bar_jumps_by_bytes_while_the_line_count_is_unknown() {
     bounded("the scroll bar", || {
         let size = 4u64 << 30;
-        let lines = size / LINE;
-        let mut net = log_net(size);
+        let half = size / 2;
+        let mut net = written(size, lopsided(size));
         let (mut win, mut drv) = opened(&mut net, "big.log");
-        let track = drv
-            .texts()
-            .into_iter()
-            .find(|(_, _, t)| t.starts_with('↑'))
-            .map(|(r, _, _)| r)
-            .expect("the scroll bar");
+        let (column, _) = bar_share(&drv, 0.0);
+        // Six tenths of the way down the bar.
+        let y = column.top() + column.height() * 0.6;
+        let (_, share) = bar_share(&drv, y);
+        assert!((0.55..0.65).contains(&share), "{share}");
+        let byte = byte_at(size, share);
+        let line = (byte - half) / LINE;
+        // The same share of the file's lines is more than a tenth of the file away.
+        let (long, short) = (half / LONG, half / LINE);
+        let by_lines = ((long + short) as f64 * f64::from(share)) as u64;
+        assert!(by_lines > long, "{by_lines}");
+        let there = half + (by_lines - long) * LINE;
+        assert!(there.abs_diff(byte) > size / 10, "{there:#x} and {byte:#x}");
         let before = fetched(&net);
-        drv.click(&mut win, track.center());
+        let sent = net.reads().len();
+        drv.click(&mut win, Pos2::new(column.center().x, y));
+        // All of the jump's blocks are on their way before the first reply.
+        net.out();
+        let asked = jump_blocks(byte, size);
+        assert_eq!(net.reads()[sent..], asked, "the jump's one ask");
         quiesce(&mut drv, &mut win, &mut net, 400);
-        let top = rows(&win)[0].clone();
-        let number: u64 = top[5..17].parse().expect("a line of the log");
-        let share = number as f64 / lines as f64;
-        assert!((0.4..0.6).contains(&share), "line {number} of {lines}");
+        assert_eq!(
+            rows(&win)[0],
+            short_line(line),
+            "the line byte {byte:#x} is in"
+        );
+        assert_eq!(net.reads()[sent..], asked, "nothing more was asked for");
         let after = fetched(&net);
-        assert!(after.demand - before.demand <= 3 * BLOCK, "{after:?}");
+        assert_eq!(
+            after.demand + after.prefetch - before.demand - before.prefetch,
+            asked.len() as u64 * BLOCK,
+            "{after:?}"
+        );
         assert_eq!(after.bulk, before.bulk);
-        // The thumb is where the page is, by bytes.
+        let place = inputs(&net).pop().expect("the click is an `input`");
+        assert!(place.ends_with(&format!(" place={byte:#x}")), "{place}");
+        // The thumb is where the page is, by bytes: where the pointer was.
         let thumb = crate::gui::chrome::PALETTE.thumb;
         let at = drv
             .rects()
@@ -651,10 +782,7 @@ fn the_scroll_bar_jumps_by_bytes_while_the_line_count_is_unknown() {
             .find(|(_, fill, _)| *fill == thumb)
             .map(|(r, _, _)| r.center().y)
             .expect("the thumb");
-        assert!(
-            (at - track.center().y).abs() <= 24.0,
-            "thumb at {at}, track {track:?}"
-        );
+        assert!((at - y).abs() <= 12.0, "thumb at {at}, clicked at {y}");
     });
 }
 
@@ -678,12 +806,9 @@ fn the_cr_of_a_far_line_end_is_not_fetched_before_its_last_row() {
         net.settle();
         drv.idle(&mut win, 2);
         net.settle();
-        let far: Vec<(u64, u32)> = net
-            .reads()
-            .into_iter()
-            .filter(|r| r.0 >= 2 * BLOCK)
-            .collect();
-        assert_eq!(far, [], "the line's end was fetched for its first rows");
+        // Everything read for the first rows: the line's first block, and nothing of its end.
+        assert_eq!(net.reads(), [(0, BLOCK as u32)], "the first screen's reads");
+        assert_eq!(net.fetched(), BLOCK);
         // The line's last rows, then the next line: no `\r` is shown (it would be `♪`).
         drv.key(&mut win, Key::End, Modifiers::NONE);
         quiesce(&mut drv, &mut win, &mut net, 400);
@@ -701,21 +826,49 @@ fn the_cr_of_a_far_line_end_is_not_fetched_before_its_last_row() {
     });
 }
 
+/// A diff of a little over 17 MiB in added lines of about a kilobyte, and each line's first
+/// byte. (A diff: its grammar parses a megabyte in a fraction of a second, where Rust's takes
+/// seven — and a page below 16 MiB is highlighted only once every line before it is parsed.)
+fn big_diff() -> (String, Vec<u64>) {
+    let filler = "x".repeat(1000);
+    let (mut body, mut starts) = (String::new(), Vec::new());
+    let mut i = 0;
+    while (body.len() as u64) < HIGHLIGHT_MAX + (1 << 20) {
+        starts.push(body.len() as u64);
+        body.push_str(&format!("+k{i:06} {filler}\n"));
+        i += 1;
+    }
+    starts.push(body.len() as u64);
+    body.push_str(" the end\n");
+    (body, starts)
+}
+
+/// Some line on the page has more than one colour.
+fn coloured(win: &TextWindow) -> bool {
+    colors(win).iter().any(|line| {
+        let distinct: std::collections::HashSet<_> = line.iter().collect();
+        distinct.len() >= 2
+    })
+}
+
+/// The first line (0-based) of `starts` that begins at or after byte `at`.
+fn line_from(starts: &[u64], at: u64) -> u64 {
+    starts.partition_point(|s| *s < at) as u64
+}
+
 /// 06 Tensions, settled: a local file over 16 MiB keeps its whole-file pass — every byte is
 /// indexed before its first screen, and every line has its number — and it is highlighted as
-/// a stream is: over its first 16 MiB, plain past them.
+/// a stream is: over its first 16 MiB — a page past 4 MiB and one just below 16 MiB are
+/// coloured — and plain from the first line past them.
 #[test]
 fn a_local_file_over_16_mib_is_indexed_whole_and_highlighted_over_its_first_16_mib() {
     let tmp = tempfile::tempdir().unwrap();
-    let mut body = wide_rust(260_000);
-    let total = body.len() as u64;
-    assert!(total > HIGHLIGHT_MAX + (2 << 20), "{total}");
-    body.push_str("// the end\n");
+    let (body, starts) = big_diff();
     let total = body.len() as u64;
     let lines = body.lines().count() as u64;
-    let mut win = twin(tmp.path(), "big.rs", body.as_bytes());
+    let mut win = twin(tmp.path(), "big.diff", body.as_bytes());
     // The pass read the whole file, once, before the window was made.
-    let read: u64 = index_reads(&tmp.path().join("big.rs"))
+    let read: u64 = index_reads(&tmp.path().join("big.diff"))
         .iter()
         .map(|r| r.1)
         .sum();
@@ -723,13 +876,7 @@ fn a_local_file_over_16_mib_is_indexed_whole_and_highlighted_over_its_first_16_m
     assert_eq!(win.doc.line_count(), lines);
     assert!(win.doc.whole());
     let mut drv = Driver::new(800.0, 500.0);
-    drv.until(&mut win, 60, |w| w.ready());
-    let coloured = |win: &TextWindow| {
-        colors(win).iter().any(|line| {
-            let distinct: std::collections::HashSet<_> = line.iter().collect();
-            distinct.len() >= 2
-        })
-    };
+    drv.until(&mut win, 120, |w| w.ready());
     assert!(coloured(&win), "the first page is plain");
     assert!(
         !says(&drv, "shown without highlighting"),
@@ -740,14 +887,29 @@ fn a_local_file_over_16_mib_is_indexed_whole_and_highlighted_over_its_first_16_m
         &drv,
         &format!("{} lines", crate::gui::hex::grouped(lines))
     ));
-    // Past 16 MiB: plain, with its line numbers.
+    // Past 4 MiB, and the last lines below 16 MiB: coloured.
+    for at in [5 << 20, HIGHLIGHT_MAX - 3 * SPAN] {
+        let line = line_from(&starts, at);
+        go_to(&mut drv, &mut win, &(line + 1).to_string());
+        drv.until(&mut win, 300, |w| w.ready() && w.line == Some(line));
+        assert!(rows(&win)[0].starts_with(&format!("+k{line:06} ")));
+        assert!(coloured(&win), "plain at byte {at}, below 16 MiB");
+    }
+    // From the first line past 16 MiB: plain, with its line number.
+    let line = line_from(&starts, HIGHLIGHT_MAX);
+    go_to(&mut drv, &mut win, &(line + 1).to_string());
+    drv.until(&mut win, 60, |w| w.ready() && w.line == Some(line));
+    drv.idle(&mut win, 3);
+    assert!(rows(&win)[0].starts_with(&format!("+k{line:06} ")));
+    assert!(!coloured(&win), "highlighted past 16 MiB");
+    let x = text_x(&drv, &rows(&win)[0]);
+    assert!(gutter(&drv, x).contains(&(line + 1).to_string()));
+    // And the end.
     drv.key(&mut win, Key::End, command(false));
     drv.until(&mut win, 60, |w| w.ready());
     drv.idle(&mut win, 3);
-    assert_eq!(rows(&win).last().map(String::as_str), Some("// the end"));
+    assert_eq!(rows(&win).last().map(String::as_str), Some(" the end"));
     assert!(!coloured(&win), "highlighted past 16 MiB");
-    let x = text_x(&drv, "// the end");
-    assert!(gutter(&drv, x).contains(&lines.to_string()));
 }
 
 /// A pass over nothing yet.
@@ -841,8 +1003,10 @@ fn v12_the_index_of_4_gib_of_empty_lines_stays_within_16_mib() {
     let size = 4u64 << 30;
     let scan = index_of(size, &[(size, 1)]);
     assert_eq!((scan.at, scan.line), (size, size));
-    let bytes = scan.marks.len() * std::mem::size_of::<Mark>();
-    assert!(bytes <= 16 << 20, "{bytes} bytes of index");
+    // The most room the index was ever allocated, across its thinnings: not its length.
+    assert!(scan.thinned >= 4, "thinned {} times", scan.thinned);
+    let bytes = scan.peak.max(scan.marks.capacity()) * std::mem::size_of::<Mark>();
+    assert!(bytes <= 16 << 20, "{bytes} bytes allocated for the index");
     assert!(scan.marks.len() > MARKS_MAX / 4, "{}", scan.marks.len());
 }
 
@@ -868,10 +1032,11 @@ fn the_index_of_a_24_gb_file_is_bounded_whatever_its_lines() {
     for size in [24_000_000_000u64, 24 << 30, 64 << 30] {
         for shape in shapes {
             let scan = index_of(size, shape);
-            let bytes = scan.marks.len() * std::mem::size_of::<Mark>();
+            // What was allocated at its most, during the pass and after it.
+            let bytes = scan.peak.max(scan.marks.capacity()) * std::mem::size_of::<Mark>();
             assert!(
                 bytes <= index_bound(size),
-                "{size} bytes of {shape:?}: {bytes} bytes of index, over {}",
+                "{size} bytes of {shape:?}: {bytes} bytes allocated for the index, over {}",
                 index_bound(size)
             );
         }
@@ -961,9 +1126,18 @@ fn the_index_is_held_once_and_the_highlighter_has_the_first_16_mib_of_it() {
         let Backing::Stream(stream) = &win.doc.backing else {
             unreachable!("a streamed document");
         };
+        assert_eq!(
+            stream.scan.marks.capacity(),
+            0,
+            "the pass kept marks, or room for them, of its own"
+        );
+        // The document's allocation, the pass's included, is within the bound.
+        let room = win.doc.marks.capacity() + stream.scan.marks.capacity();
+        assert!(room * std::mem::size_of::<Mark>() <= index_bound(size));
         assert!(
-            stream.scan.marks.is_empty(),
-            "the pass kept marks of its own"
+            room <= 2 * win.doc.marks() + 64,
+            "{room} for {}",
+            win.doc.marks()
         );
         assert!(win.doc.marks() >= 350_000 / 256);
         let copy = win.doc.share_first(HIGHLIGHT_MAX).unwrap();
@@ -1048,70 +1222,115 @@ fn typing_in_go_to_is_not_the_windows_keys() {
 }
 
 /// The thumb dragged along the scroll bar fetches nothing until it is let go (06 §11: a place
-/// the thumb only passes is not an `input`): then one jump, to where it was let go.
+/// the thumb only passes is not an `input`): held at the end of the drag, with the transport
+/// pumped, nothing is asked for and the page stays. Let go, it is one jump, to the byte the
+/// pointer was let go at.
 #[test]
 fn a_dragged_thumb_jumps_once_where_it_is_let_go() {
     bounded("the thumb, dragged", || {
         let size = 4u64 << 30;
-        let lines = size / LINE;
-        let mut net = log_net(size);
+        let half = size / 2;
+        let mut net = written(size, lopsided(size));
         let (mut win, mut drv) = opened(&mut net, "big.log");
-        let track = drv
-            .texts()
+        let (column, _) = bar_share(&drv, 0.0);
+        let x = column.center().x;
+        let (from, to) = (column.top() + 40.0, column.top() + column.height() * 0.8);
+        let page = rows(&win);
+        let (sent, marked) = (net.requests(), inputs(&net).len());
+        drv.move_to(&mut win, Pos2::new(x, from));
+        drv.press(&mut win, egui::PointerButton::Primary);
+        for step in 1..=8 {
+            let y = from + (to - from) * step as f32 / 8.0;
+            drv.move_to(&mut win, Pos2::new(x, y));
+        }
+        // Held where it stopped: passes go by and the transport is pumped — nothing happens.
+        for _ in 0..6 {
+            drv.idle(&mut win, 1);
+            net.settle();
+        }
+        assert!(win.drag.is_some(), "the thumb is not being dragged");
+        assert!(idle(&mut net));
+        assert_eq!(
+            net.requests(),
+            sent,
+            "a place the thumb passed was asked for"
+        );
+        assert_eq!(
+            inputs(&net).len(),
+            marked,
+            "a place the thumb passed is an `input`"
+        );
+        assert_eq!(rows(&win), page, "the page moved under the drag");
+        // The thumb itself is where the pointer is.
+        let thumb = crate::gui::chrome::PALETTE.thumb;
+        let at = drv
+            .rects()
             .into_iter()
-            .find(|(_, _, t)| t.starts_with('↑'))
-            .map(|(r, _, _)| r)
-            .expect("the scroll bar");
-        let sent = net.requests();
-        let x = track.center().x;
-        let from = Pos2::new(x, track.top() + 24.0);
-        let to = Pos2::new(x, track.top() + track.height() * 0.75);
-        let mut inputs = 0;
-        drv.drag_watching(&mut win, egui::PointerButton::Primary, from, to, |_| {
-            inputs += 1;
-        });
-        assert!(inputs > 2, "the drag had steps");
+            .find(|(_, fill, _)| *fill == thumb)
+            .map(|(r, _, _)| r.center().y)
+            .expect("the thumb");
+        assert!((at - to).abs() <= 12.0, "thumb at {at}, pointer at {to}");
+        // Let go: one jump, to the byte of that place.
+        let (_, share) = bar_share(&drv, to);
+        let byte = byte_at(size, share);
+        let reads = net.reads().len();
+        drv.release(&mut win, egui::PointerButton::Primary);
+        // (The pass after the release reads the page of the jump.)
+        drv.idle(&mut win, 1);
         net.out();
-        let asked = net.requests() - sent;
-        assert!(asked <= 4, "{asked} requests: only the jump's");
-        let marked = net
-            .lines
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|l| l.starts_with("stream input "))
-            .count();
-        assert_eq!(marked, 1, "one `input`, where the thumb was let go");
+        let asked = jump_blocks(byte, size);
+        assert_eq!(net.reads()[reads..], asked, "the jump's one ask");
+        let now = inputs(&net);
+        assert_eq!(now.len(), marked + 1, "one `input`");
+        assert!(
+            now[marked].ends_with(&format!(" place={byte:#x}")),
+            "{now:?}"
+        );
         quiesce(&mut drv, &mut win, &mut net, 400);
-        let number: u64 = rows(&win)[0][5..17].parse().expect("a line of the log");
-        let share = number as f64 / lines as f64;
-        assert!((0.6..0.9).contains(&share), "line {number} of {lines}");
+        assert_eq!(rows(&win)[0], short_line((byte - half) / LINE));
+        assert_eq!(net.reads()[reads..], asked, "nothing more was asked for");
+        assert!(win.drag.is_none());
     });
 }
 
 /// A stream over 16 MiB is highlighted over its first 16 MiB and plain past them (06 §7.2),
-/// as a local file is: the highlighter's state runs from the top of the file.
+/// as a local file is: the highlighter's state runs from the top of the file. A page past
+/// 4 MiB and one just below 16 MiB are coloured; the first lines past 16 MiB are plain.
 #[test]
 fn a_stream_over_16_mib_is_highlighted_over_its_first_16_mib() {
     bounded("highlighting, 16 MiB", || {
-        let mut body = wide_rust(260_000);
-        body.push_str("// the end\n");
-        assert!(body.len() as u64 > HIGHLIGHT_MAX + (2 << 20));
+        let (body, starts) = big_diff();
         let mut net = net(body.as_bytes(), gate());
-        let (mut win, mut drv) = opened(&mut net, "big.rs");
-        let coloured = |win: &TextWindow| {
-            colors(win).iter().any(|line| {
-                let distinct: std::collections::HashSet<_> = line.iter().collect();
-                distinct.len() >= 2
-            })
-        };
+        let (mut win, mut drv) = opened(&mut net, "big.diff");
         run(&mut drv, &mut win, &mut net, "the first page", |w, _| {
             w.ready() && coloured(w)
         });
+        for at in [5 << 20, HIGHLIGHT_MAX - 3 * SPAN] {
+            let line = line_from(&starts, at);
+            go_to(&mut drv, &mut win, &(line + 1).to_string());
+            run(
+                &mut drv,
+                &mut win,
+                &mut net,
+                "a page below 16 MiB",
+                |w, _| w.ready() && w.line == Some(line) && coloured(w),
+            );
+            assert!(rows(&win)[0].starts_with(&format!("+k{line:06} ")));
+        }
+        // The first line past 16 MiB, by its byte: plain.
+        let line = line_from(&starts, HIGHLIGHT_MAX);
+        go_to(
+            &mut drv,
+            &mut win,
+            &format!("0x{:X}", starts[line as usize]),
+        );
+        quiesce(&mut drv, &mut win, &mut net, 4000);
+        assert!(rows(&win)[0].starts_with(&format!("+k{line:06} ")));
+        assert!(!coloured(&win), "highlighted past 16 MiB");
         // The end: by bytes, plain.
         drv.key(&mut win, Key::End, command(false));
-        quiesce(&mut drv, &mut win, &mut net, 400);
-        assert_eq!(rows(&win).last().map(String::as_str), Some("// the end"));
+        quiesce(&mut drv, &mut win, &mut net, 4000);
+        assert_eq!(rows(&win).last().map(String::as_str), Some(" the end"));
         assert!(!coloured(&win), "highlighted past 16 MiB");
         assert!(win.ready());
         // Back at the top: its colours again.
@@ -1123,7 +1342,7 @@ fn a_stream_over_16_mib_is_highlighted_over_its_first_16_mib() {
             "the first page again",
             |w, _| w.ready() && coloured(w),
         );
-        assert_eq!(rows(&win)[0], "// numbers, one a line");
+        assert!(rows(&win)[0].starts_with("+k000000 "));
     });
 }
 
@@ -1136,7 +1355,7 @@ fn a_reload_at_a_place_past_the_lines_known_comes_back_to_it() {
         let mut net = log_net(size);
         let (mut win, mut drv) = opened(&mut net, "big.log");
         go_to(&mut drv, &mut win, &format!("0x{:X}", 3u64 << 30));
-        quiesce(&mut drv, &mut win, &mut net, 400);
+        quiesce(&mut drv, &mut win, &mut net, 4000);
         let before = rows(&win);
         assert_eq!(before[0], log_line((3u64 << 30) / LINE));
         drv.key(&mut win, Key::R, command(false));
@@ -1144,7 +1363,7 @@ fn a_reload_at_a_place_past_the_lines_known_comes_back_to_it() {
         run(&mut drv, &mut win, &mut net, "the reload", |w, _| {
             w.ready() && w.doc.size() > 0
         });
-        quiesce(&mut drv, &mut win, &mut net, 400);
+        quiesce(&mut drv, &mut win, &mut net, 4000);
         assert_eq!(rows(&win), before);
         let got = fetched(&net);
         assert!(got.total <= 2 * HIGHLIGHT_MAX + (2 << 20), "{got:?}");
@@ -1276,6 +1495,8 @@ fn rows_past_the_lines_known_are_the_same_down_and_up() {
             };
         }
         let (mut down, mut p) = (Vec::new(), wrap::Pos::default());
+        // Each row: its first byte in the file, the bytes it takes, its text.
+        let mut shown: Vec<(u64, u64, String)> = Vec::new();
         let mut text = String::new();
         loop {
             let row = got!(w.page(p, 1)).0.remove(0);
@@ -1287,6 +1508,7 @@ fn rows_past_the_lines_known_are_the_same_down_and_up() {
                 text.push(' ');
             }
             down.push(p);
+            shown.push((p.at + p.off, row.cut.bytes as u64, row.cut.text()));
             match got!(w.next(p)) {
                 Some(q) => p = q,
                 None => break,
@@ -1302,11 +1524,33 @@ fn rows_past_the_lines_known_are_the_same_down_and_up() {
         up.reverse();
         assert_eq!(up.len(), down.len());
         assert_eq!(up, down, "the same rows going back up");
-        // And from any byte: the row that holds it is one of them.
-        for x in (0..body.len() as u64).step_by(20_011) {
+        // Each row is the file's bytes from its first: what it takes, less the space it
+        // broke at and the `\r` before a line's end.
+        for (start, bytes, text) in &shown {
+            let slice = &body[*start as usize..(*start + *bytes) as usize];
+            let want = String::from_utf8_lossy(slice);
+            assert_eq!(
+                text.trim_end_matches(' '),
+                want.trim_end_matches([' ', '\r']),
+                "the row at byte {start}"
+            );
+        }
+        // And from any byte, the row that holds it: the last row that starts at or before
+        // the byte (a line's `\n`, and a `\r` before it, are its last row's) — every byte
+        // around each line's end, and bytes all over the file.
+        let ends = body
+            .iter()
+            .enumerate()
+            .filter(|(_, b)| **b == b'\n')
+            .flat_map(|(i, _)| (i as u64).saturating_sub(2)..=i as u64 + 1);
+        let all: Vec<u64> = (0..body.len() as u64).step_by(20_011).chain(ends).collect();
+        assert!(all.len() > 1_000);
+        for x in all.into_iter().filter(|x| *x < body.len() as u64) {
+            let k = shown.partition_point(|(start, _, _)| *start <= x) - 1;
             let at = got!(w.at_byte(x));
-            assert!(down.contains(&at), "byte {x}: {at:?} is no row start");
-            assert!(at.at + at.off <= x, "byte {x}: {at:?}");
+            assert_eq!(at, down[k], "byte {x} is in the row at byte {}", shown[k].0);
+            let row = got!(w.page(at, 1)).0.remove(0);
+            assert_eq!(row.cut.text(), shown[k].2, "byte {x}");
         }
         // The end of the file, found from its end alone, is the last of them.
         let end = got!(w.end(1, false));
@@ -1406,4 +1650,329 @@ fn loading_1_is_ready_at_the_first_rows_and_shoots_what_is_on_its_way() {
         drv.until(&mut local, 60, |w| w.ready());
         assert!(has_rows(&local));
     });
+}
+
+// ---------------------------------------------------------------------------------------------
+// Review round 1.
+
+/// A point-unit wheel event `dx` points sideways.
+fn swipe(dx: f32) -> Event {
+    Event::MouseWheel {
+        unit: egui::MouseWheelUnit::Point,
+        delta: egui::Vec2::new(dx, 0.0),
+        phase: egui::TouchPhase::Move,
+        source: egui::MouseWheelSource::Unknown,
+        modifiers: Modifiers::NONE,
+    }
+}
+
+/// A slow sideways swipe moves an unwrapped line (06 §7.2): each frame's wheel event is less
+/// than a column, and the parts add up across frames — in both directions — instead of each
+/// being dropped.
+#[test]
+fn a_slow_sideways_swipe_moves_an_unwrapped_line_and_keeps_its_remainder() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut body: Vec<u8> = (0..400u64).flat_map(|i| word(i).into_bytes()).collect();
+    body.push(b'\n');
+    let mut win = twin(tmp.path(), "long.txt", &body);
+    let mut drv = Driver::new(800.0, 500.0);
+    drv.until(&mut win, 60, |w| w.ready());
+    drv.key(&mut win, Key::W, Modifiers::NONE);
+    drv.until(&mut win, 60, |w| w.ready());
+    let cw = drv.ctx.fonts_mut(|f| f.glyph_width(&chrome::font(), '0'));
+    drv.move_to(&mut win, Pos2::new(300.0, 200.0));
+    // A quarter of a column a frame (the content follows the fingers: a negative delta moves
+    // on into the line).
+    for frame in 1..=10u64 {
+        drv.frame(&mut win, vec![swipe(-0.25 * cw)], Modifiers::NONE);
+        assert_eq!(win.left, frame / 4, "after {frame} quarter columns");
+    }
+    // Two and a half columns so far: the half is kept, and two more quarters make the third.
+    drv.frame(&mut win, vec![swipe(-0.25 * cw)], Modifiers::NONE);
+    assert_eq!(win.left, 2);
+    drv.frame(&mut win, vec![swipe(-0.25 * cw)], Modifiers::NONE);
+    assert_eq!(win.left, 3);
+    drv.idle(&mut win, 2);
+    assert!(
+        rows(&win)[0].starts_with(&word(0)[3..]),
+        "{:?}",
+        rows(&win)[0]
+    );
+    // And back, as slowly.
+    for frame in 1..=12u64 {
+        drv.frame(&mut win, vec![swipe(0.25 * cw)], Modifiers::NONE);
+        assert_eq!(win.left, 3 - frame / 4, "back {frame} quarter columns");
+    }
+    drv.idle(&mut win, 2);
+    assert!(rows(&win)[0].starts_with(&word(0)));
+}
+
+/// The text the last pass painted whole — inside its clip — that ends with `tail`.
+fn painted_whole_ending(drv: &Driver, tail: &str) -> Option<String> {
+    drv.texts()
+        .into_iter()
+        .find(|(rect, clip, t)| t.ends_with(tail) && rect.right() <= clip.right() + 0.5)
+        .map(|(_, _, t)| t)
+}
+
+/// Unwrapped, End puts the end of a long line on screen whatever its last characters are
+/// (06 §7.2): tabs, which paint as several columns each, and characters of several bytes. A
+/// second End is then the end of the file. Read in place and through a Source.
+#[test]
+fn unwrapped_end_shows_the_end_of_a_line_of_tabs_and_wide_characters() {
+    bounded("unwrapped End", || {
+        let long = "word ".repeat(3_000);
+        let tabs = format!("{long}{}LAST", "\ta".repeat(60));
+        let wide = format!("{long}{}끝", "한글 ".repeat(80));
+        for (what, line, tail) in [("tabs", &tabs, "LAST"), ("wide", &wide, "끝")] {
+            let body = format!("{line}\nthe line after\n");
+            for stream in [false, true] {
+                let at = format!("{what}, stream {stream}");
+                let tmp = tempfile::tempdir().unwrap();
+                let mut net = net(body.as_bytes(), gate());
+                let mut drv = Driver::new(800.0, 500.0);
+                let mut win = if stream {
+                    let mut win = net.window("long.txt");
+                    run(&mut drv, &mut win, &mut net, "the index", |w, _| {
+                        w.doc.whole() && w.ready()
+                    });
+                    win
+                } else {
+                    twin(tmp.path(), "long.txt", body.as_bytes())
+                };
+                drv.until(&mut win, 60, |w| w.ready());
+                drv.key(&mut win, Key::W, Modifiers::NONE);
+                quiesce(&mut drv, &mut win, &mut net, 200);
+                assert!(rows(&win)[0].starts_with("word word"), "{at}");
+                drv.key(&mut win, Key::End, Modifiers::NONE);
+                quiesce(&mut drv, &mut win, &mut net, 200);
+                drv.idle(&mut win, 1);
+                assert!(
+                    painted_whole_ending(&drv, tail).is_some(),
+                    "{at}: the line's end is not on screen: {:?}",
+                    rows(&win)[0]
+                );
+                assert_eq!(win.line, Some(0), "{at}: still that line");
+                assert_eq!(rows(&win).len(), 2, "{at}");
+                // Already at its end: the end of the file.
+                drv.key(&mut win, Key::End, Modifiers::NONE);
+                quiesce(&mut drv, &mut win, &mut net, 200);
+                assert_eq!(
+                    rows(&win).last().map(String::as_str),
+                    Some("the line after"),
+                    "{at}"
+                );
+            }
+        }
+    });
+}
+
+/// A row that would hold only the `\r` before a line's end is no row, whichever way it is
+/// reached: a line of 16,383 letters, a space, then `\r\n` has its restart point on the `\r`.
+/// Down, up, the line's last row and a jump to the terminator agree on the same rows, wrapped;
+/// not wrapped, the line is one row without the `\r`.
+#[test]
+fn a_cr_alone_past_a_restart_point_is_no_row_from_any_side() {
+    let tmp = tempfile::tempdir().unwrap();
+    let restart = wrap::RESTART as usize;
+    // Enough before it that the line after it starts at a mark: the index then names the
+    // line's end without having read its last byte.
+    let mut body = String::new();
+    // (2,559 lines: the line after the long one is line 2,560, where a mark falls.)
+    for i in 0..2_559 {
+        body.push_str(&format!("short line {i:05}\r\n"));
+    }
+    let start = body.len();
+    body.push_str(&"x".repeat(restart - 1));
+    body.push_str(" \r\n");
+    let cr = (start + restart) as u64;
+    body.push_str("the line after\r\nand the last\r\n");
+    let mut win = twin(tmp.path(), "cr.txt", body.as_bytes());
+    let mut drv = Driver::new(800.0, 500.0);
+    drv.until(&mut win, 60, |w| w.ready());
+    let plain = chrome::Palette::of(&drv.ctx.global_style().visuals).text;
+    let font = chrome::font();
+    let cell = drv.ctx.fonts_mut(|f| f.glyph_width(&font, '0'));
+    let room = win.room;
+    let mut memo = wrap::Memo::default();
+    memo.reset(room);
+    let mut w = wrap::Wrapper {
+        doc: &mut win.doc,
+        memo: &mut memo,
+        m: wrap::Measure::new(&drv.ctx, font, plain),
+        width: room,
+        read: wrap::read_cap(room, cell),
+    };
+    let line = w.line(2_559).unwrap();
+    assert_eq!(line.start, start as u64);
+    assert!(
+        line.cr,
+        "the index did not leave the line's last byte unread"
+    );
+    let (mut down, mut p) = (Vec::new(), wrap::Pos::of(&line));
+    let mut blank = Vec::new();
+    loop {
+        let row = w.page(p, 1).unwrap().0.remove(0);
+        if row.cut.shown.is_empty() {
+            blank.push(p);
+        }
+        down.push(p);
+        match w.next(p).unwrap() {
+            Some(q) => p = q,
+            None => break,
+        }
+    }
+    assert_eq!(blank, [], "a blank row going down");
+    let mut up = vec![p];
+    while let Some(q) = w.prev(p).unwrap() {
+        if q.at < line.start {
+            break;
+        }
+        up.push(q);
+        p = q;
+    }
+    up.reverse();
+    assert_eq!(up, down, "the same rows going back up");
+    let of_line: Vec<wrap::Pos> = down
+        .iter()
+        .copied()
+        .filter(|p| p.at == line.start)
+        .collect();
+    let last = *of_line.last().unwrap();
+    assert_eq!(w.last_of(line).unwrap(), last, "the line's last row");
+    for at in [cr - 1, cr, cr + 1] {
+        assert_eq!(w.at_byte(at).unwrap(), last, "a jump to byte {at}");
+    }
+    assert_eq!(
+        w.snap(wrap::Pos {
+            off: restart as u64,
+            ..last
+        })
+        .unwrap(),
+        last
+    );
+    // Not wrapped: the line is one row, the next line follows it, and no `\r` is painted —
+    // from its start and from its end.
+    drv.key(&mut win, Key::W, Modifiers::NONE);
+    win.jump_to(Jump::Byte(cr - 5));
+    drv.idle(&mut win, 3);
+    for at_end in [false, true] {
+        if at_end {
+            win.left = cr - start as u64 - 10;
+            drv.idle(&mut win, 2);
+        }
+        let shown = rows(&win);
+        let k = shown
+            .iter()
+            .position(|r| r.starts_with("xxxx"))
+            .unwrap_or_else(|| panic!("the long line is not on the page: {shown:?}"));
+        // (From byte 16,374 the row is the line's last ten bytes, and shorter lines show
+        // nothing.)
+        let (row, after) = if at_end {
+            ("xxxxxxxxx ", "")
+        } else {
+            (shown[k].as_str(), "the line after")
+        };
+        assert_eq!(shown[k], row);
+        assert_eq!(shown[k + 1], after);
+        assert!(shown.iter().all(|r| !r.contains('♪')), "{shown:?}");
+    }
+}
+
+/// A jump is one ask also when its line starts right at the place and runs on (06 §7.2): a
+/// newline on a block boundary past the lines known, then a line longer than the jump's
+/// blocks reach. The line's first piece is placed from the bytes the jump asked for — two
+/// blocks here — and nothing more is asked for before its page is up.
+#[test]
+fn a_jump_to_the_start_of_a_long_line_is_still_one_ask() {
+    bounded("a jump, a long line from the place", || {
+        let size = 1u64 << 30;
+        let g = 512u64 << 20;
+        let long = 300_000u64;
+        let text: Text = Arc::new(move |off, len| {
+            (off..off + len as u64)
+                .map(|o| {
+                    if o == g {
+                        b'\n'
+                    } else if o > g && o <= g + long {
+                        word((o - g - 1) / 16).as_bytes()[((o - g - 1) % 16) as usize]
+                    } else if o % LINE == LINE - 1 {
+                        b'\n'
+                    } else {
+                        b'.'
+                    }
+                })
+                .collect()
+        });
+        let mut net = written(size, text);
+        let (mut win, mut drv) = opened(&mut net, "big.log");
+        let before = fetched(&net);
+        let sent = net.reads().len();
+        go_to(&mut drv, &mut win, &format!("0x{:X}", g + 2));
+        net.out();
+        let asked = [(g - BLOCK, BLOCK as u32), (g, BLOCK as u32)];
+        assert_eq!(net.reads()[sent..], asked, "the jump's one ask");
+        run(&mut drv, &mut win, &mut net, "the page", |w, _| {
+            w.ready() && rows(w).first().is_some_and(|r| r.starts_with(&word(0)))
+        });
+        net.out();
+        assert_eq!(
+            net.reads()[sent..],
+            asked,
+            "asked again before the page was up"
+        );
+        let after = fetched(&net);
+        assert_eq!(after.demand - before.demand, 2 * BLOCK, "{after:?}");
+        assert_eq!(after.prefetch, before.prefetch, "{after:?}");
+        let x = text_x(&drv, &rows(&win)[0][..31]);
+        assert!(
+            gutter(&drv, x).contains(&format!("0x{:X}", g + 1)),
+            "{:?}",
+            gutter(&drv, x)
+        );
+    });
+}
+
+/// The index's allocation is bounded, not only its length (06 §7.2): room is never made for
+/// more marks than the bound, thinning compacts the marks where they are — the same
+/// allocation before and after, no second one beside it — and the room does not grow back
+/// past the bound afterwards.
+#[test]
+fn thinning_compacts_the_index_in_place_within_its_bound() {
+    // (Not a power of two: room that doubles would pass it.)
+    let limit = 1_000;
+    let size = 1u64 << 30;
+    let mut scan = Scan { limit, ..scan() };
+    let line = *b"\n";
+    let mut events = 0;
+    while events < 3 {
+        let (thinned, room, at) = (scan.thinned, scan.marks.capacity(), scan.marks.as_ptr());
+        let full = scan.marks.len() == limit;
+        scan.feed(&line, size);
+        assert!(scan.marks.capacity() <= limit, "{}", scan.marks.capacity());
+        if scan.thinned > thinned {
+            events += 1;
+            assert!(full, "thinned before it was full");
+            assert_eq!(room, limit, "full, in an allocation of the bound");
+            // As thinning left them, before the mark that set it off was added: where they
+            // were, with the room they had.
+            assert_eq!(
+                scan.after_thin,
+                (at as usize, room),
+                "thinning moved the marks, or made another allocation"
+            );
+            assert_eq!(
+                scan.marks.capacity(),
+                room,
+                "thinning made another allocation"
+            );
+            assert_eq!(scan.marks.as_ptr(), at, "thinning moved the marks");
+            assert!(scan.marks.len() <= limit / 2 + 2, "{}", scan.marks.len());
+        }
+    }
+    assert_eq!(scan.peak, limit);
+    // Emptied (the pass hands its marks to the document): no allocation is left behind.
+    let taken = std::mem::take(&mut scan.marks);
+    assert_eq!(scan.marks.capacity(), 0);
+    assert!(taken.capacity() <= limit);
 }

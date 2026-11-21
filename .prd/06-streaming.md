@@ -685,10 +685,12 @@ the page and drop the queued keys.
   - It looks at most **64 KiB back** (`SPAN`) from that grid point. That bounds the read, not the
     line: SPAN only says where marks fall, and a line can be any length. A line whose start is not
     found within those 64 KiB has an **unknown start**.
-    - A line whose start is found is laid out from its start as one piece up to the first grid
-      point 64 KiB or more past it. What is left of a longer line follows in pieces that begin
-      on the grid, as an unknown start's do. So the rows are the same going down and going back
-      up, and from any byte of the first piece the start is found again.
+    - A line whose start is found is laid out from its start as one piece up to 64 KiB past
+      the grid point at or before that start. What is left of a longer line follows in pieces
+      that begin on the grid, as an unknown start's do. So the rows are the same going down
+      and going back up, from any byte of the first piece the start is found again, and the
+      piece lies inside the blocks the jump asked for: placing the line is never a second ask
+      (found in review: a piece that ran a grid cell further was).
     - A piece is cut at the start of the character a grid point falls in.
   - **A line is never read or laid out whole.** A row reads at most 16 bytes per column plus 256,
     and wrapping restarts every 16 KiB. A jump into a 1 GiB line with no newline read at most
@@ -705,6 +707,10 @@ the page and drop the queued keys.
       and the row is read under the same row bound around it. So a long line can be scrolled to
       any byte. Home is the line's start, and the file's start when already there; End is the
       line's end at the right edge, and the file's end when the line already ends on screen.
+      The line's end is placed by what its last characters paint as — a tab as its columns,
+      a character of several bytes as one — not by counting bytes. A jump (End of file, Go
+      to, the scroll bar) lands on its line from the line's start. The wheel sideways keeps
+      what is less than a byte for the next frame, as it does for rows.
       - Past the prefix a line longer than its first piece shows its next pieces as rows of
         their own, each from its grid point. Inside the prefix, and in a local file, a line is
         one row whatever its length.
@@ -746,6 +752,12 @@ the page and drop the queued keys.
       reading the file again. So a mark is dropped only when every line start up to the next
       mark stays within 64 KiB of the mark before. That keeps at most three marks per 64 KiB
       (two line marks and the one that ends a long line) where the old text counted one.
+  - **The bound is of what is allocated, not of what is used.** Room for marks is made by the
+    index itself, doubling up to 1 Mi marks and stopping there exactly, and thinning compacts
+    the marks where they are: no second set is allocated beside the first. (Past 1 Mi marks —
+    only where no mark can be dropped any more — room grows a sixteenth at a time.) What the
+    allocator does while it makes that room larger is its own: a move then holds the old room
+    and the new for a moment.
   - **One copy.** The document holds the marks, and the pass adds to them in place. The
     highlighter's copy is of the first 16 MiB only. A local file's re-read builds the new index
     beside the old one until it is swapped in.
