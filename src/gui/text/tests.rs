@@ -359,6 +359,160 @@ fn a_line_cut_for_display_stops_highlighting_there() {
     assert_eq!(drv.colors_of("fn after399() {}"), Some(vec![plain]));
 }
 
+/// The most word characters (letters, digits, `_`) in a row in `text`.
+fn longest_word_run(text: &str) -> usize {
+    text.split(|c: char| !(c.is_alphanumeric() || c == '_'))
+        .map(|w| w.chars().count())
+        .max()
+        .unwrap_or(0)
+}
+
+/// A highlighter for files named `*.ext`, and the longest word run its parser was handed.
+fn counting_highlighter(ext: &str) -> (Highlight, Arc<AtomicUsize>) {
+    let syntax = syntaxes().find_syntax_by_extension(ext).unwrap();
+    let mut hl = Highlight::new(syntax, Color32::WHITE, u64::MAX).unwrap();
+    let longest = Arc::new(AtomicUsize::new(0));
+    let seen = longest.clone();
+    hl.hook = Some(Arc::new(move |text: &str| {
+        seen.fetch_max(longest_word_run(text), Ordering::Relaxed);
+    }));
+    (hl, longest)
+}
+
+/// A run of word characters costs the grammars' patterns the square of its length (on a pattern
+/// fancy-regex runs itself, a search tries every start in the run and each try runs to its end):
+/// a comment of 1,000 `x`s took Rust's 20 ms, 1,400 or more hit fancy-regex's backtrack limit.
+/// However long a file's runs are, the parser is handed none longer than [`RUN_MAX`].
+#[test]
+fn the_parser_is_never_handed_a_long_word_run() {
+    let tmp = tempfile::tempdir().unwrap();
+    let run = "x".repeat(300);
+    let hex = "f".repeat(300);
+    let body = format!(
+        "fn a() {{}}\nlet v = 1; // {run}\nlet s = \"{run}\";\n{run}::new(0x{hex}u64);\nfn b() {{}}\n"
+    );
+    let path = write(tmp.path(), "runs.rs", body.as_bytes());
+    let mut doc = TextDoc::open(&path).unwrap();
+    let (mut hl, longest) = counting_highlighter("rs");
+    let runs = hl.page(&mut doc, 0, 5, &|| false).unwrap().unwrap();
+    assert_eq!(runs.len(), 5);
+    let longest = longest.load(Ordering::Relaxed);
+    assert!(
+        longest <= RUN_MAX,
+        "the parser was handed a run of {longest} word characters"
+    );
+}
+
+/// Each character of `lines` and its colour, the lines parsed whole, in order, from the top.
+fn whole_line_colours(ext: &str, lines: &[String]) -> Vec<Vec<(char, Color32)>> {
+    let syntax = syntaxes().find_syntax_by_extension(ext).unwrap();
+    let highlighter = Highlighter::new(chrome::syntax_theme());
+    let mut parse = ParseState::new(syntax);
+    let mut colour = HighlightState::new(&highlighter, ScopeStack::new());
+    lines
+        .iter()
+        .map(|line| {
+            let ops = parse.parse_line(line, syntaxes()).unwrap();
+            HighlightIterator::new(&mut colour, &ops, line, &highlighter)
+                .flat_map(|(style, text)| {
+                    let c = style.foreground;
+                    let c = Color32::from_rgb(c.r, c.g, c.b);
+                    text.chars().map(move |ch| (ch, c))
+                })
+                .collect()
+        })
+        .collect()
+}
+
+/// A shortened run is coloured as the whole one: every character of every line — the run, what
+/// follows it on its line, the lines after it — has the colour the line parsed whole gives it.
+/// Runs 200 long: past [`RUN_MAX`], and far from the backtrack limit, so parsing them whole is
+/// exact. A prefix and suffix on a run (`0x…u64`, `…_t`, `t_t…_t`), capitals with a small
+/// letter in the middle, letters of two bytes, two runs on a line, and strings, a raw string and
+/// a heredoc (whose delimiter is a long run) open across lines.
+#[test]
+fn a_line_with_long_word_runs_has_the_colours_of_the_whole_line() {
+    let x = "x".repeat(200);
+    let y = "y".repeat(200);
+    let cases: [(&str, Vec<String>); 5] = [
+        (
+            "rs",
+            vec![
+                format!("let v = 1; // {x}"),
+                format!("let s = \"{x}\";"),
+                format!("{x}::new(0x{}u64);", "f".repeat(200)),
+                format!("let k = {}a{};", "A".repeat(100), "A".repeat(100)),
+                format!("let k = {};", "A".repeat(201)),
+                format!("type {x}_t = u8;"),
+                // A suffix made of characters the run already had: only its tail keeps it.
+                format!("let t = {}t;", "t_".repeat(100)),
+                format!("let e = \"{}\"; // {y}", "é".repeat(200)),
+                format!("let r = r#\"{x}"),
+                "\"#; fn f() { let a = \"b\"; }".to_string(),
+            ],
+        ),
+        (
+            "js",
+            vec![
+                format!("{x}.prototype.f = function() {{}};"),
+                format!("let t = `{x}"),
+                "`; let u = 'v';".to_string(),
+            ],
+        ),
+        (
+            "py",
+            vec![
+                format!("s = '''{x}"),
+                "''' ; def f(a): pass".to_string(),
+                format!("{x}(1)  # {y}"),
+            ],
+        ),
+        (
+            "sh",
+            vec![
+                format!("cat <<{}", "E".repeat(200)),
+                format!("body {y} \"quote"),
+                "E".repeat(200),
+                "echo \"$HOME\" # done".to_string(),
+            ],
+        ),
+        (
+            "md",
+            vec![format!("Some **{x}** text `{y}`"), format!("{x}@{y}.com")],
+        ),
+    ];
+    let tmp = tempfile::tempdir().unwrap();
+    for (ext, lines) in cases {
+        let body: String = lines.iter().map(|l| format!("{l}\n")).collect();
+        let path = write(tmp.path(), &format!("runs.{ext}"), body.as_bytes());
+        let mut doc = TextDoc::open(&path).unwrap();
+        let (mut hl, longest) = counting_highlighter(ext);
+        let runs = hl
+            .page(&mut doc, 0, lines.len(), &|| false)
+            .unwrap()
+            .unwrap();
+        assert!(
+            longest.load(Ordering::Relaxed) <= RUN_MAX,
+            "{ext}: shortened"
+        );
+        let whole = whole_line_colours(ext, &lines);
+        for (i, (got, want)) in runs.iter().zip(&whole).enumerate() {
+            let got: Vec<(char, Color32)> = got
+                .iter()
+                .flat_map(|(c, text)| text.chars().map(move |ch| (ch, *c)))
+                .collect();
+            if let Some(at) = (0..got.len().max(want.len())).find(|&k| got.get(k) != want.get(k)) {
+                panic!(
+                    "{ext} line {i}, character {at}: {:?}, parsed whole {:?}",
+                    got.get(at),
+                    want.get(at)
+                );
+            }
+        }
+        assert_eq!(runs.len(), whole.len());
+    }
+}
+
 /// T3: the file changes under the viewer (it reads it live, a page at a time): grown,
 /// truncated, rewritten in place — any difference is a change (grown or rewritten no shorter:
 /// `Grown`, re-read soon; truncated: `Changed`). Reads never panic.

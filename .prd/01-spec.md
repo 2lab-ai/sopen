@@ -331,7 +331,13 @@ too, where F3 closes it as ⌘W does.
   highlighting is busy in other viewers. A worker that fails (a read error, a panic) leaves the
   page plain, ready, with the reason on the status row. A line is parsed only whole, so
   highlighting stops at the first line over 4096 bytes (the status row says which) and the rest
-  is plain — wrapped, still whole; files over 16 MiB are shown plain. The file is read live, the index is of the file as
+  is plain — wrapped, still whole; files over 16 MiB are shown plain. A run of more than 128
+  letters, digits and underscores (a hex blob, a long name) reaches the parser
+  shortened — its first and last 32 characters and, between them, each other character it holds,
+  once, in order, up to 64 — and is coloured as the whole run, the line around it and the lines
+  after it as they are: a grammar's patterns cost the square of such a run's length (parsed
+  whole, a Rust line with a comment of 1,000 `x`s costs 20 ms, 1,000 bytes of ordinary code 1.5 ms).
+  The file is read live, the index is of the file as
   scanned, checked when the viewer opens and before each page against the open handle and the
   path it was opened by. Both still showing the indexed device, inode, size and modification
   time: unchanged. Both still showing the indexed device and inode, the scan having read every
