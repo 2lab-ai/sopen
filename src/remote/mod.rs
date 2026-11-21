@@ -5,9 +5,16 @@
 
 mod local;
 pub mod ops;
+mod ranged;
 mod sftp;
 
 pub use local::LocalFs;
+#[cfg(test)]
+pub(crate) use ranged::{
+    fake, pattern, pattern_byte, read_to_over, Change, Clock, FakeControl, FakeFile, Fault, Link,
+    SentRecord, PIPE_REQUEST, STAT_REPLY,
+};
+pub use ranged::{Asked, Completion, Ranged, Refused, Reply, Ticket, Wake};
 pub use sftp::{connection_args, SftpRemote};
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -354,8 +361,20 @@ impl<W: Write> Write for Hashing<W> {
     }
 }
 
+/// A [`RemoteFs`] as the boxed connection every caller holds. Implemented for every `RemoteFs`
+/// (there is nothing to write): it lets a provided method hand its own connection back.
+pub trait IntoBoxed {
+    fn into_boxed(self: Box<Self>) -> Box<dyn RemoteFs + Send>;
+}
+
+impl<T: RemoteFs + Send + 'static> IntoBoxed for T {
+    fn into_boxed(self: Box<Self>) -> Box<dyn RemoteFs + Send> {
+        self
+    }
+}
+
 /// File operations on one host. Paths are absolute (or home-relative for SFTP) unix paths.
-pub trait RemoteFs {
+pub trait RemoteFs: IntoBoxed {
     /// `stat` following symlinks; `Ok(None)` when the path does not exist.
     fn stat_opt(&mut self, path: &str) -> Result<Option<Stat>>;
     /// `lstat`: like [`RemoteFs::stat_opt`] but a final symlink is reported as itself.
@@ -416,6 +435,17 @@ pub trait RemoteFs {
     /// Largest target whose content is re-read and hashed before a replace (tests lower it).
     fn hash_check_limit(&self) -> u64 {
         HASH_CHECK_MAX
+    }
+
+    /// The connection becomes the byte transport of `path` (06 §2): the file is opened on it
+    /// once, its handle `fstat`ed, and its reads and status requests go out on this one session.
+    /// A failure gives the connection back unchanged in [`Refused`]. Only SFTP streams (a local
+    /// file is read in place, 06 §1); the default says so.
+    fn into_ranged(self: Box<Self>, path: &str) -> std::result::Result<Box<dyn Ranged>, Refused> {
+        Err(Refused {
+            conn: self.into_boxed(),
+            error: anyhow!("{path}: this connection does not stream"),
+        })
     }
 
     fn stat(&mut self, path: &str) -> Result<Stat> {
