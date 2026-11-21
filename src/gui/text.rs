@@ -3033,6 +3033,13 @@ impl TextWindow {
         // highlighter below starts on the new index).
         self.poll_reindex();
         self.poll_stream(&ctx);
+        if self.input && self.stream_down() {
+            // A key, a click or a scroll retries a failed stream (06 §5) — also one whose page
+            // is cached, which reads without asking. At most one attempt a second is made.
+            if let Some(source) = self.doc.source() {
+                source.retry();
+            }
+        }
         let outer = ui.max_rect();
         let p = chrome::Palette::of(ui.visuals());
         // The window: its frame, titled as PC Shell's (single-lined in a preview: it does not

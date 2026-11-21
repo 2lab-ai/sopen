@@ -1038,7 +1038,28 @@ fn highlighting_comes_back_after_the_stream_failed_under_the_worker() {
             });
             drv.idle(&mut win, 2);
             assert_eq!(rows(&win), shown, "the screen stays");
-            assert!(says(&drv, "the connection closed"), "{:?}", painted(&drv));
+            // The status row has the Source's reason as it is now. Which one is a race the
+            // worker's thread decides: its blocked read asked for a retry, and a reconnect
+            // already refused replaces the lost channel's own words.
+            let failed = |net: &Net| match net.source.state() {
+                Streamed::Failed(reason) => reason,
+                other => panic!("{other:?}"),
+            };
+            let reason = failed(&net);
+            assert!(
+                reason.contains("the connection closed") || reason.contains("Connection refused"),
+                "{reason}"
+            );
+            assert!(says(&drv, &reason), "{:?}", painted(&drv));
+            // A key while the line is still down: it retries — its page is cached, so no read
+            // of its own asks — and the refusal is the reason shown.
+            net.advance(Duration::from_secs(2));
+            drv.key(&mut win, Key::ArrowUp, Modifiers::NONE);
+            run(&mut drv, &mut win, &mut net, "the refusal", |_, d| {
+                says(d, "Connection refused")
+            });
+            assert!(failed(&net).contains("Connection refused"));
+            assert!(win.worker.is_none());
             // The line is back; the next key retries.
             *net.down.lock().unwrap() = None;
             net.advance(Duration::from_secs(2));
@@ -1056,7 +1077,9 @@ fn highlighting_comes_back_after_the_stream_failed_under_the_worker() {
             local_drv.until(&mut local, 60, |w| w.ready());
             local_drv.key(&mut local, Key::End, command(false));
             local_drv.key(&mut local, Key::ArrowUp, Modifiers::NONE);
+            local_drv.key(&mut local, Key::ArrowUp, Modifiers::NONE);
             local_drv.until(&mut local, 60, |w| w.ready());
+            assert_eq!(net.source.state(), Streamed::Live);
             assert_eq!(rows(&win), rows(&local));
             assert_eq!(colors(&win), colors(&local), "highlighted as today");
         },
