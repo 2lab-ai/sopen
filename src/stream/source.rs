@@ -1521,6 +1521,10 @@ impl Reader {
     /// `Err(Failed)` when it failed, `Err(Closed)` when it closed. A failed stream is asked to
     /// retry, as `try_read` asks, so the caller's next call may find it back.
     pub fn read_at(&mut self, off: u64, buf: &mut [u8], cancel: &AtomicBool) -> Result<usize> {
+        if buf.is_empty() {
+            // A read of nothing: the wait before it is over, as `try_read(off, 0)` ends it.
+            return self.look(off, 0, false).map(|_| 0);
+        }
         let mut done = 0;
         while done < buf.len() {
             if cancel.load(Ordering::SeqCst) {

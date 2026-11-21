@@ -2598,10 +2598,14 @@ fn a_reader_holds_blocks_only_for_its_one_wait() {
 #[test]
 fn an_empty_read_retires_the_wait_before_it() {
     let holding = |rig: &Rig| rig.source().core().pf.holding();
-    for case in ["at the end", "of no length"] {
+    let cancel = AtomicBool::new(false);
+    for case in ["at the end", "of no length", "into an empty buffer"] {
+        // Whether the read came back with nothing, and no error.
         let empty = |r: &mut Reader| match case {
-            "at the end" => r.try_read(MODEL, 100),
-            _ => r.try_read(9 * GIB, 0),
+            "at the end" => matches!(r.try_read(MODEL, 100), Poll::Ready(Ok(b)) if b.is_empty()),
+            "of no length" => matches!(r.try_read(9 * GIB, 0), Poll::Ready(Ok(b)) if b.is_empty()),
+            // The blocking read of workers and HTTP connections.
+            _ => r.read_at(9 * GIB, &mut [], &cancel) == Ok(0),
         };
         // Its blocks arrived, unread.
         let mut rig = rig(MODEL, sim(1, 1_000_000_000));
@@ -2609,10 +2613,7 @@ fn an_empty_read_retires_the_wait_before_it() {
         assert!(r.try_read(GIB, MAX_READ).is_pending());
         settle(&mut rig);
         assert_eq!(holding(&rig), 256);
-        assert!(
-            matches!(empty(&mut r), Poll::Ready(Ok(b)) if b.is_empty()),
-            "{case}"
-        );
+        assert!(empty(&mut r), "{case}");
         assert_eq!(holding(&rig), 0, "an empty read {case} let go of nothing");
         assert_eq!(r.waiting(), None);
         // Most of its demand unsent, on a slow link.
@@ -2622,10 +2623,7 @@ fn an_empty_read_retires_the_wait_before_it() {
         rig.engine.pump();
         let sent = read_offsets(&rig).len();
         assert!((1..16).contains(&sent), "the cap let a few go: {sent}");
-        assert!(
-            matches!(empty(&mut r), Poll::Ready(Ok(b)) if b.is_empty()),
-            "{case}"
-        );
+        assert!(empty(&mut r), "{case}");
         settle(&mut rig);
         assert_eq!(
             read_offsets(&rig).len(),
