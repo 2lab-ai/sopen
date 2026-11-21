@@ -1538,6 +1538,9 @@ pub fn orphans(fs: &Arc<dyn Fs>, cache: &Path, host: &str, path: &str) -> Result
         }
         let lock = match fs.lock(&dir.join(LOCK), false) {
             Ok(Some(held)) => Some(held),
+            // Taken: a live session's — or, for a moment, a copy of the descriptor in a child
+            // another thread is starting (from its fork until its exec). A caller that lists
+            // right after it dropped a journal lists again (§3 "Recovery").
             Ok(None) => continue,
             Err(e) if e.kind() == io::ErrorKind::NotFound => match fs.lock(&dir.join(LOCK), true) {
                 Ok(Some(held)) => Some(held),

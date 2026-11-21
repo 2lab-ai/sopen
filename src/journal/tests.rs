@@ -533,11 +533,17 @@ const LOCK_WAIT: Duration = Duration::from_secs(30);
 /// waits for them here. A lock still held after [`LOCK_WAIT`] was not such a copy: that fails,
 /// under its own name.
 fn free_lock(fs: &dyn Fs, path: &Path) -> io::Result<Held> {
+    free_lock_counting(fs, path, &AtomicUsize::new(0))
+}
+
+/// [`free_lock`], adding to `busy` each time the lock was found taken.
+fn free_lock_counting(fs: &dyn Fs, path: &Path, busy: &AtomicUsize) -> io::Result<Held> {
     let t0 = Instant::now();
     loop {
         if let Some(held) = fs.lock(path, false)? {
             return Ok(held);
         }
+        busy.fetch_add(1, Ordering::SeqCst);
         assert!(
             t0.elapsed() < LOCK_WAIT,
             "{}: still locked {LOCK_WAIT:?} after its holder was dropped",
@@ -548,11 +554,12 @@ fn free_lock(fs: &dyn Fs, path: &Path) -> io::Result<Held> {
 }
 
 /// The real disk as the next session finds it after the last one ended in this process: an
-/// existing lock is taken with [`free_lock`]. Only for listings where every lock is free.
-struct Settled(Arc<dyn Fs>);
+/// existing lock is taken with [`free_lock`]. Only for listings where every lock is free. The
+/// count is how often a lock was found taken.
+struct Settled(Arc<dyn Fs>, Arc<AtomicUsize>);
 
 fn settled_disk() -> Arc<dyn Fs> {
-    Arc::new(Settled(disk()))
+    Arc::new(Settled(disk(), Arc::default()))
 }
 
 impl Fs for Settled {
@@ -590,7 +597,7 @@ impl Fs for Settled {
         if create {
             return self.0.lock(path, true);
         }
-        free_lock(self.0.as_ref(), path).map(Some)
+        free_lock_counting(self.0.as_ref(), path, &self.1).map(Some)
     }
 }
 
@@ -1436,25 +1443,40 @@ fn a_kill_at_any_step_on_the_real_disk_recovers_a_whole_generation() {
     kills_on_the_real_disk(&settled_disk());
 }
 
-/// What made that test fail once in a full run, made to happen every time: the dropped session's
-/// lock is still held through another open file (as a starting child holds it) when the listing
-/// comes. The journal is offered once that copy is gone — it was never lost.
+/// Contention on the lock of a session that is gone: another open file still holds it when the
+/// listing comes, and lets go only once the listing has found it taken. The listing takes it
+/// then and offers the journal — it was never lost. (What made the test above fail once in a
+/// full run was such a holder: a child another test was starting, see [`free_lock`].)
 #[test]
-fn a_listing_after_a_kill_waits_out_a_copy_of_the_dead_sessions_lock() {
+fn a_listing_retries_a_lock_still_held_after_its_session_ended() {
     let tmp = tempfile::tempdir().unwrap();
     let cache = tmp.path();
     let mut j = Journal::create(disk(), cache, HOST, PATH, Kind::Image).unwrap();
     let acks = [Ack::Gen(j.publish(&image_snap(&[1])).unwrap().n)];
     let lock = j.dir().join(LOCK);
     drop(j);
-    let copy = free_lock(&Disk, &lock).unwrap();
+    let holder = free_lock(&Disk, &lock).unwrap();
     let gens: BTreeMap<u64, Snapshot> = [(1, image_snap(&[1]))].into();
-    let child = std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_millis(100));
-        drop(copy);
-    });
-    let found = recover(&settled_disk(), cache, &acks, &gens);
-    child.join().unwrap();
+    let busy = Arc::new(AtomicUsize::new(0));
+    let listed = Arc::new(AtomicBool::new(false));
+    let releasing = {
+        let (busy, listed) = (busy.clone(), listed.clone());
+        std::thread::spawn(move || {
+            // Until the listing met the held lock, or ended without meeting it.
+            while busy.load(Ordering::SeqCst) == 0 && !listed.load(Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            drop(holder);
+        })
+    };
+    let next: Arc<dyn Fs> = Arc::new(Settled(disk(), busy.clone()));
+    let found = recover(&next, cache, &acks, &gens);
+    listed.store(true, Ordering::SeqCst);
+    releasing.join().unwrap();
+    assert!(
+        busy.load(Ordering::SeqCst) > 0,
+        "the listing met the held lock"
+    );
     assert!(found.unwrap().is_some(), "gen-1 is offered");
 }
 

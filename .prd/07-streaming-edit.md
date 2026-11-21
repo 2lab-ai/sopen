@@ -127,7 +127,11 @@ The journal and §3.1's save reconciliation are **the workstream's reading** of 
 - **When it is kept.** On any other ending (a crash, a kill, a power loss). The lock is then free.
 
 **Recovery.** On open, sopen looks for `<abs path>.journal-*` directories of the same host and path
-whose lock it can take. Each one gets a row:
+whose lock it can take. A lock found taken is tried again for up to 500 ms before the journal counts
+as another live session's: the lock belongs to the open file, and a child that another thread is
+starting (ssh, ffmpeg) holds a copy of every open descriptor from its fork until its exec, so the
+lock of a journal this process has just let go can look taken for that moment. The viewers' open
+path does the retrying (ED4–ED6); `orphans` itself tries once. Each one gets a row:
 
 > unsaved edits from 2026-11-20 11:42 (4 bytes changed) kept at ~/…/model.bin.journal-… — [Restore] [Later] [Discard]
 
