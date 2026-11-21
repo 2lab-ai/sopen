@@ -483,17 +483,57 @@ large files.
 **W5a — reads through `Bytes`, first screen first.**
 
 - **Reads go through `Bytes`** (§5). A read that is not cached returns `Pending`, which travels up
-  the way today's `Stale` does: the page is not replaced, the frame asks again when the block
-  arrives, and nothing blocks a frame. The highlight worker reads through a `Reader` of its own on
-  the same Source, never a second `File`.
-- **The first screen from byte 0 comes first.** The view shows lines from the first block while the
-  index grows, and the background index pass starts only once that screen is up.
-- **The background pass**, a Bulk reader, indexes at most the first **16 MiB** (`HIGHLIGHT_MAX`). On
-  the rig that is 2–8 s.
+  the way today's `Stale` does, in an arm of its own. Measured (X3): with any latency the first
+  screen is the 4th pass, one round trip plus one frame after open, and no pass runs while the
+  viewer waits.
+  - **While Pending, the page on screen stays.** Where the keys asked to go is kept and applied when
+    the block arrives. Pending never takes the error path, which would blank the page and drop the
+    keys.
+  - **The status row describes the page on screen** and adds `loading…`; it never shows where the
+    keys asked to go. The window's `ready()` (the screenshot hook's test) is false while a page read
+    is Pending.
+  - **Before the first block,** the body shows one dim row, `loading…`, and the status row says
+    `loading…`. The viewer never says `empty` or `0 lines` for a file whose size is not 0. The top
+    bar shows the file's size from the Source, and `lines known to 65.5 KB of 7.8 MB` until the
+    index is whole.
+  - **The gutter is sized once.** The width does not change while the index grows. Without this the
+    text moved right twice and wrapped rows re-wrapped.
+    - A file read through a Source that fits the first block uses its line count. Any other file
+      read through a Source uses the digits of min(size, 16 MiB), at most 8, because its index can
+      never hold more lines than bytes.
+    - A local file uses its line count, however many digits that is. Its whole-file pass runs
+      before its first screen, as today, so the count is known when the gutter is sized.
+  - **A failed read leaves no bytes behind.** The read window is filled into a fresh buffer; a
+    Pending or failed read keeps the old window. Today's code resizes first, and showed zeros as
+    file bytes.
+  - **The syntax is picked by first line when the first block arrives,** in the pass that shows the
+    first screen, not at construction.
+  - **The highlight worker reads through a `Reader` of its own on the same Source, with the blocking
+    `read_at`,** never `try_read` and never a second `File`. Pending never reaches the worker: one
+    Pending stopped highlighting for good in X3.
+  - **Growing the index does not re-read the page** unless a line on screen got longer. In X3 each
+    1 MiB step re-wrapped an unchanged screen.
+- **The first screen from byte 0 comes first.** It needs the first 64 KiB block and nothing else:
+  one round trip when the reply is full (a short reply costs its remainder's round trip, §2). The
+  background index pass starts only once that screen is up. A line's last byte is not read to look
+  for a `\r` before the row that holds the line's end is on screen; that probe cost a second round
+  trip to the file's last block in X3.
+  - **The first screen is the rows the first block supplies.** `first` (§11) and the window's
+    `ready()` mean those rows are drawn.
+  - Wrapped, the one block fills the screen whatever the line lengths, because rows restart every
+    16 KiB.
+  - Unwrapped, a first line that runs past the block leaves the rows below it without a known
+    start. Each such row shows a dim `loading…` and fills in as the index pass reaches it.
+- **The background pass**, a Bulk reader, indexes at most the first **16 MiB** (`HIGHLIGHT_MAX`) of
+  a file read through a Source. On the rig that is 2–8 s.
   - It continues S1-B's preview pass, which stops at 4 MiB and resumes from there on hand-over (02
     §4.4).
   - A file of at most 16 MiB is then indexed whole. Line numbers, the line count and highlighting
     work as today.
+  - A local file keeps today's whole-file pass, which runs before its first screen. With a 16 MiB
+    index and no W5b, X3's viewer showed the first 16 MiB of a 1 GiB file as the whole file: End
+    went to byte 16,775,028 and the status row said `line 1 of 1`. So no file over 16 MiB is read
+    through a capped index before W5b.
 - **Highlighting runs over the indexed prefix as it grows.** A page whose lines all lie in the
   prefix is highlighted, with state carried from byte 0; a page past it shows plain until the prefix
   reaches it.
@@ -505,6 +545,21 @@ large files.
   keep `TextDoc::now`'s rules (01 §3a).
 - W5a alone never reaches users for remote text: W8, which routes remote text through a Source,
   waits for W5b (§13). Until W8, remote text is still fetched whole, as today.
+
+**W5a must fix (found in X3, 2026-11-21).** Five defects in today's text viewer, each answered by a
+rule above:
+
+1. **Zeros shown as file bytes.** `Window_::at` resizes its buffer before the read. A failed read
+   leaves the zero-filled buffer in the wrap memo, and the next read is served from it.
+2. **Highlighting dies for good.** A worker that reads with `try_read` hits Pending once and stops.
+3. **First-line syntax is lost.** `syntax_of` reads line 1 at construction and swallows the error.
+4. **False status before the first block:** `empty` in the status row and `0 lines · 0 B` in the
+   top bar.
+5. **The gutter moves the text** twice and re-wraps rows: the gutter width follows the line count
+   as the index grows.
+
+Seen in the code but not run: if Pending fell into `ensure_page`'s general error arm, it would blank
+the page and drop the queued keys.
 
 **W5b — large files by byte position.**
 
@@ -518,23 +573,43 @@ large files.
   prefix reaches it. `TextWindow`'s top, wrap's `Pos` and `Row` and its memos are keyed by byte
   offset.
   - The gutter shows line numbers inside the prefix. Past it, the gutter shows the line's byte
-    offset (`0x4B0000000`) in the skin's dim colour.
-  - The status row says `lines known to 3.1 MB of 24 GB`.
+    offset (`0x4B0000000`) in the skin's dim colour. W5a's width (at most 8 digits) covers line
+    numbers only; the width for byte offsets is W5b's to set.
+  - The top bar says `lines known to 3.1 MB of 24 GB`, where W5a put it.
 - **The scroll bar** is by bytes while the line count is unknown, and by lines once the whole file
   is indexed.
-- **A jump** (the scroll bar, End, Go to) reads the block at the target and looks back for the line
-  that holds it.
-  - It reads at most **64 KiB back** (`SPAN`). That bounds the read, not the line: SPAN only says
-    where marks fall, and a line can be any length. A line whose start is not found within those
-    64 KiB has an **unknown start**.
+- **A jump** (the scroll bar, End, Go to) reads around the target and looks back for the line that
+  holds it.
+  - **A jump asks once.** It asks for the 64 KiB before the 16 KiB grid point and the 64 KiB after
+    it in one read: at most 3 blocks, and one round trip when the replies are full. A short reply
+    costs its remainder's round trip (§2, §5); the block count does not change. Asked row by row,
+    half of X3's 200 jumps into a 1 GiB line took two round trips.
+    - End is the 2-block case. Its target is the end of the file, so it asks for the 64 KiB before
+      the grid point and the rest up to the end, with nothing after: at most 2 blocks, 128 KiB
+      (V12).
+  - It looks at most **64 KiB back** (`SPAN`) from that grid point. That bounds the read, not the
+    line: SPAN only says where marks fall, and a line can be any length. A line whose start is not
+    found within those 64 KiB has an **unknown start**.
+  - **A line is never read or laid out whole.** A row reads at most 16 bytes per column plus 256,
+    and wrapping restarts every 16 KiB. A jump into a 1 GiB line with no newline read at most
+    49,741 bytes and laid out at most 51,484 characters; the first screen read 16,577 bytes. Peak
+    memory stayed under 25 MiB plus the block cache.
   - **Wrapped** (the default since PR #14): the rows of a line with an unknown start begin on wrap's
     restart grid, at the absolute 16 KiB offset at or before the target. The status row says
     `line start not known`.
-  - **Unwrapped:** that line shows as one row from the same 16 KiB grid point, cut at 4 096 bytes
-    as any long line is. The gutter shows its byte offset with `…` before it.
-    - PgUp and ↑ move back one grid point (16 KiB) at a time, until a newline is found and the line
-      start becomes known.
-    - PgDn and ↓ move to the next line start after the target.
+  - **Unwrapped:** that line shows as one row from the same 16 KiB grid point, read under the row
+    bound above. The gutter shows its byte offset with `…` before it.
+    - **Unwrapped, a long line can be scrolled through.** Today the row is cut at 4,096 bytes and
+      nothing past that can be reached. The place within an unwrapped line is a byte offset in that
+      line. →, ←, Home, End-of-line and the horizontal scroll move that offset, and the row is read
+      under the same row bound around it. So a long line can be scrolled to any byte.
+    - **Up and down move by line starts, with one exception: the unknown-start grid step.** It is
+      the exception wrapped mode already has, and the offset within the line does not change it.
+      - ↑ and PgUp land on the previous line start when it is already known, or when it is found
+        within one ask (64 KiB back). Otherwise they step back one 16 KiB grid point, and the
+        gutter marks that row as an unknown line start (its byte offset with `…` before it).
+      - ↓ and PgDn work the same way forward: the next line start when it is known or found within
+        one ask, otherwise one 16 KiB grid point forward, marked the same way.
   - With a known start, PgUp reads the block before and splits it at newlines, and a partial first
     line is joined when its own block arrives.
 - **Go to: Cmd/Ctrl+G** opens a field in the status row, as in the hex window. It takes a line
@@ -962,7 +1037,7 @@ Left as whole fetches, with the fetch now pipelined (§2):
 | Disk for whole-file actions | as today: the interim hex Save's cache copy (§7.1), "Save to…"'s staging file |
 | SFTP channels | 1 per remote viewer; 2 from its first Save, Save copy or Export (§6) |
 | Bytes before a hex first screen | the blocks covering the screen and its margin: one 64 KiB block at offset 0 for any window under 1 300 rows, at most two elsewhere |
-| Bytes before a text first screen | the blocks covering the bytes its rows read and their margin: one block for a file of short lines at offset 0; unwrapped, at most 30 rows × 4 KiB + the margin; the background index pass comes after it |
+| Bytes before a text first screen | one 64 KiB block at offset 0, for any file read through a Source, wrapped or not: the first screen is the rows that block supplies (§7.2); after a jump, at most 3 blocks, in one round trip when the replies are full; the background index pass comes after it |
 | A demand's wait behind what was sent | `(cap + one block per other waiting reader) / rate`, cap ≤ 4 MiB (§4) |
 | The byte server | 32 connections, an 8 KiB request head, 5 s to send it, 60 s without progress (§9) |
 
@@ -1117,8 +1192,8 @@ stream <event> t=<ms> <host:/abs> fetched=<b> demand=<b> prefetch=<b> bulk=<b> d
 - **V12. Text, 4 GiB remote log** (lines under 200 bytes). Gates on the `Fake`:
   - at `first`, `fetched ≤ 64 KiB`, because the background pass has not started;
   - the background pass then reads at most the first 16 MiB (`bulk ≤ 16 MiB`);
-  - End adds at most 128 KiB of demand and prefetch, the gutter shows byte offsets, and the status
-    row says `lines known to …`;
+  - End adds at most 128 KiB of demand and prefetch, the gutter shows byte offsets, and the top
+    bar says `lines known to …`;
   - PgUp from there adds at most 64 KiB of demand per page;
   - Go to line 10 000 000 shows progress, and after Esc only what was in flight (≤ the cap) arrives;
   - the index stays within 16 MiB on a 4 GiB file of empty lines.
@@ -1126,6 +1201,18 @@ stream <event> t=<ms> <host:/abs> fetched=<b> demand=<b> prefetch=<b> bulk=<b> d
   Qualification: `first − open ≤ 1.0 s`, and End's `ready − input ≤ 1.0 s`.
 - **V13. Text, small file.** A remote file of at most 16 MiB shows its first screen before its index
   finishes. Once indexed, it has the line count and highlighting it has today.
+- **V13a. Text, the five X3 fixes** (§7.2). Gates on the `Fake`, with reads held Pending or failed:
+  - after a Pending read and after a failed read, the read window still holds the bytes it had, and
+    no row shows zeros the file does not contain;
+  - keys pressed while a page read is Pending are applied when the block arrives, and the page on
+    screen stays until then;
+  - a file whose syntax is known only from its first line gets that syntax in the pass that shows
+    the first screen, with the first block held Pending at construction;
+  - highlighting still completes after the highlight worker's read has waited on a Pending block;
+  - the gutter width at `first` equals the width once the index is whole, and no row re-wraps in
+    between;
+  - before the first block, the status row and the body say `loading…`, and neither `empty` nor
+    `0 lines` appears for a file whose size is not 0.
 - **V14. Image, partial picture.**
   - Gate (`Fake`): a 6000×4000 progressive JPEG (16.6 MB) shows its size and Exif thumbnail having
     fetched ≤ the bytes up to its SOF + one block; a whole-frame preview exists by 25 % fetched; Esc
@@ -1212,7 +1299,7 @@ that shows something on screen also brings a screenshot receipt someone looked a
 | W2 | **Stream core.** `Source`, `BlockCache` with its floors, `Prefetcher` with §4's admission, `Reader`, `Bytes`, validation and generations, polling, reload, the MaxSessions line; the counters and events of `SOPEN_STREAM_STATS`, and `SOPEN_STREAM_THROTTLE` (§11) | `src/stream/{mod,cache,prefetch,source}.rs`, `src/stream/tests.rs` (all new); `src/lib.rs` (`pub mod stream`) | W1 |
 | W3 | **Byte server.** §9 whole: token, the three reader-kind paths, head limits and deadlines, the Host rules, the range table, one request per connection, the 32-connection bound, shutdown, the cut account, the Linux peer check | `src/stream/http.rs`, `src/stream/http/tests.rs` (new) | W2 |
 | W4 | **Hex streams.** `Pages` over `Bytes`, Pending and Failed rows, the drag debounce, patches keeping their byte (fixes the hex bug, §7.1), the interim Save. Its first commit is a pure move of the write side (`Ident` … `HexFile::save_copy`) into `src/gui/hex/file.rs`. Adds `SOPEN_STATE`'s `loading=1` (§11) | `src/gui/hex.rs`, `src/gui/hex/file.rs` (new), `src/gui/hex/tests.rs`; `src/gui/mod.rs` (`State`'s `loading` field only) | W2; browser S1 merged |
-| W5a | **Text reads through `Bytes`.** Pending travels like `Stale`; the first screen first; the background pass capped at 16 MiB, continuing S1-B's 4 MiB preview pass; highlighting over the indexed prefix (§7.2) | `src/gui/text.rs`, `src/gui/text/tests.rs` | W2; S1 merged; X3 |
+| W5a | **Text reads through `Bytes`.** Pending travels like `Stale`, in an arm of its own; the first screen first, from one block; the background pass capped at 16 MiB for a file read through a Source, continuing S1-B's 4 MiB preview pass, while a local file keeps its whole-file pass; highlighting over the indexed prefix; the five defects X3 found (§7.2) | `src/gui/text.rs`, `src/gui/text/tests.rs` | W2; S1 merged (X3 is done: 2026-11-21, §7.2) |
 | W5b | **Large text files by byte position.** The prefix index, byte-offset keys in `TextWindow` and wrap, unknown line starts, Go to, the index memory bound (§7.2) | `src/gui/text.rs`, `src/gui/text/wrap.rs`, `src/gui/text/tests.rs` | W5a |
 | W6 | **Image streams.** Header walk with the SOF read directly, thumbnail, the memory line with Continue, the reserved buffer, the streamed read, partial pictures for the four measured formats (plain PNG included) | `src/gui/image.rs`, `src/gui/image/probe.rs` (new), `src/gui/image/robustness_tests.rs`; `Cargo.toml` and `Cargo.lock` (the direct `png` dependency) | W2; S1 merged; X4 |
 | W7 | **Media streams.** URL `Input`s with their own input options and reader kinds, the progressive waveform on a `bulk` connection, Export through the URL and its Cancel, runs failed on a cut response | `src/gui/media.rs`, `src/gui/media/*`, `src/gui/playback.rs`, `src/ffmpeg.rs`, `src/cut.rs` | W3; S1, PR #15 and S1-M merged; X1, X5 |
@@ -1325,3 +1412,24 @@ contract.
   says. W8 writes them there, in its own PR.
 - **02 §8**: one sentence, added by this docs PR at its rebase (loop.md): S2-E comes after the
   viewer units, or touches only the trait default (§13).
+
+## Tensions
+
+Open questions X3 (2026-11-21) raised and did not measure. Neither is decided here. W5b settles
+both, with the evidence named.
+
+- **A local file after W5b: whole-file pass or prefix index.**
+  - Reading A: a local file keeps today's whole-file index pass for good. §7.2's W5a text says it
+    keeps that pass, and says only that no file over 16 MiB is read through a capped index *before*
+    W5b.
+  - Reading B: from W5b on, a local file goes through the prefix index like a remote one. §7.2's
+    W5b text applies the index memory bound to local files too.
+  - Evidence W5b collects: whether a local file goes through the prefix index, shown by what the
+    index pass reads of a local file over 16 MiB.
+- **Highlighting past 16 MiB for a local file.**
+  - Reading A: a local file over 16 MiB is plain throughout, as today's rule (`HIGHLIGHT_MAX`) says
+    for the whole file.
+  - Reading B: it is highlighted over its first 16 MiB and plain past that, as §7.2 says for
+    "files over 16 MiB" without naming local or remote.
+  - Evidence W5b collects: what is highlighted past 16 MiB, and before it, in a local file over
+    16 MiB.

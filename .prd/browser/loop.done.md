@@ -1,0 +1,28 @@
+# browser — done (append-only)
+
+Loop: [`loop.md`](loop.md). Each round close appends one block at the bottom; nothing above it ever
+changes. Rows here are snapshots taken when they were moved.
+
+## R1 (part) — closed 2026-11-21
+
+- measured G-WRAP ✅ G-WAVE ✅ S1-0 ✅ S1-A ✅ S1-B ✅ S1-C ✅ S1-D ✅ · result: both gates and five of
+  S1's work units merged; S1-E (PR #29) is in review and S1-M waits on it · closed rows: G-WRAP,
+  G-WAVE, S1-0, S1-A, S1-B, S1-C, S1-D · PRs: #14, #15, #18, #20, #21, #22, #23
+
+### Closed rows
+
+| ID | Status | Branch | Scope | Owner files (02 §5) | After |
+|---|---|---|---|---|---|
+| G-WRAP | ✅ merged: PR #14 (dd7dce4), 2026-11-20 | — | the text-wrap branch (PR #14) merged: S1-B's text preview (and P1) builds on its wrap mode; message 13 arrives with it | — | — |
+| G-WAVE | ✅ merged: PR #15 (f1359ac), 2026-11-20 | — | PR #15 merged: it rewrites `media.rs`; S1-B touches `media.rs` only after it, and only for the `set_preview` default; S1-M follows it | — | — |
+| S1-0 | ✅ merged: PR #18 (d970a3f), 2026-11-20 | `feat/browser-s1-scaffold` | `mod` lines and stubs for S1's files; `Window::set_preview` on the trait (default: nothing); `Start` carries the ssh destination and the state dir; touches no viewer file | `src/lib.rs`, `src/main.rs`, `src/gui/mod.rs` (mod lines, the trait method), `src/gui/browser.rs` (`mod keys; ops; view; preview;`, `Start`), `src/remote/{mod,sftp,local}.rs` (mod lines), stubs | E3 |
+| S1-A | ✅ merged: PR #21 (221f58e), 2026-11-20 | `feat/browser-s1-keys` | the key table with every context's rows (04 §3, 03 §9, 05 §1), exact modifiers that consume their events, typed-text `+ - *`; Cmd/Ctrl+digit → F-key in the raw-input hook; clickable F-key row; F1 help; `mode=` and `bar=` state keys | `src/gui/browser/keys.rs`, `src/gui/mod.rs`, `src/gui/chrome.rs`, `src/gui/chrome/tests.rs`, `src/gui/help.rs` | S1-0 |
+| S1-B | ✅ merged: PR #22 (7470a8a), 2026-11-20 | `feat/browser-s1-preview-viewers` | `Window::set_preview`: inactive frame, no bars, disabled input, no audio, no following; the budgets of 02 §4.3; the preview read without claiming, the placeholder connection, the hard-link claim on hand-over, resuming work past the budget; the `.preview` cache root | `src/gui/{text,image,hex}.rs` and tests, `src/gui/media.rs` (after G-WAVE, the default only), `src/gui/browser/prepare.rs`, `src/cache.rs` | S1-0, G-WRAP |
+| S1-C | ✅ merged: PR #23 (ccd3ef3), 2026-11-21 | `feat/browser-s1-fileops` | rename, copy, move of files and folders, local and remote (`hardlink@` + `REMOVE` for files, a remote folder's move by copy, check and remove, chunked `copy-data`, staged temps, `Fs::symlink(target, link)`), never overwriting (04 §5) | `src/fileops/*.rs`, `src/remote/ops.rs`, `src/remote/{sftp,local}/ops.rs` | S1-0 |
+| S1-D | ✅ merged: PR #20 (3aca81d), 2026-11-20 | `feat/browser-s1-ops-ui` | selection (Space, Ins, `+ - *`, Cmd/Ctrl+A), the Copy/Move dialog, inline rename, name-in-the-way dialog, progress, the report (04 §4–§5); drawing helpers for the rename field and selection colours, called by S1-E's `panel_ui` | `src/gui/browser/ops.rs`, `src/gui/browser/panel.rs` | S1-0 |
+
+### Round section
+
+- Merge dates are GitHub's, in UTC. S1-A and S1-D merged before S1-B; S1-C merged last, on
+  2026-11-21.
+- E3 is not in this block: 02 §8.2 records no result for it, so its row stays in `loop.md`.
