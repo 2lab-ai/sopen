@@ -788,8 +788,10 @@ to every run on the file: the probe, playback, the paused frame, the waveform, S
         an invalid synchsafe byte, an unsupported tag version, junk before the first frame, and a
         file cut inside the frame.
       - X5 measured only mono 44.1 kHz files with small tags.
-- **ffmpeg's reconnect options stay off.** The server ends a connection only on an error the window
-  already shows from its Source, so a reconnect would only repeat it.
+- **ffmpeg's reconnect options stay off.** Every end the server makes is deliberate and counted: a
+  read error or a change the window already shows from its Source, or a `Busy` or `Stalled` end
+  of the server's own (§9). Each fails the run through the cut account. A reconnect would hide
+  that: it could continue silently on a stream in another state, or repeat the error.
 - **ffmpeg's exit status cannot be trusted for a cut-short input** (verified with ffmpeg 9.0.2,
   scratch). The server cut every response short at 300 kB. ffmpeg logged `Stream ends prematurely`
   and `partial file`, yet **exited 0**, and wrote a 3.2 s output from a 20 s source.
@@ -805,16 +807,97 @@ to every run on the file: the probe, playback, the paused frame, the waveform, S
   - it reads through its `bulk` URL, so it is a Bulk reader: it never evicts playback's blocks, and
     it yields to playback's demand (§4);
   - it runs only for audio-only files, as today.
-- **Many inputs at once.** A PR #15 render opens up to 24 inputs (`ffmpeg::MAX_INPUTS`), each one
-  `render` connection on the one in-order channel, sharing the 48 MiB of protected windows (§3).
-  - Each reader keeps a floor of 256 KiB ahead and 64 KiB behind, whatever the share. So 32 readers
-    need at most 10 MiB.
-  - How such a render behaves against the cap is unmeasured. X1 (loop.md) measures PR #15's real
-    `edit_args` and playback commands against a spike server with this block size, cache and cap
-    before W7.
-- **Export** reads only what the cut needs (*view* §2.3: 12 % of a 2-minute video for 10 s) and
-  publishes as today (01 §7: a render under `<cache>/.exports`, then a new sibling, never over
-  anything). Its progress is ffmpeg's time-based progress.
+- **Many inputs at once.** A PR #15 render opens up to 24 inputs (`ffmpeg::MAX_INPUTS`). An input is
+  not one connection: ffmpeg opens the file at byte 0, reads the index where it lies, and opens a
+  new connection at its seek.
+  - **Measured** (X1, 2026-11-21, ffmpeg 9.0.2, 600 s files on the local `sftp-server`): 2
+    connections per input for a faststart mp4, 3 for a wav, 4 for an mp4 with its `moov` at the
+    end, 1–2 for an mp3. A 24-input render made 32 connections (mp3), 46–47 (faststart mp4), 71
+    (wav) or 95 (`moov` at the end).
+  - **Seats.** All inputs seek within a few milliseconds, and the server sees that a connection
+    has gone only at its next look (§9). So a render holds up to two seats per input for a moment.
+    With 32 seats, 3 of 9 24-input mp4 renders had an input refused (`Busy`): ffmpeg exited 0 and
+    wrote 115 s, 115 s and 56 s of a 120 s edit. With 64 seats, 0 of 19, and up to 45 bodies were
+    under way at once. So the server has 64 seats (§9).
+  - **An input that waits is not stalled.** ffmpeg reads each input when its piece's turn comes,
+    and playback starts the next piece's decoder with the current one. Such a connection takes
+    nothing for as long as the pieces before it last. Measured with a 60 s no-progress rule on
+    every connection: a 2-input render at 2 MB/s lost its second input at 66 s, and ffmpeg exited
+    0 with 270 s of a 540 s edit; playing a 75 s piece lost the next piece's decoders at 65 s, and
+    the player reported no error. With the rule off, the same runs had no cut and the whole
+    output. So the 60 s rule does not run on the body of a `render` or `play` response (§9). The
+    head of every answer keeps it.
+  - **Every run has an owner that ends it (W7's rule).** With no 60 s rule on those bodies, a
+    client that neither reads nor closes keeps its seat until it is killed. So every ffmpeg or
+    ffprobe run on a `play` or `render` URL has an owner that kills it and reaps it:
+    - **Export, Save and every render pass:** the progress watchdog. A run whose output does not
+      advance for 120 s is stopped (`ffmpeg::STALL_LIMIT`, in `run_watched`), and a run whose
+      caller goes is killed on drop.
+    - **Playback:** dropping the player kills and reaps its decoders (`kill_all` and `Reaped` in
+      `src/gui/playback.rs`). Pause, a seek and closing the window all drop it.
+    - **The paused frame:** its budget, 5 s for one frame today (`SCRUB_BUDGET` in
+      `src/gui/media.rs`), after which its ffmpeg is killed and reaped. W7 keeps it for a URL.
+    - **A probe** has no deadline today: `ffmpeg::probe` waits for ffprobe to exit. W7 adds one,
+      **30 s**, after which ffprobe is killed and reaped and the probe fails with the Source's
+      state. This covers the window's probe and the `.ts` refine. The 30 s are a choice, not a
+      measurement. X1's 73 probe phases took 0.33–0.55 s unthrottled and 0.57–1.84 s
+      throttled, the slowest at 0.7 MB/s; each figure includes about 0.3 s the harness waits
+      for the stream to go idle.
+    - The waveform reads a `bulk` URL, which keeps the 60 s rule.
+    - A run W7 adds on a `play` or `render` URL gets an owner of one of these kinds.
+  - **The cut account is what catches a missing piece.** In every damaged output above ffmpeg
+    exited 0, and today's `cut::render_edit` returned `Ok`. **W7's rule:** it reads
+    `Server::cuts(Render)` before and after every ffmpeg run of a render (each pass of a render in
+    passes), and fails the render if the count went up, whatever ffmpeg's status (§9).
+  - Each reader keeps a floor of 256 KiB ahead and 64 KiB behind, whatever the share. So 64 readers
+    need at most 20 MiB (arithmetic, not measured). A render's Bulk readers, two per input for a
+    moment, ask for at most 48 MiB of windows, which is the protected total (§3) (arithmetic, not
+    measured).
+  - **What a render fetches, mp4 and wav** (X1, a 310 MB 1080p mp4 at 4 Mbit/s with a key frame
+    every 8.3 s, and a 106 MB wav):
+    - One cut: 1.00–1.05 × the kept bytes.
+    - 10 and 24 reordered pieces: each input reads from the key frame at or before its piece to
+      1 s past its end, and the server had sent 1.1–5.6 MB more per input when ffmpeg stopped
+      (0.1–1.5 MB at 30 ms and 12.5 MB/s). In total 1.5–1.9 × (kept + key-frame run-up) for the
+      mp4, which is 2.0–3.5 × the kept bytes, and 1.6–2.5 × the kept bytes for the wav.
+    - The head and the `moov` are sent to every input and fetched once. Beyond what was sent,
+      an input fetched at most 1.18 MiB, whether it was 2, 3 or 4 connections. That this is its
+      1 MiB window plus the blocks at its ends is reasoned, not measured.
+    - No block was fetched twice (480–3 710 evicted, none asked for again), and a 512 MiB cache
+      fetched the same.
+    - **The cap.** By itself it stayed at its 256 KiB floor in every run. Pinned at 4 MiB, the mp4
+      renders fetched the same and the 24-input wav render fetched 81 MB instead of 42–53 MB (3.8 ×
+      the kept bytes; one run).
+  - **What a render fetches, mp3.** Save and Export seek exactly, so every input reads the file
+    from byte 0 to its piece.
+    - A 14 MB mp3 is fetched once, whole, whatever the edit: 1.10 × the kept bytes for one cut,
+      and 4.9–5.9 × for the reordered 10- and 24-input edits, which were sent 88 MB and 204 MB.
+    - A 144 MB mp3 does not fit the cache: 10 inputs fetched 304 MB to keep 4 MB (2 511 blocks
+      fetched again after eviction; 140 MB with a 512 MiB cache).
+    - The bound is the file once per input (arithmetic, not measured). W7 shows the read's
+      progress, as for a far seek. Whether to keep this cost is open (Tensions).
+  - **Gates for W7:** §12 V16's render gates.
+- **Playback of an edit.** Each start runs up to four decoders on a video file (picture and sound
+  of the current piece and of the next) and two on an audio file, each a `play` connection with
+  its own readahead of 10 s of bytes.
+  - Measured (X1, 12 s of play from three positions of a 10-piece edit): 25–44 MB fetched per
+    start on the 4 Mbit/s mp4, 4–7 × the bytes played, of which 23–37 MB was readahead; 9–15 MB on
+    the wav. Over 85 s of play the ratio was 1.5–1.6.
+  - Picture and sound read the same bytes through two connections; the connections share cached
+    bytes.
+  - **Blocks fetched again.** With the cap left alone (256 KiB), 1 block was fetched a second
+    time in the nine mp4 starts. With the cap pinned at 4 MiB, one of three starts fetched 60
+    blocks again (34 at 30 ms and 12.5 MB/s).
+  - An mp3 without `+fastseek` reads from byte 0 at every start: 20–31 MB sent per start of a
+    14 MB file, which fits the cache and was fetched once over the three starts. With it the
+    three starts fetched 7.9, 4.8 and 0.5 MB.
+  - First picture after a start: 0.07–0.13 s on the local server; 0.6–2.1 s at 30 ms and
+    12.5 MB/s.
+- **Export** reads, for each input, from the key frame at or before its piece to 1 s past its end
+  (*view* §2.3: 12 % of a 2-minute video for 10 s; X1: 1.00–1.05 × the kept bytes for one cut of a
+  10-minute file), and an mp3 from byte 0 ("Many inputs at once" above). It publishes as today
+  (01 §7: a render under `<cache>/.exports`, then a new sibling, never over anything). Its
+  progress is ffmpeg's time-based progress.
 - **Export can be cancelled.** This is **the workstream's decision**, written into ssot's fixed scope
   (item 1: "streams with progress and can be cancelled"). It is not in message 17's own words. Today
   an export cannot be cancelled: a close only waits. The export's progress row gets **Cancel**, and
@@ -931,8 +1014,10 @@ Left as whole fetches, with the fetch now pipelined (§2):
   - **The reasons:** `Changed`, `Reloaded`, `Closed` and `Failed` (a read error from the Source; a
     write to the client that failed for a reason other than the client leaving; a connection
     thread that panicked), and two the server adds itself:
-    - `Stalled`: the client took too little for 60 s (below). A player that pauses by no longer
-      reading ffmpeg's output gets this after 60 s, and starts ffmpeg again at its position.
+    - `Stalled`: the client took too little for 60 s (below): of a `bulk` body, or of any
+      answer's head while the head's write is still blocked. The body of a `render` or `play`
+      response never gets it. A paused player is not a client that stops reading: pause drops
+      the player, which kills its decoders, and Play starts ffmpeg again at its position.
     - `Busy`: a request with a valid token and kind was refused with 503 (below). No body was
       begun, but a run refused an input must not pass.
   - A connection closed unanswered for want of a seat or a thread counts against every kind: whose
@@ -955,18 +1040,38 @@ Left as whole fetches, with the fetch now pipelined (§2):
   - A socket that fails there for any other reason ends the response the same way, as `Failed`.
 - **A server that fails to start** stops and joins the thread it had started (the watch), so it
   holds no Source.
-- **Deadlines.** A response is closed (`Stalled`) once its writes have waited on the client for
+- **Deadlines.** An answer is closed (`Stalled`) once its writes have waited on the client for
   **60 s** (01 §5's no-progress bound) without **64 KiB** going. The 60 s start again only when
   64 KiB have gone since they last started, so a trickle does not keep a response open. Time a read
   waits for the remote is not counted here: the Source's own reads are bounded by §5's timeouts.
+  - **On a body, the 60 s run for `bulk` only.** The body of a `render` or `play` response whose
+    client is connected and not reading is waiting its turn (§7.4, X1), and is never `Stalled`.
+    The exemption begins once the answer's head has been written to the socket. So a head whose
+    write is still blocked at 60 s is closed, for every kind, and so is a refusal. This is about
+    the server's write, not about what the client's program reads: the kernel buffers a head of
+    a few hundred bytes for a client that never reads it, and the response is then in its body,
+    where a `render` or `play` one waits without a deadline.
+  - **Such a body ends with its owner.** A client that neither reads nor closes keeps its seat
+    until it is killed, so every ffmpeg or ffprobe run on a `play` or `render` URL has an owner
+    that kills and reaps it (§7.4, W7's rule): the 120 s progress watchdog for an export or a
+    render, the player's drop for playback, a deadline for the paused frame (5 s) and for a
+    probe (30 s). When the client is killed, the server finds it gone at its next look and
+    frees the seat.
+  - Everything else holds for every kind: the head's 5 s, the look for a client that has gone, the
+    64 KiB of input dropped under a response, and the shutdown.
 - **Connections.** The path's kind decides the connection's reader: `play` is a Media reader
   (`ReaderKind::Media`, at the probed byte rate once the window has set it), `bulk` and `render`
   are Bulk readers, which yield to playback's demand (§4). Each is served by blocking `read_at` on
   a std thread. TCP backpressure from ffmpeg paces it.
-  - At most **32** are served at once, and a 33rd gets 503.
-  - PR #15 needs up to 31 at once: a render opens at most 24 inputs (`ffmpeg::MAX_INPUTS`), playback
-    runs two pieces at a boundary (video and audio each, 4), and the paused frame, the waveform and
-    a probe take one each.
+  - At most **64** are served at once, and a 65th gets 503. The next 64 past them still have their
+    heads read, so that they get their 503; past those a connection is closed unanswered.
+  - An ffmpeg input is not one connection (X1, §7.4): 2 per input for a faststart mp4, 3 for a wav,
+    4 for an mp4 with its `moov` at the end, 1–2 for an mp3, one after another. At its seek an
+    input holds two seats for a moment, until the server sees the old connection gone.
+  - PR #15 needs up to 62 for a moment (arithmetic, not measured): a render's 24 inputs
+    (`ffmpeg::MAX_INPUTS`) at two seats each (48), playback's two pieces at a boundary, video and
+    audio each, likewise (8), and the paused frame, the waveform and a probe likewise (6).
+    Measured: up to 45 bodies at once in a 24-input render, and no refusal in 19 such renders.
 - **Shutdown.** Dropping the server sets the stop and every connection's cancel flag and shuts
   down every accepted socket (`shutdown` of both directions), and only then closes the listener. A
   thread blocked in `read_at` or a socket write returns at once. The accept thread takes at most
@@ -1039,7 +1144,7 @@ Left as whole fetches, with the fetch now pipelined (§2):
 | Bytes before a hex first screen | the blocks covering the screen and its margin: one 64 KiB block at offset 0 for any window under 1 300 rows, at most two elsewhere |
 | Bytes before a text first screen | one 64 KiB block at offset 0, for any file read through a Source, wrapped or not: the first screen is the rows that block supplies (§7.2); after a jump, at most 3 blocks, in one round trip when the replies are full; the background index pass comes after it |
 | A demand's wait behind what was sent | `(cap + one block per other waiting reader) / rate`, cap ≤ 4 MiB (§4) |
-| The byte server | 32 connections, an 8 KiB request head, 5 s to send it, 60 s without progress (§9) |
+| The byte server | 64 connections, an 8 KiB request head, 5 s to send it, 60 s without progress on a `bulk` response (§9) |
 
 ## 11. Usage log and receipt hooks
 
@@ -1230,7 +1335,41 @@ stream <event> t=<ms> <host:/abs> fetched=<b> demand=<b> prefetch=<b> bulk=<b> d
     then it keeps today's error row (W8's gate).
 - **V16. Video, `moov` at the end** (123 MB, remote; gates on `local_server()` with a `lavfi`
   fixture of the same shape).
-  - Gate: at every step, `fetched ≤ http_sent + Σ live readers' ahead + cap`.
+  - **Playback gate**, read once per start, when the player is dropped (each term is that
+    start's own: the counters' growth from `Player::start` to the drop):
+    - `fetched − refetched ≤ http_sent + (play readers opened during that start) × their ahead +
+      cap`;
+    - `refetched ≤ 1 block` per start, as a regression threshold for X1's own fixture and not
+      a promise about playback in general. The fixture: the 600 s, 310 MB 1080p mp4 at
+      4 Mbit/s, either layout; the edit of 10 pieces of 10 s reordered; 12 s of play from
+      timeline positions 5 s, 45 s and 85 s, one after another on one Source; the cap left
+      alone, where it stayed at its 256 KiB floor.
+    - `refetched` is the bytes of blocks fetched again after eviction. `Stats` has no such
+      counter today: W7 adds it.
+    - It is not a bound "at every step": `fetched` is cumulative and counts refetches,
+      `http_sent` is a union, and a reader's allowance goes when it closes.
+    - X1 on that fixture: 1 block was fetched again in nine starts. With the cap pinned at
+      4 MiB one start fetched 60 blocks again (34 throttled), so the threshold holds only with
+      the cap at its floor. At the first start `fetched` was 18.0 MB over `http_sent`.
+      Counting only the four readers that stayed open, at 5.2 MB `ahead` each, 20.9 MB was
+      allowed (arithmetic, not measured); that start opened 24 `play` connections in all, so
+      the gate's own allowance is larger.
+    - This gate is for playback only. A render has its own bound below. What X1 saw miss on
+      a render was the earlier formula, `fetched ≤ http_sent + Σ live readers' ahead + cap`
+      (123.9 MB against 122.1 MB for 10 inputs), not this one, which no render was held to.
+  - **Owner gate** (W7, §7.4's rule): after an owner stops its run, the seats that run held are
+    back to 0. Three cases: a dropped player, an export stopped by the 120 s watchdog, and a
+    probe that ran past its 30 s. Each is against a client that neither reads nor closes.
+  - **Render gates** (W7; X1's measurements are in §7.4), for an mp4 with its `moov` at the end,
+    the same file faststart, and a wav:
+    - a render of 24 reordered pieces (24 inputs) of each mp4 layout has no cut
+      (`Server::cuts(Render)` unchanged) and the edit's length;
+    - `fetched ≤ http_sent + inputs × 1.25 MiB + cap` over the render, and no block is fetched
+      twice (X1: at most 1.18 MiB per input in 50 mp4 and wav renders, with the cap at 256 KiB
+      and pinned at 4 MiB; 0 blocks twice);
+    - a 2-input render whose second input waits past 60 s (a throttled Source) has no cut and the
+      edit's length;
+    - a render whose `cuts(Render)` went up is failed though ffmpeg exits 0 (§7.4's rule).
   - Qualification: `first − open ≤ 1.5 s` for the probe and first frame (measured 0.30 + 0.10 s),
     and `ready − input ≤ 1.5 s` for a far scrub to 80 % (measured 0.41–1.06 s across three
     containers). Measured with no readahead:
@@ -1264,9 +1403,15 @@ stream <event> t=<ms> <host:/abs> fetched=<b> demand=<b> prefetch=<b> bulk=<b> d
     - a head of 9 KiB gets 431;
     - a head trickled over 6 s is closed unanswered;
     - a second request on the same connection is never answered;
-    - a 33rd connection gets 503.
+    - exactly 64 connections are served and a 65th gets 503;
+    - 48 connections asked at once, the seeks of a 24-input render, are all served, and the 24
+      that then close are no cut.
   - **Lifetime:**
-    - a client that stops reading is closed after 60 s (simulated time);
+    - a `bulk` client that stops reading is closed after 60 s (simulated time);
+    - a `render` and a `play` client that take nothing for 61 s, and for an hour, are open and
+      uncounted, and get the file's bytes from where they stopped when they read on;
+    - a head whose write is still blocked at 60 s is closed, for every kind (the write held by
+      the test's write gate, on the simulated clock);
     - after the window closes, the port refuses connections, and a thread blocked in a write
       returns;
     - a source that changes during a response already started cuts it short, sends no byte of the
@@ -1297,12 +1442,12 @@ that shows something on screen also brings a screenshot receipt someone looked a
 |---|---|---|---|
 | W1 | **Transport.** `Ranged` (with `reopen` and `into_connection`) and `into_ranged`, which gives the connection back on failure; the SFTP, local and `Fake` implementations; short replies and early ends; one task sending in queue order; the validation `fstat`; bounded close; `read_with` / `read_to` with explicit offsets and up to 4 MiB in flight (fixes the latent cursor bug, §2); the clipping proxy for V5 | `src/remote/ranged.rs` (new: trait, local impl, `Fake`), `src/remote/sftp/ranged.rs` (new, child module), `src/remote/sftp.rs` (`read_with`, `read_to`, the `mod` line), `src/remote/mod.rs` (`into_ranged`, the `mod` line), `src/remote/local.rs` (`into_ranged`), `src/remote/tests.rs`; `Cargo.toml` and `Cargo.lock` (tokio dev-features for the proxy, if any) | — (if PR #16 lands first, W1 rebases: they share only `Cargo.toml`, in different sections) |
 | W2 | **Stream core.** `Source`, `BlockCache` with its floors, `Prefetcher` with §4's admission, `Reader`, `Bytes`, validation and generations, polling, reload, the MaxSessions line; the counters and events of `SOPEN_STREAM_STATS`, and `SOPEN_STREAM_THROTTLE` (§11) | `src/stream/{mod,cache,prefetch,source}.rs`, `src/stream/tests.rs` (all new); `src/lib.rs` (`pub mod stream`) | W1 |
-| W3 | **Byte server.** §9 whole: token, the three reader-kind paths, head limits and deadlines, the Host rules, the range table, one request per connection, the 32-connection bound, shutdown, the cut account, the Linux peer check | `src/stream/http.rs`, `src/stream/http/tests.rs` (new) | W2 |
+| W3 | **Byte server.** §9 whole: token, the three reader-kind paths, head limits and deadlines, the Host rules, the range table, one request per connection, the 64-connection bound, shutdown, the cut account, the Linux peer check | `src/stream/http.rs`, `src/stream/http/tests.rs` (new) | W2 |
 | W4 | **Hex streams.** `Pages` over `Bytes`, Pending and Failed rows, the drag debounce, patches keeping their byte (fixes the hex bug, §7.1), the interim Save. Its first commit is a pure move of the write side (`Ident` … `HexFile::save_copy`) into `src/gui/hex/file.rs`. Adds `SOPEN_STATE`'s `loading=1` (§11) | `src/gui/hex.rs`, `src/gui/hex/file.rs` (new), `src/gui/hex/tests.rs`; `src/gui/mod.rs` (`State`'s `loading` field only) | W2; browser S1 merged |
 | W5a | **Text reads through `Bytes`.** Pending travels like `Stale`, in an arm of its own; the first screen first, from one block; the background pass capped at 16 MiB for a file read through a Source, continuing S1-B's 4 MiB preview pass, while a local file keeps its whole-file pass; highlighting over the indexed prefix; the five defects X3 found (§7.2) | `src/gui/text.rs`, `src/gui/text/tests.rs` | W2; S1 merged (X3 is done: 2026-11-21, §7.2) |
 | W5b | **Large text files by byte position.** The prefix index, byte-offset keys in `TextWindow` and wrap, unknown line starts, Go to, the index memory bound (§7.2) | `src/gui/text.rs`, `src/gui/text/wrap.rs`, `src/gui/text/tests.rs` | W5a |
 | W6 | **Image streams.** Header walk with the SOF read directly, thumbnail, the memory line with Continue, the reserved buffer, the streamed read, partial pictures for the four measured formats (plain PNG included) | `src/gui/image.rs`, `src/gui/image/probe.rs` (new), `src/gui/image/robustness_tests.rs`; `Cargo.toml` and `Cargo.lock` (the direct `png` dependency) | W2; S1 merged; X4 |
-| W7 | **Media streams.** URL `Input`s with their own input options and reader kinds, the progressive waveform on a `bulk` connection, Export through the URL and its Cancel, runs failed on a cut response | `src/gui/media.rs`, `src/gui/media/*`, `src/gui/playback.rs`, `src/ffmpeg.rs`, `src/cut.rs` | W3; S1, PR #15 and S1-M merged; X1, X5 |
+| W7 | **Media streams.** URL `Input`s with their own input options and reader kinds, the progressive waveform on a `bulk` connection, Export through the URL and its Cancel, runs failed on a cut response | `src/gui/media.rs`, `src/gui/media/*`, `src/gui/playback.rs`, `src/ffmpeg.rs`, `src/cut.rs` | W3; S1, PR #15 and S1-M merged; X5 |
 | W8 | **Routing.** The browser's Enter, the standalone route, the dialog and `--hex` open a Source instead of fetching, with the placeholder `Origin`; the image → hex switch (§7.3); the preview change below, with its 02 §4.3–§4.4 text and S1's tests it changes; the `.ts` refine over the URL; "Save to…" cancel; `bytes_fetched`; forwarding §11's hooks | `src/gui/browser/prepare.rs`, `src/gui/browser/preview.rs` (the hand-over only), `src/gui/browser.rs` (the hex switch), `src/gui/browser/tests.rs` (P6 and P12's remote parts), `src/cache.rs` (the `.preview` root, if unused), `src/gui/binary.rs`, `src/gui/binary/tests.rs`, `src/main.rs`, `src/kind.rs`, `src/usage.rs`, `src/forward.rs`, `src/gui/mod.rs` (`Origin`), `tests/cli.rs`, `.prd/02-architecture.md` (§4.3–§4.4) | W4, W5a, W5b, W6, W7 and ED6; S1 and S1-M merged |
 
 07 §14 has the edit units (ED1–ED6) and the docs unit (D1), which rewrites 01, AGENTS.md and the
@@ -1433,3 +1578,21 @@ both, with the evidence named.
     "files over 16 MiB" without naming local or remote.
   - Evidence W5b collects: what is highlighted past 16 MiB, and before it, in a local file over
     16 MiB.
+
+An open question X1 (2026-11-21) measured and did not settle. It is not decided here. W7 settles
+it.
+
+- **An mp3 render reads the file once per input.**
+  - The fact: Save and Export seek exactly (§7.4, 01 §7's exact cuts), and an exact mp3 seek reads
+    from byte 0. So each input of a render reads the file up to its piece. Measured (X1): a
+    144 MB mp3 with 10 inputs fetched 304 MB to keep 4 MB, with 2 511 blocks fetched again after
+    eviction; a 14 MB one is fetched once and sent 88 MB to 10 inputs and 204 MB to 24.
+  - Reading A: keep it. The cut stays exact, the cost is bytes and time, and W7 shows the read's
+    progress.
+  - Reading B: an mp3 gets one input, decoded through once, and every piece is taken from it by
+    `asplit`, whatever the order. `edit_args` already shares one input between pieces in source
+    order less than 10 s apart.
+  - The spike W7 runs before it decides: the 10- and 24-piece reordered edits of X1 on a 14 MB
+    and a 144 MB mp3 with one shared input. It records `fetched`, the bytes sent, ffmpeg's peak
+    memory and wall time, whether the graph ever stalls on pieces held out of order, and whether
+    the output is sample-exact against today's render.
