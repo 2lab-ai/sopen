@@ -1786,36 +1786,49 @@ fn the_read_does_not_wait_for_a_picture_and_marks_reached_meanwhile_are_skipped(
 }
 
 /// `SOPEN_AUTOSAVE` has no window to show a wait in and nobody to end it: a stream that fails
-/// ends the run with the stream's words, instead of waiting for a connection that may never
-/// come back.
+/// — a read answered with an error, or the connection lost — ends the run with the stream's
+/// words, at once: it does not wait for a reconnect (the stream makes one a second later at
+/// the earliest, and here the link's clock never gets that far).
 #[test]
 fn a_run_without_a_window_fails_on_a_failed_stream_instead_of_waiting() {
-    let file = png(1200, 900, false);
-    let mut fx = fx(file);
-    // The window's own loader is not what is tested: it is stopped.
-    fx.win.stop();
-    fx.until("the window's loader ends", |fx| fx.workers_ended());
-    // The read's second request is answered with an error.
-    let faulted = fx.requests() + 1;
-    fx.control
-        .fault(faulted, Fault::Status("the disk is on fire"));
-    let (tx, rx) = mpsc::channel();
-    let source = fx.source.clone();
-    std::thread::spawn(move || {
-        let done = load_input(Input::Stream(source), &Load::windowless());
-        let _ = tx.send(done.map(|_| ()).map_err(|e| format!("{e:#}")));
-    });
-    let started = Instant::now();
-    let done = loop {
-        fx.reply();
-        match rx.recv_timeout(Duration::from_millis(2)) {
-            Ok(done) => break done,
-            Err(_) => assert!(started.elapsed() < HANG / 4, "the run waits for the stream"),
-        }
-    };
-    let why = done.expect_err("the read failed");
-    assert!(fx.requests() > faulted, "the faulted request was sent");
-    assert!(why.contains("the disk is on fire"), "{why}");
+    for (fault, words) in [
+        (Fault::Lost, "the connection closed"),
+        (Fault::Status("the disk is on fire"), "the disk is on fire"),
+    ] {
+        let mut fx = fx(png(1200, 900, false));
+        // The window's own loader is not what is tested: it is stopped.
+        fx.win.stop();
+        fx.until("the window's loader ends", |fx| fx.workers_ended());
+        // The read's second request is the one that fails.
+        let faulted = fx.requests() + 1;
+        fx.control.fault(faulted, fault);
+        let (tx, rx) = mpsc::channel();
+        let source = fx.source.clone();
+        std::thread::spawn(move || {
+            let done = load_input(Input::Stream(source), &Load::windowless());
+            let _ = tx.send(done.map(|_| ()).map_err(|e| format!("{e:#}")));
+        });
+        let started = Instant::now();
+        let done = loop {
+            fx.reply();
+            match rx.recv_timeout(Duration::from_millis(2)) {
+                Ok(done) => break done,
+                Err(_) => assert!(
+                    started.elapsed() < HANG / 4,
+                    "{words}: the run waits for the stream"
+                ),
+            }
+        };
+        let why = done.expect_err(words);
+        assert!(fx.requests() > faulted, "the faulted request was sent");
+        assert!(why.contains(words), "{words}: {why}");
+        // No reconnect was waited for: the link's clock is short of the first retry.
+        assert!(
+            fx.control.elapsed() < crate::stream::RETRY_EVERY,
+            "{words}: {:?} passed on the link",
+            fx.control.elapsed()
+        );
+    }
 }
 
 /// A decode nobody is asked about keeps the image crate's own allocation limit, as before:
