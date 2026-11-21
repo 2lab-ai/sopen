@@ -35,9 +35,9 @@ One slice at a time (02 §8.1). Worktree = `.worktrees/<branch with / as ->`.
 
 ## Next
 
-- 2026-11-21: S1-E merged (PR #29, 0120d40) and is deployed as preview 0120d40813a0. S1-M is ready to start, and so
-  are the streaming units that waited on S1: W4 and W5a are in progress, W6 and ED3 are ready
-  ([`../streaming/loop.md`](../streaming/loop.md)).
+- 2026-11-21: S1-E merged (PR #29, 0120d40) and is deployed as preview 0120d40813a0. S1-M and the streaming units
+  that waited on S1 were then ready to start: S1-M (PR #36) and W6 merged on 2026-11-22, W4 and
+  W5a on 2026-11-21, and ED3 is in progress ([`../streaming/loop.md`](../streaming/loop.md)).
 - 2026-11-21: S1-M is in review in this PR: the media preview, its budgets and hand-over, with E3's media rerun
   written into 02 §8.2.
 - E3 is closed (2026-11-21): its result is in 02 §8.2 and its row in [`loop.done.md`](loop.done.md). S1-M reruns
