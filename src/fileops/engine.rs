@@ -10,7 +10,7 @@
 
 use super::{Answer, Clash, Control, Hosts, Item, ItemOutcome, Job, Op, Progress, Report, STOPPED};
 use crate::remote::ops::{
-    is_no_rename, is_taken, FileOps, Publish, Renamed, Staged, REMOTE_FOLDER_RENAME,
+    is_no_rename, is_taken, FileOps, Ident, Pin, Publish, Renamed, Staged, REMOTE_FOLDER_RENAME,
 };
 use crate::remote::{
     describe_change, is_cancelled, join, random_hex, suffixed, Created, EntryKind, Stat,
@@ -23,6 +23,18 @@ use std::sync::Arc;
 
 /// The longest name a folder holds (bytes; `NAME_MAX` of the filesystems sopen meets).
 const NAME_MAX: usize = 255;
+
+/// A batch of moved items, copied and checked, waits for one durability barrier and then has its
+/// sources removed together (04 §5.1): flushed at this many items, …
+const BATCH_ITEMS: usize = 64;
+
+/// … this long after its first item, before any question, on Esc or Cancel, and at the end.
+const BATCH_AGE: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// The most descriptors (pins) one operation holds at once on moved sources — a batch's items
+/// — so the copy itself never runs out of them; a source past it is known by its device, inode
+/// and status-change time instead.
+const PIN_BUDGET: usize = 64;
 
 /// Highest `-N` suffix tried for a free name.
 const MAX_SUFFIX: u32 = 10_000;
@@ -122,7 +134,10 @@ pub fn run(job: &Job, hosts: Hosts<'_>, ctl: &mut dyn Control) -> Report {
         item: 0,
         publish: HashMap::new(),
         wrote: false,
-        in_place_said: false,
+        in_place_said: HashSet::new(),
+        pending: Vec::new(),
+        batch_since: None,
+        pin_slots: Arc::new(()),
         touched: Vec::new(),
         all_touched: Vec::new(),
     };
@@ -131,9 +146,10 @@ pub fn run(job: &Job, hosts: Hosts<'_>, ctl: &mut dyn Control) -> Report {
     }
     for (i, name) in job.names.iter().enumerate() {
         engine.item = i + 1;
-        engine.in_place_said = false;
         engine.touched.clear();
         if engine.stopped() {
+            // The checked items' sources go after their barrier; nothing more starts.
+            engine.flush();
             let rest = job.names.len() - i;
             engine.report.notes.push(format!(
                 "stopped (Esc) before {name}: {rest} item(s) not reached"
@@ -148,6 +164,9 @@ pub fn run(job: &Job, hosts: Hosts<'_>, ctl: &mut dyn Control) -> Report {
         });
         let lines = std::mem::take(&mut engine.lines);
         engine.report.items.extend(lines);
+        if engine.batch_due() {
+            engine.flush();
+        }
         let rest = job.names.len() - i - 1;
         let note = match flow {
             Flow::Go => continue,
@@ -160,14 +179,17 @@ pub fn run(job: &Job, hosts: Hosts<'_>, ctl: &mut dyn Control) -> Report {
             )),
         };
         engine.report.notes.extend(note);
+        engine.flush();
         engine.not_reached(i + 1);
         break;
     }
-    // What was written is made durable once, at the end (04 §5.1).
+    engine.flush();
+    // What was written is made durable once more at the end, after the last removal (04 §5.1).
     if engine.wrote {
         let all = std::mem::take(&mut engine.all_touched);
         if let Err(why) = engine.barrier(all) {
-            engine.report.notes.push(why);
+            let note = format!("the copies could not be made durable: {why}");
+            engine.report.notes.push(note);
         }
     }
     engine.report
@@ -205,6 +227,30 @@ enum Still {
     Changed(String),
 }
 
+/// A moved item whose copy is checked and whose sources wait for the batch's barrier.
+struct Pending {
+    /// Its line in the report.
+    idx: usize,
+    name: String,
+    removal: Removal,
+    /// The target folders its copy went into.
+    touched: Vec<String>,
+}
+
+/// What a pending item's removal is.
+enum Removal {
+    File {
+        from: String,
+        copied: Copied,
+    },
+    Folder {
+        from: String,
+        want: String,
+        nodes: Vec<Node>,
+        copied: Vec<Option<Copied>>,
+    },
+}
+
 /// After an item: go on, or end the operation.
 enum Flow {
     Go,
@@ -234,12 +280,27 @@ enum Placed {
     Failed(String),
 }
 
+/// A moved source's [`Pin`] and its place in the operation's [`PIN_BUDGET`], given back when it
+/// is dropped.
+struct SourcePin {
+    pin: Pin,
+    _slot: Arc<()>,
+}
+
 /// A file (or link) published at its target: its final name, and its source as it was read —
 /// what the removal of a moved source checks again.
 struct Copied {
     name: String,
     before: Stat,
-    id: Option<(u64, u64)>,
+    /// Locally the source's device, inode and status-change time as it was read.
+    id: Option<Ident>,
+    /// A moved source's descriptor, held from its capture to its removal: while it is open the
+    /// inode cannot be freed and its number reused (ext4 does at once), so the name is the same
+    /// file while it stays on that inode — whatever happens to the file's metadata, and to its
+    /// other names (an unlink of one bumps the ctime of the rest). `None` past [`PIN_BUDGET`] or
+    /// where none can be had: then `id` in full is compared, the ctime included — a hard-linked
+    /// sibling whose other name went first is kept, both copies said to exist (never lost).
+    pin: Option<SourcePin>,
     /// A link's target text, as copied.
     target: Option<String>,
 }
@@ -358,8 +419,14 @@ struct Engine<'j, 'h, 'c> {
     publish: HashMap<String, Publish>,
     /// Something was written on the target (the end's durability barrier is due).
     wrote: bool,
-    /// The current item has said it was written in place.
-    in_place_said: bool,
+    /// The target folders whose "written in place" was said (once each per operation).
+    in_place_said: HashSet<String>,
+    /// Moved items copied and checked, their sources waiting for the batch's barrier.
+    pending: Vec<Pending>,
+    /// When the pending batch began.
+    batch_since: Option<std::time::Instant>,
+    /// One clone per source pin this operation holds ([`PIN_BUDGET`]).
+    pin_slots: Arc<()>,
     /// The folders that received an entry for the current item, and for the whole operation:
     /// what a barrier makes durable.
     touched: Vec<String>,
@@ -457,7 +524,8 @@ impl Engine<'_, '_, '_> {
             for start in [job.dst_dir.as_str(), dst_real.as_str()] {
                 let mut at = start.trim_end_matches('/').to_string();
                 while !at.is_empty() {
-                    if fs.identity(&at, true).ok().flatten() == Some(id) {
+                    let here = fs.identity(&at, true).ok().flatten();
+                    if here.is_some_and(|h| h.inode() == id.inode()) {
                         return Err(refuse());
                     }
                     at = match at.rfind('/') {
@@ -530,18 +598,75 @@ impl Engine<'_, '_, '_> {
     /// The durability barrier ([`FileOps::barrier`]) over `dirs`, deepest first.
     fn barrier(&mut self, mut dirs: Vec<String>) -> Result<(), String> {
         dirs.sort_by_key(|d| std::cmp::Reverse(d.matches('/').count()));
-        self.ends
-            .dst()
-            .barrier(&dirs)
-            .map_err(|e| format!("the copies could not be made durable: {e:#}"))
+        self.ends.dst().barrier(&dirs).map_err(|e| format!("{e:#}"))
     }
 
-    /// Before a moved item's sources go: its copies made durable, or none of them goes.
-    fn durable_item(&mut self) -> Result<(), String> {
-        let dirs = self.touched.clone();
-        self.barrier(dirs).map_err(|e| {
-            format!("the copy exists but its durability was not confirmed ({e}); the source stays")
-        })
+    /// A moved item copied and checked: its source removal waits for the batch's barrier. Its
+    /// line (about to be pushed) says done until then.
+    fn defer(&mut self, name: &str, removal: Removal) {
+        self.pending.push(Pending {
+            idx: self.report.items.len(),
+            name: name.to_string(),
+            removal,
+            touched: self.touched.clone(),
+        });
+        self.batch_since.get_or_insert_with(std::time::Instant::now);
+    }
+
+    fn batch_due(&self) -> bool {
+        !self.pending.is_empty()
+            && (self.pending.len() >= BATCH_ITEMS
+                || self.batch_since.is_some_and(|t| t.elapsed() >= BATCH_AGE))
+    }
+
+    /// The batch: one barrier over every folder its items' copies went into — failing, none of
+    /// their sources goes — then each item's sources removed (checked again, bottom-up), its
+    /// line set and its entries' lines put after it. Esc does not cut a flush short: its items
+    /// were copied, checked and made durable.
+    fn flush(&mut self) {
+        if self.pending.is_empty() {
+            return;
+        }
+        let pending = std::mem::take(&mut self.pending);
+        self.batch_since = None;
+        // The lines of the item in progress, if any, wait.
+        let held = std::mem::take(&mut self.lines);
+        let mut dirs: Vec<String> = Vec::new();
+        for d in pending.iter().flat_map(|p| &p.touched) {
+            if !dirs.contains(d) {
+                dirs.push(d.clone());
+            }
+        }
+        let durable = self.barrier(dirs);
+        let mut shift = 0;
+        for p in pending {
+            let idx = p.idx + shift;
+            let outcome = match (&durable, p.removal) {
+                (Err(e), Removal::File { .. }) => ItemOutcome::Failed(format!(
+                    "the copy exists but its durability was not confirmed: {e}; the source stays"
+                )),
+                (Err(e), Removal::Folder { .. }) => ItemOutcome::Failed(format!(
+                    "the copy exists but its durability was not confirmed: {e}; its sources stay"
+                )),
+                (Ok(()), Removal::File { from, copied }) => {
+                    self.remove_moved(&p.name, &from, &copied)
+                }
+                (
+                    Ok(()),
+                    Removal::Folder {
+                        from,
+                        want,
+                        nodes,
+                        copied,
+                    },
+                ) => self.remove_tree(&p.name, &from, &want, &nodes, &copied),
+            };
+            self.report.items[idx].outcome = outcome;
+            let lines = std::mem::take(&mut self.lines);
+            shift += lines.len();
+            self.report.items.splice(idx + 1..idx + 1, lines);
+        }
+        self.lines = held;
     }
 
     /// How copies get their names in `dir`, probed once per folder (a failed probe: atomic, the
@@ -642,7 +767,8 @@ impl Engine<'_, '_, '_> {
         let fs = self.ends.src();
         let err = |e: anyhow::Error| format!("{e:#}");
         if let Some(id) = fs.identity(from, false).map_err(err)? {
-            if fs.identity(target, false).map_err(err)? != Some(id) {
+            let there = fs.identity(target, false).map_err(err)?;
+            if there.map(|t| t.inode()) != Some(id.inode()) {
                 return Ok(false);
             }
         }
@@ -796,11 +922,10 @@ impl Engine<'_, '_, '_> {
         };
         match placed {
             Placed::At(copied) if mv => {
-                // Durable before its source goes (04 §5.1); else it stays.
-                if let Err(why) = self.durable_item() {
-                    return (ItemOutcome::Failed(why), Flow::Go);
-                }
-                (self.remove_moved(name, &from, &copied), Flow::Go)
+                // Its source goes with the batch, after the barrier (04 §5.1).
+                let outcome = named(name, &copied.name);
+                self.defer(name, Removal::File { from, copied });
+                (outcome, Flow::Go)
             }
             Placed::At(copied) => (named(name, &copied.name), Flow::Go),
             Placed::Keep(why) => (ItemOutcome::Failed(why), Flow::Go),
@@ -831,6 +956,8 @@ impl Engine<'_, '_, '_> {
                 Some(answer) => answer,
                 None => {
                     let free = self.next_free(dir, &want)?;
+                    // No checked item waits on an answer with both copies in place.
+                    self.flush();
                     let reply = self.ctl.ask(&Clash {
                         name: want.clone(),
                         free,
@@ -909,6 +1036,7 @@ impl Engine<'_, '_, '_> {
             Ok(id) => id,
             Err(e) => return Placed::Failed(format!("{e:#}")),
         };
+        let pin = self.pin_source(from, id.as_ref());
         let in_place = self.publish_in(dir) == Publish::InPlace;
         let nothing = || "nothing of it was copied (what was written went again)".to_string();
         let (temp, staged, read) = loop {
@@ -935,24 +1063,23 @@ impl Engine<'_, '_, '_> {
                 Err(StageErr::Taken(why) | StageErr::Failed(why)) => return Placed::Failed(why),
             }
         };
-        if in_place && !self.in_place_said {
-            self.in_place_said = true;
+        if in_place && self.in_place_said.insert(dir.to_string()) {
             self.report.notes.push(format!(
                 "written in place in {dir}: this volume cannot publish a finished copy \
                  atomically, so an interrupted copy leaves a partial file under its name"
             ));
         }
         if let Err(why) = self.check_copy(from, shown, &before, &staged, read) {
-            self.drop_staged(&temp, staged.id);
+            self.drop_staged(&temp, staged.id_now());
             return Placed::Failed(why);
         }
         if self.stopped() {
-            self.drop_staged(&temp, staged.id);
+            self.drop_staged(&temp, staged.id_now());
             return Placed::Stopped(nothing());
         }
         // The name is published only while it is still the file the copy was written through
         // (this machine: its inode, by the descriptor). Anything else there is not sopen's.
-        if let Err(why) = self.is_staged(&temp, staged.id) {
+        if let Err(why) = self.is_staged(&temp, staged.id_now()) {
             return Placed::Failed(format!("{why}; nothing was published"));
         }
         let mv = self.job.op == Op::Move;
@@ -980,12 +1107,12 @@ impl Engine<'_, '_, '_> {
                     }
                     Err(e) if is_taken(&e) && top => match self.resolve(dir, &want, false) {
                         Ok(Resolved::Name(_)) if self.stopped() => {
-                            self.drop_staged(&temp, staged.id);
+                            self.drop_staged(&temp, staged.id_now());
                             return Placed::Stopped(nothing());
                         }
                         Ok(Resolved::Name(n)) => want = n,
                         other => {
-                            self.drop_staged(&temp, staged.id);
+                            self.drop_staged(&temp, staged.id_now());
                             return match other {
                                 Ok(Resolved::Skip) => Placed::Skipped,
                                 Ok(_) => Placed::Cancelled,
@@ -994,7 +1121,7 @@ impl Engine<'_, '_, '_> {
                         }
                     },
                     Err(e) => {
-                        self.drop_staged(&temp, staged.id);
+                        self.drop_staged(&temp, staged.id_now());
                         return Placed::Failed(format!("{e:#}"));
                     }
                 }
@@ -1003,13 +1130,14 @@ impl Engine<'_, '_, '_> {
         self.touch(dir);
         // Still the copy under its final name? (The name could change hands between the check
         // above and the rename.) If not, nothing is removed and what is there is left.
-        if let Err(why) = self.is_staged(&target, staged.id) {
+        if let Err(why) = self.is_staged(&target, staged.id_now()) {
             return Placed::Failed(why);
         }
         let copied = Copied {
             name: want,
             before,
             id,
+            pin,
             target: None,
         };
         if mv {
@@ -1043,7 +1171,7 @@ impl Engine<'_, '_, '_> {
                 Err(StageErr::Failed(why) | StageErr::Taken(why)) => {
                     let what = match self.still(from, &copied) {
                         Still::Same => {
-                            let gone = self.unpublish(&target, staged.id, published);
+                            let gone = self.unpublish(&target, staged.id_now(), published);
                             format!("{gone}; {shown} stays")
                         }
                         Still::Gone => format!("{shown} is gone, so the copy {target} stays"),
@@ -1059,15 +1187,18 @@ impl Engine<'_, '_, '_> {
         Placed::At(copied)
     }
 
-    /// Is `path` still the file the copy was written through? On this machine by its inode — a
-    /// failure to read it is a no (fail closed). Over SFTP there is no inode (`id` is `None`):
-    /// taken to be, as for every SFTP name.
+    /// Is `path` still the file the copy was written through? On this machine by its inode, as
+    /// the held descriptor reports it now ([`Staged::id_now`]): sound while the descriptor is open
+    /// (its inode cannot be freed and its number reused), and right on a volume whose inode
+    /// numbers follow a rename (an empty file on FAT or exFAT); a failure to read it is a no (fail
+    /// closed). Over SFTP there is no inode (`id` is `None`): taken to be, as for every SFTP
+    /// name.
     fn is_staged(&mut self, path: &str, id: Option<(u64, u64)>) -> Result<(), String> {
         let Some(id) = id else {
             return Ok(());
         };
         match self.ends.dst().identity(path, false) {
-            Ok(Some(now)) if now == id => Ok(()),
+            Ok(Some(now)) if now.inode() == id => Ok(()),
             Ok(_) => Err(format!(
                 "{path} is not the copy sopen made (another file has its name now); it is left \
                  as it is"
@@ -1168,7 +1299,7 @@ impl Engine<'_, '_, '_> {
             Created::Yes => {
                 // Removed only while the name is still the file written (this machine: its
                 // inode, by the descriptor); over SFTP, by its name.
-                let left = match self.is_staged(temp, e.id) {
+                let left = match self.is_staged(temp, e.id_now()) {
                     Ok(()) => match self.ends.dst().remove(temp) {
                         Ok(()) => None,
                         Err(re) => Some(format!("{temp} could not be removed: {re:#}")),
@@ -1327,6 +1458,7 @@ impl Engine<'_, '_, '_> {
             Ok(id) => id,
             Err(e) => return Placed::Failed(format!("{e:#}")),
         };
+        let pin = self.pin_source(from, id.as_ref());
         let target = match self.ends.src().read_link(from) {
             Ok(t) => t,
             Err(e) => return Placed::Failed(format!("{e:#}")),
@@ -1354,6 +1486,7 @@ impl Engine<'_, '_, '_> {
             name: want,
             before,
             id,
+            pin,
             target: Some(target.clone()),
         };
         let how = match self.still(from, &copied) {
@@ -1376,6 +1509,18 @@ impl Engine<'_, '_, '_> {
         ))
     }
 
+    /// A moved source's descriptor (a copy's source is read once and compared at once: no pin).
+    fn pin_source(&mut self, path: &str, id: Option<&Ident>) -> Option<SourcePin> {
+        if self.job.op != Op::Move || Arc::strong_count(&self.pin_slots) > PIN_BUDGET {
+            return None;
+        }
+        let pin = self.ends.src().pin(path, id?)?;
+        Some(SourcePin {
+            pin,
+            _slot: self.pin_slots.clone(),
+        })
+    }
+
     /// Is a moved source still the entry that was copied (04 §5.1 "Before removing a source")?
     /// The same type, size and mtime, and locally the same inode.
     fn still(&mut self, path: &str, copied: &Copied) -> Still {
@@ -1391,9 +1536,18 @@ impl Engine<'_, '_, '_> {
         if now.size != before.size || now.mtime != before.mtime {
             return Still::Changed(describe_change(&before.fingerprint(), &now));
         }
-        if copied.id.is_some() && self.ends.src().identity(path, false).ok().flatten() != copied.id
-        {
-            return Still::Changed("another file has its name now".into());
+        if let Some(id) = &copied.id {
+            let now = self.ends.src().identity(path, false).ok().flatten();
+            let same = match (now, &copied.pin) {
+                // The inode is held open, so its number is no other file's: the name is still
+                // the entry that was read while it stays on that inode.
+                (Some(now), Some(held)) => held.pin.inode() == Some(now.inode()),
+                (Some(now), None) => now == *id,
+                (None, _) => false,
+            };
+            if !same {
+                return Still::Changed("another file has its name now".into());
+            }
         }
         if let Some(target) = &copied.target {
             match self.ends.src().read_link(path) {
@@ -1482,6 +1636,10 @@ impl Engine<'_, '_, '_> {
                 self.report.notes.push(partial(&root));
                 return (stopped(&left(&root)), Flow::Stop);
             }
+            // A long folder does not hold the sources of the items before it past the batch's age.
+            if self.batch_due() {
+                self.flush();
+            }
             let source = join(from, &node.rel);
             let shown = format!("{name}/{}", node.rel);
             if node.kind == Kind::Unknown {
@@ -1550,13 +1708,16 @@ impl Engine<'_, '_, '_> {
             return (named(name, &want), Flow::Go);
         }
         // Durable before any of its sources goes (04 §5.1); else they all stay.
-        if let Err(why) = self.durable_item() {
-            return (
-                ItemOutcome::Failed(why.replace("the source stays", "its sources stay")),
-                Flow::Go,
-            );
-        }
-        self.remove_tree(name, from, &want, &nodes, &copied)
+        // Its sources go with the batch, after the barrier (04 §5.1).
+        let outcome = named(name, &want);
+        let removal = Removal::Folder {
+            from: from.to_string(),
+            want,
+            nodes,
+            copied,
+        };
+        self.defer(name, removal);
+        (outcome, Flow::Go)
     }
 
     /// The bits and times of the source's folders on their copies, deepest first and the new
@@ -1633,22 +1794,10 @@ impl Engine<'_, '_, '_> {
         want: &str,
         nodes: &[Node],
         copied: &[Option<Copied>],
-    ) -> (ItemOutcome, Flow) {
+    ) -> ItemOutcome {
         let mut blocked: HashSet<String> = HashSet::new();
         let mut kept = 0usize;
         for (node, copied) in nodes.iter().zip(copied).rev() {
-            if self.stopped() {
-                self.report.notes.push(format!(
-                    "stopped while removing the source of {name}: what was not removed yet \
-                     exists in both places"
-                ));
-                return (
-                    stopped(
-                        "while removing its source: what was not removed yet exists in both places",
-                    ),
-                    Flow::Stop,
-                );
-            }
             let path = join(from, &node.rel);
             let stays = match (node.kind, copied) {
                 (Kind::Dir, _) if blocked.contains(&node.rel) => Some(None),
@@ -1681,30 +1830,24 @@ impl Engine<'_, '_, '_> {
         }
         if !blocked.contains("") {
             if let Err(e) = self.ends.src().remove_dir(from) {
-                return (
-                    ItemOutcome::Failed(format!(
-                        "{name} was copied, but its folder could not be removed ({e:#}); both \
-                         copies exist"
-                    )),
-                    Flow::Go,
-                );
+                return ItemOutcome::Failed(format!(
+                    "{name} was copied, but its folder could not be removed ({e:#}); both copies \
+                     exist"
+                ));
             }
         }
         if kept == 0 {
-            return (named(name, want), Flow::Go);
+            return named(name, want);
         }
         let to = if want == name {
             String::new()
         } else {
             format!(" as {want}")
         };
-        (
-            ItemOutcome::Failed(format!(
-                "{name} was copied{to}, but {kept} of its entries stay where they were (listed \
-                 below): what was copied of them exists in both places"
-            )),
-            Flow::Go,
-        )
+        ItemOutcome::Failed(format!(
+            "{name} was copied{to}, but {kept} of its entries stay where they were (listed \
+             below): what was copied of them exists in both places"
+        ))
     }
 }
 

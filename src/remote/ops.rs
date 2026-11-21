@@ -32,8 +32,50 @@ pub struct FileMeta {
     pub mtime: Option<SystemTime>,
 }
 
+/// An entry's identity on this machine: its device and inode — and its status-change time, which
+/// a new file given a freed inode's number (ext4 reuses one at once) does not share.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Ident {
+    pub dev: u64,
+    pub ino: u64,
+    /// `st_ctime`, seconds and nanoseconds.
+    pub ctime: (i64, i64),
+}
+
+impl Ident {
+    /// The device and inode alone (one entry seen twice at one moment).
+    pub fn inode(&self) -> (u64, u64) {
+        (self.dev, self.ino)
+    }
+}
+
+/// An open descriptor held so its inode is not freed — nor its number given to another file —
+/// while sopen still compares a name with it (04 §5.1).
+#[derive(Clone)]
+pub struct Pin(std::sync::Arc<std::fs::File>);
+
+impl Pin {
+    pub fn new(file: std::fs::File) -> Self {
+        Self(std::sync::Arc::new(file))
+    }
+
+    /// The device and inode of what the descriptor holds (`fstat`): never another file's, as the
+    /// number cannot be reused while it is open.
+    pub fn inode(&self) -> Option<(u64, u64)> {
+        use std::os::unix::fs::MetadataExt;
+        let m = self.0.metadata().ok()?;
+        Some((m.dev(), m.ino()))
+    }
+}
+
+impl std::fmt::Debug for Pin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Pin")
+    }
+}
+
 /// A file copied under a temp name, not yet published.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct Staged {
     /// The temp's size when it was closed.
     pub size: u64,
@@ -48,6 +90,18 @@ pub struct Staged {
     /// machine): the engine publishes the name only while it is still this file. `None` over
     /// SFTP, which carries no inode.
     pub id: Option<(u64, u64)>,
+    /// That descriptor, held while the engine relies on `id` (publish, read-back, any cleanup):
+    /// the inode cannot be freed and its number reused meanwhile.
+    pub pin: Option<Pin>,
+}
+
+impl Staged {
+    /// The inode of the copy now: what the held descriptor reports (it follows the file through
+    /// a rename, also where the number itself changes with the name — an empty file on FAT or
+    /// exFAT), else `id` as it was when the copy was closed.
+    pub fn id_now(&self) -> Option<(u64, u64)> {
+        self.pin.as_ref().and_then(Pin::inode).or(self.id)
+    }
 }
 
 /// What a never-replacing rename did besides giving the new name.
@@ -83,6 +137,8 @@ pub struct StageFailure {
     /// machine): it is removed only while its name is still that file. `None` over SFTP, which
     /// carries no inode, or when nothing was created.
     pub id: Option<(u64, u64)>,
+    /// The descriptor it was written through, held until the cleanup compared `id`.
+    pub pin: Option<Pin>,
     pub error: anyhow::Error,
 }
 
@@ -92,8 +148,14 @@ impl StageFailure {
         Self {
             created: Created::No,
             id: None,
+            pin: None,
             error,
         }
+    }
+
+    /// The inode of what was created, as [`Staged::id_now`].
+    pub fn id_now(&self) -> Option<(u64, u64)> {
+        self.pin.as_ref().and_then(Pin::inode).or(self.id)
     }
 }
 
@@ -102,6 +164,7 @@ impl From<CreateError> for StageFailure {
         Self {
             created: e.created,
             id: None,
+            pin: None,
             error: e.error,
         }
     }
@@ -206,10 +269,18 @@ pub const REMOTE_FOLDER_RENAME: &str = "renaming a folder on a remote needs SFTP
 /// (a `Box<dyn FileOps + Send>`, an operation's own, 04 §5.1) serves both the stats and transfers
 /// of `RemoteFs` and these. None of them replaces an existing name.
 pub trait FileOps: RemoteFs {
-    /// The device and inode of `path` on this machine — of the entry itself (`lstat`), or with
-    /// `follow` of what a link there points at (`stat`); `None` over SFTP, which carries no
-    /// inode.
-    fn identity(&mut self, path: &str, follow: bool) -> Result<Option<(u64, u64)>>;
+    /// The identity of `path` on this machine — of the entry itself (`lstat`), or with `follow`
+    /// of what a link there points at (`stat`); `None` over SFTP, which carries no inode.
+    fn identity(&mut self, path: &str, follow: bool) -> Result<Option<Ident>>;
+
+    /// A descriptor on the entry `path` itself (never what a link points at), held so that the
+    /// inode of `id` — as [`FileOps::identity`] gave it just before — cannot be freed and its
+    /// number given to another file while the caller compares the name with it. `None` over
+    /// SFTP, where there is no inode; and locally where no descriptor can be had (too many open
+    /// files, an entry this account cannot open) or the name is no longer `id`'s entry.
+    fn pin(&mut self, _path: &str, _id: &Ident) -> Option<Pin> {
+        None
+    }
 
     /// `path`'s own permission bits, size and times (`lstat`).
     fn meta(&mut self, path: &str) -> Result<FileMeta>;

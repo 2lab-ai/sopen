@@ -336,7 +336,11 @@ impl SftpRemote {
 }
 
 impl FileOps for SftpRemote {
-    fn identity(&mut self, _path: &str, _follow: bool) -> Result<Option<(u64, u64)>> {
+    fn identity(
+        &mut self,
+        _path: &str,
+        _follow: bool,
+    ) -> Result<Option<crate::remote::ops::Ident>> {
         Ok(None)
     }
 
@@ -531,6 +535,7 @@ impl FileOps for SftpRemote {
                     source,
                     notes,
                     id: None,
+                    pin: None,
                 })
             };
             let staged = fill
@@ -602,6 +607,7 @@ impl FileOps for SftpRemote {
                 source: *meta,
                 notes,
                 id: None,
+                pin: None,
             })
         });
         staged.map_err(|e| StageFailure::from(CreateError::new(Created::Yes, e)))

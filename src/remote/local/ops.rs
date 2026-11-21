@@ -12,7 +12,7 @@
 
 use super::LocalFs;
 use crate::remote::ops::{
-    taken, FileMeta, FileOps, NoRename, Opened, Publish, Renamed, StageFailure, Staged,
+    taken, FileMeta, FileOps, Ident, NoRename, Opened, Pin, Publish, Renamed, StageFailure, Staged,
 };
 use crate::remote::{join, random_hex, split_parent, Cancelled, Created, Hashing};
 use anyhow::{anyhow, Context, Result};
@@ -35,6 +35,7 @@ fn c_path(path: &str) -> Result<CString> {
 struct At {
     dev: u64,
     ino: u64,
+    ctime: (i64, i64),
     dir: bool,
     link: bool,
 }
@@ -60,9 +61,38 @@ fn stat_at(dir: &fs::File, name: &CStr) -> std::io::Result<At> {
     Ok(At {
         dev: st.st_dev as u64,
         ino: st.st_ino as u64,
+        ctime: (st.st_ctime as i64, st.st_ctime_nsec as i64),
         dir: kind == libc::S_IFDIR,
         link: kind == libc::S_IFLNK,
     })
+}
+
+/// A descriptor on the entry `name` itself (never what a link points at, never blocking on a
+/// fifo), held so its inode cannot be freed and its number reused while sopen compares the name
+/// with it — `O_PATH` on Linux; on macOS a read-only open (`O_SYMLINK` for a link). `None` where
+/// it cannot be held (too many open files; on macOS an entry this account cannot read), or where
+/// what opened is not `own` any more.
+fn pin_at(dir: &fs::File, name: &CStr, own: &At) -> Option<fs::File> {
+    use std::os::fd::FromRawFd;
+    #[cfg(target_os = "linux")]
+    let flags = libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    #[cfg(target_os = "macos")]
+    let flags = if own.link {
+        libc::O_RDONLY | libc::O_SYMLINK | libc::O_CLOEXEC
+    } else {
+        libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC
+    };
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    let flags = libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC;
+    // SAFETY: an open descriptor and a NUL-terminated name.
+    let fd = unsafe { libc::openat(dir.as_raw_fd(), name.as_ptr(), flags) };
+    if fd < 0 {
+        return None;
+    }
+    // SAFETY: a descriptor just opened, owned by nothing else.
+    let file = unsafe { fs::File::from_raw_fd(fd) };
+    let m = file.metadata().ok()?;
+    ((m.dev(), m.ino()) == (own.dev, own.ino)).then_some(file)
 }
 
 /// The folder holding `path`, opened once: what is done to its entry goes through this
@@ -239,6 +269,7 @@ fn create_temp(temp: &str) -> std::result::Result<(fs::File, (u64, u64)), StageF
     let made = file.metadata().map_err(|e| StageFailure {
         created: Created::Yes,
         id: None,
+        pin: None,
         error: anyhow!(e).context(format!("cannot stat {temp}")),
     })?;
     let id = (made.dev(), made.ino());
@@ -352,17 +383,30 @@ fn kernel_copy(
 }
 
 impl FileOps for LocalFs {
-    fn identity(&mut self, path: &str, follow: bool) -> Result<Option<(u64, u64)>> {
+    fn identity(&mut self, path: &str, follow: bool) -> Result<Option<Ident>> {
         let meta = if follow {
             fs::metadata(path)
         } else {
             fs::symlink_metadata(path)
         };
         match meta {
-            Ok(m) => Ok(Some((m.dev(), m.ino()))),
+            Ok(m) => Ok(Some(Ident {
+                dev: m.dev(),
+                ino: m.ino(),
+                ctime: (m.ctime(), m.ctime_nsec()),
+            })),
             Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),
             Err(e) => Err(e).with_context(|| format!("cannot stat {path}")),
         }
+    }
+
+    fn pin(&mut self, path: &str, id: &Ident) -> Option<Pin> {
+        let (folder, name) = open_folder(path).ok()?;
+        let own = stat_at(&folder, &name).ok()?;
+        if (own.dev, own.ino) != (id.dev, id.ino) {
+            return None;
+        }
+        pin_at(&folder, &name, &own).map(Pin::new)
     }
 
     fn meta(&mut self, path: &str) -> Result<FileMeta> {
@@ -397,6 +441,9 @@ impl FileOps for LocalFs {
                  {to}; nothing was changed"
             ))));
         }
+        // The old entry's inode, held until the check before its unlink: while it is open, no
+        // other file can be given its number (ext4 reuses a freed one at once).
+        let pin = pin_at(&folder, &name, &own);
         let made = if own.link {
             read_link_at(&folder, &name).and_then(|target| {
                 // SAFETY: two NUL-terminated paths; the new link's is relative to the working
@@ -456,10 +503,24 @@ impl FileOps for LocalFs {
                      whether it is still there could not be confirmed"
                 )))
             }
-            Ok(now) if (now.dev, now.ino) != (own.dev, own.ino) => {
-                return Ok(both("another entry has its name now".into()))
+            Ok(now) => {
+                let same = match &pin {
+                    Some(pin) => pin
+                        .metadata()
+                        .is_ok_and(|m| (m.dev(), m.ino()) == (now.dev, now.ino)),
+                    // No descriptor could be held: the device and inode — kept alive by the
+                    // hard link just made — and for a link (made again elsewhere, so its old
+                    // inode may be freed and reused) its status-change time too, which a new
+                    // file does not share.
+                    None => {
+                        (now.dev, now.ino) == (own.dev, own.ino)
+                            && (!own.link || now.ctime == own.ctime)
+                    }
+                };
+                if !same {
+                    return Ok(both("another entry has its name now".into()));
+                }
             }
-            Ok(_) => {}
         }
         // SAFETY: an open descriptor and a NUL-terminated name; flags 0 removes a non-folder.
         Ok(
@@ -499,10 +560,22 @@ impl FileOps for LocalFs {
         }
         // SAFETY: a descriptor just opened, owned by nothing else.
         let probe = unsafe { fs::File::from_raw_fd(fd) };
-        let Ok(made) = probe.metadata() else {
-            return Ok((Publish::Atomic, Vec::new()));
+        let made = probe.metadata();
+        #[cfg(test)]
+        let made = if PROBE_STAT_FAILS.with(|f| f.get()) {
+            Err(std::io::Error::other("injected: no stat"))
+        } else {
+            made
         };
-        let id = (made.dev(), made.ino());
+        if let Err(e) = made {
+            let path = join(dir, &first);
+            return Ok((
+                Publish::Atomic,
+                vec![format!(
+                    "sopen's probe file {path} could not be checked ({e}); it was left as it is"
+                )],
+            ));
+        }
         let both = format!("{}\n{}", join(dir, &first), join(dir, &second));
         // The names that are still the probe's own.
         let (mode, ours): (Publish, Vec<(&CStr, &str)>) = match rename_excl_at(&folder, &f, &o) {
@@ -526,8 +599,20 @@ impl FileOps for LocalFs {
         let mut notes = Vec::new();
         for (name, shown) in ours {
             let path = join(dir, shown);
+            // Compared with the probe's descriptor as it is now, not with the number it had when
+            // it was made: an empty file's number follows its name on FAT and exFAT.
+            let held = match probe.metadata() {
+                Ok(m) => (m.dev(), m.ino()),
+                Err(e) => {
+                    notes.push(format!(
+                        "sopen's probe file {path} could not be checked ({e}); it was left as it \
+                         is"
+                    ));
+                    continue;
+                }
+            };
             match stat_at(&folder, name) {
-                Ok(now) if (now.dev, now.ino) == id => {
+                Ok(now) if held == (now.dev, now.ino) => {
                     // SAFETY: an open descriptor and a NUL-terminated name.
                     let gone =
                         zero_ok(unsafe { libc::unlinkat(folder.as_raw_fd(), name.as_ptr(), 0) });
@@ -566,12 +651,19 @@ impl FileOps for LocalFs {
         for dir in dirs {
             let folder = open(dir)?;
             // SAFETY: an open descriptor.
-            match zero_ok(unsafe { libc::fsync(folder.as_raw_fd()) }) {
-                Ok(()) => {}
-                // Some filesystems do not flush folders; their entries go with the data.
-                Err(e) if is_errno(&e, &[libc::EINVAL, libc::ENOTSUP, libc::EOPNOTSUPP]) => {}
-                Err(e) => return Err(e).with_context(|| format!("cannot flush the folder {dir}")),
-            }
+            let flushed = zero_ok(unsafe { libc::fsync(folder.as_raw_fd()) });
+            #[cfg(test)]
+            let flushed = match DIR_FSYNC_ERRNO.with(|e| e.get()) {
+                Some(errno) => Err(std::io::Error::from_raw_os_error(errno)),
+                None => flushed,
+            };
+            // Refused for any reason — unsupported included — the entries are not known to be
+            // on disk: no source may go on that.
+            flushed.map_err(|e| {
+                anyhow!(
+                    "this filesystem cannot confirm that the entries of {dir} are on disk ({e})"
+                )
+            })?;
         }
         #[cfg(target_os = "macos")]
         if let Some(dir) = dirs.last() {
@@ -685,11 +777,6 @@ impl FileOps for LocalFs {
         let (mut src, src_meta) = open_source(from).map_err(StageFailure::not_created)?;
         let source = meta_of(&src_meta);
         let (dst, id) = create_temp(temp)?;
-        let ours = |error: anyhow::Error| StageFailure {
-            created: Created::Yes,
-            id: Some(id),
-            error,
-        };
         let mut fill = || -> Result<Staged> {
             #[cfg(target_os = "linux")]
             let copied = kernel_copy(&src, &dst, source.size, cancel, progress)?;
@@ -711,9 +798,11 @@ impl FileOps for LocalFs {
                 source,
                 notes,
                 id: Some((made.dev(), made.ino())),
+                pin: None,
             })
         };
-        fill().map_err(ours)
+        let filled = fill();
+        pinned(filled, dst, id)
     }
 
     fn open_read(&mut self, path: &str) -> Result<Opened<'_>> {
@@ -746,13 +835,32 @@ impl FileOps for LocalFs {
                 source: *meta,
                 notes,
                 id: Some((made.dev(), made.ino())),
+                pin: None,
             })
         };
-        fill().map_err(|error| StageFailure {
+        let filled = fill();
+        pinned(filled, dst, id)
+    }
+}
+
+/// A copy's result with the descriptor it was written through kept as its pin: the engine relies
+/// on its inode until the read-back and any cleanup are done.
+fn pinned(
+    filled: Result<Staged>,
+    dst: fs::File,
+    id: (u64, u64),
+) -> std::result::Result<Staged, StageFailure> {
+    match filled {
+        Ok(staged) => Ok(Staged {
+            pin: Some(Pin::new(dst)),
+            ..staged
+        }),
+        Err(error) => Err(StageFailure {
             created: Created::Yes,
             id: Some(id),
+            pin: Some(Pin::new(dst)),
             error,
-        })
+        }),
     }
 }
 
@@ -777,6 +885,8 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
     static AFTER_PROBE: std::cell::RefCell<Option<crate::remote::ops::SeamHook>> =
         const { std::cell::RefCell::new(None) };
+    static DIR_FSYNC_ERRNO: std::cell::Cell<Option<i32>> = const { std::cell::Cell::new(None) };
+    static PROBE_STAT_FAILS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 #[cfg(all(test, target_os = "macos"))]
@@ -807,6 +917,18 @@ impl LocalFs {
         hook: impl FnMut(&str) + 'static,
     ) -> crate::remote::ops::SeamGuard {
         crate::remote::ops::set_seam(&BEFORE_UNLINK, hook)
+    }
+
+    /// The publish probe cannot stat its own file.
+    pub(crate) fn seam_probe_stat_fails() -> crate::remote::ops::SeamGuard {
+        PROBE_STAT_FAILS.with(|f| f.set(true));
+        crate::remote::ops::SeamGuard::new(|| PROBE_STAT_FAILS.with(|f| f.set(false)))
+    }
+
+    /// Every folder `fsync` of a barrier fails with this errno.
+    pub(crate) fn seam_dir_fsync_errno(errno: i32) -> crate::remote::ops::SeamGuard {
+        DIR_FSYNC_ERRNO.with(|e| e.set(Some(errno)));
+        crate::remote::ops::SeamGuard::new(|| DIR_FSYNC_ERRNO.with(|e| e.set(None)))
     }
 
     /// In the publish probe: after its file was renamed (or linked) to its second name, before
