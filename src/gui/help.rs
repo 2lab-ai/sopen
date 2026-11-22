@@ -459,6 +459,10 @@ mod tests {
                     keys: "F5".into(),
                     what: format!("Save (as {cmd}+S)")
                 },
+                Line {
+                    keys: "F7".into(),
+                    what: format!("Save As: a new local file with your edits (as Alt+{cmd}+S)")
+                },
                 aliases(),
             ]
         );

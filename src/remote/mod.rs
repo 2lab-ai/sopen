@@ -75,6 +75,32 @@ impl Stat {
     }
 }
 
+/// Where [`RemoteFs::write_atomic_with`] is, told as it happens: so a caller can record each
+/// step durably (07 §3.1) before the request that follows it.
+#[derive(Debug, Clone, Copy)]
+pub enum Step<'a> {
+    /// The temp's name, before its exclusive create: nothing is at it of this replace yet.
+    Named { temp: &'a str },
+    /// The temp was created and filled — one request sequence (`create_from`), so there is no
+    /// step between the two — and this is its `lstat` (the first request of the checks that
+    /// follow, not one more).
+    Written { temp: &'a str, stat: &'a Stat },
+    /// Every check before the replace passed: the temp as it will be renamed, and what was
+    /// uploaded into it. The rename is the next request.
+    Staged {
+        temp: &'a str,
+        stat: &'a Stat,
+        uploaded: &'a Uploaded,
+    },
+    /// The rename got its reply: the target is the temp now.
+    Renamed { temp: &'a str },
+    /// The temp this replace made was removed again (a change found, a failure): nothing of it
+    /// is left.
+    Removed { temp: &'a str },
+    /// The temp this replace made could not be removed: it is left, and the result names it.
+    Left { temp: &'a str },
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WriteOutcome {
     /// The target now holds the local content. `now` is the next save's baseline: the target's
@@ -579,6 +605,22 @@ pub trait RemoteFs: IntoBoxed {
         target: &str,
         expected: Fingerprint,
     ) -> Result<WriteOutcome> {
+        self.write_atomic_with(local, target, expected, &mut |_| Ok(()))
+    }
+
+    /// [`RemoteFs::write_atomic`], telling `steps` where it is as it goes ([`Step`]): the temp's
+    /// name before its create, the temp once written, the temp as it will be renamed, the rename
+    /// done, and a temp of its own removed or left. It sends nothing more than
+    /// [`RemoteFs::write_atomic`] does. An error `steps` returns stops the replace there, as a
+    /// failure would — a temp it made is removed, or named when it cannot be — and is the error
+    /// returned; once the rename has its reply, what `steps` returns changes nothing.
+    fn write_atomic_with(
+        &mut self,
+        local: &Path,
+        target: &str,
+        expected: Fingerprint,
+        steps: &mut dyn FnMut(Step<'_>) -> Result<()>,
+    ) -> Result<WriteOutcome> {
         if !self.can_replace() {
             bail!(
                 "this server cannot replace a file in one step (it does not offer \
@@ -600,6 +642,7 @@ pub trait RemoteFs: IntoBoxed {
         let (dir, name) = split_parent(target);
         let tmp = join(dir, &format!(".{name}.sopen-{}", random_hex()));
         let like = Like { mode, uid, gid };
+        steps(Step::Named { temp: &tmp })?;
         let uploaded = match self.create_from(local, &tmp, Some(like)) {
             Ok(u) => u,
             Err(e) if e.created == Created::Unknown => {
@@ -607,27 +650,44 @@ pub trait RemoteFs: IntoBoxed {
                 return Err(unknown_at(e.error, &what, &tmp));
             }
             Err(e) => {
-                let e = abandon(self, &tmp, e);
+                // As `abandon` does, `steps` told whether a temp the create made went.
+                let e = match e.created {
+                    Created::Yes => remove_telling(self, &tmp, e.error, steps),
+                    _ => abandon(self, &tmp, e),
+                };
                 return Err(e.context(format!("{target} was not replaced")));
             }
         };
         // The temp is ours from here: every exit removes it or names it.
         let swap = prepare_swap(
-            self, target, &tmp, &current, &expected, &uploaded, mode, &mut notes,
+            self, target, &tmp, &current, &expected, &uploaded, mode, &mut notes, steps,
         );
         let staged = match swap {
             Ok(Swap::Ready(staged)) => staged,
             Ok(Swap::Changed(now, reason)) => {
-                if let Err(e) = self.remove(&tmp) {
-                    notes.push(format!("the temp file {tmp} could not be removed: {e:#}"));
+                match self.remove(&tmp) {
+                    Ok(()) => {
+                        let _ = steps(Step::Removed { temp: &tmp });
+                    }
+                    Err(e) => {
+                        let _ = steps(Step::Left { temp: &tmp });
+                        notes.push(format!("the temp file {tmp} could not be removed: {e:#}"));
+                    }
                 }
                 return Ok(WriteOutcome::Conflict { now, reason, notes });
             }
             Err(e) => {
                 let e = e.context(format!("{target} was not replaced"));
-                return Err(remove_or_name(self, &tmp, e));
+                return Err(remove_telling(self, &tmp, e, steps));
             }
         };
+        if let Err(e) = steps(Step::Staged {
+            temp: &tmp,
+            stat: &staged,
+            uploaded: &uploaded,
+        }) {
+            return Err(remove_telling(self, &tmp, e, steps));
+        }
         if let Err(e) = self.rename_over(&tmp, target) {
             if is_outcome_unknown(&e) {
                 // It may have landed: the temp is not removed, and both paths are named.
@@ -637,8 +697,10 @@ pub trait RemoteFs: IntoBoxed {
             let e = e.context(format!(
                 "cannot rename {tmp} over {target}; {target} was not replaced"
             ));
-            return Err(remove_or_name(self, &tmp, e));
+            return Err(remove_telling(self, &tmp, e, steps));
         }
+        // Landed: nothing `steps` says now undoes that.
+        let _ = steps(Step::Renamed { temp: &tmp });
         // Replaced. Is the target still the object sopen staged?
         let after = self
             .lstat_opt(target)
@@ -832,6 +894,7 @@ fn prepare_swap<F: RemoteFs + ?Sized>(
     uploaded: &Uploaded,
     mode: u32,
     notes: &mut Vec<String>,
+    steps: &mut dyn FnMut(Step<'_>) -> Result<()>,
 ) -> Result<Swap> {
     // The temp as it will be renamed: what the target will be right after the rename. Owner
     // and mode were given through its handle (create_from); here they are only checked, never
@@ -839,6 +902,10 @@ fn prepare_swap<F: RemoteFs + ?Sized>(
     let staged = fs
         .lstat_opt(tmp)?
         .with_context(|| format!("{tmp} vanished right after it was uploaded"))?;
+    steps(Step::Written {
+        temp: tmp,
+        stat: &staged,
+    })?;
     if let Some(attr) = staged.missing {
         bail!("the server does not report the {attr} of {tmp}; cannot match the target's owner");
     }
@@ -900,6 +967,26 @@ fn abandon<F: RemoteFs + ?Sized>(fs: &mut F, path: &str, e: CreateError) -> anyh
         Created::No => e.error,
         Created::Yes => remove_or_name(fs, path, e.error),
         Created::Unknown => unknown_at(e.error, &format!("creating {path} got no reply"), path),
+    }
+}
+
+/// [`remove_or_name`] for [`RemoteFs::write_atomic_with`]: `steps` is told whether the temp
+/// went ([`Step::Removed`]) or is left ([`Step::Left`]).
+fn remove_telling<F: RemoteFs + ?Sized>(
+    fs: &mut F,
+    tmp: &str,
+    e: anyhow::Error,
+    steps: &mut dyn FnMut(Step<'_>) -> Result<()>,
+) -> anyhow::Error {
+    match fs.remove(tmp) {
+        Ok(()) => {
+            let _ = steps(Step::Removed { temp: tmp });
+            e
+        }
+        Err(re) => {
+            let _ = steps(Step::Left { temp: tmp });
+            e.context(format!("{tmp} is left behind ({re:#})"))
+        }
     }
 }
 
@@ -1022,3 +1109,6 @@ pub fn random_hex() -> String {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod steps_tests;

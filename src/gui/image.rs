@@ -1,10 +1,16 @@
 //! The image window (spec §6): fit/zoom/pan, a rectangle in image pixels, Crop, Pixelize,
 //! Cut / Copy / Paste through the system clipboard ([`clip`]), Undo/Redo, Save (backup first,
-//! conflict-checked overwrite) and Save copy (a new sibling).
+//! conflict-checked overwrite), Save copy (a new sibling) and Save As (a new local file, 07 §7).
 //!
-//! [`Doc`] is the edit model (decode, ops, history, encode) and [`ImageFile`] the write side;
-//! both are window-free, so the tests and the `SOPEN_AUTOSAVE` hook run the exact code the
-//! window's buttons run.
+//! [`Doc`] is the edit model (decode, ops, history, encode) and [`ImageFile`] the write side
+//! (`file.rs`); both are window-free, so the tests and the `SOPEN_AUTOSAVE` hook run the exact
+//! code the window's buttons run.
+//!
+//! Every unsaved edit is also kept on the local disk (07 §3, §8): [`Doc`] records each one as an
+//! [`Edit`], the window writes them, with the pasted pictures, to the session's journal, and the
+//! next open offers the journals of sessions that ended without a Save back — Restore replays
+//! the edits on the file as decoded again, once its whole SHA-256 is the one they were made on.
+//! While a Save, a Save copy or Save As runs the picture takes no edit, undo or redo (07 §10).
 //!
 //! As the file browser's preview (02 §4.2, [`embed_preview`]) the window shows the picture fitted,
 //! without toolbars, rows or prompt, and takes no input; [`dimensions`] and
@@ -12,11 +18,16 @@
 //! at every read of it), [`fitted`] the picture it shows, made off the window's thread.
 
 pub mod clip;
+mod file;
 pub mod probe;
 
+pub(in crate::gui) use file::failed;
+pub use file::{ImageFile, Saved, CANNOT_REPLACE};
+
 use super::fonts::{self, Face};
+use super::{binary, save_as};
 use super::{Hooks, Map, Op, Origin, Outcome, Selection, Status};
-use crate::remote::WriteOutcome;
+use crate::journal;
 use crate::stream::{Mark, ReadError, Reader, ReaderKind, Source};
 use anyhow::{anyhow, bail, Context as _, Result};
 use eframe::egui::{self, Color32, Key, Pos2, Rect, Sense, TextureHandle, Vec2};
@@ -26,7 +37,7 @@ use image::{
 };
 use num_traits::ToPrimitive;
 use sha2::{Digest as _, Sha256};
-use std::io::{Cursor, Write as _};
+use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver};
@@ -65,6 +76,396 @@ pub struct Doc {
     rev: u64,
     saved_rev: u64,
     copied_rev: u64,
+    /// The operations that make the picture from the file as opened or last saved: what the
+    /// journal keeps (07 §3).
+    trail: Trail,
+}
+
+/// One edit as the journal keeps it (07 §3 `edits`, one line each): what it did, with every
+/// choice it was made with, so that replaying it on the decoded file gives the same pixels.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Edit {
+    Crop {
+        rect: [u32; 4],
+    },
+    Pixelize {
+        rect: [u32; 4],
+        block: u32,
+    },
+    /// The rectangle left in `fill`.
+    Cut {
+        rect: [u32; 4],
+        fill: clip::Colour,
+    },
+    /// A picture laid into `rect` as `fit` says, `background` around it.
+    Paste {
+        rect: [u32; 4],
+        fit: clip::Fit,
+        background: clip::Colour,
+        picture: Arc<Picture>,
+    },
+    Text {
+        rect: [u32; 4],
+        colour: clip::Colour,
+        size: clip::TextSize,
+        text: String,
+    },
+}
+
+/// A pasted picture: its pixels, and the PNG the journal keeps of it (`paste-<sha256>.png`),
+/// made once, when it is first kept.
+#[derive(Debug)]
+pub struct Picture {
+    pub rgba: image::RgbaImage,
+    png: std::sync::OnceLock<journal::Paste>,
+}
+
+impl PartialEq for Picture {
+    fn eq(&self, other: &Self) -> bool {
+        self.rgba == other.rgba
+    }
+}
+
+impl Picture {
+    fn new(rgba: image::RgbaImage) -> Arc<Self> {
+        Arc::new(Self {
+            rgba,
+            png: std::sync::OnceLock::new(),
+        })
+    }
+
+    /// The PNG as the journal keeps it (lossless, 8-bit RGBA: decoding it gives the pixels).
+    pub fn paste(&self) -> Result<&journal::Paste> {
+        if let Some(paste) = self.png.get() {
+            return Ok(paste);
+        }
+        let (w, h) = self.rgba.dimensions();
+        let mut png = Vec::new();
+        image::codecs::png::PngEncoder::new(&mut png)
+            .write_image(self.rgba.as_raw(), w, h, image::ExtendedColorType::Rgba8)
+            .context("cannot keep the pasted picture")?;
+        Ok(self.png.get_or_init(|| journal::Paste::new(png)))
+    }
+}
+
+fn colour_text([r, g, b, a]: clip::Colour) -> String {
+    format!("{r:02x}{g:02x}{b:02x}{a:02x}")
+}
+
+fn parse_colour(text: &str) -> Result<clip::Colour> {
+    let ok = text.len() == 8 && text.bytes().all(|c| c.is_ascii_hexdigit());
+    anyhow::ensure!(ok, "'{text}' is not a colour (RRGGBBAA)");
+    let byte = |i: usize| u8::from_str_radix(&text[i..i + 2], 16).unwrap_or_default();
+    Ok([byte(0), byte(2), byte(4), byte(6)])
+}
+
+fn parse_sha(text: &str) -> Result<journal::Sha> {
+    let ok = text.len() == 64 && text.bytes().all(|c| c.is_ascii_hexdigit());
+    anyhow::ensure!(ok, "'{text}' is not a SHA-256");
+    let mut sha = [0u8; 32];
+    for (i, byte) in sha.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&text[2 * i..2 * i + 2], 16).unwrap_or_default();
+    }
+    Ok(sha)
+}
+
+/// Pasted text on one line: `%`, control characters and line breaks as `%XX`.
+fn escape_text(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        if c == '%' || c.is_control() {
+            let mut buf = [0u8; 4];
+            for b in c.encode_utf8(&mut buf).bytes() {
+                out.push_str(&format!("%{b:02X}"));
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+fn unescape_text(text: &str) -> Result<String> {
+    let mut out = Vec::with_capacity(text.len());
+    let mut bytes = text.bytes();
+    while let Some(b) = bytes.next() {
+        if b == b'%' {
+            let hex: Vec<u8> = bytes.by_ref().take(2).collect();
+            let byte = std::str::from_utf8(&hex)
+                .ok()
+                .filter(|h| h.len() == 2)
+                .and_then(|h| u8::from_str_radix(h, 16).ok())
+                .context("a broken %XX escape")?;
+            out.push(byte);
+        } else {
+            out.push(b);
+        }
+    }
+    String::from_utf8(out).context("the text is not UTF-8")
+}
+
+impl Edit {
+    /// Whether it can be applied to a picture of `size`, and the size it leaves: what the
+    /// model's own checks refuse (a rectangle outside the picture, an empty paste, blank text)
+    /// refused here first.
+    fn fits(&self, (w, h): (u32, u32)) -> Result<(u32, u32)> {
+        let rect = match self {
+            Edit::Crop { rect }
+            | Edit::Pixelize { rect, .. }
+            | Edit::Cut { rect, .. }
+            | Edit::Paste { rect, .. }
+            | Edit::Text { rect, .. } => *rect,
+        };
+        let [x, y, rw, rh] = rect;
+        if rw == 0 || rh == 0 || x.saturating_add(rw) > w || y.saturating_add(rh) > h {
+            bail!("rectangle {x},{y} {rw}×{rh} is outside the {w}×{h} image");
+        }
+        match self {
+            Edit::Crop { .. } => return Ok((rw, rh)),
+            Edit::Paste { picture, .. }
+                if picture.rgba.width() == 0 || picture.rgba.height() == 0 =>
+            {
+                bail!("the pasted picture is empty")
+            }
+            Edit::Text { text, .. } if text.trim().is_empty() => bail!("the pasted text is blank"),
+            _ => {}
+        }
+        Ok((w, h))
+    }
+
+    /// Its journal line: `crop X,Y,W,H`, `pixelize X,Y,W,H,BLOCK`, `cut X,Y,W,H,FILL`,
+    /// `paste X,Y,W,H,MODE,BACKGROUND,SHA256` (MODE `stretch`, `fit` or `1:1`) and
+    /// `text X,Y,W,H,COLOUR,SIZE,TEXT` (SIZE `fill` or `px=N`; TEXT escaped), colours as
+    /// `RRGGBBAA`. A paste's picture is kept beside it under its hash ([`Picture::paste`]).
+    pub fn line(&self) -> Result<String> {
+        let at = |[x, y, w, h]: [u32; 4]| format!("{x},{y},{w},{h}");
+        Ok(match self {
+            Edit::Crop { rect } => format!("crop {}", at(*rect)),
+            Edit::Pixelize { rect, block } => format!("pixelize {},{block}", at(*rect)),
+            Edit::Cut { rect, fill } => format!("cut {},{}", at(*rect), colour_text(*fill)),
+            Edit::Paste {
+                rect,
+                fit,
+                background,
+                picture,
+            } => format!(
+                "paste {},{},{},{}",
+                at(*rect),
+                fit.name(),
+                colour_text(*background),
+                crate::cache::hex(&picture.paste()?.sha256)
+            ),
+            Edit::Text {
+                rect,
+                colour,
+                size,
+                text,
+            } => {
+                let size = match size {
+                    clip::TextSize::Fill => "fill".to_string(),
+                    clip::TextSize::Px(px) => format!("px={px}"),
+                };
+                format!(
+                    "text {},{},{size},{}",
+                    at(*rect),
+                    colour_text(*colour),
+                    escape_text(text)
+                )
+            }
+        })
+    }
+
+    /// The edit a journal line names; a paste's picture comes from `paste` by its hash.
+    pub fn parse(
+        line: &str,
+        paste: &mut dyn FnMut(&journal::Sha) -> Result<Vec<u8>>,
+    ) -> Result<Self> {
+        let (word, rest) = line.split_once(' ').context("an edit with no fields")?;
+        // The text is the last field and may hold commas.
+        let fields: Vec<&str> = match word {
+            "text" => rest.splitn(7, ',').collect(),
+            _ => rest.split(',').collect(),
+        };
+        let number = |i: usize| -> Result<u32> {
+            let text = fields.get(i).context("a field is missing")?;
+            text.parse()
+                .with_context(|| format!("'{text}' is not a whole number"))
+        };
+        let rect = [number(0)?, number(1)?, number(2)?, number(3)?];
+        let count = match word {
+            "crop" => 4,
+            "pixelize" | "cut" => 5,
+            "paste" | "text" => 7,
+            other => bail!("unknown edit '{other}'"),
+        };
+        anyhow::ensure!(
+            fields.len() == count,
+            "a {word} line has {count} fields, not {}",
+            fields.len()
+        );
+        Ok(match word {
+            "crop" => Edit::Crop { rect },
+            "pixelize" => Edit::Pixelize {
+                rect,
+                block: number(4)?,
+            },
+            "cut" => Edit::Cut {
+                rect,
+                fill: parse_colour(fields[4])?,
+            },
+            "paste" => {
+                let fit = [clip::Fit::Stretch, clip::Fit::Fit, clip::Fit::OneToOne]
+                    .into_iter()
+                    .find(|f| f.name() == fields[4])
+                    .with_context(|| format!("'{}' is not a way to paste", fields[4]))?;
+                let sha = parse_sha(fields[6])?;
+                let png = paste(&sha)?;
+                let rgba = image::load_from_memory_with_format(&png, ImageFormat::Png)
+                    .context("the pasted picture cannot be read")?
+                    .to_rgba8();
+                let picture = Picture::new(rgba);
+                let kept = journal::Paste::new(png);
+                anyhow::ensure!(
+                    kept.sha256 == sha,
+                    "the pasted picture is not the one named"
+                );
+                let _ = picture.png.set(kept);
+                Edit::Paste {
+                    rect,
+                    fit,
+                    background: parse_colour(fields[5])?,
+                    picture,
+                }
+            }
+            _ => Edit::Text {
+                rect,
+                colour: parse_colour(fields[4])?,
+                size: match fields[5] {
+                    "fill" => clip::TextSize::Fill,
+                    px => clip::TextSize::Px(
+                        px.strip_prefix("px=")
+                            .and_then(|n| n.parse().ok())
+                            .filter(|n: &f32| n.is_finite() && *n > 0.0)
+                            .with_context(|| format!("'{px}' is not a text size"))?,
+                    ),
+                },
+                text: unescape_text(fields[6])?,
+            },
+        })
+    }
+}
+
+/// Where the picture is on the line of its edits, for the journal (07 §3): the operations
+/// recorded from `first` on, how many are in effect (`at`, both counted from the session's
+/// start) and where the file is (`base`). Undo and redo move `at`; an edit cuts the line at `at`
+/// and adds itself. The journal holds `ops[base..at]`: replayed on the file, they give the
+/// picture. Undo past the file, or an edit made there, leaves a picture that no operations on
+/// the file make ([`Trail::edits`] `None`) until the next Save.
+#[derive(Debug, Default)]
+struct Trail {
+    ops: Vec<Edit>,
+    first: usize,
+    at: usize,
+    base: Option<usize>,
+    /// Counts the edits that cut the line (dropped what Redo had): a [`Spot`] taken before one
+    /// is no longer on the line.
+    era: u64,
+}
+
+/// A place on the line of edits ([`Doc::spot`]): where the picture was when a Save took it, so
+/// that the Save, once it landed — maybe found only later — makes that place the file's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Spot {
+    at: usize,
+    era: u64,
+}
+
+impl Trail {
+    fn opened() -> Self {
+        Self {
+            base: Some(0),
+            ..Self::default()
+        }
+    }
+
+    /// `at` has its operations recorded (it is not below `first`, nor past what was recorded).
+    fn known(&self) -> bool {
+        self.at >= self.first && self.at - self.first <= self.ops.len()
+    }
+
+    fn commit(&mut self, op: Edit) {
+        if self.known() {
+            if self.ops.len() > self.at - self.first {
+                self.era += 1;
+            }
+            self.ops.truncate(self.at - self.first);
+        } else {
+            self.era += 1;
+            self.ops.clear();
+            self.first = self.at;
+        }
+        if self.base.is_some_and(|b| b > self.at || b < self.first) {
+            self.base = None;
+        }
+        self.ops.push(op);
+        self.at += 1;
+    }
+
+    fn undo(&mut self) {
+        self.at = self.at.saturating_sub(1);
+    }
+
+    fn redo(&mut self) {
+        self.at += 1;
+    }
+
+    /// The operations that make the picture from the file, when there are such.
+    fn edits(&self) -> Option<&[Edit]> {
+        let base = self.base?;
+        if base < self.first || self.at < base || !self.known() {
+            return None;
+        }
+        Some(&self.ops[base - self.first..self.at - self.first])
+    }
+
+    /// The picture is now the file (a Save landed): what led to it is not needed any more.
+    fn rebase(&mut self) {
+        self.rebase_to(self.spot());
+    }
+
+    fn spot(&self) -> Spot {
+        Spot {
+            at: self.at,
+            era: self.era,
+        }
+    }
+
+    /// The picture at `spot` is now the file. When that is the picture on screen, the file is a
+    /// fresh start of the line there — also below what was recorded (a Save of a picture Undo
+    /// took back past an earlier Save): the edits after it are journaled from it. Another spot
+    /// still on the line keeps the operations after it; one no longer on the line (an edit cut
+    /// it since), or never recorded, leaves no operations on the file.
+    fn rebase_to(&mut self, spot: Spot) {
+        if spot == self.spot() {
+            if self.known() {
+                self.ops.drain(..self.at - self.first);
+            } else {
+                self.ops.clear();
+            }
+            self.first = self.at;
+            self.base = Some(self.at);
+            return;
+        }
+        let on_line =
+            spot.era == self.era && spot.at >= self.first && spot.at - self.first <= self.ops.len();
+        if !on_line {
+            self.base = None;
+            return;
+        }
+        self.ops.drain(..spot.at - self.first);
+        self.first = spot.at;
+        self.base = Some(spot.at);
+    }
 }
 
 fn animated(bytes: &[u8], format: ImageFormat) -> bool {
@@ -501,6 +902,7 @@ impl Doc {
             rev: 0,
             saved_rev: 0,
             copied_rev: 0,
+            trail: Trail::opened(),
         })
     }
 
@@ -565,8 +967,102 @@ impl Doc {
         self.rev
     }
 
+    /// The file now holds revision `rev` (a Save landed). When that is the picture on screen,
+    /// the journal's edits start again from it ([`Doc::journal_edits`]); any other revision
+    /// leaves no edits the journal can write on the file.
     pub fn mark_saved(&mut self, rev: u64) {
         self.saved_rev = rev;
+        if rev == self.rev {
+            self.trail.rebase();
+        } else {
+            self.trail.base = None;
+        }
+    }
+
+    /// The file changed to a picture this window cannot place on its line of edits: no
+    /// operations on it make the picture (the journal says `NOT kept` until the next Save).
+    pub fn unbase(&mut self) {
+        self.trail.base = None;
+    }
+
+    /// Where the picture is on the line of its edits, for a Save to take ([`Doc::mark_saved_at`]).
+    pub fn spot(&self) -> Spot {
+        self.trail.spot()
+    }
+
+    /// A Save of revision `rev`, taken at `spot`, landed: the file is that picture now, and the
+    /// journal's operations start from there — also when the landing is found only later and
+    /// the picture has moved on since.
+    pub fn mark_saved_at(&mut self, rev: u64, spot: Spot) {
+        self.saved_rev = rev;
+        self.trail.rebase_to(spot);
+    }
+
+    /// The operations that, replayed on the file as opened or last saved, give the picture on
+    /// screen: what the journal keeps (07 §3). `None` when no operations do — Undo went past
+    /// the last Save, or an edit was made there.
+    pub fn journal_edits(&self) -> Option<&[Edit]> {
+        self.trail.edits()
+    }
+
+    /// Replays a journal's `edits` (one [`Edit::line`] each) on this picture, as the edits
+    /// that made them were: each its own undo step. Every line is read, every pasted picture
+    /// fetched from `paste` by its hash, and every edit checked against the picture as the ones
+    /// before it leave it, before anything is applied: an error leaves the picture as it was.
+    /// Returns how many were applied.
+    pub fn replay(
+        &mut self,
+        edits: &str,
+        paste: &mut dyn FnMut(&journal::Sha) -> Result<Vec<u8>>,
+        hangul: Option<&Face>,
+    ) -> Result<usize> {
+        let ops: Vec<Edit> = edits
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(|l| Edit::parse(l, paste).with_context(|| format!("cannot read the edit '{l}'")))
+            .collect::<Result<_>>()?;
+        self.editable()?;
+        let mut size = self.size();
+        for (n, op) in ops.iter().enumerate() {
+            size = op
+                .fits(size)
+                .with_context(|| format!("edit {} of {} cannot be replayed", n + 1, ops.len()))?;
+        }
+        for (n, op) in ops.iter().enumerate() {
+            if let Err(e) = self.apply(op, hangul) {
+                // Checked above, so not expected: what was applied is taken back.
+                for _ in 0..n {
+                    self.undo();
+                }
+                return Err(e.context(format!("edit {} of {} was not replayed", n + 1, ops.len())));
+            }
+        }
+        Ok(ops.len())
+    }
+
+    /// Applies one recorded edit, as the window's own did.
+    pub fn apply(&mut self, edit: &Edit, hangul: Option<&Face>) -> Result<()> {
+        match edit {
+            Edit::Crop { rect } => self.crop(*rect).map(drop),
+            Edit::Pixelize { rect, block } => self.pixelize(*rect, *block).map(drop),
+            Edit::Cut { rect, fill } => self.cut(Some(*rect), *fill).map(drop),
+            Edit::Paste {
+                rect,
+                fit,
+                background,
+                picture,
+            } => self
+                .paste_kept(Some(*rect), picture.clone(), *fit, *background)
+                .map(drop),
+            Edit::Text {
+                rect,
+                colour,
+                size,
+                text,
+            } => self
+                .text_sized(*rect, *size, text, *colour, hangul)
+                .map(drop),
+        }
     }
 
     pub fn can_undo(&self) -> bool {
@@ -592,7 +1088,8 @@ impl Doc {
         Ok(())
     }
 
-    fn commit(&mut self, next: DynamicImage) {
+    fn commit(&mut self, next: DynamicImage, op: Edit) {
+        self.trail.commit(op);
         let prev = std::mem::replace(&mut self.img, next);
         self.undo.push(prev);
         self.redo.clear();
@@ -608,7 +1105,7 @@ impl Doc {
         self.check_rect(rect)?;
         let [x, y, w, h] = rect;
         let next = self.img.crop_imm(x, y, w, h);
-        self.commit(next);
+        self.commit(next, Edit::Crop { rect });
         Ok(format!("cropped to {w}×{h}"))
     }
 
@@ -617,7 +1114,7 @@ impl Doc {
         self.check_rect(rect)?;
         let mut next = self.img.clone();
         pixelize(&mut next, rect, block);
-        self.commit(next);
+        self.commit(next, Edit::Pixelize { rect, block });
         Ok(format!(
             "pixelized {}×{} with {}px blocks",
             rect[2],
@@ -654,7 +1151,8 @@ impl Doc {
         let cut = self.copy(Some(rect))?;
         let mut next = self.img.clone();
         clip::fill(&mut next, rect, background);
-        self.commit(next);
+        let fill = background;
+        self.commit(next, Edit::Cut { rect, fill });
         Ok((cut, format!("cut {}×{}", rect[2], rect[3])))
     }
 
@@ -673,6 +1171,25 @@ impl Doc {
         if pw == 0 || ph == 0 {
             bail!("the clipboard image is empty");
         }
+        if let Some(rect) = rect {
+            self.check_rect(rect)?;
+        }
+        self.paste_kept(rect, Picture::new(picture.clone()), fit, background)
+    }
+
+    /// [`Doc::paste_image`] of a picture the journal keeps.
+    fn paste_kept(
+        &mut self,
+        rect: Option<[u32; 4]>,
+        picture: Arc<Picture>,
+        fit: clip::Fit,
+        background: clip::Colour,
+    ) -> Result<(String, [u32; 4])> {
+        self.editable()?;
+        let (pw, ph) = picture.rgba.dimensions();
+        if pw == 0 || ph == 0 {
+            bail!("the clipboard image is empty");
+        }
         let (rect, fit) = match rect {
             Some(rect) => {
                 self.check_rect(rect)?;
@@ -684,8 +1201,14 @@ impl Doc {
             }
         };
         let mut next = self.img.clone();
-        let at = clip::place(&mut next, rect, picture, fit, background);
-        self.commit(next);
+        let at = clip::place(&mut next, rect, &picture.rgba, fit, background);
+        let op = Edit::Paste {
+            rect,
+            fit,
+            background,
+            picture,
+        };
+        self.commit(next, op);
         let line = format!(
             "pasted image {pw}×{ph} → {}×{} ({})",
             at[2],
@@ -722,10 +1245,33 @@ impl Doc {
                 ([0, 0, w, h], clip::TextSize::Px(px))
             }
         };
+        self.text_sized(rect, size, text, colour, hangul)
+    }
+
+    /// [`Doc::paste_text`] into `rect` at `size`, as the journal keeps it.
+    fn text_sized(
+        &mut self,
+        rect: [u32; 4],
+        size: clip::TextSize,
+        text: &str,
+        colour: clip::Colour,
+        hangul: Option<&Face>,
+    ) -> Result<(String, [u32; 4])> {
+        self.editable()?;
+        if text.trim().is_empty() {
+            bail!("the clipboard text is blank");
+        }
+        self.check_rect(rect)?;
         let faces: Vec<&Face> = hangul.into_iter().chain([fonts::fallback()]).collect();
         let mut next = self.img.clone();
         let drawn = clip::draw_text(&mut next, rect, text, colour, &faces, size);
-        self.commit(next);
+        let op = Edit::Text {
+            rect,
+            colour,
+            size,
+            text: text.to_string(),
+        };
+        self.commit(next, op);
         // Counted as drawn: composed (a decomposed Korean syllable is one character, not three).
         let mut line = format!("pasted text ({} chars)", clip::composed(text).count());
         match (drawn.missing, hangul.is_some()) {
@@ -744,6 +1290,7 @@ impl Doc {
             return false;
         };
         self.redo.push(std::mem::replace(&mut self.img, prev));
+        self.trail.undo();
         self.rev += 1;
         true
     }
@@ -753,6 +1300,7 @@ impl Doc {
             return false;
         };
         self.undo.push(std::mem::replace(&mut self.img, next));
+        self.trail.redo();
         self.rev += 1;
         true
     }
@@ -963,200 +1511,8 @@ fn pixelize_buf<P: Pixel>(buf: &mut ImageBuffer<P, Vec<P::Subpixel>>, rect: [u32
 // ---------------------------------------------------------------------------------------------
 // The write side.
 
-/// The opened image file: where it lives, its bytes as opened (for the backup) and the local
-/// places sopen writes to.
-pub struct ImageFile {
-    pub origin: Origin,
-    /// The bytes as opened — what the backup holds. Kept in memory: a later fetch of the same
-    /// file can replace the cached copy while this window is open.
-    original: Arc<Vec<u8>>,
-    /// Encoded edits waiting to be uploaded, and refused ones: `<cache>/.edits/<host>/<abs>`.
-    edits: PathBuf,
-    /// `<cache>` (backups go to `<cache>/.backup/<host>/<abs>.<stamp>`).
-    cache_root: PathBuf,
-    /// Set by the first successful backup; later saves of the same session keep it.
-    backup: Option<PathBuf>,
-}
-
-/// Result of one Save.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Saved {
-    /// `notes`: what the owner must still hear (e.g. the remote changed right after the save).
-    Written {
-        remote: String,
-        backup: PathBuf,
-        notes: Vec<String>,
-        /// What the saved file does not carry (metadata), shown with the result.
-        not_kept: Vec<String>,
-    },
-    /// The remote changed since it was fetched; nothing was written.
-    Refused { message: String, kept: PathBuf },
-}
-
 /// Closing was asked for while a save runs.
 const CLOSES_AFTER_SAVE: &str = "the window closes when the save is done";
-
-/// Why Save cannot replace the file on this server (spec §5): Save copy still works.
-pub const CANNOT_REPLACE: &str = "this server cannot replace a file in one step (no \
-     posix-rename@openssh.com) — Save copy writes the edit next to the original instead";
-
-/// The one line for a write that failed, keeping the edit. A request that got no reply is
-/// "outcome unknown — check <path>", never "not saved". The hex window says it the same way.
-pub(super) fn failed(e: &anyhow::Error, staged: &Path) -> anyhow::Error {
-    match crate::remote::outcome_unknown(e) {
-        Some(unknown) => anyhow!(
-            "{unknown}; your edit is at {} (cause: {})",
-            staged.display(),
-            e.root_cause()
-        ),
-        None => anyhow!("{e:#}; not saved — your edit is at {}", staged.display()),
-    }
-}
-
-impl ImageFile {
-    pub fn new(origin: Origin, original: Vec<u8>, cache_root: &Path) -> Self {
-        let edits = crate::cache::edits_path(cache_root, origin.host(), &origin.abs);
-        Self {
-            origin,
-            original: Arc::new(original),
-            edits,
-            cache_root: cache_root.to_path_buf(),
-            backup: None,
-        }
-    }
-
-    pub fn original(&self) -> &[u8] {
-        &self.original
-    }
-
-    /// Whether Save can replace the original here (Save copy always can).
-    pub fn can_replace(&self) -> bool {
-        self.origin.can_replace()
-    }
-
-    /// The encoded edit in a new owner-only file next to where edits are kept (never over or
-    /// through an existing one).
-    fn stage(&self, encoded: &[u8], tag: &str) -> Result<PathBuf> {
-        let (path, mut file) = super::create_keep(&self.edits, tag)?;
-        if let Err(e) = file.write_all(encoded) {
-            let _ = std::fs::remove_file(&path);
-            return Err(e).with_context(|| format!("cannot write {}", path.display()));
-        }
-        Ok(path)
-    }
-
-    /// The local backup of the original, written once per session before the first overwrite.
-    fn ensure_backup(&mut self) -> Result<PathBuf> {
-        if let Some(path) = &self.backup {
-            return Ok(path.clone());
-        }
-        let first = crate::cache::backup_path(
-            &self.cache_root,
-            self.origin.host(),
-            &self.origin.abs,
-            SystemTime::now(),
-        );
-        // Another session's backup from the same second keeps its name: this one adds `-<random>`.
-        let (path, mut file) = crate::cache::create_unique(|attempt| {
-            if attempt == 0 {
-                return first.clone();
-            }
-            let mut name = first.file_name().unwrap_or_default().to_os_string();
-            name.push(format!("-{}", &crate::remote::random_hex()[..8]));
-            first.with_file_name(name)
-        })?;
-        if let Err(e) = file.write_all(self.original.as_slice()) {
-            let _ = std::fs::remove_file(&path);
-            return Err(e).with_context(|| format!("cannot write the backup {}", path.display()));
-        }
-        println!("backup of {} at {}", self.origin.display(), path.display());
-        self.backup = Some(path.clone());
-        Ok(path)
-    }
-
-    /// Save (spec §5), in this order: can this server replace a file in one step (refused
-    /// before anything is written if not) → the local backup of the original (printed) →
-    /// `encode` → stage the edit locally → conflict-checked overwrite. An encode failure leaves
-    /// the backup made; a refusal or a transport error keeps the edit in a local file whose
-    /// path the message names.
-    pub fn save(&mut self, encode: impl FnOnce() -> Result<Encoded>) -> Result<Saved> {
-        if !self.can_replace() {
-            bail!(
-                "{} was not touched: {CANNOT_REPLACE}",
-                self.origin.display()
-            );
-        }
-        let backup = self.ensure_backup()?;
-        let encoded = encode().with_context(|| {
-            format!(
-                "{} was not touched (the original is backed up at {})",
-                self.origin.display(),
-                backup.display()
-            )
-        })?;
-        let not_kept = encoded.not_kept;
-        let staged = self.stage(&encoded.bytes, "edited")?;
-        let result = (|| -> Result<Saved> {
-            let at = self.origin.at;
-            let abs = self.origin.abs.clone();
-            match self
-                .origin
-                .fs()?
-                .write_atomic(&staged, &abs, at.fingerprint())?
-            {
-                WriteOutcome::Written { now, notes } => {
-                    self.origin.at = now;
-                    let _ = std::fs::remove_file(&staged);
-                    Ok(Saved::Written {
-                        remote: self.origin.display(),
-                        backup,
-                        notes,
-                        not_kept,
-                    })
-                }
-                WriteOutcome::Conflict { reason, notes, .. } => {
-                    // A name of its own first, so the move cannot replace anyone's file.
-                    let (kept, _) = super::create_keep(&self.edits, "conflict")?;
-                    if let Err(e) = std::fs::rename(&staged, &kept) {
-                        let _ = std::fs::remove_file(&kept);
-                        return Err(e).with_context(|| {
-                            format!("cannot keep the edited copy at {}", kept.display())
-                        });
-                    }
-                    let mut message = format!(
-                        "{} changed since it was opened ({reason}); not saved — your edit is at {}",
-                        self.origin.display(),
-                        kept.display()
-                    );
-                    for note in notes {
-                        message.push_str(&format!("; {note}"));
-                    }
-                    Ok(Saved::Refused { message, kept })
-                }
-            }
-        })();
-        result.map_err(|e| failed(&e, &staged))
-    }
-
-    /// Save copy: `<stem>.edited.<ext>` next to the original (`-N` when taken). Returns the
-    /// printed path of the new file.
-    pub fn save_copy(&mut self, encoded: &[u8]) -> Result<String> {
-        let staged = self.stage(encoded, "copy")?;
-        let (dir, name) = self.origin.parent();
-        let wanted = super::edited_name(&name);
-        let result = self
-            .origin
-            .fs()
-            .and_then(|fs| fs.write_new_sibling(&staged, &dir, &wanted));
-        match result {
-            Ok(final_name) => {
-                let _ = std::fs::remove_file(&staged);
-                Ok(self.origin.show(&crate::remote::join(&dir, &final_name)))
-            }
-            Err(e) => Err(failed(&e, &staged)),
-        }
-    }
-}
 
 fn apply_state(doc: &mut Doc, sel: &mut Selection, block: &mut u32, hooks: &Hooks) -> Result<()> {
     let state = &hooks.state;
@@ -1225,6 +1581,17 @@ fn decoded_or_asking(
     }
 }
 
+/// `SOPEN_KEYS` (a receipt hook): keys the window of its own plays as the owner's, one each time
+/// it has settled — as the file browser plays them.
+fn keys_hook() -> Result<std::collections::VecDeque<super::browser::Play>> {
+    match std::env::var("SOPEN_KEYS") {
+        Ok(text) => Ok(super::browser::parse_keys(&text)
+            .map_err(|e| anyhow!("SOPEN_KEYS: {e}"))?
+            .into()),
+        Err(_) => Ok(Default::default()),
+    }
+}
+
 /// Opens the image: the window, or the windowless `SOPEN_AUTOSAVE` run.
 /// `notices` (where earlier copies' unsaved edits went) are shown whole in the window's rows.
 pub fn open(file: ImageFile, hooks: &Hooks, notices: Vec<String>) -> Result<Outcome> {
@@ -1250,6 +1617,9 @@ pub fn open(file: ImageFile, hooks: &Hooks, notices: Vec<String>) -> Result<Outc
     }
     let mut window = ImageWindow::new(file, doc, sel, block, notices);
     window.ask_close = hooks.state.ask_close;
+    window.restore_first = hooks.state.restore;
+    window.scripted = hooks.screenshot.is_some();
+    window.script = keys_hook()?;
     let outcome = window.outcome.clone();
     let leftover = window.leftover.clone();
     // A window that shows the image near 1:1 where the screen allows (the two toolbar rows,
@@ -1282,7 +1652,37 @@ fn autosave(mut file: ImageFile, doc: &Doc, hooks: &Hooks) -> Result<Outcome> {
     if let Some(line) = doc.not_kept_line() {
         eprintln!("sopen: {line}");
     }
-    match file.save(doc.encoder())? {
+    // The Save records its steps in a journal of the state's edits (07 §3.1), as the window's
+    // does. A scripted run keeps nothing of them — unless the outcome is unknown: then the next
+    // open reconciles it.
+    let take = doc
+        .journal_edits()
+        .filter(|ops| !ops.is_empty())
+        .map(|ops| file::Take {
+            rev: doc.rev(),
+            basis: file.basis(),
+            ops: ops.to_vec(),
+        });
+    let mut journal = match &take {
+        Some(take) => match file::begin_journal(&file, take) {
+            Ok(journal) => Some(journal),
+            Err(e) => {
+                eprintln!("sopen: the edits are not kept on disk: {e:#}");
+                None
+            }
+        },
+        None => None,
+    };
+    let saving = file::Saving::default();
+    let saved = file.save_kept(doc.encoder(), &mut journal, take.as_ref(), &saving);
+    if let Some(journal) = journal {
+        if journal.pending_save().is_none() {
+            if let Err(e) = journal.remove() {
+                eprintln!("sopen: {e:#}");
+            }
+        }
+    }
+    match saved? {
         Saved::Written {
             remote,
             notes,
@@ -1301,6 +1701,15 @@ fn autosave(mut file: ImageFile, doc: &Doc, hooks: &Hooks) -> Result<Outcome> {
             outcome.conflict = true;
             outcome.refused = Some(message);
         }
+        Saved::Found { notes } => {
+            outcome.saved = true;
+            for note in notes {
+                eprintln!("sopen: {note}");
+            }
+        }
+        Saved::Cancelled => bail!("{STOPPED}"),
+        // No one to answer here (a run's own journal has no earlier Save): said, not written.
+        Saved::Ask(left) => bail!("{}; nothing was written", left.line),
     }
     Ok(outcome)
 }
@@ -1362,6 +1771,29 @@ fn report(result: &Result<JobDone>, outcome: &mut Outcome) -> (Status, Vec<Strin
                 vec![message.clone()],
             )
         }
+        Ok(JobDone::Saved(Saved::Cancelled)) => {
+            eprintln!("sopen: {STOPPED}");
+            (Status::info(STOPPED), Vec::new())
+        }
+        Ok(JobDone::Saved(Saved::Found { notes })) => {
+            outcome.saved = true;
+            outcome.refused = None;
+            for note in notes {
+                eprintln!("sopen: {note}");
+            }
+            let line = notes.first().cloned().unwrap_or_default();
+            (Status::info(line), notes.clone())
+        }
+        // A question the window asks (a save gone with its window: said, nothing written).
+        Ok(JobDone::Saved(Saved::Ask(left))) => {
+            eprintln!("sopen: {}; nothing was written", left.line);
+            (
+                Status::error("not saved: answer about the interrupted save's temporary file"),
+                vec![left.line.clone()],
+            )
+        }
+        // The encode before Save As: the modal reports what it saves.
+        Ok(JobDone::Encoded(_)) => (Status::info("Save As…"), Vec::new()),
         Ok(JobDone::Copy(path, not_kept)) => {
             let line = super::with_notes(&format!("saved a copy at {path}"), not_kept);
             println!("{line}");
@@ -1385,9 +1817,18 @@ struct View {
     center: Option<Pos2>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum JobKind {
-    Save { close_after: bool },
-    SaveCopy { close_after: bool },
+    Save {
+        close_after: bool,
+    },
+    SaveCopy {
+        close_after: bool,
+    },
+    /// The encode Save As writes (07 §7, §8): the modal opens with its exact size.
+    SaveAs {
+        close_after: bool,
+    },
 }
 
 struct Job {
@@ -1400,6 +1841,98 @@ enum JobDone {
     Saved(Saved),
     /// The copy's printed path and what it does not carry.
     Copy(String, Vec<String>),
+    /// What Save As writes.
+    Encoded(Encoded),
+}
+
+/// While a Save, a Save copy or Save As runs (07 §10, §3.1): no edit, undo or redo.
+const SAVING: &str = "saving — editing resumes when the save is done";
+
+/// A Save stopped by Esc before its rename (07 §10).
+const STOPPED: &str = "stopped: nothing was written; the original is untouched";
+
+/// Why the journal holds nothing for a picture Undo took past the last Save (07 §3's `NOT kept
+/// on disk (<why>)`): its edits are not operations on the file as saved.
+/// A Save waiting on the answer about an earlier Save's temp.
+const ASKED: &str = "the save waits for your answer about the file at the interrupted save's \
+     temporary path";
+
+const PAST_THE_SAVE: &str = "undone past the last save, which the journal cannot replay";
+
+/// The Save As modal over the window, with the revision its encoder took and what that encoder
+/// did not keep.
+struct SavingAs {
+    modal: save_as::SaveAs,
+    rev: u64,
+    close_after: bool,
+    not_kept: Vec<String>,
+}
+
+/// A recovery row's answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Answer {
+    Restore,
+    Later,
+    Discard,
+    /// About a temp of uncertain ownership (07 §3.1).
+    Remove,
+    Keep,
+}
+
+/// `2026-11-20 11:42 UTC`.
+fn when(t: SystemTime) -> String {
+    let r = crate::cache::rfc3339(t);
+    format!("{} {} UTC", &r[..10], &r[11..16])
+}
+
+/// A recovery row's words (07 §3): `unsaved edits from 2026-11-20 11:42 UTC (3 operations)
+/// kept at ~/…`, then what stands in Restore's way, if anything.
+fn row_line(row: &file::Found) -> String {
+    let at = binary::tilde(row.orphan.dir());
+    let gen = match &row.orphan.found {
+        journal::Found::Edits(gen) => Some(gen),
+        journal::Found::Unusable { generation, .. } => generation.as_ref(),
+    };
+    if row.landed {
+        // Its edits are in the file: only the temp's question keeps the journal.
+        return format!(
+            "{} — its journal is kept at {at} until the file at that save's temporary path is \
+             answered for",
+            row.said.join("; ")
+        );
+    }
+    let mut line = match gen {
+        Some(gen) if gen.head.kind != journal::Kind::Image => format!(
+            "{} edits from {} kept at {at}",
+            gen.head.kind.word(),
+            when(gen.head.created)
+        ),
+        Some(gen) => format!(
+            "unsaved edits from {} ({}) kept at {at}",
+            when(gen.head.created),
+            plural(gen.edits.lines().count(), "operation")
+        ),
+        None => format!("unsaved edits kept at {at}"),
+    };
+    match &row.restore {
+        journal::Restore::Apply { notes } => {
+            for note in notes {
+                line.push_str(&format!(" — {note}"));
+            }
+        }
+        journal::Restore::Ask => line.push_str(&format!(" — {}", journal::ASK_PENDING)),
+        journal::Restore::Refuse { why } | journal::Restore::Unchecked { why } => {
+            line.push_str(&format!(" — not restored: {why}"));
+        }
+        journal::Restore::OtherKind(kind) => line.push_str(&format!(
+            " — made in the {} window; never applied here",
+            kind.word()
+        )),
+    }
+    for note in row.orphan.notes.iter().chain(&row.said) {
+        line.push_str(&format!("; {note}"));
+    }
+    line
 }
 
 struct ImageWindow {
@@ -1416,6 +1949,9 @@ struct ImageWindow {
     view: View,
     status: Status,
     job: Option<Job>,
+    /// How many saves have ended — a result taken, a refusal, a stop: what a wait for a save's
+    /// end counts (a queued Save has no `job` yet, so an empty `job` is not an end).
+    saves_ended: u64,
     outcome: Arc<Mutex<Outcome>>,
     prompt: bool,
     close_ok: bool,
@@ -1448,12 +1984,65 @@ struct ImageWindow {
     held: Option<Held>,
     /// `SOPEN_STATE` `close=ask`: closing is asked for on the first pass.
     ask_close: bool,
+    /// `SOPEN_STATE` `restore=1`: Restore on the first recovery row is pressed once it is drawn.
+    restore_first: bool,
     /// A preview in the file browser (02 §4.2): the picture fitted in a single-lined frame, no
     /// toolbars, status row or disclosures, and no input of its own.
     preview: bool,
     /// The picture a preview shows when the image is larger ([`fitted`], made off this thread);
     /// the hand-over shows the image itself again.
     shown: Option<image::RgbaImage>,
+    /// The journal of this session's edits (07 §3).
+    keeper: file::Keeper,
+    /// The revision last handed to the journal's schedule.
+    kept_rev: u64,
+    /// The journals earlier sessions left, each a row until it is answered (07 §3 Recovery).
+    rows: Vec<file::Found>,
+    /// A save asked for, waiting for the journal to hold the edits it writes (and for the look
+    /// for earlier sessions' journals): [`ImageWindow::launch`] starts it then.
+    queued: Option<JobKind>,
+    /// A generation at once was asked for while that look was out.
+    flush_wanted: bool,
+    /// The journal's keeper wakes the window when a generation is in (set on the first pass).
+    waking: bool,
+    /// Tests: where Save As's fill waits.
+    save_as_hold: Option<Arc<file::Hold>>,
+    /// The question a queued Save waits on (07 §3.1, [`file::Saved::Ask`]): a file at the temp
+    /// path of this session's cut-off Save, sopen unsure it is its own.
+    asking: Option<file::LeftTemp>,
+    /// Its Remove it, running on a worker.
+    answering: Option<Receiver<std::result::Result<String, String>>>,
+    /// Its Keep it, for the Save that goes on.
+    kept_temp: Option<String>,
+    /// A Remove it running on a worker, for the row of this journal.
+    removing: Option<(PathBuf, Receiver<std::result::Result<String, String>>)>,
+    /// They were looked for: on the first pass as the image window, never as a preview (a
+    /// listing holds each journal's lock until it is answered).
+    listed: bool,
+    /// The look for them, on a worker (it may reconcile a cut-off Save over the connection):
+    /// no Save until it is back.
+    recovering: Option<Receiver<file::Recovered>>,
+    /// The Save As modal while it is open (07 §7).
+    saving_as: Option<SavingAs>,
+    /// The folder Save As's field starts in (`binary::download_dir()`).
+    save_as_folder: PathBuf,
+    /// The file's name (Save As's field).
+    name: String,
+    /// What the journal's edits are against: the file as read, then as last saved.
+    basis: file::Basis,
+    /// The running Save's progress and Cancel (07 §10), and where on the line of edits it took
+    /// the picture.
+    saving: Arc<file::Saving>,
+    save_spot: Spot,
+    /// A Save whose outcome is unknown: its revision and place, for when the next Save finds
+    /// it landed (07 §3.1).
+    pending: Option<(u64, Spot)>,
+    /// A scripted run (`SOPEN_SCREENSHOT`): its edits are the state's, and it keeps no journal
+    /// of them — unless a Save's outcome is unknown.
+    scripted: bool,
+    /// `SOPEN_KEYS`: keys played as the owner's own, one each time the window has settled.
+    script: std::collections::VecDeque<super::browser::Play>,
+    script_gap: u8,
 }
 
 /// A Cut or Paste whose key has not been let go yet. egui-winit 0.37 drops winit's key-repeat
@@ -1485,6 +2074,18 @@ impl Drop for ImageWindow {
         if let Some(job) = self.job.take() {
             *self.leftover.lock().unwrap() = Some(job);
         }
+        // Discard came while a generation was being written: the journal goes once it is in —
+        // waited for on a thread of its own.
+        if self.keeper.removing() {
+            self.keeper.remove_when_written();
+        }
+        // A scripted run's edits are its state's, not the owner's: nothing of them is kept —
+        // unless a Save's outcome is unknown (the next open reconciles it).
+        if self.scripted && self.keeper.settle_writer().pending_save() == Some(false) {
+            if let Err(e) = self.keeper.discard() {
+                eprintln!("sopen: {e:#}");
+            }
+        }
     }
 }
 
@@ -1501,6 +2102,8 @@ impl ImageWindow {
             .into_iter()
             .chain((!can_replace).then(|| CANNOT_REPLACE.to_string()))
             .collect();
+        let keeper = file::Keeper::new(&file);
+        let (name, basis) = (file.origin.parent().1, file.basis());
         Self {
             title: file.origin.display(),
             can_replace,
@@ -1513,6 +2116,7 @@ impl ImageWindow {
             view: View::default(),
             status: Status::default(),
             job: None,
+            saves_ended: 0,
             outcome: Arc::default(),
             prompt: false,
             close_ok: false,
@@ -1531,8 +2135,531 @@ impl ImageWindow {
             text_colour: Color32::BLACK,
             held: None,
             ask_close: false,
+            restore_first: false,
             preview: false,
             shown: None,
+            keeper,
+            kept_rev: 0,
+            rows: Vec::new(),
+            removing: None,
+            asking: None,
+            answering: None,
+            kept_temp: None,
+            queued: None,
+            flush_wanted: false,
+            waking: false,
+            save_as_hold: None,
+            listed: false,
+            recovering: None,
+            saving_as: None,
+            save_as_folder: binary::download_dir(),
+            name,
+            basis,
+            saving: file::Saving::new(),
+            save_spot: Spot { at: 0, era: 0 },
+            pending: None,
+            scripted: false,
+            script: Default::default(),
+            script_gap: 0,
+        }
+    }
+
+    /// A save runs or waits in its queue (tests: "started").
+    #[cfg(test)]
+    fn saving_or_queued(&self) -> bool {
+        self.job.is_some() || self.queued.is_some()
+    }
+
+    /// The save asked for after [`ImageWindow::saves_ended`] was `since` has ended: its result
+    /// taken (or it was refused or stopped), and nothing runs, waits in the queue or is open in
+    /// Save As (tests).
+    #[cfg(test)]
+    fn save_ended(&self, since: u64) -> bool {
+        self.saves_ended > since
+            && self.job.is_none()
+            && self.queued.is_none()
+            && self.saving_as.is_none()
+    }
+
+    /// Nothing runs or waits: no save, no generation being written or due, the look for
+    /// earlier sessions' journals back (tests).
+    #[cfg(test)]
+    fn quiet(&self) -> bool {
+        self.job.is_none()
+            && self.queued.is_none()
+            && self.recovering.is_none()
+            && self.removing.is_none()
+            && self.keeper.settled()
+    }
+
+    /// A Save, a Save copy or Save As is under way: the picture takes no edit, undo or redo
+    /// until it ends (07 §10, §3.1).
+    fn edits_held(&self) -> bool {
+        self.job.is_some() || self.saving_as.is_some() || self.queued.is_some()
+    }
+
+    /// An edit asked for while they are held: nothing happens, and the status row says why.
+    fn held_back(&mut self) -> bool {
+        if self.edits_held() {
+            self.status = Status::info(SAVING);
+        }
+        self.edits_held()
+    }
+
+    /// The generation the journal would write now: the picture's operations on the file.
+    fn take(&self, ops: &[Edit]) -> file::Take {
+        file::Take {
+            rev: self.doc.rev(),
+            basis: self.basis.clone(),
+            ops: ops.to_vec(),
+        }
+    }
+
+    /// The journal, each pass (07 §3): nothing while a save runs; gone once nothing is unsaved;
+    /// a generation at most [`journal::DELAY`] after a change, written on a worker; `NOT kept`
+    /// for a picture no operations on the file make.
+    fn keep(&mut self, ctx: &egui::Context) {
+        self.keeper.poll();
+        // Nothing while a Save runs, nor while the look for earlier sessions' journals is out:
+        // it would take a journal this session is making for an earlier one's.
+        if self.job.is_some() || self.saving_as.is_some() || self.recovering.is_some() {
+            return;
+        }
+        // A generation asked for at once while that look was out (focus loss, closing, a Save).
+        if std::mem::take(&mut self.flush_wanted) {
+            self.keep_now();
+        }
+        if self.queued.is_some() {
+            return;
+        }
+        let rev = self.doc.rev();
+        let ops = match self.doc.journal_edits() {
+            _ if !self.doc.unsaved() => None,
+            Some([]) => None,
+            Some(ops) => Some(Ok(ops.to_vec())),
+            None => Some(Err(())),
+        };
+        let Some(ops) = ops else {
+            // Nothing to keep: the edits are in the file or a copy, or there are none — but a
+            // Save whose outcome is unknown keeps its record for a reconciliation (07 §3.1).
+            if self.keeper.holds() && self.keeper.pending_save() == Some(false) {
+                if let Err(e) = self.keeper.remove() {
+                    self.status = Status::error(format!("{e:#}"));
+                }
+            }
+            self.kept_rev = rev;
+            return;
+        };
+        let now = std::time::Instant::now();
+        if rev != self.kept_rev {
+            self.keeper.changed(rev, now);
+            self.kept_rev = rev;
+        }
+        match ops {
+            Err(()) => self.keeper.cannot(PAST_THE_SAVE),
+            Ok(ops) if self.keeper.is_due(now) => {
+                let take = self.take(&ops);
+                self.keeper.write_later(take);
+            }
+            Ok(_) => {
+                if let Some(due) = self.keeper.due() {
+                    ctx.request_repaint_after(due.saturating_duration_since(now));
+                }
+            }
+        }
+    }
+
+    /// A generation at once (07 §3: focus loss, closing, before a Save starts) — when there is
+    /// something to keep. Written on a worker, never waited for on the window's thread: a Save
+    /// waits in its queue until it is in ([`ImageWindow::launch`]). While the look for earlier
+    /// sessions' journals is out, it is asked for once that is back.
+    fn keep_now(&mut self) {
+        self.keeper.poll();
+        if self.recovering.is_some() {
+            self.flush_wanted = true;
+            return;
+        }
+        // While a save runs nothing changes (the journal was written as it started), and its
+        // worker has the journal.
+        if self.job.is_some() || self.saving_as.is_some() {
+            return;
+        }
+        // Nothing to keep now (back to the file, or past a Save): a generation still due for an
+        // earlier picture is not written — a queued Save waits on nothing.
+        let ops = match self.doc.journal_edits() {
+            _ if !self.doc.unsaved() => return self.keeper.unschedule(),
+            Some([]) => return self.keeper.unschedule(),
+            None => return self.keeper.cannot(PAST_THE_SAVE),
+            Some(ops) => ops,
+        };
+        let rev = self.doc.rev();
+        if rev != self.kept_rev {
+            self.keeper.changed(rev, std::time::Instant::now());
+            self.kept_rev = rev;
+        }
+        let take = self.take(ops);
+        self.keeper.flush(take);
+    }
+
+    /// The journals earlier sessions left (07 §3 Recovery), looked for once, as the image
+    /// window (never as a preview).
+    fn list_journals(&mut self, ctx: &egui::Context) {
+        if std::mem::replace(&mut self.listed, true) {
+            return;
+        }
+        // The whole hash the journal keeps as evidence, taken off this thread before an edit
+        // asks for it (a stream gave it already).
+        let basis = self.basis.clone();
+        let _ = std::thread::Builder::new()
+            .name("image-hash".into())
+            .spawn(move || {
+                basis.whole();
+            });
+        let (tx, rx) = mpsc::channel();
+        let (file, basis, ctx) = (self.file.clone(), self.basis.clone(), ctx.clone());
+        let fs = self.keeper.fs();
+        let spawned = std::thread::Builder::new()
+            .name("image-recover".into())
+            .spawn(move || {
+                let _ = tx.send(file::recover(&file, &basis, &fs));
+                ctx.request_repaint();
+            });
+        match spawned {
+            Ok(_) => self.recovering = Some(rx),
+            Err(e) => self.opened.push(format!(
+                "earlier unsaved edits could not be looked for: {e}"
+            )),
+        }
+    }
+
+    /// The look for earlier sessions' journals, once it is back: its rows, and what it settled.
+    fn poll_recovery(&mut self) {
+        let Some(rx) = &self.recovering else {
+            return;
+        };
+        let found = match rx.try_recv() {
+            Ok(found) => found,
+            Err(mpsc::TryRecvError::Empty) => return,
+            Err(mpsc::TryRecvError::Disconnected) => file::Recovered::default(),
+        };
+        self.recovered(found);
+    }
+
+    fn recovered(&mut self, found: file::Recovered) {
+        self.recovering = None;
+        for note in &found.notes {
+            eprintln!("sopen: {note}");
+        }
+        self.opened.extend(found.notes);
+        self.rows = found.rows;
+    }
+
+    /// Restore (07 §3): the row's operations replayed on the picture as decoded — only while it
+    /// has no edits of its own — and its journal this session's from now on.
+    fn restore(&mut self, at: usize) {
+        // The edits are replayed on the file: the picture must be it, with no edits of its own.
+        let on_the_file = self.doc.journal_edits().is_some_and(|ops| ops.is_empty());
+        if self.edits_held() || !on_the_file {
+            return self.status = Status::error(
+                "Restore replays its edits on the file as it is: undo your edits first",
+            );
+        }
+        if self.rows[at].temp.is_some() || self.rows[at].landed {
+            return self.status =
+                Status::error("answer about the interrupted save's temporary file first");
+        }
+        if !self.keeper.settled() {
+            return self.status =
+                Status::info("the journal is being written — Restore again in a moment");
+        }
+        // Checked again here: a Save since the listing made another file of it.
+        file::recheck(&self.basis, &mut self.rows[at]);
+        if !matches!(
+            self.rows[at].restore,
+            journal::Restore::Apply { .. } | journal::Restore::Ask
+        ) {
+            return self.status =
+                Status::error(format!("not restored: {}", row_line(&self.rows[at])));
+        }
+        let row = self.rows.remove(at);
+        let journal::Found::Edits(gen) = &row.orphan.found else {
+            return self.rows.insert(at, row);
+        };
+        let edits = gen.edits.clone();
+        let orphan = &row.orphan;
+        let mut paste = |sha: &journal::Sha| orphan.read_paste(sha);
+        match self.doc.replay(&edits, &mut paste, fonts::hangul()) {
+            Ok(n) => {
+                self.status = Status::info(format!("restored {}", plural(n, "edit")));
+                match row.orphan.adopt() {
+                    Ok(mut journal) => {
+                        // A Save its session left cut off ends here: its row named what to
+                        // check, and these edits are now this window's.
+                        if journal.pending_save().is_some() {
+                            if let Err(e) = journal.clear_save() {
+                                self.opened.push(format!("{e:#}"));
+                            }
+                        }
+                        self.keeper.adopt(journal);
+                    }
+                    Err(e) => self
+                        .opened
+                        .push(format!("the restored edits are kept anew: {e:#}")),
+                }
+            }
+            Err(e) => {
+                // Nothing was applied (the replay checks every edit first); the row stays.
+                self.status = Status::error(format!("not restored: {e:#}"));
+                self.rows.insert(at, row);
+            }
+        }
+        self.tex_rev = None;
+    }
+
+    /// The rows of the journals earlier sessions left: what each holds, where it is kept, and
+    /// Restore (where its check passed), Later and Discard — buttons, not plain-letter keys. A
+    /// temp of uncertain ownership is asked about first — Remove it, Keep it — and Restore and
+    /// Discard wait for the answer; Later asks it again on the next open. A journal whose Save
+    /// landed offers only that question. A row whose removal is running takes no answer.
+    fn recovery_rows(&mut self, ui: &mut egui::Ui) {
+        let mut answer = None;
+        // While a removal runs, no row takes an answer (one runs at a time).
+        let busy = self.removing.is_some();
+        // `restore=1`: the first row's Restore, pressed as a click would.
+        let press_first = self.restore_first && !self.rows.is_empty() && !busy;
+        for (i, row) in self.rows.iter().enumerate() {
+            let line = row_line(row);
+            let pending = busy;
+            ui.horizontal_wrapped(|ui| {
+                ui.label(egui::RichText::new(line).color(ui.visuals().warn_fg_color));
+                ui.add_enabled_ui(!pending, |ui| {
+                    if let Some(left) = &row.temp {
+                        ui.label(egui::RichText::new(&left.line).color(ui.visuals().warn_fg_color));
+                        if ui.button("Remove it").clicked() {
+                            answer = Some((i, Answer::Remove));
+                        }
+                        if ui.button("Keep it").clicked() {
+                            answer = Some((i, Answer::Keep));
+                        }
+                    } else if !row.landed {
+                        let can = matches!(
+                            row.restore,
+                            journal::Restore::Apply { .. } | journal::Restore::Ask
+                        );
+                        let label = if matches!(row.restore, journal::Restore::Ask) {
+                            "Restore anyway"
+                        } else {
+                            "Restore"
+                        };
+                        if can && (ui.button(label).clicked() || (i == 0 && press_first)) {
+                            answer = Some((i, Answer::Restore));
+                        }
+                    }
+                    if ui
+                        .button("Later")
+                        .on_hover_text("asked again on the next open")
+                        .clicked()
+                    {
+                        answer = Some((i, Answer::Later));
+                    }
+                    if row.temp.is_none()
+                        && !row.landed
+                        && ui
+                            .button("Discard")
+                            .on_hover_text(format!(
+                                "deletes the kept edits at {}",
+                                binary::tilde(row.orphan.dir())
+                            ))
+                            .clicked()
+                    {
+                        answer = Some((i, Answer::Discard));
+                    }
+                });
+            });
+        }
+        if press_first {
+            self.restore_first = false;
+        }
+        if let Some((i, answer)) = answer {
+            self.answer(i, answer);
+        }
+    }
+
+    /// A recovery row's answer. Remove it runs on a worker ([`ImageWindow::poll_removal`]); while
+    /// it runs, that row takes no answer.
+    fn answer(&mut self, i: usize, answer: Answer) {
+        if self.removing.is_some() {
+            return;
+        }
+        match answer {
+            Answer::Restore => self.restore(i),
+            Answer::Later => drop(self.rows.remove(i)),
+            Answer::Discard => {
+                if let Err(e) = self.rows.remove(i).orphan.remove() {
+                    self.status = Status::error(format!("{e:#}"));
+                }
+            }
+            Answer::Keep => {
+                self.rows[i].temp = None;
+                self.temp_answered(i);
+            }
+            Answer::Remove => {
+                let Some(left) = self.rows[i].temp.clone() else {
+                    return;
+                };
+                if self.edits_held() || self.recovering.is_some() {
+                    return self.status =
+                        Status::info("the file is busy — answer again in a moment");
+                }
+                let dir = self.rows[i].orphan.dir().to_path_buf();
+                let (tx, rx) = mpsc::channel();
+                let file = self.file.clone();
+                let spawned = std::thread::Builder::new()
+                    .name("image-remove-temp".into())
+                    .spawn(move || {
+                        let _ = tx.send(file::remove_left(&file, &left));
+                    });
+                match spawned {
+                    Ok(_) => {
+                        self.removing = Some((dir, rx));
+                        self.status = Status::info("checking the file before removing it…");
+                    }
+                    Err(e) => self.status = Status::error(format!("{e}")),
+                }
+            }
+        }
+    }
+
+    /// A temp's question answered (Keep it, or a removal done): its `save` record ends, and a
+    /// journal whose Save landed is retired — its edits are in the file.
+    fn temp_answered(&mut self, i: usize) {
+        if self.rows[i].landed {
+            let row = self.rows.remove(i);
+            match row.orphan.landed() {
+                Ok(_) => {}
+                Err(e) => self.status = Status::error(format!("{e:#}")),
+            }
+            return;
+        }
+        if let Err(e) = self.rows[i].orphan.clear_save() {
+            self.status = Status::error(format!("{e:#}"));
+        }
+    }
+
+    /// The question a queued Save waits on (07 §3.1): Remove it — only the file shown, checked
+    /// again on a worker — or Keep it; the Save goes on after the answer. Its buttons are off
+    /// while Remove it runs.
+    fn asked_row(&mut self, ui: &mut egui::Ui) {
+        let Some(left) = &self.asking else {
+            return;
+        };
+        let free = self.answering.is_none();
+        let mut answer = None;
+        ui.horizontal_wrapped(|ui| {
+            ui.label(egui::RichText::new(&left.line).color(ui.visuals().warn_fg_color));
+            if ui
+                .add_enabled(free, egui::Button::new("Remove it"))
+                .clicked()
+            {
+                answer = Some(Answer::Remove);
+            }
+            if ui.add_enabled(free, egui::Button::new("Keep it")).clicked() {
+                answer = Some(Answer::Keep);
+            }
+        });
+        match answer {
+            Some(Answer::Keep) => {
+                let left = self.asking.take().expect("asked");
+                self.kept_temp = Some(left.path);
+                self.status = Status::info(format!(
+                    "the file at the interrupted save's temporary path is kept · {SAVING}"
+                ));
+            }
+            Some(Answer::Remove) => {
+                let left = left.clone();
+                let (tx, rx) = mpsc::channel();
+                let file = self.file.clone();
+                let spawned = std::thread::Builder::new()
+                    .name("image-remove-temp".into())
+                    .spawn(move || {
+                        let _ = tx.send(file::remove_left(&file, &left));
+                    });
+                match spawned {
+                    Ok(_) => {
+                        self.answering = Some(rx);
+                        self.status = Status::info("checking the file before removing it…");
+                    }
+                    Err(e) => self.status = Status::error(format!("{e}")),
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Remove it for the queued Save's question, once it is back: removed — the Save goes on;
+    /// kept (it was not the file shown, or could not be checked) — the Save is refused, with
+    /// why, and the next Save asks about the file there then.
+    fn poll_answer(&mut self, ctx: &egui::Context) {
+        let Some(rx) = &self.answering else {
+            return;
+        };
+        let result = match rx.try_recv() {
+            Ok(result) => result,
+            Err(mpsc::TryRecvError::Empty) => return,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                Err("the removal stopped without a result".to_string())
+            }
+        };
+        self.answering = None;
+        self.asking = None;
+        match result {
+            Ok(line) => self.status = Status::info(format!("{line} · {SAVING}")),
+            Err(why) => {
+                self.queued = None;
+                self.saves_ended += 1;
+                self.status = Status::error(format!("not saved: {why}"));
+                self.pending_notices = Some(vec![format!(
+                    "{why} — not saved; Save again to be asked about the file there now"
+                )]);
+                if std::mem::take(&mut self.close_when_done) && self.doc.unsaved() {
+                    self.prompt = true;
+                }
+            }
+        }
+        if self.queued.is_some() {
+            self.launch(ctx);
+        }
+    }
+
+    /// A removal asked for by Remove it, once it is back: its row answered when it went; kept,
+    /// with why, when the file was not the one asked about.
+    fn poll_removal(&mut self) {
+        let Some((dir, rx)) = &self.removing else {
+            return;
+        };
+        let result = match rx.try_recv() {
+            Ok(result) => result,
+            Err(mpsc::TryRecvError::Empty) => return,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                Err("the removal stopped without a result".to_string())
+            }
+        };
+        let dir = dir.clone();
+        self.removing = None;
+        let Some(i) = self.rows.iter().position(|r| r.orphan.dir() == dir) else {
+            return;
+        };
+        match result {
+            Ok(line) => {
+                self.status = Status::info(line);
+                self.rows[i].temp = None;
+                self.temp_answered(i);
+            }
+            Err(why) => {
+                // The file and the record stay: the question is asked again, with why.
+                self.rows[i].said.push(why.clone());
+                self.status = Status::error(why);
+            }
         }
     }
 
@@ -1561,6 +2688,9 @@ impl ImageWindow {
     }
 
     fn crop(&mut self) {
+        if self.held_back() {
+            return;
+        }
         let Some(rect) = self.rect() else {
             return self.status = Status::error("draw a rectangle first");
         };
@@ -1573,6 +2703,9 @@ impl ImageWindow {
     }
 
     fn pixelize(&mut self) {
+        if self.held_back() {
+            return;
+        }
         let Some(rect) = self.rect() else {
             return self.status = Status::error("draw a rectangle first");
         };
@@ -1581,6 +2714,9 @@ impl ImageWindow {
     }
 
     fn undo(&mut self) {
+        if self.held_back() {
+            return;
+        }
         if self.doc.undo() {
             self.status = Status::info("undone");
         }
@@ -1640,7 +2776,7 @@ impl ImageWindow {
     /// that end a held one ([`Held`]) — also while the shortcuts themselves are off, so that a
     /// key let go meanwhile is not missed.
     fn clipboard(&mut self, ctx: &egui::Context) {
-        let off = self.prompt || ctx.text_edit_focused();
+        let off = self.prompt || self.saving_as.is_some() || ctx.text_edit_focused();
         let events: Vec<egui::Event> = ctx.input(|i| {
             i.events
                 .iter()
@@ -1684,6 +2820,11 @@ impl ImageWindow {
             if off || (action.is_some() && self.held == action) {
                 continue;
             }
+            if action.is_some() && self.held_back() {
+                // A cut or paste while a save runs does nothing (07 §10); its repeats neither.
+                self.held = action;
+                continue;
+            }
             match &event {
                 egui::Event::Copy => self.copy(ctx),
                 egui::Event::Cut => self.cut(ctx),
@@ -1710,13 +2851,16 @@ impl ImageWindow {
     }
 
     fn redo(&mut self) {
+        if self.held_back() {
+            return;
+        }
         if self.doc.redo() {
             self.status = Status::info("redone");
         }
     }
 
     fn start(&mut self, ctx: &egui::Context, kind: JobKind) {
-        if self.job.is_some() {
+        if self.edits_held() {
             return;
         }
         if let Some(reason) = &self.doc.read_only {
@@ -1730,30 +2874,77 @@ impl ImageWindow {
                 return self.status = Status::info("no changes to save");
             }
         }
+        // Before any save starts, the journal holds the edits it writes (07 §3): a generation is
+        // asked for now, and the save waits in its queue until it is in — and until the look
+        // for earlier sessions' journals is back (it may be reconciling over the connection).
+        // Nothing waits on the window's thread; no edit happens meanwhile.
+        self.queued = Some(kind);
+        self.status = Status::info(SAVING);
+        self.keep_now();
+        self.launch(ctx);
+    }
+
+    /// The queued save, once the journal holds its edits and nothing else is in its way.
+    fn launch(&mut self, ctx: &egui::Context) {
+        let Some(kind) = self.queued else {
+            return;
+        };
+        self.keeper.poll();
+        if self.recovering.is_some() || self.flush_wanted || !self.keeper.settled() {
+            return;
+        }
+        // A question about a temp is answered first (the Save's record holds it).
+        if self.asking.is_some() || self.answering.is_some() {
+            return;
+        }
+        self.queued = None;
         let encoder = self.doc.encoder();
         let file = self.file.clone();
-        let copy = matches!(kind, JobKind::SaveCopy { .. });
+        let kept = self.kept_temp.take();
+        let (copy, save_as) = match kind {
+            JobKind::Save { .. } => (false, false),
+            JobKind::SaveCopy { .. } => (true, false),
+            JobKind::SaveAs { .. } => (false, true),
+        };
+        // The edits the Save's record names (07 §3.1): those the journal holds now.
+        let take = self
+            .doc
+            .journal_edits()
+            .filter(|ops| !ops.is_empty() && self.doc.unsaved())
+            .map(|ops| self.take(ops));
+        let (slot, saving) = (self.keeper.slot(), file::Saving::new());
+        self.saving = saving.clone();
+        self.save_spot = self.doc.spot();
         let (tx, rx) = mpsc::channel();
         let ctx = ctx.clone();
         std::thread::spawn(move || {
-            let mut file = file.lock().unwrap();
-            let result = if copy {
-                encoder().and_then(|enc| {
-                    file.save_copy(&enc.bytes)
-                        .map(|path| JobDone::Copy(path, enc.not_kept))
-                })
+            let result = if save_as {
+                encoder().map(JobDone::Encoded)
             } else {
-                file.save(encoder).map(JobDone::Saved)
+                let mut file = file.lock().unwrap();
+                let result = if copy {
+                    encoder().and_then(|enc| {
+                        file.save_copy(&enc.bytes)
+                            .map(|path| JobDone::Copy(path, enc.not_kept))
+                    })
+                } else {
+                    file.kept_temp = kept;
+                    let mut journal = slot.lock().unwrap_or_else(|p| p.into_inner());
+                    let saved = file
+                        .save_kept(encoder, &mut journal, take.as_ref(), &saving)
+                        .map(JobDone::Saved);
+                    // Said with the result, while the journal is still this worker's.
+                    saving
+                        .set_pending(journal.as_ref().is_some_and(|j| j.pending_save().is_some()));
+                    saved
+                };
+                drop(file);
+                result
             };
-            drop(file);
             let _ = tx.send(result);
             ctx.request_repaint();
         });
-        self.status = Status::info(if copy {
-            "saving a copy…"
-        } else {
-            "saving…"
-        });
+        self.status = Status::info(SAVING);
         self.job = Some(Job {
             kind,
             rev: self.doc.rev(),
@@ -1769,19 +2960,79 @@ impl ImageWindow {
             return;
         };
         let job = self.job.take().expect("checked above");
+        let result = match result {
+            Ok(JobDone::Encoded(encoded)) => {
+                if std::mem::take(&mut self.close_when_done) {
+                    // Closing was asked for meanwhile: that, not Save As.
+                    self.saves_ended += 1;
+                    self.status = Status::default();
+                    if self.doc.unsaved() {
+                        self.prompt = true;
+                    } else {
+                        self.close_ok = true;
+                        super::request_close(ctx);
+                    }
+                    return;
+                }
+                let close_after = matches!(job.kind, JobKind::SaveAs { close_after: true });
+                return self.open_save_as(encoded, job.rev, close_after);
+            }
+            // A file at the temp path of an earlier cut-off Save: nothing was written, and the
+            // Save waits in its queue for the answer (Remove it, Keep it), then goes on.
+            Ok(JobDone::Saved(Saved::Ask(left))) => {
+                self.status = Status::info(ASKED);
+                self.asking = Some(left);
+                self.queued = Some(job.kind);
+                return;
+            }
+            other => other,
+        };
+        self.saves_ended += 1;
         let (status, shown) = report(&result, &mut self.outcome.lock().unwrap());
         self.status = status;
         self.pending_notices = Some(shown);
         let close_after = match &result {
             Ok(JobDone::Saved(Saved::Written { notes, .. })) => {
-                self.doc.mark_saved(job.rev);
+                self.doc.mark_saved_at(job.rev, self.save_spot);
+                self.landed();
+                self.pending = None;
                 matches!(job.kind, JobKind::Save { close_after: true }) && notes.is_empty()
             }
             Ok(JobDone::Copy(..)) => {
                 self.doc.mark_copied(job.rev);
                 matches!(job.kind, JobKind::SaveCopy { close_after: true })
             }
-            _ => false,
+            // An earlier Save of this session, its outcome unknown then, had landed: the file
+            // is that Save's picture (07 §3.1); nothing was written again.
+            Ok(JobDone::Saved(Saved::Found { .. })) => {
+                match self.pending.take() {
+                    // Only the revision that Save took is saved: edits made since stay
+                    // unsaved, kept against the file it wrote.
+                    Some((rev, spot)) => self.doc.mark_saved_at(rev, spot),
+                    // Which revision landed is not known here: nothing is called saved, and no
+                    // operations on the file make the picture any more.
+                    None => self.doc.unbase(),
+                }
+                self.landed();
+                // Edits made since that Save are against the file it wrote now: kept so at once.
+                self.kept_rev = u64::MAX;
+                self.keep_now();
+                false
+            }
+            _ => {
+                // Unknown: its record stays, and the next Save reconciles it first — that Save's
+                // revision is what a later "landed" saves.
+                if self.saving.pending() && self.saving.began() {
+                    // This Save's own record: its revision is the one a later "landed" saves.
+                    self.pending = Some((job.rev, self.save_spot));
+                } else if self.saving.pending() {
+                    // An earlier Save's record stays (this one was refused before beginning
+                    // its own): that Save's revision still is.
+                } else {
+                    self.pending = None;
+                }
+                false
+            }
         };
         // An edit made while the save ran is not in what it wrote.
         let newer = self.doc.rev() != job.rev;
@@ -1800,10 +3051,111 @@ impl ImageWindow {
         }
     }
 
+    /// A Save landed: the file is another now — what the journal's edits are against, and what
+    /// the rows' Restore is checked against again.
+    fn landed(&mut self) {
+        self.basis = self.file.lock().unwrap().basis();
+        self.keeper.retired();
+        for row in &mut self.rows {
+            file::recheck(&self.basis, row);
+        }
+    }
+
+    /// The Save As modal (07 §7) over the encoder's output, its field in the download folder.
+    fn open_save_as(&mut self, encoded: Encoded, rev: u64, close_after: bool) {
+        let name = self.name.clone();
+        let bytes = Arc::new(encoded.bytes);
+        let job = save_as::Job {
+            name,
+            size: save_as::Size::Exact(bytes.len() as u64),
+            // Nothing moves over the network: the output is in memory, the target local.
+            rate: None,
+            producer: Box::new(file::Output(bytes, self.save_as_hold.clone())),
+        };
+        let modal =
+            save_as::SaveAs::new(job, &self.save_as_folder, Box::new(binary::NativeChooser));
+        self.status = Status::info("Save As…");
+        self.saving_as = Some(SavingAs {
+            modal,
+            rev,
+            close_after,
+            not_kept: encoded.not_kept,
+        });
+    }
+
+    /// One pass of the Save As modal while it is open; once a save lands the edits are
+    /// somewhere, as after a Save copy (07 §7 "What it counts as"), and a close waiting for it
+    /// goes ahead.
+    fn save_as_pass(&mut self, ctx: &egui::Context) {
+        let Some(open) = &mut self.saving_as else {
+            return;
+        };
+        let ended = open.modal.show(ctx);
+        let busy = open.modal.busy();
+        match ended {
+            Some(save_as::Ended::Saved { line, notes, .. }) => {
+                self.saves_ended += 1;
+                let open = self.saving_as.take().expect("open");
+                self.doc.mark_copied(open.rev);
+                self.status = Status::info(line);
+                self.pending_notices = Some(notes.into_iter().chain(open.not_kept).collect());
+                let waited = std::mem::take(&mut self.close_when_done);
+                if open.close_after || waited {
+                    if self.doc.unsaved() {
+                        self.prompt = true;
+                    } else {
+                        self.close_ok = true;
+                        super::request_close(ctx);
+                    }
+                }
+            }
+            Some(save_as::Ended::Closed) => {
+                self.saves_ended += 1;
+                self.saving_as = None;
+                self.close_when_done = false;
+                self.status = Status::info("Save As closed: nothing was saved");
+            }
+            // A close asked for while it wrote waits for it; a write that did not land keeps
+            // the window, and the modal says why.
+            None if !busy => self.close_when_done = false,
+            None => {}
+        }
+    }
+
     fn keys(&mut self, ctx: &egui::Context) {
         use super::{command_key, plain_key};
-        if self.prompt {
+        if self.prompt || self.saving_as.is_some() {
             return;
+        }
+        // Esc stops a Save before its rename (07 §10), in a window of its own and hosted in the
+        // file browser alike — the viewer stays; a rectangle drawn waits. Leaving the viewer or
+        // closing the window during a Save still waits for it: only Esc stops one.
+        let saving = matches!(
+            self.job,
+            Some(Job {
+                kind: JobKind::Save { .. },
+                ..
+            })
+        );
+        if saving && plain_key(ctx, Key::Escape) && !self.saving.cancel() {
+            self.status = Status::info("the file is being replaced: it cannot be stopped now");
+        }
+        // A Save still in its queue (waiting for the journal, or for an answer): Esc drops it —
+        // nothing was sent. A question stays with its record, asked by the next Save.
+        if self.job.is_none() && self.queued.is_some() && plain_key(ctx, Key::Escape) {
+            self.queued = None;
+            self.saves_ended += 1;
+            if self.answering.is_none() {
+                self.asking = None;
+            }
+            self.status = Status::info(STOPPED);
+            if std::mem::take(&mut self.close_when_done) && self.doc.unsaved() {
+                self.prompt = true;
+            }
+        }
+        // Before Cmd/Ctrl+S: egui's own check would take Alt+Cmd/Ctrl+S for it (07 §7).
+        if save_as::pressed(ctx) {
+            self.start(ctx, JobKind::SaveAs { close_after: false });
         }
         if command_key(ctx, Key::Z, true) {
             self.redo();
@@ -1841,21 +3193,28 @@ impl ImageWindow {
         let ctx = ui.ctx().clone();
         let editable = self.doc.read_only.is_none();
         let has_rect = self.rect().is_some();
-        let busy = self.job.is_some();
+        let busy = self.edits_held();
         // Wraps on a narrow window so Save stays reachable; its height depends only on the
         // window width (button labels never change, nothing in it comes and goes — the busy
         // spinner is in the status bar), so it cannot move the image mid-drag.
         ui.horizontal_wrapped(|ui| {
-            let why = "draw a rectangle on the image first";
+            let why = if busy {
+                SAVING
+            } else {
+                "draw a rectangle on the image first"
+            };
             if ui
-                .add_enabled(editable && has_rect, egui::Button::new("Crop  C"))
+                .add_enabled(editable && has_rect && !busy, egui::Button::new("Crop  C"))
                 .on_disabled_hover_text(why)
                 .clicked()
             {
                 self.crop();
             }
             if ui
-                .add_enabled(editable && has_rect, egui::Button::new("Pixelize  P"))
+                .add_enabled(
+                    editable && has_rect && !busy,
+                    egui::Button::new("Pixelize  P"),
+                )
                 .on_disabled_hover_text(why)
                 .clicked()
             {
@@ -1869,14 +3228,14 @@ impl ImageWindow {
             );
             ui.separator();
             if ui
-                .add_enabled(self.doc.can_undo(), egui::Button::new("Undo"))
+                .add_enabled(self.doc.can_undo() && !busy, egui::Button::new("Undo"))
                 .on_hover_text("⌘/Ctrl+Z")
                 .clicked()
             {
                 self.undo();
             }
             if ui
-                .add_enabled(self.doc.can_redo(), egui::Button::new("Redo"))
+                .add_enabled(self.doc.can_redo() && !busy, egui::Button::new("Redo"))
                 .on_hover_text("⇧⌘/Shift+Ctrl+Z")
                 .clicked()
             {
@@ -1957,6 +3316,76 @@ impl ImageWindow {
         });
     }
 
+    /// The status row while a Save runs: why nothing can be edited, where the Save is, and how
+    /// to stop it (07 §10).
+    fn progress(&mut self) {
+        let saving = matches!(
+            self.job,
+            Some(Job {
+                kind: JobKind::Save { .. },
+                ..
+            })
+        );
+        if saving && !self.status.error {
+            // Whether Esc can still stop it decides the words: a refused Esc stays said.
+            let stop = if self.saving.cancelled() {
+                "stopping…".to_string()
+            } else if self.saving.stoppable() {
+                format!("{}… · Esc stops it", self.saving.word())
+            } else {
+                format!("{}… · it can no longer be stopped", self.saving.word())
+            };
+            self.status = Status::info(format!("{SAVING} · {stop}"));
+        }
+    }
+
+    /// `SOPEN_KEYS` (a receipt hook): the next key, once the window has settled, as the owner's
+    /// own key or typing in this pass.
+    fn play(&mut self, ctx: &egui::Context) {
+        if self.script_gap > 0 {
+            self.script_gap -= 1;
+            ctx.request_repaint();
+            return;
+        }
+        if self.script.is_empty() || !self.settled() {
+            return;
+        }
+        let Some(step) = self.script.pop_front() else {
+            return;
+        };
+        self.script_gap = 2;
+        ctx.input_mut(|i| match step {
+            super::browser::Play::Text(text) => i.events.push(egui::Event::Text(text)),
+            super::browser::Play::Key(key, modifiers) => {
+                for pressed in [true, false] {
+                    i.events.push(egui::Event::Key {
+                        key,
+                        physical_key: None,
+                        pressed,
+                        repeat: false,
+                        modifiers,
+                    });
+                }
+            }
+        });
+        ctx.request_repaint();
+    }
+
+    /// Nothing is running: painted, no save or write of the journal under way, the look for
+    /// earlier sessions' journals back, and the Save As modal (if open) not writing.
+    fn settled(&self) -> bool {
+        self.painted
+            && self.job.is_none()
+            && self.queued.is_none()
+            && self.removing.is_none()
+            && self.keeper.settled()
+            && self.recovering.is_none()
+            && self.saving_as.as_ref().is_none_or(|s| !s.modal.busy())
+            // `restore=1`: not before the listing is back and its first row's Restore pressed —
+            // keys played after it act on the restored picture.
+            && !(self.restore_first && (!self.listed || !self.rows.is_empty()))
+    }
+
     /// `zoom` is the previous pass's (the image is laid out after the bar).
     /// One line whatever it says (see [`super::one_line`]): the image above must not move. The
     /// busy spinner sits here, before "saving…", rather than in the wrapping toolbar: kept out
@@ -1976,16 +3405,36 @@ impl ImageWindow {
             }
             if self.doc.unsaved() {
                 ui.separator();
-                ui.label("unsaved changes");
+                // Where the edits are kept (07 §3), cut to half the bar so the status beside it
+                // keeps room; whole on hover.
+                let (line, colour) = self.keep_line(ui);
+                let room = (ui.available_width() / 2.0).max(160.0);
+                let height = ui.text_style_height(&egui::TextStyle::Body);
+                ui.allocate_ui(Vec2::new(room, height), |ui| {
+                    super::one_line(ui, &line, colour)
+                });
             }
             ui.separator();
-            if self.job.is_some() {
+            if self.job.is_some()
+                || (self.queued.is_some() && self.asking.is_none())
+                || self.saving_as.as_ref().is_some_and(|s| s.modal.busy())
+            {
                 // No taller than the status text beside it, so the bar keeps its height.
                 let size = ui.text_style_height(&egui::TextStyle::Body);
                 ui.add(egui::Spinner::new().size(size));
             }
             self.status.show(ui);
         });
+    }
+
+    /// The status bar's words for unsaved edits: where the journal keeps them (07 §3).
+    fn keep_line(&self, ui: &egui::Ui) -> (String, Color32) {
+        let at = self.keeper.dir().map(binary::tilde).unwrap_or_default();
+        match self.keeper.status() {
+            journal::Keep::Clean => ("unsaved changes".to_string(), ui.visuals().text_color()),
+            keep @ journal::Keep::NotKept(_) => (keep.line(&at), ui.visuals().error_fg_color),
+            keep => (keep.line(&at), ui.visuals().text_color()),
+        }
     }
 
     fn texture(&mut self, ctx: &egui::Context) -> egui::TextureId {
@@ -2100,7 +3549,8 @@ impl ImageWindow {
             Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
             Color32::WHITE,
         );
-        if self.doc.read_only.is_none() && !self.prompt && !self.preview {
+        let covered = self.prompt || self.saving_as.is_some();
+        if self.doc.read_only.is_none() && !covered && !self.preview {
             self.sel.handle(ui, &resp, map);
         }
         self.sel.draw(&painter, map);
@@ -2130,8 +3580,23 @@ impl ImageWindow {
                     self.prompt = false;
                     self.start(ctx, JobKind::SaveCopy { close_after: true });
                 }
-                if ui.button("Discard").clicked() {
+                // The window closes only once that save has landed (07 §10).
+                if ui.button("Save As…").clicked() {
                     self.prompt = false;
+                    self.start(ctx, JobKind::SaveAs { close_after: true });
+                }
+                let discard = ui.button("Discard");
+                let discard = match self.keeper.dir() {
+                    Some(dir) => discard
+                        .on_hover_text(format!("deletes the kept edits at {}", binary::tilde(dir))),
+                    None => discard,
+                };
+                if discard.clicked() {
+                    self.prompt = false;
+                    // Discard is the one way out that does not keep the journal (07 §3).
+                    if let Err(e) = self.keeper.discard() {
+                        eprintln!("sopen: {e:#}");
+                    }
                     self.close_ok = true;
                     super::request_close(ctx);
                 }
@@ -2156,13 +3621,29 @@ impl super::Window for ImageWindow {
                 .show(ui, |ui| self.zoom = self.central(ui));
             return;
         }
+        // The journals earlier sessions left, on the first pass as the image window.
+        self.list_journals(&ctx);
+        self.poll_recovery();
+        self.poll_removal();
+        self.play(&ctx);
         if std::mem::take(&mut self.ask_close) {
             // `SOPEN_STATE` `close=ask`: as if closing were asked for (the prompt's receipt).
             self.close_requested();
         }
+        if ctx.input(|i| i.events.contains(&egui::Event::WindowFocused(false))) {
+            // Focus loss writes the journal at once (07 §3).
+            self.keep_now();
+        }
+        if !std::mem::replace(&mut self.waking, true) {
+            let wake = ctx.clone();
+            self.keeper.set_wake(move || wake.request_repaint());
+        }
         self.poll_job(&ctx);
+        self.poll_answer(&ctx);
+        self.launch(&ctx);
         self.keys(&ctx);
         self.clipboard(&ctx);
+        self.progress();
         egui::Panel::top("tools").show(ui, |ui| {
             ui.add_space(3.0);
             self.toolbar(ui);
@@ -2206,14 +3687,26 @@ impl super::Window for ImageWindow {
                 ui.add_space(2.0);
             });
         }
+        if !self.rows.is_empty() || self.asking.is_some() {
+            egui::Panel::bottom("recovery").show(ui, |ui| {
+                ui.add_space(2.0);
+                self.asked_row(ui);
+                self.recovery_rows(ui);
+                ui.add_space(2.0);
+            });
+        }
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE)
             .show(ui, |ui| self.zoom = self.central(ui));
+        self.save_as_pass(&ctx);
         self.close_prompt(&ctx);
+        self.keep(&ctx);
     }
 
+    /// Painted, no save running, and the journal holding the edits on screen (a receipt of
+    /// the close prompt or of the recovery rows shows them kept).
     fn ready(&self) -> bool {
-        self.painted && self.job.is_none()
+        self.settled() && self.script.is_empty() && self.script_gap == 0
     }
 
     fn keys(&self) -> &'static [super::chrome::FKey] {
@@ -2235,11 +3728,19 @@ impl super::Window for ImageWindow {
         if self.close_ok || self.preview {
             return true;
         }
-        if self.job.is_some() {
+        if let Some(open) = &self.saving_as {
+            if !open.modal.busy() {
+                // Nothing is being written: the modal goes, and closing asks as ever.
+                self.saving_as = None;
+            }
+        }
+        let saving_as = self.saving_as.is_some();
+        // A save waiting in its queue is one under way: closing waits for it too.
+        if self.job.is_some() || saving_as || self.queued.is_some() {
             // Never close mid-write: the window closes once the save has reported. Said in the
             // rows (read whole on a narrow window), after any report still held.
             self.close_when_done = true;
-            self.status = Status::info("saving…");
+            self.status = Status::info(SAVING);
             let mut next = self
                 .pending_notices
                 .take()
@@ -2251,8 +3752,17 @@ impl super::Window for ImageWindow {
             return false;
         }
         if !self.doc.unsaved() {
+            // The edits are in the file, a copy or a Save As: the journal goes (07 §3) — unless
+            // a Save's outcome is unknown, whose record the next open reconciles.
+            if self.keeper.pending_save() == Some(false) {
+                if let Err(e) = self.keeper.discard() {
+                    eprintln!("sopen: {e:#}");
+                }
+            }
             return true;
         }
+        // Closing writes the journal at once, before it asks (07 §3).
+        self.keep_now();
         self.prompt = true;
         false
     }
@@ -2813,6 +4323,8 @@ struct Streaming {
     sized: bool,
     /// This machine's physical memory, for the memory line.
     physical: Option<u64>,
+    /// `SOPEN_KEYS`, for the image window once the image is whole (a window of its own only).
+    script: std::collections::VecDeque<super::browser::Play>,
 }
 
 impl Drop for Streaming {
@@ -2863,6 +4375,7 @@ impl Streaming {
             first: false,
             sized: false,
             physical: probe::physical_memory(),
+            script: Default::default(),
         })
     }
 
@@ -2903,7 +4416,11 @@ impl Streaming {
         if loaded.sha256.is_some() {
             origin.at.sha256 = loaded.sha256;
         }
-        let file = ImageFile::new(origin, loaded.bytes, &cache_root);
+        let mut file = ImageFile::new(origin, loaded.bytes, &cache_root);
+        if let Some(sha) = loaded.sha256 {
+            // The whole hash the journal's evidence is (07 §3 `seen`), from the streamed read.
+            file = file.knowing(sha);
+        }
         let (mut doc, mut sel, mut block) = (loaded.doc, Selection::default(), DEFAULT_BLOCK);
         if let Err(e) = apply_state(&mut doc, &mut sel, &mut block, &self.hooks) {
             return self.fail(ctx, format!("{e:#}"));
@@ -2918,6 +4435,9 @@ impl Streaming {
         }
         let mut window = ImageWindow::new(file, doc, sel, block, notices);
         window.ask_close = self.hooks.state.ask_close;
+        window.restore_first = self.hooks.state.restore;
+        window.scripted = self.hooks.screenshot.is_some();
+        window.script = std::mem::take(&mut self.script);
         window.outcome = self.outcome.clone();
         window.leftover = self.leftover.clone();
         window.preview = self.preview;
@@ -3179,6 +4699,7 @@ pub fn open_stream(
 /// The loading window in a window of its own, as [`open`] runs the image window.
 fn run_streaming(mut window: Streaming, hooks: &Hooks) -> Result<Outcome> {
     window.standalone = true;
+    window.script = keys_hook()?;
     let title = window.title.clone();
     let (outcome, leftover) = (window.outcome.clone(), window.leftover.clone());
     let failed = window.failed.clone();
@@ -3212,6 +4733,15 @@ pub fn embed_stream(
 }
 
 #[cfg(test)]
+mod edit_tests;
+
+#[cfg(test)]
+mod trail_tests;
+
+#[cfg(test)]
+mod save_tests;
+
+#[cfg(test)]
 mod input_tests;
 
 #[cfg(test)]
@@ -3229,6 +4759,7 @@ mod tests {
     use crate::remote::{LocalFs, RemoteFs};
     use crate::testutil::NoReplace;
     use image::{GenericImageView, Rgb, Rgba};
+    use std::time::SystemTime;
 
     fn gradient(w: u32, h: u32) -> DynamicImage {
         DynamicImage::ImageRgba8(ImageBuffer::from_fn(w, h, |x, y| {

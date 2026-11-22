@@ -1523,6 +1523,37 @@ pub struct Orphan {
     pub notes: Vec<String>,
 }
 
+/// The journals of this file (`abs` on `host`) on disk, by directory: each named as a journal of
+/// it (not one being removed), and — where its generation can be read — written for this host
+/// and path (a journal of another file whose cache path maps to the same place is not this
+/// file's: [`orphans`] skips it). One whose generation cannot be read counts: the listing names
+/// it too, once its lock is free. What a listing should find once no other session holds one —
+/// the windows' recovery lists again, for a while, until it has found them all. Read straight
+/// off the disk, without taking any lock.
+pub fn this_files_journals(cache: &Path, host: &str, abs: &str) -> Vec<PathBuf> {
+    let base = crate::cache::edits_path(cache, host, abs);
+    let (Some(home), Some(name)) = (base.parent(), base.file_name()) else {
+        return Vec::new();
+    };
+    let file = name.to_string_lossy();
+    let head_is_ours = |dir: &Path| -> bool {
+        let gen = std::fs::read(dir.join(CURRENT))
+            .ok()
+            .and_then(|bytes| parse_current(&bytes).ok())
+            .and_then(|at| std::fs::read(dir.join(gen_name(at.n))).ok())
+            .and_then(|bytes| parse_generation(&bytes).ok());
+        gen.is_none_or(|g| g.head.host == host && g.head.path == abs)
+    };
+    std::fs::read_dir(home)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| journal_entry(&e.file_name().to_string_lossy(), &file) == Some(false))
+        .map(|e| e.path())
+        .filter(|dir| head_is_ours(dir))
+        .collect()
+}
+
 /// The journals of `path` on `host` left by sessions that are gone (their lock free), newest
 /// first. A journal whose lock file was never made gets one, made exclusively. Journals being
 /// removed are emptied on the way; one written for another host or path that maps to the same

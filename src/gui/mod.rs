@@ -283,8 +283,8 @@ pub enum Op {
 /// browser `open=NAME`, and `at=OFFSET` for the first text file it opens — by `open=NAME` or by
 /// hand, whichever comes first (the row that byte is in at the top), `mode=dual|preview` and
 /// `bar=NAME` (02 §9); the image, hex and media windows `close=ask`; the media window
-/// `clips=START-END[,START-END]` (its edit list, source seconds) and `stereo=1`; every window
-/// `help=1`.
+/// `clips=START-END[,START-END]` (its edit list, source seconds) and `stereo=1`; the image window
+/// `restore=1`; every window `help=1`.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct State {
     pub rect: Option<[u32; 4]>,
@@ -317,6 +317,10 @@ pub struct State {
     /// Every window: F1 is pressed once what the state asked for is on screen, so the key help
     /// is what the screenshot shows (`help=1`, F1's receipt).
     pub help: bool,
+    /// Image window: once the rows of the journals earlier sessions left are on screen, Restore
+    /// on the first row is pressed, as a click would — where that row offers it (`restore=1`, a
+    /// crash recovery's receipt).
+    pub restore: bool,
     /// Hex, text and image over a stream: the screenshot is taken at the first frame drawn with
     /// content from the stream, rows still loading shot as they are (`loading=1`, 06 §11).
     pub loading: bool,
@@ -393,6 +397,10 @@ impl State {
                 "help" => match value {
                     "1" => state.help = true,
                     other => bail!("SOPEN_STATE: help must be 1 (got '{other}')"),
+                },
+                "restore" => match value {
+                    "1" => state.restore = true,
+                    other => bail!("SOPEN_STATE: restore must be 1 (got '{other}')"),
                 },
                 "loading" => match value {
                     "1" => state.loading = true,
@@ -1329,6 +1337,9 @@ mod tests {
         assert!(State::parse("zoom=2").is_err());
         assert!(State::parse("rect=1,2,3").is_err());
         assert_eq!(State::parse("").unwrap(), State::default());
+        assert!(State::parse("op=crop;restore=1").unwrap().restore);
+        assert!(!State::parse("op=crop").unwrap().restore);
+        assert!(State::parse("restore=yes").is_err());
     }
 
     #[test]

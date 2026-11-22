@@ -6494,7 +6494,7 @@ mod stream {
         )
         .unwrap();
         assert_eq!(
-            file::this_files_journals(&cache, "host", &abs),
+            crate::journal::this_files_journals(&cache, "host", &abs),
             vec![ours.clone()]
         );
         // A file of its own, not in a window: nothing else holds a journal of it.
