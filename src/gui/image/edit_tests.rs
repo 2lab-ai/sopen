@@ -414,9 +414,16 @@ fn no_edit_undo_or_redo_while_a_save_runs() {
         fx.drv.click_text(&mut fx.win, name);
         assert!(state(&fx) == before, "{name} button");
     }
-    // The save ends: editing resumes.
+    // The save ends: editing resumes — the same pastes take effect now (a paste is applied to
+    // the picture at once; nothing is staged for later), and undo works again.
     tx.send(Err(anyhow!("the save failed (a test)"))).unwrap();
     fx.until_idle();
+    let img = fx.win.doc.img.clone();
+    fx.drv.paste_text(&mut fx.win, "x");
+    assert!(fx.win.doc.img != img, "the text paste after the save");
+    let img = fx.win.doc.img.clone();
+    fx.drv.paste_image(&mut fx.win, clipboard_picture());
+    assert!(fx.win.doc.img != img, "the picture paste after the save");
     fx.key(Key::Z, command(false));
     assert_ne!(fx.win.doc.rev(), before.0, "undo works again");
 }

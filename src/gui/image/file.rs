@@ -42,6 +42,9 @@ pub struct ImageFile {
     opened: Arc<OnceLock<Sha>>,
     /// The whole SHA-256 of what the last Save wrote, once one landed.
     saved: Option<Sha>,
+    /// The owner's Keep it for the file at a cut-off Save's temp path (asked in the window,
+    /// [`Saved::Ask`]): the next Save keeps it and goes on. Taken by that Save.
+    pub(super) kept_temp: Option<String>,
 }
 
 /// Why Save cannot replace the file on this server (spec §5): Save copy still works.
@@ -72,6 +75,7 @@ impl ImageFile {
             backup: None,
             opened: Arc::default(),
             saved: None,
+            kept_temp: None,
         }
     }
 
@@ -300,11 +304,14 @@ impl ImageFile {
     }
 
     /// A Save this session left cut off (an unknown outcome): reconciled now, from fresh reads
-    /// of the remote (07 §3.1), before anything is written again. Landed: the file is that
-    /// Save's output — nothing is written again ([`Saved::Found`]). Not landed: its record goes
-    /// (its temp removed when provably its own, else named) and this Save goes on. Unknown:
-    /// this Save is refused, saying what to check.
+    /// of the remote (07 §3.1), before anything is written again. A file at its temp path that
+    /// is not provably its own is asked about first ([`Saved::Ask`]), the record kept — unless
+    /// the owner already said Keep it. Landed: the file is that Save's output — nothing is
+    /// written again ([`Saved::Found`]). Not landed: its record goes (its temp removed when
+    /// provably its own, still as recorded) and this Save goes on. Unknown: this Save is
+    /// refused, saying what to check.
     fn settle(&mut self, journal: &mut Option<Journal>) -> Result<Option<Saved>> {
+        let kept = self.kept_temp.take();
         let Some(j) = journal.as_mut() else {
             return Ok(None);
         };
@@ -320,34 +327,61 @@ impl ImageFile {
             journal::reconcile(&intent, &host, &mut patch::Fresh::new(patcher))
         };
         let mut notes = Vec::new();
-        match &reconciled.temp {
+        // A file at the temp path sopen cannot prove its own: asked about — the record that
+        // holds the question stays — unless the owner said Keep it for that path.
+        let mut ask = |path: &str, why: &str, fs: &mut dyn RemoteFs| -> Result<Option<Saved>> {
+            if kept.as_deref() == Some(path) {
+                notes.push(format!("{host}:{path} is kept, as you answered"));
+                return Ok(None);
+            }
+            match look_at(fs, path) {
+                Ok(Some((seen, sha))) => Ok(Some(Saved::Ask(LeftTemp {
+                    path: path.to_string(),
+                    line: format!(
+                        "a save was cut off at {}, and a file is at its temporary path \
+                         {host}:{path} ({why}) — remove it? The save waits for the answer",
+                        when_of(intent.started)
+                    ),
+                    seen,
+                    sha,
+                }))),
+                Ok(None) => Ok(None),
+                Err(e) => bail!(
+                    "a save was cut off at {}, and the file at its temporary path {host}:{path} \
+                     could not be checked ({e:#}); it is kept — nothing was written this time",
+                    when_of(intent.started)
+                ),
+            }
+        };
+        let asked = match &reconciled.temp {
             // Provably that Save's temp: removed once its stat is still the recorded one, read
-            // again right before.
+            // again right before; otherwise asked about.
             journal::Temp::Remove(path) => {
                 let same = match (fs.lstat_opt(path), recorded_temp(&intent)) {
                     (Ok(Some(now)), Some(rec)) => rec.matches(&now),
                     _ => false,
                 };
-                if !same {
-                    bail!(
-                        "{host}:{path} is at the temporary path of the save cut off at {}, and it \
-                         changed since it was checked; it is kept, and asked about when the file \
-                         is opened again — nothing was written this time",
-                        when_of(intent.started)
-                    );
-                }
-                if let Err(e) = fs.remove(path) {
-                    notes.push(format!("{host}:{path} could not be removed ({e:#})"));
+                if same {
+                    // Its removal failed: asked about, as for a temp not provably its own —
+                    // Remove it tries again, Keep it ends the record.
+                    match fs.remove(path) {
+                        Ok(()) => None,
+                        Err(e) => {
+                            let why =
+                                format!("it is that save's own, and its removal failed: {e:#}");
+                            ask(path, &why, fs)?
+                        }
+                    }
+                } else {
+                    let why = "it changed since it was checked against the save's record";
+                    ask(path, why, fs)?
                 }
             }
-            // Its ownership is uncertain: asked, never removed unasked — and the record that holds
-            // the question stays until it is answered, on the next open.
-            journal::Temp::Keep { path, why } => bail!(
-                "a save was cut off at {}, and a file is at its temporary path {host}:{path} ({why}); \
-                 it is asked about when the file is opened again — nothing was written this time",
-                when_of(intent.started)
-            ),
-            journal::Temp::None | journal::Temp::Gone(_) => {}
+            journal::Temp::Keep { path, why } => ask(path, why, fs)?,
+            journal::Temp::None | journal::Temp::Gone(_) => None,
+        };
+        if let Some(asked) = asked {
+            return Ok(Some(asked));
         }
         let line = reconciled.line.replace("(found on reopen)", "(found now)");
         match reconciled.outcome {
@@ -584,6 +618,11 @@ pub enum Saved {
     /// An earlier Save of this session, cut off, had landed: found now, and nothing was written
     /// again. `notes` say so first.
     Found { notes: Vec<String> },
+    /// An earlier Save of this session was cut off, and a file sopen cannot prove its own is at
+    /// its temp path: nothing was written, its record stays, and the owner is asked — Remove it
+    /// (only that file, checked again: [`remove_left`]) or Keep it ([`ImageFile::kept_temp`]).
+    /// The Save waits for the answer, then goes on.
+    Ask(LeftTemp),
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -696,6 +735,9 @@ pub(super) struct Keeper {
     again: Option<Take>,
     /// The journal goes once the generation being written is in (Discard, nothing unsaved).
     remove_after: bool,
+    /// Discard, or the window closing with nothing unsaved: the journal goes, and no later
+    /// generation is written. A removal for nothing unsaved alone is undone by a newer edit.
+    discarding: bool,
     /// Wakes the window when a generation is in.
     wake: Option<Arc<dyn Fn() + Send + Sync>>,
     schedule: Schedule,
@@ -721,6 +763,7 @@ impl Keeper {
             writing: None,
             again: None,
             remove_after: false,
+            discarding: false,
             wake: None,
             schedule: Schedule::default(),
             dir: None,
@@ -882,6 +925,9 @@ impl Keeper {
 
     /// Writes `take` on a worker, unless one is writing already (the next pass looks again).
     pub(super) fn write_later(&mut self, take: Take) {
+        if !self.wanted() {
+            return;
+        }
         if self.writing.is_some() {
             return;
         }
@@ -889,10 +935,23 @@ impl Keeper {
         self.spawn(take);
     }
 
+    /// A newer generation is asked for: none after Discard; a removal waiting only because
+    /// nothing was unsaved is undone (the generation being written stays, and this one follows).
+    fn wanted(&mut self) -> bool {
+        if self.discarding {
+            return false;
+        }
+        self.remove_after = false;
+        true
+    }
+
     /// A generation at once (07 §3: focus loss, close, the start of a Save), written on a
     /// worker — after the one being written, if any; nothing waits for it on the window's
     /// thread. [`Keeper::settled`] says when it is in.
     pub(super) fn flush(&mut self, take: Take) {
+        if !self.wanted() {
+            return;
+        }
         self.schedule.taking();
         if self.writing.is_some() {
             self.again = Some(take);
@@ -921,9 +980,22 @@ impl Keeper {
         }
     }
 
+    /// A generation due for a picture that has nothing to keep (back to the file, or past a
+    /// Save): not written — nothing waits on it.
+    pub(super) fn unschedule(&mut self) {
+        self.schedule.taking();
+    }
+
+    /// Discard, or the window closing with nothing unsaved: as [`Keeper::remove`], and nothing
+    /// is written after it.
+    pub(super) fn discard(&mut self) -> Result<()> {
+        self.discarding = true;
+        self.remove()
+    }
+
     /// Nothing is unsaved, or Discard: the journal goes, and the schedule starts over — once
     /// the generation being written is in (it is not waited for here: [`Keeper::poll`] removes
-    /// it then).
+    /// it then, unless a newer generation was asked for meanwhile and this is not a Discard).
     pub(super) fn remove(&mut self) -> Result<()> {
         if self.writing.is_some() {
             self.remove_after = true;
@@ -932,6 +1004,8 @@ impl Keeper {
         }
         self.schedule = Schedule::default();
         self.dir = None;
+        // Removed: a window that lives on keeps its later edits again.
+        self.discarding = false;
         let journal = self.slot.lock().unwrap_or_else(|p| p.into_inner()).take();
         match journal {
             Some(journal) => journal.remove(),
@@ -974,8 +1048,8 @@ const LOCK_RETRY: Duration = Duration::from_millis(500);
 /// record, which stays until it is answered — Later asks it again on the next open; Restore and
 /// Discard wait for the answer — and to the file as it was when asked: its stat and, up to
 /// 256 MiB, its content's SHA-256. Remove it removes only that file ([`remove_left`]).
-#[derive(Clone)]
-pub(super) struct LeftTemp {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LeftTemp {
     pub path: String,
     pub line: String,
     pub seen: FileStat,

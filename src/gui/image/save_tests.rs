@@ -35,6 +35,8 @@ enum Cut {
     HoldCreate,
     /// A remove waits for `release`.
     HoldRemove,
+    /// A remove is refused.
+    FailRemove,
 }
 
 #[derive(Default)]
@@ -58,7 +60,16 @@ impl Control {
 
     fn writes(&self) -> Vec<String> {
         let mutating = [
-            "create", "rename", "remove", "set-mode", "link", "write", "copy",
+            "create",
+            "create-temp",
+            "rename",
+            "remove",
+            "set-mode",
+            "set-owner",
+            "set-handle-mode",
+            "link",
+            "write",
+            "copy",
         ];
         self.log
             .lock()
@@ -128,6 +139,7 @@ impl RemoteFs for Cutting {
     }
     fn read_head(&mut self, path: &str, max: usize) -> Result<Vec<u8>> {
         self.alive()?;
+        self.control.note(format!("read-head {path} {max}"));
         self.inner.read_head(path, max)
     }
     fn list_dir(&mut self, path: &str) -> Result<Vec<String>> {
@@ -212,6 +224,10 @@ impl RemoteFs for Cutting {
     fn remove(&mut self, path: &str) -> Result<()> {
         if self.cut() == Cut::HoldRemove {
             self.control.hold();
+        }
+        if self.cut() == Cut::FailRemove {
+            self.control.note(format!("remove-refused {path}"));
+            bail!("simulated: the remove was refused");
         }
         self.alive()?;
         self.control.note(format!("remove {path}"));
@@ -384,9 +400,13 @@ impl Rig {
     }
 
     /// The window gone without a word (a kill), and the file opened again through a healthy
-    /// connection of the same side.
+    /// connection of the same side — logged from its first request (`control`, a new one).
     fn reopen(&mut self) {
-        let fs = connection(self.side).unwrap();
+        self.control = Arc::new(Control::default());
+        let fs = Box::new(Cutting {
+            inner: connection(self.side).unwrap(),
+            control: self.control.clone(),
+        });
         let next = window_through(&self.path, &self.cache, fs);
         drop(std::mem::replace(&mut self.win, next));
         self.drv = Driver::new(1000.0, 700.0);
@@ -542,6 +562,20 @@ fn e18_an_image_save_cut_at_each_step_is_reconciled_on_reopen() {
             rig.reopen();
             let now = std::fs::metadata(&rig.path).unwrap().modified().unwrap();
             assert_eq!(now, before, "{case}: nothing is written to the file");
+            // Every request the reopened window sent that changes anything: none of the file,
+            // and only the removal of a temp provably the cut-off Save's own.
+            let target_s = rig.path.to_str().unwrap().to_string();
+            let temp_s = temp_path.to_str().unwrap().to_string();
+            let sent = rig.control.writes();
+            assert!(
+                sent.iter().all(|w| !w.contains(&target_s)),
+                "{case}: {sent:?}"
+            );
+            let want: Vec<String> = match cut {
+                Cut::DieAfterTempStat | Cut::DieBeforeRename => vec![format!("remove {temp_s}")],
+                _ => Vec::new(),
+            };
+            assert_eq!(sent, want, "{case}: what recovery changed");
             match cut {
                 Cut::CreatedNoReply => {
                     assert!(rig.drv.find_text("Remove it").is_some(), "{case}");
@@ -564,6 +598,7 @@ fn e18_an_image_save_cut_at_each_step_is_reconciled_on_reopen() {
                         rig.drv.find_text("Remove it").is_some(),
                         "{case}: asked again"
                     );
+                    assert_eq!(rig.control.writes(), Vec::<String>::new(), "{case}");
                     rig.drv.click_text(&mut rig.win, "Remove it");
                     rig.drv.until(&mut rig.win, 10, |w| w.quiet());
                     rig.drv.idle(&mut rig.win, 2);
@@ -571,6 +606,11 @@ fn e18_an_image_save_cut_at_each_step_is_reconciled_on_reopen() {
                         temp_is(&temp_path, &output),
                         TempIs::Absent,
                         "{case}: removed"
+                    );
+                    assert_eq!(
+                        rig.control.writes(),
+                        [format!("remove {temp_s}")],
+                        "{case}: only the file asked about"
                     );
                     assert!(
                         rig.drv.find_text("Restore").is_some(),
@@ -656,8 +696,49 @@ fn remove_it_keeps_a_file_that_changed_since_the_question_was_shown() {
     }
 }
 
-/// P2: Remove it runs on a worker — the pass that took the click returns while the removal is
-/// held — and the row takes no answer until it is back.
+/// After 10 s it runs `release` and says it fired: a pass that waits on what a test holds fails
+/// the test instead of hanging it. Stops when dropped.
+struct Watchdog {
+    fired: Arc<AtomicBool>,
+    done: Arc<AtomicBool>,
+}
+
+impl Watchdog {
+    fn new(release: impl Fn() + Send + 'static) -> Self {
+        let (fired, done) = (
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+        );
+        let (f, d) = (fired.clone(), done.clone());
+        std::thread::spawn(move || {
+            let until = std::time::Instant::now() + Duration::from_secs(10);
+            while std::time::Instant::now() < until {
+                if d.load(Ordering::SeqCst) {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            f.store(true, Ordering::SeqCst);
+            release();
+        });
+        Self { fired, done }
+    }
+
+    fn fired(&self) -> bool {
+        self.fired.load(Ordering::SeqCst)
+    }
+}
+
+impl Drop for Watchdog {
+    fn drop(&mut self) {
+        self.done.store(true, Ordering::SeqCst);
+    }
+}
+
+/// P2: Remove it runs on a worker. The removal is held at a barrier: the passes that took the
+/// click, and those after it, return while it is held (a pass that waited for it would be
+/// freed only by the watchdog, failing the test); meanwhile the row takes no answer; released,
+/// the removal lands and the row is answered.
 #[test]
 fn remove_it_does_not_hold_the_window() {
     let mut rig = rig(Side::Local).unwrap();
@@ -676,24 +757,17 @@ fn remove_it_does_not_hold_the_window() {
     rig.drv = Driver::new(1000.0, 700.0);
     rig.settle();
     let at = rig.drv.find_text("Remove it").expect("asked").center();
-    // Released from elsewhere after 3 s, so a pass held by the removal cannot hang the test.
     let late = control.clone();
-    std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_secs(3));
-        late.release.store(true, Ordering::SeqCst);
-    });
-    let started = std::time::Instant::now();
+    let dog = Watchdog::new(move || late.release.store(true, Ordering::SeqCst));
     rig.drv.click(&mut rig.win, at);
-    assert!(
-        started.elapsed() < Duration::from_secs(2),
-        "the click's passes waited for the removal ({:?})",
-        started.elapsed()
-    );
     rig.drv
         .until(&mut rig.win, 5, |_| control.holding.load(Ordering::SeqCst));
     assert!(rig.win.removing.is_some(), "running");
     // Its row takes no answer meanwhile.
     rig.drv.click_text(&mut rig.win, "Keep it");
+    rig.drv.idle(&mut rig.win, 3);
+    assert!(!dog.fired(), "a pass waited for the removal");
+    assert!(!control.release.load(Ordering::SeqCst), "still held");
     assert!(temp.exists());
     assert_eq!(rig.phase().as_deref(), Some("Naming"), "no answer taken");
     control.release.store(true, Ordering::SeqCst);
@@ -1084,6 +1158,328 @@ fn a_temp_that_cannot_be_checked_keeps_the_record() {
     }
 }
 
+/// The cut-off Save of [`Cut::CreatedNoReply`] in the window, and the next Save asked for in
+/// the same session: it reconciles first — reading only — and, the empty file at the temp path
+/// not provably its own, asks in the window, bound to that file. Nothing is written, the record
+/// stays, and the Save waits in its queue (Cmd+S again changes nothing).
+fn to_the_question(side: Side) -> (Rig, PathBuf, Vec<u8>, Vec<u8>) {
+    let mut rig = rig(side).unwrap();
+    let original = std::fs::read(&rig.path).unwrap();
+    rig.crop();
+    let output = rig.win.doc.encode().unwrap().bytes;
+    rig.cut(Cut::CreatedNoReply);
+    rig.save();
+    let temp = left_by(&rig).temp.unwrap();
+    rig.cut(Cut::None);
+    rig.control.taken();
+    rig.key(Key::S, command(false));
+    rig.drv.until(&mut rig.win, 10, |w| w.asking.is_some());
+    rig.drv.idle(&mut rig.win, 2);
+    let line = rig.win.asking.as_ref().unwrap().line.clone();
+    assert!(
+        line.ends_with("— remove it? The save waits for the answer"),
+        "{side:?}: {line}"
+    );
+    assert!(
+        rig.texts().contains(&line),
+        "{side:?}: shown whole: {:?}",
+        rig.texts()
+    );
+    assert!(rig.drv.find_text("Remove it").is_some(), "{side:?}");
+    assert!(rig.drv.find_text("Keep it").is_some(), "{side:?}");
+    assert!(
+        rig.win.queued.is_some() && rig.win.job.is_none(),
+        "{side:?}: waits"
+    );
+    assert_eq!(
+        rig.control.writes(),
+        Vec::<String>::new(),
+        "{side:?}: nothing sent"
+    );
+    assert_eq!(
+        rig.phase().as_deref(),
+        Some("Naming"),
+        "{side:?}: the record stays"
+    );
+    assert_eq!(
+        std::fs::read(&temp).unwrap(),
+        b"",
+        "{side:?}: the temp untouched"
+    );
+    assert_eq!(std::fs::read(&rig.path).unwrap(), original, "{side:?}");
+    rig.key(Key::S, command(false));
+    rig.drv.idle(&mut rig.win, 3);
+    assert!(
+        rig.win.job.is_none(),
+        "{side:?}: Save again does not go past the question"
+    );
+    assert_eq!(rig.control.writes(), Vec::<String>::new(), "{side:?}");
+    (rig, temp, original, output)
+}
+
+/// 07 §8: a Save meeting a temp of uncertain ownership in the same session asks in the window
+/// and goes on after the answer — Keep it: the file stays as it was, the record ends, the Save
+/// lands; Remove it: only that file is removed (checked again on a worker), then the Save lands.
+/// Through both sides.
+#[test]
+fn a_save_asks_about_an_uncertain_temp_and_goes_on_after_the_answer() {
+    for side in sides() {
+        for keep in [true, false] {
+            let case = format!("{side:?} keep={keep}");
+            let (mut rig, temp, _, output) = to_the_question(side);
+            let temp_s = temp.to_str().unwrap().to_string();
+            rig.drv
+                .click_text(&mut rig.win, if keep { "Keep it" } else { "Remove it" });
+            rig.drv.until(&mut rig.win, 10, |w| w.quiet());
+            rig.drv.idle(&mut rig.win, 2);
+            assert!(
+                rig.win.status.text.starts_with("saved "),
+                "{case}: {}",
+                rig.win.status.text
+            );
+            assert_eq!(std::fs::read(&rig.path).unwrap(), output, "{case}: landed");
+            assert!(!rig.win.doc.unsaved(), "{case}");
+            assert!(rig.journals().is_empty(), "{case}: retired");
+            if keep {
+                assert_eq!(std::fs::read(&temp).unwrap(), b"", "{case}: kept as it was");
+                assert!(rig
+                    .control
+                    .writes()
+                    .iter()
+                    .all(|w| w != &format!("remove {temp_s}")));
+            } else {
+                assert!(!temp.exists(), "{case}: removed");
+                assert_eq!(
+                    rig.control.writes().first(),
+                    Some(&format!("remove {temp_s}")),
+                    "{case}: removed before anything was written"
+                );
+            }
+        }
+    }
+}
+
+/// Remove it for that question removes only the file shown: one put at the name after it was
+/// shown survives; the Save is refused, saying why; the record stays; the next Save asks about
+/// the file there now, and Keep it lets it land. Through both sides.
+#[test]
+fn a_saves_question_keeps_a_file_that_changed_and_the_save_is_refused() {
+    for side in sides() {
+        let (mut rig, temp, original, output) = to_the_question(side);
+        std::fs::remove_file(&temp).unwrap();
+        std::fs::write(&temp, b"another program's file").unwrap();
+        rig.drv.click_text(&mut rig.win, "Remove it");
+        rig.drv.until(&mut rig.win, 10, |w| {
+            w.answering.is_none() && w.queued.is_none()
+        });
+        rig.drv.idle(&mut rig.win, 2);
+        assert_eq!(
+            std::fs::read(&temp).unwrap(),
+            b"another program's file",
+            "{side:?}"
+        );
+        assert!(rig.win.status.error, "{side:?}: {}", rig.win.status.text);
+        assert!(
+            rig.win.status.text.contains("changed since it was shown"),
+            "{side:?}: {}",
+            rig.win.status.text
+        );
+        assert!(
+            rig.win.job.is_none() && rig.win.asking.is_none(),
+            "{side:?}: refused"
+        );
+        assert_eq!(
+            rig.phase().as_deref(),
+            Some("Naming"),
+            "{side:?}: the record stays"
+        );
+        assert_eq!(
+            std::fs::read(&rig.path).unwrap(),
+            original,
+            "{side:?}: not written"
+        );
+        assert!(rig.win.doc.unsaved(), "{side:?}");
+        // The next Save asks about the file there now.
+        rig.key(Key::S, command(false));
+        rig.drv.until(&mut rig.win, 10, |w| w.asking.is_some());
+        rig.drv.idle(&mut rig.win, 2);
+        rig.drv.click_text(&mut rig.win, "Keep it");
+        rig.drv.until(&mut rig.win, 10, |w| w.quiet());
+        assert_eq!(
+            std::fs::read(&rig.path).unwrap(),
+            output,
+            "{side:?}: landed"
+        );
+        assert_eq!(
+            std::fs::read(&temp).unwrap(),
+            b"another program's file",
+            "{side:?}"
+        );
+        assert!(rig.journals().is_empty(), "{side:?}");
+    }
+}
+
+/// A cut-off Save's own temp — provably, by its record — whose removal fails when the next
+/// Save reconciles it: that Save asks about it in the window instead of being refused, and
+/// goes on once it is removed. Through both sides.
+#[test]
+fn a_save_asks_when_removing_its_own_earlier_temp_fails() {
+    for side in sides() {
+        let mut rig = rig(side).unwrap();
+        let original = std::fs::read(&rig.path).unwrap();
+        rig.crop();
+        let output = rig.win.doc.encode().unwrap().bytes;
+        rig.cut(Cut::DieAfterTempStat);
+        rig.save();
+        let temp = left_by(&rig).temp.unwrap();
+        assert_eq!(rig.phase().as_deref(), Some("Created"), "{side:?}");
+        // The connection is back; its removes are refused.
+        rig.control.dead.store(false, Ordering::SeqCst);
+        rig.cut(Cut::FailRemove);
+        rig.key(Key::S, command(false));
+        rig.drv.until(&mut rig.win, 10, |w| w.asking.is_some());
+        let line = rig.win.asking.as_ref().unwrap().line.clone();
+        assert!(line.contains("its removal failed"), "{side:?}: {line}");
+        assert!(
+            rig.win.queued.is_some() && rig.win.job.is_none(),
+            "{side:?}: waits"
+        );
+        assert_eq!(
+            std::fs::read(&temp).unwrap(),
+            output,
+            "{side:?}: the temp as staged"
+        );
+        assert_eq!(std::fs::read(&rig.path).unwrap(), original, "{side:?}");
+        assert_eq!(
+            rig.phase().as_deref(),
+            Some("Created"),
+            "{side:?}: the record stays"
+        );
+        rig.cut(Cut::None);
+        rig.drv.idle(&mut rig.win, 2);
+        rig.drv.click_text(&mut rig.win, "Remove it");
+        rig.drv.until(&mut rig.win, 10, |w| w.quiet());
+        assert!(!temp.exists(), "{side:?}: removed");
+        assert_eq!(
+            std::fs::read(&rig.path).unwrap(),
+            output,
+            "{side:?}: landed"
+        );
+        assert!(rig.journals().is_empty(), "{side:?}");
+    }
+}
+
+/// Esc drops a Save still in its queue — here waiting on its question: nothing is sent, the
+/// question goes with it and its record stays (the next Save asks again); with a close waiting
+/// on that Save, the close prompt comes up.
+#[test]
+fn esc_drops_a_save_waiting_on_its_question() {
+    let (mut rig, temp, original, _) = to_the_question(Side::Local);
+    rig.key(Key::Escape, Modifiers::NONE);
+    rig.drv.idle(&mut rig.win, 2);
+    assert!(
+        rig.win.queued.is_none() && rig.win.asking.is_none(),
+        "dropped"
+    );
+    assert_eq!(rig.win.status.text, STOPPED);
+    assert!(!rig.win.prompt, "no close was waiting");
+    assert_eq!(rig.control.writes(), Vec::<String>::new(), "nothing sent");
+    assert_eq!(rig.phase().as_deref(), Some("Naming"), "the record stays");
+    assert_eq!(std::fs::read(&temp).unwrap(), b"");
+    assert!(rig.win.doc.unsaved());
+    // Asked again by the next Save; a close now waits on it, and Esc brings up its prompt.
+    rig.key(Key::S, command(false));
+    rig.drv.until(&mut rig.win, 10, |w| w.asking.is_some());
+    assert!(
+        !crate::gui::Window::close_requested(&mut rig.win),
+        "waits for the save"
+    );
+    rig.key(Key::Escape, Modifiers::NONE);
+    rig.drv.idle(&mut rig.win, 2);
+    assert!(rig.win.queued.is_none(), "dropped");
+    assert!(rig.win.prompt, "the close prompt, the edits unsaved");
+    assert_eq!(rig.control.writes(), Vec::<String>::new());
+    assert_eq!(std::fs::read(&rig.path).unwrap(), original);
+}
+
+/// Q1: a generation due for a picture that has nothing to keep any more is not waited for. A
+/// pixelize schedules one; in the same pass, before it is due, Undo takes the picture back to
+/// the file's pixels (no operation left to journal) and Save copy is asked for: the Save copy
+/// runs and writes its sibling.
+#[test]
+fn a_save_never_waits_on_a_generation_due_for_an_earlier_picture() {
+    let mut rig = rig(Side::Local).unwrap();
+    rig.win.sel.set([0, 0, 10, 10]);
+    rig.drv.idle(&mut rig.win, 1);
+    rig.key(Key::P, Modifiers::NONE);
+    assert!(rig.win.doc.unsaved());
+    assert!(rig.win.keeper.due().is_some(), "a generation is due");
+    let key = |key, modifiers| Event::Key {
+        key,
+        physical_key: None,
+        pressed: true,
+        repeat: false,
+        modifiers,
+    };
+    rig.drv.frame(
+        &mut rig.win,
+        vec![key(Key::Z, command(false)), key(Key::S, command(true))],
+        command(true),
+    );
+    assert!(!rig.win.doc.can_undo(), "undone");
+    assert_eq!(
+        rig.win.doc.journal_edits().map(<[Edit]>::len),
+        Some(0),
+        "nothing to journal"
+    );
+    assert!(
+        rig.win.queued.is_some() || rig.win.job.is_some(),
+        "Save copy asked for"
+    );
+    rig.drv.until(&mut rig.win, 10, |w| w.quiet());
+    let copy = rig.dir.join("shot.edited.png");
+    assert!(copy.exists(), "{:?}: {}", rig.texts(), rig.win.status.text);
+}
+
+/// Q2: a removal asked for while a generation is being written (nothing unsaved at that moment)
+/// does not take a newer generation with it. A held, the removal asked for, a newer edit flushed
+/// (B); A released: the journal is on disk holding B.
+#[test]
+fn a_removal_waiting_on_a_write_does_not_drop_a_newer_generation() {
+    let mut rig = rig(Side::Local).unwrap();
+    let gates = Arc::new(GatedDisk::default());
+    rig.win.keeper = file::Keeper::at(gates.clone(), &rig.win.file.lock().unwrap());
+    rig.crop();
+    gates.write_held.store(true, Ordering::SeqCst);
+    gates.write_reached.store(false, Ordering::SeqCst);
+    rig.win.sel.set([0, 0, 10, 10]);
+    rig.drv.idle(&mut rig.win, 1);
+    rig.key(Key::P, Modifiers::NONE);
+    let g = gates.clone();
+    rig.drv
+        .until(&mut rig.win, 5, |_| g.write_reached.load(Ordering::SeqCst));
+    // What the clean-state pass asks for when it finds the journal free between A's last write
+    // and its result.
+    rig.win.keeper.remove().unwrap();
+    rig.win.sel.set([20, 20, 10, 10]);
+    rig.drv.idle(&mut rig.win, 1);
+    rig.key(Key::P, Modifiers::NONE);
+    rig.drv.frame(
+        &mut rig.win,
+        vec![Event::WindowFocused(false)],
+        Modifiers::NONE,
+    );
+    gates.write_held.store(false, Ordering::SeqCst);
+    rig.drv.until(&mut rig.win, 10, |w| w.quiet());
+    let dirs = rig.journals();
+    assert_eq!(dirs.len(), 1, "the journal stays");
+    assert_eq!(
+        words(&current(&dirs[0])),
+        ["crop", "pixelize", "pixelize"],
+        "B"
+    );
+}
+
 /// P4: a Save of a picture Undo took back past an earlier Save is the file's fresh start: the
 /// edits after it are journaled — edit, Save, Undo, Save, edit, kept, killed, Restore gives the
 /// picture back.
@@ -1181,6 +1577,8 @@ fn the_lock_retry_counts_only_this_files_journals() {
 struct GatedDisk {
     list_held: AtomicBool,
     write_held: AtomicBool,
+    /// A generation's write got to its gate.
+    write_reached: AtomicBool,
     trace: std::sync::Mutex<Vec<String>>,
 }
 
@@ -1203,6 +1601,7 @@ impl journal::Fs for GatedDisk {
         journal::Disk.create_dir(path)
     }
     fn write_new(&self, path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+        self.write_reached.store(true, Ordering::SeqCst);
         Self::wait(&self.write_held);
         journal::Disk.write_new(path, bytes)
     }
@@ -1272,6 +1671,12 @@ fn nothing_the_journal_waits_on_holds_the_window_and_a_save_waits_for_the_journa
     drop(std::mem::replace(&mut rig.win, win));
     rig.drv = Driver::new(1000.0, 700.0);
     let original = std::fs::read(&rig.path).unwrap();
+    let (g, c) = (gates.clone(), rig.control.clone());
+    let dog = Watchdog::new(move || {
+        g.list_held.store(false, Ordering::SeqCst);
+        g.write_held.store(false, Ordering::SeqCst);
+        c.release.store(true, Ordering::SeqCst);
+    });
     let mut slowest = Duration::ZERO;
     let mut pass = |rig: &mut Rig, events: Vec<Event>, mods: Modifiers| {
         let started = std::time::Instant::now();
@@ -1321,6 +1726,7 @@ fn nothing_the_journal_waits_on_holds_the_window_and_a_save_waits_for_the_journa
         "still queued"
     );
     assert!(rig.control.writes().is_empty(), "nothing sent");
+    assert!(!dog.fired(), "a pass waited on a held gate");
     assert!(
         slowest < Duration::from_millis(300),
         "a pass waited: {slowest:?}"
@@ -1546,26 +1952,47 @@ fn a_landed_save_above_256_mib_is_found_by_its_first_and_last_mib() {
         }
         let (found, log) = reopen_look(&cache, &target);
         let shown = target.to_str().unwrap();
-        // What the look read of the file, and that it changed nothing.
-        let reads: Vec<&String> = log.iter().filter(|l| l.starts_with("read ")).collect();
-        for read in &reads {
-            let first = format!("read {shown} 0 {MIB}");
-            let last = format!("read {shown} {} {MIB}", SIZE - MIB);
+        // What the look read of the file, and that it changed nothing: no whole read (read-all,
+        // read-through, read-head) of it at all, and its ranged reads only the first and the
+        // last MiB — for a landed case exactly those two, once each.
+        let first = format!("read {shown} 0 {MIB}");
+        let last = format!("read {shown} {} {MIB}", SIZE - MIB);
+        let of_it: Vec<&String> = log
+            .iter()
+            .filter(|l| l.starts_with("read") && l.contains(shown))
+            .collect();
+        for read in &of_it {
             assert!(**read == first || **read == last, "{case}: {read}");
         }
-        assert!(!reads.is_empty(), "{case}");
+        let lands = matches!(case, "as staged" | "middle changed");
+        if lands {
+            let mut sorted: Vec<&str> = of_it.iter().map(|r| r.as_str()).collect();
+            sorted.sort();
+            let mut want = vec![first.as_str(), last.as_str()];
+            want.sort();
+            assert_eq!(sorted, want, "{case}: the reads of the file");
+        } else {
+            assert!(of_it.contains(&&first), "{case}: {of_it:?}");
+        }
         let writes: Vec<&String> = log
             .iter()
             .filter(|l| {
                 [
-                    "create", "rename", "remove", "set-mode", "link", "write ", "copy",
+                    "create",
+                    "rename",
+                    "remove",
+                    "set-mode",
+                    "set-owner",
+                    "set-handle-mode",
+                    "link",
+                    "write ",
+                    "copy",
                 ]
                 .iter()
                 .any(|m| l.starts_with(m))
             })
             .collect();
         assert!(writes.is_empty(), "{case}: {writes:?}");
-        let lands = matches!(case, "as staged" | "middle changed");
         if lands {
             assert!(found.rows.is_empty(), "{case}");
             assert_eq!(found.notes.len(), 1, "{case}: {:?}", found.notes);

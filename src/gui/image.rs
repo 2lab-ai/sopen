@@ -1707,6 +1707,8 @@ fn autosave(mut file: ImageFile, doc: &Doc, hooks: &Hooks) -> Result<Outcome> {
             }
         }
         Saved::Cancelled => bail!("{STOPPED}"),
+        // No one to answer here (a run's own journal has no earlier Save): said, not written.
+        Saved::Ask(left) => bail!("{}; nothing was written", left.line),
     }
     Ok(outcome)
 }
@@ -1781,6 +1783,14 @@ fn report(result: &Result<JobDone>, outcome: &mut Outcome) -> (Status, Vec<Strin
             let line = notes.first().cloned().unwrap_or_default();
             (Status::info(line), notes.clone())
         }
+        // A question the window asks (a save gone with its window: said, nothing written).
+        Ok(JobDone::Saved(Saved::Ask(left))) => {
+            eprintln!("sopen: {}; nothing was written", left.line);
+            (
+                Status::error("not saved: answer about the interrupted save's temporary file"),
+                vec![left.line.clone()],
+            )
+        }
         // The encode before Save As: the modal reports what it saves.
         Ok(JobDone::Encoded(_)) => (Status::info("Save As…"), Vec::new()),
         Ok(JobDone::Copy(path, not_kept)) => {
@@ -1842,6 +1852,10 @@ const STOPPED: &str = "stopped: nothing was written; the original is untouched";
 
 /// Why the journal holds nothing for a picture Undo took past the last Save (07 §3's `NOT kept
 /// on disk (<why>)`): its edits are not operations on the file as saved.
+/// A Save waiting on the answer about an earlier Save's temp.
+const ASKED: &str = "the save waits for your answer about the file at the interrupted save's \
+     temporary path";
+
 const PAST_THE_SAVE: &str = "undone past the last save, which the journal cannot replay";
 
 /// The Save As modal over the window, with the revision its encoder took and what that encoder
@@ -1987,6 +2001,13 @@ struct ImageWindow {
     waking: bool,
     /// Tests: where Save As's fill waits.
     save_as_hold: Option<Arc<file::Hold>>,
+    /// The question a queued Save waits on (07 §3.1, [`file::Saved::Ask`]): a file at the temp
+    /// path of this session's cut-off Save, sopen unsure it is its own.
+    asking: Option<file::LeftTemp>,
+    /// Its Remove it, running on a worker.
+    answering: Option<Receiver<std::result::Result<String, String>>>,
+    /// Its Keep it, for the Save that goes on.
+    kept_temp: Option<String>,
     /// A Remove it running on a worker, for the row of this journal.
     removing: Option<(PathBuf, Receiver<std::result::Result<String, String>>)>,
     /// They were looked for: on the first pass as the image window, never as a preview (a
@@ -2055,7 +2076,7 @@ impl Drop for ImageWindow {
         // A scripted run's edits are its state's, not the owner's: nothing of them is kept —
         // unless a Save's outcome is unknown (the next open reconciles it).
         if self.scripted && self.keeper.settle_writer().pending_save() == Some(false) {
-            if let Err(e) = self.keeper.remove() {
+            if let Err(e) = self.keeper.discard() {
                 eprintln!("sopen: {e:#}");
             }
         }
@@ -2113,6 +2134,9 @@ impl ImageWindow {
             kept_rev: 0,
             rows: Vec::new(),
             removing: None,
+            asking: None,
+            answering: None,
+            kept_temp: None,
             queued: None,
             flush_wanted: false,
             waking: false,
@@ -2238,11 +2262,16 @@ impl ImageWindow {
         }
         // While a save runs nothing changes (the journal was written as it started), and its
         // worker has the journal.
-        if self.job.is_some() || self.saving_as.is_some() || !self.doc.unsaved() {
+        if self.job.is_some() || self.saving_as.is_some() {
             return;
         }
-        let Some(ops) = self.doc.journal_edits().filter(|o| !o.is_empty()) else {
-            return;
+        // Nothing to keep now (back to the file, or past a Save): a generation still due for an
+        // earlier picture is not written — a queued Save waits on nothing.
+        let ops = match self.doc.journal_edits() {
+            _ if !self.doc.unsaved() => return self.keeper.unschedule(),
+            Some([]) => return self.keeper.unschedule(),
+            None => return self.keeper.cannot(PAST_THE_SAVE),
+            Some(ops) => ops,
         };
         let rev = self.doc.rev();
         if rev != self.kept_rev {
@@ -2375,10 +2404,11 @@ impl ImageWindow {
     /// landed offers only that question. A row whose removal is running takes no answer.
     fn recovery_rows(&mut self, ui: &mut egui::Ui) {
         let mut answer = None;
-        let busy = self.removing.as_ref().map(|(dir, _)| dir.clone());
+        // While a removal runs, no row takes an answer (one runs at a time).
+        let busy = self.removing.is_some();
         for (i, row) in self.rows.iter().enumerate() {
             let line = row_line(row);
-            let pending = busy.as_deref() == Some(row.orphan.dir());
+            let pending = busy;
             ui.horizontal_wrapped(|ui| {
                 ui.label(egui::RichText::new(line).color(ui.visuals().warn_fg_color));
                 ui.add_enabled_ui(!pending, |ui| {
@@ -2489,6 +2519,90 @@ impl ImageWindow {
         }
         if let Err(e) = self.rows[i].orphan.clear_save() {
             self.status = Status::error(format!("{e:#}"));
+        }
+    }
+
+    /// The question a queued Save waits on (07 §3.1): Remove it — only the file shown, checked
+    /// again on a worker — or Keep it; the Save goes on after the answer. Its buttons are off
+    /// while Remove it runs.
+    fn asked_row(&mut self, ui: &mut egui::Ui) {
+        let Some(left) = &self.asking else {
+            return;
+        };
+        let free = self.answering.is_none();
+        let mut answer = None;
+        ui.horizontal_wrapped(|ui| {
+            ui.label(egui::RichText::new(&left.line).color(ui.visuals().warn_fg_color));
+            if ui
+                .add_enabled(free, egui::Button::new("Remove it"))
+                .clicked()
+            {
+                answer = Some(Answer::Remove);
+            }
+            if ui.add_enabled(free, egui::Button::new("Keep it")).clicked() {
+                answer = Some(Answer::Keep);
+            }
+        });
+        match answer {
+            Some(Answer::Keep) => {
+                let left = self.asking.take().expect("asked");
+                self.kept_temp = Some(left.path);
+                self.status = Status::info(format!(
+                    "the file at the interrupted save's temporary path is kept · {SAVING}"
+                ));
+            }
+            Some(Answer::Remove) => {
+                let left = left.clone();
+                let (tx, rx) = mpsc::channel();
+                let file = self.file.clone();
+                let spawned = std::thread::Builder::new()
+                    .name("image-remove-temp".into())
+                    .spawn(move || {
+                        let _ = tx.send(file::remove_left(&file, &left));
+                    });
+                match spawned {
+                    Ok(_) => {
+                        self.answering = Some(rx);
+                        self.status = Status::info("checking the file before removing it…");
+                    }
+                    Err(e) => self.status = Status::error(format!("{e}")),
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Remove it for the queued Save's question, once it is back: removed — the Save goes on;
+    /// kept (it was not the file shown, or could not be checked) — the Save is refused, with
+    /// why, and the next Save asks about the file there then.
+    fn poll_answer(&mut self, ctx: &egui::Context) {
+        let Some(rx) = &self.answering else {
+            return;
+        };
+        let result = match rx.try_recv() {
+            Ok(result) => result,
+            Err(mpsc::TryRecvError::Empty) => return,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                Err("the removal stopped without a result".to_string())
+            }
+        };
+        self.answering = None;
+        self.asking = None;
+        match result {
+            Ok(line) => self.status = Status::info(format!("{line} · {SAVING}")),
+            Err(why) => {
+                self.queued = None;
+                self.status = Status::error(format!("not saved: {why}"));
+                self.pending_notices = Some(vec![format!(
+                    "{why} — not saved; Save again to be asked about the file there now"
+                )]);
+                if std::mem::take(&mut self.close_when_done) && self.doc.unsaved() {
+                    self.prompt = true;
+                }
+            }
+        }
+        if self.queued.is_some() {
+            self.launch(ctx);
         }
     }
 
@@ -2754,9 +2868,14 @@ impl ImageWindow {
         if self.recovering.is_some() || self.flush_wanted || !self.keeper.settled() {
             return;
         }
+        // A question about a temp is answered first (the Save's record holds it).
+        if self.asking.is_some() || self.answering.is_some() {
+            return;
+        }
         self.queued = None;
         let encoder = self.doc.encoder();
         let file = self.file.clone();
+        let kept = self.kept_temp.take();
         let (copy, save_as) = match kind {
             JobKind::Save { .. } => (false, false),
             JobKind::SaveCopy { .. } => (true, false),
@@ -2784,6 +2903,7 @@ impl ImageWindow {
                             .map(|path| JobDone::Copy(path, enc.not_kept))
                     })
                 } else {
+                    file.kept_temp = kept;
                     let mut journal = slot.lock().unwrap_or_else(|p| p.into_inner());
                     let saved = file
                         .save_kept(encoder, &mut journal, take.as_ref(), &saving)
@@ -2830,6 +2950,14 @@ impl ImageWindow {
                 }
                 let close_after = matches!(job.kind, JobKind::SaveAs { close_after: true });
                 return self.open_save_as(encoded, job.rev, close_after);
+            }
+            // A file at the temp path of an earlier cut-off Save: nothing was written, and the
+            // Save waits in its queue for the answer (Remove it, Keep it), then goes on.
+            Ok(JobDone::Saved(Saved::Ask(left))) => {
+                self.status = Status::info(ASKED);
+                self.asking = Some(left);
+                self.queued = Some(job.kind);
+                return;
             }
             other => other,
         };
@@ -2982,6 +3110,18 @@ impl ImageWindow {
         );
         if saving && plain_key(ctx, Key::Escape) && !self.saving.cancel() {
             self.status = Status::info("the file is being replaced: it cannot be stopped now");
+        }
+        // A Save still in its queue (waiting for the journal, or for an answer): Esc drops it —
+        // nothing was sent. A question stays with its record, asked by the next Save.
+        if self.job.is_none() && self.queued.is_some() && plain_key(ctx, Key::Escape) {
+            self.queued = None;
+            if self.answering.is_none() {
+                self.asking = None;
+            }
+            self.status = Status::info(STOPPED);
+            if std::mem::take(&mut self.close_when_done) && self.doc.unsaved() {
+                self.prompt = true;
+            }
         }
         // Before Cmd/Ctrl+S: egui's own check would take Alt+Cmd/Ctrl+S for it (07 §7).
         if save_as::pressed(ctx) {
@@ -3243,7 +3383,7 @@ impl ImageWindow {
             }
             ui.separator();
             if self.job.is_some()
-                || self.queued.is_some()
+                || (self.queued.is_some() && self.asking.is_none())
                 || self.saving_as.as_ref().is_some_and(|s| s.modal.busy())
             {
                 // No taller than the status text beside it, so the bar keeps its height.
@@ -3421,7 +3561,7 @@ impl ImageWindow {
                 if discard.clicked() {
                     self.prompt = false;
                     // Discard is the one way out that does not keep the journal (07 §3).
-                    if let Err(e) = self.keeper.remove() {
+                    if let Err(e) = self.keeper.discard() {
                         eprintln!("sopen: {e:#}");
                     }
                     self.close_ok = true;
@@ -3466,6 +3606,7 @@ impl super::Window for ImageWindow {
             self.keeper.set_wake(move || wake.request_repaint());
         }
         self.poll_job(&ctx);
+        self.poll_answer(&ctx);
         self.launch(&ctx);
         self.keys(&ctx);
         self.clipboard(&ctx);
@@ -3513,9 +3654,10 @@ impl super::Window for ImageWindow {
                 ui.add_space(2.0);
             });
         }
-        if !self.rows.is_empty() {
+        if !self.rows.is_empty() || self.asking.is_some() {
             egui::Panel::bottom("recovery").show(ui, |ui| {
                 ui.add_space(2.0);
+                self.asked_row(ui);
                 self.recovery_rows(ui);
                 ui.add_space(2.0);
             });
@@ -3580,7 +3722,7 @@ impl super::Window for ImageWindow {
             // The edits are in the file, a copy or a Save As: the journal goes (07 §3) — unless
             // a Save's outcome is unknown, whose record the next open reconciles.
             if self.keeper.pending_save() == Some(false) {
-                if let Err(e) = self.keeper.remove() {
+                if let Err(e) = self.keeper.discard() {
                     eprintln!("sopen: {e:#}");
                 }
             }

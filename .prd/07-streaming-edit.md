@@ -640,7 +640,10 @@ size rule. Image and media upload their output, as today.
   edits — until that generation is durable (and until the look for earlier journals is back),
   then starts; a close or leaving the viewer meanwhile waits for it as for a running Save.
   The look for earlier journals runs on a worker too, and no generation is written while it
-  is out (it would take a journal being made for an earlier one's).
+  is out (it would take a journal being made for an earlier one's). A generation due for a
+  picture that has nothing to keep any more is dropped, not waited for. The journal's removal
+  once nothing is unsaved waits for a generation being written, and a newer edit meanwhile
+  cancels it; Discard's does not.
 - **A temp asked about** (§3.1: phase `naming`, or one that no longer equals the record) is
   bound to its journal's record and to the file as it was when asked — its stat and, up to
   256 MiB, its content's SHA-256. The record stays until the question is answered, also when
@@ -648,8 +651,13 @@ size rule. Image and media upload their output, as today.
   worker and removes it only when it is still that file; otherwise, or when it cannot be checked,
   the file and the record stay and the row says why. A temp that cannot be read to be checked
   keeps the record too, for the next open. A removal without asking re-reads the temp's stat
-  right before it and requires the recorded one. A Save in the same session that
-  finds such a temp refuses, and leaves the question to the next open.
+  right before it and requires the recorded one; where that removal fails, the temp is asked
+  about the same way. A Save in the same session that finds such a
+  temp writes nothing and asks in the window, as a reopen does, bound the same way: the Save
+  waits in its queue for the answer. Keep it leaves the file, ends the record, and the Save goes
+  on; Remove it removes that file on a worker and the Save goes on — or, the file not the one
+  shown or not checkable, keeps it, refuses the Save with why, and the next Save asks about the
+  file there then. Esc drops a Save still in its queue; nothing was sent.
 - **The journal** records the operations and the pasted pictures (§3). A restore replays them on the
   decoded original.
 - **Save As** writes the encoder's output (§7).

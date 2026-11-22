@@ -334,9 +334,20 @@ fn failures_tell_where_the_temp_went() {
     assert_eq!(std::fs::read(&rig.target).unwrap(), b"the edited content");
 }
 
-/// The requests a replace sent, the target as `T`, the temp as `t`, their folder as `D`.
+/// The temp this replace created: the path of its first create.
+fn created(fs: &Counted) -> Option<String> {
+    fs.requests
+        .lock()
+        .unwrap()
+        .iter()
+        .find_map(|r| r.strip_prefix("create ").map(str::to_string))
+}
+
+/// The requests a replace sent, the target as `T`, the temp it created as `t` (that path only —
+/// any other name stays as sent), their folder as `D`.
 fn trace(fs: &Counted, target: &str) -> Vec<String> {
     let dir = target.rsplit_once('/').map(|(d, _)| d).unwrap_or_default();
+    let temp = created(fs);
     fs.requests
         .lock()
         .unwrap()
@@ -346,7 +357,7 @@ fn trace(fs: &Counted, target: &str) -> Vec<String> {
                 .map(|w| {
                     if w == target {
                         "T"
-                    } else if w.contains(".sopen-") {
+                    } else if Some(w) == temp.as_deref() {
                         "t"
                     } else if w == dir {
                         "D"
@@ -433,6 +444,11 @@ fn every_path_sends_the_pinned_requests() {
                 *want,
                 "{case} (steps told: {with_steps})"
             );
+            // A cleanup removed the temp it created.
+            if want.contains(&"remove t") {
+                let temp = created(&fs).expect("created");
+                assert!(!Path::new(&temp).exists(), "{case}: {temp} is left");
+            }
         }
     }
     // A content change found after the upload: same size and mtime, other bytes.
@@ -460,6 +476,8 @@ fn every_path_sends_the_pinned_requests() {
             ["lstat T", "create t", "lstat t", "read T", "remove t"],
             "content changed (steps told: {with_steps})"
         );
+        let temp = created(&fs).expect("created");
+        assert!(!Path::new(&temp).exists(), "{temp} is left");
     }
     // A cleanup whose remove failed: the rename refused, the temp left.
     for with_steps in [false, true] {
@@ -488,5 +506,7 @@ fn every_path_sends_the_pinned_requests() {
             ],
             "remove failed (steps told: {with_steps})"
         );
+        let temp = created(&fs).expect("created");
+        assert!(Path::new(&temp).exists(), "left, as said");
     }
 }
