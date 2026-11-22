@@ -154,10 +154,11 @@ pub fn tracks_for(probe: &Probe, out_ext: &str) -> Vec<ffmpeg::Track> {
     tracks
 }
 
-/// Renders the edit `spec` of local file `src` into `dst` (spec §7, message 13): one ffmpeg
-/// run, or — for an edit that reads more separate stretches of the source than one run may
-/// open — lossless passes into `work` and a final one ([`ffmpeg::edit_passes`]). `progress`
-/// gets 0.0..=1.0 of all of it; every run has the progress-stall watchdog.
+/// Renders the edit `spec` of `src` into `dst` (spec §7, message 13): one ffmpeg run, or — for
+/// an edit that reads more separate stretches of the source than one run may open — lossless
+/// passes into `work` and a final one ([`ffmpeg::edit_passes`]). `progress` gets 0.0..=1.0 of
+/// all of it; every run has the progress-stall watchdog. A remote file is read through its
+/// `render` URL, and a run whose input was cut short fails, whatever ffmpeg's status (06 §7.4).
 #[allow(clippy::too_many_arguments)]
 pub fn render_edit(
     tools: &Tools,
@@ -193,7 +194,38 @@ pub fn render_edit_with(
     progress: &mut dyn FnMut(f64),
     max_inputs: usize,
 ) -> Result<()> {
-    let passes = ffmpeg::edit_passes(spec, max_inputs)?;
+    let to = Render {
+        dst,
+        work,
+        max_inputs,
+        stopped: &|| false,
+    };
+    render(tools, src, spec, (media, plan), &to, progress)
+}
+
+/// Where a render goes and what stops it.
+struct Render<'a> {
+    dst: &'a Path,
+    work: &'a Path,
+    max_inputs: usize,
+    /// Asked while each run goes: true stops it ([`ffmpeg::run_stoppable`]).
+    stopped: &'a dyn Fn() -> bool,
+}
+
+/// The render itself ([`render_edit`]). The server's cut account is read before and after
+/// every ffmpeg run of it, each pass of a render in passes too, and a count that went up fails
+/// the render (06 §7.4, W7's rule): ffmpeg exits 0 on an input cut short, and its output is then
+/// short.
+fn render(
+    tools: &Tools,
+    src: &Input,
+    spec: &EditSpec,
+    (media, plan): (MediaKind, &ExportPlan),
+    to: &Render,
+    progress: &mut dyn FnMut(f64),
+) -> Result<()> {
+    let src = src.of_kind(crate::stream::http::Kind::Render);
+    let passes = ffmpeg::edit_passes(spec, &src, to.max_inputs)?;
     let total: f64 = passes.iter().map(EditSpec::length).sum::<f64>().max(1e-9);
     let encoders = ffmpeg::available_encoders(tools)?;
     let mut files: Vec<Input> = vec![src.clone()];
@@ -201,9 +233,9 @@ pub fn render_edit_with(
     for (k, pass) in passes.iter().enumerate() {
         let last = k + 1 == passes.len();
         let out = if last {
-            dst.to_path_buf()
+            to.dst.to_path_buf()
         } else {
-            work.join(format!("pass-{k}.mkv"))
+            to.work.join(format!("pass-{k}.mkv"))
         };
         let inputs: Vec<&Input> = files.iter().collect();
         let encode = if last {
@@ -212,11 +244,29 @@ pub fn render_edit_with(
             Encode::Lossless
         };
         let args = ffmpeg::edit_args(&inputs, &out, pass, media, plan, encode)?;
-        let args = ffmpeg::assemble(tools, args, work, &format!("graph-{k}.txt"))?;
+        let args = ffmpeg::assemble(tools, args, to.work, &format!("graph-{k}.txt"))?;
         let args = ffmpeg::adapt_to_encoders(args, &encoders)?;
         let length = pass.length();
-        ffmpeg::run_export(tools, &args, length, &mut |f| {
-            progress(((done + f * length) / total).clamp(0.0, 1.0))
+        let before = src.cuts();
+        let ran = ffmpeg::run_stoppable(
+            tools,
+            &args,
+            length,
+            &mut |f| progress(((done + f * length) / total).clamp(0.0, 1.0)),
+            ffmpeg::STALL_LIMIT,
+            ffmpeg::Watched {
+                stopped: to.stopped,
+                fed: &|| src.fed(),
+                now: &std::time::Instant::now,
+            },
+        );
+        if let Some(why) = src.cut_since(before) {
+            bail!("{why}; the render was stopped");
+        }
+        // ffmpeg's words name the stream's URL: said as the file.
+        ran.map_err(|e| match crate::remote::is_cancelled(&e) {
+            true => e,
+            false => anyhow::anyhow!("{}", src.said(&format!("{e:#}"))),
         })?;
         done += length;
         if !last {
@@ -227,8 +277,152 @@ pub fn render_edit_with(
     Ok(())
 }
 
+/// An export's Cancel against its publishing, decided once (06 §7.4). The boundary is the
+/// decision to publish, taken right before the step that gives the new name: the link of the
+/// uploaded temp, or — on a server that cannot link — the write straight into the new name,
+/// decided before that write begins. A Cancel that comes first wins: ffmpeg is killed, or the
+/// upload stops, its temp is removed and nothing is linked. One that comes after the decision
+/// is too late, even while the link or the direct write is still going: the result names the
+/// sibling.
+#[derive(Debug, Default)]
+pub struct Stop(std::sync::atomic::AtomicU8);
+
+const RUNNING: u8 = 0;
+const CANCELLED: u8 = 1;
+const PUBLISHING: u8 = 2;
+
+impl Stop {
+    /// Cancel: true when it came in time and nothing will be published; false once the
+    /// publishing has begun.
+    pub fn cancel(&self) -> bool {
+        use std::sync::atomic::Ordering::SeqCst;
+        match self.0.compare_exchange(RUNNING, CANCELLED, SeqCst, SeqCst) {
+            Ok(_) => true,
+            Err(now) => now == CANCELLED,
+        }
+    }
+
+    pub fn cancelled(&self) -> bool {
+        self.0.load(std::sync::atomic::Ordering::SeqCst) == CANCELLED
+    }
+
+    /// Tests: the publishing begins.
+    #[cfg(test)]
+    pub(crate) fn publish_for_tests(&self) -> bool {
+        self.publish()
+    }
+
+    /// The new name is about to be given: false when a Cancel came first.
+    fn publish(&self) -> bool {
+        use std::sync::atomic::Ordering::SeqCst;
+        match self.0.compare_exchange(RUNNING, PUBLISHING, SeqCst, SeqCst) {
+            Ok(_) => true,
+            Err(now) => now == PUBLISHING,
+        }
+    }
+}
+
+/// The export's remote while it publishes ([`RemoteFs::write_new_sibling`] runs through it):
+/// the publishing — the link of the uploaded temp, or the direct write where the server cannot
+/// link — is where [`Stop`] decides. A Cancel stops the temp's upload between chunks; once one
+/// has come, nothing is created and nothing is linked: the temp is removed and no name is taken.
+/// Everything else passes through.
+struct Vetoed<'a> {
+    fs: &'a mut dyn RemoteFs,
+    stop: &'a Stop,
+}
+
+impl crate::remote::IntoBoxed for Vetoed<'_> {
+    fn into_boxed(self: Box<Self>) -> Box<dyn RemoteFs + Send> {
+        unreachable!("an export's publishing never hands its connection over")
+    }
+}
+
+impl RemoteFs for Vetoed<'_> {
+    fn stat_opt(&mut self, path: &str) -> Result<Option<crate::remote::Stat>> {
+        self.fs.stat_opt(path)
+    }
+    fn lstat_opt(&mut self, path: &str) -> Result<Option<crate::remote::Stat>> {
+        self.fs.lstat_opt(path)
+    }
+    fn realpath(&mut self, path: &str) -> Result<String> {
+        self.fs.realpath(path)
+    }
+    fn read_head(&mut self, path: &str, max: usize) -> Result<Vec<u8>> {
+        self.fs.read_head(path, max)
+    }
+    fn list_dir(&mut self, path: &str) -> Result<Vec<String>> {
+        self.fs.list_dir(path)
+    }
+    fn list_entries(&mut self, path: &str) -> Result<Vec<crate::remote::Entry>> {
+        self.fs.list_entries(path)
+    }
+    fn free_space(&mut self, path: &str) -> Option<u64> {
+        self.fs.free_space(path)
+    }
+    fn read_to(
+        &mut self,
+        path: &str,
+        out: &mut dyn std::io::Write,
+        progress: &mut dyn FnMut(u64),
+    ) -> Result<u64> {
+        self.fs.read_to(path, out, progress)
+    }
+    fn create_from(
+        &mut self,
+        local: &Path,
+        path: &str,
+        like: Option<crate::remote::Like>,
+    ) -> std::result::Result<crate::remote::Uploaded, crate::remote::CreateError> {
+        // Without links the file is written under its new name: that write is the publishing.
+        let refused = if self.fs.can_link() {
+            self.stop.cancelled()
+        } else {
+            !self.stop.publish()
+        };
+        if refused {
+            return Err(crate::remote::CreateError::new(
+                crate::remote::Created::No,
+                anyhow::anyhow!(crate::remote::Cancelled),
+            ));
+        }
+        // A Cancel during the upload stops it between chunks: the temp, ours, is removed and
+        // nothing is linked. The direct write is the publishing itself, never stopped.
+        let stop = self.stop;
+        let linking = self.fs.can_link();
+        self.fs
+            .create_from_stoppable(local, path, like, &|| linking && stop.cancelled())
+    }
+    fn set_mode(&mut self, path: &str, mode: u32) -> Result<()> {
+        self.fs.set_mode(path, mode)
+    }
+    fn rename_over(&mut self, from: &str, to: &str) -> Result<()> {
+        self.fs.rename_over(from, to)
+    }
+    fn link_new(&mut self, from: &str, to: &str) -> Result<()> {
+        if !self.stop.publish() {
+            return Err(anyhow::anyhow!(crate::remote::Cancelled));
+        }
+        self.fs.link_new(from, to)
+    }
+    fn can_link(&self) -> bool {
+        self.fs.can_link()
+    }
+    fn can_replace(&self) -> bool {
+        self.fs.can_replace()
+    }
+    fn remove(&mut self, path: &str) -> Result<()> {
+        self.fs.remove(path)
+    }
+    fn hash_check_limit(&self) -> u64 {
+        self.fs.hash_check_limit()
+    }
+}
+
 /// The export of a timeline's `[in_s, out_s]` (`spec` already cut to it) as a new sibling
-/// `<stem>.cut-<in>-<out>.<ext>` — the window's Export.
+/// `<stem>.cut-<in>-<out>.<ext>` — the window's Export. `stop` cancels it ([`Stop`]): during
+/// the render ffmpeg is killed and the local render removed; during the upload the upload stops,
+/// its temp is removed and nothing is linked; the error is then [`crate::remote::Cancelled`].
 #[allow(clippy::too_many_arguments)]
 pub fn render_and_publish(
     fs: &mut dyn RemoteFs,
@@ -240,8 +434,10 @@ pub fn render_and_publish(
     (in_s, out_s): (f64, f64),
     work_root: &Path,
     progress: &mut dyn FnMut(f64),
+    stop: &Stop,
 ) -> Result<Published> {
-    let probe = ffmpeg::probe(tools, src)?;
+    let src = src.of_kind(crate::stream::http::Kind::Render);
+    let probe = ffmpeg::probe_input(tools, &src, src_name)?;
     let (media, out_ext, plan) = plan(tools, &probe, src_name)?;
     let mut spec = spec.clone();
     spec.crop = match (spec.crop, probe.display, media) {
@@ -256,8 +452,14 @@ pub fn render_and_publish(
     crate::cache::private_dir(&work)?;
     let result = (|| -> Result<String> {
         let dst = work.join(&name);
-        render_edit(tools, src, &dst, &spec, media, &plan, &work, progress)?;
-        fs.write_new_sibling(&dst, dir, &name)
+        let to = Render {
+            dst: &dst,
+            work: &work,
+            max_inputs: ffmpeg::MAX_INPUTS,
+            stopped: &|| stop.cancelled(),
+        };
+        render(tools, &src, &spec, (media, &plan), &to, progress)?;
+        Vetoed { fs, stop }.write_new_sibling(&dst, dir, &name)
     })();
     let _ = std::fs::remove_dir_all(&work);
     result.map(|name| Published {

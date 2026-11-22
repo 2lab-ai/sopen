@@ -963,7 +963,7 @@ fn paused_and_played_frames_are_the_frames_save_renders_at_ntsc_rates() {
             .find(|(key, _)| *key == k)
             .map(|(_, f)| gray(f));
         assert_eq!(shown, Some(k), "paused frame at tick {k}");
-        let src = Source {
+        let src = playback::Source {
             input: Input::path(&path),
             duration: 1.0,
             video: Some(((64, 64), fps)),
@@ -1114,6 +1114,7 @@ fn a_failed_waveform_is_said_where_the_waveform_is() {
         lanes: Vec::new(),
         version: 99,
         complete: false,
+        read: 0.0,
         error: Some("ffmpeg exit status: 1: Invalid data".to_string()),
     };
     *fx.win.wave.as_ref().unwrap().peaks.lock().unwrap() = Some(failed);
@@ -1210,6 +1211,7 @@ fn a_worker_that_ends_without_a_result_is_a_failure_not_busy_forever() {
     fx.win.job = Some(ExportJob {
         progress: Arc::default(),
         rx,
+        stop: Arc::default(),
     });
     drop(tx);
     fx.drv.idle(&mut fx.win, 2);

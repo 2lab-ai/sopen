@@ -870,7 +870,7 @@ fn a_long_out_of_order_edit_renders_in_passes_frame_exact() {
         tracks: probe.tracks.clone(),
     };
     assert!(
-        ffmpeg::edit_passes(&spec, ffmpeg::MAX_INPUTS)
+        ffmpeg::edit_passes(&spec, &ffmpeg::Input::path(&src), ffmpeg::MAX_INPUTS)
             .unwrap()
             .len()
             > 1,
@@ -1026,6 +1026,7 @@ fn an_edited_export_is_a_new_sibling() {
         (0.0, 1.0),
         &tmp.path().join("work"),
         &mut |_| {},
+        &crate::cut::Stop::default(),
     )
     .unwrap();
     assert_eq!(published.name, "t.cut-0-1.wav");
@@ -1762,5 +1763,63 @@ fn a_render_s_ffmpeg_dies_with_its_sopen_even_on_sigkill() {
             panic!("the stand-in ffmpeg outlived its sopen");
         }
         std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+/// An mp3 edit with a piece pasted after itself, or two pieces over the same stretch, taken
+/// from one input decoded once (below `HOLD_MAX`) gives the same samples as an input for each
+/// piece: the same file read under a name that is not an mp3's gets an input per piece.
+#[test]
+fn repeated_and_overlapping_mp3_pieces_from_one_input_are_the_same_samples() {
+    let Some(tools) = tools_or_skip() else { return };
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("a.mp3");
+    tones(
+        &tools,
+        &src,
+        TONES,
+        44_100,
+        &["-c:a", "libmp3lame", "-q:a", "2"],
+    );
+    let apart = tmp.path().join("a.bin");
+    std::fs::copy(&src, &apart).unwrap();
+    let probe = ffmpeg::probe(&tools, &src).unwrap();
+    let (media, _, plan) = super::plan(&tools, &probe, "a.mp3").unwrap();
+    let rate = f64::from(probe.sample_rate.unwrap());
+    let s = |secs: f64| (secs * rate) as i64;
+    let cases = [
+        ("repeated", [(s(1.0), s(2.0)), (s(1.0), s(2.0))]),
+        ("overlapping", [(0, s(2.0)), (s(1.0), s(3.0))]),
+    ];
+    for (what, ranges) in cases {
+        let spec = audio_spec(&probe, spans(rate, &ranges, false));
+        let (one, each) = (ffmpeg::Input::path(&src), ffmpeg::Input::path(&apart));
+        assert_eq!(spec.groups_from(&one).len(), 1, "{what}: one input");
+        assert_eq!(spec.groups_from(&each).len(), 2, "{what}: an input each");
+        let out = |input: &ffmpeg::Input, name: &str| {
+            let dst = tmp.path().join(name);
+            let work = tmp.path().join(format!("work-{name}"));
+            crate::cache::private_dir(&work).unwrap();
+            render_edit_with(
+                &tools,
+                input,
+                &dst,
+                &spec,
+                (media, &plan),
+                &work,
+                &mut |_| {},
+                ffmpeg::MAX_INPUTS,
+            )
+            .unwrap();
+            pcm(&tools, &dst, 0)
+        };
+        let shared = out(&one, &format!("{what}-one.mp3"));
+        let separate = out(&each, &format!("{what}-each.mp3"));
+        assert_eq!(
+            shared.1[0].len(),
+            separate.1[0].len(),
+            "{what}: the same length"
+        );
+        assert!(shared == separate, "{what}: the same samples");
     }
 }

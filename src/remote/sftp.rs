@@ -60,6 +60,9 @@ pub struct SftpRemote {
     /// Stat requests sopen sent (tests: a listing must not stat every name).
     #[cfg(test)]
     stats: u64,
+    /// Tests: the chunk of an upload (counted from 1) whose write fails.
+    #[cfg(test)]
+    fail_chunk: Option<usize>,
 }
 
 /// How long a failed start waits for the sftp subsystem to exit, to say how it ended.
@@ -320,6 +323,8 @@ impl SftpRemote {
             writes,
             #[cfg(test)]
             stats: 0,
+            #[cfg(test)]
+            fail_chunk: None,
         })
     }
 
@@ -386,6 +391,123 @@ fn changed(what: &str, got: std::result::Result<Result<(), SftpErr>, ()>) -> Res
             "{what}: request sent, no reply in {}s — it may or may not have happened",
             META_TIMEOUT.as_secs()
         ))),
+    }
+}
+
+impl SftpRemote {
+    /// [`RemoteFs::create_from`], stopped between chunks once `stop` says so
+    /// ([`RemoteFs::create_from_stoppable`]).
+    fn upload(
+        &mut self,
+        local: &Path,
+        path: &str,
+        like: Option<Like>,
+        stop: &dyn Fn() -> bool,
+    ) -> std::result::Result<Uploaded, CreateError> {
+        let not_created = |e| CreateError::new(Created::No, e);
+        let mut src = std::fs::File::open(local)
+            .with_context(|| format!("cannot open {}", local.display()))
+            .map_err(not_created)?;
+        #[cfg(test)]
+        let fail_at = self.fail_chunk;
+        let (rt, sftp, _) = self.parts();
+        rt.block_on(async {
+            let opened = within(
+                META_TIMEOUT,
+                sftp.options().write(true).create_new(true).open(path),
+            )
+            .await;
+            let mut file = match opened {
+                Ok(Ok(file)) => file,
+                Ok(Err(e)) => return Err(failed_create(path, e)),
+                Err(()) => {
+                    return Err(CreateError::new(
+                        Created::Unknown,
+                        unknown(format!(
+                            "create {path}: request sent, no reply in {}s",
+                            META_TIMEOUT.as_secs()
+                        )),
+                    ))
+                }
+            };
+            // From here `path` is ours.
+            let fill = async {
+                let mut out = Hashing::new(std::io::sink());
+                // Handle-based metadata updates on the open file, never by path: the owner, then
+                // the permission bits without set-id bits before the content, then the full mode
+                // restored after the content, so set-id bits are applied last.
+                if let Some(like) = like {
+                    // A refused owner change is not fatal here: the caller checks the result
+                    // (a mismatch refuses the save; an owner that was already right passes).
+                    let owner = MetaDataBuilder::new().id((like.uid, like.gid)).create();
+                    match within(META_TIMEOUT, file.set_metadata(owner)).await {
+                        Ok(Ok(())) => {}
+                        Ok(Err(e)) => crate::debug!("set owner on {path}: {e}"),
+                        Err(()) => {
+                            return Err(timed_out(&format!("set owner on {path}"), META_TIMEOUT))
+                        }
+                    }
+                    within(META_TIMEOUT, file.set_permissions(perms(like.mode & 0o777)))
+                        .await
+                        .map_err(|()| timed_out(&format!("set mode on {path}"), META_TIMEOUT))?
+                        .map_err(|e| anyhow!("cannot set mode on {path}: {e}"))?;
+                }
+                // write_all splits at the server's write limit.
+                let mut buf = vec![0u8; CHUNK];
+                #[cfg(test)]
+                let mut chunk = 0;
+                loop {
+                    if stop() {
+                        return Ok(None);
+                    }
+                    let n = src
+                        .read(&mut buf)
+                        .with_context(|| format!("cannot read {}", local.display()))?;
+                    if n == 0 {
+                        break;
+                    }
+                    #[cfg(test)]
+                    {
+                        chunk += 1;
+                        if fail_at == Some(chunk) {
+                            bail!("cannot write {path}: the write failed (a test's)");
+                        }
+                    }
+                    within(STALL_TIMEOUT, file.write_all(&buf[..n]))
+                        .await
+                        .map_err(|()| timed_out(&format!("write {path}"), STALL_TIMEOUT))?
+                        .map_err(|e| anyhow!("cannot write {path}: {e}"))?;
+                    out.write_all(&buf[..n])?;
+                }
+                if let Some(like) = like {
+                    within(META_TIMEOUT, file.set_permissions(perms(like.mode)))
+                        .await
+                        .map_err(|()| timed_out(&format!("set mode on {path}"), META_TIMEOUT))?
+                        .map_err(|e| anyhow!("cannot set mode on {path}: {e}"))?;
+                }
+                if sftp.support_fsync() {
+                    within(STALL_TIMEOUT, file.sync_all())
+                        .await
+                        .map_err(|()| timed_out(&format!("fsync {path}"), STALL_TIMEOUT))?
+                        .map_err(|e| anyhow!("cannot fsync {path}: {e}"))?;
+                }
+                Ok(Some(out))
+            };
+            let filled = fill.await;
+            // The handle is closed whatever came of the content — a stop and a failure too, not
+            // only a whole upload — and its answer waited for, bounded. A dropped handle's close
+            // is sent but not waited for, and a failure of it is never seen (the client crate's
+            // `OwnedHandle` drop).
+            let closed = within(META_TIMEOUT, file.close())
+                .await
+                .map_err(|()| timed_out(&format!("close {path}"), META_TIMEOUT))
+                .and_then(|got| got.map_err(|e| anyhow!("cannot close {path}: {e}")));
+            let ours = |e| CreateError::new(Created::Yes, e);
+            match filled.map_err(ours)? {
+                None => Err(ours(anyhow!(super::Cancelled))),
+                Some(out) => closed.map(|()| out.finish()).map_err(ours),
+            }
+        })
     }
 }
 
@@ -734,87 +856,17 @@ impl RemoteFs for SftpRemote {
         path: &str,
         like: Option<Like>,
     ) -> std::result::Result<Uploaded, CreateError> {
-        let not_created = |e| CreateError::new(Created::No, e);
-        let mut src = std::fs::File::open(local)
-            .with_context(|| format!("cannot open {}", local.display()))
-            .map_err(not_created)?;
-        let (rt, sftp, _) = self.parts();
-        rt.block_on(async {
-            let opened = within(
-                META_TIMEOUT,
-                sftp.options().write(true).create_new(true).open(path),
-            )
-            .await;
-            let mut file = match opened {
-                Ok(Ok(file)) => file,
-                Ok(Err(e)) => return Err(failed_create(path, e)),
-                Err(()) => {
-                    return Err(CreateError::new(
-                        Created::Unknown,
-                        unknown(format!(
-                            "create {path}: request sent, no reply in {}s",
-                            META_TIMEOUT.as_secs()
-                        )),
-                    ))
-                }
-            };
-            // From here `path` is ours.
-            let fill = async {
-                // Handle-based metadata updates on the open file, never by path: the owner, then
-                // the permission bits without set-id bits before the content, then the full mode
-                // restored after the content, so set-id bits are applied last.
-                if let Some(like) = like {
-                    // A refused owner change is not fatal here: the caller checks the result
-                    // (a mismatch refuses the save; an owner that was already right passes).
-                    let owner = MetaDataBuilder::new().id((like.uid, like.gid)).create();
-                    match within(META_TIMEOUT, file.set_metadata(owner)).await {
-                        Ok(Ok(())) => {}
-                        Ok(Err(e)) => crate::debug!("set owner on {path}: {e}"),
-                        Err(()) => {
-                            return Err(timed_out(&format!("set owner on {path}"), META_TIMEOUT))
-                        }
-                    }
-                    within(META_TIMEOUT, file.set_permissions(perms(like.mode & 0o777)))
-                        .await
-                        .map_err(|()| timed_out(&format!("set mode on {path}"), META_TIMEOUT))?
-                        .map_err(|e| anyhow!("cannot set mode on {path}: {e}"))?;
-                }
-                // write_all splits at the server's write limit.
-                let mut out = Hashing::new(std::io::sink());
-                let mut buf = vec![0u8; CHUNK];
-                loop {
-                    let n = src
-                        .read(&mut buf)
-                        .with_context(|| format!("cannot read {}", local.display()))?;
-                    if n == 0 {
-                        break;
-                    }
-                    within(STALL_TIMEOUT, file.write_all(&buf[..n]))
-                        .await
-                        .map_err(|()| timed_out(&format!("write {path}"), STALL_TIMEOUT))?
-                        .map_err(|e| anyhow!("cannot write {path}: {e}"))?;
-                    out.write_all(&buf[..n])?;
-                }
-                if let Some(like) = like {
-                    within(META_TIMEOUT, file.set_permissions(perms(like.mode)))
-                        .await
-                        .map_err(|()| timed_out(&format!("set mode on {path}"), META_TIMEOUT))?
-                        .map_err(|e| anyhow!("cannot set mode on {path}: {e}"))?;
-                }
-                if sftp.support_fsync() {
-                    within(STALL_TIMEOUT, file.sync_all())
-                        .await
-                        .map_err(|()| timed_out(&format!("fsync {path}"), STALL_TIMEOUT))?
-                        .map_err(|e| anyhow!("cannot fsync {path}: {e}"))?;
-                }
-                within(META_TIMEOUT, file.close())
-                    .await
-                    .map_err(|()| timed_out(&format!("close {path}"), META_TIMEOUT))?
-                    .map_err(|e| anyhow!("cannot close {path}: {e}"))?;
-                Ok(out.finish())
-            };
-            fill.await.map_err(|e| CreateError::new(Created::Yes, e))
-        })
+        self.upload(local, path, like, &|| false)
+    }
+
+    fn create_from_stoppable(
+        &mut self,
+        local: &Path,
+        path: &str,
+        like: Option<Like>,
+        stop: &dyn Fn() -> bool,
+    ) -> std::result::Result<Uploaded, CreateError> {
+        self.upload(local, path, like, stop)
     }
 
     fn set_mode(&mut self, path: &str, mode: u32) -> Result<()> {
@@ -1239,6 +1291,11 @@ impl SftpRemote {
     /// [`SftpRemote::local_server`] with `args` for the server (`-P copy-data` to refuse a
     /// request) and, with `log`, its log (`-e -l INFO`: one line per request, as OpenSSH words
     /// it) written to that file — the request log 04 §8 checks for `posix-rename`.
+    /// Tests: the `chunk`th write of every upload from now on fails (counted from 1).
+    pub(crate) fn fail_chunk(&mut self, chunk: usize) {
+        self.fail_chunk = Some(chunk);
+    }
+
     pub(crate) fn local_server_args(args: &[&str], log: Option<&Path>) -> Option<Self> {
         Self::local_server_run(None, args, log)
     }
@@ -1331,6 +1388,7 @@ impl SftpRemote {
             fs: Some(fs),
             writes,
             stats: 0,
+            fail_chunk: None,
         })
     }
 
@@ -1614,6 +1672,7 @@ mod tests {
             fs: Some(fs),
             writes,
             stats: 0,
+            fail_chunk: None,
         };
         assert!(session.stat("/").unwrap().is_dir, "a working session");
         assert!(!ended(), "listening while the session lives");

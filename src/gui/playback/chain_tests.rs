@@ -129,6 +129,7 @@ fn decode_all(
         (rate, 2),
         None,
         (&live, &stop, &state),
+        (&|| None, &|said| said.to_string()),
         &mut out,
     );
     (got, state, biggest)
@@ -239,7 +240,13 @@ fn a_stop_pads_nothing() {
     };
     let input = Input::path(tmp.path());
     let start = |p: &Part| audio_cmd(&tools, &input, p, false, 48_000, 2);
-    chain(vec![piece], start, &live, &stop, &state, &mut pcm);
+    chain(
+        vec![piece],
+        start,
+        (&live, &stop, &state),
+        (&|| None, &|said| said.to_string()),
+        &mut pcm,
+    );
     drop(pcm);
     assert!(calls > 0, "it read the decoder's output");
     assert_eq!(state.error(), None);
@@ -396,7 +403,13 @@ fn the_chain_kills_and_reaps_a_decoder_however_its_piece_ends() {
             count: Some(48_000),
         };
         let start = |p: &Part| audio_cmd(&tools, &input, p, false, 48_000, 2);
-        chain(vec![part], start, &live, &stop, &state, &mut consumer);
+        chain(
+            vec![part],
+            start,
+            (&live, &stop, &state),
+            (&|| None, &|said| said.to_string()),
+            &mut consumer,
+        );
         let pid = std::fs::read_to_string(&pids).unwrap();
         assert_eq!(
             process_state(pid.trim()),
@@ -446,7 +459,13 @@ fn the_boundary_wait_starts_after_the_padding() {
     let state = ChainState::default();
     let input = Input::path(tmp.path());
     let start = |p: &Part| audio_cmd(&tools, &input, p, false, 48_000, 2);
-    chain(vec![part, part], start, &live, &stop, &state, &mut SlowPad);
+    chain(
+        vec![part, part],
+        start,
+        (&live, &stop, &state),
+        (&|| None, &|said| said.to_string()),
+        &mut SlowPad,
+    );
     assert_eq!(state.error(), None);
     let waits = state.waits.lock().unwrap().clone();
     assert_eq!(waits.len(), 1);

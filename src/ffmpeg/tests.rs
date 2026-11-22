@@ -888,7 +888,8 @@ fn edit_passes_split_a_long_out_of_order_edit() {
         .collect();
     let spec = edit(spans.clone(), vec![track(2, 44_100, "s16")]);
     assert_eq!(spec.groups().len(), n);
-    let passes = edit_passes(&spec, max).unwrap();
+    let src = Input::path(Path::new("/c/src.mp4"));
+    let passes = edit_passes(&spec, &src, max).unwrap();
     assert_eq!(passes.len(), 4, "three lossless passes and the final one");
     let budgeted = spec.clone().budget();
     let first: Vec<Span> = passes[..3].iter().flat_map(|p| p.spans.clone()).collect();
@@ -915,7 +916,7 @@ fn edit_passes_split_a_long_out_of_order_edit() {
     assert!((last.length() - spec.length()).abs() < 1e-9);
     // One that fits is one pass (budgeted).
     let small = edit(spans[..3].to_vec(), Vec::new());
-    assert_eq!(edit_passes(&small, max).unwrap(), [small.budget()]);
+    assert_eq!(edit_passes(&small, &src, max).unwrap(), [small.budget()]);
 }
 
 /// The stall rule on explicit instants: progress lines that repeat the same output position
@@ -978,9 +979,7 @@ fn inputs_are_paths_or_urls() {
         (p.ext(), p.local()),
         ("mp4".to_string(), Some(Path::new("/c/Talk.MP4")))
     );
-    let u = Input(OsString::from(
-        "http://127.0.0.1:9/tok/dir/clip.ts?range=1#x",
-    ));
+    let u = Input::path(Path::new("http://127.0.0.1:9/tok/dir/clip.ts?range=1#x"));
     assert_eq!((u.ext(), u.local()), ("ts".to_string(), None));
     assert_eq!(Input::path(Path::new("/c/README")).ext(), "");
     // A local name keeps its `?` and `#`: they are not a query.
@@ -1177,4 +1176,109 @@ fn a_probe_refusal_of_a_copy_names_the_file() {
         probe_refusal(copy, "/c/box/data/a.mp4: Invalid data found"),
         "ffprobe cannot read /c/box/data/a.mp4: Invalid data found"
     );
+}
+
+/// An mp3 render takes every piece from one input, decoded through once from the first piece's
+/// place, whatever the pieces' order (06 Tensions, settled by W7); another file keeps an input
+/// per run of pieces. The one input holds only while the pieces it gives before they are wanted
+/// come to at most [`HOLD_MAX`] of decoded sound.
+#[test]
+fn an_mp3_edit_takes_its_pieces_from_one_input_while_what_it_holds_is_bounded() {
+    let stereo = vec![track(2, 44_100, "fltp")];
+    // Output: [300, 310) then [100, 110) then [500, 505): every piece out of order.
+    let spans = vec![
+        span(0, 300.0, 10.0),
+        span(0, 100.0, 10.0),
+        span(0, 500.0, 5.0),
+    ];
+    let spec = EditSpec {
+        fps: None,
+        ..edit(spans, stereo.clone())
+    };
+    let (mp3, wav) = (
+        Input::path(Path::new("/c/s.mp3")),
+        Input::path(Path::new("/c/s.wav")),
+    );
+    assert_eq!(spec.groups_from(&mp3), vec![vec![0, 1, 2]]);
+    assert_eq!(spec.groups_from(&wav), spec.groups());
+    assert_eq!(spec.groups().len(), 3);
+    // Decoded in the file's order, [100, 110) is given first and waits for [300, 310): 10 s of
+    // 44.1 kHz stereo floats.
+    assert_eq!(spec.held(), 10 * 44_100 * 2 * 4);
+    let args = edit_args(
+        &[&mp3],
+        Path::new("/c/out.mp3"),
+        &spec.clone().budget(),
+        MediaKind::Audio,
+        &ExportPlan::basic(Some("mp3")),
+        Encode::Final,
+    )
+    .unwrap();
+    let text: Vec<String> = args
+        .inputs
+        .iter()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect();
+    // One input, from just before its first piece in the file to past its last one.
+    assert_eq!(text.iter().filter(|a| *a == "-i").count(), 1, "{text:?}");
+    assert_eq!(text[..2], ["-ss", "99.800000"], "{text:?}");
+    assert_eq!(text[2..4], ["-t", "406.200000"], "{text:?}");
+    assert!(args.graph.contains("asplit=3"), "{}", args.graph);
+    // Pieces held for longer than the bound: an input each again.
+    let long = EditSpec {
+        spans: vec![span(0, 2000.0, 600.0), span(0, 0.0, 600.0)],
+        fps: None,
+        ..edit(Vec::new(), stereo)
+    };
+    assert!(long.held() > HOLD_MAX);
+    assert_eq!(long.groups_from(&mp3).len(), 2);
+    // One piece is one input whatever the file.
+    let one = EditSpec {
+        spans: vec![span(0, 10.0, 5.0)],
+        fps: None,
+        ..edit(Vec::new(), Vec::new())
+    };
+    assert_eq!(one.groups_from(&mp3), one.groups());
+}
+
+/// A piece pasted right after itself, or two pieces over the same stretch, are decoded from one
+/// input at once: the later one waits whole while the earlier one plays. [`EditSpec::held`]
+/// counts that wait, so such an edit shares one input only below [`HOLD_MAX`].
+#[test]
+fn repeated_or_overlapping_mp3_pieces_share_one_input_only_below_the_bound() {
+    let stereo = vec![track(2, 44_100, "fltp")];
+    let mp3 = Input::path(Path::new("/c/s.mp3"));
+    let spec = |ranges: &[(f64, f64)]| EditSpec {
+        spans: ranges.iter().map(|&(a, b)| span(0, a, b - a)).collect(),
+        fps: None,
+        ..edit(Vec::new(), stereo.clone())
+    };
+    let per_s = 44_100 * 2 * 4;
+    // Pasted after itself: the copy waits whole.
+    let repeated = spec(&[(0.0, 600.0), (0.0, 600.0)]);
+    assert_eq!(repeated.held(), 600 * per_s);
+    assert!(repeated.held() > HOLD_MAX);
+    assert_eq!(
+        repeated.groups_from(&mp3),
+        repeated.groups(),
+        "past the bound: an input each"
+    );
+    assert_eq!(repeated.groups().len(), 2);
+    let short = spec(&[(0.0, 60.0), (0.0, 60.0)]);
+    assert_eq!(short.held(), 60 * per_s);
+    assert_eq!(
+        short.groups_from(&mp3),
+        vec![vec![0, 1]],
+        "below it: one input"
+    );
+    // Overlapping by 600 s: what the second has been given by the first's end waits.
+    let overlap = spec(&[(0.0, 800.0), (200.0, 1000.0)]);
+    assert_eq!(overlap.held(), 600 * per_s);
+    assert_eq!(overlap.groups_from(&mp3).len(), 2);
+    let small = spec(&[(0.0, 100.0), (50.0, 150.0)]);
+    assert_eq!(small.held(), 50 * per_s);
+    assert_eq!(small.groups_from(&mp3), vec![vec![0, 1]]);
+    // The order the output takes them in decides: the later stretch first holds the earlier.
+    let swapped = spec(&[(50.0, 150.0), (0.0, 100.0)]);
+    assert_eq!(swapped.held(), 100 * per_s);
 }

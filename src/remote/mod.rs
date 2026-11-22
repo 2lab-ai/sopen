@@ -416,6 +416,20 @@ pub trait RemoteFs: IntoBoxed {
         path: &str,
         like: Option<Like>,
     ) -> std::result::Result<Uploaded, CreateError>;
+    /// [`RemoteFs::create_from`] that stops sending once `stop` says so, looked at before each
+    /// chunk: the error is then [`Cancelled`], and `path`, created and partly written, is the
+    /// caller's to remove ([`Created::Yes`]) — an export's Cancel during its upload (06 §7.4).
+    /// Where a file layer cannot stop, the whole file is written.
+    fn create_from_stoppable(
+        &mut self,
+        local: &Path,
+        path: &str,
+        like: Option<Like>,
+        stop: &dyn Fn() -> bool,
+    ) -> std::result::Result<Uploaded, CreateError> {
+        let _ = stop;
+        self.create_from(local, path, like)
+    }
     /// Sets `path`'s permission bits by path (setstat). The write algorithms never use it —
     /// they set modes through the open handle; it is for setting up tests and tools.
     fn set_mode(&mut self, path: &str, mode: u32) -> Result<()>;

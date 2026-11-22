@@ -354,6 +354,7 @@ fn a_running_export_never_moves_the_frame() {
         fx.win.job = Some(ExportJob {
             progress: progress.clone(),
             rx,
+            stop: Arc::default(),
         });
         for per_mille in [0, 300, 1000] {
             progress.store(per_mille, SeqCst);
@@ -436,6 +437,7 @@ fn an_export_finishing_under_a_held_button_waits_for_the_release() {
     fx.win.job = Some(ExportJob {
         progress: Arc::default(),
         rx,
+        stop: Arc::default(),
     });
     fx.settle();
     assert_eq!(fx.win.map, map);
@@ -490,6 +492,7 @@ fn the_kept_copy_notice_is_shown_whole_on_open_and_stays() {
     fx.win.job = Some(ExportJob {
         progress: Arc::default(),
         rx,
+        stop: Arc::default(),
     });
     tx.send(Ok(("box:/clip.cut-0-4.mp4".to_string(), Vec::new())))
         .unwrap();
@@ -517,6 +520,7 @@ fn the_close_during_export_hint_is_shown_whole_on_a_narrow_window() {
     fx.win.job = Some(ExportJob {
         progress: Arc::default(),
         rx,
+        stop: Arc::default(),
     });
     fx.settle();
     use crate::gui::Window;
@@ -541,6 +545,7 @@ fn f3_closes_the_window() {
     fx.win.job = Some(ExportJob {
         progress: Arc::default(),
         rx,
+        stop: Arc::default(),
     });
     fx.key(Key::F3);
     assert_eq!(
