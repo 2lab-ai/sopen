@@ -1287,9 +1287,14 @@ fn shortened_runs_are_longer_than_any_whole_run_and_tell_runs_apart() {
 /// The patterns of the Makefile grammar the highlighter parses with ([`parsing`]) that walk
 /// balanced parentheses (their source has the comment `level 0`).
 fn makefile_paren_patterns() -> Vec<String> {
-    use syntect::parsing::syntax_definition::Pattern;
     let makefile = syntaxes().find_syntax_by_name("Makefile").unwrap();
-    let set = parsing(makefile).0.clone().into_builder();
+    paren_patterns_of(parsing(makefile).0)
+}
+
+/// The Makefile grammar's patterns in `set` that walk balanced parentheses.
+fn paren_patterns_of(set: &SyntaxSet) -> Vec<String> {
+    use syntect::parsing::syntax_definition::Pattern;
+    let set = set.clone().into_builder();
     let grammar = set
         .syntaxes()
         .iter()
@@ -1416,6 +1421,27 @@ fn makefile_lines_are_searched_within_a_small_backtrack_budget() {
             }
         }
     }
+    // The control: as bundled, each lookahead goes past 50,000 steps on an ordinary recipe line
+    // (720,000 and 76,000), and the search ends in the backtrack limit's error.
+    let recipe = "\techo building the project now please wait while everything compiles fine";
+    let bundled = paren_patterns_of(syntaxes());
+    assert_eq!(bundled.len(), 2);
+    for pattern in &bundled {
+        let regex = fancy_regex::RegexBuilder::new(pattern)
+            .oniguruma_mode(true)
+            .backtrack_limit(50_000)
+            .build()
+            .unwrap();
+        assert!(
+            matches!(
+                regex.captures_from_pos(recipe, 0),
+                Err(fancy_regex::Error::RuntimeError(
+                    fancy_regex::RuntimeError::BacktrackLimitExceeded
+                ))
+            ),
+            "the bundled lookahead stays within 50,000 steps"
+        );
+    }
 }
 
 /// Makefile's lookaheads rewritten keep what they mean ([`balanced_once`]): every line of a real
@@ -1440,6 +1466,7 @@ fn makefile_lines_keep_the_bundled_grammars_colours() {
     let bundled = whole_line_colours("mk", &others);
     for end in ["\n", "\r\n"] {
         let got = highlighted("mk", &others, end);
+        assert_eq!(got.len(), bundled.len(), "its lines");
         for (i, (got, want)) in got.iter().zip(&bundled).enumerate() {
             assert_eq!(got.len(), want.len(), "line {i}: its characters");
             if let Some(at) = (0..got.len()).find(|&k| got[k] != want[k]) {
@@ -1469,6 +1496,68 @@ fn makefile_lines_keep_the_bundled_grammars_colours() {
     assert!(got[1].iter().map(|&(c, _)| c).eq(pair[1].chars()));
 }
 
+/// The scope stack at each character of each line, and at its end, the lines parsed in order
+/// as one file with `set`'s Makefile grammar.
+fn makefile_scopes(
+    set: &SyntaxSet,
+    lines: &[String],
+) -> Vec<(
+    Vec<Vec<syntect::parsing::Scope>>,
+    Vec<syntect::parsing::Scope>,
+)> {
+    let grammar = set.find_syntax_by_name("Makefile").unwrap();
+    let mut parse = ParseState::new(grammar);
+    let mut stack = ScopeStack::new();
+    lines
+        .iter()
+        .map(|line| {
+            let ops = parse.parse_line(line, set).unwrap();
+            let mut next = 0;
+            let mut at_chars = Vec::new();
+            for (at, _) in line.char_indices() {
+                while next < ops.len() && ops[next].0 <= at {
+                    stack.apply(&ops[next].1).unwrap();
+                    next += 1;
+                }
+                at_chars.push(stack.as_slice().to_vec());
+            }
+            for (_, op) in &ops[next..] {
+                stack.apply(op).unwrap();
+            }
+            (at_chars, stack.as_slice().to_vec())
+        })
+        .collect()
+}
+
+/// Beneath the colours, the scopes: every character of every line of a real Makefile but the
+/// `objects` one (the bundled grammar gives up on it; above) is in the same scopes, the rewritten
+/// grammar against the bundled one, and each line ends with the same stack, the lines parsed in
+/// order as one file.
+#[test]
+fn makefile_lines_keep_the_bundled_grammars_scopes() {
+    let others: Vec<String> = makefile_lines()
+        .into_iter()
+        .filter(|l| !l.starts_with("objects := "))
+        .collect();
+    let bundled = makefile_scopes(syntaxes(), &others);
+    let rewritten = makefile_scopes(makefile_syntaxes().expect("rewritten"), &others);
+    assert_eq!(bundled.len(), rewritten.len());
+    for (i, (want, got)) in bundled.iter().zip(&rewritten).enumerate() {
+        assert_eq!(got.0.len(), want.0.len(), "line {i}: its characters");
+        if let Some(at) = (0..got.0.len()).find(|&k| got.0[k] != want.0[k]) {
+            panic!(
+                "line {i} {:?}, character {at}: {:?}, bundled {:?}",
+                others[i], got.0[at], want.0[at]
+            );
+        }
+        assert_eq!(
+            got.1, want.1,
+            "line {i} {:?}: the stack it ends with",
+            others[i]
+        );
+    }
+}
+
 /// The rewrite is of the bundled Makefile grammar's two lookaheads, exactly: in the set a
 /// Makefile is parsed with — taken on the highlighting worker, never when a viewer makes its
 /// highlighter on a frame — both are the rewritten text, and no group closed is followed by a run
@@ -1478,9 +1567,21 @@ fn makefile_lines_keep_the_bundled_grammars_colours() {
 fn the_makefile_lookaheads_are_rewritten_only_when_they_are_the_bundled_ones() {
     use syntect::parsing::syntax_definition::Pattern;
     let makefile = syntaxes().find_syntax_by_name("Makefile").unwrap();
-    // A viewer's highlighter takes its syntaxes on its worker, at its first page: none yet.
-    let hl = Highlight::new(makefile, Color32::WHITE, u64::MAX).unwrap();
+    // A viewer's highlighter takes its syntaxes on its worker, at its first page: a frame that
+    // makes it does not ask for the rewritten set (counted on this thread), the first page does.
+    let asked = || MAKEFILE_SYNTAXES_ASKED.with(|n| n.get());
+    let before = asked();
+    let mut hl = Highlight::new(makefile, Color32::WHITE, u64::MAX).unwrap();
+    assert_eq!(asked(), before, "a frame asked for the rewritten set");
     assert!(hl.set.is_none() && hl.states.is_empty());
+    let tmp = tempfile::tempdir().unwrap();
+    let path = write(tmp.path(), "Makefile", b"all: dep\n\t$(CC) -o $@ $^\n");
+    let mut doc = TextDoc::open(&path).unwrap();
+    hl.page(&mut doc, 0, 2, &|| false).unwrap().unwrap();
+    assert_eq!(asked(), before + 1, "the first page asks once");
+    hl.page(&mut doc, 0, 2, &|| false).unwrap().unwrap();
+    assert_eq!(asked(), before + 1, "and the next pages do not");
+    assert!(std::ptr::eq(hl.set.unwrap(), makefile_syntaxes().unwrap()));
     let (set, _) = parsing(makefile);
     assert!(std::ptr::eq(set, makefile_syntaxes().expect("rewritten")));
     let patterns = makefile_paren_patterns();

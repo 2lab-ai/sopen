@@ -2052,19 +2052,31 @@ fn fnv1a(bytes: &[u8]) -> u64 {
 /// The bundled syntaxes with Makefile's lookaheads rewritten ([`balanced_once`]); `None` when
 /// they are not the ones the rewrite is for, and the grammar is parsed as bundled. Built once, by
 /// the highlighting worker that first parses a Makefile: every grammar is read and built again
-/// (75 ms, and as much memory again as the bundled set while it is built).
+/// (75 ms; 13.4 MB more heap at its peak while it is built). From then on both sets stay for the
+/// process's life, the bundled one for every other syntax: this one holds 4.5 MB more heap once
+/// a Makefile is parsed with it (the bundled set, with a Rust and a Makefile line parsed, 9 MB).
 fn makefile_syntaxes() -> Option<&'static SyntaxSet> {
+    #[cfg(test)]
+    MAKEFILE_SYNTAXES_ASKED.with(|n| n.set(n.get() + 1));
     static SET: OnceLock<Option<SyntaxSet>> = OnceLock::new();
     SET.get_or_init(|| with_makefile_rewritten(SyntaxSet::load_defaults_nonewlines()))
         .as_ref()
 }
 
+#[cfg(test)]
+thread_local! {
+    /// How often this thread asked for [`makefile_syntaxes`] (tests: never by a frame).
+    pub(crate) static MAKEFILE_SYNTAXES_ASKED: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
 /// `set` with the Makefile grammar's [`MAKEFILE_LOOKAHEADS`] rewritten, every grammar in its place
-/// (a grammar's contexts name others' by place); `None` unless both are found.
+/// (a grammar's contexts name others' by place); `None` unless each of them is found.
 fn with_makefile_rewritten(set: SyntaxSet) -> Option<SyntaxSet> {
     let bundled = set.into_builder();
     let mut rewritten = SyntaxSetBuilder::new();
-    let mut found = 0;
+    // Which of the lookaheads were found.
+    let mut found = [false; MAKEFILE_LOOKAHEADS.len()];
     for syntax in bundled.syntaxes() {
         let mut syntax = syntax.clone();
         if syntax.name == "Makefile" {
@@ -2072,9 +2084,10 @@ fn with_makefile_rewritten(set: SyntaxSet) -> Option<SyntaxSet> {
                 for pattern in &mut context.patterns {
                     if let Pattern::Match(matched) = pattern {
                         let source = matched.regex.regex_str();
-                        if MAKEFILE_LOOKAHEADS.contains(&(source.len(), fnv1a(source.as_bytes()))) {
+                        let known = (source.len(), fnv1a(source.as_bytes()));
+                        if let Some(i) = MAKEFILE_LOOKAHEADS.iter().position(|&k| k == known) {
                             matched.regex = Regex::new(balanced_once(source));
-                            found += 1;
+                            found[i] = true;
                         }
                     }
                 }
@@ -2082,7 +2095,7 @@ fn with_makefile_rewritten(set: SyntaxSet) -> Option<SyntaxSet> {
         }
         rewritten.add(syntax);
     }
-    (found == MAKEFILE_LOOKAHEADS.len()).then(|| rewritten.build())
+    found.iter().all(|&f| f).then(|| rewritten.build())
 }
 
 /// A Makefile lookahead with no two runs of characters side by side. It walks balanced
