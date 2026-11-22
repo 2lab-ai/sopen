@@ -1000,6 +1000,17 @@ to every run on the file: the probe, playback, the paused frame, the waveform, S
       `render` kind, `Server::sent`). A render reading deep into an mp3 to its first piece has
       no output for as long as that read lasts, and goes on while it is fed (W7). A run whose
       caller goes is killed on drop.
+      - "Fed" is the bytes the server got onto the run's sockets, not what ffmpeg has read:
+        the kernel's buffers lie between. On Linux the count moves in steps. Against W7's
+        stand-in client reading 640 KiB/s, it rose by 2.6 MB at once, then by about 1 MB at a
+        time, standing still for 500 ms and more in between (W7, sampled every 500 ms).
+      - It is still a sound sign of life at 120 s. Once the run has read as much as the
+        server's send buffer holds, the buffer has emptied and the server's write has gone on.
+        So the count stands for 120 s only if the run reads less than that buffer in 120 s.
+        The buffer is at most 4 MiB on both test machines (Linux `tcp_wmem`, macOS
+        `autosndbufmax`): less than 35 KB/s. A decode to a seek point reads far faster.
+      - The stall rule reads the count right before each decision, so bytes sent while ffmpeg
+        was waited for are counted first.
     - **Playback:** dropping the player kills and reaps its decoders (`kill_all` and `Reaped` in
       `src/gui/playback.rs`). Pause, a seek and closing the window all drop it.
     - **The paused frame:** its budget, 5 s for one frame today (`SCRUB_BUDGET` in
@@ -1064,9 +1075,11 @@ to every run on the file: the probe, playback, the paused frame, the waveform, S
       - The wait's cost, measured once: two 600 s pieces of the 144 MB file swapped held 600 s of
         sound, and ffmpeg's peak memory was 286 MB against 20 MB with an input each; hence the
         bound.
-    - So an mp3 render fetches the file once at most: from byte 0 (its one exact seek reads up
-      to the first piece's place) to its last piece's end (arithmetic for files over the cache:
-      the one input passes each block once).
+    - So an mp3 render that shares one input fetches the file once at most: from byte 0 (its
+      one exact seek reads up to the first piece's place) to its last piece's end (arithmetic
+      for files over the cache: the one input passes each block once). An edit past
+      `HOLD_MAX` keeps an input per piece out of order, each reading from byte 0 to its piece,
+      as X1 measured.
   - **Gates for W7:** §12 V16's render gates.
 - **Playback of an edit.** Each start runs up to four decoders on a video file (picture and sound
   of the current piece and of the next) and two on an audio file, each a `play` connection with
@@ -1086,7 +1099,8 @@ to every run on the file: the probe, playback, the paused frame, the waveform, S
     12.5 MB/s.
 - **Export** reads, for each input, from the key frame at or before its piece to 1 s past its end
   (*view* §2.3: 12 % of a 2-minute video for 10 s; X1: 1.00–1.05 × the kept bytes for one cut of a
-  10-minute file), and an mp3 from byte 0, once ("Many inputs at once" above). It publishes as today
+  10-minute file), and an mp3 from byte 0 — once, through its one shared input, below
+  `HOLD_MAX`; past it, once per input ("Many inputs at once" above). It publishes as today
   (01 §7: a render under `<cache>/.exports`, then a new sibling, never over anything). Its
   progress is ffmpeg's time-based progress.
 - **Export can be cancelled.** This is **the workstream's decision**, written into ssot's fixed scope
@@ -1272,6 +1286,24 @@ Left as whole fetches, with the fetch now pipelined (§2):
     the response itself, as `Failed` and counted, and frees the seat: ffmpeg sends nothing after its
     request, and a connection is never left unwatched.
   - A socket that fails there for any other reason ends the response the same way, as `Failed`.
+- **What the kernel holds of a response: one send buffer, 128 KiB** (`SEND_BUFFER`, set on each
+  accepted socket; Linux keeps twice what is asked, 256 KiB). A body is read from the Source as
+  fast as its writes return, so the send buffer, the block in hand and what the client's own
+  socket holds are how far a connection is read ahead of its client. Left alone, Linux grows the
+  buffer with the connection, toward `tcp_wmem`'s ceiling (4 MiB): a connection read fast had
+  2.5 MiB, and a decoder's opening connection, read a few KB of and closed, had MBs read for it
+  (§12 V16). A client that read 8 MiB fast and stopped had been sent 2.0 MB more on macOS left
+  alone, 0.70 MB with the buffer (0.72 MB on Linux).
+  - The cost, a 60 MB file read whole through `bulk` (three reads each):
+
+    | Platform | Cached, left alone | Cached, 128 KiB | From the local `sftp-server` |
+    |---|---|---|---|
+    | macOS | 3.4–5.6 GB/s | 2.2–3.8 GB/s | 150–159 MB/s either way |
+    | Linux | 4.1–5.1 GB/s | 4.1–4.9 GB/s | 121–176 MB/s either way |
+
+    A remote read is slower than all of these, and a decoder takes less still. 64 KiB cost more
+    (1.3–3.2 GB/s cached on macOS, 1.3–4.8 on Linux) and once let a render fetch 4 blocks twice
+    on Linux. The test: `a_connection_is_read_ahead_of_its_client_by_one_send_buffer_at_most`.
 - **A server that fails to start** stops and joins the thread it had started (the watch), so it
   holds no Source.
 - **Deadlines.** An answer is closed (`Stalled`) once its writes have waited on the client for
@@ -1378,7 +1410,7 @@ Left as whole fetches, with the fetch now pipelined (§2):
 | Bytes before a hex first screen | the blocks covering the screen and its margin: one 64 KiB block at offset 0 for any window under 1 300 rows, at most two elsewhere |
 | Bytes before a text first screen | one 64 KiB block at offset 0, asked as a 1-byte demand so that no margin block comes with it (§7.2), for any file read through a Source, wrapped or not: the first screen is the rows that block supplies (§7.2); after a jump, at most 3 blocks, in one round trip when the replies are full; the background index pass comes after it |
 | A demand's wait behind what was sent | `(cap + one block per other waiting reader) / rate`, cap ≤ 4 MiB (§4) |
-| The byte server | 64 connections, an 8 KiB request head, 5 s to send it, 60 s without progress on a `bulk` response (§9) |
+| The byte server | 64 connections, an 8 KiB request head, 5 s to send it, 60 s without progress on a `bulk` response, a 128 KiB send buffer per connection (§9) |
 
 ## 11. Usage log and receipt hooks
 
@@ -1593,20 +1625,31 @@ stream <event> t=<ms> <host:/abs> fetched=<b> demand=<b> prefetch=<b> bulk=<b> d
       counter: W7's gate reads it from the engine's trace of what it sent
       (`src/gui/media/stream_tests.rs`).
     - **On W7's `lavfi` fixture of that shape** (600 s at 4 Mbit/s, a key frame every 8 s, the
-      `moov` at the end, 320×240) the gate holds `refetched` to **2 MiB per start**, and no
-      block a decoder waited for may come twice. Measured (ffmpeg 9.0.2, three runs): 0, 14–24
-      and 9–15 blocks fetched again for the three starts, every one of them a prefetch that no
-      decoder read (W7, from the trace).
+      `moov` at the end, 320×240) the gate holds `refetched` to **1.5 MiB per start**, and no
+      block a decoder waited for may come twice. Measured with §9's send buffer (ffmpeg 9.0.2,
+      three runs on each platform; bytes fetched again at the starts from 5 s, 45 s and 85 s):
+
+      | Platform | 5 s | 45 s | 85 s |
+      |---|---|---|---|
+      | macOS | 0 | 0.88–0.94 MiB | 0.94–1.00 MiB |
+      | Linux | 0 | 1.00 MiB | 0 |
+
+      Without it, Linux fetched 2.2–4.0 MiB again at the 45 s start, and the gate failed in
+      each of 9 runs; macOS was about as above. In the engine's trace every second fetch is a
+      prefetch, and no block a reader waited for was fetched twice (W7). Whether ffmpeg read
+      any of those bytes is not measured: the trace shows what was asked for, not what the
+      client took.
       - Why: each decoder opens a `moov`-at-the-end file at byte 0, reads a few KB and seeks to
         the `moov`. Meanwhile the server fills that connection's socket from the cached head;
         each read is a sequential hit that doubles its reader's readahead
         (`Readahead::access`), so prefetch past the cached head goes out before ffmpeg closes
-        the connection about 3 ms later.
-      - Those blocks are never read. Once the cache is full (the second start), they are the
-        least recently used, outside every live window, and evicted (`BlockCache::evict`). The
-        next decoder's opening (a piece boundary) prefetches them again.
-      - So the 1-block figure belongs to X1's own fixture. Whether a connection's readahead
-        should wait for its client to read is a question for the stream core, not W7.
+        the connection about 3 ms later. How much the socket takes is §9's send buffer: left
+        to Linux it grew to 2.5 MiB at once, and the prefetch went that much further.
+      - No reader waited for those blocks. Once the cache is full (the second start), they are
+        the least recently used, outside every live window as sampled every 2 ms, and evicted
+        (`BlockCache::evict`). The next decoder's opening (a piece boundary) prefetches them
+        again.
+      - So the 1-block figure belongs to X1's own fixture.
     - It is not a bound "at every step": `fetched` is cumulative and counts refetches,
       `http_sent` is a union, and a reader's allowance goes when it closes.
     - X1 on that fixture: 1 block was fetched again in nine starts. With the cap pinned at
@@ -1627,7 +1670,12 @@ stream <event> t=<ms> <host:/abs> fetched=<b> demand=<b> prefetch=<b> bulk=<b> d
       (`Server::cuts(Render)` unchanged) and the edit's length;
     - `fetched ≤ http_sent + inputs × 1.25 MiB + cap` over the render, and no block is fetched
       twice (X1: at most 1.18 MiB per input in 50 mp4 and wav renders, with the cap at 256 KiB
-      and pinned at 4 MiB; 0 blocks twice);
+      and pinned at 4 MiB; 0 blocks twice). W7's 24-input render of its 80 MB `moov`-at-the-end
+      fixture, three runs each, with §9's send buffer: macOS fetched 64.2–65.6 MB, Linux
+      69.8–70.1 MB, 0 blocks twice on both. Without it Linux fetched 86.5–90.4 MB, every block
+      of the file, and 7.5–11.1 MB twice: each of the 24 connections, opened together, had
+      about 4 MB read for it in under a second, past the next pieces' places, and the 64 MiB
+      cache let blocks go before the input that wanted them got there;
     - a 2-input render whose second input waits past 60 s (a throttled Source) has no cut and the
       edit's length;
     - a render whose `cuts(Render)` went up is failed though ffmpeg exits 0 (§7.4's rule).

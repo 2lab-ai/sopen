@@ -152,8 +152,7 @@ impl Media {
     /// yet: the window does that ([`MediaWindow::start_planning`]).
     pub fn stream(source: Source, name: &str, shown: &str) -> Result<Self> {
         let tools = ffmpeg::resolve()?;
-        let fastseek = cut::stem_ext(name).1.eq_ignore_ascii_case("mp3")
-            && mp3::info_tag(&mut source.reader(ReaderKind::Media { bytes_per_s: 0 }));
+        let fastseek = seeks_fast(&source, name);
         let served = ffmpeg::Served::start(source, name, shown, fastseek)?;
         Self::served(&tools, served, name, shown)
     }
@@ -367,6 +366,14 @@ impl Media {
             ),
         }
     }
+}
+
+/// Whether the file `name` read through `source` gets `-fflags +fastseek` on its `play` input
+/// (06 §7.4): an mp3 whose first frame carries a LAME `Info` tag, read through a `play`
+/// reader. Every other file seeks exactly.
+fn seeks_fast(source: &Source, name: &str) -> bool {
+    cut::stem_ext(name).1.eq_ignore_ascii_case("mp3")
+        && mp3::info_tag(&mut source.reader(ReaderKind::Media { bytes_per_s: 0 }))
 }
 
 /// `m:ss.cc` (or `h:mm:ss.cc`).
@@ -1390,6 +1397,12 @@ struct MediaWindow {
     tex: Option<TextureHandle>,
     /// The frame on screen (timeline time, source frame when known) and the one asked for.
     tex_at: Option<(f64, Option<Tick>)>,
+    /// Tests: the pixels of the frame on screen, as they were put up.
+    #[cfg(test)]
+    shown_rgba: Vec<u8>,
+    /// Why the paused frame asked for last could not be had. A picture is shown only with the
+    /// place it is of: while this is set none is, and this is said where it would be.
+    frame_failed: Option<String>,
     want: Option<(f64, Tick)>,
     scrub: Option<Scrubber>,
     wave: Option<wave::Decode>,
@@ -1516,6 +1529,9 @@ impl MediaWindow {
             sel,
             tex: None,
             tex_at: None,
+            #[cfg(test)]
+            shown_rgba: Vec::new(),
+            frame_failed: None,
             want: None,
             scrub: None,
             wave: None,
@@ -1644,6 +1660,11 @@ impl MediaWindow {
             None => self.tex = Some(ctx.load_texture("frame", image, egui::TextureOptions::LINEAR)),
         }
         self.tex_at = Some((t, key));
+        self.frame_failed = None;
+        #[cfg(test)]
+        {
+            self.shown_rgba = rgba.to_vec();
+        }
         // A frame of the playback, or the paused frame asked for.
         if key.is_none() || self.frame_ready() {
             self.shown();
@@ -1656,15 +1677,24 @@ impl MediaWindow {
         self.media.input.served().map(|s| s.source().clone())
     }
 
-    /// Content from the stream is on screen — a frame, the first peaks of the waveform, sound
-    /// given to the output: `first` once, and the `ready` an `input` waits for.
-    fn shown(&mut self) {
+    /// Content from the stream is on screen: `first`, once. A sound's first peaks are this
+    /// and no more: they answer no place asked for.
+    fn first_shown(&mut self) {
         let Some(source) = self.stream() else {
             return;
         };
         if !std::mem::replace(&mut self.marked, true) {
             source.mark(Mark::First);
         }
+    }
+
+    /// What was asked for is here — a frame, or sound given to the output: `first` once, and
+    /// the `ready` an `input` waits for.
+    fn shown(&mut self) {
+        let Some(source) = self.stream() else {
+            return;
+        };
+        self.first_shown();
         if self.asked.take().is_some() {
             source.mark(Mark::Ready);
             if self.status.text.starts_with(READING) {
@@ -2262,6 +2292,7 @@ impl MediaWindow {
         self.wave = None;
         self.columns = None;
         self.tex_at = None;
+        self.frame_failed = None;
         self.want = None;
         self.timeline = Timeline::new(media.rate(), media.ticks());
         self.clipboard.clear();
@@ -2881,6 +2912,15 @@ impl MediaWindow {
         let panel = super::chrome::frame(&ui.painter_at(outer), outer, VIDEO_TITLE, true);
         let painter = ui.painter_at(panel);
         painter.rect_filled(panel, 0.0, p.picture_back);
+        if let Some(why) = &self.frame_failed {
+            let width = (panel.width() - 16.0).max(super::chrome::CELL.x);
+            let said = painter.layout(why.clone(), super::chrome::font(), p.error, width);
+            let at = panel.center() - said.size() / 2.0;
+            painter.galley(at, said, p.error);
+            self.map = None;
+            self.painted = true;
+            return;
+        }
         let Some(tex) = &self.tex else {
             painter.text(
                 panel.center(),
@@ -3138,7 +3178,7 @@ impl super::Window for MediaWindow {
                     .map(|p| p.read > 0.0 || p.complete)
             });
             if peaks == Some(true) {
-                self.shown();
+                self.first_shown();
             }
         }
         if self.player.is_none() {
@@ -3166,9 +3206,13 @@ impl super::Window for MediaWindow {
                     self.status = Status::error(e);
                     super::request_close(&ctx);
                 }
-                // What was asked for is not coming: what is said is why, not the read.
+                // What was asked for is not coming: what is said is why, not the read. The
+                // picture of another place goes, so as not to stand for this one: the failure
+                // is said where it was.
                 Some(Err(e)) => {
                     self.asked = None;
+                    self.tex_at = None;
+                    self.frame_failed = Some(e.clone());
                     self.status = Status::error(e);
                 }
                 None => {}

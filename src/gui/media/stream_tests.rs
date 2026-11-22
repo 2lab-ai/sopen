@@ -8,9 +8,10 @@ use super::timeline::{Clip, Timeline, View};
 use super::*;
 use crate::ffmpeg::{Served, Span};
 use crate::remote::{LocalFs, RemoteFs, SftpRemote};
-use crate::stream::http::{Config, Seams, Server};
+use crate::stream::http::{Config, Seams, Server, SEND_BUFFER};
 use crate::stream::{limits, Class, Engine, Opening, Settings, BLOCK, CAP_MAX};
-use std::sync::atomic::AtomicUsize;
+use std::collections::BTreeSet;
+use std::sync::atomic::{AtomicU64, AtomicUsize};
 
 const MIB: u64 = 1 << 20;
 
@@ -91,6 +92,17 @@ fn fetched_again(source: &Source) -> (u64, u64) {
         }
     }
     (prefetch, other)
+}
+
+/// Where the engine's trace of what it sent is now: what a run sends from here is after it.
+fn traced(source: &Source) -> usize {
+    source.core().trace.len()
+}
+
+/// The cap the engine sent under since trace position `from`: the highest it was at a send.
+fn cap_since(source: &Source, from: usize) -> u64 {
+    let core = source.core();
+    core.trace[from..].iter().map(|t| t.cap).max().unwrap_or(0)
 }
 
 /// A 600 s video (1 Mbit/s, 320×240, a key frame every 8 s, AAC sound): its `moov` at the end,
@@ -224,7 +236,8 @@ fn samples(tools: &Tools, file: &Path) -> u64 {
 
 /// 06 §12 V16's render gates: 24 reordered pieces (24 inputs) of a 600 s video with its `moov`
 /// at the end, of the same file faststart, and of a wav. Each render has no cut and the edit's
-/// length, fetches at most `http_sent + inputs × 1.25 MiB + cap`, and fetches no block twice.
+/// length, fetches at most `http_sent + inputs × 1.25 MiB + cap` (the cap the highest the engine
+/// sent under during the render), and fetches no block twice.
 #[test]
 fn v16_a_render_of_24_reordered_pieces_fetches_within_its_bound() {
     bounded(400, |t| {
@@ -247,6 +260,8 @@ fn v16_a_render_of_24_reordered_pieces_fetches_within_its_bound() {
             assert_eq!(spec.groups_from(&media.input).len(), 24, "24 inputs");
             idle(&source);
             let before = source.stats();
+            let from = traced(&source);
+            let inputs = spec.groups_from(&media.input).len() as u64;
             let work = dir.path().join(format!("work-{name}"));
             std::fs::create_dir_all(&work).unwrap();
             let out = work.join(format!("out.{}", if frames { "mp4" } else { "wav" }));
@@ -272,11 +287,14 @@ fn v16_a_render_of_24_reordered_pieces_fetches_within_its_bound() {
             }
             let fetched = after.fetched.total - before.fetched.total;
             let sent = after.http_sent - before.http_sent;
-            let allowed = sent + 24 * (5 * MIB / 4) + CAP_MAX;
+            let cap = cap_since(&source, from);
+            assert!(cap > 0, "{name}: the render sent nothing");
+            let allowed = sent + inputs * (5 * MIB / 4) + cap;
             eprintln!(
-                "V16 render {name} ({} bytes): fetched {fetched}, http_sent {sent}, allowed \
-                 {allowed}, refetched {}",
+                "V16 render {name} ({} bytes): fetched {fetched}, http_sent {sent}, {inputs} \
+                 inputs, {} render readers, cap {cap}, allowed {allowed}, refetched {}",
                 source.size(),
+                served.server().opened(Kind::Render),
                 refetched(&source)
             );
             assert!(fetched <= allowed, "{name}: fetched {fetched} > {allowed}");
@@ -290,9 +308,8 @@ fn v16_a_render_of_24_reordered_pieces_fetches_within_its_bound() {
 /// 8 s, its `moov` at the end; 320×240 here, which costs the same bytes): an edit of 10 pieces
 /// of 10 s reordered, 12 s of play from timeline positions 5 s, 45 s and 85 s, one after another
 /// on one Source. Each start, from `Player::start` to the drop, fetches at most `http_sent +
-/// (play readers opened) × their ahead + cap` beyond what it fetched again. Neither the server
-/// nor the Source counts the readers a start opened: they are bounded by the decoders it started
-/// × 4, X1's most connections per input (a `moov` at the end).
+/// (play readers opened) × their ahead + cap` beyond what it fetched again: the readers as the
+/// server counts the `play` responses it began, the cap the highest the engine sent under.
 ///
 /// What it fetches again is held to [`REFETCH_PER_START`], not to 06's one block: that is X1's
 /// own fixture's threshold, and this one measures more (below).
@@ -318,7 +335,6 @@ fn v16_playback_of_an_edit_fetches_within_its_bound() {
         assert!(tl.set_clips(clips, View::default()));
         let rate = source.size() / media.duration as u64;
         let (ahead, _) = limits(ReaderKind::Media { bytes_per_s: rate });
-        let url = PathBuf::from(media.input.show());
         idle(&source);
         for at in [5.0, 45.0, 85.0] {
             let from = tl.tick(at);
@@ -337,10 +353,12 @@ fn v16_playback_of_an_edit_fetches_within_its_bound() {
                     .collect(),
                 stereo: false,
             };
-            let (stats, again, decoders) = (
+            let server = media.input.served().unwrap().server();
+            let (stats, again, opened, traced_at) = (
                 source.stats(),
                 refetched(&source),
-                ffmpeg::spawns::of(&url).preview,
+                server.opened(Kind::Play),
+                traced(&source),
             );
             let mut player = Player::start(
                 &tools,
@@ -369,11 +387,16 @@ fn v16_playback_of_an_edit_fetches_within_its_bound() {
             let fetched = now.fetched.total - stats.fetched.total;
             let again = refetched(&source) - again;
             let sent = now.http_sent - stats.http_sent;
-            let readers = (ffmpeg::spawns::of(&url).preview - decoders) * 4;
-            let allowed = sent + readers * ahead + CAP_MAX;
+            let readers = server.opened(Kind::Play) - opened;
+            let cap = cap_since(&source, traced_at);
+            assert!(
+                readers >= 1 && cap > 0,
+                "from {at} s: {readers} readers, cap {cap}"
+            );
+            let allowed = sent + readers * ahead + cap;
             eprintln!(
                 "V16 playback from {at} s: fetched {fetched} (again {again}), http_sent {sent}, \
-                 readers ≤ {readers}, allowed {allowed}"
+                 {readers} play readers, cap {cap}, allowed {allowed}"
             );
             assert!(fetched - again <= allowed, "from {at} s: fetched {fetched}");
             // What comes again is readahead nobody read, never a block a decoder waited for.
@@ -394,40 +417,54 @@ fn v16_playback_of_an_edit_fetches_within_its_bound() {
 }
 
 /// What a playback start of [`v16_playback_of_an_edit_fetches_within_its_bound`] may fetch
-/// again: a regression threshold for this fixture (06 §12 V16). Measured (ffmpeg 9.0.2, three
-/// runs): 0, 14–24 and 9–15 blocks for the three starts, every one a prefetch that no decoder
-/// read. Each decoder opens this `moov`-at-the-end file at byte 0, reads a few KB and seeks to
-/// the `moov`; meanwhile the server fills that connection's socket from the cached head, each
-/// read a sequential hit that grows its reader's readahead, so prefetch past the cached head
-/// goes out before ffmpeg closes the connection. Never read, those blocks are the first the
-/// cache evicts once it is full (outside every live window), and the next decoder's opening
-/// prefetches them again. X1 measured 1 block in nine starts on its own 1080p fixture.
-const REFETCH_PER_START: u64 = 2 * MIB;
+/// again: a regression threshold for this fixture (06 §12 V16). Measured with the server's
+/// send buffer bounded ([`SEND_BUFFER`]; ffmpeg 9.0.2, three runs each): at most 16 blocks
+/// (1 MiB) a start on macOS and on Linux, every second fetch a prefetch in the engine's trace —
+/// no block a reader waited for came twice. Each decoder opens this `moov`-at-the-end file at
+/// byte 0, reads a few KB and seeks to the `moov`; meanwhile the server fills that connection's
+/// socket from the cached head, each read a sequential hit that grows its reader's readahead,
+/// so prefetch past the cached head goes out before ffmpeg closes the connection. No reader
+/// waits for those blocks; they are the first the cache evicts once it is full, and the next
+/// decoder's opening prefetches them again. With the buffer left to Linux, 2.2–4.0 MiB came
+/// again at one start. X1 measured 1 block in nine starts on its own 1080p fixture.
+const REFETCH_PER_START: u64 = 3 * MIB / 2;
 
-/// 06 §12 V16: a 2-input render whose second input waits for its piece past 60 s (on the
-/// server's clock, which the test moves) has no cut and the edit's length — the 60 s rule does
-/// not run on a `render` body (06 §9).
+/// 06 §12 V16: a 2-input render whose inputs wait past 60 s (on the server's clock, which the
+/// test moves) has no cut and the edit's length — the 60 s rule does not run on a `render`
+/// body (06 §9). The waits are seen: each `render` body connection, by its id, has a write
+/// blocked on its client; after each move of the clock, every one of them has looked at the
+/// clock past the move and counted no time against its client.
 #[test]
 fn v16_a_render_input_that_waits_past_60_s_is_not_cut() {
     bounded(240, |t| {
         let Some(tools) = tools() else { return };
         let dir = t.tmp();
+        // 600 s (80 MB): what follows each piece is more than both sockets' buffers can take
+        // on either platform, so each body's writes come to wait.
         let made = dir.path().join("made.mp4");
-        long_video(&tools, &made, 120);
+        long_video(&tools, &made, 600);
         let path = dir.path().join("v.mp4");
         faststart(&tools, &made, &path);
         let Some(source) = streamed(&path) else {
             return;
         };
         let hand = t.hand();
-        let blocked = Arc::new(AtomicUsize::new(0));
-        let count = blocked.clone();
+        // The render bodies blocked on their client, by connection; each look at the clock
+        // after a wait ran out: the connection, the time counted against it, the time read.
+        let blocked: Arc<Mutex<BTreeSet<u64>>> = Arc::default();
+        let looked: Arc<Mutex<Vec<(u64, Duration, Instant)>>> = Arc::default();
+        let (b, l) = (blocked.clone(), looked.clone());
         let config = Config {
             clock: hand.clock(),
             tick: Some(Duration::from_millis(20)),
             seams: Seams {
-                blocking: Some(Arc::new(move || {
-                    count.fetch_add(1, SeqCst);
+                body_blocked: Some(Arc::new(move |id, kind| {
+                    if kind == Kind::Render {
+                        b.lock().unwrap().insert(id);
+                    }
+                })),
+                evaluated: Some(Arc::new(move |id, idle, now| {
+                    l.lock().unwrap().push((id, idle, now));
                 })),
                 ..Seams::default()
             },
@@ -469,14 +506,50 @@ fn v16_a_render_input_that_waits_past_60_s_is_not_cut() {
             .recv_timeout(Duration::from_secs(60))
             .expect("the render begins");
         // Both inputs are open; their connections fill and their writes wait.
-        let held = blocked.load(SeqCst);
-        until("the render's writes wait", || {
-            blocked.load(SeqCst) >= held + 2
+        // The render bodies waiting now: those whose blocked writes look at the clock from
+        // here on (a connection ffmpeg closed earlier looks no more).
+        let from = looked.lock().unwrap().len();
+        let waiting = || -> BTreeSet<u64> {
+            let blocked = blocked.lock().unwrap();
+            let looked = looked.lock().unwrap();
+            looked[from..]
+                .iter()
+                .map(|l| l.0)
+                .filter(|id| blocked.contains(id))
+                .collect()
+        };
+        until("both render bodies wait on their client", || {
+            waiting().len() >= 2
         });
+        let ids = waiting();
         for _ in 0..2 {
             hand.advance(Duration::from_secs(61));
-            // A few of the server's looks at its clock.
-            std::thread::sleep(Duration::from_millis(200));
+            let moved = hand.now();
+            // Every waiting body looks at the clock past the move — or a cut ends the wait.
+            let seen = |id: u64| {
+                let looked = looked.lock().unwrap();
+                looked
+                    .iter()
+                    .rev()
+                    .find(|l| l.0 == id && l.2 >= moved)
+                    .copied()
+            };
+            until("each waiting body looks at the moved clock", || {
+                served.server().cuts(Kind::Render) > 0 || ids.iter().all(|id| seen(*id).is_some())
+            });
+            assert_eq!(
+                served.server().cuts(Kind::Render),
+                0,
+                "a waiting input was cut"
+            );
+            for id in &ids {
+                let (_, idle, _) = seen(*id).unwrap();
+                assert_eq!(
+                    idle,
+                    Duration::ZERO,
+                    "connection {id}: time counted against it"
+                );
+            }
         }
         hold_tx.send(()).unwrap();
         render.join().unwrap().unwrap();
@@ -491,22 +564,25 @@ fn v16_a_render_input_that_waits_past_60_s_is_not_cut() {
 }
 
 /// The file changes on the remote while an Export renders it: the render's stream is cut, and
-/// though ffmpeg exits 0 on a body cut short (06 §7.4), nothing is published and nothing is left
-/// under `<cache>/.exports` (06 §12 V22, V16's "a render whose `cuts(Render)` went up").
+/// ffmpeg exits 0 on that body cut short (06 §7.4: shown here, from its own exit status), yet
+/// nothing is published and nothing is left under `<cache>/.exports` (06 §12 V22, V16's "a
+/// render whose `cuts(Render)` went up"). A wav: its demuxer takes the end of its bytes for the
+/// end of the sound, with no container index to miss (run on ffmpeg 9.0.2; not on 8).
 #[test]
 fn v22_a_render_whose_stream_was_cut_publishes_nothing() {
     bounded(240, |t| {
         let Some(tools) = tools() else { return };
         let dir = t.tmp();
-        let path = dir.path().join("v.mp4");
-        long_video(&tools, &path, 600);
+        let path = dir.path().join("v.wav");
+        let sound = "sine=frequency=330:sample_rate=48000:duration=600";
+        make(&tools, &["-f", "lavfi", "-i", sound, "-ac", "2"], &path);
         let size = std::fs::metadata(&path).unwrap().len();
         let Some((source, mut engine)) = stepped(&path) else {
             return;
         };
-        let served = Served::start(source.clone(), "v.mp4", "v.mp4", false).unwrap();
+        let served = Served::start(source.clone(), "v.wav", "v.wav", false).unwrap();
         let media = stepping(&mut engine, || {
-            Media::served(&tools, served.clone(), "v.mp4", "v.mp4").unwrap()
+            Media::served(&tools, served.clone(), "v.wav", "v.wav").unwrap()
         });
         let spec = spec_of(&media, &[(300.0, 60.0)]);
         let exports = dir.path().join("exports");
@@ -531,7 +607,7 @@ fn v22_a_render_whose_stream_was_cut_publishes_nothing() {
                     &tools2,
                     &input,
                     &target,
-                    "v.mp4",
+                    "v.wav",
                     &spec,
                     (300.0, 360.0),
                     &exports,
@@ -562,7 +638,14 @@ fn v22_a_render_whose_stream_was_cut_publishes_nothing() {
         let err = result.expect_err("a render whose stream was cut publishes nothing");
         let said = format!("{err:#}");
         assert!(said.contains("changed on the remote"), "{said}");
-        assert!(served.server().cuts(Kind::Render) >= 1);
+        assert!(
+            served.server().cuts(Kind::Render) >= 1,
+            "the cut is counted"
+        );
+        // ffmpeg itself took the cut body for the end of the file and ended well.
+        let ended = ffmpeg::exits::naming(exports.to_str().unwrap());
+        assert_eq!(ended.len(), 1, "one render run: {ended:?}");
+        assert!(ended[0].success(), "ffmpeg exited {}", ended[0]);
         assert_eq!(listed(), before, "nothing was published");
         let left: Vec<_> = std::fs::read_dir(&exports)
             .map(|d| d.map(|e| e.unwrap().path()).collect())
@@ -574,13 +657,41 @@ fn v22_a_render_whose_stream_was_cut_publishes_nothing() {
     });
 }
 
-/// A `LocalFs` as an export's remote, whose upload or link a test watches: a Cancel arrives
-/// during the upload (`cancel_in_upload`), or right after the link has landed.
+/// When a test's Cancel comes to an export it watches through [`Publishing`].
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CancelAt {
+    /// Once this many bytes of the upload are in the remote file: the owner's Cancel, made on
+    /// another thread while the upload holds at that checkpoint (its look at the stop before
+    /// its next chunk) until the Cancel has landed.
+    MidUpload(u64),
+    /// Right after the upload has returned, before the link.
+    AfterUpload,
+    /// Right after the link has landed: too late.
+    AfterLink,
+}
+
+/// What a [`Publishing`] saw.
+#[derive(Default, Debug)]
+struct Seen {
+    /// The bytes in the remote temp when the Cancel landed, and when the temp was removed.
+    at_cancel: Option<u64>,
+    at_removal: Option<u64>,
+    /// What a Cancel after the link said (`false`: too late).
+    late: Option<bool>,
+    linked: bool,
+}
+
+/// An export's remote (any file layer on this machine) that cancels the export at a moment of
+/// its upload or link ([`CancelAt`]), and sees what the remote file held then.
 struct Publishing {
-    fs: LocalFs,
+    fs: Box<dyn RemoteFs + Send>,
     stop: Arc<cut::Stop>,
-    cancel_in_upload: bool,
-    cancel_after_link: Arc<Mutex<Option<bool>>>,
+    at: CancelAt,
+    seen: Arc<Mutex<Seen>>,
+}
+
+fn size_of(path: &str) -> u64 {
+    std::fs::metadata(path).map_or(0, |m| m.len())
 }
 
 impl RemoteFs for Publishing {
@@ -616,10 +727,37 @@ impl RemoteFs for Publishing {
         path: &str,
         like: Option<crate::remote::Like>,
     ) -> std::result::Result<crate::remote::Uploaded, crate::remote::CreateError> {
-        let up = self.fs.create_from(local, path, like);
-        if self.cancel_in_upload {
-            // The owner's Cancel, while the bytes went.
-            assert!(self.stop.cancel(), "a Cancel during the upload is in time");
+        self.create_from_stoppable(local, path, like, &|| false)
+    }
+    fn create_from_stoppable(
+        &mut self,
+        local: &Path,
+        path: &str,
+        like: Option<crate::remote::Like>,
+        stop: &dyn Fn() -> bool,
+    ) -> std::result::Result<crate::remote::Uploaded, crate::remote::CreateError> {
+        let (owner, seen) = (self.stop.clone(), self.seen.clone());
+        let fired = std::cell::Cell::new(false);
+        let checked = || {
+            if let CancelAt::MidUpload(at) = self.at {
+                let len = size_of(path);
+                if !fired.get() && len >= at {
+                    fired.set(true);
+                    let owner = owner.clone();
+                    let landed = std::thread::spawn(move || owner.cancel()).join().unwrap();
+                    assert!(landed, "a Cancel during the upload is in time");
+                    seen.lock().unwrap().at_cancel = Some(len);
+                }
+            }
+            stop()
+        };
+        let up = self.fs.create_from_stoppable(local, path, like, &checked);
+        if self.at == CancelAt::AfterUpload {
+            assert!(
+                self.stop.cancel(),
+                "a Cancel after the upload, before the link, is in time"
+            );
+            self.seen.lock().unwrap().at_cancel = Some(size_of(path));
         }
         up
     }
@@ -632,17 +770,31 @@ impl RemoteFs for Publishing {
     fn link_new(&mut self, from: &str, to: &str) -> Result<()> {
         let linked = self.fs.link_new(from, to);
         if linked.is_ok() {
-            *self.cancel_after_link.lock().unwrap() = Some(self.stop.cancel());
+            let mut seen = self.seen.lock().unwrap();
+            seen.linked = true;
+            if self.at == CancelAt::AfterLink {
+                seen.late = Some(self.stop.cancel());
+            }
         }
         linked
     }
+    fn can_link(&self) -> bool {
+        self.fs.can_link()
+    }
+    fn can_replace(&self) -> bool {
+        self.fs.can_replace()
+    }
     fn remove(&mut self, path: &str) -> Result<()> {
+        if path.contains(".sopen-") {
+            self.seen.lock().unwrap().at_removal = Some(size_of(path));
+        }
         self.fs.remove(path)
     }
 }
 
 /// 06 §12 V22: Cancel during the render kills ffmpeg and leaves no file under the exports and
-/// nothing on the remote; during the upload it removes the remote temp and links nothing; after
+/// nothing on the remote; during the upload it stops the upload, removes the remote temp and
+/// links nothing (and so after the upload, before the link); after
 /// the link it is too late and the result names the sibling; a name already taken is never
 /// written over.
 #[test]
@@ -707,30 +859,54 @@ fn v22_export_cancel_at_each_step() {
         assert_eq!(listed(), before, "nothing on the remote");
         nothing_under_exports();
         none_left(dir.path()).unwrap();
-        // During the upload.
-        let stop = Arc::new(cut::Stop::default());
-        let mut fs = Publishing {
-            fs: LocalFs::new(),
-            stop: stop.clone(),
-            cancel_in_upload: true,
-            cancel_after_link: Arc::default(),
+        // During the upload: the Cancel lands once 512 KiB are in the remote temp, and nothing
+        // more is written.
+        let publishing = |at: CancelAt| {
+            let stop = Arc::new(cut::Stop::default());
+            let fs = Publishing {
+                fs: Box::new(LocalFs::new()),
+                stop: stop.clone(),
+                at,
+                seen: Arc::default(),
+            };
+            (fs, stop)
         };
+        let (mut fs, stop) = publishing(CancelAt::MidUpload(512 << 10));
         let err = export(&mut fs, &stop, false).unwrap_err();
         assert!(crate::remote::is_cancelled(&err), "{err:#}");
+        let seen = fs.seen.lock().unwrap();
+        let (at_cancel, at_removal) = (
+            seen.at_cancel.expect("the Cancel landed mid-upload"),
+            seen.at_removal.expect("the temp was removed"),
+        );
+        assert!(
+            at_removal <= at_cancel + (256 << 10),
+            "{seen:?}: written after the Cancel"
+        );
+        assert!(!seen.linked, "no link");
+        drop(seen);
         assert_eq!(listed(), before, "the temp is removed and nothing linked");
-        assert_eq!(*fs.cancel_after_link.lock().unwrap(), None, "no link");
+        nothing_under_exports();
+        // After the upload, before the link: the whole temp is there, and still goes.
+        let (mut fs, stop) = publishing(CancelAt::AfterUpload);
+        let err = export(&mut fs, &stop, false).unwrap_err();
+        assert!(crate::remote::is_cancelled(&err), "{err:#}");
+        let seen = fs.seen.lock().unwrap();
+        assert!(
+            seen.at_cancel.is_some_and(|n| n > 0) && !seen.linked,
+            "{seen:?}"
+        );
+        drop(seen);
+        assert_eq!(listed(), before, "the temp is removed and nothing linked");
         nothing_under_exports();
         // After the link.
-        let stop = Arc::new(cut::Stop::default());
-        let late = Arc::new(Mutex::new(None));
-        let mut fs = Publishing {
-            fs: LocalFs::new(),
-            stop: stop.clone(),
-            cancel_in_upload: false,
-            cancel_after_link: late.clone(),
-        };
+        let (mut fs, stop) = publishing(CancelAt::AfterLink);
         let published = export(&mut fs, &stop, false).unwrap();
-        assert_eq!(*late.lock().unwrap(), Some(false), "too late: refused");
+        assert_eq!(
+            fs.seen.lock().unwrap().late,
+            Some(false),
+            "too late: refused"
+        );
         assert_eq!(published.name, "v.cut-10-40.mp4");
         assert!(dir.path().join(&published.name).is_file());
         // Its name is taken now: the next export is published beside it, never over it.
@@ -774,8 +950,9 @@ fn holder(dir: &Path) -> Tools {
 
 /// 06 §12 V16's owner gate (06 §7.4, W7's rule): every run on a `play` or `render` URL has an
 /// owner that ends it, and once it has, the seats the run held are back to 0 — for a client
-/// that neither reads nor closes. A dropped player; an export stopped by its watchdog (its
-/// limit shortened here); a probe past its time (shortened); a paused frame past its budget.
+/// that neither reads nor closes. A dropped player; an export stopped by its watchdog and a
+/// probe past its time, each timed out on a clock the test moves once the seat is held; a
+/// paused frame past its budget.
 #[test]
 fn v16_every_run_on_a_stream_has_an_owner_that_frees_its_seats() {
     bounded(120, |t| {
@@ -804,17 +981,44 @@ fn v16_every_run_on_a_stream_has_an_owner_that_frees_its_seats() {
         until("the player's decoders hold their seats", || seats() >= 2);
         drop(player);
         until("a dropped player's seats are free", || seats() == 0);
-        // An export stopped by its watchdog.
+        // An export stopped by its watchdog, and a probe past its time: each on a clock this
+        // test moves, only once the run's seat is held, by the real limits.
         let args = media.input.of_kind(Kind::Render).args();
-        let limit = Duration::from_secs(1);
-        let err = ffmpeg::run_stoppable(&held, &args, 1.0, &mut |_| {}, limit, (&|| false, &|| 0))
-            .unwrap_err();
-        assert!(format!("{err:#}").contains("no progress"), "{err:#}");
+        let hand = t.hand();
+        let now = hand.clock();
+        let seated = || {
+            until("the run holds its seat", || seats() >= 1);
+            // Its client neither reads nor closes: the seat stays while nothing moves.
+            std::thread::sleep(Duration::from_millis(300));
+            assert!(seats() >= 1, "the seat is held");
+        };
+        std::thread::scope(|scope| {
+            let run = scope.spawn(|| {
+                let watched = ffmpeg::Watched {
+                    now: &*now,
+                    ..ffmpeg::Watched::plain()
+                };
+                ffmpeg::run_stoppable(&held, &args, 1.0, &mut |_| {}, ffmpeg::STALL_LIMIT, watched)
+            });
+            seated();
+            assert!(!run.is_finished(), "nothing stops it before its time");
+            hand.advance(ffmpeg::STALL_LIMIT + Duration::from_secs(1));
+            let err = run.join().unwrap().unwrap_err();
+            assert!(format!("{err:#}").contains("no progress"), "{err:#}");
+        });
         until("a stopped export's seat is free", || seats() == 0);
-        // A probe past its time.
-        let err = ffmpeg::probe_within(&held, &media.input, "v.mp4", limit).unwrap_err();
-        assert!(format!("{err:#}").contains("longer than"), "{err:#}");
+        std::thread::scope(|scope| {
+            let run = scope.spawn(|| {
+                ffmpeg::probe_timed(&held, &media.input, "v.mp4", ffmpeg::PROBE_LIMIT, &*now)
+            });
+            seated();
+            assert!(!run.is_finished(), "nothing stops it before its time");
+            hand.advance(ffmpeg::PROBE_LIMIT + Duration::from_secs(1));
+            let err = run.join().unwrap().unwrap_err();
+            assert!(format!("{err:#}").contains("longer than"), "{err:#}");
+        });
         until("a stopped probe's seat is free", || seats() == 0);
+        let limit = Duration::from_secs(1);
         // A paused frame past its budget.
         let mut held_media = media.clone();
         held_media.tools = held.clone();
@@ -971,13 +1175,16 @@ fn v19_the_waveform_of_a_24_mb_mp3_fetches_it_about_once() {
         );
         assert!(fetched as f64 <= 1.05 * size as f64, "fetched {fetched}");
         let reads = reads.lock().unwrap().clone();
-        let partial: Vec<f64> = reads
+        // Each notice reads the peaks as they are by then: two may see the same hand-over.
+        assert!(reads.windows(2).all(|w| w[0] <= w[1]), "{reads:?}");
+        let mut partial: Vec<f64> = reads
             .iter()
             .copied()
             .filter(|r| *r < media.duration)
             .collect();
+        partial.dedup();
+        assert!(partial.iter().all(|r| *r > 0.0), "{reads:?}");
         assert!(partial.len() >= 3, "handed over as it filled: {reads:?}");
-        assert!(partial.windows(2).all(|w| w[0] <= w[1]), "{reads:?}");
         drop(decode);
         none_reading(&media);
         drop(media);
@@ -1387,8 +1594,10 @@ fn a_stream_cut_short_fails_every_run_with_the_source_s_state() {
 }
 
 /// The window over a stream (06 §7.4, §11): a click far into the timeline shows the frame there
+/// — its pixels nearer the frame decoded from the file at that place than either neighbour's —
 /// and ends its wait (`ready`), with no read still said; once the file has changed on the
-/// remote, a click elsewhere shows no frame, says the change, and ends its wait too.
+/// remote, a click elsewhere ends its wait too, and no picture stands for the place asked for:
+/// the earlier frame goes, and the change is said where it was.
 #[test]
 fn a_far_scrub_in_the_window_shows_its_frame_and_ends_its_wait() {
     bounded(240, |t| {
@@ -1432,11 +1641,73 @@ fn a_far_scrub_in_the_window_shows_its_frame_and_ends_its_wait() {
         );
         assert!(win.asked.is_none(), "its ready came with the frame");
         assert!(drv.text_starting_with(READING).is_none());
-        // The file changes: the next place asked for shows no frame, and says why.
+        // Which frame: the one at the place asked for, decoded from the file itself.
+        let (_, key) = win.want.expect("a frame asked for");
+        let (w, h) = win.media.decode_size().unwrap();
+        let fps = win.media.fps;
+        let decoded = |k: i64| {
+            let at = win.media.origin() + (k as f64 - 0.5) / fps;
+            let out = std::process::Command::new(&tools.ffmpeg)
+                .args(["-nostdin", "-loglevel", "error", "-ss", &format!("{at:.6}")])
+                .arg("-i")
+                .arg(&path)
+                .args(["-an", "-vf", &format!("scale={w}:{h},format=rgba")])
+                .args(["-frames:v", "1", "-f", "rawvideo", "-"])
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            out.stdout
+        };
+        let apart = |a: &[u8], b: &[u8]| -> u64 {
+            assert_eq!(a.len(), b.len());
+            a.iter()
+                .zip(b)
+                .map(|(x, y)| u64::from(x.abs_diff(*y)))
+                .sum()
+        };
+        let shown = win.shown_rgba.clone();
+        let picture = drv.pictures();
+        assert_eq!(picture.len(), 1, "the frame is on screen: {picture:?}");
+        let (here, before, after) = (
+            apart(&shown, &decoded(key)),
+            apart(&shown, &decoded(key - 1)),
+            apart(&shown, &decoded(key + 1)),
+        );
+        eprintln!(
+            "frame {key}: {here} apart from its decode, {before} and {after} from its neighbours'"
+        );
+        assert!(
+            here < before && here < after,
+            "frame {key}: {here} / {before} / {after}"
+        );
+        // The file changes: the next place asked for puts no frame up, and says why.
         change_in_place(&path, &source);
         click(&mut drv, &mut win, 0.3);
         drv.until(&mut win, 60, |w| w.asked.is_none());
         drv.idle(&mut win, 2);
+        assert!(!win.frame_ready(), "no frame for the place asked for");
+        assert_eq!(win.tex_at, None, "no picture claims a place");
+        assert!(win.shown_rgba == shown, "nothing new was put up");
+        assert!(
+            drv.pictures().is_empty(),
+            "the earlier frame is gone: {:?}",
+            drv.pictures()
+        );
+        // Said where the picture was (and in the status line).
+        let area = picture[0].expand(8.0);
+        let said: Vec<_> = drv
+            .texts()
+            .into_iter()
+            .filter(|t| t.2.contains("changed on the remote"))
+            .collect();
+        assert!(
+            said.iter().any(|t| area.contains_rect(t.0)),
+            "{said:?} not in {area:?}"
+        );
         assert!(
             win.status.text.contains("changed on the remote"),
             "{}",
@@ -1571,12 +1842,14 @@ fn a_seek_in_a_sound_playing_silently_ends_its_wait() {
         drv.key(&mut win, egui::Key::Space, egui::Modifiers::NONE);
         drv.idle(&mut win, 2);
         assert!(win.player.is_some(), "it plays, silently");
+        let was = win.marks.t;
         drv.key(&mut win, egui::Key::ArrowRight, egui::Modifiers::NONE);
-        let since = Instant::now();
-        while since.elapsed() < Duration::from_millis(1500) {
-            drv.idle(&mut win, 1);
-            std::thread::sleep(Duration::from_millis(20));
-        }
+        assert!(win.marks.t > was, "the seek moved the playhead");
+        drv.until(&mut win, 60, |w| {
+            w.asked.is_none() && w.status.text.contains("playing without sound")
+        });
+        // And it stays so.
+        drv.idle(&mut win, 5);
         assert!(win.asked.is_none(), "no sound is waited for");
         assert!(drv.text_starting_with(READING).is_none());
         assert!(
@@ -1589,8 +1862,10 @@ fn a_seek_in_a_sound_playing_silently_ends_its_wait() {
     });
 }
 
-/// 06 §7.4, §12 V22: Cancel during the upload of a large Export stops sending — the temp on the
-/// remote stops growing far short of the file — then the temp is removed and nothing is linked.
+/// 06 §7.4, §12 V22: Cancel during the upload of a large Export (115 MB over SFTP) stops
+/// sending. The Cancel lands at the upload's own checkpoint once 8 MiB are in the remote temp;
+/// what the temp holds when it is removed is at most one chunk more; nothing is linked and the
+/// folder is left empty.
 #[test]
 fn v22_cancel_during_a_large_upload_stops_sending() {
     bounded(240, |t| {
@@ -1603,38 +1878,22 @@ fn v22_cancel_during_a_large_upload_stops_sending() {
             return;
         };
         let media = Media::stream(source, "long.wav", "long.wav").unwrap();
-        let Some(mut fs) = SftpRemote::local_server() else {
+        let Some(sftp) = SftpRemote::local_server() else {
             return;
         };
-        // The export publishes into a folder of its own, watched from here.
+        let stop = Arc::new(cut::Stop::default());
+        let mut fs = Publishing {
+            fs: Box::new(sftp),
+            stop: stop.clone(),
+            at: CancelAt::MidUpload(8 * MIB),
+            seen: Arc::default(),
+        };
+        // The export publishes into a folder of its own.
         let out = dir.path().join("out");
         std::fs::create_dir(&out).unwrap();
         let spec = spec_of(&media, &[(0.0, 600.0)]);
         // 600 s of 16-bit stereo at 48 kHz.
         let size = 600 * 48_000 * 4;
-        let stop = Arc::new(cut::Stop::default());
-        let done = Arc::new(AtomicBool::new(false));
-        let watcher = {
-            let (out, stop, done) = (out.clone(), stop.clone(), done.clone());
-            std::thread::spawn(move || {
-                let mut most = 0u64;
-                while !done.load(SeqCst) {
-                    for entry in std::fs::read_dir(&out).unwrap().flatten() {
-                        let name = entry.file_name().to_string_lossy().into_owned();
-                        if name.starts_with('.') && name.contains(".sopen-") {
-                            let len = entry.metadata().map_or(0, |m| m.len());
-                            most = most.max(len);
-                            // The owner's Cancel, while the bytes go.
-                            if len >= 8 * MIB {
-                                stop.cancel();
-                            }
-                        }
-                    }
-                    std::thread::sleep(Duration::from_millis(1));
-                }
-                most
-            })
-        };
         let result = cut::render_and_publish(
             &mut fs,
             &tools,
@@ -1647,18 +1906,22 @@ fn v22_cancel_during_a_large_upload_stops_sending() {
             &mut |_| {},
             &stop,
         );
-        done.store(true, SeqCst);
-        let most = watcher.join().unwrap();
-        eprintln!("an upload of {size} bytes, cancelled: the temp reached {most} bytes");
         let err = result.unwrap_err();
         assert!(crate::remote::is_cancelled(&err), "{err:#}");
-        assert!(most >= 8 * MIB, "the upload was under way: {most}");
+        let seen = fs.seen.lock().unwrap();
+        eprintln!("an upload of {size} bytes, cancelled: {seen:?}");
+        let at_cancel = seen.at_cancel.expect("the Cancel landed mid-upload");
+        let at_removal = seen.at_removal.expect("the temp was removed");
+        assert!(at_cancel >= 8 * MIB && at_cancel < size, "{seen:?}");
         assert!(
-            most < size / 4,
-            "the upload stopped: the temp reached {most} of {size}"
+            at_removal <= at_cancel + (256 << 10),
+            "{} bytes written after the Cancel",
+            at_removal - at_cancel
         );
+        assert!(!seen.linked, "nothing linked");
         let left: Vec<_> = std::fs::read_dir(&out).unwrap().flatten().collect();
         assert!(left.is_empty(), "nothing left on the remote: {left:?}");
+        drop(seen);
         none_reading(&media);
         drop(media);
         none_left(dir.path()).unwrap();
@@ -1666,14 +1929,19 @@ fn v22_cancel_during_a_large_upload_stops_sending() {
 }
 
 /// A stand-in for ffmpeg and ffprobe that fails naming its input's URL, as ffmpeg does for a
-/// server's refusal (it answers a render's encoder question from the real ffmpeg).
+/// server's refusal, the server's TCP endpoint and the URL's authority alone, as it does where
+/// it cannot connect — and, last, addresses that are not this server's (it answers a render's
+/// encoder question from the real ffmpeg).
 fn complainer(dir: &Path, real: &Path) -> Tools {
     let body = format!(
         "case \"$*\" in *-encoders*) exec '{}' \"$@\";; esac\n\
          prev=; url=; last=\n\
          for a in \"$@\"; do last=$a; [ \"$prev\" = -i ] && url=$a; prev=$a; done\n\
          [ -z \"$url\" ] && url=$last\n\
-         echo \"$url: Server returned 404 Not Found\" >&2\n\
+         port=${{url#http://127.0.0.1:}}; port=${{port%%/*}}\n\
+         echo \"Connection to tcp://127.0.0.1:$port failed: Connection refused; \
+         http://127.0.0.1:$port: $url: Server returned 404 Not Found; not ours: \
+         127.0.0.1:1 and http://127.0.0.1:${{port}}9/x\" >&2\n\
          exit 1",
         real.display()
     );
@@ -1704,13 +1972,36 @@ fn ffmpeg_s_errors_name_the_file_never_the_stream_s_url() {
         let token = url.split('/').nth(3).unwrap().to_string();
         assert_eq!(token.len(), 32, "{url}");
         let bad = complainer(dir.path(), &tools.ffmpeg);
-        let clean = |what: &str, said: &str| {
-            assert!(said.contains(shown), "{what} names the file: {said}");
+        let port = url
+            .split('/')
+            .nth(2)
+            .unwrap()
+            .rsplit(':')
+            .next()
+            .unwrap()
+            .to_string();
+        let ours = format!("127.0.0.1:{port}");
+        let theirs = format!("http://127.0.0.1:{port}9/x");
+        // Nothing of this server's address or token; another address as it was printed.
+        let unexposed = |what: &str, said: &str| {
             assert!(
-                !said.contains("127.0.0.1"),
-                "{what} shows the address: {said}"
+                !said.replace(&theirs, "").contains(&ours),
+                "{what} shows the server: {said}"
             );
             assert!(!said.contains(&token), "{what} shows the token: {said}");
+        };
+        let clean = |what: &str, said: &str| {
+            unexposed(what, said);
+            assert!(said.contains(shown), "{what} names the file: {said}");
+            assert!(
+                said.contains(&format!("Connection to {shown} failed")),
+                "{what}: {said}"
+            );
+            assert!(said.contains(&theirs), "{what} keeps another port: {said}");
+            assert!(
+                said.contains("127.0.0.1:1 "),
+                "{what} keeps another address: {said}"
+            );
         };
         let work = dir.path().join("work");
         std::fs::create_dir_all(&work).unwrap();
@@ -1751,6 +2042,18 @@ fn ffmpeg_s_errors_name_the_file_never_the_stream_s_url() {
         clean("the waveform", &waved);
         let probed = ffmpeg::probe_input(&bad, &media.input, shown).unwrap_err();
         clean("a probe", &format!("{probed:#}"));
+        // The paused frame shows none of ffmpeg's words (its errors are not read): only its
+        // own.
+        let mut failing = media.clone();
+        failing.tools = bad.clone();
+        let scrub = Scrubber::start(&failing, egui::Context::default()).unwrap();
+        scrub.request(2.0, 50);
+        until("the frame fails", || {
+            scrub.result.lock().unwrap().frame.is_some()
+        });
+        let framed = scrub.result.lock().unwrap().take().unwrap();
+        unexposed("the paused frame", &framed.map(|_| ()).unwrap_err());
+        drop(scrub);
         drop(wave);
         none_reading(&media);
         drop(media);
@@ -1758,9 +2061,9 @@ fn ffmpeg_s_errors_name_the_file_never_the_stream_s_url() {
     });
 }
 
-/// A stand-in for ffmpeg that reads its input slowly — 64 KiB every 100 ms for 3 s — and prints
-/// nothing, then ends well: a render reading deep into a file to its first piece over a slow
-/// link, with no output meanwhile.
+/// A stand-in for ffmpeg that reads its input — 64 KiB every 20 ms, 12.5 MiB in all, more than
+/// the file or any socket's buffer — and prints nothing, then ends well: a render reading deep
+/// into a file to its first piece, with no output meanwhile.
 fn slow_reader(dir: &Path) -> Tools {
     let path = dir.join("slow-reader");
     let script = "#!/bin/bash\n[ \"$1\" = -version ] && exit 0\n\
@@ -1769,7 +2072,7 @@ fn slow_reader(dir: &Path) -> Tools {
         rest=\"${url#http://127.0.0.1:}\"; port=\"${rest%%/*}\"; path=\"/${rest#*/}\"\n\
         exec 3<>\"/dev/tcp/127.0.0.1/$port\"\n\
         printf 'GET %s HTTP/1.1\\r\\nHost: 127.0.0.1:%s\\r\\n\\r\\n' \"$path\" \"$port\" >&3\n\
-        for i in $(seq 1 30); do head -c 65536 <&3 >/dev/null; sleep 0.1; done\n\
+        for i in $(seq 1 200); do head -c 65536 <&3 >/dev/null; sleep 0.02; done\n\
         exit 0\n";
     std::fs::write(&path, script).unwrap();
     use std::os::unix::fs::PermissionsExt;
@@ -1781,38 +2084,92 @@ fn slow_reader(dir: &Path) -> Tools {
     }
 }
 
-/// 06 §7.4: a render's watchdog counts its input going on as progress. A run with no output for
-/// longer than its limit while the byte server keeps sending it bytes is not stopped; one that
-/// takes no bytes and gives no output is (the limit shortened here, as the owner gate does).
+/// 06 §7.4: a render's watchdog counts its input going on as progress — the bytes the byte
+/// server got onto the run's socket. On a clock the test moves only once the watchdog itself
+/// has read a count higher than at the last move — each move 0.8 × the limit, several in all,
+/// far past the limit with no output — a run being fed is not stopped. One that takes nothing
+/// gives the server nothing to send: once the count stands, moved past its limit once, it is
+/// stopped, and its seat comes back. The file (24 MB) and what the reader takes (12.5 MiB) are
+/// larger than the sockets' buffers on either platform.
 #[test]
 fn a_render_fed_by_its_input_is_not_stopped_and_one_starved_is() {
-    bounded(120, |t| {
+    bounded(180, |t| {
         let Some(tools) = tools() else { return };
         let dir = t.tmp();
         let path = dir.path().join("v.mp4");
-        long_video(&tools, &path, 60);
+        long_video(&tools, &path, 180);
         let Some(source) = streamed(&path) else {
             return;
         };
         let media = Media::stream(source, "v.mp4", "v.mp4").unwrap();
         let render = media.input.of_kind(Kind::Render);
         let args = render.args();
-        let limit = Duration::from_secs(1);
-        let fed = || render.fed();
-        let started = Instant::now();
+        let limit = ffmpeg::STALL_LIMIT;
+        // What the watchdog last read of the count.
+        let read = AtomicU64::new(0);
+        let fed = || {
+            let n = render.fed();
+            read.store(n, SeqCst);
+            n
+        };
+        let hand = t.hand();
+        let now = hand.clock();
+        // The run's watch, made on the run's own thread.
+        let run_on = |tools: &Tools| {
+            let watched = ffmpeg::Watched {
+                fed: &fed,
+                now: &*now,
+                ..ffmpeg::Watched::plain()
+            };
+            ffmpeg::run_stoppable(tools, &args, 1.0, &mut |_| {}, limit, watched)
+        };
         let reader = slow_reader(dir.path());
-        ffmpeg::run_stoppable(&reader, &args, 1.0, &mut |_| {}, limit, (&|| false, &fed))
-            .expect("fed, it is not stopped");
-        let took = started.elapsed();
+        let moves = std::thread::scope(|scope| {
+            let run = scope.spawn(|| run_on(&reader));
+            let (mut moves, mut acked) = (0, 0);
+            while !run.is_finished() {
+                // The watchdog has read more than at the last move: it reset its wait then.
+                let give_up = Instant::now() + Duration::from_secs(20);
+                while read.load(SeqCst) <= acked && !run.is_finished() {
+                    assert!(Instant::now() < give_up, "nothing more was sent");
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                let now_read = read.load(SeqCst);
+                if now_read > acked {
+                    acked = now_read;
+                    hand.advance(limit.mul_f64(0.8));
+                    moves += 1;
+                }
+            }
+            run.join().unwrap().expect("fed, it is not stopped");
+            moves
+        });
         assert!(
-            took >= 2 * limit,
-            "it ran {took:?}, past its limit, with no output"
+            moves >= 3,
+            "{moves} moves of 0.8 × the limit: past it, with no output"
         );
         let held = holder(dir.path());
-        let err = ffmpeg::run_stoppable(&held, &args, 1.0, &mut |_| {}, limit, (&|| false, &fed))
-            .unwrap_err();
-        assert!(format!("{err:#}").contains("no progress"), "{err:#}");
         let server = media.input.served().unwrap().server();
+        std::thread::scope(|scope| {
+            let run = scope.spawn(|| run_on(&held));
+            until("the starved run holds its seat", || {
+                server.watch().open() >= 1
+            });
+            // What the sockets take is sent; then nothing more goes, and the watchdog has read
+            // that.
+            let mut sent = render.fed();
+            loop {
+                std::thread::sleep(Duration::from_millis(300));
+                if render.fed() == sent && read.load(SeqCst) == sent {
+                    break;
+                }
+                sent = render.fed();
+            }
+            assert!(!run.is_finished(), "nothing stops it before its time");
+            hand.advance(limit + Duration::from_secs(1));
+            let err = run.join().unwrap().unwrap_err();
+            assert!(format!("{err:#}").contains("no progress"), "{err:#}");
+        });
         until("the stopped run's seat is free", || {
             server.watch().open() == 0
         });
@@ -1844,8 +2201,10 @@ fn an_upload_stops_between_chunks() {
     let tmp = tempfile::tempdir().unwrap();
     let src = tmp.path().join("big");
     std::fs::write(&src, vec![7u8; 32 << 20]).unwrap();
+    // The SFTP session logs its requests (`sftp-server -l INFO`): a handle's close is there.
+    let log = tmp.path().join("sftp-server.log");
     let mut layers: Vec<(&str, Box<dyn RemoteFs>)> = vec![("local", Box::new(LocalFs::new()))];
-    if let Some(sftp) = SftpRemote::local_server() {
+    if let Some(sftp) = SftpRemote::local_server_args(&[], Some(&log)) {
         layers.push(("sftp", Box::new(sftp)));
     }
     for (what, mut fs) in layers {
@@ -1866,9 +2225,236 @@ fn an_upload_stops_between_chunks() {
         assert_eq!(err.created, crate::remote::Created::Yes, "{what}");
         let len = std::fs::metadata(&dst).unwrap().len();
         assert!(len <= 4 << 20, "{what}: {len} bytes went before the stop");
+        if what == "sftp" {
+            // Closed by the time the stop returned: not left to a dropped handle's close, which
+            // is sent but not waited for.
+            let said = std::fs::read_to_string(&log).unwrap();
+            let closed = format!("close \"{}\"", dst.display());
+            assert!(
+                said.contains(&closed),
+                "{what}: the handle is not closed: {said}"
+            );
+        }
         // Unstopped, the whole file goes.
         let whole = tmp.path().join(format!("whole-{what}"));
         let up = fs.create_from(&src, whole.to_str().unwrap(), None).unwrap();
         assert_eq!(up.size, 32 << 20, "{what}");
     }
+}
+
+/// A sound's first peaks are its first content on screen (`first`), not the answer to a place
+/// asked for: a seek waiting for its sound keeps waiting — its `ready` comes with sound, or its
+/// end with a failure or the end of playback.
+#[test]
+fn a_sound_s_first_peaks_do_not_answer_a_seek() {
+    bounded(120, |t| {
+        let Some(tools) = tools() else { return };
+        let dir = t.tmp();
+        let path = dir.path().join("m.mp3");
+        let noise = "anoisesrc=seed=5:amplitude=0.3:sample_rate=44100";
+        make(
+            &tools,
+            &["-f", "lavfi", "-i", noise, "-t", "30", "-c:a", "libmp3lame"],
+            &path,
+        );
+        let Some(source) = streamed(&path) else {
+            return;
+        };
+        let media = Media::stream(source, "m.mp3", "m.mp3").unwrap();
+        let abs = path.to_str().unwrap().to_string();
+        let mut fs = LocalFs::new();
+        let at = fs.stat(&abs).unwrap();
+        let origin = Origin::new(Box::new(fs), None, None, abs, at);
+        let mut win = MediaWindow::new(
+            media,
+            MediaFile::new(origin, &dir.path().join("cache")),
+            dir.path().join("work"),
+            Marks::default(),
+            Selection::default(),
+            Vec::new(),
+        );
+        win.sink = Sink::Null;
+        let mut drv = crate::gui::testkit::Driver::new(900.0, 460.0);
+        drv.idle(&mut win, 1);
+        // Nothing on screen yet, a seek waiting for its sound, and then the first peaks.
+        let bins = wave::bins_for(win.media.duration);
+        let first = wave::Source {
+            bin_secs: win.media.duration / bins as f64,
+            lanes: vec![vec![[-0.3, 0.3]; bins]; 2],
+            version: 1,
+            complete: false,
+            read: 3.0,
+            error: None,
+        };
+        win.wave = Some(wave::Decode::done(first));
+        win.marked = false;
+        win.asked = Some((Instant::now(), 0));
+        drv.idle(&mut win, 2);
+        assert!(win.marked, "the first peaks are the first content");
+        assert!(win.asked.is_some(), "the seek still waits for its sound");
+        drop(win);
+        none_left(dir.path()).unwrap();
+    });
+}
+
+/// A plain HTTP/1.1 GET of `url` on its own connection: its socket, with the request sent.
+fn get(url: &str) -> std::net::TcpStream {
+    use std::io::Write;
+    let rest = url.strip_prefix("http://").unwrap();
+    let (host, path) = rest.split_once('/').unwrap();
+    let mut socket = std::net::TcpStream::connect(host).unwrap();
+    write!(
+        socket,
+        "GET /{path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n"
+    )
+    .unwrap();
+    socket
+}
+
+/// Reads `socket` until `want` bytes have come, or its end: how many came.
+fn read_up_to(socket: &mut std::net::TcpStream, want: u64) -> u64 {
+    use std::io::Read;
+    let (mut got, mut buf) = (0u64, vec![0u8; 256 << 10]);
+    while got < want {
+        let n = socket.read(&mut buf).unwrap();
+        if n == 0 {
+            break;
+        }
+        got += n as u64;
+    }
+    got
+}
+
+/// The receive buffer the kernel keeps for `socket`.
+fn receive_buffer_of(socket: &std::net::TcpStream) -> u64 {
+    use std::os::fd::AsRawFd;
+    let mut size: libc::c_int = 0;
+    let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+    // SAFETY: a valid descriptor, and an int of the length given to write into.
+    unsafe {
+        libc::getsockopt(
+            socket.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_RCVBUF,
+            (&mut size as *mut libc::c_int).cast(),
+            &mut len,
+        );
+    }
+    size.max(0) as u64
+}
+
+/// 06 §7.4, V16: every connection's send buffer is bounded ([`SEND_BUFFER`]; Linux keeps twice
+/// what is asked). A 48 MB body read as fast as the client can never has it grown past that —
+/// left alone, Linux grows it to MBs. And a client that stops reading, after 8 MiB, has been
+/// sent no more than it read, what its own socket holds, the server's buffer and the block in
+/// hand.
+#[test]
+fn a_connection_is_read_ahead_of_its_client_by_one_send_buffer_at_most() {
+    bounded(120, |t| {
+        let dir = t.tmp();
+        let path = dir.path().join("big");
+        let size: u64 = 48 << 20;
+        let body: Vec<u8> = (0..size)
+            .map(|i| ((i * 2_654_435_761) >> 13) as u8)
+            .collect();
+        std::fs::write(&path, &body).unwrap();
+        let Some(source) = streamed(&path) else {
+            return;
+        };
+        let biggest = Arc::new(AtomicUsize::new(0));
+        let seen = biggest.clone();
+        let config = Config {
+            clock: Arc::new(Instant::now),
+            tick: None,
+            seams: Seams {
+                send_buffer: Some(Arc::new(move |_, size| {
+                    seen.fetch_max(size, SeqCst);
+                })),
+                ..Seams::default()
+            },
+        };
+        let server = Server::start_with(source.clone(), config).unwrap();
+        let url = server.url(Kind::Bulk, "big");
+        let bound = 2 * SEND_BUFFER;
+        let mut fast = get(&url);
+        assert!(
+            read_up_to(&mut fast, u64::MAX) > size,
+            "the whole body came"
+        );
+        drop(fast);
+        let most = biggest.load(SeqCst);
+        eprintln!("a 48 MB body read fast: the send buffer at most {most} bytes");
+        assert!(most > 0 && most <= bound, "the send buffer grew to {most}");
+        // A client that reads 8 MiB fast, then stops.
+        let before = server.sent(Kind::Bulk);
+        let mut slow = get(&url);
+        let read = read_up_to(&mut slow, 8 << 20);
+        let mut sent = server.sent(Kind::Bulk) - before;
+        loop {
+            std::thread::sleep(Duration::from_millis(300));
+            let now = server.sent(Kind::Bulk) - before;
+            if now == sent {
+                break;
+            }
+            sent = now;
+        }
+        let theirs = receive_buffer_of(&slow);
+        let ahead = sent - read;
+        eprintln!(
+            "a client that stopped after {read} bytes: sent {ahead} more (its socket holds \
+             {theirs}, the server's {bound}, a block {BLOCK})"
+        );
+        assert!(
+            ahead <= theirs + bound as u64 + BLOCK,
+            "{ahead} bytes ahead of the client"
+        );
+        drop(slow);
+        drop(server);
+        none_left(dir.path()).unwrap();
+    });
+}
+
+/// An SFTP upload whose write fails part way (here the 3rd chunk's, as a test's seam has it)
+/// has closed its remote handle by the time it returns — the log of the session's requests
+/// (`sftp-server -l INFO`) has the close, though nothing was sent since — and the error is
+/// one with the file made. Through the publishing of a sibling, the temp is removed and
+/// nothing is published.
+#[test]
+fn a_failed_upload_closes_its_handle_and_its_temp_goes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("big");
+    std::fs::write(&src, vec![7u8; 4 << 20]).unwrap();
+    let log = tmp.path().join("sftp-server.log");
+    let Some(mut fs) = SftpRemote::local_server_args(&[], Some(&log)) else {
+        return;
+    };
+    fs.fail_chunk(3);
+    let out = tmp.path().join("out");
+    std::fs::create_dir(&out).unwrap();
+    let up = out.join("up");
+    let err = fs
+        .create_from(&src, up.to_str().unwrap(), None)
+        .unwrap_err();
+    assert!(
+        format!("{:#}", err.error).contains("the write failed"),
+        "{:#}",
+        err.error
+    );
+    assert_eq!(err.created, crate::remote::Created::Yes);
+    let said = std::fs::read_to_string(&log).unwrap();
+    let closed = format!("close \"{}\"", up.display());
+    assert!(said.contains(&closed), "the handle is not closed: {said}");
+    std::fs::remove_file(&up).unwrap();
+    // Publishing a sibling: the temp it wrote goes, and nothing is named.
+    let err = fs
+        .write_new_sibling(&src, out.to_str().unwrap(), "up")
+        .unwrap_err();
+    assert!(format!("{err:#}").contains("the write failed"), "{err:#}");
+    let said = std::fs::read_to_string(&log).unwrap();
+    let temp_closed = said
+        .lines()
+        .any(|l| l.contains("close \"") && l.contains(".up.sopen-"));
+    assert!(temp_closed, "the temp's handle is not closed: {said}");
+    let left: Vec<_> = std::fs::read_dir(&out).unwrap().flatten().collect();
+    assert!(left.is_empty(), "left in the folder: {left:?}");
 }

@@ -254,7 +254,11 @@ fn render(
             length,
             &mut |f| progress(((done + f * length) / total).clamp(0.0, 1.0)),
             ffmpeg::STALL_LIMIT,
-            (to.stopped, &|| src.fed()),
+            ffmpeg::Watched {
+                stopped: to.stopped,
+                fed: &|| src.fed(),
+                now: &std::time::Instant::now,
+            },
         );
         if let Some(why) = src.cut_since(before) {
             bail!("{why}; the render was stopped");
@@ -273,9 +277,12 @@ fn render(
     Ok(())
 }
 
-/// An export's Cancel against its publishing, decided once (06 §7.4): a Cancel that comes
-/// before the publishing link is made wins — ffmpeg is killed, or the uploaded temp is removed
-/// and nothing is linked — and one that comes after it is too late: the result names the
+/// An export's Cancel against its publishing, decided once (06 §7.4). The boundary is the
+/// decision to publish, taken right before the step that gives the new name: the link of the
+/// uploaded temp, or — on a server that cannot link — the write straight into the new name,
+/// decided before that write begins. A Cancel that comes first wins: ffmpeg is killed, or the
+/// upload stops, its temp is removed and nothing is linked. One that comes after the decision
+/// is too late, even while the link or the direct write is still going: the result names the
 /// sibling.
 #[derive(Debug, Default)]
 pub struct Stop(std::sync::atomic::AtomicU8);

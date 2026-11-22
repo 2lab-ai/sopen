@@ -306,12 +306,40 @@ impl Served {
         let root = root.trim_end_matches('/');
         let token = root.rsplit('/').next().unwrap_or_default();
         out = out.replace(root, &self.shown);
-        if token.is_empty() {
-            out
-        } else {
-            out.replace(token, "…")
+        if !token.is_empty() {
+            out = out.replace(token, "…");
         }
+        // ffmpeg names the server alone where it cannot reach it: its TCP endpoint
+        // (`tcp://127.0.0.1:<port>`), or the URL's authority (`http://127.0.0.1:<port>`).
+        // This port only: an address another server has is left as it was printed.
+        let port = self.server.port();
+        for authority in [
+            format!("tcp://127.0.0.1:{port}"),
+            format!("http://127.0.0.1:{port}"),
+        ] {
+            out = replace_endpoint(&out, &authority, &self.shown);
+        }
+        out
     }
+}
+
+/// `text` with every `endpoint` that a digit does not go on from (`:5934` is not `:59340`) as
+/// `with`.
+fn replace_endpoint(text: &str, endpoint: &str, with: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find(endpoint) {
+        let after = &rest[at + endpoint.len()..];
+        out.push_str(&rest[..at]);
+        if after.starts_with(|c: char| c.is_ascii_digit()) {
+            out.push_str(endpoint);
+        } else {
+            out.push_str(with);
+        }
+        rest = after;
+    }
+    out.push_str(rest);
+    out
 }
 
 /// Starts an ffmpeg or ffprobe run. Every run on a media file goes through here or
@@ -327,6 +355,31 @@ pub fn output(cmd: &mut Command) -> std::io::Result<std::process::Output> {
     #[cfg(test)]
     spawns::note(cmd);
     cmd.output()
+}
+
+/// Test-only: how each render run ended ([`run_stoppable`]), by its arguments: ffmpeg exits 0
+/// on an input cut short (06 §7.4), and a test shows that it did.
+#[cfg(test)]
+pub mod exits {
+    use std::ffi::OsString;
+    use std::process::ExitStatus;
+    use std::sync::Mutex;
+
+    static RUNS: Mutex<Vec<(Vec<OsString>, ExitStatus)>> = Mutex::new(Vec::new());
+
+    pub fn note(args: &[OsString], status: ExitStatus) {
+        let mut runs = RUNS.lock().unwrap_or_else(|p| p.into_inner());
+        runs.push((args.to_vec(), status));
+    }
+
+    /// How the runs that named `part` in an argument (a path in a test's folder) ended.
+    pub fn naming(part: &str) -> Vec<ExitStatus> {
+        let runs = RUNS.lock().unwrap_or_else(|p| p.into_inner());
+        runs.iter()
+            .filter(|(args, _)| args.iter().any(|a| a.to_string_lossy().contains(part)))
+            .map(|(_, status)| *status)
+            .collect()
+    }
 }
 
 /// Test-only: how many ffmpeg / ffprobe runs read each file, by what they were for.
@@ -478,7 +531,17 @@ pub fn probe_within(
     shown: &str,
     limit: std::time::Duration,
 ) -> Result<Probe> {
-    use std::time::Instant;
+    probe_timed(tools, input, shown, limit, &std::time::Instant::now)
+}
+
+/// [`probe_within`] on a clock of the caller's (the tests move it).
+pub fn probe_timed(
+    tools: &Tools,
+    input: &Input,
+    shown: &str,
+    limit: std::time::Duration,
+    now: &dyn Fn() -> std::time::Instant,
+) -> Result<Probe> {
     let before = input.cuts();
     let mut cmd = probe_command(tools, input);
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
@@ -492,12 +555,12 @@ pub fn probe_within(
         json
     });
     let err = ErrorTail::spawn(child.stderr.take().expect("piped"));
-    let deadline = Instant::now() + limit;
+    let deadline = now() + limit;
     let status = loop {
         if let Some(status) = child.try_wait()? {
             break Some(status);
         }
-        if Instant::now() >= deadline {
+        if now() >= deadline {
             let _ = child.kill();
             let _ = child.wait();
             break None;
@@ -1415,10 +1478,13 @@ impl EditSpec {
         }
     }
 
-    /// The most decoded sound one input decoded through in source order holds, in bytes: the
-    /// pieces it has given whole that the output does not want yet (a piece is taken as it
-    /// comes once every piece before it in the output has been), as ffmpeg's float samples of
-    /// every track.
+    /// The most decoded sound one input decoded through in source order holds, in bytes, as
+    /// ffmpeg's float samples of every track. The decode is at source time `x`; each piece has
+    /// been given as much of itself as `x` has passed of it — two pieces over the same stretch
+    /// (one pasted after itself, or overlapping) both at once. The output takes the first piece
+    /// it has not finished as it comes; every piece after that one waits with what it has been
+    /// given. The most that waits is reached just before a piece the output is on ends, so it
+    /// is looked at there, and at every piece's start.
     pub fn held(&self) -> u64 {
         let per_s: f64 = self
             .tracks
@@ -1427,20 +1493,16 @@ impl EditSpec {
             .sum::<f64>()
             .max(1.0)
             * 4.0;
-        let mut by_start: Vec<usize> = (0..self.spans.len()).collect();
-        by_start.sort_by(|&a, &b| self.spans[a].start.total_cmp(&self.spans[b].start));
-        let mut done = vec![false; self.spans.len()];
-        let (mut next, mut peak) = (0usize, 0.0f64);
-        for i in by_start {
-            done[i] = true;
-            while next < done.len() && done[next] {
-                next += 1;
-            }
-            let held: f64 = (next..done.len())
-                .filter(|&k| done[k])
-                .map(|k| self.spans[k].len)
-                .sum();
-            peak = peak.max(held);
+        let spans = &self.spans;
+        let given = |k: usize, x: f64| (x - spans[k].start).clamp(0.0, spans[k].len.max(0.0));
+        let mut peak = 0.0f64;
+        for x in spans.iter().flat_map(|s| [s.start, s.start + s.len]) {
+            // At `x`, a piece ending exactly there is not finished yet (the moment before).
+            let Some(now) = (0..spans.len()).find(|&k| spans[k].start + spans[k].len >= x) else {
+                continue;
+            };
+            let waits: f64 = (now + 1..spans.len()).map(|k| given(k, x)).sum();
+            peak = peak.max(waits);
         }
         (peak * per_s) as u64
     }
@@ -2210,24 +2272,46 @@ pub fn run_watched(
     progress: &mut dyn FnMut(f64),
     limit: std::time::Duration,
 ) -> Result<()> {
-    run_stoppable(tools, args, length_s, progress, limit, (&|| false, &|| 0))
+    run_stoppable(tools, args, length_s, progress, limit, Watched::plain())
 }
 
-/// [`run_watched`] that is also stopped — ffmpeg killed and reaped, the error
-/// [`crate::remote::Cancelled`] — once `stopped` says so (an export's Cancel, 06 §7.4). It is
-/// asked at least every 250 ms whatever ffmpeg prints: a render blocked on its input prints
-/// nothing. `fed` says how many bytes the run's input has been sent: while it grows the run is
-/// not stalled, though its output stands still ([`Watchdog::fed`]).
+/// What a run is watched by besides its output ([`run_stoppable`]).
+#[derive(Clone, Copy)]
+pub struct Watched<'a> {
+    /// True stops the run: ffmpeg killed and reaped, the error [`crate::remote::Cancelled`]
+    /// (an export's Cancel, 06 §7.4).
+    pub stopped: &'a dyn Fn() -> bool,
+    /// How many bytes the run's input has been sent: while it grows the run is not stalled,
+    /// though its output stands still ([`Watchdog::fed`]).
+    pub fed: &'a dyn Fn() -> u64,
+    /// The time the stall rule reads (the tests move it).
+    pub now: &'a dyn Fn() -> std::time::Instant,
+}
+
+impl Watched<'static> {
+    /// Nothing stops it, no input is counted, the real clock.
+    pub fn plain() -> Self {
+        Self {
+            stopped: &|| false,
+            fed: &|| 0,
+            now: &std::time::Instant::now,
+        }
+    }
+}
+
+/// [`run_watched`] that is also stopped, fed and timed as `watched` says. Its stop is asked
+/// at least every 250 ms whatever ffmpeg prints: a render blocked on its input prints nothing.
 pub fn run_stoppable(
     tools: &Tools,
     args: &[OsString],
     length_s: f64,
     progress: &mut dyn FnMut(f64),
     limit: std::time::Duration,
-    (stopped, fed): (&dyn Fn() -> bool, &dyn Fn() -> u64),
+    watched: Watched<'_>,
 ) -> Result<()> {
+    let Watched { stopped, fed, now } = watched;
     use std::sync::mpsc::{sync_channel, RecvTimeoutError};
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
     let mut cmd = Command::new(&tools.ffmpeg);
     cmd.args([
         "-hide_banner",
@@ -2269,7 +2353,13 @@ pub fn run_stoppable(
         }
     });
     let poll = Duration::from_millis(250).min(limit);
-    let mut dog = Watchdog::new(limit, Instant::now());
+    let mut dog = Watchdog::new(limit, now());
+    // The stall rule is looked at with what the input has been sent up to that moment: bytes
+    // that went while ffmpeg was waited for count before the wait does.
+    let fed_stalled = |dog: &mut Watchdog| {
+        dog.fed(fed(), now());
+        dog.stalled(now())
+    };
     let stall = |child: &mut std::process::Child, dog: &Watchdog| {
         let _ = child.kill();
         let _ = child.wait();
@@ -2284,10 +2374,10 @@ pub fn run_stoppable(
         if stopped() {
             return Err(stop(&mut child));
         }
-        dog.fed(fed(), Instant::now());
+        dog.fed(fed(), now());
         match rx.recv_timeout(poll) {
             Ok(Ok(line)) => {
-                dog.line(&line, Instant::now());
+                dog.line(&line, now());
                 if let Some(us) = line.strip_prefix("out_time_us=") {
                     if let Ok(us) = us.trim().parse::<f64>() {
                         if length_s > 0.0 {
@@ -2297,10 +2387,10 @@ pub fn run_stoppable(
                 } else if line == "progress=end" {
                     progress(1.0);
                 }
-                dog.resume(Instant::now());
+                dog.resume(now());
                 // Stuck, ffmpeg 7+ still prints a block every half second: checked here too,
                 // not only when nothing comes.
-                if dog.stalled(Instant::now()) {
+                if fed_stalled(&mut dog) {
                     return Err(stall(&mut child, &dog));
                 }
             }
@@ -2310,7 +2400,7 @@ pub fn run_stoppable(
                 return Err(e).context("reading ffmpeg's progress");
             }
             Err(RecvTimeoutError::Timeout) => {
-                if dog.stalled(Instant::now()) {
+                if fed_stalled(&mut dog) {
                     return Err(stall(&mut child, &dog));
                 }
             }
@@ -2325,12 +2415,13 @@ pub fn run_stoppable(
         if stopped() {
             return Err(stop(&mut child));
         }
-        dog.fed(fed(), Instant::now());
-        if dog.stalled(Instant::now()) {
+        if fed_stalled(&mut dog) {
             return Err(stall(&mut child, &dog));
         }
         std::thread::sleep(Duration::from_millis(20));
     };
+    #[cfg(test)]
+    exits::note(args, status);
     let errors = errors.join().unwrap_or_default();
     if !status.success() {
         bail!("ffmpeg failed ({status}): {}", errors.last_line());

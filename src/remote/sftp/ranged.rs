@@ -414,6 +414,8 @@ impl Ranged for SftpRanged {
                 writes: session.writes,
                 #[cfg(test)]
                 stats: session.stats,
+                #[cfg(test)]
+                fail_chunk: None,
             }),
             Ok(None) | Err(_) => Box::new(Lost(lost)),
         }

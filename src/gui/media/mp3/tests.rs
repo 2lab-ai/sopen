@@ -52,7 +52,14 @@ fn ffmpeg_is_cbr(tools: &Tools, path: &Path) -> bool {
         .args(["-t", "0.1", "-f", "null", "-"])
         .output()
         .unwrap();
-    !String::from_utf8_lossy(&out.stderr).contains("may be imprecise")
+    let said = String::from_utf8_lossy(&out.stderr);
+    // An answer only from a seek that worked.
+    assert!(
+        out.status.success(),
+        "ffmpeg's seek in {}: {said}",
+        path.display()
+    );
+    !said.contains("may be imprecise")
 }
 
 fn sopen_says(path: &Path) -> bool {
@@ -171,15 +178,12 @@ fn reference_fixtures_agree_with_ffmpeg() {
     assert!(sopen_says(&info) && !sopen_says(&fixtures[1].1));
 }
 
-#[test]
-fn fallback_fixtures_seek_exactly() {
-    let Some(tools) = tools_or_skip() else { return };
-    let tmp = tempfile::tempdir().unwrap();
-    let dir = tmp.path();
-    let info = encode(&tools, dir, "info.mp3", &["-b:a", "128k"]);
+/// The fallback fixtures, and an `Info` frame cut short before or after its marker, each built
+/// from one Info file.
+fn fallback_cases(tools: &Tools, dir: &Path) -> (PathBuf, Vec<(&'static str, Vec<u8>)>) {
+    let info = encode(tools, dir, "info.mp3", &["-b:a", "128k"]);
     let bytes = std::fs::read(&info).unwrap();
     let at = first_frame(&bytes);
-    assert!(sopen_says(&info), "the base file is Info");
     let mut cases: Vec<(&str, Vec<u8>)> = Vec::new();
     let mut bad = bytes.clone();
     bad[7] |= 0x80;
@@ -191,9 +195,55 @@ fn fallback_fixtures_seek_exactly() {
     junk.extend([0u8; 100]);
     junk.extend(&bytes[at..]);
     cases.push(("junk before the first frame", junk));
-    cases.push(("a file cut inside the frame", bytes[..at + 20].to_vec()));
+    // MPEG-1 stereo: the marker is 4 + 32 bytes in, its 4 bytes after.
+    cases.push(("a file cut before the marker", bytes[..at + 20].to_vec()));
+    cases.push((
+        "a file cut right after the marker",
+        bytes[..at + 40].to_vec(),
+    ));
+    cases.push(("a file cut later in the frame", bytes[..at + 200].to_vec()));
+    (info, cases)
+}
+
+/// What sopen reads of the fallback fixtures: none of them is an `Info` file.
+#[test]
+fn fallback_fixtures_are_not_read_as_info() {
+    let Some(tools) = tools_or_skip() else { return };
+    let tmp = tempfile::tempdir().unwrap();
+    let (info, cases) = fallback_cases(&tools, tmp.path());
+    assert!(sopen_says(&info), "the base file is Info");
     for (what, case) in cases {
-        let path = write(dir, "case.mp3", &case);
+        let path = write(tmp.path(), "case.mp3", &case);
         assert!(!sopen_says(&path), "{what}: an exact seek");
+    }
+}
+
+/// The fallback fixtures seek exactly: read through a stream on the local `sftp-server` as a
+/// window opens one (`seeks_fast`, which `Media::stream` takes), their `play` input has no
+/// `+fastseek` — the Info file they are made from does.
+#[test]
+fn fallback_fixtures_seek_exactly() {
+    use crate::ffmpeg::Served;
+    use crate::remote::{RemoteFs, SftpRemote};
+    use crate::stream::http::{Kind, Server};
+    use crate::stream::Source;
+    let Some(tools) = tools_or_skip() else { return };
+    let tmp = tempfile::tempdir().unwrap();
+    let (info, mut cases) = fallback_cases(&tools, tmp.path());
+    cases.insert(0, ("the Info file", std::fs::read(&info).unwrap()));
+    for (k, (what, case)) in cases.into_iter().enumerate() {
+        let path = write(tmp.path(), &format!("case-{k}.mp3"), &case);
+        let Some(fs) = SftpRemote::local_server() else {
+            return;
+        };
+        let transport = Box::new(fs).into_ranged(path.to_str().unwrap()).unwrap();
+        let no_reopen: crate::stream::Reopen = Box::new(|| anyhow::bail!("no second connection"));
+        let source = Source::open(transport, no_reopen, std::sync::Arc::new(|| {})).unwrap();
+        let fast = crate::gui::media::seeks_fast(&source, "case.mp3");
+        let server = Server::start(source.clone()).unwrap();
+        let served = Served::new(server, source, "case.mp3", "case.mp3", fast);
+        let options = served.input(Kind::Play).options().to_vec();
+        let fastseek = options.iter().any(|o| o == "+fastseek");
+        assert_eq!(fastseek, k == 0, "{what}: {options:?}");
     }
 }

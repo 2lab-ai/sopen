@@ -13,7 +13,7 @@ use super::child::{Ending, Slot};
 use super::timeline::{Clip, Timeline};
 use crate::ffmpeg::{Input, Tools};
 use crate::stream::http::Kind;
-use std::io::{BufReader, Read};
+use std::io::Read;
 use std::process::{Command, Stdio};
 #[cfg(test)]
 use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
@@ -81,8 +81,9 @@ pub fn bins_for(duration: f64) -> usize {
 }
 
 /// Reads `input` (interleaved f32le, `lanes` channels at [`RATE`]) into peaks, handing the
-/// peaks so far to `publish` every 1/[`HANDOVERS`] of the expected samples (by count, not by
-/// time). Returns the peaks at the end of its input, or the read error that stopped it (the
+/// peaks so far to `publish` every 1/[`HANDOVERS`] of the expected samples, and after any read
+/// that ends [`HANDOVER_EVERY`] or more after the last hand-over with samples it has not handed
+/// over (a slow stream gives few samples a read). Returns the peaks at the end of its input, or the read error that stopped it (the
 /// end of input is not an error; a sample cut short at it is dropped). Nothing it publishes
 /// is complete: whether the decode ended well is the caller's to say ([`start`]).
 pub fn read_peaks(
@@ -119,7 +120,6 @@ pub fn read_onto(
         }
         version = before.version;
     }
-    let mut reader = BufReader::with_capacity(64 * 1024, input);
     let step = (expected * lanes / HANDOVERS).max(1);
     let per_bin = peaks[0].per_bin;
     let mut snapshot = |peaks: &[Peaks]| {
@@ -133,22 +133,38 @@ pub fn read_onto(
             error: None,
         }
     };
-    let mut b4 = [0u8; 4];
-    let (mut c, mut n) = (0, 0usize);
+    // What one read of the decoder's output gives, and a sample it cut in two.
+    let mut buf = vec![0u8; 64 * 1024];
+    let (mut part, mut have) = ([0u8; 4], 0usize);
+    let (mut c, mut n, mut handed_n) = (0, 0usize, 0usize);
     let mut handed = std::time::Instant::now();
     loop {
-        match reader.read_exact(&mut b4) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+        let got = match input.read(&mut buf) {
+            Ok(0) => break,
+            Ok(got) => got,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(e) => return Err(e),
+        };
+        for &byte in &buf[..got] {
+            part[have] = byte;
+            have += 1;
+            if have < 4 {
+                continue;
+            }
+            have = 0;
+            peaks[c].push(f32::from_le_bytes(part));
+            c = (c + 1) % lanes;
+            n += 1;
+            if n % step == 0 {
+                publish(snapshot(&peaks));
+                (handed, handed_n) = (std::time::Instant::now(), n);
+            }
         }
-        peaks[c].push(f32::from_le_bytes(b4));
-        c = (c + 1) % lanes;
-        n += 1;
-        // The clock is looked at every 4096 samples only.
-        if n % step == 0 || (n % 4096 == 0 && handed.elapsed() >= HANDOVER_EVERY) {
+        // After every read, however little it gave: a slow stream fills by the time — with
+        // something new only.
+        if n > handed_n && handed.elapsed() >= HANDOVER_EVERY {
             publish(snapshot(&peaks));
-            handed = std::time::Instant::now();
+            (handed, handed_n) = (std::time::Instant::now(), n);
         }
     }
     Ok(snapshot(&peaks))
@@ -678,6 +694,45 @@ mod tests {
         assert!(
             handed[0] < done.read,
             "{handed:?} before the end at {}",
+            done.read
+        );
+    }
+
+    /// A slow stream that gives a few samples a read — 400, every 120 ms, far fewer than any
+    /// count step or 4096 — is still handed over as it fills: at several distinct moments, each
+    /// later than the one before, each reaching further, none of them complete.
+    #[test]
+    fn a_trickle_of_samples_is_handed_over_as_it_comes() {
+        struct Trickle(usize);
+        impl Read for Trickle {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                if self.0 == 0 {
+                    return Ok(0);
+                }
+                self.0 -= 1;
+                std::thread::sleep(std::time::Duration::from_millis(120));
+                let n = buf.len().min(400 * 4);
+                buf[..n].fill(0);
+                Ok(n)
+            }
+        }
+        let started = std::time::Instant::now();
+        let mut handed: Vec<(std::time::Duration, f64, bool)> = Vec::new();
+        let done = read_peaks(&mut Trickle(12), 1, 3600.0, &mut |s| {
+            handed.push((started.elapsed(), s.read, s.complete))
+        })
+        .unwrap();
+        assert!(handed.len() >= 3, "handed over as it came: {handed:?}");
+        assert!(handed.iter().all(|h| !h.2 && h.1 > 0.0), "{handed:?}");
+        assert!(
+            handed
+                .windows(2)
+                .all(|w| w[0].0 < w[1].0 && w[0].1 < w[1].1),
+            "later and further each time: {handed:?}"
+        );
+        assert!(
+            handed.last().unwrap().1 <= done.read,
+            "{handed:?} {}",
             done.read
         );
     }

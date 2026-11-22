@@ -1240,3 +1240,45 @@ fn an_mp3_edit_takes_its_pieces_from_one_input_while_what_it_holds_is_bounded() 
     };
     assert_eq!(one.groups_from(&mp3), one.groups());
 }
+
+/// A piece pasted right after itself, or two pieces over the same stretch, are decoded from one
+/// input at once: the later one waits whole while the earlier one plays. [`EditSpec::held`]
+/// counts that wait, so such an edit shares one input only below [`HOLD_MAX`].
+#[test]
+fn repeated_or_overlapping_mp3_pieces_share_one_input_only_below_the_bound() {
+    let stereo = vec![track(2, 44_100, "fltp")];
+    let mp3 = Input::path(Path::new("/c/s.mp3"));
+    let spec = |ranges: &[(f64, f64)]| EditSpec {
+        spans: ranges.iter().map(|&(a, b)| span(0, a, b - a)).collect(),
+        fps: None,
+        ..edit(Vec::new(), stereo.clone())
+    };
+    let per_s = 44_100 * 2 * 4;
+    // Pasted after itself: the copy waits whole.
+    let repeated = spec(&[(0.0, 600.0), (0.0, 600.0)]);
+    assert_eq!(repeated.held(), 600 * per_s);
+    assert!(repeated.held() > HOLD_MAX);
+    assert_eq!(
+        repeated.groups_from(&mp3),
+        repeated.groups(),
+        "past the bound: an input each"
+    );
+    assert_eq!(repeated.groups().len(), 2);
+    let short = spec(&[(0.0, 60.0), (0.0, 60.0)]);
+    assert_eq!(short.held(), 60 * per_s);
+    assert_eq!(
+        short.groups_from(&mp3),
+        vec![vec![0, 1]],
+        "below it: one input"
+    );
+    // Overlapping by 600 s: what the second has been given by the first's end waits.
+    let overlap = spec(&[(0.0, 800.0), (200.0, 1000.0)]);
+    assert_eq!(overlap.held(), 600 * per_s);
+    assert_eq!(overlap.groups_from(&mp3).len(), 2);
+    let small = spec(&[(0.0, 100.0), (50.0, 150.0)]);
+    assert_eq!(small.held(), 50 * per_s);
+    assert_eq!(small.groups_from(&mp3), vec![vec![0, 1]]);
+    // The order the output takes them in decides: the later stretch first holds the earlier.
+    let swapped = spec(&[(50.0, 150.0), (0.0, 100.0)]);
+    assert_eq!(swapped.held(), 100 * per_s);
+}

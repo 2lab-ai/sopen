@@ -18,7 +18,8 @@ use std::sync::atomic::AtomicBool;
 /// - **The first frame** must start right after the tags (ffmpeg resyncs over junk; this does
 ///   not): an 11-bit sync, layer III, a valid bitrate and sample-rate index. Its tag is read
 ///   4 + 32 bytes in (MPEG-1 stereo), 4 + 17 (MPEG-1 mono, MPEG-2 and 2.5 stereo) or 4 + 9
-///   (MPEG-2 and 2.5 mono), with no adjustment for a CRC, as ffmpeg reads it.
+///   (MPEG-2 and 2.5 mono), with no adjustment for a CRC, as ffmpeg reads it — and only if the
+///   whole frame, by its header's bitrate, rate and padding, is in the file.
 ///
 /// A read that fails or a file that ends first is `false`.
 pub fn info_tag(file: &mut dyn Bytes) -> bool {
@@ -51,10 +52,44 @@ pub fn info_tag(file: &mut dyn Bytes) -> bool {
         };
         off += 10 + size + footer;
     };
-    let Some(side) = side_info(&head[..4]) else {
+    let Some((side, len)) = frame(&head[..4]) else {
         return false;
     };
-    read(off + 4 + side, 4).is_some_and(|tag| tag == b"Info")
+    // The tag is believed only in a whole frame: a file that ends inside it is cut short.
+    read(off + len - 1, 1).is_some() && read(off + 4 + side, 4).is_some_and(|tag| tag == b"Info")
+}
+
+/// Kbit/s by bitrate index, layer III: MPEG-1, then MPEG-2 and 2.5.
+const BITRATES: [[u64; 15]; 2] = [
+    [
+        0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320,
+    ],
+    [0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160],
+];
+/// Hz by sample-rate index: MPEG-1, MPEG-2, MPEG-2.5.
+const RATES: [[u64; 3]; 3] = [
+    [44_100, 48_000, 32_000],
+    [22_050, 24_000, 16_000],
+    [11_025, 12_000, 8_000],
+];
+
+/// Of a valid MPEG audio layer III frame header: the side information's length, which is where
+/// its Xing / Info tag starts after the 4 header bytes, and the whole frame's length in bytes;
+/// `None` for anything else.
+fn frame(h: &[u8]) -> Option<(u64, u64)> {
+    let side = side_info(h)?;
+    let version = (h[1] >> 3) & 3;
+    let mpeg1 = version == 3;
+    let kbps = BITRATES[usize::from(!mpeg1)][usize::from(h[2] >> 4)];
+    let rate = RATES[match version {
+        3 => 0,
+        2 => 1,
+        _ => 2,
+    }][usize::from((h[2] >> 2) & 3)];
+    let padding = u64::from((h[2] >> 1) & 1);
+    // 1152 samples a frame for MPEG-1, 576 for MPEG-2 and 2.5: 144 or 72 bytes per kbit/s.
+    let per = if mpeg1 { 144_000 } else { 72_000 };
+    Some((side, per * kbps / rate + padding))
 }
 
 /// The side information's length of a valid MPEG audio layer III frame header, which is where

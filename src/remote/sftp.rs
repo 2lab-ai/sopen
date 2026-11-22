@@ -60,6 +60,9 @@ pub struct SftpRemote {
     /// Stat requests sopen sent (tests: a listing must not stat every name).
     #[cfg(test)]
     stats: u64,
+    /// Tests: the chunk of an upload (counted from 1) whose write fails.
+    #[cfg(test)]
+    fail_chunk: Option<usize>,
 }
 
 /// How long a failed start waits for the sftp subsystem to exit, to say how it ended.
@@ -320,6 +323,8 @@ impl SftpRemote {
             writes,
             #[cfg(test)]
             stats: 0,
+            #[cfg(test)]
+            fail_chunk: None,
         })
     }
 
@@ -403,6 +408,8 @@ impl SftpRemote {
         let mut src = std::fs::File::open(local)
             .with_context(|| format!("cannot open {}", local.display()))
             .map_err(not_created)?;
+        #[cfg(test)]
+        let fail_at = self.fail_chunk;
         let (rt, sftp, _) = self.parts();
         rt.block_on(async {
             let opened = within(
@@ -425,6 +432,7 @@ impl SftpRemote {
             };
             // From here `path` is ours.
             let fill = async {
+                let mut out = Hashing::new(std::io::sink());
                 // Handle-based metadata updates on the open file, never by path: the owner, then
                 // the permission bits without set-id bits before the content, then the full mode
                 // restored after the content, so set-id bits are applied last.
@@ -445,17 +453,25 @@ impl SftpRemote {
                         .map_err(|e| anyhow!("cannot set mode on {path}: {e}"))?;
                 }
                 // write_all splits at the server's write limit.
-                let mut out = Hashing::new(std::io::sink());
                 let mut buf = vec![0u8; CHUNK];
+                #[cfg(test)]
+                let mut chunk = 0;
                 loop {
                     if stop() {
-                        return Err(anyhow!(super::Cancelled));
+                        return Ok(None);
                     }
                     let n = src
                         .read(&mut buf)
                         .with_context(|| format!("cannot read {}", local.display()))?;
                     if n == 0 {
                         break;
+                    }
+                    #[cfg(test)]
+                    {
+                        chunk += 1;
+                        if fail_at == Some(chunk) {
+                            bail!("cannot write {path}: the write failed (a test's)");
+                        }
                     }
                     within(STALL_TIMEOUT, file.write_all(&buf[..n]))
                         .await
@@ -475,13 +491,22 @@ impl SftpRemote {
                         .map_err(|()| timed_out(&format!("fsync {path}"), STALL_TIMEOUT))?
                         .map_err(|e| anyhow!("cannot fsync {path}: {e}"))?;
                 }
-                within(META_TIMEOUT, file.close())
-                    .await
-                    .map_err(|()| timed_out(&format!("close {path}"), META_TIMEOUT))?
-                    .map_err(|e| anyhow!("cannot close {path}: {e}"))?;
-                Ok(out.finish())
+                Ok(Some(out))
             };
-            fill.await.map_err(|e| CreateError::new(Created::Yes, e))
+            let filled = fill.await;
+            // The handle is closed whatever came of the content — a stop and a failure too, not
+            // only a whole upload — and its answer waited for, bounded. A dropped handle's close
+            // is sent but not waited for, and a failure of it is never seen (the client crate's
+            // `OwnedHandle` drop).
+            let closed = within(META_TIMEOUT, file.close())
+                .await
+                .map_err(|()| timed_out(&format!("close {path}"), META_TIMEOUT))
+                .and_then(|got| got.map_err(|e| anyhow!("cannot close {path}: {e}")));
+            let ours = |e| CreateError::new(Created::Yes, e);
+            match filled.map_err(ours)? {
+                None => Err(ours(anyhow!(super::Cancelled))),
+                Some(out) => closed.map(|()| out.finish()).map_err(ours),
+            }
         })
     }
 }
@@ -1266,6 +1291,11 @@ impl SftpRemote {
     /// [`SftpRemote::local_server`] with `args` for the server (`-P copy-data` to refuse a
     /// request) and, with `log`, its log (`-e -l INFO`: one line per request, as OpenSSH words
     /// it) written to that file — the request log 04 §8 checks for `posix-rename`.
+    /// Tests: the `chunk`th write of every upload from now on fails (counted from 1).
+    pub(crate) fn fail_chunk(&mut self, chunk: usize) {
+        self.fail_chunk = Some(chunk);
+    }
+
     pub(crate) fn local_server_args(args: &[&str], log: Option<&Path>) -> Option<Self> {
         Self::local_server_run(None, args, log)
     }
@@ -1358,6 +1388,7 @@ impl SftpRemote {
             fs: Some(fs),
             writes,
             stats: 0,
+            fail_chunk: None,
         })
     }
 
@@ -1641,6 +1672,7 @@ mod tests {
             fs: Some(fs),
             writes,
             stats: 0,
+            fail_chunk: None,
         };
         assert!(session.stat("/").unwrap().is_dir, "a working session");
         assert!(!ended(), "listening while the session lives");
