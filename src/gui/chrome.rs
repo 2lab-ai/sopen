@@ -124,9 +124,10 @@ pub const EXIT_KEY: FKey = FKey {
 };
 
 /// F7 in the hex, image and media windows: Save As, the same as Alt+Cmd/Ctrl+S — the edited
-/// result to a new local file (07 §7, `gui::save_as`). No row lists it yet: each of those
-/// windows adds it to its row, with its help line, in the change that wires the modal (ED4–ED6),
-/// so a slot never names a key that does nothing. The text viewer is read-only and has none.
+/// result to a new local file (07 §7, `gui::save_as`). The image window's row lists it
+/// ([`IMAGE_KEYS`]); the hex and media windows add it to theirs, with the help line, in the
+/// change that wires the modal (ED4, ED6), so a slot never names a key that does nothing. The
+/// text viewer is read-only and has none.
 pub const SAVE_AS_KEY: FKey = FKey {
     n: 7,
     label: "SaveAs",
@@ -149,11 +150,15 @@ pub const HEX_KEYS: &[FKey] = &[
     },
 ];
 
-/// The image window's own key: F5 is Save, the same as Cmd/Ctrl+S (as in the hex window).
-pub const IMAGE_KEYS: &[FKey] = &[FKey {
-    n: 5,
-    label: "Save",
-}];
+/// The image window's own keys: F5 is Save, the same as Cmd/Ctrl+S (as in the hex window); F7
+/// is Save As, as Alt+Cmd/Ctrl+S.
+pub const IMAGE_KEYS: &[FKey] = &[
+    FKey {
+        n: 5,
+        label: "Save",
+    },
+    SAVE_AS_KEY,
+];
 
 /// The media window's own key: F5 is Save, as in the image and hex windows (message 13 made
 /// video and audio savable).

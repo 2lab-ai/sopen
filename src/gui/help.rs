@@ -141,6 +141,7 @@ fn describe(key: FKey) -> String {
         (3, "Exit") => format!("Close the window (as {cmd}+W)"),
         (5, "Save") => format!("Save (as {cmd}+S)"),
         (6, "Goto") => format!("Go to an offset (as {cmd}+G)"),
+        (7, "SaveAs") => format!("Save As: a new local file with your edits (as Alt+{cmd}+S)"),
         (8, "Asc/hx") => "Type in the ASCII or the hex column (as Tab)".to_string(),
         (2, "Unwrap") => "One row per line (as W)".to_string(),
         (2, "Wrap") => "Wrap the lines at the window's width (as W)".to_string(),
@@ -444,6 +445,10 @@ mod tests {
                 Line {
                     keys: "F5".into(),
                     what: format!("Save (as {cmd}+S)")
+                },
+                Line {
+                    keys: "F7".into(),
+                    what: format!("Save As: a new local file with your edits (as Alt+{cmd}+S)")
                 },
                 aliases(),
             ]

@@ -1729,12 +1729,79 @@ fn a_good_listing_clears_an_earlier_listing_error() {
     assert!(!said.error && fx.b.status.text.is_empty(), "{}", said.text);
 }
 
-/// X1: a running save is never cut off. The upload is held at a gate; Esc and closing the window
-/// both leave the image (it says it closes when the save is done); once the save lands the
-/// viewer goes — and the window with it, as the last thing asked was closing it — and the file
-/// holds the saved edit, its original backed up.
+/// X1: leaving never cuts a running save off; Esc is 07 §10's Stop. The upload is held at a gate.
+/// Esc during it stops the save up to its rename: the viewer stays and says so, the file is as
+/// before the save and its backup holds the original. A close asked for during a held upload
+/// waits — the window says it closes when the save is done — and the window closes once the
+/// save has landed, the file holding the edit.
 #[test]
 fn a_running_save_is_not_cut_off() {
+    let walk = |dir: &std::path::Path| -> Vec<std::path::PathBuf> {
+        let mut out = Vec::new();
+        let mut todo = vec![dir.to_path_buf()];
+        while let Some(d) = todo.pop() {
+            for e in std::fs::read_dir(&d).into_iter().flatten().flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    todo.push(p);
+                } else {
+                    out.push(p);
+                }
+            }
+        }
+        out
+    };
+    // Esc: stopped, the viewer stays.
+    let gate = Gate::default();
+    let mut fx = fixture_with(None, gated(&gate, "create_from"), None);
+    let photo = format!("{}/photo.png", fx.root);
+    let original = std::fs::read(&photo).unwrap();
+    fx.open("photo.png");
+    edit_image(&mut fx);
+    fx.drv
+        .key(&mut fx.b, Key::S, crate::gui::testkit::command(false));
+    gate.reached();
+    fx.key(Key::Escape);
+    gate.release();
+    let stopped = "stopped: nothing was written; the original is untouched";
+    for _ in 0..200 {
+        let said = fx
+            .drv
+            .texts()
+            .iter()
+            .any(|(_, _, t)| t.starts_with(stopped));
+        if said {
+            break;
+        }
+        fx.drv.idle(&mut fx.b, 1);
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(
+        fx.drv
+            .texts()
+            .iter()
+            .any(|(_, _, t)| t.starts_with(stopped)),
+        "it says it was stopped"
+    );
+    assert!(fx.b.viewer.is_some(), "Esc during the save left the image");
+    assert!(!fx.drv.closed());
+    assert_eq!(
+        std::fs::read(&photo).unwrap(),
+        original,
+        "the file as before"
+    );
+    let backups = walk(&fx.cache.join(".backup"));
+    assert_eq!(backups.len(), 1, "{backups:?}");
+    assert_eq!(std::fs::read(&backups[0]).unwrap(), original);
+    let dir = std::path::Path::new(&photo).parent().unwrap();
+    let temps: Vec<_> = std::fs::read_dir(dir)
+        .unwrap()
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().contains(".sopen-"))
+        .collect();
+    assert!(temps.is_empty(), "the temp removed");
+
+    // A close during the save: it waits, then closes once the save has landed.
     let gate = Gate::default();
     let mut fx = fixture_with(None, gated(&gate, "create_from"), None);
     fx.open("photo.png");
@@ -1742,19 +1809,17 @@ fn a_running_save_is_not_cut_off() {
     fx.drv
         .key(&mut fx.b, Key::S, crate::gui::testkit::command(false));
     gate.reached();
-    fx.key(Key::Escape);
-    assert!(fx.b.viewer.is_some(), "Esc during the save left the image");
+    assert!(
+        !Window::close_requested(&mut fx.b),
+        "closing the window waits"
+    );
+    fx.drv.idle(&mut fx.b, 2);
     assert!(
         fx.drv
             .find_text("the window closes when the save is done")
             .is_some(),
         "it says why it stays"
     );
-    assert!(
-        !Window::close_requested(&mut fx.b),
-        "closing the window waits too"
-    );
-    fx.drv.idle(&mut fx.b, 1);
     assert!(fx.b.viewer.is_some() && !fx.drv.closed());
     gate.release();
     fx.drv.until(&mut fx.b, 10, |b| b.viewer.is_none());
