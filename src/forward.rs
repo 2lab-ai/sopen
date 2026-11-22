@@ -17,7 +17,7 @@ use std::process::{Command, ExitStatus};
 /// Receipt hooks (AGENTS.md "Receipts") a forwarded run carries to HOST. Settings that name local
 /// paths — `SOPEN_CODE`, `SOPEN_ZED`, `SOPEN_FFMPEG`, `SOPEN_FFPROBE`, `SOPEN_CACHE_DIR`, `SOPEN_STATE_DIR`,
 /// `SOPEN_CONFIG` — mean nothing on HOST and stay here.
-pub const FORWARDED_ENV: [&str; 17] = [
+pub const FORWARDED_ENV: [&str; 19] = [
     "SOPEN_STATE",
     "SOPEN_SCREENSHOT",
     "SOPEN_WATCHDOG",
@@ -30,6 +30,9 @@ pub const FORWARDED_ENV: [&str; 17] = [
     "SOPEN_CHOICE",
     "SOPEN_SAVE_TO",
     "SOPEN_SAVE_HOLD_MS",
+    // 07 §7: the hex window's Save As, where the window is.
+    "SOPEN_SAVE_AS",
+    "SOPEN_SAVE_AS_HOLD_MS",
     "SOPEN_LIST",
     "SOPEN_LOG",
     "SOPEN_TARGET_BIN",
@@ -632,6 +635,16 @@ mod tests {
         // 06 §11: a `--target` run carries the stream's hooks to HOST as it carries the others.
         assert!(env.contains(&"SOPEN_STREAM_STATS=v-SOPEN_STREAM_STATS".to_string()));
         assert!(env.contains(&"SOPEN_STREAM_THROTTLE=v-SOPEN_STREAM_THROTTLE".to_string()));
+        // 07 §7: the hex window's Save As hooks travel as "Save to…"'s do — the window, and the
+        // folder it saves into, are on HOST.
+        for key in [
+            "SOPEN_SAVE_TO",
+            "SOPEN_SAVE_HOLD_MS",
+            "SOPEN_SAVE_AS",
+            "SOPEN_SAVE_AS_HOLD_MS",
+        ] {
+            assert!(env.contains(&format!("{key}=v-{key}")), "{key}");
+        }
         for local in [
             "SOPEN_CODE",
             "VSCODE_EXTENSIONS",

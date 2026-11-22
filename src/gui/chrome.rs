@@ -134,7 +134,8 @@ pub const SAVE_AS_KEY: FKey = FKey {
 };
 
 /// The hex window's own keys — PC Shell's Sector Edit row (`5Save`, `8Asc/hx`) with File Edit's
-/// `6` for going somewhere: F5 is Cmd/Ctrl+S, F6 is Cmd/Ctrl+G, F8 is Tab (the typing column).
+/// `6` for going somewhere: F5 is Cmd/Ctrl+S, F6 is Cmd/Ctrl+G, F7 is Save As (Alt+Cmd/Ctrl+S,
+/// 07 §7), F8 is Tab (the typing column).
 pub const HEX_KEYS: &[FKey] = &[
     FKey {
         n: 5,
@@ -144,6 +145,7 @@ pub const HEX_KEYS: &[FKey] = &[
         n: 6,
         label: "Goto",
     },
+    SAVE_AS_KEY,
     FKey {
         n: 8,
         label: "Asc/hx",

@@ -414,7 +414,16 @@ mod tests {
         let keys: Vec<&str> = page.lines.iter().map(|l| l.keys.as_str()).collect();
         assert_eq!(
             keys,
-            ["F1", "F3, Esc", "F4", "F5", "F6", "F8", &aliases().keys]
+            [
+                "F1",
+                "F3, Esc",
+                "F4",
+                "F5",
+                "F6",
+                "F7",
+                "F8",
+                &aliases().keys
+            ]
         );
         let cmd = keys::command_name();
         assert_eq!(
@@ -422,6 +431,10 @@ mod tests {
             format!("Save (as {cmd}+S)")
         );
         assert_eq!(line(&page, "F3, Esc").unwrap().what, "Back to the list");
+        assert_eq!(
+            line(&page, "F7").unwrap().what,
+            format!("Save As: a new local file with your edits (as Alt+{cmd}+S)")
+        );
     }
 
     /// A window of its own lists its row: Help, Exit (as Cmd/Ctrl+W) and its own keys.

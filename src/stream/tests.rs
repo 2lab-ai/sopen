@@ -3277,3 +3277,19 @@ fn v7_a_rename_over_is_replaced_on_the_local_server() {
     assert!(matches!(r.try_read(at, 480), Poll::Ready(Ok(b)) if b[..] == body[from..from + 480]));
     assert_eq!(source.state(), State::Replaced);
 }
+
+/// What the viewer is getting from the remote (07 §7's expected time, §4.1's cost): the
+/// admission's own measure, `None` until a read has come back.
+#[test]
+fn the_rate_is_the_admissions_measure() {
+    let mut rig = rig(MODEL, Link::gate());
+    assert_eq!(rig.source().rate(), None, "nothing came yet");
+    let mut bulk = rig.reader(ReaderKind::Bulk);
+    for mib in 0..4 {
+        rig.stream(&mut bulk, mib * MIB, (mib + 1) * MIB, BLOCK as usize);
+    }
+    let rate = rig.source().rate().expect("measured");
+    assert_eq!(Some(rate), rig.source().core().pf.adm.rate());
+    // The gate link: 5 MB/s behind 20 ms.
+    assert!((2e6..=5.5e6).contains(&rate), "{rate}");
+}

@@ -450,6 +450,24 @@ pub(crate) fn undo_fails_at(stage: Option<UndoStage>) {
     UNDO_FAILS.with(|f| f.set(stage));
 }
 
+/// Tests: every undo-file publication's write — the file written and its bytes — on any thread
+/// (a test sums the ones under its own folder: tests run side by side).
+#[cfg(test)]
+pub(crate) static UNDO_WRITES: std::sync::Mutex<Vec<(PathBuf, u64)>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Tests: the bytes undo-file publications wrote under `dir`, every one counted.
+#[cfg(test)]
+pub(crate) fn undo_bytes_under(dir: &Path) -> u64 {
+    UNDO_WRITES
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .iter()
+        .filter(|(path, _)| path.starts_with(dir))
+        .map(|(_, n)| n)
+        .sum()
+}
+
 fn undo_stage(stage: UndoStage) -> std::io::Result<()> {
     #[cfg(test)]
     if UNDO_FAILS.with(|f| f.get()) == Some(stage) {
@@ -601,6 +619,11 @@ impl UndoFile {
                 .mode(0o600)
                 .open(&tmp)?;
             file.write_all(text.as_bytes())?;
+            #[cfg(test)]
+            UNDO_WRITES
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .push((tmp.clone(), text.len() as u64));
             undo_stage(UndoStage::Sync)?;
             file.sync_all()?;
             undo_stage(UndoStage::Rename)?;

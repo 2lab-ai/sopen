@@ -248,6 +248,10 @@ impl RemoteFs for MeteredFs {
     fn remove(&mut self, p: &str) -> anyhow::Result<()> {
         self.fs().remove(p)
     }
+    /// A hex Save's requests by handle (07 §4) go to the session itself: none is a whole read.
+    fn patcher(&mut self) -> Option<&mut dyn crate::remote::patch::PatchFs> {
+        self.fs().patcher()
+    }
     /// The session becomes a stream's transport (06 §2), metered below the `Source`.
     fn into_ranged(mut self: Box<Self>, path: &str) -> Result<Box<dyn Ranged>, Refused> {
         let meter = self.meter.clone();

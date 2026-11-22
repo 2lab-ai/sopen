@@ -1284,6 +1284,340 @@ fn shortened_runs_are_longer_than_any_whole_run_and_tell_runs_apart() {
     );
 }
 
+/// The patterns of the Makefile grammar the highlighter parses with ([`parsing`]) that walk
+/// balanced parentheses (their source has the comment `level 0`).
+fn makefile_paren_patterns() -> Vec<String> {
+    let makefile = syntaxes().find_syntax_by_name("Makefile").unwrap();
+    paren_patterns_of(parsing(makefile).0)
+}
+
+/// The Makefile grammar's patterns in `set` that walk balanced parentheses.
+fn paren_patterns_of(set: &SyntaxSet) -> Vec<String> {
+    use syntect::parsing::syntax_definition::Pattern;
+    let set = set.clone().into_builder();
+    let grammar = set
+        .syntaxes()
+        .iter()
+        .find(|s| s.name == "Makefile")
+        .unwrap();
+    let mut found = Vec::new();
+    for context in grammar.contexts.values() {
+        for pattern in &context.patterns {
+            if let Pattern::Match(m) = pattern {
+                if m.regex.regex_str().contains("#       level 0") {
+                    found.push(m.regex.regex_str().to_string());
+                }
+            }
+        }
+    }
+    found
+}
+
+/// Lines of real Makefiles: variables of every flavour, rules, pattern and double-colon rules,
+/// target-specific variables, recipes, conditionals, `$(…)` and `${…}` nested 1–6 deep, and
+/// unbalanced parentheses.
+fn makefile_lines() -> Vec<String> {
+    let mut lines: Vec<String> = [
+        "# Project build",
+        ".DEFAULT_GOAL := all",
+        "CC ?= cc",
+        "CFLAGS = -O2 -Wall -Wextra -pedantic -std=c11",
+        "CFLAGS += -g -fsanitize=address,undefined -DNDEBUG",
+        "LDFLAGS ::= -lm -lpthread",
+        "VERSION != git describe --tags --always",
+        "BUILDDIR := build/$(MODE)",
+        "OBJS_1 := $(patsubst $(SRCDIR)/%.c,$(BUILDDIR)/%.o,$(SRCS_1))",
+        "DEPS_1 := $(OBJS_1:.o=.d)",
+        "SRCS := $(foreach m,$(MODULES),$(wildcard $(SRCDIR)/$(m)/*.c))",
+        "OBJS := $(sort $(patsubst %.c,%.o,$(filter-out $(SRCDIR)/test/%,$(SRCS))))",
+        "objects := $(patsubst %.c,%.o,$(wildcard src/*.c src/**/*.c)) $(EXTRA_OBJECTS) $(MORE)",
+        "mix := ${A} $(B) ${C $(D)} $$(shell date)",
+        "unbal1 := $(foo",
+        "unbal2 := foo)",
+        "unbal3 := $(a $(b) c",
+        "weird)name: dep",
+        "rule $(a $(b: c",
+        "x := (a:b) = c",
+        "ifeq ($(MODE),debug)",
+        "else ifeq ($(origin CC),default)",
+        "endif",
+        "define compile_rule",
+        "$(BUILDDIR)/$(1)/%.o: $(SRCDIR)/$(1)/%.c | $(BUILDDIR)/$(1)",
+        "\t$(Q)$(CC) $(CFLAGS) -MMD -MP -c $$< -o $$@",
+        "endef",
+        "$(foreach m,$(MODULES),$(eval $(call compile_rule,$(m))))",
+        ".PHONY: all clean install test check dist",
+        "$(BUILDDIR)/mod1/%.o: $(SRCDIR)/mod1/%.c | $(BUILDDIR)/mod1",
+        "\t@mkdir -p $(dir $@)",
+        "\t@echo \"  CC      $(notdir $<) -> $(notdir $@)\"",
+        "%.o: %.c",
+        "\t$(CC) $(CFLAGS) -c $< -o $@",
+        "install:: all",
+        "test: CFLAGS += -DTEST",
+        "\t@for t in $(TESTS); do \\",
+        "\t  ./$$t || exit 1; \\",
+        "\tdone",
+        "\t@if [ -n \"$$(git status --porcelain)\" ]; then echo dirty; fi",
+        "dist: VERSION := $(shell git describe)",
+        "-include $(DEPS_0) $(DEPS_1) $(DEPS_2)",
+        "export PATH := $(PWD)/bin:$(PATH)",
+        "print-%: ; @echo $* = $($*)",
+        "target7: dep7.o $(OBJS_7) | $(BUILDDIR)",
+        "\techo building the project now please wait while everything compiles fine",
+    ]
+    .iter()
+    .map(|l| l.to_string())
+    .collect();
+    let mut nested = String::from("x");
+    for depth in 1..=6 {
+        nested = format!("$(f{depth} {nested},y)");
+        for form in [
+            "v := {}",
+            "{}: dep",
+            "dep: {}",
+            "\techo {}",
+            "{} = 1",
+            "a: v := {}",
+        ] {
+            lines.push(form.replace("{}", &nested));
+        }
+        lines.push(format!("v := {}", &nested[..nested.len() - 1]));
+        lines.push(format!("{nested}) := 1"));
+    }
+    lines
+}
+
+/// Makefile's grammar looks ahead on every line for a rule or a variable through balanced
+/// parentheses written out four levels deep; as bundled, two runs of characters with nothing
+/// between them may share a stretch every way there is (`[^()]*`, an optional group skipped,
+/// `[^()]*`), so a line costs a power of its length: an ordinary 73-character recipe line 720,000
+/// backtracking steps, 100 `x`s past fancy-regex's limit of 1,000,000 (an error: no match). As the
+/// highlighter parses it, every line of a real Makefile is searched within 50,000 steps (at most
+/// 36,297 here), and lines of 100 to 300 characters with no parentheses within that limit (the
+/// lookaheads still try every start: at most 604,225). The limits are set on the engine syntect
+/// runs the grammars on: a search past one is an error.
+#[test]
+fn makefile_lines_are_searched_within_a_small_backtrack_budget() {
+    let patterns = makefile_paren_patterns();
+    assert_eq!(patterns.len(), 2, "the rule and the variable lookaheads");
+    let mut long = Vec::new();
+    for n in [100, 200, 300] {
+        long.push("x".repeat(n));
+        long.push(format!("all: {}", "obj.o ".repeat(n / 6)));
+        long.push(format!("\t{}", "x ".repeat(n / 2)));
+    }
+    for pattern in &patterns {
+        for (lines, budget) in [(makefile_lines(), 50_000), (long.clone(), 1_000_000)] {
+            let regex = fancy_regex::RegexBuilder::new(pattern)
+                .oniguruma_mode(true)
+                .backtrack_limit(budget)
+                .build()
+                .unwrap();
+            for line in &lines {
+                assert!(
+                    regex.captures_from_pos(line, 0).is_ok(),
+                    "over {budget} steps: {line:.60}"
+                );
+            }
+        }
+    }
+    // The control: as bundled, each lookahead goes past 50,000 steps on an ordinary recipe line
+    // (720,000 and 76,000), and the search ends in the backtrack limit's error.
+    let recipe = "\techo building the project now please wait while everything compiles fine";
+    let bundled = paren_patterns_of(syntaxes());
+    assert_eq!(bundled.len(), 2);
+    for pattern in &bundled {
+        let regex = fancy_regex::RegexBuilder::new(pattern)
+            .oniguruma_mode(true)
+            .backtrack_limit(50_000)
+            .build()
+            .unwrap();
+        assert!(
+            matches!(
+                regex.captures_from_pos(recipe, 0),
+                Err(fancy_regex::Error::RuntimeError(
+                    fancy_regex::RuntimeError::BacktrackLimitExceeded
+                ))
+            ),
+            "the bundled lookahead stays within 50,000 steps"
+        );
+    }
+}
+
+/// Makefile's lookaheads rewritten keep what they mean ([`balanced_once`]): every line of a real
+/// Makefile — variables of every flavour, rules, recipes, conditionals, `$(…)` nested 1–6 deep,
+/// unbalanced parentheses — has the colours the bundled grammar gives it, the lines parsed in
+/// order as one file, ended by LF and by CRLF. All but one: on
+/// `objects := $(patsubst %.c,%.o,$(wildcard …)) …` the bundled grammar's variable lookahead
+/// goes past fancy-regex's backtrack limit and is taken for no match, so the line is not read as
+/// a variable's and its value is not coloured as one (`.c` in `$(patsubst %.c,…)` plain);
+/// rewritten, it is, as on `OBJS := $(sort $(patsubst %.c,…))`, a line the bundled grammar gets
+/// through. (Counted with a syntect that counts its search errors: over these lines the
+/// bundled grammar errs 5 times, on 3 lines, the rewritten never; this is the one whose colours
+/// it changed.)
+#[test]
+fn makefile_lines_keep_the_bundled_grammars_colours() {
+    let lines = makefile_lines();
+    let gave_up = "objects := $(patsubst %.c,%.o,$(wildcard src/*.c src/**/*.c)) $(EXTRA_OBJECTS) \
+                   $(MORE)";
+    let others: Vec<String> = lines.iter().filter(|l| *l != gave_up).cloned().collect();
+    assert_eq!(others.len(), lines.len() - 1);
+    // The bundled grammar's colours once (slow: what this rewrite is for), the viewer's twice.
+    let bundled = whole_line_colours("mk", &others);
+    for end in ["\n", "\r\n"] {
+        let got = highlighted("mk", &others, end);
+        assert_eq!(got.len(), bundled.len(), "its lines");
+        for (i, (got, want)) in got.iter().zip(&bundled).enumerate() {
+            assert_eq!(got.len(), want.len(), "line {i}: its characters");
+            if let Some(at) = (0..got.len()).find(|&k| got[k] != want[k]) {
+                panic!(
+                    "line {i} {:?}, character {at}: {:?}, bundled {:?}",
+                    others[i], got[at], want[at]
+                );
+            }
+        }
+    }
+    let pair = [
+        "OBJS := $(sort $(patsubst %.c,%.o,$(filter-out $(SRCDIR)/test/%,$(SRCS))))".to_string(),
+        gave_up.to_string(),
+    ];
+    let got = highlighted("mk", &pair, "\n");
+    let bundled = whole_line_colours("mk", &pair);
+    // The `.` of the first `.c`: a value's text.
+    let dot = |line: &str| line.chars().position(|c| c == '.').unwrap();
+    let (in_objs, in_objects) = (dot(&pair[0]), dot(&pair[1]));
+    let value = bundled[0][in_objs].1;
+    assert_eq!(got[0][in_objs].1, value, "as bundled on the `OBJS` line");
+    assert_eq!(got[1][in_objects].1, value, "a value on the `objects` line");
+    assert_ne!(
+        bundled[1][in_objects].1, value,
+        "the bundled grammar gave up on the `objects` line"
+    );
+    assert!(got[1].iter().map(|&(c, _)| c).eq(pair[1].chars()));
+}
+
+/// The scope stack at each character of each line, and at its end, the lines parsed in order
+/// as one file with `set`'s Makefile grammar.
+fn makefile_scopes(
+    set: &SyntaxSet,
+    lines: &[String],
+) -> Vec<(
+    Vec<Vec<syntect::parsing::Scope>>,
+    Vec<syntect::parsing::Scope>,
+)> {
+    let grammar = set.find_syntax_by_name("Makefile").unwrap();
+    let mut parse = ParseState::new(grammar);
+    let mut stack = ScopeStack::new();
+    lines
+        .iter()
+        .map(|line| {
+            let ops = parse.parse_line(line, set).unwrap();
+            let mut next = 0;
+            let mut at_chars = Vec::new();
+            for (at, _) in line.char_indices() {
+                while next < ops.len() && ops[next].0 <= at {
+                    stack.apply(&ops[next].1).unwrap();
+                    next += 1;
+                }
+                at_chars.push(stack.as_slice().to_vec());
+            }
+            for (_, op) in &ops[next..] {
+                stack.apply(op).unwrap();
+            }
+            (at_chars, stack.as_slice().to_vec())
+        })
+        .collect()
+}
+
+/// Beneath the colours, the scopes: every character of every line of a real Makefile but the
+/// `objects` one (the bundled grammar gives up on it; above) is in the same scopes, the rewritten
+/// grammar against the bundled one, and each line ends with the same stack, the lines parsed in
+/// order as one file.
+#[test]
+fn makefile_lines_keep_the_bundled_grammars_scopes() {
+    let others: Vec<String> = makefile_lines()
+        .into_iter()
+        .filter(|l| !l.starts_with("objects := "))
+        .collect();
+    let bundled = makefile_scopes(syntaxes(), &others);
+    let rewritten = makefile_scopes(makefile_syntaxes().expect("rewritten"), &others);
+    assert_eq!(bundled.len(), rewritten.len());
+    for (i, (want, got)) in bundled.iter().zip(&rewritten).enumerate() {
+        assert_eq!(got.0.len(), want.0.len(), "line {i}: its characters");
+        if let Some(at) = (0..got.0.len()).find(|&k| got.0[k] != want.0[k]) {
+            panic!(
+                "line {i} {:?}, character {at}: {:?}, bundled {:?}",
+                others[i], got.0[at], want.0[at]
+            );
+        }
+        assert_eq!(
+            got.1, want.1,
+            "line {i} {:?}: the stack it ends with",
+            others[i]
+        );
+    }
+}
+
+/// The rewrite is of the bundled Makefile grammar's two lookaheads, exactly: in the set a
+/// Makefile is parsed with — taken on the highlighting worker, never when a viewer makes its
+/// highlighter on a frame — both are the rewritten text, and no group closed is followed by a run
+/// outside it. Every other syntax is parsed with the bundled set. A grammar whose lookahead is
+/// not the bundled text — here one space more, which `(?x)` ignores — is left as it is.
+#[test]
+fn the_makefile_lookaheads_are_rewritten_only_when_they_are_the_bundled_ones() {
+    use syntect::parsing::syntax_definition::Pattern;
+    let makefile = syntaxes().find_syntax_by_name("Makefile").unwrap();
+    // A viewer's highlighter takes its syntaxes on its worker, at its first page: a frame that
+    // makes it does not ask for the rewritten set (counted on this thread), the first page does.
+    let asked = || MAKEFILE_SYNTAXES_ASKED.with(|n| n.get());
+    let before = asked();
+    let mut hl = Highlight::new(makefile, Color32::WHITE, u64::MAX).unwrap();
+    assert_eq!(asked(), before, "a frame asked for the rewritten set");
+    assert!(hl.set.is_none() && hl.states.is_empty());
+    let tmp = tempfile::tempdir().unwrap();
+    let path = write(tmp.path(), "Makefile", b"all: dep\n\t$(CC) -o $@ $^\n");
+    let mut doc = TextDoc::open(&path).unwrap();
+    hl.page(&mut doc, 0, 2, &|| false).unwrap().unwrap();
+    assert_eq!(asked(), before + 1, "the first page asks once");
+    hl.page(&mut doc, 0, 2, &|| false).unwrap().unwrap();
+    assert_eq!(asked(), before + 1, "and the next pages do not");
+    assert!(std::ptr::eq(hl.set.unwrap(), makefile_syntaxes().unwrap()));
+    let (set, _) = parsing(makefile);
+    assert!(std::ptr::eq(set, makefile_syntaxes().expect("rewritten")));
+    let patterns = makefile_paren_patterns();
+    let mut hashes: Vec<u64> = patterns.iter().map(|p| fnv1a(p.as_bytes())).collect();
+    hashes.sort();
+    assert_eq!(hashes, [0x5daf_d94e_51a7_e64c, 0xda7d_2adc_b711_d0ce]);
+    for pattern in &patterns {
+        let lines: Vec<&str> = pattern.lines().map(str::trim_start).collect();
+        assert!(!lines
+            .windows(2)
+            .any(|w| w[0].starts_with("\\))?") && w[1].starts_with("[^()]*")));
+    }
+    let rust = syntaxes().find_syntax_by_extension("rs").unwrap();
+    assert!(std::ptr::eq(parsing(rust).0, syntaxes()));
+    // One space more in the rule's lookahead: not the bundled text.
+    let bundled = syntaxes().clone().into_builder();
+    let mut changed = syntect::parsing::SyntaxSetBuilder::new();
+    for syntax in bundled.syntaxes() {
+        let mut syntax = syntax.clone();
+        if syntax.name == "Makefile" {
+            for context in syntax.contexts.values_mut() {
+                for pattern in &mut context.patterns {
+                    if let Pattern::Match(m) = pattern {
+                        if m.regex.regex_str().starts_with("(?=(?x)") {
+                            let spaced = format!("{} ", m.regex.regex_str());
+                            m.regex = syntect::parsing::Regex::new(spaced);
+                        }
+                    }
+                }
+            }
+        }
+        changed.add(syntax);
+    }
+    assert!(with_makefile_rewritten(changed.build()).is_none());
+}
+
 /// T3: the file changes under the viewer (it reads it live, a page at a time): grown,
 /// truncated, rewritten in place — any difference is a change (grown or rewritten no shorter:
 /// `Grown`, re-read soon; truncated: `Changed`). Reads never panic.
