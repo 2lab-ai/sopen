@@ -635,7 +635,7 @@ fn the_next_free_name_of_a_longest_name_still_fits() {
     let long = format!("{}.bin", "n".repeat(251));
     let taken = tmp.path().join(&long);
     std::fs::write(&taken, b"mine").unwrap();
-    let next = next_free(&taken);
+    let next = next_free(&taken).unwrap();
     let name = next.file_name().unwrap().to_string_lossy().into_owned();
     assert!(name.len() <= 255, "{} bytes: {name}", name.len());
     assert!(name.ends_with("-1.bin"), "{name}");
@@ -650,7 +650,7 @@ fn the_next_free_name_of_a_longest_name_still_fits() {
     assert_eq!(wide.len(), 255);
     let taken = tmp.path().join(&wide);
     std::fs::write(&taken, b"mine").unwrap();
-    let next = next_free(&taken);
+    let next = next_free(&taken).unwrap();
     let name = next.file_name().unwrap().to_str().unwrap().to_string();
     assert_eq!(name, format!("{}-1", "한".repeat(84)));
     std::fs::write(&next, b"").unwrap();
@@ -2310,18 +2310,24 @@ fn the_next_free_name_counts_on_in_its_series() {
         std::fs::write(at(name), b"").unwrap();
     }
     assert_eq!(
-        next_free(&at("model.edited-1.bin")),
+        next_free(&at("model.edited-1.bin")).unwrap(),
         at("model.edited-2.bin")
     );
-    assert_eq!(next_free(&at("model.edited.bin")), at("model.edited-2.bin"));
+    assert_eq!(
+        next_free(&at("model.edited.bin")).unwrap(),
+        at("model.edited-2.bin")
+    );
     std::fs::write(at("model.edited-3.bin"), b"").unwrap();
     assert_eq!(
-        next_free(&at("model.edited-3.bin")),
+        next_free(&at("model.edited-3.bin")).unwrap(),
         at("model.edited-2.bin")
     );
     // A number of the name's own.
     std::fs::write(at("report-2024.pdf"), b"").unwrap();
-    assert_eq!(next_free(&at("report-2024.pdf")), at("report-2024-1.pdf"));
+    assert_eq!(
+        next_free(&at("report-2024.pdf")).unwrap(),
+        at("report-2024-1.pdf")
+    );
     // Save As's refusal of a name taken meanwhile (the field held `-1`).
     let (path, _) = suggest(at("model.edited.bin"));
     assert_eq!(path, at("model.edited-2.bin"));
@@ -2330,6 +2336,22 @@ fn the_next_free_name_counts_on_in_its_series() {
         Err(e) => panic!("{e}"),
         Ok(_) => panic!("saved over a taken name"),
     }
+    // Every name up to the limit taken: an error, never a name nobody looked at.
+    let full = |name: &str| std::fs::write(at(name), b"").unwrap();
+    full("a.bin");
+    full("a-1.bin");
+    full("a-2.bin");
+    let e = next_free_within(&at("a.bin"), 2).unwrap_err();
+    assert_eq!(
+        format!("{e:#}"),
+        format!(
+            "every name from a-1.bin to a-2.bin is taken in {}",
+            tilde(tmp.path())
+        )
+    );
+    assert_eq!(next_free_within(&at("a.bin"), 3).unwrap(), at("a-3.bin"));
+    // From inside the series too (the input's own name is one it looks at, and it is taken).
+    assert!(next_free_within(&at("a-2.bin"), 2).is_err());
 }
 
 #[test]
@@ -2337,11 +2359,11 @@ fn names_paths_and_kinds() {
     let tmp = tempfile::tempdir().unwrap();
     let a = tmp.path().join("a.tar.gz");
     std::fs::write(&a, b"").unwrap();
-    assert_eq!(next_free(&a), tmp.path().join("a.tar-1.gz"));
+    assert_eq!(next_free(&a).unwrap(), tmp.path().join("a.tar-1.gz"));
     std::fs::write(tmp.path().join("a.tar-1.gz"), b"").unwrap();
-    assert_eq!(next_free(&a), tmp.path().join("a.tar-2.gz"));
+    assert_eq!(next_free(&a).unwrap(), tmp.path().join("a.tar-2.gz"));
     assert_eq!(
-        next_free(&tmp.path().join("README")),
+        next_free(&tmp.path().join("README")).unwrap(),
         tmp.path().join("README-1")
     );
     // The default path: itself when free; else the next free name, said.

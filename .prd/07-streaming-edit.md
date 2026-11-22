@@ -143,7 +143,10 @@ starting (ssh, ffmpeg) holds a copy of every open descriptor from its fork until
 lock of a journal this process has just let go can look taken for that moment. The viewers' open
 path does the retrying (ED4–ED6); `orphans` itself tries once. The hex window lists them at its
 first pass as a viewer, in the background — never as a browser preview, which must not hold
-another session's journals — and tries a taken lock again every 50 ms for up to 500 ms. Its
+another session's journals — and tries a taken lock again every 50 ms for up to 500 ms. It waits
+only for this file's own journals: a folder named exactly `<file>.journal-<UTC stamp>-<8 hex>`
+whose generation, when it can be read, is of this host and path — not another file's whose name
+starts the same, one being removed, or one written for another path that maps to the same place. Its
 `Origin` connects for the listing only when there is a journal to check (reconcile, Restore's
 reads): that is its first use (06 §2). Each one gets a row:
 
@@ -176,13 +179,15 @@ byte.
     the current open's fingerprint, its `seen` pages are taken again, and a later Save runs every
     check of §4 against that baseline.
 - **Restore in a window that has edits of its own** is refused (`undo or save them first`): one
-  window keeps one journal.
+  window keeps one journal. The row stays, its journal untouched; once the window's own edits
+  are undone or saved, Restore goes ahead.
 - **Restored bytes land as their pages arrive** (over a stream, as a typed byte needs its page).
   Until all are in, the journal Restore took over is left exactly as it is — no generation holds a
   part of them, closing asks, and a window that goes anyway leaves it for the next open — and no
   Save starts. The status row says `putting back N bytes…`, then `restored N bytes`.
 - **A journal that holds no edit** (its edits undone before the end) is removed when it is listed:
-  there is nothing to offer.
+  there is nothing to offer — unless it still holds a question about an interrupted save's file
+  (§3.1): then its row says `an interrupted save's record is kept at <journal>` and asks it.
 - **Later** leaves the journal for the next open.
 - **Discard** removes it.
 - A journal of **another kind** (the same file opened as hex earlier, now as an image) is named in
@@ -260,6 +265,17 @@ offered:
   The row's Restore and Discard wait for the answer, since both would end the record. (A temp of
   uncertain ownership beside a Save that *landed* has no record to keep the question: it is asked
   on that open only.)
+  - **The same in a live window.** A Save of this session cut off that way is reconciled by the
+    next Save's start: nothing is sent, the record stays, and the window asks the question in
+    its own row with Remove it and Keep it. Save waits for the answer. A window closed with the
+    question open keeps the record for the next open — without the edits, when they were
+    discarded or nothing is unsaved; one closed while an answer is on its way waits for it
+    first.
+- **Not landed, with a temp provably the Save's that cannot be removed** (the server refuses the
+  removal): the record stays too, and the same question is asked — `the interrupted save's
+  temporary file <host>:<path> could not be removed (<why>) — remove it?`. Remove it tries again
+  (a failure keeps the question); Keep it ends the record. The next open, or the next Save, first
+  tries the removal again by itself, since the temp is provably the Save's.
 
 **Owning a temp.** Only the exclusive create's reply proves that sopen made a temp: `SSH_FXP_HANDLE`.
 - An exclusive create on a name that already exists gets `SSH_FX_FAILURE` and leaves that file
@@ -589,7 +605,10 @@ size rule. Image and media upload their output, as today.
   one is taken (`binary::suggest`, `binary::next_free`). A name already in a counted series —
   `<stem>-N<ext>` beside its `<stem><ext>` — counts on in that series: `model.edited-1.bin` taken
   gives `model.edited-2.bin`, never `model.edited-1-1.bin`; a number of the name's own
-  (`report-2024.pdf`, nothing at `report.pdf`) stays. A Save copy's sibling names start from
+  (`report-2024.pdf`, nothing at `report.pdf`) stays. It looks at `-1` to `-9999`; with every one
+  of them taken it suggests nothing (the field keeps the name, and says `every name from
+  model.edited-1.bin to model.edited-9999.bin is taken in <folder>`), and a Save to a taken name
+  there is refused with those words. A Save copy's sibling names start from
   `<stem>.edited<ext>` the same way (`remote::candidate`). A folder typed in the field gets that
   name inside it. Browse… opens the system's save dialog (`binary::NativeChooser`). It shows the size and
   the time expected at the rate the viewer is getting: `24.0 GB — about 1 h 50 min at 3.6 MB/s`. A
@@ -704,6 +723,14 @@ size rule. Image and media upload their output, as today.
     edited can still change; Restore or Load as edits stops there and says how many bytes were not
     put in). A Save that lands makes room: what it wrote is the file's, and the evidence of
     offsets nothing names any more is let go.
+  - Undo and redo hold it too. A step that would add an offset past the bound is refused with
+    the same line and stays on its stack; nothing is lost. A byte put back to what the file holds
+    there, with its page in memory, is no entry at all, so undoing an edit frees its slot. Where
+    the page is not in memory (dropped from a stream's cache), the entry stays: it is what shows
+    that byte without reading the file again.
+  - What the edits keep beside the entries — each edited offset's original byte, each edited
+    page's evidence — goes once nothing names its offset any more (no entry, no undo or redo
+    step): it stays within twice what the entries and steps name.
 - **Local disk.** A hex Save of a remote file writes only the journal and the undo file, in
   proportion to the edit, never to the file: at most 16 KiB + 16 bytes per changed byte + 128 bytes
   per edited 4 KiB page (two generations at a time). For E1's 4-byte edit that is under
@@ -744,6 +771,11 @@ progress at or past 30 % for that long, so `SOPEN_SCREENSHOT` shows it under way
     journal is gone once nothing is unsaved.
 - **E2. The view keeps working during a save.** While E1 copies, scroll the grid. Every read is
   answered within RTT + 250 ms.
+  - The unit test holds the copy and requires each uncached read to complete while it is held,
+    on both servers (a handshake; no clock but a deadlock watchdog). The time is the live run's:
+    `live_e2_reads_while_a_real_save_copies` (ignored; `SOPEN_TEST_SFTP_HOST=<alias>
+    SOPEN_TEST_SFTP_FILE=<abs path of a file above 256 MiB>`, `--ignored --nocapture`) saves for
+    real and prints each far read's time, frames included.
 - **E3. Changed since open.** Change the remote's mtime, then Save.
   - It is refused at the first `lstat`, and nothing is created on the remote.
   - The edits stay in the window, and the journal path is named.

@@ -134,6 +134,9 @@ pub struct Checking {
     /// Passes begun (tests).
     #[cfg(test)]
     pub(crate) runs: AtomicU64,
+    /// Callers waiting for a pass another thread runs (tests: the wait's boundary).
+    #[cfg(test)]
+    pub(crate) waiters: AtomicU64,
 }
 
 #[derive(Default)]
@@ -166,6 +169,8 @@ impl Checking {
                     return Ok(pass.clone());
                 }
                 PassState::Running => {
+                    #[cfg(test)]
+                    self.waiters.fetch_add(1, Ordering::SeqCst);
                     state = self
                         .ended
                         .wait_timeout(state, Duration::from_millis(100))
@@ -373,6 +378,12 @@ pub struct HexFile {
     /// The copy's pace (tests: [`patch::Pace::timed`]'s rule at small sizes).
     #[cfg(test)]
     pub(crate) pace: Option<Box<patch::Pace>>,
+    /// The rate a streamed Save says its cost at, instead of the stream's (tests: an exact
+    /// line).
+    #[cfg(test)]
+    pub(crate) rate: Option<f64>,
+    /// Where the journals are written (tests: a disk that counts what is written).
+    pub(super) journal_fs: Arc<dyn journal::Fs>,
 }
 
 /// Result of one Save.
@@ -490,6 +501,9 @@ impl HexFile {
             step_hook: None,
             #[cfg(test)]
             pace: None,
+            #[cfg(test)]
+            rate: None,
+            journal_fs: journal::disk(),
         }
     }
 
@@ -523,6 +537,9 @@ impl HexFile {
             step_hook: None,
             #[cfg(test)]
             pace: None,
+            #[cfg(test)]
+            rate: None,
+            journal_fs: journal::disk(),
         }
     }
 
@@ -1006,11 +1023,13 @@ pub(super) struct Request {
     pub session: u64,
 }
 
-/// Where a streamed Save is (the status row) and its cancel (Esc).
+/// Where a streamed Save is (the status row), its cancel (Esc), and whether it has kept the
+/// edits at its start in the journal (the window's `kept` line says so only then).
 #[derive(Default)]
 pub(super) struct Saving {
     pub progress: Mutex<Option<Progress>>,
     pub cancel: AtomicBool,
+    pub kept: AtomicBool,
 }
 
 /// How a streamed Save ended when it did not fail.
@@ -1041,6 +1060,10 @@ pub(super) enum Streamed {
         line: String,
         next: Option<(Fingerprint, journal::Seen)>,
     },
+    /// A Save of this session that was cut off did not land, and left a file at its temp path
+    /// that sopen cannot prove its own (§3.1): nothing was written; the record stays, holding
+    /// the question, until the owner answers it — Remove it or Keep it.
+    Ask(LeftTemp),
 }
 
 /// The connection a streamed Save runs on: the `Origin`, connected now if it was not (06 §2).
@@ -1092,29 +1115,48 @@ impl HexFile {
         // Save — a refused session included — they are in the journal.
         let mut slot = slot.lock().unwrap_or_else(|p| p.into_inner());
         if slot.is_none() {
-            let made = Journal::create(journal::disk(), &cache, &host, &abs, Kind::Hex)
+            let made = Journal::create(self.journal_fs.clone(), &cache, &host, &abs, Kind::Hex)
                 .with_context(|| {
                     format!("{shown} was not touched: the edits could not be kept in a journal")
                 })?;
             *slot = Some(made);
         }
         let journal = slot.as_mut().expect("made above");
-        if journal.pending_save().is_none() {
-            journal.publish(&snap).with_context(|| {
-                format!("{shown} was not touched: the edits could not be kept in a journal")
-            })?;
-        }
+        // A cut-off Save's record stays beside it (its generation is kept until reconciled).
+        journal.publish(&snap).with_context(|| {
+            format!("{shown} was not touched: the edits could not be kept in a journal")
+        })?;
+        saving.kept.store(true, Ordering::SeqCst);
         let fs = connect(&mut self.origin, &mut self.connected)?;
         if let Some(intent) = journal.pending_save().cloned() {
             let found = journal::reconcile(&intent, &host, &mut patch::Fresh::new(fs));
             match found.outcome {
-                journal::Outcome::NotLanded => {
-                    if let journal::Temp::Remove(temp) = &found.temp {
-                        fs.remove(temp)
-                            .with_context(|| format!("{shown} was not touched: {}", found.line))?;
+                // A temp of uncertain ownership: the record keeps the question (as on open).
+                journal::Outcome::NotLanded => match &found.temp {
+                    journal::Temp::Keep { path, why } => {
+                        return Ok(Streamed::Ask(LeftTemp {
+                            path: path.clone(),
+                            line: format!("{why} — remove it?"),
+                        }));
                     }
-                    journal.clear_save()?;
-                }
+                    temp => {
+                        // Provably this Save's: removed now. A removal that fails keeps the
+                        // record, and the question is asked — Remove it tries again, Keep it
+                        // ends it (as on open).
+                        if let journal::Temp::Remove(temp) = temp {
+                            if let Err(e) = fs.remove(temp) {
+                                return Ok(Streamed::Ask(LeftTemp {
+                                    path: temp.clone(),
+                                    line: format!(
+                                        "the interrupted save's temporary file {host}:{temp} \
+                                         could not be removed ({e:#}) — remove it?"
+                                    ),
+                                }));
+                            }
+                        }
+                        journal.clear_save()?;
+                    }
+                },
                 journal::Outcome::Landed => {
                     journal.clear_save()?;
                     return Ok(Streamed::FoundLanded {
@@ -1151,6 +1193,11 @@ impl HexFile {
             runs: &runs,
             pass: pass.as_ref(),
             rate: source.rate(),
+        };
+        #[cfg(test)]
+        let job = patch::Job {
+            rate: self.rate.or(job.rate),
+            ..job
         };
         let mut report = |p: Progress| {
             *saving.progress.lock().unwrap_or_else(|e| e.into_inner()) = Some(p);
@@ -1245,6 +1292,31 @@ impl HexFile {
     pub(super) fn remove_left(&mut self, path: &str) -> Result<()> {
         let fs = connect(&mut self.origin, &mut self.connected)?;
         fs.remove(path)
+    }
+
+    /// The owner's answer to a live session's question about a temp (`Streamed::Ask`): `remove`
+    /// removes it first (a failure keeps the question); either way the record that held the
+    /// question then ends, and the next Save goes ahead.
+    pub(super) fn answer_left(
+        &mut self,
+        left: &LeftTemp,
+        remove: bool,
+        slot: &Mutex<Option<Journal>>,
+    ) -> Result<String> {
+        let shown = self.origin.show(&left.path);
+        if remove {
+            self.remove_left(&left.path)
+                .with_context(|| format!("{shown} was not removed"))?;
+        }
+        let mut slot = slot.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(journal) = slot.as_mut().filter(|j| j.pending_save().is_some()) {
+            journal.clear_save()?;
+        }
+        Ok(if remove {
+            format!("removed {shown}")
+        } else {
+            format!("kept {shown}; it will not be asked about again")
+        })
     }
 
     /// The window's baseline as opened: the stream's fingerprint, or the local base's.
@@ -1349,6 +1421,9 @@ pub(super) struct HexProducer {
     /// past 30 %, and says so in `held`.
     pub hold: Option<Duration>,
     pub held: Option<Arc<AtomicBool>>,
+    /// Tests: the hold lasts until this is set (or the save is cancelled) instead of `hold`.
+    #[cfg(test)]
+    pub release: Option<Arc<AtomicBool>>,
     read: Option<Read>,
 }
 
@@ -1366,6 +1441,8 @@ impl HexProducer {
             baseline,
             hold: None,
             held: None,
+            #[cfg(test)]
+            release: None,
             read: None,
         }
     }
@@ -1432,6 +1509,8 @@ impl super::super::save_as::Producer for HexProducer {
         let whole = size <= HASH_CHECK_MAX;
         let hold = self.hold;
         let held_flag = self.held.clone();
+        #[cfg(test)]
+        let release = self.release.clone();
         let mut held = false;
         let mut through = Through::new(&self.changes, whole);
         let mut write = |at: u64, chunk: &[u8]| -> Result<()> {
@@ -1447,8 +1526,15 @@ impl super::super::save_as::Producer for HexProducer {
                     flag.store(true, Ordering::SeqCst);
                 }
                 let until = std::time::Instant::now() + hold;
-                while std::time::Instant::now() < until && !ctl.cancelled() {
-                    std::thread::sleep(Duration::from_millis(20));
+                let due = || {
+                    #[cfg(test)]
+                    if let Some(release) = &release {
+                        return release.load(Ordering::SeqCst);
+                    }
+                    std::time::Instant::now() >= until
+                };
+                while !due() && !ctl.cancelled() {
+                    std::thread::sleep(Duration::from_millis(5));
                 }
             }
             Ok(())
@@ -1591,6 +1677,7 @@ pub(super) enum Row {
 /// removal is offered, never done unasked. The question lives in the journal's `save` record,
 /// which stays until it is answered — Remove it, or Keep it — so Later asks it again on the
 /// next open; Restore and Discard of that journal wait for the answer.
+#[derive(Debug, Clone)]
 pub(super) struct LeftTemp {
     pub path: String,
     pub line: String,
@@ -1611,23 +1698,53 @@ fn bytes_word(n: usize) -> String {
     }
 }
 
-/// The journal folders of `abs` on `host`, live or not (tombstones aside): how many a listing
-/// should find once no other session holds one.
-fn journal_dirs(cache: &Path, host: &str, abs: &str) -> usize {
+/// `<file>.journal-<UTC stamp>-<8 hex>` exactly, as `Journal::create` names one.
+fn journal_name(entry: &str, file: &str) -> bool {
+    let Some(id) = entry
+        .strip_prefix(file)
+        .and_then(|rest| rest.strip_prefix(".journal-"))
+    else {
+        return false;
+    };
+    let b = id.as_bytes();
+    b.len() == 25
+        && b[..8].iter().all(u8::is_ascii_digit)
+        && b[8] == b'T'
+        && b[9..15].iter().all(u8::is_ascii_digit)
+        && b[15] == b'Z'
+        && b[16] == b'-'
+        && b[17..]
+            .iter()
+            .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(c))
+}
+
+/// The journals of this file (`abs` on `host`) on disk: each folder named as a journal of it
+/// and — where its generation can be read — written for this host and path (a journal of
+/// another file whose cache path maps to the same place is not this file's: the listing skips
+/// it). One whose generation cannot be read counts: the listing names it too, once its lock is
+/// free. What a listing should find once no other session holds one.
+pub(super) fn this_files_journals(cache: &Path, host: &str, abs: &str) -> Vec<PathBuf> {
     let base = crate::cache::edits_path(cache, host, abs);
     let (Some(home), Some(name)) = (base.parent(), base.file_name()) else {
-        return 0;
+        return Vec::new();
     };
-    let prefix = format!("{}.journal-", name.to_string_lossy());
+    let file = name.to_string_lossy();
+    let head_is_ours = |dir: &Path| -> bool {
+        let gen = std::fs::read(dir.join("CURRENT"))
+            .ok()
+            .and_then(|bytes| journal::parse_current(&bytes).ok())
+            .and_then(|at| std::fs::read(dir.join(format!("gen-{}", at.n))).ok())
+            .and_then(|bytes| journal::parse_generation(&bytes).ok());
+        gen.is_none_or(|g| g.head.host == host && g.head.path == abs)
+    };
     std::fs::read_dir(home)
         .into_iter()
         .flatten()
         .flatten()
-        .filter(|e| {
-            let n = e.file_name().to_string_lossy().into_owned();
-            n.starts_with(&prefix) && !n.ends_with(".gone")
-        })
-        .count()
+        .filter(|e| journal_name(&e.file_name().to_string_lossy(), &file))
+        .map(|e| e.path())
+        .filter(|dir| head_is_ours(dir))
+        .collect()
 }
 
 /// How long a journal whose lock is taken is tried again (§3 Recovery: a child another thread
@@ -1644,9 +1761,12 @@ const UNDO_ROWS: usize = 3;
 /// under the edits read fresh, never only the metadata). The `Origin` connects only when there
 /// is a journal to check. A journal that holds no edit is removed: there is nothing to offer.
 pub(super) fn recover(file: &Mutex<HexFile>) -> Vec<Row> {
-    let (host, abs, cache) = file.lock().unwrap_or_else(|p| p.into_inner()).place();
-    let fs = journal::disk();
-    let want = journal_dirs(&cache, &host, &abs);
+    let (host, abs, cache, fs) = {
+        let file = file.lock().unwrap_or_else(|p| p.into_inner());
+        let (host, abs, cache) = file.place();
+        (host, abs, cache, file.journal_fs.clone())
+    };
+    let want = this_files_journals(&cache, &host, &abs).len();
     let started = std::time::Instant::now();
     let mut orphans = Vec::new();
     loop {
@@ -1741,12 +1861,19 @@ fn recover_one(
                 })
             }
             journal::Temp::Remove(path) if r.outcome == journal::Outcome::NotLanded => {
+                // Provably this Save's: removed now. A removal that fails keeps the record, and
+                // the question is asked — Remove it tries again, Keep it ends it.
                 match fs.as_deref_mut().map(|fs| fs.remove(path)) {
                     Some(Ok(())) => {}
-                    Some(Err(e)) => said.push(format!(
-                        "the interrupted save's temporary file {host}:{path} could not be removed \
-                         ({e:#})"
-                    )),
+                    Some(Err(e)) => {
+                        left = Some(LeftTemp {
+                            path: path.clone(),
+                            line: format!(
+                                "the interrupted save's temporary file {host}:{path} could not be \
+                                 removed ({e:#}) — remove it?"
+                            ),
+                        })
+                    }
                     None => {}
                 }
             }
@@ -1805,6 +1932,16 @@ fn recover_one(
                 if let Err(e) = orphan.remove() {
                     crate::debug!("journal: an empty one stays: {e:#}");
                 }
+                return rows;
+            }
+            // No edits, only the question about an interrupted save's file: that is the row.
+            if n == 0 && left.is_some() {
+                let line = format!("an interrupted save's record is kept at {dir}");
+                rows.push(Row::Kept {
+                    line: tail(line, &said),
+                    orphan,
+                    temp: left,
+                });
                 return rows;
             }
             let check = match fs {

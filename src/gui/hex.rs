@@ -38,7 +38,7 @@ use std::fs::File;
 use std::io::Write as _;
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex};
 use std::task::Poll;
@@ -530,6 +530,9 @@ pub struct HexDoc {
     undo_cap: usize,
     /// Offsets the edits may hold ([`EDITS`]).
     edit_cap: usize,
+    /// The last undo or redo was refused: it would have passed `edit_cap` (taken by the window,
+    /// which says so).
+    over_cap: bool,
     /// The byte whose high nibble was just typed (its step is the last one): the low nibble
     /// typed next joins that step, so a byte typed as two digits undoes as one.
     open_step: Option<u64>,
@@ -605,6 +608,7 @@ impl HexDoc {
             redo: Vec::new(),
             undo_cap: UNDO_STEPS,
             edit_cap: EDITS,
+            over_cap: false,
             open_step: None,
             rev: 0,
             saved: BTreeMap::new(),
@@ -622,15 +626,58 @@ impl HexDoc {
         self.undo_cap = cap;
     }
 
+    /// A smaller edit bound (tests reach it without a hundred thousand edits).
+    #[cfg(test)]
+    pub(crate) fn set_edit_cap(&mut self, cap: usize) {
+        self.edit_cap = cap;
+    }
+
     /// Whether an edit at `at` is past 07 §11's bound: a new offset while the edits hold
     /// [`EDITS`] of them already. A byte already edited can always change.
     pub fn full_at(&self, at: u64) -> bool {
         !self.patches.contains_key(&at) && self.patches.len() >= self.edit_cap
     }
 
+    /// Whether putting `value` at `at` would pass the bound: it adds an entry (a new offset, and
+    /// not one [`HexDoc::put`] leaves out) while the edits are full.
+    fn over_cap_with(&self, at: u64, value: u8) -> bool {
+        self.full_at(at) && !self.is_baseline(at, value)
+    }
+
+    /// `value` is the byte the edits are laid over at `at` (`replaced`: what the first edit
+    /// there replaced, or what a streamed Save wrote there since), and the page of `at` is here
+    /// to show it: an entry for it changes nothing shown, and a Save writes that byte there
+    /// anyway. Where the page is not here (a stream's, dropped from the cache) the entry is what
+    /// shows the byte without reading the file again (06 §7.1).
+    fn is_baseline(&self, at: u64, value: u8) -> bool {
+        let here = self.pages.in_place || self.pages.held.contains_key(&(at / PAGE));
+        here && self.replaced.get(&at) == Some(&value)
+    }
+
+    /// `value` at `at`, as an entry of the edits — none where it is the file's own byte
+    /// ([`HexDoc::is_baseline`]): such an entry would only count against the bound.
+    fn put(&mut self, at: u64, value: u8) {
+        if self.is_baseline(at, value) {
+            self.patches.remove(&at);
+        } else {
+            self.patches.insert(at, value);
+        }
+    }
+
+    /// Whether the last undo or redo was refused for the bound (once).
+    pub fn take_over_cap(&mut self) -> bool {
+        std::mem::take(&mut self.over_cap)
+    }
+
     /// Undo steps held now.
     pub fn undo_len(&self) -> usize {
         self.undo.len()
+    }
+
+    /// Offsets whose file byte is kept, and edited pages whose evidence is (tests: the bound).
+    #[cfg(test)]
+    pub(crate) fn kept_len(&self) -> (usize, usize) {
+        (self.replaced.len(), self.seen.len())
     }
 
     pub fn size(&self) -> u64 {
@@ -886,7 +933,7 @@ impl HexDoc {
             self.replaced.insert(at, before);
             self.see(at);
         }
-        self.patches.insert(at, value);
+        self.put(at, value);
         self.undo.push_back(Step {
             at,
             before,
@@ -897,8 +944,24 @@ impl HexDoc {
             self.undo.pop_front();
         }
         self.redo.clear();
+        // An offset nothing names any more (its undo and redo steps gone, its entry back at the
+        // file's byte) is let go once what is kept is twice what is named: 07 §11's bound holds
+        // for the kept bytes and their evidence too, at a cost spread over the edits.
+        if self.replaced.len() > 2 * self.named_len() + 64 {
+            self.prune();
+        }
         self.bump();
         Some(true)
+    }
+
+    /// How many offsets the edits, saved and copied bytes and undo and redo steps can name (at
+    /// most; one offset may be named twice).
+    fn named_len(&self) -> usize {
+        self.patches.len()
+            + self.saved.len()
+            + self.copied.as_ref().map_or(0, BTreeMap::len)
+            + self.undo.len()
+            + self.redo.len()
     }
 
     /// The low nibble typed right after the high one: into the high nibble's step when it
@@ -914,7 +977,7 @@ impl HexDoc {
         if step.before == value {
             self.undo.pop_back();
         }
-        self.patches.insert(at, value);
+        self.put(at, value);
         self.bump();
         true
     }
@@ -959,13 +1022,19 @@ impl HexDoc {
         }
     }
 
-    /// Undoes the last change; returns where the cursor goes.
+    /// Undoes the last change; returns where the cursor goes. `None` also when it would pass
+    /// 07 §11's bound ([`HexDoc::take_over_cap`]): the step stays where it is.
     pub fn undo(&mut self) -> Option<Cursor> {
         self.open_step = None;
-        let step = self.undo.pop_back()?;
+        let step = *self.undo.back()?;
+        if self.over_cap_with(step.at, step.before) {
+            self.over_cap = true;
+            return None;
+        }
+        self.undo.pop_back();
         // A page whose evidence went with a rebase (a Save in place) gets it again.
         self.see(step.at);
-        self.patches.insert(step.at, step.before);
+        self.put(step.at, step.before);
         self.redo.push(step);
         self.bump();
         Some(Cursor {
@@ -978,9 +1047,14 @@ impl HexDoc {
     /// Redoes the last undone change; returns where the cursor goes.
     pub fn redo(&mut self) -> Option<Cursor> {
         self.open_step = None;
-        let step = self.redo.pop()?;
+        let step = *self.redo.last()?;
+        if self.over_cap_with(step.at, step.after) {
+            self.over_cap = true;
+            return None;
+        }
+        self.redo.pop();
         self.see(step.at);
-        self.patches.insert(step.at, step.after);
+        self.put(step.at, step.after);
         self.undo.push_back(step);
         self.bump();
         Some(Cursor {
@@ -1344,6 +1418,13 @@ fn autosave(mut file: HexFile, doc: &mut HexDoc, hooks: &Hooks) -> Result<Outcom
                 }
                 outcome.refused = Some(message);
             }
+            Streamed::Ask(left) => {
+                outcome.conflict = true;
+                outcome.refused = Some(format!(
+                    "not saved: an earlier save was cut off — {}",
+                    left.line
+                ));
+            }
             Streamed::Copied { .. } | Streamed::FoundLanded { .. } => {
                 bail!("{} was not saved", file.origin.display())
             }
@@ -1499,6 +1580,11 @@ fn report(result: &Result<JobDone>, outcome: &mut Outcome) -> (Status, Vec<Strin
                 println!("{line}");
                 (Status::info(line.clone()), Vec::new())
             }
+            // The question is asked in its own row (`HexWindow::left_row`).
+            Streamed::Ask(_) => {
+                eprintln!("sopen: {line}");
+                (Status::error(line.clone()), Vec::new())
+            }
         },
         // A streamed Save stopped by Esc between its requests: its temp is gone (07 §4.2).
         Err(e) if stopped(e) => (Status::info(STOPPED), Vec::new()),
@@ -1547,6 +1633,11 @@ enum JobKind {
     /// Write in place (07 §4.4): only from its dialog, after a refusal that offers it.
     InPlace,
 }
+
+/// A background generation's end: the revision it holds, and the journal it kept them in —
+/// `Ok(None)` when it found the journal moved on (a Save started, or the journal retired) and
+/// wrote nothing.
+type Generated = (u64, std::result::Result<Option<PathBuf>, String>);
 
 /// A removal the owner asked for: the journal whose question it answers, and how it went.
 type Removed = (Option<PathBuf>, std::result::Result<String, String>);
@@ -1620,12 +1711,24 @@ pub(super) struct HexWindow {
     /// The session's journal (07 §3): made at the first generation, shared with a Save's worker,
     /// which records the save intent in it; retired once nothing is unsaved.
     journal: Arc<Mutex<Option<Journal>>>,
+    /// Bumped when a Save starts and when the journal is retired: a generation begun before
+    /// that finds it moved when it takes the journal, and writes nothing — it can never bring a
+    /// retired journal back with edits a Save has written since.
+    journal_epoch: Arc<AtomicU64>,
+    /// Where the journals are written (the file's: tests count it).
+    journal_fs: Arc<dyn journal::Fs>,
+    /// Tests: a background generation waits here before it takes the journal; and what runs
+    /// when a Save's start waits for one, or the window's end for an answer to its question.
+    #[cfg(test)]
+    pub(super) generation_gate: Option<Arc<AtomicBool>>,
+    #[cfg(test)]
+    pub(super) before_drain: Option<Box<dyn FnMut() + Send>>,
     /// When the next generation is due, and whether the latest edit is kept.
     schedule: Schedule,
     /// The document revision last given to the schedule.
     journal_rev: u64,
     /// A generation being written in the background: the revision it holds, and its result.
-    writing: Option<Receiver<(u64, std::result::Result<PathBuf, String>)>>,
+    writing: Option<Receiver<Generated>>,
     /// The journal's folder once a generation of it is kept (`kept at <journal>`).
     journal_dir: Option<PathBuf>,
     /// Discard was chosen: the journal goes with the window, unwritten.
@@ -1640,6 +1743,11 @@ pub(super) struct HexWindow {
     edit_blocked: bool,
     /// A refusal whose row offers Write in place… and Save As… (07 §4.1).
     offer: Option<String>,
+    /// A cut-off Save of this session left a file at its temp path that sopen cannot prove its
+    /// own (07 §3.1): the question the next Save found, until the owner answers it — and the
+    /// answer on its way.
+    left: Option<LeftTempRef>,
+    answering: Option<Receiver<std::result::Result<String, String>>>,
     /// Write in place's dialog (07 §4.4) is up, with its words.
     in_place_ask: Option<String>,
     /// The Save As modal (07 §7): the modal, whether the window closes once it lands, and the
@@ -1654,9 +1762,14 @@ pub(super) struct HexWindow {
     /// its fill has reached its hold.
     save_as_hook: Option<PathBuf>,
     save_as_held: Arc<AtomicBool>,
-    /// Tests: the Save As fill holds this long at 30 % (as `SOPEN_SAVE_AS_HOLD_MS` does).
+    /// Tests: the Save As fill holds this long at 30 % (as `SOPEN_SAVE_AS_HOLD_MS` does), or
+    /// until `test_release` is set; and the rate the modal says its time at.
     #[cfg(test)]
     pub(super) test_hold: Option<Duration>,
+    #[cfg(test)]
+    pub(super) test_release: Option<Arc<AtomicBool>>,
+    #[cfg(test)]
+    pub(super) test_rate: Option<f64>,
     /// A Save of this session whose outcome was unknown: the bytes it was writing (found landed
     /// by the next Save's reconciliation, they are the file's).
     cut_off: Option<BTreeMap<u64, u8>>,
@@ -1826,6 +1939,7 @@ impl HexWindow {
             .chain((!can_replace).then(|| CANNOT_REPLACE.to_string()))
             .collect();
         let (home, baseline, checking) = (file.place(), file.opened(), file.checking.clone());
+        let file_journal_fs = file.journal_fs.clone();
         Self {
             title: file.origin.display(),
             can_replace,
@@ -1837,6 +1951,12 @@ impl HexWindow {
             checking,
             saving: Arc::default(),
             journal: Arc::default(),
+            journal_epoch: Arc::default(),
+            journal_fs: file_journal_fs,
+            #[cfg(test)]
+            generation_gate: None,
+            #[cfg(test)]
+            before_drain: None,
             schedule: Schedule::default(),
             journal_rev: 0,
             writing: None,
@@ -1847,6 +1967,8 @@ impl HexWindow {
             confirmed: false,
             edit_blocked: false,
             offer: None,
+            left: None,
+            answering: None,
             in_place_ask: None,
             save_as: None,
             save_as_folder: None,
@@ -1856,6 +1978,10 @@ impl HexWindow {
             save_as_held: Arc::default(),
             #[cfg(test)]
             test_hold: None,
+            #[cfg(test)]
+            test_release: None,
+            #[cfg(test)]
+            test_rate: None,
             cut_off: None,
             rows: Vec::new(),
             recovering: None,
@@ -2132,6 +2258,8 @@ impl HexWindow {
             self.cursor = cursor;
             self.follow = true;
             self.status = Status::info("undone");
+        } else if self.doc.take_over_cap() {
+            self.status = Status::error(EDITS_FULL);
         }
     }
 
@@ -2140,6 +2268,8 @@ impl HexWindow {
             self.cursor = cursor;
             self.follow = true;
             self.status = Status::info("redone");
+        } else if self.doc.take_over_cap() {
+            self.status = Status::error(EDITS_FULL);
         }
     }
 
@@ -2174,6 +2304,12 @@ impl HexWindow {
         if !self.state_patches.is_empty() {
             return self.status = Status::info("your edits are still being put back");
         }
+        // An earlier save's question (07 §3.1) is answered first.
+        if self.left.is_some() || self.answering.is_some() {
+            return self.status = Status::error(
+                "first answer the question about the interrupted save's file: remove it or keep it",
+            );
+        }
         if matches!(kind, JobKind::Save { .. }) {
             if !self.can_replace {
                 return self.status = Status::error(CANNOT_REPLACE);
@@ -2200,6 +2336,19 @@ impl HexWindow {
         {
             self.save_starts += 1;
         }
+        // A generation on its way is taken first: the Save's worker must not overtake it, nor
+        // a generation of edits it has saved land after it (it would bring a retired journal
+        // back). And none begun before now writes from here on.
+        if let Some(rx) = self.writing.take() {
+            #[cfg(test)]
+            if let Some(hook) = self.before_drain.as_mut() {
+                hook();
+            }
+            if let Ok((rev, result)) = rx.recv() {
+                self.generation_written(rev, result);
+            }
+        }
+        self.journal_epoch.fetch_add(1, Ordering::SeqCst);
         self.offer = None;
         self.edit_blocked = false;
         let patches = self.doc.patches().clone();
@@ -2225,6 +2374,7 @@ impl HexWindow {
                 .lock()
                 .unwrap_or_else(|p| p.into_inner()) = None;
             self.saving.cancel.store(false, Ordering::SeqCst);
+            self.saving.kept.store(false, Ordering::SeqCst);
             let (journal, saving) = (self.journal.clone(), self.saving.clone());
             let (host, abs) = (self.home.0.clone(), self.home.1.clone());
             std::thread::spawn(move || {
@@ -2243,6 +2393,10 @@ impl HexWindow {
                             Streamed::FoundLanded { line, .. } => {
                                 format!("{line}: nothing was written again")
                             }
+                            Streamed::Ask(_) => "not saved: an earlier save was cut off and \
+                                                 left a file at its temporary path — answer \
+                                                 the question below first"
+                                .to_string(),
                         };
                         JobDone::Streamed { line, done }
                     });
@@ -2303,11 +2457,11 @@ impl HexWindow {
         let job = self.job.take().expect("checked above");
         self.edit_blocked = false;
         if let Some(rev) = job.kept {
-            // What the worker kept at its start, unless the journal could not be made.
+            // What the worker kept at its start, unless it could not keep it.
             let kept = match self.journal.try_lock() {
                 Ok(slot) => slot
                     .as_ref()
-                    .filter(|j| j.current().is_some())
+                    .filter(|_| self.saving.kept.load(Ordering::SeqCst))
                     .map(|j| j.dir().to_path_buf()),
                 Err(_) => None,
             };
@@ -2389,6 +2543,10 @@ impl HexWindow {
                     }
                     false
                 }
+                Streamed::Ask(left) => {
+                    self.left = Some(left.clone());
+                    false
+                }
                 Streamed::FoundLanded { next, .. } => {
                     if let (Some(wrote), Some((base, journal::Seen::Known(ev)))) =
                         (self.cut_off.take(), next.clone())
@@ -2463,6 +2621,7 @@ impl HexWindow {
     /// After a Save that landed: nothing is unsaved (no edit is taken while a Save runs), so the
     /// journal goes — a streamed Save's worker retired it already — and nothing is due.
     fn saved_journal(&mut self) {
+        self.journal_epoch.fetch_add(1, Ordering::SeqCst);
         if !self.doc.unsaved() {
             if let Ok(mut slot) = self.journal.try_lock() {
                 if let Some(journal) = slot.take() {
@@ -2543,17 +2702,30 @@ impl HexWindow {
         let snap = snapshot_of(&self.doc, self.baseline);
         let slot = self.journal.clone();
         let (host, abs, cache) = self.home.clone();
-        let work = move || -> std::result::Result<PathBuf, String> {
+        let fs = self.journal_fs.clone();
+        let (epochs, epoch) = (
+            self.journal_epoch.clone(),
+            self.journal_epoch.load(Ordering::SeqCst),
+        );
+        #[cfg(test)]
+        let gate = self.generation_gate.clone();
+        let work = move || -> std::result::Result<Option<PathBuf>, String> {
+            #[cfg(test)]
+            while gate.as_ref().is_some_and(|g| g.load(Ordering::SeqCst)) {
+                std::thread::sleep(Duration::from_millis(2));
+            }
             let mut slot = slot.lock().unwrap_or_else(|p| p.into_inner());
+            if epochs.load(Ordering::SeqCst) != epoch {
+                return Ok(None);
+            }
             if slot.is_none() {
-                let made =
-                    Journal::create(journal::disk(), &cache, &host, &abs, journal::Kind::Hex)
-                        .map_err(|e| format!("{e:#}"))?;
+                let made = Journal::create(fs.clone(), &cache, &host, &abs, journal::Kind::Hex)
+                    .map_err(|e| format!("{e:#}"))?;
                 *slot = Some(made);
             }
             let journal = slot.as_mut().expect("made above");
             journal.publish(&snap).map_err(|e| format!("{e:#}"))?;
-            Ok(journal.dir().to_path_buf())
+            Ok(Some(journal.dir().to_path_buf()))
         };
         if wait {
             let result = work();
@@ -2567,12 +2739,18 @@ impl HexWindow {
         }
     }
 
-    fn generation_written(&mut self, rev: u64, result: std::result::Result<PathBuf, String>) {
+    fn generation_written(
+        &mut self,
+        rev: u64,
+        result: std::result::Result<Option<PathBuf>, String>,
+    ) {
         match result {
-            Ok(dir) => {
+            Ok(Some(dir)) => {
                 self.journal_dir = Some(dir);
                 self.schedule.kept(rev);
             }
+            // Superseded: what it held is a Save's to keep, or saved.
+            Ok(None) => {}
             Err(why) => self.schedule.failed(why),
         }
     }
@@ -2583,8 +2761,42 @@ impl HexWindow {
         if let Some(rx) = self.writing.take() {
             let _ = rx.recv();
         }
+        // An answer to the question on its way is waited for: it holds the journal while it
+        // ends the record, and what is kept depends on whether it did.
+        if let Some(rx) = self.answering.take() {
+            #[cfg(test)]
+            if let Some(hook) = self.before_drain.as_mut() {
+                hook();
+            }
+            if let Ok(Ok(_)) = rx.recv() {
+                self.left = None;
+            }
+        }
         // Restored bytes not all in: the journal they came from stays exactly as it is.
         if !self.discard && !self.state_patches.is_empty() {
+            return;
+        }
+        // A question about an interrupted save's file still open (07 §3.1): its record stays
+        // for the next open to ask again — without the edits, when they were discarded or
+        // nothing is unsaved.
+        if self.left.is_some() {
+            if self.discard || self.scripted || !self.doc.unsaved() {
+                let empty = journal::Snapshot {
+                    baseline: self.baseline,
+                    seen: journal::Seen::pages(BTreeMap::new()),
+                    edits: file::edits_text(&BTreeMap::new()),
+                    pastes: Vec::new(),
+                };
+                let kept = match self.journal.try_lock() {
+                    Ok(mut slot) => slot.as_mut().map(|j| j.publish(&empty).map(|_| ())),
+                    Err(_) => None,
+                };
+                if let Some(Err(e)) = kept {
+                    eprintln!("sopen: the interrupted save's question could not be kept: {e:#}");
+                }
+            } else {
+                self.write_generation(true);
+            }
             return;
         }
         // A scripted run's edits are its state's, not the owner's: nothing of them is kept.
@@ -2782,6 +2994,16 @@ impl HexWindow {
             }
             _ => {}
         }
+        // One window keeps one journal: with edits of its own, Restore is refused and the row
+        // stays.
+        if action == RowAction::Restore
+            && (self.doc.changed_count() > 0 || self.journal_dir.is_some())
+        {
+            self.status = Status::error(
+                "not restored: this window has edits of its own — undo or save them first",
+            );
+            return;
+        }
         let row = self.rows.remove(i);
         match (row, action) {
             (
@@ -2812,13 +3034,6 @@ impl HexWindow {
                 );
             }
             (Row::Edits { orphan, edits, .. }, RowAction::Restore) => {
-                let busy = self.doc.changed_count() > 0 || self.journal_dir.is_some();
-                if busy {
-                    self.status = Status::error(
-                        "not restored: this window has edits of its own — undo or save them first",
-                    );
-                    return;
-                }
                 match orphan.adopt() {
                     Ok(mut taken) => {
                         // A Save its session left cut off is ended here: the row named what to
@@ -2979,15 +3194,19 @@ impl HexWindow {
         #[cfg(test)]
         if let Some(hold) = self.test_hold {
             producer.hold = Some(hold);
+            producer.release = self.test_release.clone();
         }
         if producer.hold.is_some() {
             producer.held = Some(self.save_as_held.clone());
         }
         let name = crate::remote::split_parent(&self.home.1).1.to_string();
+        let rate = self.stream.as_ref().and_then(Source::rate);
+        #[cfg(test)]
+        let rate = self.test_rate.or(rate);
         let job = save_as::Job {
             name,
             size: save_as::Size::Exact(self.doc.size()),
-            rate: self.stream.as_ref().and_then(Source::rate),
+            rate,
             producer: Box::new(producer),
         };
         let folder = self
@@ -3969,6 +4188,71 @@ impl HexWindow {
     }
 
     /// A refusal's row (07 §4.1): its words, Write in place… and Save As….
+    /// A live session's question about a temp (07 §3.1): Remove it or Keep it; the next Save
+    /// waits for the answer, since the record that holds the question is that Save's to replace.
+    fn left_row(&mut self, ui: &mut egui::Ui) {
+        if let Some(rx) = &self.answering {
+            match rx.try_recv() {
+                Ok(Ok(line)) => {
+                    self.answering = None;
+                    self.left = None;
+                    self.status = Status::info(line);
+                }
+                Ok(Err(why)) => {
+                    self.answering = None;
+                    self.status = Status::error(why);
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+                Err(mpsc::TryRecvError::Disconnected) => self.answering = None,
+            }
+        }
+        let Some(left) = &self.left else {
+            return;
+        };
+        let error = ui.visuals().error_fg_color;
+        super::disclosures(ui, &[(left.line.clone(), error)]);
+        let free = self.job.is_none() && self.answering.is_none() && !self.dialog_up();
+        let mut answer = None;
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(free, egui::Button::new("Remove it"))
+                .clicked()
+            {
+                answer = Some(true);
+            }
+            if ui.add_enabled(free, egui::Button::new("Keep it")).clicked() {
+                answer = Some(false);
+            }
+        });
+        if let Some(remove) = answer {
+            self.answer_left(ui.ctx(), remove);
+        }
+    }
+
+    /// The owner's answer to the live question, on the `Origin`, off the frame.
+    fn answer_left(&mut self, ctx: &egui::Context, remove: bool) {
+        let Some(left) = self.left.clone() else {
+            return;
+        };
+        let (tx, rx) = mpsc::channel();
+        let (file, journal, ctx) = (self.file.clone(), self.journal.clone(), ctx.clone());
+        std::thread::spawn(move || {
+            let answered = file
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .answer_left(&left, remove, &journal)
+                .map_err(|e| format!("{e:#}"));
+            let _ = tx.send(answered);
+            ctx.request_repaint();
+        });
+        self.answering = Some(rx);
+        self.status = Status::info(if remove {
+            "removing…"
+        } else {
+            "keeping it…"
+        });
+    }
+
     fn offer_row(&mut self, ui: &mut egui::Ui) {
         let Some(why) = self.offer.clone() else {
             return;
@@ -4110,7 +4394,10 @@ impl super::Window for HexWindow {
             .map(|n| (n.clone(), error))
             .collect();
         let keep_row = self.read_only.is_some() && self.retained.is_none();
-        let recovery = !self.rows.is_empty() || self.offer.is_some();
+        let recovery = !self.rows.is_empty()
+            || self.offer.is_some()
+            || self.left.is_some()
+            || self.answering.is_some();
         if !lines.is_empty() || keep_row || recovery {
             egui::Panel::bottom("disclosures").show(ui, |ui| {
                 ui.add_space(2.0);
@@ -4119,6 +4406,7 @@ impl super::Window for HexWindow {
                     self.keep_row(ui);
                 }
                 self.offer_row(ui);
+                self.left_row(ui);
                 self.recovery_rows(ui);
                 ui.add_space(2.0);
             });
