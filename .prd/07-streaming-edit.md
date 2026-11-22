@@ -6,9 +6,11 @@ tags: [sopen, spec, streaming, edit]
 
 # 07 — Editing a streamed file
 
-Status: in progress (2026-11-22: ED1, ED2 and ED3 merged; ED4, the hex window, in review). This
-is the contract the edit units (§14) build. Until each lands, [`01-spec.md`](01-spec.md)
-describes what ships.
+Status: shipped (2026-11-23). This is the contract the code implements, not a future target: every
+edit unit of §14 has merged, and [`01-spec.md`](01-spec.md) says the same (§13 lists the 01 and
+AGENTS.md text they changed). Where this document says "today" or "as today", it means sopen before
+the workstream (`main` 3a426b6, 2026-11-20); a unit's name (ED…, W…) says which change brought a
+rule.
 
 Viewing is [`06-streaming.md`](06-streaming.md). This document reads through 06's `Source`, its
 `Bytes` and its range server. Owner message 17 is quoted whole in 06's header; this is its third
@@ -17,7 +19,8 @@ paragraph, verbatim:
 > 그리고 그냥 뷰어가 아니라 만약 편집할 경우는 다른데 이것은 별도로 리서치해서 처리해줘. 편집할경우는 그 편집된 부분은 전부 현재 로컬에 해당 내역이 모두 메모리 혹은 파일로 임시 저장해야하는거고 원하면 save as 로 로컬에 저장할 수 있게 해줘. (디폴트는 원격 편집 저장임)
 
 The measurements are in [`research/streaming-edit.md`](research/streaming-edit.md) (cited as *edit*
-§n). Times quoted are from 06's reference rig. Code citations name functions, at `main` 3a426b6.
+§n). Times quoted are from 06's reference rig. Code citations name functions; a line number, where
+given, is at the commit named beside it, else at `main` 3a426b6.
 
 ## 1. The contract
 
@@ -29,7 +32,7 @@ The measurements are in [`research/streaming-edit.md`](research/streaming-edit.m
     across them. Focus loss and closing wait for it; a Save's worker writes it before anything
     else, and the window goes on drawing meanwhile.
   - The journal is offered back on the next open: Restore, Later or Discard.
-  - Today a crash loses every unsaved hex and image edit (*edit* §1).
+  - Before the journal a crash lost every unsaved hex and image edit (*edit* §1).
 - **Save writes to the remote file. It is the default** (Cmd/Ctrl+S, F5). It keeps 01 §5: a conflict
   check before anything is written and again right before the replace, a backup, and the atomic
   rename (§4, §5).
@@ -40,8 +43,8 @@ The measurements are in [`research/streaming-edit.md`](research/streaming-edit.m
   (`copy-data`) into the temp, patches the changed ranges, and renames. Measured on a 24 GB remote
   file with a 4-byte patch: **6.3 s** with the file in memory (tmpfs), of which the copy was
   3.4 s, with 8 bytes of file content on the wire. On a real disk the copy alone takes about 17 s on
-  the Linux laptop and 5–14 s on the Mac (X2, §4.2). Today the same Save
-  costs 48 GB over the network and 48 GB of local disk: about 4.8 h at the measured 1.39 MB/s each
+  the Linux laptop and 5–14 s on the Mac (X2, §4.2). Before the workstream the same Save
+  cost 48 GB over the network and 48 GB of local disk: about 4.8 h at the measured 1.39 MB/s each
   way (*edit* §2.3–§2.4).
 - **Save As writes the edited result to a local path** (Alt+Cmd/Ctrl+S, F7), streaming the unchanged
   ranges from the remote and applying the edits on the way. It never writes over anything (§7).
@@ -150,7 +153,7 @@ whose lock it can take. A lock found taken is tried again for up to 500 ms befor
 as another live session's: the lock belongs to the open file, and a child that another thread is
 starting (ssh, ffmpeg) holds a copy of every open descriptor from its fork until its exec, so the
 lock of a journal this process has just let go can look taken for that moment. The viewers' open
-path does the retrying (ED4–ED6); `orphans` itself tries once. The hex window lists them at its
+path does the retrying (the hex, image and media windows'); `orphans` itself tries once. The hex window lists them at its
 first pass as a viewer, in the background — never as a browser preview, which must not hold
 another session's journals — and tries a taken lock again every 50 ms for up to 500 ms. It waits
 only for this file's own journals: a folder named exactly `<file>.journal-<UTC stamp>-<8 hex>`
@@ -330,7 +333,7 @@ offered:
       partial copy, so it was not removed — remove it?`. That is a temp a Save was cut off
       filling, one whose mode had just been set, and one already given a set-id target's full
       mode — or another file that took the name since. The words claim no ownership, and the
-      prompt the hex window shows (ED4) carries the same uncertainty.
+      prompt the hex window shows carries the same uncertainty.
     - **Why not less.** A random name, an owner, a mode and a size below the target's do not
       prove a file is sopen's: any number of files share them, and after the process has died
       another file can take the name. Removing on those would delete someone else's file.
@@ -368,7 +371,7 @@ offered:
   Source to reload. The journal (§3), Save As (§7) and the close prompt (§10) apply to it as to a
   remote file.
   - `LocalFs::patcher()` exists for the tests and for parity with SFTP (ED1's algorithms run on
-    both). ED4 never routes a local file through it.
+    both). The hex window never routes a local file through it.
 
 ### 4.2 Server copy, then patch, then rename
 
@@ -527,7 +530,7 @@ A write or fsync with no reply is an unknown outcome **on the target itself**:
 - **Every Save, whatever the size, also reads each edited page fresh and compares it with `seen`.**
   For files of at most 256 MiB that check runs alongside the whole-content hash.
 - **Larger files are checked by size, mtime and the pages under the edits** (the page check above).
-  Today a file above 256 MiB is checked by size and mtime only.
+  Before the workstream a file above 256 MiB was checked by size and mtime only.
   - Size and mtime are checked four times: at open, before the copy, after the copy, before the
     rename.
   - Each edited 4 KiB page is read back from the temp and compared with `seen`, which also catches a
@@ -539,7 +542,7 @@ A write or fsync with no reply is an unknown outcome **on the target itself**:
 
   | Another writer's change | Kept in the saved file? |
   |---|---|
-  | made before the copy read that region, **captured by the copy**, size and mtime put back, outside the edited pages (file above 256 MiB) | **yes**: the patch lands on the file as copied, where today's whole rewrite would have overwritten it |
+  | made before the copy read that region, **captured by the copy**, size and mtime put back, outside the edited pages (file above 256 MiB) | **yes**: the patch lands on the file as copied, where the whole rewrite before the workstream would have overwritten it |
   | made before the copy, anywhere (file at most 256 MiB) | no Save: the whole-content check refuses |
   | made to a region **after the copy read it**, with the mtime put back | **no**: the temp holds the bytes from before, and the rename replaces the writer's change, unseen |
   | made **between the last check (step 9) and the rename**, even with a normal mtime | **no**: the rename replaces it, unseen (01 §5: "a write racing the final rename is not detected") |
@@ -629,17 +632,15 @@ size rule. Image and media upload their output, as today.
 
 - **Keys.** Alt+Cmd/Ctrl+S, and **F7 "SaveAs"** in the hex, image and media windows' F-key rows
   (`chrome::SAVE_AS_KEY`). The text viewer is read-only and gets no Save As.
-  - The key and the chord are the windows' to add as ED4, ED5 and ED6 wire Save As, each in its
-    own change. That change adds F7 to its row and its help line, and calls `save_as::pressed`
-    before its Cmd/Ctrl+S checks. F7 stays unused in every viewer row until then, so no slot
-    names a key that does nothing.
+  - Each window lists F7 in its row and its help line, and calls `save_as::pressed` before its
+    Cmd/Ctrl+S checks.
   - The chord is Alt with Cmd/Ctrl and nothing else; F7 is F7 alone, and not while a text field
-    has the typing. egui's own shortcut check ignores an extra Alt, so a window that has not
-    wired Save As takes Alt+Cmd/Ctrl+S as its Cmd/Ctrl+S.
+    has the typing. egui's own shortcut check ignores an extra Alt, which is why `save_as::pressed`
+    runs before a window's Cmd/Ctrl+S check: otherwise Alt+Cmd/Ctrl+S would be taken as Cmd/Ctrl+S.
   - The hex window's grid holds the keyboard, which egui counts as a widget wanting the keys, so
     `save_as::pressed` leaves F7 there: the hex window takes F7 alone itself, as it takes F5, and
     not while the Go to field has the typing. Its toolbar has a Save As… button too.
-- **The modal** (`gui::save_as`, ED3; each window opens it from its Save path, ED4–ED6). One path
+- **The modal** (`gui::save_as`; each window opens it from its Save path). One path
   field, prefilled with `<download folder>/<stem>.edited<ext>`; the next free `-N` name when that
   one is taken (`binary::suggest`, `binary::next_free`). A name already in a counted series —
   `<stem>-N<ext>` beside its `<stem><ext>` — counts on in that series: `model.edited-1.bin` taken
@@ -708,7 +709,7 @@ size rule. Image and media upload their output, as today.
 
 - **Editing needs no new fetch.** Viewing already holds the whole file and the decoded image
   (06 §7.3), including after Continue on a large one. No editing-specific budget or confirm exists.
-- **Save** is today's: the local backup (§5.2), encode, stage, then `write_atomic`'s conflict-checked
+- **Save** is as before the workstream: the local backup (§5.2), encode, stage, then `write_atomic`'s conflict-checked
   overwrite. The content check is the whole hash taken by the streamed read (§4.5).
   - It runs through `RemoteFs::write_atomic_with`, which sends what `write_atomic` sends and says
     where it is: the temp's name before its create; the temp once created and written (one
@@ -768,14 +769,15 @@ size rule. Image and media upload their output, as today.
 - **Save** runs PR #15's pre-render check and renders. It then makes the hard-link backup (§5.3,
   first Save only) and writes over the original by `write_atomic` (01 §5, unchanged). The upload is
   the output's size; the content is new, so that cannot be avoided.
-- **What ED6 changes in PR #15.**
-  - PR #15's Save refuses an `Input` that is a URL (`media/file.rs`), and its background hash skips
-    remote files. ED6 lets Save take the URL. The baseline for a remote file of at most 256 MiB
-    comes from §4.5's baseline pass, through the `bulk` URL; above that, from the first and last
-    1 MiB (§3).
-  - ED6 lands **before** W8b, which routes remote media through a Source, so remote media Save never breaks between them (06 §13).
-- **After a remote Save lands**, PR #15 plays the staged render, which now equals the remote file.
-  ED6 keeps that, and **closes the window's Source and its byte server**. The window's `Input`
+- **What ED6 changed in PR #15.**
+  - PR #15's Save refused an `Input` that is a URL (`media/file.rs`), and its background hash skipped
+    remote files. Save takes the URL. The baseline for a remote file of at most 256 MiB comes from
+    §4.5's baseline pass, a Bulk reader on the window's stream; above that, from the first and last
+    1 MiB (§3), read again right before the overwrite.
+  - ED6 merged **before** W8b, which routes remote media through a Source, so remote media Save
+    never broke between them (06 §13).
+- **After a remote Save lands**, the window plays the staged render, which now equals the remote
+  file (PR #15's rule), and **closes the window's Source and its byte server**. The window's `Input`
   becomes the staged render's path, so the window never shows `Replaced` for its own save. The next
   Save's baseline is `write_atomic`'s staged stat, as today.
 - **Export** is unchanged: `write_new_sibling`.
@@ -841,8 +843,9 @@ that can stop the save there, or lose the step's reply, as 01 §5's tests alread
 Gates and qualification are as in 06 §12. The live receipt is a file under a remote
 `/tmp/sopen-receipts/`.
 
-Two receipt hooks of the hex window, read in `gui/hex.rs` (in AGENTS.md's table):
-`SOPEN_SAVE_AS=<folder>` saves the edits as `<folder>/<stem>.edited<ext>` — without a window
+Two receipt hooks of the hex and media windows, read in `gui/hex.rs` and `gui/media.rs` (in
+AGENTS.md's table): `SOPEN_SAVE_AS=<folder>` saves the edits as `<folder>/<stem>.edited<ext>`
+(media: the extension its render has) — without a window
 under `SOPEN_AUTOSAVE` (progress on stderr, `saved <path>` on stdout), else through the Save As
 modal once the state is on screen; `SOPEN_SAVE_AS_HOLD_MS=<ms>` holds that fill at its first
 progress at or past 30 % for that long, so `SOPEN_SCREENSHOT` shows it under way.
@@ -1007,6 +1010,8 @@ progress at or past 30 % for that long, so `SOPEN_SCREENSHOT` shows it under way
 
 ## 13. 01 and AGENTS.md text this changes (written by D1)
 
+D1 brought 01 and AGENTS.md to these on 2026-11-23.
+
 - **AGENTS.md "Never overwrite silently".** The content hash stays up to 256 MiB. Above that, the
   check is size, mtime and the pages under the edits (§4.5), with the best-effort table and the
   one-time confirmation. The hex backup is the undo file (§5.1). A remote media Save keeps a remote
@@ -1016,20 +1021,22 @@ progress at or past 30 % for that long, so `SOPEN_SCREENSHOT` shows it under way
   same-mtime change above 256 MiB, and the writes a Save can lose (§4.5). The undo file, the hard-link
   backup, and journals as a new owner-only kind of file under `<cache>/.edits`, with their durability
   rules and the save intent (§3, §3.1).
-- **01 §6a and §6.** Today hex takes edits during a Save ("an edit or an undo in that frame counts").
-  Now hex and image take none until the Save ends (§10).
+- **01 §6a and §6.** Before the workstream hex took edits during a Save ("an edit or an undo in
+  that frame counts"). Hex and image take none until the Save ends (§10).
 - **01 §6, §6a, §7.** Save As and its keys (§7). The close prompt's Save As… (§10). The recovery rows
   (§3, §5.1). F7 in the three F-key rows.
 - **Browser workstream, for its owner.** Its key survey says "F2, F7 and F10 do nothing inside a
-  viewer" (`.prd/research/keys.md`, merged with PR #17). F7 is Save As in the three editing viewers once
-  ED3 lands, which that line must say. Its 04 gives F7 to MkDir in the list only, so the two do not
-  collide.
+  viewer" (`.prd/research/keys.md`, merged with PR #17). F7 is Save As in the three editing viewers
+  (and F2 is the text viewer's Unwrap), which that line must say; D1 does not own that file and left
+  it to its owner. Its 04 gives F7 to MkDir in the list only, so the two do not collide.
 
 ## 14. Work units
 
-Same rules as 06 §13: one agent, one branch, one worktree each; the gate is
-`SOPEN_REQUIRE_FFMPEG=1 SOPEN_REQUIRE_SFTP_SERVER=1 just check`. The live table is
-[`streaming/loop.md`](streaming/loop.md).
+Same rules as 06 §13: one agent, one branch, one worktree each; the gate was
+`SOPEN_REQUIRE_FFMPEG=1 SOPEN_REQUIRE_SFTP_SERVER=1 just check`. Every unit below has merged (the
+last on 2026-11-23); each one's PR and merge commit are in
+[`streaming/loop.done.md`](streaming/loop.done.md). This section is the record of how the work was
+cut and sequenced; the contract is §1–§12.
 
 The edit units are ED1–ED6. Plain E-numbers are this document's acceptance scenarios (§12), and the
 browser's experiments are its own E1–E5 (02 §8.2).
@@ -1044,16 +1051,16 @@ browser's experiments are its own E1–E5 (02 §8.2).
 | ED6 | **Media edit on streams.** Save taking a URL `Input`; the baseline pass for remote files; Save, Save As and Export through the URL, failed on a cut response; the hard-link backup through the existing `link_new` (no remote-layer change) and its disclosure; closing the Source after a remote Save; the journal and its evidence | `src/gui/media/file.rs`, `src/gui/media.rs`, `src/gui/media/edit_tests.rs` | W7, ED2, ED3; **before W8b** |
 | D1 | **Docs.** 01 rewritten to the shipped contract (06 §14, §13 above); AGENTS.md rules and the 06 §11 hooks; README; 06 and 07 marked shipped | `.prd/01-spec.md`, `AGENTS.md`, `README.md`, `.prd/06-streaming.md`, `.prd/07-streaming-edit.md` | every unit of 06 and 07 |
 
-**Order.**
-1. ED2 now.
+**Order** (each unit merged after what it names):
+1. ED2 first.
 2. ED1 after W1 and S1-C.
-3. ED3 once S1 has merged.
+3. ED3 once S1 had merged.
 4. ED5 after W6.
 5. ED6 after W7, then W8b.
 6. ED4 after W8a.
 7. D1 last.
 
-loop.md has the merge order across both workstreams.
+loop.done.md has the merge order across both workstreams.
 
 **Serial chains** (06 §13):
 - hex W4 → ED4;

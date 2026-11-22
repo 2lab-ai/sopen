@@ -1605,17 +1605,16 @@ pub fn open_file(
             }
             out.saved_to = Some(dest);
         }
-        // `--hex`, and the windowless autosave: fetched with the progress on the terminal.
+        // `--hex`, and the windowless autosave: a remote file opens as a stream on this
+        // connection and a local one in place (06 §7.1, §7.5) — nothing is fetched, so the
+        // terminal has no progress line to show.
         Some(Choice::Hex) if hex_flag || hooks.autosave => {
-            meter.start(&format!("fetching {}", info.name));
-            let opened = source.open_hex(&mut |d, t| meter.bytes(d, t));
-            meter.finish();
-            let opened = opened?;
+            let opened = source.open_hex(&mut |_, _| {})?;
             out.fetch_ms = opened.fetch_ms;
             out.hex(hex::open(opened.file, hooks, opened.notices)?);
         }
-        // The dialog; with SOPEN_CHOICE=hex already answered (the fetch starts at once, in the
-        // window, which then becomes the hex window).
+        // The dialog; with SOPEN_CHOICE=hex already answered (the hex window is opened at once,
+        // in the dialog's window, which then becomes it: a remote file as a stream).
         Some(Choice::Hex) | None => {
             let local = info.local;
             let ended = dialog(info, Box::new(source), chooser, hooks, run)?;
@@ -1894,7 +1893,8 @@ impl BinaryWindow {
         matches!(self.stage, Stage::Ask)
     }
 
-    /// Hex: fetch (or open the local file) on a worker, then become the hex window.
+    /// Hex: open the file on a worker — a remote one as a stream, a local one in place — then
+    /// become the hex window.
     fn start_hex(&mut self, ctx: &egui::Context) {
         let Some(mut source) = self.source.take() else {
             return;

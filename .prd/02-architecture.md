@@ -333,8 +333,8 @@ bar does not have to move).
     twice more to verify them (hashed before and after the continuation); a mismatch re-indexes
     the whole file.
   - **What a media preview left undone starts now**: the file as opened is hashed for Save's check
-    (a local file; a remote one's baseline is its Save's own, from the stream — 07 §5.3, which
-    ED6 brings), and the cache is swept of dead Save and Export jobs. How Save and Export render the file came with the preview; only where the
+    (a local file; a remote one's baseline is its Save's own, from the stream — 07 §4.5, §9),
+    and the cache is swept of dead Save and Export jobs. How Save and Export render the file came with the preview; only where the
     encoder question ran out of time is it asked again — on a thread of its own, Save and Export
     unavailable and the status row saying `checking the encoder…` until the answer lands (§6:
     nothing slow on a frame). A media window opened by itself (`sopen file.mov`) asks the same

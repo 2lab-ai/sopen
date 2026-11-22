@@ -160,3 +160,69 @@ changes. Rows here are snapshots taken when they were moved.
 
 - W7 (PR #46, merged 2026-11-22, 41dee30) and ED4 (PR #47, merged 2026-11-22, 0302a69).
 - Dates in this block are the merge commits' dates in +0900.
+
+## R1 (part 8) — closed 2026-11-23
+
+- merged ED5 ✅ ED6 ✅ W8b ✅ D1 ✅ · result: the image window's journal, Save As and recovery
+  (ED5); media Save from a stream, with the remote original kept as a hard link (ED6); every
+  remote open goes through a stream — text over 16 MiB, images with the image → hex switch,
+  video and sound, the `.ts` refine over the URL — and the `.preview` root is swept (W8b); 01,
+  AGENTS.md, the README, 06 and 07 brought to the shipped contract, 06 and 07 marked shipped
+  (D1). Round 1 and the workstream are closed · closed rows: ED5, ED6, W8b, D1 · PRs: #49
+  (b3cf430), #55 (1877c17), #54 (7993f2b), and the PR that carries this block
+
+### Closed rows
+
+| ID | Status | Branch | Worktree | Scope | Owns | After | Gate |
+|---|---|---|---|---|---|---|---|
+| ED5 | ✅ | `feat/stream-edit-image` | `.worktrees/feat-stream-edit-image` | 07 §8: image journal, Save As | `src/gui/image/file.rs`, `src/gui/image.rs`, `src/gui/image/robustness_tests.rs` | W6, ED2, ED3 | Merged PR #49 (b3cf430), 2026-11-22, with the test fix PR #50 (e1e3c99) |
+| ED6 | ✅ | `feat/stream-edit-media` | `.worktrees/feat-stream-edit-media` | 07 §5.3, §9: Save from a URL, baseline pass, cut renders failed, hard-link backup and disclosure, Source closed after Save, journal | `src/gui/media/file.rs`, `src/gui/media.rs`, `src/gui/media/edit_tests.rs`, `src/gui/media/save_tests.rs` (new); `src/gui/chrome.rs` (`MEDIA_KEYS`' F7 only); `src/cut.rs` (`render_edit_stoppable`, added) | — (W7 merged: PR #46, 41dee30; ED2, ED3 merged); before W8b | Merged PR #55 (1877c17), 2026-11-22 |
+| W8b | ✅ | `feat/stream-routing-b` | `.worktrees/feat-stream-routing-b` | 06 §7.3, §13: remote text over 16 MiB through a Source, the image → hex switch, the image and media routes and previews through a Source with 02 §4.3–§4.4 and P6's image part, the `.ts` refine over the URL, the `.preview` root | `src/gui/browser/prepare.rs`, `src/gui/browser/preview.rs`, `src/gui/browser.rs` (hex switch), `src/gui/browser/tests.rs`, `src/gui/browser/prepare/tests.rs`, `src/cache.rs` (`.preview` root), `src/main.rs`, `src/kind.rs`, `.prd/02-architecture.md` (§4.3–§4.4) | W8a, W5b, W6, W7, ED6; S1-M merged | Merged PR #54 (7993f2b), 2026-11-23 |
+| D1 | ✅ | `feat/stream-docs` | `.worktrees/feat-stream-docs` | 06 §14, 07 §13: 01, AGENTS.md and README to the shipped contract; 06 and 07 marked shipped; the ledger closed; then, by the dispatcher's extension, `ssot.md`'s status, 02 §4.4's ED6 note, `research/keys.md`'s viewer F-keys and the streaming comments left stale in code, with the `--hex` route's progress label that could never print | `.prd/01-spec.md`, `AGENTS.md`, `README.md`, `.prd/06-streaming.md`, `.prd/07-streaming-edit.md`, `.prd/streaming/loop.md`, `.prd/streaming/loop.done.md`; extended: `.prd/streaming/ssot.md`, `.prd/02-architecture.md` (§4.4), `.prd/research/keys.md`, `src/gui/binary.rs`, `src/gui/mod.rs`, `src/forward.rs`, `src/lib.rs` (comments, and the dead meter) | every unit above | `SOPEN_REQUIRE_FFMPEG=1 SOPEN_REQUIRE_SFTP_SERVER=1 just check` exit 0 in 142 s on the Mac (lib 1620 passed 10 ignored, main 15, `tests/cli.rs` 48, `highlight_alloc` 1, `sftp_live` 4 ignored); `loop-lint.py` 0 FAIL, 0 WARN; the PR that carries this block |
+
+### Round section
+
+- ED5 (PR #49, merged 2026-11-22, b3cf430), with the test fix PR #50 (e1e3c99); ED6 (PR #55,
+  merged 2026-11-22, 1877c17); W8b (PR #54, merged 2026-11-23, 7993f2b); then D1.
+- PRs merged meanwhile that are not work units:
+  - #45 (54d921f): long chains and long YAML values no longer make highlighting quadratic;
+  - #48 (623c6f9): Makefile highlighting without catastrophic backtracking;
+  - #57 (4f8075d): a journal folder that holds nothing is removed when listed;
+  - #61 (f5f1242, 2026-11-23): Esc closes a hex viewer on its second frame, and an image that
+    gives way to hex in the frame Esc came is not switched in;
+  - tests only: #51 (d21f1b3), #52 (628370d), #53 (4278a6f), #56 (0072b6f), #58 (dcff255), #59
+    (d886983), #60 (c6be02e).
+- The merge order loop.md gave. The "After" column was authoritative, and the merges went by it
+  rather than by the step numbers (ED4, for one, merged before W7, ED5 and ED6):
+  1. PR #15 (media edit) and PR #16 (stems): both merged on 2026-11-20. PR #16 shared only
+     `Cargo.toml` with W1 (other sections).
+  2. The streaming docs branch, rebased on `main` (S1-0 merged), with the 02 §8 sentence below.
+  3. In parallel with the browser's S1-A…D: W1 and ED2; then W2, then W3 (new files).
+  4. ED1 after W1 and S1-C.
+  5. Once S1 had merged, in parallel: S1-M, W4, W5a, W6 and ED3.
+  6. W7 after S1-M and W3; W5b; ED5.
+  7. W8a after W4 and W5a, not waiting for step 6: hex and text of at most 16 MiB, with the 02
+     §4.3–§4.5 edits. S1-M (PR #36) shared `prepare.rs` and `preview.rs`: the second to merge
+     rebased.
+  8. ED6, then W8b. W8b also took `browser.rs` for the hex switch.
+  9. ED4 (after W8a), then the browser's S2-E (after W4–W7 and ED4–ED6, or the trait default
+     only), then D1.
+
+  **02 §8 (added in the streaming docs PR):** at the end of "Hand-overs between slices": "S2-E
+  changes the viewer files (`text`, `image`, `hex`, `media`) only after the streaming units W4–W7
+  and ED4–ED6 have merged, or it touches only the `Window` trait's default
+  (`.prd/06-streaming.md` §13)."
+
+  Serial chains: W4 → ED4; W6 → ED5; PR #15 → S1-M → W7 → ED6; W5a → W5b; W1 → ED1; S1-C → ED1
+  (`src/remote/sftp/ops.rs`); W8a → W8b (`browser/prepare.rs`, `browser/preview.rs`).
+- Build facts kept in loop.md during the round: `main` 3a426b6, 2026-11-20, the Mac (Apple
+  silicon, cargo 1.99.1, fresh target directory): `SOPEN_REQUIRE_FFMPEG=1
+  SOPEN_REQUIRE_SFTP_SERVER=1 just check` exit 0 in 82 s; fmt and clippy clean; lib 460, main 13,
+  `tests/cli.rs` 27 passed; `tests/sftp_live.rs` 4 ignored. Checked 2026-11-20 with throwaway
+  clients, results cited where used (06 §2, §4, §5, §7.4, §9; 07 §5.3, §12): OpenSSH 10.3p1
+  `sftp-server` (read limit and full replies, EOF cases, reply order, `fstat` after writes and
+  rename-over, `copy-data`, hard link and old-handle write); ffmpeg 9.0.2 (request forms, exit 0
+  on a cut-short body).
+- Step 9's S2-E is the browser workstream's slice (02 §8), not a unit of this one: no S2 work had
+  merged on `main` by 2026-11-23, so the order's one remaining step is that workstream's.
+- Dates in this block are the merge commits' dates in +0900.

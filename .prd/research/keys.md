@@ -314,7 +314,11 @@ Why a mis-press is cheap:
 
 The one hazard is muscle memory. Someone who pressed F5 = Save in hex, then Esc, then F5 again
 gets the Copy dialog, not a save. That is why Copy and Move must start with a dialog, never act
-at once. F2, F7 and F10 do nothing inside a viewer.
+at once. Inside a viewer F10 does nothing; F2 is only the text viewer's Unwrap / Wrap (an alias of
+W), and F7 only Save As in the hex, image and media windows (an alias of Alt+Cmd/Ctrl+S, which
+opens a modal and writes a new local file, never over anything; `chrome::SAVE_AS_KEY`,
+`.prd/07-streaming-edit.md` §7). This sentence was corrected on 2026-11-23 to what the windows'
+F-key rows (`src/gui/chrome.rs`) do.
 
 The viewers' own F-keys already have non-F aliases (spec §3a): hex 5 = ⌘S, 6 = ⌘G, 8 = Tab; 3 Exit =
 Esc / ⌘W. So **the fn problem is mainly the list's**: Rename, Copy, Move, MkDir, Delete and Tree have

@@ -96,7 +96,7 @@ its git panel changes repositories, every history rewrite or destructive action 
 | A1 | `sopen host:/path`, scp syntax, any machine in `~/.ssh/config` | `sopen <alias>:/abs/file`, `sopen <alias>:rel/to/home`, `sopen user@host:/x` all open; aliases, ProxyJump, agent behave exactly as `ssh <alias>` does (system ssh is used). Local paths (`sopen ./x.png`) open too. |
 | A2 | Text edit, syntax highlight; VS Code first (msg 10; folders: msg 12, A11) | Text file → VS Code when `code` is found; a remote one only when VS Code's Remote - SSH extension is installed (`code --folder-uri` / `--file-uri vscode-remote://ssh-remote+[user@]host/<percent-encoded abs>` by the kind sopen detected, since a bare `--remote` path's kind is guessed from its name; the extension is never installed by sopen), else Zed with `VS Code has no Remote - SSH extension; opening in Zed` on stderr. Without VS Code, Zed (`zed ssh://…` on macOS, `zeditor`/`zed` on Linux). A VS Code launch failure is reported, not followed by Zed. The editor owns Save. The file browser's F4 hands a folder or file to the same editor the same way (A11). On Linux under KDE Plasma (msg 11) the editor's window that asked for attention is brought to where the user is — the active window's desktop and screen — and activated (§3). |
 | A3 | Image: view + rectangle crop + rectangle pixelize + clipboard copy / cut / paste (msg 12) | Built-in window shows the image; drag draws a rectangle in image pixels; Crop and Pixelize act on it; Cmd/Ctrl+C copies it (the whole image without one) to the system clipboard as a picture, Cmd/Ctrl+X copies it and leaves it in the background colour, Cmd/Ctrl+V pastes the clipboard's picture (Stretch by default, Fit or 1:1) or text into it; Undo; Save writes back to the remote file. |
-| A4 | Video: view + rectangle crop + time cut; cut / copy / paste on the timeline, previewed at once, rendered only on Save (msg 13) | Built-in window plays the video with sound; scrub timeline; a drag on it selects (`I`/`O` set the selection's edges at the playhead); Cmd/Ctrl+C / X / V, Delete, Cmd/Ctrl+Z / Shift+Cmd/Ctrl+Z edit the timeline and never start ffmpeg — playback and the paused frame show the edited timeline at once; drag a crop rectangle (Export crops its whole output by it); Save (Cmd/Ctrl+S, F5) renders the edit list with ffmpeg and writes it back over the original after a local backup (§5) — the edit list only, never the rectangle; Export writes `<stem>.cut-<in>-<out>.<ext>` of the timeline, cropped, next to the original on the remote. |
+| A4 | Video: view + rectangle crop + time cut; cut / copy / paste on the timeline, previewed at once, rendered only on Save (msg 13) | Built-in window plays the video with sound; scrub timeline; a drag on it selects (`I`/`O` set the selection's edges at the playhead); Cmd/Ctrl+C / X / V, Delete, Cmd/Ctrl+Z / Shift+Cmd/Ctrl+Z edit the timeline and never start ffmpeg — playback and the paused frame show the edited timeline at once; drag a crop rectangle (Export crops its whole output by it); Save (Cmd/Ctrl+S, F5) renders the edit list with ffmpeg and writes it back over the original after a backup (§5: a local copy of a local file, a hard link beside a remote one) — the edit list only, never the rectangle; Export writes `<stem>.cut-<in>-<out>.<ext>` of the timeline, cropped, next to the original on the remote. |
 | A5 | Audio (mp3/wav): view + time cut; cut / copy / paste, both channels shown, Mono → Stereo (msg 13) | Same window: waveform (a stereo file in two lanes, L and R), play, the same selection and edits, `M` = Mono → Stereo on a mono file (left = right = its channel, heard in playback and written by Save), Save, Export. |
 | A6 | "아무 파일"; binary files open in a hex editor by default, after a dialog (msg 9) | Any other type (a zip, any binary) opens a small dialog before anything is downloaded — name, size, type when the extension says it: Enter = "Open in hex editor" (the default: sopen's hex window, §6a — a remote file is viewed as a stream, with nothing fetched first, [06](06-streaming.md) §7.1); "Save to…" downloads it to a path the owner picks (the download folder by default, never over an existing file); Esc or closing it downloads nothing. `sopen --hex SOURCE` opens any file straight in the hex window. `--app <App>` still opens it in a named local app and uploads it back when the user presses Enter in the terminal. With no display (Linux over ssh) the file is fetched and its path printed, and one line says why. |
 | A7 | Rust, macOS + Linux, `brew install …` and use immediately | `brew install 2lab-ai/tap/sopen-preview` on macOS (arm64, x86_64) and Linux (x86_64, aarch64) installs `sopen` and the `ffmpeg` it needs; the first `sopen host:/a.mp3` works with no further setup. |
@@ -111,8 +111,9 @@ its git panel changes repositories, every history rewrite or destructive action 
 | A16 | Split an audio track into voice and music (msg 13) | `sopen stems host:/a.mp3` writes `a.voice.mp3` and `a.music.mp3` next to it — new files, never over anything — and prints both paths; a video gives `.m4a` (AAC) stems; on a 0 dB voice/music mix each stem is ≈ 14 dB SDR (§7a). `brew install` brings the model; a missing or different model is one error naming the path it expected. The window gets its button in a later change; its child-process API is §7a's. |
 
 Owner message 17 (2026-11-20, quoted in [`06-streaming.md`](06-streaming.md)) asks that every viewer
-stream and that edits live locally until saved. Its contract is planned, and this file describes
-what ships until each work unit lands:
+stream and that edits live locally until saved. Its contract shipped on 2026-11-23: viewing is
+[06](06-streaming.md), editing [07](07-streaming-edit.md), and this file says what they mean for
+each window (§3a, §5–§8):
 
 | # | Owner intent | Acceptance (observable) |
 |---|---|---|
@@ -130,6 +131,18 @@ what ships until each work unit lands:
 | audio | `mp3 wav flac m4a aac ogg opus` | media window |
 | other | everything else | the binary dialog: hex window (default) or Save to… (A6, §6a) |
 
+- A remote file that opens in one of sopen's windows is read as a stream ([06](06-streaming.md)
+  §13): nothing is fetched before the window shows, whatever the file's size. The connection
+  that resolved the path, stat'ed it and sniffed its kind becomes the stream's transport, and
+  the window's own connection is made at its first use: a Save, or an earlier session's journal
+  to check on open ([07](07-streaming-edit.md) §3). An image's window reads the header,
+  then the whole file into memory (its decode needs every byte) and gives way to the hex window
+  on the same stream where the image does not decode or the owner picks Hex view (§6). A video
+  or a sound is read by ffmpeg through the window's loopback byte server (§7); a `.ts` is probed
+  through it, and one ffprobe does not read as media goes to the binary dialog. Without a
+  display, and with no scripted save or export, the file is fetched and its local path printed
+  instead (nothing to stream to). A local file is read in place, but for an image, which is
+  copied into the cache first (its Save needs the bytes as opened).
 - VS Code is found as `code` on PATH, then on macOS `/Applications/Visual Studio Code.app/Contents/Resources/app/bin/code` or the same path under `~/Applications`. Remote - SSH counts as installed when a directory `ms-vscode-remote.remote-ssh-<version>` is in `$VSCODE_EXTENSIONS` (when non-empty) or `~/.vscode/extensions` and is not a key of the `.obsolete` JSON object there; VS Code is not started to check. Without a usable VS Code, Zed is found as `zed` / `zeditor` on PATH, macOS also `/Applications/Zed.app/Contents/MacOS/cli`. Neither found: text → fetch, run `$VISUAL`/`$EDITOR` in the terminal, upload on exit if changed; F4 in the browser says in its status row that neither was found. A folder opens in an editor only where the browser cannot open (no display, §3a); then neither found is an error that names the missing editors.
 - On Linux, when `XDG_CURRENT_DESKTOP` names KDE (any case, anywhere in its colon-separated list) and
   `SOPEN_RAISE` is not `0`, sopen brings the editor's window to the user after the hand-off — the CLI's own and the
@@ -172,12 +185,13 @@ what ships until each work unit lands:
 A folder opens in a sopen window titled `host:/abs` (the local path for a local folder). Its rows
 are where PC Shell puts them: the program's name on the top row; two file panels side by side,
 each in a frame with its folder (`host:/abs`) centred in the top border and the active panel's
-frame drawn heavier; the status row (a fetch's progress, the last result, else what the keys do);
+frame drawn heavier; the status row (an opening's or an operation's progress, the last result, else what the keys do);
 the bottom row lists the F-keys that work there and nothing else (the list, since slice S1 of the
 browser workstream: 1 Help, 2 Rename, 3 View, 4 Edit, 5 Copy, 6 Move, 9 Dual — `Prevw` in dual
 mode; a viewer: 1 Help, 3 Exit, 4 Edit and the viewer's own — the text viewer's 2 Unwrap (Wrap once unwrapped),
-an alias of W; the hex window's 5 Save, 6 Goto, 8 Asc/hx, aliases of ⌘S, ⌘G and Tab; and the
-image window's 5 Save; a plain F-key never acts while a text field has the typing). The foot shows `N Listed = N bytes` whole inside the frame whatever the width: the
+an alias of W; the hex window's 5 Save, 6 Goto, 7 SaveAs, 8 Asc/hx, aliases of ⌘S, ⌘G, ⌥⌘S and
+Tab; and the image and media windows' 5 Save and 7 SaveAs; a plain F-key never acts while a text
+field has the typing). The foot shows `N Listed = N bytes` whole inside the frame whatever the width: the
 free space gives way first, then the end of the total. Every cell fits its column at a glyph
 boundary (a name or an extension too long ends in "…"; a size too long for its column is said in
 the smallest unit that fits, KB to EB, never cut). All drawing of those rows, the frames, the bar and every colour sits in
@@ -216,11 +230,13 @@ too, where F3 closes it as ⌘W does.
   first frame with its size and duration, a sound's waveform — of its first 10 minutes when it is
   longer — with its whole duration; a file over a preview budget, 02 §4.3, or one that cannot be
   read as an info card saying why); on a folder or `..` it shows its own list (the git panel
-  comes with S2). A preview takes no key, click, drag or wheel, claims nothing in the cache (a
-  remote file is read into a private copy under `<cache>/.preview/`, removed with the preview)
-  and is prepared one at a time on one connection; Enter or F3 on the file makes the live
-  preview the viewer (a remote copy is published into the cache by a hard link; a preview still
-  reading goes on as the opening). **F9** switches to **dual mode** — two lists, as before — and
+  comes with S2). A preview takes no key, click, drag or wheel, claims nothing in the cache and
+  writes nothing to disk (a remote file of any kind is read through a stream on the window's one
+  preview connection, which becomes the stream's transport: an image read whole into memory,
+  text, hex rows, a video and a sound only as far as they show, 02 §4.3–§4.4), and is prepared
+  one at a time on that connection; Enter or F3 on the file makes the live preview the viewer
+  (a streamed preview hands its stream over, nothing read twice; a preview still reading goes on
+  as the opening). **F9** switches to **dual mode** — two lists, as before — and
   back; slot 9 names the mode it switches to. The mode is the window's and is not saved.
 - **Selection and file operations** (msg 15; [04](04-file-keys.md) §3–§5, S1's part). Space or
   Ins selects the bar's entry and steps down; `+` and `-` select and unselect by a pattern, `*`
@@ -247,36 +263,55 @@ too, where F3 closes it as ⌘W does.
   entry — folder or file — in the external editor, VS Code then Zed, chosen as A2 chooses (§3);
   a click puts the bar on a row, a double click opens it; the wheel scrolls the rows, and the
   next key brings them back to the bar. While a file is being made ready only Esc works (it
-  stops a fetch); while a folder is listed, no key; a preview being prepared holds no key, and a
+  stops the opening); while a folder is listed, no key; a preview being prepared holds no key, and a
   running file operation only a second operation (02 §6).
 - **Enter on a file** opens the viewer for its kind (§3: extension, then the sniff) in the same
   window, in place of the two panels: text → the text viewer; image → the image window; video
   and audio → the media window (a `.ts` ffprobe cannot read as media → hex); anything else → the
   hex window (the binary dialog's "ask first" is not needed here: the hex view is the default).
   The path is resolved first (a link opens, and saves, as the file it points at: §5). A remote
-  file the hex window shows, of any size, and remote text of at most 16 MiB are viewed as a
-  stream ([06](06-streaming.md) §7.1, §7.2, §13; the text viewer is the browser's alone —
-  `sopen host:/file.txt` on its own still opens the editor, §3): the viewer opens at once, shows its first
-  64 KiB block when it arrives and reads on as the view moves; nothing is fetched whole and
-  nothing is written to the cache. Any other remote file — an image, video, audio, and text over
-  16 MiB until 06's W5b — is fetched into the cache exactly as the standalone routes fetch it
-  (claimed, recorded, an earlier copy's unsaved edits moved aside), with its progress on the
-  status row; Esc stops the
-  fetch (and the indexing of a text file, checked every MiB): the partial copy is removed and the cached copy left as it was, also when Esc comes
-  after the last byte but before the copy is in place. Esc once the copy is in place (while the
-  file is decoded, probed or indexed) keeps the viewer from opening; the fetched copy stays in
-  the cache, recorded, and the status row says so. An image is always a
-  copy (Save needs the bytes as opened); local media, text and other files are read in place.
-  Message 17 replaces this whole-file fetch, and the cached copy the text viewer reads, with a
-  stream for every viewer ([06](06-streaming.md) §7, planned).
-  Each viewer gets a connection of its own (its Save and Export use it), and the copy it shows
-  stays claimed until it is gone. The viewers keep exactly their edits, keys and Save rules
-  (§6, §6a, §7); no new save path.
+  file of any kind and any size is viewed as a stream ([06](06-streaming.md) §7, §13; the text
+  viewer is the browser's alone — `sopen host:/file.txt` on its own still opens the editor, §3):
+  nothing is fetched before it shows, and nothing is written to the cache. Text and hex rows open
+  at once, show their first 64 KiB block when it arrives and read on as the view moves. An image
+  reads its header, then the whole file into memory with its progress (06 §7.3; Esc stops the
+  read, keeps nothing and shows the list again), and gives way to the hex window on the same
+  stream when it does not decode or the owner picks Hex view (§6). A video or a sound is probed
+  through the window's byte server before its viewer shows (§7); Esc stops that wherever it
+  waits — a stalled read, the probe (ffprobe is killed, one not started yet is never started) —
+  and an empty one is said to be empty. A local image is copied into the cache first (claimed,
+  recorded, an earlier copy's unsaved edits moved aside: its Save needs the bytes as opened),
+  with its progress on the status row; local media, text and other files are read in place.
+  Esc stops a local image's copy and a local text file's index pass (checked every MiB): the
+  partial copy is removed and the cached copy left as it was, also when Esc comes after the last
+  byte but before the copy is in place. Esc once the copy is in place (while the image is
+  decoded) keeps the viewer from opening; the copy stays in the cache, recorded, and the status
+  row says so. A streamed viewer's own connection is made at its first use — a Save, Save As or
+  Export (§5), or an earlier session's journal to check on open — and a cached copy a viewer shows
+  stays claimed until it is gone. The viewers keep exactly their edits,
+  keys and Save rules (§6, §6a, §7); the browser adds no save path of its own.
 - **The text viewer** is read-only: line numbers, syntax highlighting (syntect — Sublime
   syntaxes and themes, on the pure-Rust regex engine, nothing linked) chosen by the extension or
   the whole name, else by the first line (a shebang) as read through an index that may be read —
-  at open and again from each new index. It never reads the file whole: opening indexes the lines
-  in one pass (a mark every 256 lines, and at the first line start 64 KiB past the last mark).
+  at open and again from each new index. It never reads the file whole for a screen. Its index
+  holds a mark every 256 lines, and one at the first line start 64 KiB past the last mark.
+  - **A local file** is indexed in one pass at open, on the opener's worker, before its first
+    screen: every line has its number.
+  - **A remote file**, read through its stream ([06](06-streaming.md) §7.2), shows its first
+    screen from its first 64 KiB block, then indexes its first 16 MiB in the background (the top
+    bar says `lines known to 3.1 MB of 24 GB` until the index is whole). Past that prefix the
+    place on screen is a byte offset: the index grows from the blocks the screen reads next to
+    it, the gutter shows a line's byte offset (`0x…`, dim) where its number is not known, the
+    status row names the page by its bytes, and a line whose start is not found within 64 KiB
+    back is shown from the 16 KiB grid point before the place (`line start not known`).
+  - **Go to** (Cmd/Ctrl+G) opens a field in the status row: a line number, or `0x…` for a byte
+    offset; Enter goes there, Esc leaves the field. A line past a stream's prefix runs the index
+    pass up to it, with its progress (`indexing… 1.2 GB of 24 GB · Esc stops`); it is the only
+    thing that reads a large file through, and only when asked.
+  - The index's memory is bounded, for local files too: 16 MiB, or 48 bytes per 64 KiB of
+    indexed text where that is more (17.6 MB for 24 GB); past 1 Mi marks the line spacing
+    doubles and the marks no longer due are dropped.
+
   Invalid UTF-8 shows as U+FFFD (each maximal bad sequence one, as Rust's lossy decoding has it);
   a control character as its code page 437 glyph.
   - **Wrapped** (the default, msg 13): every line is shown whole, in rows as wide as the window,
@@ -311,13 +346,17 @@ too, where F3 closes it as ⌘W does.
     character is never decoded cut in two at a read's edge. The status row says which
     lines are on screen and, when the top row is inside a line, how far into it (`line 7 (12 % of
     it) of 120`); the scroll bar's thumb goes by bytes (rows cannot be counted without reading
-    everything). A narrower or wider window, or a new index, puts the top back on the start of the
+    everything), and a click on it, or a drag let go, is a jump there (a place the thumb only
+    passes is not read). A narrower or wider window, or a new index, puts the top back on the start of the
     row it is in. A highlighted line's colours run on across its rows.
   - **Unwrapped** (W or F2 again): one row per line, ↑/↓, PgUp/PgDn (a page keeps one line of
-    context), Home/End and Cmd/Ctrl+Home/End (start and end of the file), ←/→ scroll sideways, the
-    wheel scrolls; a page reads at most 64 KiB before it plus the shown part of each line. 4096
-    bytes of a line are shown (the bar says when lines are cut; a real character cut in two at the
-    end of a cut line is left out; bytes that can never start one stay U+FFFD).
+    context), Cmd/Ctrl+Home/End (start and end of the file), the wheel scrolls; a page reads at
+    most 64 KiB before it plus the shown part of each line. A line of any length can be scrolled
+    to any byte: the place within a line is a byte of it, which ←/→, Home, End and the wheel
+    sideways move, and a row is read under the wrapped row's bound around it. Home is the
+    line's start, and the file's start when already there; End is the line's end at the right
+    edge (placed by what its last characters paint as), and the file's end when the line already
+    ends on screen. The scroll bar goes by lines once every line is known, else by bytes.
 
   Highlighting carries state from the top of the file: the
   state at each mark is computed once, on a worker of the viewer's own with its own handle on the
@@ -331,7 +370,9 @@ too, where F3 closes it as ⌘W does.
   highlighting is busy in other viewers. A worker that fails (a read error, a panic) leaves the
   page plain, ready, with the reason on the status row. A line is parsed only whole, so
   highlighting stops at the first line over 4096 bytes (the status row says which) and the rest
-  is plain — wrapped, still whole; files over 16 MiB are shown plain. A run of more than 128
+  is plain — wrapped, still whole; a file over 16 MiB is highlighted over its first 16 MiB and
+  plain past them, read in place or through a stream alike (the status row says `highlighted over
+  its first 16.8 MB`; 06 Tensions). A run of more than 128
   letters, digits and underscores (a hex blob, a long name) reaches the parser shortened, to
   more than 128 and fewer than 256 of its own characters in their order — its first and last 32
   and, between them, its stretches of one character, a lone one kept alone and a repeated one
@@ -400,30 +441,37 @@ too, where F3 closes it as ⌘W does.
   again each second with no input (one stat), so a growing log is followed without a key press —
   also one written to without pause (each re-read is used though the file grew during it); away
   from the end it is looked at only on the next frame. A path that names nothing any more keeps
-  the last page with "the file was deleted" and reads no more. A remote file is viewed from its
-  cached copy, which does not change under the viewer and is not followed. A write that lands
+  the last page with "the file was deleted" and reads no more. A remote file read through its
+  stream is checked against the handle's size and modification time taken at open, by an `fstat`
+  after every batch of reads and by a poll while it is shown ([06](06-streaming.md) §5): a file
+  changed under the handle freezes the page (`the file changed on the remote — Cmd/Ctrl+R
+  reloads`), and a file replaced under the path keeps showing the version opened, saying so; it
+  is not followed like `tail -f`. A write that lands
   between a change and its detection, or one that only looks like growth (written in place, no
   shorter), cannot make a read run away: a line is never read past where the index says it must
   end — the next mark, or 64 KiB past its own block's mark when the next line was no mark — and
   one that does not end there makes the index unusable and starts a re-read. Offsets from the
   index are always checked.
 - **Leaving a viewer** — Esc or F3 (when the viewer does not use Esc itself: the image and media
-  windows' Esc first clears a drawn rectangle, and while the image window's Save runs, Esc stops
-  that Save before its rename instead — the viewer stays (07 §10); an Esc that takes the keyboard
+  windows' Esc first clears a drawn rectangle; while a Save runs, Esc stops that Save before its
+  rename instead — the image and media windows' at any step before it, a streamed hex file's
+  between its requests — and the viewer stays (07 §10); while the media window exports, Esc is
+  the export's Cancel (§7); an Esc that takes the keyboard
   from a text field is the field's), or closing the window — goes through that viewer's own close
-  question: its unsaved-changes prompt (Save / Discard / Cancel), its "closes when the save is
-  done" (leaving never cuts a running save off), its second close during an export. The viewer
-  goes only once it says yes; Esc then shows the list with the bar where it was, and closing the
-  window closes it. Cancel keeps the viewer. A save or export still running when a viewer goes is
-  waited for before sopen exits, its result printed, as its own window's opener does. A fetch
-  running when the window closes is stopped.
+  question: its unsaved-changes prompt (Save / Save As… / Discard / Cancel), its "closes when the
+  save is done" (leaving never cuts a running save off), its second close during an export. The
+  viewer goes only once it says yes; Esc then shows the list with the bar where it was, and
+  closing the window closes it. Cancel keeps the viewer. A save or export still running when a
+  viewer goes is waited for before sopen exits, its result printed, as its own window's opener
+  does. An opening still running when the window closes is stopped.
 - F4 in a viewer opens its file in the external editor too; the viewer stays.
 - **Without a display** (Linux over ssh) a folder opens in the editor as before message 12, with
   one line on stderr saying why. `SOPEN_LIST` prints the browser's listing (the path, a row per
   entry, the foot) instead of a window; a scripted save or export (`SOPEN_AUTOSAVE`,
   `SOPEN_AUTOEXPORT`) on a folder is an error (nothing to act on).
-- With `--target` the browser runs on HOST, which lists the folder over SFTP as it fetches any
-  file; nothing new is forwarded but the `SOPEN_LIST` receipt hook.
+- With `--target` the browser runs on HOST, which lists the folder over SFTP as it streams any
+  file; nothing new is forwarded but the receipt hooks (`SOPEN_LIST`, and the stream's
+  `SOPEN_STREAM_STATS` and `SOPEN_STREAM_THROTTLE`).
 - **Usage log:** a browser session is one line, kind `dir`; its action is `save` / `export` when a
   viewer in it saved or exported, and a viewer whose last save was refused makes the exit code 3.
 
@@ -467,7 +515,7 @@ one: `box.lan` from a machine named just `box` is forwarded, and so is `box.othe
 
 SOURCE is rewritten to what HOST must be given. A file on HOST itself (`[user@]HOST:path`, with no user or HOST's
 user) becomes `path`, which HOST opens as a local file; a relative path stays relative to HOST's home, where the
-command starts. A file on any other machine is passed unchanged, and HOST fetches it over SFTP itself. A local path
+command starts. A file on any other machine is passed unchanged, and HOST opens it over SFTP itself. A local path
 becomes `<this machine's short host name>:<absolute path>`, and a loopback source (by the same rule:
 `localhost:path`, `[::1]:path`, not `localhost.example.com:path`), which would mean HOST itself there, becomes
 `<this machine's short host name>:path` — so HOST must reach this machine
@@ -520,13 +568,21 @@ symlink keeps its link). A new file is readable by its owner only (0600); a repl
 
 ## 5. Writes back (conflict-safe, never silent)
 
-- Every fetch records the remote `(size, mtime)` and the SHA-256 of the fetched bytes. The write target is the
-  `realpath` resolved at fetch time.
+- **The baseline** is the file as sopen opened it. Every fetch records the remote `(size, mtime)` and the
+  SHA-256 of the fetched bytes. A file read through a stream ([06](06-streaming.md)) is not fetched: its
+  baseline is the handle's `(size, mtime)` at open and, up to 256 MiB, the SHA-256 of the file as opened — the
+  image window's from its whole read, the hex and media windows' from a baseline pass over the stream that
+  starts at the first edit (`checking the file for Save — 37 %`; a Save waits for it). Above 256 MiB a
+  media file's baseline, local or remote, is the SHA-256 of its first and last MiB instead. A hex edit also keeps the
+  hash of each edited 4 KiB page as the window showed it, which every Save checks whatever the size
+  ([07](07-streaming-edit.md) §4.5). The write target is the `realpath` resolved when the file was opened.
 - Before any write: `lstat` the target. If it is gone, now a symlink or not a regular file, or its size or mtime
-  differ — or, up to 256 MiB, its content hash differs (above that: size and mtime only, and the result says so) —
-  refuse, keep the edited local copy, print its path. No overwrite. A server that leaves out size, mtime,
-  permissions, type or owner gets no write.
-- Write = create `.<name>.sopen-<random>` exclusively in the same remote directory → through its open handle
+  differ — or, up to 256 MiB, its content hash differs (above that: size and mtime, the hex window's edited pages
+  and the media window's first and last MiB, and the result says what was checked) — refuse: nothing is
+  written, and the edits stay where they were kept (the edited local copy, the window and its journal), named.
+  No overwrite. A server that leaves out size, mtime, permissions, type or owner gets no write.
+- **The upload route** (image and media Save, a local file's hex Save, `--app`, the terminal editor). Write =
+  create `.<name>.sopen-<random>` exclusively in the same remote directory → through its open handle
   (fsetstat, never by path): the target's owner, its permission bits, the content, then the full mode again (writing
   clears set-id bits) → `fsync@openssh.com` if offered → check the temp has the target's owner and mode (refuse if
   not) → re-check → `posix-rename@openssh.com` over the target (plain rename if not offered). Only a temp this
@@ -536,8 +592,52 @@ symlink keeps its link). A new file is readable by its owner only (0600); a repl
   differs from it right after the rename, that is reported ("saved, but the remote changed right after") and the next
   save refuses. A server without `posix-rename@openssh.com` cannot replace a file in one step: Save is refused before
   anything is uploaded, and Save copy (a new sibling) is offered.
+- **A streamed hex file's Save moves bytes, not the file** ([07](07-streaming-edit.md) §4). Its route is decided
+  before anything is written, from what the server offers and the free space in the target's folder:
+  - **Server copy** (`copy-data` and `posix-rename`, room for the file's size + 1 GiB, or no `statvfs`): the server
+    copies the file into the temp, in requests sized to about 1 s each with an fsync every 2 GiB or 10 s
+    (`saving — copying on <host> 37 % (8.9 of 24.0 GB)`; Esc stops it between requests, the temp removed); the
+    changed runs are written into the temp at their offsets; the temp is fsynced, given the target's owner and
+    mode, and renamed over the target. Size and mtime are checked four times — at open, before the copy, after
+    it and right before the rename — and the content once the copy is made: up to 256 MiB the whole temp is read
+    back and hashed against the baseline, and at every size each edited page is read back and compared with the
+    page as shown. A 4-byte Save of a 24 GB file sends 4 bytes of file content.
+  - **Streamed rewrite** (no `copy-data`, at most 256 MiB): the same steps, with the copy, the patch and the
+    content check one fresh pass through this machine, the patches applied on the way.
+  - **Refused**, with the reason and the cost, before any transfer: above 256 MiB without `copy-data`
+    (`rewriting 24.0 GB through this machine moves 48.0 GB …`), or without room for size + 1 GiB (`needs 24.0 GB
+    free in /data, has 3.1 GB`). The refusal row offers **Write in place…** and **Save As…**.
+  - **Write in place…**, only from that row, behind a dialog that says it is not atomic: the target is opened
+    read-write without truncating, its edited pages are checked, the undo file is made durable, then the runs are
+    written and fsynced. A write or fsync with no reply is an unknown outcome on the target itself (`<file> may
+    hold some of your changes — check it; the original bytes are at <undo file>`).
+  - A server without `fsync@openssh.com` cannot flush: the Save goes ahead and says so before it starts and in
+    its result.
 - Conflict detection is best-effort: it catches changes made before you save (size, mtime, and content hash up to
-  256 MiB); it cannot lock the remote file, so a write racing the final rename is not detected.
+  256 MiB); it cannot lock the remote file, so a write racing the final rename is not detected. Above 256 MiB a
+  Save checks size, mtime and what its window holds evidence for (a hex edit's pages, a media file's first and
+  last MiB), and its result says so (`checked size, modification time and the 8 KiB under your edits, not the
+  whole content`). The hex window's first Save of a session on a file above 256 MiB asks once: `A program
+  writing to the file while it saves can lose that write`. Which writes a Save can lose — a change made after the
+  copy read its region with the mtime put back, one between the last check and the rename — and which it keeps
+  (one the copy captured outside the edited pages, above 256 MiB) is 07 §4.5's table.
+- **The journal.** Every unsaved edit of the hex, image and media windows is kept on the local disk as well as in
+  memory, in a new owner-only kind of file: `<cache>/.edits/<host>/<abs path>.journal-<UTC stamp>-<8 hex>/`
+  (0700, its files 0600, created exclusively, never through a link, its creation fsynced in its parent), made at
+  the first edit ([07](07-streaming-edit.md) §3). Each generation is one immutable file holding the baseline, the
+  evidence and the edits together, made durable (fsynced, renamed to a new name, the folder fsynced) and named by
+  `CURRENT`, which is replaced atomically. One is written at most 250 ms after a change, and at once on focus
+  loss, at close and before a Save; the status bar says `unsaved — keeping…`, then `unsaved — kept at <journal>`,
+  or `unsaved — NOT kept on disk (<why>)`. It is removed once nothing is unsaved, or by Discard, and kept on any
+  other ending. The next open offers it in a recovery row — Restore (after checking the file's content against
+  the journal's evidence), Later, Discard. A scripted run keeps none.
+- **The save intent.** Every Save of every route records what it is doing in the journal's `save` file, durably,
+  before each request that changes the remote: the temp's name before its exclusive create, the temp's stat once
+  created, the staged temp's stat and the post-save evidence, then `renaming` ([07](07-streaming-edit.md) §3.1). A
+  Save cut off (sopen killed, a reply lost) is reconciled from fresh reads on the next open or at the next Save's
+  start: landed (`… landed (found now): nothing was written again`), not landed (its edits offered back), or
+  unknown (the target and the temp named). A temp is removed only when the record proves it was the Save's;
+  any other is kept, named, and its removal asked (Remove it / Keep it).
 - Any save that does not land moves the edited copy aside to `<copy>.conflict-<UTC stamp>` and prints that path. A
   fetch never overwrites a cached copy holding unsaved edits: it moves it aside first, and says what is known — "had
   unsaved edits" when the copy differs from what sopen recorded, "no record of what was fetched … kept it … in case
@@ -565,18 +665,59 @@ symlink keeps its link). A new file is readable by its owner only (0600); a repl
   SFTP status reply proves a rename, link or exclusive create did not happen; a timeout or a lost reply (connection
   closed, EOF, garbled reply) is "outcome unknown — check <path>", never "nothing was written", and a temp or export
   that may have been created is named, not removed.
-- Image Save (Cmd/Ctrl+S) overwrites the original **after** copying the fetched original to the local backup
-  `<cache>/.backup/<host>/<abs path>.<UTC stamp>` and printing that path; media Save (§7) does the same with the
-  file it plays, then renders. "Save copy" writes `<stem>.edited.<ext>`
-  next to the original instead. Media Export never overwrites (sibling file; `-N` suffix if the name exists): it is
-  published by hard link from a temp, or — where links are unavailable — written into a name created exclusively.
+- **Backups.** Image Save (Cmd/Ctrl+S) overwrites the original **after** writing the original as opened (its
+  bytes, held in memory) to the local backup `<cache>/.backup/<host>/<abs path>.<UTC stamp>` and printing that
+  path; a local file's hex Save does the same (§6a), and a local file's media Save (§7) copies the file it
+  plays, then renders. Two Saves keep no local copy of the original:
+  - **A streamed hex file's Save** keeps a local undo file, `<cache>/.backup/<host>/<abs path>.<UTC
+    stamp>.undo.txt` (0600): the bytes this session's Saves replaced, one `0xOFF: OLD` line per run, made
+    durable before the target changes. It reverts sopen's own overwrites, not another writer's change a Save
+    kept. The hex window lists a file's undo files in its recovery rows, and **Load as edits** makes those
+    bytes unsaved edits, which a Save then writes with every check; nothing writes one back without a window
+    and a Save ([07](07-streaming-edit.md) §5.1).
+  - **A remote media Save** keeps the original on its own host: the session's first Save, once its render is
+    staged, links the original to `.<name>.sopen-backup-<UTC stamp>` beside it (`hardlink@openssh.com`, never
+    over anything), then overwrites. The status line says so while it renders, and the result names the link
+    and its size: it is the original's inode, not a copy, so other links or programs that have it open can
+    still change it. A Save that does not land removes the link (an unknown outcome keeps and names it). A
+    server without hard links has no remote media Save; Save As and Export are offered (07 §5.3).
+
+  "Save copy" writes `<stem>.edited.<ext>` next to the original instead (a streamed hex file's by the server
+  copy or the streamed rewrite, published by a hard link, never over anything). Media Export never overwrites
+  (sibling file; `-N` suffix if the name exists): it is published by hard link from a temp, or — where links
+  are unavailable — written into a name created exclusively.
+- **Save As** (Alt+Cmd/Ctrl+S, F7: the hex, image and media windows) writes the edited result to a new local
+  file, by "Save to…"'s rules (§6a: a private staging folder, a hard-link publish, never over anything, nor
+  through a link), after checking the chosen folder's free space; the hex window reads the unchanged bytes
+  fresh from the remote and applies the edits on the way, the image window writes its encoder's output, and
+  the media window renders in sopen's own exports folder and copies the render in. Its modal shows the size and
+  the time expected, its progress and Cancel ([07](07-streaming-edit.md) §7).
 - Live receipts run only on files created under the remote `/tmp` for that purpose.
 
 ## 6. Image window (A3)
 
+- Opening ([06](06-streaming.md) §7.3): the header first, by a walk capped at 1 MiB (a JPEG's marker segments
+  up to its SOF, read by sopen's own walk), then the whole file into memory, with `W×H, N MB, loading N %`, the
+  Exif thumbnail scaled up and, for JPEG and PNG, a partial picture as the bytes come; Esc stops the read and
+  keeps nothing. A decode that needs over 512 MiB, or a file over 512 MiB, first shows the memory needed and
+  the machine's (`… — Continue (Enter) · Hex view (H) · Close (Esc)`), and nothing more is read until the owner
+  continues; this applies to local images too. Hex view, and a file that does not decode, open the hex window
+  in place, on the same stream for a remote file, the reason first in its rows.
 - Fit-to-window view, zoom (wheel / pinch), pan; status bar shows image size, rectangle `x,y w×h`.
 - Drag = rectangle in image pixels (handles to adjust). `C` Crop, `P` Pixelize (block size, default 16 px), Undo/Redo
-  (Cmd/Ctrl+Z / Shift+Cmd/Ctrl+Z), Cmd/Ctrl+S Save, Save copy, Esc clears the rectangle.
+  (Cmd/Ctrl+Z / Shift+Cmd/Ctrl+Z), Cmd/Ctrl+S (F5) Save, Shift+Cmd/Ctrl+S Save copy, Alt+Cmd/Ctrl+S (F7) Save
+  As (§5), Esc clears the rectangle.
+- Edits are kept in the journal (§5) as operations on the file as last saved — `crop`, `pixelize`, `cut`,
+  `paste` with its picture kept by its hash, `text` — and Restore replays them on the decoded original once its
+  SHA-256 equals the journal's. An Undo back past a Save leaves a picture the journal cannot replay: the status
+  bar says `unsaved — NOT kept on disk (undone past the last save, …)` until the next Save, and the close
+  prompt still guards it ([07](07-streaming-edit.md) §8).
+- While a Save, Save copy or Save As runs the window takes no edit, undo or redo (`saving — editing resumes
+  when the save is done`); the status row says where the Save is (`encoding`, `uploading`, `checking the file`,
+  `replacing the file`) and Esc stops it up to the rename — the temp removed, the original untouched. Closing
+  or leaving the viewer waits for it. The result is `saved host:/abs · original backed up at <path>`.
+- Closing with unsaved edits asks Save · Save As… · Discard · Cancel (Save copy where Save is off); the
+  window closes only after a save that landed.
 - Clipboard (msg 12 item 3): Cmd/Ctrl+C copies the rectangle — the whole image without one — as a picture;
   Cmd/Ctrl+X copies it and fills it with the background colour (white; transparent offered on an image with alpha);
   Cmd/Ctrl+V pastes into it a picture — stretched (the default), fitted (aspect kept, centred, the rest in the
@@ -623,8 +764,8 @@ nothing and closing waits for it.
   the cache (a `.ts` that turned out not to be media) is opened as it is. Every step that can fail
   (opening the file, its handle's stat) comes before the connection is handed to the hex window:
   after a failure the dialog is as it was, with its connection, for a retry or "Save to…". The
-  hex window's first Save connects again and fetches the whole file then (06 §7.1, until 07's
-  Save).
+  hex window's first Save connects again and saves by §5's routes for a streamed file: nothing
+  of the file is fetched for it.
 - Save to…: bytes are never put under the chosen name before they are complete, and never over, or
   through, anything already there (a file, a link). The chosen path's folder is opened once (a link
   to a folder is followed at that moment) and everything after goes through that descriptor, never
@@ -657,16 +798,17 @@ nothing and closing waits for it.
   copy) is copied the same way, checked by its handle: size, mtime, change time and bytes copied.
   Then "saved <path>" shows a moment, the same line is printed on stdout, and the window closes —
   unless there are notes to read (a Close button then).
-- Closing the window during a fetch or a download does not cut it: the window says it closes when
-  the transfer is done, and does. A transfer whose worker ends without a result is a final, visible
-  failure (the window says so and offers only Close; a close asked for meanwhile closes it). The
-  line on the terminal when nothing was opened or saved says "nothing was downloaded" only when no
-  transfer was started; a hex fetch that landed while the window closed is said as such.
+- Closing the window while the hex window is being opened does not cut the opening: the window says
+  it closes when that is done, and does; closing during a "Save to…" cancels it (above). A transfer
+  whose worker ends without a result is a final, visible failure (the window says so and offers
+  only Close; a close asked for meanwhile closes it). The line on the terminal when nothing was
+  opened or saved says "nothing was downloaded" only when nothing was started.
 
 `sopen --hex SOURCE` opens any file (any kind; not a folder) straight in the hex window — no dialog;
-a remote one is fetched first, with the progress on the terminal. `--hex` and `--app` are exclusive.
-With no display (Linux, neither `DISPLAY` nor `WAYLAND_DISPLAY`) the dialog and `--hex` fall back to
-fetching the file and printing its local path, with one line on stderr saying why.
+a remote one opens as a stream on the open's connection, nothing fetched ([06](06-streaming.md)
+§7.1). `--hex` and `--app` are exclusive. With no display (Linux, neither `DISPLAY` nor
+`WAYLAND_DISPLAY`) the dialog and `--hex` fall back to fetching the file and printing its local
+path, with one line on stderr saying why.
 
 **The hex window** has the image and media windows' look and layout rules: a one-line toolbar on
 top, a one-line status bar at the bottom, nothing that changes size while you work. The grid's top
@@ -678,7 +820,12 @@ once the primary button is up, and take rows off the grid's bottom.
   in hex grouped 8 + 8, and the ASCII column (non-printable bytes as `.`). Only the rows on screen are
   read and painted: the file is read through a small page cache (at most 64 pages of 4 KiB; the least
   recently used goes first), never whole, so a file of any size scrolls the same. The grid has its
-  own scroll bar (row positions are kept as 64-bit row numbers, not as pixels).
+  own scroll bar (row positions are kept as 64-bit row numbers, not as pixels). Over a stream
+  ([06](06-streaming.md) §7.1) a page not here yet shows `··` in the dim colour and the status row
+  says `loading 0x…`; a failed one says why and is retried; the stream's warning (the file changed
+  or was replaced on the remote, a failed read) stays in the rows below the grid, and Cmd/Ctrl+R
+  reloads (refused while edits are saved nowhere). A drag of the scroll bar reads only where the
+  thumb rests.
 - The cursor is on a byte, shown in both columns (filled in the column that types, outlined in the
   other). Arrows, PgUp/PgDn, Home/End (start / end of the row), Cmd/Ctrl+Home/End (start / end of the
   file), a click places it (in the column clicked), Tab switches the column, the wheel scrolls (three
@@ -689,15 +836,27 @@ once the primary button is up, and take rows off the grid's bottom.
   the high nibble, the next one the low nibble, and the cursor moves on (the two digits are one undo
   step, also at the undo bound); in the ASCII column a printable ASCII character overwrites the
   byte. Edits are a sparse map offset → the byte wanted there, in absolute values (and each undo
-  and redo step records the bytes shown before and after) — the cached copy is never written;
-  whether a byte is changed is a comparison with the file, so a byte typed back to its value is no
-  longer a change. "Unsaved" is by content: edits undone back to what the file holds (as opened,
-  or as last saved) are not unsaved. Changed
-  bytes are marked in both columns. Undo/Redo: Cmd/Ctrl+Z, Shift+Cmd/Ctrl+Z.
+  and redo step records the bytes shown before and after) — the file and any cached copy are
+  never written by an edit. Each edit keeps the byte it replaced, read when it was typed, and
+  whether a byte is changed is a comparison with that byte — the file is not read again — so a
+  byte typed back to its value is no longer a change. A key on a byte whose page is not here
+  changes nothing (`0x… is still loading`). "Unsaved" is by content: edits undone back to what
+  the file holds (as opened, or as last saved) are not unsaved. At most 100,000 offsets are
+  changed at once (`too many changes for one save — save first`). Changed bytes are marked in both
+  columns. Undo/Redo: Cmd/Ctrl+Z, Shift+Cmd/Ctrl+Z.
 - Status bar: the cursor's offset (hex and decimal), its byte (hex, decimal, the character when
   printable), the file's size (the exact count on hover), "N bytes changed", "unsaved", and the
   last result.
-- Save (Cmd/Ctrl+S) is image Save's contract (§5), from one pass over the bytes as opened: the
+- Save (Cmd/Ctrl+S, F5) of a **streamed file** — a remote file the window reads through its stream —
+  is §5's server copy or streamed rewrite on the window's own connection, made at that first use
+  (an sshd that refuses the session fails the Save before anything is sent, the edits kept):
+  nothing of the file is fetched, its backup is the undo file, and every phase is in the journal
+  first. Its progress is the status row's; Esc stops it between its requests. After it lands the
+  window reloads its stream, and each saved edit drops out without a read. Save copy
+  (Shift+Cmd/Ctrl+S) publishes `<stem>.edited<ext>` beside the original by the same routes, never
+  replacing anything.
+- Save (Cmd/Ctrl+S, F5) of a **file with a local base** — a local file read in place, or a remote
+  file's copy in the cache — is image Save's contract (§5), from one pass over the bytes as opened: the
   same reads write the local backup of the original under `<cache>/.backup` (the session's first
   Save; path printed), the staged copy with the edits applied (created exclusively and owner-only
   under `<cache>/.edits`), and their SHA-256. The handle's size, mtime, change time and inode are
@@ -735,26 +894,44 @@ once the primary button is up, and take rows off the grid's bottom.
   and the window stays usable.
 - Where the server cannot replace a file in one step (`posix-rename@openssh.com`), Save is off with
   the reason on hover and in the rows; editing and Save copy work — the image window's rule.
-- Closing with unsaved edits asks: Save (Save copy where Save is off) / Discard / Cancel. Closing
-  during a save waits for it. Either way the window closes only when the save landed with nothing
-  to read and nothing unsaved — a finished save is taken after the frame's input, so an edit or an
-  undo in that frame counts; one that did not land, or landed with notes (the remote changed right
-  after), keeps the window open; newer edits ask again. A close asked for during a save is used up
-  by that save, whatever it reports: it never closes the window after a later Save. Once closing
-  is decided nothing edits.
+- Save As (Alt+Cmd/Ctrl+S, F7, or the toolbar's Save As… button) writes the edited file to a new
+  local file (§5); a completed one counts as Save copy does for the close prompt.
+- While a Save, Save copy or Save As runs the window takes no edit, undo or redo; a key that would
+  edit is refused and the status row says `saving — editing resumes when the save is done`. The view
+  still scrolls.
+- Every edit is in the journal (§5) as well as in memory; the status bar's right end says `unsaved —
+  kept at <journal>` (`unsaved — kept` where there is no room for the path). On open, the window
+  lists in its recovery rows, as buttons (a letter types a byte): the journals an earlier session
+  left (Restore — which reads the pages under the edits and applies nothing if any differs —
+  Later, Discard), a Save that session left cut off (its outcome, as §5 reconciles it), and the
+  file's undo files, newest three (Load as edits, Later). A row's buttons are off while a Save runs.
+- Closing with unsaved edits asks: Save (Save copy where Save is off) / Save As… / Discard / Cancel;
+  Discard's hover names the kept edits it deletes. Closing during a save waits for it. Either way
+  the window closes only when the save landed with nothing to read and nothing unsaved; one that
+  did not land, or landed with notes (the remote changed right after), keeps the window open; newer
+  edits ask again. A close asked for during a save is used up by that save, whatever it reports: it
+  never closes the window after a later Save. Once closing is decided nothing edits.
 
 ## 7. Media window (A4, A5)
 
 - Probe with `ffprobe` (duration, streams, size, each audio track's channels and rate, chapters). `ffmpeg`/`ffprobe`
   are resolved at runtime (`SOPEN_FFMPEG`, then PATH; the brew formula depends on `ffmpeg`). Every run on the file —
-  probe, playback, the paused frame, the waveform, Save, Export — reads one input value (`ffmpeg::Input`: the local
-  file or cached copy; a URL there is the seam for streaming). Save's backup reads the local file.
+  probe, playback, the paused frame, the waveform, Save, Save As, Export — reads one input value (`ffmpeg::Input`):
+  a local file's path, or — for a remote file — a URL on the window's loopback byte server
+  (`http://127.0.0.1:<port>/<token>/<kind>/<name>`, one server per window, 64 connections at most), whose bytes
+  all come from the window's stream ([06](06-streaming.md) §7.4, §9). The URL's kind picks the reader: `play`
+  for playback, the paused frame and the probe; `bulk` for the waveform; `render` for Save, Save As and Export.
+  A probe has 30 s, then ffprobe is killed. A render one of whose responses the server cut short (the file
+  changed on the remote, say) is failed whatever ffmpeg's exit status — ffmpeg can exit 0 on a short input — and
+  publishes and uploads nothing.
 - Video: playback in the window with sound (ffmpeg subprocess decode → frames; audio → `cpal`; audio clock master),
   timeline scrub, drag = crop rectangle in source pixels, Space play/pause, Export.
 - Audio: waveform — min/max peaks per channel from one decode at 8 kHz, at most 100 per second and 2^19 per lane (an
   hour of stereo is a few MB; the PCM is never held), handed over as they fill; a stereo file shows two lanes, L and
-  R (more channels are mixed down to two); same transport, Export. A decode that fails (a read error, ffmpeg's error
-  exit — its last words are kept) is said where the waveform is, never drawn as a finished flat line.
+  R (more channels are mixed down to two); same transport, Export. A remote sound's decode reads its `bulk` URL,
+  so it yields to playback, and the waveform is drawn as far as it has been read while the rest comes. A decode
+  that fails (a read error, ffmpeg's error exit — its last words are kept) is said where the waveform is, never
+  drawn as a finished flat line.
 - Editing (msg 13): the timeline is a list of clips, each a range of the source in ticks — video frames (a cut is a
   frame time, and the sound cut with it cannot drift) or audio samples. A drag on the timeline selects (the playhead
   follows the pointer, so the frame there shows), a click moves the playhead and clears the selection, `I`/`O` set
@@ -765,8 +942,8 @@ once the primary button is up, and take rows off the grid's bottom.
   clipboard is not used (a Cmd/Ctrl+V whose press egui-winit swallows on an empty system clipboard is taken at its
   key-up). `M` (audio, mono file only) = Mono → Stereo: left = right = the channel, at its level. Neighbouring
   pieces that continue each other are one clip, so an edit undone by hand is no edit. Nothing a key does runs ffmpeg
-  or ffprobe; keys follow the image window's gating (none while a text field has the typing or a prompt is up), and
-  hosted in the browser the row shows `5 Save`.
+  or ffprobe; keys follow the image window's gating (none while a text field has the typing or a prompt is up, and
+  no edit while a Save runs), and the row shows `5 Save` and `7 SaveAs`.
 - Preview: playback plays the clips in order, each piece by an ffmpeg of its own started as soon as the one before it
   starts. Picture and sound each lay one grid over the whole play — piece `k` gets `round(end_k · rate) −
   round(start_k · rate)` frames or samples — so no rounding builds up between them and a piece shorter than a frame
@@ -792,17 +969,28 @@ once the primary button is up, and take rows off the grid's bottom.
   `origin + k / fps`, `origin` the picture's offset within a frame period from the file's start (a transport stream
   whose sound starts first has its frames 21.3 ms in): picture and sound are cut at the same instant.
 - Save (Cmd/Ctrl+S, F5): refused before anything is backed up or rendered when the file changed since it was opened —
-  by the overwrite's own rule: type, size, modification time and (up to 256 MiB) content, against the fetch's hash
-  or, for a file opened in place, the hash of its bytes taken on a worker when the window opened (a render can take
-  minutes; a hash that failed refuses every Save until the file is opened again) — or when the server cannot replace a file in one step; else the original is copied to the
-  local backup (§5, once per session, path printed), the edit is rendered into a staged file under `.edits`, and
-  that file is written over the original by the conflict-checked overwrite (§5). Then the window plays the saved
-  file, unedited (the clipboard and the history were ranges of the old one); a remote file plays from the staged
-  render — still locked, so a sopen killed later leaves it to the sweep below — removed when the window goes. Save keeps the file's format: a file whose container cannot take the
-  re-encoded streams (`.webm` video) is not saved — Export writes `.mp4`. Edits make the window unsaved: closing,
-  F3, `close=ask` and leaving it in the browser ask Save / Discard / Cancel as the image window does; a running save
-  closes the window when it is done; a running export keeps the close-again rule. A save or export whose worker ends
-  without a result (it panicked) is a visible failure; the edits stay and the window is usable.
+  by the overwrite's own rule: type, size, modification time and (up to 256 MiB) content, against the baseline a
+  worker takes (§5: the file's whole SHA-256 up to 256 MiB, above that the SHA-256 of its first and last MiB,
+  read again right before the overwrite; a local file's from when the window opens, a remote file's from its
+  first edit, a Bulk read of its stream with `checking the file for Save — 37 %` on the status row; a render
+  can take minutes; a baseline that failed refuses every Save until the file is opened again) — or when the server cannot replace a file in one
+  step, or, for a remote file, has no hard links; else the original is backed up and the edit rendered into a
+  staged file under `.edits` (§5, once per session: a local file is copied to the local backup before the
+  render, path printed; a remote one, once its render is staged, is linked to `.<name>.sopen-backup-<UTC stamp>`
+  beside it, which the status line says while it renders and the result names), and the staged file is written
+  over the original by the conflict-checked overwrite (§5), each of its phases in the journal first. While it runs nothing is edited, and Esc stops it before its rename. Then the window plays the
+  saved file, unedited (the clipboard and the history were ranges of the old one); a remote file plays from the
+  staged render — still locked, so a sopen killed later leaves it to the sweep below — removed when the window
+  goes, and the window's stream and byte server are closed. Save keeps the file's format: a file whose container
+  cannot take the re-encoded streams (`.webm` video) is not saved — Export writes `.mp4`. Edits make the window
+  unsaved and are kept in the journal (§5: the clip list in ticks, Mono → Stereo, the crop, In/Out; Restore checks
+  the file's whole content at most 256 MiB, above that its size, time and first and last MiB): closing, F3,
+  `close=ask` and leaving it in the browser ask Save / Save As… / Discard / Cancel as the image window does; a
+  running save closes the window when it is done; a running export keeps the close-again rule. A save or export
+  whose worker ends without a result (it panicked) is a visible failure; the edits stay and the window is usable.
+- Save As (Alt+Cmd/Ctrl+S, F7) renders the edit in sopen's own exports folder, after checking the free space there
+  against its estimated size, and copies the render into a new local file by §5's Save As rules; a render cut
+  short publishes nothing.
 - A render's work folder (`.exports/<random>`), its staged file (`<stem>.render-…` in `.edits`) and a `sopen stems`
   job's work folder (`.exports/<random>` from the command, `.exports/stems-<random>` for the window's child) each have a
   `<name>.lock` held while the job runs; a sopen killed meanwhile leaves them to the next media window's, `sopen
@@ -830,6 +1018,10 @@ once the primary button is up, and take rows off the grid's bottom.
   `pan=stereo|c0=c0|c1=c0`.
 - Export: In–Out of the timeline (the whole timeline without a selection) and the crop, re-encoded (H.264 + AAC for
   video; the source codec for audio) by the render above; progress shown; result uploaded as a sibling (§5).
+  Its progress row has **Cancel**, and Esc does the same while it runs: during the render ffmpeg is killed and the
+  render removed, during the upload the upload stops and its remote temp is removed, and the result says `export
+  cancelled: nothing was published`; once the publishing link has landed it is too late, and the result names
+  the sibling. A close still waits (the second close closes, and sopen waits and prints the result).
 - Save and Export map streams explicitly: the first picture stream and every audio track (one, for one-track
   containers); >8-bit sources stay 10-bit where libx264 has it; colour tags are carried. What is not kept (subtitles,
   data, attachments, cover art, alpha, depth, chapters) is named in the window before Save or Export and in the
@@ -915,7 +1107,9 @@ into the cache (claimed while it runs), and it always runs on this machine (§4a
 
 ## 8. Usage log
 
-One JSON line per run in `<state>/usage.jsonl`: `ts, host_hash, kind, ext, bytes, fetch_ms, action (open|save|export|cut|stems|discard), conflict, ok, forwarded, target_hash`.
+One JSON line per run in `<state>/usage.jsonl`: `ts, host_hash, kind, ext, bytes, fetch_ms, bytes_fetched, action (open|save|export|cut|stems|discard), conflict, ok, forwarded, target_hash`.
+`bytes_fetched` is what every stream of the run received from its remote ([06](06-streaming.md) §11); a
+streamed open keeps `bytes` (the file's size) and has `fetch_ms` 0.
 Hosts are hashed, never written by name. A run forwarded with `--target` (§4a) is logged on both machines: here with
 `forwarded: true` and the target's hash (its kind is known only there), there as an ordinary open.
 Local only, never sent anywhere. Exists for §10.

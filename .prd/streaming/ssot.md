@@ -1,6 +1,7 @@
 # streaming — fixed target
 
-Status: in-progress (opened 2026-11-20)
+Status: done (2026-11-23; opened 2026-11-20). The fixed scope below shipped: 06 and 07 are its
+contract, and the ledger is [`loop.done.md`](loop.done.md).
 
 This file fixes the target of the streaming workstream (owner message 17). It is not reinterpreted
 during the loop; a change of scope comes only from a new owner message, quoted here verbatim.
