@@ -46,6 +46,10 @@
 //! ends, its characters and their order, and is coloured as the whole run, but for the
 //! differences known, which [`Shortened`] lists (most in a varied run: the left-out part where a
 //! grammar colours inside a word; a back-reference between two long runs that shorten alike).
+//! So does a chain of names longer than that (`a.b.c`, `a,b,c`, `a$b$c`, `a-b-c`), and in YAML
+//! a stretch of a line without its `: # [ ] { } " ' \` (a long value): whole units of them from
+//! each end, an even number left out between, the left-out part coloured as the character kept
+//! before it — as it is, but where a grammar colours a chain's names apart.
 //!
 //! The file is read live; the index is of the file as opened. A file that differs from it in any
 //! way ([`TextDoc::now`]: written to, grown, truncated, another file renamed over its path) is
@@ -112,8 +116,9 @@ pub const LINE_MAX: usize = 4096;
 /// Highlighting covers this much of a file, from its start (its state runs from the top of the
 /// file); the rest is plain. Also how far a stream's index pass reads without being asked.
 pub const HIGHLIGHT_MAX: u64 = 16 << 20;
-/// The longest run of word characters the parser is handed as it is. A longer one is shortened
-/// ([`Shortened`]) — to more than this, so it never reads as a shorter run, and less than twice it.
+/// The longest run of word characters, chain of names or YAML stretch the parser is handed as
+/// it is. A longer one is shortened ([`Shortened`]) — to more than this, so it never reads as a
+/// shorter one: a run to less than twice it, a chain or stretch to at most three units more.
 const RUN_MAX: usize = 2 * RUN_END + RUN_MIDDLE;
 /// Characters a shortened run keeps at each end: twice the longest counted repeat in the bundled
 /// grammars that can match word characters (16, C++'s raw-string delimiter), so a prefix or
@@ -2055,11 +2060,101 @@ fn word(c: char) -> bool {
     c == '_' || c.is_ascii_digit() || c.is_alphabetic()
 }
 
+/// What a chain joins its word runs with, one of them, the same each time: nothing a bundled
+/// grammar nests, and a chain is shortened by an even number of them, so `$`, which turns TeX's
+/// math on and off, still leaves it as it was.
+const CHAIN_SEPARATORS: [char; 4] = ['.', ',', '-', '$'];
+
+/// What ends a stretch of a YAML line: what opens or ends something within one — a key's `:`, a
+/// comment's `#`, a flow collection, a quote, an escape.
+const YAML_STOPS: [char; 9] = [':', '#', '[', ']', '{', '}', '"', '\'', '\\'];
+
+/// What of a syntax's lines its parser is handed shortened ([`Shortened`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Shape {
+    /// Long runs of word characters, and long chains of short ones.
+    Code,
+    /// YAML: also a line's long stretches without its stops. YAML looks for a second key on
+    /// every line, `(?=… ( [^\s:] | :\S | \s+(?![#\s]) )* \s*:(\s|$))` scanning the rest of the
+    /// line from each place a key could start, so a long value — prose, quoted, in a list —
+    /// costs the square of its length (5–7 ms at 500 characters).
+    Yaml,
+}
+
+impl Shape {
+    fn of(syntax: &SyntaxReference) -> Self {
+        if syntax.name == "YAML" {
+            Shape::Yaml
+        } else {
+            Shape::Code
+        }
+    }
+}
+
+/// The runs of characters `part` takes in `line[within]`, each as long as it goes: where it is
+/// in the line, and how many characters it has.
+fn runs_of(
+    line: &str,
+    within: std::ops::Range<usize>,
+    part: impl Fn(char) -> bool,
+) -> Vec<(std::ops::Range<usize>, usize)> {
+    let mut runs = Vec::new();
+    let (mut start, mut chars) = (within.start, 0);
+    for (at, c) in line[within.clone()].char_indices() {
+        let at = within.start + at;
+        if part(c) {
+            if chars == 0 {
+                start = at;
+            }
+            chars += 1;
+        } else if chars > 0 {
+            runs.push((start..at, chars));
+            chars = 0;
+        }
+    }
+    if chars > 0 {
+        runs.push((start..within.end, chars));
+    }
+    runs
+}
+
+/// Where the chain from `words[i]` ends: the word runs after it, each one separator after the
+/// one before, the same separator each time.
+fn chain_end(line: &str, words: &[(std::ops::Range<usize>, usize)], i: usize) -> usize {
+    let mut separator = None;
+    let mut end = i + 1;
+    while end < words.len() {
+        let mut gap = line[words[end - 1].0.end..words[end].0.start].chars();
+        match (gap.next(), gap.next()) {
+            (Some(c), None)
+                if CHAIN_SEPARATORS.contains(&c) && separator.is_none_or(|s| s == c) =>
+            {
+                separator = Some(c);
+                end += 1;
+            }
+            _ => break,
+        }
+    }
+    end
+}
+
 /// A line as the parser is handed it: each run of more than [`RUN_MAX`] word characters
-/// shortened, the rest as it is. A grammar pattern that fancy-regex runs on its own engine (one
-/// with a lookaround) costs the square of a run's length, until the backtrack limit, 1,000,000
+/// shortened, each chain of names longer than that, and in YAML ([`Shape`]) each stretch longer
+/// than that; the rest as it is. A grammar pattern that fancy-regex runs on its own engine (one
+/// with a lookaround) costs the square of what it walks, until the backtrack limit, 1,000,000
 /// steps, ends the search as no match: 1,000 `x`s in a Rust comment cost 20 ms, ordinary code
-/// 1.5 µs a byte.
+/// 1.5 µs a byte. What it walks is a run, or a chain — names joined by one separator, the same
+/// each time ([`CHAIN_SEPARATORS`]): a dotted name in Python, Java or JavaScript, an argument
+/// list in Go, an identifier with `$` in Java (1,000 characters of one name: 10–61 ms; of
+/// varied names: up to 21 ms) —, or in YAML the rest of the line.
+///
+/// A shortened chain, or YAML stretch, is whole units of it — a name, or what spaces part, with
+/// what parts it from the one before — from its start and its end, an even number of them left
+/// out between, and longer than [`RUN_MAX`] (by at most three units): every two characters
+/// side by side in it are side by side in the chain. A run over [`RUN_MAX`] parts a chain, and
+/// so does a number: that run is shortened as alone, the names on each side as chains of their
+/// own, and a list of numbers is no chain (it costs its length, and is coloured number by
+/// number). A YAML unit over [`RUN_MAX`] parts its stretch the same way, shortened as code is.
 ///
 /// A shortened run is pieces of the run itself, in order, nothing added: its first and last
 /// [`RUN_END`] characters and, between them, the middle's stretches of one character — one
@@ -2071,19 +2166,25 @@ fn word(c: char) -> bool {
 /// side in the run, but where such a middle is cut. So the parser sees the run's ends, its
 /// characters, their order and everything around it, and the scopes it finds, put back on the
 /// line ([`Self::place`]), are those of the line itself — on a run long enough for the limit,
-/// those its patterns mean rather than no match. The differences known, all of runs over
-/// [`RUN_MAX`] with a middle of many stretches but the last:
-/// - The part of a run its shortened form leaves out takes the colour of the character kept
-///   before it: in a grammar that colours inside a word (CSS colours digits in one), not the
-///   colour it has.
-/// - Where such a middle is cut, two characters that are not neighbours in the run meet, and a
-///   pattern that reads them together may read the kept ones otherwise.
-/// - A middle with more than [`RUN_MIDDLE`] different characters keeps the first of them only,
-///   so a test over the whole run (all of one script) may answer otherwise.
-/// - A back-reference (a heredoc's delimiter) compares shortened runs: two runs that agree in
+/// those its patterns mean rather than no match. The differences known, all of runs, chains or
+/// stretches over [`RUN_MAX`]:
+/// - The part a shortened form leaves out takes the colour of the character kept before it, so
+///   where a grammar colours it otherwise, not the colour it has: inside a varied run where a
+///   grammar colours inside a word (CSS colours digits in one); in a chain whose names and what
+///   joins them a grammar colours apart (SQL's `a.b.c`, TeX's `$`, JavaScript's
+///   `a.b.c.f = function`, PHP's constants `A-B-C`, `true,false,null` in JSON, JavaScript or
+///   Python); in a YAML flow collection (`[a, 1, true]`).
+/// - Where a run's middle of many stretches is cut, two characters that are not neighbours in
+///   the run meet, and a pattern that reads them together may read the kept ones otherwise.
+/// - A run's middle with more than [`RUN_MIDDLE`] different characters keeps the first of them
+///   only, so a test over the whole run (all of one script) may answer otherwise.
+/// - A pattern that reads a whole chain sees its kept units only: one among those left out that
+///   it would treat apart (JavaScript's `prototype` mid-chain) is not seen.
+/// - A back-reference (a heredoc's delimiter) compares shortened text: two runs that agree in
 ///   their ends and in the stretches of their middle, each the same length modulo
 ///   [`RUN_STRETCH`] (200 and 216 `x`s), or in a middle of many stretches up to where the hash
-///   cuts it and in what its rest holds, read as the same.
+///   cuts it and in what its rest holds, and two chains that agree in the units they keep, read
+///   as the same.
 struct Shortened {
     text: String,
     /// Where each piece of `text` starts: in `text`, and in the line it was copied from.
@@ -2091,33 +2192,139 @@ struct Shortened {
 }
 
 impl Shortened {
-    /// `None` when the line has no run that long (it is parsed as it is).
-    fn of(line: &str) -> Option<Self> {
-        let mut short: Option<Self> = None;
-        // The line is copied up to here.
-        let mut copied = 0;
-        let (mut start, mut chars) = (0, 0);
-        // A space after the last character ends a run the line ends in.
-        for (at, c) in line.char_indices().chain([(line.len(), ' ')]) {
-            if word(c) {
-                if chars == 0 {
-                    start = at;
+    /// `None` when the line has nothing that long (it is parsed as it is).
+    fn of(line: &str, shape: Shape) -> Option<Self> {
+        let mut short = Self {
+            text: String::new(),
+            pieces: Vec::new(),
+        };
+        let copied = match shape {
+            Shape::Code => short.code(line, 0, 0..line.len()),
+            Shape::Yaml => {
+                // The line is copied up to here.
+                let mut copied = 0;
+                let stretches = runs_of(line, 0..line.len(), |c| !YAML_STOPS.contains(&c));
+                for (stretch, chars) in stretches {
+                    if chars <= RUN_MAX {
+                        continue;
+                    }
+                    // Its units are what spaces part: whole ones are left out, as a chain's are,
+                    // so no token is cut in two and the spaces before its first (a line's
+                    // indentation, YAML's structure) are kept. A long unit parts them, and is
+                    // shortened as code is.
+                    let units = runs_of(line, stretch, |c| !c.is_whitespace());
+                    copied = short.parted(
+                        line,
+                        copied,
+                        &units,
+                        |_| false,
+                        |short, copied, unit| short.code(line, copied, unit),
+                    );
                 }
-                chars += 1;
-                continue;
+                copied
             }
-            if chars > RUN_MAX {
-                let short = short.get_or_insert_with(|| Self {
-                    text: String::with_capacity(line.len().min(4 * RUN_MAX)),
-                    pieces: Vec::new(),
-                });
-                copied = short.shorten(line, copied, start..at);
-            }
-            chars = 0;
+        };
+        if short.pieces.is_empty() {
+            return None;
         }
-        let mut short = short?;
         short.copy(line, copied..line.len());
         Some(short)
+    }
+
+    /// Shortens `line[within]` as code is, the line copied up to `copied`; says where it is
+    /// copied up to now. Its long word runs are shortened, and its long chains of names: names
+    /// only — the patterns that cost a chain's square walk names, and a list of numbers
+    /// (`1,2,3`) costs its length and is coloured number by number — so a number parts a chain,
+    /// as a long run does (shortened as alone).
+    fn code(&mut self, line: &str, mut copied: usize, within: std::ops::Range<usize>) -> usize {
+        let words = runs_of(line, within, word);
+        let number = |w: &(std::ops::Range<usize>, usize)| {
+            line[w.0.clone()].starts_with(|c: char| c.is_ascii_digit())
+        };
+        let mut i = 0;
+        while i < words.len() {
+            let end = chain_end(line, &words, i);
+            copied = self.parted(
+                line,
+                copied,
+                &words[i..end],
+                number,
+                |short, copied, run| short.shorten(line, copied, run),
+            );
+            i = end;
+        }
+        copied
+    }
+
+    /// Shortens `units` — runs, each parted from the one before by what joins them — the line
+    /// copied up to `copied`; says where it is copied up to now. A unit over [`RUN_MAX`] or one
+    /// `apart` names parts them and is shortened by `long` (when long); the units between, more
+    /// than one and longer than [`RUN_MAX`] together, are shortened as a chain.
+    fn parted(
+        &mut self,
+        line: &str,
+        mut copied: usize,
+        units: &[(std::ops::Range<usize>, usize)],
+        apart: impl Fn(&(std::ops::Range<usize>, usize)) -> bool,
+        long: impl Fn(&mut Self, usize, std::ops::Range<usize>) -> usize,
+    ) -> usize {
+        let mut start = 0;
+        for at in 0..=units.len() {
+            let unit = units.get(at);
+            if unit.is_some_and(|u| u.1 <= RUN_MAX && !apart(u)) {
+                continue;
+            }
+            let joined = &units[start..at];
+            if let (Some(first), Some(last)) = (joined.first(), joined.last()) {
+                if joined.len() > 1 && line[first.0.start..last.0.end].chars().count() > RUN_MAX {
+                    copied = self.chain(line, copied, joined);
+                }
+            }
+            if let Some(unit) = unit.filter(|u| u.1 > RUN_MAX) {
+                copied = long(self, copied, unit.0.clone());
+            }
+            start = at + 1;
+        }
+        copied
+    }
+
+    /// Copies the line from `from` to the end of the chain's units it keeps from its start, and
+    /// says where those it keeps at its end start (copied with what follows them). A unit is a
+    /// run with what parts it from the run before (the first, the run alone): the chain keeps its
+    /// units to [`RUN_END`] characters from each end, then more of those after its start until
+    /// it is longer than [`RUN_MAX`] and leaves out an even number of them.
+    fn chain(
+        &mut self,
+        line: &str,
+        from: usize,
+        words: &[(std::ops::Range<usize>, usize)],
+    ) -> usize {
+        // Where unit `i` starts (at the end of the run before it), and its characters.
+        let start = |i: usize| {
+            if i == 0 {
+                words[0].0.start
+            } else {
+                words[i - 1].0.end
+            }
+        };
+        let chars = |i: usize| words[i].1 + line[start(i)..words[i].0.start].chars().count();
+        let (mut head, mut kept) = (0, 0);
+        while kept < RUN_END {
+            kept += chars(head);
+            head += 1;
+        }
+        let (mut tail, mut end) = (words.len(), 0);
+        while end < RUN_END && tail > head {
+            tail -= 1;
+            end += chars(tail);
+        }
+        kept += end;
+        while head < tail && (kept <= RUN_MAX || (tail - head) % 2 == 1) {
+            kept += chars(head);
+            head += 1;
+        }
+        self.copy(line, from..start(head));
+        start(tail)
     }
 
     /// Copies the line from `from` to the end of the run's head, then the run's middle
@@ -2212,6 +2419,8 @@ struct Highlight {
     plain: Color32,
     /// Lines parsed so far (tests).
     parsed: Arc<AtomicU64>,
+    /// What of its lines the parser is handed shortened.
+    shape: Shape,
     #[cfg(test)]
     hook: Option<ParseHook>,
     /// Called right after the worker's thread asked the window to wake as it ends (tests: the
@@ -2236,6 +2445,7 @@ impl Highlight {
             stop,
             plain,
             parsed: Arc::default(),
+            shape: Shape::of(syntax),
             #[cfg(test)]
             hook: None,
             #[cfg(test)]
@@ -2244,7 +2454,7 @@ impl Highlight {
     }
 
     fn run(&self, state: &mut State, line: &str) -> Runs {
-        let short = Shortened::of(line);
+        let short = Shortened::of(line, self.shape);
         let parsed = short.as_ref().map_or(line, |s| s.text.as_str());
         #[cfg(test)]
         if let Some(hook) = &self.hook {
