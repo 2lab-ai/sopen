@@ -4627,14 +4627,18 @@ mod stream {
     // ---- 07's Save over a stream (07 §4–§7, §10, §12): a real file, the engine running ----
 
     /// What the `Origin`'s connection moved of the file (07 §12: "at the client's read and
-    /// write payloads"), on every path that carries file bytes: what each read handed over as
-    /// it came (a streamed whole read part-way counts what it handed over; a positioned read
-    /// that fails counts what it asked for, the most it can have moved), what each write sent
-    /// (counted before the reply, so a failed one counts too), and — apart — what the server's
-    /// copy moved, by its own progress, which no request carries. An upload (`create_from`)
-    /// cannot be watched below the trait: it counts the whole local file, the most it can
-    /// send; `whole` counts the calls that move a whole file, so a test can say there were
-    /// none. It can say it has no `copy-data`.
+    /// write payloads"), on every path that carries file bytes — exact where the bytes are
+    /// seen, and conservative (the most it can be) where they are not:
+    /// - reads: exact as they are handed over (a streamed whole read cut off part-way counts
+    ///   what it handed over); a positioned read that fails counts the length it asked for;
+    /// - writes: the bytes each one sends, counted before its reply — a failed or short write
+    ///   counts its whole length;
+    /// - an upload (`create_from`) cannot be watched below the trait: it counts the whole local
+    ///   file; `whole` counts the calls that move a whole file, so a test can say there were
+    ///   none;
+    /// - apart, what the server's copy moved, by its own progress — no request carries it.
+    ///
+    /// It can say it has no `copy-data`.
     #[derive(Clone, Default)]
     struct Moved {
         read: Arc<std::sync::atomic::AtomicU64>,
@@ -5418,12 +5422,21 @@ mod stream {
                 "{side:?}"
             );
             assert!(ed.journals().is_empty(), "{side:?}: the journal stays");
-            // Local disk written, throughout: every journal file written (generations, CURRENT,
-            // the save record — removed since), counted as written; and the most the rest of the
-            // cache held at any step of the Save — the undo file alone (published once, its
-            // temp renamed within that step), no staging copy.
+            // Local disk written, throughout, counted as written — files removed since
+            // included: every journal file (generations, CURRENT, the save record), and every
+            // undo-file publication (its text, through a temp). Those are the two local writers
+            // a streamed Save has.
             let journal = ed.moved.disk.load(Ordering::SeqCst);
+            let undone = patch::undo_bytes_under(&ed.tmp.path().join("cache"));
             let undo_bytes = std::fs::metadata(&undo[0]).unwrap().len();
+            assert!(journal > 0, "{side:?}: the journal was written");
+            assert_eq!(undone, undo_bytes, "{side:?}: the undo file, written once");
+            assert!(
+                journal + undone <= 64 * KIB,
+                "{side:?}: {journal} journal + {undone} undo bytes written"
+            );
+            // Apart: what the cache held at each step of the Save besides the journal — the
+            // undo file alone, never a staging copy or anything else.
             let (most, names) = seen.lock().unwrap().clone();
             let undo_name = undo[0].file_name().unwrap().to_string_lossy().into_owned();
             assert_eq!(
@@ -5432,11 +5445,6 @@ mod stream {
                 "{side:?}: on the disk"
             );
             assert_eq!(most, undo_bytes, "{side:?}");
-            assert!(journal > 0, "{side:?}: the journal was written");
-            assert!(
-                journal + most <= 64 * KIB,
-                "{side:?}: {journal} journal + {most} other bytes written"
-            );
             // What is left once nothing is unsaved: the undo file alone.
             assert_eq!(
                 ed.local_bytes(),
@@ -5931,6 +5939,52 @@ mod stream {
         );
     }
 
+    /// Every name the Save As field could suggest taken (`-1` to `-9999` beside the name
+    /// itself): it suggests none — the field keeps the name and the modal says why — and a Save
+    /// there is refused with those words, the file there untouched and nothing left beside it.
+    #[test]
+    fn save_as_with_every_name_taken_says_so_and_saves_nothing() {
+        let mut ed = ed_side(Some(&body()), Side::Local);
+        ed.typed("AB");
+        let out = ed.tmp.path().join("out");
+        std::fs::create_dir(&out).unwrap();
+        std::fs::write(out.join("model.edited.bin"), b"the owner's file").unwrap();
+        for n in 1..=9999 {
+            std::fs::write(out.join(format!("model.edited-{n}.bin")), b"").unwrap();
+        }
+        let taken = format!(
+            "every name from model.edited-1.bin to model.edited-9999.bin is taken in {}",
+            crate::gui::binary::tilde(&out)
+        );
+        save_as_into(&mut ed, &out);
+        let said = |ed: &Ed| -> Vec<String> {
+            ed.drv
+                .texts()
+                .into_iter()
+                .map(|(_, _, t)| t)
+                .filter(|t| t.contains("every name from"))
+                .collect()
+        };
+        assert_eq!(said(&ed), std::slice::from_ref(&taken), "the modal's note");
+        ed.key(Key::Enter, Modifiers::NONE);
+        ed.drv.until(&mut ed.win, 60, |w| {
+            w.save_as.as_ref().is_some_and(|(m, ..)| !m.busy())
+        });
+        ed.frames(2);
+        let refused = said(&ed);
+        assert!(
+            refused.len() == 1 && refused[0].ends_with(&taken) && refused[0].contains("exists"),
+            "{refused:?}"
+        );
+        assert_eq!(
+            std::fs::read(out.join("model.edited.bin")).unwrap(),
+            b"the owner's file"
+        );
+        assert_eq!(entries(&out).len(), 10_000, "something left beside them");
+        assert!(ed.win.doc.unsaved(), "the edits are saved nowhere");
+        ed.key(Key::Escape, Modifiers::NONE);
+    }
+
     /// 07 E12: Esc while Save As transfers leaves nothing in the folder (no `part`, no staging),
     /// and the edits stay unsaved.
     #[test]
@@ -6331,12 +6385,14 @@ mod stream {
             longest = longest.max(frame.elapsed());
         }
         println!("the longest frame so far: {longest:?}");
-        // Places spread over the file, none read before.
+        // Places spread over the file, none read before; each counted read is a byte on screen
+        // that came while the status row said the copy was under way, before and after it.
+        let copying = |ed: &mut Ed| ed.status().starts_with("saving — copying on ");
         let local = std::path::Path::new(&abs).exists();
         let mut n = 0;
         for i in 1..=12u64 {
             let place = size / 13 * i / PAGE * PAGE + 0x800;
-            if ed.win.job.is_none() {
+            if !copying(&mut ed) {
                 break;
             }
             assert_eq!(ed.win.doc.cell(place), Cell::Pending, "read before");
@@ -6350,15 +6406,15 @@ mod stream {
                 ed.frames(1);
             }
             let took = start.elapsed();
-            let during = ed.win.job.is_some();
+            let during = copying(&mut ed);
+            let Cell::Byte(b) = ed.win.doc.cell(place) else {
+                panic!("0x{place:X}: {:?}", ed.win.doc.cell(place));
+            };
             if local {
-                assert_eq!(
-                    ed.win.doc.cell(place),
-                    Cell::Byte(bytes_at(&ed.remote, place, 1)[0])
-                );
+                assert_eq!(b, bytes_at(&ed.remote, place, 1)[0], "0x{place:X}");
             }
             println!(
-                "read 0x{place:X}: {took:?}, the save still copying: {during} ({})",
+                "read 0x{place:X}: {took:?}, 0x{b:02X}, still in the copy: {during} ({})",
                 ed.status()
             );
             n += usize::from(during);
@@ -6370,6 +6426,16 @@ mod stream {
             ed.win.status.text
         );
         assert!(n > 0, "no read happened during the copy");
+        assert!(
+            ed.win.status.text.starts_with("saved "),
+            "{}",
+            ed.win.status.text
+        );
+        // The edited byte, read back from the remote over a new session.
+        let mut check = connect().unwrap();
+        let head = check.read_head(&abs, 0x1001).unwrap();
+        assert_eq!(head[0x1000], byte, "the saved byte on the remote");
+        println!("0x1000 on the remote: 0x{:02X}", head[0x1000]);
     }
 
     /// 07 §3 Recovery: the lock retry waits only for this file's own journals — a folder named
@@ -6428,7 +6494,9 @@ mod stream {
             vec![ours.clone()]
         );
         // A file of its own, not in a window: nothing else holds a journal of it.
-        let file = Mutex::new(file_on(ed.tmp.path(), &ed.remote, &ed.moved));
+        let file = file_on(ed.tmp.path(), &ed.remote, &ed.moved);
+        let retries = file.retries.clone();
+        let file = Mutex::new(file);
         let began = Instant::now();
         let rows = file::recover(&file);
         let took = began.elapsed();
@@ -6441,11 +6509,9 @@ mod stream {
             .collect();
         assert_eq!(lines.len(), 1, "{lines:?}");
         assert!(lines[0].contains(&*ours.file_name().unwrap().to_string_lossy()));
-        // The retry is 500 ms; a recovery that waited it out took at least that.
-        assert!(
-            took < Duration::from_millis(500),
-            "recovery waited {took:?}"
-        );
+        assert_eq!(retries.load(Ordering::SeqCst), 0, "listed again for them");
+        // A watchdog only (a deadlock would never come back).
+        assert!(took < Duration::from_secs(30), "{took:?}");
     }
 
     // ---- review round 1: the journal's generations, the temp questions, Restore ----
@@ -6457,6 +6523,190 @@ mod stream {
         fn drop(&mut self) {
             self.0.store(false, Ordering::SeqCst);
         }
+    }
+
+    /// P8: a generation held on its way to the journal (slow or stalled storage) when Save is
+    /// pressed: the frame does not wait for it — the window keeps drawing, the Save shows as
+    /// under way and edits are refused — and once it is let go the Save runs, after it, and
+    /// leaves no journal. (A watchdog lets it go after 10 s, so a frame that waits fails rather
+    /// than hangs.)
+    #[test]
+    fn a_save_does_not_wait_on_the_frame_for_a_generation() {
+        for side in sides() {
+            let body = body();
+            let mut ed = ed_side(Some(&body), side);
+            let gate = Arc::new(AtomicBool::new(true));
+            let _open = Opens(gate.clone());
+            ed.win.generation_gate = Some(gate.clone());
+            ed.typed("AB");
+            ed.drv.until(&mut ed.win, 60, |w| w.writing.is_some());
+            let (done, watched) = mpsc::channel::<()>();
+            let fired = Arc::new(AtomicBool::new(false));
+            let watchdog = {
+                let (gate, fired) = (gate.clone(), fired.clone());
+                std::thread::spawn(move || {
+                    if watched.recv_timeout(Duration::from_secs(10)).is_err() {
+                        fired.store(true, Ordering::SeqCst);
+                        gate.store(false, Ordering::SeqCst);
+                    }
+                })
+            };
+            ed.key(Key::S, command(false));
+            ed.frames(3);
+            assert!(!fired.load(Ordering::SeqCst), "{side:?}: the frame waited");
+            assert!(
+                gate.load(Ordering::SeqCst),
+                "{side:?}: let go before the test did"
+            );
+            assert!(ed.win.job.is_some(), "{side:?}: no Save under way");
+            let patches = ed.win.doc.patches().clone();
+            ed.typed("CD");
+            assert_eq!(
+                *ed.win.doc.patches(),
+                patches,
+                "{side:?}: an edit while it waits"
+            );
+            assert_eq!(ed.status(), EDITING_RESUMES, "{side:?}");
+            assert_eq!(
+                bytes_at(&ed.remote, 0, 1),
+                [body[0]],
+                "{side:?}: saved early"
+            );
+            let _ = done.send(());
+            watchdog.join().unwrap();
+            gate.store(false, Ordering::SeqCst);
+            ed.drv.until(&mut ed.win, 120, |w| w.job.is_none());
+            ed.frames(4);
+            assert!(
+                ed.win.status.text.starts_with("saved "),
+                "{side:?}: {}",
+                ed.win.status.text
+            );
+            assert_eq!(bytes_at(&ed.remote, 0, 1), [0xAB], "{side:?}");
+            assert!(ed.journals().is_empty(), "{side:?}: {:?}", ed.journals());
+            assert!(ed.win.journal_dir.is_none(), "{side:?}: a journal named");
+            assert!(!ed.win.doc.unsaved(), "{side:?}");
+        }
+    }
+
+    /// P8, Esc: a Save still waiting for a generation on its way (stalled storage) is stopped
+    /// by Esc — nothing sent, nothing written, the edits unsaved and not said to have failed to
+    /// be kept; once the storage answers, the next generation keeps them.
+    #[test]
+    fn esc_stops_a_save_waiting_for_a_generation() {
+        let body = body();
+        let mut ed = ed(&body);
+        let gate = Arc::new(AtomicBool::new(true));
+        let _open = Opens(gate.clone());
+        ed.win.generation_gate = Some(gate.clone());
+        ed.typed("AB");
+        ed.drv.until(&mut ed.win, 60, |w| w.writing.is_some());
+        ed.key(Key::S, command(false));
+        ed.frames(2);
+        assert!(ed.win.job.is_some());
+        ed.key(Key::Escape, Modifiers::NONE);
+        ed.drv.until(&mut ed.win, 200, |w| w.job.is_none());
+        assert_eq!(ed.win.status.text, STOPPED);
+        assert!(ed.win.doc.unsaved());
+        assert_ne!(
+            ed.win.schedule.status(),
+            Keep::NotKept("the journal could not be written".into()),
+            "a failure said"
+        );
+        assert!(std::fs::read(&ed.remote).unwrap() == body, "sent");
+        assert!(ed.temps().is_empty());
+        // The storage answers: the edits are kept.
+        gate.store(false, Ordering::SeqCst);
+        ed.kept();
+        assert_eq!(kept_in(&ed.journals()[0]).0, ["0x0: AB was 00"]);
+    }
+
+    /// P8 for a local file's Save (in place): its worker, not the frame, waits for the
+    /// generation on its way and then keeps the edits; the window goes on drawing and refuses
+    /// edits meanwhile; then the Save lands and nothing is left in the journal.
+    #[test]
+    fn a_local_save_does_not_wait_on_the_frame_either() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("local.bin");
+        std::fs::write(&path, FIXTURE).unwrap();
+        let cache = tmp.path().join("cache");
+        let mut fx = super::in_place(&path, tmp, 1000.0, 600.0);
+        let gate = Arc::new(AtomicBool::new(true));
+        let _open = Opens(gate.clone());
+        fx.win.generation_gate = Some(gate.clone());
+        let waited = Arc::new(AtomicBool::new(false));
+        let seen = waited.clone();
+        fx.win.before_drain = Some(Box::new(move || seen.store(true, Ordering::SeqCst)));
+        fx.typed("00");
+        fx.drv.until(&mut fx.win, 60, |w| w.writing.is_some());
+        let (done, watched) = mpsc::channel::<()>();
+        let fired = Arc::new(AtomicBool::new(false));
+        let watchdog = {
+            let (gate, fired) = (gate.clone(), fired.clone());
+            std::thread::spawn(move || {
+                if watched.recv_timeout(Duration::from_secs(10)).is_err() {
+                    fired.store(true, Ordering::SeqCst);
+                    gate.store(false, Ordering::SeqCst);
+                }
+            })
+        };
+        fx.key(Key::S, command(false));
+        fx.drv.idle(&mut fx.win, 3);
+        assert!(!fired.load(Ordering::SeqCst), "the frame waited");
+        assert!(fx.win.job.is_some(), "no Save under way");
+        let patches = fx.win.doc.patches().clone();
+        fx.typed("11");
+        assert_eq!(*fx.win.doc.patches(), patches, "an edit while it waits");
+        assert_eq!(std::fs::read(&path).unwrap(), FIXTURE, "saved early");
+        let _ = done.send(());
+        watchdog.join().unwrap();
+        gate.store(false, Ordering::SeqCst);
+        fx.wait_for_save();
+        assert!(
+            waited.load(Ordering::SeqCst),
+            "the Save did not wait for it"
+        );
+        assert!(
+            fx.win.status.text.starts_with("saved "),
+            "{}",
+            fx.win.status.text
+        );
+        assert_eq!(std::fs::read(&path).unwrap()[0], 0x00);
+        assert!(
+            journal_dirs_in(&cache).is_empty(),
+            "{:?}",
+            journal_dirs_in(&cache)
+        );
+        assert!(fx.win.journal_dir.is_none());
+    }
+
+    /// A local file's Save that does not land, its start unable to keep the edits (the disk
+    /// under the journal refuses the write): the window says they are not kept, and why.
+    #[test]
+    fn a_local_save_that_could_not_keep_the_edits_says_why() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("local.bin");
+        std::fs::write(&path, FIXTURE).unwrap();
+        let mut fx = super::in_place(&path, tmp, 1000.0, 600.0);
+        fx.win.journal_fs = Arc::new(Writes {
+            bytes: Arc::default(),
+            full: Arc::new(AtomicBool::new(true)),
+            hold_record: Arc::default(),
+        });
+        fx.typed("00");
+        // Another writer, so the Save is refused.
+        write_back(&path, 5, b"x");
+        set_mtime(&path, OLD + 60);
+        fx.key(Key::S, command(false));
+        fx.wait_for_save();
+        assert!(
+            !fx.win.status.text.starts_with("saved "),
+            "{}",
+            fx.win.status.text
+        );
+        assert!(fx.win.doc.unsaved());
+        let (line, _, failed) = fx.win.kept_line();
+        assert!(failed && line.contains("no space left on device"), "{line}");
     }
 
     /// A generation due when Save is pressed, not yet at the journal (held before it takes it):
@@ -6633,8 +6883,21 @@ mod stream {
             let mut ed = ed_side(Some(&body()), side);
             ed.typed("AB");
             let _ = cut_off_leaving_a_temp(&mut ed);
+            // The ordinary writer is held on its way, so what is on disk when Save is pressed
+            // is the generation from before the edit; it writes nothing after the Save starts.
+            let gate = Arc::new(AtomicBool::new(true));
+            let _open = Opens(gate.clone());
+            ed.win.generation_gate = Some(gate.clone());
             ed.win.place(0x20, Pane::Hex);
             ed.typed("CD");
+            ed.drv.until(&mut ed.win, 60, |w| w.writing.is_some());
+            assert_eq!(
+                kept_in(&ed.journals()[0]).0,
+                ["0x0: AB was 00"],
+                "{side:?}: on disk at the Save's start"
+            );
+            let open = gate.clone();
+            ed.win.before_drain = Some(Box::new(move || open.store(false, Ordering::SeqCst)));
             ed.save();
             assert!(live_question(&ed).is_some(), "{side:?}: no question");
             let (line, _, failed) = ed.win.kept_line();
@@ -6765,7 +7028,9 @@ mod stream {
         assert!(said.contains("could not be kept in a journal"), "{said}");
         let (line, _, failed) = ed.win.kept_line();
         assert!(
-            failed && line.starts_with("unsaved — NOT kept on disk"),
+            failed
+                && line.starts_with("unsaved — NOT kept on disk")
+                && line.contains("no space left on device"),
             "{line}"
         );
         assert_eq!(
@@ -6775,6 +7040,181 @@ mod stream {
         );
         assert!(std::fs::read(&ed.remote).unwrap() == body, "sent");
         ed.moved.disk_full.store(false, Ordering::SeqCst);
+    }
+
+    /// P9: Remove it removes only the file the question was about. Between the question and
+    /// the answer another file takes the temp's name: in the live window and in an open's row,
+    /// Remove it removes nothing — the other file stays, byte for byte, the record stays, the
+    /// question stays — and says why. Keep it then ends the record and leaves that file.
+    #[test]
+    fn remove_it_removes_only_the_file_it_asked_about() {
+        for side in sides() {
+            for live in [true, false] {
+                let tag = format!("{side:?} live={live}");
+                let mut ed = ed_side(Some(&body()), side);
+                ed.typed("AB");
+                let temp = if live {
+                    let (temp, _) = cut_off_leaving_a_temp(&mut ed);
+                    ed.save();
+                    assert!(live_question(&ed).is_some(), "{tag}");
+                    temp
+                } else {
+                    kill_at(&mut ed, patch::Step::Copy(1));
+                    ed.reopen();
+                    let temps = ed.temps();
+                    assert_eq!(temps.len(), 1, "{tag}: {temps:?}");
+                    ed.remote.parent().unwrap().join(&temps[0])
+                };
+                // Another program's file under the temp's name, after the question was asked.
+                std::fs::remove_file(&temp).unwrap();
+                std::fs::write(&temp, b"another program's file").unwrap();
+                if live {
+                    ed.frames(2);
+                    ed.drv.click_text(&mut ed.win, "Remove it");
+                    ed.drv.until(&mut ed.win, 30, |w| w.answering.is_none());
+                    assert!(live_question(&ed).is_some(), "{tag}: the question went");
+                } else {
+                    ed.press_row("could not verify", RowAction::Remove);
+                    assert!(
+                        ed.rows().iter().any(|l| l.ends_with("— remove it?")),
+                        "{tag}: {:?}",
+                        ed.rows()
+                    );
+                }
+                assert_eq!(
+                    std::fs::read(&temp).unwrap(),
+                    b"another program's file",
+                    "{tag}: removed"
+                );
+                let _ = save_record(&ed);
+                let status = ed.win.status.text.clone();
+                assert!(
+                    status.contains("is not the file the question was about")
+                        && status.ends_with("— not removed"),
+                    "{tag}: {status}"
+                );
+                if live {
+                    ed.frames(2);
+                    ed.drv.click_text(&mut ed.win, "Keep it");
+                    ed.drv.until(&mut ed.win, 30, |w| {
+                        w.answering.is_none() && w.left.is_none()
+                    });
+                } else {
+                    ed.press_row("could not verify", RowAction::Keep);
+                }
+                assert!(
+                    !ed.journals()[0].join("save").exists(),
+                    "{tag}: the record stays"
+                );
+                assert_eq!(
+                    std::fs::read(&temp).unwrap(),
+                    b"another program's file",
+                    "{tag}"
+                );
+            }
+        }
+    }
+
+    /// P9, a temp the record proved the Save's (staged, its contents' evidence recorded) whose
+    /// removal failed on open: before Remove it removes it, the record is reconciled again. A
+    /// file put there since with every attribute equal — size, modification time, owner, mode —
+    /// but other bytes is not that temp any more: it stays, and so do the record and the
+    /// question.
+    #[test]
+    fn remove_it_checks_a_proven_temp_as_the_record_does() {
+        for side in sides() {
+            let mut ed = ed_side(Some(&body()), side);
+            ed.typed("AB");
+            kill_at(&mut ed, patch::Step::Rename);
+            let temps = ed.temps();
+            assert_eq!(temps.len(), 1, "{side:?}: {temps:?}");
+            let temp = ed.remote.parent().unwrap().join(&temps[0]);
+            ed.moved.fail_remove.store(true, Ordering::SeqCst);
+            ed.reopen();
+            ed.moved.fail_remove.store(false, Ordering::SeqCst);
+            assert!(
+                ed.rows()
+                    .iter()
+                    .any(|l| l.contains("could not be removed") && l.ends_with("— remove it?")),
+                "{side:?}: {:?}",
+                ed.rows()
+            );
+            // Other bytes, every attribute as it was.
+            let before = std::fs::metadata(&temp).unwrap();
+            let mut bytes = std::fs::read(&temp).unwrap();
+            bytes[0x10] ^= 0xFF;
+            let mut f = std::fs::OpenOptions::new().write(true).open(&temp).unwrap();
+            std::io::Write::write_all(&mut f, &bytes).unwrap();
+            f.set_modified(before.modified().unwrap()).unwrap();
+            drop(f);
+            let after = std::fs::metadata(&temp).unwrap();
+            assert_eq!(
+                (after.len(), after.modified().unwrap(), after.permissions()),
+                (
+                    before.len(),
+                    before.modified().unwrap(),
+                    before.permissions()
+                ),
+                "{side:?}"
+            );
+            ed.press_row("could not be removed", RowAction::Remove);
+            assert_eq!(std::fs::read(&temp).unwrap(), bytes, "{side:?}: removed");
+            let status = ed.win.status.text.clone();
+            assert!(
+                status.contains("is not the file the question was about")
+                    && status.ends_with("— not removed"),
+                "{side:?}: {status}"
+            );
+            assert!(
+                ed.rows().iter().any(|l| l.ends_with("— remove it?")),
+                "{side:?}"
+            );
+            let _ = save_record(&ed);
+        }
+    }
+
+    /// P9, the record: Remove it acts only for the record that asked. With that record ended
+    /// some other way (here by hand, as no path of the window does it while the question is
+    /// open), Remove it removes nothing and says why — in the live window and in an open's row.
+    #[test]
+    fn remove_it_needs_the_record_that_asked() {
+        for live in [true, false] {
+            let mut ed = ed(&body());
+            ed.typed("AB");
+            let temp = if live {
+                let (temp, _) = cut_off_leaving_a_temp(&mut ed);
+                ed.save();
+                assert!(live_question(&ed).is_some());
+                let mut slot = ed.win.journal.lock().unwrap();
+                slot.as_mut().unwrap().clear_save().unwrap();
+                temp
+            } else {
+                kill_at(&mut ed, patch::Step::Copy(1));
+                ed.reopen();
+                let temps = ed.temps();
+                for row in &mut ed.win.rows {
+                    if let Row::Edits { orphan, .. } = row {
+                        orphan.save = journal::SaveFile::None;
+                    }
+                }
+                ed.remote.parent().unwrap().join(&temps[0])
+            };
+            let held = std::fs::read(&temp).unwrap();
+            if live {
+                ed.frames(2);
+                ed.drv.click_text(&mut ed.win, "Remove it");
+                ed.drv.until(&mut ed.win, 30, |w| w.answering.is_none());
+            } else {
+                ed.press_row("could not verify", RowAction::Remove);
+            }
+            assert_eq!(std::fs::read(&temp).unwrap(), held, "live={live}: removed");
+            let status = ed.win.status.text.clone();
+            assert!(
+                status.starts_with("the interrupted save's record no longer names ")
+                    && status.ends_with(" — not removed"),
+                "live={live}: {status}"
+            );
+        }
     }
 
     /// A temp provably the cut-off Save's whose removal fails at the next Save's start: that
@@ -7733,9 +8173,11 @@ mod stream {
         sx.win.save_as_folder = Some(out.path().to_path_buf());
         sx.key(Key::F7, Modifiers::NONE);
         sx.frames(2);
+        // Nothing waits for the pass yet (the count is of waits, one per 100 ms a caller spends
+        // waiting): it goes up once the Save As's worker is at the wait.
+        let waits = sx.win.checking.waiters.load(Ordering::SeqCst);
         sx.key(Key::Enter, Modifiers::NONE);
         // The Save As's worker reached the wait for the pass, and the pass is not done.
-        let waits = sx.win.checking.waiters.load(Ordering::SeqCst);
         sx.drv.until(&mut sx.win, 30, |w| {
             w.checking.waiters.load(Ordering::SeqCst) > waits
         });

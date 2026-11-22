@@ -1634,6 +1634,10 @@ enum JobKind {
     InPlace,
 }
 
+/// A generation's write ([`HexWindow::generation`]): the journal it kept the edits in, `None`
+/// when it found the journal's epoch moved and wrote nothing.
+type GenerationWork = Box<dyn FnOnce() -> std::result::Result<Option<PathBuf>, String> + Send>;
+
 /// A background generation's end: the revision it holds, and the journal it kept them in —
 /// `Ok(None)` when it found the journal moved on (a Save started, or the journal retired) and
 /// wrote nothing.
@@ -2336,19 +2340,46 @@ impl HexWindow {
         {
             self.save_starts += 1;
         }
-        // A generation on its way is taken first: the Save's worker must not overtake it, nor
-        // a generation of edits it has saved land after it (it would bring a retired journal
-        // back). And none begun before now writes from here on.
-        if let Some(rx) = self.writing.take() {
-            #[cfg(test)]
-            if let Some(hook) = self.before_drain.as_mut() {
-                hook();
+        // A generation on its way is waited for by the Save's worker before it takes the journal
+        // — never by the frame, which goes on drawing whatever the journal's disk does — so the
+        // Save cannot overtake it. None begun before now writes from here on: it cannot bring a
+        // journal the Save retires back. (What it held is in the Save's own first write, which
+        // says what is kept.)
+        let behind = self.writing.take();
+        #[cfg(test)]
+        let mut hook = behind.as_ref().and_then(|_| self.before_drain.take());
+        // Returns false when the Save was stopped (Esc) while it waited: it then sends nothing.
+        let settle = move |cancel: &AtomicBool| -> bool {
+            if let Some(rx) = behind {
+                #[cfg(test)]
+                if let Some(hook) = hook.as_mut() {
+                    hook();
+                }
+                loop {
+                    match rx.recv_timeout(Duration::from_millis(50)) {
+                        Err(mpsc::RecvTimeoutError::Timeout) if cancel.load(Ordering::SeqCst) => {
+                            return false
+                        }
+                        Err(mpsc::RecvTimeoutError::Timeout) => {}
+                        _ => break,
+                    }
+                }
             }
-            if let Ok((rev, result)) = rx.recv() {
-                self.generation_written(rev, result);
-            }
-        }
+            true
+        };
         self.journal_epoch.fetch_add(1, Ordering::SeqCst);
+        *self
+            .saving
+            .progress
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = None;
+        self.saving.cancel.store(false, Ordering::SeqCst);
+        self.saving.kept.store(false, Ordering::SeqCst);
+        *self
+            .saving
+            .kept_why
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = None;
         self.offer = None;
         self.edit_blocked = false;
         let patches = self.doc.patches().clone();
@@ -2356,6 +2387,14 @@ impl HexWindow {
         let file = self.file.clone();
         let (tx, rx) = mpsc::channel();
         let ctx2 = ctx.clone();
+        // Before any Save starts the edits are kept (07 §3), by its worker, first: a streamed
+        // Save's own worker writes them with its record before anything is sent; another's
+        // writes this generation.
+        let keep = (!streamed && self.wants_generation()).then(|| self.generation());
+        let kept = match &keep {
+            Some((rev, _)) => Some(*rev),
+            None => streamed.then(|| self.schedule.taking()),
+        };
         if streamed {
             let way = match kind {
                 JobKind::Save { .. } => Way::Save,
@@ -2368,16 +2407,14 @@ impl HexWindow {
                 snap: snapshot_of(&self.doc, self.baseline),
                 session: self.session,
             };
-            *self
-                .saving
-                .progress
-                .lock()
-                .unwrap_or_else(|p| p.into_inner()) = None;
-            self.saving.cancel.store(false, Ordering::SeqCst);
-            self.saving.kept.store(false, Ordering::SeqCst);
             let (journal, saving) = (self.journal.clone(), self.saving.clone());
             let (host, abs) = (self.home.0.clone(), self.home.1.clone());
             std::thread::spawn(move || {
+                if !settle(&saving.cancel) {
+                    let _ = tx.send(Err(anyhow!(crate::remote::Cancelled)));
+                    ctx2.request_repaint();
+                    return;
+                }
                 let wake = || ctx2.request_repaint();
                 let mut file = file.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
                 let result = file
@@ -2405,11 +2442,20 @@ impl HexWindow {
                 ctx2.request_repaint();
             });
         } else {
-            // Before any Save starts the edits are kept at once (07 §3); a streamed Save's own
-            // worker writes them, with its record, before anything is sent.
-            self.write_generation(true);
+            let saving = self.saving.clone();
             let copy = matches!(kind, JobKind::SaveCopy { .. });
             std::thread::spawn(move || {
+                // Esc does not stop a Save of a local file: this waits for the generation.
+                settle(&saving.cancel);
+                if let Some((_, work)) = keep {
+                    match work() {
+                        Ok(Some(_)) => saving.kept.store(true, Ordering::SeqCst),
+                        Ok(None) => {}
+                        Err(why) => {
+                            *saving.kept_why.lock().unwrap_or_else(|p| p.into_inner()) = Some(why)
+                        }
+                    }
+                }
                 // A save whose worker died holding the file leaves it as it was: usable.
                 let mut file = file.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
                 let result = if copy {
@@ -2427,9 +2473,6 @@ impl HexWindow {
             JobKind::InPlace => "writing in place…",
             JobKind::Save { .. } => "saving…",
         });
-        // A streamed Save's worker keeps the edits in the journal before anything else: the
-        // generation due for them is that one.
-        let kept = streamed.then(|| self.schedule.taking());
         self.job = Some(Job {
             kind,
             snapshot,
@@ -2470,9 +2513,21 @@ impl HexWindow {
                     self.journal_dir = Some(dir);
                     self.schedule.kept(rev);
                 }
-                None if self.doc.unsaved() => self
-                    .schedule
-                    .failed("the journal could not be written".to_string()),
+                // Stopped before it kept anything (Esc while it waited for the generation on its
+                // way): nothing failed — the next generation is due, as after any change.
+                None if self.doc.unsaved() && matches!(&result, Err(e) if stopped(e)) => {
+                    self.schedule.changed(self.doc.rev(), Instant::now())
+                }
+                None if self.doc.unsaved() => {
+                    let why = self
+                        .saving
+                        .kept_why
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .take();
+                    self.schedule
+                        .failed(why.unwrap_or_else(|| "the journal could not be written".into()))
+                }
                 None => {}
             }
         }
@@ -2686,10 +2741,7 @@ impl HexWindow {
     /// Writes the next generation — now, waiting for it (focus loss, close, a Save's start), or
     /// in the background. The journal is made by the first one.
     fn write_generation(&mut self, wait: bool) {
-        if self.preview || (self.journal_dir.is_none() && self.doc.changed_count() == 0) {
-            return;
-        }
-        if !self.state_patches.is_empty() {
+        if !self.wants_generation() {
             return;
         }
         // One at a time: a generation on its way is waited for before the next.
@@ -2698,6 +2750,31 @@ impl HexWindow {
                 self.generation_written(rev, result);
             }
         }
+        let (rev, work) = self.generation();
+        if wait {
+            let result = work();
+            self.generation_written(rev, result);
+        } else {
+            let (tx, rx) = mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = tx.send((rev, work()));
+            });
+            self.writing = Some(rx);
+        }
+    }
+
+    /// Whether there is a generation to write: edits (or a journal already holding some), not a
+    /// preview, and no restored bytes still landing.
+    fn wants_generation(&mut self) -> bool {
+        !self.preview
+            && (self.journal_dir.is_some() || self.doc.changed_count() > 0)
+            && self.state_patches.is_empty()
+    }
+
+    /// The next generation, to write: the revision it holds, and the write (the journal made by
+    /// the first one). It writes nothing once the journal's epoch has moved past the one it was
+    /// made in (a Save started, or the journal was retired).
+    fn generation(&mut self) -> (u64, GenerationWork) {
         let rev = self.schedule.taking();
         let snap = snapshot_of(&self.doc, self.baseline);
         let slot = self.journal.clone();
@@ -2727,16 +2804,7 @@ impl HexWindow {
             journal.publish(&snap).map_err(|e| format!("{e:#}"))?;
             Ok(Some(journal.dir().to_path_buf()))
         };
-        if wait {
-            let result = work();
-            self.generation_written(rev, result);
-        } else {
-            let (tx, rx) = mpsc::channel();
-            std::thread::spawn(move || {
-                let _ = tx.send((rev, work()));
-            });
-            self.writing = Some(rx);
-        }
+        (rev, Box::new(work))
     }
 
     fn generation_written(
@@ -2942,19 +3010,24 @@ impl HexWindow {
 
     /// Removes a file at an interrupted Save's temp path, after the owner's answer: on the
     /// `Origin`, off the frame (it may connect first). `dir`: the journal whose question it is.
-    fn remove_temp(&mut self, path: String, dir: Option<PathBuf>) {
+    fn remove_temp(
+        &mut self,
+        left: LeftTempRef,
+        dir: Option<PathBuf>,
+        record: Option<journal::SaveIntent>,
+    ) {
         let (tx, rx) = mpsc::channel();
         let (file, host) = (self.file.clone(), self.home.0.clone());
         std::thread::spawn(move || {
             let removed = file
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
-                .remove_left(&path);
+                .remove_left(&left, record.as_ref());
             let _ = tx.send((
                 dir,
                 match removed {
-                    Ok(()) => Ok(format!("removed {host}:{path}")),
-                    Err(e) => Err(format!("not removed: {e:#}")),
+                    Ok(()) => Ok(format!("removed {host}:{}", left.path)),
+                    Err(e) => Err(format!("{e:#}")),
                 },
             ));
         });
@@ -2970,9 +3043,18 @@ impl HexWindow {
         // A journal whose row still asks about a temp: Restore and Discard wait for the answer
         // (the question is in its record, which both would end).
         let asking = match &self.rows[i] {
-            Row::Edits { orphan, temp, .. } | Row::Kept { orphan, temp, .. } => temp
-                .as_ref()
-                .map(|t| (orphan.dir().to_path_buf(), t.path.clone())),
+            Row::Edits { orphan, temp, .. } | Row::Kept { orphan, temp, .. } => {
+                temp.as_ref().map(|t| {
+                    // The record that asked it, still naming that temp (07 §3.1).
+                    let asked = match &orphan.save {
+                        journal::SaveFile::Intent(intent) => {
+                            file::record_temp(intent) == Some(t.path.as_str())
+                        }
+                        _ => false,
+                    };
+                    (orphan.dir().to_path_buf(), t.clone(), asked)
+                })
+            }
             _ => None,
         };
         match (&asking, action) {
@@ -2983,10 +3065,24 @@ impl HexWindow {
                 );
                 return;
             }
-            (Some((dir, path)), RowAction::Remove) => {
-                return self.remove_temp(path.clone(), Some(dir.clone()));
+            (Some((_, left, false)), RowAction::Remove) => {
+                self.status = Status::error(format!(
+                    "the interrupted save's record no longer names {}:{} — not removed",
+                    self.home.0, left.path
+                ));
+                return;
             }
-            (Some((dir, _)), RowAction::Keep) => {
+            (Some((dir, left, true)), RowAction::Remove) => {
+                let record = self.rows.get(i).and_then(|row| match row {
+                    Row::Edits { orphan, .. } | Row::Kept { orphan, .. } => match &orphan.save {
+                        journal::SaveFile::Intent(intent) => Some((**intent).clone()),
+                        _ => None,
+                    },
+                    _ => None,
+                });
+                return self.remove_temp(left.clone(), Some(dir.clone()), record);
+            }
+            (Some((dir, ..)), RowAction::Keep) => {
                 let dir = dir.clone();
                 self.temp_answered(&dir);
                 self.status = Status::info("kept; it will not be asked about again");
@@ -3085,7 +3181,16 @@ impl HexWindow {
                 }));
                 self.status = Status::info(format!("loaded {} as edits", plural_bytes(n as u64)));
             }
-            (Row::Temp { path, .. }, RowAction::Remove) => self.remove_temp(path, None),
+            (Row::Temp { path, line, seen }, RowAction::Remove) => self.remove_temp(
+                LeftTempRef {
+                    path,
+                    line,
+                    seen,
+                    proven: false,
+                },
+                None,
+                None,
+            ),
             // Keep (a temp of a Save that landed: nothing records the question) and Later: the
             // row goes, and what it held (its journal's lock) with it. A journal that still asks
             // about a temp asks again on the next open.

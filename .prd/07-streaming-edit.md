@@ -25,8 +25,9 @@ The measurements are in [`research/streaming-edit.md`](research/streaming-edit.m
   - **Recovery reaches the last durable generation** (§3). A generation is scheduled at most
     250 ms after a change, and writing it takes its own time on top. The status bar shows that lag
     (`keeping…`, then `kept`), so a crash loses only edits the window had not yet shown as kept.
-  - **Focus loss, closing and the start of a Save** write the journal at once and wait for it, so
-    nothing is lost across them.
+  - **Focus loss, closing and the start of a Save** write the journal at once, so nothing is lost
+    across them. Focus loss and closing wait for it; a Save's worker writes it before anything
+    else, and the window goes on drawing meanwhile.
   - The journal is offered back on the next open: Restore, Later or Discard.
   - Today a crash loses every unsaved hex and image edit (*edit* §1).
 - **Save writes to the remote file. It is the default** (Cmd/Ctrl+S, F5). It keeps 01 §5: a conflict
@@ -96,8 +97,12 @@ The journal and §3.1's save reconciliation are **the workstream's reading** of 
 - **When a generation is written.** The first change after the last generation schedules the next
   one at most 250 ms later, holding every change up to then. So continuous typing schedules at most
   four a second.
-  - It is also written at once, and waited for, at focus loss, at close (any path out of the window,
-    Discard excepted), and before any Save starts.
+  - It is also written at once, and waited for, at focus loss and at close (any path out of the
+    window, Discard excepted). Before any Save sends anything, the Save's own worker writes it: a
+    generation still on its way is waited for there first — never on the frame, so a slow or
+    stalled disk under the journal does not stop the window; edits are refused meanwhile, as for
+    the whole Save, and Esc stops a streamed Save still waiting there, nothing sent — and none
+    begun before the Save writes after it starts.
   - A hex generation is a few hundred bytes.
 - **How a generation is made durable**, one at a time:
   1. Each new paste: written to `paste-<sha256>.png.tmp`, fsynced, renamed to its own new name, and
@@ -262,6 +267,20 @@ offered:
   about the temp (below), which the journal's row asks under its own line with **Remove it** and
   **Keep it**. Either answer ends the record — Remove it once the file is gone, Keep it leaving
   the file where it is, never asked about again. **Later** leaves the question for the next open.
+  - **Remove it removes only the file the question was about.** The question holds the file's
+    attributes as they were when it was asked (its `lstat`: a regular file, size, modification
+    time, owner and mode). Before removing, the record must still name that temp, and it is
+    reconciled again from fresh reads: a temp it proves the Save's is removed as a reconcile
+    removes one. A question about a temp the record proved the Save's (its removal failed)
+    removes it only while that proof — the recorded stat and, from `staged` on, the contents'
+    evidence — still holds. Otherwise the file there now must have every attribute the question
+    saw. Anything else — another file under the name, a file that cannot be looked at, a
+    question that could not look at its file — removes nothing and keeps the question and the
+    record: `<host>:<path> is not the file the question was about (…) — not removed`. A file of
+    uncertain ownership put there since with every attribute equal is not told apart (SFTP has
+    no inode). The removals sopen makes by itself (a temp provably the Save's, at open or at the
+    next Save's start) are the reconcile's own, from its fresh `lstat` against the recorded stat
+    and the contents' evidence.
   The row's Restore and Discard wait for the answer, since both would end the record. (A temp of
   uncertain ownership beside a Save that *landed* has no record to keep the question: it is asked
   on that open only.)

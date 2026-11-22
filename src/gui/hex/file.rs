@@ -134,7 +134,8 @@ pub struct Checking {
     /// Passes begun (tests).
     #[cfg(test)]
     pub(crate) runs: AtomicU64,
-    /// Callers waiting for a pass another thread runs (tests: the wait's boundary).
+    /// Waits for a pass another thread runs, one counted for each 100 ms a caller spends
+    /// waiting (tests: a caller has reached the wait once this goes up).
     #[cfg(test)]
     pub(crate) waiters: AtomicU64,
 }
@@ -384,6 +385,9 @@ pub struct HexFile {
     pub(crate) rate: Option<f64>,
     /// Where the journals are written (tests: a disk that counts what is written).
     pub(super) journal_fs: Arc<dyn journal::Fs>,
+    /// Tests: how many times recovery listed the journals again (its lock retry).
+    #[cfg(test)]
+    pub(crate) retries: Arc<AtomicU64>,
 }
 
 /// Result of one Save.
@@ -504,6 +508,8 @@ impl HexFile {
             #[cfg(test)]
             rate: None,
             journal_fs: journal::disk(),
+            #[cfg(test)]
+            retries: Arc::default(),
         }
     }
 
@@ -540,6 +546,8 @@ impl HexFile {
             #[cfg(test)]
             rate: None,
             journal_fs: journal::disk(),
+            #[cfg(test)]
+            retries: Arc::default(),
         }
     }
 
@@ -1030,6 +1038,8 @@ pub(super) struct Saving {
     pub progress: Mutex<Option<Progress>>,
     pub cancel: AtomicBool,
     pub kept: AtomicBool,
+    /// Why the edits could not be kept at the Save's start, when its worker could say.
+    pub kept_why: Mutex<Option<String>>,
 }
 
 /// How a streamed Save ended when it did not fail.
@@ -1114,18 +1124,19 @@ impl HexFile {
         // The edits are kept at once, before anything else (07 §3): whatever becomes of this
         // Save — a refused session included — they are in the journal.
         let mut slot = slot.lock().unwrap_or_else(|p| p.into_inner());
-        if slot.is_none() {
-            let made = Journal::create(self.journal_fs.clone(), &cache, &host, &abs, Kind::Hex)
-                .with_context(|| {
-                    format!("{shown} was not touched: the edits could not be kept in a journal")
-                })?;
-            *slot = Some(made);
-        }
-        let journal = slot.as_mut().expect("made above");
         // A cut-off Save's record stays beside it (its generation is kept until reconciled).
-        journal.publish(&snap).with_context(|| {
-            format!("{shown} was not touched: the edits could not be kept in a journal")
-        })?;
+        let kept = match slot.as_mut() {
+            Some(journal) => journal.publish(&snap).map(|_| ()),
+            None => Journal::create(self.journal_fs.clone(), &cache, &host, &abs, Kind::Hex)
+                .and_then(|made| slot.insert(made).publish(&snap).map(|_| ())),
+        };
+        if let Err(e) = kept {
+            *saving.kept_why.lock().unwrap_or_else(|p| p.into_inner()) = Some(format!("{e:#}"));
+            return Err(e.context(format!(
+                "{shown} was not touched: the edits could not be kept in a journal"
+            )));
+        }
+        let journal = slot.as_mut().expect("kept above");
         saving.kept.store(true, Ordering::SeqCst);
         let fs = connect(&mut self.origin, &mut self.connected)?;
         if let Some(intent) = journal.pending_save().cloned() {
@@ -1137,6 +1148,8 @@ impl HexFile {
                         return Ok(Streamed::Ask(LeftTemp {
                             path: path.clone(),
                             line: format!("{why} — remove it?"),
+                            seen: looked_at(fs, path),
+                            proven: false,
                         }));
                     }
                     temp => {
@@ -1151,6 +1164,8 @@ impl HexFile {
                                         "the interrupted save's temporary file {host}:{temp} \
                                          could not be removed ({e:#}) — remove it?"
                                     ),
+                                    seen: looked_at(fs, temp),
+                                    proven: true,
                                 }));
                             }
                         }
@@ -1287,16 +1302,68 @@ impl HexFile {
         }
     }
 
-    /// Removes a temp an interrupted Save left, after the owner chose to (its row): sopen could
-    /// not prove it is its own, so only an explicit answer removes it.
-    pub(super) fn remove_left(&mut self, path: &str) -> Result<()> {
+    /// Removes the file a question about an interrupted Save's temp was about, after the owner
+    /// chose to (its row) — that file only. With the question's record (`record`), the record
+    /// is reconciled again first, from fresh reads: a temp it proves the Save's is removed as a
+    /// reconcile removes one; one it proved before and no longer does is left. Otherwise the
+    /// file at the path now must be a regular file with every attribute the question saw (SFTP
+    /// has no inode to compare; a file put there since with all of them equal is not told
+    /// apart). Anything else — another file, one that cannot be looked at, a question that could
+    /// not look at its file — is left, and said.
+    pub(super) fn remove_left(
+        &mut self,
+        left: &LeftTemp,
+        record: Option<&journal::SaveIntent>,
+    ) -> Result<()> {
+        let shown = self.origin.show(&left.path);
+        let host = self.origin.host().to_string();
         let fs = connect(&mut self.origin, &mut self.connected)?;
-        fs.remove(path)
+        if let Some(intent) = record {
+            let found = journal::reconcile(intent, &host, &mut patch::Fresh::new(&mut *fs));
+            match &found.temp {
+                journal::Temp::Remove(path) if *path == left.path => {
+                    return fs
+                        .remove(path)
+                        .with_context(|| format!("{shown} was not removed"));
+                }
+                journal::Temp::Gone(_) => return Ok(()),
+                _ if left.proven => bail!(
+                    "{shown} is not the file the question was about (the interrupted save's \
+                     record no longer proves it its own) — not removed"
+                ),
+                _ => {}
+            }
+        } else if left.proven {
+            bail!("{shown} cannot be checked against the interrupted save's record — not removed");
+        }
+        let Some(seen) = left.seen else {
+            bail!(
+                "{shown} could not be looked at when the question was asked, so it cannot be told \
+                 from another file — not removed"
+            );
+        };
+        let now = fs
+            .lstat_opt(&left.path)
+            .with_context(|| format!("{shown} could not be looked at — not removed"))?;
+        match now {
+            // Gone already: nothing to remove.
+            None => Ok(()),
+            Some(now) if now.missing.is_none() && seen.matches(&now) => fs
+                .remove(&left.path)
+                .with_context(|| format!("{shown} was not removed")),
+            Some(now) => bail!(
+                "{shown} is not the file the question was about (it is {} now, modified {}) — \
+                 not removed",
+                bytes_word(now.size as usize),
+                crate::cache::rfc3339(now.mtime)
+            ),
+        }
     }
 
-    /// The owner's answer to a live session's question about a temp (`Streamed::Ask`): `remove`
-    /// removes it first (a failure keeps the question); either way the record that held the
-    /// question then ends, and the next Save goes ahead.
+    /// The owner's answer to a live session's question about a temp (`Streamed::Ask`): the
+    /// record must still be the one that asked it (naming that temp); `remove` then removes the
+    /// file it was about ([`HexFile::remove_left`] — a failure keeps the question and the
+    /// record). Then the record ends, and the next Save goes ahead.
     pub(super) fn answer_left(
         &mut self,
         left: &LeftTemp,
@@ -1305,8 +1372,15 @@ impl HexFile {
     ) -> Result<String> {
         let shown = self.origin.show(&left.path);
         if remove {
-            self.remove_left(&left.path)
-                .with_context(|| format!("{shown} was not removed"))?;
+            let asked = slot
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .as_ref()
+                .and_then(|j| j.pending_save().cloned());
+            let Some(intent) = asked.filter(|i| record_temp(i) == Some(left.path.as_str())) else {
+                bail!("the interrupted save's record no longer names {shown} — not removed");
+            };
+            self.remove_left(left, Some(&intent))?;
         }
         let mut slot = slot.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(journal) = slot.as_mut().filter(|j| j.pending_save().is_some()) {
@@ -1668,7 +1742,11 @@ pub(super) enum Row {
     /// A file at the temp path of a Save that landed, which sopen could not verify is its own:
     /// its removal is offered, never done unasked (§3.1). (A Save that did not land keeps the
     /// question in its journal's row: [`LeftTemp`].)
-    Temp { path: String, line: String },
+    Temp {
+        path: String,
+        line: String,
+        seen: Option<journal::FileStat>,
+    },
     /// What was settled (a landed Save found, a provable temp removed): said once.
     Note(String),
 }
@@ -1681,6 +1759,36 @@ pub(super) enum Row {
 pub(super) struct LeftTemp {
     pub path: String,
     pub line: String,
+    /// The file at `path` when the question was asked ([`looked_at`]): Remove it removes that
+    /// file only.
+    pub seen: Option<journal::FileStat>,
+    /// The record proved the file the Save's own (its removal failed): Remove it removes it
+    /// only while the record's check — the one a reconcile makes, contents included from
+    /// `staged` on — still proves it.
+    pub proven: bool,
+}
+
+/// The attributes of the regular file at `path` (its `lstat`, every attribute there), or
+/// `None`: nothing there, a link or another kind of file, an attribute the server left out, or
+/// no answer.
+pub(super) fn looked_at(fs: &mut dyn PatchFs, path: &str) -> Option<journal::FileStat> {
+    match fs.lstat_opt(path) {
+        Ok(Some(stat)) if stat.is_file && !stat.is_symlink && stat.missing.is_none() => {
+            Some(journal::FileStat::of(&stat))
+        }
+        _ => None,
+    }
+}
+
+/// The temp a Save's record names (none for Write in place).
+pub(super) fn record_temp(intent: &journal::SaveIntent) -> Option<&str> {
+    match &intent.phase {
+        journal::Phase::Naming { temp }
+        | journal::Phase::Created { temp, .. }
+        | journal::Phase::Staged { temp, .. }
+        | journal::Phase::Renaming { temp, .. } => Some(temp),
+        journal::Phase::Writing { .. } => None,
+    }
 }
 
 /// `2026-11-20 11:42 UTC`.
@@ -1766,6 +1874,12 @@ pub(super) fn recover(file: &Mutex<HexFile>) -> Vec<Row> {
         let (host, abs, cache) = file.place();
         (host, abs, cache, file.journal_fs.clone())
     };
+    #[cfg(test)]
+    let retries = file
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .retries
+        .clone();
     let want = this_files_journals(&cache, &host, &abs).len();
     let started = std::time::Instant::now();
     let mut orphans = Vec::new();
@@ -1778,6 +1892,8 @@ pub(super) fn recover(file: &Mutex<HexFile>) -> Vec<Row> {
             break;
         }
         orphans.clear();
+        #[cfg(test)]
+        retries.fetch_add(1, Ordering::SeqCst);
         std::thread::sleep(Duration::from_millis(50));
     }
     let mut rows = Vec::new();
@@ -1849,15 +1965,20 @@ fn recover_one(
     };
     if let Some(r) = reconciled {
         match &r.temp {
-            journal::Temp::Keep { path, why } if r.outcome == journal::Outcome::Landed => rows
-                .push(Row::Temp {
+            journal::Temp::Keep { path, why } if r.outcome == journal::Outcome::Landed => {
+                let seen = fs.as_deref_mut().and_then(|fs| looked_at(fs, path));
+                rows.push(Row::Temp {
                     path: path.clone(),
                     line: format!("{why} — remove it?"),
-                }),
+                    seen,
+                })
+            }
             journal::Temp::Keep { path, why } => {
                 left = Some(LeftTemp {
                     path: path.clone(),
                     line: format!("{why} — remove it?"),
+                    seen: fs.as_deref_mut().and_then(|fs| looked_at(fs, path)),
+                    proven: false,
                 })
             }
             journal::Temp::Remove(path) if r.outcome == journal::Outcome::NotLanded => {
@@ -1872,6 +1993,8 @@ fn recover_one(
                                 "the interrupted save's temporary file {host}:{path} could not be \
                                  removed ({e:#}) — remove it?"
                             ),
+                            seen: fs.as_deref_mut().and_then(|fs| looked_at(fs, path)),
+                            proven: true,
                         })
                     }
                     None => {}
