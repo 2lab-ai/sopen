@@ -334,13 +334,19 @@ impl Driver {
     /// the galley holds all of it (a galley cut short with "…" keeps the full string but is
     /// `elided`), and all of its bounds lie inside the shape's clip rect and the window.
     pub fn find_text(&self, text: &str) -> Option<Rect> {
+        self.labelled(text).first().copied()
+    }
+
+    /// Every place the last pass drew `text` whole (as for [`Driver::find_text`]), in the order
+    /// it was painted: what is drawn on top — a modal's — comes last.
+    fn labelled(&self, text: &str) -> Vec<Rect> {
         let found = self.shown(|s| match s {
             egui::Shape::Text(t) if t.galley.text() == text && !t.galley.elided => {
                 Some((t.galley.rect.translate(t.pos.to_vec2()), ()))
             }
             _ => None,
         });
-        found.first().map(|(r, ())| *r)
+        found.into_iter().map(|(r, ())| r).collect()
     }
 
     /// The colour of each section of the galley the last pass drew for exactly `text`, where it
@@ -525,6 +531,18 @@ impl Driver {
     pub fn click_text<W: Window>(&mut self, win: &mut W, text: &str) {
         let rect = self
             .find_text(text)
+            .unwrap_or_else(|| panic!("nothing labelled {text:?} on screen"));
+        self.click(win, rect.center());
+    }
+
+    /// Clicks the control labelled `text` that is drawn on top: a prompt's button, not one of the
+    /// same name in a row under it (a click there lands on the prompt's backdrop, which closes
+    /// the prompt).
+    pub fn click_text_on_top<W: Window>(&mut self, win: &mut W, text: &str) {
+        let rect = self
+            .labelled(text)
+            .last()
+            .copied()
             .unwrap_or_else(|| panic!("nothing labelled {text:?} on screen"));
         self.click(win, rect.center());
     }
