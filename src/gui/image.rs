@@ -4283,6 +4283,38 @@ fn decode_loaded(bytes: Vec<u8>, sha256: Option<[u8; 32]>, load: &Arc<Load>) -> 
     })
 }
 
+/// Where an image window that reads a stream gives way to the hex window (06 §7.3): Hex view on
+/// the memory line, or a file that does not decode. The window leaves the hex window's file
+/// here — on the same stream, nothing read again — and whoever hosts it (the file browser, or
+/// [`open_stream`]'s own window) shows the hex window in its place after that pass.
+#[derive(Clone)]
+pub struct HexSwitch {
+    /// What the stream was opened to wake ([`super::hex::Repaint::waker`]): the hex window binds
+    /// its context to it.
+    repaint: super::hex::Repaint,
+    wanted: Arc<Mutex<Option<GivenWay>>>,
+}
+
+/// What an image window that gave way leaves its host: the hex window's file and the notices
+/// its rows open with.
+type GivenWay = (super::hex::HexFile, Vec<String>);
+
+impl HexSwitch {
+    /// For a stream opened to wake `repaint`.
+    pub fn new(repaint: super::hex::Repaint) -> Self {
+        Self {
+            repaint,
+            wanted: Arc::default(),
+        }
+    }
+
+    /// The hex window's file and its first rows' notices (why the image did not decode), once
+    /// the image window has given way; taken once.
+    pub fn take(&self) -> Option<GivenWay> {
+        self.wanted.lock().unwrap_or_else(|p| p.into_inner()).take()
+    }
+}
+
 /// What the loading window's last pass drew.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Drawn {
@@ -4325,6 +4357,8 @@ struct Streaming {
     physical: Option<u64>,
     /// `SOPEN_KEYS`, for the image window once the image is whole (a window of its own only).
     script: std::collections::VecDeque<super::browser::Play>,
+    /// Where the window gives way to the hex window (a stream's only).
+    switch: Option<HexSwitch>,
 }
 
 impl Drop for Streaming {
@@ -4376,7 +4410,15 @@ impl Streaming {
             sized: false,
             physical: probe::physical_memory(),
             script: Default::default(),
+            switch: None,
         })
+    }
+
+    /// The window gives way to the hex window through `switch` (06 §7.3) — a stream's only: the
+    /// stream is what the hex window reads.
+    fn switching(mut self, switch: Option<HexSwitch>) -> Self {
+        self.switch = switch.filter(|_| self.source.is_some());
+        self
     }
 
     /// Stops the loader: nothing more is asked of the stream, and nothing read is kept.
@@ -4394,12 +4436,46 @@ impl Streaming {
         super::request_close(ctx);
     }
 
+    /// Gives way to the hex window (06 §7.3): Hex view (`why` `None`), or a file that does not
+    /// decode (`why`, said first in the hex window's rows). The loader stops and keeps nothing;
+    /// the stream is the hex window's, with what it has read. Without a stream there is no hex
+    /// window to give way to, and a failure is said as before — as it is when the stream itself
+    /// is not live (it changed, failed or closed): that is what failed, not the file's content.
+    fn give_way(&mut self, ctx: &egui::Context, why: Option<String>) {
+        let live = self
+            .source
+            .as_ref()
+            .is_some_and(|s| s.state().status().is_none());
+        let switch = self.switch.take().filter(|_| live || why.is_none());
+        let Some(switch) = switch.filter(|_| self.source.is_some()) else {
+            if let Some(why) = why {
+                self.fail(ctx, why);
+            }
+            return;
+        };
+        // The loader stops (a read it waits on is woken); the stream goes on, as the hex
+        // window's.
+        self.stop();
+        let (Some(source), Some((origin, cache_root, mut notices))) =
+            (self.source.take(), self.parts.take())
+        else {
+            return;
+        };
+        if let Some(why) = why {
+            notices.insert(0, format!("{why}; the file is shown as bytes"));
+        }
+        let file =
+            super::hex::HexFile::streamed(origin, source, switch.repaint.clone(), &cache_root);
+        *switch.wanted.lock().unwrap_or_else(|p| p.into_inner()) = Some((file, notices));
+        ctx.request_repaint();
+    }
+
     /// The loader's result, once it has one: the image window, or why there is none.
     fn finish(&mut self, ctx: &egui::Context) {
         let Some(done) = self.load.progress().done.take() else {
             return;
         };
-        if let Some(source) = self.source.take() {
+        if let Some(source) = &self.source {
             if !self.first {
                 source.mark(Mark::First);
                 self.first = true;
@@ -4408,8 +4484,11 @@ impl Streaming {
         let loaded = match done {
             Ok(loaded) => loaded,
             Err(e) if e.is::<Stopped>() => return,
-            Err(e) => return self.fail(ctx, format!("{e:#}")),
+            // A file that does not decode is shown as bytes, on the stream it was read through.
+            Err(e) => return self.give_way(ctx, Some(format!("{e:#}"))),
         };
+        self.source = None;
+        self.switch = None;
         let Some((mut origin, cache_root, notices)) = self.parts.take() else {
             return;
         };
@@ -4492,23 +4571,32 @@ impl Streaming {
         }
         let physical = self.physical;
         let mut lines: Vec<(String, Color32)> = Vec::new();
+        // A stream can be shown as bytes instead (06 §7.3): the hex window reads only what it
+        // shows.
+        let hex_view = self.switch.is_some();
         if let Some(ask) = ask {
             let color = if ask.exceeds(physical) {
                 ui.visuals().error_fg_color
             } else {
                 ui.visuals().warn_fg_color
             };
-            lines.push((
-                format!("{} — Continue (Enter) · Close (Esc)", ask.line(physical)),
-                color,
-            ));
+            let keys = if hex_view {
+                "Continue (Enter) · Hex view (H) · Close (Esc)"
+            } else {
+                "Continue (Enter) · Close (Esc)"
+            };
+            lines.push((format!("{} — {keys}", ask.line(physical)), color));
         }
         if let Some(warning) = warning {
             lines.push((warning, ui.visuals().error_fg_color));
         }
+        let mut hex_view_pressed = false;
         if !self.preview {
             if ask.is_some() && super::plain_key(&ctx, Key::Enter) {
                 self.load.go();
+            }
+            if ask.is_some() && hex_view && super::plain_key(&ctx, Key::H) {
+                hex_view_pressed = true;
             }
             if super::plain_key(&ctx, Key::Escape) {
                 // Esc stops the read and keeps nothing (06 §8).
@@ -4585,6 +4673,9 @@ impl Streaming {
                 source.mark(Mark::First);
             }
             self.first = true;
+        }
+        if hex_view_pressed {
+            self.give_way(&ctx, None);
         }
     }
 }
@@ -4674,13 +4765,16 @@ impl super::Window for Streaming {
 /// Opens the image at `origin` through `source` (06 §7.3): the window shows the header's size
 /// and thumbnail before the file is read, and nothing is fetched to open it. With
 /// `SOPEN_AUTOSAVE` there is no window: the file is read, the state applied and saved.
-/// `notices` are shown whole in the window's rows, as [`open`] shows them.
+/// `notices` are shown whole in the window's rows, as [`open`] shows them. `switch`: the window
+/// becomes the hex window, on the same stream, where the image gives way to it (Hex view, a file
+/// that does not decode); `None` keeps the failure as an error.
 pub fn open_stream(
     mut origin: Origin,
     source: Source,
     cache_root: &Path,
     hooks: &Hooks,
     notices: Vec<String>,
+    switch: Option<HexSwitch>,
 ) -> Result<Outcome> {
     if hooks.autosave {
         // No window, and nobody to ask: the run was told to save.
@@ -4692,20 +4786,39 @@ pub fn open_stream(
         return autosave(file, &doc, hooks);
     }
     let input = Input::Stream(source);
-    let window = Streaming::new(input, origin, cache_root, hooks, notices, probe::BUDGET)?;
+    let window =
+        Streaming::new(input, origin, cache_root, hooks, notices, probe::BUDGET)?.switching(switch);
     run_streaming(window, hooks)
 }
 
-/// The loading window in a window of its own, as [`open`] runs the image window.
+/// The loading window in a window of its own, as [`open`] runs the image window — and, where
+/// it gives way, the hex window in the same window ([`Switching`]).
 fn run_streaming(mut window: Streaming, hooks: &Hooks) -> Result<Outcome> {
     window.standalone = true;
     window.script = keys_hook()?;
     let title = window.title.clone();
     let (outcome, leftover) = (window.outcome.clone(), window.leftover.clone());
     let failed = window.failed.clone();
-    let run = super::run_window(&title, LOADING_SIZE, window, hooks);
+    let host = Switching {
+        switch: window.switch.clone(),
+        image: Some(window),
+        hex: None,
+        hooks: hooks.clone(),
+        hex_outcome: Arc::default(),
+        hex_leftover: Arc::default(),
+        failed: failed.clone(),
+    };
+    let (hex_outcome, hex_leftover) = (host.hex_outcome.clone(), host.hex_leftover.clone());
+    let run = super::run_window(&title, LOADING_SIZE, host, hooks);
     // Never exit with a write in flight without its outcome on the terminal.
-    let outcome = settle(&leftover, &outcome, true).unwrap_or_default();
+    let mut outcome = settle(&leftover, &outcome, true).unwrap_or_default();
+    super::hex::finish(&hex_leftover, &hex_outcome);
+    outcome.merge(
+        hex_outcome
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone(),
+    );
     run?;
     if let Some(why) = failed.lock().unwrap_or_else(|p| p.into_inner()).take() {
         bail!(why);
@@ -4713,18 +4826,114 @@ fn run_streaming(mut window: Streaming, hooks: &Hooks) -> Result<Outcome> {
     Ok(outcome)
 }
 
+/// [`open_stream`]'s window: the loading window (then the image window), or — once it gave
+/// way (06 §7.3) — the hex window on the same stream, in the same window, as the binary dialog
+/// becomes the hex window.
+struct Switching {
+    image: Option<Streaming>,
+    hex: Option<super::hex::HexWindow>,
+    switch: Option<HexSwitch>,
+    hooks: Hooks,
+    hex_outcome: Arc<Mutex<Outcome>>,
+    hex_leftover: Arc<Mutex<Option<super::hex::Job>>>,
+    /// The image window's: why the file cannot be shown (the hex window not opening is said
+    /// here too).
+    failed: Arc<Mutex<Option<String>>>,
+}
+
+impl Switching {
+    /// The image window gave way: the hex window from now on.
+    fn swap(&mut self, ctx: &egui::Context) {
+        let Some((file, notices)) = self.switch.as_ref().and_then(HexSwitch::take) else {
+            return;
+        };
+        self.image = None;
+        let made = super::hex::embedded(
+            file,
+            &self.hooks,
+            notices,
+            self.hex_outcome.clone(),
+            self.hex_leftover.clone(),
+        );
+        match made {
+            Ok(window) => {
+                if self.hooks.window_size.is_none() {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(
+                        super::hex::WINDOW.into(),
+                    ));
+                }
+                self.hex = Some(window);
+            }
+            Err(e) => {
+                *self.failed.lock().unwrap_or_else(|p| p.into_inner()) = Some(format!("{e:#}"));
+                super::request_close(ctx);
+            }
+        }
+        ctx.request_repaint();
+    }
+
+    fn window(&self) -> Option<&dyn super::Window> {
+        match (&self.hex, &self.image) {
+            (Some(hex), _) => Some(hex),
+            (None, Some(image)) => Some(image),
+            (None, None) => None,
+        }
+    }
+}
+
+impl super::Window for Switching {
+    fn ui(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
+        match (&mut self.hex, &mut self.image) {
+            (Some(hex), _) => hex.ui(ui),
+            (None, Some(image)) => image.ui(ui),
+            (None, None) => {}
+        }
+        if self.hex.is_none() {
+            self.swap(&ctx);
+        }
+    }
+
+    fn ready(&self) -> bool {
+        self.window().is_none_or(super::Window::ready)
+    }
+
+    fn keys(&self) -> &'static [super::chrome::FKey] {
+        self.window().map_or(&[], super::Window::keys)
+    }
+
+    fn close_requested(&mut self) -> bool {
+        match (&mut self.hex, &mut self.image) {
+            (Some(hex), _) => hex.close_requested(),
+            (None, Some(image)) => image.close_requested(),
+            (None, None) => true,
+        }
+    }
+
+    fn failure(&self) -> Option<String> {
+        self.failed
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+    }
+}
+
 /// [`embed`] for an image read through `source` (06 §7.3): the window to host while the file
-/// streams in, which becomes the image window once it is whole. A file that cannot be shown
-/// asks to be closed and says why ([`super::Window::failure`]).
+/// streams in, which becomes the image window once it is whole. Where the image gives way to
+/// the hex window (Hex view, a file that does not decode) it leaves the hex window's file in
+/// `switch` for its host to show; a file that cannot be shown otherwise asks to be closed and
+/// says why ([`super::Window::failure`]).
 pub fn embed_stream(
     origin: Origin,
     source: Source,
     cache_root: &Path,
     notices: Vec<String>,
+    switch: Option<HexSwitch>,
 ) -> Result<super::Embedded> {
     let hooks = Hooks::default();
     let input = Input::Stream(source);
-    let window = Streaming::new(input, origin, cache_root, &hooks, notices, probe::BUDGET)?;
+    let window = Streaming::new(input, origin, cache_root, &hooks, notices, probe::BUDGET)?
+        .switching(switch);
     let (outcome, leftover) = (window.outcome.clone(), window.leftover.clone());
     Ok(super::Embedded {
         window: Box::new(window),

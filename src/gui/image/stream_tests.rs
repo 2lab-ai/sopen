@@ -1176,8 +1176,8 @@ fn a_file_that_cannot_be_a_picture_is_refused_from_its_header() {
     }
 }
 
-/// A file that arrives whole and does not decode keeps today's error (06 §7.3: the hex
-/// fallback is W8b's).
+/// Without a way to the hex window (`switch` `None`: no host that shows one), a file that
+/// arrives whole and does not decode says so as before.
 #[test]
 fn a_file_that_does_not_decode_says_so_as_today() {
     let mut file = png(64, 64, false);
@@ -1189,6 +1189,81 @@ fn a_file_that_does_not_decode_says_so_as_today() {
     fx.until("the failure", |fx| fx.win.failure().is_some());
     assert_eq!(fx.win.failure(), Some(today));
     assert!(fx.drv.closed() && fx.win.image.is_none());
+}
+
+/// 06 §7.3 and V15 (W8b), in a window of its own ([`open_stream`]'s): a file that does not
+/// decode gives way to the hex window on the same stream — why said first in its rows, its
+/// first rows read from what the stream already holds — and the same window becomes the hex
+/// window ([`Switching`]): it does not close, and it fails nothing.
+#[test]
+fn w8b_a_file_that_does_not_decode_becomes_the_hex_window_on_its_stream() {
+    let mut file = png(64, 64, false);
+    let len = file.len();
+    file.truncate(len - 6000);
+    let today = format!("{:#}", Doc::decode(&file).err().unwrap());
+    let fx = fx(file);
+    let Fx {
+        _tmp,
+        source,
+        mut engine,
+        mut win,
+        mut drv,
+        ..
+    } = fx;
+    let switch = HexSwitch::new(crate::gui::hex::Repaint::default());
+    win.switch = Some(switch.clone());
+    let failed = win.failed.clone();
+    let mut host = Switching {
+        switch: Some(switch),
+        image: Some(win),
+        hex: None,
+        hooks: Hooks::default(),
+        hex_outcome: Arc::default(),
+        hex_leftover: Arc::default(),
+        failed,
+    };
+    let started = Instant::now();
+    while drv
+        .find_text("89 50 4E 47 0D 0A 1A 0A  00 00 00 0D 49 48 44 52")
+        .is_none()
+    {
+        drv.idle(&mut host, 1);
+        engine.pump();
+        if engine.transport().map_or(0, |r| r.pending()) > 0 {
+            engine.step(None);
+        } else {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(started.elapsed() < HANG, "the hex rows never came");
+    }
+    assert!(
+        host.image.is_none() && host.hex.is_some(),
+        "the hex window now"
+    );
+    assert!(
+        drv.texts().iter().any(|(_, _, t)| t.contains(&today)),
+        "why, in its rows"
+    );
+    assert!(!drv.closed(), "the window stayed");
+    assert_eq!(super::super::Window::failure(&host), None);
+    assert!(source.state().status().is_none(), "the same stream, live");
+}
+
+/// W8b: a stream that changed mid-read is what failed, not the file's content: with a way to
+/// the hex window the window still says it changed and gives no way.
+#[test]
+fn w8b_a_file_changed_mid_read_is_not_given_to_the_hex_window() {
+    let file = png(1200, 900, false);
+    let size = file.len() as u64;
+    let mut fx = fx(file);
+    let switch = HexSwitch::new(crate::gui::hex::Repaint::default());
+    fx.win.switch = Some(switch.clone());
+    fx.until("a part", |fx| fx.loaded() > size / 4);
+    fx.control.change(Change::Truncate(size / 2));
+    fx.until("the failure", |fx| fx.win.failure().is_some());
+    let why = fx.win.failure().unwrap();
+    assert!(why.contains("changed"), "{why}");
+    assert!(switch.take().is_none(), "no way to the hex window");
 }
 
 /// 06 §5 in the loading window: a connection lost mid-read is said, the screen stays, and the
@@ -1361,7 +1436,7 @@ fn autosave_through_a_stream_reads_applies_and_saves() {
         ..Default::default()
     };
     let cache = tmp.path().join("cache");
-    let out = open_stream(origin, source, &cache, &hooks, Vec::new()).unwrap();
+    let out = open_stream(origin, source, &cache, &hooks, Vec::new(), None).unwrap();
     assert!(out.saved && out.refused.is_none());
     let saved = Doc::decode(&std::fs::read(&path).unwrap()).unwrap();
     assert_eq!(saved.size(), (40, 30));

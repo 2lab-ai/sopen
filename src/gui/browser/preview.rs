@@ -14,16 +14,15 @@
 //!   has ended — its result came, or its channel closed — and was joined; a cancel flag alone
 //!   frees nothing. So the window has at most one preview worker and one preview session.
 //! - **The exits**: the bar on another file, a folder or `..`, F9, Tab — the display changes,
-//!   the preparation is cancelled and the preview dropped (its private copy with it; a
-//!   streamed one's connection comes back for the next preparation, 06 §13); F4 changes
+//!   the preparation is cancelled and the preview dropped (a remote one's stream gives its
+//!   connection back for the next preparation, 06 §13; nothing of it is on disk); F4 changes
 //!   nothing; Enter or F3 takes the preview away as a viewer ([`Host::take`]); the window
 //!   closing cancels and does not wait ([`Host::cancel`]).
 //! - **Held, not drawn** (a viewer covers the panels): the preview is told
 //!   (`Window::set_shown(false)`), so a streamed one does not poll its file (06 §5).
 
-use super::prepare::{self, Budget, HandedOver, Preview, PreviewRequest, Previewed, Reuse};
+use super::prepare::{self, Budget, HandedOver, Preview, PreviewRequest, Previewed};
 use super::Connect;
-use crate::cache::PreviewSpace;
 use crate::gui::chrome;
 #[cfg(test)]
 use crate::gui::Window;
@@ -97,7 +96,7 @@ impl Prep {
 enum Shown {
     /// The viewer, told it is a preview, or the info card.
     Ready(Box<Preview>),
-    /// Why there is none (no preview folder, a worker that died).
+    /// Why there is none (a worker that died).
     Failed(String),
 }
 
@@ -105,9 +104,8 @@ enum Shown {
 pub(super) enum Taken {
     /// The finished preview, a viewer now: handed over.
     Viewer(HandedOver),
-    /// The file shows an info card: it opens as from the list, a complete private copy
-    /// published instead of read again.
-    Card(Option<Reuse>),
+    /// The file shows an info card: it opens as from the list.
+    Card,
     /// Still being prepared: the same preparation goes on as the viewer's opening, its budget
     /// lifted.
     Running(Prep),
@@ -127,8 +125,6 @@ pub(super) struct Host {
     back: Arc<prepare::Back>,
     /// The preview was drawn this pass ([`Host::ui`]); looked at by the next [`Host::sync`].
     drawn: bool,
-    /// The window's preview copies, made at the first preview.
-    space: Option<Arc<PreviewSpace>>,
     /// The file the committed display shows a preview of.
     display: Option<Want>,
     shown: Option<Shown>,
@@ -151,7 +147,6 @@ impl Host {
             conn: Arc::default(),
             back: Arc::default(),
             drawn: false,
-            space: None,
             display: None,
             shown: None,
             prep: None,
@@ -229,7 +224,7 @@ impl Host {
             }
         }
         if display != self.display {
-            // Committed: the old preview is dropped (its private copy with it).
+            // Committed: the old preview is dropped (its stream with it).
             self.shown = None;
             self.last_progress.clear();
             self.display = display;
@@ -245,7 +240,7 @@ impl Host {
                     // On screen until a pass goes by without drawing it.
                     self.drawn = true;
                 }
-                // Another file's: dropped, its copy removed.
+                // Another file's: dropped.
                 Ended::Ready(_) | Ended::Cancelled => {}
                 Ended::Died if ours => {
                     let why = "no preview: its preparation stopped without a result";
@@ -266,16 +261,6 @@ impl Host {
     }
 
     fn start(&mut self, ctx: &egui::Context, want: Want) {
-        let space = match &self.space {
-            Some(space) => space.clone(),
-            None => match PreviewSpace::new(&self.cache) {
-                Ok(space) => self.space.insert(Arc::new(space)).clone(),
-                Err(e) => {
-                    self.shown = Some(Shown::Failed(format!("no preview: {e:#}")));
-                    return;
-                }
-            },
-        };
         let (done, total) = (Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)));
         let (cancel, budget) = (Arc::new(AtomicBool::new(false)), (self.budget)());
         let (tx, rx) = mpsc::channel();
@@ -305,7 +290,6 @@ impl Host {
                 label: label.as_deref(),
                 abs: &path,
                 cache: &cache,
-                space: &space,
                 back: &back,
                 wake: &wake,
                 began,
@@ -316,7 +300,7 @@ impl Host {
                 waker.request_repaint();
             });
             drop(conn);
-            // Nobody may be listening (the window closed): the preview, and its copy, go here.
+            // Nobody may be listening (the window closed): the preview, and its stream, go here.
             let _ = tx.send(result);
             waker.request_repaint();
         });
@@ -337,7 +321,7 @@ impl Host {
     }
 
     /// Enter or F3 on the file at `path` (02 §4.4): what the host has of it is taken away —
-    /// the finished preview as a viewer, a card's copy, or the running preparation with its
+    /// the finished preview as a viewer, a card, or the running preparation with its
     /// budget lifted. A preparation of another file is cancelled.
     pub fn take(&mut self, path: &str) -> Taken {
         let shows = self.display.as_ref().is_some_and(|w| w.path == path);
@@ -346,7 +330,7 @@ impl Host {
                 Some(Shown::Ready(preview)) => {
                     return match preview.hand_over() {
                         Ok(viewer) => Taken::Viewer(viewer),
-                        Err(card) => Taken::Card(card.into_reuse()),
+                        Err(_card) => Taken::Card,
                     }
                 }
                 Some(Shown::Failed(_)) | None => {}
@@ -367,7 +351,7 @@ impl Host {
     }
 
     /// The window closes: the preparation is cancelled; nothing waits for its worker (it only
-    /// reads, and removes its own private copy) — so an ffprobe or ffmpeg it runs for a video
+    /// reads, and writes nothing) — so an ffprobe or ffmpeg it runs for a video
     /// or a sound is killed and reaped here, at once: the process may end before the worker
     /// would have looked at its stop flag.
     pub fn cancel(&mut self) {

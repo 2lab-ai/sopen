@@ -371,6 +371,8 @@ struct Viewer {
     hold: Option<crate::cache::Claim>,
     /// The file (for F4).
     abs: String,
+    /// An image read through a stream: where it gives way to the hex window (06 §7.3).
+    switch: Option<super::image::HexSwitch>,
 }
 
 /// What a viewer's close leads to: back to the list (Esc, F3), or the window closing.
@@ -679,15 +681,8 @@ impl Browser {
         });
     }
 
-    /// Makes the file at `abs` ready for its viewer, on a worker; `reuse`: a preview card's
-    /// complete private copy, published instead of read again (02 §4.4).
-    fn start_open(
-        &mut self,
-        ctx: &egui::Context,
-        abs: String,
-        name: String,
-        reuse: Option<prepare::Reuse>,
-    ) {
+    /// Makes the file at `abs` ready for its viewer, on a worker.
+    fn start_open(&mut self, ctx: &egui::Context, abs: String, name: String) {
         let (done, total) = (Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)));
         let cancel = Arc::new(AtomicBool::new(false));
         let (tx, rx) = mpsc::channel();
@@ -717,10 +712,7 @@ impl Browser {
                 t.store(all, Ordering::Relaxed);
                 waker.request_repaint();
             };
-            let result = match reuse {
-                Some(reuse) => prepare::prepare_reusing(&req, reuse, &stop, &mut progress),
-                None => prepare::prepare(&req, &stop, &mut progress),
-            };
+            let result = prepare::prepare(&req, &stop, &mut progress);
             let _ = tx.send(result);
             waker.request_repaint();
         });
@@ -1056,12 +1048,12 @@ impl Browser {
             }
             Ok(result) => self.opened(ctx, result, abs, name),
             // The preview's preparation, taken over, came to its end: the live preview becomes
-            // the viewer — or it is an info card (a video, an error), and the file opens as
-            // from the list, a complete private copy published instead of read again.
+            // the viewer — or it is an info card (an error), and the file opens as from the
+            // list.
             Err(preview::Ended::Ready(_)) if cancelled => self.status = not_opened(&name, false),
             Err(preview::Ended::Ready(previewed)) => match previewed.show().hand_over() {
                 Ok(viewer) => self.handed_over(ctx, viewer, abs),
-                Err(card) => self.start_open(ctx, abs, name, card.into_reuse()),
+                Err(_card) => self.start_open(ctx, abs, name),
             },
             Err(preview::Ended::Cancelled) => {
                 self.status = Status::info("cancelled; nothing was kept")
@@ -1087,6 +1079,7 @@ impl Browser {
             }
         };
         let title = show(self.label.as_deref(), &abs);
+        let mut switch = None;
         let (embedded, hold) = match prepared {
             Prepared::Image {
                 file,
@@ -1094,6 +1087,33 @@ impl Browser {
                 notices,
                 claim,
             } => (super::image::embed(file, doc, notices), claim),
+            Prepared::ImageStream {
+                origin,
+                source,
+                repaint,
+                notices,
+            } => {
+                // 06 §7.3: the window reads on a worker of its own, and gives way to the hex
+                // window on the same stream (Hex view, a file that does not decode).
+                let gives_way = super::image::HexSwitch::new(repaint);
+                let made = super::image::embed_stream(
+                    origin,
+                    source,
+                    &self.cache,
+                    notices,
+                    Some(gives_way.clone()),
+                );
+                match made {
+                    Ok(embedded) => {
+                        switch = Some(gives_way);
+                        (embedded, None)
+                    }
+                    Err(e) => {
+                        self.status = Status::error(format!("{e:#}"));
+                        return;
+                    }
+                }
+            }
             Prepared::Media {
                 origin,
                 media,
@@ -1102,6 +1122,15 @@ impl Browser {
             } => (
                 super::media::embed(origin, *media, &self.cache, notices),
                 claim,
+            ),
+            // Probed on the worker: nothing slow is left for this frame (06 §7.4).
+            Prepared::MediaStream {
+                origin,
+                media,
+                notices,
+            } => (
+                super::media::embed_streamed(origin, *media, &self.cache, notices),
+                None,
             ),
             Prepared::Hex { file, notices } => (super::hex::embed(file, notices), None),
             Prepared::Text {
@@ -1120,7 +1149,7 @@ impl Browser {
             }
         };
         self.status = Status::default();
-        self.view(ctx, embedded, hold, abs);
+        self.view(ctx, embedded, hold, abs, switch);
     }
 
     /// What `SOPEN_STATE` asks of the browser (a scripted run): the entry to open or to put
@@ -1139,7 +1168,7 @@ impl Browser {
             [] => Status::default(),
             said => Status::info(said.join(" · ")),
         };
-        self.view(ctx, viewer.embedded, viewer.hold, abs);
+        self.view(ctx, viewer.embedded, viewer.hold, abs, None);
     }
 
     /// `embedded` is the viewer on screen from now on.
@@ -1149,6 +1178,7 @@ impl Browser {
         embedded: Embedded,
         hold: Option<crate::cache::Claim>,
         abs: String,
+        switch: Option<super::image::HexSwitch>,
     ) {
         // The list gave up the keyboard: the viewer's keys are its own now.
         ctx.memory_mut(|m| m.surrender_focus(list_id()));
@@ -1160,6 +1190,7 @@ impl Browser {
             embedded,
             hold,
             abs,
+            switch,
         });
         self.moved_at = None;
     }
@@ -1247,7 +1278,7 @@ impl Browser {
                 };
                 match taken {
                     preview::Taken::Viewer(viewer) => self.handed_over(ctx, viewer, path),
-                    preview::Taken::Card(reuse) => self.start_open(ctx, path, entry.name, reuse),
+                    preview::Taken::Card => self.start_open(ctx, path, entry.name),
                     preview::Taken::Running(prep) => {
                         self.status = Status::default();
                         self.opening = Some(Opening {
@@ -1260,7 +1291,7 @@ impl Browser {
                             source: Source::Preview(prep),
                         });
                     }
-                    preview::Taken::Nothing => self.start_open(ctx, path, entry.name, None),
+                    preview::Taken::Nothing => self.start_open(ctx, path, entry.name),
                 }
             }
             EntryKind::Special => {
@@ -1410,6 +1441,15 @@ impl Browser {
             return;
         };
         let ((), asked) = super::host_pass(&ctx, || viewer.embedded.window.ui(ui));
+        // 06 §7.3: the image gave way to the hex window (Hex view, a file that does not
+        // decode) — on the same stream, in its place, nothing read again.
+        if let Some((file, notices)) = viewer.switch.as_ref().and_then(|s| s.take()) {
+            let abs = viewer.abs.clone();
+            self.drop_viewer();
+            self.view(&ctx, super::hex::embed(file, notices), None, abs, None);
+            ctx.request_repaint();
+            return;
+        }
         if asked {
             // Its prompt was answered, or a write it waited for landed — or it found it cannot
             // show its file after all: ask it again.

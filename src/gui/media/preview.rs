@@ -331,6 +331,8 @@ pub fn prepare(
             // No further than the preview reads; a sound that ends before that is read whole.
             let upto = watch.sound().filter(|upto| *upto < media.duration);
             let lanes = media.lanes().max(1);
+            // A streamed file's waveform is a Bulk reader's, as the window's is (06 §7.4).
+            let input = &input.of_kind(crate::stream::http::Kind::Bulk);
             let mut cmd = wave::command(tools, input, lanes, 0.0, upto);
             #[cfg(test)]
             wave::note_start(input, 0.0, upto);

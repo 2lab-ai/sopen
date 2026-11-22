@@ -504,7 +504,7 @@ fn run_open(
     match route(kind) {
         Route::Browser => open_in_browser(place, &abs, dirs, rec),
         Route::Editor => open_in_editor(&mut place, &abs, kind, dirs, rec),
-        Route::Window => open_in_window(place, &abs, kind, dirs, rec),
+        Route::Window => open_in_window(place, &abs, kind, sniff, dirs, rec),
         Route::Binary => open_binary(place, &abs, stat.size, sniff, None, false, dirs, rec),
     }
 }
@@ -744,17 +744,26 @@ fn open_binary(
     }
 }
 
-/// Images and media open in sopen's own window (spec §6, §7). Images are always fetched (a
-/// local one is copied into the cache: Save needs the bytes as opened); local media is played
-/// in place. Without a display (Linux over ssh) the local copy's path is printed instead.
+/// Images and media open in sopen's own window (spec §6, §7). A remote one opens through a
+/// stream on this connection, whatever its size: nothing is fetched first ([`open_streamed`], 06
+/// §13). A local image is copied into the cache (Save needs the bytes as opened); local media is
+/// played in place. Without a display (Linux over ssh) and with no scripted save or export, the
+/// file is fetched (a local image copied) and the copy's path printed instead. `sniff` = the
+/// bytes the kind sniff read of it.
 fn open_in_window(
     mut place: Place,
     abs: &str,
     kind: Kind,
+    sniff: u64,
     dirs: &Dirs,
     rec: &mut Record,
 ) -> Result<()> {
     let hooks = gui::Hooks::from_env()?;
+    let remote = matches!(place, Place::Remote(..));
+    let windowless = !gui::display_available() && !hooks.autosave && !hooks.autoexport;
+    if window_streams(remote, windowless) {
+        return open_streamed(place, abs, kind, sniff, dirs, rec, &hooks);
+    }
     let mut fetched = None;
     let (local, at) = match (&place, kind) {
         (Place::Local(_), Kind::Video | Kind::Audio) => {
@@ -783,7 +792,7 @@ fn open_in_window(
         .unwrap_or_default();
     // Held until the window closes (media plays from the copy).
     let _claim = fetched.map(|f| f.claim);
-    if !gui::display_available() && !hooks.autosave && !hooks.autoexport {
+    if windowless {
         println!(
             "no display for a window (DISPLAY / WAYLAND_DISPLAY unset); {}",
             local.display()
@@ -793,6 +802,96 @@ fn open_in_window(
     let known = place.display(abs);
     let origin = place.into_origin(abs, at, dirs);
     let outcome = open_copy(kind, origin, &local, &known, &dirs.cache, &hooks, notices)?;
+    rec.action = Some(outcome.action());
+    rec.conflict = outcome.conflict;
+    match outcome.refused {
+        Some(message) => Err(Refused(message).into()),
+        None => Ok(()),
+    }
+}
+
+/// Whether an image, a video or a sound opens through a stream (06 §13 W8b): a remote one that
+/// a window shows, or that a scripted save or export reads. A local file is read in place; with
+/// no window and nothing scripted, the file is fetched and its path printed (nothing to stream
+/// to).
+fn window_streams(remote: bool, windowless: bool) -> bool {
+    remote && !windowless
+}
+
+/// A remote image, video or sound in its window through a stream on the open's own connection
+/// (06 §13 W8b), as the browser's Enter opens it: nothing is fetched, whatever its size, and the
+/// window's `Origin` connects on its first use (a Save). An image's window reads its header, then
+/// the file, and becomes the hex window on the same stream where it gives way (Hex view, a file
+/// that does not decode: 06 §7.3). A video or a sound is read through its byte server's URLs (06
+/// §7.4); a `.ts` is probed through its `play` URL first, and one ffprobe cannot read as media
+/// goes to the binary dialog, as any other file does — on a connection of its own, the stream's
+/// closed.
+fn open_streamed(
+    place: Place,
+    abs: &str,
+    kind: Kind,
+    sniff: u64,
+    dirs: &Dirs,
+    rec: &mut Record,
+    hooks: &gui::Hooks,
+) -> Result<()> {
+    let Place::Remote(spec, conn) = place else {
+        bail!("{abs} is on this machine: it is read in place, not streamed");
+    };
+    let known = spec.display(abs);
+    let dial: gui::browser::Connect = {
+        let (spec, state) = (spec.clone(), dirs.state.clone());
+        std::sync::Arc::new(move || {
+            let fs = SftpRemote::connect(&spec, &state)?;
+            Ok(Box::new(fs) as Box<dyn RemoteFs + Send>)
+        })
+    };
+    let reconnect = |dial: &gui::browser::Connect| -> gui::Reconnect {
+        let dial = dial.clone();
+        Box::new(move || dial())
+    };
+    let repaint = gui::hex::Repaint::default();
+    let opening = sopen::stream::Opening {
+        label: known.clone(),
+        began: Instant::now(),
+        sniff,
+    };
+    let opened = gui::streamed::open(
+        conn,
+        abs,
+        opening,
+        Some(dial.clone()),
+        repaint.waker(),
+        None,
+    )
+    .map_err(|not| anyhow::anyhow!(sopen::stream::explain(&not.error)))?;
+    let origin = gui::Origin::placeholder(
+        Some(reconnect(&dial)),
+        spec.label(),
+        abs.to_string(),
+        opened.at,
+        gui::Placeholder::YES,
+    );
+    let source = opened.source;
+    let outcome = if kind == Kind::Image {
+        let switch = gui::image::HexSwitch::new(repaint);
+        gui::image::open_stream(origin, source, &dirs.cache, hooks, Vec::new(), Some(switch))?
+    } else {
+        let (_, name) = remote::split_parent(abs);
+        if kind::maybe_video(name) {
+            // The `.ts` refine over the URL (06 §7.4).
+            let input = gui::media::served_input(source.clone(), name, &known)?;
+            let refined = kind::refine_input(&input, name, kind);
+            rec.kind = Some(refined);
+            if refined == Kind::Other {
+                drop((input, source, origin));
+                let fs = SftpRemote::connect(&spec, &dirs.state).map_err(refusal_said)?;
+                let place = Place::Remote(spec, Box::new(fs));
+                return open_binary(place, abs, opened.at.size, sniff, None, false, dirs, rec);
+            }
+        }
+        gui::media::open_stream(origin, source, &dirs.cache, hooks, Vec::new())?
+    };
     rec.action = Some(outcome.action());
     rec.conflict = outcome.conflict;
     match outcome.refused {
@@ -1409,6 +1508,12 @@ mod tests {
             assert_eq!(route(kind), Route::Window);
         }
         assert_eq!(route(Kind::Other), Route::Binary);
+        // 06 §13 W8b: a remote image or medium a window shows (or a scripted run reads) opens
+        // through a stream; a local one never, nor one fetched only to print its path.
+        assert!(window_streams(true, false));
+        assert!(!window_streams(true, true));
+        assert!(!window_streams(false, false));
+        assert!(!window_streams(false, true));
         let none = gui::Hooks::default();
         assert_eq!(folder_run(&none, true), FolderRun::Browser);
         assert_eq!(folder_run(&none, false), FolderRun::Editor);

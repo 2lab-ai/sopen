@@ -1216,9 +1216,29 @@ pub fn embed_stream(
 ) -> Result<super::Embedded> {
     let (_, name) = origin.parent();
     let media = Media::stream(source, &name, &origin.display())?;
+    Ok(embed_streamed(origin, media, cache, notices))
+}
+
+/// [`embed_stream`]'s window for `media` a route's worker probed already ([`Media::stream`]):
+/// nothing slow runs here, so the window is made on the frame that shows it. The window works out
+/// how Save and Export render the file itself.
+pub fn embed_streamed(
+    origin: Origin,
+    media: Media,
+    cache: &Path,
+    notices: Vec<String>,
+) -> super::Embedded {
     let mut window = hosted_window(origin, media, cache, notices);
     window.unplanned = true;
-    Ok(hosted(window))
+    hosted(window)
+}
+
+/// The `play` input [`Media::stream`] probes (06 §7.4): `source` served by a byte server of its
+/// own, an mp3 with a LAME `Info` tag seeking fast — for a run that probes it under a watch of
+/// its own (the file browser's preview, [`preview::prepare`]; the `.ts` refine).
+pub fn served_input(source: Source, name: &str, shown: &str) -> Result<Input> {
+    let fastseek = seeks_fast(&source, name);
+    Ok(ffmpeg::Served::start(source, name, shown, fastseek)?.input(Kind::Play))
 }
 
 /// The media window as a preview in the file browser (02 §4.2): told it is one before its first

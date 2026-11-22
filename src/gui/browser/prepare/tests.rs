@@ -1,21 +1,18 @@
 //! The preview's preparation (02 §4.3–§4.4) against a real SFTP server (this machine's own
 //! `sftp-server` over pipes, posing as host `box`) and the local disk: it reads without claiming
 //! the cache, keeps to its budgets — an info card when one is hit, before the bytes past it are
-//! read — and uses the window's one preview connection. Remote text and what the hex window
-//! shows read through a stream on that connection (06 §13 W8a): nothing is written to disk,
-//! a cancelled preview gives the connection back, and the hand-over moves the stream to the
-//! viewer. A remote image is still read into a private copy, published at the hand-over by a
-//! hard link; such a viewer's own session opens on its first remote call. Enter's own
-//! preparation is at the end.
+//! read — and uses the window's one preview connection. Every remote file reads through a stream
+//! on that connection (06 §13 W8a, W8b): nothing is written to disk, a cancelled preview gives
+//! the connection back, and the hand-over moves the stream to the viewer — an image's stream,
+//! read whole, gives it back at once, and such a viewer's own session opens on its first remote
+//! call. Enter's own preparation is at the end.
 
 use super::*;
-use crate::cache::PreviewSpace;
 use crate::gui::testkit::{command, Driver};
 use crate::gui::Window;
 use crate::remote::SftpRemote;
 use eframe::egui::{self, Key};
 use std::collections::BTreeMap;
-use std::os::unix::fs::MetadataExt;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -23,17 +20,13 @@ use std::time::Duration;
 /// What a test runs after a request: its name and path.
 type After = Box<dyn FnMut(&str, &str) + Send>;
 
-/// What crossed the connections a test opened. `content` counts the bytes a reader accepted;
-/// `responses` is what the server sent, one entry per SFTP read response as it reached the reader
-/// (`read_to`'s sink writes each response once, whole) — also bytes the reader then refused —
-/// with the range of the file it holds, decoded from its bytes ([`stamped`] files say where every
-/// byte is: never inferred from what came before). `ops` logs every request made, in order.
+/// What crossed the connections a test opened. `content` counts the bytes a whole read's reader
+/// accepted; `ops` logs every request made, in order.
 #[derive(Default)]
 struct Counts {
     content: AtomicU64,
     heads: AtomicU64,
     reads: Mutex<Vec<(String, u64)>>,
-    responses: Mutex<Vec<(String, Option<u64>, u64)>>,
     ops: Mutex<Vec<String>>,
     /// What streams asked of the connections that became their transport: `(path, offset,
     /// length)` of every read, in order.
@@ -49,7 +42,8 @@ struct Counts {
     after: Mutex<Option<After>>,
     /// Every lstat fails with this, the session staying healthy (a path error).
     lstat_error: Mutex<Option<std::io::ErrorKind>>,
-    /// Called on the first read response, before the reader gets it (tests: hold the read).
+    /// Called on the first read response — a whole read's, or a stream's reply with bytes —
+    /// before the reader gets it (tests: hold the read).
     gate: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
@@ -63,15 +57,6 @@ impl Counts {
 
     fn ops(&self) -> Vec<String> {
         self.ops.lock().unwrap().clone()
-    }
-
-    /// The read responses for `path`, `(offset, bytes)`.
-    fn responses(&self, path: &str) -> Vec<(Option<u64>, u64)> {
-        let all = self.responses.lock().unwrap();
-        all.iter()
-            .filter(|(p, _, _)| p == path)
-            .map(|&(_, at, n)| (at, n))
-            .collect()
     }
 }
 
@@ -146,12 +131,11 @@ impl Counting {
     }
 }
 
-/// What a reader gets: each write is one SFTP read response, recorded with its range at the
-/// boundary, held at the gate the first time, then handed on.
+/// What a reader gets: each write is one SFTP read response, held at the gate the first time,
+/// then handed on.
 struct CountingWriter<'a> {
     out: &'a mut dyn std::io::Write,
     counts: &'a Counts,
-    path: &'a str,
     n: u64,
 }
 
@@ -162,11 +146,6 @@ impl std::io::Write for CountingWriter<'_> {
         Ok(n)
     }
     fn write_all(&mut self, buf: &[u8]) -> std::io::Result<()> {
-        self.counts.responses.lock().unwrap().push((
-            self.path.to_string(),
-            source_of(buf),
-            buf.len() as u64,
-        ));
         let gate = self.counts.gate.lock().unwrap().take();
         if let Some(gate) = gate {
             gate();
@@ -244,7 +223,6 @@ impl RemoteFs for Counting {
         let mut counted = CountingWriter {
             out,
             counts: &counts,
-            path: p,
             n: 0,
         };
         let result = self.inner().read_to(p, &mut counted, progress);
@@ -362,6 +340,14 @@ impl crate::remote::Ranged for CountingRanged {
         let c = self.inner_mut().next(timeout)?;
         let n = c.data().map_or(0, |b| b.len() as u64);
         self.counts.streamed.fetch_add(n, Ordering::Relaxed);
+        // The gate, at the first reply that carries bytes (a stream's read held, as a whole
+        // read's first response is).
+        if n > 0 {
+            let gate = self.counts.gate.lock().unwrap().take();
+            if let Some(gate) = gate {
+                gate();
+            }
+        }
         Some(c)
     }
     fn waker(&self) -> crate::remote::Wake {
@@ -410,13 +396,12 @@ impl crate::remote::Ranged for CountingRanged {
     }
 }
 
-/// A folder of files on "host `box`" (this machine's SFTP server), a cache, the window's preview
-/// space, and a `Connect` that counts the sessions it opens and what is read over them.
+/// A folder of files on "host `box`" (this machine's SFTP server), a cache, and a `Connect` that
+/// counts the sessions it opens and what is read over them.
 struct Fx {
     _tmp: tempfile::TempDir,
     root: PathBuf,
     cache: PathBuf,
-    space: PreviewSpace,
     connect: Connect,
     sessions: Arc<AtomicUsize>,
     counts: Arc<Counts>,
@@ -454,7 +439,6 @@ fn fixture(label: Option<&'static str>) -> Fx {
     let root = base.join("files");
     std::fs::create_dir(&root).unwrap();
     let cache = base.join("cache");
-    let space = PreviewSpace::new(&cache).unwrap();
     let sessions = Arc::new(AtomicUsize::new(0));
     let counts = Arc::new(Counts::default());
     let (n, c) = (sessions.clone(), counts.clone());
@@ -467,7 +451,6 @@ fn fixture(label: Option<&'static str>) -> Fx {
         _tmp: tmp,
         root,
         cache,
-        space,
         connect,
         sessions,
         counts,
@@ -492,7 +475,6 @@ impl Fx {
             label: self.label,
             abs,
             cache: &self.cache,
-            space: &self.space,
             back: &self.back,
             wake: &self.wake,
             began: std::time::Instant::now(),
@@ -510,6 +492,15 @@ impl Fx {
         self.preview_limited(abs, Limits::PREVIEW)
     }
 
+    /// [`Fx::preview_limited`] on a clock that never moves: no step runs over its time, however
+    /// loaded the machine (a test about bytes, not about the budget's times).
+    fn preview_unhurried(&mut self, abs: &str, limits: Limits) -> Preview {
+        let at = std::time::Instant::now();
+        let budget = Budget::with_clock(limits, Box::new(move || at));
+        self.preview_with(abs, &budget, &AtomicBool::new(false))
+            .expect("not cancelled")
+    }
+
     fn request<'a>(&'a self, abs: &'a str) -> Request<'a> {
         Request {
             connect: &self.connect,
@@ -521,39 +512,25 @@ impl Fx {
         }
     }
 
-    /// Every file under the cache outside the preview root, with its content: what a preview
-    /// must not change.
+    /// Every file under the cache, with its content: what a preview must not change (it writes
+    /// nothing to disk).
     fn cache_files(&self) -> BTreeMap<PathBuf, Vec<u8>> {
-        fn walk(dir: &Path, skip: &Path, out: &mut BTreeMap<PathBuf, Vec<u8>>) {
+        fn walk(dir: &Path, out: &mut BTreeMap<PathBuf, Vec<u8>>) {
             let Ok(entries) = std::fs::read_dir(dir) else {
                 return;
             };
             for entry in entries.flatten() {
                 let path = entry.path();
-                if path.starts_with(skip) {
-                    continue;
-                }
                 if path.is_dir() {
-                    walk(&path, skip, out);
+                    walk(&path, out);
                 } else {
                     out.insert(path.clone(), std::fs::read(&path).unwrap_or_default());
                 }
             }
         }
         let mut out = BTreeMap::new();
-        walk(&self.cache, &self.cache.join(".preview"), &mut out);
+        walk(&self.cache, &mut out);
         out
-    }
-
-    /// The names in the window's preview folder.
-    fn preview_copies(&self) -> Vec<PathBuf> {
-        let mut names: Vec<_> = std::fs::read_dir(self.space.dir())
-            .unwrap()
-            .flatten()
-            .map(|e| e.path())
-            .collect();
-        names.sort();
-        names
     }
 }
 
@@ -634,13 +611,13 @@ fn a_prepared_preview_crosses_to_the_window() {
     fn crosses<T: Send + 'static>() {}
     crosses::<Previewed>();
     crosses::<Arc<Budget>>();
-    crosses::<Reuse>();
+    crosses::<Prepared>();
 }
 
-/// A remote preview that reads a copy (an image) never touches the cache: it reads the file
-/// into a private copy of the window's (02 §4.4) — also with an earlier session's copy of the
-/// same file in the cache, holding an edit it never saved — and dropping it removes the copy.
-/// Only a hand-over claims: then the edit is moved aside, and said so, as Enter's fetch does.
+/// A remote preview never touches the cache: an image reads through a stream on the preview
+/// connection — also with an earlier session's copy of the same file in the cache, holding an
+/// edit it never saved — and writes nothing to disk; nor does the hand-over (a stream claims
+/// nothing: that copy and its edit stay as they are, and nothing is said of them).
 #[test]
 fn a_remote_preview_reads_without_claiming_the_cache() {
     let Some(mut fx) = remote() else { return };
@@ -649,37 +626,26 @@ fn a_remote_preview_reads_without_claiming_the_cache() {
     // An earlier session's copy: recorded, then edited and never saved.
     crate::cache::seed_copy(&fx.cache, "box", &abs, b"fetched", b"an unsaved edit");
     let before = fx.cache_files();
-    let p = fx.preview(&abs);
+    let mut p = fx.preview(&abs);
     assert!(p.card().is_none(), "{}", card_why(&p));
     assert_eq!(fx.cache_files(), before, "the cache is as it was");
-    let copies = fx.preview_copies();
-    assert_eq!(copies.len(), 1, "{copies:?}");
-    assert_eq!(std::fs::read(&copies[0]).unwrap(), bytes);
-    use std::os::unix::fs::PermissionsExt;
-    let mode = std::fs::metadata(&copies[0]).unwrap().permissions().mode() & 0o777;
-    assert_eq!(mode, 0o600);
-    let mut p = p;
     let mut drv = Driver::new(500.0, 300.0);
     shown(&mut drv, &mut Host(&mut p.embedded.window));
     assert_eq!(drv.pictures().len(), 1, "the picture is drawn");
     drop(p);
-    assert!(
-        fx.preview_copies().is_empty(),
-        "the copy goes with the preview"
-    );
     assert_eq!(fx.cache_files(), before);
     let handed = fx.preview(&abs).hand_over().ok().expect("a viewer");
-    assert_eq!(handed.notices.len(), 1, "{:?}", handed.notices);
-    assert!(
-        handed.notices[0].contains("unsaved edits"),
-        "{:?}",
-        handed.notices
+    assert!(handed.hold.is_none(), "a stream claims nothing");
+    assert!(handed.notices.is_empty(), "{:?}", handed.notices);
+    assert_eq!(
+        fx.cache_files(),
+        before,
+        "nothing claimed, nothing moved aside"
     );
-    let cached = crate::cache::cache_path(&fx.cache, "box", &abs);
-    assert_eq!(std::fs::read(&cached).unwrap(), bytes);
+    assert_eq!(whole_reads(&fx), Vec::<String>::new());
 }
 
-/// A streamed remote preview (text, 06 §13) writes nothing at all: no private copy, nothing in
+/// A streamed remote preview (text, 06 §13) writes nothing at all: nothing anywhere in
 /// the cache — an earlier session's copy there, holding an edit it never saved, stays exactly
 /// as it is, through the hand-over too (a stream claims nothing).
 #[test]
@@ -693,7 +659,6 @@ fn w8a_a_streamed_preview_writes_nothing_to_disk() {
     let mut drv = Driver::new(500.0, 300.0);
     shown(&mut drv, &mut Host(&mut p.embedded.window));
     assert!(drv.find_text("what the remote holds").is_some());
-    assert!(fx.preview_copies().is_empty(), "{:?}", fx.preview_copies());
     assert_eq!(fx.cache_files(), before, "the cache is as it was");
     assert_eq!(whole_reads(&fx), Vec::<String>::new());
     let mut handed = p.hand_over().ok().expect("a viewer");
@@ -702,7 +667,6 @@ fn w8a_a_streamed_preview_writes_nothing_to_disk() {
     shown(&mut drv, &mut Host(&mut handed.embedded.window));
     assert!(drv.find_text("what the remote holds").is_some());
     assert_eq!(fx.cache_files(), before, "nothing is published");
-    assert!(fx.preview_copies().is_empty());
 }
 
 /// P3: a remote file over the read budget that is read whole to be previewed (an image) shows
@@ -725,7 +689,6 @@ fn a_remote_file_over_the_read_budget_is_a_card_with_nothing_read() {
         "not even a head"
     );
     assert!(fx.counts.ranged.lock().unwrap().is_empty());
-    assert!(fx.preview_copies().is_empty());
 }
 
 /// 02 §4.3 with streaming: the read budget no longer gates a file by its size when it is
@@ -759,80 +722,61 @@ fn w8a_a_large_remote_binary_previews_its_first_rows() {
     );
     assert!(fx.counts.heads.load(Ordering::Relaxed) <= 8 << 10);
     assert_eq!(whole_reads(&fx), Vec::<String>::new());
-    assert!(fx.preview_copies().is_empty());
     assert!(fx.cache_files().is_empty());
-    // Remote text over 16 MiB is not streamed before W5b (06 §7.2): past the read budget it is
-    // the card, decided from the stat and its name — nothing read.
+    // Remote text over 16 MiB streams too (W5b): past the read budget it previews, its name
+    // saying its kind — nothing sniffed, nothing read whole.
     let log = fx.file("huge.log", b"");
-    std::fs::File::options()
-        .write(true)
-        .open(&log)
-        .unwrap()
-        .set_len(40 << 20)
-        .unwrap();
+    grow(&log, 40 << 20);
     drop(p);
     let heads = fx.counts.heads.load(Ordering::Relaxed);
     let p = fx.preview(&log);
-    assert_eq!(card_why(&p), "over the preview limit: Enter opens it");
+    assert!(p.card().is_none(), "{}", card_why(&p));
     assert_eq!(fx.counts.heads.load(Ordering::Relaxed), heads);
     assert_eq!(whole_reads(&fx), Vec::<String>::new());
     assert_eq!(fx.sessions.load(Ordering::SeqCst), 1, "one preview session");
 }
 
-/// P3: a remote file that grows past the budget while it is read is cut at the budget (plus the
-/// one response that crossed it) and shows the card; its partial copy is gone.
+/// P3 through a stream: the handle's size decides too. An image that grew past the read budget
+/// between the stat that decided it fits and its open is the card, nothing of it read through
+/// the stream; with Enter meanwhile (the budget lifted) the whole larger file is read, every
+/// range once, and shows.
 #[test]
-fn a_remote_read_stops_at_the_budget() {
+fn an_image_grown_past_the_read_budget_before_its_open_is_its_card() {
     let Some(mut fx) = remote() else { return };
-    // More than one response at the stat (a short read would make the SFTP client skip what
-    // the file grows by: it moves its offset by what it asked for).
-    // (An image by its name: the file is read into a copy, and the card comes before any
-    // decoding.)
-    let abs = fx.file("growing.png", &stamped(400 << 10));
+    let small = png(64, 48);
+    let big = noisy_png(300, 200);
     let limits = Limits {
-        read: 500 << 10,
+        read: small.len() as u64 + 100,
         ..Limits::PREVIEW
     };
-    let budget = Budget::new(limits);
-    let path = PathBuf::from(&abs);
-    let req = PreviewRequest {
-        conn: &mut fx.conn,
-        connect: &fx.connect,
-        label: fx.label,
-        abs: &abs,
-        cache: &fx.cache,
-        space: &fx.space,
-        back: &fx.back,
-        wake: &fx.wake,
-        began: std::time::Instant::now(),
-    };
-    let mut grown = false;
-    let p = preview(req, &budget, &AtomicBool::new(false), &mut |_, _| {
-        if !grown {
-            // Grown while being read (the stat said 400 KiB).
-            std::fs::write(&path, stamped(8 << 20)).unwrap();
-            grown = true;
+    assert!(big.len() as u64 > 2 * limits.read);
+    for lift in [false, true] {
+        let abs = fx.file(&format!("grows-{lift}.png"), &small);
+        let budget = Budget::new(limits);
+        let (path, bigger, enter) = (abs.clone(), big.clone(), budget.clone());
+        let mut armed = true;
+        *fx.counts.after.lock().unwrap() = Some(Box::new(move |op, p| {
+            // After the stat that decided it fits.
+            if op == "stat" && p == path && std::mem::take(&mut armed) {
+                std::fs::write(&path, &bigger).unwrap();
+                if lift {
+                    enter.lift();
+                }
+            }
+        }));
+        let p = fx
+            .preview_with(&abs, &budget, &AtomicBool::new(false))
+            .unwrap();
+        let reads = stream_reads(&fx, &abs);
+        if lift {
+            assert!(p.card().is_none(), "{}", card_why(&p));
+            assert!(assert_read_once(&reads) >= big.len() as u64, "{reads:?}");
+        } else {
+            assert_eq!(card_why(&p), OVER_LIMIT);
+            assert!(reads.is_empty(), "nothing of it read: {reads:?}");
         }
-    })
-    .unwrap()
-    .show();
-    assert_eq!(card_why(&p), "over the preview limit: Enter opens it");
-    // At the read boundary: what the server sent, response by response, read once, in order —
-    // and taken no further than the response that crossed the budget. (The SFTP reader keeps
-    // requests in flight, at most 4 MiB, 06 §2: what was already sent past that response
-    // arrives and is dropped, never taken.)
-    let responses = fx.counts.responses(&abs);
-    assert_ranges_once(&responses);
-    let sent: u64 = responses.iter().map(|r| r.1).sum();
-    assert!(
-        sent <= (500 << 10) + SFTP_RESPONSE,
-        "the server sent {sent} bytes"
-    );
-    assert_eq!(fx.counts.reads.lock().unwrap().len(), 1, "one read");
-    // What the copy took: never past the budget.
-    let taken = fx.counts.content.load(Ordering::Relaxed);
-    assert!(taken <= 500 << 10, "the copy took {taken} bytes");
-    assert!(fx.preview_copies().is_empty(), "{:?}", fx.preview_copies());
+    }
+    assert_eq!(whole_reads(&fx), Vec::<String>::new());
 }
 
 /// The most one SFTP read response carries: what the whole-file reader asks per request
@@ -881,12 +825,6 @@ fn ranges_once(responses: &[(Option<u64>, u64)]) -> std::result::Result<(), Stri
         }
     }
     Ok(())
-}
-
-fn assert_ranges_once(responses: &[(Option<u64>, u64)]) {
-    if let Err(why) = ranges_once(responses) {
-        panic!("{why}: {responses:?}");
-    }
 }
 
 /// The range oracle reads the ranges from the bytes, not from their count: a response sent twice,
@@ -1026,7 +964,13 @@ fn a_handed_over_local_text_reads_past_its_budget_once() {
         .collect();
     assert_eq!(body.len(), 6 << 20);
     let abs = fx.file("six.log", body.as_bytes());
-    let p = fx.preview(&abs);
+    // The 5 s deadline is not what this is about (its own tests move a clock): a loaded machine
+    // indexing 4 MiB must not make it the card.
+    let unhurried = Limits {
+        time: Duration::from_secs(600),
+        ..Limits::PREVIEW
+    };
+    let p = fx.preview_limited(&abs, unhurried);
     assert!(p.card().is_none(), "{}", card_why(&p));
     let path = PathBuf::from(&abs);
     assert_eq!(
@@ -1066,12 +1010,12 @@ fn a_handed_over_local_text_reads_past_its_budget_once() {
     assert!(fx.cache_files().is_empty(), "{:?}", fx.cache_files().keys());
 }
 
-/// P6 / P12 (remote): handed over, a remote preview's copy is published into the cache by a hard
-/// link — the same inode — and only then claimed (locked) and recorded; the file was read once,
-/// on the preview connection; the viewer's own session opens on its first remote call (here its
-/// Save copy), and the preview name goes when the viewer does.
+/// P6 / P12 (remote image): handed over, the viewer is the window the preview made — nothing
+/// claimed, nothing in the cache, the file read once through the preview's stream (which gave
+/// the session back as soon as it had read it) and decoded once — and the viewer's own session
+/// opens on its first remote call (here its Save copy).
 #[test]
-fn a_handed_over_remote_preview_is_published_by_a_hard_link_and_reconnects_on_use() {
+fn a_handed_over_remote_image_reconnects_on_first_use() {
     let Some(mut fx) = remote() else { return };
     let bytes = png(64, 48);
     let abs = fx.file("photo.png", &bytes);
@@ -1083,42 +1027,14 @@ fn a_handed_over_remote_preview_is_published_by_a_hard_link_and_reconnects_on_us
         1,
         "the preview connection"
     );
-    let copy = fx.preview_copies().remove(0);
-    let cached = crate::cache::cache_path(&fx.cache, "box", &abs);
-    assert!(!cached.exists(), "nothing published before the hand-over");
-    // Before the hand-over the preview holds nothing: no session has ever asked for the copy's
-    // lock, so its lock file is not there. (Not shown by claiming it here: a process a parallel
-    // test forks while that claim is held keeps the lock's descriptor until its exec, and the
-    // hand-over's own claim then finds the copy held and takes a session copy.)
-    let lock = fx
-        .cache
-        .join(".meta/lock")
-        .join(cached.strip_prefix(&fx.cache).unwrap());
-    assert!(!lock.exists(), "not claimed by the preview");
-    let mut handed = p.hand_over().ok().expect("a viewer");
-    assert!(lock.exists(), "claimed by the hand-over");
-    assert!(handed.notices.is_empty(), "{:?}", handed.notices);
-    let hold = handed.hold.take().expect("claimed");
-    assert_eq!(hold.local, cached);
-    let ino = |p: &Path| std::fs::metadata(p).unwrap().ino();
-    assert_eq!(ino(&cached), ino(&copy), "the same inode");
-    let record = fx
-        .cache
-        .join(".meta/record")
-        .join(cached.strip_prefix(&fx.cache).unwrap());
-    let sha = crate::cache::hex(&crate::app::file_hash(&cached).unwrap());
-    assert_eq!(std::fs::read_to_string(record).unwrap().trim(), sha);
-    assert_eq!(
-        *fx.counts.reads.lock().unwrap(),
-        vec![(abs.clone(), bytes.len() as u64)],
-        "one read, of the whole file"
+    assert!(
+        fx.conn.is_some(),
+        "the stream gave the preview session back"
     );
-    assert_eq!(fx.sessions.load(Ordering::SeqCst), 1, "no session yet");
-    // Held from the hand-over on: another session gets a copy of its own.
-    let other = crate::cache::claim(&fx.cache, "box", &abs).unwrap();
-    assert!(other.note.is_some(), "held by the viewer");
-    assert_ne!(other.local, cached);
-    drop(other);
+    let mut handed = p.hand_over().ok().expect("a viewer");
+    assert!(handed.hold.is_none(), "a stream claims nothing");
+    assert!(handed.notices.is_empty(), "{:?}", handed.notices);
+    assert!(fx.cache_files().is_empty(), "{:?}", fx.cache_files().keys());
     let mut drv = Driver::new(800.0, 600.0);
     let mut win = Host(&mut handed.embedded.window);
     shown(&mut drv, &mut win);
@@ -1134,17 +1050,8 @@ fn a_handed_over_remote_preview_is_published_by_a_hard_link_and_reconnects_on_us
         2,
         "its own session, on first use"
     );
-    assert_eq!(
-        fx.counts.reads.lock().unwrap().len(),
-        1,
-        "nothing read again"
-    );
     let crate::gui::Embedded { window, mut settle } = handed.embedded;
     drop(window);
-    assert!(
-        copy.exists(),
-        "the viewer's name lives while it may still write"
-    );
     let deadline = std::time::Instant::now() + Duration::from_secs(20);
     while settle(true).is_none() {
         assert!(
@@ -1152,37 +1059,27 @@ fn a_handed_over_remote_preview_is_published_by_a_hard_link_and_reconnects_on_us
             "the viewer never settled"
         );
     }
-    drop(settle);
-    assert!(!copy.exists(), "the preview name goes with the viewer");
-    assert!(cached.exists(), "the cached copy stays");
     assert_eq!(
         crate::gui::image::decodes(),
         decoded + 1,
         "decoded once: for the preview, never again"
     );
-    drop(hold);
-    // Released with the viewer: the next session gets the shared copy again. (A process forked
-    // by a parallel test can hold the lock's descriptor for a moment: asked again until then.)
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    loop {
-        let other = crate::cache::claim(&fx.cache, "box", &abs).unwrap();
-        if other.note.is_none() {
-            assert_eq!(other.local, cached);
-            break;
-        }
-        assert!(std::time::Instant::now() < deadline, "never released");
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    assert_eq!(
+        fx.counts.streamed.load(Ordering::Relaxed),
+        bytes.len() as u64,
+        "read once"
+    );
+    assert_eq!(whole_reads(&fx), Vec::<String>::new());
 }
 
-/// P4: twenty quick moves — each preview cancelled at once, mid-read, or after it is ready and
-/// dropped — use the window's one preview connection, leave no copy or partial copy, and leave
-/// the cache's mirror and records as they were (empty).
+/// P4: twenty quick moves over images — each preview cancelled at once, mid-read, or after it
+/// is ready and dropped — use the window's one preview connection (each stream gives it back),
+/// never two at once, and leave nothing on disk.
 #[test]
 fn twenty_quick_moves_use_one_connection_and_leave_nothing() {
     let Some(mut fx) = remote() else { return };
-    // Images: read into a private copy (text and binaries stream, 06 §13: their twenty moves
-    // are `w8a_twenty_quick_moves_over_streams_use_one_session`).
+    // Images: read whole through their stream (text and binaries read what they show: their
+    // twenty moves are `w8a_twenty_quick_moves_over_streams_use_one_session`).
     let picture = noisy_png(320, 300);
     assert!(
         picture.len() as u64 > 2 * SFTP_RESPONSE,
@@ -1200,7 +1097,6 @@ fn twenty_quick_moves_use_one_connection_and_leave_nothing() {
             label: fx.label,
             abs,
             cache: &fx.cache,
-            space: &fx.space,
             back: &fx.back,
             wake: &fx.wake,
             began: std::time::Instant::now(),
@@ -1224,7 +1120,12 @@ fn twenty_quick_moves_use_one_connection_and_leave_nothing() {
         1,
         "one preview connection"
     );
-    assert!(fx.preview_copies().is_empty(), "{:?}", fx.preview_copies());
+    assert_eq!(
+        fx.counts.peak.load(Ordering::SeqCst),
+        1,
+        "never two at once"
+    );
+    assert_eq!(whole_reads(&fx), Vec::<String>::new());
     assert!(fx.cache_files().is_empty(), "{:?}", fx.cache_files().keys());
 }
 
@@ -1250,10 +1151,10 @@ fn the_placeholder_connection_reconnects_on_first_use() {
     let Some(fx) = remote() else { return };
     let abs = fx.file("a.txt", b"x");
     let conn = (fx.connect)().unwrap();
-    let mut origin = placeholder_origin(
-        &fx.connect,
-        "box",
-        conn.as_ref(),
+    let connect = fx.connect.clone();
+    let mut origin = Origin::placeholder(
+        Some(Box::new(move || connect()) as Reconnect),
+        "box".to_string(),
         abs.clone(),
         Stat {
             is_dir: false,
@@ -1266,6 +1167,10 @@ fn the_placeholder_connection_reconnects_on_first_use() {
             gid: None,
             missing: None,
             sha256: None,
+        },
+        Placeholder {
+            can_replace: conn.can_replace(),
+            can_link: conn.can_link(),
         },
     );
     let opened = fx.sessions.load(Ordering::SeqCst);
@@ -1281,114 +1186,42 @@ fn the_placeholder_connection_reconnects_on_first_use() {
     assert_eq!(fx.sessions.load(Ordering::SeqCst), opened + 1, "and kept");
 }
 
-/// Enter on an info card whose private copy is complete and unchanged publishes that copy into
-/// the cache instead of reading the file again (02 §4.4); a file changed since is fetched anew.
+/// Lifted (Enter while the preview is still being prepared, 02 §4.4), the preparation goes on
+/// under the viewer's rules: an image over the preview's pixel budget, Enter coming as its
+/// stream opens, is read and decoded all the same — the file read once, every range once — and
+/// there is no card. Without Enter the same file is the card.
 #[test]
-fn enter_on_a_card_reuses_its_complete_unchanged_copy() {
+fn a_lifted_budget_lets_the_preparation_go_on() {
     let Some(mut fx) = remote() else { return };
-    let abs = fx.file("photo.png", &png(64, 48));
+    let bytes = noisy_png(300, 200);
     let few_pixels = Limits {
         pixels: 1000,
         ..Limits::PREVIEW
     };
-    let p = fx.preview_limited(&abs, few_pixels);
-    assert_eq!(card_why(&p), "image is 64×48; Enter opens it");
-    let copy = fx.preview_copies().remove(0);
-    let copy_ino = std::fs::metadata(&copy).unwrap().ino();
-    let reads = fx.counts.reads.lock().unwrap().len();
-    let reuse = p.into_reuse().expect("a complete copy");
-    let opened = prepare_reusing(
-        &fx.request(&abs),
-        reuse,
-        &AtomicBool::new(false),
-        &mut |_, _| {},
-    )
-    .unwrap();
-    let Prepared::Image { claim, .. } = opened else {
-        panic!("not an image")
-    };
-    let claim = claim.expect("claimed");
+    let abs = fx.file("held.png", &bytes);
     assert_eq!(
-        std::fs::metadata(&claim.local).unwrap().ino(),
-        copy_ino,
-        "published, not copied"
+        card_why(&fx.preview_limited(&abs, few_pixels)),
+        "image is 300×200; Enter opens it"
     );
-    assert!(!copy.exists(), "its preview name is gone");
-    assert_eq!(
-        fx.counts.reads.lock().unwrap().len(),
-        reads,
-        "not read again"
-    );
-    drop(claim);
-    // Changed since its preview: read again.
-    let p = fx.preview_limited(&abs, few_pixels);
-    let reuse = p.into_reuse().unwrap();
-    std::fs::write(&abs, png(32, 32)).unwrap();
-    let opened = prepare_reusing(
-        &fx.request(&abs),
-        reuse,
-        &AtomicBool::new(false),
-        &mut |_, _| {},
-    )
-    .unwrap();
-    let Prepared::Image { doc, .. } = opened else {
-        panic!("not an image")
-    };
-    assert_eq!(doc.size(), (32, 32), "the file as it is now");
-}
-
-/// Lifted (Enter while the preview is still being prepared, 02 §4.4), the preparation goes on
-/// under the viewer's rules: Enter comes while the read is under way — after its first response
-/// arrived — and that same read goes on to the end (one read, every range once), then the text
-/// is indexed past the text budget, all of it within the preparation; no card.
-#[test]
-fn a_lifted_budget_lets_the_preparation_go_on() {
-    let Some(mut fx) = remote() else { return };
-    // Over 16 MiB: remote text that is still read into a copy (06 §7.2, until W5b).
-    let body = stamped(TEXT_STREAM_MAX + (1 << 20));
-    let abs = fx.file("long.txt", &body);
-    let budget = Budget::new(Limits {
-        text: 64 << 10,
-        ..Limits::PREVIEW
-    });
-    let (lift, reached) = (budget.clone(), Arc::new(AtomicBool::new(false)));
-    let seen = reached.clone();
-    *fx.counts.gate.lock().unwrap() = Some(Box::new(move || {
-        seen.store(true, Ordering::SeqCst);
-        lift.lift();
+    let abs = fx.file("lifted.png", &bytes);
+    let budget = Budget::new(few_pixels);
+    let (lift, path) = (budget.clone(), abs.clone());
+    *fx.counts.after.lock().unwrap() = Some(Box::new(move |op, p| {
+        if op == "into_ranged" && p == path {
+            lift.lift();
+        }
     }));
     let p = fx
         .preview_with(&abs, &budget, &AtomicBool::new(false))
         .unwrap();
-    assert!(reached.load(Ordering::SeqCst), "lifted mid-read");
     assert!(p.card().is_none(), "{}", card_why(&p));
-    let responses = fx.counts.responses(&abs);
-    assert!(responses.len() > 1, "lifted with the read under way");
-    assert_ranges_once(&responses);
-    assert_eq!(
-        responses.iter().map(|r| r.1).sum::<u64>(),
-        body.len() as u64
-    );
-    assert_eq!(
-        fx.counts.reads.lock().unwrap().len(),
-        1,
-        "not started again"
-    );
-    let copy = fx.preview_copies().remove(0);
-    let indexed: u64 = crate::gui::text::index_reads(&copy)
-        .iter()
-        .map(|r| r.1)
-        .sum();
-    assert_eq!(indexed, body.len() as u64, "indexed past the text budget");
+    let reads = stream_reads(&fx, &abs);
+    assert!(assert_read_once(&reads) >= bytes.len() as u64, "{reads:?}");
     let mut handed = p.hand_over().ok().unwrap();
     let mut drv = Driver::new(600.0, 400.0);
-    let mut win = Host(&mut handed.embedded.window);
-    shown(&mut drv, &mut win);
-    drv.key(&mut win, Key::End, command(false));
-    drv.idle(&mut win, 2);
-    let last = format!("@{:014x}", body.len() as u64 - 16);
-    assert!(drv.find_text(&last).is_some(), "the whole file");
-    assert_eq!(fx.counts.content.load(Ordering::Relaxed), body.len() as u64);
+    shown(&mut drv, &mut Host(&mut handed.embedded.window));
+    assert_eq!(drv.pictures().len(), 1, "the picture");
+    assert_eq!(whole_reads(&fx), Vec::<String>::new());
 }
 
 /// The byte ranges streams asked of `path`, in order, as `(offset, length)`.
@@ -1469,7 +1302,6 @@ fn a_handed_over_remote_text_goes_on_through_its_stream() {
     assert_eq!(whole_reads(&fx), Vec::<String>::new());
     assert_eq!(fx.sessions.load(Ordering::SeqCst), 1, "one session");
     assert_eq!(fx.counts.peak.load(Ordering::SeqCst), 1);
-    assert!(fx.preview_copies().is_empty());
     assert!(fx.cache_files().is_empty(), "{:?}", fx.cache_files().keys());
 }
 
@@ -1589,77 +1421,12 @@ fn w8a_a_shutdown_slower_than_the_wait_makes_two_sessions_and_the_late_one_is_cl
     assert_eq!(fx.counts.live.load(Ordering::SeqCst), 1);
 }
 
-/// Text that grows past 16 MiB between its stat and its open is not shown through a capped
-/// index (06 §7.2): the handle's size decides too. As a preview it is the card, nothing of it
-/// read — and its stream gave the session back: the next preview uses it. By Enter it is
-/// fetched whole, on a connection of its own.
+/// P12 for remote text over 16 MiB (W5b): a 17 MiB file previews through its stream, indexed to
+/// 4 MiB; handed over, the stream is the viewer's, and End shows the last line — no byte range
+/// asked twice over preview and viewer together, nothing read whole, nothing on disk, one
+/// session.
 #[test]
-fn w8a_text_grown_past_16_mib_between_stat_and_open_is_not_streamed() {
-    let Some(mut fx) = remote() else { return };
-    let grown = TEXT_STREAM_MAX + 1;
-    let grows_after_its_stat = |fx: &Fx, abs: &str| {
-        let (path, mut armed) = (abs.to_string(), true);
-        *fx.counts.after.lock().unwrap() = Some(Box::new(move |op, p| {
-            if op == "stat" && p == path && std::mem::take(&mut armed) {
-                let file = std::fs::File::options().write(true).open(&path).unwrap();
-                file.set_len(grown).unwrap();
-            }
-        }));
-    };
-    let abs = fx.file("grows.txt", b"small when it was stat'ed\n");
-    let other = fx.file("small.txt", b"another file\n");
-    grows_after_its_stat(&fx, &abs);
-    let p = fx.preview(&abs);
-    assert_eq!(card_why(&p), OVER_LIMIT);
-    assert!(fx.counts.ops().contains(&format!("into_ranged {abs}")));
-    assert!(stream_reads(&fx, &abs).is_empty(), "nothing of it was read");
-    assert_eq!(whole_reads(&fx), Vec::<String>::new());
-    drop(p);
-    let mut p = fx.preview(&other);
-    assert!(p.card().is_none(), "{}", card_why(&p));
-    let mut drv = Driver::new(500.0, 300.0);
-    shown(&mut drv, &mut Host(&mut p.embedded.window));
-    assert!(drv.find_text("another file").is_some());
-    assert_eq!(
-        fx.sessions.load(Ordering::SeqCst),
-        1,
-        "the rejected stream gave the preview session back"
-    );
-    assert_eq!(fx.counts.peak.load(Ordering::SeqCst), 1);
-    assert!(fx.counts.ops().contains(&format!("into_connection {abs}")));
-    drop(p);
-    // Enter on such a file: the whole fetch.
-    let abs = fx.file("grows-too.txt", b"small when it was stat'ed\n");
-    grows_after_its_stat(&fx, &abs);
-    let sessions = fx.sessions.load(Ordering::SeqCst);
-    let prepared = prepare(&fx.request(&abs), &AtomicBool::new(false), &mut |_, _| {}).unwrap();
-    let Prepared::Text { doc, claim, .. } = prepared else {
-        panic!("not the text viewer")
-    };
-    assert!(!doc.is_stream(), "not through a capped index");
-    assert_eq!(doc.size(), grown, "indexed whole");
-    assert_eq!(
-        std::fs::metadata(&claim.expect("fetched").local)
-            .unwrap()
-            .len(),
-        grown
-    );
-    assert_eq!(whole_reads(&fx), vec![format!("read_to {abs}")]);
-    assert_eq!(
-        fx.sessions.load(Ordering::SeqCst),
-        sessions + 2,
-        "the stream's connection, then the fetch's own"
-    );
-    assert!(stream_reads(&fx, &abs).is_empty());
-}
-
-/// P12 for remote text over 16 MiB, which is still read into a copy (06 §7.2, until W5b): a
-/// 17 MiB file is fetched once, into the preview's copy, which the preview indexes to 4 MiB;
-/// handed over, the copy is the cached one (claimed by its hard link: the same inode) and the
-/// index goes on through the copy's name from 4 MiB — the remote is not read again, no byte is
-/// indexed twice — and End shows the last line.
-#[test]
-fn a_handed_over_remote_text_over_16_mib_resumes_through_its_copy() {
+fn a_handed_over_remote_text_over_16_mib_goes_on_through_its_stream() {
     let Some(mut fx) = remote() else { return };
     let lines = 17 * 16_384;
     let body: String = (0..lines)
@@ -1670,73 +1437,47 @@ fn a_handed_over_remote_text_over_16_mib_resumes_through_its_copy() {
     let abs = fx.file("big.log", body.as_bytes());
     let p = fx.preview(&abs);
     assert!(p.card().is_none(), "{}", card_why(&p));
-    assert!(stream_reads(&fx, &abs).is_empty(), "not a stream");
-    let copy = fx.preview_copies().remove(0);
-    let indexed = |path: &Path| {
-        crate::gui::text::index_reads(path)
-            .iter()
-            .map(|r| r.1)
-            .sum::<u64>()
-    };
-    assert_eq!(indexed(&copy), 4 << 20, "the preview indexed 4 MiB");
     let mut handed = p.hand_over().ok().expect("a viewer");
-    let hold = handed.hold.take().expect("claimed");
-    assert_eq!(
-        std::fs::metadata(&hold.local).unwrap().ino(),
-        std::fs::metadata(&copy).unwrap().ino(),
-        "published by a hard link"
-    );
+    assert!(handed.hold.is_none(), "a stream claims nothing");
     let mut drv = Driver::new(600.0, 400.0);
     let mut win = Host(&mut handed.embedded.window);
-    drv.until(&mut win, 30, |_| indexed(&copy) >= size);
     shown(&mut drv, &mut win);
     drv.key(&mut win, Key::End, command(false));
-    drv.idle(&mut win, 2);
-    assert!(drv
-        .text_starting_with(&format!("{:08} ", lines - 1))
-        .is_some());
-    let mut at = 0;
-    for (offset, n) in crate::gui::text::index_reads(&copy) {
-        assert_eq!(offset, at, "in order, nothing twice");
-        at += n;
+    let last = format!("{:08} ", lines - 1);
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    while drv.text_starting_with(&last).is_none() {
+        assert!(std::time::Instant::now() < deadline, "End never showed it");
+        drv.idle(&mut win, 1);
     }
-    assert_eq!(at, size);
-    assert_eq!(
-        *fx.counts.reads.lock().unwrap(),
-        vec![(abs.clone(), size)],
-        "one fetch"
-    );
+    assert_read_once(&stream_reads(&fx, &abs));
+    assert_eq!(whole_reads(&fx), Vec::<String>::new());
+    assert!(fx.cache_files().is_empty(), "{:?}", fx.cache_files().keys());
+    assert_eq!(fx.sessions.load(Ordering::SeqCst), 1, "one session");
 }
 
 /// A remote file over the read budget whose name says nothing and whose bytes are text: the
-/// sniff (at most 8 KiB) says so, text over 16 MiB does not stream, and it is the card —
-/// nothing more of its 33 MiB read, whole or by range.
+/// sniff (at most 8 KiB) says so, and text of any size streams (W5b) — its preview is its first
+/// page, through the stream on the preview session: nothing read whole, nothing on disk.
 #[test]
-fn w8a_a_nameless_text_file_over_the_read_budget_is_its_card_after_the_sniff() {
+fn w8a_a_nameless_text_file_over_the_read_budget_previews_after_the_sniff() {
     let Some(mut fx) = remote() else { return };
     let body = "a printable line of a file with no extension\n".repeat(1 << 20);
     let bytes = &body.as_bytes()[..(33 << 20)];
     let abs = fx.file("README", bytes);
-    let p = fx.preview(&abs);
-    assert_eq!(card_why(&p), OVER_LIMIT);
-    assert_eq!(
-        p.card().unwrap().kind,
-        Some(Kind::Text),
-        "the sniff said text"
-    );
+    let mut p = fx.preview(&abs);
+    assert!(p.card().is_none(), "{}", card_why(&p));
     let sniffed = fx.counts.heads.load(Ordering::Relaxed);
     assert!(sniffed > 0 && sniffed <= 8 << 10, "{sniffed}");
-    assert_eq!(whole_reads(&fx), Vec::<String>::new());
+    let mut drv = Driver::new(600.0, 400.0);
+    shown(&mut drv, &mut Host(&mut p.embedded.window));
     assert!(
-        fx.counts.ranged.lock().unwrap().is_empty(),
-        "no stream read"
+        drv.text_starting_with("a printable line").is_some(),
+        "its first page"
     );
-    assert!(!fx
-        .counts
-        .ops()
-        .iter()
-        .any(|op| op.starts_with("into_ranged")));
-    assert!(fx.preview_copies().is_empty());
+    let block = crate::stream::BLOCK;
+    assert_eq!(stream_reads(&fx, &abs).first(), Some(&(0, block)));
+    assert_eq!(whole_reads(&fx), Vec::<String>::new());
+    assert!(fx.cache_files().is_empty(), "{:?}", fx.cache_files().keys());
     assert_eq!(fx.sessions.load(Ordering::SeqCst), 1);
 }
 
@@ -1797,7 +1538,6 @@ fn w8a_twenty_quick_moves_over_streams_use_one_session() {
         "never two at once"
     );
     assert_eq!(whole_reads(&fx), Vec::<String>::new());
-    assert!(fx.preview_copies().is_empty(), "{:?}", fx.preview_copies());
     assert!(fx.cache_files().is_empty(), "{:?}", fx.cache_files().keys());
 }
 
@@ -1924,8 +1664,8 @@ fn a_dead_session_is_dropped_before_the_next_one_opens() {
 
 /// Cancel is looked at between every two requests of a preparation: raised inside any one of
 /// them — opening the connection, the lstat, the link target's stat, realpath, the stat, the
-/// sniff, then the stream's open (text: 06 §13) or the read's own stat and the read (an image,
-/// read into a copy) — no later request is made. On a dead session, a cancel raised inside the
+/// sniff (a name that says nothing), then the stream's open (06 §13; an image's too, its name
+/// saying its kind) — no later request is made, and nothing is read through the stream. On a dead session, a cancel raised inside the
 /// failed lstat leaves it there: no probe, no new connection.
 #[test]
 fn a_cancel_inside_any_step_starts_no_later_one() {
@@ -1941,16 +1681,15 @@ fn a_cancel_inside_any_step_starts_no_later_one() {
         "into_ranged {data}",
     ];
     // Its name says its kind: no sniff.
-    let copied = [
+    let image = [
         "connect ",
         "lstat {link}",
         "stat {link}",
         "realpath {link}",
         "stat {data}",
-        "stat {data}",
-        "read_to {data}",
+        "into_ranged {data}",
     ];
-    for (name, steps) in [("data", &streamed), ("data.png", &copied)] {
+    for (name, steps) in [("data", &streamed[..]), ("data.png", &image[..])] {
         for k in 0..steps.len() {
             let mut fx = remote().unwrap();
             let data = fx.file(name, b"plain text with no extension\n");
@@ -1975,7 +1714,6 @@ fn a_cancel_inside_any_step_starts_no_later_one() {
                 result.as_ref().err()
             );
             assert_eq!(requests(&fx), expected, "{name}: cancelled inside step {k}");
-            assert!(fx.preview_copies().is_empty());
             assert!(
                 fx.counts.ranged.lock().unwrap().is_empty(),
                 "{name} step {k}: nothing was read through the stream"
@@ -1999,17 +1737,18 @@ fn a_cancel_inside_any_step_starts_no_later_one() {
     assert_eq!(fx.sessions.load(Ordering::SeqCst), 0, "no new connection");
 }
 
-/// P4: a cancel raised by the window while a read is in flight — after its first response has
-/// arrived — ends the read at that response: the server is asked for nothing more, far less than
-/// the file is sent, the result is a cancel and the partial copy is gone. (That only one worker
-/// runs at a time is the preview host's to show.)
+/// P4: a cancel raised by the window while an image's read is in flight — once its stream's
+/// first reply has arrived — ends the read there: no later range is asked, a fraction of the
+/// file crosses, the result is a cancel, and nothing is on disk. (That only one worker runs at a
+/// time is the preview host's to show.)
 #[test]
 fn a_cancel_during_a_read_stops_its_requests() {
     let Some(mut fx) = remote() else { return };
-    let abs = fx.file("big.png", &stamped(4 << 20));
+    let bytes = noisy_png(1200, 1000);
+    let abs = fx.file("big.png", &bytes);
     let (reached_tx, reached) = std::sync::mpsc::channel::<()>();
     let (go, go_rx) = std::sync::mpsc::channel::<()>();
-    // The worker waits at the gate a bounded time (a test that failed never leaves it hanging),
+    // The stream waits at the gate a bounded time (a test that failed never leaves it hanging),
     // and is let go before anything here can panic.
     *fx.counts.gate.lock().unwrap() = Some(Box::new(move || {
         let _ = reached_tx.send(());
@@ -2031,21 +1770,16 @@ fn a_cancel_during_a_read_stops_its_requests() {
         "{:?}",
         result.err()
     );
-    let responses = fx.counts.responses(&abs);
+    let block = crate::stream::BLOCK;
     assert_eq!(
-        responses.len(),
-        1,
-        "nothing asked after the cancel: {responses:?}"
+        stream_reads(&fx, &abs),
+        vec![(0, block)],
+        "nothing asked after the cancel"
     );
-    let sent: u64 = responses.iter().map(|r| r.1).sum();
-    // One response at most, a fraction of the file's 4 MiB.
-    assert!(sent <= SFTP_RESPONSE, "sent {sent}");
-    assert_eq!(
-        fx.counts.content.load(Ordering::Relaxed),
-        0,
-        "the copy took nothing"
-    );
-    assert!(fx.preview_copies().is_empty(), "{:?}", fx.preview_copies());
+    assert!(fx.counts.streamed.load(Ordering::Relaxed) <= block);
+    assert!(bytes.len() as u64 > 20 * block, "a fraction of the file");
+    assert_eq!(whole_reads(&fx), Vec::<String>::new());
+    assert!(fx.cache_files().is_empty(), "{:?}", fx.cache_files().keys());
 }
 
 /// A clock for a budget that the test moves.
@@ -2092,9 +1826,9 @@ fn the_deadline_stops_a_preparation_in_the_middle() {
     drop(now);
 }
 
-/// The 5 s count from the end of the remote read (02 §4.3: the read shows its progress and is
-/// bounded by its bytes): a read that takes a minute leaves the preparation after it its whole
-/// 5 s, and the preview shows.
+/// The 5 s count from the end of the remote read (02 §4.3: an image's read through its stream
+/// shows its progress and is bounded by its bytes): a read that takes a minute leaves the
+/// preparation after it its whole 5 s, and the preview shows.
 #[test]
 fn the_deadline_starts_after_the_read() {
     let Some(mut fx) = remote() else { return };
@@ -2110,105 +1844,9 @@ fn the_deadline_starts_after_the_read() {
         .unwrap();
     assert!(p.card().is_none(), "{}", card_why(&p));
     assert!(
-        fx.counts.responses(&abs).len() > 1,
+        stream_reads(&fx, &abs).len() > 1,
         "the read went on after the minute"
     );
-}
-
-/// One read budget for the whole preview (02 §4.3), however many times the read starts: a file
-/// that changed during a complete first read is read again only if what is left of the budget
-/// holds it — here it does not, and the card shows, the server having sent no more than the
-/// budget and one response.
-#[test]
-fn a_read_started_again_shares_one_budget() {
-    let Some(mut fx) = remote() else { return };
-    let body = stamped(200 << 10);
-    let abs = fx.file("touched.png", &body);
-    let limits = Limits {
-        read: 300 << 10,
-        ..Limits::PREVIEW
-    };
-    let path = abs.clone();
-    let mut armed = true;
-    *fx.counts.after.lock().unwrap() = Some(Box::new(move |op, p| {
-        if op == "read_to" && p == path && std::mem::take(&mut armed) {
-            // Written to as the first read ended: its time moves.
-            let f = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
-            let then = f.metadata().unwrap().modified().unwrap();
-            f.set_modified(then - Duration::from_secs(3600)).unwrap();
-        }
-    }));
-    let p = fx.preview_limited(&abs, limits);
-    assert_eq!(card_why(&p), OVER_LIMIT);
-    let sent: u64 = fx.counts.responses(&abs).iter().map(|r| r.1).sum();
-    assert!(
-        sent <= limits.read + SFTP_RESPONSE,
-        "the server sent {sent} bytes for a {} byte budget",
-        limits.read
-    );
-    assert!(fx.preview_copies().is_empty(), "{:?}", fx.preview_copies());
-}
-
-/// P6 (remote, the read budget itself): Enter while the read is under way lifts the read budget
-/// for that same read. The file was just under the budget at the stat that decided it and grew
-/// before it was read; Enter comes at the first (full-size) response, and the whole larger file
-/// arrives in that one read — past the budget, every range once, not started again — and shows.
-/// Without Enter the same read stops at the response that crossed the budget: the card.
-#[test]
-fn a_read_lifted_mid_way_goes_past_its_read_budget() {
-    let Some(mut fx) = remote() else { return };
-    // Over 16 MiB throughout: remote text that is still read into a copy (06 §7.2, until W5b).
-    let cap = TEXT_STREAM_MAX + (1 << 20);
-    let grown = stamped(cap + (1 << 20));
-    for lift in [true, false] {
-        let abs = fx.file(&format!("grown-{lift}.txt"), &stamped(cap - (10 << 10)));
-        let (path, bigger) = (abs.clone(), grown.clone());
-        let mut armed = true;
-        *fx.counts.after.lock().unwrap() = Some(Box::new(move |op, p| {
-            // After the stat that decided it fits.
-            if op == "stat" && p == path && std::mem::take(&mut armed) {
-                std::fs::write(&path, &bigger).unwrap();
-            }
-        }));
-        let budget = Budget::new(Limits {
-            read: cap,
-            ..Limits::PREVIEW
-        });
-        if lift {
-            let enter = budget.clone();
-            *fx.counts.gate.lock().unwrap() = Some(Box::new(move || enter.lift()));
-        }
-        let reads = fx.counts.reads.lock().unwrap().len();
-        let p = fx
-            .preview_with(&abs, &budget, &AtomicBool::new(false))
-            .unwrap();
-        let responses = fx.counts.responses(&abs);
-        assert_eq!(
-            responses.first().map(|r| r.1),
-            Some(SFTP_RESPONSE),
-            "the first response is full-size — the length asked, no short read: {responses:?}"
-        );
-        // Enter (the gate, at the first response) came before the read crossed its budget; the
-        // lifted read then crosses it.
-        assert!(
-            SFTP_RESPONSE < cap,
-            "the first response alone is under the budget"
-        );
-        assert_ranges_once(&responses);
-        assert_eq!(fx.counts.reads.lock().unwrap().len(), reads + 1, "one read");
-        let sent: u64 = responses.iter().map(|r| r.1).sum();
-        if lift {
-            assert!(p.card().is_none(), "{}", card_why(&p));
-            assert_eq!(sent, grown.len() as u64, "the whole larger file");
-            assert!(sent > cap, "past the read budget");
-            let copy = fx.preview_copies().remove(0);
-            assert_eq!(std::fs::read(copy).unwrap(), grown);
-        } else {
-            assert_eq!(card_why(&p), OVER_LIMIT);
-            assert!(sent <= cap + SFTP_RESPONSE, "the server sent {sent} bytes");
-            assert!(fx.preview_copies().is_empty());
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -2291,16 +1929,15 @@ fn w8a_enter_on_a_remote_binary_opens_a_stream_and_fetches_one_block() {
     assert!(fx.cache_files().is_empty(), "{:?}", fx.cache_files().keys());
 }
 
-/// The browser's Enter on remote text: a file of at most 16 MiB opens through a stream (06
-/// §7.2 W5a: its index is then whole, as today) — no whole read, nothing in the cache; one byte
-/// more and it keeps today's route, fetched into the cache, until W5b (a capped index would
-/// show the first 16 MiB as the whole file).
+/// The browser's Enter on remote text: a file of any size opens through a stream (06 §7.2; W5b
+/// for one over 16 MiB) — no whole read, nothing in the cache, the open's one session, and its
+/// first screen's block first.
 #[test]
-fn w8a_enter_on_remote_text_streams_up_to_16_mib_and_fetches_above() {
+fn w8a_enter_on_remote_text_streams_at_any_size() {
     let Some(probe) = remote() else { return };
     drop(probe);
     let cap = crate::gui::text::HIGHLIGHT_MAX;
-    for (size, streams) in [(300 << 10, true), (cap, true), (cap + 1, false)] {
+    for size in [300 << 10, cap, cap + 1] {
         let fx = remote().unwrap();
         let mut body = b"the first line\n".to_vec();
         body.resize(size as usize - 1, b'x');
@@ -2310,17 +1947,9 @@ fn w8a_enter_on_remote_text_streams_up_to_16_mib_and_fetches_above() {
         let Prepared::Text { doc, claim, .. } = prepared else {
             panic!("{size}: not the text viewer")
         };
-        assert_eq!(doc.is_stream(), streams, "{size} bytes");
-        assert_eq!(claim.is_none(), streams, "{size} bytes: the cache");
-        assert_eq!(
-            whole_reads(&fx).len(),
-            usize::from(!streams),
-            "{size} bytes"
-        );
+        assert!(doc.is_stream(), "{size} bytes");
+        assert!(claim.is_none(), "{size} bytes: the cache");
         assert_eq!(fx.sessions.load(Ordering::SeqCst), 1, "{size} bytes");
-        if !streams {
-            continue;
-        }
         assert_eq!(doc.total(), size);
         let mut embedded = text::embed(
             doc,
@@ -2339,7 +1968,7 @@ fn w8a_enter_on_remote_text_streams_up_to_16_mib_and_fetches_above() {
             Some((abs.clone(), 0, crate::stream::BLOCK as u32)),
             "{size} bytes: the first screen's block comes first"
         );
-        assert_eq!(whole_reads(&fx), Vec::<String>::new());
+        assert_eq!(whole_reads(&fx), Vec::<String>::new(), "{size} bytes");
         assert!(fx.cache_files().is_empty(), "{:?}", fx.cache_files().keys());
     }
 }
@@ -2400,6 +2029,429 @@ fn w8a_an_empty_remote_file_opens_and_comes_ready() {
         assert!(p.embedded.window.ready(), "{name}: the preview");
     }
     assert_eq!(whole_reads(&fx), Vec::<String>::new());
+}
+
+// ---------------------------------------------------------------------------------------------
+// 06 §13 W8b: the rest of the routes through a stream — remote text over 16 MiB, images and
+// media, by Enter and as previews.
+
+/// `len` bytes of text in lines, each saying its number (`line 00000000 …`).
+fn text_lines(len: usize) -> Vec<u8> {
+    let mut body = Vec::with_capacity(len + 64);
+    let mut n = 0u64;
+    while body.len() < len {
+        body.extend_from_slice(format!("line {n:08} of a long remote log\n").as_bytes());
+        n += 1;
+    }
+    body.truncate(len - 1);
+    body.push(b'\n');
+    body
+}
+
+/// The file at `abs` made `len` bytes long without writing them (sparse: zeros past its end).
+fn grow(abs: &str, len: u64) {
+    std::fs::File::options()
+        .write(true)
+        .open(abs)
+        .unwrap()
+        .set_len(len)
+        .unwrap();
+}
+
+/// What a 2 GiB video's first frame may cost here, at most: a sixteenth of the file — a bound in
+/// bytes, never a time, that a route fetching the file whole cannot stay under. It is not the
+/// engine's own figure: the byte server's rate is the file's (2 GiB in 2 s), so a `play` reader
+/// may read ahead its most (32 MiB, 06 §4's table), and the probe and the frame open a few such
+/// readers; this leaves room for several of them. W8b's live receipts measured 3–5 MB.
+const FAR_SHORT: u64 = (2 << 30) / 16;
+
+/// A 2 s 160×120 clip with its `moov` at the front, followed by a top-level `free` box (64-bit
+/// size) that makes the file `len` bytes long, sparse: a valid video of any size that costs no
+/// disk.
+fn padded_clip(tools: &Tools, dst: &Path, len: u64) {
+    let front = dst.with_extension("front.mp4");
+    clip(tools, &front, (160, 120));
+    make_media(
+        tools,
+        &[
+            "-i",
+            front.to_str().unwrap(),
+            "-c",
+            "copy",
+            "-movflags",
+            "+faststart",
+        ],
+        dst,
+    );
+    std::fs::remove_file(&front).unwrap();
+    let have = std::fs::metadata(dst).unwrap().len();
+    let mut box_head = 1u32.to_be_bytes().to_vec();
+    box_head.extend_from_slice(b"free");
+    box_head.extend_from_slice(&(len - have).to_be_bytes());
+    use std::io::Write as _;
+    let mut file = std::fs::File::options().append(true).open(dst).unwrap();
+    file.write_all(&box_head).unwrap();
+    file.set_len(len).unwrap();
+}
+
+/// W8b at the browser's Enter: remote text over 16 MiB (W5b's large text) opens through a stream
+/// as text of any size does — its first block first, nothing read whole, nothing in the cache,
+/// the open's one session — and End shows its last line, read from the end, not after the rest.
+#[test]
+fn w8b_enter_on_remote_text_over_16_mib_streams() {
+    let Some(fx) = remote() else { return };
+    // Over W5a's 16 MiB, by a margin.
+    let size = 17 << 20;
+    let body = text_lines(size);
+    // The last whole line (the body ends with its newline).
+    let tail = &body[body.len() - 200..body.len() - 1];
+    let from = tail.iter().rposition(|&b| b == b'\n').unwrap() + 1;
+    let last = String::from_utf8_lossy(&tail[from..]).to_string();
+    let abs = fx.file("big.log", &body);
+    drop(body);
+    let prepared = prepare(&fx.request(&abs), &AtomicBool::new(false), &mut |_, _| {});
+    assert_eq!(whole_reads(&fx), Vec::<String>::new(), "nothing read whole");
+    let Prepared::Text { doc, claim, .. } = prepared.unwrap() else {
+        panic!("not the text viewer")
+    };
+    assert!(doc.is_stream(), "read through a stream");
+    assert!(claim.is_none());
+    assert_eq!(doc.total(), size as u64);
+    assert_eq!(
+        fx.sessions.load(Ordering::SeqCst),
+        1,
+        "the open's one session"
+    );
+    let mut embedded = text::embed(
+        doc,
+        format!("box:{abs}"),
+        "big.log",
+        Vec::new(),
+        false,
+        None,
+    );
+    let mut drv = Driver::new(700.0, 400.0);
+    let mut win = Host(&mut embedded.window);
+    shown(&mut drv, &mut win);
+    assert!(
+        drv.text_starting_with("line 00000000").is_some(),
+        "the first screen"
+    );
+    let block = crate::stream::BLOCK;
+    assert_eq!(
+        fx.counts.ranged.lock().unwrap().first().cloned(),
+        Some((abs.clone(), 0, block as u32)),
+        "the first screen's block first"
+    );
+    drv.key(&mut win, Key::End, command(false));
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    while drv.text_starting_with(&last).is_none() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "End never showed {last}"
+        );
+        drv.idle(&mut win, 1);
+    }
+    assert_eq!(whole_reads(&fx), Vec::<String>::new());
+    assert!(fx.cache_files().is_empty(), "{:?}", fx.cache_files().keys());
+}
+
+/// W8b as a preview: remote text over 16 MiB previews through a stream (no longer the card,
+/// nor read whole): its first page, nothing read whole, nothing on disk.
+#[test]
+fn w8b_a_remote_text_over_16_mib_previews_through_its_stream() {
+    let Some(mut fx) = remote() else { return };
+    let abs = fx.file("big.log", &text_lines(17 << 20));
+    let mut p = fx.preview(&abs);
+    assert!(p.card().is_none(), "{}", card_why(&p));
+    let mut drv = Driver::new(600.0, 400.0);
+    shown(&mut drv, &mut Host(&mut p.embedded.window));
+    assert!(
+        drv.text_starting_with("line 00000000").is_some(),
+        "its first page"
+    );
+    assert_eq!(whole_reads(&fx), Vec::<String>::new());
+    assert!(fx.cache_files().is_empty(), "{:?}", fx.cache_files().keys());
+}
+
+/// W8b at the browser's Enter: a remote image opens through a stream on the open's connection
+/// — a 2 GiB one (sparse, a PNG header at its front) included: nothing of it is read whole,
+/// nothing reaches the cache, one session. Its window shows the memory line (with Hex view)
+/// having read its header's block, and nothing more until it is answered.
+#[test]
+fn w8b_enter_on_a_remote_image_reads_nothing_whole() {
+    let Some(fx) = remote() else { return };
+    let abs = fx.file("huge.png", &png_header(100_000, 100_000));
+    grow(&abs, 2 << 30);
+    let prepared = prepare(&fx.request(&abs), &AtomicBool::new(false), &mut |_, _| {});
+    assert_eq!(whole_reads(&fx), Vec::<String>::new(), "nothing read whole");
+    assert!(prepared.is_ok(), "{:#}", prepared.as_ref().err().unwrap());
+    assert!(fx.cache_files().is_empty(), "{:?}", fx.cache_files().keys());
+    assert_eq!(
+        fx.sessions.load(Ordering::SeqCst),
+        1,
+        "the open's one session"
+    );
+    let Ok(Prepared::ImageStream {
+        origin,
+        source,
+        repaint,
+        notices,
+    }) = prepared
+    else {
+        panic!("not an image through its stream")
+    };
+    assert_eq!(source.size(), 2 << 30);
+    let switch = image::HexSwitch::new(repaint);
+    let mut embedded =
+        image::embed_stream(origin, source, &fx.cache, notices, Some(switch)).expect("the window");
+    let mut drv = Driver::new(900.0, 600.0);
+    let mut win = Host(&mut embedded.window);
+    shown(&mut drv, &mut win);
+    drv.idle(&mut win, 5);
+    let line = drv
+        .text_starting_with("reading and decoding this image needs")
+        .expect("the memory line");
+    assert!(line.contains("Hex view (H)"), "{line}");
+    let block = crate::stream::BLOCK;
+    assert_eq!(
+        *fx.counts.ranged.lock().unwrap(),
+        vec![(abs.clone(), 0, block as u32)],
+        "its header's block, and nothing until the line is answered"
+    );
+}
+
+/// W8b as a preview: a remote image previews through a stream on the window's preview session
+/// — read once, nothing read whole, nothing in the cache — and the picture is
+/// drawn.
+#[test]
+fn w8b_a_remote_image_previews_through_a_stream() {
+    let Some(mut fx) = remote() else { return };
+    let bytes = png(64, 48);
+    let abs = fx.file("photo.png", &bytes);
+    let mut p = fx.preview(&abs);
+    assert!(p.card().is_none(), "{}", card_why(&p));
+    let mut drv = Driver::new(500.0, 300.0);
+    shown(&mut drv, &mut Host(&mut p.embedded.window));
+    assert_eq!(drv.pictures().len(), 1, "the picture is drawn");
+    assert_eq!(whole_reads(&fx), Vec::<String>::new(), "nothing read whole");
+    assert!(fx.cache_files().is_empty(), "{:?}", fx.cache_files().keys());
+}
+
+/// W8b, 02 §4.3's pixel budget through a stream: a remote image whose header says it is over
+/// 64 megapixels is the card having read its header's block — not its 20 MiB body.
+#[test]
+fn w8b_a_remote_image_over_the_pixel_budget_is_its_card_after_its_header() {
+    let Some(mut fx) = remote() else { return };
+    let abs = fx.file("wide.png", &png_header(30_000, 30_000));
+    grow(&abs, 20 << 20);
+    let p = fx.preview(&abs);
+    assert_eq!(card_why(&p), "image is 30000×30000; Enter opens it");
+    assert_eq!(whole_reads(&fx), Vec::<String>::new(), "nothing read whole");
+    let block = crate::stream::BLOCK;
+    assert_eq!(
+        *fx.counts.ranged.lock().unwrap(),
+        vec![(abs.clone(), 0, block as u32)],
+        "the header's block"
+    );
+}
+
+/// Lifted (Enter while it is prepared), an image's preview keeps the image window's own question
+/// (06 §7.3's memory line): a remote image whose header asks for more than the window decodes
+/// without asking is the card having read its header's block — never read whole into memory
+/// unasked — and Enter opens it in the window that asks.
+#[test]
+fn w8b_a_lifted_image_preview_still_asks_before_it_reads_a_huge_image() {
+    let Some(mut fx) = remote() else { return };
+    let abs = fx.file("huge.png", &png_header(100_000, 100_000));
+    grow(&abs, 40 << 20);
+    let budget = Budget::preview();
+    let (lift, path) = (budget.clone(), abs.clone());
+    // Enter right after its stat: the read budget, which would have made it the card from the
+    // stat, is lifted.
+    *fx.counts.after.lock().unwrap() = Some(Box::new(move |op, p| {
+        if op == "stat" && p == path {
+            lift.lift();
+        }
+    }));
+    let p = fx
+        .preview_with(&abs, &budget, &AtomicBool::new(false))
+        .unwrap();
+    assert!(budget.lifted());
+    assert!(
+        fx.counts.ops().contains(&format!("into_ranged {abs}")),
+        "it went on to its stream"
+    );
+    assert_eq!(card_why(&p), OVER_LIMIT);
+    let block = crate::stream::BLOCK;
+    assert_eq!(
+        stream_reads(&fx, &abs),
+        vec![(0, block)],
+        "its header's block, nothing more"
+    );
+    assert_eq!(whole_reads(&fx), Vec::<String>::new());
+}
+
+/// 06 §7.3 for a local image: one that does not decode opens in the hex window, why said first
+/// in its rows — not the error row of before.
+#[test]
+fn w8b_a_local_image_that_does_not_decode_opens_as_bytes() {
+    let fx = local();
+    let mut broken = b"\x89PNG\r\n\x1a\n".to_vec();
+    broken.extend((0..200u32).map(|i| (i * 7) as u8));
+    let abs = fx.file("broken.png", &broken);
+    let prepared = prepare(&fx.request(&abs), &AtomicBool::new(false), &mut |_, _| {}).unwrap();
+    let Prepared::Hex { file, notices } = prepared else {
+        panic!("not the hex window")
+    };
+    assert!(file.stream().is_none(), "read in place");
+    assert_eq!(notices.len(), 1, "{notices:?}");
+    assert!(
+        notices[0].contains("cannot decode") || notices[0].contains("Format error"),
+        "{notices:?}"
+    );
+}
+
+/// P6 (image) through a stream: Enter on a previewed remote image — the preview is the viewer:
+/// nothing claimed or published into the cache, the file crossed once, decoded once.
+#[test]
+fn w8b_a_handed_over_remote_image_is_the_viewer_with_nothing_cached() {
+    let Some(mut fx) = remote() else { return };
+    let bytes = png(64, 48);
+    let abs = fx.file("photo.png", &bytes);
+    let decodes = crate::gui::image::decodes();
+    let p = fx.preview(&abs);
+    assert!(p.card().is_none(), "{}", card_why(&p));
+    let mut handed = p.hand_over().ok().expect("a viewer");
+    assert!(handed.hold.is_none(), "a stream claims nothing");
+    assert!(fx.cache_files().is_empty(), "{:?}", fx.cache_files().keys());
+    let mut drv = Driver::new(700.0, 500.0);
+    shown(&mut drv, &mut Host(&mut handed.embedded.window));
+    assert_eq!(drv.pictures().len(), 1, "the picture");
+    assert_eq!(crate::gui::image::decodes() - decodes, 1, "decoded once");
+    assert_eq!(whole_reads(&fx), Vec::<String>::new());
+    assert_eq!(
+        fx.counts.streamed.load(Ordering::Relaxed),
+        bytes.len() as u64,
+        "the file crossed once"
+    );
+}
+
+/// W8b at the browser's Enter: a remote video — 2 GiB, sparse, its `moov` at the front — opens
+/// through a stream: nothing read whole, nothing in the cache.
+#[test]
+fn w8b_enter_on_remote_media_reads_nothing_whole() {
+    let Some(tools) = media_tools() else { return };
+    let Some(fx) = remote() else { return };
+    let video = fx.root.join("big.mp4");
+    padded_clip(&tools, &video, 2 << 30);
+    let abs = video.to_str().unwrap().to_string();
+    let prepared = prepare(&fx.request(&abs), &AtomicBool::new(false), &mut |_, _| {});
+    assert_eq!(whole_reads(&fx), Vec::<String>::new(), "nothing read whole");
+    assert!(prepared.is_ok(), "{:#}", prepared.as_ref().err().unwrap());
+    assert!(fx.cache_files().is_empty(), "{:?}", fx.cache_files().keys());
+    let Ok(Prepared::MediaStream {
+        origin,
+        media,
+        notices,
+    }) = prepared
+    else {
+        panic!("not a medium through its stream")
+    };
+    assert_eq!(media.input.kind(), Some(crate::stream::http::Kind::Play));
+    let mut embedded = media::embed_streamed(origin, *media, &fx.cache, notices);
+    let mut drv = Driver::new(800.0, 600.0);
+    {
+        let mut win = Host(&mut embedded.window);
+        shown(&mut drv, &mut win);
+        assert_eq!(drv.pictures().len(), 1, "its first frame");
+    }
+    let crossed = fx.counts.streamed.load(Ordering::Relaxed);
+    assert!(crossed <= FAR_SHORT, "{crossed} bytes of a 2 GiB file");
+    assert_eq!(whole_reads(&fx), Vec::<String>::new());
+    assert_eq!(
+        fx.sessions.load(Ordering::SeqCst),
+        1,
+        "the open's one session"
+    );
+    drop(embedded);
+}
+
+/// W8b as a preview: a remote video far over the read budget (2 GiB) previews its first frame
+/// through a stream (02 §4.3: the 32 MiB no longer gates it), nothing read whole.
+#[test]
+fn w8b_a_remote_video_over_the_read_budget_previews_its_first_frame() {
+    let Some(tools) = media_tools() else { return };
+    let Some(mut fx) = remote() else { return };
+    let video = fx.root.join("big.mp4");
+    padded_clip(&tools, &video, 2 << 30);
+    let mut p = fx.preview_unhurried(video.to_str().unwrap(), Limits::PREVIEW);
+    assert!(p.card().is_none(), "{}", card_why(&p));
+    let mut drv = Driver::new(500.0, 400.0);
+    shown(&mut drv, &mut Host(&mut p.embedded.window));
+    assert_eq!(drv.pictures().len(), 1, "the frame");
+    assert_eq!(whole_reads(&fx), Vec::<String>::new());
+    assert!(fx.cache_files().is_empty(), "{:?}", fx.cache_files().keys());
+}
+
+/// W8b, 02 §4.4: a remote video's and a remote sound's previews, dropped (the bar moves on),
+/// give the preview session back — every hold on their stream (the byte server, its
+/// connections, the probe's input) goes with them — and the next preview takes it: one session
+/// throughout, never two at once.
+#[test]
+fn w8b_a_dropped_media_preview_gives_its_session_back() {
+    let Some(tools) = media_tools() else { return };
+    let Some(mut fx) = remote() else { return };
+    let video = fx.root.join("clip.mp4");
+    clip(&tools, &video, (160, 120));
+    let sound = fx.root.join("tone.wav");
+    tone(&tools, &sound, 3);
+    let text = fx.file("after.txt", b"the next preview\n");
+    for media in [&video, &sound] {
+        let abs = media.to_str().unwrap().to_string();
+        let mut p = fx.preview_unhurried(&abs, Limits::PREVIEW);
+        assert!(p.card().is_none(), "{}", card_why(&p));
+        let mut drv = Driver::new(500.0, 400.0);
+        shown(&mut drv, &mut Host(&mut p.embedded.window));
+        drop(p);
+        let given = format!("into_connection {abs}");
+        wait_for(&given, || fx.counts.ops().contains(&given));
+    }
+    let mut p = fx.preview(&text);
+    let mut drv = Driver::new(500.0, 400.0);
+    shown(&mut drv, &mut Host(&mut p.embedded.window));
+    assert!(drv.find_text("the next preview").is_some());
+    assert_eq!(fx.sessions.load(Ordering::SeqCst), 1, "one preview session");
+    assert_eq!(
+        fx.counts.peak.load(Ordering::SeqCst),
+        1,
+        "never two at once"
+    );
+    assert_eq!(whole_reads(&fx), Vec::<String>::new());
+}
+
+/// W8b, the `.ts` refine over the URL (06 §7.4): a remote `.ts` whose head looks like a
+/// transport stream but which ffprobe does not read as media opens in the hex window on the
+/// same stream — nothing read whole first.
+#[test]
+fn w8b_a_remote_ts_that_is_not_media_is_hex_on_its_stream() {
+    let Some(_tools) = media_tools() else { return };
+    let Some(fx) = remote() else { return };
+    let mut body = vec![0u8; 188 * 64];
+    for packet in body.chunks_mut(188) {
+        packet[0] = 0x47;
+    }
+    let abs = fx.file("clip.ts", &body);
+    let prepared = prepare(&fx.request(&abs), &AtomicBool::new(false), &mut |_, _| {}).unwrap();
+    assert_eq!(whole_reads(&fx), Vec::<String>::new(), "nothing read whole");
+    let Prepared::Hex { file, .. } = prepared else {
+        panic!("not the hex window")
+    };
+    assert!(
+        file.stream().is_some(),
+        "on the stream it was probed through"
+    );
+    assert!(fx.cache_files().is_empty(), "{:?}", fx.cache_files().keys());
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -2489,32 +2541,23 @@ fn a_video_previews_its_frame_and_a_sound_its_waveform() {
     assert!(fx.cache_files().is_empty(), "{:?}", fx.cache_files().keys());
 }
 
-/// P6 (video): handed over, a remote video's private copy is published into the cache by a hard
-/// link and claimed only then; the media window plays the copy the preview read — the file is
-/// read once, probed once, its first frame decoded once — and the preview name goes with the
-/// viewer.
+/// P6 (video) through a stream: handed over, a remote video's stream is the media window's —
+/// its frame the one the preview decoded, the session gone with it (not given back), nothing
+/// claimed or on disk — and of a 2 GiB file (its `moov` at the front) far less than the file
+/// crossed ([`FAR_SHORT`]).
 #[test]
-fn a_handed_over_remote_video_keeps_its_copy_and_its_frame() {
+fn a_handed_over_remote_video_keeps_its_stream_and_its_frame() {
     let Some(tools) = media_tools() else { return };
     let Some(mut fx) = remote() else { return };
     let video = fx.root.join("clip.mp4");
-    clip(&tools, &video, (160, 120));
+    padded_clip(&tools, &video, 2 << 30);
     let abs = video.to_str().unwrap().to_string();
-    let size = std::fs::metadata(&video).unwrap().len();
-    let p = fx.preview(&abs);
+    let p = fx.preview_unhurried(&abs, Limits::PREVIEW);
     assert!(p.card().is_none(), "{}", card_why(&p));
-    let copy = fx.preview_copies().remove(0);
-    let cached = crate::cache::cache_path(&fx.cache, "box", &abs);
-    assert!(!cached.exists(), "nothing published before the hand-over");
-    assert!(fx.cache_files().is_empty(), "{:?}", fx.cache_files().keys());
-    let runs = spawns::of(&copy);
-    assert_eq!((runs.probe, runs.preview), (1, 1), "one probe, one frame");
-    let started = started_under(&fx.cache);
+    let crossed = fx.counts.streamed.load(Ordering::Relaxed);
+    assert!(crossed <= FAR_SHORT, "{crossed} bytes for the first frame");
     let mut handed = p.hand_over().ok().expect("a viewer");
-    let hold = handed.hold.take().expect("claimed");
-    assert_eq!(hold.local, cached);
-    let ino = |p: &Path| std::fs::metadata(p).unwrap().ino();
-    assert_eq!(ino(&cached), ino(&copy), "the same inode");
+    assert!(handed.hold.is_none(), "a stream claims nothing");
     let mut drv = Driver::new(800.0, 600.0);
     {
         let mut win = Host(&mut handed.embedded.window);
@@ -2523,23 +2566,15 @@ fn a_handed_over_remote_video_keeps_its_copy_and_its_frame() {
         assert_eq!(drv.pictures().len(), 1, "the frame");
         drv.idle(&mut win, 3);
     }
-    assert_eq!(
-        spawns::of(&copy),
-        runs,
-        "not probed again, the first frame not decoded again"
-    );
-    assert_eq!(started_under(&fx.cache), started, "nothing was started");
-    assert_eq!(
-        spawns::of(&cached),
-        spawns::Counts::default(),
-        "the viewer plays the copy the preview read"
-    );
-    assert_eq!(
-        *fx.counts.reads.lock().unwrap(),
-        vec![(abs.clone(), size)],
-        "one read, of the whole file"
-    );
+    assert_eq!(whole_reads(&fx), Vec::<String>::new());
     assert_eq!(fx.sessions.load(Ordering::SeqCst), 1, "no second session");
+    assert!(
+        !fx.counts
+            .ops()
+            .iter()
+            .any(|op| op.starts_with("into_connection ")),
+        "the stream kept its session"
+    );
     let crate::gui::Embedded { window, mut settle } = handed.embedded;
     drop(window);
     let deadline = std::time::Instant::now() + Duration::from_secs(20);
@@ -2547,28 +2582,27 @@ fn a_handed_over_remote_video_keeps_its_copy_and_its_frame() {
         assert!(std::time::Instant::now() < deadline, "never settled");
     }
     drop(settle);
-    assert!(!copy.exists(), "the preview name goes with the viewer");
-    assert!(cached.exists(), "the cached copy stays");
+    assert!(fx.cache_files().is_empty(), "{:?}", fx.cache_files().keys());
     assert_none_left(&base(&fx));
 }
 
-/// P12 (audio): a remote sound longer than a preview reads (here 2 s of 6) shows that much of
-/// its waveform; handed over, the viewer decodes on from there, from the same private copy —
-/// the first stretch is not decoded again.
+/// P12 (audio) through a stream: a remote sound longer than a preview reads (here 2 s of 6)
+/// shows that much of its waveform; handed over, the viewer decodes on from there through the
+/// same stream — no byte range asked twice over preview and viewer together, nothing on disk.
 #[test]
-fn a_handed_over_remote_sound_decodes_on_from_its_copy() {
+fn a_handed_over_remote_sound_decodes_on_through_its_stream() {
     let Some(tools) = media_tools() else { return };
     let Some(mut fx) = remote() else { return };
     let sound = fx.root.join("tone.wav");
     tone(&tools, &sound, 6);
     let abs = sound.to_str().unwrap().to_string();
+    let size = std::fs::metadata(&sound).unwrap().len();
     let limits = Limits {
         sound: Duration::from_secs(2),
         ..Limits::PREVIEW
     };
-    let mut p = fx.preview_limited(&abs, limits);
+    let mut p = fx.preview_unhurried(&abs, limits);
     assert!(p.card().is_none(), "{}", card_why(&p));
-    let copy = fx.preview_copies().remove(0);
     let mut drv = Driver::new(500.0, 400.0);
     shown(&mut drv, &mut Host(&mut p.embedded.window));
     let said = drv.text_starting_with("audio · mono").expect("the line");
@@ -2576,7 +2610,6 @@ fn a_handed_over_remote_sound_decodes_on_from_its_copy() {
         said.contains("0:06.00") && said.contains("preview of the first 2 s"),
         "{said}"
     );
-    assert_eq!(wave::starts(&copy), [(0.0, Some(2.0))]);
     let mut handed = p.hand_over().ok().expect("a viewer");
     let mut drv = Driver::new(800.0, 500.0);
     {
@@ -2584,14 +2617,19 @@ fn a_handed_over_remote_sound_decodes_on_from_its_copy() {
         drv.until(&mut win, 20, |w| w.ready());
         drv.idle(&mut win, 2);
         assert!(drv.find_text("Play").is_some(), "the media window's bars");
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        while fx.counts.streamed.load(Ordering::Relaxed) < size {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "never read to its end"
+            );
+            drv.idle(&mut win, 1);
+        }
     }
-    assert_eq!(
-        wave::starts(&copy),
-        [(0.0, Some(2.0)), (2.0, None)],
-        "decoded on from 2 s"
-    );
-    assert_eq!(fx.counts.reads.lock().unwrap().len(), 1, "read once");
+    assert!(assert_read_once(&stream_reads(&fx, &abs)) >= size);
+    assert_eq!(whole_reads(&fx), Vec::<String>::new());
     drop(handed);
+    assert!(fx.cache_files().is_empty(), "{:?}", fx.cache_files().keys());
     assert_none_left(&base(&fx));
 }
 
@@ -2662,9 +2700,9 @@ fn on_the_real_clock_a_stalled_ffprobe_is_a_card_in_time() {
     });
 }
 
-/// P4: the bar leaves a remote video while its first frame is being decoded (an ffmpeg that
-/// never gives one): the preparation ends cancelled, its ffmpeg is killed and reaped, and its
-/// private copy is gone.
+/// P4: the bar leaves a remote video while its first frame is being decoded through its stream
+/// (an ffmpeg that never gives one): the preparation ends cancelled, its ffmpeg is killed and
+/// reaped, and nothing is on disk.
 #[test]
 fn a_cancel_during_the_first_frame_stops_its_ffmpeg() {
     let Some(real) = media_tools() else { return };
@@ -2678,24 +2716,25 @@ fn a_cancel_during_the_first_frame_stops_its_ffmpeg() {
         clip(&real, &video, (160, 120));
         let abs = video.to_str().unwrap().to_string();
         let hold = t.hold(&base(&fx), "hold");
+        // The stand-in says it runs (a shell builtin: still one process) before it waits: a run
+        // on a URL names no file a count could find.
+        let decoding = base(&fx).join("decoding");
+        let body = format!(": > '{}'\n{}", decoding.display(), hold.stalls());
         let tools = Tools {
-            ffmpeg: stand_in(&base(&fx), "stalls", &hold.stalls()),
+            ffmpeg: stand_in(&base(&fx), "stalls", &body),
             ffprobe: real.ffprobe,
         };
         let budget = budget_on(&t.hand(), tools);
         let cancel = AtomicBool::new(false);
-        let cache = fx.cache.clone();
         let result = std::thread::scope(|scope| {
             // The bar, on a thread of its own: it leaves once the frame's decode runs (the
             // probe, then the decode).
             let bar = scope.spawn(|| {
-                until("the decode starts", || started_under(&cache).len() >= 2);
-                let running = still_running(&started_under(&cache));
+                until("the decode starts", || decoding.exists());
                 cancel.store(true, Ordering::SeqCst);
-                running
             });
             let result = fx.preview_with(&abs, &budget, &cancel);
-            assert_eq!(bar.join().unwrap(), 1, "the decode ran when the bar left");
+            bar.join().unwrap();
             result
         });
         assert!(
@@ -2704,7 +2743,6 @@ fn a_cancel_during_the_first_frame_stops_its_ffmpeg() {
             result.as_ref().err()
         );
         assert_none_left(&base(&fx));
-        assert!(fx.preview_copies().is_empty(), "{:?}", fx.preview_copies());
         assert!(fx.cache_files().is_empty());
     });
 }
@@ -2802,9 +2840,9 @@ fn a_cards_reason_is_never_cut_in_a_small_side() {
     );
 }
 
-/// A remote file's card names the file as the owner knows it — `host:/abs` — never the private
-/// copy the preview read; and a remote file over the read limit, of which nothing is read,
-/// still says its kind (by its name).
+/// A remote file's card names the file as the owner knows it — `host:/abs` — never the URL its
+/// byte server reads it through; and a remote image over the read limit, of which nothing is
+/// read, still says its kind (by its name).
 #[test]
 fn a_remote_card_names_the_remote_file_and_says_its_kind() {
     let Some(mut fx) = remote() else { return };
@@ -2818,14 +2856,14 @@ fn a_remote_card_names_the_remote_file_and_says_its_kind() {
             Some(format!("ffprobe cannot read box:{abs}").as_str())
         );
     }
-    let big = fx.file("big.mp4", &vec![7u8; 200 << 10]);
+    let big = fx.file("big.png", &vec![7u8; 200 << 10]);
     let limits = Limits {
         read: 100 << 10,
         ..Limits::PREVIEW
     };
     let p = fx.preview_limited(&big, limits);
     assert_eq!(card_why(&p), "over the preview limit: Enter opens it");
-    assert_eq!(p.card().unwrap().kind, Some(Kind::Video), "by its name");
+    assert_eq!(p.card().unwrap().kind, Some(Kind::Image), "by its name");
     assert_eq!(fx.counts.heads.load(Ordering::Relaxed), 0, "nothing read");
     let mut p = p;
     let mut drv = Driver::new(500.0, 400.0);

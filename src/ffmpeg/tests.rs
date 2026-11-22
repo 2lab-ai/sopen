@@ -1176,6 +1176,16 @@ fn a_probe_refusal_of_a_copy_names_the_file() {
         probe_refusal(copy, "/c/box/data/a.mp4: Invalid data found"),
         "ffprobe cannot read /c/box/data/a.mp4: Invalid data found"
     );
+    // A streamed file's line was said about the file already (its URL said as it): named once.
+    let url = Path::new("http://127.0.0.1:9/t/play/a.mp4");
+    assert_eq!(
+        probe_refusal_shown(
+            url,
+            "box:/data/a.mp4",
+            "box:/data/a.mp4: Invalid data found"
+        ),
+        "ffprobe cannot read box:/data/a.mp4: Invalid data found"
+    );
 }
 
 /// An mp3 render takes every piece from one input, decoded through once from the first piece's

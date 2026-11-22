@@ -633,9 +633,13 @@ pub fn probe_refusal(input: &Path, said: &str) -> String {
 /// ([`whole_path_as`]).
 pub fn probe_refusal_shown(input: &Path, shown: &str, said: &str) -> String {
     let input = input.display().to_string();
-    // ffprobe names the file in front of its reason: said once here.
-    let named = format!("{input}: ");
-    let said = said.strip_prefix(&named).unwrap_or(said);
+    // ffprobe names the file in front of its reason: said once here — also where its line was
+    // already said about `shown` (a URL of a streamed file, [`Input::said`]).
+    let (named, named_shown) = (format!("{input}: "), format!("{shown}: "));
+    let said = said
+        .strip_prefix(&named)
+        .or_else(|| said.strip_prefix(&named_shown))
+        .unwrap_or(said);
     format!(
         "ffprobe cannot read {shown}: {}",
         whole_path_as(said, &input, shown)

@@ -247,13 +247,23 @@ pub fn detect_sniffed(
 /// no video stream (per ffprobe) is audio; a `.ts` ffprobe cannot read as media is not media.
 /// Without ffprobe, video stays video.
 pub fn refine_local(local: &std::path::Path, name: &str, kind: Kind) -> Kind {
+    refine_input(&crate::ffmpeg::Input::path(local), name, kind)
+}
+
+/// [`refine_local`] for any input ffprobe reads: a local path, or a remote file's `play` URL on
+/// its window's byte server (06 §7.4: the `.ts` refine probes the URL, nothing is fetched first).
+/// The probe has the URL's deadline ([`crate::ffmpeg::probe_input`]).
+pub fn refine_input(input: &crate::ffmpeg::Input, name: &str, kind: Kind) -> Kind {
     if kind != Kind::Video {
         return kind;
     }
-    let probe = match crate::ffmpeg::resolve().and_then(|t| crate::ffmpeg::probe(&t, local)) {
+    let shown = input.show();
+    let probed =
+        crate::ffmpeg::resolve().and_then(|t| crate::ffmpeg::probe_input(&t, input, &shown));
+    let probe = match probed {
         Ok(probe) => Some((probe.video.is_some(), probe.has_audio)),
         Err(e) => {
-            crate::debug!("not probed: {e:#}");
+            crate::debug!("not probed: {}", input.said(&format!("{e:#}")));
             None
         }
     };
