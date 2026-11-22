@@ -3094,3 +3094,231 @@ fn enter_on_a_video_with_no_frame_comes_back_to_the_list_with_the_reason() {
         assert_none_left(&base(&fx));
     });
 }
+
+/// The connections a remote Save test runs on: "box" as the local disk, and as OpenSSH's
+/// `sftp-server` where there is one (required under `SOPEN_REQUIRE_SFTP_SERVER`).
+fn save_backends() -> Vec<(&'static str, Connect)> {
+    let mut all: Vec<(&'static str, Connect)> = vec![("local", local_connect())];
+    if SftpRemote::local_server().is_some() {
+        let sftp: Connect = Arc::new(|| {
+            let server = SftpRemote::local_server().expect("sftp-server");
+            Ok(Box::new(server) as Box<dyn RemoteFs + Send>)
+        });
+        all.push(("sftp", sftp));
+    }
+    all
+}
+
+/// A 4 s frame counter at 25 fps (frame N's luma is 16 + 2N, read back by
+/// [`crate::cut::edit_tests::frame_numbers`]), with a sound track.
+fn counter_clip(tools: &Tools, dst: &Path) {
+    crate::gui::media::fixtures::make(
+        tools,
+        &[
+            "-f",
+            "lavfi",
+            "-i",
+            "nullsrc=s=64x64:r=25:d=4.001,geq=lum='16+2*N':cb=128:cr=128,format=yuv420p",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=f=440:r=48000:d=4",
+            "-frames:v",
+            "100",
+            "-c:v",
+            "libx264",
+            "-crf",
+            "10",
+            "-g",
+            "50",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "aac",
+            "-shortest",
+        ],
+        dst,
+    );
+}
+
+/// The frames an independent ffmpeg render of `src` without frames 25–49 shows (`trim` and
+/// `concat` on its picture): what a Save of that cut must hold.
+fn trimmed_independently(tools: &Tools, src: &Path, dst: &Path) -> Vec<i64> {
+    let graph = "[0:v]trim=start_frame=0:end_frame=25,setpts=PTS-STARTPTS[a];\
+                 [0:v]trim=start_frame=50:end_frame=100,setpts=PTS-STARTPTS[b];\
+                 [a][b]concat=n=2:v=1:a=0[v]";
+    let src = src.to_str().unwrap();
+    crate::gui::media::fixtures::make(
+        tools,
+        &[
+            "-i",
+            src,
+            "-filter_complex",
+            graph,
+            "-map",
+            "[v]",
+            "-c:v",
+            "libx264",
+            "-crf",
+            "10",
+            "-pix_fmt",
+            "yuv420p",
+            "-f",
+            "mp4",
+        ],
+        dst,
+    );
+    crate::cut::edit_tests::frame_numbers(tools, dst)
+}
+
+/// The journal folders of `abs` (of host box) under `cache`.
+fn box_journals(cache: &Path, abs: &str) -> Vec<PathBuf> {
+    let home = crate::cache::edits_path(cache, "box", abs);
+    let (dir, name) = (home.parent().unwrap(), home.file_name().unwrap());
+    let prefix = format!("{}.journal-", name.to_string_lossy());
+    std::fs::read_dir(dir)
+        .map(|d| {
+            d.flatten()
+                .map(|e| e.path())
+                .filter(|p| {
+                    p.file_name()
+                        .unwrap()
+                        .to_string_lossy()
+                        .starts_with(&prefix)
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Passes until `done`, or panics with `what` after `secs` (a bound that only catches a hang).
+fn until_seen(fx: &mut Fx, secs: u64, what: &str, mut done: impl FnMut(&Fx) -> bool) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(secs);
+    while !done(fx) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{what}: not in {secs} s ({:?}; {:?})",
+            fx.b.status.text,
+            fx.drv
+                .texts()
+                .iter()
+                .map(|(_, _, t)| t.clone())
+                .collect::<Vec<_>>()
+        );
+        fx.drv.idle(&mut fx.b, 1);
+        std::thread::sleep(Duration::from_millis(2));
+    }
+}
+
+/// Some text on screen starts with `part`.
+fn on_screen(fx: &Fx, part: &str) -> bool {
+    fx.drv.texts().iter().any(|(_, _, t)| t.starts_with(part))
+}
+
+/// W8b's last step: an edited remote video saved from the window the browser opened it in —
+/// `handed_over` `false`: Enter in dual mode (`media::embed_streamed`); `true`: Enter on its
+/// preview, which becomes the viewer (`MediaWindow::previewing`, `set_preview(false)`) — on the
+/// local disk and over `sftp-server`, by keys as the owner presses them: the second second cut
+/// (Right, I, Right, O, Delete), the edits kept in the journal, then Cmd+S. The file is then
+/// the render — its frames those of an independent ffmpeg `trim`/`concat` of the original, and
+/// the literal 0–24, 50–99 — the original is kept beside it as one hard link (its inode and
+/// bytes), and no journal is left. A handed-over preview is proven one: one probe of the file
+/// and one preparation, and the next remote preview still shows after its Save.
+fn a_remote_video_saved_from_the_browser(handed_over: bool) {
+    let Some(tools) = media_tools() else { return };
+    for (backend, connect) in save_backends() {
+        let what = format!("{backend}, handed over: {handed_over}");
+        let mut fx = fixture_with(Some("box"), connect, None);
+        let name = format!("save-{}.mp4", &crate::remote::random_hex()[..12]);
+        let abs = format!("{}/{name}", fx.root);
+        counter_clip(&tools, Path::new(&abs));
+        let original = std::fs::read(&abs).unwrap();
+        let ino = std::fs::metadata(&abs).unwrap().ino();
+        fx.relist();
+        if handed_over {
+            fx.bar_on(&name);
+            until_seen(&mut fx, 120, "the preview", |fx| {
+                fx.b.preview.shown_window().is_some() && fx.b.ready()
+            });
+        } else {
+            fx.key(Key::F9);
+            fx.select(&name);
+        }
+        let (probes, prepared) = (spawns::naming(&name).probe, fx.b.preview.spawned());
+        fx.key(Key::Enter);
+        until_seen(&mut fx, 120, "the viewer", |fx| {
+            fx.b.viewer.is_some() && fx.b.ready()
+        });
+        if handed_over {
+            assert_eq!(probes, 1, "{what}: the preview probed it once");
+            assert_eq!(spawns::naming(&name).probe, 1, "{what}: no second probe");
+            assert_eq!(
+                fx.b.preview.spawned(),
+                prepared,
+                "{what}: no second preparation"
+            );
+        } else {
+            assert_eq!(spawns::naming(&name).probe, 1, "{what}: one probe");
+        }
+        for key in [Key::ArrowRight, Key::I, Key::ArrowRight, Key::O] {
+            fx.key(key);
+        }
+        fx.key(Key::Delete);
+        until_seen(&mut fx, 20, "the cut", |fx| on_screen(fx, "deleted 1.00 s"));
+        // Focus lost: the edits go to the journal now.
+        let lost = vec![eframe::egui::Event::WindowFocused(false)];
+        fx.drv.frame(&mut fx.b, lost, Modifiers::NONE);
+        until_seen(&mut fx, 20, "the journal", |fx| {
+            box_journals(&fx.cache, &abs).len() == 1
+        });
+        fx.with(Key::S, command(false));
+        let saved = format!("saved box:{abs}");
+        until_seen(&mut fx, 300, "the save", |fx| on_screen(fx, &saved));
+        let want: Vec<i64> = (0..25).chain(50..100).collect();
+        let frames = crate::cut::edit_tests::frame_numbers(&tools, Path::new(&abs));
+        assert_eq!(frames, want, "{what}: the render");
+        let prefix = format!(".{name}.sopen-backup-");
+        let links: Vec<PathBuf> = std::fs::read_dir(&fx.root)
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| {
+                p.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with(&prefix)
+            })
+            .collect();
+        assert_eq!(links.len(), 1, "{what}: {links:?}");
+        assert_eq!(std::fs::metadata(&links[0]).unwrap().ino(), ino, "{what}");
+        assert_eq!(std::fs::read(&links[0]).unwrap(), original, "{what}");
+        let independent = fx.cache.parent().unwrap().join(format!("trimmed-{name}"));
+        assert_eq!(
+            trimmed_independently(&tools, &links[0], &independent),
+            frames,
+            "{what}: an independent trim and concat"
+        );
+        until_seen(&mut fx, 20, "the journal's end", |fx| {
+            box_journals(&fx.cache, &abs).is_empty()
+        });
+        if handed_over {
+            // The next remote preview: a session of its own, after the Save closed the stream.
+            fx.key(Key::Escape);
+            fx.wait(|b| b.viewer.is_none());
+            fx.bar_on("notes.txt");
+            until_seen(&mut fx, 60, "the next preview", |fx| {
+                fx.drv.find_text("plain notes").is_some()
+            });
+        }
+    }
+}
+
+#[test]
+fn w8b_a_remote_video_opened_by_enter_saves_its_cut() {
+    a_remote_video_saved_from_the_browser(false);
+}
+
+#[test]
+fn w8b_a_handed_over_remote_video_preview_saves_its_cut() {
+    a_remote_video_saved_from_the_browser(true);
+}
