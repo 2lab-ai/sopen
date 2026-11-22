@@ -367,64 +367,6 @@ fn longest_word_run(text: &str) -> usize {
         .unwrap_or(0)
 }
 
-/// The system allocator, counting the allocations of each thread: every allocation in the test
-/// binary goes through it, and a test reads its own thread's count ([`allocations`]).
-struct Counting;
-
-thread_local! {
-    static ALLOCATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-}
-
-unsafe impl std::alloc::GlobalAlloc for Counting {
-    unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
-        let _ = ALLOCATIONS.try_with(|n| n.set(n.get() + 1));
-        unsafe { std::alloc::System.alloc(layout) }
-    }
-
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: std::alloc::Layout) {
-        unsafe { std::alloc::System.dealloc(ptr, layout) }
-    }
-
-    unsafe fn realloc(&self, ptr: *mut u8, layout: std::alloc::Layout, new_size: usize) -> *mut u8 {
-        let _ = ALLOCATIONS.try_with(|n| n.set(n.get() + 1));
-        unsafe { std::alloc::System.realloc(ptr, layout, new_size) }
-    }
-}
-
-#[global_allocator]
-static COUNTING: Counting = Counting;
-
-/// The allocations `f` makes on this thread.
-fn allocations(f: impl FnOnce()) -> usize {
-    let before = ALLOCATIONS.with(|n| n.get());
-    f();
-    ALLOCATIONS.with(|n| n.get()) - before
-}
-
-/// Every line is looked at before it is parsed; an ordinary one — nothing in it long enough to
-/// shorten, short or over [`RUN_MAX`] — is looked at without allocating: code and YAML.
-#[test]
-fn an_ordinary_line_is_looked_at_without_allocating() {
-    let long_code =
-        "let total = first.value + second.value * third(count, limit) - fourth.offset; \
-                     // a comment that runs on, past the length of any shortened run"
-            .to_string();
-    let pairs: Vec<String> = (0..30).map(|i| format!("k{i}: v{i}")).collect();
-    let long_yaml = format!("key: {{{}}}  # and a comment", pairs.join(", "));
-    assert!(long_code.chars().count() > RUN_MAX && long_yaml.chars().count() > RUN_MAX);
-    for (line, shape) in [
-        ("let x = 1;", Shape::Code),
-        (long_code.as_str(), Shape::Code),
-        ("key: value", Shape::Yaml),
-        (long_yaml.as_str(), Shape::Yaml),
-    ] {
-        let mut none = false;
-        let n = allocations(|| none = Shortened::of(line, shape).is_none());
-        assert!(none, "{line:.30}…: not shortened");
-        assert_eq!(n, 0, "{line:.30}… ({shape:?}): {n} allocations");
-    }
-}
-
 /// Whether the one pass finds anything to shorten in `line`.
 fn finds(line: &str, shape: Shape) -> bool {
     match shape {
@@ -437,8 +379,8 @@ fn finds(line: &str, shape: Shape) -> bool {
 /// runs of every length about [`RUN_MAX`], chains about it (whole, parted by a number, two
 /// separators joined), spaces, YAML's stops and letters of several bytes, put together at random
 /// (the same each run), the pass finds something in a line, in code and in YAML, just when
-/// building its shortened form keeps anything out: it never misses a line to shorten, and never
-/// sends an ordinary one to be built (and allocate).
+/// building its shortened form returns `Some`: it never misses a line to shorten, and never
+/// sends an ordinary one to be built (and allocate; `tests/highlight_alloc.rs` counts that).
 #[test]
 fn the_pass_that_finds_a_shortening_agrees_with_making_it() {
     let mut seed: u64 = 0x5eed;

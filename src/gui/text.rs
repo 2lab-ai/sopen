@@ -2513,6 +2513,16 @@ impl Shortened {
     }
 }
 
+/// Whether highlighting hands `line` to the parser shortened ([`Shortened`]): as YAML's line
+/// when `yaml`, else as code's. For `tests/highlight_alloc.rs`, which counts its allocations
+/// with an allocator of its own — in a test binary of its own, as that allocator slows every
+/// allocation it sees.
+#[doc(hidden)]
+pub fn shortens(line: &str, yaml: bool) -> bool {
+    let shape = if yaml { Shape::Yaml } else { Shape::Code };
+    Shortened::of(line, shape).is_some()
+}
+
 /// Parser and highlighter state after some line.
 type State = (ParseState, HighlightState);
 
