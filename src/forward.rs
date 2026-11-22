@@ -967,6 +967,19 @@ mod tests {
             for (k, v) in extra_env {
                 cmd.env(k, v);
             }
+            // The signals' default dispositions, as a session sshd starts has them. An ignored
+            // signal is handed on across exec: a test runner started with SIGINT ignored (in the
+            // background of a non-interactive shell, or under `nohup` for SIGHUP) would hand it to
+            // the line, and sopen would survive the Ctrl+C a test sends it.
+            // SAFETY: only `signal`, async-signal-safe, between fork and exec.
+            unsafe {
+                cmd.pre_exec(|| {
+                    for signal in [libc::SIGINT, libc::SIGQUIT, libc::SIGTERM, libc::SIGHUP] {
+                        libc::signal(signal, libc::SIG_DFL);
+                    }
+                    Ok(())
+                });
+            }
             let out = cmd.output().unwrap();
             (
                 out.status.code().unwrap_or(-1),
