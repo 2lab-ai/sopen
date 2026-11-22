@@ -945,6 +945,21 @@ mod tests {
             .unwrap_or_else(|| panic!("no {name} line in {out}"))
     }
 
+    /// The signals the lanes send, or a session's terminal does.
+    const RESET: [libc::c_int; 4] = [libc::SIGINT, libc::SIGQUIT, libc::SIGTERM, libc::SIGHUP];
+
+    /// Whether this process ignores any of `signals` (a child would start ignoring it too).
+    fn ignored(signals: &[libc::c_int]) -> bool {
+        signals.iter().any(|&signal| {
+            // SAFETY: a null new action only reads the current one into `old`.
+            unsafe {
+                let mut old: libc::sigaction = std::mem::zeroed();
+                libc::sigaction(signal, std::ptr::null(), &mut old) == 0
+                    && old.sa_sigaction == libc::SIG_IGN
+            }
+        })
+    }
+
     impl Host {
         /// Runs `words` as sshd does: joined with spaces, `<login shell> -c "<line>"`, with only
         /// HOST's PATH and HOME (and `extra_env`, which may replace them).
@@ -970,15 +985,19 @@ mod tests {
             // The signals' default dispositions, as a session sshd starts has them. An ignored
             // signal is handed on across exec: a test runner started with SIGINT ignored (in the
             // background of a non-interactive shell, or under `nohup` for SIGHUP) would hand it to
-            // the line, and sopen would survive the Ctrl+C a test sends it.
-            // SAFETY: only `signal`, async-signal-safe, between fork and exec.
-            unsafe {
-                cmd.pre_exec(|| {
-                    for signal in [libc::SIGINT, libc::SIGQUIT, libc::SIGTERM, libc::SIGHUP] {
-                        libc::signal(signal, libc::SIG_DFL);
-                    }
-                    Ok(())
-                });
+            // the line, and sopen would survive the Ctrl+C a test sends it. Put back in the child
+            // only then: a `pre_exec` makes the spawn a fork, whose child holds a copy of every
+            // descriptor of this process until its exec — other tests' journal locks among them.
+            if ignored(&RESET) {
+                // SAFETY: only `signal`, async-signal-safe, between fork and exec.
+                unsafe {
+                    cmd.pre_exec(|| {
+                        for signal in RESET {
+                            libc::signal(signal, libc::SIG_DFL);
+                        }
+                        Ok(())
+                    });
+                }
             }
             let out = cmd.output().unwrap();
             (

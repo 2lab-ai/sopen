@@ -6497,6 +6497,35 @@ mod stream {
             crate::journal::this_files_journals(&cache, "host", &abs),
             vec![ours.clone()]
         );
+        // Our journal's lock is free before the look. A child another test forks holds a copy
+        // of every descriptor until its exec, so a lock let go a moment ago can look taken for
+        // a while — what the retry is for (07 §3 Recovery). Waited out here: a retry below can
+        // only be for a journal that is not this file's. The look's own lock is let go by
+        // `unlock`, not by closing: a child forked while it is held keeps its copy of the
+        // descriptor, and the lock with it, until its exec — unlocking releases it for both.
+        let freed = Instant::now();
+        loop {
+            use std::os::unix::fs::OpenOptionsExt;
+            let lock = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .custom_flags(libc::O_NOFOLLOW)
+                .open(ours.join("lock"))
+                .unwrap();
+            match lock.try_lock() {
+                Ok(()) => {
+                    lock.unlock().unwrap();
+                    break;
+                }
+                Err(std::fs::TryLockError::WouldBlock) => {}
+                Err(std::fs::TryLockError::Error(e)) => panic!("our journal's lock: {e}"),
+            }
+            assert!(
+                freed.elapsed() < Duration::from_secs(30),
+                "our journal stays locked"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
         // A file of its own, not in a window: nothing else holds a journal of it.
         let file = file_on(ed.tmp.path(), &ed.remote, &ed.moved);
         let retries = file.retries.clone();
