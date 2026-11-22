@@ -6985,6 +6985,64 @@ mod stream {
         }
     }
 
+    /// 07 §3: a journal folder that holds nothing but its lock — or not even that: its session
+    /// ended between the `mkdir` and its first generation — holds no edit. The next open removes
+    /// it, shows no row and does not list again waiting for it.
+    #[test]
+    fn a_journal_folder_holding_nothing_is_removed_and_never_offered() {
+        for locked in [false, true] {
+            let body = body();
+            let mut ed = ed(&body);
+            let base = crate::cache::edits_path(&ed.tmp.path().join("cache"), "host", &ed.abs());
+            let name = base.file_name().unwrap().to_string_lossy().into_owned();
+            let dir = base.with_file_name(format!("{name}.journal-20261122T010203Z-0123abcd"));
+            std::fs::create_dir_all(&dir).unwrap();
+            if locked {
+                std::fs::write(dir.join("lock"), b"").unwrap();
+            }
+            ed.reopen();
+            assert!(ed.rows().is_empty(), "locked={locked}: {:?}", ed.rows());
+            let left: Vec<_> = std::fs::read_dir(dir.parent().unwrap())
+                .unwrap()
+                .flatten()
+                .map(|e| e.file_name())
+                .collect();
+            assert!(left.is_empty(), "locked={locked}: left {left:?}");
+            let retries = ed.win.file.lock().unwrap().retries.load(Ordering::SeqCst);
+            assert_eq!(retries, 0, "locked={locked}: listed again for it");
+        }
+    }
+
+    /// 07 §3, §3.1: a journal folder holding a Save's record and no generation is not one that
+    /// holds nothing — the next open still asks about the interrupted save's file, and the
+    /// folder stays.
+    #[test]
+    fn a_journal_holding_only_a_save_record_still_asks_about_the_temp() {
+        let body = body();
+        let mut ed = ed(&body);
+        ed.typed("AB");
+        let (temp, grown) = cut_off_leaving_a_temp(&mut ed);
+        // The window ends as a kill ends it; then its generations go, its record stays.
+        let next = window_on(ed.tmp.path(), &ed.remote, ed.side, None, &ed.moved).1;
+        std::mem::replace(&mut ed.win, next).crash();
+        let dirs = ed.journals();
+        assert_eq!(dirs.len(), 1, "{dirs:?}");
+        for entry in std::fs::read_dir(&dirs[0]).unwrap().flatten() {
+            let name = entry.file_name();
+            if name != "lock" && name != "save" {
+                std::fs::remove_file(entry.path()).unwrap();
+            }
+        }
+        ed.reopen();
+        let rows = ed.rows();
+        assert!(
+            rows.iter().any(|l| l.contains("sopen could not verify")),
+            "{rows:?}"
+        );
+        assert!(dirs[0].join("save").exists(), "the record stays");
+        assert_eq!(std::fs::read(&temp).unwrap(), grown, "the temp untouched");
+    }
+
     /// Closing (Discard) while the answer Remove it is on its way — held as it removes the
     /// record, the journal in its hands: the window's end waits for it, so the discarded edits
     /// go with the journal and are never offered again.

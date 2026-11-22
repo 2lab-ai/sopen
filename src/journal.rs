@@ -1089,12 +1089,22 @@ impl Journal {
             }
             fs.sync_dir(&home)
                 .map_err(|e| io_err(e, "make durable the folder", &home))?;
+            #[cfg(test)]
+            gap::hold(cache);
             // A listing that found this directory before its lock existed makes the lock itself
-            // (exclusively) and owns the directory: this session then takes another.
+            // (exclusively) and owns the directory — and, finding nothing in it, removes it
+            // (`orphans`): this session then takes another.
             let lock = match fs.lock(&dir.join(LOCK), true) {
                 Ok(Some(held)) => held,
                 Ok(None) => continue,
-                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        io::ErrorKind::AlreadyExists | io::ErrorKind::NotFound
+                    ) =>
+                {
+                    continue
+                }
                 Err(e) => return Err(io_err(e, "lock", &dir.join(LOCK))),
             };
             return Ok(Journal {
@@ -1555,9 +1565,10 @@ pub fn this_files_journals(cache: &Path, host: &str, abs: &str) -> Vec<PathBuf> 
 }
 
 /// The journals of `path` on `host` left by sessions that are gone (their lock free), newest
-/// first. A journal whose lock file was never made gets one, made exclusively. Journals being
-/// removed are emptied on the way; one written for another host or path that maps to the same
-/// place is skipped.
+/// first. A journal whose lock file was never made gets one, made exclusively. One that holds
+/// nothing but its lock is removed, not offered ([`holds_nothing`]). Journals being removed are
+/// emptied on the way; one written for another host or path that maps to the same place is
+/// skipped.
 pub fn orphans(fs: &Arc<dyn Fs>, cache: &Path, host: &str, path: &str) -> Result<Vec<Orphan>> {
     let (home, file) = journal_home(cache, host, path)?;
     // Never through a link below the cache, as when they are made.
@@ -1607,6 +1618,15 @@ pub fn orphans(fs: &Arc<dyn Fs>, cache: &Path, host: &str, path: &str) -> Result
             continue;
         }
         let Some(lock) = lock else { continue };
+        // §3: a journal that holds no edit is removed when it is listed — there is nothing to
+        // offer. Its lock held here, nothing else is written into it.
+        if holds_nothing(fs.as_ref(), &dir) {
+            if let Err(e) = retire(fs.as_ref(), &dir) {
+                crate::debug!("journal: an empty one stays: {e:#}");
+            }
+            drop(lock);
+            continue;
+        }
         let (found, notes) = read_found(fs.as_ref(), &dir);
         let head = match &found {
             Found::Edits(g) => Some(&g.head),
@@ -1635,6 +1655,16 @@ pub fn orphans(fs: &Arc<dyn Fs>, cache: &Path, host: &str, path: &str) -> Result
         });
     }
     Ok(out)
+}
+
+/// Whether the journal folder `dir` holds nothing but its lock: no `CURRENT`, no generation
+/// (whole, torn or still being written), no pasted picture, no `save` record — what a session
+/// leaves when it ends between its `mkdir` and its first generation, or what a listing took from
+/// a session still between the folder and its lock (that session then makes another,
+/// [`Journal::create`]). Anything else in it may hold an edit or a Save's record: it is offered.
+fn holds_nothing(fs: &dyn Fs, dir: &Path) -> bool {
+    fs.list(dir)
+        .is_ok_and(|names| names.iter().all(|name| name == LOCK))
 }
 
 /// Reads `gen-<n>` and checks it is whole and is generation `n`.
@@ -3028,6 +3058,94 @@ impl SaveIntent {
     /// The record as the `save` file holds it.
     pub fn text(&self) -> String {
         String::from_utf8_lossy(&intent_bytes(self)).into_owned()
+    }
+}
+
+/// Tests: the next [`Journal::create`] under a cache held between its directory and its lock —
+/// where a listing ([`orphans`]) finds the directory without a lock and takes it (a slow disk
+/// stretches that moment) — until released. Armed per cache: the tests of a process run side by
+/// side.
+#[cfg(test)]
+pub mod gap {
+    use std::path::{Path, PathBuf};
+    use std::sync::{Arc, Condvar, Mutex};
+    use std::time::{Duration, Instant};
+
+    /// (a journal is held there, it may go on)
+    type Shared = Arc<(Mutex<(bool, bool)>, Condvar)>;
+
+    static ARMED: Mutex<Vec<(PathBuf, Shared)>> = Mutex::new(Vec::new());
+
+    /// The hold of the next journal made under one cache. Dropped, it lets it go.
+    pub struct Gap {
+        cache: PathBuf,
+        shared: Shared,
+    }
+
+    /// The next journal made under `cache` (exactly that path) waits at the gap.
+    pub fn arm(cache: &Path) -> Gap {
+        let shared = Shared::default();
+        let mut armed = ARMED.lock().unwrap_or_else(|p| p.into_inner());
+        armed.push((cache.to_path_buf(), shared.clone()));
+        Gap {
+            cache: cache.to_path_buf(),
+            shared,
+        }
+    }
+
+    impl Gap {
+        /// Waits until a journal is held at the gap; panics after 30 s.
+        pub fn reached(&self) {
+            let deadline = Instant::now() + Duration::from_secs(30);
+            let (lock, cv) = &*self.shared;
+            let mut state = lock.lock().unwrap_or_else(|p| p.into_inner());
+            while !state.0 {
+                let left = deadline.saturating_duration_since(Instant::now());
+                assert!(
+                    !left.is_zero(),
+                    "no journal of {:?} came to the gap",
+                    self.cache
+                );
+                state = cv
+                    .wait_timeout(state, left)
+                    .unwrap_or_else(|p| p.into_inner())
+                    .0;
+            }
+        }
+
+        /// The held journal goes on to its lock.
+        pub fn release(&self) {
+            let (lock, cv) = &*self.shared;
+            lock.lock().unwrap_or_else(|p| p.into_inner()).1 = true;
+            cv.notify_all();
+        }
+    }
+
+    impl Drop for Gap {
+        fn drop(&mut self) {
+            self.release();
+            let mut armed = ARMED.lock().unwrap_or_else(|p| p.into_inner());
+            armed.retain(|(_, shared)| !Arc::ptr_eq(shared, &self.shared));
+        }
+    }
+
+    /// [`super::Journal::create`], between the directory and its lock: held there once, when a
+    /// gap is armed for `cache`.
+    pub(super) fn hold(cache: &Path) {
+        let shared = {
+            let mut armed = ARMED.lock().unwrap_or_else(|p| p.into_inner());
+            match armed.iter().position(|(armed, _)| armed == cache) {
+                Some(at) => armed.remove(at).1,
+                None => return,
+            }
+        };
+        let (lock, cv) = &*shared;
+        let mut state = lock.lock().unwrap_or_else(|p| p.into_inner());
+        state.0 = true;
+        cv.notify_all();
+        while !state.1 {
+            state = cv.wait(state).unwrap_or_else(|p| p.into_inner());
+        }
     }
 }
 

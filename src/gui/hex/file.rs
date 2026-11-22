@@ -1831,7 +1831,6 @@ pub(super) fn recover(file: &Mutex<HexFile>) -> Vec<Row> {
         .unwrap_or_else(|p| p.into_inner())
         .retries
         .clone();
-    let want = journal::this_files_journals(&cache, &host, &abs).len();
     let started = std::time::Instant::now();
     let mut orphans = Vec::new();
     loop {
@@ -1839,6 +1838,8 @@ pub(super) fn recover(file: &Mutex<HexFile>) -> Vec<Row> {
             Ok(found) => orphans = found,
             Err(e) => crate::debug!("journal: no listing: {e:#}"),
         }
+        // Counted after the listing: one it removed (it held nothing) is not waited for.
+        let want = journal::this_files_journals(&cache, &host, &abs).len();
         if orphans.len() >= want || started.elapsed() >= LOCK_RETRY {
             break;
         }
