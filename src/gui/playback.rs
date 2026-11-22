@@ -169,18 +169,25 @@ fn tail_of(
     stderr.map(ErrorTail::spawn)
 }
 
+/// What a decoder chain asks of its input ([`chain`]): why its stream was cut short since the
+/// session began, if it was, and how a decoder's words are said (a streamed file's URL as the
+/// file).
+type Told<'a> = (&'a dyn Fn() -> Option<String>, &'a dyn Fn(&str) -> String);
+
 /// Decodes `parts` one after another, each by the ffmpeg `start` makes for it, the next one
 /// started as soon as the current one is (its seek and first decode happen meanwhile); a part
 /// with a count of 0 is skipped. Every child is in `live` while it runs. A decoder that cannot
 /// start, whose output cannot be read, or that ends early with a failure stops the chain with
 /// the reason in `state`; one that ends early by itself is a short stream (padded); `stop` (or
-/// the consumer stopping) ends it without either.
+/// the consumer stopping) ends it without either. A remote file's stream cut short (`cut`
+/// says why: the server's account went up, 06 §7.4) stops it too, whatever the decoder said:
+/// ffmpeg ends a cut-short input as if the file ended there. A decoder's words are said as
+/// `said` gives them (a streamed file's URL as the file).
 fn chain(
     parts: Vec<Part>,
     mut start: impl FnMut(&Part) -> std::io::Result<Child>,
-    live: &Live,
-    stop: &AtomicBool,
-    state: &ChainState,
+    (live, stop, state): (&Live, &AtomicBool, &ChainState),
+    (cut, said): Told<'_>,
     consumer: &mut dyn Consumer,
 ) {
     type Running = (
@@ -229,6 +236,10 @@ fn chain(
         drop(out);
         // Killed and waited for below, whichever way the piece ended.
         let mut child = take_child(live, id);
+        if let Some(why) = cut() {
+            state.fail(why);
+            break;
+        }
         let go_on = match fed {
             Fed::Done => true,
             Fed::Stopped => false,
@@ -254,8 +265,8 @@ fn chain(
                 });
                 match status {
                     Some(Some(s)) if !s.success() => {
-                        let said = err.and_then(|h| h.join().ok()).unwrap_or_default();
-                        let last = said.last_line();
+                        let tail = err.and_then(|h| h.join().ok()).unwrap_or_default();
+                        let last = said(&tail.last_line());
                         state.fail(format!(
                             "ffmpeg stopped decoding the piece at {:.2} s ({s}): {last}",
                             part.start
@@ -617,6 +628,7 @@ fn decode_pcm(
     (rate, channels): (u32, u16),
     first: Option<Child>,
     (live, stop, state): (&Live, &AtomicBool, &ChainState),
+    told: Told<'_>,
     out: &mut dyn FnMut(&[f32]) -> bool,
 ) {
     let parts = parts(pieces, f64::from(rate));
@@ -634,7 +646,7 @@ fn decode_pcm(
         bytes: vec![0u8; 16 * 1024],
         samples: Vec::new(),
     };
-    chain(parts, start, live, stop, state, &mut pcm);
+    chain(parts, start, (live, stop, state), told, &mut pcm);
 }
 
 /// Audio playback from one position: the decoder, the ring and the output.
@@ -741,6 +753,8 @@ impl Audio {
         };
         let live: Live = Arc::default();
         let state = Arc::new(ChainState::default());
+        // The stream's cut account when the session started (a remote file).
+        let mut cuts = None;
         // Where the PCM comes from: pieces of a file through ffmpeg, or a WAV read here.
         enum From {
             Ffmpeg {
@@ -759,6 +773,7 @@ impl Audio {
                 pieces,
                 stereo,
             } => {
+                cuts = input.cuts();
                 // The first piece is started here, so a missing ffmpeg is this call's error.
                 let at = parts(&pieces, f64::from(rate))
                     .into_iter()
@@ -819,6 +834,7 @@ impl Audio {
                     (rate, channels),
                     first,
                     (&dec_live, &dec_stop, &dec_state),
+                    (&|| input.cut_since(cuts), &|said| input.said(said)),
                     &mut push,
                 ),
                 From::Pcm(pcm) => {
@@ -877,8 +893,8 @@ fn audio_cmd(
 ) -> std::io::Result<Child> {
     let mut cmd = ffmpeg_cmd(tools);
     let start = part.start;
-    cmd.args(["-ss", &format!("{start:.6}"), "-i"])
-        .arg(path.arg())
+    cmd.args(["-ss", &format!("{start:.6}")])
+        .args(path.args())
         .args(["-vn", "-sn"]);
     // A track that starts after the play position keeps its offset (silence first), as Save
     // renders it; Mono → Stereo as Save pans it.
@@ -933,8 +949,8 @@ fn video_cmd(
     let mut cmd = ffmpeg_cmd(tools);
     // Half a frame early, as Save renders a cut: the first frame is the one at `start`.
     let seek = (start - 0.5 / fps.max(1.0)).max(0.0);
-    cmd.args(["-ss", &format!("{seek:.6}"), "-i"])
-        .arg(path.arg())
+    cmd.args(["-ss", &format!("{seek:.6}")])
+        .args(path.args())
         .args(["-an", "-sn", "-vf"])
         // Timed from the cut (`start`, which is `start - seek` after the seek), as the sound is:
         // a picture that starts later than the cut keeps its offset (its first frame held from
@@ -1037,6 +1053,7 @@ impl Video {
             pieces
         };
         let parts = parts(&pieces, fps);
+        let cuts = path.cuts();
         // The first piece is started here, so a missing ffmpeg is this call's error.
         let mut first = match parts.iter().find(|p| p.count != Some(0)) {
             Some(p) => Some(
@@ -1068,7 +1085,15 @@ impl Video {
                 tx: &tx,
                 wake: &*wake,
             };
-            chain(parts, start, &r_live, &r_stop, &r_state, &mut frames);
+            let cut = || path.cut_since(cuts);
+            let said = |text: &str| path.said(text);
+            chain(
+                parts,
+                start,
+                (&r_live, &r_stop, &r_state),
+                (&cut, &said),
+                &mut frames,
+            );
             drop(tx);
             wake();
         });
@@ -1292,6 +1317,13 @@ impl Player {
             Some(a) => self.t0 + a.heard(now),
             None => self.t0 + now.saturating_duration_since(started).as_secs_f64(),
         }
+    }
+
+    /// Sound of this session has been given to the output (06 §11's `ready` for a sound).
+    pub fn sounded(&self) -> bool {
+        self.audio
+            .as_ref()
+            .is_some_and(|a| a.shared.frames_played.load(SeqCst) > 0)
     }
 
     /// Frames shown and dropped so far.

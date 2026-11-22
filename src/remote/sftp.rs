@@ -389,6 +389,103 @@ fn changed(what: &str, got: std::result::Result<Result<(), SftpErr>, ()>) -> Res
     }
 }
 
+impl SftpRemote {
+    /// [`RemoteFs::create_from`], stopped between chunks once `stop` says so
+    /// ([`RemoteFs::create_from_stoppable`]).
+    fn upload(
+        &mut self,
+        local: &Path,
+        path: &str,
+        like: Option<Like>,
+        stop: &dyn Fn() -> bool,
+    ) -> std::result::Result<Uploaded, CreateError> {
+        let not_created = |e| CreateError::new(Created::No, e);
+        let mut src = std::fs::File::open(local)
+            .with_context(|| format!("cannot open {}", local.display()))
+            .map_err(not_created)?;
+        let (rt, sftp, _) = self.parts();
+        rt.block_on(async {
+            let opened = within(
+                META_TIMEOUT,
+                sftp.options().write(true).create_new(true).open(path),
+            )
+            .await;
+            let mut file = match opened {
+                Ok(Ok(file)) => file,
+                Ok(Err(e)) => return Err(failed_create(path, e)),
+                Err(()) => {
+                    return Err(CreateError::new(
+                        Created::Unknown,
+                        unknown(format!(
+                            "create {path}: request sent, no reply in {}s",
+                            META_TIMEOUT.as_secs()
+                        )),
+                    ))
+                }
+            };
+            // From here `path` is ours.
+            let fill = async {
+                // Handle-based metadata updates on the open file, never by path: the owner, then
+                // the permission bits without set-id bits before the content, then the full mode
+                // restored after the content, so set-id bits are applied last.
+                if let Some(like) = like {
+                    // A refused owner change is not fatal here: the caller checks the result
+                    // (a mismatch refuses the save; an owner that was already right passes).
+                    let owner = MetaDataBuilder::new().id((like.uid, like.gid)).create();
+                    match within(META_TIMEOUT, file.set_metadata(owner)).await {
+                        Ok(Ok(())) => {}
+                        Ok(Err(e)) => crate::debug!("set owner on {path}: {e}"),
+                        Err(()) => {
+                            return Err(timed_out(&format!("set owner on {path}"), META_TIMEOUT))
+                        }
+                    }
+                    within(META_TIMEOUT, file.set_permissions(perms(like.mode & 0o777)))
+                        .await
+                        .map_err(|()| timed_out(&format!("set mode on {path}"), META_TIMEOUT))?
+                        .map_err(|e| anyhow!("cannot set mode on {path}: {e}"))?;
+                }
+                // write_all splits at the server's write limit.
+                let mut out = Hashing::new(std::io::sink());
+                let mut buf = vec![0u8; CHUNK];
+                loop {
+                    if stop() {
+                        return Err(anyhow!(super::Cancelled));
+                    }
+                    let n = src
+                        .read(&mut buf)
+                        .with_context(|| format!("cannot read {}", local.display()))?;
+                    if n == 0 {
+                        break;
+                    }
+                    within(STALL_TIMEOUT, file.write_all(&buf[..n]))
+                        .await
+                        .map_err(|()| timed_out(&format!("write {path}"), STALL_TIMEOUT))?
+                        .map_err(|e| anyhow!("cannot write {path}: {e}"))?;
+                    out.write_all(&buf[..n])?;
+                }
+                if let Some(like) = like {
+                    within(META_TIMEOUT, file.set_permissions(perms(like.mode)))
+                        .await
+                        .map_err(|()| timed_out(&format!("set mode on {path}"), META_TIMEOUT))?
+                        .map_err(|e| anyhow!("cannot set mode on {path}: {e}"))?;
+                }
+                if sftp.support_fsync() {
+                    within(STALL_TIMEOUT, file.sync_all())
+                        .await
+                        .map_err(|()| timed_out(&format!("fsync {path}"), STALL_TIMEOUT))?
+                        .map_err(|e| anyhow!("cannot fsync {path}: {e}"))?;
+                }
+                within(META_TIMEOUT, file.close())
+                    .await
+                    .map_err(|()| timed_out(&format!("close {path}"), META_TIMEOUT))?
+                    .map_err(|e| anyhow!("cannot close {path}: {e}"))?;
+                Ok(out.finish())
+            };
+            fill.await.map_err(|e| CreateError::new(Created::Yes, e))
+        })
+    }
+}
+
 /// A failed exclusive open: refused by the server = not created; a lost reply = unknown.
 fn failed_create(path: &str, e: SftpErr) -> CreateError {
     let created = if answered(&e) {
@@ -734,87 +831,17 @@ impl RemoteFs for SftpRemote {
         path: &str,
         like: Option<Like>,
     ) -> std::result::Result<Uploaded, CreateError> {
-        let not_created = |e| CreateError::new(Created::No, e);
-        let mut src = std::fs::File::open(local)
-            .with_context(|| format!("cannot open {}", local.display()))
-            .map_err(not_created)?;
-        let (rt, sftp, _) = self.parts();
-        rt.block_on(async {
-            let opened = within(
-                META_TIMEOUT,
-                sftp.options().write(true).create_new(true).open(path),
-            )
-            .await;
-            let mut file = match opened {
-                Ok(Ok(file)) => file,
-                Ok(Err(e)) => return Err(failed_create(path, e)),
-                Err(()) => {
-                    return Err(CreateError::new(
-                        Created::Unknown,
-                        unknown(format!(
-                            "create {path}: request sent, no reply in {}s",
-                            META_TIMEOUT.as_secs()
-                        )),
-                    ))
-                }
-            };
-            // From here `path` is ours.
-            let fill = async {
-                // Handle-based metadata updates on the open file, never by path: the owner, then
-                // the permission bits without set-id bits before the content, then the full mode
-                // restored after the content, so set-id bits are applied last.
-                if let Some(like) = like {
-                    // A refused owner change is not fatal here: the caller checks the result
-                    // (a mismatch refuses the save; an owner that was already right passes).
-                    let owner = MetaDataBuilder::new().id((like.uid, like.gid)).create();
-                    match within(META_TIMEOUT, file.set_metadata(owner)).await {
-                        Ok(Ok(())) => {}
-                        Ok(Err(e)) => crate::debug!("set owner on {path}: {e}"),
-                        Err(()) => {
-                            return Err(timed_out(&format!("set owner on {path}"), META_TIMEOUT))
-                        }
-                    }
-                    within(META_TIMEOUT, file.set_permissions(perms(like.mode & 0o777)))
-                        .await
-                        .map_err(|()| timed_out(&format!("set mode on {path}"), META_TIMEOUT))?
-                        .map_err(|e| anyhow!("cannot set mode on {path}: {e}"))?;
-                }
-                // write_all splits at the server's write limit.
-                let mut out = Hashing::new(std::io::sink());
-                let mut buf = vec![0u8; CHUNK];
-                loop {
-                    let n = src
-                        .read(&mut buf)
-                        .with_context(|| format!("cannot read {}", local.display()))?;
-                    if n == 0 {
-                        break;
-                    }
-                    within(STALL_TIMEOUT, file.write_all(&buf[..n]))
-                        .await
-                        .map_err(|()| timed_out(&format!("write {path}"), STALL_TIMEOUT))?
-                        .map_err(|e| anyhow!("cannot write {path}: {e}"))?;
-                    out.write_all(&buf[..n])?;
-                }
-                if let Some(like) = like {
-                    within(META_TIMEOUT, file.set_permissions(perms(like.mode)))
-                        .await
-                        .map_err(|()| timed_out(&format!("set mode on {path}"), META_TIMEOUT))?
-                        .map_err(|e| anyhow!("cannot set mode on {path}: {e}"))?;
-                }
-                if sftp.support_fsync() {
-                    within(STALL_TIMEOUT, file.sync_all())
-                        .await
-                        .map_err(|()| timed_out(&format!("fsync {path}"), STALL_TIMEOUT))?
-                        .map_err(|e| anyhow!("cannot fsync {path}: {e}"))?;
-                }
-                within(META_TIMEOUT, file.close())
-                    .await
-                    .map_err(|()| timed_out(&format!("close {path}"), META_TIMEOUT))?
-                    .map_err(|e| anyhow!("cannot close {path}: {e}"))?;
-                Ok(out.finish())
-            };
-            fill.await.map_err(|e| CreateError::new(Created::Yes, e))
-        })
+        self.upload(local, path, like, &|| false)
+    }
+
+    fn create_from_stoppable(
+        &mut self,
+        local: &Path,
+        path: &str,
+        like: Option<Like>,
+        stop: &dyn Fn() -> bool,
+    ) -> std::result::Result<Uploaded, CreateError> {
+        self.upload(local, path, like, stop)
     }
 
     fn set_mode(&mut self, path: &str, mode: u32) -> Result<()> {

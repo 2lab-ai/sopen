@@ -16,12 +16,14 @@
 //! export ([`crate::cut::cut_and_publish`]).
 
 use super::image::CANNOT_REPLACE;
-use super::playback::{self, Piece, Player, Sink, Source};
+use super::playback::{self, Piece, Player, Sink};
 use super::{Hooks, Map, Origin, Outcome, Selection, Status};
 use crate::cut;
 use crate::ffmpeg::{
     self, EditSpec, ExportPlan, Input, MediaKind, Probe, Rect as CropRect, Span, Tools,
 };
+use crate::stream::http::Kind;
+use crate::stream::{Mark, ReaderKind, Source};
 use anyhow::{bail, Context as _, Result};
 use eframe::egui::{self, Color32, Key, Pos2, Rect, Sense, Stroke, TextureHandle, Vec2};
 use file::{MediaFile, Saved};
@@ -73,6 +75,10 @@ enum Answer {
 
 /// Closing was asked for while a save runs.
 const CLOSES_AFTER_SAVE: &str = "the window closes when the save is done";
+/// The spacing of the dim band's hatch over a waveform's unread part, in points.
+const UNREAD_HATCH: f32 = 12.0;
+/// What the stream reads for a place asked for, while it takes long.
+const READING: &str = "reading the file up to the place asked for";
 
 /// The window's title in its frame, in the manner of PC Shell's `File Edit`: a video, a sound.
 const VIDEO_TITLE: &str = "Video Edit";
@@ -130,9 +136,36 @@ impl Media {
     /// `shown`, the file as its owner knows it (`host:/abs`) — never about the copy's path.
     pub fn probe_shown(input: &Input, name: &str, shown: &str) -> Result<Self> {
         let tools = ffmpeg::resolve()?;
-        let probe = ffmpeg::probe_shown(&tools, input, shown)?;
+        let probe = ffmpeg::probe_input(&tools, input, shown)?;
         let mut media = Self::of_probe(tools, input, name, shown, probe)?;
         media.plan();
+        Ok(media)
+    }
+
+    /// A remote file read as a stream (06 §7.4): `source` served to ffmpeg by a byte server of
+    /// its own, every run on it reading the URL of its reader kind ([`ffmpeg::Served`]) — the
+    /// probe, playback and the paused frame `play`, the waveform `bulk`, Save and Export
+    /// `render`. An mp3 whose first frame carries a LAME `Info` tag seeks fast ([`mp3`]). The
+    /// probe is held to [`ffmpeg::PROBE_LIMIT`]. Nothing is fetched to the cache: what plays is
+    /// what the stream reads. `name` is the file's name (its extension is what ffmpeg sees),
+    /// `shown` how it is said (`host:/abs`). How Save and Export render it is not worked out
+    /// yet: the window does that ([`MediaWindow::start_planning`]).
+    pub fn stream(source: Source, name: &str, shown: &str) -> Result<Self> {
+        let tools = ffmpeg::resolve()?;
+        let fastseek = cut::stem_ext(name).1.eq_ignore_ascii_case("mp3")
+            && mp3::info_tag(&mut source.reader(ReaderKind::Media { bytes_per_s: 0 }));
+        let served = ffmpeg::Served::start(source, name, shown, fastseek)?;
+        Self::served(&tools, served, name, shown)
+    }
+
+    /// [`Media::stream`] through a server already started (the tests' own clock).
+    fn served(tools: &Tools, served: Arc<ffmpeg::Served>, name: &str, shown: &str) -> Result<Self> {
+        let media = Self::unplanned(tools, &served.input(Kind::Play), name, shown)?;
+        // `play` connections read ahead by the file's own rate from here (06 §4).
+        let size = served.source().size() as f64;
+        served
+            .server()
+            .set_rate((size / media.duration.max(1e-3)) as u64);
         Ok(media)
     }
 
@@ -140,7 +173,7 @@ impl Media {
     /// window opens with (it works that out itself, off its frames: [`Planning`]).
     /// `shown` is how the file is named in what is said ([`Media::probe_shown`]).
     fn unplanned(tools: &Tools, input: &Input, name: &str, shown: &str) -> Result<Self> {
-        let probe = ffmpeg::probe_shown(tools, input, shown)?;
+        let probe = ffmpeg::probe_input(tools, input, shown)?;
         Self::of_probe(tools.clone(), input, name, shown, probe)
     }
 
@@ -388,8 +421,7 @@ fn frame_command(
         .arg(format!("{from:.6}"))
         .arg("-t")
         .arg(format!("{span:.6}"))
-        .arg("-i")
-        .arg(input.arg())
+        .args(input.args())
         .args(["-an", "-sn", "-vf"]);
     match before {
         None => {
@@ -557,6 +589,9 @@ impl Scrubber {
                     return Err(Miss::Spent);
                 }
                 let before = (!one).then_some(slot_end - from);
+                // A remote file's frame read through a stream cut short is no frame: it says
+                // the Source's state (06 §7.4).
+                let cuts = path.cuts();
                 let mut cmd = frame_command(&tools, &path, (from, span), (w, h), before);
                 cmd.stderr(Stdio::null());
                 let mut child = ffmpeg::spawn(&mut cmd).map_err(|e| {
@@ -597,6 +632,9 @@ impl Scrubber {
                 let mut child = child.lock().unwrap();
                 let _ = child.kill();
                 let _ = child.wait();
+                if let Some(why) = path.cut_since(cuts) {
+                    return Err(Miss::Nothing(why));
+                }
                 match last {
                     // The first picture is the one, however close to the deadline it came.
                     Some(rgba) if one => Ok(rgba),
@@ -795,8 +833,12 @@ pub fn export_edit(
     range: (f64, f64),
     work_root: &Path,
     progress: &mut dyn FnMut(f64),
+    stop: &cut::Stop,
 ) -> Result<(String, Vec<String>)> {
     let (dir, name) = origin.parent();
+    if stop.cancelled() {
+        bail!(crate::remote::Cancelled);
+    }
     let fs = origin.fs()?;
     let published = cut::render_and_publish(
         fs,
@@ -808,14 +850,21 @@ pub fn export_edit(
         range,
         work_root,
         progress,
+        stop,
     )?;
     let path = origin.show(&crate::remote::join(&dir, &published.name));
     Ok((path, published.notes))
 }
 
+/// What an export cancelled in time says (06 §7.4): nothing of it is anywhere.
+const EXPORT_CANCELLED: &str = "export cancelled: nothing was published";
+
 /// A failed export, in one line. An upload that got no reply is "outcome unknown — check
-/// <path>" (the sibling may exist), never "export failed".
+/// <path>" (the sibling may exist), never "export failed"; a cancelled one says so.
 fn export_error(e: &anyhow::Error) -> anyhow::Error {
+    if crate::remote::is_cancelled(e) {
+        return anyhow::anyhow!(EXPORT_CANCELLED);
+    }
     match crate::remote::outcome_unknown(e) {
         Some(unknown) => anyhow::anyhow!("export: {unknown} (cause: {})", e.root_cause()),
         None => anyhow::anyhow!("export failed: {e:#}"),
@@ -883,6 +932,7 @@ impl ExportWork {
         media: &Media,
         work: &Path,
         progress: &mut dyn FnMut(f64),
+        stop: &cut::Stop,
     ) -> Result<(String, Vec<String>)> {
         let (a, b) = self.range;
         if b <= a || self.spec.spans.is_empty() {
@@ -892,7 +942,7 @@ impl ExportWork {
                 clock_text(a)
             );
         }
-        export_edit(origin, media, &self.spec, (a, b), work, progress)
+        export_edit(origin, media, &self.spec, (a, b), work, progress, stop)
     }
 }
 
@@ -933,11 +983,40 @@ pub fn open(
 ) -> Result<Outcome> {
     let (_, name) = origin.parent();
     sweep(cache);
-    // A window works out how Save and Export render the file itself, off its frames (02 §6:
-    // for a video above 8 bits that asks ffmpeg); the windowless runs need it now.
     // The file as its owner knows it: `local` may be its copy in sopen's cache.
     let shown = origin.display();
-    let mut media = Media::unplanned(&ffmpeg::resolve()?, &Input::path(local), &name, &shown)?;
+    let media = Media::unplanned(&ffmpeg::resolve()?, &Input::path(local), &name, &shown)?;
+    open_media(origin, media, cache, hooks, notices)
+}
+
+/// [`open`] for a remote file read through `source` (06 §7.4, [`Media::stream`]): nothing is
+/// fetched first. The route that opens a remote video or sound as a stream calls this, as
+/// [`embed_stream`] for a window the file browser hosts. Save keeps today's rule (a remote file
+/// is saved from a fetched copy: ED6 brings Save from a stream).
+pub fn open_stream(
+    origin: Origin,
+    source: Source,
+    cache: &Path,
+    hooks: &Hooks,
+    notices: Vec<String>,
+) -> Result<Outcome> {
+    let (_, name) = origin.parent();
+    sweep(cache);
+    let media = Media::stream(source, &name, &origin.display())?;
+    open_media(origin, media, cache, hooks, notices)
+}
+
+/// The window (or the windowless `SOPEN_AUTOEXPORT` / `SOPEN_AUTOSAVE` run) for `media`, probed
+/// and not planned yet.
+fn open_media(
+    origin: Origin,
+    mut media: Media,
+    cache: &Path,
+    hooks: &Hooks,
+    notices: Vec<String>,
+) -> Result<Outcome> {
+    // A window works out how Save and Export render the file itself, off its frames (02 §6:
+    // for a video above 8 bits that asks ffmpeg); the windowless runs need it now.
     if hooks.autosave || hooks.autoexport {
         media.plan();
     }
@@ -971,7 +1050,13 @@ pub fn open(
             eprintln!("sopen: export: {note}");
         }
         let (path, notes) = job
-            .run(&mut file.origin, &media, &work_root, &mut |_| {})
+            .run(
+                &mut file.origin,
+                &media,
+                &work_root,
+                &mut |_| {},
+                &cut::Stop::default(),
+            )
             .map_err(|e| export_error(&e))?;
         let (in_s, out_s) = job.range();
         let line = format!(
@@ -1002,6 +1087,7 @@ pub fn open(
     window.unplanned = true;
     window.export_hold = hooks.export_hold;
     window.ask_close = state.ask_close;
+    window.loading = state.loading;
     let outcome = window.outcome.clone();
     let leftover = window.leftover.clone();
     let run = super::run_window(&title, size, window, hooks);
@@ -1077,16 +1163,25 @@ fn autosave(
 /// the probed `media`, without the receipt hooks. `cache` is where exports are staged and Save
 /// keeps its backup.
 pub fn embed(origin: Origin, media: Media, cache: &Path, notices: Vec<String>) -> super::Embedded {
+    hosted(hosted_window(origin, media, cache, notices))
+}
+
+/// The window [`embed`] hosts, not handed over yet.
+fn hosted_window(origin: Origin, media: Media, cache: &Path, notices: Vec<String>) -> MediaWindow {
     sweep(cache);
     let work_root = crate::cache::exports_root(cache);
-    let window = MediaWindow::new(
+    MediaWindow::new(
         media,
         MediaFile::new(origin, cache),
         work_root,
         Marks::default(),
         Selection::default(),
         notices,
-    );
+    )
+}
+
+/// `window` as the file browser hosts it: its outcome settled once its writes are done.
+fn hosted(window: MediaWindow) -> super::Embedded {
     let (outcome, leftover) = (window.outcome.clone(), window.leftover.clone());
     super::Embedded {
         window: Box::new(window),
@@ -1101,6 +1196,22 @@ pub fn embed(origin: Origin, media: Media, cache: &Path, notices: Vec<String>) -
             Some(outcome.lock().unwrap().clone())
         }),
     }
+}
+
+/// [`embed`] for a remote file read through `source` (06 §7.4, [`Media::stream`]): the probe
+/// runs here, on the caller's thread (a route's worker), and the window works out how Save and
+/// Export render the file itself.
+pub fn embed_stream(
+    origin: Origin,
+    source: Source,
+    cache: &Path,
+    notices: Vec<String>,
+) -> Result<super::Embedded> {
+    let (_, name) = origin.parent();
+    let media = Media::stream(source, &name, &origin.display())?;
+    let mut window = hosted_window(origin, media, cache, notices);
+    window.unplanned = true;
+    Ok(hosted(window))
 }
 
 /// The media window as a preview in the file browser (02 §4.2): told it is one before its first
@@ -1135,6 +1246,10 @@ fn report_export(
             outcome.exported = true;
             println!("{}", super::with_notes(&format!("exported {path}"), &notes));
             (Status::info(format!("exported {path}")), notes)
+        }
+        Err(e) if crate::remote::is_cancelled(&e) => {
+            eprintln!("sopen: {EXPORT_CANCELLED}");
+            (Status::info(EXPORT_CANCELLED), Vec::new())
         }
         Err(e) => {
             let e = export_error(&e);
@@ -1196,6 +1311,8 @@ struct ExportJob {
     /// 0..=1000 (per mille), written by the worker.
     progress: Arc<AtomicU32>,
     rx: Receiver<Result<(String, Vec<String>)>>,
+    /// Its Cancel (the progress row's button, and Esc while it runs).
+    stop: Arc<cut::Stop>,
 }
 
 struct SaveJob {
@@ -1346,6 +1463,15 @@ struct MediaWindow {
     /// The file cannot be shown after all (no frame of it decodes): why. The window has asked
     /// to be closed ([`super::Window::failure`]).
     failed: Option<String>,
+    /// A streamed file's stats line (06 §11): `first` was marked, and an `input` waits for its
+    /// `ready` — since when, and what the stream had fetched then (the read's progress is
+    /// shown while it takes long: a far seek in a long VBR mp3 reads the file up to it, 06
+    /// §7.4).
+    marked: bool,
+    asked: Option<(Instant, u64)>,
+    /// `SOPEN_STATE` `loading=1` (06 §11): a sound is ready to be shot at its first peaks from
+    /// the stream, the rest of the waveform still being read, instead of once it is whole.
+    loading: bool,
     /// Tests: how often playback was started (the audio output is opened there).
     #[cfg(test)]
     plays: usize,
@@ -1429,6 +1555,9 @@ impl MediaWindow {
             clock: Arc::new(Instant::now),
             hold_started: false,
             failed: None,
+            marked: false,
+            asked: None,
+            loading: false,
             #[cfg(test)]
             plays: 0,
         }
@@ -1515,6 +1644,77 @@ impl MediaWindow {
             None => self.tex = Some(ctx.load_texture("frame", image, egui::TextureOptions::LINEAR)),
         }
         self.tex_at = Some((t, key));
+        // A frame of the playback, or the paused frame asked for.
+        if key.is_none() || self.frame_ready() {
+            self.shown();
+        }
+    }
+
+    /// The file's stream, whose stats line has the window's events (06 §11); `None` for a
+    /// local file.
+    fn stream(&self) -> Option<Source> {
+        self.media.input.served().map(|s| s.source().clone())
+    }
+
+    /// Content from the stream is on screen — a frame, the first peaks of the waveform, sound
+    /// given to the output: `first` once, and the `ready` an `input` waits for.
+    fn shown(&mut self) {
+        let Some(source) = self.stream() else {
+            return;
+        };
+        if !std::mem::replace(&mut self.marked, true) {
+            source.mark(Mark::First);
+        }
+        if self.asked.take().is_some() {
+            source.mark(Mark::Ready);
+            if self.status.text.starts_with(READING) {
+                self.status = Status::default();
+            }
+        }
+    }
+
+    /// What was asked for will not come (a decode failed, playback ended): no `ready` for it,
+    /// and the read's progress is no longer said.
+    fn unasked(&mut self) {
+        self.asked = None;
+        if self.status.text.starts_with(READING) {
+            self.status = Status::default();
+        }
+    }
+
+    /// While what was asked for takes more than a second to come: how much of the file the
+    /// stream has read for it.
+    fn reading(&mut self, ctx: &egui::Context) {
+        let (Some((at, from)), Some(source)) = (self.asked, self.stream()) else {
+            return;
+        };
+        if at.elapsed() < Duration::from_secs(1) {
+            ctx.request_repaint_after(Duration::from_secs(1).saturating_sub(at.elapsed()));
+            return;
+        }
+        let read = source.fetched().total.saturating_sub(from);
+        self.status = Status::info(format!("{READING}: {:.1} MB read", read as f64 / 1e6));
+        ctx.request_repaint_after(Duration::from_millis(250));
+    }
+
+    /// The owner moved the playhead to `t` (a click or drag's end on the timeline, a key): an
+    /// `input` on the stats line, at the place in the file that time is at (by its share of the
+    /// length: what a far scrub costs is read from there). Its `ready` is the frame there, or
+    /// the sound from there once playback goes on.
+    fn moved(&mut self, t: f64) {
+        let Some(source) = self.stream() else {
+            return;
+        };
+        let tl = &self.timeline;
+        let tick = tl.tick(t).clamp(0, (tl.len() - 1).max(0));
+        let at = tl.secs(timeline::source_at(tl.clips(), tick)) / self.media.duration.max(1e-9);
+        source.mark(Mark::Input(
+            (at.clamp(0.0, 1.0) * source.size() as f64) as u64,
+        ));
+        // A paused sound shows nothing new for a place: nothing is read for it.
+        if !self.audio_only() || self.player.is_some() || self.resume {
+            self.asked = Some((Instant::now(), source.fetched().total));
+        }
     }
 
     /// The source frame shown at timeline time `t`: past the picture's last frame (a longer
@@ -1547,6 +1747,9 @@ impl MediaWindow {
         if self.player.take().is_some() {
             self.resume = true;
         }
+        if done {
+            self.moved(t);
+        }
         self.seek(ctx, t);
         if done && std::mem::take(&mut self.resume) {
             self.play(ctx);
@@ -1575,7 +1778,7 @@ impl MediaWindow {
                 len: tl.secs(c.len()),
             })
             .collect();
-        let src = Source {
+        let src = playback::Source {
             input: media.input.clone(),
             duration: length,
             video: media.decode_size().map(|size| (size, media.fps)),
@@ -1593,11 +1796,18 @@ impl MediaWindow {
                     scrub.supersede();
                 }
             }
-            Err(e) => self.status = Status::error(format!("cannot play: {e:#}")),
+            Err(e) => {
+                self.unasked();
+                self.status = Status::error(format!("cannot play: {e:#}"));
+            }
         }
     }
 
     fn pause(&mut self, ctx: &egui::Context) {
+        if self.audio_only() {
+            // A paused sound shows nothing new for the place: the wait for it is over.
+            self.unasked();
+        }
         if let Some(player) = self.player.take() {
             self.marks.t = player.clock(Instant::now()).min(self.length());
             let (shown, dropped) = player.stats();
@@ -1616,17 +1826,27 @@ impl MediaWindow {
         };
         let pump = player.pump(Instant::now());
         let note = player.audio_note.clone();
+        let sounded = player.sounded();
         self.marks.t = pump.position;
         if let Some(frame) = pump.frame {
             self.show_frame(ctx, &frame.rgba, frame.pts, None);
         }
+        if sounded && (self.asked.is_some() || !self.marked) && self.audio_only() {
+            self.shown();
+        }
         if let Some(note) = note {
+            // A sound that plays silently gives no sound for the place asked for.
+            if self.audio_only() {
+                self.unasked();
+            }
             self.status = Status::error(format!("{note} — playing without sound"));
         }
         if let Some(error) = &pump.error {
             self.status = Status::error(format!("playback stopped: {error}"));
         }
         if pump.ended {
+            // Playback is over: nothing more is read for what was asked for.
+            self.unasked();
             self.player = None;
             self.marks.t = pump.position;
             // The frame at the end on screen, asked for as a pause asks.
@@ -1907,25 +2127,46 @@ impl MediaWindow {
         );
         let (shared, waker) = (progress.clone(), ctx.clone());
         let mut hold = self.export_hold;
+        let stop = Arc::new(cut::Stop::default());
+        let theirs = stop.clone();
         std::thread::spawn(move || {
             // A worker that panicked mid-write must not lock the file out of every later
             // Save and Export: its state is the file's own (origin, backup), still valid.
             let mut file = file.lock().unwrap_or_else(|e| e.into_inner());
-            let result = work.run(&mut file.origin, &media, &root, &mut |f| {
+            let mut progress = |f: f64| {
                 shared.store((f * 1000.0) as u32, SeqCst);
                 waker.request_repaint();
                 if f >= 0.3 {
                     if let Some(d) = hold.take() {
-                        // Receipt hook: ffmpeg blocks on its progress pipe meanwhile.
-                        std::thread::sleep(d);
+                        // Receipt hook: ffmpeg blocks on its progress pipe meanwhile; a
+                        // Cancel ends the hold.
+                        let until = Instant::now() + d;
+                        while Instant::now() < until && !theirs.cancelled() {
+                            std::thread::sleep(Duration::from_millis(20));
+                        }
                     }
                 }
-            });
+            };
+            let result = work.run(&mut file.origin, &media, &root, &mut progress, &theirs);
             let _ = tx.send(result);
             waker.request_repaint();
         });
         self.status = Status::info("exporting…");
-        self.job = Some(ExportJob { progress, rx });
+        self.job = Some(ExportJob { progress, rx, stop });
+    }
+
+    /// The export's Cancel (06 §7.4): its ffmpeg is killed and its local render removed, or
+    /// its uploaded temp removed and nothing linked. Once the publishing link has been made it
+    /// is too late: the result names the new file.
+    fn cancel_export(&mut self) {
+        let Some(job) = &self.job else {
+            return;
+        };
+        self.status = if job.stop.cancel() {
+            Status::info("cancelling the export…")
+        } else {
+            Status::info("too late to cancel: the export is being published")
+        };
     }
 
     fn start_save(&mut self, ctx: &egui::Context, close_after: bool) {
@@ -2187,9 +2428,11 @@ impl MediaWindow {
         if plain_key(ctx, Key::M) {
             self.toggle_stereo(ctx);
         }
-        // Esc: the crop rectangle first, then the selection (with neither, the browser
-        // around a hosted window takes it to leave).
-        if self.sel.is_set() && plain_key(ctx, Key::Escape) {
+        // Esc: a running export's Cancel first, then the crop rectangle, then the selection
+        // (with none of them, the browser around a hosted window takes it to leave).
+        if self.job.is_some() && plain_key(ctx, Key::Escape) {
+            self.cancel_export();
+        } else if self.sel.is_set() && plain_key(ctx, Key::Escape) {
             self.sel.clear();
         } else if self.marks.selected() && plain_key(ctx, Key::Escape) {
             self.marks.clear();
@@ -2208,11 +2451,40 @@ impl MediaWindow {
             }
         };
         if let Some(s) = step(ctx, Key::ArrowLeft) {
-            self.seek(ctx, self.marks.t - s);
+            let t = (self.marks.t - s).clamp(0.0, self.length());
+            self.moved(t);
+            self.seek(ctx, t);
         }
         if let Some(s) = step(ctx, Key::ArrowRight) {
-            self.seek(ctx, self.marks.t + s);
+            let t = (self.marks.t + s).clamp(0.0, self.length());
+            self.moved(t);
+            self.seek(ctx, t);
         }
+    }
+
+    /// The stretches of the timeline (seconds) whose source the waveform's decode has not read
+    /// yet: none once it is complete or has failed.
+    fn unread(&self) -> Vec<(f64, f64)> {
+        let Some(wave) = &self.wave else {
+            return Vec::new();
+        };
+        let read = match wave.peaks.lock().unwrap().as_ref() {
+            Some(p) if !p.complete && p.error.is_none() => p.read,
+            Some(_) => return Vec::new(),
+            None => 0.0,
+        };
+        let tl = &self.timeline;
+        let from = tl.tick((read - self.media.origin()).max(0.0));
+        let mut at = 0;
+        let mut out = Vec::new();
+        for c in tl.clips() {
+            let start = c.start.max(from);
+            if start < c.end {
+                out.push((tl.secs(at + start - c.start), tl.secs(at + c.len())));
+            }
+            at += c.len();
+        }
+        out
     }
 
     /// The waveform's columns for the timeline as it is now (from the peaks so far; no decode).
@@ -2262,6 +2534,20 @@ impl MediaWindow {
             let width = rect.width().max(1.0) as usize;
             if let Some(cols) = self.wave_columns(width, lanes) {
                 paint_wave(&painter, rect, &cols, self.media.lane_names(), &font);
+                // What the decode has not reached yet lies under a dim band (06 §7.4): through
+                // the edit list, wherever that part of the source is on the timeline. On the
+                // black timeline the band is a hatch in the skin's dim colour.
+                for (a, b) in self.unread() {
+                    let (a, b) = (x_of(a), x_of(b));
+                    let mut x = a;
+                    while x <= b {
+                        painter.line_segment(
+                            [Pos2::new(x, rect.top()), Pos2::new(x, rect.bottom())],
+                            Stroke::new(1.0, p.dim),
+                        );
+                        x += UNREAD_HATCH;
+                    }
+                }
             } else {
                 painter.text(
                     rect.center(),
@@ -2530,6 +2816,14 @@ impl MediaWindow {
         ui.horizontal(|ui| {
             ui.set_min_height(ui.spacing().interact_size.y);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if self.job.is_some()
+                    && ui
+                        .add(egui::Button::new("Cancel"))
+                        .on_hover_text("Esc — stops the export; nothing is published")
+                        .clicked()
+                {
+                    self.cancel_export();
+                }
                 if let Some((what, per_mille)) = progress {
                     ui.label(format!("{what} {:.0} %", per_mille as f32 / 10.0));
                     let size = ui.text_style_height(&egui::TextStyle::Body);
@@ -2833,6 +3127,20 @@ impl super::Window for MediaWindow {
         self.keys(&ctx);
         self.clipboard(&ctx);
         self.pump(&ctx);
+        self.reading(&ctx);
+        // A sound's first peaks are its first content on screen.
+        if !self.marked && self.audio_only() {
+            let peaks = self.wave.as_ref().and_then(|w| {
+                w.peaks
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .map(|p| p.read > 0.0 || p.complete)
+            });
+            if peaks == Some(true) {
+                self.shown();
+            }
+        }
         if self.player.is_none() {
             let scrubbed = self
                 .scrub
@@ -2854,10 +3162,15 @@ impl super::Window for MediaWindow {
                     let why = format!("cannot show {}: {e}", self.title);
                     self.outcome.lock().unwrap().failed = Some(why.clone());
                     self.failed = Some(why);
+                    self.asked = None;
                     self.status = Status::error(e);
                     super::request_close(&ctx);
                 }
-                Some(Err(e)) => self.status = Status::error(e),
+                // What was asked for is not coming: what is said is why, not the read.
+                Some(Err(e)) => {
+                    self.asked = None;
+                    self.status = Status::error(e);
+                }
                 None => {}
             }
         }
@@ -2923,12 +3236,11 @@ impl super::Window for MediaWindow {
                         let h = ui.available_height().max(60.0);
                         seek = self.timeline(ui, h, true).or(seek);
                     });
+                    let loading = self.loading;
                     self.painted = self.wave.as_ref().is_some_and(|w| {
-                        w.peaks
-                            .lock()
-                            .unwrap()
-                            .as_ref()
-                            .is_some_and(|p| p.complete || p.error.is_some())
+                        w.peaks.lock().unwrap().as_ref().is_some_and(|p| {
+                            p.complete || p.error.is_some() || (loading && p.read > 0.0)
+                        })
                     });
                 } else {
                     self.picture(ui);
@@ -3049,6 +3361,7 @@ mod file;
 mod child;
 #[cfg(test)]
 pub(crate) mod fixtures;
+pub mod mp3;
 pub mod preview;
 pub mod timeline;
 pub mod wave;
@@ -3061,6 +3374,9 @@ mod input_tests;
 
 #[cfg(test)]
 mod preview_tests;
+
+#[cfg(test)]
+mod stream_tests;
 
 #[cfg(test)]
 mod tests {
@@ -3096,6 +3412,7 @@ mod tests {
         w.job = Some(ExportJob {
             progress: Arc::default(),
             rx,
+            stop: Arc::default(),
         });
         use super::super::Window;
         assert!(!w.close_requested(), "first close waits for the export");
@@ -3246,7 +3563,13 @@ mod tests {
         let timeline = Timeline::new(media.rate(), media.ticks());
         let job = ExportWork::new(&media, &timeline, &marks, Some([10, 20, 300, 600]));
         let out = job
-            .run(&mut origin, &media, &tmp.path().join("work"), &mut |_| {})
+            .run(
+                &mut origin,
+                &media,
+                &tmp.path().join("work"),
+                &mut |_| {},
+                &cut::Stop::default(),
+            )
             .unwrap()
             .0;
         let probe = ffmpeg::probe(&tools, Path::new(&out)).unwrap();
@@ -3300,9 +3623,13 @@ mod tests {
         let job = ExportWork::new(&media, &timeline, &marks, Some([101, 51, 401, 201]));
         let mut last = 0.0;
         let path = job
-            .run(&mut origin, &media, &tmp.path().join("work"), &mut |f| {
-                last = f
-            })
+            .run(
+                &mut origin,
+                &media,
+                &tmp.path().join("work"),
+                &mut |f| last = f,
+                &cut::Stop::default(),
+            )
             .unwrap()
             .0;
         // Cuts are at frame times: Out 2.25 s at 30 fps is the start of frame 68 (2.267 s) —
@@ -3325,7 +3652,13 @@ mod tests {
             out_s: Some(1.0),
         };
         let err = ExportWork::new(&media, &timeline, &bad, None)
-            .run(&mut origin, &media, &tmp.path().join("work"), &mut |_| {})
+            .run(
+                &mut origin,
+                &media,
+                &tmp.path().join("work"),
+                &mut |_| {},
+                &cut::Stop::default(),
+            )
             .unwrap_err();
         assert!(err.to_string().contains("must be after"), "{err}");
     }

@@ -1,14 +1,18 @@
 //! The audio window's waveform (spec §7): one decode of the whole file into min/max peaks per
 //! channel — two lanes for stereo (more channels are mixed down to two), one for mono — at a
 //! fixed resolution of the source, never the PCM itself. The peaks are handed over as they
-//! fill (a streamed file arrives over time), and the timeline on screen is drawn from them
-//! through the edit list, so an edit redraws it at once, with no decode. The decode stops when
-//! its window goes ([`Decode`]); one that follows a preview goes on from where the preview's
-//! stopped ([`resume`], 02 §4.4).
+//! fill, about every [`HANDOVER_EVERY`] (a streamed file arrives over time), with how far into
+//! the source they reach ([`Source::read`]), and the timeline on screen is drawn from them
+//! through the edit list, so an edit redraws it at once, with no decode. A remote file is read
+//! through its `bulk` URL (06 §7.4): a Bulk reader, which never evicts playback's blocks and
+//! yields to its demand; a decode whose stream was cut short is a failure, never a complete
+//! waveform. The decode stops when its window goes ([`Decode`]); one that follows a preview
+//! goes on from where the preview's stopped ([`resume`], 02 §4.4).
 
 use super::child::{Ending, Slot};
 use super::timeline::{Clip, Timeline};
 use crate::ffmpeg::{Input, Tools};
+use crate::stream::http::Kind;
 use std::io::{BufReader, Read};
 use std::process::{Command, Stdio};
 #[cfg(test)]
@@ -57,6 +61,8 @@ pub struct Source {
     pub version: u64,
     /// The decode read the whole file and ended well.
     pub complete: bool,
+    /// How many seconds of the source the peaks reach: what lies past it is not read yet.
+    pub read: f64,
     /// The decode failed (what it said): the peaks are what it read before, never complete.
     pub error: Option<String>,
 }
@@ -64,8 +70,10 @@ pub struct Source {
 /// Filled in by the decoder thread as it reads, then once more when it is done.
 pub type Shared = Arc<Mutex<Option<Source>>>;
 
-/// Hand-overs while decoding: the peaks so far, this many times over the file.
+/// Hand-overs while decoding: the peaks so far, at least this many times over the file, and
+/// at least every [`HANDOVER_EVERY`] (06 §7.4: a streamed file fills as its bytes come).
 const HANDOVERS: usize = 32;
+pub const HANDOVER_EVERY: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// How many bins a `duration`-second source gets.
 pub fn bins_for(duration: f64) -> usize {
@@ -121,11 +129,13 @@ pub fn read_onto(
             lanes: peaks.iter().map(|p| p.bins.clone()).collect(),
             version,
             complete: false,
+            read: peaks[0].seen as f64 / RATE,
             error: None,
         }
     };
     let mut b4 = [0u8; 4];
     let (mut c, mut n) = (0, 0usize);
+    let mut handed = std::time::Instant::now();
     loop {
         match reader.read_exact(&mut b4) {
             Ok(()) => {}
@@ -135,8 +145,10 @@ pub fn read_onto(
         peaks[c].push(f32::from_le_bytes(b4));
         c = (c + 1) % lanes;
         n += 1;
-        if n % step == 0 {
+        // The clock is looked at every 4096 samples only.
+        if n % step == 0 || (n % 4096 == 0 && handed.elapsed() >= HANDOVER_EVERY) {
             publish(snapshot(&peaks));
+            handed = std::time::Instant::now();
         }
     }
     Ok(snapshot(&peaks))
@@ -154,7 +166,7 @@ pub fn command(tools: &Tools, input: &Input, lanes: usize, from: f64, len: Optio
     if let Some(len) = len {
         cmd.arg("-t").arg(format!("{len:.6}"));
     }
-    cmd.arg("-i").arg(input.arg()).arg("-vn");
+    cmd.args(input.args()).arg("-vn");
     if lanes >= 2 {
         // The source's first two channels as they are — of a sound in more than two, not a
         // mix of them all (its lanes are named after those two channels).
@@ -306,9 +318,11 @@ fn start_onto(
     let (slot, running) = (decode.peaks.clone(), decode.child.clone());
     #[cfg(test)]
     let waiting = decode.waiting.clone();
-    let (tools, input) = (tools.clone(), input.clone());
+    // A remote file's waveform is a Bulk reader's (06 §7.4).
+    let (tools, input) = (tools.clone(), input.of_kind(Kind::Bulk));
     std::thread::spawn(move || {
         let from = onto.as_ref().map_or(0.0, |(_, secs)| *secs);
+        let cuts = input.cuts();
         let mut cmd = command(&tools, &input, lanes, from, None);
         let failed = |why: String, last: Option<Source>| {
             let mut peaks = last.unwrap_or(Source {
@@ -316,6 +330,7 @@ fn start_onto(
                 lanes: Vec::new(),
                 version: 0,
                 complete: false,
+                read: 0.0,
                 error: None,
             });
             peaks.version += 1;
@@ -372,13 +387,20 @@ fn start_onto(
                     }
                 };
                 let last_line = said.join().unwrap_or_default().last_line();
+                // ffmpeg exits 0 on a stream cut short: the account says it (06 §7.4).
+                let cut = input.cut_since(cuts);
                 match (read, status) {
                     (Err(e), _) => failed(format!("reading the decoded sound: {e}"), None),
+                    (Ok(peaks), _) if cut.is_some() => failed(cut.expect("checked"), Some(peaks)),
                     (Ok(peaks), Ok(s)) if s.success() => Source {
                         complete: true,
+                        read: duration,
                         ..peaks
                     },
-                    (Ok(peaks), Ok(s)) => failed(format!("ffmpeg {s}: {last_line}"), Some(peaks)),
+                    (Ok(peaks), Ok(s)) => {
+                        let said = input.said(&last_line);
+                        failed(format!("ffmpeg {s}: {said}"), Some(peaks))
+                    }
                     (Ok(peaks), Err(e)) => failed(format!("ffmpeg: {e}"), Some(peaks)),
                 }
             }
@@ -620,6 +642,46 @@ mod tests {
         assert!(error.len() < 8192, "{} bytes", error.len());
     }
 
+    /// A stream slower than the count of hand-overs: the peaks are handed over at least every
+    /// [`HANDOVER_EVERY`] as they fill (06 §7.4), not only at each 1/32 of the file.
+    #[test]
+    fn a_slow_stream_is_handed_over_by_the_time() {
+        struct Slow {
+            chunks: usize,
+            at: usize,
+        }
+        impl Read for Slow {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                if self.chunks == 0 {
+                    return Ok(0);
+                }
+                // 16 384 samples (mono f32) a chunk, a little over a hand-over apart.
+                if self.at == 0 {
+                    std::thread::sleep(HANDOVER_EVERY + std::time::Duration::from_millis(50));
+                }
+                let n = buf.len().min(16_384 * 4 - self.at);
+                buf[..n].fill(0);
+                self.at += n;
+                if self.at == 16_384 * 4 {
+                    (self.chunks, self.at) = (self.chunks - 1, 0);
+                }
+                Ok(n)
+            }
+        }
+        let mut handed: Vec<f64> = Vec::new();
+        // An hour of sound: a count step is 900 000 samples, far past what comes here.
+        let done = read_peaks(&mut Slow { chunks: 3, at: 0 }, 1, 3600.0, &mut |s| {
+            handed.push(s.read)
+        })
+        .unwrap();
+        assert!(!handed.is_empty(), "handed over as it filled");
+        assert!(
+            handed[0] < done.read,
+            "{handed:?} before the end at {}",
+            done.read
+        );
+    }
+
     /// After a cut and a paste the columns show the source in the edit's order — from the same
     /// peaks, no decode.
     #[test]
@@ -630,6 +692,7 @@ mod tests {
             lanes: vec![(1..=4).map(|k| [-(k as f32), k as f32]).collect()],
             version: 1,
             complete: true,
+            read: 4.0,
             error: None,
         };
         let mut t = Timeline::new(10.0, 40);

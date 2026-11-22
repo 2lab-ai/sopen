@@ -266,6 +266,8 @@ struct Shared {
     /// The watch waits here, on `conns`, while no body is under way.
     watching: Condvar,
     account: Mutex<Account>,
+    /// Body bytes sent to clients, by reader kind ([`Server::sent`]).
+    sent: [AtomicU64; 3],
     config: Config,
     /// Tests: socket waits that ran out and looked at the clock.
     #[cfg(test)]
@@ -527,6 +529,7 @@ impl Server {
             conns: Mutex::default(),
             watching: Condvar::new(),
             account: Mutex::default(),
+            sent: Default::default(),
             config,
             #[cfg(test)]
             checks: AtomicU64::new(0),
@@ -604,6 +607,12 @@ impl Server {
     /// The last response of this kind ended early: what a failed run says of its input.
     pub fn last_cut(&self, kind: Kind) -> Option<Cut> {
         self.shared.account().tally(kind).last.clone()
+    }
+
+    /// Body bytes sent so far to clients of this kind: a run's input going on (a render's
+    /// watchdog counts it as progress, 06 §7.4).
+    pub fn sent(&self, kind: Kind) -> u64 {
+        self.shared.sent[kind as usize].load(Ordering::SeqCst)
     }
 
     #[cfg(test)]
@@ -1445,8 +1454,10 @@ impl Conn {
             stop = match got {
                 Ok(n) if n == want => {
                     let mut off = at;
+                    let kind = request.kind as usize;
                     let sent = self.send(&buf[..want], |n| {
                         shared.source.sent_http(off, n as u64);
+                        shared.sent[kind].fetch_add(n as u64, Ordering::SeqCst);
                         off += n as u64;
                     });
                     at = off;

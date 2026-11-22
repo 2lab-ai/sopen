@@ -870,7 +870,7 @@ fn a_long_out_of_order_edit_renders_in_passes_frame_exact() {
         tracks: probe.tracks.clone(),
     };
     assert!(
-        ffmpeg::edit_passes(&spec, ffmpeg::MAX_INPUTS)
+        ffmpeg::edit_passes(&spec, &ffmpeg::Input::path(&src), ffmpeg::MAX_INPUTS)
             .unwrap()
             .len()
             > 1,
@@ -1026,6 +1026,7 @@ fn an_edited_export_is_a_new_sibling() {
         (0.0, 1.0),
         &tmp.path().join("work"),
         &mut |_| {},
+        &crate::cut::Stop::default(),
     )
     .unwrap();
     assert_eq!(published.name, "t.cut-0-1.wav");

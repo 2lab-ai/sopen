@@ -219,7 +219,7 @@ pub(crate) fn plain(said: &str, input: &Input) -> String {
         said = rest.trim_start();
     }
     let named = format!("{}: ", input.show());
-    said.strip_prefix(&named).unwrap_or(said).to_string()
+    input.said(said.strip_prefix(&named).unwrap_or(said))
 }
 
 /// ffprobe cannot read the file as media: its own reason, without the file's path (whoever
@@ -245,7 +245,7 @@ fn probe(
     watch: &dyn Watch,
 ) -> Result<Result<Probe>> {
     watch.begin(Step::Probe);
-    let mut cmd = ffmpeg::probe_command(tools, input.arg());
+    let mut cmd = ffmpeg::probe_command(tools, input);
     let (json, status, last) = run(&mut cmd, input, children, watch, |out| {
         let mut json = Vec::new();
         let _ = out.read_to_end(&mut json);
