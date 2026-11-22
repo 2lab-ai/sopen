@@ -9,7 +9,7 @@ use crate::gui::testkit::{command, key_up, Driver};
 use crate::remote::{LocalFs, RemoteFs};
 use eframe::egui::{Event, Key, Modifiers, PointerButton};
 
-fn tools_or_skip() -> Option<Tools> {
+pub(super) fn tools_or_skip() -> Option<Tools> {
     match ffmpeg::resolve() {
         Ok(t) => Some(t),
         Err(e) if std::env::var_os("SOPEN_REQUIRE_FFMPEG").is_some() => {
@@ -22,7 +22,7 @@ fn tools_or_skip() -> Option<Tools> {
     }
 }
 
-fn ff(tools: &Tools, args: &[&str]) {
+pub(super) fn ff(tools: &Tools, args: &[&str]) {
     let ok = std::process::Command::new(&tools.ffmpeg)
         .args(["-hide_banner", "-loglevel", "error", "-nostdin", "-y"])
         .args(args)
@@ -34,7 +34,7 @@ fn ff(tools: &Tools, args: &[&str]) {
 
 /// Four seconds at 44.1 kHz: left 440, 880, 1320, 1760 Hz a second each; right 660 Hz (stereo),
 /// or the left alone (mono).
-fn tones(tools: &Tools, dst: &Path, stereo: bool) {
+pub(super) fn tones(tools: &Tools, dst: &Path, stereo: bool) {
     let left = "0.5*sin(2*PI*(440+440*floor(t))*t)";
     let expr = if stereo {
         format!("aevalsrc='{left}|0.5*sin(2*PI*660*t)':s=44100:d=4")
@@ -402,7 +402,7 @@ fn wait_save(fx: &mut Fx) {
 }
 
 /// The left channel's tones of a file, in order (from the cut tests' reader).
-fn order(file: &Path) -> Vec<u32> {
+pub(super) fn order(file: &Path) -> Vec<u32> {
     let tools = ffmpeg::resolve().unwrap();
     let out = std::process::Command::new(&tools.ffmpeg)
         .args(["-hide_banner", "-loglevel", "error", "-nostdin", "-i"])
@@ -484,7 +484,7 @@ fn save_renders_writes_back_after_a_backup_and_reloads() {
     assert_eq!(walk(&fx.tmp.path().join("cache").join(".backup")).len(), 1);
 }
 
-fn walk(dir: &Path) -> Vec<PathBuf> {
+pub(super) fn walk(dir: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
     if let Ok(entries) = std::fs::read_dir(dir) {
         for e in entries.flatten() {
@@ -1194,6 +1194,10 @@ fn a_worker_that_ends_without_a_result_is_a_failure_not_busy_forever() {
         progress: Arc::default(),
         rx,
         close_after: false,
+        stop: Arc::default(),
+        stage: Arc::default(),
+        host: String::new(),
+        rev: 0,
     });
     drop(tx);
     fx.drv.idle(&mut fx.win, 2);

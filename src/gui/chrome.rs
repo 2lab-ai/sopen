@@ -124,10 +124,9 @@ pub const EXIT_KEY: FKey = FKey {
 };
 
 /// F7 in the hex, image and media windows: Save As, the same as Alt+Cmd/Ctrl+S — the edited
-/// result to a new local file (07 §7, `gui::save_as`). The image window's row lists it
-/// ([`IMAGE_KEYS`]); the hex and media windows add it to theirs, with the help line, in the
-/// change that wires the modal (ED4, ED6), so a slot never names a key that does nothing. The
-/// text viewer is read-only and has none.
+/// result to a new local file (07 §7, `gui::save_as`). Their rows list it ([`HEX_KEYS`],
+/// [`IMAGE_KEYS`], [`MEDIA_KEYS`]), and the key help says it from there. The text viewer is
+/// read-only and has none.
 pub const SAVE_AS_KEY: FKey = FKey {
     n: 7,
     label: "SaveAs",
@@ -162,12 +161,15 @@ pub const IMAGE_KEYS: &[FKey] = &[
     SAVE_AS_KEY,
 ];
 
-/// The media window's own key: F5 is Save, as in the image and hex windows (message 13 made
-/// video and audio savable).
-pub const MEDIA_KEYS: &[FKey] = &[FKey {
-    n: 5,
-    label: "Save",
-}];
+/// The media window's own keys: F5 is Save, as in the image and hex windows (message 13 made
+/// video and audio savable); F7 is Save As, as Alt+Cmd/Ctrl+S (07 §7).
+pub const MEDIA_KEYS: &[FKey] = &[
+    FKey {
+        n: 5,
+        label: "Save",
+    },
+    SAVE_AS_KEY,
+];
 
 /// The text viewer's own key while lines wrap: F2 (or W) shows one row per line instead, as
 /// Norton Commander's and Far's viewers name it.
