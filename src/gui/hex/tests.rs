@@ -4650,8 +4650,9 @@ mod stream {
         disk: Arc<std::sync::atomic::AtomicU64>,
         disk_full: Arc<AtomicBool>,
         hold_record: Arc<AtomicBool>,
-        /// Every removal fails (a server that refuses it).
+        /// Every removal fails (a server that refuses it); every rename too.
         fail_remove: Arc<AtomicBool>,
+        fail_rename: Arc<AtomicBool>,
         /// Calls that move a whole file — an upload (`create_from`), a whole read (`read_to`,
         /// `read_head`) — whatever they moved: a streamed Save makes none.
         whole: Arc<std::sync::atomic::AtomicU64>,
@@ -4735,6 +4736,9 @@ mod stream {
             self.inner.set_mode(p, mode)
         }
         fn rename_over(&mut self, from: &str, to: &str) -> Result<()> {
+            if self.moved.fail_rename.load(Ordering::SeqCst) {
+                bail!("rename {from}: permission denied");
+            }
             self.inner.rename_over(from, to)
         }
         fn link_new(&mut self, from: &str, to: &str) -> Result<()> {
@@ -6590,8 +6594,9 @@ mod stream {
     }
 
     /// P8, Esc: a Save still waiting for a generation on its way (stalled storage) is stopped
-    /// by Esc — nothing sent, nothing written, the edits unsaved and not said to have failed to
-    /// be kept; once the storage answers, the next generation keeps them.
+    /// by Esc — nothing read, written or copied over the connection, nothing written to the
+    /// journal, no temp, the remote as it was; the edits unsaved and not said to have failed to
+    /// be kept. Once the storage answers, the next generation keeps them.
     #[test]
     fn esc_stops_a_save_waiting_for_a_generation() {
         let body = body();
@@ -6601,6 +6606,14 @@ mod stream {
         ed.win.generation_gate = Some(gate.clone());
         ed.typed("AB");
         ed.drv.until(&mut ed.win, 60, |w| w.writing.is_some());
+        let counted = |ed: &Ed| {
+            (
+                ed.moved.now(),
+                ed.moved.whole.load(Ordering::SeqCst),
+                ed.moved.disk.load(Ordering::SeqCst),
+            )
+        };
+        let before = counted(&ed);
         ed.key(Key::S, command(false));
         ed.frames(2);
         assert!(ed.win.job.is_some());
@@ -6615,6 +6628,9 @@ mod stream {
         );
         assert!(std::fs::read(&ed.remote).unwrap() == body, "sent");
         assert!(ed.temps().is_empty());
+        // Nothing moved over the connection (read, written, copied, whole-file calls) and
+        // nothing written to the journal between Save and Esc.
+        assert_eq!(counted(&ed), before, "the Save did something");
         // The storage answers: the edits are kept.
         gate.store(false, Ordering::SeqCst);
         ed.kept();
@@ -7115,6 +7131,68 @@ mod stream {
         }
     }
 
+    /// P9 in the live window, a temp the record proved the Save's from `staged` on: a Save whose
+    /// rename was refused, and whose own temp could not be removed then nor at the next Save's
+    /// start, leaves the question "could not be removed". A file put there since with every
+    /// attribute equal but other bytes is not that temp: Remove it leaves it, the record and the
+    /// question — the same check as an open's row.
+    #[test]
+    fn remove_it_in_the_window_checks_a_proven_temp_as_the_record_does() {
+        for side in sides() {
+            let mut ed = ed_side(Some(&body()), side);
+            ed.typed("AB");
+            ed.moved.fail_rename.store(true, Ordering::SeqCst);
+            ed.moved.fail_remove.store(true, Ordering::SeqCst);
+            ed.save();
+            ed.moved.fail_rename.store(false, Ordering::SeqCst);
+            let temps = ed.temps();
+            assert_eq!(temps.len(), 1, "{side:?}: {temps:?}");
+            let temp = ed.remote.parent().unwrap().join(&temps[0]);
+            assert!(
+                matches!(save_record(&ed).phase, journal::Phase::Renaming { .. }),
+                "{side:?}"
+            );
+            // The next Save: its own temp, still not removable — asked.
+            ed.save();
+            let line = live_question(&ed);
+            assert!(
+                line.as_deref()
+                    .is_some_and(|l| l.contains("could not be removed")),
+                "{side:?}: {line:?}"
+            );
+            ed.moved.fail_remove.store(false, Ordering::SeqCst);
+            let before = std::fs::metadata(&temp).unwrap();
+            let mut bytes = std::fs::read(&temp).unwrap();
+            bytes[0x10] ^= 0xFF;
+            let mut f = std::fs::OpenOptions::new().write(true).open(&temp).unwrap();
+            std::io::Write::write_all(&mut f, &bytes).unwrap();
+            f.set_modified(before.modified().unwrap()).unwrap();
+            drop(f);
+            let after = std::fs::metadata(&temp).unwrap();
+            assert_eq!(
+                (after.len(), after.modified().unwrap(), after.permissions()),
+                (
+                    before.len(),
+                    before.modified().unwrap(),
+                    before.permissions()
+                ),
+                "{side:?}"
+            );
+            ed.frames(2);
+            ed.drv.click_text(&mut ed.win, "Remove it");
+            ed.drv.until(&mut ed.win, 30, |w| w.answering.is_none());
+            assert_eq!(std::fs::read(&temp).unwrap(), bytes, "{side:?}: removed");
+            let status = ed.win.status.text.clone();
+            assert!(
+                status.contains("is not the file the question was about")
+                    && status.ends_with("— not removed"),
+                "{side:?}: {status}"
+            );
+            assert!(live_question(&ed).is_some(), "{side:?}: the question went");
+            let _ = save_record(&ed);
+        }
+    }
+
     /// P9, a temp the record proved the Save's (staged, its contents' evidence recorded) whose
     /// removal failed on open: before Remove it removes it, the record is reconciled again. A
     /// file put there since with every attribute equal — size, modification time, owner, mode —
@@ -7173,47 +7251,117 @@ mod stream {
         }
     }
 
-    /// P9, the record: Remove it acts only for the record that asked. With that record ended
-    /// some other way (here by hand, as no path of the window does it while the question is
-    /// open), Remove it removes nothing and says why — in the live window and in an open's row.
+    /// `temp`'s path with its last character changed: the temp name of another Save (names are
+    /// unique per Save).
+    fn another_temp(temp: &str) -> String {
+        let (head, last) = temp.split_at(temp.len() - 1);
+        format!("{head}{}", if last == "0" { "1" } else { "0" })
+    }
+
+    /// P9, the record: Remove it acts only for the record that asked. That record ended some
+    /// other way, or another Save's record (its own temp name) there instead — neither is a path
+    /// of the window while the question is open, so they are made by hand: Remove it removes
+    /// nothing, says why, and leaves whatever record is there — in the live window and in an
+    /// open's row.
     #[test]
     fn remove_it_needs_the_record_that_asked() {
         for live in [true, false] {
-            let mut ed = ed(&body());
-            ed.typed("AB");
-            let temp = if live {
-                let (temp, _) = cut_off_leaving_a_temp(&mut ed);
-                ed.save();
-                assert!(live_question(&ed).is_some());
-                let mut slot = ed.win.journal.lock().unwrap();
-                slot.as_mut().unwrap().clear_save().unwrap();
-                temp
-            } else {
-                kill_at(&mut ed, patch::Step::Copy(1));
-                ed.reopen();
-                let temps = ed.temps();
-                for row in &mut ed.win.rows {
-                    if let Row::Edits { orphan, .. } = row {
-                        orphan.save = journal::SaveFile::None;
+            for another in [false, true] {
+                let tag = format!("live={live} another={another}");
+                let mut ed = ed(&body());
+                ed.typed("AB");
+                let (temp, other) = if live {
+                    let (temp, _) = cut_off_leaving_a_temp(&mut ed);
+                    ed.save();
+                    assert!(live_question(&ed).is_some(), "{tag}");
+                    let other = another_temp(temp.to_str().unwrap());
+                    let snap = snapshot_of(&ed.win.doc, ed.win.baseline);
+                    let mut slot = ed.win.journal.lock().unwrap();
+                    let journal = slot.as_mut().unwrap();
+                    journal.clear_save().unwrap();
+                    if another {
+                        // Another Save's record, cut off: its own temp.
+                        journal
+                            .begin_save(
+                                &snap,
+                                journal::Plan::Temp {
+                                    route: journal::Route::ServerCopy,
+                                    target: ed.remote.to_str().unwrap().to_string(),
+                                    temp: other.clone(),
+                                },
+                            )
+                            .unwrap();
+                        journal.save_unknown();
                     }
+                    drop(slot);
+                    (temp, other)
+                } else {
+                    kill_at(&mut ed, patch::Step::Copy(1));
+                    ed.reopen();
+                    let temps = ed.temps();
+                    let temp = ed.remote.parent().unwrap().join(&temps[0]);
+                    let other = another_temp(temp.to_str().unwrap());
+                    for row in &mut ed.win.rows {
+                        if let Row::Edits { orphan, .. } = row {
+                            orphan.save = match (&orphan.save, another) {
+                                (journal::SaveFile::Intent(intent), true) => {
+                                    let mut theirs = (**intent).clone();
+                                    match &mut theirs.phase {
+                                        journal::Phase::Naming { temp }
+                                        | journal::Phase::Created { temp, .. }
+                                        | journal::Phase::Staged { temp, .. }
+                                        | journal::Phase::Renaming { temp, .. } => {
+                                            *temp = other.clone()
+                                        }
+                                        journal::Phase::Writing { .. } => unreachable!(),
+                                    }
+                                    theirs.started += Duration::from_secs(1);
+                                    journal::SaveFile::Intent(Box::new(theirs))
+                                }
+                                _ => journal::SaveFile::None,
+                            };
+                        }
+                    }
+                    (temp, other)
+                };
+                let held = std::fs::read(&temp).unwrap();
+                if live {
+                    ed.frames(2);
+                    ed.drv.click_text(&mut ed.win, "Remove it");
+                    ed.drv.until(&mut ed.win, 30, |w| w.answering.is_none());
+                } else {
+                    ed.press_row("could not verify", RowAction::Remove);
                 }
-                ed.remote.parent().unwrap().join(&temps[0])
-            };
-            let held = std::fs::read(&temp).unwrap();
-            if live {
-                ed.frames(2);
-                ed.drv.click_text(&mut ed.win, "Remove it");
-                ed.drv.until(&mut ed.win, 30, |w| w.answering.is_none());
-            } else {
-                ed.press_row("could not verify", RowAction::Remove);
+                assert_eq!(std::fs::read(&temp).unwrap(), held, "{tag}: removed");
+                let status = ed.win.status.text.clone();
+                assert!(
+                    status.starts_with("the interrupted save's record no longer names ")
+                        && status.ends_with(" — not removed"),
+                    "{tag}: {status}"
+                );
+                // The record there is left as it is.
+                let there: Option<String> = if live {
+                    ed.win
+                        .journal
+                        .lock()
+                        .unwrap()
+                        .as_ref()
+                        .and_then(|j| j.pending_save())
+                        .and_then(file::record_temp)
+                        .map(str::to_string)
+                } else {
+                    ed.win.rows.iter().find_map(|row| match row {
+                        Row::Edits { orphan, .. } => match &orphan.save {
+                            journal::SaveFile::Intent(intent) => {
+                                file::record_temp(intent).map(str::to_string)
+                            }
+                            _ => None,
+                        },
+                        _ => None,
+                    })
+                };
+                assert_eq!(there, another.then_some(other), "{tag}: the record");
             }
-            assert_eq!(std::fs::read(&temp).unwrap(), held, "live={live}: removed");
-            let status = ed.win.status.text.clone();
-            assert!(
-                status.starts_with("the interrupted save's record no longer names ")
-                    && status.ends_with(" — not removed"),
-                "live={live}: {status}"
-            );
         }
     }
 
