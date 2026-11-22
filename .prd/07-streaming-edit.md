@@ -55,7 +55,7 @@ The measurements are in [`research/streaming-edit.md`](research/streaming-edit.m
 | Editor | In memory | In the journal | Size changes? |
 |---|---|---|---|
 | Hex | the patches: offset → (the byte replaced, the byte wanted), from 06 §7.1; the undo steps (at most 100 000) | the patch list, and a hash of each edited 4 KiB page as shown | never |
-| Image | the decoded image and its undo of whole images (at most 32 steps or 1 GiB), as today | the operations in order, and each pasted picture | crop, as today |
+| Image | the decoded image and its undo of whole images (at most 32 steps or 1 GiB), as today | the operations in order from the file as opened or last saved, and each pasted picture (a picture Undo takes back past a Save is not operations on the saved file: it is not kept, §8) | crop, as today |
 | Media (PR #15) | the timeline's clips, Mono → Stereo, the crop, In/Out | the same, in ticks | a render is a new file |
 
 ## 3. The journal
@@ -86,8 +86,12 @@ The journal and §3.1's save reconciliation are **the workstream's reading** of 
       - Hex: the `.hexpatch` text sopen already writes (`HexFile::list_text`), with the byte each run
         replaced (`0xOFF: NEW was OLD`).
       - Image: one line per operation, replayed in order on the decoded original: `crop x,y,w,h`,
-        `pixelize x,y,w,h,block`, `cut x,y,w,h,fill`, `paste x,y,w,h,mode,<sha256>`,
-        `text x,y,w,h,<escaped text>`.
+        `pixelize x,y,w,h,block`, `cut x,y,w,h,fill`, `paste x,y,w,h,mode,background,<sha256>`
+        (mode `stretch`, `fit` or `1:1`; the background is what Fit puts around the picture), and
+        `text x,y,w,h,colour,size,<escaped text>` (size `fill`, or `px=N` for text pasted without
+        a rectangle; `%`, line breaks and other control characters as `%XX`). Colours are
+        `RRGGBBAA`. Every edit is checked against the picture the ones before it leave before
+        the first is applied, so a journal that cannot be replayed whole applies nothing.
       - Media: the clip list in ticks, stereo, the crop, In/Out.
   - **`CURRENT`**: the name of the current generation and its SHA-256, replaced atomically.
   - **`paste-<sha256>.png`** (image): each pasted picture, named by its own hash and never changed.
@@ -220,6 +224,17 @@ before the request that moves the Save to it.
 |---|---|
 | A temp, then a rename: hex server copy (§4.2), hex streamed rewrite (§4.3), image and media upload (`write_atomic`, §8, §9) | `naming` (the temp's name, before the exclusive create) → `created` (after the create's reply: the temp's stat at creation; a hex Save records it again once the temp has its owner and mode, before it is filled) → `staged` (after the last write, the fsync and the check right before the replace, §4.2 step 9: the temp's stat and the post-save evidence) → `renaming` (just before the rename, so `staged` and `renaming` are recorded back to back) → removed once the outcome is recorded |
 | Write in place (§4.4) | `writing` (before the first write: each run's offset, old bytes and new bytes; the undo file is already durable) → removed once the fsync's reply and the `lstat` are recorded |
+
+The image Save's phases (§8, through `RemoteFs::write_atomic_with`) are `naming` (before the
+temp's exclusive create) → `created`, recorded once the temp is created **and written** — one
+step, since `create_from` creates and fills it in one call, so its stat is the written temp's →
+`staged` → `renaming`. A Save cut off inside the create therefore leaves its temp in phase
+`naming`: never assumed sopen's, it is named on the next open and its removal asked (Remove it,
+Keep it). Above 256 MiB its reconciliation reads the target's stat and its first and last MiB,
+nothing between: a target whose stat equals the staged temp's and whose first and last MiB match
+counts as landed even when its middle differs (another writer that put size, modification time,
+owner and mode back) — the journal is retired and nothing is written again, the same best effort
+as §4.5's.
 
 **Post-save evidence by kind.** There are two kinds of evidence, and they are kept apart:
 - **Reconciliation evidence** decides on a reopen whether a cut-off Save landed. It may be cheap to
@@ -687,6 +702,52 @@ size rule. Image and media upload their output, as today.
   (06 §7.3), including after Continue on a large one. No editing-specific budget or confirm exists.
 - **Save** is today's: the local backup (§5.2), encode, stage, then `write_atomic`'s conflict-checked
   overwrite. The content check is the whole hash taken by the streamed read (§4.5).
+  - It runs through `RemoteFs::write_atomic_with`, which sends what `write_atomic` sends and says
+    where it is: the temp's name before its create; the temp once created and written (one
+    step: `create_from` creates and fills it in one call); the staged temp right before the
+    rename; the rename done; a temp of its own removed or left. Each is recorded in the
+    journal's `save` file before the request that follows it (§3.1). Since the temp is recorded
+    only once written, a Save cut off inside the create leaves a temp in phase `naming`, whose
+    removal is asked (Remove it, Keep it).
+  - Progress is the status row (`encoding`, `uploading`, `checking the file`, `replacing the
+    file`). Esc stops it up to the rename — in a window of its own and hosted in the file
+    browser alike: the temp removed, the original untouched, the viewer stays and says so — and
+    is refused from the rename on. Leaving the viewer or closing the window during a Save waits
+    for it (it never cuts a save off) and says it closes when the save is done. The status row
+    starts `saving — editing resumes when the save is done` (§10), then says where the Save is
+    and `Esc stops it`.
+  - Its result line is `saved host:/abs · original backed up at <path>` (§10's `backup <path>`,
+    in the image window's words). A Save that first finds an earlier one of the session, its
+    outcome unknown then, landed writes nothing again and says `… landed (found now): nothing
+    was written again`.
+- **Undo past a Save is not kept.** The journal holds operations from the file as last saved
+  (§2). Undo back past a Save, or an edit made there, leaves a picture no operations on the
+  saved file make: the status bar says `unsaved — NOT kept on disk (undone past the last save,
+  which the journal cannot replay)` (§3) until the next Save, and the close prompt still guards
+  it. A Save of such a picture is the journal's fresh start: the edits after it are kept again.
+- **Nothing waits on the window's thread.** The generation that focus loss, closing and the start
+  of a Save ask for at once (§3) is written on a worker; a Save waits in a queue — taking no
+  edits — until that generation is durable (and until the look for earlier journals is back),
+  then starts; a close or leaving the viewer meanwhile waits for it as for a running Save.
+  The look for earlier journals runs on a worker too, and no generation is written while it
+  is out (it would take a journal being made for an earlier one's). A generation due for a
+  picture that has nothing to keep any more is dropped, not waited for. The journal's removal
+  once nothing is unsaved waits for a generation being written, and a newer edit meanwhile
+  cancels it; Discard's does not.
+- **A temp asked about** (§3.1: phase `naming`, or one that no longer equals the record) is
+  bound to its journal's record and to the file as it was when asked — its stat and, up to
+  256 MiB, its content's SHA-256. The record stays until the question is answered, also when
+  the Save landed (that journal is retired once answered). Remove it reads the file again on a
+  worker and removes it only when it is still that file; otherwise, or when it cannot be checked,
+  the file and the record stay and the row says why. A temp that cannot be read to be checked
+  keeps the record too, for the next open. A removal without asking re-reads the temp's stat
+  right before it and requires the recorded one; where that removal fails, the temp is asked
+  about the same way. A Save in the same session that finds such a
+  temp writes nothing and asks in the window, as a reopen does, bound the same way: the Save
+  waits in its queue for the answer. Keep it leaves the file, ends the record, and the Save goes
+  on; Remove it removes that file on a worker and the Save goes on — or, the file not the one
+  shown or not checkable, keeps it, refuses the Save with why, and the next Save asks about the
+  file there then. Esc drops a Save still in its queue; nothing was sent.
 - **The journal** records the operations and the pasted pictures (§3). A restore replays them on the
   decoded original.
 - **Save As** writes the encoder's output (§7).

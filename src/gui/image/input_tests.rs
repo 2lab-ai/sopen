@@ -230,11 +230,11 @@ fn escape_clears_and_a_handle_drag_resizes() {
 /// that delivered the key or click, so "started" is the job running or its result already in.
 fn wait_for_save(fx: &mut Fixture) {
     assert!(
-        fx.win.job.is_some() || fx.win.status.text.starts_with("saved "),
+        fx.win.saving_or_queued() || fx.win.status.text.starts_with("saved "),
         "no save started: {}",
         fx.win.status.text
     );
-    fx.drv.until(&mut fx.win, 20, |w| w.job.is_none());
+    fx.drv.until(&mut fx.win, 20, |w| !w.saving_or_queued());
 }
 
 #[test]
@@ -1353,7 +1353,7 @@ fn f5_saves_as_command_s_does_and_only_where_it_would() {
     fx.drv.click_text(&mut fx.win, "16");
     assert!(fx.drv.ctx.text_edit_focused());
     fx.key(Key::F5, Modifiers::NONE);
-    assert!(fx.win.job.is_none(), "F5 in a field saves nothing");
+    assert!(!fx.win.saving_or_queued(), "F5 in a field saves nothing");
     assert_eq!(std::fs::read(&fx.path).unwrap(), original);
     fx.drv.ctx.memory_mut(|m| m.stop_text_input());
     fx.drv
@@ -1365,7 +1365,10 @@ fn f5_saves_as_command_s_does_and_only_where_it_would() {
     assert!(!crate::gui::Window::close_requested(&mut fx.win));
     fx.drv.idle(&mut fx.win, 2);
     fx.key(Key::F5, Modifiers::NONE);
-    assert!(fx.win.job.is_none(), "F5 under the prompt saves nothing");
+    assert!(
+        !fx.win.saving_or_queued(),
+        "F5 under the prompt saves nothing"
+    );
     fx.drv.click_text(&mut fx.win, "Cancel");
     // F5 saves.
     fx.key(Key::F5, Modifiers::NONE);
@@ -1383,7 +1386,7 @@ fn f5_saves_as_command_s_does_and_only_where_it_would() {
     let written = std::fs::read(&fx.path).unwrap();
     fx.win.doc.read_only = Some("a test".into());
     fx.key(Key::F5, Modifiers::NONE);
-    assert!(fx.win.job.is_none(), "F5 read-only saves nothing");
+    assert!(!fx.win.saving_or_queued(), "F5 read-only saves nothing");
     assert_eq!(std::fs::read(&fx.path).unwrap(), written);
 }
 
@@ -1396,13 +1399,13 @@ fn f5_saves_only_without_modifiers() {
     assert!(fx.win.doc.dirty());
     for mods in [Modifiers::SHIFT, Modifiers::ALT] {
         fx.key(Key::F5, mods);
-        assert!(fx.win.job.is_none(), "{mods:?}+F5 started a save");
+        assert!(!fx.win.saving_or_queued(), "{mods:?}+F5 started a save");
     }
     fx.key(Key::F5, Modifiers::NONE);
     assert!(
-        fx.win.job.is_some() || fx.win.status.text.starts_with("saved"),
+        fx.win.saving_or_queued() || fx.win.status.text.starts_with("saved"),
         "F5 alone saves: {}",
         fx.win.status.text
     );
-    fx.drv.until(&mut fx.win, 20, |w| w.job.is_none());
+    fx.drv.until(&mut fx.win, 20, |w| !w.saving_or_queued());
 }

@@ -408,13 +408,15 @@ too, where F3 closes it as ⌘W does.
   one that does not end there makes the index unusable and starts a re-read. Offsets from the
   index are always checked.
 - **Leaving a viewer** — Esc or F3 (when the viewer does not use Esc itself: the image and media
-  windows' Esc first clears a drawn rectangle; an Esc that takes the keyboard from a text field
-  is the field's), or closing the window — goes through that viewer's own close question: its
-  unsaved-changes prompt (Save / Discard / Cancel), its "closes when the save is done", its second
-  close during an export. The viewer goes only once it says yes; Esc then shows the list with the
-  bar where it was, and closing the window closes it. Cancel keeps the viewer. A save or export
-  still running when a viewer goes is waited for before sopen exits, its result printed, as its
-  own window's opener does. A fetch running when the window closes is stopped.
+  windows' Esc first clears a drawn rectangle, and while the image window's Save runs, Esc stops
+  that Save before its rename instead — the viewer stays (07 §10); an Esc that takes the keyboard
+  from a text field is the field's), or closing the window — goes through that viewer's own close
+  question: its unsaved-changes prompt (Save / Discard / Cancel), its "closes when the save is
+  done" (leaving never cuts a running save off), its second close during an export. The viewer
+  goes only once it says yes; Esc then shows the list with the bar where it was, and closing the
+  window closes it. Cancel keeps the viewer. A save or export still running when a viewer goes is
+  waited for before sopen exits, its result printed, as its own window's opener does. A fetch
+  running when the window closes is stopped.
 - F4 in a viewer opens its file in the external editor too; the viewer stays.
 - **Without a display** (Linux over ssh) a folder opens in the editor as before message 12, with
   one line on stderr saying why. `SOPEN_LIST` prints the browser's listing (the path, a row per

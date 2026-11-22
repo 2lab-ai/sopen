@@ -1806,55 +1806,6 @@ fn bytes_word(n: usize) -> String {
     }
 }
 
-/// `<file>.journal-<UTC stamp>-<8 hex>` exactly, as `Journal::create` names one.
-fn journal_name(entry: &str, file: &str) -> bool {
-    let Some(id) = entry
-        .strip_prefix(file)
-        .and_then(|rest| rest.strip_prefix(".journal-"))
-    else {
-        return false;
-    };
-    let b = id.as_bytes();
-    b.len() == 25
-        && b[..8].iter().all(u8::is_ascii_digit)
-        && b[8] == b'T'
-        && b[9..15].iter().all(u8::is_ascii_digit)
-        && b[15] == b'Z'
-        && b[16] == b'-'
-        && b[17..]
-            .iter()
-            .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(c))
-}
-
-/// The journals of this file (`abs` on `host`) on disk: each folder named as a journal of it
-/// and — where its generation can be read — written for this host and path (a journal of
-/// another file whose cache path maps to the same place is not this file's: the listing skips
-/// it). One whose generation cannot be read counts: the listing names it too, once its lock is
-/// free. What a listing should find once no other session holds one.
-pub(super) fn this_files_journals(cache: &Path, host: &str, abs: &str) -> Vec<PathBuf> {
-    let base = crate::cache::edits_path(cache, host, abs);
-    let (Some(home), Some(name)) = (base.parent(), base.file_name()) else {
-        return Vec::new();
-    };
-    let file = name.to_string_lossy();
-    let head_is_ours = |dir: &Path| -> bool {
-        let gen = std::fs::read(dir.join("CURRENT"))
-            .ok()
-            .and_then(|bytes| journal::parse_current(&bytes).ok())
-            .and_then(|at| std::fs::read(dir.join(format!("gen-{}", at.n))).ok())
-            .and_then(|bytes| journal::parse_generation(&bytes).ok());
-        gen.is_none_or(|g| g.head.host == host && g.head.path == abs)
-    };
-    std::fs::read_dir(home)
-        .into_iter()
-        .flatten()
-        .flatten()
-        .filter(|e| journal_name(&e.file_name().to_string_lossy(), &file))
-        .map(|e| e.path())
-        .filter(|dir| head_is_ours(dir))
-        .collect()
-}
-
 /// How long a journal whose lock is taken is tried again (§3 Recovery: a child another thread
 /// is starting holds a copy of the lock's descriptor from its fork to its exec).
 const LOCK_RETRY: Duration = Duration::from_millis(500);
@@ -1880,7 +1831,7 @@ pub(super) fn recover(file: &Mutex<HexFile>) -> Vec<Row> {
         .unwrap_or_else(|p| p.into_inner())
         .retries
         .clone();
-    let want = this_files_journals(&cache, &host, &abs).len();
+    let want = journal::this_files_journals(&cache, &host, &abs).len();
     let started = std::time::Instant::now();
     let mut orphans = Vec::new();
     loop {
