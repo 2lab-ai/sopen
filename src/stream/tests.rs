@@ -5,7 +5,7 @@
 
 use super::cache::Protect;
 use super::prefetch::{Access, Admission, Item, Readahead, STATUS_BYTES};
-use super::source::{Engine, Flow, Settings, Traced};
+use super::source::{refetches, Engine, Flow, Refetches, Settings, Traced};
 use super::*;
 use crate::remote::{
     fake, pattern, Asked, Change, Clock, FakeControl, FakeFile, Fault, Fingerprint, Link, Reply,
@@ -531,6 +531,86 @@ fn readahead_targets_stay_inside_what_each_read_allows() {
             "the window reaches its allowance: {r:?}"
         );
     }
+}
+
+/// 06 §12 V16, the refetch a loaded CI runner failed on (block 6 of the playback fixture:
+/// a prefetch of the first reader, then a demand at the third start). A reader's readahead,
+/// still on its way when the reader closes, is cached when it lands — not lost — and the
+/// cache keeps it for any reader. Once evicted (the least recently used, no window over it), a
+/// later reader that reads it waits for it: the block comes again as a demand, though nobody
+/// had waited for it before. That is readahead fetched again, not a block waited for twice;
+/// a block a reader waited for, evicted and waited for again, is.
+#[test]
+fn readahead_landing_after_its_reader_closed_is_kept_and_only_evicted_by_the_budget() {
+    let mut rig = rig(MODEL, Link::gate());
+    let media = ReaderKind::Media { bytes_per_s: 0 };
+    // A reads blocks 0 and 1 in sequence: its window opens, and block 2 goes as readahead.
+    let mut a = rig.reader(media);
+    rig.read(&mut a, 0, BLOCK as usize);
+    rig.read(&mut a, BLOCK, BLOCK as usize);
+    rig.engine.pump();
+    let sent_2 = rig
+        .trace()
+        .iter()
+        .position(|t| t.block == Some(2))
+        .expect("block 2 went as readahead");
+    assert_eq!(rig.trace()[sent_2].class, Some(Class::Prefetch));
+    // It is on its way when A closes; then it lands.
+    assert!(!rig.source().core().cache.contains(2), "still on its way");
+    drop(a);
+    rig.drain();
+    assert!(rig.source().core().cache.contains(2), "kept once it landed");
+    // B reads it: from the cache, nothing fetched.
+    let n = rig.trace().len();
+    let mut b = rig.reader(media);
+    rig.read(&mut b, 2 * BLOCK, 100);
+    drop(b);
+    assert_eq!(rig.trace().len(), n, "block 2 came from the cache");
+    // C reads on far away, past the cache's budget: blocks 0–2, under no window, go first.
+    let mut c = rig.reader(media);
+    let far = 1000 * BLOCK;
+    rig.stream(&mut c, far, far + CACHE_BYTES + 8 * BLOCK, BLOCK as usize);
+    drop(c);
+    rig.drain();
+    let cache_has = |b: u64| rig.source().core().cache.contains(b);
+    assert!(!cache_has(0) && !cache_has(2), "evicted by the budget");
+    let before = refetches(&rig.trace());
+    // D waits for block 2 again — readahead fetched again, a demand this time —, and E for
+    // block 0, which A had waited for: a block waited for twice.
+    let mut d = rig.reader(media);
+    rig.read(&mut d, 2 * BLOCK, 100);
+    drop(d);
+    let after_d = refetches(&rig.trace());
+    let last_2 = rig
+        .trace()
+        .iter()
+        .rposition(|t| t.block == Some(2))
+        .unwrap();
+    assert_eq!(
+        rig.trace()[last_2].class,
+        Some(Class::Demand),
+        "D waited for it"
+    );
+    assert_eq!(
+        (
+            after_d.readahead - before.readahead,
+            after_d.waited_twice - before.waited_twice
+        ),
+        (BLOCK, 0),
+        "readahead fetched again, not a block waited for twice"
+    );
+    let mut e = rig.reader(media);
+    rig.read(&mut e, 0, 100);
+    drop(e);
+    let after_e = refetches(&rig.trace());
+    assert_eq!(
+        after_e,
+        Refetches {
+            readahead: after_d.readahead,
+            waited_twice: after_d.waited_twice + BLOCK,
+        },
+        "block 0, waited for by A, waited for again"
+    );
 }
 
 // ---- the first screen ----
