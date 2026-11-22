@@ -171,8 +171,20 @@ fn connect(server: &Server) -> TcpStream {
     stream
 }
 
+/// One scan of this process's descriptors at a time: the duplicates a scan makes live only
+/// while it holds this, so no scan finds another's.
+static SCAN: Mutex<()> = Mutex::new(());
+
 /// The descriptors of this process that are a socket listening on `127.0.0.1:port`.
+///
+/// Other tests close and open descriptors all the while, so a number asked twice could name
+/// an accepted connection on the port the first time and another test's listener the second
+/// (`after_the_drop_…` looks while its connections' threads are closing them). A number bound
+/// to the port is duplicated, and both questions are asked of the duplicate: one socket,
+/// whatever becomes of the number meanwhile. Nothing else is duplicated.
 fn listening(port: u16) -> Vec<i32> {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    let _one = SCAN.lock().unwrap_or_else(|e| e.into_inner());
     let dir = if cfg!(target_os = "linux") {
         "/proc/self/fd"
     } else {
@@ -182,14 +194,24 @@ fn listening(port: u16) -> Vec<i32> {
         .expect("this process's descriptors")
         .filter_map(|entry| entry.ok()?.file_name().to_str()?.parse().ok())
         .collect();
+    let on_port = |fd| bound_to(fd) == Some((Ipv4Addr::LOCALHOST, port));
     fds.into_iter()
-        .filter(|&fd| bound_to(fd) == Some((Ipv4Addr::LOCALHOST, port)) && listens_on(fd))
+        .filter(|&fd| {
+            if !on_port(fd) {
+                return false;
+            }
+            // SAFETY: `fcntl` makes a new descriptor, this scan's own, or fails (the number
+            // was closed meanwhile); `OwnedFd` closes the new one when it drops.
+            let owned = match unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) } {
+                -1 => return false,
+                copy => unsafe { OwnedFd::from_raw_fd(copy) },
+            };
+            on_port(owned.as_raw_fd()) && listens_on(owned.as_raw_fd())
+        })
         .collect()
 }
 
-/// The IPv4 address and port the socket `fd` is bound to, if it is an IPv4 socket. Any
-/// descriptor will do: one another thread closes or reuses meanwhile only makes the call
-/// fail, or answer for what it is now.
+/// The IPv4 address and port the socket `fd` is bound to, if it is an IPv4 socket.
 fn bound_to(fd: i32) -> Option<(Ipv4Addr, u16)> {
     let mut addr = std::mem::MaybeUninit::<libc::sockaddr_storage>::zeroed();
     let mut len = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
@@ -264,13 +286,36 @@ fn listens(server: &Server) -> u16 {
 /// the socket takes connections until its last copy is gone. That copy is not the server's,
 /// so the wait for the refusal only catches a hang; the server's own part is the descriptor,
 /// looked at once, right after the drop.
+///
+/// Only a refusal ends the wait. A probe such a copy takes is closed at once. One its full
+/// accept queue leaves unanswered — TCP would send its SYN again only a second or more later —
+/// gives up after [`PROBE`], within what is left of the wait, and the next probe goes.
 fn closed(port: u16) {
     let open = listening(port);
     assert!(open.is_empty(), "the listener is still open: {open:?}");
-    eventually("the port refuses", || {
-        TcpStream::connect(("127.0.0.1", port)).is_err()
-    });
+    let at = std::net::SocketAddr::from((Ipv4Addr::LOCALHOST, port));
+    let started = Instant::now();
+    let mut last = String::new();
+    loop {
+        let left = HANG.saturating_sub(started.elapsed());
+        assert!(
+            !left.is_zero(),
+            "the port refuses: not in {HANG:?} (the last probe: {last})"
+        );
+        match TcpStream::connect_timeout(&at, left.min(PROBE)) {
+            Err(e) if e.kind() == ErrorKind::ConnectionRefused => return,
+            Err(e) => last = e.to_string(),
+            Ok(taken) => {
+                drop(taken);
+                last = "taken".into();
+            }
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
 }
+
+/// The longest one probe of [`closed`] waits for an answer.
+const PROBE: Duration = Duration::from_millis(100);
 
 /// `/<token>/<kind>/m.mp4`.
 fn target(server: &Server, kind: Kind) -> String {
