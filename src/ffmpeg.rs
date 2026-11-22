@@ -259,10 +259,16 @@ impl Served {
         Ok(Self::new(server, source, name, shown, fastseek))
     }
 
-    /// The input of `kind`: its URL, with `-protocol_whitelist http,tcp` before it (06 §9),
-    /// and `-fflags +fastseek` for a `play` input of a file that seeks fast.
+    /// The input of `kind`: its URL, with a receive buffer of [`RECV_BUFFER`] and
+    /// `-protocol_whitelist http,tcp` before it (06 §9), and `-fflags +fastseek` for a `play`
+    /// input of a file that seeks fast.
     pub fn input(self: &Arc<Self>, kind: Kind) -> Input {
-        let mut options: Vec<OsString> = vec!["-protocol_whitelist".into(), "http,tcp".into()];
+        let mut options: Vec<OsString> = vec![
+            "-recv_buffer_size".into(),
+            RECV_BUFFER.to_string().into(),
+            "-protocol_whitelist".into(),
+            "http,tcp".into(),
+        ];
         if self.fastseek && kind == Kind::Play {
             options.extend(["-fflags".into(), "+fastseek".into()]);
         }
@@ -341,6 +347,13 @@ fn replace_endpoint(text: &str, endpoint: &str, with: &str) -> String {
     out.push_str(rest);
     out
 }
+
+/// The receive buffer every ffmpeg input of the byte server is given (06 §9): the client's
+/// half of how far a connection is read ahead of what ffmpeg has taken, the server's send
+/// buffer being the other (`stream::http::SEND_BUFFER`). Left to Linux it grows with a client
+/// that reads fast, to MBs: a 24-input render had that much read for each input past its piece,
+/// and the cache let blocks go that another input then read again (W7, measured).
+pub const RECV_BUFFER: u32 = 64 << 10;
 
 /// Starts an ffmpeg or ffprobe run. Every run on a media file goes through here or
 /// [`output`], so the tests can count them per file ([`spawns`]): editing must start none.

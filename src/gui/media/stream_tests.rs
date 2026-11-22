@@ -418,8 +418,9 @@ fn v16_playback_of_an_edit_fetches_within_its_bound() {
 
 /// What a playback start of [`v16_playback_of_an_edit_fetches_within_its_bound`] may fetch
 /// again: a regression threshold for this fixture (06 §12 V16). Measured with the server's
-/// send buffer bounded ([`SEND_BUFFER`]; ffmpeg 9.0.2, three runs each): at most 16 blocks
-/// (1 MiB) a start on macOS and on Linux, every second fetch a prefetch in the engine's trace —
+/// send buffer and ffmpeg's receive buffer bounded ([`SEND_BUFFER`], `ffmpeg::RECV_BUFFER`;
+/// ffmpeg 9.0.2, 10 runs on macOS, 20 on Linux): at most 1.19 MiB a start on macOS and 1 MiB on
+/// Linux, every second fetch a prefetch in the engine's trace —
 /// no block a reader waited for came twice. Each decoder opens this `moov`-at-the-end file at
 /// byte 0, reads a few KB and seeks to the `moov`; meanwhile the server fills that connection's
 /// socket from the cached head, each read a sequential hit that grows its reader's readahead,
@@ -673,6 +674,8 @@ enum CancelAt {
 /// What a [`Publishing`] saw.
 #[derive(Default, Debug)]
 struct Seen {
+    /// The size of the file being uploaded (the rendered export).
+    total: Option<u64>,
     /// The bytes in the remote temp when the Cancel landed, and when the temp was removed.
     at_cancel: Option<u64>,
     at_removal: Option<u64>,
@@ -737,6 +740,7 @@ impl RemoteFs for Publishing {
         stop: &dyn Fn() -> bool,
     ) -> std::result::Result<crate::remote::Uploaded, crate::remote::CreateError> {
         let (owner, seen) = (self.stop.clone(), self.seen.clone());
+        seen.lock().unwrap().total = std::fs::metadata(local).ok().map(|m| m.len());
         let fired = std::cell::Cell::new(false);
         let checked = || {
             if let CancelAt::MidUpload(at) = self.at {
@@ -879,6 +883,9 @@ fn v22_export_cancel_at_each_step() {
             seen.at_cancel.expect("the Cancel landed mid-upload"),
             seen.at_removal.expect("the temp was removed"),
         );
+        let total = seen.total.expect("an upload");
+        // Mid-way: part of the file was in the temp when the Cancel landed, not all of it.
+        assert!(0 < at_cancel && at_cancel < total, "{seen:?}");
         assert!(
             at_removal <= at_cancel + (256 << 10),
             "{seen:?}: written after the Cancel"
@@ -985,17 +992,26 @@ fn v16_every_run_on_a_stream_has_an_owner_that_frees_its_seats() {
         // test moves, only once the run's seat is held, by the real limits.
         let args = media.input.of_kind(Kind::Render).args();
         let hand = t.hand();
-        let now = hand.clock();
+        // The runs' clock, counting its reads: the first is the owner's start (the watchdog's,
+        // the probe's deadline), and the clock moves only after it.
+        let reads = AtomicUsize::new(0);
+        let now = || {
+            let at = hand.now();
+            reads.fetch_add(1, SeqCst);
+            at
+        };
         let seated = || {
             until("the run holds its seat", || seats() >= 1);
-            // Its client neither reads nor closes: the seat stays while nothing moves.
-            std::thread::sleep(Duration::from_millis(300));
+            until("the run's owner has started its clock", || {
+                reads.load(SeqCst) >= 1
+            });
             assert!(seats() >= 1, "the seat is held");
         };
+        reads.store(0, SeqCst);
         std::thread::scope(|scope| {
             let run = scope.spawn(|| {
                 let watched = ffmpeg::Watched {
-                    now: &*now,
+                    now: &now,
                     ..ffmpeg::Watched::plain()
                 };
                 ffmpeg::run_stoppable(&held, &args, 1.0, &mut |_| {}, ffmpeg::STALL_LIMIT, watched)
@@ -1007,9 +1023,10 @@ fn v16_every_run_on_a_stream_has_an_owner_that_frees_its_seats() {
             assert!(format!("{err:#}").contains("no progress"), "{err:#}");
         });
         until("a stopped export's seat is free", || seats() == 0);
+        reads.store(0, SeqCst);
         std::thread::scope(|scope| {
             let run = scope.spawn(|| {
-                ffmpeg::probe_timed(&held, &media.input, "v.mp4", ffmpeg::PROBE_LIMIT, &*now)
+                ffmpeg::probe_timed(&held, &media.input, "v.mp4", ffmpeg::PROBE_LIMIT, &now)
             });
             seated();
             assert!(!run.is_finished(), "nothing stops it before its time");
@@ -1369,7 +1386,8 @@ fn idle_stepped(source: &Source, engine: &mut Engine) {
 
 /// 06 §9 and §12 V20's last item: every ffmpeg and ffprobe run on a remote input — the probe,
 /// playback's picture and sound, the paused frame, the waveform, a render of two inputs — has
-/// `-protocol_whitelist http,tcp` before each of its URLs, and reads the URL of its own reader
+/// a bounded receive buffer (`-recv_buffer_size`) and `-protocol_whitelist http,tcp` before
+/// each of its URLs, and reads the URL of its own reader
 /// kind (06 §7.4: `play`, `bulk`, `render`). A stand-in records each command line and fails
 /// (it asks the real ffmpeg for its encoders, which a render looks up first).
 #[test]
@@ -1450,14 +1468,19 @@ fn every_run_on_a_stream_reads_its_kind_behind_the_whitelist() {
         let mut kinds = std::collections::BTreeMap::new();
         for line in lines.lines().filter(|l| l.contains("http://")) {
             let urls = line.matches("http://").count();
-            let guarded = line.matches("-protocol_whitelist http,tcp http://").count()
+            let guard = format!(
+                "-recv_buffer_size {} -protocol_whitelist http,tcp",
+                ffmpeg::RECV_BUFFER
+            );
+            let guarded = line.matches(&format!("{guard} http://")).count()
+                + line.matches(&format!("{guard} -i http://")).count()
                 + line
-                    .matches("-protocol_whitelist http,tcp -i http://")
-                    .count()
-                + line
-                    .matches("-protocol_whitelist http,tcp -fflags +fastseek -i http://")
+                    .matches(&format!("{guard} -fflags +fastseek -i http://"))
                     .count();
-            assert_eq!(guarded, urls, "a URL without its whitelist: {line}");
+            assert_eq!(
+                guarded, urls,
+                "a URL without its receive buffer and whitelist: {line}"
+            );
             let kind = ["/play/", "/bulk/", "/render/"]
                 .into_iter()
                 .find(|k| line.contains(k))
@@ -1912,7 +1935,9 @@ fn v22_cancel_during_a_large_upload_stops_sending() {
         eprintln!("an upload of {size} bytes, cancelled: {seen:?}");
         let at_cancel = seen.at_cancel.expect("the Cancel landed mid-upload");
         let at_removal = seen.at_removal.expect("the temp was removed");
-        assert!(at_cancel >= 8 * MIB && at_cancel < size, "{seen:?}");
+        let total = seen.total.expect("an upload");
+        assert!(total >= size, "{seen:?}: the whole export is uploaded");
+        assert!(at_cancel >= 8 * MIB && at_cancel < total, "{seen:?}");
         assert!(
             at_removal <= at_cancel + (256 << 10),
             "{} bytes written after the Cancel",
@@ -2085,10 +2110,12 @@ fn slow_reader(dir: &Path) -> Tools {
 }
 
 /// 06 §7.4: a render's watchdog counts its input going on as progress — the bytes the byte
-/// server got onto the run's socket. On a clock the test moves only once the watchdog itself
-/// has read a count higher than at the last move — each move 0.8 × the limit, several in all,
-/// far past the limit with no output — a run being fed is not stopped. One that takes nothing
-/// gives the server nothing to send: once the count stands, moved past its limit once, it is
+/// server got onto the run's socket. The clock moves inside the watchdog's own read of the
+/// count, each time it is higher than at the last move, by 0.8 × the limit: so the watchdog
+/// reads the moved time for the wait it resets, and never sees a move it has not reset for.
+/// Several moves, far past the limit with no output, and a run being fed is not stopped. One
+/// that takes nothing gives the server nothing to send: once the watchdog has read the same
+/// count twice running (the reset for it done), the clock moves past the limit once, and it is
 /// stopped, and its seat comes back. The file (24 MB) and what the reader takes (12.5 MiB) are
 /// larger than the sockets' buffers on either platform.
 #[test]
@@ -2105,15 +2132,30 @@ fn a_render_fed_by_its_input_is_not_stopped_and_one_starved_is() {
         let render = media.input.of_kind(Kind::Render);
         let args = render.args();
         let limit = ffmpeg::STALL_LIMIT;
-        // What the watchdog last read of the count.
-        let read = AtomicU64::new(0);
-        let fed = || {
-            let n = render.fed();
-            read.store(n, SeqCst);
-            n
-        };
         let hand = t.hand();
         let now = hand.clock();
+        // What the watchdog last read of the count, and how many of its reads running gave it.
+        let (last, same) = (AtomicU64::new(0), AtomicUsize::new(0));
+        // While `moving`, a higher count moves the clock, before the watchdog reads the time.
+        let (moving, moved_at, moves) = (
+            AtomicBool::new(true),
+            AtomicU64::new(0),
+            AtomicUsize::new(0),
+        );
+        let fed = || {
+            let n = render.fed();
+            if last.swap(n, SeqCst) == n {
+                same.fetch_add(1, SeqCst);
+            } else {
+                same.store(0, SeqCst);
+            }
+            if moving.load(SeqCst) && n > moved_at.load(SeqCst) {
+                moved_at.store(n, SeqCst);
+                hand.advance(limit.mul_f64(0.8));
+                moves.fetch_add(1, SeqCst);
+            }
+            n
+        };
         // The run's watch, made on the run's own thread.
         let run_on = |tools: &Tools| {
             let watched = ffmpeg::Watched {
@@ -2124,30 +2166,13 @@ fn a_render_fed_by_its_input_is_not_stopped_and_one_starved_is() {
             ffmpeg::run_stoppable(tools, &args, 1.0, &mut |_| {}, limit, watched)
         };
         let reader = slow_reader(dir.path());
-        let moves = std::thread::scope(|scope| {
-            let run = scope.spawn(|| run_on(&reader));
-            let (mut moves, mut acked) = (0, 0);
-            while !run.is_finished() {
-                // The watchdog has read more than at the last move: it reset its wait then.
-                let give_up = Instant::now() + Duration::from_secs(20);
-                while read.load(SeqCst) <= acked && !run.is_finished() {
-                    assert!(Instant::now() < give_up, "nothing more was sent");
-                    std::thread::sleep(Duration::from_millis(2));
-                }
-                let now_read = read.load(SeqCst);
-                if now_read > acked {
-                    acked = now_read;
-                    hand.advance(limit.mul_f64(0.8));
-                    moves += 1;
-                }
-            }
-            run.join().unwrap().expect("fed, it is not stopped");
-            moves
-        });
+        run_on(&reader).expect("fed, it is not stopped");
+        let moves = moves.load(SeqCst);
         assert!(
             moves >= 3,
             "{moves} moves of 0.8 × the limit: past it, with no output"
         );
+        moving.store(false, SeqCst);
         let held = holder(dir.path());
         let server = media.input.served().unwrap().server();
         std::thread::scope(|scope| {
@@ -2156,15 +2181,19 @@ fn a_render_fed_by_its_input_is_not_stopped_and_one_starved_is() {
                 server.watch().open() >= 1
             });
             // What the sockets take is sent; then nothing more goes, and the watchdog has read
-            // that.
+            // that count in a later read than the one that first gave it.
             let mut sent = render.fed();
             loop {
                 std::thread::sleep(Duration::from_millis(300));
-                if render.fed() == sent && read.load(SeqCst) == sent {
+                if render.fed() == sent {
                     break;
                 }
                 sent = render.fed();
             }
+            until("the watchdog has read the count it stands at twice", || {
+                last.load(SeqCst) == sent && same.load(SeqCst) >= 1
+            });
+            assert_eq!(render.fed(), sent, "nothing more went");
             assert!(!run.is_finished(), "nothing stops it before its time");
             hand.advance(limit + Duration::from_secs(1));
             let err = run.join().unwrap().unwrap_err();
@@ -2195,9 +2224,10 @@ fn the_watchdog_counts_input_as_progress() {
 
 /// `RemoteFs::create_from_stoppable` (06 §7.4's upload Cancel), on SFTP and on a local disk: a
 /// stop that comes after a few chunks ends the upload there — far short of the file, the error
-/// a Cancel, the path the caller's to remove.
+/// a Cancel, the path the caller's to remove. On SFTP the handle's close is in the server's log
+/// when the call returns.
 #[test]
-fn an_upload_stops_between_chunks() {
+fn an_upload_stops_between_chunks_its_close_logged_by_the_return() {
     let tmp = tempfile::tempdir().unwrap();
     let src = tmp.path().join("big");
     std::fs::write(&src, vec![7u8; 32 << 20]).unwrap();
@@ -2226,13 +2256,15 @@ fn an_upload_stops_between_chunks() {
         let len = std::fs::metadata(&dst).unwrap().len();
         assert!(len <= 4 << 20, "{what}: {len} bytes went before the stop");
         if what == "sftp" {
-            // Closed by the time the stop returned: not left to a dropped handle's close, which
-            // is sent but not waited for.
+            // The close is in the server's log when the call returns. That is all this shows:
+            // not that its reply was waited for. With the handle dropped unclosed instead (the
+            // code before), the drop's close was not in the log at that moment in 6 runs of 6
+            // (macOS).
             let said = std::fs::read_to_string(&log).unwrap();
             let closed = format!("close \"{}\"", dst.display());
             assert!(
                 said.contains(&closed),
-                "{what}: the handle is not closed: {said}"
+                "{what}: no close in the log: {said}"
             );
         }
         // Unstopped, the whole file goes.
@@ -2344,10 +2376,11 @@ fn receive_buffer_of(socket: &std::net::TcpStream) -> u64 {
 }
 
 /// 06 §7.4, V16: every connection's send buffer is bounded ([`SEND_BUFFER`]; Linux keeps twice
-/// what is asked). A 48 MB body read as fast as the client can never has it grown past that —
-/// left alone, Linux grows it to MBs. And a client that stops reading, after 8 MiB, has been
+/// what is asked, macOS what is asked). A 48 MB body read as fast as the client can never has
+/// it grown past that — left alone, Linux grows it to 2.5 MiB, macOS to 170–230 KB. And a client that stops reading, after 8 MiB, has been
 /// sent no more than it read, what its own socket holds, the server's buffer and the block in
-/// hand.
+/// hand — counted once the server's write has found no room left and then waited a tick with
+/// nothing taken (the `body_blocked` and `evaluated` seams).
 #[test]
 fn a_connection_is_read_ahead_of_its_client_by_one_send_buffer_at_most() {
     bounded(120, |t| {
@@ -2363,19 +2396,36 @@ fn a_connection_is_read_ahead_of_its_client_by_one_send_buffer_at_most() {
         };
         let biggest = Arc::new(AtomicUsize::new(0));
         let seen = biggest.clone();
+        // When a body's write found no room (its client takes none), and when a write's wait
+        // ran out with nothing taken (every 50 ms while it waits).
+        let blocked: Arc<Mutex<Vec<Instant>>> = Arc::default();
+        let waited: Arc<Mutex<Vec<Instant>>> = Arc::default();
+        let (b, w) = (blocked.clone(), waited.clone());
         let config = Config {
             clock: Arc::new(Instant::now),
-            tick: None,
+            tick: Some(Duration::from_millis(50)),
             seams: Seams {
                 send_buffer: Some(Arc::new(move |_, size| {
                     seen.fetch_max(size, SeqCst);
+                })),
+                body_blocked: Some(Arc::new(move |_, _| {
+                    b.lock().unwrap().push(Instant::now());
+                })),
+                evaluated: Some(Arc::new(move |_, _, _| {
+                    w.lock().unwrap().push(Instant::now());
                 })),
                 ..Seams::default()
             },
         };
         let server = Server::start_with(source.clone(), config).unwrap();
         let url = server.url(Kind::Bulk, "big");
-        let bound = 2 * SEND_BUFFER;
+        // What the kernel keeps of the size asked: Linux twice it (for its bookkeeping), macOS
+        // just it — and left alone, more than that on either.
+        let bound = if cfg!(target_os = "linux") {
+            2 * SEND_BUFFER
+        } else {
+            SEND_BUFFER
+        };
         let mut fast = get(&url);
         assert!(
             read_up_to(&mut fast, u64::MAX) > size,
@@ -2389,15 +2439,22 @@ fn a_connection_is_read_ahead_of_its_client_by_one_send_buffer_at_most() {
         let before = server.sent(Kind::Bulk);
         let mut slow = get(&url);
         let read = read_up_to(&mut slow, 8 << 20);
-        let mut sent = server.sent(Kind::Bulk) - before;
-        loop {
-            std::thread::sleep(Duration::from_millis(300));
-            let now = server.sent(Kind::Bulk) - before;
-            if now == sent {
-                break;
+        let stopped = Instant::now();
+        // The server has filled what the sockets hold: its write found no room after the stop,
+        // then waited a whole tick with nothing taken, and nothing went meanwhile. (A buffer
+        // the kernel grows lets the write go on: then it is waited for again.)
+        let after =
+            |at: &Mutex<Vec<Instant>>, from: Instant| at.lock().unwrap().iter().any(|t| *t >= from);
+        until("the body's write finds no room", || {
+            after(&blocked, stopped)
+        });
+        let sent = loop {
+            let (from, sent) = (Instant::now(), server.sent(Kind::Bulk) - before);
+            until("the write waits a tick", || after(&waited, from));
+            if server.sent(Kind::Bulk) - before == sent {
+                break sent;
             }
-            sent = now;
-        }
+        };
         let theirs = receive_buffer_of(&slow);
         let ahead = sent - read;
         eprintln!(
@@ -2414,13 +2471,14 @@ fn a_connection_is_read_ahead_of_its_client_by_one_send_buffer_at_most() {
     });
 }
 
-/// An SFTP upload whose write fails part way (here the 3rd chunk's, as a test's seam has it)
-/// has closed its remote handle by the time it returns — the log of the session's requests
-/// (`sftp-server -l INFO`) has the close, though nothing was sent since — and the error is
-/// one with the file made. Through the publishing of a sibling, the temp is removed and
-/// nothing is published.
+/// An SFTP upload whose write fails part way (here the 3rd chunk's, as a test's seam has it):
+/// the handle's close is in the server's log of the session's requests (`sftp-server -l INFO`)
+/// when the call returns, and the error is one with the file made. That is all the log shows —
+/// not that the close's reply was waited for. With the handle dropped unclosed instead (the
+/// code before), the drop's close was not in the log at that moment in 4 runs of 4 (macOS).
+/// Through the publishing of a sibling, the temp is removed and nothing is published.
 #[test]
-fn a_failed_upload_closes_its_handle_and_its_temp_goes() {
+fn a_failed_upload_s_close_is_logged_by_the_return_and_its_temp_goes() {
     let tmp = tempfile::tempdir().unwrap();
     let src = tmp.path().join("big");
     std::fs::write(&src, vec![7u8; 4 << 20]).unwrap();
@@ -2443,7 +2501,7 @@ fn a_failed_upload_closes_its_handle_and_its_temp_goes() {
     assert_eq!(err.created, crate::remote::Created::Yes);
     let said = std::fs::read_to_string(&log).unwrap();
     let closed = format!("close \"{}\"", up.display());
-    assert!(said.contains(&closed), "the handle is not closed: {said}");
+    assert!(said.contains(&closed), "no close in the log: {said}");
     std::fs::remove_file(&up).unwrap();
     // Publishing a sibling: the temp it wrote goes, and nothing is named.
     let err = fs
@@ -2454,7 +2512,7 @@ fn a_failed_upload_closes_its_handle_and_its_temp_goes() {
     let temp_closed = said
         .lines()
         .any(|l| l.contains("close \"") && l.contains(".up.sopen-"));
-    assert!(temp_closed, "the temp's handle is not closed: {said}");
+    assert!(temp_closed, "no close of the temp in the log: {said}");
     let left: Vec<_> = std::fs::read_dir(&out).unwrap().flatten().collect();
     assert!(left.is_empty(), "left in the folder: {left:?}");
 }
