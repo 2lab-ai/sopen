@@ -501,8 +501,11 @@ pub(crate) struct Browser {
     status: Status,
     launches: Vec<Receiver<Result<String>>>,
     leftover: Rc<RefCell<Leftover>>,
-    /// A widget had the keyboard at the end of the last pass: an Esc that took it away was that
-    /// widget's (a text field's), not a request to leave the viewer.
+    /// A text field had the keyboard at the end of the last pass: an Esc that took it away was
+    /// that field's, not a request to leave the viewer. Only a text field: a viewer's own grid
+    /// (the hex window's) holds the keyboard too, and egui lets Esc take it from the grid on the
+    /// pass after the grid first took it (its lock filter applies from its second focused pass)
+    /// — that Esc is the owner's leaving.
     focused_before: bool,
     /// Rows the active panel shows (the last pass's).
     visible: usize,
@@ -1467,8 +1470,11 @@ impl Browser {
         };
         let ((), asked) = super::host_pass(&ctx, || viewer.embedded.window.ui(ui));
         // 06 §7.3: the image gave way to the hex window (Hex view, a file that does not
-        // decode) — on the same stream, in its place, nothing read again.
-        if let Some((file, notices)) = viewer.switch.as_ref().and_then(|s| s.take()) {
+        // decode) — on the same stream, in its place, nothing read again. Unless the owner left
+        // in the same pass (its Esc asked the image window to close): then the hex window is
+        // not made, and its file — the stream with it — goes; the viewer closes below.
+        let given_way = viewer.switch.as_ref().and_then(|s| s.take());
+        if let Some((file, notices)) = given_way.filter(|_| !asked) {
             let abs = viewer.abs.clone();
             self.drop_viewer();
             self.view(&ctx, super::hex::embed(file, notices), None, abs, None);
@@ -1891,7 +1897,7 @@ impl Window for Browser {
         if working {
             ctx.request_repaint_after(Duration::from_millis(100));
         }
-        self.focused_before = ctx.memory(|m| m.focused()).is_some();
+        self.focused_before = ctx.text_edit_focused();
         self.painted = true;
     }
 
