@@ -341,6 +341,12 @@ impl Prefetcher {
         all
     }
 
+    /// Tests: the readers open now, by id.
+    #[cfg(test)]
+    pub fn open_ids(&self) -> Vec<u64> {
+        self.readers.keys().copied().collect()
+    }
+
     /// Tests: the id the last reader opened was given.
     #[cfg(test)]
     pub fn last_id(&self) -> u64 {
