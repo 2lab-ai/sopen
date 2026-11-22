@@ -490,6 +490,49 @@ fn a_bulk_readers_waiting_block_goes_before_older_bulk_readahead() {
     );
 }
 
+/// Every targeting queues only what its read allows (`legal_reach`, worked out from the read
+/// and the readahead rule): a media reader reading in sequence, then jumping, then reading on;
+/// an interactive reader the same, its targets behind it too. The window reaches its allowance
+/// and goes no further.
+#[test]
+fn readahead_targets_stay_inside_what_each_read_allows() {
+    let mut pf = Prefetcher::default();
+    let now = Instant::now();
+    let none = |_: u64| false;
+    let nothing = |_: u64| None;
+    let size = 4 * GIB;
+    for kind in [
+        ReaderKind::Media {
+            bytes_per_s: 500_000,
+        },
+        ReaderKind::Interactive,
+        ReaderKind::Bulk,
+    ] {
+        let id = pf.open(kind);
+        let mut off = 0;
+        for step in 0..40u64 {
+            if step == 20 {
+                off = GIB;
+            }
+            let len = if step % 3 == 0 { BLOCK / 2 } else { BLOCK + 7 };
+            pf.access(id, off, off + len, size, now, &nothing, &none, &none);
+            off += len;
+        }
+        pf.close(id);
+    }
+    let reaches = pf.reaches();
+    assert_eq!(reaches.len(), 3);
+    for r in &reaches {
+        assert!(r.targeted >= 30, "{r:?}");
+        assert_eq!(r.outside, None, "{r:?}");
+        assert_eq!(
+            r.widest,
+            limits(r.kind).0,
+            "the window reaches its allowance: {r:?}"
+        );
+    }
+}
+
 // ---- the first screen ----
 
 /// One block and its fence, and then nothing: the readahead window is 0 at open, and the

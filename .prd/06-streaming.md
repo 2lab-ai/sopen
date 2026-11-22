@@ -1648,33 +1648,54 @@ stream <event> t=<ms> <host:/abs> fetched=<b> demand=<b> prefetch=<b> bulk=<b> d
       counter: W7's gate reads it from the engine's trace of what it sent
       (`src/gui/media/stream_tests.rs`).
     - **On W7's `lavfi` fixture of that shape** (600 s at 4 Mbit/s, a key frame every 8 s, the
-      `moov` at the end, 320×240) the gate holds `refetched` to **1.5 MiB per start**, and no
-      block a decoder waited for may come twice. Measured with §9's send and receive buffers
-      (ffmpeg 9.0.2; 10 runs on macOS, 20 on Linux; bytes fetched again at the starts from 5 s,
-      45 s and 85 s):
+      `moov` at the end, 320×240) the gate does not fix a figure for `refetched`: it grows with
+      load. It holds what the engine is allowed to do instead, per start, from the engine's
+      own records (test-only `Prefetcher::reaches`):
+      - no block a decoder waited for comes twice;
+      - no reader's readahead window is ever wider than its `ahead`;
+      - every time a reader's prefetch targets are set, they lie inside what that read allows
+        (test-only `legal_reach`). The allowance is worked out again from the read and §4's
+        rule alone: from the read's offset to its end plus the window, where the window is
+        twice the one before (at least a block, at most `ahead`) on a sequential hit and 0
+        otherwise. An interactive reader is allowed at least its read's length ahead, and as
+        far behind. The targets the code made are not used to work it out;
+      - no block is fetched twice within the start;
+      - every block that comes again lies inside what a reader of that start read or was
+        allowed to read ahead, by that same allowance. So `refetched` ≤ the blocks fetched
+        before the start inside that reach: 0.8–2.2 MiB at the 5 s start, 1.7–6.2 MiB at the
+        later ones (both platforms, loaded).
+      - The render gate and a unit test of the prefetcher (`stream/tests.rs`) check the same
+        allowance on every reader.
+    - Why it grows with load. Each decoder opens this `moov`-at-the-end file at byte 0 (and
+      again at byte 48), reads a few KB and seeks to the `moov`. Meanwhile the server fills
+      that connection's socket from the cached head. Each read is a sequential hit that doubles
+      the reader's readahead (`Readahead::access`), to MBs within a few blocks: in every start
+      the widest window was the full `ahead`, 5.1 MB. Its prefetch past the cached head drains for
+      as long as ffmpeg keeps the connection open. Those blocks, evicted since an earlier start
+      read them, come again; no reader waits for them, and they are evicted outside every live
+      window.
+      - Idle, ffmpeg closes such a connection 1–5 ms after opening it.
+      - Loaded on macOS (W7: 36 busy loops on 18 cores, and the rest of the lib suite run over
+        and over alongside; on Linux, twice as many busy loops as cores), one start's first
+        frame came after 1.56 s (0.1–0.3 s otherwise). Its opening connections stayed open
+        190–320 ms, draining 7–12 blocks each, and 1.69 MiB came again.
+      - A loaded CI runner (lib tests 495 s instead of about 70 s) fetched 2.37 MiB again and
+        failed the earlier fixed bound, 1.5 MiB.
+    - Measured (ffmpeg 9.0.2; MiB fetched again at the starts from 5 s, 45 s and 85 s):
 
-      | Platform | 5 s | 45 s | 85 s |
-      |---|---|---|---|
-      | macOS | 0 | 0.56–0.94 MiB | 0.44–1.19 MiB |
-      | Linux | 0 | 0 | 0.94–1.00 MiB |
+      | Platform, run | 5 s | 45 s | 85 s | Over the earlier 1.5 MiB |
+      |---|---|---|---|---|
+      | macOS idle, 10 runs | 0 | 0.56–0.94 | 0.44–1.19 | 0 runs |
+      | Linux idle, 20 runs | 0 | 0 | 0.94–1.00 | 0 runs |
+      | macOS loaded, 30 runs | 0 | 0.81–1.25 | 0.81–1.62 | 2 runs |
+      | Linux loaded, 20 runs | 0 | 0–1.19 | 0–3.44 | 5 runs |
 
-      Without the send buffer, Linux fetched 2.2–4.0 MiB again at the 45 s start, and the gate
-      failed in each of 9 runs; with it alone, one start of 15 fetched 5.3 MiB again (§9).
-      macOS was about as above either way. In the engine's trace every second fetch is a
-      prefetch, and no block a reader waited for was fetched twice (W7). Whether ffmpeg read
-      any of those bytes is not measured: the trace shows what was asked for, not what the
-      client took.
-      - Why: each decoder opens a `moov`-at-the-end file at byte 0, reads a few KB and seeks to
-        the `moov`. Meanwhile the server fills that connection's socket from the cached head;
-        each read is a sequential hit that doubles its reader's readahead
-        (`Readahead::access`), so prefetch past the cached head goes out before ffmpeg closes
-        the connection about 3 ms later. How much the socket takes is §9's send buffer: left
-        to Linux it grew to 2.5 MiB at once, and the prefetch went that much further.
-      - No reader waited for those blocks. Once the cache is full (the second start), they are
-        the least recently used, outside every live window as sampled every 2 ms, and evicted
-        (`BlockCache::evict`). The next decoder's opening (a piece boundary) prefetches them
-        again.
-      - So the 1-block figure belongs to X1's own fixture.
+      All 50 loaded runs pass the gate above. Without §9's send buffer, Linux idle fetched
+      2.2–4.0 MiB again at the 45 s start. Whether ffmpeg read any of those bytes is not
+      measured: the trace shows what was asked for, not what the client took.
+    - Open for the stream core (not done here): dropping a reader's queued prefetch while its
+      client's socket is full would stop that drain, at some risk to readahead on a slow link.
+      X1's 1-block figure belongs to its own fixture.
     - It is not a bound "at every step": `fetched` is cumulative and counts refetches,
       `http_sent` is a union, and a reader's allowance goes when it closes.
     - X1 on that fixture: 1 block was fetched again in nine starts. With the cap pinned at
