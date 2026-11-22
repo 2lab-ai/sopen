@@ -923,19 +923,6 @@ pub(super) fn save_new_deciding(
     link: &mut dyn FnMut(LinkStep, &Path) -> std::io::Result<()>,
     decision: &Decision,
 ) -> std::result::Result<SavedTo, SaveError> {
-    save_new_deciding_at(dest, expected, |file, _| fill(file), link, decision)
-}
-
-/// [`save_new_deciding`] whose fill is also told where `part` is (`<folder>/.sopen-<hex>/part`,
-/// as the destination's folder was given): what writes it by its path — a media render, whose
-/// ffmpeg opens its output itself (07 §7) — writes into that same file, never a copy of it.
-pub(super) fn save_new_deciding_at(
-    dest: &Path,
-    expected: Option<u64>,
-    fill: impl FnOnce(&mut File, &Path) -> Result<u64>,
-    link: &mut dyn FnMut(LinkStep, &Path) -> std::io::Result<()>,
-    decision: &Decision,
-) -> std::result::Result<SavedTo, SaveError> {
     let nothing = |e: anyhow::Error| {
         SaveError::Failed(e.context(format!(
             "{} was not saved; nothing was transferred",
@@ -1017,7 +1004,7 @@ pub(super) fn save_new_deciding_at(
         return Err(nothing(give_up(&mut staging, e)));
     }
     let filled = (|| -> Result<u64> {
-        let n = fill(&mut file, &staging.shown.join("part"))?;
+        let n = fill(&mut file)?;
         file.sync_all()
             .with_context(|| format!("cannot write {}", staging.shown.join("part").display()))?;
         file.set_permissions(std::fs::Permissions::from_mode(mode))

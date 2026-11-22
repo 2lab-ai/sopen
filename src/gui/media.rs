@@ -1285,7 +1285,7 @@ fn autosave_as(
         hold: save_as_hold(),
         held: Arc::default(),
         #[cfg(test)]
-        before_render: None,
+        before_copy: None,
     };
     let (dest, _) = save_as::first_path(folder, &name);
     let decision = super::binary::Decision::new();
@@ -3504,7 +3504,7 @@ impl MediaWindow {
             hold: save_as_hold(),
             held: self.save_as_held.clone(),
             #[cfg(test)]
-            before_render: None,
+            before_copy: None,
         };
         let job = save_as::Job {
             name,

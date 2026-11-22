@@ -1961,85 +1961,21 @@ fn recover_one(mut orphan: journal::Orphan, host: &str, fs: Option<&mut dyn Remo
 }
 
 // ---------------------------------------------------------------------------------------------
-// Save As (07 §7): the render into the modal's staging `part`.
+// Save As (07 §7): the render in sopen's own folder, copied into the modal's staging `part`.
 
-/// Where `part` is, as the modal's writer says ([`save_as::Ctl::part`]), checked to be the
-/// very file being filled (device and inode) before anything writes it by that path.
-fn path_of(part: &std::fs::File, ctl: &crate::gui::save_as::Ctl<'_>) -> Result<PathBuf> {
-    use std::os::unix::fs::MetadataExt;
-    let path = ctl
-        .part()
-        .context("the writer did not say where its staging file is")?
-        .to_path_buf();
-    let (at, open) = (std::fs::symlink_metadata(&path)?, part.metadata()?);
-    anyhow::ensure!(
-        at.file_type().is_file() && (at.dev(), at.ino()) == (open.dev(), open.ino()),
-        "{} is not the staging file being written",
-        path.display()
-    );
-    Ok(path)
-}
-
-/// Whether another user could rename entries of a folder this user's process writes in: one
-/// not this user's (`owner` is not `uid`), or one writable by group or others without the
-/// sticky bit. (An entry renamed there between a check and a later open by path is another
-/// user's to plant.)
-pub(super) fn shared_folder(owner: u32, mode: u32, uid: u32) -> bool {
-    owner != uid || (mode & 0o022 != 0 && mode & 0o1000 == 0)
-}
-
-/// Whether no other user can rename an entry anywhere on a folder's path, so that what is
-/// checked in it is what a later open by path finds (OpenSSH's `safe_path`, root down). `chain`
-/// is each folder's owner and mode, root first and the folder last. Every folder above it must
-/// be this user's or root's and not writable by group or others — except a sticky one (as /tmp
-/// is), where only an entry's owner may rename it: the next folder must then be this user's or
-/// root's. The folder itself keeps [`shared_folder`]'s rule.
-pub(super) fn path_is_private(chain: &[(u32, u32)], uid: u32) -> bool {
-    let Some(&(owner, mode)) = chain.last() else {
-        return false;
-    };
-    if shared_folder(owner, mode, uid) {
-        return false;
-    }
-    let trusted = |owner: u32| owner == uid || owner == 0;
-    chain.windows(2).all(|pair| {
-        let ((owner, mode), (next, _)) = (pair[0], pair[1]);
-        trusted(owner) && (mode & 0o022 == 0 || (mode & 0o1000 != 0 && trusted(next)))
-    })
-}
-
-/// [`path_is_private`] for the folder at `path`, walked by its canonical path; a folder on it
-/// that cannot be looked at (or is not a folder) makes it not private.
-pub(super) fn path_is_private_at(path: &Path) -> bool {
-    use std::os::unix::fs::MetadataExt;
-    let Ok(canonical) = std::fs::canonicalize(path) else {
-        return false;
-    };
-    let mut chain = Vec::new();
-    for dir in canonical.ancestors() {
-        match std::fs::symlink_metadata(dir) {
-            Ok(meta) if meta.is_dir() => chain.push((meta.uid(), meta.mode())),
-            _ => return false,
-        }
-    }
-    chain.reverse();
-    // SAFETY: `geteuid` cannot fail and touches no memory.
-    let uid = unsafe { libc::geteuid() };
-    path_is_private(&chain, uid)
-}
-
-/// `from` (a finished render) copied into `part` through its handle, stopping at a cancel.
-fn copy_in(
+/// `from` (a finished render) copied into `part` through its handle, stopping at a cancel. A
+/// failure or a cancel leaves `part` to the writer, which publishes nothing.
+pub(super) fn copy_in(
     from: &Path,
     part: &mut std::fs::File,
-    ctl: &crate::gui::save_as::Ctl<'_>,
+    cancelled: &dyn Fn() -> bool,
 ) -> Result<()> {
     use std::io::{Read as _, Write as _};
     let mut src =
         std::fs::File::open(from).with_context(|| format!("cannot read {}", from.display()))?;
     let mut buf = vec![0u8; 1 << 20];
     loop {
-        if ctl.cancelled() {
+        if cancelled() {
             return Err(anyhow!(remote::Cancelled));
         }
         let n = src
@@ -2054,13 +1990,12 @@ fn copy_in(
 }
 
 /// Save As's producer for the media window: the edit rendered from the window's input (a stream
-/// through its `render` URL — a response cut short fails the render) straight into the modal's
-/// staging `part`, by its path and with the output's container said explicitly (`part` has no
-/// extension: `ffmpeg::edit_args_as`). Passes of a long edit, and ffmpeg's graph files, go to a
-/// private folder of sopen's exports; the output itself is written once, into `part` — except
-/// where another user could rename an entry on the destination's path ([`path_is_private`]):
-/// ffmpeg opens its output by path, so there it renders into that private folder (after its
-/// room is checked) and the output is copied in through `part`'s handle.
+/// through its `render` URL — a response cut short fails the render) into a private folder of
+/// sopen's exports, once its room there is checked, with the output's container said explicitly
+/// (`ffmpeg::edit_args_as`); then copied into the modal's staging `part` through its handle. No
+/// ffmpeg ever opens a path in the chosen folder: what a path there names when it is opened is
+/// not what was checked if another user can rename an entry anywhere on it. The render goes
+/// with its folder once copied — or not, a failure or a cancel publishing nothing.
 pub struct MediaProducer {
     pub media: Arc<Media>,
     pub spec: EditSpec,
@@ -2069,15 +2004,14 @@ pub struct MediaProducer {
     /// 30 % for this long, or until cancelled; `held` is set meanwhile.
     pub hold: Option<Duration>,
     pub held: Arc<AtomicBool>,
-    /// The tests' look between the staging file's check and the render's open: the path the
-    /// render writes, and `part`'s.
+    /// The tests' look between the render and its copy into `part`: given the render's path.
     #[cfg(test)]
-    pub before_render: Option<BeforeRender>,
+    pub before_copy: Option<BeforeCopy>,
 }
 
-/// [`MediaProducer::before_render`]: given the path the render writes, and `part`'s.
+/// [`MediaProducer::before_copy`].
 #[cfg(test)]
-pub type BeforeRender = Box<dyn FnOnce(&Path, &Path) + Send>;
+pub type BeforeCopy = Box<dyn FnOnce(&Path) + Send>;
 
 impl crate::gui::save_as::Producer for MediaProducer {
     fn fill(
@@ -2089,37 +2023,21 @@ impl crate::gui::save_as::Producer for MediaProducer {
             bail!("not a file sopen can render");
         };
         let estimate = estimate_size(&self.media, &self.spec);
-        let dst = path_of(part, ctl)?;
-        let folder = dst
-            .parent()
-            .and_then(Path::parent)
-            .context("the staging file has no folder")?;
-        let shared = !path_is_private_at(folder);
-        if shared {
-            crate::cache::private_dir(&self.work_root)?;
-            if let Some(free) = remote::LocalFs::free_space_at(&self.work_root) {
-                if free < estimate {
-                    bail!(
-                        "the render needs about {} free in {}, there is {}",
-                        crate::human(estimate),
-                        crate::gui::binary::tilde(&self.work_root),
-                        crate::human(free)
-                    );
-                }
+        crate::cache::private_dir(&self.work_root)?;
+        if let Some(free) = remote::LocalFs::free_space_at(&self.work_root) {
+            if free < estimate {
+                bail!(
+                    "the render needs about {} free in {}, there is {}",
+                    crate::human(estimate),
+                    crate::gui::binary::tilde(&self.work_root),
+                    crate::human(free)
+                );
             }
         }
         let work = self.work_root.join(remote::random_hex());
         let _job = crate::cache::JobLock::take(&work)?;
         crate::cache::private_dir(&work)?;
-        let out = if shared {
-            work.join(format!("render.{ext}"))
-        } else {
-            dst.clone()
-        };
-        #[cfg(test)]
-        if let Some(look) = self.before_render.take() {
-            look(&out, &dst);
-        }
+        let out = work.join(format!("render.{ext}"));
         let mut hold = self.hold;
         let held = self.held.clone();
         let rendered = cut::render_edit_stoppable(
@@ -2144,11 +2062,13 @@ impl crate::gui::save_as::Producer for MediaProducer {
             },
             &|| ctl.cancelled(),
         );
-        let copied = match rendered {
-            Ok(_) if shared => copy_in(&out, part, ctl),
-            Ok(_) => Ok(()),
-            Err(e) => Err(e),
-        };
+        let copied = rendered.and_then(|_| {
+            #[cfg(test)]
+            if let Some(look) = self.before_copy.take() {
+                look(&out);
+            }
+            copy_in(&out, part, &|| ctl.cancelled())
+        });
         let _ = std::fs::remove_dir_all(&work);
         copied?;
         let written = part.metadata()?.len();

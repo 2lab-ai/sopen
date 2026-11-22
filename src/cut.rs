@@ -185,8 +185,7 @@ pub fn render_edit(
 /// [`render_edit`] that `stopped` stops (07 §10: Esc stops a media Save up to its rename, and
 /// Save As's Cancel): asked while each run goes, ffmpeg is killed and the error is
 /// [`crate::remote::Cancelled`]. `as_ext`: the final file is written as a `*.ext` whatever
-/// `dst` is named ([`ffmpeg::edit_args_as`]) — Save As renders straight into its staging
-/// `part`, which has no extension (07 §7).
+/// `dst` is named ([`ffmpeg::edit_args_as`]: its container said explicitly, `-f <muxer>`).
 #[allow(clippy::too_many_arguments)]
 pub fn render_edit_stoppable(
     tools: &Tools,

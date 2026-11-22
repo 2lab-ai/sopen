@@ -1606,8 +1606,8 @@ pub fn muxer_for(ext: &str) -> Option<&'static str> {
 
 /// [`edit_args`] writing a final render as a `*.ext` file whatever `dst` is named (`as_ext`):
 /// the encoders, `+faststart` and an explicit `-f <muxer>` ([`muxer_for`]) all come from
-/// `ext`, so `dst` may have no extension at all (Save As renders straight into its staging
-/// `part`, 07 §7). `None`: from `dst`'s own extension, with no `-f`, as [`edit_args`].
+/// `ext`, so `dst` may have no extension at all. `None`: from `dst`'s own extension, with no
+/// `-f`, as [`edit_args`].
 #[allow(clippy::too_many_arguments)]
 pub fn edit_args_as(
     files: &[&Input],
