@@ -205,6 +205,22 @@ struct ReaderState {
     got: HashMap<u64, Bytes>,
     prefetch: VecDeque<u64>,
     prefetch_seq: u64,
+    /// Tests: how far it reached ([`Reach`]).
+    #[cfg(test)]
+    reach: Reach,
+}
+
+/// Tests: what one reader was let read, over its whole life.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Reach {
+    pub id: u64,
+    pub kind: ReaderKind,
+    /// The widest its readahead window has been.
+    pub widest: u64,
+    /// The bytes it read or read ahead, from the lowest to the furthest: `from..to`.
+    pub from: u64,
+    pub to: u64,
 }
 
 impl ReaderState {
@@ -233,6 +249,9 @@ pub struct Prefetcher {
     rests: VecDeque<Rest>,
     /// A poll is due (06 §5): it goes behind queued demand and ahead of everything else.
     pub poll_due: bool,
+    /// Tests: how far the readers closed so far reached ([`Prefetcher::reaches`]).
+    #[cfg(test)]
+    closed: Vec<Reach>,
 }
 
 fn blocks_of(off: u64, end: u64) -> std::ops::RangeInclusive<u64> {
@@ -254,13 +273,40 @@ impl Prefetcher {
                 got: HashMap::new(),
                 prefetch: VecDeque::new(),
                 prefetch_seq: 0,
+                #[cfg(test)]
+                reach: Reach {
+                    id: self.next_id,
+                    kind,
+                    widest: 0,
+                    from: u64::MAX,
+                    to: 0,
+                },
             },
         );
         self.next_id
     }
 
     pub fn close(&mut self, id: u64) {
-        self.readers.remove(&id);
+        let _gone = self.readers.remove(&id);
+        #[cfg(test)]
+        if let Some(r) = _gone {
+            self.closed.push(r.reach);
+        }
+    }
+
+    /// Tests: how far every reader opened so far, open or closed, was let read, by id.
+    #[cfg(test)]
+    pub fn reaches(&self) -> Vec<Reach> {
+        let open = self.readers.values().map(|r| r.reach);
+        let mut all: Vec<_> = self.closed.iter().copied().chain(open).collect();
+        all.sort_by_key(|r| r.id);
+        all
+    }
+
+    /// Tests: the id the last reader opened was given.
+    #[cfg(test)]
+    pub fn last_id(&self) -> u64 {
+        self.next_id
     }
 
     pub fn kind(&self, id: u64) -> Option<ReaderKind> {
@@ -333,6 +379,12 @@ impl Prefetcher {
         let r = self.readers.get_mut(&id)?;
         let before = r.ra.window();
         let access = r.ra.access(off, end, ahead);
+        #[cfg(test)]
+        {
+            let reach = &mut r.reach;
+            reach.widest = reach.widest.max(r.ra.window());
+            (reach.from, reach.to) = (reach.from.min(off), reach.to.max(end));
+        }
         // What it held of another place goes; what the cache has of this one is held from
         // now, whatever the cache does with it since.
         let wanted = blocks_of(off, end);
@@ -374,6 +426,14 @@ impl Prefetcher {
             if interactive && off > 0 {
                 let first = off / BLOCK;
                 targets.extend((off.saturating_sub(len) / BLOCK..first).rev());
+            }
+            #[cfg(test)]
+            {
+                let reach = &mut r.reach;
+                reach.to = reach.to.max(fwd_end);
+                if interactive {
+                    reach.from = reach.from.min(off.saturating_sub(len));
+                }
             }
             targets.retain(|b| !cached(*b));
             queued |= targets.iter().any(|b| !have(*b));

@@ -311,8 +311,18 @@ fn v16_a_render_of_24_reordered_pieces_fetches_within_its_bound() {
 /// (play readers opened) × their ahead + cap` beyond what it fetched again: the readers as the
 /// server counts the `play` responses it began, the cap the highest the engine sent under.
 ///
-/// What it fetches again is held to [`REFETCH_PER_START`], not to 06's one block: that is X1's
-/// own fixture's threshold, and this one measures more (below).
+/// What it fetches again is readahead, never a block a decoder waited for: no block twice in
+/// the start, each inside what one of the start's readers read or read ahead, and no reader's
+/// readahead past its allowance (`ahead`) — what the engine is allowed to do, from its own
+/// records ([`crate::stream::Prefetcher::reaches`]). Not 06's one block (X1's threshold for its
+/// own fixture), nor a fixed figure, for it grows with load. Each decoder opens this `moov`-at-the-end file at byte 0
+/// (and again at byte 48), reads a few KB and seeks to the `moov`. Meanwhile the server fills
+/// that connection's socket from the cached head; each read is a sequential hit that doubles
+/// the reader's readahead, to MBs within a few blocks, and its prefetch past the cached head
+/// drains for as long as ffmpeg keeps the connection open. Those blocks, evicted since an
+/// earlier start read them, come again. Idle, ffmpeg closes such a connection 1–5 ms after it
+/// opens it, and up to 1.19 MiB came again a start; loaded, it held them 190–320 ms, its first
+/// frame 1.6 s late, and 1.69 MiB came again (macOS; 2.37 MiB on a loaded CI runner).
 #[test]
 fn v16_playback_of_an_edit_fetches_within_its_bound() {
     bounded(300, |t| {
@@ -360,6 +370,7 @@ fn v16_playback_of_an_edit_fetches_within_its_bound() {
                 server.opened(Kind::Play),
                 traced(&source),
             );
+            let last_reader = source.core().pf.last_id();
             let mut player = Player::start(
                 &tools,
                 &src,
@@ -405,9 +416,64 @@ fn v16_playback_of_an_edit_fetches_within_its_bound() {
                 0,
                 "from {at} s: a demand fetched again"
             );
+            // What the start's readers were let read: each one's readahead never past its
+            // allowance, and every block that came again inside what one of them reached —
+            // once in the start, a block fetched before it.
+            let reaches: Vec<_> = source
+                .core()
+                .pf
+                .reaches()
+                .into_iter()
+                .filter(|r| r.id > last_reader)
+                .collect();
+            let widest = reaches.iter().map(|r| r.widest).max().unwrap_or(0);
             assert!(
-                again <= REFETCH_PER_START,
-                "from {at} s: {again} bytes fetched again"
+                widest <= ahead,
+                "from {at} s: a readahead of {widest} > {ahead}"
+            );
+            let reached = |b: u64| {
+                reaches
+                    .iter()
+                    .any(|r| r.from <= b * BLOCK && b * BLOCK < r.to)
+            };
+            let (before, during) = {
+                let core = source.core();
+                let blocks = |t: &[crate::stream::Traced]| -> Vec<u64> {
+                    t.iter().filter_map(|t| t.block).collect()
+                };
+                (
+                    blocks(&core.trace[..traced_at]),
+                    blocks(&core.trace[traced_at..]),
+                )
+            };
+            let earlier: std::collections::HashSet<u64> = before.into_iter().collect();
+            let mut once = std::collections::HashSet::new();
+            for b in &during {
+                assert!(
+                    once.insert(*b),
+                    "from {at} s: block {b} fetched twice in the start"
+                );
+            }
+            let came_again: Vec<u64> = during
+                .iter()
+                .copied()
+                .filter(|b| earlier.contains(b))
+                .collect();
+            assert_eq!(came_again.len() as u64 * BLOCK, again, "from {at} s");
+            let outside: Vec<u64> = came_again
+                .iter()
+                .copied()
+                .filter(|b| !reached(*b))
+                .collect();
+            assert!(
+                outside.is_empty(),
+                "from {at} s: fetched again outside every reader's reach: {outside:?}"
+            );
+            let could = earlier.iter().filter(|b| reached(**b)).count() as u64 * BLOCK;
+            eprintln!(
+                "V16 playback from {at} s: {} readers, readahead at most {widest}; {again} \
+                 fetched again of the {could} fetched before inside their reach",
+                reaches.len()
             );
         }
         none_reading(&media);
@@ -415,20 +481,6 @@ fn v16_playback_of_an_edit_fetches_within_its_bound() {
         none_left(dir.path()).unwrap();
     });
 }
-
-/// What a playback start of [`v16_playback_of_an_edit_fetches_within_its_bound`] may fetch
-/// again: a regression threshold for this fixture (06 §12 V16). Measured with the server's
-/// send buffer and ffmpeg's receive buffer bounded ([`SEND_BUFFER`], `ffmpeg::RECV_BUFFER`;
-/// ffmpeg 9.0.2, 10 runs on macOS, 20 on Linux): at most 1.19 MiB a start on macOS and 1 MiB on
-/// Linux, every second fetch a prefetch in the engine's trace —
-/// no block a reader waited for came twice. Each decoder opens this `moov`-at-the-end file at
-/// byte 0, reads a few KB and seeks to the `moov`; meanwhile the server fills that connection's
-/// socket from the cached head, each read a sequential hit that grows its reader's readahead,
-/// so prefetch past the cached head goes out before ffmpeg closes the connection. No reader
-/// waits for those blocks; they are the first the cache evicts once it is full, and the next
-/// decoder's opening prefetches them again. With the buffer left to Linux, 2.2–4.0 MiB came
-/// again at one start. X1 measured 1 block in nine starts on its own 1080p fixture.
-const REFETCH_PER_START: u64 = 3 * MIB / 2;
 
 /// 06 §12 V16: a 2-input render whose inputs wait past 60 s (on the server's clock, which the
 /// test moves) has no cut and the edit's length — the 60 s rule does not run on a `render`
