@@ -1643,7 +1643,11 @@ stream <event> t=<ms> <host:/abs> fetched=<b> demand=<b> prefetch=<b> bulk=<b> d
 - **V16. Video, `moov` at the end** (123 MB, remote; gates on `local_server()` with a `lavfi`
   fixture of the same shape).
   - **Playback gate**, read once per start, when the player is dropped (each term is that
-    start's own: the counters' growth from `Player::start` to the drop):
+    start's own: the counters' growth from `Player::start` to the drop). W7's gate reads it once
+    every reader of the start has closed, and begins each start with no reader open. A
+    connection's server thread goes on for a while after its ffmpeg has gone, so a start read
+    before that counts what the last one's readers fetch late. The render gate is read the same
+    way:
     - `fetched − refetched ≤ http_sent + (play readers opened during that start) × their ahead +
       cap`;
     - `refetched ≤ 1 block` per start, as a regression threshold for X1's own fixture and not
@@ -1747,6 +1751,12 @@ stream <event> t=<ms> <host:/abs> fetched=<b> demand=<b> prefetch=<b> bulk=<b> d
 - **V19. Waveform** of a remote 24 MB mp3.
   - Gate: the overview completes with `fetched ≤ 1.05 ×` the file.
   - Gate: while it runs, no bulk request is sent while a playback demand is queued.
+  - W7's gate measures from a settled stream: no reader open (the probe's connections gone, whose
+    server threads go on for a while after ffprobe exits) and nothing queued or in flight. Each
+    request is told by the reader it was sent for, so a request of anything but the waveform's
+    reader fails the gate as itself. Without that, a loaded CI runner counted a Demand for block 3
+    as the waveform's. Before the player starts, the only readers that send Demands are the
+    probe's `play` connections, so it was theirs (by elimination: that trace has no reader ids).
   - Qualification: the first peaks show within 1 s of `open`, and a seek while it runs has
     `ready − input ≤ 0.5 s`.
 - **V20. The byte server** (std `TcpStream` client, every row of §9's tables):

@@ -1089,6 +1089,8 @@ impl Journal {
             }
             fs.sync_dir(&home)
                 .map_err(|e| io_err(e, "make durable the folder", &home))?;
+            #[cfg(test)]
+            gap::hold(cache);
             // A listing that found this directory before its lock existed makes the lock itself
             // (exclusively) and owns the directory: this session then takes another.
             let lock = match fs.lock(&dir.join(LOCK), true) {
@@ -3028,6 +3030,94 @@ impl SaveIntent {
     /// The record as the `save` file holds it.
     pub fn text(&self) -> String {
         String::from_utf8_lossy(&intent_bytes(self)).into_owned()
+    }
+}
+
+/// Tests: the next [`Journal::create`] under a cache held between its directory and its lock —
+/// where a listing ([`orphans`]) finds the directory without a lock and takes it (a slow disk
+/// stretches that moment) — until released. Armed per cache: the tests of a process run side by
+/// side.
+#[cfg(test)]
+pub mod gap {
+    use std::path::{Path, PathBuf};
+    use std::sync::{Arc, Condvar, Mutex};
+    use std::time::{Duration, Instant};
+
+    /// (a journal is held there, it may go on)
+    type Shared = Arc<(Mutex<(bool, bool)>, Condvar)>;
+
+    static ARMED: Mutex<Vec<(PathBuf, Shared)>> = Mutex::new(Vec::new());
+
+    /// The hold of the next journal made under one cache. Dropped, it lets it go.
+    pub struct Gap {
+        cache: PathBuf,
+        shared: Shared,
+    }
+
+    /// The next journal made under `cache` (exactly that path) waits at the gap.
+    pub fn arm(cache: &Path) -> Gap {
+        let shared = Shared::default();
+        let mut armed = ARMED.lock().unwrap_or_else(|p| p.into_inner());
+        armed.push((cache.to_path_buf(), shared.clone()));
+        Gap {
+            cache: cache.to_path_buf(),
+            shared,
+        }
+    }
+
+    impl Gap {
+        /// Waits until a journal is held at the gap; panics after 30 s.
+        pub fn reached(&self) {
+            let deadline = Instant::now() + Duration::from_secs(30);
+            let (lock, cv) = &*self.shared;
+            let mut state = lock.lock().unwrap_or_else(|p| p.into_inner());
+            while !state.0 {
+                let left = deadline.saturating_duration_since(Instant::now());
+                assert!(
+                    !left.is_zero(),
+                    "no journal of {:?} came to the gap",
+                    self.cache
+                );
+                state = cv
+                    .wait_timeout(state, left)
+                    .unwrap_or_else(|p| p.into_inner())
+                    .0;
+            }
+        }
+
+        /// The held journal goes on to its lock.
+        pub fn release(&self) {
+            let (lock, cv) = &*self.shared;
+            lock.lock().unwrap_or_else(|p| p.into_inner()).1 = true;
+            cv.notify_all();
+        }
+    }
+
+    impl Drop for Gap {
+        fn drop(&mut self) {
+            self.release();
+            let mut armed = ARMED.lock().unwrap_or_else(|p| p.into_inner());
+            armed.retain(|(_, shared)| !Arc::ptr_eq(shared, &self.shared));
+        }
+    }
+
+    /// [`super::Journal::create`], between the directory and its lock: held there once, when a
+    /// gap is armed for `cache`.
+    pub(super) fn hold(cache: &Path) {
+        let shared = {
+            let mut armed = ARMED.lock().unwrap_or_else(|p| p.into_inner());
+            match armed.iter().position(|(armed, _)| armed == cache) {
+                Some(at) => armed.remove(at).1,
+                None => return,
+            }
+        };
+        let (lock, cv) = &*shared;
+        let mut state = lock.lock().unwrap_or_else(|p| p.into_inner());
+        state.0 = true;
+        cv.notify_all();
+        while !state.1 {
+            state = cv.wait(state).unwrap_or_else(|p| p.into_inner());
+        }
     }
 }
 

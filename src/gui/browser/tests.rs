@@ -306,6 +306,10 @@ fn edit_image(fx: &mut Fx) {
 #[test]
 fn an_edited_image_is_asked_before_it_goes() {
     let mut fx = fixture();
+    // The session's journal is held between its folder and its lock, where a slow disk can keep
+    // it a while: the image opened again below takes that folder as an earlier session's and
+    // shows it in a recovery row, whose Discard is drawn under the next prompt's.
+    let gap = crate::journal::gap::arm(&fx.cache);
     fx.open("photo.png");
     edit_image(&mut fx);
     fx.drv.take_viewport_commands();
@@ -332,14 +336,20 @@ fn an_edited_image_is_asked_before_it_goes() {
         !fx.drv.closed(),
         "a hosted Discard closes the viewer, not the window"
     );
-    // Closing the window with an edit, then Discard: the window closes.
+    // Closing the window with an edit, then the prompt's Discard: the window closes.
+    gap.reached();
     fx.key(Key::Enter);
     fx.settle();
+    gap.release();
     edit_image(&mut fx);
     assert!(!Window::close_requested(&mut fx.b));
     fx.drv.idle(&mut fx.b, 1);
-    fx.drv.click_text(&mut fx.b, "Discard");
-    assert!(fx.b.viewer.is_none());
+    fx.drv.click_text_on_top(&mut fx.b, "Discard");
+    assert!(
+        fx.b.viewer.is_none(),
+        "the prompt's Discard drops it at once; on screen: {:?}",
+        fx.drv.texts().into_iter().map(|t| t.2).collect::<Vec<_>>()
+    );
     assert!(
         fx.drv.closed(),
         "Discard after closing the window closes it"
@@ -1805,7 +1815,11 @@ fn clipboard_shortcuts_reach_a_hosted_image() {
     assert!(fx.b.viewer.is_none(), "Copy is not an edit");
 
     // A paste alone is an edit. Pasted without a rectangle it selects what it covers: the
-    // first Esc clears that, the second asks before the paste goes.
+    // first Esc clears that, the second asks before the paste goes. Its journal is held between
+    // its folder and its lock, where a slow disk can keep it a while: the image opened again
+    // below takes that folder as an earlier session's and shows it in a recovery row, whose
+    // Discard is drawn under the next prompt's.
+    let gap = crate::journal::gap::arm(&fx.cache);
     fx.open("photo.png");
     let red = egui::ColorImage::new([4, 4], vec![egui::Color32::RED; 16]);
     fx.drv.paste_image(&mut fx.b, red);
@@ -1822,7 +1836,9 @@ fn clipboard_shortcuts_reach_a_hosted_image() {
 
     // Cut alone: a drawn rectangle's pixels to the clipboard, the rectangle left in the
     // background colour — an edit too.
+    gap.reached();
     fx.open("photo.png");
+    gap.release();
     let c = Pos2::new(500.0, 350.0);
     fx.drv.drag(
         &mut fx.b,
@@ -1846,8 +1862,12 @@ fn clipboard_shortcuts_reach_a_hosted_image() {
         fx.drv.find_text("Unsaved changes").is_some(),
         "the cut was an edit"
     );
-    fx.drv.click_text(&mut fx.b, "Discard");
-    assert!(fx.b.viewer.is_none());
+    fx.drv.click_text_on_top(&mut fx.b, "Discard");
+    assert!(
+        fx.b.viewer.is_none(),
+        "the prompt's Discard drops it at once; on screen: {:?}",
+        fx.drv.texts().into_iter().map(|t| t.2).collect::<Vec<_>>()
+    );
     assert!(!fx.drv.closed());
 }
 
