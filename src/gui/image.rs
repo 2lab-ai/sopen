@@ -2,9 +2,9 @@
 //! Cut / Copy / Paste through the system clipboard ([`clip`]), Undo/Redo, Save (backup first,
 //! conflict-checked overwrite) and Save copy (a new sibling).
 //!
-//! [`Doc`] is the edit model (decode, ops, history, encode) and [`ImageFile`] the write side;
-//! both are window-free, so the tests and the `SOPEN_AUTOSAVE` hook run the exact code the
-//! window's buttons run.
+//! [`Doc`] is the edit model (decode, ops, history, encode) and [`ImageFile`] the write side
+//! (`file.rs`); both are window-free, so the tests and the `SOPEN_AUTOSAVE` hook run the exact
+//! code the window's buttons run.
 //!
 //! As the file browser's preview (02 §4.2, [`embed_preview`]) the window shows the picture fitted,
 //! without toolbars, rows or prompt, and takes no input; [`dimensions`] and
@@ -12,11 +12,14 @@
 //! at every read of it), [`fitted`] the picture it shows, made off the window's thread.
 
 pub mod clip;
+mod file;
 pub mod probe;
+
+pub(in crate::gui) use file::failed;
+pub use file::{ImageFile, Saved, CANNOT_REPLACE};
 
 use super::fonts::{self, Face};
 use super::{Hooks, Map, Op, Origin, Outcome, Selection, Status};
-use crate::remote::WriteOutcome;
 use crate::stream::{Mark, ReadError, Reader, ReaderKind, Source};
 use anyhow::{anyhow, bail, Context as _, Result};
 use eframe::egui::{self, Color32, Key, Pos2, Rect, Sense, TextureHandle, Vec2};
@@ -26,12 +29,12 @@ use image::{
 };
 use num_traits::ToPrimitive;
 use sha2::{Digest as _, Sha256};
-use std::io::{Cursor, Write as _};
+use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 /// Default pixelize block, in image pixels.
 pub const DEFAULT_BLOCK: u32 = 16;
@@ -963,200 +966,8 @@ fn pixelize_buf<P: Pixel>(buf: &mut ImageBuffer<P, Vec<P::Subpixel>>, rect: [u32
 // ---------------------------------------------------------------------------------------------
 // The write side.
 
-/// The opened image file: where it lives, its bytes as opened (for the backup) and the local
-/// places sopen writes to.
-pub struct ImageFile {
-    pub origin: Origin,
-    /// The bytes as opened — what the backup holds. Kept in memory: a later fetch of the same
-    /// file can replace the cached copy while this window is open.
-    original: Arc<Vec<u8>>,
-    /// Encoded edits waiting to be uploaded, and refused ones: `<cache>/.edits/<host>/<abs>`.
-    edits: PathBuf,
-    /// `<cache>` (backups go to `<cache>/.backup/<host>/<abs>.<stamp>`).
-    cache_root: PathBuf,
-    /// Set by the first successful backup; later saves of the same session keep it.
-    backup: Option<PathBuf>,
-}
-
-/// Result of one Save.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Saved {
-    /// `notes`: what the owner must still hear (e.g. the remote changed right after the save).
-    Written {
-        remote: String,
-        backup: PathBuf,
-        notes: Vec<String>,
-        /// What the saved file does not carry (metadata), shown with the result.
-        not_kept: Vec<String>,
-    },
-    /// The remote changed since it was fetched; nothing was written.
-    Refused { message: String, kept: PathBuf },
-}
-
 /// Closing was asked for while a save runs.
 const CLOSES_AFTER_SAVE: &str = "the window closes when the save is done";
-
-/// Why Save cannot replace the file on this server (spec §5): Save copy still works.
-pub const CANNOT_REPLACE: &str = "this server cannot replace a file in one step (no \
-     posix-rename@openssh.com) — Save copy writes the edit next to the original instead";
-
-/// The one line for a write that failed, keeping the edit. A request that got no reply is
-/// "outcome unknown — check <path>", never "not saved". The hex window says it the same way.
-pub(super) fn failed(e: &anyhow::Error, staged: &Path) -> anyhow::Error {
-    match crate::remote::outcome_unknown(e) {
-        Some(unknown) => anyhow!(
-            "{unknown}; your edit is at {} (cause: {})",
-            staged.display(),
-            e.root_cause()
-        ),
-        None => anyhow!("{e:#}; not saved — your edit is at {}", staged.display()),
-    }
-}
-
-impl ImageFile {
-    pub fn new(origin: Origin, original: Vec<u8>, cache_root: &Path) -> Self {
-        let edits = crate::cache::edits_path(cache_root, origin.host(), &origin.abs);
-        Self {
-            origin,
-            original: Arc::new(original),
-            edits,
-            cache_root: cache_root.to_path_buf(),
-            backup: None,
-        }
-    }
-
-    pub fn original(&self) -> &[u8] {
-        &self.original
-    }
-
-    /// Whether Save can replace the original here (Save copy always can).
-    pub fn can_replace(&self) -> bool {
-        self.origin.can_replace()
-    }
-
-    /// The encoded edit in a new owner-only file next to where edits are kept (never over or
-    /// through an existing one).
-    fn stage(&self, encoded: &[u8], tag: &str) -> Result<PathBuf> {
-        let (path, mut file) = super::create_keep(&self.edits, tag)?;
-        if let Err(e) = file.write_all(encoded) {
-            let _ = std::fs::remove_file(&path);
-            return Err(e).with_context(|| format!("cannot write {}", path.display()));
-        }
-        Ok(path)
-    }
-
-    /// The local backup of the original, written once per session before the first overwrite.
-    fn ensure_backup(&mut self) -> Result<PathBuf> {
-        if let Some(path) = &self.backup {
-            return Ok(path.clone());
-        }
-        let first = crate::cache::backup_path(
-            &self.cache_root,
-            self.origin.host(),
-            &self.origin.abs,
-            SystemTime::now(),
-        );
-        // Another session's backup from the same second keeps its name: this one adds `-<random>`.
-        let (path, mut file) = crate::cache::create_unique(|attempt| {
-            if attempt == 0 {
-                return first.clone();
-            }
-            let mut name = first.file_name().unwrap_or_default().to_os_string();
-            name.push(format!("-{}", &crate::remote::random_hex()[..8]));
-            first.with_file_name(name)
-        })?;
-        if let Err(e) = file.write_all(self.original.as_slice()) {
-            let _ = std::fs::remove_file(&path);
-            return Err(e).with_context(|| format!("cannot write the backup {}", path.display()));
-        }
-        println!("backup of {} at {}", self.origin.display(), path.display());
-        self.backup = Some(path.clone());
-        Ok(path)
-    }
-
-    /// Save (spec §5), in this order: can this server replace a file in one step (refused
-    /// before anything is written if not) → the local backup of the original (printed) →
-    /// `encode` → stage the edit locally → conflict-checked overwrite. An encode failure leaves
-    /// the backup made; a refusal or a transport error keeps the edit in a local file whose
-    /// path the message names.
-    pub fn save(&mut self, encode: impl FnOnce() -> Result<Encoded>) -> Result<Saved> {
-        if !self.can_replace() {
-            bail!(
-                "{} was not touched: {CANNOT_REPLACE}",
-                self.origin.display()
-            );
-        }
-        let backup = self.ensure_backup()?;
-        let encoded = encode().with_context(|| {
-            format!(
-                "{} was not touched (the original is backed up at {})",
-                self.origin.display(),
-                backup.display()
-            )
-        })?;
-        let not_kept = encoded.not_kept;
-        let staged = self.stage(&encoded.bytes, "edited")?;
-        let result = (|| -> Result<Saved> {
-            let at = self.origin.at;
-            let abs = self.origin.abs.clone();
-            match self
-                .origin
-                .fs()?
-                .write_atomic(&staged, &abs, at.fingerprint())?
-            {
-                WriteOutcome::Written { now, notes } => {
-                    self.origin.at = now;
-                    let _ = std::fs::remove_file(&staged);
-                    Ok(Saved::Written {
-                        remote: self.origin.display(),
-                        backup,
-                        notes,
-                        not_kept,
-                    })
-                }
-                WriteOutcome::Conflict { reason, notes, .. } => {
-                    // A name of its own first, so the move cannot replace anyone's file.
-                    let (kept, _) = super::create_keep(&self.edits, "conflict")?;
-                    if let Err(e) = std::fs::rename(&staged, &kept) {
-                        let _ = std::fs::remove_file(&kept);
-                        return Err(e).with_context(|| {
-                            format!("cannot keep the edited copy at {}", kept.display())
-                        });
-                    }
-                    let mut message = format!(
-                        "{} changed since it was opened ({reason}); not saved — your edit is at {}",
-                        self.origin.display(),
-                        kept.display()
-                    );
-                    for note in notes {
-                        message.push_str(&format!("; {note}"));
-                    }
-                    Ok(Saved::Refused { message, kept })
-                }
-            }
-        })();
-        result.map_err(|e| failed(&e, &staged))
-    }
-
-    /// Save copy: `<stem>.edited.<ext>` next to the original (`-N` when taken). Returns the
-    /// printed path of the new file.
-    pub fn save_copy(&mut self, encoded: &[u8]) -> Result<String> {
-        let staged = self.stage(encoded, "copy")?;
-        let (dir, name) = self.origin.parent();
-        let wanted = super::edited_name(&name);
-        let result = self
-            .origin
-            .fs()
-            .and_then(|fs| fs.write_new_sibling(&staged, &dir, &wanted));
-        match result {
-            Ok(final_name) => {
-                let _ = std::fs::remove_file(&staged);
-                Ok(self.origin.show(&crate::remote::join(&dir, &final_name)))
-            }
-            Err(e) => Err(failed(&e, &staged)),
-        }
-    }
-}
 
 fn apply_state(doc: &mut Doc, sel: &mut Selection, block: &mut u32, hooks: &Hooks) -> Result<()> {
     let state = &hooks.state;
@@ -3229,6 +3040,7 @@ mod tests {
     use crate::remote::{LocalFs, RemoteFs};
     use crate::testutil::NoReplace;
     use image::{GenericImageView, Rgb, Rgba};
+    use std::time::SystemTime;
 
     fn gradient(w: u32, h: u32) -> DynamicImage {
         DynamicImage::ImageRgba8(ImageBuffer::from_fn(w, h, |x, y| {
