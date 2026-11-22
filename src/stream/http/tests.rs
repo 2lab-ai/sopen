@@ -1197,62 +1197,135 @@ fn the_seeks_of_a_24_input_render_are_all_seated() {
 
 // ---- lifetime ----
 
+/// Pins `stream`'s receive buffer at `bytes` (Linux keeps twice what is asked): the kernel no
+/// longer grows it, so what the socket takes while nobody reads it is bounded.
+fn pin_receive_buffer(stream: &TcpStream, bytes: usize) {
+    let size = bytes as libc::c_int;
+    // SAFETY: a valid descriptor, and a pointer to an int of the length given, read only.
+    let set = unsafe {
+        libc::setsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_RCVBUF,
+            (&size as *const libc::c_int).cast(),
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+    assert_eq!(set, 0, "SO_RCVBUF: {}", std::io::Error::last_os_error());
+}
+
 /// A `bulk` response whose client takes no bytes for 60 s is closed, and counted: the server
-/// ended it. On the server's clock, moved by hand: at 59 s it is still open.
+/// ended it. On the server's clock, moved by hand: at 59 s it is still open. `late`: once the
+/// server has counted 59 s the client reads 256 KiB more and then nothing — the 60 s start
+/// again, and run out 60 s after that.
+fn stops_reading(late: bool) {
+    let size = 256 * MIB;
+    let (source, _control) = threaded(size);
+    let hand = Hand::new();
+    // What the server last counted of the 60 s, at its look at the clock.
+    let counted: Arc<Mutex<Duration>> = Arc::default();
+    let seen = counted.clone();
+    let seams = Seams {
+        evaluated: Some(Arc::new(move |_, idle, _| *seen.lock().unwrap() = idle)),
+        ..Seams::default()
+    };
+    let server = Server::start_with(source.clone(), hand.with(seams)).unwrap();
+    let watch = server.watch();
+    let mut client = connect(&server);
+    // Before the request, so before any byte of the body. Left to the kernel, what the socket
+    // takes while nobody reads it differed from run to run (macOS: 512 KiB or 1.1 MiB, by when
+    // its buffer grew); pinned, it is the same each time.
+    pin_receive_buffer(&client, 64 << 10);
+    client
+        .write_all(&request(&server, "GET", Kind::Bulk, ""))
+        .unwrap();
+    let head = read_head(&mut client);
+    assert_eq!(content_length(&head), size);
+    let mut got = vec![0u8; 1000];
+    client.read_exact(&mut got).unwrap();
+    // It reads no more. The server fills the socket and then waits on it.
+    let mut sent = settled(&watch, &source);
+    assert!(sent < size);
+    // The 60 s on the server's own count, read after its second look since the clock moved
+    // (`checked` comes before `evaluated`, so that look's count is in). The socket may still
+    // take bytes after the server first waited — a loaded machine's kernel moves the last ones
+    // late — and 64 KiB of them start the count again: the clock is moved by what the server
+    // has counted, never past 59 s of it, and moved again after such a start.
+    let count = || {
+        checks(&watch, 3);
+        *counted.lock().unwrap()
+    };
+    let mut late = late;
+    let mut rounds = 0;
+    loop {
+        rounds += 1;
+        assert!(rounds <= 100, "the 60 s started again {rounds} times");
+        let idle = count();
+        // Said, so a run that hangs names where.
+        eprintln!(
+            "stops_reading: round {rounds}, {} sent, {idle:?} counted",
+            source.stats().http_sent
+        );
+        if idle < Duration::from_secs(59) {
+            hand.advance(Duration::from_secs(59) - idle);
+            continue;
+        }
+        assert_eq!(
+            (watch.open(), server.cuts(Kind::Bulk)),
+            (1, 0),
+            "open at {idle:?}"
+        );
+        if std::mem::take(&mut late) {
+            // The client reads on, then stops for good: the 60 s start again.
+            let resets = watch.resets();
+            let mut more = vec![0u8; 256 << 10];
+            client.read_exact(&mut more).unwrap();
+            got.extend_from_slice(&more);
+            eventually("the 60 s start again", || watch.resets() > resets);
+            sent = source.stats().http_sent;
+            continue;
+        }
+        hand.advance(Duration::from_secs(1));
+        eventually("closed at 60 s, or its count started again", || {
+            server.cuts(Kind::Bulk) == 1 || *counted.lock().unwrap() < Duration::from_secs(59)
+        });
+        if server.cuts(Kind::Bulk) == 1 {
+            break;
+        }
+    }
+    let cut = server.last_cut(Kind::Bulk).unwrap();
+    assert_eq!(
+        (cut.kind, cut.start, cut.length, cut.reason),
+        (Kind::Bulk, 0, size, CutReason::Stalled)
+    );
+    assert!(
+        cut.sent >= sent && cut.sent < size,
+        "cut short: {} of {size}, {sent} sent when the client stopped",
+        cut.sent
+    );
+    // The account's count is what the server wrote: the Source's own, of bytes from 0.
+    assert_eq!(source.stats().http_sent, cut.sent);
+    assert_eq!(source.stats().cuts, 1);
+    // And exactly that is what comes before the end: the file's bytes, none after.
+    let rest = read_all(&mut client);
+    assert_eq!((got.len() + rest.len()) as u64, cut.sent);
+    assert!(
+        got[..] == pattern(0, got.len())[..]
+            && rest[..] == pattern(got.len() as u64, rest.len())[..]
+    );
+    eventually("its thread ends", || watch.open() == 0);
+}
+
+/// A `bulk` response whose client takes no bytes for 60 s is closed, and counted; at 59 s it
+/// is open ([`stops_reading`]). A client that reads on after 59 s starts the 60 s again.
 #[test]
 fn a_bulk_client_that_stops_reading_is_closed_after_60_s() {
-    bounded(
-        "a_bulk_client_that_stops_reading_is_closed_after_60_s",
-        || {
-            let size = 256 * MIB;
-            let (source, _control) = threaded(size);
-            let hand = Hand::new();
-            let server = Server::start_with(source.clone(), hand.config()).unwrap();
-            let watch = server.watch();
-            let mut client = connect(&server);
-            client
-                .write_all(&request(&server, "GET", Kind::Bulk, ""))
-                .unwrap();
-            let head = read_head(&mut client);
-            assert_eq!(content_length(&head), size);
-            let mut some = vec![0u8; 1000];
-            client.read_exact(&mut some).unwrap();
-            // It reads no more. The server fills the socket and then waits on it: three waits
-            // in a row with nothing more sent. How much the socket takes, and whether it takes
-            // a little more later, is the kernel's affair (Linux grows its buffers), so no
-            // count of it is pinned here.
-            assert!(settled(&watch, &source) < size);
-            hand.advance(Duration::from_secs(59));
-            checks(&watch, 3);
-            assert_eq!(
-                (watch.open(), server.cuts(Kind::Bulk)),
-                (1, 0),
-                "open at 59 s"
-            );
-            hand.advance(Duration::from_secs(1));
-            eventually("the stalled response is closed", || {
-                server.cuts(Kind::Bulk) == 1
-            });
-            let cut = server.last_cut(Kind::Bulk).unwrap();
-            assert_eq!(
-                (cut.kind, cut.start, cut.length, cut.reason),
-                (Kind::Bulk, 0, size, CutReason::Stalled)
-            );
-            assert!(
-                cut.sent >= 1000 && cut.sent < size,
-                "cut short: {} of {size}",
-                cut.sent
-            );
-            // The account's count is what the server wrote: the Source's own, of bytes from 0.
-            assert_eq!(source.stats().http_sent, cut.sent);
-            assert_eq!(source.stats().cuts, 1);
-            // And exactly that is what comes before the end: the file's bytes, none after.
-            let rest = read_all(&mut client);
-            assert_eq!(1000 + rest.len() as u64, cut.sent);
-            assert!(some[..] == pattern(0, 1000)[..] && rest[..] == pattern(1000, rest.len())[..]);
-            eventually("its thread ends", || watch.open() == 0);
-        },
-    );
+    for late in [false, true] {
+        bounded(
+            "a_bulk_client_that_stops_reading_is_closed_after_60_s",
+            move || stops_reading(late),
+        );
+    }
 }
 
 /// A `render` or a `play` connection whose client takes nothing is waiting its turn, not
