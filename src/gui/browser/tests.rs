@@ -995,6 +995,113 @@ fn w8b_a_remote_image_that_does_not_decode_opens_in_the_hex_window() {
     assert_eq!(fx.current(), "broken.png");
 }
 
+/// One pass whose input holds every key of `keys`, pressed in that order (then their releases
+/// on the next pass): what the owner's keys are when a pass is long (a loaded machine).
+fn pressed_together(fx: &mut Fx, keys: &[Key]) {
+    for pressed in [true, false] {
+        let events = keys
+            .iter()
+            .map(|&key| Event::Key {
+                key,
+                physical_key: None,
+                pressed,
+                repeat: false,
+                modifiers: Modifiers::NONE,
+            })
+            .collect();
+        fx.drv.frame(&mut fx.b, events, Modifiers::NONE);
+    }
+}
+
+/// Passes, one at a time, until `done` (a bound that only catches a hang).
+fn pass_until(fx: &mut Fx, what: &str, done: impl Fn(&Browser) -> bool) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    while !done(&fx.b) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{what}: not in 60 s ({:?})",
+            fx.b.status.text
+        );
+        fx.drv.idle(&mut fx.b, 1);
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+/// Esc on the pass right after a viewer's first one closes it. The hex window's grid takes the
+/// keyboard on its first pass, and egui keeps Esc from taking the keyboard away only from the
+/// second pass on (a widget's lock filter needs it focused the pass before): Esc on that
+/// second pass takes the grid's focus — which is no text field's, so it is the owner's
+/// leaving, not a field's Esc. Opened from the list (a remote binary, drawn on the pass it
+/// opens) and given way to by an image that does not decode (drawn on the pass after the
+/// switch). Each Esc is pressed on that exact pass, counted, never timed.
+#[test]
+fn w8b_esc_on_a_hex_windows_second_pass_closes_it() {
+    let mut broken = b"\x89PNG\r\n\x1a\n".to_vec();
+    broken.extend((0..200u32).map(|i| (i * 7) as u8));
+    for (name, switched) in [("data.bin", false), ("broken.png", true)] {
+        let mut fx = fixture_with(Some("box"), local_connect(), None);
+        std::fs::write(format!("{}/broken.png", fx.root), &broken).unwrap();
+        let root = fx.root.clone();
+        fx.b.list(Some(0), root, None, None);
+        fx.settle();
+        fx.key(Key::F9);
+        fx.select(name);
+        fx.key(Key::Enter);
+        if switched {
+            // The pass that switched: the hex window is the viewer, not drawn yet.
+            pass_until(&mut fx, "the switch", |b| {
+                b.viewer.as_ref().is_some_and(|v| v.switch.is_none())
+            });
+            // Its first pass.
+            fx.drv.idle(&mut fx.b, 1);
+        } else {
+            // The pass it opened on is its first.
+            pass_until(&mut fx, "the hex window", |b| b.viewer.is_some());
+        }
+        assert!(
+            fx.drv.find_text("Go to").is_some() || shows(&fx, "0x0 (0)"),
+            "{name}: the hex window was drawn"
+        );
+        fx.key(Key::Escape);
+        assert!(fx.b.viewer.is_none(), "{name}: Esc on its second pass");
+        assert_eq!(fx.current(), name);
+    }
+}
+
+/// W8b: H and Esc in one pass on a remote image's memory line — the owner left as the image
+/// gave way — closes the viewer: the hex window is never installed after the owner left, and
+/// nothing of it is shown.
+#[test]
+fn w8b_esc_in_the_pass_an_image_gives_way_leaves_it() {
+    let mut fx = fixture_with(Some("box"), local_connect(), None);
+    std::fs::write(
+        format!("{}/huge.png", fx.root),
+        png_claiming(100_000, 100_000),
+    )
+    .unwrap();
+    let root = fx.root.clone();
+    fx.b.list(Some(0), root, None, None);
+    fx.settle();
+    fx.key(Key::F9);
+    fx.select("huge.png");
+    fx.key(Key::Enter);
+    pass_until(&mut fx, "the memory line", |b| {
+        b.viewer.is_some() && b.ready()
+    });
+    fx.drv.idle(&mut fx.b, 1);
+    assert!(shows(&fx, "Hex view (H)"), "the memory line");
+    pressed_together(&mut fx, &[Key::H, Key::Escape]);
+    fx.drv.idle(&mut fx.b, 3);
+    assert!(fx.b.viewer.is_none(), "the owner left");
+    assert!(
+        fx.drv
+            .find_text("89 50 4E 47 0D 0A 1A 0A  00 00 00 0D 49 48 44 52")
+            .is_none(),
+        "no hex rows"
+    );
+    assert_eq!(fx.current(), "huge.png");
+}
+
 /// Some text on screen holds `part` (a line of the window's rows, wrapped or not).
 fn shows(fx: &Fx, part: &str) -> bool {
     fx.drv
