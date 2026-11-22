@@ -69,6 +69,16 @@ fn idle(source: &Source) {
     });
 }
 
+/// [`idle`], and no reader of `source` open: what the test's setup opened (a probe's
+/// connections, whose server threads go on after ffprobe has exited) is gone, so what is
+/// measured from here is the test's own.
+fn settled(source: &Source) {
+    until("no reader is open and the stream is idle", || {
+        let mut core = source.core();
+        core.pf.open_ids().is_empty() && !core.queued() && core.pf.adm.in_flight() == 0
+    });
+}
+
 /// 06 §12 V16's `refetched`: the bytes of blocks fetched more than once (`Stats` has none; read
 /// from the engine's trace of what it sent).
 fn refetched(source: &Source) -> u64 {
@@ -103,6 +113,41 @@ fn traced(source: &Source) -> usize {
 fn cap_since(source: &Source, from: usize) -> u64 {
     let core = source.core();
     core.trace[from..].iter().map(|t| t.cap).max().unwrap_or(0)
+}
+
+/// Each block fetched again in a class other than Prefetch, with every fetch of it: its place
+/// in the trace, its class, and the reader it was for (its kind and where it reached).
+fn demand_history(source: &Source) -> String {
+    let core = source.core();
+    let reaches = core.pf.reaches();
+    let reader = |id: Option<u64>| {
+        id.and_then(|id| reaches.iter().find(|r| r.id == id))
+            .map_or("-".to_string(), |r| {
+                format!("r{} {:?} {}..{}", r.id, r.kind, r.from, r.to)
+            })
+    };
+    let mut seen = std::collections::HashSet::new();
+    let again: Vec<u64> = core
+        .trace
+        .iter()
+        .filter_map(|t| t.block.map(|b| (b, t.class)))
+        .filter(|(b, class)| !seen.insert(*b) && *class != Some(Class::Prefetch))
+        .map(|(b, _)| b)
+        .collect();
+    again
+        .iter()
+        .map(|b| {
+            let fetches: Vec<String> = core
+                .trace
+                .iter()
+                .enumerate()
+                .filter(|(_, t)| t.block == Some(*b))
+                .map(|(i, t)| format!("#{i} {:?} for {}", t.class, reader(t.reader)))
+                .collect();
+            format!("block {b}: {}", fetches.join("; "))
+        })
+        .collect::<Vec<_>>()
+        .join(" | ")
 }
 
 /// A 600 s video (1 Mbit/s, 320×240, a key frame every 8 s, AAC sound): its `moov` at the end,
@@ -258,7 +303,7 @@ fn v16_a_render_of_24_reordered_pieces_fetches_within_its_bound() {
             let pieces = reordered(24, 1.0, 600.0);
             let spec = spec_of(&media, &pieces);
             assert_eq!(spec.groups_from(&media.input).len(), 24, "24 inputs");
-            idle(&source);
+            settled(&source);
             let before = source.stats();
             let from = traced(&source);
             let inputs = spec.groups_from(&media.input).len() as u64;
@@ -276,7 +321,8 @@ fn v16_a_render_of_24_reordered_pieces_fetches_within_its_bound() {
                 &mut |_| {},
             )
             .unwrap();
-            idle(&source);
+            // Every reader of the render closed: what they fetched is counted.
+            settled(&source);
             let after = source.stats();
             let served = media.input.served().unwrap();
             assert_eq!(served.server().cuts(Kind::Render), 0, "{name}: no cut");
@@ -358,7 +404,7 @@ fn v16_playback_of_an_edit_fetches_within_its_bound() {
         assert!(tl.set_clips(clips, View::default()));
         let rate = source.size() / media.duration as u64;
         let (ahead, _) = limits(ReaderKind::Media { bytes_per_s: rate });
-        idle(&source);
+        settled(&source);
         for at in [5.0, 45.0, 85.0] {
             let from = tl.tick(at);
             let src = playback::Source {
@@ -406,7 +452,9 @@ fn v16_playback_of_an_edit_fetches_within_its_bound() {
                 std::thread::sleep(Duration::from_millis(5));
             }
             drop(player);
-            idle(&source);
+            // Every reader of this start closed: what they fetched is this start's, and the
+            // next start begins with none of them.
+            settled(&source);
             let now = source.stats();
             let fetched = now.fetched.total - stats.fetched.total;
             let again = refetched(&source) - again;
@@ -427,7 +475,8 @@ fn v16_playback_of_an_edit_fetches_within_its_bound() {
             assert_eq!(
                 fetched_again(&source).1,
                 0,
-                "from {at} s: a demand fetched again"
+                "from {at} s: a demand fetched again: {}",
+                demand_history(&source)
             );
             // What the start's readers were let read: each one's readahead never past its
             // allowance, and every block that came again inside what one of them reached —
@@ -1144,7 +1193,7 @@ fn v18_an_mp3_seeks_fast_to_play_and_exactly_to_export() {
             "a LAME Info tag: the play input seeks fast"
         );
         assert!(media.input.options().iter().any(|o| o == "+fastseek"));
-        idle(&source);
+        settled(&source);
         let before = source.fetched().total;
         let src = playback::Source {
             input: media.input.clone(),
@@ -1305,8 +1354,12 @@ fn v19_the_waveform_yields_to_playback() {
         let media = stepping(&mut engine, || {
             Media::served(&tools, served.clone(), "m.mp3", "m.mp3").unwrap()
         });
-        idle_stepped(&source, &mut engine);
-        let from = source.core().trace.len();
+        // No reader but the waveform's from here: the probe's connections are gone.
+        settled_stepped(&source, &mut engine);
+        let (from, before) = {
+            let core = source.core();
+            (core.trace.len(), core.pf.last_id())
+        };
         let decode = wave::start(&tools, &media.input, 2, media.duration, || {});
         // The pass streams, then — no step — runs out of blocks and waits for its next one.
         let start = source.stats().fetched;
@@ -1323,7 +1376,30 @@ fn v19_the_waveform_yields_to_playback() {
         });
         engine.pump();
         let n = source.core().trace.len();
+        // Its readers, and only theirs: every one a bulk reader, every request for one a Bulk
+        // one, and no request sent meanwhile for a reader opened before it.
+        let waveform: Vec<u64> = {
+            let core = source.core();
+            core.pf
+                .reaches()
+                .iter()
+                .filter(|r| r.id > before)
+                .map(|r| r.id)
+                .collect()
+        };
+        assert!(!waveform.is_empty(), "the waveform opened no reader");
+        for r in source.core().pf.reaches().iter().filter(|r| r.id > before) {
+            assert_eq!(
+                r.kind,
+                ReaderKind::Bulk,
+                "a waveform reader of another kind: {r:?}"
+            );
+        }
         for t in &source.core().trace[from..n] {
+            assert!(
+                t.reader.is_none_or(|r| waveform.contains(&r)),
+                "a request for a reader that is not the waveform's: {t:?}"
+            );
             assert!(
                 matches!(t.class, Some(Class::Bulk) | None),
                 "a waveform request in another class: {t:?}"
@@ -1445,12 +1521,67 @@ fn esc_and_the_button_cancel_a_running_export() {
 }
 
 /// [`idle`] for a stream whose engine the test steps.
-fn idle_stepped(source: &Source, engine: &mut Engine) {
+/// [`settled`] and [`settled_stepped`] return only once every reader is closed — a reader left
+/// open by a test's setup (here one a thread closes 300 ms on, after it asked for a block) is
+/// waited for, though nothing is queued meanwhile.
+#[test]
+fn settling_waits_for_every_reader_to_close() {
+    bounded(120, |t| {
+        let dir = t.tmp();
+        let path = dir.path().join("f");
+        std::fs::write(&path, vec![1u8; 4 << 20]).unwrap();
+        let lingers = |source: &Source| {
+            let mut reader = source.reader(ReaderKind::Media { bytes_per_s: 0 });
+            let closed = Arc::new(Mutex::new(None));
+            let at = closed.clone();
+            let thread = std::thread::spawn(move || {
+                let mut buf = [0u8; 16];
+                let _ = reader.read_at(0, &mut buf, &AtomicBool::new(false));
+                std::thread::sleep(Duration::from_millis(300));
+                drop(reader);
+                *at.lock().unwrap() = Some(Instant::now());
+            });
+            (thread, closed)
+        };
+        let Some(source) = streamed(&path) else {
+            return;
+        };
+        let (thread, closed) = lingers(&source);
+        until("the reader has read", || source.fetched().total > 0);
+        settled(&source);
+        let back = Instant::now();
+        thread.join().unwrap();
+        assert!(
+            closed.lock().unwrap().is_some_and(|c| c <= back),
+            "settled before the close"
+        );
+        let Some((source, mut engine)) = stepped(&path) else {
+            return;
+        };
+        let (thread, closed) = lingers(&source);
+        until("the reader waits", || {
+            source.core().pf.waiting_readers() == 1
+        });
+        engine.step(Some(Duration::from_millis(5)));
+        settled_stepped(&source, &mut engine);
+        let back = Instant::now();
+        thread.join().unwrap();
+        assert!(
+            closed.lock().unwrap().is_some_and(|c| c <= back),
+            "settled before the close"
+        );
+    });
+}
+
+/// Steps `engine` until no reader of `source` is open and it is idle: what was opened for the
+/// test's setup (a probe's connections, whose server threads go on after ffprobe has exited)
+/// is gone, and nothing it asked for is still to be sent.
+fn settled_stepped(source: &Source, engine: &mut Engine) {
     let give_up = Instant::now() + Duration::from_secs(60);
     loop {
         {
             let mut core = source.core();
-            if !core.queued() && core.pf.adm.in_flight() == 0 {
+            if core.pf.open_ids().is_empty() && !core.queued() && core.pf.adm.in_flight() == 0 {
                 return;
             }
         }
@@ -1617,7 +1748,8 @@ fn a_stream_cut_short_fails_every_run_with_the_source_s_state() {
         let media = stepping(&mut engine, || {
             Media::served(&tools, served.clone(), "v.mp4", "v.mp4").unwrap()
         });
-        idle_stepped(&source, &mut engine);
+        // No reader open: the readers counted below are the runs'.
+        settled_stepped(&source, &mut engine);
         // The waveform streams, then — no step — waits for its next block.
         let wave = wave::start(&tools, &media.input, 2, media.duration, || {});
         while source.stats().fetched.bulk < 4 * MIB {

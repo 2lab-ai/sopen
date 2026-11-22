@@ -221,6 +221,8 @@ pub(crate) struct Traced {
     /// What was in flight, and the cap, when it was sent.
     pub in_flight: u64,
     pub cap: u64,
+    /// The reader it was sent for (a block's first read), if any.
+    pub reader: Option<u64>,
 }
 
 pub(crate) struct Core {
@@ -369,6 +371,13 @@ impl Core {
     }
 
     fn record(&mut self, ticket: u64, bytes: u64, kind: OutKind) {
+        self.record_for(ticket, bytes, kind, None);
+    }
+
+    /// [`Core::record`], the send made for `reader` (the tests' trace says so).
+    fn record_for(&mut self, ticket: u64, bytes: u64, kind: OutKind, reader: Option<u64>) {
+        #[cfg(not(test))]
+        let _ = reader;
         #[cfg(test)]
         {
             let (class, block) = match &kind {
@@ -383,6 +392,7 @@ impl Core {
                 bytes,
                 in_flight: self.pf.adm.in_flight(),
                 cap: self.pf.adm.cap(),
+                reader,
             });
         }
         self.pf.adm.sent(bytes);
@@ -423,7 +433,7 @@ impl Core {
             first: rest.is_none(),
             attempt,
         };
-        self.record(ticket.0, len as u64, kind);
+        self.record_for(ticket.0, len as u64, kind, cand.reader);
         true
     }
 
