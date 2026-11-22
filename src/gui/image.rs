@@ -1617,6 +1617,7 @@ pub fn open(file: ImageFile, hooks: &Hooks, notices: Vec<String>) -> Result<Outc
     }
     let mut window = ImageWindow::new(file, doc, sel, block, notices);
     window.ask_close = hooks.state.ask_close;
+    window.restore_first = hooks.state.restore;
     window.scripted = hooks.screenshot.is_some();
     window.script = keys_hook()?;
     let outcome = window.outcome.clone();
@@ -1980,6 +1981,8 @@ struct ImageWindow {
     held: Option<Held>,
     /// `SOPEN_STATE` `close=ask`: closing is asked for on the first pass.
     ask_close: bool,
+    /// `SOPEN_STATE` `restore=1`: Restore on the first recovery row is pressed once it is drawn.
+    restore_first: bool,
     /// A preview in the file browser (02 §4.2): the picture fitted in a single-lined frame, no
     /// toolbars, status row or disclosures, and no input of its own.
     preview: bool,
@@ -2128,6 +2131,7 @@ impl ImageWindow {
             text_colour: Color32::BLACK,
             held: None,
             ask_close: false,
+            restore_first: false,
             preview: false,
             shown: None,
             keeper,
@@ -2406,6 +2410,8 @@ impl ImageWindow {
         let mut answer = None;
         // While a removal runs, no row takes an answer (one runs at a time).
         let busy = self.removing.is_some();
+        // `restore=1`: the first row's Restore, pressed as a click would.
+        let press_first = self.restore_first && !self.rows.is_empty() && !busy;
         for (i, row) in self.rows.iter().enumerate() {
             let line = row_line(row);
             let pending = busy;
@@ -2430,7 +2436,7 @@ impl ImageWindow {
                         } else {
                             "Restore"
                         };
-                        if can && ui.button(label).clicked() {
+                        if can && (ui.button(label).clicked() || (i == 0 && press_first)) {
                             answer = Some((i, Answer::Restore));
                         }
                     }
@@ -2455,6 +2461,9 @@ impl ImageWindow {
                     }
                 });
             });
+        }
+        if press_first {
+            self.restore_first = false;
         }
         if let Some((i, answer)) = answer {
             self.answer(i, answer);
@@ -3351,6 +3360,9 @@ impl ImageWindow {
             && self.keeper.settled()
             && self.recovering.is_none()
             && self.saving_as.as_ref().is_none_or(|s| !s.modal.busy())
+            // `restore=1`: not before the listing is back and its first row's Restore pressed —
+            // keys played after it act on the restored picture.
+            && !(self.restore_first && (!self.listed || !self.rows.is_empty()))
     }
 
     /// `zoom` is the previous pass's (the image is laid out after the bar).
@@ -4402,6 +4414,7 @@ impl Streaming {
         }
         let mut window = ImageWindow::new(file, doc, sel, block, notices);
         window.ask_close = self.hooks.state.ask_close;
+        window.restore_first = self.hooks.state.restore;
         window.scripted = self.hooks.screenshot.is_some();
         window.script = std::mem::take(&mut self.script);
         window.outcome = self.outcome.clone();

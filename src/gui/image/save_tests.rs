@@ -1369,6 +1369,98 @@ fn a_save_asks_when_removing_its_own_earlier_temp_fails() {
     }
 }
 
+/// Keep it is kept: the cut-off Save's own temp, whose removal failed when the next Save
+/// reconciled it, is asked about; the owner says Keep it while a removal would now succeed. The
+/// resumed Save removes nothing there — no further remove request of it — and lands. Through
+/// both sides.
+#[test]
+fn keep_it_keeps_the_saves_own_temp_even_when_removing_it_would_work_now() {
+    for side in sides() {
+        let mut rig = rig(side).unwrap();
+        rig.crop();
+        let output = rig.win.doc.encode().unwrap().bytes;
+        rig.cut(Cut::DieAfterTempStat);
+        rig.save();
+        let temp = left_by(&rig).temp.unwrap();
+        let temp_s = temp.to_str().unwrap().to_string();
+        rig.control.dead.store(false, Ordering::SeqCst);
+        rig.cut(Cut::FailRemove);
+        rig.key(Key::S, command(false));
+        rig.drv.until(&mut rig.win, 10, |w| w.asking.is_some());
+        rig.drv.idle(&mut rig.win, 2);
+        // A removal would work now.
+        rig.cut(Cut::None);
+        rig.control.taken();
+        rig.drv.click_text(&mut rig.win, "Keep it");
+        rig.drv.until(&mut rig.win, 10, |w| w.quiet());
+        rig.drv.idle(&mut rig.win, 2);
+        assert_eq!(
+            std::fs::read(&temp).unwrap(),
+            output,
+            "{side:?}: kept as it was"
+        );
+        let sent = rig.control.taken();
+        assert!(
+            sent.iter()
+                .all(|r| !r.starts_with("remove") || !r.ends_with(&temp_s)),
+            "{side:?}: a remove of the kept temp was sent: {sent:?}"
+        );
+        assert_eq!(
+            std::fs::read(&rig.path).unwrap(),
+            output,
+            "{side:?}: landed"
+        );
+        assert!(rig.journals().is_empty(), "{side:?}");
+    }
+}
+
+/// Remove it for the Save's question, its removal refused by the server: the reason is shown,
+/// the record and the temp stay, the file is untouched, and no Save starts. Through both sides.
+#[test]
+fn remove_it_refused_at_answer_time_starts_no_save() {
+    for side in sides() {
+        let (mut rig, temp, original, _) = to_the_question(side);
+        rig.cut(Cut::FailRemove);
+        rig.drv.click_text(&mut rig.win, "Remove it");
+        rig.drv.until(&mut rig.win, 10, |w| {
+            w.answering.is_none() && w.asking.is_none()
+        });
+        rig.drv.idle(&mut rig.win, 3);
+        assert!(rig.win.status.error, "{side:?}: {}", rig.win.status.text);
+        assert!(
+            rig.win.status.text.contains("could not be removed"),
+            "{side:?}: {}",
+            rig.win.status.text
+        );
+        assert!(
+            rig.win.job.is_none() && rig.win.queued.is_none(),
+            "{side:?}: no Save"
+        );
+        assert_eq!(
+            rig.phase().as_deref(),
+            Some("Naming"),
+            "{side:?}: the record stays"
+        );
+        assert_eq!(
+            std::fs::read(&temp).unwrap(),
+            b"",
+            "{side:?}: the temp stays"
+        );
+        assert_eq!(
+            std::fs::read(&rig.path).unwrap(),
+            original,
+            "{side:?}: untouched"
+        );
+        assert!(
+            rig.control
+                .writes()
+                .iter()
+                .all(|w| !w.contains(rig.path.to_str().unwrap())),
+            "{side:?}: nothing sent for the file"
+        );
+    }
+}
+
 /// Esc drops a Save still in its queue — here waiting on its question: nothing is sent, the
 /// question goes with it and its record stays (the next Save asks again); with a close waiting
 /// on that Save, the close prompt comes up.
@@ -1567,7 +1659,10 @@ fn the_lock_retry_counts_only_this_files_journals() {
         home.join("shot.png.journal-20261122T010203Z-89abcdef"),
     )
     .unwrap();
-    assert_eq!(file::this_files_journals(&cache, "box", abs), vec![ours]);
+    assert_eq!(
+        crate::journal::this_files_journals(&cache, "box", abs),
+        vec![ours]
+    );
 }
 
 /// The local disk for the journal, with gates and a trace: `list` (the look for earlier
@@ -1727,6 +1822,8 @@ fn nothing_the_journal_waits_on_holds_the_window_and_a_save_waits_for_the_journa
     );
     assert!(rig.control.writes().is_empty(), "nothing sent");
     assert!(!dog.fired(), "a pass waited on a held gate");
+    // The watchdog catches a pass that waits until a gate opens; this catches one that waits on
+    // a held gate with a timeout of its own (each pass would take at least that long).
     assert!(
         slowest < Duration::from_millis(300),
         "a pass waited: {slowest:?}"

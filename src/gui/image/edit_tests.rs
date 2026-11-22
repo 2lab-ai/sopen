@@ -343,6 +343,59 @@ fn after_a_save_the_journal_goes_and_the_next_is_against_the_saved_files_whole_h
     assert_eq!(words(&gen), ["pixelize"], "only what is not in the file");
 }
 
+/// `SOPEN_STATE` `restore=1`: once the rows of the journals a killed session left are drawn,
+/// the first row's Restore is pressed as a click would, once — the picture is the crop that
+/// session kept, and the journal is this window's. Without it the row waits for the owner.
+#[test]
+fn restore_1_presses_the_first_rows_restore_once_it_is_drawn() {
+    let mut fx = open();
+    fx.select([0, 0, 70, 50]);
+    fx.key(Key::C, Modifiers::NONE);
+    fx.blur();
+    let kept = fx.win.doc.img.clone();
+    fx.reopen();
+    assert!(fx.drv.find_text("Restore").is_some(), "the row waits");
+    assert_eq!(fx.win.doc.size(), (W, H), "nothing restored unasked");
+    let mut next = window_on(&fx.path, &fx.cache);
+    next.restore_first = true;
+    drop(std::mem::replace(&mut fx.win, next));
+    fx.drv = Driver::new(1000.0, 700.0);
+    fx.drv
+        .until(&mut fx.win, 10, |w| w.listed && w.rows.is_empty());
+    fx.drv.idle(&mut fx.win, 2);
+    assert!(
+        fx.win.doc.img == kept,
+        "the picture is the crop that session kept"
+    );
+    assert!(
+        fx.status().starts_with("restored 1 edit"),
+        "{}",
+        fx.status()
+    );
+    assert!(!fx.win.restore_first, "pressed once");
+    assert_eq!(fx.journals().len(), 1, "this window's now");
+}
+
+/// `restore=1` with `SOPEN_KEYS`: the keys are played only after Restore was pressed, so a played
+/// Cmd+S saves the restored picture.
+#[test]
+fn keys_played_after_restore_1_act_on_the_restored_picture() {
+    let mut fx = open();
+    fx.select([0, 0, 70, 50]);
+    fx.key(Key::C, Modifiers::NONE);
+    fx.blur();
+    let kept = fx.win.doc.img.clone();
+    let mut next = window_on(&fx.path, &fx.cache);
+    next.restore_first = true;
+    next.script = crate::gui::browser::parse_keys("Cmd+S").unwrap().into();
+    drop(std::mem::replace(&mut fx.win, next));
+    fx.drv = Driver::new(1000.0, 700.0);
+    fx.drv.until(&mut fx.win, 20, crate::gui::Window::ready);
+    let saved = Doc::decode(&std::fs::read(&fx.path).unwrap()).unwrap();
+    assert_eq!(saved.size(), (70, 50), "{}", fx.status());
+    assert!(saved.img == kept, "the restored picture was saved");
+}
+
 /// 07 §10, E18: while a Save runs, typing, paste, cut, crop, pixelize, undo and redo do nothing,
 /// and the status row says why; once it ends, editing resumes.
 #[test]
@@ -425,7 +478,10 @@ fn no_edit_undo_or_redo_while_a_save_runs() {
     fx.drv.paste_image(&mut fx.win, clipboard_picture());
     assert!(fx.win.doc.img != img, "the picture paste after the save");
     fx.key(Key::Z, command(false));
-    assert_ne!(fx.win.doc.rev(), before.0, "undo works again");
+    assert!(
+        fx.win.doc.img == img,
+        "undo works again: the picture paste undone"
+    );
 }
 
 /// Types `path` into the Save As modal's field, over what it holds, and presses Enter.

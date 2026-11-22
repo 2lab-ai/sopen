@@ -327,13 +327,20 @@ impl ImageFile {
             journal::reconcile(&intent, &host, &mut patch::Fresh::new(patcher))
         };
         let mut notes = Vec::new();
-        // A file at the temp path sopen cannot prove its own: asked about — the record that
-        // holds the question stays — unless the owner said Keep it for that path.
-        let mut ask = |path: &str, why: &str, fs: &mut dyn RemoteFs| -> Result<Option<Saved>> {
-            if kept.as_deref() == Some(path) {
-                notes.push(format!("{host}:{path} is kept, as you answered"));
-                return Ok(None);
-            }
+        // A file at the temp path the owner said Keep it for: nothing is removed there, not even
+        // a removal that would now succeed — it is kept, said so, and the Save's outcome is
+        // reconciled as ever.
+        let temp_path = match &reconciled.temp {
+            journal::Temp::Remove(path) | journal::Temp::Keep { path, .. } => Some(path.as_str()),
+            journal::Temp::None | journal::Temp::Gone(_) => None,
+        };
+        let kept_here = temp_path.is_some() && kept.as_deref() == temp_path;
+        if let (true, Some(path)) = (kept_here, temp_path) {
+            notes.push(format!("{host}:{path} is kept, as you answered"));
+        }
+        // A file at the temp path sopen cannot prove its own, or whose removal failed: asked
+        // about — the record that holds the question stays.
+        let ask = |path: &str, why: &str, fs: &mut dyn RemoteFs| -> Result<Option<Saved>> {
             match look_at(fs, path) {
                 Ok(Some((seen, sha))) => Ok(Some(Saved::Ask(LeftTemp {
                     path: path.to_string(),
@@ -354,6 +361,7 @@ impl ImageFile {
             }
         };
         let asked = match &reconciled.temp {
+            _ if kept_here => None,
             // Provably that Save's temp: removed once its stat is still the recorded one, read
             // again right before; otherwise asked about.
             journal::Temp::Remove(path) => {
@@ -1147,54 +1155,6 @@ pub(super) fn remove_left(
     Ok(format!("removed {shown}"))
 }
 
-/// `<file>.journal-<UTC stamp>-<8 hex>` exactly, as `Journal::create` names one.
-fn journal_name(entry: &str, file: &str) -> bool {
-    let Some(id) = entry
-        .strip_prefix(file)
-        .and_then(|rest| rest.strip_prefix(".journal-"))
-    else {
-        return false;
-    };
-    let b = id.as_bytes();
-    b.len() == 25
-        && b[..8].iter().all(u8::is_ascii_digit)
-        && b[8] == b'T'
-        && b[9..15].iter().all(u8::is_ascii_digit)
-        && b[15] == b'Z'
-        && b[16] == b'-'
-        && b[17..]
-            .iter()
-            .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(c))
-}
-
-/// The journals of this file (`abs` on `host`) on disk, by directory: each named as a journal
-/// of it, and — where its generation can be read — written for this host and path (a journal
-/// of another file whose cache path maps to the same place is not this file's). One whose
-/// generation cannot be read counts: the listing names it too, once its lock is free.
-pub(super) fn this_files_journals(cache: &Path, host: &str, abs: &str) -> Vec<PathBuf> {
-    let base = crate::cache::edits_path(cache, host, abs);
-    let (Some(home), Some(name)) = (base.parent(), base.file_name()) else {
-        return Vec::new();
-    };
-    let file = name.to_string_lossy();
-    let head_is_ours = |dir: &Path| -> bool {
-        let gen = std::fs::read(dir.join("CURRENT"))
-            .ok()
-            .and_then(|bytes| journal::parse_current(&bytes).ok())
-            .and_then(|at| std::fs::read(dir.join(format!("gen-{}", at.n))).ok())
-            .and_then(|bytes| journal::parse_generation(&bytes).ok());
-        gen.is_none_or(|g| g.head.host == host && g.head.path == abs)
-    };
-    std::fs::read_dir(home)
-        .into_iter()
-        .flatten()
-        .flatten()
-        .filter(|e| journal_name(&e.file_name().to_string_lossy(), &file))
-        .map(|e| e.path())
-        .filter(|dir| head_is_ours(dir))
-        .collect()
-}
-
 /// Restore's reads of the file (07 §3: the image is read whole to show it anyway): its stat as
 /// opened, and the whole SHA-256 of the bytes read.
 struct Opened<'a> {
@@ -1246,7 +1206,7 @@ pub(super) fn recover(
             )),
         }
         // The ones this listing holds are taken now: a list again finds only those it missed.
-        let missing = this_files_journals(&cache, &host, &abs)
+        let missing = journal::this_files_journals(&cache, &host, &abs)
             .into_iter()
             .any(|dir| orphans.iter().all(|o: &Orphan| o.dir() != dir));
         if !missing || started.elapsed() >= LOCK_RETRY {
