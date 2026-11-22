@@ -344,7 +344,18 @@ too, where F3 closes it as ⌘W does.
   characters meet where the middle is cut that are not neighbours in the run, and past 64
   different characters a test over the whole run sees the first 64; and a back-reference (a
   heredoc's delimiter) reads two long runs as one when they shorten alike — the same ends and
-  stretches, each the same length modulo 16 (200 and 216 `x`s).
+  stretches, each the same length modulo 16 (200 and 216 `x`s). So does a chain of more than 128
+  characters — names joined by one `.`, `,`, `-` or `$`, the same each time (a dotted name in
+  Python, Java or JavaScript, an argument list in Go, Java's names with `$`: 10–61 ms a line of
+  1,000 parsed whole) — and in YAML any stretch of a line without `: # [ ] { } " ' \` of more
+  than 128 (a long value, prose, quoted or in a list: YAML scans the rest of the line for a
+  second key, 5–7 ms a value of 500): whole units of it — a name, or what spaces part — from
+  each end, an even number left out between (TeX's `$` turns math on and off), the left-out
+  part coloured as the character kept before it. That is its colour but where a grammar colours
+  a chain's names apart from what joins them (SQL's `a.b.c`, TeX's `$`, JavaScript's
+  `a.b.c.f = function`, PHP's constants, a list of `true,false,null`) or a YAML flow collection
+  item by item. A number or a run over 128 parts a chain, shortened apart; a list of numbers
+  is no chain.
   The file is read live, the index is of the file as
   scanned, checked when the viewer opens and before each page against the open handle and the
   path it was opened by. Both still showing the indexed device, inode, size and modification
