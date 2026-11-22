@@ -1845,6 +1845,49 @@ fn nothing_the_journal_waits_on_holds_the_window_and_a_save_waits_for_the_journa
     assert!(rig.journals().is_empty());
 }
 
+/// A Save waits in its queue until the journal holds its edits, with no job yet: a wait for an
+/// empty `job` returns before it ran, and the file read then is still the original (the macOS
+/// preview failure on b3cf430). With the generation held: queued, no job, the file the original
+/// — and the Save has not ended; released, it ends with the file saved.
+#[test]
+fn a_save_waiting_in_its_queue_has_not_ended() {
+    let mut rig = rig(Side::Local).unwrap();
+    let gates = Arc::new(GatedDisk::default());
+    rig.win.keeper = file::Keeper::at(gates.clone(), &rig.win.file.lock().unwrap());
+    rig.crop();
+    let original = std::fs::read(&rig.path).unwrap();
+    gates.write_held.store(true, Ordering::SeqCst);
+    rig.win.sel.set([0, 0, 10, 10]);
+    rig.drv.idle(&mut rig.win, 1);
+    rig.key(Key::P, Modifiers::NONE);
+    let want = rig.win.doc.encode().unwrap().bytes;
+    let since = rig.win.saves_ended;
+    rig.key(Key::S, command(false));
+    for pass in 0..5 {
+        rig.drv.idle(&mut rig.win, 1);
+        assert!(
+            rig.win.job.is_none() && rig.win.queued.is_some(),
+            "queued ({pass})"
+        );
+        assert!(
+            !rig.win.save_ended(since),
+            "not ended while queued ({pass})"
+        );
+        assert_eq!(
+            std::fs::read(&rig.path).unwrap(),
+            original,
+            "not written ({pass})"
+        );
+    }
+    gates.write_held.store(false, Ordering::SeqCst);
+    rig.drv.until(&mut rig.win, 10, |w| w.save_ended(since));
+    assert_eq!(
+        std::fs::read(&rig.path).unwrap(),
+        want,
+        "saved once it ended"
+    );
+}
+
 /// 07 §7: Alt+Cmd/Ctrl+S is Save As, not Save — egui's own check would take it for Cmd/Ctrl+S.
 /// No request that writes is sent while the modal is up; Esc closes it, nothing written.
 #[test]

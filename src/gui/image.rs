@@ -1949,6 +1949,9 @@ struct ImageWindow {
     view: View,
     status: Status,
     job: Option<Job>,
+    /// How many saves have ended — a result taken, a refusal, a stop: what a wait for a save's
+    /// end counts (a queued Save has no `job` yet, so an empty `job` is not an end).
+    saves_ended: u64,
     outcome: Arc<Mutex<Outcome>>,
     prompt: bool,
     close_ok: bool,
@@ -2113,6 +2116,7 @@ impl ImageWindow {
             view: View::default(),
             status: Status::default(),
             job: None,
+            saves_ended: 0,
             outcome: Arc::default(),
             prompt: false,
             close_ok: false,
@@ -2164,6 +2168,17 @@ impl ImageWindow {
     #[cfg(test)]
     fn saving_or_queued(&self) -> bool {
         self.job.is_some() || self.queued.is_some()
+    }
+
+    /// The save asked for after [`ImageWindow::saves_ended`] was `since` has ended: its result
+    /// taken (or it was refused or stopped), and nothing runs, waits in the queue or is open in
+    /// Save As (tests).
+    #[cfg(test)]
+    fn save_ended(&self, since: u64) -> bool {
+        self.saves_ended > since
+            && self.job.is_none()
+            && self.queued.is_none()
+            && self.saving_as.is_none()
     }
 
     /// Nothing runs or waits: no save, no generation being written or due, the look for
@@ -2601,6 +2616,7 @@ impl ImageWindow {
             Ok(line) => self.status = Status::info(format!("{line} · {SAVING}")),
             Err(why) => {
                 self.queued = None;
+                self.saves_ended += 1;
                 self.status = Status::error(format!("not saved: {why}"));
                 self.pending_notices = Some(vec![format!(
                     "{why} — not saved; Save again to be asked about the file there now"
@@ -2948,6 +2964,7 @@ impl ImageWindow {
             Ok(JobDone::Encoded(encoded)) => {
                 if std::mem::take(&mut self.close_when_done) {
                     // Closing was asked for meanwhile: that, not Save As.
+                    self.saves_ended += 1;
                     self.status = Status::default();
                     if self.doc.unsaved() {
                         self.prompt = true;
@@ -2970,6 +2987,7 @@ impl ImageWindow {
             }
             other => other,
         };
+        self.saves_ended += 1;
         let (status, shown) = report(&result, &mut self.outcome.lock().unwrap());
         self.status = status;
         self.pending_notices = Some(shown);
@@ -3076,6 +3094,7 @@ impl ImageWindow {
         let busy = open.modal.busy();
         match ended {
             Some(save_as::Ended::Saved { line, notes, .. }) => {
+                self.saves_ended += 1;
                 let open = self.saving_as.take().expect("open");
                 self.doc.mark_copied(open.rev);
                 self.status = Status::info(line);
@@ -3091,6 +3110,7 @@ impl ImageWindow {
                 }
             }
             Some(save_as::Ended::Closed) => {
+                self.saves_ended += 1;
                 self.saving_as = None;
                 self.close_when_done = false;
                 self.status = Status::info("Save As closed: nothing was saved");
@@ -3124,6 +3144,7 @@ impl ImageWindow {
         // nothing was sent. A question stays with its record, asked by the next Save.
         if self.job.is_none() && self.queued.is_some() && plain_key(ctx, Key::Escape) {
             self.queued = None;
+            self.saves_ended += 1;
             if self.answering.is_none() {
                 self.asking = None;
             }

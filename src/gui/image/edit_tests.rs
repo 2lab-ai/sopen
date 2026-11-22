@@ -802,9 +802,13 @@ fn a_streamed_image_past_the_memory_line_keeps_restores_and_saves_its_crop() {
     drv.click_text(&mut win, "Restore");
     drv.idle(&mut win, 2);
     assert_eq!(win.image.as_deref().unwrap().doc.size(), (60, 40));
-    // Save: the backup of the original first, then the encoded output over the file.
+    // Save: the backup of the original first, then the encoded output over the file — read once
+    // the Save has ended (it first waits in its queue for the journal, with no job yet).
+    let since = win.image.as_deref().unwrap().saves_ended;
     drv.key(&mut win, Key::S, command(false));
-    drv.until(&mut win, 10, |w| w.image.as_deref().unwrap().job.is_none());
+    drv.until(&mut win, 20, |w| {
+        w.image.as_deref().unwrap().save_ended(since)
+    });
     drv.idle(&mut win, 2);
     let image = win.image.as_deref().unwrap();
     let saved = std::fs::read(&path).unwrap();

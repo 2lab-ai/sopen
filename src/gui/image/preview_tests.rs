@@ -53,14 +53,14 @@ fn previewed() -> Fx {
 /// What input could change in the image window.
 fn state(win: &ImageWindow) -> String {
     format!(
-        "rev={} dirty={} rect={:?} scale={:?} centre={:?} job={} prompt={} status={:?} \
+        "rev={} dirty={} rect={:?} scale={:?} centre={:?} saving={} prompt={} status={:?} \
          fit={:?} transparent={}",
         win.doc.rev(),
         win.doc.dirty(),
         win.rect(),
         win.view.scale,
         win.view.center,
-        win.job.is_some(),
+        win.saving_or_queued(),
         win.prompt,
         win.status.text,
         win.fit,
@@ -235,9 +235,10 @@ fn a_large_image_is_previewed_fitted_and_handed_over_whole() {
     let red = egui::ColorImage::new([8, 8], vec![Color32::RED; 64]);
     drv.paste_image(&mut win, red);
     assert!(win.doc.rev() > rev, "pasted: {}", win.status.text);
+    let since = win.saves_ended;
     drv.key(&mut win, Key::S, command(false));
     drv.until(&mut win, 20, |w| {
-        w.job.is_none() && w.status.text.starts_with("saved")
+        w.save_ended(since) && w.status.text.starts_with("saved")
     });
     let saved = image::open(&path).unwrap();
     assert_eq!((saved.width(), saved.height()), (cw, ch), "saved whole");
