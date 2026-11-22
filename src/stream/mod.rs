@@ -13,6 +13,8 @@ mod source;
 #[cfg(test)]
 mod tests;
 
+#[cfg(test)]
+pub(crate) use source::refetches;
 /// Tests elsewhere in the crate step a Source by hand (`Source::build`, `Engine::step`) on the
 /// `Fake`'s simulated clock; `Source::open`'s thread is for real time only.
 #[cfg(test)]

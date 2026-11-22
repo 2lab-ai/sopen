@@ -1655,7 +1655,21 @@ stream <event> t=<ms> <host:/abs> fetched=<b> demand=<b> prefetch=<b> bulk=<b> d
       `moov` at the end, 320×240) the gate does not fix a figure for `refetched`: it grows with
       load. It holds what the engine is allowed to do instead, per start, from the engine's
       own records (test-only `Prefetcher::reaches`):
-      - no block a decoder waited for comes twice;
+      - no block a decoder waited for is waited for again: no block has two fetches that are
+        not prefetches (a bulk read counts as a wait: its class does not tell one from
+        readahead; test-only `stream::refetches`). A block fetched again once as readahead is
+        readahead fetched again, whichever of its two fetches that was. A block waited for at
+        one start can come back as readahead at a later one. Readahead nobody waited for can
+        come back as a demand: a reader that reads it later waits for it. A loaded CI runner
+        showed the last case (block 6: a prefetch of the probe's connection at open, a demand at
+        the 85 s start). Under 85 s of playback the 64 MiB cache
+        let block 6 go, the least recently used under no window. At the 85 s start an opening
+        connection, held open longer than before, had its socket filled on past the head to
+        block 6, and its server read waited for it.
+        - The engine keeps a closed reader's readahead when it lands: it is not dropped.
+          `stream::tests::readahead_landing_after_its_reader_closed_is_kept_and_only_evicted_by_the_budget`
+          shows it on the model link, with a reader closed while its prefetch is in flight. The
+          same test shows the budget's eviction and the two kinds of refetch apart;
       - no reader's readahead window is ever wider than its `ahead`;
       - every time a reader's prefetch targets are set, they lie inside what that read allows
         (test-only `legal_reach`). The allowance is worked out again from the read and §4's
@@ -1676,8 +1690,8 @@ stream <event> t=<ms> <host:/abs> fetched=<b> demand=<b> prefetch=<b> bulk=<b> d
       the reader's readahead (`Readahead::access`), to MBs within a few blocks: in every start
       the widest window was the full `ahead`, 5.1 MB. Its prefetch past the cached head drains for
       as long as ffmpeg keeps the connection open. Those blocks, evicted since an earlier start
-      read them, come again; no reader waits for them, and they are evicted outside every live
-      window.
+      read them, come again, and they are evicted outside every live window. No reader had waited
+      for them before; one may wait for them when they come again (above).
       - Idle, ffmpeg closes such a connection 1–5 ms after opening it.
       - Loaded on macOS (W7: 36 busy loops on 18 cores, and the rest of the lib suite run over
         and over alongside; on Linux, twice as many busy loops as cores), one start's first
