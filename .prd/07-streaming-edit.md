@@ -6,8 +6,9 @@ tags: [sopen, spec, streaming, edit]
 
 # 07 — Editing a streamed file
 
-Status: planned (2026-11-20). This is the contract the edit units (§14) build. Until each lands,
-[`01-spec.md`](01-spec.md) describes what ships.
+Status: in progress (2026-11-22: ED1, ED2 and ED3 merged; ED4, the hex window, in review). This
+is the contract the edit units (§14) build. Until each lands, [`01-spec.md`](01-spec.md)
+describes what ships.
 
 Viewing is [`06-streaming.md`](06-streaming.md). This document reads through 06's `Source`, its
 `Bytes` and its range server. Owner message 17 is quoted whole in 06's header; this is its third
@@ -124,16 +125,27 @@ The journal and §3.1's save reconciliation are **the workstream's reading** of 
   - then `unsaved — kept at <journal>` (the path `~`-shortened, whole on hover);
   - `unsaved — NOT kept on disk (<why>)` in the error colour when a generation cannot be written. The
     close prompt still guards the edits.
+  - The hex window puts this line at the status bar's right end, after what the window last said
+    (which is cut with "…" first). Where the bar has no room for the path in half its width, the
+    line is `unsaved — kept`, the path whole on hover either way.
 - **When it is removed.** When the window closes with nothing unsaved: the edits are in the remote
   file, in a Save copy, or in a Save As. Discard also removes it.
 - **When it is kept.** On any other ending (a crash, a kill, a power loss). The lock is then free.
+  - A scripted run (`SOPEN_SCREENSHOT`, `SOPEN_AUTOSAVE`) keeps nothing when it ends: its edits
+    are its `SOPEN_STATE`'s, not the owner's, and would otherwise come back as a recovery row. The
+    one exception is a Save whose request got no reply: its record is kept, and its place said,
+    since it is what tells later whether that Save landed.
 
 **Recovery.** On open, sopen looks for `<abs path>.journal-*` directories of the same host and path
 whose lock it can take. A lock found taken is tried again for up to 500 ms before the journal counts
 as another live session's: the lock belongs to the open file, and a child that another thread is
 starting (ssh, ffmpeg) holds a copy of every open descriptor from its fork until its exec, so the
 lock of a journal this process has just let go can look taken for that moment. The viewers' open
-path does the retrying (ED4–ED6); `orphans` itself tries once. Each one gets a row:
+path does the retrying (ED4–ED6); `orphans` itself tries once. The hex window lists them at its
+first pass as a viewer, in the background — never as a browser preview, which must not hold
+another session's journals — and tries a taken lock again every 50 ms for up to 500 ms. Its
+`Origin` connects for the listing only when there is a journal to check (reconcile, Restore's
+reads): that is its first use (06 §2). Each one gets a row:
 
 > unsaved edits from 2026-11-20 11:42 (4 bytes changed) kept at ~/…/model.bin.journal-… — [Restore] [Later] [Discard]
 
@@ -163,6 +175,14 @@ byte.
   - **Restored edits are unsaved edits against the file as now opened.** The window's baseline is
     the current open's fingerprint, its `seen` pages are taken again, and a later Save runs every
     check of §4 against that baseline.
+- **Restore in a window that has edits of its own** is refused (`undo or save them first`): one
+  window keeps one journal.
+- **Restored bytes land as their pages arrive** (over a stream, as a typed byte needs its page).
+  Until all are in, the journal Restore took over is left exactly as it is — no generation holds a
+  part of them, closing asks, and a window that goes anyway leaves it for the next open — and no
+  Save starts. The status row says `putting back N bytes…`, then `restored N bytes`.
+- **A journal that holds no edit** (its edits undone before the end) is removed when it is listed:
+  there is nothing to offer.
 - **Later** leaves the journal for the next open.
 - **Discard** removes it.
 - A journal of **another kind** (the same file opened as hex earlier, now as an image) is named in
@@ -213,6 +233,11 @@ offered:
   For hex, the undo file was written before the patch (§5.1) and stays.
   - In a live session the same holds at once: the window's next baseline is the "next baseline"
     column above, and the journal goes when nothing is unsaved.
+  - **A Save of this session that got no reply** leaves its record. The next Save reconciles it from
+    fresh reads before it sends anything. Landed: `… landed (found now): nothing was written
+    again`, and the window takes the bytes it wrote as the file's. Not landed: its provable temp is
+    removed, the record ends, and the Save goes on. Anything else: that Save is refused with the
+    line, naming what to check.
 - **Not landed** (the target still matches the pre-save evidence). The edits stay, offered by
   Restore. A temp is removed only under the ownership rule below.
 - **Write in place, classified run by run.** Each run recorded in `writing` is read back by its own
@@ -226,6 +251,15 @@ offered:
 - **Unknown:** anything else. Nothing is removed, and the row names the target and the temp (`a save
   was cut off; check host:/abs and host:/…/.model.bin.sopen-…`). Restore stays available under §3's
   checks.
+  - **Restore of a journal whose Save is unknown or in part** takes the edits over and ends the
+    record: the row has named what to check, and the edits are the window's from then on.
+- **Not landed, with a temp of uncertain ownership:** the record stays: it holds the question
+  about the temp (below), which the journal's row asks under its own line with **Remove it** and
+  **Keep it**. Either answer ends the record — Remove it once the file is gone, Keep it leaving
+  the file where it is, never asked about again. **Later** leaves the question for the next open.
+  The row's Restore and Discard wait for the answer, since both would end the record. (A temp of
+  uncertain ownership beside a Save that *landed* has no record to keep the question: it is asked
+  on that open only.)
 
 **Owning a temp.** Only the exclusive create's reply proves that sopen made a temp: `SSH_FXP_HANDLE`.
 - An exclusive create on a name that already exists gets `SSH_FX_FAILURE` and leaves that file
@@ -417,6 +451,13 @@ A write or fsync with no reply is an unknown outcome **on the target itself**:
   - The hex and media windows take it at the first edit, by a **baseline pass**: a Bulk reader hashes
     the whole file in the background, at most 256 MiB, with `checking the file for Save — 37 %` on
     the status row. A Save before the pass ends waits for it.
+    - In the hex window the reader is on the window's own stream, not the `Origin`, so the pass
+      neither connects the `Origin` nor holds what a Save needs. Its blocks are the stream's,
+      cached ones included: a change the cache hides is still refused, by the whole-content check
+      of the copy read back (§4.2 step 6).
+    - A pass that failed (the file changed since it was opened) is not started again by the
+      window; a Save, Save copy or Save As that needs it asks once more. A reload's version gets a
+      pass of its own. Esc stops a Save that waits for the pass, as it stops one copying.
   - The check reads the whole temp back fresh (or, in §4.3, hashes the pass) and compares. So a
     change made before the copy, anywhere, is refused, as today.
   - **The baseline must agree with what the window showed.** The pass also keeps an 8-byte hash
@@ -449,7 +490,8 @@ A write or fsync with no reply is an unknown outcome **on the target itself**:
   | made **between the last check (step 9) and the rename**, even with a normal mtime | **no**: the rename replaces it, unseen (01 §5: "a write racing the final rename is not detected") |
 
 - **The owner sees this before it matters.** The first Save of a session on a file above 256 MiB
-  asks once:
+  asks once (Save only: a Save copy writes no file anyone else reads, and Write in place has its own
+  dialog):
 
   > Save to host:/abs (24.0 GB)? sopen checks its size, modification time and the pages under your
   > edits. A program writing to the file while it saves can lose that write. — Save (Enter) · Cancel
@@ -539,13 +581,23 @@ size rule. Image and media upload their output, as today.
   - The chord is Alt with Cmd/Ctrl and nothing else; F7 is F7 alone, and not while a text field
     has the typing. egui's own shortcut check ignores an extra Alt, so a window that has not
     wired Save As takes Alt+Cmd/Ctrl+S as its Cmd/Ctrl+S.
+  - The hex window's grid holds the keyboard, which egui counts as a widget wanting the keys, so
+    `save_as::pressed` leaves F7 there: the hex window takes F7 alone itself, as it takes F5, and
+    not while the Go to field has the typing. Its toolbar has a Save As… button too.
 - **The modal** (`gui::save_as`, ED3; each window opens it from its Save path, ED4–ED6). One path
   field, prefilled with `<download folder>/<stem>.edited<ext>`; the next free `-N` name when that
-  one is taken (`binary::suggest`, `binary::next_free`). A folder typed in the field gets that name
-  inside it. Browse… opens the system's save dialog (`binary::NativeChooser`). It shows the size and
+  one is taken (`binary::suggest`, `binary::next_free`). A name already in a counted series —
+  `<stem>-N<ext>` beside its `<stem><ext>` — counts on in that series: `model.edited-1.bin` taken
+  gives `model.edited-2.bin`, never `model.edited-1-1.bin`; a number of the name's own
+  (`report-2024.pdf`, nothing at `report.pdf`) stays. A Save copy's sibling names start from
+  `<stem>.edited<ext>` the same way (`remote::candidate`). A folder typed in the field gets that
+  name inside it. Browse… opens the system's save dialog (`binary::NativeChooser`). It shows the size and
   the time expected at the rate the viewer is getting: `24.0 GB — about 1 h 50 min at 3.6 MB/s`. A
   media render's size is its estimate, shown as `24.0 GB (estimated) — …`. With no measured rate (a
   local file) it shows the size alone.
+  - The rate is the stream's own measure, `Source::rate`: the admission's EWMA of read replies over
+    about the last second (06 §4), `None` until a reply has come. §4.1's cost line is said at it
+    too.
 - **How it writes:**
   1. It refuses early when the chosen folder has less free space than the output (its estimate, for
      a render), by the folder's `statvfs`: `needs 24.0 GB free in ~/Downloads, has 3.1 GB; nothing
@@ -632,12 +684,12 @@ size rule. Image and media upload their output, as today.
 |---|---|
 | Dirty state | Today's, by content (hex: `HexDoc::unsaved`; image: `rev` against the saved and copied revisions). The status bar adds `kept at <journal>` (§3). |
 | Save | Cmd/Ctrl+S and F5, to the remote by §4. Progress and Cancel while it runs. Result: `saved host:/abs · backup <path>`, plus notes. |
-| While a Save runs | The hex and image windows take no edits and no undo or redo, as PR #15's media window already does (`MediaWindow::editable` is false then). The status row says `saving — editing resumes when the save is done`. The view still scrolls, zooms and plays. |
+| While a Save runs | The hex and image windows take no edits and no undo or redo, as PR #15's media window already does (`MediaWindow::editable` is false then). The status row says `saving — editing resumes when the save is done` (hex: once an edit was tried; before that, the Save's progress). The view still scrolls, zooms and plays. Esc stops a hex Save between its copy requests (§4.2 step 5). |
 | Save copy | Shift+Cmd/Ctrl+S, a remote sibling (§6). |
 | Save As… | Alt+Cmd/Ctrl+S and F7 (§7). |
 | Write in place… | Only in §4.1's refusal rows, behind §4.4's dialog. |
 | Closing with unsaved edits (closing the window, Esc out of a browser viewer, F3) | `Save the changes to host:/abs before closing?` → **Save** · **Save As…** · **Discard** · **Cancel**. Save copy stands in for Save where Save is off, as today. Save As… opens the modal, and the window closes only after a save that landed. Discard's hover says it deletes the kept edits at <path>. Today's rules stay: closing during a save waits; a save that did not land keeps the window. |
-| Recovery | §3's rows on open, and §5.1's undo-file rows in the hex window. |
+| Recovery | §3's rows on open, and §5.1's undo-file rows in the hex window: the newest three, the rest counted in a line. A row's buttons are disabled while a Save runs. |
 
 ## 11. Robustness and bounds
 
@@ -647,6 +699,11 @@ size rule. Image and media upload their output, as today.
   timeout on a server that copies at least 16 MiB/s.
 - **Memory.** Editing a 24 GB file in the hex window adds at most 16 MiB to the viewer's 06 §10
   budget: the patches and undo steps are at most 100 000 entries.
+  - The hex window holds that bound: past 100 000 changed offsets a byte at a new offset is
+    refused, and the status row says `too many changes for one save — save first` (a byte already
+    edited can still change; Restore or Load as edits stops there and says how many bytes were not
+    put in). A Save that lands makes room: what it wrote is the file's, and the evidence of
+    offsets nothing names any more is let go.
 - **Local disk.** A hex Save of a remote file writes only the journal and the undo file, in
   proportion to the edit, never to the file: at most 16 KiB + 16 bytes per changed byte + 128 bytes
   per edited 4 KiB page (two generations at a time). For E1's 4-byte edit that is under
@@ -667,6 +724,12 @@ absent. Bytes are counted at the client's read and write payloads. Every save st
 that can stop the save there, or lose the step's reply, as 01 §5's tests already do for timeouts.
 Gates and qualification are as in 06 §12. The live receipt is a file under a remote
 `/tmp/sopen-receipts/`.
+
+Two receipt hooks of the hex window, read in `gui/hex.rs` (in AGENTS.md's table):
+`SOPEN_SAVE_AS=<folder>` saves the edits as `<folder>/<stem>.edited<ext>` — without a window
+under `SOPEN_AUTOSAVE` (progress on stderr, `saved <path>` on stdout), else through the Save As
+modal once the state is on screen; `SOPEN_SAVE_AS_HOLD_MS=<ms>` holds that fill at its first
+progress at or past 30 % for that long, so `SOPEN_SCREENSHOT` shows it under way.
 
 - **E1. A 4-byte patch to a 24 GB remote file.** Open a 24 000 000 000 byte file in the hex window,
   overwrite 4 bytes at 0x2DFDC1C35, press Save.
@@ -700,9 +763,16 @@ Gates and qualification are as in 06 §12. The live receipt is a file under a re
     3. the owner edits the still-shown page;
     4. the baseline pass then reads the changed byte.
 
-    The edited page's `seen` does not match the pass's page hash: the window says the file changed
-    under the edits, and Save is refused with the original untouched. Run it both with the page
+    Save is refused with the original untouched, by one of two checks. Run it both with the page
     edited before the pass and edited after it.
+    - Where the pass reads the changed byte (the page is not in the view's cache any more, or the
+      pass reads the remote fresh, as ED1's `baseline_pass` does), the edited page's `seen` does
+      not match the pass's page hash: the window says `the file changed under your edits —
+      Cmd/Ctrl+R reloads`.
+    - The hex window's pass is a Bulk reader on its own stream (§4.5), which serves a page still
+      in its cache from the cache. Then the pass agrees with `seen`, and the change is caught by
+      the copy's whole-content check (§4.2 step 6): `its content changed (same size and
+      modification time)`.
 - **E7. No room.** `statvfs` reports less than size + 1 GiB. Save is refused before any request that
   writes, naming the needed and the free bytes, and offering Write in place… and Save As….
 - **E8. No copy-data, big file.** With no `copy-data` and a 300 MiB file, Save is refused before any

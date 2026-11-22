@@ -1,22 +1,35 @@
-//! The hex window's write side (spec §5, §6a): the file as opened ([`Base`], [`HexFile`]), one
-//! pass over its bytes that stages the edits and backs the original up, the conflict-checked
-//! Save and Save copy.
+//! The hex window's write side: the file as opened ([`Base`], [`HexFile`]) and every way its
+//! edits are written (07 §4–§7).
+//!
+//! - **A file with a local base** — a local file read in place, or a remote file read from its
+//!   copy in the cache — keeps 01 §6a's Save: one pass over its bytes that stages the edits and
+//!   backs the original up, then the conflict-checked overwrite ([`HexFile::save`],
+//!   [`HexFile::save_copy`]).
+//! - **A streamed file** (06 §7.1) has no local base: its Save is ED1's ([`HexFile::save_streamed`],
+//!   `remote::patch`), on the viewer's `Origin`, recorded in the journal before anything changes
+//!   the remote. Its baseline at most 256 MiB is the Bulk pass over the stream ([`Checking`]).
+//! - Save As writes the edits to a new local file through `gui::save_as` ([`HexProducer`]).
+//! - What an earlier session left — journals, cut-off Saves, undo files — is found on open
+//!   ([`recover`]) and offered in the window's recovery rows.
 
 use super::super::image::CANNOT_REPLACE;
 use super::super::Origin;
 use super::{grouped, Feed, InPlace};
-use crate::remote::WriteOutcome;
-use crate::stream::{ReaderKind, Source};
-use anyhow::{bail, Context as _, Result};
+use crate::journal::{self, Journal, Kind, Sha};
+use crate::remote::patch::{self, Baseline, BaselinePass, Patch, PatchFs, Progress, UndoFile};
+use crate::remote::{Fingerprint, WriteOutcome, HASH_CHECK_MAX};
+use crate::stream::{ReadError, ReaderKind, Source};
+use anyhow::{anyhow, bail, Context as _, Result};
 use eframe::egui;
+use sha2::Digest as _;
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::Write as _;
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::SystemTime;
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, SystemTime};
 
 /// What a file's handle says about it: a difference means its bytes may differ.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -103,16 +116,176 @@ struct Local {
     opened: Ident,
 }
 
-/// The interim Save's whole fetch as its worker reports it (06 §7.1): the window's status row
-/// reads it and Esc sets `cancel`.
-#[derive(Debug, Default)]
-pub struct Fetching {
-    /// The fetch is running: nothing has been written anywhere but the cache.
+/// The baseline pass of a streamed file of at most 256 MiB (07 §4.5): a Bulk reader on the
+/// stream hashes the whole file in the background, from the first edit, and keeps an 8-byte
+/// hash of every page. The window reads its progress (`checking the file for Save — 37 %`); a
+/// Save, a Save copy or a Save As that needs the hash waits for it ([`Checking::baseline`]).
+/// One pass at a time, for the version open now: a reload makes the next one read that version.
+#[derive(Default)]
+pub struct Checking {
+    state: Mutex<PassState>,
+    ended: Condvar,
+    /// A pass is reading (the status row says so).
     pub active: AtomicBool,
     pub done: AtomicU64,
     pub total: AtomicU64,
-    /// Stops the fetch between its chunks; nothing is kept of it.
+    /// Stops a pass between its reads (the window went away).
     pub cancel: AtomicBool,
+    /// Passes begun (tests).
+    #[cfg(test)]
+    pub(crate) runs: AtomicU64,
+}
+
+#[derive(Default)]
+enum PassState {
+    #[default]
+    Idle,
+    Running,
+    /// The pass over the version with this `(size, mtime)`.
+    Done(u64, SystemTime, std::result::Result<Baseline, String>),
+}
+
+impl Checking {
+    /// The pass over the version `source` has open now: the one already made, or one made now —
+    /// waiting for a pass another thread runs. A pass that failed for this version is made
+    /// again (a Save asks once more; the frames never do, see [`Checking::start`]).
+    ///
+    /// `cancel` (Esc in a Save or a Save As) ends the wait, and a pass this call runs itself
+    /// between its reads, as [`Cancelled`](crate::remote::Cancelled).
+    pub fn baseline(&self, source: &Source, cancel: &dyn Fn() -> bool) -> Result<Baseline> {
+        let opened = source.opened();
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        loop {
+            if cancel() {
+                bail!(crate::remote::Cancelled);
+            }
+            match &*state {
+                PassState::Done(size, mtime, Ok(pass))
+                    if (*size, *mtime) == (opened.size, opened.mtime) =>
+                {
+                    return Ok(pass.clone());
+                }
+                PassState::Running => {
+                    state = self
+                        .ended
+                        .wait_timeout(state, Duration::from_millis(100))
+                        .unwrap_or_else(|p| p.into_inner())
+                        .0;
+                }
+                _ => break,
+            }
+        }
+        *state = PassState::Running;
+        drop(state);
+        let made = self.make(source, Some(cancel));
+        if cancel() {
+            bail!(crate::remote::Cancelled);
+        }
+        made.map_err(|why| anyhow!(why))
+    }
+
+    /// Runs the pass, the state already `Running` (claimed by the caller), and records how it
+    /// ended for the version it read.
+    fn make(
+        &self,
+        source: &Source,
+        cancel: Option<&dyn Fn() -> bool>,
+    ) -> std::result::Result<Baseline, String> {
+        let opened = source.opened();
+        let result = self.run(source, cancel).map_err(|e| format!("{e:#}"));
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        *state = PassState::Done(opened.size, opened.mtime, result.clone());
+        self.ended.notify_all();
+        result
+    }
+
+    /// The pass's result for the version `source` has open, if one has ended.
+    pub fn ended(&self, source: &Source) -> Option<std::result::Result<Baseline, String>> {
+        let opened = source.opened();
+        match &*self.state.lock().unwrap_or_else(|p| p.into_inner()) {
+            PassState::Done(size, mtime, result)
+                if (*size, *mtime) == (opened.size, opened.mtime) =>
+            {
+                Some(result.clone())
+            }
+            _ => None,
+        }
+    }
+
+    /// Starts the pass in the background, unless one runs or has ended for this version — even
+    /// one that failed: that one is made again only by a Save that needs it, or for the next
+    /// version a reload opens.
+    pub fn start(self: &Arc<Self>, source: &Source) {
+        if source.size() > HASH_CHECK_MAX {
+            return;
+        }
+        let opened = source.opened();
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        match &*state {
+            PassState::Running => return,
+            PassState::Done(size, mtime, _) if (*size, *mtime) == (opened.size, opened.mtime) => {
+                return
+            }
+            _ => {}
+        }
+        // Claimed here, before the thread exists: the next frame sees it running.
+        *state = PassState::Running;
+        drop(state);
+        let (me, source) = (self.clone(), source.clone());
+        std::thread::spawn(move || {
+            let _ = me.make(&source, None);
+        });
+    }
+
+    /// One Bulk read through the whole version open now, at most 256 MiB; `cancel` too stops it
+    /// between its reads.
+    fn run(&self, source: &Source, cancel: Option<&dyn Fn() -> bool>) -> Result<Baseline> {
+        #[cfg(test)]
+        self.runs.fetch_add(1, Ordering::SeqCst);
+        let opened = source.opened();
+        let size = opened.size;
+        if size > HASH_CHECK_MAX {
+            bail!("over 256 MiB, a save checks the pages under the edits, not a whole hash");
+        }
+        self.done.store(0, Ordering::SeqCst);
+        self.total.store(size, Ordering::SeqCst);
+        self.active.store(true, Ordering::SeqCst);
+        struct Ended<'a>(&'a AtomicBool);
+        impl Drop for Ended<'_> {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::SeqCst);
+            }
+        }
+        let _ended = Ended(&self.active);
+        let mut reader = source.reader(ReaderKind::Bulk);
+        let mut pass = BaselinePass::new();
+        let mut buf = vec![0u8; CHUNK];
+        let mut at = 0u64;
+        while at < size {
+            if cancel.is_some_and(|c| c()) {
+                bail!(crate::remote::Cancelled);
+            }
+            let want = (size - at).min(CHUNK as u64) as usize;
+            let got = match reader.read_at(at, &mut buf[..want], &self.cancel) {
+                Ok(0) => bail!(
+                    "the file ended at {} of {} bytes",
+                    grouped(at),
+                    grouped(size)
+                ),
+                Ok(n) => n,
+                Err(ReadError::Changed) => bail!("the file changed since it was opened"),
+                Err(e) => bail!("the file could not be read for the check ({e})"),
+            };
+            pass.update(&buf[..got]);
+            at += got as u64;
+            self.done.store(at, Ordering::SeqCst);
+        }
+        let now = source.opened();
+        if (now.size, now.mtime) != (opened.size, opened.mtime) {
+            bail!("the file was reloaded during the check");
+        }
+        Ok(pass.finish())
+    }
 }
 
 /// What repaints a streamed window when its stream has something new (06 §5's `Waker`). The
@@ -152,25 +325,28 @@ impl Repaint {
 /// remote one is viewed through), and the local places sopen writes to.
 pub struct HexFile {
     pub origin: Origin,
-    /// The local file a save's pass reads. `None` for a streamed file (06 §7.1) until its first
-    /// Save or Save copy has fetched the whole file into the cache ([`HexFile::fetch_base`]).
+    /// The local file a save's pass reads. `None` for a streamed file (06 §7.1): its Saves read
+    /// the remote fresh, on the `Origin` (07 §4.2).
     local: Option<Local>,
     /// The stream a remote file is viewed through (06 §5); `None` for a file read in place.
     stream: Option<Source>,
     /// What the stream wakes.
     repaint: Repaint,
-    /// A streamed file's `Origin` has been used (06 §2: it connects on first use — a Save or a
-    /// Save copy): from then on it is what says whether this server can replace a file.
+    /// A streamed file's `Origin` has been used (06 §2: it connects on first use — a Save, a
+    /// Save copy, a Save As, or the recovery of an earlier session's edits): from then on it is
+    /// what says whether this server can replace a file.
     connected: bool,
     /// Bytes in the file as opened.
     size: u64,
-    /// The session's claim on the cached copy, held while the file is open.
-    claim: Option<crate::cache::Claim>,
-    /// The interim Save's whole fetch, for the status row and its Esc (06 §7.1, §8).
-    pub(super) fetching: Arc<Fetching>,
-    /// What that fetch said that the owner must read (an earlier copy's edits set aside), for
-    /// the window to take.
-    fetch_notices: Vec<String>,
+    /// The session's claim on the cached copy, held while the file is open (dropping it frees
+    /// the copy).
+    _claim: Option<crate::cache::Claim>,
+    /// A streamed file's baseline pass (07 §4.5), shared with the window.
+    pub(super) checking: Arc<Checking>,
+    /// A streamed file's undo file (07 §5.1): one per session of a version, made at its first
+    /// Save. The number is the window's reload count when it was made: a version reloaded by
+    /// the owner gets its own.
+    undo: Option<Box<(u64, UndoFile)>>,
     /// Staged edits and refused ones: `<cache>/.edits/<host>/<abs>`.
     pub(super) edits: PathBuf,
     /// `<cache>` (backups go to `<cache>/.backup/<host>/<abs>.<stamp>`).
@@ -191,6 +367,12 @@ pub struct HexFile {
     /// The stat that ends a save's pass fails (tests).
     #[cfg(test)]
     pub(crate) fail_stat_after_pass: bool,
+    /// A streamed Save's steps, heard before each request (tests: a stop or a lost reply, E18).
+    #[cfg(test)]
+    pub(crate) step_hook: Option<Box<dyn FnMut(patch::Step) -> patch::At + Send>>,
+    /// The copy's pace (tests: [`patch::Pace::timed`]'s rule at small sizes).
+    #[cfg(test)]
+    pub(crate) pace: Option<Box<patch::Pace>>,
 }
 
 /// Result of one Save.
@@ -290,9 +472,9 @@ impl HexFile {
             stream: None,
             repaint: Repaint::default(),
             connected: true,
-            claim,
-            fetching: Arc::default(),
-            fetch_notices: Vec::new(),
+            _claim: claim,
+            checking: Arc::default(),
+            undo: None,
             edits,
             cache_root: cache_root.to_path_buf(),
             backup: None,
@@ -304,12 +486,15 @@ impl HexFile {
             chunk_hook: None,
             #[cfg(test)]
             fail_stat_after_pass: false,
+            #[cfg(test)]
+            step_hook: None,
+            #[cfg(test)]
+            pace: None,
         }
     }
 
-    /// A remote file viewed through `source` (06 §7.1): nothing is fetched to open it. Its first
-    /// Save or Save copy fetches the whole file into the cache and runs on that copy (the interim
-    /// Save, until 07's lands). `repaint` is what `source` was opened to wake
+    /// A remote file viewed through `source` (06 §7.1): nothing is fetched to open it, and
+    /// nothing is fetched to save it (07 §4.2). `repaint` is what `source` was opened to wake
     /// ([`Repaint::waker`]).
     pub fn streamed(origin: Origin, source: Source, repaint: Repaint, cache_root: &Path) -> Self {
         let edits = crate::cache::edits_path(cache_root, origin.host(), &origin.abs);
@@ -320,9 +505,9 @@ impl HexFile {
             stream: Some(source),
             repaint,
             connected: false,
-            claim: None,
-            fetching: Arc::default(),
-            fetch_notices: Vec::new(),
+            _claim: None,
+            checking: Arc::default(),
+            undo: None,
             edits,
             cache_root: cache_root.to_path_buf(),
             backup: None,
@@ -334,6 +519,10 @@ impl HexFile {
             chunk_hook: None,
             #[cfg(test)]
             fail_stat_after_pass: false,
+            #[cfg(test)]
+            step_hook: None,
+            #[cfg(test)]
+            pace: None,
         }
     }
 
@@ -390,14 +579,9 @@ impl HexFile {
             .context("the file has not been fetched for saving")
     }
 
-    /// What the last fetch for a Save said that must be read whole, once.
-    pub fn take_fetch_notices(&mut self) -> Vec<String> {
-        std::mem::take(&mut self.fetch_notices)
-    }
-
     /// Whether Save can replace the original here (Save copy always can). A streamed file's
-    /// `Origin` connects on its first use, which is a Save (06 §2): until then nothing is asked
-    /// of it and the answer is yes — the first Save asks, before it fetches anything.
+    /// `Origin` connects on its first use (06 §2): until then nothing is asked of it and the
+    /// answer is yes — the first Save asks before it sends anything that changes the remote.
     pub fn can_replace(&self) -> bool {
         if self.stream.is_some() && !self.connected {
             return true;
@@ -405,94 +589,13 @@ impl HexFile {
         self.origin.can_replace()
     }
 
-    /// The interim Save's whole fetch (06 §7.1, until 07's Save lands): a streamed file's first
-    /// Save or Save copy fetches the whole file into the cache exactly as an open without
-    /// streaming does — claimed, recorded, pipelined, stopped by the fetch's cancel flag — and
-    /// the save's pass then runs on that copy. The fetch must be the file the stream opened:
-    /// `Some(why)` when its size or mtime is another, and then nothing is kept of it. Its stat
-    /// (with its SHA-256) becomes the baseline of the overwrite (01 §5).
-    fn fetch_base(&mut self) -> Result<Option<String>> {
-        let Some(source) = self.stream.clone() else {
-            return Ok(None);
-        };
-        if self.local.is_some() {
-            return Ok(None);
-        }
-        let opened = source.opened();
-        let fetching = self.fetching.clone();
-        fetching.cancel.store(false, Ordering::SeqCst);
-        fetching.done.store(0, Ordering::SeqCst);
-        fetching.total.store(opened.size, Ordering::SeqCst);
-        fetching.active.store(true, Ordering::SeqCst);
-        // Whatever ends the fetch, the window stops showing it.
-        struct Ended(Arc<Fetching>);
-        impl Drop for Ended {
-            fn drop(&mut self) {
-                self.0.active.store(false, Ordering::SeqCst);
-            }
-        }
-        let _ended = Ended(fetching.clone());
-        let host = self.origin.host().to_string();
-        let abs = self.origin.abs.clone();
-        let fs = self.origin.fs()?;
-        self.connected = true;
-        // What the claim set aside is said whatever comes next — a fetch that fails or is
-        // stopped, a refusal below: the owner is told where an earlier copy's edits went.
-        let mut said = Vec::new();
-        let result = crate::cache::fetch_claimed_said(
-            fs,
-            &host,
-            &abs,
-            &self.cache_root,
-            &mut |done, total| {
-                fetching.done.store(done, Ordering::SeqCst);
-                fetching.total.store(total, Ordering::SeqCst);
-            },
-            &fetching.cancel,
-            &mut said,
-        );
-        self.fetch_notices.extend(said);
-        let (fetched, _ms) = result?;
-        if fetched.at.size != opened.size {
-            return Ok(Some(format!(
-                "{} bytes then, {} now",
-                grouped(opened.size),
-                grouped(fetched.at.size)
-            )));
-        }
-        if fetched.at.mtime != opened.mtime {
-            return Ok(Some("its modification time changed".to_string()));
-        }
-        let base = Base::open(&fetched.claim.local)?;
-        self.origin.at = fetched.at;
-        self.local = Some(Local {
-            file: Arc::new(base.file),
-            path: base.path,
-            opened: base.opened,
-        });
-        self.claim = Some(fetched.claim);
-        Ok(None)
-    }
-
-    /// The stream was reloaded by the owner (Cmd/Ctrl+R): the copy a Save fetched is of the
-    /// version before, so the next Save fetches again.
-    pub(super) fn forget_fetched(&mut self) {
-        if let Some(source) = &self.stream {
-            self.size = source.size();
-            self.local = None;
-            self.claim = None;
-            // The backup made was of the version before: this one gets its own.
-            self.backup = None;
-        }
-    }
-
     /// One of sopen's own writes landed (06 §5): the stream is reloaded at once, onto the file
     /// the write's own baseline names — `Live` on the saved file, or `Changed` when the remote
     /// is already another one (the write's notes say so). What is returned must be read: the
     /// view could not be reloaded.
-    fn reload_saved(&self) -> Option<String> {
+    fn reload_saved(&self, baseline: Fingerprint) -> Option<String> {
         let source = self.stream.as_ref()?;
-        let e = source.reload_saved(self.origin.at.fingerprint()).err()?;
+        let e = source.reload_saved(baseline).err()?;
         Some(format!(
             "saved, but the view could not be reloaded ({e:#}) — Cmd/Ctrl+R reloads"
         ))
@@ -765,32 +868,19 @@ impl HexFile {
         })
     }
 
-    /// Save (spec §5, §6a), in this order: can this server replace a file in one step (refused
-    /// before anything is written if not) → one pass over the bytes as opened that writes the
-    /// backup of the original (the session's first Save; printed) and the stage, refused when
-    /// those bytes changed → the conflict-checked overwrite, checked against the content hash
-    /// from that pass when the baseline has none (a local file opened in place). A refusal or
-    /// a transport error keeps the edits in a local file whose path the message names.
+    /// Save of a file with a local base (spec §5, §6a; 07 §4.1), in this order: can this server
+    /// replace a file in one step (refused before anything is written if not) → one pass over
+    /// the bytes as opened that writes the backup of the original (the session's first Save;
+    /// printed) and the stage, refused when those bytes changed → the conflict-checked
+    /// overwrite, checked against the content hash from that pass when the baseline has none (a
+    /// local file opened in place). A refusal or a transport error keeps the edits in a local
+    /// file whose path the message names. A streamed file saves by [`HexFile::save_streamed`].
     pub fn save(&mut self, patches: &BTreeMap<u64, u8>) -> Result<Saved> {
-        // A streamed file: its `Origin` connects here, at its first use, and says whether the
-        // server can replace a file — before a byte of the whole fetch is asked for.
-        if self.stream.is_some() && !self.connected {
-            let name = self.origin.display();
-            self.origin
-                .fs()
-                .with_context(|| format!("{name} was not touched"))?;
-            self.connected = true;
-        }
         if !self.can_replace() {
             bail!(
                 "{} was not touched: {CANNOT_REPLACE}",
                 self.origin.display()
             );
-        }
-        match self.fetch_base() {
-            Ok(None) => {}
-            Ok(Some(why)) => return self.refuse_changed(patches, &why),
-            Err(e) => return Err(e.context(format!("{} was not touched", self.origin.display()))),
         }
         let first = self.backup.is_none();
         let pass = match self.pass(patches, "edited", first) {
@@ -816,10 +906,9 @@ impl HexFile {
                 .fs()?
                 .write_atomic(&staged, &abs, at.fingerprint())?
             {
-                WriteOutcome::Written { now, mut notes } => {
+                WriteOutcome::Written { now, notes } => {
                     self.origin.at = now;
                     let _ = std::fs::remove_file(&staged);
-                    notes.extend(self.reload_saved());
                     // A local file opened in place was just renamed over: the file read is
                     // gone from its path. A fetched copy is untouched: it stays as opened.
                     if self.in_place() {
@@ -858,19 +947,11 @@ impl HexFile {
         result.map_err(|e| super::super::image::failed(&e, &staged))
     }
 
-    /// Save copy: `<stem>.edited.<ext>` next to the original (`-N` when taken), never replacing
-    /// anything; staged by the same pass as Save (refused when the bytes as opened changed,
-    /// the changes listed). Returns the printed path of the new file.
+    /// Save copy of a file with a local base: `<stem>.edited.<ext>` next to the original (`-N`
+    /// when taken), never replacing anything; staged by the same pass as Save (refused when the
+    /// bytes as opened changed, the changes listed). Returns the printed path of the new file.
+    /// A streamed file's is [`HexFile::copy_streamed`].
     pub fn save_copy(&mut self, patches: &BTreeMap<u64, u8>) -> Result<String> {
-        if let Some(why) = self.fetch_base()? {
-            let kept = self.keep_patches(patches, &why)?;
-            bail!(
-                "no copy saved: {} changed since it was opened ({why}); nothing was written \
-                 — your edits are listed in {}",
-                self.read_from(),
-                kept.display()
-            );
-        }
         let staged = match self.pass(patches, "copy", false)? {
             PassResult::Done(pass) => pass.stage,
             PassResult::Changed(why) => {
@@ -897,4 +978,881 @@ impl HexFile {
             Err(e) => Err(super::super::image::failed(&e, &staged)),
         }
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// A streamed file's Save, Save copy and Write in place (07 §4.2–§4.4, §6): ED1's, on the
+// viewer's `Origin`, recorded in the journal before anything changes the remote.
+
+/// What a streamed Save writes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Way {
+    /// Over the original, by a temp and a rename (§4.2, §4.3).
+    Save,
+    /// A new sibling `<stem>.edited<ext>` (§6).
+    Copy,
+    /// Into the original itself (§4.4), only from its dialog.
+    InPlace,
+}
+
+/// A streamed Save as the window hands it over.
+pub(super) struct Request {
+    pub way: Way,
+    /// The changed bytes, offset → byte wanted: what the file holds if it lands.
+    pub changes: BTreeMap<u64, u8>,
+    /// The journal snapshot of the window's edits: their baseline, evidence and text.
+    pub snap: journal::Snapshot,
+    /// The window's reload count: a version reloaded by the owner gets an undo file of its own.
+    pub session: u64,
+}
+
+/// Where a streamed Save is (the status row) and its cancel (Esc).
+#[derive(Default)]
+pub(super) struct Saving {
+    pub progress: Mutex<Option<Progress>>,
+    pub cancel: AtomicBool,
+}
+
+/// How a streamed Save ended when it did not fail.
+#[derive(Debug)]
+pub(super) enum Streamed {
+    /// It landed (Save, Write in place): the next baseline and evidence, the undo file, what was
+    /// checked; `notes` what the owner must hear besides.
+    Saved {
+        saved: patch::Saved,
+        notes: Vec<String>,
+    },
+    /// Save copy landed: the copy as `host:/abs`.
+    Copied {
+        path: String,
+        checked: Option<String>,
+        notes: Vec<String>,
+    },
+    /// Nothing was written. `other_ways`: the refusal's row offers Write in place… and Save As…
+    /// (§4.1).
+    Refused {
+        why: String,
+        other_ways: bool,
+        notes: Vec<String>,
+    },
+    /// A Save of this session that was cut off (its outcome unknown) had landed after all: found
+    /// by the reconciliation that starts the next one, so nothing was written again.
+    FoundLanded {
+        line: String,
+        next: Option<(Fingerprint, journal::Seen)>,
+    },
+}
+
+/// The connection a streamed Save runs on: the `Origin`, connected now if it was not (06 §2).
+/// A session sshd refuses says 06 §6's line; nothing was sent.
+fn connect<'a>(origin: &'a mut Origin, connected: &mut bool) -> Result<&'a mut dyn PatchFs> {
+    let shown = origin.display();
+    let fs = origin
+        .fs()
+        .map_err(|e| anyhow!("{shown} was not touched: {}", crate::stream::explain(&e)))?;
+    *connected = true;
+    fs.patcher().with_context(|| {
+        format!("{shown} was not touched: this connection cannot write part of a file")
+    })
+}
+
+impl HexFile {
+    /// Saves a streamed file's edits (07 §4.2–§4.4, §6), in this order:
+    ///
+    /// 1. the edits kept in the journal at once (the window's, or one made now);
+    /// 2. the `Origin`, connected now if it was not — a refused session fails here, nothing sent;
+    ///    then a Save the journal still records (one of this session cut off with no reply)
+    ///    reconciled from fresh reads before anything is sent again: not landed, its provable
+    ///    temp removed and the record ended; landed, nothing is written again; anything else
+    ///    refused, the line naming what to check;
+    /// 3. at most 256 MiB, the baseline pass over the version as opened, waited for;
+    /// 4. ED1's Save, Save copy or Write in place, which records each phase in the journal
+    ///    before the request that needs it.
+    ///
+    /// A Save that lands retires the journal (no edit is made while it runs, so nothing is left
+    /// unsaved) and reloads the stream onto the saved file. A refusal or a failure leaves the
+    /// journal in `slot` with the edits.
+    pub(super) fn save_streamed(
+        &mut self,
+        req: &Request,
+        slot: &Mutex<Option<Journal>>,
+        saving: &Saving,
+        wake: &(dyn Fn() + Sync),
+    ) -> Result<Streamed> {
+        let source = self
+            .stream
+            .clone()
+            .context("a streamed save needs its stream")?;
+        let (host, abs) = (self.origin.host().to_string(), self.origin.abs.clone());
+        let shown = self.origin.display();
+        let cache = self.cache_root.clone();
+        let checking = self.checking.clone();
+        let mut snap = req.snap.clone();
+        // The edits are kept at once, before anything else (07 §3): whatever becomes of this
+        // Save — a refused session included — they are in the journal.
+        let mut slot = slot.lock().unwrap_or_else(|p| p.into_inner());
+        if slot.is_none() {
+            let made = Journal::create(journal::disk(), &cache, &host, &abs, Kind::Hex)
+                .with_context(|| {
+                    format!("{shown} was not touched: the edits could not be kept in a journal")
+                })?;
+            *slot = Some(made);
+        }
+        let journal = slot.as_mut().expect("made above");
+        if journal.pending_save().is_none() {
+            journal.publish(&snap).with_context(|| {
+                format!("{shown} was not touched: the edits could not be kept in a journal")
+            })?;
+        }
+        let fs = connect(&mut self.origin, &mut self.connected)?;
+        if let Some(intent) = journal.pending_save().cloned() {
+            let found = journal::reconcile(&intent, &host, &mut patch::Fresh::new(fs));
+            match found.outcome {
+                journal::Outcome::NotLanded => {
+                    if let journal::Temp::Remove(temp) = &found.temp {
+                        fs.remove(temp)
+                            .with_context(|| format!("{shown} was not touched: {}", found.line))?;
+                    }
+                    journal.clear_save()?;
+                }
+                journal::Outcome::Landed => {
+                    journal.clear_save()?;
+                    return Ok(Streamed::FoundLanded {
+                        line: found.line.replace("(found on reopen)", "(found now)"),
+                        next: found.next,
+                    });
+                }
+                journal::Outcome::InPart | journal::Outcome::Unknown => {
+                    return Ok(Streamed::Refused {
+                        why: found.line,
+                        other_ways: false,
+                        notes: Vec::new(),
+                    });
+                }
+            }
+        }
+        let pass = if snap.baseline.size <= HASH_CHECK_MAX && snap.baseline.sha256.is_none() {
+            let opened = source.opened();
+            if (opened.size, opened.mtime) != (snap.baseline.size, snap.baseline.mtime) {
+                bail!("{shown} was not touched: the view is of another version now; save again");
+            }
+            let pass = checking
+                .baseline(&source, &|| saving.cancel.load(Ordering::SeqCst))
+                .with_context(|| format!("{shown} was not touched: it could not be checked"))?;
+            snap.baseline.sha256 = Some(pass.sha256);
+            Some(pass)
+        } else {
+            None
+        };
+        let runs = patch::runs_of(&req.changes);
+        let job = patch::Job {
+            host: &host,
+            target: &abs,
+            runs: &runs,
+            pass: pass.as_ref(),
+            rate: source.rate(),
+        };
+        let mut report = |p: Progress| {
+            *saving.progress.lock().unwrap_or_else(|e| e.into_inner()) = Some(p);
+            wake();
+        };
+        let mut clock = patch::stopwatch();
+        let mut ctl = patch::Ctl::new(&saving.cancel, &mut report, &mut clock);
+        #[cfg(test)]
+        {
+            if let Some(pace) = &self.pace {
+                ctl.pace = (**pace).clone();
+            }
+            ctl.hook = match self.step_hook.as_deref_mut() {
+                Some(hook) => Some(hook),
+                None => None,
+            };
+        }
+        let outcome = match req.way {
+            Way::Copy => {
+                return Ok(match patch::save_copy(fs, &job, &snap, &mut ctl)? {
+                    patch::CopyOutcome::Saved {
+                        path,
+                        checked,
+                        notes,
+                    } => Streamed::Copied {
+                        path: format!("{host}:{path}"),
+                        checked,
+                        notes,
+                    },
+                    patch::CopyOutcome::Refused { why, notes } => Streamed::Refused {
+                        other_ways: why.offers_other_ways(),
+                        why: why.to_string(),
+                        notes,
+                    },
+                })
+            }
+            Way::Save | Way::InPlace => {
+                if self
+                    .undo
+                    .as_deref()
+                    .is_none_or(|(session, _)| *session != req.session)
+                {
+                    let undo = UndoFile::new(&cache, &host, &abs, snap.baseline, SystemTime::now());
+                    self.undo = Some(Box::new((req.session, undo)));
+                }
+                let undo = &mut self.undo.as_mut().expect("made above").1;
+                if req.way == Way::Save {
+                    patch::save(fs, &job, journal, &snap, undo, &mut ctl)?
+                } else {
+                    patch::write_in_place(fs, &job, journal, &snap, undo, &mut ctl)?
+                }
+            }
+        };
+        match outcome {
+            patch::SaveOutcome::Saved(saved) => {
+                let mut notes = saved.notes.clone();
+                if let Err(e) = slot.take().expect("held").save_landed(None) {
+                    notes.push(format!(
+                        "saved, but its journal could not be removed ({e:#})"
+                    ));
+                }
+                notes.extend(self.reload_saved(saved.next));
+                Ok(Streamed::Saved { saved, notes })
+            }
+            patch::SaveOutcome::Refused { why, notes } => Ok(Streamed::Refused {
+                other_ways: why.offers_other_ways(),
+                why: why.to_string(),
+                notes,
+            }),
+        }
+    }
+
+    /// The path the session's undo file has, or will have once the first Save reserves it (the
+    /// Write in place dialog names it).
+    pub(super) fn undo_path(&self, session: u64, baseline: Fingerprint) -> PathBuf {
+        match self.undo.as_deref() {
+            Some((s, undo)) if *s == session => undo.path().to_path_buf(),
+            _ => UndoFile::new(
+                &self.cache_root,
+                self.origin.host(),
+                &self.origin.abs,
+                baseline,
+                SystemTime::now(),
+            )
+            .path()
+            .to_path_buf(),
+        }
+    }
+
+    /// Removes a temp an interrupted Save left, after the owner chose to (its row): sopen could
+    /// not prove it is its own, so only an explicit answer removes it.
+    pub(super) fn remove_left(&mut self, path: &str) -> Result<()> {
+        let fs = connect(&mut self.origin, &mut self.connected)?;
+        fs.remove(path)
+    }
+
+    /// The window's baseline as opened: the stream's fingerprint, or the local base's.
+    pub(super) fn opened(&self) -> Fingerprint {
+        match (&self.stream, &self.local) {
+            (Some(source), _) => source.opened(),
+            (None, Some(local)) if self.in_place() => Fingerprint {
+                size: local.opened.len,
+                mtime: local.opened.mtime.unwrap_or(SystemTime::UNIX_EPOCH),
+                sha256: None,
+            },
+            _ => self.origin.at.fingerprint(),
+        }
+    }
+
+    /// `(host, abs, cache)`: where this file's journals and undo files are.
+    pub(super) fn place(&self) -> (String, String, PathBuf) {
+        (
+            self.origin.host().to_string(),
+            self.origin.abs.clone(),
+            self.cache_root.clone(),
+        )
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// The journal's text for hex edits (07 §3 `edits`).
+
+/// The journal's `edits` of a hex window: the `.hexpatch` lines, one run of changed bytes a line
+/// with the bytes it replaced — `0xOFF: NEW was OLD`. `changes`: offset → (wanted, replaced).
+pub(super) fn edits_text(changes: &BTreeMap<u64, (u8, u8)>) -> String {
+    let mut text = String::from(
+        "# sopen hex edits — one line per run of changed bytes: offset: the bytes wanted (hex) \
+         was the bytes replaced\n",
+    );
+    let mut runs: Vec<(u64, Vec<u8>, Vec<u8>)> = Vec::new();
+    for (&off, &(new, old)) in changes {
+        match runs.last_mut() {
+            Some((start, n, o)) if *start + n.len() as u64 == off => {
+                n.push(new);
+                o.push(old);
+            }
+            _ => runs.push((off, vec![new], vec![old])),
+        }
+    }
+    for (start, new, old) in runs {
+        text.push_str(&format!(
+            "0x{start:X}: {} was {}\n",
+            crate::cache::hex(&new).to_uppercase(),
+            crate::cache::hex(&old).to_uppercase()
+        ));
+    }
+    text
+}
+
+/// The runs of a journal's hex `edits` (offset, the bytes wanted); `#` lines and blank lines are
+/// not edits.
+pub(super) fn parse_edits(text: &str) -> Result<Vec<(u64, Vec<u8>)>> {
+    let mut out = Vec::new();
+    for line in text.lines() {
+        if line.trim().is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let parsed = (|| -> Result<(u64, Vec<u8>)> {
+            let (off, rest) = line.split_once(": ").context("no `: `")?;
+            let off = off.strip_prefix("0x").context("an offset is 0x…")?;
+            let off = u64::from_str_radix(off, 16)?;
+            let new = rest.split_once(" was ").map_or(rest, |(new, _)| new);
+            Ok((off, super::parse_bytes(new)?))
+        })();
+        out.push(parsed.with_context(|| format!("`{line}` is not a hex edit"))?);
+    }
+    Ok(out)
+}
+
+// ---------------------------------------------------------------------------------------------
+// Save As (07 §7): the edits applied to the file read fresh, into `gui::save_as`'s `part`.
+
+/// What one fill read: the source's stat around it (a streamed file's `fstat`; a local base's
+/// identity), the hashes of the edited pages as read, and the whole file's.
+struct Read {
+    changed: Option<String>,
+    pages: BTreeMap<u64, Sha>,
+    whole: Option<Sha>,
+    /// The whole SHA-256 the file must have (its baseline, at most 256 MiB), when known.
+    want: Option<Sha>,
+    bytes: u64,
+}
+
+/// The hex window's [`Producer`](super::super::save_as::Producer): the source read fresh — a
+/// streamed file on the `Origin` through a handle opened at the start of each fill, with up to
+/// 4 MiB in flight (never the view's cache), a local base through its handle — the patches
+/// applied on the way into `part`. Its check: the source's `(size, mtime)` still the baseline,
+/// the edited pages as the window showed them, and at most 256 MiB the whole hash the baseline's.
+pub(super) struct HexProducer {
+    pub file: Arc<Mutex<HexFile>>,
+    pub changes: BTreeMap<u64, u8>,
+    /// The window's evidence: each edited page as shown.
+    pub seen: BTreeMap<u64, Sha>,
+    pub baseline: Fingerprint,
+    /// `SOPEN_SAVE_AS_HOLD_MS` (a receipt): the fill holds this long at its first progress at or
+    /// past 30 %, and says so in `held`.
+    pub hold: Option<Duration>,
+    pub held: Option<Arc<AtomicBool>>,
+    read: Option<Read>,
+}
+
+impl HexProducer {
+    pub fn new(
+        file: Arc<Mutex<HexFile>>,
+        changes: BTreeMap<u64, u8>,
+        seen: BTreeMap<u64, Sha>,
+        baseline: Fingerprint,
+    ) -> Self {
+        Self {
+            file,
+            changes,
+            seen,
+            baseline,
+            hold: None,
+            held: None,
+            read: None,
+        }
+    }
+}
+
+/// Takes the file's bytes in order: the patches applied, the old bytes hashed whole and by
+/// edited page.
+struct Through<'a> {
+    changes: &'a BTreeMap<u64, u8>,
+    pages: BTreeMap<u64, sha2::Sha256>,
+    whole: Option<sha2::Sha256>,
+}
+
+impl<'a> Through<'a> {
+    fn new(changes: &'a BTreeMap<u64, u8>, whole: bool) -> Self {
+        let pages = changes
+            .keys()
+            .map(|at| (at / journal::PAGE * journal::PAGE, sha2::Sha256::new()))
+            .collect();
+        Self {
+            changes,
+            pages,
+            whole: whole.then(sha2::Sha256::new),
+        }
+    }
+
+    /// `chunk` is what the file holds at `at`; returns it with the patches applied.
+    fn feed(&mut self, at: u64, chunk: &[u8]) -> Vec<u8> {
+        let end = at + chunk.len() as u64;
+        if let Some(h) = self.whole.as_mut() {
+            h.update(chunk);
+        }
+        for (&page, h) in self
+            .pages
+            .range_mut(at / journal::PAGE * journal::PAGE..end)
+        {
+            let (from, to) = (page.max(at), (page + journal::PAGE).min(end));
+            if from < to {
+                h.update(&chunk[(from - at) as usize..(to - at) as usize]);
+            }
+        }
+        let mut out = chunk.to_vec();
+        for (&off, &b) in self.changes.range(at..end) {
+            out[(off - at) as usize] = b;
+        }
+        out
+    }
+
+    fn finish(self) -> (BTreeMap<u64, Sha>, Option<Sha>) {
+        let pages = self
+            .pages
+            .into_iter()
+            .map(|(p, h)| (p, h.finalize().into()))
+            .collect();
+        (pages, self.whole.map(|h| h.finalize().into()))
+    }
+}
+
+impl super::super::save_as::Producer for HexProducer {
+    fn fill(&mut self, part: &mut File, ctl: &super::super::save_as::Ctl<'_>) -> Result<u64> {
+        self.read = None;
+        let mut file = self.file.lock().unwrap_or_else(|p| p.into_inner());
+        let size = self.baseline.size;
+        let whole = size <= HASH_CHECK_MAX;
+        let hold = self.hold;
+        let held_flag = self.held.clone();
+        let mut held = false;
+        let mut through = Through::new(&self.changes, whole);
+        let mut write = |at: u64, chunk: &[u8]| -> Result<()> {
+            if ctl.cancelled() {
+                return Err(anyhow!(crate::remote::Cancelled));
+            }
+            part.write_all(&through.feed(at, chunk))?;
+            let done = at + chunk.len() as u64;
+            ctl.progress(done);
+            if let Some(hold) = hold.filter(|_| !held && done * 10 >= size * 3) {
+                held = true;
+                if let Some(flag) = &held_flag {
+                    flag.store(true, Ordering::SeqCst);
+                }
+                let until = std::time::Instant::now() + hold;
+                while std::time::Instant::now() < until && !ctl.cancelled() {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+            }
+            Ok(())
+        };
+        let (changed, bytes, want) = match file.stream.clone() {
+            Some(source) => {
+                // The whole hash to hold the read to, at most 256 MiB: the pass over the version
+                // as opened, unless a Save since gave the baseline its own.
+                let want = match self.baseline.sha256 {
+                    Some(sha) => Some(sha),
+                    None if whole => {
+                        Some(file.checking.baseline(&source, &|| ctl.cancelled())?.sha256)
+                    }
+                    None => None,
+                };
+                let abs = file.origin.abs.clone();
+                let file = &mut *file;
+                let fs = connect(&mut file.origin, &mut file.connected)?;
+                let mut src = fs.open(&abs, patch::OpenFor::Read)?;
+                let read = (|| -> Result<(Option<String>, u64)> {
+                    let before = fs.fstat(&mut src)?;
+                    let n = fs.read_through(&mut src, size, None, &mut |at, chunk| {
+                        write(at, chunk).map(|()| None)
+                    })?;
+                    let after = fs.fstat(&mut src)?;
+                    let baseline = &self.baseline;
+                    let differs = |s: &crate::remote::Stat| {
+                        (s.size != baseline.size || s.mtime != baseline.mtime)
+                            .then(|| crate::remote::describe_change(baseline, s))
+                    };
+                    Ok((differs(&before).or_else(|| differs(&after)), n))
+                })();
+                fs.close(src);
+                let (changed, n) = read?;
+                (changed, n, want)
+            }
+            None => {
+                let local = file.local()?;
+                let before = Ident::of(&local.file, &local.path)?;
+                let mut buf = vec![0u8; CHUNK];
+                let mut at = 0u64;
+                while at < size {
+                    let n = (size - at).min(CHUNK as u64) as usize;
+                    local
+                        .file
+                        .read_exact_at(&mut buf[..n], at)
+                        .with_context(|| format!("cannot read {}", local.path.display()))?;
+                    write(at, &buf[..n])?;
+                    at += n as u64;
+                }
+                let after = Ident::of(&local.file, &local.path)?;
+                let changed = [before, after]
+                    .iter()
+                    .find(|now| **now != local.opened)
+                    .map(|now| local.opened.change(now));
+                (changed, at, self.baseline.sha256)
+            }
+        };
+        let (pages, whole) = through.finish();
+        self.read = Some(Read {
+            changed,
+            pages,
+            whole,
+            want,
+            bytes,
+        });
+        Ok(bytes)
+    }
+
+    fn check(&mut self, written: u64) -> std::result::Result<(), String> {
+        let read = self.read.take().ok_or("nothing was read")?;
+        let shown = self
+            .file
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .origin
+            .display();
+        let why = if read.bytes != self.baseline.size || written != self.baseline.size {
+            Some(format!(
+                "it ended after {} of {} bytes",
+                grouped(read.bytes),
+                grouped(self.baseline.size)
+            ))
+        } else if let Some(changed) = read.changed {
+            Some(changed)
+        } else if let Some((page, _)) = self
+            .seen
+            .iter()
+            .find(|(page, sha)| read.pages.get(page).is_some_and(|now| now != *sha))
+        {
+            Some(format!(
+                "the bytes under your edits at 0x{page:X} are not the ones shown"
+            ))
+        } else if read.want.is_some() && read.whole.is_some() && read.want != read.whole {
+            Some("its content changed (same size and modification time)".to_string())
+        } else {
+            None
+        };
+        match why {
+            Some(why) => Err(format!("{shown} changed while it was read ({why})")),
+            None => Ok(()),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// What an earlier session left (07 §3 Recovery, §3.1, §5.1): the recovery rows.
+
+/// One recovery row.
+pub(super) enum Row {
+    /// A journal of an earlier session: what Restore may do, and the edits it holds.
+    Edits {
+        orphan: journal::Orphan,
+        line: String,
+        check: journal::Restore,
+        edits: Vec<(u64, Vec<u8>)>,
+        temp: Option<LeftTemp>,
+    },
+    /// A journal that holds nothing that can be applied here: kept and named.
+    Kept {
+        orphan: journal::Orphan,
+        line: String,
+        temp: Option<LeftTemp>,
+    },
+    /// An undo file (§5.1): Load as edits.
+    Undo {
+        line: String,
+        size: u64,
+        runs: Vec<Patch>,
+    },
+    /// A file at the temp path of a Save that landed, which sopen could not verify is its own:
+    /// its removal is offered, never done unasked (§3.1). (A Save that did not land keeps the
+    /// question in its journal's row: [`LeftTemp`].)
+    Temp { path: String, line: String },
+    /// What was settled (a landed Save found, a provable temp removed): said once.
+    Note(String),
+}
+
+/// A file at an interrupted Save's temp path that sopen could not verify is its own (§3.1): its
+/// removal is offered, never done unasked. The question lives in the journal's `save` record,
+/// which stays until it is answered — Remove it, or Keep it — so Later asks it again on the
+/// next open; Restore and Discard of that journal wait for the answer.
+pub(super) struct LeftTemp {
+    pub path: String,
+    pub line: String,
+}
+
+/// `2026-11-20 11:42 UTC`.
+fn when(t: SystemTime) -> String {
+    let r = crate::cache::rfc3339(t);
+    format!("{} {} UTC", &r[..10], &r[11..16])
+}
+
+/// `1 byte`, `4 bytes`.
+fn bytes_word(n: usize) -> String {
+    if n == 1 {
+        "1 byte".to_string()
+    } else {
+        format!("{} bytes", grouped(n as u64))
+    }
+}
+
+/// The journal folders of `abs` on `host`, live or not (tombstones aside): how many a listing
+/// should find once no other session holds one.
+fn journal_dirs(cache: &Path, host: &str, abs: &str) -> usize {
+    let base = crate::cache::edits_path(cache, host, abs);
+    let (Some(home), Some(name)) = (base.parent(), base.file_name()) else {
+        return 0;
+    };
+    let prefix = format!("{}.journal-", name.to_string_lossy());
+    std::fs::read_dir(home)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| {
+            let n = e.file_name().to_string_lossy().into_owned();
+            n.starts_with(&prefix) && !n.ends_with(".gone")
+        })
+        .count()
+}
+
+/// How long a journal whose lock is taken is tried again (§3 Recovery: a child another thread
+/// is starting holds a copy of the lock's descriptor from its fork to its exec).
+const LOCK_RETRY: Duration = Duration::from_millis(500);
+
+/// Undo-file rows shown at most (newest first); the rest are said as a count.
+const UNDO_ROWS: usize = 3;
+
+/// The journals, cut-off Saves and undo files an earlier session left for this file, as rows:
+/// a recorded Save reconciled first from fresh reads of the remote (a temp removed only when
+/// provably this Save's; one whose ownership is uncertain offered for removal), then each
+/// journal's edits checked against the file as it is now (`journal::restore_check`: the pages
+/// under the edits read fresh, never only the metadata). The `Origin` connects only when there
+/// is a journal to check. A journal that holds no edit is removed: there is nothing to offer.
+pub(super) fn recover(file: &Mutex<HexFile>) -> Vec<Row> {
+    let (host, abs, cache) = file.lock().unwrap_or_else(|p| p.into_inner()).place();
+    let fs = journal::disk();
+    let want = journal_dirs(&cache, &host, &abs);
+    let started = std::time::Instant::now();
+    let mut orphans = Vec::new();
+    loop {
+        match journal::orphans(&fs, &cache, &host, &abs) {
+            Ok(found) => orphans = found,
+            Err(e) => crate::debug!("journal: no listing: {e:#}"),
+        }
+        if orphans.len() >= want || started.elapsed() >= LOCK_RETRY {
+            break;
+        }
+        orphans.clear();
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let mut rows = Vec::new();
+    if !orphans.is_empty() {
+        let mut file = file.lock().unwrap_or_else(|p| p.into_inner());
+        let file = &mut *file;
+        let mut fs = connect(&mut file.origin, &mut file.connected);
+        for orphan in orphans {
+            let inspect: Option<&mut dyn PatchFs> = match &mut fs {
+                Ok(fs) => Some(&mut **fs),
+                Err(_) => None,
+            };
+            rows.extend(recover_one(orphan, &host, inspect));
+        }
+        if let Err(e) = &fs {
+            rows.push(Row::Note(format!(
+                "the kept edits could not be checked against the file: {e:#}"
+            )));
+        }
+    }
+    let undos = patch::UndoFile::list(&cache, &host, &abs);
+    let shown = format!("{host}:{abs}");
+    for path in undos.iter().take(UNDO_ROWS) {
+        let undo = std::fs::read_to_string(path)
+            .map_err(anyhow::Error::from)
+            .and_then(|text| UndoFile::parse(&text));
+        let Ok(undo) = undo else {
+            continue;
+        };
+        if undo.source != shown && host != crate::cache::LOCAL_HOST {
+            continue;
+        }
+        let n: usize = undo.runs.iter().map(|r| r.bytes.len()).sum();
+        let saved = std::fs::metadata(path)
+            .and_then(|m| m.modified())
+            .map_or("an earlier session".to_string(), when);
+        rows.push(Row::Undo {
+            line: format!(
+                "bytes replaced by the save at {saved} ({}) kept at {}",
+                bytes_word(n),
+                super::super::binary::tilde(path)
+            ),
+            size: undo.size,
+            runs: undo.runs,
+        });
+    }
+    if undos.len() > UNDO_ROWS {
+        rows.push(Row::Note(format!(
+            "{} older undo files of this file are kept beside the ones above",
+            undos.len() - UNDO_ROWS
+        )));
+    }
+    rows
+}
+
+/// One orphan's rows: its cut-off Save reconciled, then its edits checked.
+fn recover_one(
+    mut orphan: journal::Orphan,
+    host: &str,
+    mut fs: Option<&mut dyn PatchFs>,
+) -> Vec<Row> {
+    let mut rows = Vec::new();
+    let dir = super::super::binary::tilde(orphan.dir());
+    let mut said: Vec<String> = orphan.notes.clone();
+    let mut left = None;
+    let reconciled = match fs.as_deref_mut() {
+        Some(fs) => orphan.reconcile(&mut patch::Fresh::new(fs)),
+        None => None,
+    };
+    if let Some(r) = reconciled {
+        match &r.temp {
+            journal::Temp::Keep { path, why } if r.outcome == journal::Outcome::Landed => rows
+                .push(Row::Temp {
+                    path: path.clone(),
+                    line: format!("{why} — remove it?"),
+                }),
+            journal::Temp::Keep { path, why } => {
+                left = Some(LeftTemp {
+                    path: path.clone(),
+                    line: format!("{why} — remove it?"),
+                })
+            }
+            journal::Temp::Remove(path) if r.outcome == journal::Outcome::NotLanded => {
+                match fs.as_deref_mut().map(|fs| fs.remove(path)) {
+                    Some(Ok(())) => {}
+                    Some(Err(e)) => said.push(format!(
+                        "the interrupted save's temporary file {host}:{path} could not be removed \
+                         ({e:#})"
+                    )),
+                    None => {}
+                }
+            }
+            _ => {}
+        }
+        match r.outcome {
+            journal::Outcome::Landed => match orphan.landed() {
+                Ok(None) => {
+                    rows.push(Row::Note(r.line));
+                    return rows;
+                }
+                Ok(Some(later)) => {
+                    orphan = later;
+                    said.push(r.line);
+                }
+                Err(e) => {
+                    rows.push(Row::Note(format!("{} — its journal stays ({e:#})", r.line)));
+                    return rows;
+                }
+            },
+            journal::Outcome::NotLanded => {
+                // The record ends here — unless it holds the question about a temp sopen
+                // cannot prove its own, which stays until it is answered.
+                if left.is_none() {
+                    if let Err(e) = orphan.clear_save() {
+                        said.push(format!("{e:#}"));
+                    }
+                }
+                said.push(r.line);
+            }
+            journal::Outcome::InPart | journal::Outcome::Unknown => said.push(r.line),
+        }
+    } else if !matches!(orphan.save, journal::SaveFile::None) {
+        said.push("a save was cut off, and the file could not be read to tell how".to_string());
+    }
+    let tail = |line: String, said: &[String]| -> String {
+        said.iter()
+            .fold(line, |line, note| format!("{line}; {note}"))
+    };
+    match orphan.found.clone() {
+        journal::Found::Edits(gen) if gen.head.kind == Kind::Hex => {
+            let edits = match parse_edits(&gen.edits) {
+                Ok(edits) => edits,
+                Err(e) => {
+                    let line = format!("edits kept at {dir} cannot be read ({e:#})");
+                    rows.push(Row::Kept {
+                        line: tail(line, &said),
+                        orphan,
+                        temp: left,
+                    });
+                    return rows;
+                }
+            };
+            let n: usize = edits.iter().map(|(_, b)| b.len()).sum();
+            if n == 0 && matches!(orphan.save, journal::SaveFile::None) {
+                if let Err(e) = orphan.remove() {
+                    crate::debug!("journal: an empty one stays: {e:#}");
+                }
+                return rows;
+            }
+            let check = match fs {
+                Some(fs) => journal::restore_check(&gen, Kind::Hex, &mut patch::Fresh::new(fs)),
+                None => journal::Restore::Unchecked {
+                    why: "the file could not be read".to_string(),
+                },
+            };
+            let line = format!(
+                "unsaved edits from {} ({} changed) kept at {dir}",
+                when(gen.head.created),
+                bytes_word(n)
+            );
+            let line = match &check {
+                journal::Restore::Apply { notes } => tail(line, &[&said[..], notes].concat()),
+                journal::Restore::Refuse { why } | journal::Restore::Unchecked { why } => {
+                    tail(format!("{line} — not restored: {why}"), &said)
+                }
+                journal::Restore::Ask => tail(format!("{line}: {}", journal::ASK_PENDING), &said),
+                journal::Restore::OtherKind(_) => tail(line, &said),
+            };
+            rows.push(Row::Edits {
+                orphan,
+                line,
+                check,
+                edits,
+                temp: left,
+            });
+        }
+        journal::Found::Edits(gen) => {
+            let line = format!(
+                "edits made in the {} window are kept at {dir}; the hex window does not apply them",
+                gen.head.kind.word()
+            );
+            rows.push(Row::Kept {
+                line: tail(line, &said),
+                orphan,
+                temp: left,
+            });
+        }
+        journal::Found::Unusable { why, .. } => {
+            let line = format!("edits kept at {dir} cannot be restored: {why}");
+            rows.push(Row::Kept {
+                line: tail(line, &said),
+                orphan,
+                temp: left,
+            });
+        }
+    }
+    rows
 }

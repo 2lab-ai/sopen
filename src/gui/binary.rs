@@ -158,12 +158,16 @@ pub fn untilde(text: &str) -> PathBuf {
 }
 
 /// The first `<stem>-N<ext>` next to `path` (N = 1, 2, …) that nothing has — not even a
-/// dangling link.
+/// dangling link. A name already in a counted series — `<stem>-N<ext>` beside its
+/// `<stem><ext>` — counts on in that series (`model.edited-1.bin` gives `model.edited-2.bin`,
+/// never `model.edited-1-1.bin`); a number that is part of a name (nothing at the name without
+/// it, as `report-2024.pdf`) stays.
 pub fn next_free(path: &Path) -> PathBuf {
     let name = path
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
+    let name = series_base(path, &name).unwrap_or(name);
     for n in 1..10_000 {
         let candidate = path.with_file_name(fitted(&name, n));
         if std::fs::symlink_metadata(&candidate).is_err() {
@@ -171,6 +175,23 @@ pub fn next_free(path: &Path) -> PathBuf {
         }
     }
     path.with_file_name(fitted(&name, 10_000))
+}
+
+/// `<stem><ext>` of a name `<stem>-N<ext>` (N decimal digits) when something is at that name
+/// beside it: the series the name is in.
+fn series_base(path: &Path, name: &str) -> Option<String> {
+    let (stem, ext) = match name.rfind('.') {
+        Some(i) if i > 0 => name.split_at(i),
+        _ => (name, ""),
+    };
+    let (head, digits) = stem.rsplit_once('-')?;
+    if head.is_empty() || digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let base = format!("{head}{ext}");
+    std::fs::symlink_metadata(path.with_file_name(&base))
+        .is_ok()
+        .then_some(base)
 }
 
 /// The longest name a folder takes, in bytes (macOS and Linux alike).
