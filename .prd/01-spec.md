@@ -355,7 +355,19 @@ too, where F3 closes it as ⌘W does.
   a chain's names apart from what joins them (SQL's `a.b.c`, TeX's `$`, JavaScript's
   `a.b.c.f = function`, PHP's constants, a list of `true,false,null`) or a YAML flow collection
   item by item. A number or a run over 128 parts a chain, shortened apart; a list of numbers
-  is no chain.
+  is no chain. A Makefile is parsed with its grammar's two lookaheads for a rule and for a
+  variable rewritten to mean the same with no two runs of characters side by side (as bundled,
+  every line cost a power of its length: a 73-character recipe line 720,000 backtracking steps,
+  a 300-line Makefile 239 ms; rewritten, 36,297 at most and 9 ms), on the highlighting worker
+  the first time a Makefile is highlighted; a grammar that is not the bundled one is parsed as
+  it is. Where the bundled grammar went past the backtrack limit and gave up on a line, the line
+  is read as what it is (`objects := $(patsubst …)` a variable's). Two costs remain. A Makefile
+  line with no parentheses is still searched from every start, quadratic in its length, and
+  from about 500 characters the variable lookahead reaches the backtrack limit (1,000
+  characters: 15–25 ms a line, against 42–62 ms bundled; a 2 MB file of such lines takes about
+  22 s to its last page). Markdown's mixed `.+-` email shape (`a.b-c+d…`, no `@`) is parsed as
+  bundled: about 7 ms a line at 1,000 characters, held at about 14 ms a line by the backtrack
+  limit.
   The file is read live, the index is of the file as
   scanned, checked when the viewer opens and before each page against the open handle and the
   path it was opened by. Both still showing the indexed device, inode, size and modification
