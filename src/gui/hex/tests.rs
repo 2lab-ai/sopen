@@ -6497,6 +6497,19 @@ mod stream {
             crate::journal::this_files_journals(&cache, "host", &abs),
             vec![ours.clone()]
         );
+        // Our journal's lock is free before the look. A child another test forks holds a copy
+        // of every descriptor until its exec, so a lock let go a moment ago can look taken for
+        // a while — what the retry is for (07 §3 Recovery). Waited out here: a retry below can
+        // only be for a journal that is not this file's.
+        let lock = ours.join("lock");
+        let freed = Instant::now();
+        while journal::disk().lock(&lock, false).unwrap().is_none() {
+            assert!(
+                freed.elapsed() < Duration::from_secs(30),
+                "our journal stays locked"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
         // A file of its own, not in a window: nothing else holds a journal of it.
         let file = file_on(ed.tmp.path(), &ed.remote, &ed.moved);
         let retries = file.retries.clone();
