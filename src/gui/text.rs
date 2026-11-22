@@ -2118,6 +2118,104 @@ fn runs_of(
     runs
 }
 
+/// Whether code's shortening finds anything in `line[within]` ([`Shortened::code`]): a word run
+/// over [`RUN_MAX`], or names joined into a chain, between its numbers, longer than that. One
+/// pass and no allocation, so an ordinary line costs nothing more.
+fn code_shortens(line: &str, within: std::ops::Range<usize>) -> bool {
+    // The run being read: its characters, and whether it is a number.
+    let (mut run, mut number) = (0, false);
+    // Since the last run: whether there was one, how many characters, the first of them.
+    let (mut after_run, mut gap, mut first) = (false, 0, None::<char>);
+    // The chain: its separator, and the part of it being read (since its last number) — its
+    // names, and its characters from its first name on.
+    let (mut separator, mut names, mut chars) = (None::<char>, 0, 0);
+    // A space after the last character ends a run the line ends in.
+    for c in line[within].chars().chain([' ']) {
+        if word(c) {
+            if run == 0 {
+                number = c.is_ascii_digit();
+                let joined = after_run
+                    && gap == 1
+                    && first.is_some_and(|s| {
+                        CHAIN_SEPARATORS.contains(&s) && separator.is_none_or(|t| t == s)
+                    });
+                if joined {
+                    separator = first;
+                } else {
+                    (separator, names, chars) = (None, 0, 0);
+                }
+            }
+            run += 1;
+            continue;
+        }
+        if run > 0 {
+            if run > RUN_MAX {
+                return true;
+            }
+            if number {
+                (names, chars) = (0, 0);
+            } else if names == 0 {
+                (names, chars) = (1, run);
+            } else {
+                (names, chars) = (names + 1, chars + 1 + run);
+                if chars > RUN_MAX {
+                    return true;
+                }
+            }
+            (run, after_run, gap, first) = (0, true, 0, None);
+        }
+        if gap == 0 {
+            first = Some(c);
+        }
+        gap += 1;
+    }
+    false
+}
+
+/// Whether YAML's shortening finds anything in `line` ([`Shortened::of`]): in a stretch without
+/// its stops, units (what spaces part) longer than [`RUN_MAX`] together, between its units over
+/// that, or one of those in which code's shortening finds something. One pass and no allocation.
+fn yaml_shortens(line: &str) -> bool {
+    // The unit being read: its characters, and where it starts.
+    let (mut unit, mut start) = (0, 0);
+    // The part of the stretch being read: its units, its characters from its first unit on, and
+    // the spaces since its last.
+    let (mut units, mut chars, mut gap) = (0, 0, 0);
+    // A stop after the last character ends the line's last stretch.
+    for (at, c) in line.char_indices().chain([(line.len(), ':')]) {
+        let stop = YAML_STOPS.contains(&c);
+        if !stop && !c.is_whitespace() {
+            if unit == 0 {
+                start = at;
+            }
+            unit += 1;
+            continue;
+        }
+        if unit > 0 {
+            if unit > RUN_MAX {
+                if code_shortens(line, start..at) {
+                    return true;
+                }
+                (units, chars) = (0, 0);
+            } else if units == 0 {
+                (units, chars) = (1, unit);
+            } else {
+                (units, chars) = (units + 1, chars + gap + unit);
+                if chars > RUN_MAX {
+                    return true;
+                }
+            }
+            (unit, gap) = (0, 0);
+        }
+        if stop {
+            (units, chars, gap) = (0, 0, 0);
+        } else {
+            gap += 1;
+        }
+    }
+    false
+}
+
 /// Where the chain from `words[i]` ends: the word runs after it, each one separator after the
 /// one before, the same separator each time.
 fn chain_end(line: &str, words: &[(std::ops::Range<usize>, usize)], i: usize) -> usize {
@@ -2192,8 +2290,22 @@ struct Shortened {
 }
 
 impl Shortened {
-    /// `None` when the line has nothing that long (it is parsed as it is).
+    /// `None` when the line has nothing that long (it is parsed as it is): found without
+    /// allocating, as the ordinary line has nothing.
     fn of(line: &str, shape: Shape) -> Option<Self> {
+        let shortens = match shape {
+            Shape::Code => code_shortens(line, 0..line.len()),
+            Shape::Yaml => yaml_shortens(line),
+        };
+        if shortens {
+            Self::made(line, shape)
+        } else {
+            None
+        }
+    }
+
+    /// The line shortened, its runs, chains and stretches found and kept as they are copied.
+    fn made(line: &str, shape: Shape) -> Option<Self> {
         let mut short = Self {
             text: String::new(),
             pieces: Vec::new(),
