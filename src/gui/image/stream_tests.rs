@@ -448,6 +448,12 @@ impl Fx {
     }
 
     /// Passes and replies in turn until `done`; a reply is taken only while `feed` says so.
+    ///
+    /// Only to a request sent before `done` looked: the loader asks on threads of its own, so
+    /// one sent after the look can belong to a step the look did not see — V14's file read,
+    /// begun the moment the header is in. What is on its way is counted first, then `done`
+    /// looks; replies come in order, so while that count is not 0 the next reply is to one of
+    /// those. What has been fetched when `done` holds was all asked before it held.
     fn run(
         &mut self,
         what: &str,
@@ -457,11 +463,12 @@ impl Fx {
         let started = Instant::now();
         loop {
             self.drv.idle(&mut self.win, 1);
+            let out = self.out();
             if done(self) {
                 return;
             }
-            if !(self.out() > 0 && feed(self) && self.reply()) {
-                // Nothing is on its way: a worker may be about to ask, or to answer.
+            if !(out > 0 && feed(self) && self.reply()) {
+                // Nothing was on its way: a worker may be about to ask, or to answer.
                 std::thread::sleep(Duration::from_millis(1));
             }
             assert!(started.elapsed() < HANG, "{what}: not within {HANG:?}");

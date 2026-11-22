@@ -171,6 +171,107 @@ fn connect(server: &Server) -> TcpStream {
     stream
 }
 
+/// The descriptors of this process that are a socket listening on `127.0.0.1:port`.
+fn listening(port: u16) -> Vec<i32> {
+    let dir = if cfg!(target_os = "linux") {
+        "/proc/self/fd"
+    } else {
+        "/dev/fd"
+    };
+    let fds: Vec<i32> = std::fs::read_dir(dir)
+        .expect("this process's descriptors")
+        .filter_map(|entry| entry.ok()?.file_name().to_str()?.parse().ok())
+        .collect();
+    fds.into_iter()
+        .filter(|&fd| bound_to(fd) == Some((Ipv4Addr::LOCALHOST, port)) && listens_on(fd))
+        .collect()
+}
+
+/// The IPv4 address and port the socket `fd` is bound to, if it is an IPv4 socket. Any
+/// descriptor will do: one another thread closes or reuses meanwhile only makes the call
+/// fail, or answer for what it is now.
+fn bound_to(fd: i32) -> Option<(Ipv4Addr, u16)> {
+    let mut addr = std::mem::MaybeUninit::<libc::sockaddr_storage>::zeroed();
+    let mut len = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+    // SAFETY: the buffer is as large as `len` says, and zeroed before `getsockname` writes
+    // it; an `AF_INET` address is a `sockaddr_in`, which `sockaddr_storage` is aligned and
+    // large enough for.
+    let v4 = unsafe {
+        if libc::getsockname(fd, addr.as_mut_ptr().cast(), &mut len) != 0 {
+            return None;
+        }
+        let addr = addr.assume_init();
+        if i32::from(addr.ss_family) != libc::AF_INET {
+            return None;
+        }
+        *std::ptr::from_ref(&addr).cast::<libc::sockaddr_in>()
+    };
+    Some((
+        Ipv4Addr::from(u32::from_be(v4.sin_addr.s_addr)),
+        u16::from_be(v4.sin_port),
+    ))
+}
+
+/// Whether the socket `fd` listens: `SO_ACCEPTCONN`.
+#[cfg(target_os = "linux")]
+fn listens_on(fd: i32) -> bool {
+    let mut on: libc::c_int = 0;
+    let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+    // SAFETY: the buffer is as large as `len` says.
+    let asked = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_ACCEPTCONN,
+            (&raw mut on).cast(),
+            &mut len,
+        )
+    };
+    asked == 0 && on != 0
+}
+
+/// Whether the socket `fd` listens: macOS answers no `SO_ACCEPTCONN` (`ENOPROTOOPT`), so its
+/// TCP state, `TCPS_LISTEN` (1 in `<netinet/tcp_fsm.h>`).
+#[cfg(target_os = "macos")]
+fn listens_on(fd: i32) -> bool {
+    let mut info = std::mem::MaybeUninit::<libc::tcp_connection_info>::zeroed();
+    let mut len = std::mem::size_of::<libc::tcp_connection_info>() as libc::socklen_t;
+    // SAFETY: the buffer is as large as `len` says; it is read only once the call filled it.
+    unsafe {
+        libc::getsockopt(
+            fd,
+            libc::IPPROTO_TCP,
+            libc::TCP_CONNECTION_INFO,
+            info.as_mut_ptr().cast(),
+            &mut len,
+        ) == 0
+            && info.assume_init().tcpi_state == 1
+    }
+}
+
+/// The server's port, once its listener is seen among this process's descriptors: the look
+/// [`closed`] makes can see it.
+fn listens(server: &Server) -> u16 {
+    let port = server.port();
+    assert_eq!(listening(port).len(), 1, "the listener is not found");
+    port
+}
+
+/// The drop closed the listener (06 §9): no descriptor of this process is a socket listening
+/// on the port, and the port refuses — in the end. A child started meanwhile (by any test, or
+/// a window's ffmpeg) holds a copy of every descriptor of this process from its fork to its
+/// exec, where close-on-exec takes it away (`cache.rs`'s `claim_with` meets the same), and
+/// the socket takes connections until its last copy is gone. That copy is not the server's,
+/// so the wait for the refusal only catches a hang; the server's own part is the descriptor,
+/// looked at once, right after the drop.
+fn closed(port: u16) {
+    let open = listening(port);
+    assert!(open.is_empty(), "the listener is still open: {open:?}");
+    eventually("the port refuses", || {
+        TcpStream::connect(("127.0.0.1", port)).is_err()
+    });
+}
+
 /// `/<token>/<kind>/m.mp4`.
 fn target(server: &Server, kind: Kind) -> String {
     let url = server.url(kind, "m.mp4");
@@ -1762,7 +1863,7 @@ fn the_drop_cancels_before_it_waits_for_the_accept_thread() {
                 ..Seams::default()
             };
             let server = Server::start_with(source.clone(), Hand::new().with(seams)).unwrap();
-            let (watch, port) = (server.watch(), server.port());
+            let (watch, port) = (server.watch(), listens(&server));
             // A response under way, its client not reading.
             let mut stuck = connect(&server);
             stuck
@@ -1793,7 +1894,7 @@ fn the_drop_cancels_before_it_waits_for_the_accept_thread() {
                 2,
                 "nothing is accepted after the stop"
             );
-            assert!(TcpStream::connect(("127.0.0.1", port)).is_err());
+            closed(port);
             for kind in Kind::ALL {
                 assert_eq!(watch.cuts(kind), 0);
             }
@@ -1841,7 +1942,7 @@ fn the_drop_returns_while_connections_keep_coming() {
     bounded("the_drop_returns_while_connections_keep_coming", || {
         let (source, _control) = threaded(SIZE);
         let server = Server::start(source).unwrap();
-        let (watch, port) = (server.watch(), server.port());
+        let (watch, port) = (server.watch(), listens(&server));
         let made = Arc::new(AtomicU64::new(0));
         let counter = made.clone();
         // A few hundred at most, one after the other, ending at the first that fails.
@@ -1859,7 +1960,7 @@ fn the_drop_returns_while_connections_keep_coming() {
         drop(server);
         storm.join().unwrap();
         eventually("every thread ends", || watch.open() == 0);
-        assert!(TcpStream::connect(("127.0.0.1", port)).is_err());
+        closed(port);
     });
 }
 
@@ -1918,15 +2019,11 @@ fn after_the_drop_the_port_refuses_and_blocked_threads_return() {
             eventually("three connections are open", || {
                 (watch_w.open(), watch_r.open()) == (1, 2)
             });
-            let ports = [writing.port(), reading.port()];
+            let ports = [listens(&writing), listens(&reading)];
             drop(writing);
             drop(reading);
             for port in ports {
-                let refused = TcpStream::connect(("127.0.0.1", port));
-                assert!(
-                    refused.is_err(),
-                    "the port still accepts after the server is dropped"
-                );
+                closed(port);
             }
             eventually("every thread returns", || {
                 (watch_w.open(), watch_r.open()) == (0, 0)
