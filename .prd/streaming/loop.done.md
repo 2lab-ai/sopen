@@ -141,3 +141,22 @@ changes. Rows here are snapshots taken when they were moved.
 - ED3 (PR #44, merged 2026-11-22, 485c240), after one review round (Enter on a focused button
   is that button's, the path field holds the keyboard).
 - The date in this block is the merge commit's date in +0900.
+
+## R1 (part 7) — closed 2026-11-22
+
+- merged W7 ✅ ED4 ✅ · result: remote video and sound read through the window's byte server
+  with a URL per reader kind, a progressive waveform, Export's Cancel and renders failed on a
+  cut stream (W7); the hex window's Save, Save As, journal, recovery rows and reconciliation over
+  a stream (ED4) · closed rows: W7, ED4 · PRs: #46 (41dee30), #47 (0302a69)
+
+### Closed rows
+
+| ID | Status | Branch | Worktree | Scope | Owns | After | Gate |
+|---|---|---|---|---|---|---|---|
+| W7 | ✅ | `feat/stream-media` | `.worktrees/feat-stream-media` | 06 §7.4: URL inputs with their own options and reader kinds, progressive waveform, Export cancel, cut runs failed | `src/gui/media.rs`, `src/gui/media/*`, `src/gui/playback.rs`, `src/ffmpeg.rs`, `src/cut.rs` | — (S1-M merged: PR #36, bdb6166; W3 merged: PR #31, 5f4e6b3) | Merged PR #46 (41dee30), 2026-11-22 |
+| ED4 | ✅ | `feat/stream-edit-hex` | `.worktrees/feat-stream-edit-hex` | 07 §3–§6, §10: hex Save, Save As, journal, Restore checks, reconciliation, rows, confirmation, prompt, `Origin` refused at Save | `src/gui/hex/file.rs`, `src/gui/hex.rs`, `src/gui/hex/tests.rs` | — (W4, W8a, ED1, ED2 merged; ED3 merged: PR #44, 485c240) | Merged PR #47 (0302a69), 2026-11-22 |
+
+### Round section
+
+- W7 (PR #46, merged 2026-11-22, 41dee30) and ED4 (PR #47, merged 2026-11-22, 0302a69).
+- Dates in this block are the merge commits' dates in +0900.

@@ -182,6 +182,32 @@ pub fn render_edit(
     )
 }
 
+/// [`render_edit`] that `stopped` stops (07 §10: Esc stops a media Save up to its rename, and
+/// Save As's Cancel): asked while each run goes, ffmpeg is killed and the error is
+/// [`crate::remote::Cancelled`]. `as_ext`: the final file is written as a `*.ext` whatever
+/// `dst` is named ([`ffmpeg::edit_args_as`]) — Save As renders straight into its staging
+/// `part`, which has no extension (07 §7).
+#[allow(clippy::too_many_arguments)]
+pub fn render_edit_stoppable(
+    tools: &Tools,
+    src: &Input,
+    (dst, as_ext): (&Path, Option<&str>),
+    spec: &EditSpec,
+    (media, plan): (MediaKind, &ExportPlan),
+    work: &Path,
+    progress: &mut dyn FnMut(f64),
+    stopped: &dyn Fn() -> bool,
+) -> Result<()> {
+    let to = Render {
+        dst,
+        as_ext,
+        work,
+        max_inputs: ffmpeg::MAX_INPUTS,
+        stopped,
+    };
+    render(tools, src, spec, (media, plan), &to, progress)
+}
+
 /// [`render_edit`] with at most `max_inputs` inputs per run (the tests force passes).
 #[allow(clippy::too_many_arguments)]
 pub fn render_edit_with(
@@ -196,6 +222,7 @@ pub fn render_edit_with(
 ) -> Result<()> {
     let to = Render {
         dst,
+        as_ext: None,
         work,
         max_inputs,
         stopped: &|| false,
@@ -206,6 +233,8 @@ pub fn render_edit_with(
 /// Where a render goes and what stops it.
 struct Render<'a> {
     dst: &'a Path,
+    /// The final file's container, when `dst`'s name does not say it.
+    as_ext: Option<&'a str>,
     work: &'a Path,
     max_inputs: usize,
     /// Asked while each run goes: true stops it ([`ffmpeg::run_stoppable`]).
@@ -243,7 +272,8 @@ fn render(
         } else {
             Encode::Lossless
         };
-        let args = ffmpeg::edit_args(&inputs, &out, pass, media, plan, encode)?;
+        let as_ext = if last { to.as_ext } else { None };
+        let args = ffmpeg::edit_args_as(&inputs, &out, as_ext, pass, media, plan, encode)?;
         let args = ffmpeg::assemble(tools, args, to.work, &format!("graph-{k}.txt"))?;
         let args = ffmpeg::adapt_to_encoders(args, &encoders)?;
         let length = pass.length();
@@ -454,6 +484,7 @@ pub fn render_and_publish(
         let dst = work.join(&name);
         let to = Render {
             dst: &dst,
+            as_ext: None,
             work: &work,
             max_inputs: ffmpeg::MAX_INPUTS,
             stopped: &|| stop.cancelled(),

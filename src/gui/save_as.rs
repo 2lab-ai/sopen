@@ -70,13 +70,25 @@ impl Size {
 pub struct Ctl<'a> {
     decision: &'a Decision,
     progress: &'a dyn Fn(u64),
+    /// Where `part` is, once a fill runs ([`Ctl::part`]).
+    part: Option<&'a Path>,
 }
 
 impl<'a> Ctl<'a> {
     /// `decision` is the save's cancel ([`Decision::cancel`] stops it); `progress` gets the
     /// bytes written so far.
     pub fn new(decision: &'a Decision, progress: &'a dyn Fn(u64)) -> Self {
-        Self { decision, progress }
+        Self {
+            decision,
+            progress,
+            part: None,
+        }
+    }
+
+    /// Where `part` is, for a producer that writes it by its path (a media render's ffmpeg,
+    /// 07 §7): the file [`Producer::fill`] was handed, in sopen's private staging folder.
+    pub fn part(&self) -> Option<&Path> {
+        self.part
     }
 
     /// The bytes written into `part` so far.
@@ -326,8 +338,12 @@ fn write_with(
         return refused;
     }
     (seams.staging)();
-    let fill = |part: &mut File| -> Result<u64> {
-        let wrote = producer.fill(part, ctl);
+    let fill = |part: &mut File, at: &Path| -> Result<u64> {
+        let told = Ctl {
+            part: Some(at),
+            ..*ctl
+        };
+        let wrote = producer.fill(part, &told);
         if ctl.cancelled() {
             return Err(anyhow!(crate::remote::Cancelled));
         }
@@ -337,7 +353,7 @@ fn write_with(
             .map_err(|why| anyhow!(CheckRefused(why)))?;
         Ok(n)
     };
-    match binary::save_new_deciding(dest, size.exact(), fill, &mut |_, _| Ok(()), ctl.decision) {
+    match binary::save_new_deciding_at(dest, size.exact(), fill, &mut |_, _| Ok(()), ctl.decision) {
         Ok(saved) => Outcome::Saved {
             path: dest.to_path_buf(),
             bytes: saved.bytes,

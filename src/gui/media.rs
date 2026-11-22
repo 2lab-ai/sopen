@@ -14,19 +14,30 @@
 //! [`Input`] every run on the file reads; they run on a worker thread in the window and
 //! directly in the `SOPEN_AUTOSAVE` / `SOPEN_AUTOEXPORT` hooks. `sopen cut` keeps its own
 //! export ([`crate::cut::cut_and_publish`]).
+//!
+//! Editing a streamed file (07 §3, §5.3, §9, §10): every edit is kept in a journal on the local
+//! disk as well as in memory ([`crate::journal`]), and what an earlier session left is offered
+//! back on open (Restore, Later, Discard). Save of a remote file — read through its URL or from
+//! a fetched copy — keeps the original beside it as a hidden hard link, says so before and
+//! after, and records each phase of its upload in the journal ([`file`]); after it lands the
+//! window plays the staged render, and a stream's Source and byte server are closed. Save As
+//! (Alt+Cmd/Ctrl+S, F7) renders the edit into a new local file ([`super::save_as`]). While a
+//! Save runs nothing is edited; Esc stops it up to its rename.
 
 use super::image::CANNOT_REPLACE;
 use super::playback::{self, Piece, Player, Sink};
+use super::save_as::{self, SaveAs};
 use super::{Hooks, Map, Origin, Outcome, Selection, Status};
 use crate::cut;
 use crate::ffmpeg::{
     self, EditSpec, ExportPlan, Input, MediaKind, Probe, Rect as CropRect, Span, Tools,
 };
+use crate::journal::{self, Journal, Keep, Schedule};
 use crate::stream::http::Kind;
 use crate::stream::{Mark, ReaderKind, Source};
 use anyhow::{bail, Context as _, Result};
 use eframe::egui::{self, Color32, Key, Pos2, Rect, Sense, Stroke, TextureHandle, Vec2};
-use file::{MediaFile, Saved};
+use file::{Backup, Edits, LeftTemp, MediaFile, Row, Saved, Stage};
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -75,6 +86,8 @@ enum Answer {
 
 /// Closing was asked for while a save runs.
 const CLOSES_AFTER_SAVE: &str = "the window closes when the save is done";
+/// Closing waits for the newest edits to be written to the journal (07 §3).
+const KEEPING_TO_CLOSE: &str = "keeping the edits…";
 /// The spacing of the dim band's hatch over a waveform's unread part, in points.
 const UNREAD_HATCH: f32 = 12.0;
 /// What the stream reads for a place asked for, while it takes long.
@@ -998,8 +1011,8 @@ pub fn open(
 
 /// [`open`] for a remote file read through `source` (06 §7.4, [`Media::stream`]): nothing is
 /// fetched first. The route that opens a remote video or sound as a stream calls this, as
-/// [`embed_stream`] for a window the file browser hosts. Save keeps today's rule (a remote file
-/// is saved from a fetched copy: ED6 brings Save from a stream).
+/// [`embed_stream`] for a window the file browser hosts. Save renders from the stream's
+/// `render` URL and keeps the original as a hard link beside it (07 §5.3, §9).
 pub fn open_stream(
     origin: Origin,
     source: Source,
@@ -1047,7 +1060,10 @@ fn open_media(
     let mut file = MediaFile::new(origin, cache);
     if hooks.autosave {
         file.hash_in_background();
-        return autosave(&mut file, &media, &timeline, &work_root, hooks);
+        if let Some(folder) = save_as_hook() {
+            return autosave_as(&file, media, &timeline, &work_root, &folder);
+        }
+        return autosave(&mut file, &media, &timeline, &marks, &work_root, hooks);
     }
     if hooks.autoexport {
         let crop = media.source_size().and_then(|b| sel.pixels(b));
@@ -1095,6 +1111,9 @@ fn open_media(
     window.export_hold = hooks.export_hold;
     window.ask_close = state.ask_close;
     window.loading = state.loading;
+    // A scripted run's edits are its state's, not the owner's: nothing of them is kept (07 §3).
+    window.scripted = hooks.scripted();
+    window.save_as_hook = save_as_hook();
     let outcome = window.outcome.clone();
     let leftover = window.leftover.clone();
     let run = super::run_window(&title, size, window, hooks);
@@ -1123,11 +1142,45 @@ fn sweep(cache: &Path) {
     }
 }
 
-/// `SOPEN_AUTOSAVE`: the state's edits saved without a window (exit 3 when refused).
+/// `SOPEN_SAVE_AS=<folder>` (a receipt hook, read here as the hex window reads it): the media
+/// window saves its edit as `<folder>/<stem>.edited<ext>` — without a window under
+/// `SOPEN_AUTOSAVE`, else through the Save As modal once the state is on screen.
+fn save_as_hook() -> Option<PathBuf> {
+    std::env::var_os("SOPEN_SAVE_AS")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+}
+
+/// `SOPEN_SAVE_AS_HOLD_MS=<ms>`: the media window's Save As holds at its first progress at or
+/// past 30 % for that long, so a screenshot shows it under way.
+fn save_as_hold() -> Option<Duration> {
+    std::env::var("SOPEN_SAVE_AS_HOLD_MS")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .map(Duration::from_millis)
+}
+
+/// The words of the backup a Save landed with: PR #15's local copy, or the remote link (07
+/// §5.3's "after" line on the first Save; later Saves name the link it keeps).
+fn backup_words(backup: &Backup, host: &str) -> String {
+    match backup {
+        Backup::Local(path) => format!("original backed up at {}", path.display()),
+        Backup::Linked(link) => file::link_after(host, link),
+        Backup::Kept(link) => format!(
+            "the original stays kept on {host} as {} (a hard link)",
+            link.path
+        ),
+    }
+}
+
+/// `SOPEN_AUTOSAVE`: the state's edits saved without a window (exit 3 when refused). Its journal
+/// goes when it ends — the edits are the state's — unless a request got no reply: then its
+/// record is kept, and where is said, since it is what tells later whether that Save landed.
 fn autosave(
     file: &mut MediaFile,
     media: &Media,
     timeline: &Timeline,
+    marks: &Marks,
     work_root: &Path,
     hooks: &Hooks,
 ) -> Result<Outcome> {
@@ -1138,32 +1191,157 @@ fn autosave(
         eprintln!("waiting {} ms before saving", delay.as_millis());
         std::thread::sleep(delay);
     }
+    file.start_pass(&media.input);
     let spec = edit_spec(media, timeline, (0, timeline.len()), None);
+    let host = file.origin.host().to_string();
+    let first_link = !file.origin.is_local();
+    let said = AtomicBool::new(false);
+    let report = |stage: Stage| {
+        if first_link && matches!(stage, Stage::Rendering(_)) && !said.swap(true, SeqCst) {
+            eprintln!("sopen: {}", file::link_ahead(&host));
+        }
+    };
+    let slot = Mutex::new(None);
+    let stop = AtomicBool::new(false);
+    let job = file::Job {
+        media,
+        spec: &spec,
+        edits: edits_of(timeline, None, marks).text(),
+        work_root,
+        journal: &slot,
+        stop: &stop,
+        report: &report,
+    };
+    let saved = file.save(&job);
+    match slot.into_inner().unwrap_or_else(|p| p.into_inner()) {
+        Some(journal) if journal.pending_save().is_some() => {
+            eprintln!(
+                "sopen: the save's record is kept at {}",
+                super::binary::tilde(journal.dir())
+            );
+        }
+        Some(journal) => {
+            if let Err(e) = journal.remove() {
+                eprintln!("sopen: the kept edits could not be removed: {e:#}");
+            }
+        }
+        None => {}
+    }
     let mut outcome = Outcome::default();
-    match file.save(media, &spec, work_root, &mut |_| {})? {
+    match saved? {
         Saved::Written {
             remote,
+            backup,
             notes,
             not_kept,
             ..
         } => {
             outcome.saved = true;
-            let line = format!(
+            let mut line = format!(
                 "saved {remote} ({}, {})",
                 clock_text(spec.length()),
                 media.save_encodes()
             );
+            if !matches!(backup, Backup::Local(_)) {
+                line.push_str(&format!(" · {}", backup_words(&backup, &host)));
+            }
             println!("{}", super::with_notes(&line, &not_kept));
             for note in notes {
                 eprintln!("sopen: {note}");
             }
         }
-        Saved::Refused { message, .. } => {
+        Saved::Refused { message } => {
             outcome.conflict = true;
             outcome.refused = Some(message);
         }
+        Saved::Stopped { message } => bail!("{message}"),
+        Saved::FoundLanded { line, .. } => bail!("{line}"),
+        Saved::Ask(left) => bail!("not saved: an earlier save was cut off — {}", left.line),
+        Saved::Unresolved { message } => bail!("{message}"),
     }
     Ok(outcome)
+}
+
+/// `SOPEN_AUTOSAVE` with `SOPEN_SAVE_AS=<folder>`: the state's edit rendered into
+/// `<folder>/<stem>.edited<ext>` without a window (progress on stderr, `saved <path>` on
+/// stdout; exit 0 saved, 3 not).
+fn autosave_as(
+    file: &MediaFile,
+    media: Media,
+    timeline: &Timeline,
+    work_root: &Path,
+    folder: &Path,
+) -> Result<Outcome> {
+    if timeline.is_identity() {
+        bail!("SOPEN_SAVE_AS on media needs an edit (SOPEN_STATE clips= or stereo=1)");
+    }
+    let spec = edit_spec(&media, timeline, (0, timeline.len()), None);
+    let name = save_as_name(&media, &file.origin.parent().1);
+    let size = save_as::Size::About(file::estimate_size(&media, &spec));
+    let mut producer = file::MediaProducer {
+        media: Arc::new(media),
+        spec,
+        work_root: work_root.to_path_buf(),
+        hold: save_as_hold(),
+        held: Arc::default(),
+    };
+    let (dest, _) = save_as::first_path(folder, &name);
+    let decision = super::binary::Decision::new();
+    let began = Instant::now();
+    // A line per twentieth of the estimate (the hex window's pace), and the last one.
+    let last = Mutex::new(None::<u64>);
+    let step = (file::estimate_size(&producer.media, &producer.spec) / 20).max(1);
+    let report = |done: u64| {
+        let mut last = last.lock().unwrap_or_else(|p| p.into_inner());
+        if last.is_some_and(|l| done < l.saturating_add(step)) {
+            return;
+        }
+        *last = Some(done);
+        eprintln!(
+            "saving as {}: {}",
+            dest.display(),
+            save_as::progress_line(done, size, began.elapsed(), None)
+        );
+    };
+    let ctl = save_as::Ctl::new(&decision, &report);
+    let mut outcome = Outcome::default();
+    match save_as::write(&dest, size, &mut producer, &ctl) {
+        save_as::Outcome::Saved { path, notes, .. } => {
+            println!("saved {}", path.display());
+            for note in notes {
+                eprintln!("sopen: {note}");
+            }
+            outcome.saved = true;
+        }
+        other => outcome.refused = Some(other.line()),
+    }
+    Ok(outcome)
+}
+
+/// The name Save As writes: the file's stem with the extension its render has (a render the
+/// original's format cannot hold is written as Export writes it).
+fn save_as_name(media: &Media, name: &str) -> String {
+    let (stem, ext) = cut::stem_ext(name);
+    match &media.plan {
+        Some((_, out, _)) if !out.eq_ignore_ascii_case(ext) => format!("{stem}.{out}"),
+        _ => name.to_string(),
+    }
+}
+
+/// The window's edits as the journal keeps them (07 §3 `edits`): the clips in ticks, stereo, the
+/// crop, In/Out.
+fn edits_of(timeline: &Timeline, crop: Option<[u32; 4]>, marks: &Marks) -> Edits {
+    Edits {
+        rate: timeline.rate,
+        source: timeline.source,
+        clips: timeline.clips().iter().map(|c| (c.start, c.end)).collect(),
+        stereo: timeline.stereo(),
+        crop,
+        marks: (
+            marks.in_s.map(|t| timeline.tick(t)),
+            marks.out_s.map(|t| timeline.tick(t)),
+        ),
+    }
 }
 
 /// The media window inside another window (the file browser): the window [`open`] shows for
@@ -1266,8 +1444,9 @@ fn report_export(
     }
 }
 
-/// Prints a finished save, records it and returns the status and the rows to show whole.
-fn report_save(result: &Result<Saved>, outcome: &mut Outcome) -> (Status, Vec<String>) {
+/// Prints a finished save, records it and returns the status and the rows to show whole. `host`
+/// is how the file's host is named in the backup link's words.
+fn report_save(result: &Result<Saved>, outcome: &mut Outcome, host: &str) -> (Status, Vec<String>) {
     match result {
         Ok(Saved::Written {
             remote,
@@ -1278,25 +1457,28 @@ fn report_save(result: &Result<Saved>, outcome: &mut Outcome) -> (Status, Vec<St
         }) => {
             outcome.saved = true;
             outcome.refused = None;
-            println!(
-                "{}",
-                super::with_notes(&format!("saved {remote}"), not_kept)
-            );
+            let words = backup_words(backup, host);
+            let line = match backup {
+                Backup::Local(_) => format!("saved {remote}"),
+                _ => format!("saved {remote} · {words}"),
+            };
+            println!("{}", super::with_notes(&line, not_kept));
             for note in notes {
                 eprintln!("sopen: {note}");
             }
-            let mut shown: Vec<String> = notes.iter().chain(not_kept).cloned().collect();
+            let mut shown: Vec<String> = Vec::new();
+            // The link's words are read whole (07 §5.3: "the owner is told, after").
+            if matches!(backup, Backup::Linked(_)) {
+                shown.push(words.clone());
+            }
+            shown.extend(notes.iter().chain(not_kept).cloned());
             if let Err(e) = media.as_ref() {
                 shown.push(format!(
                     "saved, but sopen cannot read the result back ({e}); editing is off — close \
                      and open the file again"
                 ));
             }
-            let status = Status::info(format!(
-                "saved {remote} · original backed up at {}",
-                backup.display()
-            ));
-            (status, shown)
+            (Status::info(format!("saved {remote} · {words}")), shown)
         }
         Ok(Saved::Refused { message, .. }) => {
             outcome.conflict = true;
@@ -1307,9 +1489,43 @@ fn report_save(result: &Result<Saved>, outcome: &mut Outcome) -> (Status, Vec<St
                 vec![message.clone()],
             )
         }
+        Ok(Saved::Stopped { message }) => {
+            eprintln!("sopen: {message}");
+            (Status::info(message.clone()), Vec::new())
+        }
+        Ok(Saved::FoundLanded { line, media }) => {
+            outcome.saved = true;
+            outcome.refused = None;
+            eprintln!("sopen: {line}");
+            let mut shown = vec![line.clone()];
+            if !matches!(media.as_deref(), Some(Ok(_))) {
+                shown.push(
+                    "editing is off: the file now holds that save — close and open it again"
+                        .to_string(),
+                );
+            }
+            (Status::info(line.clone()), shown)
+        }
+        Ok(Saved::Ask(left)) => (
+            Status::error("not saved: answer the question about the interrupted save's file"),
+            vec![left.line.clone()],
+        ),
+        Ok(Saved::Unresolved { message }) => {
+            outcome.refused = Some(message.clone());
+            eprintln!("sopen: {message}");
+            (
+                Status::error("not saved: an earlier save was cut off"),
+                vec![message.clone()],
+            )
+        }
         Err(e) => {
             eprintln!("sopen: {e:#}");
-            (Status::error("save failed"), vec![format!("{e:#}")])
+            let status = if crate::remote::is_outcome_unknown(e) {
+                "save outcome unknown"
+            } else {
+                "save failed"
+            };
+            (Status::error(status), vec![format!("{e:#}")])
         }
     }
 }
@@ -1326,6 +1542,15 @@ struct SaveJob {
     progress: Arc<AtomicU32>,
     rx: Receiver<Result<Saved>>,
     close_after: bool,
+    /// Esc: the Save stops before its rename ([`file::Stop`]).
+    stop: Arc<AtomicBool>,
+    /// What it does now, for the status row.
+    stage: Arc<Mutex<Option<Stage>>>,
+    /// How the file's host is named in what is said.
+    host: String,
+    /// The edits' revision when it started: the Save's worker keeps that one first (none is
+    /// taken while it runs).
+    rev: u64,
 }
 
 /// A write still running when the window went: its opener waits for it and prints it.
@@ -1366,12 +1591,25 @@ impl Leftover {
             },
             Leftover::Save(job) => match take(&job.rx, wait, "the save") {
                 Some(result) => {
-                    let _ = report_save(&result, outcome);
+                    let _ = report_save(&result, outcome, &job.host);
                     true
                 }
                 None => false,
             },
         }
+    }
+}
+
+/// The transport row's words for a running Save: where it is (07 §4.5's `checking the file for
+/// Save — 37 %`, the render's percent, the link, the upload).
+fn save_stage_text(stage: Option<Stage>, per_mille: u32) -> String {
+    let percent = |f: f64| (f * 100.0).clamp(0.0, 100.0).floor();
+    match stage {
+        None | Some(Stage::Keeping) => "saving — keeping the edits…".to_string(),
+        Some(Stage::Checking(f)) => format!("checking the file for Save — {:.0} %", percent(f)),
+        Some(Stage::Rendering(_)) => format!("saving {:.0} %", per_mille as f32 / 10.0),
+        Some(Stage::Linking) => "saving — keeping the original…".to_string(),
+        Some(Stage::Uploading) => "saving — uploading…".to_string(),
     }
 }
 
@@ -1488,7 +1726,92 @@ struct MediaWindow {
     /// Tests: how often playback was started (the audio output is opened there).
     #[cfg(test)]
     plays: usize,
+    /// Why Save is off for this file (no one-step replace, no hard links on its server).
+    save_off: Option<String>,
+    /// The file's host as named in what is said, and whether it is this machine.
+    host: String,
+    local: bool,
+    /// The session's journal (07 §3): made at the first generation, shared with a Save's
+    /// worker, which keeps the edits in it before anything else.
+    journal: Arc<Mutex<Option<Journal>>>,
+    /// Bumped when a Save starts: a generation begun before that finds it moved when it takes
+    /// the journal, and writes nothing — it can never bring a retired journal back.
+    journal_epoch: Arc<AtomicU64>,
+    /// The journal's folder once a generation of it is kept (`kept at <journal>`).
+    journal_dir: Option<PathBuf>,
+    schedule: Schedule,
+    /// The edits' text as last seen (with whether the file's evidence was known then), and a
+    /// revision counted here for every change of it.
+    journal_text: (String, bool),
+    journal_rev: u64,
+    /// A generation being written in the background: the revision it holds.
+    writing: Option<Receiver<Written>>,
+    /// Discard was chosen: the journal goes with the window, unwritten.
+    discard: bool,
+    /// A scripted run (`SOPEN_SCREENSHOT`, `SOPEN_AUTOSAVE`): its edits are its state's.
+    scripted: bool,
+    /// The window had the keyboard focus on the last pass (losing it writes the edits at once).
+    focused: bool,
+    /// A generation is to be written at once (focus loss, closing), on a worker, as soon as
+    /// none is on its way.
+    write_soon: bool,
+    /// Closing waits for that generation; it is asked again once it is written.
+    close_after_kept: bool,
+    /// What a generation holds besides the edits, the window's own copy (never the file's,
+    /// which a worker may hold): the baseline, where the journals are, the disk they are on.
+    baseline: crate::remote::Fingerprint,
+    home: (String, String, PathBuf),
+    journal_fs: Arc<dyn journal::Fs>,
+    /// The baseline pass of the file as opened, once started (07 §4.5).
+    pass: Option<Arc<file::Pass>>,
+    /// What an earlier session left (07 §3): the rows, the listing on its way.
+    rows: Vec<Row>,
+    recovering: Option<Receiver<Vec<Row>>>,
+    recovery_started: bool,
+    /// A Restore being taken over on a worker: the journal and its edits.
+    #[allow(clippy::type_complexity)]
+    restoring: Option<Receiver<std::result::Result<(Journal, Edits), String>>>,
+    /// A row's question or a live one, answered on a worker: the row's index (`None`: the live
+    /// question), the orphan it was asked for, and the answer's line.
+    answering: Option<Receiver<Answered>>,
+    /// A Save of this session cut off left a file its record cannot prove its own: the
+    /// question, in its own row. Save waits for the answer.
+    left: Option<LeftTemp>,
+    /// The last Save's upload got no reply: editing waits until the next Save tells how it
+    /// went (07 §3.1), so the edits stay those it wrote.
+    unknown: bool,
+    /// The Save As modal (07 §7), whether the window closes once it lands, and the edits it is
+    /// writing.
+    save_as: Option<(SaveAs, bool, String)>,
+    /// The edits a Save As put in a new file: nothing to ask about on close while they are
+    /// the window's.
+    copied: Option<String>,
+    /// `SOPEN_SAVE_AS` in a window: the folder the modal saves to once the state is on screen.
+    save_as_hook: Option<PathBuf>,
+    save_as_folder: Option<PathBuf>,
+    /// The hook's Save As holds (`SOPEN_SAVE_AS_HOLD_MS`): the screenshot is taken then.
+    save_as_held: Arc<AtomicBool>,
+    /// Tests: the Save As modal's chooser.
+    #[cfg(test)]
+    chooser: Option<Box<dyn Fn() -> Box<dyn super::binary::Chooser>>>,
 }
+
+/// A generation written in the background: the revision it holds, and the journal it kept them in
+/// (`None` when it found the journal moved on: a Save started) or why it could not.
+type Written = (u64, std::result::Result<Option<PathBuf>, String>);
+
+/// Who an answer on a worker is for.
+enum Asker {
+    /// The live window's question about a temp ([`Saved::Ask`]).
+    Live,
+    /// The recovery row at this index; the row comes back with the answer.
+    Row(usize),
+    /// A row's Discard.
+    Discard,
+}
+
+/// An answer on a worker: who asked, the row back (a row's), and the line or why it failed.
+type Answered = (Asker, Option<Row>, std::result::Result<String, String>);
 
 impl MediaWindow {
     /// The window as `open` makes it. `notices` (where earlier copies' unsaved edits went) are
@@ -1517,7 +1840,47 @@ impl MediaWindow {
     ) -> Self {
         let timeline = Timeline::new(media.rate(), media.ticks());
         let can_replace = file.origin.can_replace();
+        let save_off = file.save_off();
+        let pass = file.pass();
+        let (baseline, home, journal_fs) = (
+            file.origin.at.fingerprint(),
+            file.place(),
+            file.journal_fs.clone(),
+        );
         Self {
+            save_off,
+            write_soon: false,
+            close_after_kept: false,
+            baseline,
+            home,
+            journal_fs,
+            host: file.origin.host().to_string(),
+            local: file.origin.is_local(),
+            journal: Arc::default(),
+            journal_epoch: Arc::default(),
+            journal_dir: None,
+            schedule: Schedule::default(),
+            journal_text: (String::new(), false),
+            journal_rev: 0,
+            writing: None,
+            discard: false,
+            scripted: false,
+            focused: true,
+            pass,
+            rows: Vec::new(),
+            recovering: None,
+            recovery_started: false,
+            restoring: None,
+            answering: None,
+            left: None,
+            unknown: false,
+            save_as: None,
+            copied: None,
+            save_as_hook: None,
+            save_as_folder: None,
+            save_as_held: Arc::default(),
+            #[cfg(test)]
+            chooser: None,
             title: file.origin.display(),
             can_replace,
             media: Arc::new(media),
@@ -1641,13 +2004,31 @@ impl MediaWindow {
         !self.timeline.is_identity()
     }
 
-    fn busy(&self) -> bool {
-        self.job.is_some() || self.save.is_some()
+    /// Unsaved edits that are nowhere else either: not in a file a Save As wrote (07 §7, "What
+    /// it counts as"). Closing asks only about these.
+    fn unsaved_nowhere(&self) -> bool {
+        self.unsaved() && self.copied.as_deref() != Some(self.edits().text().as_str())
     }
 
-    /// Editing is possible: no save running (it renders the list as it was), nothing stale.
+    /// The window's edits as the journal keeps them.
+    fn edits(&self) -> Edits {
+        edits_of(&self.timeline, self.crop(), &self.marks)
+    }
+
+    fn busy(&self) -> bool {
+        self.job.is_some()
+            || self.save.is_some()
+            || self.save_as.as_ref().is_some_and(|m| m.0.busy())
+    }
+
+    /// Editing is possible: no save running (it renders the list as it was) or whose outcome
+    /// is unknown, nothing stale, no dialog up.
     fn editable(&self) -> bool {
-        self.save.is_none() && !self.stale && !self.prompt
+        self.save.is_none()
+            && !self.stale
+            && !self.prompt
+            && !self.unknown
+            && self.save_as.is_none()
     }
 
     fn show_frame(&mut self, ctx: &egui::Context, rgba: &[u8], t: f64, key: Option<Tick>) {
@@ -2212,47 +2593,950 @@ impl MediaWindow {
         if !self.can_replace {
             return self.status = Status::error(CANNOT_REPLACE);
         }
+        if let Some(why) = &self.save_off {
+            return self.status = Status::error(why.clone());
+        }
         if let Some(why) = self.media.save_block() {
             return self.status = Status::error(why);
+        }
+        if self.left.is_some() {
+            return self.status = Status::error(
+                "answer the question about the interrupted save's file first (Remove it or Keep it)",
+            );
+        }
+        if !self.unsaved() && !self.unknown {
+            return self.status = Status::info("no changes to save");
+        }
+        let spec = edit_spec(&self.media, &self.timeline, (0, self.timeline.len()), None);
+        let edits = self.edits().text();
+        let progress = Arc::new(AtomicU32::new(0));
+        let stage: Arc<Mutex<Option<Stage>>> = Arc::default();
+        let stop = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = mpsc::channel();
+        let (media, file, root, journal) = (
+            self.media.clone(),
+            self.file.clone(),
+            self.work_root.clone(),
+            self.journal.clone(),
+        );
+        let (shared, said, theirs, waker) =
+            (progress.clone(), stage.clone(), stop.clone(), ctx.clone());
+        // Save writes the edit list; the rectangle is Export's (it stays drawn).
+        let saving = if self.crop().is_some() {
+            "saving the edit (not the crop: that is Export's)…".to_string()
+        } else {
+            "saving…".to_string()
+        };
+        // The first Save of a remote file says, while it renders, how the original is kept.
+        let host = self.file_host();
+        let first_link = !self.title_is_local() && !self.linked();
+        if let Some(player) = self.player.take() {
+            self.marks.t = player.clock(Instant::now()).min(self.length());
+        }
+        // A generation begun before this Save writes nothing once it takes the journal: the
+        // Save's worker keeps the edits itself, first (07 §3).
+        self.journal_epoch.fetch_add(1, SeqCst);
+        std::thread::spawn(move || {
+            // A worker that panicked mid-write must not lock the file out of every later
+            // Save and Export: its state is the file's own (origin, backup), still valid.
+            let mut file = file.lock().unwrap_or_else(|e| e.into_inner());
+            let report = |s: Stage| {
+                if let Stage::Rendering(f) = s {
+                    shared.store((f * 1000.0) as u32, SeqCst);
+                }
+                *said.lock().unwrap_or_else(|p| p.into_inner()) = Some(s);
+                waker.request_repaint();
+            };
+            let job = file::Job {
+                media: &media,
+                spec: &spec,
+                edits,
+                work_root: &root,
+                journal: &journal,
+                stop: &theirs,
+                report: &report,
+            };
+            let result = file.save(&job);
+            drop(file);
+            // Nothing of the file as opened is held here once the window has the result: a
+            // stream's byte server and Source go with the window's own input (07 §9).
+            drop(media);
+            let _ = tx.send(result);
+            waker.request_repaint();
+        });
+        self.status = if first_link {
+            Status::info(file::link_ahead(&host))
+        } else {
+            Status::info(saving)
+        };
+        self.save = Some(SaveJob {
+            progress,
+            rx,
+            close_after,
+            stop,
+            stage,
+            host,
+            rev: self.journal_rev,
+        });
+    }
+
+    /// How the file's host is named in what is said (`[user@]host`).
+    fn file_host(&self) -> String {
+        self.host.clone()
+    }
+
+    /// The file is on this machine.
+    fn title_is_local(&self) -> bool {
+        self.local
+    }
+
+    /// A Save of this session kept the original as a link already.
+    fn linked(&self) -> bool {
+        self.file.try_lock().map(|f| f.has_link()).unwrap_or(false)
+    }
+
+    /// Esc during a Save: it stops before its rename (07 §10). A Save waiting for the journal or
+    /// for the check sends nothing; one rendering kills ffmpeg; one uploading stops between its
+    /// chunks and removes its temp.
+    fn stop_save(&mut self) {
+        if let Some(save) = &self.save {
+            save.stop.store(true, SeqCst);
+            self.status = Status::info("stopping the save…");
+        }
+    }
+
+    // ---- the journal (07 §3) ----
+
+    /// After a Save that landed: nothing is unsaved (no edit is taken while a Save runs), and
+    /// the Save's worker retired the journal; nothing is due.
+    fn saved_journal(&mut self) {
+        self.journal_epoch.fetch_add(1, SeqCst);
+        self.journal_dir = None;
+        self.schedule = Schedule::default();
+        self.journal_text = (self.edits().text(), self.evidence_known());
+    }
+
+    /// After a Save that did not land: its worker kept the edits of revision `rev` in the
+    /// journal before anything else (07 §3), so the window says where — unless keeping them is
+    /// what failed (no journal, or none with a generation). What came after that revision (the
+    /// file's evidence, arrived meanwhile) is written as the next generation at once.
+    fn kept_by_save(&mut self, rev: u64) {
+        let kept = match self.journal.try_lock() {
+            Ok(slot) => slot
+                .as_ref()
+                .filter(|j| j.current().is_some())
+                .map(|j| j.dir().to_path_buf()),
+            Err(_) => None,
+        };
+        let Some(dir) = kept else {
+            return;
+        };
+        self.journal_dir = Some(dir);
+        if rev == self.journal_rev {
+            self.schedule.kept(rev);
+        } else if self.writing.is_none() {
+            self.schedule.changed(self.journal_rev, Instant::now());
+            self.write_generation(false);
+        }
+    }
+
+    /// The file's evidence (07 §3 `seen`) is known: the baseline pass has ended well.
+    fn evidence_known(&self) -> bool {
+        self.pass
+            .as_ref()
+            .is_some_and(|p| matches!(p.ended(), Some(Ok(_))))
+    }
+
+    /// Each pass: a change of the edits (or the file's evidence arriving) schedules the next
+    /// generation at most 250 ms later; one that is due is written in the background, one at a
+    /// time; a written one is taken. The first edit starts the baseline pass (07 §4.5).
+    fn tick_journal(&mut self, ctx: &egui::Context) {
+        if self.preview {
+            return;
+        }
+        if let Some(rx) = &self.writing {
+            match rx.try_recv() {
+                Ok((rev, result)) => {
+                    self.writing = None;
+                    self.generation_written(rev, result);
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.writing = None;
+                    self.schedule
+                        .failed("its writer ended without a result".to_string());
+                }
+            }
+        }
+        if self.unsaved() && self.pass.is_none() && self.save.is_none() {
+            if let Ok(mut file) = self.file.try_lock() {
+                file.start_pass(&self.media.input);
+                self.pass = file.pass();
+            }
+        }
+        let now = Instant::now();
+        self.note_edits(now);
+        let soon = std::mem::take(&mut self.write_soon);
+        if self.save.is_none() && self.writing.is_none() && (soon || self.schedule.is_due(now)) {
+            self.write_generation(false);
+        } else if soon {
+            // Not now (a generation on its way, or a Save keeping them itself): next pass.
+            self.write_soon = true;
+            ctx.request_repaint_after(Duration::from_millis(10));
+        }
+        if let Some(due) = self.schedule.due() {
+            ctx.request_repaint_after(due.saturating_duration_since(now));
+        }
+        if self.pass.as_ref().is_some_and(|p| p.ended().is_none()) {
+            ctx.request_repaint_after(Duration::from_millis(250));
+        }
+        // The window waited to go until the newest edits were on disk (07 §3): they are now —
+        // or could not be, which the status says — and it goes.
+        if self.close_after_kept && self.writing.is_none() && !self.write_soon {
+            self.close_after_kept = false;
+            if self.status.text == KEEPING_TO_CLOSE {
+                self.status = Status::default();
+            }
+            super::request_close(ctx);
+        }
+        if self.writing.is_some() {
+            ctx.request_repaint_after(Duration::from_millis(10));
+        }
+    }
+
+    /// The edits (and whether the file's evidence is known) as they are now, against what the
+    /// journal was last told: a change counts a revision and schedules the next generation.
+    fn note_edits(&mut self, now: Instant) {
+        let seen = (self.edits().text(), self.evidence_known());
+        if seen != self.journal_text {
+            self.journal_text = seen;
+            self.journal_rev += 1;
+            let kept = self.journal_dir.is_some() || self.writing.is_some();
+            if !self.scripted && (kept || self.journal_wants()) {
+                self.schedule.changed(self.journal_rev, now);
+            }
+        }
+    }
+
+    /// Edits the journal keeps: unsaved, and nowhere else (no Save As holds them; a window gone
+    /// stale after its Save landed holds saved ones).
+    fn journal_wants(&self) -> bool {
+        self.unsaved_nowhere() && !self.stale
+    }
+
+    /// The window may go now — unless a generation is being written (or is to be): it stays,
+    /// says `keeping the edits…`, and goes once that is on disk (07 §3: written at once, and
+    /// waited for, at close — any path out but Discard), never waiting on a frame.
+    fn go(&mut self) -> bool {
+        if self.discard {
+            // Nothing more is written; one on its way is let finish, and the journal removed,
+            // off the window ([`MediaWindow::settle_journal`]).
+            self.write_soon = false;
+            return true;
+        }
+        if self.writing.is_none() && !self.write_soon {
+            return true;
+        }
+        self.close_after_kept = true;
+        self.status = Status::info(KEEPING_TO_CLOSE);
+        false
+    }
+
+    /// Whether closing must wait for the journal first: edits it keeps whose newest revision is
+    /// not in a durable generation yet (or one is on its way). A generation that failed is said
+    /// in the status, in the error colour, and closing goes on to its prompt.
+    fn keeping_before_close(&self) -> bool {
+        if self.preview || self.scripted || !self.journal_wants() {
+            return false;
+        }
+        self.writing.is_some()
+            || self.write_soon
+            || match self.schedule.status() {
+                Keep::Kept => self.journal_dir.is_none(),
+                Keep::NotKept(_) => false,
+                Keep::Keeping | Keep::Clean => true,
+            }
+    }
+
+    /// Writes the next generation — now, waiting for it (focus loss, close), or in the
+    /// background. The journal is made by the first one.
+    fn write_generation(&mut self, wait: bool) {
+        if self.preview || self.scripted || !(self.journal_dir.is_some() || self.journal_wants()) {
+            return;
+        }
+        // One at a time: a generation on its way is waited for before the next.
+        if let Some(rx) = self.writing.take() {
+            if let Ok((rev, result)) = rx.recv() {
+                self.generation_written(rev, result);
+            }
+        }
+        let Some((rev, work)) = self.generation() else {
+            return;
+        };
+        if wait {
+            let result = work();
+            self.generation_written(rev, result);
+        } else {
+            let (tx, rx) = mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = tx.send((rev, work()));
+            });
+            self.writing = Some(rx);
+        }
+    }
+
+    /// The next generation, to write: the revision it holds, and the write (the journal made by
+    /// the first one). It writes nothing once the journal's epoch has moved past the one it was
+    /// made in (a Save started). Made from what the window holds itself — the baseline, the
+    /// pass's evidence, where the journals are — never waiting for the file a worker may hold.
+    #[allow(clippy::type_complexity)]
+    fn generation(
+        &mut self,
+    ) -> Option<(
+        u64,
+        Box<dyn FnOnce() -> std::result::Result<Option<PathBuf>, String> + Send>,
+    )> {
+        let snap = journal::Snapshot {
+            baseline: self.baseline,
+            seen: match self.pass.as_ref().and_then(|p| p.ended()) {
+                Some(Ok(evidence)) => evidence.seen(),
+                _ => journal::Seen::Pending,
+            },
+            edits: self.edits().text(),
+            pastes: Vec::new(),
+        };
+        let (host, abs, cache) = self.home.clone();
+        let fs = self.journal_fs.clone();
+        let rev = self.schedule.taking();
+        let slot = self.journal.clone();
+        let (epochs, epoch) = (self.journal_epoch.clone(), self.journal_epoch.load(SeqCst));
+        let work = move || -> std::result::Result<Option<PathBuf>, String> {
+            let mut slot = slot.lock().unwrap_or_else(|p| p.into_inner());
+            if epochs.load(SeqCst) != epoch {
+                return Ok(None);
+            }
+            if slot.is_none() {
+                let made = Journal::create(fs.clone(), &cache, &host, &abs, journal::Kind::Media)
+                    .map_err(|e| format!("{e:#}"))?;
+                *slot = Some(made);
+            }
+            let journal = slot.as_mut().expect("made above");
+            // A Save whose outcome is unknown holds its record and the generation it names.
+            if journal.pending_save().is_some() && journal.current().is_some() {
+                return Ok(Some(journal.dir().to_path_buf()));
+            }
+            journal.publish(&snap).map_err(|e| format!("{e:#}"))?;
+            Ok(Some(journal.dir().to_path_buf()))
+        };
+        Some((rev, Box::new(work)))
+    }
+
+    fn generation_written(
+        &mut self,
+        rev: u64,
+        result: std::result::Result<Option<PathBuf>, String>,
+    ) {
+        match result {
+            Ok(Some(dir)) => {
+                self.journal_dir = Some(dir);
+                self.schedule.kept(rev);
+            }
+            // Superseded: what it held is a Save's to keep, or saved.
+            Ok(None) => {}
+            Err(why) => self.schedule.failed(why),
+        }
+    }
+
+    /// The window is going (07 §3): with edits written nowhere, they are written once more and
+    /// the journal is kept for the next open; a Save's record whose outcome is unknown, or a
+    /// question about an interrupted save's file, is kept too; otherwise — or after Discard —
+    /// the journal is removed.
+    fn settle_journal(&mut self) {
+        // Discarded (or nothing left to keep) while a generation is on its way: that one writes
+        // nothing more once it sees the epoch moved, and the journal goes once it is done — on
+        // a thread of its own, never holding the window (07 §3: Discard removes the journal).
+        let keeps = !self.discard && !self.scripted && self.journal_wants();
+        if !keeps && self.left.is_none() && self.answering.is_none() {
+            if let Some(rx) = self.writing.take() {
+                self.journal_epoch.fetch_add(1, SeqCst);
+                let slot = self.journal.clone();
+                std::thread::spawn(move || {
+                    let _ = rx.recv();
+                    let mut slot = slot.lock().unwrap_or_else(|p| p.into_inner());
+                    if slot.as_ref().is_some_and(|j| j.pending_save().is_none()) {
+                        if let Some(journal) = slot.take() {
+                            if let Err(e) = journal.remove() {
+                                eprintln!("sopen: the kept edits could not be removed: {e:#}");
+                            }
+                        }
+                    }
+                });
+                return;
+            }
+        }
+        if let Some(rx) = self.writing.take() {
+            let _ = rx.recv();
+        }
+        // An answer on its way is waited for: what is kept depends on whether it ended the record.
+        if let Some(rx) = self.answering.take() {
+            if let Ok((Asker::Live, _, Ok(_))) = rx.recv() {
+                self.left = None;
+            }
+        }
+        let mut slot = self.journal.lock().unwrap_or_else(|p| p.into_inner());
+        // The record tells later whether that Save landed: it stays, with its question.
+        if slot.as_ref().is_some_and(|j| j.pending_save().is_some()) || self.left.is_some() {
+            return;
+        }
+        if !self.discard && !self.scripted && self.journal_wants() {
+            drop(slot);
+            // The newest edits once more — a first generation too, made now if the journal was
+            // not yet (an edit made just before the window went).
+            if self.schedule.status() != Keep::Kept || self.journal_dir.is_none() {
+                self.write_generation(true);
+            }
+            return;
+        }
+        if let Some(journal) = slot.take() {
+            if let Err(e) = journal.remove() {
+                eprintln!("sopen: the kept edits could not be removed: {e:#}");
+            }
+        }
+    }
+
+    /// The status row's words for edits written nowhere else (07 §3): `unsaved — keeping…`,
+    /// `unsaved — kept at <journal>`, or `unsaved — NOT kept on disk (<why>)`; whether it is an
+    /// error.
+    fn kept_line(&self) -> (String, bool) {
+        let dir = self
+            .journal_dir
+            .as_deref()
+            .map(super::binary::tilde)
+            .unwrap_or_default();
+        match self.schedule.status() {
+            Keep::Clean => (String::new(), false),
+            Keep::NotKept(why) => (Keep::NotKept(why).line(&dir), true),
+            keep => (keep.line(&dir), false),
+        }
+    }
+
+    /// Tests: the window ends as a kill ends it — the journal dropped as it is (its lock freed),
+    /// nothing written or removed.
+    #[cfg(test)]
+    fn crash(mut self) {
+        if let Some(rx) = self.writing.take() {
+            let _ = rx.recv();
+        }
+        drop(
+            self.journal
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .take(),
+        );
+        self.discard = false;
+        self.preview = true;
+        drop(self);
+    }
+
+    // ---- recovery (07 §3, §3.1) ----
+
+    /// At the first pass of a viewer (never a preview, which must not hold another session's
+    /// journals): what an earlier session left is listed in the background.
+    fn start_recovery(&mut self, ctx: &egui::Context) {
+        if self.recovery_started || self.preview {
+            return;
+        }
+        self.recovery_started = true;
+        let (tx, rx) = mpsc::channel();
+        let (file, ctx) = (self.file.clone(), ctx.clone());
+        std::thread::spawn(move || {
+            let _ = tx.send(file::recover(&file));
+            ctx.request_repaint();
+        });
+        self.recovering = Some(rx);
+    }
+
+    fn poll_recovery(&mut self) {
+        if let Some(rx) = &self.answering {
+            match rx.try_recv() {
+                Ok((at, orphan, answer)) => {
+                    self.answering = None;
+                    self.answered(at, orphan, answer);
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+                Err(mpsc::TryRecvError::Disconnected) => self.answering = None,
+            }
+        }
+        let Some(rx) = &self.recovering else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(rows) => {
+                for row in &rows {
+                    if let Row::Note(line) = row {
+                        eprintln!("sopen: {line}");
+                    }
+                }
+                self.rows = rows;
+                self.recovering = None;
+            }
+            Err(mpsc::TryRecvError::Empty) => {}
+            Err(mpsc::TryRecvError::Disconnected) => self.recovering = None,
+        }
+    }
+
+    /// An answer came back: a row's back in its place (its question gone once answered, a
+    /// removed temp's row gone); the live question gone once its record ended.
+    fn answered(
+        &mut self,
+        asker: Asker,
+        row: Option<Row>,
+        answer: std::result::Result<String, String>,
+    ) {
+        let ok = answer.is_ok();
+        match answer {
+            Ok(line) => self.status = Status::info(line),
+            Err(why) => self.status = Status::error(why),
+        }
+        match asker {
+            Asker::Live if ok => self.left = None,
+            Asker::Row(i) if i < self.rows.len() => match row {
+                Some(Row::Temp { .. }) if ok => {
+                    self.rows.remove(i);
+                }
+                Some(row) => self.rows[i] = row,
+                None => {}
+            },
+            _ => {}
+        }
+    }
+
+    /// Whether a row's buttons may act: not while a Save runs, an answer is on its way or a
+    /// Restore is being taken.
+    fn rows_free(&self) -> bool {
+        self.save.is_none() && self.answering.is_none() && self.restoring.is_none()
+    }
+
+    /// Restore (07 §3): the row's journal is taken over by this window (on a worker: its folder
+    /// is read, and a cut-off Save's record it still holds — one whose outcome could not be told
+    /// — ends, the row having named what to check) and its edits applied, unless the window has
+    /// edits of its own (`undo or save them first`), the row still asks its question, or they
+    /// were made on another timeline than this file's.
+    fn restore_row(&mut self, i: usize) {
+        if self.unsaved() || self.journal_dir.is_some() {
+            return self.status = Status::error("undo or save them first");
+        }
+        let Some(Row::Edits { edits, temp, .. }) = self.rows.get(i) else {
+            return;
+        };
+        if temp.is_some() {
+            return self.status =
+                Status::error("answer the question about the interrupted save's file first");
+        }
+        let tl = &self.timeline;
+        if edits.rate.to_bits() != tl.rate.to_bits() || edits.source != tl.source {
+            return self.status = Status::error(
+                "these edits were made on another timeline than this file's; not restored",
+            );
+        }
+        let Row::Edits { orphan, edits, .. } = self.rows.remove(i) else {
+            unreachable!("matched above")
+        };
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let adopted = orphan.adopt().and_then(|mut journal| {
+                if journal.pending_save().is_some() {
+                    journal.clear_save()?;
+                }
+                Ok(journal)
+            });
+            let _ = tx.send(adopted.map(|j| (j, edits)).map_err(|e| format!("{e:#}")));
+        });
+        self.restoring = Some(rx);
+        self.status = Status::info("restoring…");
+    }
+
+    /// A Restore's journal taken over: its edits are the window's from now on.
+    fn poll_restoring(&mut self, ctx: &egui::Context) {
+        let Some(rx) = &self.restoring else {
+            return;
+        };
+        let taken = match rx.try_recv() {
+            Ok(taken) => taken,
+            Err(mpsc::TryRecvError::Empty) => return,
+            Err(mpsc::TryRecvError::Disconnected) => Err("the restore stopped".to_string()),
+        };
+        self.restoring = None;
+        let (adopted, edits) = match taken {
+            Ok(taken) => taken,
+            Err(why) => return self.status = Status::error(format!("not restored: {why}")),
+        };
+        self.journal_dir = Some(adopted.dir().to_path_buf());
+        *self.journal.lock().unwrap_or_else(|p| p.into_inner()) = Some(adopted);
+        let view = self.view();
+        let clips = edits
+            .clips
+            .iter()
+            .map(|&(start, end)| Clip { start, end })
+            .collect();
+        self.timeline.set_clips(clips, view);
+        if edits.stereo && self.media.mono_audio() {
+            let view = self.view();
+            self.timeline.set_stereo(true, view);
+        }
+        if let Some(rect) = edits.crop.filter(|_| self.media.video.is_some()) {
+            self.sel.set(rect);
+        }
+        self.marks.in_s = edits.marks.0.map(|t| self.timeline.secs(t));
+        self.marks.out_s = edits.marks.1.map(|t| self.timeline.secs(t));
+        self.status = Status::info(format!("restored {}", edits.summary()));
+        self.edited(ctx);
+    }
+
+    /// Discard: the row's journal is removed, on a worker.
+    fn discard_row(&mut self, i: usize) {
+        if i >= self.rows.len() {
+            return;
+        }
+        match self.rows.remove(i) {
+            Row::Edits { orphan, .. } | Row::Kept { orphan, .. } => {
+                let shown = super::binary::tilde(orphan.dir());
+                let (tx, rx) = mpsc::channel();
+                std::thread::spawn(move || {
+                    let answer = orphan
+                        .remove()
+                        .map(|()| format!("discarded the edits kept at {shown}"))
+                        .map_err(|e| format!("{e:#}"));
+                    let _ = tx.send((Asker::Discard, None, answer));
+                });
+                self.answering = Some(rx);
+                self.status = Status::info("discarding…");
+            }
+            other => self.rows.insert(i, other),
+        }
+    }
+
+    /// Remove it / Keep it on a row's question about an interrupted save's file, answered on a
+    /// worker (07 §3.1): Remove it removes only the file the question was about
+    /// (`MediaFile::remove_left`, with the row's record reconciled again first), then the record
+    /// ends; Keep it ends the record and leaves the file. A failure keeps the question and the
+    /// record. The row is the worker's meanwhile, and comes back with the answer.
+    fn answer_row(&mut self, i: usize, remove: bool) {
+        if i >= self.rows.len() || self.answering.is_some() {
+            return;
+        }
+        let asks = matches!(
+            &self.rows[i],
+            Row::Temp { .. } | Row::Edits { temp: Some(_), .. } | Row::Kept { temp: Some(_), .. }
+        );
+        if !asks {
+            return;
+        }
+        if !remove {
+            if let Row::Temp { path, .. } = &self.rows[i] {
+                // Beside a save that landed there is no record: asked on this open only.
+                self.status =
+                    Status::info(format!("kept {path}; it will not be asked about again"));
+                self.rows.remove(i);
+                return;
+            }
+        }
+        let row = std::mem::replace(&mut self.rows[i], Row::Note("answering…".to_string()));
+        let file = self.file.clone();
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let mut row = row;
+            let mut file = file.lock().unwrap_or_else(|p| p.into_inner());
+            let answer = match &mut row {
+                Row::Temp { path, line, seen } => {
+                    let left = LeftTemp {
+                        path: path.clone(),
+                        line: line.clone(),
+                        seen: *seen,
+                        proven: false,
+                    };
+                    file.remove_left(&left, None)
+                        .map(|()| format!("removed {}", file.origin.show(path)))
+                }
+                Row::Edits { orphan, temp, .. } | Row::Kept { orphan, temp, .. } => {
+                    let left = temp.clone().expect("asks: checked above");
+                    let record = match &orphan.save {
+                        journal::SaveFile::Intent(intent) => Some((**intent).clone()),
+                        _ => None,
+                    };
+                    let removed = if remove {
+                        file.remove_left(&left, record.as_ref())
+                    } else {
+                        Ok(())
+                    };
+                    let shown = file.origin.show(&left.path);
+                    removed.and_then(|()| {
+                        orphan.clear_save()?;
+                        *temp = None;
+                        Ok(if remove {
+                            format!("removed {shown}")
+                        } else {
+                            format!("kept {shown}; it will not be asked about again")
+                        })
+                    })
+                }
+                Row::Note(_) => Ok(String::new()),
+            };
+            drop(file);
+            let _ = tx.send((
+                Asker::Row(i),
+                Some(row),
+                answer.map_err(|e| format!("{e:#}")),
+            ));
+        });
+        self.answering = Some(rx);
+    }
+
+    /// Remove it / Keep it on the live window's question ([`Saved::Ask`]), on a worker.
+    fn answer_live(&mut self, remove: bool) {
+        let Some(left) = self.left.clone() else {
+            return;
+        };
+        if self.answering.is_some() {
+            return;
+        }
+        let (file, journal) = (self.file.clone(), self.journal.clone());
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let mut file = file.lock().unwrap_or_else(|p| p.into_inner());
+            let answer = file
+                .answer_left(&left, remove, &journal)
+                .map_err(|e| format!("{e:#}"));
+            let _ = tx.send((Asker::Live, None, answer));
+        });
+        self.answering = Some(rx);
+    }
+
+    /// The recovery rows (07 §3) and the live question: each row's words read whole, its
+    /// actions as buttons (Restore, Later, Discard; Remove it, Keep it), disabled while a Save
+    /// runs or an answer is on its way.
+    fn recovery_ui(&mut self, ui: &mut egui::Ui) {
+        enum Act {
+            Restore(usize),
+            Later(usize),
+            Discard(usize),
+            Answer(usize, bool),
+            Live(bool),
+        }
+        let mut act = None;
+        let free = self.rows_free() && !self.prompt;
+        let error = ui.visuals().error_fg_color;
+        let text = ui.visuals().text_color();
+        let discard_hover =
+            |dir: &Path| format!("deletes the kept edits at {}", super::binary::tilde(dir));
+        for (i, row) in self.rows.iter().enumerate() {
+            ui.horizontal_wrapped(|ui| match row {
+                Row::Edits {
+                    orphan,
+                    line,
+                    check,
+                    temp,
+                    ..
+                } => {
+                    ui.colored_label(text, line);
+                    let (restore, anyway) = match check {
+                        journal::Restore::Apply { .. } => (true, false),
+                        journal::Restore::Ask => (true, true),
+                        _ => (false, false),
+                    };
+                    let label = if anyway { "Restore anyway" } else { "Restore" };
+                    if restore
+                        && ui
+                            .add_enabled(free && temp.is_none(), egui::Button::new(label))
+                            .clicked()
+                    {
+                        act = Some(Act::Restore(i));
+                    }
+                    if ui.add_enabled(free, egui::Button::new("Later")).clicked() {
+                        act = Some(Act::Later(i));
+                    }
+                    if ui
+                        .add_enabled(free && temp.is_none(), egui::Button::new("Discard"))
+                        .on_hover_text(discard_hover(orphan.dir()))
+                        .clicked()
+                    {
+                        act = Some(Act::Discard(i));
+                    }
+                }
+                Row::Kept { orphan, line, temp } => {
+                    ui.colored_label(text, line);
+                    if ui.add_enabled(free, egui::Button::new("Later")).clicked() {
+                        act = Some(Act::Later(i));
+                    }
+                    if ui
+                        .add_enabled(free && temp.is_none(), egui::Button::new("Discard"))
+                        .on_hover_text(discard_hover(orphan.dir()))
+                        .clicked()
+                    {
+                        act = Some(Act::Discard(i));
+                    }
+                }
+                Row::Temp { line, .. } => {
+                    ui.colored_label(error, line);
+                    if ui
+                        .add_enabled(free, egui::Button::new("Remove it"))
+                        .clicked()
+                    {
+                        act = Some(Act::Answer(i, true));
+                    }
+                    if ui.add_enabled(free, egui::Button::new("Keep it")).clicked() {
+                        act = Some(Act::Answer(i, false));
+                    }
+                }
+                Row::Note(line) => {
+                    ui.colored_label(text, line);
+                }
+            });
+            // A row's question about an interrupted save's file, under its own line.
+            if let Row::Edits {
+                temp: Some(left), ..
+            }
+            | Row::Kept {
+                temp: Some(left), ..
+            } = row
+            {
+                ui.horizontal_wrapped(|ui| {
+                    ui.colored_label(error, &left.line);
+                    if ui
+                        .add_enabled(free, egui::Button::new("Remove it"))
+                        .clicked()
+                    {
+                        act = Some(Act::Answer(i, true));
+                    }
+                    if ui.add_enabled(free, egui::Button::new("Keep it")).clicked() {
+                        act = Some(Act::Answer(i, false));
+                    }
+                });
+            }
+        }
+        if let Some(left) = &self.left {
+            ui.horizontal_wrapped(|ui| {
+                ui.colored_label(error, &left.line);
+                if ui
+                    .add_enabled(free, egui::Button::new("Remove it"))
+                    .clicked()
+                {
+                    act = Some(Act::Live(true));
+                }
+                if ui.add_enabled(free, egui::Button::new("Keep it")).clicked() {
+                    act = Some(Act::Live(false));
+                }
+            });
+        }
+        match act {
+            Some(Act::Restore(i)) => self.restore_row(i),
+            // Later: the journal stays for the next open; its lock is let go.
+            Some(Act::Later(i)) => {
+                self.rows.remove(i);
+            }
+            Some(Act::Discard(i)) => self.discard_row(i),
+            Some(Act::Answer(i, remove)) => self.answer_row(i, remove),
+            Some(Act::Live(remove)) => self.answer_live(remove),
+            None => {}
+        }
+    }
+
+    // ---- Save As (07 §7) ----
+
+    /// Opens the Save As modal over the edit; `close_after`: the window closes once it lands.
+    fn open_save_as(&mut self, close_after: bool) {
+        if self.save_as.is_some() || self.busy() || self.preview {
+            return;
+        }
+        if self.planning.is_some() {
+            return self.status = Status::info(CHECKING_ENCODER);
+        }
+        if self.media.plan.is_none() {
+            return self.status =
+                Status::error(format!("Save As cannot render {}", self.media.name));
         }
         if !self.unsaved() {
             return self.status = Status::info("no changes to save");
         }
         let spec = edit_spec(&self.media, &self.timeline, (0, self.timeline.len()), None);
-        let progress = Arc::new(AtomicU32::new(0));
-        let (tx, rx) = mpsc::channel();
-        let (media, file, root) = (
-            self.media.clone(),
-            self.file.clone(),
-            self.work_root.clone(),
-        );
-        let (shared, waker) = (progress.clone(), ctx.clone());
-        // Save writes the edit list; the rectangle is Export's (it stays drawn).
-        let saving = if self.crop().is_some() {
-            "saving the edit (not the crop: that is Export's)…"
-        } else {
-            "saving…"
+        let name = save_as_name(&self.media, &self.media.name);
+        let size = save_as::Size::About(file::estimate_size(&self.media, &spec));
+        let producer = file::MediaProducer {
+            media: self.media.clone(),
+            spec,
+            work_root: self.work_root.clone(),
+            hold: save_as_hold(),
+            held: self.save_as_held.clone(),
         };
+        let job = save_as::Job {
+            name,
+            size,
+            rate: self.stream().and_then(|s| s.rate()),
+            producer: Box::new(producer),
+        };
+        let folder = self
+            .save_as_folder
+            .clone()
+            .unwrap_or_else(super::binary::download_dir);
+        #[cfg(test)]
+        let chooser: Box<dyn super::binary::Chooser> = match &self.chooser {
+            Some(make) => make(),
+            None => Box::new(super::binary::NativeChooser),
+        };
+        #[cfg(not(test))]
+        let chooser: Box<dyn super::binary::Chooser> = Box::new(super::binary::NativeChooser);
         if let Some(player) = self.player.take() {
             self.marks.t = player.clock(Instant::now()).min(self.length());
         }
-        std::thread::spawn(move || {
-            // A worker that panicked mid-write must not lock the file out of every later
-            // Save and Export: its state is the file's own (origin, backup), still valid.
-            let mut file = file.lock().unwrap_or_else(|e| e.into_inner());
-            let result = file.save(&media, &spec, &root, &mut |f| {
-                shared.store((f * 1000.0) as u32, SeqCst);
-                waker.request_repaint();
-            });
-            drop(file);
-            let _ = tx.send(result);
-            waker.request_repaint();
-        });
-        self.status = Status::info(saving);
-        self.save = Some(SaveJob {
-            progress,
-            rx,
-            close_after,
+        let modal = SaveAs::new(job, &folder, chooser);
+        self.save_as = Some((modal, close_after, self.edits().text()));
+    }
+
+    /// The Save As modal's pass while it is open: a save that landed puts the edits somewhere,
+    /// as a Save copy does (07 §7 "What it counts as").
+    fn show_save_as(&mut self, ctx: &egui::Context) {
+        let Some((modal, close_after, edits)) = self.save_as.as_mut() else {
+            return;
+        };
+        let ended = modal.show(ctx);
+        let (close_after, edits) = (*close_after, edits.clone());
+        match ended {
+            Some(save_as::Ended::Saved { line, notes, .. }) => {
+                self.save_as = None;
+                self.copied = Some(edits);
+                self.status = Status::info(line);
+                self.pending_notices = Some(notes.clone());
+                if close_after && notes.is_empty() && !self.unsaved_nowhere() {
+                    self.close_ok = true;
+                    super::request_close(ctx);
+                }
+            }
+            Some(save_as::Ended::Closed) => self.save_as = None,
+            None => {}
+        }
+    }
+
+    /// `SOPEN_SAVE_AS` in a window (a receipt): once the state is on screen and what an earlier
+    /// session left is listed, the Save As modal opens on that folder and its Save is pressed.
+    fn save_as_receipt(&mut self, ctx: &egui::Context) {
+        if self.save_as_hook.is_none()
+            || !self.painted
+            || self.planning.is_some()
+            || self.unplanned
+            || self.recovering.is_some()
+        {
+            return;
+        }
+        self.save_as_folder = self.save_as_hook.take();
+        self.open_save_as(false);
+        ctx.input_mut(|i| {
+            i.events.push(egui::Event::Key {
+                key: Key::Enter,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            })
         });
     }
 
@@ -2316,16 +3600,51 @@ impl MediaWindow {
             }
         };
         let job = self.save.take().expect("checked above");
-        let (status, shown) = report_save(&result, &mut self.outcome.lock().unwrap());
+        let (status, shown) = report_save(&result, &mut self.outcome.lock().unwrap(), &job.host);
         self.status = status;
         self.pending_notices = Some(shown);
         let mut landed_clean = false;
-        if let Ok(Saved::Written { media, notes, .. }) = result {
-            match *media {
-                Ok(media) => self.reload(ctx, media),
-                Err(_) => self.stale = true,
+        // The worker is done with the file: what it learnt is the window's now.
+        if let Ok(file) = self.file.try_lock() {
+            self.save_off = file.save_off();
+            self.pass = file.pass();
+            self.baseline = file.origin.at.fingerprint();
+        }
+        match result {
+            Ok(Saved::Written { media, notes, .. }) => {
+                self.unknown = false;
+                match *media {
+                    Ok(media) => self.reload(ctx, media),
+                    Err(_) => self.stale = true,
+                }
+                landed_clean = notes.is_empty();
+                self.saved_journal();
             }
-            landed_clean = notes.is_empty();
+            Ok(Saved::FoundLanded { media, .. }) => {
+                self.unknown = false;
+                match media.map(|m| *m) {
+                    Some(Ok(media)) => self.reload(ctx, media),
+                    _ => self.stale = true,
+                }
+                landed_clean = true;
+                self.saved_journal();
+            }
+            Ok(Saved::Ask(left)) => {
+                self.left = Some(left);
+                self.kept_by_save(job.rev);
+            }
+            // The record cannot tell how that Save went: it stays, named, and editing resumes —
+            // the edits are the window's again (07 §3.1 "Anything else").
+            Ok(Saved::Unresolved { .. }) => {
+                self.unknown = false;
+                self.kept_by_save(job.rev);
+            }
+            Ok(Saved::Refused { .. } | Saved::Stopped { .. }) => self.kept_by_save(job.rev),
+            Err(e) if crate::remote::is_outcome_unknown(&e) => {
+                self.unknown = true;
+                self.kept_by_save(job.rev);
+            }
+            Err(_) => self.kept_by_save(job.rev),
         }
         let waited = std::mem::take(&mut self.close_when_saved);
         if (job.close_after && landed_clean) || (waited && !self.unsaved()) {
@@ -2342,7 +3661,7 @@ impl MediaWindow {
     /// is up. A Cmd/Ctrl+V whose press sent nothing (the system clipboard was empty) is
     /// recognised at its V key-up: this window's clipboard is its own.
     fn clipboard(&mut self, ctx: &egui::Context) {
-        let off = self.prompt || ctx.text_edit_focused();
+        let off = self.prompt || self.save_as.is_some() || ctx.text_edit_focused();
         let events: Vec<egui::Event> = ctx.input(|i| {
             i.events
                 .iter()
@@ -2424,8 +3743,13 @@ impl MediaWindow {
 
     fn keys(&mut self, ctx: &egui::Context) {
         use super::{command_key, plain_key};
-        if self.prompt {
+        // The Save As modal has the keys while it is up (its Esc, its Enter).
+        if self.prompt || self.save_as.is_some() {
             return;
+        }
+        // Save As before Cmd/Ctrl+S: egui's shortcut check takes Alt+Cmd/Ctrl+S for that too.
+        if save_as::pressed(ctx) {
+            self.open_save_as(false);
         }
         if plain_key(ctx, Key::Space) {
             if self.player.is_some() {
@@ -2459,10 +3783,13 @@ impl MediaWindow {
         if plain_key(ctx, Key::M) {
             self.toggle_stereo(ctx);
         }
-        // Esc: a running export's Cancel first, then the crop rectangle, then the selection
-        // (with none of them, the browser around a hosted window takes it to leave).
+        // Esc: a running export's Cancel first, then a running Save's stop, then the crop
+        // rectangle, then the selection (with none of them, the browser around a hosted window
+        // takes it to leave).
         if self.job.is_some() && plain_key(ctx, Key::Escape) {
             self.cancel_export();
+        } else if self.save.is_some() && plain_key(ctx, Key::Escape) {
+            self.stop_save();
         } else if self.sel.is_set() && plain_key(ctx, Key::Escape) {
             self.sel.clear();
         } else if self.marks.selected() && plain_key(ctx, Key::Escape) {
@@ -2789,33 +4116,57 @@ impl MediaWindow {
             ui.separator();
             let planning = self.planning.is_some();
             let busy = self.busy() || planning;
-            let save_ok = editable
+            let save_ok = (editable || self.unknown)
                 && !busy
-                && self.unsaved()
+                && (self.unsaved() || self.unknown)
                 && self.can_replace
+                && self.save_off.is_none()
+                && self.left.is_none()
                 && self.media.save_block().is_none();
             let why = if planning {
                 CHECKING_ENCODER.to_string()
             } else if !self.can_replace {
                 CANNOT_REPLACE.to_string()
+            } else if let Some(why) = &self.save_off {
+                why.clone()
             } else if let Some(why) = self.media.save_block() {
                 why
             } else if busy {
                 "a save or export is running".to_string()
+            } else if self.left.is_some() {
+                "answer the question about the interrupted save's file first".to_string()
             } else {
                 "no changes to save".to_string()
+            };
+            let backup = if self.local {
+                "after a local backup"
+            } else {
+                "keeping the original beside it as a hard link"
             };
             if ui
                 .add_enabled(save_ok, egui::Button::new("Save"))
                 .on_hover_text(format!(
-                    "⌘/Ctrl+S or F5 — renders the edit ({}) and overwrites the original after \
-                     a local backup; the crop rectangle is Export's, not Save's",
+                    "⌘/Ctrl+S or F5 — renders the edit ({}) and overwrites the original {backup}; \
+                     the crop rectangle is Export's, not Save's",
                     self.media.save_encodes()
                 ))
                 .on_disabled_hover_text(why)
                 .clicked()
             {
                 self.start_save(&ctx, false);
+            }
+            let save_as_ok = !busy && self.unsaved() && self.media.plan.is_some();
+            if ui
+                .add_enabled(save_as_ok, egui::Button::new("Save As…"))
+                .on_hover_text("⌥⌘/Alt+Ctrl+S or F7 — renders the edit into a new local file")
+                .on_disabled_hover_text(if busy {
+                    "a save or export is running"
+                } else {
+                    "no changes to save"
+                })
+                .clicked()
+            {
+                self.open_save_as(false);
             }
             if ui
                 .add_enabled(!busy, egui::Button::new("Export  E"))
@@ -2839,8 +4190,14 @@ impl MediaWindow {
         // shows its spinner and progress at the row's end, no taller than the row: a row that
         // came and went with it would move the frame under the pointer.
         let progress = match (&self.job, &self.save) {
-            (Some(job), _) => Some(("exporting", job.progress.load(SeqCst))),
-            (_, Some(save)) => Some(("saving", save.progress.load(SeqCst))),
+            (Some(job), _) => Some(format!(
+                "exporting {:.0} %",
+                job.progress.load(SeqCst) as f32 / 10.0
+            )),
+            (_, Some(save)) => Some(save_stage_text(
+                *save.stage.lock().unwrap_or_else(|p| p.into_inner()),
+                save.progress.load(SeqCst),
+            )),
             _ => None,
         };
         let line = egui::RichText::new(transport_text(&self.marks, self.length())).monospace();
@@ -2855,8 +4212,16 @@ impl MediaWindow {
                 {
                     self.cancel_export();
                 }
-                if let Some((what, per_mille)) = progress {
-                    ui.label(format!("{what} {:.0} %", per_mille as f32 / 10.0));
+                if self.save.is_some()
+                    && ui
+                        .add(egui::Button::new("Stop"))
+                        .on_hover_text("Esc — stops the save before it replaces the file")
+                        .clicked()
+                {
+                    self.stop_save();
+                }
+                if let Some(text) = progress {
+                    ui.label(text);
                     let size = ui.text_style_height(&egui::TextStyle::Body);
                     ui.add(egui::Spinner::new().size(size));
                     ui.separator();
@@ -2896,6 +4261,18 @@ impl MediaWindow {
                     }
                 );
                 ui.add(egui::Label::new(egui::RichText::new(text)).truncate());
+                // 07 §3: whether the edits are on the local disk yet (the path whole on hover).
+                let (kept, bad) = self.kept_line();
+                if !kept.is_empty() {
+                    ui.separator();
+                    let color = if bad {
+                        ui.visuals().error_fg_color
+                    } else {
+                        ui.visuals().text_color()
+                    };
+                    ui.add(egui::Label::new(egui::RichText::new(&kept).color(color)).truncate())
+                        .on_hover_text(&kept);
+                }
             }
             ui.separator();
             self.status.show(ui);
@@ -2953,8 +4330,17 @@ impl MediaWindow {
             return;
         }
         let id = egui::Id::unique("unsaved-media");
-        let can_save = self.can_replace && self.media.save_block().is_none() && !self.stale;
+        let can_save = self.can_replace
+            && self.save_off.is_none()
+            && self.left.is_none()
+            && self.media.save_block().is_none()
+            && !self.stale;
+        let can_save_as = self.media.plan.is_some() && !self.stale;
         let exporting = self.job.is_some();
+        let discard_hover = match &self.journal_dir {
+            Some(dir) => format!("deletes the kept edits at {}", super::binary::tilde(dir)),
+            None => "the edits are not kept anywhere".to_string(),
+        };
         let modal = super::chrome::dialog(ctx, id, "Unsaved changes", |ui| {
             ui.set_width(360.0);
             ui.label(format!(
@@ -2972,9 +4358,20 @@ impl MediaWindow {
                     self.prompt = false;
                     self.start_save(ctx, true);
                 }
-                if ui.button("Discard").clicked() {
+                // The window closes only after a Save As that landed (07 §10).
+                if can_save_as
+                    && ui
+                        .add_enabled(!exporting, egui::Button::new("Save As…"))
+                        .on_disabled_hover_text("an export is running")
+                        .clicked()
+                {
+                    self.prompt = false;
+                    self.open_save_as(true);
+                }
+                if ui.button("Discard").on_hover_text(&discard_hover).clicked() {
                     self.prompt = false;
                     self.close_ok = !exporting;
+                    self.discard = true;
                     // With an export running the window still waits for it (closing again
                     // closes it now): that rule is unchanged by the edits.
                     self.timeline = Timeline::new(self.media.rate(), self.media.ticks());
@@ -3128,6 +4525,12 @@ impl MediaWindow {
 
 impl Drop for MediaWindow {
     fn drop(&mut self) {
+        // A Save As still writing is stopped, and waited for: only sopen's staging is removed.
+        if let Some((modal, ..)) = self.save_as.take() {
+            modal.cancel();
+            drop(modal);
+        }
+        let saving = self.save.is_some();
         let left = match (self.job.take(), self.save.take()) {
             (Some(job), _) => Some(Leftover::Export(job)),
             (None, Some(save)) => Some(Leftover::Save(save)),
@@ -3135,6 +4538,11 @@ impl Drop for MediaWindow {
         };
         if left.is_some() {
             *self.leftover.lock().unwrap() = left;
+        }
+        // Closing (07 §3): the edits are written once more and kept, or — nothing unsaved, or
+        // Discard — the journal goes. A Save still running holds the journal and settles it.
+        if !saving && !self.preview {
+            self.settle_journal();
         }
     }
 }
@@ -3153,6 +4561,16 @@ impl super::Window for MediaWindow {
             self.start_decoders(&ctx);
             self.seek(&ctx, self.marks.t);
         }
+        self.start_recovery(&ctx);
+        self.poll_recovery();
+        self.poll_restoring(&ctx);
+        // Losing the keyboard focus writes the edits at once (07 §3), on a worker.
+        let focused = ctx.input(|i| i.focused);
+        if self.focused && !focused && self.save.is_none() {
+            self.note_edits(Instant::now());
+            self.write_soon = true;
+        }
+        self.focused = focused;
         self.poll_planning();
         if self.export_hold.is_some() && self.planning.is_none() && !self.hold_started {
             self.hold_started = true;
@@ -3254,6 +4672,13 @@ impl super::Window for MediaWindow {
                 ui.add_space(2.0);
             });
         }
+        // What an earlier session left, and a cut-off Save's question (07 §3, §3.1).
+        if !self.rows.is_empty() || self.left.is_some() {
+            egui::Panel::top("recovery").show(ui, |ui| {
+                self.recovery_ui(ui);
+                ui.add_space(2.0);
+            });
+        }
         let mut seek = None;
         let audio_only = self.audio_only();
         // The F-key row, the window's last (on its own: the browser around it has the row).
@@ -3293,7 +4718,10 @@ impl super::Window for MediaWindow {
         if let Some((t, done)) = seek {
             self.scrub_to(&ctx, t, done);
         }
+        self.tick_journal(&ctx);
+        self.save_as_receipt(&ctx);
         self.close_prompt(&ctx);
+        self.show_save_as(&ctx);
     }
 
     fn failure(&self) -> Option<String> {
@@ -3315,12 +4743,21 @@ impl super::Window for MediaWindow {
                 .as_ref()
                 .is_some_and(|j| j.progress.load(SeqCst) >= 300);
         let planned = self.planning.is_none() && !self.unplanned;
+        // Under `SOPEN_SAVE_AS` (a receipt), once that Save As holds or has ended.
+        let save_as = match &self.save_as {
+            Some((modal, ..)) => !modal.busy() || self.save_as_held.load(SeqCst),
+            None => self.save_as_hook.is_none(),
+        };
+        // And once what an earlier session left is listed (its rows on screen).
+        let listed = self.recovery_started && self.recovering.is_none();
         self.painted
             && frame_ok
             && self.player.is_none()
             && export_ok
             && self.save.is_none()
             && planned
+            && save_as
+            && listed
     }
 
     fn keys(&self) -> &'static [super::chrome::FKey] {
@@ -3348,17 +4785,27 @@ impl super::Window for MediaWindow {
 
     fn close_requested(&mut self) -> bool {
         // A preview holds nothing unsaved and writes nothing: dropping it asks nothing.
-        if self.close_ok || self.preview {
+        if self.preview {
             return true;
+        }
+        if self.close_ok {
+            return self.go();
         }
         // Nor does one that failed to show its file, still as it was opened: it goes. (One
         // edited or writing since then is asked as any other, and its open did not fail.)
         if self.failed.is_some() {
             if self.as_opened() {
-                return true;
+                return self.go();
             }
             self.failed = None;
             self.outcome.lock().unwrap().failed = None;
+        }
+        if let Some((modal, ..)) = &self.save_as {
+            // A Save As under way is stopped, and the modal says so; the window asks again.
+            if modal.busy() {
+                modal.cancel();
+                return false;
+            }
         }
         if self.save.is_some() {
             // Never close mid-write: the window closes once the save has reported. Said in the
@@ -3375,17 +4822,23 @@ impl super::Window for MediaWindow {
             self.pending_notices = Some(next);
             return false;
         }
-        if self.unsaved() && !self.stale {
+        if self.unsaved_nowhere() && !self.stale {
+            // Closing writes the newest edits at once (07 §3), on a worker, while the prompt
+            // asks; whatever the answer, the window goes only once they are on disk.
+            self.note_edits(Instant::now());
+            if self.keeping_before_close() && self.writing.is_none() {
+                self.write_soon = true;
+            }
             self.prompt = true;
             return false;
         }
         if self.job.is_none() {
-            return true;
+            return self.go();
         }
         if self.close_when_done {
             // Second request: the window goes now; `open` waits for the export and prints
             // its outcome in the terminal.
-            return true;
+            return self.go();
         }
         self.close_when_done = true;
         self.status = Status::info("exporting…");
@@ -3412,6 +4865,12 @@ pub mod wave;
 
 #[cfg(test)]
 mod edit_tests;
+
+#[cfg(test)]
+mod save_tests;
+
+#[cfg(test)]
+mod live_tests;
 
 #[cfg(test)]
 mod input_tests;

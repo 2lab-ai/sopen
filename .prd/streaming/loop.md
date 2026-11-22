@@ -14,17 +14,16 @@ browser's experiments are its own E1–E5 (02 §8.2).
 
 | ID | Status | Branch | Worktree | Scope | Owns | After | Gate |
 |---|---|---|---|---|---|---|---|
-| W7 | 🟡 | `feat/stream-media` | `.worktrees/feat-stream-media` | 06 §7.4: URL inputs with their own options and reader kinds, progressive waveform, Export cancel, cut runs failed | `src/gui/media.rs`, `src/gui/media/*`, `src/gui/playback.rs`, `src/ffmpeg.rs`, `src/cut.rs` | — (S1-M merged: PR #36, bdb6166; W3 merged: PR #31, 5f4e6b3) | V16, V18, V19, V22 |
-| ED6 | 🚪 | `feat/stream-edit-media` | `.worktrees/feat-stream-edit-media` | 07 §5.3, §9: Save from a URL, baseline pass, cut renders failed, hard-link backup and disclosure, Source closed after Save, journal | `src/gui/media/file.rs`, `src/gui/media.rs`, `src/gui/media/edit_tests.rs` | W7, ED2, ED3; before W8b | E15, E16, E20 |
+| ED6 | 🟡 | `feat/stream-edit-media` | `.worktrees/feat-stream-edit-media` | 07 §5.3, §9: Save from a URL, baseline pass, cut renders failed, hard-link backup and disclosure, Source closed after Save, journal | `src/gui/media/file.rs`, `src/gui/media.rs`, `src/gui/media/edit_tests.rs`, `src/gui/media/save_tests.rs` (new); `src/gui/chrome.rs` (`MEDIA_KEYS`' F7 only); `src/cut.rs` (`render_edit_stoppable`, added) | — (W7 merged: PR #46, 41dee30; ED2, ED3 merged); before W8b | E15, E16, E20 |
 | W8b | 🚪 | `feat/stream-routing-b` | `.worktrees/feat-stream-routing-b` | 06 §7.3, §13: remote text over 16 MiB through a Source, the image → hex switch, the image and media routes and previews through a Source with 02 §4.3–§4.4 and P6's image part, the `.ts` refine over the URL, the `.preview` root | `src/gui/browser/prepare.rs`, `src/gui/browser/preview.rs`, `src/gui/browser.rs` (hex switch), `src/gui/browser/tests.rs`, `src/gui/browser/prepare/tests.rs`, `src/cache.rs` (`.preview` root), `src/main.rs`, `src/kind.rs`, `.prd/02-architecture.md` (§4.3–§4.4) | W8a, W5b, W6, W7, ED6; S1-M merged | V15's Hex view; live V2–V3 with `SOPEN_STREAM_STATS` |
-| ED4 | 🟡 | `feat/stream-edit-hex` | `.worktrees/feat-stream-edit-hex` | 07 §3–§6, §10: hex Save, Save As, journal, Restore checks, reconciliation, rows, confirmation, prompt, `Origin` refused at Save | `src/gui/hex/file.rs`, `src/gui/hex.rs`, `src/gui/hex/tests.rs` | — (W4, W8a, ED1, ED2 merged; ED3 merged: PR #44, 485c240) | E1, E2, E10–E13, E16–E18, E21; live E1 on a 24 GB file |
 | ED5 | 🟡 | `feat/stream-edit-image` | `.worktrees/feat-stream-edit-image` | 07 §8: image journal, Save As | `src/gui/image/file.rs`, `src/gui/image.rs`, `src/gui/image/robustness_tests.rs` | W6, ED2, ED3 | E14, E16, E18 (image cases, no edits during Save) |
 | D1 | 🚪 | `feat/stream-docs` | `.worktrees/feat-stream-docs` | 06 §14, 07 §13: 01, AGENTS.md and README to the shipped contract | `.prd/01-spec.md`, `AGENTS.md`, `README.md`, `.prd/06-streaming.md`, `.prd/07-streaming-edit.md` | every unit above | review |
 
 ## Merge order, both workstreams
 
 The "After" column is authoritative; this is the order it gives. As of 2026-11-22, steps 1–5 and 7
-are done; W7 and ED5 are left of step 6.
+are done (ED5 merged too: PR #49, b3cf430; its row is still to be closed); ED6 is left of step 8,
+and S2-E and D1 of step 9.
 
 1. PR #15 (media edit) and PR #16 (stems): both merged on 2026-11-20. PR #16 shared only
    `Cargo.toml` with W1 (other sections).
@@ -65,7 +64,8 @@ PR #38 (d7f9000, from W8a's live probe), PR #41 (622e843, a media decoder race) 
 rows and ED3's are the last two blocks of [`loop.done.md`](loop.done.md). No experiment is left
 open: X1–X5 are done.
 
-- In progress since 2026-11-22, in parallel: W7 (media over URLs) and ED4 (hex edit). W7 takes
-  X1's rules with it (06 §7.4: the cut account around every render run; §12 V16's render gates)
-  and settles the mp3 question in 06's Tensions.
-- Then ED5 (after ED3) and ED6 (after W7 and ED3); then W8b (after W7 and ED6); then D1.
+- W7 (PR #46, 41dee30) and ED4 (PR #47, 0302a69) merged on 2026-11-22: the last block of
+  [`loop.done.md`](loop.done.md).
+- ED5 (image edit) merged on 2026-11-22: PR #49 (b3cf430), with the test fix PR #50 (e1e3c99).
+- In progress since 2026-11-22: ED6 (media edit).
+- Then W8b (after ED6); then D1.
