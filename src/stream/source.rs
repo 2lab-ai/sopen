@@ -1301,6 +1301,13 @@ impl Source {
         self.shared.lock().stats()
     }
 
+    /// Bytes a second the viewer is getting from the remote: the admission's measure (06 §4,
+    /// an EWMA over about the last second of read replies), `None` until a reply has come.
+    /// What 07 §7's expected time and §4.1's cost are said at.
+    pub fn rate(&self) -> Option<f64> {
+        self.shared.lock().pf.adm.rate()
+    }
+
     /// Re-opens the path, takes a new fingerprint and drops the cache (Cmd/Ctrl+R). Waits for
     /// it — an open and an `fstat` on the stream's connection — so not for a frame:
     /// [`Source::request_reload`] does not wait.

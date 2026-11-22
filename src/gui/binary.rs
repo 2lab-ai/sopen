@@ -158,19 +158,54 @@ pub fn untilde(text: &str) -> PathBuf {
 }
 
 /// The first `<stem>-N<ext>` next to `path` (N = 1, 2, …) that nothing has — not even a
-/// dangling link.
-pub fn next_free(path: &Path) -> PathBuf {
+/// dangling link. A name already in a counted series — `<stem>-N<ext>` beside its
+/// `<stem><ext>` — counts on in that series (`model.edited-1.bin` gives `model.edited-2.bin`,
+/// never `model.edited-1-1.bin`); a number that is part of a name (nothing at the name without
+/// it, as `report-2024.pdf`) stays. An error when every `-N` up to [`NAME_TRIES`] is taken —
+/// never a name it did not look at.
+pub fn next_free(path: &Path) -> Result<PathBuf> {
+    next_free_within(path, NAME_TRIES)
+}
+
+/// The `-N` names [`next_free`] looks at: `-1` to `-9999`.
+const NAME_TRIES: u32 = 9_999;
+
+/// [`next_free`] over `-1` to `-<limit>` (tests: a small limit).
+fn next_free_within(path: &Path, limit: u32) -> Result<PathBuf> {
     let name = path
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
-    for n in 1..10_000 {
+    let name = series_base(path, &name).unwrap_or(name);
+    for n in 1..=limit {
         let candidate = path.with_file_name(fitted(&name, n));
         if std::fs::symlink_metadata(&candidate).is_err() {
-            return candidate;
+            return Ok(candidate);
         }
     }
-    path.with_file_name(fitted(&name, 10_000))
+    bail!(
+        "every name from {} to {} is taken in {}",
+        fitted(&name, 1),
+        fitted(&name, limit),
+        tilde(path.parent().unwrap_or(Path::new(".")))
+    )
+}
+
+/// `<stem><ext>` of a name `<stem>-N<ext>` (N decimal digits) when something is at that name
+/// beside it: the series the name is in.
+fn series_base(path: &Path, name: &str) -> Option<String> {
+    let (stem, ext) = match name.rfind('.') {
+        Some(i) if i > 0 => name.split_at(i),
+        _ => (name, ""),
+    };
+    let (head, digits) = stem.rsplit_once('-')?;
+    if head.is_empty() || digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let base = format!("{head}{ext}");
+    std::fs::symlink_metadata(path.with_file_name(&base))
+        .is_ok()
+        .then_some(base)
 }
 
 /// The longest name a folder takes, in bytes (macOS and Linux alike).
@@ -209,7 +244,11 @@ pub fn suggest(path: PathBuf) -> (PathBuf, Option<String>) {
     if std::fs::symlink_metadata(&path).is_err() {
         return (path, None);
     }
-    let next = next_free(&path);
+    let next = match next_free(&path) {
+        Ok(next) => next,
+        // Nothing free to suggest: the field keeps the name, and the note says why.
+        Err(e) => return (path, Some(format!("{e:#}"))),
+    };
     let note = format!(
         "{} is already in {}; suggesting {}",
         path.file_name().unwrap_or_default().to_string_lossy(),
@@ -253,8 +292,9 @@ pub struct SavedTo {
 }
 
 fn exists(dest: &Path) -> SaveError {
-    SaveError::Exists {
-        next: next_free(dest),
+    match next_free(dest) {
+        Ok(next) => SaveError::Exists { next },
+        Err(e) => SaveError::Failed(e.context(format!("{} exists", dest.display()))),
     }
 }
 

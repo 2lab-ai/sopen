@@ -123,3 +123,21 @@ changes. Rows here are snapshots taken when they were moved.
   long runs of word characters.
 - Dates in this block are the merge commits' dates in +0900. In UTC (GitHub's times), all six
   merges fell on 2026-11-21.
+
+## R1 (part 6) — closed 2026-11-22
+
+- merged ED3 ✅ · result: the shared Save As modal and its writer (`gui::save_as`) and F7
+  "SaveAs" (`chrome::SAVE_AS_KEY`), wired by no window yet: each of ED4–ED6 adds F7 to its row
+  and help line when it wires the modal · closed rows: ED3 · PRs: #44 (485c240)
+
+### Closed rows
+
+| ID | Status | Branch | Worktree | Scope | Owns | After | Gate |
+|---|---|---|---|---|---|---|---|
+| ED3 | ✅ | `feat/stream-edit-save-as` | `.worktrees/feat-stream-edit-save-as` | 07 §7: Save As modal, F7 in three rows | `src/gui/save_as.rs`, `src/gui/save_as/tests.rs`, `src/gui/mod.rs`, `src/gui/chrome.rs` (F7 entries) | — (browser S1 merged: S1-E, PR #29, 0120d40; S1-A owns `chrome.rs`'s body) | Merged PR #44 (485c240), 2026-11-22 |
+
+### Round section
+
+- ED3 (PR #44, merged 2026-11-22, 485c240), after one review round (Enter on a focused button
+  is that button's, the path field holds the keyboard).
+- The date in this block is the merge commit's date in +0900.
