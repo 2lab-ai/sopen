@@ -225,6 +225,44 @@ pub(crate) struct Traced {
     pub reader: Option<u64>,
 }
 
+/// Tests: the blocks of `trace` fetched more than once, in bytes, by whether a reader waited
+/// both times (06 §12 V16). A fetch is a wait unless it is a prefetch (a bulk read counts as
+/// one: its class does not tell a wait from readahead). `waited_twice`: a block a reader had
+/// waited for, evicted, and waited for again. `readahead`: every other block fetched again —
+/// readahead nobody had waited for, or a block waited for once that came back as readahead.
+#[cfg(test)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Refetches {
+    pub readahead: u64,
+    pub waited_twice: u64,
+}
+
+#[cfg(test)]
+pub(crate) fn refetches(trace: &[Traced]) -> Refetches {
+    let mut waited: std::collections::HashMap<u64, bool> = std::collections::HashMap::new();
+    let mut out = Refetches::default();
+    for t in trace {
+        let (Some(class), Some(block)) = (t.class, t.block) else {
+            continue;
+        };
+        let wait = class != Class::Prefetch;
+        match waited.get_mut(&block) {
+            None => {
+                waited.insert(block, wait);
+            }
+            Some(before) => {
+                if *before && wait {
+                    out.waited_twice += BLOCK;
+                } else {
+                    out.readahead += BLOCK;
+                }
+                *before |= wait;
+            }
+        }
+    }
+    out
+}
+
 pub(crate) struct Core {
     pub(crate) state: State,
     pub(crate) gen: u64,

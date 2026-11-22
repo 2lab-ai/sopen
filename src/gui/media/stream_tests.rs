@@ -9,7 +9,7 @@ use super::*;
 use crate::ffmpeg::{Served, Span};
 use crate::remote::{LocalFs, RemoteFs, SftpRemote};
 use crate::stream::http::{Config, Seams, Server, SEND_BUFFER};
-use crate::stream::{limits, Class, Engine, Opening, Settings, BLOCK, CAP_MAX};
+use crate::stream::{limits, refetches, Class, Engine, Opening, Settings, BLOCK, CAP_MAX};
 use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicU64, AtomicUsize};
 
@@ -82,26 +82,8 @@ fn settled(source: &Source) {
 /// 06 §12 V16's `refetched`: the bytes of blocks fetched more than once (`Stats` has none; read
 /// from the engine's trace of what it sent).
 fn refetched(source: &Source) -> u64 {
-    let (prefetch, demand) = fetched_again(source);
-    prefetch + demand
-}
-
-/// [`refetched`] by the class of the fetch that came again: `(prefetch, demand and bulk)`. A
-/// demand fetched again is a block a reader waited for twice.
-fn fetched_again(source: &Source) -> (u64, u64) {
-    let mut seen = std::collections::HashSet::new();
-    let (mut prefetch, mut other) = (0, 0);
-    for t in &source.core().trace {
-        if let (Some(class), Some(block)) = (t.class, t.block) {
-            if !seen.insert(block) {
-                match class {
-                    Class::Prefetch => prefetch += BLOCK,
-                    _ => other += BLOCK,
-                }
-            }
-        }
-    }
-    (prefetch, other)
+    let again = refetches(&source.core().trace);
+    again.readahead + again.waited_twice
 }
 
 /// Where the engine's trace of what it sent is now: what a run sends from here is after it.
@@ -115,8 +97,9 @@ fn cap_since(source: &Source, from: usize) -> u64 {
     core.trace[from..].iter().map(|t| t.cap).max().unwrap_or(0)
 }
 
-/// Each block fetched again in a class other than Prefetch, with every fetch of it: its place
-/// in the trace, its class, and the reader it was for (its kind and where it reached).
+/// Each block a reader waited for twice (two fetches other than a prefetch), with every fetch
+/// of it: its place in the trace, its class, and the reader it was for (its kind and where it
+/// reached).
 fn demand_history(source: &Source) -> String {
     let core = source.core();
     let reaches = core.pf.reaches();
@@ -126,14 +109,18 @@ fn demand_history(source: &Source) -> String {
                 format!("r{} {:?} {}..{}", r.id, r.kind, r.from, r.to)
             })
     };
-    let mut seen = std::collections::HashSet::new();
-    let again: Vec<u64> = core
-        .trace
-        .iter()
-        .filter_map(|t| t.block.map(|b| (b, t.class)))
-        .filter(|(b, class)| !seen.insert(*b) && *class != Some(Class::Prefetch))
-        .map(|(b, _)| b)
-        .collect();
+    let mut waited = std::collections::HashMap::new();
+    let mut again = Vec::new();
+    for t in &core.trace {
+        let (Some(class), Some(b)) = (t.class, t.block) else {
+            continue;
+        };
+        let (before, wait) = (waited.get(&b).copied(), class != Class::Prefetch);
+        if before == Some(true) && wait && !again.contains(&b) {
+            again.push(b);
+        }
+        waited.insert(b, before.unwrap_or(false) || wait);
+    }
     again
         .iter()
         .map(|b| {
@@ -471,11 +458,14 @@ fn v16_playback_of_an_edit_fetches_within_its_bound() {
                  {readers} play readers, cap {cap}, allowed {allowed}"
             );
             assert!(fetched - again <= allowed, "from {at} s: fetched {fetched}");
-            // What comes again is readahead nobody read, never a block a decoder waited for.
+            // What comes again is readahead — one of its two fetches: a reader that reads it
+            // later waits for it —, never a block a decoder waited for twice. (The trace's lock
+            // is let go before the message, which takes it again.)
+            let waited_twice = refetches(&source.core().trace).waited_twice;
             assert_eq!(
-                fetched_again(&source).1,
+                waited_twice,
                 0,
-                "from {at} s: a demand fetched again: {}",
+                "from {at} s: a block waited for twice: {}",
                 demand_history(&source)
             );
             // What the start's readers were let read: each one's readahead never past its
@@ -1508,7 +1498,9 @@ fn esc_and_the_button_cancel_a_running_export() {
         win.sel.is_set() && win.marks.selected(),
         "Esc went to the export only"
     );
-    assert!(drv.find_text("cancelling the export…").is_some());
+    // The status says so (the window's crop is an edit: the status row also names it, and may
+    // cut the status short on this narrow window).
+    assert_eq!(win.status.text, "cancelling the export…");
     let (stop, _tx) = job(&mut win);
     drv.idle(&mut win, 2);
     drv.click_text(&mut win, "Cancel");
@@ -1521,9 +1513,10 @@ fn esc_and_the_button_cancel_a_running_export() {
     drv.key(&mut win, egui::Key::Escape, egui::Modifiers::NONE);
     drv.idle(&mut win, 1);
     assert!(!stop.cancelled());
-    assert!(drv
-        .find_text("too late to cancel: the export is being published")
-        .is_some());
+    assert_eq!(
+        win.status.text,
+        "too late to cancel: the export is being published"
+    );
 }
 
 /// [`idle`] for a stream whose engine the test steps.

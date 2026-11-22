@@ -49,11 +49,14 @@ downloaded and checked by build.rs; `SHERPA_ONNX_LIB_DIR` for offline builds); `
 - **Never overwrite silently.** Every write re-checks the remote file first (`lstat`: still a regular file,
   same `(size, mtime)`, same content hash up to 256 MiB) and refuses on change; writes go to a temp name in the
   same directory with the target's owner and mode and are renamed over the target. Spec §5 is the full rule.
-  Image, hex and media Save keep a local backup of the original first — except a streamed hex file (a remote
-  file in the hex window), whose Save copies the file on its host, patches the copy and renames it over the
-  target, checking the pages under the edits (and up to 256 MiB the whole content) on the way; its backup is a
-  local undo file of the bytes it replaced, durable before anything is patched, and every edit is kept in a
-  local journal first (`.prd/07-streaming-edit.md` §3–§5). Media exports always write a new sibling
+  Image and hex Save, and media Save of a local file, keep a local backup of the original first — except a
+  streamed hex file (a remote file in the hex window), whose Save copies the file on its host, patches the
+  copy and renames it over the target, checking the pages under the edits (and up to 256 MiB the whole
+  content) on the way; its backup is a local undo file of the bytes it replaced, durable before anything is
+  patched, and every edit is kept in a local journal first (`.prd/07-streaming-edit.md` §3–§5). Media Save of
+  a remote file keeps the original on its own host instead: its first Save of a session links it to
+  `.<name>.sopen-backup-<UTC>` beside it (a hard link, never over anything) before the overwrite, says so
+  before and after, and is off where the server has no hard links (07 §5.3). Media exports always write a new sibling
   file and never use a replacing rename to publish it. The binary dialog's "Save to…" fills a file in a private
   staging folder and publishes it complete by a hard link, never over anything (spec §6a). The browser's rename,
   copy, move and make folder never replace an existing name; a remote rename is SFTP's plain rename, never
@@ -99,8 +102,8 @@ prompts on close.
 | `SOPEN_KEYS='F5,Enter'` | The file browser: keys played as the owner's own, one each time the window has settled (nothing listing, opening or being previewed, the display committed; a file operation waiting at its name-in-the-way question counts as settled), so `SOPEN_SCREENSHOT` shoots what they lead to — a dialog, the rename field, a report. Steps are separated by commas: a key by egui's name (`F2`, `Enter`, `Esc`, `Down`, `Space`, `Tab`, a letter), with `Shift+`, `Alt+` or `Cmd+` / `Ctrl+` before it, or `text:…` for typed text (`text:+,text:*.txt,Enter` selects by a pattern). An unknown key is an error before the window opens. A limit of the hook: a step is played only once the window has settled, so a key cannot be pressed in the middle of a running operation (an `Esc` after `F5,Enter` waits until the copy has ended or asks about a name) — stopping one mid-way is proven by the gated tests in `src/gui/browser/tests/s1.rs`, not by this hook. The image window of its own takes it too, played the same way once the window has settled (after `SOPEN_STATE`, whose `rect=` a played `C` crops): `SOPEN_STATE='rect=100,60,320,200' SOPEN_KEYS='C,F7,Cmd+A,text:<folder>/shot.edited.png,Enter'` crops and saves as a new local file; `C,Cmd+S` crops and saves over the file. Cmd/Ctrl+C, X and V arrive as clipboard events, never as keys, so they cannot be played. A local setting, not forwarded by `--target`. |
 | `SOPEN_LIST=1` | A folder: print what the file browser lists (the path, a row per entry — Name, Ext, Size, Date, Time — and the `N Listed = N bytes` foot) instead of opening the window. A scripted save or export (`SOPEN_AUTOSAVE`, `SOPEN_AUTOEXPORT`) on a folder is an error. |
 | `SOPEN_SAVE_TO=<path>` | Where the dialog's "Save to…" saves (the path field's first value; a folder gets the file's name), instead of the download folder — no native dialog. |
-| `SOPEN_SAVE_AS=<folder>` | The hex window: its edits are saved as `<folder>/<stem>.edited<ext>` (the next free `-N` when taken) — without a window under `SOPEN_AUTOSAVE` (progress lines on stderr, `saved <path>` on stdout; exit 0 saved, 3 not), else through the Save As modal once the state is on screen (`.prd/07-streaming-edit.md` §7). |
-| `SOPEN_SAVE_AS_HOLD_MS=<ms>` | With `SOPEN_SAVE_AS`: the save holds at its first progress at or past 30 % for that long, so `SOPEN_SCREENSHOT` shoots the modal mid-transfer. |
+| `SOPEN_SAVE_AS=<folder>` | The hex and media windows: their edits are saved as `<folder>/<stem>.edited<ext>` (the next free `-N` when taken; media: the extension its render has) — without a window under `SOPEN_AUTOSAVE` (progress lines on stderr, `saved <path>` on stdout; exit 0 saved, 3 not), else through the Save As modal once the state is on screen (`.prd/07-streaming-edit.md` §7). |
+| `SOPEN_SAVE_AS_HOLD_MS=<ms>` | With `SOPEN_SAVE_AS`: the save holds at its first progress at or past 30 % for that long (media: of the render), so `SOPEN_SCREENSHOT` shoots the modal mid-transfer. |
 | `SOPEN_SAVE_HOLD_MS=<ms>` | `SOPEN_CHOICE=save`: the save holds at its first progress report for that long, or until it is cancelled — so a signal reaches it mid-way (Ctrl-C and SIGTERM cancel a save without a window: nothing is left, exit 130 / 143). `<ms>:stalled` holds for the whole time whatever comes, as a transfer whose remote has stalled: the first signal is not seen, and the same signal again ends sopen. |
 | `SOPEN_AUTOEXPORT=1` | Media: apply the state and Export without a window; prints the new sibling's path. |
 | `SOPEN_EXPORT_HOLD_MS=<ms>` | Media window: start an Export on open and hold it, at its first progress report at or past 30 %, for that long, so `SOPEN_SCREENSHOT` captures the window mid-export; when the window closes sopen waits for the export and prints its result. |

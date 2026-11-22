@@ -1092,11 +1092,19 @@ impl Journal {
             #[cfg(test)]
             gap::hold(cache);
             // A listing that found this directory before its lock existed makes the lock itself
-            // (exclusively) and owns the directory: this session then takes another.
+            // (exclusively) and owns the directory — and, finding nothing in it, removes it
+            // (`orphans`): this session then takes another.
             let lock = match fs.lock(&dir.join(LOCK), true) {
                 Ok(Some(held)) => held,
                 Ok(None) => continue,
-                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        io::ErrorKind::AlreadyExists | io::ErrorKind::NotFound
+                    ) =>
+                {
+                    continue
+                }
                 Err(e) => return Err(io_err(e, "lock", &dir.join(LOCK))),
             };
             return Ok(Journal {
@@ -1557,9 +1565,10 @@ pub fn this_files_journals(cache: &Path, host: &str, abs: &str) -> Vec<PathBuf> 
 }
 
 /// The journals of `path` on `host` left by sessions that are gone (their lock free), newest
-/// first. A journal whose lock file was never made gets one, made exclusively. Journals being
-/// removed are emptied on the way; one written for another host or path that maps to the same
-/// place is skipped.
+/// first. A journal whose lock file was never made gets one, made exclusively. One that holds
+/// nothing but its lock is removed, not offered ([`holds_nothing`]). Journals being removed are
+/// emptied on the way; one written for another host or path that maps to the same place is
+/// skipped.
 pub fn orphans(fs: &Arc<dyn Fs>, cache: &Path, host: &str, path: &str) -> Result<Vec<Orphan>> {
     let (home, file) = journal_home(cache, host, path)?;
     // Never through a link below the cache, as when they are made.
@@ -1609,6 +1618,15 @@ pub fn orphans(fs: &Arc<dyn Fs>, cache: &Path, host: &str, path: &str) -> Result
             continue;
         }
         let Some(lock) = lock else { continue };
+        // §3: a journal that holds no edit is removed when it is listed — there is nothing to
+        // offer. Its lock held here, nothing else is written into it.
+        if holds_nothing(fs.as_ref(), &dir) {
+            if let Err(e) = retire(fs.as_ref(), &dir) {
+                crate::debug!("journal: an empty one stays: {e:#}");
+            }
+            drop(lock);
+            continue;
+        }
         let (found, notes) = read_found(fs.as_ref(), &dir);
         let head = match &found {
             Found::Edits(g) => Some(&g.head),
@@ -1637,6 +1655,16 @@ pub fn orphans(fs: &Arc<dyn Fs>, cache: &Path, host: &str, path: &str) -> Result
         });
     }
     Ok(out)
+}
+
+/// Whether the journal folder `dir` holds nothing but its lock: no `CURRENT`, no generation
+/// (whole, torn or still being written), no pasted picture, no `save` record — what a session
+/// leaves when it ends between its `mkdir` and its first generation, or what a listing took from
+/// a session still between the folder and its lock (that session then makes another,
+/// [`Journal::create`]). Anything else in it may hold an edit or a Save's record: it is offered.
+fn holds_nothing(fs: &dyn Fs, dir: &Path) -> bool {
+    fs.list(dir)
+        .is_ok_and(|names| names.iter().all(|name| name == LOCK))
 }
 
 /// Reads `gen-<n>` and checks it is whole and is generation `n`.

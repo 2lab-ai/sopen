@@ -197,6 +197,11 @@ byte.
 - **A journal that holds no edit** (its edits undone before the end) is removed when it is listed:
   there is nothing to offer — unless it still holds a question about an interrupted save's file
   (§3.1): then its row says `an interrupted save's record is kept at <journal>` and asks it.
+  - So is a journal folder holding nothing but its lock — no `CURRENT`, no generation (whole, torn
+    or `.tmp`), no paste, no `save`: a session that ended between its `mkdir` and its first
+    generation, or a folder the listing took from a session still between the folder and its lock
+    (a slow disk). That session then makes another journal, and its edits go there. A folder with
+    anything else in it is offered as before, with what it holds.
 - **Later** leaves the journal for the next open.
 - **Discard** removes it.
 - A journal of **another kind** (the same file opened as hex earlier, now as an image) is named in
@@ -674,8 +679,11 @@ size rule. Image and media upload their output, as today.
      - Hex: it reads the source fresh on the `Origin` (never the view's cache, §4.2) through a handle
        opened at the start, with up to 4 MiB in flight, and applies the patches.
      - Image: the encoder's output.
-     - Media: ffmpeg rendering into `part`, with an explicit `-f <muxer>` since `part` has no
-       extension.
+     - Media: ffmpeg renders in sopen's own exports folder (after its free-space check), with an
+       explicit `-f <muxer>`, and the render is copied into `part` through its open handle. No
+       ffmpeg opens a path in the chosen folder: what a path there names when it is opened is
+       not what was checked if another user can rename an entry anywhere on it. A cancel or a
+       failed copy publishes nothing; the render goes with its folder either way.
   4. After the transfer (hex) the handle's `(size, mtime)` must still equal the baseline. The edited
      pages streamed must equal `seen`. At most 256 MiB, the hash of the source bytes read must equal
      the baseline. Otherwise nothing is saved and `part` is removed, with the reason (01 §6a: "a
@@ -771,7 +779,8 @@ size rule. Image and media upload their output, as today.
   becomes the staged render's path, so the window never shows `Replaced` for its own save. The next
   Save's baseline is `write_atomic`'s staged stat, as today.
 - **Export** is unchanged: `write_new_sibling`.
-- **Save As** renders straight into the staging `part` (§7).
+- **Save As** renders in sopen's exports folder and copies the render into the staging `part`
+  through its handle (§7).
 - **A source that changes mid-render** gets its response cut short by the range server (06 §9).
   ffmpeg may still exit 0 with a truncated output (verified, 06 §7.4), so the server's cut account
   decides: the render is failed, nothing is uploaded or published, the journal stays, and the

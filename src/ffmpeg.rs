@@ -1623,6 +1623,44 @@ pub fn edit_args(
     plan: &ExportPlan,
     encode: Encode,
 ) -> Result<EditArgs> {
+    edit_args_as(files, dst, None, spec, kind, plan, encode)
+}
+
+/// The muxer ffmpeg picks for an output named `*.ext` (`ffmpeg … out.ext` prints it as
+/// `Output #0, <muxer>`; checked on ffmpeg 9.0.2), for the containers a render writes.
+pub fn muxer_for(ext: &str) -> Option<&'static str> {
+    Some(match ext.to_ascii_lowercase().as_str() {
+        "mp4" => "mp4",
+        "m4v" | "m4a" => "ipod",
+        "mov" => "mov",
+        "mkv" => "matroska",
+        "webm" => "webm",
+        "avi" => "avi",
+        "ts" => "mpegts",
+        "mp3" => "mp3",
+        "wav" => "wav",
+        "flac" => "flac",
+        "aac" => "adts",
+        "ogg" => "ogg",
+        "opus" => "opus",
+        _ => return None,
+    })
+}
+
+/// [`edit_args`] writing a final render as a `*.ext` file whatever `dst` is named (`as_ext`):
+/// the encoders, `+faststart` and an explicit `-f <muxer>` ([`muxer_for`]) all come from
+/// `ext`, so `dst` may have no extension at all. `None`: from `dst`'s own extension, with no
+/// `-f`, as [`edit_args`].
+#[allow(clippy::too_many_arguments)]
+pub fn edit_args_as(
+    files: &[&Input],
+    dst: &Path,
+    as_ext: Option<&str>,
+    spec: &EditSpec,
+    kind: MediaKind,
+    plan: &ExportPlan,
+    encode: Encode,
+) -> Result<EditArgs> {
     if spec.spans.is_empty()
         || spec
             .spans
@@ -1631,10 +1669,13 @@ pub fn edit_args(
     {
         bail!("the edit has nothing to render");
     }
-    let ext = dst
-        .extension()
-        .map(|e| e.to_string_lossy().to_ascii_lowercase())
-        .unwrap_or_default();
+    let ext = match as_ext {
+        Some(ext) => ext.to_ascii_lowercase(),
+        None => dst
+            .extension()
+            .map(|e| e.to_string_lossy().to_ascii_lowercase())
+            .unwrap_or_default(),
+    };
     let video = kind == MediaKind::Video;
     if !video && spec.crop.is_some() {
         bail!("--crop applies to video only");
@@ -1857,6 +1898,10 @@ pub fn edit_args(
                 None => bail!("no audio export for .{ext} files"),
             },
         },
+    }
+    if let (Encode::Final, Some(_)) = (encode, as_ext) {
+        let muxer = muxer_for(&ext).with_context(|| format!("no muxer for .{ext} files"))?;
+        push(&mut outputs, &["-f", muxer]);
     }
     outputs.push(dst.as_os_str().to_owned());
     Ok(EditArgs {
