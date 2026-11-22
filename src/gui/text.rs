@@ -49,7 +49,9 @@
 //! So does a chain of names longer than that (`a.b.c`, `a,b,c`, `a$b$c`, `a-b-c`), and in YAML
 //! a stretch of a line without its `: # [ ] { } " ' \` (a long value): whole units of them from
 //! each end, an even number left out between, the left-out part coloured as the character kept
-//! before it — as it is, but where a grammar colours a chain's names apart.
+//! before it — as it is, but where a grammar colours a chain's names apart. A Makefile is
+//! parsed with its grammar's lookaheads for a rule and a variable rewritten to mean the same
+//! without their cost, a power of a line's length ([`parsing`], [`balanced_once`]).
 //!
 //! The file is read live; the index is of the file as opened. A file that differs from it in any
 //! way ([`TextDoc::now`]: written to, grown, truncated, another file renamed over its path) is
@@ -104,7 +106,10 @@ use std::sync::Arc;
 use std::sync::OnceLock;
 use std::task::Poll;
 use syntect::highlighting::{HighlightIterator, HighlightState, Highlighter};
-use syntect::parsing::{ParseState, ScopeStack, SyntaxReference, SyntaxSet};
+use syntect::parsing::syntax_definition::Pattern;
+use syntect::parsing::{
+    ParseState, Regex, ScopeStack, SyntaxReference, SyntaxSet, SyntaxSetBuilder,
+};
 
 /// A mark in the line index every this many lines…
 const BLOCK_LINES: u64 = 256;
@@ -2016,6 +2021,107 @@ fn syntaxes() -> &'static SyntaxSet {
     SET.get_or_init(SyntaxSet::load_defaults_nonewlines)
 }
 
+/// The syntaxes `syntax` is parsed with, and its own among them: a Makefile with
+/// [`makefile_syntaxes`], when they could be built; anything else with the bundled ones.
+fn parsing(syntax: &'static SyntaxReference) -> (&'static SyntaxSet, &'static SyntaxReference) {
+    if syntax.name == "Makefile" {
+        if let Some(set) = makefile_syntaxes() {
+            if let Some(own) = set.find_syntax_by_name(&syntax.name) {
+                return (set, own);
+            }
+        }
+    }
+    (syntaxes(), syntax)
+}
+
+/// The bundled Makefile grammar's lookaheads for a rule (in `main`) and for a variable (in
+/// `variable-definitions`), by the length and FNV-1a hash of their source: only these are
+/// rewritten ([`balanced_once`]), and only both together.
+const MAKEFILE_LOOKAHEADS: [(usize, u64); 2] = [
+    (3728, 0x5bc9_6045_23ad_8dd6),
+    (13089, 0xdd3d_1fae_4ec9_06ec),
+];
+
+/// FNV-1a, 64 bits: the same on every build (std's hasher may change between them).
+fn fnv1a(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf2_9ce4_8422_2325_u64, |h, &b| {
+        (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
+    })
+}
+
+/// The bundled syntaxes with Makefile's lookaheads rewritten ([`balanced_once`]); `None` when
+/// they are not the ones the rewrite is for, and the grammar is parsed as bundled. Built once, by
+/// the highlighting worker that first parses a Makefile: every grammar is read and built again
+/// (75 ms; 13.4 MB more heap at its peak while it is built). From then on both sets stay for the
+/// process's life, the bundled one for every other syntax: this one holds 4.5 MB more heap once
+/// a Makefile is parsed with it (the bundled set, with a Rust and a Makefile line parsed, 9 MB).
+fn makefile_syntaxes() -> Option<&'static SyntaxSet> {
+    #[cfg(test)]
+    MAKEFILE_SYNTAXES_ASKED.with(|n| n.set(n.get() + 1));
+    static SET: OnceLock<Option<SyntaxSet>> = OnceLock::new();
+    SET.get_or_init(|| with_makefile_rewritten(SyntaxSet::load_defaults_nonewlines()))
+        .as_ref()
+}
+
+#[cfg(test)]
+thread_local! {
+    /// How often this thread asked for [`makefile_syntaxes`] (tests: never by a frame).
+    pub(crate) static MAKEFILE_SYNTAXES_ASKED: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// `set` with the Makefile grammar's [`MAKEFILE_LOOKAHEADS`] rewritten, every grammar in its place
+/// (a grammar's contexts name others' by place); `None` unless each of them is found.
+fn with_makefile_rewritten(set: SyntaxSet) -> Option<SyntaxSet> {
+    let bundled = set.into_builder();
+    let mut rewritten = SyntaxSetBuilder::new();
+    // Which of the lookaheads were found.
+    let mut found = [false; MAKEFILE_LOOKAHEADS.len()];
+    for syntax in bundled.syntaxes() {
+        let mut syntax = syntax.clone();
+        if syntax.name == "Makefile" {
+            for context in syntax.contexts.values_mut() {
+                for pattern in &mut context.patterns {
+                    if let Pattern::Match(matched) = pattern {
+                        let source = matched.regex.regex_str();
+                        let known = (source.len(), fnv1a(source.as_bytes()));
+                        if let Some(i) = MAKEFILE_LOOKAHEADS.iter().position(|&k| k == known) {
+                            matched.regex = Regex::new(balanced_once(source));
+                            found[i] = true;
+                        }
+                    }
+                }
+            }
+        }
+        rewritten.add(syntax);
+    }
+    found.iter().all(|&f| f).then(|| rewritten.build())
+}
+
+/// A Makefile lookahead with no two runs of characters side by side. It walks balanced
+/// parentheses written out four levels deep, `[^()]* (?:\( … \))? [^()]*` at each: with the group
+/// skipped, the two runs are one stretch shared every way there is, and nested that costs a
+/// power of a line's length (an 86-character line 33 ms; 100 `x`s past the backtrack limit). Each
+/// run after a group moves into it: `(?:\( … \) [^()]*)?`. What matches is the same — with the
+/// group, the same pieces in the same order; without it, one `[^()]*` matches what two did — and
+/// so is the order its ends are tried in (with the group first, then the stretch before it, each
+/// longest first), so the lookahead holds at the same places and takes its captures from the
+/// same match; a stretch is read once. The source is `(?x)`, a piece a line, so the move is a
+/// line's: a line that closes a group (`\))?`) followed by one that is a run (`[^()]*`).
+fn balanced_once(source: &str) -> String {
+    let lines: Vec<&str> = source.split('\n').collect();
+    let mut out: Vec<String> = lines.iter().map(|line| line.to_string()).collect();
+    for i in 1..lines.len() {
+        if lines[i - 1].trim_start().starts_with("\\))?")
+            && lines[i].trim_start().starts_with("[^()]*")
+        {
+            out[i - 1] = out[i - 1].replacen("\\))?", "\\)", 1);
+            out[i] = out[i].replacen("[^()]*", "[^()]*)?", 1);
+        }
+    }
+    out.join("\n")
+}
+
 /// Loads the bundled syntaxes and builds the skin's theme (tens of milliseconds, once): the
 /// opener calls it on its worker, so the window does not wait for it.
 pub fn warm() {
@@ -2451,9 +2557,7 @@ impl Shortened {
         // Where the middle's `i`th character starts in the line (the tail's start past its end).
         let at = |i: usize| middle.get(i).map_or(chars[tail].0, |c| c.0);
         // The run's FNV-1a hash: the same on every build (std's hasher may change between them).
-        let hash = line[run].bytes().fold(0xcbf2_9ce4_8422_2325_u64, |h, b| {
-            (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
-        });
+        let hash = fnv1a(line[run].as_bytes());
         let cut = RUN_MIDDLE + (hash % RUN_STRETCH as u64) as usize;
         // The middle's stretches of one character, in order, while they fit: where each starts,
         // how long it is and how much of it is kept.
@@ -2534,7 +2638,11 @@ pub(crate) type ParseHook = Arc<dyn Fn(&str) + Send + Sync>;
 /// Highlighting state at each mark, computed in order from the top of the file — the worker's.
 struct Highlight {
     highlighter: Highlighter<'static>,
-    /// The state at mark `i`'s line, for every `i < states.len()`.
+    /// The syntax the file's name or first line picked.
+    syntax: &'static SyntaxReference,
+    /// The syntaxes it is parsed with ([`parsing`]), taken on the worker at its first page.
+    set: Option<&'static SyntaxSet>,
+    /// The state at mark `i`'s line, for every `i < states.len()` (none before the first page).
     states: Vec<State>,
     /// Lines from here on are plain (the first line cut for display, see the module doc).
     stop: u64,
@@ -2557,13 +2665,11 @@ const BATCH: usize = 64;
 impl Highlight {
     fn new(syntax: &'static SyntaxReference, plain: Color32, stop: u64) -> Option<Self> {
         let highlighter = Highlighter::new(chrome::syntax_theme());
-        let start = (
-            ParseState::new(syntax),
-            HighlightState::new(&highlighter, ScopeStack::new()),
-        );
         Some(Self {
             highlighter,
-            states: vec![start],
+            syntax,
+            set: None,
+            states: Vec::new(),
             stop,
             plain,
             parsed: Arc::default(),
@@ -2583,7 +2689,8 @@ impl Highlight {
             hook(parsed);
         }
         self.parsed.fetch_add(1, Ordering::Relaxed);
-        let Ok(mut ops) = state.0.parse_line(parsed, syntaxes()) else {
+        let set = self.set.unwrap_or_else(syntaxes);
+        let Ok(mut ops) = state.0.parse_line(parsed, set) else {
             return vec![(self.plain, line.to_string())];
         };
         if let Some(short) = &short {
@@ -2643,6 +2750,14 @@ impl Highlight {
         let end = (top + lines.len() as u64).min(self.stop);
         let mut runs = Vec::new();
         if top < end {
+            if self.states.is_empty() {
+                // The first page: the syntaxes it is parsed with (a grammar rewritten for it is
+                // built here, on the worker, never on a frame).
+                let (set, syntax) = parsing(self.syntax);
+                self.set = Some(set);
+                let start = HighlightState::new(&self.highlighter, ScopeStack::new());
+                self.states.push((ParseState::new(syntax), start));
+            }
             // The states up to the mark before the page, a whole block at a time.
             let k = doc.mark_before(top);
             while self.states.len() <= k {

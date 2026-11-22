@@ -635,7 +635,7 @@ fn the_next_free_name_of_a_longest_name_still_fits() {
     let long = format!("{}.bin", "n".repeat(251));
     let taken = tmp.path().join(&long);
     std::fs::write(&taken, b"mine").unwrap();
-    let next = next_free(&taken);
+    let next = next_free(&taken).unwrap();
     let name = next.file_name().unwrap().to_string_lossy().into_owned();
     assert!(name.len() <= 255, "{} bytes: {name}", name.len());
     assert!(name.ends_with("-1.bin"), "{name}");
@@ -650,7 +650,7 @@ fn the_next_free_name_of_a_longest_name_still_fits() {
     assert_eq!(wide.len(), 255);
     let taken = tmp.path().join(&wide);
     std::fs::write(&taken, b"mine").unwrap();
-    let next = next_free(&taken);
+    let next = next_free(&taken).unwrap();
     let name = next.file_name().unwrap().to_str().unwrap().to_string();
     assert_eq!(name, format!("{}-1", "한".repeat(84)));
     std::fs::write(&next, b"").unwrap();
@@ -1547,6 +1547,11 @@ impl RemoteFs for Counting {
     fn remove(&mut self, p: &str) -> Result<()> {
         self.fs.remove(p)
     }
+    /// A hex Save's file-by-handle requests (07 §4), on the connection under the count: none of
+    /// them is a whole read.
+    fn patcher(&mut self) -> Option<&mut dyn crate::remote::patch::PatchFs> {
+        self.fs.patcher()
+    }
     /// The connection becomes the stream's transport (06 §2); a failure gives it back.
     fn into_ranged(
         self: Box<Self>,
@@ -1886,7 +1891,7 @@ fn w8a_the_dialog_streams_on_enter_and_on_a_preset_answer() {
 
 /// `--hex` (06 §7.5) opens a stream; with `SOPEN_AUTOSAVE` its Save runs without a window. The
 /// open's connection is the stream's, so the Save is the `Origin`'s first use: it connects
-/// then, once, and fetches the whole file for the interim Save (06 §7.1) — the one whole read.
+/// then, once, and saves by 07 §4.2 — copied on the server, patched, renamed: no whole read.
 #[test]
 fn w8a_the_hex_flag_streams_and_its_save_is_the_origins_first_use() {
     let route = Route::new();
@@ -1917,8 +1922,8 @@ fn w8a_the_hex_flag_streams_and_its_save_is_the_origins_first_use() {
     assert_eq!(route.dials(), 1, "the Origin connected at its first Save");
     assert_eq!(
         route.reads(),
-        2,
-        "the interim Save's whole fetch, and the overwrite's re-read of the target (01 §5)"
+        0,
+        "no whole read: the file was copied on its host"
     );
 }
 
@@ -2292,16 +2297,73 @@ fn autosave_without_an_answer_is_an_error_not_a_window() {
     assert_eq!(route.reads(), 0);
 }
 
+/// The next free name of a name already in a counted series counts on in that series:
+/// `model.edited-1.bin` taken (beside `model.edited.bin`) gives `model.edited-2.bin`, never
+/// `model.edited-1-1.bin`. A number that is part of a name (nothing at the name without it)
+/// stays: `report-2024.pdf` taken gives `report-2024-1.pdf`. Save As's first path, its refusal
+/// of a name taken meanwhile and Save to… all name by this rule.
+#[test]
+fn the_next_free_name_counts_on_in_its_series() {
+    let tmp = tempfile::tempdir().unwrap();
+    let at = |name: &str| tmp.path().join(name);
+    for name in ["model.edited.bin", "model.edited-1.bin"] {
+        std::fs::write(at(name), b"").unwrap();
+    }
+    assert_eq!(
+        next_free(&at("model.edited-1.bin")).unwrap(),
+        at("model.edited-2.bin")
+    );
+    assert_eq!(
+        next_free(&at("model.edited.bin")).unwrap(),
+        at("model.edited-2.bin")
+    );
+    std::fs::write(at("model.edited-3.bin"), b"").unwrap();
+    assert_eq!(
+        next_free(&at("model.edited-3.bin")).unwrap(),
+        at("model.edited-2.bin")
+    );
+    // A number of the name's own.
+    std::fs::write(at("report-2024.pdf"), b"").unwrap();
+    assert_eq!(
+        next_free(&at("report-2024.pdf")).unwrap(),
+        at("report-2024-1.pdf")
+    );
+    // Save As's refusal of a name taken meanwhile (the field held `-1`).
+    let (path, _) = suggest(at("model.edited.bin"));
+    assert_eq!(path, at("model.edited-2.bin"));
+    match save_new(&at("model.edited-1.bin"), |_| Ok(0)) {
+        Err(SaveError::Exists { next }) => assert_eq!(next, at("model.edited-2.bin")),
+        Err(e) => panic!("{e}"),
+        Ok(_) => panic!("saved over a taken name"),
+    }
+    // Every name up to the limit taken: an error, never a name nobody looked at.
+    let full = |name: &str| std::fs::write(at(name), b"").unwrap();
+    full("a.bin");
+    full("a-1.bin");
+    full("a-2.bin");
+    let e = next_free_within(&at("a.bin"), 2).unwrap_err();
+    assert_eq!(
+        format!("{e:#}"),
+        format!(
+            "every name from a-1.bin to a-2.bin is taken in {}",
+            tilde(tmp.path())
+        )
+    );
+    assert_eq!(next_free_within(&at("a.bin"), 3).unwrap(), at("a-3.bin"));
+    // From inside the series too (the input's own name is one it looks at, and it is taken).
+    assert!(next_free_within(&at("a-2.bin"), 2).is_err());
+}
+
 #[test]
 fn names_paths_and_kinds() {
     let tmp = tempfile::tempdir().unwrap();
     let a = tmp.path().join("a.tar.gz");
     std::fs::write(&a, b"").unwrap();
-    assert_eq!(next_free(&a), tmp.path().join("a.tar-1.gz"));
+    assert_eq!(next_free(&a).unwrap(), tmp.path().join("a.tar-1.gz"));
     std::fs::write(tmp.path().join("a.tar-1.gz"), b"").unwrap();
-    assert_eq!(next_free(&a), tmp.path().join("a.tar-2.gz"));
+    assert_eq!(next_free(&a).unwrap(), tmp.path().join("a.tar-2.gz"));
     assert_eq!(
-        next_free(&tmp.path().join("README")),
+        next_free(&tmp.path().join("README")).unwrap(),
         tmp.path().join("README-1")
     );
     // The default path: itself when free; else the next free name, said.

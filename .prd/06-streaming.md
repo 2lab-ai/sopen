@@ -69,11 +69,13 @@ The first two paragraphs are this document. The third is 07.
     opens `path` again on the same connection. A cancelled preview uses them to keep the window's
     preview session (§13).
   - The viewer's `Origin` then holds a **placeholder** connection that connects on first use, which
-    is 02 §4.4's rule for a previewed window. Save, Save copy, Export and a reconnect are what use it.
+    is 02 §4.4's rule for a previewed window. Save, Save copy, Save As, Export and a reconnect are
+    what use it — and, in the hex window, the recovery listing on open when an earlier session left
+    a journal of the file (07 §3: reconciling a cut-off Save and Restore's checks read the remote
+    fresh). With no journal, opening never connects it.
   - **Whether the server can replace a file is asked at the first Save, not at open.** The
     placeholder answers `can_replace` without connecting: until its first use the window takes the
-    answer as yes, and the first Save connects and asks before it fetches or writes anything
-    (§7.1).
+    answer as yes, and the first Save connects and asks before it writes anything (07 §4.2).
   - So viewing costs one SFTP session (§6).
 - **Every read carries its own offset.** A read of `len` bytes at `off` goes out with that offset
   (`start_seek(Start(off))` on a `File` clone), never through a shared cursor. Each read is clipped
@@ -401,8 +403,10 @@ window on that host shares that one budget.
 
 - **A remote viewer that only views holds one channel**: its `Ranged`, which carries every read
   (§2). Prefetch never opens another.
-- **Its `Origin` connects on first use** (02 §4.4's placeholder): Save, Save copy, Export, or a
-  reconnect. From then on the viewer holds two channels. A Save never opens a third (07 §11).
+- **Its `Origin` connects on first use** (02 §4.4's placeholder): Save, Save copy, Save As, Export,
+  or a reconnect — and in the hex window the recovery of an earlier session's journal on open
+  (07 §3), only when there is one. From then on the viewer holds two channels. A Save never opens
+  a third (07 §11).
   - The two stay apart because a long `copy-data` request holds its channel; a `stat` behind one
     waited 3.1 s (*edit* §2.4). The viewer's reads, on its `Ranged`, are not held up by it.
 - **The media window holds one Source.** All of ffmpeg's HTTP connections read through its single
@@ -410,9 +414,9 @@ window on that host shares that one budget.
 
 | Holder | Channels while it lives |
 |---|---|
-| a standalone viewer (hex, image, media) | 1; 2 from its first Save, Save copy or Export |
+| a standalone viewer (hex, image, media) | 1; 2 from its first Save, Save copy, Save As or Export (hex: or from an open that recovers a journal) |
 | the browser's listing | 1 |
-| a browser viewer | 1; 2 from its first Save, Save copy or Export |
+| a browser viewer | 1; 2 from its first Save, Save copy, Save As or Export (hex: or from an open that recovers a journal) |
 | the browser's preview session (02 §4.4, one per window) | 1 |
 | the directory tree (browser 05) | 1 |
 | a file operation (browser 04) | 1 each |
@@ -431,7 +435,9 @@ nothing else is affected:
 1. **At open**, when the open's own connection is made. Nothing is open yet. The browser's status
    row shows the line. A route that was not opening a viewer stays as it was; for the binary
    dialog, that means ready for a retry or "Save to…".
-2. **At the `Origin`'s first use**: a Save, a Save copy or an Export, possibly with unsaved edits.
+2. **At the `Origin`'s first use**: a Save, a Save copy, a Save As or an Export, possibly with
+   unsaved edits (or the hex window's recovery listing on open, which then says it could not check
+   the kept edits and offers nothing to apply).
    The action fails with the line, and the edits stay in the window and in the journal (07 §4.2).
    Nothing on the remote was touched, because no request was sent. The next Save tries to connect
    again.

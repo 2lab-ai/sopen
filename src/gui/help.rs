@@ -141,6 +141,7 @@ fn describe(key: FKey) -> String {
         (3, "Exit") => format!("Close the window (as {cmd}+W)"),
         (5, "Save") => format!("Save (as {cmd}+S)"),
         (6, "Goto") => format!("Go to an offset (as {cmd}+G)"),
+        (7, "SaveAs") => format!("Save As: a new local file with your edits (as Alt+{cmd}+S)"),
         (8, "Asc/hx") => "Type in the ASCII or the hex column (as Tab)".to_string(),
         (2, "Unwrap") => "One row per line (as W)".to_string(),
         (2, "Wrap") => "Wrap the lines at the window's width (as W)".to_string(),
@@ -413,7 +414,16 @@ mod tests {
         let keys: Vec<&str> = page.lines.iter().map(|l| l.keys.as_str()).collect();
         assert_eq!(
             keys,
-            ["F1", "F3, Esc", "F4", "F5", "F6", "F8", &aliases().keys]
+            [
+                "F1",
+                "F3, Esc",
+                "F4",
+                "F5",
+                "F6",
+                "F7",
+                "F8",
+                &aliases().keys
+            ]
         );
         let cmd = keys::command_name();
         assert_eq!(
@@ -421,6 +431,10 @@ mod tests {
             format!("Save (as {cmd}+S)")
         );
         assert_eq!(line(&page, "F3, Esc").unwrap().what, "Back to the list");
+        assert_eq!(
+            line(&page, "F7").unwrap().what,
+            format!("Save As: a new local file with your edits (as Alt+{cmd}+S)")
+        );
     }
 
     /// A window of its own lists its row: Help, Exit (as Cmd/Ctrl+W) and its own keys.

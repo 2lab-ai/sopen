@@ -202,7 +202,10 @@ fn the_f_key_tables() {
     assert_eq!(pairs(VIEWER_KEYS), [(1, "Help"), (3, "Exit"), (4, "Edit")]);
     assert_eq!(VIEWER_KEYS, row(Context::Viewer, Mode::Preview).as_slice());
     assert_eq!(pairs(&[HELP_KEY, EXIT_KEY]), [(1, "Help"), (3, "Exit")]);
-    assert_eq!(pairs(HEX_KEYS), [(5, "Save"), (6, "Goto"), (8, "Asc/hx")]);
+    assert_eq!(
+        pairs(HEX_KEYS),
+        [(5, "Save"), (6, "Goto"), (7, "SaveAs"), (8, "Asc/hx")]
+    );
     assert_eq!(
         pairs(&merged(VIEWER_KEYS, HEX_KEYS)),
         [
@@ -211,6 +214,7 @@ fn the_f_key_tables() {
             (4, "Edit"),
             (5, "Save"),
             (6, "Goto"),
+            (7, "SaveAs"),
             (8, "Asc/hx")
         ]
     );
@@ -290,9 +294,9 @@ fn a_click_on_a_slot_presses_its_key() {
     let digit = drv.find_text("8").expect("the digit 8");
     drv.click(&mut win, digit.center());
     assert_eq!(win.presses[8], 1, "{:?}", win.presses);
-    // Slot 7 is empty here: its label block is there, and a click on it is nothing.
-    let (_, seven) = key_slot(0.0, 800.0, 7);
-    drv.click(&mut win, Pos2::new(seven.center().x, 300.0 - CELL.y / 2.0));
+    // Slot 9 is empty here: its label block is there, and a click on it is nothing.
+    let (_, nine) = key_slot(0.0, 800.0, 9);
+    drv.click(&mut win, Pos2::new(nine.center().x, 300.0 - CELL.y / 2.0));
     drv.idle(&mut win, 2);
     let mut want = [0; 11];
     want[5] = 1;
