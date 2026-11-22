@@ -1538,8 +1538,10 @@ fn settling_waits_for_every_reader_to_close() {
                 let mut buf = [0u8; 16];
                 let _ = reader.read_at(0, &mut buf, &AtomicBool::new(false));
                 std::thread::sleep(Duration::from_millis(300));
+                // The time is taken before the close: a settle that waits for it returns after.
+                let c = Instant::now();
                 drop(reader);
-                *at.lock().unwrap() = Some(Instant::now());
+                *at.lock().unwrap() = Some(c);
             });
             (thread, closed)
         };
