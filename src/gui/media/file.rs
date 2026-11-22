@@ -1988,14 +1988,44 @@ pub(super) fn shared_folder(owner: u32, mode: u32, uid: u32) -> bool {
     owner != uid || (mode & 0o022 != 0 && mode & 0o1000 == 0)
 }
 
-/// [`shared_folder`] of the folder at `path` (followed: the folder itself).
-fn shared_folder_at(path: &Path) -> Result<bool> {
+/// Whether no other user can rename an entry anywhere on a folder's path, so that what is
+/// checked in it is what a later open by path finds (OpenSSH's `safe_path`, root down). `chain`
+/// is each folder's owner and mode, root first and the folder last. Every folder above it must
+/// be this user's or root's and not writable by group or others — except a sticky one (as /tmp
+/// is), where only an entry's owner may rename it: the next folder must then be this user's or
+/// root's. The folder itself keeps [`shared_folder`]'s rule.
+pub(super) fn path_is_private(chain: &[(u32, u32)], uid: u32) -> bool {
+    let Some(&(owner, mode)) = chain.last() else {
+        return false;
+    };
+    if shared_folder(owner, mode, uid) {
+        return false;
+    }
+    let trusted = |owner: u32| owner == uid || owner == 0;
+    chain.windows(2).all(|pair| {
+        let ((owner, mode), (next, _)) = (pair[0], pair[1]);
+        trusted(owner) && (mode & 0o022 == 0 || (mode & 0o1000 != 0 && trusted(next)))
+    })
+}
+
+/// [`path_is_private`] for the folder at `path`, walked by its canonical path; a folder on it
+/// that cannot be looked at (or is not a folder) makes it not private.
+pub(super) fn path_is_private_at(path: &Path) -> bool {
     use std::os::unix::fs::MetadataExt;
-    let meta = std::fs::metadata(path)
-        .with_context(|| format!("cannot look at the folder {}", path.display()))?;
+    let Ok(canonical) = std::fs::canonicalize(path) else {
+        return false;
+    };
+    let mut chain = Vec::new();
+    for dir in canonical.ancestors() {
+        match std::fs::symlink_metadata(dir) {
+            Ok(meta) if meta.is_dir() => chain.push((meta.uid(), meta.mode())),
+            _ => return false,
+        }
+    }
+    chain.reverse();
     // SAFETY: `geteuid` cannot fail and touches no memory.
     let uid = unsafe { libc::geteuid() };
-    Ok(shared_folder(meta.uid(), meta.mode(), uid))
+    path_is_private(&chain, uid)
 }
 
 /// `from` (a finished render) copied into `part` through its handle, stopping at a cancel.
@@ -2028,9 +2058,9 @@ fn copy_in(
 /// staging `part`, by its path and with the output's container said explicitly (`part` has no
 /// extension: `ffmpeg::edit_args_as`). Passes of a long edit, and ffmpeg's graph files, go to a
 /// private folder of sopen's exports; the output itself is written once, into `part` — except
-/// in a folder another user could rename entries of ([`shared_folder`]): ffmpeg opens its
-/// output by path, so there it renders into that private folder (after its room is checked)
-/// and the output is copied in through `part`'s handle.
+/// where another user could rename an entry on the destination's path ([`path_is_private`]):
+/// ffmpeg opens its output by path, so there it renders into that private folder (after its
+/// room is checked) and the output is copied in through `part`'s handle.
 pub struct MediaProducer {
     pub media: Arc<Media>,
     pub spec: EditSpec,
@@ -2064,7 +2094,7 @@ impl crate::gui::save_as::Producer for MediaProducer {
             .parent()
             .and_then(Path::parent)
             .context("the staging file has no folder")?;
-        let shared = shared_folder_at(folder)?;
+        let shared = !path_is_private_at(folder);
         if shared {
             crate::cache::private_dir(&self.work_root)?;
             if let Some(free) = remote::LocalFs::free_space_at(&self.work_root) {

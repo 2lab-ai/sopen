@@ -2648,6 +2648,153 @@ fn a_folder_is_shared_unless_it_is_this_users_and_closed_or_sticky() {
     }
 }
 
+/// 07 §7: a path no other user can rename an entry on, root down: every folder above this
+/// user's or root's and closed to group and others, or sticky with the next folder this user's
+/// or root's; the folder itself this user's, closed or sticky.
+#[test]
+fn a_path_is_private_only_if_no_other_user_can_rename_on_it() {
+    let (me, other, dir) = (501, 502, 0o040000);
+    let d = |owner: u32, mode: u32| (owner, dir | mode);
+    for (chain, private, what) in [
+        (
+            vec![d(0, 0o755), d(0, 0o755), d(me, 0o700)],
+            true,
+            "home-like",
+        ),
+        (
+            vec![d(0, 0o755), d(me, 0o755), d(me, 0o700)],
+            true,
+            "own parent",
+        ),
+        (
+            vec![d(0, 0o755), d(0, 0o1777), d(me, 0o700)],
+            true,
+            "under /tmp",
+        ),
+        (
+            vec![d(0, 0o1777), d(0, 0o755), d(me, 0o700)],
+            true,
+            "sticky, root's next",
+        ),
+        (
+            vec![d(0, 0o755), d(me, 0o1777), d(me, 0o700)],
+            true,
+            "own sticky",
+        ),
+        (
+            vec![d(0, 0o755), d(me, 0o777), d(me, 0o700)],
+            false,
+            "parent 0777",
+        ),
+        (
+            vec![d(0, 0o755), d(me, 0o775), d(me, 0o700)],
+            false,
+            "parent 0775",
+        ),
+        (
+            vec![d(0, 0o777), d(me, 0o755), d(me, 0o700)],
+            false,
+            "root folder 0777",
+        ),
+        (
+            vec![d(0, 0o755), d(0, 0o1777), d(other, 0o755), d(me, 0o700)],
+            false,
+            "sticky, other's next",
+        ),
+        (
+            vec![d(0, 0o755), d(other, 0o755), d(me, 0o700)],
+            false,
+            "other's parent",
+        ),
+        (
+            vec![d(0, 0o755), d(other, 0o1777), d(me, 0o700)],
+            false,
+            "other's sticky parent",
+        ),
+        (vec![d(0, 0o755), d(me, 0o775)], false, "the folder 0775"),
+        (vec![d(0, 0o755), d(0, 0o1777)], false, "the folder root's"),
+        (vec![d(0, 0o755), d(me, 0o1777)], true, "the folder sticky"),
+        (vec![], false, "nothing"),
+    ] {
+        assert_eq!(file::path_is_private(&chain, me), private, "{what}");
+    }
+}
+
+/// 07 §7: the folders tests and people use most take the fast route: the home folder and the
+/// temporary folder (on a usual system: owned, under root's folders).
+#[test]
+fn the_home_and_temporary_folders_are_private_paths() {
+    let tmp = tempfile::tempdir().unwrap();
+    assert!(
+        file::path_is_private_at(tmp.path()),
+        "{}",
+        tmp.path().display()
+    );
+    if let Some(home) = std::env::var_os("HOME") {
+        assert!(file::path_is_private_at(Path::new(&home)), "{home:?}");
+    }
+    assert!(!file::path_is_private_at(&tmp.path().join("missing")));
+}
+
+/// Save As of a 2 s clip's first half into `folder` as `v.edited.mp4`, `look` run between the
+/// staging file's check and the render's open. Returns the outcome, and the path the render
+/// wrote with `part`'s (the same path: straight into `part`).
+fn save_half_as(
+    tools: &Tools,
+    tmp: &Path,
+    folder: &Path,
+    look: file::BeforeRender,
+) -> (save_as::Outcome, (PathBuf, PathBuf)) {
+    let src = tmp.join("v.mp4");
+    super::fixtures::clip(tools, &src, (64, 48));
+    let mut media = Media::probe(&src).unwrap();
+    media.plan();
+    let half = media.ticks() / 2;
+    let mut timeline = Timeline::new(media.rate(), media.ticks());
+    timeline.set_clips(
+        vec![Clip {
+            start: 0,
+            end: half,
+        }],
+        View::default(),
+    );
+    let spec = edit_spec(&media, &timeline, (0, timeline.len()), None);
+    let seen: Arc<Mutex<Option<(PathBuf, PathBuf)>>> = Arc::default();
+    let looked = seen.clone();
+    let mut producer = file::MediaProducer {
+        media: Arc::new(media),
+        spec,
+        work_root: tmp.join("exports"),
+        hold: None,
+        held: Arc::default(),
+        before_render: Some(Box::new(move |out: &Path, part: &Path| {
+            *looked.lock().unwrap() = Some((out.to_path_buf(), part.to_path_buf()));
+            look(out, part);
+        })),
+    };
+    let dest = folder.join("v.edited.mp4");
+    let decision = super::super::binary::Decision::new();
+    let ctl = save_as::Ctl::new(&decision, &|_| {});
+    let outcome = save_as::write(&dest, save_as::Size::About(1 << 20), &mut producer, &ctl);
+    let seen = seen.lock().unwrap().clone().expect("looked");
+    (outcome, seen)
+}
+
+/// The half-length render with picture and sound at `path`.
+fn assert_half(tools: &Tools, path: &Path, what: &str) {
+    let probe = ffmpeg::probe(tools, path).unwrap();
+    let duration = probe.duration.unwrap();
+    assert!((duration - 1.0).abs() < 0.05, "{what}: {duration}");
+    assert!(probe.video.is_some() && probe.has_audio, "{what}");
+}
+
+/// A folder made with `mode` (whatever the umask).
+fn folder_with(path: &Path, mode: u32) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::create_dir(path).unwrap();
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+}
+
 /// 07 §7: Save As into a folder whose entries another user could rename (not this user's, or
 /// writable by group or others without the sticky bit) renders into sopen's own folder and
 /// copies through the staging file's handle: a staging folder swapped, between the check and
@@ -2655,40 +2802,19 @@ fn a_folder_is_shared_unless_it_is_this_users_and_closed_or_sticky() {
 /// the render. Into a folder of this user's only, the render goes straight into `part`.
 #[test]
 fn save_as_into_a_shared_folder_never_writes_through_a_swapped_part() {
-    use std::os::unix::fs::PermissionsExt;
     let Some(tools) = tools_or_skip() else { return };
     for shared in [false, true] {
         let tmp = tempfile::tempdir().unwrap();
-        let src = tmp.path().join("v.mp4");
-        super::fixtures::clip(&tools, &src, (64, 48));
-        let mut media = Media::probe(&src).unwrap();
-        media.plan();
-        let half = media.ticks() / 2;
-        let mut timeline = Timeline::new(media.rate(), media.ticks());
-        timeline.set_clips(
-            vec![Clip {
-                start: 0,
-                end: half,
-            }],
-            View::default(),
-        );
-        let spec = edit_spec(&media, &timeline, (0, timeline.len()), None);
         let folder = tmp.path().join("out");
-        std::fs::create_dir(&folder).unwrap();
-        let mode = if shared { 0o777 } else { 0o700 };
-        std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(mode)).unwrap();
+        folder_with(&folder, if shared { 0o777 } else { 0o700 });
         let victim = tmp.path().join("victim");
         std::fs::write(&victim, b"not sopen's").unwrap();
-        let seen: Arc<Mutex<Option<(PathBuf, PathBuf)>>> = Arc::default();
-        let (looked, target) = (seen.clone(), victim.clone());
-        let mut producer = file::MediaProducer {
-            media: Arc::new(media),
-            spec,
-            work_root: tmp.path().join("exports"),
-            hold: None,
-            held: Arc::default(),
-            before_render: Some(Box::new(move |out: &Path, part: &Path| {
-                *looked.lock().unwrap() = Some((out.to_path_buf(), part.to_path_buf()));
+        let target = victim.clone();
+        let (outcome, (out, part)) = save_half_as(
+            &tools,
+            tmp.path(),
+            &folder,
+            Box::new(move |_, part| {
                 if shared {
                     // Another user's swap: the staging folder renamed aside, and under its name
                     // a folder of theirs whose `part` links to a file of yours.
@@ -2699,30 +2825,99 @@ fn save_as_into_a_shared_folder_never_writes_through_a_swapped_part() {
                     std::fs::create_dir(staging).unwrap();
                     std::os::unix::fs::symlink(&target, staging.join("part")).unwrap();
                 }
-            })),
-        };
-        let dest = folder.join("v.edited.mp4");
-        let decision = super::super::binary::Decision::new();
-        let ctl = save_as::Ctl::new(&decision, &|_| {});
-        let outcome = save_as::write(&dest, save_as::Size::About(1 << 20), &mut producer, &ctl);
+            }),
+        );
         assert_eq!(
             std::fs::read(&victim).unwrap(),
             b"not sopen's",
             "shared {shared}: never written through the link"
         );
-        let (out, part) = seen.lock().unwrap().clone().expect("looked");
         if shared {
             assert!(!out.starts_with(&folder), "{}", out.display());
         } else {
             assert_eq!(out, part, "straight into part");
         }
+        let dest = folder.join("v.edited.mp4");
         match outcome {
             save_as::Outcome::Saved { path, .. } => assert_eq!(path, dest),
             other => panic!("shared {shared}: {}", other.line()),
         }
-        let probe = ffmpeg::probe(&tools, &dest).unwrap();
-        let duration = probe.duration.unwrap();
-        assert!((duration - 1.0).abs() < 0.05, "shared {shared}: {duration}");
-        assert!(probe.video.is_some() && probe.has_audio);
+        assert_half(&tools, &dest, &format!("shared {shared}"));
     }
+}
+
+/// 07 §7: a folder of this user's only, under a parent another user can rename entries of
+/// (writable by others, not sticky), is no safer than that parent: the render goes to sopen's
+/// own folder and is copied in. The destination folder renamed aside between the check and the
+/// render, and made again under its name with the staging folder's name and a `part` linking
+/// to a file of yours, is never written through; the file saved is the render, in the folder
+/// renamed aside (the save reaches it by its handle).
+#[test]
+fn save_as_under_a_parent_others_can_rename_in_never_writes_through_a_swap() {
+    let Some(tools) = tools_or_skip() else { return };
+    let tmp = tempfile::tempdir().unwrap();
+    let parent = tmp.path().join("shared");
+    folder_with(&parent, 0o777);
+    let folder = parent.join("mine");
+    folder_with(&folder, 0o700);
+    let aside = parent.join("mine-aside");
+    let victim = tmp.path().join("victim");
+    std::fs::write(&victim, b"not sopen's").unwrap();
+    let (target, moved) = (victim.clone(), aside.clone());
+    let (outcome, (out, part)) = save_half_as(
+        &tools,
+        tmp.path(),
+        &folder,
+        Box::new(move |_, part| {
+            let staging = part.parent().unwrap();
+            let folder = staging.parent().unwrap();
+            std::fs::rename(folder, &moved).unwrap();
+            std::fs::create_dir(folder).unwrap();
+            std::fs::create_dir(staging).unwrap();
+            std::os::unix::fs::symlink(&target, staging.join("part")).unwrap();
+        }),
+    );
+    assert_eq!(
+        std::fs::read(&victim).unwrap(),
+        b"not sopen's",
+        "never written through the link"
+    );
+    assert!(
+        !out.starts_with(&parent),
+        "the copy route: {}",
+        out.display()
+    );
+    assert_ne!(out, part);
+    match outcome {
+        save_as::Outcome::Saved { .. } => {}
+        other => panic!("{}", other.line()),
+    }
+    assert_half(
+        &tools,
+        &aside.join("v.edited.mp4"),
+        "in the folder renamed aside",
+    );
+}
+
+/// 07 §7: the fast route stays for folders on a path no other user can rename entries of: a
+/// folder of this user's under a sticky parent (as /tmp is) renders straight into `part`.
+#[test]
+fn save_as_under_a_sticky_parent_renders_straight_into_part() {
+    let Some(tools) = tools_or_skip() else { return };
+    let tmp = tempfile::tempdir().unwrap();
+    let parent = tmp.path().join("sticky");
+    folder_with(&parent, 0o1777);
+    let folder = parent.join("mine");
+    folder_with(&folder, 0o700);
+    let (outcome, (out, part)) = save_half_as(&tools, tmp.path(), &folder, Box::new(|_, _| {}));
+    assert_eq!(out, part, "straight into part");
+    match outcome {
+        save_as::Outcome::Saved { .. } => {}
+        other => panic!("{}", other.line()),
+    }
+    assert_half(
+        &tools,
+        &folder.join("v.edited.mp4"),
+        "under a sticky parent",
+    );
 }
