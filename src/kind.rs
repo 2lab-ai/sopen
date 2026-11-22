@@ -247,13 +247,47 @@ pub fn detect_sniffed(
 /// no video stream (per ffprobe) is audio; a `.ts` ffprobe cannot read as media is not media.
 /// Without ffprobe, video stays video.
 pub fn refine_local(local: &std::path::Path, name: &str, kind: Kind) -> Kind {
+    refine_input(&crate::ffmpeg::Input::path(local), name, kind)
+}
+
+/// [`refine_local`] for any input ffprobe reads: a local path, or a remote file's `play` URL on
+/// its window's byte server (06 §7.4: the `.ts` refine probes the URL, nothing is fetched first).
+/// The probe has the URL's deadline ([`crate::ffmpeg::probe_input`]).
+pub fn refine_input(input: &crate::ffmpeg::Input, name: &str, kind: Kind) -> Kind {
+    refine_input_until(input, name, kind, &|| false)
+}
+
+/// [`refine_input`] that its caller can stop: said before ffprobe is started, none is; said
+/// while it runs, it is killed and reaped at its next look ([`crate::ffmpeg::probe_timed`]).
+/// Either way nothing is known of the file — whoever stopped it does not use the answer.
+pub fn refine_input_until(
+    input: &crate::ffmpeg::Input,
+    name: &str,
+    kind: Kind,
+    stop: &dyn Fn() -> bool,
+) -> Kind {
     if kind != Kind::Video {
         return kind;
     }
-    let probe = match crate::ffmpeg::resolve().and_then(|t| crate::ffmpeg::probe(&t, local)) {
+    refine_input_with(crate::ffmpeg::resolve(), input, name, kind, stop)
+}
+
+/// [`refine_input_until`] of a video with the tools given (tests: a stand-in `ffprobe`).
+pub(crate) fn refine_input_with(
+    tools: anyhow::Result<crate::ffmpeg::Tools>,
+    input: &crate::ffmpeg::Input,
+    name: &str,
+    kind: Kind,
+    stop: &dyn Fn() -> bool,
+) -> Kind {
+    let shown = input.show();
+    let (limit, now) = (crate::ffmpeg::PROBE_LIMIT, std::time::Instant::now);
+    let probed =
+        tools.and_then(|t| crate::ffmpeg::probe_timed(&t, input, &shown, limit, &now, stop));
+    let probe = match probed {
         Ok(probe) => Some((probe.video.is_some(), probe.has_audio)),
         Err(e) => {
-            crate::debug!("not probed: {e:#}");
+            crate::debug!("not probed: {}", input.said(&format!("{e:#}")));
             None
         }
     };

@@ -1140,7 +1140,8 @@ fn v16_every_run_on_a_stream_has_an_owner_that_frees_its_seats() {
         reads.store(0, SeqCst);
         std::thread::scope(|scope| {
             let run = scope.spawn(|| {
-                ffmpeg::probe_timed(&held, &media.input, "v.mp4", ffmpeg::PROBE_LIMIT, &now)
+                let limit = ffmpeg::PROBE_LIMIT;
+                ffmpeg::probe_timed(&held, &media.input, "v.mp4", limit, &now, &|| false)
             });
             seated();
             assert!(!run.is_finished(), "nothing stops it before its time");
@@ -1337,7 +1338,12 @@ fn v19_the_waveform_yields_to_playback() {
             return;
         };
         let fastseek = stepping(&mut engine, || {
-            mp3::info_tag(&mut source.reader(ReaderKind::Media { bytes_per_s: 0 }))
+            let never = AtomicBool::new(false);
+            mp3::info_tag(
+                &mut source.reader(ReaderKind::Media { bytes_per_s: 0 }),
+                &never,
+            )
+            .unwrap()
         });
         assert!(fastseek);
         let served = Served::start(source.clone(), "m.mp3", "m.mp3", fastseek).unwrap();
@@ -2717,4 +2723,153 @@ fn a_failed_upload_s_close_is_logged_by_the_return_and_its_temp_goes() {
     assert!(temp_closed, "no close of the temp in the log: {said}");
     let left: Vec<_> = std::fs::read_dir(&out).unwrap().flatten().collect();
     assert!(left.is_empty(), "left in the folder: {left:?}");
+}
+
+/// The stand-in `ffprobe` of the probe-stop tests: it waits at `hold`, never answering, until
+/// it is killed. Whether one was started is counted as it is ([`ffmpeg::spawns::naming`]).
+fn waiting_probe(dir: &Path, hold: &super::fixtures::Hold) -> Tools {
+    let path = super::fixtures::stand_in(dir, "ffprobe", &hold.stalls());
+    Tools {
+        ffmpeg: path.clone(),
+        ffprobe: path,
+    }
+}
+
+/// How many `ffprobe` runs were started on a file named `name`.
+fn probes_started(name: &str) -> u64 {
+    ffmpeg::spawns::naming(name).probe
+}
+
+/// W8b review: a stop that comes during a remote medium's setup — after the open's first look
+/// at it, before ffprobe is started (here an mp3's tag read, which waits on the stream: the
+/// barrier) — ends the open there: once the read is let through it returns cancelled within a
+/// bounded number of the engine's steps, no ffprobe was started, and none naming the file (a
+/// name made for this run) is left.
+#[test]
+fn a_stop_during_a_mediums_setup_starts_no_probe() {
+    bounded(120, |t| {
+        let dir = t.tmp();
+        let name = format!("stop-{}.mp3", &crate::remote::random_hex()[..12]);
+        let file = dir.path().join(&name);
+        std::fs::write(&file, vec![0x55u8; 256 * 1024]).unwrap();
+        let Some((source, mut engine)) = stepped(&file) else {
+            return;
+        };
+        let hold = super::fixtures::Hold::new(dir.path(), "hold");
+        let tools = waiting_probe(dir.path(), &hold);
+        let stop = AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            let run =
+                scope.spawn(|| Media::stream_with(&tools, source.clone(), &name, &name, &stop));
+            until("the setup's read waits on the stream", || {
+                source.core().pf.waiting_readers() >= 1
+            });
+            assert!(!run.is_finished(), "held in its setup");
+            stop.store(true, SeqCst);
+            let mut steps = 0;
+            while !run.is_finished() {
+                assert!(steps < 1000, "the open still runs after {steps} steps");
+                engine.step(Some(Duration::from_millis(5)));
+                std::thread::sleep(Duration::from_millis(5));
+                steps += 1;
+            }
+            let Err(err) = run.join().unwrap() else {
+                panic!("stopped, not opened");
+            };
+            assert!(err.is::<crate::remote::Cancelled>(), "{err:#}");
+        });
+        assert_eq!(probes_started(&name), 0, "no ffprobe was started");
+        assert_eq!(super::fixtures::naming(Path::new(&name)), 0, "none left");
+    });
+}
+
+/// W8b review: the same stop, with the stream never let through — the mp3's tag read waits on
+/// a stream that gives nothing (a stalled remote) — ends the read itself: the open returns
+/// cancelled within a bounded number of polls with the engine not stepped, no ffprobe was
+/// started, and none naming the file is left.
+#[test]
+fn a_stop_during_a_mediums_setup_ends_its_tag_read_on_a_stalled_stream() {
+    bounded(120, |t| {
+        let dir = t.tmp();
+        let name = format!("stop-{}.mp3", &crate::remote::random_hex()[..12]);
+        let file = dir.path().join(&name);
+        std::fs::write(&file, vec![0x55u8; 256 * 1024]).unwrap();
+        let Some((source, mut engine)) = stepped(&file) else {
+            return;
+        };
+        let hold = super::fixtures::Hold::new(dir.path(), "hold");
+        let tools = waiting_probe(dir.path(), &hold);
+        let stop = AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            let run =
+                scope.spawn(|| Media::stream_with(&tools, source.clone(), &name, &name, &stop));
+            until("the setup's read waits on the stream", || {
+                source.core().pf.waiting_readers() >= 1
+            });
+            assert!(!run.is_finished(), "held in its setup");
+            stop.store(true, SeqCst);
+            // The engine is not stepped: the stream gives nothing.
+            let mut polls = 0;
+            while !run.is_finished() && polls < 1000 {
+                std::thread::sleep(Duration::from_millis(5));
+                polls += 1;
+            }
+            let ended = run.is_finished();
+            // Whatever it did, it is let end (a read that misses the stop waits on the stream).
+            while !run.is_finished() {
+                engine.step(Some(Duration::from_millis(5)));
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            let ran = run.join().unwrap();
+            assert!(
+                ended,
+                "the open still waits on its tag read after {polls} polls"
+            );
+            let Err(err) = ran else {
+                panic!("stopped, not opened");
+            };
+            assert!(err.is::<crate::remote::Cancelled>(), "{err:#}");
+        });
+        assert_eq!(probes_started(&name), 0, "no ffprobe was started");
+        assert_eq!(super::fixtures::naming(Path::new(&name)), 0, "none left");
+    });
+}
+
+/// W8b review: a `.ts` refine over its URL entered with the stop already said starts no
+/// ffprobe: it returns within a bounded number of polls, and none naming the file is left.
+#[test]
+fn a_refine_entered_stopped_starts_no_probe() {
+    bounded(120, |t| {
+        let dir = t.tmp();
+        let name = format!("stop-{}.ts", &crate::remote::random_hex()[..12]);
+        let file = dir.path().join(&name);
+        let mut body = vec![0u8; 188 * 64];
+        for packet in body.chunks_mut(188) {
+            packet[0] = 0x47;
+        }
+        std::fs::write(&file, &body).unwrap();
+        // Never stepped: an ffprobe that read the URL would wait on it.
+        let Some((source, _engine)) = stepped(&file) else {
+            return;
+        };
+        let hold = super::fixtures::Hold::new(dir.path(), "hold");
+        let tools = waiting_probe(dir.path(), &hold);
+        let never = AtomicBool::new(false);
+        let input = served_input(source.clone(), &name, &name, &never).unwrap();
+        std::thread::scope(|scope| {
+            let run = scope.spawn(|| {
+                let video = crate::kind::Kind::Video;
+                crate::kind::refine_input_with(Ok(tools.clone()), &input, &name, video, &|| true)
+            });
+            let mut polls = 0;
+            while !run.is_finished() {
+                assert!(polls < 1000, "the refine still runs after {polls} polls");
+                std::thread::sleep(Duration::from_millis(5));
+                polls += 1;
+            }
+            run.join().unwrap();
+        });
+        assert_eq!(probes_started(&name), 0, "no ffprobe was started");
+        assert_eq!(super::fixtures::naming(Path::new(&name)), 0, "none left");
+    });
 }

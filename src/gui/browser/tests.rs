@@ -705,14 +705,19 @@ fn f4_opens_the_entry_in_the_editor() {
     assert!(fx.b.viewer.is_some(), "F4 leaves the viewer open");
 }
 
-/// A folder "on host box": a file that is still fetched (an image) goes into the cache as the
-/// standalone routes fetch it, and the copy is released with the viewer — opening it again
-/// uses the same copy, not a session copy of its own.
+/// A local image is copied into the cache as the standalone route copies it (Save needs the
+/// bytes as opened), and the copy is released with the viewer — opening it again uses the same
+/// copy, not a session copy of its own. (A remote one is read through a stream and reaches the
+/// cache not at all: `w8b_a_remote_image_opens_through_a_stream_with_nothing_in_the_cache`.)
 #[test]
 fn a_viewer_holds_its_cached_copy_only_while_it_shows_it() {
-    let mut fx = fixture_with(Some("box"), local_connect(), None);
+    let mut fx = fixture();
     fx.open("photo.png");
-    let copy = crate::cache::cache_path(&fx.cache, "box", &format!("{}/photo.png", fx.root));
+    let copy = crate::cache::cache_path(
+        &fx.cache,
+        crate::cache::LOCAL_HOST,
+        &format!("{}/photo.png", fx.root),
+    );
     assert_eq!(
         std::fs::read(&copy).unwrap(),
         std::fs::read(format!("{}/photo.png", fx.root)).unwrap()
@@ -850,10 +855,10 @@ fn lines_of(size: usize) -> Vec<u8> {
 /// The browser's Enter on remote text at the limit, over real SFTP, by the fixture's count.
 /// Exactly 16 MiB streams: the first screen's block is the first read, nothing is read whole,
 /// and when the index pass is done the file has crossed once — the budget is the file's size,
-/// so a byte read twice would have passed it. One byte more is fetched whole, once, into the
-/// cache, and no stream is opened for it (its budget is nothing).
+/// so a byte read twice would have passed it. One byte more streams too (W5b): its first block
+/// first, nothing read whole (its whole budget is nothing), nothing in the cache.
 #[test]
-fn w8a_enter_on_remote_text_at_16_mib_streams_and_one_byte_more_is_fetched() {
+fn w8a_enter_on_remote_text_at_16_mib_streams_and_one_byte_more_too() {
     let cap = crate::gui::text::HIGHLIGHT_MAX;
     let block = crate::stream::BLOCK;
     let body = lines_of(cap as usize);
@@ -883,16 +888,291 @@ fn w8a_enter_on_remote_text_at_16_mib_streams_and_one_byte_more_is_fetched() {
     assert_eq!(files_in(&fx.cache), Vec::<PathBuf>::new());
 
     let body = lines_of(cap as usize + 1);
-    let Some((mut fx, meter, abs)) = metered(0, cap + 1, "over-limit.log", Ok(&body)) else {
+    let Some((mut fx, meter, abs)) = metered(cap + 1, 0, "over-limit.log", Ok(&body)) else {
         return;
     };
     fx.open("over-limit.log");
     assert!(fx.drv.find_text("Text Viewer").is_some());
-    assert_eq!(meter.totals(), (0, 0, cap + 1, 1), "fetched whole, once");
-    assert!(meter.opened.lock().unwrap().is_empty(), "no stream");
+    assert_eq!(meter.reads_of(&abs).first(), Some(&(0, block as u32)));
+    let (_, _, whole_bytes, whole_reads) = meter.totals();
+    assert_eq!((whole_bytes, whole_reads), (0, 0), "nothing read whole");
+    assert!(!meter.tripped(), "no byte was asked for twice");
+    assert_eq!(meter.connects.load(Ordering::SeqCst), 1);
+    assert_eq!(files_in(&fx.cache), Vec::<PathBuf>::new());
+}
+
+/// W8b, the browser's Enter on a remote image (dual mode: from the start): its window reads it
+/// through a stream on the open's connection and shows the picture — nothing reaches the cache —
+/// and Esc is back in the list.
+#[test]
+fn w8b_a_remote_image_opens_through_a_stream_with_nothing_in_the_cache() {
+    let mut fx = fixture_with(Some("box"), local_connect(), None);
+    fx.key(Key::F9);
+    fx.open("photo.png");
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    while fx.drv.pictures().is_empty() {
+        assert!(std::time::Instant::now() < deadline, "no picture");
+        fx.drv.idle(&mut fx.b, 1);
+    }
+    assert_eq!(files_in(&fx.cache), Vec::<PathBuf>::new());
+    fx.key(Key::Escape);
+    assert!(fx.b.viewer.is_none());
+    assert_eq!(fx.current(), "photo.png");
+}
+
+/// A PNG that says it is `w`×`h` and holds one empty row (its header is real, its pixel data is
+/// not): a decode it asks for would be `w × h × 3` bytes.
+fn png_claiming(w: u32, h: u32) -> Vec<u8> {
+    fn chunk(out: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) {
+        out.extend_from_slice(&(data.len() as u32).to_be_bytes());
+        let mut crc_input = kind.to_vec();
+        crc_input.extend_from_slice(data);
+        out.extend_from_slice(&crc_input);
+        let mut crc = 0xFFFF_FFFFu32;
+        for &b in &crc_input {
+            crc ^= u32::from(b);
+            for _ in 0..8 {
+                crc = if crc & 1 != 0 {
+                    0xEDB8_8320 ^ (crc >> 1)
+                } else {
+                    crc >> 1
+                };
+            }
+        }
+        out.extend_from_slice(&(!crc).to_be_bytes());
+    }
+    let mut out = b"\x89PNG\r\n\x1a\n".to_vec();
+    let mut ihdr = Vec::new();
+    ihdr.extend_from_slice(&w.to_be_bytes());
+    ihdr.extend_from_slice(&h.to_be_bytes());
+    ihdr.extend_from_slice(&[8, 2, 0, 0, 0]);
+    chunk(&mut out, b"IHDR", &ihdr);
+    chunk(
+        &mut out,
+        b"IDAT",
+        &[0x78, 0x9c, 0x03, 0x00, 0x00, 0x00, 0x00, 0x01],
+    );
+    chunk(&mut out, b"IEND", &[]);
+    out
+}
+
+/// 06 §7.3, §12 V15 (W8b): a remote image that does not decode opens in the hex window, on
+/// the stream it was read through — not the error row of before — and nothing is in the cache.
+#[test]
+fn w8b_a_remote_image_that_does_not_decode_opens_in_the_hex_window() {
+    let mut fx = fixture_with(Some("box"), local_connect(), None);
+    let mut broken = b"\x89PNG\r\n\x1a\n".to_vec();
+    broken.extend((0..200u32).map(|i| (i * 7) as u8));
+    std::fs::write(format!("{}/broken.png", fx.root), &broken).unwrap();
+    let root = fx.root.clone();
+    fx.b.list(Some(0), root, None, None);
+    fx.settle();
+    fx.key(Key::F9);
+    fx.select("broken.png");
+    fx.key(Key::Enter);
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    while fx
+        .drv
+        .find_text("89 50 4E 47 0D 0A 1A 0A  00 07 0E 15 1C 23 2A 31")
+        .is_none()
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no hex rows ({:?})",
+            fx.b.status.text
+        );
+        fx.drv.idle(&mut fx.b, 1);
+    }
+    assert!(fx.b.viewer.is_some(), "{:?}", fx.b.status.text);
+    assert!(
+        shows(&fx, "cannot decode the image"),
+        "why, in the hex window's rows"
+    );
+    assert_eq!(files_in(&fx.cache), Vec::<PathBuf>::new());
+    fx.settle();
+    fx.key(Key::Escape);
+    assert!(fx.b.viewer.is_none());
+    assert_eq!(fx.current(), "broken.png");
+}
+
+/// Some text on screen holds `part` (a line of the window's rows, wrapped or not).
+fn shows(fx: &Fx, part: &str) -> bool {
+    fx.drv
+        .texts()
+        .iter()
+        .any(|(_, _, text)| text.contains(part))
+}
+
+/// 06 §7.3, §12 V15 (W8b): the memory line of a remote image too large to decode without asking
+/// offers Hex view, and H switches to the hex window — the same stream, the file's first rows.
+#[test]
+fn w8b_hex_view_on_the_memory_line_switches_to_the_hex_window() {
+    let mut fx = fixture_with(Some("box"), local_connect(), None);
+    std::fs::write(
+        format!("{}/huge.png", fx.root),
+        png_claiming(100_000, 100_000),
+    )
+    .unwrap();
+    let root = fx.root.clone();
+    fx.b.list(Some(0), root, None, None);
+    fx.settle();
+    fx.key(Key::F9);
+    fx.select("huge.png");
+    fx.key(Key::Enter);
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    while !shows(&fx, "Hex view (H)") {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no memory line with Hex view ({:?})",
+            fx.b.status.text
+        );
+        fx.drv.idle(&mut fx.b, 1);
+    }
+    fx.key(Key::H);
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    while fx
+        .drv
+        .find_text("89 50 4E 47 0D 0A 1A 0A  00 00 00 0D 49 48 44 52")
+        .is_none()
+    {
+        assert!(std::time::Instant::now() < deadline, "no hex rows");
+        fx.drv.idle(&mut fx.b, 1);
+    }
+    assert!(fx.b.viewer.is_some());
+    assert_eq!(files_in(&fx.cache), Vec::<PathBuf>::new());
+}
+
+/// W8b: the private preview copies' root an older sopen made (`<cache>/.preview`) is swept when
+/// a browser window opens — the folders of windows that are gone, then the root itself, empty.
+#[test]
+fn w8b_a_legacy_preview_root_is_swept_when_the_browser_opens() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = std::fs::canonicalize(tmp.path()).unwrap().join("root");
+    tree(&root);
+    let cache = tmp.path().join("cache");
+    let legacy = cache.join(".preview");
+    // A window of an older sopen that is gone: its folder, a copy in it, and its lock, free.
+    std::fs::create_dir_all(legacy.join("0a1b2c3d4e5f")).unwrap();
+    std::fs::write(legacy.join("0a1b2c3d4e5f/0.png"), b"left behind").unwrap();
+    std::fs::write(legacy.join("0a1b2c3d4e5f.lock"), b"").unwrap();
+    let b = Browser::new(Start {
+        fs: Box::new(LocalFs::new()),
+        connect: local_connect(),
+        label: None,
+        destination: None,
+        abs: root.to_str().unwrap().to_string(),
+        cache: cache.clone(),
+        state_dir: tmp.path().join("state"),
+        launch: Arc::new(|_: &str, _: bool| Ok(String::new())),
+    });
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while legacy.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the legacy root stayed"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    drop(b);
+}
+
+/// 06 §7.3 for a local image (the memory line "applies to local images too"): one too large to
+/// decode without asking shows the memory line with Hex view in the browser, and H shows the
+/// file's bytes, read in place.
+#[test]
+fn w8b_a_local_image_too_large_to_decode_asks_and_offers_hex_view() {
+    let mut fx = fixture();
+    std::fs::write(
+        format!("{}/huge.png", fx.root),
+        png_claiming(100_000, 100_000),
+    )
+    .unwrap();
+    let root = fx.root.clone();
+    fx.b.list(Some(0), root, None, None);
+    fx.settle();
+    fx.key(Key::F9);
+    fx.select("huge.png");
+    fx.key(Key::Enter);
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    while !shows(&fx, "Hex view (H)") {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no memory line with Hex view ({:?})",
+            fx.b.status.text
+        );
+        fx.drv.idle(&mut fx.b, 1);
+    }
+    assert!(shows(&fx, "decoding this image needs"), "the memory line");
+    fx.key(Key::H);
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    while fx
+        .drv
+        .find_text("89 50 4E 47 0D 0A 1A 0A  00 00 00 0D 49 48 44 52")
+        .is_none()
+    {
+        assert!(std::time::Instant::now() < deadline, "no hex rows");
+        fx.drv.idle(&mut fx.b, 1);
+    }
+    assert!(fx.b.viewer.is_some());
+}
+
+/// W8b at the browser's Enter over real SFTP, by the fixture's count: a 2 GiB remote image
+/// (sparse, a PNG header at its front) shows its window and its memory line having read its
+/// header's block — nothing read whole (the budget is nothing), one session. H then shows its
+/// hex rows on the same stream: no stream opened again, no connection, no byte read again.
+#[test]
+fn w8b_enter_on_a_2_gib_remote_image_reads_its_header_only() {
+    let block = crate::stream::BLOCK;
+    let Some((mut fx, meter, abs)) = metered(block, 0, "huge.png", Ok(&png_claiming(9, 9))) else {
+        return;
+    };
+    std::fs::File::options()
+        .write(true)
+        .open(&abs)
+        .unwrap()
+        .set_len(2 << 30)
+        .unwrap();
+    fx.select("huge.png");
+    fx.key(Key::Enter);
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    while !shows(&fx, "Continue (Enter)") {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no memory line ({:?})",
+            fx.b.status.text
+        );
+        fx.drv.idle(&mut fx.b, 1);
+    }
+    let (_, _, whole_bytes, whole_reads) = meter.totals();
+    assert_eq!((whole_bytes, whole_reads), (0, 0), "nothing read whole");
+    assert_eq!(meter.reads_of(&abs), vec![(0, block as u32)], "its header");
     assert!(!meter.tripped());
-    let copy = crate::cache::cache_path(&fx.cache, "box", &abs);
-    assert_eq!(std::fs::metadata(copy).unwrap().len(), cap + 1);
+    assert_eq!(meter.connects.load(Ordering::SeqCst), 1, "one session");
+    assert_eq!(files_in(&fx.cache), Vec::<PathBuf>::new());
+    // Hex view: the same stream, what it holds already.
+    fx.key(Key::H);
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    while fx
+        .drv
+        .find_text("89 50 4E 47 0D 0A 1A 0A  00 00 00 0D 49 48 44 52")
+        .is_none()
+    {
+        assert!(std::time::Instant::now() < deadline, "no hex rows");
+        fx.drv.idle(&mut fx.b, 1);
+    }
+    assert_eq!(
+        meter.opened.lock().unwrap().len(),
+        1,
+        "no stream opened again"
+    );
+    assert_eq!(
+        meter.reads_of(&abs),
+        vec![(0, block as u32)],
+        "nothing read again"
+    );
+    assert_eq!(meter.connects.load(Ordering::SeqCst), 1, "no connection");
+    assert!(!meter.tripped());
+    assert_eq!(files_in(&fx.cache), Vec::<PathBuf>::new());
 }
 
 /// 06 §12 V10 at open, in the browser: the open's own connection is refused as sshd refuses a
@@ -1073,27 +1353,24 @@ fn gated(gate: &Gate, at: &'static str) -> Connect {
     })
 }
 
-/// Esc during a fetch stops it: back to the list, nothing of it kept in the cache; the progress
-/// was on the status row meanwhile.
+/// Esc during a copy stops it: back to the list, nothing of it kept in the cache. (A local
+/// image is what is still copied whole — into the cache, as the standalone route copies it;
+/// every remote file opens as a stream, 06 §13.)
 #[test]
 fn esc_stops_a_fetch() {
     let gate = Gate::default();
-    let mut fx = fixture_with(Some("box"), gated(&gate, "read_to"), None);
-    // An image: a file that is still fetched whole (a binary would open as a stream, 06 §7.1).
+    let mut fx = fixture_with(None, gated(&gate, "read_to"), None);
     std::fs::write(format!("{}/big.png", fx.root), vec![1u8; 2 << 20]).unwrap();
     let root = fx.root.clone();
     fx.b.list(Some(0), root, None, None);
     fx.settle();
     fx.select("big.png");
     fx.key(Key::Enter);
-    // The worker is held inside the fetch, a chunk in.
+    // The worker is held inside the copy, a chunk in.
     gate.reached();
     fx.drv.idle(&mut fx.b, 1);
     let shown = fx.b.status_line().text;
-    assert!(
-        shown.starts_with("fetching big.png ") && shown.ends_with("Esc cancels"),
-        "{shown}"
-    );
+    assert_eq!(shown, "opening big.png…");
     fx.key(Key::Escape);
     gate.release();
     fx.drv.until(&mut fx.b, 10, |b| b.opening.is_none());
@@ -1103,7 +1380,11 @@ fn esc_stops_a_fetch() {
         "{}",
         fx.b.status.text
     );
-    let copy = crate::cache::cache_path(&fx.cache, "box", &format!("{}/big.png", fx.root));
+    let copy = crate::cache::cache_path(
+        &fx.cache,
+        crate::cache::LOCAL_HOST,
+        &format!("{}/big.png", fx.root),
+    );
     let left: Vec<String> = std::fs::read_dir(copy.parent().unwrap())
         .unwrap()
         .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
@@ -1400,9 +1681,11 @@ fn a_video_opens_in_the_media_window_and_esc_leaves_it() {
     assert!(!fx.drv.closed());
 }
 
-/// Enter on a remote file ffprobe cannot read (an empty `.mp4`): the status row says so about
-/// the file as its owner knows it, `host:/abs` — never about the private copy in sopen's cache
-/// that ffprobe was run on. From the list (dual mode: no preview) and from the preview's card.
+/// Enter on a remote `.mp4` that does not open: the status row says why about the file as its
+/// owner knows it, `host:/abs`, named once — never the URL of the byte server ffprobe read it
+/// through, nor a cache copy. An empty one is said to be empty (the byte server has no range of
+/// it to serve, and its words are not shown); one that is not a video is what ffprobe said of
+/// it. From the list (dual mode: no preview) and from the preview's card, which says the same.
 /// Needs ffmpeg (skips without it, unless `SOPEN_REQUIRE_FFMPEG` is set).
 #[test]
 fn a_remote_file_that_fails_to_open_is_named_as_host_abs_never_as_its_cache_copy() {
@@ -1413,41 +1696,66 @@ fn a_remote_file_that_fails_to_open_is_named_as_host_abs_never_as_its_cache_copy
         eprintln!("skipping: {e}");
         return;
     }
+    let files: [(&str, Vec<u8>); 2] =
+        [("k_zero.mp4", Vec::new()), ("k_junk.mp4", vec![0x55; 4096])];
     for mode in [view::Mode::Dual, view::Mode::Preview] {
-        let mut fx = fixture_with(Some("box"), local_connect(), None);
-        fx.b.mode = mode;
-        std::fs::write(format!("{}/k_zero.mp4", fx.root), b"").unwrap();
-        let root = fx.root.clone();
-        fx.b.list(None, root, None, None);
-        fx.settle();
-        fx.select("k_zero.mp4");
-        // The bar rests (past the 150 ms commit): in preview mode the card is on screen.
-        fx.drv.idle(&mut fx.b, 12);
-        fx.settle();
-        fx.key(Key::Enter);
-        fx.settle();
-        assert!(fx.b.viewer.is_none(), "{mode:?}: nothing to show");
-        let said = fx.b.status.text.clone();
-        assert!(fx.b.status.error, "{mode:?}: {said}");
-        let known = format!("box:{}/k_zero.mp4", fx.root);
-        assert!(
-            said.starts_with(&format!("ffprobe cannot read {known}")),
-            "{mode:?}: the file as its owner knows it: {said}"
-        );
-        let cache = std::fs::canonicalize(&fx.cache).unwrap_or_else(|_| fx.cache.clone());
-        for copy in [fx.cache.as_path(), cache.as_path()] {
-            assert!(
-                !said.contains(copy.to_str().unwrap()),
-                "{mode:?}: the cache copy is named: {said}"
-            );
+        for (name, bytes) in &files {
+            let mut fx = fixture_with(Some("box"), local_connect(), None);
+            fx.b.mode = mode;
+            std::fs::write(format!("{}/{name}", fx.root), bytes).unwrap();
+            let root = fx.root.clone();
+            fx.b.list(None, root, None, None);
+            fx.settle();
+            fx.select(name);
+            // The bar rests (past the 150 ms commit): in preview mode the card is on screen.
+            fx.drv.idle(&mut fx.b, 12);
+            fx.settle();
+            if mode == view::Mode::Preview {
+                let card = match bytes.is_empty() {
+                    true => "the file is empty (0 bytes)",
+                    false => "ffprobe cannot read",
+                };
+                assert!(shows(&fx, card), "{name}: the card");
+                for never in ["Server returned", "127.0.0.1", "http://"] {
+                    assert!(!shows(&fx, never), "{name}: the card shows {never}");
+                }
+            }
+            fx.key(Key::Enter);
+            fx.settle();
+            assert!(fx.b.viewer.is_none(), "{mode:?} {name}: nothing to show");
+            let said = fx.b.status.text.clone();
+            assert!(fx.b.status.error, "{mode:?}: {said}");
+            let known = format!("box:{}/{name}", fx.root);
+            if bytes.is_empty() {
+                assert_eq!(
+                    said,
+                    format!("{known} is empty (0 bytes): nothing to play"),
+                    "{mode:?}: the file as its owner knows it"
+                );
+            } else {
+                assert!(
+                    said.starts_with(&format!("ffprobe cannot read {known}: ")),
+                    "{mode:?}: the file as its owner knows it: {said}"
+                );
+            }
+            for never in ["Server returned", "127.0.0.1", "http://"] {
+                assert!(!said.contains(never), "{mode:?}: {said}");
+            }
+            let cache = std::fs::canonicalize(&fx.cache).unwrap_or_else(|_| fx.cache.clone());
+            for copy in [fx.cache.as_path(), cache.as_path()] {
+                assert!(
+                    !said.contains(copy.to_str().unwrap()),
+                    "{mode:?}: the cache copy is named: {said}"
+                );
+            }
+            assert_eq!(said.matches(*name).count(), 1, "{mode:?}: {said}");
         }
-        assert_eq!(said.matches("k_zero.mp4").count(), 1, "{mode:?}: {said}");
     }
 }
 
 /// The preview of a remote file ffprobe reads but that holds no picture and no sound (a
 /// Matroska file with only subtitles): the card says so about the file as its owner knows it,
-/// `host:/abs` — never about the private preview copy ffprobe was run on.
+/// `host:/abs` — never about the URL ffprobe read it through.
 /// Needs ffmpeg (skips without it, unless `SOPEN_REQUIRE_FFMPEG` is set).
 #[test]
 fn a_remote_preview_without_a_stream_is_named_as_host_abs_never_as_its_preview_copy() {
@@ -1482,8 +1790,8 @@ fn a_remote_preview_without_a_stream_is_named_as_host_abs_never_as_its_preview_c
     let about: Vec<&String> = said.iter().filter(|t| t.contains("no audio")).collect();
     assert_eq!(about, [&known], "the card's reason");
     assert!(
-        !said.iter().any(|t| t.contains(".preview")),
-        "the preview copy is named: {about:?}"
+        !said.iter().any(|t| t.contains("127.0.0.1")),
+        "the byte server is named: {about:?}"
     );
 }
 

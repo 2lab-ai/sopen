@@ -1070,6 +1070,45 @@ fn a_crash_leaves_the_journal_and_the_next_open_restores_it() {
     }
 }
 
+/// 07 §3 (the image and hex windows' rule, for media): a journal folder that holds nothing but
+/// its lock — or not even that: its session ended between the `mkdir` and its first
+/// generation — holds no edit. The next open removes it and shows no row. On both servers.
+#[test]
+fn a_journal_folder_holding_nothing_is_removed_and_never_offered() {
+    let Some(tools) = tools_or_skip() else { return };
+    for side in sides() {
+        for locked in [false, true] {
+            let what = format!("{side:?}, locked={locked}");
+            let tmp = tempfile::tempdir().unwrap();
+            let dir = tmp.path().join("remote");
+            std::fs::create_dir(&dir).unwrap();
+            let remote = dir.join("r.wav");
+            tones(&tools, &remote, true);
+            let cache = tmp.path().join("cache");
+            let base = crate::cache::edits_path(&cache, HOST, remote.to_str().unwrap());
+            let name = base.file_name().unwrap().to_string_lossy().into_owned();
+            let journal = base.with_file_name(format!("{name}.journal-20261122T010203Z-0123abcd"));
+            std::fs::create_dir_all(&journal).unwrap();
+            if locked {
+                std::fs::write(journal.join("lock"), b"").unwrap();
+            }
+            let ed = Ed::on(side, Read::Copy, Knobs::default(), tmp, remote);
+            assert!(ed.win.rows.is_empty(), "{what}: offered");
+            assert!(
+                ed.drv.text_starting_with("unsaved edits from ").is_none(),
+                "{what}: {}",
+                ed.texts()
+            );
+            let left: Vec<_> = std::fs::read_dir(journal.parent().unwrap())
+                .unwrap()
+                .flatten()
+                .map(|e| e.file_name())
+                .collect();
+            assert!(left.is_empty(), "{what}: left {left:?}");
+        }
+    }
+}
+
 /// 07 §3: a scripted run (`SOPEN_AUTOSAVE`) keeps no journal when its Save landed, and makes
 /// the one backup link (07 §5.3). Its result line, which names the link, goes to stdout: the
 /// live receipt reads it; the window's words are asserted in

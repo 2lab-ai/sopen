@@ -124,6 +124,88 @@ pub fn open(
     }
 }
 
+/// What the standalone route (`sopen host:/file`) opens a remote image, video or sound as (06
+/// §13 W8b), on the connection that resolved, stat'ed and sniffed it: a stream, with nothing
+/// fetched.
+pub enum Standalone {
+    /// The image window over `source`; `switch` is where it gives way to the hex window, in the
+    /// same window (Hex view, a file that does not decode: 06 §7.3).
+    Image {
+        origin: super::Origin,
+        source: Source,
+        switch: super::image::HexSwitch,
+    },
+    /// The media window over `source` (06 §7.4).
+    Media {
+        origin: super::Origin,
+        source: Source,
+    },
+    /// A `.ts` ffprobe does not read as media through its `play` URL (06 §7.4): any other file,
+    /// for the binary dialog. Its stream is closed: the dialog opens the file from the start.
+    /// `size`: the file's, as its handle said.
+    NotMedia { size: u64 },
+}
+
+/// Opens the remote `kind` (an image, a video or a sound) at `abs` on `label`'s host as a
+/// stream on `conn` ([`open`]) for its window of its own: its `Origin` a placeholder that
+/// connects through `dial` on its first use (a Save), answering yes until then (06 §2). A `.ts`
+/// is probed through its `play` URL first. `sniff`: the bytes the kind sniff read of it. Every
+/// step that can fail comes before the stream is handed on; a failure is said in 06 §6's words.
+pub fn standalone(
+    conn: Box<dyn RemoteFs + Send>,
+    label: &str,
+    abs: &str,
+    kind: crate::kind::Kind,
+    sniff: u64,
+    dial: Connect,
+) -> anyhow::Result<Standalone> {
+    let shown = format!("{label}:{abs}");
+    let repaint = super::hex::Repaint::default();
+    let opening = Opening {
+        label: shown.clone(),
+        began: Instant::now(),
+        sniff,
+    };
+    let opened = open(
+        conn,
+        abs,
+        opening,
+        Some(dial.clone()),
+        repaint.waker(),
+        None,
+    )
+    .map_err(|not| anyhow!(crate::stream::explain(&not.error)))?;
+    let origin = super::Origin::placeholder(
+        Some(Box::new(move || dial()) as super::Reconnect),
+        label.to_string(),
+        abs.to_string(),
+        opened.at,
+        super::Placeholder::YES,
+    );
+    let source = opened.source;
+    if kind == crate::kind::Kind::Image {
+        let switch = super::image::HexSwitch::new(repaint);
+        return Ok(Standalone::Image {
+            origin,
+            source,
+            switch,
+        });
+    }
+    let (_, name) = crate::remote::split_parent(abs);
+    if crate::kind::maybe_video(name) {
+        // The `.ts` refine over the URL (06 §7.4).
+        // No window yet, so nothing to stop it with.
+        let never = std::sync::atomic::AtomicBool::new(false);
+        let input = super::media::served_input(source.clone(), name, &shown, &never)?;
+        if crate::kind::refine_input(&input, name, kind) == crate::kind::Kind::Other {
+            return Ok(Standalone::NotMedia {
+                size: opened.at.size,
+            });
+        }
+    }
+    Ok(Standalone::Media { origin, source })
+}
+
 /// The transport of a stream a route opened: counts what it receives, and gives its connection
 /// back to its [`Lease`] when the stream closes it.
 struct Routed {
@@ -381,5 +463,199 @@ mod tests {
         .expect("no such file");
         let mut conn = not.conn.expect("the connection is given back");
         assert!(conn.stat(tmp.path().to_str().unwrap()).unwrap().is_dir);
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // The standalone route (`sopen host:/file`, 06 §13 W8b), by the fixture's own count
+    // ([`Meter`]: below the `Source`, with budgets that end the I/O the moment a route asks
+    // for more). The local disk poses as host `box`.
+
+    use crate::gui::testkit::{Driver, Meter};
+    use crate::gui::Window;
+    use crate::kind::Kind;
+    use eframe::egui;
+
+    /// A window around an `Embedded`'s, for the test kit.
+    struct Host<'a>(&'a mut Box<dyn Window>);
+
+    impl Window for Host<'_> {
+        fn ui(&mut self, ui: &mut egui::Ui) {
+            self.0.ui(ui)
+        }
+        fn ready(&self) -> bool {
+            self.0.ready()
+        }
+    }
+
+    /// A metered connection to "box" (the local disk) and a `dial` that meters what it opens.
+    fn metered(stream_budget: u64) -> (Arc<Meter>, Box<dyn RemoteFs + Send>, Connect) {
+        let meter = Meter::new(stream_budget, 0);
+        let conn = meter.connection(Box::new(LocalFs::new()));
+        let dial = meter.connect(|| Ok(Box::new(LocalFs::new()) as Box<dyn RemoteFs + Send>));
+        (meter, conn, dial)
+    }
+
+    /// Some text the last pass painted holds `part`.
+    fn shows(drv: &Driver, part: &str) -> bool {
+        drv.texts().iter().any(|(_, _, t)| t.contains(part))
+    }
+
+    /// A PNG header saying `w`×`h`, and one empty row of data.
+    fn png_claiming(w: u32, h: u32) -> Vec<u8> {
+        fn chunk(out: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) {
+            out.extend_from_slice(&(data.len() as u32).to_be_bytes());
+            let typed = [kind.as_slice(), data].concat();
+            let mut crc = 0xFFFF_FFFFu32;
+            for &b in &typed {
+                crc ^= u32::from(b);
+                for _ in 0..8 {
+                    crc = if crc & 1 != 0 {
+                        0xEDB8_8320 ^ (crc >> 1)
+                    } else {
+                        crc >> 1
+                    };
+                }
+            }
+            out.extend_from_slice(&typed);
+            out.extend_from_slice(&(!crc).to_be_bytes());
+        }
+        let mut out = b"\x89PNG\r\n\x1a\n".to_vec();
+        let mut ihdr = w.to_be_bytes().to_vec();
+        ihdr.extend_from_slice(&h.to_be_bytes());
+        ihdr.extend_from_slice(&[8, 2, 0, 0, 0]);
+        chunk(&mut out, b"IHDR", &ihdr);
+        chunk(
+            &mut out,
+            b"IDAT",
+            &[0x78, 0x9c, 0x03, 0x00, 0x00, 0x00, 0x00, 0x01],
+        );
+        chunk(&mut out, b"IEND", &[]);
+        out
+    }
+
+    /// The standalone route on a 2 GiB remote image (sparse, a PNG header at its front): a
+    /// stream on the open's own connection, its window at the memory line (with Hex view)
+    /// having read its header's block — nothing read whole, no second connection.
+    #[test]
+    fn the_standalone_route_streams_a_remote_image() {
+        let tmp = tempfile::tempdir().unwrap();
+        let abs = tmp.path().join("huge.png");
+        std::fs::write(&abs, png_claiming(100_000, 100_000)).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&abs)
+            .unwrap()
+            .set_len(2 << 30)
+            .unwrap();
+        let abs = abs.to_str().unwrap().to_string();
+        let (meter, conn, dial) = metered(BLOCK);
+        let opened = standalone(conn, "box", &abs, Kind::Image, 0, dial).unwrap();
+        let Standalone::Image {
+            origin,
+            source,
+            switch,
+        } = opened
+        else {
+            panic!("not the image window")
+        };
+        let cache = tmp.path().join("cache");
+        let mut embedded =
+            crate::gui::image::embed_stream(origin, source, &cache, Vec::new(), Some(switch))
+                .unwrap();
+        let mut drv = Driver::new(900.0, 600.0);
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while !shows(&drv, "Hex view (H)") {
+            assert!(Instant::now() < deadline, "no memory line");
+            drv.idle(&mut Host(&mut embedded.window), 1);
+        }
+        assert_eq!(meter.totals().2, 0, "nothing read whole");
+        assert_eq!(meter.reads_of(&abs), vec![(0, BLOCK as u32)], "its header");
+        assert!(!meter.tripped());
+        assert_eq!(
+            meter.connects.load(Ordering::SeqCst),
+            0,
+            "no second connection"
+        );
+    }
+
+    /// The standalone route on a 2 GiB remote video (sparse, its `moov` at the front): the
+    /// media window shows its first frame having read a sixteenth of the file at most —
+    /// nothing read whole, no second connection.
+    #[test]
+    fn the_standalone_route_streams_a_remote_video() {
+        let Some(tools) = crate::gui::media::fixtures::tools() else {
+            return;
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let (front, abs) = (tmp.path().join("front.mp4"), tmp.path().join("big.mp4"));
+        crate::gui::media::fixtures::clip(&tools, &front, (160, 120));
+        let args = [
+            "-i",
+            front.to_str().unwrap(),
+            "-c",
+            "copy",
+            "-movflags",
+            "+faststart",
+        ];
+        crate::gui::media::fixtures::make(&tools, &args, &abs);
+        let have = std::fs::metadata(&abs).unwrap().len();
+        let size: u64 = 2 << 30;
+        let mut free = 1u32.to_be_bytes().to_vec();
+        free.extend_from_slice(b"free");
+        free.extend_from_slice(&(size - have).to_be_bytes());
+        {
+            use std::io::Write as _;
+            let mut file = std::fs::File::options().append(true).open(&abs).unwrap();
+            file.write_all(&free).unwrap();
+            file.set_len(size).unwrap();
+        }
+        let abs = abs.to_str().unwrap().to_string();
+        let (meter, conn, dial) = metered(size / 16);
+        let opened = standalone(conn, "box", &abs, Kind::Video, 0, dial).unwrap();
+        let Standalone::Media { origin, source } = opened else {
+            panic!("not the media window")
+        };
+        let shown = origin.display();
+        let media = crate::gui::media::Media::stream(source, "big.mp4", &shown).unwrap();
+        let cache = tmp.path().join("cache");
+        let mut embedded = crate::gui::media::embed_streamed(origin, media, &cache, Vec::new());
+        let mut drv = Driver::new(800.0, 600.0);
+        drv.until(&mut Host(&mut embedded.window), 60, |w| w.ready());
+        drv.idle(&mut Host(&mut embedded.window), 2);
+        assert_eq!(drv.pictures().len(), 1, "its first frame");
+        assert_eq!(meter.totals().2, 0, "nothing read whole");
+        assert!(!meter.tripped(), "{} bytes", meter.totals().0);
+        assert_eq!(
+            meter.connects.load(Ordering::SeqCst),
+            0,
+            "no second connection"
+        );
+    }
+
+    /// The standalone route on a remote `.ts` that looks like a transport stream but that
+    /// ffprobe does not read as media: probed through its `play` URL (06 §7.4) — nothing read
+    /// whole, no byte read twice — and it is not a medium (the binary dialog opens it).
+    #[test]
+    fn the_standalone_route_refines_a_ts_over_its_url() {
+        if crate::gui::media::fixtures::tools().is_none() {
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let abs = tmp.path().join("clip.ts");
+        let mut body = vec![0u8; 188 * 64];
+        for packet in body.chunks_mut(188) {
+            packet[0] = 0x47;
+        }
+        std::fs::write(&abs, &body).unwrap();
+        let abs = abs.to_str().unwrap().to_string();
+        let (meter, conn, dial) = metered(body.len() as u64);
+        let opened = standalone(conn, "box", &abs, Kind::Video, 0, dial).unwrap();
+        let Standalone::NotMedia { size } = opened else {
+            panic!("taken for a medium")
+        };
+        assert_eq!(size, body.len() as u64);
+        assert_eq!(meter.totals().2, 0, "nothing read whole");
+        assert!(!meter.tripped(), "no byte asked twice");
+        assert_eq!(meter.connects.load(Ordering::SeqCst), 0);
     }
 }

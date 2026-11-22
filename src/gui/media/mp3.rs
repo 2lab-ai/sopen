@@ -6,8 +6,9 @@
 //! (`xing_offtbl` in libavformat/mp3dec.c), and anything it does not read as `Info` means an
 //! exact seek: a misreading costs bytes, never precision.
 
+use crate::remote::Cancelled;
 use crate::stream::Bytes;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Whether the mp3 `file` (read through a `play` reader) starts, after its ID3v2 tags, with a
 /// frame whose LAME tag says `Info`.
@@ -21,26 +22,28 @@ use std::sync::atomic::AtomicBool;
 ///   (MPEG-2 and 2.5 mono), with no adjustment for a CRC, as ffmpeg reads it — and only if the
 ///   whole frame, by its header's bitrate, rate and padding, is in the file.
 ///
-/// A read that fails or a file that ends first is `false`.
-pub fn info_tag(file: &mut dyn Bytes) -> bool {
-    let cancel = AtomicBool::new(false);
-    let mut read = |off: u64, len: usize| -> Option<Vec<u8>> {
+/// A read that fails or a file that ends first is `false`. `cancel` is the reads' (a stream's
+/// reader looks at it while it waits): once it is set, the read ends and so does this, as
+/// [`Cancelled`] — a stalled stream does not hold whoever stopped the open.
+pub fn info_tag(file: &mut dyn Bytes, cancel: &AtomicBool) -> Result<bool, Cancelled> {
+    let mut read = |off: u64, len: usize| -> Result<Option<Vec<u8>>, Cancelled> {
         let mut buf = vec![0u8; len];
-        match file.read_at(off, &mut buf, &cancel) {
-            Ok(n) if n == len => Some(buf),
-            _ => None,
+        match file.read_at(off, &mut buf, cancel) {
+            Ok(n) if n == len => Ok(Some(buf)),
+            _ if cancel.load(Ordering::SeqCst) => Err(Cancelled),
+            _ => Ok(None),
         }
     };
     let mut off = 0u64;
     let head = loop {
-        let Some(head) = read(off, 10) else {
-            return false;
+        let Some(head) = read(off, 10)? else {
+            return Ok(false);
         };
         if &head[..3] != b"ID3" {
             break head;
         }
         if !matches!(head[3], 3 | 4) || head[6..10].iter().any(|b| *b >= 0x80) {
-            return false;
+            return Ok(false);
         }
         let size = head[6..10]
             .iter()
@@ -53,10 +56,11 @@ pub fn info_tag(file: &mut dyn Bytes) -> bool {
         off += 10 + size + footer;
     };
     let Some((side, len)) = frame(&head[..4]) else {
-        return false;
+        return Ok(false);
     };
     // The tag is believed only in a whole frame: a file that ends inside it is cut short.
-    read(off + len - 1, 1).is_some() && read(off + 4 + side, 4).is_some_and(|tag| tag == b"Info")
+    Ok(read(off + len - 1, 1)?.is_some()
+        && read(off + 4 + side, 4)?.is_some_and(|tag| tag == b"Info"))
 }
 
 /// Kbit/s by bitrate index, layer III: MPEG-1, then MPEG-2 and 2.5.

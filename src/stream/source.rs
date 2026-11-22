@@ -290,6 +290,10 @@ pub(crate) struct Core {
     sink: Option<Sink>,
     /// `first` was marked and the engine has not stamped it yet; then when it did.
     first_marked: bool,
+    /// `first` is on the stats line already: one open has one, whichever viewer shows the file
+    /// first (an image window that gives way to the hex window on the same stream, 06 §7.3,
+    /// leaves the hex window's unsaid).
+    first_said: bool,
     idle_at: Option<Instant>,
     /// Reloads asked for, in order: each is run, and none replaces another. Only two plain
     /// ones, neither started, are one.
@@ -1262,6 +1266,7 @@ impl Source {
             began: opening.began,
             sink: settings.stats,
             first_marked: false,
+            first_said: false,
             idle_at: None,
             reload_queue: VecDeque::new(),
             next_reload: 0,
@@ -1422,8 +1427,10 @@ impl Source {
         let mut core = self.shared.lock();
         match mark {
             Mark::First => {
-                core.line("first", "");
-                core.first_marked = true;
+                if !std::mem::replace(&mut core.first_said, true) {
+                    core.line("first", "");
+                    core.first_marked = true;
+                }
             }
             Mark::Input(place) => {
                 core.first_marked = false;

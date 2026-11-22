@@ -281,9 +281,10 @@ pub enum Found {
 }
 
 /// Makes the preview of the media file `input` (named `name`, and `shown` in what is said of
-/// it: the file as its owner knows it — `input` may be a private preview copy, whose path is
-/// never said; `kind` by its name and first bytes): the probe, then the first frame (video) or the waveform (sound) — each a step with
-/// its own time, and all of it stopped as soon as `watch` says so.
+/// it: the file as its owner knows it — `input` may be a remote file's URL on its byte server,
+/// which is never said; `kind` by its name and first bytes): the probe, then the first frame
+/// (video) or the waveform (sound) — each a step with its own time, and all of it stopped as
+/// soon as `watch` says so.
 pub fn prepare(
     tools: &Tools,
     input: &Input,
@@ -331,6 +332,8 @@ pub fn prepare(
             // No further than the preview reads; a sound that ends before that is read whole.
             let upto = watch.sound().filter(|upto| *upto < media.duration);
             let lanes = media.lanes().max(1);
+            // A streamed file's waveform is a Bulk reader's, as the window's is (06 §7.4).
+            let input = &input.of_kind(crate::stream::http::Kind::Bulk);
             let mut cmd = wave::command(tools, input, lanes, 0.0, upto);
             #[cfg(test)]
             wave::note_start(input, 0.0, upto);

@@ -1176,8 +1176,8 @@ fn a_file_that_cannot_be_a_picture_is_refused_from_its_header() {
     }
 }
 
-/// A file that arrives whole and does not decode keeps today's error (06 §7.3: the hex
-/// fallback is W8b's).
+/// Without a way to the hex window (`switch` `None`: no host that shows one), a file that
+/// arrives whole and does not decode says so as before.
 #[test]
 fn a_file_that_does_not_decode_says_so_as_today() {
     let mut file = png(64, 64, false);
@@ -1189,6 +1189,89 @@ fn a_file_that_does_not_decode_says_so_as_today() {
     fx.until("the failure", |fx| fx.win.failure().is_some());
     assert_eq!(fx.win.failure(), Some(today));
     assert!(fx.drv.closed() && fx.win.image.is_none());
+}
+
+/// 06 §7.3 and V15 (W8b), in a window of its own ([`open_stream`]'s): a file that does not
+/// decode gives way to the hex window on the same stream — why said first in its rows, its
+/// first rows read from what the stream already holds — and the same window becomes the hex
+/// window ([`Switching`]): it does not close, and it fails nothing.
+#[test]
+fn w8b_a_file_that_does_not_decode_becomes_the_hex_window_on_its_stream() {
+    let mut file = png(64, 64, false);
+    let len = file.len();
+    file.truncate(len - 6000);
+    let today = format!("{:#}", Doc::decode(&file).err().unwrap());
+    let fx = fx(file);
+    let Fx {
+        _tmp,
+        source,
+        mut engine,
+        mut win,
+        mut drv,
+        lines,
+        ..
+    } = fx;
+    let switch = HexSwitch::new(crate::gui::hex::Repaint::default());
+    win.switch = Some(switch.clone());
+    let failed = win.failed.clone();
+    let mut host = Switching {
+        switch: Some(switch),
+        image: Some(win),
+        hex: None,
+        hooks: Hooks::default(),
+        hex_outcome: Arc::default(),
+        hex_leftover: Arc::default(),
+        failed,
+    };
+    let started = Instant::now();
+    while drv
+        .find_text("89 50 4E 47 0D 0A 1A 0A  00 00 00 0D 49 48 44 52")
+        .is_none()
+    {
+        drv.idle(&mut host, 1);
+        engine.pump();
+        if engine.transport().map_or(0, |r| r.pending()) > 0 {
+            engine.step(None);
+        } else {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(started.elapsed() < HANG, "the hex rows never came");
+    }
+    assert!(
+        host.image.is_none() && host.hex.is_some(),
+        "the hex window now"
+    );
+    assert!(
+        drv.texts().iter().any(|(_, _, t)| t.contains(&today)),
+        "why, in its rows"
+    );
+    assert!(!drv.closed(), "the window stayed");
+    assert_eq!(super::super::Window::failure(&host), None);
+    assert!(source.state().status().is_none(), "the same stream, live");
+    // One open, one `first` on the stats line (06 §11): the image's, not the hex window's too.
+    let said = lines.lock().unwrap().clone();
+    let firsts = said
+        .iter()
+        .filter(|l| l.starts_with("stream first "))
+        .count();
+    assert_eq!(firsts, 1, "{said:?}");
+}
+
+/// W8b: a stream that changed mid-read is what failed, not the file's content: with a way to
+/// the hex window the window still says it changed and gives no way.
+#[test]
+fn w8b_a_file_changed_mid_read_is_not_given_to_the_hex_window() {
+    let file = png(1200, 900, false);
+    let size = file.len() as u64;
+    let mut fx = fx(file);
+    let switch = HexSwitch::new(crate::gui::hex::Repaint::default());
+    fx.win.switch = Some(switch.clone());
+    fx.until("a part", |fx| fx.loaded() > size / 4);
+    fx.control.change(Change::Truncate(size / 2));
+    fx.until("the failure", |fx| fx.win.failure().is_some());
+    let why = fx.win.failure().unwrap();
+    assert!(why.contains("changed"), "{why}");
+    assert!(switch.take().is_none(), "no way to the hex window");
 }
 
 /// 06 §5 in the loading window: a connection lost mid-read is said, the screen stays, and the
@@ -1336,6 +1419,170 @@ fn a_local_image_over_the_budget_asks_before_it_decodes() {
     assert_eq!(image.file.lock().unwrap().original(), bytes.as_slice());
 }
 
+/// 06 §7.3 on a local image in a window of its own: its memory line offers Hex view, and H
+/// makes the same window the hex window on the file, read in place.
+#[test]
+fn w8b_hex_view_on_a_local_images_memory_line_becomes_the_hex_window() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("huge.png");
+    let bytes = png_claiming(100_000, 100_000);
+    std::fs::write(&path, &bytes).unwrap();
+    let mut fs = LocalFs::new();
+    let abs = path.to_str().unwrap().to_string();
+    let at = fs.stat(&abs).unwrap();
+    let origin = Origin::new(Box::new(fs), None, None, abs, at);
+    let file = ImageFile::new(origin, bytes, &tmp.path().join("cache"));
+    let hooks = Hooks::default();
+    let asking = decoded_or_asking(file, &hooks, Vec::new(), probe::BUDGET).unwrap();
+    let Start::Asking(win) = asking else {
+        panic!("a decode over the budget is asked about first");
+    };
+    let failed = win.failed.clone();
+    let mut host = Switching {
+        switch: win.switch.clone(),
+        image: Some(*win),
+        hex: None,
+        hooks,
+        hex_outcome: Arc::default(),
+        hex_leftover: Arc::default(),
+        failed,
+    };
+    let mut drv = Driver::new(900.0, 700.0);
+    drv.until(&mut host, 60, |host| {
+        host.image.as_ref().is_some_and(|win| win.asked)
+    });
+    drv.idle(&mut host, 1);
+    assert!(
+        drv.texts()
+            .iter()
+            .any(|(_, _, t)| t.contains("Hex view (H)")),
+        "the memory line offers Hex view"
+    );
+    drv.key(&mut host, Key::H, Modifiers::NONE);
+    let started = Instant::now();
+    while drv
+        .find_text("89 50 4E 47 0D 0A 1A 0A  00 00 00 0D 49 48 44 52")
+        .is_none()
+    {
+        assert!(started.elapsed() < HANG, "the hex rows never came");
+        drv.idle(&mut host, 1);
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert!(
+        host.image.is_none() && host.hex.is_some(),
+        "the hex window now"
+    );
+    assert!(!drv.closed(), "the window stayed");
+}
+
+/// W8b review, the frame rule: H on a local image's memory line opens the file for the hex
+/// window off the frame. With that open held at a barrier, the key's frame returns and the
+/// window goes on painting — saying it opens the hex view — and once the open is let go the
+/// same window becomes the hex window. (The window is driven on a thread of its own, so a
+/// frame that waited on the open is told apart from one that did not.)
+#[test]
+fn w8b_a_local_hex_view_is_opened_off_the_frame() {
+    // (reached, released)
+    let gate: Arc<(Mutex<(bool, bool)>, std::sync::Condvar)> = Arc::default();
+    let pause = {
+        let gate = gate.clone();
+        move || {
+            let (lock, cv) = &*gate;
+            let mut st = lock.lock().unwrap();
+            st.0 = true;
+            cv.notify_all();
+            // Never for ever: a frame that waits here (the defect) is let go after a while.
+            let _ = cv.wait_timeout_while(st, Duration::from_secs(30), |s| !s.1);
+        }
+    };
+    let release = || {
+        let (lock, cv) = &*gate;
+        lock.lock().unwrap().1 = true;
+        cv.notify_all();
+    };
+    let (said, heard) = std::sync::mpsc::channel::<&'static str>();
+    let window = std::thread::spawn(move || {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("huge.png");
+        let bytes = png_claiming(100_000, 100_000);
+        std::fs::write(&path, &bytes).unwrap();
+        let mut fs = LocalFs::new();
+        let abs = path.to_str().unwrap().to_string();
+        let at = fs.stat(&abs).unwrap();
+        let origin = Origin::new(Box::new(fs), None, None, abs, at);
+        let file = ImageFile::new(origin, bytes, &tmp.path().join("cache"));
+        let hooks = Hooks::default();
+        let asking = decoded_or_asking(file, &hooks, Vec::new(), probe::BUDGET).unwrap();
+        let Start::Asking(mut win) = asking else {
+            panic!("a decode over the budget is asked about first");
+        };
+        let mut switch = win.switch.take().expect("a local switch");
+        switch.before_open = Some(Arc::new(pause));
+        win.switch = Some(switch.clone());
+        let failed = win.failed.clone();
+        let mut host = Switching {
+            switch: Some(switch),
+            image: Some(*win),
+            hex: None,
+            hooks,
+            hex_outcome: Arc::default(),
+            hex_leftover: Arc::default(),
+            failed,
+        };
+        let mut drv = Driver::new(900.0, 700.0);
+        drv.until(&mut host, 60, |host| {
+            host.image.as_ref().is_some_and(|win| win.asked)
+        });
+        drv.key(&mut host, Key::H, Modifiers::NONE);
+        said.send("the key's frame returned").unwrap();
+        drv.idle(&mut host, 5);
+        let opening = drv
+            .texts()
+            .iter()
+            .any(|(_, _, t)| t.contains("opening the hex view"));
+        said.send(if opening {
+            "painting: opening"
+        } else {
+            "painting: silent"
+        })
+        .unwrap();
+        let started = Instant::now();
+        while drv
+            .find_text("89 50 4E 47 0D 0A 1A 0A  00 00 00 0D 49 48 44 52")
+            .is_none()
+        {
+            assert!(started.elapsed() < HANG, "the hex rows never came");
+            drv.idle(&mut host, 1);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(
+            host.image.is_none() && host.hex.is_some(),
+            "the hex window now"
+        );
+        assert!(!drv.closed(), "the window stayed");
+    });
+    {
+        let (lock, cv) = &*gate;
+        let st = lock.lock().unwrap();
+        let (st, _) = cv
+            .wait_timeout_while(st, Duration::from_secs(60), |s| !s.0)
+            .unwrap();
+        assert!(st.0, "the open never started");
+    }
+    // The open is held: the window's frames go on.
+    let first = heard.recv_timeout(Duration::from_secs(10));
+    let then = heard.recv_timeout(Duration::from_secs(10));
+    release();
+    let joined = window.join();
+    assert_eq!(
+        first,
+        Ok("the key's frame returned"),
+        "the frame waited on the open"
+    );
+    assert_eq!(then, Ok("painting: opening"), "while the open is held");
+    joined.unwrap();
+}
+
 /// `SOPEN_AUTOSAVE` through a stream: no window and nobody to ask — the file is read, the
 /// state applied and the edit saved over the original, checked against the bytes read.
 #[test]
@@ -1361,7 +1608,7 @@ fn autosave_through_a_stream_reads_applies_and_saves() {
         ..Default::default()
     };
     let cache = tmp.path().join("cache");
-    let out = open_stream(origin, source, &cache, &hooks, Vec::new()).unwrap();
+    let out = open_stream(origin, source, &cache, &hooks, Vec::new(), None).unwrap();
     assert!(out.saved && out.refused.is_none());
     let saved = Doc::decode(&std::fs::read(&path).unwrap()).unwrap();
     assert_eq!(saved.size(), (40, 30));

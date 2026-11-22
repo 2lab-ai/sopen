@@ -164,15 +164,61 @@ impl Media {
     /// `shown` how it is said (`host:/abs`). How Save and Export render it is not worked out
     /// yet: the window does that ([`MediaWindow::start_planning`]).
     pub fn stream(source: Source, name: &str, shown: &str) -> Result<Self> {
-        let tools = ffmpeg::resolve()?;
-        let fastseek = seeks_fast(&source, name);
-        let served = ffmpeg::Served::start(source, name, shown, fastseek)?;
-        Self::served(&tools, served, name, shown)
+        Self::stream_until(source, name, shown, &AtomicBool::new(false))
     }
 
-    /// [`Media::stream`] through a server already started (the tests' own clock).
+    /// [`Media::stream`] that its caller can stop: `stop` is looked at before the setup, by an
+    /// mp3's tag read while it waits on the stream ([`seeks_fast`]), before ffprobe is started
+    /// (none is, then) and while it runs ([`ffmpeg::probe_timed`]: it is killed and reaped), and
+    /// the open fails as [`crate::remote::Cancelled`] — an Esc during the open waits out
+    /// neither a stalled stream nor [`ffmpeg::PROBE_LIMIT`]. An empty file is said to be one:
+    /// there is nothing to probe, and the byte server has no range to serve.
+    pub fn stream_until(
+        source: Source,
+        name: &str,
+        shown: &str,
+        stop: &AtomicBool,
+    ) -> Result<Self> {
+        if source.size() == 0 {
+            bail!("{shown} is empty (0 bytes): nothing to play");
+        }
+        Self::stream_with(&ffmpeg::resolve()?, source, name, shown, stop)
+    }
+
+    /// [`Media::stream_until`] with the tools given (tests: a stand-in `ffprobe`).
+    fn stream_with(
+        tools: &Tools,
+        source: Source,
+        name: &str,
+        shown: &str,
+        stop: &AtomicBool,
+    ) -> Result<Self> {
+        if stop.load(SeqCst) {
+            bail!(crate::remote::Cancelled);
+        }
+        let fastseek = seeks_fast(&source, name, stop)?;
+        let served = ffmpeg::Served::start(source, name, shown, fastseek)?;
+        Self::served_until(tools, served, name, shown, &|| stop.load(SeqCst))
+    }
+
+    /// [`Media::stream`] through a server already started.
+    #[cfg(test)]
     fn served(tools: &Tools, served: Arc<ffmpeg::Served>, name: &str, shown: &str) -> Result<Self> {
-        let media = Self::unplanned(tools, &served.input(Kind::Play), name, shown)?;
+        Self::served_until(tools, served, name, shown, &|| false)
+    }
+
+    /// [`Media::served`] that `stop` stops ([`Media::stream_until`]).
+    fn served_until(
+        tools: &Tools,
+        served: Arc<ffmpeg::Served>,
+        name: &str,
+        shown: &str,
+        stop: &dyn Fn() -> bool,
+    ) -> Result<Self> {
+        let input = served.input(Kind::Play);
+        let limit = ffmpeg::PROBE_LIMIT;
+        let probe = ffmpeg::probe_timed(tools, &input, shown, limit, &Instant::now, stop)?;
+        let media = Self::of_probe(tools.clone(), &input, name, shown, probe)?;
         // `play` connections read ahead by the file's own rate from here (06 §4).
         let size = served.source().size() as f64;
         served
@@ -384,9 +430,14 @@ impl Media {
 /// Whether the file `name` read through `source` gets `-fflags +fastseek` on its `play` input
 /// (06 §7.4): an mp3 whose first frame carries a LAME `Info` tag, read through a `play`
 /// reader. Every other file seeks exactly.
-fn seeks_fast(source: &Source, name: &str) -> bool {
-    cut::stem_ext(name).1.eq_ignore_ascii_case("mp3")
-        && mp3::info_tag(&mut source.reader(ReaderKind::Media { bytes_per_s: 0 }))
+///
+/// `cancel` ends the tag read, waiting on the stream or not, as [`crate::remote::Cancelled`].
+fn seeks_fast(source: &Source, name: &str, cancel: &AtomicBool) -> Result<bool> {
+    if !cut::stem_ext(name).1.eq_ignore_ascii_case("mp3") {
+        return Ok(false);
+    }
+    let mut reader = source.reader(ReaderKind::Media { bytes_per_s: 0 });
+    Ok(mp3::info_tag(&mut reader, cancel)?)
 }
 
 /// `m:ss.cc` (or `h:mm:ss.cc`).
@@ -1396,9 +1447,30 @@ pub fn embed_stream(
 ) -> Result<super::Embedded> {
     let (_, name) = origin.parent();
     let media = Media::stream(source, &name, &origin.display())?;
+    Ok(embed_streamed(origin, media, cache, notices))
+}
+
+/// [`embed_stream`]'s window for `media` a route's worker probed already ([`Media::stream`]):
+/// nothing slow runs here, so the window is made on the frame that shows it. The window works out
+/// how Save and Export render the file itself.
+pub fn embed_streamed(
+    origin: Origin,
+    media: Media,
+    cache: &Path,
+    notices: Vec<String>,
+) -> super::Embedded {
     let mut window = hosted_window(origin, media, cache, notices);
     window.unplanned = true;
-    Ok(hosted(window))
+    hosted(window)
+}
+
+/// The `play` input [`Media::stream`] probes (06 §7.4): `source` served by a byte server of its
+/// own, an mp3 with a LAME `Info` tag seeking fast — for a run that probes it under a watch of
+/// its own (the file browser's preview, [`preview::prepare`]; the `.ts` refine). `cancel`
+/// (its caller's stop) ends an mp3's tag read as [`crate::remote::Cancelled`].
+pub fn served_input(source: Source, name: &str, shown: &str, cancel: &AtomicBool) -> Result<Input> {
+    let fastseek = seeks_fast(&source, name, cancel)?;
+    Ok(ffmpeg::Served::start(source, name, shown, fastseek)?.input(Kind::Play))
 }
 
 /// The media window as a preview in the file browser (02 §4.2): told it is one before its first
