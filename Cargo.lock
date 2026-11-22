@@ -3737,6 +3737,7 @@ dependencies = [
  "directories",
  "eframe",
  "egui_system_font_provider",
+ "fancy-regex",
  "futures-core",
  "gethostname",
  "icu_normalizer",
