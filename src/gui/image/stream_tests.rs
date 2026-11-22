@@ -1208,6 +1208,7 @@ fn w8b_a_file_that_does_not_decode_becomes_the_hex_window_on_its_stream() {
         mut engine,
         mut win,
         mut drv,
+        lines,
         ..
     } = fx;
     let switch = HexSwitch::new(crate::gui::hex::Repaint::default());
@@ -1247,6 +1248,13 @@ fn w8b_a_file_that_does_not_decode_becomes_the_hex_window_on_its_stream() {
     assert!(!drv.closed(), "the window stayed");
     assert_eq!(super::super::Window::failure(&host), None);
     assert!(source.state().status().is_none(), "the same stream, live");
+    // One open, one `first` on the stats line (06 §11): the image's, not the hex window's too.
+    let said = lines.lock().unwrap().clone();
+    let firsts = said
+        .iter()
+        .filter(|l| l.starts_with("stream first "))
+        .count();
+    assert_eq!(firsts, 1, "{said:?}");
 }
 
 /// W8b: a stream that changed mid-read is what failed, not the file's content: with a way to
@@ -1409,6 +1417,62 @@ fn a_local_image_over_the_budget_asks_before_it_decodes() {
     assert_eq!(win.load.progress().reserved, 180_000);
     let image = win.image.as_deref().unwrap();
     assert_eq!(image.file.lock().unwrap().original(), bytes.as_slice());
+}
+
+/// 06 §7.3 on a local image in a window of its own: its memory line offers Hex view, and H
+/// makes the same window the hex window on the file, read in place.
+#[test]
+fn w8b_hex_view_on_a_local_images_memory_line_becomes_the_hex_window() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("huge.png");
+    let bytes = png_claiming(100_000, 100_000);
+    std::fs::write(&path, &bytes).unwrap();
+    let mut fs = LocalFs::new();
+    let abs = path.to_str().unwrap().to_string();
+    let at = fs.stat(&abs).unwrap();
+    let origin = Origin::new(Box::new(fs), None, None, abs, at);
+    let file = ImageFile::new(origin, bytes, &tmp.path().join("cache"));
+    let hooks = Hooks::default();
+    let asking = decoded_or_asking(file, &hooks, Vec::new(), probe::BUDGET).unwrap();
+    let Start::Asking(win) = asking else {
+        panic!("a decode over the budget is asked about first");
+    };
+    let failed = win.failed.clone();
+    let mut host = Switching {
+        switch: win.switch.clone(),
+        image: Some(*win),
+        hex: None,
+        hooks,
+        hex_outcome: Arc::default(),
+        hex_leftover: Arc::default(),
+        failed,
+    };
+    let mut drv = Driver::new(900.0, 700.0);
+    drv.until(&mut host, 60, |host| {
+        host.image.as_ref().is_some_and(|win| win.asked)
+    });
+    drv.idle(&mut host, 1);
+    assert!(
+        drv.texts()
+            .iter()
+            .any(|(_, _, t)| t.contains("Hex view (H)")),
+        "the memory line offers Hex view"
+    );
+    drv.key(&mut host, Key::H, Modifiers::NONE);
+    let started = Instant::now();
+    while drv
+        .find_text("89 50 4E 47 0D 0A 1A 0A  00 00 00 0D 49 48 44 52")
+        .is_none()
+    {
+        assert!(started.elapsed() < HANG, "the hex rows never came");
+        drv.idle(&mut host, 1);
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert!(
+        host.image.is_none() && host.hex.is_some(),
+        "the hex window now"
+    );
+    assert!(!drv.closed(), "the window stayed");
 }
 
 /// `SOPEN_AUTOSAVE` through a stream: no window and nobody to ask — the file is read, the

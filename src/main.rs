@@ -838,7 +838,6 @@ fn open_streamed(
     let Place::Remote(spec, conn) = place else {
         bail!("{abs} is on this machine: it is read in place, not streamed");
     };
-    let known = spec.display(abs);
     let dial: gui::browser::Connect = {
         let (spec, state) = (spec.clone(), dirs.state.clone());
         std::sync::Arc::new(move || {
@@ -846,51 +845,24 @@ fn open_streamed(
             Ok(Box::new(fs) as Box<dyn RemoteFs + Send>)
         })
     };
-    let reconnect = |dial: &gui::browser::Connect| -> gui::Reconnect {
-        let dial = dial.clone();
-        Box::new(move || dial())
-    };
-    let repaint = gui::hex::Repaint::default();
-    let opening = sopen::stream::Opening {
-        label: known.clone(),
-        began: Instant::now(),
-        sniff,
-    };
-    let opened = gui::streamed::open(
-        conn,
-        abs,
-        opening,
-        Some(dial.clone()),
-        repaint.waker(),
-        None,
-    )
-    .map_err(|not| anyhow::anyhow!(sopen::stream::explain(&not.error)))?;
-    let origin = gui::Origin::placeholder(
-        Some(reconnect(&dial)),
-        spec.label(),
-        abs.to_string(),
-        opened.at,
-        gui::Placeholder::YES,
-    );
-    let source = opened.source;
-    let outcome = if kind == Kind::Image {
-        let switch = gui::image::HexSwitch::new(repaint);
-        gui::image::open_stream(origin, source, &dirs.cache, hooks, Vec::new(), Some(switch))?
-    } else {
-        let (_, name) = remote::split_parent(abs);
-        if kind::maybe_video(name) {
-            // The `.ts` refine over the URL (06 §7.4).
-            let input = gui::media::served_input(source.clone(), name, &known)?;
-            let refined = kind::refine_input(&input, name, kind);
-            rec.kind = Some(refined);
-            if refined == Kind::Other {
-                drop((input, source, origin));
-                let fs = SftpRemote::connect(&spec, &dirs.state).map_err(refusal_said)?;
-                let place = Place::Remote(spec, Box::new(fs));
-                return open_binary(place, abs, opened.at.size, sniff, None, false, dirs, rec);
-            }
+    let opened = gui::streamed::standalone(conn, &spec.label(), abs, kind, sniff, dial)?;
+    let outcome = match opened {
+        gui::streamed::Standalone::Image {
+            origin,
+            source,
+            switch,
+        } => gui::image::open_stream(origin, source, &dirs.cache, hooks, Vec::new(), Some(switch))?,
+        gui::streamed::Standalone::Media { origin, source } => {
+            gui::media::open_stream(origin, source, &dirs.cache, hooks, Vec::new())?
         }
-        gui::media::open_stream(origin, source, &dirs.cache, hooks, Vec::new())?
+        gui::streamed::Standalone::NotMedia { size } => {
+            // A `.ts` ffprobe does not read as media: the binary dialog, as any other file, on
+            // a connection of its own (the stream's is closed).
+            rec.kind = Some(Kind::Other);
+            let fs = SftpRemote::connect(&spec, &dirs.state).map_err(refusal_said)?;
+            let place = Place::Remote(spec, Box::new(fs));
+            return open_binary(place, abs, size, sniff, None, false, dirs, rec);
+        }
     };
     rec.action = Some(outcome.action());
     rec.conflict = outcome.conflict;

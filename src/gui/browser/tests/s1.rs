@@ -2543,8 +2543,9 @@ fn closing_at_a_question_reports_the_item_as_cancelled() {
 
 use crate::ffmpeg::{spawns, Tools};
 use crate::gui::media::fixtures::{
-    bounded as watched_over, clip, index_only, median, most_at_once, none_left, quiet_then_loud,
-    stand_in, started_under, still_running, tone, tools as media_tools, Census, Hand,
+    bounded as watched_over, clip, index_only, median, most_at_once, naming, none_left,
+    quiet_then_loud, stand_in, started_under, still_running, tone, tools as media_tools, Census,
+    Hand,
 };
 use crate::gui::media::wave;
 
@@ -2976,6 +2977,62 @@ fn p6_enter_during_a_videos_probe_continues_it_as_the_opening() {
         let runs = spawns::of(&path);
         assert_eq!((runs.probe, runs.preview), (1, 1), "one probe, one frame");
         assert_none_left(&base(&fx));
+    });
+}
+
+/// W8b: Esc while a remote video's probe waits on its stream — the stream's first reply held,
+/// so `ffprobe` has nothing to read — stops the probe: the list is back within a bounded number
+/// of passes (10 ms apart: seconds, against the probe's own 30 s limit), `cancelled` on its
+/// status row, while the stream still gives nothing; and no `ffprobe` reading the file is left
+/// (found by its command line, whose URL names the file — a name made for this run, which no
+/// other process's command line has). Both probes an open runs: a `.mp4`'s, and a `.ts`'s
+/// refine over its URL (06 §7.4), which comes first.
+#[test]
+fn esc_during_a_remote_videos_probe_stops_it() {
+    let Some(tools) = media_tools() else { return };
+    watched_over(180, move |_| {
+        for ext in ["mp4", "ts"] {
+            let unique = &crate::remote::random_hex()[..12];
+            let name: &'static str =
+                Box::leak(format!("w8b-esc-probe-{unique}.{ext}").into_boxed_str());
+            let (mut fx, _seen, gate) = watched(name);
+            clip(
+                &tools,
+                Path::new(&format!("{}/{name}", fx.root)),
+                (160, 120),
+            );
+            fx.relist();
+            // Dual mode: Enter opens it from the start (no preview's preparation to take over).
+            fx.key(Key::F9);
+            fx.select(name);
+            fx.key(Key::Enter);
+            // ffprobe asked for its first bytes, and the reply is held.
+            gate.reached();
+            assert!(fx.b.opening.is_some(), "{name}");
+            assert!(naming(Path::new(name)) >= 1, "{name}: an ffprobe reads it");
+            fx.key(Key::Escape);
+            let mut passes = 0;
+            while fx.b.opening.is_some() {
+                assert!(
+                    passes < 500,
+                    "{name}: the open still runs after {passes} passes"
+                );
+                fx.drv.idle(&mut fx.b, 1);
+                std::thread::sleep(Duration::from_millis(10));
+                passes += 1;
+            }
+            fx.drv.idle(&mut fx.b, 2);
+            assert!(fx.b.viewer.is_none(), "{name}: nothing opened");
+            assert!(
+                fx.b.status.text.starts_with("cancelled"),
+                "{name}: {}",
+                fx.b.status.text
+            );
+            if let Err(left) = none_left(Path::new(name)) {
+                panic!("{name}: {left}");
+            }
+            gate.release();
+        }
     });
 }
 

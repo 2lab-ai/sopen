@@ -281,9 +281,10 @@ pub enum Found {
 }
 
 /// Makes the preview of the media file `input` (named `name`, and `shown` in what is said of
-/// it: the file as its owner knows it — `input` may be a private preview copy, whose path is
-/// never said; `kind` by its name and first bytes): the probe, then the first frame (video) or the waveform (sound) — each a step with
-/// its own time, and all of it stopped as soon as `watch` says so.
+/// it: the file as its owner knows it — `input` may be a remote file's URL on its byte server,
+/// which is never said; `kind` by its name and first bytes): the probe, then the first frame
+/// (video) or the waveform (sound) — each a step with its own time, and all of it stopped as
+/// soon as `watch` says so.
 pub fn prepare(
     tools: &Tools,
     input: &Input,

@@ -559,6 +559,12 @@ const VIEWER_HINT: &str = "Esc or F3 back to the list · F4 VS Code / Zed";
 
 impl Browser {
     pub(crate) fn new(start: Start) -> Self {
+        // The preview copies an older sopen left (every preview reads through a stream now, 06
+        // §13): swept once, off the window's thread.
+        let cache = start.cache.clone();
+        let _ = std::thread::Builder::new()
+            .name("legacy-previews".into())
+            .spawn(move || crate::cache::sweep_legacy_previews(&cache));
         let preview = preview::Host::new(
             start.connect.clone(),
             start.label.clone(),
@@ -1087,6 +1093,25 @@ impl Browser {
                 notices,
                 claim,
             } => (super::image::embed(file, doc, notices), claim),
+            Prepared::ImageAsking {
+                file,
+                path,
+                notices,
+                claim,
+            } => {
+                // 06 §7.3: the memory line, with Hex view on the file read in place.
+                let gives_way = super::image::HexSwitch::local(path);
+                match super::image::embed_asking(file, notices, Some(gives_way.clone())) {
+                    Ok(embedded) => {
+                        switch = Some(gives_way);
+                        (embedded, claim)
+                    }
+                    Err(e) => {
+                        self.status = Status::error(format!("{e:#}"));
+                        return;
+                    }
+                }
+            }
             Prepared::ImageStream {
                 origin,
                 source,

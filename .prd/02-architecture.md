@@ -202,7 +202,7 @@ frame single-lined), and the text viewer does not follow a growing file.
   it`, `image is 30000×30000; Enter opens it`, the error). The kind is there also when nothing of
   the file was read (a remote file over the limit: by its name). The reason comes first and is
   never cut; where it is about a file a program could not read, that is said under it, the file
-  named once and as its owner knows it (`ffprobe cannot read host:/abs` — never the private copy),
+  named once and as its owner knows it (`ffprobe cannot read host:/abs` — never the URL it read),
   and that line is what a small side cuts. What `ffprobe` or `ffmpeg` said is shown without its
   `[component @ 0x…]` tags and without the path it puts in front. The status row stays the list's.
 - **A link** is previewed as the file it points at (01 §3a: a link opens as its target); a broken
@@ -269,8 +269,12 @@ bar does not have to move).
   keep their stream for as long as the preview shows. A preview never claims a cached copy,
   publishes into the mirror, moves earlier edits aside or creates a session copy (01 §5's
   machinery is for files that are opened). The private preview copies under `<cache>/.preview`
-  went with W8b: nothing uses them, and nothing makes the folder (one an older sopen left is
-  not swept).
+  went with W8b: nothing uses them, and nothing makes the folder. One an older sopen left is
+  swept when a browser window opens, off its frames, by that sopen's own rule: the folder of every
+  window that is gone (its `<window>.lock` free or missing) and its lock, a lock with no folder once
+  it is free and a minute old (a window being made has one for an instant), then the root once it
+  is empty — a window an older sopen still runs keeps its folder; a link at that place is left as
+  it is.
 - **A streamed preview that is dropped gives the connection back** (the bar moved on, F9, Tab, a
   cancel): its stream closes the file's handle and returns the session, and the next preparation
   takes it. So the window still has one preview session. The one exception: a session whose
@@ -290,8 +294,8 @@ bar does not have to move).
   the kernel kills every such child with it (each sets `PR_SET_PDEATHSIG`); on macOS there is
   no such thing, and the one `ffprobe` or `ffmpeg` that ran is left to end by itself — each is
   bounded by its input (one probe, one frame, at most the file's sound), and a Ctrl+C in the
-  terminal reaches it with the rest of the process group. The private preview folder such an end
-  leaves is swept by the next window (its lock is free). sopen keeps no list of its children
+  terminal reaches it with the rest of the process group. Such an end leaves nothing of a
+  preview on disk: a preview writes nothing (§4.4). sopen keeps no list of its children
   and handles no signal — but for one: while a "Save to…" runs without a window, SIGINT and
   SIGTERM cancel it (06 §7.5; a handler that only stores into atomics, there for that save
   alone).
@@ -379,40 +383,41 @@ P1 and the final acceptance run after the text-wrap branch has landed (§4.2).
 - P2. Press ↓ quickly through ten files → nothing is fetched for the files passed (test: a counting
   `RemoteFs` sees one preparation, for the file the bar rested on).
 - P3. Put the bar on a 100 MiB remote image → the info card `over the preview limit`; nothing is
-  read. Put it on a 24 GB remote binary → its first hex rows, one 64 KiB block fetched after a sniff
-  of at most 8 KiB (06 §13; test: the reads' ranges). Put it on a local 30000×30000 PNG, a local 2 GB log, a two-hour MP3 and a video whose probe
+  read. Put it on a remote image whose header says 30000×30000 → its card, having read its
+  header's block. Put it on a 24 GB remote binary → its first hex rows, one 64 KiB block fetched
+  after a sniff of at most 8 KiB, and on a 2 GiB remote video → its first frame, far short of the
+  file (06 §13; test: the reads' ranges). Put it on a local 30000×30000 PNG, a local 2 GB log, a two-hour MP3 and a video whose probe
   hangs (a stand-in `ffprobe` that sleeps) and leave the bar there → each shows its card or its bounded
   preview (`first 4 MiB`, `first 10 minutes`) within its budget, and no worker is left running.
-- P4. Put the bar on a 30 MiB remote image and move away at 40 % → its requests stop, nothing is
-  published under any name in the cache (the private preview copy is removed), and the next preview
-  starts only after the first worker ended (test with a slow fake worker: peak live preview workers =
-  1, peak preview SFTP sessions = 1, across 20 quick moves). The same 20 moves over remote text and
-  binaries, which stream: one session, never two at once — each dropped preview gave it back —
-  and nothing on disk. (A shutdown slower than 2 s: two for that moment, the late one closed.) Sweep the bar over 50 files of every kind
-  → no ffmpeg process outlives its preview, and the cache's mirror and session folders are unchanged.
+- P4. Put the bar on a 30 MiB remote image and move away at 40 % → its stream's requests stop,
+  nothing is on disk, and the next preview starts only after the first worker ended (test with a
+  held worker: peak live preview workers = 1, peak preview SFTP sessions = 1). Twenty quick moves
+  over remote images, text and binaries, and over remote videos and sounds: one session, never two
+  at once — each dropped preview's stream gave it back — and nothing on disk. (A shutdown slower
+  than 2 s: two for that moment, the late one closed.) Sweep the bar over 50 files of every kind →
+  no ffmpeg process outlives its preview, and nothing is written to the cache.
 - P5. For each kind (text, image, video, audio, hex), previewed: real clicks (the media window's
   Play button included), drags, the wheel, `C`, `P`, Space, Cmd/Ctrl+V and typing over it → nothing
   changes in the viewer (its dirty state stays clean), no audio output is opened (a stand-in output
   counts opens), the list's keys still act, and moving the bar away asks nothing. The preview draws as
   inactive and without bars (screenshot).
-- P6. Press Enter on a previewed remote image → the image window opens at once; no byte range is read
-  twice and nothing is decoded twice (test: the reads' ranges, one decode), and the cached copy is
-  claimed and recorded only now, by a hard link to the preview copy (same inode); the viewer's Save
-  reconnects on its first remote call. Press Enter while the preview still reads → the same read
-  continues as the viewer's opening. Press Enter on a previewed remote binary or text file (06 §13)
-  → its stream is the viewer's: the block the preview read is not read again (test: the reads'
-  ranges do not overlap), nothing is in the cache, the session went with it, and the next remote
-  preview opens a new one.
+- P6. Press Enter on a previewed remote image → the image window opens at once; the file crossed
+  once and was decoded once (test: the bytes streamed, one decode), nothing is claimed or written
+  in the cache, and the viewer's Save connects on its first remote call (the image's stream gave
+  the preview session back when its read ended). Press Enter while the preview still reads → the
+  same read continues as the viewer's opening. Press Enter on a previewed remote binary, text file,
+  video or sound (06 §13) → its stream is the viewer's: the block the preview read is not read
+  again (test: the reads' ranges do not overlap), nothing is in the cache, the session went with
+  it, and the next remote preview opens a new one.
 - P12. A local text file of 6 MiB and a remote one of 20 MiB: the preview shows the first page and
   `preview of the first 4 MiB`; Enter → the viewer; End → the file's last line. On a continuation
   that succeeds each byte is indexed once, and the 4 MiB before the cut are read twice more only to
   verify them (§4.4) (test: the index's reads see every offset once, the verification reads are
-  counted apart). The remote one, being over 16 MiB, is read into the private copy once (one
-  fetch). A remote text file of 6 MiB streams (06 §13): the preview fetches its 4 MiB and no more,
-  and after Enter the rest — every byte range asked for once over preview and viewer together,
-  `fetched` equal to the file's size, one session, nothing on disk. Enter on a 100 MiB remote text
-  file's info card → the ordinary open, with its fetch progress on the status row. An audio file of
-  20 minutes (after S1-M): Enter → the waveform's first 10 minutes stay, the rest is decoded from 10:00.
+  counted apart). Remote text of any size streams (06 §13): the preview fetches its first 4 MiB and
+  no more, and after Enter the rest — every byte range asked for once over preview and viewer
+  together, one session, nothing on disk; past 16 MiB, End goes to the file's end by its bytes
+  (W5b's index). An audio file of 20 minutes (after S1-M): Enter → the waveform's first 10
+  minutes stay, the rest is decoded from 10:00 — a remote one through the same stream.
 - P13. Two histories reach the bar on file X within 150 ms — one from a preview of file W, one from the
   git panel on `..` — → each side keeps its own display (W's preview; the git panel) until the
   deadline, then both show X's preview; Tab, F9 or entering a folder during the 150 ms commit at once
@@ -441,7 +446,7 @@ slice named here (§8); a file that exists today changes owner only from one sli
 | `src/gui/browser/keys.rs` | the browser's one key table — every context's rows, written up front from 02 §3.2, 03 §9, 04 §2–§3 and 05 §1 — `Command`, exact modifier matching, typed-text characters (04 §3) | S1-A; later slices change rows only through a declared hand-over |
 | `src/gui/mod.rs` | `Window::set_preview(bool)` on the trait, with a default that does nothing (S1-0, so S1-B and S1-A never share the file); Cmd/Ctrl+digit → F-key, once, in the shell's raw-input hook; clicks on the F-key row; `State::parse` and `Hooks` for the receipt keys (§9); focus events (S7) | S1-0, then S1-A, then each slice's integration WU for its receipt keys |
 | `src/gui/chrome.rs` (body), `src/gui/chrome/tests.rs`, `src/gui/help.rs` | the clickable F-key row; F1's key help screen in every window | S1-A |
-| `src/gui/{text,image,hex,media}.rs` and their `tests.rs`, `src/gui/browser/prepare.rs`, `src/cache.rs` | `Window::set_preview(bool)` (inactive frame, no bars, no input, no audio, no following, §4.3's budgets); the preview's read without claiming, the placeholder connection, the hard-link claim on hand-over; the `.preview` cache root | S1-B (`media.rs` only after PR #15, and only the `set_preview` default; then S1-M); in S2 the `read_only` flag and the `.revisions` root (S2-E) |
+| `src/gui/{text,image,hex,media}.rs` and their `tests.rs`, `src/gui/browser/prepare.rs`, `src/cache.rs` | `Window::set_preview(bool)` (inactive frame, no bars, no input, no audio, no following, §4.3's budgets); the preview's read without claiming, the placeholder connection (since W8b every remote preview reads through a stream, and the `.preview` cache root is gone — an older sopen's is swept) | S1-B (`media.rs` only after PR #15, and only the `set_preview` default; then S1-M); in S2 the `read_only` flag and the `.revisions` root (S2-E) |
 | `src/fileops/*.rs`, `src/remote/ops.rs`, `src/remote/sftp/ops.rs`, `src/remote/local/ops.rs` | S1-C: rename, copy and move of files and folders, with the primitives they need — `MKDIR` for a copied folder, `REMOVE` and `RMDIR` for a moved one's sources; S6-A: F7 and F8 as actions, the local Trash, the plain-rename channel for remote folders: plans and runs over both file layers, never overwriting (04 §5) | S1-C, S6-A |
 | `src/gui/browser/ops.rs`, `src/gui/browser/panel.rs` | selection, the file-operation dialogs, progress and reports; **drawing helpers** for the inline rename field and the selection colours, which `browser.rs`'s `panel_ui` (S1-E) calls | S1-D, S6-B |
 | `src/gui/browser/view.rs`, `src/gui/browser/preview.rs` | modes and `view::resolve` (§3) with its table test; the preview host (§4) | S1-E (O6 and the pin: S2-F) |
@@ -557,7 +562,7 @@ a slice depends on runs before it (§8.2).
 
 | Slice | What the owner gets | WUs (owner files: §5) | Needs first |
 |---|---|---|---|
-| **S1** | Preview mode (text, image, hex; video and audio came with S1-M), F9 and rules O2 / O5 / O7, F2 rename, F5 copy, F6 move — local, and remote: files through `hardlink@` + `REMOVE`, folders by copy, check and remove (04 §5.6) — selection, the clickable F-key row with Cmd/Ctrl+digit aliases, F1 key help | S1-0 scaffold (touches no viewer file) · S1-A keys, aliases, row, help · S1-B viewer preview flags, preview read path, `.preview` cache root · S1-C file-operations engine · S1-D selection and file-operation dialogs, with drawing helpers for the inline rename field and selection colours · S1-E view, preview host, integration (calls S1-D's helpers in `panel_ui`) | E3; for S1-B (and P1) the text-wrap branch (PR #14) merged; S1-B changes `media.rs` only after PR #15 has merged, and then only for the `set_preview` default |
+| **S1** | Preview mode (text, image, hex; video and audio came with S1-M), F9 and rules O2 / O5 / O7, F2 rename, F5 copy, F6 move — local, and remote: files through `hardlink@` + `REMOVE`, folders by copy, check and remove (04 §5.6) — selection, the clickable F-key row with Cmd/Ctrl+digit aliases, F1 key help | S1-0 scaffold (touches no viewer file) · S1-A keys, aliases, row, help · S1-B viewer preview flags, preview read path, `.preview` cache root (gone with W8b, §4.4) · S1-C file-operations engine · S1-D selection and file-operation dialogs, with drawing helpers for the inline rename field and selection colours · S1-E view, preview host, integration (calls S1-D's helpers in `panel_ui`) | E3; for S1-B (and P1) the text-wrap branch (PR #14) merged; S1-B changes `media.rs` only after PR #15 has merged, and then only for the `set_preview` default |
 | **S1-M** | The media preview: video frame and audio waveform previews, their budgets and hand-over (§4.2–§4.4) | S1-M (one WU: `media.rs`, its tests, the preview host's media row) | S1; PR #15 merged |
 | **S2** | The read-only git panel: detection, the log stream, the graph, details, diffs, files at a revision, find and filters, pin, refresh, `SOPEN_LIST=git` | S2-0 scaffold · S2-A runner · S2-B read model · S2-C lane layout · S2-D panel UI · S2-E viewers' read-only flag, `.revisions` root · S2-F O6, pin, integration | S1; E4 |
 | **S3** | Every Git Graph action, staging and commit, backups, restore and undo, the banner, the command log | S3-0 · S3-A actions and backups (logic) · S3-B menu, dialogs, backups list, log, banner · S3-C integration | S2; E5 |
@@ -627,6 +632,8 @@ a slice depends on runs before it (§8.2).
   real ones. At most 1 at a time; 0 alive after the window closed.
 - **Cache:** the preview cache peaked at 0 bytes locally (files are read in place) and at 7.2 MB
   over ssh (one mp3's private copy); 0 bytes after exit in both; nothing outside `.preview`.
+  Since W8b a remote preview reads through a stream and writes nothing: that peak is 0 bytes
+  over ssh too, and the `.preview` folder is never made.
 
 ## 9. Receipts and test hooks
 

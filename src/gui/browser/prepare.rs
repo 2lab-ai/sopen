@@ -43,6 +43,16 @@ pub enum Prepared {
         notices: Vec<String>,
         claim: Option<Claim>,
     },
+    /// A local image whose decode must be asked about first (06 §7.3: the memory line applies
+    /// to local images too): its window asks, decodes on a worker of its own, and gives way to
+    /// the hex window on the file at `path`, read in place (Hex view, a file that does not
+    /// decode).
+    ImageAsking {
+        file: ImageFile,
+        path: PathBuf,
+        notices: Vec<String>,
+        claim: Option<Claim>,
+    },
     /// A remote image read through `source` (06 §7.3): its window is made on the frame — it
     /// reads on a worker of its own — and gives way to the hex window on the same stream
     /// (Hex view, a file that does not decode); `repaint` is what the stream wakes.
@@ -187,8 +197,18 @@ pub fn prepare(
             let bytes = std::fs::read(&fetched.claim.local)
                 // Read from the copy, said about the file: the copy is never named.
                 .with_context(|| format!("cannot read {}", req.show()))?;
-            let doc = match Doc::decode(&bytes) {
-                Ok(doc) => doc,
+            let doc = match image::decode_unless_asking(&bytes, image::probe::BUDGET, true) {
+                Ok(Some(doc)) => doc,
+                // 06 §7.3, for a local image too: the memory line first, with Hex view.
+                Ok(None) => {
+                    let file = ImageFile::new(req.origin(fs, fetched.at), bytes, req.cache);
+                    return Ok(Prepared::ImageAsking {
+                        file,
+                        path,
+                        notices: fetched.notices,
+                        claim: Some(fetched.claim),
+                    });
+                }
                 // 06 §7.3: a file that does not decode is shown as bytes, why said first.
                 Err(e) => {
                     let base = hex::Base::open_as(Path::new(req.abs), &req.show())?;
@@ -258,9 +278,10 @@ fn streamed_prepared(
     sniff: u64,
     cancel: &AtomicBool,
 ) -> Result<Prepared> {
-    // Esc is looked at between the steps that take a moment (a probe runs to its end).
+    // Esc is looked at between the steps, and while a probe runs (its ffprobe is killed then).
+    let stop = || cancel.load(Ordering::Relaxed);
     let stopped = || -> Result<()> {
-        if cancel.load(Ordering::Relaxed) {
+        if stop() {
             bail!(crate::remote::Cancelled);
         }
         Ok(())
@@ -297,14 +318,19 @@ fn streamed_prepared(
                 // The `.ts` refine over the URL (06 §7.4): ffprobe reads the `play` URL, so
                 // what it reads is what the window plays next — from the stream's cache.
                 let input = media::served_input(source.clone(), name, &req.show())?;
-                if kind::refine_input(&input, name, kind) == Kind::Other {
+                let refined = kind::refine_input_until(&input, name, kind, &stop);
+                // Stopped, the probe knows nothing of the file: its answer is not used.
+                stopped()?;
+                if refined == Kind::Other {
                     drop(input);
                     return Ok(hex_of_stream(origin, source, repaint));
                 }
             }
             stopped()?;
-            let media = Media::stream(source, name, &req.show())?;
+            let media = Media::stream_until(source, name, &req.show(), &stop);
+            // A probe Esc stopped fails as one: that is the cancel, not the file's fault.
             stopped()?;
+            let media = media?;
             Ok(Prepared::MediaStream {
                 origin,
                 media: Box::new(media),
@@ -1092,6 +1118,8 @@ fn preview_parts(
                 shown,
             }
         }
+        // An empty file has nothing to probe, and its byte server no range to serve.
+        Kind::Video | Kind::Audio if source.size() == 0 => bail!("the file is empty (0 bytes)"),
         Kind::Video | Kind::Audio => {
             budget.read_done();
             // Each of its steps has a time of its own (02 §4.3), and every ffprobe and ffmpeg it

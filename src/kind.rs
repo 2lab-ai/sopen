@@ -254,12 +254,31 @@ pub fn refine_local(local: &std::path::Path, name: &str, kind: Kind) -> Kind {
 /// its window's byte server (06 §7.4: the `.ts` refine probes the URL, nothing is fetched first).
 /// The probe has the URL's deadline ([`crate::ffmpeg::probe_input`]).
 pub fn refine_input(input: &crate::ffmpeg::Input, name: &str, kind: Kind) -> Kind {
+    refine_input_until(input, name, kind, &|| false)
+}
+
+/// [`refine_input`] that its caller can stop: once `stop` says so, ffprobe is killed and reaped
+/// at its next look (every few milliseconds) and nothing is known of the file — whoever stopped
+/// it does not use the answer.
+pub fn refine_input_until(
+    input: &crate::ffmpeg::Input,
+    name: &str,
+    kind: Kind,
+    stop: &dyn Fn() -> bool,
+) -> Kind {
     if kind != Kind::Video {
         return kind;
     }
     let shown = input.show();
-    let probed =
-        crate::ffmpeg::resolve().and_then(|t| crate::ffmpeg::probe_input(&t, input, &shown));
+    // A stop makes the probe's time run out at its next look.
+    let far = std::time::Duration::from_secs(365 * 24 * 3600);
+    let now = || match stop() {
+        true => std::time::Instant::now() + far,
+        false => std::time::Instant::now(),
+    };
+    let limit = crate::ffmpeg::PROBE_LIMIT;
+    let probed = crate::ffmpeg::resolve()
+        .and_then(|t| crate::ffmpeg::probe_timed(&t, input, &shown, limit, &now));
     let probe = match probed {
         Ok(probe) => Some((probe.video.is_some(), probe.has_audio)),
         Err(e) => {

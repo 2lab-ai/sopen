@@ -151,15 +151,54 @@ impl Media {
     /// `shown` how it is said (`host:/abs`). How Save and Export render it is not worked out
     /// yet: the window does that ([`MediaWindow::start_planning`]).
     pub fn stream(source: Source, name: &str, shown: &str) -> Result<Self> {
+        Self::stream_until(source, name, shown, &|| false)
+    }
+
+    /// [`Media::stream`] that its caller can stop: `stop` is looked at while the probe runs,
+    /// every few milliseconds, and once it says so ffprobe is killed and reaped and the probe
+    /// fails (an Esc during the open does not wait out [`ffmpeg::PROBE_LIMIT`]). An empty file
+    /// is said to be one: there is nothing to probe, and the byte server has no range to serve.
+    pub fn stream_until(
+        source: Source,
+        name: &str,
+        shown: &str,
+        stop: &dyn Fn() -> bool,
+    ) -> Result<Self> {
+        if source.size() == 0 {
+            bail!("{shown} is empty (0 bytes): nothing to play");
+        }
         let tools = ffmpeg::resolve()?;
+        if stop() {
+            bail!(crate::remote::Cancelled);
+        }
         let fastseek = seeks_fast(&source, name);
         let served = ffmpeg::Served::start(source, name, shown, fastseek)?;
-        Self::served(&tools, served, name, shown)
+        // A stop makes the probe's time run out at its next look.
+        let far = Duration::from_secs(365 * 24 * 3600);
+        let now = move || match stop() {
+            true => Instant::now() + far,
+            false => Instant::now(),
+        };
+        Self::served_until(&tools, served, name, shown, &now)
     }
 
     /// [`Media::stream`] through a server already started (the tests' own clock).
+    #[cfg(test)]
     fn served(tools: &Tools, served: Arc<ffmpeg::Served>, name: &str, shown: &str) -> Result<Self> {
-        let media = Self::unplanned(tools, &served.input(Kind::Play), name, shown)?;
+        Self::served_until(tools, served, name, shown, &Instant::now)
+    }
+
+    /// [`Media::served`] with the probe's time read from `now` ([`Media::stream_until`]).
+    fn served_until(
+        tools: &Tools,
+        served: Arc<ffmpeg::Served>,
+        name: &str,
+        shown: &str,
+        now: &dyn Fn() -> Instant,
+    ) -> Result<Self> {
+        let input = served.input(Kind::Play);
+        let probe = ffmpeg::probe_timed(tools, &input, shown, ffmpeg::PROBE_LIMIT, now)?;
+        let media = Self::of_probe(tools.clone(), &input, name, shown, probe)?;
         // `play` connections read ahead by the file's own rate from here (06 §4).
         let size = served.source().size() as f64;
         served

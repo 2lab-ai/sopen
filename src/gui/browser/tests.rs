@@ -1027,6 +1027,80 @@ fn w8b_hex_view_on_the_memory_line_switches_to_the_hex_window() {
     assert_eq!(files_in(&fx.cache), Vec::<PathBuf>::new());
 }
 
+/// W8b: the private preview copies' root an older sopen made (`<cache>/.preview`) is swept when
+/// a browser window opens — the folders of windows that are gone, then the root itself, empty.
+#[test]
+fn w8b_a_legacy_preview_root_is_swept_when_the_browser_opens() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = std::fs::canonicalize(tmp.path()).unwrap().join("root");
+    tree(&root);
+    let cache = tmp.path().join("cache");
+    let legacy = cache.join(".preview");
+    // A window of an older sopen that is gone: its folder, a copy in it, and its lock, free.
+    std::fs::create_dir_all(legacy.join("0a1b2c3d4e5f")).unwrap();
+    std::fs::write(legacy.join("0a1b2c3d4e5f/0.png"), b"left behind").unwrap();
+    std::fs::write(legacy.join("0a1b2c3d4e5f.lock"), b"").unwrap();
+    let b = Browser::new(Start {
+        fs: Box::new(LocalFs::new()),
+        connect: local_connect(),
+        label: None,
+        destination: None,
+        abs: root.to_str().unwrap().to_string(),
+        cache: cache.clone(),
+        state_dir: tmp.path().join("state"),
+        launch: Arc::new(|_: &str, _: bool| Ok(String::new())),
+    });
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while legacy.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the legacy root stayed"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    drop(b);
+}
+
+/// 06 §7.3 for a local image (the memory line "applies to local images too"): one too large to
+/// decode without asking shows the memory line with Hex view in the browser, and H shows the
+/// file's bytes, read in place.
+#[test]
+fn w8b_a_local_image_too_large_to_decode_asks_and_offers_hex_view() {
+    let mut fx = fixture();
+    std::fs::write(
+        format!("{}/huge.png", fx.root),
+        png_claiming(100_000, 100_000),
+    )
+    .unwrap();
+    let root = fx.root.clone();
+    fx.b.list(Some(0), root, None, None);
+    fx.settle();
+    fx.key(Key::F9);
+    fx.select("huge.png");
+    fx.key(Key::Enter);
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    while !shows(&fx, "Hex view (H)") {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no memory line with Hex view ({:?})",
+            fx.b.status.text
+        );
+        fx.drv.idle(&mut fx.b, 1);
+    }
+    assert!(shows(&fx, "decoding this image needs"), "the memory line");
+    fx.key(Key::H);
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    while fx
+        .drv
+        .find_text("89 50 4E 47 0D 0A 1A 0A  00 00 00 0D 49 48 44 52")
+        .is_none()
+    {
+        assert!(std::time::Instant::now() < deadline, "no hex rows");
+        fx.drv.idle(&mut fx.b, 1);
+    }
+    assert!(fx.b.viewer.is_some());
+}
+
 /// W8b at the browser's Enter over real SFTP, by the fixture's count: a 2 GiB remote image
 /// (sparse, a PNG header at its front) shows its window and its memory line having read its
 /// header's block — nothing read whole (the budget is nothing), one session. H then shows its
@@ -1592,9 +1666,11 @@ fn a_video_opens_in_the_media_window_and_esc_leaves_it() {
     assert!(!fx.drv.closed());
 }
 
-/// Enter on a remote file ffprobe cannot read (an empty `.mp4`): the status row says so about
-/// the file as its owner knows it, `host:/abs` — never about the URL of the byte server
-/// ffprobe read it through. From the list (dual mode: no preview) and from the preview's card.
+/// Enter on a remote `.mp4` that does not open: the status row says why about the file as its
+/// owner knows it, `host:/abs`, named once — never the URL of the byte server ffprobe read it
+/// through, nor a cache copy. An empty one is said to be empty (the byte server has no range of
+/// it to serve, and its words are not shown); one that is not a video is what ffprobe said of
+/// it. From the list (dual mode: no preview) and from the preview's card, which says the same.
 /// Needs ffmpeg (skips without it, unless `SOPEN_REQUIRE_FFMPEG` is set).
 #[test]
 fn a_remote_file_that_fails_to_open_is_named_as_host_abs_never_as_its_cache_copy() {
@@ -1605,35 +1681,60 @@ fn a_remote_file_that_fails_to_open_is_named_as_host_abs_never_as_its_cache_copy
         eprintln!("skipping: {e}");
         return;
     }
+    let files: [(&str, Vec<u8>); 2] =
+        [("k_zero.mp4", Vec::new()), ("k_junk.mp4", vec![0x55; 4096])];
     for mode in [view::Mode::Dual, view::Mode::Preview] {
-        let mut fx = fixture_with(Some("box"), local_connect(), None);
-        fx.b.mode = mode;
-        std::fs::write(format!("{}/k_zero.mp4", fx.root), b"").unwrap();
-        let root = fx.root.clone();
-        fx.b.list(None, root, None, None);
-        fx.settle();
-        fx.select("k_zero.mp4");
-        // The bar rests (past the 150 ms commit): in preview mode the card is on screen.
-        fx.drv.idle(&mut fx.b, 12);
-        fx.settle();
-        fx.key(Key::Enter);
-        fx.settle();
-        assert!(fx.b.viewer.is_none(), "{mode:?}: nothing to show");
-        let said = fx.b.status.text.clone();
-        assert!(fx.b.status.error, "{mode:?}: {said}");
-        let known = format!("box:{}/k_zero.mp4", fx.root);
-        assert!(
-            said.starts_with(&format!("ffprobe cannot read {known}")),
-            "{mode:?}: the file as its owner knows it: {said}"
-        );
-        let cache = std::fs::canonicalize(&fx.cache).unwrap_or_else(|_| fx.cache.clone());
-        for copy in [fx.cache.as_path(), cache.as_path()] {
-            assert!(
-                !said.contains(copy.to_str().unwrap()),
-                "{mode:?}: the cache copy is named: {said}"
-            );
+        for (name, bytes) in &files {
+            let mut fx = fixture_with(Some("box"), local_connect(), None);
+            fx.b.mode = mode;
+            std::fs::write(format!("{}/{name}", fx.root), bytes).unwrap();
+            let root = fx.root.clone();
+            fx.b.list(None, root, None, None);
+            fx.settle();
+            fx.select(name);
+            // The bar rests (past the 150 ms commit): in preview mode the card is on screen.
+            fx.drv.idle(&mut fx.b, 12);
+            fx.settle();
+            if mode == view::Mode::Preview {
+                let card = match bytes.is_empty() {
+                    true => "the file is empty (0 bytes)",
+                    false => "ffprobe cannot read",
+                };
+                assert!(shows(&fx, card), "{name}: the card");
+                for never in ["Server returned", "127.0.0.1", "http://"] {
+                    assert!(!shows(&fx, never), "{name}: the card shows {never}");
+                }
+            }
+            fx.key(Key::Enter);
+            fx.settle();
+            assert!(fx.b.viewer.is_none(), "{mode:?} {name}: nothing to show");
+            let said = fx.b.status.text.clone();
+            assert!(fx.b.status.error, "{mode:?}: {said}");
+            let known = format!("box:{}/{name}", fx.root);
+            if bytes.is_empty() {
+                assert_eq!(
+                    said,
+                    format!("{known} is empty (0 bytes): nothing to play"),
+                    "{mode:?}: the file as its owner knows it"
+                );
+            } else {
+                assert!(
+                    said.starts_with(&format!("ffprobe cannot read {known}: ")),
+                    "{mode:?}: the file as its owner knows it: {said}"
+                );
+            }
+            for never in ["Server returned", "127.0.0.1", "http://"] {
+                assert!(!said.contains(never), "{mode:?}: {said}");
+            }
+            let cache = std::fs::canonicalize(&fx.cache).unwrap_or_else(|_| fx.cache.clone());
+            for copy in [fx.cache.as_path(), cache.as_path()] {
+                assert!(
+                    !said.contains(copy.to_str().unwrap()),
+                    "{mode:?}: the cache copy is named: {said}"
+                );
+            }
+            assert_eq!(said.matches(*name).count(), 1, "{mode:?}: {said}");
         }
-        assert_eq!(said.matches("k_zero.mp4").count(), 1, "{mode:?}: {said}");
     }
 }
 

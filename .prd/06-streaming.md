@@ -635,8 +635,7 @@ large files.
 - **W8a routes remote text of at most 16 MiB through a Source** (§13), where W5a's index is
   whole — in the browser, on Enter and in the preview: those are the text viewer's only routes.
   `sopen host:/file.txt` on its own still hands the file to VS Code or Zed (01 §3, §1's last
-  bullet). A remote text file over 16 MiB is still fetched whole, as today, until W5b: W8b
-  routes it through a Source then.
+  bullet). A remote text file over 16 MiB goes through a Source too since W8b, on W5b's index.
 
 **W5a must fix (found in X3, 2026-11-21).** Five defects in today's text viewer, each answered by a
 rule above:
@@ -814,7 +813,8 @@ the page and drop the queued keys.
       segment, still fails in the decoder.
     - A SOF that zune-jpeg cannot decode (any type but C0, C1, C2, or a precision other than 8:
       arithmetic, 12-bit, lossless) is reported at once with its type and size, and the file is
-      not streamed for a decode. Hex view stays offered once W8b brings it.
+      not streamed for a decode: the image window gives way to the hex window on the same
+      stream, the reason first in its rows (below).
   - **PNG, GIF, BMP, WebP:** the header is at the start (PNG's IHDR at byte 16; WebP's
     VP8/VP8L/VP8X chunk first). The decoder from `ImageReader::into_decoder` reads it, a 64 KiB
     block at a time, and gives the dimensions and the colour type it produces. A PNG's header
@@ -867,12 +867,19 @@ the page and drop the queued keys.
     - The asking path (`Doc::decode_asking`: the memory line and Continue) raises that limit to
       the need + 512 MiB once the owner continues.
     - `Doc::decode` and `Doc::decode_checked` ask nothing and keep the crate's limit.
-- **Hex view, and the hex view for a file that does not decode**, are new. Today a decode error is a
-  status-row error in the browser (`prepare`, then `browser.rs`). The standalone route opens the hex
-  window only for `--hex`, the binary dialog and a `.ts` file (`main.rs`).
-  - Switching an open image to the hex window needs `browser.rs` and `main.rs`, so **W8b** brings
-    Hex view and the fallback.
-  - Until then, Hex view is not offered, and a decode failure keeps today's error row.
+- **Hex view, and the hex view for a file that does not decode.** The memory line offers Hex view
+  (H), which shows the file's bytes in the hex window — in the browser, and in a window of its
+  own, which becomes the hex window in place (as the binary dialog does). A file that does not
+  decode opens in the hex window the same way, its reason the first of the window's rows.
+  - A remote file's hex window reads the same stream: nothing is read again, and the stats line
+    has one `first` for the open.
+  - A local file's reads the file in place. A local image whose decode must be asked about opens
+    at the memory line in the browser too, as it does in a window of its own: one rule decides
+    for both (`image::decode_unless_asking`, the decoder's header before any pixel memory).
+  - A local image decoded without asking that fails is shown as bytes in the browser; in a window
+    of its own it is an error, as before W8b.
+  - Only a live stream gives way: a stream that changed or failed while the image was read is
+    what failed, and that is said as before.
 - **Then the whole file streams** into memory through a Bulk reader, with progress and Esc. Esc stops
   the reader and keeps nothing. The read hashes as it goes, so 01 §5's SHA-256 baseline comes out
   of it, as today's fetch gives it. No cache copy is made.
@@ -1629,10 +1636,10 @@ stream <event> t=<ms> <host:/abs> fetched=<b> demand=<b> prefetch=<b> bulk=<b> d
 - **V15. Image header limits.**
   - A JPEG with a 64 KB Exif APP1 and an ICC segment before its SOF shows its size and thumbnail
     having fetched ≤ 1 MiB.
-  - A PNG whose header claims 100000×100000 shows the memory line with Continue and Close, having
-    fetched ≤ 64 KiB, and Continue proceeds (W6). Once W8b lands, the line also offers Hex view,
-    which switches to the hex window, and a file that does not decode opens in the hex window; until
-    then it keeps today's error row (W8b's gate).
+  - A PNG whose header claims 100000×100000 shows the memory line with Continue, Hex view and
+    Close, having fetched ≤ 64 KiB; Continue proceeds (W6), and Hex view switches to the hex
+    window on the same stream, nothing read again; a file that does not decode opens in the hex
+    window (W8b's gate).
 - **V16. Video, `moov` at the end** (123 MB, remote; gates on `local_server()` with a `lavfi`
   fixture of the same shape).
   - **Playback gate**, read once per start, when the player is dropped (each term is that
@@ -1830,17 +1837,21 @@ are in [`streaming/loop.md`](streaming/loop.md).
 needed for hex or for text that fits W5a's index: so W8a routes those now, and W8b keeps what
 needs the later units.
 
-**Which route opens what as a stream (W8a).**
+**Which route opens what as a stream (W8a and W8b).**
 
-| Route | What the hex window shows (any size) | Text of at most 16 MiB | Text over 16 MiB | Image, video, audio |
+| Route | What the hex window shows (any size) | Text of any size | Image | Video, audio |
 |---|---|---|---|---|
-| the browser's Enter or F3 on a remote file | stream | stream | fetched whole (until W5b) | fetched whole (W8b) |
-| the browser's preview of a remote file | stream | stream | private copy up to 32 MiB, else the info card | image, video, audio: private copy up to 32 MiB, else the info card (W8b lifts it) |
-| standalone `sopen host:/file` | the dialog; its "Open in hex editor" streams | VS Code or Zed, which read it their own way (01 §3): sopen streams nothing | the same | fetched whole (W8b) |
+| the browser's Enter or F3 on a remote file | stream | stream (W5b's index past 16 MiB) | stream: the header, then the file read whole into memory; Hex view on the same stream | stream, through the byte server's URLs; a `.ts` ffprobe does not read as media is the hex window on the same stream |
+| the browser's preview of a remote file | stream | stream | stream, read whole: over 32 MiB the info card from the stat, over 64 megapixels the card from the header | stream: the first frame, or the waveform's first 10 minutes, whatever the file's size |
+| standalone `sopen host:/file` | the dialog; its "Open in hex editor" streams | VS Code or Zed, which read it their own way (01 §3): sopen streams nothing | stream, in a window of its own that becomes the hex window in place | stream; a `.ts` ffprobe does not read as media goes to the dialog |
 | the binary dialog's Enter, `SOPEN_CHOICE=hex` | stream | — (the dialog is for files of no other kind) | — | — |
 | `--hex SOURCE`, any kind of file | stream | stream, as bytes in the hex window | stream, as bytes in the hex window | stream, as bytes in the hex window |
 
-A local file is read in place by every route and never gets a stream.
+A local file is read in place by every route and never gets a stream. Esc during the browser's
+open of a remote video or sound stops its probe (ffprobe is killed, not waited for); the
+standalone route opens before its window shows, with nothing to press Esc in. An empty remote video or sound
+is said to be empty. Without a display, and with no scripted save or export, the standalone route
+still fetches the file and prints its path (nothing to stream to).
 
 Why ED6 comes before W8b: PR #15's Save refuses a URL input (`media/file.rs`), and its background hash
 skips remote files. If W8b routed remote media through a Source first, remote media Save would break
@@ -1884,25 +1895,25 @@ are not disjoint, and are sequenced instead.
   to the dispatcher, never resolved by dropping the other side.
 - **The preview** (02 §4, merged with PR #17) stays the browser's contract. Streaming changes three
   things in it, written into 02 §4.3–§4.5 in the same PR as the code, with S1's tests they change.
-  **W8a does this for text and for what the hex window shows; W8b for images and media**, whose
-  previews read a private copy until then (an image; a video or a sound, since S1-M).
+  **W8a did this for text and for what the hex window shows; W8b for images and media**: no
+  remote preview reads a private copy any more.
   02 §4.3 already foresaw the first: "with streaming (another workstream), only the byte ranges
   the preview shows, never more than 32 MiB".
-  1. **The read.** A remote preview read into a private copy, `<cache>/.preview/<window>/<n>`.
-     A streamed one reads through a Source on the window's one preview session, which becomes that
-     Source's `Ranged`.
+  1. **The read.** A remote preview reads through a Source on the window's one preview session,
+     which becomes that Source's `Ranged` (it was read into a private copy,
+     `<cache>/.preview/<window>/<n>`, before W8a and W8b).
      - The 32 MiB budget is no longer a gate on the file's size for a streamed preview. So a large
-       remote binary previews its first rows (W8a), and a large remote video will preview its
-       first frame (W8b; 02 §4.3: "Lifting that limit belongs to the streaming workstream").
-       - A file whose preview is still read whole keeps the gate, decided from the stat and its
-         name, with nothing read. A file over the budget whose name does not say its kind is
+       remote binary previews its first rows (W8a), and a large remote video previews its first
+       frame (W8b; 02 §4.3: "Lifting that limit belongs to the streaming workstream").
+       - An image, whose preview is still read whole (through its stream, into memory: its
+         decode needs every byte), keeps the gate, decided from the stat and its name, with
+         nothing read. A file over the budget whose name does not say its kind is
          sniffed first (at most 8 KiB), since only its kind says whether it streams.
        - What a streamed preview fetches is bounded by what it shows: one block for hex rows; for
          text the first block and its index pass, 4 MiB in all. Both are far under 32 MiB.
      - The other budgets are unchanged: 4 MiB of text index, 64 Mpx of image, 5 s and 10 minutes.
      - Nothing is written to disk. A local file is still read in place.
-     - Remote text over 16 MiB is not streamed before W5b (§7.2): its preview and its Enter keep
-       the private copy and the whole fetch, and over 32 MiB it is the info card.
+     - Remote text over 16 MiB streams too since W8b, on W5b's index (§7.2).
   2. **The hand-over.** Enter on a previewed remote file moves the Source to the viewer, with its
      cache, its readers and its session.
      - No byte is read twice. P6 and P12 then assert the reads' ranges and `fetched`, not a hard
@@ -1912,9 +1923,11 @@ are not disjoint, and are sequenced instead.
      - The window opens a new preview session at its next remote preview. There is still at most one
        preview session at a time (with item 3's one exception); the one handed over now counts as
        the viewer's, and closing that viewer closes it — it is not given back to the window.
-     - 02 §4.4's placeholder `Origin` stays for a viewer that read a copy, with its preview
-       connection's answers; a streamed viewer's answers yes until its first use (§2).
-     - The `.preview` root goes when nothing uses it (W8b: images use it until then).
+     - 02 §4.4's placeholder `Origin` carries the preview connection's answers for an image's
+       viewer, whose stream closed when its read ended; a viewer that keeps its stream answers
+       yes until its first use (§2).
+     - The `.preview` root is gone (W8b). One an older sopen left is swept when a browser window
+       opens (02 §4.4).
   3. **A cancelled preview** (the bar moves on) gives the connection back: its `Ranged` closes its
      handle and returns the session (`into_connection()`), and the next preparation takes it — as
      its own `Ranged` when that preview streams, which is what `reopen(path)` is. So the window

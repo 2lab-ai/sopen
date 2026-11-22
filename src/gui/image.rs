@@ -1557,15 +1557,9 @@ fn decoded_or_asking(
     notices: Vec<String>,
     budget: u64,
 ) -> Result<Start> {
-    let asks = |need: u64, size: (u32, u32)| -> Result<()> {
-        match probe::ask_decode(need, size, budget) {
-            Some(_) if !hooks.autosave => Err(anyhow!(Asks)),
-            _ => Ok(()),
-        }
-    };
-    match Doc::decode_asking(file.original(), &|| Ok(()), &asks) {
-        Ok(doc) => Ok(Start::Decoded(Box::new((file, doc, notices)))),
-        Err(e) if e.is::<Asks>() => {
+    match decode_unless_asking(file.original(), budget, !hooks.autosave)? {
+        Some(doc) => Ok(Start::Decoded(Box::new((file, doc, notices)))),
+        None => {
             let ImageFile {
                 origin,
                 original,
@@ -1574,9 +1568,31 @@ fn decoded_or_asking(
             } = file;
             let bytes = Arc::try_unwrap(original).unwrap_or_else(|shared| (*shared).clone());
             let input = Input::Bytes(bytes);
-            let window = Streaming::new(input, origin, &cache_root, hooks, notices, budget)?;
+            // A local file's memory line offers Hex view too: the file, read in place.
+            let switch = origin
+                .is_local()
+                .then(|| HexSwitch::local(PathBuf::from(&origin.abs)));
+            let window = Streaming::new(input, origin, &cache_root, hooks, notices, budget)?
+                .switching(switch);
             Ok(Start::Asking(Box::new(window)))
         }
+    }
+}
+
+/// The decode of `bytes`, or `None` when it must be asked about first (06 §7.3: what it needs
+/// is over `budget`, and `ask` — there is a window to ask in): the decoder says so from the
+/// header, before any memory is reserved for the pixels. One rule for every local image, in a
+/// window of its own and in the file browser.
+pub fn decode_unless_asking(bytes: &[u8], budget: u64, ask: bool) -> Result<Option<Doc>> {
+    let asks = |need: u64, size: (u32, u32)| -> Result<()> {
+        match probe::ask_decode(need, size, budget) {
+            Some(_) if ask => Err(anyhow!(Asks)),
+            _ => Ok(()),
+        }
+    };
+    match Doc::decode_asking(bytes, &|| Ok(()), &asks) {
+        Ok(doc) => Ok(Some(doc)),
+        Err(e) if e.is::<Asks>() => Ok(None),
         Err(e) => Err(e),
     }
 }
@@ -4283,15 +4299,18 @@ fn decode_loaded(bytes: Vec<u8>, sha256: Option<[u8; 32]>, load: &Arc<Load>) -> 
     })
 }
 
-/// Where an image window that reads a stream gives way to the hex window (06 §7.3): Hex view on
-/// the memory line, or a file that does not decode. The window leaves the hex window's file
-/// here — on the same stream, nothing read again — and whoever hosts it (the file browser, or
-/// [`open_stream`]'s own window) shows the hex window in its place after that pass.
+/// Where an image window gives way to the hex window (06 §7.3): Hex view on the memory line, or
+/// a file that does not decode. The window leaves the hex window's file here — a remote one on
+/// the same stream, nothing read again; a local one read in place — and whoever hosts it (the
+/// file browser, or [`open_stream`]'s own window) shows the hex window in its place after that
+/// pass.
 #[derive(Clone)]
 pub struct HexSwitch {
     /// What the stream was opened to wake ([`super::hex::Repaint::waker`]): the hex window binds
     /// its context to it.
     repaint: super::hex::Repaint,
+    /// A local file's path: its hex window reads it in place.
+    local: Option<PathBuf>,
     wanted: Arc<Mutex<Option<GivenWay>>>,
 }
 
@@ -4304,6 +4323,16 @@ impl HexSwitch {
     pub fn new(repaint: super::hex::Repaint) -> Self {
         Self {
             repaint,
+            local: None,
+            wanted: Arc::default(),
+        }
+    }
+
+    /// For a local file at `path`, which the hex window reads in place.
+    pub fn local(path: PathBuf) -> Self {
+        Self {
+            repaint: Default::default(),
+            local: Some(path),
             wanted: Arc::default(),
         }
     }
@@ -4417,7 +4446,7 @@ impl Streaming {
     /// The window gives way to the hex window through `switch` (06 §7.3) — a stream's only: the
     /// stream is what the hex window reads.
     fn switching(mut self, switch: Option<HexSwitch>) -> Self {
-        self.switch = switch.filter(|_| self.source.is_some());
+        self.switch = switch.filter(|s| self.source.is_some() || s.local.is_some());
         self
     }
 
@@ -4446,8 +4475,11 @@ impl Streaming {
             .source
             .as_ref()
             .is_some_and(|s| s.state().status().is_none());
-        let switch = self.switch.take().filter(|_| live || why.is_none());
-        let Some(switch) = switch.filter(|_| self.source.is_some()) else {
+        let switch = self.switch.take().filter(|s| match &self.source {
+            Some(_) => live || why.is_none(),
+            None => s.local.is_some(),
+        });
+        let Some(switch) = switch else {
             if let Some(why) = why {
                 self.fail(ctx, why);
             }
@@ -4456,16 +4488,22 @@ impl Streaming {
         // The loader stops (a read it waits on is woken); the stream goes on, as the hex
         // window's.
         self.stop();
-        let (Some(source), Some((origin, cache_root, mut notices))) =
-            (self.source.take(), self.parts.take())
-        else {
+        let Some((origin, cache_root, mut notices)) = self.parts.take() else {
             return;
         };
         if let Some(why) = why {
             notices.insert(0, format!("{why}; the file is shown as bytes"));
         }
-        let file =
-            super::hex::HexFile::streamed(origin, source, switch.repaint.clone(), &cache_root);
+        let file = match (self.source.take(), &switch.local) {
+            (Some(source), _) => {
+                super::hex::HexFile::streamed(origin, source, switch.repaint.clone(), &cache_root)
+            }
+            (None, Some(path)) => match super::hex::Base::open_as(path, &origin.display()) {
+                Ok(base) => super::hex::HexFile::new(origin, base, None, &cache_root),
+                Err(e) => return self.fail(ctx, format!("{e:#}")),
+            },
+            (None, None) => return,
+        };
         *switch.wanted.lock().unwrap_or_else(|p| p.into_inner()) = Some((file, notices));
         ctx.request_repaint();
     }
@@ -4916,6 +4954,39 @@ impl super::Window for Switching {
             .unwrap_or_else(|p| p.into_inner())
             .clone()
     }
+}
+
+/// [`embed`] for a local image whose decode must be asked about first (06 §7.3: the memory line
+/// "applies to local images too"): the window asks — Continue, Hex view, Close — then decodes
+/// on a worker of its own and becomes the image window. `switch` (a [`HexSwitch::local`] of the
+/// file) is where it gives way to the hex window: Hex view, or a file that does not decode.
+pub fn embed_asking(
+    file: ImageFile,
+    notices: Vec<String>,
+    switch: Option<HexSwitch>,
+) -> Result<super::Embedded> {
+    let ImageFile {
+        origin,
+        original,
+        cache_root,
+        ..
+    } = file;
+    let bytes = Arc::try_unwrap(original).unwrap_or_else(|shared| (*shared).clone());
+    let hooks = Hooks::default();
+    let window = Streaming::new(
+        Input::Bytes(bytes),
+        origin,
+        &cache_root,
+        &hooks,
+        notices,
+        probe::BUDGET,
+    )?
+    .switching(switch);
+    let (outcome, leftover) = (window.outcome.clone(), window.leftover.clone());
+    Ok(super::Embedded {
+        window: Box::new(window),
+        settle: Box::new(move |wait| settle(&leftover, &outcome, wait)),
+    })
 }
 
 /// [`embed`] for an image read through `source` (06 §7.3): the window to host while the file
