@@ -30,7 +30,7 @@ pub const FORWARDED_ENV: [&str; 19] = [
     "SOPEN_CHOICE",
     "SOPEN_SAVE_TO",
     "SOPEN_SAVE_HOLD_MS",
-    // 07 §7: the hex window's Save As, where the window is.
+    // 07 §7: the hex and media windows' Save As, where the window is.
     "SOPEN_SAVE_AS",
     "SOPEN_SAVE_AS_HOLD_MS",
     "SOPEN_LIST",

@@ -6,14 +6,17 @@ tags: [sopen, spec, streaming]
 
 # 06 — Viewing a remote file as a stream
 
-Status: planned (2026-11-20). This is the contract the streaming work units (§13) build. Until each
-lands, [`01-spec.md`](01-spec.md) describes what ships; §14 lists the 01 text each unit replaces.
+Status: shipped (2026-11-23). This is the contract the code implements, not a future target: every
+work unit of §13 has merged, and [`01-spec.md`](01-spec.md) says the same (§14 lists the 01 text
+they replaced). Where this document says "today", "as today" or "before W…", it means sopen before
+the workstream (`main` 3a426b6, 2026-11-20); a unit's name (W…, ED…) says which change brought a
+rule.
 
 Editing a streamed file is [`07-streaming-edit.md`](07-streaming-edit.md). The measurements behind
 both documents are in [`research/streaming-view.md`](research/streaming-view.md) (cited as *view*
 §n) and [`research/streaming-edit.md`](research/streaming-edit.md) (*edit* §n). The target is fixed
 in [`streaming/ssot.md`](streaming/ssot.md). Code citations name functions. Where a line number is
-given, it is at `main` 3a426b6, and the branches that land first will move it (§13).
+given, it is at the commit named beside it, else at `main` 3a426b6; later changes have moved some.
 
 **Reference rig.** Every time and rate quoted here comes from one link: a remote on a mesh VPN,
 ICMP RTT 12–40 ms, 2–10 MB/s, OpenSSH 10.5p1 `sftp-server` reading from tmpfs (*view* §2.1). Byte
@@ -46,7 +49,7 @@ The first two paragraphs are this document. The third is 07.
   waveform, an index pass the owner asked for, and the edit actions of 07. The cancel is ssot's
   fixed scope, the workstream's reading of message 17, not its words ([`streaming/ssot.md`](streaming/ssot.md)).
 - **Viewing writes nothing to disk.** No cache copy is made for viewing a remote file (§10).
-- **Local files keep reading in place** as today (01 §3a). No stream is created for them (§12 V17).
+- **Local files are read in place** (01 §3a). No stream is created for them (§12 V17).
 - **Text sent to VS Code or Zed is unchanged.** Message 17 is about sopen's own viewers; the
   editors read remote files their own way (01 A2).
 
@@ -463,8 +466,8 @@ The owner's 24 GB model file lands here: `.safetensors`, `.gguf` and `.bin` are 
 - **Reads.** `Pages` keeps its 4 KiB pages and its 64-page LRU, now read through `Bytes`.
   - A page that has not arrived is **Pending**, not empty. Its rows show `··` in the skin's dim
     colour, the status row says `loading 0x…`, and the frame repaints when it arrives.
-  - A page that failed is the status row's `Failed` text and is retried. Today a failed read is held
-    as an empty page (`Pages::byte`) and shows as nothing.
+  - A page that failed is the status row's `Failed` text and is retried. Before W4 a failed read was
+    held as an empty page (`Pages::byte`) and showed as nothing.
   - **The stream's warning stays on screen** for as long as its state is `Replaced`, `Changed` or
     `Failed` (§5): whole, with its reload hint, in the rows below the grid, where the window's
     notices go. The status row is one line and is cut to the window's width; it keeps the
@@ -487,9 +490,9 @@ The owner's 24 GB model file lands here: `.safetensors`, `.gguf` and `.bin` are 
   the edit was typed. So an edit is made only where the page is present.
   - So `changed`, `differ`, `changed_count`, `dirty` and `unsaved` compare a patch with its own
     replaced byte and never read the file.
-  - This fixes a bug in today's code. Those functions read the file's byte for every patch, through
-    a synchronous `read_exact_at` on the frame thread, and count a byte that cannot be read as
-    changed. Over a stream that would block a frame or misreport.
+  - This fixed a bug in the code before W4. Those functions read the file's byte for every patch,
+    through a synchronous `read_exact_at` on the frame thread, and counted a byte that could not be
+    read as changed. Over a stream that would block a frame or misreport.
   - **A key on a byte whose page is not present changes nothing**, and the status row says
     `0x… is still loading`. The page need not be the screen's: the cursor can be left behind by the
     wheel on a page since dropped from the page cache. The key brings the cursor's row back on
@@ -499,31 +502,22 @@ The owner's 24 GB model file lands here: `.safetensors`, `.gguf` and `.bin` are 
 - **Reload** (Cmd/Ctrl+R, §5) is refused while edits are saved nowhere. Otherwise it drops the
   edits and the undo and redo steps, and clamps the offset to the new size. The key is the window's
   only when it reads through a stream; a file read in place leaves it to the browser.
-- **Save until 07 lands (interim).** Save and Save copy of a streamed file first fetch the whole
-  file into the cache exactly as today's fetch does: claimed, recorded, pipelined (§2), with
-  progress on the status row and Esc to stop. Today's Save then runs on that copy.
-  - The fetch must equal `Source::opened()`. A different `(size, mtime)` is refused as a change.
-  - Its SHA-256 is 01 §5's baseline, as today.
-  - **Whether the server can replace a file** is asked here, at the `Origin`'s first use (§2),
-    before the fetch.
-  - **Closing during the fetch stops it.** Nothing has been written yet, so the window does not
-    wait for the fetch as it waits for a write: the fetch is stopped, and closing then asks about
-    the edits as it would with no save running.
-  - 07 replaces this with its Save, which fetches nothing. It is the only whole fetch the hex window
-    makes of a version it opened: after Cmd/Ctrl+R the copy fetched is of the version before, so
-    the next Save fetches the reloaded one and backs it up first.
+- **Save** of a streamed file is 07's (§4): the server copy or the streamed rewrite on the
+  viewer's `Origin`, which fetches nothing of the file. Whether the server can replace a file is
+  asked at the `Origin`'s first use (§2). The interim Save W4 shipped — the whole file fetched into
+  the cache, then the old Save on that copy — went with ED4.
 
 ### 7.2 Text (the browser's text viewer)
 
-Today the text viewer keys everything by line number, and every read blocks:
+Before W5a and W5b the text viewer keyed everything by line number, and every read blocked:
 - `TextDoc`'s marks and line count;
 - `read_lines` and the highlight worker's own `File`;
 - `TextWindow`'s top line;
 - wrap's `Pos { line, off }`, its `Row` and its memos (PR #14, merged: `src/gui/text/wrap.rs`).
 
-One pass indexes the whole file at open. So the work is split in two units (§13): W5a makes reads
-streamable for files of any size it already handles, and W5b removes the line-number keying for
-large files.
+One pass indexed the whole file at open. So the work was split in two units (§13): W5a made reads
+streamable for files of any size it already handled, and W5b removed the line-number keying for
+large files. What follows is the contract both left.
 
 **W5a — reads through `Bytes`, first screen first.**
 
@@ -570,8 +564,8 @@ large files.
       gutter leaves fewer columns. 12,000 lines of 312 KB get 6 digits through a Source and 5
       locally. Rows compare one for one only where no line wraps.
   - **A failed read leaves no bytes behind.** The read window is filled into a fresh buffer; a
-    Pending or failed read keeps the old window. Today's code resizes first, and showed zeros as
-    file bytes.
+    Pending or failed read keeps the old window. The code before W5a resized first, and showed
+    zeros as file bytes.
   - **The syntax is picked by first line when the first block arrives,** in the pass that shows the
     first screen, not at construction.
   - **The highlight worker reads through a `Reader` of its own on the same Source, with the blocking
@@ -619,26 +613,27 @@ large files.
     work as today.
   - A local file keeps today's whole-file pass, which runs before its first screen. With a 16 MiB
     index and no W5b, X3's viewer showed the first 16 MiB of a 1 GiB file as the whole file: End
-    went to byte 16,775,028 and the status row said `line 1 of 1`. So no file over 16 MiB is read
-    through a capped index before W5b.
+    went to byte 16,775,028 and the status row said `line 1 of 1`. So no file over 16 MiB was read
+    through a capped index before W5b (Tensions: a local file keeps its whole-file pass).
 - **Highlighting runs over the indexed prefix as it grows.** A page whose lines all lie in the
   prefix is highlighted, with state carried from byte 0; a page past it shows plain until the prefix
   reaches it.
   - This is what 02 §4.2's preview already does under its 4 MiB cap, so a 4–16 MiB remote text file
     previews highlighted too.
-  - Files over 16 MiB stay plain past the first 16 MiB, as today's rule says for the whole file.
+  - A file over 16 MiB is plain past its first 16 MiB, read through a Source or in place alike
+    (Tensions). Before W5b such a file was plain throughout.
 - **Change.** A remote file follows §5. `Changed` freezes the page and offers Cmd/Ctrl+R. `Replaced`
   keeps showing the version opened. A remote file is still not followed like `tail -f`. Local files
   keep `TextDoc::now`'s rules (01 §3a).
-- **Stats events.** W5a emits `first` (§11) only. `input` and `ready` for jumps (End, a place
-  opened at, Go to) are W5b's, with V12's `ready − input` qualification.
-- **W8a routes remote text of at most 16 MiB through a Source** (§13), where W5a's index is
-  whole — in the browser, on Enter and in the preview: those are the text viewer's only routes.
-  `sopen host:/file.txt` on its own still hands the file to VS Code or Zed (01 §3, §1's last
-  bullet). A remote text file over 16 MiB goes through a Source too since W8b, on W5b's index.
+- **Stats events.** `first` (§11), and `input` and `ready` for jumps (End, a place opened at,
+  Go to), with V12's `ready − input` qualification.
+- **Remote text of any size goes through a Source** (§13: W8a for at most 16 MiB, where W5a's
+  index is whole, W8b past that, on W5b's index) — in the browser, on Enter and in the preview:
+  those are the text viewer's only routes. `sopen host:/file.txt` on its own still hands the file
+  to VS Code or Zed (01 §3, §1's last bullet).
 
-**W5a must fix (found in X3, 2026-11-21).** Five defects in today's text viewer, each answered by a
-rule above:
+**What W5a fixed (found in X3, 2026-11-21).** Five defects in the text viewer before W5a, each
+answered by a rule above:
 
 1. **Zeros shown as file bytes.** `Window_::at` resizes its buffer before the read. A failed read
    leaves the zero-filled buffer in the wrap memo, and the next read is served from it.
@@ -899,10 +894,10 @@ the page and drop the queued keys.
   | WebP, TIFF, GIF, BMP | not measured | the thumbnail or the size line until complete. A measurement may add them later; nothing is promised for them here. |
 
   - A preview decode needs the whole buffer, so it runs only within the budget or after Continue.
-  - The plain-PNG row reader is the `png` crate's own API. `png` is only a transitive dependency
-    today, so W6 adds it to `Cargo.toml` at the version the lock already has (0.18.1).
-- **Once complete**, the decoded image, its edits and Save are today's: the full bytes are in memory
-  (07 §8).
+  - The plain-PNG row reader is the `png` crate's own API. `png` was only a transitive dependency
+    before W6, which added it to `Cargo.toml` at the version the lock already had (0.18.1).
+- **Once complete**, the decoded image and its edits are as before streaming, and its Save is 07
+  §8's: the full bytes are in memory.
 
 ### 7.4 Audio and video
 
@@ -917,7 +912,8 @@ to every run on the file: the probe, playback, the paused frame, the waveform, S
 
   The file name stays last, so ffmpeg still sees its extension. A local file's `Input` is its path,
   as today.
-- **The `.ts` refine** (`kind::refine_local`) probes the `play` URL.
+- **The `.ts` refine** (`kind::refine_input_until`, the URL form of `kind::refine_local`) probes the
+  `play` URL; in the browser's open, Esc stops it.
 - **`Input` carries its own input options.** Each `Input` holds the options that must precede its
   `-i`, and emits them there. So every remote input, each group input of PR #15's `edit_args`
   included, gets `-protocol_whitelist http,tcp`. mp3 `play` inputs with a LAME `Info` tag (below) also get
@@ -1028,18 +1024,18 @@ to every run on the file: the probe, playback, the paused frame, the waveform, S
         was waited for are counted first.
     - **Playback:** dropping the player kills and reaps its decoders (`kill_all` and `Reaped` in
       `src/gui/playback.rs`). Pause, a seek and closing the window all drop it.
-    - **The paused frame:** its budget, 5 s for one frame today (`SCRUB_BUDGET` in
-      `src/gui/media.rs`), after which its ffmpeg is killed and reaped. W7 keeps it for a URL.
-    - **A probe** has no deadline today: `ffmpeg::probe` waits for ffprobe to exit. W7 adds one,
-      **30 s**, after which ffprobe is killed and reaped and the probe fails with the Source's
-      state. This covers the window's probe and the `.ts` refine. The 30 s are a choice, not a
+    - **The paused frame:** its budget, 5 s for one frame (`SCRUB_BUDGET` in
+      `src/gui/media.rs`), after which its ffmpeg is killed and reaped, for a URL as for a path.
+    - **A probe** has a deadline, **30 s** (`ffmpeg::PROBE_LIMIT`; before W7 `ffmpeg::probe` waited
+      for ffprobe to exit), after which ffprobe is killed and reaped and the probe fails with the
+      Source's state. This covers the window's probe and the `.ts` refine. The 30 s are a choice, not a
       measurement. X1's 73 probe phases took 0.33–0.55 s unthrottled and 0.57–1.84 s
       throttled, the slowest at 0.7 MB/s; each figure includes about 0.3 s the harness waits
       for the stream to go idle.
     - The waveform reads a `bulk` URL, which keeps the 60 s rule.
     - A run W7 adds on a `play` or `render` URL gets an owner of one of these kinds.
   - **The cut account is what catches a missing piece.** In every damaged output above ffmpeg
-    exited 0, and today's `cut::render_edit` returned `Ok`. **W7's rule:** it reads
+    exited 0, and `cut::render_edit` before W7 returned `Ok`. **W7's rule:** it reads
     `Server::cuts(Render)` before and after every ffmpeg run of a render (each pass of a render in
     passes), and fails the render if the count went up, whatever ffmpeg's status (§9).
   - Each reader keeps a floor of 256 KiB ahead and 64 KiB behind, whatever the share. So 64 readers
@@ -1119,17 +1115,17 @@ to every run on the file: the probe, playback, the paused frame, the waveform, S
   (01 §7: a render under `<cache>/.exports`, then a new sibling, never over anything). Its
   progress is ffmpeg's time-based progress.
 - **Export can be cancelled.** This is **the workstream's decision**, written into ssot's fixed scope
-  (item 1: "streams with progress and can be cancelled"). It is not in message 17's own words. Today
-  an export cannot be cancelled: a close only waits. The export's progress row gets **Cancel**, and
-  Esc does the same while it runs.
+  (item 1: "streams with progress and can be cancelled"). It is not in message 17's own words. Before
+  W7 an export could not be cancelled: a close only waited. The export's progress row has **Cancel**,
+  and Esc does the same while it runs.
   - **During the render:** ffmpeg is killed, and the local render and its folder are removed.
     Nothing is uploaded.
   - **During the upload:** the upload stops, and its remote temp is removed (01 §5: only a temp this
     export created). Nothing is linked under any name.
   - **After the publishing link has landed** it is too late. The result says the sibling was
     published, and names it.
-  - Closing the window keeps today's rules (the first close waits, the second closes and sopen still
-    waits and prints the result). Only Cancel cancels: an export nobody cancelled is finished.
+  - Closing the window keeps its rules from before W7 (the first close waits, the second closes and
+    sopen still waits and prints the result). Only Cancel cancels: an export nobody cancelled is finished.
 
 ### 7.5 The binary dialog
 
@@ -1197,11 +1193,10 @@ None blocks a window before it shows.
 | Action | Reads | Progress | Cancel |
 |---|---|---|---|
 | Image decode (§7.3) | the whole file, Bulk reader, into memory | bytes / size, with previews | Esc, or closing: the reader stops, nothing is kept |
-| Interim hex Save (§7.1, until 07) | the whole file into the cache, as today | the status row | Esc (`fetch_claimed_cancellable`), or closing: the fetch stops, then closing asks about the edits |
-| "Save to…" (§7.5) | the whole file into the private staging file | the dialog's bytes / size | **new:** Esc and closing |
+| "Save to…" (§7.5) | the whole file into the private staging file | the dialog's bytes / size | Esc, Cancel and closing (before W8a: none) |
 | Waveform (§7.4) | every byte of an audio-only file, Bulk reader | the waveform fills in | closing kills the decoder and drops its reader |
 | Text Go to past the prefix (§7.2) | from the last mark to the line | `indexing… X of Y` | Esc |
-| Media Export (§7.4) | only what the cut needs, through the URL | ffmpeg's time | **new:** Cancel and Esc, at every stage (§7.4) |
+| Media Export (§7.4) | only what the cut needs, through the URL | ffmpeg's time | Cancel and Esc, at every stage (§7.4; before W7: none) |
 | 07's Save, Save copy, Save As, media render | 07 §4–§9 | 07 | 07 |
 
 Left as whole fetches, with the fetch now pipelined (§2):
@@ -1437,7 +1432,7 @@ Left as whole fetches, with the fetch now pipelined (§2):
 | RAM, the text viewer | + its index, at most 16 MiB or 48 bytes per 64 KiB of indexed text, whichever is more: 17.6 MB for 24 GB (§7.2) |
 | RAM, the image window | the encoded bytes + the decoded pixels, as today; above 512 MiB decoded only after Continue (§7.3) |
 | Disk for viewing | **0 bytes**: nothing is created or grows under the cache directory |
-| Disk for whole-file actions | as today: the interim hex Save's cache copy (§7.1), "Save to…"'s staging file |
+| Disk for whole-file actions | "Save to…"'s and Save As's staging file (§7.5, 07 §7); a media render under `<cache>/.exports` (07 §9); the image window's local backup (07 §5.2). A hex Save of a remote file writes only its journal and undo file (07 §11) |
 | SFTP channels | 1 per remote viewer; 2 from its first Save, Save copy or Export (§6) |
 | Bytes before a hex first screen | the blocks covering the screen and its margin: one 64 KiB block at offset 0 for any window under 1 300 rows, at most two elsewhere |
 | Bytes before a text first screen | one 64 KiB block at offset 0, asked as a 1-byte demand so that no margin block comes with it (§7.2), for any file read through a Source, wrapped or not: the first screen is the rows that block supplies (§7.2); after a jump, at most 3 blocks, in one round trip when the replies are full; the background index pass comes after it |
@@ -1828,8 +1823,10 @@ stream <event> t=<ms> <host:/abs> fetched=<b> demand=<b> prefetch=<b> bulk=<b> d
 
 ## 13. Work units
 
-Each unit is one agent, one branch and one worktree (`.worktrees/<branch with dashes>`). The live
-table, with status, is [`streaming/loop.md`](streaming/loop.md). A unit's gate is AGENTS.md's
+Each unit was one agent, one branch and one worktree (`.worktrees/<branch with dashes>`). Every unit
+below has merged (the last on 2026-11-23); each one's PR and merge commit are in
+[`streaming/loop.done.md`](streaming/loop.done.md). This section is the record of how the work was
+cut and sequenced; the contract is §1–§12. A unit's gate is AGENTS.md's
 `just check`, run with `SOPEN_REQUIRE_FFMPEG=1 SOPEN_REQUIRE_SFTP_SERVER=1`, as CI runs it. A unit
 that shows something on screen also brings a screenshot receipt someone looked at.
 
@@ -1843,25 +1840,24 @@ that shows something on screen also brings a screenshot receipt someone looked a
 | W5b | **Large text files by byte position.** The prefix index, byte-offset keys in `TextWindow` and wrap, unknown line starts, Go to, the index memory bound (§7.2) | `src/gui/text.rs`, `src/gui/text/wrap.rs`, `src/gui/text/tests.rs` | W5a |
 | W6 | **Image streams.** Header walk with the SOF read directly, thumbnail, the memory line with Continue, the reserved buffer, the streamed read, partial pictures for the four measured formats (plain PNG included) | `src/gui/image.rs`, `src/gui/image/probe.rs` (new), `src/gui/image/robustness_tests.rs`; `Cargo.toml` and `Cargo.lock` (the direct `png` dependency) | W2; S1 merged; X4 |
 | W7 | **Media streams.** URL `Input`s with their own input options and reader kinds, the progressive waveform on a `bulk` connection, Export through the URL and its Cancel, runs failed on a cut response | `src/gui/media.rs`, `src/gui/media/*`, `src/gui/playback.rs`, `src/ffmpeg.rs`, `src/cut.rs` | W3; S1, PR #15 and S1-M merged; X5 |
-| W8a | **Routing, hex and text.** The hex window opens a Source instead of fetching, for a remote file of any size, on all four routes: the browser's Enter, the standalone route's dialog, the dialog's preset answer and `--hex`. The text viewer opens a Source for remote text of at most 16 MiB on the browser's Enter and preview only — standalone text still goes to the editor (01 §3), and a larger file keeps today's whole fetch until W5b; local files keep today's route (the table under "W8 is split" has every route). Both with the placeholder `Origin`, which answers `can_replace` without connecting at open (§2); the preview change below for text and hex, with its 02 §4.3–§4.4 text and S1's tests it changes; "Save to…" cancel; `bytes_fetched`; forwarding §11's hooks; ssh's stderr kept for a failed start (§6, V10 at open); the `Window` trait gains a shown / hidden call (`set_shown`) and the browser calls `Source::set_visible` through it, so a preview it holds but does not draw does not poll (§5); one preview-index constant for text — the route passes `prepare.rs`'s `text: 4 << 20` to the viewer, and `text.rs`'s own `PREVIEW_INDEX` (W5a's copy of it) goes | `src/gui/streamed.rs` (new: the route's open, its transport's count and give-back), `src/gui/browser/prepare.rs`, `src/gui/browser/prepare/tests.rs` (P3, P4, P6 and P12's remote parts), `src/gui/browser/preview.rs` (the hand-over, the give-back, shown / hidden), `src/gui/browser.rs` (the refusal line, a stream is not followed), `src/gui/browser/tests.rs`, `src/gui/browser/tests/s1.rs`, `src/gui/binary.rs`, `src/gui/binary/tests.rs`, `src/main.rs`, `src/kind.rs` (the sniff's bytes), `src/usage.rs`, `src/forward.rs`, `src/gui/mod.rs` (`Origin::placeholder`, `Window::set_shown`), `src/gui/hex.rs` and `src/gui/text.rs` (`set_shown`; `text.rs` also the preview index), their stream tests, `src/remote/sftp.rs` (`start_sftp`'s stderr), `tests/cli.rs`, `.prd/02-architecture.md` (§4.3–§4.5) | W4 and W5a; S1 merged |
+| W8a | **Routing, hex and text.** The hex window opens a Source instead of fetching, for a remote file of any size, on all four routes: the browser's Enter, the standalone route's dialog, the dialog's preset answer and `--hex`. The text viewer opens a Source for remote text of at most 16 MiB on the browser's Enter and preview only — standalone text still goes to the editor (01 §3), and a larger file kept the old whole fetch, until W8b; local files kept their route (the table under "W8 is split" has every route). Both with the placeholder `Origin`, which answers `can_replace` without connecting at open (§2); the preview change below for text and hex, with its 02 §4.3–§4.4 text and S1's tests it changes; "Save to…" cancel; `bytes_fetched`; forwarding §11's hooks; ssh's stderr kept for a failed start (§6, V10 at open); the `Window` trait gains a shown / hidden call (`set_shown`) and the browser calls `Source::set_visible` through it, so a preview it holds but does not draw does not poll (§5); one preview-index constant for text — the route passes `prepare.rs`'s `text: 4 << 20` to the viewer, and `text.rs`'s own `PREVIEW_INDEX` (W5a's copy of it) goes | `src/gui/streamed.rs` (new: the route's open, its transport's count and give-back), `src/gui/browser/prepare.rs`, `src/gui/browser/prepare/tests.rs` (P3, P4, P6 and P12's remote parts), `src/gui/browser/preview.rs` (the hand-over, the give-back, shown / hidden), `src/gui/browser.rs` (the refusal line, a stream is not followed), `src/gui/browser/tests.rs`, `src/gui/browser/tests/s1.rs`, `src/gui/binary.rs`, `src/gui/binary/tests.rs`, `src/main.rs`, `src/kind.rs` (the sniff's bytes), `src/usage.rs`, `src/forward.rs`, `src/gui/mod.rs` (`Origin::placeholder`, `Window::set_shown`), `src/gui/hex.rs` and `src/gui/text.rs` (`set_shown`; `text.rs` also the preview index), their stream tests, `src/remote/sftp.rs` (`start_sftp`'s stderr), `tests/cli.rs`, `.prd/02-architecture.md` (§4.3–§4.5) | W4 and W5a; S1 merged |
 | W8b | **Routing, the rest.** Remote text over 16 MiB through a Source; the image → hex switch (§7.3: Hex view on the memory line, and a file that does not decode opens in the hex window); the image and media routes and their previews through a Source, with 02 §4.3–§4.4's text for them and P6's image part; the `.ts` refine over the URL; the `.preview` root removed once nothing uses it | `src/gui/browser/prepare.rs`, `src/gui/browser/preview.rs`, `src/gui/browser.rs` (the hex switch), `src/gui/browser/tests.rs` and `src/gui/browser/prepare/tests.rs` (P6's image part), `src/cache.rs` (the `.preview` root, if unused), `src/main.rs`, `src/kind.rs`, `.prd/02-architecture.md` (§4.3–§4.4) | W8a, W5b, W6, W7 and ED6; S1-M merged |
 
-07 §14 has the edit units (ED1–ED6) and the docs unit (D1), which rewrites 01, AGENTS.md and the
-README once the code has landed. The experiments X1–X5 and the merge order across both workstreams
-are in [`streaming/loop.md`](streaming/loop.md).
+07 §14 has the edit units (ED1–ED6) and the docs unit (D1), which rewrote 01, AGENTS.md and the
+README once the code had landed. The experiments X1–X5 and the merge order across both workstreams
+are in [`streaming/loop.done.md`](streaming/loop.done.md).
 
-**Order** (loop.md has the full merge order):
+**Order**, as merged (loop.done.md has the full merge order):
 1. W1 → W2 → W3, alongside S1-A…D.
 2. Once S1 has merged: W4, W5a and W6.
 3. Once W3, PR #15 and S1-M have merged: W7. W5b follows W5a.
-4. W8a once W4 and W5a have merged: it wires the routes for hex and for remote text of at most
-   16 MiB, so the owner's 24 GB file is not fetched before the other viewers stream.
-5. ED6 (media edit on streams), then W8b, which wires the rest. W8b waits for W5b too: a remote
-   text file over 16 MiB never ships with W5a's 16 MiB stop-gap, and until then it is fetched whole.
+4. W8a once W4 and W5a had merged: it wired the routes for hex and for remote text of at most
+   16 MiB, so the owner's 24 GB file was not fetched while the other viewers waited for theirs.
+5. ED6 (media edit on streams), then W8b, which wired the rest. W8b waited for W5b too: no remote
+   text file over 16 MiB was ever read through W5a's 16 MiB cap; until W8b it was fetched whole.
 
-**W8 is split (decided 2026-11-21).** W8 waited for W5b, W6, W7 and ED6, and none of them is
-needed for hex or for text that fits W5a's index: so W8a routes those now, and W8b keeps what
-needs the later units.
+**W8 was split (decided 2026-11-21).** W8 waited for W5b, W6, W7 and ED6, and none of them was
+needed for hex or for text that fits W5a's index: so W8a routed those first, and W8b the rest.
 
 **Which route opens what as a stream (W8a and W8b).**
 
@@ -1880,13 +1876,13 @@ the standalone route opens before its window shows, with nothing to press Esc in
 is said to be empty. Without a display, and with no scripted save or export, the standalone route
 still fetches the file and prints its path (nothing to stream to).
 
-Why ED6 comes before W8b: PR #15's Save refuses a URL input (`media/file.rs`), and its background hash
-skips remote files. If W8b routed remote media through a Source first, remote media Save would break
-until ED6.
+Why ED6 came before W8b: PR #15's Save refused a URL input (`media/file.rs`), and its background
+hash skipped remote files. Had W8b routed remote media through a Source first, remote media Save
+would have broken until ED6.
 
-- W4–W7 land with remote files still fetched by today's routes. Each viewer reads `Bytes`, which a
+- W4–W7 landed with remote files still fetched by the old routes. Each viewer reads `Bytes`, which a
   local `File` implements, and is tested over a Source on the `Fake` and on `local_server()`. W8a
-  and W8b switch the routes to open a Source. So `main` ships a working build after every merge.
+  and W8b switched the routes to open a Source. So `main` shipped a working build after every merge.
 - `src/lib.rs` gets one `mod` line each from W2 and ED2, which may run in parallel; whichever merges
   second rebases.
 - `src/gui/mod.rs` is edited by W4 (`State`), then W8a (`Origin`, `Window`). ED3's `mod` line rebases onto
@@ -1910,8 +1906,8 @@ are not disjoint, and are sequenced instead.
   preview changes (`set_preview`, S1-B). W4–W8b rebase onto it. S1-M takes `media.rs` after PR #15,
   before W7.
 - **S2-E** gives the viewers a `read_only` flag (02 §5). It comes after W4–W7 and ED4–ED6, or touches
-  only the `Window` trait's default. This docs PR adds that sentence to 02 §8 when it is rebased
-  onto `main` (the exact text is in loop.md), because S2 starts right after S1.
+  only the `Window` trait's default. 02 §8 says so (added by the streaming docs PR at its rebase;
+  the text is in loop.done.md).
 - **PR #16** (stems) touches `Cargo.toml`, `main.rs`, `ffmpeg.rs`, `cut.rs`, `lib.rs`, `usage.rs` and
   `tests/cli.rs`. It shares only `Cargo.toml` with W1, in a different section, so neither waits: the
   one that merges second rebases. Its remote sources go through `fetch_to_cache`, which W1 only
@@ -1927,8 +1923,8 @@ are not disjoint, and are sequenced instead.
   02 §4.3 already foresaw the first: "with streaming (another workstream), only the byte ranges
   the preview shows, never more than 32 MiB".
   1. **The read.** A remote preview reads through a Source on the window's one preview session,
-     which becomes that Source's `Ranged` (it was read into a private copy,
-     `<cache>/.preview/<window>/<n>`, before W8a and W8b).
+     which becomes that Source's `Ranged` (before W8a and W8b it was read into a private copy,
+     `<cache>/.preview/<window>/<n>`).
      - The 32 MiB budget is no longer a gate on the file's size for a streamed preview. So a large
        remote binary previews its first rows (W8a), and a large remote video previews its first
        frame (W8b; 02 §4.3: "Lifting that limit belongs to the streaming workstream").
@@ -1976,8 +1972,8 @@ every test.
 
 ## 14. 01 text this replaces
 
-Each unit's PR names the sentences it makes untrue. D1 (07 §14) rewrites them in 01 as the shipped
-contract.
+Each unit's PR named the sentences it made untrue. D1 (07 §14) rewrote them in 01 as the shipped
+contract (2026-11-23).
 
 - **A6 and §6a.** "Enter = Open in hex editor (the default: fetched to the cache, then sopen's hex
   window)" and "Hex: the file is fetched into the cache as every fetch is …" (W8a). And "during a
@@ -1999,8 +1995,8 @@ contract.
   of scope, and §10 no longer waits on usage to consider streaming.
 - **02 §4.3 and §4.4** (the browser's document): the preview's read, hand-over and cancel, as §13
   says. W8a writes them there for text and hex, W8b for images and media, each in its own PR.
-- **02 §8**: one sentence, added by this docs PR at its rebase (loop.md): S2-E comes after the
-  viewer units, or touches only the trait default (§13).
+- **02 §8**: one sentence, added by the streaming docs PR at its rebase (loop.done.md): S2-E comes
+  after the viewer units, or touches only the trait default (§13).
 
 ## Tensions
 
@@ -2032,7 +2028,7 @@ Two questions X3 (2026-11-21) raised and did not measure. **W5b settled both (20
     first 16.8 MB`.
   - Evidence: in the same test the first page of the local file is coloured and its last page is
     not; `a_stream_over_16_mib_is_highlighted_over_its_first_16_mib` shows the same through a
-    Source. 01 §3a still says such a file is plain: D1 brings it to this.
+    Source. D1 brought 01 §3a to this.
 
 An open question X1 (2026-11-21) measured and did not settle. **W7 settled it (2026-11-22).**
 

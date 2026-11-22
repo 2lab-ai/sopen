@@ -15,6 +15,13 @@ sopen --target <host> myserver:/tmp/a.mp3   # the same, on <host>'s screen inste
 
 Same syntax as `scp`. Uses your `ssh` and `~/.ssh/config`; the remote needs nothing but sshd.
 
+Remote files are never downloaded just to look at them: sopen reads what is on screen and a
+little around it, the rest as you move, like a video stream — a 24 GB file in the hex editor
+shows its first screen after reading 64 KiB of it. Edits in sopen's image, video, audio and hex
+windows are kept on this machine until you save — in memory and, a moment later, on disk, so a
+crash loses at most that moment's — and Save writes back to the remote file, Save As to a local
+one.
+
 ## Install
 
 ```sh
@@ -35,14 +42,16 @@ brew install 2lab-ai/tap/sopen-preview    # macOS (arm64, x86_64), Linux (x86_64
   `sopen stems`) — both present on desktop Linux; sopen runs
   on the machine whose screen shows the file (the one you sit at, or the `--target`), not on the
   remote. The file browser, the image and media windows, the binary-file dialog and the hex window
-  need a desktop session (X11 or Wayland); without one a folder opens in the editor and a binary
-  file is fetched and its path printed.
+  need a desktop session (X11 or Wayland); without one a folder opens in the editor and a binary,
+  image or media file is fetched and its path printed.
 
 ## What the remote needs
 
 Only sshd with its SFTP subsystem (the default). sopen installs and runs nothing there. When you open
 a text file (or press F4 in the file browser), VS Code Remote - SSH or Zed installs its own remote server on first use — that is the editor's behaviour,
-not sopen's. Folders are listed over SFTP. Images and media are fetched over SFTP and handled locally. (A `--target` machine is
+not sopen's. Folders are listed over SFTP. What sopen shows itself — text in the file browser, images,
+video, audio, the hex editor — is read over SFTP a piece at a time and handled on this machine; video
+and audio are decoded here by ffmpeg from that stream. (A `--target` machine is
 different: it shows the file, so it needs sopen installed — see below.)
 
 ## Open on another machine's screen: `--target`
@@ -93,8 +102,9 @@ folders, then the files (Name · Ext · Size · Date · Time; hidden files dimme
 `N Listed = N bytes` and `N Bytes Free` at the foot.
 
 The window opens in **preview mode**: rest the bar on a file and the other side shows it — text
-(wrapped, highlighted), an image, or the hex rows of anything else; video and audio show a card
-with their size and date for now. On a folder the other side is its own list again. `F9` switches
+(wrapped, highlighted), an image, a video's first frame, a sound's waveform (its first 10
+minutes), or the hex rows of anything else, whatever the file's size. On a folder the other side is
+its own list again. `F9` switches
 to two plain lists (**dual mode**) and back. A preview is only looked at: `Enter` makes it the
 viewer.
 
@@ -125,8 +135,9 @@ keys that work there are labelled), cyan dialogs with a shadow.
 Text shows read-only with syntax highlighting and line numbers, a page at a time (a file of any
 size opens alike); images open in the image window, video and audio in the media window, anything
 else in the hex editor — each with its own edits and Save, as below. Leaving a viewer with unsaved
-changes asks first, as its own window does. A remote file is fetched with its progress in the
-status row; `Esc` stops the fetch.
+changes asks first, as its own window does. A remote file is not downloaded: it shows as soon as
+its first part arrives and the rest is read as you move (an image is read whole into memory first,
+with its progress; `Esc` stops that).
 
 Rename, copy and move never replace anything: a name already there asks **Skip**, **Rename** (a
 free name is proposed) or **Cancel**. A copy shows its progress in the status row, `Esc` stops
@@ -140,11 +151,15 @@ between any two characters, never before closing punctuation such as `。` or `�
 to the next stop of four cells. A row starting with a Hebrew or Arabic word still reads left to
 right: its English stays as written, each right-to-left word reads right to left. The file is still read a chunk at a time — a line of hundreds of
 megabytes too, from wherever you are in it. Inside a line longer than the window the status row
-says how far into it you are (`line 7 (12 % of it) of 120`), and the scroll bar goes by bytes.
+says how far into it you are (`line 7 (12 % of it) of 120`), and the scroll bar goes by bytes; a
+click on it jumps there. A remote file's lines are numbered as far as they have been read (its
+first 16 MiB in the background); past that the gutter shows byte offsets (`0x…`) until you get
+there.
 
 | Key in the text viewer | |
 |---|---|
-| `W` / `F2` | switch wrapping off (one row per line, `←` / `→` scroll sideways, 4096 bytes of a line shown) and on again; the F-key row says `Unwrap` or `Wrap` |
+| `W` / `F2` | switch wrapping off (one row per line; `←` / `→`, `Home` / `End` move along a line of any length) and on again; the F-key row says `Unwrap` or `Wrap` |
+| `⌘G` (`Ctrl+G` elsewhere) | go to a line number, or a byte offset (`0x…`); in a large remote file a line not reached yet is counted up to, with its progress (`Esc` stops) |
 | `↑` / `↓`, `PgUp` / `PgDn`, the wheel | wrapped: move by rows (a page keeps one row); unwrapped: by lines |
 | `Home` / `End` | wrapped, inside a long line: its first / last row first, then the start / end of the file; otherwise the start / end of the file |
 | `⌘Home` / `⌘End` (`Ctrl` elsewhere) | the start / end of the file |
@@ -164,8 +179,9 @@ inside moves it), then:
 | `⌘V` | paste into the rectangle: a picture as the toolbar's **Paste** choice says (**Stretch**, the default, to the rectangle's size; **Fit** keeps its aspect, centred, the rest in the background colour; **1:1** unscaled at the rectangle's top-left, cut off at its edges), text in the **Text** colour, wrapped to the rectangle's width and as large as fits. With no rectangle a picture goes 1:1 at the top-left, text at the top-left in letters a tenth of the image's height, and what was pasted becomes the rectangle |
 | `Esc` | clear the rectangle |
 | `⌘Z` / `⇧⌘Z` (Ctrl on Linux) | undo / redo |
-| `⌘S` or `F5` | Save: the original is first backed up locally (path printed), then overwritten in place in the same format (PNG, WebP, BMP, TIFF lossless; JPEG quality 95). A server without `posix-rename@openssh.com` cannot replace a file safely: Save is off there, Save copy works |
+| `⌘S` or `F5` | Save: the original is first backed up locally (path printed), then overwritten in place in the same format (PNG, WebP, BMP, TIFF lossless; JPEG quality 95). A server without `posix-rename@openssh.com` cannot replace a file safely: Save is off there, Save copy works. While it runs nothing is edited; `Esc` stops it before the original is replaced |
 | `⇧⌘S` | Save copy: `<name>.edited.<ext>` next to the original |
+| `⌥⌘S` or `F7` | Save As: the edited image to a new file on this machine (never over an existing one) |
 
 The second toolbar row holds the **Paste** choice and two colours: **Background** (white by
 default; on an image with alpha, **transparent** too) and **Text** (black). A pasted picture's
@@ -177,6 +193,12 @@ undo step, saved by Save or Save copy like the other edits; a key held until it 
 once, a second press pastes again. Pictures go through the clipboard as 8-bit RGBA, so a 16-bit
 image's copy is 8-bit.
 
+A remote image shows its size (and its Exif thumbnail) at once, then fills in as it is read —
+JPEG and PNG as a partial picture. An image whose decoding needs more than 512 MiB of memory (or
+a file over 512 MiB) first says how much it needs and what this machine has, and waits:
+**Continue** or **Close** — and for a large decode **Hex view** too, its bytes in the hex editor.
+A file that does not decode opens in the hex editor, saying why.
+
 Animated GIF/PNG/WebP and multi-page TIFF open read-only (first frame / page; `⌘C` still copies).
 Closing with unsaved changes asks first. Save keeps the ICC profile and Exif where the format
 holds them; anything it cannot keep (XMP, text chunks, IPTC, comments) is named in the window when
@@ -187,9 +209,10 @@ the image opens and again in the result line.
 Video plays in the window with sound; audio shows its waveform, a stereo file in two lanes (L and
 R). Both are edited on the timeline: cut, copy and paste stretches of it, as the image window
 edits a rectangle. Editing only changes the list of pieces, so playback and the paused frame show
-the edit at once; ffmpeg renders it only when you Save (over the original, after a local backup)
-or Export (a new file next to it). If no audio device can be opened the video plays silently and
-says so.
+the edit at once; ffmpeg renders it only when you Save (over the original, after keeping it — see
+below) or Export (a new file next to it). A remote file plays without being downloaded: ffmpeg
+reads it through sopen, which fetches only what it asks for, and the waveform of a long sound fills
+in as it is read. If no audio device can be opened the video plays silently and says so.
 
 | Key | |
 |---|---|
@@ -205,8 +228,9 @@ says so.
 | `M` | audio, mono file: Mono → Stereo — left and right are both the one channel (`M` again: mono) |
 | `Esc` | clear the crop rectangle, then the selection |
 | `⌘Z` / `⇧⌘Z` | undo / redo |
-| `⌘S` or `F5` | Save: the original is backed up locally (path printed), the edit is rendered (video: H.264 + AAC; audio: its own codec) and written over it in the same format — refused, nothing rendered, if the file changed since it was opened. Then the window plays the saved file |
-| `E` | Export In–Out of the timeline (all of it without a selection) and the crop as `<stem>.cut-<in>-<out>.<ext>` next to the original, and show its remote path |
+| `⌘S` or `F5` | Save: the edit is rendered (video: H.264 + AAC; audio: its own codec) and written over the original in the same format — refused, nothing rendered, if the file changed since it was opened. The original is kept first: a local file as a local backup (path printed); a remote one on its own server, as a hidden hard link beside it (`.<name>.sopen-backup-<time>`, named in the result — not a copy: a program that still has the original open can change it; delete it when you no longer need it). Then the window plays the saved file. `Esc` stops a Save before the original is replaced |
+| `⌥⌘S` or `F7` | Save As: render the edit into a new file on this machine (never over an existing one) |
+| `E` | Export In–Out of the timeline (all of it without a selection) and the crop as `<stem>.cut-<in>-<out>.<ext>` next to the original, and show its remote path; **Cancel** (or `Esc`) stops it and publishes nothing |
 
 On video, drag a rectangle on the picture to crop what Export writes (Save writes the edit only,
 never a crop over the original). Cuts land on frame times, so
@@ -225,12 +249,13 @@ sopen --hex myserver:/srv/notes.txt   # any file straight in the hex editor, no 
 ```
 
 Anything that is not a folder, text, an image or media opens a small dialog first — its name, size
-and type; nothing is downloaded yet. **Enter** fetches it and opens sopen's hex editor (the
-default). **Save to…** downloads it to the path below the buttons — your download folder at first,
-or the one "Browse…" picks — and never over an existing file: if the name is taken it says so and
-offers the next free one (`data-1.zip`). **Esc** (or closing the window) downloads nothing.
-Exceptions: Enter in the path field saves there (it never opens the hex editor); while a transfer
-runs, Enter and Esc do nothing and closing the window waits for it to finish.
+and type; nothing is downloaded yet. **Enter** opens sopen's hex editor (the default) at once,
+reading only what is on screen. **Save to…** downloads it to the path below the buttons — your
+download folder at first, or the one "Browse…" picks — and never over an existing file: if the name
+is taken it says so and offers the next free one (`data-1.zip`). **Esc** (or closing the window)
+downloads nothing. Exceptions: Enter in the path field saves there (it never opens the hex editor);
+while a download runs, Enter does nothing, and Esc, Cancel or closing the window stops it and
+leaves nothing behind (`cancelled; nothing was saved`).
 
 The file appears under its name only complete: it is written into a private hidden folder
 (`.sopen-…`) in the chosen folder and published from there with a hard link, never over anything.
@@ -250,8 +275,13 @@ size:
 | hex digits / characters | overwrite: in the hex column two digits per byte, in the ASCII column one character (printable ASCII); `Tab` or `F8` switches the column |
 | `⌘G` or `F6` | go to an offset (`0x…` or decimal) |
 | `⌘Z` / `⇧⌘Z` (Ctrl on Linux) | undo / redo |
-| `⌘S` or `F5` | Save: the original is first backed up locally (path printed), then overwritten in place, as image Save does. When it is refused, the window names where your edits were kept: if the file changed since it was opened, nothing is written and the edits are listed in a `.hexpatch-….txt` file; if the overwrite itself is refused (the remote changed), the staged edited file is kept |
+| `⌘S` or `F5` | Save. A remote file is copied on its own server, your changed bytes are written into the copy, and the copy replaces the original: a 4-byte change to a 24 GB file sends 4 bytes, not the file. The bytes it replaced are kept in a local undo file (named in the result), which the hex editor offers back as **Load as edits**. A server without `copy-data` (OpenSSH before 9.0) has a file of up to 256 MiB rewritten through this machine; above that, or without room on the server for the copy, Save is refused before anything moves and offers **Write in place…** (not atomic, and it says so) or **Save As…**. A local file is first backed up locally (path printed), then overwritten in place, as image Save does. If the file changed since it was opened, nothing is written and your edits stay. While a Save runs nothing is edited; `Esc` stops a remote Save before it replaces anything |
 | `⇧⌘S` | Save copy: `<name>.edited.<ext>` next to the original |
+| `⌥⌘S` or `F7` | Save As: the edited file to a new file on this machine (never over an existing one), the unchanged bytes read from the remote on the way |
+
+A remote file above 256 MiB cannot have its whole content checked before a Save: sopen checks its
+size, modification time and the bytes under your edits, and the first Save asks once, since a
+program writing to the file at the same time can lose that write.
 
 If a local file saved in place is changed by someone else right after the save, the window turns
 read-only and lists your edits in a `.hexpatch` file it names. When even that list cannot be
@@ -304,7 +334,7 @@ that file before it uses it; `--model PATH` or `SOPEN_STEMS_MODEL` names another
 
 - Every write first re-checks the remote file: still the same regular file (not a symlink), same
   size and modification time, and — up to 256 MiB — the same content. If anything changed since
-  sopen fetched it, nothing is written; your edited copy is kept and its path printed (exit 3).
+  sopen opened it, nothing is written; your edits are kept and where is printed (exit 3).
 - Conflict detection is best-effort: sopen cannot lock the remote file, so a write that races the
   final rename is not detected.
 - Writes go to a temporary file in the same directory, get the original's owner and permission
@@ -312,8 +342,12 @@ that file before it uses it; `--model PATH` or `SOPEN_STEMS_MODEL` names another
   nothing is written.
 - A save that fails for any reason moves your edited copy aside (`<file>.conflict-<time>`) and
   prints where. Opening the file again never overwrites an unsaved edit.
-- The local copies sopen creates (the cache, image, hex and media backups, kept edits) are readable by you
-  only. A binary file saved with "Save to…" is created new, never over an existing file.
+- Unsaved edits in the hex, image and media windows are kept on disk as well as in memory until you
+  save or discard them. After a crash the next open offers them back — **Restore**, **Later** or
+  **Discard** — once the file is checked to be the one they were made on. A save that was cut off
+  is checked on the next open: sopen says whether it landed and never writes it twice.
+- The local copies sopen creates (the cache, image, hex and media backups, hex undo files, kept
+  edits) are readable by you only. A binary file saved with "Save to…" is created new, never over an existing file.
   A second sopen session on a file that is still open in the first gets its own copy, so neither
   overwrites the other's edits.
 - Exports never overwrite: if the name exists, sopen adds `-1`, `-2`, ….

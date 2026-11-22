@@ -19,7 +19,11 @@ anything is downloaded: sopen's hex window (the default; byte overwrite only) or
 `--hex` opens any file in the hex window. It opens on the machine it was typed on, or — with `--target HOST`,
 `SOPEN_TARGET` or `target` in sopen's config — on HOST's screen, by running HOST's installed sopen with `--here`
 over ssh: HOST
-is a machine the owner uses sopen on, not a file's remote, which still needs only sshd (spec §4a). Spec and
+is a machine the owner uses sopen on, not a file's remote, which still needs only sshd (spec §4a). A remote
+file that one of sopen's own windows shows is read as a stream, never downloaded first, whatever its size
+([`.prd/06-streaming.md`](.prd/06-streaming.md)); its edits live in memory and in a local journal until they
+are saved, and Save writes to the remote by default, Save As to a local path
+([`.prd/07-streaming-edit.md`](.prd/07-streaming-edit.md)). Spec and
 scope: [`.prd/01-spec.md`](.prd/01-spec.md) — its §1 owner intent and §9 out-of-scope list decide every "should
 we add X" question; the browser workstream (modes, git panel, file keys, directory tree) is
 [`.prd/02-architecture.md`](.prd/02-architecture.md) to [`.prd/05-directory-tree.md`](.prd/05-directory-tree.md).
@@ -49,14 +53,25 @@ downloaded and checked by build.rs; `SHERPA_ONNX_LIB_DIR` for offline builds); `
 - **Never overwrite silently.** Every write re-checks the remote file first (`lstat`: still a regular file,
   same `(size, mtime)`, same content hash up to 256 MiB) and refuses on change; writes go to a temp name in the
   same directory with the target's owner and mode and are renamed over the target. Spec §5 is the full rule.
-  Image and hex Save, and media Save of a local file, keep a local backup of the original first — except a
+  Above 256 MiB the content check is what the window holds evidence for — the hex window's edited 4 KiB
+  pages, the media window's first and last MiB — besides size and mtime; the result says what was checked,
+  and the hex window's first Save of a session on such a file asks once, because a concurrent writer's
+  change can be lost (07 §4.5 has the table of what a Save can lose). These checks are best effort, never a
+  compare-and-swap. Every unsaved hex, image and media edit is kept in a local journal as well as in memory,
+  and every Save records its phases there before each request that changes the remote, so a Save cut off is
+  reconciled, never repeated blindly (07 §3–§3.1). Image and hex Save, and media Save of a local file, keep a
+  local backup of the original first — except a
   streamed hex file (a remote file in the hex window), whose Save copies the file on its host, patches the
   copy and renames it over the target, checking the pages under the edits (and up to 256 MiB the whole
   content) on the way; its backup is a local undo file of the bytes it replaced, durable before anything is
-  patched, and every edit is kept in a local journal first (`.prd/07-streaming-edit.md` §3–§5). Media Save of
+  patched (`.prd/07-streaming-edit.md` §4–§5). Writing a streamed hex file in place is offered only from the
+  refusal row where no atomic route fits, behind a dialog that says it is not atomic — never as a fallback
+  (07 §4.4). Media Save of
   a remote file keeps the original on its own host instead: its first Save of a session links it to
   `.<name>.sopen-backup-<UTC>` beside it (a hard link, never over anything) before the overwrite, says so
-  before and after, and is off where the server has no hard links (07 §5.3). Media exports always write a new sibling
+  before and after — it is the same inode, so other links or open handles can still change it — and is off
+  where the server has no hard links (07 §5.3). Save As writes a new local file by "Save to…"'s rules, never
+  over anything (07 §7). Media exports always write a new sibling
   file and never use a replacing rename to publish it. The binary dialog's "Save to…" fills a file in a private
   staging folder and publishes it complete by a hard link, never over anything (spec §6a). The browser's rename,
   copy, move and make folder never replace an existing name; a remote rename is SFTP's plain rename, never
@@ -79,13 +94,40 @@ downloaded and checked by build.rs; `SHERPA_ONNX_LIB_DIR` for offline builds); `
   MP4's `stts` and edit list must say exactly the timeline's samples; Matroska declares only its priming, as
   CodecDelay, so there the end may run on by less than one AAC frame), and read frames with `-fps_mode passthrough`.
 - Tests must not need ssh or a network: the remote layer sits behind a trait with a local-filesystem
-  implementation used by tests.
+  implementation used by tests. SFTP itself is tested against this machine's own OpenSSH `sftp-server`, run
+  as a child over pipes (`SftpRemote::local_server()`, `src/remote/sftp.rs`; `local_server_args` passes it
+  flags such as `-P copy-data`, `local_server_with` puts a proxy between); a stream's transport against the
+  in-order `Fake` with a simulated link (`src/remote/ranged.rs`); the byte server against a plain
+  `TcpStream` client. `SOPEN_TEST_HIDE_SFTP_SERVER=1` makes the server look absent — the receipt that every
+  test needing it fails under `SOPEN_REQUIRE_SFTP_SERVER`. Tests that need a real host or volume are
+  `#[ignore]`d and run by hand only: `tests/sftp_live.rs` (`SOPEN_TEST_SFTP_HOST=<ssh alias>`,
+  `SOPEN_TEST_SFTP_DIR`, default `/tmp/sopen-receipts`), the hex window's live Save of a file above 256 MiB
+  (`SOPEN_TEST_SFTP_HOST`, `SOPEN_TEST_SFTP_FILE`; `src/gui/hex/tests.rs`), the media window's live Save
+  (the same two and `SOPEN_TEST_CLIPS=<START-END[,START-END]>`; `src/gui/media/live_tests.rs`), the read
+  benchmark (`SOPEN_BENCH_FILE=<a large file>`, `src/remote/tests.rs`) and a real volume's copy and move
+  (`SOPEN_TEST_VOLUME=<folder>`, `src/fileops/tests.rs`).
 - Public repo hygiene: no machine names, IP addresses, home-directory paths or session scratch paths in
   commits, receipts or docs. Commit identity `Z <z@2lab.ai>`.
 - **One look, one place.** Every window wears the PC Tools (PC Shell 5.5 / 6) skin from
   `src/gui/chrome.rs`: colours, the font, frames, the title and F-key rows, dialogs and the syntax
   theme. Windows never pick a colour or a font size themselves. The VGA font in `assets/fonts/` is
   CC BY-SA 4.0, not MIT: its licence file and the README credit stay with it.
+
+## Where the code is
+
+`src/lib.rs`'s doc comment maps the top-level modules; each module's own `//!` header is its contract
+summary. Viewing a remote file as a stream and editing it (06, 07) live in:
+
+| Module | What it is |
+|---|---|
+| `remote::ranged` (`src/remote/ranged.rs`, SFTP half `src/remote/sftp/ranged.rs`) | `Ranged`: one open handle on one connection, reads at explicit offsets sent in queue order; the pipelined whole-file read; the tests' in-order `Fake` |
+| `stream` (`src/stream/`) | `Source`, one remote file open for viewing: the 64 KiB block cache (`cache.rs`), what is sent next (`prefetch.rs`), validation by `fstat` fences, change detection and the viewers' `Reader` (`source.rs`), the `Bytes` every viewer reads through, a local `File` too (`mod.rs`), the loopback byte server ffmpeg reads through (`http.rs`) |
+| `gui::streamed` (`src/gui/streamed.rs`) | how a route turns the open's connection into a `Source`, the placeholder `Origin`, `bytes_fetched`, a preview's connection given back |
+| `remote::patch` (`src/remote/patch.rs`, `sftp/patch.rs`, `local/patch.rs`) | a hex Save without moving the file: server copy, patch, rename; the streamed rewrite; Write in place; the undo file |
+| `journal` (`src/journal.rs`) | the edit journal of the hex, image and media windows, the save intent and its reconciliation |
+| `gui::save_as` (`src/gui/save_as.rs`) | the Save As modal and writer the three windows share |
+| `gui::{hex,image,media}::file` | each window's write side: Save, Save copy, Save As's producer, recovery |
+| `gui::image::probe` | an image's header walk, the memory its decode needs, the thumbnail, partial pictures |
 
 ## Receipts
 
@@ -107,9 +149,13 @@ prompts on close.
 | `SOPEN_SAVE_HOLD_MS=<ms>` | `SOPEN_CHOICE=save`: the save holds at its first progress report for that long, or until it is cancelled — so a signal reaches it mid-way (Ctrl-C and SIGTERM cancel a save without a window: nothing is left, exit 130 / 143). `<ms>:stalled` holds for the whole time whatever comes, as a transfer whose remote has stalled: the first signal is not seen, and the same signal again ends sopen. |
 | `SOPEN_AUTOEXPORT=1` | Media: apply the state and Export without a window; prints the new sibling's path. |
 | `SOPEN_EXPORT_HOLD_MS=<ms>` | Media window: start an Export on open and hold it, at its first progress report at or past 30 %, for that long, so `SOPEN_SCREENSHOT` captures the window mid-export; when the window closes sopen waits for the export and prints its result. |
+| `SOPEN_STREAM_STATS=1` | Every stream (a remote file a window reads, `.prd/06-streaming.md` §11) prints one line on stderr at each event — `stream <open\|first\|idle\|input\|ready\|close> t=<ms> <host:/abs> fetched= demand= prefetch= bulk= delivered= http_sent= sniff= requests= max_in_flight= runs= jumps= cuts=` (`input` adds ` place=0x…`; `t` counts from the open), every counter cumulative — and the byte bounds of 06 §12 are read from those lines. Only the value `1` turns it on. A local file makes no stream and prints nothing. |
+| `SOPEN_STREAM_THROTTLE=<ms>,<bytes/s>` | Every read of every stream is delayed by `<ms>` and paced to `<bytes/s>`, order kept, as the tests' `Fake` does, so a screenshot catches rows still loading or a partial picture. Anything else (a rate of 0, no comma) is ignored. |
 | `SOPEN_WINDOW_SIZE=<w>x<h>` | Open the window at that size in points (layout receipts on a narrow window). |
 | `SOPEN_RENDERER=wgpu\|glow` | Force a renderer (default: wgpu, glow when wgpu does not start; `WGPU_BACKEND=dx12` on macOS forces that fallback). |
 | `SOPEN_CODE=<path>` | Use this VS Code CLI for text and for the file browser's F4 (a folder itself opens in the browser); an empty value means VS Code is absent. A local setting, not forwarded by `--target`. |
+| `SOPEN_ZED=<path>` | Use this Zed CLI instead of searching PATH and its usual install paths; an empty value means Zed is absent. A local setting, not forwarded by `--target`. |
+| `SOPEN_CACHE_DIR=<dir>`, `SOPEN_STATE_DIR=<dir>` | The cache (fetched copies, `.edits` with the journals, `.backup`, `.exports`, …) and the state folder (ssh control sockets, `usage.jsonl`) instead of the platform's; an empty value is ignored. Tests point both at a temp dir (`tests/cli.rs`). Local settings, not forwarded by `--target`. |
 | `VSCODE_EXTENSIONS=<dir>` | VS Code's own extensions-dir variable; when non-empty sopen looks there (instead of `~/.vscode/extensions`) for Remote - SSH before opening a remote path in VS Code. Tests point it at a temp dir. Not forwarded by `--target`. |
 | `SOPEN_RAISE=0\|wait` | KDE Plasma (spec §3, msg 11): `0` leaves the editor's window where KWin put it (tests/cli.rs sets it, so a test run in a KDE session never moves a real window); `wait` brings it forward in sopen's own process, about 3 s, instead of a detached `sopen --raise-window`, so a test sees every D-Bus call before sopen exits. HOST's own setting: not forwarded by `--target`. |
 | `SOPEN_EDITOR_WAIT=<seconds>` | How long sopen waits for the editor CLI (VS Code, Zed) to exit before it counts as handed off — default 3, at most 120 (anything else: 3); the wait ends as soon as the CLI exits. tests/cli.rs sets 60 where a stand-in CLI fails, so a loaded machine still sees the failure. Never unbounded. A local setting, not forwarded by `--target`. |

@@ -284,7 +284,8 @@ pub enum Op {
 /// hand, whichever comes first (the row that byte is in at the top), `mode=dual|preview` and
 /// `bar=NAME` (02 §9); the image, hex and media windows `close=ask`; the media window
 /// `clips=START-END[,START-END]` (its edit list, source seconds) and `stereo=1`; the image window
-/// `restore=1`; every window `help=1`.
+/// `restore=1`; the hex window, and text, an image or a sound read through a stream, `loading=1`;
+/// every window `help=1`.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct State {
     pub rect: Option<[u32; 4]>,
@@ -321,8 +322,9 @@ pub struct State {
     /// on the first row is pressed, as a click would — where that row offers it (`restore=1`, a
     /// crash recovery's receipt).
     pub restore: bool,
-    /// Hex, text and image over a stream: the screenshot is taken at the first frame drawn with
-    /// content from the stream, rows still loading shot as they are (`loading=1`, 06 §11).
+    /// Hex, text, image and a sound in the media window over a stream: the screenshot is taken at
+    /// the first frame drawn with content from the stream — rows still loading, a partial picture,
+    /// a sound's first peaks — shot as they are (`loading=1`, 06 §11).
     pub loading: bool,
 }
 
@@ -426,7 +428,8 @@ impl State {
 /// The answer to the binary-file dialog (spec §6a), given by `SOPEN_CHOICE` instead of a click.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Choice {
-    /// Fetch into the cache and open the hex window.
+    /// Open the hex window: a remote file as a stream, nothing fetched (06 §7.5); a local file
+    /// in place.
     Hex,
     /// Save a copy at a chosen path (`SOPEN_SAVE_TO`, else the download folder).
     Save,
