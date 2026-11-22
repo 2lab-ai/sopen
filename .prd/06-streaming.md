@@ -873,9 +873,11 @@ the page and drop the queued keys.
   decode opens in the hex window the same way, its reason the first of the window's rows.
   - A remote file's hex window reads the same stream: nothing is read again, and the stats line
     has one `first` for the open.
-  - A local file's reads the file in place. A local image whose decode must be asked about opens
-    at the memory line in the browser too, as it does in a window of its own: one rule decides
-    for both (`image::decode_unless_asking`, the decoder's header before any pixel memory).
+  - A local file's reads the file in place, opened on a thread of its own (the window says
+    `opening the hex view…` meanwhile: a frame never waits on a disk). A local image whose
+    decode must be asked about opens at the memory line in the browser too, as it does in a
+    window of its own: one rule decides for both (`image::decode_unless_asking`, the decoder's
+    header before any pixel memory).
   - A local image decoded without asking that fails is shown as bytes in the browser; in a window
     of its own it is an error, as before W8b.
   - Only a live stream gives way: a stream that changed or failed while the image was read is
@@ -1858,8 +1860,9 @@ needs the later units.
 | `--hex SOURCE`, any kind of file | stream | stream, as bytes in the hex window | stream, as bytes in the hex window | stream, as bytes in the hex window |
 
 A local file is read in place by every route and never gets a stream. Esc during the browser's
-open of a remote video or sound stops its probe (ffprobe is killed, not waited for); the
-standalone route opens before its window shows, with nothing to press Esc in. An empty remote video or sound
+open of a remote video or sound stops it wherever it waits — an mp3's tag read on a stream that
+stalls, or its probe (ffprobe is killed, not waited for; one not started yet is never started);
+the standalone route opens before its window shows, with nothing to press Esc in. An empty remote video or sound
 is said to be empty. Without a display, and with no scripted save or export, the standalone route
 still fetches the file and prints its path (nothing to stream to).
 

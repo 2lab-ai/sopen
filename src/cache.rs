@@ -541,13 +541,15 @@ fn claim_for_fetch(cache: &Path, host: &str, abs: &str) -> Result<(Claim, Vec<St
 }
 
 /// Removes the preview copies an older sopen left in `cache` (`<cache>/.preview`, which this
-/// one never makes), by that sopen's own rule: the folder `<window>` of every window that is
-/// gone — its `<window>.lock` can be locked, or there is none — and that lock; a lock with no
-/// folder once it is free and [`LONE_LOCK_AGE`] old (an older window makes and locks its lock
-/// just before its folder); then the root itself once it is empty. A window whose lock is held
-/// (an older sopen still running) keeps its folder, and so the root stays. Only a real folder at
-/// exactly that place under the cache is looked into: a link there, or a file, is not sopen's
-/// to remove, and nothing a link inside points at is touched.
+/// one never makes), by that sopen's own rule and only what it made there: a window's folder
+/// `<window>` — 12 lowercase hex characters, as it named them — and `<window>.lock`. The folder
+/// of every window that is gone (its lock can be locked, or there is none) goes with that lock;
+/// a lock with no folder once it is free and [`LONE_LOCK_AGE`] old (an older window makes and
+/// locks its lock just before its folder); then the root itself once it is empty. A window whose
+/// lock is held (an older sopen still running) keeps its folder, and anything of another name is
+/// never touched — so the root stays with them. Only a real folder at exactly that place under
+/// the cache is looked into: a link there, or a file, is not sopen's to remove, and nothing a
+/// link inside points at is touched.
 pub fn sweep_legacy_previews(cache: &Path) {
     sweep_legacy_previews_at(cache, SystemTime::now())
 }
@@ -577,11 +579,18 @@ fn sweep_legacy_previews_at(cache: &Path, now: SystemTime) {
         Err(_) => None,
         Ok(file) => file.try_lock().is_ok().then_some(Some(file)),
     };
+    // A window's name as an older sopen made it (`PreviewSpace`: 12 of `random_hex`'s digits).
+    let window = |name: &str| {
+        name.len() == 12 && name.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    };
     let mut lone = Vec::new();
     for entry in entries.flatten() {
         let path = entry.path();
+        let name = entry.file_name();
+        let name = name.to_str().unwrap_or_default();
+        let lock_of_window = name.strip_suffix(".lock").is_some_and(window);
         match entry.file_type() {
-            Ok(t) if t.is_dir() => {
+            Ok(t) if t.is_dir() && window(name) => {
                 let lock = lock_of(&path);
                 if let Some(held) = gone(&lock) {
                     // `remove_dir_all` removes a link inside, never what it points at.
@@ -590,9 +599,7 @@ fn sweep_legacy_previews_at(cache: &Path, now: SystemTime) {
                     drop(held);
                 }
             }
-            Ok(t) if t.is_file() && path.extension().is_some_and(|e| e == "lock") => {
-                lone.push(path)
-            }
+            Ok(t) if t.is_file() && lock_of_window => lone.push(path),
             _ => {}
         }
     }
@@ -1284,74 +1291,101 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&referent).unwrap(), "referent");
     }
 
-    /// W8b: the preview root an older sopen left is swept by its own rule — a gone window's
-    /// folder and lock, a folder with no lock, an old lock without its folder, then the root —
-    /// while a live window (its lock held) keeps its folder and a fresh lock without one (a
-    /// window being made) stays, and the root with them; a link at the root's place is left,
-    /// and what it points at.
+    /// W8b: the preview root an older sopen left is swept by its own rule, and only what that
+    /// sopen made there — a window's folder named by 12 hex characters, and `<that>.lock`: a
+    /// gone window's folder and lock, a folder with no lock, an old lock without its folder.
+    /// A live window (its lock held) keeps its folder, a fresh lock without one (a window
+    /// being made) stays, and anything else — a folder `keep/` with files, a `foo.lock` — is
+    /// never touched, so the root stays with it; a link at the root's place is left, and what
+    /// it points at.
     #[test]
     fn the_legacy_preview_root_is_swept_and_a_live_windows_folder_kept() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join(LEGACY_PREVIEW);
-        std::fs::create_dir_all(root.join("dead")).unwrap();
-        std::fs::write(root.join("dead/0.png"), "left behind").unwrap();
-        std::fs::write(root.join("dead.lock"), "").unwrap();
-        std::fs::create_dir(root.join("orphan")).unwrap();
-        std::fs::write(root.join("lonely.lock"), "").unwrap();
-        std::fs::write(root.join("fresh.lock"), "").unwrap();
-        std::fs::create_dir(root.join("live")).unwrap();
-        std::fs::write(root.join("live/0.txt"), "in use").unwrap();
-        let held = File::create(root.join("live.lock")).unwrap();
+        let (dead, orphan, lonely, fresh, live) = (
+            "0a1b2c3d4e01",
+            "0a1b2c3d4e02",
+            "0a1b2c3d4e03",
+            "0a1b2c3d4e04",
+            "0a1b2c3d4e05",
+        );
+        std::fs::create_dir_all(root.join(dead)).unwrap();
+        std::fs::write(root.join(dead).join("0.png"), "left behind").unwrap();
+        std::fs::write(root.join(format!("{dead}.lock")), "").unwrap();
+        std::fs::create_dir(root.join(orphan)).unwrap();
+        std::fs::write(root.join(format!("{lonely}.lock")), "").unwrap();
+        std::fs::write(root.join(format!("{fresh}.lock")), "").unwrap();
+        std::fs::create_dir(root.join(live)).unwrap();
+        std::fs::write(root.join(live).join("0.txt"), "in use").unwrap();
+        let held = File::create(root.join(format!("{live}.lock"))).unwrap();
         held.try_lock().unwrap();
+        // Not of that grammar: a folder with files and no lock, and an old free lock.
+        std::fs::create_dir(root.join("keep")).unwrap();
+        std::fs::write(root.join("keep/mine.txt"), "not sopen's").unwrap();
+        std::fs::write(root.join("foo.lock"), "").unwrap();
         let old = SystemTime::now() - 2 * LONE_LOCK_AGE;
-        File::options()
-            .write(true)
-            .open(root.join("lonely.lock"))
-            .unwrap()
-            .set_modified(old)
-            .unwrap();
+        for aged in [format!("{lonely}.lock"), "foo.lock".to_string()] {
+            File::options()
+                .write(true)
+                .open(root.join(aged))
+                .unwrap()
+                .set_modified(old)
+                .unwrap();
+        }
+        let left = || {
+            let mut left: Vec<String> = std::fs::read_dir(&root)
+                .unwrap()
+                .flatten()
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect();
+            left.sort();
+            left
+        };
         sweep_legacy_previews(tmp.path());
-        let mut left: Vec<String> = std::fs::read_dir(&root)
-            .unwrap()
-            .flatten()
-            .map(|e| e.file_name().to_string_lossy().into_owned())
-            .collect();
-        left.sort();
+        let live_lock = format!("{live}.lock");
+        let fresh_lock = format!("{fresh}.lock");
         assert_eq!(
-            left,
-            ["fresh.lock", "live", "live.lock"],
-            "a live window stays"
+            left(),
+            [&fresh_lock, live, &live_lock, "foo.lock", "keep"],
+            "a live window, a window being made and what is not sopen's stay"
         );
         assert_eq!(
-            std::fs::read_to_string(root.join("live/0.txt")).unwrap(),
+            std::fs::read_to_string(root.join(live).join("0.txt")).unwrap(),
             "in use"
         );
         drop(held);
         // Two minutes on, the fresh lock is old. A lock just let go may still be held for an
         // instant — a process another test forks has a copy of its descriptor until its exec
-        // (the note on `claim`) — so the sweep is asked again until the root is gone.
+        // (the note on `claim`) — so the sweep is asked again until the window is gone.
         let later = SystemTime::now() + 2 * LONE_LOCK_AGE;
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         while {
             sweep_legacy_previews_at(tmp.path(), later);
-            root.exists()
+            left() != ["foo.lock", "keep"]
         } {
             assert!(
                 std::time::Instant::now() < deadline,
-                "the root stayed with the last window gone"
+                "the last window stayed: {:?}",
+                left()
             );
             std::thread::sleep(Duration::from_millis(5));
         }
-        // A link where the root was: not sopen's folder.
+        assert_eq!(
+            std::fs::read_to_string(root.join("keep/mine.txt")).unwrap(),
+            "not sopen's"
+        );
+        // A link where the root is: not sopen's folder.
+        let other = tempfile::tempdir().unwrap();
         let elsewhere = tempfile::tempdir().unwrap();
-        std::fs::create_dir(elsewhere.path().join("keep")).unwrap();
-        std::os::unix::fs::symlink(elsewhere.path(), &root).unwrap();
-        sweep_legacy_previews(tmp.path());
-        assert!(std::fs::symlink_metadata(&root)
+        std::fs::create_dir(elsewhere.path().join(dead)).unwrap();
+        let linked = other.path().join(LEGACY_PREVIEW);
+        std::os::unix::fs::symlink(elsewhere.path(), &linked).unwrap();
+        sweep_legacy_previews(other.path());
+        assert!(std::fs::symlink_metadata(&linked)
             .unwrap()
             .file_type()
             .is_symlink());
-        assert!(elsewhere.path().join("keep").exists());
+        assert!(elsewhere.path().join(dead).exists());
     }
 
     #[test]

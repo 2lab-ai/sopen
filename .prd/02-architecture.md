@@ -270,11 +270,12 @@ bar does not have to move).
   publishes into the mirror, moves earlier edits aside or creates a session copy (01 §5's
   machinery is for files that are opened). The private preview copies under `<cache>/.preview`
   went with W8b: nothing uses them, and nothing makes the folder. One an older sopen left is
-  swept when a browser window opens, off its frames, by that sopen's own rule: the folder of every
-  window that is gone (its `<window>.lock` free or missing) and its lock, a lock with no folder once
-  it is free and a minute old (a window being made has one for an instant), then the root once it
-  is empty — a window an older sopen still runs keeps its folder; a link at that place is left as
-  it is.
+  swept when a browser window opens, off its frames, by that sopen's own rule and only what it
+  made there — a window's folder named by 12 hex characters, and `<window>.lock`: the folder of
+  every window that is gone (its lock free or missing) and its lock, a lock with no folder once it
+  is free and a minute old (a window being made has one for an instant), then the root once it is
+  empty. A window an older sopen still runs keeps its folder, anything of another name is never
+  touched (the root stays with it), and a link at that place is left as it is.
 - **A streamed preview that is dropped gives the connection back** (the bar moved on, F9, Tab, a
   cancel): its stream closes the file's handle and returns the session, and the next preparation
   takes it. So the window still has one preview session. The one exception: a session whose

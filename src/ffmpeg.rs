@@ -459,6 +459,23 @@ pub mod spawns {
     pub fn of(file: &Path) -> Counts {
         map().lock().unwrap().get(file).copied().unwrap_or_default()
     }
+
+    /// The runs so far that read a file whose path holds `part` — a name made for one test: a
+    /// served file's URL ends with its name. Counted as each is started, whether or not it ever
+    /// ran a line.
+    pub fn naming(part: &str) -> Counts {
+        let map = map().lock().unwrap();
+        let mut all = Counts::default();
+        for (_, c) in map
+            .iter()
+            .filter(|(f, _)| f.to_string_lossy().contains(part))
+        {
+            all.preview += c.preview;
+            all.render += c.render;
+            all.probe += c.probe;
+        }
+        all
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -544,17 +561,31 @@ pub fn probe_within(
     shown: &str,
     limit: std::time::Duration,
 ) -> Result<Probe> {
-    probe_timed(tools, input, shown, limit, &std::time::Instant::now)
+    probe_timed(
+        tools,
+        input,
+        shown,
+        limit,
+        &std::time::Instant::now,
+        &|| false,
+    )
 }
 
-/// [`probe_within`] on a clock of the caller's (the tests move it).
+/// [`probe_within`] on a clock of the caller's (the tests move it), that its caller can stop:
+/// `stop` is looked at before ffprobe is started — then none is, and the probe fails as
+/// [`crate::remote::Cancelled`] — and at every look while it runs (every 5 ms), when it is
+/// killed and reaped and the probe fails the same way. `now` is for the time limit only.
 pub fn probe_timed(
     tools: &Tools,
     input: &Input,
     shown: &str,
     limit: std::time::Duration,
     now: &dyn Fn() -> std::time::Instant,
+    stop: &dyn Fn() -> bool,
 ) -> Result<Probe> {
+    if stop() {
+        bail!(crate::remote::Cancelled);
+    }
     let before = input.cuts();
     let mut cmd = probe_command(tools, input);
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
@@ -569,14 +600,19 @@ pub fn probe_timed(
     });
     let err = ErrorTail::spawn(child.stderr.take().expect("piped"));
     let deadline = now() + limit;
-    let status = loop {
+    let (status, stopped) = loop {
+        if stop() {
+            let _ = child.kill();
+            let _ = child.wait();
+            break (None, true);
+        }
         if let Some(status) = child.try_wait()? {
-            break Some(status);
+            break (Some(status), false);
         }
         if now() >= deadline {
             let _ = child.kill();
             let _ = child.wait();
-            break None;
+            break (None, false);
         }
         std::thread::sleep(std::time::Duration::from_millis(5).min(limit));
     };
@@ -584,6 +620,9 @@ pub fn probe_timed(
         out.join().unwrap_or_default(),
         err.join().unwrap_or_default(),
     );
+    if stopped {
+        bail!(crate::remote::Cancelled);
+    }
     if let Some(why) = input.cut_since(before) {
         bail!("ffprobe cannot read {shown}: {why}");
     }

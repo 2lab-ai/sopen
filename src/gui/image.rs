@@ -4312,6 +4312,9 @@ pub struct HexSwitch {
     /// A local file's path: its hex window reads it in place.
     local: Option<PathBuf>,
     wanted: Arc<Mutex<Option<GivenWay>>>,
+    /// Tests: run where the local file is opened, just before it is (a barrier).
+    #[cfg(test)]
+    before_open: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 /// What an image window that gave way leaves its host: the hex window's file and the notices
@@ -4325,6 +4328,8 @@ impl HexSwitch {
             repaint,
             local: None,
             wanted: Arc::default(),
+            #[cfg(test)]
+            before_open: None,
         }
     }
 
@@ -4334,6 +4339,8 @@ impl HexSwitch {
             repaint: Default::default(),
             local: Some(path),
             wanted: Arc::default(),
+            #[cfg(test)]
+            before_open: None,
         }
     }
 
@@ -4386,8 +4393,19 @@ struct Streaming {
     physical: Option<u64>,
     /// `SOPEN_KEYS`, for the image window once the image is whole (a window of its own only).
     script: std::collections::VecDeque<super::browser::Play>,
-    /// Where the window gives way to the hex window (a stream's only).
+    /// Where the window gives way to the hex window (a stream's, or a local file's).
     switch: Option<HexSwitch>,
+    /// A local file's hex window being opened off the frame (Hex view, a file that does not
+    /// decode): the window says so until it is there.
+    hex_opening: Option<HexOpening>,
+}
+
+/// A local file opened for the hex window on a thread of its own — a disk (a network mount
+/// that stalls) is never waited on by a frame — then given to `switch` with `notices`.
+struct HexOpening {
+    switch: HexSwitch,
+    notices: Vec<String>,
+    opened: Receiver<std::result::Result<super::hex::HexFile, String>>,
 }
 
 impl Drop for Streaming {
@@ -4440,6 +4458,7 @@ impl Streaming {
             physical: probe::physical_memory(),
             script: Default::default(),
             switch: None,
+            hex_opening: None,
         })
     }
 
@@ -4498,14 +4517,79 @@ impl Streaming {
             (Some(source), _) => {
                 super::hex::HexFile::streamed(origin, source, switch.repaint.clone(), &cache_root)
             }
-            (None, Some(path)) => match super::hex::Base::open_as(path, &origin.display()) {
-                Ok(base) => super::hex::HexFile::new(origin, base, None, &cache_root),
-                Err(e) => return self.fail(ctx, format!("{e:#}")),
-            },
+            (None, Some(path)) => {
+                let path = path.clone();
+                return self.open_hex(ctx, switch, (path, origin, cache_root), notices);
+            }
             (None, None) => return,
         };
         *switch.wanted.lock().unwrap_or_else(|p| p.into_inner()) = Some((file, notices));
         ctx.request_repaint();
+    }
+
+    /// Opens the local file at `path` (`origin`'s, with sopen's cache at `cache_root`) for the
+    /// hex window on a thread of its own ([`HexOpening`]); the window is woken when it is open,
+    /// or could not be.
+    fn open_hex(
+        &mut self,
+        ctx: &egui::Context,
+        switch: HexSwitch,
+        (path, origin, cache_root): (PathBuf, Origin, PathBuf),
+        notices: Vec<String>,
+    ) {
+        let (tx, opened) = mpsc::channel();
+        let (woken, wake) = (ctx.clone(), ctx.clone());
+        #[cfg(test)]
+        let pause = switch.before_open.clone();
+        let spawned = std::thread::Builder::new()
+            .name("hex-open".into())
+            .spawn(move || {
+                #[cfg(test)]
+                if let Some(pause) = pause {
+                    pause();
+                }
+                let made = super::hex::Base::open_as(&path, &origin.display())
+                    .map(|base| super::hex::HexFile::new(origin, base, None, &cache_root))
+                    .map_err(|e| format!("{e:#}"));
+                let _ = tx.send(made);
+                woken.request_repaint();
+            });
+        match spawned {
+            Ok(_) => {
+                self.hex_opening = Some(HexOpening {
+                    switch,
+                    notices,
+                    opened,
+                });
+                wake.request_repaint();
+            }
+            Err(e) => self.fail(ctx, format!("cannot open the hex view: {e}")),
+        }
+    }
+
+    /// The local file's hex window, once its thread has opened it: given to the host — or why
+    /// it could not be, as the window's failure.
+    fn hex_opened(&mut self, ctx: &egui::Context) {
+        let Some(opening) = &self.hex_opening else {
+            return;
+        };
+        let made = match opening.opened.try_recv() {
+            Ok(made) => made,
+            Err(mpsc::TryRecvError::Empty) => return,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                Err("cannot open the hex view: its thread ended".to_string())
+            }
+        };
+        let HexOpening {
+            switch, notices, ..
+        } = self.hex_opening.take().expect("looked at above");
+        match made {
+            Ok(file) => {
+                *switch.wanted.lock().unwrap_or_else(|p| p.into_inner()) = Some((file, notices));
+                ctx.request_repaint();
+            }
+            Err(why) => self.fail(ctx, why),
+        }
     }
 
     /// The loader's result, once it has one: the image window, or why there is none.
@@ -4571,7 +4655,9 @@ impl Streaming {
             parts.push(format!("{w}×{h}"));
         }
         parts.push(probe::size_text(self.size));
-        if progress.ask.is_some() {
+        if self.hex_opening.is_some() {
+            parts.push("opening the hex view…".into());
+        } else if progress.ask.is_some() {
             // It waits for an answer: nothing loads and nothing decodes.
         } else if progress.decoding {
             parts.push("decoding…".into());
@@ -4590,7 +4676,8 @@ impl Streaming {
             let progress = self.load.progress();
             (
                 self.line(&progress),
-                progress.ask,
+                // Its answer is given while the hex view opens: nothing more is asked.
+                progress.ask.filter(|_| self.hex_opening.is_none()),
                 progress.warning.clone(),
                 progress.sketch.clone(),
                 progress.header.as_ref().map(probe::Header::upright),
@@ -4727,6 +4814,7 @@ impl super::Window for Streaming {
                 *slot = Some(ctx.clone());
             }
             drop(slot);
+            self.hex_opened(&ctx);
             self.finish(&ctx);
         }
         match &mut self.image {

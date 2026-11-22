@@ -63,7 +63,8 @@ fn ffmpeg_is_cbr(tools: &Tools, path: &Path) -> bool {
 }
 
 fn sopen_says(path: &Path) -> bool {
-    info_tag(&mut std::fs::File::open(path).unwrap())
+    let never = std::sync::atomic::AtomicBool::new(false);
+    info_tag(&mut std::fs::File::open(path).unwrap(), &never).unwrap()
 }
 
 /// An ID3v2 tag of `version` holding `size` bytes of padding.
@@ -239,7 +240,8 @@ fn fallback_fixtures_seek_exactly() {
         let transport = Box::new(fs).into_ranged(path.to_str().unwrap()).unwrap();
         let no_reopen: crate::stream::Reopen = Box::new(|| anyhow::bail!("no second connection"));
         let source = Source::open(transport, no_reopen, std::sync::Arc::new(|| {})).unwrap();
-        let fast = crate::gui::media::seeks_fast(&source, "case.mp3");
+        let never = std::sync::atomic::AtomicBool::new(false);
+        let fast = crate::gui::media::seeks_fast(&source, "case.mp3", &never).unwrap();
         let server = Server::start(source.clone()).unwrap();
         let served = Served::new(server, source, "case.mp3", "case.mp3", fast);
         let options = served.input(Kind::Play).options().to_vec();

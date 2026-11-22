@@ -194,7 +194,9 @@ pub fn standalone(
     let (_, name) = crate::remote::split_parent(abs);
     if crate::kind::maybe_video(name) {
         // The `.ts` refine over the URL (06 §7.4).
-        let input = super::media::served_input(source.clone(), name, &shown)?;
+        // No window yet, so nothing to stop it with.
+        let never = std::sync::atomic::AtomicBool::new(false);
+        let input = super::media::served_input(source.clone(), name, &shown, &never)?;
         if crate::kind::refine_input(&input, name, kind) == crate::kind::Kind::Other {
             return Ok(Standalone::NotMedia {
                 size: opened.at.size,

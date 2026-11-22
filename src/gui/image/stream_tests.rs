@@ -1475,6 +1475,114 @@ fn w8b_hex_view_on_a_local_images_memory_line_becomes_the_hex_window() {
     assert!(!drv.closed(), "the window stayed");
 }
 
+/// W8b review, the frame rule: H on a local image's memory line opens the file for the hex
+/// window off the frame. With that open held at a barrier, the key's frame returns and the
+/// window goes on painting — saying it opens the hex view — and once the open is let go the
+/// same window becomes the hex window. (The window is driven on a thread of its own, so a
+/// frame that waited on the open is told apart from one that did not.)
+#[test]
+fn w8b_a_local_hex_view_is_opened_off_the_frame() {
+    // (reached, released)
+    let gate: Arc<(Mutex<(bool, bool)>, std::sync::Condvar)> = Arc::default();
+    let pause = {
+        let gate = gate.clone();
+        move || {
+            let (lock, cv) = &*gate;
+            let mut st = lock.lock().unwrap();
+            st.0 = true;
+            cv.notify_all();
+            // Never for ever: a frame that waits here (the defect) is let go after a while.
+            let _ = cv.wait_timeout_while(st, Duration::from_secs(30), |s| !s.1);
+        }
+    };
+    let release = || {
+        let (lock, cv) = &*gate;
+        lock.lock().unwrap().1 = true;
+        cv.notify_all();
+    };
+    let (said, heard) = std::sync::mpsc::channel::<&'static str>();
+    let window = std::thread::spawn(move || {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("huge.png");
+        let bytes = png_claiming(100_000, 100_000);
+        std::fs::write(&path, &bytes).unwrap();
+        let mut fs = LocalFs::new();
+        let abs = path.to_str().unwrap().to_string();
+        let at = fs.stat(&abs).unwrap();
+        let origin = Origin::new(Box::new(fs), None, None, abs, at);
+        let file = ImageFile::new(origin, bytes, &tmp.path().join("cache"));
+        let hooks = Hooks::default();
+        let asking = decoded_or_asking(file, &hooks, Vec::new(), probe::BUDGET).unwrap();
+        let Start::Asking(mut win) = asking else {
+            panic!("a decode over the budget is asked about first");
+        };
+        let mut switch = win.switch.take().expect("a local switch");
+        switch.before_open = Some(Arc::new(pause));
+        win.switch = Some(switch.clone());
+        let failed = win.failed.clone();
+        let mut host = Switching {
+            switch: Some(switch),
+            image: Some(*win),
+            hex: None,
+            hooks,
+            hex_outcome: Arc::default(),
+            hex_leftover: Arc::default(),
+            failed,
+        };
+        let mut drv = Driver::new(900.0, 700.0);
+        drv.until(&mut host, 60, |host| {
+            host.image.as_ref().is_some_and(|win| win.asked)
+        });
+        drv.key(&mut host, Key::H, Modifiers::NONE);
+        said.send("the key's frame returned").unwrap();
+        drv.idle(&mut host, 5);
+        let opening = drv
+            .texts()
+            .iter()
+            .any(|(_, _, t)| t.contains("opening the hex view"));
+        said.send(if opening {
+            "painting: opening"
+        } else {
+            "painting: silent"
+        })
+        .unwrap();
+        let started = Instant::now();
+        while drv
+            .find_text("89 50 4E 47 0D 0A 1A 0A  00 00 00 0D 49 48 44 52")
+            .is_none()
+        {
+            assert!(started.elapsed() < HANG, "the hex rows never came");
+            drv.idle(&mut host, 1);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(
+            host.image.is_none() && host.hex.is_some(),
+            "the hex window now"
+        );
+        assert!(!drv.closed(), "the window stayed");
+    });
+    {
+        let (lock, cv) = &*gate;
+        let st = lock.lock().unwrap();
+        let (st, _) = cv
+            .wait_timeout_while(st, Duration::from_secs(60), |s| !s.0)
+            .unwrap();
+        assert!(st.0, "the open never started");
+    }
+    // The open is held: the window's frames go on.
+    let first = heard.recv_timeout(Duration::from_secs(10));
+    let then = heard.recv_timeout(Duration::from_secs(10));
+    release();
+    let joined = window.join();
+    assert_eq!(
+        first,
+        Ok("the key's frame returned"),
+        "the frame waited on the open"
+    );
+    assert_eq!(then, Ok("painting: opening"), "while the open is held");
+    joined.unwrap();
+}
+
 /// `SOPEN_AUTOSAVE` through a stream: no window and nobody to ask — the file is read, the
 /// state applied and the edit saved over the original, checked against the bytes read.
 #[test]

@@ -257,9 +257,9 @@ pub fn refine_input(input: &crate::ffmpeg::Input, name: &str, kind: Kind) -> Kin
     refine_input_until(input, name, kind, &|| false)
 }
 
-/// [`refine_input`] that its caller can stop: once `stop` says so, ffprobe is killed and reaped
-/// at its next look (every few milliseconds) and nothing is known of the file — whoever stopped
-/// it does not use the answer.
+/// [`refine_input`] that its caller can stop: said before ffprobe is started, none is; said
+/// while it runs, it is killed and reaped at its next look ([`crate::ffmpeg::probe_timed`]).
+/// Either way nothing is known of the file — whoever stopped it does not use the answer.
 pub fn refine_input_until(
     input: &crate::ffmpeg::Input,
     name: &str,
@@ -269,16 +269,21 @@ pub fn refine_input_until(
     if kind != Kind::Video {
         return kind;
     }
+    refine_input_with(crate::ffmpeg::resolve(), input, name, kind, stop)
+}
+
+/// [`refine_input_until`] of a video with the tools given (tests: a stand-in `ffprobe`).
+pub(crate) fn refine_input_with(
+    tools: anyhow::Result<crate::ffmpeg::Tools>,
+    input: &crate::ffmpeg::Input,
+    name: &str,
+    kind: Kind,
+    stop: &dyn Fn() -> bool,
+) -> Kind {
     let shown = input.show();
-    // A stop makes the probe's time run out at its next look.
-    let far = std::time::Duration::from_secs(365 * 24 * 3600);
-    let now = || match stop() {
-        true => std::time::Instant::now() + far,
-        false => std::time::Instant::now(),
-    };
-    let limit = crate::ffmpeg::PROBE_LIMIT;
-    let probed = crate::ffmpeg::resolve()
-        .and_then(|t| crate::ffmpeg::probe_timed(&t, input, &shown, limit, &now));
+    let (limit, now) = (crate::ffmpeg::PROBE_LIMIT, std::time::Instant::now);
+    let probed =
+        tools.and_then(|t| crate::ffmpeg::probe_timed(&t, input, &shown, limit, &now, stop));
     let probe = match probed {
         Ok(probe) => Some((probe.video.is_some(), probe.has_audio)),
         Err(e) => {

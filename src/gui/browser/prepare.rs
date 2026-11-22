@@ -317,7 +317,10 @@ fn streamed_prepared(
                 stopped()?;
                 // The `.ts` refine over the URL (06 §7.4): ffprobe reads the `play` URL, so
                 // what it reads is what the window plays next — from the stream's cache.
-                let input = media::served_input(source.clone(), name, &req.show())?;
+                let input = media::served_input(source.clone(), name, &req.show(), cancel);
+                // An Esc during its setup (a stream that stalls): the cancel, not the file.
+                stopped()?;
+                let input = input?;
                 let refined = kind::refine_input_until(&input, name, kind, &stop);
                 // Stopped, the probe knows nothing of the file: its answer is not used.
                 stopped()?;
@@ -327,7 +330,7 @@ fn streamed_prepared(
                 }
             }
             stopped()?;
-            let media = Media::stream_until(source, name, &req.show(), &stop);
+            let media = Media::stream_until(source, name, &req.show(), cancel);
             // A probe Esc stopped fails as one: that is the cancel, not the file's fault.
             stopped()?;
             let media = media?;
@@ -1134,7 +1137,7 @@ fn preview_parts(
             let tools = budget.tools()?;
             // The file's own name (a link's target's): its extension says how it is rendered.
             let name = crate::remote::split_parent(&real).1;
-            let input = media::served_input(source.clone(), name, &shown)?;
+            let input = media::served_input(source.clone(), name, &shown, cancel)?;
             let found = media::preview::prepare(
                 &tools,
                 &input,
