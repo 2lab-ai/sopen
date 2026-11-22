@@ -218,9 +218,45 @@ pub struct Reach {
     pub kind: ReaderKind,
     /// The widest its readahead window has been.
     pub widest: u64,
-    /// The bytes it read or read ahead, from the lowest to the furthest: `from..to`.
+    /// The bytes it read or was allowed to read ahead, from the lowest to the furthest:
+    /// `from..to`. The far end is the read's end and the window the readahead rule allows at
+    /// that read ([`legal_reach`]), not where the targets were made to end.
     pub from: u64,
     pub to: u64,
+    /// How many times its prefetch targets were set, and the first target that lay outside
+    /// what that read allowed (`(block, from, to)`, the interval in bytes).
+    pub targeted: u64,
+    pub outside: Option<(u64, u64, u64)>,
+}
+
+/// Tests: what one targeting may queue, worked out again from the read and the readahead
+/// rule alone (06 §4) — not from the targets the code made. The window after the read is twice
+/// the one before it, at least a block and at most `ahead`, on a sequential hit, and 0 on
+/// anything else; an interactive reader reads ahead at least its read's length, and as far
+/// behind. In bytes, `from..to`, clipped to the file.
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub fn legal_reach(
+    access: Access,
+    before: u64,
+    ahead: u64,
+    interactive: bool,
+    off: u64,
+    end: u64,
+    size: u64,
+) -> (u64, u64) {
+    let window = match access {
+        Access::Hit => (before * 2).max(BLOCK).min(ahead),
+        Access::First | Access::Jump | Access::Same => 0,
+    };
+    let len = end - off;
+    let forward = if interactive { window.max(len) } else { window };
+    let from = if interactive {
+        off.saturating_sub(len)
+    } else {
+        off
+    };
+    (from, end.saturating_add(forward).min(size))
 }
 
 impl ReaderState {
@@ -280,6 +316,8 @@ impl Prefetcher {
                     widest: 0,
                     from: u64::MAX,
                     to: 0,
+                    targeted: 0,
+                    outside: None,
                 },
             },
         );
@@ -429,11 +467,18 @@ impl Prefetcher {
             }
             #[cfg(test)]
             {
+                let (from, to) = legal_reach(access, before, ahead, interactive, off, end, size);
                 let reach = &mut r.reach;
-                reach.to = reach.to.max(fwd_end);
-                if interactive {
-                    reach.from = reach.from.min(off.saturating_sub(len));
+                reach.targeted += 1;
+                let first = from / BLOCK;
+                let stray = targets
+                    .iter()
+                    .find(|b| **b < first || **b * BLOCK >= to)
+                    .copied();
+                if let (None, Some(b)) = (reach.outside, stray) {
+                    reach.outside = Some((b, from, to));
                 }
+                (reach.from, reach.to) = (reach.from.min(from), reach.to.max(to));
             }
             targets.retain(|b| !cached(*b));
             queued |= targets.iter().any(|b| !have(*b));

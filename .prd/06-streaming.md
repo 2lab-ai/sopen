@@ -1653,11 +1653,19 @@ stream <event> t=<ms> <host:/abs> fetched=<b> demand=<b> prefetch=<b> bulk=<b> d
       own records (test-only `Prefetcher::reaches`):
       - no block a decoder waited for comes twice;
       - no reader's readahead window is ever wider than its `ahead`;
+      - every time a reader's prefetch targets are set, they lie inside what that read allows
+        (test-only `legal_reach`). The allowance is worked out again from the read and §4's
+        rule alone: from the read's offset to its end plus the window, where the window is
+        twice the one before (at least a block, at most `ahead`) on a sequential hit and 0
+        otherwise. An interactive reader is allowed at least its read's length ahead, and as
+        far behind. The targets the code made are not used to work it out;
       - no block is fetched twice within the start;
-      - every block that comes again lies inside what a reader of that start read or read
-        ahead, from the lowest offset it read to the furthest its readahead reached. So
-        `refetched` ≤ the blocks fetched before the start inside that reach: 0.8–2.2 MiB at
-        the 5 s start, 1.7–6.2 MiB at the later ones (both platforms, loaded).
+      - every block that comes again lies inside what a reader of that start read or was
+        allowed to read ahead, by that same allowance. So `refetched` ≤ the blocks fetched
+        before the start inside that reach: 0.8–2.2 MiB at the 5 s start, 1.7–6.2 MiB at the
+        later ones (both platforms, loaded).
+      - The render gate and a unit test of the prefetcher (`stream/tests.rs`) check the same
+        allowance on every reader.
     - Why it grows with load. Each decoder opens this `moov`-at-the-end file at byte 0 (and
       again at byte 48), reads a few KB and seeks to the `moov`. Meanwhile the server fills
       that connection's socket from the cached head. Each read is a sequential hit that doubles

@@ -299,6 +299,17 @@ fn v16_a_render_of_24_reordered_pieces_fetches_within_its_bound() {
             );
             assert!(fetched <= allowed, "{name}: fetched {fetched} > {allowed}");
             assert_eq!(refetched(&source), 0, "{name}: a block fetched twice");
+            // Each targeting of every reader queued only what its read allowed.
+            let reaches = source.core().pf.reaches();
+            assert!(
+                reaches.iter().any(|r| r.targeted > 0),
+                "{name}: no readahead"
+            );
+            let strays: Vec<_> = reaches.iter().filter(|r| r.outside.is_some()).collect();
+            assert!(
+                strays.is_empty(),
+                "{name}: readahead outside what its read allowed: {strays:?}"
+            );
         }
         none_left(dir.path()).unwrap();
     });
@@ -312,11 +323,13 @@ fn v16_a_render_of_24_reordered_pieces_fetches_within_its_bound() {
 /// server counts the `play` responses it began, the cap the highest the engine sent under.
 ///
 /// What it fetches again is readahead, never a block a decoder waited for: no block twice in
-/// the start, each inside what one of the start's readers read or read ahead, and no reader's
-/// readahead past its allowance (`ahead`) — what the engine is allowed to do, from its own
-/// records ([`crate::stream::Prefetcher::reaches`]). Not 06's one block (X1's threshold for its
-/// own fixture), nor a fixed figure, for it grows with load. Each decoder opens this `moov`-at-the-end file at byte 0
-/// (and again at byte 48), reads a few KB and seeks to the `moov`. Meanwhile the server fills
+/// the start, each inside what one of the start's readers read or was allowed to read ahead,
+/// every prefetch target inside what its read allowed, and no reader's readahead past its
+/// allowance (`ahead`) — what the engine is allowed to do, from its own records
+/// ([`crate::stream::Prefetcher::reaches`], the prefetcher's `legal_reach`). Not 06's one
+/// block (X1's threshold for its own fixture), nor a fixed figure, for it grows with load.
+/// Each decoder opens this `moov`-at-the-end file at byte 0 (and again at byte 48), reads a
+/// few KB and seeks to the `moov`. Meanwhile the server fills
 /// that connection's socket from the cached head; each read is a sequential hit that doubles
 /// the reader's readahead, to MBs within a few blocks, and its prefetch past the cached head
 /// drains for as long as ffmpeg keeps the connection open. Those blocks, evicted since an
@@ -430,6 +443,16 @@ fn v16_playback_of_an_edit_fetches_within_its_bound() {
             assert!(
                 widest <= ahead,
                 "from {at} s: a readahead of {widest} > {ahead}"
+            );
+            // Each targeting queued only what its read allowed (`legal_reach`).
+            assert!(
+                reaches.iter().any(|r| r.targeted > 0),
+                "from {at} s: no readahead was set"
+            );
+            let strays: Vec<_> = reaches.iter().filter(|r| r.outside.is_some()).collect();
+            assert!(
+                strays.is_empty(),
+                "from {at} s: readahead outside what its read allowed: {strays:?}"
             );
             let reached = |b: u64| {
                 reaches
