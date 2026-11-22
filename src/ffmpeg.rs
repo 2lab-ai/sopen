@@ -3,6 +3,8 @@
 //! H.264 + AAC for video; for audio the source's codec (from ffprobe), in the source's container
 //! when it can hold that codec.
 
+use crate::stream::http::{CutReason, Kind, Server};
+use crate::stream::Source;
 use anyhow::{anyhow, bail, Context, Result};
 use std::collections::HashSet;
 use std::ffi::{OsStr, OsString};
@@ -10,6 +12,7 @@ use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::str::FromStr;
+use std::sync::Arc;
 
 #[derive(Debug, Clone)]
 pub struct Tools {
@@ -41,33 +44,79 @@ pub fn resolve() -> Result<Tools> {
     })
 }
 
-/// What ffmpeg and ffprobe read for a media window: one value — a local path today, and a URL
-/// once remote media is streamed — handed unchanged to every run on the source: the probe,
-/// playback, the paused frame, the waveform, Save and Export. Nothing reads the source any
-/// other way (Save's backup asks for [`Input::local`]).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Input(OsString);
+/// What ffmpeg and ffprobe read for a media window: one file — a local path, or a remote file
+/// streamed through the window's byte server as a URL ([`Served`]) — handed to every run on the
+/// source: the probe, playback, the paused frame, the waveform, Save and Export. Nothing reads
+/// the source any other way (Save's backup asks for [`Input::local`]).
+///
+/// An input carries the options that must stand before its `-i` (ffprobe: before the input
+/// itself), and every command line takes it whole ([`Input::args`], [`Input::probed`]): a URL
+/// never reaches ffmpeg without its `-protocol_whitelist http,tcp` (06 §9).
+#[derive(Clone)]
+pub struct Input {
+    arg: OsString,
+    options: Vec<OsString>,
+    /// The server a URL is read through, and its reader kind.
+    served: Option<(Arc<Served>, Kind)>,
+}
+
+impl PartialEq for Input {
+    fn eq(&self, other: &Self) -> bool {
+        self.arg == other.arg && self.options == other.options
+    }
+}
+
+impl Eq for Input {}
+
+impl std::fmt::Debug for Input {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Input")
+            .field("arg", &self.arg)
+            .field("options", &self.options)
+            .field("kind", &self.kind())
+            .finish()
+    }
+}
 
 impl Input {
     pub fn path(path: &Path) -> Self {
-        Self(path.as_os_str().to_owned())
+        Self {
+            arg: path.as_os_str().to_owned(),
+            options: Vec::new(),
+            served: None,
+        }
     }
 
-    /// As ffmpeg's `-i` (and ffprobe's) argument.
-    pub fn arg(&self) -> &OsStr {
-        &self.0
+    /// `options… -i <arg>`: the input as an ffmpeg command line takes it (an input option such
+    /// as `-ss` may stand before it).
+    pub fn args(&self) -> Vec<OsString> {
+        let mut args = self.options.clone();
+        args.extend(["-i".into(), self.arg.clone()]);
+        args
+    }
+
+    /// `options… <arg>`: the input as ffprobe takes it, last.
+    pub fn probed(&self) -> Vec<OsString> {
+        let mut args = self.options.clone();
+        args.push(self.arg.clone());
+        args
+    }
+
+    /// The options that stand before its `-i`.
+    pub fn options(&self) -> &[OsString] {
+        &self.options
     }
 
     /// A local file's path; `None` for a URL.
     pub fn local(&self) -> Option<&Path> {
-        let text = self.0.to_string_lossy();
-        (!text.contains("://")).then(|| Path::new(&self.0))
+        let text = self.arg.to_string_lossy();
+        (self.served.is_none() && !text.contains("://")).then(|| Path::new(&self.arg))
     }
 
     /// The extension of its last path segment (a URL's query and fragment left out; a local
     /// name may hold `?` and `#`), lowercase.
     pub fn ext(&self) -> String {
-        let text = self.0.to_string_lossy();
+        let text = self.arg.to_string_lossy();
         let path = if self.local().is_some() {
             &text[..]
         } else {
@@ -81,15 +130,230 @@ impl Input {
     }
 
     pub fn show(&self) -> String {
-        self.0.to_string_lossy().into_owned()
+        self.arg.to_string_lossy().into_owned()
+    }
+
+    /// The reader kind its URL is served by; `None` for a local file.
+    pub fn kind(&self) -> Option<Kind> {
+        self.served.as_ref().map(|(_, kind)| *kind)
+    }
+
+    /// The server it is read through.
+    pub fn served(&self) -> Option<&Arc<Served>> {
+        self.served.as_ref().map(|(served, _)| served)
+    }
+
+    /// The same file through `kind`'s reader (06 §7.4: `play` for playback, the paused frame
+    /// and the probe; `bulk` for the waveform; `render` for Save and Export). A local file is
+    /// itself.
+    pub fn of_kind(&self, kind: Kind) -> Input {
+        match &self.served {
+            Some((served, _)) => served.input(kind),
+            None => self.clone(),
+        }
+    }
+
+    /// The server's cut account for its kind (06 §9); `None` for a local file. A run reads it
+    /// before it starts ffmpeg, and [`Input::cut_since`] when ffmpeg has exited.
+    pub fn cuts(&self) -> Option<u64> {
+        self.served
+            .as_ref()
+            .map(|(served, kind)| served.server.cuts(*kind))
+    }
+
+    /// Why a run on this input fails although ffmpeg may have exited 0 (06 §7.4: ffmpeg exits
+    /// 0 on a body cut short): the account has gone up since `before` (what [`Input::cuts`]
+    /// said when the run started). Said as the Source's state where it is not live, else as
+    /// the last cut's reason. `None`: no cut, or a local file.
+    pub fn cut_since(&self, before: Option<u64>) -> Option<String> {
+        let (served, kind) = self.served.as_ref()?;
+        if served.server.cuts(*kind) <= before.unwrap_or(0) {
+            return None;
+        }
+        Some(served.trouble().unwrap_or_else(|| {
+            let why = served.server.last_cut(*kind).map_or_else(
+                || "a connection was closed unanswered".to_string(),
+                |c| cut_reason(&c.reason),
+            );
+            format!("the stream of the file was cut short ({why})")
+        }))
+    }
+
+    /// Bytes the byte server has sent to readers of this input's kind ([`Server::sent`]): a
+    /// run's input going on. 0 for a local file.
+    pub fn fed(&self) -> u64 {
+        self.served
+            .as_ref()
+            .map_or(0, |(served, kind)| served.server.sent(*kind))
+    }
+
+    /// What the Source says of itself where it is not live (its status row's words).
+    pub fn trouble(&self) -> Option<String> {
+        self.served().and_then(|served| served.trouble())
+    }
+
+    /// `text` — what ffmpeg or ffprobe printed about this input — as the owner may read it:
+    /// every URL of a streamed file said as the file (`host:/abs`), the byte server's address
+    /// and token never shown (06 §9). Every line of ffmpeg's that sopen shows goes through
+    /// here. A local file's text is as it was printed.
+    pub fn said(&self, text: &str) -> String {
+        match self.served() {
+            Some(served) => served.said(text),
+            None => text.to_string(),
+        }
     }
 }
 
-impl AsRef<OsStr> for Input {
-    fn as_ref(&self) -> &OsStr {
-        &self.0
+/// A cut's reason in words.
+fn cut_reason(reason: &CutReason) -> String {
+    match reason {
+        CutReason::Changed => "the file changed on the remote".into(),
+        CutReason::Reloaded => "the file was reloaded".into(),
+        CutReason::Failed(why) => why.clone(),
+        CutReason::Closed => "the stream was closed".into(),
+        CutReason::Stalled => "its reader took nothing for 60 s".into(),
+        CutReason::Busy => format!(
+            "the byte server was serving {} connections already",
+            crate::stream::http::MAX_CONNECTIONS
+        ),
     }
 }
+
+/// A remote file served to ffmpeg (06 §7.4, §9): the window's byte server over the file's
+/// Source. Every run reads it through the URL of the reader kind it needs ([`Served::input`]),
+/// and reads the server's cut account around it ([`Input::cut_since`]). Dropped with the last
+/// input that reads it: a window's, or an export the window left running.
+pub struct Served {
+    server: Server,
+    source: Source,
+    name: String,
+    /// The file as its owner knows it (`host:/abs`): what a URL of it is said as.
+    shown: String,
+    /// `play` inputs seek with `-fflags +fastseek`: an mp3 whose first frame carries a LAME
+    /// `Info` tag, where a fast seek is within one frame (06 §7.4).
+    fastseek: bool,
+}
+
+impl Served {
+    /// The server over `source`, its URLs ending in `name` (so ffmpeg sees the extension), the
+    /// file said as `shown` (`host:/abs`).
+    pub fn new(
+        server: Server,
+        source: Source,
+        name: &str,
+        shown: &str,
+        fastseek: bool,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            server,
+            source,
+            name: name.to_string(),
+            shown: shown.to_string(),
+            fastseek,
+        })
+    }
+
+    /// [`Served::new`] with a server started for `source`.
+    pub fn start(source: Source, name: &str, shown: &str, fastseek: bool) -> Result<Arc<Self>> {
+        let server = Server::start(source.clone())?;
+        Ok(Self::new(server, source, name, shown, fastseek))
+    }
+
+    /// The input of `kind`: its URL, with a receive buffer of [`RECV_BUFFER`] and
+    /// `-protocol_whitelist http,tcp` before it (06 §9), and `-fflags +fastseek` for a `play`
+    /// input of a file that seeks fast.
+    pub fn input(self: &Arc<Self>, kind: Kind) -> Input {
+        let mut options: Vec<OsString> = vec![
+            "-recv_buffer_size".into(),
+            RECV_BUFFER.to_string().into(),
+            "-protocol_whitelist".into(),
+            "http,tcp".into(),
+        ];
+        if self.fastseek && kind == Kind::Play {
+            options.extend(["-fflags".into(), "+fastseek".into()]);
+        }
+        Input {
+            arg: self.server.url(kind, &self.name).into(),
+            options,
+            served: Some((self.clone(), kind)),
+        }
+    }
+
+    pub fn server(&self) -> &Server {
+        &self.server
+    }
+
+    pub fn source(&self) -> &Source {
+        &self.source
+    }
+
+    /// `play` inputs seek with `+fastseek`.
+    pub fn fastseek(&self) -> bool {
+        self.fastseek
+    }
+
+    /// The Source's own words where it is not live.
+    fn trouble(&self) -> Option<String> {
+        self.source.state().status()
+    }
+
+    /// [`Input::said`]: each of the file's URLs said as the file; whatever else of the
+    /// server's address is left (a URL cut or decoded) as the file too, and the token as `…`.
+    fn said(&self, text: &str) -> String {
+        let mut out = text.to_string();
+        for kind in Kind::ALL {
+            out = out.replace(&self.server.url(kind, &self.name), &self.shown);
+        }
+        // `http://127.0.0.1:<port>/<token>`, the part every URL of the server starts with.
+        let root = self.server.url(Kind::Play, "");
+        let root = root
+            .trim_end_matches('/')
+            .trim_end_matches(Kind::Play.segment());
+        let root = root.trim_end_matches('/');
+        let token = root.rsplit('/').next().unwrap_or_default();
+        out = out.replace(root, &self.shown);
+        if !token.is_empty() {
+            out = out.replace(token, "…");
+        }
+        // ffmpeg names the server alone where it cannot reach it: its TCP endpoint
+        // (`tcp://127.0.0.1:<port>`), or the URL's authority (`http://127.0.0.1:<port>`).
+        // This port only: an address another server has is left as it was printed.
+        let port = self.server.port();
+        for authority in [
+            format!("tcp://127.0.0.1:{port}"),
+            format!("http://127.0.0.1:{port}"),
+        ] {
+            out = replace_endpoint(&out, &authority, &self.shown);
+        }
+        out
+    }
+}
+
+/// `text` with every `endpoint` that a digit does not go on from (`:5934` is not `:59340`) as
+/// `with`.
+fn replace_endpoint(text: &str, endpoint: &str, with: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find(endpoint) {
+        let after = &rest[at + endpoint.len()..];
+        out.push_str(&rest[..at]);
+        if after.starts_with(|c: char| c.is_ascii_digit()) {
+            out.push_str(endpoint);
+        } else {
+            out.push_str(with);
+        }
+        rest = after;
+    }
+    out.push_str(rest);
+    out
+}
+
+/// The receive buffer every ffmpeg input of the byte server is given (06 §9): the client's
+/// half of how far a connection is read ahead of what ffmpeg has taken, the server's send
+/// buffer being the other (`stream::http::SEND_BUFFER`). Left to Linux it grows with a client
+/// that reads fast, to MBs: a 24-input render had that much read for each input past its piece,
+/// and the cache let blocks go that another input then read again (W7, measured).
+pub const RECV_BUFFER: u32 = 64 << 10;
 
 /// Starts an ffmpeg or ffprobe run. Every run on a media file goes through here or
 /// [`output`], so the tests can count them per file ([`spawns`]): editing must start none.
@@ -104,6 +368,31 @@ pub fn output(cmd: &mut Command) -> std::io::Result<std::process::Output> {
     #[cfg(test)]
     spawns::note(cmd);
     cmd.output()
+}
+
+/// Test-only: how each render run ended ([`run_stoppable`]), by its arguments: ffmpeg exits 0
+/// on an input cut short (06 §7.4), and a test shows that it did.
+#[cfg(test)]
+pub mod exits {
+    use std::ffi::OsString;
+    use std::process::ExitStatus;
+    use std::sync::Mutex;
+
+    static RUNS: Mutex<Vec<(Vec<OsString>, ExitStatus)>> = Mutex::new(Vec::new());
+
+    pub fn note(args: &[OsString], status: ExitStatus) {
+        let mut runs = RUNS.lock().unwrap_or_else(|p| p.into_inner());
+        runs.push((args.to_vec(), status));
+    }
+
+    /// How the runs that named `part` in an argument (a path in a test's folder) ended.
+    pub fn naming(part: &str) -> Vec<ExitStatus> {
+        let runs = RUNS.lock().unwrap_or_else(|p| p.into_inner());
+        runs.iter()
+            .filter(|(args, _)| args.iter().any(|a| a.to_string_lossy().contains(part)))
+            .map(|(_, status)| *status)
+            .collect()
+    }
 }
 
 /// Test-only: how many ffmpeg / ffprobe runs read each file, by what they were for.
@@ -224,7 +513,7 @@ pub struct Probe {
 }
 
 /// `ffprobe -v error -print_format json -show_format -show_streams -show_chapters <input>` (a
-/// path or a URL).
+/// local path).
 pub fn probe(tools: &Tools, input: impl AsRef<OsStr>) -> Result<Probe> {
     let shown = Path::new(input.as_ref()).display().to_string();
     probe_shown(tools, input, &shown)
@@ -233,20 +522,92 @@ pub fn probe(tools: &Tools, input: impl AsRef<OsStr>) -> Result<Probe> {
 /// [`probe`] of a remote file's copy in sopen's cache: a refusal is said about `shown`, the
 /// file as its owner knows it (`host:/abs`) — never about the copy's path.
 pub fn probe_shown(tools: &Tools, input: impl AsRef<OsStr>, shown: &str) -> Result<Probe> {
-    let path = Path::new(input.as_ref());
-    let mut cmd = probe_command(tools, input.as_ref());
-    let out =
-        output(&mut cmd).with_context(|| format!("cannot run {}", tools.ffprobe.display()))?;
-    if !out.status.success() {
-        let said = last_line(&String::from_utf8_lossy(&out.stderr));
+    probe_input(tools, &Input::path(Path::new(input.as_ref())), shown)
+}
+
+/// How long a probe may run: then ffprobe is killed and reaped, and the probe fails (06 §7.4,
+/// W7's rule: every run on a `play` or `render` URL has an owner that ends it, and a client
+/// that neither reads nor closes keeps its seat until then). A choice, not a measurement: X1's
+/// probes took 0.33–1.84 s, the slowest at 0.7 MB/s.
+pub const PROBE_LIMIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// [`probe_shown`] of any [`Input`] (a served file through its URL), held to [`PROBE_LIMIT`].
+pub fn probe_input(tools: &Tools, input: &Input, shown: &str) -> Result<Probe> {
+    probe_within(tools, input, shown, PROBE_LIMIT)
+}
+
+/// [`probe_input`] with the time given (the tests shorten it). Over its time, or with the
+/// input's stream cut short meanwhile, the probe fails and says the Source's state.
+pub fn probe_within(
+    tools: &Tools,
+    input: &Input,
+    shown: &str,
+    limit: std::time::Duration,
+) -> Result<Probe> {
+    probe_timed(tools, input, shown, limit, &std::time::Instant::now)
+}
+
+/// [`probe_within`] on a clock of the caller's (the tests move it).
+pub fn probe_timed(
+    tools: &Tools,
+    input: &Input,
+    shown: &str,
+    limit: std::time::Duration,
+    now: &dyn Fn() -> std::time::Instant,
+) -> Result<Probe> {
+    let before = input.cuts();
+    let mut cmd = probe_command(tools, input);
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child =
+        spawn(&mut cmd).with_context(|| format!("cannot run {}", tools.ffprobe.display()))?;
+    // Both pipes are read while it runs, so it never blocks on a full one.
+    let mut stdout = child.stdout.take().expect("piped");
+    let out = std::thread::spawn(move || {
+        let mut json = Vec::new();
+        let _ = stdout.read_to_end(&mut json);
+        json
+    });
+    let err = ErrorTail::spawn(child.stderr.take().expect("piped"));
+    let deadline = now() + limit;
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break Some(status);
+        }
+        if now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            break None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5).min(limit));
+    };
+    let (json, said) = (
+        out.join().unwrap_or_default(),
+        err.join().unwrap_or_default(),
+    );
+    if let Some(why) = input.cut_since(before) {
+        bail!("ffprobe cannot read {shown}: {why}");
+    }
+    let Some(status) = status else {
+        let state = input
+            .trouble()
+            .map(|why| format!(": {why}"))
+            .unwrap_or_default();
+        bail!(
+            "ffprobe cannot read {shown}: it took longer than {} s and was stopped{state}",
+            limit.as_secs_f64()
+        );
+    };
+    if !status.success() {
+        let path = Path::new(&input.arg);
+        let said = input.said(&said.last_line());
         bail!("{}", probe_refusal_shown(path, shown, &said));
     }
-    parse_probe(&String::from_utf8_lossy(&out.stdout))
+    parse_probe(&String::from_utf8_lossy(&json))
 }
 
 /// The ffprobe run [`probe`] makes on `input`, not started: a preview runs the same one where it
 /// can be stopped ([`crate::gui::media::preview`]). Its stdout is what [`parse_probe`] reads.
-pub fn probe_command(tools: &Tools, input: &OsStr) -> Command {
+pub fn probe_command(tools: &Tools, input: &Input) -> Command {
     let mut cmd = Command::new(&tools.ffprobe);
     cmd.args([
         "-v",
@@ -257,7 +618,7 @@ pub fn probe_command(tools: &Tools, input: &OsStr) -> Command {
         "-show_streams",
         "-show_chapters",
     ])
-    .arg(input)
+    .args(input.probed())
     .stdin(Stdio::null());
     cmd
 }
@@ -1108,6 +1469,64 @@ impl EditSpec {
     }
 }
 
+impl EditSpec {
+    /// The inputs a render of this edit from `src` opens, each a run of pieces
+    /// ([`EditSpec::groups`]). An mp3 source gets one input that every piece is taken from,
+    /// decoded through once, whatever the pieces' order (06 Tensions, settled by W7): an exact
+    /// mp3 seek reads the file from byte 0, so an input per piece read it once per piece
+    /// (measured: 144 MB with 24 pieces fetched 679 MB through the byte server, sent 1.78 GB,
+    /// and nothing came out until every input had read to its piece; one input fetched
+    /// 142 MB, and the output was the same PCM). Pieces wanted later than the source gives
+    /// them wait in the graph as PCM, so this holds only while that wait is at most
+    /// [`HOLD_MAX`] ([`EditSpec::held`]); past it, the inputs of [`EditSpec::groups`].
+    pub fn groups_from(&self, src: &Input) -> Vec<Vec<usize>> {
+        let shared = src.ext() == "mp3"
+            && self.spans.len() > 1
+            && self.spans.iter().all(|s| s.file == 0)
+            && self.held() <= HOLD_MAX;
+        if shared {
+            vec![(0..self.spans.len()).collect()]
+        } else {
+            self.groups()
+        }
+    }
+
+    /// The most decoded sound one input decoded through in source order holds, in bytes, as
+    /// ffmpeg's float samples of every track. The decode is at source time `x`; each piece has
+    /// been given as much of itself as `x` has passed of it — two pieces over the same stretch
+    /// (one pasted after itself, or overlapping) both at once. The output takes the first piece
+    /// it has not finished as it comes; every piece after that one waits with what it has been
+    /// given. The most that waits is reached just before a piece the output is on ends, so it
+    /// is looked at there, and at every piece's start.
+    pub fn held(&self) -> u64 {
+        let per_s: f64 = self
+            .tracks
+            .iter()
+            .map(|t| f64::from(t.rate.unwrap_or(48_000)) * f64::from(t.channels.unwrap_or(2)))
+            .sum::<f64>()
+            .max(1.0)
+            * 4.0;
+        let spans = &self.spans;
+        let given = |k: usize, x: f64| (x - spans[k].start).clamp(0.0, spans[k].len.max(0.0));
+        let mut peak = 0.0f64;
+        for x in spans.iter().flat_map(|s| [s.start, s.start + s.len]) {
+            // At `x`, a piece ending exactly there is not finished yet (the moment before).
+            let Some(now) = (0..spans.len()).find(|&k| spans[k].start + spans[k].len >= x) else {
+                continue;
+            };
+            let waits: f64 = (now + 1..spans.len()).map(|k| given(k, x)).sum();
+            peak = peak.max(waits);
+        }
+        (peak * per_s) as u64
+    }
+}
+
+/// The most decoded sound a shared mp3 input may hold for pieces wanted later
+/// ([`EditSpec::groups_from`]): 128 MiB, about 6 minutes of 44.1 kHz stereo. A choice, not a
+/// measurement; measured, ffmpeg's peak memory rose by 15–28 MB for 90–115 s held and by
+/// 266 MB for 600 s held (06 Tensions).
+pub const HOLD_MAX: u64 = 128 << 20;
+
 /// One render opens at most this many inputs, each a demuxer and decoder of its own (300 of
 /// them took 1.6 GB on a 64×64 source and ran out of file descriptors at `ulimit -n 256`). An
 /// edit that needs more is rendered in passes ([`edit_passes`]).
@@ -1186,7 +1605,7 @@ pub fn edit_args(
         (true, Some(fps)) if fps > 0.0 => 0.5 / fps,
         _ => 0.0,
     };
-    let groups = spec.groups();
+    let groups = spec.groups_from(files[0]);
     if groups.len() > MAX_INPUTS {
         bail!(
             "one render reads at most {MAX_INPUTS} inputs; this edit needs {} (render it in \
@@ -1208,16 +1627,19 @@ pub fn edit_args(
             .map(|&i| spec.spans[i].start + spec.spans[i].len)
             .fold(0.0, f64::max);
         let pre = if ts { TS_PRESEEK_S } else { EDIT_PREROLL_S };
-        let seek = (first.start - half - pre).max(0.0);
+        let low = members
+            .iter()
+            .map(|&i| spec.spans[i].start)
+            .fold(f64::INFINITY, f64::min);
+        let seek = (low - half - pre).max(0.0);
         if seek > 0.0 {
             inputs.extend(["-ss".into(), OsString::from(format!("{seek:.6}"))]);
         }
         inputs.extend([
             "-t".into(),
             OsString::from(format!("{:.6}", end - seek + 1.0)),
-            "-i".into(),
-            file.arg().to_owned(),
         ]);
+        inputs.extend(file.args());
         let wanted_v: Vec<usize> = members
             .iter()
             .copied()
@@ -1407,9 +1829,9 @@ pub fn edit_args(
 /// `max_inputs`² separate stretches of the source is refused. `spec` is budgeted first
 /// ([`EditSpec::budget`]) and an intermediate's counts are its pieces' sums, so the final file
 /// holds exactly the frames and samples one pass would.
-pub fn edit_passes(spec: &EditSpec, max_inputs: usize) -> Result<Vec<EditSpec>> {
+pub fn edit_passes(spec: &EditSpec, src: &Input, max_inputs: usize) -> Result<Vec<EditSpec>> {
     let spec = spec.clone().budget();
-    let groups = spec.groups();
+    let groups = spec.groups_from(src);
     if groups.len() <= max_inputs {
         return Ok(vec![spec]);
     }
@@ -1596,16 +2018,6 @@ pub fn adapt_to_encoders(
     Ok(args)
 }
 
-/// The last line of `text` that says something (an error output's last words).
-pub(crate) fn last_line(text: &str) -> String {
-    text.lines()
-        .rev()
-        .find(|l| !l.trim().is_empty())
-        .unwrap_or("no error output")
-        .trim()
-        .to_string()
-}
-
 /// The bounded tail of a child's error output: the last `LINES` lines, at most `BYTES` bytes of
 /// them, a line that never ends cut to its first `BYTES` bytes (at a character's edge) and
 /// marked `…`. However much is printed — ffmpeg prints an error per damaged frame for as long as
@@ -1725,6 +2137,8 @@ pub struct Watchdog {
     mark: std::time::Instant,
     /// The last `out_time_us`, `frame` and `total_size` seen.
     seen: [Option<String>; 3],
+    /// The bytes its input had been sent, when last seen ([`Watchdog::fed`]).
+    fed: u64,
 }
 
 impl Watchdog {
@@ -1734,6 +2148,7 @@ impl Watchdog {
             idle: std::time::Duration::ZERO,
             mark: now,
             seen: [None, None, None],
+            fed: 0,
         }
     }
 
@@ -1763,6 +2178,19 @@ impl Watchdog {
             self.idle = std::time::Duration::ZERO;
         }
         moved
+    }
+
+    /// `bytes`: what the run's input has been sent so far (a streamed file's, by the byte server,
+    /// 06 §7.4), at `now`. More than before is the run going on, whatever its output says: a
+    /// render reading deep into an mp3 to its first piece has no output for as long as that
+    /// read lasts, and on a slow link that is longer than the limit.
+    pub fn fed(&mut self, bytes: u64, now: std::time::Instant) {
+        self.idle += now.saturating_duration_since(self.mark);
+        self.mark = now;
+        if bytes > self.fed {
+            self.fed = bytes;
+            self.idle = std::time::Duration::ZERO;
+        }
     }
 
     /// The caller's own work (the progress callback) ended at `now`: that time does not count.
@@ -1857,8 +2285,46 @@ pub fn run_watched(
     progress: &mut dyn FnMut(f64),
     limit: std::time::Duration,
 ) -> Result<()> {
+    run_stoppable(tools, args, length_s, progress, limit, Watched::plain())
+}
+
+/// What a run is watched by besides its output ([`run_stoppable`]).
+#[derive(Clone, Copy)]
+pub struct Watched<'a> {
+    /// True stops the run: ffmpeg killed and reaped, the error [`crate::remote::Cancelled`]
+    /// (an export's Cancel, 06 §7.4).
+    pub stopped: &'a dyn Fn() -> bool,
+    /// How many bytes the run's input has been sent: while it grows the run is not stalled,
+    /// though its output stands still ([`Watchdog::fed`]).
+    pub fed: &'a dyn Fn() -> u64,
+    /// The time the stall rule reads (the tests move it).
+    pub now: &'a dyn Fn() -> std::time::Instant,
+}
+
+impl Watched<'static> {
+    /// Nothing stops it, no input is counted, the real clock.
+    pub fn plain() -> Self {
+        Self {
+            stopped: &|| false,
+            fed: &|| 0,
+            now: &std::time::Instant::now,
+        }
+    }
+}
+
+/// [`run_watched`] that is also stopped, fed and timed as `watched` says. Its stop is asked
+/// at least every 250 ms whatever ffmpeg prints: a render blocked on its input prints nothing.
+pub fn run_stoppable(
+    tools: &Tools,
+    args: &[OsString],
+    length_s: f64,
+    progress: &mut dyn FnMut(f64),
+    limit: std::time::Duration,
+    watched: Watched<'_>,
+) -> Result<()> {
+    let Watched { stopped, fed, now } = watched;
     use std::sync::mpsc::{sync_channel, RecvTimeoutError};
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
     let mut cmd = Command::new(&tools.ffmpeg);
     cmd.args([
         "-hide_banner",
@@ -1900,16 +2366,31 @@ pub fn run_watched(
         }
     });
     let poll = Duration::from_millis(250).min(limit);
-    let mut dog = Watchdog::new(limit, Instant::now());
+    let mut dog = Watchdog::new(limit, now());
+    // The stall rule is looked at with what the input has been sent up to that moment: bytes
+    // that went while ffmpeg was waited for count before the wait does.
+    let fed_stalled = |dog: &mut Watchdog| {
+        dog.fed(fed(), now());
+        dog.stalled(now())
+    };
     let stall = |child: &mut std::process::Child, dog: &Watchdog| {
         let _ = child.kill();
         let _ = child.wait();
         anyhow!(stall_message(limit, dog.seen[0].as_deref()))
     };
+    let stop = |child: &mut std::process::Child| {
+        let _ = child.kill();
+        let _ = child.wait();
+        anyhow!(crate::remote::Cancelled)
+    };
     loop {
+        if stopped() {
+            return Err(stop(&mut child));
+        }
+        dog.fed(fed(), now());
         match rx.recv_timeout(poll) {
             Ok(Ok(line)) => {
-                dog.line(&line, Instant::now());
+                dog.line(&line, now());
                 if let Some(us) = line.strip_prefix("out_time_us=") {
                     if let Ok(us) = us.trim().parse::<f64>() {
                         if length_s > 0.0 {
@@ -1919,10 +2400,10 @@ pub fn run_watched(
                 } else if line == "progress=end" {
                     progress(1.0);
                 }
-                dog.resume(Instant::now());
+                dog.resume(now());
                 // Stuck, ffmpeg 7+ still prints a block every half second: checked here too,
                 // not only when nothing comes.
-                if dog.stalled(Instant::now()) {
+                if fed_stalled(&mut dog) {
                     return Err(stall(&mut child, &dog));
                 }
             }
@@ -1932,7 +2413,7 @@ pub fn run_watched(
                 return Err(e).context("reading ffmpeg's progress");
             }
             Err(RecvTimeoutError::Timeout) => {
-                if dog.stalled(Instant::now()) {
+                if fed_stalled(&mut dog) {
                     return Err(stall(&mut child, &dog));
                 }
             }
@@ -1944,11 +2425,16 @@ pub fn run_watched(
         if let Some(status) = child.try_wait()? {
             break status;
         }
-        if dog.stalled(Instant::now()) {
+        if stopped() {
+            return Err(stop(&mut child));
+        }
+        if fed_stalled(&mut dog) {
             return Err(stall(&mut child, &dog));
         }
         std::thread::sleep(Duration::from_millis(20));
     };
+    #[cfg(test)]
+    exits::note(args, status);
     let errors = errors.join().unwrap_or_default();
     if !status.success() {
         bail!("ffmpeg failed ({status}): {}", errors.last_line());

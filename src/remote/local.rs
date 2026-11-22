@@ -156,6 +156,16 @@ impl RemoteFs for LocalFs {
         path: &str,
         like: Option<Like>,
     ) -> std::result::Result<Uploaded, CreateError> {
+        self.create_from_stoppable(local, path, like, &|| false)
+    }
+
+    fn create_from_stoppable(
+        &mut self,
+        local: &Path,
+        path: &str,
+        like: Option<Like>,
+        stop: &dyn Fn() -> bool,
+    ) -> std::result::Result<Uploaded, CreateError> {
         let mut src = fs::File::open(local)
             .with_context(|| format!("cannot open {}", local.display()))
             .map_err(|e| CreateError::new(Created::No, e))?;
@@ -185,7 +195,22 @@ impl RemoteFs for LocalFs {
                 set_mode(like.mode & 0o777)?;
             }
             let mut out = Hashing::new(&dst);
-            std::io::copy(&mut src, &mut out).with_context(|| format!("cannot write {path}"))?;
+            let mut buf = vec![0u8; 256 << 10];
+            loop {
+                if stop() {
+                    return Err(anyhow!(super::Cancelled));
+                }
+                let n = match src.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => n,
+                    Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+                    Err(e) => {
+                        return Err(e).with_context(|| format!("cannot read {}", local.display()))
+                    }
+                };
+                out.write_all(&buf[..n])
+                    .with_context(|| format!("cannot write {path}"))?;
+            }
             let written = out.finish();
             if let Some(like) = like {
                 set_mode(like.mode)?;

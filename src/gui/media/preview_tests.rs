@@ -638,7 +638,7 @@ fn a_waveform_read_in_two_runs_is_the_waveform_of_one() {
             args.extend_from_slice(codec);
             make(&tools, &args, &path);
             let input = Input::path(&path);
-            let duration = ffmpeg::probe(&tools, &input).unwrap().duration.unwrap();
+            let duration = ffmpeg::probe(&tools, &path).unwrap().duration.unwrap();
             let read = |from: f64, len: Option<f64>, onto: Option<(&wave::Source, f64)>| {
                 let out = wave::command(&tools, &input, 1, from, len)
                     .stderr(Stdio::null())
@@ -1189,7 +1189,7 @@ fn the_encoder_is_asked_while_the_preview_is_prepared() {
             "the hand-over asked the encoder nothing"
         );
         assert_eq!(spawns::of(&fx.path), runs, "and ran no ffmpeg on the file");
-        let probe = ffmpeg::probe(&real, Input::path(&fx.path)).unwrap();
+        let probe = ffmpeg::probe(&real, &fx.path).unwrap();
         let takes = ffmpeg::encoder_pix_fmts(&real, cut::PLAN_ENCODER).unwrap();
         let as_opened = cut::plan_with(&probe, "deep.mov", Some(&takes)).ok();
         assert!(as_opened.is_some());
@@ -1261,7 +1261,7 @@ fn a_held_encoder_answer_never_holds_a_frame() {
                 fx.drv.find_text("checking the encoder…").is_none(),
                 "{which}: the answer landed"
             );
-            let probe = ffmpeg::probe(&real, Input::path(&fx.path)).unwrap();
+            let probe = ffmpeg::probe(&real, &fx.path).unwrap();
             let takes = ffmpeg::encoder_pix_fmts(&real, cut::PLAN_ENCODER).unwrap();
             let as_opened = cut::plan_with(&probe, "deep.mov", Some(&takes)).ok();
             assert_eq!(

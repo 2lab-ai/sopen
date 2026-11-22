@@ -161,6 +161,10 @@ pub(crate) enum Gate {
     Fail(std::io::Error),
 }
 
+/// The seam a test sees the no-progress rule's looks through ([`Seams::evaluated`]).
+#[cfg(test)]
+pub(crate) type Evaluated = Arc<dyn Fn(u64, Duration, Instant) + Send + Sync>;
+
 /// Tests: places where a test stops a thread of the server, or decides what a write does.
 #[cfg(test)]
 #[derive(Clone, Default)]
@@ -172,6 +176,15 @@ pub(crate) struct Seams {
     pub before_write: Option<Arc<dyn Fn(u64, usize) -> Gate + Send + Sync>>,
     /// Called when a write to a client would take nothing now, before it is made to block.
     pub blocking: Option<Arc<dyn Fn() + Send + Sync>>,
+    /// Called when a write of a response's body would take nothing now, before it is made to
+    /// block: the connection and its kind.
+    pub body_blocked: Option<Arc<dyn Fn(u64, Kind) + Send + Sync>>,
+    /// Called each time a write's wait ran out and the no-progress rule looked at the clock: the
+    /// connection, the time the rule has counted for it, and the time read.
+    pub evaluated: Option<Evaluated>,
+    /// Called after each write that took bytes: the connection and the send buffer the kernel
+    /// keeps for its socket then.
+    pub send_buffer: Option<Arc<dyn Fn(u64, usize) + Send + Sync>>,
     /// The accept thread cannot be started: the start fails after the watch is running.
     pub no_accept_thread: bool,
     /// Called at each look at a response's socket: an error it returns is what the look's
@@ -266,6 +279,10 @@ struct Shared {
     /// The watch waits here, on `conns`, while no body is under way.
     watching: Condvar,
     account: Mutex<Account>,
+    /// Body bytes sent to clients, by reader kind ([`Server::sent`]).
+    sent: [AtomicU64; 3],
+    /// Responses begun, each a reader of its own, by kind ([`Server::opened`]).
+    opened: [AtomicU64; 3],
     config: Config,
     /// Tests: socket waits that ran out and looked at the clock.
     #[cfg(test)]
@@ -527,6 +544,8 @@ impl Server {
             conns: Mutex::default(),
             watching: Condvar::new(),
             account: Mutex::default(),
+            sent: Default::default(),
+            opened: Default::default(),
             config,
             #[cfg(test)]
             checks: AtomicU64::new(0),
@@ -604,6 +623,18 @@ impl Server {
     /// The last response of this kind ended early: what a failed run says of its input.
     pub fn last_cut(&self, kind: Kind) -> Option<Cut> {
         self.shared.account().tally(kind).last.clone()
+    }
+
+    /// Body bytes sent so far to clients of this kind: a run's input going on (a render's
+    /// watchdog counts it as progress, 06 §7.4).
+    pub fn sent(&self, kind: Kind) -> u64 {
+        self.shared.sent[kind as usize].load(Ordering::SeqCst)
+    }
+
+    /// Responses of this kind begun so far, each read by a reader of its own: what a run's
+    /// readers are counted by (06 §12 V16's allowance).
+    pub fn opened(&self, kind: Kind) -> u64 {
+        self.shared.opened[kind as usize].load(Ordering::SeqCst)
     }
 
     #[cfg(test)]
@@ -744,6 +775,7 @@ fn admit(shared: &Arc<Shared>, stream: TcpStream) {
     if stream.set_nonblocking(false).is_err() || !peer_ok(&stream) {
         return;
     }
+    bound_send_buffer(&stream);
     let Ok(twin) = stream.try_clone() else {
         return;
     };
@@ -792,6 +824,8 @@ fn admit(shared: &Arc<Shared>, stream: TcpStream) {
         idle: Duration::ZERO,
         progress: 0,
         stalls: true,
+        #[cfg(test)]
+        body: None,
     };
     let spawned = std::thread::Builder::new()
         .name("sopen-http-conn".into())
@@ -1171,6 +1205,48 @@ impl Drop for Response {
     }
 }
 
+/// The send buffer each accepted socket is given (06 §7.4, V16): what the kernel holds of a
+/// response its client has not read yet. A body is read from the Source as fast as its writes
+/// return, so this, with the block in hand and what the client's own socket holds, is how far
+/// a connection is read ahead of its client. Left to itself Linux grows it with the
+/// connection, to `tcp_wmem`'s ceiling (4 MiB): a decoder's opening connection, read a few KB
+/// of and closed, had MBs read for it, and readahead past the cache (W7, measured).
+pub(crate) const SEND_BUFFER: usize = 128 << 10;
+
+/// Gives `stream` a send buffer of [`SEND_BUFFER`] (Linux keeps twice what is asked, for its
+/// bookkeeping). A refusal leaves the kernel's own: the connection works either way.
+fn bound_send_buffer(stream: &TcpStream) {
+    let size = SEND_BUFFER as libc::c_int;
+    // SAFETY: a valid descriptor, and a pointer to an int of the length given, read only.
+    unsafe {
+        libc::setsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_SNDBUF,
+            (&size as *const libc::c_int).cast(),
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        );
+    }
+}
+
+/// Tests: the send buffer the kernel keeps for `stream` now.
+#[cfg(test)]
+fn send_buffer_of(stream: &TcpStream) -> usize {
+    let mut size: libc::c_int = 0;
+    let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+    // SAFETY: a valid descriptor, and an int of the length given to write into.
+    unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_SNDBUF,
+            (&mut size as *mut libc::c_int).cast(),
+            &mut len,
+        );
+    }
+    size.max(0) as usize
+}
+
 fn timed_out(e: &std::io::Error) -> bool {
     matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut)
 }
@@ -1194,6 +1270,9 @@ struct Conn {
     /// The no-progress timer runs: on every answer but a `render` or `play` body
     /// ([`Kind::stalls`]).
     stalls: bool,
+    /// Tests: the body of a response of this kind is under way (its head has been written).
+    #[cfg(test)]
+    body: Option<Kind>,
 }
 
 impl Conn {
@@ -1309,20 +1388,27 @@ impl Conn {
             #[cfg(test)]
             let wrote = {
                 let seams = &self.shared.config.seams;
-                // With that seam, a write is first tried without waiting: one that takes
+                // With those seams, a write is first tried without waiting: one that takes
                 // nothing is said, and then made again, to block.
-                let tried = seams.blocking.as_ref().and_then(|blocking| {
+                let watched = seams.blocking.is_some() || seams.body_blocked.is_some();
+                let tried = watched.then(|| {
                     let _ = self.stream.set_nonblocking(true);
                     let tried = self.stream.write(bytes);
                     let _ = self.stream.set_nonblocking(false);
-                    match tried {
-                        Err(e) if e.kind() == ErrorKind::WouldBlock => {
-                            blocking();
-                            None
-                        }
-                        tried => Some(tried),
-                    }
+                    tried
                 });
+                let tried = match tried {
+                    Some(Err(e)) if e.kind() == ErrorKind::WouldBlock => {
+                        if let Some(blocking) = &seams.blocking {
+                            blocking();
+                        }
+                        if let (Some(said), Some(kind)) = (&seams.body_blocked, self.body) {
+                            said(self.id, kind);
+                        }
+                        None
+                    }
+                    tried => tried,
+                };
                 let gate = seams.before_write.as_ref();
                 match (
                     tried,
@@ -1345,6 +1431,10 @@ impl Conn {
                 Ok(0) => return Err(Stop::Failed("the socket took no bytes".into())),
                 Ok(n) => {
                     sent(n);
+                    #[cfg(test)]
+                    if let Some(seen) = &self.shared.config.seams.send_buffer {
+                        seen(self.id, send_buffer_of(&self.stream));
+                    }
                     bytes = &bytes[n..];
                     self.written += n as u64;
                     self.progress += n as u64;
@@ -1353,7 +1443,13 @@ impl Conn {
                         self.shared.reset();
                     }
                 }
-                Err(e) if timed_out(&e) => self.shared.checked(),
+                Err(e) if timed_out(&e) => {
+                    self.shared.checked();
+                    #[cfg(test)]
+                    if let Some(evaluated) = &self.shared.config.seams.evaluated {
+                        evaluated(self.id, self.idle, now);
+                    }
+                }
                 Err(e) if e.kind() == ErrorKind::Interrupted => {}
                 Err(e) => return Err(self.write_failed(e)),
             }
@@ -1399,6 +1495,7 @@ impl Conn {
         // The reader first, then the size: a reload between them gives the reader `Reloaded`
         // for every read, so a head of the new size is never followed by bytes.
         let mut reader = shared.source.reader(request.kind.reader(rate));
+        shared.opened[request.kind as usize].fetch_add(1, Ordering::SeqCst);
         let size = reader.len();
         let Ok((start, length, partial)) = request.range.within(size) else {
             return self.refuse(416, Some(size));
@@ -1433,6 +1530,10 @@ impl Conn {
         // The head has gone, under the 60 s like every answer's. Only the body of a `render`
         // or `play` response is exempt from here on ([`Kind::stalls`]).
         self.stalls = request.kind.stalls();
+        #[cfg(test)]
+        {
+            self.body = Some(request.kind);
+        }
         let mut buf = vec![0u8; BLOCK as usize];
         if stop.is_none() && at < end {
             // From here the thread may wait for a block, where it does not see its socket.
@@ -1445,8 +1546,10 @@ impl Conn {
             stop = match got {
                 Ok(n) if n == want => {
                     let mut off = at;
+                    let kind = request.kind as usize;
                     let sent = self.send(&buf[..want], |n| {
                         shared.source.sent_http(off, n as u64);
+                        shared.sent[kind].fetch_add(n as u64, Ordering::SeqCst);
                         off += n as u64;
                     });
                     at = off;
