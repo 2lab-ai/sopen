@@ -770,8 +770,8 @@ impl MediaFile {
             let fs = self.origin.fs()?;
             let Some(patcher) = fs.patcher() else {
                 bail!(
-                    "not saved: an earlier save was cut off, and this connection cannot read \
-                     {shown} to tell whether it landed: check it"
+                    "save outcome unknown: an earlier save was cut off, and this connection \
+                     cannot read {shown} to tell whether it landed: check it"
                 );
             };
             let found = journal::reconcile(&intent, &host, &mut remote::patch::Fresh::new(patcher));
@@ -847,9 +847,11 @@ impl MediaFile {
                     }
                     return Ok(Saved::FoundLanded { line, media });
                 }
+                // The file may hold that Save's render already: never "not saved". (`InPart` is a
+                // write in place's, run by run; a media Save writes through a temp.)
                 journal::Outcome::InPart | journal::Outcome::Unknown => {
                     return Ok(Saved::Unresolved {
-                        message: format!("not saved: {}", found.line),
+                        message: format!("save outcome unknown: {}", found.line),
                     });
                 }
             }
@@ -1632,18 +1634,20 @@ impl Edits {
         })
     }
 
-    /// Nothing is edited: the whole source, as it is.
+    /// Nothing is edited: the whole source, as it is, and no crop drawn (one is an edit the
+    /// journal keeps, 07 §2, though Save writes the edit list only).
     pub fn is_identity(&self) -> bool {
-        !self.stereo && self.clips == [(0, self.source)]
+        !self.stereo && self.clips == [(0, self.source)] && self.crop.is_none()
     }
 
     /// `3 pieces`, `1 piece, stereo`.
     pub fn summary(&self) -> String {
         let n = self.clips.len();
         format!(
-            "{n} piece{}{}",
+            "{n} piece{}{}{}",
             if n == 1 { "" } else { "s" },
-            if self.stereo { ", stereo" } else { "" }
+            if self.stereo { ", stereo" } else { "" },
+            if self.crop.is_some() { ", crop" } else { "" }
         )
     }
 }
@@ -1752,7 +1756,6 @@ pub fn recover(file: &Mutex<MediaFile>) -> Vec<Row> {
         let (host, abs, cache) = file.place();
         (host, abs, cache, file.journal_fs.clone())
     };
-    let want = this_files_journals(&cache, &host, &abs);
     let started = std::time::Instant::now();
     let mut orphans = Vec::new();
     loop {
@@ -1760,7 +1763,11 @@ pub fn recover(file: &Mutex<MediaFile>) -> Vec<Row> {
             Ok(found) => orphans = found,
             Err(e) => crate::debug!("journal: no listing: {e:#}"),
         }
-        if orphans.len() >= want || started.elapsed() >= LOCK_RETRY {
+        // Counted after each listing (as image and hex do): a folder the listing removed is not
+        // waited for.
+        if orphans.len() >= this_files_journals(&cache, &host, &abs)
+            || started.elapsed() >= LOCK_RETRY
+        {
             break;
         }
         orphans.clear();
@@ -1973,11 +1980,57 @@ fn path_of(part: &std::fs::File, ctl: &crate::gui::save_as::Ctl<'_>) -> Result<P
     Ok(path)
 }
 
+/// Whether another user could rename entries of a folder this user's process writes in: one
+/// not this user's (`owner` is not `uid`), or one writable by group or others without the
+/// sticky bit. (An entry renamed there between a check and a later open by path is another
+/// user's to plant.)
+pub(super) fn shared_folder(owner: u32, mode: u32, uid: u32) -> bool {
+    owner != uid || (mode & 0o022 != 0 && mode & 0o1000 == 0)
+}
+
+/// [`shared_folder`] of the folder at `path` (followed: the folder itself).
+fn shared_folder_at(path: &Path) -> Result<bool> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = std::fs::metadata(path)
+        .with_context(|| format!("cannot look at the folder {}", path.display()))?;
+    // SAFETY: `geteuid` cannot fail and touches no memory.
+    let uid = unsafe { libc::geteuid() };
+    Ok(shared_folder(meta.uid(), meta.mode(), uid))
+}
+
+/// `from` (a finished render) copied into `part` through its handle, stopping at a cancel.
+fn copy_in(
+    from: &Path,
+    part: &mut std::fs::File,
+    ctl: &crate::gui::save_as::Ctl<'_>,
+) -> Result<()> {
+    use std::io::{Read as _, Write as _};
+    let mut src =
+        std::fs::File::open(from).with_context(|| format!("cannot read {}", from.display()))?;
+    let mut buf = vec![0u8; 1 << 20];
+    loop {
+        if ctl.cancelled() {
+            return Err(anyhow!(remote::Cancelled));
+        }
+        let n = src
+            .read(&mut buf)
+            .with_context(|| format!("cannot read {}", from.display()))?;
+        if n == 0 {
+            return Ok(());
+        }
+        part.write_all(&buf[..n])
+            .context("cannot write the staging file")?;
+    }
+}
+
 /// Save As's producer for the media window: the edit rendered from the window's input (a stream
 /// through its `render` URL — a response cut short fails the render) straight into the modal's
 /// staging `part`, by its path and with the output's container said explicitly (`part` has no
 /// extension: `ffmpeg::edit_args_as`). Passes of a long edit, and ffmpeg's graph files, go to a
-/// private folder of sopen's exports; the output itself is written once, into `part`.
+/// private folder of sopen's exports; the output itself is written once, into `part` — except
+/// in a folder another user could rename entries of ([`shared_folder`]): ffmpeg opens its
+/// output by path, so there it renders into that private folder (after its room is checked)
+/// and the output is copied in through `part`'s handle.
 pub struct MediaProducer {
     pub media: Arc<Media>,
     pub spec: EditSpec,
@@ -1986,7 +2039,15 @@ pub struct MediaProducer {
     /// 30 % for this long, or until cancelled; `held` is set meanwhile.
     pub hold: Option<Duration>,
     pub held: Arc<AtomicBool>,
+    /// The tests' look between the staging file's check and the render's open: the path the
+    /// render writes, and `part`'s.
+    #[cfg(test)]
+    pub before_render: Option<BeforeRender>,
 }
+
+/// [`MediaProducer::before_render`]: given the path the render writes, and `part`'s.
+#[cfg(test)]
+pub type BeforeRender = Box<dyn FnOnce(&Path, &Path) + Send>;
 
 impl crate::gui::save_as::Producer for MediaProducer {
     fn fill(
@@ -1999,15 +2060,42 @@ impl crate::gui::save_as::Producer for MediaProducer {
         };
         let estimate = estimate_size(&self.media, &self.spec);
         let dst = path_of(part, ctl)?;
+        let folder = dst
+            .parent()
+            .and_then(Path::parent)
+            .context("the staging file has no folder")?;
+        let shared = shared_folder_at(folder)?;
+        if shared {
+            crate::cache::private_dir(&self.work_root)?;
+            if let Some(free) = remote::LocalFs::free_space_at(&self.work_root) {
+                if free < estimate {
+                    bail!(
+                        "the render needs about {} free in {}, there is {}",
+                        crate::human(estimate),
+                        crate::gui::binary::tilde(&self.work_root),
+                        crate::human(free)
+                    );
+                }
+            }
+        }
         let work = self.work_root.join(remote::random_hex());
         let _job = crate::cache::JobLock::take(&work)?;
         crate::cache::private_dir(&work)?;
+        let out = if shared {
+            work.join(format!("render.{ext}"))
+        } else {
+            dst.clone()
+        };
+        #[cfg(test)]
+        if let Some(look) = self.before_render.take() {
+            look(&out, &dst);
+        }
         let mut hold = self.hold;
         let held = self.held.clone();
         let rendered = cut::render_edit_stoppable(
             &self.media.tools,
             &self.media.input,
-            (&dst, Some(ext.as_str())),
+            (&out, Some(ext.as_str())),
             &self.spec,
             (kind, &plan),
             &work,
@@ -2026,8 +2114,13 @@ impl crate::gui::save_as::Producer for MediaProducer {
             },
             &|| ctl.cancelled(),
         );
+        let copied = match rendered {
+            Ok(_) if shared => copy_in(&out, part, ctl),
+            Ok(_) => Ok(()),
+            Err(e) => Err(e),
+        };
         let _ = std::fs::remove_dir_all(&work);
-        rendered?;
+        copied?;
         let written = part.metadata()?.len();
         ctl.progress(written);
         Ok(written)

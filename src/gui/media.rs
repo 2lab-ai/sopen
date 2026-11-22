@@ -1284,6 +1284,8 @@ fn autosave_as(
         work_root: work_root.to_path_buf(),
         hold: save_as_hold(),
         held: Arc::default(),
+        #[cfg(test)]
+        before_render: None,
     };
     let (dest, _) = save_as::first_path(folder, &name);
     let decision = super::binary::Decision::new();
@@ -1513,10 +1515,7 @@ fn report_save(result: &Result<Saved>, outcome: &mut Outcome, host: &str) -> (St
         Ok(Saved::Unresolved { message }) => {
             outcome.refused = Some(message.clone());
             eprintln!("sopen: {message}");
-            (
-                Status::error("not saved: an earlier save was cut off"),
-                vec![message.clone()],
-            )
+            (Status::error("save outcome unknown"), vec![message.clone()])
         }
         Err(e) => {
             eprintln!("sopen: {e:#}");
@@ -1999,15 +1998,22 @@ impl MediaWindow {
         tl.is_identity() && !tl.can_undo() && !tl.can_redo() && !self.busy() && !self.sel.is_set()
     }
 
-    /// Unsaved edits: the output is not the file as it is.
+    /// Edits a Save writes: the output is not the file as it is. (The crop is not one: Save
+    /// writes the edit list only, never the rectangle — Export crops, 01 A4.)
     fn unsaved(&self) -> bool {
         !self.timeline.is_identity()
     }
 
-    /// Unsaved edits that are nowhere else either: not in a file a Save As wrote (07 §7, "What
-    /// it counts as"). Closing asks only about these.
+    /// Edits closing would lose: [`Self::unsaved`]'s, or a crop drawn — one the journal keeps
+    /// (07 §2) and Restore draws again.
+    fn has_edits(&self) -> bool {
+        self.unsaved() || self.crop().is_some()
+    }
+
+    /// Edits that are nowhere else either: not in a file a Save As wrote (07 §7, "What it
+    /// counts as"). Closing asks only about these, and the journal keeps them.
     fn unsaved_nowhere(&self) -> bool {
-        self.unsaved() && self.copied.as_deref() != Some(self.edits().text().as_str())
+        self.has_edits() && self.copied.as_deref() != Some(self.edits().text().as_str())
     }
 
     /// The window's edits as the journal keeps them.
@@ -2029,6 +2035,7 @@ impl MediaWindow {
             && !self.prompt
             && !self.unknown
             && self.save_as.is_none()
+            && self.restoring.is_none()
     }
 
     fn show_frame(&mut self, ctx: &egui::Context, rgba: &[u8], t: f64, key: Option<Tick>) {
@@ -2707,13 +2714,18 @@ impl MediaWindow {
 
     // ---- the journal (07 §3) ----
 
-    /// After a Save that landed: nothing is unsaved (no edit is taken while a Save runs), and
-    /// the Save's worker retired the journal; nothing is due.
+    /// After a Save that landed: nothing it writes is unsaved (no edit is taken while a Save
+    /// runs), and the Save's worker retired the journal; nothing is due — unless a crop stays
+    /// drawn (Save never writes it): that is kept on its own, in a journal of its own.
     fn saved_journal(&mut self) {
         self.journal_epoch.fetch_add(1, SeqCst);
         self.journal_dir = None;
         self.schedule = Schedule::default();
-        self.journal_text = (self.edits().text(), self.evidence_known());
+        self.journal_text = if self.journal_wants() {
+            Default::default()
+        } else {
+            (self.edits().text(), self.evidence_known())
+        };
     }
 
     /// After a Save that did not land: its worker kept the edits of revision `rev` in the
@@ -2768,7 +2780,7 @@ impl MediaWindow {
                 }
             }
         }
-        if self.unsaved() && self.pass.is_none() && self.save.is_none() {
+        if self.has_edits() && self.pass.is_none() && self.save.is_none() {
             if let Ok(mut file) = self.file.try_lock() {
                 file.start_pass(&self.media.input);
                 self.pass = file.pass();
@@ -3117,14 +3129,24 @@ impl MediaWindow {
         self.save.is_none() && self.answering.is_none() && self.restoring.is_none()
     }
 
+    /// No generation of the window's own is on its way (or due at once): Restore takes a
+    /// journal over only then — never over one a write is making, nor waiting for it.
+    fn no_write_on_its_way(&self) -> bool {
+        self.writing.is_none() && !self.write_soon
+    }
+
     /// Restore (07 §3): the row's journal is taken over by this window (on a worker: its folder
     /// is read, and a cut-off Save's record it still holds — one whose outcome could not be told
     /// — ends, the row having named what to check) and its edits applied, unless the window has
     /// edits of its own (`undo or save them first`), the row still asks its question, or they
     /// were made on another timeline than this file's.
     fn restore_row(&mut self, i: usize) {
-        if self.unsaved() || self.journal_dir.is_some() {
+        if self.has_edits() || self.journal_dir.is_some() {
             return self.status = Status::error("undo or save them first");
+        }
+        if !self.no_write_on_its_way() {
+            return self.status =
+                Status::error("this window's edits are being kept: Restore once that is done");
         }
         let Some(Row::Edits { edits, temp, .. }) = self.rows.get(i) else {
             return;
@@ -3156,10 +3178,20 @@ impl MediaWindow {
         self.status = Status::info("restoring…");
     }
 
-    /// A Restore's journal taken over: its edits are the window's from now on.
+    /// A Restore's journal taken over: its edits are the window's from now on. Installed only
+    /// when the window's journal slot is free at once — never waited for on the frame.
     fn poll_restoring(&mut self, ctx: &egui::Context) {
         let Some(rx) = &self.restoring else {
             return;
+        };
+        let slot = self.journal.clone();
+        let mut slot = match slot.try_lock() {
+            Ok(slot) => slot,
+            Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                ctx.request_repaint_after(Duration::from_millis(10));
+                return;
+            }
         };
         let taken = match rx.try_recv() {
             Ok(taken) => taken,
@@ -3172,7 +3204,8 @@ impl MediaWindow {
             Err(why) => return self.status = Status::error(format!("not restored: {why}")),
         };
         self.journal_dir = Some(adopted.dir().to_path_buf());
-        *self.journal.lock().unwrap_or_else(|p| p.into_inner()) = Some(adopted);
+        *slot = Some(adopted);
+        drop(slot);
         let view = self.view();
         let clips = edits
             .clips
@@ -3347,7 +3380,10 @@ impl MediaWindow {
                     let label = if anyway { "Restore anyway" } else { "Restore" };
                     if restore
                         && ui
-                            .add_enabled(free && temp.is_none(), egui::Button::new(label))
+                            .add_enabled(
+                                free && temp.is_none() && self.no_write_on_its_way(),
+                                egui::Button::new(label),
+                            )
                             .clicked()
                     {
                         act = Some(Act::Restore(i));
@@ -3467,6 +3503,8 @@ impl MediaWindow {
             work_root: self.work_root.clone(),
             hold: save_as_hold(),
             held: self.save_as_held.clone(),
+            #[cfg(test)]
+            before_render: None,
         };
         let job = save_as::Job {
             name,
@@ -3633,12 +3671,10 @@ impl MediaWindow {
                 self.left = Some(left);
                 self.kept_by_save(job.rev);
             }
-            // The record cannot tell how that Save went: it stays, named, and editing resumes —
-            // the edits are the window's again (07 §3.1 "Anything else").
-            Ok(Saved::Unresolved { .. }) => {
-                self.unknown = false;
-                self.kept_by_save(job.rev);
-            }
+            // The record cannot tell how that Save went: it stays, named, and so does the
+            // generation it rendered — no edit is made until a Save tells it (07 §3.1: landed
+            // means every edit in the journal is in the file). Save As, Discard and closing stay.
+            Ok(Saved::Unresolved { .. }) => self.kept_by_save(job.rev),
             Ok(Saved::Refused { .. } | Saved::Stopped { .. }) => self.kept_by_save(job.rev),
             Err(e) if crate::remote::is_outcome_unknown(&e) => {
                 self.unknown = true;
@@ -3790,7 +3826,8 @@ impl MediaWindow {
             self.cancel_export();
         } else if self.save.is_some() && plain_key(ctx, Key::Escape) {
             self.stop_save();
-        } else if self.sel.is_set() && plain_key(ctx, Key::Escape) {
+        } else if self.sel.is_set() && self.editable() && plain_key(ctx, Key::Escape) {
+            // (Not while editing is off: Esc is then what it is without a rectangle.)
             self.sel.clear();
         } else if self.marks.selected() && plain_key(ctx, Key::Escape) {
             self.marks.clear();
@@ -4074,7 +4111,10 @@ impl MediaWindow {
             }
             if !self.audio_only()
                 && ui
-                    .add_enabled(self.crop().is_some(), egui::Button::new("Clear rect"))
+                    .add_enabled(
+                        editable && self.crop().is_some(),
+                        egui::Button::new("Clear rect"),
+                    )
                     .on_hover_text("Esc")
                     .clicked()
             {
@@ -4248,18 +4288,22 @@ impl MediaWindow {
                 let text = egui::RichText::new(format!("crop {x},{y} {w}×{h}{even}")).monospace();
                 ui.add(egui::Label::new(text).truncate());
             }
-            if self.unsaved() {
+            if self.has_edits() {
                 ui.separator();
                 let pieces = self.timeline.clips().len();
-                let text = format!(
-                    "unsaved: {pieces} piece{}{}",
-                    if pieces == 1 { "" } else { "s" },
-                    if self.timeline.stereo() {
-                        ", stereo"
-                    } else {
-                        ""
-                    }
-                );
+                let text = if self.unsaved() {
+                    format!(
+                        "unsaved: {pieces} piece{}{}",
+                        if pieces == 1 { "" } else { "s" },
+                        if self.timeline.stereo() {
+                            ", stereo"
+                        } else {
+                            ""
+                        }
+                    )
+                } else {
+                    "unsaved: the crop".to_string()
+                };
                 ui.add(egui::Label::new(egui::RichText::new(text)).truncate());
                 // 07 §3: whether the edits are on the local disk yet (the path whole on hover).
                 let (kept, bad) = self.kept_line();
@@ -4317,7 +4361,8 @@ impl MediaWindow {
             Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
             Color32::WHITE,
         );
-        if !self.prompt {
+        // The rectangle is an edit (07 §2): drawn only while editing is possible (§10).
+        if self.editable() {
             self.sel.handle(ui, &resp, map);
         }
         self.sel.draw(&painter, map);
@@ -4336,6 +4381,13 @@ impl MediaWindow {
             && self.media.save_block().is_none()
             && !self.stale;
         let can_save_as = self.media.plan.is_some() && !self.stale;
+        // A crop alone: Save and Save As write the edit list only (01 A4) — nothing to write.
+        let crop_only = !self.unsaved() && !self.unknown;
+        let (can_save, can_save_as) = if crop_only {
+            (false, false)
+        } else {
+            (can_save, can_save_as)
+        };
         let exporting = self.job.is_some();
         let discard_hover = match &self.journal_dir {
             Some(dir) => format!("deletes the kept edits at {}", super::binary::tilde(dir)),
@@ -4343,10 +4395,14 @@ impl MediaWindow {
         };
         let modal = super::chrome::dialog(ctx, id, "Unsaved changes", |ui| {
             ui.set_width(360.0);
-            ui.label(format!(
-                "Save the changes to {} before closing?",
-                self.title
-            ));
+            ui.label(if crop_only {
+                format!(
+                    "Discard the crop drawn on {}? Save writes the edit list only; Export crops.",
+                    self.title
+                )
+            } else {
+                format!("Save the changes to {} before closing?", self.title)
+            });
             ui.add_space(8.0);
             ui.horizontal(|ui| {
                 if can_save
@@ -4375,6 +4431,7 @@ impl MediaWindow {
                     // With an export running the window still waits for it (closing again
                     // closes it now): that rule is unchanged by the edits.
                     self.timeline = Timeline::new(self.media.rate(), self.media.ticks());
+                    self.sel.clear();
                     super::request_close(ctx);
                 }
                 if ui.button("Cancel").clicked() {

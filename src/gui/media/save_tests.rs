@@ -353,25 +353,26 @@ impl Ed {
         remote: PathBuf,
     ) -> Ed {
         let abs = remote.to_str().unwrap().to_string();
+        let name = remote.file_name().unwrap().to_string_lossy().into_owned();
         let shown = format!("{HOST}:{abs}");
         let cache = tmp.path().join("cache");
         let mut fs = conn(side);
         let (media, at, served) = match read {
             Read::Copy => {
-                let copy = tmp.path().join("copy").join("r.wav");
+                let copy = tmp.path().join("copy").join(&name);
                 std::fs::create_dir_all(copy.parent().unwrap()).unwrap();
                 std::fs::copy(&remote, &copy).unwrap();
                 let bytes = std::fs::read(&copy).unwrap();
                 let mut at = fs.stat(&abs).unwrap();
                 at.sha256 = Some(journal::sha256(&bytes));
-                let media = Media::probe_shown(&Input::path(&copy), "r.wav", &shown).unwrap();
+                let media = Media::probe_shown(&Input::path(&copy), &name, &shown).unwrap();
                 (media, at, None)
             }
             Read::Stream => {
                 let transport = conn(side).into_ranged(&abs).map_err(|r| r.error).unwrap();
                 let at = transport.opened();
                 let source = Source::open(transport, no_reopen(), Arc::new(|| {})).unwrap();
-                let media = Media::stream(source, "r.wav", &shown).unwrap();
+                let media = Media::stream(source, &name, &shown).unwrap();
                 let served = media.input.served().map(Arc::downgrade);
                 (media, at, served)
             }
@@ -446,6 +447,13 @@ impl Ed {
     fn save(&mut self) {
         self.drv.key(&mut self.win, Key::S, command(false));
         assert!(self.win.save.is_some(), "⌘S started a save");
+        self.wait_save();
+    }
+
+    /// ⌘S and the Save's end, for a Save that may end within the key's own frames (one that
+    /// renders nothing).
+    fn save_briefly(&mut self) {
+        self.drv.key(&mut self.win, Key::S, command(false));
         self.wait_save();
     }
 
@@ -1234,7 +1242,7 @@ fn f7_and_alt_command_s_open_save_as_and_save_as_writes_a_local_file() {
             return;
         };
         let folder = ed.tmp.path().join("out");
-        std::fs::create_dir(&folder).unwrap();
+        own_folder(&folder);
         ed.win.save_as_folder = Some(folder.clone());
         ed.drv.as_shell();
         ed.drv.idle(&mut ed.win, 1);
@@ -1977,9 +1985,10 @@ fn save_as_of_a_video_renders_straight_into_part() {
         work_root: exports.clone(),
         hold: None,
         held: Arc::default(),
+        before_render: None,
     };
     let folder = tmp.path().join("out");
-    std::fs::create_dir(&folder).unwrap();
+    own_folder(&folder);
     let dest = folder.join("v.edited.mp4");
     let decision = super::super::binary::Decision::new();
     let ctl = save_as::Ctl::new(&decision, &|_| {});
@@ -1997,6 +2006,14 @@ fn save_as_of_a_video_renders_straight_into_part() {
     let duration = probe.duration.unwrap();
     assert!((duration - 1.0).abs() < 0.05, "{duration}");
     assert!(probe.video.is_some() && probe.has_audio);
+}
+
+/// A folder of this user's only (0700, whatever the umask): Save As renders straight into its
+/// staging `part` there.
+fn own_folder(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::create_dir(path).unwrap();
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
 }
 
 /// The journal's current generation's edits in `dir` (read off the disk).
@@ -2213,5 +2230,499 @@ fn closing_writes_the_newest_edits_first_and_goes_only_once_they_are_on_disk() {
         assert_eq!(dirs.len(), 1, "{side:?}");
         assert_eq!(kept_edits(&dirs[0]), edits, "{side:?}");
         drop(tmp);
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// An earlier Save whose outcome cannot be told; the crop on its own; Restore beside a write of
+// the window's own; Save As into a folder others can rename in.
+
+/// A Save whose rename landed with its reply lost, then the file at its name swapped for other
+/// bytes, the landed file kept aside: the retry cannot tell how that Save went. Also returned:
+/// the file's bytes and modification time before that Save.
+fn cut_off_and_swapped(side: Side) -> Option<(Ed, PathBuf, (Vec<u8>, std::time::SystemTime))> {
+    let mut ed = Ed::open(side, Read::Copy, Knobs::default())?;
+    let before = (
+        std::fs::read(&ed.remote).unwrap(),
+        std::fs::metadata(&ed.remote).unwrap().modified().unwrap(),
+    );
+    ed.knobs.lose_rename.store(true, SeqCst);
+    ed.cut_second();
+    ed.save();
+    assert_eq!(
+        ed.win.status.text,
+        "save outcome unknown",
+        "{side:?}: {}",
+        ed.texts()
+    );
+    let aside = ed.tmp.path().join("landed");
+    std::fs::rename(&ed.remote, &aside).unwrap();
+    std::fs::write(
+        &ed.remote,
+        b"neither the file before that save nor its render",
+    )
+    .unwrap();
+    let sent = ed.log.lines().len();
+    ed.save_briefly();
+    assert!(
+        ed.texts().contains("a save was cut off"),
+        "{side:?}: the retry ran: {}",
+        ed.texts()
+    );
+    assert_eq!(
+        ed.log.lines().len(),
+        sent,
+        "{side:?}: nothing sent: {:?}",
+        ed.log.lines()
+    );
+    Some((ed, aside, before))
+}
+
+/// 07 §3.1: a retry that finds an earlier Save of the session neither landed nor not landed
+/// says the outcome is unknown and names what to check — never "not saved": the file may hold
+/// that Save's render already. Its record stays.
+#[test]
+fn a_retry_that_cannot_tell_says_the_outcome_is_unknown() {
+    for side in sides() {
+        let Some((ed, ..)) = cut_off_and_swapped(side) else {
+            return;
+        };
+        let abs = ed.remote.to_str().unwrap();
+        assert!(
+            !ed.texts().contains("not saved"),
+            "{side:?}: {}",
+            ed.texts()
+        );
+        assert_eq!(
+            ed.win.status.text,
+            "save outcome unknown",
+            "{side:?}: {}",
+            ed.texts()
+        );
+        let line = ed
+            .win
+            .notices
+            .iter()
+            .find(|n| n.contains("a save was cut off"))
+            .unwrap_or_else(|| panic!("{side:?}: {}", ed.texts()));
+        assert!(
+            line.starts_with("save outcome unknown: a save was cut off; check "),
+            "{side:?}: {line}"
+        );
+        assert!(line.contains(&format!("{HOST}:{abs} and ")), "{line}");
+        let journals = ed.journals();
+        assert_eq!(journals.len(), 1, "{side:?}");
+        assert!(
+            journals[0].join("save").exists(),
+            "{side:?}: its record stays"
+        );
+    }
+}
+
+/// 07 §3.1: while an earlier Save's outcome cannot be told, its record holds the generation it
+/// rendered and no edit is made. The Save that then finds it landed retires that generation
+/// only — nothing newer was made; the one that finds the file as it was before renders exactly
+/// that generation.
+#[test]
+fn no_edit_is_made_while_an_earlier_saves_outcome_is_unknown() {
+    for side in sides() {
+        for landed in [true, false] {
+            let Some((mut ed, aside, (bytes, mtime))) = cut_off_and_swapped(side) else {
+                return;
+            };
+            let what = format!("{side:?}, landed {landed}");
+            let journal = ed.journals().pop().expect("its journal");
+            let kept = kept_edits(&journal);
+            assert_eq!(kept, ed.win.edits().text(), "{what}");
+            // An edit tried now — a cut of the first piece — is refused.
+            let clips = ed.win.timeline.clips().to_vec();
+            let (a, b) = (ed.at(0.02), ed.at(0.2));
+            ed.drv.drag(&mut ed.win, PointerButton::Primary, a, b);
+            ed.drv.key(&mut ed.win, Key::Delete, Modifiers::NONE);
+            ed.drv.idle(&mut ed.win, 3);
+            assert_eq!(
+                ed.win.timeline.clips(),
+                &clips[..],
+                "{what}: no edit while the outcome is unknown"
+            );
+            assert_eq!(ed.win.status.text, "save outcome unknown", "{what}");
+            assert!(
+                ed.texts()
+                    .contains("save outcome unknown: a save was cut off; check "),
+                "{what}: what to check stays said: {}",
+                ed.texts()
+            );
+            assert_eq!(
+                kept_edits(&journal),
+                kept,
+                "{what}: the record's generation"
+            );
+            if landed {
+                // The landed file back under its name: found landed, nothing sent.
+                std::fs::rename(&aside, &ed.remote).unwrap();
+                let sent = ed.log.lines().len();
+                ed.save_briefly();
+                assert!(
+                    ed.win
+                        .status
+                        .text
+                        .contains("landed (found now): nothing was written again"),
+                    "{what}: {}",
+                    ed.texts()
+                );
+                assert_eq!(ed.log.lines().len(), sent, "{what}: {:?}", ed.log.lines());
+            } else {
+                // The file as it was before that Save: not landed; the Save renders the record's
+                // generation.
+                std::fs::write(&ed.remote, &bytes).unwrap();
+                std::fs::File::options()
+                    .write(true)
+                    .open(&ed.remote)
+                    .unwrap()
+                    .set_modified(mtime)
+                    .unwrap();
+                ed.save();
+                assert!(
+                    ed.win.status.text.starts_with("saved "),
+                    "{what}: {}",
+                    ed.texts()
+                );
+            }
+            assert_eq!(order(&ed.remote), [440, 1320, 1760], "{what}");
+            assert!(!ed.win.unsaved() && !ed.win.unknown, "{what}");
+            assert!(ed.journals().is_empty(), "{what}: {:?}", ed.journals());
+        }
+    }
+}
+
+/// A video window (a 2 s clip, 64×48) on a "remote" file of a fresh folder.
+fn video(side: Side) -> Option<Ed> {
+    let tools = tools_or_skip()?;
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("remote");
+    std::fs::create_dir(&dir).unwrap();
+    let remote = dir.join("v.mp4");
+    super::fixtures::clip(&tools, &remote, (64, 48));
+    Some(Ed::on_video(side, tmp, remote))
+}
+
+impl Ed {
+    /// The window on a video `remote`, settled: planned, its picture on screen and what an
+    /// earlier session left listed.
+    fn on_video(side: Side, tmp: tempfile::TempDir, remote: PathBuf) -> Ed {
+        let mut ed = Ed::unsettled(side, Read::Copy, Knobs::default(), tmp, remote);
+        ed.drv.until(&mut ed.win, 120, |w| {
+            w.map.is_some()
+                && w.timeline_rect.is_some()
+                && w.planning.is_none()
+                && !w.unplanned
+                && w.recovering.is_none()
+                && w.recovery_started
+        });
+        ed.drv.idle(&mut ed.win, 2);
+        ed
+    }
+}
+
+/// 07 §2: the crop is one of the media window's edits the journal keeps, on its own too: a
+/// rectangle drawn on an unedited timeline is kept, a window killed then offers it on the next
+/// open, and Restore draws it again.
+#[test]
+fn a_crop_on_its_own_is_kept_and_restored() {
+    for side in sides() {
+        let Some(mut ed) = video(side) else {
+            return;
+        };
+        let disp = ed.win.map.as_ref().unwrap().disp;
+        let (a, b) = (
+            disp.lerp_inside(egui::vec2(0.2, 0.2)),
+            disp.lerp_inside(egui::vec2(0.7, 0.8)),
+        );
+        ed.drv.drag(&mut ed.win, PointerButton::Primary, a, b);
+        let crop = ed.win.crop().expect("a rectangle drawn");
+        assert!(ed.win.timeline.is_identity(), "{side:?}: the crop alone");
+        ed.drv.idle(&mut ed.win, 3);
+        assert!(
+            ed.win.journal_wants(),
+            "{side:?}: a crop alone is an edit to keep"
+        );
+        ed.drv.until(&mut ed.win, 60, |w| {
+            w.journal_text.1 && w.schedule.status() == Keep::Kept
+        });
+        assert_eq!(ed.journals().len(), 1, "{side:?}");
+        let Ed {
+            win, tmp, remote, ..
+        } = ed;
+        win.crash();
+        let mut again = Ed::on_video(side, tmp, remote);
+        assert_eq!(again.win.rows.len(), 1, "{side:?}: offered");
+        assert_eq!(again.journals().len(), 1, "{side:?}: still on disk");
+        again.drv.click_text(&mut again.win, "Restore");
+        again
+            .drv
+            .until(&mut again.win, 60, |w| w.restoring.is_none());
+        assert_eq!(again.win.crop(), Some(crop), "{side:?}: {}", again.texts());
+        // Closing asks about it: Discard or Cancel (Save and Save As have nothing to write).
+        assert!(!crate::gui::Window::close_requested(&mut again.win));
+        again.drv.idle(&mut again.win, 2);
+        assert!(again.win.prompt, "{side:?}: asked");
+        assert!(
+            again
+                .drv
+                .text_starting_with("Discard the crop drawn on ")
+                .is_some(),
+            "{side:?}: the prompt says what it is about"
+        );
+        assert!(again.drv.find_text("Cancel").is_some());
+        again.drv.click_text(&mut again.win, "Discard");
+        again.drv.idle(&mut again.win, 2);
+        assert!(again.win.crop().is_none(), "{side:?}");
+        assert!(crate::gui::Window::close_requested(&mut again.win));
+    }
+}
+
+/// 07 §2: an edit list with a crop on an otherwise whole timeline is an edit: a journal of it
+/// is not one with nothing in it (which the next open removes).
+#[test]
+fn an_edit_list_with_only_a_crop_is_not_the_file_as_it_is() {
+    let whole = file::Edits {
+        rate: 100.0,
+        source: 400,
+        clips: vec![(0, 400)],
+        stereo: false,
+        crop: None,
+        marks: (None, None),
+    };
+    assert!(whole.is_identity());
+    let cropped = file::Edits {
+        crop: Some([8, 6, 32, 24]),
+        ..whole
+    };
+    assert!(!cropped.is_identity());
+    assert_eq!(cropped.summary(), "1 piece, crop");
+    let read = file::Edits::parse(&cropped.text()).unwrap();
+    assert!(!read.is_identity(), "{}", cropped.text());
+}
+
+/// 07 §10: the crop is an edit: while editing is off (here, an earlier Save's outcome unknown)
+/// a drag on the picture draws no rectangle and the one drawn stays — neither Esc nor Clear
+/// rect takes it; Esc is then what it is without one.
+#[test]
+fn the_crop_is_neither_drawn_nor_cleared_while_editing_is_off() {
+    for side in sides() {
+        let Some(mut ed) = video(side) else {
+            return;
+        };
+        let disp = ed.win.map.as_ref().unwrap().disp;
+        let at = |x: f32, y: f32| disp.lerp_inside(egui::vec2(x, y));
+        ed.drv.drag(
+            &mut ed.win,
+            PointerButton::Primary,
+            at(0.2, 0.2),
+            at(0.7, 0.8),
+        );
+        let crop = ed.win.crop().expect("a rectangle drawn");
+        ed.knobs.lose_rename.store(true, SeqCst);
+        ed.cut(0.25, 0.5);
+        ed.save();
+        assert!(
+            ed.win.unknown && !ed.win.editable(),
+            "{side:?}: {}",
+            ed.texts()
+        );
+        // Where the picture is now (rows the Save added may have moved it).
+        let disp = ed.win.map.as_ref().unwrap().disp;
+        let at = |x: f32, y: f32| disp.lerp_inside(egui::vec2(x, y));
+        ed.drv.drag(
+            &mut ed.win,
+            PointerButton::Primary,
+            at(0.05, 0.05),
+            at(0.5, 0.5),
+        );
+        assert_eq!(ed.win.crop(), Some(crop), "{side:?}: no drawing");
+        ed.drv.key(&mut ed.win, Key::Escape, Modifiers::NONE);
+        assert_eq!(ed.win.crop(), Some(crop), "{side:?}: Esc keeps it");
+        ed.drv.click_text(&mut ed.win, "Clear rect");
+        ed.drv.idle(&mut ed.win, 2);
+        assert_eq!(ed.win.crop(), Some(crop), "{side:?}: Clear rect is off");
+    }
+}
+
+/// A window whose earlier session left a journal (the second second cut), reopened: the row
+/// that offers it is listed.
+fn with_a_row(side: Side) -> Option<Ed> {
+    let mut ed = Ed::open(side, Read::Copy, Knobs::default())?;
+    ed.cut_second();
+    ed.drv.until(&mut ed.win, 60, |w| {
+        w.journal_text.1 && w.schedule.status() == Keep::Kept
+    });
+    let Ed {
+        win, tmp, remote, ..
+    } = ed;
+    win.crash();
+    let again = Ed::on(side, Read::Copy, Knobs::default(), tmp, remote);
+    assert_eq!(again.win.rows.len(), 1, "{side:?}: one row");
+    Some(again)
+}
+
+/// 07 §3, §10: Restore is not taken while a generation of the window's own is on its way — an
+/// edit's first, held on a slow disk, the edit undone meanwhile — and the frame never waits for
+/// that write. Once it is written, the row is still there.
+#[test]
+fn restore_is_refused_while_a_generation_is_on_its_way() {
+    for side in sides() {
+        let hold = Arc::new(AtomicBool::new(true));
+        let inside = hold.clone();
+        let ran = super::fixtures::supervised(120, move |_| {
+            let Some(mut ed) = with_a_row(side) else {
+                return;
+            };
+            let waiting = Arc::new(AtomicBool::new(false));
+            ed.win.journal_fs = Arc::new(SlowDisk {
+                held: inside.clone(),
+                waiting: waiting.clone(),
+            });
+            ed.cut_second();
+            ed.drv.until(&mut ed.win, 60, |_| waiting.load(SeqCst));
+            ed.drv.key(&mut ed.win, Key::Z, command(false));
+            assert!(!ed.win.unsaved(), "{side:?}: undone");
+            assert!(ed.win.writing.is_some(), "{side:?}: still on its way");
+            ed.drv.click_text(&mut ed.win, "Restore");
+            ed.drv.idle(&mut ed.win, 5);
+            assert!(
+                ed.win.restoring.is_none() && ed.win.rows.len() == 1,
+                "{side:?}: not taken: {}",
+                ed.texts()
+            );
+            inside.store(false, SeqCst);
+            ed.drv.until(&mut ed.win, 60, |w| w.writing.is_none());
+            assert_eq!(ed.win.rows.len(), 1, "{side:?}");
+        });
+        hold.store(false, SeqCst);
+        if let Err(why) = ran {
+            panic!("{side:?}: {why}");
+        }
+    }
+}
+
+/// 07 §3: no edit is made while a Restore is on its way (its journal would land over the one
+/// the edit starts, and its clips over the edit).
+#[test]
+fn no_edit_is_made_while_a_restore_is_on_its_way() {
+    for side in sides() {
+        let Some(mut ed) = with_a_row(side) else {
+            return;
+        };
+        assert!(ed.win.editable(), "{side:?}");
+        ed.win.restore_row(0);
+        assert!(ed.win.restoring.is_some(), "{side:?}: on its way");
+        assert!(!ed.win.editable(), "{side:?}: no edit meanwhile");
+        ed.drv
+            .until(&mut ed.win, 60, |w| w.restoring.is_none() && w.unsaved());
+        assert!(ed.win.editable(), "{side:?}");
+    }
+}
+
+/// 07 §7: the folders whose entries another user could rename: not this user's (whatever its
+/// mode), or writable by group or others without the sticky bit.
+#[test]
+fn a_folder_is_shared_unless_it_is_this_users_and_closed_or_sticky() {
+    let me = 501;
+    for (owner, mode, shared) in [
+        (me, 0o700, false),
+        (me, 0o755, false),
+        (me, 0o775, true),
+        (me, 0o757, true),
+        (me, 0o777, true),
+        (me, 0o1777, false),
+        (me, 0o2775, true),
+        (0, 0o755, true),
+        (0, 0o1777, true),
+        (502, 0o700, true),
+    ] {
+        assert_eq!(
+            file::shared_folder(owner, 0o040000 | mode, me),
+            shared,
+            "owner {owner}, mode {mode:o}"
+        );
+    }
+}
+
+/// 07 §7: Save As into a folder whose entries another user could rename (not this user's, or
+/// writable by group or others without the sticky bit) renders into sopen's own folder and
+/// copies through the staging file's handle: a staging folder swapped, between the check and
+/// the render, for one whose `part` is a link is never written through, and the file saved is
+/// the render. Into a folder of this user's only, the render goes straight into `part`.
+#[test]
+fn save_as_into_a_shared_folder_never_writes_through_a_swapped_part() {
+    use std::os::unix::fs::PermissionsExt;
+    let Some(tools) = tools_or_skip() else { return };
+    for shared in [false, true] {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("v.mp4");
+        super::fixtures::clip(&tools, &src, (64, 48));
+        let mut media = Media::probe(&src).unwrap();
+        media.plan();
+        let half = media.ticks() / 2;
+        let mut timeline = Timeline::new(media.rate(), media.ticks());
+        timeline.set_clips(
+            vec![Clip {
+                start: 0,
+                end: half,
+            }],
+            View::default(),
+        );
+        let spec = edit_spec(&media, &timeline, (0, timeline.len()), None);
+        let folder = tmp.path().join("out");
+        std::fs::create_dir(&folder).unwrap();
+        let mode = if shared { 0o777 } else { 0o700 };
+        std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(mode)).unwrap();
+        let victim = tmp.path().join("victim");
+        std::fs::write(&victim, b"not sopen's").unwrap();
+        let seen: Arc<Mutex<Option<(PathBuf, PathBuf)>>> = Arc::default();
+        let (looked, target) = (seen.clone(), victim.clone());
+        let mut producer = file::MediaProducer {
+            media: Arc::new(media),
+            spec,
+            work_root: tmp.path().join("exports"),
+            hold: None,
+            held: Arc::default(),
+            before_render: Some(Box::new(move |out: &Path, part: &Path| {
+                *looked.lock().unwrap() = Some((out.to_path_buf(), part.to_path_buf()));
+                if shared {
+                    // Another user's swap: the staging folder renamed aside, and under its name
+                    // a folder of theirs whose `part` links to a file of yours.
+                    let staging = part.parent().unwrap();
+                    let name = staging.file_name().unwrap().to_string_lossy();
+                    std::fs::rename(staging, staging.with_file_name(format!("{name}-aside")))
+                        .unwrap();
+                    std::fs::create_dir(staging).unwrap();
+                    std::os::unix::fs::symlink(&target, staging.join("part")).unwrap();
+                }
+            })),
+        };
+        let dest = folder.join("v.edited.mp4");
+        let decision = super::super::binary::Decision::new();
+        let ctl = save_as::Ctl::new(&decision, &|_| {});
+        let outcome = save_as::write(&dest, save_as::Size::About(1 << 20), &mut producer, &ctl);
+        assert_eq!(
+            std::fs::read(&victim).unwrap(),
+            b"not sopen's",
+            "shared {shared}: never written through the link"
+        );
+        let (out, part) = seen.lock().unwrap().clone().expect("looked");
+        if shared {
+            assert!(!out.starts_with(&folder), "{}", out.display());
+        } else {
+            assert_eq!(out, part, "straight into part");
+        }
+        match outcome {
+            save_as::Outcome::Saved { path, .. } => assert_eq!(path, dest),
+            other => panic!("shared {shared}: {}", other.line()),
+        }
+        let probe = ffmpeg::probe(&tools, &dest).unwrap();
+        let duration = probe.duration.unwrap();
+        assert!((duration - 1.0).abs() < 0.05, "shared {shared}: {duration}");
+        assert!(probe.video.is_some() && probe.has_audio);
     }
 }

@@ -1426,7 +1426,9 @@ fn esc_and_the_button_cancel_a_running_export() {
         win.sel.is_set() && win.marks.selected(),
         "Esc went to the export only"
     );
-    assert!(drv.find_text("cancelling the export…").is_some());
+    // The status says so (the window's crop is an edit: the status row also names it, and may
+    // cut the status short on this narrow window).
+    assert_eq!(win.status.text, "cancelling the export…");
     let (stop, _tx) = job(&mut win);
     drv.idle(&mut win, 2);
     drv.click_text(&mut win, "Cancel");
@@ -1439,9 +1441,10 @@ fn esc_and_the_button_cancel_a_running_export() {
     drv.key(&mut win, egui::Key::Escape, egui::Modifiers::NONE);
     drv.idle(&mut win, 1);
     assert!(!stop.cancelled());
-    assert!(drv
-        .find_text("too late to cancel: the export is being published")
-        .is_some());
+    assert_eq!(
+        win.status.text,
+        "too late to cancel: the export is being published"
+    );
 }
 
 /// [`idle`] for a stream whose engine the test steps.
