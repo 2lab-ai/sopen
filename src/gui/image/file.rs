@@ -16,11 +16,11 @@ use crate::journal::{
     self, FileStat, Journal, Kind, Orphan, Plan, PostEvidence, Restore, Route, Schedule, Seen, Sha,
     Snapshot,
 };
-use crate::remote::{patch, Fingerprint, Stat, Step, WriteOutcome, HASH_CHECK_MAX};
+use crate::remote::{patch, Fingerprint, RemoteFs, Stat, Step, WriteOutcome, HASH_CHECK_MAX};
 use anyhow::{anyhow, bail, Context as _, Result};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
@@ -209,6 +209,7 @@ impl ImageFile {
                 told.step(step, journal, snap.as_ref(), &abs, (whole, ends), saving)
             })
         });
+        saving.began.store(told.begun, Ordering::SeqCst);
         self.after(journal, &told, &written);
         let result = (|| -> Result<Saved> {
             let landed = match written {
@@ -320,12 +321,32 @@ impl ImageFile {
         };
         let mut notes = Vec::new();
         match &reconciled.temp {
+            // Provably that Save's temp: removed once its stat is still the recorded one, read
+            // again right before.
             journal::Temp::Remove(path) => {
+                let same = match (fs.lstat_opt(path), recorded_temp(&intent)) {
+                    (Ok(Some(now)), Some(rec)) => rec.matches(&now),
+                    _ => false,
+                };
+                if !same {
+                    bail!(
+                        "{host}:{path} is at the temporary path of the save cut off at {}, and it \
+                         changed since it was checked; it is kept, and asked about when the file \
+                         is opened again — nothing was written this time",
+                        when_of(intent.started)
+                    );
+                }
                 if let Err(e) = fs.remove(path) {
                     notes.push(format!("{host}:{path} could not be removed ({e:#})"));
                 }
             }
-            journal::Temp::Keep { path, why } => notes.push(format!("{host}:{path}: {why}")),
+            // Its ownership is uncertain: asked, never removed unasked — and the record that holds
+            // the question stays until it is answered, on the next open.
+            journal::Temp::Keep { path, why } => bail!(
+                "a save was cut off at {}, and a file is at its temporary path {host}:{path} ({why}); \
+                 it is asked about when the file is opened again — nothing was written this time",
+                when_of(intent.started)
+            ),
             journal::Temp::None | journal::Temp::Gone(_) => {}
         }
         let line = reconciled.line.replace("(found on reopen)", "(found now)");
@@ -398,6 +419,11 @@ pub(super) struct Saving {
     stage: AtomicU8,
     /// 0: open; 1: cancelled; 2: the rename is next (a cancel is refused).
     decision: AtomicU8,
+    /// Set by the Save's worker as it ends: its outcome is unknown, and its record stays for a
+    /// reconciliation (07 §3.1) — the revision it took is the one a later "landed" saves.
+    pending: AtomicBool,
+    /// This Save began a record of its own (an earlier one it found was ended first).
+    began: AtomicBool,
 }
 
 impl Saving {
@@ -433,6 +459,26 @@ impl Saving {
 
     pub(super) fn cancelled(&self) -> bool {
         self.decision.load(Ordering::SeqCst) == 1
+    }
+
+    /// Esc can still stop it: not cancelled, and its rename is not next.
+    pub(super) fn stoppable(&self) -> bool {
+        self.decision.load(Ordering::SeqCst) == 0
+    }
+
+    /// The Save ended with its `save` record kept (an unknown outcome).
+    pub(super) fn pending(&self) -> bool {
+        self.pending.load(Ordering::SeqCst)
+    }
+
+    pub(super) fn set_pending(&self, pending: bool) {
+        self.pending.store(pending, Ordering::SeqCst);
+    }
+
+    /// Whether this Save began a `save` record of its own: a record still there after it is
+    /// this Save's, not an earlier one's.
+    pub(super) fn began(&self) -> bool {
+        self.began.load(Ordering::SeqCst)
     }
 
     /// The rename is next, unless the Save was cancelled: whether it goes ahead.
@@ -646,6 +692,12 @@ pub(super) struct Keeper {
     slot: Slot,
     /// A generation being written on a worker.
     writing: Option<Receiver<Wrote>>,
+    /// A generation asked for at once while another was being written: written next.
+    again: Option<Take>,
+    /// The journal goes once the generation being written is in (Discard, nothing unsaved).
+    remove_after: bool,
+    /// Wakes the window when a generation is in.
+    wake: Option<Arc<dyn Fn() + Send + Sync>>,
     schedule: Schedule,
     /// The journal's directory, once made (`kept at <journal>`, Discard's words).
     dir: Option<PathBuf>,
@@ -667,9 +719,22 @@ impl Keeper {
             },
             slot: Slot::default(),
             writing: None,
+            again: None,
+            remove_after: false,
+            wake: None,
             schedule: Schedule::default(),
             dir: None,
         }
+    }
+
+    /// Where the journals of the file are (the look for earlier sessions' runs on it too).
+    pub(super) fn fs(&self) -> Arc<dyn journal::Fs> {
+        self.place.fs.clone()
+    }
+
+    /// What wakes the window when a generation is in (set once it has a context).
+    pub(super) fn set_wake(&mut self, wake: impl Fn() + Send + Sync + 'static) {
+        self.wake = Some(Arc::new(wake));
     }
 
     /// The journal, for a Save's worker.
@@ -687,9 +752,12 @@ impl Keeper {
         self.schedule.status()
     }
 
-    /// No generation is being written, and none is due.
+    /// No generation is being written, none is due, and nothing waits on one.
     pub(super) fn settled(&self) -> bool {
-        self.writing.is_none() && self.schedule.due().is_none()
+        self.writing.is_none()
+            && self.schedule.due().is_none()
+            && self.again.is_none()
+            && !self.remove_after
     }
 
     /// The window's edits are now at revision `rev`.
@@ -720,7 +788,8 @@ impl Keeper {
         Some(slot.as_ref().is_some_and(|j| j.pending_save().is_some()))
     }
 
-    /// Takes in a worker's outcome, if one came back.
+    /// Takes in a worker's outcome, if one came back — then what waited on it: a generation
+    /// asked for meanwhile, or the journal's removal.
     pub(super) fn poll(&mut self) {
         let Some(rx) = &self.writing else {
             return;
@@ -730,18 +799,62 @@ impl Keeper {
                 self.writing = None;
                 self.landed(wrote);
             }
-            Err(mpsc::TryRecvError::Empty) => {}
+            Err(mpsc::TryRecvError::Empty) => return,
             Err(mpsc::TryRecvError::Disconnected) => {
                 self.writing = None;
                 self.schedule
                     .failed("the journal's writer stopped".to_string());
             }
         }
+        if std::mem::take(&mut self.remove_after) {
+            self.again = None;
+            if let Err(e) = self.remove() {
+                eprintln!("sopen: {e:#}");
+            }
+        } else if let Some(take) = self.again.take() {
+            self.spawn(take);
+        }
     }
 
-    /// Waits for a generation still being written.
+    /// The journal goes once the generation being written is in (Discard came meanwhile).
+    pub(super) fn removing(&self) -> bool {
+        self.remove_after
+    }
+
+    /// The window goes while the journal waits on a generation to be removed (Discard came
+    /// during a write): a thread of its own waits for it and removes the journal, so the
+    /// window's last pass does not.
+    pub(super) fn remove_when_written(&mut self) {
+        let Some(rx) = self.writing.take() else {
+            return;
+        };
+        self.remove_after = false;
+        let slot = self.slot.clone();
+        let _ = std::thread::Builder::new()
+            .name("image-journal-discard".into())
+            .spawn(move || {
+                let _ = rx.recv();
+                let journal = slot.lock().unwrap_or_else(|p| p.into_inner()).take();
+                if let Some(journal) = journal {
+                    if let Err(e) = journal.remove() {
+                        eprintln!("sopen: {e:#}");
+                    }
+                }
+            });
+    }
+
+    /// Waits for a generation still being written, and what waited on it: only as the window
+    /// goes (its last pass is over).
     pub(super) fn settle_writer(&mut self) -> &mut Self {
-        self.wait();
+        while self.writing.is_some() {
+            self.wait();
+            if std::mem::take(&mut self.remove_after) {
+                self.again = None;
+                let _ = self.remove();
+            } else if let Some(take) = self.again.take() {
+                self.spawn(take);
+            }
+        }
         self
     }
 
@@ -768,19 +881,37 @@ impl Keeper {
     }
 
     /// Writes `take` on a worker, unless one is writing already (the next pass looks again).
-    pub(super) fn write_later(&mut self, take: Take, wake: impl FnOnce() + Send + 'static) {
+    pub(super) fn write_later(&mut self, take: Take) {
         if self.writing.is_some() {
             return;
         }
         self.schedule.taking();
+        self.spawn(take);
+    }
+
+    /// A generation at once (07 §3: focus loss, close, the start of a Save), written on a
+    /// worker — after the one being written, if any; nothing waits for it on the window's
+    /// thread. [`Keeper::settled`] says when it is in.
+    pub(super) fn flush(&mut self, take: Take) {
+        self.schedule.taking();
+        if self.writing.is_some() {
+            self.again = Some(take);
+        } else {
+            self.spawn(take);
+        }
+    }
+
+    fn spawn(&mut self, take: Take) {
         let (tx, rx) = mpsc::channel();
-        let (place, slot) = (self.place.clone(), self.slot.clone());
+        let (place, slot, wake) = (self.place.clone(), self.slot.clone(), self.wake.clone());
         let spawned = std::thread::Builder::new()
             .name("image-journal".into())
             .spawn(move || {
                 let result = place.write(&slot, &take);
                 let _ = tx.send((take.rev, result));
-                wake();
+                if let Some(wake) = wake {
+                    wake();
+                }
             });
         match spawned {
             Ok(_) => self.writing = Some(rx),
@@ -790,17 +921,15 @@ impl Keeper {
         }
     }
 
-    /// Writes `take` now and waits for it (07 §3: focus loss, close, the start of a Save).
-    pub(super) fn write_now(&mut self, take: Take) {
-        self.wait();
-        self.schedule.taking();
-        let result = self.place.write(&self.slot, &take);
-        self.landed((take.rev, result));
-    }
-
-    /// Nothing is unsaved, or Discard: the journal goes, and the schedule starts over.
+    /// Nothing is unsaved, or Discard: the journal goes, and the schedule starts over — once
+    /// the generation being written is in (it is not waited for here: [`Keeper::poll`] removes
+    /// it then).
     pub(super) fn remove(&mut self) -> Result<()> {
-        self.wait();
+        if self.writing.is_some() {
+            self.remove_after = true;
+            self.again = None;
+            return Ok(());
+        }
         self.schedule = Schedule::default();
         self.dir = None;
         let journal = self.slot.lock().unwrap_or_else(|p| p.into_inner()).take();
@@ -825,9 +954,9 @@ impl Keeper {
         }
     }
 
-    /// Restore took an earlier session's journal over: it is this session's from now on.
+    /// Restore took an earlier session's journal over: it is this session's from now on (the
+    /// window asks only once nothing is being written).
     pub(super) fn adopt(&mut self, journal: Journal) {
-        self.wait();
         self.dir = Some(journal.dir().to_path_buf());
         *self.slot.lock().unwrap_or_else(|p| p.into_inner()) = Some(journal);
     }
@@ -841,31 +970,107 @@ impl Keeper {
 const LOCK_RETRY: Duration = Duration::from_millis(500);
 
 /// A file at an interrupted Save's temp path that sopen could not verify is its own (07 §3.1):
-/// its removal is offered, never done unasked. While its journal holds the question (its `save`
-/// record), Later asks it again on the next open; Restore and Discard wait for the answer.
+/// its removal is offered, never done unasked. The question is bound to its journal's `save`
+/// record, which stays until it is answered — Later asks it again on the next open; Restore and
+/// Discard wait for the answer — and to the file as it was when asked: its stat and, up to
+/// 256 MiB, its content's SHA-256. Remove it removes only that file ([`remove_left`]).
+#[derive(Clone)]
 pub(super) struct LeftTemp {
     pub path: String,
     pub line: String,
+    pub seen: FileStat,
+    pub sha: Option<Sha>,
 }
 
 /// One journal an earlier session left, with what Restore may do with it, what its cut-off
-/// Save came to, and a temp whose removal is asked about.
+/// Save came to, and a temp whose removal is asked about. `landed`: its Save landed — its edits
+/// are in the file, and only the temp's question keeps it (retired once answered).
 pub(super) struct Found {
     pub orphan: Orphan,
     pub restore: Restore,
     pub said: Vec<String>,
     pub temp: Option<LeftTemp>,
+    pub landed: bool,
 }
 
 /// What a look for earlier sessions' journals found.
 #[derive(Default)]
 pub(super) struct Recovered {
     pub rows: Vec<Found>,
-    /// A file at the temp path of a Save that landed, its ownership uncertain: Remove it or Keep
-    /// it (its journal is retired).
-    pub temps: Vec<LeftTemp>,
     /// What was settled (a landed Save found, a provable temp removed): said once.
     pub notes: Vec<String>,
+}
+
+/// `2026-11-20 11:42 UTC`.
+fn when_of(t: SystemTime) -> String {
+    let r = crate::cache::rfc3339(t);
+    format!("{} {} UTC", &r[..10], &r[11..16])
+}
+
+/// The stat a cut-off Save recorded of its temp (`created`, then `staged`): what a removal
+/// without asking checks the temp against once more, right before it.
+fn recorded_temp(intent: &journal::SaveIntent) -> Option<FileStat> {
+    match &intent.phase {
+        journal::Phase::Created { created, .. } => Some(*created),
+        journal::Phase::Staged { staged, .. } | journal::Phase::Renaming { staged, .. } => {
+            Some(*staged)
+        }
+        journal::Phase::Naming { .. } | journal::Phase::Writing { .. } => None,
+    }
+}
+
+/// The file at `path` now, as a question about it holds it: its stat and, up to 256 MiB, its
+/// content's SHA-256. `None` when nothing is there.
+fn look_at(fs: &mut dyn RemoteFs, path: &str) -> Result<Option<(FileStat, Option<Sha>)>> {
+    let Some(now) = fs.lstat_opt(path)? else {
+        return Ok(None);
+    };
+    let seen = FileStat::of(&now);
+    if !now.is_file || now.is_symlink || now.size > HASH_CHECK_MAX {
+        return Ok(Some((seen, None)));
+    }
+    let patcher = fs
+        .patcher()
+        .context("this connection cannot read the file to check it")?;
+    let sha = journal::Inspect::whole_sha256(&mut patch::Fresh::new(patcher), path, now.size)?;
+    Ok(Some((seen, sha)))
+}
+
+/// Remove it: removes the file at the temp path only when it is still the file the question
+/// was about — the same stat and, where taken, the same content — read again right before.
+/// Anything else, or anything that cannot be checked, keeps the file, and says why.
+pub(super) fn remove_left(
+    file: &Mutex<ImageFile>,
+    left: &LeftTemp,
+) -> std::result::Result<String, String> {
+    let mut file = file.lock().unwrap_or_else(|p| p.into_inner());
+    let shown = file.origin.show(&left.path);
+    let kept = |why: String| format!("{shown} was kept: {why}");
+    let fs = file.origin.fs().map_err(|e| kept(format!("{e:#}")))?;
+    let now =
+        look_at(fs, &left.path).map_err(|e| kept(format!("it could not be checked ({e:#})")))?;
+    let Some((stat, sha)) = now else {
+        return Ok(format!("{shown} is gone already"));
+    };
+    if stat != left.seen {
+        return Err(kept(
+            "it changed since it was shown (another file may have its name now)".to_string(),
+        ));
+    }
+    match (left.sha, sha) {
+        (Some(want), Some(got)) if want != got => {
+            return Err(kept("its content changed since it was shown".to_string()));
+        }
+        (Some(_), None) => {
+            return Err(kept(
+                "its content could not be read again to check it".to_string(),
+            ));
+        }
+        _ => {}
+    }
+    fs.remove(&left.path)
+        .map_err(|e| kept(format!("it could not be removed ({e:#})")))?;
+    Ok(format!("removed {shown}"))
 }
 
 /// `<file>.journal-<UTC stamp>-<8 hex>` exactly, as `Journal::create` names one.
@@ -943,7 +1148,11 @@ impl journal::Inspect for Opened<'_> {
 /// The connection is made only when a journal records a Save. Then each journal's edits are
 /// checked against the file as this window read it (`basis`). A journal whose lock is taken is
 /// looked at again for up to [`LOCK_RETRY`]. Their locks are held until each is answered.
-pub(super) fn recover(file: &Mutex<ImageFile>, basis: &Basis) -> Recovered {
+pub(super) fn recover(
+    file: &Mutex<ImageFile>,
+    basis: &Basis,
+    fs: &Arc<dyn journal::Fs>,
+) -> Recovered {
     let (cache, host, abs) = {
         let file = file.lock().unwrap_or_else(|p| p.into_inner());
         (
@@ -952,12 +1161,11 @@ pub(super) fn recover(file: &Mutex<ImageFile>, basis: &Basis) -> Recovered {
             file.origin.abs.clone(),
         )
     };
-    let fs = journal::disk();
     let started = Instant::now();
     let mut orphans = Vec::new();
     let mut out = Recovered::default();
     loop {
-        match journal::orphans(&fs, &cache, &host, &abs) {
+        match journal::orphans(fs, &cache, &host, &abs) {
             Ok(found) => orphans.extend(found),
             Err(e) => out.notes.push(format!(
                 "earlier unsaved edits could not be looked for: {e:#}"
@@ -990,6 +1198,13 @@ fn recover_one(
 ) -> Option<Found> {
     let mut said = Vec::new();
     let mut temp = None;
+    let mut landed = false;
+    // A temp asked about that could not be looked at: its record stays, as for a question.
+    let mut unchecked = false;
+    let recorded = match &orphan.save {
+        journal::SaveFile::Intent(intent) => recorded_temp(intent),
+        _ => None,
+    };
     if !matches!(orphan.save, journal::SaveFile::None) {
         let mut file = file.lock().unwrap_or_else(|p| p.into_inner());
         let reconciled = file.origin.fs().and_then(|fs| {
@@ -1000,29 +1215,60 @@ fn recover_one(
         });
         match reconciled {
             Ok(Some(r)) => {
-                match &r.temp {
-                    journal::Temp::Keep { path, why } => {
-                        let left = LeftTemp {
-                            path: path.clone(),
-                            line: format!("{why} — remove it?"),
+                let fs = file.origin.fs();
+                let mut ask = |path: &str, why: &str, fs: &mut dyn RemoteFs| match look_at(fs, path)
+                {
+                    Ok(Some((seen, sha))) => Some(LeftTemp {
+                        path: path.to_string(),
+                        line: format!("{why} — remove it?"),
+                        seen,
+                        sha,
+                    }),
+                    Ok(None) => None,
+                    Err(e) => {
+                        said.push(format!(
+                            "{host}:{path} is kept: it could not be checked ({e:#})"
+                        ));
+                        unchecked = true;
+                        None
+                    }
+                };
+                match (&r.temp, fs) {
+                    (journal::Temp::Keep { path, why }, Ok(fs)) => temp = ask(path, why, fs),
+                    // Provably this Save's temp, by its recorded stat and evidence: removed —
+                    // once its stat is still the recorded one, read again right before.
+                    (journal::Temp::Remove(path), Ok(fs))
+                        if r.outcome == journal::Outcome::NotLanded =>
+                    {
+                        let same = match (fs.lstat_opt(path), recorded) {
+                            (Ok(Some(now)), Some(rec)) => rec.matches(&now),
+                            _ => false,
                         };
-                        if r.outcome == journal::Outcome::Landed {
-                            out.temps.push(left);
+                        if same {
+                            if let Err(e) = fs.remove(path) {
+                                said.push(format!(
+                                    "the interrupted save's temporary file {host}:{path} could \
+                                     not be removed ({e:#})"
+                                ));
+                            }
                         } else {
-                            temp = Some(left);
+                            let why = "it changed since it was checked against the save's record";
+                            temp = ask(path, why, fs);
                         }
                     }
-                    journal::Temp::Remove(path) if r.outcome == journal::Outcome::NotLanded => {
-                        if let Err(e) = file.origin.fs().and_then(|fs| fs.remove(path)) {
-                            said.push(format!(
-                                "the interrupted save's temporary file {host}:{path} could not \
-                                 be removed ({e:#})"
-                            ));
-                        }
+                    (journal::Temp::Keep { path, .. } | journal::Temp::Remove(path), Err(e)) => {
+                        said.push(format!("{host}:{path} is kept: {e:#}"));
+                        unchecked = true;
                     }
                     _ => {}
                 }
                 match r.outcome {
+                    // Landed: its edits are in the file. With a temp asked about, the journal —
+                    // and its record — stay until the question is answered.
+                    journal::Outcome::Landed if temp.is_some() || unchecked => {
+                        landed = true;
+                        said.push(format!("{}: nothing was written again", r.line));
+                    }
                     journal::Outcome::Landed => match orphan.landed() {
                         Ok(None) => {
                             out.notes
@@ -1042,7 +1288,7 @@ fn recover_one(
                     journal::Outcome::NotLanded => {
                         // The record ends here — unless it holds the question about a temp sopen
                         // cannot prove its own, which stays until it is answered.
-                        if temp.is_none() {
+                        if temp.is_none() && !unchecked {
                             if let Err(e) = orphan.clear_save() {
                                 said.push(format!("{e:#}"));
                             }
@@ -1064,6 +1310,7 @@ fn recover_one(
         restore,
         said,
         temp,
+        landed,
     })
 }
 
@@ -1088,7 +1335,15 @@ pub(super) fn recheck(basis: &Basis, found: &mut Found) {
 
 /// Save As's producer for an image: the encoder's output, written whole into `part` (again on
 /// every try).
-pub(super) struct Output(pub Arc<Vec<u8>>);
+pub(super) struct Output(pub Arc<Vec<u8>>, pub Option<Arc<Hold>>);
+
+/// Tests: a Save As fill waits here, before its first byte, while `held` is set; `reached` says
+/// it got there.
+#[derive(Debug, Default)]
+pub(super) struct Hold {
+    pub held: AtomicBool,
+    pub reached: AtomicBool,
+}
 
 impl crate::gui::save_as::Producer for Output {
     fn fill(
@@ -1096,6 +1351,12 @@ impl crate::gui::save_as::Producer for Output {
         part: &mut std::fs::File,
         ctl: &crate::gui::save_as::Ctl<'_>,
     ) -> Result<u64> {
+        if let Some(hold) = &self.1 {
+            hold.reached.store(true, Ordering::SeqCst);
+            while hold.held.load(Ordering::SeqCst) && !ctl.cancelled() {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        }
         let mut done = 0u64;
         for chunk in self.0.chunks(1 << 20) {
             if ctl.cancelled() {

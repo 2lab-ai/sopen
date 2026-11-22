@@ -5,13 +5,15 @@
 use super::*;
 use std::sync::{Arc, Mutex};
 
-/// The local disk, each request counted; a create, a rename or a remove can be made to fail.
+/// The local disk, every request of the trait noted (the queries `can_link`, `can_replace` and
+/// `hash_check_limit` send nothing); a create, a rename or a remove can be made to fail.
 #[derive(Default)]
 struct Counted {
     inner: LocalFs,
     requests: Arc<Mutex<Vec<String>>>,
     fail_create_after_bytes: bool,
     rename_unknown: bool,
+    fail_rename: bool,
     fail_remove: bool,
 }
 
@@ -23,24 +25,37 @@ impl Counted {
 
 impl RemoteFs for Counted {
     fn stat_opt(&mut self, path: &str) -> Result<Option<Stat>> {
-        self.note("stat");
+        self.note(&format!("stat {path}"));
         self.inner.stat_opt(path)
     }
     fn lstat_opt(&mut self, path: &str) -> Result<Option<Stat>> {
-        self.note("lstat");
+        self.note(&format!("lstat {path}"));
         self.inner.lstat_opt(path)
     }
     fn realpath(&mut self, path: &str) -> Result<String> {
+        self.note(&format!("realpath {path}"));
         self.inner.realpath(path)
     }
     fn read_head(&mut self, path: &str, max: usize) -> Result<Vec<u8>> {
+        self.note(&format!("read-head {path}"));
         self.inner.read_head(path, max)
     }
     fn list_dir(&mut self, path: &str) -> Result<Vec<String>> {
+        self.note(&format!("list {path}"));
         self.inner.list_dir(path)
     }
     fn list_entries(&mut self, path: &str) -> Result<Vec<Entry>> {
+        self.note(&format!("list-entries {path}"));
         self.inner.list_entries(path)
+    }
+    fn free_space(&mut self, path: &str) -> Option<u64> {
+        self.note(&format!("free-space {path}"));
+        self.inner.free_space(path)
+    }
+    fn patcher(&mut self) -> Option<&mut dyn patch::PatchFs> {
+        // Handles stay off (the requests above are the whole trace); asking is noted.
+        self.note("patcher");
+        None
     }
     fn read_to(
         &mut self,
@@ -48,7 +63,7 @@ impl RemoteFs for Counted {
         out: &mut dyn Write,
         progress: &mut dyn FnMut(u64),
     ) -> Result<u64> {
-        self.note("read");
+        self.note(&format!("read {path}"));
         self.inner.read_to(path, out, progress)
     }
     fn create_from(
@@ -57,7 +72,7 @@ impl RemoteFs for Counted {
         path: &str,
         like: Option<Like>,
     ) -> std::result::Result<Uploaded, CreateError> {
-        self.note("create");
+        self.note(&format!("create {path}"));
         let up = self.inner.create_from(local, path, like)?;
         if self.fail_create_after_bytes {
             return Err(CreateError::new(
@@ -68,20 +83,25 @@ impl RemoteFs for Counted {
         Ok(up)
     }
     fn set_mode(&mut self, path: &str, mode: u32) -> Result<()> {
+        self.note(&format!("set-mode {path}"));
         self.inner.set_mode(path, mode)
     }
     fn rename_over(&mut self, from: &str, to: &str) -> Result<()> {
-        self.note("rename");
+        self.note(&format!("rename {from} {to}"));
         if self.rename_unknown {
             return Err(unknown("simulated: rename sent, no reply"));
+        }
+        if self.fail_rename {
+            bail!("simulated: the rename was refused");
         }
         self.inner.rename_over(from, to)
     }
     fn link_new(&mut self, from: &str, to: &str) -> Result<()> {
+        self.note(&format!("link {from} {to}"));
         self.inner.link_new(from, to)
     }
     fn remove(&mut self, path: &str) -> Result<()> {
-        self.note("remove");
+        self.note(&format!("remove {path}"));
         if self.fail_remove {
             bail!("simulated: permission denied");
         }
@@ -97,7 +117,7 @@ struct Rig {
     at: Fingerprint,
 }
 
-fn make() -> Rig {
+fn make_rig() -> Rig {
     let tmp = tempfile::tempdir().unwrap();
     let target = tmp.path().join("shot.png");
     std::fs::write(&target, b"the original").unwrap();
@@ -143,25 +163,12 @@ fn names(told: &[(&'static str, String)]) -> Vec<&'static str> {
     told.iter().map(|(n, _)| *n).collect()
 }
 
-/// A replace that lands tells named → written → staged → renamed, each of one temp, sends the
-/// same requests as `write_atomic`, and the written and staged stats are the temp's.
+/// A replace that lands tells named → written → staged → renamed, each of one temp; the
+/// written and staged stats are the temp's; its requests are the pinned ones
+/// ([`every_path_sends_the_pinned_requests`]).
 #[test]
-fn a_landed_replace_tells_every_step_and_sends_what_write_atomic_sends() {
-    let rig = make();
-    let mut plain = Counted::default();
-    let before = std::fs::read(&rig.target).unwrap();
-    plain.write_atomic(&rig.local, &rig.target, rig.at).unwrap();
-    let plain_requests = plain.requests.lock().unwrap().clone();
-    // Again, from the same start, with the steps told.
-    std::fs::write(&rig.target, &before).unwrap();
-    let rig = Rig {
-        at: {
-            let mut at = LocalFs::new().stat(&rig.target).unwrap();
-            at.sha256 = rig.at.sha256;
-            at.fingerprint()
-        },
-        ..rig
-    };
+fn a_landed_replace_tells_every_step() {
+    let rig = make_rig();
     let mut fs = Counted::default();
     let mut stats = Vec::new();
     let mut told = Vec::new();
@@ -185,9 +192,16 @@ fn a_landed_replace_tells_every_step_and_sends_what_write_atomic_sends() {
         assert!(step.starts_with(word), "{told:?}");
     }
     assert_eq!(
-        *fs.requests.lock().unwrap(),
-        plain_requests,
-        "nothing more is sent"
+        trace(&fs, &rig.target),
+        [
+            "lstat T",
+            "create t",
+            "lstat t",
+            "read T",
+            "lstat T",
+            "rename t T",
+            "lstat T"
+        ]
     );
     assert_eq!(stats[0], stats[1]);
     assert_eq!((now.size, now.mtime), (stats[1].size, stats[1].mtime));
@@ -198,14 +212,19 @@ fn a_landed_replace_tells_every_step_and_sends_what_write_atomic_sends() {
 /// and its error is the result.
 #[test]
 fn a_stop_at_named_makes_nothing() {
-    let rig = make();
+    let rig = make_rig();
     let mut fs = Counted::default();
     let (result, told) = run(&mut fs, &rig, |step| {
         matches!(step, Step::Named { .. }).then(|| anyhow!("not recorded"))
     });
     assert_eq!(format!("{:#}", result.unwrap_err()), "not recorded");
     assert_eq!(names(&told), ["named"]);
-    assert!(!fs.requests.lock().unwrap().contains(&"create".to_string()));
+    assert!(!fs
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|r| r.starts_with("create ")));
     assert_eq!(std::fs::read(&rig.target).unwrap(), b"the original");
     let dir = std::path::Path::new(&rig.target).parent().unwrap();
     assert_eq!(std::fs::read_dir(dir).unwrap().count(), 2, "no temp");
@@ -216,7 +235,7 @@ fn a_stop_at_named_makes_nothing() {
 #[test]
 fn a_stop_after_the_temp_removes_it_and_says_so() {
     for at in ["written", "staged"] {
-        let rig = make();
+        let rig = make_rig();
         let mut fs = Counted::default();
         let (result, told) = run(&mut fs, &rig, |step| {
             let here = matches!(
@@ -236,9 +255,14 @@ fn a_stop_after_the_temp_removes_it_and_says_so() {
         assert!(told.iter().all(|(_, t)| *t == told[0].1), "one temp");
         assert!(!std::path::Path::new(&told[0].1).exists(), "{at}: removed");
         assert_eq!(std::fs::read(&rig.target).unwrap(), b"the original");
-        assert!(!fs.requests.lock().unwrap().contains(&"rename".to_string()));
+        assert!(!fs
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|r| r.starts_with("rename ")));
     }
-    let rig = make();
+    let rig = make_rig();
     let mut fs = Counted {
         fail_remove: true,
         ..Counted::default()
@@ -258,7 +282,7 @@ fn a_stop_after_the_temp_removes_it_and_says_so() {
 /// rename landed changes nothing.
 #[test]
 fn failures_tell_where_the_temp_went() {
-    let rig = make();
+    let rig = make_rig();
     let mut fs = Counted {
         fail_create_after_bytes: true,
         ..Counted::default()
@@ -268,7 +292,7 @@ fn failures_tell_where_the_temp_went() {
     assert_eq!(names(&told), ["named", "removed"]);
     assert!(!std::path::Path::new(&told[0].1).exists());
 
-    let rig = make();
+    let rig = make_rig();
     let mut fs = Counted::default();
     let target = rig.target.clone();
     let (result, told) = run(&mut fs, &rig, |step| {
@@ -287,7 +311,7 @@ fn failures_tell_where_the_temp_went() {
     );
     assert_eq!(names(&told), ["named", "written", "removed"]);
 
-    let rig = make();
+    let rig = make_rig();
     let mut fs = Counted {
         rename_unknown: true,
         ..Counted::default()
@@ -300,7 +324,7 @@ fn failures_tell_where_the_temp_went() {
         "kept: it may have landed"
     );
 
-    let rig = make();
+    let rig = make_rig();
     let mut fs = Counted::default();
     let (result, told) = run(&mut fs, &rig, |step| {
         matches!(step, Step::Renamed { .. }).then(|| anyhow!("could not record it"))
@@ -308,4 +332,161 @@ fn failures_tell_where_the_temp_went() {
     assert!(matches!(result.unwrap(), WriteOutcome::Written { .. }));
     assert_eq!(names(&told), ["named", "written", "staged", "renamed"]);
     assert_eq!(std::fs::read(&rig.target).unwrap(), b"the edited content");
+}
+
+/// The requests a replace sent, the target as `T`, the temp as `t`, their folder as `D`.
+fn trace(fs: &Counted, target: &str) -> Vec<String> {
+    let dir = target.rsplit_once('/').map(|(d, _)| d).unwrap_or_default();
+    fs.requests
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|r| {
+            r.split(' ')
+                .map(|w| {
+                    if w == target {
+                        "T"
+                    } else if w.contains(".sopen-") {
+                        "t"
+                    } else if w == dir {
+                        "D"
+                    } else {
+                        w
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .collect()
+}
+
+/// The requests of a replace, pinned for each path through it — what `write_atomic` sent before
+/// the seam was added (the same test ran on 54d921f) — and `write_atomic_with` with an observer
+/// that stops nothing sends exactly these too: landed; refused at the first check; a content
+/// change found after the upload (the temp removed); a create that failed after it wrote (the
+/// temp removed); a rename whose reply was lost (nothing after it); a cleanup whose remove
+/// failed (the temp left).
+#[test]
+fn every_path_sends_the_pinned_requests() {
+    let success = [
+        "lstat T",
+        "create t",
+        "lstat t",
+        "read T",
+        "lstat T",
+        "rename t T",
+        "lstat T",
+    ];
+    type Make = Box<dyn Fn() -> Counted>;
+    type Before = Box<dyn Fn(&Rig)>;
+    let cases: Vec<(&str, Make, Before, Vec<&str>)> = vec![
+        (
+            "landed",
+            Box::new(Counted::default),
+            Box::new(|_| {}),
+            success.to_vec(),
+        ),
+        (
+            "refused at the first check",
+            Box::new(Counted::default),
+            Box::new(|rig| std::fs::write(&rig.target, b"longer than the original").unwrap()),
+            vec!["lstat T"],
+        ),
+        (
+            "create failed after writing",
+            Box::new(|| Counted {
+                fail_create_after_bytes: true,
+                ..Counted::default()
+            }),
+            Box::new(|_| {}),
+            vec!["lstat T", "create t", "remove t"],
+        ),
+        (
+            "rename reply lost",
+            Box::new(|| Counted {
+                rename_unknown: true,
+                ..Counted::default()
+            }),
+            Box::new(|_| {}),
+            vec![
+                "lstat T",
+                "create t",
+                "lstat t",
+                "read T",
+                "lstat T",
+                "rename t T",
+            ],
+        ),
+    ];
+    for (case, make, before, want) in &cases {
+        for with_steps in [false, true] {
+            let rig = make_rig();
+            before(&rig);
+            let mut fs = make();
+            let _ = if with_steps {
+                fs.write_atomic_with(&rig.local, &rig.target, rig.at, &mut |_| Ok(()))
+            } else {
+                fs.write_atomic(&rig.local, &rig.target, rig.at)
+            };
+            assert_eq!(
+                trace(&fs, &rig.target),
+                *want,
+                "{case} (steps told: {with_steps})"
+            );
+        }
+    }
+    // A content change found after the upload: same size and mtime, other bytes.
+    for with_steps in [false, true] {
+        let rig = make_rig();
+        let mut fs = Counted::default();
+        let target = rig.target.clone();
+        // Another writer before the replace reads it back: same size and mtime.
+        let mtime = std::fs::metadata(&target).unwrap().modified().unwrap();
+        std::fs::write(&target, b"the 0riginal").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&target)
+            .unwrap()
+            .set_modified(mtime)
+            .unwrap();
+        let result = if with_steps {
+            fs.write_atomic_with(&rig.local, &rig.target, rig.at, &mut |_| Ok(()))
+        } else {
+            fs.write_atomic(&rig.local, &rig.target, rig.at)
+        };
+        assert!(matches!(result.unwrap(), WriteOutcome::Conflict { .. }));
+        assert_eq!(
+            trace(&fs, &rig.target),
+            ["lstat T", "create t", "lstat t", "read T", "remove t"],
+            "content changed (steps told: {with_steps})"
+        );
+    }
+    // A cleanup whose remove failed: the rename refused, the temp left.
+    for with_steps in [false, true] {
+        let rig = make_rig();
+        let mut fs = Counted {
+            fail_remove: true,
+            fail_rename: true,
+            ..Counted::default()
+        };
+        let result = if with_steps {
+            fs.write_atomic_with(&rig.local, &rig.target, rig.at, &mut |_| Ok(()))
+        } else {
+            fs.write_atomic(&rig.local, &rig.target, rig.at)
+        };
+        assert!(format!("{:#}", result.unwrap_err()).contains("is left behind"));
+        assert_eq!(
+            trace(&fs, &rig.target),
+            [
+                "lstat T",
+                "create t",
+                "lstat t",
+                "read T",
+                "lstat T",
+                "rename t T",
+                "remove t"
+            ],
+            "remove failed (steps told: {with_steps})"
+        );
+    }
 }

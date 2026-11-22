@@ -950,6 +950,20 @@ impl Gate {
         lock.lock().unwrap().1 = true;
         cv.notify_all();
     }
+
+    /// Passes of the browser until a worker is held (at most 10 s): what it waits on may need
+    /// the window's passes first (a save waits for its journal).
+    fn reached_running(&self, fx: &mut Fx) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !self.0 .0.lock().unwrap().0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the worker never got to the gate"
+            );
+            fx.drv.idle(&mut fx.b, 1);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
 }
 
 /// The local disk posing as a remote whose `read_to` (a fetch: after the first chunk) or
@@ -1760,7 +1774,7 @@ fn a_running_save_is_not_cut_off() {
     edit_image(&mut fx);
     fx.drv
         .key(&mut fx.b, Key::S, crate::gui::testkit::command(false));
-    gate.reached();
+    gate.reached_running(&mut fx);
     fx.key(Key::Escape);
     gate.release();
     let stopped = "stopped: nothing was written; the original is untouched";
@@ -1800,6 +1814,39 @@ fn a_running_save_is_not_cut_off() {
         .filter(|e| e.file_name().to_string_lossy().contains(".sopen-"))
         .collect();
     assert!(temps.is_empty(), "the temp removed");
+    // The picture is still the edited one, and unsaved: its size line is the crop's, and the
+    // status bar says where its edits are kept.
+    let texts: Vec<String> = fx.drv.texts().into_iter().map(|(_, _, t)| t).collect();
+    let size = texts
+        .iter()
+        .find(|t| t.contains(" PNG · "))
+        .unwrap_or_else(|| panic!("the size line: {texts:?}"));
+    assert!(
+        !size.starts_with("64×48 "),
+        "the edit is still there: {size}"
+    );
+    assert!(
+        texts.iter().any(|t| t.starts_with("unsaved")),
+        "still unsaved: {texts:?}"
+    );
+
+    // F3 (leaving the viewer) during the save: it waits for it; once it has landed, the viewer
+    // goes back to the list, the window open.
+    let gate = Gate::default();
+    let mut fx = fixture_with(None, gated(&gate, "create_from"), None);
+    fx.open("photo.png");
+    edit_image(&mut fx);
+    fx.drv
+        .key(&mut fx.b, Key::S, crate::gui::testkit::command(false));
+    gate.reached_running(&mut fx);
+    fx.key(Key::F3);
+    fx.drv.idle(&mut fx.b, 2);
+    assert!(fx.b.viewer.is_some(), "F3 during the save waits for it");
+    gate.release();
+    fx.drv.until(&mut fx.b, 10, |b| b.viewer.is_none());
+    assert!(!fx.drv.closed(), "back to the list, the window open");
+    let (w, h) = image::image_dimensions(format!("{}/photo.png", fx.root)).unwrap();
+    assert!((w, h) != (64, 48), "the crop was saved: {w}×{h}");
 
     // A close during the save: it waits, then closes once the save has landed.
     let gate = Gate::default();
@@ -1808,7 +1855,7 @@ fn a_running_save_is_not_cut_off() {
     edit_image(&mut fx);
     fx.drv
         .key(&mut fx.b, Key::S, crate::gui::testkit::command(false));
-    gate.reached();
+    gate.reached_running(&mut fx);
     assert!(
         !Window::close_requested(&mut fx.b),
         "closing the window waits"

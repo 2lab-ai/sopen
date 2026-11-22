@@ -77,9 +77,11 @@ impl Fx {
     }
 
     /// The window loses the keyboard (the owner went to another application).
+    /// ...and the generation that asks for, once it is in (written on a worker).
     fn blur(&mut self) {
         let lost = vec![Event::WindowFocused(false)];
         self.drv.frame(&mut self.win, lost, Modifiers::NONE);
+        self.drv.until(&mut self.win, 10, |w| w.quiet());
         self.drv.idle(&mut self.win, 1);
     }
 
@@ -127,7 +129,7 @@ impl Fx {
 
     /// Passes until no save, Save copy or encode runs.
     fn until_idle(&mut self) {
-        self.drv.until(&mut self.win, 10, |w| w.job.is_none());
+        self.drv.until(&mut self.win, 10, |w| w.quiet());
         self.drv.idle(&mut self.win, 2);
     }
 }
@@ -185,7 +187,7 @@ pub(super) fn clipboard_picture() -> egui::ColorImage {
     egui::ColorImage::from_rgba_unmultiplied([6, 4], &rgba)
 }
 
-fn alt_command() -> Modifiers {
+pub(super) fn alt_command() -> Modifiers {
     Modifiers::ALT | Modifiers::COMMAND
 }
 
@@ -341,22 +343,6 @@ fn after_a_save_the_journal_goes_and_the_next_is_against_the_saved_files_whole_h
     assert_eq!(words(&gen), ["pixelize"], "only what is not in the file");
 }
 
-/// 07 §3, before any Save starts: the journal is written at once (a Save cut off then leaves
-/// its edits kept), and nothing is written while the Save runs.
-#[test]
-fn a_save_writes_the_journal_before_it_starts() {
-    let mut fx = open();
-    fx.select([0, 0, 90, 60]);
-    fx.key(Key::C, Modifiers::NONE);
-    let ctx = fx.drv.ctx.clone();
-    fx.win.start(&ctx, JobKind::Save { close_after: false });
-    let dirs = fx.journals();
-    assert_eq!(dirs.len(), 1, "written before the save's worker started");
-    assert_eq!(words(&current(&dirs[0])), ["crop"]);
-    fx.until_idle();
-    assert!(fx.journals().is_empty());
-}
-
 /// 07 §10, E18: while a Save runs, typing, paste, cut, crop, pixelize, undo and redo do nothing,
 /// and the status row says why; once it ends, editing resumes.
 #[test]
@@ -367,34 +353,72 @@ fn no_edit_undo_or_redo_while_a_save_runs() {
     fx.select([0, 0, 30, 30]);
     fx.key(Key::P, Modifiers::NONE);
     fx.key(Key::Z, command(false));
-    assert!(fx.win.doc.can_undo() && fx.win.doc.can_redo());
+    assert!(
+        fx.win.doc.can_undo() && fx.win.doc.can_redo(),
+        "something to undo and redo"
+    );
     let (tx, rx) = mpsc::channel();
     fx.win.job = Some(Job {
         kind: JobKind::Save { close_after: false },
         rev: fx.win.doc.rev(),
         rx,
     });
-    let (rev, img) = (fx.win.doc.rev(), fx.win.doc.img.clone());
     fx.select([10, 10, 20, 20]);
-    fx.key(Key::C, Modifiers::NONE);
-    fx.key(Key::P, Modifiers::NONE);
-    fx.key(Key::Z, command(false));
-    fx.key(Key::Z, command(true));
-    fx.drv.cut(&mut fx.win);
-    fx.drv.paste_text(&mut fx.win, "x");
-    fx.drv.paste_image(&mut fx.win, clipboard_picture());
-    assert_eq!(fx.win.doc.rev(), rev, "nothing changed the picture");
-    assert_eq!(fx.win.doc.img, img);
-    assert!(fx.status().starts_with(SAVING), "{}", fx.status());
-    // The toolbar's buttons say so too: not one of them edits.
-    fx.drv.click_text(&mut fx.win, "Undo");
-    fx.drv.click_text(&mut fx.win, "Crop  C");
-    assert_eq!(fx.win.doc.rev(), rev);
+    // What the picture is, and its history, before each input.
+    let state = |fx: &Fx| {
+        (
+            fx.win.doc.rev(),
+            fx.win.doc.img.clone(),
+            fx.win.doc.undo.len(),
+            fx.win.doc.redo.len(),
+            fx.win.doc.journal_edits().map(<[Edit]>::len),
+        )
+    };
+    let before = state(&fx);
+    type Input = Box<dyn Fn(&mut Fx)>;
+    let inputs: [(&str, Input); 9] = [
+        ("crop key", Box::new(|fx| fx.key(Key::C, Modifiers::NONE))),
+        (
+            "pixelize key",
+            Box::new(|fx| fx.key(Key::P, Modifiers::NONE)),
+        ),
+        ("undo", Box::new(|fx| fx.key(Key::Z, command(false)))),
+        ("redo", Box::new(|fx| fx.key(Key::Z, command(true)))),
+        ("cut", Box::new(|fx| fx.drv.cut(&mut fx.win))),
+        (
+            "paste text",
+            Box::new(|fx| fx.drv.paste_text(&mut fx.win, "x")),
+        ),
+        (
+            "paste picture",
+            Box::new(|fx| fx.drv.paste_image(&mut fx.win, clipboard_picture())),
+        ),
+        (
+            "Undo button",
+            Box::new(|fx| fx.drv.click_text(&mut fx.win, "Undo")),
+        ),
+        (
+            "Crop button",
+            Box::new(|fx| fx.drv.click_text(&mut fx.win, "Crop  C")),
+        ),
+    ];
+    for (name, input) in &inputs {
+        input(&mut fx);
+        assert!(
+            state(&fx) == before,
+            "{name} changed the picture or its history"
+        );
+        assert!(fx.status().starts_with(SAVING), "{name}: {}", fx.status());
+    }
+    for name in ["Redo", "Pixelize  P"] {
+        fx.drv.click_text(&mut fx.win, name);
+        assert!(state(&fx) == before, "{name} button");
+    }
     // The save ends: editing resumes.
     tx.send(Err(anyhow!("the save failed (a test)"))).unwrap();
     fx.until_idle();
     fx.key(Key::Z, command(false));
-    assert_ne!(fx.win.doc.rev(), rev, "undo works again");
+    assert_ne!(fx.win.doc.rev(), before.0, "undo works again");
 }
 
 /// Types `path` into the Save As modal's field, over what it holds, and presses Enter.
@@ -433,29 +457,6 @@ fn f7_saves_the_encoders_output_as_a_new_local_file() {
     assert!(fx.status().starts_with("saved "), "{}", fx.status());
 }
 
-/// 07 §7: Alt+Cmd/Ctrl+S is Save As, not Save — egui's own check would take it for Cmd/Ctrl+S.
-#[test]
-fn alt_command_s_opens_save_as_and_never_saves_over_the_file() {
-    let mut fx = open();
-    fx.select([0, 0, 70, 50]);
-    fx.key(Key::C, Modifiers::NONE);
-    let original = std::fs::read(&fx.path).unwrap();
-    fx.key(Key::S, alt_command());
-    fx.until_shown("Save shot.png with your edits to a new local file");
-    fx.drv.idle(&mut fx.win, 5);
-    std::thread::sleep(Duration::from_millis(50));
-    fx.drv.idle(&mut fx.win, 5);
-    assert_eq!(std::fs::read(&fx.path).unwrap(), original, "not saved");
-    assert!(fx.win.doc.unsaved());
-    // Esc closes the modal; nothing was written anywhere.
-    fx.key(Key::Escape, Modifiers::NONE);
-    assert!(fx
-        .drv
-        .find_text("Save shot.png with your edits to a new local file")
-        .is_none());
-    assert!(fx.win.doc.unsaved());
-}
-
 /// 07 §7: Save As never writes over anything: a taken name is refused and the field offers the
 /// next free one; the file there is untouched and the edits stay unsaved.
 #[test]
@@ -480,6 +481,7 @@ fn the_close_prompt_offers_save_as_and_discard_deletes_the_kept_edits() {
     fx.select([0, 0, 70, 50]);
     fx.key(Key::C, Modifiers::NONE);
     assert!(!crate::gui::Window::close_requested(&mut fx.win));
+    fx.drv.until(&mut fx.win, 10, |w| w.quiet());
     fx.drv.idle(&mut fx.win, 2);
     for button in ["Save", "Save As…", "Discard", "Cancel"] {
         assert!(
@@ -489,7 +491,7 @@ fn the_close_prompt_offers_save_as_and_discard_deletes_the_kept_edits() {
         );
     }
     let dirs = fx.journals();
-    assert_eq!(dirs.len(), 1, "closing writes the journal at once");
+    assert_eq!(dirs.len(), 1, "closing asks for the journal at once");
     let discard = fx.drv.find_text("Discard").unwrap();
     fx.drv.move_to(&mut fx.win, discard.center());
     for _ in 0..90 {
@@ -509,28 +511,129 @@ fn the_close_prompt_offers_save_as_and_discard_deletes_the_kept_edits() {
 }
 
 /// 07 §10: Save As… in the close prompt opens the modal, and the window closes only once that
-/// save has landed.
+/// save has landed. Its writer held: the window stays, the edits unsaved and recoverable from
+/// the journal, the destination not there; released: the encoder's output there, and closed.
 #[test]
 fn save_as_from_the_close_prompt_closes_once_it_lands() {
     let mut fx = open();
+    let hold = Arc::new(super::file::Hold::default());
+    hold.held.store(true, Ordering::SeqCst);
+    fx.win.save_as_hold = Some(hold.clone());
     fx.select([0, 0, 70, 50]);
     fx.key(Key::C, Modifiers::NONE);
+    let want = fx.win.doc.encode().unwrap().bytes;
     assert!(!crate::gui::Window::close_requested(&mut fx.win));
+    fx.drv.until(&mut fx.win, 10, |w| w.quiet());
     fx.drv.idle(&mut fx.win, 2);
     fx.drv.click_text(&mut fx.win, "Save As…");
     let dest = fx.tmp.path().join("closing.png");
     save_as_to(&mut fx, &dest);
+    fx.drv
+        .until(&mut fx.win, 10, |_| hold.reached.load(Ordering::SeqCst));
+    fx.drv.idle(&mut fx.win, 3);
+    assert!(
+        !fx.win.close_ok && !fx.drv.closed(),
+        "stays while it writes"
+    );
+    assert!(fx.win.doc.unsaved());
+    assert!(!dest.exists());
+    let dirs = fx.journals();
+    assert_eq!(dirs.len(), 1, "recoverable meanwhile");
+    assert_eq!(words(&current(&dirs[0])), ["crop"]);
+    hold.held.store(false, Ordering::SeqCst);
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     while !fx.win.close_ok {
         assert!(std::time::Instant::now() < deadline, "never closed");
         fx.drv.idle(&mut fx.win, 1);
         std::thread::sleep(Duration::from_millis(10));
     }
-    assert!(dest.exists());
+    assert!(fx.drv.closed(), "closed once it landed");
+    assert_eq!(std::fs::read(&dest).unwrap(), want, "the encoder's output");
+    fx.drv.idle(&mut fx.win, 2);
     assert!(
         fx.journals().is_empty(),
         "nothing unsaved: the journal went"
     );
+}
+
+/// Where the last pass drew `text` lowest: the prompt's button, below the toolbar's of the same
+/// name.
+fn lowest(drv: &Driver, text: &str) -> Option<Rect> {
+    drv.texts()
+        .into_iter()
+        .filter(|(_, _, t)| t == text)
+        .map(|(r, _, _)| r)
+        .max_by(|a, b| a.top().total_cmp(&b.top()))
+}
+
+/// 07 §10, E16: the close prompt's answers, performed. Save writes the picture and closes; Cancel
+/// keeps the window, the edits and the journal, and writes nothing; where Save is off, Save copy
+/// writes the edited sibling and closes.
+#[test]
+fn the_close_prompts_save_cancel_and_save_copy_do_what_they_say() {
+    // Save.
+    let mut fx = open();
+    fx.select([0, 0, 70, 50]);
+    fx.key(Key::C, Modifiers::NONE);
+    let want = fx.win.doc.encode().unwrap().bytes;
+    assert!(!crate::gui::Window::close_requested(&mut fx.win));
+    fx.drv.until(&mut fx.win, 10, |w| w.quiet());
+    fx.drv.idle(&mut fx.win, 2);
+    let save = lowest(&fx.drv, "Save").expect("the prompt's Save (below the toolbar's)");
+    fx.drv.click(&mut fx.win, save.center());
+    fx.drv.until(&mut fx.win, 10, |w| w.close_ok);
+    assert_eq!(std::fs::read(&fx.path).unwrap(), want, "saved");
+    assert!(fx.drv.closed(), "closed");
+    // Cancel.
+    let mut fx = open();
+    let original = std::fs::read(&fx.path).unwrap();
+    fx.select([0, 0, 70, 50]);
+    fx.key(Key::C, Modifiers::NONE);
+    let shown = fx.win.doc.img.clone();
+    assert!(!crate::gui::Window::close_requested(&mut fx.win));
+    fx.drv.until(&mut fx.win, 10, |w| w.quiet());
+    fx.drv.idle(&mut fx.win, 2);
+    fx.drv.click_text(&mut fx.win, "Cancel");
+    fx.drv.idle(&mut fx.win, 3);
+    assert!(
+        !fx.win.prompt && !fx.win.close_ok && !fx.drv.closed(),
+        "the window stays"
+    );
+    assert_eq!(fx.win.doc.img, shown, "the edits stay");
+    assert!(fx.win.doc.unsaved());
+    assert_eq!(fx.journals().len(), 1, "the journal stays");
+    assert_eq!(
+        std::fs::read(&fx.path).unwrap(),
+        original,
+        "nothing written"
+    );
+    // Save copy, where Save is off.
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("shot.png");
+    let bytes = bytes_of(ImageFormat::Png);
+    std::fs::write(&path, &bytes).unwrap();
+    let abs = path.to_str().unwrap().to_string();
+    let mut fs = crate::testutil::NoReplace(LocalFs::new());
+    let at = fs.stat(&abs).unwrap();
+    let origin = Origin::new(Box::new(fs), None, None, abs, at);
+    let file = ImageFile::new(origin, bytes.clone(), &tmp.path().join("cache"));
+    let doc = Doc::decode(file.original()).unwrap();
+    let mut win = ImageWindow::new(file, doc, Selection::default(), DEFAULT_BLOCK, Vec::new());
+    let mut drv = Driver::new(1000.0, 700.0);
+    drv.until(&mut win, 10, |w| w.listed && w.quiet());
+    win.doc.crop([0, 0, 50, 40]).unwrap();
+    let want = win.doc.encode().unwrap().bytes;
+    drv.idle(&mut win, 1);
+    assert!(!crate::gui::Window::close_requested(&mut win));
+    drv.until(&mut win, 10, |w| w.quiet());
+    drv.idle(&mut win, 2);
+    let copy = lowest(&drv, "Save copy").expect("the prompt's Save copy");
+    drv.click(&mut win, copy.center());
+    drv.until(&mut win, 10, |w| w.close_ok);
+    assert!(drv.closed());
+    assert_eq!(std::fs::read(&path).unwrap(), bytes, "the file untouched");
+    let copy = tmp.path().join("shot.edited.png");
+    assert_eq!(std::fs::read(&copy).unwrap(), want, "the edited sibling");
 }
 
 /// 07 §3's `NOT kept on disk (<why>)`: Undo past a Save leaves a picture the journal cannot
@@ -604,6 +707,9 @@ fn a_streamed_image_past_the_memory_line_keeps_restores_and_saves_its_crop() {
     drv.key(&mut win, Key::C, Modifiers::NONE);
     let lost = vec![Event::WindowFocused(false)];
     drv.frame(&mut win, lost, Modifiers::NONE);
+    drv.until(&mut win, 10, |w| {
+        w.image.as_deref().is_some_and(|i| i.quiet())
+    });
     let base = crate::cache::edits_path(&cache, "host", path.to_str().unwrap());
     let dirs = {
         let home = base.parent().unwrap();

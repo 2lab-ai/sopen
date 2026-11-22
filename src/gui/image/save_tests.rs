@@ -7,6 +7,7 @@
 use super::edit_tests::{bytes_of, current, journal_dirs_of, words};
 use super::*;
 use crate::gui::testkit::{command, Driver};
+use crate::remote::patch::{CopyCtl, Each, Handle, OpenFor, PatchFs};
 use crate::remote::{
     CreateError, Created, Entry, Like, LocalFs, RemoteFs, SftpRemote, Stat, Uploaded,
 };
@@ -20,15 +21,20 @@ enum Cut {
     None,
     /// The temp's create gets no reply, and nothing was made.
     CreateNoReply,
-    /// The temp's create gets no reply, after it made the (empty) temp.
+    /// The temp's create gets no reply, after it made the (empty) temp — through the backend.
     CreatedNoReply,
     /// The connection dies once the temp, written, was stat'ed: every request fails from then
     /// on, a remove included.
     DieAfterTempStat,
+    /// The connection dies right before the rename (the temp staged, the record `renaming`):
+    /// the rename and every request after fail.
+    DieBeforeRename,
     /// The rename lands, and its reply is lost.
     RenameReplyLost,
     /// The temp's create waits for `release`.
     HoldCreate,
+    /// A remove waits for `release`.
+    HoldRemove,
 }
 
 #[derive(Default)]
@@ -37,10 +43,42 @@ struct Control {
     dead: AtomicBool,
     holding: AtomicBool,
     release: AtomicBool,
+    /// Every request, as `op path` (offsets for reads), in order.
+    log: std::sync::Mutex<Vec<String>>,
+}
+
+impl Control {
+    fn note(&self, line: String) {
+        self.log.lock().unwrap().push(line);
+    }
+
+    fn taken(&self) -> Vec<String> {
+        std::mem::take(&mut *self.log.lock().unwrap())
+    }
+
+    fn writes(&self) -> Vec<String> {
+        let mutating = [
+            "create", "rename", "remove", "set-mode", "link", "write", "copy",
+        ];
+        self.log
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|l| mutating.iter().any(|m| l.starts_with(&format!("{m} "))))
+            .cloned()
+            .collect()
+    }
+
+    fn hold(&self) {
+        self.holding.store(true, Ordering::SeqCst);
+        while !self.release.load(Ordering::SeqCst) {
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
 }
 
 /// A connection — the local disk, or a real `sftp-server` — that cuts a Save off as `Control`
-/// says.
+/// says and logs every request, those of its handles included.
 struct Cutting {
     inner: Box<dyn RemoteFs + Send>,
     control: Arc<Control>,
@@ -64,6 +102,10 @@ impl Cutting {
         }
         Ok(())
     }
+
+    fn handles(&mut self) -> &mut dyn PatchFs {
+        self.inner.patcher().expect("the backend takes handles")
+    }
 }
 
 impl RemoteFs for Cutting {
@@ -73,6 +115,7 @@ impl RemoteFs for Cutting {
     }
     fn lstat_opt(&mut self, path: &str) -> Result<Option<Stat>> {
         self.alive()?;
+        self.control.note(format!("lstat {path}"));
         let st = self.inner.lstat_opt(path)?;
         if self.cut() == Cut::DieAfterTempStat && is_temp(path) {
             self.control.dead.store(true, Ordering::SeqCst);
@@ -102,6 +145,7 @@ impl RemoteFs for Cutting {
         progress: &mut dyn FnMut(u64),
     ) -> Result<u64> {
         self.alive()?;
+        self.control.note(format!("read-all {path}"));
         self.inner.read_to(path, out, progress)
     }
     fn create_from(
@@ -113,6 +157,7 @@ impl RemoteFs for Cutting {
         if let Err(e) = self.alive() {
             return Err(CreateError::new(Created::No, e));
         }
+        self.control.note(format!("create {path}"));
         match self.cut() {
             Cut::CreateNoReply => {
                 return Err(CreateError::new(
@@ -121,32 +166,30 @@ impl RemoteFs for Cutting {
                 ))
             }
             Cut::CreatedNoReply => {
-                std::fs::OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .open(path)
-                    .unwrap();
+                // Made through the backend, empty, then the reply is lost.
+                let empty = tempfile::NamedTempFile::new().unwrap();
+                let _ = self.inner.create_from(empty.path(), path, None)?;
                 return Err(CreateError::new(
                     Created::Unknown,
                     anyhow!("simulated: the create got no reply"),
                 ));
             }
-            Cut::HoldCreate => {
-                self.control.holding.store(true, Ordering::SeqCst);
-                while !self.control.release.load(Ordering::SeqCst) {
-                    std::thread::sleep(Duration::from_millis(2));
-                }
-            }
+            Cut::HoldCreate => self.control.hold(),
             _ => {}
         }
         self.inner.create_from(local, path, like)
     }
     fn set_mode(&mut self, path: &str, mode: u32) -> Result<()> {
         self.alive()?;
+        self.control.note(format!("set-mode {path}"));
         self.inner.set_mode(path, mode)
     }
     fn rename_over(&mut self, from: &str, to: &str) -> Result<()> {
+        if self.cut() == Cut::DieBeforeRename {
+            self.control.dead.store(true, Ordering::SeqCst);
+        }
         self.alive()?;
+        self.control.note(format!("rename {from} {to}"));
         self.inner.rename_over(from, to)?;
         if self.cut() == Cut::RenameReplyLost {
             return Err(crate::remote::unknown(
@@ -157,6 +200,7 @@ impl RemoteFs for Cutting {
     }
     fn link_new(&mut self, from: &str, to: &str) -> Result<()> {
         self.alive()?;
+        self.control.note(format!("link {from} {to}"));
         self.inner.link_new(from, to)
     }
     fn can_link(&self) -> bool {
@@ -166,14 +210,88 @@ impl RemoteFs for Cutting {
         self.inner.can_replace()
     }
     fn remove(&mut self, path: &str) -> Result<()> {
+        if self.cut() == Cut::HoldRemove {
+            self.control.hold();
+        }
         self.alive()?;
+        self.control.note(format!("remove {path}"));
         self.inner.remove(path)
     }
     fn hash_check_limit(&self) -> u64 {
         self.inner.hash_check_limit()
     }
-    fn patcher(&mut self) -> Option<&mut dyn crate::remote::patch::PatchFs> {
-        self.inner.patcher()
+    fn patcher(&mut self) -> Option<&mut dyn PatchFs> {
+        self.inner.patcher()?;
+        Some(self)
+    }
+}
+
+impl PatchFs for Cutting {
+    fn can_copy(&self) -> bool {
+        false
+    }
+    fn open(&mut self, path: &str, how: OpenFor) -> Result<Handle> {
+        self.alive()?;
+        self.handles().open(path, how)
+    }
+    fn create_temp(&mut self, path: &str) -> std::result::Result<Handle, CreateError> {
+        self.control.note(format!("create-temp {path}"));
+        self.handles().create_temp(path)
+    }
+    fn fstat(&mut self, file: &mut Handle) -> Result<Stat> {
+        self.alive()?;
+        self.handles().fstat(file)
+    }
+    fn read_at(&mut self, file: &mut Handle, offset: u64, len: usize) -> Result<Vec<u8>> {
+        self.alive()?;
+        let got = self.handles().read_at(file, offset, len)?;
+        self.control
+            .note(format!("read {} {offset} {}", file.path(), got.len()));
+        Ok(got)
+    }
+    fn read_through(
+        &mut self,
+        src: &mut Handle,
+        size: u64,
+        dst: Option<&mut Handle>,
+        each: &mut Each<'_>,
+    ) -> Result<u64> {
+        self.alive()?;
+        self.control
+            .note(format!("read-through {} {size}", src.path()));
+        self.handles().read_through(src, size, dst, each)
+    }
+    fn write_at(&mut self, file: &mut Handle, offset: u64, bytes: &[u8]) -> Result<()> {
+        self.alive()?;
+        self.control.note(format!("write {} {offset}", file.path()));
+        self.handles().write_at(file, offset, bytes)
+    }
+    fn set_owner(&mut self, file: &mut Handle, uid: u32, gid: u32) -> Result<()> {
+        self.control.note(format!("set-owner {}", file.path()));
+        self.handles().set_owner(file, uid, gid)
+    }
+    fn set_handle_mode(&mut self, file: &mut Handle, mode: u32) -> Result<()> {
+        self.control
+            .note(format!("set-handle-mode {}", file.path()));
+        self.handles().set_handle_mode(file, mode)
+    }
+    fn fsync(&mut self, file: &mut Handle) -> Result<()> {
+        self.control.note(format!("fsync {}", file.path()));
+        self.handles().fsync(file)
+    }
+    fn copy(
+        &mut self,
+        src: &mut Handle,
+        dst: &mut Handle,
+        size: u64,
+        ctl: &mut CopyCtl<'_>,
+    ) -> Result<()> {
+        self.control
+            .note(format!("copy {} {}", src.path(), dst.path()));
+        self.handles().copy(src, dst, size, ctl)
+    }
+    fn close(&mut self, file: Handle) {
+        self.handles().close(file)
     }
 }
 
@@ -243,9 +361,7 @@ fn rig(side: Side) -> Option<Rig> {
 
 impl Rig {
     fn settle(&mut self) {
-        self.drv.until(&mut self.win, 20, |w| {
-            w.listed && w.recovering.is_none() && w.job.is_none()
-        });
+        self.drv.until(&mut self.win, 20, |w| w.listed && w.quiet());
         self.drv.idle(&mut self.win, 2);
     }
 
@@ -260,6 +376,7 @@ impl Rig {
         self.key(Key::C, Modifiers::NONE);
         let lost = vec![Event::WindowFocused(false)];
         self.drv.frame(&mut self.win, lost, Modifiers::NONE);
+        self.drv.until(&mut self.win, 10, |w| w.quiet());
     }
 
     fn cut(&self, cut: Cut) {
@@ -307,10 +424,6 @@ impl Rig {
         self.drv.texts().into_iter().map(|(_, _, t)| t).collect()
     }
 
-    fn shows(&self, prefix: &str) -> bool {
-        self.texts().iter().any(|t| t.starts_with(prefix))
-    }
-
     fn save(&mut self) {
         self.key(Key::S, command(false));
         self.settle();
@@ -321,128 +434,272 @@ fn journal_edits_of(rig: &Rig) -> Vec<String> {
     words(&current(&rig.journals()[0]))
 }
 
-/// E18, cut before the temp: the create got no reply and made nothing. The record (phase
-/// `naming`) stays; the next open finds the file as it was — not landed — clears it, and offers
-/// the edits back. Nothing is left in the folder.
-#[test]
-fn e18_cut_before_the_temp_offers_the_edits_back() {
-    let mut rig = rig(Side::Local).unwrap();
-    let original = std::fs::read(&rig.path).unwrap();
-    rig.crop();
-    rig.cut(Cut::CreateNoReply);
-    rig.save();
-    assert_eq!(
-        rig.phase().as_deref(),
-        Some("Naming"),
-        "recorded before the create"
-    );
-    assert!(rig.temps().is_empty());
-    assert!(
-        rig.win.doc.unsaved(),
-        "the outcome is unknown: the edits stay"
-    );
-    rig.reopen();
-    assert_eq!(rig.phase(), None, "not landed: the record ended");
-    assert!(rig.drv.find_text("Restore").is_some(), "{:?}", rig.texts());
-    assert!(rig.shows("unsaved edits from "));
-    assert_eq!(std::fs::read(&rig.path).unwrap(), original);
-    assert_eq!(journal_edits_of(&rig), ["crop"]);
+/// What a cut-off Save left on disk, read before any reopen: the phase its record is in, the
+/// temp it names, and the edits of the generation it names.
+struct Left {
+    phase: &'static str,
+    temp: Option<PathBuf>,
+    saved: Vec<String>,
 }
 
-/// E18, cut after the temp was created (its create's reply lost): the temp is there, but only
-/// the name was recorded, so sopen cannot prove it its own. The next open asks — Remove it, Keep
-/// it — and Restore and Discard wait; Later asks again on the next open; Remove it removes it,
-/// and then the edits are offered.
+fn left_by(rig: &Rig) -> Left {
+    let dirs = rig.journals();
+    assert_eq!(dirs.len(), 1, "{dirs:?}");
+    let intent =
+        journal::parse_save(&std::fs::read(dirs[0].join("save")).expect("a save record")).unwrap();
+    let (phase, temp) = match &intent.phase {
+        journal::Phase::Naming { temp } => ("naming", Some(temp)),
+        journal::Phase::Created { temp, .. } => ("created", Some(temp)),
+        journal::Phase::Staged { temp, .. } => ("staged", Some(temp)),
+        journal::Phase::Renaming { temp, .. } => ("renaming", Some(temp)),
+        journal::Phase::Writing { .. } => ("writing", None),
+    };
+    let gen = journal::parse_generation(
+        &std::fs::read(dirs[0].join(format!("gen-{}", intent.saved.n))).unwrap(),
+    )
+    .unwrap();
+    Left {
+        phase,
+        temp: temp.map(PathBuf::from),
+        saved: words(&gen),
+    }
+}
+
+/// What is at a cut-off Save's temp path.
+#[derive(Debug, PartialEq, Eq)]
+enum TempIs {
+    Absent,
+    Empty,
+    /// The encoded output, whole.
+    Output,
+}
+
+fn temp_is(path: &Path, output: &[u8]) -> TempIs {
+    match std::fs::read(path) {
+        Err(_) => TempIs::Absent,
+        Ok(b) if b.is_empty() => TempIs::Empty,
+        Ok(b) => {
+            assert_eq!(b, output, "the temp holds the encoded output whole");
+            TempIs::Output
+        }
+    }
+}
+
+/// The sides a cut-off Save is run through: the local disk, and a real `sftp-server` — which
+/// fails, rather than skips, under `SOPEN_REQUIRE_SFTP_SERVER` when there is none.
+fn sides() -> Vec<Side> {
+    let mut sides = vec![Side::Local];
+    if SftpRemote::local_server().is_some() {
+        sides.push(Side::Sftp);
+    }
+    sides
+}
+
+/// E18 for an image Save, cut at each step, through both sides. Before any reopen, what is on
+/// disk is read as it was left: the record's phase at the cut, the temp it names (absent,
+/// empty, or holding the encoded output), the file, and the generation the record names (the
+/// crop). Then the next open:
+/// - cut before the temp (the create's reply lost, nothing made): not landed, the record ends,
+///   the edits offered;
+/// - cut after the temp was created (reply lost, an empty temp): only the name was recorded, so
+///   the temp is asked about — Remove it, Keep it; Restore and Discard wait; Later asks again;
+/// - cut after the temp was written (`created`, the connection gone, its remove too) and cut
+///   right before the rename (`renaming`, the temp staged): the temp equals the record — removed
+///   unasked; the edits offered;
+/// - the rename landed, its reply lost: landed, the journal retired, nothing written again.
 #[test]
-fn e18_cut_after_the_temp_was_created_asks_before_removing_it() {
+fn e18_an_image_save_cut_at_each_step_is_reconciled_on_reopen() {
+    for side in sides() {
+        let cases = [
+            (Cut::CreateNoReply, "naming", TempIs::Absent, false),
+            (Cut::CreatedNoReply, "naming", TempIs::Empty, false),
+            (Cut::DieAfterTempStat, "created", TempIs::Output, false),
+            (Cut::DieBeforeRename, "renaming", TempIs::Output, false),
+            (Cut::RenameReplyLost, "renaming", TempIs::Absent, true),
+        ];
+        for (cut, phase, temp, lands) in cases {
+            let case = format!("{side:?} {cut:?}");
+            let mut rig = rig(side).unwrap();
+            let original = std::fs::read(&rig.path).unwrap();
+            rig.crop();
+            let output = rig.win.doc.encode().unwrap().bytes;
+            rig.cut(cut);
+            rig.save();
+            // What the cut left, before any reopen.
+            let left = left_by(&rig);
+            assert_eq!(left.phase, phase, "{case}");
+            assert_eq!(left.saved, ["crop"], "{case}: the generation it names");
+            let temp_path = left.temp.expect("a temp is named");
+            assert_eq!(temp_path.parent(), Some(rig.dir.as_path()), "{case}");
+            assert_eq!(temp_is(&temp_path, &output), temp, "{case}");
+            let target = std::fs::read(&rig.path).unwrap();
+            assert_eq!(&target, if lands { &output } else { &original }, "{case}");
+            assert!(
+                rig.win.doc.unsaved(),
+                "{case}: the outcome is unknown, the edits stay"
+            );
+            let before = std::fs::metadata(&rig.path).unwrap().modified().unwrap();
+            rig.reopen();
+            let now = std::fs::metadata(&rig.path).unwrap().modified().unwrap();
+            assert_eq!(now, before, "{case}: nothing is written to the file");
+            match cut {
+                Cut::CreatedNoReply => {
+                    assert!(rig.drv.find_text("Remove it").is_some(), "{case}");
+                    assert!(rig.drv.find_text("Keep it").is_some(), "{case}");
+                    assert!(rig.drv.find_text("Restore").is_none(), "{case}: waits");
+                    assert!(rig.drv.find_text("Discard").is_none(), "{case}");
+                    assert_eq!(
+                        temp_is(&temp_path, &output),
+                        TempIs::Empty,
+                        "{case}: unasked, kept"
+                    );
+                    assert_eq!(
+                        rig.phase().as_deref(),
+                        Some("Naming"),
+                        "{case}: the record stays"
+                    );
+                    rig.drv.click_text(&mut rig.win, "Later");
+                    rig.reopen();
+                    assert!(
+                        rig.drv.find_text("Remove it").is_some(),
+                        "{case}: asked again"
+                    );
+                    rig.drv.click_text(&mut rig.win, "Remove it");
+                    rig.drv.until(&mut rig.win, 10, |w| w.quiet());
+                    rig.drv.idle(&mut rig.win, 2);
+                    assert_eq!(
+                        temp_is(&temp_path, &output),
+                        TempIs::Absent,
+                        "{case}: removed"
+                    );
+                    assert!(
+                        rig.drv.find_text("Restore").is_some(),
+                        "{case}: {:?}",
+                        rig.texts()
+                    );
+                    assert_eq!(rig.phase(), None, "{case}: answered, the record ended");
+                }
+                Cut::RenameReplyLost => {
+                    assert!(
+                        rig.texts()
+                            .iter()
+                            .any(|t| t
+                                .ends_with("landed (found on reopen): nothing was written again")),
+                        "{case}: {:?}",
+                        rig.texts()
+                    );
+                    assert!(rig.journals().is_empty(), "{case}: retired");
+                    assert!(rig.drv.find_text("Restore").is_none(), "{case}");
+                }
+                _ => {
+                    assert_eq!(temp_is(&temp_path, &output), TempIs::Absent, "{case}");
+                    assert!(rig.drv.find_text("Remove it").is_none(), "{case}");
+                    assert!(
+                        rig.drv.find_text("Restore").is_some(),
+                        "{case}: {:?}",
+                        rig.texts()
+                    );
+                    assert_eq!(rig.phase(), None, "{case}: not landed, the record ended");
+                    assert_eq!(journal_edits_of(&rig), ["crop"], "{case}");
+                }
+            }
+            assert_eq!(
+                std::fs::read(&rig.path).unwrap(),
+                target,
+                "{case}: as the cut left it"
+            );
+            assert!(rig.temps().is_empty(), "{case}: {:?}", rig.temps());
+        }
+    }
+}
+
+/// P1: Remove it removes only the file the question was about. A file put at the temp's name
+/// after the question was shown — other content, another size — survives Remove it; the record
+/// stays, and the row says why. Through both sides.
+#[test]
+fn remove_it_keeps_a_file_that_changed_since_the_question_was_shown() {
+    for side in sides() {
+        let mut rig = rig(side).unwrap();
+        rig.crop();
+        rig.cut(Cut::CreatedNoReply);
+        rig.save();
+        let temp = left_by(&rig).temp.unwrap();
+        rig.reopen();
+        assert!(rig.drv.find_text("Remove it").is_some(), "{side:?}");
+        // Another program's file takes the name meanwhile.
+        std::fs::remove_file(&temp).unwrap();
+        std::fs::write(&temp, b"someone else's file, not sopen's").unwrap();
+        rig.drv.click_text(&mut rig.win, "Remove it");
+        rig.drv.until(&mut rig.win, 10, |w| w.quiet());
+        rig.drv.idle(&mut rig.win, 2);
+        assert_eq!(
+            std::fs::read(&temp).unwrap(),
+            b"someone else's file, not sopen's",
+            "{side:?}: it survives"
+        );
+        assert_eq!(
+            rig.phase().as_deref(),
+            Some("Naming"),
+            "{side:?}: the record stays"
+        );
+        assert!(
+            rig.texts()
+                .iter()
+                .any(|t| t.contains("changed since it was shown")),
+            "{side:?}: says why: {:?}",
+            rig.texts()
+        );
+        assert!(
+            rig.drv.find_text("Remove it").is_some(),
+            "{side:?}: still asked"
+        );
+    }
+}
+
+/// P2: Remove it runs on a worker — the pass that took the click returns while the removal is
+/// held — and the row takes no answer until it is back.
+#[test]
+fn remove_it_does_not_hold_the_window() {
     let mut rig = rig(Side::Local).unwrap();
     rig.crop();
     rig.cut(Cut::CreatedNoReply);
     rig.save();
-    assert_eq!(rig.temps().len(), 1);
-    assert_eq!(rig.phase().as_deref(), Some("Naming"));
-    rig.reopen();
+    let temp = left_by(&rig).temp.unwrap();
+    let control = Arc::new(Control::default());
+    *control.cut.lock().unwrap() = Cut::HoldRemove;
+    let fs = Box::new(Cutting {
+        inner: Box::new(LocalFs::new()),
+        control: control.clone(),
+    });
+    let next = window_through(&rig.path, &rig.cache, fs);
+    drop(std::mem::replace(&mut rig.win, next));
+    rig.drv = Driver::new(1000.0, 700.0);
+    rig.settle();
+    let at = rig.drv.find_text("Remove it").expect("asked").center();
+    // Released from elsewhere after 3 s, so a pass held by the removal cannot hang the test.
+    let late = control.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_secs(3));
+        late.release.store(true, Ordering::SeqCst);
+    });
+    let started = std::time::Instant::now();
+    rig.drv.click(&mut rig.win, at);
     assert!(
-        rig.drv.find_text("Remove it").is_some(),
-        "{:?}",
-        rig.texts()
+        started.elapsed() < Duration::from_secs(2),
+        "the click's passes waited for the removal ({:?})",
+        started.elapsed()
     );
-    assert!(rig.drv.find_text("Keep it").is_some());
-    assert!(
-        rig.drv.find_text("Restore").is_none(),
-        "waits for the answer"
-    );
-    assert!(rig.drv.find_text("Discard").is_none());
-    assert!(rig.shows("unsaved edits from "));
-    assert_eq!(rig.temps().len(), 1, "never removed unasked");
-    // Later: asked again.
-    rig.drv.click_text(&mut rig.win, "Later");
-    rig.reopen();
-    assert!(rig.drv.find_text("Remove it").is_some(), "asked again");
-    rig.drv.click_text(&mut rig.win, "Remove it");
-    rig.drv.idle(&mut rig.win, 2);
-    assert!(rig.temps().is_empty(), "removed as asked");
-    assert!(rig.drv.find_text("Restore").is_some(), "{:?}", rig.texts());
-    assert_eq!(rig.phase(), None, "answered: the record ended");
-}
-
-/// E18, cut after the temp was written and its stat recorded (phase `created`), the connection
-/// gone — its remove too: the temp is left. The next open finds it equal to the record — the
-/// one this Save made — and removes it unasked; the file is as it was; the edits are offered.
-#[test]
-fn e18_cut_after_the_temp_was_written_removes_it_on_reopen() {
-    let mut rig = rig(Side::Local).unwrap();
-    let original = std::fs::read(&rig.path).unwrap();
-    rig.crop();
-    rig.cut(Cut::DieAfterTempStat);
-    rig.save();
-    assert_eq!(rig.phase().as_deref(), Some("Created"));
-    assert_eq!(rig.temps().len(), 1, "left: its remove failed too");
-    rig.reopen();
-    assert!(rig.temps().is_empty(), "provably its own: removed");
-    assert!(rig.drv.find_text("Remove it").is_none());
-    assert!(rig.drv.find_text("Restore").is_some(), "{:?}", rig.texts());
-    assert_eq!(std::fs::read(&rig.path).unwrap(), original);
+    rig.drv
+        .until(&mut rig.win, 5, |_| control.holding.load(Ordering::SeqCst));
+    assert!(rig.win.removing.is_some(), "running");
+    // Its row takes no answer meanwhile.
+    rig.drv.click_text(&mut rig.win, "Keep it");
+    assert!(temp.exists());
+    assert_eq!(rig.phase().as_deref(), Some("Naming"), "no answer taken");
+    control.release.store(true, Ordering::SeqCst);
+    rig.drv.until(&mut rig.win, 10, |w| w.quiet());
+    assert!(!temp.exists(), "removed once it was back");
     assert_eq!(rig.phase(), None);
-}
-
-/// E18, the rename landed and its reply was lost, then a kill — through the local disk and a
-/// real `sftp-server`. The next open finds the file holding the output: landed, the journal
-/// retired, and nothing written again.
-#[test]
-fn e18_a_landed_rename_whose_reply_was_lost_is_found_on_reopen() {
-    for side in [Side::Local, Side::Sftp] {
-        let Some(mut rig) = rig(side) else {
-            continue;
-        };
-        rig.crop();
-        let output = rig.win.doc.encode().unwrap().bytes;
-        rig.cut(Cut::RenameReplyLost);
-        rig.save();
-        assert_eq!(rig.phase().as_deref(), Some("Renaming"), "{side:?}");
-        assert_eq!(
-            std::fs::read(&rig.path).unwrap(),
-            output,
-            "{side:?}: it landed"
-        );
-        let landed = std::fs::metadata(&rig.path).unwrap().modified().unwrap();
-        rig.reopen();
-        assert!(
-            rig.shows("the save at ")
-                && rig
-                    .texts()
-                    .iter()
-                    .any(|t| t.ends_with("landed (found on reopen): nothing was written again")),
-            "{side:?}: {:?}",
-            rig.texts()
-        );
-        assert!(rig.journals().is_empty(), "{side:?}: retired");
-        assert!(rig.drv.find_text("Restore").is_none());
-        assert_eq!(std::fs::read(&rig.path).unwrap(), output);
-        let now = std::fs::metadata(&rig.path).unwrap().modified().unwrap();
-        assert_eq!(now, landed, "{side:?}: not written again");
-        assert!(rig.temps().is_empty());
-    }
 }
 
 /// The same lost reply in the same session: the next Save reconciles first, finds it landed,
@@ -481,6 +738,7 @@ fn the_next_save_finds_a_landed_save_and_writes_nothing_again() {
         vec![Event::WindowFocused(false)],
         Modifiers::NONE,
     );
+    rig.drv.until(&mut rig.win, 10, |w| w.quiet());
     let gen = current(&rig.journals()[0]);
     assert_eq!(words(&gen), ["pixelize"]);
     assert_eq!(gen.head.baseline.sha256, Some(journal::sha256(&output)));
@@ -632,6 +890,239 @@ fn an_edit_after_an_unknown_save_is_kept_against_the_file_it_turns_out_to_have_w
     assert_eq!(words(&gen), ["pixelize"]);
     assert_eq!(gen.head.baseline.sha256, Some(journal::sha256(&output)));
     assert_eq!(rig.phase(), None);
+    // Killed and opened again: Restore gives the picture the window had — the newer edit on the
+    // file that Save wrote.
+    let shown = rig.win.doc.img.clone();
+    rig.reopen();
+    assert!(rig.drv.find_text("Restore").is_some(), "{:?}", rig.texts());
+    rig.drv.click_text(&mut rig.win, "Restore");
+    rig.drv.idle(&mut rig.win, 2);
+    assert_eq!(rig.win.doc.img, shown, "restored on the saved file");
+    assert!(rig.win.doc.unsaved());
+}
+
+/// P5: two Saves whose outcomes were unknown, an edit between them: the first did not land (its
+/// create got no reply), the second did (its rename's reply was lost). The next Save finds the
+/// second landed and marks that Save's picture saved — not the first one's: nothing is unsaved,
+/// the journal goes, nothing is written again.
+#[test]
+fn a_landed_save_found_later_saves_its_own_picture_not_an_earlier_ones() {
+    let mut rig = rig(Side::Local).unwrap();
+    rig.win.sel.set([0, 0, 10, 10]);
+    rig.drv.idle(&mut rig.win, 1);
+    rig.key(Key::P, Modifiers::NONE);
+    rig.cut(Cut::CreateNoReply);
+    rig.save();
+    assert!(rig.win.doc.unsaved(), "the first: unknown");
+    rig.crop();
+    let output = rig.win.doc.encode().unwrap().bytes;
+    rig.cut(Cut::RenameReplyLost);
+    rig.save();
+    assert!(rig.win.doc.unsaved(), "the second: unknown");
+    assert_eq!(std::fs::read(&rig.path).unwrap(), output, "it landed");
+    let landed = std::fs::metadata(&rig.path).unwrap().modified().unwrap();
+    rig.cut(Cut::None);
+    rig.save();
+    assert!(
+        rig.win
+            .status
+            .text
+            .ends_with("landed (found now): nothing was written again"),
+        "{}",
+        rig.win.status.text
+    );
+    assert!(
+        !rig.win.doc.unsaved(),
+        "the picture the second Save wrote is saved"
+    );
+    rig.drv.idle(&mut rig.win, 3);
+    assert!(rig.journals().is_empty(), "nothing unsaved: no journal");
+    let now = std::fs::metadata(&rig.path).unwrap().modified().unwrap();
+    assert_eq!(now, landed, "not written again");
+}
+
+/// A Save waiting in its queue (its generation held) is a Save under way: a close asked for
+/// right then is refused without the prompt, and the window closes once that Save has landed.
+#[test]
+fn a_close_while_a_save_is_queued_waits_for_it() {
+    let mut rig = rig(Side::Local).unwrap();
+    let gates = Arc::new(GatedDisk::default());
+    rig.win.keeper = file::Keeper::at(gates.clone(), &rig.win.file.lock().unwrap());
+    rig.crop();
+    gates.write_held.store(true, Ordering::SeqCst);
+    rig.win.sel.set([0, 0, 10, 10]);
+    rig.drv.idle(&mut rig.win, 1);
+    rig.key(Key::P, Modifiers::NONE);
+    let want = rig.win.doc.encode().unwrap().bytes;
+    rig.key(Key::S, command(false));
+    assert!(rig.win.queued.is_some() && rig.win.job.is_none(), "queued");
+    assert!(
+        !crate::gui::Window::close_requested(&mut rig.win),
+        "refused"
+    );
+    rig.drv.idle(&mut rig.win, 2);
+    assert!(
+        !rig.win.prompt,
+        "no prompt: it closes when the save is done"
+    );
+    assert!(
+        rig.texts().iter().any(|t| t == CLOSES_AFTER_SAVE),
+        "{:?}",
+        rig.texts()
+    );
+    gates.write_held.store(false, Ordering::SeqCst);
+    rig.drv.until(&mut rig.win, 10, |w| w.close_ok);
+    assert!(rig.drv.closed(), "closed once it landed");
+    assert_eq!(std::fs::read(&rig.path).unwrap(), want, "saved");
+}
+
+/// P1 for a Save that landed: a file at its temp's name after the rename (its reply lost) is
+/// another program's, maybe. The next open says the Save landed and asks about that file only —
+/// Remove it, Keep it, Later; no Restore, no Discard — and the journal and its `renaming` record
+/// stay until it is answered. Later asks again on the next open; a file put there after it was
+/// shown survives Remove it, the row saying why; Remove it of the file shown removes it and
+/// retires the journal. Nothing is written to the file. Through both sides.
+#[test]
+fn a_landed_saves_journal_stays_until_a_file_at_its_temp_is_answered() {
+    for side in sides() {
+        let mut rig = rig(side).unwrap();
+        rig.crop();
+        let output = rig.win.doc.encode().unwrap().bytes;
+        rig.cut(Cut::RenameReplyLost);
+        rig.save();
+        let temp = left_by(&rig).temp.unwrap();
+        assert!(!temp.exists(), "{side:?}: renamed");
+        std::fs::write(&temp, b"a file of another program").unwrap();
+        let landed = std::fs::metadata(&rig.path).unwrap().modified().unwrap();
+        rig.reopen();
+        let asked = |rig: &Rig| {
+            assert!(
+                rig.drv.find_text("Remove it").is_some(),
+                "{side:?}: {:?}",
+                rig.texts()
+            );
+            assert!(rig.drv.find_text("Keep it").is_some(), "{side:?}");
+            assert!(rig.drv.find_text("Later").is_some(), "{side:?}");
+            assert!(rig.drv.find_text("Restore").is_none(), "{side:?}");
+            assert!(rig.drv.find_text("Discard").is_none(), "{side:?}");
+            assert!(
+                rig.texts()
+                    .iter()
+                    .any(|t| t.contains("nothing was written again")),
+                "{side:?}: says it landed: {:?}",
+                rig.texts()
+            );
+            assert_eq!(rig.journals().len(), 1, "{side:?}: the journal stays");
+            assert_eq!(rig.phase().as_deref(), Some("Renaming"), "{side:?}");
+        };
+        asked(&rig);
+        rig.drv.click_text(&mut rig.win, "Later");
+        rig.reopen();
+        asked(&rig);
+        // Another file takes the name after it was shown: it survives Remove it.
+        std::fs::remove_file(&temp).unwrap();
+        std::fs::write(&temp, b"yet another program's file").unwrap();
+        rig.drv.click_text(&mut rig.win, "Remove it");
+        rig.drv.until(&mut rig.win, 10, |w| w.quiet());
+        rig.drv.idle(&mut rig.win, 2);
+        assert_eq!(
+            std::fs::read(&temp).unwrap(),
+            b"yet another program's file",
+            "{side:?}"
+        );
+        assert!(
+            rig.texts()
+                .iter()
+                .any(|t| t.contains("changed since it was shown")),
+            "{side:?}: {:?}",
+            rig.texts()
+        );
+        assert_eq!(rig.phase().as_deref(), Some("Renaming"), "{side:?}: kept");
+        // Shown again, then removed as asked: the journal is retired.
+        rig.reopen();
+        asked(&rig);
+        rig.drv.click_text(&mut rig.win, "Remove it");
+        rig.drv.until(&mut rig.win, 10, |w| w.quiet());
+        rig.drv.idle(&mut rig.win, 2);
+        assert!(!temp.exists(), "{side:?}: removed");
+        assert!(rig.journals().is_empty(), "{side:?}: retired");
+        assert!(rig.win.rows.is_empty(), "{side:?}");
+        assert_eq!(std::fs::read(&rig.path).unwrap(), output, "{side:?}");
+        let now = std::fs::metadata(&rig.path).unwrap().modified().unwrap();
+        assert_eq!(now, landed, "{side:?}: nothing written to the file");
+    }
+}
+
+/// A file at a landed Save's temp name that cannot be read to be checked: it is kept, the row
+/// says why, and the journal and its record stay for the next open — not retired as if nothing
+/// were there. Through both sides.
+#[test]
+fn a_temp_that_cannot_be_checked_keeps_the_record() {
+    use std::os::unix::fs::PermissionsExt;
+    for side in sides() {
+        let mut rig = rig(side).unwrap();
+        rig.crop();
+        rig.cut(Cut::RenameReplyLost);
+        rig.save();
+        let temp = left_by(&rig).temp.unwrap();
+        std::fs::write(&temp, b"unreadable").unwrap();
+        std::fs::set_permissions(&temp, std::fs::Permissions::from_mode(0o000)).unwrap();
+        rig.reopen();
+        let said = rig.texts();
+        std::fs::set_permissions(&temp, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(
+            said.iter().any(|t| t.contains("it could not be checked")),
+            "{side:?}: {said:?}"
+        );
+        assert!(temp.exists(), "{side:?}: kept");
+        assert_eq!(rig.journals().len(), 1, "{side:?}: the journal stays");
+        assert_eq!(
+            rig.phase().as_deref(),
+            Some("Renaming"),
+            "{side:?}: so does its record"
+        );
+    }
+}
+
+/// P4: a Save of a picture Undo took back past an earlier Save is the file's fresh start: the
+/// edits after it are journaled — edit, Save, Undo, Save, edit, kept, killed, Restore gives the
+/// picture back.
+#[test]
+fn edits_after_saving_an_undone_picture_are_kept() {
+    let mut rig = rig(Side::Local).unwrap();
+    rig.crop();
+    rig.save();
+    assert!(!rig.win.doc.unsaved());
+    rig.key(Key::Z, command(false));
+    assert!(rig.win.doc.unsaved(), "undone past the save");
+    rig.save();
+    assert!(!rig.win.doc.unsaved(), "saved again");
+    assert_eq!(rig.win.doc.size(), (120, 80), "the file as at first");
+    rig.win.sel.set([0, 0, 20, 20]);
+    rig.drv.idle(&mut rig.win, 1);
+    rig.key(Key::P, Modifiers::NONE);
+    rig.drv.frame(
+        &mut rig.win,
+        vec![Event::WindowFocused(false)],
+        Modifiers::NONE,
+    );
+    rig.drv.until(&mut rig.win, 10, |w| w.quiet());
+    rig.drv.idle(&mut rig.win, 1);
+    assert!(
+        rig.texts()
+            .iter()
+            .any(|t| t.starts_with("unsaved — kept at ")),
+        "{:?}",
+        rig.texts()
+    );
+    let dirs = rig.journals();
+    assert_eq!(dirs.len(), 1, "kept");
+    assert_eq!(words(&current(&dirs[0])), ["pixelize"]);
+    let shown = rig.win.doc.img.clone();
+    rig.reopen();
+    rig.drv.click_text(&mut rig.win, "Restore");
+    rig.drv.idle(&mut rig.win, 2);
+    assert_eq!(rig.win.doc.img, shown);
 }
 
 /// Item 6 (07 §3 Recovery): the lock retry waits only for this file's own journals — a folder
@@ -683,39 +1174,36 @@ fn the_lock_retry_counts_only_this_files_journals() {
     assert_eq!(file::this_files_journals(&cache, "box", abs), vec![ours]);
 }
 
-/// The first pass of a window with an edit and a close asked for at once (`close=ask`): the
-/// journal it writes is not taken for an earlier session's by the look for those, which runs
-/// in the same pass — no row, one journal, every time.
-#[test]
-fn the_first_journal_is_never_listed_as_an_earlier_one() {
-    for _ in 0..20 {
-        let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("shot.png");
-        std::fs::write(&path, bytes_of(ImageFormat::Png)).unwrap();
-        let cache = tmp.path().join("cache");
-        let mut win = super::edit_tests::window_on(&path, &cache);
-        win.doc.crop([0, 0, 50, 40]).unwrap();
-        win.ask_close = true;
-        let mut drv = Driver::new(1000.0, 700.0);
-        drv.until(&mut win, 10, |w| w.listed && w.recovering.is_none());
-        drv.idle(&mut win, 2);
-        assert!(win.rows.is_empty() && win.temps.is_empty(), "no row");
-        assert!(win.prompt, "asked");
-        assert_eq!(super::edit_tests::journal_dirs(&cache, &path).len(), 1);
+/// The local disk for the journal, with gates and a trace: `list` (the look for earlier
+/// journals) waits while `list_held`, `write_new` (a generation's files) while `write_held`;
+/// every listing and every directory made is traced, in order.
+#[derive(Default)]
+struct GatedDisk {
+    list_held: AtomicBool,
+    write_held: AtomicBool,
+    trace: std::sync::Mutex<Vec<String>>,
+}
+
+impl GatedDisk {
+    fn wait(gate: &AtomicBool) {
+        while gate.load(Ordering::SeqCst) {
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    fn trace(&self) -> Vec<String> {
+        self.trace.lock().unwrap().clone()
     }
 }
 
-/// The local disk, a directory's creation held a moment after it is made (before its journal
-/// has its lock file): the moment a listing could take a journal being made for an earlier one.
-struct SlowMkdir;
-
-impl journal::Fs for SlowMkdir {
+impl journal::Fs for GatedDisk {
     fn create_dir(&self, path: &Path) -> std::io::Result<()> {
-        journal::Disk.create_dir(path)?;
-        std::thread::sleep(Duration::from_millis(200));
-        Ok(())
+        let name = path.file_name().unwrap_or_default().to_string_lossy();
+        self.trace.lock().unwrap().push(format!("mkdir {name}"));
+        journal::Disk.create_dir(path)
     }
     fn write_new(&self, path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+        Self::wait(&self.write_held);
         journal::Disk.write_new(path, bytes)
     }
     fn sync_file(&self, path: &Path) -> std::io::Result<()> {
@@ -737,6 +1225,9 @@ impl journal::Fs for SlowMkdir {
         journal::Disk.read(path)
     }
     fn list(&self, dir: &Path) -> std::io::Result<Vec<String>> {
+        Self::wait(&self.list_held);
+        let name = dir.file_name().unwrap_or_default().to_string_lossy();
+        self.trace.lock().unwrap().push(format!("list {name}"));
         journal::Disk.list(dir)
     }
     fn node(&self, path: &Path, follow: bool) -> std::io::Result<Option<journal::Node>> {
@@ -747,28 +1238,154 @@ impl journal::Fs for SlowMkdir {
     }
 }
 
-/// The same first pass with the journal's folder made slowly: the look for earlier journals,
-/// running meanwhile, would find it without its lock and take it — unless no journal is written
-/// while that look is out.
+/// The journals' folder of `path`, made (as an earlier session leaves it): only a journal's own
+/// directory is made then, and the look for earlier journals lists it.
+fn journal_home(cache: &Path, host: &str, path: &Path) {
+    use std::os::unix::fs::DirBuilderExt;
+    let base = crate::cache::edits_path(cache, host, path.to_str().unwrap());
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(base.parent().unwrap())
+        .unwrap();
+}
+
+/// P3, T3: nothing the journal or the look for earlier journals waits on holds the window. The
+/// look is held, then a generation's write: every pass returns at once meanwhile — through an
+/// edit, a focus loss and Cmd+S — and the Save waits in its queue, sending nothing. Once both are
+/// in, the Save starts; at its first write-side request (the temp's create, held there) the
+/// generation holding the edit is on disk, readable, and the record says `naming`.
+#[test]
+fn nothing_the_journal_waits_on_holds_the_window_and_a_save_waits_for_the_journal() {
+    let mut rig = rig(Side::Local).unwrap();
+    // A fresh window on the same file, its journal on a gated disk, before its first pass.
+    journal_home(&rig.cache, "host", &rig.path);
+    let gates = Arc::new(GatedDisk::default());
+    gates.list_held.store(true, Ordering::SeqCst);
+    gates.write_held.store(true, Ordering::SeqCst);
+    let fs = Box::new(Cutting {
+        inner: Box::new(LocalFs::new()),
+        control: rig.control.clone(),
+    });
+    let mut win = window_through(&rig.path, &rig.cache, fs);
+    win.keeper = file::Keeper::at(gates.clone(), &win.file.lock().unwrap());
+    drop(std::mem::replace(&mut rig.win, win));
+    rig.drv = Driver::new(1000.0, 700.0);
+    let original = std::fs::read(&rig.path).unwrap();
+    let mut slowest = Duration::ZERO;
+    let mut pass = |rig: &mut Rig, events: Vec<Event>, mods: Modifiers| {
+        let started = std::time::Instant::now();
+        rig.drv.frame(&mut rig.win, events, mods);
+        slowest = slowest.max(started.elapsed());
+    };
+    for _ in 0..3 {
+        pass(&mut rig, Vec::new(), Modifiers::NONE);
+    }
+    assert!(rig.win.recovering.is_some(), "the look is held");
+    rig.win.sel.set([0, 0, 90, 60]);
+    let key = |key, pressed, modifiers| Event::Key {
+        key,
+        physical_key: None,
+        pressed,
+        repeat: false,
+        modifiers,
+    };
+    pass(
+        &mut rig,
+        vec![key(Key::C, true, Modifiers::NONE)],
+        Modifiers::NONE,
+    );
+    pass(&mut rig, vec![Event::WindowFocused(false)], Modifiers::NONE);
+    let cmd = command(false);
+    pass(&mut rig, vec![key(Key::S, true, cmd)], cmd);
+    for _ in 0..10 {
+        pass(&mut rig, Vec::new(), Modifiers::NONE);
+    }
+    assert!(rig.win.queued.is_some() && rig.win.job.is_none(), "queued");
+    assert!(rig.control.writes().is_empty(), "nothing sent");
+    // The look comes back; the generation is asked for, and held.
+    gates.list_held.store(false, Ordering::SeqCst);
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while rig.win.recovering.is_some() {
+        assert!(std::time::Instant::now() < deadline);
+        pass(&mut rig, Vec::new(), Modifiers::NONE);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    for _ in 0..10 {
+        pass(&mut rig, Vec::new(), Modifiers::NONE);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(!rig.win.keeper.settled(), "the generation is held");
+    assert!(
+        rig.win.queued.is_some() && rig.win.job.is_none(),
+        "still queued"
+    );
+    assert!(rig.control.writes().is_empty(), "nothing sent");
+    assert!(
+        slowest < Duration::from_millis(300),
+        "a pass waited: {slowest:?}"
+    );
+    // The generation goes in: the Save starts, and is held at its first write-side request.
+    rig.cut(Cut::HoldCreate);
+    gates.write_held.store(false, Ordering::SeqCst);
+    let control = rig.control.clone();
+    rig.drv
+        .until(&mut rig.win, 10, |_| control.holding.load(Ordering::SeqCst));
+    let left = left_by(&rig);
+    assert_eq!(left.phase, "naming");
+    assert_eq!(left.saved, ["crop"], "durable before the first write");
+    assert_eq!(words(&current(&rig.journals()[0])), ["crop"]);
+    assert_eq!(std::fs::read(&rig.path).unwrap(), original);
+    rig.control.release.store(true, Ordering::SeqCst);
+    rig.settle();
+    assert!(!rig.win.doc.unsaved(), "saved");
+    assert!(rig.journals().is_empty());
+}
+
+/// 07 §7: Alt+Cmd/Ctrl+S is Save As, not Save — egui's own check would take it for Cmd/Ctrl+S.
+/// No request that writes is sent while the modal is up; Esc closes it, nothing written.
+#[test]
+fn alt_command_s_opens_save_as_and_sends_nothing() {
+    let mut rig = rig(Side::Local).unwrap();
+    rig.crop();
+    let original = std::fs::read(&rig.path).unwrap();
+    rig.control.taken();
+    rig.key(Key::S, super::edit_tests::alt_command());
+    rig.drv.until(&mut rig.win, 10, |w| w.saving_as.is_some());
+    rig.drv.idle(&mut rig.win, 5);
+    assert!(
+        rig.texts()
+            .iter()
+            .any(|t| t == "Save shot.png with your edits to a new local file"),
+        "{:?}",
+        rig.texts()
+    );
+    assert_eq!(
+        rig.control.writes(),
+        Vec::<String>::new(),
+        "nothing written"
+    );
+    assert_eq!(std::fs::read(&rig.path).unwrap(), original);
+    assert!(rig.win.doc.unsaved());
+    rig.key(Key::Escape, Modifiers::NONE);
+    rig.drv.idle(&mut rig.win, 2);
+    assert!(rig.win.saving_as.is_none());
+    assert_eq!(rig.control.writes(), Vec::<String>::new());
+    assert!(rig.win.doc.unsaved());
+}
+
+/// The first pass of a window with an edit and a close asked for at once (`close=ask`), while
+/// the look for earlier journals is kept going (another live session's journal of the file is
+/// tried again for a while): no journal directory is made until the look is over — the trace
+/// has every listing before the window's journal is made — so the look never takes it for an
+/// earlier one's. No row; the live one and this window's.
 #[test]
 fn the_first_journal_waits_for_the_look_for_earlier_ones() {
     let tmp = tempfile::tempdir().unwrap();
     let path = tmp.path().join("shot.png");
     std::fs::write(&path, bytes_of(ImageFormat::Png)).unwrap();
     let cache = tmp.path().join("cache");
-    // The journals' folder is there already (an earlier session's journal went, its folder
-    // stays): only the journal's own directory is made now.
-    let base = crate::cache::edits_path(&cache, crate::cache::LOCAL_HOST, path.to_str().unwrap());
-    {
-        use std::os::unix::fs::DirBuilderExt;
-        std::fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(base.parent().unwrap())
-            .unwrap();
-    }
-    // Another live session's journal of the file: its lock is taken, so the look goes on
-    // trying it for a while — the time a journal made meanwhile could be taken.
+    journal_home(&cache, crate::cache::LOCAL_HOST, &path);
     let live = journal::Journal::create(
         journal::disk(),
         &cache,
@@ -777,14 +1394,35 @@ fn the_first_journal_waits_for_the_look_for_earlier_ones() {
         journal::Kind::Image,
     )
     .unwrap();
+    let gates = Arc::new(GatedDisk::default());
     let mut win = super::edit_tests::window_on(&path, &cache);
-    win.keeper = file::Keeper::at(Arc::new(SlowMkdir), &win.file.lock().unwrap());
+    win.keeper = file::Keeper::at(gates.clone(), &win.file.lock().unwrap());
     win.doc.crop([0, 0, 50, 40]).unwrap();
     win.ask_close = true;
     let mut drv = Driver::new(1000.0, 700.0);
-    drv.until(&mut win, 10, |w| w.listed && w.recovering.is_none());
+    drv.until(&mut win, 10, |w| w.listed && w.quiet());
     drv.idle(&mut win, 2);
-    assert!(win.rows.is_empty() && win.temps.is_empty(), "no row");
+    assert!(win.rows.is_empty(), "no row");
+    // The look lists the journals' folder (the file's folder in the cache); a journal lists
+    // only its own directory.
+    let home = path
+        .parent()
+        .unwrap()
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    let look = format!("list {home}");
+    let trace = gates.trace();
+    let made = trace
+        .iter()
+        .position(|e| e.starts_with("mkdir shot.png.journal-"))
+        .unwrap_or_else(|| panic!("the window's journal was made: {trace:?}"));
+    assert!(trace[..made].contains(&look), "{trace:?}");
+    assert!(
+        !trace[made..].contains(&look),
+        "the look listed after the journal was made: {trace:?}"
+    );
     let dirs = super::edit_tests::journal_dirs(&cache, &path);
     assert_eq!(dirs.len(), 2, "the live one and this window's: {dirs:?}");
     drop(live);
@@ -849,80 +1487,114 @@ fn cut_off_big_save(cache: &Path, target: &Path) {
 }
 
 /// What the next open's look finds for `target`.
-fn reopen_look(cache: &Path, target: &Path) -> file::Recovered {
+fn reopen_look(cache: &Path, target: &Path) -> (file::Recovered, Vec<String>) {
     let abs = target.to_str().unwrap().to_string();
     let at = LocalFs::new().stat(&abs).unwrap();
-    let origin = Origin::new(Box::new(LocalFs::new()), None, Some("host".into()), abs, at);
+    let control = Arc::new(Control::default());
+    let fs = Box::new(Cutting {
+        inner: Box::new(LocalFs::new()),
+        control: control.clone(),
+    });
+    let origin = Origin::new(fs, None, Some("host".into()), abs, at);
     let file = ImageFile::new(origin, b"the bytes as read".to_vec(), cache);
     let basis = file.basis();
-    file::recover(&Mutex::new(file), &basis)
+    let found = file::recover(&Mutex::new(file), &basis, &journal::disk());
+    let log = control.taken();
+    (found, log)
 }
 
-/// E18, an image whose encoded output is above 256 MiB, landed with its reply lost: the next
-/// open finds it by the staged stat and the first and last MiB (nothing between is read), retires
-/// the journal and writes nothing again. A file whose middle differs, its stat and ends the
-/// same, counts as landed too — reconciliation reads nothing between (07 §3.1).
+/// Overwrites `at` of `target` with `bytes`, its modification time put back.
+fn overwrite_keeping_mtime(target: &Path, at: u64, bytes: &[u8]) {
+    use std::io::{Seek, SeekFrom, Write};
+    let mtime = std::fs::metadata(target).unwrap().modified().unwrap();
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .open(target)
+        .unwrap();
+    f.seek(SeekFrom::Start(at)).unwrap();
+    f.write_all(bytes).unwrap();
+    f.set_modified(mtime).unwrap();
+}
+
+/// E18, an image whose encoded output is above 256 MiB, landed with its reply lost. The journal
+/// is built as the Save's steps build it (`PostEvidence::image` with the staged stat, the first
+/// and last MiB and the whole hash), not by a real encode of that size. The next open:
+/// - the output as staged: landed, found by the staged stat and the first and last MiB — the
+///   reads of the file are those two MiB and nothing between — the journal retired, nothing
+///   written or renamed;
+/// - its middle changed by another writer, stat and ends the same: landed too (07 §3.1 says
+///   reconciliation reads nothing between, the same best effort as §4.5's);
+/// - its first or its last MiB changed: neither the output nor the file it started from —
+///   unknown, the row says a save was cut off, and the journal is kept.
 #[test]
 fn a_landed_save_above_256_mib_is_found_by_its_first_and_last_mib() {
     const SIZE: u64 = crate::remote::HASH_CHECK_MAX + (16 << 20);
-    for middle_changed in [false, true] {
+    const MIB: u64 = 1 << 20;
+    for (case, change) in [
+        ("as staged", None),
+        ("middle changed", Some(SIZE / 2)),
+        ("first MiB changed", Some(10)),
+        ("last MiB changed", Some(SIZE - 4)),
+    ] {
         let tmp = tempfile::tempdir().unwrap();
         let cache = tmp.path().join("cache");
         let target = tmp.path().join("big.png");
         big_output(&target, SIZE);
         cut_off_big_save(&cache, &target);
-        if middle_changed {
-            use std::io::{Seek, SeekFrom, Write};
-            let mtime = std::fs::metadata(&target).unwrap().modified().unwrap();
-            let mut f = std::fs::OpenOptions::new()
-                .write(true)
-                .open(&target)
-                .unwrap();
-            f.seek(SeekFrom::Start(SIZE / 2)).unwrap();
-            f.write_all(b"another writer").unwrap();
-            f.set_modified(mtime).unwrap();
+        if let Some(at) = change {
+            overwrite_keeping_mtime(&target, at, b"edge");
         }
-        let found = reopen_look(&cache, &target);
-        assert!(found.rows.is_empty(), "middle_changed={middle_changed}");
-        assert_eq!(found.notes.len(), 1, "{:?}", found.notes);
-        assert!(
-            found.notes[0].ends_with("landed (found on reopen): nothing was written again"),
-            "{:?}",
-            found.notes
-        );
-        assert!(
-            journal_dirs_of(&cache, "host", &target).is_empty(),
-            "retired"
-        );
+        let (found, log) = reopen_look(&cache, &target);
+        let shown = target.to_str().unwrap();
+        // What the look read of the file, and that it changed nothing.
+        let reads: Vec<&String> = log.iter().filter(|l| l.starts_with("read ")).collect();
+        for read in &reads {
+            let first = format!("read {shown} 0 {MIB}");
+            let last = format!("read {shown} {} {MIB}", SIZE - MIB);
+            assert!(**read == first || **read == last, "{case}: {read}");
+        }
+        assert!(!reads.is_empty(), "{case}");
+        let writes: Vec<&String> = log
+            .iter()
+            .filter(|l| {
+                [
+                    "create", "rename", "remove", "set-mode", "link", "write ", "copy",
+                ]
+                .iter()
+                .any(|m| l.starts_with(m))
+            })
+            .collect();
+        assert!(writes.is_empty(), "{case}: {writes:?}");
+        let lands = matches!(case, "as staged" | "middle changed");
+        if lands {
+            assert!(found.rows.is_empty(), "{case}");
+            assert_eq!(found.notes.len(), 1, "{case}: {:?}", found.notes);
+            assert!(
+                found.notes[0].ends_with("landed (found on reopen): nothing was written again"),
+                "{case}: {:?}",
+                found.notes
+            );
+            assert!(
+                journal_dirs_of(&cache, "host", &target).is_empty(),
+                "{case}: retired"
+            );
+        } else {
+            assert!(found.notes.is_empty(), "{case}: {:?}", found.notes);
+            assert_eq!(found.rows.len(), 1, "{case}");
+            assert!(
+                found.rows[0]
+                    .said
+                    .iter()
+                    .any(|s| s.starts_with("a save was cut off")),
+                "{case}: {:?}",
+                found.rows[0].said
+            );
+            assert_eq!(
+                journal_dirs_of(&cache, "host", &target).len(),
+                1,
+                "{case}: kept"
+            );
+        }
         assert_eq!(std::fs::metadata(&target).unwrap().len(), SIZE);
     }
-    // Its ends changed: not the output — and not the file it started from either: unknown.
-    let tmp = tempfile::tempdir().unwrap();
-    let cache = tmp.path().join("cache");
-    let target = tmp.path().join("big.png");
-    big_output(&target, SIZE);
-    cut_off_big_save(&cache, &target);
-    {
-        use std::io::{Seek, SeekFrom, Write};
-        let mtime = std::fs::metadata(&target).unwrap().modified().unwrap();
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .open(&target)
-            .unwrap();
-        f.seek(SeekFrom::Start(SIZE - 4)).unwrap();
-        f.write_all(b"edge").unwrap();
-        f.set_modified(mtime).unwrap();
-    }
-    let found = reopen_look(&cache, &target);
-    assert!(found.notes.is_empty(), "{:?}", found.notes);
-    assert_eq!(found.rows.len(), 1);
-    assert!(
-        found.rows[0]
-            .said
-            .iter()
-            .any(|s| s.starts_with("a save was cut off")),
-        "{:?}",
-        found.rows[0].said
-    );
-    assert_eq!(journal_dirs_of(&cache, "host", &target).len(), 1, "kept");
 }

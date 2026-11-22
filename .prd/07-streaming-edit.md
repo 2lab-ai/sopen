@@ -634,7 +634,22 @@ size rule. Image and media upload their output, as today.
   (§2). Undo back past a Save, or an edit made there, leaves a picture no operations on the
   saved file make: the status bar says `unsaved — NOT kept on disk (undone past the last save,
   which the journal cannot replay)` (§3) until the next Save, and the close prompt still guards
-  it.
+  it. A Save of such a picture is the journal's fresh start: the edits after it are kept again.
+- **Nothing waits on the window's thread.** The generation that focus loss, closing and the start
+  of a Save ask for at once (§3) is written on a worker; a Save waits in a queue — taking no
+  edits — until that generation is durable (and until the look for earlier journals is back),
+  then starts; a close or leaving the viewer meanwhile waits for it as for a running Save.
+  The look for earlier journals runs on a worker too, and no generation is written while it
+  is out (it would take a journal being made for an earlier one's).
+- **A temp asked about** (§3.1: phase `naming`, or one that no longer equals the record) is
+  bound to its journal's record and to the file as it was when asked — its stat and, up to
+  256 MiB, its content's SHA-256. The record stays until the question is answered, also when
+  the Save landed (that journal is retired once answered). Remove it reads the file again on a
+  worker and removes it only when it is still that file; otherwise, or when it cannot be checked,
+  the file and the record stay and the row says why. A temp that cannot be read to be checked
+  keeps the record too, for the next open. A removal without asking re-reads the temp's stat
+  right before it and requires the recorded one. A Save in the same session that
+  finds such a temp refuses, and leaves the question to the next open.
 - **The journal** records the operations and the pasted pictures (§3). A restore replays them on the
   decoded original.
 - **Save As** writes the encoder's output (§7).
