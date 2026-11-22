@@ -197,6 +197,11 @@ byte.
 - **A journal that holds no edit** (its edits undone before the end) is removed when it is listed:
   there is nothing to offer — unless it still holds a question about an interrupted save's file
   (§3.1): then its row says `an interrupted save's record is kept at <journal>` and asks it.
+  - So is a journal folder holding nothing but its lock — no `CURRENT`, no generation (whole, torn
+    or `.tmp`), no paste, no `save`: a session that ended between its `mkdir` and its first
+    generation, or a folder the listing took from a session still between the folder and its lock
+    (a slow disk). That session then makes another journal, and its edits go there. A folder with
+    anything else in it is offered as before, with what it holds.
 - **Later** leaves the journal for the next open.
 - **Discard** removes it.
 - A journal of **another kind** (the same file opened as hex earlier, now as an image) is named in

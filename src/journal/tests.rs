@@ -1970,34 +1970,157 @@ fn the_lock_keeps_two_sessions_apart() {
     assert_eq!(edits_of(&again[0]).at.n, 2);
 }
 
-/// A journal whose lock file never got made (a kill right after the `mkdir`) is taken by the next
-/// listing, which makes the lock exclusively; one created by a session at the same moment then
-/// goes to a journal of its own.
+/// The journal folders of [`PATH`] on [`MEM_CACHE`], tombstones included.
+fn mem_journal_names(mem: &MemFs) -> Vec<String> {
+    mem.list(Path::new("/cache/.edits/box/data"))
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|n| n.contains(".journal-"))
+        .collect()
+}
+
+/// §3: a journal folder that holds nothing — its session killed right after the `mkdir`, so no
+/// lock file, or right after its lock, the lock free now — holds no edit and no save record: the
+/// listing takes it and removes it, and offers nothing. (Until 2026-11-22 it was offered as a
+/// journal whose generation cannot be read, on every open until answered.)
 #[test]
-fn a_journal_without_a_lock_file_is_taken_by_the_listing() {
-    let stop = {
+fn a_journal_holding_nothing_is_removed_by_the_listing() {
+    let lock_step = {
         let mem = MemFs::with_cache();
         let (count, logfs) = logged(&mem);
         drop(Journal::create(logfs, Path::new(MEM_CACHE), HOST, PATH, Kind::Hex).unwrap());
         count.ops().len() - 1
     };
-    let mem = MemFs::with_cache();
-    let dying = Dying::new(Arc::new(mem.clone()), stop);
-    assert!(Journal::create(dying, Path::new(MEM_CACHE), HOST, PATH, Kind::Hex).is_err());
-    let fs2: Arc<dyn Fs> = Arc::new(mem.clone());
-    let found = orphans(&fs2, Path::new(MEM_CACHE), HOST, PATH).unwrap();
-    assert_eq!(found.len(), 1);
-    assert!(matches!(
-        found[0].found,
-        Found::Unusable {
-            generation: None,
-            ..
+    for locked in [false, true] {
+        let mem = MemFs::with_cache();
+        if locked {
+            let fs: Arc<dyn Fs> = Arc::new(mem.clone());
+            drop(Journal::create(fs, Path::new(MEM_CACHE), HOST, PATH, Kind::Hex).unwrap());
+        } else {
+            let dying = Dying::new(Arc::new(mem.clone()), lock_step);
+            assert!(Journal::create(dying, Path::new(MEM_CACHE), HOST, PATH, Kind::Hex).is_err());
         }
-    ));
-    let dir = found[0].dir().to_path_buf();
-    assert!(mem.exists(&dir.join("lock")));
-    found.into_iter().next().unwrap().remove().unwrap();
-    assert!(!mem.exists(&dir));
+        let made = mem_journal_names(&mem);
+        assert_eq!(made.len(), 1, "locked={locked}: {made:?}");
+        let after = mem.killed();
+        let fs: Arc<dyn Fs> = Arc::new(after.clone());
+        let found = orphans(&fs, Path::new(MEM_CACHE), HOST, PATH).unwrap();
+        let rows: Vec<&Found> = found.iter().map(|o| &o.found).collect();
+        assert!(rows.is_empty(), "locked={locked}: offered {rows:?}");
+        drop(found);
+        let left = mem_journal_names(&after);
+        assert!(left.is_empty(), "locked={locked}: left {left:?}");
+    }
+}
+
+/// §3: a journal folder with anything of an edit or a Save in it is not one that holds nothing:
+/// a generation that cannot be read and no `CURRENT`, a generation still being written, a
+/// pasted picture, a `save` record whole or torn — each is still offered, with what it holds,
+/// and stays.
+#[test]
+fn a_journal_with_anything_of_an_edit_or_a_save_in_it_is_still_offered() {
+    let cases = [
+        "torn gen-1, no CURRENT",
+        "gen-1.tmp",
+        "a paste",
+        "save",
+        "torn save",
+    ];
+    for case in cases {
+        let (mem, _, mut j) = mem_journal(Kind::Image);
+        let snap = image_snap(&[3]);
+        j.publish(&snap).unwrap();
+        j.begin_save(&snap, upload_plan()).unwrap();
+        let dir = j.dir().to_path_buf();
+        drop(j);
+        let all = mem.list(&dir).unwrap();
+        let paste = all
+            .iter()
+            .find(|n| n.starts_with("paste-"))
+            .unwrap()
+            .clone();
+        let gen = mem.read(&dir.join("gen-1")).unwrap();
+        let keep = match case {
+            "a paste" => vec![LOCK, paste.as_str()],
+            "save" | "torn save" => vec![LOCK, SAVE],
+            _ => vec![LOCK],
+        };
+        for name in &all {
+            if !keep.contains(&name.as_str()) {
+                mem.remove_file(&dir.join(name)).unwrap();
+            }
+        }
+        match case {
+            "torn gen-1, no CURRENT" => mem.write_new(&dir.join("gen-1"), &gen[..gen.len() / 2]),
+            "gen-1.tmp" => mem.write_new(&dir.join("gen-1.tmp"), &gen),
+            "torn save" => {
+                let save = mem.read(&dir.join(SAVE)).unwrap();
+                mem.remove_file(&dir.join(SAVE)).unwrap();
+                mem.write_new(&dir.join(SAVE), &save[..save.len() / 2])
+            }
+            _ => Ok(()),
+        }
+        .unwrap();
+        let after = mem.killed();
+        let fs: Arc<dyn Fs> = Arc::new(after.clone());
+        let found = listed(&fs);
+        assert_eq!(found.len(), 1, "{case}: offered");
+        assert!(
+            matches!(
+                found[0].found,
+                Found::Unusable {
+                    generation: None,
+                    ..
+                }
+            ),
+            "{case}: {:?}",
+            found[0].found
+        );
+        match case {
+            "save" => assert!(matches!(found[0].save, SaveFile::Intent(_)), "{case}"),
+            "torn save" => assert!(matches!(found[0].save, SaveFile::Unreadable(_)), "{case}"),
+            _ => assert_eq!(found[0].save, SaveFile::None, "{case}"),
+        }
+        drop(found);
+        assert!(after.exists(&dir), "{case}: kept");
+    }
+}
+
+/// §3: the listing that takes a session's folder between its `mkdir` and its lock (a slow disk
+/// holds a session there), finds nothing in it and removes it, never costs that session its
+/// journal: the session makes another, its generation lands there, and once the session is gone
+/// the next listing offers it.
+#[test]
+fn a_folder_taken_before_its_lock_never_costs_its_session_the_journal() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cache = tmp.path().to_path_buf();
+    let gap = gap::arm(&cache);
+    let session = {
+        let cache = cache.clone();
+        std::thread::spawn(move || -> Result<PathBuf> {
+            let mut j = Journal::create(disk(), &cache, HOST, PATH, Kind::Hex)?;
+            j.publish(&hex_snap(1))?;
+            Ok(j.dir().to_path_buf())
+        })
+    };
+    gap.reached();
+    let caught = this_files_journals(&cache, HOST, PATH);
+    assert_eq!(caught.len(), 1, "the session's folder, before its lock");
+    let found = orphans(&disk(), &cache, HOST, PATH).unwrap();
+    let rows: Vec<&Found> = found.iter().map(|o| &o.found).collect();
+    assert!(rows.is_empty(), "offered {rows:?}");
+    drop(found);
+    assert!(!caught[0].exists(), "the folder holding nothing is removed");
+    gap.release();
+    let kept = session
+        .join()
+        .unwrap()
+        .unwrap_or_else(|e| panic!("the session lost its journal: {e:#}"));
+    assert_ne!(kept, caught[0], "a journal of its own");
+    let found = orphans(&settled_disk(), &cache, HOST, PATH).unwrap();
+    assert_eq!(found.len(), 1);
+    assert_eq!(found[0].dir(), kept);
+    assert_eq!(edits_of(&found[0]).at.n, 1, "its generation is kept");
 }
 
 // ---------------------------------------------------------------------------------------------

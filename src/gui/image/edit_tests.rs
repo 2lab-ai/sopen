@@ -308,6 +308,78 @@ fn restore_refuses_a_file_whose_content_changed_and_keeps_the_journal() {
     assert!(fx.drv.text_starting_with("unsaved edits from ").is_none());
 }
 
+/// 07 §3: a journal folder that holds nothing but its lock — or not even that: its session
+/// ended between the `mkdir` and its first generation — holds no edit. The next open removes it
+/// and shows no row.
+#[test]
+fn a_journal_folder_holding_nothing_is_removed_and_never_offered() {
+    for locked in [false, true] {
+        let mut fx = open();
+        let base = crate::cache::edits_path(
+            &fx.cache,
+            crate::cache::LOCAL_HOST,
+            fx.path.to_str().unwrap(),
+        );
+        let name = base.file_name().unwrap().to_string_lossy().into_owned();
+        let dir = base.with_file_name(format!("{name}.journal-20261122T010203Z-0123abcd"));
+        std::fs::create_dir_all(&dir).unwrap();
+        if locked {
+            std::fs::write(dir.join("lock"), b"").unwrap();
+        }
+        fx.reopen();
+        fx.until_idle();
+        assert!(
+            fx.said("unsaved edits").is_none() && fx.drv.find_text("Later").is_none(),
+            "locked={locked}: offered: {:?}",
+            fx.texts()
+        );
+        let left: Vec<_> = std::fs::read_dir(dir.parent().unwrap())
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name())
+            .collect();
+        assert!(left.is_empty(), "locked={locked}: left {left:?}");
+    }
+}
+
+/// 07 §3: another window's look for earlier journals that takes this window's journal folder
+/// between its `mkdir` and its lock (a slow disk holds the writer there) — and removes it,
+/// finding nothing in it — never costs this window its journal: its generation lands in one of
+/// its own, which the status bar names.
+#[test]
+fn a_journal_folder_taken_before_its_lock_never_costs_the_window_its_journal() {
+    let mut fx = open();
+    fx.until_idle();
+    let gap = crate::journal::gap::arm(&fx.cache);
+    fx.select([0, 0, 50, 40]);
+    fx.key(Key::C, Modifiers::NONE);
+    // Focus loss writes the generation at once: its writer stops between folder and lock.
+    let lost = vec![Event::WindowFocused(false)];
+    fx.drv.frame(&mut fx.win, lost, Modifiers::NONE);
+    gap.reached();
+    let caught = fx.journals();
+    assert_eq!(caught.len(), 1, "the folder, before its lock");
+    let mut other = window_on(&fx.path, &fx.cache);
+    let mut drv = Driver::new(1000.0, 700.0);
+    // Its first pass starts the look; then until it is back.
+    drv.idle(&mut other, 1);
+    drv.until(&mut other, 10, |w| w.quiet());
+    drv.idle(&mut other, 1);
+    let said: Vec<String> = drv.texts().into_iter().map(|(_, _, t)| t).collect();
+    assert!(
+        !said.iter().any(|t| t.starts_with("unsaved edits")),
+        "offered in the other window: {said:?}"
+    );
+    assert!(!caught[0].exists(), "the folder holding nothing is removed");
+    gap.release();
+    fx.until_idle();
+    let kept = fx.journals();
+    assert_eq!(kept.len(), 1, "{kept:?}; {:?}", fx.texts());
+    assert_ne!(kept[0], caught[0], "a journal of its own");
+    assert_eq!(words(&current(&kept[0])), ["crop"]);
+    assert!(fx.said("unsaved — kept at ").is_some(), "{:?}", fx.texts());
+}
+
 /// 07 §3.1's next baseline: once a Save lands the journal goes (nothing is unsaved), and the
 /// next edit's journal is against the file as saved — its size and its whole SHA-256 — not the
 /// bytes the window first read.

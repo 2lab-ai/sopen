@@ -307,8 +307,8 @@ fn edit_image(fx: &mut Fx) {
 fn an_edited_image_is_asked_before_it_goes() {
     let mut fx = fixture();
     // The session's journal is held between its folder and its lock, where a slow disk can keep
-    // it a while: the image opened again below takes that folder as an earlier session's and
-    // shows it in a recovery row, whose Discard is drawn under the next prompt's.
+    // it a while: the image opened again below takes that folder, finds nothing in it and
+    // removes it — no recovery row (07 §3), none with a Discard under the next prompt's.
     let gap = crate::journal::gap::arm(&fx.cache);
     fx.open("photo.png");
     edit_image(&mut fx);
@@ -341,6 +341,11 @@ fn an_edited_image_is_asked_before_it_goes() {
     fx.key(Key::Enter);
     fx.settle();
     gap.release();
+    let said: Vec<String> = fx.drv.texts().into_iter().map(|t| t.2).collect();
+    assert!(
+        !said.iter().any(|t| t.starts_with("unsaved edits")),
+        "the discarded session's folder is offered: {said:?}"
+    );
     edit_image(&mut fx);
     assert!(!Window::close_requested(&mut fx.b));
     fx.drv.idle(&mut fx.b, 1);
@@ -1509,8 +1514,8 @@ fn clipboard_shortcuts_reach_a_hosted_image() {
     // A paste alone is an edit. Pasted without a rectangle it selects what it covers: the
     // first Esc clears that, the second asks before the paste goes. Its journal is held between
     // its folder and its lock, where a slow disk can keep it a while: the image opened again
-    // below takes that folder as an earlier session's and shows it in a recovery row, whose
-    // Discard is drawn under the next prompt's.
+    // below takes that folder, finds nothing in it and removes it — no recovery row (07 §3),
+    // none with a Discard under the next prompt's.
     let gap = crate::journal::gap::arm(&fx.cache);
     fx.open("photo.png");
     let red = egui::ColorImage::new([4, 4], vec![egui::Color32::RED; 16]);
@@ -1531,6 +1536,11 @@ fn clipboard_shortcuts_reach_a_hosted_image() {
     gap.reached();
     fx.open("photo.png");
     gap.release();
+    let said: Vec<String> = fx.drv.texts().into_iter().map(|t| t.2).collect();
+    assert!(
+        !said.iter().any(|t| t.starts_with("unsaved edits")),
+        "the discarded session's folder is offered: {said:?}"
+    );
     let c = Pos2::new(500.0, 350.0);
     fx.drv.drag(
         &mut fx.b,
