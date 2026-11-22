@@ -40,7 +40,16 @@
 //! line longer than [`LINE_MAX`] (only its start is read, and a comment or string closed past the
 //! cut would colour everything after it), and the rest of the file is plain (wrapped, still
 //! whole). A file over [`HIGHLIGHT_MAX`] is highlighted over its first 16 MiB and plain past
-//! them, read through a stream or in place (06 Tensions, settled by W5b).
+//! them, read through a stream or in place (06 Tensions, settled by W5b). A run of more than
+//! [`RUN_MAX`] word characters (a hex blob, a long name) reaches the parser shortened — the
+//! grammars' patterns cost the square of a run's length — to pieces of itself that keep its
+//! ends, its characters and their order, and is coloured as the whole run, but for the
+//! differences known, which [`Shortened`] lists (most in a varied run: the left-out part where a
+//! grammar colours inside a word; a back-reference between two long runs that shorten alike).
+//! So does a chain of names longer than that (`a.b.c`, `a,b,c`, `a$b$c`, `a-b-c`), and in YAML
+//! a stretch of a line without its `: # [ ] { } " ' \` (a long value): whole units of them from
+//! each end, an even number left out between, the left-out part coloured as the character kept
+//! before it — as it is, but where a grammar colours a chain's names apart.
 //!
 //! The file is read live; the index is of the file as opened. A file that differs from it in any
 //! way ([`TextDoc::now`]: written to, grown, truncated, another file renamed over its path) is
@@ -107,6 +116,20 @@ pub const LINE_MAX: usize = 4096;
 /// Highlighting covers this much of a file, from its start (its state runs from the top of the
 /// file); the rest is plain. Also how far a stream's index pass reads without being asked.
 pub const HIGHLIGHT_MAX: u64 = 16 << 20;
+/// The longest run of word characters, chain of names or YAML stretch the parser is handed as
+/// it is. A longer one is shortened ([`Shortened`]) — to more than this, so it never reads as a
+/// shorter one: a run to less than twice it, a chain or stretch to at most three units more.
+const RUN_MAX: usize = 2 * RUN_END + RUN_MIDDLE;
+/// Characters a shortened run keeps at each end: twice the longest counted repeat in the bundled
+/// grammars that can match word characters (16, C++'s raw-string delimiter), so a prefix or
+/// suffix (`0x`, `u64`, `_t`) is seen as it is.
+const RUN_END: usize = 32;
+/// A shortened run's middle is longer than this: room for every ASCII word character, so a test
+/// over the whole run (all capitals, all hex digits) answers as it does on the run itself.
+const RUN_MIDDLE: usize = 64;
+/// A stretch of one repeated character in a shortened run's middle keeps its length modulo this
+/// (and two characters at least), so runs that differ only in a stretch's length mostly differ.
+const RUN_STRETCH: usize = 16;
 /// Reads while looking for the end of a line.
 const CHUNK: usize = 16 * 1024;
 /// The most marks the index holds before it thins them (06 §7.2): 16 MiB of them.
@@ -2031,10 +2054,480 @@ fn syntax_of(name: &str, doc: &mut TextDoc) -> Result<Option<&'static SyntaxRefe
 /// A highlighted line: runs of text and their colour.
 type Runs = Vec<(Color32, String)>;
 
+/// A character of a word run: what the grammars' identifier, number and keyword patterns are
+/// made of, and never a delimiter (a quote, a bracket, a comment's start).
+fn word(c: char) -> bool {
+    c == '_' || c.is_ascii_digit() || c.is_alphabetic()
+}
+
+/// What a chain joins its word runs with, one of them, the same each time: nothing a bundled
+/// grammar nests, and a chain is shortened by an even number of them, so `$`, which turns TeX's
+/// math on and off, still leaves it as it was.
+const CHAIN_SEPARATORS: [char; 4] = ['.', ',', '-', '$'];
+
+/// What ends a stretch of a YAML line: what opens or ends something within one — a key's `:`, a
+/// comment's `#`, a flow collection, a quote, an escape.
+const YAML_STOPS: [char; 9] = [':', '#', '[', ']', '{', '}', '"', '\'', '\\'];
+
+/// What of a syntax's lines its parser is handed shortened ([`Shortened`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Shape {
+    /// Long runs of word characters, and long chains of short ones.
+    Code,
+    /// YAML: also a line's long stretches without its stops. YAML looks for a second key on
+    /// every line, `(?=… ( [^\s:] | :\S | \s+(?![#\s]) )* \s*:(\s|$))` scanning the rest of the
+    /// line from each place a key could start, so a long value — prose, quoted, in a list —
+    /// costs the square of its length (5–7 ms at 500 characters).
+    Yaml,
+}
+
+impl Shape {
+    fn of(syntax: &SyntaxReference) -> Self {
+        if syntax.name == "YAML" {
+            Shape::Yaml
+        } else {
+            Shape::Code
+        }
+    }
+}
+
+/// The runs of characters `part` takes in `line[within]`, each as long as it goes: where it is
+/// in the line, and how many characters it has.
+fn runs_of(
+    line: &str,
+    within: std::ops::Range<usize>,
+    part: impl Fn(char) -> bool,
+) -> Vec<(std::ops::Range<usize>, usize)> {
+    let mut runs = Vec::new();
+    let (mut start, mut chars) = (within.start, 0);
+    for (at, c) in line[within.clone()].char_indices() {
+        let at = within.start + at;
+        if part(c) {
+            if chars == 0 {
+                start = at;
+            }
+            chars += 1;
+        } else if chars > 0 {
+            runs.push((start..at, chars));
+            chars = 0;
+        }
+    }
+    if chars > 0 {
+        runs.push((start..within.end, chars));
+    }
+    runs
+}
+
+/// Whether code's shortening finds anything in `line[within]` ([`Shortened::code`]): a word run
+/// over [`RUN_MAX`], or names joined into a chain, between its numbers, longer than that. One
+/// pass and no allocation, so an ordinary line costs nothing more.
+fn code_shortens(line: &str, within: std::ops::Range<usize>) -> bool {
+    // The run being read: its characters, and whether it is a number.
+    let (mut run, mut number) = (0, false);
+    // Since the last run: whether there was one, how many characters, the first of them.
+    let (mut after_run, mut gap, mut first) = (false, 0, None::<char>);
+    // The chain: its separator, and the part of it being read (since its last number) — its
+    // names, and its characters from its first name on.
+    let (mut separator, mut names, mut chars) = (None::<char>, 0, 0);
+    // A space after the last character ends a run the line ends in.
+    for c in line[within].chars().chain([' ']) {
+        if word(c) {
+            if run == 0 {
+                number = c.is_ascii_digit();
+                let joined = after_run
+                    && gap == 1
+                    && first.is_some_and(|s| {
+                        CHAIN_SEPARATORS.contains(&s) && separator.is_none_or(|t| t == s)
+                    });
+                if joined {
+                    separator = first;
+                } else {
+                    (separator, names, chars) = (None, 0, 0);
+                }
+            }
+            run += 1;
+            continue;
+        }
+        if run > 0 {
+            if run > RUN_MAX {
+                return true;
+            }
+            if number {
+                (names, chars) = (0, 0);
+            } else if names == 0 {
+                (names, chars) = (1, run);
+            } else {
+                (names, chars) = (names + 1, chars + 1 + run);
+                if chars > RUN_MAX {
+                    return true;
+                }
+            }
+            (run, after_run, gap, first) = (0, true, 0, None);
+        }
+        if gap == 0 {
+            first = Some(c);
+        }
+        gap += 1;
+    }
+    false
+}
+
+/// Whether YAML's shortening finds anything in `line` ([`Shortened::of`]): in a stretch without
+/// its stops, units (what spaces part) longer than [`RUN_MAX`] together, between its units over
+/// that, or one of those in which code's shortening finds something. One pass and no allocation.
+fn yaml_shortens(line: &str) -> bool {
+    // The unit being read: its characters, and where it starts.
+    let (mut unit, mut start) = (0, 0);
+    // The part of the stretch being read: its units, its characters from its first unit on, and
+    // the spaces since its last.
+    let (mut units, mut chars, mut gap) = (0, 0, 0);
+    // A stop after the last character ends the line's last stretch.
+    for (at, c) in line.char_indices().chain([(line.len(), ':')]) {
+        let stop = YAML_STOPS.contains(&c);
+        if !stop && !c.is_whitespace() {
+            if unit == 0 {
+                start = at;
+            }
+            unit += 1;
+            continue;
+        }
+        if unit > 0 {
+            if unit > RUN_MAX {
+                if code_shortens(line, start..at) {
+                    return true;
+                }
+                (units, chars) = (0, 0);
+            } else if units == 0 {
+                (units, chars) = (1, unit);
+            } else {
+                (units, chars) = (units + 1, chars + gap + unit);
+                if chars > RUN_MAX {
+                    return true;
+                }
+            }
+            (unit, gap) = (0, 0);
+        }
+        if stop {
+            (units, chars, gap) = (0, 0, 0);
+        } else {
+            gap += 1;
+        }
+    }
+    false
+}
+
+/// Where the chain from `words[i]` ends: the word runs after it, each one separator after the
+/// one before, the same separator each time.
+fn chain_end(line: &str, words: &[(std::ops::Range<usize>, usize)], i: usize) -> usize {
+    let mut separator = None;
+    let mut end = i + 1;
+    while end < words.len() {
+        let mut gap = line[words[end - 1].0.end..words[end].0.start].chars();
+        match (gap.next(), gap.next()) {
+            (Some(c), None)
+                if CHAIN_SEPARATORS.contains(&c) && separator.is_none_or(|s| s == c) =>
+            {
+                separator = Some(c);
+                end += 1;
+            }
+            _ => break,
+        }
+    }
+    end
+}
+
+/// A line as the parser is handed it: each run of more than [`RUN_MAX`] word characters
+/// shortened, each chain of names longer than that, and in YAML ([`Shape`]) each stretch longer
+/// than that; the rest as it is. A grammar pattern that fancy-regex runs on its own engine (one
+/// with a lookaround) costs the square of what it walks, until the backtrack limit, 1,000,000
+/// steps, ends the search as no match: 1,000 `x`s in a Rust comment cost 20 ms, ordinary code
+/// 1.5 µs a byte. What it walks is a run, or a chain — names joined by one separator, the same
+/// each time ([`CHAIN_SEPARATORS`]): a dotted name in Python, Java or JavaScript, an argument
+/// list in Go, an identifier with `$` in Java (1,000 characters of one name: 10–61 ms; of
+/// varied names: up to 21 ms) —, or in YAML the rest of the line.
+///
+/// A shortened chain, or YAML stretch, is whole units of it — a name, or what spaces part, with
+/// what parts it from the one before — from its start and its end, an even number of them left
+/// out between, and longer than [`RUN_MAX`] (by at most three units): every two characters
+/// side by side in it are side by side in the chain. A run over [`RUN_MAX`] parts a chain, and
+/// so does a number: that run is shortened as alone, the names on each side as chains of their
+/// own, and a list of numbers is no chain (it costs its length, and is coloured number by
+/// number). A YAML unit over [`RUN_MAX`] parts its stretch the same way, shortened as code is.
+///
+/// A shortened run is pieces of the run itself, in order, nothing added: its first and last
+/// [`RUN_END`] characters and, between them, the middle's stretches of one character — one
+/// that stands alone kept alone (an exponent's `e`), a repeated one kept repeated, its length
+/// modulo [`RUN_STRETCH`] — grown, while all of them fit, until the run is longer than
+/// [`RUN_MAX`]; a middle of more stretches than fit (a hex blob) keeps its first ones, up to a
+/// point a hash of the run picks, then each character the rest holds that they do not, once,
+/// up to [`RUN_MIDDLE`] different ones. Every two characters side by side in it are side by
+/// side in the run, but where such a middle is cut. So the parser sees the run's ends, its
+/// characters, their order and everything around it, and the scopes it finds, put back on the
+/// line ([`Self::place`]), are those of the line itself — on a run long enough for the limit,
+/// those its patterns mean rather than no match. The differences known, all of runs, chains or
+/// stretches over [`RUN_MAX`]:
+/// - The part a shortened form leaves out takes the colour of the character kept before it, so
+///   where a grammar colours it otherwise, not the colour it has: inside a varied run where a
+///   grammar colours inside a word (CSS colours digits in one); in a chain whose names and what
+///   joins them a grammar colours apart (SQL's `a.b.c`, TeX's `$`, JavaScript's
+///   `a.b.c.f = function`, PHP's constants `A-B-C`, `true,false,null` in JSON, JavaScript or
+///   Python); in a YAML flow collection (`[a, 1, true]`).
+/// - Where a run's middle of many stretches is cut, two characters that are not neighbours in
+///   the run meet, and a pattern that reads them together may read the kept ones otherwise.
+/// - A run's middle with more than [`RUN_MIDDLE`] different characters keeps the first of them
+///   only, so a test over the whole run (all of one script) may answer otherwise.
+/// - A pattern that reads a whole chain sees its kept units only: one among those left out that
+///   it would treat apart (JavaScript's `prototype` mid-chain) is not seen.
+/// - A back-reference (a heredoc's delimiter) compares shortened text: two runs that agree in
+///   their ends and in the stretches of their middle, each the same length modulo
+///   [`RUN_STRETCH`] (200 and 216 `x`s), or in a middle of many stretches up to where the hash
+///   cuts it and in what its rest holds, and two chains that agree in the units they keep, read
+///   as the same.
+struct Shortened {
+    text: String,
+    /// Where each piece of `text` starts: in `text`, and in the line it was copied from.
+    pieces: Vec<(usize, usize)>,
+}
+
+impl Shortened {
+    /// `None` when the line has nothing that long (it is parsed as it is): found without
+    /// allocating, as the ordinary line has nothing.
+    fn of(line: &str, shape: Shape) -> Option<Self> {
+        let shortens = match shape {
+            Shape::Code => code_shortens(line, 0..line.len()),
+            Shape::Yaml => yaml_shortens(line),
+        };
+        if shortens {
+            Self::made(line, shape)
+        } else {
+            None
+        }
+    }
+
+    /// The line shortened, its runs, chains and stretches found and kept as they are copied.
+    fn made(line: &str, shape: Shape) -> Option<Self> {
+        let mut short = Self {
+            text: String::new(),
+            pieces: Vec::new(),
+        };
+        let copied = match shape {
+            Shape::Code => short.code(line, 0, 0..line.len()),
+            Shape::Yaml => {
+                // The line is copied up to here.
+                let mut copied = 0;
+                let stretches = runs_of(line, 0..line.len(), |c| !YAML_STOPS.contains(&c));
+                for (stretch, chars) in stretches {
+                    if chars <= RUN_MAX {
+                        continue;
+                    }
+                    // Its units are what spaces part: whole ones are left out, as a chain's are,
+                    // so no token is cut in two and the spaces before its first (a line's
+                    // indentation, YAML's structure) are kept. A long unit parts them, and is
+                    // shortened as code is.
+                    let units = runs_of(line, stretch, |c| !c.is_whitespace());
+                    copied = short.parted(
+                        line,
+                        copied,
+                        &units,
+                        |_| false,
+                        |short, copied, unit| short.code(line, copied, unit),
+                    );
+                }
+                copied
+            }
+        };
+        if short.pieces.is_empty() {
+            return None;
+        }
+        short.copy(line, copied..line.len());
+        Some(short)
+    }
+
+    /// Shortens `line[within]` as code is, the line copied up to `copied`; says where it is
+    /// copied up to now. Its long word runs are shortened, and its long chains of names: names
+    /// only — the patterns that cost a chain's square walk names, and a list of numbers
+    /// (`1,2,3`) costs its length and is coloured number by number — so a number parts a chain,
+    /// as a long run does (shortened as alone).
+    fn code(&mut self, line: &str, mut copied: usize, within: std::ops::Range<usize>) -> usize {
+        let words = runs_of(line, within, word);
+        let number = |w: &(std::ops::Range<usize>, usize)| {
+            line[w.0.clone()].starts_with(|c: char| c.is_ascii_digit())
+        };
+        let mut i = 0;
+        while i < words.len() {
+            let end = chain_end(line, &words, i);
+            copied = self.parted(
+                line,
+                copied,
+                &words[i..end],
+                number,
+                |short, copied, run| short.shorten(line, copied, run),
+            );
+            i = end;
+        }
+        copied
+    }
+
+    /// Shortens `units` — runs, each parted from the one before by what joins them — the line
+    /// copied up to `copied`; says where it is copied up to now. A unit over [`RUN_MAX`] or one
+    /// `apart` names parts them and is shortened by `long` (when long); the units between, more
+    /// than one and longer than [`RUN_MAX`] together, are shortened as a chain.
+    fn parted(
+        &mut self,
+        line: &str,
+        mut copied: usize,
+        units: &[(std::ops::Range<usize>, usize)],
+        apart: impl Fn(&(std::ops::Range<usize>, usize)) -> bool,
+        long: impl Fn(&mut Self, usize, std::ops::Range<usize>) -> usize,
+    ) -> usize {
+        let mut start = 0;
+        for at in 0..=units.len() {
+            let unit = units.get(at);
+            if unit.is_some_and(|u| u.1 <= RUN_MAX && !apart(u)) {
+                continue;
+            }
+            let joined = &units[start..at];
+            if let (Some(first), Some(last)) = (joined.first(), joined.last()) {
+                if joined.len() > 1 && line[first.0.start..last.0.end].chars().count() > RUN_MAX {
+                    copied = self.chain(line, copied, joined);
+                }
+            }
+            if let Some(unit) = unit.filter(|u| u.1 > RUN_MAX) {
+                copied = long(self, copied, unit.0.clone());
+            }
+            start = at + 1;
+        }
+        copied
+    }
+
+    /// Copies the line from `from` to the end of the chain's units it keeps from its start, and
+    /// says where those it keeps at its end start (copied with what follows them). A unit is a
+    /// run with what parts it from the run before (the first, the run alone): the chain keeps its
+    /// units to [`RUN_END`] characters from each end, then more of those after its start until
+    /// it is longer than [`RUN_MAX`] and leaves out an even number of them.
+    fn chain(
+        &mut self,
+        line: &str,
+        from: usize,
+        words: &[(std::ops::Range<usize>, usize)],
+    ) -> usize {
+        // Where unit `i` starts (at the end of the run before it), and its characters.
+        let start = |i: usize| {
+            if i == 0 {
+                words[0].0.start
+            } else {
+                words[i - 1].0.end
+            }
+        };
+        let chars = |i: usize| words[i].1 + line[start(i)..words[i].0.start].chars().count();
+        let (mut head, mut kept) = (0, 0);
+        while kept < RUN_END {
+            kept += chars(head);
+            head += 1;
+        }
+        let (mut tail, mut end) = (words.len(), 0);
+        while end < RUN_END && tail > head {
+            tail -= 1;
+            end += chars(tail);
+        }
+        kept += end;
+        while head < tail && (kept <= RUN_MAX || (tail - head) % 2 == 1) {
+            kept += chars(head);
+            head += 1;
+        }
+        self.copy(line, from..start(head));
+        start(tail)
+    }
+
+    /// Copies the line from `from` to the end of the run's head, then the run's middle
+    /// shortened, and says where its tail starts (copied with what follows it).
+    fn shorten(&mut self, line: &str, from: usize, run: std::ops::Range<usize>) -> usize {
+        let chars: Vec<(usize, char)> = line[run.clone()]
+            .char_indices()
+            .map(|(i, c)| (run.start + i, c))
+            .collect();
+        let tail = chars.len() - RUN_END;
+        let middle = &chars[RUN_END..tail];
+        // Where the middle's `i`th character starts in the line (the tail's start past its end).
+        let at = |i: usize| middle.get(i).map_or(chars[tail].0, |c| c.0);
+        // The run's FNV-1a hash: the same on every build (std's hasher may change between them).
+        let hash = line[run].bytes().fold(0xcbf2_9ce4_8422_2325_u64, |h, b| {
+            (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
+        });
+        let cut = RUN_MIDDLE + (hash % RUN_STRETCH as u64) as usize;
+        // The middle's stretches of one character, in order, while they fit: where each starts,
+        // how long it is and how much of it is kept.
+        let mut stretches: Vec<(usize, usize, usize)> = Vec::new();
+        let (mut next, mut kept) = (0, 0);
+        while next < middle.len() && kept <= cut {
+            let c = middle[next].1;
+            let len = middle[next..].iter().take_while(|m| m.1 == c).count();
+            let keep = if len == 1 {
+                1
+            } else {
+                2 + (len - 2) % RUN_STRETCH
+            };
+            stretches.push((next, len, keep));
+            kept += keep;
+            next += len;
+        }
+        // All of them fit: they grow, a whole number of times RUN_STRETCH, no longer than they are
+        // (their kept length is theirs modulo it), until the middle is long enough.
+        for (_, len, keep) in &mut stretches {
+            while kept <= RUN_MIDDLE && *keep < *len {
+                *keep += RUN_STRETCH;
+                kept += RUN_STRETCH;
+            }
+        }
+        self.copy(line, from..chars[RUN_END].0);
+        let mut seen: Vec<char> = Vec::with_capacity(RUN_MIDDLE);
+        for &(start, _, keep) in &stretches {
+            self.copy(line, at(start)..at(start + keep));
+            if !seen.contains(&middle[start].1) {
+                seen.push(middle[start].1);
+            }
+        }
+        // The rest of a middle of many stretches: each character not kept yet, once, in order.
+        for &(place, c) in &middle[next..] {
+            if seen.len() >= RUN_MIDDLE {
+                break;
+            }
+            if !seen.contains(&c) {
+                seen.push(c);
+                self.copy(line, place..place + c.len_utf8());
+            }
+        }
+        chars[tail].0
+    }
+
+    fn copy(&mut self, line: &str, part: std::ops::Range<usize>) {
+        self.pieces.push((self.text.len(), part.start));
+        self.text.push_str(&line[part]);
+    }
+
+    /// Where byte `at` of the text (one of its character starts, or its end) is in the line.
+    fn place(&self, at: usize) -> usize {
+        let i = self.pieces.partition_point(|&(text, _)| text <= at) - 1;
+        let (text, line) = self.pieces[i];
+        line + (at - text)
+    }
+}
+
+/// Whether highlighting hands `line` to the parser shortened ([`Shortened`]): as YAML's line
+/// when `yaml`, else as code's. For `tests/highlight_alloc.rs`, which counts its allocations
+/// with an allocator of its own — in a test binary of its own, as that allocator slows every
+/// allocation it sees.
+#[doc(hidden)]
+pub fn shortens(line: &str, yaml: bool) -> bool {
+    let shape = if yaml { Shape::Yaml } else { Shape::Code };
+    Shortened::of(line, shape).is_some()
+}
+
 /// Parser and highlighter state after some line.
 type State = (ParseState, HighlightState);
 
-/// Called with each line before it is parsed (tests: a parser that blocks on a line).
+/// Called with each line as the parser is handed it, before it is parsed (tests: a parser that
+/// blocks on a line).
 #[cfg(test)]
 pub(crate) type ParseHook = Arc<dyn Fn(&str) + Send + Sync>;
 
@@ -2048,6 +2541,8 @@ struct Highlight {
     plain: Color32,
     /// Lines parsed so far (tests).
     parsed: Arc<AtomicU64>,
+    /// What of its lines the parser is handed shortened.
+    shape: Shape,
     #[cfg(test)]
     hook: Option<ParseHook>,
     /// Called right after the worker's thread asked the window to wake as it ends (tests: the
@@ -2072,6 +2567,7 @@ impl Highlight {
             stop,
             plain,
             parsed: Arc::default(),
+            shape: Shape::of(syntax),
             #[cfg(test)]
             hook: None,
             #[cfg(test)]
@@ -2080,14 +2576,21 @@ impl Highlight {
     }
 
     fn run(&self, state: &mut State, line: &str) -> Runs {
+        let short = Shortened::of(line, self.shape);
+        let parsed = short.as_ref().map_or(line, |s| s.text.as_str());
         #[cfg(test)]
         if let Some(hook) = &self.hook {
-            hook(line);
+            hook(parsed);
         }
         self.parsed.fetch_add(1, Ordering::Relaxed);
-        let Ok(ops) = state.0.parse_line(line, syntaxes()) else {
+        let Ok(mut ops) = state.0.parse_line(parsed, syntaxes()) else {
             return vec![(self.plain, line.to_string())];
         };
+        if let Some(short) = &short {
+            for op in &mut ops {
+                op.0 = short.place(op.0);
+            }
+        }
         HighlightIterator::new(&mut state.1, &ops, line, &self.highlighter)
             .map(|(style, text)| {
                 let c = style.foreground;

@@ -15,6 +15,7 @@ pub mod hex;
 pub mod image;
 pub mod media;
 pub mod playback;
+pub mod save_as;
 mod select;
 pub mod streamed;
 #[cfg(test)]

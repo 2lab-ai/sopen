@@ -359,6 +359,931 @@ fn a_line_cut_for_display_stops_highlighting_there() {
     assert_eq!(drv.colors_of("fn after399() {}"), Some(vec![plain]));
 }
 
+/// The most word characters (letters, digits, `_`) in a row in `text`.
+fn longest_word_run(text: &str) -> usize {
+    text.split(|c: char| !(c.is_alphanumeric() || c == '_'))
+        .map(|w| w.chars().count())
+        .max()
+        .unwrap_or(0)
+}
+
+/// Whether the one pass finds anything to shorten in `line`.
+fn finds(line: &str, shape: Shape) -> bool {
+    match shape {
+        Shape::Code => code_shortens(line, 0..line.len()),
+        Shape::Yaml => yaml_shortens(line),
+    }
+}
+
+/// What the one pass finds is what the shortening shortens: on lines made of names, numbers,
+/// runs of every length about [`RUN_MAX`], chains about it (whole, parted by a number, two
+/// separators joined), spaces, YAML's stops and letters of several bytes, put together at random
+/// (the same each run), the pass finds something in a line, in code and in YAML, just when
+/// building its shortened form returns `Some`: it never misses a line to shorten, and never
+/// sends an ordinary one to be built (and allocate; `tests/highlight_alloc.rs` counts that).
+#[test]
+fn the_pass_that_finds_a_shortening_agrees_with_making_it() {
+    let mut seed: u64 = 0x5eed;
+    let mut next = |n: usize| {
+        seed = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (seed >> 33) as usize % n
+    };
+    let pieces = [
+        ".", ",", "-", "$", " ", "  ", "\t", ":", "#", "[", "\"", "\\", "(", ";", "é", "漢",
+    ];
+    // Each part of a chain shorter than RUN_MAX, longer together: parted by a number, or two
+    // chains of two separators side by side — nothing to shorten; one more name, and there is.
+    let ab = |sep: &str, n: usize| format!("ab{sep}").repeat(n);
+    for (line, shortened) in [
+        (format!("v = {}7x.{}ab;", ab(".", 30), ab(".", 30)), false),
+        (format!("v = {}ab{};", ab(".", 40), ",ab".repeat(40)), false),
+        // 43 names are 128 characters; 44, 131.
+        (format!("v = {}ab;", ab(".", 42)), false),
+        (format!("v = {}ab;", ab(".", 43)), true),
+    ] {
+        for shape in [Shape::Code, Shape::Yaml] {
+            assert_eq!(Shortened::made(&line, shape).is_some(), shortened, "{line}");
+            assert_eq!(finds(&line, shape), shortened, "{shape:?}: {line}");
+        }
+    }
+    let (mut shortened, mut lines) = (0, 0);
+    for _ in 0..3000 {
+        let mut line = String::new();
+        let target = [40, 130, 300, 700][next(4)];
+        while line.chars().count() < target {
+            match next(6) {
+                // A name, sometimes long, sometimes a number.
+                0..=2 => {
+                    let len = if next(8) == 0 {
+                        [127, 128, 129, 200][next(4)]
+                    } else {
+                        [1, 3, 8, 60][next(4)]
+                    };
+                    let first = if next(5) == 0 { "7" } else { "n" };
+                    line.push_str(first);
+                    line.push_str(&"x".repeat(len - 1));
+                }
+                // A chain of names about the length that is shortened; or two parts of one, each
+                // shorter and longer together, parted by a number or joined by two separators.
+                3 => {
+                    let seps = [".", ",", "-", "$", " "];
+                    let sep = seps[next(5)];
+                    let unit = format!("{}{sep}", "ab".repeat(1 + next(3)));
+                    match next(3) {
+                        0 => line.push_str(&unit.repeat(10 + next(40))),
+                        1 => {
+                            line.push_str(&unit.repeat(10 + next(15)));
+                            line.push_str(&format!("7x{sep}"));
+                            line.push_str(&unit.repeat(10 + next(15)));
+                        }
+                        _ => {
+                            let other = format!("{}{}", "ab".repeat(1 + next(3)), seps[next(5)]);
+                            line.push_str(&unit.repeat(10 + next(15)));
+                            line.push_str(&other.repeat(10 + next(15)));
+                        }
+                    }
+                }
+                _ => line.push_str(pieces[next(pieces.len())]),
+            }
+        }
+        for shape in [Shape::Code, Shape::Yaml] {
+            let made = Shortened::made(&line, shape).is_some();
+            assert_eq!(finds(&line, shape), made, "{shape:?}: {line}");
+            shortened += usize::from(made);
+            lines += 1;
+        }
+    }
+    // Both answers came up often.
+    assert!(
+        shortened > lines / 10 && shortened < lines * 9 / 10,
+        "{shortened} of {lines}"
+    );
+}
+
+/// The most characters in a row in `text` that `part` takes.
+fn longest_where(text: &str, part: impl Fn(char) -> bool) -> usize {
+    let (mut longest, mut now) = (0, 0);
+    for c in text.chars() {
+        now = if part(c) { now + 1 } else { 0 };
+        longest = longest.max(now);
+    }
+    longest
+}
+
+/// The longest chain in `text`: word characters and the separators `.` `,` `-` `$`.
+fn longest_chain(text: &str) -> usize {
+    longest_where(text, |c| c.is_alphanumeric() || "_.,-$".contains(c))
+}
+
+/// The longest stretch of `text` with none of YAML's `: # [ ] { } " ' \`.
+fn longest_yaml_span(text: &str) -> usize {
+    longest_where(text, |c| !":#[]{}\"'\\".contains(c))
+}
+
+/// A highlighter for files named `*.ext`, and what its parser was handed: the longest word run,
+/// and how many lines.
+fn counting_highlighter(ext: &str) -> (Highlight, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+    measuring_highlighter(ext, longest_word_run)
+}
+
+/// A highlighter for files named `*.ext`, and what its parser was handed: the most `measure`
+/// gives of any line, and how many lines.
+fn measuring_highlighter(
+    ext: &str,
+    measure: fn(&str) -> usize,
+) -> (Highlight, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+    let syntax = syntaxes().find_syntax_by_extension(ext).unwrap();
+    let mut hl = Highlight::new(syntax, Color32::WHITE, u64::MAX).unwrap();
+    let (longest, lines) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+    let (seen, count) = (longest.clone(), lines.clone());
+    hl.hook = Some(Arc::new(move |text: &str| {
+        seen.fetch_max(measure(text), Ordering::Relaxed);
+        count.fetch_add(1, Ordering::Relaxed);
+    }));
+    (hl, longest, lines)
+}
+
+/// What `ext`'s parser is handed of `lines`: the most `measure` gives of any line (every line
+/// handed over, the page highlighted).
+fn handed(ext: &str, lines: &[String], measure: fn(&str) -> usize) -> usize {
+    let tmp = tempfile::tempdir().unwrap();
+    let body: String = lines.iter().map(|l| format!("{l}\n")).collect();
+    let path = write(tmp.path(), &format!("shape.{ext}"), body.as_bytes());
+    let mut doc = TextDoc::open(&path).unwrap();
+    let (mut hl, longest, count) = measuring_highlighter(ext, measure);
+    let runs = hl
+        .page(&mut doc, 0, lines.len(), &|| false)
+        .unwrap()
+        .unwrap();
+    assert_eq!(runs.len(), lines.len());
+    assert_eq!(
+        count.load(Ordering::Relaxed),
+        lines.len(),
+        "every line was parsed"
+    );
+    longest.load(Ordering::Relaxed)
+}
+
+/// A chain — short word runs joined by one separator, `x.x.x`, `x,x,x`, `x$x$x`, `x-x-x` —
+/// costs the patterns that walk a dotted name, an argument list or an identifier with `$` in it
+/// the square of its length (1,000 characters: Python's dotted `x.` 28 ms, Java's `x$` 61 ms,
+/// Go's `x,` 10 ms; their backtrack limit from about 1,000 or 2,000). However long a chain is,
+/// the parser is handed it shortened: longer than [`RUN_MAX`], shorter than twice it.
+#[test]
+fn the_parser_is_never_handed_a_long_chain() {
+    let chain = |unit: &str| format!("{}x", unit.repeat(500));
+    for (ext, line) in [
+        ("py", format!("v = {}", chain("x."))),
+        ("java", format!("v = {};", chain("x."))),
+        ("java", format!("v = {};", chain("x$"))),
+        ("js", format!("let v = {};", chain("x."))),
+        ("go", format!("f({})", chain("x,"))),
+        ("md", format!("see {} here", chain("x-"))),
+    ] {
+        let longest = handed(ext, &[line, "x = 1".to_string()], longest_chain);
+        assert!(
+            RUN_MAX < longest && longest < 2 * RUN_MAX,
+            "{ext}: the parser was handed a chain of {longest}"
+        );
+    }
+}
+
+/// YAML looks for a second key on every line — `(?=… ( [^\s:] | :\S | \s+(?![#\s]) )* \s*:(\s|$))`
+/// scans the rest of the line from each place a key could start — so any long value costs the
+/// square of its length: plain, quoted or in a list, 5–7 ms at 500 characters, past the
+/// backtrack limit from 1,000. Its long stretches without `: # [ ] { } " ' \` reach the parser
+/// shortened: longer than [`RUN_MAX`], shorter than twice it.
+#[test]
+fn a_long_yaml_value_reaches_the_parser_shortened() {
+    let prose = "Lorem ipsum dolor sit amet, consectetur (adipiscing) elit. ".repeat(17);
+    let lines = [
+        format!("description: {prose}"),
+        format!("- {prose}"),
+        format!("key: \"{prose}\""),
+        format!("  - name: {prose}"),
+        // One unit, no spaces: shortened as code is (a chain, a run).
+        format!("key: {}x", "x-".repeat(500)),
+        format!("key: {}", "0123456789abcdef".repeat(60)),
+        "after: 1".to_string(),
+    ];
+    let longest = handed("yaml", &lines, longest_yaml_span);
+    assert!(
+        RUN_MAX < longest && longest < 2 * RUN_MAX,
+        "the parser was handed a stretch of {longest}"
+    );
+}
+
+/// A run of word characters costs the grammars' patterns the square of its length (on a pattern
+/// fancy-regex runs itself, a search tries every start in the run and each try runs to its end):
+/// a comment of 1,000 `x`s took Rust's 20 ms, 1,400 or more hit fancy-regex's backtrack limit.
+/// However long a file's runs are, the parser is handed every line, and a long run shortened:
+/// longer than [`RUN_MAX`] (the longest handed over as it is), shorter than twice it.
+#[test]
+fn the_parser_is_never_handed_a_long_word_run() {
+    let tmp = tempfile::tempdir().unwrap();
+    let run = "x".repeat(300);
+    let hex = "f".repeat(300);
+    let body = format!(
+        "fn a() {{}}\nlet v = 1; // {run}\nlet s = \"{run}\";\n{run}::new(0x{hex}u64);\nfn b() {{}}\n"
+    );
+    let path = write(tmp.path(), "runs.rs", body.as_bytes());
+    let mut doc = TextDoc::open(&path).unwrap();
+    let (mut hl, longest, lines) = counting_highlighter("rs");
+    let runs = hl.page(&mut doc, 0, 5, &|| false).unwrap().unwrap();
+    assert_eq!(runs.len(), 5);
+    assert_eq!(lines.load(Ordering::Relaxed), 5, "every line was parsed");
+    let longest = longest.load(Ordering::Relaxed);
+    assert!(
+        RUN_MAX < longest && longest < 2 * RUN_MAX,
+        "the parser was handed a run of {longest} word characters"
+    );
+}
+
+/// Each character of `lines` and its colour, the lines parsed whole, in order, from the top.
+fn whole_line_colours(ext: &str, lines: &[String]) -> Vec<Vec<(char, Color32)>> {
+    let syntax = syntaxes().find_syntax_by_extension(ext).unwrap();
+    let highlighter = Highlighter::new(chrome::syntax_theme());
+    let mut parse = ParseState::new(syntax);
+    let mut colour = HighlightState::new(&highlighter, ScopeStack::new());
+    lines
+        .iter()
+        .map(|line| {
+            let ops = parse.parse_line(line, syntaxes()).unwrap();
+            HighlightIterator::new(&mut colour, &ops, line, &highlighter)
+                .flat_map(|(style, text)| {
+                    let c = style.foreground;
+                    let c = Color32::from_rgb(c.r, c.g, c.b);
+                    text.chars().map(move |ch| (ch, c))
+                })
+                .collect()
+        })
+        .collect()
+}
+
+/// For each character of `line`, whether its shortened form keeps it (every one, when no run in
+/// it is shortened).
+fn kept_characters(line: &str, shape: Shape) -> Vec<bool> {
+    let Some(short) = Shortened::of(line, shape) else {
+        return vec![true; line.chars().count()];
+    };
+    let mut kept = vec![false; line.len()];
+    for (i, &(text, at)) in short.pieces.iter().enumerate() {
+        let end = short.pieces.get(i + 1).map_or(short.text.len(), |p| p.0);
+        kept[at..at + (end - text)].fill(true);
+    }
+    line.char_indices().map(|(i, _)| kept[i]).collect()
+}
+
+/// Each character of `lines` and its colour as the viewer's highlighter gives it (a file named
+/// `*.ext`, each line ended by `end`), its long runs shortened: handed over at fewer than twice
+/// [`RUN_MAX`] characters, and over [`RUN_MAX`] just when a line has a run that long.
+fn highlighted(ext: &str, lines: &[String], end: &str) -> Vec<Vec<(char, Color32)>> {
+    let tmp = tempfile::tempdir().unwrap();
+    let body: String = lines.iter().map(|l| format!("{l}{end}")).collect();
+    let path = write(tmp.path(), &format!("runs.{ext}"), body.as_bytes());
+    let mut doc = TextDoc::open(&path).unwrap();
+    let (mut hl, longest, _) = counting_highlighter(ext);
+    let runs = hl
+        .page(&mut doc, 0, lines.len(), &|| false)
+        .unwrap()
+        .unwrap();
+    let longest = longest.load(Ordering::Relaxed);
+    let long = lines.iter().any(|l| longest_word_run(l) > RUN_MAX);
+    assert!(
+        longest < 2 * RUN_MAX && (longest > RUN_MAX) == long,
+        "{ext}: handed a run of {longest}"
+    );
+    assert_eq!(runs.len(), lines.len());
+    runs.iter()
+        .map(|line| {
+            line.iter()
+                .flat_map(|(c, text)| text.chars().map(move |ch| (ch, *c)))
+                .collect()
+        })
+        .collect()
+}
+
+/// The viewer highlights `lines` (a file named `*.ext`, each line ended by `end`) with every
+/// character coloured as the lines parsed whole give it.
+fn assert_colours_of_whole_lines(ext: &str, lines: &[String], end: &str) {
+    let got = highlighted(ext, lines, end);
+    let whole = whole_line_colours(ext, lines);
+    for (i, (got, want)) in got.iter().zip(&whole).enumerate() {
+        assert_eq!(got.len(), want.len(), "{ext} line {i}: its characters");
+        if let Some(at) = (0..got.len()).find(|&k| got[k] != want[k]) {
+            panic!(
+                "{ext} line {i}, character {at}: {:?}, parsed whole {:?}",
+                got[at], want[at]
+            );
+        }
+    }
+}
+
+/// A shortened run is coloured as the whole one: every character of every line — the run, what
+/// follows it on its line, the lines after it — has the colour the line parsed whole gives it.
+/// Runs 200 long: past [`RUN_MAX`], and far from the backtrack limit — parsing these lines and
+/// those of the tests below whole ends no fancy-regex search in an error (counted once, with a
+/// syntect that counts them: 0) — so the colours parsed whole are exact. A prefix and suffix on
+/// a run (`0x…u64`, `…_t`, `t_t…_t`), capitals with a small letter in the middle — in a middle of
+/// a few stretches and of many —, letters of two bytes, two runs on a line, and strings, a raw
+/// string and a heredoc (whose delimiter is a long run) open across lines.
+#[test]
+fn a_line_with_long_word_runs_has_the_colours_of_the_whole_line() {
+    let x = "x".repeat(200);
+    let y = "y".repeat(200);
+    let cases: [(&str, Vec<String>); 5] = [
+        (
+            "rs",
+            vec![
+                format!("let v = 1; // {x}"),
+                format!("let s = \"{x}\";"),
+                format!("{x}::new(0x{}u64);", "f".repeat(200)),
+                format!("let k = {}a{};", "A".repeat(100), "A".repeat(100)),
+                // The small letter past the stretches kept: only the rest of the middle has it.
+                format!("let k = {}a{};", "AB".repeat(60), "AB".repeat(40)),
+                format!("let k = {};", "A".repeat(201)),
+                format!("type {x}_t = u8;"),
+                // A suffix made of characters the run already had: only its tail keeps it.
+                format!("let t = {}t;", "t_".repeat(100)),
+                format!("let e = \"{}\"; // {y}", "é".repeat(200)),
+                format!("let r = r#\"{x}"),
+                "\"#; fn f() { let a = \"b\"; }".to_string(),
+            ],
+        ),
+        (
+            "js",
+            vec![
+                format!("{x}.prototype.f = function() {{}};"),
+                format!("let t = `{x}"),
+                "`; let u = 'v';".to_string(),
+            ],
+        ),
+        (
+            "py",
+            vec![
+                format!("s = '''{x}"),
+                "''' ; def f(a): pass".to_string(),
+                format!("{x}(1)  # {y}"),
+            ],
+        ),
+        (
+            "sh",
+            vec![
+                format!("cat <<{}", "E".repeat(200)),
+                format!("body {y} \"quote"),
+                "E".repeat(200),
+                "echo \"$HOME\" # done".to_string(),
+            ],
+        ),
+        (
+            "md",
+            vec![format!("Some **{x}** text `{y}`"), format!("{x}@{y}.com")],
+        ),
+    ];
+    for (ext, lines) in cases {
+        assert_colours_of_whole_lines(ext, &lines, "\n");
+    }
+}
+
+/// Shortening at its edges, each character against the lines parsed whole: runs of exactly
+/// [`RUN_MAX`] (handed over as they are) and one more (shortened); CRLF line ends; characters of
+/// three and four bytes on both sides of where the ends are cut; an emoji (no word character)
+/// against a run; and a character met once in the middle that decides the token — an exponent's
+/// `e`, a `z` that ends a hex number — with a token right after the run.
+#[test]
+fn shortening_at_its_edges_keeps_the_colours_of_the_whole_line() {
+    let x = |n: usize| "x".repeat(n);
+    // 漢 and 𠀀 are the run's 32nd and 33rd characters; 𝐀 and 漢 its 33rd and 32nd from the end.
+    let cut = format!("{}漢𠀀{}𝐀漢{}", x(31), x(134), x(31));
+    let float = format!("1{}e{}", "0".repeat(100), "0".repeat(99));
+    let hex = format!("0x{}z{}", "F".repeat(100), "F".repeat(99));
+    let rust = [
+        format!("let v = 1; // {}", x(128)),
+        format!("let s = \"{}\";", x(129)),
+        format!("{}::new(1); {}::new(2);", x(128), x(129)),
+        format!("let s = \"{cut}\"; // {cut}"),
+        format!("let {cut} = 1;"),
+        format!("// {}😀{}", x(200), x(200)),
+        format!("let s = \"😀{}😀\";", x(200)),
+        format!("let f = {float} + 1; // after"),
+        format!("let h = {hex} + 1; // after"),
+        "fn after() { let a = \"b\"; }".to_string(),
+    ];
+    for end in ["\n", "\r\n"] {
+        assert_colours_of_whole_lines("rs", &rust, end);
+    }
+    for (ext, line) in [
+        ("js", format!("let f = {float} + 1; // after")),
+        ("py", format!("f = {float} + 1  # after")),
+        ("c", format!("double f = {float} + 1; // after")),
+        ("java", format!("double f = {float} + 1; // after")),
+        ("js", format!("{}.prototype.f = function() {{}};", x(129))),
+        ("md", format!("{cut} **bold** {} `code`", x(129))),
+    ] {
+        assert_colours_of_whole_lines(ext, &[line, "x = 1".to_string()], "\n");
+    }
+}
+
+/// The one difference in colour the `Shortened` doc states for what a shortened line leaves
+/// out, on line `at` of `lines` (a file named `*.ext`): parsed whole, its colour changes inside
+/// the part left out; in the viewer each left-out character takes the colour of the character
+/// kept before it, every kept character has the colour parsed whole, and so has every other line
+/// — the lines ended by LF, and by CRLF.
+fn assert_left_out_take_the_colour_before(ext: &str, lines: &[String], at: usize, shape: Shape) {
+    for end in ["\n", "\r\n"] {
+        assert_left_out_part_colour(ext, lines, at, shape, end);
+    }
+}
+
+fn assert_left_out_part_colour(ext: &str, lines: &[String], at: usize, shape: Shape, end: &str) {
+    let got = highlighted(ext, lines, end);
+    let whole = whole_line_colours(ext, lines);
+    let kept = kept_characters(&lines[at], shape);
+    assert!(
+        (1..kept.len()).any(|k| !kept[k] && whole[at][k].1 != whole[at][k - 1].1),
+        "{ext}: parsed whole, the colour changes inside the part left out"
+    );
+    let (line, want) = (&got[at], &whole[at]);
+    assert_eq!(line.len(), want.len());
+    let mut before = None;
+    for (k, (&(ch, colour), &whole)) in line.iter().zip(want).enumerate() {
+        assert_eq!(ch, whole.0, "{ext}: character {k}");
+        if kept[k] {
+            assert_eq!(
+                colour, whole.1,
+                "{ext}: kept character {k}: as parsed whole"
+            );
+            before = Some(colour);
+        } else {
+            let before = before.expect("a line starts with kept characters");
+            assert_eq!(
+                colour, before,
+                "{ext}: left-out character {k}: the kept one's before it"
+            );
+        }
+    }
+    assert_ne!(
+        line, want,
+        "{ext}: the left-out part differs from the line parsed whole"
+    );
+    for (i, (got, whole)) in got.iter().zip(&whole).enumerate() {
+        if i != at {
+            assert_eq!(got, whole, "{ext} line {i}: as parsed whole");
+        }
+    }
+}
+
+/// A grammar that colours inside a word: CSS colours the digits in one, so its scope changes
+/// inside the part of a varied run the shortened form leaves out.
+#[test]
+fn inside_a_word_only_the_left_out_part_of_a_run_differs() {
+    let hex: String = (0..150)
+        .map(|i| char::from_digit(i * 7 % 16, 16).unwrap())
+        .collect();
+    let lines = [
+        format!("a {{ color: #{hex}g{}; }}", "a".repeat(59)),
+        "b { margin: 10px; }".to_string(),
+    ];
+    assert_left_out_take_the_colour_before("css", &lines, 0, Shape::Code);
+}
+
+/// A shortened chain is coloured as the whole one: every character of every line — the chain,
+/// the token after it, the lines after it — has the colour the lines parsed whole give it, in the
+/// grammars whose patterns cost a chain's square (Python, Java, JavaScript, Go, Markdown) and
+/// in others that name things in chains. Chains of about 300 characters: past [`RUN_MAX`], short
+/// of the backtrack limit (parsing these lines whole ends no fancy-regex search in an error —
+/// counted once, with a syntect that counts them: 0). Names of one letter and of several, one
+/// separator a chain, a chain that ends in a call, an assignment of a function, `:=`, and one in
+/// a string, its closing quote and code after it; the lines ended by LF, and by CRLF.
+#[test]
+fn long_chains_have_the_colours_of_the_whole_line() {
+    let chain = |unit: &str, n: usize| format!("{}x", unit.repeat(n));
+    let names = |sep: &str, n: usize| {
+        let names = ["alpha", "beta", "gamma_2", "Delta", "épsilon"];
+        (0..n)
+            .map(|i| names[i % names.len()])
+            .collect::<Vec<_>>()
+            .join(sep)
+    };
+    let cases: [(&str, Vec<String>); 11] = [
+        (
+            "py",
+            vec![
+                format!("v = {} + 1  # after", chain("x.", 150)),
+                format!("s = \"{}\" + v.attr  # after", chain("x.", 150)),
+                format!("v = {}(1)", names(".", 45)),
+                format!("f({})  # after", chain("x,", 150)),
+                "def g(a): return a".to_string(),
+            ],
+        ),
+        (
+            "java",
+            vec![
+                format!("v = {}; // after", chain("x.", 150)),
+                format!("v = {};", chain("x$", 150)),
+                format!("{}<String> v = null;", names(".", 45)),
+                "int g() { return 1; }".to_string(),
+            ],
+        ),
+        (
+            "js",
+            vec![
+                format!("let v = {}; // after", chain("x.", 150)),
+                format!("let s = \"{}\" + v.length; // after", chain("x.", 150)),
+                format!("let v = {}.f(1);", names(".", 45)),
+                "let u = 'v';".to_string(),
+            ],
+        ),
+        (
+            "go",
+            vec![
+                format!("f({}) // after", chain("x,", 150)),
+                format!("{} := g()", names(",", 45)),
+                "func h() {}".to_string(),
+            ],
+        ),
+        (
+            "md",
+            vec![
+                format!("see {} **bold** after", chain("x-", 150)),
+                format!("and {} `code`", names(".", 45)),
+            ],
+        ),
+        (
+            "rs",
+            vec![
+                format!("let v = {}; // after", chain("x.", 150)),
+                "fn f() {}".to_string(),
+            ],
+        ),
+        (
+            "c",
+            vec![
+                format!("int v = {}; // after", chain("x-", 150)),
+                "int f(void);".to_string(),
+            ],
+        ),
+        (
+            "cs",
+            vec![
+                format!("var v = {}; // after", chain("x.", 150)),
+                "class C {}".to_string(),
+            ],
+        ),
+        (
+            "sh",
+            vec![
+                format!("echo {} # after", chain("x.", 150)),
+                "echo \"$HOME\"".to_string(),
+            ],
+        ),
+        (
+            "lua",
+            vec![
+                format!("v = {} -- after", chain("x-", 150)),
+                "w = 'v'".to_string(),
+            ],
+        ),
+        (
+            "hs",
+            vec![
+                format!("v = {} -- after", chain("x.", 150)),
+                "w = 1".to_string(),
+            ],
+        ),
+    ];
+    for (ext, lines) in cases {
+        for end in ["\n", "\r\n"] {
+            assert_colours_of_whole_lines(ext, &lines, end);
+        }
+    }
+}
+
+/// Where a grammar colours the names of a chain apart from what joins them — SQL's `a.b.c`,
+/// TeX's `$`, which turns math on and off, JavaScript's `a.b.c.f = function`, PHP's constants
+/// `A-B-C`, a list of `true,false,null` in JSON or JavaScript — the left-out units take the
+/// colour of the character kept before them: the difference the `Shortened` doc states. The
+/// rest is as parsed whole, the line after too: an even number of `$` is left out, so after the
+/// chain TeX is in text or in math as it is (`12 \alpha` is coloured apart in math).
+#[test]
+fn a_chain_coloured_name_by_name_differs_only_in_its_left_out_units() {
+    let chain = |unit: &str| format!("{}x", unit.repeat(150));
+    let sql = [
+        format!("SELECT {} FROM t", chain("x.")),
+        "SELECT 1 FROM u".to_string(),
+    ];
+    assert_left_out_take_the_colour_before("sql", &sql, 0, Shape::Code);
+    // 150 and 151 units: whichever count a chain has, an even number is left out.
+    for units in [150, 151] {
+        let tex = [
+            // In math, digits and `\\alpha` are coloured apart: after the chain, they show which.
+            format!("Some {}x after 12 \\alpha", "x$".repeat(units)),
+            "more text, then $y$".to_string(),
+        ];
+        assert_left_out_take_the_colour_before("tex", &tex, 0, Shape::Code);
+    }
+    let literals = "true,false,null,".repeat(20) + "true";
+    let json = [format!("{{\"a\": [{literals}]}}"), "{}".to_string()];
+    assert_left_out_take_the_colour_before("json", &json, 0, Shape::Code);
+    let js = [format!("let a = [{literals}];"), "let u = 'v';".to_string()];
+    assert_left_out_take_the_colour_before("js", &js, 0, Shape::Code);
+    let names: Vec<&str> = ["alpha", "beta", "gamma_2", "Delta", "épsilon"]
+        .into_iter()
+        .cycle()
+        .take(45)
+        .collect();
+    let js = [
+        format!("{}.f = function() {{}};", names.join(".")),
+        "let u = 'v';".to_string(),
+    ];
+    assert_left_out_take_the_colour_before("js", &js, 0, Shape::Code);
+    let php = [
+        format!("<?php $v = {}; // after", chain("x-")),
+        "$w = 1;".to_string(),
+    ];
+    assert_left_out_take_the_colour_before("php", &php, 0, Shape::Code);
+}
+
+/// A long YAML value is coloured as the whole one, every character of every line: plain prose
+/// with its punctuation, in a list, quoted twice and once, under a key in a list, after an
+/// anchor, before a comment, a block scalar's lines, a value of one long unit (a chain, a hex
+/// word) and a long unit between two long stretches of prose. Values of 300–450 characters: YAML's
+/// whole parse ends no search in an error there (counted, as above: 0); at 1,000 it does.
+#[test]
+fn long_yaml_values_have_the_colours_of_the_whole_line() {
+    let prose =
+        "Lorem ipsum dolor sit amet, consectetur (adipiscing) elit; sed-do eiusmod 42 true! ";
+    let lines = [
+        format!("description: {}", prose.repeat(5)),
+        format!("- {}", prose.repeat(5)),
+        format!("key: \"{}\"", prose.repeat(5)),
+        format!("key: '{}it''s'", prose.repeat(5)),
+        format!("  - name: {}", prose.repeat(4)),
+        format!("key: &anchor {} *alias", prose.repeat(4)),
+        format!("key: {} # a comment", prose.repeat(4)),
+        "block: |".to_string(),
+        format!("  {}", prose.repeat(5)),
+        format!("  {}", prose.repeat(4)),
+        format!("key: {}x", "x-".repeat(150)),
+        format!("key: {}", "0123456789abcdef".repeat(19)),
+        // A long unit between two long stretches of prose: each shortened apart.
+        format!(
+            "key: {} {} {}",
+            prose.repeat(2),
+            "0123456789abcdef".repeat(10),
+            prose.repeat(2)
+        ),
+        "after: 1".to_string(),
+    ];
+    for end in ["\n", "\r\n"] {
+        assert_colours_of_whole_lines("yaml", &lines, end);
+    }
+}
+
+/// A flow collection in YAML is coloured item by item (its commas, numbers, `true`), so a long
+/// one's left-out part takes the colour of the character kept before it: the difference the
+/// `Shortened` doc states. The rest is as parsed whole, the next lines too — a collection closed
+/// on a later line, and the mapping after it, included.
+#[test]
+fn a_long_yaml_flow_collection_differs_only_in_its_left_out_part() {
+    let lines = [
+        format!("key: [{}abc]", "abc, 123, true, ".repeat(20)),
+        "after: 1".to_string(),
+    ];
+    assert_left_out_take_the_colour_before("yaml", &lines, 0, Shape::Yaml);
+    // Opened on one line, shortened there, closed on a later one: the lines after it are as
+    // parsed whole, the mapping after it too.
+    let lines = [
+        format!("key: [{}", "abc, 123, true, ".repeat(20)),
+        "  def, 456]".to_string(),
+        "other: value".to_string(),
+        "- item".to_string(),
+    ];
+    assert_left_out_take_the_colour_before("yaml", &lines, 0, Shape::Yaml);
+}
+
+/// How chains and YAML stretches are shortened. A chain keeps whole units — a name with the
+/// separator before it — from its start and its end, leaves out an even number of them, and is
+/// longer than [`RUN_MAX`]: every two characters side by side in it are side by side in the
+/// chain. A list of numbers, a chain of two separators and a chain with a long run in it are
+/// not shortened as chains (that run is, as alone). YAML keeps a line's indentation and every
+/// one of its stops.
+#[test]
+fn chains_are_shortened_by_whole_units_and_yaml_keeps_its_structure() {
+    let chain_in = |text: &str| -> String {
+        let longest = longest_chain(text);
+        let chains: Vec<&str> = text
+            .split(|c: char| !(c.is_alphanumeric() || "_.,-$".contains(c)))
+            .filter(|w| w.chars().count() == longest)
+            .collect();
+        chains[0].to_string()
+    };
+    for (sep, unit) in [(".", "x."), (",", "ab,"), ("$", "x$"), ("-", "q-")] {
+        let whole = format!("{}x", unit.repeat(301));
+        let line = format!("v = {whole};");
+        let short = Shortened::of(&line, Shape::Code).expect("shortened");
+        let kept = chain_in(&short.text);
+        let n = kept.chars().count();
+        assert!(RUN_MAX < n && n < 2 * RUN_MAX, "{unit}: {n}");
+        let left_out = whole.matches(sep).count() - kept.matches(sep).count();
+        assert_eq!(left_out % 2, 0, "{unit}: an even number of units left out");
+        let pairs = |s: &str| -> std::collections::HashSet<(char, char)> {
+            s.chars().zip(s.chars().skip(1)).collect()
+        };
+        assert!(pairs(&kept).is_subset(&pairs(&whole)), "{unit}: {kept}");
+        assert!(short.text.starts_with("v = ") && short.text.ends_with("x;"));
+    }
+    assert!(Shortened::of(&format!("v = [{}1];", "12,".repeat(100)), Shape::Code).is_none());
+    assert!(Shortened::of(&format!("v = {}x;", "x.x,".repeat(100)), Shape::Code).is_none());
+    // Names of 100 characters: at most RUN_MAX and three of its units.
+    let names = vec!["n".repeat(100); 9];
+    let line = format!("v = {};", names.join("."));
+    let n = longest_chain(&Shortened::of(&line, Shape::Code).expect("shortened").text);
+    assert!(RUN_MAX < n && n <= RUN_MAX + 3 * 101, "long names: {n}");
+    let long = format!("{}.prototype.f", "x".repeat(200));
+    let short = Shortened::of(&long, Shape::Code).unwrap().text;
+    let run = Shortened::of(&"x".repeat(200), Shape::Code).unwrap().text;
+    assert_eq!(short, format!("{run}.prototype.f"));
+    let prose = "lorem: ipsum # dolor [sit] {amet} \"x\" 'y' \\n, consectetur adipiscing elit. ";
+    let line = format!(
+        "      key: {}",
+        "lorem ipsum, dolor sit amet. ".repeat(20) + prose
+    );
+    let short = Shortened::of(&line, Shape::Yaml).expect("shortened").text;
+    assert!(short.starts_with("      key: "));
+    // A long unit parts a stretch: the prose on each side of it is still shortened.
+    let prose = "lorem ipsum, dolor sit amet. ".repeat(28);
+    let parted = format!("key: {prose} {} {prose}", "0123456789abcdef".repeat(13));
+    let shorter = Shortened::of(&parted, Shape::Yaml).expect("shortened").text;
+    assert!(
+        shorter.chars().count() < 4 * RUN_MAX,
+        "{}",
+        shorter.chars().count()
+    );
+    for stop in YAML_STOPS {
+        assert_eq!(
+            short.matches(stop).count(),
+            line.matches(stop).count(),
+            "{stop}"
+        );
+    }
+}
+
+/// A heredoc ends only on its own delimiter. A run shortened to the length of a real, shorter
+/// delimiter (129 `x`s against 65, or 81: what its ends and middle would make without growing),
+/// or to the text of a different run with the same ends and characters (`E…EFE…E` against
+/// `E…FE…E`), must not close it early: the body after it stays in the heredoc, as it does parsed
+/// whole. A long delimiter — of one character, and varied — still closes on its own line.
+#[test]
+fn a_shortened_run_never_ends_a_heredoc_it_is_not_the_delimiter_of() {
+    for short in ["x".repeat(65), "x".repeat(81)] {
+        for open in ["<<'D'", "<<D", "<<-D"] {
+            let lines = [
+                format!("cat {}", open.replace('D', &short)),
+                "x".repeat(129),
+                "echo still_heredoc \"$HOME\"".to_string(),
+                short.clone(),
+                "echo after \"$HOME\"".to_string(),
+            ];
+            assert_colours_of_whole_lines("sh", &lines, "\n");
+        }
+    }
+    let delimiter = format!("{}F{}", "E".repeat(100), "E".repeat(99));
+    let body = format!("{}F{}", "E".repeat(99), "E".repeat(100));
+    let varied: String = (0..200)
+        .map(|i| char::from_digit(i * 7 % 16, 16).unwrap())
+        .collect();
+    for (delimiter, body) in [
+        (delimiter, body),
+        ("E".repeat(200), format!("body {}", "y".repeat(200))),
+        (varied, format!("body {}", "y".repeat(200))),
+    ] {
+        let lines = [
+            format!("cat <<'{delimiter}'"),
+            body,
+            "echo still_heredoc \"$HOME\"".to_string(),
+            delimiter,
+            "echo after \"$HOME\"".to_string(),
+        ];
+        assert_colours_of_whole_lines("sh", &lines, "\n");
+    }
+}
+
+/// The known difference the `Shortened` doc names last — a back-reference compares shortened
+/// runs, so two runs over [`RUN_MAX`] with the same ends and stretches, each the same length
+/// modulo [`RUN_STRETCH`], read as one — end to end. A heredoc opened by 200 `x`s, with a body
+/// line of 216: parsed whole, that line, the next and the real 200 `x`s are the heredoc's; in
+/// the viewer the 216 end it — coloured as its delimiter is —, the next line is shell code, and
+/// so are the 200 `x`s (a command of that name); the line after them is as parsed whole again.
+/// A body line of 201 or 300 `x`s shortens otherwise, and the file is as parsed whole.
+#[test]
+fn a_long_run_that_shortens_like_a_heredoc_delimiter_ends_it() {
+    let delimiter = "x".repeat(200);
+    let lines = |body: usize| {
+        [
+            format!("cat <<'{delimiter}'"),
+            "x".repeat(body),
+            "echo still_heredoc \"$HOME\"".to_string(),
+            delimiter.clone(),
+            "echo after \"$HOME\"".to_string(),
+        ]
+    };
+    for body in [201, 300] {
+        assert_colours_of_whole_lines("sh", &lines(body), "\n");
+    }
+    let lines = lines(216);
+    let got = highlighted("sh", &lines, "\n");
+    let whole = whole_line_colours("sh", &lines);
+    // As code, each line on its own.
+    let code = |line: &String| whole_line_colours("sh", std::slice::from_ref(line)).remove(0);
+    assert_eq!(got[0], whole[0], "the opener: as parsed whole");
+    let end = whole[3][0].1;
+    assert!(whole[3].iter().all(|&(_, c)| c == end));
+    assert!(
+        whole[1].iter().all(|&(_, c)| c != end),
+        "parsed whole, the 216 `x`s are the heredoc's body"
+    );
+    assert!(
+        got[1].iter().map(|&(ch, _)| ch).eq(lines[1].chars()),
+        "the body line is shown whole: {} characters of {}",
+        got[1].len(),
+        lines[1].chars().count()
+    );
+    assert!(
+        got[1].iter().all(|&(_, c)| c == end),
+        "in the viewer they end it, coloured as its delimiter: {:?}",
+        got[1][0]
+    );
+    assert_ne!(
+        whole[2],
+        code(&lines[2]),
+        "parsed whole, still in the heredoc"
+    );
+    assert_eq!(got[2], code(&lines[2]), "in the viewer, shell code");
+    assert_ne!(whole[3], code(&lines[3]), "parsed whole, the delimiter");
+    assert_eq!(got[3], code(&lines[3]), "in the viewer, a command");
+    assert_eq!(got[4], whole[4], "after them: as parsed whole");
+}
+
+/// Shortened runs: each one longer than [`RUN_MAX`] — longer than any run handed over as it is —
+/// and shorter than twice it, one run still. Runs that differ in where a lone character sits, in
+/// a stretch's length (but by a multiple of [`RUN_STRETCH`]), or late in a varied middle, shorten
+/// differently. What remains alike: runs with the same ends and the same stretches, each the
+/// same length modulo [`RUN_STRETCH`] — 200 and 216 `x`s (the module doc's known difference).
+#[test]
+fn shortened_runs_are_longer_than_any_whole_run_and_tell_runs_apart() {
+    assert!(
+        Shortened::of(&"x".repeat(RUN_MAX), Shape::Code).is_none(),
+        "a run of RUN_MAX is handed over as it is"
+    );
+    let short = |run: &str| Shortened::of(run, Shape::Code).expect("shortened").text;
+    let varied = |n: u32| -> String {
+        (0..n)
+            .map(|i| char::from_digit(i * 7 % 16, 16).unwrap())
+            .collect()
+    };
+    let han: String = (0..300)
+        .map(|i| char::from_u32(0x4E00 + i).unwrap())
+        .collect();
+    let runs = [
+        "x".repeat(129),
+        "x".repeat(200),
+        "x".repeat(4096),
+        format!("{}F{}", "E".repeat(100), "E".repeat(99)),
+        varied(129),
+        varied(4000),
+        "xy".repeat(100),
+        format!("{}t", "t_".repeat(100)),
+        format!("{}{}", "a".repeat(80), varied(120)),
+        han,
+    ];
+    for run in &runs {
+        let text = short(run);
+        let n = text.chars().count();
+        assert!(
+            RUN_MAX < n && n < 2 * RUN_MAX && longest_word_run(&text) == n,
+            "{run:.20}…: shortened to {n}"
+        );
+    }
+    let near = |a: usize, b: usize| format!("{}F{}", "E".repeat(a), "E".repeat(b));
+    assert_ne!(short(&near(100, 99)), short(&near(99, 100)));
+    assert_ne!(short(&"x".repeat(200)), short(&"x".repeat(201)));
+    let mut late = varied(200);
+    late.replace_range(150..151, if &late[150..151] == "0" { "1" } else { "0" });
+    assert_ne!(
+        short(&varied(200)),
+        short(&late),
+        "a change late in a varied run"
+    );
+    assert_eq!(
+        short(&"x".repeat(200)),
+        short(&"x".repeat(216)),
+        "the known difference"
+    );
+}
+
 /// T3: the file changes under the viewer (it reads it live, a page at a time): grown,
 /// truncated, rewritten in place — any difference is a change (grown or rewritten no shorter:
 /// `Grown`, re-read soon; truncated: `Changed`). Reads never panic.

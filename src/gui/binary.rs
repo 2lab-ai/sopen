@@ -701,6 +701,15 @@ fn sweep_dead(dir: &OwnedFd, parent: &Path) {
     }
 }
 
+/// [`sweep_dead`] for the folder `parent`, opened here: Save As runs it before it measures the
+/// folder's free space, so what a killed save left never counts against the room
+/// (`gui::save_as`). A folder that cannot be opened is left alone; nothing here fails.
+pub(super) fn sweep_dead_in(parent: &Path) {
+    if let Ok(dir) = open_folder(parent) {
+        sweep_dead(&dir, parent);
+    }
+}
+
 /// [`sweep_dead`] for one folder: `Some` when it was removed. It is dead when its `lock` can be
 /// taken without waiting — every save holds its own for as long as it runs, and a lock dies
 /// with its process, so a process id used again cannot pass for the owner. And it is a partial
