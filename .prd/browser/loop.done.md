@@ -93,3 +93,22 @@ changes. Rows here are snapshots taken when they were moved.
   remote without a commit-graph and 117 ms with one. The 150 ms rest, at most 3 in flight per host
   and the 30 s hidden stream stay. A parked stream and more than 3 in flight were not tested: E5
   and G-P3.
+
+## E1 — closed 2026-11-23
+
+- measured E1 ✅ · result: `HIDFKeyMode` set to 1 and back to 0 by an unprivileged program, the
+  setter → registry → keyboard filter chain and the readbacks written into 02 §8.2, 04 §6.2 and
+  keys.md §4.1; S7 can start · closed rows: E1 · PRs: the PR that carries this block
+
+### Closed rows
+
+| ID | Status | Before | What (02 §8.2) |
+|---|---|---|---|
+| E1 | ✅ done: 2026-11-23, result in 02 §8.2 | S7 | `IOHIDSetCFTypeParameter("HIDFKeyMode", 1)` unprivileged, read back with `ioreg`, restored |
+
+### Round section
+
+- E1: a Mac (macOS 26.7.1, arm64), the built-in keyboard; two windows of value 1, about 550 ms
+  each, after rehearsals at 0; every call returned 0 with no entitlement; the registry and the
+  keyboard filters' `FnKeyMode` followed the set, `hidutil property` and `fnState` did not. The
+  F5 key itself is the owner's receipt K-F3 (04 §8).

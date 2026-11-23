@@ -370,17 +370,23 @@ no key other than their F-key. The digit aliases and the clickable row fix exact
      `WindowEvent::Focused(true)`) and restore the saved value on `Focused(false)`, on quit, before
      sleep and on session switch. Fluor restores on `willSleepNotification` and
      `sessionDidResignActiveNotification`, and on quit (`BehaviorController.swift:60-63, 80-92, 165-178`).
-   - **The hop in between, partly read.** `IOHIDSystem::setParamProperties` pushes the parameters
-     to every event service through `setSystemProperties`. But `createFilteredParamPropertiesForService`
-     skips any key the service already has in its own registry: "properties generated via the global
-     IOHIDSystem::setParamProperties are defaults" (`IOHIDSystem.cpp:3809-3846`). The keyboard
-     services here do carry their own `HIDFKeyMode` (236 registry entries, §1), so a global set may
-     not reach them. That would explain Fluor's mixed reports `[추정]`. The last step, from the
-     kernel service to hidd's user-space `IOHIDKeyboardFilter`, is unread.
+   - **The hop in between, measured** (E1, 2026-11-23, 02 §8.2). `IOHIDSystem::setParamProperties`
+     pushes the parameters to every event service through `setSystemProperties`, and
+     `createFilteredParamPropertiesForService` skips any key the service already has in its own
+     registry: "properties generated via the global IOHIDSystem::setParamProperties are defaults"
+     (`IOHIDSystem.cpp:3809-3846`). The guess that this keeps the keyboard services from the global
+     set is refuted on this Mac: every service's `HIDEventServiceProperties` copy moved with
+     IOHIDSystem's own (the count drifts: 236 in §1, 232 that day). The last step is measured too:
+     IOKit forwards the set (`IOHIDSetHIDParameterToEventSystem`) to the HID event system, which on
+     26.7.1 runs in WindowServer, and the built-in keyboard's user-space `IOHIDKeyboardFilter`
+     applies it (`_fnKeyMode`; its `FnKeyMode` in `hidutil dump services` reads 1 during the set).
+     So the chain is setter → registry → keyboard filter, and this hop does not explain Fluor's
+     mixed reports.
    - **A second candidate setter:** the public `IOHIDEventSystemClientSetProperty(client,
-     "HIDFKeyMode", …)` (`IOHIDEventSystemClient.h:61-75`). Whether the keyboard filter honours that
-     route is not shown. `hidutil` returns `(null)` for this key at both levels while the registry
-     says 0 (§1).
+     "HIDFKeyMode", …)` (`IOHIDEventSystemClient.h:61-75`). E1 did not need it: the filter applies
+     route 1 above; route 2 is untested. `hidutil` returns `(null)` for this key at both levels
+     whatever the registry says (§1, and at 1 in E1), so `hidutil property` is not a readback for
+     this switch; nor are `IOHIDEventSystemClientCopyProperty` and `com.apple.keyboard.fnState`.
 2. **Privileges:**
    - **No root or entitlement in the source path.** `IOHIDSystem::newUserClientGated` hands out a
      param connect with no entitlement check (`IOHIDSystem.cpp:2923-2928`), and
@@ -396,9 +402,11 @@ no key other than their F-key. The digit aliases and the clickable row fix exact
      Accessibility**. That points to an event-tap mechanism instead (`[추정]`). FunctionFlip, for
      example, uses a `CGEventTapCreate(kCGSessionEventTap, …, NX_SYSDEFINED | keyDown/Up)`
      (`FFHelperApp.m:196-197`).
-   - **Effect on 26.7.1 is unverified.** Fluor's reports are mixed: #92 has a 15.5 user with "the
-     mode doesn't actually change" and a 14.7.6 user for whom it works; #99 is a Tahoe-beta launch
-     failure.
+   - **Effect on 26.7.1: the setter half is measured.** E1 (02 §8.2) set and restored the value
+     from an unprivileged program, with no entitlement held, and the keyboard filter applied it.
+     Whether a physical F5 then reaches sopen is the owner's receipt K-F3 (04 §8). Fluor's reports
+     are mixed: #92 has a 15.5 user with "the mode doesn't actually change" and a 14.7.6 user for
+     whom it works; #99 is a Tahoe-beta launch failure.
 3. **Side effects and safe restore:**
    - **Global while focused.** Every app sees F-keys while sopen is in front; brightness and volume
      then need fn.
@@ -443,7 +451,9 @@ no key other than their F-key. The digit aliases and the clickable row fix exact
     what `fnState` means (Tension 4). It does **not** prove that an app can set the value.
   - **(b) One-off build.** Set mode 1 the Fluor way, read `ioreg` back, check that a plain F5
     reaches egui as `Key::F5`, and restore. Until (b) passes on 26.7, the macOS switch is
-    **unproven**.
+    **unproven**. E1 (2026-11-23, 02 §8.2) did (b)'s set, read-back and restore, and settled (a)'s
+    readback question (the registry and the filter's `FnKeyMode` follow the switch; `hidutil
+    property` and `fnState` do not); the F5 key itself is K-F3 (04 §8).
 
 ### 4.2 Linux (KDE Plasma 6 Wayland on the ROG Flow Z13; measured kernel 7.2.6-cachyos)
 
@@ -547,7 +557,9 @@ no key other than their F-key. The digit aliases and the clickable row fix exact
 4. **macOS readback.** The registry `HIDFKeyMode`=0 (236 entries, IOHIDSystem's `HIDParameters` among them) disagrees with
    `hidutil property --get HIDFKeyMode` = `(null)`. Two candidate setters
    (`IOHIDSetCFTypeParameter` on IOHIDSystem vs the event-system client property); which one the
-   keyboard filter honours on 26.7 is not shown.
+   keyboard filter honours on 26.7 is not shown. Closed by E1 (2026-11-23, 02 §8.2): the registry
+   and the keyboard filter's `FnKeyMode` follow `IOHIDSetCFTypeParameter`, which the filter applies;
+   `hidutil property` follows neither value; the client property is untested and not needed.
 5. **Fluor on newer macOS.** #92: a Sonoma 14.7.6 user says it works, a 15.5 user says it doesn't.
    #99: it doesn't launch on the Tahoe beta. #101 (closed 2026-04) modernises the build. The
    mechanism is sound per source, but its effect on 26.7.1 is unproven.

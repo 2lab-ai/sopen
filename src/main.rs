@@ -49,7 +49,7 @@ struct Cli {
     /// [user@]host:path, or a local path
     #[arg(
         value_name = "SOURCE",
-        required_unless_present_any = ["selftest_audio", "raise_window"]
+        required_unless_present_any = ["selftest_audio", "raise_window", "fkeys_watchdog"]
     )]
     source: Option<String>,
     /// Open on HOST's screen instead of this machine's (sopen runs on HOST, over ssh)
@@ -93,6 +93,25 @@ struct Cli {
         allow_hyphen_values = true
     )]
     raise_caption: Option<String>,
+    /// Internal: the F-key switch's watchdog (`.prd/04-file-keys.md` §6.3), the child the first
+    /// acquisition starts: once its input ends it releases the switch for HOLDER (`<pid>:<start>`).
+    #[arg(
+        long,
+        hide = true,
+        value_name = "HOLDER",
+        requires = "fkeys_dir",
+        conflicts_with_all = ["source", "app", "hex", "target", "here", "selftest_audio", "raise_window"]
+    )]
+    fkeys_watchdog: Option<String>,
+    /// Internal: the holder's state folder (with --fkeys-watchdog).
+    #[arg(
+        long,
+        hide = true,
+        value_name = "DIR",
+        requires = "fkeys_watchdog",
+        conflicts_with_all = ["source", "app", "hex", "target", "here", "selftest_audio", "raise_window"]
+    )]
+    fkeys_dir: Option<PathBuf>,
 }
 
 #[derive(Subcommand)]
@@ -130,7 +149,8 @@ enum Cmd {
         #[arg(long, hide = true, requires = "work_dir")]
         wait_to_publish: bool,
     },
-    /// Show the config file, or set where `sopen SOURCE` opens by default
+    /// Show the config file, or set where `sopen SOURCE` opens by default and what the Mac's
+    /// top row sends while sopen is in front
     Config {
         #[command(subcommand)]
         key: Option<ConfigKey>,
@@ -147,6 +167,12 @@ enum ConfigKey {
         /// Open on this machine by default again
         #[arg(long, conflicts_with = "host")]
         unset: bool,
+    },
+    /// macOS: F1…F12 without fn while sopen is in front (function, the default), or the
+    /// system's setting, never touched (system)
+    Fkeys {
+        #[arg(value_name = "MODE", value_parser = ["function", "system"])]
+        mode: String,
     },
 }
 
@@ -171,6 +197,9 @@ fn main() -> ExitCode {
     {
         raise::window_now(editor, cli.raise_caption.as_deref().unwrap_or_default());
         return ExitCode::SUCCESS;
+    }
+    if let (Some(holder), Some(dir)) = (&cli.fkeys_watchdog, &cli.fkeys_dir) {
+        return ExitCode::from(sopen::fnkeys::watchdog_main(holder, dir));
     }
     if let Some(file) = &cli.selftest_audio {
         return match gui::playback::selftest(file) {
@@ -408,7 +437,7 @@ fn fetch_to_cache(place: &mut Place, abs: &str, dirs: &Dirs, rec: &mut Record) -
     Ok(fetched)
 }
 
-/// `sopen config [target HOST | target --unset]`.
+/// `sopen config [target HOST | target --unset | fkeys function|system]`.
 fn run_config(key: Option<ConfigKey>) -> Result<()> {
     let path = config::path()?;
     match key {
@@ -418,6 +447,9 @@ fn run_config(key: Option<ConfigKey>) -> Result<()> {
             match current.target {
                 Some(host) => println!("target = {host}"),
                 None => println!("target is not set"),
+            }
+            if let Some(fkeys) = current.fkeys {
+                println!("fkeys = {}", fkeys.word());
             }
             if let Some(host) = std::env::var("SOPEN_TARGET").ok().filter(|h| !h.is_empty()) {
                 println!("SOPEN_TARGET={host} is set in this environment and comes first");
@@ -431,6 +463,14 @@ fn run_config(key: Option<ConfigKey>) -> Result<()> {
             let host = host.context("give a HOST, or --unset")?;
             config::set_target(&path, &host)?;
             println!("target = {host} ({})", path.display());
+        }
+        Some(ConfigKey::Fkeys { mode }) => {
+            let fkeys = match mode.as_str() {
+                "system" => config::Fkeys::System,
+                _ => config::Fkeys::Function,
+            };
+            config::set_fkeys(&path, fkeys)?;
+            println!("fkeys = {} ({})", fkeys.word(), path.display());
         }
     }
     Ok(())
@@ -1426,6 +1466,29 @@ mod tests {
         assert!(Cli::try_parse_from(["sopen", "config", "target", "box", "--unset"]).is_err());
         let cli = Cli::try_parse_from(["sopen", "config"]).unwrap();
         assert!(matches!(cli.cmd, Some(Cmd::Config { key: None })));
+        let cli = Cli::try_parse_from(["sopen", "config", "fkeys", "system"]).unwrap();
+        assert!(matches!(
+            cli.cmd,
+            Some(Cmd::Config { key: Some(ConfigKey::Fkeys { ref mode }) }) if mode == "system"
+        ));
+        assert!(Cli::try_parse_from(["sopen", "config", "fkeys", "media"]).is_err());
+        assert!(Cli::try_parse_from(["sopen", "config", "fkeys"]).is_err());
+        // The watchdog child's hidden flags: both or neither, and nothing else.
+        let cli =
+            Cli::try_parse_from(["sopen", "--fkeys-watchdog", "1:2", "--fkeys-dir", "/s"]).unwrap();
+        assert_eq!(cli.fkeys_watchdog.as_deref(), Some("1:2"));
+        assert_eq!(cli.fkeys_dir.as_deref(), Some(Path::new("/s")));
+        assert!(Cli::try_parse_from(["sopen", "--fkeys-watchdog", "1:2"]).is_err());
+        assert!(Cli::try_parse_from(["sopen", "--fkeys-dir", "/s", "a"]).is_err());
+        assert!(Cli::try_parse_from([
+            "sopen",
+            "--fkeys-watchdog",
+            "1:2",
+            "--fkeys-dir",
+            "/s",
+            "a"
+        ])
+        .is_err());
         let cli = Cli::try_parse_from([
             "sopen",
             "cut",

@@ -612,6 +612,33 @@ then its WUs in parallel on disjoint files, then its **integration** WU, the sli
 | E4 | S2 | five git reads over the ssh master, timed |
 | E5 | S3 | remote stop: `exec sh -c 'echo $$ >&2; exec sleep 300'`, then `kill -TERM -- -<pid>`, under zsh, fish and bash login shells; an SFTP listing on the same master working while a parked `git log` stream is open |
 
+**E1's result** (measured 2026-11-23 on a Mac (macOS 26.7.1, arm64), the built-in keyboard, a
+small C program run as the logged-in user without sudo):
+
+- **Run:** route 1 of keys.md §4.1 — `IOServiceOpen(IOService:/IOResources/IOHIDSystem,
+  kIOHIDParamConnectType)`, `IOHIDSetCFTypeParameter(connect, "HIDFKeyMode", 1)`, then the same
+  with 0 — in two windows of value 1, about 550 ms each, after rehearsals at the value it had
+  (0): the whole flow, the alarm watchdog, SIGTERM and SIGINT. Every way out restored, and a
+  separate pass after each window found 0 everywhere and nothing to restore.
+- **Return codes:** `IOServiceOpen`, the set to 1 and the restore to 0 all returned 0. No
+  entitlement, Accessibility grant or root; no prompt.
+- **The chain, setter → registry → keyboard filter:** IOHIDSystem's `HIDParameters["HIDFKeyMode"]`
+  and every event service's `HIDEventServiceProperties` copy moved 0 → 1 → 0 together (232 entries
+  that day; the count drifts as services come and go, so no test or receipt hard-codes it). IOKit
+  forwards each set (`IOHIDSetHIDParameterToEventSystem`, one passive connection per call) to the
+  HID event system in WindowServer, where the built-in keyboard's `IOHIDKeyboardFilter` logged
+  `_fnKeyMode: 1`, then `0`; its `FnKeyMode` in `hidutil dump services` read 1 during the set and 0
+  before and after, on all three keyboard filters. keys.md §4.1's `[추정]` that the services keep
+  their own value and miss the global set is refuted.
+- **Readbacks:** the registry (sopen's own reads, 04 §6.2) and the filter's `FnKeyMode` (receipts)
+  follow the switch. `hidutil property --get HIDFKeyMode`, globally and per keyboard,
+  `IOHIDEventSystemClientCopyProperty` and `com.apple.keyboard.fnState` stayed unset at 0 and at
+  1: they are not readbacks.
+- **Nothing else changed:** the rest of `HIDParameters` and every service's copy were the same
+  before and after; no preference file was written.
+- **Not tested:** route 2 (`IOHIDEventSystemClientSetProperty`), not needed; and whether a physical
+  F5 then reaches sopen as `Key::F5` — the owner's receipt K-F3 (04 §8).
+
 **E3's result** (measured 2026-11-21 on preview 0120d40813a0):
 
 - **Run:** 50 files (10 txt, 10 rs, 8 png, 7 jpg, 5 mp4, 3 wav, 2 mp3, 5 bin; 3 MB in total) on a

@@ -337,6 +337,18 @@ contexts where it acts (list, viewer, git panel, tree, a dialog) and its `Comman
   `IOHIDSetCFTypeParameter(connect, "HIDFKeyMode", 1)`; it reads the value from the registry property
   `HIDParameters["HIDFKeyMode"]`. IOKit is loaded at runtime; no entitlement, Accessibility grant or
   root is needed on that path per Apple's IOHIDFamily source (keys.md §4.1 item 2).
+- **Measured** (E1, 02 §8.2; a Mac, macOS 26.7.1, arm64): run unprivileged, `IOServiceOpen` and
+  `IOHIDSetCFTypeParameter` return 0, and no entitlement is held. The value lands in IOHIDSystem's
+  `HIDParameters` and in every event service's `HIDEventServiceProperties` (a count that drifts as
+  services come and go: never hard-coded). IOKit forwards it (`IOHIDSetHIDParameterToEventSystem`)
+  to the HID event system in WindowServer, where the built-in keyboard's `IOHIDKeyboardFilter`
+  applies it (`_fnKeyMode`): setter → registry → keyboard filter.
+- **Readback**: sopen's own reads use the registry's `HIDParameters["HIDFKeyMode"]`. A receipt
+  reads the consumer too: the keyboard filters' `FnKeyMode`, per keyboard service, in
+  `hidutil dump services` (`hidutil dump services -f text | awk '/IOClass = /{c=$3} /FnKeyMode = /{print c, $0}'`).
+  `hidutil property --get HIDFKeyMode`, `IOHIDEventSystemClientCopyProperty` and
+  `com.apple.keyboard.fnState` do not follow this switch (they stayed unset at 0 and at 1): never
+  use them as readbacks.
 - **When**: a sopen process **acquires** the switch when one of its windows gains focus, and
   **releases** it when none of its windows has focus any more, when it quits, before the Mac sleeps
   and when the session is switched away; it acquires again on wake or session return if one of its
@@ -349,10 +361,10 @@ contexts where it acts (list, viewer, git panel, tree, a dialog) and its `Comman
   `sopen config target` sets the target.
 - **Never in a scripted run or a test**: `SOPEN_SCREENSHOT`, `SOPEN_AUTOSAVE`, `SOPEN_AUTOEXPORT`,
   `SOPEN_LIST` runs and `cargo test` never switch it (tests use a fake behind a trait).
-- **Unproven on macOS 26.7.1**: the mechanism is sound per source, but Fluor's users report mixed
-  results on recent macOS (keys.md §5 items 4–5). The owner's receipt (§8, K-F3) decides: if F5
-  without fn does not reach sopen there, the default becomes `"system"` and this section records the
-  result.
+- **Half proven on macOS 26.7.1**: E1 (02 §8.2) proved the setter-to-filter half above; Fluor's
+  users report mixed results on recent macOS (keys.md §5 items 4–5). The key half — a plain F5
+  reaching sopen — is the owner's receipt (§8, K-F3), and it decides: if F5 without fn does not
+  reach sopen there, the default becomes `"system"` and this section records the result.
 
 ### 6.3 Restoring it, even when sopen dies
 
@@ -374,14 +386,31 @@ contexts where it acts (list, viewer, git panel, tree, a dialog) and its `Comman
   - **A write that fails or does not read back 1 is not an acquisition**: this process is removed from
     the holders again; with none left, the recorded original is set back and the state removed; the
     status row says the F-key switch did not take effect, and §6.1's fallback stays.
-- **Release**: remove this process from the holders; if none remain, set the recorded original value
-  and remove `fkeys.json` (the lock file stays).
-- **Watchdog**: the first acquire in a process spawns a small child of sopen's own binary (a hidden
+- **Release**: remove this process from the holders; if none remain, set the recorded original value,
+  **read it back**, and remove `fkeys.json` only when the read equals the original (the lock file
+  stays). A release that fails — the lock, the read, the write, or a read-back that differs — keeps
+  the state and is tried again (below).
+- **A state is trusted only as sopen writes it**: sopen records an original of 0 and nothing else, so
+  a `fkeys.json` whose original is not 0 is read as original 0 with no holders — restoring ends at 0
+  and the file is removed; a damaged file can never make sopen write 1.
+- **Watchdog**: an acquire first needs a ready watchdog: a small child of sopen's own binary (a hidden
   subcommand, as `--raise-window` is) holding the read end of a pipe whose write end only sopen holds.
-  When the pipe reaches end of file — sopen exited, crashed or was killed — the child releases for that
-  process (above), then exits. It does nothing else and opens no window.
+  The child reads the switch once, starts its reader, and prints one ready line; sopen waits for it at
+  most 2 s. A child that ends or stays silent is killed and reaped, and there is **no acquisition**
+  (the status row says why). Before each later acquire sopen checks the child still runs and starts a
+  new one, with the same wait, if it does not. When the pipe reaches end of file — sopen exited,
+  crashed or was killed — the child releases for that process (above). It keeps trying until the
+  original reads back, a live holder has taken over, or no state is left — 50 ms, doubling to 2 s,
+  for at most 60 s in total — and then exits, leaving any state for the next start. It does nothing
+  else and opens no window. A release that fails inside a running sopen is retried the same way.
 - **At start**: sopen runs the holder clean-up under the lock; with no holder left and a state file
-  present, the value is restored.
+  present, the value is restored. **Except across a reboot**: the state records the boot
+  (`kern.bootsessionuuid` on macOS, `/proc/sys/kernel/random/boot_id` on Linux), and a state left
+  by another boot is removed without touching the value. The switch writes no preference (E1, 02
+  §8.2), and login applies the owner's own setting again *(estimate: a reboot test has not been
+  run)*; restoring a pre-reboot original would then overwrite a setting the owner made since. If a
+  stuck 1 did survive a reboot, the next acquire reads it as the owner's own and nothing restores
+  it — the risk taken. Without a readable boot id, the plain rule applies.
 - **Known gap**: overlays such as Mission Control can leave sopen "active", so F-key mode stays on
   over them (keys.md §4.1 item 3).
 
@@ -479,6 +508,8 @@ Run locally and on a remote folder under `/tmp/sopen-receipts/`; window receipts
 - K-F3. **Owner-run receipt** (macOS 26.7.1, the built-in keyboard, the default setting): open a
   folder in sopen, press F5 without fn → the Copy dialog opens; switch to another app → the top row's
   F5 is dictation again; `kill -9` sopen while it is in front → `ioreg -c IOHIDSystem -r -d 1 | grep
-  HIDFKeyMode` shows 0 again within a second. Until this receipt exists, §6.2 is unproven.
+  HIDFKeyMode` shows 0 again within a second. E1 proved the setter-to-filter half on 26.7.1
+  (02 §8.2); K-F3 proves the key half: a plain F5 opens the Copy dialog. Until this receipt
+  exists, that half of §6.2 is unproven.
 - K-F4. `sopen config fkeys system` → the config file holds `fkeys = "system"` and sopen never opens
   IOHIDSystem (test: the fake is never called).
