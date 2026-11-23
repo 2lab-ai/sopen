@@ -2,8 +2,12 @@
 //! a record that does not parse is an error, never a panic. S2-B writes it.
 //!
 //! Every parser takes git's bytes as they came: records end in NUL or a newline as the read's
-//! form says, names and paths are bytes (a name that is not UTF-8 shows with U+FFFD and its
-//! `lossy` flag is set), and text is cut at a character boundary. §8.5's probe has no parser
+//! form says, and output whose last record lacks its end is an error (cut short), never a record;
+//! names and paths are bytes (a name that is not UTF-8 shows with U+FFFD and its `lossy` flag is
+//! set), and text is cut at a character boundary. Ids and numbers are taken only in their exact
+//! form. The log and details records end every field in NUL, which git never prints inside a
+//! name, an email or a message (it prints a message up to its first NUL), so no field can shift
+//! another (review round 1). §8.5's probe has no parser
 //! yet: 03 gives its outputs, not its printed form.
 
 use super::model::*;
@@ -28,6 +32,57 @@ fn error<T>(what: impl Into<String>) -> Result<T, ParseError> {
 pub const NAME_CAP: usize = 256;
 /// `%s` is cut at 1 KiB (03 §4.5).
 pub const SUBJECT_CAP: usize = 1024;
+
+/// The details read's whole output at most (03 §6.1): past it, an error.
+pub const DETAILS_CAP: usize = 1 << 20;
+/// The fields of a log record (03 §4.1), each ending in NUL.
+pub const RECORD_FIELDS: usize = 7;
+/// `%P` at most: an octopus merge of about 1 600 parents.
+pub const PARENTS_CAP: usize = 64 << 10;
+/// What is kept of each log record field, in order: a field that can be cut (the name, the
+/// email, the subject) is kept up to its cap and 3 bytes more, which decide its first `cap`
+/// bytes of text; any other field is never longer than this when it parses.
+pub const FIELD_KEEP: [usize; RECORD_FIELDS] = [
+    64,
+    PARENTS_CAP,
+    NAME_CAP + 3,
+    NAME_CAP + 3,
+    20,
+    20,
+    SUBJECT_CAP + 3,
+];
+/// Which log record fields are cut past their cap rather than refused.
+pub const FIELD_CUT: [bool; RECORD_FIELDS] = [false, false, true, true, false, false, true];
+/// Each log record field's name, for an error.
+pub const FIELD_NAMES: [&str; RECORD_FIELDS] = [
+    "the hash",
+    "the parents",
+    "the author name",
+    "the author email",
+    "the author date",
+    "the commit date",
+    "the subject",
+];
+/// What ends a cut text field.
+const MARK: &str = "…";
+/// The fields of the details record (03 §6.1), each ending in NUL.
+const DETAILS_FIELDS: usize = 9;
+
+/// `bytes` as text of at most `cap` bytes: whole when it fits, else cut 3 bytes short at a
+/// character boundary and marked with `…`. Decodes only what the cut can keep: a character is at
+/// most 4 bytes and decodes to at least as many as it takes, so the bytes past `cap + 3` cannot
+/// reach the first `cap` of the text, nor change whether it fits — the same answer from the
+/// whole field or from the `cap + 3` bytes the log stream keeps of it.
+pub fn capped(bytes: &[u8], cap: usize) -> String {
+    let kept = &bytes[..bytes.len().min(cap.saturating_add(3))];
+    let text = String::from_utf8_lossy(kept).into_owned();
+    if text.len() <= cap {
+        return text;
+    }
+    let mut text = cut(text, cap.saturating_sub(MARK.len()));
+    text.push_str(MARK);
+    text
+}
 
 /// `text` cut to at most `max` bytes at a character boundary.
 pub fn cut(mut text: String, max: usize) -> String {
@@ -69,8 +124,13 @@ fn oids(bytes: &[u8], what: &str) -> Result<Vec<Oid>, ParseError> {
     bytes.split(|&b| b == b' ').map(|p| oid(p, what)).collect()
 }
 
+/// A count or a date as git prints it: ASCII digits only — no sign, space or other form.
 fn number<T: std::str::FromStr>(bytes: &[u8], what: &str) -> Result<T, ParseError> {
-    match std::str::from_utf8(bytes).ok().and_then(|s| s.parse().ok()) {
+    let digits = !bytes.is_empty() && bytes.iter().all(u8::is_ascii_digit);
+    match digits
+        .then(|| std::str::from_utf8(bytes).ok()?.parse().ok())
+        .flatten()
+    {
         Some(n) => Ok(n),
         None => error(format!("{what} is not a number: {:?}", shown(bytes))),
     }
@@ -90,11 +150,30 @@ fn fields<'a>(
     Ok(f)
 }
 
-/// Records ending in `end`: the last may lack it; an empty tail is no record.
-fn records(out: &[u8], end: u8) -> impl Iterator<Item = &[u8]> {
-    let out = out.strip_suffix(&[end]).unwrap_or(out);
-    out.split(move |&b| b == end)
-        .filter(move |_| !out.is_empty())
+/// `record` split at `sep` into exactly `n` fields, `sep` in none of them.
+fn exact<'a>(record: &'a [u8], sep: u8, n: usize, what: &str) -> Result<Vec<&'a [u8]>, ParseError> {
+    let f: Vec<&[u8]> = record.split(|&b| b == sep).collect();
+    if f.len() != n {
+        return error(format!("{what} has {} fields, not {n}", f.len()));
+    }
+    Ok(f)
+}
+
+/// The records of output where each ends in `end`; nothing for no output. Output whose last
+/// record lacks its `end` was cut short: an error, never a record.
+fn terminated<'a>(
+    out: &'a [u8],
+    end: u8,
+    what: &str,
+) -> Result<impl Iterator<Item = &'a [u8]> + 'a, ParseError> {
+    let body = match out.split_last() {
+        None => None,
+        Some((&last, body)) if last == end => Some(body),
+        Some(_) => return error(format!("{what} is cut short: its last record has no end")),
+    };
+    Ok(body
+        .into_iter()
+        .flat_map(move |body| body.split(move |&b| b == end)))
 }
 
 /// stderr's first line, as git printed it.
@@ -155,7 +234,7 @@ pub fn detection(code: Option<i32>, stdout: &[u8], stderr: &[u8], folder: &str) 
 
 /// Exit 0: `false`, `false`, shallow, git dir, common dir, top level [, superproject].
 fn work_tree(stdout: &[u8], folder: &str) -> Result<Detection, ParseError> {
-    let lines: Vec<&[u8]> = records(stdout, b'\n').collect();
+    let lines: Vec<&[u8]> = terminated(stdout, b'\n', "git's answer")?.collect();
     if !matches!(lines.len(), 6 | 7) {
         return error(format!("git's answer has {} lines", lines.len()));
     }
@@ -201,8 +280,11 @@ fn work_tree(stdout: &[u8], folder: &str) -> Result<Detection, ParseError> {
 
 /// `git version`'s stdout; `None` when it is not `git version <n>.<n>…`.
 pub fn git_version(stdout: &[u8]) -> Option<GitVersion> {
-    let out = std::str::from_utf8(stdout).ok()?;
-    let rest = out.lines().next()?.strip_prefix("git version ")?.trim();
+    let out = std::str::from_utf8(stdout).ok()?.strip_suffix('\n')?;
+    let rest = out.strip_prefix("git version ")?.trim();
+    if rest.contains('\n') {
+        return None;
+    }
     let numbers = rest.split([' ', '-']).next()?;
     let mut parts = numbers.split('.').map(|p| p.parse::<u32>());
     let major = parts.next()?.ok()?;
@@ -218,7 +300,9 @@ pub fn git_version(stdout: &[u8]) -> Option<GitVersion> {
 
 /// The refs read (03 §4.1): one ref per line, six fields split at NUL.
 pub fn refs(stdout: &[u8]) -> Result<Vec<RefLabel>, ParseError> {
-    records(stdout, b'\n').map(ref_line).collect()
+    terminated(stdout, b'\n', "the refs read")?
+        .map(ref_line)
+        .collect()
 }
 
 fn ref_line(line: &[u8]) -> Result<RefLabel, ParseError> {
@@ -273,15 +357,21 @@ pub fn head(
     symbolic: (Option<i32>, &[u8]),
     verify: (Option<i32>, &[u8]),
 ) -> Result<Head, ParseError> {
-    let line = |out: &[u8]| -> Vec<u8> { out.strip_suffix(b"\n").unwrap_or(out).to_vec() };
+    // Each prints one line: a line without its end was cut short.
+    let line = |out: &'_ [u8], what: &str| -> Result<Vec<u8>, ParseError> {
+        match out.strip_suffix(b"\n") {
+            Some(line) if !line.contains(&b'\n') => Ok(line.to_vec()),
+            _ => error(format!("{what} is not one whole line: {:?}", shown(out))),
+        }
+    };
     let commit = match verify {
-        (Some(0), out) => Some(oid(&line(out), "HEAD")?),
+        (Some(0), out) => Some(oid(&line(out, "rev-parse --verify HEAD")?, "HEAD")?),
         (Some(1), _) => None,
         (code, _) => return error(format!("rev-parse --verify HEAD ended with {code:?}")),
     };
     match (symbolic, commit) {
         ((Some(0), out), commit) => {
-            let name = line(out);
+            let name = line(out, "symbolic-ref HEAD")?;
             if name.is_empty() {
                 return error("symbolic-ref printed no branch");
             }
@@ -303,7 +393,9 @@ pub fn head(
 
 /// The stashes read (03 §4.1): NUL-terminated records, five fields split at `\x1f`.
 pub fn stashes(stdout: &[u8]) -> Result<Vec<StashRow>, ParseError> {
-    records(stdout, 0).map(stash_record).collect()
+    terminated(stdout, 0, "the stash list")?
+        .map(stash_record)
+        .collect()
 }
 
 fn stash_record(record: &[u8]) -> Result<StashRow, ParseError> {
@@ -331,7 +423,7 @@ fn stash_record(record: &[u8]) -> Result<StashRow, ParseError> {
 pub fn status(stdout: &[u8]) -> Result<Status, ParseError> {
     let mut branch = BranchStatus::default();
     let mut entries = Vec::new();
-    let mut tokens = records(stdout, 0);
+    let mut tokens = terminated(stdout, 0, "the status read")?;
     while let Some(token) = tokens.next() {
         let (kind, rest) = match token.split_first() {
             Some((k, rest)) if rest.first() == Some(&b' ') => (*k, &rest[1..]),
@@ -451,25 +543,48 @@ fn changed(xy: &[u8]) -> Result<StatusState, ParseError> {
     }
 }
 
-/// One record of the log stream (03 §4.1), its NUL terminator already taken off: seven fields
-/// split at `\x1f`, the subject last so a stray `\x1f` in it stays in it.
+/// One record of the log stream (03 §4.1) without the NUL that ends its last field: exactly
+/// [`RECORD_FIELDS`] fields split at NUL. The name, email and subject are decoded only up to
+/// their caps and marked when cut; any other field past [`FIELD_KEEP`] is an error.
 pub fn commit_record(record: &[u8]) -> Result<CommitRow, ParseError> {
-    let f = fields(record, 0x1f, 7, "a commit record")?;
+    let f = exact(record, 0, RECORD_FIELDS, "a commit record")?;
+    for (i, field) in f.iter().enumerate() {
+        if !FIELD_CUT[i] && field.len() > FIELD_KEEP[i] {
+            return error(format!(
+                "{} is longer than {} bytes",
+                FIELD_NAMES[i], FIELD_KEEP[i]
+            ));
+        }
+    }
+    commit_fields(std::array::from_fn(|i| f[i]))
+}
+
+/// A log record's fields, the cut ones whole or as the stream kept them ([`FIELD_KEEP`]).
+pub fn commit_fields(f: [&[u8]; RECORD_FIELDS]) -> Result<CommitRow, ParseError> {
     Ok(CommitRow {
         oid: oid(f[0], "a commit")?,
         parents: oids(f[1], "a parent")?,
-        author_name: cut(shown(f[2]), NAME_CAP),
-        author_email: cut(shown(f[3]), NAME_CAP),
+        author_name: capped(f[2], NAME_CAP),
+        author_email: capped(f[3], NAME_CAP),
         author_time: number(f[4], "the author date")?,
         commit_time: number(f[5], "the commit date")?,
-        subject: cut(shown(f[6]), SUBJECT_CAP),
+        subject: capped(f[6], SUBJECT_CAP),
     })
 }
 
-/// The details read (03 §6.1): one NUL-terminated record, nine fields, `%B` last.
+/// The details read (03 §6.1): one record of nine fields, each ending in NUL, `%B` last; past
+/// [`DETAILS_CAP`] an error.
 pub fn details(stdout: &[u8]) -> Result<CommitDetails, ParseError> {
-    let record = stdout.strip_suffix(&[0]).unwrap_or(stdout);
-    let f = fields(record, 0x1f, 9, "a details record")?;
+    if stdout.len() > DETAILS_CAP {
+        return error(format!(
+            "the details read is longer than {} MiB",
+            DETAILS_CAP >> 20
+        ));
+    }
+    let Some(record) = stdout.strip_suffix(&[0]) else {
+        return error("the details read is cut short: its record has no end");
+    };
+    let f = exact(record, 0, DETAILS_FIELDS, "a details record")?;
     let (message, message_lossy) = text(f[8]);
     Ok(CommitDetails {
         oid: oid(f[0], "a commit")?,
@@ -488,10 +603,10 @@ pub fn details(stdout: &[u8]) -> Result<CommitDetails, ParseError> {
 /// `hash-object -t tree --stdin`'s stdout: the empty tree's id (03 §6.2), whichever hash the
 /// repository uses.
 pub fn object_id(stdout: &[u8]) -> Result<Oid, ParseError> {
-    oid(
-        stdout.strip_suffix(b"\n").unwrap_or(stdout),
-        "hash-object's answer",
-    )
+    match stdout.strip_suffix(b"\n") {
+        Some(line) => oid(line, "hash-object's answer"),
+        None => error("hash-object's answer is cut short"),
+    }
 }
 
 /// One `--name-status -z` row: the letter, the path and a rename's or copy's old path.
@@ -504,7 +619,7 @@ type Counted<'a> = (Option<(u64, u64)>, &'a [u8], Option<&'a [u8]>);
 /// same two endpoints, joined row by row (git lists both in the same order).
 pub fn changed_files(name_status: &[u8], numstat: &[u8]) -> Result<Vec<ChangedFile>, ParseError> {
     let mut named: Vec<Named> = Vec::new();
-    let mut tokens = records(name_status, 0);
+    let mut tokens = terminated(name_status, 0, "the name-status read")?;
     while let Some(status) = tokens.next() {
         let Some(&letter) = status.first() else {
             return error("an empty name-status letter");
@@ -523,7 +638,7 @@ pub fn changed_files(name_status: &[u8], numstat: &[u8]) -> Result<Vec<ChangedFi
     }
 
     let mut counted: Vec<Counted> = Vec::new();
-    let mut tokens = records(numstat, 0);
+    let mut tokens = terminated(numstat, 0, "the numstat read")?;
     while let Some(row) = tokens.next() {
         let f = fields(row, b'\t', 3, "a numstat row")?;
         let lines = match (f[0], f[1]) {

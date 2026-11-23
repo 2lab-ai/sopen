@@ -671,3 +671,45 @@ fn the_version_line() {
         assert_eq!(parse::git_version(bad), None, "{bad:?}");
     }
 }
+
+/// Review round 1, item 6: the shim guard holds whichever way git was chosen — `SOPEN_GIT`
+/// naming `/usr/bin/git` or a link to it, a bare name looked up on `PATH`, or a link on `PATH`;
+/// never asked about elsewhere, or off macOS.
+#[test]
+fn the_shim_guard_holds_for_sopen_git_and_links() {
+    let shim = Path::new("/usr/bin/git");
+    if !shim.is_file() {
+        eprintln!("skipping: no /usr/bin/git here");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let link = tmp.path().join("git");
+    std::os::unix::fs::symlink(shim, &link).unwrap();
+    let never = || panic!("xcode-select is asked only about the shim on macOS");
+    let usr = OsStr::new("/usr/bin");
+    let chosen = |sopen: &str, path: Option<&OsStr>, ok: bool| {
+        detect::local_git(Some(OsStr::new(sopen)), path, true, move || ok)
+    };
+    assert_eq!(chosen("/usr/bin/git", None, false), Err(Unavailable::NoGit));
+    assert_eq!(chosen("/usr/bin/git", None, true), Ok(shim.into()));
+    assert_eq!(
+        chosen(link.to_str().unwrap(), None, false),
+        Err(Unavailable::NoGit)
+    );
+    assert_eq!(chosen("git", Some(usr), false), Err(Unavailable::NoGit));
+    assert_eq!(chosen("git", Some(usr), true), Ok(shim.into()));
+    assert_eq!(
+        detect::local_git(None, Some(tmp.path().as_os_str()), true, || false),
+        Err(Unavailable::NoGit),
+        "a link on PATH to the shim"
+    );
+    assert_eq!(
+        detect::local_git(Some(OsStr::new("/usr/bin/git")), None, false, never),
+        Ok(shim.into())
+    );
+    assert_eq!(
+        detect::local_git(Some(OsStr::new("nonexistent-git")), Some(usr), true, never),
+        Err(Unavailable::NoGit),
+        "a bare name not on PATH"
+    );
+}

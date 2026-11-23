@@ -8,6 +8,7 @@ use crate::git::history::{
     self, Generation, Git, LogOptions, LogStream, PageEnd, Pipe, Ran, RunError, StartError, PAGE,
 };
 use crate::git::model::Oid;
+use crate::git::parse;
 use std::collections::HashSet;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -512,7 +513,7 @@ fn every_read_runs_03s_words() {
                 "log",
                 "-1",
                 "-z",
-                "--format=%H%x1f%P%x1f%aN%x1f%aE%x1f%at%x1f%cN%x1f%cE%x1f%ct%x1f%B",
+                "--format=%H%x00%P%x00%aN%x00%aE%x00%at%x00%cN%x00%cE%x00%ct%x00%B",
                 c.as_str(),
                 "--",
             ],
@@ -532,11 +533,12 @@ fn every_read_runs_03s_words() {
     }
 }
 
-/// 03 §4.1's log form, word for word; the roots go on stdin.
+/// 03 §4.1's log form, word for word: seven fields, each ending in NUL (`-z` ends the last), so no
+/// field can shift another; the roots go on stdin.
 #[test]
 fn the_log_runs_03s_form() {
     let words = |o: LogOptions| history::argv::log(&o).join(" ");
-    let format = "--format=%H%x1f%P%x1f%aN%x1f%aE%x1f%at%x1f%ct%x1f%s";
+    let format = "--format=%H%x00%P%x00%aN%x00%aE%x00%at%x00%ct%x00%s";
     assert_eq!(
         words(LogOptions::default()),
         format!("log -z --date-order {format} --stdin --")
@@ -858,4 +860,353 @@ fn roots_are_the_ids_the_labels_show() {
         lossy: false,
     };
     assert!(history::roots(&[], Some(&unborn), &[]).is_empty());
+}
+
+/// A record as git prints it under `argv::log`'s and `argv::details`' forms: every field ends
+/// in NUL (`-z` ends the last).
+pub(super) fn framed(fields: &[&[u8]]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for field in fields {
+        out.extend_from_slice(field);
+        out.push(0);
+    }
+    out
+}
+
+/// One log record as git prints it under `argv::log`'s form.
+fn wire(fields: [&[u8]; 7]) -> Vec<u8> {
+    framed(&fields)
+}
+
+/// Commit `n` (from 1) of a made-up history: one parent (`n - 1`), none for the first; with
+/// `odd`, a unit separator inside its name and subject. Its row and its record.
+fn sample(n: usize, odd: bool) -> (crate::git::model::CommitRow, Vec<u8>) {
+    let id = |k: usize| format!("{k:040x}");
+    let parents = if n > 1 { id(n - 1) } else { String::new() };
+    let name = if odd { "Ann\u{1f}Alias" } else { "Ann" };
+    let subject = if odd {
+        format!("commit {n}\u{1f}with a unit separator")
+    } else {
+        format!("commit {n} and its subject")
+    };
+    let (at, ct) = (1_700_000_000 + n as i64, 1_700_000_100 + n as i64);
+    let row = crate::git::model::CommitRow {
+        oid: Oid::parse(&id(n)).unwrap(),
+        parents: if n > 1 {
+            vec![Oid::parse(&id(n - 1)).unwrap()]
+        } else {
+            vec![]
+        },
+        author_name: name.into(),
+        author_email: "ann@example.invalid".into(),
+        author_time: at,
+        commit_time: ct,
+        subject: subject.clone(),
+    };
+    let record = wire([
+        id(n).as_bytes(),
+        parents.as_bytes(),
+        name.as_bytes(),
+        b"ann@example.invalid",
+        at.to_string().as_bytes(),
+        ct.to_string().as_bytes(),
+        subject.as_bytes(),
+    ]);
+    (row, record)
+}
+
+/// A runner whose one log stream is scripted: `chunks`, each one read at a time (cut to the
+/// reader's buffer), then `endless` more bytes of `x` (output that never ends a record, capped
+/// so a reader that does not stop still ends), then stdout's end and the exit `code`.
+struct Scripted {
+    pipe: Mutex<Option<ScriptedPipe>>,
+    stopped: Arc<std::sync::atomic::AtomicBool>,
+}
+
+struct ScriptedPipe {
+    chunks: std::collections::VecDeque<Vec<u8>>,
+    endless: usize,
+    code: Option<i32>,
+    stopped: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Scripted {
+    fn new(chunks: Vec<Vec<u8>>, endless: usize, code: Option<i32>) -> Scripted {
+        let stopped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        Scripted {
+            pipe: Mutex::new(Some(ScriptedPipe {
+                chunks: chunks.into(),
+                endless,
+                code,
+                stopped: stopped.clone(),
+            })),
+            stopped,
+        }
+    }
+
+    /// The stream of `bytes` handed out `sizes` bytes at a time, in turn.
+    fn split(bytes: &[u8], sizes: &[usize], code: Option<i32>) -> Scripted {
+        let mut chunks = Vec::new();
+        let mut at = 0;
+        for size in sizes.iter().cycle() {
+            if at >= bytes.len() {
+                break;
+            }
+            let end = (at + size).min(bytes.len());
+            chunks.push(bytes[at..end].to_vec());
+            at = end;
+        }
+        Scripted::new(chunks, 0, code)
+    }
+
+    fn stopped(&self) -> bool {
+        self.stopped.load(Ordering::SeqCst)
+    }
+}
+
+impl Git for Scripted {
+    fn run(&self, _: &str, _: &[String], _: &[u8], _: history::Bound) -> Result<Ran, RunError> {
+        Err(RunError::Failed(
+            "a scripted stream runs nothing else".into(),
+        ))
+    }
+
+    fn spawn(&self, _: &str, _: &[String], _: &[u8]) -> Result<Box<dyn Pipe>, RunError> {
+        let pipe = self.pipe.lock().unwrap().take().expect("one stream");
+        Ok(Box::new(pipe))
+    }
+}
+
+impl Pipe for ScriptedPipe {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if let Some(mut chunk) = self.chunks.pop_front() {
+            if chunk.len() > buf.len() {
+                let rest = chunk.split_off(buf.len());
+                self.chunks.push_front(rest);
+            }
+            buf[..chunk.len()].copy_from_slice(&chunk);
+            return Ok(chunk.len());
+        }
+        let n = self.endless.min(buf.len());
+        buf[..n].fill(b'x');
+        self.endless -= n;
+        Ok(n)
+    }
+
+    fn running(&mut self) -> bool {
+        !self.stopped.load(Ordering::SeqCst)
+    }
+
+    fn stop(&mut self) {
+        self.stopped.store(true, Ordering::SeqCst);
+    }
+
+    fn finish(&mut self) -> Ran {
+        Ran {
+            code: self.code,
+            stdout: Vec::new(),
+            stderr: b"fatal: scripted\n".to_vec(),
+        }
+    }
+}
+
+fn scripted_stream(git: &Scripted) -> LogStream {
+    let generation = Generation::new();
+    let load = generation.bump();
+    let root = [Oid::parse(&"a".repeat(40)).unwrap()];
+    LogStream::start(git, "/r", &LogOptions::default(), &root, &generation, load).unwrap()
+}
+
+/// Records cut across pipe reads at every size from 1 byte (fields, their ends and records split
+/// anywhere) are rebuilt whole: a root, a commit with a unit separator in its name and subject,
+/// and the rest; the stream's end after the last record's end is `all loaded`.
+#[test]
+fn records_split_across_pipe_reads_are_rebuilt() {
+    let samples: Vec<_> = (1..=6).map(|n| sample(n, n % 2 == 0)).collect();
+    let bytes: Vec<u8> = samples.iter().flat_map(|(_, r)| r.clone()).collect();
+    let want: Vec<_> = samples.iter().map(|(row, _)| row.clone()).collect();
+    for sizes in [&[1][..], &[2, 3], &[5, 1, 7], &[64]] {
+        let git = Scripted::split(&bytes, sizes, Some(0));
+        let mut stream = scripted_stream(&git);
+        let page = stream.page(PAGE);
+        assert_eq!(page.rows, want, "read {sizes:?} bytes at a time");
+        assert_eq!(page.end, PageEnd::AllLoaded);
+        assert_eq!(stream.bytes_read(), bytes.len() as u64);
+    }
+}
+
+/// Review round 1, item 3 (as the coordinator revised it): after a full page, a record whose
+/// field never ends (a header, then 17 MiB with no NUL) is read and dropped past the field's cap
+/// until 16 MiB have been dropped, then ends the stream with an error — reading that and a pipe
+/// read more, never the whole output. A field that cannot be cut (the hash) ends it at once.
+#[test]
+fn a_record_that_never_ends_stops_the_stream_at_16_mib() {
+    let mut bytes = Vec::new();
+    for n in 1..=PAGE {
+        bytes.extend(sample(n, false).1);
+    }
+    let page_bytes = bytes.len() as u64;
+    let id = "f".repeat(40);
+    bytes.extend_from_slice(id.as_bytes());
+    bytes.extend_from_slice(b"\0\0");
+    let git = Scripted::new(vec![bytes], 17 << 20, Some(0));
+    let mut stream = scripted_stream(&git);
+    let first = stream.page(PAGE);
+    assert_eq!((first.rows.len(), &first.end), (PAGE, &PageEnd::More));
+    let next = stream.page(PAGE);
+    assert!(next.rows.is_empty());
+    let PageEnd::Error(why) = &next.end else {
+        panic!("{:?}", next.end);
+    };
+    assert!(
+        why.contains("record 501") && why.contains("16 MiB"),
+        "{why}"
+    );
+    let read = stream.bytes_read();
+    assert!(
+        read <= page_bytes + (16 << 20) + (128 << 10),
+        "read {read} bytes for a record capped at 16 MiB dropped"
+    );
+    assert!(git.stopped(), "git is stopped");
+    assert_eq!(stream.page(PAGE).end, next.end, "the stream stays ended");
+
+    // No NUL at all: the hash field cannot be cut, so the first record fails at once.
+    let git = Scripted::new(Vec::new(), 17 << 20, Some(0));
+    let mut stream = scripted_stream(&git);
+    let page = stream.page(PAGE);
+    assert!(page.rows.is_empty());
+    let PageEnd::Error(why) = &page.end else {
+        panic!("{:?}", page.end);
+    };
+    assert!(why.contains("record 1"), "{why}");
+    assert!(
+        stream.bytes_read() <= 128 << 10,
+        "read {}",
+        stream.bytes_read()
+    );
+    assert!(git.stopped());
+}
+
+/// The coordinator's revision of item 3: a commit whose subject (200 KiB) and name run past
+/// their caps sits between two normal ones → three rows, its subject and name cut to their caps
+/// and marked with `…`, and the log goes on — whatever the pipe reads' sizes.
+#[test]
+fn a_field_past_its_cap_is_cut_and_the_log_goes_on() {
+    let (first, a) = sample(1, false);
+    let (third, c) = sample(3, true);
+    let subject = "s".repeat(200 << 10);
+    let name = format!("{}한", "n".repeat(300));
+    let id = format!("{:040x}", 2);
+    let b = framed(&[
+        id.as_bytes(),
+        format!("{:040x}", 1).as_bytes(),
+        name.as_bytes(),
+        b"ann@example.invalid",
+        b"1700000002",
+        b"1700000102",
+        subject.as_bytes(),
+    ]);
+    let bytes = [a, b, c].concat();
+    for sizes in [&[64 << 10][..], &[3, 4093], &[1 << 20]] {
+        let git = Scripted::split(&bytes, sizes, Some(0));
+        let mut stream = scripted_stream(&git);
+        let page = stream.page(PAGE);
+        assert_eq!(page.end, PageEnd::AllLoaded, "{sizes:?}");
+        assert_eq!(page.rows.len(), 3);
+        assert_eq!(page.rows[0], first);
+        assert_eq!(page.rows[2], third);
+        let cut = &page.rows[1];
+        assert_eq!(cut.oid.as_str(), id);
+        let want_subject = format!("{}…", "s".repeat(parse::SUBJECT_CAP - 3));
+        assert_eq!(cut.subject, want_subject);
+        assert_eq!(
+            cut.author_name,
+            format!("{}…", "n".repeat(parse::NAME_CAP - 3))
+        );
+        assert_eq!(
+            (cut.author_time, cut.commit_time),
+            (1_700_000_002, 1_700_000_102)
+        );
+        assert_eq!(stream.bytes_read(), bytes.len() as u64);
+    }
+}
+
+/// The same through git: a commit whose subject is one 200 KiB line, between two normal commits,
+/// gives three rows, the middle one's subject cut and marked, and the log reads on to its end.
+#[test]
+fn a_200_kib_subject_from_git_is_cut_and_the_log_goes_on() {
+    let Some(git) = TestGit::local() else { return };
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    sh(dir, &["init", "-q", "-b", "main"]);
+    sh_at(
+        dir,
+        1_700_000_000,
+        &["commit", "-q", "--allow-empty", "-m", "before"],
+    );
+    let long = format!("{}\n\nthe body\n", "s".repeat(200 << 10));
+    sh_with(
+        dir,
+        1_700_000_060,
+        &[],
+        &["commit", "-q", "--allow-empty", "-F", "-"],
+        long.as_bytes(),
+    );
+    sh_at(
+        dir,
+        1_700_000_120,
+        &["commit", "-q", "--allow-empty", "-m", "after"],
+    );
+    let top = real(dir);
+    let roots = load_roots(&git, &top);
+    let generation = Generation::new();
+    let load = generation.bump();
+    let mut stream = LogStream::start(
+        &git,
+        &top,
+        &LogOptions::default(),
+        &roots,
+        &generation,
+        load,
+    )
+    .unwrap();
+    let page = stream.page(PAGE);
+    assert_eq!(page.end, PageEnd::AllLoaded);
+    let subjects: Vec<&str> = page.rows.iter().map(|r| r.subject.as_str()).collect();
+    let cut = format!("{}…", "s".repeat(parse::SUBJECT_CAP - 3));
+    assert_eq!(subjects, ["after", cut.as_str(), "before"]);
+}
+
+/// Review round 1, item 4: a record the stream ends inside (cut mid-subject, no NUL) is no row,
+/// whatever git's exit: exit 0 is a framing error; a failed git reports its exit.
+#[test]
+fn a_record_cut_by_the_end_of_the_stream_is_no_row() {
+    let mut whole = Vec::new();
+    for n in 1..=3 {
+        whole.extend(sample(n, false).1);
+    }
+    let cut = sample(4, false).1;
+    let cut = &cut[..cut.len() - 5];
+    for code in [Some(0), Some(1)] {
+        let mut bytes = whole.clone();
+        bytes.extend_from_slice(cut);
+        let git = Scripted::new(vec![bytes], 0, code);
+        let mut stream = scripted_stream(&git);
+        let page = stream.page(PAGE);
+        assert_eq!(
+            page.rows.len(),
+            3,
+            "exit {code:?}: the cut record published a row"
+        );
+        let PageEnd::Error(why) = &page.end else {
+            panic!("{:?}", page.end);
+        };
+        match code {
+            Some(0) => assert!(
+                why.contains("record 4") && why.contains("cut short"),
+                "{why}"
+            ),
+            _ => assert!(why.contains("exited with 1"), "{why}"),
+        }
+    }
 }

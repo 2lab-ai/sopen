@@ -4,7 +4,7 @@
 //! what git prints, names that are not UTF-8, the caps, and records cut short or garbled — each
 //! an answer or an error, never a panic.
 
-use super::history::{oid, real, rev_list, sh, sh_at, sh_with, TestGit};
+use super::history::{framed, oid, real, rev_list, sh, sh_at, sh_with, TestGit};
 use crate::git::history::{self, Generation, LogOptions, LogStream, PageEnd, PAGE};
 use crate::git::model::*;
 use crate::git::parse::{self, NAME_CAP, SUBJECT_CAP};
@@ -534,80 +534,352 @@ fn cut_keeps_characters_whole() {
     assert_eq!(parse::cut("한".into(), 0), "");
 }
 
-/// The log record (03 §4.1): the fields, a stray `\x1f` in the subject, text that is not UTF-8,
-/// the 256-byte and 1 KiB cuts at a character boundary; and the records that do not parse.
+/// The log record (03 §4.1): the fields, a unit separator in the name, email and subject, text
+/// that is not UTF-8, the 256-byte and 1 KiB cuts at a character boundary; and the records that
+/// do not parse — a field too few or too many, a hash, a parent or a date that is not one.
 #[test]
 fn commit_records() {
-    let rec = format!(
-        "{}\x1f{} {}\x1fAnn\x1fann@x\x1f1700000000\x1f1700000060\x1fa\x1fb",
-        id('a'),
-        id('b'),
-        id('c')
-    );
-    let row = parse::commit_record(rec.as_bytes()).unwrap();
+    // `commit_record` takes a record without the NUL `-z` ends it with.
+    let rec = |fields: &[&[u8]]| {
+        let mut r = framed(fields);
+        r.pop();
+        r
+    };
+    let (a, b, c) = (id('a'), id('b'), id('c'));
+    let parents = format!("{b} {c}");
+    let fields: [&[u8]; 7] = [
+        a.as_bytes(),
+        parents.as_bytes(),
+        b"Ann\x1fAlias",
+        b"ann\x1f@x",
+        b"1700000000",
+        b"1700000060",
+        b"a\x1fb",
+    ];
+    let row = parse::commit_record(&rec(&fields)).unwrap();
     assert_eq!(
         row,
         CommitRow {
-            oid: oid(&id('a')),
-            parents: vec![oid(&id('b')), oid(&id('c'))],
-            author_name: "Ann".into(),
-            author_email: "ann@x".into(),
+            oid: oid(&a),
+            parents: vec![oid(&b), oid(&c)],
+            author_name: "Ann\u{1f}Alias".into(),
+            author_email: "ann\u{1f}@x".into(),
             author_time: 1_700_000_000,
             commit_time: 1_700_000_060,
             subject: "a\u{1f}b".into(),
         }
     );
-    let root = format!("{}\x1f\x1fAnn\x1f\x1f0\x1f0\x1f", id('a'));
-    let row = parse::commit_record(root.as_bytes()).unwrap();
+    let root = rec(&[a.as_bytes(), b"", b"Ann", b"", b"0", b"0", b""]);
+    let row = parse::commit_record(&root).unwrap();
     assert!(row.parents.is_empty() && row.subject.is_empty() && row.author_email.is_empty());
 
     let long_name = format!("{}한한", "n".repeat(NAME_CAP - 1));
-    let long_subject = format!("{}é", "s".repeat(SUBJECT_CAP - 1));
-    let mut rec = format!("{}\x1f\x1f{long_name}\x1f", id('a')).into_bytes();
-    rec.extend_from_slice(b"e\xffmail\x1f1\x1f2\x1f");
-    rec.extend_from_slice(long_subject.as_bytes());
-    let row = parse::commit_record(&rec).unwrap();
-    assert_eq!(row.author_name, "n".repeat(NAME_CAP - 1));
+    let long_subject = format!("{}é{}", "s".repeat(SUBJECT_CAP - 1), "t".repeat(5000));
+    let row = parse::commit_record(&rec(&[
+        a.as_bytes(),
+        b"",
+        long_name.as_bytes(),
+        b"e\xffmail",
+        b"1",
+        b"2",
+        long_subject.as_bytes(),
+    ]))
+    .unwrap();
+    // A cut field is marked: cut to 3 bytes under its cap, then `…`.
+    assert_eq!(row.author_name, format!("{}…", "n".repeat(NAME_CAP - 3)));
     assert_eq!(row.author_email, "e\u{fffd}mail");
-    assert_eq!(row.subject, "s".repeat(SUBJECT_CAP - 1));
+    assert_eq!(row.subject, format!("{}…", "s".repeat(SUBJECT_CAP - 3)));
+    let exact_cap = "s".repeat(SUBJECT_CAP);
+    let at_cap = parse::commit_record(&rec(&[
+        a.as_bytes(),
+        b"",
+        b"A",
+        b"a",
+        b"1",
+        b"2",
+        exact_cap.as_bytes(),
+    ]))
+    .unwrap();
+    assert_eq!(at_cap.subject, exact_cap, "a field at its cap is not cut");
 
-    let sha256 = format!(
-        "{}\x1f{}\x1fA\x1fa\x1f1\x1f1\x1fs",
-        "4f".repeat(32),
-        "5e".repeat(32)
-    );
-    assert_eq!(
-        parse::commit_record(sha256.as_bytes())
-            .unwrap()
-            .parents
-            .len(),
-        1
-    );
+    let (h256, p256) = ("4f".repeat(32), "5e".repeat(32));
+    let sha256 = rec(&[
+        h256.as_bytes(),
+        p256.as_bytes(),
+        b"A",
+        b"a",
+        b"1",
+        b"1",
+        b"s",
+    ]);
+    assert_eq!(parse::commit_record(&sha256).unwrap().parents.len(), 1);
 
+    let two = format!("{b}  {c}");
+    let upper = a.to_uppercase();
+    // Past the parents' cap (64 KiB: an octopus of about 1 600 parents).
+    let many_parents = vec![b.as_str(); 1700].join(" ");
+    let trailing = format!("{b} ");
     let bad: Vec<Vec<u8>> = vec![
         b"".to_vec(),
-        id('a').into_bytes(),
-        format!("{}\x1f\x1fA\x1fa\x1f1\x1f1", id('a')).into_bytes(),
-        b"XYZ\x1f\x1fA\x1fa\x1f1\x1f1\x1fs".to_vec(),
-        format!("{}\x1fnope\x1fA\x1fa\x1f1\x1f1\x1fs", id('a')).into_bytes(),
-        format!(
-            "{}\x1f{}  {}\x1fA\x1fa\x1f1\x1f1\x1fs",
-            id('a'),
-            id('b'),
-            id('c')
-        )
-        .into_bytes(),
-        format!("{}\x1f\x1fA\x1fa\x1fsoon\x1f1\x1fs", id('a')).into_bytes(),
-        format!("{}\x1f\x1fA\x1fa\x1f1\x1f\x1fs", id('a')).into_bytes(),
-        b"\xff\xfe\x1f\x1f\x1f\x1f\x1f\x1f".to_vec(),
+        a.clone().into_bytes(),
+        rec(&[a.as_bytes(), b"", b"A", b"a", b"1", b"1"]),
+        rec(&[a.as_bytes(), b"", b"A", b"a", b"1", b"1", b"s", b"extra"]),
+        rec(&[b"XYZ", b"", b"A", b"a", b"1", b"1", b"s"]),
+        rec(&[upper.as_bytes(), b"", b"A", b"a", b"1", b"1", b"s"]),
+        rec(&[a.as_bytes(), b"nope", b"A", b"a", b"1", b"1", b"s"]),
+        rec(&[a.as_bytes(), two.as_bytes(), b"A", b"a", b"1", b"1", b"s"]),
+        rec(&[
+            a.as_bytes(),
+            trailing.as_bytes(),
+            b"A",
+            b"a",
+            b"1",
+            b"1",
+            b"s",
+        ]),
+        rec(&[a.as_bytes(), b"", b"A", b"a", b"soon", b"1", b"s"]),
+        rec(&[a.as_bytes(), b"", b"A", b"a", b"1", b"", b"s"]),
+        rec(&[a.as_bytes(), b"", b"A", b"a", b"+1", b"1", b"s"]),
+        rec(&[a.as_bytes(), b"", b"A", b"a", b"1", b" 1", b"s"]),
+        rec(&[a.as_bytes(), b"", b"A", b"a", b"-1", b"1", b"s"]),
+        rec(&[
+            a.as_bytes(),
+            b"",
+            b"A",
+            b"a",
+            b"99999999999999999999",
+            b"1",
+            b"s",
+        ]),
+        rec(&[b"\xff\xfe", b"", b"", b"", b"", b"", b""]),
+        rec(&[
+            a.as_bytes(),
+            b"",
+            b"A",
+            b"a",
+            b"1",
+            b"1".repeat(21).as_slice(),
+            b"s",
+        ]),
+        rec(&[
+            a.as_bytes(),
+            many_parents.as_bytes(),
+            b"A",
+            b"a",
+            b"1",
+            b"1",
+            b"s",
+        ]),
     ];
-    for rec in bad {
+    for r in bad {
         assert!(
-            parse::commit_record(&rec).is_err(),
+            parse::commit_record(&r).is_err(),
             "{:?}",
-            String::from_utf8_lossy(&rec)
+            String::from_utf8_lossy(&r)
         );
     }
+}
+
+/// Review round 1, item 5: a capped field is decoded only up to its cap, with the same result as
+/// decoding it whole and cutting — a multibyte character, a byte that is not UTF-8 and a
+/// character cut by the cap included; a cut field ends in `…` and stays within its cap.
+#[test]
+fn capped_text_decodes_only_up_to_the_cap() {
+    let long = "x".repeat(10_000);
+    let cases: Vec<(Vec<u8>, usize)> = vec![
+        (b"".to_vec(), 4),
+        (b"abc".to_vec(), 4),
+        (long.clone().into_bytes(), 256),
+        (format!("{}한한", "n".repeat(255)).into_bytes(), 256),
+        (
+            format!("{}\u{1f600}tail", "n".repeat(254)).into_bytes(),
+            256,
+        ),
+        (
+            [
+                b"n".repeat(255),
+                b"\xff\xfe\xfd".to_vec(),
+                long.clone().into_bytes(),
+            ]
+            .concat(),
+            256,
+        ),
+        (
+            [b"n".repeat(250), b"\xe2\x82".to_vec(), long.into_bytes()].concat(),
+            256,
+        ),
+        (b"\xf0\x9f\x98".to_vec(), 4),
+        (b"abcd".to_vec(), 3),
+    ];
+    for (bytes, cap) in cases {
+        let decoded = String::from_utf8_lossy(&bytes).into_owned();
+        let whole = if decoded.len() <= cap {
+            decoded
+        } else {
+            format!("{}…", parse::cut(decoded, cap.saturating_sub(3)))
+        };
+        let got = parse::capped(&bytes, cap);
+        assert!(got.len() <= cap, "{got:?}");
+        assert_eq!(got, whole, "{:?}", &bytes[..bytes.len().min(16)]);
+    }
+}
+
+/// Review round 1, item 1: a unit separator in an author's or committer's name and email, and in
+/// a subject, shifts no field — through the live log stream and details read; a message with a
+/// NUL inside is printed by git up to the NUL, and the records after it still parse.
+#[test]
+fn identity_fields_never_shift() {
+    let Some(git) = TestGit::local() else { return };
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("repo");
+    std::fs::create_dir(&dir).unwrap();
+    sh(&dir, &["init", "-q", "-b", "main"]);
+    let base = commit(&dir, 1_700_000_000, &[("a.txt", "a\n")], "base");
+    let tree = sh(&dir, &["rev-parse", "HEAD^{tree}"]);
+    let odd = format!(
+        "tree {tree}\nparent {base}\n\
+         author Alice\u{1f}alias <alice\u{1f}x@example.invalid> 1700000100 +0000\n\
+         committer Bob\u{1f}by <bob@example.invalid> 1700000200 +0000\n\n\
+         subject\u{1f}with a unit\n\nbody\n"
+    );
+    let hash = ["hash-object", "-t", "commit", "-w", "--stdin"];
+    let odd = sh_with(&dir, 0, &[], &hash, odd.as_bytes());
+    let mut nul = format!(
+        "tree {tree}\nparent {odd}\n\
+         author Ann <ann@example.invalid> 1700000300 +0000\n\
+         committer Ann <ann@example.invalid> 1700000300 +0000\n\nbefore"
+    )
+    .into_bytes();
+    nul.extend_from_slice(b"\0after\x1fmore\n\nbody\0tail\n");
+    // fsck refuses a NUL in a commit; a remote repository may still hold one.
+    let literally = [
+        "hash-object",
+        "-t",
+        "commit",
+        "-w",
+        "--stdin",
+        "--literally",
+    ];
+    let nul = sh_with(&dir, 0, &[], &literally, &nul);
+    sh(&dir, &["update-ref", "refs/heads/main", &nul]);
+    let top = real(&dir);
+
+    let generation = Generation::new();
+    let load = generation.bump();
+    let roots = [oid(&nul)];
+    let mut stream = LogStream::start(
+        &git,
+        &top,
+        &LogOptions::default(),
+        &roots,
+        &generation,
+        load,
+    )
+    .unwrap();
+    let page = stream.page(PAGE);
+    assert_eq!(page.end, PageEnd::AllLoaded);
+    assert_eq!(page.rows.len(), 3);
+    assert_eq!(
+        (page.rows[0].oid.as_str(), page.rows[0].subject.as_str()),
+        (nul.as_str(), "before"),
+        "git prints a message up to its NUL"
+    );
+    assert_eq!(page.rows[0].parents, vec![oid(&odd)]);
+    assert_eq!(
+        page.rows[1],
+        CommitRow {
+            oid: oid(&odd),
+            parents: vec![oid(&base)],
+            author_name: "Alice\u{1f}alias".into(),
+            author_email: "alice\u{1f}x@example.invalid".into(),
+            author_time: 1_700_000_100,
+            commit_time: 1_700_000_200,
+            subject: "subject\u{1f}with a unit".into(),
+        }
+    );
+    assert_eq!(page.rows[2].oid.as_str(), base);
+
+    let d = history::details(&git, &top, &oid(&odd)).unwrap();
+    assert_eq!(
+        (
+            d.author_name.as_str(),
+            d.author_email.as_str(),
+            d.author_time
+        ),
+        (
+            "Alice\u{1f}alias",
+            "alice\u{1f}x@example.invalid",
+            1_700_000_100
+        )
+    );
+    assert_eq!(
+        (
+            d.committer_name.as_str(),
+            d.committer_email.as_str(),
+            d.commit_time
+        ),
+        ("Bob\u{1f}by", "bob@example.invalid", 1_700_000_200)
+    );
+    assert_eq!(d.message, "subject\u{1f}with a unit\n\nbody\n");
+    let d = history::details(&git, &top, &oid(&nul)).unwrap();
+    assert_eq!((d.message.as_str(), d.message_lossy), ("before", false));
+}
+
+/// Review round 1, item 2: every read framed by a terminator refuses output whose last record
+/// lacks it (cut short), where a lenient reader would take the cut text as a whole name.
+#[test]
+fn a_read_cut_short_is_an_error() {
+    assert!(parse::status(b"? file").is_err());
+    assert!(parse::status(b"# branch.oid (initial)\0? file").is_err());
+    assert!(parse::status(b"# branch.oid (initial)\0? file\0").is_ok());
+    let rename = format!(
+        "2 R. N... 100644 100644 100644 {a} {a} R100 new\0old",
+        a = id('a')
+    );
+    assert!(parse::status(rename.as_bytes()).is_err());
+    assert!(parse::changed_files(b"M\0file", b"1\t1\tfile\0").is_err());
+    assert!(parse::changed_files(b"M\0file\0", b"1\t1\tfile").is_err());
+    assert!(parse::changed_files(b"R100\0old\0new", b"0\t0\t\0old\0new\0").is_err());
+    assert!(parse::changed_files(b"R100\0old\0new\0", b"0\t0\t\0old\0new").is_err());
+    assert!(parse::changed_files(b"M\0file\0", b"1\t1\tfile\0").is_ok());
+    let stash = format!(
+        "{}\x1f{} {}\x1fstash@{{0}}\x1f1\x1fWIP",
+        id('a'),
+        id('b'),
+        id('c')
+    );
+    assert!(parse::stashes(stash.as_bytes()).is_err());
+    assert!(parse::stashes(format!("{stash}\0").as_bytes()).is_ok());
+    let line = format!("{}\0commit\0\0refs/heads/main\0\0", id('a'));
+    assert!(parse::refs(line.as_bytes()).is_err());
+    assert!(parse::refs(format!("{line}\n").as_bytes()).is_ok());
+    let cut = parse::detection(
+        Some(0),
+        b"false\nfalse\nfalse\n/r/.git\n.git\n/r",
+        b"",
+        "/r",
+    );
+    assert!(
+        matches!(&cut, Detection::Unavailable(Unavailable::Failed(why)) if why.contains("cut short")),
+        "{cut:?}"
+    );
+    let a_line = format!("{}\n", id('a'));
+    assert!(parse::head((Some(0), b"refs/heads/ma"), (Some(0), a_line.as_bytes())).is_err());
+    assert!(parse::head((Some(1), b""), (Some(0), id('a').as_bytes())).is_err());
+    assert_eq!(parse::git_version(b"git version 2.5"), None);
+    let details = framed(&[
+        id('a').as_bytes(),
+        b"",
+        b"A",
+        b"a",
+        b"1",
+        b"C",
+        b"c",
+        b"2",
+        b"the message",
+    ]);
+    assert!(parse::details(&details).is_ok());
+    assert!(parse::details(&details[..details.len() - 1]).is_err());
 }
 
 /// The refs read's lines: each field, a ref name that is not UTF-8, and lines that do not parse.
@@ -894,30 +1166,75 @@ fn status_records() {
     }
 }
 
-/// The details record: every field, `%B` whole with a stray `\x1f`; and records that do not parse.
+/// The details record: every field, a unit separator in the names and `%B` kept whole; the
+/// message cap; and records that do not parse.
 #[test]
 fn details_records() {
-    let out = format!(
-        "{}\x1f{}\x1fAnn\x1fann@x\x1f10\x1fCarl\x1fcarl@x\x1f20\x1fsubject\n\nbody\x1fmore\n\0",
-        id('a'),
-        id('b')
-    );
-    let d = parse::details(out.as_bytes()).unwrap();
-    assert_eq!(d.parents, vec![oid(&id('b'))]);
+    let (a, b) = (id('a'), id('b'));
+    let out = framed(&[
+        a.as_bytes(),
+        b.as_bytes(),
+        b"Ann\x1fAlias",
+        b"ann@x",
+        b"10",
+        b"Carl\x1fC",
+        b"carl@x",
+        b"20",
+        b"subject\n\nbody\x1fmore\n",
+    ]);
+    let d = parse::details(&out).unwrap();
+    assert_eq!(d.parents, vec![oid(&b)]);
     assert_eq!((d.author_time, d.commit_time), (10, 20));
+    assert_eq!(d.author_name, "Ann\u{1f}Alias");
     assert_eq!(
         (d.committer_name.as_str(), d.committer_email.as_str()),
-        ("Carl", "carl@x")
+        ("Carl\u{1f}C", "carl@x")
     );
     assert_eq!(d.message, "subject\n\nbody\u{1f}more\n");
     assert!(!d.message_lossy);
+
+    // Item 5: past the cap, an error, never a message cut without saying so.
+    let big = "m".repeat(parse::DETAILS_CAP);
+    let fields = |message: &str| {
+        framed(&[
+            a.as_bytes(),
+            b"",
+            b"A",
+            b"a",
+            b"1",
+            b"C",
+            b"c",
+            b"2",
+            message.as_bytes(),
+        ])
+    };
+    assert!(parse::details(&fields(&big[..parse::DETAILS_CAP - 100])).is_ok());
+    let past = parse::details(&fields(&big)).unwrap_err();
+    assert!(past.0.contains("1 MiB"), "{past}");
+
     for bad in [
-        String::new(),
-        format!("{}\x1f\x1fA\x1fa\x1f1\x1fC\x1fc\x1f2\0", id('a')),
-        format!("{}\x1f\x1fA\x1fa\x1fx\x1fC\x1fc\x1f2\x1fm\0", id('a')),
-        "nope\x1f\x1fA\x1fa\x1f1\x1fC\x1fc\x1f2\x1fm\0".to_string(),
+        Vec::new(),
+        framed(&[a.as_bytes(), b"", b"A", b"a", b"1", b"C", b"c", b"2"]),
+        framed(&[a.as_bytes(), b"", b"A", b"a", b"x", b"C", b"c", b"2", b"m"]),
+        framed(&[b"nope", b"", b"A", b"a", b"1", b"C", b"c", b"2", b"m"]),
+        framed(&[
+            a.as_bytes(),
+            b"",
+            b"A",
+            b"a",
+            b"1",
+            b"C",
+            b"c",
+            b"2",
+            b"m",
+            b"extra",
+        ]),
     ] {
-        assert!(parse::details(bad.as_bytes()).is_err(), "{bad:?}");
+        assert!(
+            parse::details(&bad).is_err(),
+            "{:?}",
+            String::from_utf8_lossy(&bad)
+        );
     }
     assert_eq!(
         parse::object_id(format!("{}\n", id('4')).as_bytes()).unwrap(),

@@ -254,27 +254,42 @@ impl Detection {
 }
 
 /// The local git (03 §2.4) from `SOPEN_GIT` and `PATH` as given: `SOPEN_GIT` when set (an empty
-/// value is ignored; a path that does not exist is the runner's `NoGit`), else the first `git` on
-/// `path`. On macOS (`macos`), `/usr/bin/git` is the developer-tools shim: it counts only when
-/// `xcode_select_ok` (`xcode-select -p` succeeds), so sopen never makes macOS offer the tools.
+/// value is ignored; a bare name is looked up on `path`; a path that does not exist is the
+/// runner's `NoGit`), else the first `git` on `path`. On macOS (`macos`), `/usr/bin/git` is the
+/// developer-tools shim: whichever way it was chosen — `SOPEN_GIT`, `PATH`, or a link to it — it
+/// counts only when `xcode_select_ok` (`xcode-select -p` succeeds), so sopen never makes macOS
+/// offer the tools.
 pub fn local_git(
     sopen_git: Option<&OsStr>,
     path: Option<&OsStr>,
     macos: bool,
     xcode_select_ok: impl FnOnce() -> bool,
 ) -> Result<PathBuf, Unavailable> {
-    if let Some(chosen) = sopen_git.filter(|p| !p.is_empty()) {
-        return Ok(PathBuf::from(chosen));
+    let on_path = |name: &OsStr| {
+        std::env::split_paths(path?)
+            .filter(|dir| !dir.as_os_str().is_empty())
+            .map(|dir| dir.join(name))
+            .find(|candidate| executable(candidate))
+    };
+    let chosen = match sopen_git.filter(|p| !p.is_empty()) {
+        Some(named) if !named.as_encoded_bytes().contains(&b'/') => on_path(named),
+        Some(named) => Some(PathBuf::from(named)),
+        None => on_path(OsStr::new("git")),
     }
-    let found = std::env::split_paths(path.ok_or(Unavailable::NoGit)?)
-        .filter(|dir| !dir.as_os_str().is_empty())
-        .map(|dir| dir.join("git"))
-        .find(|candidate| executable(candidate))
-        .ok_or(Unavailable::NoGit)?;
-    if macos && found == Path::new("/usr/bin/git") && !xcode_select_ok() {
+    .ok_or(Unavailable::NoGit)?;
+    if macos && is_shim(&chosen) && !xcode_select_ok() {
         return Err(Unavailable::NoGit);
     }
-    Ok(found)
+    Ok(chosen)
+}
+
+/// `path` is macOS's `/usr/bin/git`, itself or through links.
+fn is_shim(path: &Path) -> bool {
+    let shim = Path::new("/usr/bin/git");
+    match (std::fs::canonicalize(path), std::fs::canonicalize(shim)) {
+        (Ok(real), Ok(real_shim)) => real == real_shim,
+        _ => path == shim,
+    }
 }
 
 fn executable(path: &Path) -> bool {

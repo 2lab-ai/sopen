@@ -88,10 +88,10 @@ pub trait Pipe: Send {
 }
 
 /// Every read's words, starting at the subcommand, exactly as 03 writes them — the one place
-/// S2-F checks against the runner. The only additions to 03's forms are the `--` after a
-/// revision (`details`, `name_status`, `numstat`): without it a work-tree file named like the
-/// hash makes git stop with `ambiguous argument … both revision and filename` (verified, git
-/// 2.56.1), as 03 §4.1's log form already ends in `--`.
+/// S2-F checks against the runner. `details`, `name_status` and `numstat` end in `--`: without
+/// it a work-tree file named like the hash makes git stop with `ambiguous argument … both
+/// revision and filename` (verified, git 2.56.1). The log and details forms end every field in
+/// NUL (`%x00`, `-z` ending the last), which git never prints inside one.
 pub mod argv {
     use super::{LogOptions, Oid};
 
@@ -164,7 +164,7 @@ pub mod argv {
     /// --stdin --`, the roots' ids on stdin.
     pub fn log(options: &LogOptions) -> Vec<String> {
         let mut w = words(&["log", "-z", options.order.flag()]);
-        w.push("--format=%H%x1f%P%x1f%aN%x1f%aE%x1f%at%x1f%ct%x1f%s".into());
+        w.push("--format=%H%x00%P%x00%aN%x00%aE%x00%at%x00%ct%x00%s".into());
         if options.first_parent {
             w.push("--first-parent".into());
         }
@@ -181,7 +181,7 @@ pub mod argv {
             "log",
             "-1",
             "-z",
-            "--format=%H%x1f%P%x1f%aN%x1f%aE%x1f%at%x1f%cN%x1f%cE%x1f%ct%x1f%B",
+            "--format=%H%x00%P%x00%aN%x00%aE%x00%at%x00%cN%x00%cE%x00%ct%x00%B",
         ]);
         w.push(c.as_str().into());
         w.push("--".into());
@@ -479,9 +479,11 @@ pub struct LogStream {
     generation: u64,
     current: Generation,
     pipe: Option<Box<dyn Pipe>>,
-    /// Bytes read from the pipe and not parsed yet (`buf[at..]`).
+    /// The last pipe read, taken up to `at`.
     buf: Vec<u8>,
     at: usize,
+    /// The record being read.
+    record: Partial,
     rows: usize,
     bytes: u64,
     /// How the stream ended, once it has: every later page ends the same way, with no rows.
@@ -490,6 +492,23 @@ pub struct LogStream {
 
 /// How much is asked of the pipe at a time.
 const CHUNK: usize = 64 << 10;
+
+/// The most bytes one log record may run past its fields' caps (review round 1): a field past
+/// its cap is read to its end and dropped ([`parse::FIELD_KEEP`]), so memory stays at the caps;
+/// a record that drops more than this — output that never ends a field — ends the stream with
+/// an error.
+pub const DROPPED_CAP: usize = 16 << 20;
+
+/// The record being read: its fields so far and the one being read, each kept up to its cap.
+#[derive(Default)]
+struct Partial {
+    fields: Vec<Vec<u8>>,
+    field: Vec<u8>,
+    /// Bytes dropped past the caps.
+    dropped: usize,
+    /// A byte of it has been read.
+    started: bool,
+}
 
 impl LogStream {
     /// Starts the log for the load `generation` of `current`, `roots` on stdin, one id a line.
@@ -521,6 +540,7 @@ impl LogStream {
             pipe: Some(pipe),
             buf: Vec::new(),
             at: 0,
+            record: Partial::default(),
             rows: 0,
             bytes: 0,
             finished: None,
@@ -528,9 +548,12 @@ impl LogStream {
     }
 
     /// The next `n` records (03 §4.5: [`PAGE`]), blocking until they came or the stream ended.
-    /// Only whole records are parsed; what the pipe gave past the n-th waits for the next page.
-    /// Between records it checks the load's generation: once superseded, the rows read so far
-    /// are dropped and git is stopped.
+    /// Only whole records are parsed — [`parse::RECORD_FIELDS`] fields, each ending in NUL —
+    /// and what the pipe gave past the n-th waits for the next page. A name, email or subject
+    /// past its cap is read to its end and cut (`…`); a record that drops more than
+    /// [`DROPPED_CAP`], whose other fields run past theirs, or that the stream ends inside, ends
+    /// the stream with an error and is no row. Between records it checks the load's generation: once superseded, the rows read so
+    /// far are dropped and git is stopped.
     pub fn page(&mut self, n: usize) -> Page {
         let mut rows = Vec::new();
         let end = match &self.finished {
@@ -561,27 +584,25 @@ impl LogStream {
             if rows.len() >= n {
                 return PageEnd::More;
             }
-            if let Some(len) = self.buf[self.at..].iter().position(|&b| b == 0) {
-                let record = &self.buf[self.at..self.at + len];
-                match parse::commit_record(record) {
-                    Ok(row) => rows.push(row),
-                    Err(e) => return PageEnd::Error(format!("record {}: {e}", self.rows + 1)),
+            match self.take() {
+                Some(Ok(row)) => {
+                    rows.push(row);
+                    self.rows += 1;
+                    continue;
                 }
-                self.at += len + 1;
-                self.rows += 1;
-                continue;
+                Some(Err(e)) => return PageEnd::Error(format!("record {}: {e}", self.rows + 1)),
+                None => {}
             }
             let Some(pipe) = self.pipe.as_mut() else {
                 return PageEnd::Error("the stream was stopped".into());
             };
-            self.buf.drain(..self.at);
+            self.buf.clear();
             self.at = 0;
-            let had = self.buf.len();
-            self.buf.resize(had + CHUNK, 0);
-            let read = pipe.read(&mut self.buf[had..]);
-            self.buf.truncate(had + *read.as_ref().unwrap_or(&0));
+            self.buf.resize(CHUNK, 0);
+            let read = pipe.read(&mut self.buf);
+            self.buf.truncate(*read.as_ref().unwrap_or(&0));
             match read {
-                Ok(0) => return self.end_of_stdout(rows),
+                Ok(0) => return self.end_of_stdout(),
                 Ok(k) => self.bytes += k as u64,
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
                 Err(e) => return PageEnd::Error(format!("reading git log: {e}")),
@@ -589,23 +610,59 @@ impl LogStream {
         }
     }
 
-    /// stdout ended: a last record without its NUL, then git's exit.
-    fn end_of_stdout(&mut self, rows: &mut Vec<CommitRow>) -> PageEnd {
+    /// Takes the last read's bytes into the record being read, each byte looked at once: a
+    /// whole record, its error, or `None` once the read is used up.
+    fn take(&mut self) -> Option<Result<CommitRow, String>> {
+        while self.at < self.buf.len() {
+            let index = self.record.fields.len();
+            let rest = &self.buf[self.at..];
+            let (piece, ends) = match rest.iter().position(|&b| b == 0) {
+                Some(i) => (&rest[..i], true),
+                None => (rest, false),
+            };
+            self.at += piece.len() + usize::from(ends);
+            self.record.started = true;
+            let keep = parse::FIELD_KEEP[index];
+            let taken = piece.len().min(keep - self.record.field.len());
+            self.record.field.extend_from_slice(&piece[..taken]);
+            if taken < piece.len() {
+                if !parse::FIELD_CUT[index] {
+                    let what = parse::FIELD_NAMES[index];
+                    return Some(Err(format!("{what} is longer than {keep} bytes")));
+                }
+                self.record.dropped += piece.len() - taken;
+                if self.record.dropped > DROPPED_CAP {
+                    let cap = DROPPED_CAP >> 20;
+                    return Some(Err(format!("more than {cap} MiB past its fields' caps")));
+                }
+            }
+            if ends {
+                let field = std::mem::take(&mut self.record.field);
+                self.record.fields.push(field);
+                if self.record.fields.len() == parse::RECORD_FIELDS {
+                    let record = std::mem::take(&mut self.record);
+                    let f = std::array::from_fn(|i| record.fields[i].as_slice());
+                    return Some(parse::commit_fields(f).map_err(|e| e.to_string()));
+                }
+            }
+        }
+        None
+    }
+
+    /// stdout ended: git's exit. A record the stream ended inside is no row, whatever the exit.
+    fn end_of_stdout(&mut self) -> PageEnd {
         let ran = match self.pipe.take() {
             Some(mut pipe) => pipe.finish(),
             None => Ran::default(),
         };
-        let tail = &self.buf[self.at..];
-        if !tail.is_empty() {
-            match parse::commit_record(tail) {
-                Ok(row) => rows.push(row),
-                Err(e) => return PageEnd::Error(format!("record {}: {e}", self.rows + 1)),
-            }
-            self.rows += 1;
-        }
+        let cut = std::mem::take(&mut self.record).started;
         self.buf.clear();
         self.at = 0;
         match ran.code {
+            Some(0) if cut => PageEnd::Error(format!(
+                "record {}: cut short, the stream ended inside it",
+                self.rows + 1
+            )),
             Some(0) => PageEnd::AllLoaded,
             Some(c) => PageEnd::Error(format!(
                 "git log exited with {c}: {}",

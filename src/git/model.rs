@@ -139,7 +139,7 @@ impl Head {
 }
 
 /// One commit of the log stream: 03 §4.1's record,
-/// `%H%x1f%P%x1f%aN%x1f%aE%x1f%at%x1f%ct%x1f%s`, holding what 03 §4.5 says a row stores. Its
+/// `%H%x00%P%x00%aN%x00%aE%x00%at%x00%ct%x00%s`, holding what 03 §4.5 says a row stores. Its
 /// lanes and node segments are not here: they are the lane layout's (`graph`, S2-C).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommitRow {
@@ -282,7 +282,7 @@ pub struct AheadBehind {
 }
 
 /// A commit's summary in the details pane (03 §6.1), from `log -1 -z
-/// --format=%H%x1f%P%x1f%aN%x1f%aE%x1f%at%x1f%cN%x1f%cE%x1f%ct%x1f%B <c> --`.
+/// --format=%H%x00%P%x00%aN%x00%aE%x00%at%x00%cN%x00%cE%x00%ct%x00%B <c> --`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommitDetails {
     /// `%H`.
