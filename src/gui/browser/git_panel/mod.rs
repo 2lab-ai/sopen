@@ -31,10 +31,13 @@ mod graph_view;
 mod in_progress;
 mod log_view;
 mod menu;
+mod planner;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
 mod tests_s3;
+#[cfg(test)]
+mod tests_s4;
 
 pub use details::{Details, FileGroup, FileRow, Group, Summary};
 pub use dialogs::Prefill;

@@ -13,6 +13,8 @@
 //! - [`actions`]: every action of 03 §7.1–§7.7 as a pure plan, and the in-progress banner (§8.5;
 //!   S3-A).
 //! - [`backup`]: backups, manifests, restore and undo (03 §8.2–§8.3; S3-A).
+//! - [`rebase`]: the history edits of 03 §7.8, the quick edits and the planner, as plans of
+//!   `actions` (S4-A).
 //!
 //! S2-0 scaffold: the `mod` lines, the tests' among them, so no unit edits this file for its
 //! tests. S3's scaffold added `actions` and `backup`; S4's adds `rebase` (02 §5).
@@ -24,6 +26,7 @@ pub mod graph;
 pub mod history;
 pub mod model;
 pub mod parse;
+pub mod rebase;
 pub mod runner;
 
 /// Each unit's tests, in a file of its own (02 §5): `src/git/tests/<module>.rs`.
@@ -36,5 +39,6 @@ mod tests {
     mod history;
     mod model;
     mod parse;
+    mod rebase;
     mod runner;
 }

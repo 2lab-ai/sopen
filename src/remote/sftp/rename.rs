@@ -834,14 +834,24 @@ impl SftpRemote {
     /// needed: to a new local `sftp-server`, its request log (`-e -l INFO`) at `log`. `opened`
     /// counts the opens.
     pub(crate) fn with_local_plain(
+        self,
+        log: Option<&Path>,
+        opened: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) -> Self {
+        self.with_local_plain_tapped(log, opened, Tap::Off)
+    }
+
+    /// [`SftpRemote::with_local_plain`], the channel behind `tap`.
+    fn with_local_plain_tapped(
         mut self,
         log: Option<&Path>,
         opened: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        tap: Tap,
     ) -> Self {
         let log = log.map(Path::to_path_buf);
         self.plain = Slot::Closed(Box::new(move || {
             opened.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            Plain::local_server(&[], log.as_deref(), Tap::Off)
+            Plain::local_server(&[], log.as_deref(), tap)
                 .ok_or_else(|| anyhow!("no sftp-server on this machine"))
         }));
         self
@@ -1043,6 +1053,105 @@ mod tests {
         let e = fs.publish_probe(root.to_str().unwrap()).unwrap_err();
         assert!(format!("{e:#}").contains(why), "{e:#}");
         assert_eq!(opened.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// Each session keeps its own probe verdict (04 §5.6: once per SFTP session): of two sessions
+    /// at once, one whose channel's rename replaces (behind the tap that answers done) refuses
+    /// every copy, and the other, whose server refuses, publishes — asked again, each says the
+    /// same without probing again (one probe folder each), and each opened its channel once.
+    #[test]
+    fn two_sessions_keep_their_own_probe_verdicts() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let tmp = tempfile::tempdir().unwrap();
+        let (log_a, log_b) = (tmp.path().join("a.log"), tmp.path().join("b.log"));
+        let (Some(a), Some(b)) = (
+            SftpRemote::local_server_args(&[], Some(&log_a)),
+            SftpRemote::local_server_args(&[], Some(&log_b)),
+        ) else {
+            return;
+        };
+        let (opened_a, opened_b) = (
+            std::sync::Arc::new(AtomicUsize::new(0)),
+            std::sync::Arc::new(AtomicUsize::new(0)),
+        );
+        let mut a = a.with_local_plain_tapped(None, opened_a.clone(), Tap::AnswerDone);
+        let mut b = b.with_local_plain_tapped(None, opened_b.clone(), Tap::Off);
+        let dir = std::fs::canonicalize(tmp.path()).unwrap().join("target");
+        std::fs::create_dir(&dir).unwrap();
+        let dir = dir.to_str().unwrap();
+        let verdict = |fs: &SftpRemote| match &fs.plain {
+            Slot::Open(plain) => plain.verdict,
+            _ => None,
+        };
+        for round in 0..2 {
+            let refused = a.probe(dir).unwrap_err();
+            assert!(
+                format!("{refused:#}").contains(REPLACES),
+                "{round}: {refused:#}"
+            );
+            assert_eq!(b.probe(dir).unwrap(), Vec::<String>::new(), "{round}");
+            assert_eq!(verdict(&a), Some(Verdict::Replaces), "{round}");
+            assert_eq!(verdict(&b), Some(Verdict::Refuses), "{round}");
+        }
+        drop((a, b));
+        for log in [&log_a, &log_b] {
+            let text = std::fs::read_to_string(log).unwrap();
+            assert_eq!(text.matches("mkdir name").count(), 1, "one probe: {text}");
+        }
+        assert_eq!(opened_a.load(Ordering::SeqCst), 1);
+        assert_eq!(opened_b.load(Ordering::SeqCst), 1);
+        assert_eq!(std::fs::read_dir(dir).unwrap().count(), 0, "nothing left");
+    }
+
+    /// Dropping a session whose channel was opened ends that channel: its subsystem's process
+    /// (here the test's `sftp-server`; over ssh, the `ssh` child) exits, within 5 s.
+    #[test]
+    fn dropping_a_session_ends_its_plain_rename_channel() {
+        use crate::remote::ops::FileOps;
+        let Some(session) = SftpRemote::local_server() else {
+            return;
+        };
+        let opened = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut fs = session.with_local_plain(None, opened);
+        let tmp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        std::fs::create_dir(root.join("a")).unwrap();
+        let at = |n: &str| root.join(n).to_str().unwrap().to_string();
+        assert!(matches!(
+            fs.rename_new(&at("a"), &at("b")),
+            Ok(Renamed::Moved)
+        ));
+        let pid = match &fs.plain {
+            Slot::Open(plain) => plain
+                ._keep
+                .downcast_ref::<tokio::process::Child>()
+                .and_then(tokio::process::Child::id)
+                .expect("the channel's server"),
+            _ => panic!("the channel is open"),
+        };
+        let pid = libc::pid_t::try_from(pid).unwrap();
+        // SAFETY: signal 0 only asks whether the process exists.
+        assert_eq!(
+            unsafe { libc::kill(pid, 0) },
+            0,
+            "it runs while the session lives"
+        );
+        drop(fs);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let mut status = 0;
+            // SAFETY: our own child, not waited for elsewhere once its handle is dropped (a
+            // reaper that got there first makes this ECHILD: gone too).
+            let reaped = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+            if reaped == pid || reaped == -1 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the channel's server outlived its session"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
     }
 
     /// Live, by hand only — tests never need ssh: the plain rename over a real ssh master, the

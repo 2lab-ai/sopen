@@ -742,15 +742,19 @@ shown in their confirmation.
 | id | Action (key) | Options | The plan |
 |---|---|---|---|
 | `reword` | Reword… (F2 on a commit) | the message, prefilled | HEAD: `commit --amend --only --allow-empty --cleanup=verbatim -F -` (no plan; *inventory §7, verified there with git 2.56.1: a staged file stays staged*); older: `pick <c>` + the message line |
-| `author` | Author and date… | author name, email, author date (prefilled); committer date: keep (default) / now / same as the author date | HEAD: `commit --amend --only --allow-empty --no-edit --author=<a> --date=<d>` with `GIT_COMMITTER_DATE` per the choice; older: `pick <c>` + the author line |
-| `squash` | Squash into the commit below… | the message: both messages, the older first, a blank line between, editable | `pick <parent>`, `fixup <c>`, the message line |
+| `author` | Author and date… | author name, email, author date (prefilled); committer date: keep (default) / now / same as the author date | HEAD: `commit --amend --only --allow-empty --cleanup=verbatim -F - --author=<a> --date=<d>`, the commit's own message on stdin, with `GIT_COMMITTER_DATE` per the choice — not `--no-edit`, which cleans the message up again: trailing spaces and blank lines went, and with `--cleanup=verbatim` a leading blank line still went (*verified, git 2.56.1*); older: `pick <c>` + the author line. A commit whose message is not valid UTF-8 is refused, as for `reword`: its bytes could not be kept (see the checks, §7.8.2) |
+| `squash` | Squash into the commit below… | the message: both messages, the older first, a blank line between, editable — each whole, byte for byte, the blank line added after the older one's last line (`rebase::squash_message`, the planner pane's and the todo's one rule) | `pick <parent>`, `fixup <c>`, the message line |
 | `fixup` | Fix up into the commit below | — | `pick <parent>`, `fixup <c>` (the older message stays) |
 | `move-up`, `move-down` | Move up / Move down | — | the two lines swapped |
 | `drop` | Drop… (F8 on a commit) | — | `drop <c>` (any commit in the range, not only a chain ending at HEAD) |
 | `edit` | Stop here to edit… | — | `edit <c>`: the run stops after `<c>`; the banner (§8.5) offers Amend, Split, Continue, Abort |
-| `split` | Split… | — (refused on a root commit: it has no `HEAD^`, *verified*) | `edit <c>`; at the stop sopen records the commit's paths (`diff --name-only -z <c>^1 <c>`) and runs `reset HEAD^` (mixed): the commit's changes are now in the uncommitted row — files it added as **untracked** — to be committed in parts (file by file: stage, Commit…). sopen's Continue is refused while any recorded path still differs from HEAD (`status --porcelain=v2 -z --untracked-files=all -- <paths>` not empty): git itself would continue and leave an added file out of history, untracked (*verified, git 2.56.1*). Parts finer than a file are not offered (§10.2). |
-| `fold` | Fold the staged changes into this commit… | — | `commit --fixup=<c>` (git's own `fixup! <subject>` message, no editor *(estimate)*), then the new commit's line moved right after `<c>` as `fixup` |
+| `split` | Split… | — (refused on a root commit: it has no `HEAD^`, *verified*) | `edit <c>`; at the stop sopen records the commit's paths (`diff-tree -r -z --name-only --no-renames <c>^1 <c>`: both names of a rename — `diff --name-only` named only the new one, and Continue then let the old name's deletion stay uncommitted, *verified, git 2.56.1*) and runs `reset --mixed <c>^1` (the parent by its hash; backup `detached`, undone in its own mode, §8.3): the commit's changes are now in the uncommitted row — files it added as **untracked** — to be committed in parts (file by file: stage, Commit…). Split is refused away from an edit stop at `<c>` — a rebase stopped by a conflict or a failed `exec` line is not one: the last line done must be `edit` (*verified, git 2.56.1*: a stop at a message line a `commit-msg` hook refused) — on a commit that changes no file, and with uncommitted changes at the stop. sopen's Continue is refused while any recorded path still differs from HEAD (`status --porcelain=v2 -z --untracked-files=all --ignored -- <paths>` not empty): git itself would continue and leave an added file out of history, untracked (*verified, git 2.56.1*); without `--ignored`, an added file that `.gitignore` matches did not show and Continue went ahead without it (*verified, git 2.56.1*). Parts finer than a file are not offered (§10.2). |
+| `fold` | Fold the staged changes into this commit… | — (refused with nothing staged) | `commit --fixup=<c>` (git's own `fixup! <subject>` message, no editor, *verified, git 2.56.1* under `GIT_EDITOR=false`), then the new commit's line right after `<c>`'s as `fixup HEAD fixup! <subject>`: git resolves each name of the todo when it reads it, before the rebase checks anything out, so `HEAD` is still the commit `--fixup` made (*verified, git 2.56.1*: into an older commit, into HEAD, on a detached HEAD, with unstaged changes stashed for the run). Backup also `worktree` (§8.2): Undo, even after an Abort that leaves HEAD at that commit, puts the staged changes back staged; without it they were left only in that commit (*verified, git 2.56.1*) |
 | `plan` | Edit history from here… (Cmd/Ctrl+E) | — | opens the planner with base = this commit's row: the rows above it up to HEAD |
+
+A quick edit other than the HEAD forms runs over the range from `<c>`'s parent (`squash`, `fixup`
+and `move-down`: its grandparent), or `--root` where there is none, with `--autostash` when there are
+uncommitted changes (its dialog has no option for it; the confirmation says so, §7.8.2's checks).
 
 #### 7.8.2 The planner
 
@@ -760,19 +764,38 @@ shown in their confirmation.
 - **Keys**: ↑/↓ the bar; `P` `R` `E` `S` `F` `D` set the bar's verb (git's own todo letters,
   git-rebase(1)); `A` author and date; Cmd/Ctrl+↑/↓ move the row; Enter edits the message of a
   `reword` or `squash` row (a squash row's message is the group's); Cmd/Ctrl+Enter runs; Esc closes
-  (asks when something changed). Typed letters set verbs here; they do not start Find.
+  (asks when something changed: a row's verb, place, author or typed message, or a run option against
+  how the planner opened). Typed letters set verbs here; they do not start Find.
 - **Checks before the run**: the range holds no merge commit (a range with merges is refused, naming
   them: pick a base above the newest merge, §10.2); a `squash` or `fixup` row has a non-dropped row
-  below it; the uncommitted changes are stashed for the run (`--autostash`, shown) or the run is
-  refused; commits of the range that a remote-tracking branch already contains are named ("already on
+  below it; the uncommitted changes are stashed for the run (`--autostash`, shown; on when the
+  planner opens over uncommitted changes) or the run is refused; no operation is in progress (§8.5);
+  commits of the range that a remote-tracking branch already contains are named ("already on
   `origin/main`: you will need to push with overwrite") — the same warning every rewrite gives,
-  quick edits, `amend` and the HEAD forms of `reword` and `author` included.
+  quick edits, `amend` and the HEAD forms of `reword` and `author` included. git's `--autostash`
+  applies its stash without `--index`: every change comes back, but what was staged comes back
+  unstaged (*verified, git 2.56.1*); the confirmation says so, and the run backs up `worktree` so
+  Undo puts both back as they were (§8.2, §8.3). Planner runs need git 2.22
+  (`--reschedule-failed-exec`); below it they are refused. An author change on a `squash` or
+  `fixup` row would be lost — its commit goes into the group's first row, whose author the result
+  keeps — so it is a check that fails, in either order of setting them: "`<c>`: its author would be
+  lost — it is squashed into `<head>`; set the author on `<head>`". **Only UTF-8 is rewritten**: a
+  commit whose message or author sopen's own lines write (a reword, an author change, a squash
+  group's first and squash rows; the HEAD forms) is read as stored (`cat-file commit <c>`) and
+  refused when it has an `encoding` header other than UTF-8 or bytes that are not UTF-8 —
+  "`<c>`: its message is not UTF-8 (ISO-8859-1); sopen rewrites UTF-8 only". `git log` re-encodes
+  a message and its author per that header (sopen passes `i18n.commitEncoding=UTF-8`, §3.3), so the
+  range read alone cannot see it (*verified, git 2.56.1*). git's own `pick` and `fixup` of such a
+  commit are left as they are.
 - **Other branches in the range**: with `--update-refs` (offered on git ≥ 2.38), every local branch
   whose tip is in the range — `for-each-ref --merged HEAD --no-merged <upstream> refs/heads/`, the
   current branch left out (*verified*) — gets an `update-ref refs/heads/<b>` line right after the
   line of the commit it points at (git's own todo puts it there, and a todo without the line leaves
-  the branch where it was; *verified, git 2.56.1*). Each of them is backed up (§8.2). A branch whose
-  commit is dropped moves to the nearest kept commit below it, as git does *(estimate)*.
+  the branch where it was; *verified, git 2.56.1*). Each of them is backed up (§8.2). A branch at a
+  commit that a squash group folds goes after the group's last line, as git's own `--autosquash
+  --update-refs` todo puts it (*verified, git 2.56.1*). A branch whose commit is dropped moves to the
+  nearest kept commit below it, or to the base, as git does *(estimate)*; with none (`--root`) the run
+  is refused, naming the branch.
   **Branches checked out in another worktree** (`worktree list --porcelain`, its `branch` lines) are
   left out, and the plan view says so (`mid is checked out in another worktree; it stays where it
   is`): git's own todo comments them out, and an `update-ref` line for one did not move it
@@ -780,11 +803,25 @@ shown in their confirmation.
 - **The run** *(verified, git 2.56.1, through `sh -c` as a remote shell runs it)*:
 
   ```
-  GIT_SEQUENCE_EDITOR='f(){ cat >"$1";};f' git rebase -i --reschedule-failed-exec [--autostash] [--update-refs] <base>|--root
+  GIT_SEQUENCE_EDITOR='f(){ cat >"$1";};f' git -c core.commentChar=# rebase -i --reschedule-failed-exec [--autostash] [--update-refs|--no-update-refs] <base>|--root
   ```
 
   with the todo on stdin (the variable is one of the `env` words, §3.2). git hands the todo file to the sequence editor, which replaces it with
-  stdin; nothing is written by sopen anywhere. The todo, oldest first, one line per row:
+  stdin; nothing is written by sopen anywhere. `-c core.commentChar=#`: git reads the todo with the
+  repository's comment character, so `core.commentChar = p` made every `pick` line a comment — a todo
+  of picks and a message line dropped the picks, amended the base with the message and reported
+  success (*verified, git 2.56.1*); the `-c` also wins over `core.commentString` (*verified*). The
+  `-c` covers only this command: a Continue or a Skip reads the todo again under the repository's
+  own setting. So sopen **fails closed**: when the effective `core.commentChar` or
+  `core.commentString` (`config --get`) is set and is not `#`, a history-edit run is refused before
+  it starts, and the banner's Continue and Skip are refused for a rebase (§8.5's row 1; Abort still
+  runs), each with "core.commentChar is '`<c>`': start or finish this rebase in a terminal" (`auto`
+  counts as set). The HEAD forms of `reword` and `author` write no todo and are not refused.
+  `--no-update-refs` (git ≥ 2.38) when other branches are not moved along, so `rebase.updateRefs` in
+  the config never moves a branch the backup does not hold (the replaced todo already left it,
+  *verified, git 2.56.1*; the flag says so for every git). A stop at an `edit` line exits 0; a
+  conflict or a failed `exec` line exits 1 (*verified, git 2.56.1*); the banner (§8.5) tells the
+  stop. The todo, oldest first, one line per row:
 
   | Row | Todo lines |
   |---|---|
@@ -793,8 +830,9 @@ shown in their confirmation.
   | edit | `edit <c> <subject>` |
   | fixup | `fixup <c> <subject>` |
   | reword | `pick <c> <subject>` + the **message line** |
-  | squash (a group) | `pick <first> …`, `fixup <c> …` for each squashed row, then the **message line** |
-  | author / date | after the commit's line(s): the **author line** |
+  | squash (a group) | `pick <first> …`, `fixup <c> …` for each squashed row (a dropped row between is its `drop` line), then the **message line**: typed (the newest squash row's), else the first row's message (a reword's own) and each squash row's joined as `squash`'s (§7.8.1), a fixup's left out |
+  | author / date | after the commit's line(s) — a group's last line —: the **author line**, which then carries the message in place of the message line |
+  | `fold`'s commit | right after `<c>`'s line: `fixup HEAD fixup! <subject>` (§7.8.1) |
   | a branch tip (with `--update-refs`) | after the commit's line(s): `update-ref refs/heads/<b>` |
 
   - **Message line**: `exec printf '%b' '<m>' | git commit --amend --only --allow-empty --cleanup=verbatim -F -`,
@@ -804,15 +842,30 @@ shown in their confirmation.
     `$`, backquotes, `#` lines, Hangul, leading blank lines, trailing spaces and blank lines, tab, CR
     and ESC; `printf %b` checked in dash, bash as sh and bash). `--allow-empty` is needed: amending
     an originally empty commit fails without it (*verified*).
-  - **Author line**: `exec GIT_COMMITTER_DATE='<cd>' git commit --amend --only --allow-empty --no-edit
-    --author='<name> <<email>>' --date='<ad>'`, dates as `@<unix> <±hhmm>` (*verified*); the
-    `GIT_COMMITTER_DATE` assignment only when the committer date is not "now".
+  - **Author line**: `exec printf '%b' '<m>' | GIT_COMMITTER_DATE='<cd>' git commit --amend --only
+    --allow-empty --cleanup=verbatim -F - --author='<name> <<email>>' --date='<ad>'`, `<m>` as in the
+    message line — the row's new message, else the commit's own — and dates as `@<unix> <±hhmm>`
+    (*verified*); the `GIT_COMMITTER_DATE` assignment only when the committer date is not "now". The
+    last line to amend a commit sets both its message bytes and its committer date, so one line does
+    both. `--no-edit` alone cleaned the message up again (trailing spaces and blank lines went), and
+    with `--cleanup=verbatim` still dropped a leading blank line (*verified, git 2.56.1*), so it is
+    never used. On an `edit` row, whose message the stop may have changed, and for a commit's own
+    message too long for one todo line (60 KiB: git runs an `exec` line as one `sh -c` argument,
+    which Linux caps at 128 KiB), the line reads HEAD's message as it is when it runs, byte for byte:
+    `exec git cat-file commit HEAD | { while IFS= read -r l && [ -n "$l" ]; do :; done; cat; } |
+    GIT_COMMITTER_DATE='<cd>' git commit --amend --only --allow-empty --cleanup=verbatim -F -
+    --author=… --date=…` — the header read line by line up to its blank line, the rest copied as it
+    is (*verified, git 2.56.1*: a leading blank line kept, as the commit had it and as an Amend at the
+    stop made it; the read checked under sh and dash). A typed message past 60 KiB is refused, and so
+    is one with NUL or none at all.
   - The verbs `reword` and `squash` are never written: they call the editor. A message line carries
     the message instead, so **the whole plan lives in git's todo**: after a conflict stop, Continue —
     from sopen or from a terminal — finishes the same plan (*verified*: a message line ran after a
     conflict was resolved and the rebase continued).
 - Each rewritten commit gets a new committer date (git's rebase does that) unless the author line
-  says otherwise.
+  says otherwise. git's own `pick` and `fixup` of a message that starts with a blank line drop that
+  line (*verified, git 2.56.1*), as a plain Rebase does; the rows sopen writes (message and author
+  lines) keep every byte.
 
 ## 8. Safety
 
@@ -838,10 +891,10 @@ Before any history rewrite or destructive action, sopen writes a **backup group*
 | Kind | Holds | Written before |
 |---|---|---|
 | `heads/<b>` | the branch's commit | rebase (and every branch `--update-refs` moves, §7.8.2), reset, amend, reword, every planner run, Move branch, a branch's forced move, Fetch into with force, Delete branch |
-| `detached` | HEAD's commit when detached | the same, on a detached HEAD |
+| `detached` | HEAD's commit when detached | the same, on a detached HEAD; Split at an edit stop (§7.8.1), the run's HEAD being detached there |
 | `tags/<t>` | the tag (its tag object when annotated) | Delete tag, Move tag, a fetch that may prune tags |
 | `stash` | the stash commit | Pop, Drop, New branch from stash |
-| `worktree` | `stash create`'s commit of the index and the tracked changes (none when clean); its second parent keeps the index | Reset hard, Reset the changes (hard), Discard of tracked files |
+| `worktree` | `stash create`'s commit of the index and the tracked changes (none when clean); its second parent keeps the index | Reset hard, Reset the changes (hard), Discard of tracked files; `fold` (its staged changes are committed by the run); a history edit run with `--autostash` over uncommitted changes (git's autostash gives back what was staged unstaged, *verified, git 2.56.1*, §7.8.2) |
 | `files` | a commit, parent HEAD, of the **current bytes** of a list of paths, whatever git thinks of them: untracked files, ignored files in the way (§8.6), a conflicted file before Take ours / Take theirs / Redo | Remove untracked files, Discard of untracked files or folders, Reset hard over files in the way, Take ours, Take theirs, Redo the merge |
 | `pushed/<r>/heads/<b>`, `pushed/<r>/tags/<t>` | the remote's value, taken from the push endpoint (§8.4) | Delete on the remote, overwriting Push |
 | `remotes/<r>/<b>` | a remote-tracking ref | Delete a remote; a fetch with prune; Prune a remote |
@@ -916,10 +969,10 @@ that does not exist now). So undo, redo and undo again each restore the previous
 |---|---|
 | a ref, not the checked-out branch | `update-ref --stdin`, compare-and-swap against the value read for the dialog: `update <ref> <backup> <now>`; `create <ref> <backup>` when it is absent now; `delete <ref> <now>` when the manifest says `absent`. A ref that moved since the dialog fails the transaction and nothing changes |
 | the checked-out branch | `reset --keep <backup>` (refuses rather than lose local changes), after checking that HEAD still is the value read for the dialog. **The undo of a soft or mixed `reset`** uses that reset's own mode — `reset --soft <backup>` / `reset --mixed <backup>`: HEAD (and, for mixed, the index) go back and the working files are left as they are, which already hold the backup's content; `reset --keep` would refuse there (*verified, git 2.56.1*). A hard reset's undo is `reset --keep` plus its `files` and `worktree` items |
-| a detached HEAD | `reset --keep <backup>` on the detached HEAD, as for the branch, and a soft or mixed reset's undo in its own mode (*verified, git 2.56.1*; `checkout --detach` failed after a mixed reset, the reset's files being untracked) |
+| a detached HEAD | `reset --keep <backup>` on the detached HEAD, as for the branch, and a soft or mixed reset's undo in its own mode (*verified, git 2.56.1*; `checkout --detach` failed after a mixed reset, the reset's files being untracked) — a Split's `reset --mixed` (§7.8.1) included, so its undo is `reset --mixed` back and leaves the files |
 | `tags/<t>` | as a ref: an annotated tag comes back as its tag object, with its message (`update` with the old value, *verified*; `create` refuses an existing tag, *verified*) |
 | `stash` | `stash store -m '<its subject>' <backup>`. **The stash list contract**: the entry comes back at the top (`stash@{0}`) with its message; its old position and its old reflog date are not restored. The inverse — restoring a group whose manifest says the entry was `absent` — is `stash drop stash@{k}`, `k` being the entry whose hash is the backup's (`stash list --format=%H`), after its own `stash` backup. `refs/stash` is never set with `update-ref` (that would not rebuild the list or its reflog). Undo, redo and undo again leave the same entries (*verified, git 2.56.1*) |
-| `worktree` | First the current tracked state is backed up (`stash create`; nothing to back up = the manifest says `clean`). Then `reset --hard HEAD` (with §8.6's check) and, unless the group says `clean`, `stash apply --index <backup>`: staged and unstaged parts come back as they were. So clean → dirty → clean → dirty round-trips exactly (*verified, git 2.56.1*: Discard, Undo, Redo, Undo; the trees equal). **Exact only while HEAD is the backup's base** (`<backup>^1`); when HEAD has moved, the dialog says the changes are applied onto the current HEAD, may conflict, and that redo is then not exact. When the index part cannot be applied, the dialog offers `stash apply` without `--index` and says what it loses. Untracked files are never part of this item (they are `files`) |
+| `worktree` | First the current tracked state is backed up (`stash create`; nothing to back up = the manifest says `clean`). Then `reset --hard HEAD` (with §8.6's check) and, unless the group says `clean`, `stash apply --index <backup>`: staged and unstaged parts come back as they were. So clean → dirty → clean → dirty round-trips exactly (*verified, git 2.56.1*: Discard, Undo, Redo, Undo; the trees equal). **Exact only while HEAD is the backup's base** (`<backup>^1`); when HEAD has moved, the dialog says the changes are applied onto the current HEAD, may conflict, and that redo is then not exact. When the index part cannot be applied, the dialog offers `stash apply` without `--index` and says what it loses. Untracked files are never part of this item (they are `files`). **After a `fold` or an `--autostash` history edit** (§8.2) Undo puts the branch back first, then this item — chosen by default, and listed in the restore's confirmation as `the tracked changes as they were (staged and unstaged)` — so the staged and unstaged changes come back as they were (*verified, git 2.56.1*: a fold into HEAD, a fold stopped at a conflict and aborted, a reword with staged and unstaged changes stashed for the run). Undo therefore also resets the work tree: tracked edits made after the run go into the restore's own group first, and redo brings them back; nothing is lost |
 | `files` | **Raw, never over anything, never through a link**: the files restore snippet (§3.2) gets `<mode> <sha> <path>` for each entry of `ls-tree -r -z <backup>`. For each entry: (1) **every parent component** of `./<path>`, from the top level down, must be a real folder — `[ -d c ] && [ ! -L c ]`; a missing one is made with `mkdir` (one level, never `-p`) and checked the same way; a component that is a symlink, a file or anything else refuses the entry (`not a folder: <component>`); (2) **the leaf must not exist at all** — `[ -e p ] || [ -L p ]` refuses it, so a file, a folder, a symlink and a dangling symlink all count as occupied; (3) write: `git cat-file blob <sha> > ./<path>` under `set -C` (no smudge filter, no `eol` conversion, no working-tree encoding), the executable bit for `100755`; for `120000`, `ln -s <the blob's text> ./<path>` — only after (2), because `ln -s` onto an existing folder makes the link inside it instead of refusing (BSD's `-n` does not stop that and GNU's `-T` does not exist on BSD, *verified*); (4) the parent components are checked again and a change is reported (`changed while restoring: <path>`). **The check and the write are not atomic**: a process of the same account that swaps a parent for a symlink between (1) and (3) is not prevented, only reported by (4) (the same trust as 01 §6a's private folder). *Verified, git 2.56.1*: with the backed-up folder `dir` replaced by a symlink to a folder outside the work tree, a folder at a link's path and a dangling symlink at a file's path, the unchecked recipe wrote `dir/sub/n.dat` outside the work tree and put a link inside the folder, while the checked one refused all three and wrote nothing; `>` under `set -C` through a dangling symlink was refused in sh, dash, bash and zsh. CRLF bytes, a filtered file and a nested file came back byte for byte, `100755` as 755, a symlink with its target; a second restore over the existing files was refused and left them alone (`restore --worktree` would have run the smudge filter: it did). A link target ending in a newline loses it (the shell strips it) — named when it happens. An occupied leaf or a non-folder parent is listed and left unless the dialog's "replace" is chosen, which writes its own `files` backup of what is there first, removes it (a symlink as a link, never its target) and then runs (1)–(4); a path the manifest says was `absent` is removed (`clean -f -- <path>` for an untracked file, after the same parent check) |
 | `pushed/…` | `push --progress --force-with-lease=<ref>:<the remote's value now, or empty when gone> <r> <backup>:<ref>` (an empty lease means "must not exist", *verified*) |
 
