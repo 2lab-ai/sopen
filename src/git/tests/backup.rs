@@ -3,11 +3,12 @@
 //! again. The fixture is `tests/actions.rs`'.
 
 use super::actions::{conflicted, done, fixture, repo_of, run, Fx};
-use crate::git::actions::{Action, Outcome, Plan, ResetMode, StepOutcome};
+use crate::git::actions::{inspect, Action, Outcome, Plan, Repo, ResetMode, StepOutcome};
 use crate::git::backup::{
     self, kind_name, kind_of, stamp, Manifest, ManifestEntry, RestoreEntry, Subject, Undo, Value,
 };
 use crate::git::model::{BackupKind, Oid};
+use crate::git::rebase::{self as history, Base, Edit, Model, Op, Verb};
 use crate::git::runner::{GitRunner, Handle};
 use std::path::Path;
 use std::time::{Duration, SystemTime};
@@ -838,6 +839,494 @@ fn a_detached_head_is_restored_by_reset_keep() {
             "edited, not committed\n",
             "{lane}: the local change kept"
         );
+    }
+}
+
+/// G-S1 for a hard reset (03 §8.3, a HEAD item with a `worktree` item): Reset hard over staged
+/// and unstaged changes to a file the two commits differ in → undo → redo → undo, on the
+/// checked-out branch and on a detached HEAD. Each step is exact — HEAD, the index's tree, every
+/// working file's bytes, the status — and nothing is refused: the work tree is reset to HEAD
+/// before HEAD moves (reset after it, the redo's `reset --keep` refused: `Entry 'a.txt' would be
+/// overwritten by merge`).
+#[test]
+fn g_s1_reset_hard_round_trips() {
+    let Some(fx) = fixture() else { return };
+    for (lane, runner) in fx.lanes() {
+        for detached in [false, true] {
+            let name = format!("hard-trip-{lane}-{detached}");
+            let dir = fx.repo(&name);
+            let c1 = fx.commit(&dir, "a.txt", "one\n", "first a.txt");
+            // c2 changes a.txt and adds b.txt; both get changes c1 cannot carry.
+            std::fs::write(dir.join("b.txt"), "b\n").unwrap();
+            fx.git(&dir, &["add", "b.txt"]);
+            let c2 = fx.commit(&dir, "a.txt", "two\n", "second");
+            if detached {
+                fx.git(&dir, &["checkout", "-q", "--detach", c2.as_str()]);
+            }
+            std::fs::write(dir.join("a.txt"), "staged\n").unwrap();
+            fx.git(&dir, &["add", "a.txt"]);
+            std::fs::write(dir.join("a.txt"), "unstaged\r\n").unwrap();
+            std::fs::write(dir.join("b.txt"), "b, edited\n").unwrap();
+            std::fs::write(dir.join("README"), "edited\n").unwrap();
+            let state = || {
+                (
+                    fx.rev(&dir, "HEAD").unwrap(),
+                    fx.git(&dir, &["write-tree"]),
+                    bytes(&dir, "a.txt"),
+                    bytes(&dir, "b.txt"),
+                    bytes(&dir, "README"),
+                    fx.git(&dir, &["status", "--porcelain", "--untracked-files=all"]),
+                    fx.output(&dir, &["symbolic-ref", "-q", "HEAD"])
+                        .status
+                        .success(),
+                )
+            };
+            let dirty = state();
+            let mut window = Undo::default();
+            act(
+                &name,
+                &runner,
+                &dir,
+                &mut window,
+                Action::Reset {
+                    to: c1.clone(),
+                    mode: ResetMode::Hard,
+                },
+            );
+            let reset = state();
+            assert_eq!(reset.0, c1.as_str(), "{name}");
+            assert_eq!(
+                reset.2.as_deref(),
+                Some(&b"one\n"[..]),
+                "{name}: c1's a.txt"
+            );
+            assert_eq!(reset.3, None, "{name}: b.txt gone with c2");
+            // Each restore's plan: HEAD goes back to the work tree backup's base first, so the
+            // dialog never says the changes land on a moved HEAD.
+            let step = |window: &mut Undo, what: &str| {
+                let stamp = window.newest().unwrap().to_string();
+                let (_, plan, outcome) = restore(&runner, &dir, &stamp);
+                done(&name, &outcome);
+                window.push(outcome.backup.clone().unwrap());
+                let notes = plan.confirm.as_ref().unwrap().notes.join("\n");
+                assert!(!notes.contains("HEAD has moved"), "{name}: {what}: {notes}");
+                plan
+            };
+            step(&mut window, "undo");
+            assert_eq!(state(), dirty, "{name}: undo");
+            step(&mut window, "redo");
+            assert_eq!(state(), reset, "{name}: redo");
+            let plan = step(&mut window, "undo again");
+            assert_eq!(state(), dirty, "{name}: undo again");
+            // The order: the work tree reset to HEAD after HEAD's check, then HEAD moved, then
+            // the changes applied.
+            let lines = super::actions::commands(&plan);
+            let at = |want: &dyn Fn(&str) -> bool| {
+                lines
+                    .iter()
+                    .position(|l| want(l))
+                    .unwrap_or_else(|| panic!("{name}: {lines:#?}"))
+            };
+            let check = at(&|l| l.starts_with("git update-ref --stdin"));
+            let wipe = at(&|l| l == "git reset --hard HEAD");
+            let back = at(&|l| l == format!("git reset --keep {}", c2.as_str()));
+            let apply = at(&|l| l.starts_with("git stash apply --index "));
+            assert!(
+                check < wipe && wipe < back && back < apply,
+                "{name}: {lines:#?}"
+            );
+        }
+    }
+}
+
+/// The sentence a restore's result carries when it stopped after the work tree's reset and
+/// before the apply (03 §8.3): `<the step> was refused; your uncommitted changes were set aside
+/// in backup <stamp> — restore it to bring them back`.
+fn set_aside(line: &str, stamp: &str) -> String {
+    format!(
+        "{line} was refused; your uncommitted changes were set aside in backup {stamp} — restore \
+         it to bring them back"
+    )
+}
+
+/// G-S1 for a Reset hard over an untracked file in the way (03 §8.3's order, `files` after the
+/// move): undo puts the file back byte for byte without "replace" — the target's tracked file
+/// there is HEAD's own and the move removes it before the files are written. The redo meets
+/// that untracked file where its HEAD move writes: refused at plan time, naming it, nothing run
+/// (§8.6). Put there only after the plan, the move refuses it at Run after the work tree's
+/// reset: the result says where the uncommitted changes went (the restore's own group, by its
+/// stamp), and restoring that group puts them back.
+#[test]
+fn g_s1_reset_hard_over_a_file_in_the_way_undo_and_redo() {
+    let Some(fx) = fixture() else { return };
+    for (lane, runner) in fx.lanes() {
+        let dir = fx.repo(&format!("in-the-way-trip-{lane}"));
+        let base = fx.oid(&dir, "HEAD");
+        let target = fx.commit(&dir, "u.txt", "tracked\n", "u.txt");
+        fx.git(&dir, &["reset", "-q", "--hard", base.as_str()]);
+        std::fs::write(dir.join("u.txt"), "mine, untracked\r\n").unwrap();
+        std::fs::write(dir.join("README"), "edited\n").unwrap();
+        let dirty = tracked(&fx, &dir);
+        let mut window = Undo::default();
+        act(
+            &lane,
+            &runner,
+            &dir,
+            &mut window,
+            Action::Reset {
+                to: target.clone(),
+                mode: ResetMode::Hard,
+            },
+        );
+        assert_eq!(bytes(&dir, "u.txt").as_deref(), Some(&b"tracked\n"[..]));
+        // Undo: the file chosen as a free one, never "replace", written after the move.
+        let entries = undo(&lane, &runner, &dir, &mut window);
+        let path = entries
+            .iter()
+            .find(|e| e.subject == Subject::Path("u.txt".into()))
+            .expect("the files entry");
+        assert!(path.chosen && !path.replace, "{lane}: {path:?}");
+        assert_eq!(fx.oid(&dir, "HEAD"), base, "{lane}: undo's HEAD");
+        assert_eq!(tracked(&fx, &dir), dirty, "{lane}: undo's changes");
+        assert_eq!(
+            bytes(&dir, "u.txt").as_deref(),
+            Some(&b"mine, untracked\r\n"[..]),
+            "{lane}: undo's file, byte for byte"
+        );
+        // Redo: refused before anything runs, naming the file; the work tree untouched.
+        let stamp = window.newest().unwrap().to_string();
+        let top = dir.to_str().unwrap();
+        let record = backup::group(&runner, &Handle::new(), top, &stamp)
+            .unwrap()
+            .unwrap();
+        let repo = repo_of(&runner, &dir);
+        let entries = backup::entries(&runner, &Handle::new(), top, &record, &repo.head).unwrap();
+        let redo = Action::Restore {
+            stamp: stamp.clone(),
+            entries,
+        };
+        let why = super::actions::planned(&runner, &dir, &redo).unwrap_err().0;
+        assert!(
+            why.contains("u.txt") && why.contains("Move them away first"),
+            "{lane}: {why}"
+        );
+        assert_eq!(fx.oid(&dir, "HEAD"), base, "{lane}: HEAD untouched");
+        assert_eq!(tracked(&fx, &dir), dirty, "{lane}: the changes untouched");
+        assert_eq!(
+            bytes(&dir, "u.txt").as_deref(),
+            Some(&b"mine, untracked\r\n"[..]),
+            "{lane}: the file untouched"
+        );
+        // The file put there after the plan: the move refused at Run, and the result says so.
+        let aside = fx.root.join(format!("u-{lane}.txt"));
+        std::fs::rename(dir.join("u.txt"), &aside).unwrap();
+        let plan = super::actions::planned(&runner, &dir, &redo).unwrap();
+        std::fs::rename(&aside, dir.join("u.txt")).unwrap();
+        let outcome = crate::git::actions::execute(&plan, top, &runner, &Handle::new());
+        let at = outcome
+            .steps
+            .iter()
+            .position(|s| s.outcome == StepOutcome::Failed)
+            .unwrap_or_else(|| panic!("{lane}: the redo's move was not refused"));
+        let line = outcome.steps[at].line.clone();
+        assert_eq!(line, format!("git reset --keep {}", target.as_str()));
+        super::actions::failed_at(&lane, &outcome, at);
+        let own = outcome.backup.clone().expect("the restore's own group");
+        // What the result dialog shows: the failed step's last unfinished command's text.
+        let shown = outcome.steps[at]
+            .ran
+            .iter()
+            .rev()
+            .find(|d| !d.ok())
+            .map(|d| d.error_text())
+            .unwrap();
+        assert!(
+            shown.contains("would be overwritten"),
+            "{lane}: git's text: {shown}"
+        );
+        assert!(shown.contains(&set_aside(&line, &own)), "{lane}: {shown}");
+        assert_eq!(outcome.warning(), Some(set_aside(&line, &own)), "{lane}");
+        assert_eq!(fx.oid(&dir, "HEAD"), base, "{lane}: HEAD unchanged");
+        assert_eq!(tracked(&fx, &dir), (String::new(), String::new()));
+        // Restoring that group puts the changes back; the untracked file is left alone.
+        let (_, _, outcome) = restore(&runner, &dir, &own);
+        done(&lane, &outcome);
+        assert_eq!(tracked(&fx, &dir), dirty, "{lane}: the changes back");
+        assert_eq!(
+            bytes(&dir, "u.txt").as_deref(),
+            Some(&b"mine, untracked\r\n"[..]),
+            "{lane}: the untracked file left alone"
+        );
+    }
+}
+
+/// The same refusal over a clean work tree sets nothing aside, and the result says nothing of
+/// the kind: the restore's own group says `clean`.
+#[test]
+fn a_refused_move_over_a_clean_tree_sets_nothing_aside() {
+    let Some(fx) = fixture() else { return };
+    for (lane, runner) in fx.lanes() {
+        let dir = fx.repo(&format!("refused-clean-{lane}"));
+        let start = fx.oid(&dir, "HEAD");
+        let with_p = fx.commit(&dir, "p.txt", "tracked\n", "p.txt");
+        std::fs::write(dir.join("README"), "edited\n").unwrap();
+        let (_, outcome) = run(
+            &runner,
+            &dir,
+            &Action::Reset {
+                to: start.clone(),
+                mode: ResetMode::Hard,
+            },
+        );
+        done(&lane, &outcome);
+        let stamp = outcome.backup.clone().unwrap();
+        // Clean now; after the plan, an untracked file where the backup's commit has a tracked
+        // one (before it, the plan refuses: `g_s1_reset_hard_over_a_file_in_the_way_…`).
+        let top = dir.to_str().unwrap();
+        let record = backup::group(&runner, &Handle::new(), top, &stamp)
+            .unwrap()
+            .unwrap();
+        let repo = repo_of(&runner, &dir);
+        let entries = backup::entries(&runner, &Handle::new(), top, &record, &repo.head).unwrap();
+        assert!(
+            entries.iter().filter(|e| e.chosen).count() == 2,
+            "{lane}: HEAD and the work tree chosen: {entries:?}"
+        );
+        let plan =
+            super::actions::planned(&runner, &dir, &Action::Restore { stamp, entries }).unwrap();
+        super::actions::has_line(&plan, "git reset --hard HEAD");
+        std::fs::write(dir.join("p.txt"), "untracked\n").unwrap();
+        let outcome = crate::git::actions::execute(&plan, top, &runner, &Handle::new());
+        let at = outcome
+            .steps
+            .iter()
+            .position(|s| s.outcome == StepOutcome::Failed)
+            .unwrap_or_else(|| panic!("{lane}: the move was not refused"));
+        assert_eq!(
+            outcome.steps[at].line,
+            format!("git reset --keep {}", with_p.as_str())
+        );
+        let text = super::actions::failed_at(&lane, &outcome, at);
+        assert!(!text.contains("set aside"), "{lane}: {text}");
+        assert_eq!(outcome.warning(), None, "{lane}");
+        assert_eq!(fx.oid(&dir, "HEAD"), start, "{lane}");
+    }
+}
+
+/// The planner opened on `base` (as `tests/rebase.rs`' `opened`): the repository with its reads
+/// made, and the model.
+fn opened(runner: &GitRunner, dir: &Path, base: &Base) -> (Repo, Model) {
+    let mut repo = repo_of(runner, dir);
+    for _ in 0..6 {
+        let missing = history::open_needs(base, &repo);
+        if missing.is_empty() {
+            break;
+        }
+        inspect(runner, &Handle::new(), &mut repo, &missing)
+            .unwrap_or_else(|e| panic!("inspect: {}", e.reason));
+    }
+    let model = history::open(base, &repo).unwrap_or_else(|r| panic!("open refused: {}", r.0));
+    (repo, model)
+}
+
+/// A history edit of `model` dropping `commit` with `--update-refs` and `--autostash` (03
+/// §7.8.2), run: its group holds HEAD, the branch in the range and the work tree.
+fn drop_with_update_refs(
+    lane: &str,
+    runner: &GitRunner,
+    dir: &Path,
+    (mut repo, mut model): (Repo, Model),
+    commit: &Oid,
+) -> String {
+    assert!(model.autostash, "{lane}: on with uncommitted changes");
+    model.update_refs = true;
+    model
+        .apply(Op::Verb {
+            commit: commit.clone(),
+            verb: Verb::Drop,
+        })
+        .unwrap();
+    let edit = Edit::Plan(model);
+    for _ in 0..6 {
+        let missing = history::needs(&edit, &repo);
+        if missing.is_empty() {
+            break;
+        }
+        inspect(runner, &Handle::new(), &mut repo, &missing)
+            .unwrap_or_else(|e| panic!("inspect: {}", e.reason));
+    }
+    let plan = history::plan(&edit, &repo).unwrap_or_else(|r| panic!("refused: {}", r.0));
+    let outcome =
+        crate::git::actions::execute(&plan, dir.to_str().unwrap(), runner, &Handle::new());
+    done(lane, &outcome);
+    outcome.backup.clone().expect("a group")
+}
+
+/// The restore plan of group `stamp`, every entry chosen.
+fn restore_all(runner: &GitRunner, dir: &Path, stamp: &str) -> Plan {
+    let top = dir.to_str().unwrap();
+    let record = backup::group(runner, &Handle::new(), top, stamp)
+        .unwrap()
+        .unwrap();
+    let repo = repo_of(runner, dir);
+    let mut entries = backup::entries(runner, &Handle::new(), top, &record, &repo.head).unwrap();
+    for e in &mut entries {
+        e.chosen = true;
+    }
+    super::actions::planned(
+        runner,
+        dir,
+        &Action::Restore {
+            stamp: stamp.into(),
+            entries,
+        },
+    )
+    .unwrap_or_else(|r| panic!("refused: {}", r.0))
+}
+
+/// The confirmation's `git update-ref --stdin` lines (HEAD's checks, the ref transaction) all
+/// come before the work tree's reset (03 §8.3's order); the index of that reset.
+#[track_caller]
+fn refusals_first(lane: &str, plan: &Plan, updates: usize) -> usize {
+    let lines = super::actions::commands(plan);
+    let wipe = lines
+        .iter()
+        .position(|l| l == "git reset --hard HEAD")
+        .unwrap_or_else(|| panic!("{lane}: {lines:#?}"));
+    let before: Vec<usize> = lines
+        .iter()
+        .enumerate()
+        .filter(|(_, l)| l.starts_with("git update-ref --stdin"))
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(before.len(), updates, "{lane}: {lines:#?}");
+    assert!(before.iter().all(|i| *i < wipe), "{lane}: {lines:#?}");
+    wipe
+}
+
+/// A `reference-transaction` hook that sets `refname` to `oid` once the restore's own group is
+/// written (its `manifest` created): what moves between that backup, which checks the values
+/// the dialog read, and the restore's own checks and ref transaction.
+fn moves_after_the_backup(dir: &Path, refname: &str, oid: &Oid) {
+    super::actions::script(
+        &dir.join(".git/hooks/reference-transaction"),
+        &format!(
+            "[ \"$1\" = committed ] || exit 0\n\
+             if grep -q 'refs/sopen-backup/.*/manifest$'; then git update-ref {refname} {}; fi\n\
+             exit 0",
+            oid.as_str()
+        ),
+    );
+}
+
+/// HEAD, the index's tree and the working files' tracked state, as a restore must leave them
+/// when it stops before the work tree's reset.
+fn untouched(fx: &Fx, dir: &Path) -> (String, Option<Vec<u8>>, String) {
+    (
+        fx.git(dir, &["write-tree"]),
+        bytes(dir, "README"),
+        fx.git(dir, &["diff", "--stat"]),
+    )
+}
+
+/// 03 §8.3's order, what can refuse first: the undo of an `--update-refs` history edit run with
+/// `--autostash` (HEAD, another branch and the work tree). Its ref transaction comes before the
+/// work tree's reset: when the other branch moves after the restore's own backup (which checks
+/// the values the dialog read), the compare-and-swap fails there and the work tree, the index
+/// and HEAD stay as they were.
+#[test]
+fn a_refused_ref_transaction_leaves_the_work_tree_alone() {
+    let Some(fx) = fixture() else { return };
+    for (lane, runner) in fx.lanes() {
+        let dir = fx.repo(&format!("cas-first-{lane}"));
+        let base = fx.oid(&dir, "HEAD");
+        let c1 = fx.commit(&dir, "f1", "1\n", "one");
+        fx.commit(&dir, "f2", "2\n", "two");
+        fx.git(&dir, &["branch", "mid"]);
+        fx.commit(&dir, "f3", "3\n", "three");
+        std::fs::write(dir.join("README"), "edited\n").unwrap();
+        let opened = opened(&runner, &dir, &Base::Commit(base.clone()));
+        let stamp = drop_with_update_refs(&lane, &runner, &dir, opened, &c1);
+        assert_eq!(
+            group_names(&fx, &dir, &stamp),
+            ["heads/main", "heads/mid", "manifest", "worktree"]
+        );
+        let plan = restore_all(&runner, &dir, &stamp);
+        let wipe = refusals_first(&lane, &plan, 2);
+        moves_after_the_backup(&dir, "refs/heads/mid", &base);
+        let head = fx.rev(&dir, "HEAD").unwrap();
+        let before = untouched(&fx, &dir);
+        let outcome =
+            crate::git::actions::execute(&plan, dir.to_str().unwrap(), &runner, &Handle::new());
+        let at = outcome
+            .steps
+            .iter()
+            .position(|s| s.outcome == StepOutcome::Failed)
+            .unwrap_or_else(|| panic!("{lane}: the ref transaction did not refuse"));
+        assert!(
+            at == 2 && outcome.steps[at].line.starts_with("git update-ref --stdin"),
+            "{lane}: step {at}: {}",
+            outcome.steps[at].line
+        );
+        assert!(at < wipe, "{lane}: stopped before the work tree's reset");
+        super::actions::failed_at(&lane, &outcome, at);
+        assert_eq!(fx.rev(&dir, "HEAD").unwrap(), head, "{lane}: HEAD");
+        assert_eq!(
+            fx.oid(&dir, "mid"),
+            base,
+            "{lane}: mid where the hook put it"
+        );
+        assert_eq!(untouched(&fx, &dir), before, "{lane}: the work tree");
+        assert_eq!(outcome.warning(), None, "{lane}");
+    }
+}
+
+/// 03 §8.3's order with two HEAD items chosen — a detached HEAD's and the branch checked out
+/// since (a detached `--update-refs` edit run with `--autostash`, then that branch checked
+/// out): both checks come before the work tree's reset. Such a restore never gets past its own
+/// backup: that one transaction verifies `HEAD` and the branch `HEAD` points to, which git
+/// refuses (`multiple updates for 'refs/heads/side' (including one via symref 'HEAD') are not
+/// allowed`), so it stops before anything else runs, the work tree, the index and HEAD as they
+/// were.
+#[test]
+fn both_head_checks_come_before_the_work_tree_reset() {
+    let Some(fx) = fixture() else { return };
+    for (lane, runner) in fx.lanes() {
+        let dir = fx.repo(&format!("two-heads-{lane}"));
+        let base = fx.oid(&dir, "HEAD");
+        fx.git(&dir, &["checkout", "-q", "--detach"]);
+        let c1 = fx.commit(&dir, "f1", "1\n", "one");
+        fx.commit(&dir, "f2", "2\n", "two");
+        fx.git(&dir, &["branch", "side"]);
+        fx.commit(&dir, "f3", "3\n", "three");
+        std::fs::write(dir.join("README"), "edited\n").unwrap();
+        let opened = opened(&runner, &dir, &Base::Commit(base));
+        let stamp = drop_with_update_refs(&lane, &runner, &dir, opened, &c1);
+        assert_eq!(
+            group_names(&fx, &dir, &stamp),
+            ["detached", "heads/side", "manifest", "worktree"]
+        );
+        fx.git(&dir, &["checkout", "-q", "side"]);
+        let plan = restore_all(&runner, &dir, &stamp);
+        let lines = super::actions::commands(&plan);
+        let moves = lines
+            .iter()
+            .filter(|l| l.starts_with("git reset --keep "))
+            .count();
+        assert_eq!(moves, 2, "{lane}: two HEAD items: {lines:#?}");
+        refusals_first(&lane, &plan, 2);
+        let head = fx.rev(&dir, "HEAD").unwrap();
+        let before = untouched(&fx, &dir);
+        let outcome =
+            crate::git::actions::execute(&plan, dir.to_str().unwrap(), &runner, &Handle::new());
+        let text = super::actions::failed_at(&lane, &outcome, 0);
+        assert!(
+            text.contains("multiple updates for 'refs/heads/side'"),
+            "{lane}: {text}"
+        );
+        assert_eq!(outcome.backup, None, "{lane}: no group written");
+        assert_eq!(fx.rev(&dir, "HEAD").unwrap(), head, "{lane}: HEAD");
+        assert_eq!(untouched(&fx, &dir), before, "{lane}: the work tree");
     }
 }
 

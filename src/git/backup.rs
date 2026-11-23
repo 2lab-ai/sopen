@@ -362,7 +362,8 @@ pub enum RestoreHow {
     /// backup.
     Stash,
     /// The tracked state backed up first, then `reset --hard HEAD` and, unless `clean`, `stash
-    /// apply --index <backup>`; exact only while HEAD is the backup's base.
+    /// apply --index <backup>`; exact only while the changes land on the backup's base. With
+    /// HEAD restored too, the reset comes before HEAD's move and the apply after it.
     WorkTree,
     /// The files restore snippet: raw, never over anything, never through a link.
     Files,
@@ -1520,8 +1521,9 @@ fn after(s: &mut Session, stamp: &str) -> Result<Option<Manifest>, String> {
 /// The restore dialog's entries for `record` (03 §8.3): each manifest line with its value now —
 /// refs and HEAD read, the stash list, the work tree's tracked changes, each path looked at by
 /// the files restore snippet (`c`), a remote's ref by `ls-remote` — `moved since` against the
-/// group's `after` record, and chosen when there is something to put back and it did not move.
-/// `head` is HEAD as the panel read it (which branch is checked out).
+/// group's `after` record, and chosen when there is something to put back and it did not move
+/// (a path: where it is free, or freed by the chosen HEAD item's move). `head` is HEAD as the
+/// panel read it (which branch is checked out).
 pub fn entries(
     runner: &GitRunner,
     handle: &Handle,
@@ -1690,7 +1692,47 @@ fn entries_in(s: &mut Session, record: &Record, head: &Head) -> Result<Vec<Resto
             replace: false,
         });
     }
+    freed_by_the_move(s, &mut entries)?;
     Ok(entries)
+}
+
+/// 03 §8.3's order puts the `files` after HEAD's move: a path held now by HEAD's own tracked
+/// file, as HEAD has it, where the chosen HEAD item's commit has no such path, is free by then
+/// (the move removes it), so it is chosen like a free one — never "replace". The snippet's `w`
+/// still refuses it at Run if something is there then.
+fn freed_by_the_move(s: &mut Session, entries: &mut [RestoreEntry]) -> Result<(), String> {
+    let Some(to) = entries
+        .iter()
+        .filter(|e| e.chosen && matches!(e.how, RestoreHow::CheckedOut | RestoreHow::Detached))
+        .filter_map(|e| e.backup.as_ref().map(|b| b.oid.clone()))
+        .next_back()
+    else {
+        return Ok(());
+    };
+    let waiting = |e: &RestoreEntry| {
+        matches!(e.subject, Subject::Path(_))
+            && !e.chosen
+            && matches!((&e.before, &e.now), (Value::Object(_), Value::Object(_)))
+    };
+    if !entries.iter().any(waiting) {
+        return Ok(());
+    }
+    let head = tree_entries(&s.read(["ls-tree", "-r", "-z", "--full-tree", "HEAD"])?);
+    let there = tree_entries(&s.read(["ls-tree", "-r", "-z", "--full-tree", to.as_str()])?);
+    for e in entries.iter_mut().filter(|e| waiting(e)) {
+        let Subject::Path(p) = &e.subject else {
+            continue;
+        };
+        let ours = head
+            .iter()
+            .any(|t| &t.path == p && e.now == Value::Object(t.oid.clone()));
+        let under = format!("{p}/");
+        e.chosen = ours
+            && !there
+                .iter()
+                .any(|t| &t.path == p || t.path.starts_with(&under));
+    }
+    Ok(())
 }
 
 /// What [`entries`]' `c` look said of a path that stops a plain restore (an occupied leaf or a
