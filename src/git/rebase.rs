@@ -69,8 +69,8 @@
 //!   planner's model starts with it on when there are uncommitted changes ([`open`]).
 
 use super::actions::{
-    self, on_remotes, rebase_paths, refuse_ignored, Action, Draft, Need, Plan, Proceed, Reads,
-    Refused, Repo,
+    self, on_remotes, rebase_paths, refuse_comment_char, refuse_ignored, Action, Banner, Draft,
+    Need, Plan, Proceed, Reads, Refused, Repo,
 };
 use super::backup::{self, Source};
 use super::model::{BackupKind, CommitRow, Head, Oid, Operation, RefKind, Sequence, StatusState};
@@ -388,6 +388,9 @@ pub enum Problem {
     Busy(String),
     /// `fold` with nothing staged (S4-A).
     NothingStaged,
+    /// An author set on a `squash` or `fixup` row: its commit goes into the group's head, whose
+    /// author the result keeps, so the change would be lost (S4-A review round 1).
+    AuthorLost { commit: Oid, into: Oid },
 }
 
 impl Problem {
@@ -411,6 +414,12 @@ impl Problem {
                 format!("{what} is in progress (the banner): finish it or abort it first")
             }
             Problem::NothingStaged => "nothing is staged to fold in".into(),
+            Problem::AuthorLost { commit, into } => format!(
+                "{}: its author would be lost — it is squashed into {}; set the author on {}",
+                commit.short(),
+                into.short(),
+                into.short()
+            ),
         }
     }
 }
@@ -628,6 +637,20 @@ impl Model {
                 problems.push(Problem::NothingBelow(row.commit.row.oid.clone()));
             }
         }
+        for unit in units(&self.rows) {
+            let Unit::Group { head, members } = unit else {
+                continue;
+            };
+            for m in members {
+                let row = &self.rows[m];
+                if row.author.is_some() && matches!(row.verb, Verb::Squash | Verb::Fixup) {
+                    problems.push(Problem::AuthorLost {
+                        commit: row.commit.row.oid.clone(),
+                        into: self.rows[head].commit.row.oid.clone(),
+                    });
+                }
+            }
+        }
         let fold = self.fold.is_some();
         if fold && !staged(repo) {
             problems.push(Problem::NothingStaged);
@@ -748,8 +771,8 @@ impl Model {
                             line.message = match (message, h.verb) {
                                 (Some(m), _) => Some(m),
                                 (None, Verb::Edit) => None,
-                                // Past what one todo line carries, `--no-edit` keeps it
-                                // (all but a leading blank line).
+                                // Past what one todo line carries, the line reads it from
+                                // HEAD when it runs.
                                 (None, _) if fits(&h.commit.message) => {
                                     Some(h.commit.message.clone())
                                 }
@@ -974,15 +997,20 @@ impl Exec {
                         "printf '%b' {} | {committer}{AMEND} -F - {who}",
                         printf_word(m)
                     ),
-                    None => format!(
-                        "{committer}git commit --amend --only --allow-empty --no-edit \
-                         --cleanup=verbatim {who}"
-                    ),
+                    None => format!("{HEAD_MESSAGE} | {committer}{AMEND} -F - {who}"),
                 }
             }
         }
     }
 }
+
+/// The message of HEAD as it is when the line runs, byte for byte: `git cat-file commit HEAD`'s
+/// body after the header's blank line (the header read line by line up to the empty one, the
+/// rest copied as it is). An author line without [`AuthorLine::message`] pipes it into `commit
+/// -F -` (S4-A review round 1): `--no-edit`, even with `--cleanup=verbatim`, dropped a leading
+/// blank line (git 2.56.1), and at an `edit` stop the message may have been changed.
+pub const HEAD_MESSAGE: &str =
+    r#"git cat-file commit HEAD | { while IFS= read -r l && [ -n "$l" ]; do :; done; cat; }"#;
 
 /// `word` as one POSIX shell word: single quotes, each `'` as `'\''` (git's `exec` runs under
 /// `/bin/sh`).
@@ -1004,12 +1032,12 @@ pub enum Exec {
     /// --cleanup=verbatim -F -`, `<m>` the message with `\` doubled and each newline written
     /// `\n`, quoted as one shell word, every other byte as it is.
     Message(String),
-    /// The author line: `exec [GIT_COMMITTER_DATE='<cd>'] git commit --amend --only
-    /// --allow-empty --no-edit --cleanup=verbatim --author='<name> <<email>>' --date='<ad>'`; with
-    /// [`AuthorLine::message`], `exec printf '%b' '<m>' | [GIT_COMMITTER_DATE='<cd>'] git commit
-    /// --amend --only --allow-empty --cleanup=verbatim -F - --author=… --date=…` (S4-A: 03's
-    /// `--no-edit` alone re-cleans the message, dropping trailing blank lines and spaces, and with
-    /// `--cleanup=verbatim` still drops a leading blank line; git 2.56.1).
+    /// The author line: `exec printf '%b' '<m>' | [GIT_COMMITTER_DATE='<cd>'] git commit --amend
+    /// --only --allow-empty --cleanup=verbatim -F - --author='<name> <<email>>' --date='<ad>'`
+    /// with [`AuthorLine::message`]; without it the message comes from HEAD as it is then
+    /// ([`HEAD_MESSAGE`]` | … -F - …`). S4-A: 03's `--no-edit` re-cleans the message, dropping
+    /// trailing blank lines and spaces, and with `--cleanup=verbatim` still drops a leading blank
+    /// line (git 2.56.1).
     Author(AuthorLine),
 }
 
@@ -1024,9 +1052,9 @@ pub struct AuthorLine {
     pub committer: Option<Date>,
     /// The message the line writes as well (S4-A): `Some` pipes it in as the message line does
     /// (`printf '%b' '<m>' | … -F -`), so one line sets both the message and the committer date
-    /// — the last line to amend a commit decides both, and `--no-edit` drops a leading blank
-    /// line even with `--cleanup=verbatim` (git 2.56.1). `None` keeps the commit's own
-    /// (`--no-edit`): an `edit` row's, which the stop may change.
+    /// — the last line to amend a commit decides both. `None` writes HEAD's message as it is
+    /// when the line runs, read byte for byte ([`HEAD_MESSAGE`]): an `edit` row's, which the stop
+    /// may change, or a commit's own too long for one todo line.
     pub message: Option<String>,
 }
 
@@ -1341,6 +1369,74 @@ fn paths_need(parent: &Oid, c: &Oid) -> Need {
         parent.as_str(),
         c.as_str(),
     ])
+}
+
+/// A commit as stored (`cat-file commit <c>`): `git log` re-encodes a message and its author per
+/// the commit's `encoding` header, so only the raw object tells what bytes it holds.
+fn raw_need(c: &Oid) -> Need {
+    need(&["cat-file", "commit", c.as_str()])
+}
+
+/// sopen writes a commit's message and author only when they are UTF-8 as stored (S4-A review
+/// round 1): an `encoding` header other than UTF-8, or a message or author line whose bytes are
+/// not UTF-8, refuses the edit. Not read yet: no refusal here (the plan refuses as `not read
+/// yet`).
+fn rewritable(reads: &Reads, c: &Oid) -> Result<(), Refused> {
+    let raw = reads.get(raw_need(c));
+    if raw.is_empty() {
+        return Ok(());
+    }
+    let (header, message) = match raw.windows(2).position(|w| w == b"\n\n") {
+        Some(at) => (&raw[..at], &raw[at + 2..]),
+        None => (&raw[..], &raw[raw.len()..]),
+    };
+    let mut encoding: Option<String> = None;
+    let mut author: &[u8] = b"";
+    for line in header.split(|&b| b == b'\n') {
+        if let Some(v) = line.strip_prefix(b"encoding ") {
+            encoding = Some(String::from_utf8_lossy(v).into_owned());
+        } else if let Some(v) = line.strip_prefix(b"author ") {
+            author = v;
+        }
+    }
+    let foreign = encoding
+        .as_deref()
+        .filter(|e| !e.eq_ignore_ascii_case("utf-8") && !e.eq_ignore_ascii_case("utf8"));
+    let message_bad = foreign.is_some() || std::str::from_utf8(message).is_err();
+    let author_bad =
+        std::str::from_utf8(author).is_err() || (foreign.is_some() && !author.is_ascii());
+    let what = match (message_bad, author_bad) {
+        (false, false) => return Ok(()),
+        (true, true) => "message and author are",
+        (true, false) => "message is",
+        (false, true) => "author is",
+    };
+    refused(format!(
+        "{}: its {what} not UTF-8 ({}); sopen rewrites UTF-8 only",
+        c.short(),
+        foreign.unwrap_or("no encoding header")
+    ))
+}
+
+/// The commits of a run whose message or author sopen's own lines write: a reword's, an author
+/// change's, and a squash group's head and squash rows (the group's message and author).
+fn written(model: &Model) -> Vec<&Oid> {
+    let mut out = Vec::new();
+    for unit in units(&model.rows) {
+        let Unit::Group { head, members } = unit else {
+            continue;
+        };
+        let h = &model.rows[head];
+        let squashes: Vec<usize> = members
+            .into_iter()
+            .filter(|&m| model.rows[m].verb == Verb::Squash)
+            .collect();
+        if h.verb == Verb::Reword || h.author.is_some() || !squashes.is_empty() {
+            out.push(&h.commit.row.oid);
+        }
+        out.extend(squashes.into_iter().map(|m| &model.rows[m].commit.row.oid));
+    }
+    out
 }
 
 /// The commits [`FORMAT`] printed.
@@ -1780,6 +1876,7 @@ fn quick(q: &Quick, repo: &Repo, reads: &Reads) -> Result<Plan, Refused> {
 /// a staged file stays staged.
 fn reword_head(this: &Commit, message: &str, repo: &Repo, reads: &Reads) -> Result<Plan, Refused> {
     kept_whole(this)?;
+    rewritable(reads, &this.row.oid)?;
     check_message(message)?;
     let short = this.row.oid.short();
     let mut d = Draft::new(
@@ -1821,6 +1918,7 @@ fn author_head(
     reads: &Reads,
 ) -> Result<Plan, Refused> {
     kept_whole(this)?;
+    rewritable(reads, &this.row.oid)?;
     author.check()?;
     let short = this.row.oid.short();
     let mut d = Draft::new(
@@ -1886,6 +1984,12 @@ fn run_plan(
         ));
     }
     let run = model.run(repo)?;
+    for c in written(model) {
+        rewritable(reads, c)?;
+    }
+    // The run's `-c core.commentChar=#` covers only the command that starts it: a Continue or
+    // Skip reads the todo again under the repository's own setting (review round 1).
+    refuse_comment_char(reads)?;
     // 03 §8.6: a rebase writes over an ignored file in its way, with no flag to stop it.
     let paths = match &model.base {
         Base::Commit(b) => rebase_paths(reads, b.as_str()),
@@ -2031,6 +2135,16 @@ fn split_stop(commit: &Oid, repo: &Repo, reads: &Reads) -> Result<Plan, Refused>
     if repo.in_progress.operation != Some(Operation::Rebase) {
         return refused("Split is offered at an edit stop, and no rebase is stopped here");
     }
+    // The last line done is an `edit` (the probe's `done-last`), with no conflict: not a stop
+    // at a failed `exec` line or a conflict (review round 1).
+    let at_edit =
+        Banner::of(&repo.in_progress, &repo.status).is_some_and(|b| b.edit_stop().is_some());
+    if !at_edit {
+        return refused(
+            "Split is offered at an edit stop, and this rebase stopped for another reason (a \
+             conflict or a failed line)",
+        );
+    }
     if repo.head.oid() != Some(commit) {
         return refused(format!(
             "the edit stop is at {}, not {}",
@@ -2120,7 +2234,11 @@ fn continue_split(split: &Split, repo: &Repo, reads: &Reads) -> Result<Plan, Ref
             if differ.len() == 1 { "it" } else { "them" },
         ));
     }
-    actions::plan(&Action::Proceed(Proceed::Continue), repo)
+    let cont = Action::Proceed(Proceed::Continue);
+    for need in actions::needs(&cont, repo) {
+        reads.get(need);
+    }
+    actions::plan(&cont, repo)
 }
 
 /// The paths of `status --porcelain=v2 -z` records: ordinary (`1`), renamed (`2`, then its

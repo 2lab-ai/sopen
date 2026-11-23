@@ -742,13 +742,13 @@ shown in their confirmation.
 | id | Action (key) | Options | The plan |
 |---|---|---|---|
 | `reword` | Reword… (F2 on a commit) | the message, prefilled | HEAD: `commit --amend --only --allow-empty --cleanup=verbatim -F -` (no plan; *inventory §7, verified there with git 2.56.1: a staged file stays staged*); older: `pick <c>` + the message line |
-| `author` | Author and date… | author name, email, author date (prefilled); committer date: keep (default) / now / same as the author date | HEAD: `commit --amend --only --allow-empty --cleanup=verbatim -F - --author=<a> --date=<d>`, the commit's own message on stdin, with `GIT_COMMITTER_DATE` per the choice — not `--no-edit`, which cleans the message up again: trailing spaces and blank lines went, and with `--cleanup=verbatim` a leading blank line still went (*verified, git 2.56.1*); older: `pick <c>` + the author line. A commit whose message is not valid UTF-8 is refused, as for `reword`: its bytes could not be kept |
+| `author` | Author and date… | author name, email, author date (prefilled); committer date: keep (default) / now / same as the author date | HEAD: `commit --amend --only --allow-empty --cleanup=verbatim -F - --author=<a> --date=<d>`, the commit's own message on stdin, with `GIT_COMMITTER_DATE` per the choice — not `--no-edit`, which cleans the message up again: trailing spaces and blank lines went, and with `--cleanup=verbatim` a leading blank line still went (*verified, git 2.56.1*); older: `pick <c>` + the author line. A commit whose message is not valid UTF-8 is refused, as for `reword`: its bytes could not be kept (see the checks, §7.8.2) |
 | `squash` | Squash into the commit below… | the message: both messages, the older first, a blank line between, editable — each whole, byte for byte, the blank line added after the older one's last line (`rebase::squash_message`, the planner pane's and the todo's one rule) | `pick <parent>`, `fixup <c>`, the message line |
 | `fixup` | Fix up into the commit below | — | `pick <parent>`, `fixup <c>` (the older message stays) |
 | `move-up`, `move-down` | Move up / Move down | — | the two lines swapped |
 | `drop` | Drop… (F8 on a commit) | — | `drop <c>` (any commit in the range, not only a chain ending at HEAD) |
 | `edit` | Stop here to edit… | — | `edit <c>`: the run stops after `<c>`; the banner (§8.5) offers Amend, Split, Continue, Abort |
-| `split` | Split… | — (refused on a root commit: it has no `HEAD^`, *verified*) | `edit <c>`; at the stop sopen records the commit's paths (`diff-tree -r -z --name-only --no-renames <c>^1 <c>`: both names of a rename — `diff --name-only` named only the new one, and Continue then let the old name's deletion stay uncommitted, *verified, git 2.56.1*) and runs `reset --mixed <c>^1` (the parent by its hash; backup `detached`, undone in its own mode, §8.3): the commit's changes are now in the uncommitted row — files it added as **untracked** — to be committed in parts (file by file: stage, Commit…). Split is refused away from an edit stop at `<c>`, on a commit that changes no file, and with uncommitted changes at the stop. sopen's Continue is refused while any recorded path still differs from HEAD (`status --porcelain=v2 -z --untracked-files=all --ignored -- <paths>` not empty): git itself would continue and leave an added file out of history, untracked (*verified, git 2.56.1*); without `--ignored`, an added file that `.gitignore` matches did not show and Continue went ahead without it (*verified, git 2.56.1*). Parts finer than a file are not offered (§10.2). |
+| `split` | Split… | — (refused on a root commit: it has no `HEAD^`, *verified*) | `edit <c>`; at the stop sopen records the commit's paths (`diff-tree -r -z --name-only --no-renames <c>^1 <c>`: both names of a rename — `diff --name-only` named only the new one, and Continue then let the old name's deletion stay uncommitted, *verified, git 2.56.1*) and runs `reset --mixed <c>^1` (the parent by its hash; backup `detached`, undone in its own mode, §8.3): the commit's changes are now in the uncommitted row — files it added as **untracked** — to be committed in parts (file by file: stage, Commit…). Split is refused away from an edit stop at `<c>` — a rebase stopped by a conflict or a failed `exec` line is not one: the last line done must be `edit` (*verified, git 2.56.1*: a stop at a message line a `commit-msg` hook refused) — on a commit that changes no file, and with uncommitted changes at the stop. sopen's Continue is refused while any recorded path still differs from HEAD (`status --porcelain=v2 -z --untracked-files=all --ignored -- <paths>` not empty): git itself would continue and leave an added file out of history, untracked (*verified, git 2.56.1*); without `--ignored`, an added file that `.gitignore` matches did not show and Continue went ahead without it (*verified, git 2.56.1*). Parts finer than a file are not offered (§10.2). |
 | `fold` | Fold the staged changes into this commit… | — (refused with nothing staged) | `commit --fixup=<c>` (git's own `fixup! <subject>` message, no editor, *verified, git 2.56.1* under `GIT_EDITOR=false`), then the new commit's line right after `<c>`'s as `fixup HEAD fixup! <subject>`: git resolves each name of the todo when it reads it, before the rebase checks anything out, so `HEAD` is still the commit `--fixup` made (*verified, git 2.56.1*: into an older commit, into HEAD, on a detached HEAD, with unstaged changes stashed for the run). Backup also `worktree` (§8.2): Undo, even after an Abort that leaves HEAD at that commit, puts the staged changes back staged; without it they were left only in that commit (*verified, git 2.56.1*) |
 | `plan` | Edit history from here… (Cmd/Ctrl+E) | — | opens the planner with base = this commit's row: the rows above it up to HEAD |
 
@@ -776,7 +776,17 @@ uncommitted changes (its dialog has no option for it; the confirmation says so, 
   applies its stash without `--index`: every change comes back, but what was staged comes back
   unstaged (*verified, git 2.56.1*); the confirmation says so, and the run backs up `worktree` so
   Undo puts both back as they were (§8.2, §8.3). Planner runs need git 2.22
-  (`--reschedule-failed-exec`); below it they are refused.
+  (`--reschedule-failed-exec`); below it they are refused. An author change on a `squash` or
+  `fixup` row would be lost — its commit goes into the group's first row, whose author the result
+  keeps — so it is a check that fails, in either order of setting them: "`<c>`: its author would be
+  lost — it is squashed into `<head>`; set the author on `<head>`". **Only UTF-8 is rewritten**: a
+  commit whose message or author sopen's own lines write (a reword, an author change, a squash
+  group's first and squash rows; the HEAD forms) is read as stored (`cat-file commit <c>`) and
+  refused when it has an `encoding` header other than UTF-8 or bytes that are not UTF-8 —
+  "`<c>`: its message is not UTF-8 (ISO-8859-1); sopen rewrites UTF-8 only". `git log` re-encodes
+  a message and its author per that header (sopen passes `i18n.commitEncoding=UTF-8`, §3.3), so the
+  range read alone cannot see it (*verified, git 2.56.1*). git's own `pick` and `fixup` of such a
+  commit are left as they are.
 - **Other branches in the range**: with `--update-refs` (offered on git ≥ 2.38), every local branch
   whose tip is in the range — `for-each-ref --merged HEAD --no-merged <upstream> refs/heads/`, the
   current branch left out (*verified*) — gets an `update-ref refs/heads/<b>` line right after the
@@ -800,7 +810,13 @@ uncommitted changes (its dialog has no option for it; the confirmation says so, 
   stdin; nothing is written by sopen anywhere. `-c core.commentChar=#`: git reads the todo with the
   repository's comment character, so `core.commentChar = p` made every `pick` line a comment — a todo
   of picks and a message line dropped the picks, amended the base with the message and reported
-  success (*verified, git 2.56.1*); the `-c` also wins over `core.commentString` (*verified*).
+  success (*verified, git 2.56.1*); the `-c` also wins over `core.commentString` (*verified*). The
+  `-c` covers only this command: a Continue or a Skip reads the todo again under the repository's
+  own setting. So sopen **fails closed**: when the effective `core.commentChar` or
+  `core.commentString` (`config --get`) is set and is not `#`, a history-edit run is refused before
+  it starts, and the banner's Continue and Skip are refused for a rebase (§8.5's row 1; Abort still
+  runs), each with "core.commentChar is '`<c>`': start or finish this rebase in a terminal" (`auto`
+  counts as set). The HEAD forms of `reword` and `author` write no todo and are not refused.
   `--no-update-refs` (git ≥ 2.38) when other branches are not moved along, so `rebase.updateRefs` in
   the config never moves a branch the backup does not hold (the replaced todo already left it,
   *verified, git 2.56.1*; the flag says so for every git). A stop at an `edit` line exits 0; a
@@ -832,11 +848,16 @@ uncommitted changes (its dialog has no option for it; the confirmation says so, 
     (*verified*); the `GIT_COMMITTER_DATE` assignment only when the committer date is not "now". The
     last line to amend a commit sets both its message bytes and its committer date, so one line does
     both. `--no-edit` alone cleaned the message up again (trailing spaces and blank lines went), and
-    with `--cleanup=verbatim` still dropped a leading blank line (*verified, git 2.56.1*); it is used
-    only on an `edit` row, whose message the stop may have changed (`exec … git commit --amend --only
-    --allow-empty --no-edit --cleanup=verbatim --author=… --date=…`), and for a commit's own message too
-    long for one todo line (60 KiB: git runs an `exec` line as one `sh -c` argument, which Linux caps
-    at 128 KiB). A typed message past that is refused, and so is one with NUL or none at all.
+    with `--cleanup=verbatim` still dropped a leading blank line (*verified, git 2.56.1*), so it is
+    never used. On an `edit` row, whose message the stop may have changed, and for a commit's own
+    message too long for one todo line (60 KiB: git runs an `exec` line as one `sh -c` argument,
+    which Linux caps at 128 KiB), the line reads HEAD's message as it is when it runs, byte for byte:
+    `exec git cat-file commit HEAD | { while IFS= read -r l && [ -n "$l" ]; do :; done; cat; } |
+    GIT_COMMITTER_DATE='<cd>' git commit --amend --only --allow-empty --cleanup=verbatim -F -
+    --author=… --date=…` — the header read line by line up to its blank line, the rest copied as it
+    is (*verified, git 2.56.1*: a leading blank line kept, as the commit had it and as an Amend at the
+    stop made it; the read checked under sh and dash). A typed message past 60 KiB is refused, and so
+    is one with NUL or none at all.
   - The verbs `reword` and `squash` are never written: they call the editor. A message line carries
     the message instead, so **the whole plan lives in git's todo**: after a conflict stop, Continue —
     from sopen or from a terminal — finishes the same plan (*verified*: a message line ran after a

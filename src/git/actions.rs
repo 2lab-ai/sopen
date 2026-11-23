@@ -3343,7 +3343,7 @@ fn draft(action: &Action, repo: &Repo, reads: &Reads) -> Result<Plan, Refused> {
             );
             d
         }
-        Action::Proceed(p) => proceed_draft(repo, *p)?,
+        Action::Proceed(p) => proceed_draft(repo, reads, *p)?,
     };
     Ok(d.finish())
 }
@@ -3408,7 +3408,7 @@ fn pull_steps(
 }
 
 /// 03 §8.5's table: Continue, Skip, Abort for the operation in progress, Bisect Reset.
-fn proceed_draft<'a>(repo: &'a Repo, p: Proceed) -> Result<Draft<'a>, Refused> {
+fn proceed_draft<'a>(repo: &'a Repo, reads: &Reads, p: Proceed) -> Result<Draft<'a>, Refused> {
     if p == Proceed::BisectReset {
         if !repo.in_progress.bisect {
             return refused("no bisect is in progress");
@@ -3444,6 +3444,9 @@ fn proceed_draft<'a>(repo: &'a Repo, p: Proceed) -> Result<Draft<'a>, Refused> {
             ));
         }
     }
+    if op == Operation::Rebase && matches!(p, Proceed::Continue | Proceed::Skip) {
+        refuse_comment_char(reads)?;
+    }
     let mut d = Draft::new(repo, format!("{word} the {verb}"), "");
     let mut cmd = d.command(Class::Write, [verb, flag]);
     if p == Proceed::Continue && verb != "am" {
@@ -3452,6 +3455,26 @@ fn proceed_draft<'a>(repo: &'a Repo, p: Proceed) -> Result<Draft<'a>, Refused> {
     d.step(cmd);
     d.changes_files = true;
     Ok(d)
+}
+
+/// An interactive rebase's todo is read with the repository's comment character: set to anything
+/// but `#` (`core.commentChar`, or git 2.45's `core.commentString`), a `pick` line can read as a
+/// comment and its commit is dropped (03 §7.8.2, *verified, git 2.56.1* with `p`). A history
+/// edit's own start passes `-c core.commentChar=#`, which a Continue or a Skip cannot: git reads
+/// the todo again under the repository's setting. So both fail closed (S4-A review round 1):
+/// start or finish such a rebase in a terminal.
+pub(crate) fn refuse_comment_char(reads: &Reads) -> Result<(), Refused> {
+    for key in ["core.commentChar", "core.commentString"] {
+        let value = reads.get(Need::of(&["config", "--get", key]));
+        let value = String::from_utf8_lossy(&value);
+        let value = value.strip_suffix('\n').unwrap_or(&value);
+        if !value.is_empty() && value != "#" {
+            return refused(format!(
+                "{key} is '{value}': start or finish this rebase in a terminal"
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn oid_of(value: &Value) -> Option<&Oid> {

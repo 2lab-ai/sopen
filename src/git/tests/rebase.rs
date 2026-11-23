@@ -18,7 +18,7 @@ use crate::git::model::{
 use crate::git::rebase::{
     needs, open, open_needs, plan, split_of, Author, AuthorLine, Base, BranchTip, Commit,
     CommitterDate, Date, Edit, EditId, Exec, Model, Named, Op, Problem, Quick, Run, Split,
-    TodoLine, Toward, Verb, SEQUENCE_EDITOR,
+    TodoLine, Toward, Verb, HEAD_MESSAGE, SEQUENCE_EDITOR,
 };
 use crate::git::runner::{GitRunner, Handle};
 use std::path::Path;
@@ -315,9 +315,11 @@ fn todo_lines_as_git_reads_them() {
     };
     assert_eq!(
         TodoLine::Exec(Exec::Author(line(None, Some(date(1_700_000_000, 540))))).text(),
-        "exec GIT_COMMITTER_DATE='@1700000000 +0900' git commit --amend --only --allow-empty \
-         --no-edit --cleanup=verbatim --author='Ann O'\\''Ther <ann@example.invalid>' \
-         --date='@1600000000 -0230'"
+        format!(
+            "exec {HEAD_MESSAGE} | GIT_COMMITTER_DATE='@1700000000 +0900' git commit --amend \
+             --only --allow-empty --cleanup=verbatim -F - --author='Ann O'\\''Ther \
+             <ann@example.invalid>' --date='@1600000000 -0230'"
+        )
     );
     assert_eq!(
         TodoLine::Exec(Exec::Author(line(Some("m\n"), None))).text(),
@@ -364,6 +366,48 @@ fn the_message_line_comes_back_byte_for_byte_in_sh_and_dash() {
                 String::from_utf8_lossy(&out.stdout),
                 message,
                 "{shell}: {printf}"
+            );
+        }
+    }
+}
+
+/// The author line's read of HEAD's message ([`HEAD_MESSAGE`]'s body after the header's blank
+/// line) gives the message back byte for byte under `/bin/sh` and dash: a leading blank line, a
+/// header line that continues (`gpgsig`), CR, no final newline.
+#[test]
+fn the_head_message_comes_back_byte_for_byte_in_sh_and_dash() {
+    let body = HEAD_MESSAGE
+        .split_once(" | ")
+        .map(|(_, b)| b)
+        .expect("the body part");
+    for message in [
+        &b"\n\nlead\r\n# x  \n\n"[..],
+        b"plain\n",
+        b"no newline",
+        b"",
+    ] {
+        let mut object = b"tree 4b825dc642cb6eb9a060e54bf8d69288fbee4904\nauthor A <a@b> 1 +0000\n\
+                           gpgsig -----BEGIN-----\n line two\n -----END-----\n\n"
+            .to_vec();
+        object.extend_from_slice(message);
+        for shell in ["/bin/sh", "/bin/dash"] {
+            if !Path::new(shell).exists() {
+                continue;
+            }
+            use std::io::Write as _;
+            let mut child = std::process::Command::new(shell)
+                .arg("-c")
+                .arg(body)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            child.stdin.take().unwrap().write_all(&object).unwrap();
+            let out = child.wait_with_output().unwrap();
+            assert_eq!(
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(message),
+                "{shell}"
             );
         }
     }
@@ -2236,8 +2280,10 @@ fn g_h5_update_refs() {
 
 /// A todo line is never read as a comment: with `core.commentChar = p` git reads every `pick`
 /// line as a comment, so a todo of picks and a message line drops the picks and amends the base
-/// instead, and says it succeeded (measured with git 2.56.1). The run passes `-c
-/// core.commentChar=#`, which `core.commentString` gives way to as well.
+/// instead, and says it succeeded (measured with git 2.56.1, before the run's `-c
+/// core.commentChar=#`). Since review round 1 the run fails closed on any comment character but
+/// `#`, `core.commentString` too (a Continue would read the todo under the repository's own
+/// setting; `r1_comment_char_fails_closed`): refused, nothing changed.
 #[test]
 fn a_todo_line_is_never_read_as_a_comment() {
     let Some(fx) = fixture() else { return };
@@ -2263,11 +2309,18 @@ fn a_todo_line_is_never_read_as_a_comment() {
                     message: "two, reworded\n".into(),
                 })
                 .unwrap();
-            let (_, outcome) = run_on(&runner, &dir, repo, &Edit::Plan(model));
-            done(&lane, &outcome);
+            let edit = Edit::Plan(model);
+            let mut repo = repo;
+            ready(&runner, &mut repo, &edit);
+            let why = plan(&edit, &repo).unwrap_err().0;
+            assert_eq!(
+                why,
+                format!("{key} is '{value}': start or finish this rebase in a terminal"),
+                "{lane}"
+            );
             assert_eq!(
                 subjects(&fx, &dir, "HEAD"),
-                ["first", "one", "two, reworded", "three"],
+                ["first", "one", "two", "three"],
                 "{lane}"
             );
             assert_eq!(fx.oid(&dir, "HEAD~3"), base, "{lane}: the base untouched");
@@ -2613,5 +2666,324 @@ fn quick_squash_fixup_and_moves() {
         .unwrap_err()
         .0;
         assert!(why.contains("top"), "{lane}: {why}");
+    }
+}
+
+// =============================================================================================
+// Review round 1 (PR #89)
+
+/// R1-1: an author set on a row that a squash group folds is lost with the row's commit, in
+/// either order (author, then the verb; the verb, then the author): a problem that names the
+/// head to set it on, and the run is refused.
+#[test]
+fn r1_an_author_on_a_folded_row_is_a_problem() {
+    let Some(fx) = fixture() else { return };
+    for (lane, runner) in fx.lanes() {
+        let lane = lane.as_str();
+        let dir = fx.repo(&format!("r1-folded-author-{lane}"));
+        let base = fx.oid(&dir, "HEAD");
+        let c1 = fx.commit(&dir, "f1", "1\n", "one");
+        let c2 = fx.commit(&dir, "f2", "2\n", "two");
+        let c3 = fx.commit(&dir, "f3", "3\n", "three");
+        let who = Some(someone("Bo"));
+        // The author first, then `fixup`; and `squash` first, then the author.
+        let orders: [Vec<Op>; 2] = [
+            vec![
+                Op::Author {
+                    commit: c2.clone(),
+                    author: who.clone(),
+                },
+                Op::Verb {
+                    commit: c2.clone(),
+                    verb: Verb::Fixup,
+                },
+            ],
+            vec![
+                Op::Verb {
+                    commit: c3.clone(),
+                    verb: Verb::Squash,
+                },
+                Op::Author {
+                    commit: c3.clone(),
+                    author: who.clone(),
+                },
+            ],
+        ];
+        for (ops, (lost, into)) in orders.into_iter().zip([(&c2, &c1), (&c3, &c2)]) {
+            let (repo, mut model) = opened(&runner, &dir, &Base::Commit(base.clone()));
+            for op in ops {
+                model.apply(op).unwrap();
+            }
+            let problems: Vec<String> = model.problems(&repo).iter().map(Problem::text).collect();
+            let want = format!(
+                "{}: its author would be lost — it is squashed into {}; set the author on {}",
+                lost.short(),
+                into.short(),
+                into.short()
+            );
+            assert_eq!(problems, std::slice::from_ref(&want), "{lane}");
+            let why = planned(&runner, &dir, &Edit::Plan(model)).unwrap_err().0;
+            assert_eq!(why, want, "{lane}");
+        }
+    }
+}
+
+/// R1-2: an author change on an `edit` row keeps the message as it is at the stop, byte for
+/// byte — read with `git cat-file commit HEAD` — a leading blank line included: as the commit
+/// had it, and as an Amend at the stop made it.
+#[test]
+fn r1_an_author_at_an_edit_stop_keeps_the_message_at_the_stop() {
+    const KEPT: &[u8] = b"\n  a leading blank line\n# hash\n\ntrailing   \n\n";
+    const AMENDED: &str = "\n\namended at the stop  \n\n";
+    let Some(fx) = fixture() else { return };
+    for (lane, runner) in fx.lanes() {
+        let lane = lane.as_str();
+        let dir = fx.repo(&format!("r1-edit-author-{lane}"));
+        let base = fx.oid(&dir, "HEAD");
+        fx.commit(&dir, "f1", "1\n", "one");
+        commit_raw(&fx, &dir, Some(("f2", "2\n")), KEPT, None);
+        fx.commit(&dir, "f3", "3\n", "three");
+        for amend in [None, Some(AMENDED)] {
+            let (repo, mut model) = opened(&runner, &dir, &Base::Commit(base.clone()));
+            let edited = model.rows[1].commit.row.oid.clone();
+            for op in [
+                Op::Verb {
+                    commit: edited.clone(),
+                    verb: Verb::Edit,
+                },
+                Op::Author {
+                    commit: edited.clone(),
+                    author: Some(someone("Bo")),
+                },
+            ] {
+                model.apply(op).unwrap();
+            }
+            let (_, outcome) = run_on(&runner, &dir, repo, &Edit::Plan(model));
+            done(lane, &outcome);
+            assert!(!idle(&runner, &dir), "{lane}: the stop");
+            if let Some(m) = amend {
+                let (_, amended) = act(
+                    &runner,
+                    &dir,
+                    &Action::Amend {
+                        message: Some(m.into()),
+                    },
+                );
+                done(lane, &amended);
+            }
+            let (_, cont) = act(&runner, &dir, &Action::Proceed(Proceed::Continue));
+            done(lane, &cont);
+            assert!(idle(&runner, &dir), "{lane}");
+            let want = amend.map_or(KEPT.to_vec(), |m| m.as_bytes().to_vec());
+            assert_eq!(
+                String::from_utf8_lossy(&raw_message(&fx, &dir, "HEAD~1")),
+                String::from_utf8_lossy(&want),
+                "{lane}: {amend:?}"
+            );
+            assert_eq!(idents(&fx, &dir, "HEAD~1")[0], "Bo", "{lane}");
+        }
+    }
+}
+
+/// A commit made with a message encoding other than UTF-8 (`i18n.commitEncoding`): git stores
+/// the bytes as given and writes an `encoding` header.
+fn commit_encoded(fx: &Fx, dir: &Path, file: (&str, &str), encoding: &str, message: &[u8]) -> Oid {
+    std::fs::write(dir.join(file.0), file.1).unwrap();
+    fx.git(dir, &["add", "--", file.0]);
+    let m = fx.root.join("encoded.txt");
+    std::fs::write(&m, message).unwrap();
+    let key = format!("i18n.commitEncoding={encoding}");
+    fx.git(
+        dir,
+        &["-c", &key, "commit", "-q", "-F", m.to_str().unwrap()],
+    );
+    fx.oid(dir, "HEAD")
+}
+
+/// R1-3: a commit whose message or author is not UTF-8 is never rewritten by sopen's own lines:
+/// read raw (`cat-file commit`), an `encoding` header other than UTF-8 (which `git log`
+/// re-encodes, so the range read cannot see it) or bytes that are not UTF-8 refuse a reword, an
+/// author change and a squash, naming the encoding. A drop elsewhere in the range still runs.
+#[test]
+fn r1_a_commit_not_in_utf8_is_never_rewritten() {
+    let Some(fx) = fixture() else { return };
+    for (lane, runner) in fx.lanes() {
+        let lane = lane.as_str();
+        let dir = fx.repo(&format!("r1-latin1-{lane}"));
+        let base = fx.oid(&dir, "HEAD");
+        let latin = commit_encoded(&fx, &dir, ("f1", "1\n"), "ISO-8859-1", b"caf\xe9 au lait\n");
+        let raw = fx
+            .output(&dir, &["cat-file", "commit", latin.as_str()])
+            .stdout;
+        assert!(
+            raw.windows(20).any(|w| w == b"encoding ISO-8859-1\n"),
+            "{lane}: the fixture"
+        );
+        let plain = fx.commit(&dir, "f2", "2\n", "two");
+        let head = commit_encoded(&fx, &dir, ("f3", "3\n"), "ISO-8859-1", b"na\xefve\n");
+        let refused = |edit: Edit| planned(&runner, &dir, &edit).unwrap_err().0;
+        for (what, edit) in [
+            (
+                "reword",
+                Edit::Quick(Quick::Reword {
+                    commit: latin.clone(),
+                    message: "x\n".into(),
+                }),
+            ),
+            (
+                "reword HEAD",
+                Edit::Quick(Quick::Reword {
+                    commit: head.clone(),
+                    message: "x\n".into(),
+                }),
+            ),
+            (
+                "author HEAD",
+                Edit::Quick(Quick::Author {
+                    commit: head.clone(),
+                    author: someone("Bo"),
+                }),
+            ),
+            (
+                "squash",
+                Edit::Quick(Quick::Squash {
+                    commit: plain.clone(),
+                    message: "x\n".into(),
+                }),
+            ),
+        ] {
+            let why = refused(edit);
+            assert!(
+                why.contains("is not UTF-8 (ISO-8859-1); sopen rewrites UTF-8 only"),
+                "{lane}: {what}: {why}"
+            );
+        }
+        // The planner's model reads the message re-encoded: `R` is allowed there, the run is
+        // refused.
+        let (_, mut model) = opened(&runner, &dir, &Base::Commit(base.clone()));
+        assert!(model.rows.iter().all(|r| !r.commit.message_lossy), "{lane}");
+        model
+            .apply(Op::Verb {
+                commit: latin.clone(),
+                verb: Verb::Reword,
+            })
+            .unwrap();
+        let why = planned(&runner, &dir, &Edit::Plan(model)).unwrap_err().0;
+        assert!(why.starts_with(latin.short()), "{lane}: {why}");
+        // A drop elsewhere: git replays the others itself.
+        let (_, outcome) = run(&runner, &dir, &Edit::Quick(Quick::Drop { commit: plain }));
+        done(lane, &outcome);
+
+        // An author that is not UTF-8 with no `encoding` header.
+        let dir = fx.repo(&format!("r1-latin1-author-{lane}"));
+        let c = commit_with_author(&fx, &dir, b"Jos\xe9 <jose@example.invalid>");
+        let edit = Edit::Quick(Quick::Author {
+            commit: c.clone(),
+            author: someone("Bo"),
+        });
+        let why = planned(&runner, &dir, &edit).unwrap_err().0;
+        assert!(why.contains("its author is not UTF-8"), "{lane}: {why}");
+    }
+}
+
+/// A commit of a new file whose author line is `author` byte for byte (`hash-object`); the
+/// branch moves to it.
+fn commit_with_author(fx: &Fx, dir: &Path, author: &[u8]) -> Oid {
+    use std::io::Write as _;
+    std::fs::write(dir.join("a"), "a\n").unwrap();
+    fx.git(dir, &["add", "a"]);
+    let tree = fx.git(dir, &["write-tree"]).trim().to_string();
+    let parent = fx.oid(dir, "HEAD");
+    let mut object = format!("tree {tree}\nparent {}\nauthor ", parent.as_str()).into_bytes();
+    object.extend_from_slice(author);
+    object.extend_from_slice(
+        b" 1500000000 +0000\ncommitter A U Thor <a@example.invalid> 1500000000 +0000\n\nplain\n",
+    );
+    let mut c = fx.command(dir, &["hash-object", "-t", "commit", "-w", "--stdin"]);
+    c.stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped());
+    let mut child = c.spawn().unwrap();
+    child.stdin.take().unwrap().write_all(&object).unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(out.status.success(), "hash-object");
+    let oid = String::from_utf8(out.stdout).unwrap().trim().to_string();
+    fx.git(dir, &["update-ref", "HEAD", &oid]);
+    Oid::parse(&oid).unwrap()
+}
+
+/// R1-4: `core.commentChar` set to anything but `#` fails closed: sopen's `-c` covers only the
+/// command that starts the rebase, and Continue or Skip reads the todo again under the
+/// repository's own setting, where `p` makes the remaining picks comments. So a history-edit
+/// run is refused to start, and the banner's Continue and Skip are refused for a rebase; Abort
+/// still runs. `#` and unset both work.
+#[test]
+fn r1_comment_char_fails_closed() {
+    let Some(fx) = fixture() else { return };
+    for (lane, runner) in fx.lanes() {
+        let lane = lane.as_str();
+        let dir = fx.repo(&format!("r1-comment-{lane}"));
+        fx.commit(&dir, "f1", "1\n", "one");
+        let c2 = fx.commit(&dir, "f2", "2\n", "two");
+        fx.commit(&dir, "f3", "3\n", "three");
+        let said = "core.commentChar is 'p': start or finish this rebase in a terminal";
+        fx.git(&dir, &["config", "core.commentChar", "p"]);
+        let why = planned(
+            &runner,
+            &dir,
+            &Edit::Quick(Quick::Drop { commit: c2.clone() }),
+        )
+        .unwrap_err()
+        .0;
+        assert_eq!(why, said, "{lane}: the start");
+
+        fx.git(&dir, &["config", "--unset", "core.commentChar"]);
+        let (_, outcome) = run(&runner, &dir, &Edit::Quick(Quick::Edit { commit: c2 }));
+        done(lane, &outcome);
+        assert!(!idle(&runner, &dir), "{lane}: the stop");
+        fx.git(&dir, &["config", "core.commentChar", "p"]);
+        for p in [Proceed::Continue, Proceed::Skip] {
+            let why = super::actions::planned(&runner, &dir, &Action::Proceed(p))
+                .unwrap_err()
+                .0;
+            assert_eq!(why, said, "{lane}: {p:?}");
+        }
+        assert!(super::actions::planned(&runner, &dir, &Action::Proceed(Proceed::Abort)).is_ok());
+        fx.git(&dir, &["config", "core.commentChar", "#"]);
+        let (_, cont) = act(&runner, &dir, &Action::Proceed(Proceed::Continue));
+        done(lane, &cont);
+        assert!(idle(&runner, &dir), "{lane}");
+        assert_eq!(
+            subjects(&fx, &dir, "HEAD"),
+            ["first", "one", "two", "three"]
+        );
+    }
+}
+
+/// R1-5: Split is offered at an edit stop only: a rebase stopped by a failed `exec` line (a
+/// `commit-msg` hook refused a message line), clean and at HEAD, is refused.
+#[test]
+fn r1_split_needs_an_edit_stop() {
+    let Some(fx) = fixture() else { return };
+    for (lane, runner) in fx.lanes() {
+        let lane = lane.as_str();
+        let dir = fx.repo(&format!("r1-split-exec-{lane}"));
+        let c1 = fx.commit(&dir, "f1", "1\n", "one");
+        fx.commit(&dir, "f2", "2\n", "two");
+        script(&dir.join(".git/hooks/commit-msg"), "exit 1");
+        let (_, outcome) = run(
+            &runner,
+            &dir,
+            &Edit::Quick(Quick::Reword {
+                commit: c1.clone(),
+                message: "one, reworded\n".into(),
+            }),
+        );
+        failed_at(lane, &outcome, 1);
+        assert!(!idle(&runner, &dir), "{lane}: stopped at the exec line");
+        let head = fx.oid(&dir, "HEAD");
+        let why = planned(&runner, &dir, &Edit::SplitStop { commit: head })
+            .unwrap_err()
+            .0;
+        assert!(why.contains("edit stop"), "{lane}: {why}");
     }
 }
