@@ -1214,6 +1214,48 @@ fn a_file_at_a_revision_moves_and_goes_to_but_edits_and_saves_nothing() {
     );
 }
 
+/// Told late (`set_read_only(true)` after the first pass, review round 1): with a byte typed,
+/// kept in the journal, and the Save As modal open on a folder, the flag closes the modal — its
+/// Enter writes nothing — and after it no key, focus loss or close writes anything: no Save As
+/// file, no journal generation, no save, copy or backup. It closes without asking.
+#[test]
+fn told_late_with_save_as_open_nothing_is_written_after_the_flag() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("rev.bin");
+    std::fs::write(&path, FIXTURE).unwrap();
+    let out = tmp.path().join("out");
+    std::fs::create_dir(&out).unwrap();
+    let mut fx = in_place(&path, tmp, 1000.0, 600.0);
+    fx.typed("00");
+    fx.drv
+        .until(&mut fx.win, 20, |w| w.schedule.status() == Keep::Kept);
+    fx.win.save_as_folder = Some(out.clone());
+    fx.key(Key::F7, Modifiers::NONE);
+    fx.drv.idle(&mut fx.win, 2);
+    assert!(fx.win.save_as.is_some(), "F7");
+    let before = files_under(fx.tmp.path());
+    fx.win.set_read_only(true);
+    fx.key(Key::Enter, Modifiers::NONE);
+    fx.drv.until(&mut fx.win, 10, |w| w.save_as.is_none());
+    fx.typed("41");
+    fx.key(Key::S, command(false));
+    fx.key(Key::S, command(true));
+    fx.drv.focused = false;
+    for _ in 0..30 {
+        fx.drv.idle(&mut fx.win, 1);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(
+        walk(&out).is_empty(),
+        "the open Save As wrote after the flag"
+    );
+    assert!(fx.win.job.is_none() && fx.win.save_as.is_none());
+    assert!(fx.win.close_requested(), "nothing to ask");
+    let Fx { tmp, win, .. } = fx;
+    drop(win);
+    assert_eq!(files_under(tmp.path()), before, "written after the flag");
+}
+
 /// `SOPEN_STATE` patches (each byte an undo step) and places the cursor; `SOPEN_AUTOSAVE`
 /// saves them without a window, or reports the refusal (exit 3 in the CLI).
 #[test]

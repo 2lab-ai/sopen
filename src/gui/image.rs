@@ -2110,7 +2110,10 @@ impl Drop for ImageWindow {
         }
         // A scripted run's edits are its state's, not the owner's: nothing of them is kept —
         // unless a Save's outcome is unknown (the next open reconciles it).
-        if self.scripted && self.keeper.settle_writer().pending_save() == Some(false) {
+        if self.scripted
+            && self.at_revision.is_none()
+            && self.keeper.settle_writer().pending_save() == Some(false)
+        {
             if let Err(e) = self.keeper.discard() {
                 eprintln!("sopen: {e:#}");
             }
@@ -2249,15 +2252,16 @@ impl ImageWindow {
     /// a generation at most [`journal::DELAY`] after a change, written on a worker; `NOT kept`
     /// for a picture no operations on the file make.
     fn keep(&mut self, ctx: &egui::Context) {
+        // Nothing for a file at a revision: no generation is written once it is one — not
+        // even the one asked for while another was being written, which polling the keeper
+        // would start.
+        if self.at_revision.is_some() {
+            return;
+        }
         self.keeper.poll();
         // Nothing while a Save runs, nor while the look for earlier sessions' journals is out:
-        // it would take a journal this session is making for an earlier one's. Nothing for a
-        // file at a revision: it is never written.
-        if self.job.is_some()
-            || self.saving_as.is_some()
-            || self.recovering.is_some()
-            || self.at_revision.is_some()
-        {
+        // it would take a journal this session is making for an earlier one's.
+        if self.job.is_some() || self.saving_as.is_some() || self.recovering.is_some() {
             return;
         }
         // A generation asked for at once while that look was out (focus loss, closing, a Save).
@@ -2309,10 +2313,10 @@ impl ImageWindow {
     /// waits in its queue until it is in ([`ImageWindow::launch`]). While the look for earlier
     /// sessions' journals is out, it is asked for once that is back.
     fn keep_now(&mut self) {
-        self.keeper.poll();
         if self.at_revision.is_some() {
             return;
         }
+        self.keeper.poll();
         if self.recovering.is_some() {
             self.flush_wanted = true;
             return;
@@ -2529,6 +2533,10 @@ impl ImageWindow {
     fn answer(&mut self, i: usize, answer: Answer) {
         if self.removing.is_some() {
             return;
+        }
+        // Restore, Discard, Remove it and Keep it all write: not for a file at a revision.
+        if self.at_revision.is_some() && answer != Answer::Later {
+            return self.status = Status::error(format!("cannot answer: {AT_A_REVISION}"));
         }
         match answer {
             Answer::Restore => self.restore(i),
@@ -2923,11 +2931,33 @@ impl ImageWindow {
         self.launch(ctx);
     }
 
+    /// A save in its queue, dropped: the window shows a file at a revision now. Nothing of it
+    /// was sent; its question, if it waits on one, stays in its record for the next open.
+    fn refuse_queued(&mut self) {
+        if self.queued.take().is_some() {
+            self.saves_ended += 1;
+            self.status = Status::error(format!("cannot save: {AT_A_REVISION}"));
+        }
+        if self.answering.is_none() {
+            self.asking = None;
+        }
+    }
+
     /// The queued save, once the journal holds its edits and nothing else is in its way.
     fn launch(&mut self, ctx: &egui::Context) {
         let Some(kind) = self.queued else {
             return;
         };
+        // Where a queued save starts writing: never for a file at a revision, however late it
+        // became one.
+        if self.at_revision.is_some() {
+            self.refuse_queued();
+            // A close that waited for it goes ahead: nothing is left to ask about.
+            if std::mem::take(&mut self.close_when_done) {
+                super::request_close(ctx);
+            }
+            return;
+        }
         self.keeper.poll();
         if self.recovering.is_some() || self.flush_wanted || !self.keeper.settled() {
             return;
@@ -3102,6 +3132,10 @@ impl ImageWindow {
 
     /// The Save As modal (07 §7) over the encoder's output, its field in the download folder.
     fn open_save_as(&mut self, encoded: Encoded, rev: u64, close_after: bool) {
+        // An encode that ran while the window became a file at a revision: no modal to save it.
+        if self.at_revision.is_some() {
+            return self.status = Status::error(format!("cannot save: {AT_A_REVISION}"));
+        }
         let name = self.name.clone();
         let bytes = Arc::new(encoded.bytes);
         let job = save_as::Job {
@@ -3129,6 +3163,13 @@ impl ImageWindow {
         let Some(open) = &mut self.saving_as else {
             return;
         };
+        // Where Save As starts writing is the modal's pass: a file at a revision has none — a
+        // modal not writing yet goes (one already writing finishes).
+        if self.at_revision.is_some() && !open.modal.busy() {
+            self.saving_as = None;
+            self.saves_ended += 1;
+            return;
+        }
         let ended = open.modal.show(ctx);
         let busy = open.modal.busy();
         match ended {
@@ -3417,7 +3458,8 @@ impl ImageWindow {
             && self.job.is_none()
             && self.queued.is_none()
             && self.removing.is_none()
-            && self.keeper.settled()
+            // A file at a revision waits on no generation: none is taken after the flag.
+            && (self.at_revision.is_some() || self.keeper.settled())
             && self.recovering.is_none()
             && self.saving_as.as_ref().is_none_or(|s| !s.modal.busy())
             // `restore=1`: not before the listing is back and its first row's Restore pressed —
@@ -3599,6 +3641,10 @@ impl ImageWindow {
     }
 
     fn close_prompt(&mut self, ctx: &egui::Context) {
+        // A file at a revision has nothing to ask about (its Discard removes the journal).
+        if self.at_revision.is_some() {
+            self.prompt = false;
+        }
         if !self.prompt {
             return;
         }
@@ -3772,9 +3818,17 @@ impl super::Window for ImageWindow {
                 let own = self.doc.read_only.replace(AT_A_REVISION.to_string());
                 self.at_revision = Some(own);
                 // Told late (its opener says so before the first pass): an earlier session's
-                // rows go unanswered — their Restore, Discard and Remove all write.
+                // rows go unanswered — their Restore, Discard and Remove all write — and so do
+                // the close prompt and a Save As not writing yet. A save in its queue is
+                // dropped where it would start ([`ImageWindow::launch`]); one already writing
+                // finishes.
                 self.rows.clear();
                 self.recovering = None;
+                self.prompt = false;
+                if self.saving_as.as_ref().is_some_and(|s| !s.modal.busy()) {
+                    self.saving_as = None;
+                    self.saves_ended += 1;
+                }
             }
             (true, kept) => self.at_revision = kept,
             (false, Some(own)) => self.doc.read_only = own,

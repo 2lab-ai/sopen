@@ -646,11 +646,24 @@ fn window_name(name: &str) -> bool {
 /// windows that are gone (their lock is free, or missing) and old free locks without a folder,
 /// so a crashed window's files do not stay. Where the lock cannot be taken (a filesystem
 /// without working locks) there is no space: its folder would look like a crashed window's.
+/// What it removes, it removes only while the path still names what it made: the folder's
+/// device and inode, the lock it holds — never through a link put in their place.
 pub struct RevisionSpace {
     dir: PathBuf,
+    /// The folder's device and inode, as made.
+    id: (u64, u64),
     lock: PathBuf,
     _held: File,
     next: std::sync::atomic::AtomicU64,
+}
+
+/// A folder's device and inode, the last component not followed.
+fn dir_id(dir: &Path) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::symlink_metadata(dir)
+        .ok()
+        .filter(|m| m.is_dir())
+        .map(|m| (m.dev(), m.ino()))
 }
 
 impl RevisionSpace {
@@ -659,56 +672,74 @@ impl RevisionSpace {
     }
 
     /// [`RevisionSpace::new`], with `try_lock` standing in for `File::try_lock` (tests: a
-    /// filesystem whose locks fail).
+    /// filesystem whose locks fail, a pause before the lock is taken).
     fn new_with(
         cache: &Path,
         try_lock: &mut dyn FnMut(&File) -> std::result::Result<(), std::fs::TryLockError>,
     ) -> Result<Self> {
+        const TRIES: u32 = 3;
         let root = revisions_root(cache);
+        for _ in 0..TRIES {
+            let (lock, held) = Self::new_lock(&root)?;
+            // Without its lock held the folder would look like a crashed window's, and the next
+            // window's sweep would remove it under this one: no space, then.
+            if let Err(e) = try_lock(&held) {
+                let _ = std::fs::remove_file(&lock);
+                let _ = std::fs::remove_dir(&root);
+                let why = match e {
+                    std::fs::TryLockError::Error(e) => e.to_string(),
+                    std::fs::TryLockError::WouldBlock => "it is held".to_string(),
+                };
+                anyhow::bail!(
+                    "{} cannot be locked ({why}): no files at a revision",
+                    lock.display()
+                );
+            }
+            // A pause between making the lock and taking it, past a lone lock's age, lets a
+            // sweep take the free lock for a crashed window's and unlink it: what is locked is
+            // then no file at the path, and the folder would be swept as a crashed window's.
+            // Another lock is made; whatever is at the path now is not this space's.
+            if !same_file(&held, &lock) {
+                continue;
+            }
+            let dir = lock.with_extension("");
+            if let Err(e) = DirBuilder::new().mode(0o700).create(&dir) {
+                let _ = std::fs::remove_file(&lock);
+                return Err(e).with_context(|| format!("cannot create {}", dir.display()));
+            }
+            let Some(id) = dir_id(&dir) else {
+                let _ = std::fs::remove_file(&lock);
+                anyhow::bail!("{} is not the folder just made", dir.display());
+            };
+            return Ok(Self {
+                dir,
+                id,
+                lock,
+                _held: held,
+                next: std::sync::atomic::AtomicU64::new(0),
+            });
+        }
+        anyhow::bail!(
+            "the lock made in {} was swept before it was taken, {TRIES} times: no files at a \
+             revision",
+            root.display()
+        )
+    }
+
+    /// A new lock file for a window under `root`, not locked yet. The root goes with its last
+    /// window's folder: one that went between the root being made here and the lock being made
+    /// in it took the root along — made again, then.
+    fn new_lock(root: &Path) -> Result<(PathBuf, File)> {
         let lock_name = || root.join(format!("{}.lock", &crate::remote::random_hex()[..12]));
-        let mut made = None;
-        // The root goes with its last window's folder: one that went between the root being
-        // made here and the lock being made in it took the root along — made again, then.
         for _ in 0..3 {
-            private_dir(&root)?;
-            sweep_windows(&root, SystemTime::now());
+            private_dir(root)?;
+            sweep_windows(root, SystemTime::now());
             match create_unique(|_| lock_name()) {
                 Err(_) if !root.exists() => continue,
-                done => {
-                    made = Some(done?);
-                    break;
-                }
+                done => return done,
             }
         }
-        let (lock, held) = match made {
-            Some(made) => made,
-            None => create_unique(|_| lock_name())?,
-        };
-        // Without its lock held the folder would look like a crashed window's, and the next
-        // window's sweep would remove it under this one: no space, then.
-        if let Err(e) = try_lock(&held) {
-            let _ = std::fs::remove_file(&lock);
-            let _ = std::fs::remove_dir(&root);
-            let why = match e {
-                std::fs::TryLockError::Error(e) => e.to_string(),
-                std::fs::TryLockError::WouldBlock => "it is held".to_string(),
-            };
-            anyhow::bail!(
-                "{} cannot be locked ({why}): no files at a revision",
-                lock.display()
-            );
-        }
-        let dir = lock.with_extension("");
-        if let Err(e) = DirBuilder::new().mode(0o700).create(&dir) {
-            let _ = std::fs::remove_file(&lock);
-            return Err(e).with_context(|| format!("cannot create {}", dir.display()));
-        }
-        Ok(Self {
-            dir,
-            lock,
-            _held: held,
-            next: std::sync::atomic::AtomicU64::new(0),
-        })
+        create_unique(|_| lock_name())
     }
 
     /// The window's folder.
@@ -760,13 +791,20 @@ impl RevisionSpace {
 
 impl Drop for RevisionSpace {
     fn drop(&mut self) {
+        // Only what the paths still name as made: a folder swapped for a link, or a root
+        // swapped for one (it would be followed), is never removed through. A cache reached
+        // through a link is named the same way as when the folder was made.
         // The folder first, while the lock is still held: no sweep takes it meanwhile.
-        let _ = std::fs::remove_dir_all(&self.dir);
-        let _ = std::fs::remove_file(&self.lock);
-        // The root too, when this was the last window's folder in it (it is removed only
-        // empty): a closed window leaves nothing of its revisions in the cache.
-        if let Some(root) = self.dir.parent() {
-            let _ = std::fs::remove_dir(root);
+        if dir_id(&self.dir) == Some(self.id) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+        // The lock, and the root it is in when this was the last window's folder there (it is
+        // removed only empty): a closed window leaves nothing of its revisions in the cache.
+        if same_file(&self._held, &self.lock) {
+            let _ = std::fs::remove_file(&self.lock);
+            if let Some(root) = self.dir.parent() {
+                let _ = std::fs::remove_dir(root);
+            }
         }
     }
 }
@@ -1703,6 +1741,90 @@ mod tests {
             RevisionSpace::new(tmp.path()).is_ok(),
             "the next one starts"
         );
+    }
+
+    /// Dropping a space removes its folder and its lock only while their paths still name what
+    /// it made (device and inode): a window folder swapped for a link to an outside folder, or
+    /// the revisions root swapped for one, leaves what is there untouched. A cache reached
+    /// through a link (a folder on another disk) is cleaned as ever.
+    #[test]
+    fn a_dropped_space_removes_only_the_folder_it_made() {
+        use std::os::unix::fs::symlink;
+        // The window folder swapped for a link to an outside folder.
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("sentinel"), "not sopen's").unwrap();
+        let space = RevisionSpace::new(tmp.path()).unwrap();
+        let dir = space.dir().to_path_buf();
+        std::fs::remove_dir(&dir).unwrap();
+        symlink(outside.path(), &dir).unwrap();
+        drop(space);
+        assert!(
+            outside.path().join("sentinel").exists(),
+            "removed through a link"
+        );
+        // The root swapped for a link to an outside folder holding the window's names.
+        let tmp = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let space = RevisionSpace::new(tmp.path()).unwrap();
+        let window = space.dir().file_name().unwrap().to_owned();
+        let mut lock_name = window.clone();
+        lock_name.push(".lock");
+        let root = revisions_root(tmp.path());
+        std::fs::rename(&root, tmp.path().join("moved")).unwrap();
+        std::fs::create_dir(elsewhere.path().join(&window)).unwrap();
+        std::fs::write(elsewhere.path().join(&window).join("sentinel"), "x").unwrap();
+        std::fs::write(elsewhere.path().join(&lock_name), "not sopen's").unwrap();
+        symlink(elsewhere.path(), &root).unwrap();
+        drop(space);
+        assert!(
+            elsewhere.path().join(&window).join("sentinel").exists(),
+            "removed through a linked root"
+        );
+        assert!(
+            elsewhere.path().join(&lock_name).exists(),
+            "a lock not its own"
+        );
+        // A cache reached through a link: its space goes with the window.
+        let real = tempfile::tempdir().unwrap();
+        let links = tempfile::tempdir().unwrap();
+        let cache = links.path().join("cache");
+        symlink(real.path(), &cache).unwrap();
+        let space = RevisionSpace::new(&cache).unwrap();
+        space.create("a.png").unwrap();
+        drop(space);
+        assert!(
+            !real.path().join(REVISIONS).exists(),
+            "a linked cache is cleaned"
+        );
+    }
+
+    /// A creator held between making its lock and locking it, for longer than a lone lock's
+    /// age, may find a sweep took the free lock for a crashed window's and unlinked it. It does
+    /// not go on with a lock on an unlinked file (its folder would look like a crashed window's
+    /// to the next sweep): it sees its path no longer names what it locked, and makes another.
+    #[test]
+    fn a_lock_swept_before_it_was_taken_is_made_again() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = revisions_root(tmp.path());
+        let later = SystemTime::now() + 2 * LONE_LOCK_AGE;
+        let mut tries = 0;
+        let space = RevisionSpace::new_with(tmp.path(), &mut |file| {
+            tries += 1;
+            if tries == 1 {
+                // The pause: a sweep two minutes on finds the lock old, free and alone.
+                sweep_windows(&root, later);
+            }
+            file.try_lock()
+        })
+        .unwrap();
+        assert_eq!(tries, 2, "made again once");
+        assert!(
+            same_file(&space._held, &space.lock),
+            "the lock path names the lock held"
+        );
+        sweep_windows(&root, later);
+        assert!(space.dir().exists(), "its folder survives the next sweep");
     }
 
     #[test]

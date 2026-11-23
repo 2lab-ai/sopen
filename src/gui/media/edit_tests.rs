@@ -1826,3 +1826,45 @@ fn a_file_at_a_revision_plays_but_edits_saves_and_exports_nothing() {
         "nothing written, nothing removed"
     );
 }
+
+/// Told late (`set_read_only(true)` after the first pass, review round 1): with a cut kept in
+/// the journal and the Save As modal open on a folder, the flag closes the modal — its Enter
+/// renders and writes nothing — and after it no key, focus loss or close writes anything: no
+/// Save As file, no render, no journal generation, no save or backup. It closes without asking.
+#[test]
+fn told_late_with_save_as_open_nothing_is_written_after_the_flag() {
+    let Some(mut fx) = audio(false) else { return };
+    fx.drag(0.25, 0.5);
+    fx.drv.cut(&mut fx.win);
+    fx.drv
+        .until(&mut fx.win, 20, |w| w.schedule.status() == Keep::Kept);
+    let out = fx.tmp.path().join("out");
+    std::fs::create_dir(&out).unwrap();
+    fx.win.save_as_folder = Some(out.clone());
+    fx.key(Key::F7, Modifiers::NONE);
+    assert!(fx.win.save_as.is_some(), "F7");
+    let before = files_under(fx.tmp.path());
+    crate::gui::Window::set_read_only(&mut fx.win, true);
+    fx.key(Key::Enter, Modifiers::NONE);
+    fx.drv.until(&mut fx.win, 10, |w| w.save_as.is_none());
+    fx.drag(0.0, 0.25);
+    fx.drv.cut(&mut fx.win);
+    fx.key(Key::S, command(false));
+    fx.drv.focused = false;
+    for _ in 0..30 {
+        fx.drv.idle(&mut fx.win, 1);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(
+        walk(&out).is_empty(),
+        "the open Save As wrote after the flag"
+    );
+    assert!(fx.win.save.is_none() && fx.win.save_as.is_none() && fx.win.job.is_none());
+    assert!(
+        crate::gui::Window::close_requested(&mut fx.win),
+        "nothing to ask"
+    );
+    let Fx { tmp, win, .. } = fx;
+    drop(win);
+    assert_eq!(files_under(tmp.path()), before, "written after the flag");
+}

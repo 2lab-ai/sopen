@@ -3073,6 +3073,10 @@ impl HexWindow {
         if i >= self.rows.len() {
             return;
         }
+        // Restore, Load, Discard, Remove and Keep all write: not for a file at a revision.
+        if self.at_revision && action != RowAction::Later {
+            return self.status = Status::error(format!("cannot answer: {AT_A_REVISION}"));
+        }
         // A journal whose row still asks about a temp: Restore and Discard wait for the answer
         // (the question is in its record, which both would end).
         let asking = match &self.rows[i] {
@@ -3371,6 +3375,12 @@ impl HexWindow {
         let Some((modal, close_after, edits)) = self.save_as.as_mut() else {
             return;
         };
+        // Where Save As starts writing is the modal's pass: a file at a revision has none — a
+        // modal not writing yet goes (one already writing finishes).
+        if self.at_revision && !modal.busy() {
+            self.save_as = None;
+            return;
+        }
         let ended = modal.show(ctx);
         let (close_after, edits) = (*close_after, edits.clone());
         match ended {
@@ -4224,6 +4234,10 @@ impl HexWindow {
     /// `Save the changes to host:/abs before closing?` — Save (Save copy where Save is off) ·
     /// Save As… · Discard · Cancel (07 §10).
     fn close_prompt(&mut self, ctx: &egui::Context) {
+        // A file at a revision has nothing to ask about (its Discard removes the journal).
+        if self.at_revision {
+            self.prompt = false;
+        }
         if !self.prompt {
             return;
         }
@@ -4385,6 +4399,11 @@ impl HexWindow {
 
     /// The owner's answer to the live question, on the `Origin`, off the frame.
     fn answer_left(&mut self, ctx: &egui::Context, remove: bool) {
+        // Both answers end the record, a write; Remove it removes a file: not for a file at a
+        // revision (the question stays in its record for the next open).
+        if self.at_revision {
+            return self.status = Status::error(format!("cannot answer: {AT_A_REVISION}"));
+        }
         let Some(left) = self.left.clone() else {
             return;
         };
@@ -4621,9 +4640,25 @@ impl super::Window for HexWindow {
         if read_only {
             self.state_patches.clear();
             // Told late (its opener says so before the first pass): an earlier session's rows
-            // go unanswered — their Restore, Discard and Remove all write.
+            // go unanswered — their Restore, Discard and Remove all write — and so do the
+            // close prompt, the questions before a Save (its size, Write in place), the
+            // question about an interrupted save's file and a Save As not writing yet. A save
+            // already writing finishes.
             self.rows.clear();
             self.recovering = None;
+            self.prompt = false;
+            self.confirm = None;
+            self.in_place_ask = None;
+            if self.answering.is_none() {
+                self.left = None;
+            }
+            if self
+                .save_as
+                .as_ref()
+                .is_some_and(|(modal, ..)| !modal.busy())
+            {
+                self.save_as = None;
+            }
         }
     }
 

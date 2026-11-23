@@ -1189,3 +1189,48 @@ fn a_file_at_a_revision_stays_read_only_through_the_loading_window() {
     drop(win);
     assert_eq!(files_under(tmp.path()), before, "nothing written");
 }
+
+/// Told late (`set_read_only(true)` after the first pass, review round 1): with an edit kept in
+/// the journal and the Save As modal open, its path typed, the flag closes the modal — its
+/// Enter writes nothing — and after it no key, focus loss or close writes anything: no Save As
+/// file, no journal generation, no save, backup or copy. It closes without asking.
+#[test]
+fn told_late_with_save_as_open_nothing_is_written_after_the_flag() {
+    let mut fx = open();
+    fx.select([0, 0, 70, 50]);
+    fx.key(Key::C, Modifiers::NONE);
+    fx.key(Key::F7, Modifiers::NONE);
+    fx.until_shown("Save shot.png with your edits to a new local file");
+    let dest = fx.tmp.path().join("late.png");
+    fx.key(Key::A, command(false));
+    let text = vec![Event::Text(dest.to_str().unwrap().to_string())];
+    fx.drv.frame(&mut fx.win, text, Modifiers::NONE);
+    fx.until_idle();
+    assert!(fx.win.saving_as.is_some() && fx.journals().len() == 1);
+    let before = files_under(fx.tmp.path());
+    crate::gui::Window::set_read_only(&mut fx.win, true);
+    fx.key(Key::Enter, Modifiers::NONE);
+    fx.drv.until(&mut fx.win, 10, |w| w.saving_as.is_none());
+    fx.select([0, 0, 10, 10]);
+    fx.key(Key::P, Modifiers::NONE);
+    fx.key(Key::S, command(false));
+    fx.key(Key::F7, Modifiers::NONE);
+    fx.drv.frame(
+        &mut fx.win,
+        vec![Event::WindowFocused(false)],
+        Modifiers::NONE,
+    );
+    for _ in 0..30 {
+        fx.drv.idle(&mut fx.win, 1);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(!dest.exists(), "the open Save As wrote after the flag");
+    assert!(!fx.win.saving_or_queued() && fx.win.saving_as.is_none());
+    assert!(
+        crate::gui::Window::close_requested(&mut fx.win),
+        "nothing to ask"
+    );
+    let Fx { tmp, win, .. } = fx;
+    drop(win);
+    assert_eq!(files_under(tmp.path()), before, "written after the flag");
+}

@@ -2963,7 +2963,12 @@ impl MediaWindow {
     /// Writes the next generation — now, waiting for it (focus loss, close), or in the
     /// background. The journal is made by the first one.
     fn write_generation(&mut self, wait: bool) {
-        if self.preview || self.scripted || !(self.journal_dir.is_some() || self.journal_wants()) {
+        // Never for a file at a revision — not even into a journal made before it became one.
+        if self.preview
+            || self.scripted
+            || self.at_revision
+            || !(self.journal_dir.is_some() || self.journal_wants())
+        {
             return;
         }
         // One at a time: a generation on its way is waited for before the next.
@@ -3236,7 +3241,19 @@ impl MediaWindow {
     /// — ends, the row having named what to check) and its edits applied, unless the window has
     /// edits of its own (`undo or save them first`), the row still asks its question, or they
     /// were made on another timeline than this file's.
+    /// A row's or a question's answer writes (Restore takes the journal over, Discard removes
+    /// it, Remove it removes a file, Keep it ends the record): not for a file at a revision.
+    fn no_answer_here(&mut self) -> bool {
+        if self.at_revision {
+            self.status = Status::error(format!("cannot answer: {AT_A_REVISION}"));
+        }
+        self.at_revision
+    }
+
     fn restore_row(&mut self, i: usize) {
+        if self.no_answer_here() {
+            return;
+        }
         if self.has_edits() || self.journal_dir.is_some() {
             return self.status = Status::error("undo or save them first");
         }
@@ -3324,7 +3341,7 @@ impl MediaWindow {
 
     /// Discard: the row's journal is removed, on a worker.
     fn discard_row(&mut self, i: usize) {
-        if i >= self.rows.len() {
+        if i >= self.rows.len() || self.no_answer_here() {
             return;
         }
         match self.rows.remove(i) {
@@ -3351,7 +3368,7 @@ impl MediaWindow {
     /// ends; Keep it ends the record and leaves the file. A failure keeps the question and the
     /// record. The row is the worker's meanwhile, and comes back with the answer.
     fn answer_row(&mut self, i: usize, remove: bool) {
-        if i >= self.rows.len() || self.answering.is_some() {
+        if i >= self.rows.len() || self.answering.is_some() || self.no_answer_here() {
             return;
         }
         let asks = matches!(
@@ -3423,6 +3440,9 @@ impl MediaWindow {
 
     /// Remove it / Keep it on the live window's question ([`Saved::Ask`]), on a worker.
     fn answer_live(&mut self, remove: bool) {
+        if self.no_answer_here() {
+            return;
+        }
         let Some(left) = self.left.clone() else {
             return;
         };
@@ -3635,6 +3655,12 @@ impl MediaWindow {
         let Some((modal, close_after, edits)) = self.save_as.as_mut() else {
             return;
         };
+        // Where Save As starts writing is the modal's pass: a file at a revision has none — a
+        // modal not writing yet goes (one already writing finishes).
+        if self.at_revision && !modal.busy() {
+            self.save_as = None;
+            return;
+        }
         let ended = modal.show(ctx);
         let (close_after, edits) = (*close_after, edits.clone());
         match ended {
@@ -4480,6 +4506,10 @@ impl MediaWindow {
     }
 
     fn close_prompt(&mut self, ctx: &egui::Context) {
+        // A file at a revision has nothing to ask about (its Discard removes the journal).
+        if self.at_revision {
+            self.prompt = false;
+        }
         if !self.prompt {
             return;
         }
@@ -4956,9 +4986,24 @@ impl super::Window for MediaWindow {
         self.at_revision = read_only;
         if read_only {
             // Told late (its opener says so before the first pass): an earlier session's rows
-            // go unanswered — their Restore, Discard and Remove all write.
+            // go unanswered — their Restore, Discard and Remove all write — and so do the
+            // close prompt, the question about an interrupted save's file, a generation still
+            // to be written and a Save As not writing yet. A save, an export or a generation
+            // already writing finishes.
             self.rows.clear();
             self.recovering = None;
+            self.prompt = false;
+            self.write_soon = false;
+            if self.answering.is_none() {
+                self.left = None;
+            }
+            if self
+                .save_as
+                .as_ref()
+                .is_some_and(|(modal, ..)| !modal.busy())
+            {
+                self.save_as = None;
+            }
         }
     }
 
