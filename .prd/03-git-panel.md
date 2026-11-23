@@ -302,11 +302,14 @@ dropped unread, and its stream is stopped:
   "Reflog commits" (§4.6) `--reflog` adds the reflogs as git reads them then. **An empty id list is
   never sent**: git then falls back to HEAD (*verified*), so a filter that leaves no ref shows
   `no refs chosen` and runs no log.
-- **Commit record** (one per commit, NUL-terminated, fields split at `\x1f`, the subject last so a
-  stray `\x1f` in it cannot shift a field): `log -z --<order> --format=%H%x1f%P%x1f%aN%x1f%aE%x1f%at%x1f%ct%x1f%s
+- **Commit record** (one per commit: seven fields, each ending in NUL, `-z` ending the last; git
+  prints no NUL inside a name or an email and prints a message up to its first NUL, so no field can
+  shift another, *verified, git 2.56.1*): `log -z --<order> --format=%H%x00%P%x00%aN%x00%aE%x00%at%x00%ct%x00%s
   [--first-parent] [--reflog] --stdin --`. `%aN`/`%aE` follow `.mailmap` as `git log` does. Text
-  that is not UTF-8 shows with U+FFFD. A record whose hash or parents do not parse ends the page with
-  an error on the paging line, never a panic.
+  that is not UTF-8 shows with U+FFFD. A name, email or subject past its cap (§4.5) is read to its
+  NUL and cut, ending in `…`; the rest of the log goes on. A record whose hash, parents or dates do
+  not parse, that the stream ends inside, or that runs 16 MiB past its caps ends the page with an
+  error on the paging line, never a panic.
 - **Order**: `--date-order` by default (children always above their parents, then by commit date);
   the filters offer `--author-date-order` and `--topo-order`. One of the three is always passed: the
   lane layout needs children before parents, which plain `git log` does not promise.
@@ -511,10 +514,13 @@ A label's menu has "Show only this branch" and "Show all branches" (§7.2). The 
   loaded), `Author` (name <email>), `Author date`, `Committer` and `Commit date` (shown only when they
   differ from the author's), `In` (branches and tags that contain the commit, filled in when
   `for-each-ref --contains <c>` answers; `…` until then, bounded as a read), then the whole message,
-  scrollable. From `log -1 -z --format=%H%x1f%P%x1f%aN%x1f%aE%x1f%at%x1f%cN%x1f%cE%x1f%ct%x1f%B <c>`.
+  scrollable. From `log -1 -z --format=%H%x00%P%x00%aN%x00%aE%x00%at%x00%cN%x00%cE%x00%ct%x00%B <c> --`
+  (nine fields, each ending in NUL, as the commit record's; past 1 MiB an error).
+  These reads and the two below end in `--`: without it a work-tree file named like the hash makes
+  git stop with "ambiguous argument" (exit 128, reproduced).
 - **Files**: one row per changed path — the change letter (`A` added, `M` modified, `D` deleted,
   `R` renamed with `old → new`, `T` type changed, `U` unmerged, `?` untracked), the path, and
-  `+adds -dels` for text (blank for binary). From `diff -z --find-renames --name-status <old> <new>`
+  `+adds -dels` for text (blank for binary). From `diff -z --find-renames --name-status <old> <new> --`
   and the same with `--numstat`, the two endpoints from §6.2's table. For a merge, the diff is
   against the first parent.
 - A file whose diff was opened in this window is marked `√` (the "viewed" mark, for the window only).
