@@ -61,6 +61,11 @@ jobs:
           ffmpeg -hide_banner -version | head -n 3
           ffprobe -hide_banner -version | head -n 1
 
+      # The git panel's tests run the host's own git (`.prd/03-git-panel.md` §11); GitHub's
+      # runners ship it. Which git they ran against, and the step fails if there is none.
+      - name: git version
+        run: git --version
+
       - name: ffmpeg's AAC trims
         continue-on-error: true
         run: |
@@ -127,8 +132,10 @@ jobs:
           # fish fails the login-shell lanes, and a missing node fails the KWin script's behaviour
           # test (node is preinstalled on GitHub's runners). A missing OpenSSH `sftp-server` fails the
           # SFTP listing test (a real server over pipes; macOS ships it, Linux installs it above).
-          # A missing voice/music model fails the separation tests (downloaded above).
+          # A missing voice/music model fails the separation tests (downloaded above). A missing
+          # git fails the git panel's tests.
           SOPEN_REQUIRE_FFMPEG: "1"
+          SOPEN_REQUIRE_GIT: "1"
           SOPEN_REQUIRE_STEMS: "1"
           SOPEN_STEMS_MODEL: ${{ runner.temp }}/stems-model/UVR-MDX-NET-Voc_FT.onnx
           SOPEN_REQUIRE_SHELLS: "1"
