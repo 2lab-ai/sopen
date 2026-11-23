@@ -198,8 +198,8 @@ Each folder row ends with three right-aligned columns, from the folder's own lis
   (cached, not re-checked: a folder's mtime does not change when something deep inside it does).
 - **Tags** in place of the size: `<LINK>` (R1), `<SYS>` (R4), `<NET>` (R5), `<AUTO>` (R6), `<SYSVOL>`
   (R7), `?` unreadable (R2), `not answering` (§6.2).
-- **A mount point** of a disk filesystem (R3) and a macOS `nobrowse` volume (R7) show at once the
-  filesystem mounted there: `=87G fs` = `(f_blocks − f_bfree) × f_frsize` from one `statvfs`
+- **A mount point** of a disk filesystem (R3) shows at once the filesystem mounted there (a macOS
+  `nobrowse` volume, R7, shows its `<SYSVOL>` tag instead, as D-4 asks): `=87G fs` = `(f_blocks − f_bfree) × f_frsize` from one `statvfs`
   (`statvfs@openssh.com` remotely), and its used file count `(f_files − f_ffree)` on the status row
   while the bar is on it. `=` and `fs` say it is the filesystem's figure (on APFS per volume; a btrfs
   subvolume reports the pool). A deep scan of an R3 row, when it runs, replaces it with the folder's
