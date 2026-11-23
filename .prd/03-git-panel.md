@@ -1070,6 +1070,7 @@ slot keeps the meaning it has in the file list where git has one, so a mis-press
 | Cmd/Ctrl+B · Cmd/Ctrl+L | Backups list · command log |
 | Cmd/Ctrl+Shift+C · Cmd/Ctrl+Shift+S · Cmd/Ctrl+Shift+A | while the banner shows an operation (§8.5): its Continue · Skip · Abort, each through its dialog (§8.1); a step the state does not offer (Skip in a merge) does nothing, and the status row says so |
 | Cmd/Ctrl+Shift+B | while bisect is in progress: its Reset (`bisect reset`), through its dialog |
+| Cmd/Ctrl+Shift+M · Cmd/Ctrl+Shift+P | at an edit stop (§8.5): its Amend (§7.6's `amend`) · Split (§7.8.1's `split`), each through its dialog (§8.1) and a button as well; while the banner shows any other state they do nothing, and the status row says so |
 | Cmd/Ctrl+E | the planner from the bar's commit (§7.8.2) |
 | Cmd/Ctrl+J | the bar to HEAD's row |
 | Cmd/Ctrl+G · Cmd/Ctrl+Shift+G | pin / unpin (02 §3.2) · the git panel over both sides and back |

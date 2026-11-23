@@ -17,7 +17,9 @@
 #![allow(dead_code)]
 
 use crate::git::actions::{Action, Banner, Proceed};
+use crate::git::model::Oid;
 use crate::git::model::{InProgress, Status};
+use crate::git::rebase::Edit;
 use crate::gui::browser::keys::{self, Mods};
 use crate::gui::chrome::{self, PALETTE};
 use eframe::egui::{self, Key, Pos2, Rect, Vec2};
@@ -143,6 +145,223 @@ pub fn draw(ui: &mut egui::Ui, rect: Rect, banner: &BannerView) -> Option<Presse
             .on_hover_text(key_text(p));
         if button.clicked() {
             pressed = Some(banner.press(p));
+        }
+        right -= w + cw;
+    }
+    for (k, line) in banner.lines.iter().enumerate() {
+        let y = rect.top() + row_h * k as f32;
+        let end = if k == 0 { right } else { rect.right() };
+        let shown = chrome::fit_start(&ctx, line, &font, (end - rect.left()).max(0.0));
+        painter.text(
+            Pos2::new(rect.left(), y),
+            egui::Align2::LEFT_TOP,
+            shown,
+            font.clone(),
+            PALETTE.warn,
+        );
+    }
+    pressed
+}
+
+// ---------------------------------------------------------------------------------------------
+// An edit stop's Amend and Split (03 §8.5; S4-B). S3-B's banner above is unchanged: these
+// items stand beside it, and S3-B's steps come back as S3-B's `Pressed`. Each item carries its
+// own `dead_code` allowance, which S4-C removes when it wires them.
+
+/// An edit stop's own steps (03 §8.5: "with Amend, Split, Continue, Abort"), beside the banner's
+/// Continue and Abort.
+#[allow(dead_code)] // S4-C removes this when it wires the edit stop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StopStep {
+    /// §7.6's `amend`: the staged changes into the stopped commit.
+    Amend,
+    /// §7.8.1's `split`: the stopped commit's paths recorded, then `reset HEAD^`.
+    Split,
+}
+
+/// The edit stop's steps, in their keys' order.
+#[allow(dead_code)] // S4-C removes this when it wires the edit stop.
+pub const STOP_STEPS: [StopStep; 2] = [StopStep::Amend, StopStep::Split];
+
+/// What a step's button says.
+#[allow(dead_code)] // S4-C removes this when it wires the edit stop.
+pub fn stop_word(s: StopStep) -> &'static str {
+    match s {
+        StopStep::Amend => "Amend",
+        StopStep::Split => "Split",
+    }
+}
+
+/// A step's key, with Cmd/Ctrl+Shift as the banner's others (S4-B's proposal for 03 §9.2:
+/// aMend, sPlit — C, S, A and B are the banner's already).
+#[allow(dead_code)] // S4-C removes this when it wires the edit stop.
+pub fn stop_key(s: StopStep) -> Key {
+    match s {
+        StopStep::Amend => Key::M,
+        StopStep::Split => Key::P,
+    }
+}
+
+/// A step's key as the help writes it: `Cmd+Shift+M`.
+#[allow(dead_code)] // S4-C removes this when it wires the edit stop.
+pub fn stop_key_text(s: StopStep) -> String {
+    format!("{}{}", Mods::CommandShift.prefix(), stop_key(s).name())
+}
+
+/// An edit stop (03 §8.5: `stopped to edit abc12345`): the commit it stopped at, as the banner
+/// names it, and in full when the probe read it so — `stopped-sha`, else the second word of
+/// `done`'s last line (`edit <c> …`), each taken only when it is a whole object id that starts
+/// with the banner's. Without the full id Split is not offered (`Edit::SplitStop` names a whole
+/// id); Amend needs none.
+#[allow(dead_code)] // S4-C removes this when it wires the edit stop.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EditStop {
+    short: String,
+    commit: Option<Oid>,
+}
+
+/// What an edit stop's key or button asks for.
+#[allow(dead_code)] // S4-C removes this when it wires the edit stop.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StopPressed {
+    /// Amend: §7.6's `amend` dialog on the stopped commit (`ActionDialog::open(ActionId::Amend,
+    /// &Target::Uncommitted, …)`, its message prefilled from the commit), so "keep its message"
+    /// or "edit it" stays the owner's choice.
+    Amend,
+    /// Split: this edit through its dialog (`planner::QuickDialog::confirm`).
+    Split(Edit),
+    /// A step the state does not offer: nothing happens, and the status row says this.
+    NotOffered(String),
+}
+
+/// What the banner of an edit stop gives: S3-B's steps as S3-B's [`Pressed`], or Amend / Split.
+#[allow(dead_code)] // S4-C removes this when it wires the edit stop.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StopEnd {
+    Banner(Pressed),
+    Stop(StopPressed),
+}
+
+#[allow(dead_code)] // S4-C removes this when it wires the edit stop.
+impl EditStop {
+    /// The edit stop `banner` shows (`Banner::edit_stop`), or `None` when it shows none.
+    pub fn of(banner: &Banner) -> Option<EditStop> {
+        let short = banner.edit_stop()?.to_string();
+        let rebase = banner.state.rebase.as_ref()?;
+        let stopped = rebase.stopped_sha.as_deref().map(str::trim);
+        let done = rebase
+            .done_last
+            .as_deref()
+            .and_then(|l| l.split_whitespace().nth(1));
+        let commit = [stopped, done]
+            .into_iter()
+            .flatten()
+            .filter_map(Oid::parse)
+            .find(|o| o.as_str().starts_with(&short));
+        Some(EditStop { short, commit })
+    }
+
+    /// The edit stop of a refresh (03 §5, §8.5), through `Banner::of`; `None` while there is none.
+    pub fn probe(in_progress: &InProgress, status: &Status) -> Option<EditStop> {
+        EditStop::of(&Banner::of(in_progress, status)?)
+    }
+
+    /// An edit stop at `short`, its full id `commit` when known (S4-C may resolve it itself).
+    pub fn new(short: impl Into<String>, commit: Option<Oid>) -> EditStop {
+        EditStop {
+            short: short.into(),
+            commit,
+        }
+    }
+
+    /// The commit it stopped at, in full, when known.
+    pub fn commit(&self) -> Option<&Oid> {
+        self.commit.as_ref()
+    }
+
+    /// The steps it offers: Amend, and Split when the commit is known in full.
+    pub fn offers(&self) -> Vec<StopStep> {
+        STOP_STEPS
+            .into_iter()
+            .filter(|s| *s == StopStep::Amend || self.commit.is_some())
+            .collect()
+    }
+
+    /// Step `s`, by its key or its button.
+    pub fn press(&self, s: StopStep) -> StopPressed {
+        match (s, &self.commit) {
+            (StopStep::Amend, _) => StopPressed::Amend,
+            (StopStep::Split, Some(commit)) => StopPressed::Split(Edit::SplitStop {
+                commit: commit.clone(),
+            }),
+            (StopStep::Split, None) => StopPressed::NotOffered(format!(
+                "Split: the stopped commit {} was not read in full",
+                self.short
+            )),
+        }
+    }
+}
+
+/// An edit stop's keys this frame, with exact modifiers: Cmd/Ctrl+Shift+M (Amend) and
+/// Cmd/Ctrl+Shift+P (Split), S4-B's proposal for 03 §9.2. Read where the banner's own keys are
+/// ([`keys`]), while a banner shows; without an edit stop (`stop` `None`) they do nothing and
+/// the status row says so, as for a step the state does not offer.
+#[allow(dead_code)] // S4-C removes this when it wires the edit stop.
+pub fn stop_keys(
+    ctx: &egui::Context,
+    banner: &BannerView,
+    stop: Option<&EditStop>,
+) -> Option<StopPressed> {
+    STOP_STEPS.into_iter().find_map(|s| {
+        ctx.input_mut(|i| keys::take(i, stop_key(s), Mods::CommandShift))
+            .then(|| match stop {
+                Some(stop) => stop.press(s),
+                None => {
+                    let state = banner.lines.first().map_or("", String::as_str);
+                    StopPressed::NotOffered(format!("{}: not offered while {state}", stop_word(s)))
+                }
+            })
+    })
+}
+
+/// The banner of an edit stop in `rect`, as [`draw`] draws a banner, with Amend and Split
+/// before S3-B's steps at the right of its first row (03 §8.5's order: Amend, Split, Continue,
+/// Abort); a click is the step's key.
+#[allow(dead_code)] // S4-C removes this when it wires the edit stop.
+pub fn draw_stop(
+    ui: &mut egui::Ui,
+    rect: Rect,
+    banner: &BannerView,
+    stop: &EditStop,
+) -> Option<StopEnd> {
+    let ctx = ui.ctx().clone();
+    let font = chrome::mono(ui);
+    let (cw, text_h) = ctx.fonts_mut(|f| (f.glyph_width(&font, '0'), f.row_height(&font)));
+    let row_h = text_h.ceil();
+    let painter = ui.painter_at(rect);
+    // The buttons, right to left from the first row's end: S3-B's steps, then Split and Amend.
+    let buttons = banner
+        .offers
+        .iter()
+        .rev()
+        .map(|&p| (word(p), key_text(p), Err(p)))
+        .chain(
+            stop.offers()
+                .into_iter()
+                .rev()
+                .map(|s| (stop_word(s), stop_key_text(s), Ok(s))),
+        );
+    let mut right = rect.right();
+    let mut pressed = None;
+    for (word, key, step) in buttons {
+        let w = cw * (word.chars().count() + 2) as f32;
+        let at = Rect::from_min_size(Pos2::new(right - w, rect.top()), Vec2::new(w, row_h));
+        let button = ui.put(at, egui::Button::new(word)).on_hover_text(key);
+        if button.clicked() {
+            pressed = Some(match step {
+                Ok(s) => StopEnd::Stop(stop.press(s)),
+                Err(p) => StopEnd::Banner(banner.press(p)),
+            });
         }
         right -= w + cw;
     }
