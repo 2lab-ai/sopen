@@ -287,9 +287,10 @@ struct Shared {
     /// Tests: socket waits that ran out and looked at the clock.
     #[cfg(test)]
     checks: AtomicU64,
-    /// Tests: how often a no-progress timer started again, and clients found gone.
+    /// Tests: how often a no-progress timer started again.
     #[cfg(test)]
     resets: AtomicU64,
+    /// Tests: responses whose client left, whoever found it gone ([`Shared::left`]).
     #[cfg(test)]
     left: AtomicU64,
 }
@@ -321,6 +322,13 @@ impl Shared {
     fn reset(&self) {
         #[cfg(test)]
         self.resets.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// A response ended because its client left (06 §7.4's evidence), found by the watch or
+    /// by the response's own write. Its thread says so once, before it gives its seat back.
+    fn left(&self) {
+        #[cfg(test)]
+        self.left.fetch_add(1, Ordering::SeqCst);
     }
 
     fn cuts(&self, kind: Kind) -> u64 {
@@ -468,11 +476,8 @@ fn watch_loop(shared: Arc<Shared>) {
                         "the client sent more than {LINGER_BYTES} bytes after its request"
                     ))
                 }
-                Peer::Gone => {
-                    #[cfg(test)]
-                    shared.left.fetch_add(1, Ordering::SeqCst);
-                    None
-                }
+                // Its thread counts the client as left, as it does when its write finds it.
+                Peer::Gone => None,
                 Peer::Broken(why) => Some(why),
             };
             open.fault = fault;
@@ -692,7 +697,7 @@ impl Watch {
         self.0.resets.load(Ordering::SeqCst)
     }
 
-    /// Clients the watch found gone under a response.
+    /// Responses whose client left: found gone by the watch, or by the response's own write.
     pub(crate) fn left(&self) -> u64 {
         self.0.left.load(Ordering::SeqCst)
     }
@@ -1587,7 +1592,14 @@ impl Conn {
                         response.cut(reason);
                         let _ = self.stream.shutdown(Shutdown::Both);
                     }
-                    None => response.owed = false,
+                    None => {
+                        response.owed = false;
+                        // Whichever of the watch and the write saw it first, the client left
+                        // — unless the server is going.
+                        if !shared.cancelled() {
+                            shared.left();
+                        }
+                    }
                 }
             }
         }
