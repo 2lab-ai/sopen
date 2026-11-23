@@ -836,26 +836,33 @@ fn netstat_listener(line: &str) -> Option<(std::net::IpAddr, u16)> {
     Some((ip, port))
 }
 
-/// Whether an address a socket listens on is this machine's alone: 127/8, `::1`, or an IPv4
-/// loopback address in IPv6.
+/// Whether an address a socket listens on is one the tunnel's own bind can be: `127.0.0.1`,
+/// `::1`, or `::ffff:127.0.0.1`.
 fn loopback_only(ip: std::net::IpAddr) -> bool {
+    let v4 = std::net::Ipv4Addr::LOCALHOST;
     match ip {
-        std::net::IpAddr::V4(v4) => v4.is_loopback(),
-        std::net::IpAddr::V6(v6) => {
-            v6.is_loopback() || v6.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback())
-        }
+        std::net::IpAddr::V4(ip) => ip == v4,
+        std::net::IpAddr::V6(ip) => ip.is_loopback() || ip.to_ipv4_mapped() == Some(v4),
     }
 }
 
-/// `Err` naming the first listener on `port` in `table` that is not loopback.
-pub fn private_in(table: &str, port: u16) -> Result<()> {
-    match listeners_on(table, port)
-        .into_iter()
-        .find(|&ip| !loopback_only(ip))
-    {
+/// `Ok` only on positive evidence that the tunnel's port `port` is private on `here` (this
+/// machine's name, for the message): `table` has at least one listener on it — the tunnel's
+/// own, which sshd opened before this command started — and every one is `127.0.0.1`, `::1` or
+/// `::ffff:127.0.0.1`. No listener seen (an empty table, none on the port, output that does not
+/// parse) refuses as well: it cannot confirm the port is private.
+pub fn private_in(table: &str, port: u16, here: &str) -> Result<()> {
+    let listeners = listeners_on(table, port);
+    if listeners.is_empty() {
+        bail!(
+            "cannot confirm the tunnel is private on {here} (no listener seen on port {port}); \
+             refused, nothing was opened"
+        );
+    }
+    match listeners.into_iter().find(|&ip| !loopback_only(ip)) {
         None => Ok(()),
         Some(ip) => bail!(
-            "the tunnel's port {port} listens on {ip} here, open to the network (sshd's \
+            "the tunnel's port {port} listens on {ip} on {here}, open to the network (sshd's \
              GatewayPorts yes binds a forward to every interface, or another program holds the \
              port); refused, nothing was opened"
         ),
@@ -864,8 +871,10 @@ pub fn private_in(table: &str, port: u16) -> Result<()> {
 
 /// This machine's listening TCP sockets: `SOPEN_LISTENERS` (a receipt hook: a file holding such
 /// a table) when set and not empty; else `/proc/net/tcp` and `/proc/net/tcp6` on Linux,
-/// `netstat -anv -p tcp` elsewhere. A table that cannot be read is an error: the check fails
-/// closed.
+/// `netstat -anv -p tcp` elsewhere. Both list every user's sockets — the tunnel's belongs to
+/// sshd: `/proc/net/tcp*` is the network namespace's whole table, with a uid column (proc(5)),
+/// and macOS's netstat shows root's too (launchd's `*.22`). A table that cannot be read is an
+/// error: the check fails closed.
 fn listener_table() -> Result<String> {
     if let Some(file) = std::env::var_os("SOPEN_LISTENERS").filter(|f| !f.is_empty()) {
         return std::fs::read_to_string(&file).with_context(|| {
@@ -900,11 +909,12 @@ fn listener_table() -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
-/// HOST's half of a tunnel, before the browser opens: `Err` (refused) when anything listening
-/// on the tunnel's port `port` here is reachable from the network, or when that cannot be
-/// read.
+/// HOST's half of a tunnel, before the browser opens: `Ok` only when the tunnel's port `port`
+/// is seen listening here on loopback alone ([`private_in`]); `Err` (refused) otherwise, or when
+/// the table cannot be read.
 pub fn tunnel_port_is_private(port: u16) -> Result<()> {
-    private_in(&listener_table()?, port)
+    let here = hostname().unwrap_or_else(|| "this machine".to_string());
+    private_in(&listener_table()?, port, &here)
 }
 
 /// `sopen URL` with HOST: serves the loopback address `url` from this machine on HOST through a
@@ -1824,20 +1834,49 @@ tcp4       0      0  198.51.100.18.4323      *.*                    LISTEN      
         );
         assert_eq!(listeners_on(table, 4322), [ip("0.0.0.0")]);
         assert!(listeners_on(table, 9).is_empty());
-        // Loopback only: fine; anything reachable from the network: refused, said.
+        // Only on positive evidence: the tunnel's listener seen, on 127.0.0.1, ::1 or
+        // ::ffff:127.0.0.1 alone.
         let only_loopback = "\
    0: 0100007F:04D2 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 1 1
    0: 00000000000000000000000001000000:04D2 00000000000000000000000000000000:0000 0A 0 0
    0: 0000000000000000FFFF00000100007F:04D2 00000000000000000000000000000000:0000 0A 0 0
 tcp4       0      0  127.0.0.1.1234         *.*                    LISTEN            0
 ";
-        assert!(private_in(only_loopback, 1234).is_ok());
-        assert!(private_in("", 1234).is_ok());
-        let e = private_in(table, 1234).unwrap_err().to_string();
-        assert!(e.contains("port 1234 listens on 0.0.0.0"), "{e}");
+        assert!(private_in(only_loopback, 1234, "box").is_ok());
+        assert!(private_in("tcp6 0 0 ::1.1234 *.* LISTEN 0", 1234, "box").is_ok());
+        // Nothing seen on the port — an empty table, none on it, only a connection on it,
+        // output that does not parse — cannot confirm it: refused.
+        for unseen in [
+            "",
+            only_loopback
+                .replace("04D2", "04D3")
+                .replace(".1234", ".1235")
+                .as_str(),
+            "tcp4 0 0 127.0.0.1.1234 192.0.2.7.443 ESTABLISHED 0",
+            "   2: 0100007F:04D2 0100007F:C000 01 00000000:00000000 00:00000000 0 1000 0 3 1",
+            "netstat: sysctl: net.inet.tcp.pcblist_n: Operation not permitted",
+            "garbage 127.0.0.1:1234 LISTEN",
+        ] {
+            let e = private_in(unseen, 1234, "box").unwrap_err().to_string();
+            assert!(
+                e.starts_with(
+                    "cannot confirm the tunnel is private on box (no listener seen on port 1234)"
+                ),
+                "{unseen:?}: {e}"
+            );
+        }
+        // Anything else listening on the port — the network, or another loopback address
+        // than the tunnel binds — refuses, said.
+        let e = private_in(table, 1234, "box").unwrap_err().to_string();
+        assert!(e.contains("port 1234 listens on 0.0.0.0 on box"), "{e}");
         assert!(e.contains("GatewayPorts"), "{e}");
-        assert!(private_in(table, 4321).is_err());
-        assert!(private_in(table, 8080).is_err());
+        assert!(private_in(table, 4321, "box").is_err());
+        assert!(private_in(table, 8080, "box").is_err());
+        let other_loopback = "tcp4 0 0 127.0.0.2.1234 *.* LISTEN 0";
+        assert!(private_in(other_loopback, 1234, "box")
+            .unwrap_err()
+            .to_string()
+            .contains("listens on 127.0.0.2"));
     }
 
     /// The live table: this machine's own (`/proc` on Linux, netstat on macOS) is read and
@@ -1851,7 +1890,7 @@ tcp4       0      0  127.0.0.1.1234         *.*                    LISTEN       
             listeners_on(&table, port).contains(&"127.0.0.1".parse().unwrap()),
             "port {port} not found"
         );
-        assert!(private_in(&table, port).is_ok());
+        assert!(private_in(&table, port, "here").is_ok());
     }
 
     /// The shells `/bin/sh` may be where the guard runs: this machine's, dash (Debian's and

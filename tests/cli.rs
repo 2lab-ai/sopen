@@ -1445,8 +1445,10 @@ fn media_autoexport_writes_a_sibling() {
 // `FAKE_SSH_TAKEN=<port>` fails a `-R` on that port (bound to 127.0.0.1) as ssh does with
 // `ExitOnForwardFailure`; `FAKE_SSH_LINGER=1` keeps it running after the target's command ends,
 // its output closed, as a real ssh waits for the forwarded connections a browser keeps open (and
-// hands its output to the session, which has ended). The target's stand-in sopen prints
-// `FAKE_SOPEN_SAY`, if set, before it exits.
+// hands its output to the session, which has ended). As sshd does, it opens the forward's
+// listener before the target's command starts: a loopback LISTEN row for the `-R` port goes into
+// the `SOPEN_LISTENERS` table, if one is set (`FAKE_SSH_NO_BIND=1`: no row, a listener HOST
+// cannot see). The target's stand-in sopen prints `FAKE_SOPEN_SAY`, if set, before it exits.
 
 /// A target name no test machine has.
 const HOST: &str = "sopen-test-target";
@@ -1541,6 +1543,9 @@ impl FakeSsh {
                  fwd=; prev=; for a in \"$@\"; do if [ \"$prev\" = -R ]; then fwd=$a; fi; prev=$a; done\n\
                  if [ -n \"${{FAKE_SSH_TAKEN:-}}\" ]; then case $fwd in \"127.0.0.1:$FAKE_SSH_TAKEN\":*) \
                  echo \"Error: remote port forwarding failed for listen port $FAKE_SSH_TAKEN\" >&2; exit 255;; esac; fi\n\
+                 if [ -n \"${{SOPEN_LISTENERS:-}}\" ] && [ -z \"${{FAKE_SSH_NO_BIND:-}}\" ]; then case $fwd in \
+                 127.0.0.1:*) p=${{fwd#127.0.0.1:}}; printf 'tcp4 0 0 127.0.0.1.%s *.* LISTEN 0\\n' \"${{p%%:*}}\" >> \"$SOPEN_LISTENERS\";; \
+                 \\[::1\\]:*) p=${{fwd#*]:}}; printf 'tcp6 0 0 ::1.%s *.* LISTEN 0\\n' \"${{p%%:*}}\" >> \"$SOPEN_LISTENERS\";; esac; fi\n\
                  while [ \"$#\" -gt 0 ] && [ \"$1\" != -- ]; do shift; done\n\
                  shift\n\
                  line=$(printf '%s' \"$*\" | sed{unplug})\n\
@@ -3047,7 +3052,8 @@ fn the_real_child_publishes_nothing_before_the_go_ahead() {
 // than the usual 3 s to start it), so its call is recorded before sopen says "opened" — on the
 // fake target too, which runs with this side's environment. `SOPEN_LISTENERS` points the
 // target's port check at a table of the test's own (an empty one by default), never at what
-// happens to listen on the test machine.
+// happens to listen on the test machine; the fake ssh adds the forward's loopback listener to
+// it, as sshd opens one.
 
 /// An address with a password, a query and a fragment: none of them may be printed.
 const SECRET_URL: &str = "http://me:s3cret@127.0.0.1:1234/x?token=abc#frag9";
@@ -3085,10 +3091,22 @@ fn browser_calls(calls: &Path) -> Vec<Vec<String>> {
         .collect()
 }
 
-/// An empty listener table in `home` (nothing listens anywhere).
+/// An empty listener table in `home` (nothing listens anywhere), for the fake ssh to add the
+/// tunnel's listener to.
 fn no_listeners(home: &Path) -> PathBuf {
     let table = home.join("listeners-none");
     std::fs::write(&table, "").unwrap();
+    table
+}
+
+/// A listener table in `home` with the tunnel's listener on `port`, on 127.0.0.1 only.
+fn loopback_listener(home: &Path, port: u16) -> PathBuf {
+    let table = home.join(format!("listeners-{port}"));
+    std::fs::write(
+        &table,
+        format!("tcp4       0      0  127.0.0.1.{port}         *.*        LISTEN       0\n"),
+    )
+    .unwrap();
     table
 }
 
@@ -3234,7 +3252,8 @@ fn hold_until_eof_opens_then_waits_for_the_inputs_end() {
     let tmp = tempfile::tempdir().unwrap();
     let (browser, calls) = stand_in_browser(tmp.path());
     let url = "http://127.0.0.1:50000/x?token=abc";
-    let (mut guard, stdout, stderr) = held(tmp.path(), &browser, url, &no_listeners(tmp.path()));
+    let table = loopback_listener(tmp.path(), 50000);
+    let (mut guard, stdout, stderr) = held(tmp.path(), &browser, url, &table);
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
     while browser_calls(&calls).is_empty() {
         assert!(
@@ -3269,8 +3288,8 @@ fn hold_until_eof_opens_then_waits_for_the_inputs_end() {
 }
 
 /// The tunnel's port open to the network on HOST (sshd's `GatewayPorts yes` binds a forward to
-/// every interface): HOST's half refuses before the browser opens, and so does a table it
-/// cannot read — the check fails closed.
+/// every interface): HOST's half refuses before the browser opens. So it does without positive
+/// evidence — no listener seen on the port, a table it cannot read: the check fails closed.
 #[test]
 fn hold_until_eof_refuses_a_port_open_to_the_network() {
     let tmp = tempfile::tempdir().unwrap();
@@ -3286,9 +3305,13 @@ fn hold_until_eof_refuses_a_port_open_to_the_network() {
     )
     .unwrap();
     let missing = tmp.path().join("no-such-table");
+    let elsewhere = loopback_listener(tmp.path(), 50001);
+    let unseen = "cannot confirm the tunnel is private on ";
     for (table, says) in [
-        (&wildcard, "the tunnel's port 50000 listens on 0.0.0.0 here"),
+        (&wildcard, "the tunnel's port 50000 listens on 0.0.0.0 on "),
         (&missing, "cannot read SOPEN_LISTENERS"),
+        (&no_listeners(tmp.path()), unseen),
+        (&elsewhere, unseen),
     ] {
         let (mut guard, stdout, stderr) = held(tmp.path(), &browser, url, table);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
@@ -3303,6 +3326,9 @@ fn hold_until_eof_refuses_a_port_open_to_the_network() {
         let err = text(&stderr.recv().unwrap());
         assert_eq!(status.code(), Some(1), "{err}");
         assert!(err.contains(says), "{err}");
+        if says == unseen {
+            assert!(err.contains("(no listener seen on port 50000)"), "{err}");
+        }
         assert_eq!(text(&stdout.recv().unwrap()), "", "the cue was said");
     }
     assert!(browser_calls(&calls).is_empty(), "the browser was called");
@@ -3661,10 +3687,35 @@ fn a_tunnel_open_to_the_network_on_the_target_is_refused() {
     let err = text(&out.stderr);
     assert_eq!(out.status.code(), Some(1), "{err}");
     assert!(
-        err.contains("the tunnel's port 1234 listens on 0.0.0.0 here"),
+        err.contains("the tunnel's port 1234 listens on 0.0.0.0 on "),
         "{err}"
     );
     assert!(err.contains("refused, nothing was opened"), "{err}");
+    assert_eq!(text(&out.stdout), "");
+    assert!(browser_calls(&calls).is_empty(), "the browser was called");
+    all_gone(&tunnel_pids(&ssh));
+
+    // No listener seen on HOST for the tunnel's port: refused too — no positive evidence.
+    let none = no_listeners(tmp.path());
+    let out = sopen(
+        tmp.path(),
+        &["--target", HOST, "http://127.0.0.1:1234/"],
+        &[
+            ("PATH", ssh.path.as_str()),
+            ("SOPEN_TARGET_BIN", env!("CARGO_BIN_EXE_sopen")),
+            ("SOPEN_BROWSER", browser.to_str().unwrap()),
+            ("SOPEN_EDITOR_WAIT", "60"),
+            ("SOPEN_LISTENERS", none.to_str().unwrap()),
+            ("FAKE_SSH_NO_BIND", "1"),
+        ],
+    );
+    let err = text(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{err}");
+    assert!(
+        err.contains("cannot confirm the tunnel is private on "),
+        "{err}"
+    );
+    assert!(err.contains("(no listener seen on port 1234)"), "{err}");
     assert_eq!(text(&out.stdout), "");
     assert!(browser_calls(&calls).is_empty(), "the browser was called");
     all_gone(&tunnel_pids(&ssh));
