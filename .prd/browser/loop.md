@@ -22,7 +22,6 @@ files; then S5-C, the slice's integration. Contract: 05. Worktree = `.worktrees/
 | ID | Status | Before | What (02 §8.2) |
 |---|---|---|---|
 | E5 | 🔴 open | S3 | remote process-group stop under zsh, fish and bash login shells; an SFTP listing on the same master while a parked `git log` stream is open |
-| E2 | 🔴 open | S6 | plain SFTP rename: `openssh-sftp-client-lowlevel` vs an auxiliary channel, against a local `sftp-server -e -l INFO` |
 
 ## Build facts
 
@@ -69,3 +68,14 @@ E1 is closed (2026-11-23): its result is in 02 §8.2 and its row in [`loop.done.
 |---|---|---|---|---|---|
 | S7-A | 🟡 in progress | `feat/browser-s7-fnkeys` | the switch (`HIDFKeyMode` through IOKit, loaded at runtime), its lock, state and watchdog, the `fkeys` config key and `sopen config fkeys`; K-F1, K-F2, K-F4, K-F5, K-F6 against a fake (04 §6) | `src/fnkeys/{mod,macos,tests}.rs`, `src/config.rs`; in `src/main.rs` the hidden watchdog flags and `config fkeys` | E1 |
 | S7-B | 🟡 in progress: code done; the owner's K-F3 open | `feat/browser-s7-focus` | focus, sleep and session events into the switch, the status row's line when it did not take effect, integration; `fkeys` in AGENTS.md, README and 01 §4a; then the owner's receipt K-F3 | `src/gui/mod.rs`, `src/gui/browser.rs`, `tests/cli.rs`, docs | S7-A |
+
+## Round 2 — slice S6 (F7 make folder, F8 delete, remote folder rename, copy publish without `hardlink@`)
+
+E2 is closed (2026-11-23): route B, its result in 02 §8.2 and 04 §5.6, its row in [`loop.done.md`](loop.done.md).
+
+| ID | Status | Branch | Scope | Owner files (02 §5) | After |
+|---|---|---|---|---|---|
+| S6-0 | 🟡 in progress | `feat/browser-s6-scaffold` | `openssh-sftp-client-lowlevel = "=0.7.4"` as a direct dependency (already locked); `mod` lines and empty stubs for S6-A's new files: `remote::sftp::rename`, `remote::local::trash`, `fileops::{make_dir,delete}`; no `keys.rs` row, no behaviour change; E2's result in 02 §8.2 and 04 §5.6 (K-C4, K-N1) | `Cargo.toml`, `Cargo.lock`, `src/remote/{sftp,local}.rs`, `src/fileops/mod.rs` (mod lines), the stubs; `.prd/02-architecture.md`, `.prd/04-file-keys.md`, `.prd/browser/loop*.md` | S1, E2 |
+| S6-A | 🔴 open | `feat/browser-s6-engine` | F7 and F8 as actions over both file layers (04 §5.4, §5.5): `MKDIR` / `mkdir`; bottom-up `REMOVE` and `RMDIR`, links as links; the local Trash (macOS `trashItemAtURL` loaded at runtime, the freedesktop Trash); the plain-rename channel (route B) for a remote folder's rename and move and for a copy's publish without `hardlink@`, links never through it (04 §5.6); K-K1, K-D1, K-M1 and K-N1 for remote folders, K-C4 without `hardlink@` (its `-P hardlink` test, `src/fileops/tests.rs`, now expects the publish) | `src/fileops/*.rs`, `src/remote/ops.rs`, `src/remote/{sftp,local}/ops.rs`, `src/remote/sftp/rename.rs`, `src/remote/local/trash.rs` | S6-0 |
+| S6-B | 🔴 open | `feat/browser-s6-dialogs` | the make-folder dialog (one line, a name with `/` refused) and the delete dialog (`Delete <name>?` / `Delete N items (F files, D folders)?`, `and everything inside it`, `permanent — no Trash on <host>`, Shift+F8's `permanent` in the error colour) (04 §5.4, §5.5). A new `ops::Job` variant needs an arm in `browser.rs`'s engine match (S6-C's file): declared, or left to S6-C | `src/gui/browser/ops.rs`, `src/gui/browser/panel.rs` | S6-0 |
+| S6-C | 🔴 open | `feat/browser-s6-integration` | wiring S6-A and S6-B: F7, F8, Del, ⌘⌫, Shift+F8, Shift+Del into the dialogs and the engine; F2 and F6 of a remote folder through the plain rename; S6's key rows landed (`keys.rs` lands rows by one threshold, `slice <= LANDED`, so S6 before S2–S5 needs a change there, declared); S6's scenarios (02 §8.1's table: 04 K-R1 slots 7, 8, K-R3 Shift+F8, K-K1, K-D1, K-N1 remote folders, K-C4 without `hardlink@`), receipts; AGENTS.md, README, 01 §3a | `src/gui/browser.rs`, `src/gui/browser/{view,tests}.rs`, `src/gui/browser/keys.rs` (hand-over), `src/gui/mod.rs` (receipt keys), `src/main.rs`, `tests/cli.rs`, `AGENTS.md`, `README.md`, `.prd/01-spec.md` | S6-A, S6-B |

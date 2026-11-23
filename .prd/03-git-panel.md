@@ -426,8 +426,9 @@ above); the result does not depend on anything but the input (run twice, compare
   reads 500 records and stops reading; git then blocks on the full pipe (locally, measured below) or
   on the ssh channel's flow-control window (remotely *(estimate)*: G-P3 is the receipt) and waits. "More" reads the next 500 from the same stream, so pages are
   one walk of the history in one order, with no rows repeated or skipped.
-- More is read when the bar comes within one screen of the last loaded row, or on Enter on the
-  paging line. The stream ends: `all loaded`.
+- More is read when the bar comes within one screen of the last loaded row, on ↓ on the last loaded
+  row, or on a click on the paging line (the bar never stands on the paging line itself). The stream
+  ends: `all loaded`.
 - A refresh that changes refs or HEAD (§5) ends the stream and starts a new one, reading as many
   pages as were loaded; the bar stays on the same commit when it is still there.
 - **Memory grows only with the pages read.** A row stores its hash, its parents (as row indices or
@@ -1037,6 +1038,7 @@ slot keeps the meaning it has in the file list where git has one, so a mis-press
 | a typed letter | starts Find with it (§4.7) |
 | Cmd/Ctrl+F · Cmd/Ctrl+Shift+F | Find · History search |
 | Cmd/Ctrl+R · Cmd/Ctrl+Shift+R | hard refresh (§5) · Fetch all (§7.7) |
+| Cmd/Ctrl+K | the filters (§4.6) — from slice S2 on, before the F10 menu (slice S3) offers them too |
 | Cmd/Ctrl+Z | undo the newest backup group (§8.3) |
 | Cmd/Ctrl+B · Cmd/Ctrl+L | Backups list · command log |
 | Cmd/Ctrl+E | the planner from the bar's commit (§7.8.2) |
