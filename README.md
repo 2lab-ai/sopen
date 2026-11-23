@@ -77,9 +77,12 @@ target = "<host>"
 fkeys = "function"   # or "system"; without the key, "function"
 ```
 
-`fkeys` is for macOS: with `"function"` (the default), while a sopen window is in front the
-top row sends F1–F12 without fn — so F5 copies — and brightness and volume need fn; once no sopen
-window is in front, the Mac's own setting is back, even if sopen crashed. The setting is global,
+`fkeys` is for macOS: with `"function"` (the default), while a sopen window is in front sopen
+switches the Mac's top row to F1–F12 without fn — so F5 should copy — and brightness and volume
+need fn; once no sopen window is in front (or the Mac sleeps, or you switch user), the Mac's own
+setting is back, even if sopen crashed. The switch is measured to reach the keyboard driver;
+that a plain F5 then reaches sopen is not yet checked on a real keyboard (`.prd/04-file-keys.md`
+§6.2, K-F3). The setting is global,
 so other apps see F-keys while sopen is in front. `"system"` leaves the Mac's setting alone; the
 F-key row's slots and Cmd/Ctrl+1…0 (F1–F10) work either way. Linux has no such switch: a laptop's
 own Fn lock (often Fn+Esc) is the way there.

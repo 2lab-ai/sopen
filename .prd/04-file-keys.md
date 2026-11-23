@@ -357,13 +357,16 @@ contexts where it acts (list, viewer, git panel, tree, a dialog) and its `Comman
   (`NSWorkspaceWillSleepNotification`) and when the session is switched away
   (`NSWorkspaceSessionDidResignActiveNotification`); it acquires again on wake
   (`NSWorkspaceDidWakeNotification`) or session return (`NSWorkspaceSessionDidBecomeActiveNotification`)
-  if one of its windows is still in front, and not while the Mac sleeps or the session is away,
-  whatever its windows say. The four are observed on `NSWorkspace.sharedWorkspace.notificationCenter`,
-  once per process and only when the switch is in use (not with `"system"`, not in a scripted run);
-  eframe and winit pass on none of them. Acquire and release are §6.3's protocol, so several windows
-  and several sopen processes hand focus to each other in any order of events; they run on a thread of
-  their own, which the windows and the notifications only send to, never on a window's or AppKit's
-  main thread (the lock can be held by a stopped sopen). A covered window (a locked screen, a screen
+  if one of its windows is in front by its windows' latest word (never by the focus it held before it
+  let go), and not while the Mac sleeps or the session is away, whatever its windows say. The four
+  are observed on `NSWorkspace.sharedWorkspace.notificationCenter`, once per process, registered once
+  the switch is built (not with `"system"`, not in a scripted run); eframe and winit pass on none of
+  them. Acquire and release are §6.3's protocol, so several windows and several sopen processes hand
+  focus to each other in any order of events; they run on a thread of their own — which also reads
+  the config and builds the switch — never on a window's or AppKit's main thread (the lock can be held
+  by a stopped sopen). The windows and the notifications only send to it, except the will-sleep
+  notification: the Mac may suspend once its observers return, so it waits for the release, at most
+  1 s, then returns either way. A covered window (a locked screen, a screen
   saver) is not in front where macOS reports it covered *(estimate: not measured)*. Should a wake
   come without its notification, it is seen afterwards: the wall clock has run ahead of the monotonic
   one, which stops while the Mac sleeps; the switch is then let go and acquired again, read back anew,

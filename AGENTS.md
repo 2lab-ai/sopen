@@ -20,7 +20,8 @@ anything is downloaded: sopen's hex window (the default; byte overwrite only) or
 `SOPEN_TARGET` or `target` in sopen's config — on HOST's screen, by running HOST's installed sopen with `--here`
 over ssh: HOST
 is a machine the owner uses sopen on, not a file's remote, which still needs only sshd (spec §4a). On macOS,
-while a sopen window is in front, the top row sends F1–F12 without fn: `fkeys` in sopen's config —
+while a sopen window is in front, the top row is meant to send F1–F12 without fn (the key half is the owner's
+receipt K-F3, still open): `fkeys` in sopen's config —
 `"function"` (the default) or `"system"` (never touched), set by `sopen config fkeys function|system` — and
 sopen sets the global `HIDFKeyMode` to 1 and puts back what it found once none of its windows is in front,
 even when it dies (lock, state file, watchdog child; `.prd/04-file-keys.md` §6, `src/fnkeys/`); a run a hook
