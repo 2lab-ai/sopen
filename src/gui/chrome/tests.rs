@@ -179,7 +179,8 @@ fn cp437_gives_every_byte_a_glyph_of_the_font() {
 }
 
 /// The F-key rows label only keys that work there; a viewer's own keys join the browser's. The
-/// browser's two come from its key table (S1's list row, 02 §7; 1 is Help everywhere).
+/// browser's two come from its key table (S1's list row, 02 §7, and S5's 10Tree; 1 is Help
+/// everywhere).
 #[test]
 fn the_f_key_tables() {
     use crate::gui::browser::keys::{row, Context};
@@ -195,7 +196,8 @@ fn the_f_key_tables() {
             (4, "Edit"),
             (5, "Copy"),
             (6, "Move"),
-            (9, "Dual")
+            (9, "Dual"),
+            (10, "Tree")
         ]
     );
     assert_eq!(LIST_KEYS, row(Context::List, Mode::Preview).as_slice());
@@ -228,7 +230,8 @@ fn the_f_key_tables() {
             (4, "Edit"),
             (5, "Copy"),
             (6, "Move"),
-            (9, "Dual")
+            (9, "Dual"),
+            (10, "Tree")
         ]
     );
     // PC Shell's labels are six characters at most ("Disply", "Locate"); so are these.

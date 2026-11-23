@@ -175,8 +175,9 @@ fn ops_connect(state_dir: PathBuf) -> OpsConnect {
 }
 
 /// Makes the tree's worker and names the account `~<user>` is (05 §2, §6.4), on a thread of its
-/// own: a remote one connects.
-pub(crate) type TreeConnect = Arc<dyn Fn() -> Result<TreeWorker> + Send + Sync>;
+/// own: a remote one connects. The flag says the tree closed meanwhile: nothing is built then
+/// ([`built_unless_closed`]).
+pub(crate) type TreeConnect = Arc<dyn Fn(&AtomicBool) -> Result<TreeWorker> + Send + Sync>;
 
 /// The tree's worker and the account `~<user>` is (`None`: the home is `realpath(".")`).
 pub(crate) type TreeWorker = (Box<dyn TreeFs>, Option<String>);
@@ -186,17 +187,94 @@ pub(crate) type TreeWorker = (Box<dyn TreeFs>, Option<String>);
 /// §6.4: a deep scan never queues behind the panel's listing), which the worker renews through
 /// a fresh one once handles may have been left open on the server.
 fn tree_connect(label: Option<String>, state_dir: PathBuf) -> TreeConnect {
-    Arc::new(move || match label.as_deref() {
+    Arc::new(move |closed: &AtomicBool| match label.as_deref() {
         None => Ok((LocalFs::tree(), None)),
         Some(label) => {
             let spec = host_spec(label)?;
             let user = spec.user.clone().or_else(|| ssh_user(&spec.destination()));
-            let conn = SftpRemote::connect(&spec, &state_dir)?;
+            let conn = SftpRemote::connect(&spec, &state_dir);
             let state_dir = state_dir.clone();
-            let renew = Box::new(move || SftpRemote::connect(&spec, &state_dir).ok());
-            Ok((Box::new(conn).into_tree_renewing(renew), user))
+            built_unless_closed(closed, conn, move |conn| {
+                let renew = Box::new(move || SftpRemote::connect(&spec, &state_dir).ok());
+                (Box::new(conn).into_tree_renewing(renew), user)
+            })
         }
     })
+}
+
+/// The tree's worker built on `conn` once its connect has returned — unless the tree closed
+/// while it connected (`closed`; a blocking connect cannot be stopped): then the connection is
+/// dropped at once, closing, and nothing is built on it.
+fn built_unless_closed<C>(
+    closed: &AtomicBool,
+    conn: Result<C>,
+    build: impl FnOnce(C) -> TreeWorker,
+) -> Result<TreeWorker> {
+    let conn = conn?;
+    if closed.load(Ordering::Acquire) {
+        drop(conn);
+        bail!("the tree closed while it connected");
+    }
+    Ok(build(conn))
+}
+
+/// How long Enter on a link waits for the browser's connection to be free (a panel's listing
+/// on it): it is taken only when free, never queued for, so the panel's own work never waits
+/// behind a link's resolution.
+const LINK_WAIT: Duration = Duration::from_millis(500);
+
+/// A link's target, `realpath` on the browser's connection (05 §1, Enter on a link). The
+/// connection is tried, never waited on, for at most [`LINK_WAIT`]; `None` — nothing called —
+/// once the tree closed (`closed`), looked at before the connection is taken and again before
+/// `realpath`.
+fn resolve_link(
+    conn: &Mutex<Box<dyn RemoteFs + Send>>,
+    path: &str,
+    closed: &AtomicBool,
+) -> Option<Result<String>> {
+    let deadline = std::time::Instant::now() + LINK_WAIT;
+    loop {
+        if closed.load(Ordering::Acquire) {
+            return None;
+        }
+        let mut fs = match conn.try_lock() {
+            Ok(fs) => fs,
+            Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                if std::time::Instant::now() >= deadline {
+                    return Some(Err(anyhow::anyhow!(
+                        "the connection is busy with the panel; Enter again"
+                    )));
+                }
+                std::thread::sleep(Duration::from_millis(10));
+                continue;
+            }
+        };
+        if closed.load(Ordering::Acquire) {
+            return None;
+        }
+        return Some(fs.realpath(path));
+    }
+}
+
+/// A flag set when it is dropped: the tree's work on other threads (its connect, a link's
+/// resolution) is told the tree closed — by Esc, Enter, F10 or the window closing alike.
+struct Closed(Arc<AtomicBool>);
+
+impl Closed {
+    fn new() -> Self {
+        Self(Arc::default())
+    }
+
+    fn flag(&self) -> Arc<AtomicBool> {
+        self.0.clone()
+    }
+}
+
+impl Drop for Closed {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
+    }
 }
 
 /// The account `ssh -G` names for `dest` (05 §6.4: whose home `~<user>` is); `None` when ssh
@@ -461,9 +539,12 @@ struct TreeSide {
     built_seen: bool,
     /// What the model was last told of the screen (`top`, `height`, the bar's row).
     told: Option<(usize, usize, Option<crate::tree::RowId>)>,
-    /// Enter on a link: its row as the status row names it, and its target being resolved on
-    /// the browser's connection.
-    target: Option<(String, Receiver<Result<String>>)>,
+    /// Enter on a link: its row as the status row names it, its target being resolved on the
+    /// browser's connection, and that resolution's flag (set when it is dropped: replaced by
+    /// another Enter, or the tree closed).
+    target: Option<(String, Receiver<Result<String>>, Closed)>,
+    /// Set when the tree goes: its connect, if still running, builds nothing.
+    closed: Closed,
     /// What the tree says on its status row until the next key (a link whose target does not
     /// resolve).
     said: Option<Status>,
@@ -1517,9 +1598,17 @@ impl Browser {
             .map_or(view::Content::List, |shown| shown[1 - side].clone());
         let (tx, rx) = mpsc::channel();
         let (connect, waker) = (self.tree_connect.clone(), ctx.clone());
+        let closed = Closed::new();
+        let flag = closed.flag();
         std::thread::spawn(move || {
-            // A tree closed meanwhile drops what comes, and with it the worker (it closes).
-            let _ = tx.send(connect());
+            let made = connect(&flag);
+            // A tree closed meanwhile gets nothing: what was made goes here, and its connection
+            // closes with it.
+            if flag.load(Ordering::Acquire) {
+                drop(made);
+                return;
+            }
+            let _ = tx.send(made);
             waker.request_repaint();
         });
         let title = show(self.label.as_deref(), &folder);
@@ -1533,6 +1622,7 @@ impl Browser {
             built_seen: false,
             told: None,
             target: None,
+            closed,
             said: None,
             fs_seen: HashMap::new(),
         });
@@ -1541,10 +1631,18 @@ impl Browser {
     }
 
     /// Closes the tree (Esc, F10, Enter): every listing and scan stops, nothing is waited for;
-    /// the side shows its list as it was and the other side follows the rules again, at once.
+    /// its connect and a link's resolution still running are told (their flags), so neither
+    /// builds or calls anything more; the side shows its list as it was and the other side
+    /// follows the rules again, at once.
     fn close_tree(&mut self) {
-        if let Some(TreeModel::Open(mut model)) = self.tree.take().map(|t| t.model) {
-            model.close();
+        if let Some(t) = self.tree.take() {
+            t.closed.0.store(true, Ordering::Release);
+            if let Some((_, _, closed)) = &t.target {
+                closed.0.store(true, Ordering::Release);
+            }
+            if let TreeModel::Open(mut model) = t.model {
+                model.close();
+            }
         }
         self.moved_at = None;
     }
@@ -1626,7 +1724,7 @@ impl Browser {
         }
         // Enter on a link: its target, once resolved, is listed; one that does not resolve is
         // said, and the tree stays.
-        if let Some((shown, rx)) = &t.target {
+        if let Some((shown, rx, _)) = &t.target {
             match rx.try_recv() {
                 Ok(Ok(path)) => went = Some(path),
                 Ok(Err(e)) => {
@@ -1744,12 +1842,16 @@ impl Browser {
         let (tx, rx) = mpsc::channel();
         let conn = self.conn.clone();
         let wanted = path.clone();
+        let closed = Closed::new();
+        let flag = closed.flag();
         std::thread::spawn(move || {
-            let mut fs = conn.lock().unwrap_or_else(|p| p.into_inner());
-            let _ = tx.send(fs.realpath(&wanted));
-            waker.request_repaint();
+            if let Some(resolved) = resolve_link(&conn, &wanted, &flag) {
+                let _ = tx.send(resolved);
+                waker.request_repaint();
+            }
         });
-        t.target = Some((show(self.label.as_deref(), &path), rx));
+        // An Enter before it drops the earlier resolution, whose flag stops it.
+        t.target = Some((show(self.label.as_deref(), &path), rx, closed));
     }
 
     /// What the tree hands the browser (02 §7): Enter's folder is listed in the tree's panel,
@@ -2257,7 +2359,7 @@ impl Browser {
             if let Some(said) = &t.said {
                 return said.clone();
             }
-            if let Some((shown, _)) = &t.target {
+            if let Some((shown, _, _)) = &t.target {
                 return Status::info(format!("resolving {shown}…"));
             }
             if let Some(said) = self.ops.status() {

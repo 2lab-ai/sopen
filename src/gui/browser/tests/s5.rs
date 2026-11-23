@@ -12,8 +12,10 @@
 
 use super::*;
 use crate::remote::treefs::{Budget, Disk, FsStat, Listing, Live, Mounts, Resolved};
+use crate::remote::treefs::{Reply, TreeFs};
+use crate::remote::Stat;
 use crate::tree::watchdog::{Pool, Timing};
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicU64, AtomicUsize};
 use std::sync::Condvar;
 use std::time::{Duration, Instant};
 
@@ -125,7 +127,7 @@ fn with_tree(fx: &mut Fx, home: &str) -> Tree5 {
     let disk = TestDisk::new(home);
     let pool = Pool::new(Timing::default());
     let (d, p) = (disk.clone(), pool.clone());
-    let connect: TreeConnect = Arc::new(move || {
+    let connect: TreeConnect = Arc::new(move |_: &AtomicBool| {
         let fs = LocalFs::tree_with(d.clone() as Arc<dyn Disk>, p.clone());
         Ok((fs, None))
     });
@@ -273,7 +275,7 @@ fn t_open_over_sftp() {
     let root = fx.root.clone();
     let host = "s5-sftp-tree";
     let home = root.clone();
-    let connect: TreeConnect = Arc::new(move || {
+    let connect: TreeConnect = Arc::new(move |_: &AtomicBool| {
         let conn = SftpRemote::local_server_args(&["-d", &home], None)
             .ok_or_else(|| anyhow::anyhow!("no sftp-server"))?;
         Ok((Box::new(conn).into_tree_renewing(Box::new(|| None)), None))
@@ -856,4 +858,243 @@ fn the_models_rows_map_to_the_views() {
         (hidden.kind, hidden.fold, hidden.hidden),
         (tree::RowKind::Hidden(3), tree::Fold::Leaf, true)
     );
+}
+
+// ---------------------------------------------------------------------------------------------
+// Review round 1: what the tree started on other threads stops with it.
+
+/// A stand-in connection, counted while it lives.
+struct Conn(Arc<AtomicUsize>);
+
+impl Conn {
+    fn new(live: &Arc<AtomicUsize>) -> Self {
+        live.fetch_add(1, Ordering::SeqCst);
+        Conn(live.clone())
+    }
+}
+
+impl Drop for Conn {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// A tree worker on a stand-in connection that answers nothing.
+struct OnConn(#[allow(dead_code)] Conn);
+
+impl TreeFs for OnConn {
+    fn send(&mut self, _: u64, _: u64, _: crate::remote::treefs::Ask) {}
+    fn cancel(&mut self, _: u64) {}
+    fn next(&mut self, _: Duration) -> Option<Reply> {
+        None
+    }
+    fn set_wake(&mut self, _: crate::remote::Wake) {}
+    fn close(&mut self) {}
+    fn held(&self) -> Option<String> {
+        None
+    }
+    fn is_local(&self) -> bool {
+        false
+    }
+}
+
+/// Closing the tree while its connect blocks — by Esc, or by the window closing — builds no
+/// worker on the connection that comes, and keeps no connection afterwards.
+#[test]
+fn closing_while_the_tree_connects_builds_nothing_and_keeps_no_connection() {
+    let mut fx = fixture();
+    let (live, built, returned) = (
+        Arc::new(AtomicUsize::new(0)),
+        Arc::new(AtomicUsize::new(0)),
+        Arc::new(AtomicUsize::new(0)),
+    );
+    for (n, way) in ["Esc", "the window closing"].into_iter().enumerate() {
+        let gate = Gate::default();
+        let (g, l, b, r) = (gate.clone(), live.clone(), built.clone(), returned.clone());
+        let connect: TreeConnect = Arc::new(move |closed: &AtomicBool| {
+            // A connect that blocks until the test lets it return.
+            g.hold();
+            let made = built_unless_closed(closed, Ok(Conn::new(&l)), |conn| {
+                b.fetch_add(1, Ordering::SeqCst);
+                (Box::new(OnConn(conn)) as Box<dyn TreeFs>, None)
+            });
+            r.fetch_add(1, Ordering::SeqCst);
+            made
+        });
+        fx.b.set_tree_connect(connect, "s5-connect");
+        fx.key(Key::F10);
+        gate.reached();
+        let connecting = |b: &Browser| {
+            matches!(
+                b.tree.as_ref().map(|t| &t.model),
+                Some(TreeModel::Connecting(_))
+            )
+        };
+        assert!(connecting(&fx.b), "{way}: the tree is connecting");
+        match n {
+            0 => fx.key(Key::Escape),
+            _ => assert!(fx.b.close_requested()),
+        }
+        assert!(fx.b.tree.is_none(), "{way}: the tree closed");
+        gate.release();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while returned.load(Ordering::SeqCst) <= n {
+            assert!(
+                Instant::now() < deadline,
+                "{way}: the connect never returned"
+            );
+            std::thread::sleep(MS(5));
+        }
+        // The connector's thread drops what it made right after returning.
+        std::thread::sleep(MS(50));
+        assert_eq!(built.load(Ordering::SeqCst), 0, "{way}: nothing built");
+        assert_eq!(live.load(Ordering::SeqCst), 0, "{way}: no connection kept");
+        fx.drv.idle(&mut fx.b, 2);
+        assert!(fx.b.tree.is_none(), "{way}: nothing reached the window");
+    }
+}
+
+/// The local disk as the browser's own connection, its `realpath` calls counted and its next
+/// listing held at a gate when one is set.
+struct Watched {
+    fs: LocalFs,
+    hold: Arc<Mutex<Option<Gate>>>,
+    realpaths: Arc<AtomicUsize>,
+}
+
+impl RemoteFs for Watched {
+    fn stat_opt(&mut self, p: &str) -> Result<Option<Stat>> {
+        self.fs.stat_opt(p)
+    }
+    fn lstat_opt(&mut self, p: &str) -> Result<Option<Stat>> {
+        self.fs.lstat_opt(p)
+    }
+    fn realpath(&mut self, p: &str) -> Result<String> {
+        self.realpaths.fetch_add(1, Ordering::SeqCst);
+        self.fs.realpath(p)
+    }
+    fn read_head(&mut self, p: &str, max: usize) -> Result<Vec<u8>> {
+        self.fs.read_head(p, max)
+    }
+    fn list_dir(&mut self, p: &str) -> Result<Vec<String>> {
+        self.fs.list_dir(p)
+    }
+    fn list_entries(&mut self, p: &str) -> Result<Vec<crate::remote::Entry>> {
+        let gate = self.hold.lock().unwrap().take();
+        if let Some(gate) = gate {
+            gate.hold();
+        }
+        self.fs.list_entries(p)
+    }
+    fn read_to(
+        &mut self,
+        p: &str,
+        out: &mut dyn Write,
+        progress: &mut dyn FnMut(u64),
+    ) -> Result<u64> {
+        self.fs.read_to(p, out, progress)
+    }
+    fn create_from(
+        &mut self,
+        local: &std::path::Path,
+        p: &str,
+        like: Option<crate::remote::Like>,
+    ) -> std::result::Result<crate::remote::Uploaded, crate::remote::CreateError> {
+        self.fs.create_from(local, p, like)
+    }
+    fn set_mode(&mut self, p: &str, mode: u32) -> Result<()> {
+        self.fs.set_mode(p, mode)
+    }
+    fn rename_over(&mut self, from: &str, to: &str) -> Result<()> {
+        self.fs.rename_over(from, to)
+    }
+    fn link_new(&mut self, from: &str, to: &str) -> Result<()> {
+        self.fs.link_new(from, to)
+    }
+    fn remove(&mut self, p: &str) -> Result<()> {
+        self.fs.remove(p)
+    }
+}
+
+/// The fixture with a link `link` to the folder `target`, the tree open on it with the bar on
+/// the link, the browser's own connection [`Watched`]: its listing gate and its `realpath`
+/// count.
+fn on_a_link() -> (Fx, Tree5, Arc<Mutex<Option<Gate>>>, Arc<AtomicUsize>) {
+    let mut fx = fixture();
+    let root = fx.root.clone();
+    std::fs::create_dir(format!("{root}/target")).unwrap();
+    std::os::unix::fs::symlink(format!("{root}/target"), format!("{root}/link")).unwrap();
+    let t5 = with_tree(&mut fx, &root);
+    fx.relist_root();
+    let (hold, realpaths) = (Arc::default(), Arc::new(AtomicUsize::new(0)));
+    *fx.b.conn.lock().unwrap() = Box::new(Watched {
+        fs: LocalFs::new(),
+        hold: Arc::clone(&hold),
+        realpaths: realpaths.clone(),
+    });
+    open_tree(&mut fx, Modifiers::NONE);
+    tree_bar_on(&mut fx, "link");
+    (fx, t5, hold, realpaths)
+}
+
+/// The right panel lists the root on the browser's connection, held at a gate there.
+fn panel_listing_held(fx: &mut Fx, hold: &Arc<Mutex<Option<Gate>>>) -> Gate {
+    let gate = Gate::default();
+    *hold.lock().unwrap() = Some(gate.clone());
+    let root = fx.root.clone();
+    fx.b.relist(Some(1), root, None, None, None);
+    gate.reached();
+    gate
+}
+
+/// Esc while a link's target waits for the browser's connection (a panel's listing has it):
+/// `realpath` is never called after the close, and the panel's next listing runs as soon as
+/// the first ends — not behind the link's resolution.
+#[test]
+fn closing_during_a_links_resolution_calls_nothing_and_delays_no_listing() {
+    let (mut fx, _t5, hold, realpaths) = on_a_link();
+    let gate = panel_listing_held(&mut fx, &hold);
+    fx.key(Key::Enter);
+    assert!(
+        fx.b.tree.as_ref().is_some_and(|t| t.target.is_some()),
+        "the link's target is being resolved"
+    );
+    fx.key(Key::Escape);
+    assert!(fx.b.tree.is_none(), "Esc closed the tree");
+    // The left panel's listing queues behind the held one; then the held one ends.
+    let root = fx.root.clone();
+    fx.b.relist(Some(0), root, None, None, None);
+    gate.release();
+    fx.drv.until(&mut fx.b, 10, |b| b.listing.is_empty());
+    // Past the time the resolution would have waited for the connection.
+    std::thread::sleep(LINK_WAIT + MS(200));
+    assert_eq!(
+        realpaths.load(Ordering::SeqCst),
+        0,
+        "no realpath after the close"
+    );
+}
+
+/// A link's target waits a moment at most for the browser's connection, never queued behind
+/// the panel's listing: it gives up without calling `realpath` and says so; once the
+/// connection is free, Enter resolves it and the panel lists the target.
+#[test]
+fn a_links_resolution_gives_up_while_the_panel_has_the_connection() {
+    let (mut fx, _t5, hold, realpaths) = on_a_link();
+    let gate = panel_listing_held(&mut fx, &hold);
+    fx.key(Key::Enter);
+    fx.drv.until(&mut fx.b, 5, |b| {
+        b.tree.as_ref().is_some_and(|t| t.said.is_some())
+    });
+    let said = fx.b.status_line();
+    assert!(said.error && said.text.contains("busy"), "{said:?}");
+    assert_eq!(realpaths.load(Ordering::SeqCst), 0);
+    assert!(fx.b.tree.is_some(), "the tree stays");
+    gate.release();
+    fx.drv.until(&mut fx.b, 10, |b| b.listing.is_empty());
+    fx.key(Key::Enter);
+    fx.drv.until(&mut fx.b, 10, |b| b.tree.is_none());
+    fx.settle();
+    assert_eq!(realpaths.load(Ordering::SeqCst), 1);
+    assert_eq!(fx.b.panels[0].dir, format!("{}/target", fx.root));
 }

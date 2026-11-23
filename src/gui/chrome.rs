@@ -68,10 +68,10 @@ pub struct FKey {
     pub label: &'static str,
 }
 
-/// The file list's row in slice S1 (02 §7, 04 §2): only the keys that work, F9's label naming
-/// the mode it switches to from the default (preview) mode. It is the browser key table's
-/// (`browser::keys::row`, a test holds them equal). The browser draws the table's row, by its
-/// mode; this constant is what the tests hold it to.
+/// The file list's row in the landed slices, S1 and S5 (02 §7, 04 §2; S5 adds 10Tree): only the
+/// keys that work, F9's label naming the mode it switches to from the default (preview) mode. It
+/// is the browser key table's (`browser::keys::row`, a test holds them equal). The browser draws
+/// the table's row, by its mode; this constant is what the tests hold it to.
 pub const LIST_KEYS: &[FKey] = &[
     HELP_KEY,
     FKey {
@@ -97,6 +97,10 @@ pub const LIST_KEYS: &[FKey] = &[
     FKey {
         n: 9,
         label: "Dual",
+    },
+    FKey {
+        n: 10,
+        label: "Tree",
     },
 ];
 
