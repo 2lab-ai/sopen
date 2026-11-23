@@ -1,7 +1,8 @@
 //! sopen: open a file or folder on another machine as if it were local. Spec: `.prd/01-spec.md`.
 //!
-//! Module map: [`target`] parses the scp-style argument, [`forward`] decides where it opens (here,
-//! or on another machine's screen — [`config`] holds the default), [`remote`] is the file layer
+//! Module map: [`target`] parses the scp-style argument and [`url`] a web address (opened in a
+//! browser), [`forward`] decides where it opens (here, or on another machine's screen — through an
+//! ssh tunnel for a loopback address; [`config`] holds the default), [`remote`] is the file layer
 //! (SFTP over the system ssh, or the local disk), [`kind`] routes by type, [`zed`] / [`app`] hand
 //! the file to an editor ([`raise`] brings the editor's window to the user on KDE Plasma),
 //! [`ffmpeg`] / [`cut`] cut media, [`stems`] splits voice from music, [`cache`] owns local paths,
@@ -32,6 +33,7 @@ pub mod stems;
 pub mod stream;
 pub mod target;
 pub mod tree;
+pub mod url;
 pub mod usage;
 pub mod zed;
 

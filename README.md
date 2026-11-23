@@ -11,6 +11,7 @@ sopen myserver:/tmp/a.mp3          # audio → play, cut / copy / paste, mono �
 sopen stems myserver:/tmp/a.mp3    # voice and music → two new files next to it
 sopen myserver:/tmp/a.zip          # anything else → asks: hex editor (default) or save it to a path
 sopen --target <host> myserver:/tmp/a.mp3   # the same, on <host>'s screen instead of this one
+sopen --target <host> http://127.0.0.1:1234/  # this machine's web page in <host>'s browser, tunnelled
 ```
 
 Same syntax as `scp`. Uses your `ssh` and `~/.ssh/config`; the remote needs nothing but sshd.
@@ -103,6 +104,37 @@ there; a sopen stopped without a terminal leaves the window on `<host>` open.
 The exit code is `<host>`'s; `could not reach <host>` means ssh did not get there, `sopen is not
 installed on <host>` (exit 127) means it has no sopen, and `sopen on <host> ended with status
 N (signal n?)` means it most likely was interrupted there.
+
+## Web addresses: `sopen URL`
+
+```sh
+sopen http://127.0.0.1:1234/                  # opens in this machine's default browser, and sopen ends
+sopen --target <host> https://example.com/    # opens in <host>'s default browser (Safari, Chrome, Edge…)
+sopen --target <host> http://127.0.0.1:1234/  # a page served here, opened on <host> through an ssh tunnel
+```
+
+An `http://` or `https://` address (the scheme in any case) is never read as `host:path`; it goes to
+the default browser of the machine that shows things — `open` on macOS, `xdg-open` on Linux —
+exactly as written. Without a target that is all: the browser opens, sopen ends.
+
+With a target, an address that would mean `<host>` itself there — `localhost`, `127.x.y.z`, `[::1]`
+(and the other loopback names `--target` treats as this machine) — is served from this machine
+instead: sopen opens an ssh connection of its own to `<host>` (never its shared one) with
+`-R <port>:<address's host>:<port>`, and `<host>`'s sopen opens the address in its browser and waits.
+sopen prints `<address> is open on <host> through a tunnel — Ctrl-C closes it` and stays; Ctrl-C (or
+SIGTERM) closes the tunnel and exits 0. When sopen ends any other way — killed outright included —
+its pipe to ssh closes: `<host>`'s sopen ends, and so does the ssh under sopen's guard, even while
+the browser still holds a connection, so the page no longer opens. When the address's port is taken
+on `<host>` (or `<host>`'s sshd refuses it, as it does a port below 1024 for a user), sopen tries a
+few random ports from 49152–65535 and says which one it took: the address then opens with that port,
+a different origin. Any other address (`https://example.com/`) is handed to `<host>`'s sopen as it
+is, with no tunnel. `--app` and `--hex` open files, so with an address they are a usage error
+(exit 2).
+
+The tunnel needs only what `ssh -R` needs: `<host>`'s sshd allowing TCP forwarding (the default). A
+`LocalForward` or `RemoteForward` your `~/.ssh/config` sets for `<host>` is requested by this
+connection too and, if it fails, ends it. So far the tunnel is tested against a stand-in `ssh`, not
+yet a real one.
 
 ## Folders: the file browser
 

@@ -36,17 +36,19 @@ const EXIT_CONFLICT: u8 = 3;
         its viewer, F4 opens VS Code or Zed); text opens in VS Code when present, otherwise Zed; \
         images, video and audio in sopen's own window. Any other file (a zip, a binary) asks first: open it in \
         sopen's hex editor (the default) or save it to a path you choose. --hex opens any file in \
-        the hex editor.\n\n\
+        the hex editor. An http:// or https:// address opens in the default browser.\n\n\
         It opens on this machine, or with --target HOST on HOST's screen (sopen runs there, \
         started over ssh). SOPEN_TARGET or `sopen config target HOST` make a HOST the default; \
-        --here opens on this machine anyway.",
+        --here opens on this machine anyway. A loopback address (localhost, 127.0.0.1, [::1]) \
+        opens on HOST through an ssh tunnel from this machine that closes when sopen ends \
+        (Ctrl-C).",
     args_conflicts_with_subcommands = true,
     subcommand_negates_reqs = true
 )]
 struct Cli {
     #[command(subcommand)]
     cmd: Option<Cmd>,
-    /// [user@]host:path, or a local path
+    /// [user@]host:path, a local path, or an http(s):// address
     #[arg(
         value_name = "SOURCE",
         required_unless_present_any = ["selftest_audio", "raise_window", "fkeys_watchdog"]
@@ -64,6 +66,10 @@ struct Cli {
     /// Open the file in sopen's hex editor, whatever its type (no dialog first)
     #[arg(long, conflicts_with = "app")]
     hex: bool,
+    /// Internal (HOST's half of `sopen URL` through a tunnel, spec §4a): once the address is
+    /// open, wait for the input's end — the other machine's sopen ending — then exit 0.
+    #[arg(long, hide = true, requires = "here", conflicts_with_all = ["app", "hex"])]
+    hold_until_eof: bool,
     /// Receipt check: play FILE on the real audio device at gain 0 for ~2 s and print the
     /// callback / underrun counts (AGENTS.md "Receipts").
     #[arg(
@@ -176,6 +182,21 @@ enum ConfigKey {
     },
 }
 
+/// A command line sopen cannot run, found past clap (an address with `--app`): exit 2, as
+/// clap's own usage errors.
+#[derive(Debug)]
+struct Usage(String);
+
+impl std::fmt::Display for Usage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Usage {}
+
+const EXIT_USAGE: u8 = 2;
+
 /// A write that was refused because the remote changed since the fetch (exit 3).
 #[derive(Debug)]
 struct Refused(String);
@@ -241,6 +262,7 @@ fn main() -> ExitCode {
                 cli.source.as_deref().unwrap_or_default(),
                 cli.target.as_deref(),
                 cli.here,
+                cli.hold_until_eof,
                 cli.app.as_deref(),
                 cli.hex,
                 dirs,
@@ -273,6 +295,8 @@ fn exit(result: Result<u8>) -> ExitCode {
                 ExitCode::from(interrupted.exit_code())
             } else if e.chain().any(|c| c.is::<Refused>()) {
                 ExitCode::from(EXIT_CONFLICT)
+            } else if e.chain().any(|c| c.is::<Usage>()) {
+                ExitCode::from(EXIT_USAGE)
             } else {
                 ExitCode::from(EXIT_ERROR)
             }
@@ -478,15 +502,27 @@ fn run_config(key: Option<ConfigKey>) -> Result<()> {
 
 /// `sopen SOURCE`: on this machine, or forwarded to the target HOST (spec §4a). Returns the exit
 /// code — HOST's own when forwarded.
+#[allow(clippy::too_many_arguments)]
 fn run_source(
     source: &str,
     flag: Option<&str>,
     here: bool,
+    hold: bool,
     app_name: Option<&str>,
     hex: bool,
     dirs: &Dirs,
     rec: &mut Record,
 ) -> Result<u8> {
+    // An address before anything reads SOURCE as a path or `host:path` (`http` would be a host).
+    if let Some(url) = sopen::url::parse(source) {
+        return run_url(source, url, flag, here, hold, app_name, hex, dirs, rec);
+    }
+    if hold {
+        return Err(Usage(format!(
+            "--hold-until-eof is for an http(s):// address, not {source}"
+        ))
+        .into());
+    }
     let chosen = forward::choose(here, flag, forward::target_env, || {
         Ok(config::load(&config::path()?)?.target)
     })?;
@@ -511,6 +547,61 @@ fn run_source(
     Ok(code)
 }
 
+/// `sopen URL` (spec §4a): opened in this machine's browser; with a HOST, in HOST's — a
+/// loopback address served from here through a tunnel that lives as long as this sopen, any
+/// other passed to HOST's sopen as it is.
+#[allow(clippy::too_many_arguments)]
+fn run_url(
+    source: &str,
+    url: std::result::Result<sopen::url::Url, String>,
+    flag: Option<&str>,
+    here: bool,
+    hold: bool,
+    app_name: Option<&str>,
+    hex: bool,
+    dirs: &Dirs,
+    rec: &mut Record,
+) -> Result<u8> {
+    for (given, flag_name) in [(app_name.is_some(), "--app"), (hex, "--hex")] {
+        if given {
+            return Err(Usage(format!(
+                "{flag_name} opens a file; {source} is an address (it opens in the browser)"
+            ))
+            .into());
+        }
+    }
+    let url = url.map_err(|why| anyhow::anyhow!("not an address sopen can open: {why}"))?;
+    rec.action = Some("open");
+    let chosen = forward::choose(here, flag, forward::target_env, || {
+        Ok(config::load(&config::path()?)?.target)
+    })?;
+    let hostname = forward::hostname();
+    let host = match chosen {
+        Some(host) if !forward::is_here(&host, hostname.as_deref()) => host,
+        _ => return open_url(&url, hold).map(|()| 0),
+    };
+    rec.target = Some(host.clone());
+    if url.is_loopback() {
+        sopen::debug!("opening {} on {host} through a tunnel", url.as_str());
+        forward::tunnel(&host, &url, &dirs.state)
+    } else {
+        sopen::debug!("opening {} on {host}", url.as_str());
+        forward::run(&host, url.as_str(), None, false, &dirs.state)
+    }
+}
+
+/// Opens `url` in this machine's browser and says so; with `hold` (HOST's half of a tunnel)
+/// then waits for the input's end — the other side's sopen ending, however it ends.
+fn open_url(url: &sopen::url::Url, hold: bool) -> Result<()> {
+    sopen::url::open(url)?;
+    println!("{}", sopen::url::opened_line(url.as_str()));
+    if hold {
+        // The end of the input, or an error reading it: either way the other side is gone.
+        let _ = std::io::copy(&mut std::io::stdin().lock(), &mut std::io::sink());
+    }
+    Ok(())
+}
+
 fn run_open(
     arg: &str,
     app_name: Option<&str>,
@@ -518,6 +609,15 @@ fn run_open(
     dirs: &Dirs,
     rec: &mut Record,
 ) -> Result<()> {
+    // An address is never a path or `host:path` (run_source sends one to run_url first).
+    if let Some(url) = sopen::url::parse(arg) {
+        if app_name.is_some() || hex {
+            bail!(Usage(format!(
+                "--app and --hex open files; {arg} is an address"
+            )));
+        }
+        return open_url(&url.map_err(anyhow::Error::msg)?, false);
+    }
     // The windows of this run feed the macOS F-key switch (04 §6.2), its files in the state
     // folder; nothing is read or started before the first window.
     gui::fkeys_for_run(dirs.state.clone());

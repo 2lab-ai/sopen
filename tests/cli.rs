@@ -1434,12 +1434,16 @@ fn media_autoexport_writes_a_sibling() {
 
 // ---------------------------------------------------------------------------------------------
 // Where it opens (spec §4a). `ssh` is a stand-in: it answers `ssh -G`, records the call that runs
-// sopen on the target, and then runs it as OpenSSH does — the words after the destination
+// sopen on the target (`argv`; every call, in `calls`, and its pid, in `ssh-pids`), and then
+// runs it as OpenSSH does — the words after the destination
 // joined with spaces, `sh -c "<line>"` on the "target" (here, in a home of its own, with a
 // PATH of only the tools the script uses and a display set; the script's Linux branch has its
 // own tests). The target has nothing installed: no sopen on that PATH, and the absolute install
 // paths in the command are pointed at a directory that does not exist, so a sopen installed on
-// the test machine is never run. `FAKE_SSH_EXIT` stops it before the run, with that code.
+// the test machine is never run. `FAKE_SSH_EXIT` stops it before the run, with that code;
+// `FAKE_SSH_TAKEN=<port>` fails a `-R` on that port as ssh does with `ExitOnForwardFailure`;
+// `FAKE_SSH_LINGER=1` keeps it running after the target's command ends, as a real ssh waits for
+// the forwarded connections a browser keeps open.
 
 /// A target name no test machine has.
 const HOST: &str = "sopen-test-target";
@@ -1528,11 +1532,19 @@ impl FakeSsh {
                 "#!/bin/sh\n\
                  if [ \"$1\" = -G ]; then printf 'controlpath {CONTROL_PATH}\\nconnecttimeout none\\n'; exit 0; fi\n\
                  for a in \"$@\"; do printf '%s\\n' \"$a\"; done > '{dir}/argv'\n\
+                 printf '%s\\n' \"$$\" >> '{dir}/ssh-pids'\n\
+                 {{ for a in \"$@\"; do printf '%s\\n' \"$a\"; done; echo ---; }} >> '{dir}/calls'\n\
                  if [ -n \"${{FAKE_SSH_EXIT:-}}\" ]; then exit \"$FAKE_SSH_EXIT\"; fi\n\
+                 fwd=; prev=; for a in \"$@\"; do if [ \"$prev\" = -R ]; then fwd=$a; fi; prev=$a; done\n\
+                 if [ -n \"${{FAKE_SSH_TAKEN:-}}\" ]; then case $fwd in \"$FAKE_SSH_TAKEN\":*) \
+                 echo \"Error: remote port forwarding failed for listen port $FAKE_SSH_TAKEN\" >&2; exit 255;; esac; fi\n\
                  while [ \"$#\" -gt 0 ] && [ \"$1\" != -- ]; do shift; done\n\
                  shift\n\
                  line=$(printf '%s' \"$*\" | sed{unplug})\n\
                  mkdir -p '{dir}/target-home'\n\
+                 if [ -n \"${{FAKE_SSH_LINGER:-}}\" ]; then \
+                 HOME='{dir}/target-home' PATH='{dir}/target-path' DISPLAY=:99 /bin/sh -c \"$line\"; \
+                 trap '' INT HUP; exec sleep 120; fi\n\
                  HOME='{dir}/target-home' PATH='{dir}/target-path' DISPLAY=:99 exec /bin/sh -c \"$line\"\n",
                 dir = dir.display()
             ),
@@ -3022,4 +3034,447 @@ fn the_real_child_publishes_nothing_before_the_go_ahead() {
         }
         assert!(!work.exists(), "{answer:?}: the work folder is left");
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// `sopen URL` (spec §4a). The browser is always a stand-in (`SOPEN_BROWSER`): a script that
+// appends its arguments, one call a block ended by `---`, so no test opens a real browser.
+// `SOPEN_EDITOR_WAIT=60`: sopen waits for the stand-in's exit (a loaded machine can take longer
+// than the usual 3 s to start it), so its call is recorded before sopen says "opened" — on the
+// fake target too, which runs with this side's environment.
+
+/// A stand-in browser in `dir` and the file its calls go to.
+fn stand_in_browser(dir: &Path) -> (PathBuf, PathBuf) {
+    let browser = dir.join("browser");
+    let calls = dir.join("browser-calls");
+    executable(
+        &browser,
+        &format!(
+            "#!/bin/sh\n{{ for a in \"$@\"; do printf '%s\\n' \"$a\"; done; echo ---; }} >> '{}'\n",
+            calls.display()
+        ),
+    );
+    (browser, calls)
+}
+
+/// The browser's calls, each its arguments.
+fn browser_calls(calls: &Path) -> Vec<Vec<String>> {
+    std::fs::read_to_string(calls)
+        .unwrap_or_default()
+        .split("---\n")
+        .filter(|c| !c.is_empty())
+        .map(|c| c.lines().map(str::to_string).collect())
+        .collect()
+}
+
+#[test]
+fn an_address_opens_in_this_machines_browser_once_and_sopen_ends() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (browser, calls) = stand_in_browser(tmp.path());
+    let ssh = FakeSsh::new(tmp.path());
+    let url = "http://127.0.0.1:1234/a?b=c#d";
+    let env = [
+        ("SOPEN_BROWSER", browser.to_str().unwrap()),
+        ("SOPEN_EDITOR_WAIT", "60"),
+        ("PATH", ssh.path.as_str()),
+    ];
+    let out = sopen(tmp.path(), &[url], &env);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert_eq!(text(&out.stdout), format!("opened {url} in the browser\n"));
+    assert_eq!(browser_calls(&calls), [[url]]);
+    // `--here`, and a target that is this machine: here too, never over ssh.
+    for (args, extra) in [
+        (vec!["--here", url], None),
+        (vec!["--target", "localhost", url], None),
+        (vec![url], Some(("SOPEN_TARGET", "127.0.0.1"))),
+    ] {
+        let mut env = env.to_vec();
+        env.extend(extra);
+        let out = sopen(tmp.path(), &args, &env);
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "{args:?}: {}",
+            text(&out.stderr)
+        );
+    }
+    assert_eq!(browser_calls(&calls).len(), 4);
+    assert!(ssh.argv().is_none(), "ssh ran");
+    // A browser that fails is said, as an error.
+    executable(&browser, "#!/bin/sh\nexit 4\n");
+    let out = sopen(tmp.path(), &[url], &env);
+    assert_eq!(out.status.code(), Some(1));
+    let err = text(&out.stderr);
+    assert!(
+        err.starts_with(&format!("sopen: cannot open {url} in the browser: ")),
+        "{err}"
+    );
+}
+
+#[test]
+fn an_address_with_app_or_hex_is_a_usage_error_and_a_malformed_one_says_why() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (browser, calls) = stand_in_browser(tmp.path());
+    let env = [
+        ("SOPEN_BROWSER", browser.to_str().unwrap()),
+        ("SOPEN_EDITOR_WAIT", "60"),
+    ];
+    let url = "http://127.0.0.1:1234/";
+    for (args, code, says) in [
+        (
+            vec!["--app", "Safari", url],
+            2,
+            "sopen: --app opens a file; ",
+        ),
+        (vec!["--hex", url], 2, "sopen: --hex opens a file; "),
+        (
+            vec!["http://"],
+            1,
+            "sopen: not an address sopen can open: no host in 'http://'",
+        ),
+        (
+            vec!["http://box:99999/"],
+            1,
+            "sopen: not an address sopen can open: '99999' is not a port",
+        ),
+        // The hidden flag is HOST's, for an address, with --here.
+        (vec!["--hold-until-eof", url], 2, "--here"),
+        (
+            vec!["--here", "--hold-until-eof", "box:/x"],
+            2,
+            "sopen: --hold-until-eof is for an http(s):// address",
+        ),
+    ] {
+        let out = sopen(tmp.path(), &args, &env);
+        assert_eq!(
+            out.status.code(),
+            Some(code),
+            "{args:?}: {}",
+            text(&out.stderr)
+        );
+        assert!(
+            text(&out.stderr).contains(says),
+            "{args:?}: {}",
+            text(&out.stderr)
+        );
+    }
+    assert!(browser_calls(&calls).is_empty(), "the browser was called");
+}
+
+/// The other side of a tunnel: `--here --hold-until-eof URL` opens the browser, says so, and
+/// then stays until its input ends — the other machine's sopen ending — and exits 0.
+#[test]
+fn hold_until_eof_opens_then_waits_for_the_inputs_end() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (browser, calls) = stand_in_browser(tmp.path());
+    let url = "http://127.0.0.1:50000/x";
+    let mut cmd = sopen_command(tmp.path());
+    cmd.args(["--here", "--hold-until-eof", url])
+        .env("SOPEN_BROWSER", &browser)
+        .env("SOPEN_EDITOR_WAIT", "60")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let mut guard = Reaped(Some(cmd.spawn().unwrap()));
+    let child = guard.0.as_mut().unwrap();
+    let stdout = collected(child.stdout.take());
+    let stderr = collected(child.stderr.take());
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while browser_calls(&calls).is_empty() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the browser was not called"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert_eq!(browser_calls(&calls), [[url]]);
+    // Opened, input still open: it holds.
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    assert!(child.try_wait().unwrap().is_none(), "it did not hold");
+    drop(child.stdin.take());
+    let status = loop {
+        if let Some(status) = guard.0.as_mut().unwrap().try_wait().unwrap() {
+            break status;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "it did not end at its input's end"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    };
+    guard.0 = None;
+    let err = stderr.recv().unwrap();
+    assert_eq!(status.code(), Some(0), "{}", text(&err));
+    assert_eq!(
+        text(&stdout.recv().unwrap()),
+        format!("opened {url} in the browser\n")
+    );
+}
+
+/// A run of `sopen --target HOST URL` through the fake ssh, HOST's half the real binary: its
+/// stdout lines as they come, its stderr at its end.
+struct Tunnelled {
+    guard: Reaped,
+    lines: std::sync::mpsc::Receiver<String>,
+    stderr: std::sync::mpsc::Receiver<Vec<u8>>,
+}
+
+impl Tunnelled {
+    fn start(home: &Path, ssh: &FakeSsh, browser: &Path, url: &str, env: &[(&str, &str)]) -> Self {
+        let mut cmd = sopen_command(home);
+        cmd.args(["--target", HOST, url])
+            .env("PATH", &ssh.path)
+            .env("SOPEN_TARGET_BIN", env!("CARGO_BIN_EXE_sopen"))
+            .env("SOPEN_BROWSER", browser)
+            .env("SOPEN_EDITOR_WAIT", "60")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        for (k, v) in env {
+            cmd.env(k, v);
+        }
+        let mut guard = Reaped(Some(cmd.spawn().unwrap()));
+        let child = guard.0.as_mut().unwrap();
+        let out = child.stdout.take().unwrap();
+        let (tx, lines) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            use std::io::BufRead;
+            for line in std::io::BufReader::new(out).lines().map_while(Result::ok) {
+                if tx.send(line).is_err() {
+                    break;
+                }
+            }
+        });
+        let stderr = collected(child.stderr.take());
+        Self {
+            guard,
+            lines,
+            stderr,
+        }
+    }
+
+    /// The first stdout line, within 30 s.
+    fn first_line(&self) -> String {
+        self.lines
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .unwrap_or_else(|_| {
+                let err = self
+                    .stderr
+                    .recv_timeout(std::time::Duration::from_millis(100))
+                    .unwrap_or_default();
+                panic!("no line from sopen within 30 s; stderr: {}", text(&err))
+            })
+    }
+
+    fn signal(&self, signal: i32) {
+        let pid = self.guard.0.as_ref().unwrap().id() as i32;
+        // SAFETY: the child is ours and not reaped yet, so the id is still its own.
+        assert_eq!(unsafe { libc::kill(pid, signal) }, 0);
+    }
+
+    /// Its exit status and stderr, within 20 s.
+    fn ended(mut self) -> (std::process::ExitStatus, String) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        let status = loop {
+            if let Some(status) = self.guard.0.as_mut().unwrap().try_wait().unwrap() {
+                break status;
+            }
+            assert!(std::time::Instant::now() < deadline, "sopen did not end");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        self.guard.0 = None;
+        let err = self
+            .stderr
+            .recv_timeout(std::time::Duration::from_secs(20))
+            .unwrap_or_default();
+        (status, text(&err))
+    }
+}
+
+/// A process that is gone (or a zombie: it serves nothing).
+fn gone(pid: i32) -> bool {
+    // SAFETY: signal 0 only asks whether the process exists.
+    let absent = unsafe { libc::kill(pid, 0) != 0 };
+    absent
+        || Command::new("ps")
+            .args(["-o", "stat=", "-p", &pid.to_string()])
+            .output()
+            .is_ok_and(|o| text(&o.stdout).trim().starts_with('Z'))
+}
+
+/// Every pid the fake ssh was run as is gone within 10 s.
+fn all_gone(ssh: &FakeSsh) {
+    let pids: Vec<i32> = ssh
+        .lines("ssh-pids")
+        .unwrap_or_default()
+        .iter()
+        .map(|p| p.parse().unwrap())
+        .collect();
+    assert!(!pids.is_empty());
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    for pid in pids {
+        while !gone(pid) {
+            if std::time::Instant::now() >= deadline {
+                // SAFETY: a stand-in this test started; it must not outlive the test.
+                unsafe { libc::kill(pid, libc::SIGKILL) };
+                panic!("the tunnel's ssh {pid} outlived sopen");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+}
+
+/// The calls the fake ssh recorded, each its arguments.
+fn ssh_calls(ssh: &FakeSsh) -> Vec<Vec<String>> {
+    std::fs::read_to_string(ssh.dir.join("calls"))
+        .unwrap_or_default()
+        .split("---\n")
+        .filter(|c| !c.is_empty())
+        .map(|c| c.lines().map(str::to_string).collect())
+        .collect()
+}
+
+#[test]
+fn a_loopback_address_on_a_target_goes_through_a_tunnel_that_ends_with_sopen() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (browser, calls) = stand_in_browser(tmp.path());
+    let ssh = FakeSsh::new(tmp.path());
+    let url = "http://127.0.0.1:1234/x?q=1#f";
+    let run = Tunnelled::start(tmp.path(), &ssh, &browser, url, &[]);
+    assert_eq!(
+        run.first_line(),
+        format!("{url} is open on {HOST} through a tunnel — Ctrl-C closes it")
+    );
+    // HOST's browser got the address as written.
+    assert_eq!(browser_calls(&calls), [[url]]);
+    let made = ssh_calls(&ssh);
+    assert_eq!(made.len(), 1, "{made:#?}");
+    let argv = &made[0];
+    // Its own connection, never sopen's master; ExitOnForwardFailure; no terminal, and this
+    // side's input (no -n); the address's own port on HOST.
+    let at = argv.iter().position(|a| a == HOST).unwrap();
+    let before: Vec<&str> = argv[..at].iter().map(String::as_str).collect();
+    for (i, pair) in [
+        ["-S", "none"],
+        ["-o", "ControlMaster=no"],
+        ["-o", "ExitOnForwardFailure=yes"],
+        ["-o", "ServerAliveInterval=10"],
+        ["-o", "ConnectTimeout=15"],
+        ["-R", "1234:127.0.0.1:1234"],
+    ]
+    .iter()
+    .enumerate()
+    {
+        assert!(before.windows(2).any(|w| w == pair), "{i}: {before:?}");
+    }
+    assert!(
+        before.contains(&"-T") && !before.contains(&"-n"),
+        "{before:?}"
+    );
+    assert!(
+        !before.iter().any(|a| a.contains("ControlPersist")),
+        "{before:?}"
+    );
+    assert_eq!(argv.last().unwrap(), &q(url));
+    assert!(argv.contains(&q("--hold-until-eof")), "{argv:#?}");
+
+    // SIGTERM (as Ctrl-C) closes it: exit 0, and ssh is gone.
+    run.signal(libc::SIGTERM);
+    let (status, err) = run.ended();
+    assert_eq!(status.code(), Some(0), "{err}");
+    all_gone(&ssh);
+}
+
+#[test]
+fn a_taken_port_on_the_target_takes_another() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (browser, calls) = stand_in_browser(tmp.path());
+    let ssh = FakeSsh::new(tmp.path());
+    let url = "http://localhost:1234/x";
+    let run = Tunnelled::start(
+        tmp.path(),
+        &ssh,
+        &browser,
+        url,
+        &[("FAKE_SSH_TAKEN", "1234")],
+    );
+    let line = run.first_line();
+    let made = ssh_calls(&ssh);
+    assert_eq!(made.len(), 2, "{made:#?}");
+    let forward = |call: &[String]| {
+        let at = call.iter().position(|a| a == "-R").unwrap();
+        call[at + 1].clone()
+    };
+    assert_eq!(forward(&made[0]), "1234:localhost:1234");
+    let port: u16 = forward(&made[1])
+        .strip_suffix(":localhost:1234")
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!((49152..=65535).contains(&port), "{port}");
+    let there = format!("http://localhost:{port}/x");
+    assert_eq!(browser_calls(&calls), [[there.clone()]]);
+    assert_eq!(
+        line,
+        format!(
+            "{url} is open on {HOST} as {there} through a tunnel (port 1234 is taken there) — \
+             Ctrl-C closes it"
+        )
+    );
+    run.signal(libc::SIGINT);
+    let (status, err) = run.ended();
+    assert_eq!(status.code(), Some(0), "{err}");
+    // ssh's own failure line is read, not passed on; sopen says which port it took.
+    assert!(!err.contains("remote port forwarding failed"), "{err}");
+    assert!(
+        err.contains(&format!(
+            "sopen: port 1234 is taken on {HOST}; trying {port}"
+        )),
+        "{err}"
+    );
+    all_gone(&ssh);
+}
+
+/// sopen killed outright (SIGKILL: nothing of it runs) still ends the tunnel — even when ssh
+/// would stay for the forwarded connections a browser keeps open (`FAKE_SSH_LINGER`).
+#[test]
+fn a_killed_sopen_leaves_no_tunnel() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (browser, _) = stand_in_browser(tmp.path());
+    let ssh = FakeSsh::new(tmp.path());
+    let url = "http://127.0.0.1:1234/";
+    let run = Tunnelled::start(tmp.path(), &ssh, &browser, url, &[("FAKE_SSH_LINGER", "1")]);
+    assert!(run.first_line().contains("through a tunnel"));
+    run.signal(libc::SIGKILL);
+    let (status, _) = run.ended();
+    assert_eq!(status.code(), None);
+    all_gone(&ssh);
+}
+
+/// A non-loopback address goes to HOST's sopen as it is: no tunnel, no hold.
+#[test]
+fn another_address_on_a_target_is_opened_there_as_it_is() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (browser, calls) = stand_in_browser(tmp.path());
+    let ssh = FakeSsh::new(tmp.path());
+    let url = "https://example.com/a?b";
+    let out = sopen(
+        tmp.path(),
+        &["--target", HOST, url],
+        &[
+            ("PATH", ssh.path.as_str()),
+            ("SOPEN_TARGET_BIN", env!("CARGO_BIN_EXE_sopen")),
+            ("SOPEN_BROWSER", browser.to_str().unwrap()),
+            ("SOPEN_EDITOR_WAIT", "60"),
+        ],
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert_eq!(browser_calls(&calls), [[url]]);
+    assert_eq!(text(&out.stdout), format!("opened {url} in the browser\n"));
+    let argv = ssh.argv().unwrap();
+    assert!(!argv
+        .iter()
+        .any(|a| a == "-R" || a.contains("hold-until-eof")));
+    assert!(argv.contains(&"-n".to_string()), "{argv:#?}");
+    assert_eq!(argv.last().unwrap(), &q(url));
 }

@@ -20,7 +20,10 @@ anything is downloaded: sopen's hex window (the default; byte overwrite only) or
 `--hex` opens any file in the hex window. It opens on the machine it was typed on, or — with `--target HOST`,
 `SOPEN_TARGET` or `target` in sopen's config — on HOST's screen, by running HOST's installed sopen with `--here`
 over ssh: HOST
-is a machine the owner uses sopen on, not a file's remote, which still needs only sshd (spec §4a). On macOS,
+is a machine the owner uses sopen on, not a file's remote, which still needs only sshd (spec §4a). An `http://` or
+`https://` address as SOURCE opens in the default browser of the machine that shows things; on HOST a loopback one is
+served from this machine through an ssh tunnel of its own that lives exactly as long as this sopen (spec §4a,
+`src/url.rs`, `forward::tunnel`). On macOS,
 while a sopen window is in front, the top row is meant to send F1–F12 without fn (the key half is the owner's
 receipt K-F3, still open): `fkeys` in sopen's config —
 `"function"` (the default) or `"system"` (never touched), set by `sopen config fkeys function|system` — and
@@ -170,6 +173,8 @@ prompts on close.
 | `SOPEN_RAISE=0\|wait` | KDE Plasma (spec §3, msg 11): `0` leaves the editor's window where KWin put it (tests/cli.rs sets it, so a test run in a KDE session never moves a real window); `wait` brings it forward in sopen's own process, about 3 s, instead of a detached `sopen --raise-window`, so a test sees every D-Bus call before sopen exits. HOST's own setting: not forwarded by `--target`. |
 | `SOPEN_EDITOR_WAIT=<seconds>` | How long sopen waits for the editor CLI (VS Code, Zed) to exit before it counts as handed off — default 3, at most 120 (anything else: 3); the wait ends as soon as the CLI exits. tests/cli.rs sets 60 where a stand-in CLI fails, so a loaded machine still sees the failure. Never unbounded. A local setting, not forwarded by `--target`. |
 | `sopen --raise-window code\|zed --raise-caption=<name>` | Hidden, internal: the detached child. It loads one KWin script for the opened `<name>` and runs it once, through `busctl --user` (else `qdbus6`/`qdbus`) on PATH, then unloads it ~3 s later. It prints nothing and always exits 0. Tests run it with a stand-in `busctl` first on PATH. The script's behaviour is tested under node against a stand-in `workspace` with signals (`tests/kwin-script.mjs`). |
+| `SOPEN_BROWSER=<command>` | `sopen URL`: run this command with the address as its one argument instead of the default browser's opener (`open` on macOS, `xdg-open` on Linux); an empty value is ignored. Waited for as an editor CLI is (`SOPEN_EDITOR_WAIT`). The tests point it at a stand-in that records its argument, so no test opens a real browser. Forwarded by `--target`: it acts where the address opens. |
+| `sopen --here --hold-until-eof URL` | Hidden, internal: HOST's half of a tunnel (spec §4a). Opens the address, prints `opened <URL> in the browser` (the line the other side waits for), then reads its input to the end and exits 0 — the other side's sopen ending, however it ends, closes the session. Needs `--here`; only for an address. |
 | `SOPEN_TARGET_BIN=<path>` | `--target` runs this sopen binary on HOST (a build not installed there yet) instead of the one on HOST's PATH or in its Homebrew / cargo install paths. A `--target` run carries this and the hooks above, and `SOPEN_LOG`, to HOST; settings naming local paths stay here. |
 | `SOPEN_CONFIG=<file>` | The config file to use instead of `$XDG_CONFIG_HOME/sopen/config.toml` / `~/.config/sopen/config.toml` (tests point it at a temp file, so the owner's default target never forwards a test run). |
 | `sopen --selftest-audio <file>` | Hidden: play the file on the real output device at gain 0 for ~2 s; prints `callbacks=N underruns=M device=<name> … decoder=ffmpeg\|wav` (a WAV is read in-process where there is no ffmpeg). |

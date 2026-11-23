@@ -103,6 +103,7 @@ its git panel changes repositories, every history rewrite or destructive action 
 | A8 | Developed like llmux | Public repo `2lab-ai/sopen`, MIT; `ci.yml` (macOS + Linux), `preview.yml` (every main push → prerelease + tap bump), `release.yml` (`v*` tag = owner gate); `AGENTS.md` SSOT; `.prd/` spec. |
 | A9 | `sopen SOURCE` opens here; `sopen --target <host> SOURCE` opens it on `<host>` (msg 7) | `sopen <host-a>:/tmp/a.html` opens on the machine it was typed on, as before. `sopen --target <host-b> <host-a>:/tmp/a.html` opens it on `<host-b>`'s screen: the same window or editor, started by `<host-b>`'s own sopen (on macOS sopen's window floats above the others until it is used; the editor opens behind the active app, §4a); exit code is `<host-b>`'s; `could not reach <host-b>` when ssh cannot get there; `sopen is not installed on <host-b> …` (exit 127) when it has no sopen. A file on `<host-b>` itself opens there as a local file; a local file reaches `<host-b>` as `<this machine>:<path>`. |
 | A10 | Default target in sopen's settings (msg 8) | `sopen config target <host-b>` writes `target = "<host-b>"` to the config file (§4a); from then on `sopen SOURCE` opens on `<host-b>`, `--here` opens on this machine anyway, `--target` picks another; `sopen config` shows the file and the target; `sopen config target --unset` removes it. A config sopen cannot read is an error naming the file, never ignored. |
+| A10a | `sopen URL`: a web address in a real browser on the machine that shows things, tunnelled when that is another machine, never after sopen ends (owner, 2026-11-23: "sopen http://127.0.0.1:1234/ — 해당 머신의 safari 혹은 크롬 혹은 edge로 열어줘. (자연스럽게 터널링 포함해서 처리해주고 sopen이 종료되면 안열려야함)") | `sopen http://127.0.0.1:1234/` opens it in this machine's default browser and exits 0. `sopen --target <host-b> http://127.0.0.1:1234/` opens it in `<host-b>`'s default browser through an ssh tunnel from this machine, prints `… is open on <host-b> through a tunnel — Ctrl-C closes it` and stays; when that port is taken on `<host-b>` it takes a random one in 49152–65535 and says which. Ctrl-C closes it (exit 0), and once sopen has ended — killed outright included — the page no longer loads on `<host-b>`. A non-loopback address opens on `<host-b>` as written, with no tunnel. `--app` / `--hex` with an address is a usage error (exit 2); a malformed address is one error line (§4a). |
 | A11 | A folder opens in a Total Commander-like program; Enter on a file runs its default viewer there (msg 12) | `sopen host:/dir` opens sopen's file browser (§3a): two panels on the folder, folders first; Tab switches panels, Enter enters a folder, Backspace goes up, a letter jumps to the next name with it; Enter on a file shows it in the same window — text highlighted with line numbers, its lines wrapped (msg 13; W or F2: one row per line), an image in the image window, video/audio in the media window, anything else in the hex window — and Esc returns to the list with the bar where it was; F4 opens the entry in VS Code / Zed (A2's choice). An edited image, hex or media file is never dropped unasked: leaving asks as its own window does. `--app` still opens a file in a named app; a folder with `--app` / `--hex` is an error, as before. |
 | A12 | Git panel and browser modes (msg 14) | In a folder inside a git work tree, local or remote, the opposite side shows the git panel: every commit and branch as a graph, commit details and diffs, every Git Graph action and free history editing, each history rewrite or destructive action confirmed and backed up; the browser opens in preview mode (the opposite side previews the file under the bar) and F9 switches to dual-directory mode. Scenarios: 02 §4.5, 03 §11. |
 | A13 | F2 rename, F5 copy, F6 move, the conventional rest (msg 15) | The list's F-key row reads `1Help 2Rename 3View 4Edit 5Copy 6Move 7MkDir 8Delete 9Dual 10Tree` once every slice has landed (until then a slot not built yet is empty, 02 §8); every file-changing key asks first and never overwrites an existing name, locally and over SFTP. Scenarios: 04 §8 (K-R, K-S, K-C, K-M, K-N, K-K, K-D). |
@@ -532,6 +533,33 @@ becomes `<this machine's short host name>:<absolute path>`, and a loopback sourc
 `localhost:path`, `[::1]:path`, not `localhost.example.com:path`), which would mean HOST itself there, becomes
 `<this machine's short host name>:path` — so HOST must reach this machine
 by that name with `ssh`. A local file that does not exist is the same error a local open gives.
+
+A SOURCE that starts with `http://` or `https://` (the scheme in any case) is an address, recognised before anything
+reads SOURCE as a path or `host:path` (`http` would be a host). A small parser (`src/url.rs`) takes the scheme, the
+host (an IPv6 one in brackets), the port (80 / 443 when absent) and the rest — path, query, fragment — as written. No
+host, a port outside 1–65535, an unclosed `[`, a blank or control character, or a character a host cannot have is one
+error line naming the address (exit 1); `--app` and `--hex` open files, so with an address they are a usage error
+(exit 2). Opened here — no HOST, or HOST is this machine — the address goes to the default browser exactly as written
+(`open` on macOS, `xdg-open` elsewhere; `SOPEN_BROWSER` replaces it, AGENTS.md "Receipts"), started in its own process
+group with no input or output and waited for as an editor CLI is; sopen prints `opened <URL> in the browser` and exits
+0. With a HOST, an address that is not loopback (by the rule above) goes to HOST's sopen as it is, with no tunnel. A
+loopback one would mean HOST itself there, so it is served from this machine: `ssh -S none -o ControlMaster=no -o
+ExitOnForwardFailure=yes <§4's keepalives and connect bound> -T -R P:<host>:<port> <run options> HOST -- <the script>
+--hold-until-eof -- <the address on P>` — a connection of its own, because a `-R` asked through the multiplexed master
+belongs to the master and would outlive sopen; no terminal; and this side's input, a pipe sopen holds and never
+writes. P is the address's port first, so its origin is unchanged. When ssh reports that remote port taken (`remote
+port forwarding failed for listen port P`, exit 255 — also what a port below 1024 gets for a user) sopen says so on
+stderr and tries up to four random ports in 49152–65535, each a new ssh; the address then opens with the port it got,
+another origin. Any other ssh failure is not retried. HOST's sopen opens the address as above and prints the opened
+line, which sopen reads instead of passing on, and prints `<URL> is open on HOST through a tunnel — Ctrl-C closes it`
+(after a fallback, `<URL> is open on HOST as <URL on P> through a tunnel (port <port> is taken there) — …`); HOST's
+sopen then waits for its input's end. ssh's output passes through but for the forward-failure line. Ctrl-C or SIGTERM
+closes the tunnel and sopen exits 0 (128 + n when the address had not opened yet); ssh ending on its own leaves with
+the exit codes above. The tunnel must not outlive sopen, however sopen ends. ssh alone does not end with HOST's
+command: it stays while a browser holds a forwarded connection (ssh(1), `~&`), and new connections would still be
+served. So ssh runs under a `sh` guard whose watcher reads the same pipe and kills ssh at its end: a SIGKILL of sopen
+closes the pipe, HOST's sopen ends, and the guard ends ssh. The tunnel is tested against a stand-in ssh; a live
+receipt against a real HOST is still open.
 
 On HOST, sopen is looked for on PATH, then in the usual Homebrew and cargo install paths; when there is none HOST
 prints `sopen is not installed on HOST (brew install 2lab-ai/tap/sopen-preview)` and the run exits 127. A
