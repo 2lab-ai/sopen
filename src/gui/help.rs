@@ -458,11 +458,12 @@ mod tests {
         assert_eq!(page.lines.last(), Some(&aliases()));
     }
 
-    /// F1 in the git panel (03 §9, landed with S2): its S2 keys, each on one line — the
-    /// details, a file at a revision, the editor, the mode, the bar, the label cursor, marks,
-    /// Tab back, Esc, Find, history search, refresh, the filters (Cmd/Ctrl+K), HEAD, wide, the
-    /// pin — and none of S3's actions (Reword, Pick, Rebase, Branch, Delete, Menu) or S4's
-    /// planner.
+    /// F1 in the git panel (03 §9; S2's keys, and S3's since it landed), each on one line: the
+    /// details, a file at a revision, the editor, the mode, the bar, the label cursor, marks and
+    /// staging, Tab back, Esc, Find, history search, refresh, the filters, HEAD, wide, the pin;
+    /// S3's slots (Reword's rename, Pick, Rebase, Branch / Commit, Delete, the menu), Fetch all,
+    /// undo, the Backups list, the command log and the banner's Cmd/Ctrl+Shift+C, S, A, B — and
+    /// not S4's planner (Cmd/Ctrl+E).
     #[test]
     fn the_git_page_lists_the_git_panels_keys() {
         let page = for_context(Context::Git, Mode::Preview, &[]);
@@ -482,7 +483,10 @@ mod tests {
             ("↑, ↓, PgUp, PgDn, Home, End", "Move the bar"),
             ("←", "The label cursor to the previous label"),
             ("→", "The label cursor to the next label"),
-            ("Space, Ins", "Mark or unmark the row, then step down"),
+            (
+                "Space, Ins",
+                "Mark or unmark the row, then step down (a changed file: stage or unstage it)",
+            ),
             ("Tab, Shift+Tab", "Back to the list"),
             ("Esc", "Close the innermost open thing; with none, unpin"),
             ("a letter", "Find, starting with it"),
@@ -496,6 +500,39 @@ mod tests {
             ),
             (&format!("{cmd}+G"), "Pin this git panel; again: unpin"),
             (&format!("{cmd}+K"), "The filters"),
+            // S3.
+            (
+                "F2",
+                "On a branch's label: rename it (a commit's reword comes with the history edits)",
+            ),
+            (
+                "F5",
+                "Cherry-pick it or the marked ones; a stash: apply it",
+            ),
+            ("F6", "Rebase the current branch onto it"),
+            ("F7", "A new branch here (uncommitted row: commit)"),
+            (
+                "F8",
+                "Delete or discard what is under the bar (asks; a commit's drop comes with the history edits)",
+            ),
+            ("F10, Shift+F10", "The menu of what is under the bar"),
+            (&format!("{cmd}+Shift+R"), "Fetch all"),
+            (&format!("{cmd}+Z"), "Undo the newest backup group"),
+            (&format!("{cmd}+B"), "The backups"),
+            (&format!("{cmd}+L"), "The command log"),
+            (
+                &format!("{cmd}+Shift+C"),
+                "The operation in progress: Continue (asks)",
+            ),
+            (
+                &format!("{cmd}+Shift+S"),
+                "The operation in progress: Skip (asks)",
+            ),
+            (
+                &format!("{cmd}+Shift+A"),
+                "The operation in progress: Abort (asks)",
+            ),
+            (&format!("{cmd}+Shift+B"), "Bisect in progress: Reset (asks)"),
         ] {
             assert_eq!(
                 line(&page, keys).map(|l| l.what.as_str()),
@@ -507,30 +544,12 @@ mod tests {
             .unwrap()
             .what
             .starts_with("Switch to dual mode"));
-        assert!(
-            page.lines.iter().all(|l| !l.what.contains("stage")),
-            "staging is S3's: {page:#?}"
-        );
         let all: Vec<&str> = page.lines.iter().map(|l| l.keys.as_str()).collect();
-        for later in [
-            "F2",
-            "F5",
-            "F6",
-            "F7",
-            "F8",
-            "F10",
-            "Shift+F10",
-            &format!("{cmd}+Z"),
-            &format!("{cmd}+B"),
-            &format!("{cmd}+L"),
-            &format!("{cmd}+E"),
-            &format!("{cmd}+Shift+R"),
-        ] {
-            assert!(
-                !all.iter().any(|keys| keys.split(", ").any(|k| k == later)),
-                "{later} lands later: {all:?}"
-            );
-        }
+        let later = format!("{cmd}+E");
+        assert!(
+            !all.iter().any(|keys| keys.split(", ").any(|k| k == later)),
+            "{later} lands with S4: {all:?}"
+        );
         assert_eq!(page.lines.last(), Some(&aliases()));
     }
 

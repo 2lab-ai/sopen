@@ -242,8 +242,8 @@ Every git command gets this environment and these options:
 - **Remote**: a second command over the same master, `exec 'kill' '-TERM' '--' '-<pid>'`, with the pid
   from the `sopen-pid` line (sshd starts the session's command as the leader of a new session, so the
   pid is the group — *measured, E5, 2026-11-23*: under fish, and under bash and zsh with `-c` and
-  `-l -c` emulated from a fish account, 02 §8.2; G-R3 stays the receipt of sopen's own stop and of
-  `stop sent`); after 5 s, `kill -KILL` the same way; then sopen
+  `-l -c` emulated from a fish account, 02 §8.2; G-R3 is the receipt of sopen's own stop and of
+  `stop sent` — *measured, S3-C, 2026-11-23, under zsh* (§11)); after 5 s, `kill -KILL` the same way; then sopen
   closes the command's ssh channel. While it waits, sopen keeps reading and dropping the command's
   output: the channel cannot end while the master holds output nobody reads, so a parked stream's
   stop would otherwise take the whole 5 s (E5: 0.59 s with the output read, 5.17 s without). When
@@ -1161,7 +1161,17 @@ under the remote `/tmp/sopen-receipts/`. A window receipt is a screenshot someon
   on sopen's own binary against a real ssh host): the same on a remote fixture under zsh, bash and
   fish login shells → after Esc,
   `ssh host pgrep -f 'sleep 30'` prints nothing; with the master killed before Esc → the result says
-  `may still be running`.
+  `may still be running`. *Measured, S3-C, 2026-11-23, zsh only* — sopen's own browser and runner
+  (`git_connect`, `SshGit` over a real master; the window the test kit's, the shipped binary's
+  `SOPEN_KEYS` cannot press Esc mid-run) against a macOS host whose login shell is zsh (git 2.54):
+  Esc ended the fetch in 0.19 s, the log said `stopped`, `pgrep -f 'slee[p] 30.4711'` found
+  nothing (twice: 0.19 s, 0.20 s); with the master gone (`ssh -O exit`) before Esc, one run said
+  `stop sent; the command may still be running on <host>` and the other `outcome unknown: the
+  connection to <host> was lost after the command was sent` — the dead master ended the command's
+  own ssh before Esc reached it (a race between the two, not a wording sopen picks) — and both
+  times the upload-pack was indeed still running (the receipt ended it): never `stopped`. Not run: fish (its host was offline), bash (no account with a bash login shell). The local
+  half is `gui::browser::tests::s3::g_a3_g_r3_esc_stops_a_pull_during_its_fetch_and_leaves_head`;
+  the live one `live_g_r3_esc_stops_a_remote_fetch` (AGENTS.md).
 - G-R4. A test transport (`ShellGit` with a fault switch) that runs the command and then loses its
   stderr and exit status, returning 255 → for a commit: the result is `outcome unknown`, the command ran
   exactly once (a counter in the fixture's `post-commit` hook), nothing is re-run, and the refresh shows

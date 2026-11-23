@@ -12,10 +12,6 @@
 //! dialog (`ActionDialog::confirm`); a step the state does not offer gives
 //! [`Pressed::NotOffered`], the status row's words, and does nothing (Skip in a merge).
 
-// Nothing uses these screens until S3-C wires them into the panel (as `mod.rs`'s own
-// allowance says of S2-F); S3-C removes this line when it does.
-#![allow(dead_code)]
-
 use crate::git::actions::{Action, Banner, Proceed};
 use crate::git::model::{InProgress, Status};
 use crate::gui::browser::keys::{self, Mods};
