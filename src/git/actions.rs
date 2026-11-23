@@ -1297,20 +1297,20 @@ use std::ffi::OsString;
 
 /// What [`draft`] reads from [`Repo::seen`], recording each read it lacks (an empty answer
 /// stands in for it, so one pass finds every read that does not depend on another).
-struct Reads<'a> {
+pub(crate) struct Reads<'a> {
     seen: &'a Seen,
-    missing: RefCell<Vec<Need>>,
+    pub(crate) missing: RefCell<Vec<Need>>,
 }
 
 impl<'a> Reads<'a> {
-    fn new(seen: &'a Seen) -> Self {
+    pub(crate) fn new(seen: &'a Seen) -> Self {
         Self {
             seen,
             missing: RefCell::new(Vec::new()),
         }
     }
 
-    fn get(&self, need: Need) -> Vec<u8> {
+    pub(crate) fn get(&self, need: Need) -> Vec<u8> {
         match self.seen.get(&need) {
             Some(out) => out.to_vec(),
             None => {
@@ -1324,7 +1324,7 @@ impl<'a> Reads<'a> {
     }
 
     /// NUL-terminated records.
-    fn records(&self, need: Need) -> Vec<String> {
+    pub(crate) fn records(&self, need: Need) -> Vec<String> {
         backup::records(&self.get(need))
     }
 
@@ -1376,21 +1376,25 @@ fn rev_shown(rev: &Rev) -> String {
 }
 
 /// A plan being made.
-struct Draft<'a> {
+pub(crate) struct Draft<'a> {
     repo: &'a Repo,
     confirm: bool,
     title: String,
-    loses: Vec<String>,
-    changes: Vec<String>,
-    notes: Vec<String>,
+    pub(crate) loses: Vec<String>,
+    pub(crate) changes: Vec<String>,
+    pub(crate) notes: Vec<String>,
     takes: Vec<Take>,
     steps: Vec<Step>,
     message: String,
-    changes_files: bool,
+    pub(crate) changes_files: bool,
 }
 
 impl<'a> Draft<'a> {
-    fn new(repo: &'a Repo, title: impl Into<String>, message: impl Into<String>) -> Self {
+    pub(crate) fn new(
+        repo: &'a Repo,
+        title: impl Into<String>,
+        message: impl Into<String>,
+    ) -> Self {
         Self {
             repo,
             confirm: true,
@@ -1405,7 +1409,7 @@ impl<'a> Draft<'a> {
         }
     }
 
-    fn command<I, S>(&self, class: Class, args: I) -> GitCommand
+    pub(crate) fn command<I, S>(&self, class: Class, args: I) -> GitCommand
     where
         I: IntoIterator<Item = S>,
         S: Into<OsString>,
@@ -1413,11 +1417,11 @@ impl<'a> Draft<'a> {
         GitCommand::new(class, self.repo.top.as_str(), args).git_dir(&self.repo.git_dir)
     }
 
-    fn step(&mut self, cmd: GitCommand) {
+    pub(crate) fn step(&mut self, cmd: GitCommand) {
         self.steps.push(Step::Git(cmd));
     }
 
-    fn write<I, S>(&mut self, args: I)
+    pub(crate) fn write<I, S>(&mut self, args: I)
     where
         I: IntoIterator<Item = S>,
         S: Into<OsString>,
@@ -1444,7 +1448,7 @@ impl<'a> Draft<'a> {
         }
     }
 
-    fn take(&mut self, kind: BackupKind, from: Source) {
+    pub(crate) fn take(&mut self, kind: BackupKind, from: Source) {
         if self.takes.iter().any(|t| t.kind == kind) {
             return;
         }
@@ -1456,7 +1460,7 @@ impl<'a> Draft<'a> {
     }
 
     /// A local ref at its value now (03 §8.2).
-    fn take_ref(&mut self, refname: &str) {
+    pub(crate) fn take_ref(&mut self, refname: &str) {
         if let Some(kind) = backup::kind_for(refname) {
             let value = ref_value(self.repo, refname);
             self.take(
@@ -1470,7 +1474,7 @@ impl<'a> Draft<'a> {
     }
 
     /// `heads/<current>`, or `detached` (03 §8.2).
-    fn take_head(&mut self) -> Result<(), Refused> {
+    pub(crate) fn take_head(&mut self) -> Result<(), Refused> {
         match &self.repo.head {
             Head::Branch {
                 refname,
@@ -1530,7 +1534,7 @@ impl<'a> Draft<'a> {
         });
     }
 
-    fn finish(self) -> Plan {
+    pub(crate) fn finish(self) -> Plan {
         let mut steps = self.steps;
         if !self.takes.is_empty() {
             steps.insert(0, Step::Backup);
@@ -1752,7 +1756,7 @@ fn commit_paths(reads: &Reads, c: &Oid, mainline: Option<u32>) -> Vec<String> {
 
 /// What a rebase of HEAD onto `onto` writes: the diff from HEAD to `onto`, and every path the
 /// commits it replays change.
-fn rebase_paths(reads: &Reads, onto: &str) -> Vec<String> {
+pub(crate) fn rebase_paths(reads: &Reads, onto: &str) -> Vec<String> {
     let mut paths = diff_paths(reads, "HEAD", onto);
     paths.extend(
         reads.records(Need(
@@ -1799,7 +1803,7 @@ fn stash_paths(reads: &Reads, stash: &StashRow) -> Vec<String> {
 
 /// 03 §8.6's refusal: an ignored file sits at a path `what` writes (git overwrites it, with no
 /// flag to stop it).
-fn refuse_ignored(reads: &Reads, paths: Vec<String>, what: &str) -> Result<(), Refused> {
+pub(crate) fn refuse_ignored(reads: &Reads, paths: Vec<String>, what: &str) -> Result<(), Refused> {
     let footprint: BTreeSet<String> = paths.into_iter().collect();
     let hits: Vec<String> = ignored(reads)
         .into_iter()
@@ -2074,7 +2078,7 @@ fn remote_change(
 }
 
 /// The note every rewrite gives (03 §7.8.2): commits it rewrites already on a remote branch.
-fn on_remotes(d: &mut Draft, reads: &Reads, range: &str) {
+pub(crate) fn on_remotes(d: &mut Draft, reads: &Reads, range: &str) {
     let all = reads.lines(Need(vec!["rev-list".into(), range.into()]));
     let local = reads.lines(Need(vec![
         "rev-list".into(),
