@@ -262,7 +262,7 @@ pub(super) struct GitSide {
     pub(super) stop_after: Duration,
     /// The split this window keeps per repository (03 §7.8.1 `split`, S4): recorded when the
     /// Split ran, dropped once nothing is in progress or its Continue ran.
-    pub(super) splits: HashMap<String, rebase::Split>,
+    pub(super) splits: HashMap<String, KeptSplit>,
 }
 
 impl GitSide {
@@ -372,6 +372,30 @@ impl RepoPanel {
         self.failed_reads
             .as_ref()
             .is_some_and(|(g, failed)| *g == generation && failed.contains(need))
+    }
+}
+
+/// A split the window keeps (03 §7.8.1 `split`, S4): the split — the commit it split, HEAD at
+/// the stop, and its paths — and the stop's identity, the commit token of `done`'s last `edit`
+/// line when it ran. git names the stop by the commit the todo named, which is not HEAD once an
+/// earlier commit was rewritten (S4-C review, round 3), so the split is kept while that line is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct KeptSplit {
+    pub(super) split: rebase::Split,
+    pub(super) stop: String,
+}
+
+/// The commit token of a rebase's last done line when it is an `edit` line (03 §8.5's probe):
+/// the stop git is at; `None` with anything else in progress, or nothing.
+pub(super) fn edit_token(in_progress: &InProgress) -> Option<String> {
+    if in_progress.operation != Some(crate::git::model::Operation::Rebase) {
+        return None;
+    }
+    let line = in_progress.rebase.as_ref()?.done_last.as_deref()?;
+    let mut words = line.split_whitespace();
+    match words.next() {
+        Some("edit" | "e") => words.next().map(String::from),
+        _ => None,
     }
 }
 
@@ -1526,28 +1550,22 @@ impl Browser {
                 .and_then(|u| u.newest().map(String::from)),
         );
         // S4: the split kept for this repository lasts as long as its own stop (03 §7.8.1): a
-        // rebase whose last done line is still `edit <its commit>` — a conflict there (a stash
-        // applied at the stop) keeps it. It goes once that changes: nothing in progress, the
-        // next line done after its Continue (a pick that conflicts included), another stop. The
-        // view routes the banner's Continue through it while it is kept.
-        let in_progress = &snapshot.in_progress;
-        let done_last = in_progress
-            .rebase
-            .as_ref()
-            .and_then(|r| r.done_last.clone())
-            .filter(|_| in_progress.operation == Some(crate::git::model::Operation::Rebase));
-        let at_its_stop = |split: &rebase::Split| {
-            let mut words = done_last.as_deref().unwrap_or("").split_whitespace();
-            matches!(words.next(), Some("edit" | "e"))
-                && words
-                    .next()
-                    .is_some_and(|c| c.len() >= 4 && split.commit.as_str().starts_with(c))
-        };
-        if !self.git.splits.get(&top).is_some_and(at_its_stop) {
+        // rebase whose last done line is still the `edit` line it ran at (`KeptSplit::stop`) — a
+        // conflict there (a stash applied at the stop) keeps it. It goes once that changes:
+        // nothing in progress, the next line done after its Continue (a pick that conflicts
+        // included), another stop. The view routes the banner's Continue through it while kept.
+        let stop = edit_token(&snapshot.in_progress);
+        if !self
+            .git
+            .splits
+            .get(&top)
+            .is_some_and(|kept| stop.as_deref() == Some(kept.stop.as_str()))
+        {
             self.git.splits.remove(&top);
         }
         let p = &mut self.git.panels[i];
-        p.view.set_split(self.git.splits.get(&top).cloned());
+        p.view
+            .set_split(self.git.splits.get(&top).map(|kept| kept.split.clone()));
         // A quick `split` stopped at its commit: its Split's confirmation, now that the banner
         // shows the stop.
         if std::mem::take(&mut p.split_next) {
@@ -2363,14 +2381,15 @@ pub(super) enum RunEnd {
     /// none) and the plan made now asks for one (03 §8.1) — its dialog opens again (review 1).
     Confirm { title: String, action: Box<Action> },
     /// A history edit's plan ran (S4): as [`RunEnd::Ran`], with the edit and, for an edit stop's
-    /// Split, the split its plan's reads recorded (`rebase::split_of`, read before it ran).
+    /// Split, the split its plan's reads recorded (`rebase::split_of`, read before it ran) and
+    /// the stop it ran at.
     Edited {
         outcome: Box<Outcome>,
         title: String,
         what: String,
         changes_files: bool,
         edit: Box<Edit>,
-        split: Option<rebase::Split>,
+        split: Option<KeptSplit>,
     },
     /// Nothing ran: a history edit whose shown plan was lost and whose plan now asks for a
     /// confirmation — its confirmation opens again (S3-C's rule, S4).
@@ -2954,19 +2973,26 @@ impl Browser {
                 },
                 Ok((plan, repo)) => {
                     let split = match &edit {
-                        Edit::SplitStop { commit } => match rebase::split_of(commit, &repo) {
-                            Some(split) => Some(split),
-                            None => {
-                                return RunEnd::NotRun {
-                                    title: t,
-                                    why: format!(
-                                        "{}'s paths were not read: nothing was run",
-                                        commit.short()
-                                    ),
-                                    line: None,
+                        // Its paths and the stop it ran at, read before it runs (the refresh
+                        // after it clears the reads): without them it does not run, since the
+                        // kept split is what guards its Continue.
+                        Edit::SplitStop { commit } => {
+                            let kept =
+                                rebase::split_of(commit, &repo).zip(edit_token(&repo.in_progress));
+                            match kept {
+                                Some((split, stop)) => Some(KeptSplit { split, stop }),
+                                None => {
+                                    return RunEnd::NotRun {
+                                        title: t,
+                                        why: format!(
+                                            "{}'s paths or its stop were not read: nothing was run",
+                                            commit.short()
+                                        ),
+                                        line: None,
+                                    }
                                 }
                             }
-                        },
+                        }
                         _ => None,
                     };
                     let outcome = actions::execute(&plan, &repo.top, runner, h);
@@ -3408,7 +3434,15 @@ impl Browser {
                 Opening::Edit { id, .. } => git_panel::history_label(*id).trim_end_matches('…'),
                 Opening::Planner => "Edit history",
             };
+            // Read for an older snapshot: a refresh came meanwhile, so the range may no longer
+            // be the history — nothing opens on it (S4-C review, round 3).
+            let current = p.view.repo().map(|(_, generation)| generation);
             match (opened.model, opened.opening) {
+                _ if current != Some(opened.generation) => {
+                    p.view.status = Some(Status::info(format!(
+                        "{what}: the repository changed while it was read — open it again"
+                    )));
+                }
                 (Ok(model), Opening::Edit { id, commit }) => {
                     let asked = p.view.open_edit(id, &commit, &model);
                     self.git_actions(ctx, i, asked);

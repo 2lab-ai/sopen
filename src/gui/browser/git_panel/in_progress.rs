@@ -231,7 +231,11 @@ pub enum StopEnd {
 }
 
 impl EditStop {
-    /// The edit stop `banner` shows (`Banner::edit_stop`), or `None` when it shows none.
+    /// The edit stop `banner` shows (`Banner::edit_stop`), or `None` when it shows none, its
+    /// commit as git names it (`stopped-sha`, `done`): the commit the todo named, which is not
+    /// HEAD once an earlier commit was rewritten (S4-C round 3). The panel's Split takes HEAD
+    /// ([`EditStop::probe`]); S4-B's tests read git's name here.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn of(banner: &Banner) -> Option<EditStop> {
         let short = banner.edit_stop()?.to_string();
         let rebase = banner.state.rebase.as_ref()?;
@@ -249,8 +253,18 @@ impl EditStop {
     }
 
     /// The edit stop of a refresh (03 §5, §8.5), through `Banner::of`; `None` while there is none.
-    pub fn probe(in_progress: &InProgress, status: &Status) -> Option<EditStop> {
-        EditStop::of(&Banner::of(in_progress, status)?)
+    /// Its Split splits `head`, the commit checked out, as git's own split recipe does: git's
+    /// `stopped-sha` and `done` name the commit the todo named, and once an earlier commit was
+    /// rewritten the stopped one is replayed, so that id is not HEAD (*measured, git 2.56.1*:
+    /// `stopped-sha` and `done` held `9c6719af…` after an earlier reword, HEAD `fe7c9e26…`; S4-C
+    /// round 3). The banner keeps git's name.
+    pub fn probe(
+        in_progress: &InProgress,
+        status: &Status,
+        head: Option<&Oid>,
+    ) -> Option<EditStop> {
+        let short = Banner::of(in_progress, status)?.edit_stop()?.to_string();
+        Some(EditStop::new(short, head.cloned()))
     }
 
     /// An edit stop at `short`, its full id `commit` when known (S4-C may resolve it itself).

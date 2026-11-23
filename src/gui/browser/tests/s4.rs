@@ -719,6 +719,124 @@ fn a_conflict_at_the_splits_stop_keeps_the_split() {
     assert!(g.repo.top.join(".git/rebase-merge").exists(), "nothing ran");
 }
 
+/// The edit stop's two identities (S4-C review, round 3): a plan rewords an older commit and
+/// stops to edit a later one, so git's `stopped-sha` and `done` line name the original commit
+/// while HEAD is its replayed copy (measured, git 2.56.1). Split targets HEAD — the commit
+/// checked out — and runs; the kept split survives a refresh (it remembers the stop by the
+/// `done` line's commit); the banner's Continue is `Edit::ContinueSplit`'s, refused while a
+/// recorded file differs, then finishes; the history holds the split's parts and every file is
+/// tracked.
+#[test]
+fn split_at_a_stop_after_an_earlier_rewrite() {
+    let git = git_or_skip!();
+    let repo = Repo::new(&git);
+    repo.write("a.txt", "a\n");
+    repo.commit("base");
+    repo.write("one.txt", "1\n");
+    repo.commit("one");
+    repo.write("a.txt", "a, changed\n");
+    repo.write("new.txt", "new\n");
+    let both = repo.commit("both");
+    repo.write("z.txt", "z\n");
+    repo.commit("top");
+    let mut g = Gx::new(repo);
+    g.fx.drv.resize(1800.0, 1400.0);
+    g.ready_in_git();
+    g.bar_to("base");
+    g.open_planner_here();
+    // rows: top, both, one — reword one, stop to edit both.
+    g.key(Key::End);
+    g.fx.typed("r");
+    g.idle(1);
+    g.key(Key::Enter);
+    g.idle(2);
+    g.replace_typed("one, reworded");
+    g.key(Key::Enter);
+    g.idle(2);
+    g.key(Key::ArrowUp);
+    g.fx.typed("e");
+    g.idle(2);
+    g.with(Key::Enter, Modifiers::COMMAND);
+    g.idle(2);
+    g.until_quiet("the run's reads");
+    g.run();
+    assert!(g.shows("stopped to edit"), "{:#?}", g.texts());
+    let head = g.repo.rev("HEAD");
+    assert_ne!(head, both, "both was replayed onto the reworded one");
+    assert_eq!(
+        std::fs::read_to_string(g.repo.top.join(".git/rebase-merge/stopped-sha"))
+            .unwrap()
+            .trim(),
+        both,
+        "git names the original"
+    );
+    // Split: HEAD's, planned and run.
+    g.cmd_shift(Key::P);
+    g.until_quiet("the Split's reads");
+    g.idle(4);
+    assert!(
+        matches!(g.view().edit_draft(), Some(Edit::SplitStop { commit }) if commit.as_str() == head),
+        "{:?}",
+        g.view().edit_draft()
+    );
+    assert!(
+        g.shows(&format!("Split {} both", &head[..8])),
+        "the confirmation names HEAD: {:#?}",
+        g.texts()
+    );
+    assert!(!g.shows("the edit stop is at"), "{:#?}", g.texts());
+    g.run();
+    assert_eq!(g.repo.rev("HEAD"), g.repo.rev(&format!("{head}^")), "reset");
+    let top = g.top();
+    assert!(g.b().git.splits.contains_key(&top), "the split kept");
+    // A refresh keeps it; Continue is the split's.
+    g.cmd(Key::R);
+    g.until_quiet("the refresh");
+    assert!(g.b().git.splits.contains_key(&top), "kept across a refresh");
+    g.cmd_shift(Key::C);
+    g.until_quiet("Continue's reads");
+    assert!(
+        matches!(g.view().edit_draft(), Some(Edit::ContinueSplit(_))),
+        "{:?}",
+        g.view().edit_draft()
+    );
+    g.idle(4);
+    assert!(
+        g.shows("Continue is refused while 2 files still differ from HEAD"),
+        "{:#?}",
+        g.texts()
+    );
+    g.esc();
+    // Committed in parts, then Continue finishes.
+    g.repo.run(&["add", "a.txt"]);
+    g.repo.run(&["commit", "-q", "-m", "the change"]);
+    g.repo.run(&["add", "new.txt"]);
+    g.repo.run(&["commit", "-q", "-m", "the new file"]);
+    g.cmd(Key::R);
+    g.until_quiet("the refresh");
+    g.cmd_shift(Key::C);
+    g.until_quiet("Continue's reads");
+    assert!(
+        matches!(g.view().edit_draft(), Some(Edit::ContinueSplit(_))),
+        "{:?}",
+        g.view().edit_draft()
+    );
+    g.idle(4);
+    assert!(!g.shows("Continue is refused"), "{:#?}", g.texts());
+    g.run();
+    assert!(!g.repo.top.join(".git/rebase-merge").exists(), "finished");
+    assert_eq!(
+        g.log_of("%s", "main"),
+        ["top", "the new file", "the change", "one, reworded", "base"]
+    );
+    assert_eq!(
+        g.repo.run(&["status", "--porcelain"]),
+        "",
+        "every file tracked"
+    );
+    assert!(g.repo.run(&["ls-files"]).lines().any(|l| l == "new.txt"));
+}
+
 /// G-H3's other rows through the window: `split` on the root commit is refused in its dialog
 /// and Enter runs nothing; `edit` a commit, then the banner's Amend (Cmd/Ctrl+Shift+M: §7.6's
 /// `amend` dialog, the stopped commit's message prefilled) amends it with a new message, and
@@ -1172,6 +1290,37 @@ fn a_refresh_before_detection_answers_keeps_the_git_version() {
     g.until_quiet("the run's reads");
     g.idle(2);
     assert!(!g.shows("history edits need git 2.22"), "{:#?}", g.texts());
+}
+
+/// A range read for an older snapshot is dropped (S4-C review, round 3): the planner asked for,
+/// then the repository refreshed before the range came — nothing opens, and the status row says
+/// to open it again; asked again, it opens.
+#[test]
+fn a_range_read_before_a_refresh_opens_nothing() {
+    let git = git_or_skip!();
+    let mut g = Gx::new(five(&git));
+    g.ready_in_git();
+    let ctx = g.fx.drv.ctx.clone();
+    let i = g.b().git.panel(g.repo.top()).unwrap();
+    let base = crate::git::model::Oid::parse(&g.repo.rev("HEAD~5")).unwrap();
+    let open = GitAction::OpenPlanner(crate::git::rebase::Base::Commit(base));
+    g.fx.b.git_actions(&ctx, i, vec![open.clone()]);
+    // A refresh's snapshot lands while the range is read.
+    let repo = g.view().repo().unwrap().0.clone();
+    g.panel_mut().view.set_repo(repo);
+    g.until_quiet("the range's read");
+    assert!(g.plan_model().is_none(), "nothing opened on the old range");
+    assert!(
+        g.view()
+            .status_line()
+            .text
+            .contains("the repository changed while it was read — open it again"),
+        "{}",
+        g.view().status_line().text
+    );
+    g.fx.b.git_actions(&ctx, i, vec![open]);
+    g.until_quiet("the range's read");
+    assert!(g.plan_model().is_some(), "asked again, it opens");
 }
 
 /// S3-C's review rules for history edits: a run whose shown plan was lost (none was shown here)

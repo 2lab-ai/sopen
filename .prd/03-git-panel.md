@@ -1225,7 +1225,13 @@ under the remote `/tmp/sopen-receipts/`. A window receipt is a screenshot someon
   `stop sent; the command may still be running on <host>` and the other `outcome unknown: the
   connection to <host> was lost after the command was sent` — the dead master ended the command's
   own ssh before Esc reached it (a race between the two, not a wording sopen picks) — and both
-  times the upload-pack was indeed still running (the receipt ended it): never `stopped`. Not run: fish (its host was offline), bash (no account with a bash login shell). The local
+  times the upload-pack was indeed still running (the receipt ended it): never `stopped`.
+  *Measured, 2026-11-24, fish* — the same test against a Linux host whose login shell is fish
+  (git 2.55), three runs: Esc ended the fetch in 0.36–0.38 s, the log said `stopped`, `pgrep`
+  found nothing; with the master gone before Esc, two runs said `outcome unknown: the connection
+  to <host> was lost after the command was sent` and one `stop sent; the command may still be
+  running on <host>`, the status row `Fetch origin: failed`, never `stopped`. Not run: bash (no
+  account with a bash login shell). The local
   half is `gui::browser::tests::s3::g_a3_g_r3_esc_stops_a_pull_during_its_fetch_and_leaves_head`;
   the live one `live_g_r3_esc_stops_a_remote_fetch` (AGENTS.md).
 - G-R4. A test transport (`ShellGit` with a fault switch) that runs the command and then loses its

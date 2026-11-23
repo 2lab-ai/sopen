@@ -1596,6 +1596,94 @@ fn g_h3_split_and_its_continue() {
     }
 }
 
+/// The edit stop's two identities (S4-C round 3, measured with git 2.56.1): a plan that rewords
+/// an older commit and stops to edit a later one replays that one, so `stopped-sha` and `done`
+/// name the original while HEAD is its replayed copy. Split of HEAD — the commit checked out —
+/// plans and runs, its confirmation naming HEAD; Split of the original id is refused (it is not
+/// checked out); the split's Continue then finishes with every file in history.
+#[test]
+fn split_at_a_stop_after_an_earlier_rewrite_takes_head() {
+    let Some(fx) = fixture() else { return };
+    for (lane, runner) in fx.lanes() {
+        let lane = lane.as_str();
+        let dir = fx.repo(&format!("h3-rewritten-{lane}"));
+        let base = fx.oid(&dir, "HEAD");
+        fx.commit(&dir, "f", "1\n", "one");
+        std::fs::write(dir.join("n"), "new\n").unwrap();
+        fx.git(&dir, &["add", "n"]);
+        let two = fx.commit(&dir, "f", "2\n", "two");
+        fx.commit(&dir, "g", "g\n", "three");
+        let (repo, mut model) = opened(&runner, &dir, &Base::Commit(base.clone()));
+        let one = model.rows[2].commit.row.oid.clone();
+        model
+            .apply(Op::Verb {
+                commit: one.clone(),
+                verb: Verb::Reword,
+            })
+            .unwrap();
+        model
+            .apply(Op::Message {
+                commit: one,
+                message: "one, reworded\n".into(),
+            })
+            .unwrap();
+        model
+            .apply(Op::Verb {
+                commit: two.clone(),
+                verb: Verb::Edit,
+            })
+            .unwrap();
+        let (_, outcome) = run_on(&runner, &dir, repo, &Edit::Plan(model));
+        done(lane, &outcome);
+        let head = fx.oid(&dir, "HEAD");
+        assert_ne!(head, two, "{lane}: two replayed");
+        let repo = repo_of(&runner, &dir);
+        let stopped = repo.in_progress.rebase.as_ref().unwrap();
+        assert_eq!(
+            stopped.stopped_sha.as_deref().map(str::trim),
+            Some(two.as_str()),
+            "{lane}: git names the original"
+        );
+        // The original id is not checked out: refused.
+        let why = planned(
+            &runner,
+            &dir,
+            &Edit::SplitStop {
+                commit: two.clone(),
+            },
+        )
+        .unwrap_err()
+        .0;
+        assert!(why.contains("the edit stop is at"), "{lane}: {why}");
+        // HEAD's: planned, named, run.
+        let plan_of_head = planned(
+            &runner,
+            &dir,
+            &Edit::SplitStop {
+                commit: head.clone(),
+            },
+        )
+        .unwrap_or_else(|r| panic!("{lane}: {}", r.0));
+        let title = plan_of_head.confirm.as_ref().unwrap().title.clone();
+        assert_eq!(title, format!("Split {} two", head.short()), "{lane}");
+        let split = split_at(lane, &runner, &dir, &head);
+        assert_eq!(split.paths, ["f", "n"], "{lane}");
+        fx.git(&dir, &["add", "f"]);
+        fx.git(&dir, &["commit", "-q", "-m", "two: f"]);
+        fx.git(&dir, &["add", "n"]);
+        fx.git(&dir, &["commit", "-q", "-m", "two: n"]);
+        let (_, outcome) = run(&runner, &dir, &Edit::ContinueSplit(split));
+        done(lane, &outcome);
+        assert!(idle(&runner, &dir), "{lane}");
+        assert_eq!(
+            subjects(&fx, &dir, &format!("{}..HEAD", base.as_str())),
+            ["one, reworded", "two: f", "two: n", "three"],
+            "{lane}"
+        );
+        assert_eq!(fx.git(&dir, &["status", "--porcelain"]), "", "{lane}");
+    }
+}
+
 /// G-H3's refusals: `split` on the root commit (it has no `HEAD^`); Split with no edit stop.
 #[test]
 fn g_h3_split_is_refused_where_it_cannot_be() {

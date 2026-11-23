@@ -2146,22 +2146,11 @@ impl GitView {
 // ---------------------------------------------------------------------------------------------
 // S4: the history edits (03 §7.8; S4-C wires S4-B's screens to S4-A's plans).
 
-/// The edit stop of `repo`'s banner (03 §8.5), its commit in full: the probe's `stopped-sha` or
-/// `done` line when they hold a whole id, else HEAD's — at an edit stop HEAD is the commit it
-/// stopped at (S4-A: `Edit::SplitStop` names HEAD's full id from the refresh).
+/// The edit stop of `repo`'s banner (03 §8.5), its Split on HEAD's full id, the commit checked
+/// out (`EditStop::probe`: git's own name for the stop is not HEAD once an earlier commit was
+/// rewritten, and a Split of it was always refused; S4-C review, round 3).
 fn edit_stop(repo: &Repo) -> Option<in_progress::EditStop> {
-    let stop = in_progress::EditStop::probe(&repo.in_progress, &repo.status)?;
-    if stop.commit().is_some() {
-        return Some(stop);
-    }
-    let banner = actions::Banner::of(&repo.in_progress, &repo.status)?;
-    let short = banner.edit_stop()?;
-    let head = repo
-        .head
-        .oid()
-        .filter(|h| h.as_str().starts_with(short))
-        .cloned();
-    Some(in_progress::EditStop::new(short, head))
+    in_progress::EditStop::probe(&repo.in_progress, &repo.status, repo.head.oid())
 }
 
 impl GitView {
