@@ -27,7 +27,7 @@ use eframe::egui::{self, Event, Key, Modifiers};
 /// The set of landed slices (02 §8.1: 1 = S1 … 7 = S7); a slice's integration WU adds its
 /// number. Rows of a slice not in it do nothing yet. A set, not the highest slice: slices land in
 /// any order their "Needs first" allows (02 §8.1 "Schedule"), so S5 and S6 landed before S3–S4.
-pub const LANDED_SLICES: Slices = Slices::of(&[1, 2, 3, 5, 6]);
+pub const LANDED_SLICES: Slices = Slices::of(&[1, 2, 3, 4, 5, 6]);
 
 /// Every slice, 1 to 7: every row of the table.
 #[cfg_attr(not(test), allow(dead_code))] // Only the tests use it.
@@ -236,6 +236,11 @@ pub enum Command {
     Abort,
     /// Cmd/Ctrl+Shift+B: bisect's Reset (`bisect reset`).
     BisectReset,
+    /// Cmd/Ctrl+Shift+M: an edit stop's Amend (§7.6's `amend`), through its dialog (03 §8.5,
+    /// §9.2; S4).
+    Amend,
+    /// Cmd/Ctrl+Shift+P: an edit stop's Split (§7.8.1's `split`), through its dialog (S4).
+    Split,
     // The directory tree (05 §1; S5).
     /// F10, Alt+F10, Esc: close the tree, the panel as it was.
     CloseTree,
@@ -498,7 +503,7 @@ pub const TABLE: &[Row] = &[
     key(Viewer, K::F4, Plain, C::Edit, "Edit", "The file in VS Code or Zed", 1),
     // The git panel (03 §9.1, §9.2).
     key(Git, K::F1, Plain, C::Help, "Help", HELP, 2),
-    key(Git, K::F2, Plain, C::Reword, "Reword", "On a branch's label: rename it (a commit's reword comes with the history edits)", 3),
+    key(Git, K::F2, Plain, C::Reword, "Reword", "A commit: reword it; a branch's label: rename it", 3),
     key(Git, K::F3, Shift, C::RevisionFile, "", "The file at this revision", 2),
     key(Git, K::F3, Plain, C::Details, "View", DETAILS, 2),
     key(Git, K::Enter, Plain, C::Details, "", DETAILS, 2),
@@ -506,7 +511,7 @@ pub const TABLE: &[Row] = &[
     key(Git, K::F5, Plain, C::Pick, "Pick", "Cherry-pick it or the marked ones; a stash: apply it", 3),
     key(Git, K::F6, Plain, C::Rebase, "Rebase", "Rebase the current branch onto it", 3),
     key(Git, K::F7, Plain, C::Branch, "Branch", "A new branch here (uncommitted row: commit)", 3),
-    key(Git, K::F8, Plain, C::Remove, "Delete", "Delete or discard what is under the bar (asks; a commit's drop comes with the history edits)", 3),
+    key(Git, K::F8, Plain, C::Remove, "Delete", "Delete, drop or discard what is under the bar (asks)", 3),
     key(Git, K::F9, Plain, C::SwitchMode, "Dual", SWITCH, 2),
     key(Git, K::F10, Shift, C::Menu, "", MENU, 3),
     key(Git, K::F10, Plain, C::Menu, "Menu", MENU, 3),
@@ -540,6 +545,8 @@ pub const TABLE: &[Row] = &[
     key(Git, K::S, CmdShift, C::Skip, "", "The operation in progress: Skip (asks)", 3),
     key(Git, K::A, CmdShift, C::Abort, "", "The operation in progress: Abort (asks)", 3),
     key(Git, K::B, CmdShift, C::BisectReset, "", "Bisect in progress: Reset (asks)", 3),
+    key(Git, K::M, CmdShift, C::Amend, "", "An edit stop: Amend (asks)", 4),
+    key(Git, K::P, CmdShift, C::Split, "", "An edit stop: Split (asks)", 4),
     // The directory tree (05 §1).
     key(TreeSide, K::F1, Plain, C::Help, "Help", HELP, 5),
     key(TreeSide, K::F10, Alt, C::CloseTree, "", CLOSE_TREE, 5),
@@ -1028,18 +1035,22 @@ mod tests {
         assert!(TABLE.iter().all(|r| ALL_SLICES.has(r.slice)));
     }
 
-    /// The landed slices are a set (02 §8.1 "Schedule"): S1, S2, S3, S5 and S6 have landed, so
-    /// exactly their rows act — F10 opens the tree, Cmd/Ctrl+G pins the git panel, F7 makes a
-    /// folder and Shift+F8 deletes without the Trash, the git panel's F5 picks (S3) and the
-    /// banner's Cmd/Ctrl+Shift+C continues, while Cmd/Ctrl+E, S4's planner, still does nothing.
+    /// The landed slices are a set (02 §8.1 "Schedule"): S1 to S6 have landed (S7's keys are
+    /// none of the table's), so exactly their rows act — F10 opens the tree, Cmd/Ctrl+G pins the
+    /// git panel, F7 makes a folder and Shift+F8 deletes without the Trash, the git panel's F5
+    /// picks (S3) and the banner's Cmd/Ctrl+Shift+C continues, and S4's Cmd/Ctrl+E (the planner)
+    /// and Cmd/Ctrl+Shift+M and P (an edit stop's Amend and Split, 03 §9.2) act.
     #[test]
     fn landed_slices_are_a_set() {
-        assert_eq!(LANDED_SLICES, Slices::of(&[1, 2, 3, 5, 6]));
+        assert_eq!(LANDED_SLICES, Slices::of(&[1, 2, 3, 4, 5, 6]));
         assert!(TABLE
             .iter()
-            .all(|r| LANDED_SLICES.has(r.slice) == matches!(r.slice, 1 | 2 | 3 | 5 | 6)));
+            .all(|r| LANDED_SLICES.has(r.slice) == matches!(r.slice, 1..=6)));
         assert!(!ALL_SLICES.has(0) && !ALL_SLICES.has(8) && !ALL_SLICES.has(u8::MAX));
-        assert_eq!(LANDED_SLICES.with(4), Slices::of(&[1, 2, 3, 4, 5, 6]));
+        assert_eq!(
+            Slices::of(&[1, 2, 3, 5, 6]).with(4),
+            Slices::of(&[1, 2, 3, 4, 5, 6])
+        );
         assert_eq!(
             find(&mut vec![press(K::F10, NONE)], List, LANDED_SLICES),
             Some(Command::Tree)
@@ -1067,10 +1078,24 @@ mod tests {
             (K::S, Command::Skip),
             (K::A, Command::Abort),
             (K::B, Command::BisectReset),
+            (K::M, Command::Amend),
+            (K::P, Command::Split),
         ] {
             assert_eq!(find(&mut banner(key), Git, LANDED_SLICES), Some(command));
-            // Nowhere else, and never without Shift (Cmd/Ctrl+B is the Backups list).
-            assert_eq!(find(&mut banner(key), List, ALL_SLICES), None);
+            // Nowhere else — not in the list, a viewer, the tree or a dialog — and never
+            // without Shift (Cmd/Ctrl+B is the Backups list).
+            for context in [List, Viewer, TreeSide, Dialog] {
+                assert_eq!(
+                    find(&mut banner(key), context, ALL_SLICES),
+                    None,
+                    "{key:?} in {context:?}"
+                );
+            }
+            assert_ne!(
+                find(&mut vec![press(key, Modifiers::COMMAND)], Git, ALL_SLICES),
+                Some(command),
+                "{key:?} without Shift"
+            );
         }
         assert_eq!(
             find(
@@ -1086,8 +1111,8 @@ mod tests {
                 Git,
                 LANDED_SLICES
             ),
-            None,
-            "S4 has not landed"
+            Some(Command::Planner),
+            "S4 has landed"
         );
     }
 

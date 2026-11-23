@@ -9,6 +9,7 @@ use super::*;
 use crate::git::actions::{self, Action, ActionId, Outcome, Plan, Repo, Seen, Step};
 use crate::git::backup::{self, Record, RestoreEntry};
 use crate::git::model::{BackupRef, GitVersion, InProgress};
+use crate::git::rebase::{self, Base, Edit, EditId, Model};
 
 /// Makes the window's git runner (02 §6 `GitHost`): on a worker, the first time detection needs
 /// it (`ssh -G` for a remote, `xcode-select -p` for the macOS shim); why there is none, else.
@@ -165,8 +166,8 @@ pub(super) struct RepoPanel {
     /// The reads that failed for the snapshot of that generation: never recorded, never asked
     /// again for it — the plan stays "not read yet" and the dialog says so.
     pub(super) failed_reads: Option<(u64, Vec<actions::Need>)>,
-    /// The draft, snapshot generation and number of reads `actions::needs` was last asked about.
-    pub(super) checked: Option<(Action, u64, usize)>,
+    /// The draft, snapshot generation and number of reads `needs` was last asked about.
+    pub(super) checked: Option<(Drafted, u64, usize)>,
     /// The Backups list being read.
     pub(super) backups_read: Option<Pending<std::result::Result<Vec<Record>, backup::Failed>>>,
     /// A restore's entries being read: the group's stamp, the one ref asked for.
@@ -176,6 +177,14 @@ pub(super) struct RepoPanel {
     /// Backup refs the Backups list's Show added to the graph's revisions, until the next
     /// refresh (03 §8.2).
     pub(super) shown: Vec<Oid>,
+    // S4 (S4-C): the history edits.
+    /// The range a quick edit's dialog or the planner opens on, being read (S4-A's
+    /// `open_needs` / `inspect` / `open`).
+    pub(super) edit_open: Option<Pending<EditOpened>>,
+    /// A quick `split` ran to its stop: once the refresh shows the edit stop, its Split's
+    /// confirmation opens (03 §7.8.1: "at the stop sopen records the commit's paths and runs
+    /// `reset --mixed`").
+    pub(super) split_next: bool,
 }
 
 /// Panels kept per window (02 §3.1: the least recently shown is dropped).
@@ -199,8 +208,9 @@ pub(super) struct GitScript {
     pub(super) select: Option<String>,
     pub(super) details: bool,
     pub(super) label: Option<usize>,
-    /// `dialog=<id>`: that action's dialog on the object under the bar (S3).
-    pub(super) dialog: Option<ActionId>,
+    /// `dialog=<id>`: that action's dialog on the object under the bar (S3), or a history
+    /// edit's (S4).
+    pub(super) dialog: Option<crate::gui::DialogId>,
 }
 
 impl GitScript {
@@ -250,6 +260,9 @@ pub(super) struct GitSide {
     pub(super) quiet_after: Duration,
     /// Esc asks "Stop git?" of a write running this long (03 §3.4: 10 s; tests shorten it).
     pub(super) stop_after: Duration,
+    /// The split this window keeps per repository (03 §7.8.1 `split`, S4): recorded when the
+    /// Split ran, dropped once nothing is in progress or its Continue ran.
+    pub(super) splits: HashMap<String, KeptSplit>,
 }
 
 impl GitSide {
@@ -276,6 +289,7 @@ impl GitSide {
             write_locks: HashMap::new(),
             quiet_after: QUIET_AFTER,
             stop_after: QUIET_AFTER,
+            splits: HashMap::new(),
         }
     }
 
@@ -337,13 +351,16 @@ impl RepoPanel {
             || self.backups_read.is_some()
             || self.restore_read.is_some()
             || self.text_read.is_some()
+            || self.edit_open.is_some()
     }
 
-    /// The open dialog still lacks a read its plan needs (`actions::needs`) that has not failed:
-    /// it says `not read yet` until the next pass asks for it.
+    /// The open dialog still lacks a read its plan needs (`actions::needs`, or `rebase::needs`
+    /// for a history edit's) that has not failed: it says `not read yet` until the next pass
+    /// asks for it.
     pub(super) fn dialog_reading(&self) -> bool {
-        match (self.view.draft(), self.view.repo()) {
-            (Some(draft), Some((repo, generation))) => actions::needs(draft, repo)
+        match (Drafted::of(&self.view), self.view.repo()) {
+            (Some(draft), Some((repo, generation))) => draft
+                .needs(repo)
                 .iter()
                 .any(|n| !self.read_failed(generation, n)),
             _ => false,
@@ -355,6 +372,56 @@ impl RepoPanel {
         self.failed_reads
             .as_ref()
             .is_some_and(|(g, failed)| *g == generation && failed.contains(need))
+    }
+}
+
+/// A split the window keeps (03 §7.8.1 `split`, S4): the split — the commit it split, HEAD at
+/// the stop, and its paths — and the stop's identity, the commit token of `done`'s last `edit`
+/// line when it ran. git names the stop by the commit the todo named, which is not HEAD once an
+/// earlier commit was rewritten (S4-C review, round 3), so the split is kept while that line is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct KeptSplit {
+    pub(super) split: rebase::Split,
+    pub(super) stop: String,
+}
+
+/// The commit token of a rebase's last done line when it is an `edit` line (03 §8.5's probe):
+/// the stop git is at; `None` with anything else in progress, or nothing.
+pub(super) fn edit_token(in_progress: &InProgress) -> Option<String> {
+    if in_progress.operation != Some(crate::git::model::Operation::Rebase) {
+        return None;
+    }
+    let line = in_progress.rebase.as_ref()?.done_last.as_deref()?;
+    let mut words = line.split_whitespace();
+    match words.next() {
+        Some("edit" | "e") => words.next().map(String::from),
+        _ => None,
+    }
+}
+
+/// What an open dialog plans, for its reads beyond the refresh: S3's action, or a history
+/// edit (a quick edit's draft, the planner's run).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum Drafted {
+    Action(Action),
+    Edit(Edit),
+}
+
+impl Drafted {
+    /// The open dialog's draft: S3's action dialog first, else S4's.
+    pub(super) fn of(view: &GitView) -> Option<Drafted> {
+        match view.draft() {
+            Some(action) => Some(Drafted::Action(action.clone())),
+            None => view.edit_draft().map(Drafted::Edit),
+        }
+    }
+
+    /// The reads its plan lacks (`actions::needs`, `rebase::needs`).
+    pub(super) fn needs(&self, repo: &Repo) -> Vec<actions::Need> {
+        match self {
+            Drafted::Action(action) => actions::needs(action, repo),
+            Drafted::Edit(edit) => rebase::needs(edit, repo),
+        }
     }
 }
 
@@ -1270,6 +1337,8 @@ impl Browser {
             restore_read: None,
             text_read: None,
             shown: Vec::new(),
+            edit_open: None,
+            split_next: false,
         });
         let i = self.git.panels.len() - 1;
         self.start_read(ctx, i, false, 1);
@@ -1447,6 +1516,10 @@ impl Browser {
     ) {
         let version = self.git.detector.version(&self.git.host);
         let p = &mut self.git.panels[i];
+        // Cmd/Ctrl+R forgets the host's version until detection reads it again: a snapshot read
+        // that lands first keeps the version this panel last had, never the 2.20 stand-in (with
+        // it every history edit, which needs 2.22, was refused; S4-C).
+        let version = version.or_else(|| p.view.repo().map(|(r, _)| r.version.clone()));
         p.view.set_remotes(snapshot.remotes.clone());
         p.view
             .set_refs(snapshot.refs.clone(), head_ref(&snapshot.head));
@@ -1476,15 +1549,39 @@ impl Browser {
                 .get(&top)
                 .and_then(|u| u.newest().map(String::from)),
         );
+        // S4: the split kept for this repository lasts as long as its own stop (03 §7.8.1): a
+        // rebase whose last done line is still the `edit` line it ran at (`KeptSplit::stop`) — a
+        // conflict there (a stash applied at the stop) keeps it. It goes once that changes:
+        // nothing in progress, the next line done after its Continue (a pick that conflicts
+        // included), another stop. The view routes the banner's Continue through it while kept.
+        let stop = edit_token(&snapshot.in_progress);
+        if self
+            .git
+            .splits
+            .get(&top)
+            .is_none_or(|kept| stop.as_deref() != Some(kept.stop.as_str()))
+        {
+            self.git.splits.remove(&top);
+        }
+        let p = &mut self.git.panels[i];
+        p.view
+            .set_split(self.git.splits.get(&top).map(|kept| kept.split.clone()));
+        // A quick `split` stopped at its commit: its Split's confirmation, now that the banner
+        // shows the stop.
+        if std::mem::take(&mut p.split_next) {
+            match p.view.split_at_the_stop() {
+                Some(asked) => self.git_actions(ctx, i, asked),
+                None => {
+                    let p = &mut self.git.panels[i];
+                    p.view.status = Some(Status::error(
+                        "Split: the run did not stop to edit its commit; nothing was split",
+                    ));
+                }
+            }
+        }
         let p = &mut self.git.panels[i];
         // Show's backups stay until the next refresh (03 §8.2).
         let showed = !std::mem::take(&mut p.shown).is_empty();
-        // The details pane of the uncommitted row follows the status (a file staged).
-        if p.view.pane_subject() == Some(&Subject::Row(RowKey::Uncommitted)) && p.details.is_none()
-        {
-            self.ask_details(ctx, i, Subject::Row(RowKey::Uncommitted));
-        }
-        let p = &mut self.git.panels[i];
         let keep = !showed
             && soft
             && p.stream.is_some()
@@ -1492,6 +1589,13 @@ impl Browser {
                 .as_ref()
                 .is_some_and(|old| old.same_graph(&snapshot));
         let was = p.snapshot.replace(snapshot);
+        // The details pane of the uncommitted row follows the status (a file staged), read from
+        // the snapshot just put in place — not the one it replaced (PR #90 review).
+        if p.view.pane_subject() == Some(&Subject::Row(RowKey::Uncommitted)) && p.details.is_none()
+        {
+            self.ask_details(ctx, i, Subject::Row(RowKey::Uncommitted));
+        }
+        let p = &mut self.git.panels[i];
         if !keep {
             // 03 §4.5: a refresh that moved the graph reads as many pages as were loaded.
             let loaded = p.view.rows().len().div_ceil(history::PAGE);
@@ -1679,6 +1783,7 @@ impl Browser {
         p.backups_read = None;
         p.restore_read = None;
         p.text_read = None;
+        p.edit_open = None;
         self.status = Status::info("stopped");
         // An action (03 §3.4): one waiting for the lock, or running a network command, stops at
         // once; a write after 10 s, with a question.
@@ -1843,6 +1948,17 @@ impl Browser {
                     }
                     p.view.status = Some(Status::info("stopping git…"));
                 }
+                // S4 (03 §7.8).
+                GitAction::OpenEdit { id, commit, base } => {
+                    self.ask_edit_open(ctx, i, Opening::Edit { id, commit }, From::Base(base))
+                }
+                GitAction::OpenPlanner(base) => {
+                    self.ask_edit_open(ctx, i, Opening::Planner, From::Base(base))
+                }
+                GitAction::PlanBeforeRebase(onto) => {
+                    self.ask_edit_open(ctx, i, Opening::Planner, From::MergeBase(onto))
+                }
+                GitAction::RunEdit(edit) => self.start_edit(ctx, i, edit),
             }
         }
     }
@@ -2264,6 +2380,20 @@ pub(super) enum RunEnd {
     /// Nothing ran: no confirmation showed this run's plan (it was lost, or the action came with
     /// none) and the plan made now asks for one (03 §8.1) — its dialog opens again (review 1).
     Confirm { title: String, action: Box<Action> },
+    /// A history edit's plan ran (S4): as [`RunEnd::Ran`], with the edit and, for an edit stop's
+    /// Split, the split its plan's reads recorded (`rebase::split_of`, read before it ran) and
+    /// the stop it ran at.
+    Edited {
+        outcome: Box<Outcome>,
+        title: String,
+        what: String,
+        changes_files: bool,
+        edit: Box<Edit>,
+        split: Option<KeptSplit>,
+    },
+    /// Nothing ran: a history edit whose shown plan was lost and whose plan now asks for a
+    /// confirmation — its confirmation opens again (S3-C's rule, S4).
+    ConfirmEdit { title: String, edit: Box<Edit> },
 }
 
 /// A backup stamp's order (03 §8.2: `YYYYMMDDTHHMMSSZ`, then `-2`, `-3`… when taken): its UTC
@@ -2326,6 +2456,94 @@ pub(super) struct Inspected {
     pub(super) failed: Option<backup::Failed>,
 }
 
+/// What a history edit opens once its range is read (S4).
+#[derive(Debug, Clone)]
+pub(super) enum Opening {
+    /// A quick edit's dialog on `commit` (03 §7.8.1).
+    Edit { id: EditId, commit: Oid },
+    /// The planner (03 §7.8.2).
+    Planner,
+}
+
+/// Where the range a history edit opens on starts (S4).
+#[derive(Debug, Clone)]
+pub(super) enum From {
+    /// This base.
+    Base(Base),
+    /// Above `merge-base HEAD <onto>`, from the root when there is none: the commits `rebase
+    /// <onto>` moves (Rebase's "plan the commits first", 03 §7.1).
+    MergeBase(actions::Rev),
+}
+
+/// The range a history edit opens on, as read (S4): for the snapshot of `generation`, the reads
+/// made (a failed one is never among them), and the model or why there is none.
+pub(super) struct EditOpened {
+    pub(super) opening: Opening,
+    pub(super) generation: u64,
+    pub(super) seen: Seen,
+    pub(super) model: std::result::Result<Model, (String, Option<String>)>,
+}
+
+/// A revision as `merge-base` takes it: a commit by its hash, a ref by its full name.
+fn rev_ref(rev: &actions::Rev) -> String {
+    match rev {
+        actions::Rev::Commit(c) => c.as_str().to_string(),
+        actions::Rev::Branch(b) => format!("refs/heads/{b}"),
+        actions::Rev::RemoteBranch { remote, branch } => {
+            format!("refs/remotes/{remote}/{branch}")
+        }
+        actions::Rev::Tag(t) => format!("refs/tags/{t}^{{commit}}"),
+    }
+}
+
+/// The range `from` names up to HEAD, read on a worker (S4-A's API): the merge base first when
+/// asked, then `rebase::open_needs` and `actions::inspect` until it has its reads (a read that
+/// fails ends it unrecorded), then `rebase::open`.
+fn read_edit_range(
+    runner: &GitRunner,
+    handle: &Handle,
+    repo: &mut Repo,
+    from: &From,
+) -> std::result::Result<Model, (String, Option<String>)> {
+    let base = match from {
+        From::Base(base) => base.clone(),
+        From::MergeBase(onto) => {
+            let git = RunnerGit::new(runner.clone(), handle.clone());
+            let args: Vec<String> = ["merge-base", "HEAD", &rev_ref(onto)]
+                .map(String::from)
+                .to_vec();
+            let line = Some(format!("git {}", args.join(" ")));
+            match git.run(&repo.top, &args, b"", history::Bound::Read) {
+                Ok(ran) if ran.code == Some(0) => {
+                    let text = String::from_utf8_lossy(&ran.stdout);
+                    match Oid::parse(text.trim()) {
+                        Some(oid) => Base::Commit(oid),
+                        None => return Err(("merge-base printed no commit".into(), line)),
+                    }
+                }
+                // No common ancestor: every commit up to HEAD.
+                Ok(ran) if ran.code == Some(1) && ran.stdout.is_empty() => Base::Root,
+                Ok(ran) => {
+                    let said = String::from_utf8_lossy(&ran.stderr).trim().to_string();
+                    return Err((said, line));
+                }
+                Err(e) => return Err((e.to_string(), line)),
+            }
+        }
+    };
+    for _ in 0..8 {
+        let missing = rebase::open_needs(&base, repo);
+        if missing.is_empty() {
+            return rebase::open(&base, repo).map_err(|r| (r.0, None));
+        }
+        if let Err(failed) = actions::inspect(runner, handle, repo, &missing) {
+            let line = failed.ran.last().map(|d| d.entry.line.clone());
+            return Err((failed.reason, line));
+        }
+    }
+    Err(("the reads of the range did not settle".into(), None))
+}
+
 /// A restore's entries as read (03 §8.3): the group's stamp, the entries, the ref asked for.
 pub(super) type RestoreRead =
     std::result::Result<(String, Vec<RestoreEntry>, Option<String>), String>;
@@ -2334,7 +2552,7 @@ pub(super) type RestoreRead =
 pub(super) fn wait_run(mut run: Running) -> JoinHandle<()> {
     std::thread::spawn(move || {
         let said = match run.rx.recv() {
-            Ok(RunEnd::Ran { outcome, title, .. }) => {
+            Ok(RunEnd::Ran { outcome, title, .. } | RunEnd::Edited { outcome, title, .. }) => {
                 let failed = outcome
                     .steps
                     .iter()
@@ -2346,7 +2564,7 @@ pub(super) fn wait_run(mut run: Running) -> JoinHandle<()> {
                 }
             }
             Ok(RunEnd::NotRun { title, why, .. }) => format!("{title}: not run: {why}"),
-            Ok(RunEnd::Confirm { title, .. }) => {
+            Ok(RunEnd::Confirm { title, .. } | RunEnd::ConfirmEdit { title, .. }) => {
                 format!("{title}: not run: its plan asks for a confirmation")
             }
             Err(_) => format!("{}: the run stopped without a result", run.title),
@@ -2390,6 +2608,74 @@ fn plan_now(
         }
     }
     Err(("the reads its plan needs did not settle".into(), None))
+}
+
+/// [`plan_now`] for a history edit (S4): `rebase::needs` and `actions::inspect` until it has its
+/// reads (S4-A: three rounds at most for an older commit), then `rebase::plan`. A read that
+/// fails is never recorded: the plan is not made.
+fn plan_edit_now(
+    runner: &GitRunner,
+    handle: &Handle,
+    mut repo: Repo,
+    edit: &Edit,
+) -> std::result::Result<(Plan, Repo), (String, Option<String>)> {
+    for _ in 0..8 {
+        let missing = rebase::needs(edit, &repo);
+        if missing.is_empty() {
+            return match rebase::plan(edit, &repo) {
+                Ok(plan) => Ok((plan, repo)),
+                Err(refused) => Err((refused.0, None)),
+            };
+        }
+        if let Err(failed) = actions::inspect(runner, handle, &mut repo, &missing) {
+            let line = failed.ran.last().map(|d| d.entry.line.clone());
+            return Err((failed.reason, line));
+        }
+    }
+    Err(("the reads its plan needs did not settle".into(), None))
+}
+
+/// A run's words for the status row and its log: its confirmation's title, else `fallback`
+/// (the menu's words).
+fn run_title(plan: Option<&Plan>, fallback: impl FnOnce() -> String) -> String {
+    plan.and_then(|plan| plan.confirm.as_ref())
+        .map(|c| c.title.clone())
+        .filter(|t| !t.is_empty())
+        .unwrap_or_else(fallback)
+}
+
+/// A plan's network command lines (03 §3.4: Esc stops them at once).
+fn network_lines(plan: Option<&Plan>) -> Vec<String> {
+    plan.map_or_else(Vec::new, |plan| {
+        plan.steps
+            .iter()
+            .filter_map(|s| match s {
+                Step::Git(cmd) if cmd.class() == Class::Network => Some(cmd.command_line()),
+                _ => None,
+            })
+            .collect()
+    })
+}
+
+/// The status row's `<what was done>` (03 §8.3): the plan's reflog message without `sopen: `,
+/// else `title`.
+fn done_words(plan: &Plan, title: &str) -> String {
+    plan.message
+        .strip_prefix("sopen: ")
+        .filter(|m| !m.is_empty())
+        .map_or_else(|| title.to_string(), str::to_string)
+}
+
+/// A history edit's name before a plan names it (the menu's words).
+fn edit_label(edit: &Edit) -> String {
+    match edit {
+        Edit::Quick(q) => git_panel::history_label(q.id())
+            .trim_end_matches('…')
+            .to_string(),
+        Edit::Plan(_) => "Edit history".into(),
+        Edit::SplitStop { .. } => "Split".into(),
+        Edit::ContinueSplit(_) => "Continue".into(),
+    }
 }
 
 /// The exit codes a read of the integration's own takes as an answer — every other ending is a
@@ -2600,54 +2886,29 @@ impl Browser {
     /// plans when no confirmation showed its plan (else runs exactly that plan, S3-A: its backup
     /// verifies what the owner confirmed), executes, and tells the panel.
     pub(super) fn start_action(&mut self, ctx: &egui::Context, i: usize, action: Action) {
-        let Some(runner) = self.git_runner() else {
+        if self.git_runner().is_none() {
             return;
-        };
+        }
         let p = &mut self.git.panels[i];
         let Some((repo, _)) = p.view.repo() else {
             return;
         };
         let repo = repo.clone();
         let plan = p.view.take_plan(&action);
-        let title = plan
-            .as_ref()
-            .and_then(|plan| plan.confirm.as_ref())
-            .map(|c| c.title.clone())
-            .filter(|t| !t.is_empty())
-            .unwrap_or_else(|| {
-                git_panel::action_label(action.id())
-                    .trim_end_matches('…')
-                    .to_string()
-            });
-        let network = plan.as_ref().map_or_else(Vec::new, |plan| {
-            plan.steps
-                .iter()
-                .filter_map(|s| match s {
-                    Step::Git(cmd) if cmd.class() == Class::Network => Some(cmd.command_line()),
-                    _ => None,
-                })
-                .collect()
+        let title = run_title(plan.as_ref(), || {
+            git_panel::action_label(action.id())
+                .trim_end_matches('…')
+                .to_string()
         });
-        let lock = self
-            .git
-            .write_locks
-            .entry(p.top.clone())
-            .or_default()
-            .clone();
-        let handle = Handle::new();
-        let started = Arc::new(AtomicBool::new(false));
-        let (tx, rx) = mpsc::channel();
-        let (h, s, waker, t) = (handle.clone(), started.clone(), ctx.clone(), title.clone());
-        let worker = std::thread::spawn(move || {
-            let _held = lock.lock().unwrap_or_else(|p| p.into_inner());
-            s.store(true, Ordering::Relaxed);
-            waker.request_repaint();
+        let network = network_lines(plan.as_ref());
+        let t = title.clone();
+        self.spawn_run(ctx, i, title, network, move |runner, h| {
             let confirmed = plan.is_some();
             let planned = match plan {
                 Some(plan) => Ok((plan, repo)),
-                None => plan_now(&runner, &h, repo, &action),
+                None => plan_now(runner, h, repo, &action),
             };
-            let end = match planned {
+            match planned {
                 // 03 §8.1: only a plan with no confirmation runs at once; one that asks for a
                 // confirmation no dialog showed does not run (review 1).
                 Ok((plan, _)) if !confirmed && plan.confirm.is_some() => RunEnd::Confirm {
@@ -2655,12 +2916,8 @@ impl Browser {
                     action: Box::new(action),
                 },
                 Ok((plan, repo)) => {
-                    let outcome = actions::execute(&plan, &repo.top, &runner, &h);
-                    let what = plan
-                        .message
-                        .strip_prefix("sopen: ")
-                        .filter(|m| !m.is_empty())
-                        .map_or_else(|| t.clone(), str::to_string);
+                    let outcome = actions::execute(&plan, &repo.top, runner, h);
+                    let what = done_words(&plan, &t);
                     let squash = matches!(
                         &action,
                         Action::Merge { options, .. } if options.squash && !options.no_commit
@@ -2679,7 +2936,114 @@ impl Browser {
                     why,
                     line,
                 },
+            }
+        });
+    }
+
+    /// Runs history edit `edit` of panel `i` on a worker (S4; 02 §6, 03 §7.8), as
+    /// [`Browser::start_action`] runs an action: under the repository's write lock, the plan its
+    /// confirmation showed (else planned there — `rebase::needs` / `actions::inspect` /
+    /// `rebase::plan` — and, when that plan asks for a confirmation, not run but shown again),
+    /// through `actions::execute`. An edit stop's Split records its paths first
+    /// (`rebase::split_of`, from the reads its plan made): without them it does not run, since
+    /// the kept split is what guards its Continue.
+    pub(super) fn start_edit(&mut self, ctx: &egui::Context, i: usize, edit: Edit) {
+        if self.git_runner().is_none() {
+            return;
+        }
+        let p = &mut self.git.panels[i];
+        let Some((repo, _)) = p.view.repo() else {
+            return;
+        };
+        let repo = repo.clone();
+        let plan = p.view.take_edit_plan(&edit);
+        let title = run_title(plan.as_ref(), || edit_label(&edit));
+        let network = network_lines(plan.as_ref());
+        let t = title.clone();
+        self.spawn_run(ctx, i, title, network, move |runner, h| {
+            let confirmed = plan.is_some();
+            let planned = match plan {
+                Some(plan) => Ok((plan, repo)),
+                None => plan_edit_now(runner, h, repo, &edit),
             };
+            match planned {
+                Ok((plan, _)) if !confirmed && plan.confirm.is_some() => RunEnd::ConfirmEdit {
+                    title: t,
+                    edit: Box::new(edit),
+                },
+                Ok((plan, repo)) => {
+                    let split = match &edit {
+                        // Its paths and the stop it ran at, read before it runs (the refresh
+                        // after it clears the reads): without them it does not run, since the
+                        // kept split is what guards its Continue.
+                        Edit::SplitStop { commit } => {
+                            let kept =
+                                rebase::split_of(commit, &repo).zip(edit_token(&repo.in_progress));
+                            match kept {
+                                Some((split, stop)) => Some(KeptSplit { split, stop }),
+                                None => {
+                                    return RunEnd::NotRun {
+                                        title: t,
+                                        why: format!(
+                                            "{}'s paths or its stop were not read: nothing was run",
+                                            commit.short()
+                                        ),
+                                        line: None,
+                                    }
+                                }
+                            }
+                        }
+                        _ => None,
+                    };
+                    let outcome = actions::execute(&plan, &repo.top, runner, h);
+                    RunEnd::Edited {
+                        what: done_words(&plan, &t),
+                        outcome: Box::new(outcome),
+                        title: t,
+                        changes_files: plan.changes_files,
+                        edit: Box::new(edit),
+                        split,
+                    }
+                }
+                Err((why, line)) => RunEnd::NotRun {
+                    title: t,
+                    why,
+                    line,
+                },
+            }
+        });
+    }
+
+    /// `work` on a worker of panel `i` once it holds the repository's write lock (02 §6: one
+    /// repository-changing run at a time; a second waits in line, the status row saying so), its
+    /// end told to the panel. Never a [`Pending`]: see [`Running`].
+    fn spawn_run(
+        &mut self,
+        ctx: &egui::Context,
+        i: usize,
+        title: String,
+        network: Vec<String>,
+        work: impl FnOnce(&GitRunner, &Handle) -> RunEnd + Send + 'static,
+    ) {
+        let Some(runner) = self.git_runner() else {
+            return;
+        };
+        let p = &mut self.git.panels[i];
+        let lock = self
+            .git
+            .write_locks
+            .entry(p.top.clone())
+            .or_default()
+            .clone();
+        let handle = Handle::new();
+        let started = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = mpsc::channel();
+        let (h, s, waker) = (handle.clone(), started.clone(), ctx.clone());
+        let worker = std::thread::spawn(move || {
+            let _held = lock.lock().unwrap_or_else(|p| p.into_inner());
+            s.store(true, Ordering::Relaxed);
+            waker.request_repaint();
+            let end = work(&runner, &h);
             let _ = tx.send(end);
             waker.request_repaint();
         });
@@ -2712,8 +3076,57 @@ impl Browser {
             self.git_actions(ctx, i, asked);
             return;
         }
+        if let RunEnd::ConfirmEdit { title, edit } = end {
+            // A history edit's shown plan was lost: its confirmation again, nothing run.
+            let p = &mut self.git.panels[i];
+            p.view.status = Some(Status::info(format!(
+                "{title}: not run — its plan asks for a confirmation"
+            )));
+            p.view.reconfirm_edit(*edit);
+            return;
+        }
         match end {
-            RunEnd::Confirm { .. } => {}
+            RunEnd::Confirm { .. } | RunEnd::ConfirmEdit { .. } => {}
+            RunEnd::Edited {
+                outcome,
+                title,
+                what,
+                changes_files,
+                edit,
+                split,
+            } => {
+                if let Some(stamp) = &outcome.backup {
+                    let undo = self.git.undo.entry(top.clone()).or_default();
+                    record_group(undo, stamp.clone());
+                    let newest = undo.newest().map(String::from);
+                    self.git.panels[i].view.set_undo(newest);
+                }
+                let done = outcome
+                    .steps
+                    .iter()
+                    .all(|s| s.outcome == actions::StepOutcome::Done);
+                // The split kept per window (03 §7.8.1): recorded by its Split, dropped by the
+                // Continue that went through it.
+                match (&*edit, split) {
+                    (Edit::SplitStop { .. }, Some(split)) if done => {
+                        self.git.splits.insert(top.clone(), split);
+                    }
+                    (Edit::ContinueSplit(_), _) if done => {
+                        self.git.splits.remove(&top);
+                    }
+                    _ => {}
+                }
+                let p = &mut self.git.panels[i];
+                // A quick `split` stops at its commit: the Split's confirmation opens there once
+                // the refresh shows the stop.
+                p.split_next = done && matches!(&*edit, Edit::Quick(rebase::Quick::Split { .. }));
+                let said = p.view.show_outcome(&title, &what, &outcome);
+                p.view.status = Some(said);
+                if changes_files {
+                    let host = self.label.clone();
+                    self.git_event(ctx, GitEvent::WorkTreeChanged { host, top });
+                }
+            }
             RunEnd::Ran {
                 outcome,
                 title,
@@ -2808,8 +3221,9 @@ impl Browser {
         p.prefill = Some(Pending { rx, handle });
     }
 
-    /// The reads the open dialog's plan needs beyond the refresh (S3-A's `needs` / `inspect`),
-    /// on a worker, once per draft and snapshot; the dialog plans again with them.
+    /// The reads the open dialog's plan needs beyond the refresh (S3-A's `needs` / `inspect`; a
+    /// history edit's `rebase::needs`, S4), on a worker, once per draft and snapshot; the dialog
+    /// plans again with them.
     fn dialog_reads(&mut self, ctx: &egui::Context, i: usize) {
         let Some(runner) = self.git_runner() else {
             return;
@@ -2818,16 +3232,18 @@ impl Browser {
         if p.inspect.is_some() {
             return;
         }
-        let (Some(draft), Some((repo, generation))) = (p.view.draft(), p.view.repo()) else {
+        let (Some(draft), Some((repo, generation))) = (Drafted::of(&p.view), p.view.repo()) else {
             p.checked = None;
             return;
         };
-        let key = (draft.clone(), generation, repo.seen.reads.len());
+        let key = (draft, generation, repo.seen.reads.len());
         if p.checked.as_ref() == Some(&key) {
             return;
         }
         // A read that failed for this snapshot is not asked again (no loop of failing reads).
-        let missing: Vec<actions::Need> = actions::needs(draft, repo)
+        let missing: Vec<actions::Need> = key
+            .0
+            .needs(repo)
             .into_iter()
             .filter(|n| !p.read_failed(generation, n))
             .collect();
@@ -2851,6 +3267,33 @@ impl Browser {
             waker.request_repaint();
         });
         p.inspect = Some((Pending { rx, handle }, generation));
+    }
+
+    /// The range a history edit opens on (S4: a quick edit's dialog, the planner), read on a
+    /// worker; then its dialog or the pane ([`Browser::poll_actions`]).
+    fn ask_edit_open(&mut self, ctx: &egui::Context, i: usize, opening: Opening, from: From) {
+        let Some(runner) = self.git_runner() else {
+            return;
+        };
+        let p = &mut self.git.panels[i];
+        let Some((repo, generation)) = p.view.repo() else {
+            return;
+        };
+        let mut repo = repo.clone();
+        let handle = Handle::new();
+        let (tx, rx) = mpsc::channel();
+        let (h, waker) = (handle.clone(), ctx.clone());
+        std::thread::spawn(move || {
+            let model = read_edit_range(&runner, &h, &mut repo, &from);
+            let _ = tx.send(EditOpened {
+                opening,
+                generation,
+                seen: repo.seen,
+                model,
+            });
+            waker.request_repaint();
+        });
+        p.edit_open = Some(Pending { rx, handle });
     }
 
     /// The Backups list (03 §8.2), read on a worker.
@@ -2982,6 +3425,35 @@ impl Browser {
             }
             p.view.seen(generation, read.seen);
         }
+        // S4: the range a history edit opens on came — its dialog, or the planner.
+        let p = &mut self.git.panels[i];
+        if let Some(Ok(opened)) = p.edit_open.as_ref().map(|r| r.rx.try_recv()) {
+            p.edit_open = None;
+            p.view.seen(opened.generation, opened.seen);
+            let what = match &opened.opening {
+                Opening::Edit { id, .. } => git_panel::history_label(*id).trim_end_matches('…'),
+                Opening::Planner => "Edit history",
+            };
+            // Read for an older snapshot: a refresh came meanwhile, so the range may no longer
+            // be the history — nothing opens on it (S4-C review, round 3).
+            let current = p.view.repo().map(|(_, generation)| generation);
+            match (opened.model, opened.opening) {
+                _ if current != Some(opened.generation) => {
+                    p.view.status = Some(Status::info(format!(
+                        "{what}: the repository changed while it was read — open it again"
+                    )));
+                }
+                (Ok(model), Opening::Edit { id, commit }) => {
+                    let asked = p.view.open_edit(id, &commit, &model);
+                    self.git_actions(ctx, i, asked);
+                }
+                (Ok(model), Opening::Planner) => p.view.open_planner(model),
+                (Err((why, line)), _) => {
+                    p.view.show_text(what, &why, line.as_deref());
+                    p.view.status = Some(Status::error(format!("{what}: {why}")));
+                }
+            }
+        }
         self.dialog_reads(ctx, i);
         let p = &mut self.git.panels[i];
         if let Some(Ok(read)) = p.backups_read.as_ref().map(|r| r.rx.try_recv()) {
@@ -3066,11 +3538,13 @@ pub(super) fn git_waiting(p: &RepoPanel) -> Vec<Handle> {
         out.push(r.handle.clone());
     }
     // S3's reads the owner waits for: a dialog's prefill, the Backups list, a restore's entries,
-    // a tag's details.
+    // a tag's details; S4's range a history edit opens on.
     out.extend(p.prefill.as_ref().map(|r| r.handle.clone()));
     out.extend(p.backups_read.as_ref().map(|r| r.handle.clone()));
     out.extend(p.restore_read.as_ref().map(|r| r.handle.clone()));
     out.extend(p.text_read.as_ref().map(|r| r.handle.clone()));
+    // S4: the range a quick edit's dialog or the planner opens on.
+    out.extend(p.edit_open.as_ref().map(|r| r.handle.clone()));
     out
 }
 

@@ -979,7 +979,7 @@ fn sopen_state_git_pin_select_details_label() {
     assert_eq!(d.summary.map(|s| s.oid), Some(merge));
     // A key the browser does not know is refused before the window opens.
     assert!(crate::gui::State::parse("git=open").is_err());
-    assert!(crate::gui::State::parse("dialog=drop").is_err());
+    assert!(crate::gui::State::parse("dialog=dropped").is_err());
 }
 
 /// `SOPEN_LIST=git`'s text for `abs` with the fixture's git.

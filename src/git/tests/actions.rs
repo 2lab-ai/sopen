@@ -3067,6 +3067,29 @@ fn the_probe_parses_each_state() {
         detail(&["exists MERGE_HEAD", &head, "merge-msg a message of my own"]),
         "MERGE of 01234567"
     );
+    // S4-C (S3-C review): only git's own first lines name what is merged — measured with git
+    // 2.56.1 on conflicted merges: `Merge branch 'side'`, `… 'side' into feat`, `… 'side' of
+    // <url>` (a pull), `Merge remote-tracking branch 'origin/side'`, `Merge tag 'v1'`, `Merge
+    // commit '<hash>'` (8 digits shown); a branch whose name holds a quote. A message of the
+    // owner's own (`git merge -m`) names its commit, whatever it quotes.
+    for (msg, shown) in [
+        ("Merge branch 'side' of /srv/origin", "MERGE of side"),
+        ("Merge tag 'v1'", "MERGE of v1"),
+        ("Merge branch 'it's'", "MERGE of it's"),
+        ("Merge branch 'it's' into feat", "MERGE of it's"),
+        (
+            "Merge commit 'b48d942cf4209248c83a00e891cccfcf3f528e27'",
+            "MERGE of b48d942c",
+        ),
+        ("it's 'x' mine", "MERGE of 01234567"),
+        ("Fix 'quoted' thing", "MERGE of 01234567"),
+        ("Merge branches 'a' and 'b'", "MERGE of 01234567"),
+        ("Merge branch ''", "MERGE of 01234567"),
+        ("Merge branch 'unclosed", "MERGE of 01234567"),
+    ] {
+        let line = format!("merge-msg {msg}");
+        assert_eq!(detail(&["exists MERGE_HEAD", &head, &line]), shown, "{msg}");
+    }
     assert_eq!(
         detail(&["exists CHERRY_PICK_HEAD", &head]),
         "CHERRY-PICK 01234567"

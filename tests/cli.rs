@@ -3151,9 +3151,10 @@ fn sopen_list_git_prints_the_first_page() {
     assert_eq!(lines[1..], golden[..], "{listed}");
 }
 
-/// `SOPEN_STATE dialog=<id>` (02 §9, S3): an id of 03 §7 is taken — the run goes on, here to
-/// `SOPEN_LIST=git`'s first page (whose load runs the in-progress probe too); any other word
-/// ends the run with the reason, before anything is listed.
+/// `SOPEN_STATE dialog=<id>` (02 §9, S3): an id of 03 §7 is taken — §7.8's history edits too
+/// (S4: `drop`, `move-up`, `plan`) — and the run goes on, here to `SOPEN_LIST=git`'s first page
+/// (whose load runs the in-progress probe too); any other word ends the run with the reason,
+/// before anything is listed.
 #[test]
 fn sopen_state_dialog_takes_an_action_id() {
     if test_git().is_none() {
@@ -3178,9 +3179,19 @@ fn sopen_state_dialog_takes_an_action_id() {
             ],
         )
     };
-    let out = run("git=pin;select=v1.0;dialog=reset");
-    assert!(out.status.success(), "{}", text(&out.stderr));
-    assert!(text(&out.stdout).contains("9 commits · all loaded"));
+    for state in [
+        "git=pin;select=v1.0;dialog=reset",
+        "git=pin;select=v1.0;dialog=drop",
+        "git=pin;dialog=move-up",
+        "git=pin;dialog=plan",
+    ] {
+        let out = run(state);
+        assert!(out.status.success(), "{state}: {}", text(&out.stderr));
+        assert!(
+            text(&out.stdout).contains("9 commits · all loaded"),
+            "{state}"
+        );
+    }
     let out = run("git=pin;dialog=nonsense");
     let err = text(&out.stderr);
     assert!(

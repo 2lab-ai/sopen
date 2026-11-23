@@ -9,7 +9,7 @@
 //!   give fakes; the integration gives these.
 //! - **A quick edit's dialog** ([`QuickDialog`], §7.8.1, §8.1) starts from the [`Commit`] it edits
 //!   (for `squash`, also the commit below): reword's message, squash's two messages joined
-//!   ([`squash_message`]), author's name, email and dates. It holds the edit as its options make
+//!   (`rebase::squash_message`, the todo's own rule), author's name, email and dates. It holds the edit as its options make
 //!   it, plans it again whenever that changes, and shows the plan's confirmation: the line of what
 //!   is lost first, the options, what changes, the backups, the exact command lines, the notes, or
 //!   the refusal. Enter or Run returns the edit ([`QuickEnd::Run`]) only when the plan shown is
@@ -27,10 +27,6 @@
 //!   its options (`--autostash`, `--update-refs`) and the checks that fail; Esc closes, asking
 //!   first when something changed. Each key becomes an [`Op`] the model applies or refuses; a
 //!   refusal is the pane's note, in the error colour.
-
-// Nothing uses these screens until S4-C wires them into the panel (as S3-B's files say of
-// S3-C); S4-C removes this line when it does.
-#![allow(dead_code)]
 
 use super::dialogs::{remote_warning, step_line, width};
 use super::graph_view::{self, printable};
@@ -114,13 +110,6 @@ fn lossy_text(commit: &Oid) -> String {
         "{}: its message is not valid UTF-8; editing it would change its bytes",
         commit.short()
     )
-}
-
-/// `squash`'s message (03 §7.8.1): both messages, the older first, a blank line between. Each is
-/// kept whole, byte for byte; the blank line is added after the older one's last line.
-pub fn squash_message(older: &str, newer: &str) -> String {
-    let gap = if older.ends_with('\n') { "\n" } else { "\n\n" };
-    format!("{older}{gap}{newer}")
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -523,7 +512,7 @@ impl QuickDialog {
                     _ if commit.message_lossy => refused = Some(lossy_text(&c)),
                     None => refused = Some(format!("{}: there is no commit below it", c.short())),
                     Some(b) if b.message_lossy => refused = Some(lossy_text(&b.row.oid)),
-                    Some(b) => message = Some(squash_message(&b.message, &commit.message)),
+                    Some(b) => message = Some(rebase::squash_message(&b.message, &commit.message)),
                 }
                 Quick::Squash {
                     commit: c,
@@ -792,6 +781,9 @@ pub struct PlannerView {
     scroll: Scroll,
     note: Option<Note>,
     inner: Option<Inner>,
+    /// The edit and plan the run dialog showed when Enter returned [`PlannerEnd::Run`] (S4-C:
+    /// what runs is the plan shown, [`PlannerView::take_shown`]).
+    shown: Option<(Edit, Plan)>,
 }
 
 fn inner_id(kind: &str) -> egui::Id {
@@ -806,10 +798,10 @@ fn first_line(text: &str, n: usize) -> String {
 
 /// The message of the squash group row `k` is in (03 §7.8.2): the group's own when one of its
 /// squash rows has it (each of them holds the same), else the group's messages joined, the
-/// oldest first ([`squash_message`]): its first row's (a reword's own), then each squash row's;
-/// a fixup row's is left out. The group is the nearest row below that is neither squash, fixup
-/// nor dropped, and the squash, fixup and dropped rows above it. A message that is not UTF-8 is
-/// refused, as reword's is.
+/// oldest first (`rebase::squash_message`, the rule the todo writes): its first row's (a
+/// reword's own), then each squash row's; a fixup row's is left out. The group is the nearest
+/// row below that is neither squash, fixup nor dropped, and the squash, fixup and dropped rows
+/// above it. A message that is not UTF-8 is refused, as reword's is.
 fn group_message(model: &Model, k: usize) -> Result<String, String> {
     let rows = &model.rows;
     let member = |v: Verb| matches!(v, Verb::Squash | Verb::Fixup | Verb::Drop);
@@ -848,7 +840,7 @@ fn group_message(model: &Model, k: usize) -> Result<String, String> {
     }
     let mut parts = parts.into_iter();
     let joined = parts.next().unwrap_or_default().to_string();
-    Ok(parts.fold(joined, |older, newer| squash_message(&older, newer)))
+    Ok(parts.fold(joined, |older, newer| rebase::squash_message(&older, newer)))
 }
 
 impl PlannerView {
@@ -861,6 +853,7 @@ impl PlannerView {
             scroll: Scroll::default(),
             note: None,
             inner: None,
+            shown: None,
         }
     }
 
@@ -890,6 +883,22 @@ impl PlannerView {
     /// in the panel's `dialog_up()`.
     pub fn dialog_up(&self) -> bool {
         self.inner.is_some()
+    }
+
+    /// While the run's confirmation is up (Cmd/Ctrl+Enter): the edit it plans, for the reads
+    /// its plan needs (`rebase::needs`), which the integration makes and hands back through
+    /// [`PlannerView::set_repo`].
+    pub fn run_draft(&self) -> Option<Edit> {
+        match &self.inner {
+            Some(Inner::Run { .. }) => Some(Edit::Plan(self.model.clone())),
+            _ => None,
+        }
+    }
+
+    /// The edit and the plan the run dialog showed when it returned [`PlannerEnd::Run`], taken
+    /// once.
+    pub fn take_shown(&mut self) -> Option<(Edit, Plan)> {
+        self.shown.take()
     }
 
     /// The pane's note: the last op's refusal, or what a key does.
@@ -1299,7 +1308,11 @@ impl PlannerView {
                 let ready =
                     problems.is_empty() && matches!(&planned, Some((m, Ok(_))) if *m == self.model);
                 if run && ready {
-                    return Some(PlannerEnd::Run(Edit::Plan(self.model.clone())));
+                    let edit = Edit::Plan(self.model.clone());
+                    if let Some((_, Ok(plan))) = planned {
+                        self.shown = Some((edit.clone(), plan));
+                    }
+                    return Some(PlannerEnd::Run(edit));
                 }
                 self.inner = Some(Inner::Run {
                     planned,

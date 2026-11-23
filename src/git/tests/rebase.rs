@@ -1596,6 +1596,94 @@ fn g_h3_split_and_its_continue() {
     }
 }
 
+/// The edit stop's two identities (S4-C round 3, measured with git 2.56.1): a plan that rewords
+/// an older commit and stops to edit a later one replays that one, so `stopped-sha` and `done`
+/// name the original while HEAD is its replayed copy. Split of HEAD — the commit checked out —
+/// plans and runs, its confirmation naming HEAD; Split of the original id is refused (it is not
+/// checked out); the split's Continue then finishes with every file in history.
+#[test]
+fn split_at_a_stop_after_an_earlier_rewrite_takes_head() {
+    let Some(fx) = fixture() else { return };
+    for (lane, runner) in fx.lanes() {
+        let lane = lane.as_str();
+        let dir = fx.repo(&format!("h3-rewritten-{lane}"));
+        let base = fx.oid(&dir, "HEAD");
+        fx.commit(&dir, "f", "1\n", "one");
+        std::fs::write(dir.join("n"), "new\n").unwrap();
+        fx.git(&dir, &["add", "n"]);
+        let two = fx.commit(&dir, "f", "2\n", "two");
+        fx.commit(&dir, "g", "g\n", "three");
+        let (repo, mut model) = opened(&runner, &dir, &Base::Commit(base.clone()));
+        let one = model.rows[2].commit.row.oid.clone();
+        model
+            .apply(Op::Verb {
+                commit: one.clone(),
+                verb: Verb::Reword,
+            })
+            .unwrap();
+        model
+            .apply(Op::Message {
+                commit: one,
+                message: "one, reworded\n".into(),
+            })
+            .unwrap();
+        model
+            .apply(Op::Verb {
+                commit: two.clone(),
+                verb: Verb::Edit,
+            })
+            .unwrap();
+        let (_, outcome) = run_on(&runner, &dir, repo, &Edit::Plan(model));
+        done(lane, &outcome);
+        let head = fx.oid(&dir, "HEAD");
+        assert_ne!(head, two, "{lane}: two replayed");
+        let repo = repo_of(&runner, &dir);
+        let stopped = repo.in_progress.rebase.as_ref().unwrap();
+        assert_eq!(
+            stopped.stopped_sha.as_deref().map(str::trim),
+            Some(two.as_str()),
+            "{lane}: git names the original"
+        );
+        // The original id is not checked out: refused.
+        let why = planned(
+            &runner,
+            &dir,
+            &Edit::SplitStop {
+                commit: two.clone(),
+            },
+        )
+        .unwrap_err()
+        .0;
+        assert!(why.contains("the edit stop is at"), "{lane}: {why}");
+        // HEAD's: planned, named, run.
+        let plan_of_head = planned(
+            &runner,
+            &dir,
+            &Edit::SplitStop {
+                commit: head.clone(),
+            },
+        )
+        .unwrap_or_else(|r| panic!("{lane}: {}", r.0));
+        let title = plan_of_head.confirm.as_ref().unwrap().title.clone();
+        assert_eq!(title, format!("Split {} two", head.short()), "{lane}");
+        let split = split_at(lane, &runner, &dir, &head);
+        assert_eq!(split.paths, ["f", "n"], "{lane}");
+        fx.git(&dir, &["add", "f"]);
+        fx.git(&dir, &["commit", "-q", "-m", "two: f"]);
+        fx.git(&dir, &["add", "n"]);
+        fx.git(&dir, &["commit", "-q", "-m", "two: n"]);
+        let (_, outcome) = run(&runner, &dir, &Edit::ContinueSplit(split));
+        done(lane, &outcome);
+        assert!(idle(&runner, &dir), "{lane}");
+        assert_eq!(
+            subjects(&fx, &dir, &format!("{}..HEAD", base.as_str())),
+            ["one, reworded", "two: f", "two: n", "three"],
+            "{lane}"
+        );
+        assert_eq!(fx.git(&dir, &["status", "--porcelain"]), "", "{lane}");
+    }
+}
+
 /// G-H3's refusals: `split` on the root commit (it has no `HEAD^`); Split with no edit stop.
 #[test]
 fn g_h3_split_is_refused_where_it_cannot_be() {
@@ -2530,6 +2618,73 @@ fn a_plan_is_refused_when_head_moved_since_it_was_read() {
         fx.commit(&dir, "f2", "2\n", "two, made meanwhile");
         let why = planned(&runner, &dir, &Edit::Plan(model)).unwrap_err().0;
         assert!(why.contains("HEAD"), "{lane}: {why}");
+    }
+}
+
+/// A plan that moves or drops the newest row is the owner's plan, not a moved HEAD (S4-C round
+/// 2): the check compares HEAD with the newest row as the planner read it (`Model::read`), so
+/// Cmd/Ctrl+↓ on the top row and `D` on it plan and run, and the history is exactly that.
+#[test]
+fn a_plan_that_moves_or_drops_the_newest_row_runs() {
+    let Some(fx) = fixture() else { return };
+    for (lane, runner) in fx.lanes() {
+        let lane = lane.as_str();
+        let dir = fx.repo(&format!("newest-{lane}"));
+        let base = fx.oid(&dir, "HEAD");
+        fx.commit(&dir, "f1", "1\n", "one");
+        let two = fx.commit(&dir, "f2", "2\n", "two");
+        let (mut repo, model) = opened(&runner, &dir, &Base::Commit(base.clone()));
+        assert_eq!(
+            model.read.order.first(),
+            Some(&two),
+            "{lane}: read as opened"
+        );
+        // Both planned: the newest row moved down one place, and dropped.
+        let mut moved = model.clone();
+        moved
+            .apply(Op::Move {
+                commit: two.clone(),
+                toward: Toward::Down,
+            })
+            .unwrap();
+        let mut dropped = model.clone();
+        dropped
+            .apply(Op::Verb {
+                commit: two.clone(),
+                verb: Verb::Drop,
+            })
+            .unwrap();
+        let (moved, dropped) = (Edit::Plan(moved), Edit::Plan(dropped));
+        ready(&runner, &mut repo, &moved);
+        ready(&runner, &mut repo, &dropped);
+        let plans = [
+            plan(&moved, &repo).map(|_| ()),
+            plan(&dropped, &repo).map(|_| ()),
+        ];
+        assert!(
+            plans.iter().all(Result::is_ok),
+            "{lane}: moved {:?}, dropped {:?}",
+            plans[0],
+            plans[1]
+        );
+        // Run: the moved one, then (opened again) the newest dropped.
+        let (_, outcome) = run_on(&runner, &dir, repo, &moved);
+        done(lane, &outcome);
+        let range = format!("{}..HEAD", base.as_str());
+        assert_eq!(subjects(&fx, &dir, &range), ["two", "one"], "{lane}");
+        // The newest row (now `one`) dropped.
+        let (repo, mut model) = opened(&runner, &dir, &Base::Commit(base.clone()));
+        let newest = model.rows[0].commit.row.oid.clone();
+        model
+            .apply(Op::Verb {
+                commit: newest,
+                verb: Verb::Drop,
+            })
+            .unwrap();
+        let (_, outcome) = run_on(&runner, &dir, repo, &Edit::Plan(model));
+        done(lane, &outcome);
+        assert_eq!(subjects(&fx, &dir, &range), ["two"], "{lane}");
+        assert!(!dir.join("f1").exists(), "{lane}: one's file gone");
     }
 }
 

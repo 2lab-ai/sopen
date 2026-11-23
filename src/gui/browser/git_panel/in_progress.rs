@@ -161,12 +161,11 @@ pub fn draw(ui: &mut egui::Ui, rect: Rect, banner: &BannerView) -> Option<Presse
 
 // ---------------------------------------------------------------------------------------------
 // An edit stop's Amend and Split (03 §8.5; S4-B). S3-B's banner above is unchanged: these
-// items stand beside it, and S3-B's steps come back as S3-B's `Pressed`. Each item carries its
-// own `dead_code` allowance, which S4-C removes when it wires them.
+// items stand beside it, and S3-B's steps come back as S3-B's `Pressed`. S4-C wires them
+// (`GitView`'s banner and the key table's Cmd/Ctrl+Shift+M and P).
 
 /// An edit stop's own steps (03 §8.5: "with Amend, Split, Continue, Abort"), beside the banner's
 /// Continue and Abort.
-#[allow(dead_code)] // S4-C removes this when it wires the edit stop.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StopStep {
     /// §7.6's `amend`: the staged changes into the stopped commit.
@@ -176,11 +175,9 @@ pub enum StopStep {
 }
 
 /// The edit stop's steps, in their keys' order.
-#[allow(dead_code)] // S4-C removes this when it wires the edit stop.
 pub const STOP_STEPS: [StopStep; 2] = [StopStep::Amend, StopStep::Split];
 
 /// What a step's button says.
-#[allow(dead_code)] // S4-C removes this when it wires the edit stop.
 pub fn stop_word(s: StopStep) -> &'static str {
     match s {
         StopStep::Amend => "Amend",
@@ -190,7 +187,6 @@ pub fn stop_word(s: StopStep) -> &'static str {
 
 /// A step's key, with Cmd/Ctrl+Shift as the banner's others (S4-B's proposal for 03 §9.2:
 /// aMend, sPlit — C, S, A and B are the banner's already).
-#[allow(dead_code)] // S4-C removes this when it wires the edit stop.
 pub fn stop_key(s: StopStep) -> Key {
     match s {
         StopStep::Amend => Key::M,
@@ -199,7 +195,6 @@ pub fn stop_key(s: StopStep) -> Key {
 }
 
 /// A step's key as the help writes it: `Cmd+Shift+M`.
-#[allow(dead_code)] // S4-C removes this when it wires the edit stop.
 pub fn stop_key_text(s: StopStep) -> String {
     format!("{}{}", Mods::CommandShift.prefix(), stop_key(s).name())
 }
@@ -209,7 +204,6 @@ pub fn stop_key_text(s: StopStep) -> String {
 /// `done`'s last line (`edit <c> …`), each taken only when it is a whole object id that starts
 /// with the banner's. Without the full id Split is not offered (`Edit::SplitStop` names a whole
 /// id); Amend needs none.
-#[allow(dead_code)] // S4-C removes this when it wires the edit stop.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EditStop {
     short: String,
@@ -217,7 +211,6 @@ pub struct EditStop {
 }
 
 /// What an edit stop's key or button asks for.
-#[allow(dead_code)] // S4-C removes this when it wires the edit stop.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StopPressed {
     /// Amend: §7.6's `amend` dialog on the stopped commit (`ActionDialog::open(ActionId::Amend,
@@ -231,16 +224,18 @@ pub enum StopPressed {
 }
 
 /// What the banner of an edit stop gives: S3-B's steps as S3-B's [`Pressed`], or Amend / Split.
-#[allow(dead_code)] // S4-C removes this when it wires the edit stop.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StopEnd {
     Banner(Pressed),
     Stop(StopPressed),
 }
 
-#[allow(dead_code)] // S4-C removes this when it wires the edit stop.
 impl EditStop {
-    /// The edit stop `banner` shows (`Banner::edit_stop`), or `None` when it shows none.
+    /// The edit stop `banner` shows (`Banner::edit_stop`), or `None` when it shows none, its
+    /// commit as git names it (`stopped-sha`, `done`): the commit the todo named, which is not
+    /// HEAD once an earlier commit was rewritten (S4-C round 3). The panel's Split takes HEAD
+    /// ([`EditStop::probe`]); S4-B's tests read git's name here.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn of(banner: &Banner) -> Option<EditStop> {
         let short = banner.edit_stop()?.to_string();
         let rebase = banner.state.rebase.as_ref()?;
@@ -258,8 +253,18 @@ impl EditStop {
     }
 
     /// The edit stop of a refresh (03 §5, §8.5), through `Banner::of`; `None` while there is none.
-    pub fn probe(in_progress: &InProgress, status: &Status) -> Option<EditStop> {
-        EditStop::of(&Banner::of(in_progress, status)?)
+    /// Its Split splits `head`, the commit checked out, as git's own split recipe does: git's
+    /// `stopped-sha` and `done` name the commit the todo named, and once an earlier commit was
+    /// rewritten the stopped one is replayed, so that id is not HEAD (*measured, git 2.56.1*:
+    /// `stopped-sha` and `done` held `9c6719af…` after an earlier reword, HEAD `fe7c9e26…`; S4-C
+    /// round 3). The banner keeps git's name.
+    pub fn probe(
+        in_progress: &InProgress,
+        status: &Status,
+        head: Option<&Oid>,
+    ) -> Option<EditStop> {
+        let short = Banner::of(in_progress, status)?.edit_stop()?.to_string();
+        Some(EditStop::new(short, head.cloned()))
     }
 
     /// An edit stop at `short`, its full id `commit` when known (S4-C may resolve it itself).
@@ -298,11 +303,23 @@ impl EditStop {
     }
 }
 
+/// Step `s` while `banner` shows: the edit stop's ([`EditStop::press`]), or without one
+/// (`stop` `None`) nothing, the status row saying so, as for a step the state does not offer.
+/// The key table's Cmd/Ctrl+Shift+M and P rows (03 §9.2, S4-C) come here.
+pub fn stop_step(banner: &BannerView, stop: Option<&EditStop>, s: StopStep) -> StopPressed {
+    match stop {
+        Some(stop) => stop.press(s),
+        None => {
+            let state = banner.lines.first().map_or("", String::as_str);
+            StopPressed::NotOffered(format!("{}: not offered while {state}", stop_word(s)))
+        }
+    }
+}
+
 /// An edit stop's keys this frame, with exact modifiers: Cmd/Ctrl+Shift+M (Amend) and
-/// Cmd/Ctrl+Shift+P (Split), S4-B's proposal for 03 §9.2. Read where the banner's own keys are
-/// ([`keys`]), while a banner shows; without an edit stop (`stop` `None`) they do nothing and
-/// the status row says so, as for a step the state does not offer.
-#[allow(dead_code)] // S4-C removes this when it wires the edit stop.
+/// Cmd/Ctrl+Shift+P (Split) (03 §9.2), each [`stop_step`]. The panel reads them through the key
+/// table's rows instead (S4-C, so F1 lists them); S4-B's tests read them here.
+#[cfg_attr(not(test), allow(dead_code))] // The key table's rows are the panel's.
 pub fn stop_keys(
     ctx: &egui::Context,
     banner: &BannerView,
@@ -310,20 +327,13 @@ pub fn stop_keys(
 ) -> Option<StopPressed> {
     STOP_STEPS.into_iter().find_map(|s| {
         ctx.input_mut(|i| keys::take(i, stop_key(s), Mods::CommandShift))
-            .then(|| match stop {
-                Some(stop) => stop.press(s),
-                None => {
-                    let state = banner.lines.first().map_or("", String::as_str);
-                    StopPressed::NotOffered(format!("{}: not offered while {state}", stop_word(s)))
-                }
-            })
+            .then(|| stop_step(banner, stop, s))
     })
 }
 
 /// The banner of an edit stop in `rect`, as [`draw`] draws a banner, with Amend and Split
 /// before S3-B's steps at the right of its first row (03 §8.5's order: Amend, Split, Continue,
 /// Abort); a click is the step's key.
-#[allow(dead_code)] // S4-C removes this when it wires the edit stop.
 pub fn draw_stop(
     ui: &mut egui::Ui,
     rect: Rect,

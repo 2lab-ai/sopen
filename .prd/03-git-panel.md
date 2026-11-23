@@ -1043,6 +1043,8 @@ that does not exist now). So undo, redo and undo again each restore the previous
   (the hand-made resolution survives; Restore brings it back, *verified*). Mark resolved (`add`); F4
   opens the file in the editor to merge it by hand; Enter shows its diff.
 - **An edit stop** (`edit`, `split`): `stopped to edit abc12345`, with Amend, Split, Continue, Abort.
+  git writes the stopped commit in full in `rebase-merge/stopped-sha` and in `done`'s last line
+  (*verified, git 2.56.1*, S4-C), so Split names it by its whole id (HEAD's, at the stop, otherwise).
 - **A planner line that fails** (a commit hook refused a message line): git stops with its message,
   which the banner shows; planner runs pass `--reschedule-failed-exec`, so Continue runs that line
   again once the cause is fixed *(verified, git 2.56.1: a `commit-msg` hook that refused, removed,
@@ -1223,7 +1225,13 @@ under the remote `/tmp/sopen-receipts/`. A window receipt is a screenshot someon
   `stop sent; the command may still be running on <host>` and the other `outcome unknown: the
   connection to <host> was lost after the command was sent` — the dead master ended the command's
   own ssh before Esc reached it (a race between the two, not a wording sopen picks) — and both
-  times the upload-pack was indeed still running (the receipt ended it): never `stopped`. Not run: fish (its host was offline), bash (no account with a bash login shell). The local
+  times the upload-pack was indeed still running (the receipt ended it): never `stopped`.
+  *Measured, 2026-11-24, fish* — the same test against a Linux host whose login shell is fish
+  (git 2.55), three runs: Esc ended the fetch in 0.36–0.38 s, the log said `stopped`, `pgrep`
+  found nothing; with the master gone before Esc, two runs said `outcome unknown: the connection
+  to <host> was lost after the command was sent` and one `stop sent; the command may still be
+  running on <host>`, the status row `Fetch origin: failed`, never `stopped`. Not run: bash (no
+  account with a bash login shell). The local
   half is `gui::browser::tests::s3::g_a3_g_r3_esc_stops_a_pull_during_its_fetch_and_leaves_head`;
   the live one `live_g_r3_esc_stops_a_remote_fetch` (AGENTS.md).
 - G-R4. A test transport (`ShellGit` with a fault switch) that runs the command and then loses its
@@ -1389,7 +1397,13 @@ confirmation's command lines, and the backup refs)
 - G-K2. Esc walks §9.2's chain to the unpin; Tab returns to the list; F9 switches the mode from the
   git panel.
 - G-W1. Window receipts, local and remote: the graph, the details pane, a diff, the planner, the
-  banner, the Backups list, the command log.
+  banner, the Backups list, the command log. The history edits' local receipts (*measured, S4-C,
+  2026-11-24*, sopen's own binary, `--here`): `SOPEN_STATE='git=pin;select=HEAD~1' SOPEN_KEYS='F10'`
+  — a commit's menu, S3's items, then the history row (Reword… F2, Drop… F8, Edit history from
+  here… Cmd+E), `Repository…`, the status row counting 21 items; `SOPEN_STATE='git=pin;select=HEAD~5;
+  dialog=plan' SOPEN_KEYS='Down,Down,Down,text:s'` — the planner over five commits, one `squash`, the
+  F-key row 1 Help and 9 Dual only; a repository stopped at an `edit` line with `git=pin` — the banner
+  `stopped to edit <c>` with Amend, Split, Continue, Abort, and their keys on the status row.
 
 ## 12. Coverage of the inventory
 
