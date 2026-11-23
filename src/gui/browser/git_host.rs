@@ -1555,11 +1555,11 @@ impl Browser {
         // nothing in progress, the next line done after its Continue (a pick that conflicts
         // included), another stop. The view routes the banner's Continue through it while kept.
         let stop = edit_token(&snapshot.in_progress);
-        if !self
+        if self
             .git
             .splits
             .get(&top)
-            .is_some_and(|kept| stop.as_deref() == Some(kept.stop.as_str()))
+            .is_none_or(|kept| stop.as_deref() != Some(kept.stop.as_str()))
         {
             self.git.splits.remove(&top);
         }
