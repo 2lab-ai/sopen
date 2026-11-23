@@ -304,6 +304,7 @@ fn g_s1_reset_hard_is_backed_up_and_cmd_z_undoes_it() {
     );
     g.run();
     assert_eq!(g.repo.rev("HEAD"), second, "reset");
+    let at_second = std::fs::read(g.repo.top.join("a.txt")).unwrap();
     assert!(g.backups().contains("/heads/main"), "{}", g.backups());
     let status = g.status();
     let undoes = format!("{}Z undoes", keys::Mods::Command.prefix());
@@ -326,15 +327,21 @@ fn g_s1_reset_hard_is_backed_up_and_cmd_z_undoes_it() {
     g.run();
     assert_eq!(g.repo.rev("HEAD"), third, "undone");
     assert_eq!(std::fs::read(g.repo.top.join("a.txt")).unwrap(), changed);
-    // Redo: the restore wrote its own group, the newest now. Its plan moves the branch with
-    // `reset --keep` before its work-tree item, and git refuses over the change the undo put
-    // back (S3-A's plan order; see the report) — said in the result dialog, nothing lost.
+    // Redo: the restore wrote its own group, the newest now. Its work-tree item resets to HEAD
+    // before the branch moves (03 §8.3's order), so the redo lands exactly where the reset did.
     g.cmd(Key::Z);
     g.until_quiet("the redo's entries");
     assert_eq!(g.dialog_id(), Some(ActionId::Restore));
     g.run();
-    assert!(g.painted("failed"), "the result dialog: {:#?}", g.texts());
-    assert_eq!(g.repo.rev("HEAD"), third, "nothing moved");
+    assert!(!g.painted("failed"), "the result dialog: {:#?}", g.texts());
+    assert_eq!(g.repo.rev("HEAD"), second, "redone");
+    assert_eq!(std::fs::read(g.repo.top.join("a.txt")).unwrap(), at_second);
+    // And undo again: back to the change the reset discarded, exactly.
+    g.cmd(Key::Z);
+    g.until_quiet("the second undo's entries");
+    assert_eq!(g.dialog_id(), Some(ActionId::Restore));
+    g.run();
+    assert_eq!(g.repo.rev("HEAD"), third, "undone again");
     assert_eq!(std::fs::read(g.repo.top.join("a.txt")).unwrap(), changed);
 }
 
