@@ -12,10 +12,6 @@
 //! now are read), a delete through its confirmation (`Action::DeleteBackup`), Show into the
 //! graph's revisions with a dim `backup` label until the next refresh.
 
-// Nothing uses these screens until S3-C wires them into the panel (as `mod.rs`'s own
-// allowance says of S2-F); S3-C removes this line when it does.
-#![allow(dead_code)]
-
 use super::graph_view::printable;
 use super::Scroll;
 use crate::git::actions::Action;

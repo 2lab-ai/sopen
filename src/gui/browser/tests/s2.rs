@@ -17,18 +17,18 @@ use std::time::{Duration, Instant};
 const REST: usize = 12;
 
 /// The browser on `repo`'s top level (or `folder` in it), its git the fixture's own.
-struct Gx {
-    repo: Repo,
-    fx: Fx,
+pub(super) struct Gx {
+    pub(super) repo: Repo,
+    pub(super) fx: Fx,
 }
 
 impl Gx {
-    fn new(repo: Repo) -> Gx {
+    pub(super) fn new(repo: Repo) -> Gx {
         Self::at(repo, None)
     }
 
     /// The browser opened on `sub` of the repository (its top level with `None`).
-    fn at(repo: Repo, sub: Option<&str>) -> Gx {
+    pub(super) fn at(repo: Repo, sub: Option<&str>) -> Gx {
         let tmp = tempfile::tempdir().unwrap();
         let root = match sub {
             Some(sub) => format!("{}/{sub}", repo.top()),
@@ -67,16 +67,16 @@ impl Gx {
         gx
     }
 
-    fn b(&self) -> &Browser {
+    pub(super) fn b(&self) -> &Browser {
         &self.fx.b
     }
 
-    fn idle(&mut self, n: usize) {
+    pub(super) fn idle(&mut self, n: usize) {
         self.fx.drv.idle(&mut self.fx.b, n);
     }
 
     /// Passes until `done` (at most 20 s), then the window settles.
-    fn until(&mut self, what: &str, done: impl Fn(&Browser) -> bool) {
+    pub(super) fn until(&mut self, what: &str, done: impl Fn(&Browser) -> bool) {
         let t = Instant::now();
         while !done(&self.fx.b) {
             assert!(
@@ -97,54 +97,54 @@ impl Gx {
         }
     }
 
-    fn settle(&mut self) {
+    pub(super) fn settle(&mut self) {
         self.fx.settle();
         self.idle(2);
     }
 
     /// The bar rests where it is.
-    fn rest(&mut self) {
+    pub(super) fn rest(&mut self) {
         self.idle(REST);
         self.settle();
     }
 
-    fn key(&mut self, key: Key) {
+    pub(super) fn key(&mut self, key: Key) {
         self.fx.key(key);
     }
 
-    fn with(&mut self, key: Key, modifiers: Modifiers) {
+    pub(super) fn with(&mut self, key: Key, modifiers: Modifiers) {
         self.fx.drv.key(&mut self.fx.b, key, modifiers);
     }
 
-    fn cmd(&mut self, key: Key) {
+    pub(super) fn cmd(&mut self, key: Key) {
         self.with(key, Modifiers::COMMAND);
     }
 
-    fn shown(&self) -> [view::Content; 2] {
+    pub(super) fn shown(&self) -> [view::Content; 2] {
         self.fx.b.shown.clone().expect("a display")
     }
 
-    fn top(&self) -> String {
+    pub(super) fn top(&self) -> String {
         self.repo.top().to_string()
     }
 
-    fn git(&self) -> view::Content {
+    pub(super) fn git(&self) -> view::Content {
         view::Content::Git(self.top())
     }
 
     /// The git panel of the repository.
-    fn panel(&self) -> &RepoPanel {
+    pub(super) fn panel(&self) -> &RepoPanel {
         let i = self.fx.b.git.panel(self.repo.top()).expect("a git panel");
         &self.fx.b.git.panels[i]
     }
 
-    fn panel_mut(&mut self) -> &mut RepoPanel {
+    pub(super) fn panel_mut(&mut self) -> &mut RepoPanel {
         let i = self.fx.b.git.panel(self.repo.top()).expect("a git panel");
         &mut self.fx.b.git.panels[i]
     }
 
     /// The rows the panel shows, as `SOPEN_LIST=git` would print their subjects.
-    fn subjects(&self) -> Vec<String> {
+    pub(super) fn subjects(&self) -> Vec<String> {
         let view = &self.panel().view;
         (0..view.rows().len())
             .filter_map(|i| view.line(i).map(|r| r.subject))
@@ -152,7 +152,7 @@ impl Gx {
     }
 
     /// The git panel shows on the right with its first page.
-    fn wait_for_the_panel(&mut self) {
+    pub(super) fn wait_for_the_panel(&mut self) {
         let top = self.top();
         self.until("the git panel with its rows", |b| {
             b.shown
@@ -166,14 +166,14 @@ impl Gx {
     }
 
     /// Tab into the git panel on the right.
-    fn tab_into_git(&mut self) {
+    pub(super) fn tab_into_git(&mut self) {
         self.key(Key::Tab);
         self.settle();
         assert!(self.fx.b.git_focused().is_some(), "the keyboard in Git");
     }
 
     /// The panel's bar on the row whose subject is `subject`.
-    fn bar_to(&mut self, subject: &str) {
+    pub(super) fn bar_to(&mut self, subject: &str) {
         let at = self
             .subjects()
             .iter()
@@ -184,11 +184,11 @@ impl Gx {
         self.idle(2);
     }
 
-    fn painted(&self, text: &str) -> bool {
+    pub(super) fn painted(&self, text: &str) -> bool {
         self.fx.drv.find_text(text).is_some()
     }
 
-    fn on_right(&self, text: &str) -> bool {
+    pub(super) fn on_right(&self, text: &str) -> bool {
         self.fx
             .drv
             .texts_starting_with(text)
@@ -200,7 +200,7 @@ impl Gx {
 /// A small history (G-G1's shape, the remote aside): `main` with three commits, a merged
 /// `feature`, an annotated tag `v1.0` and a lightweight `light`, an image, a folder; then a
 /// stash holding an untracked `u.txt`, and two uncommitted changes.
-fn small(git: &std::path::Path) -> Repo {
+pub(super) fn small(git: &std::path::Path) -> Repo {
     let repo = Repo::new(git);
     repo.write("a.txt", "one\n");
     repo.write("sub/s.txt", "in a folder\n");
@@ -1407,7 +1407,9 @@ fn a_slow_git_connect_never_holds_the_window() {
 
 /// Review 1.2: a history search's parked stream ends at the hidden deadline even when the
 /// graph's stream has already ended (all loaded) — its worker goes, the host's slot is free —
-/// and its results stay, read again by the next page.
+/// and its results stay, read again by the next page: back in the panel, ↓ on their last row
+/// runs the search again (`MoreResults`), as many pages as were shown and one more — the query
+/// kept, the first page's rows the same, no commit twice, and paging goes on (S3-C).
 #[test]
 fn a_hidden_search_ends_at_the_deadline_with_the_graph_all_loaded() {
     let git = git_or_skip!();
@@ -1451,6 +1453,39 @@ fn a_hidden_search_ends_at_the_deadline_with_the_graph_all_loaded() {
     });
     assert!(g.panel().search_dropped.is_some());
     assert_eq!(git_view(&g).search_rows(), 500, "its results stay");
+    let query = git_view(&g).search().cloned().expect("the search shown");
+    let first = git_view(&g).search_commits();
+    // Back to the panel (the bar on `..`): ↓ on the results' last row reads them again.
+    g.key(Key::Home);
+    g.rest();
+    assert_eq!(g.shown()[1], g.git());
+    g.tab_into_git();
+    g.key(Key::End);
+    g.key(Key::ArrowDown);
+    let top = g.top();
+    g.until("the search read again", |b| {
+        let i = b.git.panel(&top).unwrap();
+        let p = &b.git.panels[i];
+        p.search.as_ref().is_some_and(|s| s.link.asked == 0) && p.view.search_rows() > 500
+    });
+    assert!(g.panel().search_dropped.is_none());
+    assert_eq!(git_view(&g).search(), Some(&query), "the query kept");
+    let again = git_view(&g).search_commits();
+    assert_eq!(again.len(), 1000, "the pages shown and one more");
+    assert_eq!(again[..500], first[..], "the first page's rows the same");
+    let distinct: std::collections::HashSet<_> = again.iter().collect();
+    assert_eq!(distinct.len(), again.len(), "no commit twice");
+    assert!(matches!(
+        git_view(&g).paging(),
+        Paging::More(_) | Paging::AllLoaded
+    ));
+    // Paging goes on: the next page of the same stream.
+    g.key(Key::End);
+    g.key(Key::ArrowDown);
+    g.until("the next page", |b| {
+        let i = b.git.panel(&top).unwrap();
+        b.git.panels[i].view.search_rows() == 1200
+    });
 }
 
 /// Review 1.3: Esc while a file row's diff is on its way stops it, and a result that had come

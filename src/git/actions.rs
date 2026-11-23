@@ -52,8 +52,8 @@
 
 use super::backup::{self, RestoreEntry, RestoreHow, Subject, Take, Value};
 use super::model::{
-    BackupKind, GitVersion, Head, InProgress, Oid, Operation, RebaseProgress, RefKind, RefLabel,
-    Sequence, StashRow, Status, StatusState,
+    BackupKind, GitVersion, Head, InProgress, Oid, Operation, OperationHead, RebaseProgress,
+    RefKind, RefLabel, Sequence, StashRow, Status, StatusState,
 };
 use super::runner::{Class, Done, GitCommand, GitRunner, Handle, Snippet};
 use std::cell::RefCell;
@@ -1027,8 +1027,10 @@ pub fn probe_paths(stdout: &[u8]) -> Option<Vec<String>> {
 /// `<key> <value>` records, each ending in NUL — `exists <marker>` for each marker there
 /// (`rebase-merge`, `rebase-apply`, `applying`, `rebasing`, `MERGE_HEAD`, `CHERRY_PICK_HEAD`,
 /// `REVERT_HEAD`, `sequencer`, `BISECT_LOG`), `rebase-merge/`'s `msgnum`, `end`, `head-name`,
-/// `onto`, `stopped-sha` and `done-last` (the last line of `done`), and `todo-first` (the first
-/// line of `sequencer/todo`). It runs no git.
+/// `onto`, `stopped-sha` and `done-last` (the last line of `done`), `todo-first` (the first
+/// line of `sequencer/todo`), `head` (the first line of the first of `MERGE_HEAD`,
+/// `CHERRY_PICK_HEAD` and `REVERT_HEAD` that exists) and, with `MERGE_HEAD`, `merge-msg` (the
+/// first line of `MERGE_MSG` beside it) — the banner's detail (S3-C). It runs no git.
 pub static PROBE: Snippet = Snippet {
     name: "sopen-probe",
     script: concat!(
@@ -1044,6 +1046,10 @@ pub static PROBE: Snippet = Snippet {
         r#"if [ -f "$rm_/$f" ]; then v=; IFS= read -r v < "$rm_/$f"; rec "$f" "$v"; fi; done; "#,
         r#"if [ -f "$rm_/done" ]; then v=$(tail -n 1 "$rm_/done"); rec done-last "$v"; fi; fi; "#,
         r#"if [ -f "$sq/todo" ]; then v=; IFS= read -r v < "$sq/todo"; rec todo-first "$v"; fi; "#,
+        r#"for h in "$3" "$4" "$5"; do h=$(at "$h"); "#,
+        r#"if [ -f "$h" ]; then v=; IFS= read -r v < "$h"; rec head "$v"; break; fi; done; "#,
+        r#"mh=$(at "$3"); if [ -f "$mh" ] && [ -f "${mh%/*}/MERGE_MSG" ]; then "#,
+        r#"v=; IFS= read -r v < "${mh%/*}/MERGE_MSG"; rec merge-msg "$v"; fi; "#,
         r#"exit 0"#,
     ),
 };
@@ -1059,6 +1065,8 @@ pub fn parse_probe(stdout: &[u8]) -> InProgress {
     let mut rebase = RebaseProgress::default();
     let mut any_rebase = false;
     let mut todo_first = None;
+    let mut head: Option<OperationHead> = None;
+    let mut merge_msg = None;
     for record in stdout.split(|&b| b == 0).filter(|r| !r.is_empty()) {
         let record = String::from_utf8_lossy(record);
         let (key, value) = record.split_once(' ').unwrap_or((&record, ""));
@@ -1072,9 +1080,16 @@ pub fn parse_probe(stdout: &[u8]) -> InProgress {
             "stopped-sha" => rebase.stopped_sha = value,
             "done-last" => rebase.done_last = value,
             "todo-first" => todo_first = value,
+            "head" => {
+                head = value.map(|commit| OperationHead {
+                    commit,
+                    merge_msg: None,
+                })
+            }
+            "merge-msg" => merge_msg = value,
             _ => continue,
         }
-        any_rebase |= !matches!(key, "exists" | "todo-first");
+        any_rebase |= !matches!(key, "exists" | "todo-first" | "head" | "merge-msg");
     }
     let has = |m: &str| exists.iter().any(|e| e == m);
     let sequence = || match todo_first
@@ -1106,7 +1121,17 @@ pub fn parse_probe(stdout: &[u8]) -> InProgress {
         bisect: has("BISECT_LOG"),
         rebase: any_rebase.then_some(rebase),
         todo_first,
+        head: head.map(|h| OperationHead { merge_msg, ..h }),
     }
+}
+
+/// What a merge merges, from its `MERGE_MSG`'s first line: the first name git quotes in it
+/// (`Merge branch 'feature' into main`, `Merge remote-tracking branch 'origin/x'`, `Merge tag
+/// 'v1'`); `None` for a message of the owner's own.
+fn merged_name(msg: &str) -> Option<&str> {
+    let (_, rest) = msg.split_once('\'')?;
+    let (name, _) = rest.split_once('\'')?;
+    (!name.is_empty()).then_some(name)
 }
 
 /// How one step of a run ended (03 §3.8's list).
@@ -1192,10 +1217,10 @@ impl Banner {
     }
 
     /// Its text (03 §8.5): `REBASE 3/7 · stopped at abc12345 <subject> · 2 conflicts`, `AM · 1 conflict`,
-    /// `MERGE · 1 conflict`, `CHERRY-PICK`, `REVERT`, `BISECT · Reset` on a line of its own;
-    /// an edit stop `stopped to edit abc12345`. The probe reads no `MERGE_HEAD` or
-    /// `CHERRY_PICK_HEAD` content, so `of feature` and a pick's hash are not shown (see S3-A's
-    /// report).
+    /// `MERGE of feature · 1 conflict`, `CHERRY-PICK abc12345`, `REVERT abc12345`, `BISECT ·
+    /// Reset` on a line of its own; an edit stop `stopped to edit abc12345`. The detail is the
+    /// probe's `head` record ([`InProgress::head`], S3-C): a merge's name from its `MERGE_MSG`,
+    /// else its commit; without the record, the state alone.
     pub fn text(&self) -> String {
         let mut lines = Vec::new();
         if let Some(op) = self.state.operation {
@@ -1220,13 +1245,17 @@ impl Banner {
                 }
                 (Operation::Am, None) => "AM".into(),
                 (Operation::RebaseApply, None) => "REBASE".into(),
-                (Operation::Merge, None) => "MERGE".into(),
-                (Operation::CherryPick | Operation::Sequence(Sequence::Pick), None) => {
-                    "CHERRY-PICK".into()
-                }
-                (Operation::Revert | Operation::Sequence(Sequence::Revert), None) => {
-                    "REVERT".into()
-                }
+                (Operation::Merge, None) => match &self.state.head {
+                    Some(h) => {
+                        let msg = h.merge_msg.as_deref().and_then(merged_name);
+                        format!("MERGE of {}", msg.unwrap_or(shown_id(h.commit.trim())))
+                    }
+                    None => "MERGE".into(),
+                },
+                (Operation::CherryPick, None) => self.with_head("CHERRY-PICK"),
+                (Operation::Revert, None) => self.with_head("REVERT"),
+                (Operation::Sequence(Sequence::Pick), None) => "CHERRY-PICK".into(),
+                (Operation::Sequence(Sequence::Revert), None) => "REVERT".into(),
             };
             match self.conflicts {
                 0 => {}
@@ -1239,6 +1268,14 @@ impl Banner {
             lines.push("BISECT · Reset".into());
         }
         lines.join("\n")
+    }
+
+    /// `word` and the operation's commit, 8 digits, when the probe read it.
+    fn with_head(&self, word: &str) -> String {
+        match &self.state.head {
+            Some(h) => format!("{word} {}", shown_id(h.commit.trim())),
+            None => word.to_string(),
+        }
     }
 
     /// The keys §8.5's table offers for the state, in order. An edit stop adds §7.6's `amend`

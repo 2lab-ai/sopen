@@ -27,7 +27,7 @@ use eframe::egui::{self, Event, Key, Modifiers};
 /// The set of landed slices (02 §8.1: 1 = S1 … 7 = S7); a slice's integration WU adds its
 /// number. Rows of a slice not in it do nothing yet. A set, not the highest slice: slices land in
 /// any order their "Needs first" allows (02 §8.1 "Schedule"), so S5 and S6 landed before S3–S4.
-pub const LANDED_SLICES: Slices = Slices::of(&[1, 2, 5, 6]);
+pub const LANDED_SLICES: Slices = Slices::of(&[1, 2, 3, 5, 6]);
 
 /// Every slice, 1 to 7: every row of the table.
 #[cfg_attr(not(test), allow(dead_code))] // Only the tests use it.
@@ -228,6 +228,14 @@ pub enum Command {
     Wide,
     /// Cmd/Ctrl+K: the filters (03 §4.6, §9.2; the F10 menu offers them too from S3).
     Filters,
+    /// Cmd/Ctrl+Shift+C: the banner's Continue, through its dialog (03 §8.5, §9.2).
+    Continue,
+    /// Cmd/Ctrl+Shift+S: the banner's Skip.
+    Skip,
+    /// Cmd/Ctrl+Shift+A: the banner's Abort.
+    Abort,
+    /// Cmd/Ctrl+Shift+B: bisect's Reset (`bisect reset`).
+    BisectReset,
     // The directory tree (05 §1; S5).
     /// F10, Alt+F10, Esc: close the tree, the panel as it was.
     CloseTree,
@@ -425,9 +433,9 @@ const OTHER_SIDE: &str = "The keyboard to the other side";
 const CLOSE_VIEWER: &str = "Back to the list";
 const DETAILS: &str = "The row's details (with one marked row: compare the two)";
 const MENU: &str = "The menu of what is under the bar";
-/// S2's words; staging a file of the uncommitted row (Space there) comes with S3's actions, whose
-/// scaffold changes the row's words.
-const MARK: &str = "Mark or unmark the row, then step down";
+/// Space and Ins: S2's marks, and from S3 a file of the uncommitted row staged or unstaged (03
+/// §7.6, §9.2).
+const MARK: &str = "Mark or unmark the row, then step down (a changed file: stage or unstage it)";
 const BACK_TO_LIST: &str = "Back to the list";
 const CLOSE_TREE: &str = "Close the tree, the list as it was";
 
@@ -490,7 +498,7 @@ pub const TABLE: &[Row] = &[
     key(Viewer, K::F4, Plain, C::Edit, "Edit", "The file in VS Code or Zed", 1),
     // The git panel (03 §9.1, §9.2).
     key(Git, K::F1, Plain, C::Help, "Help", HELP, 2),
-    key(Git, K::F2, Plain, C::Reword, "Reword", "Reword the commit; on a branch's label: rename it", 3),
+    key(Git, K::F2, Plain, C::Reword, "Reword", "On a branch's label: rename it (a commit's reword comes with the history edits)", 3),
     key(Git, K::F3, Shift, C::RevisionFile, "", "The file at this revision", 2),
     key(Git, K::F3, Plain, C::Details, "View", DETAILS, 2),
     key(Git, K::Enter, Plain, C::Details, "", DETAILS, 2),
@@ -498,7 +506,7 @@ pub const TABLE: &[Row] = &[
     key(Git, K::F5, Plain, C::Pick, "Pick", "Cherry-pick it or the marked ones; a stash: apply it", 3),
     key(Git, K::F6, Plain, C::Rebase, "Rebase", "Rebase the current branch onto it", 3),
     key(Git, K::F7, Plain, C::Branch, "Branch", "A new branch here (uncommitted row: commit)", 3),
-    key(Git, K::F8, Plain, C::Remove, "Delete", "Drop, delete or discard what is under the bar (asks)", 3),
+    key(Git, K::F8, Plain, C::Remove, "Delete", "Delete or discard what is under the bar (asks; a commit's drop comes with the history edits)", 3),
     key(Git, K::F9, Plain, C::SwitchMode, "Dual", SWITCH, 2),
     key(Git, K::F10, Shift, C::Menu, "", MENU, 3),
     key(Git, K::F10, Plain, C::Menu, "Menu", MENU, 3),
@@ -528,6 +536,10 @@ pub const TABLE: &[Row] = &[
     key(Git, K::G, CmdShift, C::Wide, "", "The git panel over both sides, and back", 2),
     key(Git, K::G, Cmd, C::Pin, "", "Pin this git panel; again: unpin", 2),
     key(Git, K::K, Cmd, C::Filters, "", "The filters", 2),
+    key(Git, K::C, CmdShift, C::Continue, "", "The operation in progress: Continue (asks)", 3),
+    key(Git, K::S, CmdShift, C::Skip, "", "The operation in progress: Skip (asks)", 3),
+    key(Git, K::A, CmdShift, C::Abort, "", "The operation in progress: Abort (asks)", 3),
+    key(Git, K::B, CmdShift, C::BisectReset, "", "Bisect in progress: Reset (asks)", 3),
     // The directory tree (05 §1).
     key(TreeSide, K::F1, Plain, C::Help, "Help", HELP, 5),
     key(TreeSide, K::F10, Alt, C::CloseTree, "", CLOSE_TREE, 5),
@@ -1016,18 +1028,18 @@ mod tests {
         assert!(TABLE.iter().all(|r| ALL_SLICES.has(r.slice)));
     }
 
-    /// The landed slices are a set (02 §8.1 "Schedule"): S1, S2, S5 and S6 have landed, so
+    /// The landed slices are a set (02 §8.1 "Schedule"): S1, S2, S3, S5 and S6 have landed, so
     /// exactly their rows act — F10 opens the tree, Cmd/Ctrl+G pins the git panel, F7 makes a
-    /// folder and Shift+F8 deletes without the Trash, while the git panel's F5, an S3 row, still
-    /// does nothing.
+    /// folder and Shift+F8 deletes without the Trash, the git panel's F5 picks (S3) and the
+    /// banner's Cmd/Ctrl+Shift+C continues, while Cmd/Ctrl+E, S4's planner, still does nothing.
     #[test]
     fn landed_slices_are_a_set() {
-        assert_eq!(LANDED_SLICES, Slices::of(&[1, 2, 5, 6]));
+        assert_eq!(LANDED_SLICES, Slices::of(&[1, 2, 3, 5, 6]));
         assert!(TABLE
             .iter()
-            .all(|r| LANDED_SLICES.has(r.slice) == matches!(r.slice, 1 | 2 | 5 | 6)));
+            .all(|r| LANDED_SLICES.has(r.slice) == matches!(r.slice, 1 | 2 | 3 | 5 | 6)));
         assert!(!ALL_SLICES.has(0) && !ALL_SLICES.has(8) && !ALL_SLICES.has(u8::MAX));
-        assert_eq!(LANDED_SLICES.with(3), Slices::of(&[1, 2, 3, 5, 6]));
+        assert_eq!(LANDED_SLICES.with(4), Slices::of(&[1, 2, 3, 4, 5, 6]));
         assert_eq!(
             find(&mut vec![press(K::F10, NONE)], List, LANDED_SLICES),
             Some(Command::Tree)
@@ -1046,8 +1058,36 @@ mod tests {
         );
         assert_eq!(
             find(&mut vec![press(K::F5, NONE)], Git, LANDED_SLICES),
+            Some(Command::Pick),
+            "S3 has landed"
+        );
+        let banner = |key| vec![press(key, Modifiers::COMMAND | SHIFT)];
+        for (key, command) in [
+            (K::C, Command::Continue),
+            (K::S, Command::Skip),
+            (K::A, Command::Abort),
+            (K::B, Command::BisectReset),
+        ] {
+            assert_eq!(find(&mut banner(key), Git, LANDED_SLICES), Some(command));
+            // Nowhere else, and never without Shift (Cmd/Ctrl+B is the Backups list).
+            assert_eq!(find(&mut banner(key), List, ALL_SLICES), None);
+        }
+        assert_eq!(
+            find(
+                &mut vec![press(K::B, Modifiers::COMMAND)],
+                Git,
+                LANDED_SLICES
+            ),
+            Some(Command::Backups)
+        );
+        assert_eq!(
+            find(
+                &mut vec![press(K::E, Modifiers::COMMAND)],
+                Git,
+                LANDED_SLICES
+            ),
             None,
-            "S3 has not landed"
+            "S4 has not landed"
         );
     }
 
@@ -1110,11 +1150,12 @@ mod tests {
         }
     }
 
-    /// 02 §7, 04 §2: the rows of the landed slices, S1, S2, S5 and S6 — the list's slots are
+    /// 02 §7, 04 §2: the rows of the landed slices, S1, S2, S3, S5 and S6 — the list's slots are
     /// `1Help 2Rename 3View 4Edit 5Copy 6Move 7MkDir 8Delete 9Dual 10Tree` (9 names the mode F9
-    /// switches to; S6 adds 7 and 8); the viewer's `1Help 3Exit 4Edit`; the git panel's `1Help
-    /// 3View 4Edit 9Dual` (03 §9.1, S2's slots); the tree's `1Help 10Tree` (05 §1). The keys of
-    /// the slices not landed do nothing yet.
+    /// switches to; S6 adds 7 and 8); the viewer's `1Help 3Exit 4Edit`; the git panel's table row
+    /// every slot of 03 §9.1 (S3 adds 2, 5–8 and 10; the panel shows those that act on the object
+    /// under the bar); the tree's `1Help 10Tree` (05 §1). The keys of the slices not landed do
+    /// nothing yet.
     #[test]
     fn the_rows_of_s1() {
         let pairs = |keys: Vec<FKey>| -> Vec<(u8, &str)> {
@@ -1142,10 +1183,21 @@ mod tests {
         );
         assert_eq!(
             pairs(row(Git, Mode::Preview)),
-            [(1, "Help"), (3, "View"), (4, "Edit"), (9, "Dual")],
-            "S2"
+            [
+                (1, "Help"),
+                (2, "Reword"),
+                (3, "View"),
+                (4, "Edit"),
+                (5, "Pick"),
+                (6, "Rebase"),
+                (7, "Branch"),
+                (8, "Delete"),
+                (9, "Dual"),
+                (10, "Menu")
+            ],
+            "S2 and S3"
         );
-        assert_eq!(pairs(row(Git, Mode::Dual))[3], (9, "Prevw"));
+        assert_eq!(pairs(row(Git, Mode::Dual))[8], (9, "Prevw"));
         assert_eq!(
             pairs(row(TreeSide, Mode::Preview)),
             [(1, "Help"), (10, "Tree")],

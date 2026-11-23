@@ -192,15 +192,16 @@ pub const LOCAL_REPO_ENV: [&str; 15] = [
 /// `sopen_id <pid>`: the process's identity in `$sopen_i` — its start time, which a pid that
 /// is used again does not share (S2-F review 1; 03 §3.5): field 22 of `/proc/<pid>/stat` (clock
 /// ticks since boot) where there is a `/proc`, else `ps -o lstart=` (macOS); empty when there is
-/// no such process. Builtins only on Linux (no process started): `read`, the parameter cut and
-/// the function's own positional parameters (the caller's `"$@"` is untouched). No `'` and no
-/// backslash in it. A macro, so the pid line, `<locate>` and the stop share one text.
+/// no such process, and when `ps` fails (what a failed `ps` printed is no start time). Builtins
+/// only on Linux (no process started): `read`, the parameter cut and the function's own
+/// positional parameters (the caller's `"$@"` is untouched). No `'` and no backslash in it. A
+/// macro, so the pid line, `<locate>` and the stop share one text.
 macro_rules! id_fn {
     () => {
         concat!(
             r#"sopen_id() { sopen_i=; if { read -r sopen_s <"/proc/$1/stat"; } 2>/dev/null; then "#,
             r#"sopen_s=${sopen_s##*) }; set -- $sopen_s; [ $# -ge 20 ] && shift 19 && sopen_i=$1; "#,
-            r#"else sopen_i=$(ps -o lstart= -p "$1" 2>/dev/null); fi; }; "#,
+            r#"else sopen_i=$(ps -o lstart= -p "$1" 2>/dev/null) || sopen_i=; fi; }; "#,
         )
     };
 }
@@ -2992,6 +2993,38 @@ mod stop_lane_tests {
             String::from_utf8_lossy(&out.stderr)
         );
         group_answers(&out.stdout)
+    }
+
+    /// The identity `id_fn!` reads for a pid with `ps` a stand-in, first on `PATH`, that prints
+    /// a start time and exits `code` (a pid no `/proc` has, so Linux takes the `ps` branch too).
+    fn identity_with_ps(code: i32) -> String {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let ps = dir.path().join("ps");
+        let stand_in = format!("#!/bin/sh\necho 'Mon Nov 23 10:00:00 2026'\nexit {code}\n");
+        std::fs::write(&ps, stand_in).unwrap();
+        std::fs::set_permissions(&ps, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = format!(
+            "{}:{}",
+            dir.path().display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let script = concat!(id_fn!(), r#"sopen_id "$1"; printf %s "$sopen_i""#);
+        let out = Command::new("/bin/sh")
+            .env("PATH", path)
+            .args(["-c", script, "id", "999999999"])
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    }
+
+    /// S2-F fix-check (defensive): the identity's `ps` fallback keeps nothing from a `ps` that
+    /// failed — what it printed is no start time, so a stop never matches a group by it; a `ps`
+    /// that succeeds is kept as before.
+    #[test]
+    fn a_ps_that_fails_gives_no_identity() {
+        assert_eq!(identity_with_ps(1), "", "a failed ps is no identity");
+        assert_eq!(identity_with_ps(0), "Mon Nov 23 10:00:00 2026");
     }
 
     /// This machine's identity of `pid`, as the pid line reads it.

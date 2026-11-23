@@ -21,10 +21,6 @@
 //! - **Masking** (03 §3.7) is for what sopen shows from git: a URL the owner types (Add remote, a
 //!   retyped Edit remote field) shows as typed, while the result dialog and the log mask it.
 
-// Nothing uses these screens until S3-C wires them into the panel (as `mod.rs`'s own
-// allowance says of S2-F); S3-C removes this line when it does.
-#![allow(dead_code)]
-
 use super::menu::{self, Target};
 use crate::git::actions::{
     self, Action, ActionId, ArchiveFormat, ConfigScope, FastForward, MergeOptions, Outcome,
@@ -1210,7 +1206,9 @@ fn restore_ui(ui: &mut egui::Ui, entries: &mut [RestoreEntry]) {
             if e.moved_since {
                 ui.label(format!("moved since (now {})", value_text(&e.now)));
             }
-            if matches!(e.subject, Subject::Path(_)) && e.now == Value::Occupied {
+            // In the way as S3-A's `entries` looked: a leaf of other bytes (`now` is its blob) or
+            // anything that is not a file (`occupied`) — S3-C: not `Occupied` alone.
+            if crate::git::backup::blocked(e) {
                 ui.label("occupied: left as it is unless replace is chosen");
                 toggle(ui, &mut e.replace, "replace");
             }
@@ -1592,6 +1590,9 @@ pub struct ResultDialog {
     error: Option<(String, Option<String>)>,
     /// The group written before the first step, whatever came after.
     backup: Option<String>,
+    /// The run's warning (`Outcome::warning`: `backup <stamp> incomplete: …`), said in the
+    /// error colour in place of the backup's undo line.
+    warning: Option<String>,
 }
 
 fn result_id() -> egui::Id {
@@ -1599,19 +1600,27 @@ fn result_id() -> egui::Id {
 }
 
 impl ResultDialog {
-    /// The dialog of `outcome`, titled with the action; `None` when every step is done (the
-    /// status row then says what was done, [`status_text`]).
+    /// The dialog of `outcome`, titled with the action; `None` when every step is done and the
+    /// backup is whole (the status row then says what was done, [`status_text`]). A run whose
+    /// backup is incomplete (`Outcome::warning`) has its dialog too, the warning in place of the
+    /// undo line (S3-C).
     pub fn of(title: &str, outcome: &Outcome) -> Option<ResultDialog> {
+        let warning = outcome.warning().map(|w| mask_credentials(&w));
         let failed = outcome
             .steps
             .iter()
-            .find(|s| s.outcome == StepOutcome::Failed)?;
-        let done = failed
-            .ran
-            .iter()
-            .rev()
-            .find(|d| !d.ok())
-            .or(failed.ran.last());
+            .find(|s| s.outcome == StepOutcome::Failed);
+        if failed.is_none() && warning.is_none() {
+            return None;
+        }
+        let done = failed.and_then(|failed| {
+            failed
+                .ran
+                .iter()
+                .rev()
+                .find(|d| !d.ok())
+                .or(failed.ran.last())
+        });
         Some(ResultDialog {
             title: title.to_string(),
             steps: outcome
@@ -1624,6 +1633,7 @@ impl ResultDialog {
                 (mask_credentials(&d.error_text()), Some(line))
             }),
             backup: outcome.backup.clone(),
+            warning,
         })
     }
 
@@ -1635,6 +1645,7 @@ impl ResultDialog {
             steps: Vec::new(),
             error: Some((mask_credentials(text), command_line.map(mask_credentials))),
             backup: None,
+            warning: None,
         }
     }
 
@@ -1675,7 +1686,10 @@ impl ResultDialog {
                     ui.add(egui::Label::new(RichText::new(line.as_str()).weak()).wrap());
                 }
             }
-            if let Some(stamp) = &self.backup {
+            if let Some(warning) = &self.warning {
+                ui.add_space(chrome::CELL.y / 2.0);
+                ui.add(egui::Label::new(RichText::new(warning.as_str()).color(error)).wrap());
+            } else if let Some(stamp) = &self.backup {
                 ui.add_space(chrome::CELL.y / 2.0);
                 ui.label(backup_line(stamp));
             }

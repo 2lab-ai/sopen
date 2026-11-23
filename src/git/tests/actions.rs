@@ -2810,8 +2810,8 @@ fn g_s3_conflicts_and_the_banner() {
         let b = banner(&runner, &dir).expect("a banner");
         assert_eq!(b.state.operation, Some(Operation::Merge));
         assert_eq!(b.conflicts, 1);
-        assert!(b.text().starts_with("MERGE"), "{lane}: {}", b.text());
-        assert!(b.text().ends_with(" · 1 conflict"), "{lane}: {}", b.text());
+        // 03 §8.5's detail: the branch merged, from `MERGE_MSG`'s first line.
+        assert_eq!(b.text(), "MERGE of side · 1 conflict", "{lane}");
         assert_eq!(b.offers(), vec![Proceed::Continue, Proceed::Abort]);
         assert!(planned(&runner, &dir, &Action::Proceed(Proceed::Skip)).is_err());
         let (_, outcome) = run(
@@ -2839,7 +2839,12 @@ fn g_s3_conflicts_and_the_banner() {
         assert!(!fx.output(&dir, &["cherry-pick", &side]).status.success());
         let b = banner(&runner, &dir).unwrap();
         assert_eq!(b.state.operation, Some(Operation::CherryPick));
-        assert!(b.text().starts_with("CHERRY-PICK"), "{lane}: {}", b.text());
+        // The commit being picked, from `CHERRY_PICK_HEAD`.
+        assert_eq!(
+            b.text(),
+            format!("CHERRY-PICK {} · 1 conflict", &side[..8]),
+            "{lane}"
+        );
         assert_eq!(
             b.offers(),
             vec![Proceed::Continue, Proceed::Skip, Proceed::Abort]
@@ -2858,7 +2863,12 @@ fn g_s3_conflicts_and_the_banner() {
             .success());
         let b = banner(&runner, &dir).unwrap();
         assert_eq!(b.state.operation, Some(Operation::Revert));
-        assert!(b.text().starts_with("REVERT"), "{lane}: {}", b.text());
+        // The commit being reverted, from `REVERT_HEAD`.
+        assert_eq!(
+            b.text(),
+            format!("REVERT {} · 1 conflict", &main_commit[..8]),
+            "{lane}"
+        );
         let (plan, outcome) = proceed(&runner, &dir, Proceed::Skip);
         done(&lane, &outcome);
         has_line(&plan, "git revert --skip");
@@ -3020,7 +3030,58 @@ fn the_probe_parses_each_state() {
         state: both,
         conflicts: 0,
     };
-    assert_eq!(b.text(), "CHERRY-PICK\nBISECT · Reset");
+    assert_eq!(
+        b.text(),
+        "CHERRY-PICK\nBISECT · Reset",
+        "no head record: no detail"
+    );
+    // The operation's head (03 §8.5's detail): a merge names what it merges from `MERGE_MSG`
+    // (`MERGE of feature`; its commit when the message names none), a pick or a revert its
+    // commit; a head that is not hex is cut, never inside a character.
+    let detail = |records: &[&str]| {
+        Banner {
+            state: p(records),
+            conflicts: 0,
+        }
+        .text()
+    };
+    let oid = "0123456789abcdef0123456789abcdef01234567";
+    let head = format!("head {oid}");
+    assert_eq!(
+        detail(&[
+            "exists MERGE_HEAD",
+            &head,
+            "merge-msg Merge branch 'feature' into main"
+        ]),
+        "MERGE of feature"
+    );
+    assert_eq!(
+        detail(&[
+            "exists MERGE_HEAD",
+            &head,
+            "merge-msg Merge remote-tracking branch 'origin/x'"
+        ]),
+        "MERGE of origin/x"
+    );
+    assert_eq!(
+        detail(&["exists MERGE_HEAD", &head, "merge-msg a message of my own"]),
+        "MERGE of 01234567"
+    );
+    assert_eq!(
+        detail(&["exists CHERRY_PICK_HEAD", &head]),
+        "CHERRY-PICK 01234567"
+    );
+    assert_eq!(detail(&["exists REVERT_HEAD", &head]), "REVERT 01234567");
+    assert_eq!(
+        detail(&["exists REVERT_HEAD", "head aaaaaaaé"]),
+        "REVERT aaaaaaaé"
+    );
+    let merge = p(&["exists MERGE_HEAD", &head, "merge-msg Merge tag 'v1'"]);
+    assert_eq!(merge.head.as_ref().map(|h| h.commit.as_str()), Some(oid));
+    assert_eq!(
+        merge.head.as_ref().and_then(|h| h.merge_msg.as_deref()),
+        Some("Merge tag 'v1'")
+    );
     assert_eq!(
         b.offers(),
         vec![

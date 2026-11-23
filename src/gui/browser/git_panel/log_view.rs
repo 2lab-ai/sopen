@@ -10,10 +10,6 @@
 //! whole), Esc (`Back`) closes that, then the log. The log is in memory only and its lines are
 //! masked already (03 §3.7).
 
-// Nothing uses these screens until S3-C wires them into the panel (as `mod.rs`'s own
-// allowance says of S2-F); S3-C removes this line when it does.
-#![allow(dead_code)]
-
 use super::graph_view::printable;
 use super::Scroll;
 use crate::git::runner::LogEntry;

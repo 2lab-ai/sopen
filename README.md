@@ -179,7 +179,21 @@ viewer and read-only. Mark a commit (`Space`) and `F3` on another to compare the
 finds in the loaded rows, `⌘⇧F` searches the whole history, `⌘K` filters it (branches, remotes,
 tags, stashes, first parent, order), `⌘R` refreshes. `⌘G` pins the panel to its side: it stays
 while you move over files or go elsewhere; `Esc` unpins. It runs the host's own `git` (on a remote
-over the same ssh connection, nothing installed) and changes nothing in the repository yet.
+over the same ssh connection, nothing installed).
+
+Every Git Graph action is there too: `F10` (or `Shift+F10`, a right click) opens the menu of what
+is under the bar — a commit, the branch or tag label under the label cursor (`←` `→`), a stash,
+the uncommitted row or one of its files, the repository — and the F-keys keep their meaning: `F5`
+cherry-pick (on a stash: apply), `F6` rebase onto it, `F7` new branch (on the uncommitted row:
+commit), `F8` delete or discard, `F2` rename a branch; `Space` on a changed file stages or unstages
+it. Each action shows a dialog first that says exactly what changes, the backup refs it writes
+before anything rewrites or deletes (`refs/sopen-backup/<stamp>/…`) and the exact git command
+lines; `Enter` runs it, `Esc` cancels. A run shows its time on the status row (and, when git goes
+quiet, what it may be waiting for); `Esc` stops a fetch, and a write after 10 s, asking first.
+`⌘Z` undoes the newest backup written in this window (again: redo), `⌘B` lists every backup
+(restore, show, delete), `⌘L` shows the command log, `⌘⇧R` fetches all. While a merge, rebase,
+cherry-pick, revert or bisect is in progress the panel's top row says so (`MERGE of feature · 1
+conflict`), with its Continue (`⌘⇧C`), Skip (`⌘⇧S`), Abort (`⌘⇧A`) and bisect's Reset (`⌘⇧B`).
 
 `F10` shows the **directory tree** in place of the list: rooted at your home when the folder is
 under it, else at `/`, the bar on the folder you were in. Folders with few subfolders open by
@@ -214,6 +228,7 @@ keys that work there are labelled), cyan dialogs with a shadow.
 | `F9` | preview mode ↔ dual mode |
 | `⌘G` | pin the git panel to the other side (again, or `Esc`: unpin) |
 | in the git panel | `Enter` / `F3` details (one marked row: compare) · `Shift+F3` the file at that commit · a letter / `⌘F` find · `⌘⇧F` history search · `⌘K` filters · `⌘R` refresh · `⌘J` to HEAD · `⌘⇧G` over both sides · `Tab` back to the list · `Esc` closes the innermost thing |
+| actions in the git panel | `F10` / `Shift+F10` / right click the menu · `F5` pick · `F6` rebase · `F7` branch (uncommitted row: commit) · `F8` delete / discard · `F2` rename a branch · `Space` on a changed file stage / unstage · `⌘⇧R` fetch all · `⌘Z` undo · `⌘B` backups · `⌘L` command log · `⌘⇧C` / `⌘⇧S` / `⌘⇧A` continue / skip / abort, `⌘⇧B` bisect reset |
 | `F10` (or `Alt+F10`) | the directory tree; in it `→` / `←` open and close a folder, `Space` sizes a row now (`Esc` stops that), `⌘R` reads a row again, `Enter` lists the folder in the panel, `Esc` / `F10` close the tree |
 | `⌘R` · `⌘U` · `⌘←` / `⌘→` | re-read · swap the panels · this folder in the left / right panel |
 | `⌘1`…`⌘0`, or a click on the bottom row | `F1`…`F10` (Ctrl on Linux) |
