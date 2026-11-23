@@ -2506,8 +2506,9 @@ mod read_only_tests {
         }
     }
 
-    /// "Save to…" is off with the reason on hover, and Enter in its path field saves nothing:
-    /// the dialog says why.
+    /// A click on "Save to…" (off) saves nothing, and the save itself (`start_save`, where the
+    /// button and Enter in the path field both lead) refuses with the reason in the dialog's
+    /// notes. The hover text and the Enter key are not driven here.
     #[test]
     fn a_file_at_a_revision_has_no_save_to() {
         let saves = Arc::new(AtomicUsize::new(0));

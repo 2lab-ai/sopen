@@ -527,6 +527,16 @@ fn g_t2_shift_f3_on_an_image_shows_that_version_read_only() {
         .expect("the file under .revisions");
     let shown = image::open(&found).unwrap().to_rgb8();
     assert_eq!(shown.get_pixel(0, 0)[2], 10);
+    // Review 1.5: read where it is — nothing of it in the cache's mirror or its records, only
+    // under `.revisions`.
+    let elsewhere: Vec<_> = walk(&g.fx.cache)
+        .into_iter()
+        .filter(|p| p.ends_with("picture.png") && !p.starts_with(&revisions))
+        .collect();
+    assert!(
+        elsewhere.is_empty(),
+        "copies outside .revisions: {elsewhere:#?}"
+    );
 
     // Cmd/Ctrl+S saves nothing: the reason on the status row.
     g.cmd(Key::S);
@@ -1329,4 +1339,149 @@ fn a_soft_refresh_with_moved_refs_reads_the_loaded_pages_again() {
         hashes(git_view(&g)).len()
     );
     assert_eq!(git_view(&g).bar_row().map(git_panel::RowKey::of), bar);
+}
+
+/// Review 1.1: the window never waits for the git runner's connect (`ssh -G`, finding git): while
+/// a slow connect runs on detection's worker, `git_runner()` answers at once ("not yet") and the
+/// list's Cmd/Ctrl+R returns at once; once the connect ends, the panel comes.
+#[test]
+fn a_slow_git_connect_never_holds_the_window() {
+    let git = git_or_skip!();
+    let repo = small(&git);
+    let tmp = tempfile::tempdir().unwrap();
+    let entered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let release = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let local = repo.local();
+    let (e, r) = (entered.clone(), release.clone());
+    let connect: GitConnect = Arc::new(move || {
+        e.store(true, std::sync::atomic::Ordering::SeqCst);
+        // At most 5 s, so a window that does wait fails on time instead of hanging.
+        let t = Instant::now();
+        while !r.load(std::sync::atomic::Ordering::SeqCst) && t.elapsed() < Duration::from_secs(5) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        Ok(GitRunner::local(local.clone()))
+    });
+    let b = Browser::new(Start {
+        fs: Box::new(LocalFs::new()),
+        connect: local_connect(),
+        label: None,
+        destination: None,
+        abs: repo.top().to_string(),
+        cache: tmp.path().join("cache"),
+        state_dir: tmp.path().join("state"),
+        launch: Arc::new(|_: &str, _: bool| Ok(String::new())),
+        git: Some(connect),
+    });
+    let mut g = Gx {
+        repo,
+        fx: Fx {
+            _tmp: tmp,
+            root: String::new(),
+            cache: PathBuf::new(),
+            drv: Driver::new(1000.0, 700.0),
+            b,
+            launched: Arc::default(),
+        },
+    };
+    g.until("the connect running", |_| {
+        entered.load(std::sync::atomic::Ordering::SeqCst)
+    });
+    let t = Instant::now();
+    assert!(g.b().git_runner().is_none(), "not made yet");
+    assert!(
+        t.elapsed() < Duration::from_millis(100),
+        "{:?}",
+        t.elapsed()
+    );
+    let t = Instant::now();
+    g.cmd(Key::R);
+    assert!(
+        t.elapsed() < Duration::from_millis(1500),
+        "Cmd/Ctrl+R waited {:?}",
+        t.elapsed()
+    );
+    release.store(true, std::sync::atomic::Ordering::SeqCst);
+    g.wait_for_the_panel();
+}
+
+/// Review 1.2: a history search's parked stream ends at the hidden deadline even when the
+/// graph's stream has already ended (all loaded) — its worker goes, the host's slot is free —
+/// and its results stay, read again by the next page.
+#[test]
+fn a_hidden_search_ends_at_the_deadline_with_the_graph_all_loaded() {
+    let git = git_or_skip!();
+    let repo = fixture::big(&git, 1200);
+    repo.write("note.txt", "a file to put the bar on\n");
+    let mut g = Gx::new(repo);
+    g.fx.b.git.hidden_stream = Duration::from_millis(300);
+    g.wait_for_the_panel();
+    g.tab_into_git();
+    for _ in 0..4 {
+        g.key(Key::End);
+        pages_in(&mut g);
+    }
+    assert_eq!(
+        *git_view(&g).paging(),
+        Paging::AllLoaded,
+        "the graph all loaded"
+    );
+    assert!(g.panel().stream.as_ref().unwrap().ended);
+    g.with(Key::F, Modifiers::COMMAND | Modifiers::SHIFT);
+    g.idle(3);
+    g.fx.typed("^commit");
+    g.key(Key::Enter);
+    let top = g.top();
+    g.until("the first page of results", |b| {
+        let i = b.git.panel(&top).unwrap();
+        b.git.panels[i]
+            .search
+            .as_ref()
+            .is_some_and(|s| s.link.asked == 0)
+    });
+    let r = runner(&g);
+    assert_eq!(r.in_flight(), 1, "the search parked, holding its slot");
+    // Away from the panel: the bar on a file, the preview on the other side.
+    g.key(Key::Tab);
+    g.fx.select("note.txt");
+    g.rest();
+    assert!(matches!(&g.shown()[1], view::Content::Preview(_)));
+    g.until("the hidden search ended", |b| {
+        b.git.panels[0].search.is_none() && r.in_flight() == 0
+    });
+    assert!(g.panel().search_dropped.is_some());
+    assert_eq!(git_view(&g).search_rows(), 500, "its results stay");
+}
+
+/// Review 1.3: Esc while a file row's diff is on its way stops it, and a result that had come
+/// already — git ended, the window not yet told — opens no viewer.
+#[test]
+fn esc_drops_a_diff_that_came_before_it_was_heard() {
+    let git = git_or_skip!();
+    let mut g = Gx::new(small(&git));
+    g.wait_for_the_panel();
+    g.tab_into_git();
+    let file = g.repo.tmp.path().join("ready.diff");
+    std::fs::write(&file, "+ready\n").unwrap();
+    let handle = Handle::new();
+    let (tx, rx) = mpsc::channel();
+    g.panel_mut().reveal = Some(Pending {
+        rx,
+        handle: handle.clone(),
+    });
+    // git has ended and sent its result; the next pass would open it.
+    tx.send(Revealed::File {
+        file,
+        title: "ready".into(),
+        edit: g.top(),
+    })
+    .unwrap();
+    g.key(Key::Escape);
+    g.idle(3);
+    assert!(handle.is_stopped());
+    assert!(
+        g.b().viewer.is_none() && g.b().opening.is_none(),
+        "no viewer"
+    );
+    assert!(g.panel().reveal.is_none());
 }

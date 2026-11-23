@@ -982,6 +982,7 @@ impl Browser {
         let cancel = Arc::new(AtomicBool::new(false));
         let (tx, rx) = mpsc::channel();
         let remote = label.is_some();
+        let in_place = read_only.is_some();
         let cache = self.cache.clone();
         let (d, t, stop, waker, path) = (
             done.clone(),
@@ -1007,7 +1008,11 @@ impl Browser {
                 t.store(all, Ordering::Relaxed);
                 waker.request_repaint();
             };
-            let result = prepare::prepare(&req, &stop, &mut progress);
+            let result = if in_place {
+                prepare::prepare_in_place(&req, &stop, &mut progress)
+            } else {
+                prepare::prepare(&req, &stop, &mut progress)
+            };
             let _ = tx.send(result);
             waker.request_repaint();
         });
@@ -1142,8 +1147,8 @@ impl Browser {
                 self.git.detector.forget(&self.git.host, &dir);
                 self.git.detections.remove(&dir);
                 self.git.said.remove(&dir);
-                {
-                    let mut made = self.git.runner.lock().unwrap_or_else(|p| p.into_inner());
+                // On the frame: only if the lock is free at once (it is held for a store only).
+                if let Ok(mut made) = self.git.runner.try_lock() {
                     if made.as_ref().is_some_and(|r| r.is_err()) {
                         *made = None;
                     }
@@ -2646,6 +2651,7 @@ impl Window for Browser {
         // Before anything else this pass: did this frame's Esc take the keyboard from a field?
         let esc_was_a_fields = self.focused_before && ctx.memory(|m| m.focused()).is_none();
         self.play(&ctx);
+        self.git_stop_on_esc(&ctx);
         self.poll(&ctx);
         self.git_pass(&ctx);
         if self.tree.is_some() {
@@ -2862,6 +2868,8 @@ struct RepoPanel {
     /// panel's): shown again, a new one reads as many pages as were loaded.
     stream_dropped: bool,
     search: Option<SearchLink>,
+    /// A history search whose stream was ended while hidden: its next page runs it again.
+    search_dropped: Option<git_panel::SearchQuery>,
     details: Option<Pending<Details>>,
     /// The details the pane was last given (an untracked folder's files go into them).
     last_details: Option<Details>,
@@ -3266,7 +3274,11 @@ fn read_details(
                 Err(e) => return fail(details, e),
             }
             tell(details.clone());
-            details.contains = Some(history::contains(git, top, oid).unwrap_or_default());
+            // A failed read is said as such, never as "in no branch".
+            details.contains = Some(
+                history::contains(git, top, oid)
+                    .unwrap_or_else(|e| vec![format!("unavailable: {e}")]),
+            );
             tell(details);
         }
         Subject::Compare { from, to } => {
@@ -3626,8 +3638,14 @@ fn text_row(view: &GitView, i: usize) -> Option<String> {
 
 impl Browser {
     /// The runner, once the first detection's worker made it (never made on a frame).
+    /// Never waits: the lock is held only to read or store the result (the connect runs outside
+    /// it), and a moment it is held reads as "not ready yet".
     fn git_runner(&self) -> Option<GitRunner> {
-        let made = self.git.runner.lock().unwrap_or_else(|p| p.into_inner());
+        let made = match self.git.runner.try_lock() {
+            Ok(made) => made,
+            Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return None,
+        };
         made.as_ref().and_then(|r| r.as_ref().ok()).cloned()
     }
 
@@ -3716,9 +3734,16 @@ impl Browser {
         );
         let (waker, path) = (ctx.clone(), folder.clone());
         std::thread::spawn(move || {
-            let made = {
-                let mut cell = cell.lock().unwrap_or_else(|p| p.into_inner());
-                cell.get_or_insert_with(|| connect()).clone()
+            // The connect (`ssh -G`, finding git) runs outside the lock; the first result stored
+            // wins, a second worker's is dropped.
+            let known = cell.lock().unwrap_or_else(|p| p.into_inner()).clone();
+            let made = match known {
+                Some(made) => made,
+                None => {
+                    let fresh = connect();
+                    let mut cell = cell.lock().unwrap_or_else(|p| p.into_inner());
+                    cell.get_or_insert(fresh).clone()
+                }
             };
             let detection = match made {
                 Ok(runner) => detector.detect(&host, &path, &RunnerGit::new(runner, Handle::new())),
@@ -3768,10 +3793,20 @@ impl Browser {
                 continue;
             }
             let since = *p.hidden_since.get_or_insert(now);
-            if since.elapsed() >= hidden_stream && p.stream.as_ref().is_some_and(|s| !s.ended) {
+            if since.elapsed() < hidden_stream {
+                continue;
+            }
+            if p.stream.as_ref().is_some_and(|s| !s.ended) {
                 p.stream = None;
-                p.search = None;
                 p.stream_dropped = true;
+            }
+            // A history search's stream has the same deadline, whatever the graph's did: its
+            // results stay, and ↓ on their last row (or the foot) reads them again.
+            if let Some(search) = p.search.take_if(|s| !s.link.ended) {
+                let paging = Paging::Error("stopped while hidden; ↓ reads it again".into());
+                p.view
+                    .append_search_results(&search.query, Vec::new(), paging);
+                p.search_dropped = Some(search.query);
             }
         }
         // The least recently shown panel goes when a fourth is kept (its running reads stop).
@@ -3819,6 +3854,7 @@ impl Browser {
             stream: None,
             stream_dropped: false,
             search: None,
+            search_dropped: None,
             details: None,
             last_details: None,
             reveal: None,
@@ -4152,9 +4188,31 @@ impl Browser {
         }
     }
 
-    /// The git panel's keys (03 §9), through the key table's git context. Esc first stops
-    /// what the panel waits for (03 §3.4: reads stop on Esc) — a page, a history search's page,
-    /// a load's reads, a file row's diff or file — and only then walks the panel's chain.
+    /// Esc in the git panel, before anything that arrived is heard (03 §3.4: reads stop on Esc):
+    /// what the panel waits for — a page, a history search's page, a load's reads, a file row's
+    /// diff or file — is stopped, and a file row's result is dropped unread, so a diff whose git
+    /// had already ended opens no viewer. Only with nothing waited for is Esc the panel's chain.
+    fn git_stop_on_esc(&mut self, ctx: &egui::Context) {
+        if self.ops.holds_keyboard() || self.viewer.is_some() || self.tree.is_some() {
+            return;
+        }
+        let Some(i) = self.git_focused() else {
+            return;
+        };
+        let waiting = git_waiting(&self.git.panels[i]);
+        if waiting.is_empty()
+            || !ctx.input_mut(|inp| keys::take(inp, Key::Escape, keys::Mods::None))
+        {
+            return;
+        }
+        for handle in waiting {
+            handle.stop();
+        }
+        self.git.panels[i].reveal = None;
+        self.status = Status::info("stopped");
+    }
+
+    /// The git panel's keys (03 §9), through the key table's git context.
     fn git_keys(&mut self, ctx: &egui::Context) {
         if self.ops.holds_keyboard() {
             return;
@@ -4162,16 +4220,6 @@ impl Browser {
         let Some(i) = self.git_focused() else {
             return;
         };
-        let waiting = git_waiting(&self.git.panels[i]);
-        if !waiting.is_empty()
-            && ctx.input_mut(|inp| keys::take(inp, Key::Escape, keys::Mods::None))
-        {
-            for handle in waiting {
-                handle.stop();
-            }
-            self.status = Status::info("stopped");
-            return;
-        }
         // A key of the owner's: what was said before is old news.
         let pressed = ctx.input(|inp| {
             inp.events.iter().any(|e| {
@@ -4202,6 +4250,17 @@ impl Browser {
                 GitAction::MoreRows => self.more_rows(ctx, i),
                 GitAction::Search(query) => self.start_search(ctx, i, query),
                 GitAction::MoreResults => {
+                    let p = &mut self.git.panels[i];
+                    if p.search.is_none() {
+                        // Ended while hidden: run again, as many pages as were shown and one more.
+                        if let Some(query) = p.search_dropped.take() {
+                            if p.view.search() == Some(&query) {
+                                let shown = p.view.search_rows().div_ceil(history::PAGE);
+                                self.start_search_pages(ctx, i, query, shown + 1);
+                                continue;
+                            }
+                        }
+                    }
                     if let Some(s) = self.git.panels[i].search.as_mut() {
                         let link = &mut s.link;
                         if !link.ended && link.asked == 0 && link.ask.send(1).is_ok() {
@@ -4448,9 +4507,21 @@ impl Browser {
     /// History search (03 §4.7): `git log` with the query's options and the panel's revisions,
     /// paged like the graph.
     fn start_search(&mut self, ctx: &egui::Context, i: usize, query: git_panel::SearchQuery) {
+        self.start_search_pages(ctx, i, query, 1);
+    }
+
+    /// [`Browser::start_search`], reading `pages` pages at once.
+    fn start_search_pages(
+        &mut self,
+        ctx: &egui::Context,
+        i: usize,
+        query: git_panel::SearchQuery,
+        pages: usize,
+    ) {
         let Some(runner) = self.git_runner() else {
             return;
         };
+        self.git.panels[i].search_dropped = None;
         self.git.panels[i].search = None;
         self.make_room_for_a_stream(i);
         let p = &mut self.git.panels[i];
@@ -4495,8 +4566,8 @@ impl Browser {
             first: true,
             ended: false,
         };
-        if link.ask.send(1).is_ok() {
-            link.asked = 1;
+        if link.ask.send(pages).is_ok() {
+            link.asked = pages;
         }
         p.search = Some(SearchLink { query, link });
     }

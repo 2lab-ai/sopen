@@ -419,7 +419,9 @@ const OTHER_SIDE: &str = "The keyboard to the other side";
 const CLOSE_VIEWER: &str = "Back to the list";
 const DETAILS: &str = "The row's details (with one marked row: compare the two)";
 const MENU: &str = "The menu of what is under the bar";
-const MARK: &str = "Mark or unmark the row, then step down (files: stage, unstage)";
+/// S2's words; staging a file of the uncommitted row (Space there) comes with S3's actions, whose
+/// scaffold changes the row's words.
+const MARK: &str = "Mark or unmark the row, then step down";
 const BACK_TO_LIST: &str = "Back to the list";
 const CLOSE_TREE: &str = "Close the tree, the list as it was";
 

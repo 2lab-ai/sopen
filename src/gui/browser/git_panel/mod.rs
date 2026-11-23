@@ -590,6 +590,12 @@ impl GitView {
         }
     }
 
+    /// The rows of the history search shown (S2-F: a search ended while hidden reads as many
+    /// again).
+    pub fn search_rows(&self) -> usize {
+        self.search.as_ref().map_or(0, |s| s.rows.len())
+    }
+
     /// The history search shown, if any.
     pub fn search(&self) -> Option<&SearchQuery> {
         self.search.as_ref().map(|s| &s.query)

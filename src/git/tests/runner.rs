@@ -1492,9 +1492,11 @@ fn a_record_or_an_output_past_its_bound_is_stopped() {
     }
 }
 
-/// Review 1.4: a helper the command left behind holding stderr (a hook's background job) is
-/// ended with the command once its output has had its moment: `finish` returns, nothing of the
-/// group is left, and the stderr reader has let go of the pipe.
+/// Review 1.4: a helper the command left behind holding stderr (a hook's background job): once
+/// its output has had its moment `finish` returns and the stderr reader has let go of the pipe.
+/// Locally the group is ended with the command; remotely its leader has ended, so the group is
+/// never signalled by its number alone (S2-F review 1, 03 §3.5): the helper lives on (the
+/// test's `Group` ends it).
 #[test]
 fn a_helper_left_holding_stderr_is_ended_with_the_command() {
     let Some(fx) = fixture() else { return };
@@ -1518,7 +1520,14 @@ fn a_helper_left_holding_stderr_is_ended_with_the_command() {
         );
         assert_eq!(done.ending, Ending::Exit(0), "{lane}: {}", done.stderr);
         assert_eq!(done.stdout, b"done\n", "{lane}");
-        wait_for("the group gone", Duration::from_secs(2), || !group.alive());
+        if lane == "local" {
+            wait_for("the group gone", Duration::from_secs(2), || !group.alive());
+        } else {
+            assert!(
+                group.alive(),
+                "{lane}: its leader is gone, so its group is never signalled by number (03 §3.5)"
+            );
+        }
         assert!(
             reader_done(),
             "{lane}: the stderr reader still holds the pipe"
@@ -1526,9 +1535,11 @@ fn a_helper_left_holding_stderr_is_ended_with_the_command() {
     }
 }
 
-/// Review 1.5: a remote stop does not take the channel's end for the group's: a child that
-/// ignores `SIGTERM` and has closed its descriptors outlives the channel, and only the
-/// `kill -KILL -- -<pid>` sent after the grace ends it. Locally the group itself is watched.
+/// Review 1.5: a stop does not take the channel's end for the group's: a child that ignores
+/// `SIGTERM` and has closed its descriptors outlives the channel. Locally the group itself is
+/// watched and the `SIGKILL` after the grace ends it. Remotely its leader died at `SIGTERM`, so
+/// the group is not signalled by its number alone (S2-F review 1, 03 §3.5): the stop says it may
+/// still be running, and the child lives on (the test's `Group` ends it).
 #[test]
 fn a_stop_kills_a_child_that_ignores_term_and_left_the_channel() {
     let Some(fx) = fixture() else { return };
@@ -1560,12 +1571,24 @@ fn a_stop_kills_a_child_that_ignores_term_and_left_the_channel() {
         }
         handle.stop();
         let done = running.finish();
-        assert!(
-            matches!(&done.ending, Ending::Stopped(s) if s.killed),
-            "{lane}: {}",
-            done.ending
-        );
-        wait_for("the group gone", Duration::from_secs(2), || !group.alive());
+        if lane == "local" {
+            assert!(
+                matches!(&done.ending, Ending::Stopped(s) if s.killed),
+                "{lane}: {}",
+                done.ending
+            );
+            wait_for("the group gone", Duration::from_secs(2), || !group.alive());
+        } else {
+            assert_eq!(
+                done.ending,
+                Ending::StopSent { host: "box".into() },
+                "{lane}: a group left without its leader may still be running: stop sent"
+            );
+            assert!(
+                group.alive(),
+                "{lane}: its leader is gone, so its group is never signalled by number (03 §3.5)"
+            );
+        }
     }
 }
 
@@ -1721,8 +1744,10 @@ fn no_reader_outlives_a_helper_in_a_session_of_its_own() {
     }
 }
 
-/// Review 2.4: a stop that comes once the channel has ended still asks the group, and ends what
-/// is left of it: a child that ignores `SIGTERM` and closed its descriptors.
+/// Review 2.4: a stop that comes once the channel has ended. Locally what is left of the group
+/// — a child that ignores `SIGTERM` and closed its descriptors — is ended. Remotely the leader
+/// has exited, so nothing is signalled by the number (S2-F review 1, 03 §3.5): the group is only
+/// asked, and the stop says it may still be running (the test's `Group` ends the child).
 #[test]
 fn a_stop_after_the_channel_ended_still_ends_what_is_left() {
     let Some(fx) = fixture() else { return };
@@ -1754,18 +1779,30 @@ fn a_stop_after_the_channel_ended_still_ends_what_is_left() {
         std::thread::sleep(Duration::from_millis(500));
         handle.stop();
         let done = running.finish();
-        assert!(
-            matches!(&done.ending, Ending::Stopped(s) if s.killed),
-            "{lane}: {}",
-            done.ending
-        );
-        wait_for("the group gone", Duration::from_secs(2), || !group.alive());
+        if lane == "local" {
+            assert!(
+                matches!(&done.ending, Ending::Stopped(s) if s.killed),
+                "{lane}: {}",
+                done.ending
+            );
+            wait_for("the group gone", Duration::from_secs(2), || !group.alive());
+        } else {
+            assert_eq!(
+                done.ending,
+                Ending::StopSent { host: "box".into() },
+                "{lane}: a group left without its leader may still be running: stop sent"
+            );
+            assert!(
+                group.alive(),
+                "{lane}: its leader is gone, so its group is never signalled by number (03 §3.5)"
+            );
+        }
     }
 }
 
 /// Review 2.5: `SIGKILL` goes only to a group the probe just before it found alive — after a
-/// stop whose `SIGTERM` ended everything, and in the cleanup after a command whose leftover is
-/// not in its group, only `kill -0` is sent.
+/// stop whose `SIGTERM` ended everything only `-TERM` and `-0` sessions run; and the cleanup
+/// after a command (its leader ended) runs no session at all (S2-F review 1: never by number).
 #[test]
 fn kill_goes_only_to_a_group_found_alive() {
     let Some(fx) = fixture() else { return };
@@ -1801,9 +1838,8 @@ fn kill_goes_only_to_a_group_found_alive() {
     let _helper = left_process(&pid_file);
     assert_eq!(done.ending, Ending::Exit(0));
     let sent = faults.signals.lock().unwrap().clone();
-    assert_eq!(
-        sent,
-        ["-0"],
-        "the cleanup asks first, and the group is gone"
+    assert!(
+        sent.is_empty(),
+        "the cleanup after the leader ended signals nothing by number (03 §3.5): {sent:?}"
     );
 }

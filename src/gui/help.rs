@@ -468,10 +468,7 @@ mod tests {
             ("↑, ↓, PgUp, PgDn, Home, End", "Move the bar"),
             ("←", "The label cursor to the previous label"),
             ("→", "The label cursor to the next label"),
-            (
-                "Space, Ins",
-                "Mark or unmark the row, then step down (files: stage, unstage)",
-            ),
+            ("Space, Ins", "Mark or unmark the row, then step down"),
             ("Tab, Shift+Tab", "Back to the list"),
             ("Esc", "Close the innermost open thing; with none, unpin"),
             ("a letter", "Find, starting with it"),
@@ -496,6 +493,10 @@ mod tests {
             .unwrap()
             .what
             .starts_with("Switch to dual mode"));
+        assert!(
+            page.lines.iter().all(|l| !l.what.contains("stage")),
+            "staging is S3's: {page:#?}"
+        );
         let all: Vec<&str> = page.lines.iter().map(|l| l.keys.as_str()).collect();
         for later in [
             "F2",
