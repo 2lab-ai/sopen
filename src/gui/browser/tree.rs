@@ -7,16 +7,14 @@
 //! per drawn row, the bar and the status row's words. The integration (S5-C) builds the rows from
 //! the model, reads the keys with [`keys`] before the pass draws, draws with [`draw`] and carries
 //! out the [`TreeAction`]s both give. The bar is the view's: its keys, the letters and a click
-//! move it here and ask nothing of the model.
-//!
-//! Nothing uses it until S5-C; the `dead_code` allowance below goes then, as a hand-over declared
-//! with it (this file is S5-B's).
-#![allow(dead_code)]
+//! move it here and ask nothing of the model. The browser (`Browser::tree_pass`) is that
+//! integration: it maps [`crate::tree::Row`]s to [`TreeRow`]s every pass.
 
 use super::keys::{self, Command, Context, Mods, Step, Trigger};
 use crate::gui::chrome::tree::{self as look, LOOK};
 use crate::gui::chrome::{self, FKey};
 use crate::gui::Status;
+use crate::tree as model;
 use eframe::egui::{self, Color32, Pos2, Rect, Sense, Vec2};
 use std::time::Duration;
 
@@ -225,10 +223,32 @@ impl TreeView {
     }
 
     /// The rows the last pass drew (empty before the first): what 05 §6.3's phases 2 and 3
-    /// read around.
+    /// read around (the browser tells the model `top` and [`TreeView::height`]).
+    #[cfg_attr(not(test), allow(dead_code))] // Only the tests use it.
     pub fn on_screen(&self) -> std::ops::Range<usize> {
         let end = self.top.saturating_add(self.visible).min(self.rows.len());
         self.top.min(end)..end
+    }
+
+    /// The rows the last pass had room for (0 before the first): the screen's height the model
+    /// is told (`crate::tree::Tree::view`).
+    pub fn height(&self) -> usize {
+        self.visible
+    }
+
+    /// The next pass puts the bar's row in the middle again, as the first pass with rows did
+    /// (rows that opened by themselves above it since, 05 §5).
+    pub fn centre(&mut self) {
+        self.center = true;
+    }
+
+    /// Puts the bar on the row `id` names, scrolled into view by the next pass (← on a closed
+    /// row: its parent's, as the model names it); nothing when no row has it.
+    pub fn put_bar(&mut self, id: usize) {
+        if let Some(at) = self.rows.iter().position(|r| r.id == id) {
+            self.bar = at;
+            self.moved = true;
+        }
     }
 
     /// The status row while the tree is shown: what the whole tree says; else, the bar on a
@@ -367,17 +387,6 @@ impl TreeView {
     }
 }
 
-/// The slice the tree lands with (02 §8.1).
-const SLICE: u8 = 5;
-
-/// The key table's rows the tree reads: up to its own slice — landed whenever the tree is on
-/// screen, F10 being one of its rows — whatever [`keys::LANDED`] says yet; later slices' too.
-const UPTO: u8 = if keys::LANDED > SLICE {
-    keys::LANDED
-} else {
-    SLICE
-};
-
 /// What the status row says while nothing else is to be said.
 const HINT: &str =
     "Enter list it · → open · ← close · Space size it · a letter jumps · Esc back · F1 the keys";
@@ -403,7 +412,7 @@ const COUNTED: usize = 48;
 /// in order: each carried out on the view, what is left for the model returned.
 pub fn keys(ctx: &egui::Context, view: &mut TreeView) -> Vec<TreeAction> {
     let mut asked = Vec::new();
-    while let Some(command) = ctx.input_mut(|i| keys::find(&mut i.events, Context::Tree, UPTO)) {
+    while let Some(command) = ctx.input_mut(|i| keys::lookup(i, Context::Tree)) {
         asked.extend(view.run(command));
     }
     asked
@@ -412,7 +421,7 @@ pub fn keys(ctx: &egui::Context, view: &mut TreeView) -> Vec<TreeAction> {
 /// The tree's F-key row (05 §1): the key table's plain F-keys of the tree context, by number —
 /// `1Help` and `10Tree`.
 pub fn fkeys() -> Vec<FKey> {
-    let mut row: Vec<FKey> = keys::rows(Context::Tree, UPTO)
+    let mut row: Vec<FKey> = keys::rows(Context::Tree, keys::LANDED_SLICES)
         .filter_map(|r| match r.trigger {
             Trigger::Key(key, Mods::None) if !r.label.is_empty() => {
                 chrome::fkey_number(key).map(|n| FKey { n, label: r.label })
@@ -623,10 +632,10 @@ pub fn draw(ui: &mut egui::Ui, rect: Rect, view: &mut TreeView, active: bool) ->
             ui.scope_id().with(("sopen-tree", at)),
             Sense::click(),
         );
-        if resp.double_clicked() {
-            clicked = Some((at, true));
-        } else if resp.clicked() {
-            clicked = Some((at, false));
+        if resp.clicked() {
+            // The row by its id: rows come and go above it between two clicks (05 §6.3).
+            let pair = egui::Id::unique(("sopen-tree-row", row.id));
+            clicked = Some((at, super::second_click(&resp, pair)));
         }
     }
     // The scroll bar on the right border, beside the rows.
@@ -654,6 +663,98 @@ pub fn draw(ui: &mut egui::Ui, rect: Rect, view: &mut TreeView, active: bool) ->
         }
     }
     asked
+}
+
+/// The view's id of a model row (S5-C's mapping): a folder's id doubled, its `· N hidden folders`
+/// row's one more — stable while the tree is open, as the model's ids are.
+pub fn view_id(id: model::RowId) -> usize {
+    match id {
+        model::RowId::Folder(n) => (n as usize) << 1,
+        model::RowId::Hidden(n) => (n as usize) << 1 | 1,
+    }
+}
+
+/// The model's row of a view id ([`view_id`]'s inverse).
+pub fn model_id(id: usize) -> model::RowId {
+    let n = (id >> 1) as u32;
+    if id & 1 == 0 {
+        model::RowId::Folder(n)
+    } else {
+        model::RowId::Hidden(n)
+    }
+}
+
+/// A model row as the view draws it (05 §3, §6.1). `fs`: the filesystem figure last seen of a
+/// boundary row — the model gives it only until a scan gives the folder's own size, and the
+/// status row goes on saying it while the bar is there.
+pub fn view_row(row: &model::Row, fs: Option<u64>) -> TreeRow {
+    let i = &row.info;
+    let (size, scanning, used) = match i.size {
+        model::Size::Unknown => (Size::Unknown, false, None),
+        model::Size::Bytes {
+            bytes,
+            more,
+            cached,
+            scanning,
+        } => (
+            Size::Bytes {
+                n: bytes,
+                more,
+                cached,
+            },
+            scanning,
+            None,
+        ),
+        model::Size::Fs { used_bytes } => (Size::Unknown, false, Some(used_bytes)),
+        model::Size::Tag(tag) => (Size::Tag(tag_of(tag)), false, None),
+    };
+    let count = |c: Option<model::Count>| {
+        c.map(|c| Count {
+            n: c.n,
+            more: c.more,
+        })
+    };
+    TreeRow {
+        id: view_id(row.id),
+        depth: row.depth,
+        name: row.name.clone(),
+        kind: match row.kind {
+            model::RowKind::Folder => RowKind::Folder,
+            model::RowKind::Link => RowKind::Link,
+            model::RowKind::Hidden(n) => RowKind::Hidden(n),
+        },
+        fold: match row.glyph {
+            model::Glyph::Open if row.auto => Fold::AutoOpened,
+            model::Glyph::Open => Fold::Open,
+            model::Glyph::None => Fold::Leaf,
+            model::Glyph::Closed | model::Glyph::Link => Fold::Closed,
+        },
+        hidden: row.dimmed,
+        // R3 (the model reads its filesystem's used files there); R7 is its `<SYSVOL>` tag.
+        boundary: i.fs_files.is_some(),
+        info: Info {
+            dirs: count(i.dirs),
+            files: count(i.files),
+            size,
+            fs: i
+                .fs_files
+                .zip(used.or(fs))
+                .map(|(files, bytes)| FsUse { bytes, files }),
+            scanning,
+        },
+    }
+}
+
+fn tag_of(tag: model::Tag) -> Tag {
+    match tag {
+        model::Tag::Link => Tag::Link,
+        model::Tag::Sys => Tag::Sys,
+        model::Tag::Net => Tag::Net,
+        model::Tag::Auto => Tag::Auto,
+        model::Tag::SysVol => Tag::SysVol,
+        model::Tag::Unreadable => Tag::Unreadable,
+        model::Tag::NotAnswering => Tag::NotAnswering,
+    }
 }
 
 #[cfg(test)]

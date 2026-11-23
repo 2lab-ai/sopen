@@ -10,8 +10,11 @@
 //! active list previews the file under its bar ([`view`] decides what each side shows,
 //! [`preview`] hosts the preview); in dual mode both sides are lists. F2 renames the entry under
 //! the bar, F5 copies and F6 moves the selection or that entry to the other panel's folder,
-//! never over anything ([`ops`], on [`crate::fileops`]'s engine; 04 §5). Every key is a row of
-//! the one key table ([`keys`]).
+//! never over anything ([`ops`], on [`crate::fileops`]'s engine; 04 §5). F10 (or Alt+F10) shows
+//! the directory tree in place of the active list (05; [`crate::tree`] is its model on a worker of
+//! its own, [`tree`] its view), the other side frozen as it was (02 §3.1 O4) until Enter lists the
+//! tree's folder in the panel or Esc / F10 closes it. Every key is a row of the one key table
+//! ([`keys`]).
 //!
 //! Every way out of a viewer — Esc, F3, closing the window — goes through the viewer's own
 //! [`Window::close_requested`], so its unsaved-changes prompt and its running saves are honoured
@@ -37,6 +40,7 @@ use super::chrome::{self, FKey};
 use super::{help, Embedded, Hooks, Outcome, Status, Window};
 use crate::fileops::{self, Item, ItemOutcome, Report};
 use crate::remote::ops::FileOps;
+use crate::remote::treefs::TreeFs;
 use crate::remote::{EntryKind, LocalFs, RemoteFs, SftpRemote};
 use anyhow::{bail, Result};
 use eframe::egui::{self, Key, Modifiers, Pos2, Rect, Sense, Vec2};
@@ -44,7 +48,7 @@ use keys::{Command, Context, Step};
 pub use panel::Panel;
 use prepare::Prepared;
 use std::cell::RefCell;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -168,6 +172,49 @@ fn ops_connect(state_dir: PathBuf) -> OpsConnect {
             &state_dir,
         )?)),
     })
+}
+
+/// Makes the tree's worker and names the account `~<user>` is (05 §2, §6.4), on a thread of its
+/// own: a remote one connects.
+pub(crate) type TreeConnect = Arc<dyn Fn() -> Result<TreeWorker> + Send + Sync>;
+
+/// The tree's worker and the account `~<user>` is (`None`: the home is `realpath(".")`).
+pub(crate) type TreeWorker = (Box<dyn TreeFs>, Option<String>);
+
+/// The tree's worker as the window's own connection is made: this machine's disk on the
+/// watchdog pool (05 §6.2), or the tree's own SFTP session to the host over its ssh master (05
+/// §6.4: a deep scan never queues behind the panel's listing), which the worker renews through
+/// a fresh one once handles may have been left open on the server.
+fn tree_connect(label: Option<String>, state_dir: PathBuf) -> TreeConnect {
+    Arc::new(move || match label.as_deref() {
+        None => Ok((LocalFs::tree(), None)),
+        Some(label) => {
+            let spec = host_spec(label)?;
+            let user = spec.user.clone().or_else(|| ssh_user(&spec.destination()));
+            let conn = SftpRemote::connect(&spec, &state_dir)?;
+            let state_dir = state_dir.clone();
+            let renew = Box::new(move || SftpRemote::connect(&spec, &state_dir).ok());
+            Ok((Box::new(conn).into_tree_renewing(renew), user))
+        }
+    })
+}
+
+/// The account `ssh -G` names for `dest` (05 §6.4: whose home `~<user>` is); `None` when ssh
+/// cannot say. Nothing goes over the network.
+fn ssh_user(dest: &str) -> Option<String> {
+    let out = std::process::Command::new("ssh")
+        .arg("-G")
+        .arg(dest)
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()
+        .filter(|out| out.status.success())?;
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .find_map(|line| line.strip_prefix("user "))
+        .map(|user| user.trim().to_string())
+        .filter(|user| !user.is_empty())
 }
 
 /// The browser's dialogs on [`fileops`]' engine: an [`ops::Run`] that runs the job on the
@@ -396,6 +443,60 @@ struct Viewer {
     switch: Option<super::image::HexSwitch>,
 }
 
+/// The directory tree on the side that had the keyboard when F10 was pressed (05; 02 §3.1
+/// `Content::Tree`): its model on a worker of its own, the view it is drawn from, and what the
+/// other side showed then (O4).
+struct TreeSide {
+    side: usize,
+    /// The panel's folder as F10 found it (05 §2 resolves it).
+    folder: String,
+    /// What the other side showed when the tree opened, with its identity (02 §3.1
+    /// `tree_snapshot`): shown, unchanged, until the tree closes.
+    snapshot: view::Content,
+    model: TreeModel,
+    view: tree::TreeView,
+    /// The rows have been given to the view once (its first pass with rows centres the bar).
+    rows_given: bool,
+    /// 05 §5 has run to its end since: the bar was centred again then.
+    built_seen: bool,
+    /// What the model was last told of the screen (`top`, `height`, the bar's row).
+    told: Option<(usize, usize, Option<crate::tree::RowId>)>,
+    /// Enter on a link: its row as the status row names it, and its target being resolved on
+    /// the browser's connection.
+    target: Option<(String, Receiver<Result<String>>)>,
+    /// What the tree says on its status row until the next key (a link whose target does not
+    /// resolve).
+    said: Option<Status>,
+    /// The filesystem figure each boundary row showed last (the status row keeps it once a
+    /// scan replaces the size, 05 §6.1).
+    fs_seen: HashMap<crate::tree::RowId, u64>,
+}
+
+/// The tree's model, once its worker is made (a remote one connects first).
+enum TreeModel {
+    Connecting(Receiver<Result<TreeWorker>>),
+    Open(Box<crate::tree::Tree>),
+}
+
+impl TreeSide {
+    /// Nothing is on its way that a receipt waits for: the rows are on screen, 05 §5 has run to
+    /// its end (or the tree has said why it has none), no link is being resolved. Listings
+    /// further away and scans go on (`~/Library` and tag rows never get counts).
+    fn settled(&self) -> bool {
+        match &self.model {
+            TreeModel::Connecting(_) => false,
+            TreeModel::Open(model) => {
+                self.target.is_none()
+                    && (model.error().is_some() || model.built() && self.told.is_some())
+            }
+        }
+    }
+}
+
+/// The rows the tree has room for beyond the list's: it has no column heads, rule or foot (its
+/// 05 §5 budget E is the rows it shows).
+const TREE_ROWS_OVER_LIST: usize = 3;
+
 /// What a viewer's close leads to: back to the list (Esc, F3), or the window closing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Exit {
@@ -550,6 +651,12 @@ pub(crate) struct Browser {
     /// by before the next (a field opened by one takes the typing on the pass after).
     script: VecDeque<Play>,
     script_gap: u8,
+    /// The directory tree, while it is open (F10, 05).
+    tree: Option<TreeSide>,
+    /// Makes the tree's worker (05 §6.4).
+    tree_connect: TreeConnect,
+    /// The tree's host as its per-process cache knows it: empty on this machine, else `label`.
+    tree_host: String,
 }
 
 impl Drop for Browser {
@@ -579,6 +686,22 @@ fn list_id() -> egui::Id {
     egui::Id::unique("sopen-browser-list")
 }
 
+/// Whether a click (`resp.clicked()`) is the second of a double click on the row `row` names,
+/// which opens it — in the list and in the tree. egui's count says the click came within its
+/// double-click time and distance of the one before; that one must have been on the same row.
+/// egui alone counts a click on one row and then a double click on another as a triple click
+/// (its count checks the earlier clicks' times, not their places), so its `double_clicked`
+/// misses the second row's double click. A click that opened starts no pair.
+fn second_click(resp: &egui::Response, row: egui::Id) -> bool {
+    let quick = resp.double_clicked() || resp.triple_clicked();
+    let last = egui::Id::unique("sopen-browser-last-row-click");
+    resp.ctx.data_mut(|d| {
+        let opens = quick && d.get_temp::<egui::Id>(last) == Some(row);
+        d.insert_temp(last, if opens { egui::Id::NULL } else { row });
+        opens
+    })
+}
+
 /// The keys the status row names when nothing else is to be said.
 const LIST_HINT: &str =
     "Enter open · Tab other panel · Backspace up · a letter jumps to a name · F1 the keys";
@@ -597,6 +720,8 @@ impl Browser {
             start.label.clone(),
             start.cache.clone(),
         );
+        let tree_connect = tree_connect(start.label.clone(), start.state_dir.clone());
+        let tree_host = start.label.clone().unwrap_or_default();
         let mut browser = Self {
             title: show(start.label.as_deref(), &start.abs),
             label: start.label,
@@ -634,6 +759,9 @@ impl Browser {
             open_loading: false,
             script: VecDeque::new(),
             script_gap: 0,
+            tree: None,
+            tree_connect,
+            tree_host,
         };
         browser.list(None, start.abs, None, None);
         browser
@@ -655,6 +783,14 @@ impl Browser {
     #[cfg(test)]
     fn set_ops_run(&mut self, run: ops::Run) {
         self.ops = ops::Ops::new(run);
+    }
+
+    /// Tests: the tree's worker made by `connect`, its per-process cache keyed by `host` (a
+    /// test's own, so no other test's home is taken for it).
+    #[cfg(test)]
+    fn set_tree_connect(&mut self, connect: TreeConnect, host: &str) {
+        self.tree_connect = connect;
+        self.tree_host = host.to_string();
     }
 
     /// Lists `dir` on a worker for `panel` (`None`: both), the bar then on `select`.
@@ -840,6 +976,7 @@ impl Browser {
                 // The keyboard goes with its list.
                 self.active = 1 - active;
             }
+            Command::Tree => self.open_tree(ctx),
             Command::SameFolder(side) => {
                 let to = match side {
                     keys::Side::Left => 0,
@@ -1369,6 +1506,291 @@ impl Browser {
         self.list(Some(self.active), parent, Some(name), Some(ctx));
     }
 
+    /// F10, Alt+F10 (05 §1): the tree in place of the active list, its worker made on a thread
+    /// (a remote one connects); the other side keeps what it shows (O4). It commits at once.
+    fn open_tree(&mut self, ctx: &egui::Context) {
+        let side = self.active;
+        let folder = self.panels[side].dir.clone();
+        let snapshot = self
+            .shown
+            .as_ref()
+            .map_or(view::Content::List, |shown| shown[1 - side].clone());
+        let (tx, rx) = mpsc::channel();
+        let (connect, waker) = (self.tree_connect.clone(), ctx.clone());
+        std::thread::spawn(move || {
+            // A tree closed meanwhile drops what comes, and with it the worker (it closes).
+            let _ = tx.send(connect());
+            waker.request_repaint();
+        });
+        let title = show(self.label.as_deref(), &folder);
+        self.tree = Some(TreeSide {
+            side,
+            folder,
+            snapshot,
+            model: TreeModel::Connecting(rx),
+            view: tree::TreeView::new(title, Vec::new(), 0),
+            rows_given: false,
+            built_seen: false,
+            told: None,
+            target: None,
+            said: None,
+            fs_seen: HashMap::new(),
+        });
+        self.status = Status::default();
+        self.moved_at = None;
+    }
+
+    /// Closes the tree (Esc, F10, Enter): every listing and scan stops, nothing is waited for;
+    /// the side shows its list as it was and the other side follows the rules again, at once.
+    fn close_tree(&mut self) {
+        if let Some(TreeModel::Open(mut model)) = self.tree.take().map(|t| t.model) {
+            model.close();
+        }
+        self.moved_at = None;
+    }
+
+    /// The tree's pass before the sides are drawn (05 §1): its worker once made, the model's
+    /// answers and its rows given to the view, a link's target resolved for Enter, then the
+    /// tree's keys — none while a file operation's dialog has the keyboard.
+    fn tree_pass(&mut self, ctx: &egui::Context) {
+        let Some(t) = self.tree.as_mut() else {
+            return;
+        };
+        let mut failed = None;
+        if let TreeModel::Connecting(rx) = &t.model {
+            match rx.try_recv() {
+                Ok(Ok((fs, user))) => {
+                    let params = crate::tree::Params {
+                        e: self.visible + TREE_ROWS_OVER_LIST,
+                        ..Default::default()
+                    };
+                    let mut model = crate::tree::Tree::open(
+                        fs,
+                        crate::tree::Open {
+                            host: self.tree_host.clone(),
+                            folder: t.folder.clone(),
+                            user,
+                            params,
+                        },
+                    );
+                    let waker = ctx.clone();
+                    model.set_wake(crate::remote::Wake::new(move || waker.request_repaint()));
+                    t.model = TreeModel::Open(Box::new(model));
+                }
+                Ok(Err(e)) => failed = Some(format!("{e:#}")),
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => {
+                    failed = Some("its worker stopped without a result".to_string())
+                }
+            }
+        }
+        let mut went = None;
+        if let TreeModel::Open(model) = &mut t.model {
+            model.poll();
+            if let Some(why) = model.error() {
+                failed = Some(why.to_string());
+            } else if model.ready() {
+                let rows = model
+                    .rows()
+                    .iter()
+                    .map(|row| {
+                        if let crate::tree::Size::Fs { used_bytes } = row.info.size {
+                            t.fs_seen.insert(row.id, used_bytes);
+                        }
+                        tree::view_row(row, t.fs_seen.get(&row.id).copied())
+                    })
+                    .collect::<Vec<_>>();
+                if t.rows_given {
+                    t.view.set_rows(rows);
+                } else {
+                    // The first rows: the bar on the panel's folder, its row in the middle.
+                    let bar = model
+                        .current()
+                        .and_then(|id| rows.iter().position(|r| r.id == tree::view_id(id)))
+                        .unwrap_or(0);
+                    let title = model.title().unwrap_or_else(|| t.view.title.clone());
+                    t.view = tree::TreeView::new(title, rows, bar);
+                    t.rows_given = true;
+                }
+                if model.built() && !t.built_seen {
+                    // The folders 05 §5 opened since the first frame may have put rows above the
+                    // bar: its row goes back to the middle (05 §1) — unless the owner moved it.
+                    t.built_seen = true;
+                    let current = model.current().map(tree::view_id);
+                    if t.view.bar_row().map(|r| r.id) == current {
+                        t.view.centre();
+                    }
+                }
+            }
+            t.view.status = model.status().map(Status::error);
+        }
+        // Enter on a link: its target, once resolved, is listed; one that does not resolve is
+        // said, and the tree stays.
+        if let Some((shown, rx)) = &t.target {
+            match rx.try_recv() {
+                Ok(Ok(path)) => went = Some(path),
+                Ok(Err(e)) => {
+                    t.said = Some(Status::error(format!(
+                        "{shown}: the link's target cannot be reached: {e:#}"
+                    )));
+                }
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => {
+                    t.said = Some(Status::error(format!(
+                        "{shown}: its target was not resolved"
+                    )));
+                }
+            }
+            if went.is_some() || t.said.is_some() {
+                t.target = None;
+            }
+        }
+        if let Some(why) = failed {
+            self.close_tree();
+            self.status = Status::error(format!("the tree cannot open: {why}"));
+            return;
+        }
+        if let Some(path) = went {
+            self.tree_outcome(ctx, tree::TreeOutcome::GoTo(path));
+            return;
+        }
+        if self.ops.holds_keyboard() {
+            return;
+        }
+        let Some(t) = self.tree.as_mut() else {
+            return;
+        };
+        // Esc first stops an owner's whole listing or Space's scan (05 §6.3); else it closes the
+        // tree, as F10 does.
+        if let TreeModel::Open(model) = &mut t.model {
+            if model.owner_busy() && ctx.input_mut(|i| keys::take(i, Key::Escape, keys::Mods::None))
+            {
+                model.stop_owner();
+                t.said = None;
+            }
+        }
+        let actions = tree::keys(ctx, &mut t.view);
+        self.tree_actions(ctx, actions);
+    }
+
+    /// Carries out what the tree's keys and clicks ask of the model (05 §1).
+    fn tree_actions(&mut self, ctx: &egui::Context, actions: Vec<tree::TreeAction>) {
+        use tree::TreeAction as A;
+        for action in actions {
+            let Some(t) = self.tree.as_mut() else {
+                return;
+            };
+            t.said = None;
+            let TreeModel::Open(model) = &mut t.model else {
+                // The worker is still being made: only F1 and closing act.
+                match action {
+                    A::Help => help::open(ctx, help::for_context(Context::Tree, self.mode, &[])),
+                    A::Close => self.close_tree(),
+                    _ => {}
+                }
+                continue;
+            };
+            match action {
+                A::Help => help::open(ctx, help::for_context(Context::Tree, self.mode, &[])),
+                A::Close => self.close_tree(),
+                A::GoTo(id) => self.tree_go_to(ctx, id),
+                A::Expand(id) => {
+                    model.expand(tree::model_id(id));
+                }
+                A::Collapse(id) => {
+                    if let Some(parent) = model.collapse(tree::model_id(id)) {
+                        t.view.put_bar(tree::view_id(parent));
+                    }
+                }
+                A::SizeNow(id) => model.size_now(tree::model_id(id)),
+                A::Reread(id) => model.reread(tree::model_id(id)),
+                // Done in the view: the bar is on the next row starting with it.
+                A::Jump(_) => {}
+            }
+        }
+    }
+
+    /// Enter on a row (05 §1): its folder — a chain's last — is listed in the panel and the tree
+    /// closes; a link's target is resolved first, on the browser's connection, and a target that
+    /// no longer resolves is said (the model drops that answer).
+    fn tree_go_to(&mut self, ctx: &egui::Context, id: usize) {
+        let Some(t) = self.tree.as_mut() else {
+            return;
+        };
+        let TreeModel::Open(model) = &mut t.model else {
+            return;
+        };
+        let row = tree::model_id(id);
+        let link = t
+            .view
+            .rows
+            .iter()
+            .any(|r| r.id == id && r.kind == tree::RowKind::Link);
+        if !link {
+            if let Some(path) = model.enter(row) {
+                self.tree_outcome(ctx, tree::TreeOutcome::GoTo(path));
+            }
+            return;
+        }
+        let Some(path) = model
+            .rows()
+            .into_iter()
+            .find(|r| r.id == row)
+            .map(|r| r.path)
+        else {
+            return;
+        };
+        let waker = ctx.clone();
+        let (tx, rx) = mpsc::channel();
+        let conn = self.conn.clone();
+        let wanted = path.clone();
+        std::thread::spawn(move || {
+            let mut fs = conn.lock().unwrap_or_else(|p| p.into_inner());
+            let _ = tx.send(fs.realpath(&wanted));
+            waker.request_repaint();
+        });
+        t.target = Some((show(self.label.as_deref(), &path), rx));
+    }
+
+    /// What the tree hands the browser (02 §7): Enter's folder is listed in the tree's panel,
+    /// and the tree closes.
+    fn tree_outcome(&mut self, ctx: &egui::Context, outcome: tree::TreeOutcome) {
+        let Some(side) = self.tree.as_ref().map(|t| t.side) else {
+            return;
+        };
+        match outcome {
+            tree::TreeOutcome::GoTo(path) => {
+                self.close_tree();
+                self.list(Some(side), path, None, Some(ctx));
+            }
+        }
+    }
+
+    /// The tree's side: the view drawn (its clicks carried out), then the model told what is on
+    /// screen when that changed — phase 2 lists around it, phase 3 sizes on it (05 §6.3).
+    fn tree_ui(&mut self, ui: &mut egui::Ui, i: usize, rect: Rect) {
+        let Some(t) = self.tree.as_mut() else {
+            self.panel_ui(ui, i, rect);
+            return;
+        };
+        let mut actions = tree::draw(ui, rect, &mut t.view, true);
+        if self.ops.holds_keyboard() {
+            // A file operation's dialog is the owner's now, as in the list.
+            actions.clear();
+        }
+        if let TreeModel::Open(model) = &mut t.model {
+            if t.rows_given {
+                let bar = t.view.bar_row().map(|r| tree::model_id(r.id));
+                let now = (t.view.top, t.view.height(), bar);
+                if t.told != Some(now) {
+                    model.view(now.0, now.1, now.2);
+                    t.told = Some(now);
+                }
+            }
+        }
+        self.tree_actions(ui.ctx(), actions);
+    }
+
     /// `SOPEN_KEYS`: the next step, once the window has settled — as the owner's own key or
     /// typing in this pass.
     fn play(&mut self, ctx: &egui::Context) {
@@ -1405,7 +1827,7 @@ impl Browser {
     /// typed text ask for, in order. Not while a dialog or the rename field has the keyboard
     /// (04 §3 rule 4: its typing and its Enter and Esc are its own).
     fn list_keys(&mut self, ctx: &egui::Context) {
-        while !self.ops.holds_keyboard() && self.viewer.is_none() {
+        while !self.ops.holds_keyboard() && self.viewer.is_none() && self.tree.is_none() {
             let Some(command) = ctx.input_mut(|i| keys::lookup(i, Context::List)) else {
                 break;
             };
@@ -1449,7 +1871,8 @@ impl Browser {
         };
         let resolved = view::resolve(&view::Inputs {
             mode: self.mode,
-            focus: self.active,
+            focus: self.tree.as_ref().map_or(self.active, |t| t.side),
+            tree_snapshot: self.tree.as_ref().map(|t| t.snapshot.clone()),
             bar,
             rest: self
                 .moved_at
@@ -1475,11 +1898,17 @@ impl Browser {
             _ => None,
         });
         // While a file is being opened nothing new is prepared: an opening taken over from the
-        // preview is still that preparation's worker.
-        let bar = file
-            .as_ref()
-            .filter(|_| self.opening.is_none() && self.viewer.is_none())
-            .map(|w| w.path.as_str());
+        // preview is still that preparation's worker. While the tree is open the other side is
+        // its snapshot (O4): a preview in it is kept, its preparation not cancelled, and the
+        // tree's bar prepares nothing.
+        let bar = match self.tree.as_ref().map(|t| &t.snapshot) {
+            Some(view::Content::Preview(path)) => Some(path.as_str()),
+            Some(_) => None,
+            None => file
+                .as_ref()
+                .filter(|_| self.opening.is_none() && self.viewer.is_none())
+                .map(|w| w.path.as_str()),
+        };
         self.preview.sync(ctx, display, bar);
         self.shown = Some(resolved.show);
     }
@@ -1581,14 +2010,10 @@ impl Browser {
                 Vec2::new(half, area.height()),
             )
             .shrink(2.0);
-            let preview = matches!(
-                self.shown.as_ref().map(|s| &s[i]),
-                Some(view::Content::Preview(_))
-            );
-            if preview {
-                self.preview.ui(ui, rect);
-            } else {
-                self.panel_ui(ui, i, rect);
+            match self.shown.as_ref().map(|s| &s[i]) {
+                Some(view::Content::Preview(_)) => self.preview.ui(ui, rect),
+                Some(view::Content::Tree) => self.tree_ui(ui, i, rect),
+                _ => self.panel_ui(ui, i, rect),
             }
         }
     }
@@ -1727,10 +2152,9 @@ impl Browser {
                 cell(&painter, x_time, y, &time, color);
             }
             let resp = ui.interact(row_rect, list_id().with((i, idx)), Sense::click());
-            if resp.double_clicked() {
-                clicked = Some((idx, true));
-            } else if resp.clicked() {
-                clicked = Some((idx, false));
+            if resp.clicked() {
+                let pair = list_id().with((i, &panel.dir, &entry.name));
+                clicked = Some((idx, second_click(&resp, pair)));
             }
         }
         if let Some(rect) = field {
@@ -1790,7 +2214,9 @@ impl Browser {
             p.text,
         );
         if let Some((idx, open)) = clicked {
-            let free = self.listing.is_empty() && self.opening.is_none();
+            // While the tree is open the other side is a snapshot (02 §3.1 O4): a click there
+            // moves nothing.
+            let free = self.listing.is_empty() && self.opening.is_none() && self.tree.is_none();
             if free && self.viewer.is_none() && !self.ops.holds_keyboard() {
                 self.active = i;
                 self.panels[i].highlight = idx;
@@ -1825,6 +2251,21 @@ impl Browser {
                 ))
             } else {
                 Status::info(format!("opening {name}…"))
+            };
+        }
+        if let Some(t) = &self.tree {
+            if let Some(said) = &t.said {
+                return said.clone();
+            }
+            if let Some((shown, _)) = &t.target {
+                return Status::info(format!("resolving {shown}…"));
+            }
+            if let Some(said) = self.ops.status() {
+                return said;
+            }
+            return match &t.model {
+                TreeModel::Open(model) if model.ready() => t.view.status_line(),
+                _ => Status::info(format!("reading the tree of {}…", t.view.title)),
             };
         }
         if self.viewer.is_some() {
@@ -1877,6 +2318,7 @@ impl Browser {
                 None => self.preview.settled(),
             }
             && (!self.ops.busy() || self.ops.holds_keyboard())
+            && self.tree.as_ref().is_none_or(TreeSide::settled)
     }
 }
 
@@ -1887,15 +2329,20 @@ impl Window for Browser {
         let esc_was_a_fields = self.focused_before && ctx.memory(|m| m.focused()).is_none();
         self.play(&ctx);
         self.poll(&ctx);
-        self.list_keys(&ctx);
+        if self.tree.is_some() {
+            self.tree_pass(&ctx);
+        } else {
+            self.list_keys(&ctx);
+        }
         self.resolve(&ctx);
         // The F-key row is the key table's, by the context and the mode (04 §2).
-        let keys: Vec<FKey> = match &self.viewer {
-            Some(v) => chrome::merged(
+        let keys: Vec<FKey> = match (&self.viewer, &self.tree) {
+            (Some(v), _) => chrome::merged(
                 &keys::row(Context::Viewer, self.mode),
                 v.embedded.window.keys(),
             ),
-            None => keys::row(Context::List, self.mode),
+            (None, Some(_)) => tree::fkeys(),
+            (None, None) => keys::row(Context::List, self.mode),
         };
         chrome::title_panel(ui, "sopen-browser-title", &self.title);
         chrome::key_panel(ui, "sopen-browser-keys", &keys);
@@ -1926,7 +2373,8 @@ impl Window for Browser {
             || self.opening.is_some()
             || !self.launches.is_empty()
             || self.preview.busy()
-            || self.ops.busy();
+            || self.ops.busy()
+            || self.tree.as_ref().is_some_and(|t| !t.settled());
         if working {
             ctx.request_repaint_after(Duration::from_millis(100));
         }
@@ -1954,6 +2402,8 @@ impl Window for Browser {
             opening.cancel.store(true, Ordering::Relaxed);
         }
         self.preview.cancel();
+        // The tree's listings and scans stop; nothing waits for them (05 §6.2).
+        self.close_tree();
         true
     }
 }

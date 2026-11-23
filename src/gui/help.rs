@@ -41,11 +41,13 @@ pub(crate) struct Page {
 /// the aliases. F9's words name the mode it switches to in `mode`. The browser opens it on
 /// `keys::Command::Help`.
 pub(crate) fn for_context(context: Context, mode: Mode, own: &[FKey]) -> Page {
-    page_upto(context, mode, own, keys::LANDED)
+    page_upto(context, mode, own, keys::LANDED_SLICES)
 }
 
-/// [`for_context`] with the rows landed by slice `upto`.
-fn page_upto(context: Context, mode: Mode, own: &[FKey], upto: u8) -> Page {
+/// [`for_context`] with the rows of the slices in `upto` — the set of landed slices
+/// ([`keys::LANDED_SLICES`]; a slice's integration WU adds its number), or every slice in the
+/// tests.
+fn page_upto(context: Context, mode: Mode, own: &[FKey], upto: keys::Slices) -> Page {
     // One line per wording, in the table's order; its keys plain ones first.
     let mut lines: Vec<(Vec<(bool, String)>, String)> = Vec::new();
     let mut slots = Vec::new();
@@ -331,7 +333,7 @@ pub(crate) fn end_pass(ctx: &egui::Context) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::gui::browser::keys::{rows, LANDED};
+    use crate::gui::browser::keys::{rows, LANDED_SLICES};
     use crate::gui::testkit::Driver;
     use crate::gui::Window;
 
@@ -385,7 +387,7 @@ mod tests {
             .starts_with("Switch to preview mode"));
         // Each landed row's key is on exactly one line.
         let all: Vec<&str> = page.lines.iter().map(|l| l.keys.as_str()).collect();
-        for row in rows(Context::List, LANDED) {
+        for row in rows(Context::List, LANDED_SLICES) {
             let name = row.trigger.name();
             let hits = all
                 .iter()
@@ -393,8 +395,14 @@ mod tests {
                 .count();
             assert_eq!(hits, 1, "{name} in {all:?}");
         }
-        // Not yet: F7, F8, F10, Cmd/Ctrl+G.
-        for later in ["F7", "F8", "F10", "Alt+F10"] {
+        // S5 has landed: F10 and Alt+F10, the tree, on one line.
+        assert_eq!(
+            line(&page, "F10, Alt+F10").map(|l| l.what.as_str()),
+            Some("The directory tree in place of this list"),
+            "{page:#?}"
+        );
+        // Not yet: F7, F8, Cmd/Ctrl+G.
+        for later in ["F7", "F8", &format!("{cmd}+G")] {
             assert!(
                 !all.iter().any(|keys| keys.split(", ").any(|k| k == later)),
                 "{later} lands later: {all:?}"
@@ -402,6 +410,32 @@ mod tests {
         }
         assert_eq!(page.lines.last(), Some(&aliases()));
         assert_eq!(page.lines.first().map(|l| l.keys.as_str()), Some("F1"));
+    }
+
+    /// F1 in the tree (05 §1, landed with S5): every key of the tree's context, the aliases last.
+    #[test]
+    fn the_tree_page_lists_the_trees_keys() {
+        let page = for_context(Context::Tree, Mode::Preview, &[]);
+        assert_eq!(page.title, "Keys in the directory tree");
+        let cmd = keys::command_name();
+        for (keys, what) in [
+            ("F1", "This screen"),
+            ("F10, Esc, Alt+F10", "Close the tree, the list as it was"),
+            ("Enter", "List that folder in this panel"),
+            ("→", "Open the folder (listed if it never was)"),
+            ("←", "Close the folder; on a closed one: its parent"),
+            ("↑, ↓, PgUp, PgDn, Home, End", "Move the bar"),
+            ("a letter", "The next folder starting with it"),
+            ("Space", "Size the folder now"),
+            (&format!("{cmd}+R"), "List the folder again"),
+        ] {
+            assert_eq!(
+                line(&page, keys).map(|l| l.what.as_str()),
+                Some(what),
+                "{keys}: {page:#?}"
+            );
+        }
+        assert_eq!(page.lines.last(), Some(&aliases()));
     }
 
     /// A viewer in the browser: the table's viewer rows, then the viewer's own slots the table

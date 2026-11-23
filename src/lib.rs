@@ -8,8 +8,11 @@
 //! [`usage`] appends the run log, [`fileops`] renames, copies and moves for the file browser,
 //! [`stream`] reads a remote file a window shows as a stream, never whole first
 //! (`.prd/06-streaming.md`), [`journal`] keeps the windows' unsaved edits on the local disk
-//! until they are saved (`.prd/07-streaming-edit.md`), and [`git`] reads a repository for the
-//! browser's git panel (`.prd/03-git-panel.md`).
+//! until they are saved (`.prd/07-streaming-edit.md`), [`git`] reads a repository for the
+//! browser's git panel (`.prd/03-git-panel.md`), and [`tree`] is the browser's directory tree
+//! (F10): its root, the folders that open by themselves, each row's counts and growing size, read
+//! through [`remote::treefs`]'s worker — locally behind a watchdog, remotely on a connection of its
+//! own (`.prd/05-directory-tree.md`).
 
 pub mod app;
 pub mod cache;

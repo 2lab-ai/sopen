@@ -8,9 +8,9 @@
 //!
 //! - **Every context's rows are here**, each marked with the slice that lands it (02 §8.1).
 //!   [`lookup`], [`row`] and the help screen use only the rows of the slices merged so far
-//!   ([`LANDED`]): a key whose feature has not landed does nothing and its F-key slot is empty
-//!   (02 §7). A later slice raises [`LANDED`] or changes a row in its scaffold step, as a declared
-//!   hand-over.
+//!   ([`LANDED_SLICES`], the set of landed slices; a slice's integration WU adds its number): a
+//!   key whose feature has not landed does nothing and its F-key slot is empty (02 §7). A later
+//!   slice changes a row in its scaffold step, as a declared hand-over.
 //! - **Text fields own their typing** (04 §3 rule 4): [`lookup`] cannot see the keyboard focus,
 //!   so while a field has the typing (the inline rename, a dialog's path, find) the caller asks
 //!   with [`Context::Dialog`], whose only rows are Enter and Esc.
@@ -24,12 +24,52 @@ use super::view::Mode;
 use crate::gui::chrome::{self, FKey};
 use eframe::egui::{self, Event, Key, Modifiers};
 
-/// The slices merged so far (02 §8.1: 1 = S1 … 7 = S7); rows of a later slice do nothing yet.
+/// The set of landed slices (02 §8.1: 1 = S1 … 7 = S7); a slice's integration WU adds its
+/// number. Rows of a slice not in it do nothing yet. A set, not the highest slice: slices land in
+/// any order their "Needs first" allows (02 §8.1 "Schedule"), so S5 landed before S2–S4.
+pub const LANDED_SLICES: Slices = Slices::of(&[1, 5]);
+
+/// The slices landed in order from S1: every slice from 1 to this one is in [`LANDED_SLICES`]
+/// (S2 is not yet, so 1). The git panel's own key reading (`git_panel`'s `UPTO`, a `const` that
+/// compares it) still takes this number; S2's integration moves it to the set.
 pub const LANDED: u8 = 1;
 
-/// The last slice: every row of the table.
+/// Every slice, 1 to 7: every row of the table.
 #[cfg_attr(not(test), allow(dead_code))] // Only the tests use it.
-pub const ALL_SLICES: u8 = 7;
+pub const ALL_SLICES: Slices = Slices::of(&[1, 2, 3, 4, 5, 6, 7]);
+
+/// A set of slices by number (1 to 7), one bit each.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Slices(u8);
+
+impl Slices {
+    /// The set of these slice numbers, each 1 to 7 (in a `const`, a number from 8 on does not
+    /// compile).
+    pub const fn of(slices: &[u8]) -> Slices {
+        let mut bits: u8 = 0;
+        let mut i = 0;
+        while i < slices.len() {
+            bits |= 1u8 << slices[i];
+            i += 1;
+        }
+        Slices(bits)
+    }
+
+    /// Whether `slice` is in the set (a number outside 1 to 7 never is).
+    pub fn has(self, slice: u8) -> bool {
+        slice != 0
+            && 1u8
+                .checked_shl(slice.into())
+                .is_some_and(|bit| self.0 & bit != 0)
+    }
+}
+
+/// Slices 1 to `n`, every one up to the highest landed in order (the git panel's `UPTO`).
+impl From<u8> for Slices {
+    fn from(n: u8) -> Slices {
+        Slices((1..=n.min(7)).fold(0, |bits, slice| bits | 1 << slice))
+    }
+}
 
 /// Where the keyboard is: a row acts only in the context it names (04 §3 rule 4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -511,12 +551,13 @@ pub const TABLE: &[Row] = &[
     key(Dialog, K::Escape, Plain, C::Cancel, "", "Cancel", 1),
 ];
 
-/// The rows of `context` landed by slice `upto` that can be pressed on this machine, in table
+/// The rows of `context` of the slices in `upto` that can be pressed on this machine, in table
 /// order.
-pub fn rows(context: Context, upto: u8) -> impl Iterator<Item = &'static Row> {
+pub fn rows(context: Context, upto: impl Into<Slices>) -> impl Iterator<Item = &'static Row> {
+    let upto = upto.into();
     TABLE
         .iter()
-        .filter(move |r| r.context == context && r.slice <= upto)
+        .filter(move |r| r.context == context && upto.has(r.slice))
         .filter(|r| match r.trigger {
             Trigger::Key(_, mods) => mods.here(),
             _ => true,
@@ -528,11 +569,16 @@ pub fn rows(context: Context, upto: u8) -> impl Iterator<Item = &'static Row> {
 /// widget or later pass acts on it (04 §3 rule 1). One command per call, in the order of the
 /// events: call it until `None`.
 pub fn lookup(input: &mut egui::InputState, context: Context) -> Option<Command> {
-    find(&mut input.events, context, LANDED)
+    find(&mut input.events, context, LANDED_SLICES)
 }
 
-/// [`lookup`] over `events`, with the rows landed by slice `upto`.
-pub(crate) fn find(events: &mut Vec<Event>, context: Context, upto: u8) -> Option<Command> {
+/// [`lookup`] over `events`, with the rows of the slices in `upto`.
+pub(crate) fn find(
+    events: &mut Vec<Event>,
+    context: Context,
+    upto: impl Into<Slices>,
+) -> Option<Command> {
+    let upto = upto.into();
     for at in 0..events.len() {
         match &mut events[at] {
             Event::Key {
@@ -575,7 +621,7 @@ pub(crate) fn find(events: &mut Vec<Event>, context: Context, upto: u8) -> Optio
 
 /// The row a typed `c` acts on in `context`: its own (`+ - *`), else the letter row; whitespace
 /// is never a letter.
-fn char_row(context: Context, upto: u8, c: char) -> Option<&'static Row> {
+fn char_row(context: Context, upto: Slices, c: char) -> Option<&'static Row> {
     rows(context, upto)
         .find(|r| r.trigger == Trigger::Char(c))
         .or_else(|| {
@@ -613,7 +659,7 @@ pub fn switch_label(mode: Mode) -> &'static str {
 
 /// The F-key row of `context` in `mode`: the landed plain F-keys and their labels, by number.
 pub fn row(context: Context, mode: Mode) -> Vec<FKey> {
-    let mut keys: Vec<FKey> = rows(context, LANDED)
+    let mut keys: Vec<FKey> = rows(context, LANDED_SLICES)
         .filter_map(|r| match r.trigger {
             Trigger::Key(key, Mods::None) if !r.label.is_empty() => {
                 chrome::fkey_number(key).map(|n| FKey {
@@ -815,7 +861,7 @@ mod tests {
             press(K::Q, NONE),
             Event::Text("q".into()),
         ];
-        assert_eq!(find(&mut events, List, LANDED), Some(Command::Copy));
+        assert_eq!(find(&mut events, List, LANDED_SLICES), Some(Command::Copy));
         assert_eq!(
             events,
             vec![
@@ -825,8 +871,11 @@ mod tests {
                 Event::Text("q".into()),
             ]
         );
-        assert_eq!(find(&mut events, List, LANDED), Some(Command::Jump('q')));
-        assert_eq!(find(&mut events, List, LANDED), None);
+        assert_eq!(
+            find(&mut events, List, LANDED_SLICES),
+            Some(Command::Jump('q'))
+        );
+        assert_eq!(find(&mut events, List, LANDED_SLICES), None);
         assert_eq!(
             events,
             vec![press(K::F5, SHIFT), release(K::F5, NONE), press(K::Q, NONE)]
@@ -840,7 +889,7 @@ mod tests {
             modifiers: NONE,
         }];
         assert_eq!(
-            find(&mut held, List, LANDED),
+            find(&mut held, List, LANDED_SLICES),
             Some(Command::Bar(Step::Down))
         );
         // Through egui's own input, as the browser asks: `lookup` takes the key from the frame.
@@ -887,17 +936,25 @@ mod tests {
             (de_plus, Command::SelectGroup),
         ] {
             let mut events = events;
-            assert_eq!(find(&mut events, List, LANDED), Some(want), "{events:?}");
+            assert_eq!(
+                find(&mut events, List, LANDED_SLICES),
+                Some(want),
+                "{events:?}"
+            );
             assert!(
                 !events.iter().any(|e| matches!(e, Event::Text(_))),
                 "the text is taken: {events:?}"
             );
-            assert_eq!(find(&mut events, List, LANDED), None, "and nothing else");
+            assert_eq!(
+                find(&mut events, List, LANDED_SLICES),
+                None,
+                "and nothing else"
+            );
         }
         // Several characters in one frame: one command each, in order; spaces are no letters.
         let mut events = vec![Event::Text("a+ b".into())];
         let mut got = Vec::new();
-        while let Some(c) = find(&mut events, List, LANDED) {
+        while let Some(c) = find(&mut events, List, LANDED_SLICES) {
             got.push(c);
         }
         assert_eq!(
@@ -957,7 +1014,34 @@ mod tests {
             }
         }
         // Every slice number is one of the seven.
-        assert!(TABLE.iter().all(|r| (1..=ALL_SLICES).contains(&r.slice)));
+        assert!(TABLE.iter().all(|r| ALL_SLICES.has(r.slice)));
+    }
+
+    /// The landed slices are a set (02 §8.1 "Schedule"): S1 and S5 have landed, so exactly their
+    /// rows act — F10 opens the tree while Cmd/Ctrl+G, an S2 row, still does nothing.
+    #[test]
+    fn landed_slices_are_a_set() {
+        assert_eq!(LANDED_SLICES, Slices::of(&[1, 5]));
+        assert!(TABLE
+            .iter()
+            .all(|r| LANDED_SLICES.has(r.slice) == matches!(r.slice, 1 | 5)));
+        // The run landed in order from S1 is S1 alone: S2 has not landed.
+        assert!((1..=LANDED).all(|s| LANDED_SLICES.has(s)) && !LANDED_SLICES.has(LANDED + 1));
+        assert_eq!(Slices::from(LANDED), Slices::of(&[1]));
+        assert_eq!(Slices::from(2), Slices::of(&[1, 2]));
+        assert_eq!(Slices::from(9), ALL_SLICES);
+        assert!(!ALL_SLICES.has(0) && !ALL_SLICES.has(8) && !ALL_SLICES.has(u8::MAX));
+        assert_eq!(
+            find(&mut vec![press(K::F10, NONE)], List, LANDED_SLICES),
+            Some(Command::Tree)
+        );
+        let pin = || vec![press(K::G, Modifiers::COMMAND)];
+        assert_eq!(
+            find(&mut pin(), List, LANDED_SLICES),
+            None,
+            "S2 has not landed"
+        );
+        assert_eq!(find(&mut pin(), List, ALL_SLICES), Some(Command::Pin));
     }
 
     /// PC Shell's labels are six characters at most, and six fit a slot from an 80-column
@@ -988,9 +1072,10 @@ mod tests {
         }
     }
 
-    /// 02 §7, 04 §2: S1's rows — the list's slots are `1Help 2Rename 3View 4Edit 5Copy 6Move
-    /// 9Dual` (9 names the mode F9 switches to); the viewer's `1Help 3Exit 4Edit`. The keys of
-    /// later slices do nothing yet.
+    /// 02 §7, 04 §2: the rows of the landed slices, S1 and S5 — the list's slots are `1Help
+    /// 2Rename 3View 4Edit 5Copy 6Move 9Dual 10Tree` (9 names the mode F9 switches to); the
+    /// viewer's `1Help 3Exit 4Edit`; the tree's `1Help 10Tree` (05 §1). The keys of the slices
+    /// not landed do nothing yet.
     #[test]
     fn the_rows_of_s1() {
         let pairs = |keys: Vec<FKey>| -> Vec<(u8, &str)> {
@@ -1005,32 +1090,40 @@ mod tests {
                 (4, "Edit"),
                 (5, "Copy"),
                 (6, "Move"),
-                (9, "Dual")
+                (9, "Dual"),
+                (10, "Tree")
             ]
         );
-        assert_eq!(pairs(row(List, Mode::Dual)).last(), Some(&(9, "Prevw")));
+        assert_eq!(pairs(row(List, Mode::Dual))[6], (9, "Prevw"));
         assert_eq!(
             pairs(row(Viewer, Mode::Preview)),
             [(1, "Help"), (3, "Exit"), (4, "Edit")]
         );
         assert!(row(Git, Mode::Preview).is_empty(), "S2");
-        assert!(row(TreeSide, Mode::Preview).is_empty(), "S5");
+        assert_eq!(
+            pairs(row(TreeSide, Mode::Preview)),
+            [(1, "Help"), (10, "Tree")],
+            "S5"
+        );
         assert!(row(Dialog, Mode::Preview).is_empty());
-        for (key, mods) in [
-            (K::F7, NONE),
-            (K::F8, NONE),
-            (K::F10, NONE),
-            (K::F10, ALT),
-            (K::G, Modifiers::COMMAND),
-        ] {
+        // S5: F10 and Alt+F10 open the tree from the list, and close it from the tree.
+        for mods in [NONE, ALT] {
+            let f10 = || vec![press(K::F10, mods)];
+            assert_eq!(find(&mut f10(), List, LANDED_SLICES), Some(Command::Tree));
             assert_eq!(
-                find(&mut vec![press(key, mods)], List, LANDED),
+                find(&mut f10(), TreeSide, LANDED_SLICES),
+                Some(Command::CloseTree)
+            );
+        }
+        for (key, mods) in [(K::F7, NONE), (K::F8, NONE), (K::G, Modifiers::COMMAND)] {
+            assert_eq!(
+                find(&mut vec![press(key, mods)], List, LANDED_SLICES),
                 None,
                 "{key:?} {mods:?} lands later"
             );
         }
         assert_eq!(
-            find(&mut vec![press(K::F9, NONE)], List, LANDED),
+            find(&mut vec![press(K::F9, NONE)], List, LANDED_SLICES),
             Some(Command::SwitchMode)
         );
     }
@@ -1087,15 +1180,12 @@ mod tests {
         // `+` committed is the select-group key, as typed; an empty commit is nothing.
         assert_eq!(looked_up(List, vec![commit("+")]).0, [C::SelectGroup]);
         assert_eq!(looked_up(List, vec![commit("")]).0, []);
-        // The tree jumps, the git panel finds; a dialog's field keeps its composition and commit.
+        // The tree jumps (S5 has landed), the git panel finds; a dialog's field keeps its
+        // composition and commit.
         assert_eq!(
             looked_up(TreeSide, vec![commit("한")]).0,
-            [] as [C; 0],
+            [C::Jump('한')],
             "S5"
-        );
-        assert_eq!(
-            find(&mut vec![commit("한")], TreeSide, ALL_SLICES),
-            Some(C::Jump('한'))
         );
         assert_eq!(
             find(&mut vec![commit("한")], Git, ALL_SLICES),

@@ -186,9 +186,9 @@ A folder opens in a sopen window titled `host:/abs` (the local path for a local 
 are where PC Shell puts them: the program's name on the top row; two file panels side by side,
 each in a frame with its folder (`host:/abs`) centred in the top border and the active panel's
 frame drawn heavier; the status row (an opening's or an operation's progress, the last result, else what the keys do);
-the bottom row lists the F-keys that work there and nothing else (the list, since slice S1 of the
-browser workstream: 1 Help, 2 Rename, 3 View, 4 Edit, 5 Copy, 6 Move, 9 Dual — `Prevw` in dual
-mode; a viewer: 1 Help, 3 Exit, 4 Edit and the viewer's own — the text viewer's 2 Unwrap (Wrap once unwrapped),
+the bottom row lists the F-keys that work there and nothing else (the list, since slices S1 and S5
+of the browser workstream: 1 Help, 2 Rename, 3 View, 4 Edit, 5 Copy, 6 Move, 9 Dual — `Prevw` in
+dual mode — and 10 Tree; the directory tree: 1 Help, 10 Tree; a viewer: 1 Help, 3 Exit, 4 Edit and the viewer's own — the text viewer's 2 Unwrap (Wrap once unwrapped),
 an alias of W; the hex window's 5 Save, 6 Goto, 7 SaveAs, 8 Asc/hx, aliases of ⌘S, ⌘G, ⌥⌘S and
 Tab; and the image and media windows' 5 Save and 7 SaveAs; a plain F-key never acts while a text
 field has the typing). The foot shows `N Listed = N bytes` whole inside the frame whatever the width: the
@@ -238,6 +238,18 @@ too, where F3 closes it as ⌘W does.
   (a streamed preview hands its stream over, nothing read twice; a preview still reading goes on
   as the opening). **F9** switches to **dual mode** — two lists, as before — and
   back; slot 9 names the mode it switches to. The mode is the window's and is not saved.
+- **The directory tree** (msg 16; [05](05-directory-tree.md), landed with slice S5) is a third
+  content of a side (02 §3.1): **F10** (or Alt+F10) shows it in place of the active list — rooted
+  at the home when the folder is under it, else at `/`, the bar on the panel's folder — and the
+  other side keeps what it showed, frozen, until it closes. It lists folders and links to folders
+  only; unlike the list, a folder's hidden subfolders are one dimmed row, `· N hidden folders`
+  (→ or Enter opens it into a row each). Every row ends with its subfolder and file counts and its
+  size, a lower bound marked `+` until a background scan has counted everything below; device,
+  virtual, network and mounted folders never open by themselves, and every local call of the tree
+  runs behind a 2 s watchdog (`not answering`). Enter lists the row's folder in the panel (a
+  link's target, resolved; a link whose target is gone says so) and closes the tree; Esc or F10
+  closes it with the panel as it was; Esc first stops an owner's whole listing or Space's scan.
+  Remotely the tree has an SFTP connection of its own.
 - **Selection and file operations** (msg 15; [04](04-file-keys.md) §3–§5, S1's part). Space or
   Ins selects the bar's entry and steps down; `+` and `-` select and unselect by a pattern, `*`
   inverts, Cmd/Ctrl+A selects all; selected entries are yellow and the foot counts them first.
