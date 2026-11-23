@@ -48,3 +48,27 @@ changes. Rows here are snapshots taken when they were moved.
   for the 50 settled previews, 0 ffmpeg or ffprobe processes, the preview cache at most 196 KB and
   0 bytes after exit. Clicks and drags were not part of the run: S1-E's P5 tests cover input
   isolation.
+
+## R1 (part 3) — closed 2026-11-23
+
+- measured S1-M ✅ · result: S1's last unit merged, so all of S1 is merged; round 1 is closed ·
+  closed rows: S1-M · PRs: #36, and the PR that carries this block
+
+### Closed rows
+
+| ID | Status | Branch | Scope | Owner files (02 §5) | After |
+|---|---|---|---|---|---|
+| S1-M | ✅ merged: PR #36 (bdb6166), 2026-11-22 | `feat/browser-s1-media-preview` | the media preview: video frame, audio waveform, their budgets and hand-over; reruns P1, P5, P6, P12 for media | `src/gui/media.rs` and tests, the preview host's media row | S1-E, G-WAVE |
+
+### Round section
+
+- As it was in `loop.md`, under "Round 1 — slice S1 (preview mode, F9, F2/F5/F6, F-key row, F1
+  help)": "S1-0 and S1-A to S1-E are merged, with PR #14 and PR #15 (rows in `loop.done.md`). S1-M
+  merged on 2026-11-22 (PR #36, bdb6166), so all of S1 is merged; its row below moves to
+  `loop.done.md` in a later change. One slice at a time (02 §8.1). Worktree = `.worktrees/<branch
+  with / as ->`."
+- S1-M (PR #36, merge commit bdb6166): the media preview, its budgets and hand-over, with E3's
+  media rerun written into 02 §8.2. The row's date is the merge commit's in +0900 (2026-11-21 in
+  UTC).
+- "One slice at a time" no longer holds from round 2: slices run at the same time once their
+  "Needs first" is met, and only work on a shared file runs one at a time (02 §8.1 "Schedule").

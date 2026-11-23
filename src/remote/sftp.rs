@@ -11,6 +11,7 @@
 mod ops;
 mod patch;
 mod ranged;
+mod treefs;
 mod writes;
 
 #[cfg(test)]

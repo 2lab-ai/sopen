@@ -2,6 +2,7 @@
 
 mod ops;
 mod patch;
+mod treefs;
 
 use super::{CreateError, Created, Entry, Hashing, Like, RemoteFs, Stat, Uploaded};
 use anyhow::{anyhow, Context, Result};
