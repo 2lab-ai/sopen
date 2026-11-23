@@ -167,6 +167,18 @@ pub(super) struct Pane {
     /// The width, in cells, the message's lines were wrapped to (`None`: not yet, for these
     /// lines).
     wrapped_for: Option<usize>,
+    /// For each line, the line of the unwrapped list it is part of.
+    origin: Vec<usize>,
+}
+
+/// Where the pane's bar is, in terms that survive the lines being made again (details delivered
+/// again, the message wrapped to another width).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Spot {
+    /// On a file row: its group and path.
+    File(Group, String),
+    /// On another line: the unwrapped line, and the row of it when it wrapped.
+    Line(usize, usize),
 }
 
 impl Pane {
@@ -181,6 +193,7 @@ impl Pane {
             lines: Vec::new(),
             placed: false,
             wrapped_for: None,
+            origin: Vec::new(),
         };
         pane.build();
         pane
@@ -191,23 +204,79 @@ impl Pane {
         if details.subject != self.subject {
             return false;
         }
+        // The same commit delivered again (`In` answered, a refresh) keeps the bar where it is;
+        // the first delivery, or another commit, puts it on the first file.
+        let oid = |d: &Option<Details>| {
+            d.as_ref()
+                .and_then(|d| d.summary.as_ref().map(|s| s.oid.clone()))
+        };
+        let same = std::mem::replace(&mut self.placed, true)
+            && oid(&self.details) == details.summary.as_ref().map(|s| s.oid.clone());
+        let spot = same.then(|| self.spot());
         self.details = Some(details);
         self.build();
-        if !std::mem::replace(&mut self.placed, true) {
-            let first_file = self
-                .lines
-                .iter()
-                .position(|l| matches!(l, Line::File { .. }));
-            self.scroll.to(first_file.unwrap_or(0));
-        } else {
-            self.scroll.bar = self.scroll.bar.min(self.lines.len().saturating_sub(1));
+        match spot {
+            Some(spot) => self.restore(&spot),
+            None => {
+                let first_file = self
+                    .lines
+                    .iter()
+                    .position(|l| matches!(l, Line::File { .. }));
+                self.scroll.to(first_file.unwrap_or(0));
+            }
         }
         true
+    }
+
+    /// Where the bar is now.
+    fn spot(&self) -> Spot {
+        let bar = self.scroll.bar;
+        if let Some(Line::File { group, file }) = self.line() {
+            if let Some((g, f)) = self.file(*group, *file) {
+                return Spot::File(g, f.path.clone());
+            }
+        }
+        let origin = self.origin.get(bar).copied().unwrap_or(bar);
+        let first = self.origin.iter().position(|&o| o == origin).unwrap_or(bar);
+        Spot::Line(origin, bar.saturating_sub(first))
+    }
+
+    /// The bar back on `spot` in the lines as they are now; a file no longer there leaves it on
+    /// the same line number.
+    fn restore(&mut self, spot: &Spot) {
+        let last = self.lines.len().saturating_sub(1);
+        let at = match spot {
+            Spot::File(group, path) => self.lines.iter().position(|l| match l {
+                Line::File { group: g, file: f } => self
+                    .file(*g, *f)
+                    .is_some_and(|(kind, row)| kind == *group && row.path == *path),
+                _ => false,
+            }),
+            Spot::Line(origin, row) => self.origin.iter().position(|o| o == origin).map(|first| {
+                let rows = self.origin[first..]
+                    .iter()
+                    .take_while(|o| *o == origin)
+                    .count();
+                first + (*row).min(rows.saturating_sub(1))
+            }),
+        };
+        let fallback = match spot {
+            Spot::Line(origin, _) => *origin,
+            Spot::File(..) => self.scroll.bar,
+        };
+        self.scroll.bar = at.unwrap_or(fallback).min(last);
+        self.scroll.moved = true;
     }
 
     /// The lines from the details, the message's not wrapped yet.
     fn build(&mut self) {
         self.wrapped_for = None;
+        self.build_lines();
+        self.origin = (0..self.lines.len()).collect();
+    }
+
+    /// The lines from the details, unwrapped.
+    fn build_lines(&mut self) {
         let mut lines: Vec<Line> = self
             .header
             .iter()
@@ -276,30 +345,29 @@ impl Pane {
         if self.wrapped_for == Some(chars) {
             return;
         }
-        let bar_file = match self.line() {
-            Some(Line::File { group, file }) => Some((*group, *file)),
-            _ => None,
-        };
+        let spot = self.spot();
         self.build();
         let width = cw * chars.max(1) as f32;
         let mut wrapped = Vec::with_capacity(self.lines.len());
-        for line in std::mem::take(&mut self.lines) {
+        let mut origin = Vec::with_capacity(self.lines.len());
+        for (k, line) in std::mem::take(&mut self.lines).into_iter().enumerate() {
             match line {
                 Line::Text(s) => {
-                    wrapped.extend(wrap_line(ctx, font, &s, width).into_iter().map(Line::Text))
+                    for row in wrap_line(ctx, font, &s, width) {
+                        wrapped.push(Line::Text(row));
+                        origin.push(k);
+                    }
                 }
-                other => wrapped.push(other),
+                other => {
+                    wrapped.push(other);
+                    origin.push(k);
+                }
             }
         }
         self.lines = wrapped;
+        self.origin = origin;
         self.wrapped_for = Some(chars);
-        let at = bar_file.and_then(|(g, f)| {
-            self.lines
-                .iter()
-                .position(|l| *l == Line::File { group: g, file: f })
-        });
-        self.scroll.bar = at.unwrap_or(self.scroll.bar.min(self.lines.len().saturating_sub(1)));
-        self.scroll.moved = true;
+        self.restore(&spot);
     }
 
     /// The line under the pane's bar.
@@ -457,12 +525,16 @@ pub(super) fn draw(
 /// word longer than the line is broken).
 fn wrap_line(ctx: &egui::Context, font: &egui::FontId, line: &str, width: f32) -> Vec<String> {
     let mut expanded = String::with_capacity(line.len());
+    // The column, counted as the line is read (not measured again per tab).
+    let mut column = 0;
     for c in line.chars() {
         if c == '\t' {
-            let n = expanded.chars().count();
-            expanded.extend(std::iter::repeat_n(' ', 8 - n % 8));
+            let n = 8 - column % 8;
+            expanded.extend(std::iter::repeat_n(' ', n));
+            column += n;
         } else {
             expanded.push(c);
+            column += 1;
         }
     }
     let text = printable(&expanded).into_owned();

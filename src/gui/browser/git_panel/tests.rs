@@ -1650,3 +1650,81 @@ fn a_lossy_ref_makes_a_lossy_label() {
     fx.view_mut().set_label_cursor(1);
     assert!(!fx.view().bar_label().unwrap().lossy);
 }
+
+/// Review round 2: details delivered again (`In` answered) keep the bar on its file, however the
+/// message wrapped.
+#[test]
+fn details_again_keep_the_bar_on_its_file() {
+    let long: Vec<String> = (0..100).map(|k| format!("word{k:02}")).collect();
+    let long = long.join(" ");
+    let file = |path: &str| FileRow {
+        letter: 'M',
+        path: path.into(),
+        old_path: None,
+        lines: Some((1, 1)),
+        lossy: false,
+    };
+    let details = |contains: Option<Vec<String>>| Details {
+        subject: Subject::Row(RowKey::Commit(oid(9))),
+        summary: Some(Summary {
+            oid: oid(9),
+            parents: vec![oid(7), oid(8)],
+            author_name: "Ann".into(),
+            author_email: "ann@example.com".into(),
+            author_time: day(9),
+            committer_name: "Ann".into(),
+            committer_email: "ann@example.com".into(),
+            commit_time: day(9),
+            message: format!("Merge\n\n{long}\n"),
+        }),
+        contains,
+        groups: vec![FileGroup {
+            group: Group::Files,
+            files: vec![file("a.txt"), file("b.txt")],
+        }],
+        error: None,
+    };
+    let mut fx = Fx::new(1000.0, 800.0, fixture_view());
+    fx.press(Key::ArrowDown);
+    fx.press(Key::Enter);
+    fx.view_mut().set_details(details(None));
+    fx.idle();
+    fx.view_mut()
+        .set_details(details(Some(vec!["main".into()])));
+    let asked = fx.press(Key::Enter);
+    assert!(
+        matches!(&asked[..], [GitAction::Diff { file, .. }] if file.path == "a.txt"),
+        "{asked:?}"
+    );
+}
+
+/// A message's tabs go to the next eighth cell, counted along the line.
+#[test]
+fn message_tabs_stop_at_every_eighth_cell() {
+    let mut fx = Fx::new(1000.0, 800.0, fixture_view());
+    fx.press(Key::ArrowDown);
+    fx.press(Key::Enter);
+    fx.view_mut().set_details(Details {
+        subject: Subject::Row(RowKey::Commit(oid(9))),
+        summary: Some(Summary {
+            oid: oid(9),
+            parents: vec![oid(7)],
+            author_name: "Ann".into(),
+            author_email: "ann@example.com".into(),
+            author_time: day(9),
+            committer_name: "Ann".into(),
+            committer_email: "ann@example.com".into(),
+            commit_time: day(9),
+            message: "Merge\n\nx\tyz\t\tw|abcdefgh\tz\n".into(),
+        }),
+        contains: Some(Vec::new()),
+        groups: Vec::new(),
+        error: None,
+    });
+    fx.idle();
+    assert!(
+        fx.shows("x       yz              w|abcdefgh      z"),
+        "{:?}",
+        fx.texts()
+    );
+}
