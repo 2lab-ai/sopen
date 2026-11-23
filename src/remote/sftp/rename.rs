@@ -12,11 +12,16 @@
 //! onto the second, both read back, then removed while they are still what was made. Only a
 //! status 4 with both files intact lets the session publish by the plain rename.
 //!
-//! **Where the channel comes from.** `SftpRemote` has no field for it yet:
-//! [`SftpRemote::with_plain`] is the one place that lends it, and in a build without tests it has
-//! none — a remote folder's rename stays refused, as before S6, and a copy to a server without
-//! `hardlink@` too. Tests put one on their thread ([`SftpRemote::seam_plain`]). [`Plain::over`] is
-//! what `SftpRemote::connect` is to open once the struct carries the channel.
+//! **Where the channel comes from.** The session's [`Slot`]: `SftpRemote::connect` leaves it
+//! closed over the session's master, and [`SftpRemote::with_plain`], the one place that lends the
+//! channel, opens it ([`Plain::over`]) the first time a folder rename, a rename probe or a publish
+//! needs it; it is then kept for the session. An open that failed is kept with its reason, said by
+//! every later use on that connection (a remote folder's F2 says why; a move copies, checks and
+//! removes instead; a copy without `hardlink@` is refused with it). A session with no slot to
+//! open — a test's local server, a stream's session given back — has none: a remote folder's
+//! rename is refused there, as before S6. Tests give a session a channel of its own
+//! ([`SftpRemote::with_local_plain`]), which goes with it to an operation's worker, or put one on
+//! their thread ([`SftpRemote::seam_plain`]).
 
 use super::{answered, within, SftpRemote, META_TIMEOUT};
 use crate::remote::ops::{taken, NoRename, Renamed, REMOTE_FOLDER_RENAME};
@@ -159,10 +164,6 @@ impl Plain {
 
     /// A second `sftp` subsystem over `session`, the master the session's own channel runs on
     /// (E2's route B). What `ssh` says on its stderr goes with a failed start.
-    #[expect(
-        dead_code,
-        reason = "SftpRemote::connect opens it once SftpRemote has a field for the channel"
-    )]
     pub(crate) fn over(session: std::sync::Arc<openssh::Session>) -> Result<Self> {
         let rt = runtime()?;
         let spawned = rt.block_on(within(META_TIMEOUT, async {
@@ -242,26 +243,38 @@ impl Drop for Plain {
     }
 }
 
+/// Opens a session's plain-rename channel.
+type Opener = Box<dyn FnOnce() -> Result<Plain> + Send>;
+
+/// Where a session keeps its plain-rename channel (see the module's doc).
+pub(super) enum Slot {
+    /// None to be had: a test's local server, a stream's session given back.
+    None,
+    /// Not opened yet: opened when first needed, by this.
+    Closed(Opener),
+    Open(Box<Plain>),
+    /// Its open failed, why: not tried again on this connection — every use says why. An
+    /// operation has connections of its own (04 §5.1), so the next operation tries anew.
+    Failed(String),
+}
+
+impl Slot {
+    /// A channel opened over `session`, the master the session's own channel runs on, when
+    /// first needed.
+    pub(super) fn over(session: std::sync::Arc<openssh::Session>) -> Self {
+        Slot::Closed(Box::new(move || Plain::over(session)))
+    }
+
+    /// No channel.
+    pub(super) fn none() -> Self {
+        Slot::None
+    }
+}
+
 #[cfg(test)]
 thread_local! {
     /// The session's plain-rename channel, while a test lends one to this thread.
     static PLAIN: std::cell::RefCell<Option<Plain>> = const { std::cell::RefCell::new(None) };
-}
-
-/// The channel, out of where it is kept, for one use.
-fn take_plain() -> Option<Plain> {
-    #[cfg(test)]
-    return PLAIN.with(|p| p.borrow_mut().take());
-    #[cfg(not(test))]
-    None
-}
-
-/// The channel back where it is kept.
-fn put_plain(plain: Plain) {
-    #[cfg(test)]
-    PLAIN.with(|p| *p.borrow_mut() = Some(plain));
-    #[cfg(not(test))]
-    drop(plain);
 }
 
 /// Why a copy to a server without `hardlink@` is refused where the session has no plain-rename
@@ -270,31 +283,77 @@ pub const NO_PUBLISH: &str = "this server does not offer hardlink@openssh.com, a
     connection has no channel for SFTP's plain rename, so sopen cannot put a copy under its name \
     without the risk of replacing anything there";
 
+/// Why a copy without `hardlink@` is refused where the session's plain-rename channel is not
+/// there: none to be had (`None`), or its open failed (why).
+fn no_publish(why: Option<String>) -> anyhow::Error {
+    match why {
+        None => anyhow!(NO_PUBLISH),
+        Some(why) => anyhow!(
+            "this server does not offer hardlink@openssh.com, and the channel for SFTP's plain \
+             rename could not be opened ({why}), so sopen cannot put a copy under its name \
+             without the risk of replacing anything there"
+        ),
+    }
+}
+
 impl SftpRemote {
-    /// The session's plain-rename channel, lent to `f` with the session itself: `None` where the
-    /// session has none (see the module's doc).
-    fn with_plain<R>(&mut self, f: impl FnOnce(&mut Self, &mut Plain) -> R) -> Option<R> {
-        let mut plain = take_plain()?;
+    /// The session's plain-rename channel, lent to `f` with the session itself — opened first
+    /// where it is not yet (see the module's doc). `Err` where there is none: `None` when the
+    /// session cannot have one, else why its open failed.
+    fn with_plain<R>(
+        &mut self,
+        f: impl FnOnce(&mut Self, &mut Plain) -> R,
+    ) -> std::result::Result<R, Option<String>> {
+        #[cfg(test)]
+        if let Some(mut plain) = PLAIN.with(|p| p.borrow_mut().take()) {
+            let got = f(self, &mut plain);
+            PLAIN.with(|p| *p.borrow_mut() = Some(plain));
+            return Ok(got);
+        }
+        let mut plain = match std::mem::replace(&mut self.plain, Slot::None) {
+            Slot::Open(plain) => *plain,
+            Slot::Closed(open) => match open() {
+                Ok(plain) => plain,
+                Err(e) => {
+                    let why = format!("{e:#}");
+                    self.plain = Slot::Failed(why.clone());
+                    return Err(Some(why));
+                }
+            },
+            Slot::Failed(why) => {
+                self.plain = Slot::Failed(why.clone());
+                return Err(Some(why));
+            }
+            Slot::None => return Err(None),
+        };
         let got = f(self, &mut plain);
-        put_plain(plain);
-        Some(got)
+        self.plain = Slot::Open(Box::new(plain));
+        Ok(got)
     }
 
-    /// Whether the session has a plain-rename channel.
+    /// Whether the session has a plain-rename channel, or one to open (whose open may yet fail:
+    /// then each use says why).
     pub(super) fn has_plain(&self) -> bool {
         #[cfg(test)]
-        return PLAIN.with(|p| p.borrow().is_some());
-        #[cfg(not(test))]
-        false
+        if PLAIN.with(|p| p.borrow().is_some()) {
+            return true;
+        }
+        !matches!(self.plain, Slot::None)
     }
 
     /// A folder renamed by one plain `SSH_FXP_RENAME` (04 §5.6, the folder row), never replacing:
     /// [`taken`] only when `lstat` then finds the new name (status 4 is the generic failure);
-    /// [`NoRename`] where the session has no channel, or the two names may be on two
-    /// filesystems (a move then copies, checks and removes).
+    /// [`NoRename`] where the session has no channel (or its open failed: why), or the two names
+    /// may be on two filesystems (a move then copies, checks and removes).
     pub(super) fn rename_folder(&mut self, from: &str, to: &str) -> Result<Renamed> {
-        let Some(said) = self.with_plain(|_, plain| plain.rename(from, to)) else {
-            return Err(anyhow!(NoRename(REMOTE_FOLDER_RENAME.to_string())));
+        let said = match self.with_plain(|_, plain| plain.rename(from, to)) {
+            Ok(said) => said,
+            Err(None) => return Err(anyhow!(NoRename(REMOTE_FOLDER_RENAME.to_string()))),
+            Err(Some(why)) => {
+                return Err(anyhow!(NoRename(format!(
+                    "cannot rename {from} to {to}: {why}; nothing was changed"
+                ))))
+            }
         };
         let e = match said {
             Said::Done => return Ok(Renamed::Moved),
@@ -337,7 +396,7 @@ impl SftpRemote {
                  published"
             )),
         });
-        let said = got.unwrap_or_else(|| Err(anyhow!(NO_PUBLISH)))?;
+        let said = got.map_err(no_publish)??;
         match said {
             Said::Done => Ok(Renamed::Moved),
             Said::Refused(e) => match self.lstat_opt(target) {
@@ -384,7 +443,7 @@ impl SftpRemote {
                 }
             }
         });
-        got.unwrap_or_else(|| Err(anyhow!(NO_PUBLISH)))
+        got.map_err(no_publish)?
     }
 
     /// The probe itself: what it found (`Err`: it could not run), and every entry of its own it
@@ -769,6 +828,50 @@ impl SftpRemote {
         Self::seam_plain_with(Plain::local_server(args, log, Tap::Replace)?)
     }
 
+    /// Tests: this session with a plain-rename channel in its own slot, as `connect` gives one
+    /// — so it goes with the session to an operation's worker, which the thread-local
+    /// [`SftpRemote::seam_plain`] never reaches — opened, as `connect`'s is, only when first
+    /// needed: to a new local `sftp-server`, its request log (`-e -l INFO`) at `log`. `opened`
+    /// counts the opens.
+    pub(crate) fn with_local_plain(
+        self,
+        log: Option<&Path>,
+        opened: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) -> Self {
+        self.with_local_plain_tapped(log, opened, Tap::Off)
+    }
+
+    /// [`SftpRemote::with_local_plain`], the channel behind `tap`.
+    fn with_local_plain_tapped(
+        mut self,
+        log: Option<&Path>,
+        opened: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        tap: Tap,
+    ) -> Self {
+        let log = log.map(Path::to_path_buf);
+        self.plain = Slot::Closed(Box::new(move || {
+            opened.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Plain::local_server(&[], log.as_deref(), tap)
+                .ok_or_else(|| anyhow!("no sftp-server on this machine"))
+        }));
+        self
+    }
+
+    /// Tests: this session's plain-rename channel cannot be opened (`why`); `opened` counts the
+    /// tries.
+    pub(crate) fn with_plain_failing(
+        mut self,
+        why: &str,
+        opened: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) -> Self {
+        let why = why.to_string();
+        self.plain = Slot::Closed(Box::new(move || {
+            opened.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(anyhow!(why))
+        }));
+        self
+    }
+
     fn seam_plain_with(plain: Plain) -> Option<crate::remote::ops::SeamGuard> {
         PLAIN.with(|p| *p.borrow_mut() = Some(plain));
         Some(crate::remote::ops::SeamGuard::new(|| {
@@ -872,6 +975,260 @@ mod tests {
             "{left:?}"
         );
         assert!(left[1].contains("left its folder"), "{left:?}");
+    }
+
+    /// The session's own slot, as `connect` leaves it: closed until a folder rename needs the
+    /// channel — making a folder and looking at one open nothing — then opened once and kept: a
+    /// second rename uses the same channel. Each rename is one plain `SSH_FXP_RENAME` in the
+    /// channel's log, never `posix-rename` in the session's.
+    #[test]
+    fn the_channel_opens_when_a_folder_rename_first_needs_it_and_stays() {
+        use crate::remote::ops::FileOps;
+        let tmp = tempfile::tempdir().unwrap();
+        let (main_log, plain_log) = (tmp.path().join("main.log"), tmp.path().join("plain.log"));
+        let Some(session) = SftpRemote::local_server_args(&[], Some(&main_log)) else {
+            return;
+        };
+        let opened = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut fs = session.with_local_plain(Some(&plain_log), opened.clone());
+        let count = || opened.load(std::sync::atomic::Ordering::SeqCst);
+        let root = std::fs::canonicalize(tmp.path()).unwrap().join("root");
+        std::fs::create_dir(&root).unwrap();
+        let at = |n: &str| root.join(n).to_str().unwrap().to_string();
+        assert!(fs.can_rename_dir(), "a channel to open counts");
+        fs.make_folder(&at("a")).unwrap();
+        std::fs::write(root.join("a/inside"), "kept").unwrap();
+        assert!(fs.lstat_opt(&at("a")).unwrap().is_some());
+        assert_eq!(count(), 0, "nothing opened it yet");
+        assert!(matches!(
+            fs.rename_new(&at("a"), &at("b")),
+            Ok(Renamed::Moved)
+        ));
+        assert_eq!(count(), 1, "opened by the first folder rename");
+        assert!(matches!(
+            fs.rename_new(&at("b"), &at("c")),
+            Ok(Renamed::Moved)
+        ));
+        assert_eq!(count(), 1, "kept for the session");
+        assert_eq!(
+            std::fs::read_to_string(root.join("c/inside")).unwrap(),
+            "kept"
+        );
+        drop(fs);
+        let plain = std::fs::read_to_string(&plain_log).unwrap();
+        assert_eq!(plain.matches("rename old").count(), 2, "{plain}");
+        let main = std::fs::read_to_string(&main_log).unwrap();
+        assert!(!main.contains("rename"), "{main}");
+    }
+
+    /// A channel whose open fails: a folder's rename says why and changes nothing, and the
+    /// connection does not try again — the next rename says the same reason without a second
+    /// open. A copy to a server without `hardlink@` on that connection is refused with it.
+    #[test]
+    fn a_channel_that_cannot_be_opened_says_why_and_is_not_tried_again() {
+        use crate::remote::ops::{FileOps, NoRename};
+        let Some(session) = SftpRemote::local_server_args(&["-P", "hardlink"], None) else {
+            return;
+        };
+        let opened = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let why = "the server would not open another session (a test's)";
+        let mut fs = session.with_plain_failing(why, opened.clone());
+        let tmp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        std::fs::create_dir(root.join("a")).unwrap();
+        let at = |n: &str| root.join(n).to_str().unwrap().to_string();
+        for _ in 0..2 {
+            let e = fs.rename_new(&at("a"), &at("b")).unwrap_err();
+            assert!(
+                e.chain().any(|c| c.is::<NoRename>()),
+                "a move copies: {e:#}"
+            );
+            let said = format!("{e:#}");
+            assert!(
+                said.contains(why) && said.contains("nothing was changed"),
+                "{said}"
+            );
+            assert!(root.join("a").is_dir() && !root.join("b").exists());
+        }
+        let e = fs.publish_probe(root.to_str().unwrap()).unwrap_err();
+        assert!(format!("{e:#}").contains(why), "{e:#}");
+        assert_eq!(opened.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// Each session keeps its own probe verdict (04 §5.6: once per SFTP session): of two sessions
+    /// at once, one whose channel's rename replaces (behind the tap that answers done) refuses
+    /// every copy, and the other, whose server refuses, publishes — asked again, each says the
+    /// same without probing again (one probe folder each), and each opened its channel once.
+    #[test]
+    fn two_sessions_keep_their_own_probe_verdicts() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let tmp = tempfile::tempdir().unwrap();
+        let (log_a, log_b) = (tmp.path().join("a.log"), tmp.path().join("b.log"));
+        let (Some(a), Some(b)) = (
+            SftpRemote::local_server_args(&[], Some(&log_a)),
+            SftpRemote::local_server_args(&[], Some(&log_b)),
+        ) else {
+            return;
+        };
+        let (opened_a, opened_b) = (
+            std::sync::Arc::new(AtomicUsize::new(0)),
+            std::sync::Arc::new(AtomicUsize::new(0)),
+        );
+        let mut a = a.with_local_plain_tapped(None, opened_a.clone(), Tap::AnswerDone);
+        let mut b = b.with_local_plain_tapped(None, opened_b.clone(), Tap::Off);
+        let dir = std::fs::canonicalize(tmp.path()).unwrap().join("target");
+        std::fs::create_dir(&dir).unwrap();
+        let dir = dir.to_str().unwrap();
+        let verdict = |fs: &SftpRemote| match &fs.plain {
+            Slot::Open(plain) => plain.verdict,
+            _ => None,
+        };
+        for round in 0..2 {
+            let refused = a.probe(dir).unwrap_err();
+            assert!(
+                format!("{refused:#}").contains(REPLACES),
+                "{round}: {refused:#}"
+            );
+            assert_eq!(b.probe(dir).unwrap(), Vec::<String>::new(), "{round}");
+            assert_eq!(verdict(&a), Some(Verdict::Replaces), "{round}");
+            assert_eq!(verdict(&b), Some(Verdict::Refuses), "{round}");
+        }
+        drop((a, b));
+        for log in [&log_a, &log_b] {
+            let text = std::fs::read_to_string(log).unwrap();
+            assert_eq!(text.matches("mkdir name").count(), 1, "one probe: {text}");
+        }
+        assert_eq!(opened_a.load(Ordering::SeqCst), 1);
+        assert_eq!(opened_b.load(Ordering::SeqCst), 1);
+        assert_eq!(std::fs::read_dir(dir).unwrap().count(), 0, "nothing left");
+    }
+
+    /// Dropping a session whose channel was opened ends that channel: its subsystem's process
+    /// (here the test's `sftp-server`; over ssh, the `ssh` child) exits, within 5 s.
+    #[test]
+    fn dropping_a_session_ends_its_plain_rename_channel() {
+        use crate::remote::ops::FileOps;
+        let Some(session) = SftpRemote::local_server() else {
+            return;
+        };
+        let opened = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut fs = session.with_local_plain(None, opened);
+        let tmp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        std::fs::create_dir(root.join("a")).unwrap();
+        let at = |n: &str| root.join(n).to_str().unwrap().to_string();
+        assert!(matches!(
+            fs.rename_new(&at("a"), &at("b")),
+            Ok(Renamed::Moved)
+        ));
+        let pid = match &fs.plain {
+            Slot::Open(plain) => plain
+                ._keep
+                .downcast_ref::<tokio::process::Child>()
+                .and_then(tokio::process::Child::id)
+                .expect("the channel's server"),
+            _ => panic!("the channel is open"),
+        };
+        let pid = libc::pid_t::try_from(pid).unwrap();
+        // SAFETY: signal 0 only asks whether the process exists.
+        assert_eq!(
+            unsafe { libc::kill(pid, 0) },
+            0,
+            "it runs while the session lives"
+        );
+        drop(fs);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let mut status = 0;
+            // SAFETY: our own child, not waited for elsewhere once its handle is dropped (a
+            // reaper that got there first makes this ECHILD: gone too).
+            let reaped = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+            if reaped == pid || reaped == -1 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the channel's server outlived its session"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    /// Live, by hand only — tests never need ssh: the plain rename over a real ssh master, the
+    /// channel opened by `SftpRemote::connect`'s slot through [`Plain::over`] (04 §5.6).
+    ///
+    /// ```sh
+    /// SOPEN_TEST_SFTP_HOST=<alias> SOPEN_TEST_SFTP_DIR=/tmp/sopen-receipts \
+    ///   cargo test --lib remote::sftp::rename::tests::live -- --ignored --nocapture
+    /// ```
+    ///
+    /// In a new folder of its own under the directory, everything made and removed over SFTP: a
+    /// folder holding one renamed by one plain rename, what is inside kept; a folder renamed onto
+    /// an existing one → `exists`, both left; the session's rename probe finds that the server
+    /// refuses an existing name.
+    #[test]
+    #[ignore]
+    fn live_the_plain_rename_over_a_real_master() {
+        use crate::remote::ops::{is_taken, FileOps};
+        let Ok(host) = std::env::var("SOPEN_TEST_SFTP_HOST") else {
+            eprintln!("skipping: SOPEN_TEST_SFTP_HOST is not set");
+            return;
+        };
+        let dir =
+            std::env::var("SOPEN_TEST_SFTP_DIR").unwrap_or_else(|_| "/tmp/sopen-receipts".into());
+        let spec = crate::target::RemoteSpec {
+            user: None,
+            host,
+            path: dir.clone(),
+        };
+        let state = crate::cache::dirs().unwrap().state;
+        let mut fs = SftpRemote::connect(&spec, &state).unwrap();
+        assert!(matches!(fs.plain, Slot::Closed(_)), "closed until needed");
+        let made_base = fs.lstat_opt(&dir).unwrap().is_none();
+        if made_base {
+            fs.make_dir(&dir).unwrap();
+        }
+        let base = fs.realpath(&dir).unwrap();
+        let scratch = join(&base, &format!("s6c-live-{}", random_hex()));
+        fs.make_folder(&scratch).unwrap();
+        let at = |n: &str| join(&scratch, n);
+        fs.make_folder(&at("a")).unwrap();
+        fs.make_folder(&at("a/inner")).unwrap();
+        fs.make_folder(&at("b")).unwrap();
+        println!("made {scratch}/a, a/inner, b over SFTP");
+        let renamed = fs.rename_new(&at("a"), &at("c"));
+        println!("plain rename a → c: {renamed:?}");
+        assert!(matches!(renamed, Ok(Renamed::Moved)), "{renamed:?}");
+        assert!(matches!(fs.plain, Slot::Open(_)), "the channel is open now");
+        assert!(fs.lstat_opt(&at("a")).unwrap().is_none());
+        assert!(fs
+            .lstat_opt(&at("c/inner"))
+            .unwrap()
+            .is_some_and(|s| s.is_dir));
+        println!("a is gone; c/inner is there");
+        let onto = fs.rename_new(&at("c"), &at("b"));
+        let said = onto.as_ref().map_err(|e| format!("{e:#}"));
+        println!("plain rename c → b (b exists): {said:?}");
+        assert!(onto.as_ref().is_err_and(is_taken), "{said:?}");
+        assert!(fs.lstat_opt(&at("c/inner")).unwrap().is_some());
+        assert!(fs.lstat_opt(&at("b")).unwrap().is_some_and(|s| s.is_dir));
+        println!("both c and b are left");
+        let probed = fs.probe(&scratch);
+        let verdict = match &fs.plain {
+            Slot::Open(plain) => plain.verdict,
+            _ => None,
+        };
+        println!("rename probe in {scratch}: {probed:?}, verdict {verdict:?}");
+        assert_eq!(probed.unwrap(), Vec::<String>::new());
+        assert_eq!(verdict, Some(Verdict::Refuses));
+        for gone in [at("c/inner"), at("c"), at("b"), scratch.clone()] {
+            fs.remove_dir(&gone).unwrap();
+        }
+        if made_base {
+            fs.remove_dir(&base).unwrap();
+        }
+        assert!(fs.lstat_opt(&scratch).unwrap().is_none());
+        println!("removed {scratch}");
     }
 
     /// A probe file whose CLOSE fails after its bytes were written stays in the probe's ledger:

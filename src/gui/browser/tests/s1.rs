@@ -1121,18 +1121,15 @@ fn the_mode_bar_and_keys_hooks_set_the_window_up() {
 // ---------------------------------------------------------------------------------------------
 // 04 §8: keys.
 
-/// K-R1: the list's row names the keys that work in the slices landed, S1 and S5 — no slot for a
-/// key of a slice not landed — and the viewer's row keeps its own.
+/// K-R1: the list's row names the keys that work in the slices landed, S1, S5 and S6 — every
+/// slot of 04 §2's row — and the viewer's row keeps its own.
 #[test]
 fn k_r1_the_rows_name_the_keys_that_work() {
     let mut fx = fixture();
     for label in [
-        "Help", "Rename", "View", "Edit", "Copy", "Move", "Dual", "Tree",
+        "Help", "Rename", "View", "Edit", "Copy", "Move", "MkDir", "Delete", "Dual", "Tree",
     ] {
         assert!(fx.label(label), "{label} in the list's row");
-    }
-    for label in ["MkDir", "Delete"] {
-        assert!(!fx.label(label), "{label} has not landed");
     }
     fx.open("data.bin");
     for label in ["Help", "Exit", "Edit", "Save", "Goto", "Asc/hx"] {
@@ -1740,13 +1737,14 @@ fn k_n1_f2_renames_in_place() {
     fx.key(Key::F2);
     assert_eq!(fx.b.ops.renaming(), None);
     assert!(fx.b.status_line().error);
-    // A folder on a remote: the reason, nothing changed (until S6).
+    // A folder on a remote has its field too since S6 (its plain rename: `tests/s6.rs`).
     let mut fx = fixture_with(Some("box"), local_connect(), None);
     fx.select("alpha");
     fx.key(Key::F2);
+    assert_eq!(fx.b.ops.renaming(), Some("alpha"));
+    assert!(!fx.b.status_line().error, "{}", fx.status());
+    fx.key(Key::Escape);
     assert_eq!(fx.b.ops.renaming(), None);
-    let said = fx.status();
-    assert!(said.contains("cannot rename a folder on box yet"), "{said}");
 }
 
 /// K-E1 through the window: a folder copied into itself is refused before anything happens, and
@@ -1911,22 +1909,32 @@ fn the_status_row_names_the_item_a_question_is_about() {
     fx.key(Key::Enter);
 }
 
-/// The key help says what Esc does now S2 has landed (02 §3.2: stop, else unpin) and names no
-/// key of a slice that has not: nothing of F7 or F8 (S6).
+/// The key help says what Esc does now S2 has landed (02 §3.2: stop, else unpin), and names F7
+/// and F8 now S6 has: make a folder, delete (to the Trash), Shift+F8 without it.
 #[test]
-fn the_key_help_names_no_key_of_a_later_slice() {
+fn the_key_help_names_the_keys_of_the_slices_landed() {
     let page = help::for_context(Context::List, view::Mode::Preview, &[]);
     let esc = page.lines.iter().find(|l| l.keys == "Esc").expect("Esc");
     assert_eq!(
         esc.what,
         "Stop a fetch or a file operation; else unpin the git panel"
     );
-    assert!(
+    let line = |key: &str| {
         page.lines
             .iter()
-            .all(|l| !l.keys.split(", ").any(|k| k == "F7" || k == "F8")),
+            .find(|l| l.keys.split(", ").any(|k| k == key))
+            .map(|l| l.what.as_str())
+    };
+    assert_eq!(
+        line("F7"),
+        Some("Make a folder (asks its name)"),
         "{page:?}"
     );
+    assert_eq!(
+        line("F8"),
+        Some("Delete the selection or the entry (asks; locally to the Trash)")
+    );
+    assert_eq!(line("Shift+F8"), Some("Delete without the Trash (asks)"));
 }
 
 /// A stand-in engine held at `gate`, then — `ask` — asking about its first name, and done.
@@ -2438,7 +2446,11 @@ fn p5_text_and_hex_previews_take_no_input() {
         );
         fx.drv.wheel(&mut fx.b, centre, -6.0);
         fx.drv.paste_text(&mut fx.b, "pasted");
+        // Del is the list's since S6 (delete, which asks first): it never reaches the preview.
         fx.with(Key::Delete, Modifiers::NONE);
+        assert!(fx.b.ops.holds_keyboard(), "Del asks the list's question");
+        fx.with(Key::Escape, Modifiers::NONE);
+        assert!(!fx.b.ops.holds_keyboard(), "Esc cancelled it");
         fx.with(Key::W, Modifiers::NONE);
         fx.drv.idle(&mut fx.b, 2);
     };

@@ -342,8 +342,8 @@ mod tests {
     }
 
     /// F1 in the list (K-R1's help): every landed row of the list is on one line, the
-    /// alternatives of one action together (plain key first), in the table's order; nothing of
-    /// a later slice; the aliases last.
+    /// alternatives of one action together (plain key first), in the table's order — S6's F7 and
+    /// F8 among them; the aliases last.
     #[test]
     fn the_list_page_lists_the_tables_rows() {
         let page = for_context(Context::List, Mode::Preview, &[]);
@@ -407,13 +407,27 @@ mod tests {
             Some("Pin the git panel to the other side; again: unpin"),
             "{page:#?}"
         );
-        // Not yet: F7, F8 (S6).
-        for later in ["F7", "F8"] {
-            assert!(
-                !all.iter().any(|keys| keys.split(", ").any(|k| k == later)),
-                "{later} lands later: {all:?}"
-            );
-        }
+        // S6 has landed: F7 makes a folder; F8, Del (and ⌘⌫ on macOS) delete to the Trash,
+        // Shift+F8 and Shift+Del without it — each action on one line.
+        assert_eq!(
+            line(&page, "F7").map(|l| l.what.as_str()),
+            Some("Make a folder (asks its name)"),
+            "{page:#?}"
+        );
+        let delete = match cfg!(target_os = "macos") {
+            true => format!("F8, Del, {cmd}+Backspace"),
+            false => "F8, Del".to_string(),
+        };
+        assert_eq!(
+            line(&page, &delete).map(|l| l.what.as_str()),
+            Some("Delete the selection or the entry (asks; locally to the Trash)"),
+            "{page:#?}"
+        );
+        assert_eq!(
+            line(&page, "Shift+F8, Shift+Del").map(|l| l.what.as_str()),
+            Some("Delete without the Trash (asks)"),
+            "{page:#?}"
+        );
         assert_eq!(page.lines.last(), Some(&aliases()));
         assert_eq!(page.lines.first().map(|l| l.keys.as_str()), Some("F1"));
     }

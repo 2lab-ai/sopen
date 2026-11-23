@@ -203,8 +203,9 @@ impl std::fmt::Display for Taken {
 
 impl std::error::Error for Taken {}
 
-/// The rename cannot happen here (another filesystem; a remote folder before slice S6) and
-/// nothing changed: a move goes on as a copy, a check and a removal (04 §5.2).
+/// The rename cannot happen here (another filesystem; a remote folder where the connection has
+/// no plain-rename channel, or its open failed) and nothing changed: a move goes on as a copy, a
+/// check and a removal (04 §5.2).
 #[derive(Debug)]
 pub struct NoRename(pub String);
 
@@ -276,10 +277,12 @@ pub(crate) fn set_seam(
     SeamGuard::new(move || slot.with(|s| *s.borrow_mut() = None))
 }
 
-/// Why a remote folder is not renamed where the session has no plain-rename channel (04 §5.3,
-/// §5.6): before slice S6, and wherever that second channel is not there.
+/// Why a remote folder is not renamed where the session has no plain-rename channel to open (04
+/// §5.3, §5.6): a session `SftpRemote::connect` did not make — a test's local server, a stream's
+/// session given back. Every connection a file operation makes has one; where its open fails,
+/// the reason is said instead (`sftp/rename.rs`).
 pub const REMOTE_FOLDER_RENAME: &str = "renaming a folder on a remote needs SFTP's plain \
-    rename, which sopen cannot send yet (it comes with slice S6); nothing was changed";
+    rename, and this connection has no channel for it; nothing was changed";
 
 /// The system Trash of this machine (04 §5.5): macOS's through `NSFileManager`, the freedesktop
 /// Trash elsewhere (`remote/local/trash.rs`). A trait, so that tests reach a stand-in and never
