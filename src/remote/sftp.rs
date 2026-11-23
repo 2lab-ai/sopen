@@ -11,6 +11,7 @@
 mod ops;
 mod patch;
 mod ranged;
+mod rename;
 mod treefs;
 mod writes;
 

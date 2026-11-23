@@ -34,6 +34,12 @@ directories = "6.0.0"
 # Transport = the system `ssh` binary (spec §4); process-mux (default) attaches to our own ControlMaster.
 openssh = "0.11.6"
 openssh-sftp-client = { version = "0.15.12", features = ["openssh"] }
+# The browser's remote folder rename, and a copy's publish where the server has no
+# `hardlink@openssh.com`, send SFTP's plain `SSH_FXP_RENAME`, which OpenSSH's server refuses onto an
+# existing name for a file or a folder (04 §5.6, E2 in 02 §8.2); openssh-sftp-client keeps that
+# request private and its `Fs::rename` sends `posix-rename@openssh.com`, which replaces. Already in
+# the tree (openssh-sftp-client's own), at the same version.
+openssh-sftp-client-lowlevel = "=0.7.4"
 # `ReadDir` is a `futures_core::Stream` (directory listing over SFTP).
 futures-core = "0.3.31"
 # ffprobe output and the usage log are JSON.
