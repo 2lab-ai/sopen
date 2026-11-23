@@ -1,8 +1,11 @@
 //! The config file (spec §4a): `$SOPEN_CONFIG`, else `$XDG_CONFIG_HOME/sopen/config.toml`, else
-//! `~/.config/sopen/config.toml` — the same rule on macOS and Linux. TOML with one key,
-//! `target = "<host>"`: the machine `sopen SOURCE` opens on when neither `--here`, `--target` nor
-//! `SOPEN_TARGET` says. A key sopen does not know, a value it cannot use or a file that is not
-//! TOML is an error naming the file — never ignored.
+//! `~/.config/sopen/config.toml` — the same rule on macOS and Linux. TOML with two keys:
+//! `target = "<host>"`, the machine `sopen SOURCE` opens on when neither `--here`, `--target` nor
+//! `SOPEN_TARGET` says; and `fkeys = "function" | "system"`, whether the Mac's top row sends
+//! F1…F12 without fn while sopen is in front (`"function"`, the default when the key is absent)
+//! or sopen never touches that setting (`"system"`; `.prd/04-file-keys.md` §6.2, [`crate::fnkeys`]).
+//! A key sopen does not know, a value it cannot use or a file that is not TOML is an error naming
+//! the file — never ignored.
 
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -16,6 +19,38 @@ pub struct Config {
     /// Where `sopen SOURCE` opens by default: `[user@]host`, as `--target` takes it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target: Option<String>,
+    /// The macOS F-key switch; absent = [`Fkeys::Function`]. Written only when set, so a file
+    /// that never set it reads as it did before the key existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fkeys: Option<Fkeys>,
+}
+
+/// `fkeys` (04 §6.2): what the Mac's top row sends while a sopen window is in front.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Fkeys {
+    /// F1…F12 without fn while sopen is in front: sopen switches `HIDFKeyMode` and restores it.
+    #[default]
+    Function,
+    /// sopen never touches the setting.
+    System,
+}
+
+impl Fkeys {
+    /// The word in the file and on the command line.
+    pub fn word(self) -> &'static str {
+        match self {
+            Fkeys::Function => "function",
+            Fkeys::System => "system",
+        }
+    }
+}
+
+impl Config {
+    /// `fkeys` as it applies: the default when the key is absent.
+    pub fn fkeys(&self) -> Fkeys {
+        self.fkeys.unwrap_or_default()
+    }
 }
 
 /// The config file's path, from the environment.
@@ -92,6 +127,14 @@ pub fn unset_target(path: &Path) -> Result<bool> {
     }
     write(path, &config)?;
     Ok(true)
+}
+
+/// Sets `fkeys = "<word>"` (`sopen config fkeys function|system`), as [`set_target`] sets the
+/// target. A file sopen cannot read is refused rather than replaced.
+pub fn set_fkeys(path: &Path, fkeys: Fkeys) -> Result<()> {
+    let mut config = load(path)?;
+    config.fkeys = Some(fkeys);
+    write(path, &config)
 }
 
 /// A new config file is private (it names the machines you use); a replaced one keeps its mode.
@@ -242,6 +285,53 @@ mod tests {
         std::fs::write(&file, "colour = \"red\"\n").unwrap();
         assert!(set_target(&file, "box").is_err());
         assert!(unset_target(&file).is_err());
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "colour = \"red\"\n"
+        );
+    }
+
+    /// 04 §8 K-F4, the file's half: `sopen config fkeys system` writes `fkeys = "system"`; the
+    /// key is absent until set and reads as the default then (the other half, that sopen never
+    /// opens IOHIDSystem, is `fnkeys::tests::kf4_system_never_opens_the_switch`).
+    #[test]
+    fn kf4_fkeys_is_set_as_the_target_is() {
+        assert_eq!(parse("").unwrap().fkeys(), Fkeys::Function);
+        assert_eq!(
+            parse("fkeys = \"system\"\n").unwrap().fkeys(),
+            Fkeys::System
+        );
+        assert_eq!(
+            parse("fkeys = \"function\"\n").unwrap().fkeys,
+            Some(Fkeys::Function)
+        );
+        for bad in ["fkeys = \"media\"\n", "fkeys = 1\n", "fkeys = \"System\"\n"] {
+            let e = parse(bad).unwrap_err();
+            assert!(e.starts_with("line 1: "), "{bad}: {e}");
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("config.toml");
+        set_fkeys(&file, Fkeys::System).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "fkeys = \"system\"\n"
+        );
+        set_target(&file, "box").unwrap();
+        set_fkeys(&file, Fkeys::Function).unwrap();
+        let config = load(&file).unwrap();
+        assert_eq!(config.target.as_deref(), Some("box"), "the target is kept");
+        assert_eq!(config.fkeys, Some(Fkeys::Function));
+        assert!(unset_target(&file).unwrap());
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "fkeys = \"function\"\n",
+            "unsetting the target keeps fkeys"
+        );
+
+        // A file sopen cannot read is not replaced.
+        std::fs::write(&file, "colour = \"red\"\n").unwrap();
+        assert!(set_fkeys(&file, Fkeys::System).is_err());
         assert_eq!(
             std::fs::read_to_string(&file).unwrap(),
             "colour = \"red\"\n"

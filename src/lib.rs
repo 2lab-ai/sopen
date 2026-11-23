@@ -17,6 +17,7 @@ pub mod config;
 pub mod cut;
 pub mod ffmpeg;
 pub mod fileops;
+pub mod fnkeys;
 pub mod forward;
 pub mod git;
 pub mod gui;
