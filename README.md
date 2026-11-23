@@ -121,6 +121,15 @@ its own list again. `F9` switches
 to two plain lists (**dual mode**) and back. A preview is only looked at: `Enter` makes it the
 viewer.
 
+`F10` shows the **directory tree** in place of the list: rooted at your home when the folder is
+under it, else at `/`, the bar on the folder you were in. Folders with few subfolders open by
+themselves; every row shows at once how many folders and files it holds and how big it is — a size
+with `+` is still a lower bound and grows as the tree reads below it. Hidden folders are one dimmed
+row (`· 3 hidden folders`); device, system, network and mounted folders are never opened by
+themselves, and a folder that does not answer says so instead of holding the tree up. `Enter` lists
+the folder in the panel; `Esc` or `F10` closes the tree with the panel as it was. While the tree is
+open the other side keeps what it showed.
+
 Every sopen window looks like PC Shell from the DOS PC Tools 5.5 / 6: the VGA text font, blue
 windows framed in box lines (a double line around the active one) with their title in the frame,
 the light-red highlight bar, the title row with the clock, the F-key row at the bottom (only the
@@ -140,6 +149,7 @@ keys that work there are labelled), cyan dialogs with a shadow.
 | `F4` | open the folder or file in VS Code / Zed |
 | `F5` / `F6` | copy / move the selection (or the entry) to the other panel's folder — asks first; the target can be any folder, `host:/path` too |
 | `F9` | preview mode ↔ dual mode |
+| `F10` (or `Alt+F10`) | the directory tree; in it `→` / `←` open and close a folder, `Space` sizes a row now (`Esc` stops that), `⌘R` reads a row again, `Enter` lists the folder in the panel, `Esc` / `F10` close the tree |
 | `⌘R` · `⌘U` · `⌘←` / `⌘→` | re-read · swap the panels · this folder in the left / right panel |
 | `⌘1`…`⌘0`, or a click on the bottom row | `F1`…`F10` (Ctrl on Linux) |
 | `Esc` / `F3` in a viewer | back to the list, the bar where it was |

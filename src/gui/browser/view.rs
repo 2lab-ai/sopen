@@ -1,7 +1,7 @@
 //! What each side of the browser shows (02 §2–§3): the mode, and [`resolve`], a pure function of
 //! 02 §3.1's inputs (the committed display among them) that the browser asks on every pass. S1-E
-//! wrote the rules O2, O5 and O7, the 150 ms commit and their table test; S2-F adds O6 and the
-//! pin, S5 the tree's O4.
+//! wrote the rules O2, O5 and O7, the 150 ms commit and their table test; S5-C added the tree's
+//! O4 (rule 3's Tree and its `tree_snapshot`); S2-F adds O6 and the pin.
 
 use std::time::Duration;
 
@@ -29,14 +29,16 @@ impl Mode {
     }
 }
 
-/// What one side shows (02 §1), with its identity. S1 has these; the git panel (S2-F) and the
-/// tree (S5) add theirs.
+/// What one side shows (02 §1), with its identity. S1 and S5 have these; the git panel (S2-F)
+/// adds its own.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Content {
     /// The side's own panel.
     List,
     /// The preview of this file — the path under the active list's bar (02 §4).
     Preview(String),
+    /// The directory tree, in place of the side's list (05 §1): the side with the keyboard.
+    Tree,
     /// A viewer opened by Enter or F3 covers the side (rule 1).
     Viewer,
 }
@@ -51,13 +53,17 @@ pub enum Bar {
     Other,
 }
 
-/// 02 §3.1's inputs, those S1 has (`origin`, `folder`'s detection, `pin`, `tree_snapshot` and
-/// `git_wide` come with S2 and S5).
+/// 02 §3.1's inputs, those S1 and S5 have (`origin`, `folder`'s detection, `pin` and `git_wide`
+/// come with S2).
 #[derive(Debug, Clone, Default)]
 pub struct Inputs {
     pub mode: Mode,
-    /// The side whose List has the keyboard (0 left, 1 right).
+    /// The side that has the keyboard (0 left, 1 right): in its List, or in its Tree while
+    /// `tree_snapshot` is there.
     pub focus: usize,
+    /// The tree is open on the focus side (05 §1): what the other side showed when it opened
+    /// (O4), with its identity — shown, unchanged, until the tree closes.
+    pub tree_snapshot: Option<Content>,
     pub bar: Bar,
     /// How long the bar has rested since it last moved within the same folder; `None` when the
     /// last change was anything else — the window opening, a focus, mode or folder change, a
@@ -85,19 +91,25 @@ pub fn target(inputs: &Inputs) -> [Content; 2] {
     if inputs.viewer {
         return [Content::Viewer, Content::Viewer];
     }
-    let other = match (inputs.mode, &inputs.bar) {
+    let other = match (inputs.mode, &inputs.tree_snapshot, &inputs.bar) {
         // O2: dual mode — its own list.
-        (Mode::Dual, _) => Content::List,
+        (Mode::Dual, _, _) => Content::List,
+        // O4: the keyboard is in the tree — what the side showed when it opened.
+        (Mode::Preview, Some(snapshot), _) => snapshot.clone(),
         // O5: the bar on a file — its preview.
-        (Mode::Preview, Bar::File(path)) => Content::Preview(path.clone()),
+        (Mode::Preview, None, Bar::File(path)) => Content::Preview(path.clone()),
         // O7 (O6, the git panel, comes with S2-F): its own list.
-        (Mode::Preview, Bar::Other) => Content::List,
+        (Mode::Preview, None, Bar::Other) => Content::List,
     };
-    // Rule 3: the side with the keyboard shows what the keyboard is in — its List.
+    // Rule 3: the side with the keyboard shows what the keyboard is in — its List, or its Tree.
+    let own = match inputs.tree_snapshot {
+        Some(_) => Content::Tree,
+        None => Content::List,
+    };
     if inputs.focus == 0 {
-        [Content::List, other]
+        [own, other]
     } else {
-        [other, Content::List]
+        [other, own]
     }
 }
 
@@ -231,6 +243,45 @@ mod tests {
         let x = [Content::List, preview("/d/x.txt")];
         assert_eq!(resolve(&on_x(&from_preview, 150)).show, x);
         assert_eq!(resolve(&on_x(&from_list, 150)).show, x);
+    }
+
+    /// Rule 3 and O4 (02 §3.1): while the tree is open the side with the keyboard shows it, and
+    /// the other side shows the snapshot taken when it opened — whatever the bar's rest, the
+    /// mode's O2 aside — until it closes; then the rules apply again.
+    #[test]
+    fn o4_the_other_side_is_the_snapshot_while_the_tree_is_open() {
+        use Content::{List, Tree};
+        for focus in [0, 1] {
+            for snapshot in [List, preview("/d/w.txt")] {
+                let inputs = Inputs {
+                    focus,
+                    // The bar of the list under the tree is on another file now (a re-read).
+                    bar: file("/d/x.txt"),
+                    tree_snapshot: Some(snapshot.clone()),
+                    rest: Some(MS(10_000)),
+                    shown: Some([List, List]),
+                    ..Default::default()
+                };
+                let got = resolve(&inputs);
+                assert_eq!(got.show[focus], Tree, "focus {focus}");
+                assert_eq!(got.show[1 - focus], snapshot, "O4, focus {focus}");
+                assert_eq!(got.pending, None);
+                // Dual mode: O2 comes first, the other side's own list.
+                let dual = Inputs {
+                    mode: Mode::Dual,
+                    ..inputs.clone()
+                };
+                assert_eq!(resolve(&dual).show[1 - focus], List, "O2");
+                // The tree closed: O5 again.
+                let closed = Inputs {
+                    tree_snapshot: None,
+                    rest: None,
+                    ..inputs
+                };
+                assert_eq!(resolve(&closed).show[1 - focus], preview("/d/x.txt"));
+                assert_eq!(resolve(&closed).show[focus], List);
+            }
+        }
     }
 
     /// Every change but a bar move commits at once (`rest` is `None` then): Tab, F9, entering

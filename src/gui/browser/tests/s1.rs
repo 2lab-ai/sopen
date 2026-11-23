@@ -1121,15 +1121,17 @@ fn the_mode_bar_and_keys_hooks_set_the_window_up() {
 // ---------------------------------------------------------------------------------------------
 // 04 §8: keys.
 
-/// K-R1: the list's row names the keys that work in S1 — no slot for a key of a later slice —
-/// and the viewer's row keeps its own.
+/// K-R1: the list's row names the keys that work in the slices landed, S1 and S5 — no slot for a
+/// key of a slice not landed — and the viewer's row keeps its own.
 #[test]
 fn k_r1_the_rows_name_the_keys_that_work() {
     let mut fx = fixture();
-    for label in ["Help", "Rename", "View", "Edit", "Copy", "Move", "Dual"] {
+    for label in [
+        "Help", "Rename", "View", "Edit", "Copy", "Move", "Dual", "Tree",
+    ] {
         assert!(fx.label(label), "{label} in the list's row");
     }
-    for label in ["MkDir", "Delete", "Tree"] {
+    for label in ["MkDir", "Delete"] {
         assert!(!fx.label(label), "{label} has not landed");
     }
     fx.open("data.bin");
