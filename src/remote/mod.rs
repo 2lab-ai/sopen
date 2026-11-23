@@ -3,6 +3,7 @@
 //! by every test). The conflict-safe write algorithm (spec §5) is written once, as provided methods
 //! on top of a few primitives, so the tests exercise exactly what runs against a remote.
 
+pub mod exec;
 mod local;
 pub mod ops;
 pub mod patch;

@@ -7,8 +7,9 @@
 //! [`ffmpeg`] / [`cut`] cut media, [`stems`] splits voice from music, [`cache`] owns local paths,
 //! [`usage`] appends the run log, [`fileops`] renames, copies and moves for the file browser,
 //! [`stream`] reads a remote file a window shows as a stream, never whole first
-//! (`.prd/06-streaming.md`), and [`journal`] keeps the windows' unsaved edits on the local disk
-//! until they are saved (`.prd/07-streaming-edit.md`).
+//! (`.prd/06-streaming.md`), [`journal`] keeps the windows' unsaved edits on the local disk
+//! until they are saved (`.prd/07-streaming-edit.md`), and [`git`] reads a repository for the
+//! browser's git panel (`.prd/03-git-panel.md`).
 
 pub mod app;
 pub mod cache;
@@ -17,6 +18,7 @@ pub mod cut;
 pub mod ffmpeg;
 pub mod fileops;
 pub mod forward;
+pub mod git;
 pub mod gui;
 pub mod journal;
 pub mod kind;
