@@ -17,6 +17,7 @@ use crate::git::actions::{ActionId, Repo};
 use crate::git::model::{
     CommitRow, Head, ObjectType, RefKind, RefLabel, StashRow, StatusEntry, StatusState,
 };
+use crate::git::rebase::EditId;
 use crate::gui::browser::keys::{self, Mods};
 use crate::gui::chrome;
 use eframe::egui::{self, Key};
@@ -628,5 +629,287 @@ impl Menu {
             return self.choose(at);
         }
         response.should_close().then_some(MenuEnd::Cancel)
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// The commit menu's history row (03 §7.1's last row, §7.8.1; S4-B). S3-B's items above are
+// unchanged: [`HistoryMenu`] holds S3-B's [`Menu`] and gives its [`MenuEnd`] back as it is, so
+// what matches on `MenuEnd` keeps working. Each item below carries its own `dead_code`
+// allowance, which S4-C removes when it wires the row.
+
+/// One line of the commit menu's history row.
+#[allow(dead_code)] // S4-C removes this when it wires the history row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HistoryItem {
+    pub id: EditId,
+    /// What the menu calls it (03 §7.8.1's Action column).
+    pub label: String,
+    /// Its key (03 §9.1: F2, F8; §9.2: Cmd/Ctrl+E).
+    pub key: Option<String>,
+}
+
+/// What 03 §7.8.1 calls a history edit (its Action column).
+#[allow(dead_code)] // S4-C removes this when it wires the history row.
+pub fn history_label(id: EditId) -> &'static str {
+    match id {
+        EditId::Reword => "Reword…",
+        EditId::Author => "Author and date…",
+        EditId::Squash => "Squash into the commit below…",
+        EditId::Fixup => "Fix up into the commit below",
+        EditId::MoveUp => "Move up",
+        EditId::MoveDown => "Move down",
+        EditId::Drop => "Drop…",
+        EditId::Edit => "Stop here to edit…",
+        EditId::Split => "Split…",
+        EditId::Fold => "Fold the staged changes into this commit…",
+        EditId::Plan => "Edit history from here…",
+    }
+}
+
+/// A history edit's key on a commit row: F2 `reword`, F8 `drop` (03 §9.1), Cmd/Ctrl+E the
+/// planner (§9.2).
+#[allow(dead_code)] // S4-C removes this when it wires the history row.
+fn history_key(id: EditId) -> Option<String> {
+    match id {
+        EditId::Reword => Some("F2".to_string()),
+        EditId::Drop => Some("F8".to_string()),
+        EditId::Plan => Some(format!("{}E", Mods::Command.prefix())),
+        _ => None,
+    }
+}
+
+/// What the history row needs to know of a commit that `Repo` does not hold: the graph's
+/// answers, which the integration (S4-C) fills from the rows it has read. The default is a
+/// commit with no history edit.
+#[allow(dead_code)] // S4-C removes this when it wires the history row.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Eligibility {
+    /// The commit is HEAD or an ancestor of HEAD (03 §7.8: history edits rewrite those).
+    pub ancestor: bool,
+    /// No commit from it up to HEAD, itself included, is a merge (more than one parent): the
+    /// range a quick edit rewrites (03 §7.8.2: a range with merges is refused).
+    pub linear: bool,
+    /// The commit below it (its first parent) is a merge: `squash`, `fixup` and `move-down`
+    /// rewrite that one too (their range starts below it, `rebase::Quick::apply`).
+    pub below_merge: bool,
+}
+
+/// The history row of `commit`'s menu (03 §7.8.1), in its table's order, as `eligible` allows.
+/// Offered or absent, never greyed (S3-B's rule):
+/// - nothing off the ancestors of HEAD, nor with HEAD unborn (03 §7.8);
+/// - the quick edits only on a linear range (03 §7.8.2 refuses a range with merges, G-H4), and
+///   `squash`, `fixup` and `move-down` not above a merge, whose range holds it;
+/// - `plan` on any ancestor but HEAD, merges or not: the planner opens on the range and names
+///   its merges as a check that fails (03 §7.8.2), so a base above the newest merge can be
+///   chosen;
+/// - nothing above HEAD to move up past or to plan; nothing below a root commit to squash or fix
+///   up into or to move down past; `fold` only with staged changes. `split` stays on a root
+///   commit, where its plan refuses it with the reason (G-H3).
+#[allow(dead_code)] // S4-C removes this when it wires the history row.
+pub fn history_items(commit: &CommitRow, eligible: Eligibility, repo: &Repo) -> Vec<HistoryItem> {
+    let Some(head) = repo.head.oid().filter(|_| eligible.ancestor) else {
+        return Vec::new();
+    };
+    let is_head = *head == commit.oid;
+    let root = commit.parents.is_empty();
+    let any_staged = repo.status.entries.iter().any(|e| !e.lossy && staged(e));
+    EditId::ALL
+        .into_iter()
+        .filter(|id| match id {
+            EditId::Plan => !is_head,
+            _ if !eligible.linear => false,
+            EditId::Squash | EditId::Fixup | EditId::MoveDown => !root && !eligible.below_merge,
+            EditId::MoveUp => !is_head,
+            EditId::Fold => any_staged,
+            _ => true,
+        })
+        .map(|id| HistoryItem {
+            id,
+            label: history_label(id).to_string(),
+            key: history_key(id),
+        })
+        .collect()
+}
+
+/// How the commit menu with its history row ended.
+#[allow(dead_code)] // S4-C removes this when it wires the history row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HistoryMenuEnd {
+    /// S3-B's menu ended (one of its items, `Repository…`'s menu, Esc): its [`MenuEnd`] as it is.
+    Menu(MenuEnd),
+    /// A history item: its id on this commit, for `planner::QuickDialog::open` (`plan`: the
+    /// planner on the commit's row).
+    Edit { id: EditId, commit: CommitRow },
+}
+
+/// A menu with the history row: S3-B's [`Menu`] of the target, then, on a commit row, §7.8's
+/// items, then `Repository…` (03 §7.1's last row). Another target's is S3-B's menu as it is.
+#[allow(dead_code)] // S4-C removes this when it wires the history row.
+#[derive(Debug, Clone)]
+pub struct HistoryMenu {
+    menu: Menu,
+    /// The commit whose history row this is (none once `Repository…` was chosen).
+    commit: Option<CommitRow>,
+    history: Vec<HistoryItem>,
+    /// The line under the bar: S3-B's items, then the history row, then `Repository…`.
+    bar: usize,
+    /// The bar moved by a key: the next pass shows it.
+    moved: bool,
+}
+
+#[allow(dead_code)] // S4-C removes this when it wires the history row.
+impl HistoryMenu {
+    /// `target`'s menu on `repo` with the history row ([`history_items`]; `eligible`: what the
+    /// graph says of a commit target), the bar on its first item.
+    pub fn new(target: Target, eligible: Eligibility, repo: &Repo) -> HistoryMenu {
+        let (commit, history) = match &target {
+            Target::Commit { commit, .. } => {
+                let items = history_items(commit, eligible, repo);
+                (Some(commit.clone()), items)
+            }
+            _ => (None, Vec::new()),
+        };
+        HistoryMenu {
+            menu: Menu::new(target, repo),
+            commit,
+            history,
+            bar: 0,
+            moved: false,
+        }
+    }
+
+    /// S3-B's menu inside.
+    pub fn menu(&self) -> &Menu {
+        &self.menu
+    }
+
+    pub fn history(&self) -> &[HistoryItem] {
+        &self.history
+    }
+
+    /// Its lines: S3-B's items, the history row, then `Repository…` unless this is the
+    /// repository's menu.
+    fn lines(&self) -> usize {
+        self.menu.items.len() + self.history.len() + usize::from(!self.menu.repository.is_empty())
+    }
+
+    /// The line `at` chosen.
+    fn choose(&mut self, at: usize) -> Option<HistoryMenuEnd> {
+        let n = self.menu.items.len();
+        if at < n {
+            return self.menu.choose(at).map(HistoryMenuEnd::Menu);
+        }
+        if let Some(item) = self.history.get(at - n) {
+            let commit = self.commit.clone()?;
+            return Some(HistoryMenuEnd::Edit {
+                id: item.id,
+                commit,
+            });
+        }
+        if at == n + self.history.len() && !self.menu.repository.is_empty() {
+            // `Repository…`: S3-B's menu turns into the repository's; the history row goes.
+            self.history.clear();
+            self.commit = None;
+            self.bar = 0;
+            return self.menu.choose(n).map(HistoryMenuEnd::Menu);
+        }
+        None
+    }
+
+    /// One pass, as S3-B's [`Menu::ui`]: ↑ ↓ PgUp PgDn Home End move the bar over all its lines,
+    /// Enter or a click chooses, Esc or F10 closes; its keys are taken before anything else sees
+    /// them.
+    pub fn ui(&mut self, ctx: &egui::Context) -> Option<HistoryMenuEnd> {
+        let take = |key: Key| ctx.input_mut(|i| keys::take(i, key, Mods::None));
+        if take(Key::Escape) || take(Key::F10) {
+            return Some(HistoryMenuEnd::Menu(MenuEnd::Cancel));
+        }
+        let last = self.lines().saturating_sub(1);
+        let page = 8;
+        for (key, to) in [
+            (Key::ArrowUp, self.bar.saturating_sub(1)),
+            (Key::ArrowDown, (self.bar + 1).min(last)),
+            (Key::PageUp, self.bar.saturating_sub(page)),
+            (Key::PageDown, (self.bar + page).min(last)),
+            (Key::Home, 0),
+            (Key::End, last),
+        ] {
+            if take(key) {
+                self.bar = to;
+                self.moved = true;
+            }
+        }
+        let mut chosen = take(Key::Enter).then_some(self.bar);
+        let cells = self
+            .menu
+            .items
+            .iter()
+            .map(|i| (i.label.as_str(), i.key.as_deref()))
+            .chain(
+                self.history
+                    .iter()
+                    .map(|i| (i.label.as_str(), i.key.as_deref())),
+            )
+            .map(|(label, key)| label.chars().count() + key.map_or(0, |k| k.chars().count() + 4))
+            .max()
+            .unwrap_or(0)
+            .max(NOTHING.chars().count().min(40))
+            .max(24);
+        let width = (cells as f32 * chrome::CELL.x).min(ctx.content_rect().width() * 0.8);
+        let (bar, moved) = (self.bar, std::mem::take(&mut self.moved));
+        let n = self.menu.items.len();
+        let line = |ui: &mut egui::Ui, at: usize, label: &str, key: Option<&str>| {
+            let mut button = egui::Button::selectable(at == bar, label)
+                .min_size(egui::vec2(width, chrome::CELL.y));
+            if let Some(key) = key {
+                button = button.right_text(key);
+            }
+            let r = ui.add(button);
+            if moved && at == bar {
+                r.scroll_to_me(None);
+            }
+            r.clicked()
+        };
+        let response = chrome::dialog(ctx, menu_id(), &self.menu.title, |ui| {
+            ui.set_width(width);
+            // As tall as it needs up to the most it may take, at once: without the floor egui
+            // grows a new modal's scroll area over several passes (about 20 lines at first).
+            let most = ctx.content_rect().height() * 0.7;
+            egui::ScrollArea::vertical()
+                .max_height(most)
+                .min_scrolled_height(most)
+                .show(ui, |ui| {
+                    for (k, item) in self.menu.items.iter().enumerate() {
+                        if line(ui, k, &item.label, item.key.as_deref()) {
+                            chosen = Some(k);
+                        }
+                    }
+                    if !self.history.is_empty() {
+                        ui.add_space(chrome::CELL.y / 2.0);
+                    }
+                    for (k, item) in self.history.iter().enumerate() {
+                        if line(ui, n + k, &item.label, item.key.as_deref()) {
+                            chosen = Some(n + k);
+                        }
+                    }
+                    if self.menu.items.is_empty() && self.history.is_empty() {
+                        ui.add(egui::Label::new(NOTHING).wrap());
+                    }
+                });
+            if !self.menu.repository.is_empty() {
+                ui.add_space(chrome::CELL.y / 2.0);
+                let at = n + self.history.len();
+                if line(ui, at, REPOSITORY, None) {
+                    chosen = Some(at);
+                }
+            }
+        });
+        if let Some(at) = chosen {
+            return self.choose(at);
+        }
+        response
+            .should_close()
+            .then_some(HistoryMenuEnd::Menu(MenuEnd::Cancel))
     }
 }
