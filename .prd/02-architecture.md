@@ -466,10 +466,11 @@ slice named here (§8); a file that exists today changes owner only from one sli
 | `src/fnkeys/{mod,macos}.rs`, `src/config.rs` | the macOS F-key switch, its lock, state and watchdog, the `fkeys` config key (04 §6) | S7-A |
 | `src/git/tests/*.rs`, `src/gui/browser/git_panel/tests*.rs` | each git WU's tests in a file of its own | the WU they test |
 
-- The remote layer grows **new traits in new files** (`remote::ops::FileOps`, `remote::treefs::TreeFs`)
-  implemented for `SftpRemote` and `LocalFs` in submodules of `sftp.rs` and `local.rs`. A submodule sees
-  its parent's private fields, so `sftp.rs`, `local.rs` and `RemoteFs` stay as they are; the slice's
-  scaffold step adds the `mod` lines.
+- The remote layer grows **new traits in new files** (`remote::ops::FileOps`, `remote::treefs::TreeFs`),
+  written in submodules of `sftp.rs` and `local.rs`: `FileOps` is implemented for `SftpRemote` and
+  `LocalFs`; `TreeFs` is a worker (05 §7) that `LocalFs::tree()` and `SftpRemote::into_tree()` build. A
+  submodule sees its parent's private fields, so `sftp.rs`, `local.rs` and `RemoteFs` stay as they are;
+  the slice's scaffold step adds the `mod` lines.
 - Git never goes through `RemoteFs`: it runs as a command (03 §3).
 
 ## 6. Threading and data flow
