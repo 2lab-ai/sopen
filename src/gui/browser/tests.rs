@@ -10,6 +10,7 @@ use std::io::Write;
 use std::path::Path;
 
 mod s1;
+mod s2;
 mod s5;
 
 const RUST: &str = "// a comment\nfn main() {\n    let answer = 42;\n}\n";
@@ -71,6 +72,7 @@ fn fixture_with(label: Option<&str>, connect: Connect, launch: Option<Launch>) -
         cache: cache.clone(),
         state_dir: tmp.path().join("state"),
         launch,
+        git: None,
     });
     let mut fx = Fx {
         _tmp: tmp,
@@ -1172,6 +1174,7 @@ fn w8b_a_legacy_preview_root_is_swept_when_the_browser_opens() {
         cache: cache.clone(),
         state_dir: tmp.path().join("state"),
         launch: Arc::new(|_: &str, _: bool| Ok(String::new())),
+        git: None,
     });
     let deadline = std::time::Instant::now() + Duration::from_secs(20);
     while legacy.exists() {
@@ -1651,6 +1654,7 @@ fn the_open_state_opens_an_entry_once_listed() {
         cache: tmp.path().join("cache"),
         state_dir: tmp.path().join("state"),
         launch: Arc::new(|_: &str, _: bool| Ok(String::new())),
+        git: None,
     });
     b.open_first = Some("main.rs".to_string());
     let mut drv = Driver::new(1000.0, 700.0);
@@ -1676,6 +1680,7 @@ fn the_at_state_opens_a_text_file_at_that_byte() {
         cache: tmp.path().join("cache"),
         state_dir: tmp.path().join("state"),
         launch: Arc::new(|_: &str, _: bool| Ok(String::new())),
+        git: None,
     });
     b.open_first = Some("rows.txt".to_string());
     // Inside "row 0600".
@@ -1711,6 +1716,7 @@ fn the_loading_state_reaches_the_text_viewer_the_browser_opens() {
             cache: tmp.path().join("cache"),
             state_dir: tmp.path().join("state"),
             launch: Arc::new(|_: &str, _: bool| Ok(String::new())),
+            git: None,
         });
         let state = crate::gui::State::parse(text).unwrap();
         b.scripted(&state);

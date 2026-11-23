@@ -165,6 +165,26 @@ pub fn prepare(
     cancel: &AtomicBool,
     progress: &mut dyn FnMut(u64, u64),
 ) -> Result<Prepared> {
+    prepare_with(req, false, cancel, progress)
+}
+
+/// [`prepare`] for a file at a revision or a diff (03 §6.2–§6.3, S2-F), opened read-only from
+/// the cache's `.revisions`: read where it is — an image is not copied into the cache's mirror
+/// (it is never saved, and nothing of it may outlive its window).
+pub fn prepare_in_place(
+    req: &Request,
+    cancel: &AtomicBool,
+    progress: &mut dyn FnMut(u64, u64),
+) -> Result<Prepared> {
+    prepare_with(req, true, cancel, progress)
+}
+
+fn prepare_with(
+    req: &Request,
+    in_place: bool,
+    cancel: &AtomicBool,
+    progress: &mut dyn FnMut(u64, u64),
+) -> Result<Prepared> {
     let mut fs = (req.connect)()?;
     let abs = fs.realpath(req.abs)?;
     let req = &Request { abs: &abs, ..*req };
@@ -185,28 +205,36 @@ pub fn prepare(
     let path = PathBuf::from(req.abs);
     match kind {
         Kind::Image => {
-            // Always a copy, as the standalone route makes it: Save needs the bytes as opened.
-            let (fetched, _ms) = cache::fetch_claimed_cancellable(
-                fs.as_mut(),
-                cache::LOCAL_HOST,
-                req.abs,
-                req.cache,
-                progress,
-                cancel,
-            )?;
-            let bytes = std::fs::read(&fetched.claim.local)
-                // Read from the copy, said about the file: the copy is never named.
-                .with_context(|| format!("cannot read {}", req.show()))?;
+            // Always a copy, as the standalone route makes it: Save needs the bytes as opened —
+            // but a file at a revision is read where it is (it is never saved).
+            let (bytes, at, notices, claim) = if in_place {
+                let bytes =
+                    std::fs::read(&path).with_context(|| format!("cannot read {}", req.show()))?;
+                (bytes, stat, Vec::new(), None)
+            } else {
+                let (fetched, _ms) = cache::fetch_claimed_cancellable(
+                    fs.as_mut(),
+                    cache::LOCAL_HOST,
+                    req.abs,
+                    req.cache,
+                    progress,
+                    cancel,
+                )?;
+                let bytes = std::fs::read(&fetched.claim.local)
+                    // Read from the copy, said about the file: the copy is never named.
+                    .with_context(|| format!("cannot read {}", req.show()))?;
+                (bytes, fetched.at, fetched.notices, Some(fetched.claim))
+            };
             let doc = match image::decode_unless_asking(&bytes, image::probe::BUDGET, true) {
                 Ok(Some(doc)) => doc,
                 // 06 §7.3, for a local image too: the memory line first, with Hex view.
                 Ok(None) => {
-                    let file = ImageFile::new(req.origin(fs, fetched.at), bytes, req.cache);
+                    let file = ImageFile::new(req.origin(fs, at), bytes, req.cache);
                     return Ok(Prepared::ImageAsking {
                         file,
                         path,
-                        notices: fetched.notices,
-                        claim: Some(fetched.claim),
+                        notices,
+                        claim,
                     });
                 }
                 // 06 §7.3: a file that does not decode is shown as bytes, why said first.
@@ -218,12 +246,12 @@ pub fn prepare(
                     });
                 }
             };
-            let file = ImageFile::new(req.origin(fs, fetched.at), bytes, req.cache);
+            let file = ImageFile::new(req.origin(fs, at), bytes, req.cache);
             Ok(Prepared::Image {
                 file,
                 doc,
-                notices: fetched.notices,
-                claim: Some(fetched.claim),
+                notices,
+                claim,
             })
         }
         Kind::Video | Kind::Audio => {

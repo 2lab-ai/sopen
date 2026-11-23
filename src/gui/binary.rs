@@ -1827,6 +1827,11 @@ pub struct BinaryWindow {
     /// Passes so far, and the height last asked of the window (and when).
     frames: u64,
     asked: Option<(f32, u64)>,
+    /// A file at a revision (03 §6.3, S2-F): "Save to…" is off with the reason, and the hex
+    /// window it becomes is read-only. The browser never routes such a file here (it opens
+    /// anything that is not text, an image or media in the hex window); this keeps the dialog
+    /// from being a way to save one.
+    read_only: bool,
 }
 
 impl Drop for BinaryWindow {
@@ -1877,6 +1882,7 @@ impl BinaryWindow {
             field_save: false,
             frames: 0,
             asked: None,
+            read_only: false,
         }
     }
 
@@ -1929,6 +1935,11 @@ impl BinaryWindow {
     /// Save to the path in the field — exactly as typed (only an empty field is refused) — on a
     /// worker. A folder gets the file's name inside it.
     fn start_save(&mut self, ctx: &egui::Context, from_field: bool) {
+        if self.read_only {
+            let why = super::image::AT_A_REVISION;
+            self.notes = vec![(format!("cannot save: {why}"), true)];
+            return;
+        }
         if self.path.trim().is_empty() {
             self.notes = vec![("type a path to save to".to_string(), true)];
             if from_field {
@@ -2119,6 +2130,10 @@ impl BinaryWindow {
                                 hex::WINDOW.into(),
                             ));
                         }
+                        let mut window = window;
+                        if self.read_only {
+                            window.set_read_only(true);
+                        }
                         self.stage = Stage::Hex(Box::new(window));
                     }
                     Err(e) => {
@@ -2185,12 +2200,13 @@ impl BinaryWindow {
                 self.start_hex(&ctx);
             }
             let save = ui
-                .add_enabled(asking, egui::Button::new("Save to…"))
+                .add_enabled(asking && !self.read_only, egui::Button::new("Save to…"))
                 .on_hover_text(if local {
                     "copies it to the path below; never over an existing file"
                 } else {
                     "downloads it to the path below; never over an existing file"
-                });
+                })
+                .on_disabled_hover_text(super::image::AT_A_REVISION);
             if save.clicked() {
                 self.start_save(&ctx, false);
             }
@@ -2415,6 +2431,14 @@ impl Window for BinaryWindow {
         self.painted = true;
     }
 
+    /// A file at a revision: "Save to…" off, the hex window it becomes read-only (03 §6.3).
+    fn set_read_only(&mut self, read_only: bool) {
+        self.read_only = read_only;
+        if let Stage::Hex(window) = &mut self.stage {
+            window.set_read_only(read_only);
+        }
+    }
+
     fn ready(&self) -> bool {
         // On screen once the window has its content's size (a pass or two after asking).
         let sized = self.hooks.window_size.is_some()
@@ -2448,3 +2472,79 @@ impl Window for BinaryWindow {
 
 #[cfg(test)]
 mod tests;
+
+/// S2-F: the dialog is never a way to save a file at a revision (S2-E's hand-over).
+#[cfg(test)]
+mod read_only_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// A source that counts what is asked of it and does nothing.
+    struct Counted(Arc<AtomicUsize>);
+
+    impl Source for Counted {
+        fn open_hex(&mut self, _: &mut dyn FnMut(u64, u64)) -> Result<Opened> {
+            anyhow::bail!("not here")
+        }
+
+        fn save_to(
+            &mut self,
+            _: &Path,
+            _: &mut dyn FnMut(u64, u64),
+            _: &Decision,
+        ) -> std::result::Result<SavedTo, SaveError> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Err(SaveError::Failed(anyhow::anyhow!("not here")))
+        }
+    }
+
+    struct Never;
+
+    impl Chooser for Never {
+        fn choose(&mut self, _: &Path) -> Receiver<Option<PathBuf>> {
+            std::sync::mpsc::channel().1
+        }
+    }
+
+    /// A click on "Save to…" (off) saves nothing, and the save itself (`start_save`, where the
+    /// button and Enter in the path field both lead) refuses with the reason in the dialog's
+    /// notes. The hover text and the Enter key are not driven here.
+    #[test]
+    fn a_file_at_a_revision_has_no_save_to() {
+        let saves = Arc::new(AtomicUsize::new(0));
+        let tmp = tempfile::tempdir().unwrap();
+        let hooks = Hooks {
+            save_to: Some(tmp.path().join("out.bin")),
+            ..Hooks::default()
+        };
+        let info = Info {
+            title: "/r/blob.bin @ 0123abcd".into(),
+            name: "blob.bin".into(),
+            size: 4,
+            local: true,
+        };
+        let mut win = BinaryWindow::new(
+            info,
+            Box::new(Counted(saves.clone())),
+            Box::new(Never),
+            &hooks,
+        );
+        win.set_read_only(true);
+        let mut drv = crate::gui::testkit::Driver::new(WINDOW[0], 320.0);
+        drv.idle(&mut win, 3);
+        drv.click_text(&mut win, "Save to…");
+        drv.idle(&mut win, 2);
+        let ctx = drv.ctx.clone();
+        win.start_save(&ctx, true);
+        drv.idle(&mut win, 2);
+        assert_eq!(saves.load(Ordering::SeqCst), 0, "nothing saved");
+        assert!(
+            win.notes
+                .iter()
+                .any(|(n, e)| *e && n.contains(super::super::image::AT_A_REVISION)),
+            "{:?}",
+            win.notes
+        );
+        assert!(!tmp.path().join("out.bin").exists());
+    }
+}

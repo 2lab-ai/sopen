@@ -3045,6 +3045,162 @@ fn the_real_child_publishes_nothing_before_the_go_ahead() {
     }
 }
 
+/// This machine's git for a test, or `None` with a note (a failure under `SOPEN_REQUIRE_GIT=1`).
+fn test_git() -> Option<()> {
+    let found = Command::new("git")
+        .arg("version")
+        .output()
+        .is_ok_and(|o| o.status.success());
+    if found {
+        return Some(());
+    }
+    assert!(
+        std::env::var("SOPEN_REQUIRE_GIT").map_or(true, |v| v != "1"),
+        "git is required (SOPEN_REQUIRE_GIT=1) and there is none"
+    );
+    eprintln!("skipping: no git on this machine");
+    None
+}
+
+/// 03 G-G1's fixture: two branches and a merge, an octopus merge, an annotated and a
+/// lightweight tag, a remote with `main` at the local `main` and `feature` behind it, a stash,
+/// two uncommitted changes. Fixed identity and dates, no config of the machine's.
+const G_G1: &str = r#"set -eu
+root=$1
+mkdir -p "$root/home"
+export HOME="$root/home" GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null LC_ALL=C TZ=UTC
+export GIT_AUTHOR_NAME=Ann GIT_AUTHOR_EMAIL=ann@example.com GIT_COMMITTER_NAME=Ann GIT_COMMITTER_EMAIL=ann@example.com
+t=1767225600
+c() { t=$((t+3600)); GIT_AUTHOR_DATE="$t +0000" GIT_COMMITTER_DATE="$t +0000" git "$@"; }
+git init -q -b main "$root/repo"; cd "$root/repo"
+echo one > a.txt; mkdir sub; echo s > sub/s.txt; git add -A; c commit -q -m "first commit"
+git branch feature; git branch x; git branch y
+echo two > b.txt; git add -A; c commit -q -m "main: second"; git tag light
+git checkout -q feature; echo f > f.txt; git add -A; c commit -q -m "feature: work"
+git checkout -q x; echo x > x.txt; git add -A; c commit -q -m "x: side work"
+git checkout -q y; echo y > y.txt; git add -A; c commit -q -m "y: other side work"
+git checkout -q main; c merge -q --no-ff -m "Merge branch 'feature'" feature
+c merge -q --no-ff -m "Merge branches 'x' and 'y'" x y >/dev/null
+c tag -a -m "version one" v1.0
+echo three >> a.txt; git add -A; c commit -q -m "main: third"
+git init -q --bare "$root/origin.git"
+git remote add origin "$root/origin.git"
+git push -q origin main feature
+git checkout -q feature; echo more >> f.txt; git add -A; c commit -q -m "feature: ahead of origin"
+git checkout -q main
+git branch --set-upstream-to=origin/main main >/dev/null
+echo stashed > u.txt; echo stash >> a.txt; c stash push -q -u -m "work in progress"
+echo changed >> a.txt; echo new > n.txt
+"#;
+
+/// Builds G-G1's fixture under `root`: `root/repo` and its remote `root/origin.git`.
+fn g_g1_fixture(root: &Path) {
+    let out = Command::new("sh")
+        .arg("-c")
+        .arg(G_G1)
+        .arg("sh")
+        .arg(root)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", text(&out.stderr));
+}
+
+/// 03 G-G1 and G-D1 (`SOPEN_LIST=git`, 02 §9): in a work tree's subfolder the first page prints
+/// — the frame title line is the top level, the uncommitted row first, `►main↔origin`,
+/// `origin/feature`, both tags, `stash@{0}`, the octopus merge, the lanes in ASCII — then the
+/// paging line; the golden text, dates in UTC.
+#[test]
+fn sopen_list_git_prints_the_first_page() {
+    if test_git().is_none() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let root = std::fs::canonicalize(tmp.path()).unwrap();
+    g_g1_fixture(&root);
+    let repo = root.join("repo");
+    let home = root.join("home");
+    let out = sopen(
+        tmp.path(),
+        &["--here", repo.join("sub").to_str().unwrap()],
+        &[
+            ("SOPEN_LIST", "git"),
+            ("TZ", "UTC"),
+            ("HOME", home.to_str().unwrap()),
+            ("GIT_CONFIG_NOSYSTEM", "1"),
+            ("GIT_CONFIG_GLOBAL", "/dev/null"),
+        ],
+    );
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let listed = text(&out.stdout);
+    let lines: Vec<&str> = listed.lines().collect();
+    assert_eq!(lines[0], repo.to_str().unwrap(), "{listed}");
+    let golden = [
+        "o         Uncommitted changes (2)  *    *",
+        "| *       [feature] feature: ahead of origin  Ann  2026-01-01 10:00  a299fc4f",
+        "| | =     [stash@{0}] On main: work in progress    2026-01-01 11:00  4a70fd50",
+        "@/|       [►main↔origin] main: third  Ann  2026-01-01 09:00  b455002a",
+        "*\\|       [v1.0] Merge branches 'x' and 'y'  Ann  2026-01-01 07:00  976b4028",
+        "*\\| | |   Merge branch 'feature'  Ann  2026-01-01 06:00  cd8fa821",
+        "| | | *   [y] y: other side work  Ann  2026-01-01 05:00  cf3dd192",
+        "| | * |   [x] x: side work  Ann  2026-01-01 04:00  5d70bb93",
+        "| * | |   [origin/feature] feature: work  Ann  2026-01-01 03:00  0b03602c",
+        "* | | |   [light] main: second  Ann  2026-01-01 02:00  7ab4bb8e",
+        "*/        first commit  Ann  2026-01-01 01:00  9ca3c71f",
+        "9 commits · all loaded",
+    ];
+    assert_eq!(lines[1..], golden[..], "{listed}");
+}
+
+/// 03 G-D1's other half: a bare repository, the inside of `.git`, a plain folder, and
+/// `SOPEN_GIT=/nonexistent` → the directory listing (as `SOPEN_LIST=1`) and one line saying why.
+#[test]
+fn sopen_list_git_outside_a_work_tree_lists_and_says_why() {
+    if test_git().is_none() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let root = std::fs::canonicalize(tmp.path()).unwrap();
+    g_g1_fixture(&root);
+    let plain = root.join("plain");
+    std::fs::create_dir(&plain).unwrap();
+    std::fs::write(plain.join("a.txt"), "a").unwrap();
+    let home = root.join("home");
+    let list = |dir: &Path, git: Option<&str>| {
+        let mut env = vec![
+            ("SOPEN_LIST", "git"),
+            ("HOME", home.to_str().unwrap()),
+            ("GIT_CONFIG_NOSYSTEM", "1"),
+            ("GIT_CONFIG_GLOBAL", "/dev/null"),
+        ];
+        if let Some(git) = git {
+            env.push(("SOPEN_GIT", git));
+        }
+        let out = sopen(tmp.path(), &["--here", dir.to_str().unwrap()], &env);
+        assert!(out.status.success(), "{}", text(&out.stderr));
+        text(&out.stdout)
+    };
+    for (dir, git, why) in [
+        (root.join("origin.git"), None, "bare"),
+        (root.join("repo/.git"), None, "not a work tree"),
+        (plain.clone(), None, "not a repository"),
+        (root.join("repo"), Some("/nonexistent"), "no git"),
+    ] {
+        let listed = list(&dir, git);
+        let lines: Vec<&str> = listed.lines().collect();
+        assert_eq!(lines[0], dir.to_str().unwrap(), "{listed}");
+        assert!(
+            lines[1].starts_with("..") && lines[1].ends_with("<UP>"),
+            "{listed}"
+        );
+        let last = lines.last().unwrap();
+        assert!(
+            last.starts_with("git panel: ") && last.contains(why),
+            "{why}: {listed}"
+        );
+        assert!(lines[lines.len() - 2].contains(" Listed = "), "{listed}");
+    }
+}
+
 // ---------------------------------------------------------------------------------------------
 // `sopen URL` (spec §4a). The browser is always a stand-in (`SOPEN_BROWSER`): a script that
 // appends its arguments, one call a block ended by `---`, so no test opens a real browser.

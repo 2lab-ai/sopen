@@ -39,11 +39,26 @@ pub(crate) mod view;
 use super::chrome::{self, FKey};
 use super::{help, Embedded, Hooks, Outcome, Status, Window};
 use crate::fileops::{self, Item, ItemOutcome, Report};
+use crate::git::detect::{self, Detector};
+use crate::git::graph::{Row, RowStream};
+use crate::git::history::{
+    self, argv::Side as DiffSide, Generation, Git as _, LogOptions, LogStream, Page, PageEnd,
+    RunnerGit, StartError,
+};
+use crate::git::model::{
+    Change, ChangedFile, CommitDetails, Detection, FileLetter, Head, Oid, RefLabel, StashRow,
+    Status as GitStatus, StatusState, Unavailable,
+};
+use crate::git::runner::{Class, Ending, GitCommand, GitRunner, Handle, LocalGit, SshGit, StopBy};
 use crate::remote::ops::FileOps;
 use crate::remote::treefs::TreeFs;
 use crate::remote::{EntryKind, LocalFs, RemoteFs, SftpRemote};
 use anyhow::{bail, Result};
 use eframe::egui::{self, Key, Modifiers, Pos2, Rect, Sense, Vec2};
+use git_panel::{
+    Details, FileGroup, FileRow, GitAction, GitView, Group, HeadRef, Paging, RowKey, Subject,
+    Summary, Tracking,
+};
 use keys::{Command, Context, Step};
 pub use panel::Panel;
 use prepare::Prepared;
@@ -77,8 +92,8 @@ pub struct Start {
     pub label: Option<String>,
     /// The host as `ssh` takes it (`user@host`, an IPv6 host unbracketed:
     /// [`RemoteSpec::destination`](crate::target::RemoteSpec::destination), not `label`); `None`
-    /// on this machine. For what runs over the folder's ssh master besides the listing (02 §5:
-    /// git, from S2); nothing reads it yet.
+    /// on this machine. For what runs over the folder's ssh master besides the listing: git
+    /// ([`git_connect`] takes it).
     pub destination: Option<String>,
     /// The folder (absolute).
     pub abs: String,
@@ -89,6 +104,9 @@ pub struct Start {
     /// go over it.
     pub state_dir: PathBuf,
     pub launch: Launch,
+    /// Makes the git runner for the folder's host (03 §3; [`git_connect`]); `None`: no git
+    /// panel in this window.
+    pub git: Option<GitConnect>,
 }
 
 /// What the browser's features tell it (02 §7): [`Browser::event`] handles them.
@@ -490,6 +508,8 @@ struct Opening {
     total: Arc<AtomicU64>,
     cancel: Arc<AtomicBool>,
     source: Source,
+    /// A diff or a file at a revision (03 §6.2–§6.3): its viewer is read-only.
+    read_only: Option<ReadOnly>,
 }
 
 /// Where an opening's file comes from.
@@ -513,6 +533,9 @@ struct Viewer {
     abs: String,
     /// An image read through a stream: where it gives way to the hex window (06 §7.3).
     switch: Option<super::image::HexSwitch>,
+    /// A diff or a file at a revision (03 §6.3): the viewer was told before its first pass, and
+    /// so is the hex window it gives way to.
+    read_only: bool,
 }
 
 /// The directory tree on the side that had the keyboard when F10 was pressed (05; 02 §3.1
@@ -732,6 +755,8 @@ pub(crate) struct Browser {
     tree_connect: TreeConnect,
     /// The tree's host as its per-process cache knows it: empty on this machine, else `label`.
     tree_host: String,
+    /// The git panels (03): the host, detection, the panels, the pin.
+    git: GitSide,
 }
 
 impl Drop for Browser {
@@ -754,6 +779,13 @@ impl Drop for Browser {
         // A running file operation is waited for, not stopped (02 §6); a preview's
         // preparation is cancelled and not waited for (02 §4.4: the host's own drop).
         leftover.ops = Some(std::mem::replace(&mut self.ops, ops::Ops::new(no_engine())));
+        // The git panels' reads and streams stop with their handles; the `.revisions` folder
+        // goes once the viewers that may read it are done, off the window's thread.
+        self.git.panels.clear();
+        let space = self.git.space.clone();
+        leftover.workers.push(std::thread::spawn(move || {
+            drop(space.lock().unwrap_or_else(|p| p.into_inner()).take());
+        }));
     }
 }
 
@@ -797,6 +829,7 @@ impl Browser {
         );
         let tree_connect = tree_connect(start.label.clone(), start.state_dir.clone());
         let tree_host = start.label.clone().unwrap_or_default();
+        let git = GitSide::new(start.git, start.label.as_deref());
         let mut browser = Self {
             title: show(start.label.as_deref(), &start.abs),
             label: start.label,
@@ -837,6 +870,7 @@ impl Browser {
             tree: None,
             tree_connect,
             tree_host,
+            git,
         };
         browser.list(None, start.abs, None, None);
         browser
@@ -928,11 +962,28 @@ impl Browser {
 
     /// Makes the file at `abs` ready for its viewer, on a worker.
     fn start_open(&mut self, ctx: &egui::Context, abs: String, name: String) {
+        let (connect, label) = (self.connect.clone(), self.label.clone());
+        self.start_open_with(ctx, abs, name, connect, label, None);
+    }
+
+    /// [`Browser::start_open`] over `connect` to `label`'s files (a diff or a file at a revision
+    /// is this machine's, in the cache's `.revisions`, whatever the folder's host), read-only
+    /// when `read_only` says so.
+    fn start_open_with(
+        &mut self,
+        ctx: &egui::Context,
+        abs: String,
+        name: String,
+        connect: Connect,
+        label: Option<String>,
+        read_only: Option<ReadOnly>,
+    ) {
         let (done, total) = (Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)));
         let cancel = Arc::new(AtomicBool::new(false));
         let (tx, rx) = mpsc::channel();
-        let (connect, label, cache) =
-            (self.connect.clone(), self.label.clone(), self.cache.clone());
+        let remote = label.is_some();
+        let in_place = read_only.is_some();
+        let cache = self.cache.clone();
         let (d, t, stop, waker, path) = (
             done.clone(),
             total.clone(),
@@ -957,7 +1008,11 @@ impl Browser {
                 t.store(all, Ordering::Relaxed);
                 waker.request_repaint();
             };
-            let result = prepare::prepare(&req, &stop, &mut progress);
+            let result = if in_place {
+                prepare::prepare_in_place(&req, &stop, &mut progress)
+            } else {
+                prepare::prepare(&req, &stop, &mut progress)
+            };
             let _ = tx.send(result);
             waker.request_repaint();
         });
@@ -965,7 +1020,7 @@ impl Browser {
         self.opening = Some(Opening {
             abs,
             name,
-            remote: self.label.is_some(),
+            remote,
             done,
             total,
             cancel,
@@ -973,6 +1028,7 @@ impl Browser {
                 rx,
                 worker: Some(worker),
             },
+            read_only,
         });
     }
 
@@ -1023,7 +1079,49 @@ impl Browser {
                 }
                 None => {}
             },
-            Command::OtherSide => self.active = 1 - active,
+            // Tab (02 §3.2): into the other side's git panel when it shows one (pinned or O6),
+            // else into its list.
+            Command::OtherSide => match self.shown.as_ref().map(|s| &s[1 - active]) {
+                Some(view::Content::Git(_)) => {
+                    self.git.focus = true;
+                    self.moved_at = None;
+                }
+                _ => self.active = 1 - active,
+            },
+            // Cmd/Ctrl+G (02 §3.2): the active folder's repository pinned to the other side;
+            // again, unpinned.
+            Command::Pin => {
+                if self.git.pin.take().is_some() {
+                    self.moved_at = None;
+                    return;
+                }
+                let dir = self.panels[active].dir.clone();
+                match self.git.detections.get(&dir) {
+                    Some(Detection::WorkTree { top, .. }) => {
+                        self.git.pin = Some(view::Pin {
+                            side: 1 - active,
+                            repo: top.clone(),
+                        });
+                        self.moved_at = None;
+                    }
+                    found => {
+                        let host = self.label.clone().unwrap_or_else(|| "this machine".into());
+                        let why = found.and_then(|d| d.reason(&host)).unwrap_or_else(|| {
+                            match (found, &self.git.connect) {
+                                (None, Some(_)) => {
+                                    "git panel: still asking git about this folder".into()
+                                }
+                                (None, None) => "git panel: no git in this window".into(),
+                                _ => "git panel: not in a git work tree".into(),
+                            }
+                        });
+                        self.status = Status::info(format!(
+                            "{why} — nothing to pin ({})",
+                            show(self.label.as_deref(), &dir)
+                        ));
+                    }
+                }
+            }
             Command::SwitchMode => {
                 self.mode = self.mode.other();
                 // A mode change commits at once (02 §3.1).
@@ -1044,12 +1142,26 @@ impl Browser {
             Command::Reread => {
                 let (dir, at) = (panel.dir.clone(), panel.highlight);
                 let name = panel.current().map(|e| e.name.clone());
+                // 03 §2.2: the folder is detected again — and a host whose git could not be
+                // reached (none, too old, its ssh options unread) is asked again.
+                self.git.detector.forget(&self.git.host, &dir);
+                self.git.detections.remove(&dir);
+                self.git.said.remove(&dir);
+                // On the frame: only if the lock is free at once (it is held for a store only).
+                if let Ok(mut made) = self.git.runner.try_lock() {
+                    if made.as_ref().is_some_and(|r| r.is_err()) {
+                        *made = None;
+                    }
+                }
                 self.relist(Some(active), dir, name, Some(at), Some(ctx));
             }
             Command::SwapPanels => {
                 self.panels.swap(0, 1);
-                // The keyboard goes with its list.
-                self.active = 1 - active;
+                // The keyboard goes with its list — unless the other side is pinned: the pin
+                // belongs to its side, and the keyboard's list stays where it is.
+                if self.git.pin.is_none() {
+                    self.active = 1 - active;
+                }
             }
             Command::Tree => self.open_tree(ctx),
             Command::SameFolder(side) => {
@@ -1068,12 +1180,15 @@ impl Browser {
     }
 
     /// Esc in the list (02 §3.2): stops a running fetch, else a running file operation —
-    /// the engine stops at its next check and reports what it did (04 §5.1, §5.2).
+    /// the engine stops at its next check and reports what it did (04 §5.1, §5.2) — else, when
+    /// a pin exists, unpins it.
     fn stop(&mut self) {
         if let Some(opening) = &self.opening {
             opening.cancel.store(true, Ordering::Relaxed);
         } else if self.ops.busy() {
             self.ops.stop();
+        } else if self.git.pin.take().is_some() {
+            self.moved_at = None;
         }
     }
 
@@ -1097,6 +1212,16 @@ impl Browser {
             BrowserEvent::FilesChanged { host, dirs } => {
                 if host != self.label {
                     return;
+                }
+                // 03 §5: a git panel whose top level holds one soft-refreshes.
+                for i in 0..self.git.panels.len() {
+                    let top = self.git.panels[i].top.clone();
+                    let inside = |d: &String| {
+                        *d == top || d.starts_with(&format!("{}/", top.trim_end_matches('/')))
+                    };
+                    if dirs.iter().any(inside) {
+                        self.start_read(ctx, i, true, 0);
+                    }
                 }
                 for i in 0..2 {
                     let panel = &self.panels[i];
@@ -1225,8 +1350,16 @@ impl Browser {
                 panel.highlight = row.min(panel.entries.len().saturating_sub(1));
             }
         }
-        // A listing is not a bar move: what it changes commits at once (02 §3.1).
+        // A listing is not a bar move: what it changes commits at once (02 §3.1). A folder whose
+        // detection failed (an answer it could not read, a lost channel) is asked again on this
+        // visit (S2-B: such a result is not cached).
         self.moved_at = None;
+        if matches!(
+            self.git.detections.get(&dir),
+            Some(Detection::Unavailable(Unavailable::Failed(_)))
+        ) {
+            self.git.detections.remove(&dir);
+        }
         let first = self.open_first.take().map(|name| (name, true));
         let first = first.or_else(|| self.bar_first.take().map(|name| (name, false)));
         if let Some((name, open)) = first {
@@ -1269,7 +1402,7 @@ impl Browser {
             return;
         };
         let cancelled = opening.cancel.load(Ordering::Relaxed);
-        let (abs, name) = (opening.abs, opening.name);
+        let (abs, name, read_only) = (opening.abs, opening.name, opening.read_only);
         if let Source::Fresh {
             worker: Some(worker),
             ..
@@ -1292,7 +1425,7 @@ impl Browser {
                 drop(result);
                 self.status = not_opened(&name, self.label.is_some());
             }
-            Ok(result) => self.opened(ctx, result, abs, name),
+            Ok(result) => self.opened(ctx, result, abs, name, read_only),
             // The preview's preparation, taken over, came to its end: the live preview becomes
             // the viewer — or it is an info card (an error), and the file opens as from the
             // list.
@@ -1310,8 +1443,16 @@ impl Browser {
         }
     }
 
-    /// The file at `abs` came back ready: its viewer shows, in this window.
-    fn opened(&mut self, ctx: &egui::Context, result: Result<Prepared>, abs: String, name: String) {
+    /// The file at `abs` came back ready: its viewer shows, in this window — read-only, titled
+    /// and edited as `read_only` says, for a diff or a file at a revision (03 §6.2–§6.3).
+    fn opened(
+        &mut self,
+        ctx: &egui::Context,
+        result: Result<Prepared>,
+        abs: String,
+        name: String,
+        read_only: Option<ReadOnly>,
+    ) {
         let prepared = match result {
             Ok(prepared) => prepared,
             Err(e) if crate::remote::is_cancelled(&e) => {
@@ -1324,7 +1465,10 @@ impl Browser {
                 return;
             }
         };
-        let title = show(self.label.as_deref(), &abs);
+        let title = match &read_only {
+            Some(r) => r.title.clone(),
+            None => show(self.label.as_deref(), &abs),
+        };
         let mut switch = None;
         let (embedded, hold) = match prepared {
             Prepared::Image {
@@ -1414,7 +1558,12 @@ impl Browser {
             }
         };
         self.status = Status::default();
-        self.view(ctx, embedded, hold, abs, switch);
+        // F4 in a viewer of a revision opens the file's path now, never the cache's copy.
+        let (abs, read_only) = match read_only {
+            Some(r) => (r.edit, true),
+            None => (abs, false),
+        };
+        self.view(ctx, embedded, hold, abs, switch, read_only);
     }
 
     /// What `SOPEN_STATE` asks of the browser (a scripted run): the entry to open or to put
@@ -1425,6 +1574,12 @@ impl Browser {
         self.open_loading = state.loading;
         self.mode = state.mode;
         self.bar_first = state.bar.clone();
+        self.git.script = GitScript {
+            pin: state.git_pin,
+            select: state.select.clone(),
+            details: state.details,
+            label: state.label,
+        };
     }
 
     /// A preview handed over (02 §4.4): the live window is the viewer.
@@ -1433,18 +1588,24 @@ impl Browser {
             [] => Status::default(),
             said => Status::info(said.join(" · ")),
         };
-        self.view(ctx, viewer.embedded, viewer.hold, abs, None);
+        self.view(ctx, viewer.embedded, viewer.hold, abs, None, false);
     }
 
-    /// `embedded` is the viewer on screen from now on.
+    /// `embedded` is the viewer on screen from now on; `read_only` (a diff, a file at a
+    /// revision) is told to it here, before its first pass (03 §6.3; S2-E: a flag set later
+    /// could let a recovery of an earlier session start).
     fn view(
         &mut self,
         ctx: &egui::Context,
-        embedded: Embedded,
+        mut embedded: Embedded,
         hold: Option<crate::cache::Claim>,
         abs: String,
         switch: Option<super::image::HexSwitch>,
+        read_only: bool,
     ) {
+        if read_only {
+            embedded.window.set_read_only(true);
+        }
         // The list gave up the keyboard: the viewer's keys are its own now.
         ctx.memory_mut(|m| m.surrender_focus(list_id()));
         self.exit = Exit::List;
@@ -1456,6 +1617,7 @@ impl Browser {
             hold,
             abs,
             switch,
+            read_only,
         });
         self.moved_at = None;
     }
@@ -1554,6 +1716,7 @@ impl Browser {
                             total: prep.total.clone(),
                             cancel: prep.cancel.clone(),
                             source: Source::Preview(prep),
+                            read_only: None,
                         });
                     }
                     preview::Taken::Nothing => self.start_open(ctx, path, entry.name),
@@ -1923,7 +2086,11 @@ impl Browser {
     /// typed text ask for, in order. Not while a dialog or the rename field has the keyboard
     /// (04 §3 rule 4: its typing and its Enter and Esc are its own).
     fn list_keys(&mut self, ctx: &egui::Context) {
-        while !self.ops.holds_keyboard() && self.viewer.is_none() && self.tree.is_none() {
+        while !self.ops.holds_keyboard()
+            && self.viewer.is_none()
+            && self.tree.is_none()
+            && self.git_focused().is_none()
+        {
             let Some(command) = ctx.input_mut(|i| keys::lookup(i, Context::List)) else {
                 break;
             };
@@ -1935,6 +2102,33 @@ impl Browser {
     /// measured on egui's clock, and the preview host told what the committed display is.
     fn resolve(&mut self, ctx: &egui::Context) {
         let now = ctx.input(|i| i.time);
+        // The keyboard in a git panel: the one the committed display shows opposite the active
+        // list — kept under a viewer it opened (Esc comes back to it); a display that no longer
+        // shows one gives the keyboard back.
+        let pinned_there = self
+            .git
+            .pin
+            .as_ref()
+            .filter(|p| p.side == 1 - self.active)
+            .map(|p| p.repo.clone());
+        let in_git = match self.shown.as_ref().map(|s| &s[1 - self.active]) {
+            _ if !self.git.focus => None,
+            // The pinned side shows its panel whatever the display showed (rule 2).
+            _ if pinned_there.is_some() && self.viewer.is_none() => {
+                self.git.focus_top = pinned_there.clone();
+                pinned_there
+            }
+            Some(view::Content::Git(top)) => {
+                self.git.focus_top = Some(top.clone());
+                Some(top.clone())
+            }
+            Some(view::Content::Viewer) => self.git.focus_top.clone(),
+            _ => None,
+        };
+        if self.git.focus && in_git.is_none() && self.shown.is_some() {
+            self.git.focus = false;
+            self.git.wide = false;
+        }
         let panel = &self.panels[self.active];
         let entry = panel.current();
         let bar_is = (
@@ -1965,9 +2159,18 @@ impl Browser {
             Some(want) => view::Bar::File(want.path.clone()),
             None => view::Bar::Other,
         };
+        let focus = match (&self.tree, &in_git) {
+            (Some(t), _) => t.side,
+            (None, Some(_)) => 1 - self.active,
+            (None, None) => self.active,
+        };
         let resolved = view::resolve(&view::Inputs {
             mode: self.mode,
-            focus: self.tree.as_ref().map_or(self.active, |t| t.side),
+            focus,
+            in_git: in_git.clone(),
+            repo: self.git.repo_of(&panel.dir).map(str::to_string),
+            pin: self.git.pin.clone(),
+            git_wide: self.git.wide,
             tree_snapshot: self.tree.as_ref().map(|t| t.snapshot.clone()),
             bar,
             rest: self
@@ -2002,7 +2205,7 @@ impl Browser {
             Some(_) => None,
             None => file
                 .as_ref()
-                .filter(|_| self.opening.is_none() && self.viewer.is_none())
+                .filter(|_| self.opening.is_none() && self.viewer.is_none() && in_git.is_none())
                 .map(|w| w.path.as_str()),
         };
         self.preview.sync(ctx, display, bar);
@@ -2025,9 +2228,11 @@ impl Browser {
         // not made, and its file — the stream with it — goes; the viewer closes below.
         let given_way = viewer.switch.as_ref().and_then(|s| s.take());
         if let Some((file, notices)) = given_way.filter(|_| !asked) {
-            let abs = viewer.abs.clone();
+            let (abs, read_only) = (viewer.abs.clone(), viewer.read_only);
             self.drop_viewer();
-            self.view(&ctx, super::hex::embed(file, notices), None, abs, None);
+            // A file at a revision stays read-only in the hex window it gives way to.
+            let made = super::hex::embed(file, notices);
+            self.view(&ctx, made, None, abs, None, read_only);
             ctx.request_repaint();
             return;
         }
@@ -2099,6 +2304,13 @@ impl Browser {
                 },
             )
         });
+        // Wide (Cmd/Ctrl+Shift+G): the git panel over both sides.
+        if let Some([view::Content::Git(a), view::Content::Git(b)]) = self.shown.clone() {
+            if a == b {
+                self.git_ui(ui, 1 - self.active, area.shrink(2.0), &a);
+                return;
+            }
+        }
         let half = (area.width() / 2.0).floor();
         for i in 0..2 {
             let rect = Rect::from_min_size(
@@ -2106,9 +2318,10 @@ impl Browser {
                 Vec2::new(half, area.height()),
             )
             .shrink(2.0);
-            match self.shown.as_ref().map(|s| &s[i]) {
+            match self.shown.as_ref().map(|s| s[i].clone()) {
                 Some(view::Content::Preview(_)) => self.preview.ui(ui, rect),
                 Some(view::Content::Tree) => self.tree_ui(ui, i, rect),
+                Some(view::Content::Git(top)) => self.git_ui(ui, i, rect, &top),
                 _ => self.panel_ui(ui, i, rect),
             }
         }
@@ -2121,7 +2334,7 @@ impl Browser {
     fn panel_ui(&mut self, ui: &mut egui::Ui, i: usize, rect: Rect) {
         let ctx = ui.ctx().clone();
         let painter = ui.painter_at(rect);
-        let active = i == self.active && self.viewer.is_none();
+        let active = i == self.active && self.viewer.is_none() && !self.git.focus;
         let title = show(self.label.as_deref(), &self.panels[i].dir);
         let inner = chrome::panel_frame(&painter, rect, &title, active);
         let p = chrome::Palette::of(ui.visuals());
@@ -2315,6 +2528,9 @@ impl Browser {
             let free = self.listing.is_empty() && self.opening.is_none() && self.tree.is_none();
             if free && self.viewer.is_none() && !self.ops.holds_keyboard() {
                 self.active = i;
+                // A click in a list gives it the keyboard back from a git panel.
+                self.git.focus = false;
+                self.git.wide = false;
                 self.panels[i].highlight = idx;
                 if open {
                     self.enter(&ctx, false);
@@ -2381,6 +2597,13 @@ impl Browser {
         if let Some(said) = self.ops.status() {
             return said;
         }
+        // The git panel has the keyboard: a line of ours (an open refused, …), else its own.
+        if let Some(i) = self.git_focused() {
+            if !self.status.text.is_empty() {
+                return self.status.clone();
+            }
+            return self.git.panels[i].view.status_line();
+        }
         match &self.list_errors {
             [None, None] => {}
             [Some(left), Some(right)] if left == right => return Status::error(left.clone()),
@@ -2415,6 +2638,10 @@ impl Browser {
             }
             && (!self.ops.busy() || self.ops.holds_keyboard())
             && self.tree.as_ref().is_none_or(TreeSide::settled)
+            && self.git.settled(
+                &self.panels[self.active].dir,
+                self.shown.as_ref().map_or(&[], |s| s.as_slice()),
+            )
     }
 }
 
@@ -2424,20 +2651,27 @@ impl Window for Browser {
         // Before anything else this pass: did this frame's Esc take the keyboard from a field?
         let esc_was_a_fields = self.focused_before && ctx.memory(|m| m.focused()).is_none();
         self.play(&ctx);
+        self.git_stop_on_esc(&ctx);
         self.poll(&ctx);
+        self.git_pass(&ctx);
         if self.tree.is_some() {
             self.tree_pass(&ctx);
+        } else if self.git_focused().is_some() {
+            self.git_keys(&ctx);
         } else {
             self.list_keys(&ctx);
         }
         self.resolve(&ctx);
+        self.git_follow(&ctx);
         // The F-key row is the key table's, by the context and the mode (04 §2).
+        let in_git = self.git_focused().is_some();
         let keys: Vec<FKey> = match (&self.viewer, &self.tree) {
             (Some(v), _) => chrome::merged(
                 &keys::row(Context::Viewer, self.mode),
                 v.embedded.window.keys(),
             ),
             (None, Some(_)) => tree::fkeys(),
+            (None, None) if in_git => git_panel::fkeys(self.mode),
             (None, None) => keys::row(Context::List, self.mode),
         };
         chrome::title_panel(ui, "sopen-browser-title", &self.title);
@@ -2470,7 +2704,8 @@ impl Window for Browser {
             || !self.launches.is_empty()
             || self.preview.busy()
             || self.ops.busy()
-            || self.tree.as_ref().is_some_and(|t| !t.settled());
+            || self.tree.as_ref().is_some_and(|t| !t.settled())
+            || self.git.busy();
         if working {
             ctx.request_repaint_after(Duration::from_millis(100));
         }
@@ -2502,6 +2737,2044 @@ impl Window for Browser {
         self.close_tree();
         true
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// The git panel's side of the browser (03; 02 §3, §6; S2-F): the window's git host, detection of
+// the active folder, a panel per repository (at most 3 kept), their loads, pages, details,
+// history searches, diffs and files at a revision.
+
+/// Makes the window's git runner (02 §6 `GitHost`): on a worker, the first time detection needs
+/// it (`ssh -G` for a remote, `xcode-select -p` for the macOS shim); why there is none, else.
+pub type GitConnect = Arc<dyn Fn() -> std::result::Result<GitRunner, Unavailable> + Send + Sync>;
+
+/// The git runner as the window's own connection reaches the folder: this machine's git (03
+/// §2.4: `SOPEN_GIT`, else `git` on `PATH`, the shim only with the developer tools), or the
+/// remote's over the ssh master (03 §3.2), the browser's `connect` bringing a missing master back.
+pub fn git_connect(
+    destination: Option<String>,
+    label: Option<String>,
+    state_dir: PathBuf,
+    connect: Connect,
+) -> GitConnect {
+    Arc::new(move || match (&destination, &label) {
+        (Some(dest), Some(label)) => {
+            let ssh = SshGit::new(dest, label, &state_dir)
+                .map_err(|e| Unavailable::Failed(format!("{e:#}")))?;
+            let connect = connect.clone();
+            let revive: crate::git::runner::Revive = Arc::new(move || connect().map(|_| ()));
+            Ok(GitRunner::ssh(ssh).with_revive(revive))
+        }
+        _ => Ok(GitRunner::local(LocalGit::new(detect::which_git()?))),
+    })
+}
+
+/// A history read off the window's thread: `rx` gets what it found; `handle` stops it (a newer
+/// one replaces it, the panel goes).
+struct Pending<T> {
+    rx: Receiver<T>,
+    handle: Handle,
+}
+
+impl<T> Drop for Pending<T> {
+    fn drop(&mut self) {
+        self.handle.stop();
+    }
+}
+
+/// The reads a load starts from (03 §4.1): refs, HEAD, stashes, status, and the remotes.
+#[derive(Debug, Clone)]
+struct Snapshot {
+    refs: Vec<RefLabel>,
+    head: Head,
+    stashes: Vec<StashRow>,
+    status: GitStatus,
+    remotes: Vec<String>,
+}
+
+impl Snapshot {
+    /// The same graph: refs, HEAD and stashes unchanged (03 §5's soft refresh keeps the rows).
+    fn same_graph(&self, other: &Snapshot) -> bool {
+        self.refs == other.refs && self.head == other.head && self.stashes == other.stashes
+    }
+}
+
+/// A load's snapshot read: a full load (`soft` false) starts a new stream; a soft refresh
+/// starts one only when the refs, HEAD or stashes moved (03 §5).
+struct SnapshotRead {
+    soft: bool,
+    /// Pages the new stream reads at once (a reload reads as many as were loaded, 03 §4.5).
+    pages: usize,
+    pending: Pending<std::result::Result<Snapshot, String>>,
+}
+
+/// The log stream of one load on a worker of its own (03 §4.5): asked for pages, it reads them;
+/// between asks git waits on the full pipe. Dropping the link stops git (the handle) and ends
+/// the worker (the sender).
+struct StreamLink {
+    generation: u64,
+    handle: Handle,
+    ask: mpsc::Sender<usize>,
+    pages: Receiver<Page>,
+    /// Pages asked for and not come back yet.
+    asked: usize,
+    rows: RowStream,
+    /// The next page is the load's first: it replaces the rows.
+    first: bool,
+    /// The stream has ended: all loaded, an error, or stopped.
+    ended: bool,
+}
+
+impl Drop for StreamLink {
+    fn drop(&mut self) {
+        self.handle.stop();
+    }
+}
+
+/// A history search's stream (03 §4.7), paged like the graph's.
+struct SearchLink {
+    query: git_panel::SearchQuery,
+    link: StreamLink,
+}
+
+/// What a file row's Enter or Shift+F3 found (03 §6.2–§6.3).
+enum Revealed {
+    /// A diff or a blob written under `.revisions`: opened read-only, titled `host:/top/path @
+    /// <rev>`; F4 opens the path now.
+    File {
+        file: PathBuf,
+        title: String,
+        edit: String,
+    },
+    /// The working file itself (the uncommitted row's untracked file, a comparison's work-tree
+    /// end of one): opened as Enter in the list opens it.
+    Working(String),
+    /// Nothing to open, and why (`not in this version`, a read that failed).
+    Refused(String),
+}
+
+/// The git panel of one repository (03), kept while the window lives (at most [`KEPT_PANELS`]).
+struct RepoPanel {
+    /// Its top level.
+    top: String,
+    /// Detection said it is a shallow clone: the last page's end is `history ends here`.
+    shallow: bool,
+    view: GitView,
+    generation: Generation,
+    snapshot: Option<Snapshot>,
+    read: Option<SnapshotRead>,
+    stream: Option<StreamLink>,
+    /// The stream was ended while the panel was hidden (03 §4.5: after 30 s, or for a newer
+    /// panel's): shown again, a new one reads as many pages as were loaded.
+    stream_dropped: bool,
+    search: Option<SearchLink>,
+    /// A history search whose stream was ended while hidden: its next page runs it again.
+    search_dropped: Option<git_panel::SearchQuery>,
+    details: Option<Pending<Details>>,
+    /// The details the pane was last given (an untracked folder's files go into them).
+    last_details: Option<Details>,
+    reveal: Option<Pending<Revealed>>,
+    /// `SOPEN_STATE select=REV` resolved: the commit's id.
+    resolving: Option<Pending<std::result::Result<Oid, String>>>,
+    /// Shown now (egui time it was last shown; `None` while it shows).
+    hidden_since: Option<std::time::Instant>,
+    /// When the panel last asked for its refs (a refresh younger than 10 s is not repeated).
+    refreshed: Option<std::time::Instant>,
+    /// Least recently shown first, by this counter.
+    last_shown: u64,
+}
+
+/// Panels kept per window (02 §3.1: the least recently shown is dropped).
+const KEPT_PANELS: usize = 3;
+/// A hidden panel's stream ends after this long (03 §4.5).
+const HIDDEN_STREAM: Duration = Duration::from_secs(30);
+/// A refresh younger than this is not repeated when the panel is shown again (03 §5).
+const REFRESH_AGAIN: Duration = Duration::from_secs(10);
+/// Parked log streams per host at most: each holds one of the host's 3 command slots (02 §6),
+/// and a read must always find one.
+const PARKED_STREAMS: usize = 2;
+
+/// `SOPEN_STATE`'s git keys (02 §9): what is left to do once the panel is there.
+#[derive(Debug, Clone, Default, PartialEq)]
+struct GitScript {
+    pin: bool,
+    select: Option<String>,
+    details: bool,
+    label: Option<usize>,
+}
+
+impl GitScript {
+    fn done(&self) -> bool {
+        *self == GitScript::default()
+    }
+}
+
+/// The window's git state (02 §6's `GitHost` and its repositories).
+struct GitSide {
+    connect: Option<GitConnect>,
+    /// The host's runner, made by the first detection's worker; why there is none, until the
+    /// list's Cmd/Ctrl+R asks again (03 §2.2: a host without git is detected again then).
+    runner: Arc<Mutex<Option<std::result::Result<GitRunner, Unavailable>>>>,
+    detector: Arc<Detector>,
+    /// The host as detection's cache names it: empty on this machine, else the label.
+    host: String,
+    /// Each folder's detection this window had (03 §2.2), and those still asked.
+    detections: HashMap<String, Detection>,
+    asking: HashMap<String, Receiver<Detection>>,
+    /// Folders whose reason the status row has said (once per folder, 03 §2.3).
+    said: std::collections::HashSet<String>,
+    panels: Vec<RepoPanel>,
+    shown_counter: u64,
+    pin: Option<view::Pin>,
+    /// The keyboard is in the git panel on the side opposite the active list (the active list
+    /// is the origin list then, 02 §3.1 `origin`).
+    focus: bool,
+    /// That panel's repository, as the display last showed it (a viewer it opened covers it).
+    focus_top: Option<String>,
+    /// The keyboard's git panel over both sides (Cmd/Ctrl+Shift+G).
+    wide: bool,
+    /// The window's folder under `.revisions` (03 §6.2), made on the first diff's worker.
+    space: Arc<Mutex<Option<crate::cache::RevisionSpace>>>,
+    script: GitScript,
+    /// The window had the focus at the last pass (a soft refresh when it gains it, 03 §5).
+    window_focused: Option<bool>,
+    /// How long a hidden panel keeps its stream ([`HIDDEN_STREAM`]; tests shorten it).
+    hidden_stream: Duration,
+}
+
+impl GitSide {
+    fn new(connect: Option<GitConnect>, label: Option<&str>) -> Self {
+        Self {
+            connect,
+            runner: Arc::default(),
+            detector: Arc::new(Detector::new()),
+            host: label.unwrap_or_default().to_string(),
+            detections: HashMap::new(),
+            asking: HashMap::new(),
+            said: Default::default(),
+            panels: Vec::new(),
+            shown_counter: 0,
+            pin: None,
+            focus: false,
+            focus_top: None,
+            wide: false,
+            space: Arc::default(),
+            script: GitScript::default(),
+            window_focused: None,
+            hidden_stream: HIDDEN_STREAM,
+        }
+    }
+
+    /// The repository of `folder` when detection found a work tree there.
+    fn repo_of(&self, folder: &str) -> Option<&str> {
+        match self.detections.get(folder) {
+            Some(Detection::WorkTree { top, .. }) => Some(top),
+            _ => None,
+        }
+    }
+
+    fn panel(&self, top: &str) -> Option<usize> {
+        self.panels.iter().position(|p| p.top == top)
+    }
+
+    /// Nothing git is on its way that a receipt waits for.
+    fn settled(&self, active_folder: &str, shown: &[view::Content]) -> bool {
+        if self.asking.contains_key(active_folder) || !self.script.done() {
+            return false;
+        }
+        self.panels.iter().all(|p| {
+            let showing = shown
+                .iter()
+                .any(|c| matches!(c, view::Content::Git(top) if *top == p.top));
+            !showing
+                || (p.read.is_none()
+                    && p.stream.as_ref().is_none_or(|s| s.asked == 0)
+                    && p.details.is_none()
+                    && p.reveal.is_none()
+                    && p.resolving.is_none()
+                    && p.view.selecting().is_none()
+                    && p.search.as_ref().is_none_or(|s| s.link.asked == 0))
+        })
+    }
+
+    fn busy(&self) -> bool {
+        !self.asking.is_empty()
+            || self.panels.iter().any(|p| {
+                p.read.is_some()
+                    || p.stream.as_ref().is_some_and(|s| s.asked > 0)
+                    || p.details.is_some()
+                    || p.reveal.is_some()
+                    || p.resolving.is_some()
+                    || p.search.as_ref().is_some_and(|s| s.link.asked > 0)
+            })
+    }
+}
+
+/// HEAD as the panel's labels take it.
+fn head_ref(head: &Head) -> HeadRef {
+    match head {
+        Head::Branch { refname, .. } => HeadRef::Branch(refname.clone()),
+        Head::Detached(oid) => HeadRef::Detached(oid.clone()),
+        Head::Unborn { .. } => HeadRef::Unborn,
+    }
+}
+
+/// The foot's right end from the status read's branch headers (03 §4.2).
+fn tracking(status: &GitStatus) -> Option<Tracking> {
+    let b = &status.branch;
+    let (Some(branch), Some(upstream), Some(ab)) = (&b.head, &b.upstream, &b.ahead_behind) else {
+        return None;
+    };
+    Some(Tracking {
+        branch: branch.clone(),
+        upstream: upstream.clone(),
+        ahead: ab.ahead,
+        behind: ab.behind,
+    })
+}
+
+/// The log's options from the panel's filters (03 §4.6).
+fn log_options(f: &git_panel::Filters) -> LogOptions {
+    LogOptions {
+        order: match f.order {
+            git_panel::Order::Date => history::Order::Date,
+            git_panel::Order::AuthorDate => history::Order::AuthorDate,
+            git_panel::Order::Topo => history::Order::Topo,
+        },
+        first_parent: f.first_parent,
+        reflog: f.reflog,
+    }
+}
+
+/// The log's roots for the filters (03 §4.1, §4.6).
+fn roots_of(f: &git_panel::Filters, s: &Snapshot) -> Vec<Oid> {
+    let revisions = f.revisions(&s.refs, &s.remotes);
+    let head = f.head_is_revision().then_some(&s.head);
+    history::roots(&revisions, head, f.stash_revisions(&s.stashes))
+}
+
+/// The four reads of a load and the remotes (03 §4.1), at once (at most 3 in flight per host).
+fn read_snapshot(git: &RunnerGit, top: &str) -> std::result::Result<Snapshot, String> {
+    std::thread::scope(|s| {
+        let refs = s.spawn(|| history::refs(git, top));
+        let head = s.spawn(|| history::head(git, top));
+        let stashes = s.spawn(|| history::stashes(git, top));
+        let status = s.spawn(|| history::status(git, top));
+        let remotes = history::remotes(git, top);
+        let said = |what: &str, e: history::ReadError| format!("git panel: the {what} read: {e}");
+        Ok(Snapshot {
+            refs: joined(refs.join()).map_err(|e| said("refs", e))?,
+            head: joined(head.join()).map_err(|e| said("HEAD", e))?,
+            stashes: joined(stashes.join()).map_err(|e| said("stashes", e))?,
+            status: joined(status.join()).map_err(|e| said("status", e))?,
+            remotes: remotes.map_err(|e| said("remotes", e))?,
+        })
+    })
+}
+
+/// A read joined from its thread (a panic in it is a read that stopped).
+fn joined<T>(
+    r: std::thread::Result<std::result::Result<T, history::ReadError>>,
+) -> std::result::Result<T, history::ReadError> {
+    r.unwrap_or_else(|_| {
+        Err(history::ReadError::Run(history::RunError::Failed(
+            "the read stopped".into(),
+        )))
+    })
+}
+
+/// A change letter as the pane draws it (03 §6.1).
+fn letter_of(letter: FileLetter) -> char {
+    match letter {
+        FileLetter::Change(c) => change_char(c),
+        FileLetter::Unmerged => 'U',
+        FileLetter::Untracked => '?',
+    }
+}
+
+fn change_char(c: Change) -> char {
+    match c {
+        Change::Added => 'A',
+        Change::Modified => 'M',
+        Change::Deleted => 'D',
+        Change::Renamed => 'R',
+        Change::TypeChanged => 'T',
+        Change::Copied => 'C',
+    }
+}
+
+fn file_row(f: ChangedFile) -> FileRow {
+    FileRow {
+        letter: letter_of(f.letter),
+        path: f.path,
+        old_path: f.old_path,
+        lines: f.lines,
+        lossy: f.lossy,
+    }
+}
+
+/// `+adds -dels` by path (a binary file has none).
+type LineCounts = HashMap<String, (u64, u64)>;
+
+/// The uncommitted row's groups (03 §6.1) from the status read, with their line counts.
+fn uncommitted_groups(status: &GitStatus, counts: &[LineCounts; 2]) -> Vec<FileGroup> {
+    let mut conflicts = Vec::new();
+    let mut staged = Vec::new();
+    let mut not_staged = Vec::new();
+    let mut untracked = Vec::new();
+    for e in &status.entries {
+        let row = |letter: char, lines: Option<(u64, u64)>| FileRow {
+            letter,
+            path: e.path.clone(),
+            old_path: e.old_path.clone(),
+            lines,
+            lossy: e.lossy,
+        };
+        match &e.state {
+            StatusState::Conflict(_) => conflicts.push(row('U', None)),
+            StatusState::Untracked => untracked.push(FileRow {
+                old_path: None,
+                ..row('?', None)
+            }),
+            StatusState::Changed {
+                staged: s,
+                unstaged: u,
+            } => {
+                if let Some(c) = s {
+                    staged.push(row(change_char(*c), counts[0].get(&e.path).copied()));
+                }
+                if let Some(c) = u {
+                    not_staged.push(FileRow {
+                        old_path: None,
+                        ..row(change_char(*c), counts[1].get(&e.path).copied())
+                    });
+                }
+            }
+        }
+    }
+    [
+        (Group::Conflicts, conflicts),
+        (Group::Staged, staged),
+        (Group::NotStaged, not_staged),
+        (Group::Untracked, untracked),
+    ]
+    .into_iter()
+    .filter(|(_, files)| !files.is_empty())
+    .map(|(group, files)| FileGroup { group, files })
+    .collect()
+}
+
+/// A commit's summary as the pane takes it.
+fn summary(d: &CommitDetails) -> Summary {
+    Summary {
+        oid: d.oid.clone(),
+        parents: d.parents.clone(),
+        author_name: d.author_name.clone(),
+        author_email: d.author_email.clone(),
+        author_time: d.author_time,
+        committer_name: d.committer_name.clone(),
+        committer_email: d.committer_email.clone(),
+        commit_time: d.commit_time,
+        message: d.message.clone(),
+    }
+}
+
+/// What the load knows that a details read needs: the stashes (a stash row's parents) and the
+/// status (the uncommitted row's groups).
+#[derive(Clone)]
+struct DetailsInputs {
+    stashes: Vec<StashRow>,
+    status: GitStatus,
+}
+
+/// The details of `subject` (03 §6.1, §6.4), told through `tell` — the summary and files first,
+/// then again with `In` once `for-each-ref --contains` has answered.
+fn read_details(
+    git: &RunnerGit,
+    top: &str,
+    subject: &Subject,
+    inputs: &DetailsInputs,
+    tell: &dyn Fn(Details),
+) {
+    let mut details = Details {
+        subject: subject.clone(),
+        summary: None,
+        contains: None,
+        groups: Vec::new(),
+        error: None,
+    };
+    let fail = |mut d: Details, e: history::ReadError| {
+        d.error = Some(e.to_string());
+        tell(d)
+    };
+    let counts = || -> std::result::Result<[LineCounts; 2], history::ReadError> {
+        Ok([
+            history::uncommitted_counts(git, top, true)?,
+            history::uncommitted_counts(git, top, false)?,
+        ])
+    };
+    let files = |rows: Vec<ChangedFile>| FileGroup {
+        group: Group::Files,
+        files: rows.into_iter().map(file_row).collect(),
+    };
+    let oid_of = |key: &RowKey| match key {
+        RowKey::Commit(oid) | RowKey::Stash(oid) => Some(oid.clone()),
+        RowKey::Uncommitted => None,
+    };
+    match subject {
+        Subject::Row(RowKey::Uncommitted) => {
+            let counts = match counts() {
+                Ok(c) => c,
+                Err(e) => return fail(details, e),
+            };
+            details.groups = uncommitted_groups(&inputs.status, &counts);
+            tell(details);
+        }
+        Subject::Row(RowKey::Stash(oid)) => {
+            let d = match history::details(git, top, oid) {
+                Ok(d) => d,
+                Err(e) => return fail(details, e),
+            };
+            details.summary = Some(summary(&d));
+            let stash = inputs.stashes.iter().find(|s| s.oid == *oid).cloned();
+            let stash = stash.unwrap_or_else(|| StashRow {
+                oid: oid.clone(),
+                base: d.parents.first().cloned().unwrap_or_else(|| oid.clone()),
+                index: d.parents.get(1).cloned(),
+                untracked: d.parents.get(2).cloned(),
+                selector: String::new(),
+                commit_time: d.commit_time,
+                subject: String::new(),
+            });
+            match history::stash_files(git, top, &stash) {
+                Ok(rows) => {
+                    let (untracked, tracked): (Vec<_>, Vec<_>) = rows
+                        .into_iter()
+                        .partition(|f| f.letter == FileLetter::Untracked);
+                    details.groups.push(files(tracked));
+                    if !untracked.is_empty() {
+                        details.groups.push(FileGroup {
+                            group: Group::Untracked,
+                            ..files(untracked)
+                        });
+                    }
+                    tell(details);
+                }
+                Err(e) => fail(details, e),
+            }
+        }
+        Subject::Row(RowKey::Commit(oid)) => {
+            let d = match history::details(git, top, oid) {
+                Ok(d) => d,
+                Err(e) => return fail(details, e),
+            };
+            details.summary = Some(summary(&d));
+            match history::commit_files(git, top, &d) {
+                Ok(rows) => details.groups.push(files(rows)),
+                Err(e) => return fail(details, e),
+            }
+            tell(details.clone());
+            // A failed read is said as such, never as "in no branch".
+            details.contains = Some(
+                history::contains(git, top, oid)
+                    .unwrap_or_else(|e| vec![format!("unavailable: {e}")]),
+            );
+            tell(details);
+        }
+        Subject::Compare { from, to } => {
+            let result = match (oid_of(from), oid_of(to)) {
+                (Some(a), Some(b)) => {
+                    history::files(git, top, &a, &b).map(|rows| vec![files(rows)])
+                }
+                (Some(a), None) | (None, Some(a)) => {
+                    history::worktree_files(git, top, &a).map(|rows| {
+                        let mut groups = vec![files(rows)];
+                        let untracked: Vec<FileRow> = inputs
+                            .status
+                            .entries
+                            .iter()
+                            .filter(|e| e.state == StatusState::Untracked)
+                            .map(|e| FileRow {
+                                letter: '?',
+                                path: e.path.clone(),
+                                old_path: None,
+                                lines: None,
+                                lossy: e.lossy,
+                            })
+                            .collect();
+                        if !untracked.is_empty() {
+                            groups.push(FileGroup {
+                                group: Group::Untracked,
+                                files: untracked,
+                            });
+                        }
+                        groups
+                    })
+                }
+                (None, None) => Ok(Vec::new()),
+            };
+            match result {
+                Ok(groups) => {
+                    details.groups = groups;
+                    tell(details);
+                }
+                Err(e) => fail(details, e),
+            }
+        }
+    }
+}
+
+/// The two endpoints of a file row (03 §6.2's table); `None` for the working file.
+fn endpoints(
+    git: &RunnerGit,
+    top: &str,
+    subject: &Subject,
+    group: Group,
+) -> std::result::Result<(Option<DiffSide>, Option<DiffSide>, String), history::ReadError> {
+    let parents = |oid: &Oid| history::details(git, top, oid).map(|d| d.parents);
+    let empty = || history::empty_tree(git, top);
+    let short = |oid: &Oid| oid.as_str().chars().take(8).collect::<String>();
+    Ok(match subject {
+        Subject::Row(RowKey::Commit(c)) => {
+            let old = match parents(c)?.first() {
+                Some(p) => p.clone(),
+                None => empty()?,
+            };
+            (
+                Some(DiffSide::Tree(old)),
+                Some(DiffSide::Tree(c.clone())),
+                short(c),
+            )
+        }
+        Subject::Row(RowKey::Stash(s)) => {
+            let parents = parents(s)?;
+            match (group, parents.get(2)) {
+                (Group::Untracked, Some(untracked)) => (
+                    Some(DiffSide::Tree(empty()?)),
+                    Some(DiffSide::Tree(untracked.clone())),
+                    format!("{}^3", short(s)),
+                ),
+                _ => (
+                    Some(DiffSide::Tree(parents.first().cloned().unwrap_or(empty()?))),
+                    Some(DiffSide::Tree(s.clone())),
+                    short(s),
+                ),
+            }
+        }
+        Subject::Row(RowKey::Uncommitted) => match group {
+            Group::Staged => {
+                let head = history::head(git, top)?;
+                let old = match head.oid() {
+                    Some(oid) => oid.clone(),
+                    None => empty()?,
+                };
+                (
+                    Some(DiffSide::Tree(old)),
+                    Some(DiffSide::Index),
+                    "index".into(),
+                )
+            }
+            Group::Untracked => (None, None, "work tree".into()),
+            _ => (
+                Some(DiffSide::Index),
+                Some(DiffSide::WorkTree),
+                "work tree".into(),
+            ),
+        },
+        Subject::Compare { from, to } => {
+            let oid = |k: &RowKey| match k {
+                RowKey::Commit(o) | RowKey::Stash(o) => Some(o.clone()),
+                RowKey::Uncommitted => None,
+            };
+            match (oid(from), oid(to)) {
+                (Some(a), Some(b)) => {
+                    let rev = short(&b);
+                    (Some(DiffSide::Tree(a)), Some(DiffSide::Tree(b)), rev)
+                }
+                (Some(a), None) if group == Group::Untracked => {
+                    let _ = a;
+                    (None, None, "work tree".into())
+                }
+                (Some(a), None) | (None, Some(a)) => (
+                    Some(DiffSide::Tree(a)),
+                    Some(DiffSide::WorkTree),
+                    "work tree".into(),
+                ),
+                (None, None) => (None, None, "work tree".into()),
+            }
+        }
+    })
+}
+
+/// The most of a diff written (03 §6.2): a longer one is cut there with a last line saying so.
+const DIFF_CAP: usize = 256 << 20;
+
+/// Writes `bytes` to a new file named `name` in the window's `.revisions` folder (made here, on
+/// this worker, the first time).
+fn revision_file(
+    space: &Mutex<Option<crate::cache::RevisionSpace>>,
+    cache: &std::path::Path,
+    name: &str,
+    bytes: &[u8],
+) -> Result<PathBuf> {
+    let mut space = space.lock().unwrap_or_else(|p| p.into_inner());
+    if space.is_none() {
+        *space = Some(crate::cache::RevisionSpace::new(cache)?);
+    }
+    let Some(space) = space.as_ref() else {
+        bail!("no folder for files at a revision");
+    };
+    let (path, mut file) = space.create(name)?;
+    use std::io::Write as _;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    Ok(path)
+}
+
+/// The file at `path`'s last component, `.diff` added for a diff.
+fn file_name(path: &str) -> &str {
+    crate::remote::split_parent(path.trim_end_matches('/')).1
+}
+
+/// Enter (`diff`) or Shift+F3 on a file row (03 §6.2, §6.3): the diff of its endpoints, or its
+/// new endpoint's bytes, written under `.revisions`; the working file itself where that is the
+/// endpoint.
+#[allow(clippy::too_many_arguments)]
+fn reveal(
+    git: &RunnerGit,
+    top: &str,
+    shown_top: &str,
+    subject: &Subject,
+    group: Group,
+    file: &FileRow,
+    diff: bool,
+    space: &Mutex<Option<crate::cache::RevisionSpace>>,
+    cache: &std::path::Path,
+) -> Revealed {
+    let working = || Revealed::Working(format!("{}/{}", top.trim_end_matches('/'), file.path));
+    let edit = format!("{}/{}", top.trim_end_matches('/'), file.path);
+    let (old, new, rev) = match endpoints(git, top, subject, group) {
+        Ok(e) => e,
+        Err(e) => return Revealed::Refused(format!("{}: {e}", file.path)),
+    };
+    let title = format!("{}/{} @ {rev}", shown_top.trim_end_matches('/'), file.path);
+    let written = |name: String, bytes: &[u8]| match revision_file(space, cache, &name, bytes) {
+        Ok(path) => Revealed::File {
+            file: path,
+            title: title.clone(),
+            edit: edit.clone(),
+        },
+        Err(e) => Revealed::Refused(format!("{}: {e:#}", file.path)),
+    };
+    let read = |args: Vec<String>| {
+        let cmd = GitCommand::new(Class::Read, top, args).max_output(DIFF_CAP);
+        let done = git.runner.run(&cmd, &git.handle);
+        match &done.ending {
+            Ending::Exit(0) => Ok((done.stdout, false)),
+            Ending::Stopped(s) if matches!(s.by, StopBy::Overflow(_)) => Ok((done.stdout, true)),
+            _ => Err(done.entry.status_line()),
+        }
+    };
+    if diff {
+        let (Some(old), Some(new)) = (old, new) else {
+            // The uncommitted row's untracked file (and a comparison's): the working file.
+            return working();
+        };
+        let paths: Vec<&str> = file
+            .old_path
+            .iter()
+            .map(String::as_str)
+            .chain([file.path.as_str()])
+            .collect();
+        return match read(history::argv::diff_text(&old, &new, &paths)) {
+            Ok((mut bytes, cut)) => {
+                if cut {
+                    bytes.extend_from_slice(b"\n... the diff is cut here: it is over 256 MiB\n");
+                }
+                written(format!("{}.diff", file_name(&file.path)), &bytes)
+            }
+            Err(why) => Revealed::Refused(format!("{}: {why}", file.path)),
+        };
+    }
+    // Shift+F3: the new endpoint; none for a deleted file.
+    if file.letter == 'D' {
+        return Revealed::Refused(format!("{}: not in this version", file.path));
+    }
+    let rev = match new {
+        Some(DiffSide::Tree(oid)) => Some(oid),
+        Some(DiffSide::Index) => None,
+        Some(DiffSide::WorkTree) | None => return working(),
+    };
+    match read(history::argv::blob(rev.as_ref(), &file.path)) {
+        Ok((bytes, false)) => written(file_name(&file.path).to_string(), &bytes),
+        Ok((_, true)) => Revealed::Refused(format!("{}: over 256 MiB", file.path)),
+        Err(why) => Revealed::Refused(format!("{}: {why}", file.path)),
+    }
+}
+
+/// The first page of `folder`'s git panel as text (`SOPEN_LIST=git`, 02 §9; 03 §11 G-D1, G-D2,
+/// G-G1): the title line, a line per row — the lanes in ASCII, the labels, the subject, the
+/// author, the date, the hash — then the paging line. A folder outside a work tree: the listing
+/// and one line saying why.
+pub fn git_listing(
+    fs: &mut dyn RemoteFs,
+    label: Option<&str>,
+    abs: &str,
+    connect: &GitConnect,
+) -> Result<Vec<String>> {
+    let host = label.unwrap_or_default();
+    let detection = match connect() {
+        Ok(runner) => Detector::new().detect(host, abs, &RunnerGit::new(runner, Handle::new())),
+        Err(why) => Detection::Unavailable(why),
+    };
+    let Detection::WorkTree { top, shallow, .. } = &detection else {
+        let mut out = listing(fs, label, abs)?;
+        let shown = label.unwrap_or("this machine");
+        let why = detection
+            .reason(shown)
+            .unwrap_or_else(|| "git panel: not a work tree".into());
+        out.push(why);
+        return Ok(out);
+    };
+    let runner = connect().map_err(|e| anyhow::anyhow!("{e:?}"))?;
+    let git = RunnerGit::new(runner, Handle::new());
+    let snapshot = read_snapshot(&git, top).map_err(|e| anyhow::anyhow!(e))?;
+    let title = format!("{}{}", show(label, top), detection.title_notes());
+    let mut view = GitView::new(title.clone());
+    view.set_remotes(snapshot.remotes.clone());
+    view.set_refs(snapshot.refs.clone(), head_ref(&snapshot.head));
+    view.tracking = tracking(&snapshot.status);
+    let f = view.filters().clone();
+    let mut rows = RowStream::new(
+        snapshot.head.oid().cloned(),
+        !snapshot.status.entries.is_empty(),
+        snapshot.stashes.clone(),
+        f.stashes,
+    );
+    let roots = roots_of(&f, &snapshot);
+    let n = snapshot.status.entries.len();
+    let current = Generation::new();
+    let g = current.bump();
+    match LogStream::start(&git, top, &log_options(&f), &roots, &current, g) {
+        Ok(mut stream) => {
+            let page = stream.page(history::PAGE);
+            view.set_rows(rows.page(page.rows), f.first_parent, n);
+            view.set_paging(paging_of(&page.end, *shallow));
+        }
+        Err(StartError::NoRoots) => {
+            view.set_rows(rows.page(Vec::new()), f.first_parent, n);
+            view.set_paging(Paging::NoCommits);
+        }
+        Err(e) => bail!("git panel: the log: {e:?}"),
+    }
+    let mut out = vec![title];
+    for i in 0..view.rows().len() {
+        out.extend(text_row(&view, i));
+    }
+    out.push(view.paging_line());
+    Ok(out)
+}
+
+/// What the paging line says after a page that ended so.
+fn paging_of(end: &PageEnd, shallow: bool) -> Paging {
+    match end {
+        PageEnd::More => Paging::More(history::PAGE),
+        PageEnd::AllLoaded if shallow => Paging::Shallow,
+        PageEnd::AllLoaded => Paging::AllLoaded,
+        PageEnd::Error(e) => Paging::Error(e.clone()),
+        PageEnd::Superseded => Paging::Loading,
+    }
+}
+
+/// Row `i` of `view` as `SOPEN_LIST=git` prints it: the lanes in ASCII (`*` a commit, `@` the
+/// checked-out one, `=` a stash, `o` the uncommitted row, `|` a line, `/` `\` a lane change),
+/// the labels in brackets, the subject, then the author, the date and the hash.
+fn text_row(view: &GitView, i: usize) -> Option<String> {
+    use crate::git::graph::{End, Node};
+    let row = view.line(i)?;
+    let graph = view.graph();
+    let width = (graph.width() as usize).max(1);
+    let mut cells = vec![' '; width * 2];
+    for p in graph.pass_throughs(i..i + 1) {
+        if let Some(c) = cells.get_mut(p.slot as usize * 2) {
+            *c = '|';
+        }
+    }
+    let rg = graph.row(i);
+    let column = rg.column as usize;
+    for s in graph.segments(i) {
+        let slot = s.slot as usize;
+        if slot == column {
+            continue;
+        }
+        let between = slot.min(column) * 2 + 1;
+        let up = matches!(s.end, End::Top);
+        let glyph = match (up, slot > column) {
+            (true, true) | (false, false) => '/',
+            _ => '\\',
+        };
+        if let Some(c) = cells.get_mut(between) {
+            *c = glyph;
+        }
+    }
+    if let Some(c) = cells.get_mut(column * 2) {
+        *c = match rg.node {
+            Node::Commit => '*',
+            Node::CheckedOut => '@',
+            Node::Stash => '=',
+            Node::Uncommitted => 'o',
+        };
+    }
+    let lanes: String = cells.into_iter().collect();
+    let labels: String = row.labels.iter().map(|l| format!("[{l}] ")).collect();
+    let mut line = format!(
+        "{lanes}  {labels}{}  {}  {}  {}",
+        row.subject, row.author, row.date, row.commit
+    );
+    let trimmed = line.trim_end().len();
+    line.truncate(trimmed);
+    Some(line)
+}
+
+impl Browser {
+    /// The runner, once the first detection's worker made it (never made on a frame).
+    /// Never waits: the lock is held only to read or store the result (the connect runs outside
+    /// it), and a moment it is held reads as "not ready yet".
+    fn git_runner(&self) -> Option<GitRunner> {
+        let made = match self.git.runner.try_lock() {
+            Ok(made) => made,
+            Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return None,
+        };
+        made.as_ref().and_then(|r| r.as_ref().ok()).cloned()
+    }
+
+    /// The git panel the keyboard is in (02 §3.1 `in_git`): the one shown on the side opposite
+    /// the active list.
+    fn git_focused(&self) -> Option<usize> {
+        if !self.git.focus || self.viewer.is_some() {
+            return None;
+        }
+        match self.shown.as_ref().map(|s| &s[1 - self.active]) {
+            Some(view::Content::Git(top)) => self.git.panel(top),
+            _ => None,
+        }
+    }
+
+    /// The keyboard back to the origin list (Tab, Esc's unpin, F9 from an automatic panel).
+    fn git_leave(&mut self) {
+        self.git.focus = false;
+        self.git.wide = false;
+        self.moved_at = None;
+    }
+
+    /// The git pass before the keys (02 §6): detections that answered (a detection answer
+    /// commits at once), the active folder's asked on a worker, each panel's reads, pages,
+    /// details and files heard, a hidden panel's stream ended after 30 s.
+    fn git_pass(&mut self, ctx: &egui::Context) {
+        let mut answered = Vec::new();
+        self.git.asking.retain(|folder, rx| match rx.try_recv() {
+            Ok(d) => {
+                answered.push((folder.clone(), d));
+                false
+            }
+            Err(TryRecvError::Empty) => true,
+            Err(TryRecvError::Disconnected) => false,
+        });
+        for (folder, detection) in answered {
+            if folder == self.panels[self.active].dir {
+                self.moved_at = None;
+            }
+            // 03 §2.3: why there is no panel, once per folder.
+            if detection.on_status_row() && self.git.said.insert(folder.clone()) {
+                let host = self.label.clone().unwrap_or_else(|| "this machine".into());
+                if let Some(why) = detection.reason(&host) {
+                    self.status = Status::error(why);
+                }
+            }
+            self.git.detections.insert(folder, detection);
+        }
+        let folder = self.panels[self.active].dir.clone();
+        let listing = self.listing.iter().any(|l| l.dir == folder);
+        if self.git.connect.is_some()
+            && !listing
+            && !self.git.detections.contains_key(&folder)
+            && !self.git.asking.contains_key(&folder)
+        {
+            self.ask_detection(ctx, folder);
+        }
+        for i in 0..self.git.panels.len() {
+            self.poll_panel(ctx, i);
+        }
+        self.git_script(ctx);
+        // A window that gains the focus soft-refreshes what it shows (03 §5).
+        let focused = ctx.input(|i| i.viewport().focused);
+        if let Some(now) = focused {
+            if self.git.window_focused == Some(false) && now {
+                for i in 0..self.git.panels.len() {
+                    if self.git.panels[i].hidden_since.is_none() {
+                        self.start_read(ctx, i, true, 0);
+                    }
+                }
+            }
+            self.git.window_focused = Some(now);
+        }
+    }
+
+    /// Detection of `folder` on a worker (03 §2): the runner is made there the first time.
+    fn ask_detection(&mut self, ctx: &egui::Context, folder: String) {
+        let Some(connect) = self.git.connect.clone() else {
+            return;
+        };
+        let (tx, rx) = mpsc::channel();
+        let (cell, detector, host) = (
+            self.git.runner.clone(),
+            self.git.detector.clone(),
+            self.git.host.clone(),
+        );
+        let (waker, path) = (ctx.clone(), folder.clone());
+        std::thread::spawn(move || {
+            // The connect (`ssh -G`, finding git) runs outside the lock; the first result stored
+            // wins, a second worker's is dropped.
+            let known = cell.lock().unwrap_or_else(|p| p.into_inner()).clone();
+            let made = match known {
+                Some(made) => made,
+                None => {
+                    let fresh = connect();
+                    let mut cell = cell.lock().unwrap_or_else(|p| p.into_inner());
+                    cell.get_or_insert(fresh).clone()
+                }
+            };
+            let detection = match made {
+                Ok(runner) => detector.detect(&host, &path, &RunnerGit::new(runner, Handle::new())),
+                Err(why) => Detection::Unavailable(why),
+            };
+            let _ = tx.send(detection);
+            waker.request_repaint();
+        });
+        self.git.asking.insert(folder, rx);
+    }
+
+    /// After the sides are resolved: each git panel shown exists (made and loaded the first
+    /// time), one shown again is refreshed (03 §5) or its stream started again (03 §4.5); one
+    /// hidden for 30 s has its stream ended; at most [`KEPT_PANELS`] are kept.
+    fn git_follow(&mut self, ctx: &egui::Context) {
+        let shown: Vec<String> = self
+            .shown
+            .iter()
+            .flatten()
+            .filter_map(|c| match c {
+                view::Content::Git(top) => Some(top.clone()),
+                _ => None,
+            })
+            .collect();
+        let now = std::time::Instant::now();
+        for top in &shown {
+            let i = match self.git.panel(top) {
+                Some(i) => i,
+                None => self.make_panel(ctx, top.clone()),
+            };
+            self.git.shown_counter += 1;
+            let counter = self.git.shown_counter;
+            let p = &mut self.git.panels[i];
+            p.last_shown = counter;
+            if p.hidden_since.take().is_some() {
+                if p.stream_dropped {
+                    let pages = p.view.rows().len().div_ceil(history::PAGE).max(1);
+                    self.start_read(ctx, i, false, pages);
+                } else if p.refreshed.is_none_or(|t| t.elapsed() >= REFRESH_AGAIN) {
+                    self.start_read(ctx, i, true, 0);
+                }
+            }
+        }
+        let hidden_stream = self.git.hidden_stream;
+        for p in self.git.panels.iter_mut() {
+            if shown.contains(&p.top) {
+                continue;
+            }
+            let since = *p.hidden_since.get_or_insert(now);
+            if since.elapsed() < hidden_stream {
+                continue;
+            }
+            if p.stream.as_ref().is_some_and(|s| !s.ended) {
+                p.stream = None;
+                p.stream_dropped = true;
+            }
+            // A history search's stream has the same deadline, whatever the graph's did: its
+            // results stay, and ↓ on their last row (or the foot) reads them again.
+            if let Some(search) = p.search.take_if(|s| !s.link.ended) {
+                let paging = Paging::Error("stopped while hidden; ↓ reads it again".into());
+                p.view
+                    .append_search_results(&search.query, Vec::new(), paging);
+                p.search_dropped = Some(search.query);
+            }
+        }
+        // The least recently shown panel goes when a fourth is kept (its running reads stop).
+        while self.git.panels.len() > KEPT_PANELS {
+            let pinned = self.git.pin.as_ref().map(|p| p.repo.clone());
+            let drop = self
+                .git
+                .panels
+                .iter()
+                .enumerate()
+                .filter(|(_, p)| !shown.contains(&p.top) && Some(&p.top) != pinned.as_ref())
+                .min_by_key(|(_, p)| p.last_shown)
+                .map(|(i, _)| i);
+            match drop {
+                Some(i) => {
+                    self.git.panels.remove(i);
+                }
+                None => break,
+            }
+        }
+        let hidden_any = self.git.panels.iter().any(|p| p.hidden_since.is_some());
+        if hidden_any {
+            // An idle window still ends a hidden stream on time.
+            ctx.request_repaint_after(Duration::from_secs(1));
+        }
+    }
+
+    /// A new panel for the repository at `top`, its load started; its index.
+    fn make_panel(&mut self, ctx: &egui::Context, top: String) -> usize {
+        let detection = self
+            .git
+            .detections
+            .values()
+            .find(|d| matches!(d, Detection::WorkTree { top: t, .. } if *t == top));
+        let notes = detection.map(Detection::title_notes).unwrap_or_default();
+        let shallow = matches!(detection, Some(Detection::WorkTree { shallow: true, .. }));
+        let title = format!("{}{notes}", show(self.label.as_deref(), &top));
+        self.git.panels.push(RepoPanel {
+            top,
+            shallow,
+            view: GitView::new(title),
+            generation: Generation::new(),
+            snapshot: None,
+            read: None,
+            stream: None,
+            stream_dropped: false,
+            search: None,
+            search_dropped: None,
+            details: None,
+            last_details: None,
+            reveal: None,
+            resolving: None,
+            hidden_since: None,
+            refreshed: None,
+            last_shown: 0,
+        });
+        let i = self.git.panels.len() - 1;
+        self.start_read(ctx, i, false, 1);
+        i
+    }
+
+    /// The reads of a load (03 §4.1) on a worker: `soft` keeps the rows when the refs, HEAD and
+    /// stashes did not move (03 §5); otherwise a new stream reads `pages` pages (at least one).
+    fn start_read(&mut self, ctx: &egui::Context, i: usize, soft: bool, pages: usize) {
+        let Some(runner) = self.git_runner() else {
+            return;
+        };
+        let p = &mut self.git.panels[i];
+        let handle = Handle::new();
+        let git = RunnerGit::new(runner, handle.clone());
+        let (tx, rx) = mpsc::channel();
+        let (top, waker) = (p.top.clone(), ctx.clone());
+        std::thread::spawn(move || {
+            let _ = tx.send(read_snapshot(&git, &top));
+            waker.request_repaint();
+        });
+        // A newer read replaces an older one (its handle stops what it still runs).
+        p.read = Some(SnapshotRead {
+            soft: soft && p.snapshot.is_some() && p.stream.is_some(),
+            pages: pages.max(1),
+            pending: Pending { rx, handle },
+        });
+        p.refreshed = Some(std::time::Instant::now());
+        if !soft && p.view.rows().is_empty() {
+            p.view.set_paging(Paging::Loading);
+        }
+    }
+
+    /// Everything panel `i` waits for, heard.
+    fn poll_panel(&mut self, ctx: &egui::Context, i: usize) {
+        // The load's reads.
+        let read = self.git.panels[i]
+            .read
+            .as_ref()
+            .and_then(|r| r.pending.rx.try_recv().ok());
+        if let Some(result) = read {
+            let Some(read) = self.git.panels[i].read.take() else {
+                return;
+            };
+            match result {
+                Ok(snapshot) => self.snapshot_read(ctx, i, snapshot, read.soft, read.pages),
+                Err(why) => {
+                    let p = &mut self.git.panels[i];
+                    p.view.status = Some(Status::error(why.clone()));
+                    if p.view.rows().is_empty() {
+                        p.view.set_paging(Paging::Error(why));
+                    }
+                }
+            }
+        }
+        // The stream's pages.
+        loop {
+            let p = &mut self.git.panels[i];
+            let Some(link) = p.stream.as_mut() else {
+                break;
+            };
+            let Ok(page) = link.pages.try_recv() else {
+                break;
+            };
+            link.asked = link.asked.saturating_sub(1);
+            if page.generation != link.generation || page.end == PageEnd::Superseded {
+                continue;
+            }
+            let n = p.snapshot.as_ref().map_or(0, |s| s.status.entries.len());
+            let rows = link.rows.page(page.rows);
+            if std::mem::take(&mut link.first) {
+                let first_parent = p.view.filters().first_parent;
+                p.view.set_rows(rows, first_parent, n);
+            } else {
+                p.view.append_rows(rows);
+            }
+            if page.end != PageEnd::More {
+                link.ended = true;
+                link.asked = 0;
+            }
+            p.view.set_paging(paging_of(&page.end, p.shallow));
+        }
+        // A history search's pages.
+        loop {
+            let p = &mut self.git.panels[i];
+            let Some(search) = p.search.as_mut() else {
+                break;
+            };
+            let Ok(page) = search.link.pages.try_recv() else {
+                break;
+            };
+            let link = &mut search.link;
+            link.asked = link.asked.saturating_sub(1);
+            if page.end != PageEnd::More {
+                link.ended = true;
+                link.asked = 0;
+            }
+            let paging = paging_of(&page.end, false);
+            if std::mem::take(&mut link.first) {
+                p.view.set_search_results(&search.query, page.rows, paging);
+            } else {
+                p.view
+                    .append_search_results(&search.query, page.rows, paging);
+            }
+        }
+        if self.git.panels[i]
+            .search
+            .as_ref()
+            .is_some_and(|s| self.git.panels[i].view.search() != Some(&s.query))
+        {
+            // The search was left (Esc back to the graph): its stream goes.
+            self.git.panels[i].search = None;
+        }
+        // Details.
+        let p = &mut self.git.panels[i];
+        if let Some(pending) = &p.details {
+            loop {
+                match pending.rx.try_recv() {
+                    Ok(details) => {
+                        p.last_details = Some(details.clone());
+                        p.view.set_details(details);
+                    }
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => {
+                        p.details = None;
+                        break;
+                    }
+                }
+            }
+        }
+        // A file row's diff or file.
+        let revealed = p.reveal.as_ref().and_then(|r| r.rx.try_recv().ok());
+        if let Some(revealed) = revealed {
+            p.reveal = None;
+            self.revealed(ctx, revealed);
+        }
+        // `select=REV` resolved.
+        let p = &mut self.git.panels[i];
+        let resolved = p.resolving.as_ref().and_then(|r| r.rx.try_recv().ok());
+        if let Some(resolved) = resolved {
+            p.resolving = None;
+            match resolved {
+                Ok(oid) => {
+                    p.view.select(RowKey::Commit(oid));
+                }
+                Err(why) => {
+                    p.view.status = Some(Status::error(why));
+                    self.git.script = GitScript::default();
+                }
+            }
+        }
+    }
+
+    /// The load's refs, HEAD, stashes, status and remotes came: the labels and the foot now; the
+    /// rows kept (a soft refresh with the graph unchanged, the uncommitted row put in or taken
+    /// out) or a new stream started.
+    fn snapshot_read(
+        &mut self,
+        ctx: &egui::Context,
+        i: usize,
+        snapshot: Snapshot,
+        soft: bool,
+        pages: usize,
+    ) {
+        let p = &mut self.git.panels[i];
+        p.view.set_remotes(snapshot.remotes.clone());
+        p.view
+            .set_refs(snapshot.refs.clone(), head_ref(&snapshot.head));
+        p.view.tracking = tracking(&snapshot.status);
+        let keep = soft
+            && p.stream.is_some()
+            && p.snapshot
+                .as_ref()
+                .is_some_and(|old| old.same_graph(&snapshot));
+        let was = p.snapshot.replace(snapshot);
+        if !keep {
+            // 03 §4.5: a refresh that moved the graph reads as many pages as were loaded.
+            let loaded = p.view.rows().len().div_ceil(history::PAGE);
+            self.start_stream(ctx, i, pages.max(loaded));
+            return;
+        }
+        // 03 §5: the rows stay; the uncommitted row and its count follow the status.
+        let p = &mut self.git.panels[i];
+        let Some(now) = p.snapshot.as_ref() else {
+            return;
+        };
+        let n = now.status.entries.len();
+        let had = was.as_ref().map_or(0, |w| w.status.entries.len());
+        if n != had {
+            let mut rows = p.view.rows().to_vec();
+            let first_is = matches!(rows.first(), Some(Row::Uncommitted { .. }));
+            if n == 0 && first_is {
+                rows.remove(0);
+            } else if n > 0 && !first_is {
+                rows.insert(
+                    0,
+                    Row::Uncommitted {
+                        head: now.head.oid().cloned(),
+                    },
+                );
+            }
+            let first_parent = p.view.filters().first_parent;
+            p.view.set_rows(rows, first_parent, n);
+        }
+    }
+
+    /// A new log stream for panel `i` (03 §4.5), reading `pages` pages: the old one ends, and a
+    /// hidden panel's parked stream gives way when the host has [`PARKED_STREAMS`] already.
+    fn start_stream(&mut self, ctx: &egui::Context, i: usize, pages: usize) {
+        let Some(runner) = self.git_runner() else {
+            return;
+        };
+        self.git.panels[i].stream = None;
+        self.git.panels[i].stream_dropped = false;
+        self.make_room_for_a_stream(i);
+        let p = &mut self.git.panels[i];
+        let Some(snapshot) = p.snapshot.clone() else {
+            return;
+        };
+        let f = p.view.filters().clone();
+        let mut rows = RowStream::new(
+            snapshot.head.oid().cloned(),
+            !snapshot.status.entries.is_empty(),
+            snapshot.stashes.clone(),
+            f.stashes,
+        );
+        let roots = roots_of(&f, &snapshot);
+        if roots.is_empty() {
+            // 03 §4.1: no id is ever sent — git would take HEAD.
+            let n = snapshot.status.entries.len();
+            p.view.set_rows(rows.page(Vec::new()), f.first_parent, n);
+            let nothing = snapshot.refs.is_empty() && snapshot.head.oid().is_none();
+            p.view.set_paging(if nothing {
+                Paging::NoCommits
+            } else {
+                Paging::NoRefsChosen
+            });
+            return;
+        }
+        let g = p.generation.bump();
+        let handle = Handle::new();
+        let link = spawn_stream(
+            ctx,
+            RunnerGit::new(runner, handle.clone()),
+            p.top.clone(),
+            history::argv::log(&log_options(&f)),
+            roots,
+            p.generation.clone(),
+            g,
+        );
+        let mut link = StreamLink {
+            generation: g,
+            handle,
+            ask: link.0,
+            pages: link.1,
+            asked: 0,
+            rows,
+            first: true,
+            ended: false,
+        };
+        if link.ask.send(pages).is_ok() {
+            link.asked = pages;
+        }
+        p.stream = Some(link);
+        if p.view.rows().is_empty() {
+            p.view.set_paging(Paging::Loading);
+        }
+    }
+
+    /// At most [`PARKED_STREAMS`] streams per host: the least recently shown hidden panel's ends
+    /// first (it reads its pages again when it is shown).
+    fn make_room_for_a_stream(&mut self, for_panel: usize) {
+        loop {
+            let live = self
+                .git
+                .panels
+                .iter()
+                .map(|p| {
+                    usize::from(p.stream.as_ref().is_some_and(|s| !s.ended))
+                        + usize::from(p.search.as_ref().is_some_and(|s| !s.link.ended))
+                })
+                .sum::<usize>();
+            if live < PARKED_STREAMS {
+                return;
+            }
+            let victim = self
+                .git
+                .panels
+                .iter()
+                .enumerate()
+                .filter(|(i, p)| {
+                    *i != for_panel
+                        && p.hidden_since.is_some()
+                        && (p.stream.as_ref().is_some_and(|s| !s.ended) || p.search.is_some())
+                })
+                .min_by_key(|(_, p)| p.last_shown)
+                .map(|(i, _)| i);
+            let Some(v) = victim else {
+                return;
+            };
+            let p = &mut self.git.panels[v];
+            p.stream = None;
+            p.search = None;
+            p.stream_dropped = true;
+        }
+    }
+
+    /// The next page of panel `i`'s stream (03 §4.5); a stream that ended on an error or was
+    /// dropped is started again, reading as many pages as were loaded and one more.
+    fn more_rows(&mut self, ctx: &egui::Context, i: usize) {
+        let p = &mut self.git.panels[i];
+        let retry = matches!(p.view.paging(), Paging::Error(_)) || p.stream_dropped;
+        match p.stream.as_mut() {
+            Some(link) if !link.ended && !retry => {
+                if link.asked == 0 && link.ask.send(1).is_ok() {
+                    link.asked = 1;
+                }
+            }
+            _ if retry => {
+                let pages = p.view.rows().len().div_ceil(history::PAGE) + 1;
+                self.start_read(ctx, i, false, pages);
+            }
+            _ => {}
+        }
+    }
+
+    /// Esc in the git panel, before anything that arrived is heard (03 §3.4: reads stop on Esc):
+    /// what the panel waits for — a page, a history search's page, a load's reads, a file row's
+    /// diff or file — is stopped, and a file row's result is dropped unread, so a diff whose git
+    /// had already ended opens no viewer. Only with nothing waited for is Esc the panel's chain.
+    fn git_stop_on_esc(&mut self, ctx: &egui::Context) {
+        if self.ops.holds_keyboard() || self.viewer.is_some() || self.tree.is_some() {
+            return;
+        }
+        let Some(i) = self.git_focused() else {
+            return;
+        };
+        let waiting = git_waiting(&self.git.panels[i]);
+        if waiting.is_empty()
+            || !ctx.input_mut(|inp| keys::take(inp, Key::Escape, keys::Mods::None))
+        {
+            return;
+        }
+        for handle in waiting {
+            handle.stop();
+        }
+        self.git.panels[i].reveal = None;
+        self.status = Status::info("stopped");
+    }
+
+    /// The git panel's keys (03 §9), through the key table's git context.
+    fn git_keys(&mut self, ctx: &egui::Context) {
+        if self.ops.holds_keyboard() {
+            return;
+        }
+        let Some(i) = self.git_focused() else {
+            return;
+        };
+        // A key of the owner's: what was said before is old news.
+        let pressed = ctx.input(|inp| {
+            inp.events.iter().any(|e| {
+                matches!(
+                    e,
+                    egui::Event::Key { pressed: true, .. } | egui::Event::Text(_)
+                )
+            })
+        });
+        if pressed {
+            self.status = Status::default();
+        }
+        let actions = git_panel::keys(ctx, &mut self.git.panels[i].view);
+        self.git_actions(ctx, i, actions);
+    }
+
+    /// Carries out what panel `i` asks (S2-D's `GitAction`s).
+    fn git_actions(&mut self, ctx: &egui::Context, i: usize, actions: Vec<GitAction>) {
+        for action in actions {
+            if i >= self.git.panels.len() {
+                return;
+            }
+            match action {
+                GitAction::Help => {
+                    help::open(ctx, help::for_context(Context::Git, self.mode, &[]));
+                }
+                GitAction::Details(subject) => self.ask_details(ctx, i, subject),
+                GitAction::MoreRows => self.more_rows(ctx, i),
+                GitAction::Search(query) => self.start_search(ctx, i, query),
+                GitAction::MoreResults => {
+                    let p = &mut self.git.panels[i];
+                    if p.search.is_none() {
+                        // Ended while hidden: run again, as many pages as were shown and one more.
+                        if let Some(query) = p.search_dropped.take() {
+                            if p.view.search() == Some(&query) {
+                                let shown = p.view.search_rows().div_ceil(history::PAGE);
+                                self.start_search_pages(ctx, i, query, shown + 1);
+                                continue;
+                            }
+                        }
+                    }
+                    if let Some(s) = self.git.panels[i].search.as_mut() {
+                        let link = &mut s.link;
+                        if !link.ended && link.asked == 0 && link.ask.send(1).is_ok() {
+                            link.asked = 1;
+                        }
+                    }
+                }
+                GitAction::FiltersChanged(_) => {
+                    let pages = self.git.panels[i].view.rows().len().div_ceil(history::PAGE);
+                    self.start_stream(ctx, i, pages.max(1));
+                }
+                GitAction::Diff {
+                    subject,
+                    group,
+                    file,
+                } => self.ask_reveal(ctx, i, subject, group, file, true),
+                GitAction::RevisionFile {
+                    subject,
+                    group,
+                    file,
+                } => self.ask_reveal(ctx, i, subject, group, file, false),
+                GitAction::ListFolder { subject, dir } => self.list_folder(ctx, i, subject, dir),
+                GitAction::Edit(path) => {
+                    let top = self.git.panels[i].top.clone();
+                    match path {
+                        None => self.edit(ctx, top, true),
+                        Some(path) => {
+                            let abs = format!("{}/{path}", top.trim_end_matches('/'));
+                            self.edit(ctx, abs, false)
+                        }
+                    }
+                }
+                GitAction::OtherSide => self.git_leave(),
+                GitAction::SwitchMode => {
+                    // 02 §2: an automatic panel gives the keyboard back first; a pinned one
+                    // keeps it (the pin outranks the mode).
+                    let pinned = self
+                        .git
+                        .pin
+                        .as_ref()
+                        .is_some_and(|p| p.repo == self.git.panels[i].top);
+                    if !pinned {
+                        self.git_leave();
+                    }
+                    self.git.wide = false;
+                    self.mode = self.mode.other();
+                    self.moved_at = None;
+                }
+                GitAction::Refresh => self.hard_refresh(ctx, i),
+                GitAction::Pin => {
+                    if self.git.pin.take().is_some() {
+                        self.git_leave();
+                    } else {
+                        self.git.pin = Some(view::Pin {
+                            side: 1 - self.active,
+                            repo: self.git.panels[i].top.clone(),
+                        });
+                    }
+                    self.moved_at = None;
+                }
+                GitAction::Unpin => {
+                    if self.git.pin.take().is_some() {
+                        self.git_leave();
+                    } else if self.git.wide {
+                        self.git.wide = false;
+                    }
+                    self.moved_at = None;
+                }
+                GitAction::Wide => {
+                    self.git.wide = !self.git.wide;
+                    self.moved_at = None;
+                }
+            }
+        }
+    }
+
+    /// Cmd/Ctrl+R in the git panel (03 §5): detection, git version and every read again.
+    fn hard_refresh(&mut self, ctx: &egui::Context, i: usize) {
+        let top = self.git.panels[i].top.clone();
+        let host = self.git.host.clone();
+        let folders: Vec<String> = self
+            .git
+            .detections
+            .iter()
+            .filter(|(_, d)| matches!(d, Detection::WorkTree { top: t, .. } if *t == top))
+            .map(|(f, _)| f.clone())
+            .collect();
+        self.git.detector.forget_host(&host);
+        for folder in folders {
+            self.git.detector.forget(&host, &folder);
+            self.git.detections.remove(&folder);
+            self.git.said.remove(&folder);
+        }
+        let pages = self.git.panels[i].view.rows().len().div_ceil(history::PAGE);
+        self.start_read(ctx, i, false, pages.max(1));
+    }
+
+    /// The details of `subject` on a worker (03 §6.1, §6.4); a newer ask stops an older one.
+    fn ask_details(&mut self, ctx: &egui::Context, i: usize, subject: Subject) {
+        let Some(runner) = self.git_runner() else {
+            return;
+        };
+        let p = &mut self.git.panels[i];
+        let inputs = DetailsInputs {
+            stashes: p
+                .snapshot
+                .as_ref()
+                .map(|s| s.stashes.clone())
+                .unwrap_or_default(),
+            status: p
+                .snapshot
+                .as_ref()
+                .map(|s| s.status.clone())
+                .unwrap_or_else(|| GitStatus {
+                    branch: Default::default(),
+                    entries: Vec::new(),
+                }),
+        };
+        let handle = Handle::new();
+        let git = RunnerGit::new(runner, handle.clone());
+        let (tx, rx) = mpsc::channel();
+        let (top, waker) = (p.top.clone(), ctx.clone());
+        std::thread::spawn(move || {
+            let tell = |d: Details| {
+                let _ = tx.send(d);
+                waker.request_repaint();
+            };
+            read_details(&git, &top, &subject, &inputs, &tell);
+        });
+        p.details = Some(Pending { rx, handle });
+    }
+
+    /// → or Enter on an untracked folder's row (03 §6.1): its files, read now, after its row.
+    fn list_folder(&mut self, ctx: &egui::Context, i: usize, subject: Subject, dir: String) {
+        let Some(runner) = self.git_runner() else {
+            return;
+        };
+        let p = &mut self.git.panels[i];
+        let Some(mut details) = p.last_details.clone().filter(|d| d.subject == subject) else {
+            return;
+        };
+        let handle = Handle::new();
+        let git = RunnerGit::new(runner, handle.clone());
+        let (tx, rx) = mpsc::channel();
+        let (top, waker) = (p.top.clone(), ctx.clone());
+        std::thread::spawn(move || {
+            match history::others(&git, &top, &dir) {
+                Ok(files) => {
+                    for group in details.groups.iter_mut() {
+                        let Some(at) = group.files.iter().position(|f| f.path == dir) else {
+                            continue;
+                        };
+                        let already = group
+                            .files
+                            .get(at + 1)
+                            .is_some_and(|f| f.path.starts_with(dir.as_str()) && f.path != dir);
+                        if already {
+                            continue;
+                        }
+                        let rows = files.iter().map(|path| FileRow {
+                            letter: '?',
+                            path: path.clone(),
+                            old_path: None,
+                            lines: None,
+                            lossy: false,
+                        });
+                        group.files.splice(at + 1..at + 1, rows);
+                    }
+                }
+                Err(e) => details.error = Some(format!("{dir}: {e}")),
+            }
+            let _ = tx.send(details);
+            waker.request_repaint();
+        });
+        p.details = Some(Pending { rx, handle });
+    }
+
+    /// Enter or Shift+F3 on a file row (03 §6.2, §6.3), on a worker.
+    fn ask_reveal(
+        &mut self,
+        ctx: &egui::Context,
+        i: usize,
+        subject: Subject,
+        group: Group,
+        file: FileRow,
+        diff: bool,
+    ) {
+        let Some(runner) = self.git_runner() else {
+            return;
+        };
+        let p = &mut self.git.panels[i];
+        let handle = Handle::new();
+        let git = RunnerGit::new(runner, handle.clone());
+        let (tx, rx) = mpsc::channel();
+        let top = p.top.clone();
+        let shown_top = show(self.label.as_deref(), &top);
+        let (space, cache, waker) = (self.git.space.clone(), self.cache.clone(), ctx.clone());
+        let said = format!(
+            "{} {}…",
+            if diff { "diffing" } else { "reading" },
+            file.path
+        );
+        std::thread::spawn(move || {
+            let revealed = reveal(
+                &git, &top, &shown_top, &subject, group, &file, diff, &space, &cache,
+            );
+            let _ = tx.send(revealed);
+            waker.request_repaint();
+        });
+        p.reveal = Some(Pending { rx, handle });
+        self.status = Status::info(said);
+    }
+
+    /// A file row's diff or file is ready: its viewer, read-only, over both sides (03 §6.2); or
+    /// the working file as the list opens it; or why there is nothing.
+    fn revealed(&mut self, ctx: &egui::Context, revealed: Revealed) {
+        if self.viewer.is_some() || self.opening.is_some() {
+            return;
+        }
+        self.status = Status::default();
+        match revealed {
+            Revealed::File { file, title, edit } => {
+                let name = file_name(&file.to_string_lossy()).to_string();
+                let local: Connect =
+                    Arc::new(|| Ok(Box::new(LocalFs::new()) as Box<dyn RemoteFs + Send>));
+                self.start_open_with(
+                    ctx,
+                    file.to_string_lossy().into_owned(),
+                    name,
+                    local,
+                    None,
+                    Some(ReadOnly { title, edit }),
+                );
+            }
+            Revealed::Working(abs) => {
+                let name = file_name(&abs).to_string();
+                let (connect, label) = (self.connect.clone(), self.label.clone());
+                self.start_open_with(ctx, abs, name, connect, label, None);
+            }
+            Revealed::Refused(why) => self.status = Status::error(why),
+        }
+    }
+
+    /// History search (03 §4.7): `git log` with the query's options and the panel's revisions,
+    /// paged like the graph.
+    fn start_search(&mut self, ctx: &egui::Context, i: usize, query: git_panel::SearchQuery) {
+        self.start_search_pages(ctx, i, query, 1);
+    }
+
+    /// [`Browser::start_search`], reading `pages` pages at once.
+    fn start_search_pages(
+        &mut self,
+        ctx: &egui::Context,
+        i: usize,
+        query: git_panel::SearchQuery,
+        pages: usize,
+    ) {
+        let Some(runner) = self.git_runner() else {
+            return;
+        };
+        self.git.panels[i].search_dropped = None;
+        self.git.panels[i].search = None;
+        self.make_room_for_a_stream(i);
+        let p = &mut self.git.panels[i];
+        let Some(snapshot) = p.snapshot.clone() else {
+            return;
+        };
+        let f = p.view.filters().clone();
+        let roots = roots_of(&f, &snapshot);
+        let q = history::argv::Query {
+            message: query.message.clone(),
+            author: query.author.clone(),
+            text: query.text.clone(),
+            path: query.path.clone(),
+            since: query.since.clone(),
+            until: query.until.clone(),
+            case: query.case,
+        };
+        if roots.is_empty() {
+            p.view
+                .set_search_results(&query, Vec::new(), Paging::NoRefsChosen);
+            return;
+        }
+        let generation = Generation::new();
+        let g = generation.bump();
+        let handle = Handle::new();
+        let link = spawn_stream(
+            ctx,
+            RunnerGit::new(runner, handle.clone()),
+            p.top.clone(),
+            history::argv::search(&log_options(&f), &q),
+            roots,
+            generation,
+            g,
+        );
+        let mut link = StreamLink {
+            generation: g,
+            handle,
+            ask: link.0,
+            pages: link.1,
+            asked: 0,
+            rows: RowStream::new(None, false, Vec::new(), false),
+            first: true,
+            ended: false,
+        };
+        if link.ask.send(pages).is_ok() {
+            link.asked = pages;
+        }
+        p.search = Some(SearchLink { query, link });
+    }
+
+    /// `SOPEN_STATE`'s git keys (02 §9), each once its panel is there: pin (the keyboard goes
+    /// in), `select=REV` (resolved, then the bar on it once its page came — more pages asked
+    /// for until it did), `label=N`, `details=1`.
+    fn git_script(&mut self, ctx: &egui::Context) {
+        if self.git.script.done() {
+            return;
+        }
+        if self.git.script.pin {
+            let folder = self.panels[self.active].dir.clone();
+            match self.git.detections.get(&folder) {
+                Some(Detection::WorkTree { top, .. }) => {
+                    self.git.pin = Some(view::Pin {
+                        side: 1 - self.active,
+                        repo: top.clone(),
+                    });
+                    self.git.focus = true;
+                    self.git.script.pin = false;
+                    self.moved_at = None;
+                }
+                Some(other) => {
+                    let host = self.label.clone().unwrap_or_else(|| "this machine".into());
+                    self.status = Status::error(format!(
+                        "SOPEN_STATE git=pin: {}",
+                        other
+                            .reason(&host)
+                            .unwrap_or_else(|| "not in a git work tree".into())
+                    ));
+                    self.git.script = GitScript::default();
+                }
+                None => {}
+            }
+            return;
+        }
+        let Some(i) = self.git.pin.as_ref().and_then(|p| self.git.panel(&p.repo)) else {
+            return;
+        };
+        let loaded = {
+            let p = &self.git.panels[i];
+            p.read.is_none() && p.stream.as_ref().is_some_and(|s| s.asked == 0)
+                || !matches!(p.view.paging(), Paging::Loading)
+                    && p.read.is_none()
+                    && p.stream.is_none()
+        };
+        if !loaded {
+            return;
+        }
+        if let Some(rev) = self.git.script.select.take() {
+            let Some(runner) = self.git_runner() else {
+                return;
+            };
+            let p = &mut self.git.panels[i];
+            let handle = Handle::new();
+            let git = RunnerGit::new(runner, handle.clone());
+            let (tx, rx) = mpsc::channel();
+            let (top, waker) = (p.top.clone(), ctx.clone());
+            std::thread::spawn(move || {
+                let spec = format!("{rev}^{{commit}}");
+                let args = vec!["rev-parse".into(), "-q".into(), "--verify".into(), spec];
+                let found = match git.run(&top, &args, b"", history::Bound::Read) {
+                    Ok(ran) if ran.code == Some(0) => {
+                        Oid::parse(String::from_utf8_lossy(&ran.stdout).trim())
+                            .ok_or_else(|| format!("SOPEN_STATE select={rev}: not a commit"))
+                    }
+                    Ok(_) => Err(format!(
+                        "SOPEN_STATE select={rev}: git knows no such commit"
+                    )),
+                    Err(e) => Err(format!("SOPEN_STATE select={rev}: {e}")),
+                };
+                let _ = tx.send(found);
+                waker.request_repaint();
+            });
+            p.resolving = Some(Pending { rx, handle });
+            return;
+        }
+        let p = &mut self.git.panels[i];
+        if p.resolving.is_some() {
+            return;
+        }
+        if p.view.selecting().is_some() {
+            // Not loaded yet: the next page, until it comes or the history ends.
+            match p.view.paging() {
+                Paging::More(_) => self.more_rows(ctx, i),
+                _ => {
+                    self.status =
+                        Status::error("SOPEN_STATE select: that commit is not in the graph");
+                    self.git.script = GitScript::default();
+                }
+            }
+            return;
+        }
+        if let Some(n) = self.git.script.label.take() {
+            p.view.set_label_cursor(n);
+        }
+        if std::mem::take(&mut self.git.script.details) {
+            let actions = p.view.open_details();
+            self.git_actions(ctx, i, actions);
+        }
+    }
+
+    /// The git panel shown on side `side` in `rect` (the keyboard's when `active`), its clicks
+    /// carried out; a press on it gives it the keyboard.
+    fn git_ui(&mut self, ui: &mut egui::Ui, side: usize, rect: Rect, top: &str) {
+        let Some(i) = self.git.panel(top) else {
+            return;
+        };
+        let pressed = ui.input(|inp| {
+            inp.pointer.any_pressed()
+                && inp
+                    .pointer
+                    .interact_pos()
+                    .is_some_and(|pos| rect.contains(pos))
+        });
+        if pressed && !self.ops.holds_keyboard() && self.tree.is_none() && self.listing.is_empty() {
+            if side != 1 - self.active {
+                // The other side's list had the keyboard: it is the origin list now.
+                self.active = 1 - side;
+            }
+            self.git.focus = true;
+        }
+        let active = self.git.focus && side == 1 - self.active && self.viewer.is_none();
+        let mut actions = git_panel::draw(ui, rect, &mut self.git.panels[i].view, active);
+        if self.ops.holds_keyboard() || self.tree.is_some() {
+            actions.clear();
+        }
+        let ctx = ui.ctx().clone();
+        self.git_actions(&ctx, i, actions);
+    }
+}
+
+/// The handles of what panel `p` waits for on the owner's behalf: a page or a search's page asked
+/// and not come, a load's reads, a file row's diff or file. (A details read following the bar is
+/// not: the next bar move replaces it.)
+fn git_waiting(p: &RepoPanel) -> Vec<Handle> {
+    let mut out = Vec::new();
+    if let Some(s) = p.stream.as_ref().filter(|s| s.asked > 0) {
+        out.push(s.handle.clone());
+    }
+    if let Some(s) = p.search.as_ref().filter(|s| s.link.asked > 0) {
+        out.push(s.link.handle.clone());
+    }
+    if let Some(r) = &p.read {
+        out.push(r.pending.handle.clone());
+    }
+    if let Some(r) = &p.reveal {
+        out.push(r.handle.clone());
+    }
+    out
+}
+
+/// A read-only viewer's title and the file F4 opens (the path now, never the `.revisions` copy).
+#[derive(Debug, Clone)]
+struct ReadOnly {
+    title: String,
+    edit: String,
+}
+
+/// A log stream on a worker of its own: started with `args` and `roots`, it reads as many pages
+/// as each ask says, and ends when the asks' sender goes (git stopped with it).
+fn spawn_stream(
+    ctx: &egui::Context,
+    git: RunnerGit,
+    top: String,
+    args: Vec<String>,
+    roots: Vec<Oid>,
+    generation: Generation,
+    g: u64,
+) -> (mpsc::Sender<usize>, Receiver<Page>) {
+    let (ask, asks) = mpsc::channel::<usize>();
+    let (tx, pages) = mpsc::channel();
+    let waker = ctx.clone();
+    std::thread::spawn(move || {
+        let mut stream = match LogStream::start_with(&git, &top, args, &roots, &generation, g) {
+            Ok(stream) => stream,
+            Err(e) => {
+                let why = match e {
+                    StartError::Run(e) => format!("git log: {e}"),
+                    StartError::NoRoots => "no refs chosen".into(),
+                    StartError::Superseded => return,
+                };
+                let _ = tx.send(Page {
+                    generation: g,
+                    rows: Vec::new(),
+                    end: PageEnd::Error(why),
+                });
+                waker.request_repaint();
+                return;
+            }
+        };
+        while let Ok(n) = asks.recv() {
+            for _ in 0..n {
+                let page = stream.page(history::PAGE);
+                let more = page.end == PageEnd::More;
+                if tx.send(page).is_err() {
+                    return;
+                }
+                waker.request_repaint();
+                if !more {
+                    break;
+                }
+            }
+        }
+    });
+    (ask, pages)
 }
 
 #[cfg(test)]

@@ -189,7 +189,8 @@ each in a frame with its folder (`host:/abs`) centred in the top border and the 
 frame drawn heavier; the status row (an opening's or an operation's progress, the last result, else what the keys do);
 the bottom row lists the F-keys that work there and nothing else (the list, since slices S1 and S5
 of the browser workstream: 1 Help, 2 Rename, 3 View, 4 Edit, 5 Copy, 6 Move, 9 Dual — `Prevw` in
-dual mode — and 10 Tree; the directory tree: 1 Help, 10 Tree; a viewer: 1 Help, 3 Exit, 4 Edit and the viewer's own — the text viewer's 2 Unwrap (Wrap once unwrapped),
+dual mode — and 10 Tree; the directory tree: 1 Help, 10 Tree; the git panel, since S2: 1 Help, 3 View,
+4 Edit, 9 Dual; a viewer: 1 Help, 3 Exit, 4 Edit and the viewer's own — the text viewer's 2 Unwrap (Wrap once unwrapped),
 an alias of W; the hex window's 5 Save, 6 Goto, 7 SaveAs, 8 Asc/hx, aliases of ⌘S, ⌘G, ⌥⌘S and
 Tab; and the image and media windows' 5 Save and 7 SaveAs; a plain F-key never acts while a text
 field has the typing). The foot shows `N Listed = N bytes` whole inside the frame whatever the width: the
@@ -230,8 +231,8 @@ too, where F3 closes it as ⌘W does.
   a row where the side is wide enough, else eight, without the hex window's path row; a video's
   first frame with its size and duration, a sound's waveform — of its first 10 minutes when it is
   longer — with its whole duration; a file over a preview budget, 02 §4.3, or one that cannot be
-  read as an info card saying why); on a folder or `..` it shows its own list (the git panel
-  comes with S2). A preview takes no key, click, drag or wheel, claims nothing in the cache and
+  read as an info card saying why); on a folder or `..` it shows its own list, or — when the
+  folder is inside a git work tree — the git panel of that repository (below). A preview takes no key, click, drag or wheel, claims nothing in the cache and
   writes nothing to disk (a remote file of any kind is read through a stream on the window's one
   preview connection, which becomes the stream's transport: an image read whole into memory,
   text, hex rows, a video and a sound only as far as they show, 02 §4.3–§4.4), and is prepared
@@ -251,6 +252,21 @@ too, where F3 closes it as ⌘W does.
   link's target, resolved; a link whose target is gone says so) and closes the tree; Esc or F10
   closes it with the panel as it was; Esc first stops an owner's whole listing or Space's scan.
   Remotely the tree has an SFTP connection of its own.
+- **The git panel** (msg 14; [03](03-git-panel.md), read-only since slice S2) is the other side's
+  content when the bar rests on a folder, `..` or an empty list and the active folder is inside a
+  git work tree (detected once per folder with git's own `rev-parse`, locally or over the ssh
+  master; a bare repository, the inside of `.git`, a folder git refuses or a host without git
+  keep the list, the status row saying why once). It is the graph of every commit and branch —
+  lanes, labels (`►main↔origin`, tags, `stash@{n}`), subject, date, author, hash, the
+  uncommitted changes first — read 500 rows at a time from one `git log` stream that waits
+  between pages; Enter or F3 opens a commit's (a stash's, the uncommitted row's) details below
+  it, Enter on a file its diff and Shift+F3 the file at that revision, each in its viewer and
+  read-only (Save and Save copy off, `a file at a revision has no place to be saved`), F3 with
+  one marked row compares the two. Find (a typed letter, Cmd/Ctrl+F), history search
+  (Cmd/Ctrl+Shift+F), the filters (Cmd/Ctrl+K) and Cmd/Ctrl+R (refresh) act in it. **Tab**
+  gives it the keyboard and back; **Cmd/Ctrl+G** pins it to that side, so it stays while the bar
+  moves over files and while the list goes elsewhere (titled with its repository); Esc unpins.
+  It writes nothing to the repository until S3's actions.
 - **Selection and file operations** (msg 15; [04](04-file-keys.md) §3–§5, S1's part). Space or
   Ins selects the bar's entry and steps down; `+` and `-` select and unselect by a pattern, `*`
   inverts, Cmd/Ctrl+A selects all; selected entries are yellow and the foot counts them first.
@@ -716,7 +732,8 @@ goes on — it was not deciding where the file opens).
   staged and kept image, hex and media edits, backups and edits moved aside are 0600. A staged or kept image, hex or media edit gets a new name
   (`<stem>.<tag>-<UTC stamp>-<random>.<ext>`), created exclusively — never over or through an existing file.
 - The cache's fixed roots are dot-named — `<cache>/.backup`, `<cache>/.edits` (staged and kept image, hex and media edits),
-  `<cache>/.exports` (local exports before they are published), `<cache>/.sessions`, `<cache>/.meta` — and a host
+  `<cache>/.exports` (local exports before they are published), `<cache>/.revisions` (the git panel's diffs and files
+  at a revision, a folder per browser window, removed when it closes; 03 §6.2), `<cache>/.sessions`, `<cache>/.meta` — and a host
   label never starts with `.`, so no mirrored host lands in one (a host named `backup` is `<cache>/backup/…`, plain
   cache). Roots an older build made without the dot are just cache: never read or written.
 - What sopen knows about a cached copy lives outside the mirrored tree, where no remote path can reach it:

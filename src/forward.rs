@@ -14,8 +14,9 @@ use std::io::IsTerminal;
 use std::path::Path;
 use std::process::{Command, ExitStatus};
 
-/// Receipt hooks (AGENTS.md "Receipts") a forwarded run carries to HOST. Settings that name local
-/// paths — `SOPEN_CODE`, `SOPEN_ZED`, `SOPEN_FFMPEG`, `SOPEN_FFPROBE`, `SOPEN_CACHE_DIR`, `SOPEN_STATE_DIR`,
+/// Receipt hooks (AGENTS.md "Receipts") a forwarded run carries to HOST (`SOPEN_STATE`'s git keys
+/// and `SOPEN_LIST=git` among them, 02 §9). Settings that name local paths — `SOPEN_CODE`,
+/// `SOPEN_ZED`, `SOPEN_FFMPEG`, `SOPEN_FFPROBE`, `SOPEN_GIT`, `SOPEN_CACHE_DIR`, `SOPEN_STATE_DIR`,
 /// `SOPEN_CONFIG` — mean nothing on HOST and stay here.
 pub const FORWARDED_ENV: [&str; 21] = [
     "SOPEN_STATE",
@@ -1235,6 +1236,8 @@ mod tests {
             "SOPEN_ZED",
             "SOPEN_FFMPEG",
             "SOPEN_FFPROBE",
+            "SOPEN_GIT",
+            "SOPEN_REQUIRE_GIT",
             "SOPEN_CACHE_DIR",
             "SOPEN_STATE_DIR",
             "SOPEN_CONFIG",

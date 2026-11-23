@@ -62,10 +62,16 @@
 //!   `finish` collects at most [`MAX_OUTPUT`] ([`GitCommand::max_output`]); past either the
 //!   command is stopped and ends `Ending::Stopped` with `StopBy::Overflow(limit)`
 //!   (`read_record` returns `None`).
-//! - **Nothing is left behind**: once a finished command's output has had a second, whatever
-//!   of its process group still holds stdout or stderr is killed (remotely over the master, a
-//!   group found alive only); a pipe held from outside the group (a process in a session of its
-//!   own) is let go of. No reader thread outlives `finish`.
+//! - **Nothing is left behind** locally: once a finished command's output has had a second,
+//!   whatever of its process group still holds stdout or stderr is killed; a pipe held from
+//!   outside the group (a process in a session of its own) is let go of. Remotely the command's
+//!   leader has ended by then, and a group is never signalled by its number alone (03 §3.5): the
+//!   reader lets go of the pipe and a leftover may still run there. No reader thread outlives
+//!   `finish`.
+//! - **A remote stop checks whom it signals**: the `sopen-pid` line carries the leader's start
+//!   time, and each stop session reads it again right before each signal (one `sh -c`, one
+//!   answer per group); a group whose leader is gone or whose pid another process has is not
+//!   signalled, and the result says it may still be running (03 §3.5).
 //! - **No git**: `Ending::NoGit` — locally the git program is missing, remotely `<locate>`
 //!   found none (`sopen: no git`, exit 127).
 //! - [`mask_credentials`]: what every logged line and kept stderr went through; stdout is
@@ -183,9 +189,29 @@ pub const LOCAL_REPO_ENV: [&str; 15] = [
     "GIT_COMMON_DIR",
 ];
 
-/// The first line of every remote command and snippet: the pid the stop signals (03 §3.5).
-/// sshd starts the command as the leader of a new session, and every `exec` keeps the pid.
-const PID_LINE: &str = r#"echo "sopen-pid $$" >&2;"#;
+/// `sopen_id <pid>`: the process's identity in `$sopen_i` — its start time, which a pid that
+/// is used again does not share (S2-F review 1; 03 §3.5): field 22 of `/proc/<pid>/stat` (clock
+/// ticks since boot) where there is a `/proc`, else `ps -o lstart=` (macOS); empty when there is
+/// no such process. Builtins only on Linux (no process started): `read`, the parameter cut and
+/// the function's own positional parameters (the caller's `"$@"` is untouched). No `'` and no
+/// backslash in it. A macro, so the pid line, `<locate>` and the stop share one text.
+macro_rules! id_fn {
+    () => {
+        concat!(
+            r#"sopen_id() { sopen_i=; if { read -r sopen_s <"/proc/$1/stat"; } 2>/dev/null; then "#,
+            r#"sopen_s=${sopen_s##*) }; set -- $sopen_s; [ $# -ge 20 ] && shift 19 && sopen_i=$1; "#,
+            r#"else sopen_i=$(ps -o lstart= -p "$1" 2>/dev/null); fi; }; "#,
+        )
+    };
+}
+
+/// The first line of every remote command and snippet: the pid the stop signals and its
+/// identity (03 §3.5). sshd starts the command as the leader of a new session, and every `exec`
+/// keeps the pid and its start time.
+const PID_LINE: &str = concat!(
+    id_fn!(),
+    r#"sopen_id $$; echo "sopen-pid $$ $sopen_i" >&2;"#,
+);
 
 /// `<locate>` (03 §3.2, §2.4): one fixed POSIX sh script, sent as a word and run by `sh -c`. It
 /// prints the pid line, finds git — on `PATH`, then in Homebrew's and the usual directories;
@@ -194,7 +220,8 @@ const PID_LINE: &str = r#"echo "sopen-pid $$" >&2;"#;
 /// stderr and exits 127. No `'` and no `\` in it, so its quoted word is the script between two
 /// quotes.
 pub const LOCATE: &str = concat!(
-    r#"echo "sopen-pid $$" >&2; "#,
+    id_fn!(),
+    r#"sopen_id $$; echo "sopen-pid $$ $sopen_i" >&2; "#,
     r#"ok() { [ -f "$1" ] && [ -x "$1" ] || return 1; [ "$1" = /usr/bin/git ] || return 0; "#,
     r#"[ "$(uname -s)" = Darwin ] || return 0; xcode-select -p >/dev/null 2>&1; }; "#,
     r#"g=; c=$(command -v git 2>/dev/null) && ok "$c" && g=$c; "#,
@@ -762,6 +789,74 @@ pub fn kill_words(pid: u32, signal: &str) -> Vec<OsString> {
         .collect()
 }
 
+/// One stop session for several groups of a host (S2-F review 1): for each `<pid> <identity>`
+/// pair, the leader's identity is read again right before the signal ([`ID_FN`]), and the group
+/// is signalled only when it is the same process — `kill <sig> -- -<pid>` through `env` (dash's
+/// builtin refuses `--`, measured; the program is what `exec 'kill'` runs under every login
+/// shell, E5). A line per group: `<pid> ok` (signalled; with `-0`, there and ours), `<pid> gone`
+/// (no group), `<pid> leaderless` (the leader is gone, the group is not: not signalled — a number
+/// alone proves nothing), `<pid> other` (another process has the pid now: not signalled). The
+/// residual: the moment between the reading and the `kill` inside this one shell.
+const STOP: &str = concat!(
+    id_fn!(),
+    r#"sig=$1; shift; while [ $# -ge 2 ]; do p=$1; w=$2; shift 2; sopen_id "$p"; "#,
+    r#"if [ -z "$sopen_i" ]; then if env kill -0 -- "-$p" 2>/dev/null; "#,
+    r#"then echo "$p leaderless"; else echo "$p gone"; fi; "#,
+    r#"elif [ "$sopen_i" != "$w" ]; then echo "$p other"; "#,
+    r#"elif env kill "$sig" -- "-$p" 2>/dev/null; then echo "$p ok"; else echo "$p gone"; fi; "#,
+    r#"done; exit 0"#,
+);
+
+/// `exec 'sh' '-c' '<STOP>' 'sopen-stop' '<sig>' '<pid1>' '<identity1>' …`: the one session of a
+/// stop step for a host's groups.
+pub fn stop_words(signal: &str, groups: &[(u32, String)]) -> Vec<OsString> {
+    let mut plain: Vec<String> = ["sh", "-c", STOP, "sopen-stop", signal]
+        .map(String::from)
+        .into();
+    for (pid, id) in groups {
+        plain.push(pid.to_string());
+        plain.push(id.clone());
+    }
+    std::iter::once(OsString::from("exec"))
+        .chain(
+            plain
+                .iter()
+                .map(|w| OsString::from_vec(quote(w.as_bytes()))),
+        )
+        .collect()
+}
+
+/// What one stop session says of a group (see [`STOP`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GroupAnswer {
+    /// Signalled (with `-0`: there, and the leader is the one the command started with).
+    Ok,
+    /// No such group.
+    Gone,
+    /// The leader is gone and the group is not: not signalled.
+    Leaderless,
+    /// Another process has the leader's pid now: not signalled.
+    Other,
+}
+
+/// A stop session's lines, by pid; a pid it said nothing of is not in it.
+fn group_answers(stdout: &[u8]) -> Vec<(u32, GroupAnswer)> {
+    String::from_utf8_lossy(stdout)
+        .lines()
+        .filter_map(|l| {
+            let (pid, word) = l.trim().split_once(' ')?;
+            let answer = match word {
+                "ok" => GroupAnswer::Ok,
+                "gone" => GroupAnswer::Gone,
+                "leaderless" => GroupAnswer::Leaderless,
+                "other" => GroupAnswer::Other,
+                _ => return None,
+            };
+            Some((pid.parse().ok()?, answer))
+        })
+        .collect()
+}
+
 /// `words` joined as ssh joins them: one line for the login shell.
 #[cfg(test)]
 fn line_of(words: &[OsString]) -> OsString {
@@ -799,8 +894,39 @@ pub struct Faults {
     pub master_gone: std::sync::atomic::AtomicBool,
     /// Commands dispatched (a stop's `kill` is not one).
     pub dispatched: std::sync::atomic::AtomicU32,
-    /// The signals sent to the "remote" group over the master, in order (`-TERM`, `-0`, …).
+    /// The signals sent to the "remote" group over the master, in order (`-TERM`, `-0`, …):
+    /// one entry per stop session.
     pub signals: Mutex<Vec<String>>,
+    /// Every stop session's words after `kill`: the signal and the groups (`-<pid>`), in order.
+    pub sessions: Mutex<Vec<Vec<String>>>,
+    /// Stop sessions open now, and the most ever open at once.
+    pub open: std::sync::atomic::AtomicU32,
+    pub most_open: std::sync::atomic::AtomicU32,
+    /// Run once, right before the next stop session (a test's "another process takes the pid").
+    pub before_stop: BeforeStop,
+}
+
+/// [`Faults::before_stop`].
+#[cfg(test)]
+#[derive(Default)]
+pub struct BeforeStop(Mutex<Option<Box<dyn FnOnce() + Send>>>);
+
+#[cfg(test)]
+impl BeforeStop {
+    pub fn set(&self, hook: impl FnOnce() + Send + 'static) {
+        *lock(&self.0) = Some(Box::new(hook));
+    }
+
+    fn take(&self) -> Option<Box<dyn FnOnce() + Send>> {
+        lock(&self.0).take()
+    }
+}
+
+#[cfg(test)]
+impl std::fmt::Debug for BeforeStop {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("BeforeStop")
+    }
 }
 
 #[cfg(test)]
@@ -930,10 +1056,15 @@ impl Via {
         }
     }
 
-    /// `kill <signal> -- -<pid>` on the host, over the master: `kill`'s exit code (0: signalled,
-    /// 1: no such group), or `None` when it did not run there.
-    fn kill(&self, pid: u32, signal: &str) -> Option<i32> {
-        let words = kill_words(pid, signal);
+    /// One stop session on the host ([`STOP`]), over the master: what it said of each group, or
+    /// `None` when it did not run there (or not to its end). The host's stop lane is held by the
+    /// caller: never two at once.
+    fn stop_session(
+        &self,
+        signal: &str,
+        groups: &[(u32, String)],
+    ) -> Option<Vec<(u32, GroupAnswer)>> {
+        let words = stop_words(signal, groups);
         let c = match self {
             Via::Local(_) => return None,
             Via::Ssh(g) => {
@@ -944,11 +1075,54 @@ impl Via {
             #[cfg(test)]
             Via::Shell(g) => {
                 lock(&g.faults.signals).push(signal.to_string());
-                g.login(&line_of(&words))
+                let session = std::iter::once(signal.to_string())
+                    .chain(groups.iter().map(|(p, _)| format!("-{p}")))
+                    .collect();
+                lock(&g.faults.sessions).push(session);
+                let open = g.faults.open.fetch_add(1, Ordering::SeqCst) + 1;
+                g.faults.most_open.fetch_max(open, Ordering::SeqCst);
+                if let Some(hook) = g.faults.before_stop.take() {
+                    hook();
+                }
+                let out = bounded_output(g.login(&line_of(&words)));
+                g.faults.open.fetch_sub(1, Ordering::SeqCst);
+                return out
+                    .filter(|(code, _)| *code == 0)
+                    .map(|(_, stdout)| group_answers(&stdout));
             }
         };
-        bounded(c).filter(|code| matches!(code, 0 | 1))
+        bounded_output(c)
+            .filter(|(code, _)| *code == 0)
+            .map(|(_, stdout)| group_answers(&stdout))
     }
+}
+
+/// [`bounded`], with what the command printed on stdout (at most 64 KiB kept).
+fn bounded_output(mut c: Command) -> Option<(i32, Vec<u8>)> {
+    c.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    let mut child = c.spawn().ok()?;
+    let mut stdout = child.stdout.take()?;
+    let reader = std::thread::spawn(move || {
+        let mut out = Vec::new();
+        let _ = (&mut stdout).take(64 * 1024).read_to_end(&mut out);
+        out
+    });
+    let deadline = Instant::now() + CONTROL_LIMIT;
+    let code = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status.code(),
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(5)),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break None;
+            }
+        }
+    };
+    let out = reader.join().unwrap_or_default();
+    code.map(|code| (code, out))
 }
 
 /// Runs a short control command (no input, output dropped) for at most [`CONTROL_LIMIT`]: its
@@ -990,6 +1164,10 @@ struct Inner {
     revive: Option<Revive>,
     busy: Mutex<usize>,
     freed: Condvar,
+    /// The host's stop lane (S2-F, 02 §6): a remote stop — its `kill` sessions, all its waits —
+    /// runs while it holds this, so the host never has two stop sessions open at once (sshd's
+    /// `MaxSessions`: git's worst case is 3 commands and 1 stop); a second stop waits behind.
+    stop_lane: Mutex<()>,
 }
 
 impl GitRunner {
@@ -1002,6 +1180,7 @@ impl GitRunner {
                 revive: None,
                 busy: Mutex::new(0),
                 freed: Condvar::new(),
+                stop_lane: Mutex::new(()),
             }),
         }
     }
@@ -1478,9 +1657,8 @@ impl Handle {
             state.stopped = true;
             state.attached.iter().filter_map(Weak::upgrade).collect()
         };
-        for shared in attached {
-            shared.request_stop(StopBy::Asked);
-        }
+        // Together: a host's commands are stopped in one stop session (S2-F).
+        Shared::request_stops(&attached, StopBy::Asked);
     }
 
     pub fn is_stopped(&self) -> bool {
@@ -1598,19 +1776,59 @@ impl Shared {
 
     /// Starts the stop, once, on a thread of its own.
     fn request_stop(self: &Arc<Self>, by: StopBy) {
-        {
-            let mut stop = lock(&self.stop);
-            if stop.by.is_some() {
-                return;
+        Self::request_stops(std::slice::from_ref(self), by);
+    }
+
+    /// Starts the stop of each of `all` not stopping yet, on threads of their own: locally each
+    /// its own (signals are no sessions); remotely one stop for all of a host's, in the host's
+    /// stop lane ([`Shared::stop_remote_all`]).
+    fn request_stops(all: &[Arc<Self>], by: StopBy) {
+        let fresh: Vec<Arc<Self>> = all
+            .iter()
+            .filter(|s| {
+                let mut stop = lock(&s.stop);
+                let first = stop.by.is_none();
+                if first {
+                    stop.by = Some(by);
+                }
+                first
+            })
+            .cloned()
+            .collect();
+        let mut hosts: Vec<Vec<Arc<Self>>> = Vec::new();
+        for shared in fresh {
+            if !shared.runner.via.remote() {
+                std::thread::spawn(move || {
+                    let outcome = shared.stop_local();
+                    shared.stopped_with(outcome);
+                });
+                continue;
             }
-            stop.by = Some(by);
+            match hosts
+                .iter_mut()
+                .find(|h| Arc::ptr_eq(&h[0].runner, &shared.runner))
+            {
+                Some(host) => host.push(shared),
+                None => hosts.push(vec![shared]),
+            }
         }
-        let shared = self.clone();
-        std::thread::spawn(move || {
-            let outcome = shared.stop_sequence();
-            lock(&shared.stop).outcome = Some(outcome);
-            shared.stop_changed.notify_all();
-        });
+        for group in hosts {
+            std::thread::spawn(move || {
+                let outcomes = {
+                    let _lane = lock(&group[0].runner.stop_lane);
+                    Shared::stop_remote_all(&group)
+                };
+                for (shared, outcome) in group.iter().zip(outcomes) {
+                    shared.stopped_with(outcome);
+                }
+            });
+        }
+    }
+
+    /// The stop came to `outcome`: said to whoever waits for it.
+    fn stopped_with(&self, outcome: StopOutcome) {
+        lock(&self.stop).outcome = Some(outcome);
+        self.stop_changed.notify_all();
     }
 
     fn stop_requested(&self) -> Option<StopBy> {
@@ -1634,14 +1852,6 @@ impl Shared {
         }
     }
 
-    fn stop_sequence(&self) -> StopOutcome {
-        if self.runner.via.remote() {
-            self.stop_remote()
-        } else {
-            self.stop_local()
-        }
-    }
-
     /// 03 §3.5, local: `SIGTERM` to the command's process group (it leads a session of its
     /// own); after the grace, `SIGKILL` to the group.
     fn stop_local(&self) -> StopOutcome {
@@ -1657,67 +1867,142 @@ impl Shared {
         StopOutcome::Stopped { killed }
     }
 
-    /// 03 §3.5, remote, over the same master, the pid from the `sopen-pid` line: the group is
-    /// asked first (`kill -0`) when the channel has already ended — a child that ignores
-    /// `SIGTERM` and closed its descriptors outlives it — then `kill -TERM -- -<pid>`; then the
-    /// grace: the channel's end, then the group's, asked every half second; `kill -KILL` only if
-    /// the last asking found it alive; then the channel is closed. Without the line, or with the
-    /// master gone, it may still be running.
-    fn stop_remote(&self) -> StopOutcome {
-        let via = &self.runner.via;
-        let Some(pid) = self.wait_remote_pid() else {
-            if self.exit().is_some() {
-                return StopOutcome::Ended;
+    /// 03 §3.5, remote, over the same master, for one host's commands stopped together (S2-F:
+    /// one stop session at a time per host, run in its stop lane), each by the pid and identity
+    /// of its `sopen-pid` line. Nothing is ever signalled by its number alone (review 1): every
+    /// session reads each leader's identity again right before its signal ([`STOP`]), and a group
+    /// whose leader is gone, or whose pid another process has now, is not signalled. So: a
+    /// command whose channel has already ended (its leader exited) is not signalled at all — it
+    /// ended, or a leftover of it may still run; the others get one `-TERM` session; then the
+    /// grace: the channels' end, then the groups', asked every half second (`-0`, the same
+    /// check); one `-KILL` session for those still there and still theirs; then the channels are
+    /// closed. A leader gone with its group still there (a child that ignores `SIGTERM`) is
+    /// "may still be running". Without the line, or with the master gone, a command may still be
+    /// running. Its output is read and dropped meanwhile by its own reader (`Running`'s finish or
+    /// drop): a channel cannot end while the master holds output nobody reads (E5).
+    fn stop_remote_all(group: &[Arc<Self>]) -> Vec<StopOutcome> {
+        let via = &group[0].runner.via;
+        let limits = group[0].runner.limits;
+        let mut outcome: Vec<Option<StopOutcome>> = vec![None; group.len()];
+        let ids: Vec<Option<(u32, String)>> = group.iter().map(|s| s.wait_remote_pid()).collect();
+        for (i, s) in group.iter().enumerate() {
+            if ids[i].is_none() {
+                outcome[i] = Some(if s.exit().is_some() {
+                    StopOutcome::Ended
+                } else {
+                    s.close_channel();
+                    StopOutcome::Sent
+                });
             }
-            self.close_channel();
-            return StopOutcome::Sent;
-        };
-        if !via.check() {
-            self.close_channel();
-            return StopOutcome::Sent;
         }
-        if self.exit().is_some() {
-            match via.kill(pid, "-0") {
-                Some(0) => {}
-                Some(_) => return StopOutcome::Ended,
-                None => return StopOutcome::Sent,
+        let open: Vec<usize> = (0..group.len()).filter(|&i| outcome[i].is_none()).collect();
+        if !open.is_empty() && !via.check() {
+            for &i in &open {
+                group[i].close_channel();
+                outcome[i] = Some(StopOutcome::Sent);
             }
         }
-        if via.kill(pid, "-TERM").is_none() {
-            self.close_channel();
-            return StopOutcome::Sent;
+        let id = |i: usize| ids[i].clone().unwrap_or((0, String::new()));
+        // A channel already ended: its leader exited, so nothing is signalled. Asked only (`-0`,
+        // no signal) whether something of its group is left, to say so.
+        let open: Vec<usize> = (0..group.len()).filter(|&i| outcome[i].is_none()).collect();
+        let (ended, todo): (Vec<usize>, Vec<usize>) =
+            open.into_iter().partition(|&i| group[i].exit().is_some());
+        for (i, answer) in Self::session(via, "-0", &ended, &id) {
+            outcome[i] = Some(match answer {
+                Some(GroupAnswer::Gone | GroupAnswer::Other) => StopOutcome::Ended,
+                Some(GroupAnswer::Ok | GroupAnswer::Leaderless) | None => StopOutcome::Sent,
+            });
         }
-        let deadline = Instant::now() + self.runner.limits.stop_grace;
-        self.wait_exit(self.runner.limits.stop_grace);
-        // Asked until it is gone or the grace is over; any answer but "still there" ends it.
-        let last = loop {
-            let answer = via.kill(pid, "-0");
+        // One `-TERM` for all, each checked.
+        let mut alive = Vec::new();
+        for (i, answer) in Self::session(via, "-TERM", &todo, &id) {
+            match answer {
+                Some(GroupAnswer::Ok) => alive.push(i),
+                Some(GroupAnswer::Gone | GroupAnswer::Other) => {
+                    outcome[i] = Some(StopOutcome::Stopped { killed: false })
+                }
+                Some(GroupAnswer::Leaderless) | None => {
+                    group[i].close_channel();
+                    outcome[i] = Some(StopOutcome::Sent);
+                }
+            }
+        }
+        let deadline = Instant::now() + limits.stop_grace;
+        for &i in &alive {
+            group[i].wait_exit(deadline.saturating_duration_since(Instant::now()));
+        }
+        // Asked until each is gone or the grace is over.
+        loop {
+            let mut still = Vec::new();
+            for (i, answer) in Self::session(via, "-0", &alive, &id) {
+                match answer {
+                    Some(GroupAnswer::Ok) => still.push(i),
+                    Some(GroupAnswer::Gone | GroupAnswer::Other) => {
+                        outcome[i] = Some(StopOutcome::Stopped { killed: false })
+                    }
+                    Some(GroupAnswer::Leaderless) | None => outcome[i] = Some(StopOutcome::Sent),
+                }
+            }
+            alive = still;
             let left = deadline.saturating_duration_since(Instant::now());
-            if answer != Some(0) || left.is_zero() {
-                break answer;
+            if alive.is_empty() || left.is_zero() {
+                break;
             }
             std::thread::sleep(REMOTE_PROBE.min(left));
-        };
-        let outcome = match last {
-            Some(0) => match via.kill(pid, "-KILL") {
-                Some(code) => StopOutcome::Stopped { killed: code == 0 },
-                None => StopOutcome::Sent,
-            },
-            Some(_) => StopOutcome::Stopped { killed: false },
-            None => StopOutcome::Sent,
-        };
-        self.close_channel();
+        }
+        // `-KILL` for those still there and still theirs.
+        for (i, answer) in Self::session(via, "-KILL", &alive, &id) {
+            outcome[i] = Some(match answer {
+                Some(GroupAnswer::Ok) => StopOutcome::Stopped { killed: true },
+                Some(GroupAnswer::Gone | GroupAnswer::Other) => {
+                    StopOutcome::Stopped { killed: false }
+                }
+                Some(GroupAnswer::Leaderless) | None => StopOutcome::Sent,
+            });
+        }
+        for &i in &todo {
+            group[i].close_channel();
+        }
         outcome
+            .into_iter()
+            .map(|o| o.unwrap_or(StopOutcome::Stopped { killed: false }))
+            .collect()
     }
 
-    /// The `sopen-pid` line's pid, waited for up to [`PID_WAIT`]; `None` without it or once
+    /// One stop session ([`STOP`]) for `which` of a host's commands: each one's answer, `None`
+    /// where the session did not run or said nothing of it. Nothing runs for none.
+    fn session(
+        via: &Via,
+        signal: &str,
+        which: &[usize],
+        id: &dyn Fn(usize) -> (u32, String),
+    ) -> Vec<(usize, Option<GroupAnswer>)> {
+        if which.is_empty() {
+            return Vec::new();
+        }
+        let groups: Vec<(u32, String)> = which.iter().map(|&i| id(i)).collect();
+        let answers = via.stop_session(signal, &groups);
+        which
+            .iter()
+            .zip(&groups)
+            .map(|(&i, (pid, _))| {
+                let answer = answers
+                    .as_ref()
+                    .and_then(|a| a.iter().find(|(p, _)| p == pid).map(|(_, a)| *a));
+                (i, answer)
+            })
+            .collect()
+    }
+
+    /// The `sopen-pid` line's pid and identity, waited for up to [`PID_WAIT`]; `None` without it or once
     /// the channel has ended.
-    fn wait_remote_pid(&self) -> Option<u32> {
+    fn wait_remote_pid(&self) -> Option<(u32, String)> {
         let deadline = Instant::now() + PID_WAIT;
         let mut err = lock(&self.stderr);
         loop {
             if err.remote_pid.is_some() || err.eof {
-                return err.remote_pid;
+                return err.remote_pid.map(|pid| (pid, err.remote_id.clone()));
             }
             let now = Instant::now();
             if now >= deadline {
@@ -1801,14 +2086,14 @@ impl Shared {
             self.signal_group(libc::SIGKILL);
             return;
         }
-        let pid = lock(&self.stderr).remote_pid;
-        // Over the same master only, as a stop is: with it gone, what is left may still run.
-        // `SIGKILL` only to a group just found alive.
-        if let Some(pid) = pid.filter(|_| via.check()) {
-            if via.kill(pid, "-0") == Some(0) {
-                let _ = via.kill(pid, "-KILL");
-            }
-        }
+        // Remotely the command's leader has ended: its group is never signalled by its number
+        // alone (03 §3.5, review 1) — a leftover there may still run. The reader lets go of the
+        // pipe instead (`finish`).
+        crate::debug!(
+            "git {}: {}: a leftover may still hold its output; not signalled (its leader ended)",
+            via.host(),
+            self.line
+        );
     }
 
     /// Closes the command's channel: the local end (`ssh`, or `ShellGit`'s login shell) is
@@ -1875,6 +2160,9 @@ struct Stderr {
     /// The newest non-empty line or update, masked: the status row's progress.
     newest: Option<String>,
     remote_pid: Option<u32>,
+    /// The `sopen-pid` line's identity of that process (its start time; empty when the host
+    /// could not say): what a stop compares before it signals (03 §3.5).
+    remote_id: String,
     eof: bool,
 }
 
@@ -1911,8 +2199,9 @@ impl Stderr {
 
     fn commit(&mut self, line: &[u8], cut: bool) {
         if self.remote_pid.is_none() && !cut {
-            if let Some(pid) = pid_line(line) {
+            if let Some((pid, id)) = pid_line(line) {
                 self.remote_pid = Some(pid);
+                self.remote_id = id;
                 return;
             }
         }
@@ -1959,18 +2248,23 @@ fn masked_line(line: &[u8], cut: bool) -> String {
     }
 }
 
-/// `sopen-pid <pid>`: the pid, when it can name a process group of its own (2 or more; `-0` and
-/// `-1` would signal far more than the command).
-fn pid_line(line: &[u8]) -> Option<u32> {
-    let digits = line.strip_prefix(b"sopen-pid ")?;
+/// `sopen-pid <pid> <identity>`: the pid, when it can name a process group of its own (2 or
+/// more; `-0` and `-1` would signal far more than the command), and the rest of the line as the
+/// process's identity (03 §3.5).
+fn pid_line(line: &[u8]) -> Option<(u32, String)> {
+    let rest = line.strip_prefix(b"sopen-pid ")?;
+    let (digits, id) = match rest.iter().position(|&b| b == b' ') {
+        Some(at) => (&rest[..at], &rest[at + 1..]),
+        None => (rest, &b""[..]),
+    };
     if digits.is_empty() || !digits.iter().all(u8::is_ascii_digit) {
         return None;
     }
-    std::str::from_utf8(digits)
-        .ok()?
-        .parse::<u32>()
-        .ok()
-        .filter(|&pid| pid >= 2 && pid <= i32::MAX as u32)
+    let pid = std::str::from_utf8(digits).ok()?.parse::<u32>().ok()?;
+    if pid < 2 || pid > i32::MAX as u32 {
+        return None;
+    }
+    Some((pid, String::from_utf8_lossy(id).into_owned()))
 }
 
 /// Reads stderr to its end, or until told to let go: the pipe is non-blocking and waited on
@@ -2054,6 +2348,25 @@ impl Running {
         self.reading.as_mut()?.record(delim)
     }
 
+    /// stdout's next bytes into `buf`, as `std::io::Read::read` gives them (S2-F: the log
+    /// stream's pipe, `history::Pipe`): `Ok(0)` at its end. Waiting here is what the read and
+    /// network limits count, as in [`Running::read_record`]: once a limit, a stop (Esc, a
+    /// superseded load) or too much output has ended the command, the end is an error that says
+    /// so, never a quiet end of the output.
+    pub fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        match self.reading.as_mut() {
+            Some(reading) => reading.read(buf),
+            None => Ok(0),
+        }
+    }
+
+    /// The process has not exited yet (a parked stream: git blocked on the full pipe).
+    pub fn running(&self) -> bool {
+        self.reading
+            .as_ref()
+            .is_some_and(|r| r.shared.exit().is_none())
+    }
+
     /// Reads the rest of stdout, waits for the end and logs it.
     pub fn finish(mut self) -> Done {
         let reading = self.reading.take().expect("not finished yet");
@@ -2134,6 +2447,40 @@ impl Reading {
             if self.buf.len() > self.max_record {
                 self.overflow(self.max_record);
                 return None;
+            }
+            self.fill(wait_start);
+        }
+    }
+
+    /// [`Running::read`].
+    fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+        let wait_start = Instant::now();
+        loop {
+            if self.pos < self.buf.len() && !self.overflowed {
+                let n = out.len().min(self.buf.len() - self.pos);
+                out[..n].copy_from_slice(&self.buf[self.pos..self.pos + n]);
+                self.pos += n;
+                if self.pos == self.buf.len() {
+                    self.buf.clear();
+                    self.pos = 0;
+                }
+                return Ok(n);
+            }
+            if self.eof || self.overflowed {
+                return match self.shared.stop_requested() {
+                    None => Ok(0),
+                    Some(StopBy::Limit(limit)) => Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        format!("git did not answer in {} s", limit.as_secs()),
+                    )),
+                    Some(StopBy::Asked) => Err(io::Error::other("stopped")),
+                    Some(StopBy::Overflow(bytes)) => Err(io::Error::other(format!(
+                        "stopped: more than {bytes} bytes of output"
+                    ))),
+                };
+            }
+            if out.is_empty() {
+                return Ok(0);
             }
             self.fill(wait_start);
         }
@@ -2366,5 +2713,383 @@ impl Reading {
             (None, Some(signal)) => Ending::Signal(signal),
             (None, None) => Ending::Exit(-1),
         }
+    }
+}
+
+/// The host's stop lane (S2-F; 02 §6: git's worst case on a host is 3 commands and 1 stop
+/// session): a handle's commands stopped together share one stop session at a time; two
+/// stops never have two sessions open at once; a group that ignores `SIGTERM` still gets the
+/// `SIGKILL`, and only it.
+#[cfg(test)]
+mod stop_lane_tests {
+    use super::*;
+    use crate::git::history::fixture::{self, Repo};
+
+    /// A `ShellGit` runner on the fixture with a 1 s grace, and its fault switch (which records
+    /// every stop session).
+    fn shell(repo: &Repo) -> (GitRunner, Arc<Faults>) {
+        let sh = fixture::env(&repo.home())
+            .into_iter()
+            .fold(ShellGit::new("/bin/sh", "box"), |g, (k, v)| {
+                g.with_env(k, v)
+            })
+            .with_env("PATH", std::env::var_os("PATH").unwrap_or_default());
+        let faults = sh.faults();
+        let limits = Limits {
+            stop_grace: Duration::from_secs(1),
+            ..Limits::default()
+        };
+        (GitRunner::shell(sh).with_limits(limits), faults)
+    }
+
+    /// A git alias that runs `script` (no file written for it).
+    fn alias(repo: &Repo, script: &str) -> GitCommand {
+        let set = format!("alias.hang=!{script}");
+        GitCommand::new(Class::Read, repo.top(), ["-c", set.as_str(), "hang"])
+    }
+
+    /// A leader that ignores `SIGTERM` (a snippet: the leader is its own `sh`) keeps its group
+    /// past the grace; it says `ready` on stderr once it ignores it.
+    static STUBBORN: Snippet = Snippet {
+        name: "stubborn",
+        script: "trap '' TERM; echo ready >&2; sleep 30",
+    };
+
+    fn stubborn(repo: &Repo) -> GitCommand {
+        GitCommand::snippet(Class::Read, repo.top(), &STUBBORN, Vec::<String>::new())
+    }
+
+    fn group_alive(pid: u32) -> bool {
+        // SAFETY: kill(2) with signal 0 only asks.
+        unsafe { libc::kill(-(pid as libc::pid_t), 0) == 0 }
+    }
+
+    fn wait_for(what: &str, limit: Duration, done: impl Fn() -> bool) {
+        let t = Instant::now();
+        while !done() {
+            assert!(t.elapsed() < limit, "{what}: not within {limit:?}");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// Waits until the stubborn leader of `handle`'s newest command ignores `SIGTERM`.
+    fn stubborn_ready(handle: &Handle) {
+        wait_for("the leader ignoring TERM", Duration::from_secs(5), || {
+            handle.progress().as_deref() == Some("ready")
+        });
+    }
+
+    /// Starts `cmds` on `handle` and waits for their `sopen-pid` lines.
+    fn started(runner: &GitRunner, cmds: &[GitCommand], handle: &Handle) -> Vec<Running> {
+        let runs: Vec<Running> = cmds
+            .iter()
+            .map(|c| {
+                runner
+                    .start(c, handle)
+                    .unwrap_or_else(|d| panic!("{}", d.ending))
+            })
+            .collect();
+        wait_for("the sopen-pid lines", Duration::from_secs(5), || {
+            runs.iter().all(|r| r.remote_pid().is_some())
+        });
+        runs
+    }
+
+    /// Three commands of one handle stopped together: one `-TERM` session names all three
+    /// groups, and never more than one stop session is open.
+    #[test]
+    fn three_attached_commands_are_stopped_in_one_session() {
+        let Some(git) = fixture::git() else {
+            return;
+        };
+        let repo = Repo::new(&git);
+        let (runner, faults) = shell(&repo);
+        let handle = Handle::new();
+        let cmd = alias(&repo, "sleep 30");
+        let runs = started(&runner, &[cmd.clone(), cmd.clone(), cmd], &handle);
+        let pids: Vec<u32> = runs.iter().filter_map(Running::remote_pid).collect();
+        handle.stop();
+        for run in runs {
+            let done = run.finish();
+            assert!(
+                matches!(&done.ending, Ending::Stopped(s) if !s.killed),
+                "{}",
+                done.ending
+            );
+        }
+        let sessions = lock(&faults.sessions).clone();
+        let terms: Vec<&Vec<String>> = sessions.iter().filter(|s| s[0] == "-TERM").collect();
+        assert_eq!(terms.len(), 1, "{sessions:?}");
+        let mut named: Vec<String> = terms[0][1..].to_vec();
+        named.sort();
+        let mut want: Vec<String> = pids.iter().map(|p| format!("-{p}")).collect();
+        want.sort();
+        assert_eq!(named, want, "{sessions:?}");
+        assert!(!sessions.iter().any(|s| s[0] == "-KILL"), "{sessions:?}");
+        assert_eq!(faults.most_open.load(Ordering::SeqCst), 1, "{sessions:?}");
+        for pid in pids {
+            wait_for("the group gone", Duration::from_secs(2), || {
+                !group_alive(pid)
+            });
+        }
+    }
+
+    /// Two stops at once (two handles): the second waits behind the first — at no moment are
+    /// two stop sessions open — and both end their commands.
+    #[test]
+    fn two_overlapping_stops_never_open_two_sessions() {
+        let Some(git) = fixture::git() else {
+            return;
+        };
+        let repo = Repo::new(&git);
+        let (runner, faults) = shell(&repo);
+        let (first, second) = (Handle::new(), Handle::new());
+        let a = started(&runner, &[stubborn(&repo)], &first);
+        stubborn_ready(&first);
+        let b = started(&runner, &[alias(&repo, "sleep 30")], &second);
+        let pids: Vec<u32> = a.iter().chain(&b).filter_map(Running::remote_pid).collect();
+        first.stop();
+        second.stop();
+        for run in a.into_iter().chain(b) {
+            let done = run.finish();
+            assert!(matches!(done.ending, Ending::Stopped(_)), "{}", done.ending);
+        }
+        let sessions = lock(&faults.sessions).clone();
+        assert_eq!(faults.most_open.load(Ordering::SeqCst), 1, "{sessions:?}");
+        assert_eq!(
+            sessions.iter().filter(|s| s[0] == "-TERM").count(),
+            2,
+            "one stop each: {sessions:?}"
+        );
+        for pid in pids {
+            wait_for("the group gone", Duration::from_secs(3), || {
+                !group_alive(pid)
+            });
+        }
+    }
+
+    /// A group whose leader ignores `SIGTERM`, stopped with one that does not: both get the one
+    /// `-TERM`; the asking finds only the stubborn one there (and still its own), and the
+    /// `-KILL` goes to it alone.
+    #[test]
+    fn a_group_that_ignores_term_still_gets_the_kill() {
+        let Some(git) = fixture::git() else {
+            return;
+        };
+        let repo = Repo::new(&git);
+        let (runner, faults) = shell(&repo);
+        let handle = Handle::new();
+        let runs = started(
+            &runner,
+            &[alias(&repo, "sleep 30"), stubborn(&repo)],
+            &handle,
+        );
+        stubborn_ready(&handle);
+        let pids: Vec<u32> = runs.iter().filter_map(Running::remote_pid).collect();
+        handle.stop();
+        let endings: Vec<Ending> = runs.into_iter().map(|r| r.finish().ending).collect();
+        assert!(
+            matches!(&endings[0], Ending::Stopped(s) if !s.killed),
+            "{endings:?}"
+        );
+        let sessions = lock(&faults.sessions).clone();
+        assert!(
+            matches!(&endings[1], Ending::Stopped(s) if s.killed),
+            "{endings:?} {sessions:?} {pids:?}"
+        );
+        let kills: Vec<&Vec<String>> = sessions.iter().filter(|s| s[0] == "-KILL").collect();
+        assert_eq!(kills.len(), 1, "{sessions:?}");
+        assert_eq!(kills[0][1..], [format!("-{}", pids[1])], "{sessions:?}");
+        assert_eq!(faults.most_open.load(Ordering::SeqCst), 1, "{sessions:?}");
+        for pid in pids {
+            wait_for("the group gone", Duration::from_secs(3), || {
+                !group_alive(pid)
+            });
+        }
+    }
+
+    /// A stop session's words: one `sh -c` (the [`STOP`] script), the signal, then each group's
+    /// pid and identity as words of their own (an identity with spaces stays one word).
+    #[test]
+    fn the_stop_sessions_words() {
+        let words = stop_words(
+            "-TERM",
+            &[
+                (12, "98765".into()),
+                (34, "Mon Nov 23 18:58:09 2026".into()),
+            ],
+        );
+        let tail: Vec<String> = words[4..]
+            .iter()
+            .map(|w| w.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            tail,
+            [
+                "'sopen-stop'",
+                "'-TERM'",
+                "'12'",
+                "'98765'",
+                "'34'",
+                "'Mon Nov 23 18:58:09 2026'"
+            ]
+        );
+        assert_eq!(words[..3], ["exec", "'sh'", "'-c'"].map(OsString::from));
+        assert_eq!(
+            kill_words(12, "-KILL"),
+            ["exec", "'kill'", "'-KILL'", "'--'", "'-12'"].map(OsString::from)
+        );
+    }
+
+    /// `pid_line`: the pid and the rest of the line as the identity; an old form without one.
+    #[test]
+    fn the_pid_line_carries_the_identity() {
+        assert_eq!(
+            pid_line(b"sopen-pid 4242 98765"),
+            Some((4242, "98765".to_string()))
+        );
+        assert_eq!(
+            pid_line(b"sopen-pid 4242 Mon Nov 23 18:58:09 2026    "),
+            Some((4242, "Mon Nov 23 18:58:09 2026    ".to_string()))
+        );
+        assert_eq!(pid_line(b"sopen-pid 4242"), Some((4242, String::new())));
+        assert_eq!(pid_line(b"sopen-pid 1 x"), None);
+        assert_eq!(pid_line(b"sopen-pid x 1"), None);
+    }
+
+    /// A process of a group of its own, started here ("the host" is this machine): its pid.
+    fn own_group(script: &str) -> (std::process::Child, u32) {
+        let mut c = Command::new("/bin/sh");
+        c.arg("-c")
+            .arg(script)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        // SAFETY: setsid is async-signal-safe, as `pre_exec` requires.
+        unsafe {
+            c.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let child = c.spawn().unwrap();
+        let pid = child.id();
+        (child, pid)
+    }
+
+    /// The stop script's answers, run here as a remote's login shell would run its words.
+    fn stop_here(signal: &str, groups: &[(u32, String)]) -> Vec<(u32, GroupAnswer)> {
+        let out = Command::new("/bin/sh")
+            .arg("-c")
+            .arg(line_of(&stop_words(signal, groups)))
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        group_answers(&out.stdout)
+    }
+
+    /// This machine's identity of `pid`, as the pid line reads it.
+    fn identity_here(pid: u32) -> String {
+        let script = concat!(id_fn!(), r#"sopen_id "$1"; printf %s "$sopen_i""#);
+        let out = Command::new("/bin/sh")
+            .args(["-c", script, "id", &pid.to_string()])
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    }
+
+    /// Review 1.4 (pid reuse), on a stand-in host — this machine: a group whose leader's pid is
+    /// another process's now (its identity is not the one recorded) is not signalled, answered
+    /// `other`; a group whose leader is gone while the group is not is not signalled either
+    /// (`leaderless`) — its member lives on; only the group whose leader is still the one recorded
+    /// is signalled (`ok`).
+    #[test]
+    fn a_number_that_is_not_ours_is_never_signalled() {
+        // Another process at the number: the identity recorded is the old leader's.
+        let (mut other, pid) = own_group("exec sleep 30");
+        let theirs = identity_here(pid);
+        assert!(!theirs.is_empty(), "this machine names a process's start");
+        let recorded = format!("{theirs}-before");
+        assert_eq!(
+            stop_here("-TERM", &[(pid, recorded.clone())]),
+            [(pid, GroupAnswer::Other)]
+        );
+        assert_eq!(
+            stop_here("-0", &[(pid, recorded)]),
+            [(pid, GroupAnswer::Other)]
+        );
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(other.try_wait().unwrap().is_none(), "not signalled");
+        // A group without its leader: its member is not signalled.
+        let (mut leader, pid) = own_group("sleep 30 & echo $! > \"$0\".child; exit 0");
+        let _ = leader.wait();
+        assert!(group_alive(pid), "the member keeps the group");
+        assert_eq!(
+            stop_here("-KILL", &[(pid, "whatever".into())]),
+            [(pid, GroupAnswer::Leaderless)]
+        );
+        assert!(group_alive(pid), "not signalled");
+        // The leader recorded: signalled.
+        assert_eq!(
+            stop_here("-TERM", &[(other.id(), identity_here(other.id()))]),
+            [(other.id(), GroupAnswer::Ok)]
+        );
+        let _ = other.wait();
+        // SAFETY: the test's own group.
+        unsafe { libc::kill(-(pid as libc::pid_t), libc::SIGKILL) };
+        wait_for("the member gone", Duration::from_secs(2), || {
+            !group_alive(pid)
+        });
+    }
+
+    /// Review 1.4 through the runner: a command whose leader dies just before the stop's
+    /// `-TERM` session, leaving a child that holds its group: the child is not signalled by the
+    /// number, and the stop says it may still be running.
+    #[test]
+    fn a_stop_never_signals_a_group_whose_leader_is_gone() {
+        let Some(git) = fixture::git() else {
+            return;
+        };
+        let repo = Repo::new(&git);
+        let (runner, faults) = shell(&repo);
+        let handle = Handle::new();
+        let runs = started(
+            &runner,
+            &[alias(&repo, "echo ready >&2; sleep 30")],
+            &handle,
+        );
+        // The child is there (the pid line comes before git has even run).
+        wait_for("the child", Duration::from_secs(5), || {
+            handle.progress().as_deref() == Some("ready")
+        });
+        let leader = runs[0].remote_pid().unwrap();
+        // Right before the stop's first session the leader goes (its child, `sleep 30`, stays).
+        faults.before_stop.set(move || {
+            // SAFETY: the test's own process (the leader only, not its group).
+            unsafe { libc::kill(leader as libc::pid_t, libc::SIGKILL) };
+            // Until it is reaped (the command's reader does it): a zombie still has its start
+            // time, a host's sshd reaps at once.
+            // SAFETY: signal 0 only asks.
+            wait_for("the leader reaped", Duration::from_secs(3), || unsafe {
+                libc::kill(leader as libc::pid_t, 0) != 0
+            });
+        });
+        handle.stop();
+        let done = runs.into_iter().next().unwrap().finish();
+        assert_eq!(done.ending, Ending::StopSent { host: "box".into() });
+        assert!(group_alive(leader), "the child was not signalled");
+        let sessions = lock(&faults.sessions).clone();
+        assert!(!sessions.iter().any(|s| s[0] == "-KILL"), "{sessions:?}");
+        // SAFETY: the test's own group.
+        unsafe { libc::kill(-(leader as libc::pid_t), libc::SIGKILL) };
+        wait_for("the group gone", Duration::from_secs(2), || {
+            !group_alive(leader)
+        });
     }
 }

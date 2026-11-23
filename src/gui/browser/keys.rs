@@ -27,12 +27,7 @@ use eframe::egui::{self, Event, Key, Modifiers};
 /// The set of landed slices (02 §8.1: 1 = S1 … 7 = S7); a slice's integration WU adds its
 /// number. Rows of a slice not in it do nothing yet. A set, not the highest slice: slices land in
 /// any order their "Needs first" allows (02 §8.1 "Schedule"), so S5 landed before S2–S4.
-pub const LANDED_SLICES: Slices = Slices::of(&[1, 5]);
-
-/// The slices landed in order from S1: every slice from 1 to this one is in [`LANDED_SLICES`]
-/// (S2 is not yet, so 1). The git panel's own key reading (`git_panel`'s `UPTO`, a `const` that
-/// compares it) still takes this number; S2's integration moves it to the set.
-pub const LANDED: u8 = 1;
+pub const LANDED_SLICES: Slices = Slices::of(&[1, 2, 5]);
 
 /// Every slice, 1 to 7: every row of the table.
 #[cfg_attr(not(test), allow(dead_code))] // Only the tests use it.
@@ -55,19 +50,18 @@ impl Slices {
         Slices(bits)
     }
 
+    /// The set with `slice` too (1 to 7): a test's view of a slice landing.
+    #[cfg_attr(not(test), allow(dead_code))] // Only the tests use it.
+    pub const fn with(self, slice: u8) -> Slices {
+        Slices(self.0 | 1u8 << slice)
+    }
+
     /// Whether `slice` is in the set (a number outside 1 to 7 never is).
     pub fn has(self, slice: u8) -> bool {
         slice != 0
             && 1u8
                 .checked_shl(slice.into())
                 .is_some_and(|bit| self.0 & bit != 0)
-    }
-}
-
-/// Slices 1 to `n`, every one up to the highest landed in order (the git panel's `UPTO`).
-impl From<u8> for Slices {
-    fn from(n: u8) -> Slices {
-        Slices((1..=n.min(7)).fold(0, |bits, slice| bits | 1 << slice))
     }
 }
 
@@ -232,6 +226,8 @@ pub enum Command {
     ToHead,
     /// Cmd/Ctrl+Shift+G: the git panel over both sides, and back.
     Wide,
+    /// Cmd/Ctrl+K: the filters (03 §4.6, §9.2; the F10 menu offers them too from S3).
+    Filters,
     // The directory tree (05 §1; S5).
     /// F10, Alt+F10, Esc: close the tree, the panel as it was.
     CloseTree,
@@ -429,7 +425,9 @@ const OTHER_SIDE: &str = "The keyboard to the other side";
 const CLOSE_VIEWER: &str = "Back to the list";
 const DETAILS: &str = "The row's details (with one marked row: compare the two)";
 const MENU: &str = "The menu of what is under the bar";
-const MARK: &str = "Mark or unmark the row, then step down (files: stage, unstage)";
+/// S2's words; staging a file of the uncommitted row (Space there) comes with S3's actions, whose
+/// scaffold changes the row's words.
+const MARK: &str = "Mark or unmark the row, then step down";
 const BACK_TO_LIST: &str = "Back to the list";
 const CLOSE_TREE: &str = "Close the tree, the list as it was";
 
@@ -484,7 +482,7 @@ pub const TABLE: &[Row] = &[
     key(List, K::ArrowRight, Cmd, C::SameFolder(Side::Right), "", "The right panel to this folder", 1),
     key(List, K::G, Cmd, C::Pin, "", "Pin the git panel to the other side; again: unpin", 2),
     letter(List, C::Jump(' '), "The next name starting with it", 1),
-    key(List, K::Escape, Plain, C::Stop, "", "Stop a fetch or a file operation", 1),
+    key(List, K::Escape, Plain, C::Stop, "", "Stop a fetch or a file operation; else unpin the git panel", 1),
     // A viewer over both sides (01 §3a); its own keys come with its F-key slots.
     key(Viewer, K::F1, Plain, C::Help, "Help", HELP, 1),
     key(Viewer, K::F3, Plain, C::CloseViewer, "Exit", CLOSE_VIEWER, 1),
@@ -529,6 +527,7 @@ pub const TABLE: &[Row] = &[
     key(Git, K::J, Cmd, C::ToHead, "", "The bar to HEAD", 2),
     key(Git, K::G, CmdShift, C::Wide, "", "The git panel over both sides, and back", 2),
     key(Git, K::G, Cmd, C::Pin, "", "Pin this git panel; again: unpin", 2),
+    key(Git, K::K, Cmd, C::Filters, "", "The filters", 2),
     // The directory tree (05 §1).
     key(TreeSide, K::F1, Plain, C::Help, "Help", HELP, 5),
     key(TreeSide, K::F10, Alt, C::CloseTree, "", CLOSE_TREE, 5),
@@ -1017,31 +1016,65 @@ mod tests {
         assert!(TABLE.iter().all(|r| ALL_SLICES.has(r.slice)));
     }
 
-    /// The landed slices are a set (02 §8.1 "Schedule"): S1 and S5 have landed, so exactly their
-    /// rows act — F10 opens the tree while Cmd/Ctrl+G, an S2 row, still does nothing.
+    /// The landed slices are a set (02 §8.1 "Schedule"): S1, S2 and S5 have landed, so exactly
+    /// their rows act — F10 opens the tree and Cmd/Ctrl+G pins the git panel, while F7, an S6 row,
+    /// and the git panel's F5, an S3 row, still do nothing.
     #[test]
     fn landed_slices_are_a_set() {
-        assert_eq!(LANDED_SLICES, Slices::of(&[1, 5]));
+        assert_eq!(LANDED_SLICES, Slices::of(&[1, 2, 5]));
         assert!(TABLE
             .iter()
-            .all(|r| LANDED_SLICES.has(r.slice) == matches!(r.slice, 1 | 5)));
-        // The run landed in order from S1 is S1 alone: S2 has not landed.
-        assert!((1..=LANDED).all(|s| LANDED_SLICES.has(s)) && !LANDED_SLICES.has(LANDED + 1));
-        assert_eq!(Slices::from(LANDED), Slices::of(&[1]));
-        assert_eq!(Slices::from(2), Slices::of(&[1, 2]));
-        assert_eq!(Slices::from(9), ALL_SLICES);
+            .all(|r| LANDED_SLICES.has(r.slice) == matches!(r.slice, 1 | 2 | 5)));
         assert!(!ALL_SLICES.has(0) && !ALL_SLICES.has(8) && !ALL_SLICES.has(u8::MAX));
+        assert_eq!(LANDED_SLICES.with(3), Slices::of(&[1, 2, 3, 5]));
         assert_eq!(
             find(&mut vec![press(K::F10, NONE)], List, LANDED_SLICES),
             Some(Command::Tree)
         );
         let pin = || vec![press(K::G, Modifiers::COMMAND)];
+        assert_eq!(find(&mut pin(), List, LANDED_SLICES), Some(Command::Pin));
+        assert_eq!(find(&mut pin(), Git, LANDED_SLICES), Some(Command::Pin));
         assert_eq!(
-            find(&mut pin(), List, LANDED_SLICES),
+            find(&mut vec![press(K::F7, NONE)], List, LANDED_SLICES),
             None,
-            "S2 has not landed"
+            "S6 has not landed"
         );
-        assert_eq!(find(&mut pin(), List, ALL_SLICES), Some(Command::Pin));
+        assert_eq!(
+            find(&mut vec![press(K::F5, NONE)], Git, LANDED_SLICES),
+            None,
+            "S3 has not landed"
+        );
+    }
+
+    /// 03 §9.2: Cmd/Ctrl+K is the git panel's filters (from S2, before the F10 menu of S3), and
+    /// nothing elsewhere — it is free in the list, a viewer and the tree.
+    #[test]
+    fn command_k_is_the_git_panels_filters() {
+        let k = |m: Modifiers| vec![press(K::K, m)];
+        assert_eq!(
+            find(&mut k(Modifiers::COMMAND), Git, LANDED_SLICES),
+            Some(Command::Filters)
+        );
+        assert_eq!(
+            find(&mut k(real_command()), Git, LANDED_SLICES),
+            Some(Command::Filters)
+        );
+        assert_eq!(
+            find(
+                &mut k(Modifiers::COMMAND | Modifiers::SHIFT),
+                Git,
+                ALL_SLICES
+            ),
+            None
+        );
+        assert_eq!(find(&mut k(NONE), Git, ALL_SLICES), None);
+        for context in [List, Viewer, TreeSide, Dialog] {
+            assert_eq!(
+                find(&mut k(Modifiers::COMMAND), context, ALL_SLICES),
+                None,
+                "{context:?}"
+            );
+        }
     }
 
     /// PC Shell's labels are six characters at most, and six fit a slot from an 80-column
@@ -1072,10 +1105,11 @@ mod tests {
         }
     }
 
-    /// 02 §7, 04 §2: the rows of the landed slices, S1 and S5 — the list's slots are `1Help
+    /// 02 §7, 04 §2: the rows of the landed slices, S1, S2 and S5 — the list's slots are `1Help
     /// 2Rename 3View 4Edit 5Copy 6Move 9Dual 10Tree` (9 names the mode F9 switches to); the
-    /// viewer's `1Help 3Exit 4Edit`; the tree's `1Help 10Tree` (05 §1). The keys of the slices
-    /// not landed do nothing yet.
+    /// viewer's `1Help 3Exit 4Edit`; the git panel's `1Help 3View 4Edit 9Dual` (03 §9.1, S2's
+    /// slots); the tree's `1Help 10Tree` (05 §1). The keys of the slices not landed do nothing
+    /// yet.
     #[test]
     fn the_rows_of_s1() {
         let pairs = |keys: Vec<FKey>| -> Vec<(u8, &str)> {
@@ -1099,7 +1133,12 @@ mod tests {
             pairs(row(Viewer, Mode::Preview)),
             [(1, "Help"), (3, "Exit"), (4, "Edit")]
         );
-        assert!(row(Git, Mode::Preview).is_empty(), "S2");
+        assert_eq!(
+            pairs(row(Git, Mode::Preview)),
+            [(1, "Help"), (3, "View"), (4, "Edit"), (9, "Dual")],
+            "S2"
+        );
+        assert_eq!(pairs(row(Git, Mode::Dual))[3], (9, "Prevw"));
         assert_eq!(
             pairs(row(TreeSide, Mode::Preview)),
             [(1, "Help"), (10, "Tree")],
@@ -1115,7 +1154,7 @@ mod tests {
                 Some(Command::CloseTree)
             );
         }
-        for (key, mods) in [(K::F7, NONE), (K::F8, NONE), (K::G, Modifiers::COMMAND)] {
+        for (key, mods) in [(K::F7, NONE), (K::F8, NONE)] {
             assert_eq!(
                 find(&mut vec![press(key, mods)], List, LANDED_SLICES),
                 None,
