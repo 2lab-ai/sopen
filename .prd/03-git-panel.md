@@ -509,10 +509,12 @@ A label's menu has "Show only this branch" and "Show all branches" (§7.2). The 
   loaded), `Author` (name <email>), `Author date`, `Committer` and `Commit date` (shown only when they
   differ from the author's), `In` (branches and tags that contain the commit, filled in when
   `for-each-ref --contains <c>` answers; `…` until then, bounded as a read), then the whole message,
-  scrollable. From `log -1 -z --format=%H%x1f%P%x1f%aN%x1f%aE%x1f%at%x1f%cN%x1f%cE%x1f%ct%x1f%B <c>`.
+  scrollable. From `log -1 -z --format=%H%x1f%P%x1f%aN%x1f%aE%x1f%at%x1f%cN%x1f%cE%x1f%ct%x1f%B <c> --`.
+  These reads and the two below end in `--`: without it a work-tree file named like the hash makes
+  git stop with "ambiguous argument" (exit 128, reproduced).
 - **Files**: one row per changed path — the change letter (`A` added, `M` modified, `D` deleted,
   `R` renamed with `old → new`, `T` type changed, `U` unmerged, `?` untracked), the path, and
-  `+adds -dels` for text (blank for binary). From `diff -z --find-renames --name-status <old> <new>`
+  `+adds -dels` for text (blank for binary). From `diff -z --find-renames --name-status <old> <new> --`
   and the same with `--numstat`, the two endpoints from §6.2's table. For a merge, the diff is
   against the first parent.
 - A file whose diff was opened in this window is marked `√` (the "viewed" mark, for the window only).
