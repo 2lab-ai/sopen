@@ -661,9 +661,9 @@ then its WUs in parallel on disjoint files, then its **integration** WU, the sli
   the login shell prints nothing for a non-interactive command, 03 §3.2's precondition.
 - **fish:** sshd runs the command through the account's shell, and fish reads its config even
   when not interactive: `fish -c true` took 18.5 ms on the host against 1.7 ms with
-  `--no-config`, so about 17 ms of every remote command there, a quarter of the floor, is the
-  account's own config. The rest of the floor (about 47 ms) is the mux client, the channel and
-  the exit status.
+  `--no-config`, so on that host the account's own config adds about 17 ms to every remote
+  command. How the rest of the floor splits between the mux client, the channel and the exit
+  status was not measured.
 - **100 000 commits:** a `fast-import`ed fixture with 1 999 merges (E4's rebuild of 03 §4.5's
   generator), the same stream on both machines. The first page (500 records), median ms:
 
@@ -675,10 +675,15 @@ then its WUs in parallel on disjoint files, then its **integration** WU, the sli
   The whole history took 1.98 s remote and 0.39 s local without a commit-graph. The local
   numbers match 03 §4.5's 303 ms and 9 ms. After each of the 12 remote first pages, the reader
   closed its channel and the remote git was gone within 200 ms.
-- **Verdict:** a remote read is a fixed cost of 65–86 ms per command (an open sums to about
-  0.3 s on sopen and 0.6 s on the fixture without a commit-graph), so nothing in 03's rules
-  changes: the 150 ms rest, at most 3 commands in flight per host and the 30 s hidden stream
-  stay as written.
+- **Verdict:** on this host and these repositories, each of the five small reads took 65–86 ms
+  end to end (median), close to the 65.7 ms of `true` over the same master; the reads added
+  little to the per-command cost. The first page of the 100 000-commit fixture took 117 ms with
+  a commit-graph and 341 ms without. The five reads in a row sum to about 0.4 s on sopen. These
+  numbers stay well under 03's read bounds, and every repeated read costs about one round of
+  that size, which is what the 150 ms rest and the 30 s hidden stream exist to avoid; so nothing
+  in 03's rules changes: the 150 ms rest, at most 3 commands in flight per host and the 30 s
+  hidden stream stay as written. A slower link or a heavier shell config raises the per-command
+  cost; the numbers are one host's, not a bound.
 - **Not tested:** a parked stream (git blocked on the ssh window), and more than 3 commands in
   flight or alongside SFTP sessions (03 §4.1's four reads ran at most 3 in flight: 163 ms against
   314 ms one at a time, no failures). Those stay with E5 and G-P3.

@@ -87,8 +87,9 @@ changes. Rows here are snapshots taken when they were moved.
 
 ### Round section
 
-- E4: a remote read is a fixed cost of 65–86 ms per command (the `true` floor 65.7 ms, about
-  17 ms of it the account's fish config); the 100 000-commit fixture's first page took 341 ms
+- E4: on one remote Linux host the five small reads took 65–86 ms end to end (median), near the
+  `true` floor of 65.7 ms (the account's fish config adds about 17 ms per command there); the
+  100 000-commit fixture's first page took 341 ms
   remote without a commit-graph and 117 ms with one. The 150 ms rest, at most 3 in flight per host
   and the 30 s hidden stream stay. A parked stream and more than 3 in flight were not tested: E5
   and G-P3.
