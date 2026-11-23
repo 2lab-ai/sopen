@@ -134,5 +134,6 @@ changes. Rows here are snapshots taken when they were moved.
   over C: same bytes, but C turns silently into the replacing route if the crate's fallback or
   the version-reply filter changes. From the server's source, not measured: a folder rename is
   `stat` then `rename()`, so an empty folder made in between is replaced. Without `hardlink@`
-  measured on OpenSSH only (`-P hardlink`); other servers are relied on and the report says so
+  measured on OpenSSH only (`-P hardlink`); on other servers sopen first probes, once per session,
+  whether a plain rename refuses an existing target, and refuses the publish if it does not
   (04 §5.6).

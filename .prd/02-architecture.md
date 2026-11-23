@@ -659,12 +659,13 @@ a probe built on main a562e1e's `Cargo.lock`; nothing ran against a remote host)
   link and a link to a folder; a folder onto a non-empty folder, an empty folder, a file, a
   dangling link and a link to a folder; a link onto a file and onto a dangling link.
 - **What `Fs::rename` sends:** `posix-rename@openssh.com` whenever the server offers it, which
-  OpenSSH always does; the plain `SSH_FXP_RENAME` only without it. The crate keeps its low-level
+  the default OpenSSH configuration does (`-P posix-rename` turns it off); the plain
+  `SSH_FXP_RENAME` only without it. The crate keeps its low-level
   writer private, so sopen cannot send the plain request through it.
 
 | Route | On the wire | Existing targets replaced, of 11 |
 |---|---|---|
-| A | `posix-rename@openssh.com` | 6: by a file, an existing file, an empty folder, a dangling link and a link to a folder (the link replaced, its folder kept); by a link, a file and a dangling link. Refused only where `rename(2)` refuses |
+| A | `posix-rename@openssh.com` | 6: by a file, an existing file, a dangling link and a link to a folder (the link replaced, its folder kept); by a folder, an empty folder; by a link, a file and a dangling link. Refused only where `rename(2)` refuses: a file onto an empty folder, a folder onto a non-empty folder or a non-folder |
 | B, C, D | `SSH_FXP_RENAME` | 1: a link onto a dangling link. Every file or folder source was refused, source and target unchanged |
 
 - **Codes:** the plain rename refused with status 4 (`SSH_FX_FAILURE`), and 2 (`NO_SUCH_FILE`)
@@ -682,7 +683,8 @@ a probe built on main a562e1e's `Cargo.lock`; nothing ran against a remote host)
 - **Verdict:** route B. S6 adds `openssh-sftp-client-lowlevel = "=0.7.4"` as a direct dependency
   (already locked, through `openssh-sftp-client`) and sends the plain rename on a second `sftp`
   subsystem of the master: for a remote folder's rename and move, and for publishing a copy's
-  regular-file temp where the server has no `hardlink@`. Never for a link: a link keeps S1's
+  regular-file temp where the server has no `hardlink@` — there only once a probe has seen that
+  server refuse a plain rename onto an existing name (04 §5.6). Never for a link: a link keeps S1's
   path, made again at the new name. Route C puts the same bytes on the wire, but it rests on
   `Fs::rename`'s fallback and on a filter that rewrites the version reply; if either changes it
   becomes route A, which replaces, and nothing fails. The guard either way is K-M1's request
