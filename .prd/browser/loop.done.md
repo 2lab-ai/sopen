@@ -72,3 +72,23 @@ changes. Rows here are snapshots taken when they were moved.
   UTC).
 - "One slice at a time" no longer holds from round 2: slices run at the same time once their
   "Needs first" is met, and only work on a shared file runs one at a time (02 §8.1 "Schedule").
+
+## R2 (part) — E4, closed 2026-11-23
+
+- measured E4 ✅ · result: five git reads timed over an ssh master to a remote Linux host and
+  locally, on main bcd6910, and written into 02 §8.2; nothing in 03's rules changes · closed rows:
+  E4 · PRs: the PR that carries this block (S2-0's)
+
+### Closed rows
+
+| ID | Status | Before | What (02 §8.2) |
+|---|---|---|---|
+| E4 | ✅ done: 2026-11-23, result in 02 §8.2 | S2 | five git reads over the ssh master, timed |
+
+### Round section
+
+- E4: a remote read is a fixed cost of 65–86 ms per command (the `true` floor 65.7 ms, about
+  17 ms of it the account's fish config); the 100 000-commit fixture's first page took 341 ms
+  remote without a commit-graph and 117 ms with one. The 150 ms rest, at most 3 in flight per host
+  and the 30 s hidden stream stay. A parked stream and more than 3 in flight were not tested: E5
+  and G-P3.

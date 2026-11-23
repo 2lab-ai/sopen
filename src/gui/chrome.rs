@@ -18,6 +18,7 @@
 //! ☺♥▲ control glyphs the hex window shows — and no Hangul: those come from the installed font
 //! eframe's system font provider finds (see [`super::fonts`]).
 
+pub mod git;
 pub mod tree;
 
 use super::Status;

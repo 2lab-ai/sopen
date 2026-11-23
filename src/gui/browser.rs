@@ -24,6 +24,7 @@
 //! all but Esc, a preview none, a file operation none but a second operation. Esc stops a fetch
 //! or a file operation.
 
+mod git_panel;
 pub(crate) mod keys;
 mod ops;
 mod panel;

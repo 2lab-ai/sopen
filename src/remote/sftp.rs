@@ -535,14 +535,15 @@ impl Drop for SftpRemote {
 
 /// What `ssh -G` says about the destination that sopen needs.
 #[derive(Debug, PartialEq, Eq)]
-struct SshConfig {
-    control_path: PathBuf,
+pub(crate) struct SshConfig {
+    pub(crate) control_path: PathBuf,
     /// The user's config sets ConnectTimeout; sopen then leaves it alone.
-    connect_timeout_set: bool,
+    pub(crate) connect_timeout_set: bool,
 }
 
 /// `ControlPath=<state>/cm-%C` expanded by ssh itself (`ssh -G` prints the expanded value).
-fn ssh_config(dest: &str, state_dir: &Path) -> Result<SshConfig> {
+/// `pub(crate)` for `remote::exec`, which builds a git command's arguments from it (03 §3.2).
+pub(crate) fn ssh_config(dest: &str, state_dir: &Path) -> Result<SshConfig> {
     create_private_dir(state_dir)?;
     let pattern = state_dir.join("cm-%C");
     let out = Command::new("ssh")

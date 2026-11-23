@@ -638,6 +638,51 @@ then its WUs in parallel on disjoint files, then its **integration** WU, the sli
   Since W8b a remote preview reads through a stream and writes nothing: that peak is 0 bytes
   over ssh too, and the `.preview` folder is never made.
 
+**E4's result** (measured 2026-11-23 on main bcd6910):
+
+- **Run:** the five reads below, each with 03 §3.3's environment and options, 1 warm-up and 5
+  timed runs, locally on a Mac (git 2.56.1: `git -C`, no shell) and on a remote Linux host
+  (git 2.55.0, 14.7 ms average ping) over one ssh master: `-o ControlMaster=no -o BatchMode=yes`,
+  the words quoted as `forward::quote` quotes them, a `<locate>` script written from 03 §3.2,
+  the account's login shell fish. The repository is a clone of sopen (328 commits, 115 refs, no
+  commit-graph file) on both machines. Remote and local stdout had the same SHA-256 for every
+  read but detection, whose lines are absolute paths.
+
+| Read (03) | Remote, median ms | Local, median ms |
+|---|---|---|
+| detection (§2.1) | 72.7 | 10.6 |
+| refs (§4.1) | 65.2 | 6.4 |
+| the log stream (§4.1), sopen's whole history: 328 records, less than a page | 83.3 | 10.1 |
+| one commit's details (§6.1) | 81.0 | 6.7 |
+| one file's diff (§6.2) | 86.3 | 7.9 |
+
+- **Master:** its cold setup (`ssh -M -N -f`, a new handshake) took 234 ms; `-O check` 7 ms.
+- **Floor:** `exec 'true'` over the master took 65.7 ms (median; 60.9–102.7) and printed 0 bytes:
+  the login shell prints nothing for a non-interactive command, 03 §3.2's precondition.
+- **fish:** sshd runs the command through the account's shell, and fish reads its config even
+  when not interactive: `fish -c true` took 18.5 ms on the host against 1.7 ms with
+  `--no-config`, so about 17 ms of every remote command there, a quarter of the floor, is the
+  account's own config. The rest of the floor (about 47 ms) is the mux client, the channel and
+  the exit status.
+- **100 000 commits:** a `fast-import`ed fixture with 1 999 merges (E4's rebuild of 03 §4.5's
+  generator), the same stream on both machines. The first page (500 records), median ms:
+
+| | Without a commit-graph | With one |
+|---|---|---|
+| remote | 341 | 117 |
+| local | 280 | 8.3 |
+
+  The whole history took 1.98 s remote and 0.39 s local without a commit-graph. The local
+  numbers match 03 §4.5's 303 ms and 9 ms. After each of the 12 remote first pages, the reader
+  closed its channel and the remote git was gone within 200 ms.
+- **Verdict:** a remote read is a fixed cost of 65–86 ms per command (an open sums to about
+  0.3 s on sopen and 0.6 s on the fixture without a commit-graph), so nothing in 03's rules
+  changes: the 150 ms rest, at most 3 commands in flight per host and the 30 s hidden stream
+  stay as written.
+- **Not tested:** a parked stream (git blocked on the ssh window), and more than 3 commands in
+  flight or alongside SFTP sessions (03 §4.1's four reads ran at most 3 in flight: 163 ms against
+  314 ms one at a time, no failures). Those stay with E5 and G-P3.
+
 ## 9. Receipts and test hooks
 
 Added to AGENTS.md "Receipts" by the slice that brings them (the hooks travel with `--target` as
