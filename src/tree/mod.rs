@@ -1069,6 +1069,12 @@ impl Tree {
         if self.rule(i).is_some_and(|r| !r.sizable_on_space()) {
             return;
         }
+        // An automatic scan of the row gives way: Space's lists every folder whole (D-6). What
+        // it reached stays shown until Space's passes it.
+        if let (false, Some(id)) = (self.nodes[i].deep.wanted, self.nodes[i].deep.running) {
+            self.stop_scan(i, id);
+            self.nodes[i].deep.frontier = None;
+        }
         self.nodes[i].deep.wanted = true;
         self.nodes[i].deep.done = false;
         self.nodes[i].deep.not_answering = false;

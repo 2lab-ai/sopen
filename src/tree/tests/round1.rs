@@ -494,6 +494,16 @@ fn r1_7_a_scan_bounds_each_listing() {
     settle(&mut tree);
     tree.view(0, 36, None);
     settle(&mut tree);
+    // The scan's end, not a quiet moment.
+    assert!(until(&mut tree, Duration::from_secs(20), |t| {
+        matches!(
+            row(t, "row").info.size,
+            Size::Bytes {
+                scanning: false,
+                ..
+            }
+        ) && fake.lists().iter().any(|l| !l.full)
+    }));
     let scans: Vec<Listed> = fake.lists().into_iter().filter(|l| !l.full).collect();
     assert!(!scans.is_empty());
     assert!(
@@ -551,6 +561,18 @@ fn r1_13_the_cache_forgets_the_oldest_across_sessions() {
         },
     );
     settle(&mut tree);
+    // `d`'s scan to its end (own 1 B + 7 B below), not a quiet moment.
+    assert!(until(&mut tree, Duration::from_secs(20), |t| {
+        matches!(
+            row(t, "d").info.size,
+            Size::Bytes {
+                bytes: 8,
+                more: false,
+                scanning: false,
+                ..
+            }
+        )
+    }));
     tree.close();
     let d = p(&h.join("d"));
     assert!(cache::size(&at, &d).is_some(), "the scan was kept");
@@ -740,6 +762,23 @@ fn r1_7_space_lists_every_folder_whole() {
         tree.view(0, 36, None);
         settle(&mut tree);
         let size = |t: &Tree| row(t, "row").info.size;
+        // `settle` waits for a quiet moment, not for a scan's end: a 12 000-entry listing on a
+        // slow runner is a long quiet moment. Wait for the automatic scan itself (Space while it
+        // runs would test something else).
+        let idle = |t: &Tree| {
+            matches!(
+                size(t),
+                Size::Bytes {
+                    scanning: false,
+                    ..
+                }
+            )
+        };
+        assert!(
+            until(&mut tree, Duration::from_secs(20), idle),
+            "the automatic scan never ended: {:?}",
+            size(&tree)
+        );
         assert!(
             matches!(
                 size(&tree),
@@ -753,25 +792,17 @@ fn r1_7_space_lists_every_folder_whole() {
             size(&tree)
         );
         tree.size_now(row(&tree, "row").id);
-        assert!(until(&mut tree, Duration::from_secs(20), |t| {
-            matches!(
-                size(t),
-                Size::Bytes {
-                    scanning: false,
-                    ..
-                }
-            ) && !t.owner_busy()
-        }));
-        settle(&mut tree);
-        assert_eq!(
-            size(&tree),
-            Size::Bytes {
-                bytes: 12_001,
-                more: false,
-                cached: false,
-                scanning: false
-            }
-        );
+        let exact = Size::Bytes {
+            bytes: 12_001,
+            more: false,
+            cached: false,
+            scanning: false,
+        };
+        // The Space scan's own end, not a quiet moment.
+        until(&mut tree, Duration::from_secs(30), |t| {
+            size(t) == exact && !t.owner_busy()
+        });
+        assert_eq!(size(&tree), exact);
         tree.close();
     };
     let fake = Fake::new(&h);
@@ -889,6 +920,15 @@ fn r2_6_an_h3_folder_left_out_keeps_the_size_partial() {
     settle(&mut tree);
     tree.size_now(row(&tree, "~").id);
     settle(&mut tree);
+    until(&mut tree, Duration::from_secs(20), |t| {
+        matches!(
+            row(t, "~").info.size,
+            Size::Bytes {
+                scanning: false,
+                ..
+            }
+        ) && !t.owner_busy()
+    });
     let size = row(&tree, "~").info.size;
     assert!(
         matches!(
@@ -901,5 +941,47 @@ fn r2_6_an_h3_folder_left_out_keeps_the_size_partial() {
         ),
         "{size:?}"
     );
+    pool.shutdown();
+}
+
+/// Space pressed while the row's automatic scan is running is not lost: the automatic scan
+/// gives way to Space's, which lists every folder whole, and the row ends exact (D-6).
+#[test]
+fn r2_space_during_an_automatic_scan_is_not_lost() {
+    let (_tmp, h) = temp();
+    mkdirs(&h, &["row/many"]);
+    std::fs::write(h.join("row/readme"), b"x").unwrap();
+    for i in 0..20 {
+        std::fs::write(h.join(format!("row/many/f{i:02}")), b"x").unwrap();
+    }
+    let fake = Fake::new(&h);
+    // An automatic listing stops after 5 entries; Space's are whole.
+    *fake.cut.lock().unwrap() = Some((5, "never".into()));
+    fake.gate().scans = true;
+    let pool = pool(Duration::from_secs(30));
+    let mut tree = open(&fake, &pool, &h, Params { n: 5, d: 1, e: 36 });
+    settle(&mut tree);
+    tree.view(0, 36, None);
+    assert!(
+        until(&mut tree, Duration::from_secs(10), |_| fake.gate().waiting
+            == 1),
+        "the automatic scan is running"
+    );
+    tree.size_now(row(&tree, "row").id);
+    fake.gate().scans = false;
+    fake.release(10);
+    let exact = |t: &Tree| {
+        matches!(
+            row(t, "row").info.size,
+            Size::Bytes {
+                bytes: 21,
+                more: false,
+                scanning: false,
+                ..
+            }
+        )
+    };
+    until(&mut tree, Duration::from_secs(20), exact);
+    assert!(exact(&tree), "{:?}", row(&tree, "row").info.size);
     pool.shutdown();
 }
