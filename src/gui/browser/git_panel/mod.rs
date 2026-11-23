@@ -971,6 +971,15 @@ impl GitView {
             Command::Reread => return vec![A::Refresh],
             Command::Pin => return vec![A::Pin],
             Command::Wide => return vec![A::Wide],
+            _ => {}
+        }
+        // The log or the Backups list in the body takes the keyboard (review 1): its own keys,
+        // Cmd/Ctrl+L and B to switch or close it; every other key does nothing — the graph under
+        // it, and so its bar's object, is not on screen.
+        if self.log.is_some() || self.backups.is_some() {
+            return self.run_list(command);
+        }
+        match command {
             Command::HistorySearch => {
                 self.search_dialog = Some(find::SearchDialog::default());
                 return Vec::new();
@@ -1379,6 +1388,24 @@ impl GitView {
         self.stop_question = Some(what);
     }
 
+    /// The confirmation of `action` again, as a dialog (review 1: a run whose shown plan was lost
+    /// and whose plan now asks for a confirmation). Never a run from here: a plan that asks for
+    /// none says so on the status row instead.
+    pub fn reconfirm(&mut self, action: Action) -> Vec<GitAction> {
+        let Some(repo) = &self.repo else {
+            return Vec::new();
+        };
+        match dialogs::ActionDialog::confirm(action, repo, dialogs::PLAN) {
+            dialogs::Opened::Dialog(dialog) => self.dialog = Some(dialog),
+            dialogs::Opened::Run(action) => {
+                let what = menu::label(action.id()).trim_end_matches('…');
+                self.said = Some(Status::info(format!("{what}: run it again")));
+            }
+            dialogs::Opened::View(_) | dialogs::Opened::NotHere(_) => {}
+        }
+        Vec::new()
+    }
+
     /// A second dialog for an action git refused (03 §7.2: `delete-branch`'s "not fully merged":
     /// the same action, forced), in place of the error dialog.
     pub fn confirm_again(&mut self, action: Action) -> Vec<GitAction> {
@@ -1561,6 +1588,17 @@ impl GitView {
     /// works). Without a snapshot, [`fkeys`]' alone.
     pub fn fkeys(&self, mode: Mode) -> Vec<FKey> {
         let mut row = fkeys(mode);
+        // The log or the Backups list: what it does (F3 shows; the Backups list's F8 deletes).
+        if self.log.is_some() || self.backups.is_some() {
+            if self.backups.is_some() {
+                row.push(FKey {
+                    n: 8,
+                    label: "Delete",
+                });
+                row.sort_by_key(|k| k.n);
+            }
+            return row;
+        }
         let Some(object) = self.object() else {
             return row;
         };
@@ -1795,31 +1833,53 @@ impl GitView {
         }
     }
 
-    /// S3's commands (03 §9): the log and the Backups list take theirs while they show; the
-    /// F-keys' actions, the menu, a tag's details, Space on a file of the uncommitted row,
-    /// Cmd/Ctrl+Z, B, L, Shift+R and the banner's keys. `None` for a command left to S2's keys.
-    fn run_actions(&mut self, command: Command) -> Option<Vec<GitAction>> {
+    /// A command while the log or the Backups list shows in the body (03 §9.2): the list's own
+    /// rows (the log: the bar, Enter or F3 to show an entry whole, Esc; the Backups list: also
+    /// Cmd/Ctrl+Z and F8 on the line under its bar); Cmd/Ctrl+L or B closes its list or opens the
+    /// other; anything else is taken and does nothing.
+    fn run_list(&mut self, command: Command) -> Vec<GitAction> {
         if let Some(log) = &mut self.log {
-            if matches!(command, Command::Bar(_) | Command::Details | Command::Back) {
-                if log.run(command) == Some(log_view::LogEnd::Close) {
-                    self.log = None;
+            return match command {
+                Command::Bar(_) | Command::Details | Command::Back => {
+                    if log.run(command) == Some(log_view::LogEnd::Close) {
+                        self.log = None;
+                    }
+                    Vec::new()
                 }
-                return Some(Vec::new());
-            }
+                Command::Log => {
+                    self.log = None;
+                    Vec::new()
+                }
+                Command::Backups => vec![GitAction::Backups],
+                _ => Vec::new(),
+            };
         }
         if let Some(list) = &mut self.backups {
-            if matches!(
-                command,
+            return match command {
                 Command::Bar(_)
-                    | Command::Details
-                    | Command::Undo
-                    | Command::Remove
-                    | Command::Back
-            ) {
-                let end = list.run(command);
-                return Some(self.backups_end(end));
-            }
+                | Command::Details
+                | Command::Undo
+                | Command::Remove
+                | Command::Back => {
+                    let end = list.run(command);
+                    self.backups_end(end)
+                }
+                Command::Backups => {
+                    self.backups = None;
+                    Vec::new()
+                }
+                Command::Log => vec![GitAction::Log],
+                _ => Vec::new(),
+            };
         }
+        Vec::new()
+    }
+
+    /// S3's commands (03 §9) on the graph: the F-keys' actions, the menu, a tag's details, Space
+    /// on a file of the uncommitted row, Cmd/Ctrl+Z, B, L, Shift+R and the banner's keys. `None`
+    /// for a command left to S2's keys. (The log and the Backups list take theirs first,
+    /// [`GitView::run_list`].)
+    fn run_actions(&mut self, command: Command) -> Option<Vec<GitAction>> {
         let asked = match command {
             Command::Menu => {
                 self.open_menu();

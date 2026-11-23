@@ -2261,6 +2261,27 @@ pub(super) enum RunEnd {
         why: String,
         line: Option<String>,
     },
+    /// Nothing ran: no confirmation showed this run's plan (it was lost, or the action came with
+    /// none) and the plan made now asks for one (03 §8.1) — its dialog opens again (review 1).
+    Confirm { title: String, action: Box<Action> },
+}
+
+/// A backup stamp's order (03 §8.2: `YYYYMMDDTHHMMSSZ`, then `-2`, `-3`… when taken): its UTC
+/// time, then its number (none is the first).
+fn stamp_order(stamp: &str) -> (String, u64) {
+    match stamp.split_once('-') {
+        Some((base, n)) => (base.to_string(), n.parse().unwrap_or(u64::MAX)),
+        None => (stamp.to_string(), 1),
+    }
+}
+
+/// A group this window wrote, onto its undo (03 §8.3): kept in stamp order, so the newest is the
+/// newest written whatever order the runs ended in (review 1).
+pub(super) fn record_group(undo: &mut backup::Undo, stamp: String) {
+    if !undo.stamps.contains(&stamp) {
+        undo.stamps.push(stamp);
+    }
+    undo.stamps.sort_by_key(|s| stamp_order(s));
 }
 
 /// An action running on a worker, or waiting for the repository's write lock (02 §6). Never a
@@ -2325,6 +2346,9 @@ pub(super) fn wait_run(mut run: Running) -> JoinHandle<()> {
                 }
             }
             Ok(RunEnd::NotRun { title, why, .. }) => format!("{title}: not run: {why}"),
+            Ok(RunEnd::Confirm { title, .. }) => {
+                format!("{title}: not run: its plan asks for a confirmation")
+            }
             Err(_) => format!("{}: the run stopped without a result", run.title),
         };
         eprintln!(
@@ -2618,11 +2642,18 @@ impl Browser {
             let _held = lock.lock().unwrap_or_else(|p| p.into_inner());
             s.store(true, Ordering::Relaxed);
             waker.request_repaint();
+            let confirmed = plan.is_some();
             let planned = match plan {
                 Some(plan) => Ok((plan, repo)),
                 None => plan_now(&runner, &h, repo, &action),
             };
             let end = match planned {
+                // 03 §8.1: only a plan with no confirmation runs at once; one that asks for a
+                // confirmation no dialog showed does not run (review 1).
+                Ok((plan, _)) if !confirmed && plan.confirm.is_some() => RunEnd::Confirm {
+                    title: t,
+                    action: Box::new(action),
+                },
                 Ok((plan, repo)) => {
                     let outcome = actions::execute(&plan, &repo.top, &runner, &h);
                     let what = plan
@@ -2667,11 +2698,22 @@ impl Browser {
     /// backup and Cmd/Ctrl+Z, or its warning —, the group onto the window's undo, the panels'
     /// folders re-listed when files may have changed, the Commit dialog after a squash, and the
     /// refresh.
-    fn run_ended(&mut self, ctx: &egui::Context, i: usize, end: RunEnd) {
+    pub(super) fn run_ended(&mut self, ctx: &egui::Context, i: usize, end: RunEnd) {
         let top = self.git.panels[i].top.clone();
         // What Esc said while it ran ("stopping") gives way to the run's own words.
         self.status = Status::default();
+        if let RunEnd::Confirm { title, action } = end {
+            // Nothing ran, nothing to refresh: the action's confirmation, again.
+            let p = &mut self.git.panels[i];
+            p.view.status = Some(Status::info(format!(
+                "{title}: not run — its plan asks for a confirmation"
+            )));
+            let asked = p.view.reconfirm(*action);
+            self.git_actions(ctx, i, asked);
+            return;
+        }
         match end {
+            RunEnd::Confirm { .. } => {}
             RunEnd::Ran {
                 outcome,
                 title,
@@ -2681,12 +2723,10 @@ impl Browser {
                 action,
             } => {
                 if let Some(stamp) = &outcome.backup {
-                    self.git
-                        .undo
-                        .entry(top.clone())
-                        .or_default()
-                        .push(stamp.clone());
-                    self.git.panels[i].view.set_undo(Some(stamp.clone()));
+                    let undo = self.git.undo.entry(top.clone()).or_default();
+                    record_group(undo, stamp.clone());
+                    let newest = undo.newest().map(String::from);
+                    self.git.panels[i].view.set_undo(newest);
                 }
                 let p = &mut self.git.panels[i];
                 let said = p.view.show_outcome(&title, &what, &outcome);

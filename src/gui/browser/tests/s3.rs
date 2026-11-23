@@ -1684,3 +1684,145 @@ fn live_g_r3_esc_stops_a_remote_fetch() {
     );
     println!("cleanup: {}", out.trim());
 }
+
+/// Review 1, must-fix 1: while the log or the Backups list shows, the action keys do nothing —
+/// they would act on the graph's bar under the list, which is not on screen: no dialog, no menu,
+/// nothing read or run, no Find; the F-key row shows only what the list does; Cmd/Ctrl+L and B
+/// close their list.
+#[test]
+fn action_keys_do_nothing_while_a_list_shows() {
+    let git = git_or_skip!();
+    let mut g = Gx::new(small(&git));
+    g.ready_in_git();
+    g.bar_to("second");
+    let none = Modifiers::NONE;
+    let cmd_shift = Modifiers::COMMAND | Modifiers::SHIFT;
+    for (open, slots) in [(Key::L, vec![1, 3, 4, 9]), (Key::B, vec![1, 3, 4, 8, 9])] {
+        g.cmd(open);
+        g.until_quiet("the list");
+        let shows = |g: &Gx| g.view().log_newest().is_some() || g.view().backups().is_some();
+        assert!(shows(&g), "{open:?}: the list");
+        let row: Vec<u8> = g.slots().iter().map(|s| s.0).collect();
+        assert_eq!(row, slots, "{open:?}: the list's F-key row");
+        for (key, mods) in [
+            (Key::F2, none),
+            (Key::F5, none),
+            (Key::F6, none),
+            (Key::F7, none),
+            (Key::F8, none),
+            (Key::F10, none),
+            (Key::F10, Modifiers::SHIFT),
+            (Key::Space, none),
+            (Key::R, cmd_shift),
+            (Key::C, cmd_shift),
+        ] {
+            g.with(key, mods);
+            g.idle(2);
+            assert!(
+                g.dialog_id().is_none() && !g.view().dialog_up(),
+                "{open:?} {key:?}: nothing opened"
+            );
+            assert!(
+                !g.panel().acting() && g.panel().running.is_empty(),
+                "{open:?} {key:?}: nothing read or run"
+            );
+            assert!(shows(&g), "{open:?} {key:?}: the list still shows");
+        }
+        g.fx.typed("x");
+        assert!(g.view().find_text().is_none(), "{open:?}: no Find");
+        g.cmd(open);
+        g.idle(2);
+        assert!(!shows(&g), "{open:?}: closed by its key");
+    }
+}
+
+/// Review 1, must-fix 2: a run whose confirmed plan was lost (here: none was ever shown) and
+/// whose plan made now asks for a confirmation does not run — HEAD stays — and the action's
+/// dialog opens with the new confirmation; Enter there runs it.
+#[test]
+fn a_run_whose_confirmed_plan_was_lost_asks_again() {
+    let git = git_or_skip!();
+    let mut g = Gx::new(small(&git));
+    g.ready_in_git();
+    g.fx.drv.resize(1000.0, 1400.0);
+    g.idle(2);
+    let head = g.repo.rev("HEAD");
+    let light = g.repo.rev("light");
+    let action = Action::Reset {
+        to: crate::git::model::Oid::parse(&light).unwrap(),
+        mode: crate::git::actions::ResetMode::Hard,
+    };
+    let ctx = g.fx.drv.ctx.clone();
+    let i = g.b().git.panel(g.repo.top()).unwrap();
+    g.fx.b.start_action(&ctx, i, action);
+    g.until_quiet("the plan made again");
+    assert_eq!(g.repo.rev("HEAD"), head, "nothing ran");
+    assert_eq!(g.dialog_id(), Some(ActionId::Reset), "its dialog again");
+    g.idle(4);
+    assert!(
+        g.shows("git reset --hard "),
+        "the new confirmation: {:#?}",
+        g.texts()
+    );
+    assert!(
+        g.view()
+            .status_line()
+            .text
+            .contains("not run — its plan asks for a confirmation"),
+        "{}",
+        g.view().status_line().text
+    );
+    g.run();
+    assert_eq!(g.repo.rev("HEAD"), light, "confirmed, it ran");
+}
+
+/// Review 1, must-fix 3: Cmd/Ctrl+Z restores the newest group this window wrote by its stamp
+/// (UTC, then `-2`, `-3`…), whatever order the runs ended in.
+#[test]
+fn undo_takes_the_newest_stamp_whatever_order_the_runs_end_in() {
+    let git = git_or_skip!();
+    let mut g = Gx::new(small(&git));
+    g.ready_in_git();
+    let ctx = g.fx.drv.ctx.clone();
+    let i = g.b().git.panel(g.repo.top()).unwrap();
+    let top = g.top();
+    let ran = |stamp: &str| RunEnd::Ran {
+        outcome: Box::new(crate::git::actions::Outcome {
+            steps: Vec::new(),
+            backup: Some(stamp.to_string()),
+        }),
+        title: "a run".into(),
+        what: "a run".into(),
+        changes_files: false,
+        squash: false,
+        action: Box::new(Action::Fetch {
+            prune: false,
+            prune_tags: false,
+        }),
+    };
+    let newest = |g: &Gx| g.b().git.undo[&top].newest().map(String::from);
+    // The newer ended first.
+    for stamp in [
+        "20261123T120000Z-2",
+        "20261123T120000Z",
+        "20261123T115959Z-10",
+    ] {
+        g.fx.b.run_ended(&ctx, i, ran(stamp));
+    }
+    g.until_quiet("the refreshes");
+    assert_eq!(newest(&g).as_deref(), Some("20261123T120000Z-2"));
+    for stamp in ["20261123T120001Z", "20261123T120000Z-3"] {
+        g.fx.b.run_ended(&ctx, i, ran(stamp));
+    }
+    g.until_quiet("the refreshes");
+    assert_eq!(newest(&g).as_deref(), Some("20261123T120001Z"));
+    // Cmd/Ctrl+Z asks for that group (none exists here: its read says so, naming it).
+    g.esc();
+    g.cmd(Key::Z);
+    g.until_quiet("the restore's read");
+    assert!(
+        g.shows("no backup group 20261123T120001Z"),
+        "{:#?}",
+        g.texts()
+    );
+}
