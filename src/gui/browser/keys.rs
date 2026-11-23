@@ -50,6 +50,12 @@ impl Slices {
         Slices(bits)
     }
 
+    /// The set with `slice` too (1 to 7): a test's view of a slice landing.
+    #[cfg_attr(not(test), allow(dead_code))] // Only the tests use it.
+    pub const fn with(self, slice: u8) -> Slices {
+        Slices(self.0 | 1u8 << slice)
+    }
+
     /// Whether `slice` is in the set (a number outside 1 to 7 never is).
     pub fn has(self, slice: u8) -> bool {
         slice != 0
@@ -1020,6 +1026,7 @@ mod tests {
             .iter()
             .all(|r| LANDED_SLICES.has(r.slice) == matches!(r.slice, 1 | 2 | 5)));
         assert!(!ALL_SLICES.has(0) && !ALL_SLICES.has(8) && !ALL_SLICES.has(u8::MAX));
+        assert_eq!(LANDED_SLICES.with(3), Slices::of(&[1, 2, 3, 5]));
         assert_eq!(
             find(&mut vec![press(K::F10, NONE)], List, LANDED_SLICES),
             Some(Command::Tree)
