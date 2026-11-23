@@ -19,7 +19,14 @@ anything is downloaded: sopen's hex window (the default; byte overwrite only) or
 `--hex` opens any file in the hex window. It opens on the machine it was typed on, or — with `--target HOST`,
 `SOPEN_TARGET` or `target` in sopen's config — on HOST's screen, by running HOST's installed sopen with `--here`
 over ssh: HOST
-is a machine the owner uses sopen on, not a file's remote, which still needs only sshd (spec §4a). A remote
+is a machine the owner uses sopen on, not a file's remote, which still needs only sshd (spec §4a). On macOS,
+while a sopen window is in front, the top row is meant to send F1–F12 without fn (the key half is the owner's
+receipt K-F3, still open): `fkeys` in sopen's config —
+`"function"` (the default) or `"system"` (never touched), set by `sopen config fkeys function|system` — and
+sopen sets the global `HIDFKeyMode` to 1 and puts back what it found once none of its windows is in front,
+even when it dies (lock, state file, watchdog child; `.prd/04-file-keys.md` §6, `src/fnkeys/`); a run a hook
+drives (`SOPEN_SCREENSHOT`, `SOPEN_AUTOSAVE`, `SOPEN_AUTOEXPORT`, `SOPEN_LIST`, `SOPEN_KEYS`) and the tests never
+touch it, and Linux has no such switch. A remote
 file that one of sopen's own windows shows is read as a stream, never downloaded first, whatever its size
 ([`.prd/06-streaming.md`](.prd/06-streaming.md)); its edits live in memory and in a local journal until they
 are saved, and Save writes to the remote by default, Save As to a local path

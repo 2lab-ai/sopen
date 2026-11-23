@@ -63,8 +63,10 @@ sopen --target <host> <host>:/tmp/a.html      # a file on <host> itself opens th
 sopen --target <host> ./notes.txt             # a local file: <host> fetches it from this machine
 sopen config target <host>                    # from now on `sopen SOURCE` opens on <host>
 sopen --here myserver:/tmp/a.html             # …but this one here
-sopen config                                  # where the config file is, and the target
+sopen config                                  # where the config file is, the target (and fkeys, if set)
 sopen config target --unset                   # back to this machine
+sopen config fkeys system                     # macOS: sopen never touches what the top row sends
+sopen config fkeys function                   # …or F1–F12 without fn while sopen is in front (the default)
 ```
 
 The config file is `~/.config/sopen/config.toml` (`$XDG_CONFIG_HOME/sopen/config.toml` when that is
@@ -72,7 +74,18 @@ set, `$SOPEN_CONFIG` overrides both) on macOS and Linux alike:
 
 ```toml
 target = "<host>"
+fkeys = "function"   # or "system"; without the key, "function"
 ```
+
+`fkeys` is for macOS: with `"function"` (the default), while a sopen window is in front sopen
+switches the Mac's top row to F1–F12 without fn — so F5 should copy — and brightness and volume
+need fn; once no sopen window is in front (or the Mac sleeps, or you switch user), the Mac's own
+setting is back, even if sopen crashed. The switch is measured to reach the keyboard driver;
+that a plain F5 then reaches sopen is not yet checked on a real keyboard (`.prd/04-file-keys.md`
+§6.2, K-F3). The setting is global,
+so other apps see F-keys while sopen is in front. `"system"` leaves the Mac's setting alone; the
+F-key row's slots and Cmd/Ctrl+1…0 (F1–F10) work either way. Linux has no such switch: a laptop's
+own Fn lock (often Fn+Esc) is the way there.
 
 `--target` or `--here` (not both) decides one run; without them `SOPEN_TARGET=<host>` in the
 environment comes first, then the config. `<host>` is `[user@]host` — an ssh alias or a host

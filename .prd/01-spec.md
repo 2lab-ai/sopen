@@ -559,12 +559,24 @@ travel to HOST; settings that name local paths (`SOPEN_CODE`, `SOPEN_ZED`, `SOPE
 `SOPEN_STATE_DIR`, `SOPEN_CONFIG`) do not.
 
 The config file is `$SOPEN_CONFIG` if set, else `$XDG_CONFIG_HOME/sopen/config.toml`, else
-`~/.config/sopen/config.toml`, on macOS as on Linux. It is TOML with one key, `target = "<host>"`. A key sopen does
+`~/.config/sopen/config.toml`, on macOS as on Linux. It is TOML with two keys, `target = "<host>"` and
+`fkeys = "function" | "system"`. A key sopen does
 not know, a value it cannot use or text that is not TOML is an error naming the file and the line. `sopen config`
-prints the file's path and its target (or `target is not set`). `sopen config target HOST` checks HOST, creates the
+prints the file's path and its target (or `target is not set`), and `fkeys = <function|system>` when the file sets it.
+`sopen config target HOST` checks HOST, creates the
 directories, and replaces the file atomically (a temp file in the same directory, renamed over it; a config that is a
 symlink keeps its link). A new file is readable by its owner only (0600); a replaced one keeps its mode.
-`sopen config target --unset` removes the key and leaves the file, empty.
+`sopen config target --unset` removes the key and leaves the file (empty when nothing else is in it).
+
+`fkeys` is what the Mac's top row sends while a sopen window is in front ([04](04-file-keys.md) §6.2, A14):
+`"function"` — the default, also when the key is absent — F1…F12 without fn: sopen sets the HID system's
+`HIDFKeyMode` to 1 when one of its windows comes to the front and puts back what it found once none is, through a
+lock, a state file and a watchdog that restore it even when sopen dies (04 §6.3); `"system"` — sopen never touches
+the setting. The setting is global: while sopen is in front every app sees F-keys, and brightness and volume need fn.
+A run a hook drives (AGENTS.md "Receipts") and the tests never switch it; Linux and Windows have no such switch
+(04 §6.4). `sopen config fkeys function|system` sets the key as `sopen config target` sets the target. The config
+is read for it when sopen's first window opens; a config sopen cannot read then leaves the setting alone (the run
+goes on — it was not deciding where the file opens).
 
 ## 5. Writes back (conflict-safe, never silent)
 

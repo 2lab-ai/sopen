@@ -112,3 +112,16 @@ tokio = { version = "1.54.1", features = ["process", "io-util", "test-util"] }
 # turns the default menu off and handles Cmd+Q itself.
 [target.'cfg(target_os = "macos")'.dependencies]
 winit = { version = "0.30.13", default-features = false }
+# The F-key switch hears the Mac sleep, wake and switch sessions (NSWorkspace's notifications,
+# `.prd/04-file-keys.md` §6.2). Already in the tree (eframe, egui-winit, rfd → objc2-app-kit
+# 0.3), at these exact versions; only features nothing else enabled are new (`NSOperation`).
+objc2 = "=0.6.5"
+block2 = "=0.6.2"
+objc2-foundation = { version = "=0.3.2", default-features = false, features = [
+    "std",
+    "block2",
+    "NSNotification",
+    "NSOperation",
+    "NSString",
+] }
+objc2-app-kit = { version = "=0.3.2", default-features = false, features = ["std", "NSWorkspace"] }
