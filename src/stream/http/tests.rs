@@ -1653,6 +1653,8 @@ fn a_client_that_leaves_a_waiting_response_frees_its_seat() {
                 assert_eq!(server.cuts(kind), 0, "a client that left is no cut");
             }
             assert_eq!(rig.source.stats().cuts, 0);
+            // It leaves with the server's write to it under way or waiting for a block: the
+            // write or the watch finds it gone, and either way it left.
             drop(stays);
             eventually("its seat is free too", || watch.open() == 0);
             assert_eq!(server.cuts(Kind::Play), 0);
@@ -1874,7 +1876,8 @@ fn a_write_that_fails_is_a_cut_counted_before_the_client_sees_the_end() {
     );
 }
 
-/// Only an error that clearly means the client left is nobody's cut.
+/// Only an error that clearly means the client left is nobody's cut. The client left: the
+/// response's own write found it gone, not the watch, and it counts the same.
 #[test]
 fn a_write_error_that_means_the_client_left_is_not_a_cut() {
     bounded(
@@ -1899,6 +1902,7 @@ fn a_write_error_that_means_the_client_left_is_not_a_cut() {
                 eventually("its thread ends", || watch.open() == 0);
                 assert_eq!(server.cuts(Kind::Render), 0, "{kind:?}");
                 assert_eq!(source.stats().cuts, 0, "{kind:?}");
+                assert_eq!(watch.left(), 1, "{kind:?}: found gone by its write");
             }
         },
     );
@@ -2295,14 +2299,15 @@ fn a_source_that_changes_during_a_response_cuts_it_short() {
     );
 }
 
-/// A connection the client itself closes early — ffmpeg does so at every seek — is not a cut.
+/// A connection the client itself closes early — ffmpeg does so at every seek — is not a cut:
+/// the client left, whether the watch or the response's own write finds it gone.
 #[test]
 fn a_connection_the_client_closes_is_not_a_cut() {
     bounded("a_connection_the_client_closes_is_not_a_cut", || {
         let (source, _control) = threaded(256 * MIB);
         let server = Server::start(source.clone()).unwrap();
         let watch = server.watch();
-        for kind in Kind::ALL {
+        for (closed, kind) in (1..).zip(Kind::ALL) {
             let mut client = connect(&server);
             client
                 .write_all(&request(&server, "GET", kind, &range("bytes=5000-")))
@@ -2315,6 +2320,7 @@ fn a_connection_the_client_closes_is_not_a_cut() {
             eventually("its thread ends", || watch.open() == 0);
             assert_eq!(server.cuts(kind), 0);
             assert_eq!(server.last_cut(kind), None);
+            assert_eq!(watch.left(), closed, "{kind:?}: the client left");
         }
         assert_eq!(source.stats().cuts, 0);
         assert!(source.stats().http_sent >= 70_000);
