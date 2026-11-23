@@ -23,8 +23,12 @@
 //! window plays the staged render, and a stream's Source and byte server are closed. Save As
 //! (Alt+Cmd/Ctrl+S, F7) renders the edit into a new local file ([`super::save_as`]). While a
 //! Save runs nothing is edited; Esc stops it up to its rename.
+//!
+//! A file at a revision (03 §6.3, [`super::Window::set_read_only`]) plays and selects as any
+//! other, but nothing is edited and no Save, Save As or Export starts — each says
+//! [`AT_A_REVISION`] — and no journal is kept or looked for.
 
-use super::image::CANNOT_REPLACE;
+use super::image::{AT_A_REVISION, CANNOT_REPLACE};
 use super::playback::{self, Piece, Player, Sink};
 use super::save_as::{self, SaveAs};
 use super::{Hooks, Map, Origin, Outcome, Selection, Status};
@@ -1799,6 +1803,10 @@ struct MediaWindow {
     plays: usize,
     /// Why Save is off for this file (no one-step replace, no hard links on its server).
     save_off: Option<String>,
+    /// A file at a revision ([`super::Window::set_read_only`]): it plays and selects, but
+    /// nothing is edited, saved or exported, no journal is written and none of an earlier
+    /// session's is looked for (that look may reconcile a cut-off Save on the file).
+    at_revision: bool,
     /// The file's host as named in what is said, and whether it is this machine.
     host: String,
     local: bool,
@@ -1920,6 +1928,7 @@ impl MediaWindow {
         );
         Self {
             save_off,
+            at_revision: false,
             write_soon: false,
             close_after_kept: false,
             baseline,
@@ -2103,6 +2112,7 @@ impl MediaWindow {
     /// is unknown, nothing stale, no dialog up.
     fn editable(&self) -> bool {
         self.save.is_none()
+            && !self.at_revision
             && !self.stale
             && !self.prompt
             && !self.unknown
@@ -2596,6 +2606,11 @@ impl MediaWindow {
     }
 
     fn start_export(&mut self, ctx: &egui::Context) {
+        // Its new file would land beside a file at a revision, in a folder that goes with the
+        // window: no place for it either.
+        if self.at_revision {
+            return self.status = Status::error(format!("cannot export: {AT_A_REVISION}"));
+        }
         if self.planning.is_some() {
             return self.status = Status::info(CHECKING_ENCODER);
         }
@@ -2660,6 +2675,9 @@ impl MediaWindow {
     }
 
     fn start_save(&mut self, ctx: &egui::Context, close_after: bool) {
+        if self.at_revision {
+            return self.status = Status::error(format!("cannot save: {AT_A_REVISION}"));
+        }
         if self.planning.is_some() {
             return self.status = Status::info(CHECKING_ENCODER);
         }
@@ -2905,7 +2923,7 @@ impl MediaWindow {
     /// Edits the journal keeps: unsaved, and nowhere else (no Save As holds them; a window gone
     /// stale after its Save landed holds saved ones).
     fn journal_wants(&self) -> bool {
-        self.unsaved_nowhere() && !self.stale
+        self.unsaved_nowhere() && !self.stale && !self.at_revision
     }
 
     /// The window may go now — unless a generation is being written (or is to be): it stays,
@@ -2945,7 +2963,12 @@ impl MediaWindow {
     /// Writes the next generation — now, waiting for it (focus loss, close), or in the
     /// background. The journal is made by the first one.
     fn write_generation(&mut self, wait: bool) {
-        if self.preview || self.scripted || !(self.journal_dir.is_some() || self.journal_wants()) {
+        // Never for a file at a revision — not even into a journal made before it became one.
+        if self.preview
+            || self.scripted
+            || self.at_revision
+            || !(self.journal_dir.is_some() || self.journal_wants())
+        {
             return;
         }
         // One at a time: a generation on its way is waited for before the next.
@@ -3036,6 +3059,10 @@ impl MediaWindow {
     /// question about an interrupted save's file, is kept too; otherwise — or after Discard —
     /// the journal is removed.
     fn settle_journal(&mut self) {
+        // A file at a revision kept nothing; nothing an earlier session left is its to remove.
+        if self.at_revision {
+            return;
+        }
         // Discarded (or nothing left to keep) while a generation is on its way: that one writes
         // nothing more once it sees the epoch moved, and the journal goes once it is done — on
         // a thread of its own, never holding the window (07 §3: Discard removes the journal).
@@ -3127,7 +3154,9 @@ impl MediaWindow {
     /// At the first pass of a viewer (never a preview, which must not hold another session's
     /// journals): what an earlier session left is listed in the background.
     fn start_recovery(&mut self, ctx: &egui::Context) {
-        if self.recovery_started || self.preview {
+        // Nor for a file at a revision: the look may reconcile a cut-off Save on the file — a
+        // write — and nothing of another session is restored there.
+        if self.recovery_started || self.preview || self.at_revision {
             return;
         }
         self.recovery_started = true;
@@ -3212,7 +3241,19 @@ impl MediaWindow {
     /// — ends, the row having named what to check) and its edits applied, unless the window has
     /// edits of its own (`undo or save them first`), the row still asks its question, or they
     /// were made on another timeline than this file's.
+    /// A row's or a question's answer writes (Restore takes the journal over, Discard removes
+    /// it, Remove it removes a file, Keep it ends the record): not for a file at a revision.
+    fn no_answer_here(&mut self) -> bool {
+        if self.at_revision {
+            self.status = Status::error(format!("cannot answer: {AT_A_REVISION}"));
+        }
+        self.at_revision
+    }
+
     fn restore_row(&mut self, i: usize) {
+        if self.no_answer_here() {
+            return;
+        }
         if self.has_edits() || self.journal_dir.is_some() {
             return self.status = Status::error("undo or save them first");
         }
@@ -3300,7 +3341,7 @@ impl MediaWindow {
 
     /// Discard: the row's journal is removed, on a worker.
     fn discard_row(&mut self, i: usize) {
-        if i >= self.rows.len() {
+        if i >= self.rows.len() || self.no_answer_here() {
             return;
         }
         match self.rows.remove(i) {
@@ -3327,7 +3368,7 @@ impl MediaWindow {
     /// ends; Keep it ends the record and leaves the file. A failure keeps the question and the
     /// record. The row is the worker's meanwhile, and comes back with the answer.
     fn answer_row(&mut self, i: usize, remove: bool) {
-        if i >= self.rows.len() || self.answering.is_some() {
+        if i >= self.rows.len() || self.answering.is_some() || self.no_answer_here() {
             return;
         }
         let asks = matches!(
@@ -3399,6 +3440,9 @@ impl MediaWindow {
 
     /// Remove it / Keep it on the live window's question ([`Saved::Ask`]), on a worker.
     fn answer_live(&mut self, remove: bool) {
+        if self.no_answer_here() {
+            return;
+        }
         let Some(left) = self.left.clone() else {
             return;
         };
@@ -3556,6 +3600,9 @@ impl MediaWindow {
         if self.save_as.is_some() || self.busy() || self.preview {
             return;
         }
+        if self.at_revision {
+            return self.status = Status::error(format!("cannot save: {AT_A_REVISION}"));
+        }
         if self.planning.is_some() {
             return self.status = Status::info(CHECKING_ENCODER);
         }
@@ -3608,6 +3655,12 @@ impl MediaWindow {
         let Some((modal, close_after, edits)) = self.save_as.as_mut() else {
             return;
         };
+        // Where Save As starts writing is the modal's pass: a file at a revision has none — a
+        // modal not writing yet goes (one already writing finishes).
+        if self.at_revision && !modal.busy() {
+            self.save_as = None;
+            return;
+        }
         let ended = modal.show(ctx);
         let (close_after, edits) = (*close_after, edits.clone());
         match ended {
@@ -4228,14 +4281,20 @@ impl MediaWindow {
             ui.separator();
             let planning = self.planning.is_some();
             let busy = self.busy() || planning;
-            let save_ok = (editable || self.unknown)
+            // A file at a revision has no place to be saved (03 §6.3): Save, Save As and Export
+            // off, with that reason on hover before any other.
+            let here = !self.at_revision;
+            let save_ok = here
+                && (editable || self.unknown)
                 && !busy
                 && (self.unsaved() || self.unknown)
                 && self.can_replace
                 && self.save_off.is_none()
                 && self.left.is_none()
                 && self.media.save_block().is_none();
-            let why = if planning {
+            let why = if !here {
+                AT_A_REVISION.to_string()
+            } else if planning {
                 CHECKING_ENCODER.to_string()
             } else if !self.can_replace {
                 CANNOT_REPLACE.to_string()
@@ -4267,11 +4326,13 @@ impl MediaWindow {
             {
                 self.start_save(&ctx, false);
             }
-            let save_as_ok = !busy && self.unsaved() && self.media.plan.is_some();
+            let save_as_ok = here && !busy && self.unsaved() && self.media.plan.is_some();
             if ui
                 .add_enabled(save_as_ok, egui::Button::new("Save As…"))
                 .on_hover_text("⌥⌘/Alt+Ctrl+S or F7 — renders the edit into a new local file")
-                .on_disabled_hover_text(if busy {
+                .on_disabled_hover_text(if !here {
+                    AT_A_REVISION
+                } else if busy {
                     "a save or export is running"
                 } else {
                     "no changes to save"
@@ -4281,12 +4342,14 @@ impl MediaWindow {
                 self.open_save_as(false);
             }
             if ui
-                .add_enabled(!busy, egui::Button::new("Export  E"))
+                .add_enabled(here && !busy, egui::Button::new("Export  E"))
                 .on_hover_text(
                     "re-encode In–Out of the timeline (and the crop) into a new file next to \
                      the original",
                 )
-                .on_disabled_hover_text(if planning {
+                .on_disabled_hover_text(if !here {
+                    AT_A_REVISION
+                } else if planning {
                     CHECKING_ENCODER
                 } else {
                     "a save or export is running"
@@ -4443,6 +4506,10 @@ impl MediaWindow {
     }
 
     fn close_prompt(&mut self, ctx: &egui::Context) {
+        // A file at a revision has nothing to ask about (its Discard removes the journal).
+        if self.at_revision {
+            self.prompt = false;
+        }
         if !self.prompt {
             return;
         }
@@ -4878,7 +4945,7 @@ impl super::Window for MediaWindow {
             None => self.save_as_hook.is_none(),
         };
         // And once what an earlier session left is listed (its rows on screen).
-        let listed = self.recovery_started && self.recovering.is_none();
+        let listed = self.at_revision || (self.recovery_started && self.recovering.is_none());
         self.painted
             && frame_ok
             && self.player.is_none()
@@ -4912,9 +4979,41 @@ impl super::Window for MediaWindow {
         self.preview = on;
     }
 
+    /// A file at a revision (03 §6.3): it plays and selects, but nothing is edited; Save, Save
+    /// As and Export are off with [`AT_A_REVISION`] on hover and refused with it; no journal is
+    /// kept or looked for.
+    fn set_read_only(&mut self, read_only: bool) {
+        self.at_revision = read_only;
+        if read_only {
+            // Told late (its opener says so before the first pass): an earlier session's rows
+            // go unanswered — their Restore, Discard and Remove all write — and so do the
+            // close prompt, the question about an interrupted save's file, a generation still
+            // to be written and a Save As not writing yet. A save, an export or a generation
+            // already writing finishes.
+            self.rows.clear();
+            self.recovering = None;
+            self.prompt = false;
+            self.write_soon = false;
+            if self.answering.is_none() {
+                self.left = None;
+            }
+            if self
+                .save_as
+                .as_ref()
+                .is_some_and(|(modal, ..)| !modal.busy())
+            {
+                self.save_as = None;
+            }
+        }
+    }
+
     fn close_requested(&mut self) -> bool {
         // A preview holds nothing unsaved and writes nothing: dropping it asks nothing.
         if self.preview {
+            return true;
+        }
+        // Nor does a file at a revision: nothing of it can be saved anywhere.
+        if self.at_revision && self.save.is_none() && self.save_as.is_none() && self.job.is_none() {
             return true;
         }
         if self.close_ok {

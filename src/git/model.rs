@@ -58,7 +58,8 @@ pub enum Detection {
     NotARepo(Option<String>),
     /// git refuses the repository (another user's: `safe.directory`): stderr's first line.
     Refused(String),
-    /// No answer to use: git missing, too old (03 §2.4), or the 10 s bound passed.
+    /// No answer to use: git missing, too old (03 §2.4), the 10 s bound passed, a top level
+    /// that is not UTF-8, or an answer detection cannot read.
     Unavailable(Unavailable),
 }
 
@@ -71,8 +72,8 @@ pub enum NoWorkTree {
     GitDir,
 }
 
-/// Why detection gave no answer (03 §2.1's last row). [`Unavailable::NoGit`] is cached per host
-/// (03 §2.2).
+/// Why detection gave no answer to use (03 §2.1's last row, and S2-B's `NotUtf8` and `Failed`).
+/// [`Unavailable::NoGit`] is cached per host (03 §2.2).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Unavailable {
     /// No git there (a remote's `sopen: no git`, exit 127; 03 §2.4).
@@ -81,10 +82,64 @@ pub enum Unavailable {
     TooOld(String),
     /// The 10 s bound passed.
     TimedOut,
+    /// A work tree whose top level is not UTF-8 (shown here with U+FFFD): sopen names a
+    /// repository by its top level (`-C <top level>`, 03 §3.1), and a lossy name would run git
+    /// in another folder, so such a repository keeps the directory list, as the browser never
+    /// opens an entry whose name is not UTF-8 (`remote::Entry::lossy`).
+    NotUtf8(String),
+    /// git answered with something detection cannot read (an exit or a message 03 §2.1's
+    /// table does not have), or could not be run: stderr's first line or the runner's error.
+    /// Not cached, so the next visit asks again.
+    Failed(String),
+}
+
+/// A host's `git version` (03 §2.4), run once per host: the 2.20 floor and the features above
+/// it are decided from `major.minor.patch`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitVersion {
+    pub major: u32,
+    pub minor: u32,
+    pub patch: u32,
+    /// What follows `git version ` as git printed it (`2.39.5 (Apple Git-154)`).
+    pub text: String,
+}
+
+impl GitVersion {
+    /// At least `major.minor` (the floor is `at_least(2, 20)`; `--update-refs` is 2.38).
+    pub fn at_least(&self, major: u32, minor: u32) -> bool {
+        (self.major, self.minor) >= (major, minor)
+    }
+}
+
+/// 03 §4.1's HEAD read: `symbolic-ref -q HEAD`, then `rev-parse -q --verify HEAD`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Head {
+    /// The checked-out branch (`refs/heads/main`) and its commit.
+    Branch {
+        refname: String,
+        /// `refname` is not valid UTF-8: it shows with U+FFFD and names no ref.
+        lossy: bool,
+        oid: Oid,
+    },
+    /// HEAD detached at a commit.
+    Detached(Oid),
+    /// A branch with no commit yet: an empty repository (03 §4.1, `no commits yet`) or an
+    /// orphan branch.
+    Unborn { refname: String, lossy: bool },
+}
+
+impl Head {
+    /// HEAD's commit, `None` while unborn.
+    pub fn oid(&self) -> Option<&Oid> {
+        match self {
+            Head::Branch { oid, .. } | Head::Detached(oid) => Some(oid),
+            Head::Unborn { .. } => None,
+        }
+    }
 }
 
 /// One commit of the log stream: 03 §4.1's record,
-/// `%H%x1f%P%x1f%aN%x1f%aE%x1f%at%x1f%ct%x1f%s`, holding what 03 §4.5 says a row stores. Its
+/// `%H%x00%P%x00%aN%x00%aE%x00%at%x00%ct%x00%s`, holding what 03 §4.5 says a row stores. Its
 /// lanes and node segments are not here: they are the lane layout's (`graph`, S2-C).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommitRow {
@@ -124,6 +179,24 @@ pub struct RefLabel {
     pub upstream: Option<String>,
     /// `%(upstream:track)` as git prints it (`[ahead 2, behind 1]`, `[gone]`); empty for none.
     pub track: String,
+    /// `refname` or `upstream` is not valid UTF-8 (as `remote::Entry::lossy`): it shows with
+    /// U+FFFD, and no action may name the ref by it — two names can show alike.
+    pub lossy: bool,
+}
+
+impl RefLabel {
+    /// Where the label is drawn: an annotated tag's `*objectname`, else `objectname`.
+    pub fn target(&self) -> &Oid {
+        self.peeled.as_ref().unwrap_or(&self.object)
+    }
+
+    /// `refname` without its kind's prefix: `main`, `origin/main`, `v1`.
+    pub fn name(&self) -> &str {
+        ["refs/heads/", "refs/remotes/", "refs/tags/"]
+            .iter()
+            .find_map(|p| self.refname.strip_prefix(p))
+            .unwrap_or(&self.refname)
+    }
 }
 
 /// git's four object types, as `%(objecttype)` names them.
@@ -175,6 +248,88 @@ pub struct StatusEntry {
     /// A rename's old path (`R`, shown `old → new`).
     pub old_path: Option<String>,
     pub state: StatusState,
+    /// `path` or `old_path` is not valid UTF-8: it shows with U+FFFD and names no file.
+    pub lossy: bool,
+}
+
+/// 03 §4.1's status read whole: its `# branch.*` headers and its entries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Status {
+    pub branch: BranchStatus,
+    pub entries: Vec<StatusEntry>,
+}
+
+/// The status read's `--branch` headers: the foot's `main ↑2 ↓1 origin/main` (03 §4.2).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BranchStatus {
+    /// `# branch.oid`; `None` for `(initial)` (no commit yet).
+    pub oid: Option<Oid>,
+    /// `# branch.head`, the short name; `None` for `(detached)`.
+    pub head: Option<String>,
+    /// `# branch.upstream` (`origin/main`); `None` without one.
+    pub upstream: Option<String>,
+    /// `# branch.ab`; `None` when git prints none (no upstream, or it is gone).
+    pub ahead_behind: Option<AheadBehind>,
+    /// `head` or `upstream` is not valid UTF-8.
+    pub lossy: bool,
+}
+
+/// `# branch.ab +<ahead> -<behind>`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AheadBehind {
+    pub ahead: u64,
+    pub behind: u64,
+}
+
+/// A commit's summary in the details pane (03 §6.1), from `log -1 -z
+/// --format=%H%x00%P%x00%aN%x00%aE%x00%at%x00%cN%x00%cE%x00%ct%x00%B <c> --`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommitDetails {
+    /// `%H`.
+    pub oid: Oid,
+    /// `%P`, the first parent first.
+    pub parents: Vec<Oid>,
+    /// `%aN`, `%aE` (after `.mailmap`); text that is not UTF-8 has U+FFFD.
+    pub author_name: String,
+    pub author_email: String,
+    /// `%at`, Unix seconds.
+    pub author_time: i64,
+    /// `%cN`, `%cE`.
+    pub committer_name: String,
+    pub committer_email: String,
+    /// `%ct`, Unix seconds.
+    pub commit_time: i64,
+    /// `%B`, whole, as git printed it; text that is not UTF-8 has U+FFFD.
+    pub message: String,
+    /// `%B` is not valid UTF-8: never prefilled into an editor, so reword, squash and amend
+    /// refuse the commit with the reason (03 §3.3).
+    pub message_lossy: bool,
+}
+
+/// One row of the details pane's Files (03 §6.1): `diff -z --find-renames --name-status <old>
+/// <new> --` and the same with `--numstat`, joined.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChangedFile {
+    pub letter: FileLetter,
+    /// The path (a rename's or copy's new one).
+    pub path: String,
+    /// A rename's or copy's old path (`old → new`).
+    pub old_path: Option<String>,
+    /// `+adds -dels` for text; `None` for a binary file (numstat's `-`).
+    pub lines: Option<(u64, u64)>,
+    /// `path` or `old_path` is not valid UTF-8: it shows with U+FFFD and names no file.
+    pub lossy: bool,
+}
+
+/// The change letter of a details file row (03 §6.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileLetter {
+    /// `A`, `M`, `D`, `R`, `T` or `C`.
+    Change(Change),
+    /// `U`: unmerged.
+    Unmerged,
+    /// `?`: a stash's untracked file (its third parent, 03 §6.1).
+    Untracked,
 }
 
 /// Which of 03 §6.1's groups an entry is in, with its change letters.
@@ -205,6 +360,8 @@ pub enum Change {
     Renamed,
     /// `T`.
     TypeChanged,
+    /// `C`: a copy (status with `status.renames=copies`; a diff with copy detection).
+    Copied,
 }
 
 /// What the in-progress probe found (03 §8.5): the operation git has in progress in this work

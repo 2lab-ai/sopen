@@ -18,13 +18,17 @@
 //!
 //! As the file browser's preview (02 §4.2, [`super::Window::set_preview`]) the window shows its
 //! first rows without toolbar, status row or cursor, takes no input and never takes the keyboard.
+//!
+//! A file at a revision (03 §6.3, [`super::Window::set_read_only`]) is shown, moved through and
+//! gone to as any other, but no byte is typed over and no Save, Save copy, Save As or Write in
+//! place starts — each says [`AT_A_REVISION`] — and no journal is kept or looked for.
 
 mod file;
 
 pub use file::{Base, Checking, HexFile, Rebind, Repaint, Saved};
 
 use super::chrome::{self, HEX_KEYS};
-use super::image::CANNOT_REPLACE;
+use super::image::{AT_A_REVISION, CANNOT_REPLACE};
 use super::save_as::{self, SaveAs};
 use super::{Hooks, Outcome, Status};
 use crate::journal::{self, Journal, Keep, Schedule};
@@ -1868,6 +1872,10 @@ pub(super) struct HexWindow {
     /// toolbar, status row, cursor or disclosures, no input of its own, and it never takes the
     /// keyboard.
     preview: bool,
+    /// A file at a revision ([`super::Window::set_read_only`]): a viewer only — nothing is
+    /// edited or saved, no journal is written and none of an earlier session's is looked for
+    /// (that look may reconcile a cut-off Save on the file).
+    at_revision: bool,
     /// Saves started so far (tests: a key starts exactly one).
     #[cfg(test)]
     pub(super) save_starts: usize,
@@ -2033,6 +2041,7 @@ impl HexWindow {
             marked_first: false,
             awaiting: None,
             preview: false,
+            at_revision: false,
             #[cfg(test)]
             save_starts: 0,
         }
@@ -2257,7 +2266,18 @@ impl HexWindow {
         })
     }
 
+    /// No edit of a file at a revision (03 §6.3): the status row says why.
+    fn no_edit_here(&mut self) -> bool {
+        if self.at_revision {
+            self.status = Status::error(format!("cannot edit: {AT_A_REVISION}"));
+        }
+        self.at_revision
+    }
+
     fn undo(&mut self) {
+        if self.no_edit_here() {
+            return;
+        }
         if let Some(cursor) = self.doc.undo() {
             self.cursor = cursor;
             self.follow = true;
@@ -2268,6 +2288,9 @@ impl HexWindow {
     }
 
     fn redo(&mut self) {
+        if self.no_edit_here() {
+            return;
+        }
         if let Some(cursor) = self.doc.redo() {
             self.cursor = cursor;
             self.follow = true;
@@ -2297,6 +2320,9 @@ impl HexWindow {
     fn start(&mut self, ctx: &egui::Context, kind: JobKind) {
         if self.job.is_some() {
             return;
+        }
+        if self.at_revision {
+            return self.status = Status::error(format!("cannot save: {AT_A_REVISION}"));
         }
         if let Some(why) = &self.read_only {
             return self.status = Status::error(why.clone());
@@ -2767,6 +2793,7 @@ impl HexWindow {
     /// preview, and no restored bytes still landing.
     fn wants_generation(&mut self) -> bool {
         !self.preview
+            && !self.at_revision
             && (self.journal_dir.is_some() || self.doc.changed_count() > 0)
             && self.state_patches.is_empty()
     }
@@ -2826,6 +2853,10 @@ impl HexWindow {
     /// The window is going (07 §3): with edits written nowhere, they are written once more and
     /// the journal is kept for the next open; otherwise — or after Discard — it is removed.
     fn settle_journal(&mut self) {
+        // A file at a revision kept nothing; nothing an earlier session left is its to remove.
+        if self.at_revision {
+            return;
+        }
         if let Some(rx) = self.writing.take() {
             let _ = rx.recv();
         }
@@ -2930,7 +2961,9 @@ impl HexWindow {
     /// At the first pass of a viewer (never a preview, which must not hold another session's
     /// journals): what an earlier session left is listed in the background.
     fn start_recovery(&mut self, ctx: &egui::Context) {
-        if self.recovery_started || self.preview {
+        // Nor for a file at a revision: the look may reconcile a cut-off Save on the file — a
+        // write — and nothing of another session is restored there.
+        if self.recovery_started || self.preview || self.at_revision {
             return;
         }
         self.recovery_started = true;
@@ -3039,6 +3072,10 @@ impl HexWindow {
     fn row_action(&mut self, i: usize, action: RowAction) {
         if i >= self.rows.len() {
             return;
+        }
+        // Restore, Load, Discard, Remove and Keep all write: not for a file at a revision.
+        if self.at_revision && action != RowAction::Later {
+            return self.status = Status::error(format!("cannot answer: {AT_A_REVISION}"));
         }
         // A journal whose row still asks about a temp: Restore and Discard wait for the answer
         // (the question is in its record, which both would end).
@@ -3289,6 +3326,9 @@ impl HexWindow {
         if self.save_as.is_some() || self.job.is_some() {
             return;
         }
+        if self.at_revision {
+            return self.status = Status::error(format!("cannot save: {AT_A_REVISION}"));
+        }
         if let Some(why) = &self.read_only {
             return self.status = Status::error(why.clone());
         }
@@ -3335,6 +3375,12 @@ impl HexWindow {
         let Some((modal, close_after, edits)) = self.save_as.as_mut() else {
             return;
         };
+        // Where Save As starts writing is the modal's pass: a file at a revision has none — a
+        // modal not writing yet goes (one already writing finishes).
+        if self.at_revision && !modal.busy() {
+            self.save_as = None;
+            return;
+        }
         let ended = modal.show(ctx);
         let (close_after, edits) = (*close_after, edits.clone());
         match ended {
@@ -3612,6 +3658,9 @@ impl HexWindow {
                 .collect()
         });
         for c in typed {
+            if self.no_edit_here() {
+                break;
+            }
             if self.reloading.is_some() {
                 self.status = Status::info(RELOADING);
                 break;
@@ -3683,9 +3732,17 @@ impl HexWindow {
                 self.redo();
             }
             ui.separator();
+            // A file at a revision has no place to be saved (03 §6.3): all three off, with that
+            // reason on hover before any other.
+            let saves = !self.at_revision;
+            let running = if self.at_revision {
+                AT_A_REVISION
+            } else {
+                "a save is running"
+            };
             let save = ui
                 .add_enabled(
-                    free && !busy && self.doc.dirty() && self.can_replace,
+                    saves && free && !busy && self.doc.dirty() && self.can_replace,
                     egui::Button::new("Save"),
                 )
                 .on_hover_text(if self.stream.is_some() {
@@ -3694,7 +3751,9 @@ impl HexWindow {
                 } else {
                     "⌘/Ctrl+S — overwrites the original after a local backup"
                 })
-                .on_disabled_hover_text(if !self.can_replace {
+                .on_disabled_hover_text(if self.at_revision {
+                    AT_A_REVISION
+                } else if !self.can_replace {
                     CANNOT_REPLACE
                 } else if self.reloading.is_some() {
                     RELOADING
@@ -3707,16 +3766,16 @@ impl HexWindow {
                 self.start(&ctx, JobKind::Save { close_after: false });
             }
             let copy = ui
-                .add_enabled(free && !busy, egui::Button::new("Save copy"))
+                .add_enabled(saves && free && !busy, egui::Button::new("Save copy"))
                 .on_hover_text("⇧⌘/Shift+Ctrl+S — a new <name>.edited file next to the original")
-                .on_disabled_hover_text("a save is running");
+                .on_disabled_hover_text(running);
             if copy.clicked() {
                 self.start(&ctx, JobKind::SaveCopy { close_after: false });
             }
             let as_new = ui
-                .add_enabled(free, egui::Button::new("Save As…"))
+                .add_enabled(saves && free, egui::Button::new("Save As…"))
                 .on_hover_text("⌥⌘/Alt+Ctrl+S, F7 — a new local file with your changes")
-                .on_disabled_hover_text("a save is running");
+                .on_disabled_hover_text(running);
             if as_new.clicked() {
                 self.open_save_as(false);
             }
@@ -4175,6 +4234,10 @@ impl HexWindow {
     /// `Save the changes to host:/abs before closing?` — Save (Save copy where Save is off) ·
     /// Save As… · Discard · Cancel (07 §10).
     fn close_prompt(&mut self, ctx: &egui::Context) {
+        // A file at a revision has nothing to ask about (its Discard removes the journal).
+        if self.at_revision {
+            self.prompt = false;
+        }
         if !self.prompt {
             return;
         }
@@ -4336,6 +4399,11 @@ impl HexWindow {
 
     /// The owner's answer to the live question, on the `Origin`, off the frame.
     fn answer_left(&mut self, ctx: &egui::Context, remove: bool) {
+        // Both answers end the record, a write; Remove it removes a file: not for a file at a
+        // revision (the question stays in its record for the next open).
+        if self.at_revision {
+            return self.status = Status::error(format!("cannot answer: {AT_A_REVISION}"));
+        }
         let Some(left) = self.left.clone() else {
             return;
         };
@@ -4547,7 +4615,9 @@ impl super::Window for HexWindow {
             && self.job.is_none()
             && self.state_patches.is_empty()
             && self.reloading.is_none()
-            && (self.preview || (self.recovery_started && self.recovering.is_none()))
+            && (self.preview
+                || self.at_revision
+                || (self.recovery_started && self.recovering.is_none()))
             && save_as
             && (self.shoot_loading || self.doc.pending_at().is_none())
     }
@@ -4562,6 +4632,36 @@ impl super::Window for HexWindow {
         self.preview = on;
     }
 
+    /// A file at a revision (03 §6.3): a viewer only — no byte is typed over, Save, Save copy
+    /// and Save As are off with [`AT_A_REVISION`] on hover and refused with it, and no journal
+    /// is kept or looked for. Patches of a state or a Restore still to land are dropped.
+    fn set_read_only(&mut self, read_only: bool) {
+        self.at_revision = read_only;
+        if read_only {
+            self.state_patches.clear();
+            // Told late (its opener says so before the first pass): an earlier session's rows
+            // go unanswered — their Restore, Discard and Remove all write — and so do the
+            // close prompt, the questions before a Save (its size, Write in place), the
+            // question about an interrupted save's file and a Save As not writing yet. A save
+            // already writing finishes.
+            self.rows.clear();
+            self.recovering = None;
+            self.prompt = false;
+            self.confirm = None;
+            self.in_place_ask = None;
+            if self.answering.is_none() {
+                self.left = None;
+            }
+            if self
+                .save_as
+                .as_ref()
+                .is_some_and(|(modal, ..)| !modal.busy())
+            {
+                self.save_as = None;
+            }
+        }
+    }
+
     /// Held without being drawn, a streamed window does not poll its file (06 §5).
     fn set_shown(&mut self, shown: bool) {
         if let Some(stream) = &self.stream {
@@ -4571,6 +4671,10 @@ impl super::Window for HexWindow {
 
     fn close_requested(&mut self) -> bool {
         if self.close_ok || self.preview {
+            return true;
+        }
+        // A file at a revision has nothing to ask about: nothing of it can be saved anywhere.
+        if self.at_revision && self.job.is_none() && self.save_as.is_none() {
             return true;
         }
         // Read-only: nothing can be saved; closing asks only while the edits are kept nowhere.

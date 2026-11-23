@@ -1010,3 +1010,227 @@ fn restore_is_checked_again_after_a_save_and_never_replays_on_another_file() {
     assert!(!fx.win.doc.unsaved());
     assert!(fx.status().starts_with("not restored: "), "{}", fx.status());
 }
+
+/// 03 §6.3's reason, word for word (03:578).
+const NO_PLACE: &str = "a file at a revision has no place to be saved";
+
+/// Every file and folder under `dir`, with each file's bytes: what a window that writes
+/// nothing leaves exactly as it was.
+fn files_under(dir: &Path) -> std::collections::BTreeMap<PathBuf, Option<Vec<u8>>> {
+    let mut out = std::collections::BTreeMap::new();
+    let mut walk = vec![dir.to_path_buf()];
+    while let Some(at) = walk.pop() {
+        for entry in std::fs::read_dir(&at).unwrap().flatten() {
+            let path = entry.path();
+            if entry.file_type().unwrap().is_dir() {
+                walk.push(path.clone());
+                out.insert(path, None);
+            } else {
+                let bytes = std::fs::read(&path).unwrap();
+                out.insert(path, Some(bytes));
+            }
+        }
+    }
+    out
+}
+
+/// Hovers the control labelled `label` highest in the window (the toolbar's, not the F-key
+/// row's) until `tip` shows; the pointer is taken away first, so no earlier tip is up.
+fn hover_says(fx: &mut Fx, label: &str, tip: &str) {
+    let away = Pos2::new(500.0, 400.0);
+    fx.drv.move_to(&mut fx.win, away);
+    for _ in 0..90 {
+        if fx.drv.find_text(tip).is_none() {
+            break;
+        }
+        fx.drv.idle(&mut fx.win, 1);
+    }
+    assert!(
+        fx.drv.find_text(tip).is_none(),
+        "{tip:?} up before the hover"
+    );
+    let at = fx
+        .drv
+        .texts()
+        .into_iter()
+        .filter(|(_, _, t)| t == label)
+        .map(|(r, _, _)| r)
+        .min_by(|a, b| a.top().total_cmp(&b.top()))
+        .unwrap_or_else(|| panic!("no {label:?}: {:?}", fx.texts()));
+    fx.drv.move_to(&mut fx.win, at.center());
+    for _ in 0..90 {
+        fx.drv.idle(&mut fx.win, 1);
+        if fx.drv.find_text(tip).is_some() {
+            return;
+        }
+    }
+    panic!("{label:?} never said {tip:?} on hover: {:?}", fx.texts());
+}
+
+/// G-T2 (03:1161) at the image window: told before its first pass that it shows a file at a
+/// revision (`set_read_only(true)`, 03 §6.3), it shows the picture with Save and Save copy off
+/// and 03:578's reason on hover. No key, button or clipboard event edits or saves — Crop,
+/// Pixelize, Cut, Paste (a picture, text), Save, Save copy, Save As (both keys), F5 — and each
+/// save says why. An earlier session's journal of the same file is neither looked for nor
+/// touched; it closes without asking; and gone, it leaves the folder and the cache exactly as
+/// they were — no journal, no backup, no copy beside the file.
+#[test]
+fn a_file_at_a_revision_is_shown_with_every_save_off_and_writes_nothing() {
+    // An earlier session left a journal of the file: an edit kept, then a kill.
+    let mut fx = open();
+    fx.select([0, 0, 70, 50]);
+    fx.key(Key::C, Modifiers::NONE);
+    fx.blur();
+    assert_eq!(fx.journals().len(), 1, "the earlier session's journal");
+    let at_revision = window_on(&fx.path, &fx.cache);
+    drop(std::mem::replace(&mut fx.win, at_revision));
+    let before = files_under(fx.tmp.path());
+    crate::gui::Window::set_read_only(&mut fx.win, true);
+    fx.drv = Driver::new(1000.0, 700.0);
+    fx.drv.idle(&mut fx.win, 3);
+    fx.drv.until(&mut fx.win, 10, |w| w.quiet());
+    fx.drv.idle(&mut fx.win, 2);
+    assert!(
+        fx.win.painted && fx.win.tex.is_some(),
+        "the picture is shown"
+    );
+    assert_eq!(fx.win.doc.size(), (W, H));
+    assert!(
+        fx.win.rows.is_empty() && fx.drv.find_text("Restore").is_none(),
+        "no earlier session's journal is offered: {:?}",
+        fx.texts()
+    );
+    assert!(
+        fx.said(&format!("read-only: {NO_PLACE}")).is_some(),
+        "said whole in the rows: {:?}",
+        fx.texts()
+    );
+    hover_says(&mut fx, "Save", NO_PLACE);
+    hover_says(&mut fx, "Save copy", NO_PLACE);
+    // No edit.
+    fx.select([0, 0, 70, 50]);
+    fx.key(Key::C, Modifiers::NONE);
+    fx.key(Key::P, Modifiers::NONE);
+    fx.drv.cut(&mut fx.win);
+    fx.drv.paste_text(&mut fx.win, "ok");
+    fx.drv.paste_image(&mut fx.win, clipboard_picture());
+    fx.drv.click_text(&mut fx.win, "Crop  C");
+    assert_eq!(fx.win.doc.rev(), 0, "nothing edited");
+    assert_eq!(fx.win.doc.size(), (W, H));
+    // No save, whichever key or button; each key says why.
+    for (key, mods) in [
+        (Key::S, command(false)),
+        (Key::S, command(true)),
+        (Key::S, alt_command()),
+        (Key::F5, Modifiers::NONE),
+        (Key::F7, Modifiers::NONE),
+    ] {
+        fx.win.status = Status::default();
+        fx.key(key, mods);
+        assert!(
+            !fx.win.saving_or_queued() && fx.win.saving_as.is_none(),
+            "{key:?} {mods:?} started a save"
+        );
+        assert!(
+            fx.status().ends_with(NO_PLACE),
+            "{key:?} {mods:?}: {}",
+            fx.status()
+        );
+    }
+    fx.drv.click_text(&mut fx.win, "Save copy");
+    assert!(!fx.win.saving_or_queued() && fx.win.saving_as.is_none());
+    fx.drv.idle(&mut fx.win, 30);
+    assert!(fx.journals().len() == 1 && fx.win.keeper.dir().is_none());
+    assert!(
+        crate::gui::Window::close_requested(&mut fx.win),
+        "nothing to ask"
+    );
+    let Fx { tmp, win, .. } = fx;
+    drop(win);
+    assert_eq!(
+        files_under(tmp.path()),
+        before,
+        "nothing written, nothing removed"
+    );
+}
+
+/// The flag reaches the image window through the loading window the file browser hosts for a
+/// local image whose decode is asked about first (`embed_asking`, `Streaming`): told before its
+/// first pass, the image window it becomes has [`AT_A_REVISION`] as its read-only reason, looks
+/// for no journal, and refuses Save with it; nothing is written.
+#[test]
+fn a_file_at_a_revision_stays_read_only_through_the_loading_window() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("big.png");
+    let bytes = bytes_of(ImageFormat::Png);
+    std::fs::write(&path, &bytes).unwrap();
+    let abs = path.to_str().unwrap().to_string();
+    let mut fs = LocalFs::new();
+    let at = fs.stat(&abs).unwrap();
+    let origin = Origin::new(Box::new(fs), None, None, abs, at);
+    let cache = tmp.path().join("cache");
+    let hooks = Hooks::default();
+    let input = Input::Bytes(bytes);
+    let mut win = Streaming::new(input, origin, &cache, &hooks, Vec::new(), probe::BUDGET).unwrap();
+    let before = files_under(tmp.path());
+    crate::gui::Window::set_read_only(&mut win, true);
+    let mut drv = Driver::new(1000.0, 700.0);
+    drv.until(&mut win, 20, |w| {
+        w.image.as_ref().is_some_and(|i| i.painted)
+    });
+    let image = win.image.as_ref().unwrap();
+    assert_eq!(image.doc.read_only.as_deref(), Some(NO_PLACE));
+    assert!(image.at_revision.is_some() && !image.listed && image.recovering.is_none());
+    drv.key(&mut win, Key::S, command(false));
+    let image = win.image.as_ref().unwrap();
+    assert!(!image.saving_or_queued(), "Save started");
+    assert_eq!(image.status.text, format!("cannot save: {NO_PLACE}"));
+    assert!(crate::gui::Window::close_requested(&mut win));
+    drop(win);
+    assert_eq!(files_under(tmp.path()), before, "nothing written");
+}
+
+/// Told late (`set_read_only(true)` after the first pass, review round 1): with an edit kept in
+/// the journal and the Save As modal open, its path typed, the flag closes the modal — its
+/// Enter writes nothing — and after it no key, focus loss or close writes anything: no Save As
+/// file, no journal generation, no save, backup or copy. It closes without asking.
+#[test]
+fn told_late_with_save_as_open_nothing_is_written_after_the_flag() {
+    let mut fx = open();
+    fx.select([0, 0, 70, 50]);
+    fx.key(Key::C, Modifiers::NONE);
+    fx.key(Key::F7, Modifiers::NONE);
+    fx.until_shown("Save shot.png with your edits to a new local file");
+    let dest = fx.tmp.path().join("late.png");
+    fx.key(Key::A, command(false));
+    let text = vec![Event::Text(dest.to_str().unwrap().to_string())];
+    fx.drv.frame(&mut fx.win, text, Modifiers::NONE);
+    fx.until_idle();
+    assert!(fx.win.saving_as.is_some() && fx.journals().len() == 1);
+    let before = files_under(fx.tmp.path());
+    crate::gui::Window::set_read_only(&mut fx.win, true);
+    fx.key(Key::Enter, Modifiers::NONE);
+    fx.drv.until(&mut fx.win, 10, |w| w.saving_as.is_none());
+    fx.select([0, 0, 10, 10]);
+    fx.key(Key::P, Modifiers::NONE);
+    fx.key(Key::S, command(false));
+    fx.key(Key::F7, Modifiers::NONE);
+    fx.drv.frame(
+        &mut fx.win,
+        vec![Event::WindowFocused(false)],
+        Modifiers::NONE,
+    );
+    for _ in 0..30 {
+        fx.drv.idle(&mut fx.win, 1);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(!dest.exists(), "the open Save As wrote after the flag");
+    assert!(!fx.win.saving_or_queued() && fx.win.saving_as.is_none());
+    assert!(
+        crate::gui::Window::close_requested(&mut fx.win),
+        "nothing to ask"
+    );
+    let Fx { tmp, win, .. } = fx;
+    drop(win);
+    assert_eq!(files_under(tmp.path()), before, "written after the flag");
+}
