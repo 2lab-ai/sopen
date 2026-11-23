@@ -298,7 +298,7 @@ pub trait Trash: Sync {
 /// `rel` is an entry's path below the folder (`sub/name`).
 pub trait TreeWatch {
     /// Esc. Asked after every look at an entry and right before every request that removes
-    /// one: once it says so, no removal starts.
+    /// one (over SFTP, before every request): once it says so, no removal starts.
     fn stopped(&mut self) -> bool;
     /// The entry `rel` is next.
     fn at(&mut self, rel: &str);
@@ -342,13 +342,37 @@ pub(crate) fn fire_tree_looked(path: &str) {
     fire_seam(&TREE_LOOKED, path);
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Right after each request of a permanent delete by paths (SFTP's walk): `"<request>
+    /// <path>"`, the request one of `realpath`, `lstat`, `list`, `remove` and `rmdir`.
+    static TREE_ASKED: std::cell::RefCell<Option<SeamHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Test seam on this thread: `hook` runs right after each request of a permanent delete by
+/// paths, with `"<request> <path>"` — the walk's request log, and the place to press Esc in the
+/// middle of a request.
+#[cfg(test)]
+pub(crate) fn seam_tree_asked(hook: impl FnMut(&str) + 'static) -> SeamGuard {
+    set_seam(&TREE_ASKED, hook)
+}
+
+/// A request of the walk by paths has been answered.
+fn asked(_request: &str, _path: &str) {
+    #[cfg(test)]
+    fire_seam(&TREE_ASKED, &format!("{_request} {_path}"));
+}
+
 /// Does `path` still resolve to `canon` (`realpath`)? Why not, if not.
 fn resolves<F: FileOps + ?Sized>(
     fs: &mut F,
     path: &str,
     canon: &str,
 ) -> std::result::Result<(), String> {
-    match fs.realpath(path) {
+    let now = fs.realpath(path);
+    asked("realpath", path);
+    match now {
         Ok(now) if now == canon => Ok(()),
         Ok(now) => Err(format!(
             "it is not where it was listed any more (it now resolves to {now}), so nothing is \
@@ -360,10 +384,12 @@ fn resolves<F: FileOps + ?Sized>(
 
 /// [`FileOps::remove_tree`] by paths, as SFTP must (it has no request relative to a folder):
 /// bottom-up, each entry looked at (`lstat`) right before it is acted on — a link removed as a
-/// link, never entered — and each request made only while the folder it goes through still
-/// resolves (`realpath`) where the walk listed it, so a folder swapped for a link meanwhile is
-/// neither entered nor removed through. The window left is one request wide: between the last
-/// check and the request, the server resolves the path again.
+/// link, never entered — and each request that goes through a folder (its listing, a `REMOVE`
+/// in it, its `RMDIR`) made only while that folder still resolves (`realpath`) where it was
+/// listed, the selected folder's own first listing too: a folder swapped for a link meanwhile
+/// is neither listed, nor entered, nor removed through. Esc is looked at before every request,
+/// whatever it is: once it is set, no request starts. The window left is one request wide:
+/// between the last check and the request, the server resolves the path again.
 fn remove_tree_by_path<F: FileOps + ?Sized>(
     fs: &mut F,
     dir: &str,
@@ -371,7 +397,18 @@ fn remove_tree_by_path<F: FileOps + ?Sized>(
     rel: &str,
     watch: &mut dyn TreeWatch,
 ) -> TreeEnd {
-    let entries = match fs.list_entries(dir) {
+    if watch.stopped() {
+        return TreeEnd::Stopped;
+    }
+    if let Err(why) = resolves(fs, dir, canon) {
+        return TreeEnd::Kept(why);
+    }
+    if watch.stopped() {
+        return TreeEnd::Stopped;
+    }
+    let entries = fs.list_entries(dir);
+    asked("list", dir);
+    let entries = match entries {
         Ok(entries) => entries,
         Err(e) => return TreeEnd::Kept(format!("{e:#}")),
     };
@@ -392,6 +429,7 @@ fn remove_tree_by_path<F: FileOps + ?Sized>(
         }
         let child = super::join(dir, &entry.name);
         let own = fs.lstat_opt(&child);
+        asked("lstat", &child);
         #[cfg(test)]
         fire_tree_looked(&child);
         if watch.stopped() {
@@ -407,14 +445,10 @@ fn remove_tree_by_path<F: FileOps + ?Sized>(
                 continue;
             }
         };
-        let child_canon = super::join(canon, &entry.name);
         if own.is_dir && !own.is_symlink {
-            // Entered only while it still resolves where it was listed.
-            let end = match resolves(fs, &child, &child_canon) {
-                Ok(()) => remove_tree_by_path(fs, &child, &child_canon, &child_rel, watch),
-                Err(why) => TreeEnd::Kept(why),
-            };
-            match end {
+            // Entered (listed) only while it still resolves where it was listed.
+            let child_canon = super::join(canon, &entry.name);
+            match remove_tree_by_path(fs, &child, &child_canon, &child_rel, watch) {
                 TreeEnd::Removed => watch.removed(&child_rel),
                 TreeEnd::Stopped => return TreeEnd::Stopped,
                 TreeEnd::Kept(why) => {
@@ -434,7 +468,9 @@ fn remove_tree_by_path<F: FileOps + ?Sized>(
         if watch.stopped() {
             return TreeEnd::Stopped;
         }
-        match fs.remove(&child) {
+        let removed = fs.remove(&child);
+        asked("remove", &child);
+        match removed {
             Ok(()) => watch.removed(&child_rel),
             Err(e) => {
                 watch.kept(&child_rel, format!("{e:#}"));
@@ -445,13 +481,18 @@ fn remove_tree_by_path<F: FileOps + ?Sized>(
     if stays > 0 {
         return TreeEnd::Kept(format!("{stays} of the entries in it stay"));
     }
+    if watch.stopped() {
+        return TreeEnd::Stopped;
+    }
     if let Err(why) = resolves(fs, dir, canon) {
         return TreeEnd::Kept(why);
     }
     if watch.stopped() {
         return TreeEnd::Stopped;
     }
-    match fs.remove_dir(dir) {
+    let removed = fs.remove_dir(dir);
+    asked("rmdir", dir);
+    match removed {
         Ok(()) => TreeEnd::Removed,
         Err(e) => TreeEnd::Kept(format!("{e:#}")),
     }
@@ -553,27 +594,40 @@ pub trait FileOps: RemoteFs {
 
     /// Shift+F8, and F8 on a remote (04 §5.5): the folder `path` and everything in it removed
     /// permanently, bottom-up — files, links (as links, never their targets) and special files
-    /// by name, each folder once empty — never going through anything that is not the folder it
-    /// listed: a folder swapped for a link, or for another folder, meanwhile is left, and so is
-    /// what holds it. What stays is told to `watch`, entry by entry; Esc (`watch.stopped`)
-    /// starts no removal once it is set.
+    /// by name, each folder once empty. Nothing is removed through a folder swapped for a link
+    /// meanwhile: it is left, and so is what holds it. A folder swapped for another real folder
+    /// under the same name is told apart on this machine (its device and inode) and left too;
+    /// over SFTP it resolves the same and is not told apart — its entries, at the selected path,
+    /// are removed. What stays is told to `watch`, entry by entry; once Esc (`watch.stopped`) is
+    /// set, no removal starts (and over SFTP no request at all).
     ///
     /// By paths here, as SFTP must: the selected folder's canonical path (`realpath`) is taken
-    /// before it is looked at (`lstat`: a folder, not a link); then each request is made only
-    /// while the folder it goes through still resolves there (or below it, by the names
-    /// listed), the entry looked at right before. Left: one round trip, between a check's reply
-    /// and the request, where the server resolves the path again; and a server whose `realpath`
-    /// does not resolve links has no check at all (measured on OpenSSH's only). This machine
-    /// walks open folder descriptors instead (`local/ops.rs`), so nothing is resolved again from
-    /// the top.
+    /// before it is looked at (`lstat`: a folder, not a link); then each listing, `REMOVE` and
+    /// `RMDIR` is made only while the folder it goes through still resolves there (or below it,
+    /// by the names listed), the entry looked at right before. Left: one round trip, between a
+    /// check's reply and the request, where the server resolves the path again; and a server
+    /// whose `realpath` does not resolve links has no check at all (measured on OpenSSH's only).
+    /// This machine walks open folder descriptors instead (`local/ops.rs`), so nothing is
+    /// resolved again from the top.
     fn remove_tree(&mut self, path: &str, watch: &mut dyn TreeWatch) -> TreeEnd {
         // Where the folder resolves is taken first, and only then is it looked at: a folder
         // swapped for a link before the look is refused by the look; one swapped after it no
-        // longer resolves to `canon`, and nothing is removed through it.
+        // longer resolves to `canon`, and nothing is listed or removed through it.
+        if watch.stopped() {
+            return TreeEnd::Stopped;
+        }
         let canon = self.realpath(path);
+        asked("realpath", path);
+        if watch.stopped() {
+            return TreeEnd::Stopped;
+        }
         let own = self.lstat_opt(path);
+        asked("lstat", path);
         #[cfg(test)]
         fire_tree_looked(path);
+        if watch.stopped() {
+            return TreeEnd::Stopped;
+        }
         match own {
             Ok(Some(own)) if own.is_dir && !own.is_symlink => {}
             Ok(Some(_)) => {

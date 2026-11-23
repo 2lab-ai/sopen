@@ -299,8 +299,10 @@ contexts where it acts (list, viewer, git panel, tree, a dialog) and its `Comman
   before anything is removed. The Linux Trash is written only through its own folders, each opened
   from the one above with `O_NOFOLLOW` and checked as this account's, made private (0700) if group
   or others could enter it; the `.trashinfo` is created and the item moved relative to those held
-  folders, never replacing (`renameat2` with `RENAME_NOREPLACE`, else `linkat` + `unlinkat` for a
-  non-folder). A top folder that its group or others can write without the sticky bit has no Trash
+  folders, never replacing (`renameat2` with `RENAME_NOREPLACE`; where the filesystem has no
+  exclusive rename, the freedesktop spec's own way — the exclusive `.trashinfo` reserves the name,
+  the name is checked free in the held `files` folder, then a plain `renameat`, which moves whatever
+  is at the source and deletes nothing). A top folder that its group or others can write without the sticky bit has no Trash
   (another account could swap `.Trash-$uid`): the dialog says `permanent` and asks. A name longer
   than 200 bytes gets a shorter name inside the Trash; `Path=` keeps the whole name.
 - **Shift+F8 / Shift+Del** delete locally without the Trash; the dialog says `permanent` in the
@@ -311,7 +313,11 @@ contexts where it acts (list, viewer, git panel, tree, a dialog) and its `Comman
   `rm` and `fts` do — each folder opened from its parent with `O_DIRECTORY|O_NOFOLLOW` and only
   while its device and inode are those just looked at, each entry looked at and removed relative
   to it (`fstatat`, `unlinkat`). A folder swapped for a link, or for another folder, mid-delete is
-  left, named, with whatever is in it.
+  left, named, with whatever is in it. **The accepted local residual:** a folder is removed by name
+  (`unlinkat(…, AT_REMOVEDIR)`; POSIX has no removal by descriptor, and `rm` has the same window), so
+  a folder swapped in between its last check and that call is removed instead — and only if it is
+  empty, since `rmdir` never removes a folder with anything in it. The most it can cost is an empty
+  folder.
 - **Remotely, the accepted residual.** SFTP has no request relative to a folder: every `REMOVE`,
   `RMDIR` and listing names a path the server resolves again when it handles it. sopen takes the
   selected folder's canonical path (`REALPATH`) before it looks at it, and right before each

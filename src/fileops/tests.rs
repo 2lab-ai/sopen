@@ -5259,6 +5259,11 @@ fn k_c4_without_hardlink_publishes_through_the_probed_plain_rename() {
     let probe = ".sopen-probe-";
     assert_eq!(log_lines(&main, &["mkdir name", probe]), 1, "{main}");
     assert_eq!(
+        log_lines(&main, &["mkdir name", probe, "mode 0700"]),
+        1,
+        "the probe's folder is made 0700: {main}"
+    );
+    assert_eq!(
         log_lines(&main, &["open", probe, "CREATE,EXCL"]),
         2,
         "{main}"
@@ -5594,4 +5599,137 @@ fn the_selected_folder_swapped_for_a_link_mid_delete_is_never_gone_through() {
             "{how}: {r:?}"
         );
     });
+}
+
+// ---- S6-A review round 2: no request after Esc over SFTP; the first listing re-checked ----
+
+/// The SFTP walk's requests (`"<request> <path>"`), and Esc pressed inside the first one that
+/// `press` picks; what came after it is what the test reads.
+fn remote_delete_with_esc(
+    src: &Path,
+    press: impl Fn(&str, &[String]) -> bool + 'static,
+) -> Option<(Report, Vec<String>, usize)> {
+    let mut fs = SftpRemote::local_server()?;
+    let mut ctl = Script::default();
+    let esc = ctl.cancel.clone();
+    let log = Arc::new(Mutex::new(Vec::<String>::new()));
+    let pressed_at = Arc::new(AtomicUsize::new(usize::MAX));
+    let (seen, at) = (log.clone(), pressed_at.clone());
+    let _seam = crate::remote::ops::seam_tree_asked(move |request| {
+        let mut seen = seen.lock().unwrap();
+        seen.push(request.to_string());
+        if at.load(Ordering::Relaxed) == usize::MAX && press(request, &seen) {
+            at.store(seen.len(), Ordering::Relaxed);
+            esc.store(true, Ordering::Relaxed);
+        }
+    });
+    let r = run(
+        &here(Op::Delete { trash: false }, src, &["d"]),
+        Hosts::Same(&mut fs),
+        &mut ctl,
+    );
+    let log = log.lock().unwrap().clone();
+    let at = pressed_at.load(Ordering::Relaxed);
+    assert_ne!(at, usize::MAX, "Esc was never pressed: {log:?}");
+    Some((r, log, at))
+}
+
+/// Esc pressed inside a `REALPATH` of the SFTP walk — the selected folder's first one, and the
+/// one right before a `REMOVE` — starts no request after it: no listing, no `REMOVE`.
+#[test]
+fn esc_inside_a_remote_realpath_starts_no_request() {
+    let (_t, src, _dst) = scratch();
+    let d = src.join("d");
+    std::fs::create_dir(&d).unwrap();
+    std::fs::write(d.join("x"), "x").unwrap();
+    let first = format!("realpath {}", s(&d));
+    let Some((r, log, at)) = remote_delete_with_esc(&src, move |req, _| req == first) else {
+        return;
+    };
+    assert_eq!(at, 1, "{log:?}");
+    assert_eq!(
+        log[at..],
+        [] as [String; 0],
+        "no request after Esc: {log:?}"
+    );
+    assert!(stop_reason(&r.items[0]).contains("nothing"), "{r:?}");
+    let (look_x, before) = (
+        format!("lstat {}", s(&d.join("x"))),
+        format!("realpath {}", s(&d)),
+    );
+    let Some((r, log, at)) = remote_delete_with_esc(&src, move |req, seen| {
+        req == before && seen.len() >= 2 && seen[seen.len() - 2] == look_x
+    }) else {
+        return;
+    };
+    assert_eq!(
+        log[at..],
+        [] as [String; 0],
+        "no request after Esc: {log:?}"
+    );
+    assert!(!log.iter().any(|l| l.starts_with("remove ")), "{log:?}");
+    assert!(stop_reason(&r.items[0]).contains("nothing"), "{r:?}");
+    assert_eq!(std::fs::read(d.join("x")).unwrap(), b"x");
+}
+
+/// Esc pressed inside an empty folder's listing starts no request after it: neither the
+/// `REALPATH` nor the `RMDIR` that would come next.
+#[test]
+fn esc_inside_an_empty_remote_listing_starts_no_request() {
+    let (_t, src, _dst) = scratch();
+    let d = src.join("d");
+    std::fs::create_dir(&d).unwrap();
+    let list = format!("list {}", s(&d));
+    let Some((r, log, at)) = remote_delete_with_esc(&src, move |req, _| req == list) else {
+        return;
+    };
+    assert_eq!(
+        log[at..],
+        [] as [String; 0],
+        "no request after Esc: {log:?}"
+    );
+    assert!(stop_reason(&r.items[0]).contains("nothing"), "{r:?}");
+    assert!(d.is_dir());
+}
+
+/// Over SFTP, the selected folder swapped for a link to a folder outside the selection right
+/// after its `LSTAT`: its first listing is never sent — the folder no longer resolves to the
+/// canonical path taken before the look — nothing is removed, and the folder is named.
+#[test]
+fn the_selected_remote_folder_swapped_after_its_look_is_never_listed() {
+    let Some(mut fs) = SftpRemote::local_server() else {
+        return;
+    };
+    let (_t, src, dst) = scratch();
+    let (d, keep) = swap_fixture(&src, &dst);
+    let (top, away, target) = (s(&d), src.join("moved-away"), keep.clone());
+    let _swap = crate::remote::ops::seam_tree_looked(move |p| {
+        if p == top && !Path::new(&top).is_symlink() {
+            std::fs::rename(&top, &away).unwrap();
+            std::os::unix::fs::symlink(&target, &top).unwrap();
+        }
+    });
+    let log = Arc::new(Mutex::new(Vec::<String>::new()));
+    let seen = log.clone();
+    let _log =
+        crate::remote::ops::seam_tree_asked(move |req| seen.lock().unwrap().push(req.into()));
+    let r = run(
+        &here(Op::Delete { trash: false }, &src, &["d"]),
+        Hosts::Same(&mut fs),
+        &mut Script::default(),
+    );
+    let log = log.lock().unwrap().clone();
+    assert!(!log.iter().any(|l| l.starts_with("list ")), "{log:?}");
+    assert!(
+        !log.iter()
+            .any(|l| l.starts_with("remove ") || l.starts_with("rmdir ")),
+        "{log:?}"
+    );
+    assert_eq!(names(&keep), ["sentinel"]);
+    assert_eq!(r.items.len(), 1, "{r:?}");
+    assert!(
+        matches!(&r.items[0], Item { name, outcome: ItemOutcome::Failed(why) }
+            if name == "d" && why.contains("not where it was listed")),
+        "{r:?}"
+    );
 }

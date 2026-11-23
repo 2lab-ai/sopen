@@ -395,8 +395,24 @@ impl SftpRemote {
         dir: &str,
     ) -> (std::result::Result<Verdict, String>, Vec<String>) {
         let folder = join(dir, &format!(".sopen-probe-{}", random_hex()));
+        // `MKDIR` with the attributes 0700: only this account can put anything in it, so the
+        // cleanup's check of each file by its type and size is enough. A server that made it
+        // writable by others (one that ignores the attributes) gets no probe.
         if let Err(e) = crate::remote::ops::FileOps::make_dir(self, &folder) {
             return (Err(format!("{e:#}")), Vec::new());
+        }
+        match self.lstat_opt(&folder) {
+            Ok(Some(st)) if st.is_dir && !st.is_symlink && st.mode & 0o022 == 0 => {}
+            looked => {
+                let why = match looked {
+                    Err(e) => format!("{e:#}"),
+                    Ok(_) => format!(
+                        "its folder {folder} was not made private (0700), so other accounts \
+                         could put files in it"
+                    ),
+                };
+                return (Err(why), self.probe_cleanup(&folder, &[]));
+            }
         }
         let tag = random_hex();
         let files = [

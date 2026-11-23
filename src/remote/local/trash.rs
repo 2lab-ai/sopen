@@ -61,10 +61,10 @@ const MAX_SUFFIX: u32 = 10_000;
 /// The Trash's folders are checked through descriptors held open — each opened without
 /// following a link, this account's own, nobody else's way in (`fchmod` 0700 where group or
 /// others had any) — and the info file and the move go **relative to those descriptors**
-/// (`openat`, `renameat2` / `renameatx_np`, else `linkat` + `unlinkat`): a folder swapped for a
-/// link or another folder after the check is never written into. A top folder that others can
-/// write without the sticky bit is no place for a Trash: there is none there (the delete dialog
-/// then says permanent and asks, 04 §5.5).
+/// (`openat`, `renameat2` / `renameatx_np`, else a plain `renameat` once the name is free): a
+/// folder swapped for a link or another folder after the check is never written into. A top
+/// folder its group or others can write without the sticky bit is no place for a Trash: there
+/// is none there (the delete dialog then says permanent and asks, 04 §5.5).
 #[cfg_attr(target_os = "macos", allow(dead_code))] // macOS has its own
 pub(crate) struct Freedesktop {
     /// `$XDG_DATA_HOME/Trash` (`~/.local/share/Trash` by default).
@@ -87,6 +87,20 @@ struct Held {
     trash: PathBuf,
     files: std::fs::File,
     info: std::fs::File,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The filesystem says it has no exclusive rename (as some network and FUSE ones do).
+    static NO_EXCLUSIVE_RENAME: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Test seam on this thread: until the guard drops, the exclusive rename into the Trash is
+/// answered "not supported", so the move takes its fallback.
+#[cfg(test)]
+fn seam_no_exclusive_rename() -> crate::remote::ops::SeamGuard {
+    NO_EXCLUSIVE_RENAME.with(|c| c.set(true));
+    crate::remote::ops::SeamGuard::new(|| NO_EXCLUSIVE_RENAME.with(|c| c.set(false)))
 }
 
 #[cfg(test)]
@@ -399,18 +413,14 @@ fn create_at(dir: &std::fs::File, name: &CStr) -> std::io::Result<std::fs::File>
     Ok(unsafe { std::fs::File::from_raw_fd(fd) })
 }
 
-/// The entry `from` of the open folder `from_dir` moved to `to` in the open folder `to_dir`,
-/// never over anything there: the exclusive rename; where the filesystem has none, a hard link
-/// (fails on an existing name) and then the old name's removal — not for a folder, which then
-/// stays where it is.
+/// The exclusive rename of `from` in the open folder `f` to `to` in the open folder `t`:
+/// `renameat2(RENAME_NOREPLACE)` on Linux, `renameatx_np(RENAME_EXCL)` on macOS.
 #[cfg_attr(target_os = "macos", allow(dead_code))]
-fn move_excl(
-    from_dir: &std::fs::File,
-    from: &CStr,
-    to_dir: &std::fs::File,
-    to: &CStr,
-) -> std::io::Result<()> {
-    let (f, t) = (from_dir.as_raw_fd(), to_dir.as_raw_fd());
+fn rename_excl_at(f: libc::c_int, from: &CStr, t: libc::c_int, to: &CStr) -> std::io::Result<()> {
+    #[cfg(test)]
+    if NO_EXCLUSIVE_RENAME.with(|c| c.get()) {
+        return Err(std::io::Error::from_raw_os_error(libc::ENOTSUP));
+    }
     #[cfg(target_os = "macos")]
     // SAFETY: open descriptors and NUL-terminated names.
     let r = unsafe { libc::renameatx_np(f, from.as_ptr(), t, to.as_ptr(), libc::RENAME_EXCL) };
@@ -419,16 +429,34 @@ fn move_excl(
     let r = unsafe { libc::renameat2(f, from.as_ptr(), t, to.as_ptr(), libc::RENAME_NOREPLACE) };
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     let r = {
-        let _ = (f, t);
-        -2
+        let _ = (f, from, t, to);
+        return Err(std::io::Error::from_raw_os_error(libc::ENOTSUP));
     };
     if r == 0 {
-        return Ok(());
-    }
-    let e = if r == -2 {
-        std::io::Error::from_raw_os_error(libc::ENOTSUP)
+        Ok(())
     } else {
-        std::io::Error::last_os_error()
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+/// The entry `from` of the open folder `from_dir` moved to `to` in the open folder `to_dir` —
+/// the Trash's held `files`, which only this account can write (0700), `to` reserved by the
+/// `.trashinfo` made exclusively — never over anything there: the exclusive rename; where the
+/// filesystem has none, a plain `renameat` once `to` is free (the freedesktop specification's
+/// own way). A rename moves whatever is at `from` at that instant and removes nothing. Left on
+/// that fallback: another process of this same account making `to` between the look and the
+/// rename.
+#[cfg_attr(target_os = "macos", allow(dead_code))]
+fn move_excl(
+    from_dir: &std::fs::File,
+    from: &CStr,
+    to_dir: &std::fs::File,
+    to: &CStr,
+) -> std::io::Result<()> {
+    let (f, t) = (from_dir.as_raw_fd(), to_dir.as_raw_fd());
+    let e = match rename_excl_at(f, from, t, to) {
+        Ok(()) => return Ok(()),
+        Err(e) => e,
     };
     let unsupported = matches!(
         e.raw_os_error(),
@@ -437,29 +465,19 @@ fn move_excl(
     if !unsupported {
         return Err(e);
     }
-    // SAFETY: an all-zero stat is a valid value to be overwritten; an open descriptor, a
-    // NUL-terminated name and a valid place for the result.
+    // SAFETY: an all-zero stat is a valid value to be overwritten.
     let mut st: libc::stat = unsafe { std::mem::zeroed() };
-    // SAFETY: as above.
-    if unsafe { libc::fstatat(f, from.as_ptr(), &mut st, libc::AT_SYMLINK_NOFOLLOW) } != 0 {
+    // SAFETY: an open descriptor, a NUL-terminated name and a valid place for the result.
+    if unsafe { libc::fstatat(t, to.as_ptr(), &mut st, libc::AT_SYMLINK_NOFOLLOW) } == 0 {
+        return Err(std::io::Error::from_raw_os_error(libc::EEXIST));
+    }
+    let looked = std::io::Error::last_os_error();
+    if looked.kind() != std::io::ErrorKind::NotFound {
+        return Err(looked);
+    }
+    // SAFETY: open descriptors and NUL-terminated names.
+    if unsafe { libc::renameat(f, from.as_ptr(), t, to.as_ptr()) } != 0 {
         return Err(std::io::Error::last_os_error());
-    }
-    if st.st_mode & libc::S_IFMT == libc::S_IFDIR {
-        return Err(std::io::Error::other(
-            "this filesystem cannot move a folder without the risk of replacing a name",
-        ));
-    }
-    // SAFETY: open descriptors and NUL-terminated names; flags 0 links a link itself.
-    if unsafe { libc::linkat(f, from.as_ptr(), t, to.as_ptr(), 0) } != 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    // SAFETY: an open descriptor and a NUL-terminated name.
-    if unsafe { libc::unlinkat(f, from.as_ptr(), 0) } != 0 {
-        let e = std::io::Error::last_os_error();
-        // Both names are one entry: the one just made in the Trash goes again.
-        // SAFETY: as above.
-        unsafe { libc::unlinkat(t, to.as_ptr(), 0) };
-        return Err(e);
     }
     Ok(())
 }
@@ -1013,6 +1031,39 @@ mod tests {
             assert!(info_of(&moved, "f").starts_with("[Trash Info]\n"));
             assert!(!items.join("f").exists());
         }
+    }
+
+    /// A filesystem without the exclusive rename: the move falls back to a plain `renameat`
+    /// into the held `files` folder, once the name there is free (the `.trashinfo` made
+    /// exclusively reserves it). A file and a folder both go — nothing at their source,
+    /// nothing removed — and a `files/` entry without its info is never written over: the
+    /// entry takes the next free name.
+    #[test]
+    fn without_the_exclusive_rename_the_trash_renames_into_a_free_name() {
+        let (_t, data, items) = bins();
+        // SAFETY: geteuid has no preconditions.
+        let uid = unsafe { libc::geteuid() };
+        let fd = Freedesktop {
+            home: data.join("Trash"),
+            uid,
+            topdir: Box::new(|_| panic!("the home Trash's filesystem")),
+        };
+        let trash = data.join("Trash");
+        std::fs::create_dir_all(trash.join("files")).unwrap();
+        std::fs::write(trash.join("files/f"), "an orphan").unwrap();
+        std::fs::write(items.join("f"), "f").unwrap();
+        std::fs::create_dir(items.join("d")).unwrap();
+        std::fs::write(items.join("d/x"), "x").unwrap();
+        let _no_excl = seam_no_exclusive_rename();
+        let f = fd.put(&items.join("f")).unwrap();
+        let d = fd.put(&items.join("d")).unwrap();
+        assert_eq!(f, trash.join("files/f-1"));
+        assert_eq!(std::fs::read(&f).unwrap(), b"f");
+        assert_eq!(std::fs::read(trash.join("files/f")).unwrap(), b"an orphan");
+        assert_eq!(std::fs::read(d.join("x")).unwrap(), b"x");
+        assert!(info_of(&trash, "f-1").starts_with("[Trash Info]\n"));
+        assert!(!trash.join("info/f.trashinfo").exists());
+        assert_eq!(std::fs::read_dir(&items).unwrap().count(), 0);
     }
 
     /// A top folder that other accounts can write, without the sticky bit, has no Trash: `put`
