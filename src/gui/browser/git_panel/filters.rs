@@ -94,25 +94,29 @@ impl Filters {
         }
     }
 
-    /// Whether `r`'s label is drawn — and so whether it is one of the log's revisions. A remote's
-    /// `HEAD` never is (03 §4.4). With a branch filter only the chosen branches are (03:298–299,
-    /// "the chosen refs' ids only"), so no tag either.
-    pub fn shows(&self, r: &RefLabel) -> bool {
+    /// Whether `r`'s label is drawn — and so whether it is one of the log's revisions; `remotes`
+    /// are the repository's ([`split_remote`]). A remote's own `HEAD` never is (03 §4.4); a branch
+    /// whose name ends in `/HEAD` is a branch. With a branch filter only the chosen branches are
+    /// (03:298–299, "the chosen refs' ids only"), so no tag either.
+    pub fn shows(&self, r: &RefLabel, remotes: &[String]) -> bool {
         let chosen = |r: &RefLabel| self.chosen().is_none_or(|c| c.contains(&r.refname));
         match r.kind {
             RefKind::LocalBranch => chosen(r),
-            RefKind::RemoteBranch => {
-                let hidden =
-                    remote_of(&r.refname).is_some_and(|rm| self.hidden_remotes.contains(rm));
-                !r.refname.ends_with("/HEAD") && !hidden && chosen(r)
-            }
+            RefKind::RemoteBranch => match split_remote(&r.refname, remotes) {
+                Some((_, "HEAD")) => false,
+                Some((remote, _)) => !self.hidden_remotes.contains(remote) && chosen(r),
+                None => chosen(r),
+            },
             RefKind::Tag => self.tags && self.chosen().is_none(),
         }
     }
 
     /// The refs to read the log from, for S2-B's `history::roots`: those [`Filters::shows`].
-    pub fn revisions(&self, refs: &[RefLabel]) -> Vec<RefLabel> {
-        refs.iter().filter(|r| self.shows(r)).cloned().collect()
+    pub fn revisions(&self, refs: &[RefLabel], remotes: &[String]) -> Vec<RefLabel> {
+        refs.iter()
+            .filter(|r| self.shows(r, remotes))
+            .cloned()
+            .collect()
     }
 
     /// Whether HEAD's commit is one of the log's revisions: not with a branch filter (03:298).
@@ -145,12 +149,24 @@ impl Filters {
     }
 }
 
-/// The remote a remote branch's refname belongs to: the component after `refs/remotes/` (a
-/// remote whose own name has a `/` in it reads as its first component).
-pub fn remote_of(refname: &str) -> Option<&str> {
-    refname
-        .strip_prefix("refs/remotes/")
-        .and_then(|rest| rest.split('/').next())
+/// A remote branch's refname as its remote and its branch: the longest of `remotes` (the
+/// repository's, `git remote`) that `refs/remotes/<remote>/` starts it — `team/up/main` is
+/// `team/up`'s branch `main` when both `team` and `team/up` are remotes — else, without such a
+/// remote, its first component. `None` for any other refname.
+pub fn split_remote<'a>(refname: &'a str, remotes: &[String]) -> Option<(&'a str, &'a str)> {
+    let rest = refname.strip_prefix("refs/remotes/")?;
+    let named = remotes
+        .iter()
+        .filter(|r| {
+            rest.strip_prefix(r.as_str())
+                .is_some_and(|after| after.starts_with('/'))
+        })
+        .map(String::len)
+        .max();
+    match named {
+        Some(n) => Some((&rest[..n], &rest[n + 1..])),
+        None => rest.split_once('/'),
+    }
 }
 
 /// A ref's name without its kind's prefix: `main`, `origin/main`, `v1`.
@@ -176,9 +192,15 @@ pub(super) struct Dialog {
     filters: Filters,
     /// The Branches list's type-to-filter text.
     typed: String,
-    /// Every local and remote branch, by refname (a remote's `HEAD` left out), as read.
+    /// Every local and remote branch, by refname (a remote's own `HEAD` left out), as read.
     branches: Vec<String>,
-    /// Every remote with a branch, in the order first read.
+    /// Their short names in lower case, for the type-to-filter (made once).
+    lower: Vec<String>,
+    /// The branches the typed text leaves, by index, and the text they are for: worked out when
+    /// the text changes, never per pass.
+    shown: Vec<usize>,
+    shown_for: Option<String>,
+    /// The repository's remotes, else every remote a branch names.
     remotes: Vec<String>,
 }
 
@@ -192,24 +214,47 @@ fn typed_id() -> egui::Id {
 
 impl Dialog {
     /// Over `filters`, listing the branches and remotes of `refs`.
-    pub fn new(filters: &Filters, refs: &[RefLabel]) -> Dialog {
+    pub fn new(filters: &Filters, refs: &[RefLabel], remotes: &[String]) -> Dialog {
+        let own_head =
+            |r: &RefLabel| matches!(split_remote(&r.refname, remotes), Some((_, "HEAD")));
         let branches: Vec<String> = refs
             .iter()
-            .filter(|r| r.kind != RefKind::Tag && !r.refname.ends_with("/HEAD"))
+            .filter(|r| r.kind != RefKind::Tag && !own_head(r))
             .map(|r| r.refname.clone())
             .collect();
-        let mut remotes: Vec<String> = Vec::new();
-        for name in refs.iter().filter_map(|r| remote_of(&r.refname)) {
-            if !remotes.iter().any(|r| r == name) {
-                remotes.push(name.to_string());
+        let lower = branches
+            .iter()
+            .map(|b| short_name(b).to_lowercase())
+            .collect();
+        let mut named: Vec<String> = remotes.to_vec();
+        if named.is_empty() {
+            for (name, _) in refs.iter().filter_map(|r| split_remote(&r.refname, &[])) {
+                if !named.iter().any(|r| r == name) {
+                    named.push(name.to_string());
+                }
             }
         }
         Dialog {
             filters: filters.clone(),
             typed: String::new(),
             branches,
-            remotes,
+            lower,
+            shown: Vec::new(),
+            shown_for: None,
+            remotes: named,
         }
+    }
+
+    /// The branches the typed text leaves, worked out again only when it changed.
+    fn narrow(&mut self) {
+        let typed = self.typed.to_lowercase();
+        if self.shown_for.as_ref() == Some(&typed) {
+            return;
+        }
+        self.shown = (0..self.lower.len())
+            .filter(|&k| self.lower[k].contains(&typed))
+            .collect();
+        self.shown_for = Some(typed);
     }
 
     /// Toggles one branch: from every branch, all but it; else in or out of the chosen.
@@ -258,25 +303,25 @@ impl Dialog {
                         .desired_width(20.0 * chrome::CELL.x),
                 );
             });
-            let typed = self.typed.to_lowercase();
-            let shown: Vec<String> = self
-                .branches
-                .iter()
-                .filter(|b| short_name(b).to_lowercase().contains(&typed))
-                .cloned()
-                .collect();
+            // One branch a row; only the rows in view are laid out.
+            self.narrow();
+            let row = ui.spacing().interact_size.y;
+            let mut toggled = None;
             egui::ScrollArea::vertical()
-                .max_height(8.0 * chrome::CELL.y * 1.5)
-                .show(ui, |ui| {
-                    ui.horizontal_wrapped(|ui| {
-                        for refname in &shown {
-                            let on = self.filters.has_branch(refname);
-                            if chrome::choice(ui, on, short_name(refname)).clicked() {
-                                self.toggle_branch(refname);
-                            }
+                .max_height(8.0 * (row + ui.spacing().item_spacing.y))
+                .show_rows(ui, row, self.shown.len(), |ui, range| {
+                    for &k in &self.shown[range] {
+                        let refname = &self.branches[k];
+                        let on = self.filters.has_branch(refname);
+                        if chrome::choice(ui, on, short_name(refname)).clicked() {
+                            toggled = Some(k);
                         }
-                    });
+                    }
                 });
+            if let Some(k) = toggled {
+                let refname = self.branches[k].clone();
+                self.toggle_branch(&refname);
+            }
             if !self.remotes.is_empty() {
                 ui.horizontal_wrapped(|ui| {
                     ui.label("Remotes");

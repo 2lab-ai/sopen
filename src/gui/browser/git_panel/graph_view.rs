@@ -14,13 +14,14 @@
 //!   order, a local branch and the remotes having it on the same commit merged (`main↔origin,up`);
 //!   a row shows as many as fit, then `+N`.
 
-use super::filters::{short_name, Filters};
+use super::filters::{short_name, split_remote, Filters};
 use super::{HeadRef, Label, LabelKind, Paging, RowKey, Scroll, Tracking};
 use crate::git::graph::{Graph, Node, Row};
 use crate::git::model::{Oid, RefKind, RefLabel};
 use crate::gui::chrome;
 use crate::gui::chrome::git::{self as look, LOOK};
 use eframe::egui::{self, Color32, FontId, Pos2, Rect, Sense, Shape, Stroke, Vec2};
+use std::borrow::Cow;
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 /// The cells the description keeps however narrow the panel: Author, Date and Commit go first.
@@ -145,11 +146,12 @@ impl Columns {
 /// drawn.
 pub(super) fn index(
     refs: &[RefLabel],
+    remote_names: &[String],
     head: &HeadRef,
     filters: &Filters,
 ) -> HashMap<Oid, Vec<Label>> {
     let mut by: HashMap<Oid, Vec<&RefLabel>> = HashMap::new();
-    for r in refs.iter().filter(|r| filters.shows(r)) {
+    for r in refs.iter().filter(|r| filters.shows(r, remote_names)) {
         let at = r.peeled.as_ref().unwrap_or(&r.object);
         by.entry(at.clone()).or_default().push(r);
     }
@@ -171,7 +173,7 @@ pub(super) fn index(
         for local in refs.iter().filter(|r| r.kind == RefKind::LocalBranch) {
             let name = short_name(&local.refname);
             let mut with: Vec<&str> = Vec::new();
-            remotes.retain(|r| match short_name(&r.refname).split_once('/') {
+            remotes.retain(|r| match split_remote(&r.refname, remote_names) {
                 Some((remote, branch)) if branch == name => {
                     with.push(remote);
                     false
@@ -226,16 +228,47 @@ fn lossy(_r: &RefLabel) -> bool {
     false
 }
 
+/// At most `room` characters of `text`, and one more to show it does not fit: what a label lays
+/// out, however long the ref's name.
+pub(super) fn capped(text: &str, room: usize) -> Cow<'_, str> {
+    match text.char_indices().nth(room + 1) {
+        Some((at, _)) => Cow::Owned(text[..at].to_string()),
+        None => Cow::Borrowed(text),
+    }
+}
+
+/// A repository's text as a row shows it: its control characters (`\n`, `\r`, `\t`, any other)
+/// escaped, so a name or a subject never runs onto another row.
+pub fn printable(text: &str) -> Cow<'_, str> {
+    if !text.chars().any(char::is_control) {
+        return Cow::Borrowed(text);
+    }
+    let mut out = String::with_capacity(text.len() + 8);
+    for c in text.chars() {
+        if c.is_control() {
+            out.extend(c.escape_default());
+        } else {
+            out.push(c);
+        }
+    }
+    Cow::Owned(out)
+}
+
 /// The labels `row` draws.
-pub(super) fn row_labels(row: &Row, index: &HashMap<Oid, Vec<Label>>) -> Vec<Label> {
+pub(super) fn row_labels<'a>(
+    row: &'a Row,
+    index: &'a HashMap<Oid, Vec<Label>>,
+) -> Cow<'a, [Label]> {
     match row {
-        Row::Uncommitted { .. } => Vec::new(),
-        Row::Stash(stash) => vec![Label {
+        Row::Uncommitted { .. } => Cow::Borrowed(&[]),
+        Row::Stash(stash) => Cow::Owned(vec![Label {
             text: stash.selector.clone(),
             kind: LabelKind::Stash,
             lossy: false,
-        }],
-        Row::Commit { commit, .. } => index.get(&commit.oid).cloned().unwrap_or_default(),
+        }]),
+        Row::Commit { commit, .. } => index
+            .get(&commit.oid)
+            .map_or(Cow::Borrowed(&[][..]), |l| Cow::Borrowed(l.as_slice())),
     }
 }
 
@@ -275,15 +308,15 @@ pub(super) fn cells(row: &Row, uncommitted: usize) -> (String, String, String, S
             "*".to_string(),
         ),
         Row::Stash(s) => (
-            s.subject.clone(),
+            printable(&s.subject).into_owned(),
             date_text(s.commit_time),
             String::new(),
             s.oid.short().to_string(),
         ),
         Row::Commit { commit, .. } => (
-            commit.subject.clone(),
+            printable(&commit.subject).into_owned(),
             date_text(commit.author_time),
-            commit.author_name.clone(),
+            printable(&commit.author_name).into_owned(),
             commit.oid.short().to_string(),
         ),
     }
@@ -345,6 +378,7 @@ pub(super) struct Drawn {
 }
 
 /// Text cells on a painter: each left-aligned at a cell of a row.
+#[derive(Clone, Copy)]
 struct Cells<'a> {
     painter: &'a egui::Painter,
     font: &'a FontId,
@@ -475,6 +509,12 @@ pub(super) fn draw(
             LOOK.text
         };
         let (subject, date, author, commit) = cells(row, list.uncommitted);
+        // Everything of the row is painted inside it.
+        let painter = painter.with_clip_rect(row_rect(i).intersect(area));
+        let grid = Cells {
+            painter: &painter,
+            ..grid
+        };
         // The description: the labels, then the subject in what is left.
         let desc_left = left + cw * cols.desc as f32;
         let desc_right = desc_left + cw * cols.desc_w as f32;
@@ -486,7 +526,10 @@ pub(super) fn draw(
             if cursor == k + 1 {
                 colours = colours.inverted();
             }
-            let galley = painter.layout_no_wrap(label.text.clone(), font.clone(), colours.text);
+            // No more of a name than the description holds is laid out.
+            let text = capped(&label.text, cols.desc_w);
+            let galley =
+                painter.layout_no_wrap(printable(&text).into_owned(), font.clone(), colours.text);
             let w = galley.size().x;
             let more = labels.len() - k - 1;
             let reserve = if more > 0 {

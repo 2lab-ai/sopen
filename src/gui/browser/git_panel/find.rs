@@ -12,10 +12,13 @@
 //!   since, until, case) whose run is the integration's ([`super::GitAction::Search`]); its
 //!   results are a flat list in place of the graph, paged like it ([`Results`]).
 
+use super::graph_view::row_labels;
 use super::{Label, Paging, Scroll};
 use crate::git::graph::Row;
+use crate::git::model::Oid;
 use crate::gui::chrome;
 use eframe::egui::{self, Key, Modifiers};
+use std::collections::HashMap;
 
 /// Find's state while its field is open.
 #[derive(Debug, Clone)]
@@ -57,9 +60,9 @@ impl Find {
         self.scanned = 0;
     }
 
-    /// Brings the matches up to date with the text and `rows` (`labels` gives a row's labels);
+    /// Brings the matches up to date with the text and `rows` (`labels`: the label index);
     /// `true` when the text or the case changed, so the bar is to jump.
-    pub fn refresh(&mut self, rows: &[Row], labels: &dyn Fn(&Row) -> Vec<Label>) -> bool {
+    pub fn refresh(&mut self, rows: &[Row], labels: &HashMap<Oid, Vec<Label>>) -> bool {
         let wanted = (self.text.clone(), self.case);
         let changed = self.matched.as_ref() != Some(&wanted);
         if changed {
@@ -78,7 +81,7 @@ impl Find {
         };
         let start = self.scanned.min(rows.len());
         for (i, row) in rows.iter().enumerate().skip(start) {
-            if matches(row, &labels(row), &query, self.case) {
+            if matches(row, &row_labels(row, labels), &query, self.case) {
                 self.matches.push(i);
             }
         }

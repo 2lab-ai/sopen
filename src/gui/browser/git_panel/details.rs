@@ -9,7 +9,7 @@
 //! pane shows `reading…` until [`super::GitView::set_details`] hands over the details of exactly
 //! the subject it shows (a result for another is dropped).
 
-use super::graph_view::date_text;
+use super::graph_view::{date_text, printable};
 use super::{Scroll, Subject};
 use crate::git::model::Oid;
 use crate::gui::chrome;
@@ -164,6 +164,9 @@ pub(super) struct Pane {
     pub lines: Vec<Line>,
     /// The bar went to the first file once the details came.
     placed: bool,
+    /// The width, in cells, the message's lines were wrapped to (`None`: not yet, for these
+    /// lines).
+    wrapped_for: Option<usize>,
 }
 
 impl Pane {
@@ -177,6 +180,7 @@ impl Pane {
             header,
             lines: Vec::new(),
             placed: false,
+            wrapped_for: None,
         };
         pane.build();
         pane
@@ -201,8 +205,9 @@ impl Pane {
         true
     }
 
-    /// The lines from the details.
+    /// The lines from the details, the message's not wrapped yet.
     fn build(&mut self) {
+        self.wrapped_for = None;
         let mut lines: Vec<Line> = self
             .header
             .iter()
@@ -265,6 +270,38 @@ impl Pane {
         self.lines = lines;
     }
 
+    /// The message's lines wrapped to `chars` cells of `font` (03 §6.1: the whole message,
+    /// scrollable), once a width: the bar stays on its file row.
+    pub fn wrap(&mut self, ctx: &egui::Context, font: &egui::FontId, cw: f32, chars: usize) {
+        if self.wrapped_for == Some(chars) {
+            return;
+        }
+        let bar_file = match self.line() {
+            Some(Line::File { group, file }) => Some((*group, *file)),
+            _ => None,
+        };
+        self.build();
+        let width = cw * chars.max(1) as f32;
+        let mut wrapped = Vec::with_capacity(self.lines.len());
+        for line in std::mem::take(&mut self.lines) {
+            match line {
+                Line::Text(s) => {
+                    wrapped.extend(wrap_line(ctx, font, &s, width).into_iter().map(Line::Text))
+                }
+                other => wrapped.push(other),
+            }
+        }
+        self.lines = wrapped;
+        self.wrapped_for = Some(chars);
+        let at = bar_file.and_then(|(g, f)| {
+            self.lines
+                .iter()
+                .position(|l| *l == Line::File { group: g, file: f })
+        });
+        self.scroll.bar = at.unwrap_or(self.scroll.bar.min(self.lines.len().saturating_sub(1)));
+        self.scroll.moved = true;
+    }
+
     /// The line under the pane's bar.
     pub fn line(&self) -> Option<&Line> {
         self.lines.get(self.scroll.bar)
@@ -292,6 +329,8 @@ pub(super) fn draw(
     let (cw, text_h) = ctx.fonts_mut(|f| (f.glyph_width(&font, '0'), f.row_height(&font)));
     let row_h = text_h.ceil();
     let visible = ((area.height() / row_h).floor() as usize).max(1);
+    let chars = (area.width() / cw).floor().max(0.0) as usize;
+    pane.wrap(&ctx, &font, cw, chars);
     let len = pane.lines.len();
     if ui.rect_contains_pointer(area) {
         let lines: f32 = ctx.input(|i| {
@@ -313,7 +352,6 @@ pub(super) fn draw(
     let range = pane.scroll.range(len);
     let painter = ui.painter_at(area);
     let x = |cell: usize| area.left() + cw * cell as f32;
-    let chars = (area.width() / cw).floor().max(0.0) as usize;
     let mut clicked = None;
     for (k, line) in pane
         .lines
@@ -325,13 +363,15 @@ pub(super) fn draw(
         let y = area.top() + row_h * (k - range.start) as f32;
         let row = Rect::from_min_size(Pos2::new(area.left(), y), Vec2::new(area.width(), row_h));
         let on_bar = pane.keyboard && k == pane.scroll.bar;
+        // Everything of the line is painted inside it.
+        let painter = painter.with_clip_rect(row.intersect(area));
         if on_bar {
             chrome::bar(&painter, row, active);
         }
         let paint = |c| if on_bar && active { LOOK.on_bar } else { c };
         let text = |cell: usize, s: &str, c| {
             let room = cw * chars.saturating_sub(cell) as f32;
-            let shown = chrome::fit_start(&ctx, s, &font, room);
+            let shown = chrome::fit_start(&ctx, &printable(s), &font, room);
             painter.text(
                 Pos2::new(x(cell), y),
                 egui::Align2::LEFT_TOP,
@@ -369,7 +409,7 @@ pub(super) fn draw(
                 let counts = f.lines.map(|(a, d)| format!("+{a} -{d}"));
                 let counts_w = counts.as_ref().map_or(0, |c| c.chars().count() + 1);
                 let room = cw * chars.saturating_sub(4 + counts_w) as f32;
-                let path = chrome::fit_left(&ctx, &f.shown(), &font, room);
+                let path = chrome::fit_left(&ctx, &printable(&f.shown()), &font, room);
                 painter.text(
                     Pos2::new(x(4), y),
                     egui::Align2::LEFT_TOP,
@@ -410,4 +450,32 @@ pub(super) fn draw(
         (max_top > 0).then(|| pane.scroll.top as f32 / max_top as f32),
     );
     clicked
+}
+
+/// One message line as the pane's lines of `width` points: tabs to the next multiple of eight
+/// cells, other control characters escaped, then wrapped as egui wraps it (at word boundaries; a
+/// word longer than the line is broken).
+fn wrap_line(ctx: &egui::Context, font: &egui::FontId, line: &str, width: f32) -> Vec<String> {
+    let mut expanded = String::with_capacity(line.len());
+    for c in line.chars() {
+        if c == '\t' {
+            let n = expanded.chars().count();
+            expanded.extend(std::iter::repeat_n(' ', 8 - n % 8));
+        } else {
+            expanded.push(c);
+        }
+    }
+    let text = printable(&expanded).into_owned();
+    if text.is_empty() {
+        return vec![String::new()];
+    }
+    let galley = ctx.fonts_mut(|f| f.layout(text, font.clone(), LOOK.text, width));
+    galley
+        .rows
+        .iter()
+        .map(|row| {
+            let s: String = row.row.glyphs.iter().map(|g| g.chr).collect();
+            s.trim_end().to_string()
+        })
+        .collect()
 }

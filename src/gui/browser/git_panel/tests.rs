@@ -980,7 +980,7 @@ fn g_f1_each_filter_changes_the_rows() {
     fx.drv.click_text_on_top(&mut fx.host, "Tags");
     let f = apply(&mut fx);
     assert!(!f.tags);
-    assert!(!names(f.revisions(&refs()))
+    assert!(!names(f.revisions(&refs(), &[]))
         .iter()
         .any(|r| r.starts_with("refs/tags/")));
     assert!(f.head_is_revision());
@@ -994,7 +994,7 @@ fn g_f1_each_filter_changes_the_rows() {
     fx.drv.click_text_on_top(&mut fx.host, "origin");
     let f = apply(&mut fx);
     assert_eq!(
-        names(f.revisions(&refs())),
+        names(f.revisions(&refs(), &[])),
         [
             "refs/heads/feature",
             "refs/heads/main",
@@ -1013,7 +1013,7 @@ fn g_f1_each_filter_changes_the_rows() {
     fx.drv.click_text_on_top(&mut fx.host, "All branches");
     fx.drv.click_text_on_top(&mut fx.host, "feature");
     let f = apply(&mut fx);
-    assert_eq!(names(f.revisions(&refs())), ["refs/heads/feature"]);
+    assert_eq!(names(f.revisions(&refs(), &[])), ["refs/heads/feature"]);
     assert!(!f.head_is_revision());
     assert!(f.stash_revisions(&stashes()).is_empty());
     let feature: Vec<CommitRow> = history()
@@ -1108,7 +1108,7 @@ fn g_f1_each_filter_changes_the_rows() {
     assert!(f.reflog);
     assert!(f.head_is_revision());
     assert_eq!(
-        names(f.revisions(&refs())).len(),
+        names(f.revisions(&refs(), &[])).len(),
         7,
         "every branch and tag, not origin/HEAD"
     );
@@ -1369,4 +1369,260 @@ fn select_details_and_label_from_outside() {
     );
     fx.idle();
     assert!(fx.view().details_open());
+}
+
+// Review round 1 (PR #72).
+
+/// Item 1: Cmd/Ctrl+F from a history result's details pane opens no Find nobody sees — Find is
+/// over the graph's rows, which the results hide — so the keys go on acting where they are seen.
+#[test]
+fn find_is_not_opened_under_history_results() {
+    let mut fx = Fx::new(1000.0, 600.0, fixture_view());
+    fx.key(Key::F, Modifiers::COMMAND | Modifiers::SHIFT);
+    fx.typed("prepare");
+    fx.press(Key::Enter);
+    let query = SearchQuery {
+        message: "prepare".into(),
+        ..Default::default()
+    };
+    fx.view_mut().set_search_results(
+        &query,
+        vec![commit(5, &[1], "Ann", day(5), "main: prepare to merge")],
+        Paging::AllLoaded,
+    );
+    fx.idle();
+    fx.press(Key::Enter);
+    assert!(fx.view().details_open());
+    fx.key(Key::F, Modifiers::COMMAND);
+    assert_eq!(fx.view().find_text(), None, "no Find under the results");
+    fx.typed("m");
+    assert_eq!(fx.view().find_text(), None);
+    fx.press(Key::Escape);
+    fx.press(Key::Escape);
+    assert!(!fx.view().details_open(), "Esc reached the pane");
+    assert!(
+        fx.shows("main: prepare to merge"),
+        "the results still shown"
+    );
+}
+
+/// Item 2: a repository's text with control characters (a label, a subject, an author, a path)
+/// shows them escaped, on one row — nothing paints into the rows below.
+#[test]
+fn control_characters_show_escaped_on_their_row() {
+    let mut view = fixture_view();
+    let mut r = refs();
+    r.push(label("refs/tags/x\ny", 8, None));
+    view.set_refs(r, HeadRef::Branch("refs/heads/main".into()));
+    let mut commits = history();
+    commits[1].subject = "tab\there\nand a line".into();
+    commits[1].author_name = "B\rob".into();
+    view.set_rows(rows_of(commits, true), false, 2);
+    let mut fx = Fx::new(1000.0, 800.0, view);
+    assert!(fx.shows("x\\ny"), "{:?}", fx.texts());
+    assert!(fx.shows("tab\\there\\nand a line"));
+    assert!(fx.shows("B\\rob"));
+    fx.press(Key::ArrowDown);
+    fx.press(Key::ArrowDown);
+    fx.press(Key::Enter);
+    fx.view_mut().set_details(Details {
+        subject: Subject::Row(RowKey::Commit(oid(8))),
+        summary: None,
+        contains: None,
+        groups: vec![FileGroup {
+            group: Group::Files,
+            files: vec![FileRow {
+                letter: 'A',
+                path: "new\nline.txt".into(),
+                old_path: None,
+                lines: Some((1, 0)),
+                lossy: false,
+            }],
+        }],
+        error: None,
+    });
+    fx.idle();
+    assert!(fx.shows("new\\nline.txt"));
+    for (_, t) in fx.texts() {
+        // A scroll bar's column is the one text drawn over several rows.
+        let column = t.starts_with('↑');
+        assert!(column || !t.chars().any(char::is_control), "{t:?}");
+    }
+}
+
+/// Items 3 and 4: a remote is the longest remote name a remote branch starts with (two toggles
+/// for `team` and `team/up`), and only a remote's own `HEAD` is left out — a branch whose name
+/// ends in `/HEAD` is a branch.
+#[test]
+fn remotes_by_their_whole_names_and_only_their_own_head() {
+    let names =
+        |refs: Vec<RefLabel>| -> Vec<String> { refs.into_iter().map(|r| r.refname).collect() };
+    let r = vec![
+        label("refs/heads/feature/HEAD", 8, None),
+        label("refs/heads/main", 9, None),
+        label("refs/remotes/origin/feature/HEAD", 6, None),
+        label("refs/remotes/team/main", 9, None),
+        label("refs/remotes/team/up/HEAD", 9, None),
+        label("refs/remotes/team/up/main", 9, None),
+    ];
+    let remotes: Vec<String> = ["origin", "team", "team/up"].map(String::from).to_vec();
+    assert_eq!(
+        names(Filters::default().revisions(&r, &remotes)),
+        [
+            "refs/heads/feature/HEAD",
+            "refs/heads/main",
+            "refs/remotes/origin/feature/HEAD",
+            "refs/remotes/team/main",
+            "refs/remotes/team/up/main"
+        ]
+    );
+    let mut view = GitView::new("box:/srv/repo");
+    view.set_remotes(remotes.clone());
+    view.set_refs(r.clone(), HeadRef::Branch("refs/heads/main".into()));
+    view.set_rows(rows_of(history(), true), false, 2);
+    view.set_paging(Paging::AllLoaded);
+    let mut fx = Fx::new(1000.0, 600.0, view);
+    assert!(fx.shows("►main↔team,team/up"), "{:?}", fx.texts());
+    assert!(fx.shows("feature/HEAD") && fx.shows("origin/feature/HEAD"));
+    fx.view_mut().open_filters();
+    fx.idle();
+    fx.idle();
+    assert!(fx.shows("team") && fx.shows("team/up"), "a toggle each");
+    fx.drv.click_text_on_top(&mut fx.host, "team/up");
+    let asked = fx.press(Key::Enter);
+    let [GitAction::FiltersChanged(f)] = &asked[..] else {
+        panic!("{asked:?}");
+    };
+    assert_eq!(
+        names(f.revisions(&r, &remotes)),
+        [
+            "refs/heads/feature/HEAD",
+            "refs/heads/main",
+            "refs/remotes/origin/feature/HEAD",
+            "refs/remotes/team/main"
+        ]
+    );
+    fx.idle();
+    assert!(fx.shows("►main↔team"));
+    // Without the remotes' list: the first component, as before.
+    assert_eq!(
+        names(Filters::default().revisions(&r, &[])),
+        [
+            "refs/heads/feature/HEAD",
+            "refs/heads/main",
+            "refs/remotes/origin/feature/HEAD",
+            "refs/remotes/team/main",
+            "refs/remotes/team/up/HEAD",
+            "refs/remotes/team/up/main"
+        ]
+    );
+}
+
+/// Item 5: the branch chooser lays out only the branches it shows on screen, however many there
+/// are, and narrows as the filter is typed.
+#[test]
+fn the_branch_chooser_draws_only_its_visible_rows() {
+    let mut many = refs();
+    many.extend((0..20_000).map(|k| {
+        let mut b = label(&format!("refs/heads/b{k:05}"), 1, None);
+        b.object = Oid::parse(&format!("{k:040x}")).unwrap();
+        b
+    }));
+    let mut view = fixture_view();
+    view.set_refs(many, HeadRef::Branch("refs/heads/main".into()));
+    let mut fx = Fx::new(1000.0, 600.0, view);
+    fx.view_mut().open_filters();
+    fx.idle();
+    fx.idle();
+    // egui paints only what is on screen; what a pass costs is the widgets it lays out.
+    fx.idle();
+    let widgets: usize = fx
+        .drv
+        .ctx
+        .viewport(|v| v.prev_pass.widgets.layers().map(|(_, w)| w.len()).sum());
+    assert!(widgets < 400, "{widgets} widgets laid out");
+    fx.typed("b1999");
+    fx.idle();
+    assert!(fx.shows("b19995") && !fx.shows("b00001"));
+}
+
+/// Item 6: a message line longer than the pane wraps into lines of the pane, all of it readable.
+#[test]
+fn a_long_message_line_wraps_in_the_pane() {
+    let long: Vec<String> = (0..60).map(|k| format!("word{k:02}")).collect();
+    let long = long.join(" ");
+    let mut fx = Fx::new(1000.0, 800.0, fixture_view());
+    fx.press(Key::ArrowDown);
+    fx.press(Key::Enter);
+    fx.view_mut().set_details(Details {
+        subject: Subject::Row(RowKey::Commit(oid(9))),
+        summary: Some(Summary {
+            oid: oid(9),
+            parents: vec![oid(7), oid(8)],
+            author_name: "Ann".into(),
+            author_email: "ann@example.com".into(),
+            author_time: day(9),
+            committer_name: "Ann".into(),
+            committer_email: "ann@example.com".into(),
+            commit_time: day(9),
+            message: format!("Merge\n\n{long}\n"),
+        }),
+        contains: Some(Vec::new()),
+        groups: Vec::new(),
+        error: None,
+    });
+    fx.idle();
+    let lines: Vec<String> = fx
+        .texts()
+        .into_iter()
+        .map(|(_, t)| t)
+        .filter(|t| t.starts_with("word"))
+        .collect();
+    assert!(lines.len() >= 3, "{lines:?}");
+    let squeezed = |s: &str| s.split_whitespace().collect::<String>();
+    assert_eq!(
+        squeezed(&lines.concat()),
+        squeezed(&long),
+        "every word, in order"
+    );
+    assert!(!lines.iter().any(|l| l.contains('…')));
+}
+
+/// Item 7: a label lays out no more of its text than its room and one character.
+#[test]
+fn a_huge_label_is_capped_before_it_is_laid_out() {
+    let huge = "x".repeat(100_000);
+    let shown = graph_view::capped(&huge, 40);
+    assert_eq!(shown.chars().count(), 41);
+    assert!(matches!(
+        graph_view::capped("short", 40),
+        std::borrow::Cow::Borrowed("short")
+    ));
+}
+
+/// Item 8: an untracked folder whose name is not UTF-8 is not listed by its shown name.
+#[test]
+fn a_lossy_folder_is_not_listed() {
+    let mut fx = Fx::new(1000.0, 800.0, fixture_view());
+    fx.press(Key::F3);
+    fx.view_mut().set_details(Details {
+        subject: Subject::Row(RowKey::Uncommitted),
+        summary: None,
+        contains: None,
+        groups: vec![FileGroup {
+            group: Group::Untracked,
+            files: vec![FileRow {
+                letter: '?',
+                path: "d\u{FFFD}r/".into(),
+                old_path: None,
+                lines: None,
+                lossy: true,
+            }],
+        }],
+        error: None,
+    });
+    fx.idle();
+    assert!(fx.press(Key::Enter).is_empty());
+    assert!(fx.press(Key::ArrowRight).is_empty());
+    assert!(fx.view().status_line().text.contains("not valid UTF-8"));
 }

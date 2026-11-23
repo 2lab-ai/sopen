@@ -294,6 +294,8 @@ pub struct GitView {
     /// `N` of `Uncommitted changes (N)`.
     uncommitted: usize,
     refs: Vec<RefLabel>,
+    /// The repository's remotes (`git remote`): a remote branch is its longest prefix among them.
+    remotes: Vec<String>,
     head: HeadRef,
     /// The labels each commit draws, by the commit (built when the refs or the filters change,
     /// never per pass).
@@ -364,6 +366,7 @@ impl GitView {
             graph: Graph::new(false),
             uncommitted: 0,
             refs: Vec::new(),
+            remotes: Vec::new(),
             head: HeadRef::Unborn,
             labels: HashMap::new(),
             commits: 0,
@@ -392,9 +395,17 @@ impl GitView {
         self.relabel();
     }
 
+    /// The repository's remotes (`git remote`, 03 §4.6): a remote branch belongs to the longest of
+    /// them its name starts with (`team/up/main` is `team/up`'s when both `team` and `team/up` are
+    /// remotes). Without them, a remote branch's remote is its first component.
+    pub fn set_remotes(&mut self, remotes: Vec<String>) {
+        self.remotes = remotes;
+        self.relabel();
+    }
+
     /// The labels again, after the refs, HEAD or the filters changed.
     fn relabel(&mut self) {
-        self.labels = graph_view::index(&self.refs, &self.head, &self.filters);
+        self.labels = graph_view::index(&self.refs, &self.remotes, &self.head, &self.filters);
         if let Some(find) = &mut self.find {
             find.reset();
         }
@@ -587,7 +598,11 @@ impl GitView {
     pub fn open_filters(&mut self) {
         // The dialog has the typing: Find, which would keep it, closes.
         self.find = None;
-        self.filters_dialog = Some(filters::Dialog::new(&self.filters, &self.refs));
+        self.filters_dialog = Some(filters::Dialog::new(
+            &self.filters,
+            &self.refs,
+            &self.remotes,
+        ));
     }
 
     /// The label menu's "Show only this branch" (S3; 03 §7.2): the Branches filter on it alone.
@@ -623,8 +638,8 @@ impl GitView {
     pub fn bar_label(&self) -> Option<Label> {
         let k = self.label_cursor.checked_sub(1)?;
         graph_view::row_labels(self.bar_row()?, &self.labels)
-            .into_iter()
-            .nth(k)
+            .get(k)
+            .cloned()
     }
 
     /// The graph's bar's row and its place on screen (rows below the first one shown).
@@ -661,8 +676,8 @@ impl GitView {
         let (subject, date, author, commit) = graph_view::cells(row, self.uncommitted);
         Some(RowText {
             labels: graph_view::row_labels(row, &self.labels)
-                .into_iter()
-                .map(|l| l.text)
+                .iter()
+                .map(|l| graph_view::printable(&l.text).into_owned())
                 .collect(),
             subject,
             date,
@@ -728,7 +743,7 @@ impl GitView {
     }
 
     /// The labels `row` draws.
-    fn labels_of(&self, row: &Row) -> Vec<Label> {
+    fn labels_of<'a>(&'a self, row: &'a Row) -> std::borrow::Cow<'a, [Label]> {
         graph_view::row_labels(row, &self.labels)
     }
 
@@ -737,7 +752,7 @@ impl GitView {
         let Some(mut find) = self.find.take() else {
             return false;
         };
-        let changed = find.refresh(&self.rows, &|row| self.labels_of(row));
+        let changed = find.refresh(&self.rows, &self.labels);
         self.find = Some(find);
         changed
     }
@@ -949,7 +964,8 @@ impl GitView {
                 pane.keyboard = false;
                 return Vec::new();
             }
-            Command::FindWith(_) | Command::Find | Command::ToHead => {
+            // Find and Cmd/Ctrl+J are the graph's: not while a history search's results hide it.
+            Command::FindWith(_) | Command::Find | Command::ToHead if self.search.is_none() => {
                 pane.keyboard = false;
                 return self.run_graph(command);
             }
@@ -977,17 +993,20 @@ impl GitView {
                 self.pane = Some(details::Pane::new(subject.clone(), true, Vec::new()));
                 vec![A::Details(subject)]
             }
+            // A name that is not UTF-8 names nothing: no diff, no file, no folder's listing.
+            (
+                Command::Details | Command::RevisionFile | Command::Edit | Command::LabelNext,
+                _,
+                Some((_, f)),
+            ) if f.lossy => {
+                self.said = Some(Status::error(not_utf8(&f.shown())));
+                Vec::new()
+            }
             (Command::Details | Command::LabelNext, _, Some((_, f))) if f.is_folder() => {
                 vec![A::ListFolder {
                     subject,
                     dir: f.path,
                 }]
-            }
-            (Command::Details | Command::RevisionFile | Command::Edit, _, Some((_, f)))
-                if f.lossy =>
-            {
-                self.said = Some(Status::error(not_utf8(&f.shown())));
-                Vec::new()
             }
             (Command::Details, _, Some((group, file))) => {
                 self.viewed.insert((subject.clone(), file.path.clone()));
@@ -1062,6 +1081,10 @@ const FIND_HINT: &str = "Enter next · Shift+Enter previous · Esc closes Find";
 pub fn keys(ctx: &egui::Context, view: &mut GitView) -> Vec<GitAction> {
     let mut asked = Vec::new();
     while !view.dialog_up() {
+        if view.search.is_some() {
+            // Find is over the graph's rows: never left open under a history search's results.
+            view.find = None;
+        }
         if view.find.is_some() {
             // Find's field has the typing: Enter and Esc, and Shift+Enter, only (04 §3 rule 4).
             if ctx.input_mut(|i| keys::take(i, Key::Enter, Mods::Shift)) {
