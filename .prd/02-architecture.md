@@ -448,7 +448,7 @@ slice named here (§8); a file that exists today changes owner only from one sli
 | `src/gui/mod.rs` | `Window::set_preview(bool)` on the trait, with a default that does nothing (S1-0, so S1-B and S1-A never share the file); Cmd/Ctrl+digit → F-key, once, in the shell's raw-input hook; clicks on the F-key row; `State::parse` and `Hooks` for the receipt keys (§9); focus events (S7) | S1-0, then S1-A, then each slice's integration WU for its receipt keys |
 | `src/gui/chrome.rs` (body), `src/gui/chrome/tests.rs`, `src/gui/help.rs` | the clickable F-key row; F1's key help screen in every window | S1-A |
 | `src/gui/{text,image,hex,media}.rs` and their `tests.rs`, `src/gui/browser/prepare.rs`, `src/cache.rs` | `Window::set_preview(bool)` (inactive frame, no bars, no input, no audio, no following, §4.3's budgets); the preview's read without claiming, the placeholder connection (since W8b every remote preview reads through a stream, and the `.preview` cache root is gone — an older sopen's is swept) | S1-B (`media.rs` only after PR #15, and only the `set_preview` default; then S1-M); in S2 the `read_only` flag and the `.revisions` root (S2-E) |
-| `src/fileops/*.rs`, `src/remote/ops.rs`, `src/remote/sftp/ops.rs`, `src/remote/local/ops.rs` | S1-C: rename, copy and move of files and folders, with the primitives they need — `MKDIR` for a copied folder, `REMOVE` and `RMDIR` for a moved one's sources; S6-A: F7 and F8 as actions, the local Trash, the plain-rename channel for remote folders: plans and runs over both file layers, never overwriting (04 §5) | S1-C, S6-A |
+| `src/fileops/*.rs`, `src/remote/ops.rs`, `src/remote/sftp/ops.rs`, `src/remote/local/ops.rs`; from S6 `src/remote/sftp/rename.rs`, `src/remote/local/trash.rs` | S1-C: rename, copy and move of files and folders, with the primitives they need — `MKDIR` for a copied folder, `REMOVE` and `RMDIR` for a moved one's sources; S6-A: F7 and F8 as actions, the local Trash (`local/trash.rs`), the plain-rename channel (`sftp/rename.rs`) for remote folders and for a copy's publish without `hardlink@`: plans and runs over both file layers, never overwriting (04 §5) | S1-C, S6-A |
 | `src/gui/browser/ops.rs`, `src/gui/browser/panel.rs` | selection, the file-operation dialogs, progress and reports; **drawing helpers** for the inline rename field and the selection colours, which `browser.rs`'s `panel_ui` (S1-E) calls | S1-D, S6-B |
 | `src/gui/browser/view.rs`, `src/gui/browser/preview.rs` | modes and `view::resolve` (§3) with its table test; the preview host (§4) | S1-E (O6 and the pin: S2-F) |
 | `src/gui/browser.rs`, `src/gui/browser/tests.rs`, `src/main.rs` | wiring and end-to-end window tests; `Start` gains the ssh destination (`RemoteSpec::destination`, not the bracketed label) and the state dir; the per-feature job state (§6) | S1-0 first (`browser.rs`: the `mod keys; ops; view; preview;` lines next to today's `panel` and `prepare`, and `Start`; `main.rs`: building `Start`), then one integration WU per slice (S1-E, S2-F, S3-C, S4-C, S5-C, S6-C, S7-B) |
@@ -569,7 +569,7 @@ then its WUs in parallel on disjoint files, then its **integration** WU, the sli
 | **S3** | Every Git Graph action, staging and commit, backups, restore and undo, the banner, the command log | S3-0 · S3-A actions and backups (logic) · S3-B menu, dialogs, backups list, log, banner · S3-C integration | S2; E5 |
 | **S4** | Free history editing: quick edits and the planner | S4-0 · S4-A planner logic · S4-B planner UI · S4-C integration | S3 |
 | **S5** | The directory tree (F10, Alt+F10) | S5-0 · S5-A tree model, `TreeFs` worker · S5-B tree UI · S5-C integration | S1 |
-| **S6** | F7 make folder and F8 delete as actions (Trash locally), remote folder rename and copy publish without `hardlink@` through a low-level plain-rename channel (S1 already uses `MKDIR`, `REMOVE` and `RMDIR` inside copy and move) | S6-0 (adds `openssh-sftp-client-lowlevel` if E2 picks it) · S6-A engine · S6-B dialogs · S6-C integration | S1; E2 |
+| **S6** | F7 make folder and F8 delete as actions (Trash locally), remote folder rename and copy publish without `hardlink@` through a low-level plain-rename channel (S1 already uses `MKDIR`, `REMOVE` and `RMDIR` inside copy and move) | S6-0 (adds `openssh-sftp-client-lowlevel = "=0.7.4"`, already locked through `openssh-sftp-client`: E2's route B) · S6-A engine · S6-B dialogs · S6-C integration | S1; E2 |
 | **S7** | The macOS function-key switch | S7-A switch, lock, state, watchdog, config · S7-B focus events, integration | S1; E1; then the owner's receipt K-F3 (04 §8) |
 
 - **Acceptance per slice** — a slice is accepted on its own scenarios only:
@@ -638,6 +638,60 @@ small C program run as the logged-in user without sudo):
   before and after; no preference file was written.
 - **Not tested:** route 2 (`IOHIDEventSystemClientSetProperty`), not needed; and whether a physical
   F5 then reaches sopen as `Key::F5` — the owner's receipt K-F3 (04 §8).
+
+**E2's result** (measured 2026-11-23 against a Mac's own OpenSSH 10.3p1 `sftp-server`, on APFS, by
+a probe built on main a562e1e's `Cargo.lock`; nothing ran against a remote host):
+
+- **Run:** the server started as sopen's tests start one (`-e -l INFO`, a child over pipes), with
+  a tap between client and server that logged each request's packet type and each reply's status
+  code. Four routes, each with a server of its own:
+  - **A**: `openssh-sftp-client` 0.15.12's `Fs::rename` on a normal session — what sopen would
+    send today;
+  - **B**: `openssh-sftp-client-lowlevel` 0.7.4's `WriteEnd::send_rename_request` on a second
+    `sftp` channel;
+  - **C**: `Fs::rename` on a session whose version reply had `posix-rename@openssh.com` removed
+    client-side (sopen cannot pass `-P` to a remote's sftp subsystem);
+  - **D**: route B against `sftp-server -P hardlink`, a server without `hardlink@`: not
+    advertised, and the request refused with status 3.
+
+  14 cases per route, each name described before and after (bytes, listing, link text): a file, a
+  folder and a link onto a free name; a file onto an existing file, an empty folder, a dangling
+  link and a link to a folder; a folder onto a non-empty folder, an empty folder, a file, a
+  dangling link and a link to a folder; a link onto a file and onto a dangling link.
+- **What `Fs::rename` sends:** `posix-rename@openssh.com` whenever the server offers it, which
+  OpenSSH always does; the plain `SSH_FXP_RENAME` only without it. The crate keeps its low-level
+  writer private, so sopen cannot send the plain request through it.
+
+| Route | On the wire | Existing targets replaced, of 11 |
+|---|---|---|
+| A | `posix-rename@openssh.com` | 6: by a file, an existing file, an empty folder, a dangling link and a link to a folder (the link replaced, its folder kept); by a link, a file and a dangling link. Refused only where `rename(2)` refuses |
+| B, C, D | `SSH_FXP_RENAME` | 1: a link onto a dangling link. Every file or folder source was refused, source and target unchanged |
+
+- **Codes:** the plain rename refused with status 4 (`SSH_FX_FAILURE`), and 2 (`NO_SUCH_FILE`)
+  for a folder onto a dangling link. Status 4 does not mean "exists": a name is taken only when the
+  `lstat` sopen already makes after a failure finds it.
+- **Why, from the server's source** *(from the source, not measured)*: OpenSSH's `process_rename`
+  (`sftp-server.c`, V_10_3_P1) renames a regular file as `link()` then `unlink()`, which fails on
+  any existing name — the server-side twin of S1's `hardlink@` + `REMOVE`. Anything else, a folder
+  or a link, is `stat(newpath)` then `rename()` (`:1308-1309`): a check, then the act. An empty
+  folder made at the new name between the two is replaced; a dangling link passes the check
+  (`stat` follows it), and then the kernel refuses a folder onto it but lets a link replace it. On
+  a filesystem without hard links a regular file takes that same `stat` + `rename()` path
+  (`:1290-1292`). That Apple's build runs this code is inferred from every measured row matching
+  it.
+- **Verdict:** route B. S6 adds `openssh-sftp-client-lowlevel = "=0.7.4"` as a direct dependency
+  (already locked, through `openssh-sftp-client`) and sends the plain rename on a second `sftp`
+  subsystem of the master: for a remote folder's rename and move, and for publishing a copy's
+  regular-file temp where the server has no `hardlink@`. Never for a link: a link keeps S1's
+  path, made again at the new name. Route C puts the same bytes on the wire, but it rests on
+  `Fs::rename`'s fallback and on a filter that rewrites the version reply; if either changes it
+  becomes route A, which replaces, and nothing fails. The guard either way is K-M1's request
+  log (never a `posix-rename@openssh.com` request), with K-N1's link case (never a link sent as
+  `SSH_FXP_RENAME`). The folder rename is not atomic (04 §5.6).
+- **Not tested:** a Linux server; a server other than OpenSSH, whose plain rename onto an existing
+  name is its own (draft-ietf-secsh-filexfer-02 §6.5 makes it an error); a filesystem without hard
+  links; the check-then-rename window itself. `-P` takes the handler's short name: `-P hardlink`
+  hides `hardlink@openssh.com`, `-P hardlink@openssh.com` hides nothing.
 
 **E3's result** (measured 2026-11-21 on preview 0120d40813a0):
 

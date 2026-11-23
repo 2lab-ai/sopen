@@ -112,3 +112,27 @@ changes. Rows here are snapshots taken when they were moved.
   each, after rehearsals at 0; every call returned 0 with no entitlement; the registry and the
   keyboard filters' `FnKeyMode` followed the set, `hidutil property` and `fnState` did not. The
   F5 key itself is the owner's receipt K-F3 (04 §8).
+
+## E2 — closed 2026-11-23
+
+- measured E2 ✅ · result: of four routes against a Mac's own OpenSSH `sftp-server`, only the
+  plain `SSH_FXP_RENAME` refused every existing name for a file or folder source; route B (the
+  low-level crate on a second `sftp` channel) chosen and written into 02 §8.2 and 04 §5.6; S6 can
+  start · closed rows: E2 · PRs: the PR that carries this block (S6-0's)
+
+### Closed rows
+
+| ID | Status | Before | What (02 §8.2) |
+|---|---|---|---|
+| E2 | ✅ done: 2026-11-23, result in 02 §8.2 | S6 | plain SFTP rename: `openssh-sftp-client-lowlevel` vs an auxiliary channel, against a local `sftp-server -e -l INFO` |
+
+### Round section
+
+- E2: OpenSSH 10.3p1 on APFS, 14 cases on each of four routes. `Fs::rename` sends
+  `posix-rename@openssh.com` and replaced 6 of 11 existing targets; the plain rename (routes B, C
+  and D) replaced 1, a link onto a dangling link, so a link is never sent through it. Route B
+  over C: same bytes, but C turns silently into the replacing route if the crate's fallback or
+  the version-reply filter changes. From the server's source, not measured: a folder rename is
+  `stat` then `rename()`, so an empty folder made in between is replaced. Without `hardlink@`
+  measured on OpenSSH only (`-P hardlink`); other servers are relied on and the report says so
+  (04 §5.6).

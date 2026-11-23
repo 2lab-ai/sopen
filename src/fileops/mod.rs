@@ -12,7 +12,9 @@
 //! [`Report`] at the end. [`Running::stop`] is Esc. [`run`] is the same engine on the caller's
 //! thread, with a [`Control`] of the caller's own.
 
+mod delete;
 mod engine;
+mod make_dir;
 #[cfg(test)]
 mod tests;
 
