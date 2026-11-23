@@ -1143,14 +1143,19 @@ pub struct Outcome {
 impl Outcome {
     /// The run's warning, for the result dialog and the status row in place of the plain undo
     /// text: `backup <stamp> incomplete: …` when the steps were done but the group's `after`
-    /// record or its pruning trim could not be written (S3-A review round 1).
+    /// record or its pruning trim could not be written (S3-A review round 1); `<the step> was
+    /// refused; your uncommitted changes were set aside in backup <stamp> — restore it to bring
+    /// them back` when a restore stopped after its work tree's reset and before the apply (03
+    /// §8.3).
+    /// The first of them, in step order.
     pub fn warning(&self) -> Option<String> {
         self.steps
             .iter()
             .flat_map(|s| &s.ran)
             .find_map(|d| match &d.ending {
                 super::runner::Ending::NotSent(why)
-                    if why.starts_with("backup ") && why.contains(" incomplete: ") =>
+                    if (why.starts_with("backup ") && why.contains(" incomplete: "))
+                        || why.contains(" were set aside in backup ") =>
                 {
                     Some(why.clone())
                 }
@@ -3485,7 +3490,11 @@ fn oid_of(value: &Value) -> Option<&Oid> {
 }
 
 /// The restore of the group `stamp` (03 §8.3): its own group first, of every value it is about
-/// to replace, then each chosen entry by its row of §8.3's table.
+/// to replace, then each chosen entry by its row of §8.3's table, in §8.3's order: HEAD's
+/// checks and the ref transaction (what can refuse) before the work tree's `reset --hard HEAD`,
+/// then HEAD's moves, the changes applied, the files. The move then finds no local change for
+/// `reset --keep` to refuse (it refused the redo of a hard reset's undo when it came first), and
+/// an untracked or ignored file in its way refuses the restore here, before anything runs.
 fn restore_draft<'a>(
     repo: &'a Repo,
     reads: &Reads,
@@ -3504,7 +3513,16 @@ fn restore_draft<'a>(
         format!("Restore the backup {stamp}"),
         format!("sopen: restore {stamp}"),
     );
-    let mut first: Vec<Step> = Vec::new();
+    // The commit the work tree's changes are applied onto: a chosen HEAD item's backup, whose
+    // move comes first, else HEAD as it is.
+    let lands_on: Option<&Oid> = chosen
+        .iter()
+        .filter(|e| matches!(e.how, RestoreHow::CheckedOut | RestoreHow::Detached))
+        .filter_map(|e| e.backup.as_ref().map(|b| &b.oid))
+        .next_back()
+        .or(repo.head.oid());
+    let mut heads: Heads = Heads::default();
+    let mut wipe: Vec<Step> = Vec::new();
     let mut ref_lines: Vec<String> = Vec::new();
     let mut later: Vec<Step> = Vec::new();
     let mut paths: Vec<&RestoreEntry> = Vec::new();
@@ -3546,7 +3564,7 @@ fn restore_draft<'a>(
                         value: Some(n.clone()),
                     },
                 );
-                head_back(&mut d, reads, stamp, &mut first, refname, b, n);
+                head_back(&mut d, reads, stamp, &mut heads, refname, b, n);
             }
             (RestoreHow::Detached, _) => {
                 let (Some(b), Some(n)) = (&backup_oid, oid_of(&e.now)) else {
@@ -3559,7 +3577,7 @@ fn restore_draft<'a>(
                         value: Some(n.clone()),
                     },
                 );
-                head_back(&mut d, reads, stamp, &mut first, "HEAD (detached)", b, n);
+                head_back(&mut d, reads, stamp, &mut heads, "HEAD (detached)", b, n);
             }
             (RestoreHow::Stash, Subject::Stash { commit }) => match (&e.before, &e.backup) {
                 (Value::Object(_), Some(b)) => {
@@ -3598,7 +3616,7 @@ fn restore_draft<'a>(
             },
             (RestoreHow::WorkTree, _) => {
                 hard(&mut d, reads, "HEAD", "Restoring the work tree")?;
-                later.push(Step::Git(
+                wipe.push(Step::Git(
                     d.command(Class::Write, ["reset", "--hard", "HEAD"]),
                 ));
                 if let (Value::Object(_), Some(b)) = (&e.before, &backup_oid) {
@@ -3612,8 +3630,8 @@ fn restore_draft<'a>(
                         "--verify".into(),
                         format!("{}^1", b.as_str()),
                     ]));
-                    let head = repo.head.oid().map(|o| o.as_str().to_string());
-                    if !base.is_empty() && base.first() != head.as_ref() {
+                    let onto = lands_on.map(|o| o.as_str().to_string());
+                    if !base.is_empty() && base.first() != onto.as_ref() {
                         d.notes.push(
                             "HEAD has moved since the backup: the changes are applied onto the \
                              current HEAD, may conflict, and a redo is then not exact"
@@ -3656,7 +3674,12 @@ fn restore_draft<'a>(
             _ => return refused("a restore entry does not match its subject"),
         }
     }
-    let mut steps = first;
+    refuse_in_the_way_of_move(&d, reads, &heads.keeps)?;
+    // 03 §8.3's order: what can refuse first — every HEAD item's check, then the ref transaction
+    // (compare-and-swap) — so a refusal there leaves the work tree as it is; then the work tree's
+    // reset to the HEAD the checks saw (the one §8.6's look in `hard` read), HEAD's moves, `stash
+    // apply` (in `later`), and the files last, where the moves made room.
+    let mut steps = heads.checks;
     if !ref_lines.is_empty() {
         let mut input = ref_lines.join("\n");
         input.push('\n');
@@ -3665,6 +3688,8 @@ fn restore_draft<'a>(
                 .feed("ref transaction", input.into_bytes()),
         ));
     }
+    steps.append(&mut wipe);
+    steps.append(&mut heads.moves);
     steps.extend(later);
     if !paths.is_empty() {
         files_restore(&mut d, reads, stamp, &paths, &mut steps);
@@ -3711,17 +3736,80 @@ fn refuse_in_the_way_of_apply(d: &Draft, reads: &Reads, backup_oid: &Oid) -> Res
     ))
 }
 
+/// A restore's HEAD items (03 §8.3): their checks, their moves, and the commits the `--keep`
+/// moves go to.
+#[derive(Default)]
+struct Heads {
+    checks: Vec<Step>,
+    moves: Vec<Step>,
+    keeps: Vec<Oid>,
+}
+
+/// 03 §8.6 for HEAD's `reset --keep <backup>` in a restore: it refuses an untracked or ignored
+/// entry at a path the backup's commit has and HEAD and the index lack — after the work tree's
+/// reset, by then. So the restore refuses first, naming them; one the work tree's reset backs up
+/// and removes first is not in the way.
+fn refuse_in_the_way_of_move(d: &Draft, reads: &Reads, keeps: &[Oid]) -> Result<(), Refused> {
+    if keeps.is_empty() {
+        return Ok(());
+    }
+    let names = |rev: &str| -> BTreeSet<String> {
+        reads
+            .records(Need(
+                ["ls-tree", "-r", "-z", "--name-only", "--full-tree", rev]
+                    .map(String::from)
+                    .to_vec(),
+            ))
+            .into_iter()
+            .collect()
+    };
+    let mut here = names("HEAD");
+    here.extend(reads.records(Need::of(&["ls-files", "-z"])));
+    let mut footprint: BTreeSet<String> = BTreeSet::new();
+    for b in keeps {
+        footprint.extend(names(b.as_str()).into_iter().filter(|p| !here.contains(p)));
+    }
+    let taken: Vec<&String> = d
+        .takes
+        .iter()
+        .filter_map(|t| match &t.from {
+            Source::Files(paths) => Some(paths),
+            _ => None,
+        })
+        .flatten()
+        .collect();
+    let hits: Vec<String> = others(reads)
+        .into_iter()
+        .filter(|e| collides(e, &footprint))
+        .filter(|e| {
+            let at = e.trim_end_matches('/');
+            !taken
+                .iter()
+                .any(|t| t.as_str() == at || t.starts_with(&format!("{at}/")))
+        })
+        .collect();
+    if hits.is_empty() {
+        return Ok(());
+    }
+    refused(format!(
+        "putting HEAD back would write over untracked or ignored files: {}. Move them away \
+         first.",
+        few(&hits)
+    ))
+}
+
 /// Puts HEAD — the checked-out branch, or a detached HEAD — back to `backup` (03 §8.3), after
 /// checking it is still `now`: the inverse of a reset uses that reset's own mode (coordinator,
 /// 2026-11-23), read from the group's manifest — `reset --soft` (HEAD only) and `reset --mixed`
 /// (HEAD and the index) never touch the working files, which already hold the backup's content;
 /// anything else is `reset --keep`, which refuses rather than lose a local change (a hard reset's
-/// files come back from its `files` backup).
+/// files come back from its `files` backup). Adds the check and the move to `heads`, and a
+/// `--keep` move's target to its `keeps`.
 fn head_back(
     d: &mut Draft,
     reads: &Reads,
     stamp: &str,
-    first: &mut Vec<Step>,
+    heads: &mut Heads,
     what: &str,
     backup_oid: &Oid,
     now: &Oid,
@@ -3752,10 +3840,12 @@ fn head_back(
     let check = d
         .command(Class::Write, ["update-ref", "--stdin"])
         .feed("ref transaction", format!("verify HEAD {}\n", now.as_str()));
-    first.push(Step::Git(check));
-    first.push(Step::Git(
-        d.command(Class::Write, ["reset", flag, backup_oid.as_str()]),
-    ));
+    let back = d.command(Class::Write, ["reset", flag, backup_oid.as_str()]);
+    heads.checks.push(Step::Git(check));
+    heads.moves.push(Step::Git(back));
+    if flag == "--keep" {
+        heads.keeps.push(backup_oid.clone());
+    }
     d.changes.push(format!(
         "{what}: {} → {} ({how})",
         now.short(),
@@ -4272,6 +4362,36 @@ fn moved_by(plan: &Plan) -> Option<ResetMode> {
     })
 }
 
+/// The step `i` of `plan` comes after a restore's work tree reset (`reset --hard HEAD`) and
+/// before its apply — the first step past HEAD's moves, where the apply is or would be (03
+/// §8.3): stopped there, the tracked changes are reset and not yet back.
+fn between_the_wipe_and_the_apply(plan: &Plan, i: usize) -> bool {
+    let words = |step: &Step| -> Vec<String> {
+        match step {
+            Step::Git(cmd) => cmd
+                .args()
+                .iter()
+                .filter_map(|a| a.to_str())
+                .map(str::to_string)
+                .collect(),
+            _ => Vec::new(),
+        }
+    };
+    let Some(wipe) = plan
+        .steps
+        .iter()
+        .position(|s| words(s) == ["reset", "--hard", "HEAD"])
+    else {
+        return false;
+    };
+    let moves = |s: &Step| matches!(words(s).as_slice(), [r, _, t] if r == "reset" && t != "HEAD");
+    let apply = plan.steps[wipe + 1..]
+        .iter()
+        .position(|s| !moves(s))
+        .map_or(plan.steps.len(), |k| wipe + 1 + k);
+    wipe < i && i < apply
+}
+
 /// Runs `plan` in `top` (03 §3.8): its steps in order, the first failure leaving the rest `not
 /// run` (see the module's notes). Blocks: call it on a worker, holding the repository's write
 /// lock (02 §6); `handle` stops it.
@@ -4381,6 +4501,33 @@ pub fn execute(plan: &Plan, top: &str, runner: &GitRunner, handle: &Handle) -> O
         if !ok {
             failed = true;
             break;
+        }
+    }
+    // 03 §8.3: a restore stopped after its work tree's reset and before the apply (HEAD's move
+    // refused) leaves the tracked changes reset; they are in the restore's own `worktree`
+    // backup, and the result says so — after git's own text, so the dialog shows why as well as
+    // where they went.
+    let refused_at = steps.iter().position(|s| s.outcome == StepOutcome::Failed);
+    if let (Some(i), Some(r)) = (refused_at, &record) {
+        let kept = matches!(r.before(&Subject::WorkTree), Some(Value::Object(_)));
+        if kept && between_the_wipe_and_the_apply(plan, i) {
+            let reason = format!(
+                "{} was refused; your uncommitted changes were set aside in backup {} — restore \
+                 it to bring them back",
+                steps[i].line, r.group.stamp
+            );
+            let why = steps[i]
+                .ran
+                .iter()
+                .rev()
+                .find(|d| !d.ok())
+                .map(|d| d.error_text())
+                .unwrap_or_default();
+            let mut said = backup::refusal(runner, top, &steps[i].line, &reason);
+            if !why.trim().is_empty() {
+                said.stderr = format!("{}\nsopen: {reason}", why.trim_end());
+            }
+            steps[i].ran.push(said);
         }
     }
     let mut stamp = record.as_ref().map(|r| r.group.stamp.clone());
