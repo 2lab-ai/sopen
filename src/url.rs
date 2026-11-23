@@ -7,11 +7,18 @@
 //! A small parser, not a URL library: the scheme, the host (an IPv6 one in brackets), the port
 //! (80 / 443 when absent) and the rest — path, query and fragment — kept as written. Nothing is
 //! normalised: the browser gets the address byte for byte, and only a tunnel that had to take
-//! another port rewrites it, the port alone.
+//! another port rewrites it, the port alone. A host a browser would read otherwise than it is
+//! written (`127.1`, `0x7f.0.0.1`, `%31`, full-width digits, `[::ffff:127.0.0.1]`) is refused,
+//! so what sopen calls loopback is what the browser reaches.
+//!
+//! The address goes to the browser and nowhere else whole: every line sopen prints — results,
+//! errors, debug — shows it as [`redacted`] does, without a password, query or fragment.
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Result};
 use std::ffi::OsString;
 use std::path::PathBuf;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 /// An `http://` or `https://` address, as written, split where sopen needs it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -40,16 +47,94 @@ pub fn parse(arg: &str) -> Option<Result<Url, String>> {
     Some(parse_after(arg, scheme.len()))
 }
 
-/// [`parse`] past the scheme (`scheme_len` bytes, then `://`).
-fn parse_after(arg: &str, scheme_len: usize) -> Result<Url, String> {
-    // Control characters shown escaped, so the message stays one line.
-    let shown: String = arg
+/// `arg` as sopen prints it: `user:***@` for a user and password (`***@` for a user alone,
+/// which may be a token), `?…` for a query, `#…` for a fragment; the scheme, host, port and
+/// path as written; control characters escaped, so it stays one line. Any text works, an
+/// address sopen refuses too.
+pub fn redacted(arg: &str) -> String {
+    let shown = match arg.find("://") {
+        None => arg.to_string(),
+        Some(i) => {
+            let (head, after) = arg.split_at(i + 3);
+            let end = after.find(['/', '?', '#']).unwrap_or(after.len());
+            let (authority, rest) = after.split_at(end);
+            let authority = match authority.rfind('@') {
+                Some(at) => match authority[..at].split_once(':') {
+                    Some((user, _)) => format!("{user}:***@{}", &authority[at + 1..]),
+                    None => format!("***@{}", &authority[at + 1..]),
+                },
+                None => authority.to_string(),
+            };
+            let (path, tail) = rest.split_at(rest.find(['?', '#']).unwrap_or(rest.len()));
+            let mut out = format!("{head}{authority}{path}");
+            if tail.starts_with('?') {
+                out.push_str("?…");
+            }
+            if tail.contains('#') {
+                out.push_str("#…");
+            }
+            out
+        }
+    };
+    shown
         .chars()
         .map(|c| match c.is_control() {
             true => c.escape_default().to_string(),
             false => c.to_string(),
         })
-        .collect();
+        .collect()
+}
+
+/// A host spelled as a browser reads it: `None`, or why not. A browser reads a host whose last
+/// label is a number (digits, or `0x…`) as an IPv4 address — `127.1`, `2130706433`, `0177.0.0.1`
+/// and `0x7f.0.0.1` all reach 127.0.0.1 — so only a plain dotted quad may be one; it decodes `%`
+/// and maps non-ASCII (full-width digits) before that, so neither may be in a host.
+fn unplain_host(host: &str) -> Option<String> {
+    const PLAINLY: &str = "write the host plainly (127.0.0.1)";
+    if host.contains('%') {
+        return Some(format!("a '%' in the host ({PLAINLY})"));
+    }
+    if !host.is_ascii() {
+        return Some(
+            "a non-ASCII host (write it plainly in ASCII: 127.0.0.1, or xn--… for an \
+             international name)"
+                .to_string(),
+        );
+    }
+    let labels: Vec<&str> = host.split('.').collect();
+    let last = match labels.as_slice() {
+        [.., last, ""] => last,
+        [.., last] => last,
+        [] => return None,
+    };
+    let number = |label: &str| {
+        let hex = label
+            .strip_prefix("0x")
+            .or_else(|| label.strip_prefix("0X"))
+            .map(|h| h.bytes().all(|b| b.is_ascii_hexdigit()));
+        hex.unwrap_or(!label.is_empty() && label.bytes().all(|b| b.is_ascii_digit()))
+    };
+    if !number(last) {
+        return None;
+    }
+    let octet = |label: &&str| {
+        !label.is_empty()
+            && label.len() <= 3
+            && label.bytes().all(|b| b.is_ascii_digit())
+            && (label.len() == 1 || !label.starts_with('0'))
+            && label.parse::<u16>().is_ok_and(|n| n <= 255)
+    };
+    match labels.len() == 4 && labels.iter().all(octet) {
+        true => None,
+        false => Some(format!(
+            "'{host}' is read by browsers as an IPv4 address ({PLAINLY})"
+        )),
+    }
+}
+
+/// [`parse`] past the scheme (`scheme_len` bytes, then `://`).
+fn parse_after(arg: &str, scheme_len: usize) -> Result<Url, String> {
+    let shown = redacted(arg);
     let bad = |why: &str| format!("{why} in '{shown}'");
     // One argument to the browser and one line in what sopen prints: no blank in it (a space
     // is `%20` in an address), and nothing a terminal would act on.
@@ -70,10 +155,20 @@ fn parse_after(arg: &str, scheme_len: usize) -> Result<Url, String> {
             .find(']')
             .ok_or_else(|| bad("no closing ']' after an IPv6 host"))?;
         let ip = &inside[..close];
-        // A zone (`%25en0`) is not part of the address itself.
-        let bare = ip.split('%').next().unwrap_or_default();
-        if bare.parse::<std::net::Ipv6Addr>().is_err() {
+        if ip.contains('%') {
+            return Err(bad(
+                "a zone ('%…') in an IPv6 host (browsers do not take one)",
+            ));
+        }
+        let Ok(v6) = ip.parse::<std::net::Ipv6Addr>() else {
             return Err(bad(&format!("'{ip}' is not an IPv6 address")));
+        };
+        // `::ffff:127.0.0.1` (and the old `::127.0.0.1`) reach an IPv4 address.
+        let embedded = v6.segments()[..6].iter().all(|&s| s == 0) && !v6.is_loopback();
+        if v6.to_ipv4_mapped().is_some() || (embedded && !v6.is_unspecified()) {
+            return Err(bad(&format!(
+                "'{ip}' is an IPv4 address in IPv6 (write the host plainly: 127.0.0.1)"
+            )));
         }
         let after = &inside[close + 1..];
         let port = match after {
@@ -98,6 +193,11 @@ fn parse_after(arg: &str, scheme_len: usize) -> Result<Url, String> {
     {
         return Err(bad(&format!("'{c}' cannot be in a host")));
     }
+    if !host.starts_with('[') {
+        if let Some(why) = unplain_host(host) {
+            return Err(bad(&why));
+        }
+    }
     let port = match port {
         None | Some("") => None,
         Some(p) => Some(
@@ -118,9 +218,14 @@ fn parse_after(arg: &str, scheme_len: usize) -> Result<Url, String> {
 }
 
 impl Url {
-    /// The address exactly as given.
+    /// The address exactly as given — for the browser only; print [`Url::shown`].
     pub fn as_str(&self) -> &str {
         &self.text
+    }
+
+    /// The address as sopen prints it ([`redacted`]).
+    pub fn shown(&self) -> String {
+        redacted(&self.text)
     }
 
     /// The host without IPv6 brackets.
@@ -159,23 +264,28 @@ impl Url {
         format!("{}://{user}{}:{port}{}", self.scheme, self.host, self.rest)
     }
 
-    /// ssh's `-R` value that serves this address on port `listen` of the other machine:
-    /// `listen:host:port` (an IPv6 host in brackets, as ssh takes it).
+    /// ssh's `-R` value that serves this address on port `listen` of the other machine, bound
+    /// there to loopback by name: `127.0.0.1:listen:host:port`, or `[::1]:listen:host:port` for
+    /// an IPv6 address (an IPv6 host in brackets, as ssh takes it). sshd keeps an explicit
+    /// loopback address under `GatewayPorts no` and `clientspecified`; only `yes` overrides it,
+    /// which HOST's sopen refuses ([`crate::forward::tunnel_port_is_private`]).
     pub fn remote_forward(&self, listen: u16) -> String {
-        format!("{listen}:{}:{}", self.host, self.port())
+        let bind = match self.host.starts_with('[') {
+            true => "[::1]",
+            false => "127.0.0.1",
+        };
+        format!("{bind}:{listen}:{}:{}", self.host, self.port())
     }
 }
 
-/// The line a run that opened `url` prints (on HOST, the one the tunnel waits for).
-pub fn opened_line(url: &str) -> String {
-    format!("opened {url} in the browser")
+/// The line a run that opened an address prints, `shown` being [`Url::shown`].
+pub fn opened_line(shown: &str) -> String {
+    format!("opened {shown} in the browser")
 }
 
-/// Whether `line` is [`opened_line`]'s, and of which address.
-pub fn opened_in(line: &str) -> Option<&str> {
-    line.strip_prefix("opened ")?
-        .strip_suffix(" in the browser")
-}
+/// The line HOST's sopen prints once a tunnelled address is open in its browser — the cue the
+/// other side waits for. Fixed: it carries nothing of the address.
+pub const TUNNEL_OPEN: &str = "sopen-tunnel-open";
 
 /// What opens an address: `SOPEN_BROWSER` (a receipt hook: a command given the address as its
 /// one argument) when set and not empty, else the default browser's opener — `open` on macOS,
@@ -188,13 +298,53 @@ pub fn browser(hook: Option<OsString>) -> PathBuf {
     }
 }
 
+/// How long [`open`] waits for the browser's opener to exit: `SOPEN_EDITOR_WAIT` seconds as
+/// an editor CLI is waited for (at most 120), else 3 s.
+fn opener_wait(value: Option<&std::ffi::OsStr>) -> Duration {
+    value
+        .and_then(|v| v.to_str())
+        .and_then(|v| v.trim().parse::<f64>().ok())
+        .filter(|s| s.is_finite() && *s > 0.0)
+        .map(|s| Duration::from_secs_f64(s.min(120.0)))
+        .unwrap_or(Duration::from_secs(3))
+}
+
 /// Opens `url` in this machine's browser ([`browser`]): started in its own process group with
 /// no input or output (a browser that kept a session's output open would keep that session,
-/// and a tunnel through it, alive), waited for briefly; a quick failure is an error.
+/// and a tunnel through it, alive), waited for briefly ([`opener_wait`]); a quick failure is an
+/// error. Only the browser gets the address whole.
 pub fn open(url: &Url) -> Result<()> {
+    use std::os::unix::process::CommandExt;
     let browser = browser(std::env::var_os("SOPEN_BROWSER"));
-    crate::zed::open_args(&browser, &[OsString::from(url.as_str())])
-        .with_context(|| format!("cannot open {} in the browser", url.as_str()))?;
+    let shown = url.shown();
+    crate::debug!("spawn: {} {shown}", browser.display());
+    let spawned = Command::new(&browser)
+        .arg(url.as_str())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .process_group(0)
+        .spawn();
+    let mut child = match spawned {
+        Ok(child) => child,
+        Err(e) => bail!(
+            "cannot open {shown} in the browser: cannot start {}: {e}",
+            browser.display()
+        ),
+    };
+    let deadline = Instant::now() + opener_wait(std::env::var_os("SOPEN_EDITOR_WAIT").as_deref());
+    while Instant::now() < deadline {
+        if let Some(status) = child.try_wait()? {
+            if !status.success() {
+                bail!(
+                    "cannot open {shown} in the browser: {} exited with {status}",
+                    browser.display()
+                );
+            }
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
     Ok(())
 }
 
@@ -267,7 +417,8 @@ mod tests {
         // IPv6 in brackets.
         let u = url("http://[::1]:9000/x");
         assert_eq!((u.host(), u.port()), ("::1", 9000));
-        assert_eq!(url("http://[fe80::1%25en0]/").host(), "fe80::1%25en0");
+        assert_eq!(url("http://[0:0:0:0:0:0:0:1]/").host(), "0:0:0:0:0:0:0:1");
+        assert!(url("http://[0:0:0:0:0:0:0:1]/").is_loopback());
     }
 
     #[test]
@@ -292,7 +443,90 @@ mod tests {
         ] {
             let why = malformed(arg);
             assert!(why.contains(says), "{arg:?}: {why}");
-            assert!(why.contains(&arg.replace('\n', "\\n")), "{arg:?}: {why}");
+            assert!(why.contains(&redacted(arg)), "{arg:?}: {why}");
+            assert!(!why.contains('\n'), "{arg:?}: {why}");
+        }
+    }
+
+    /// A host a browser would read as another address — loopback by another spelling — is
+    /// refused, so sopen's loopback test cannot be passed by: `127.1` is 127.0.0.1 to a browser.
+    #[test]
+    fn a_host_must_be_spelled_plainly() {
+        for (arg, says) in [
+            ("http://127.1:1234/", "read by browsers as an IPv4 address"),
+            ("http://2130706433/", "read by browsers as an IPv4 address"),
+            ("http://0177.0.0.1/", "read by browsers as an IPv4 address"),
+            ("http://0x7f.0.0.1/", "read by browsers as an IPv4 address"),
+            ("http://127.0.0.0x1/", "read by browsers as an IPv4 address"),
+            ("http://127.0.0.1./", "read by browsers as an IPv4 address"),
+            ("http://127.000.0.1/", "read by browsers as an IPv4 address"),
+            ("http://1.2.3.256/", "read by browsers as an IPv4 address"),
+            ("http://foo.0x10/", "read by browsers as an IPv4 address"),
+            ("http://127.0.0.%31/", "a '%' in the host"),
+            ("http://local%68ost/", "a '%' in the host"),
+            ("http://１２７.０.０.１/", "non-ASCII host"),
+            ("http://ｌｏｃａｌｈｏｓｔ/", "non-ASCII host"),
+            ("http://[::1%25lo0]/", "a zone"),
+            ("http://[::ffff:127.0.0.1]/", "an IPv4 address in IPv6"),
+            ("http://[::127.0.0.1]/", "an IPv4 address in IPv6"),
+        ] {
+            let why = malformed(arg);
+            assert!(why.contains(says), "{arg}: {why}");
+        }
+        for plain in [
+            "http://127.0.0.1/",
+            "http://0.0.0.0/",
+            "http://10.0.0.255/",
+            "http://box/",
+            "http://box.lan/",
+            "http://1box/",
+            "http://box1.example.com/",
+            "http://localhost./",
+            "http://[::1]/",
+            "http://[::]/",
+            "http://[2001:db8::1]/",
+        ] {
+            assert!(matches!(parse(plain), Some(Ok(_))), "{plain}");
+        }
+    }
+
+    /// What sopen prints of an address: no password, query or fragment — they can be secrets.
+    #[test]
+    fn printed_addresses_carry_no_secrets() {
+        for (arg, shown) in [
+            ("http://127.0.0.1:1234/a", "http://127.0.0.1:1234/a"),
+            (
+                "https://me:s3cret@box:8443/p/q?token=abc&x=1#frag",
+                "https://me:***@box:8443/p/q?…#…",
+            ),
+            ("http://tok3n@box/", "http://***@box/"),
+            ("http://a:b@c@box/", "http://a:***@box/"),
+            ("http://box?x", "http://box?…"),
+            ("http://box/#x?y", "http://box/#…"),
+            ("http://box/a?b#c", "http://box/a?…#…"),
+            ("HTTP://[::1]:9/", "HTTP://[::1]:9/"),
+            ("http://box/\nx", "http://box/\\nx"),
+            ("not an address", "not an address"),
+        ] {
+            assert_eq!(redacted(arg), shown, "{arg}");
+        }
+        let u = url("http://me:s3cret@localhost:3000/x?token=abc#frag");
+        assert_eq!(u.shown(), "http://me:***@localhost:3000/x?…#…");
+        // The browser still gets it whole.
+        assert_eq!(
+            u.as_str(),
+            "http://me:s3cret@localhost:3000/x?token=abc#frag"
+        );
+        // An address sopen refuses is said without its secrets too.
+        for arg in [
+            "http://me:s3cret@box:99999/?token=abc#frag",
+            "http://me:s3cret@127.1/?token=abc",
+            "http://me:s3cret@box/a b?token=abc",
+        ] {
+            let why = malformed(arg);
+            for secret in ["s3cret", "token=abc", "frag"] {
+                assert!(!why.contains(secret), "{arg}: {why}");
+            }
         }
     }
 
@@ -338,26 +572,41 @@ mod tests {
 
     #[test]
     fn the_tunnel_serves_the_address_from_this_machine() {
+        // Bound to loopback by address on the other machine, by family.
         assert_eq!(
             url("http://127.0.0.1:1234/").remote_forward(1234),
-            "1234:127.0.0.1:1234"
+            "127.0.0.1:1234:127.0.0.1:1234"
         );
         assert_eq!(
             url("http://localhost/").remote_forward(50000),
-            "50000:localhost:80"
+            "127.0.0.1:50000:localhost:80"
         );
         assert_eq!(
             url("http://[::1]:9000/").remote_forward(9000),
-            "9000:[::1]:9000"
+            "[::1]:9000:[::1]:9000"
         );
     }
 
     #[test]
-    fn the_opened_line_is_read_back() {
-        let line = opened_line("http://127.0.0.1:1/");
-        assert_eq!(line, "opened http://127.0.0.1:1/ in the browser");
-        assert_eq!(opened_in(&line), Some("http://127.0.0.1:1/"));
-        assert_eq!(opened_in("opened box:/x in VS Code"), None);
+    fn the_opened_lines() {
+        let u = url("http://me:pw@127.0.0.1:1/?t=1");
+        assert_eq!(
+            opened_line(&u.shown()),
+            "opened http://me:***@127.0.0.1:1/?… in the browser"
+        );
+        // The tunnel's cue carries nothing of the address.
+        assert!(!TUNNEL_OPEN.contains("http"));
+    }
+
+    #[test]
+    fn the_opener_wait_is_bounded() {
+        let wait = |v: &str| opener_wait(Some(std::ffi::OsStr::new(v)));
+        assert_eq!(opener_wait(None), Duration::from_secs(3));
+        assert_eq!(wait("60"), Duration::from_secs(60));
+        assert_eq!(wait("1e9"), Duration::from_secs(120));
+        for bad in ["", "0", "-1", "x", "NaN", "inf"] {
+            assert_eq!(wait(bad), Duration::from_secs(3), "{bad}");
+        }
     }
 
     #[test]

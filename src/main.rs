@@ -518,10 +518,9 @@ fn run_source(
         return run_url(source, url, flag, here, hold, app_name, hex, dirs, rec);
     }
     if hold {
-        return Err(Usage(format!(
-            "--hold-until-eof is for an http(s):// address, not {source}"
-        ))
-        .into());
+        return Err(
+            Usage("--hold-until-eof is for an http(s):// address, not a file".to_string()).into(),
+        );
     }
     let chosen = forward::choose(here, flag, forward::target_env, || {
         Ok(config::load(&config::path()?)?.target)
@@ -565,7 +564,8 @@ fn run_url(
     for (given, flag_name) in [(app_name.is_some(), "--app"), (hex, "--hex")] {
         if given {
             return Err(Usage(format!(
-                "{flag_name} opens a file; {source} is an address (it opens in the browser)"
+                "{flag_name} opens a file; {} is an address (it opens in the browser)",
+                sopen::url::redacted(source)
             ))
             .into());
         }
@@ -582,23 +582,31 @@ fn run_url(
     };
     rec.target = Some(host.clone());
     if url.is_loopback() {
-        sopen::debug!("opening {} on {host} through a tunnel", url.as_str());
+        sopen::debug!("opening {} on {host} through a tunnel", url.shown());
         forward::tunnel(&host, &url, &dirs.state)
     } else {
-        sopen::debug!("opening {} on {host}", url.as_str());
+        sopen::debug!("opening {} on {host}", url.shown());
         forward::run(&host, url.as_str(), None, false, &dirs.state)
     }
 }
 
-/// Opens `url` in this machine's browser and says so; with `hold` (HOST's half of a tunnel)
-/// then waits for the input's end — the other side's sopen ending, however it ends.
+/// Opens `url` in this machine's browser and says so. With `hold` (HOST's half of a tunnel) it
+/// first checks that the tunnel's port — the address's — listens on loopback only here, and
+/// refuses otherwise; then says [`sopen::url::TUNNEL_OPEN`] and waits for the input's end —
+/// the other side's sopen ending, however it ends.
 fn open_url(url: &sopen::url::Url, hold: bool) -> Result<()> {
-    sopen::url::open(url)?;
-    println!("{}", sopen::url::opened_line(url.as_str()));
     if hold {
-        // The end of the input, or an error reading it: either way the other side is gone.
-        let _ = std::io::copy(&mut std::io::stdin().lock(), &mut std::io::sink());
+        forward::tunnel_port_is_private(url.port())?;
     }
+    sopen::url::open(url)?;
+    if !hold {
+        println!("{}", sopen::url::opened_line(&url.shown()));
+        return Ok(());
+    }
+    println!("{}", sopen::url::TUNNEL_OPEN);
+    let _ = std::io::stdout().flush();
+    // The end of the input, or an error reading it: either way the other side is gone.
+    let _ = std::io::copy(&mut std::io::stdin().lock(), &mut std::io::sink());
     Ok(())
 }
 
@@ -613,7 +621,8 @@ fn run_open(
     if let Some(url) = sopen::url::parse(arg) {
         if app_name.is_some() || hex {
             bail!(Usage(format!(
-                "--app and --hex open files; {arg} is an address"
+                "--app and --hex open files; {} is an address",
+                sopen::url::redacted(arg)
             )));
         }
         return open_url(&url.map_err(anyhow::Error::msg)?, false);
