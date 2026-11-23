@@ -1,13 +1,15 @@
 # browser — loop (open items only)
 
-Status: round 1 merged (2026-11-22; S1-M, PR #36, was its last unit). Target: [`ssot.md`](ssot.md). Contracts: `../02-architecture.md` (§8 the
-slices and their order), `../03-git-panel.md`, `../04-file-keys.md`, `../05-directory-tree.md`. Closed rows move to
-`loop.done.md` in the commit that closes their round.
+Status: round 2 merged (2026-11-24; S4-C, PR #92, was its last unit) — every slice S1–S7 is on main and every
+WU row is in [`loop.done.md`](loop.done.md). Target: [`ssot.md`](ssot.md). Contracts: `../02-architecture.md`
+(§8 the slices and their order), `../03-git-panel.md`, `../04-file-keys.md`, `../05-directory-tree.md`.
 
-## Round 2 — slice S5 (the directory tree: F10, Alt+F10)
+## Open — receipts only (no WU)
 
-All of S5 is merged — S5-0 (PR #63), S5-B (#66), S5-A (#71), S5-C (#77), 2026-11-23 — and its rows are in
-[`loop.done.md`](loop.done.md). Contract: 05.
+| ID | Status | What | Who |
+|---|---|---|---|
+| K-F3 | 🚪 owner | 04 §8: a plain F5 on the Mac's built-in keyboard opens the Copy dialog with sopen in front; another app gets dictation back; `kill -9` of sopen restores the key mode within a second. Until it exists, the key half of 04 §6.2 is unproven. | the owner, at the Mac |
+| G-R3-bash | 🔴 open | 03 §11: the live Esc-stop of a remote fetch under a bash login shell (zsh and fish are measured). | needs a host account whose login shell is bash |
 
 ## Build facts
 
@@ -20,50 +22,5 @@ All of S5 is merged — S5-0 (PR #63), S5-B (#66), S5-A (#71), S5-C (#77), 2026-
   E1; only work on a shared file runs one at a time (a scaffold's `mod` lines, the `keys.rs` and `gui/mod.rs` rows,
   each slice's integration WU in `browser.rs`, `main.rs` and `view.rs`), and two integration WUs never at once
   (02 §8.1).
-
-## Next
-
-- 2026-11-21: S1-E merged (PR #29, 0120d40) and is deployed as preview 0120d40813a0. S1-M and the streaming units
-  that waited on S1 were then ready to start: S1-M (PR #36) and W6 merged on 2026-11-22, W4 and
-  W5a on 2026-11-21, and ED3 is in progress ([`../streaming/loop.md`](../streaming/loop.md)).
-- 2026-11-22: S1-M merged (PR #36, bdb6166): the media preview, its budgets and hand-over, with E3's media rerun
-  written into 02 §8.2. Its row is in [`loop.done.md`](loop.done.md) (R1 part 3).
-- E3 is closed (2026-11-21): its result is in 02 §8.2 and its row in [`loop.done.md`](loop.done.md). S1-M reruns
-  it for media previews.
-
-## Round 2 — slice S2
-
-All of S2 is merged — S2-0 (PR #64), S2-C (#67), S2-E (#68), S2-B (#69), S2-A (#70), S2-D (#72), S2-F (#80),
-2026-11-23 — and its rows are in [`loop.done.md`](loop.done.md). Contract: 03.
-
-## Round 2 — slice S3 (git actions, staging and commit, backups, restore and undo, the banner, the log)
-
-All of S3 is merged — S3-0 (PR #79), S3-B (#81), S3-A (#83), 2026-11-23, and S3-C (#90) — and its rows are in
-[`loop.done.md`](loop.done.md). Contract: 03.
-
-## Round 2 — slice S4 (history edits: the quick edits and the planner)
-
-The history edits of 03 §7.8 with §8's safety (02 §8.1 S4; contract `../03-git-panel.md`). S4-0 (PR #86), S4-A
-(#89) and S4-B (#88) are merged (2026-11-23), their rows in [`loop.done.md`](loop.done.md); S4-C wires them, after
-S3-C (two integration WUs never run together, 02 §8.1 "Schedule").
-
-| ID | Status | Branch | Scope | Owner files (02 §5) | After |
-|---|---|---|---|---|---|
-| S4-C | 🟡 in progress | `feat/browser-s4-integration` | wiring S4-A and S4-B: the §7.8 menu row and the banner's Amend and Split that S4-B adds to `menu.rs` and `in_progress.rs`; quick edits and planner runs on a worker under the repository's write lock (`rebase::needs` and `open_needs` through `actions::inspect`, the plan through `actions::execute`), the refresh after (03 §5), `GitEvent::WorkTreeChanged`; the split kept per window, its Continue through `rebase::Edit::ContinueSplit`; F2 and F8 on a commit row as `reword` and `drop` (03 §9.1), the planner taking its keys before the git context's rows, S4's key rows landed (S4-C adds 4 to `keys.rs`'s `LANDED_SLICES`; hand-over); `SOPEN_STATE dialog=` for §7.8's ids (`EditId::parse`, 02 §9); S4's scenarios (02 §8.1's table: G-H1–G-H5, G-W1 planner), receipts | `src/gui/browser.rs`, `src/gui/browser/{view,tests}.rs`, `src/gui/browser/tests/s4.rs`, `src/gui/browser/git_panel/mod.rs` (hand-over), `src/gui/browser/keys.rs` and `src/gui/help.rs` (hand-over), `src/gui/mod.rs` (receipt keys), `src/main.rs`, `tests/cli.rs`, `AGENTS.md`, `README.md` | S4-A, S4-B, S3-C |
-
-## Round 2 — slice S7 (the macOS F-key switch)
-
-E1 is closed (2026-11-23): its result is in 02 §8.2 and its row in [`loop.done.md`](loop.done.md). S7-A (PR #65)
-and S7-B (#74) are merged (2026-11-23), their rows in `loop.done.md`. **Still open: the owner's receipt K-F3**
-(04 §8): a plain F5 on the built-in keyboard opens the Copy dialog, another app gets dictation back, and
-`kill -9` of sopen in front restores the key mode within a second. Until it exists, the key half of 04 §6.2 is
-unproven.
-
-## Round 2 — slice S6 (F7 make folder, F8 delete, remote folder rename, copy publish without `hardlink@`)
-
-E2 is closed (2026-11-23): route B, its result in 02 §8.2 and 04 §5.6, its row in [`loop.done.md`](loop.done.md).
-S6-0 (PR #73), S6-B (#75) and S6-A (#78) are merged (2026-11-23), their rows in `loop.done.md`; S6-C wires them.
-
-| ID | Status | Branch | Scope | Owner files (02 §5) | After |
-|---|---|---|---|---|---|
-| S6-C | 🟡 in progress | `feat/browser-s6-integration` | wiring S6-A and S6-B: F7, F8, Del, ⌘⌫, Shift+F8, Shift+Del into the dialogs and the engine; F2 and F6 of a remote folder through the plain rename; S6's key rows landed (`keys.rs` lands rows by one threshold, `slice <= LANDED`, so S6 before S2–S5 needs a change there, declared); S6's scenarios (02 §8.1's table: 04 K-R1 slots 7, 8, K-R3 Shift+F8, K-K1, K-D1, K-N1 remote folders, K-C4 without `hardlink@`), receipts; AGENTS.md, README, 01 §3a | `src/gui/browser.rs`, `src/gui/browser/{view,tests}.rs`, `src/gui/browser/keys.rs` (hand-over), `src/gui/mod.rs` (receipt keys), `src/main.rs`, `tests/cli.rs`, `AGENTS.md`, `README.md`, `.prd/01-spec.md` | S6-A, S6-B |
+- Clippy differs by toolchain: on 2026-11-24 the Mac's clippy passed S4-C while the Linux gate's (brew 1.96 and
+  stable 1.100) refused `nonminimal_bool` — the Linux gate's two clippy runs are part of the merge gate.

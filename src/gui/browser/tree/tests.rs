@@ -202,7 +202,7 @@ fn sample() -> Vec<TreeRow> {
     home.boundary = true;
     home.info.fs = Some(FsUse {
         bytes: 87_000_000_000,
-        files: 1_234_567,
+        files: Some(1_234_567),
     });
     let mut media = row(
         9,

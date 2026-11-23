@@ -246,7 +246,8 @@ Each folder row ends with three right-aligned columns, from the folder's own lis
   unreadable (R2).
 - A mount point of a disk filesystem (R3) and a macOS `nobrowse` volume (R7) show, at once, the filesystem mounted
   there: `=87G fs` = `(f_blocks − f_bfree) × f_frsize` from one `statvfs` (`statvfs@openssh.com` remotely), and its
-  used file count `(f_files − f_ffree)` on the status row while the bar is on it. The `=` and `fs` say it is the
+  used file count `(f_files − f_ffree)` on the status row while the bar is on it — none on a filesystem that counts
+  no files (`f_files` 0; btrfs, for one). The `=` and `fs` say it is the
   filesystem's figure, not the folder's: on APFS it is per volume; on btrfs a subvolume reports the whole pool. A
   deep scan of an R3 row, when it runs, replaces it with the folder's own size. Never for R4–R6 (meaningless
   or, for NFS and autofs, a call that can hang or mount).

@@ -201,7 +201,8 @@ Each folder row ends with three right-aligned columns, from the folder's own lis
 - **A mount point** of a disk filesystem (R3) shows at once the filesystem mounted there (a macOS
   `nobrowse` volume, R7, shows its `<SYSVOL>` tag instead, as D-4 asks): `=87G fs` = `(f_blocks − f_bfree) × f_frsize` from one `statvfs`
   (`statvfs@openssh.com` remotely), and its used file count `(f_files − f_ffree)` on the status row
-  while the bar is on it. `=` and `fs` say it is the filesystem's figure (on APFS per volume; a btrfs
+  while the bar is on it — none on a filesystem that counts no files (`f_files` 0; btrfs, for one).
+  `=` and `fs` say it is the filesystem's figure (on APFS per volume; a btrfs
   subvolume reports the pool). A deep scan of an R3 row, when it runs, replaces it with the folder's
   own size. Never for R4–R6 (meaningless, or a call that can hang or mount).
 - `T-info`: a temp folder with 2 subfolders and 3 files of 10, 20 and 30 bytes plus a hard link to
@@ -315,12 +316,17 @@ fixture under `/tmp/sopen-receipts/` (and, for the root rule, the real home, rea
   bar is on the current folder in the middle; a screenshot shows the rows of §6.1's kinds.
 - D-3. Remotely (a 12–40 ms link), F10 → the first frame within **1 s** (home, `realpath`, the mount
   table, the path's listings), and the screen's info lines within **1 s** more (measured: a screen of
-  36 rows in 133 ms with 16 in flight).
+  36 rows in 133 ms with 16 in flight). *Measured live, 2026-11-24* (the shipped binary, from a Mac
+  to a Linux host over a tailnet, F10 on `/`): the tree's first frame 794 and 776 ms after the key.
 - D-4. F10 in `/tmp` on macOS → root `/`; `/dev`, `/System/Volumes/*` and the automounted `home` show
   `<SYS>`, `<SYSVOL>`, `<AUTO>` and are never listed (the request log has no listing of them); a
   mounted disk image under `/Volumes` shows `=… fs`.
 - D-5. A remote Linux `/` → `proc`, `sys`, `dev` show `<SYS>` without a listing; `/home` and `/boot`
-  show `=… fs` from `statvfs@openssh.com`.
+  show `=… fs` from `statvfs@openssh.com` until their own scan replaces it (§6.1), and the bar on one
+  says it is a mount point. *Measured live, 2026-11-24* (the same run as D-3): `proc`, `sys`, `dev`
+  `<SYS>` with no counts; `/boot` `=1.2G fs` and an unreadable btrfs subvolume `=334G fs`; the
+  readable mounts (`/home`, `/srv`, `/tmp`, `/run`) scanned on screen, and the bar on `/home` said
+  `home is a mount point: 334G … used on its filesystem` — btrfs counts no files, so no file count.
 - D-6. A local folder with a 1 GB tree below a closed row → the row shows `…+ ·` at once and the
   exact size without `+` within seconds; a remote row with more than 300 subfolders below stops with
   `+`, Space resumes it, and it ends without `+`; a remote folder of 300 000 files in one folder stops

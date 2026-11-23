@@ -155,9 +155,15 @@ pub struct Mounts {
 pub struct FsStat {
     /// `(f_blocks − f_bfree) × f_frsize`.
     pub used_bytes: u64,
-    /// `f_files − f_ffree`.
-    pub used_files: u64,
+    /// `f_files − f_ffree`; `None` where the filesystem counts no files ([`files_used`]).
+    pub used_files: Option<u64>,
     pub fsid: u64,
+}
+
+/// The used file count of a filesystem from `statvfs`'s `f_files` and `f_ffree`: `None` where
+/// `f_files` is 0 — a filesystem that counts no files (btrfs), not one with none used.
+pub fn files_used(files: u64, ffree: u64) -> Option<u64> {
+    (files > 0).then(|| files.saturating_sub(ffree))
 }
 
 /// A path resolved by `realpath`.
@@ -476,6 +482,15 @@ mod tests {
                 ("/run/user/1000/doc", "fuse.portal"),
             ]
         );
+    }
+
+    /// 05 §6.1: a filesystem that counts no files (btrfs: `f_files` and `f_ffree` are 0) has no
+    /// used file count, not 0.
+    #[test]
+    fn a_filesystem_that_counts_no_files_has_no_file_count() {
+        assert_eq!(files_used(0, 0), None);
+        assert_eq!(files_used(10, 1), Some(9));
+        assert_eq!(files_used(10, 10), Some(0));
     }
 
     #[test]

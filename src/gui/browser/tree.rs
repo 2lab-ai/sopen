@@ -137,7 +137,8 @@ pub enum Tag {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FsUse {
     pub bytes: u64,
-    pub files: u64,
+    /// `None`: the filesystem counts no files (`f_files` is 0, as on btrfs).
+    pub files: Option<u64>,
 }
 
 /// What a key or a click on the tree asks of the model; S5-C carries it out. The bar keys move
@@ -259,12 +260,17 @@ impl TreeView {
         }
         match self.bar_row() {
             Some(row) if row.boundary => match row.info.fs {
-                Some(fs) => Status::info(format!(
-                    "{} is a mount point: {} and {} files used on its filesystem",
-                    row.name,
-                    size_text(fs.bytes, false, false),
-                    fs.files
-                )),
+                Some(fs) => {
+                    let used = size_text(fs.bytes, false, false);
+                    let used = match fs.files {
+                        Some(files) => format!("{used} and {files} files"),
+                        None => used,
+                    };
+                    Status::info(format!(
+                        "{} is a mount point: {used} used on its filesystem",
+                        row.name
+                    ))
+                }
                 None => Status::info(HINT),
             },
             _ => Status::info(HINT),
@@ -730,7 +736,8 @@ pub fn view_row(row: &model::Row, fs: Option<u64>) -> TreeRow {
             model::Glyph::Closed | model::Glyph::Link => Fold::Closed,
         },
         hidden: row.dimmed,
-        // R3 (the model reads its filesystem's used files there); R7 is its `<SYSVOL>` tag.
+        // R3 (the model reads its filesystem's used files there, counted or not); R7 is its
+        // `<SYSVOL>` tag.
         boundary: i.fs_files.is_some(),
         info: Info {
             dirs: count(i.dirs),

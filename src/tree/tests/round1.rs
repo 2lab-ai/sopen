@@ -118,7 +118,7 @@ impl Scripted {
                 id,
                 got: Got::Statvfs(Ok(FsStat {
                     used_bytes: 87_000,
-                    used_files: 9,
+                    used_files: Some(9),
                     fsid: 1,
                 })),
             });
@@ -157,7 +157,7 @@ impl TreeFs for Scripted {
             }
             Ask::Statvfs(_) => Got::Statvfs(Ok(FsStat {
                 used_bytes: 87_000,
-                used_files: 9,
+                used_files: Some(9),
                 fsid: 1,
             })),
             Ask::Scan(a) if a.start.iter().any(|p| s.hang_scans.contains(p)) => Got::NotAnswering,

@@ -11,12 +11,12 @@
 
 use super::{read_at, SftpRemote, META_TIMEOUT};
 use crate::remote::treefs::{
-    guarded, is_cachedir_tag, scan_step, Ask, Budget, Child, FsStat, Got, Kind, Listing, Mounts,
-    Reply, Resolved, ScanAsk, ScanBudget, ScanEnd, Scanned, Target, Totals, TreeFs, IN_FLIGHT,
-    NOT_ANSWERING,
+    files_used, guarded, is_cachedir_tag, scan_step, Ask, Budget, Child, FsStat, Got, Kind,
+    Listing, Mounts, Reply, Resolved, ScanAsk, ScanBudget, ScanEnd, Scanned, Target, Totals,
+    TreeFs, IN_FLIGHT, NOT_ANSWERING,
 };
 use crate::remote::Wake;
-use openssh_sftp_client::fs::Fs;
+use openssh_sftp_client::fs::{Fs, Statvfs};
 use openssh_sftp_client::Sftp;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
@@ -874,11 +874,16 @@ async fn statvfs(
         return Err("the server does not offer statvfs@openssh.com".into());
     }
     let st = within(request, &format!("statvfs {path}"), fs.statvfs(path)).await?;
-    Ok(FsStat {
+    Ok(fs_stat(&st))
+}
+
+/// What a `statvfs@openssh.com` reply says of its filesystem.
+fn fs_stat(st: &Statvfs) -> FsStat {
+    FsStat {
         used_bytes: st.blocks.saturating_sub(st.bfree).saturating_mul(st.frsize),
-        used_files: st.files.saturating_sub(st.ffree),
+        used_files: files_used(st.files, st.ffree),
         fsid: st.fsid,
-    })
+    }
 }
 
 /// What a row's listing adds to a scan's: the client to read `CACHEDIR.TAG` with, and the
@@ -1119,6 +1124,35 @@ mod tests {
 
     /// `SSH_FXP_OPENDIR`.
     const OPENDIR: u8 = 11;
+
+    /// 05 §6.1: a `statvfs@openssh.com` reply with `f_files` 0 (btrfs) gives no file count; one
+    /// that counts files gives `f_files − f_ffree`.
+    #[test]
+    fn a_statvfs_reply_without_file_counting_has_no_file_count() {
+        let reply = |files, ffree| Statvfs {
+            bsize: 4096,
+            frsize: 4096,
+            blocks: 100,
+            bfree: 40,
+            bavail: 40,
+            files,
+            ffree,
+            favail: ffree,
+            fsid: 7,
+            flag: 0,
+            namemax: 255,
+        };
+        let btrfs = fs_stat(&reply(0, 0));
+        assert_eq!(
+            btrfs,
+            FsStat {
+                used_bytes: 60 * 4096,
+                used_files: None,
+                fsid: 7,
+            }
+        );
+        assert_eq!(fs_stat(&reply(1000, 10)).used_files, Some(990));
+    }
 
     fn p(path: &Path) -> String {
         path.to_str().unwrap().to_string()

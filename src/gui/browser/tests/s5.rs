@@ -11,7 +11,9 @@
 //! cache keeps a home per host).
 
 use super::*;
-use crate::remote::treefs::{Budget, Disk, FsStat, Listing, Live, Mounts, Resolved};
+use crate::remote::treefs::{
+    files_used, Budget, Disk, FsStat, Listing, Live, Mount, Mounts, Resolved,
+};
 use crate::remote::treefs::{Reply, TreeFs};
 use crate::remote::Stat;
 use crate::tree::watchdog::{Pool, Timing};
@@ -29,6 +31,8 @@ struct TestDisk {
     slow: Mutex<Duration>,
     held: Mutex<bool>,
     moved: Condvar,
+    /// A folder the mount table gains as a btrfs mount point, and what its `statvfs` says.
+    mount: Mutex<Option<(String, FsStat)>>,
 }
 
 impl TestDisk {
@@ -40,6 +44,7 @@ impl TestDisk {
             slow: Mutex::default(),
             held: Mutex::new(false),
             moved: Condvar::new(),
+            mount: Mutex::default(),
         })
     }
 
@@ -95,11 +100,22 @@ impl Disk for TestDisk {
     }
 
     fn mounts(&self) -> std::io::Result<Mounts> {
-        self.real.mounts()
+        let mut mounts = self.real.mounts()?;
+        if let (Some((at, _)), Some(table)) = (&*self.mount.lock().unwrap(), &mut mounts.table) {
+            table.push(Mount {
+                at: at.clone(),
+                fstype: "btrfs".into(),
+                nobrowse: false,
+            });
+        }
+        Ok(mounts)
     }
 
     fn statvfs(&self, path: &str) -> std::io::Result<FsStat> {
-        self.real.statvfs(path)
+        match &*self.mount.lock().unwrap() {
+            Some((at, said)) if at == path => Ok(*said),
+            _ => self.real.statvfs(path),
+        }
     }
 }
 
@@ -512,6 +528,39 @@ fn enter_on_a_link_lists_its_target_or_says_it_is_gone() {
     assert_eq!(fx.b.panels[0].dir, format!("{root}/target"));
 }
 
+/// 05 §6.1: the bar on a mount point says what its filesystem holds — its used file count where
+/// the filesystem counts files, none where it counts none (btrfs's `f_files` and `f_ffree` are
+/// 0: "0 files" would be false).
+#[test]
+fn a_mount_point_says_its_files_only_where_its_filesystem_counts_them() {
+    for (files, ffree, said) in [
+        (
+            10,
+            1,
+            "disk is a mount point: 334G and 9 files used on its filesystem",
+        ),
+        (0, 0, "disk is a mount point: 334G used on its filesystem"),
+    ] {
+        let mut fx = fixture();
+        let root = fx.root.clone();
+        std::fs::create_dir(format!("{root}/disk")).unwrap();
+        let t5 = with_tree(&mut fx, &root);
+        *t5.disk.mount.lock().unwrap() = Some((
+            format!("{root}/disk"),
+            FsStat {
+                used_bytes: 334_000_000_000,
+                used_files: files_used(files, ffree),
+                fsid: 7,
+            },
+        ));
+        fx.relist_root();
+        open_tree(&mut fx, Modifiers::NONE);
+        tree_bar_on(&mut fx, "disk");
+        fx.wait_for(|b| b.status_line().text.contains("mount point"));
+        assert_eq!(fx.b.status_line().text, said, "f_files {files}");
+    }
+}
+
 /// F1 in the tree opens the tree's own page of the key help (it was empty before S5 landed).
 #[test]
 fn f1_in_the_tree_lists_the_trees_keys() {
@@ -808,7 +857,7 @@ fn the_models_rows_map_to_the_views() {
     );
     let disk = |size| Info {
         size,
-        fs_files: Some(1234),
+        fs_files: Some(Some(1234)),
         ..Info::default()
     };
     let fs = tree::view_row(
@@ -823,7 +872,7 @@ fn the_models_rows_map_to_the_views() {
     );
     let figure = Some(tree::FsUse {
         bytes: 87_000,
-        files: 1234,
+        files: Some(1234),
     });
     assert!(fs.boundary);
     assert_eq!((fs.info.size, fs.info.fs), (tree::Size::Unknown, figure));
