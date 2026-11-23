@@ -17,12 +17,19 @@
 //! with it (this file is S2-D's).
 #![allow(dead_code)]
 
+mod backups;
 mod details;
+mod dialogs;
 mod filters;
 mod find;
 mod graph_view;
+mod in_progress;
+mod log_view;
+mod menu;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tests_s3;
 
 // The integration's inputs (S2-F); the allowance goes with `dead_code`'s.
 #[allow(unused_imports)]

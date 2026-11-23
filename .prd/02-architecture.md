@@ -457,7 +457,7 @@ slice named here (§8); a file that exists today changes owner only from one sli
 | `tests/cli.rs`, `src/forward.rs` | end-to-end CLI tests of each slice's hooks; forwarding (nothing new: `SOPEN_STATE` and `SOPEN_LIST` already travel, `SOPEN_GIT` stays local) | each slice's integration WU |
 | `src/git/{detect,parse,history}.rs` | detection and its cache; parsers; the log stream | S2-B |
 | `src/git/graph.rs` | the lane layout (pure, deterministic) | S2-C |
-| `src/gui/browser/git_panel/{mod,graph_view,details,find,filters}.rs`, `src/gui/chrome/git.rs` | the read-only git panel and its look | S2-D |
+| `src/gui/browser/git_panel/{mod,graph_view,details,find,filters}.rs`, `src/gui/chrome/git.rs` | the read-only git panel and its look | S2-D; then S3-C (`GitAction`, `run`, `fkeys`) |
 | `src/git/{actions,backup}.rs` | every action of 03 §7 as a pure plan (steps, confirmation text, backups); backups, manifests, restores | S3-A |
 | `src/gui/browser/git_panel/{menu,dialogs,backups,log_view,in_progress}.rs` | the action menu, dialogs, the backups list, the command log, the banner | S3-B |
 | `src/git/rebase.rs`, `src/gui/browser/git_panel/planner.rs` | the history planner | S4-A, S4-B |
@@ -489,8 +489,12 @@ slice named here (§8); a file that exists today changes owner only from one sli
   load generation, a preview's bar position, a tree row's visibility); a result for an older
   generation is discarded unread.
 - **Sessions per window** (OpenSSH's default `MaxSessions` is 10 per connection): the listing 1, a
-  viewer 1, the preview 1 (§4.4), the tree 1 (05), a file operation 1 (04), git ≤ 3 — 8 in all, 9
-  while a git stop runs.
+  viewer 1, the preview 1 (§4.4), the tree 1 (05), a file operation 1 (04), git ≤ 4 — at most 3
+  commands in flight plus 1 stop session — so 9 in all. A host has **one stop session at a time**:
+  `Handle::stop` stops all its groups in that one session (`kill -TERM -- -<p1> -<p2> -<p3>`, then
+  `kill -KILL` the same way), and a second stop waits behind the first (03 §3.5). Without that rule
+  git's worst case is 6, a `kill` for each of 3 commands being stopped (E5's reading of the code,
+  §8.2), 11 in all; with it, 4.
 - **Git, per host**: one `GitHost` (runner, git version, at most 3 commands in flight; a stop has a
   session of its own, 03 §3.5). **Per repo**: one `GitRepo` (detection, the log stream, a **write
   lock**: one repository-changing command at a time; reads go on alongside).
@@ -587,7 +591,9 @@ then its WUs in parallel on disjoint files, then its **integration** WU, the sli
 | S7 | 04 K-F1–K-F6 |
 
 - **Schedule: slices run at the same time once their "Needs first" is met.** S2 → S3 → S4 keep that
-  order (each needs the one before it), and S7 waits for E1. Only work that touches a shared file
+  order (each needs the one before it), and S7 waits for E1. S3's scaffold and its logic and UI WUs
+  (S3-0, S3-A, S3-B) need only S2's merged read model and panel (S2-0–S2-E) and E5; only S3-C waits
+  for S2-F, as two integration WUs never run together. Only work that touches a shared file
   runs one at a time: a scaffold step's `mod` lines, the `keys.rs` and `gui/mod.rs` rows, and each
   slice's integration WU in `browser.rs`, `main.rs` and `view.rs` — two integration WUs never run at
   the same time. So the owner sees each part sooner, and a WU on disjoint files cannot collide with
@@ -771,6 +777,62 @@ a probe built on main a562e1e's `Cargo.lock`; nothing ran against a remote host)
 - **Not tested:** a parked stream (git blocked on the ssh window), and more than 3 commands in
   flight or alongside SFTP sessions (03 §4.1's four reads ran at most 3 in flight: 163 ms against
   314 ms one at a time, no failures). Those stay with E5 and G-P3.
+
+**E5's result** (measured 2026-11-23 on a remote Linux host — OpenSSH 10.5p1, git 2.55.0, the
+account's shell fish — from a Mac over one ssh master opened with sopen's own master options;
+sopen's binary was not run: a harness built every command's words as main a562e1e's runner builds
+them, its fixed scripts read out of the runner's source, and redid the runner's stop step by
+step):
+
+- **Run:** two parts on the one master.
+  - **Stop:** the runner's snippet form running `exec sleep 300`, plain and with a child that
+    ignores TERM, under fish (the account's shell, as sshd runs it) and under `bash -c`,
+    `bash -l -c`, `zsh -c` and `zsh -l -c`. bash and zsh were emulated: fish `exec`s the shell in
+    its own place, so the inner shell keeps the session leader's pid. Then the runner's stop:
+    `kill -TERM -- -<pid>` over the master, up to 5 s for the channel to end, `kill -0`, and
+    `kill -KILL` only if the group was still there.
+  - **Parked stream:** the runner's log words on E4's 100 000-commit fixture, 500 records read and
+    then no more; SFTP listings and a second runner command on the same master while it waited.
+- **Stop:** worked under all five forms, 10 of 10 runs. The printed pid was the group's and the
+  session's leader every time (pid = pgid = sid), its parent the master connection's sshd, so 03
+  §3.5's "the pid is the group" holds. TERM emptied a plain group in 0.14–0.74 s, no KILL sent. A
+  child that ignored TERM kept the channel open; the runner's KILL at the end of the 5 s grace
+  removed it, the whole stop 5.3–5.6 s, `killed=true`. Every outcome the runner reports matched
+  what the host showed, and nothing was left on the host.
+  - `exec 'kill'` ran util-linux `kill` under fish and bash and zsh's builtin under zsh. Both exit
+    0 for a group signalled and 1 for a group gone, the two codes the runner reads.
+  - A command the host kills with a signal makes the attached ssh exit 255, the code of a lost
+    channel. A stop reports its own outcome first, so a stop is not affected, and 03 §3.2's
+    `outcome unknown` stays the honest label for both.
+- **Parked stream:** git sat in `anon_pipe_write` (state S), having written about 2.2 MB more
+  than sopen had read (2 314 840 bytes written, 76 304 read). How that backlog splits between
+  the channel's window and the pipes on both ends is an estimate.
+  - While it waited, SFTP listings took 334–378 ms (350–388 ms with nothing parked) and the
+    second command 84–101 ms (88–98 ms); both at once worked too, and git did not move.
+  - A stop that read and dropped the output while it waited, as `Running`'s `Drop` and `finish`
+    do, ended git in 0.59 s. A stop that did not read waited out the whole 5 s grace (5.17 s):
+    git died at TERM, but the channel cannot end while the master holds output nobody reads. The
+    outcome was right either way.
+- **Sessions:** the host's sshd configuration sets no `MaxSessions`, so OpenSSH's default 10
+  applies (an estimate: `sshd -T` needs root). The run peaked at 3 sessions on the master. By
+  reading the code, git's worst case in sopen is 6: 3 commands in flight and, while each is
+  being stopped, one `kill` each, since a stop bypasses the in-flight limit. That is arithmetic,
+  not measured. §6's one stop session per host brings it to 4.
+- **Verdict:** no rule of 03 is wrong, and the design does not change. 03 §3.5's "the pid is the
+  group" and §4.5's "git blocks" are measured now, and §3.5 gains one clause: a remote stop keeps
+  reading and dropping the command's output while it waits. At a562e1e the log stream's `Pipe`
+  over the runner was not written yet; it must stop by dropping or finishing the `Running`, which
+  reads, not by stopping the handle and waiting (S2-F).
+- **Not tested:**
+  - a channel that ends while its group survives (the runner's repeated `kill -0` path);
+  - the `stop sent` paths: the master gone, or no `sopen-pid` line;
+  - bash or zsh as the real account shell (only emulated from fish); other hosts, OpenSSH versions,
+    a `ForceCommand` or `Match` block;
+  - sopen's binary itself;
+  - more than 3 sessions on the master at once, and sopen's own SFTP client rather than the `sftp`
+    program.
+
+  Every timing is a single sample.
 
 ## 9. Receipts and test hooks
 

@@ -137,3 +137,29 @@ changes. Rows here are snapshots taken when they were moved.
   measured on OpenSSH only (`-P hardlink`); on other servers sopen first probes, once per session,
   whether a plain rename refuses an existing target, and refuses the publish if it does not
   (04 §5.6).
+
+## E5 — closed 2026-11-23
+
+- measured E5 ✅ · result: the runner's remote stop worked under fish, and under bash and zsh
+  (`-c`, `-l -c`) emulated from a fish account, 10 of 10; a parked `git log` stream blocked
+  neither SFTP nor a second command on the same master; written into 02 §8.2 and 03 §3.5, §4.5;
+  S3 can start · closed rows: E5 · PRs: the PR that carries this block (S3-0's)
+
+### Closed rows
+
+| ID | Status | Before | What (02 §8.2) |
+|---|---|---|---|
+| E5 | ✅ done: 2026-11-23, result in 02 §8.2 | S3 | remote process-group stop under zsh, fish and bash login shells; an SFTP listing on the same master while a parked `git log` stream is open |
+
+### Round section
+
+- E5: one remote Linux host (OpenSSH 10.5p1, git 2.55.0, account shell fish); a harness built the
+  runner's words from main a562e1e and redid its stop step by step, sopen's binary not run. The
+  printed pid led its group and session every time; TERM emptied a plain group in 0.14–0.74 s; a
+  child that ignored TERM was gone after the runner's KILL, the stop 5.3–5.6 s. git parked in
+  `anon_pipe_write` about 2.2 MB ahead of what was read; SFTP listings (334–378 ms) and a second
+  command (84–101 ms) ran as fast as with nothing parked. A stop that drained the output took
+  0.59 s, one that did not 5.17 s: hence 03 §3.5's new clause. `MaxSessions` is the default 10
+  (an estimate); git's worst case in sopen is 6 by reading the code. Not tested: a channel that
+  ends while its group survives, the `stop sent` paths, bash or zsh as the real account shell,
+  more than 3 sessions at once.

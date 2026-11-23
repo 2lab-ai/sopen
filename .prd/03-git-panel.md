@@ -233,14 +233,22 @@ Every git command gets this environment and these options:
 ### 3.5 Stopping a command
 
 - **Priority**: a stop never waits behind the in-flight limit (§3.2); it has a session of its own.
+  On a remote that is one stop session per host at a time: a handle's stop ends all its groups in
+  it (`kill -TERM -- -<p1> -<p2> -<p3>`, then `kill -KILL` the same way), and a second stop waits
+  behind the first (02 §6's session count).
 - **Local**: `SIGTERM` to the command's process group (it has its own session, §3.1); after 5 s,
   `SIGKILL` to the group. When `SIGKILL` was needed, sopen lists any `*.lock` file it finds in the git
   directory in the result (never removing one).
 - **Remote**: a second command over the same master, `exec 'kill' '-TERM' '--' '-<pid>'`, with the pid
   from the `sopen-pid` line (sshd starts the session's command as the leader of a new session, so the
-  pid is the group *(estimate; G-R3 is the receipt)*); after 5 s, `kill -KILL` the same way; then sopen
-  closes the command's ssh channel. When the master is gone, or no `sopen-pid` line came back, the
-  result is `stop sent; the command may still be running on <host>`, never `stopped`.
+  pid is the group — *measured, E5, 2026-11-23*: under fish, and under bash and zsh with `-c` and
+  `-l -c` emulated from a fish account, 02 §8.2; G-R3 stays the receipt of sopen's own stop and of
+  `stop sent`); after 5 s, `kill -KILL` the same way; then sopen
+  closes the command's ssh channel. While it waits, sopen keeps reading and dropping the command's
+  output: the channel cannot end while the master holds output nobody reads, so a parked stream's
+  stop would otherwise take the whole 5 s (E5: 0.59 s with the output read, 5.17 s without). When
+  the master is gone, or no `sopen-pid` line came back, the result is `stop sent; the command may
+  still be running on <host>`, never `stopped`.
 - **After any stop** the panel refreshes (§5) and reports the state it finds: a stop is not a rollback.
   A stopped fetch may have updated some refs, objects and `FETCH_HEAD` (git updates refs one by one);
   a stopped write may have finished a step. The log says `stopped` with what the refresh found changed.
@@ -423,8 +431,10 @@ above); the result does not depend on anything but the input (run twice, compare
 ### 4.5 Paging
 
 - **Page size 500.** The log is one stream (`history.rs`): `git log` runs without `--max-count`; sopen
-  reads 500 records and stops reading; git then blocks on the full pipe (locally, measured below) or
-  on the ssh channel's flow-control window (remotely *(estimate)*: G-P3 is the receipt) and waits. "More" reads the next 500 from the same stream, so pages are
+  reads 500 records and stops reading; git then blocks on the full pipe (locally, measured below) or,
+  remotely, writing its stdout pipe to sshd (*measured, E5, 2026-11-23*: `anon_pipe_write`, about
+  2.2 MB beyond what sopen had read; how that backlog splits between the ssh channel's window and
+  the pipes is an *(estimate)*; G-P3 is the receipt) and waits. "More" reads the next 500 from the same stream, so pages are
   one walk of the history in one order, with no rows repeated or skipped.
 - More is read when the bar comes within one screen of the last loaded row, on ↓ on the last loaded
   row, or on a click on the paging line (the bar never stands on the paging line itself). The stream
@@ -1041,14 +1051,25 @@ slot keeps the meaning it has in the file list where git has one, so a mis-press
 | Cmd/Ctrl+K | the filters (§4.6) — from slice S2 on, before the F10 menu (slice S3) offers them too |
 | Cmd/Ctrl+Z | undo the newest backup group (§8.3) |
 | Cmd/Ctrl+B · Cmd/Ctrl+L | Backups list · command log |
+| Cmd/Ctrl+Shift+C · Cmd/Ctrl+Shift+S · Cmd/Ctrl+Shift+A | while the banner shows an operation (§8.5): its Continue · Skip · Abort, each through its dialog (§8.1); a step the state does not offer (Skip in a merge) does nothing, and the status row says so |
+| Cmd/Ctrl+Shift+B | while bisect is in progress: its Reset (`bisect reset`), through its dialog |
 | Cmd/Ctrl+E | the planner from the bar's commit (§7.8.2) |
 | Cmd/Ctrl+J | the bar to HEAD's row |
 | Cmd/Ctrl+G · Cmd/Ctrl+Shift+G | pin / unpin (02 §3.2) · the git panel over both sides and back |
 
+- **In the Backups list** (Cmd/Ctrl+B) the rows above act on the list, with no key of its own:
+  ↑ ↓ PgUp PgDn Home End move the bar over its groups and refs; Enter and F3 (View) Show the ref,
+  or the group's refs, in the graph (§8.2); Cmd/Ctrl+Z restores the group or ref under the bar
+  instead of the newest group (§8.3); F8 (Delete) deletes it; Esc closes the list. Restore and
+  Delete ask first.
+- The banner's Continue, Skip, Abort and Reset, and the Backups list's Restore, Show and Delete, are
+  buttons as well: a click does what the key does.
 - Checked against keys.md: none of these Cmd/Ctrl letters is bound in the list or a viewer's own
   pass while the git panel has the keyboard (§3.2 "what exists" there); no Ctrl+F-key and no
   Alt+F1–F4 is used (KDE takes them, keys.md §1); ⌘H (macOS hides the app) and ⇧⌘3/4/5 (screenshots)
-  are avoided. Cmd/Ctrl+R has the list's meaning (re-read), Cmd/Ctrl+Z the viewers' (undo).
+  are avoided. Cmd/Ctrl+R has the list's meaning (re-read), Cmd/Ctrl+Z the viewers' (undo). egui
+  turns Cmd/Ctrl+C, X and V into clipboard events only without Shift (egui-winit 0.37), so
+  Cmd/Ctrl+Shift+C reaches the panel as a key.
 - The planner's keys are in §7.8.2; inside a dialog, Enter runs and Esc cancels.
 
 ## 10. Out of scope, left out, open
@@ -1116,8 +1137,9 @@ under the remote `/tmp/sopen-receipts/`. A window receipt is a screenshot someon
   entry; no window or terminal prompt appears.
 - G-R3. Start a fetch whose upload-pack sleeps 30 s (`--upload-pack='sleep 30; git-upload-pack'`
   on a local fixture), press Esc → within 6 s the log says `stopped`, no process of its group is left,
-  no `*.lock` exists in the repository, and the refresh reports what changed. Live receipt (loop E5,
-  before S3): the same on a remote fixture under zsh, bash and fish login shells → after Esc,
+  no `*.lock` exists in the repository, and the refresh reports what changed. Live receipt (S3-C's,
+  on sopen's own binary against a real ssh host): the same on a remote fixture under zsh, bash and
+  fish login shells → after Esc,
   `ssh host pgrep -f 'sleep 30'` prints nothing; with the master killed before Esc → the result says
   `may still be running`.
 - G-R4. A test transport (`ShellGit` with a fault switch) that runs the command and then loses its
