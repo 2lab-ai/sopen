@@ -391,6 +391,16 @@ impl Default for PullHow {
     }
 }
 
+/// A push's own options (03 §7.2's `push` row): the same whether the push is a plain step or the
+/// lease push of an overwrite (§8.4), which carries them in its [`RemoteChange`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PushOptions {
+    /// `--set-upstream` (the dialog's default: on); never with a delete.
+    pub set_upstream: bool,
+    /// `--no-verify` (03 §3.3: skip hooks; the dialog's default: off).
+    pub no_verify: bool,
+}
+
 /// Where `user` and `user-remove` write (03 §7.7): `config --local` or `--global`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConfigScope {
@@ -489,14 +499,14 @@ pub enum Action {
         force: bool,
         remotes: Vec<String>,
     },
-    /// `push`: to each remote in turn, stopping at the first failure; `overwrite` goes through
-    /// §8.4's lease.
+    /// `push`: `push [--set-upstream] [--no-verify] <r> refs/heads/<b>:refs/heads/<b>` to each
+    /// remote in turn, stopping at the first failure; with `overwrite`, §8.4's lease push, which
+    /// keeps `options` ([`RemoteChange::options`]).
     Push {
         branch: String,
         remotes: Vec<String>,
-        set_upstream: bool,
+        options: PushOptions,
         overwrite: bool,
-        no_verify: bool,
     },
     // §7.3, a remote branch's label.
     /// `checkout-remote`: `checkout --no-overwrite-ignore -b <name> --track <r>/<b>`; `pull`
@@ -740,22 +750,28 @@ pub struct Confirmation {
 
 /// One overwrite or delete on a remote (03 §8.4), never a plain `--force`: the push endpoints,
 /// their values fetched into staging refs at Run (refused when they disagree), the backup
-/// `pushed/<r>/…`, then the push with that value as the lease.
+/// `pushed/<r>/…`, then the push with that value as the lease. Only the lease value is resolved
+/// at Run; everything else the push sends is here, decided by the plan.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemoteChange {
     pub remote: String,
     /// The remote's ref (`refs/heads/<b>`, `refs/tags/<t>`).
     pub refname: String,
     pub change: Overwrite,
+    /// The push's own options, kept as the action chose them through the lease resolved at Run
+    /// (03 §7.2's `push` with overwrite: `--set-upstream`, `--no-verify`); a delete, a replaced
+    /// tag and a restore's push have both off.
+    pub options: PushOptions,
 }
 
 /// What [`RemoteChange`] does to the remote's ref (03 §8.4, step 5).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Overwrite {
-    /// `push --force-with-lease=<ref>:<value> <r> <src>:<ref>`: an overwriting push or a
-    /// replaced tag; `src` the local side (`refs/heads/<b>`, `refs/tags/<t>`).
+    /// `push --force-with-lease=<ref>:<value> [--set-upstream] [--no-verify] <r> <src>:<ref>`: an
+    /// overwriting push or a replaced tag; `src` the local side (`refs/heads/<b>`,
+    /// `refs/tags/<t>`).
     Replace { src: String },
-    /// `push --force-with-lease=<ref>:<value> <r> --delete <ref>`.
+    /// `push --force-with-lease=<ref>:<value> [--no-verify] <r> --delete <ref>`.
     Delete,
 }
 
@@ -768,7 +784,8 @@ pub enum Step {
     Backup,
     /// One git command, its words final.
     Git(GitCommand),
-    /// §8.4's push for one change, its lease the value the backup step fetched.
+    /// §8.4's push for one change: its lease the value the backup step fetched at Run, its words
+    /// otherwise the change's own, [`RemoteChange::options`] included.
     Remote(RemoteChange),
     /// `archive`'s command, its stdout streamed into 01 §6a's staged file and published at `to`
     /// as it is (a remote archive lands on this machine).

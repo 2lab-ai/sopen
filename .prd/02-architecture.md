@@ -494,7 +494,8 @@ slice named here (§8); a file that exists today changes owner only from one sli
   `Handle::stop` stops all its groups in that one session (`kill -TERM -- -<p1> -<p2> -<p3>`, then
   `kill -KILL` the same way), and a second stop waits behind the first (03 §3.5). Without that rule
   git's worst case is 6, a `kill` for each of 3 commands being stopped (E5's reading of the code,
-  §8.2), 11 in all; with it, 4.
+  §8.2), 11 in all; with it, 4. S2-F implements the rule in the runner, with its test; until that
+  lands, the bound of 9 does not hold yet.
 - **Git, per host**: one `GitHost` (runner, git version, at most 3 commands in flight; a stop has a
   session of its own, 03 §3.5). **Per repo**: one `GitRepo` (detection, the log stream, a **write
   lock**: one repository-changing command at a time; reads go on alongside).

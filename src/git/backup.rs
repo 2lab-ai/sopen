@@ -40,8 +40,11 @@ pub enum Source {
     /// remote-tracking ref — at the value read for the dialog; `None`: absent, recorded so in the
     /// manifest.
     Ref { refname: String, value: Option<Oid> },
-    /// A stash entry's commit (`stash`).
-    Stash(Oid),
+    /// A stash list entry, by its commit (`stash`). `listed`: the entry is in the list now, so
+    /// its commit is backed up; not listed (a restore about to store it back): the manifest
+    /// records it `absent` with this commit, so the inverse can drop that entry by its hash
+    /// (§8.3).
+    Stash { commit: Oid, listed: bool },
     /// `stash create`'s commit of the index and the tracked changes at Run (`worktree`); none
     /// when clean, which the manifest records as `clean`.
     WorkTree,
@@ -57,13 +60,17 @@ pub enum Source {
 /// What a manifest line is about (03 §8.2: every ref and path the action can change).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Subject {
-    /// A ref, whole (`refs/heads/main`, `refs/tags/v1`, a remote's `refs/heads/b` under
-    /// `pushed/`).
+    /// A local ref, whole (`refs/heads/main`, `refs/tags/v1`, `refs/remotes/origin/main`).
     Ref(String),
+    /// A remote's ref (`pushed/<r>/…`, §8.4): the remote and its ref (`refs/heads/b`), so a line
+    /// that says `absent` still names where to delete it.
+    Pushed { remote: String, refname: String },
     /// HEAD, detached.
     Head,
-    /// A stash list entry.
-    Stash,
+    /// A stash list entry, by its commit (`stash list --format=%H`). The commit is the entry's
+    /// identity even where the line says `absent` (an entry a restore stored back): the inverse
+    /// drops the entry with that hash (§8.3), and no ref of the group holds it then.
+    Stash { commit: Oid },
     /// The tracked state of the work tree and the index.
     WorkTree,
     /// A path from the top level.
@@ -131,14 +138,16 @@ pub enum RestoreHow {
     /// A detached HEAD: `checkout --no-overwrite-ignore --detach <backup>`.
     Detached,
     /// `stash store -m '<its subject>' <backup>` (back at `stash@{0}`); `absent`: `stash drop
-    /// stash@{k}` after its own `stash` backup.
+    /// stash@{k}`, `k` the entry whose hash is [`Subject::Stash`]'s commit, after its own `stash`
+    /// backup.
     Stash,
     /// The tracked state backed up first, then `reset --hard HEAD` and, unless `clean`, `stash
     /// apply --index <backup>`; exact only while HEAD is the backup's base.
     WorkTree,
     /// The files restore snippet: raw, never over anything, never through a link.
     Files,
-    /// `push --force-with-lease=<ref>:<the remote's value now> <r> <backup>:<ref>`.
+    /// `push --force-with-lease=<ref>:<the remote's value now> <r> <backup>:<ref>`; `absent`: the
+    /// same lease with `--delete <ref>`, `<r>` and `<ref>` from [`Subject::Pushed`].
     Pushed,
 }
 
@@ -149,7 +158,8 @@ pub struct RestoreEntry {
     pub subject: Subject,
     pub how: RestoreHow,
     /// The group's ref that holds the value to put back; `None` where the manifest says `absent`
-    /// or `clean` (the restore removes or cleans).
+    /// or `clean`: the restore removes, drops or cleans what the subject names (a stash entry by
+    /// its commit, a remote's ref by its remote).
     pub backup: Option<BackupRef>,
     /// Its value in the manifest.
     pub before: Value,
