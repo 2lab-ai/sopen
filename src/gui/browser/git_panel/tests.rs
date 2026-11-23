@@ -174,7 +174,7 @@ fn commit(n: u32, parents: &[u32], author: &str, time: i64, subject: &str) -> Co
     }
 }
 
-/// A ref of the refs read; every label of these tests is made here (S2-B adds `lossy`).
+/// A ref of the refs read; every label of these tests is made here.
 fn label(refname: &str, object: u32, peeled: Option<u32>) -> RefLabel {
     let kind = if refname.starts_with("refs/heads/") {
         RefKind::LocalBranch
@@ -195,6 +195,7 @@ fn label(refname: &str, object: u32, peeled: Option<u32>) -> RefLabel {
         kind,
         upstream: None,
         track: String::new(),
+        lossy: false,
     }
 }
 
@@ -1241,7 +1242,7 @@ fn labels_that_do_not_fit_end_in_a_count() {
     assert!(!fx.shows("v2.0"));
 }
 
-/// The file list's rule for a name that is not UTF-8 (S2-B's `lossy`): the row shows as it is
+/// The file list's rule for a name that is not UTF-8 (the read model's `lossy`): the row shows as it is
 /// and opens nothing; the status row says why.
 #[test]
 fn a_lossy_file_row_opens_nothing() {
@@ -1625,4 +1626,27 @@ fn a_lossy_folder_is_not_listed() {
     assert!(fx.press(Key::Enter).is_empty());
     assert!(fx.press(Key::ArrowRight).is_empty());
     assert!(fx.view().status_line().text.contains("not valid UTF-8"));
+}
+
+/// The read model's `RefLabel::lossy` reaches the label (shown as it is, naming no ref).
+#[test]
+fn a_lossy_ref_makes_a_lossy_label() {
+    let mut r = refs();
+    let feature = r
+        .iter_mut()
+        .find(|l| l.refname == "refs/heads/feature")
+        .unwrap();
+    feature.refname = "refs/heads/f\u{FFFD}ature".into();
+    feature.lossy = true;
+    let mut view = fixture_view();
+    view.set_refs(r, HeadRef::Branch("refs/heads/main".into()));
+    let mut fx = Fx::new(1000.0, 500.0, view);
+    assert!(fx.shows("f\u{FFFD}ature"));
+    assert!(fx.view_mut().select(RowKey::Commit(oid(8))));
+    fx.view_mut().set_label_cursor(1);
+    let shown = fx.view().bar_label().unwrap();
+    assert!(shown.lossy, "{shown:?}");
+    assert!(fx.view_mut().select(RowKey::Commit(oid(9))));
+    fx.view_mut().set_label_cursor(1);
+    assert!(!fx.view().bar_label().unwrap().lossy);
 }

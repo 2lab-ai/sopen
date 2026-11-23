@@ -222,10 +222,10 @@ pub(super) fn index(
     out
 }
 
-/// Whether a ref's name shows with U+FFFD: S2-B's `RefLabel::lossy` once its read model lands
-/// (the one line to change then).
-fn lossy(_r: &RefLabel) -> bool {
-    false
+/// Whether a ref's name shows with U+FFFD (the read model's `RefLabel::lossy`): its label is
+/// drawn as it is and names no ref.
+fn lossy(r: &RefLabel) -> bool {
+    r.lossy
 }
 
 /// At most `room` characters of `text`, and one more to show it does not fit: what a label lays

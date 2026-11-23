@@ -176,7 +176,7 @@ pub enum GitAction {
 pub struct Label {
     pub text: String,
     pub kind: LabelKind,
-    /// The ref's name is not valid UTF-8 (shown with U+FFFD; S2-B's `RefLabel::lossy`).
+    /// The ref's name is not valid UTF-8 (shown with U+FFFD; the read model's `RefLabel::lossy`).
     pub lossy: bool,
 }
 
