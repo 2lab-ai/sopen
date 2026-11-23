@@ -123,7 +123,8 @@ instead: sopen opens an ssh connection of its own to `<host>` (never its shared 
 `-R 127.0.0.1:<port>:<address's host>:<port>` (`[::1]` for an IPv6 address), so the port listens on
 `<host>`'s loopback only, and `<host>`'s sopen opens the address in its browser and waits. If
 `<host>`'s sshd has `GatewayPorts yes`, which binds a forward to every interface whatever is asked,
-`<host>`'s sopen sees the port open to the network and refuses before the browser opens. sopen prints
+`<host>`'s sopen sees the port open to the network and refuses before the browser opens — as it
+does whenever it cannot see the tunnel's listener on loopback alone. sopen prints
 `<address> is open on <host> through a tunnel — Ctrl-C closes it` and stays; Ctrl-C (or SIGTERM)
 closes the tunnel and exits 0. When sopen ends any other way — killed outright included — its pipe
 to ssh closes: `<host>`'s sopen ends, and so does the ssh under sopen's guard, even while the browser
