@@ -7,8 +7,8 @@
 
 use super::LocalFs;
 use crate::remote::treefs::{
-    is_cachedir_tag, scan_step, Ask, Budget, Child, Disk, FsStat, Got, Kind, Listing, Live, Mount,
-    Mounts, Reply, Resolved, ScanAsk, ScanEnd, Scanned, Target, Totals, TreeFs,
+    files_used, is_cachedir_tag, scan_step, Ask, Budget, Child, Disk, FsStat, Got, Kind, Listing,
+    Live, Mount, Mounts, Reply, Resolved, ScanAsk, ScanEnd, Scanned, Target, Totals, TreeFs,
 };
 use crate::remote::Wake;
 use crate::tree::watchdog::{Job, Pool, Then, MAX_CALLS};
@@ -623,7 +623,7 @@ fn statvfs(path: &str) -> io::Result<FsStat> {
         used_bytes: (st.f_blocks as u64)
             .saturating_sub(st.f_bfree as u64)
             .saturating_mul(frsize),
-        used_files: (st.f_files as u64).saturating_sub(st.f_ffree as u64),
+        used_files: files_used(st.f_files as u64, st.f_ffree as u64),
         fsid: st.f_fsid as u64,
     })
 }
@@ -1149,7 +1149,7 @@ mod tests {
         fn statvfs(&self, _: &str) -> io::Result<FsStat> {
             Ok(FsStat {
                 used_bytes: 0,
-                used_files: 0,
+                used_files: Some(0),
                 fsid: 0,
             })
         }

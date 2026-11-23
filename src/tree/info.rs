@@ -78,8 +78,9 @@ pub struct Info {
     pub files: Option<Count>,
     pub size: Size,
     /// The used file count of the filesystem mounted there (R3, R7), for the status row while
-    /// the bar is on the row.
-    pub fs_files: Option<u64>,
+    /// the bar is on the row, once its `statvfs` has answered; `Some(None)`: a filesystem that
+    /// counts no files (btrfs).
+    pub fs_files: Option<Option<u64>>,
 }
 
 impl Default for Info {

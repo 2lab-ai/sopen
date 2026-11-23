@@ -269,3 +269,35 @@ changes. Rows here are snapshots taken when they were moved.
   (`draft` compared `model.rows.first()` with HEAD, not the order as read), so Cmd/Ctrl+↓ on the top row was
   refused "HEAD is …, not the plan's newest commit …" — fixed in S4-C's round 2; git 2.56.1 writes `rebase-merge/stopped-sha` and the
   `done` line with the full id (S4-B's open fact), so an edit stop's Split is offered.
+
+## R2 — closed 2026-11-24 (S4-C, S6-C: round 2's last units)
+
+- merged S6-C (PR #87) and S4-C (PR #92) ✅ · result: every slice of round 2 is on main — the git panel
+  (S2), every Git Graph action with backups, restore and undo (S3), free history editing: the commit menu's
+  history row, the planner, an edit stop's Amend and Split (S4), the directory tree (S5), F7 and F8 (S6) and
+  the macOS F-key switch (S7) · closed rows: S4-C, S6-C · PRs: #87, #92, and #91 (the restore order, a fix
+  outside the WU table)
+
+### Closed rows
+
+| ID | Status | Branch | Scope | Owner files (02 §5) | After |
+|---|---|---|---|---|---|
+| S6-C | ✅ merged: PR #87 (2ab2df2), 2026-11-23 | `feat/browser-s6-integration` | wiring S6-A and S6-B: F7, F8, Del, ⌘⌫, Shift+F8, Shift+Del into the dialogs and the engine; F2 and F6 of a remote folder through the plain rename; S6's key rows landed (`keys.rs` lands rows by one threshold, `slice <= LANDED`, so S6 before S2–S5 needs a change there, declared); S6's scenarios (02 §8.1's table: 04 K-R1 slots 7, 8, K-R3 Shift+F8, K-K1, K-D1, K-N1 remote folders, K-C4 without `hardlink@`), receipts; AGENTS.md, README, 01 §3a | `src/gui/browser.rs`, `src/gui/browser/{view,tests}.rs`, `src/gui/browser/keys.rs` (hand-over), `src/gui/mod.rs` (receipt keys), `src/main.rs`, `tests/cli.rs`, `AGENTS.md`, `README.md`, `.prd/01-spec.md` | S6-A, S6-B |
+| S4-C | ✅ merged: PR #92 (e3baedf), 2026-11-24 | `feat/browser-s4-integration` | wiring S4-A and S4-B: the §7.8 menu row and the banner's Amend and Split that S4-B adds to `menu.rs` and `in_progress.rs`; quick edits and planner runs on a worker under the repository's write lock (`rebase::needs` and `open_needs` through `actions::inspect`, the plan through `actions::execute`), the refresh after (03 §5), `GitEvent::WorkTreeChanged`; the split kept per window, its Continue through `rebase::Edit::ContinueSplit`; F2 and F8 on a commit row as `reword` and `drop` (03 §9.1), the planner taking its keys before the git context's rows, S4's key rows landed (S4-C adds 4 to `keys.rs`'s `LANDED_SLICES`; hand-over); `SOPEN_STATE dialog=` for §7.8's ids (`EditId::parse`, 02 §9); S4's scenarios (02 §8.1's table: G-H1–G-H5, G-W1 planner), receipts | `src/gui/browser.rs`, `src/gui/browser/{view,tests}.rs`, `src/gui/browser/tests/s4.rs`, `src/gui/browser/git_panel/mod.rs` (hand-over), `src/gui/browser/keys.rs` and `src/gui/help.rs` (hand-over), `src/gui/mod.rs` (receipt keys), `src/main.rs`, `tests/cli.rs`, `AGENTS.md`, `README.md` | S4-A, S4-B, S3-C |
+
+### Round section
+
+- Merge commits and their dates are main's (+0900). S6-C (#87) merged 2026-11-23; S3-C (#90), the restore
+  order (#91) and S4-C (#92) on 2026-11-24.
+- #91 (not a WU): a restore puts the work tree back in the safe order — HEAD checks and the other refs'
+  compare-and-swap, the work tree reset to HEAD, the HEAD move, the stash apply, the files last — so the
+  undo, redo and undo of a hard reset round-trip exactly (03 §8.3, measured through the window).
+- Found while closing S4-C (its review): at an edit stop after an earlier commit was rewritten, git names
+  the original commit (todo, `done`, `stopped-sha`) while HEAD is its replay (measured, git 2.56.1); Split
+  targets HEAD and the kept split remembers its stop by its `done` line.
+- Receipts measured on 2026-11-24 with preview 262f018ba104: G-R3 under fish (03 §11, three runs); D-3 and
+  D-5 against a remote Linux host (05 §8): F10 on `/` → the first frame after 776–794 ms; `proc`, `sys`,
+  `dev` `<SYS>` and not listed, `/boot` `=1.2G fs`; `/home` is a mount point (its status row), its row
+  showing its own scanned size as §6.1 says once its scan runs.
+- Still open, outside any WU: the owner's K-F3 (04 §8); G-R3 under bash (no account with a bash login
+  shell).
