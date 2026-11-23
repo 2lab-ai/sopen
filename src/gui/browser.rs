@@ -203,6 +203,25 @@ fn engine_seen(connect: OpsConnect, seen: Option<ProgressSeen>) -> ops::Run {
             ops::Job::Rename { dir, from, to } => {
                 (fileops::Op::Rename { to }, dir.clone(), vec![from], dir)
             }
+            // Hand-over to S6-C, which runs F7 and F8 on S6-A's engine: until then, refused
+            // before anything happens.
+            job @ (ops::Job::MakeFolder { .. } | ops::Job::Delete { .. }) => {
+                return Report {
+                    items: job
+                        .names()
+                        .into_iter()
+                        .map(|name| Item {
+                            name,
+                            outcome: ItemOutcome::NotReached,
+                        })
+                        .collect(),
+                    notes: vec![
+                        "sopen cannot make folders or delete yet (comes with S6-C); nothing \
+                         was done"
+                            .to_string(),
+                    ],
+                };
+            }
         };
         let job = fileops::Job {
             op,

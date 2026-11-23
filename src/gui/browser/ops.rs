@@ -1,9 +1,10 @@
 //! The browser's side of the file operations (04 §4–§5): the select-group dialog (`+`, `-`),
-//! the Copy / Move dialog, the inline rename field, the name-in-the-way dialog, the progress line
-//! and the report — and drawing helpers for the rename field and the selection colours, which
-//! the browser's `panel_ui` (S1-E) calls. The selection itself is the panel model's
-//! ([`Panel::toggle`] and its neighbours). The work is [`crate::fileops`]'s, behind [`Run`]. S1-D
-//! writes it (S6-B the make-folder and delete dialogs).
+//! the Copy / Move dialog, the inline rename field, the make-folder and delete dialogs, the
+//! name-in-the-way dialog, the progress line and the report — and drawing helpers for the rename
+//! field and the selection colours, which the browser's `panel_ui` (S1-E) calls. The selection
+//! itself is the panel model's ([`Panel::toggle`] and its neighbours). The work is
+//! [`crate::fileops`]'s, behind [`Run`]. S1-D writes it (S6-B the make-folder and delete
+//! dialogs).
 //!
 //! The browser holds one [`Ops`] and calls it: `open_*` from its commands, [`Ops::rename_field`]
 //! in the row being renamed, [`Ops::ui`] after the panels, [`Ops::status`] for the status row,
@@ -196,14 +197,35 @@ pub enum Job {
         from: String,
         to: String,
     },
+    /// F7: a new folder `name` (one level, a valid name) in the folder `dir`, never over an
+    /// existing name (04 §5.4).
+    MakeFolder { dir: OpsTarget, name: String },
+    /// F8 / Shift+F8: the entries `names` (in the panel's order) of the folder `dir`, a folder
+    /// with everything inside it, a link as a link (04 §5.5).
+    Delete {
+        dir: OpsTarget,
+        names: Vec<String>,
+        removal: Removal,
+    },
+}
+
+/// Where Delete sends what it removes, as its dialog said (04 §5.5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Removal {
+    /// This machine's Trash.
+    Trash,
+    /// Gone for good, bottom-up: on a remote (SFTP has no Trash), with Shift+F8 / Shift+Del, or
+    /// where this machine has no Trash for the folder.
+    Permanent,
 }
 
 impl Job {
     /// The items, by name, as the report would list them.
-    fn names(&self) -> Vec<String> {
+    pub fn names(&self) -> Vec<String> {
         match self {
-            Job::Transfer { names, .. } => names.clone(),
+            Job::Transfer { names, .. } | Job::Delete { names, .. } => names.clone(),
             Job::Rename { from, .. } => vec![from.clone()],
+            Job::MakeFolder { name, .. } => vec![name.clone()],
         }
     }
 
@@ -211,7 +233,23 @@ impl Job {
     fn place(&self) -> String {
         match self {
             Job::Transfer { to, .. } => to.shown(),
-            Job::Rename { dir, .. } => dir.shown(),
+            Job::Rename { dir, .. } | Job::MakeFolder { dir, .. } | Job::Delete { dir, .. } => {
+                dir.shown()
+            }
+        }
+    }
+
+    /// What the status row says it does (`copying`).
+    fn verb(&self) -> &'static str {
+        match self {
+            Job::Transfer { kind, .. } => kind.verb(),
+            Job::Rename { .. } => "renaming",
+            Job::MakeFolder { .. } => "making folder",
+            Job::Delete {
+                removal: Removal::Trash,
+                ..
+            } => "moving to the Trash",
+            Job::Delete { .. } => "deleting",
         }
     }
 }
@@ -382,10 +420,7 @@ impl Running {
             // The question's own item, not the one the last progress named.
             let name = &asked.clash.name;
             let names = self.job.names();
-            let verb = match &self.job {
-                Job::Transfer { kind, .. } => kind.verb(),
-                Job::Rename { .. } => "renaming",
-            };
+            let verb = self.job.verb();
             let at = match names.iter().position(|n| n == name) {
                 Some(i) => format!(" {}/{}", i + 1, names.len()),
                 None => String::new(),
@@ -404,6 +439,17 @@ impl Running {
                 format!("{} {what}… · Esc stops", kind.verb())
             }
             Job::Rename { from, to, .. } => format!("renaming {from} → {to}…"),
+            Job::MakeFolder { name, .. } => format!("making folder {name}…"),
+            Job::Delete { names, removal, .. } => {
+                let what = match names.as_slice() {
+                    [one] => one.clone(),
+                    all => format!("{} items", all.len()),
+                };
+                match removal {
+                    Removal::Trash => format!("moving {what} to the Trash… · Esc stops"),
+                    Removal::Permanent => format!("deleting {what}… · Esc stops"),
+                }
+            }
         })
     }
 
@@ -579,6 +625,16 @@ pub fn finish(job: &Job, report: Report) -> Finished {
         Job::Rename { from, to, .. } if one_done => {
             Finished::Status(Status::info(format!("renamed {from} → {to}")))
         }
+        Job::MakeFolder { name, .. } if one_done => {
+            Finished::Status(Status::info(format!("made folder {name}")))
+        }
+        Job::Delete { removal, .. } if one_done => {
+            let name = &report.items[0].name;
+            Finished::Status(Status::info(match removal {
+                Removal::Trash => format!("moved {name} to the Trash"),
+                Removal::Permanent => format!("deleted {name}"),
+            }))
+        }
         Job::Transfer { kind, to, .. } => Finished::Report(ReportView::new(
             kind.word(),
             format!("{} to {}", kind.word(), to.shown()),
@@ -587,6 +643,19 @@ pub fn finish(job: &Job, report: Report) -> Finished {
         Job::Rename { from, to, .. } => Finished::Report(ReportView::new(
             "Rename",
             format!("Rename {from} → {to}"),
+            report,
+        )),
+        Job::MakeFolder { dir, name } => Finished::Report(ReportView::new(
+            "Make folder",
+            format!("Make folder {name} in {}", dir.shown()),
+            report,
+        )),
+        Job::Delete { dir, removal, .. } => Finished::Report(ReportView::new(
+            "Delete",
+            match removal {
+                Removal::Trash => format!("Delete from {} to the Trash", dir.shown()),
+                Removal::Permanent => format!("Delete from {}, permanent", dir.shown()),
+            },
             report,
         )),
     }
@@ -733,10 +802,6 @@ impl Keyboard {
     /// buttons has the focus (Enter clicks it then); the field gets the focus unless such a
     /// button has it — the first time with its first `select` characters selected.
     fn begin(&mut self, ctx: &egui::Context, field: egui::Id, text: &str, select: usize) -> Keys {
-        let focused = ctx.memory(|m| m.focused());
-        let on_button = focused.is_some_and(|f| f != field && self.ids.contains(&f));
-        let escape = ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape));
-        let enter = !on_button && ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Enter));
         if !std::mem::replace(&mut self.opened, true) {
             let mut state = egui::text_edit::TextEditState::load(ctx, field).unwrap_or_default();
             let end = select.min(text.chars().count());
@@ -748,8 +813,18 @@ impl Keyboard {
                 )));
             state.store(ctx, field);
         }
-        if !on_button && focused != Some(field) {
-            ctx.memory_mut(|m| m.request_focus(field));
+        self.claim(ctx, field)
+    }
+
+    /// [`Keyboard::begin`] without the selection: `own` — the field, or a dialog without one its
+    /// focus holder — takes the keyboard unless one of the dialog's buttons has it.
+    fn claim(&mut self, ctx: &egui::Context, own: egui::Id) -> Keys {
+        let focused = ctx.memory(|m| m.focused());
+        let on_button = focused.is_some_and(|f| f != own && self.ids.contains(&f));
+        let escape = ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape));
+        let enter = !on_button && ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Enter));
+        if !on_button && focused != Some(own) {
+            ctx.memory_mut(|m| m.request_focus(own));
         }
         self.ids.clear();
         Keys { enter, escape }
@@ -767,10 +842,11 @@ impl Keyboard {
     }
 }
 
-/// How the Copy / Move dialog ended.
+/// How the Copy / Move dialog ended — and the make-folder and delete dialogs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CopyEnd {
-    /// Enter or the Copy / Move button, with a target that reads (04 §5.2).
+    /// Enter or the dialog's button (Copy, Move, Make, Delete), with a target that reads (04
+    /// §5.2) or a name that may be given (04 §5.4).
     Start(Job),
     /// Esc, Cancel or a click outside it.
     Cancel,
@@ -1081,6 +1157,255 @@ impl ClashDialog {
     }
 }
 
+/// F7's one-line dialog (04 §5.4): the new folder's name, in the panel's folder, which it
+/// names; Enter makes it, Esc cancels. One level: a name the browser may not give — with `/`,
+/// empty, `.` or `..`, over 255 bytes (04 §5.1) — keeps it open with the reason. Whether the
+/// name exists is the engine's to say; nothing is made over it.
+pub struct MakeFolderDialog {
+    dir: OpsTarget,
+    /// The name field.
+    pub name: String,
+    error: Option<String>,
+    keyboard: Keyboard,
+}
+
+impl MakeFolderDialog {
+    /// F7 in `panel` (its folder on `host`): never the selection (04 §4).
+    pub fn open(panel: &Panel, host: Option<&str>) -> Self {
+        Self {
+            dir: OpsTarget {
+                host: host.map(str::to_string),
+                dir: panel.dir.clone(),
+            },
+            name: String::new(),
+            error: None,
+            keyboard: Keyboard::default(),
+        }
+    }
+
+    pub fn ui(&mut self, ctx: &egui::Context) -> Option<CopyEnd> {
+        let field_id = egui::Id::unique("sopen-ops-make-folder-name");
+        let all = self.name.chars().count();
+        let keys = self.keyboard.begin(ctx, field_id, &self.name, all);
+        let (mut go, mut cancel) = (keys.enter, keys.escape);
+        let id = egui::Id::unique("sopen-ops-make-folder");
+        let modal = chrome::dialog(ctx, id, "Make folder", |ui| {
+            ui.set_width(dialog_width(ctx, 60.0));
+            let line = format!("Make a folder in {}", self.dir.shown());
+            ui.add(egui::Label::new(line).wrap());
+            ui.add_space(chrome::CELL.y / 2.0);
+            ui.horizontal(|ui| {
+                ui.label("name");
+                ui.add(
+                    chrome::field(&mut self.name)
+                        .id(field_id)
+                        .desired_width(ui.available_width()),
+                );
+            });
+            let rule = "one level: no / in the name · a name that exists is an error";
+            ui.label(RichText::new(rule).weak());
+            if let Some(error) = &self.error {
+                let color = ui.visuals().error_fg_color;
+                crate::gui::disclosures(ui, &[(error.clone(), color)]);
+            }
+            ui.add_space(chrome::CELL.y / 2.0);
+            ui.horizontal(|ui| {
+                let ok = ui.button("Make");
+                let no = ui.button("Cancel");
+                self.keyboard.laid(&ok);
+                self.keyboard.laid(&no);
+                go |= ok.clicked();
+                cancel |= no.clicked();
+            });
+        });
+        if cancel || modal.backdrop_response.clicked() {
+            return Some(CopyEnd::Cancel);
+        }
+        if !go {
+            return None;
+        }
+        match check_name(&self.name) {
+            Ok(()) => Some(CopyEnd::Start(Job::MakeFolder {
+                dir: self.dir.clone(),
+                name: self.name.clone(),
+            })),
+            Err(why) => {
+                self.error = Some(why);
+                self.keyboard.reselect();
+                None
+            }
+        }
+    }
+}
+
+/// Where a delete goes, as its dialog says it (04 §5.5).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Bin {
+    /// This machine's Trash.
+    Trash,
+    /// Shift+F8 / Shift+Del on this machine.
+    Asked,
+    /// A remote's folder (`[user@]host`): SFTP has no Trash.
+    Remote(String),
+    /// This machine has no Trash for the folder.
+    NoTrashHere,
+}
+
+impl Bin {
+    /// The dialog's line: every permanent one in the error colour.
+    fn line(&self) -> String {
+        match self {
+            Bin::Trash => "to the Trash".to_string(),
+            Bin::Asked => "permanent".to_string(),
+            Bin::Remote(host) => format!("permanent — no Trash on {host}"),
+            Bin::NoTrashHere => "permanent — no Trash here".to_string(),
+        }
+    }
+
+    fn removal(&self) -> Removal {
+        match self {
+            Bin::Trash => Removal::Trash,
+            _ => Removal::Permanent,
+        }
+    }
+}
+
+/// A folder as Delete counts it: a folder that is not a link (a link goes as a link, never what
+/// it points at, 04 §5.5). Everything else — a link to a folder too — counts as a file.
+fn folder_to_delete(entry: &Entry) -> bool {
+    entry.kind == EntryKind::Dir && !entry.link
+}
+
+/// `Delete <name>?` or `Delete N items (F files, D folders)?` (04 §5.5): a folder's adding that
+/// everything inside it goes too — every folder's, as nothing here knows whether one is empty.
+fn delete_question(entries: &[&Entry]) -> String {
+    let counted = |n: usize, one: &str, many: &str| match n {
+        1 => format!("1 {one}"),
+        n => format!("{n} {many}"),
+    };
+    match entries {
+        [one] if folder_to_delete(one) => {
+            format!("Delete {} and everything inside it?", one.name)
+        }
+        [one] => format!("Delete {}?", one.name),
+        all => {
+            let folders = all.iter().filter(|e| folder_to_delete(e)).count();
+            let inside = match folders {
+                0 => "",
+                1 => " and everything inside the folder",
+                _ => " and everything inside the folders",
+            };
+            format!(
+                "Delete {} items ({}, {}){inside}?",
+                all.len(),
+                counted(all.len() - folders, "file", "files"),
+                counted(folders, "folder", "folders")
+            )
+        }
+    }
+}
+
+/// F8 / Shift+F8's dialog (04 §5.5): always asks what (the bar's entry or the selection) and
+/// where it goes — this machine's Trash, or `permanent` in the error colour; Enter deletes, Esc
+/// cancels. It has no field: a holder of its own keeps the keyboard, so Enter deletes and Space
+/// does nothing unless Tab put the focus on one of its buttons (Enter clicks that one then).
+pub struct DeleteDialog {
+    dir: OpsTarget,
+    names: Vec<String>,
+    question: String,
+    bin: Bin,
+    /// A link is among them: it goes as a link.
+    link: bool,
+    keyboard: Keyboard,
+}
+
+fn delete_focus_id() -> egui::Id {
+    egui::Id::unique("sopen-ops-delete-focus")
+}
+
+impl DeleteDialog {
+    /// F8 (`asked` [`Removal::Trash`]) or Shift+F8 ([`Removal::Permanent`]) in `panel` (its
+    /// folder on `host`), on [`Panel::acted_on`]. On a remote it is permanent (SFTP has no
+    /// Trash); here `trash_here` says whether this machine has a Trash for the folder — without
+    /// one, F8 is permanent too, and the dialog says so before anything is removed. `Err` is for
+    /// the status row: there is nothing to act on.
+    pub fn open(
+        panel: &Panel,
+        host: Option<&str>,
+        asked: Removal,
+        trash_here: bool,
+    ) -> Result<Self, String> {
+        let entries = panel.acted_on();
+        if entries.is_empty() {
+            return Err(nothing_to("Delete", panel));
+        }
+        let bin = match (host, asked) {
+            (Some(host), _) => Bin::Remote(host.to_string()),
+            (None, Removal::Permanent) => Bin::Asked,
+            (None, Removal::Trash) if trash_here => Bin::Trash,
+            (None, Removal::Trash) => Bin::NoTrashHere,
+        };
+        Ok(Self {
+            dir: OpsTarget {
+                host: host.map(str::to_string),
+                dir: panel.dir.clone(),
+            },
+            names: entries.iter().map(|e| e.name.clone()).collect(),
+            question: delete_question(&entries),
+            link: entries.iter().any(|e| e.link),
+            bin,
+            keyboard: Keyboard::default(),
+        })
+    }
+
+    pub fn ui(&mut self, ctx: &egui::Context) -> Option<CopyEnd> {
+        let keys = self.keyboard.claim(ctx, delete_focus_id());
+        let (mut go, mut cancel) = (keys.enter, keys.escape);
+        let id = egui::Id::unique("sopen-ops-delete");
+        let modal = chrome::dialog(ctx, id, "Delete", |ui| {
+            ui.set_width(dialog_width(ctx, 60.0));
+            let asked = ui.add(egui::Label::new(self.question.as_str()).wrap());
+            ui.interact(
+                asked.rect,
+                delete_focus_id(),
+                egui::Sense::focusable_noninteractive(),
+            );
+            let line = self.bin.line();
+            if self.bin == Bin::Trash {
+                ui.label(line);
+            } else {
+                let color = ui.visuals().error_fg_color;
+                crate::gui::disclosures(ui, &[(line, color)]);
+            }
+            if self.link {
+                let rule = "a link goes as a link, never what it points at";
+                ui.label(RichText::new(rule).weak());
+            }
+            ui.add_space(chrome::CELL.y / 2.0);
+            ui.horizontal(|ui| {
+                let ok = ui.button("Delete");
+                let no = ui.button("Cancel");
+                self.keyboard.laid(&ok);
+                self.keyboard.laid(&no);
+                go |= ok.clicked();
+                cancel |= no.clicked();
+            });
+            ui.label(RichText::new("Enter deletes · Esc cancels").weak());
+        });
+        if cancel || modal.backdrop_response.clicked() {
+            Some(CopyEnd::Cancel)
+        } else if go {
+            Some(CopyEnd::Start(Job::Delete {
+                dir: self.dir.clone(),
+                names: self.names.clone(),
+                removal: self.bin.removal(),
+            }))
+        } else {
+            None
+        }
+    }
+}
+
 /// The inline rename field's widget id (one field at a time).
 fn rename_id() -> egui::Id {
     egui::Id::unique("sopen-browser-rename")
@@ -1243,6 +1568,8 @@ pub struct Ops {
     run: Run,
     group: Option<GroupDialog>,
     copy: Option<CopyDialog>,
+    make: Option<MakeFolderDialog>,
+    delete: Option<DeleteDialog>,
     rename: Option<Rename>,
     running: Option<Running>,
     report: Option<ReportView>,
@@ -1254,6 +1581,8 @@ impl Ops {
             run,
             group: None,
             copy: None,
+            make: None,
+            delete: None,
             rename: None,
             running: None,
             report: None,
@@ -1265,6 +1594,8 @@ impl Ops {
     pub fn holds_keyboard(&self) -> bool {
         self.group.is_some()
             || self.copy.is_some()
+            || self.make.is_some()
+            || self.delete.is_some()
             || self.rename.is_some()
             || self.report.is_some()
             || self.running.as_ref().is_some_and(Running::asking)
@@ -1322,6 +1653,41 @@ impl Ops {
         }
     }
 
+    /// F7 in `panel` (its folder on `host`): the make-folder dialog. `Some` is for the status
+    /// row, as for [`Ops::open_copy`] (a job running).
+    #[cfg_attr(not(test), allow(dead_code))] // S6-C wires F7 to it.
+    pub fn open_make_folder(&mut self, panel: &Panel, host: Option<&str>) -> Option<Status> {
+        if let Some(busy) = self.busy_line() {
+            return Some(busy);
+        }
+        self.make = Some(MakeFolderDialog::open(panel, host));
+        None
+    }
+
+    /// F8, Del, ⌘⌫ (`asked` [`Removal::Trash`]) or Shift+F8, Shift+Del
+    /// ([`Removal::Permanent`]) in `panel` (its folder on `host`): the delete dialog, on the
+    /// selection or the bar's entry ([`DeleteDialog::open`]; `trash_here`: this machine has a
+    /// Trash for the folder). `Some` is for the status row, as for [`Ops::open_copy`].
+    #[cfg_attr(not(test), allow(dead_code))] // S6-C wires F8 and Shift+F8 to it.
+    pub fn open_delete(
+        &mut self,
+        panel: &Panel,
+        host: Option<&str>,
+        asked: Removal,
+        trash_here: bool,
+    ) -> Option<Status> {
+        if let Some(busy) = self.busy_line() {
+            return Some(busy);
+        }
+        match DeleteDialog::open(panel, host, asked, trash_here) {
+            Ok(dialog) => {
+                self.delete = Some(dialog);
+                None
+            }
+            Err(why) => Some(Status::error(why)),
+        }
+    }
+
     /// Esc while a job runs.
     pub fn stop(&mut self) {
         if let Some(running) = &mut self.running {
@@ -1358,11 +1724,12 @@ impl Ops {
     }
 
     /// Each pass, after the panels: the running job's news, then one dialog over them — the
-    /// job's own first (its question, then its report), else the select-group or the Copy /
-    /// Move dialog, which wait aside, kept as they were, while a job's dialog is up (one modal,
-    /// one owner of the keyboard). `active` is the panel the select-group dialog acts on, and the
-    /// one a transfer started from (what it did is unselected there: what stays selected is what
-    /// is left to do). Returns what a job that just ended changed.
+    /// job's own first (its question, then its report), else the select-group, Copy / Move,
+    /// make-folder or delete dialog, which wait aside, kept as they were, while a job's dialog
+    /// is up (one modal, one owner of the keyboard). `active` is the panel the select-group
+    /// dialog acts on, and the one a transfer or a delete started from (what it did is
+    /// unselected there: what stays selected is what is left to do). Returns what a job that
+    /// just ended changed.
     #[cfg_attr(not(test), allow(dead_code))] // The browser calls `poll` and `dialogs` apart.
     pub fn ui(&mut self, ctx: &egui::Context, active: &mut Panel) -> Option<Changed> {
         let changed = self.poll(active);
@@ -1392,6 +1759,8 @@ impl Ops {
                 ..
             } => "move",
             Job::Rename { .. } => "rename",
+            Job::MakeFolder { .. } => "make folder",
+            Job::Delete { .. } => "delete",
         })
     }
 
@@ -1408,8 +1777,8 @@ impl Ops {
         }
     }
 
-    /// The select-group and Copy / Move dialogs (one is open at a time in practice: each holds
-    /// the keyboard the other's key would need).
+    /// The select-group, Copy / Move, make-folder and delete dialogs (one is open at a time in
+    /// practice: each holds the keyboard the others' keys would need).
     fn owners_dialogs(&mut self, ctx: &egui::Context, active: &mut Panel) {
         if let Some(end) = self.group.as_mut().and_then(|d| d.ui(ctx)) {
             if let GroupEnd::Apply { select, pattern } = end {
@@ -1417,12 +1786,22 @@ impl Ops {
             }
             self.group = None;
         }
-        match self.copy.as_mut().and_then(|d| d.ui(ctx)) {
+        let end = self.copy.as_mut().and_then(|d| d.ui(ctx));
+        self.started(ctx, end, |ops| ops.copy = None);
+        let end = self.make.as_mut().and_then(|d| d.ui(ctx));
+        self.started(ctx, end, |ops| ops.make = None);
+        let end = self.delete.as_mut().and_then(|d| d.ui(ctx));
+        self.started(ctx, end, |ops| ops.delete = None);
+    }
+
+    /// A dialog's end: `close` takes it down, and on Enter its job starts.
+    fn started(&mut self, ctx: &egui::Context, end: Option<CopyEnd>, close: fn(&mut Self)) {
+        match end {
             Some(CopyEnd::Start(job)) => {
-                self.copy = None;
+                close(self);
                 self.running = Some(start(&self.run, job, ctx));
             }
-            Some(CopyEnd::Cancel) => self.copy = None,
+            Some(CopyEnd::Cancel) => close(self),
             None => {}
         }
     }
@@ -1457,6 +1836,22 @@ impl Ops {
                 }
                 (finish(&job, report), dirs, None)
             }
+            // The bar goes on the new folder (04 §5.4), once it is there.
+            Job::MakeFolder { dir, name } => {
+                let done = report.items.iter().any(|i| i.outcome == ItemOutcome::Done);
+                let bar = done.then(|| name.clone());
+                (finish(&job, report), vec![dir.clone()], bar)
+            }
+            Job::Delete { dir, .. } => {
+                if active.dir == dir.dir {
+                    for item in &report.items {
+                        if item.outcome == ItemOutcome::Done {
+                            active.unselect(&item.name);
+                        }
+                    }
+                }
+                (finish(&job, report), vec![dir.clone()], None)
+            }
         };
         let said = match finished {
             Finished::Status(line) => Some(line),
@@ -1483,6 +1878,8 @@ mod tests {
     //! drawn with [`entry_color`] and the rename field in its row, and [`Ops::ui`] over them. The
     //! browser's own `panel_ui`, its keys and its bar are S1-E's and not exercised here. The
     //! engine is a stand-in [`Run`].
+
+    mod s6;
 
     use super::*;
     use crate::fileops::Item;
@@ -1550,12 +1947,33 @@ mod tests {
 
     /// The stand-in engine: a rename to a name starting `taken` is refused as the filesystem
     /// would; every other rename is done. A transfer asks at each name in `clashing` and acts on
-    /// the answer (Cancel: the rest is not reached).
+    /// the answer (Cancel: the rest is not reached). A folder is made unless a job before made
+    /// one of that name (it exists then); a delete does every item.
     fn engine(log: Shared, clashing: &'static [&'static str]) -> Run {
         Arc::new(move |job: Job, link: &Link| {
+            let made_before = log.lock().unwrap().jobs.iter().any(|j| match (j, &job) {
+                (Job::MakeFolder { name: a, .. }, Job::MakeFolder { name: b, .. }) => a == b,
+                _ => false,
+            });
             log.lock().unwrap().jobs.push(job.clone());
             let mut report = Report::default();
             match job {
+                Job::MakeFolder { name, .. } => {
+                    let outcome = if made_before {
+                        ItemOutcome::Failed(format!("{name}: a folder of that name exists"))
+                    } else {
+                        ItemOutcome::Done
+                    };
+                    report.items.push(Item { name, outcome });
+                }
+                Job::Delete { names, .. } => {
+                    for name in names {
+                        report.items.push(Item {
+                            name,
+                            outcome: ItemOutcome::Done,
+                        });
+                    }
+                }
                 Job::Rename { from, to, .. } => {
                     let outcome = if to.starts_with("taken") {
                         ItemOutcome::Failed(format!("{to}: a file of that name exists"))
@@ -1967,7 +2385,7 @@ mod tests {
             .iter()
             .map(|j| match j {
                 Job::Rename { to, .. } => to.clone(),
-                Job::Transfer { .. } => "transfer".to_string(),
+                _ => "another job".to_string(),
             })
             .collect();
         assert_eq!(jobs, ["taken.rs", "fresh.rs"]);
