@@ -32,7 +32,7 @@
 //!   [`Tree::size_now`], Cmd/Ctrl+R [`Tree::reread`], Enter [`Tree::enter`] (`Some(path)`: list
 //!   it in the panel, 02 §7 `TreeOutcome::GoTo`; `None` for a link: its resolved target comes
 //!   from [`Tree::entered`] after a poll). [`Tree::owner_busy`] / [`Tree::stop_owner`]: Esc stops
-//!   an owner's whole listing (05 §6.3) before it closes the tree.
+//!   an owner's whole listing or Space's scan (05 §6.3) before it closes the tree.
 //! - **Status row**: [`Tree::status`] (the watchdog's cap: `4 calls not answering; …`).
 //! - **Close**: [`Tree::close`] (or drop) stops every scan and listing and never waits.
 //!
@@ -141,6 +141,8 @@ struct Digest {
     venv: bool,
     /// Inodes of the files with more than one link (counted once).
     multi: Vec<(u64, u64)>,
+    /// Of `bytes`, those of the files with more than one link.
+    multi_bytes: u64,
 }
 
 impl Digest {
@@ -163,22 +165,26 @@ impl Digest {
                     d.dirs += 1;
                     d.real_dirs += 1;
                 }
-                Kind::Link(Target::Dir) => {
+                // A link whose target was not read is drawn as a link to a folder (05 §4 R1).
+                Kind::Link(Target::Dir | Target::Unread) => {
                     d.dirs += 1;
                     d.others += 1;
                 }
                 Kind::File => {
                     d.files += 1;
                     d.others += 1;
-                    let first = match c.id {
+                    let (first, multi) = match c.id {
                         Some(id) if c.nlink > 1 => {
                             d.multi.push(id);
-                            seen.insert(id)
+                            (seen.insert(id), true)
                         }
-                        _ => true,
+                        _ => (true, false),
                     };
                     if first {
                         d.bytes += c.size;
+                        if multi {
+                            d.multi_bytes += c.size;
+                        }
                     }
                 }
                 Kind::Link(Target::File) => {
@@ -222,6 +228,8 @@ struct Asked {
 
 #[derive(Debug, Clone)]
 struct Node {
+    /// Its id while the tree is open, never given to another folder ([`RowId`]).
+    id: u32,
     path: String,
     name: String,
     parent: Option<usize>,
@@ -252,6 +260,8 @@ struct Node {
     fs_asked: bool,
     /// The `statvfs` has answered (or failed).
     fs_done: bool,
+    /// The `statvfs` has not answered for 2 s (it may still).
+    fs_late: bool,
     deep: Deep,
     /// Off screen since then, with a scan running.
     left: Option<Instant>,
@@ -260,6 +270,7 @@ struct Node {
 impl Node {
     fn new(path: String, name: String, parent: Option<usize>) -> Self {
         Node {
+            id: 0,
             hidden: name.starts_with('.'),
             path,
             name,
@@ -281,6 +292,7 @@ impl Node {
             fs: None,
             fs_asked: false,
             fs_done: false,
+            fs_late: false,
             deep: Deep::default(),
             left: None,
         }
@@ -340,7 +352,12 @@ pub struct Tree {
     params: Params,
     folder_in: String,
     stage: Stage,
+    /// Folder nodes by slot; a slot a refresh freed is used again (`free`).
     nodes: Vec<Node>,
+    free: Vec<usize>,
+    /// Node id → slot, for the ids of [`RowId`].
+    ids: HashMap<u32, usize>,
+    next_node: u32,
     root: usize,
     current: usize,
     root_is_home: bool,
@@ -381,6 +398,9 @@ impl Tree {
             folder_in: open.folder,
             stage: Stage::Resolving,
             nodes: Vec::new(),
+            free: Vec::new(),
+            ids: HashMap::new(),
+            next_node: 1,
             root: 0,
             current: 0,
             root_is_home: false,
@@ -473,10 +493,58 @@ impl Tree {
     fn row_id_of(&self, node: usize) -> Option<RowId> {
         self.drawn().into_iter().find_map(|d| match d {
             Drawn::Folder { head, end, .. } if self.chain_holds(head, end, node) => {
-                Some(RowId::Folder(end as u32))
+                Some(RowId::Folder(self.nodes[end].id))
             }
             _ => None,
         })
+    }
+
+    /// Puts `node` in a free slot (or a new one) under a new id.
+    fn add_node(&mut self, mut node: Node) -> usize {
+        node.id = self.next_node;
+        self.next_node += 1;
+        let id = node.id;
+        let slot = match self.free.pop() {
+            Some(slot) => {
+                self.nodes[slot] = node;
+                slot
+            }
+            None => {
+                self.nodes.push(node);
+                self.nodes.len() - 1
+            }
+        };
+        self.ids.insert(id, slot);
+        slot
+    }
+
+    /// Frees `i` and every folder below it (a refresh no longer holds them): their requests
+    /// are cancelled, their ids retired, their slots given to the next new folders.
+    fn free_node(&mut self, i: usize) {
+        let mut gone = vec![i];
+        let mut at = 0;
+        while at < gone.len() {
+            gone.extend(self.nodes[gone[at]].children.iter().copied());
+            at += 1;
+        }
+        let asks: Vec<u64> = self
+            .asks
+            .iter()
+            .filter(|(_, what)| match what {
+                For::List(k) | For::Statvfs(k) | For::Scan(k) => gone.contains(k),
+                _ => false,
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        for id in asks {
+            self.cancel(id);
+        }
+        for k in gone {
+            let id = self.nodes[k].id;
+            self.ids.remove(&id);
+            self.nodes[k] = Node::new(String::new(), String::new(), None);
+            self.free.push(k);
+        }
     }
 
     /// The index of `id`'s row in [`Tree::rows`].
@@ -486,15 +554,15 @@ impl Tree {
 
     fn id_of(&self, d: &Drawn) -> RowId {
         match *d {
-            Drawn::Folder { end, .. } => RowId::Folder(end as u32),
-            Drawn::Hidden { parent, .. } => RowId::Hidden(parent as u32),
+            Drawn::Folder { end, .. } => RowId::Folder(self.nodes[end].id),
+            Drawn::Hidden { parent, .. } => RowId::Hidden(self.nodes[parent].id),
         }
     }
 
     /// The node a folder row stands for (its chain's last folder).
     fn node_of(&self, id: RowId) -> Option<usize> {
         match id {
-            RowId::Folder(n) => self.nodes.get(n as usize).map(|_| n as usize),
+            RowId::Folder(n) => self.ids.get(&n).copied(),
             RowId::Hidden(_) => None,
         }
     }
@@ -581,7 +649,7 @@ impl Tree {
                 count,
                 depth,
             } => Row {
-                id: RowId::Hidden(parent as u32),
+                id: RowId::Hidden(self.nodes[parent].id),
                 depth,
                 name: format!(
                     "· {count} hidden folder{}",
@@ -626,7 +694,7 @@ impl Tree {
                     Glyph::Closed
                 };
                 Row {
-                    id: RowId::Folder(end as u32),
+                    id: RowId::Folder(self.nodes[end].id),
                     depth,
                     name: names.join("/"),
                     kind: if n.link {
@@ -646,17 +714,25 @@ impl Tree {
         }
     }
 
-    /// Why `i` is never opened by itself (05 §4); `None` for the root and the path, which the
-    /// rules do not apply to.
+    /// Why `i` is never opened by itself, and what of it is never read without the owner
+    /// (05 §4). The root has none. On the path the rules hold as well — a path folder is opened
+    /// by rule 1 all the same, and is listed only where its rule allows (05 §6.3) — but for R3
+    /// ("not on the path") and H1 ("the path overrides it"). A path folder below an R4–R6 mount
+    /// on the path is held back with it: a lookup there is what those rules avoid.
     fn rule(&self, i: usize) -> Option<Rule> {
-        let n = &self.nodes[i];
-        if n.on_path {
+        if i == self.root {
             return None;
         }
+        let n = &self.nodes[i];
         if n.link {
             return Some(Rule::Link);
         }
-        if let Some(class) = self.class(i) {
+        match self.mount_class(i) {
+            Some(Class::Disk) if n.on_path => {}
+            Some(class) => return Some(Rule::Mount(class)),
+            None => {}
+        }
+        if let Some(class) = self.held_below(i) {
             return Some(Rule::Mount(class));
         }
         if n.failed {
@@ -679,7 +755,7 @@ impl Tree {
         if self.private(i) {
             return Some(Rule::Private);
         }
-        if n.hidden {
+        if n.hidden && !n.on_path {
             return Some(Rule::Hidden);
         }
         if rules::GENERATED.contains(&n.name.as_str()) {
@@ -700,11 +776,30 @@ impl Tree {
                 .is_some_and(|rest| rest == "/Library" || rest == "/.Trash")
     }
 
-    /// What is mounted at `i` (R3–R7): the table (or a remote's names), the listing's own mount
-    /// status, or a remote's `f_fsid` fence (05 §4.1).
-    fn class(&self, i: usize) -> Option<Class> {
+    /// The class of an R4–R6 mount a path folder lies below (not the root's own: a home on a
+    /// network filesystem is the tree's root, and listed).
+    fn held_below(&self, i: usize) -> Option<Class> {
+        if !self.nodes[i].on_path {
+            return None;
+        }
+        let mut at = self.nodes[i].parent;
+        while let Some(p) = at {
+            if p == self.root {
+                return None;
+            }
+            if let Some(c @ (Class::Sys | Class::Net | Class::Auto)) = self.mount_class(p) {
+                return Some(c);
+            }
+            at = self.nodes[p].parent;
+        }
+        None
+    }
+
+    /// What is mounted at `i` (R3–R7), on the path too: the table (or a remote's names), the
+    /// listing's own mount status, or a remote's `f_fsid` fence (05 §4.1). Never the root's.
+    fn mount_class(&self, i: usize) -> Option<Class> {
         let n = &self.nodes[i];
-        if i == self.root || n.on_path {
+        if i == self.root {
             return None;
         }
         let m = self.mounts.as_ref()?;
@@ -743,11 +838,12 @@ impl Tree {
                 more: !d.complete,
             });
         }
-        let class = self.class(i);
-        if class == Some(Class::Disk) {
+        let disk = rule == Some(Rule::Mount(Class::Disk));
+        if disk {
             info.fs_files = n.fs.map(|f| f.used_files);
         }
-        info.size = if n.not_answering || n.deep.not_answering {
+        let fs_late = disk && n.fs_late && n.deep.below.is_none() && n.deep.running.is_none();
+        info.size = if n.not_answering || n.deep.not_answering || fs_late {
             Size::Tag(Tag::NotAnswering)
         } else {
             match rule {
@@ -780,7 +876,7 @@ impl Tree {
         if n.digest.is_none() {
             return Size::Unknown;
         }
-        let (bytes, more) = self.total(i);
+        let (bytes, _, more) = self.total(i);
         Size::Bytes {
             bytes,
             more,
@@ -789,40 +885,50 @@ impl Tree {
         }
     }
 
-    /// Bytes in and below `i` as far as known, and whether more may be below: a closed folder's
-    /// own files plus its scan; an open one's own files plus its subfolders' totals (mounts
-    /// below are another filesystem, links are not followed).
-    fn total(&self, i: usize) -> (u64, bool) {
+    /// Bytes in and below `i` as far as known — of them, those of files with more than one
+    /// link — and whether more may be below. A closed folder: its own files plus its scan (one
+    /// set of inodes: the scan was seeded with the folder's own). An open one: its own files
+    /// plus its subfolders' totals (mounts below are another filesystem, links are not
+    /// followed) — where a file hard-linked into two of them would be counted twice, so the
+    /// files with one link are summed (each has one name, so one place) and of the multi-linked
+    /// only the largest set is taken: a lower bound that never exceeds the true size, with `+`
+    /// when it may be short (05 §6.1).
+    fn total(&self, i: usize) -> (u64, u64, bool) {
         let n = &self.nodes[i];
         let Some(d) = &n.digest else {
-            return (0, true);
+            return (0, 0, true);
         };
-        let mut more = !d.complete;
-        let mut bytes = d.bytes;
+        let more = !d.complete;
         if d.real_dirs == 0 {
-            return (bytes, more);
+            return (d.bytes, d.multi_bytes, more);
         }
         if let Some(below) = n.deep.below {
             return (
-                bytes + below.bytes,
-                more || !n.deep.complete || below.unread > 0,
+                d.bytes + below.bytes,
+                d.multi_bytes + below.multi,
+                more || !n.deep.complete || below.unread > 0 || below.partial > 0,
             );
         }
         if !n.open {
-            return (bytes, true);
+            return (d.bytes, d.multi_bytes, true);
         }
+        let mut single = d.bytes - d.multi_bytes;
+        let mut sets = vec![d.multi_bytes];
+        let mut more = more;
         for &c in &n.children {
-            let child = &self.nodes[c];
-            if child.link || self.class(c).is_some() {
+            if self.nodes[c].link || self.mount_class(c).is_some() {
                 continue;
             }
-            let (b, m) = self.total(c);
-            bytes += b;
-            more |= m;
+            let (b, m, mo) = self.total(c);
+            single += b - m;
+            sets.push(m);
+            more |= mo;
         }
+        let multi = sets.iter().copied().max().unwrap_or(0);
+        let shared = sets.iter().filter(|&&m| m > 0).count() > 1;
         // Subfolders that are not rows (names that are not UTF-8) are never counted.
         let rows = n.children.iter().filter(|&&c| !self.nodes[c].link).count() as u64;
-        (bytes, more || rows < d.real_dirs)
+        (single + multi, multi, more || shared || rows < d.real_dirs)
     }
 
     /// The rows' node ids with their positions (the build and the phases read them).
@@ -872,7 +978,7 @@ impl Tree {
     pub fn expand(&mut self, id: RowId) -> bool {
         match id {
             RowId::Hidden(p) => {
-                let Some(n) = self.nodes.get_mut(p as usize) else {
+                let Some(n) = self.ids.get(&p).map(|&slot| &mut self.nodes[slot]) else {
                     return false;
                 };
                 let was = n.hidden_open;
@@ -906,7 +1012,7 @@ impl Tree {
             let parent = tree.nodes[node].parent?;
             drawn.iter().find_map(|d| match *d {
                 Drawn::Folder { head, end, .. } if tree.chain_holds(head, end, parent) => {
-                    Some(RowId::Folder(end as u32))
+                    Some(RowId::Folder(tree.nodes[end].id))
                 }
                 _ => None,
             })
@@ -980,17 +1086,22 @@ impl Tree {
         self.nodes[i].deep = Deep::default();
         self.nodes[i].fs_asked = false;
         self.nodes[i].fs_done = false;
+        self.nodes[i].fs_late = false;
         self.nodes[i].fs = None;
         self.list_with(i, 0, true);
         self.pump();
     }
 
-    /// An owner's whole listing is running (Esc stops it before it closes the tree).
+    /// An owner's whole listing — or Space's scan, which lists every folder whole — is running
+    /// (Esc stops it before it closes the tree).
     pub fn owner_busy(&self) -> bool {
-        self.nodes.iter().any(|n| n.asked.is_some_and(|a| a.owner))
+        self.nodes
+            .iter()
+            .any(|n| n.asked.is_some_and(|a| a.owner) || n.deep.wanted && n.deep.running.is_some())
     }
 
-    /// Esc during an owner's whole listing: stops it; the row keeps what it showed.
+    /// Esc during an owner's whole listing or Space's scan: stops it; the row keeps what it
+    /// showed (a scan's figure stays, `+`, and is not started again by itself).
     pub fn stop_owner(&mut self) {
         let owned: Vec<(usize, u64)> = self
             .nodes
@@ -1001,6 +1112,15 @@ impl Tree {
         for (i, id) in owned {
             self.nodes[i].asked = None;
             self.cancel(id);
+        }
+        for i in 0..self.nodes.len() {
+            let deep = &self.nodes[i].deep;
+            if let (true, Some(id)) = (deep.wanted, deep.running) {
+                self.stop_scan(i, id);
+                let deep = &mut self.nodes[i].deep;
+                deep.wanted = false;
+                deep.done = true;
+            }
         }
     }
 
@@ -1025,6 +1145,12 @@ impl Tree {
         self.entered.take()
     }
 
+    /// The node slots held (tests: a refresh frees what it detached).
+    #[cfg(test)]
+    pub(crate) fn slots(&self) -> usize {
+        self.nodes.len()
+    }
+
     /// Closes the tree: every listing and scan stops, nothing is waited for.
     pub fn close(&mut self) {
         if self.closed {
@@ -1046,7 +1172,9 @@ impl Tree {
         let mut rows: Vec<&Child> = listing
             .children
             .iter()
-            .filter(|c| !c.lossy && matches!(c.kind, Kind::Dir | Kind::Link(Target::Dir)))
+            .filter(|c| {
+                !c.lossy && matches!(c.kind, Kind::Dir | Kind::Link(Target::Dir | Target::Unread))
+            })
             .collect();
         rows.sort_by(|a, b| {
             a.name
@@ -1065,8 +1193,7 @@ impl Tree {
                 Some(&k) => k,
                 None => {
                     let path = crate::remote::join(&self.nodes[i].path, &c.name);
-                    self.nodes.push(Node::new(path, c.name.clone(), Some(i)));
-                    let k = self.nodes.len() - 1;
+                    let k = self.add_node(Node::new(path, c.name.clone(), Some(i)));
                     self.cached_size(k);
                     k
                 }
@@ -1078,12 +1205,22 @@ impl Tree {
             kids.push(k);
         }
         // A path folder the listing did not reach (it stopped early) is drawn all the same.
+        let mut gone = Vec::new();
         for &k in old.values() {
-            if self.nodes[k].on_path && !kids.contains(&k) {
+            if kids.contains(&k) {
+                continue;
+            }
+            if self.nodes[k].on_path {
                 kids.push(k);
+            } else {
+                gone.push(k);
             }
         }
         self.nodes[i].children = kids;
+        // A folder no longer there: its requests stop and its slot is used again.
+        for k in gone {
+            self.free_node(k);
+        }
     }
 
     /// Keeps a running scan's figure in the process cache as a partial result.
@@ -1161,10 +1298,16 @@ impl Tree {
             }
             (For::List(i), Got::NotAnswering) => self.nodes[i].not_answering = true,
             (For::Statvfs(i), Got::Statvfs(r)) => {
-                self.nodes[i].fs = r.ok();
-                self.nodes[i].fs_done = true;
+                let n = &mut self.nodes[i];
+                n.fs = r.ok();
+                n.fs_done = true;
+                n.fs_late = false;
+                // Space waited for the fence (05 §4.1).
+                if n.deep.wanted {
+                    self.size_wanted();
+                }
             }
-            (For::Statvfs(i), Got::NotAnswering) => self.nodes[i].fs_done = true,
+            (For::Statvfs(i), Got::NotAnswering) => self.nodes[i].fs_late = true,
             (For::MacFence(k), Got::Statvfs(r)) => {
                 self.mac_fsids[k as usize] = r.ok().map(|f| f.fsid);
             }
@@ -1173,6 +1316,7 @@ impl Tree {
                 if n.deep.running != Some(reply.id) {
                     return false;
                 }
+                n.deep.not_answering = false;
                 // A scan started afresh shows what an earlier one reached until it passes it.
                 let behind =
                     s.end.is_none() && n.deep.below.is_some_and(|b| b.bytes > s.totals.bytes);
@@ -1200,9 +1344,13 @@ impl Tree {
                     return false;
                 }
                 n.deep.not_answering = true;
-                n.deep.done = true;
-                n.deep.running = None;
-                self.cancel(reply.id);
+                // Locally the call is abandoned and the scan has stopped; remotely it goes on
+                // waiting (the row says so until the next figure).
+                if self.local {
+                    n.deep.done = true;
+                    n.deep.running = None;
+                    self.cancel(reply.id);
+                }
             }
             _ => {}
         }

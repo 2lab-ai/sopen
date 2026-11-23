@@ -184,16 +184,45 @@ impl MountMap {
         }
     }
 
-    /// The mount points at or below `path`, which a scan of it never enters.
+    /// The folders below `path` a scan of it never enters: every mount point of the table, or,
+    /// on a remote without one, the name rules' folders (05 §4.1) — `/System/Volumes` whole on
+    /// a macOS host, every child of it being R7 and `Data/home` R6.
     pub fn below(&self, path: &str) -> Vec<String> {
-        match &self.table {
+        let names: Vec<String> = match &self.table {
+            Some(t) => t.keys().cloned().collect(),
+            None => {
+                let mut n = vec!["/dev", "/proc"];
+                if self.macos {
+                    n.extend(["/home", "/net", "/Network", "/System/Volumes"]);
+                }
+                n.into_iter().map(String::from).collect()
+            }
+        };
+        names
+            .into_iter()
+            .filter(|at| at.as_str() != path && super::root::inside(at, path))
+            .collect()
+    }
+
+    /// The mounts a link must never be followed into: R4–R6 (a lookup there can hang or mount
+    /// a share), by the table or, on a remote without one, by name.
+    pub fn guard(&self) -> Vec<String> {
+        let mut guard: Vec<String> = match &self.table {
             Some(t) => t
-                .keys()
-                .filter(|at| at.as_str() != path && super::root::inside(at, path))
-                .cloned()
+                .iter()
+                .filter(|(_, c)| matches!(c, Class::Sys | Class::Net | Class::Auto))
+                .map(|(at, _)| at.clone())
                 .collect(),
-            None => Vec::new(),
-        }
+            None => {
+                let mut n = vec!["/dev", "/proc"];
+                if self.macos {
+                    n.extend(["/home", "/net", "/Network", "/System/Volumes/Data/home"]);
+                }
+                n.into_iter().map(String::from).collect()
+            }
+        };
+        guard.sort();
+        guard
     }
 }
 

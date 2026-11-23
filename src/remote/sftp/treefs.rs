@@ -11,9 +11,9 @@
 
 use super::{read_at, SftpRemote, META_TIMEOUT};
 use crate::remote::treefs::{
-    is_cachedir_tag, scan_step, Ask, Budget, Child, FsStat, Got, Kind, Listing, Mounts, Reply,
-    Resolved, ScanAsk, ScanBudget, ScanEnd, Scanned, Target, Totals, TreeFs, IN_FLIGHT,
-    NOT_ANSWERING,
+    guarded, is_cachedir_tag, normalize, scan_step, Ask, Budget, Child, FsStat, Got, Kind, Listing,
+    Mounts, Reply, Resolved, ScanAsk, ScanBudget, ScanEnd, Scanned, Target, Totals, TreeFs,
+    IN_FLIGHT, NOT_ANSWERING,
 };
 use crate::remote::Wake;
 use openssh_sftp_client::fs::Fs;
@@ -97,7 +97,7 @@ impl SftpRemote {
 }
 
 enum Cmd {
-    Send(u64, u64, Ask),
+    Send(u64, u64, Box<Ask>),
     Cancel(u64),
     Close,
 }
@@ -111,7 +111,7 @@ struct SftpTree {
 
 impl TreeFs for SftpTree {
     fn send(&mut self, id: u64, prio: u64, ask: Ask) {
-        let _ = self.cmds.send(Cmd::Send(id, prio, ask));
+        let _ = self.cmds.send(Cmd::Send(id, prio, Box::new(ask)));
     }
 
     fn cancel(&mut self, id: u64) {
@@ -169,6 +169,9 @@ impl Out {
 
 type Fut<T> = Pin<Box<dyn Future<Output = T>>>;
 
+/// A request's "no longer wanted", which its future reads between its steps.
+type Stop = std::rc::Rc<std::cell::Cell<bool>>;
+
 /// What a request in flight is for.
 enum Flight {
     /// An answer to a request.
@@ -176,12 +179,18 @@ enum Flight {
         id: u64,
         since: Instant,
         warned: bool,
+        /// It opens a handle (a listing): cancelled, it is drained, not dropped.
+        handle: bool,
+        stop: Stop,
         fut: Fut<Got>,
     },
     /// One folder of a scan: its listing, or `None` when its fence keeps it out.
     Scan {
         id: u64,
         dir: String,
+        since: Instant,
+        warned: bool,
+        stop: Stop,
         fut: Fut<Result<Option<Listing>, String>>,
     },
 }
@@ -190,6 +199,32 @@ impl Flight {
     fn id(&self) -> u64 {
         match self {
             Flight::Ask { id, .. } | Flight::Scan { id, .. } => *id,
+        }
+    }
+
+    /// Cancels it: a future that may hold a handle keeps running until it has closed it — its
+    /// OPENDIR may already be on the wire, and a handle whose answer nobody reads is never
+    /// closed — and its answer is dropped; any other is dropped at once.
+    fn drain(self) -> Option<Fut<()>> {
+        match self {
+            Flight::Ask {
+                handle: true,
+                stop,
+                fut,
+                ..
+            } => {
+                stop.set(true);
+                Some(Box::pin(async move {
+                    fut.await;
+                }))
+            }
+            Flight::Scan { stop, fut, .. } => {
+                stop.set(true);
+                Some(Box::pin(async move {
+                    let _ = fut.await;
+                }))
+            }
+            Flight::Ask { .. } => None,
         }
     }
 }
@@ -203,6 +238,8 @@ struct RScan {
     started: Instant,
     reported: Instant,
     budget: Option<ScanBudget>,
+    /// Each folder's listing stops at this.
+    listing: Option<Budget>,
     skip: HashSet<String>,
     seen: HashSet<(u64, u64)>,
     fence: Option<Vec<u64>>,
@@ -217,6 +254,9 @@ struct Worker {
     waiting: Vec<(u64, u64, u64, Ask)>,
     seq: u64,
     flights: Vec<Flight>,
+    /// Cancelled listings running on until their handle is closed; they count toward
+    /// [`IN_FLIGHT`] — they are requests on the wire still.
+    draining: Vec<Fut<()>>,
     scans: HashMap<u64, RScan>,
     timer: Option<Pin<Box<tokio::time::Sleep>>>,
 }
@@ -231,6 +271,7 @@ impl Worker {
             waiting: Vec::new(),
             seq: 0,
             flights: Vec::new(),
+            draining: Vec::new(),
             scans: HashMap::new(),
             timer: None,
         }
@@ -243,13 +284,25 @@ impl Worker {
                 match cmds.poll_recv(cx) {
                     Poll::Ready(Some(Cmd::Send(id, prio, ask))) => {
                         self.seq += 1;
-                        self.waiting.push((prio, self.seq, id, ask));
+                        self.waiting.push((prio, self.seq, id, *ask));
                     }
                     Poll::Ready(Some(Cmd::Cancel(id))) => self.cancel(id),
                     Poll::Ready(Some(Cmd::Close)) | Poll::Ready(None) => return Poll::Ready(()),
                     Poll::Pending => break,
                 }
             }
+            // A scan whose deadline passed ends on its own, whatever is in flight.
+            let late: Vec<u64> = self
+                .scans
+                .iter()
+                .filter(|(_, s)| s.budget.is_some_and(|b| s.started.elapsed() >= b.time))
+                .map(|(id, _)| *id)
+                .collect();
+            for id in late {
+                self.scan_moved(id);
+            }
+            self.draining
+                .retain_mut(|fut| fut.as_mut().poll(cx).is_pending());
             self.start();
             let mut done = Vec::new();
             let mut i = 0;
@@ -285,15 +338,24 @@ impl Worker {
 
     fn cancel(&mut self, id: u64) {
         self.waiting.retain(|w| w.2 != id);
-        // A dropped listing's handle is closed by the client's own drop, on this runtime.
-        self.flights.retain(|f| f.id() != id);
         self.scans.remove(&id);
+        self.drop_flights(id);
+    }
+
+    /// Cancels every flight of `id` (a listing drains until its handle is closed).
+    fn drop_flights(&mut self, id: u64) {
+        let (gone, kept): (Vec<Flight>, Vec<Flight>) = std::mem::take(&mut self.flights)
+            .into_iter()
+            .partition(|f| f.id() == id);
+        self.flights = kept;
+        self.draining
+            .extend(gone.into_iter().filter_map(Flight::drain));
     }
 
     /// Starts what waits, nearest first, while fewer than [`IN_FLIGHT`] are out: requests and
     /// the scans' next folders by one order.
     fn start(&mut self) {
-        while self.flights.len() < IN_FLIGHT {
+        while self.flights.len() + self.draining.len() < IN_FLIGHT {
             let ask = self
                 .waiting
                 .iter()
@@ -321,6 +383,8 @@ impl Worker {
     fn start_ask(&mut self, id: u64, prio: u64, seq: u64, ask: Ask) {
         let fs = self.fs.clone();
         let request = self.timing.request;
+        let stop = Stop::default();
+        let handle = matches!(ask, Ask::List { .. });
         let fut: Fut<Got> = match ask {
             Ask::Resolve(path) => Box::pin(async move {
                 Got::Resolved(realpath(fs, &path, request).await.map(|path| Resolved {
@@ -336,11 +400,19 @@ impl Worker {
                 let (opts, statvfs) = (self.sftp.options(), self.sftp.support_statvfs());
                 Box::pin(async move { Got::Mounts(mounts(fs, opts, statvfs, request).await) })
             }
-            Ask::List { path, budget } => {
-                let opts = self.sftp.options();
-                Box::pin(
-                    async move { Got::Listed(list(fs, Some(opts), &path, budget, request).await) },
-                )
+            Ask::List {
+                path,
+                budget,
+                guard,
+            } => {
+                let row = Row {
+                    opts: self.sftp.options(),
+                    guard,
+                };
+                let stop = stop.clone();
+                Box::pin(async move {
+                    Got::Listed(list(fs, Some(row), &path, budget, request, &stop).await)
+                })
             }
             Ask::Statvfs(path) => {
                 let offered = self.sftp.support_statvfs();
@@ -355,6 +427,8 @@ impl Worker {
             id,
             since: Instant::now(),
             warned: false,
+            handle,
+            stop,
             fut,
         });
     }
@@ -373,6 +447,7 @@ impl Worker {
                 started: now - ask.base.time,
                 reported: now,
                 budget: ask.budget,
+                listing: ask.listing,
                 skip: ask.skip.into_iter().collect(),
                 seen: ask.seen.into_iter().collect(),
                 fence,
@@ -391,19 +466,31 @@ impl Worker {
         };
         scan.flying += 1;
         let (mut fs, request, fence) = (self.fs.clone(), self.timing.request, scan.fence.clone());
+        let budget = scan.listing;
         let path = dir.clone();
+        let stop = Stop::default();
+        let stopped = stop.clone();
         let fut: Fut<Result<Option<Listing>, String>> = Box::pin(async move {
             if let Some(allowed) = fence {
-                // 05 §4.1: a folder on another filesystem is a mount point, not entered.
-                if let Ok(Ok(st)) = tokio::time::timeout(request, fs.statvfs(&path)).await {
-                    if !allowed.contains(&st.fsid) {
-                        return Ok(None);
-                    }
+                // 05 §4.1: a folder on another filesystem is a mount point, not entered — and a
+                // folder whose filesystem cannot be told is not entered either (fail closed).
+                let st = within(request, &format!("statvfs {path}"), fs.statvfs(&path)).await?;
+                if !allowed.contains(&st.fsid) {
+                    return Ok(None);
                 }
             }
-            list(fs, None, &path, None, request).await.map(Some)
+            list(fs, None, &path, budget, request, &stopped)
+                .await
+                .map(Some)
         });
-        self.flights.push(Flight::Scan { id, dir, fut });
+        self.flights.push(Flight::Scan {
+            id,
+            dir,
+            since: Instant::now(),
+            warned: false,
+            stop,
+            fut,
+        });
     }
 
     fn finish(&mut self, flight: Flight, done: Done) {
@@ -465,7 +552,7 @@ impl Worker {
         if let Some(end) = end {
             let totals = scan.totals;
             self.scans.remove(&id);
-            self.flights.retain(|f| f.id() != id);
+            self.drop_flights(id);
             self.out.send(
                 id,
                 Got::Scan(Scanned {
@@ -483,20 +570,30 @@ impl Worker {
         let mut next: Option<Instant> = None;
         let mut late = Vec::new();
         for f in &mut self.flights {
-            if let Flight::Ask {
+            let (Flight::Ask {
                 id, since, warned, ..
-            } = f
-            {
-                if *warned {
-                    continue;
-                }
-                let due = *since + limit;
-                if Instant::now() >= due {
-                    *warned = true;
+            }
+            | Flight::Scan {
+                id, since, warned, ..
+            }) = f;
+            if *warned {
+                continue;
+            }
+            let due = *since + limit;
+            if Instant::now() >= due {
+                *warned = true;
+                if !late.contains(id) {
                     late.push(*id);
-                } else {
-                    next = Some(next.map_or(due, |n| n.min(due)));
                 }
+            } else {
+                next = Some(next.map_or(due, |n| n.min(due)));
+            }
+        }
+        // A scan's own deadline wakes the worker too.
+        for s in self.scans.values() {
+            if let Some(b) = s.budget {
+                let due = s.started + b.time;
+                next = Some(next.map_or(due, |n| n.min(due)));
             }
         }
         for id in late {
@@ -570,7 +667,7 @@ async fn mounts(
     statvfs: bool,
     request: Duration,
 ) -> Mounts {
-    if let Ok(bytes) = read_all(opts, "/proc/self/mountinfo", 1 << 20, request).await {
+    if let Ok(bytes) = read_all(opts, "/proc/self/mountinfo", 1 << 20, request, None).await {
         let table = crate::remote::treefs::parse_mountinfo(&String::from_utf8_lossy(&bytes));
         if !table.is_empty() {
             return Mounts {
@@ -601,9 +698,14 @@ async fn read_all(
     path: &str,
     max: u64,
     request: Duration,
+    stop: Option<&Stop>,
 ) -> Result<Vec<u8>, String> {
     let mut opts = opts;
     let file = within(request, &format!("open {path}"), opts.read(true).open(path)).await?;
+    if stop.is_some_and(|s| s.get()) {
+        let _ = tokio::time::timeout(Duration::from_secs(5), file.close()).await;
+        return Err(format!("read {path}: cancelled"));
+    }
     let mut out = Vec::new();
     let result = async {
         while (out.len() as u64) < max {
@@ -643,19 +745,42 @@ async fn statvfs(
     })
 }
 
+/// What a row's listing adds to a scan's: the client to read `CACHEDIR.TAG` with, and the
+/// mounts a link must not be followed into.
+struct Row {
+    opts: openssh_sftp_client::file::OpenOptions,
+    guard: Vec<String>,
+}
+
 /// One folder: OPENDIR, READDIR … (each reply within the request timeout), CLOSE — by the
-/// client's drop of the stream, also when it stops early. A row's listing (`opts` given) adds a
-/// `stat` per link and the `CACHEDIR.TAG` read; `budget` stops it between replies (once one has
-/// come — before that it waits, `not answering` after 2 s, up to the request timeout).
+/// client's drop of the handle or the stream, also when it stops early or is cancelled (`stop`,
+/// read between every two requests: a cancelled listing closes its handle as soon as it has it).
+/// `budget` stops it between replies (once one has come — before that it waits, `not answering`
+/// after 2 s, up to the request timeout).
+///
+/// A row's listing (`row`) then reads each link's target — `READLINK` first when there is a
+/// guard, and a target at or below one is not `stat`ed ([`Target::Unread`]); else one `stat` —
+/// and the 43-byte `CACHEDIR.TAG`, each only inside the budget's time and while wanted: past
+/// it the links not read stay non-rows and the listing says it is incomplete.
 async fn list(
     mut fs: Fs,
-    opts: Option<openssh_sftp_client::file::OpenOptions>,
+    row: Option<Row>,
     path: &str,
     budget: Option<Budget>,
     request: Duration,
+    stop: &Stop,
 ) -> Result<Listing, String> {
-    let dir = within(request, &format!("list {path}"), fs.open_dir(path)).await?;
+    let cancelled = || Err::<Listing, _>(format!("list {path}: cancelled"));
     let started = Instant::now();
+    // Cancelled before it was sent (a scan's folder after its fence): no OPENDIR at all.
+    if stop.get() {
+        return cancelled();
+    }
+    let dir = within(request, &format!("list {path}"), fs.open_dir(path)).await?;
+    if stop.get() {
+        // Dropping the handle closes it.
+        return cancelled();
+    }
     let mut listing = Listing {
         complete: true,
         ..Listing::default()
@@ -663,6 +788,9 @@ async fn list(
     {
         let mut stream = std::pin::pin!(dir.read_dir());
         loop {
+            if stop.get() {
+                return cancelled();
+            }
             let wait = match budget {
                 Some(b) if !listing.children.is_empty() => {
                     let left = b.time.saturating_sub(started.elapsed());
@@ -712,27 +840,64 @@ async fn list(
             }
         }
     }
-    if let Some(opts) = opts {
-        for child in &mut listing.children {
-            if child.kind == Kind::Link(Target::Other) && !child.lossy {
-                let full = crate::remote::join(path, &child.name);
-                child.kind = match within(request, "stat", fs.metadata(&full)).await {
-                    Ok(m) if m.file_type().is_some_and(|t| t.is_dir()) => Kind::Link(Target::Dir),
-                    Ok(m) if m.file_type().is_some_and(|t| t.is_file()) => Kind::Link(Target::File),
-                    _ => Kind::Link(Target::Other),
-                };
+    let Some(row) = row else {
+        return Ok(listing);
+    };
+    let deadline = budget.map(|b| started + b.time);
+    let go = || !stop.get() && deadline.is_none_or(|d| Instant::now() < d);
+    for i in 0..listing.children.len() {
+        let child = &listing.children[i];
+        if child.kind != Kind::Link(Target::Other) || child.lossy {
+            continue;
+        }
+        if !go() {
+            listing.complete = false;
+            return Ok(listing);
+        }
+        let full = crate::remote::join(path, &child.name);
+        if !row.guard.is_empty() {
+            // Where it points, by its words: a target in a guarded mount is never asked for.
+            let to = within(request, "readlink", fs.read_link(&full)).await;
+            let unread = match to {
+                Ok(to) => {
+                    let to = to.to_string_lossy().into_owned();
+                    let abs = if to.starts_with('/') {
+                        to
+                    } else {
+                        crate::remote::join(path, &to)
+                    };
+                    guarded(&normalize(&abs), &row.guard)
+                }
+                Err(_) => false,
+            };
+            if unread {
+                listing.children[i].kind = Kind::Link(Target::Unread);
+                continue;
+            }
+            if !go() {
+                listing.complete = false;
+                return Ok(listing);
             }
         }
-        if listing
-            .children
-            .iter()
-            .any(|c| c.name == "CACHEDIR.TAG" && c.kind == Kind::File)
-        {
-            let tag = crate::remote::join(path, "CACHEDIR.TAG");
-            listing.cachedir = read_all(opts, &tag, 43, request)
-                .await
-                .is_ok_and(|head| is_cachedir_tag(&head));
+        listing.children[i].kind = match within(request, "stat", fs.metadata(&full)).await {
+            Ok(m) if m.file_type().is_some_and(|t| t.is_dir()) => Kind::Link(Target::Dir),
+            Ok(m) if m.file_type().is_some_and(|t| t.is_file()) => Kind::Link(Target::File),
+            _ => Kind::Link(Target::Other),
+        };
+    }
+    let tagged = listing
+        .children
+        .iter()
+        .any(|c| c.name == "CACHEDIR.TAG" && c.kind == Kind::File);
+    if tagged {
+        if !go() {
+            listing.complete = false;
+            return Ok(listing);
         }
+        let tag = crate::remote::join(path, "CACHEDIR.TAG");
+        listing.cachedir = read_all(row.opts, &tag, 43, request, Some(stop))
+            .await
+            .is_ok_and(|head| is_cachedir_tag(&head));
     }
     Ok(listing)
 }
@@ -741,7 +906,7 @@ async fn list(
 mod tests {
     use super::*;
     use crate::remote::sftp::Proxy;
-    use crate::remote::treefs::{ScanAsk, LIST_BUDGET, REMOTE_SCAN_BUDGET};
+    use crate::remote::treefs::{ScanAsk, ScanBudget, LIST_BUDGET, REMOTE_SCAN_BUDGET};
     use std::path::Path;
     use std::sync::atomic::Ordering;
 
@@ -842,6 +1007,7 @@ mod tests {
             Ask::List {
                 path: p(&dir),
                 budget: None,
+                guard: Vec::new(),
             },
         );
         let listing = listed(&wait_for(&mut *tree, 1, Duration::from_secs(10)), 1);
@@ -870,6 +1036,7 @@ mod tests {
                     entries: 2,
                     ..LIST_BUDGET
                 }),
+                guard: Vec::new(),
             },
         );
         let cut = listed(&wait_for(&mut *tree, 2, Duration::from_secs(10)), 2);
@@ -964,6 +1131,7 @@ mod tests {
                 Ask::List {
                     path: p(&dir),
                     budget: Some(LIST_BUDGET),
+                    guard: Vec::new(),
                 },
             );
         }
@@ -1012,6 +1180,7 @@ mod tests {
         let list = |path: &Path| Ask::List {
             path: p(path),
             budget: None,
+            guard: Vec::new(),
         };
         tree.send(1, 0, list(&dir));
         assert!(until(Duration::from_secs(5), || requests(&proxy, OPENDIR) == 1));
@@ -1116,5 +1285,269 @@ mod tests {
             "no listing after the close"
         );
         assert!(at_close < before + 320, "the scan had not finished");
+    }
+
+    /// `SSH_FXP_STAT`, `SSH_FXP_READLINK`, `SSH_FXP_HANDLE`.
+    const STAT: u8 = 17;
+    const READLINK: u8 = 19;
+    const HANDLE: u8 = 102;
+
+    fn scan(start: Vec<String>) -> ScanAsk {
+        ScanAsk {
+            start,
+            ..ScanAsk::default()
+        }
+    }
+
+    fn end(replies: &[Reply], id: u64) -> Scanned {
+        replies
+            .iter()
+            .rev()
+            .find_map(|r| match (&r.got, r.id == id) {
+                (Got::Scan(s @ Scanned { end: Some(_), .. }), true) => Some(s.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("no end for {id}: {replies:?}"))
+    }
+
+    /// Item 3: a link whose target lies in a guarded mount is never `stat`ed (only read); one
+    /// outside it is.
+    #[test]
+    fn a_link_into_a_guarded_mount_is_never_stated() {
+        if SftpRemote::local_server().is_none() {
+            return;
+        }
+        let (_tmp, dir) = temp();
+        let (_g, guarded) = temp();
+        std::fs::create_dir(guarded.join("x")).unwrap();
+        std::fs::create_dir(dir.join("real")).unwrap();
+        std::os::unix::fs::symlink(guarded.join("x"), dir.join("in")).unwrap();
+        std::os::unix::fs::symlink("real", dir.join("out")).unwrap();
+        let proxy = Proxy::default();
+        let conn = SftpRemote::local_server_with(Some(proxy.clone())).unwrap();
+        let mut tree = Box::new(conn).into_tree_with(quick());
+        tree.send(
+            1,
+            0,
+            Ask::List {
+                path: p(&dir),
+                budget: None,
+                guard: vec![p(&guarded)],
+            },
+        );
+        let listing = listed(&wait_for(&mut *tree, 1, Duration::from_secs(10)), 1);
+        let kind = |n: &str| listing.children.iter().find(|c| c.name == n).unwrap().kind;
+        assert_eq!(kind("in"), Kind::Link(Target::Unread));
+        assert_eq!(kind("out"), Kind::Link(Target::Dir));
+        assert_eq!(requests(&proxy, STAT), 1, "only the link outside the guard");
+        tree.close();
+    }
+
+    /// Item 5: a folder whose `statvfs` fails under an active fence is not listed; it counts as
+    /// unread (`+`).
+    #[test]
+    fn a_fence_that_cannot_be_read_is_not_crossed() {
+        let Some(conn) = SftpRemote::local_server() else {
+            return;
+        };
+        if !conn.sftp.as_ref().unwrap().support_statvfs() {
+            eprintln!("skipping: the server has no statvfs@openssh.com");
+            return;
+        }
+        drop(conn);
+        let (_tmp, dir) = temp();
+        std::fs::create_dir(dir.join("sub")).unwrap();
+        let proxy = Proxy::default();
+        let conn = SftpRemote::local_server_with(Some(proxy.clone())).unwrap();
+        let mut tree = Box::new(conn).into_tree_with(quick());
+        // SSH_FXP_EXTENDED: the statvfs is answered SSH_FX_FAILURE.
+        proxy.rules.lock().unwrap().fail = Some(200);
+        tree.send(
+            1,
+            0,
+            Ask::Scan(ScanAsk {
+                fence: Some(vec![12345]),
+                ..scan(vec![p(&dir.join("sub"))])
+            }),
+        );
+        let got = end(&wait_for(&mut *tree, 1, Duration::from_secs(10)), 1);
+        assert_eq!((got.totals.listings, got.totals.unread), (0, 1), "{got:?}");
+        assert_eq!(requests(&proxy, OPENDIR), 0);
+        tree.close();
+    }
+
+    /// Item 7: a scan bounds each folder's listing; one read in part is counted as such.
+    #[test]
+    fn a_scan_bounds_each_listing() {
+        let Some(conn) = SftpRemote::local_server() else {
+            return;
+        };
+        let (_tmp, dir) = temp();
+        for i in 0..5 {
+            std::fs::write(dir.join(format!("f{i}")), b"x").unwrap();
+        }
+        let mut tree = Box::new(conn).into_tree_with(quick());
+        tree.send(
+            1,
+            0,
+            Ask::Scan(ScanAsk {
+                listing: Some(Budget {
+                    entries: 2,
+                    ..LIST_BUDGET
+                }),
+                ..scan(vec![p(&dir)])
+            }),
+        );
+        let got = end(&wait_for(&mut *tree, 1, Duration::from_secs(10)), 1);
+        assert_eq!((got.totals.listings, got.totals.partial), (1, 1), "{got:?}");
+        tree.close();
+    }
+
+    /// Item 7: a remote scan's own deadline fires while nothing answers.
+    #[test]
+    fn a_scan_deadline_fires_while_nothing_answers() {
+        if SftpRemote::local_server().is_none() {
+            return;
+        }
+        let (_tmp, dir) = temp();
+        let proxy = Proxy::default();
+        let conn = SftpRemote::local_server_with(Some(proxy.clone())).unwrap();
+        proxy.hold.store(true, Ordering::Relaxed);
+        let mut tree = Box::new(conn).into_tree_with(quick());
+        let started = Instant::now();
+        tree.send(
+            1,
+            0,
+            Ask::Scan(ScanAsk {
+                budget: Some(ScanBudget {
+                    time: Duration::from_millis(300),
+                    ..REMOTE_SCAN_BUDGET
+                }),
+                ..scan(vec![p(&dir)])
+            }),
+        );
+        let got = end(&wait_for(&mut *tree, 1, Duration::from_secs(5)), 1);
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "{:?}",
+            started.elapsed()
+        );
+        assert_eq!(got.end, Some(ScanEnd::Budget(vec![p(&dir)])));
+        proxy.hold.store(false, Ordering::Relaxed);
+        tree.close();
+    }
+
+    /// Item 8: a row's listing out of time reads no link's target.
+    #[test]
+    fn a_listing_out_of_time_reads_no_link() {
+        if SftpRemote::local_server().is_none() {
+            return;
+        }
+        let (_tmp, dir) = temp();
+        for i in 0..5 {
+            std::os::unix::fs::symlink("/", dir.join(format!("l{i}"))).unwrap();
+        }
+        let proxy = Proxy::default();
+        let conn = SftpRemote::local_server_with(Some(proxy.clone())).unwrap();
+        let mut tree = Box::new(conn).into_tree_with(quick());
+        tree.send(
+            1,
+            0,
+            Ask::List {
+                path: p(&dir),
+                budget: Some(Budget {
+                    entries: 10_000,
+                    time: Duration::ZERO,
+                }),
+                guard: Vec::new(),
+            },
+        );
+        let listing = listed(&wait_for(&mut *tree, 1, Duration::from_secs(10)), 1);
+        assert!(!listing.complete);
+        assert_eq!(requests(&proxy, STAT) + requests(&proxy, READLINK), 0);
+        tree.close();
+    }
+
+    /// Item 9: a scan's folder with no answer in 2 s is reported `not answering`.
+    #[test]
+    fn a_scan_folder_that_does_not_answer_is_reported() {
+        if SftpRemote::local_server().is_none() {
+            return;
+        }
+        let (_tmp, dir) = temp();
+        let proxy = Proxy::default();
+        let conn = SftpRemote::local_server_with(Some(proxy.clone())).unwrap();
+        proxy.hold.store(true, Ordering::Relaxed);
+        let mut tree = Box::new(conn).into_tree_with(quick());
+        tree.send(1, 0, Ask::Scan(scan(vec![p(&dir)])));
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut late = false;
+        while !late && Instant::now() < deadline {
+            late = matches!(
+                tree.next(Duration::from_millis(20)),
+                Some(Reply {
+                    id: 1,
+                    got: Got::NotAnswering
+                })
+            );
+        }
+        assert!(late, "no not answering for the scan");
+        proxy.hold.store(false, Ordering::Relaxed);
+        tree.close();
+    }
+
+    /// Item 11: a listing cancelled before its OPENDIR answered leaves no handle open: the late
+    /// handle is closed (the server's own log, opens against closes).
+    #[test]
+    fn cancelled_listings_leave_no_open_handle() {
+        if SftpRemote::local_server().is_none() {
+            return;
+        }
+        let (_tmp, dir) = temp();
+        let (_l, logs) = temp();
+        let log = logs.join("server.log");
+        let proxy = Proxy::default();
+        let conn = SftpRemote::local_server_run(Some(proxy.clone()), &[], Some(&log)).unwrap();
+        let mut tree = Box::new(conn).into_tree_with(quick());
+        for id in 0..100u64 {
+            proxy.hold.store(true, Ordering::Relaxed);
+            tree.send(
+                id,
+                0,
+                Ask::List {
+                    path: p(&dir),
+                    budget: None,
+                    guard: Vec::new(),
+                },
+            );
+            let sent = id as usize + 1;
+            assert!(until(Duration::from_secs(5), || requests(&proxy, OPENDIR) == sent));
+            tree.cancel(id);
+            proxy.hold.store(false, Ordering::Relaxed);
+            // The late HANDLE reaches the client before the next round holds the link again.
+            let handles = || {
+                proxy
+                    .wire
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|w| w.reply && w.kind == HANDLE)
+                    .count()
+            };
+            assert!(until(Duration::from_secs(5), || handles() == sent));
+        }
+        let count = |word: &str| {
+            std::fs::read_to_string(&log)
+                .unwrap_or_default()
+                .lines()
+                .filter(|l| l.starts_with(word))
+                .count()
+        };
+        until(Duration::from_secs(5), || {
+            count("opendir ") == 100 && count("closedir ") == 100
+        });
+        assert_eq!(count("opendir "), 100);
+        assert_eq!(count("closedir "), 100, "every late handle was closed");
+        tree.close();
     }
 }

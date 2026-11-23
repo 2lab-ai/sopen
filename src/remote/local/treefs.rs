@@ -57,21 +57,51 @@ impl Outbox {
     }
 }
 
-/// Which requests are no longer wanted.
+/// The requests still running, each with the flag that cancels it; a request leaves when it
+/// ends (answered, abandoned or cancelled), so nothing piles up over a long session.
 #[derive(Default)]
 struct Wanted {
     closed: AtomicBool,
-    cancelled: Mutex<HashSet<u64>>,
+    live: Mutex<std::collections::HashMap<u64, Arc<AtomicBool>>>,
+}
+
+/// One request's "no longer wanted": the tree closed, or the request was cancelled.
+#[derive(Clone)]
+struct Stop {
+    wanted: Arc<Wanted>,
+    cancelled: Arc<AtomicBool>,
+}
+
+impl Stop {
+    fn dropped(&self) -> bool {
+        self.wanted.closed.load(Ordering::SeqCst) || self.cancelled.load(Ordering::SeqCst)
+    }
 }
 
 impl Wanted {
-    fn dropped(&self, id: u64) -> bool {
-        self.closed.load(Ordering::SeqCst)
-            || self
-                .cancelled
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .contains(&id)
+    fn live(&self) -> std::sync::MutexGuard<'_, std::collections::HashMap<u64, Arc<AtomicBool>>> {
+        self.live.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// Starts tracking `id`.
+    fn track(self: &Arc<Self>, id: u64) -> Stop {
+        let cancelled = Arc::new(AtomicBool::new(false));
+        self.live().insert(id, cancelled.clone());
+        Stop {
+            wanted: self.clone(),
+            cancelled,
+        }
+    }
+
+    /// `id` has ended.
+    fn done(&self, id: u64) {
+        self.live().remove(&id);
+    }
+
+    fn cancel(&self, id: u64) {
+        if let Some(flag) = self.live().remove(&id) {
+            flag.store(true, Ordering::SeqCst);
+        }
     }
 }
 
@@ -106,21 +136,26 @@ impl LocalTree {
         prio: u64,
         call: impl FnOnce(&dyn Disk, &Live) -> Got + Send + 'static,
     ) {
-        let (disk, out, wanted) = (self.disk.clone(), self.out.clone(), self.wanted.clone());
+        let (disk, out) = (self.disk.clone(), self.out.clone());
         let late = self.out.clone();
-        let w = wanted.clone();
+        let stop = self.wanted.track(id);
+        let (when, gone) = (stop.clone(), stop.clone());
         self.pool.submit(Job {
             prio,
-            dropped: Arc::new(move || w.dropped(id)),
+            dropped: Arc::new(move || when.dropped()),
             work: Box::new(move |live| {
                 let got = call(&*disk, live);
                 Box::new(move || {
-                    if !wanted.dropped(id) {
+                    stop.wanted.done(id);
+                    if !stop.dropped() {
                         out.send(id, got);
                     }
                 }) as Then
             }),
-            abandoned: Box::new(move || late.send(id, Got::NotAnswering)),
+            abandoned: Box::new(move || {
+                gone.wanted.done(id);
+                late.send(id, Got::NotAnswering);
+            }),
         });
     }
 }
@@ -140,8 +175,12 @@ impl TreeFs for LocalTree {
                     statvfs: true,
                 }))
             }),
-            Ask::List { path, budget } => self.call(id, prio, move |d, live| {
-                Got::Listed(d.list(&path, budget, true, live).map_err(text))
+            Ask::List {
+                path,
+                budget,
+                guard,
+            } => self.call(id, prio, move |d, live| {
+                Got::Listed(d.list(&path, budget, true, &guard, live).map_err(text))
             }),
             Ask::Statvfs(path) => self.call(id, prio, move |d, _| {
                 Got::Statvfs(d.statvfs(&path).map_err(text))
@@ -151,11 +190,7 @@ impl TreeFs for LocalTree {
     }
 
     fn cancel(&mut self, id: u64) {
-        self.wanted
-            .cancelled
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .insert(id);
+        self.wanted.cancel(id);
     }
 
     fn next(&mut self, wait: Duration) -> Option<Reply> {
@@ -183,6 +218,14 @@ impl TreeFs for LocalTree {
     }
 }
 
+#[cfg(test)]
+impl LocalTree {
+    /// Requests the worker still keeps track of (tests: none once all have ended).
+    fn tracked(&self) -> usize {
+        self.wanted.live().len()
+    }
+}
+
 impl Drop for LocalTree {
     fn drop(&mut self) {
         self.close();
@@ -196,9 +239,11 @@ struct Scan {
     disk: Arc<dyn Disk>,
     pool: Pool,
     out: Arc<Outbox>,
-    wanted: Arc<Wanted>,
+    stop: Stop,
     skip: HashSet<String>,
     budget: Option<crate::remote::treefs::ScanBudget>,
+    /// Each folder's listing stops at this.
+    listing: Option<Budget>,
     state: Mutex<ScanState>,
 }
 
@@ -221,9 +266,10 @@ impl Scan {
             disk: tree.disk.clone(),
             pool: tree.pool.clone(),
             out: tree.out.clone(),
-            wanted: tree.wanted.clone(),
+            stop: tree.wanted.track(id),
             skip: ask.skip.into_iter().collect(),
             budget: ask.budget,
+            listing: ask.listing,
             state: Mutex::new(ScanState {
                 queue: ask.start.into_iter().collect(),
                 flying: 0,
@@ -244,7 +290,7 @@ impl Scan {
     /// Starts listings while fewer than [`MAX_CALLS`] of this scan's are out; ends the scan
     /// when nothing is left.
     fn feed(self: &Arc<Self>) {
-        if self.wanted.dropped(self.id) {
+        if self.stop.dropped() {
             return;
         }
         let mut end = None;
@@ -274,6 +320,7 @@ impl Scan {
             if let Some(end) = end {
                 let totals = s.totals;
                 drop(s);
+                self.stop.wanted.done(self.id);
                 self.out.send(
                     self.id,
                     Got::Scan(Scanned {
@@ -290,18 +337,19 @@ impl Scan {
     }
 
     fn list(self: &Arc<Self>, dir: String) {
-        let (me, late, id) = (self.clone(), self.clone(), self.id);
-        let wanted = self.wanted.clone();
+        let (me, late) = (self.clone(), self.clone());
+        let stop = self.stop.clone();
         self.pool.submit(Job {
             prio: self.prio,
-            dropped: Arc::new(move || wanted.dropped(id)),
+            dropped: Arc::new(move || stop.dropped()),
             work: Box::new(move |live| {
-                let got = me.disk.list(&dir, None, false, live);
+                let got = me.disk.list(&dir, me.listing, false, &[], live);
                 Box::new(move || me.listed(&dir, got)) as Then
             }),
             abandoned: Box::new(move || {
                 // One call that does not answer stops the scan: the row says so.
                 late.lock().over = true;
+                late.stop.wanted.done(late.id);
                 late.out.send(late.id, Got::NotAnswering);
             }),
         });
@@ -332,7 +380,7 @@ impl Scan {
             due.then_some(s.totals)
         };
         if let Some(totals) = progress {
-            if !self.wanted.dropped(self.id) {
+            if !self.stop.dropped() {
                 self.out
                     .send(self.id, Got::Scan(Scanned { totals, end: None }));
             }
@@ -350,21 +398,14 @@ impl Disk for RealDisk {
         path: &str,
         budget: Option<Budget>,
         full: bool,
+        guard: &[String],
         live: &Live,
     ) -> io::Result<Listing> {
+        let started = Instant::now();
         let mut listing = list_dir(path, budget, live)?;
         if full {
-            for child in &mut listing.children {
-                if let Kind::Link(_) = child.kind {
-                    child.kind = Kind::Link(target_of(&crate::remote::join(path, &child.name)));
-                }
-            }
-            listing.cachedir = listing
-                .children
-                .iter()
-                .any(|c| c.name == "CACHEDIR.TAG" && c.kind == Kind::File)
-                && read_head(&crate::remote::join(path, "CACHEDIR.TAG"))
-                    .is_ok_and(|head| is_cachedir_tag(&head));
+            let deadline = budget.map(|b| started + b.time);
+            enrich(path, &mut listing, guard, deadline, live, &mut RealOps);
         }
         Ok(listing)
     }
@@ -395,21 +436,155 @@ fn cpath(path: &str) -> io::Result<std::ffi::CString> {
     std::ffi::CString::new(path).map_err(|_| io::Error::other("a path with a NUL byte"))
 }
 
-/// What a link points at (it is followed once, as the list does).
-fn target_of(path: &str) -> Target {
-    match std::fs::metadata(path) {
-        Ok(m) if m.is_dir() => Target::Dir,
-        Ok(m) if m.is_file() => Target::File,
-        _ => Target::Other,
+/// What an entry is, by `lstat` (a link is not followed).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Seen {
+    Dir,
+    File,
+    Link,
+    Other,
+}
+
+/// The calls a row's listing makes after reading the folder (tests record them).
+pub(crate) trait LinkOps {
+    fn lstat(&mut self, path: &str) -> io::Result<Seen>;
+    fn readlink(&mut self, path: &str) -> io::Result<String>;
+    /// A file's first 43 bytes.
+    fn head(&mut self, path: &str) -> io::Result<Vec<u8>>;
+}
+
+struct RealOps;
+
+impl LinkOps for RealOps {
+    fn lstat(&mut self, path: &str) -> io::Result<Seen> {
+        let t = std::fs::symlink_metadata(path)?.file_type();
+        Ok(if t.is_symlink() {
+            Seen::Link
+        } else if t.is_dir() {
+            Seen::Dir
+        } else if t.is_file() {
+            Seen::File
+        } else {
+            Seen::Other
+        })
+    }
+
+    fn readlink(&mut self, path: &str) -> io::Result<String> {
+        std::fs::read_link(path)?
+            .into_os_string()
+            .into_string()
+            .map_err(|_| io::Error::other("a link target that is not UTF-8"))
+    }
+
+    fn head(&mut self, path: &str) -> io::Result<Vec<u8>> {
+        use std::io::Read as _;
+        let mut head = Vec::with_capacity(43);
+        std::fs::File::open(path)?.take(43).read_to_end(&mut head)?;
+        Ok(head)
     }
 }
 
-/// A `CACHEDIR.TAG`'s first 43 bytes.
-fn read_head(path: &str) -> io::Result<Vec<u8>> {
-    use std::io::Read as _;
-    let mut head = Vec::with_capacity(43);
-    std::fs::File::open(path)?.take(43).read_to_end(&mut head)?;
-    Ok(head)
+/// A row's listing after the folder is read: each link's target kind — never read at or below
+/// one of `guard` (a mount of R4–R6: [`Target::Unread`]) — and the `CACHEDIR.TAG` read. Every
+/// call is made only while the listing is wanted and inside its deadline; past it the links not
+/// read yet stay non-rows and the listing says it is incomplete (05 §6.3).
+pub(crate) fn enrich(
+    dir: &str,
+    listing: &mut Listing,
+    guard: &[String],
+    deadline: Option<Instant>,
+    live: &Live,
+    ops: &mut dyn LinkOps,
+) {
+    let go = || !(live.stop)() && deadline.is_none_or(|d| Instant::now() < d);
+    for child in &mut listing.children {
+        if child.kind != Kind::Link(Target::Other) || child.lossy {
+            continue;
+        }
+        let target = follow(dir, &child.name, guard, &go, ops);
+        (live.beat)();
+        match target {
+            Some(t) => child.kind = Kind::Link(t),
+            None => {
+                listing.complete = false;
+                return;
+            }
+        }
+    }
+    let tagged = listing
+        .children
+        .iter()
+        .any(|c| c.name == "CACHEDIR.TAG" && c.kind == Kind::File);
+    if tagged {
+        if !go() {
+            listing.complete = false;
+            return;
+        }
+        listing.cachedir = ops
+            .head(&crate::remote::join(dir, "CACHEDIR.TAG"))
+            .is_ok_and(|head| is_cachedir_tag(&head));
+    }
+}
+
+/// What the link `dir/name` points at, resolved one component at a time (`lstat`, and
+/// `readlink` for each link on the way, at most 40), never touching a path at or below one of
+/// `guard`: one there is [`Target::Unread`] — a lookup inside an automounter or a hung network
+/// mount is the thing to avoid. `None`: `go` said stop before the answer.
+fn follow(
+    dir: &str,
+    name: &str,
+    guard: &[String],
+    go: &dyn Fn() -> bool,
+    ops: &mut dyn LinkOps,
+) -> Option<Target> {
+    use crate::remote::treefs::guarded;
+    // `dir` was listed by its path: it is a folder, and no link is in it.
+    let mut at = dir.to_string();
+    let mut todo: VecDeque<String> = VecDeque::from([name.to_string()]);
+    let mut hops = 0;
+    while let Some(part) = todo.pop_front() {
+        match part.as_str() {
+            "" | "." => continue,
+            // Above `/` stays at `/`, as the kernel has it.
+            ".." => {
+                if at != "/" {
+                    at = crate::remote::split_parent(&at).0.to_string();
+                }
+                continue;
+            }
+            _ => {}
+        }
+        let next = crate::remote::join(&at, &part);
+        if guarded(&next, guard) {
+            return Some(Target::Unread);
+        }
+        if !go() {
+            return None;
+        }
+        match ops.lstat(&next) {
+            Ok(Seen::Dir) => at = next,
+            Ok(Seen::Link) => {
+                hops += 1;
+                if hops > 40 || !go() {
+                    return if hops > 40 { Some(Target::Other) } else { None };
+                }
+                let Ok(to) = ops.readlink(&next) else {
+                    return Some(Target::Other);
+                };
+                if to.starts_with('/') {
+                    at = "/".to_string();
+                }
+                for p in to.split('/').rev() {
+                    todo.push_front(p.to_string());
+                }
+            }
+            Ok(Seen::File) if todo.iter().all(|p| p.is_empty() || p == ".") => {
+                return Some(Target::File)
+            }
+            Ok(_) | Err(_) => return Some(Target::Other),
+        }
+    }
+    Some(Target::Dir)
 }
 
 /// `realpath`, with `(st_dev, st_ino)` of `/` and of each folder on the way to it.
@@ -712,7 +887,8 @@ fn list_dir(path: &str, budget: Option<Budget>, live: &Live) -> io::Result<Listi
             libc::statx(
                 fd,
                 raw.as_ptr(),
-                libc::AT_SYMLINK_NOFOLLOW | libc::AT_STATX_DONT_SYNC,
+                // AT_NO_AUTOMOUNT: a child that is an automount point is not mounted by this.
+                libc::AT_SYMLINK_NOFOLLOW | libc::AT_STATX_DONT_SYNC | libc::AT_NO_AUTOMOUNT,
                 mask,
                 &mut st,
             )
@@ -773,5 +949,224 @@ impl Drop for Dir {
     fn drop(&mut self) {
         // SAFETY: the stream is ours and closed once.
         unsafe { libc::closedir(self.0) };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    /// A filesystem in memory for a row's listing's calls, every call recorded.
+    #[derive(Default)]
+    struct Memory {
+        entries: HashMap<String, (Seen, String)>,
+        calls: Vec<String>,
+    }
+
+    impl Memory {
+        fn dir(mut self, path: &str) -> Self {
+            self.entries.insert(path.into(), (Seen::Dir, String::new()));
+            self
+        }
+
+        fn link(mut self, path: &str, to: &str) -> Self {
+            self.entries.insert(path.into(), (Seen::Link, to.into()));
+            self
+        }
+    }
+
+    impl LinkOps for Memory {
+        fn lstat(&mut self, path: &str) -> io::Result<Seen> {
+            self.calls.push(path.to_string());
+            self.entries
+                .get(path)
+                .map(|e| e.0)
+                .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))
+        }
+
+        fn readlink(&mut self, path: &str) -> io::Result<String> {
+            self.calls.push(path.to_string());
+            match self.entries.get(path) {
+                Some((Seen::Link, to)) => Ok(to.clone()),
+                _ => Err(io::Error::from(io::ErrorKind::InvalidInput)),
+            }
+        }
+
+        fn head(&mut self, path: &str) -> io::Result<Vec<u8>> {
+            self.calls.push(path.to_string());
+            Err(io::Error::from(io::ErrorKind::NotFound))
+        }
+    }
+
+    fn links(names: &[&str]) -> Listing {
+        Listing {
+            children: names
+                .iter()
+                .map(|n| Child::plain(n, Kind::Link(Target::Other), 0))
+                .collect(),
+            complete: true,
+            cachedir: false,
+        }
+    }
+
+    fn kind(listing: &Listing, name: &str) -> Kind {
+        listing
+            .children
+            .iter()
+            .find(|c| c.name == name)
+            .unwrap()
+            .kind
+    }
+
+    fn live() -> (impl Fn(), impl Fn() -> bool) {
+        (|| {}, || false)
+    }
+
+    /// Item 3: a link's target is resolved one component at a time, never at or below a mount the
+    /// rules forbid (an autofs trigger): directly, through another link, or by `..`.
+    #[test]
+    fn a_link_is_never_followed_into_a_guarded_mount() {
+        let mut fs = Memory::default()
+            .dir("/h")
+            .dir("/auto")
+            .dir("/data")
+            .dir("/data/d")
+            .link("/h/direct", "/auto/share/x")
+            .link("/h/hop", "/h/next")
+            .link("/h/next", "/auto/y")
+            .link("/h/up", "../auto/z")
+            .link("/h/deep", "../../../auto/z")
+            .link("/h/abs", "/data/../../auto/z")
+            .link("/h/ok", "/data/d");
+        let mut listing = links(&["direct", "hop", "up", "deep", "abs", "ok"]);
+        let (beat, stop) = live();
+        let guard = vec!["/auto".to_string()];
+        enrich(
+            "/h",
+            &mut listing,
+            &guard,
+            None,
+            &Live {
+                beat: &beat,
+                stop: &stop,
+            },
+            &mut fs,
+        );
+        // `..` above `/` stays at `/` (never the working directory's).
+        for name in ["direct", "hop", "up", "deep", "abs"] {
+            assert_eq!(kind(&listing, name), Kind::Link(Target::Unread), "{name}");
+        }
+        assert!(
+            fs.calls.iter().all(|c| c.starts_with('/')),
+            "{:?}",
+            fs.calls
+        );
+        assert_eq!(kind(&listing, "ok"), Kind::Link(Target::Dir));
+        let touched: Vec<&String> = fs
+            .calls
+            .iter()
+            .filter(|c| *c == "/auto" || c.starts_with("/auto/"))
+            .collect();
+        assert!(
+            touched.is_empty(),
+            "calls at or below the guard: {touched:?}"
+        );
+    }
+
+    /// Item 8: past its deadline (or once stopped) a row's listing makes no more calls: the links
+    /// not resolved stay non-rows, and the listing says it is incomplete.
+    #[test]
+    fn a_rows_listing_past_its_deadline_makes_no_more_calls() {
+        let mut fs = Memory::default()
+            .dir("/data")
+            .link("/h/a", "/data")
+            .link("/h/b", "/data");
+        let mut listing = links(&["a", "b", "CACHEDIR.TAG"]);
+        listing.children[2].kind = Kind::File;
+        let (beat, stop) = live();
+        enrich(
+            "/h",
+            &mut listing,
+            &[],
+            Some(Instant::now() - Duration::from_millis(1)),
+            &Live {
+                beat: &beat,
+                stop: &stop,
+            },
+            &mut fs,
+        );
+        assert!(fs.calls.is_empty(), "{:?}", fs.calls);
+        assert!(!listing.complete);
+        assert_eq!(kind(&listing, "a"), Kind::Link(Target::Other));
+        let stopped = || true;
+        let mut fs = Memory::default().dir("/data").link("/h/a", "/data");
+        let mut listing = links(&["a"]);
+        enrich(
+            "/h",
+            &mut listing,
+            &[],
+            None,
+            &Live {
+                beat: &beat,
+                stop: &stopped,
+            },
+            &mut fs,
+        );
+        assert!(fs.calls.is_empty() && !listing.complete);
+    }
+
+    /// A disk that answers at once.
+    struct Instant0;
+
+    impl Disk for Instant0 {
+        fn list(
+            &self,
+            _: &str,
+            _: Option<Budget>,
+            _: bool,
+            _: &[String],
+            _: &Live,
+        ) -> io::Result<Listing> {
+            Ok(Listing::default())
+        }
+        fn resolve(&self, path: &str) -> io::Result<Resolved> {
+            Ok(Resolved {
+                path: path.into(),
+                ids: Vec::new(),
+            })
+        }
+        fn home(&self) -> io::Result<Resolved> {
+            self.resolve("/")
+        }
+        fn mounts(&self) -> io::Result<Mounts> {
+            Err(io::Error::other("none"))
+        }
+        fn statvfs(&self, _: &str) -> io::Result<FsStat> {
+            Ok(FsStat {
+                used_bytes: 0,
+                used_files: 0,
+                fsid: 0,
+            })
+        }
+    }
+
+    /// Item 12: a request the worker tracks is let go once it has ended — cancelled or not.
+    #[test]
+    fn cancelled_requests_are_not_kept() {
+        let pool = Pool::new(crate::tree::watchdog::Timing::default());
+        let mut tree = LocalTree::new(Arc::new(Instant0), pool.clone());
+        for id in 0..300 {
+            tree.send(id, 0, Ask::Statvfs("/".into()));
+            if id % 2 == 0 {
+                tree.cancel(id);
+            }
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while (pool.outstanding().0 > 0 || tree.tracked() > 0) && Instant::now() < deadline {
+            while tree.next(Duration::from_millis(5)).is_some() {}
+        }
+        assert_eq!(tree.tracked(), 0);
+        pool.shutdown();
     }
 }

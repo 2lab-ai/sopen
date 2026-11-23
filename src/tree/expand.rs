@@ -62,18 +62,28 @@ impl Tree {
     }
 
     /// A drawn folder 05 §5 may open at `level`: listed completely, 1 to N − 1 shown subfolders,
-    /// no rule or heuristic of 05 §4 (the current folder, on the path, follows N alone), not
-    /// opened or closed by the owner, not refused by the budget already.
+    /// no rule or heuristic of 05 §4 (the current folder too: only H1 gives way to the path),
+    /// not opened or closed by the owner, not refused by the budget already.
     fn candidate(&self, x: usize, level: usize) -> bool {
         let n = &self.nodes[x];
         if n.open || n.touched || n.refused || n.link || x == self.root {
             return false;
         }
-        if x != self.current && (n.on_path || self.rule(x).is_some()) {
+        // Strict ancestors are open by rule 1; the current folder keeps its rules (H1's path
+        // override is in the rule itself).
+        if (n.on_path && x != self.current) || self.rule(x).is_some() {
             return false;
         }
         if !n.digest.as_ref().is_some_and(|d| d.complete) {
             return false;
+        }
+        // 05 §4.1: on a remote without a table a folder is opened only once its fence, and its
+        // parent's, are known.
+        if self.mounts.as_ref().is_some_and(|m| m.fences) {
+            let parent = n.parent.map(|p| self.nodes[p].fs);
+            if n.fs.is_none() || parent.is_some_and(|f| f.is_none()) {
+                return false;
+            }
         }
         let (shown, _) = self.shown_hidden(x);
         (1..self.params.n).contains(&shown) && self.level(x) == level

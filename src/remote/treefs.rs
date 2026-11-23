@@ -44,8 +44,12 @@ pub const CACHEDIR_SIGNATURE: &[u8; 43] = b"Signature: 8a477f597d28d172789f06886
 pub enum Target {
     Dir,
     File,
-    /// Anything else, a broken link, or not asked (a scan's listing does not follow links).
+    /// Anything else, a broken link, or not asked (a scan's listing does not follow links, and a
+    /// row's listing whose budget ran out stops asking).
     Other,
+    /// Not read: the target lies at or below a mount the rules forbid touching (R4–R6, 05 §4),
+    /// where even a `stat` can mount a share or hang. Shown as a link row; Enter resolves it.
+    Unread,
 }
 
 /// An entry's type, as `lstat` gives it.
@@ -182,6 +186,11 @@ pub struct Totals {
     pub listings: u64,
     /// Folders that could not be listed: more may be below them.
     pub unread: u64,
+    /// Folders listed only in part (a listing stopped at its budget): more may be in them.
+    pub partial: u64,
+    /// Of `bytes`, those of files with more than one link (each inode once): the part another
+    /// scan may have counted too (05 §6.1).
+    pub multi: u64,
     pub time: Duration,
 }
 
@@ -208,6 +217,8 @@ pub struct ScanAsk {
     pub fence: Option<Vec<u64>>,
     /// `None`: no budget (local scans, and the owner's Space).
     pub budget: Option<ScanBudget>,
+    /// Each folder's listing stops at this (05 §6.3: every automatic listing is bounded).
+    pub listing: Option<Budget>,
     /// What earlier scans of the same row counted: the budget counts from it.
     pub base: Totals,
     /// Inodes already counted (the row's own hard-linked files).
@@ -240,10 +251,12 @@ pub enum Ask {
     /// account's home even when the start folder was moved), else `realpath(".")`.
     Home(Option<String>),
     Mounts,
-    /// A row's listing; `budget: None`: whole (the owner's action).
+    /// A row's listing; `budget: None`: whole (the owner's action). A link whose target lies at
+    /// or below one of `guard` (mounts of R4–R6) is not followed: [`Target::Unread`].
     List {
         path: String,
         budget: Option<Budget>,
+        guard: Vec<String>,
     },
     Statvfs(String),
     Scan(ScanAsk),
@@ -302,13 +315,14 @@ pub struct Live<'a> {
 /// runs them on the watchdog pool (05 §6.2). The real one is the disk (`local/treefs.rs`); tests
 /// put a fake behind the same trait (a mount table, calls that never return, counts).
 pub trait Disk: Send + Sync + 'static {
-    /// One folder; `full`: a row's listing — each link's target kind and the `CACHEDIR.TAG`
-    /// read — rather than a scan's.
+    /// One folder; `full`: a row's listing — each link's target kind (never at or below one of
+    /// `guard`) and the `CACHEDIR.TAG` read — rather than a scan's.
     fn list(
         &self,
         path: &str,
         budget: Option<Budget>,
         full: bool,
+        guard: &[String],
         live: &Live,
     ) -> std::io::Result<Listing>;
     fn resolve(&self, path: &str) -> std::io::Result<Resolved>;
@@ -359,6 +373,30 @@ pub fn parse_mountinfo(text: &str) -> Vec<Mount> {
     table
 }
 
+/// `path` with `.` and `..` taken out by its words alone (no link is read): `/a/b/../c` →
+/// `/a/c`; above `/` stays at `/`.
+pub fn normalize(path: &str) -> String {
+    let mut parts: Vec<&str> = Vec::new();
+    for part in path.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            p => parts.push(p),
+        }
+    }
+    format!("/{}", parts.join("/"))
+}
+
+/// Whether `path` is one of `guard` or below one (by whole components).
+pub fn guarded(path: &str, guard: &[String]) -> bool {
+    guard.iter().any(|g| {
+        let g = g.trim_end_matches('/');
+        path == g || g.is_empty() || path.strip_prefix(g).is_some_and(|r| r.starts_with('/'))
+    })
+}
+
 /// Whether `head` (a file's first bytes) marks a cache folder (R8).
 pub fn is_cachedir_tag(head: &[u8]) -> bool {
     head.starts_with(CACHEDIR_SIGNATURE)
@@ -376,16 +414,22 @@ pub(crate) fn scan_step(
 ) -> Vec<String> {
     let mut below = Vec::new();
     totals.listings += 1;
+    if !listing.complete {
+        totals.partial += 1;
+    }
     for child in &listing.children {
         totals.entries += 1;
         match child.kind {
             Kind::File => {
-                let first = match child.id {
-                    Some(id) if child.nlink > 1 => seen.insert(id),
-                    _ => true,
+                let (first, multi) = match child.id {
+                    Some(id) if child.nlink > 1 => (seen.insert(id), true),
+                    _ => (true, false),
                 };
                 if first {
                     totals.bytes += child.size;
+                    if multi {
+                        totals.multi += child.size;
+                    }
                 }
             }
             Kind::Dir if !child.lossy && child.mnt == Mnt::No => {

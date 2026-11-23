@@ -76,17 +76,15 @@ impl Tree {
         root.hidden = false;
         root.on_path = true;
         root.open = true;
-        self.nodes.push(root);
-        self.root = 0;
-        let mut at = 0;
+        self.root = self.add_node(root);
+        let mut at = self.root;
         let rest = rooted.folder[rooted.root.len().min(rooted.folder.len())..].to_string();
         for part in rest.split('/').filter(|p| !p.is_empty()) {
             let path = crate::remote::join(&self.nodes[at].path, part);
             let mut node = Node::new(path, part.to_string(), Some(at));
             node.on_path = true;
             node.open = true;
-            self.nodes.push(node);
-            let k = self.nodes.len() - 1;
+            let k = self.add_node(node);
             self.nodes[at].children.push(k);
             at = k;
         }
@@ -95,12 +93,15 @@ impl Tree {
             // The current folder opens by 05 §5 like any other candidate.
             self.nodes[at].open = false;
         }
+        // Each by its rules: a path folder at or below an R4–R6 mount is drawn, not read.
         for i in 0..self.nodes.len() {
             self.list_auto(i, 0);
         }
         if self.mounts.as_ref().is_some_and(|m| m.fences) {
             for i in 0..self.nodes.len() {
-                self.statvfs(i, 0);
+                if self.listable(i) {
+                    self.statvfs(i, 0);
+                }
             }
             if self.mounts.as_ref().is_some_and(|m| m.macos) {
                 self.ask(For::MacFence(0), 0, Ask::Statvfs("/".into()));
@@ -150,7 +151,7 @@ impl Tree {
                     && self.listable(end)
                     && (n.digest.is_none() && !(n.failed || n.not_answering)
                         || !self.settled(n)
-                        || fences && n.fs_asked && !n.fs_done)
+                        || fences && n.fs_asked && !n.fs_done && !n.fs_late)
             }
             Drawn::Hidden { .. } => false,
         });
@@ -230,16 +231,17 @@ impl Tree {
                 self.statvfs(end, prio);
             }
             self.list_auto(end, prio);
-            if self.class(end) == Some(super::rules::Class::Disk) {
+            if self.rule(end) == Some(super::rules::Rule::Mount(super::rules::Class::Disk)) {
                 self.statvfs(end, prio);
             }
         }
     }
 
-    /// An automatic listing of `i`, unless it was ever listed or is being listed.
+    /// An automatic listing of `i`, unless it was ever listed or is being listed — or its rules
+    /// keep it unread (05 §4: never touch what they forbid).
     fn list_auto(&mut self, i: usize, prio: u64) {
         let n = &self.nodes[i];
-        if n.listed_once || n.asked.is_some() || n.digest.is_some() {
+        if n.listed_once || n.asked.is_some() || n.digest.is_some() || !self.listable(i) {
             return;
         }
         self.list_with(i, prio, false);
@@ -256,7 +258,19 @@ impl Tree {
         }
         let budget = (!owner).then_some(LIST_BUDGET);
         let path = self.nodes[i].path.clone();
-        let id = self.ask(For::List(i), prio, Ask::List { path, budget });
+        let id = self.ask(
+            For::List(i),
+            prio,
+            Ask::List {
+                path,
+                budget,
+                guard: self
+                    .mounts
+                    .as_ref()
+                    .map(super::rules::MountMap::guard)
+                    .unwrap_or_default(),
+            },
+        );
         let n = &mut self.nodes[i];
         n.asked = Some(super::Asked { id, owner });
         n.listed_once = true;
@@ -312,11 +326,16 @@ impl Tree {
         }
     }
 
-    fn stop_scan(&mut self, i: usize, id: u64) {
+    pub(super) fn stop_scan(&mut self, i: usize, id: u64) {
         self.store_partial(i);
+        let local = self.local;
         let n = &mut self.nodes[i];
         n.deep.running = None;
         n.left = None;
+        // A remote scan that was waiting is not a verdict on the row: the next one may answer.
+        if !local {
+            n.deep.not_answering = false;
+        }
         self.cancel(id);
     }
 
@@ -333,14 +352,35 @@ impl Tree {
             return false;
         }
         let rule = self.rule(i);
-        if n.deep.wanted {
-            return rule.is_none_or(|r| r.sizable_on_space());
+        let allowed = if n.deep.wanted {
+            rule.is_none_or(|r| r.sizable_on_space())
+        } else {
+            !n.link && !n.open && rule.is_none_or(|r| r.sized())
+        };
+        // 05 §4.1: on a remote without a table nothing is entered before its fence is known —
+        // Space waits for it, and a fence that cannot be read keeps the row `+`.
+        allowed && (!self.mounts.as_ref().is_some_and(|m| m.fences) || n.fs.is_some())
+    }
+
+    /// What a scan of `path` never enters: mounts and the name rules' folders below it, and
+    /// H3's folders on a macOS host (05 §4).
+    fn protected_below(&self, path: &str) -> Vec<String> {
+        let mut skip = self
+            .mounts
+            .as_ref()
+            .map(|m| m.below(path))
+            .unwrap_or_default();
+        if let (Some(home), Some(m)) = (&self.home, &self.mounts) {
+            if m.macos {
+                for name in ["Library", ".Trash"] {
+                    let p = crate::remote::join(home, name);
+                    if p != path && super::root::inside(&p, path) {
+                        skip.push(p);
+                    }
+                }
+            }
         }
-        if n.link || n.open || rule.is_some_and(|r| !r.sized()) {
-            return false;
-        }
-        // 05 §4.1: on a remote without a table, the fence first.
-        !self.mounts.as_ref().is_some_and(|m| m.fences) || !n.fs_asked || n.fs_done
+        skip
     }
 
     /// Starts the deep scan of `i` (where a stopped remote scan left off, if it did).
@@ -357,7 +397,9 @@ impl Tree {
             None => self.nodes[i]
                 .children
                 .iter()
-                .filter(|&&c| !self.nodes[c].link && self.class(c).is_none())
+                .filter(|&&c| {
+                    !self.nodes[c].link && self.mount_class(c).is_none() && !self.private(c)
+                })
                 .map(|&c| self.nodes[c].path.clone())
                 .collect(),
         };
@@ -372,13 +414,13 @@ impl Tree {
         });
         let ask = ScanAsk {
             start,
-            skip: self
-                .mounts
-                .as_ref()
-                .map(|m| m.below(&path))
-                .unwrap_or_default(),
+            skip: self.protected_below(&path),
             fence,
             budget: (remote && !wanted).then_some(REMOTE_SCAN_BUDGET),
+            // Every automatic listing is bounded, a scan's too (05 §6.3); Space is the owner's
+            // own action and lists every folder whole (D-6) — Esc stops it, and each call is
+            // still behind the watchdog.
+            listing: (!wanted).then_some(LIST_BUDGET),
             base,
             seen: self.nodes[i]
                 .digest
@@ -393,10 +435,19 @@ impl Tree {
         n.left = None;
     }
 
-    /// Space: scans `i` now if it can be, else once its whole listing is in.
+    /// Space: scans `i` now if it can be, else once its whole listing — and, on a remote
+    /// without a table, its fence — is in. A row phase 2 never fenced (H3 is not read unopened)
+    /// gets its `statvfs` here (05:117 "sized only on Space").
     pub(super) fn size_wanted(&mut self) {
+        let fences = self.mounts.as_ref().is_some_and(|m| m.fences);
         for i in 0..self.nodes.len() {
-            if self.nodes[i].deep.wanted && self.scannable(i) {
+            if !self.nodes[i].deep.wanted {
+                continue;
+            }
+            if fences && !self.nodes[i].fs_asked {
+                self.statvfs(i, 0);
+            }
+            if self.scannable(i) {
                 self.scan(i, 0);
             }
         }

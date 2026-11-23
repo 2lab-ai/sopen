@@ -14,12 +14,15 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
+mod round1;
+
 /// A filesystem call the fake let through: its path, and whether it was a row's listing (`full`)
 /// or a scan's.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Listed {
     path: String,
     full: bool,
+    budget: Option<Budget>,
 }
 
 #[derive(Default)]
@@ -114,6 +117,7 @@ impl Disk for Fake {
         path: &str,
         budget: Option<Budget>,
         full: bool,
+        guard: &[String],
         live: &Live,
     ) -> std::io::Result<Listing> {
         // A call no longer wanted never reaches the filesystem (the real disk checks first too).
@@ -123,6 +127,7 @@ impl Disk for Fake {
         self.lists.lock().unwrap().push(Listed {
             path: path.to_string(),
             full,
+            budget,
         });
         {
             let mut g = self.gate();
@@ -140,7 +145,7 @@ impl Disk for Fake {
             let slow = *self.slow.lock().unwrap();
             std::thread::sleep(slow);
         }
-        let mut listing = self.real.list(path, budget, full, live)?;
+        let mut listing = self.real.list(path, budget, full, guard, live)?;
         if let (Some(_), Some((n, never))) = (budget, self.cut.lock().unwrap().clone()) {
             listing.children.retain(|c| c.name != never);
             if listing.children.len() > n {
