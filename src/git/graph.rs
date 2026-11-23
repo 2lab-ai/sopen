@@ -287,14 +287,14 @@ impl Graph {
         // Lines into the node from above: its column's, and 3. the joins, whose slots empty.
         let mut continued = None;
         if let Some(id) = id {
-            for slot in column..self.lanes.len() {
-                let Some(lane) = &self.lanes[slot] else {
+            for (slot, lane) in self.lanes.iter_mut().enumerate().skip(column) {
+                let Some(index) = lane
+                    .as_ref()
+                    .filter(|lane| &lane.awaits == id)
+                    .map(|lane| lane.interval)
+                else {
                     continue;
                 };
-                if &lane.awaits != id {
-                    continue;
-                }
-                let index = lane.interval;
                 let occupancy = &mut self.intervals[index];
                 let dashed = occupancy.dashed_to == u32::MAX;
                 if dashed {
@@ -310,7 +310,7 @@ impl Graph {
                     continued = Some(index);
                 } else {
                     occupancy.last = Some(r);
-                    self.lanes[slot] = None;
+                    *lane = None;
                 }
             }
         }
@@ -472,21 +472,22 @@ impl Graph {
                 .last
                 .map_or(self.rows.len(), |last| last as usize)
                 .min(end);
-            // A node on the slot inside the occupancy is on its first-parent line: it parts runs.
+            // A node on the slot inside the occupancy is on its first-parent line: it parts runs;
+            // `to` ends the last.
+            let nodes = self.rows.iter().enumerate().take(to).skip(from);
+            let parts = nodes.filter(|(_, row)| row.column == slot).map(|(r, _)| r);
             let mut run = from;
-            for r in from..=to {
-                if r == to || self.rows[r].column == slot {
-                    if run < r {
-                        lines.push(PassThrough {
-                            slot,
-                            colour: occupancy.colour,
-                            rows: run..r,
-                            // No run crosses the node that ends the dash.
-                            dashed: r as u64 <= u64::from(occupancy.dashed_to),
-                        });
-                    }
-                    run = r + 1;
+            for part in parts.chain([to]) {
+                if run < part {
+                    lines.push(PassThrough {
+                        slot,
+                        colour: occupancy.colour,
+                        rows: run..part,
+                        // No run crosses the node that ends the dash.
+                        dashed: part as u64 <= u64::from(occupancy.dashed_to),
+                    });
                 }
+                run = part + 1;
             }
         }
         lines

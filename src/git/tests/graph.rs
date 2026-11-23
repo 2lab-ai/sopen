@@ -79,9 +79,12 @@ fn passing(graph: &Graph, rows: std::ops::Range<usize>) -> Vec<Vec<(u32, u32, bo
         dashed,
     } in graph.pass_throughs(rows.clone())
     {
-        for r in run {
-            assert!(rows.contains(&r), "pass-through row {r} outside {rows:?}");
-            each[r - rows.start].push((slot, colour, dashed));
+        assert!(
+            rows.start <= run.start && run.start < run.end && run.end <= rows.end,
+            "pass-through rows {run:?} outside {rows:?} or empty"
+        );
+        for row in &mut each[run.start - rows.start..run.end - rows.start] {
+            row.push((slot, colour, dashed));
         }
     }
     for row in &mut each {
@@ -679,8 +682,9 @@ fn edges_meet(graph: &Graph, context: &str) {
     if let Some(first) = top.first() {
         assert!(first.is_empty(), "{context}: lines above the first row");
     }
-    for r in 1..graph.len() {
-        assert_eq!(bottom[r - 1], top[r], "{context}: the edge above row {r}");
+    for (r, (above, below)) in bottom.iter().zip(top.iter().skip(1)).enumerate() {
+        let r = r + 1;
+        assert_eq!(above, below, "{context}: the edge above row {r}");
     }
     for (r, slots) in top.iter().chain(&bottom).enumerate() {
         let r = r % graph.len().max(1);
@@ -705,7 +709,9 @@ fn lines_reach_parents(rows: &[Row], graph: &Graph, first_parent: bool, context:
         .collect();
     let mut reached = BTreeSet::new();
     let mut into = BTreeSet::new();
-    for c in 0..graph.len() {
+    assert_eq!(rows.len(), graph.len(), "{context}");
+    let each = rows.iter().zip(&top).zip(&passes);
+    for (c, ((row, top_edge), through)) in each.enumerate() {
         let node = graph.row(c);
         let mut tops: Vec<u32> = Vec::new();
         for s in graph.segments(c) {
@@ -723,7 +729,7 @@ fn lines_reach_parents(rows: &[Row], graph: &Graph, first_parent: bool, context:
         match tops.iter().min() {
             Some(&lowest) => assert_eq!(node.column, lowest, "{context}: row {c}"),
             None => {
-                let free = (0..).find(|s| !top[c].iter().any(|&(t, _)| t == *s));
+                let free = (0..).find(|s| !top_edge.iter().any(|&(t, _)| t == *s));
                 assert_eq!(Some(node.column), free, "{context}: tip row {c}");
             }
         }
@@ -740,7 +746,7 @@ fn lines_reach_parents(rows: &[Row], graph: &Graph, first_parent: bool, context:
             .map(|s| (s.colour, s.slot))
             .collect();
         began.sort_unstable();
-        let crossed: Vec<u32> = passes[c].iter().map(|&(s, _, _)| s).collect();
+        let crossed: Vec<u32> = through.iter().map(|&(s, _, _)| s).collect();
         let free: Vec<u32> = (node.column + 1..)
             .filter(|s| !crossed.contains(s))
             .take(began.len())
@@ -749,7 +755,7 @@ fn lines_reach_parents(rows: &[Row], graph: &Graph, first_parent: bool, context:
         assert_eq!(taken, free, "{context}: row {c}'s new slots");
 
         let mut considered: Vec<&Oid> = Vec::new();
-        for p in rows[c].parents() {
+        for p in row.parents() {
             if !considered.contains(&p) {
                 considered.push(p);
             }
