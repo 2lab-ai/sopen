@@ -1427,3 +1427,94 @@ fn r4_a_state_recording_one_never_restores_one() {
         assert_eq!(state(&dir), None);
     }
 }
+
+// ---------------------------------------------------------------------------------------------
+// Review round 2 (PR #65): the watchdog's wait for the lock is bounded; a state from another boot
+// is dropped whatever it records.
+
+/// R2-1 — another sopen holds the lock and is stopped: the watchdog does not block on it past
+/// its total. It ends at the deadline without writing, and the state stays for the next start.
+#[test]
+fn r5_the_watchdog_does_not_wait_for_a_held_lock_past_its_total() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("state");
+    let hid = Fake::at(OFF);
+    let procs = Procs::default();
+    let mut a = process(&dir, &hid, &procs, 1);
+    a.focus(true);
+    let holder = Holder {
+        pid: 1,
+        start: 1001,
+    };
+    procs.kill(holder);
+    std::mem::forget(a);
+    let writes = hid.writes();
+
+    // A stopped sopen in the middle of a step: the lock is held and stays held.
+    let held = lock(&dir).unwrap();
+    let (input, pipe) = std::io::pipe().unwrap();
+    drop(pipe);
+    let pace = Pace {
+        poll: Duration::from_secs(60),
+        first: Duration::from_millis(10),
+        most: Duration::from_millis(40),
+        total: Duration::from_millis(200),
+    };
+    let (d, mut h, m) = (dir.clone(), hid.clone(), procs.machine());
+    let started = Instant::now();
+    let watchdog = std::thread::spawn(move || watch(&d, &mut h, holder, &m, input, || {}, &pace));
+    let ended_in_time = wait_until(Duration::from_secs(5), || watchdog.is_finished());
+    let took = started.elapsed();
+    let writes_while_held = hid.writes();
+    drop(held); // a watchdog still blocked goes on from here (and must not have before)
+    let done = watchdog.join().unwrap();
+
+    assert!(ended_in_time, "still waiting for the lock after {took:?}");
+    assert!(took >= pace.total, "{took:?}");
+    let e = format!("{:#}", done.unwrap_err());
+    assert!(e.contains("gave up"), "{e}");
+    assert_eq!(
+        writes_while_held, writes,
+        "nothing written without the lock"
+    );
+    assert_eq!(hid.writes(), writes);
+    assert_eq!(hid.value(), ON);
+    assert!(state(&dir).is_some(), "the state stays for the next start");
+
+    let _next = process(&dir, &hid, &procs, 2);
+    assert_eq!(hid.value(), OFF, "the next start restored");
+    assert_eq!(state(&dir), None);
+}
+
+/// R2-2 — a state from another boot is removed without touching the value, whatever original it
+/// records: after a reboot the owner's own 1 is not written over, by the start's clean-up, a
+/// watchdog's release or an acquisition.
+#[test]
+fn r6_a_state_from_another_boot_is_dropped_whatever_it_records() {
+    let procs = Procs::default();
+    let dead = procs.start(9);
+    procs.kill(dead);
+    for path in ["start", "watchdog", "acquire"] {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("state");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join(STATE),
+            r#"{"original":1,"holders":[{"pid":9,"start":1009}],"boot":"another boot"}"#,
+        )
+        .unwrap();
+        let hid = Fake::at(ON); // the owner's own 1, set again after the reboot
+        match path {
+            "start" => drop(process(&dir, &hid, &procs, 2)),
+            "watchdog" => release(&dir, &mut hid.clone(), dead, &procs.machine()).unwrap(),
+            _ => {
+                let me = procs.start(3);
+                let got = acquire(&dir, &mut hid.clone(), me, &procs.machine()).unwrap();
+                assert_eq!(got, Acquired::OwnersOwn, "{path}");
+            }
+        }
+        assert!(hid.writes().is_empty(), "{path}: wrote {:?}", hid.writes());
+        assert_eq!(hid.value(), ON, "{path}");
+        assert!(!dir.join(STATE).exists(), "{path}: the file is removed");
+    }
+}

@@ -298,7 +298,19 @@ pub(crate) fn acquire(
 /// longer runs leave the holders; with none left, the recorded original is set and the state
 /// removed (the lock file stays).
 pub(crate) fn release(dir: &Path, switch: &mut dyn Switch, who: Holder, m: &Machine) -> Result<()> {
-    let _lock = lock(dir)?;
+    release_taking(dir, switch, who, m, Take::Wait)
+}
+
+/// [`release`], taking the lock as `take` says: the watchdog's never waits for it, so a sopen
+/// stopped while it holds the lock cannot hold the watchdog past its deadline.
+fn release_taking(
+    dir: &Path,
+    switch: &mut dyn Switch,
+    who: Holder,
+    m: &Machine,
+    take: Take,
+) -> Result<()> {
+    let _lock = take_lock(dir, take)?;
     let Some(mut s) = read_state(dir)? else {
         return Ok(());
     };
@@ -362,7 +374,21 @@ struct Locked {
     _file: File,
 }
 
+/// How the lock is taken.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Take {
+    /// Waiting for it as long as it is held.
+    Wait,
+    /// Not waiting: held by another process is an error (the caller tries again later).
+    Try,
+}
+
+/// The lock, waiting for it.
 fn lock(dir: &Path) -> Result<Locked> {
+    take_lock(dir, Take::Wait)
+}
+
+fn take_lock(dir: &Path, take: Take) -> Result<Locked> {
     DirBuilder::new()
         .recursive(true)
         .mode(0o700)
@@ -378,8 +404,20 @@ fn lock(dir: &Path) -> Result<Locked> {
             .custom_flags(libc::O_NOFOLLOW)
             .open(&path)
             .with_context(|| format!("cannot open {}", path.display()))?;
-        file.lock()
-            .with_context(|| format!("cannot lock {}", path.display()))?;
+        match take {
+            Take::Wait => file
+                .lock()
+                .with_context(|| format!("cannot lock {}", path.display()))?,
+            Take::Try => match file.try_lock() {
+                Ok(()) => {}
+                Err(std::fs::TryLockError::WouldBlock) => {
+                    bail!("{} is held by another sopen", path.display())
+                }
+                Err(std::fs::TryLockError::Error(e)) => {
+                    return Err(e).with_context(|| format!("cannot lock {}", path.display()))
+                }
+            },
+        }
         let held = file.metadata()?;
         match std::fs::symlink_metadata(&path) {
             Ok(now) if now.dev() == held.dev() && now.ino() == held.ino() => {
@@ -394,7 +432,9 @@ fn lock(dir: &Path) -> Result<Locked> {
 /// [`STATE`], or `None` when there is none. Text sopen cannot read, or a state whose original is
 /// not 0 — sopen records a state only after reading 0, so it never wrote that one — counts as a
 /// state with original 0 and no holders: the restore is 0 whatever the file says, and the holders
-/// it named are lost either way (each live one adds itself back when it acquires).
+/// it named are lost either way (each live one adds itself back when it acquires). Such a state
+/// keeps the boot it names, so a state from another boot is still dropped untouched, whatever
+/// original it records (every caller checks the boot before anything else).
 pub(crate) fn read_state(dir: &Path) -> Result<Option<State>> {
     let path = dir.join(STATE);
     let bytes = match std::fs::read(&path) {
@@ -410,7 +450,10 @@ pub(crate) fn read_state(dir: &Path) -> Result<Option<State>> {
                 path.display(),
                 s.original
             );
-            State::untrusted()
+            State {
+                boot: s.boot,
+                ..State::untrusted()
+            }
         }
         Err(e) => {
             crate::debug!("{}: {e}; read as original 0, no holders", path.display());
@@ -927,7 +970,8 @@ pub(crate) fn say_ready() {
 /// `input`, calls `ready`, then waits until `input` ends or `holder` no longer runs (checked every
 /// `pace.poll`) and releases for `holder`, retrying a release that fails at `pace` until it
 /// succeeds — the original read back, a live holder found, or nothing left to do — or `pace.total`
-/// has passed (an error: the state stays for the next start).
+/// has passed (an error: the state stays for the next start). The lock is never waited for: held
+/// by another process, it is a failed try like any other, so the deadline bounds the whole.
 pub(crate) fn watch(
     dir: &Path,
     switch: &mut dyn Switch,
@@ -957,7 +1001,7 @@ pub(crate) fn watch(
     let until = Instant::now() + pace.total;
     let mut wait = pace.first;
     loop {
-        let e = match release(dir, switch, holder, m) {
+        let e = match release_taking(dir, switch, holder, m, Take::Try) {
             Ok(()) => return Ok(()),
             Err(e) => e,
         };
