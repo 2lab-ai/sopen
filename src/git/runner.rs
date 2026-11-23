@@ -63,11 +63,14 @@
 //!   command is stopped and ends `Ending::Stopped` with `StopBy::Overflow(limit)`
 //!   (`read_record` returns `None`).
 //! - **Nothing is left behind**: once a finished command's output has had a second, whatever
-//!   of its process group still holds stdout or stderr is killed (remotely over the master).
+//!   of its process group still holds stdout or stderr is killed (remotely over the master, a
+//!   group found alive only); a pipe held from outside the group (a process in a session of its
+//!   own) is let go of. No reader thread outlives `finish`.
 //! - **No git**: `Ending::NoGit` — locally the git program is missing, remotely `<locate>`
 //!   found none (`sopen: no git`, exit 127).
 //! - [`mask_credentials`]: what every logged line and kept stderr went through; stdout is
-//!   returned as git printed it, so mask it before showing it.
+//!   returned as git printed it, so show it through [`Done::stdout_text`] (masked, and as text
+//!   cut short when `Done::stdout_cut`).
 //!
 //! Not here: the per-repository write lock (02 §6's `GitRepo`), the status row's and dialogs'
 //! wording and the Stop question of a write (03 §3.4), refresh (03 §5).
@@ -82,8 +85,7 @@ use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdout, Command, ExitStatus, Stdio};
-#[cfg(test)]
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, Weak};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -797,6 +799,8 @@ pub struct Faults {
     pub master_gone: std::sync::atomic::AtomicBool,
     /// Commands dispatched (a stop's `kill` is not one).
     pub dispatched: std::sync::atomic::AtomicU32,
+    /// The signals sent to the "remote" group over the master, in order (`-TERM`, `-0`, …).
+    pub signals: Mutex<Vec<String>>,
 }
 
 #[cfg(test)]
@@ -938,7 +942,10 @@ impl Via {
                 c
             }
             #[cfg(test)]
-            Via::Shell(g) => g.login(&line_of(&words)),
+            Via::Shell(g) => {
+                lock(&g.faults.signals).push(signal.to_string());
+                g.login(&line_of(&words))
+            }
         };
         bounded(c).filter(|code| matches!(code, 0 | 1))
     }
@@ -1136,6 +1143,7 @@ impl GitRunner {
             }),
             stderr: Mutex::new(Stderr::default()),
             stderr_changed: Condvar::new(),
+            stderr_cancel: AtomicBool::new(false),
             last_byte: Mutex::new(started),
             started,
             stop: Mutex::new(StopState::default()),
@@ -1209,6 +1217,7 @@ impl GitRunner {
         Done {
             ending,
             stdout: Vec::new(),
+            stdout_cut: false,
             stderr: String::new(),
             entry,
         }
@@ -1321,8 +1330,10 @@ impl fmt::Display for Ending {
 #[derive(Debug, Clone)]
 pub struct Done {
     pub ending: Ending,
-    /// All of stdout, as git printed it (not masked).
+    /// All of stdout, as git printed it (not masked); its first bytes only when `stdout_cut`.
     pub stdout: Vec<u8>,
+    /// stdout was cut short (`StopBy::Overflow`): show it through [`Done::stdout_text`].
+    pub stdout_cut: bool,
     /// stderr as the log keeps it: `\r` updates collapsed, credentials masked, the last
     /// [`STDERR_KEPT`] bytes.
     pub stderr: String,
@@ -1342,11 +1353,22 @@ impl Done {
         if !self.stderr.trim().is_empty() {
             return self.stderr.clone();
         }
-        let stdout = String::from_utf8_lossy(&self.stdout);
+        let stdout = self.stdout_text();
         if stdout.trim().is_empty() {
             self.ending.to_string()
         } else {
-            mask_credentials(&stdout)
+            stdout
+        }
+    }
+
+    /// stdout as text to show: masked — as text cut short when it was (a URL whose `@` was cut
+    /// off loses its authority).
+    pub fn stdout_text(&self) -> String {
+        let text = String::from_utf8_lossy(&self.stdout);
+        if self.stdout_cut {
+            mask_cut(&text)
+        } else {
+            mask_credentials(&text)
         }
     }
 }
@@ -1519,6 +1541,9 @@ struct Shared {
     child: Mutex<ChildState>,
     stderr: Mutex<Stderr>,
     stderr_changed: Condvar,
+    /// Tells the stderr reader to let go of the pipe (something outside the command's group
+    /// holds it open for good).
+    stderr_cancel: AtomicBool,
     /// The last byte on stdout or stderr.
     last_byte: Mutex<Instant>,
     started: Instant,
@@ -1627,16 +1652,16 @@ impl Shared {
         if self.wait_group_gone(self.runner.limits.stop_grace) {
             return StopOutcome::Stopped { killed: false };
         }
-        self.signal_group(libc::SIGKILL);
+        let killed = self.signal_group(libc::SIGKILL);
         self.wait_group_gone(Duration::from_secs(2));
-        StopOutcome::Stopped { killed: true }
+        StopOutcome::Stopped { killed }
     }
 
-    /// 03 §3.5, remote: `kill -TERM -- -<pid>` over the same master, the pid from the
-    /// `sopen-pid` line; then the grace — the channel's end, and then the group's, asked with
-    /// `kill -0` over the master (a child that ignores `SIGTERM` and closed its descriptors
-    /// outlives the channel) — and then always `kill -KILL` the same way ("no such process"
-    /// counts as done); then the command's channel is closed. Without the line, or with the
+    /// 03 §3.5, remote, over the same master, the pid from the `sopen-pid` line: the group is
+    /// asked first (`kill -0`) when the channel has already ended — a child that ignores
+    /// `SIGTERM` and closed its descriptors outlives it — then `kill -TERM -- -<pid>`; then the
+    /// grace: the channel's end, then the group's, asked every half second; `kill -KILL` only if
+    /// the last asking found it alive; then the channel is closed. Without the line, or with the
     /// master gone, it may still be running.
     fn stop_remote(&self) -> StopOutcome {
         let via = &self.runner.via;
@@ -1647,30 +1672,42 @@ impl Shared {
             self.close_channel();
             return StopOutcome::Sent;
         };
-        if self.exit().is_some() {
-            return StopOutcome::Ended;
+        if !via.check() {
+            self.close_channel();
+            return StopOutcome::Sent;
         }
-        if !via.check() || via.kill(pid, "-TERM").is_none() {
+        if self.exit().is_some() {
+            match via.kill(pid, "-0") {
+                Some(0) => {}
+                Some(_) => return StopOutcome::Ended,
+                None => return StopOutcome::Sent,
+            }
+        }
+        if via.kill(pid, "-TERM").is_none() {
             self.close_channel();
             return StopOutcome::Sent;
         }
         let deadline = Instant::now() + self.runner.limits.stop_grace;
-        if self.wait_exit(self.runner.limits.stop_grace) {
-            // One `kill -0` per half second until the group is gone or the grace is over; any
-            // answer but "still there" ends the asking.
-            while Instant::now() < deadline && via.kill(pid, "-0") == Some(0) {
-                std::thread::sleep(
-                    REMOTE_PROBE.min(deadline.saturating_duration_since(Instant::now())),
-                );
+        self.wait_exit(self.runner.limits.stop_grace);
+        // Asked until it is gone or the grace is over; any answer but "still there" ends it.
+        let last = loop {
+            let answer = via.kill(pid, "-0");
+            let left = deadline.saturating_duration_since(Instant::now());
+            if answer != Some(0) || left.is_zero() {
+                break answer;
             }
-        }
-        let killed = via.kill(pid, "-KILL");
-        self.close_channel();
-        match killed {
-            Some(0) => StopOutcome::Stopped { killed: true },
+            std::thread::sleep(REMOTE_PROBE.min(left));
+        };
+        let outcome = match last {
+            Some(0) => match via.kill(pid, "-KILL") {
+                Some(code) => StopOutcome::Stopped { killed: code == 0 },
+                None => StopOutcome::Sent,
+            },
             Some(_) => StopOutcome::Stopped { killed: false },
             None => StopOutcome::Sent,
-        }
+        };
+        self.close_channel();
+        outcome
     }
 
     /// The `sopen-pid` line's pid, waited for up to [`PID_WAIT`]; `None` without it or once
@@ -1694,13 +1731,13 @@ impl Shared {
         }
     }
 
-    /// Signals the group the local process leads (never anything else: only a process this
-    /// runner made a session leader, and never the pid 0 or 1 groups).
-    fn signal_group(&self, signal: libc::c_int) {
-        if self.runner.via.leads_session() && self.pid >= 2 {
-            // SAFETY: plain kill(2) on the group of a process this runner started.
-            unsafe { libc::kill(-(self.pid as libc::pid_t), signal) };
-        }
+    /// Signals the group the local process leads, when it is found alive just before (never
+    /// anything else: only a process this runner made a session leader, and never the pid 0 or
+    /// 1 groups).
+    /// Whether it was signalled.
+    fn signal_group(&self, signal: libc::c_int) -> bool {
+        // SAFETY: plain kill(2) on the group of a process this runner started.
+        self.group_alive() && unsafe { libc::kill(-(self.pid as libc::pid_t), signal) } == 0
     }
 
     fn group_alive(&self) -> bool {
@@ -1738,6 +1775,24 @@ impl Shared {
         }
     }
 
+    /// Waits up to `limit` for the stderr reader to reach its end: has it?
+    fn stderr_ended(&self, limit: Duration) -> bool {
+        let deadline = Instant::now() + limit;
+        let mut err = lock(&self.stderr);
+        while !err.eof {
+            let now = Instant::now();
+            if now >= deadline {
+                return false;
+            }
+            err = self
+                .stderr_changed
+                .wait_timeout(err, (deadline - now).min(TICK))
+                .unwrap_or_else(|e| e.into_inner())
+                .0;
+        }
+        true
+    }
+
     /// Kills what is left of a finished command's process group (03 §3.5's group): locally the
     /// group it led, remotely the `sopen-pid` group over the master.
     fn end_leftovers(&self) {
@@ -1748,8 +1803,11 @@ impl Shared {
         }
         let pid = lock(&self.stderr).remote_pid;
         // Over the same master only, as a stop is: with it gone, what is left may still run.
+        // `SIGKILL` only to a group just found alive.
         if let Some(pid) = pid.filter(|_| via.check()) {
-            let _ = via.kill(pid, "-KILL");
+            if via.kill(pid, "-0") == Some(0) {
+                let _ = via.kill(pid, "-KILL");
+            }
         }
     }
 
@@ -1915,9 +1973,33 @@ fn pid_line(line: &[u8]) -> Option<u32> {
         .filter(|&pid| pid >= 2 && pid <= i32::MAX as u32)
 }
 
+/// Reads stderr to its end, or until told to let go: the pipe is non-blocking and waited on
+/// with `poll` a tick at a time, so the reader is never stuck in a `read` a process outside the
+/// command's group keeps open.
 fn read_stderr(shared: &Shared, mut stderr: std::process::ChildStderr) {
+    let fd = stderr.as_raw_fd();
+    // SAFETY: fcntl on the read end this thread owns.
+    unsafe {
+        let flags = libc::fcntl(fd, libc::F_GETFL);
+        if flags >= 0 {
+            libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+        }
+    }
     let mut buf = [0u8; 8192];
-    loop {
+    while !shared.stderr_cancel.load(Ordering::SeqCst) {
+        let mut pfd = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: one valid pollfd for the duration of the call.
+        let ready = unsafe { libc::poll(&mut pfd, 1, TICK.as_millis() as i32) };
+        if ready < 0 && io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
+            break;
+        }
+        if ready <= 0 {
+            continue;
+        }
         match stderr.read(&mut buf) {
             Ok(0) => break,
             Ok(n) => {
@@ -1925,7 +2007,11 @@ fn read_stderr(shared: &Shared, mut stderr: std::process::ChildStderr) {
                 lock(&shared.stderr).feed(&buf[..n]);
                 shared.stderr_changed.notify_all();
             }
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock
+                ) => {}
             Err(_) => break,
         }
     }
@@ -1949,7 +2035,8 @@ struct Reading {
     /// [`GitCommand::max_record`] and [`GitCommand::max_output`].
     max_record: usize,
     max_output: usize,
-    /// Stopped for too much output: nothing more is returned or collected.
+    /// Stopped for too much output: nothing more is returned or collected, and what was
+    /// collected is cut short.
     overflowed: bool,
     /// stdout was given up a moment after the process exited, still open: something the
     /// command left behind holds it.
@@ -2052,6 +2139,21 @@ impl Reading {
         }
     }
 
+    /// Moves what was read and not returned into `stdout`, up to [`GitCommand::max_output`];
+    /// past it, the command is stopped and the rest dropped.
+    fn collect(&mut self, stdout: &mut Vec<u8>) {
+        let more = &self.buf[self.pos.min(self.buf.len())..];
+        let room = self.max_output.saturating_sub(stdout.len());
+        if !self.overflowed {
+            stdout.extend_from_slice(&more[..more.len().min(room)]);
+            if more.len() > room {
+                self.overflow(self.max_output);
+            }
+        }
+        self.buf.clear();
+        self.pos = 0;
+    }
+
     /// Too much output: the command is stopped, and what was read of it is dropped.
     fn overflow(&mut self, limit: usize) {
         self.overflowed = true;
@@ -2136,24 +2238,12 @@ impl Reading {
 
     fn finish(mut self) -> Done {
         let wait_start = Instant::now();
-        let mut stdout = if self.overflowed {
-            Vec::new()
-        } else {
-            self.buf.split_off(self.pos)
-        };
-        self.buf.clear();
-        self.pos = 0;
+        // What a stream left unread counts against the bound like the rest.
+        let mut stdout = Vec::new();
+        self.collect(&mut stdout);
         while !self.eof {
             self.fill(wait_start);
-            if self.overflowed {
-                self.buf.clear();
-            } else if stdout.len() + self.buf.len() > self.max_output {
-                let room = self.max_output - stdout.len();
-                stdout.extend_from_slice(&self.buf[..room]);
-                self.overflow(self.max_output);
-            } else {
-                stdout.append(&mut self.buf);
-            }
+            self.collect(&mut stdout);
         }
         let mut pause = Duration::from_millis(1);
         let status = loop {
@@ -2184,30 +2274,25 @@ impl Reading {
             }
         }
         // Something the command left behind still holds its stdout or stderr (a hook's
-        // background job): it goes with the command, so no reader waits on it for good.
-        if self.held || !lock(&self.shared.stderr).eof {
+        // background job): it goes with the command. What its group does not hold (a process in
+        // a session of its own) the reader lets go of. No reader outlives `finish`.
+        if self.held || !self.shared.stderr_ended(Duration::ZERO) {
             self.shared.end_leftovers();
-            let deadline = Instant::now() + LEFTOVER_WAIT;
-            let mut err = lock(&self.shared.stderr);
-            while !err.eof && Instant::now() < deadline {
-                err = self
-                    .shared
-                    .stderr_changed
-                    .wait_timeout(err, TICK)
-                    .unwrap_or_else(|e| e.into_inner())
-                    .0;
+            if !self.shared.stderr_ended(LEFTOVER_WAIT) {
+                crate::debug!(
+                    "git {}: {}: stderr still held after the command ended; let go",
+                    self.shared.runner.via.host(),
+                    self.shared.line
+                );
+                self.shared.stderr_cancel.store(true, Ordering::SeqCst);
+                self.shared.stderr_ended(LEFTOVER_WAIT);
             }
         }
-        if lock(&self.shared.stderr).eof {
-            if let Some(t) = self.stderr_thread.take() {
+        if let Some(t) = self.stderr_thread.take() {
+            // It has ended (a cancelled reader stops within a tick): joined, its pipe closed.
+            if self.shared.stderr_ended(Duration::ZERO) {
                 let _ = t.join();
             }
-        } else {
-            crate::debug!(
-                "git {}: {}: stderr still held after the command ended",
-                self.shared.runner.via.host(),
-                self.shared.line
-            );
         }
         self.handle.detach(&self.shared);
         let shared = &self.shared;
@@ -2229,6 +2314,7 @@ impl Reading {
         Done {
             ending,
             stdout,
+            stdout_cut: self.overflowed,
             stderr,
             entry,
         }

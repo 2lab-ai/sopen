@@ -1595,3 +1595,215 @@ fn inherited_pathspec_settings_do_not_reach_git() {
         }
     }
 }
+
+// ---------------------------------------------------------------------------------------------
+// Review round 2
+
+/// A process the test started in a session of its own (a helper's `setsid` child), killed when
+/// the guard goes.
+struct Process(i32);
+
+impl Drop for Process {
+    fn drop(&mut self) {
+        if self.0 >= 2 {
+            // SAFETY: the one process this test made, by its pid.
+            unsafe { libc::kill(self.0, libc::SIGKILL) };
+        }
+    }
+}
+
+/// `-c alias.away=!perl … ; echo done`: a helper whose child leaves for a session of its own
+/// (`setsid`), keeping the command's stderr, its pid written to `pid_file`. `None` without
+/// perl (a note).
+fn session_leaver(pid_file: &Path) -> Option<String> {
+    let Some(perl) = which("perl") else {
+        eprintln!("note: perl is not on PATH; the setsid-helper case is skipped");
+        return None;
+    };
+    let code = r#"use POSIX qw(setsid); exit 0 if fork; setsid(); open(my $f, ">", $ARGV[0]) or die; print $f $$; close $f; sleep 30;"#;
+    Some(format!(
+        "alias.away=!{} -e '{code}' {} >/dev/null; echo done",
+        sh_word(&perl),
+        sh_word(pid_file)
+    ))
+}
+
+/// The helper's child, once its pid is written.
+fn left_process(pid_file: &Path) -> Process {
+    wait_for("the helper's pid", Duration::from_secs(5), || {
+        std::fs::read_to_string(pid_file).is_ok_and(|s| !s.is_empty())
+    });
+    Process(
+        std::fs::read_to_string(pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap(),
+    )
+}
+
+/// Review 2.1: stdout cut by `max_output` is masked as text cut short: `https://user:secret`
+/// with its `@host` past the cut shows no password, in the error dialog or anywhere else.
+#[test]
+fn cut_stdout_never_shows_a_password() {
+    let Some(fx) = fixture() else { return };
+    let repo = fx.repo("cut-stdout");
+    let alias = "alias.url=!printf 'https://user:secret@host/path'";
+    for (lane, runner) in fx.lanes() {
+        let cmd = read(repo.as_os_str(), &["-c", alias, "url"]).max_output(19);
+        let done = runner.run(&cmd, &Handle::new());
+        assert_eq!(done.stdout, b"https://user:secret", "{lane}");
+        assert!(
+            !done.error_text().contains("secret"),
+            "{lane}: {}",
+            done.error_text()
+        );
+        assert!(!done.stdout_text().contains("secret"), "{lane}");
+        assert!(done.stdout_cut, "{lane}");
+    }
+}
+
+/// Review 2.2: what a stream left in its buffer counts against `max_output` too: `finish`
+/// after `read_record` neither underflows nor returns more than the bound.
+#[test]
+fn finish_bounds_what_a_stream_left_over() {
+    let Some(fx) = fixture() else { return };
+    let repo = fx.repo("left-over");
+    let alias = "alias.rest=!printf 'a\\n0123456789'";
+    for (lane, runner) in fx.lanes() {
+        let cmd = read(repo.as_os_str(), &["-c", alias, "rest"]).max_output(4);
+        let mut running = runner.start(&cmd, &Handle::new()).unwrap();
+        assert_eq!(
+            running.read_record(b'\n').as_deref(),
+            Some(&b"a"[..]),
+            "{lane}"
+        );
+        let done = running.finish();
+        assert!(done.stdout.len() <= 4, "{lane}: {}", done.stdout.len());
+        assert!(
+            matches!(&done.ending, Ending::Stopped(s) if s.by == StopBy::Overflow(4)),
+            "{lane}: {}",
+            done.ending
+        );
+    }
+}
+
+/// Review 2.3: a helper's child in a session of its own keeps stderr open; killing the group
+/// cannot reach it, so the reader gives up on the pipe instead: `finish` returns and no reader
+/// thread outlives it.
+#[test]
+fn no_reader_outlives_a_helper_in_a_session_of_its_own() {
+    let Some(fx) = fixture() else { return };
+    let repo = fx.repo("setsid");
+    for (lane, runner) in fx.lanes() {
+        let pid_file = fx.root.join(format!("away-{lane}"));
+        let Some(alias) = session_leaver(&pid_file) else {
+            return;
+        };
+        let running = runner
+            .start(
+                &read(repo.as_os_str(), &["-c", &alias, "away"]),
+                &Handle::new(),
+            )
+            .unwrap();
+        let reader_done = running.stderr_probe();
+        let t = Instant::now();
+        let done = running.finish();
+        let _helper = left_process(&pid_file);
+        assert!(
+            t.elapsed() < Duration::from_secs(6),
+            "{lane}: {:?}",
+            t.elapsed()
+        );
+        assert_eq!(done.ending, Ending::Exit(0), "{lane}: {}", done.stderr);
+        assert_eq!(done.stdout, b"done\n", "{lane}");
+        assert!(reader_done(), "{lane}: the stderr reader is still in read");
+    }
+}
+
+/// Review 2.4: a stop that comes once the channel has ended still asks the group, and ends what
+/// is left of it: a child that ignores `SIGTERM` and closed its descriptors.
+#[test]
+fn a_stop_after_the_channel_ended_still_ends_what_is_left() {
+    let Some(fx) = fixture() else { return };
+    let repo = fx.repo("after-channel");
+    let short = Limits {
+        stop_grace: Duration::from_secs(1),
+        ..Limits::default()
+    };
+    let (shell, _) = fx.shell();
+    for (lane, runner) in [("local", fx.local()), ("sh", shell)] {
+        let runner = runner.with_limits(short);
+        let marker = fx.root.join(format!("outlived-{lane}"));
+        let alias = format!(
+            "alias.outlive=!(trap '' TERM; exec >/dev/null 2>&1 </dev/null; touch {}; sleep 30) & echo done",
+            sh_word(&marker)
+        );
+        let handle = Handle::new();
+        let running = runner
+            .start(&read(repo.as_os_str(), &["-c", &alias, "outlive"]), &handle)
+            .unwrap();
+        let group = Group(running.pid());
+        wait_for("the child", Duration::from_secs(10), || marker.exists());
+        if lane != "local" {
+            wait_for("the sopen-pid line", Duration::from_secs(5), || {
+                running.remote_pid().is_some()
+            });
+        }
+        // git and its alias have ended by now; only the child is left.
+        std::thread::sleep(Duration::from_millis(500));
+        handle.stop();
+        let done = running.finish();
+        assert!(
+            matches!(&done.ending, Ending::Stopped(s) if s.killed),
+            "{lane}: {}",
+            done.ending
+        );
+        wait_for("the group gone", Duration::from_secs(2), || !group.alive());
+    }
+}
+
+/// Review 2.5: `SIGKILL` goes only to a group the probe just before it found alive — after a
+/// stop whose `SIGTERM` ended everything, and in the cleanup after a command whose leftover is
+/// not in its group, only `kill -0` is sent.
+#[test]
+fn kill_goes_only_to_a_group_found_alive() {
+    let Some(fx) = fixture() else { return };
+    let repo = fx.repo("no-blind-kill");
+    let (runner, faults) = fx.shell();
+    let hang = read(repo.as_os_str(), &["-c", "alias.hang=!sleep 30", "hang"]);
+    let handle = Handle::new();
+    let running = runner.start(&hang, &handle).unwrap();
+    let group = Group(running.pid());
+    wait_for("the sopen-pid line", Duration::from_secs(5), || {
+        running.remote_pid().is_some()
+    });
+    handle.stop();
+    let done = running.finish();
+    assert!(
+        matches!(&done.ending, Ending::Stopped(s) if !s.killed),
+        "{}",
+        done.ending
+    );
+    wait_for("the group gone", Duration::from_secs(1), || !group.alive());
+    let sent = std::mem::take(&mut *faults.signals.lock().unwrap());
+    assert!(sent.contains(&"-TERM".to_string()), "{sent:?}");
+    assert!(!sent.contains(&"-KILL".to_string()), "{sent:?}");
+
+    let pid_file = fx.root.join("away-kill");
+    let Some(alias) = session_leaver(&pid_file) else {
+        return;
+    };
+    let done = runner.run(
+        &read(repo.as_os_str(), &["-c", &alias, "away"]),
+        &Handle::new(),
+    );
+    let _helper = left_process(&pid_file);
+    assert_eq!(done.ending, Ending::Exit(0));
+    let sent = faults.signals.lock().unwrap().clone();
+    assert_eq!(
+        sent,
+        ["-0"],
+        "the cleanup asks first, and the group is gone"
+    );
+}
