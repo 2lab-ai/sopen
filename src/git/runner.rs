@@ -19,8 +19,8 @@
 //!   `GitCommand::new(Class::Read, top, ["for-each-ref", "--format=…", "refs/heads"])`.
 //!   Builders: [`GitCommand::feed`] (bytes on stdin, said in the log as `message, 3 lines`;
 //!   otherwise stdin is `/dev/null`), [`GitCommand::env`] (`GIT_EDITOR=true`,
-//!   `GIT_COMMITTER_DATE=…`, shown in the log), [`GitCommand::patterns`] (History search: no
-//!   `GIT_LITERAL_PATHSPECS`), [`GitCommand::within`] (a bound on the whole run: detection's
+//!   `GIT_COMMITTER_DATE=…`, shown in the log), [`GitCommand::patterns`] (History search:
+//!   `GIT_LITERAL_PATHSPECS=0`), [`GitCommand::within`] (a bound on the whole run: detection's
 //!   10 s), [`GitCommand::git_dir`] (where to look for `*.lock` files after a `SIGKILL`).
 //!   [`GitCommand::snippet`] runs one of sopen's fixed POSIX sh [`Snippet`]s (the in-progress
 //!   probe, 03 §8.5) the same way, in the folder, with its arguments as `"$@"`.
@@ -57,7 +57,13 @@
 //!   status row (03 §3.4: the newest progress line; after 10 s without output, what git may
 //!   wait for).
 //! - **Limits**: read 30 s and network 120 s without a byte on stdout or stderr while sopen
-//!   waits (a parked stream is not waiting), then stopped; write none ([`Limits`]).
+//!   waits (a parked stream is not waiting), then stopped; write none ([`Limits`]). Output is
+//!   bounded too: one record at most [`MAX_RECORD`] ([`GitCommand::max_record`]), all that
+//!   `finish` collects at most [`MAX_OUTPUT`] ([`GitCommand::max_output`]); past either the
+//!   command is stopped and ends `Ending::Stopped` with `StopBy::Overflow(limit)`
+//!   (`read_record` returns `None`).
+//! - **Nothing is left behind**: once a finished command's output has had a second, whatever
+//!   of its process group still holds stdout or stderr is killed (remotely over the master).
 //! - **No git**: `Ending::NoGit` — locally the git program is missing, remotely `<locate>`
 //!   found none (`sopen: no git`, exit 127).
 //! - [`mask_credentials`]: what every logged line and kept stderr went through; stdout is
@@ -97,6 +103,12 @@ pub const MAX_ARGS: usize = 64 * 1024;
 pub const STDERR_KEPT: usize = 64 * 1024;
 /// Entries the command log holds, the oldest dropped first (memory only, 03 §3.7).
 pub const LOG_ENTRIES: usize = 500;
+/// The longest stdout record [`Running::read_record`] returns unless [`GitCommand::max_record`]
+/// says otherwise; a longer one stops the command (`StopBy::Overflow`).
+pub const MAX_RECORD: usize = 16 * 1024 * 1024;
+/// The most stdout [`Running::finish`] (and so [`GitRunner::run`]) collects unless
+/// [`GitCommand::max_output`] says otherwise; more stops the command (`StopBy::Overflow`).
+pub const MAX_OUTPUT: usize = 256 * 1024 * 1024;
 
 /// The master check and a remote `kill` (each its own short command) are given up after this.
 const CONTROL_LIMIT: Duration = Duration::from_secs(10);
@@ -105,6 +117,10 @@ const CONTROL_LIMIT: Duration = Duration::from_secs(10);
 const AFTER_EXIT: Duration = Duration::from_secs(1);
 /// How long a stop waits for the `sopen-pid` line before it gives up on the remote group.
 const PID_WAIT: Duration = Duration::from_secs(2);
+/// How often a remote stop asks whether the group is gone, within the grace.
+const REMOTE_PROBE: Duration = Duration::from_millis(500);
+/// Once a leftover of a finished command has been killed, how long its pipes may take to close.
+const LEFTOVER_WAIT: Duration = Duration::from_secs(2);
 /// The longest a blocked read waits before it looks at the limits and the stop again.
 const TICK: Duration = Duration::from_millis(50);
 
@@ -120,6 +136,15 @@ const ENV: [(&str, &str); 10] = [
     ("GIT_EDITOR", "false"),
     ("GIT_SEQUENCE_EDITOR", "false"),
     ("GIT_MERGE_AUTOEDIT", "no"),
+];
+
+/// git's global pathspec settings besides `GIT_LITERAL_PATHSPECS`, set off for every command: a
+/// session that exports one would change what a path names, and git refuses any of them next
+/// to the literal setting (`global 'literal' pathspec setting is incompatible…`).
+const PATHSPEC_OFF: [&str; 3] = [
+    "GIT_GLOB_PATHSPECS",
+    "GIT_NOGLOB_PATHSPECS",
+    "GIT_ICASE_PATHSPECS",
 ];
 
 /// 03 §3.3's options, after `-C <folder>` and before the subcommand.
@@ -246,6 +271,8 @@ pub struct GitCommand {
     patterns: bool,
     within: Option<Duration>,
     git_dir: Option<PathBuf>,
+    max_record: usize,
+    max_output: usize,
 }
 
 impl GitCommand {
@@ -265,6 +292,8 @@ impl GitCommand {
             patterns: false,
             within: None,
             git_dir: None,
+            max_record: MAX_RECORD,
+            max_output: MAX_OUTPUT,
         }
     }
 
@@ -303,7 +332,7 @@ impl GitCommand {
         self
     }
 
-    /// Without `GIT_LITERAL_PATHSPECS`: History search's path field, the one place a pathspec is
+    /// With `GIT_LITERAL_PATHSPECS=0`: History search's path field, the one place a pathspec is
     /// a pattern (03 §3.3).
     pub fn patterns(mut self) -> Self {
         self.patterns = true;
@@ -320,6 +349,20 @@ impl GitCommand {
     /// files to list (03 §3.5); without it, `<dir>/.git` when that is a folder.
     pub fn git_dir(mut self, dir: impl Into<PathBuf>) -> Self {
         self.git_dir = Some(dir.into());
+        self
+    }
+
+    /// The longest record [`Running::read_record`] returns ([`MAX_RECORD`] by default); a
+    /// longer one stops the command with `StopBy::Overflow`.
+    pub fn max_record(mut self, bytes: usize) -> Self {
+        self.max_record = bytes;
+        self
+    }
+
+    /// The most stdout [`Running::finish`] collects ([`MAX_OUTPUT`] by default); more stops the
+    /// command with `StopBy::Overflow`, and `Done::stdout` holds the first `bytes`.
+    pub fn max_output(mut self, bytes: usize) -> Self {
+        self.max_output = bytes;
         self
     }
 
@@ -368,7 +411,9 @@ impl GitCommand {
     }
 
     /// The environment it runs with: 03 §3.3's, `GIT_OPTIONAL_LOCKS=0` for a read,
-    /// `GIT_LITERAL_PATHSPECS=1` unless [`Self::patterns`], then [`Self::env`]'s own.
+    /// `GIT_LITERAL_PATHSPECS=1` (`0` with [`Self::patterns`] — set, not left out, so a value
+    /// the session exports cannot stand), the other pathspec settings `0`, then [`Self::env`]'s
+    /// own.
     fn env_pairs(&self) -> Vec<(String, String)> {
         let mut pairs: Vec<(String, String)> = ENV
             .iter()
@@ -377,9 +422,13 @@ impl GitCommand {
         if self.class == Class::Read {
             pairs.push(("GIT_OPTIONAL_LOCKS".into(), "0".into()));
         }
-        if !self.patterns {
-            pairs.push(("GIT_LITERAL_PATHSPECS".into(), "1".into()));
-        }
+        let literal = if self.patterns { "0" } else { "1" };
+        pairs.push(("GIT_LITERAL_PATHSPECS".into(), literal.into()));
+        pairs.extend(
+            PATHSPEC_OFF
+                .iter()
+                .map(|k| (k.to_string(), "0".to_string())),
+        );
         for (k, v) in &self.env {
             match pairs.iter_mut().find(|(key, _)| key == k) {
                 Some(pair) => pair.1 = v.clone(),
@@ -463,8 +512,11 @@ pub fn quote(word: &[u8]) -> Vec<u8> {
 
 /// Credentials in URLs masked (03 §3.7): `scheme://user:secret@host` → `scheme://user:***@host`,
 /// and an `http(s)` URL's user name with no password — a token — → `***@host`; every other
-/// user name (`ssh://git@host`) stays. Applied to every line the log, `SOPEN_LOG`, the status
-/// row and a dialog show, and to git's stderr before it is kept.
+/// user name (`ssh://git@host`) stays. The authority ends where URL syntax ends it — the first
+/// `/`, `?` or `#`, whitespace, or the end — and the user part is everything before its last
+/// `@`, so a password holding `'`, `"` or another sub-delim is masked whole (a quote around the
+/// URL that follows it may be masked with it). Applied to every line the log, `SOPEN_LOG`, the
+/// status row and a dialog show, and to each line of git's stderr before it is kept.
 pub fn mask_credentials(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
@@ -475,7 +527,7 @@ pub fn mask_credentials(text: &str) -> String {
         let scheme = &rest[scheme_start..at];
         let authority_start = at + 3;
         let authority_len = rest[authority_start..]
-            .find(|c: char| "/?#'\"<>`".contains(c) || c.is_whitespace())
+            .find(|c: char| "/?#".contains(c) || c.is_whitespace())
             .unwrap_or(rest.len() - authority_start);
         let authority = &rest[authority_start..authority_start + authority_len];
         out.push_str(&rest[..authority_start]);
@@ -501,6 +553,22 @@ pub fn mask_credentials(text: &str) -> String {
     }
     out.push_str(rest);
     out
+}
+
+/// [`mask_credentials`] for text cut short: when it ends inside a URL's authority with no `@` in
+/// view, what is there of the authority may be the start of a user and password whose `@` was
+/// cut off, so it is replaced by `***`.
+fn mask_cut(text: &str) -> String {
+    let mut masked = mask_credentials(text);
+    if let Some(at) = masked.rfind("://") {
+        let start = at + 3;
+        let open = !masked[start..].contains(|c: char| "/?#@".contains(c) || c.is_whitespace());
+        if open {
+            masked.truncate(start);
+            masked.push_str("***");
+        }
+    }
+    masked
 }
 
 /// This machine's git (03 §3.1): an argument vector, no shell, in a session of its own.
@@ -586,9 +654,6 @@ impl LocalGit {
         };
         for key in LOCAL_REPO_ENV {
             c.env_remove(key);
-        }
-        if cmd.patterns {
-            c.env_remove("GIT_LITERAL_PATHSPECS");
         }
         c.envs(self.env.iter().map(|(k, v)| (k, v)));
         c.envs(cmd.env_pairs());
@@ -861,12 +926,12 @@ impl Via {
         }
     }
 
-    /// `kill <signal> -- -<pid>` on the host, over the master: did it run there (0, or 1 for a
-    /// group already gone)?
-    fn kill(&self, pid: u32, signal: &str) -> bool {
+    /// `kill <signal> -- -<pid>` on the host, over the master: `kill`'s exit code (0: signalled,
+    /// 1: no such group), or `None` when it did not run there.
+    fn kill(&self, pid: u32, signal: &str) -> Option<i32> {
         let words = kill_words(pid, signal);
         let c = match self {
-            Via::Local(_) => return false,
+            Via::Local(_) => return None,
             Via::Ssh(g) => {
                 let mut c = Command::new("ssh");
                 c.args(g.argv(words));
@@ -875,7 +940,7 @@ impl Via {
             #[cfg(test)]
             Via::Shell(g) => g.login(&line_of(&words)),
         };
-        bounded(c).is_some_and(|code| code == 0 || code == 1)
+        bounded(c).filter(|code| matches!(code, 0 | 1))
     }
 }
 
@@ -1097,6 +1162,10 @@ impl GitRunner {
                 pos: 0,
                 eof: false,
                 stdout_bytes: 0,
+                max_record: cmd.max_record,
+                max_output: cmd.max_output,
+                overflowed: false,
+                held: false,
                 handle: handle.clone(),
                 _slot: slot,
                 stderr_thread: Some(stderr_thread),
@@ -1172,6 +1241,9 @@ pub enum StopBy {
     /// The automatic limit: no byte for this long (or, with [`GitCommand::within`], this long
     /// in all).
     Limit(Duration),
+    /// More stdout than this many bytes: one record past [`GitCommand::max_record`], or all of
+    /// it past [`GitCommand::max_output`].
+    Overflow(usize),
 }
 
 /// A stop that ended the command (03 §3.5).
@@ -1216,8 +1288,12 @@ impl fmt::Display for Ending {
             Ending::Signal(signal) => write!(f, "signal {signal}"),
             Ending::Stopped(s) => {
                 f.write_str("stopped")?;
-                if let StopBy::Limit(limit) = s.by {
-                    write!(f, ": git did not answer in {} s", limit.as_secs())?;
+                match s.by {
+                    StopBy::Asked => {}
+                    StopBy::Limit(limit) => {
+                        write!(f, ": git did not answer in {} s", limit.as_secs())?
+                    }
+                    StopBy::Overflow(bytes) => write!(f, ": more than {bytes} bytes of output")?,
                 }
                 if s.killed {
                     f.write_str(" (SIGKILL)")?;
@@ -1421,8 +1497,7 @@ impl Handle {
     pub fn progress(&self) -> Option<String> {
         let shared = self.running()?;
         let newest = lock(&shared.stderr).newest.clone()?;
-        let text = mask_credentials(String::from_utf8_lossy(&newest).trim_end());
-        Some(text)
+        Some(newest.trim_end().to_string())
     }
 
     /// How long what runs now has been running.
@@ -1558,8 +1633,11 @@ impl Shared {
     }
 
     /// 03 §3.5, remote: `kill -TERM -- -<pid>` over the same master, the pid from the
-    /// `sopen-pid` line; after the grace `kill -KILL` the same way; then the command's channel is
-    /// closed. Without the line, or with the master gone, it may still be running.
+    /// `sopen-pid` line; then the grace — the channel's end, and then the group's, asked with
+    /// `kill -0` over the master (a child that ignores `SIGTERM` and closed its descriptors
+    /// outlives the channel) — and then always `kill -KILL` the same way ("no such process"
+    /// counts as done); then the command's channel is closed. Without the line, or with the
+    /// master gone, it may still be running.
     fn stop_remote(&self) -> StopOutcome {
         let via = &self.runner.via;
         let Some(pid) = self.wait_remote_pid() else {
@@ -1572,19 +1650,26 @@ impl Shared {
         if self.exit().is_some() {
             return StopOutcome::Ended;
         }
-        if !via.check() || !via.kill(pid, "-TERM") {
+        if !via.check() || via.kill(pid, "-TERM").is_none() {
             self.close_channel();
             return StopOutcome::Sent;
         }
+        let deadline = Instant::now() + self.runner.limits.stop_grace;
         if self.wait_exit(self.runner.limits.stop_grace) {
-            return StopOutcome::Stopped { killed: false };
+            // One `kill -0` per half second until the group is gone or the grace is over; any
+            // answer but "still there" ends the asking.
+            while Instant::now() < deadline && via.kill(pid, "-0") == Some(0) {
+                std::thread::sleep(
+                    REMOTE_PROBE.min(deadline.saturating_duration_since(Instant::now())),
+                );
+            }
         }
         let killed = via.kill(pid, "-KILL");
         self.close_channel();
-        if killed {
-            StopOutcome::Stopped { killed: true }
-        } else {
-            StopOutcome::Sent
+        match killed {
+            Some(0) => StopOutcome::Stopped { killed: true },
+            Some(_) => StopOutcome::Stopped { killed: false },
+            None => StopOutcome::Sent,
         }
     }
 
@@ -1653,6 +1738,21 @@ impl Shared {
         }
     }
 
+    /// Kills what is left of a finished command's process group (03 §3.5's group): locally the
+    /// group it led, remotely the `sopen-pid` group over the master.
+    fn end_leftovers(&self) {
+        let via = &self.runner.via;
+        if !via.remote() {
+            self.signal_group(libc::SIGKILL);
+            return;
+        }
+        let pid = lock(&self.stderr).remote_pid;
+        // Over the same master only, as a stop is: with it gone, what is left may still run.
+        if let Some(pid) = pid.filter(|_| via.check()) {
+            let _ = via.kill(pid, "-KILL");
+        }
+    }
+
     /// Closes the command's channel: the local end (`ssh`, or `ShellGit`'s login shell) is
     /// killed and reaped; what runs on the host is not touched by it.
     fn close_channel(&self) {
@@ -1700,17 +1800,22 @@ impl Shared {
 }
 
 /// stderr as it comes (03 §3.6): split at `\r` and `\n`, a `\r` update collapsed into its last
-/// value, the first `sopen-pid` line taken out.
+/// value, the first `sopen-pid` line taken out. Every line and update is masked as a whole,
+/// before anything of it is kept, shown or cut (a line longer than [`STDERR_KEPT`] is kept to
+/// its first bytes, and masked as text cut short).
 #[derive(Default)]
 struct Stderr {
-    /// Committed lines, each ending in `\n`: the last [`STDERR_KEPT`] bytes (with some slack).
+    /// Committed lines, masked, each ending in `\n`: the last [`STDERR_KEPT`] bytes (with some
+    /// slack).
     kept: Vec<u8>,
-    /// The line being written.
+    /// The line being written, raw, and whether bytes of it were dropped.
     current: Vec<u8>,
-    /// The last value a `\r` closed, for the `\n` that ends its line.
-    shown: Option<Vec<u8>>,
-    /// The newest non-empty line or update: the status row's progress.
-    newest: Option<Vec<u8>>,
+    current_cut: bool,
+    /// The last value a `\r` closed (raw, and whether it was cut), for the `\n` that ends its
+    /// line.
+    shown: Option<(Vec<u8>, bool)>,
+    /// The newest non-empty line or update, masked: the status row's progress.
+    newest: Option<String>,
     remote_pid: Option<u32>,
     eof: bool,
 }
@@ -1722,37 +1827,42 @@ impl Stderr {
                 b'\r' => {
                     if !self.current.is_empty() {
                         let update = std::mem::take(&mut self.current);
-                        self.newest = Some(update.clone());
-                        self.shown = Some(update);
+                        let cut = std::mem::take(&mut self.current_cut);
+                        self.newest = Some(masked_line(&update, cut));
+                        self.shown = Some((update, cut));
                     }
                 }
                 b'\n' => {
-                    let line = if self.current.is_empty() {
+                    let (line, cut) = if self.current.is_empty() {
                         self.shown.take().unwrap_or_default()
                     } else {
-                        std::mem::take(&mut self.current)
+                        (
+                            std::mem::take(&mut self.current),
+                            std::mem::take(&mut self.current_cut),
+                        )
                     };
                     self.shown = None;
-                    self.commit(line);
+                    self.commit(&line, cut);
                 }
                 // A line without an end is kept to its first bytes.
                 _ if self.current.len() < STDERR_KEPT => self.current.push(b),
-                _ => {}
+                _ => self.current_cut = true,
             }
         }
     }
 
-    fn commit(&mut self, line: Vec<u8>) {
-        if self.remote_pid.is_none() {
-            if let Some(pid) = pid_line(&line) {
+    fn commit(&mut self, line: &[u8], cut: bool) {
+        if self.remote_pid.is_none() && !cut {
+            if let Some(pid) = pid_line(line) {
                 self.remote_pid = Some(pid);
                 return;
             }
         }
-        if !line.is_empty() {
-            self.newest = Some(line.clone());
+        let masked = masked_line(line, cut);
+        if !masked.is_empty() {
+            self.newest = Some(masked.clone());
         }
-        self.kept.extend_from_slice(&line);
+        self.kept.extend_from_slice(masked.as_bytes());
         self.kept.push(b'\n');
         if self.kept.len() > 2 * STDERR_KEPT {
             let cut = self.kept.len() - STDERR_KEPT;
@@ -1767,7 +1877,8 @@ impl Stderr {
         self.eof = true;
     }
 
-    /// The kept text: its last [`STDERR_KEPT`] bytes from a line's start, masked.
+    /// The kept text (masked line by line as it came): its last [`STDERR_KEPT`] bytes from a
+    /// line's start.
     fn text(&self) -> String {
         let mut kept = &self.kept[..];
         if kept.len() > STDERR_KEPT {
@@ -1776,7 +1887,17 @@ impl Stderr {
                 kept = &kept[nl + 1..];
             }
         }
-        mask_credentials(&String::from_utf8_lossy(kept))
+        String::from_utf8_lossy(kept).into_owned()
+    }
+}
+
+/// One line of stderr as it may be kept or shown: masked, as text cut short when it was.
+fn masked_line(line: &[u8], cut: bool) -> String {
+    let text = String::from_utf8_lossy(line);
+    if cut {
+        mask_cut(&text)
+    } else {
+        mask_credentials(&text)
     }
 }
 
@@ -1825,6 +1946,14 @@ struct Reading {
     pos: usize,
     eof: bool,
     stdout_bytes: u64,
+    /// [`GitCommand::max_record`] and [`GitCommand::max_output`].
+    max_record: usize,
+    max_output: usize,
+    /// Stopped for too much output: nothing more is returned or collected.
+    overflowed: bool,
+    /// stdout was given up a moment after the process exited, still open: something the
+    /// command left behind holds it.
+    held: bool,
     handle: Handle,
     _slot: Slot,
     stderr_thread: Option<std::thread::JoinHandle<()>>,
@@ -1848,6 +1977,13 @@ impl Running {
     /// (`ShellGit`) or `ssh`'s.
     pub fn pid(&self) -> u32 {
         self.reading.as_ref().map_or(0, |r| r.shared.pid)
+    }
+
+    /// Tests: has the stderr reader seen its end (and so let go of the pipe)?
+    #[cfg(test)]
+    pub fn stderr_probe(&self) -> impl Fn() -> bool + Send + 'static {
+        let shared = self.reading.as_ref().map(|r| r.shared.clone());
+        move || shared.as_ref().is_some_and(|s| lock(&s.stderr).eof)
     }
 
     /// The pid the `sopen-pid` line gave (remote commands), once it came.
@@ -1875,7 +2011,14 @@ impl Reading {
     fn record(&mut self, delim: u8) -> Option<Vec<u8>> {
         let wait_start = Instant::now();
         loop {
+            if self.overflowed {
+                return None;
+            }
             if let Some(i) = self.buf[self.pos..].iter().position(|&b| b == delim) {
+                if i > self.max_record {
+                    self.overflow(self.max_record);
+                    return None;
+                }
                 let record = self.buf[self.pos..self.pos + i].to_vec();
                 self.pos += i + 1;
                 if self.pos == self.buf.len() {
@@ -1885,6 +2028,10 @@ impl Reading {
                 return Some(record);
             }
             if self.eof {
+                if self.buf.len() - self.pos > self.max_record {
+                    self.overflow(self.max_record);
+                    return None;
+                }
                 if self.pos < self.buf.len() {
                     let record = self.buf[self.pos..].to_vec();
                     self.buf.clear();
@@ -1897,8 +2044,20 @@ impl Reading {
                 self.buf.drain(..self.pos);
                 self.pos = 0;
             }
+            if self.buf.len() > self.max_record {
+                self.overflow(self.max_record);
+                return None;
+            }
             self.fill(wait_start);
         }
+    }
+
+    /// Too much output: the command is stopped, and what was read of it is dropped.
+    fn overflow(&mut self, limit: usize) {
+        self.overflowed = true;
+        self.buf = Vec::new();
+        self.pos = 0;
+        self.shared.request_stop(StopBy::Overflow(limit));
     }
 
     /// The limit that has passed while sopen waited since `wait_start`, if one has.
@@ -1918,8 +2077,9 @@ impl Reading {
         (last.elapsed() >= idle).then_some(StopBy::Limit(idle))
     }
 
-    /// Reads what stdout has next into `buf`, waiting for it; sets `eof` at its end, once the
-    /// stop has decided, or a moment after the process has exited.
+    /// Reads what stdout has next into `buf`, waiting for it; sets `eof` at its end, once a stop
+    /// has ended the command (or given up on it), or a moment after the process has exited
+    /// (`held`: something left behind keeps it open).
     fn fill(&mut self, wait_start: Instant) {
         let fd = self.stdout.as_raw_fd();
         let mut chunk = vec![0u8; 64 * 1024];
@@ -1928,15 +2088,22 @@ impl Reading {
             if let Some(by) = self.limit_passed(wait_start) {
                 self.shared.request_stop(by);
             }
-            let decided = self.shared.stop_outcome().is_some();
+            // Stopped, or a stop that may not have arrived: the output after it is not wanted,
+            // and whatever still writes may never stop.
+            if matches!(
+                self.shared.stop_outcome(),
+                Some(StopOutcome::Stopped { .. } | StopOutcome::Sent)
+            ) {
+                self.eof = true;
+                return;
+            }
             let mut pfd = libc::pollfd {
                 fd,
                 events: libc::POLLIN,
                 revents: 0,
             };
-            let wait = if decided { 0 } else { TICK.as_millis() as i32 };
             // SAFETY: one valid pollfd for the duration of the call.
-            let ready = unsafe { libc::poll(&mut pfd, 1, wait) };
+            let ready = unsafe { libc::poll(&mut pfd, 1, TICK.as_millis() as i32) };
             if ready > 0 {
                 match self.stdout.read(&mut chunk) {
                     Ok(0) => {
@@ -1956,14 +2123,11 @@ impl Reading {
                     }
                 }
             }
-            if decided {
-                self.eof = true;
-                return;
-            }
             if self.shared.exit().is_some() {
                 let at = *exited_at.get_or_insert_with(Instant::now);
                 if at.elapsed() >= AFTER_EXIT {
                     self.eof = true;
+                    self.held = true;
                     return;
                 }
             }
@@ -1972,12 +2136,24 @@ impl Reading {
 
     fn finish(mut self) -> Done {
         let wait_start = Instant::now();
-        let mut stdout = self.buf.split_off(self.pos);
+        let mut stdout = if self.overflowed {
+            Vec::new()
+        } else {
+            self.buf.split_off(self.pos)
+        };
         self.buf.clear();
         self.pos = 0;
         while !self.eof {
             self.fill(wait_start);
-            stdout.append(&mut self.buf);
+            if self.overflowed {
+                self.buf.clear();
+            } else if stdout.len() + self.buf.len() > self.max_output {
+                let room = self.max_output - stdout.len();
+                stdout.extend_from_slice(&self.buf[..room]);
+                self.overflow(self.max_output);
+            } else {
+                stdout.append(&mut self.buf);
+            }
         }
         let mut pause = Duration::from_millis(1);
         let status = loop {
@@ -2007,10 +2183,31 @@ impl Reading {
                     .0;
             }
         }
+        // Something the command left behind still holds its stdout or stderr (a hook's
+        // background job): it goes with the command, so no reader waits on it for good.
+        if self.held || !lock(&self.shared.stderr).eof {
+            self.shared.end_leftovers();
+            let deadline = Instant::now() + LEFTOVER_WAIT;
+            let mut err = lock(&self.shared.stderr);
+            while !err.eof && Instant::now() < deadline {
+                err = self
+                    .shared
+                    .stderr_changed
+                    .wait_timeout(err, TICK)
+                    .unwrap_or_else(|e| e.into_inner())
+                    .0;
+            }
+        }
         if lock(&self.shared.stderr).eof {
             if let Some(t) = self.stderr_thread.take() {
                 let _ = t.join();
             }
+        } else {
+            crate::debug!(
+                "git {}: {}: stderr still held after the command ended",
+                self.shared.runner.via.host(),
+                self.shared.line
+            );
         }
         self.handle.detach(&self.shared);
         let shared = &self.shared;
@@ -2056,6 +2253,15 @@ impl Reading {
                 return Ending::Stopped(Stopped { by, killed, locks });
             }
             Some((_, StopOutcome::Sent)) => return Ending::StopSent { host },
+            // Too much output from a command that ended on its own meanwhile: still the
+            // overflow, since stdout was not all read.
+            Some((by @ StopBy::Overflow(_), StopOutcome::Ended)) => {
+                return Ending::Stopped(Stopped {
+                    by,
+                    killed: false,
+                    locks: Vec::new(),
+                })
+            }
             Some((_, StopOutcome::Ended)) | None => {}
         }
         if via.remote() && status.code() == Some(127) && stderr.lines().any(|l| l == NO_GIT) {

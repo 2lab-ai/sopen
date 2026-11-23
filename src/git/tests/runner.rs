@@ -355,6 +355,12 @@ fn ssh_argv_word_by_word() {
         "'i18n.commitEncoding=UTF-8'",
         "'--no-pager'",
     ];
+    // Every other global pathspec setting off (git refuses one next to the literal setting).
+    let pathspecs_off = [
+        "'GIT_GLOB_PATHSPECS=0'",
+        "'GIT_NOGLOB_PATHSPECS=0'",
+        "'GIT_ICASE_PATHSPECS=0'",
+    ];
     let locate = format!("'{LOCATE}'");
     let expect = |tail_env: &[&str], dir: &str, args: &[&str]| -> Vec<OsString> {
         let mut argv: Vec<String> = EXEC_ARGS.iter().map(|s| s.to_string()).collect();
@@ -372,7 +378,12 @@ fn ssh_argv_word_by_word() {
             ]
             .map(String::from),
         );
-        argv.extend(env.iter().chain(tail_env).map(|s| s.to_string()));
+        argv.extend(
+            env.iter()
+                .chain(tail_env)
+                .chain(&pathspecs_off)
+                .map(|s| s.to_string()),
+        );
         argv.extend(["'sh'", "'-c'"].map(String::from));
         argv.push(locate.clone());
         argv.extend(["'sopen-git'", "'-C'", dir].map(String::from));
@@ -416,12 +427,13 @@ fn ssh_argv_word_by_word() {
             ]
         )
     );
-    // History search: no GIT_LITERAL_PATHSPECS; a changed editor replaces 03 §3.3's value.
+    // History search: GIT_LITERAL_PATHSPECS=0 (set, so an exported 1 cannot stand); a changed
+    // editor replaces 03 §3.3's value.
     let search = read("/r", &["log", "--", ":(glob)a*"]).patterns();
     assert_eq!(
         ssh.argv(SshGit::words(&search)),
         expect(
-            &["'GIT_OPTIONAL_LOCKS=0'"],
+            &["'GIT_OPTIONAL_LOCKS=0'", "'GIT_LITERAL_PATHSPECS=0'"],
             "'/r'",
             &["'log'", "'--'", "':(glob)a*'"]
         )
@@ -1348,4 +1360,238 @@ fn shell_git_runs_ssh_git_words() {
         .join(&b' ');
     assert!(line.starts_with(b"exec 'env' 'LC_ALL=C' "));
     assert!(line.ends_with(b" '--no-pager' 'commit' '-F' '-'"));
+}
+
+// ---------------------------------------------------------------------------------------------
+// Review round 1
+
+/// Review 1.1: the authority ends where URL syntax ends it (the first `/`, `?` or `#`, or
+/// whitespace), so a password holding `'` or another sub-delim is masked whole — as written and
+/// as the command line quotes it.
+#[test]
+fn a_password_with_any_sub_delim_is_masked() {
+    for (text, masked) in [
+        ("https://user:pa'ss@host/x", "https://user:***@host/x"),
+        ("https://user:p\"a<s>s`@host/x", "https://user:***@host/x"),
+        (
+            "https://user:p!$&()*+,;=s@host?q",
+            "https://user:***@host?q",
+        ),
+        (
+            "'https://user:pa'\\''ss@host/x'",
+            "'https://user:***@host/x'",
+        ),
+    ] {
+        assert_eq!(mask_credentials(text), masked, "{text}");
+    }
+    let add = write("/r", &["remote", "add", "o", "https://user:pa'ss@host/x"]);
+    assert_eq!(
+        add.command_line(),
+        "git remote add o 'https://user:***@host/x'"
+    );
+}
+
+/// Review 1.2: stderr is masked before it is cut. Two cuts: the kept tail starting inside
+/// `https://user:SECRET@host` once older lines are dropped (the `https://` left behind), and the
+/// progress of an update longer than the kept 64 KiB whose kept part ends inside the URL (its
+/// `@host` past the cut). Neither shows any of the secret.
+#[test]
+fn a_cut_in_stderr_never_shows_a_secret() {
+    let Some(fx) = fixture() else { return };
+    let repo = fx.repo("cut");
+    let kept = crate::git::runner::STDERR_KEPT;
+    // The log keeps the last 64 KiB from a line's start: a first line of 64 KiB, the URL line,
+    // then one line long enough that what is dropped ends 8 bytes into the URL.
+    let url_line = "https://user:SECRET@host/x.git";
+    let mut tail = "a".repeat(kept - 1);
+    tail.push('\n');
+    tail.push_str(url_line);
+    tail.push('\n');
+    tail.push_str(&"b".repeat(kept - url_line.len() - 2 + 8 - 1));
+    tail.push('\n');
+    let tail_file = fx.root.join("tail");
+    std::fs::write(&tail_file, tail).unwrap();
+    // An update (ended by `\r`) longer than 64 KiB, cut inside the URL.
+    let cut_url = "https://user:SECRET";
+    let mut update = "x".repeat(kept - cut_url.len());
+    update.push_str(cut_url);
+    update.push_str("SECRET@host/x.git\r");
+    let update_file = fx.root.join("update");
+    std::fs::write(&update_file, update).unwrap();
+    for (lane, runner) in fx.lanes() {
+        let alias = format!("alias.tail=!cat {} >&2; exit 1", sh_word(&tail_file));
+        let done = runner.run(
+            &read(repo.as_os_str(), &["-c", &alias, "tail"]),
+            &Handle::new(),
+        );
+        assert_eq!(done.ending, Ending::Exit(1), "{lane}");
+        for shown in [
+            &done.stderr,
+            &done.entry.stderr,
+            &done.entry.status_line(),
+            &done.error_text(),
+        ] {
+            let head = &shown[..shown.len().min(40)];
+            assert!(!shown.contains("SECRET"), "{lane}: {head}…");
+        }
+
+        let marker = fx.root.join(format!("updated-{lane}"));
+        let alias = format!(
+            "alias.update=!cat {} >&2; touch {}; sleep 1",
+            sh_word(&update_file),
+            sh_word(&marker)
+        );
+        let handle = Handle::new();
+        let running = runner
+            .start(&read(repo.as_os_str(), &["-c", &alias, "update"]), &handle)
+            .unwrap();
+        wait_for("the update", Duration::from_secs(10), || marker.exists());
+        wait_for("the progress", Duration::from_secs(2), || {
+            handle.progress().is_some_and(|p| p.len() > 1000)
+        });
+        let progress = handle.progress().unwrap();
+        let end = &progress[progress.len().saturating_sub(40)..];
+        assert!(!progress.contains("SECRET"), "{lane}: …{end}");
+        running.finish();
+    }
+}
+
+/// Review 1.3: a record that never meets its delimiter, and output past what `finish` collects,
+/// stop the command with `StopBy::Overflow` instead of growing without end.
+#[test]
+fn a_record_or_an_output_past_its_bound_is_stopped() {
+    let Some(fx) = fixture() else { return };
+    let repo = fx.repo("overflow");
+    // 8 MiB with no newline.
+    let alias = "alias.flood=!head -c 8388608 /dev/zero | tr '\\0' x";
+    let flood = read(repo.as_os_str(), &["-c", alias, "flood"]);
+    let mib = 1024 * 1024;
+    for (lane, runner) in fx.lanes() {
+        let mut running = runner
+            .start(&flood.clone().max_record(mib), &Handle::new())
+            .unwrap();
+        assert_eq!(running.read_record(b'\n'), None, "{lane}");
+        let done = running.finish();
+        assert!(
+            matches!(&done.ending, Ending::Stopped(s) if s.by == StopBy::Overflow(mib)),
+            "{lane}: {}",
+            done.ending
+        );
+        let done = runner.run(&flood.clone().max_output(mib), &Handle::new());
+        assert!(
+            matches!(&done.ending, Ending::Stopped(s) if s.by == StopBy::Overflow(mib)),
+            "{lane}: {}",
+            done.ending
+        );
+        assert!(done.stdout.len() <= mib, "{lane}: {}", done.stdout.len());
+        assert_eq!(
+            done.entry.ending.to_string(),
+            format!("stopped: more than {mib} bytes of output"),
+            "{lane}"
+        );
+    }
+}
+
+/// Review 1.4: a helper the command left behind holding stderr (a hook's background job) is
+/// ended with the command once its output has had its moment: `finish` returns, nothing of the
+/// group is left, and the stderr reader has let go of the pipe.
+#[test]
+fn a_helper_left_holding_stderr_is_ended_with_the_command() {
+    let Some(fx) = fixture() else { return };
+    let repo = fx.repo("left-behind");
+    let alias = "alias.bg=!sleep 30 >/dev/null & echo done";
+    for (lane, runner) in fx.lanes() {
+        let running = runner
+            .start(
+                &read(repo.as_os_str(), &["-c", alias, "bg"]),
+                &Handle::new(),
+            )
+            .unwrap();
+        let group = Group(running.pid());
+        let reader_done = running.stderr_probe();
+        let t = Instant::now();
+        let done = running.finish();
+        assert!(
+            t.elapsed() < Duration::from_secs(5),
+            "{lane}: {:?}",
+            t.elapsed()
+        );
+        assert_eq!(done.ending, Ending::Exit(0), "{lane}: {}", done.stderr);
+        assert_eq!(done.stdout, b"done\n", "{lane}");
+        wait_for("the group gone", Duration::from_secs(2), || !group.alive());
+        assert!(
+            reader_done(),
+            "{lane}: the stderr reader still holds the pipe"
+        );
+    }
+}
+
+/// Review 1.5: a remote stop does not take the channel's end for the group's: a child that
+/// ignores `SIGTERM` and has closed its descriptors outlives the channel, and only the
+/// `kill -KILL -- -<pid>` sent after the grace ends it. Locally the group itself is watched.
+#[test]
+fn a_stop_kills_a_child_that_ignores_term_and_left_the_channel() {
+    let Some(fx) = fixture() else { return };
+    let repo = fx.repo("term-proof");
+    let short = Limits {
+        stop_grace: Duration::from_secs(1),
+        ..Limits::default()
+    };
+    let (shell, _) = fx.shell();
+    for (lane, runner) in [("local", fx.local()), ("sh", shell)] {
+        let runner = runner.with_limits(short);
+        let marker = fx.root.join(format!("immune-{lane}"));
+        let alias = format!(
+            "alias.immune=!(trap '' TERM; exec >/dev/null 2>&1 </dev/null; touch {}; sleep 30) & sleep 30",
+            sh_word(&marker)
+        );
+        let handle = Handle::new();
+        let running = runner
+            .start(&read(repo.as_os_str(), &["-c", &alias, "immune"]), &handle)
+            .unwrap();
+        let group = Group(running.pid());
+        wait_for("the immune child", Duration::from_secs(10), || {
+            marker.exists()
+        });
+        if lane != "local" {
+            wait_for("the sopen-pid line", Duration::from_secs(5), || {
+                running.remote_pid().is_some()
+            });
+        }
+        handle.stop();
+        let done = running.finish();
+        assert!(
+            matches!(&done.ending, Ending::Stopped(s) if s.killed),
+            "{lane}: {}",
+            done.ending
+        );
+        wait_for("the group gone", Duration::from_secs(2), || !group.alive());
+    }
+}
+
+/// Review 1.6: pathspec settings the session exports never reach git: History search's pattern
+/// matches under an inherited `GIT_LITERAL_PATHSPECS=1`, and a literal command works under an
+/// inherited `GIT_GLOB_PATHSPECS=1` (which git refuses next to the literal setting).
+#[test]
+fn inherited_pathspec_settings_do_not_reach_git() {
+    let Some(fx) = fixture() else { return };
+    let repo = fx.repo("pathspec-env");
+    for f in ["ab", "ac"] {
+        std::fs::write(repo.join(f), "x\n").unwrap();
+    }
+    fx.git(&repo, &["add", "ab", "ac"]);
+    fx.git(&repo, &["commit", "-q", "-m", "a files"]);
+    let search = read(repo.as_os_str(), &["ls-files", "-z", "--", ":(glob)a*"]).patterns();
+    let literal = read(repo.as_os_str(), &["ls-files", "-z", "--", "ab"]);
+    for (key, cmd, want) in [
+        ("GIT_LITERAL_PATHSPECS", &search, &b"ab\0ac\0"[..]),
+        ("GIT_GLOB_PATHSPECS", &literal, &b"ab\0"[..]),
+    ] {
+        let local = GitRunner::local(fx.local_git().with_env(key, "1"));
+        let shell = GitRunner::shell(fx.shell_git(Path::new("/bin/sh")).with_env(key, "1"));
+        for (lane, runner) in [("local", local), ("sh", shell)] {
+            let done = runner.run(cmd, &Handle::new());
+            assert_eq!(done.stdout, want, "{lane} {key}=1: {}", done.stderr);
+        }
+    }
 }
