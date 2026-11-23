@@ -386,12 +386,23 @@ contexts where it acts (list, viewer, git panel, tree, a dialog) and its `Comman
   - **A write that fails or does not read back 1 is not an acquisition**: this process is removed from
     the holders again; with none left, the recorded original is set back and the state removed; the
     status row says the F-key switch did not take effect, and §6.1's fallback stays.
-- **Release**: remove this process from the holders; if none remain, set the recorded original value
-  and remove `fkeys.json` (the lock file stays).
-- **Watchdog**: the first acquire in a process spawns a small child of sopen's own binary (a hidden
+- **Release**: remove this process from the holders; if none remain, set the recorded original value,
+  **read it back**, and remove `fkeys.json` only when the read equals the original (the lock file
+  stays). A release that fails — the lock, the read, the write, or a read-back that differs — keeps
+  the state and is tried again (below).
+- **A state is trusted only as sopen writes it**: sopen records an original of 0 and nothing else, so
+  a `fkeys.json` whose original is not 0 is read as original 0 with no holders — restoring ends at 0
+  and the file is removed; a damaged file can never make sopen write 1.
+- **Watchdog**: an acquire first needs a ready watchdog: a small child of sopen's own binary (a hidden
   subcommand, as `--raise-window` is) holding the read end of a pipe whose write end only sopen holds.
-  When the pipe reaches end of file — sopen exited, crashed or was killed — the child releases for that
-  process (above), then exits. It does nothing else and opens no window.
+  The child reads the switch once, starts its reader, and prints one ready line; sopen waits for it at
+  most 2 s. A child that ends or stays silent is killed and reaped, and there is **no acquisition**
+  (the status row says why). Before each later acquire sopen checks the child still runs and starts a
+  new one, with the same wait, if it does not. When the pipe reaches end of file — sopen exited,
+  crashed or was killed — the child releases for that process (above). It keeps trying until the
+  original reads back, a live holder has taken over, or no state is left — 50 ms, doubling to 2 s,
+  for at most 60 s in total — and then exits, leaving any state for the next start. It does nothing
+  else and opens no window. A release that fails inside a running sopen is retried the same way.
 - **At start**: sopen runs the holder clean-up under the lock; with no holder left and a state file
   present, the value is restored. **Except across a reboot**: the state records the boot
   (`kern.bootsessionuuid` on macOS, `/proc/sys/kernel/random/boot_id` on Linux), and a state left

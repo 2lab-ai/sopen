@@ -16,7 +16,13 @@
 //!   a change. Dropping it (or [`Fkeys::quit`]) releases.
 //! - [`Fkeys::status`] is the status row's line when an acquisition did not take effect
 //!   ([`NOT_IN_EFFECT`]); the clickable row and Cmd/Ctrl+digits (§6.1) still work then.
+//! - A release that failed is retried at a later call, after [`Fkeys::next_retry`] (a repaint
+//!   then lets it run); at the end, the watchdog retries it.
 //! - `sopen --fkeys-watchdog <pid>:<start> --fkeys-dir <dir>` (hidden) runs [`watchdog_main`].
+//!
+//! The responsibility for the restore never lapses: a restore counts only once the original
+//! reads back; until then the state stays, and the process, its watchdog (bounded retries) or
+//! the next start's clean-up retries it.
 //!
 //! The protocol (§6.3), every step holding an exclusive lock on [`LOCK`] in the state folder,
 //! the read and the change of the HID value included: [`acquire`], [`release`] and the start's
@@ -27,13 +33,13 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::ffi::OsString;
 use std::fs::{DirBuilder, File, OpenOptions};
-use std::io::{self, Read, Write};
+use std::io::{self, BufRead, Read, Write};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::{mpsc, Arc};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::config;
 
@@ -59,10 +65,34 @@ pub const NOT_IN_EFFECT: &str = "the F-key switch did not take effect";
 pub const WATCHDOG_FLAG: &str = "--fkeys-watchdog";
 pub const DIR_FLAG: &str = "--fkeys-dir";
 
-/// How often the watchdog also checks that its holder still runs, besides waiting for the pipe's
-/// end: a child the holder started at the moment the pipe was made could keep a copy of its
-/// write end, and the pipe would never end.
-const WATCHDOG_POLL: Duration = Duration::from_secs(1);
+/// The line a watchdog prints on its output once it is ready: it can read the switch and waits
+/// on its input. The holder acquires only after it.
+pub const READY: &str = "sopen-fkeys-watchdog-ready";
+/// How long a new watchdog has to say it is ready.
+const READY_WAIT: Duration = Duration::from_secs(2);
+
+/// How a restore is waited for and retried.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Pace {
+    /// How often the watchdog also checks that its holder still runs, besides waiting for the
+    /// pipe's end: a child the holder started at the moment the pipe was made could keep a copy
+    /// of its write end, and the pipe would never end.
+    pub poll: Duration,
+    /// A release that failed is retried after `first`, the wait doubling up to `most`, for at
+    /// most `total`; then the state is left for the next start.
+    pub first: Duration,
+    pub most: Duration,
+    pub total: Duration,
+}
+
+impl Pace {
+    pub const DEFAULT: Pace = Pace {
+        poll: Duration::from_secs(1),
+        first: Duration::from_millis(50),
+        most: Duration::from_secs(2),
+        total: Duration::from_secs(60),
+    };
+}
 
 /// Runs that hooks drive (04 §6.2: never switched): any of these set to a non-empty value.
 /// `SOPEN_KEYS` too — its keys are not the owner's.
@@ -159,6 +189,15 @@ pub(crate) struct State {
 }
 
 impl State {
+    /// What a state file sopen cannot trust is read as.
+    fn untrusted() -> State {
+        State {
+            original: OFF,
+            holders: Vec::new(),
+            boot: None,
+        }
+    }
+
     fn left_by_another_boot(&self, m: &Machine) -> bool {
         matches!((&self.boot, &m.boot), (Some(then), Some(now)) if then != now)
     }
@@ -296,13 +335,20 @@ pub(crate) fn clean_up(dir: &Path, switch: &mut dyn Switch, m: &Machine) -> Resu
     let_go(dir, switch, s)
 }
 
-/// Under the lock: writes `s`, or with no holder left sets its original back and removes the
-/// state. A restore that fails keeps the state, without holders, so the next start retries.
+/// Under the lock: writes `s`, or with no holder left sets its original back and — once it reads
+/// back — removes the state. A restore that fails or does not read back keeps the state, without
+/// holders, and is an error: the caller retries, and so does the next start.
 fn let_go(dir: &Path, switch: &mut dyn Switch, s: State) -> Result<()> {
     if !s.holders.is_empty() {
         return write_state(dir, &s);
     }
-    if let Err(e) = switch.write(s.original) {
+    let restored = switch
+        .write(s.original)
+        .and_then(|()| match switch.read()? {
+            v if v == s.original => Ok(()),
+            v => bail!("HIDFKeyMode reads {v} after it was set back"),
+        });
+    if let Err(e) = restored {
         write_state(dir, &s)?;
         return Err(e.context(format!("cannot set HIDFKeyMode back to {}", s.original)));
     }
@@ -345,9 +391,10 @@ fn lock(dir: &Path) -> Result<Locked> {
     bail!("{} keeps being replaced", path.display())
 }
 
-/// [`STATE`], or `None` when there is none. Text sopen cannot read counts as a state with
-/// original 0 and no holders: sopen writes a state only after reading 0, and the holders a
-/// broken file named are lost either way (each live one adds itself back when it acquires).
+/// [`STATE`], or `None` when there is none. Text sopen cannot read, or a state whose original is
+/// not 0 — sopen records a state only after reading 0, so it never wrote that one — counts as a
+/// state with original 0 and no holders: the restore is 0 whatever the file says, and the holders
+/// it named are lost either way (each live one adds itself back when it acquires).
 pub(crate) fn read_state(dir: &Path) -> Result<Option<State>> {
     let path = dir.join(STATE);
     let bytes = match std::fs::read(&path) {
@@ -355,14 +402,22 @@ pub(crate) fn read_state(dir: &Path) -> Result<Option<State>> {
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e).with_context(|| format!("cannot read {}", path.display())),
     };
-    Ok(Some(serde_json::from_slice(&bytes).unwrap_or_else(|e| {
-        crate::debug!("{}: {e}; read as original 0, no holders", path.display());
-        State {
-            original: OFF,
-            holders: Vec::new(),
-            boot: None,
+    let state = match serde_json::from_slice::<State>(&bytes) {
+        Ok(s) if s.original == OFF => s,
+        Ok(s) => {
+            crate::debug!(
+                "{}: original {}, not sopen's; read as 0",
+                path.display(),
+                s.original
+            );
+            State::untrusted()
         }
-    })))
+        Err(e) => {
+            crate::debug!("{}: {e}; read as original 0, no holders", path.display());
+            State::untrusted()
+        }
+    };
+    Ok(Some(state))
 }
 
 /// Replaces [`STATE`] atomically: a 0600 temp in the same folder, renamed over it. Not flushed to
@@ -418,33 +473,45 @@ pub fn scripted_run(var: impl Fn(&str) -> Option<OsString>) -> bool {
 /// (§6.4). `state_dir` is sopen's state folder. Nothing of IOKit is loaded before the switch is
 /// first needed.
 pub fn for_this_run(config: &config::Config, state_dir: &Path) -> Option<ThisRun> {
-    if cfg!(test) {
+    if cfg!(test) || scripted_run(|name| std::env::var_os(name)) {
         return None;
     }
-    let switch = allowed(
-        config.fkeys(),
-        scripted_run(|name| std::env::var_os(name)),
-        platform_switch,
-    )?;
-    Some(Fkeys::new(
-        state_dir.to_path_buf(),
-        switch,
-        Holder::this_process().map_err(|e| format!("{e:#}")),
-        Machine::this(),
-        Watchdog::Start(Box::new(watchdog_command)),
-    ))
+    from_config(config, state_dir, platform_switch, || Parts {
+        me: Holder::this_process().map_err(|e| format!("{e:#}")),
+        machine: Machine::this(),
+        watchdog: Watchdog::start(Box::new(watchdog_command)),
+    })
 }
 
 /// The switch of a run of this binary.
 pub type ThisRun = Fkeys<Box<dyn Switch + Send>>;
 
-/// The switch `open` makes, where `fkeys` and the run allow one; `open` is not called otherwise
-/// (K-F4: with `"system"` sopen never opens IOHIDSystem).
-fn allowed<S>(fkeys: config::Fkeys, scripted: bool, open: impl FnOnce() -> Option<S>) -> Option<S> {
-    if fkeys == config::Fkeys::System || scripted {
+/// What a process's switch is made of besides the switch itself.
+pub(crate) struct Parts {
+    pub me: std::result::Result<Holder, String>,
+    pub machine: Machine,
+    pub watchdog: Watchdog,
+}
+
+/// The one construction of a process's switch, [`for_this_run`]'s and the tests': none with
+/// `fkeys = "system"`, and then neither `open` nor `parts` is called (K-F4: sopen never opens
+/// IOHIDSystem); else the switch `open` makes, after the start's clean-up.
+pub(crate) fn from_config<S: Switch>(
+    config: &config::Config,
+    dir: &Path,
+    open: impl FnOnce() -> Option<S>,
+    parts: impl FnOnce() -> Parts,
+) -> Option<Fkeys<S>> {
+    if config.fkeys() == config::Fkeys::System {
         return None;
     }
-    open()
+    let switch = open()?;
+    let Parts {
+        me,
+        machine,
+        watchdog,
+    } = parts();
+    Some(Fkeys::new(dir.to_path_buf(), switch, me, machine, watchdog))
 }
 
 #[cfg(target_os = "macos")]
@@ -470,18 +537,141 @@ fn watchdog_command(dir: &Path, holder: &Holder) -> io::Result<Command> {
 /// The command a watchdog is started with, given the state folder and the holder.
 pub(crate) type WatchdogCommand = Box<dyn Fn(&Path, &Holder) -> io::Result<Command> + Send>;
 
-/// This process's watchdog: to be started at the first acquisition, or running.
-pub(crate) enum Watchdog {
-    Start(WatchdogCommand),
-    Running {
-        /// The pipe's write end, which only this process holds: its end is the watchdog's cue.
-        _input: ChildStdin,
-        /// Never waited for: the watchdog ends after this process.
-        _child: Child,
-    },
-    /// No watchdog (tests of the protocol alone).
+/// This process's watchdog: how to start one, and the one running, if any.
+pub(crate) struct Watchdog {
+    /// `None`: no watchdog (tests of the protocol alone).
+    command: Option<WatchdogCommand>,
+    running: Option<Running>,
+    /// How long a new one has to say it is ready.
+    ready_wait: Duration,
+}
+
+/// A watchdog that said it was ready.
+struct Running {
+    /// The pipe's write end, which only this process holds: its end is the watchdog's cue.
+    _input: ChildStdin,
+    /// Polled (`try_wait`) before each acquisition; never waited for otherwise: the watchdog
+    /// ends after this process.
+    child: Child,
+}
+
+impl Watchdog {
+    /// Started with `command` at the first acquisition.
+    pub fn start(command: WatchdogCommand) -> Self {
+        Watchdog {
+            command: Some(command),
+            running: None,
+            ready_wait: READY_WAIT,
+        }
+    }
+
+    /// No watchdog.
     #[cfg(test)]
-    Off,
+    pub fn off() -> Self {
+        Watchdog {
+            command: None,
+            running: None,
+            ready_wait: READY_WAIT,
+        }
+    }
+
+    /// The same, given `wait` to say it is ready.
+    #[cfg(test)]
+    pub fn ready_within(mut self, wait: Duration) -> Self {
+        self.ready_wait = wait;
+        self
+    }
+
+    /// A watchdog that runs and has said it is ready: the one there if it still runs, else a new
+    /// one, started once. An error when there is none: no acquisition then.
+    fn ensure(&mut self, dir: &Path, me: &Holder) -> io::Result<()> {
+        let Some(command) = &self.command else {
+            return Ok(());
+        };
+        if let Some(running) = &mut self.running {
+            if let Ok(None) = running.child.try_wait() {
+                return Ok(());
+            }
+            crate::debug!("F-key switch: its watchdog has ended; starting another");
+            self.running = None;
+        }
+        let mut cmd = command(dir, me)?;
+        cmd.stdin(Stdio::piped()).stdout(Stdio::piped());
+        if crate::debug_enabled() {
+            cmd.stderr(Stdio::inherit());
+        } else {
+            cmd.stderr(Stdio::null());
+        }
+        // SAFETY: setsid and signal are async-signal-safe, as `pre_exec` requires. A session of
+        // its own: a terminal's Ctrl-C or hangup does not reach it. SIGTERM, SIGINT and SIGHUP
+        // ignored: a `killall sopen` that ends this process leaves the watchdog to restore. It
+        // ends by itself once this process has.
+        unsafe {
+            cmd.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    return Err(io::Error::last_os_error());
+                }
+                for signal in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP] {
+                    libc::signal(signal, libc::SIG_IGN);
+                }
+                Ok(())
+            });
+        }
+        let mut child = cmd.spawn()?;
+        let (Some(input), Some(output)) = (child.stdin.take(), child.stdout.take()) else {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(io::Error::other("the watchdog has no pipes"));
+        };
+        // Its output is read to its end, the ready line looked for on the way.
+        let (said, ready) = mpsc::channel();
+        std::thread::spawn(move || {
+            let mut said = Some(said);
+            for line in io::BufReader::new(output).lines() {
+                let Ok(line) = line else { break };
+                if line == READY {
+                    if let Some(said) = said.take() {
+                        let _ = said.send(());
+                    }
+                }
+            }
+        });
+        match ready.recv_timeout(self.ready_wait) {
+            Ok(()) => {
+                self.running = Some(Running {
+                    _input: input,
+                    child,
+                });
+                Ok(())
+            }
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                Err(io::Error::other(match e {
+                    mpsc::RecvTimeoutError::Timeout => format!(
+                        "its watchdog did not say it was ready within {:?}",
+                        self.ready_wait
+                    ),
+                    mpsc::RecvTimeoutError::Disconnected => {
+                        "its watchdog ended before it was ready".to_string()
+                    }
+                }))
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn pid(&self) -> Option<u32> {
+        self.running.as_ref().map(|r| r.child.id())
+    }
+}
+
+/// A release that failed, to be tried again.
+#[derive(Debug, Clone, Copy)]
+struct Pending {
+    at: Instant,
+    wait: Duration,
+    until: Instant,
 }
 
 /// One process's switch: what it wants (a focused window, awake, its session in front), whether
@@ -500,6 +690,10 @@ pub struct Fkeys<S: Switch> {
     /// let go of and wanted anew.
     tried: bool,
     status: Option<String>,
+    /// A release (or an acquisition's undo) that failed: retried at a later call while the
+    /// switch is not wanted, and at the end; the watchdog retries after that.
+    pending: Option<Pending>,
+    pace: Pace,
 }
 
 impl<S: Switch> Fkeys<S> {
@@ -526,7 +720,16 @@ impl<S: Switch> Fkeys<S> {
             holds: false,
             tried: false,
             status: None,
+            pending: None,
+            pace: Pace::DEFAULT,
         }
+    }
+
+    /// The same, retrying at `pace`.
+    #[cfg(test)]
+    pub(crate) fn with_pace(mut self, pace: Pace) -> Self {
+        self.pace = pace;
+        self
     }
 
     /// Whether any of this process's windows has focus.
@@ -566,11 +769,18 @@ impl<S: Switch> Fkeys<S> {
         self.status.as_deref()
     }
 
+    /// When a release that failed is tried again — at the first call from then on (a repaint
+    /// requested for then makes one).
+    pub fn next_retry(&self) -> Option<Instant> {
+        self.pending.map(|p| p.at)
+    }
+
     fn update(&mut self) {
         let wanted = self.focused && !self.asleep && !self.away;
         if !wanted {
             self.tried = false;
-            if self.holds {
+            let due = self.pending.is_some_and(|p| Instant::now() >= p.at);
+            if self.holds || due {
                 self.let_go();
             }
         } else if !self.holds && !self.tried {
@@ -587,142 +797,178 @@ impl<S: Switch> Fkeys<S> {
                 return;
             }
         };
-        // Before the first acquisition, so a death right after it is covered.
-        if let Err(e) = self.start_watchdog(&me) {
-            self.status = Some(format!("{NOT_IN_EFFECT}: cannot start its watchdog: {e}"));
+        // A watchdog that runs and said it is ready, before every acquisition: a death of this
+        // process right after it is covered.
+        if let Err(e) = self.watchdog.ensure(&self.dir, &me) {
+            self.status = Some(format!("{NOT_IN_EFFECT}: {e}"));
             return;
         }
         match acquire(&self.dir, &mut self.switch, me, &self.machine) {
             Ok(got) if got.holds() => {
                 self.holds = true;
                 self.status = None;
+                self.pending = None;
             }
             Ok(Acquired::NotInEffect(why)) => self.status = Some(format!("{NOT_IN_EFFECT}: {why}")),
             Ok(_) => self.status = None,
-            Err(e) => self.status = Some(format!("{NOT_IN_EFFECT}: {e:#}")),
+            Err(e) => {
+                // An undo that did not hold may have left the value set: released again later.
+                self.status = Some(format!("{NOT_IN_EFFECT}: {e:#}"));
+                self.retry_later();
+            }
         }
     }
 
     fn let_go(&mut self) {
         self.holds = false;
-        if let Ok(me) = self.me {
-            if let Err(e) = release(&self.dir, &mut self.switch, me, &self.machine) {
-                // The watchdog, at this process's end, or the next start retries.
+        let Ok(me) = self.me else {
+            self.pending = None;
+            return;
+        };
+        match release(&self.dir, &mut self.switch, me, &self.machine) {
+            Ok(()) => self.pending = None,
+            Err(e) => {
                 crate::debug!("F-key switch: release failed: {e:#}");
+                self.retry_later();
             }
         }
     }
 
-    fn start_watchdog(&mut self, me: &Holder) -> io::Result<()> {
-        let Watchdog::Start(command) = &self.watchdog else {
-            return Ok(());
+    /// Schedules the next try of a release that failed: `first`, doubling up to `most`, for at
+    /// most `total`; past that only the end (and the watchdog, and the next start) retries.
+    fn retry_later(&mut self) {
+        let now = Instant::now();
+        let pace = self.pace;
+        self.pending = match self.pending {
+            None => Some(Pending {
+                at: now + pace.first,
+                wait: pace.first,
+                until: now + pace.total,
+            }),
+            Some(p) if now >= p.until => None,
+            Some(p) => {
+                let wait = (p.wait * 2).min(pace.most);
+                Some(Pending {
+                    at: now + wait,
+                    wait,
+                    until: p.until,
+                })
+            }
         };
-        let mut cmd = command(&self.dir, me)?;
-        cmd.stdin(Stdio::piped()).stdout(Stdio::null());
-        if crate::debug_enabled() {
-            cmd.stderr(Stdio::inherit());
-        } else {
-            cmd.stderr(Stdio::null());
-        }
-        // SAFETY: setsid and signal are async-signal-safe, as `pre_exec` requires. A session of
-        // its own: a terminal's Ctrl-C or hangup does not reach it. SIGTERM, SIGINT and SIGHUP
-        // ignored: a `killall sopen` that ends this process leaves the watchdog to restore. It
-        // ends by itself once this process has.
-        unsafe {
-            cmd.pre_exec(|| {
-                if libc::setsid() == -1 {
-                    return Err(io::Error::last_os_error());
-                }
-                for signal in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP] {
-                    libc::signal(signal, libc::SIG_IGN);
-                }
-                Ok(())
-            });
-        }
-        let mut child = cmd.spawn()?;
-        let Some(input) = child.stdin.take() else {
-            return Err(io::Error::other("the watchdog has no input"));
-        };
-        self.watchdog = Watchdog::Running {
-            _input: input,
-            _child: child,
-        };
-        Ok(())
     }
 
     /// The watchdog's pid, once started.
     #[cfg(test)]
     pub(crate) fn watchdog_pid(&self) -> Option<u32> {
-        match &self.watchdog {
-            Watchdog::Running { _child, .. } => Some(_child.id()),
-            _ => None,
-        }
+        self.watchdog.pid()
     }
 }
 
 impl<S: Switch> Drop for Fkeys<S> {
     fn drop(&mut self) {
-        if self.holds {
+        if self.holds || self.pending.is_some() {
             self.let_go();
         }
-        // Then the watchdog's input is dropped with the rest: it releases (nothing left to do)
-        // and ends.
+        // Then the watchdog's input is dropped with the rest: it releases (nothing left to do,
+        // or the retries of a release that failed here) and ends.
     }
 }
 
 // ---------------------------------------------------------------------------------------------
 // The watchdog.
 
-/// `sopen --fkeys-watchdog <pid>:<start> --fkeys-dir <dir>` (hidden): waits for the end of its
-/// input — the pipe whose write end only the holder has — or for the holder to stop running,
-/// then releases for it (§6.3) and ends. Opens no window and prints nothing (`SOPEN_LOG=debug`
-/// lines aside). Returns the exit code: 0, or 2 for an argument it cannot read.
+/// `sopen --fkeys-watchdog <pid>:<start> --fkeys-dir <dir>` (hidden): says [`READY`] once it can
+/// read the switch and waits on its input, then waits for the end of that input — the pipe whose
+/// write end only the holder has — or for the holder to stop running, and releases for it
+/// (§6.3), retrying until the restore reads back or a live holder has the switch (at most
+/// [`Pace::DEFAULT`]'s total; then the state stays for the next start). Opens no window and prints
+/// nothing else (`SOPEN_LOG=debug` lines aside). Returns the exit code: 0, 1 when it gave up or
+/// could not start, 2 for an argument it cannot read.
 pub fn watchdog_main(holder: &str, dir: &Path) -> u8 {
     let Some(holder) = Holder::parse(holder) else {
         crate::debug!("F-key watchdog: not a holder: {holder:?}");
         return 2;
     };
     let Some(mut switch) = platform_switch() else {
-        return 0;
+        return 1;
     };
-    let input = io::stdin();
-    if let Err(e) = watch(
+    let watched = watch(
         dir,
         &mut switch,
         holder,
         &Machine::this(),
-        input,
-        WATCHDOG_POLL,
-    ) {
-        crate::debug!("F-key watchdog: {e:#}");
+        io::stdin(),
+        say_ready,
+        &Pace::DEFAULT,
+    );
+    match watched {
+        Ok(()) => 0,
+        Err(e) => {
+            crate::debug!("F-key watchdog: {e:#}");
+            1
+        }
     }
-    0
 }
 
-/// The watchdog's body: returns once `input` ends or `holder` no longer runs (checked every
-/// `poll`), after releasing for `holder`.
+/// Prints [`READY`] on stdout, then points stdout at `/dev/null`: the holder stops reading it,
+/// and nothing written later can fail on a closed pipe.
+pub(crate) fn say_ready() {
+    let mut out = io::stdout().lock();
+    let _ = writeln!(out, "{READY}").and_then(|()| out.flush());
+    drop(out);
+    if let Ok(null) = File::options().write(true).open("/dev/null") {
+        use std::os::fd::AsRawFd;
+        // SAFETY: both are open descriptors; dup2 replaces fd 1 atomically.
+        unsafe { libc::dup2(null.as_raw_fd(), libc::STDOUT_FILENO) };
+    }
+}
+
+/// The watchdog's body: reads the switch once (it can, or it is not ready), starts reading
+/// `input`, calls `ready`, then waits until `input` ends or `holder` no longer runs (checked every
+/// `pace.poll`) and releases for `holder`, retrying a release that fails at `pace` until it
+/// succeeds — the original read back, a live holder found, or nothing left to do — or `pace.total`
+/// has passed (an error: the state stays for the next start).
 pub(crate) fn watch(
     dir: &Path,
     switch: &mut dyn Switch,
     holder: Holder,
     m: &Machine,
     input: impl Read + Send + 'static,
-    poll: Duration,
+    ready: impl FnOnce(),
+    pace: &Pace,
 ) -> Result<()> {
+    switch
+        .read()
+        .context("the watchdog cannot read the switch")?;
     let (ended, end) = mpsc::channel();
     std::thread::spawn(move || {
         let mut input = input;
         let _ = io::copy(&mut input, &mut io::sink());
         let _ = ended.send(());
     });
+    ready();
     loop {
-        match end.recv_timeout(poll) {
+        match end.recv_timeout(pace.poll) {
             Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
             Err(mpsc::RecvTimeoutError::Timeout) if !(m.runs)(&holder) => break,
             Err(mpsc::RecvTimeoutError::Timeout) => {}
         }
     }
-    release(dir, switch, holder, m)
+    let until = Instant::now() + pace.total;
+    let mut wait = pace.first;
+    loop {
+        let e = match release(dir, switch, holder, m) {
+            Ok(()) => return Ok(()),
+            Err(e) => e,
+        };
+        let now = Instant::now();
+        if now >= until {
+            return Err(e.context("gave up; the state stays for the next start"));
+        }
+        crate::debug!("F-key watchdog: {e:#}; again in {wait:?}");
+        std::thread::sleep(wait.min(until - now));
+        wait = (wait * 2).min(pace.most);
+    }
 }
 
 // ---------------------------------------------------------------------------------------------

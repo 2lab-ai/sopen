@@ -24,6 +24,12 @@ struct Hid {
     drops: bool,
     /// Every write fails.
     broken: bool,
+    /// The next this many writes fail.
+    fail_writes: usize,
+    /// Every write returns but changes nothing.
+    ignores: bool,
+    /// Every read fails.
+    blind: bool,
 }
 
 /// The HID value every made-up process of a test shares, as processes share the real one.
@@ -63,14 +69,24 @@ impl Switch for Fake {
     fn read(&mut self) -> Result<i64> {
         let mut hid = self.0.lock().unwrap();
         hid.reads += 1;
+        if hid.blind {
+            bail!("the fake cannot be read");
+        }
         Ok(hid.value)
     }
 
     fn write(&mut self, value: i64) -> Result<()> {
         let mut hid = self.0.lock().unwrap();
         hid.writes.push(value);
+        if hid.fail_writes > 0 {
+            hid.fail_writes -= 1;
+            bail!("the fake failed this write");
+        }
         if hid.broken || (value == ON && hid.refuse) {
             bail!("refused by the fake");
+        }
+        if hid.ignores {
+            return Ok(());
         }
         hid.value = if value == ON && hid.drops { OFF } else { value };
         Ok(())
@@ -114,7 +130,7 @@ fn process(dir: &Path, hid: &Fake, procs: &Procs, pid: u32) -> Fkeys<Fake> {
         hid.clone(),
         Ok(me),
         procs.machine(),
-        Watchdog::Off,
+        Watchdog::off(),
     )
 }
 
@@ -507,37 +523,49 @@ fn a_failed_restore_is_retried_and_a_broken_state_reads_as_zero() {
 // K-F4: `fkeys = "system"` never opens IOHIDSystem.
 
 /// 04 §8 K-F4 — `sopen config fkeys system` → the file holds `fkeys = "system"` (its writer is
-/// `config::set_fkeys`, the CLI's `run_config`) and the switch is never made: the factory is not
-/// called, so nothing is opened or touched. The test build gets no switch either way.
+/// `config::set_fkeys`, the CLI's `run_config`) and the switch is never made. Through
+/// [`from_config`], the construction [`for_this_run`] itself goes through, given the loaded file:
+/// neither the switch's factory nor the rest is called, nothing is touched or created. The same
+/// construction with the default makes the switch, once. (The test build's own short-circuit is
+/// outside it: [`for_this_run`] gives no switch in a test build at all.)
 #[test]
 fn kf4_system_never_opens_the_switch() {
     let tmp = tempfile::tempdir().unwrap();
     let file = tmp.path().join("config.toml");
+    let dir = tmp.path().join("state");
     config::set_fkeys(&file, config::Fkeys::System).unwrap();
     assert_eq!(
         std::fs::read_to_string(&file).unwrap(),
         "fkeys = \"system\"\n"
     );
-    let loaded = config::load(&file).unwrap();
+    let system = config::load(&file).unwrap();
     let hid = Fake::at(OFF);
-    let made = std::cell::Cell::new(0);
+    let procs = Procs::default();
+    let (made, parted) = (std::cell::Cell::new(0), std::cell::Cell::new(0));
     let open = || {
         made.set(made.get() + 1);
         Some(hid.clone())
     };
-    assert!(allowed(loaded.fkeys(), false, open).is_none());
-    assert!(allowed(loaded.fkeys(), true, open).is_none());
-    assert!(
-        allowed(config::Fkeys::Function, true, open).is_none(),
-        "nor in a scripted run"
-    );
-    assert_eq!(made.get(), 0, "the switch was never made");
-    assert!(allowed(config::Fkeys::Function, false, open).is_some());
-    assert_eq!(made.get(), 1, "the default makes it");
+    let parts = || {
+        parted.set(parted.get() + 1);
+        Parts {
+            me: Ok(procs.start(1)),
+            machine: procs.machine(),
+            watchdog: Watchdog::off(),
+        }
+    };
+    assert!(from_config(&system, &dir, open, parts).is_none());
+    assert_eq!((made.get(), parted.get()), (0, 0), "nothing was made");
     assert_eq!(hid.calls(), 0);
+    assert!(!dir.exists(), "nothing was created");
 
-    assert!(for_this_run(&loaded, tmp.path()).is_none());
-    assert!(for_this_run(&config::Config::default(), tmp.path()).is_none());
+    let default = config::load(&tmp.path().join("absent.toml")).unwrap();
+    assert!(from_config(&default, &dir, open, parts).is_some());
+    assert_eq!((made.get(), parted.get()), (1, 1), "the default makes it");
+    assert_eq!(hid.calls(), 0, "and touches nothing before a focus");
+
+    assert!(for_this_run(&system, tmp.path()).is_none());
+    assert!(for_this_run(&default, tmp.path()).is_none());
     assert!(!tmp.path().join(LOCK).exists());
 }
 
@@ -639,7 +667,12 @@ fn the_watchdog_ends_at_its_inputs_end_or_its_holders() {
         } else {
             Duration::from_millis(10)
         };
-        let watchdog = std::thread::spawn(move || watch(&d, &mut h, holder, &m, input, poll));
+        let pace = Pace {
+            poll,
+            ..Pace::DEFAULT
+        };
+        let watchdog =
+            std::thread::spawn(move || watch(&d, &mut h, holder, &m, input, || {}, &pace));
         std::thread::sleep(Duration::from_millis(50));
         assert!(
             !watchdog.is_finished(),
@@ -677,10 +710,14 @@ const SEED: &str = "SOPEN_TEST_FKEYS_SEED";
 const LOCK_INO: &str = "SOPEN_TEST_FKEYS_LOCK_INO";
 const CHILD_TEST: &str = "fnkeys::tests::child";
 const HELD: &str = "FKEYS-HELD ";
+const JOINED: &str = "FKEYS-JOINED ";
 const CYCLES: usize = 1_000;
+/// The cycle at which each contender, holding, waits for the other to hold too.
+const BARRIER_CYCLE: usize = CYCLES / 2;
 
 /// The fake shared across processes: the value in `<root>/hid`, read and written only under
-/// the protocol's lock (and by the test once its children have ended).
+/// the protocol's lock (and by the test once its children have ended). Every write is logged in
+/// `<root>/hid.log` with its time (nanoseconds since the epoch), so a test times the write itself.
 struct FileSwitch(PathBuf);
 
 impl Switch for FileSwitch {
@@ -690,8 +727,20 @@ impl Switch for FileSwitch {
 
     fn write(&mut self, value: i64) -> Result<()> {
         std::fs::write(&self.0, value.to_string())?;
+        let mut log = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(self.0.with_file_name("hid.log"))?;
+        writeln!(log, "{value} {}", now_nanos())?;
         Ok(())
     }
+}
+
+fn now_nanos() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos()
 }
 
 fn hid_file(root: &Path) -> String {
@@ -726,7 +775,7 @@ fn child() {
 }
 
 /// K-F2's holder: acquires through the whole of `Fkeys` (its watchdog this binary as
-/// "watchdog"), says so once the watchdog is waiting on its pipe, and waits to be killed.
+/// "watchdog", which says it is ready before the acquisition), says so, and waits to be killed.
 fn holder_child(root: &Path) {
     let me = Holder::this_process().unwrap();
     let watchdog_root = root.to_path_buf();
@@ -740,39 +789,43 @@ fn holder_child(root: &Path) {
         FileSwitch(root.join("hid")),
         Ok(me),
         Machine::this(),
-        Watchdog::Start(command),
+        // A test binary starts slower than sopen: a longer wait for it to say it is ready.
+        Watchdog::start(command).ready_within(Duration::from_secs(30)),
     );
     f.focus(true);
     assert!(f.holds(), "{:?}", f.status());
     let pid = f.watchdog_pid().unwrap();
-    assert!(
-        wait_until(Duration::from_secs(30), || root
-            .join(format!("ready-{pid}"))
-            .exists()),
-        "the watchdog did not start"
-    );
     println!("\n{HELD}{pid}");
     std::thread::sleep(Duration::from_secs(60));
 }
 
-/// K-F2's watchdog: says it is about to wait, then waits on its input with a poll far longer
-/// than the test's second, so what ends it in time is the pipe's end.
+/// K-F2's watchdog: says it is ready as sopen's does, then waits on its input with a poll far
+/// longer than the test's second, so what ends it in time is the pipe's end.
 fn watchdog_child(root: &Path) {
     let holder = Holder::parse(&std::env::var(HOLDER).unwrap()).unwrap();
-    std::fs::write(root.join(format!("ready-{}", std::process::id())), "").unwrap();
     watch(
         &root.join("state"),
         &mut FileSwitch(root.join("hid")),
         holder,
         &Machine::this(),
         io::stdin(),
-        Duration::from_secs(60),
+        // libtest has printed `test … ... ` without its line's end: the ready line starts anew.
+        || {
+            println!();
+            say_ready()
+        },
+        &Pace {
+            poll: Duration::from_secs(60),
+            ..Pace::DEFAULT
+        },
     )
     .unwrap();
 }
 
 /// 04 §8 K-F2 — a process holding the switch is killed with SIGKILL → within 1 s the fake
-/// is back at 0 and the state file is gone; then the watchdog ends.
+/// is back at 0 and the state file is gone; then the watchdog ends. The second runs from just
+/// before the kill to the restoring write, as the fake logged it: this test's polling and
+/// scheduling are not in it.
 #[test]
 fn kf2_a_killed_holder_is_restored_by_its_watchdog_within_a_second() {
     let tmp = tempfile::tempdir().unwrap();
@@ -804,14 +857,22 @@ fn kf2_a_killed_holder_is_restored_by_its_watchdog_within_a_second() {
     assert_eq!(hid_file(root), "1");
     assert!(state_file.exists());
 
+    let before_kill = now_nanos();
     holder.kill().unwrap(); // SIGKILL
-    let killed = Instant::now();
     holder.wait().unwrap();
-    let restored = wait_until(Duration::from_secs(5), || {
+    let restored = wait_until(Duration::from_secs(10), || {
         hid_file(root) == "0" && !state_file.exists()
     });
-    let took = killed.elapsed();
     assert!(restored, "not restored: hid {}", hid_file(root));
+    let log = std::fs::read_to_string(root.join("hid.log")).unwrap();
+    let restore = log
+        .lines()
+        .filter_map(|line| line.split_once(' '))
+        .filter(|(value, _)| *value == "0")
+        .filter_map(|(_, at)| at.parse::<u128>().ok())
+        .find(|at| *at >= before_kill)
+        .unwrap_or_else(|| panic!("no restoring write after the kill:\n{log}"));
+    let took = Duration::from_nanos(u64::try_from(restore - before_kill).unwrap());
     assert!(
         took <= Duration::from_secs(1),
         "restored only {took:?} after the kill"
@@ -824,7 +885,9 @@ fn kf2_a_killed_holder_is_restored_by_its_watchdog_within_a_second() {
 }
 
 /// K-F5's contender: [`CYCLES`] acquisitions and releases, the gaps between them (extra looks at
-/// the state under the lock, yields) drawn from its seed; every look checks the invariants.
+/// the state under the lock, yields) drawn from its seed; every look checks the invariants. At
+/// [`BARRIER_CYCLE`] it marks that it holds and, holding, waits for the other's mark, so the two
+/// hold at once at least there; it prints how often it joined holders that remained.
 fn contender_child(root: &Path) {
     let dir = root.join("state");
     let seed: u64 = std::env::var(SEED).unwrap().parse().unwrap();
@@ -839,9 +902,21 @@ fn contender_child(root: &Path) {
         rng ^= rng << 17;
         rng
     };
+    let mut joined = 0;
     for cycle in 0..CYCLES {
         let got = acquire(&dir, &mut hid, me, &m).unwrap();
         assert!(got.holds(), "cycle {cycle}: {got:?}");
+        if got == Acquired::Joined {
+            joined += 1;
+        }
+        if cycle == BARRIER_CYCLE {
+            std::fs::write(root.join(format!("barrier-{seed}")), "").unwrap();
+            let other = root.join(format!("barrier-{}", 3 - seed));
+            assert!(
+                wait_until(Duration::from_secs(20), || other.exists()),
+                "the other contender never held at the barrier"
+            );
+        }
         for _ in 0..next() % 3 {
             look(&dir, &mut hid, &m, ino, cycle);
         }
@@ -853,6 +928,7 @@ fn contender_child(root: &Path) {
             look(&dir, &mut hid, &m, ino, cycle);
         }
     }
+    println!("\n{JOINED}{joined}");
 }
 
 /// Under the lock: the lock file is the one the test made; a state names only holders that run,
@@ -889,7 +965,10 @@ fn look(dir: &Path, hid: &mut FileSwitch, m: &Machine, ino: u64, cycle: usize) {
 
 /// 04 §8 K-F5 — two processes acquire and release 1 000 times each, at random, against the
 /// fake → the lock file is never replaced or removed, the fake ends at its original value, and no
-/// run sees a state file with a holder that does not run.
+/// run sees a state file with a holder that does not run. The barrier makes them hold at once at
+/// least once, and the contested path — an acquisition that joins holders that remain — must
+/// have run. Both children's outcomes are collected (each killed and reaped past its bound) before
+/// anything is asserted.
 #[test]
 fn kf5_two_processes_acquire_and_release_a_thousand_times_each() {
     let tmp = tempfile::tempdir().unwrap();
@@ -908,15 +987,28 @@ fn kf5_two_processes_acquire_and_release_a_thousand_times_each() {
             .spawn()
             .unwrap()
     });
-    for (n, child) in children.into_iter().enumerate() {
-        let (ok, text) = finish(child, Duration::from_secs(120));
+    let outcomes: Vec<_> = children
+        .into_iter()
+        .map(|child| finish(child, Duration::from_secs(120)))
+        .collect();
+    let mut joined = 0;
+    for (n, (ok, text)) in outcomes.iter().enumerate() {
         assert!(ok, "contender {n}:\n{text}");
         assert!(
             text.contains("1 passed"),
             "contender {n} did not run:\n{text}"
         );
+        joined += text
+            .lines()
+            .find_map(|line| line.strip_prefix(JOINED))
+            .and_then(|n| n.trim().parse::<usize>().ok())
+            .unwrap_or_else(|| panic!("contender {n} did not count:\n{text}"));
     }
-    eprintln!("K-F5: 2 × {CYCLES} cycles in {:?}", started.elapsed());
+    eprintln!(
+        "K-F5: 2 × {CYCLES} cycles in {:?}, {joined} joined",
+        started.elapsed()
+    );
+    assert!(joined >= 1, "the contested path never ran");
     assert_eq!(hid_file(root), "0", "the fake ends at its original value");
     assert_eq!(
         std::fs::metadata(dir.join(LOCK)).unwrap().ino(),
@@ -989,4 +1081,349 @@ fn finish(mut child: Child, limit: Duration) -> (bool, String) {
     let status = child.wait().unwrap();
     let text = format!("{}{}", out.join().unwrap(), err.join().unwrap());
     (ended && status.success(), text)
+}
+
+// ---------------------------------------------------------------------------------------------
+// Review round 1 (PR #65): a restore that keeps its responsibility, a watchdog that is ready, a
+// state that cannot record 1.
+
+/// The token a watchdog prints once it is ready, as the stand-ins below spell it.
+const READY_LINE: &str = "sopen-fkeys-watchdog-ready";
+
+#[test]
+fn the_stand_ins_say_ready_as_sopen_does() {
+    assert_eq!(READY_LINE, READY);
+}
+
+/// A stand-in watchdog: `sh -c <script>`.
+fn stand_in(script: &'static str) -> WatchdogCommand {
+    Box::new(move |_, _| {
+        let mut cmd = Command::new("/bin/sh");
+        cmd.args(["-c", script]);
+        Ok(cmd)
+    })
+}
+
+/// R1 — a restore the watchdog could not make (a transient failure) is retried until it holds;
+/// it is not logged and dropped.
+#[test]
+fn r1_the_watchdog_retries_a_failed_restore_until_it_holds() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("state");
+    let hid = Fake::at(OFF);
+    let procs = Procs::default();
+    let mut a = process(&dir, &hid, &procs, 1);
+    a.focus(true);
+    assert_eq!(hid.value(), ON);
+    let holder = Holder {
+        pid: 1,
+        start: 1001,
+    };
+    procs.kill(holder);
+    std::mem::forget(a); // it "died": no release of its own
+    hid.with(|h| h.fail_writes = 3);
+
+    let (input, pipe) = std::io::pipe().unwrap();
+    drop(pipe);
+    let done = watch(
+        &dir,
+        &mut hid.clone(),
+        holder,
+        &procs.machine(),
+        input,
+        || {},
+        &Pace::DEFAULT,
+    );
+    assert_eq!(hid.value(), OFF, "{done:?}");
+    assert_eq!(state(&dir), None);
+    assert_eq!(
+        hid.writes(),
+        [ON, OFF, OFF, OFF, OFF],
+        "three failures, then the restore"
+    );
+    done.unwrap();
+}
+
+/// R1 — the watchdog's retries are bounded and never spin: past their total it gives up and
+/// leaves the state, without holders, for the next start, which restores.
+#[test]
+fn r1_the_watchdog_gives_up_after_its_total_and_leaves_the_state() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("state");
+    let hid = Fake::at(OFF);
+    let procs = Procs::default();
+    let mut a = process(&dir, &hid, &procs, 1);
+    a.focus(true);
+    let holder = Holder {
+        pid: 1,
+        start: 1001,
+    };
+    procs.kill(holder);
+    std::mem::forget(a);
+    hid.with(|h| h.broken = true);
+
+    let (input, pipe) = std::io::pipe().unwrap();
+    drop(pipe);
+    let pace = Pace {
+        poll: Duration::from_secs(60),
+        first: Duration::from_millis(10),
+        most: Duration::from_millis(40),
+        total: Duration::from_millis(200),
+    };
+    let started = Instant::now();
+    let done = watch(
+        &dir,
+        &mut hid.clone(),
+        holder,
+        &procs.machine(),
+        input,
+        || {},
+        &pace,
+    );
+    let took = started.elapsed();
+    let e = format!("{:#}", done.unwrap_err());
+    assert!(e.contains("gave up"), "{e}");
+    assert!(
+        took >= pace.total && took < Duration::from_secs(5),
+        "{took:?}"
+    );
+    let tries = hid.writes().len() - 1;
+    assert!(
+        (2..=12).contains(&tries),
+        "{tries} tries in {took:?}: no spinning"
+    );
+    let s = state(&dir).unwrap();
+    assert!(s.holders.is_empty(), "{s:?}");
+    assert_eq!(hid.value(), ON);
+
+    hid.with(|h| h.broken = false);
+    let _next = process(&dir, &hid, &procs, 2);
+    assert_eq!(hid.value(), OFF, "the next start restored");
+    assert_eq!(state(&dir), None);
+}
+
+/// R1 — a release that failed in the process itself is tried again at a later call once it is
+/// due (not before), and at the end; never left to the watchdog alone while the process lives.
+#[test]
+fn r1_a_failed_release_is_tried_again_at_a_later_call_and_at_the_end() {
+    let pace = Pace {
+        poll: Duration::from_secs(1),
+        first: Duration::from_millis(20),
+        most: Duration::from_millis(40),
+        total: Duration::from_secs(10),
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("state");
+    let hid = Fake::at(OFF);
+    let procs = Procs::default();
+    let mut a = process(&dir, &hid, &procs, 1).with_pace(pace);
+    a.focus(true);
+    hid.with(|h| h.fail_writes = 2);
+    a.focus(false);
+    assert_eq!(hid.value(), ON);
+    let at = a.next_retry().unwrap();
+    let writes = hid.writes().len();
+    a.focus(false);
+    if Instant::now() < at {
+        assert_eq!(
+            hid.writes().len(),
+            writes,
+            "not tried again before it is due"
+        );
+    }
+    while let Some(at) = a.next_retry() {
+        std::thread::sleep(at.saturating_duration_since(Instant::now()) + Duration::from_millis(2));
+        a.focus(false);
+    }
+    assert_eq!(hid.value(), OFF);
+    assert_eq!(state(&dir), None);
+    assert_eq!(a.next_retry(), None);
+    assert_eq!(hid.writes(), [ON, OFF, OFF, OFF]);
+
+    // At the end: one more try before the watchdog's.
+    a.focus(true);
+    hid.with(|h| h.fail_writes = 1);
+    a.focus(false);
+    assert_eq!(hid.value(), ON);
+    drop(a);
+    assert_eq!(hid.value(), OFF, "the drop tried again");
+    assert_eq!(state(&dir), None);
+}
+
+/// R2 — a restore that returns but does not take (or cannot be read back) keeps the state, so it
+/// is retried; the next start restores.
+#[test]
+fn r2_a_restore_that_does_not_read_back_keeps_the_state() {
+    for blind in [false, true] {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("state");
+        let hid = Fake::at(OFF);
+        let procs = Procs::default();
+        let mut a = process(&dir, &hid, &procs, 1);
+        a.focus(true);
+        hid.with(|h| {
+            h.ignores = !blind;
+            h.blind = blind;
+        });
+        a.focus(false);
+        let s = state(&dir).unwrap_or_else(|| {
+            panic!("blind={blind}: the state was removed with nothing verifying the restore")
+        });
+        assert!(s.holders.is_empty(), "blind={blind}: {s:?}");
+        assert_eq!(s.original, OFF);
+        hid.with(|h| {
+            h.ignores = false;
+            h.blind = false;
+        });
+        std::mem::forget(a); // it "died": what restores now is the next start
+        let _b = process(&dir, &hid, &procs, 2);
+        assert_eq!(hid.value(), OFF, "blind={blind}: the next start restored");
+        assert_eq!(state(&dir), None, "blind={blind}");
+    }
+}
+
+/// R3 — a watchdog that dies before it says it is ready is no watchdog: no acquisition, the value
+/// stays 0, and the status row says the switch did not take effect.
+#[test]
+fn r3_a_watchdog_that_dies_before_ready_is_no_acquisition() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("state");
+    let hid = Fake::at(OFF);
+    let procs = Procs::default();
+    let me = procs.start(1);
+    let mut a = Fkeys::new(
+        dir.clone(),
+        hid.clone(),
+        Ok(me),
+        procs.machine(),
+        Watchdog::start(stand_in("exit 3")),
+    );
+    a.focus(true);
+    assert!(!a.holds());
+    let status = a.status().unwrap_or_default();
+    assert!(status.starts_with(NOT_IN_EFFECT), "{status:?}");
+    assert!(hid.writes().is_empty(), "{:?}", hid.writes());
+    assert_eq!(hid.value(), OFF);
+    assert_eq!(state(&dir), None);
+}
+
+/// R3 — a watchdog that never says it is ready is stopped at the bound: no acquisition.
+#[test]
+fn r3_a_watchdog_that_never_says_ready_is_stopped_at_the_bound() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("state");
+    let hid = Fake::at(OFF);
+    let procs = Procs::default();
+    let me = procs.start(1);
+    let wait = Duration::from_millis(300);
+    let mut a = Fkeys::new(
+        dir.clone(),
+        hid.clone(),
+        Ok(me),
+        procs.machine(),
+        // Waits for its input's end with its output open, and says nothing.
+        Watchdog::start(stand_in("exec cat")).ready_within(wait),
+    );
+    let started = Instant::now();
+    a.focus(true);
+    let took = started.elapsed();
+    assert!(!a.holds());
+    assert!(took >= wait && took < Duration::from_secs(10), "{took:?}");
+    let status = a.status().unwrap_or_default();
+    assert!(
+        status.starts_with(NOT_IN_EFFECT) && status.contains("ready"),
+        "{status:?}"
+    );
+    assert_eq!(a.watchdog_pid(), None);
+    assert!(hid.writes().is_empty());
+    assert_eq!(hid.value(), OFF);
+    assert_eq!(state(&dir), None);
+}
+
+/// R3 — a watchdog that was ready once but has died since is not taken for a live one: before the
+/// next acquisition it is started again (and ready), or there is no acquisition.
+#[test]
+fn r3_a_dead_watchdog_is_replaced_before_the_next_acquisition() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("state");
+    let hid = Fake::at(OFF);
+    let procs = Procs::default();
+    let me = procs.start(1);
+    let started = Arc::new(Mutex::new(0usize));
+    let count = started.clone();
+    let scripts = [
+        // Ready, then gone.
+        "echo sopen-fkeys-watchdog-ready",
+        // Gone before ready.
+        "exit 3",
+        // Ready, and waits for its input's end.
+        "echo sopen-fkeys-watchdog-ready; exec cat >/dev/null",
+    ];
+    assert!(scripts[0].ends_with(READY_LINE));
+    let command: WatchdogCommand = Box::new(move |_, _| {
+        let mut n = count.lock().unwrap();
+        let mut cmd = Command::new("/bin/sh");
+        cmd.args(["-c", scripts[(*n).min(2)]]);
+        *n += 1;
+        Ok(cmd)
+    });
+    let mut a = Fkeys::new(
+        dir.clone(),
+        hid.clone(),
+        Ok(me),
+        procs.machine(),
+        // A loaded machine may start `sh` slowly: the bound is not what is tested here.
+        Watchdog::start(command).ready_within(Duration::from_secs(30)),
+    );
+    a.focus(true);
+    assert!(a.holds(), "{:?}", a.status());
+    a.focus(false);
+    assert_eq!(hid.value(), OFF);
+    let pid = a.watchdog_pid().unwrap();
+    assert!(
+        wait_until(Duration::from_secs(10), || process::start(pid).is_none()),
+        "the first watchdog did not end"
+    );
+
+    a.focus(true);
+    assert!(!a.holds(), "acquired with a dead watchdog");
+    assert_eq!(*started.lock().unwrap(), 2, "started again once");
+    assert!(a.status().unwrap_or_default().starts_with(NOT_IN_EFFECT));
+    assert_eq!(hid.writes(), [ON, OFF]);
+    assert_eq!(hid.value(), OFF);
+
+    a.focus(false);
+    a.focus(true);
+    assert!(a.holds(), "a third, ready watchdog: {:?}", a.status());
+    assert_eq!(*started.lock().unwrap(), 3);
+    a.quit();
+    assert_eq!(hid.value(), OFF);
+}
+
+/// R4 — sopen records only 0, so a state that says otherwise is not trusted: whatever it says,
+/// the restore is 0 and 1 is never written back.
+#[test]
+fn r4_a_state_recording_one_never_restores_one() {
+    let procs = Procs::default();
+    let dead = procs.start(9);
+    procs.kill(dead);
+    for by_watchdog in [false, true] {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("state");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join(STATE),
+            format!(r#"{{"original":1,"holders":[{{"pid":9,"start":1009}}],"boot":"{BOOT}"}}"#),
+        )
+        .unwrap();
+        let hid = Fake::at(ON);
+        if by_watchdog {
+            release(&dir, &mut hid.clone(), dead, &procs.machine()).unwrap();
+        } else {
+            let _n = process(&dir, &hid, &procs, 2);
+        }
+        assert_eq!(hid.writes(), [OFF], "by_watchdog={by_watchdog}");
+        assert_eq!(hid.value(), OFF);
+        assert_eq!(state(&dir), None);
+    }
 }
