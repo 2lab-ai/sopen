@@ -29,6 +29,7 @@ mod ops;
 mod panel;
 mod prepare;
 mod preview;
+mod tree;
 pub(crate) mod view;
 
 use super::chrome::{self, FKey};

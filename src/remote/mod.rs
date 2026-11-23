@@ -8,6 +8,7 @@ pub mod ops;
 pub mod patch;
 mod ranged;
 mod sftp;
+pub mod treefs;
 
 pub use local::LocalFs;
 #[cfg(test)]

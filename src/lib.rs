@@ -25,6 +25,7 @@ pub mod remote;
 pub mod stems;
 pub mod stream;
 pub mod target;
+pub mod tree;
 pub mod usage;
 pub mod zed;
 

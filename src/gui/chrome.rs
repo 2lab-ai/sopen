@@ -18,6 +18,8 @@
 //! ☺♥▲ control glyphs the hex window shows — and no Hangul: those come from the installed font
 //! eframe's system font provider finds (see [`super::fonts`]).
 
+pub mod tree;
+
 use super::Status;
 use eframe::egui::{self, Color32, FontId, Pos2, Rect, Stroke, Vec2};
 use std::sync::{Arc, OnceLock};

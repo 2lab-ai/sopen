@@ -551,13 +551,13 @@ feature has not landed has no row in the deployed table and its F-key slot shows
 
 ## 8. Slices and work units
 
-The workstream ships in **seven slices, in this order**. Each slice is merged and deployed on its own
-(the preview channel, AGENTS.md "Distribution"), with its receipts, before the next starts; so the
-owner sees each part as it lands, and each slice's WUs integrate into `browser.rs` directly instead
-of waiting for one integration at the end. Within a slice: a small **scaffold** step first (its `mod`
-lines, stubs, dependencies — one serial change, so `--locked` stays green), then its WUs in parallel
-on disjoint files, then its **integration** WU, the slice's one owner of `browser.rs`. The experiment
-a slice depends on runs before it (§8.2).
+The workstream ships in **seven slices**, each started once its "Needs first" (§8.1) is met. Each
+slice is merged and deployed on its own (the preview channel, AGENTS.md "Distribution"), with its
+receipts; so the owner sees each part as it lands, and each slice's WUs integrate into `browser.rs`
+directly instead of waiting for one integration at the end. Within a slice: a small **scaffold**
+step first (its `mod` lines, stubs, dependencies — one serial change, so `--locked` stays green),
+then its WUs in parallel on disjoint files, then its **integration** WU, the slice's one owner of
+`browser.rs`. The experiment a slice depends on runs before it (§8.2).
 
 ### 8.1 The slices
 
@@ -585,11 +585,13 @@ a slice depends on runs before it (§8.2).
 | S6 | 04 K-R1 (slots 7, 8), K-R3 (Shift+F8), K-K1, K-D1, K-N1 (remote folders), K-C4 (a server without `hardlink@`) |
 | S7 | 04 K-F1–K-F6 |
 
-- **Schedule: one slice at a time.** Slices never run concurrently, so no two slices ever work on a
-  shared file at once. The order is S1 → S2 → S3 → S4 → S5 → S6 → S7, constrained by the "Needs
-  first" column: S1-M runs as soon as PR #15 has merged, between two slices; S7 waits for E1 and runs
-  last. The streaming workstream (another branch) rebases onto S1, which touches `prepare.rs` and the
-  four `embed` signatures first.
+- **Schedule: slices run at the same time once their "Needs first" is met.** S2 → S3 → S4 keep that
+  order (each needs the one before it), and S7 waits for E1. Only work that touches a shared file
+  runs one at a time: a scaffold step's `mod` lines, the `keys.rs` and `gui/mod.rs` rows, and each
+  slice's integration WU in `browser.rs`, `main.rs` and `view.rs` — two integration WUs never run at
+  the same time. So the owner sees each part sooner, and a WU on disjoint files cannot collide with
+  another. The streaming workstream (another branch) rebases onto S1, which touches `prepare.rs` and
+  the four `embed` signatures first.
 - **Hand-overs between slices** are the only shared files: `keys.rs` (S1-A writes every row; a later
   slice changes a row in its scaffold step, declared there), `gui/mod.rs` (S1-A, then each
   integration WU for its receipt keys: `State::parse` rejects unknown keys and `Hooks` flags accept
@@ -677,5 +679,5 @@ Added to AGENTS.md "Receipts" by the slice that brings them (the hooks travel wi
 | One serialised preview connection per window, the budgets of §4.3, reading without claiming the cache | A bar sweep must not fetch, add sessions or fill the cache; a preview must not cost more than a glance (a 32 MiB read is a few seconds on a slow link; 64 megapixels is 256 MiB of RGBA). |
 | Previews are drawn disabled, with their events withheld, and switched to full viewers in place (`set_preview(false)`) | Withheld events alone still let egui's pointer state click; a prepared viewer cannot be cloned, so the live window is what is handed over. |
 | At most 3 git commands in flight per host | sshd's `MaxSessions` (OpenSSH default 10) is shared with the SFTP sessions of the listing, a viewer, the preview, the tree and a file operation. |
-| Seven slices, each merged and deployed on its own | The owner sees each part as it lands; each slice's integration is small; nothing waits for one big integration. |
+| Seven slices, each merged and deployed on its own; slices run at the same time once their "Needs first" is met, and only work on a shared file (a scaffold's `mod` lines, the `keys.rs` and `gui/mod.rs` rows, the integration WUs) runs one at a time | The owner sees each part as it lands, and sooner; each slice's integration is small; nothing waits for one big integration; a WU on disjoint files cannot collide. |
 | New remote primitives as new traits in submodules | Keeps `sftp.rs`, `local.rs` and `RemoteFs` out of the parallel WUs (§8). |

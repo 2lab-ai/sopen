@@ -4,15 +4,18 @@ Status: round 1 merged (2026-11-22; S1-M, PR #36, was its last unit). Target: [`
 slices and their order), `../03-git-panel.md`, `../04-file-keys.md`, `../05-directory-tree.md`. Closed rows move to
 `loop.done.md` in the commit that closes their round.
 
-## Round 1 — slice S1 (preview mode, F9, F2/F5/F6, F-key row, F1 help)
+## Round 2 — slice S5 (the directory tree: F10, Alt+F10)
 
-S1-0 and S1-A to S1-E are merged, with PR #14 and PR #15 (rows in [`loop.done.md`](loop.done.md)). S1-M merged
-on 2026-11-22 (PR #36, bdb6166), so all of S1 is merged; its row below moves to `loop.done.md` in a later change.
-One slice at a time (02 §8.1). Worktree = `.worktrees/<branch with / as ->`.
+Round 1 (S1) is closed: its rows are in [`loop.done.md`](loop.done.md). S5 needs only S1, so it runs alongside
+other slices (02 §8.1 "Schedule"). S5-0 first, the one serial change; then S5-A and S5-B in parallel on disjoint
+files; then S5-C, the slice's integration. Contract: 05. Worktree = `.worktrees/<branch with / as ->`.
 
 | ID | Status | Branch | Scope | Owner files (02 §5) | After |
 |---|---|---|---|---|---|
-| S1-M | ✅ merged: PR #36 (bdb6166), 2026-11-22 | `feat/browser-s1-media-preview` | the media preview: video frame, audio waveform, their budgets and hand-over; reruns P1, P5, P6, P12 for media | `src/gui/media.rs` and tests, the preview host's media row | S1-E, G-WAVE |
+| S5-0 | 🟡 in progress | `feat/browser-s5-scaffold` | `mod` lines and stubs for S5's files: `src/tree/` (one module per part of 05 §7), the `TreeFs` trait and its SFTP and local impls (no methods yet), `gui::browser::tree` with `TreeOutcome::GoTo`, `gui::chrome::tree`; the F10 and Alt+F10 rows of `keys.rs` checked against 05 §1 and 04 §2 (unchanged); 02 §8.1's schedule | `src/lib.rs`, `src/remote/{mod,sftp,local}.rs`, `src/gui/browser.rs`, `src/gui/chrome.rs` (mod lines), the stubs; `.prd/02-architecture.md`, `.prd/browser/loop*.md` | S1 |
+| S5-A | 🔴 open | `feat/browser-s5-tree-model` | the tree's model: the root (05 §2), rows (§3), R1–R10 and H1–H3 (§4), opening by itself (§5), the info line, the watchdog, phases 1–3 and the per-process cache (§6); `TreeFs` as a worker with channels, local and over SFTP (§6.4, §7); `T-root`, `T-rows`, `T-norules`, `T-auto`, `T-info`, `T-watchdog`, `T-lazy` | `src/tree/*.rs`, `src/remote/treefs.rs`, `src/remote/{sftp,local}/treefs.rs` | S5-0 |
+| S5-B | 🔴 open | `feat/browser-s5-tree-ui` | the tree as a side's content: its rows, the bar, the tree context's keys, the F-key row `1Help 10Tree` (05 §1); glyphs and colours (§3, §6.1) | `src/gui/browser/tree.rs`, `src/gui/chrome/tree.rs` | S5-0 |
+| S5-C | 🔴 open | `feat/browser-s5-integration` | `Content::Tree` and O4's `tree_snapshot` (02 §3.1); the tree's own connection; `TreeOutcome::GoTo` into the panel; S5's key rows landed (`keys.rs` lands rows by one threshold, `slice <= LANDED`, so S5 before S2–S4 needs a change there, declared); S5's scenarios (02 §8.1's table: 02 P11, 05 D-1–D-8, 04 K-R1 slot 10, K-R3 Alt+F10), receipts; 01 §3a and §9 as 05 amends them | `src/gui/browser.rs`, `src/gui/browser/{view,tests}.rs`, `src/gui/browser/keys.rs` (hand-over), `src/gui/mod.rs` (receipt keys), `src/main.rs`, `src/lib.rs` (the module map), `tests/cli.rs`, `AGENTS.md`, `README.md`, `.prd/01-spec.md` | S5-A, S5-B |
 
 ## Experiments for later slices (open; each runs before its slice)
 
@@ -30,8 +33,10 @@ One slice at a time (02 §8.1). Worktree = `.worktrees/<branch with / as ->`.
   Taken from AGENTS.md; not run in round 1's planning.
 - Receipts: window screenshots someone looked at (AGENTS.md "Receipts"); remote receipts under
   `/tmp/sopen-receipts/` on the remote.
-- After S1: one slice at a time, S2 → S3 → S4 → S5 → S6 → S7; S1-M between slices once PR #15 has merged; S7 after
-  E1 (02 §8.1).
+- After S1: slices run at the same time once their "Needs first" is met — S2 → S3 → S4 in that order, S7 after
+  E1; only work on a shared file runs one at a time (a scaffold's `mod` lines, the `keys.rs` and `gui/mod.rs` rows,
+  each slice's integration WU in `browser.rs`, `main.rs` and `view.rs`), and two integration WUs never at once
+  (02 §8.1).
 
 ## Next
 
@@ -39,6 +44,6 @@ One slice at a time (02 §8.1). Worktree = `.worktrees/<branch with / as ->`.
   that waited on S1 were then ready to start: S1-M (PR #36) and W6 merged on 2026-11-22, W4 and
   W5a on 2026-11-21, and ED3 is in progress ([`../streaming/loop.md`](../streaming/loop.md)).
 - 2026-11-22: S1-M merged (PR #36, bdb6166): the media preview, its budgets and hand-over, with E3's media rerun
-  written into 02 §8.2. Its row moves to [`loop.done.md`](loop.done.md) in a later change.
+  written into 02 §8.2. Its row is in [`loop.done.md`](loop.done.md) (R1 part 3).
 - E3 is closed (2026-11-21): its result is in 02 §8.2 and its row in [`loop.done.md`](loop.done.md). S1-M reruns
   it for media previews.
