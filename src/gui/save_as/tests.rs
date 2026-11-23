@@ -1246,7 +1246,9 @@ fn f7_and_alt_command_s_ask_for_save_as() {
 
 /// The key the editing windows list for Save As once each wires the modal (ED4–ED6) is F7
 /// "SaveAs" — six characters at most, as every row label — and no text viewer row has it (the
-/// text viewer is read-only), nor the browser's own rows.
+/// text viewer is read-only), nor the browser's viewer row, which a hosted editing window's own
+/// keys join. The list's F7 is another context's key since S6: make folder (04 §2), never Save
+/// As.
 #[test]
 fn the_save_as_key_is_f7_save_as() {
     assert_eq!(
@@ -1262,8 +1264,16 @@ fn the_save_as_key_is_f7_save_as() {
         ("text, wrapped", chrome::TEXT_WRAPPED_KEYS),
         ("text, unwrapped", chrome::TEXT_UNWRAPPED_KEYS),
         ("the browser's viewer row", chrome::VIEWER_KEYS),
-        ("the list", chrome::LIST_KEYS),
     ] {
         assert!(row.iter().all(|k| k.n != 7), "{name}: {row:?}");
     }
+    let list_7: Vec<&FKey> = chrome::LIST_KEYS.iter().filter(|k| k.n == 7).collect();
+    assert_eq!(
+        list_7,
+        [&FKey {
+            n: 7,
+            label: "MkDir"
+        }],
+        "the list's 7 is make folder"
+    );
 }

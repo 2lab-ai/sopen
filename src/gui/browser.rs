@@ -170,6 +170,28 @@ fn not_utf8(shown: &str) -> String {
 pub(crate) type OpsConnect =
     Arc<dyn Fn(Option<&str>) -> Result<Box<dyn FileOps + Send>> + Send + Sync>;
 
+/// Whether this machine has a Trash that takes entries of the folder it is given (F8, 04 §5.5).
+/// Asked on a worker, never on the window's thread: a folder on a slow or stalled mount must not
+/// hold the window up.
+pub(crate) type TrashCheck = Arc<dyn Fn(&str) -> bool + Send + Sync>;
+
+/// S6-A's check of this machine's Trash ([`fileops::trash_here`]): a few `stat`s of the folder,
+/// and on macOS Foundation's look-up of the Trash for it.
+fn trash_check() -> TrashCheck {
+    Arc::new(|dir: &str| {
+        matches!(
+            fileops::trash_here(&LocalFs::new(), dir),
+            fileops::Deletes::Trash
+        )
+    })
+}
+
+/// A Trash check on its worker, for the delete dialog opened with its number.
+struct TrashWait {
+    check: u64,
+    rx: Receiver<bool>,
+}
+
 /// The host `label` names (`[user@]host`, an IPv6 host bracketed), read as sopen reads its
 /// command line.
 fn host_spec(label: &str) -> Result<crate::target::RemoteSpec> {
@@ -752,10 +774,10 @@ pub(crate) struct Browser {
     tree_host: String,
     /// The git panels (03): the host, detection, the panels, the pin.
     git: GitSide,
-    /// Tests: what [`Browser::trash_here`] answers instead of asking this machine (`None`: it
-    /// asks — in a test build, the tests' stand-in Trash, which takes everything).
-    #[cfg(test)]
-    trash_answer: Option<bool>,
+    /// How F8 asks whether this machine has a Trash for a folder (tests: a stand-in of their
+    /// own), and the check running for the delete dialog that is open.
+    trash_check: TrashCheck,
+    trash_wait: Option<TrashWait>,
 }
 
 impl Drop for Browser {
@@ -870,8 +892,8 @@ impl Browser {
             tree_connect,
             tree_host,
             git,
-            #[cfg(test)]
-            trash_answer: None,
+            trash_check: trash_check(),
+            trash_wait: None,
         };
         browser.list(None, start.abs, None, None);
         browser
@@ -1146,8 +1168,8 @@ impl Browser {
                 let refused = self.ops.open_make_folder(panel, self.label.as_deref());
                 self.status = refused.unwrap_or_default();
             }
-            Command::Delete => self.delete(ops::Removal::Trash),
-            Command::DeleteNow => self.delete(ops::Removal::Permanent),
+            Command::Delete => self.delete(ctx, ops::Removal::Trash),
+            Command::DeleteNow => self.delete(ctx, ops::Removal::Permanent),
             Command::Reread => {
                 let (dir, at) = (panel.dir.clone(), panel.highlight);
                 let name = panel.current().map(|e| e.name.clone());
@@ -1214,31 +1236,60 @@ impl Browser {
     }
 
     /// F8, Del, ⌘⌫ (`asked` the Trash) or Shift+F8, Shift+Del (permanent): the delete dialog
-    /// for the selection or the bar's entry (04 §5.5). It says where they go before anything is
-    /// removed: on a remote, permanently (SFTP has no Trash); here, to the Trash where this
-    /// machine has one for the folder ([`Browser::trash_here`]), else permanently.
-    fn delete(&mut self, asked: ops::Removal) {
+    /// for the selection or the bar's entry as they are now (04 §5.5). It says where they go
+    /// before anything is removed: on a remote, permanently (SFTP has no Trash); with Shift,
+    /// permanently; here, to the Trash where this machine has one for the folder, else
+    /// permanently. That is asked on a worker ([`TrashCheck`]): the dialog opens at once saying
+    /// `checking the Trash…`, Delete off, and the answer fills it in ([`Browser::poll`]).
+    fn delete(&mut self, ctx: &egui::Context, asked: ops::Removal) {
         let panel = &self.panels[self.active];
-        let trash_here =
-            self.label.is_none() && asked == ops::Removal::Trash && self.trash_here(&panel.dir);
-        let refused = self
-            .ops
-            .open_delete(panel, self.label.as_deref(), asked, trash_here);
-        self.status = refused.unwrap_or_default();
+        if self.label.is_some() || asked == ops::Removal::Permanent {
+            let refused = self
+                .ops
+                .open_delete(panel, self.label.as_deref(), asked, false);
+            self.status = refused.unwrap_or_default();
+            return;
+        }
+        let check = match self.ops.open_delete_checking(panel) {
+            Ok(check) => check,
+            Err(refused) => {
+                self.status = refused;
+                return;
+            }
+        };
+        self.status = Status::default();
+        let (tx, rx) = mpsc::channel();
+        let (trash_here, dir, waker) = (self.trash_check.clone(), panel.dir.clone(), ctx.clone());
+        let spawned = std::thread::Builder::new()
+            .name("sopen-trash-check".into())
+            .spawn(move || {
+                let _ = tx.send(trash_here(&dir));
+                waker.request_repaint();
+            });
+        match spawned {
+            Ok(_) => self.trash_wait = Some(TrashWait { check, rx }),
+            // No worker: no Trash is known, so the dialog says permanent before anything.
+            Err(_) => {
+                self.ops.trash_checked(check, false);
+            }
+        }
     }
 
-    /// Whether this machine has a Trash that takes entries of its folder `dir` (S6-A's check,
-    /// [`fileops::trash_here`]). Asked on the window's thread when F8 is pressed: a few `stat`s
-    /// of a folder the panel has just listed (macOS: Foundation's look-up of the Trash for it).
-    fn trash_here(&self, dir: &str) -> bool {
-        #[cfg(test)]
-        if let Some(answer) = self.trash_answer {
-            return answer;
-        }
-        matches!(
-            fileops::trash_here(&LocalFs::new(), dir),
-            fileops::Deletes::Trash
-        )
+    /// The Trash check's answer, once it came: the dialog it was opened for fills in; one that
+    /// closed meanwhile, or was replaced by a later F8, takes nothing from it.
+    fn poll_trash_check(&mut self) {
+        let Some(wait) = &self.trash_wait else {
+            return;
+        };
+        let here = match wait.rx.try_recv() {
+            Ok(here) => here,
+            Err(TryRecvError::Empty) => return,
+            // The check ended without an answer (it panicked): no Trash is known.
+            Err(TryRecvError::Disconnected) => false,
+        };
+        let check = wait.check;
+        self.trash_wait = None;
+        self.ops.trash_checked(check, here);
     }
 
     /// What a feature tells the browser (02 §7).
@@ -1310,8 +1361,8 @@ impl Browser {
         self.bar_next = None;
     }
 
-    /// Results from the workers: listings, a file ready (its viewer shows), an F4 launch; and
-    /// writes of viewers already gone.
+    /// Results from the workers: listings, a file ready (its viewer shows), F8's Trash check, an
+    /// F4 launch; and writes of viewers already gone.
     fn poll(&mut self, ctx: &egui::Context) {
         let mut at = 0;
         while at < self.listing.len() {
@@ -1329,6 +1380,7 @@ impl Browser {
             self.listed(ctx, listing, result);
         }
         self.poll_opening(ctx);
+        self.poll_trash_check();
         self.launches.retain(|rx| match rx.try_recv() {
             Ok(Ok(line)) => {
                 self.status = Status::info(line);
@@ -2676,6 +2728,8 @@ impl Browser {
             // A running operation counts only while it waits at its question — not while a
             // rename's field shows it pending.
             && (!self.ops.busy() || self.ops.waiting().is_some())
+            // The delete dialog is settled once it says where things go.
+            && !self.ops.checking_trash()
             && self.tree.as_ref().is_none_or(TreeSide::settled)
             && self.git.settled(
                 &self.panels[self.active].dir,
@@ -2743,6 +2797,7 @@ impl Window for Browser {
             || !self.launches.is_empty()
             || self.preview.busy()
             || self.ops.busy()
+            || self.trash_wait.is_some()
             || self.tree.as_ref().is_some_and(|t| !t.settled())
             || self.git.busy();
         if working {

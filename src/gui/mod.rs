@@ -2199,20 +2199,31 @@ mod tests {
         assert_eq!(fx.edited(), [format!("{}/main.rs", fx.root)]);
     }
 
-    /// 04 §6.1, K-R2: a click on a slot of the real browser's row is its key: View opens the
-    /// file, Exit leaves the viewer, Edit opens the editor; an empty slot is nothing.
+    /// 04 §6.1, K-R2: a click on a slot of the real browser's row is its key: MkDir (7, S6) asks
+    /// a new folder's name, View opens the file, Exit leaves the viewer, Edit opens the editor;
+    /// an empty slot — 7 in the text viewer, which has no Save As — is nothing.
     #[test]
     fn a_click_on_a_slot_is_its_key_in_a_real_window() {
         let mut fx = BrowserFx::new();
         fx.bar_on_main();
-        let (_, empty) = chrome::key_slot(0.0, 1000.0, 7);
-        fx.drv
-            .click(&mut fx.b, egui::Pos2::new(empty.center().x, 700.0 - 8.0));
+        let (_, seven) = chrome::key_slot(0.0, 1000.0, 7);
+        let at_seven = egui::Pos2::new(seven.center().x, 700.0 - 8.0);
+        let asks = format!("Make a folder in {}", fx.root);
+        fx.drv.click(&mut fx.b, at_seven);
         fx.settle();
+        assert!(fx.drv.find_text(&asks).is_some(), "the MkDir slot asked");
+        fx.drv
+            .key(&mut fx.b, egui::Key::Escape, egui::Modifiers::NONE);
+        fx.settle();
+        assert!(fx.drv.find_text(&asks).is_none(), "Esc closed it");
         assert!(!fx.viewer());
         fx.drv.click_text(&mut fx.b, "View   ");
         fx.settle();
         assert!(fx.viewer(), "the View slot opened main.rs");
+        fx.drv.click(&mut fx.b, at_seven);
+        fx.settle();
+        assert!(fx.viewer(), "an empty slot: still the viewer");
+        assert!(fx.drv.find_text(&asks).is_none(), "and no dialog");
         fx.drv.click_text(&mut fx.b, "Exit   ");
         fx.settle();
         assert!(!fx.viewer(), "the Exit slot left it");

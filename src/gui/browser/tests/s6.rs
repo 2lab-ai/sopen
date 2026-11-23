@@ -348,7 +348,7 @@ fn k_d1_f8_here_goes_to_the_trash_and_shift_f8_does_not() {
     assert_eq!(LocalFs::trashed_by_tests(&path(&fx, "main.rs")), None);
     assert_eq!(status(&fx), "deleted main.rs");
 
-    fx.b.trash_answer = Some(false);
+    fx.b.trash_check = Arc::new(|_: &str| false);
     fx.select("zeta.md");
     fx.key(Key::F8);
     assert!(in_error_colour(&fx, "permanent — no Trash here"));
@@ -559,4 +559,224 @@ fn a_played_rename_settles_the_window_once_it_has_ended() {
     assert!(Path::new(&format!("{}/prog.rs", fx.root)).exists());
     assert_eq!(fx.current(), "prog.rs");
     assert_eq!(status(&fx), "renamed main.rs → prog.rs");
+}
+
+// ---------------------------------------------------------------------------------------------
+// Review round 1: F8's Trash check on a worker, what the dialog deletes.
+
+/// A Trash check held until the test lets it go — at most 3 s, so one that held up the window's
+/// thread fails a test rather than hanging it — then answering `here`; the folders it was asked
+/// about, in order. Every check after the first `held` ones answers at once.
+struct HeldCheck {
+    go: std::sync::mpsc::Sender<()>,
+    asked: Arc<Mutex<Vec<String>>>,
+}
+
+fn held_check(fx: &mut Fx, held: usize, here: bool) -> HeldCheck {
+    let (go, wait) = std::sync::mpsc::channel::<()>();
+    let wait = Mutex::new(wait);
+    let asked = Arc::new(Mutex::new(Vec::new()));
+    let seen = asked.clone();
+    fx.b.trash_check = Arc::new(move |dir: &str| {
+        let n = {
+            let mut seen = seen.lock().unwrap();
+            seen.push(dir.to_string());
+            seen.len()
+        };
+        if n <= held {
+            let _ = wait
+                .lock()
+                .unwrap()
+                .recv_timeout(std::time::Duration::from_secs(3));
+            here
+        } else {
+            false
+        }
+    });
+    HeldCheck { go, asked }
+}
+
+/// F8 asks this machine's Trash on a worker (04 §5.5; review round 1): the dialog opens at once
+/// on the entry, saying `checking the Trash…`, while the check is held — the window keeps passing
+/// frames, it is not settled, and Enter deletes nothing. The answer fills the line in, and only
+/// then does Enter delete, to the Trash. The check was asked about the panel's folder.
+#[test]
+fn f8_checks_the_trash_on_a_worker_and_enter_waits_for_the_answer() {
+    let mut fx = fixture();
+    let check = held_check(&mut fx, 1, true);
+    fx.select("notes.txt");
+    let pressed = std::time::Instant::now();
+    fx.key(Key::F8);
+    let took = pressed.elapsed();
+    assert!(
+        took < std::time::Duration::from_secs(1),
+        "the window was held up by the check: {took:?}"
+    );
+    assert!(fx.drv.find_text("Delete notes.txt?").is_some());
+    assert!(fx.drv.find_text("checking the Trash…").is_some());
+    assert!(fx.drv.find_text("to the Trash").is_none());
+    fx.drv.idle(&mut fx.b, 5);
+    assert!(!fx.b.ready(), "not settled while it checks");
+    fx.key(Key::Enter);
+    fx.drv.idle(&mut fx.b, 2);
+    assert!(fx.b.ops.holds_keyboard(), "Enter: still asking");
+    assert!(!fx.b.ops.busy(), "Enter deleted nothing");
+    assert!(Path::new(&format!("{}/notes.txt", fx.root)).exists());
+    check.go.send(()).unwrap();
+    wait(&mut fx, |b| !b.ops.checking_trash());
+    assert!(fx.drv.find_text("to the Trash").is_some(), "filled in");
+    assert!(fx.drv.find_text("checking the Trash…").is_none());
+    fx.key(Key::Enter);
+    ended(&mut fx);
+    assert!(LocalFs::trashed_by_tests(&format!("{}/notes.txt", fx.root)).is_some());
+    assert_eq!(*check.asked.lock().unwrap(), [fx.root.clone()]);
+}
+
+/// Esc works while the check runs; an answer that comes after its dialog closed, or after a later
+/// F8 opened another, changes nothing: the later dialog keeps its own answer.
+#[test]
+fn esc_while_checking_and_a_late_answer_changes_nothing() {
+    let mut fx = fixture();
+    let check = held_check(&mut fx, 1, true);
+    fx.select("main.rs");
+    fx.key(Key::F8);
+    assert!(fx.drv.find_text("checking the Trash…").is_some());
+    fx.key(Key::Escape);
+    assert!(!fx.b.ops.holds_keyboard(), "Esc closed it while it checked");
+    fx.select("zeta.md");
+    fx.key(Key::F8);
+    wait(&mut fx, |b| !b.ops.checking_trash());
+    assert!(
+        in_error_colour(&fx, "permanent — no Trash here"),
+        "its own answer"
+    );
+    check.go.send(()).unwrap();
+    fx.drv.idle(&mut fx.b, 5);
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    fx.drv.idle(&mut fx.b, 5);
+    assert!(fx.drv.find_text("permanent — no Trash here").is_some());
+    assert!(
+        fx.drv.find_text("to the Trash").is_none(),
+        "the late answer"
+    );
+    assert!(fx.drv.find_text("Delete zeta.md?").is_some());
+    fx.key(Key::Escape);
+    for name in ["main.rs", "zeta.md"] {
+        assert!(Path::new(&format!("{}/{name}", fx.root)).exists(), "{name}");
+    }
+}
+
+/// The dialog deletes what it showed when F8 was pressed: the selection and the bar moving while
+/// it is open (and its Trash check is held) change nothing of its job.
+#[test]
+fn the_dialog_deletes_what_it_showed_whatever_moves_meanwhile() {
+    let mut fx = fixture();
+    let check = held_check(&mut fx, 1, true);
+    fx.select("main.rs");
+    fx.key(Key::F8);
+    assert!(fx.drv.find_text("Delete main.rs?").is_some());
+    let panel = &mut fx.b.panels[0];
+    panel.select_group("*.md", true);
+    panel.highlight = panel
+        .entries
+        .iter()
+        .position(|e| e.name == "notes.txt")
+        .unwrap();
+    check.go.send(()).unwrap();
+    wait(&mut fx, |b| !b.ops.checking_trash());
+    assert!(fx.drv.find_text("Delete main.rs?").is_some(), "unchanged");
+    fx.key(Key::Enter);
+    ended(&mut fx);
+    assert!(LocalFs::trashed_by_tests(&format!("{}/main.rs", fx.root)).is_some());
+    for name in ["notes.txt", "zeta.md"] {
+        assert!(Path::new(&format!("{}/{name}", fx.root)).exists(), "{name}");
+    }
+}
+
+/// F8 in the right panel, listing another folder, deletes that panel's entry — and asks the Trash
+/// about that panel's folder.
+#[test]
+fn f8_in_the_right_panel_deletes_the_right_panels_entry() {
+    let mut fx = fixture();
+    fx.b.mode = view::Mode::Dual;
+    let asked = Arc::new(Mutex::new(Vec::<String>::new()));
+    let seen = asked.clone();
+    fx.b.trash_check = Arc::new(move |dir: &str| {
+        seen.lock().unwrap().push(dir.to_string());
+        true
+    });
+    let alpha = other_into(&mut fx, "alpha");
+    fx.key(Key::Tab);
+    assert_eq!(fx.b.active, 1);
+    fx.select("inner.txt");
+    fx.key(Key::F8);
+    wait(&mut fx, |b| !b.ops.checking_trash());
+    assert!(fx.drv.find_text("Delete inner.txt?").is_some());
+    fx.key(Key::Enter);
+    ended(&mut fx);
+    assert!(LocalFs::trashed_by_tests(&format!("{alpha}/inner.txt")).is_some());
+    assert_eq!(*asked.lock().unwrap(), [alpha]);
+    for name in ["main.rs", "notes.txt", "zeta.md"] {
+        assert!(Path::new(&format!("{}/{name}", fx.root)).exists(), "{name}");
+    }
+}
+
+/// The bar on `..`: with nothing selected F8 opens no dialog and says why; with a selection it
+/// deletes the selection only — never `..`, nor anything not selected.
+#[test]
+fn f8_on_dot_dot_deletes_only_what_is_selected() {
+    let mut fx = fixture();
+    let before = std::fs::read_dir(&fx.root).unwrap().count();
+    fx.key(Key::Home);
+    assert_eq!(fx.current(), "..");
+    fx.key(Key::F8);
+    assert!(!fx.b.ops.holds_keyboard(), "no dialog");
+    let said = fx.b.status_line();
+    assert!(said.error && said.text.contains(".."), "{}", said.text);
+    assert_eq!(std::fs::read_dir(&fx.root).unwrap().count(), before);
+
+    fx.select("zeta.md");
+    fx.key(Key::Space);
+    fx.key(Key::Home);
+    assert_eq!(fx.current(), "..");
+    fx.key(Key::F8);
+    wait(&mut fx, |b| !b.ops.checking_trash());
+    assert!(fx.drv.find_text("Delete zeta.md?").is_some());
+    fx.key(Key::Enter);
+    ended(&mut fx);
+    assert!(!Path::new(&format!("{}/zeta.md", fx.root)).exists());
+    assert_eq!(std::fs::read_dir(&fx.root).unwrap().count(), before - 1);
+    let parent = Path::new(&fx.root).parent().unwrap();
+    assert!(parent.join("root").is_dir(), "the folder itself is there");
+}
+
+/// The Trash refuses the item after the owner said yes: it fails with the reason, the file is
+/// where it was, and it is never deleted permanently instead. (The tests' stand-in Trash names
+/// an entry `<16 hex>-<name>`, so a 250-byte name is too long for it — the system Trash shortens
+/// names, the stand-in does not; a permanent delete of the name would work.)
+#[test]
+fn a_trash_that_refuses_after_yes_leaves_the_file_and_is_never_permanent() {
+    let mut fx = fixture();
+    let name = format!("l{}.txt", "o".repeat(245));
+    assert_eq!(name.len(), 250);
+    let path = format!("{}/{name}", fx.root);
+    std::fs::write(&path, "kept\n").unwrap();
+    relist(&mut fx);
+    fx.select(&name);
+    fx.key(Key::F8);
+    wait(&mut fx, |b| !b.ops.checking_trash());
+    assert!(fx.drv.find_text("to the Trash").is_some());
+    fx.key(Key::Enter);
+    ended(&mut fx);
+    assert!(fx.b.ops.holds_keyboard(), "the report is up");
+    assert!(fx
+        .drv
+        .find_text(&format!("Delete from {} to the Trash: 1 failed", fx.root))
+        .is_some());
+    let failed = fx.drv.text_starting_with("failed").expect("its line");
+    assert!(failed.contains(&name), "{failed}");
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "kept\n", "intact");
+    assert_eq!(LocalFs::trashed_by_tests(&path), None);
+    fx.key(Key::Enter);
+    assert!(fx.names(0).contains(&name), "still listed");
 }
