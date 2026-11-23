@@ -571,8 +571,11 @@ for an IPv6 address) — a connection of its own, because a `-R` asked through t
 master and would outlive sopen; no terminal; and this side's input, a pipe sopen holds and never writes. The explicit
 loopback bind address keeps the port on HOST's loopback under sshd's `GatewayPorts no` and `clientspecified`; `yes`
 binds every interface whatever is asked, so HOST's sopen, before it opens the browser, reads what listens on P
-(`/proc/net/tcp{,6}` on Linux, `netstat -anv -p tcp` on macOS; `SOPEN_LISTENERS` in tests) and refuses — exit 1, the
-browser not opened, the tunnel torn down — when anything there is not loopback, or when it cannot read the table. P is
+(`/proc/net/tcp{,6}` on Linux, `netstat -anv -p tcp` on macOS — both list every user's sockets, sshd's included;
+`SOPEN_LISTENERS` in tests) and opens only on positive evidence: at least one listener on P, every one on `127.0.0.1`,
+`::1` or `::ffff:127.0.0.1`. Anything else refuses — exit 1, the browser not opened, the tunnel torn down: a listener
+elsewhere, no listener seen (`cannot confirm the tunnel is private on <HOST> (no listener seen on port P)`), a table
+it cannot read. P is
 the address's port first, so its origin is unchanged. When ssh reports that remote port not forwarded (`remote port
 forwarding failed for listen port P`, exit 255 — the same for a port that is taken, a port below 1024 for a user, and a
 server that refuses forwarding) sopen says `port P could not be forwarded on HOST (taken there, or forwarding refused)
