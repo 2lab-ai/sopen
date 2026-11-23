@@ -13,6 +13,7 @@
 use super::LocalFs;
 use crate::remote::ops::{
     taken, FileMeta, FileOps, Ident, NoRename, Opened, Pin, Publish, Renamed, StageFailure, Staged,
+    TreeEnd, TreeWatch, NOT_UTF8,
 };
 use crate::remote::{join, random_hex, split_parent, Cancelled, Created, Hashing};
 use anyhow::{anyhow, Context, Result};
@@ -188,8 +189,8 @@ fn meta_of(m: &fs::Metadata) -> FileMeta {
     }
 }
 
-/// `rename(2)` that fails with `EEXIST` instead of replacing.
-fn rename_excl(from: &CString, to: &CString) -> std::io::Result<()> {
+/// `rename(2)` that fails with `EEXIST` instead of replacing (the Trash's move too).
+pub(super) fn rename_excl(from: &CString, to: &CString) -> std::io::Result<()> {
     #[cfg(target_os = "macos")]
     // SAFETY: two NUL-terminated paths.
     let r = unsafe { libc::renamex_np(from.as_ptr(), to.as_ptr(), libc::RENAME_EXCL) };
@@ -431,6 +432,199 @@ fn kernel_copy(
         progress(done);
     }
     Ok(true)
+}
+
+/// Opens the folder `name` of the open folder `parent` itself — never what a link put there
+/// points at (`O_NOFOLLOW`).
+fn open_dir_at(parent: &fs::File, name: &CStr) -> std::io::Result<fs::File> {
+    use std::os::fd::FromRawFd;
+    // SAFETY: an open descriptor and a NUL-terminated name.
+    let fd = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: a descriptor just opened, owned by nothing else.
+    Ok(unsafe { fs::File::from_raw_fd(fd) })
+}
+
+/// Sets `errno` to 0, so a `readdir` that returns nothing can be told from one that failed.
+fn clear_errno() {
+    // SAFETY: the calling thread's own errno.
+    #[cfg(target_os = "macos")]
+    unsafe {
+        *libc::__error() = 0
+    };
+    // SAFETY: the calling thread's own errno.
+    #[cfg(target_os = "linux")]
+    unsafe {
+        *libc::__errno_location() = 0
+    };
+}
+
+/// The names in the open folder `dir` (`.` and `..` left out), read through a descriptor of its
+/// own.
+fn names_at(dir: &fs::File) -> std::io::Result<Vec<Vec<u8>>> {
+    // SAFETY: an open descriptor; the copy is given to fdopendir, closed by closedir.
+    let fd = unsafe { libc::dup(dir.as_raw_fd()) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: a descriptor of our own on a folder.
+    let stream = unsafe { libc::fdopendir(fd) };
+    if stream.is_null() {
+        let e = std::io::Error::last_os_error();
+        // SAFETY: the copy fdopendir did not take.
+        unsafe { libc::close(fd) };
+        return Err(e);
+    }
+    let mut names = Vec::new();
+    let failed = loop {
+        clear_errno();
+        // SAFETY: an open directory stream.
+        let entry = unsafe { libc::readdir(stream) };
+        if entry.is_null() {
+            let e = std::io::Error::last_os_error();
+            break (e.raw_os_error() != Some(0)).then_some(e);
+        }
+        // SAFETY: readdir's entry holds a NUL-terminated name, valid until the next call.
+        let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes();
+        if name != b"." && name != b".." {
+            names.push(name.to_vec());
+        }
+    };
+    // SAFETY: the stream opened above, closed once.
+    unsafe { libc::closedir(stream) };
+    match failed {
+        Some(e) => Err(e),
+        None => Ok(names),
+    }
+}
+
+/// [`FileOps::remove_tree`] on this machine, through open folder descriptors as `rm` and `fts`
+/// do: each folder opened from the one holding it (`openat`, `O_NOFOLLOW`) and only while it is
+/// the folder that was looked at (its device and inode), each entry looked at
+/// (`fstatat(…, AT_SYMLINK_NOFOLLOW)`) and removed (`unlinkat`) relative to its folder's
+/// descriptor. Nothing is resolved again from the top, so a folder swapped for a link or for
+/// another folder meanwhile is never gone through: it stays, and so does what holds it.
+/// `shown` is the folder's path, for the report and the tests' seam only.
+fn remove_at(
+    parent: &fs::File,
+    name: &CStr,
+    own: At,
+    shown: &str,
+    rel: &str,
+    watch: &mut dyn TreeWatch,
+) -> TreeEnd {
+    let dir = match open_dir_at(parent, name) {
+        Ok(dir) => dir,
+        Err(e) if is_errno(&e, &[libc::ELOOP, libc::ENOTDIR]) => {
+            return TreeEnd::Kept(
+                "it is not the folder that was looked at any more (a link or a file has its \
+                 name now); nothing is removed through it"
+                    .to_string(),
+            )
+        }
+        Err(e) => return TreeEnd::Kept(e.to_string()),
+    };
+    match dir.metadata() {
+        Ok(m) if (m.dev(), m.ino()) == (own.dev, own.ino) => {}
+        Ok(_) => {
+            return TreeEnd::Kept(
+                "it is not the folder that was looked at any more (another folder has its name \
+                 now); nothing in it was removed"
+                    .to_string(),
+            )
+        }
+        Err(e) => return TreeEnd::Kept(e.to_string()),
+    }
+    let names = match names_at(&dir) {
+        Ok(names) => names,
+        Err(e) => return TreeEnd::Kept(format!("cannot list {shown}: {e}")),
+    };
+    let mut stays = 0usize;
+    for raw in names {
+        let lossy = String::from_utf8_lossy(&raw).into_owned();
+        let child_rel = match rel {
+            "" => lossy.clone(),
+            _ => format!("{rel}/{lossy}"),
+        };
+        watch.at(&child_rel);
+        if watch.stopped() {
+            return TreeEnd::Stopped;
+        }
+        if std::str::from_utf8(&raw).is_err() {
+            watch.kept(&child_rel, NOT_UTF8.to_string());
+            stays += 1;
+            continue;
+        }
+        let child = CString::new(raw).expect("readdir gives no NUL byte");
+        let child_shown = join(shown, &lossy);
+        let looked = stat_at(&dir, &child);
+        #[cfg(test)]
+        crate::remote::ops::fire_tree_looked(&child_shown);
+        if watch.stopped() {
+            return TreeEnd::Stopped;
+        }
+        let looked = match looked {
+            Ok(looked) => looked,
+            // Gone meanwhile: nothing to remove.
+            Err(e) if e.kind() == ErrorKind::NotFound => continue,
+            Err(e) => {
+                watch.kept(&child_rel, e.to_string());
+                stays += 1;
+                continue;
+            }
+        };
+        if looked.dir {
+            match remove_at(&dir, &child, looked, &child_shown, &child_rel, watch) {
+                TreeEnd::Removed => watch.removed(&child_rel),
+                TreeEnd::Stopped => return TreeEnd::Stopped,
+                TreeEnd::Kept(why) => {
+                    watch.kept(&child_rel, why);
+                    stays += 1;
+                }
+            }
+            continue;
+        }
+        // A file, a link (as a link) or a special file: its name in this folder goes.
+        // SAFETY: an open descriptor and a NUL-terminated name; flags 0 never removes a folder.
+        let unlinked = zero_ok(unsafe { libc::unlinkat(dir.as_raw_fd(), child.as_ptr(), 0) });
+        match unlinked {
+            Ok(()) => watch.removed(&child_rel),
+            Err(e) if e.kind() == ErrorKind::NotFound => {}
+            Err(e) => {
+                watch.kept(&child_rel, e.to_string());
+                stays += 1;
+            }
+        }
+    }
+    if stays > 0 {
+        return TreeEnd::Kept(format!("{stays} of the entries in it stay"));
+    }
+    // Removed from the folder that holds it, only while its name there is still this folder.
+    match stat_at(parent, name) {
+        Ok(now) if now.dir && (now.dev, now.ino) == (own.dev, own.ino) => {}
+        _ => {
+            return TreeEnd::Kept(
+                "it is not the folder that was emptied any more; it was left".to_string(),
+            )
+        }
+    }
+    if watch.stopped() {
+        return TreeEnd::Stopped;
+    }
+    // SAFETY: an open descriptor and a NUL-terminated name.
+    match zero_ok(unsafe { libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR) })
+    {
+        Ok(()) => TreeEnd::Removed,
+        Err(e) => TreeEnd::Kept(e.to_string()),
+    }
 }
 
 impl FileOps for LocalFs {
@@ -800,6 +994,37 @@ impl FileOps for LocalFs {
             Err(e) if e.kind() == ErrorKind::AlreadyExists => Err(taken(path)),
             Err(e) => Err(e).with_context(|| format!("cannot make the folder {path}")),
         }
+    }
+
+    /// Through open folder descriptors ([`remove_at`]); the folder itself is looked at in the
+    /// folder that holds it.
+    fn remove_tree(&mut self, path: &str, watch: &mut dyn TreeWatch) -> TreeEnd {
+        let (parent, name) = match open_folder(path) {
+            Ok(opened) => opened,
+            Err(e) => return TreeEnd::Kept(format!("{e:#}")),
+        };
+        let own = stat_at(&parent, &name);
+        #[cfg(test)]
+        crate::remote::ops::fire_tree_looked(path);
+        match own {
+            Ok(own) if own.dir => remove_at(&parent, &name, own, path, "", watch),
+            Ok(_) => TreeEnd::Kept("it is no longer a folder; nothing of it was removed".into()),
+            Err(e) if e.kind() == ErrorKind::NotFound => TreeEnd::Removed,
+            Err(e) => TreeEnd::Kept(e.to_string()),
+        }
+    }
+
+    fn make_folder(&mut self, path: &str) -> Result<()> {
+        // `mkdir(path, 0777)`: the umask gives the mode, as the `mkdir` command's.
+        match fs::DirBuilder::new().create(path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == ErrorKind::AlreadyExists => Err(taken(path)),
+            Err(e) => Err(e).with_context(|| format!("cannot make the folder {path}")),
+        }
+    }
+
+    fn trash(&self) -> Option<&dyn crate::remote::ops::Trash> {
+        Some(super::trash::system())
     }
 
     fn remove_dir(&mut self, path: &str) -> Result<()> {

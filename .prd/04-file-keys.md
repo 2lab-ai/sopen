@@ -296,10 +296,41 @@ contexts where it acts (list, viewer, git panel, tree, a dialog) and its `Comman
   (loaded at runtime, nothing linked, as the save dialog's AppKit is: 01 §6a); Linux through the
   freedesktop Trash (the home's `Trash` for the home's filesystem, `$topdir/.Trash-$uid` for others,
   each with its `.trashinfo`). Where neither works the dialog says `permanent — no Trash here`
-  before anything is removed.
+  before anything is removed. The Linux Trash is written only through its own folders, each opened
+  from the one above with `O_NOFOLLOW` and checked as this account's, made private (0700) if group
+  or others could enter it; the `.trashinfo` is created and the item moved relative to those held
+  folders, never replacing (`renameat2` with `RENAME_NOREPLACE`; where the filesystem has no
+  exclusive rename, the freedesktop spec's own way — the exclusive `.trashinfo` reserves the name,
+  the name is checked free in the held `files` folder, then a plain `renameat`, which moves whatever
+  is at the source and deletes nothing). A top folder that its group or others can write without the sticky bit has no Trash
+  (another account could swap `.Trash-$uid`): the dialog says `permanent` and asks. A name longer
+  than 200 bytes gets a shorter name inside the Trash; `Path=` keeps the whole name.
 - **Shift+F8 / Shift+Del** delete locally without the Trash; the dialog says `permanent` in the
   error colour.
-- A link is removed as a link, never its target.
+- A link is removed as a link, never its target. Esc stops before the next request; a request
+  already sent completes.
+- **Locally the walk never leaves the selection**: it goes through open folder descriptors, as
+  `rm` and `fts` do — each folder opened from its parent with `O_DIRECTORY|O_NOFOLLOW` and only
+  while its device and inode are those just looked at, each entry looked at and removed relative
+  to it (`fstatat`, `unlinkat`). A folder swapped for a link, or for another folder, mid-delete is
+  left, named, with whatever is in it. **The accepted local residual:** a folder is removed by name
+  (`unlinkat(…, AT_REMOVEDIR)`; POSIX has no removal by descriptor, and `rm` has the same window), so
+  a folder swapped in between its last check and that call is removed instead — and only if it is
+  empty, since `rmdir` never removes a folder with anything in it. The most it can cost is an empty
+  folder.
+- **Remotely, the accepted residual.** SFTP has no request relative to a folder: every `REMOVE`,
+  `RMDIR` and listing names a path the server resolves again when it handles it. sopen takes the
+  selected folder's canonical path (`REALPATH`) before it looks at it, and right before each
+  request checks the entry with `LSTAT` and the folder the request goes through with `REALPATH`,
+  which must still resolve where the walk listed it; otherwise the entry is left and named. Two
+  things remain. (1) *One round trip*: between the reply to that check and the server's handling of
+  the request, another process can swap a folder on the path for a link to a folder elsewhere, and
+  the request then acts on the entry of the same name in the link's target. The window is inside
+  the server, and the client cannot close it. (2) *The check is the server's `REALPATH`*: it works
+  where `REALPATH` resolves links, as OpenSSH's does (`realpath(3)`; tested against OpenSSH's
+  `sftp-server` only); against a server whose `REALPATH` does not, the check passes without seeing
+  a swap. A folder swapped for another real folder under the same name resolves the same and is not
+  detected; its entries are removed, but they lie at the selected path.
 
 ### 5.6 Primitives
 
