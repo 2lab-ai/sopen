@@ -1140,6 +1140,25 @@ pub struct Outcome {
     pub backup: Option<String>,
 }
 
+impl Outcome {
+    /// The run's warning, for the result dialog and the status row in place of the plain undo
+    /// text: `backup <stamp> incomplete: …` when the steps were done but the group's `after`
+    /// record or its pruning trim could not be written (S3-A review round 1).
+    pub fn warning(&self) -> Option<String> {
+        self.steps
+            .iter()
+            .flat_map(|s| &s.ran)
+            .find_map(|d| match &d.ending {
+                super::runner::Ending::NotSent(why)
+                    if why.starts_with("backup ") && why.contains(" incomplete: ") =>
+                {
+                    Some(why.clone())
+                }
+                _ => None,
+            })
+    }
+}
+
 /// The in-progress banner (03 §8.5): the git panel's top row, in the warning colour, while git
 /// has an operation in progress, whoever started it — the probe's [`InProgress`] and the status
 /// read's conflicts, and the keys it offers.
@@ -1184,7 +1203,7 @@ impl Banner {
                             line.push_str(&format!(" {}/{}", n.trim(), end.trim()));
                         }
                         if let Some(sha) = r.stopped_sha.as_deref().map(str::trim) {
-                            let short = &sha[..sha.len().min(8)];
+                            let short = shown_id(sha);
                             line.push_str(&format!(" · stopped at {short}"));
                             if let Some(subject) = r.done_last.as_deref().and_then(done_subject) {
                                 line.push(' ');
@@ -1245,8 +1264,20 @@ impl Banner {
             return None;
         }
         let sha = r.stopped_sha.as_deref().map(str::trim).or(words.next())?;
-        Some(&sha[..sha.len().min(8)])
+        Some(shown_id(sha))
     }
+}
+
+/// A commit id from the probe as the banner shows it: 8 digits when it is hex, as git writes
+/// it; anything else (the files are the repository's, not git's promise) its first 8
+/// characters, never cut inside one.
+fn shown_id(id: &str) -> &str {
+    let id = id.split_whitespace().next().unwrap_or("");
+    if id.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return &id[..id.len().min(8)];
+    }
+    let end = id.char_indices().nth(8).map_or(id.len(), |(i, _)| i);
+    &id[..end]
 }
 
 /// The subject of a `done` line: `pick <c> # <subject>` (or without `# `, older git).
@@ -1952,14 +1983,13 @@ fn prune_takes(
         if !remotes.contains(&remote) || spec.starts_with('^') {
             continue;
         }
-        let spec = spec.trim_start_matches('+');
-        let Some((_, dst)) = spec.split_once(':') else {
+        let Some((_, dst)) = spec.trim_start_matches('+').split_once(':') else {
             continue;
         };
-        if dst.starts_with("refs/heads/") {
+        if !(dst.starts_with("refs/remotes/") || dst.starts_with("refs/tags/")) {
             return refused(format!(
-                "{remote} fetches into refs/heads/ (a mirror: `{spec}`), so pruning it would \
-                 delete local branches; it is refused"
+                "{remote} fetches into {dst} (`{spec}`), outside refs/remotes/ and refs/tags/, so \
+                 pruning it could delete local branches or sopen's backups; it is refused"
             ));
         }
         patterns.push(dst.to_string());
@@ -2125,7 +2155,60 @@ fn user_keys(reads: &Reads, scope: ConfigScope) -> Vec<String> {
 
 // --- the actions ---------------------------------------------------------------------------
 
+/// Refuses a remote name or URL that starts with `-`: git would read it as an option
+/// (`--upload-pack=<command>` runs the command; review round 1).
+pub fn plain_word(word: &str) -> Result<(), String> {
+    if word.starts_with('-') {
+        Err(format!(
+            "`{}` starts with '-': not a URL sopen will pass to git",
+            super::runner::mask_credentials(word)
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+/// The remote names and URLs `action` passes to git, each checked by [`plain_word`].
+fn plain_words(action: &Action) -> Result<(), Refused> {
+    let mut words: Vec<&str> = Vec::new();
+    match action {
+        Action::Tag { push: Some(r), .. }
+        | Action::DeleteTag {
+            remote: Some(r), ..
+        } => words.push(r),
+        Action::DeleteBranch { remotes, .. }
+        | Action::Push { remotes, .. }
+        | Action::PushTag { remotes, .. } => words.extend(remotes.iter().map(String::as_str)),
+        Action::CheckoutRemote { remote, .. }
+        | Action::DeleteRemoteBranch { remote, .. }
+        | Action::FetchInto { remote, .. }
+        | Action::Pull { remote, .. }
+        | Action::FetchRemote { remote, .. }
+        | Action::PruneRemote { remote }
+        | Action::DeleteRemote { remote } => words.push(remote),
+        Action::AddRemote {
+            name,
+            url,
+            push_url,
+            ..
+        } => {
+            words.extend([name.as_str(), url.as_str()]);
+            words.extend(push_url.as_deref());
+        }
+        Action::EditRemote { was, now } => {
+            words.extend([was.name.as_str(), now.name.as_str(), now.url.as_str()]);
+            words.extend(now.push_url.as_deref());
+        }
+        _ => {}
+    }
+    for w in words {
+        plain_word(w).map_err(Refused)?;
+    }
+    Ok(())
+}
+
 fn draft(action: &Action, repo: &Repo, reads: &Reads) -> Result<Plan, Refused> {
+    plain_words(action)?;
     let head = head_shown(repo);
     let d = match action {
         Action::Tag {
@@ -2158,7 +2241,7 @@ fn draft(action: &Action, repo: &Repo, reads: &Reads) -> Result<Plan, Refused> {
             }
             let cmd = match message {
                 Some(m) => {
-                    args.extend(["-a", "-F", "-", name, at.as_str()]);
+                    args.extend(["-a", "--cleanup=verbatim", "-F", "-", name, at.as_str()]);
                     d.command(Class::Write, args).feed("message", m.as_bytes())
                 }
                 None => {
@@ -2392,6 +2475,11 @@ fn draft(action: &Action, repo: &Repo, reads: &Reads) -> Result<Plan, Refused> {
             }
             if options.autostash {
                 args.push("--autostash");
+            }
+            if !options.update_refs && repo.version.at_least(2, 38) {
+                // `rebase.updateRefs=true` in the config would move branches the plan has no
+                // backup of (review round 1).
+                args.push("--no-update-refs");
             }
             if options.update_refs {
                 if !repo.version.at_least(2, 38) {
@@ -2760,7 +2848,16 @@ fn draft(action: &Action, repo: &Repo, reads: &Reads) -> Result<Plan, Refused> {
                 Some(m) => d
                     .command(
                         Class::Write,
-                        ["tag", "-f", "-a", "-F", "-", tag, to.as_str()],
+                        [
+                            "tag",
+                            "-f",
+                            "-a",
+                            "--cleanup=verbatim",
+                            "-F",
+                            "-",
+                            tag,
+                            to.as_str(),
+                        ],
                     )
                     .feed("message", m.as_bytes()),
                 None => d.command(Class::Write, ["tag", "-f", tag, to.as_str()]),
@@ -3295,7 +3392,13 @@ fn pull_steps(
                 "FETCH_HEAD",
             ]);
         }
-        PullHow::Rebase => d.write(["rebase", "FETCH_HEAD"]),
+        PullHow::Rebase => {
+            if d.repo.version.at_least(2, 38) {
+                d.write(["rebase", "--no-update-refs", "FETCH_HEAD"]);
+            } else {
+                d.write(["rebase", "FETCH_HEAD"]);
+            }
+        }
     }
     Ok(())
 }
@@ -3472,6 +3575,7 @@ fn restore_draft<'a>(
                     d.command(Class::Write, ["reset", "--hard", "HEAD"]),
                 ));
                 if let (Value::Object(_), Some(b)) = (&e.before, &backup_oid) {
+                    refuse_in_the_way_of_apply(&d, reads, b)?;
                     later.push(Step::Git(
                         d.command(Class::Write, ["stash", "apply", "--index", b.as_str()]),
                     ));
@@ -3540,6 +3644,44 @@ fn restore_draft<'a>(
     }
     d.steps = steps;
     Ok(d)
+}
+
+/// 03 §8.6 for the work tree's restore (review round 1): `stash apply --index <backup>` writes
+/// the paths the backup changes (its work tree and its index against its base), and overwrites
+/// an ignored file there with no flag to stop it; any untracked or ignored entry there that the
+/// reset before it does not back up and remove refuses the restore, naming it.
+fn refuse_in_the_way_of_apply(d: &Draft, reads: &Reads, backup_oid: &Oid) -> Result<(), Refused> {
+    let b = backup_oid.as_str();
+    let mut writes = diff_paths(reads, &format!("{b}^1"), b);
+    writes.extend(diff_paths(reads, &format!("{b}^1"), &format!("{b}^2")));
+    let footprint: BTreeSet<String> = writes.into_iter().collect();
+    let taken: Vec<&String> = d
+        .takes
+        .iter()
+        .filter_map(|t| match &t.from {
+            Source::Files(paths) => Some(paths),
+            _ => None,
+        })
+        .flatten()
+        .collect();
+    let hits: Vec<String> = others(reads)
+        .into_iter()
+        .filter(|e| collides(e, &footprint))
+        .filter(|e| {
+            let at = e.trim_end_matches('/');
+            !taken
+                .iter()
+                .any(|t| t.as_str() == at || t.starts_with(&format!("{at}/")))
+        })
+        .collect();
+    if hits.is_empty() {
+        return Ok(());
+    }
+    refused(format!(
+        "restoring the tracked changes would write over untracked or ignored files: {}. Move \
+         them away first.",
+        few(&hits)
+    ))
 }
 
 /// Puts HEAD — the checked-out branch, or a detached HEAD — back to `backup` (03 §8.3), after
@@ -3783,6 +3925,31 @@ fn check_stashes(
         return Ok(Vec::new());
     };
     let mut ran = Vec::new();
+    let mut selectors: Vec<String> = plan
+        .steps
+        .iter()
+        .filter_map(|s| match s {
+            Step::Git(cmd) => Some(cmd.args()),
+            _ => None,
+        })
+        .flatten()
+        .filter_map(|w| w.to_str().filter(|w| is_selector(w)).map(str::to_string))
+        .collect();
+    selectors.sort();
+    selectors.dedup();
+    if selectors.len() > 1 {
+        let line = format!("rev-parse {}", selectors.join(" "));
+        ran.push(backup::refusal(
+            runner,
+            top,
+            &line,
+            &format!(
+                "a plan acts on one stash entry; this one names {}",
+                selectors.join(", ")
+            ),
+        ));
+        return Err(ran);
+    }
     for step in &plan.steps {
         let Step::Git(cmd) = step else { continue };
         for word in cmd.args() {
@@ -3819,6 +3986,86 @@ fn check_stashes(
         }
     }
     Ok(ran)
+}
+
+/// 03 §8.6 for a pull's rebase, again at Run (review round 1): its first check ran against the
+/// remote branch as last fetched; once the fetch has brought `FETCH_HEAD`, the paths the rebase
+/// writes are listed again — the diff from HEAD to `FETCH_HEAD` and every path the replayed
+/// commits change — against the ignored files, and any collision stops it before it runs.
+fn recheck_fetched(top: &str, runner: &GitRunner, handle: &Handle) -> (bool, Vec<Done>) {
+    let mut ran = Vec::new();
+    let mut read = |args: &[&str]| -> Option<Vec<String>> {
+        let done = runner.run(
+            &GitCommand::new(Class::Read, top, args.iter().copied()),
+            handle,
+        );
+        let out = done.ok().then(|| backup::records(&done.stdout));
+        ran.push(done);
+        out
+    };
+    let ignored = read(&[
+        "ls-files",
+        "-z",
+        "--others",
+        "--ignored",
+        "--exclude-standard",
+        "--directory",
+    ]);
+    let diff = read(&[
+        "diff-tree",
+        "-r",
+        "-z",
+        "--name-only",
+        "--no-renames",
+        "HEAD",
+        "FETCH_HEAD",
+    ]);
+    let replayed = read(&[
+        "log",
+        "-z",
+        "--name-only",
+        "--format=",
+        "--no-renames",
+        "FETCH_HEAD..HEAD",
+    ]);
+    let (Some(ignored), Some(diff), Some(replayed)) = (ignored, diff, replayed) else {
+        return (false, ran);
+    };
+    let footprint: BTreeSet<String> = diff.into_iter().chain(replayed).collect();
+    let hits: Vec<String> = ignored
+        .into_iter()
+        .filter(|e| collides(e, &footprint))
+        .collect();
+    if hits.is_empty() {
+        return (true, ran);
+    }
+    ran.push(backup::refusal(
+        runner,
+        top,
+        "git rebase FETCH_HEAD",
+        &format!(
+            "the fetch brought paths where ignored files are: {}; nothing was rebased (the \
+             fetch stays). Move them away, or use Reset hard, which backs them up.",
+            few(&hits)
+        ),
+    ));
+    (false, ran)
+}
+
+/// A `rebase … FETCH_HEAD` step (a pull's second step).
+fn rebases_fetched(cmd: &GitCommand) -> bool {
+    let args = cmd.args();
+    args.first().is_some_and(|a| a == "rebase") && args.last().is_some_and(|a| a == "FETCH_HEAD")
+}
+
+/// How the pruning trim ended.
+enum Trimmed {
+    /// The group stays (with or without refs taken out of it).
+    Kept,
+    /// Nothing was pruned: the group went whole.
+    Gone,
+    /// The trim could not be read or written: the group holds more than was pruned.
+    Failed(String),
 }
 
 /// The archive step: `command`'s stdout streamed into 01 §6a's staged file and published at
@@ -3887,7 +4134,7 @@ fn archive(
 
 /// §8.2 "Pruning": after a pruning command, the backups of refs it did not delete (still at
 /// the same value) are taken out of the group in one transaction; when nothing was pruned the
-/// group goes whole. `true`: the group is gone.
+/// group goes whole.
 fn trim(
     plan: &Plan,
     record: &backup::Record,
@@ -3895,7 +4142,7 @@ fn trim(
     runner: &GitRunner,
     handle: &Handle,
     ran: &mut Vec<Done>,
-) -> bool {
+) -> Trimmed {
     let candidates: Vec<(&BackupKind, &str, &Oid)> = plan
         .backups
         .iter()
@@ -3909,7 +4156,7 @@ fn trim(
         })
         .collect();
     if candidates.is_empty() {
-        return false;
+        return Trimmed::Kept;
     }
     let read = GitCommand::new(
         Class::Read,
@@ -3932,7 +4179,10 @@ fn trim(
         .collect();
     ran.push(done);
     if !ok {
-        return false;
+        return Trimmed::Failed(
+            "the refs the prune left could not be read, so the group holds more than was pruned"
+                .into(),
+        );
     }
     let mut lines = Vec::new();
     let mut kept = 0;
@@ -3956,7 +4206,7 @@ fn trim(
         }
     }
     if lines.is_empty() {
-        return false;
+        return Trimmed::Kept;
     }
     let mut input = lines.join("\n");
     input.push('\n');
@@ -3965,7 +4215,13 @@ fn trim(
     let done = runner.run(&cmd, handle);
     let ok = done.ok();
     ran.push(done);
-    whole && ok
+    match (ok, whole) {
+        (true, true) => Trimmed::Gone,
+        (true, false) => Trimmed::Kept,
+        (false, _) => Trimmed::Failed(
+            "the refs the prune did not delete could not be taken out of the group".into(),
+        ),
+    }
 }
 
 /// The mode of the `reset` that moves HEAD in `plan` (a `reset --<mode> <commit>` step; `reset
@@ -4045,6 +4301,17 @@ pub fn execute(plan: &Plan, top: &str, runner: &GitRunner, handle: &Handle) -> O
                     }
                 }
             }
+            Step::Git(cmd) if rebases_fetched(cmd) => {
+                let (clear, mut ran) = recheck_fetched(top, runner, handle);
+                if clear {
+                    let done = runner.run(cmd, handle);
+                    let ok = done.ok();
+                    ran.push(done);
+                    (ok, ran)
+                } else {
+                    (false, ran)
+                }
+            }
             Step::Git(cmd) => {
                 let done = runner.run(cmd, handle);
                 (done.ok(), vec![done])
@@ -4092,11 +4359,29 @@ pub fn execute(plan: &Plan, top: &str, runner: &GitRunner, handle: &Handle) -> O
     let mut stamp = record.as_ref().map(|r| r.group.stamp.clone());
     if let Some(r) = &record {
         let mut extra = Vec::new();
-        if !failed && trim(plan, r, top, runner, handle, &mut extra) {
-            stamp = None;
+        let mut incomplete: Vec<String> = Vec::new();
+        if !failed {
+            match trim(plan, r, top, runner, handle, &mut extra) {
+                Trimmed::Gone => stamp = None,
+                Trimmed::Kept => {}
+                Trimmed::Failed(why) => incomplete.push(why),
+            }
         }
-        if stamp.is_some() {
-            extra.extend(backup::seal(runner, handle, top, r));
+        if let Some(st) = &stamp {
+            let (sealed, ran) = backup::seal(runner, handle, top, r);
+            extra.extend(ran);
+            if let Err(why) = sealed {
+                incomplete.push(format!("its after record was not written ({why})"));
+            }
+            if !incomplete.is_empty() {
+                let reason = format!("backup {st} incomplete: {}", incomplete.join("; "));
+                extra.push(backup::refusal(
+                    runner,
+                    top,
+                    &format!("backup {st}"),
+                    &reason,
+                ));
+            }
         }
         if let Some(last) = steps
             .iter_mut()

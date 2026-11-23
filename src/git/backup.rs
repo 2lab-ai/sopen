@@ -181,7 +181,7 @@ impl Manifest {
     /// restore reads it).
     pub fn parse(message: &str) -> Option<Manifest> {
         let (_, body) = message.split_once("\n\n")?;
-        let mut rows = body.lines();
+        let mut rows = body.split('\n');
         if rows.next()? != MANIFEST_MARK {
             return None;
         }
@@ -243,7 +243,9 @@ fn parse_value(word: &str) -> Option<Value> {
 
 /// A path as a manifest line keeps it: `\` → `\\`, newline → `\n`.
 fn escape(path: &str) -> String {
-    path.replace('\\', "\\\\").replace('\n', "\\n")
+    path.replace('\\', "\\\\")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
 }
 
 fn unescape(text: &str) -> Option<String> {
@@ -257,6 +259,7 @@ fn unescape(text: &str) -> Option<String> {
         match chars.next()? {
             '\\' => out.push('\\'),
             'n' => out.push('\n'),
+            'r' => out.push('\r'),
             _ => return None,
         }
     }
@@ -885,6 +888,9 @@ fn remote_value(
     if urls.is_empty() {
         return Err(format!("{remote} has no push URL"));
     }
+    for url in &urls {
+        super::actions::plain_word(url)?;
+    }
     let short = refname.strip_prefix("refs/").unwrap_or(refname);
     let mut values = Vec::new();
     for url in urls {
@@ -1377,11 +1383,17 @@ fn messages(s: &mut Session, commits: &[Oid]) -> Result<BTreeMap<Oid, String>, S
 /// Writes the group's `after` record (see the module's notes): the values now of its ref, HEAD
 /// and stash lines, as manifest lines under `sopen-after`, in a commit of the empty tree whose
 /// parent is the manifest, created at `refs/sopen-backup/<stamp>/after`. Run by the executor
-/// once the plan's steps have ended; a failure only leaves `moved since` unknown.
-pub fn seal(runner: &GitRunner, handle: &Handle, top: &str, record: &Record) -> Vec<Done> {
+/// once the plan's steps have ended; a failure leaves `moved since` unknown — [`entries`] then
+/// counts every changed line as moved — and the executor says so in the outcome's warning.
+pub fn seal(
+    runner: &GitRunner,
+    handle: &Handle,
+    top: &str,
+    record: &Record,
+) -> (Result<(), String>, Vec<Done>) {
     let mut s = Session::new(runner, handle, top);
-    let _ = seal_in(&mut s, record);
-    s.ran
+    let result = seal_in(&mut s, record);
+    (result, s.ran)
 }
 
 fn seal_in(s: &mut Session, record: &Record) -> Result<(), String> {
@@ -1490,7 +1502,7 @@ fn after(s: &mut Session, stamp: &str) -> Result<Option<Manifest>, String> {
     let found = messages(s, std::slice::from_ref(&oid))?;
     Ok(found.get(&oid).and_then(|m| {
         let (_, body) = m.split_once("\n\n")?;
-        let mut rows = body.lines();
+        let mut rows = body.split('\n');
         if rows.next()? != AFTER_MARK {
             return None;
         }
@@ -1620,18 +1632,27 @@ fn entries_in(s: &mut Session, record: &Record, head: &Head) -> Result<Vec<Resto
                     .read(["remote", "get-url", "--push", remote.as_str()])
                     .map(|out| text(&out).trim().to_string())
                     .unwrap_or_else(|_| remote.clone());
-                match s.run(
-                    GitCommand::new(Class::Network, s.top, ["ls-remote", url.as_str(), refname]),
-                    &[],
-                ) {
-                    Ok(out) => text(&out)
-                        .lines()
-                        .find_map(|l| {
-                            let (oid, name) = l.split_once('\t')?;
-                            (name == refname).then(|| Oid::parse(oid)).flatten()
-                        })
-                        .map_or(Value::Absent, Value::Object),
-                    Err(_) => Value::Occupied,
+                if super::actions::plain_word(&url).is_err() {
+                    // Never passed to git (review round 1): its value now is unknown.
+                    Value::Occupied
+                } else {
+                    match s.run(
+                        GitCommand::new(
+                            Class::Network,
+                            s.top,
+                            ["ls-remote", url.as_str(), refname],
+                        ),
+                        &[],
+                    ) {
+                        Ok(out) => text(&out)
+                            .lines()
+                            .find_map(|l| {
+                                let (oid, name) = l.split_once('\t')?;
+                                (name == refname).then(|| Oid::parse(oid)).flatten()
+                            })
+                            .map_or(Value::Absent, Value::Object),
+                        Err(_) => Value::Occupied,
+                    }
                 }
             }
             subject => now.get(subject).cloned().unwrap_or(Value::Absent),
@@ -1642,7 +1663,10 @@ fn entries_in(s: &mut Session, record: &Record, head: &Head) -> Result<Vec<Resto
             Subject::Pushed { .. } => value_now == Value::Occupied,
             subject => match left_of(subject) {
                 Some(left) => value_now != e.before && value_now != left,
-                None => false,
+                // No `after` record (its seal failed): what changed since cannot be told from
+                // what the action changed, so a changed line counts as moved and waits for an
+                // explicit choice (review round 1).
+                None => value_now != e.before,
             },
         };
         let differs = value_now != e.before;

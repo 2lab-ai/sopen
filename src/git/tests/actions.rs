@@ -449,6 +449,16 @@ pub(super) fn with_origin(fx: &Fx, dir: &Path, name: &str) -> PathBuf {
     bare
 }
 
+/// `--no-update-refs ` where the host's git has it (2.38): every rebase sopen runs without the
+/// option carries it, so `rebase.updateRefs` in the config moves nothing (review round 1).
+fn no_update_refs(runner: &GitRunner, dir: &Path) -> &'static str {
+    if repo_of(runner, dir).version.at_least(2, 38) {
+        "--no-update-refs "
+    } else {
+        ""
+    }
+}
+
 fn files_of(dir: &Path) -> Vec<String> {
     let mut names: Vec<String> = std::fs::read_dir(dir)
         .unwrap()
@@ -528,7 +538,10 @@ fn g_a1_tag_and_its_move_form() {
         };
         let (plan, outcome) = run(&runner, &dir, &action);
         done(&lane, &outcome);
-        has_line(&plan, &format!("git tag -a -F - v1 {}", c1.as_str()));
+        has_line(
+            &plan,
+            &format!("git tag -a --cleanup=verbatim -F - v1 {}", c1.as_str()),
+        );
         has_line(&plan, "git push --progress origin refs/tags/v1");
         assert!(backup_names(&plan).is_empty(), "{lane}");
         assert_eq!(fx.git(&dir, &["cat-file", "-t", "v1"]).trim(), "tag");
@@ -544,7 +557,10 @@ fn g_a1_tag_and_its_move_form() {
         };
         let (plan, outcome) = run(&runner, &dir, &action);
         done(&lane, &outcome);
-        has_line(&plan, &format!("git tag -f -a -F - v1 {}", c2.as_str()));
+        has_line(
+            &plan,
+            &format!("git tag -f -a --cleanup=verbatim -F - v1 {}", c2.as_str()),
+        );
         assert_eq!(backup_names(&plan), vec!["tags/v1".to_string()]);
         assert_eq!(fx.rev(&dir, "v1^{}").unwrap(), c2.as_str());
         let (stamp, names) = fx.newest(&dir);
@@ -812,7 +828,13 @@ fn g_a1_rebase_and_reset_in_four_modes() {
             },
         );
         done(&lane, &outcome);
-        has_line(&plan, "git rebase refs/heads/main");
+        has_line(
+            &plan,
+            &format!(
+                "git rebase {}refs/heads/main",
+                no_update_refs(&runner, &dir)
+            ),
+        );
         assert_eq!(backup_names(&plan), vec!["heads/topic".to_string()]);
         assert_eq!(fx.rev(&dir, "topic^").unwrap(), m1.as_str(), "{lane}");
         let (stamp, names) = fx.newest(&dir);
@@ -1172,7 +1194,12 @@ fn g_a3_remote_branch() {
                 },
             );
             done(&lane, &outcome);
-            has_line(&plan, line);
+            if how == PullHow::Rebase {
+                let line = format!("git rebase {}FETCH_HEAD", no_update_refs(&runner, &dir));
+                has_line(&plan, &line);
+            } else {
+                has_line(&plan, line);
+            }
             if how == PullHow::Rebase {
                 assert_eq!(backup_names(&plan), vec!["heads/feat".to_string()]);
                 assert_eq!(fx.rev(&dir, "HEAD^").unwrap(), tip.as_str(), "{lane}");
@@ -1322,7 +1349,10 @@ fn g_a4_tags() {
             },
         );
         done(&lane, &outcome);
-        has_line(&plan, &format!("git tag -f -a -F - t1 {}", c2.as_str()));
+        has_line(
+            &plan,
+            &format!("git tag -f -a --cleanup=verbatim -F - t1 {}", c2.as_str()),
+        );
         assert_eq!(backup_names(&plan), vec!["tags/t1".to_string()]);
         assert_eq!(fx.rev(&dir, "t1^{}").unwrap(), c2.as_str());
         assert_eq!(
@@ -3210,5 +3240,380 @@ fn g_r5_a_wait_that_never_ends_is_stopped() {
                 "{lane} {waiter}: still staged"
             );
         }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Review round 1 (PR #83)
+
+/// Review 1: a probe value that is not hex (bytes git never writes there, but the files are the
+/// repository's) is shown cut at a character boundary, never sliced at byte 8.
+#[test]
+fn r1_the_banner_never_slices_inside_a_character() {
+    let records = |rs: &[&str]| {
+        let mut bytes = Vec::new();
+        for r in rs {
+            bytes.extend_from_slice(r.as_bytes());
+            bytes.push(0);
+        }
+        parse_probe(&bytes)
+    };
+    let state = records(&[
+        "exists rebase-merge",
+        "msgnum 1",
+        "end 2",
+        "stopped-sha aaaaaaaé and more",
+        "done-last edit aaaaaaaé # the subject",
+    ]);
+    let edit = Banner {
+        state: state.clone(),
+        conflicts: 0,
+    };
+    assert_eq!(edit.edit_stop(), Some("aaaaaaaé"));
+    assert_eq!(edit.text(), "stopped to edit aaaaaaaé");
+    let stopped = Banner {
+        state,
+        conflicts: 1,
+    };
+    assert_eq!(
+        stopped.text(),
+        "REBASE 1/2 · stopped at aaaaaaaé the subject · 1 conflict"
+    );
+}
+
+/// Review 2: the backup's fetch of a remote's value (03 §8.4 step 2) never prunes, whatever
+/// `fetch.prune` and `fetch.pruneTags` say: a local-only tag survives an overwrite push.
+#[test]
+fn r2_the_backup_fetch_never_prunes() {
+    let Some(fx) = fixture() else { return };
+    for (lane, runner) in fx.lanes() {
+        let dir = fx.repo(&format!("r2-{lane}"));
+        let bare = with_origin(&fx, &dir, &format!("r2-{lane}"));
+        fx.git(&dir, &["tag", "keep-me"]);
+        fx.git(&dir, &["config", "fetch.prune", "true"]);
+        fx.git(&dir, &["config", "fetch.pruneTags", "true"]);
+        fx.git(&dir, &["commit", "-q", "--amend", "-m", "rewritten"]);
+        let (_, outcome) = run(
+            &runner,
+            &dir,
+            &Action::Push {
+                branch: "main".into(),
+                remotes: vec!["origin".into()],
+                options: PushOptions {
+                    set_upstream: false,
+                    no_verify: false,
+                },
+                overwrite: true,
+            },
+        );
+        done(&lane, &outcome);
+        let fetches: Vec<&str> = outcome.steps[0]
+            .ran
+            .iter()
+            .map(|d| d.entry.line.as_str())
+            .filter(|l| l.starts_with("git fetch"))
+            .collect();
+        assert!(!fetches.is_empty(), "{lane}");
+        assert!(
+            fetches
+                .iter()
+                .all(|l| l.contains("--no-prune --no-prune-tags")),
+            "{lane}: {fetches:?}"
+        );
+        assert!(
+            fx.rev(&dir, "refs/tags/keep-me").is_some(),
+            "{lane}: pruned"
+        );
+        assert_eq!(fx.rev(&bare, "main"), fx.rev(&dir, "main"));
+    }
+}
+
+/// Review 4: a remote URL starting with `-` is never passed to git, where it would be read as
+/// an option (`--upload-pack=<command>` runs the command): refused naming it — in a remote's push
+/// URL at Run, and in Add remote's and Edit remote's fields.
+#[test]
+fn r4_a_url_starting_with_a_dash_is_refused() {
+    let Some(fx) = fixture() else { return };
+    for (lane, runner) in fx.lanes() {
+        let dir = fx.repo(&format!("r4-{lane}"));
+        with_origin(&fx, &dir, &format!("r4-{lane}"));
+        let marker = fx.root.join(format!("r4-ran-{lane}"));
+        let evil = format!("--upload-pack=touch {}", marker.to_str().unwrap());
+        fx.git(&dir, &["config", "remote.origin.pushurl", &evil]);
+        fx.git(&dir, &["commit", "-q", "--amend", "-m", "rewritten"]);
+        let (_, outcome) = run(
+            &runner,
+            &dir,
+            &Action::Push {
+                branch: "main".into(),
+                remotes: vec!["origin".into()],
+                options: PushOptions {
+                    set_upstream: false,
+                    no_verify: false,
+                },
+                overwrite: true,
+            },
+        );
+        let text = failed_at(&lane, &outcome, 0);
+        assert!(!marker.exists(), "{lane}: git ran the URL as an option");
+        assert!(
+            text.contains("not a URL sopen will pass to git"),
+            "{lane}: {text}"
+        );
+        for action in [
+            Action::AddRemote {
+                name: "x".into(),
+                url: "-x".into(),
+                push_url: None,
+                fetch_now: false,
+            },
+            Action::AddRemote {
+                name: "x".into(),
+                url: "/srv/x.git".into(),
+                push_url: Some("--upload-pack=x".into()),
+                fetch_now: false,
+            },
+            Action::EditRemote {
+                was: Remote {
+                    name: "origin".into(),
+                    url: "/a".into(),
+                    push_url: None,
+                },
+                now: Remote {
+                    name: "origin".into(),
+                    url: "-b".into(),
+                    push_url: None,
+                },
+            },
+        ] {
+            let refused = planned(&runner, &dir, &action).unwrap_err();
+            assert!(
+                refused.0.contains("not a URL sopen will pass to git"),
+                "{lane}: {}",
+                refused.0
+            );
+        }
+    }
+}
+
+/// Review 9: a pull's rebase is checked again after its fetch, against what the fetch brought —
+/// the remote added a tracked file at a path an ignored local file has: the fetch stays done,
+/// nothing is rebased, the file is named and left alone.
+#[test]
+fn r9_a_pull_rebase_rechecks_what_the_fetch_brought() {
+    let Some(fx) = fixture() else { return };
+    for (lane, runner) in fx.lanes() {
+        let dir = fx.repo(&format!("r9-{lane}"));
+        std::fs::write(dir.join(".gitignore"), "*.log\n").unwrap();
+        fx.git(&dir, &["add", ".gitignore"]);
+        fx.git(&dir, &["commit", "-q", "-m", "ignore"]);
+        let bare = with_origin(&fx, &dir, &format!("r9-{lane}"));
+        let other = fx.clone_of(&bare, &format!("r9-other-{lane}"));
+        fx.commit(&other, "x.log", "from the remote\n", "track x.log");
+        fx.git(&other, &["push", "-q", "origin", "main"]);
+        fx.commit(&dir, "mine.txt", "mine\n", "a local commit");
+        std::fs::write(dir.join("x.log"), "mine, ignored\n").unwrap();
+        let head = fx.rev(&dir, "HEAD").unwrap();
+        let (plan, outcome) = run(
+            &runner,
+            &dir,
+            &Action::Pull {
+                remote: "origin".into(),
+                branch: "main".into(),
+                how: PullHow::Rebase,
+            },
+        );
+        let at = plan
+            .steps
+            .iter()
+            .position(|s| matches!(s, crate::git::actions::Step::Git(c) if c.command_line().contains("rebase")))
+            .unwrap();
+        let text = failed_at(&lane, &outcome, at);
+        assert!(text.contains("x.log"), "{lane}: {text}");
+        assert_eq!(
+            fx.rev(&dir, "HEAD").unwrap(),
+            head,
+            "{lane}: nothing rebased"
+        );
+        assert!(
+            fx.rev(&dir, "FETCH_HEAD").is_some(),
+            "{lane}: the fetch stays done"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("x.log")).unwrap(),
+            "mine, ignored\n",
+            "{lane}"
+        );
+    }
+}
+
+/// Review 10: `rebase.updateRefs=true` in the config never moves a branch the plan did not back
+/// up: with the option off the rebase runs with `--no-update-refs` (git ≥ 2.38; older gits have no
+/// such config).
+#[test]
+fn r10_the_config_never_moves_other_branches() {
+    let Some(fx) = fixture() else { return };
+    for (lane, runner) in fx.lanes() {
+        let dir = fx.repo(&format!("r10-{lane}"));
+        fx.git(&dir, &["config", "rebase.updateRefs", "true"]);
+        fx.git(&dir, &["checkout", "-q", "-b", "topic"]);
+        fx.commit(&dir, "t1", "1\n", "topic one");
+        fx.git(&dir, &["branch", "mid"]);
+        fx.commit(&dir, "t2", "2\n", "topic two");
+        fx.git(&dir, &["checkout", "-q", "main"]);
+        fx.commit(&dir, "m", "m\n", "main one");
+        fx.git(&dir, &["checkout", "-q", "topic"]);
+        let mid = fx.rev(&dir, "mid").unwrap();
+        let (plan, outcome) = run(
+            &runner,
+            &dir,
+            &Action::Rebase {
+                onto: Rev::Branch("main".into()),
+                options: RebaseOptions::default(),
+            },
+        );
+        done(&lane, &outcome);
+        assert_eq!(
+            fx.rev(&dir, "mid").unwrap(),
+            mid,
+            "{lane}: mid moved with no backup"
+        );
+        if repo_of(&runner, &dir).version.at_least(2, 38) {
+            has_line(&plan, "git rebase --no-update-refs refs/heads/main");
+        }
+    }
+}
+
+/// Review 11: pruning is allowed only when every fetch refspec writes under `refs/remotes/` or
+/// `refs/tags/`: a mirror's `+refs/*:refs/*` is refused, naming it, and the backups under
+/// `refs/sopen-backup/` survive.
+#[test]
+fn r11_a_mirror_refspec_refuses_pruning() {
+    let Some(fx) = fixture() else { return };
+    for (lane, runner) in fx.lanes() {
+        let dir = fx.repo(&format!("r11-{lane}"));
+        let bare = with_origin(&fx, &dir, &format!("r11-{lane}"));
+        fx.git(&dir, &["remote", "add", "mirror", bare.to_str().unwrap()]);
+        fx.git(
+            &dir,
+            &[
+                "config",
+                "--replace-all",
+                "remote.mirror.fetch",
+                "+refs/*:refs/*",
+            ],
+        );
+        fx.git(&dir, &["branch", "gone"]);
+        let (_, outcome) = run(
+            &runner,
+            &dir,
+            &Action::DeleteBranch {
+                branch: "gone".into(),
+                force: true,
+                remotes: vec![],
+            },
+        );
+        done(&lane, &outcome);
+        let groups = fx.groups(&dir);
+        for action in [
+            Action::FetchRemote {
+                remote: "mirror".into(),
+                prune: true,
+                prune_tags: false,
+            },
+            Action::Fetch {
+                prune: true,
+                prune_tags: false,
+            },
+            Action::PruneRemote {
+                remote: "mirror".into(),
+            },
+        ] {
+            let refused = planned(&runner, &dir, &action).unwrap_err();
+            assert!(
+                refused.0.contains("+refs/*:refs/*"),
+                "{lane}: {}",
+                refused.0
+            );
+        }
+        assert_eq!(fx.groups(&dir), groups, "{lane}: the backups survive");
+    }
+}
+
+/// Review 12: Move tag keeping it annotated commits its message byte for byte (03 §3.3).
+#[test]
+fn r12_move_tag_keeps_the_message_bytes() {
+    let Some(fx) = fixture() else { return };
+    for (lane, runner) in fx.lanes() {
+        let dir = fx.repo(&format!("r12-{lane}"));
+        let c1 = fx.oid(&dir, "HEAD");
+        let c2 = fx.commit(&dir, "a", "a\n", "second");
+        fx.git(&dir, &["tag", "-a", "-m", "x", "t", c1.as_str()]);
+        let message = "\n  leading blank line\n# kept\ntrailing spaces  \n\n\n";
+        let (plan, outcome) = run(
+            &runner,
+            &dir,
+            &Action::MoveTag {
+                tag: "t".into(),
+                to: c2.clone(),
+                message: Some(message.into()),
+            },
+        );
+        done(&lane, &outcome);
+        has_line(
+            &plan,
+            &format!("git tag -f -a --cleanup=verbatim -F - t {}", c2.as_str()),
+        );
+        let raw = fx.git(&dir, &["cat-file", "tag", "t"]);
+        assert_eq!(raw.split_once("\n\n").unwrap().1, message, "{lane}");
+    }
+}
+
+/// Review 13: a plan acts on one stash entry: a plan naming two `stash@{n}` is refused before
+/// anything runs, and nothing is dropped.
+#[test]
+fn r13_a_plan_names_one_stash_entry() {
+    let Some(fx) = fixture() else { return };
+    for (lane, runner) in fx.lanes() {
+        let dir = fx.repo(&format!("r13-{lane}"));
+        for n in ["one", "two"] {
+            std::fs::write(dir.join("README"), format!("{n}\n")).unwrap();
+            fx.git(&dir, &["stash", "push", "-q", "-m", n]);
+        }
+        let repo = repo_of(&runner, &dir);
+        let top = dir.to_str().unwrap();
+        let drop = |sel: &str| {
+            crate::git::actions::Step::Git(GitCommand::new(
+                Class::Write,
+                top,
+                ["stash", "drop", sel],
+            ))
+        };
+        let plan = Plan {
+            confirm: None,
+            backups: vec![backup::Take {
+                kind: crate::git::model::BackupKind::Stash,
+                from: backup::Source::Stash {
+                    commit: repo.stashes[0].oid.clone(),
+                    listed: true,
+                },
+                pruned_only: false,
+            }],
+            message: "sopen: two drops".into(),
+            steps: vec![
+                crate::git::actions::Step::Backup,
+                drop("stash@{0}"),
+                drop("stash@{1}"),
+            ],
+            changes_files: false,
+        };
+        let outcome = execute(&plan, top, &runner, &Handle::new());
+        let text = failed_at(&lane, &outcome, 0);
+        assert!(text.contains("one stash entry"), "{lane}: {text}");
+        assert_eq!(
+            fx.git(&dir, &["stash", "list"]).lines().count(),
+            2,
+            "{lane}"
+        );
     }
 }

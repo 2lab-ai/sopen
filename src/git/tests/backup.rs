@@ -930,3 +930,165 @@ fn a_mixed_or_soft_reset_is_undone_in_its_own_mode() {
         }
     }
 }
+
+// ---------------------------------------------------------------------------------------------
+// Review round 1 (PR #83)
+
+/// Review 3: a group without its `after` record (its seal failed) cannot tell "moved since" from
+/// "changed by the action": unknown counts as moved, so a ref that moved later is not chosen.
+#[test]
+fn r3_no_after_record_counts_as_moved() {
+    let Some(fx) = fixture() else { return };
+    for (lane, runner) in fx.lanes() {
+        let dir = fx.repo(&format!("r3-{lane}"));
+        let c1 = fx.oid(&dir, "HEAD");
+        let c2 = fx.commit(&dir, "a", "a\n", "second");
+        fx.git(&dir, &["branch", "gone", c2.as_str()]);
+        let (_, outcome) = run(
+            &runner,
+            &dir,
+            &Action::DeleteBranch {
+                branch: "gone".into(),
+                force: true,
+                remotes: vec![],
+            },
+        );
+        done(&lane, &outcome);
+        let stamp = outcome.backup.clone().unwrap();
+        fx.git(
+            &dir,
+            &[
+                "update-ref",
+                "-d",
+                &format!("refs/sopen-backup/{stamp}/after"),
+            ],
+        );
+        fx.git(&dir, &["branch", "gone", c1.as_str()]);
+        let top = dir.to_str().unwrap();
+        let record = backup::group(&runner, &Handle::new(), top, &stamp)
+            .unwrap()
+            .unwrap();
+        let repo = repo_of(&runner, &dir);
+        let entries = backup::entries(&runner, &Handle::new(), top, &record, &repo.head).unwrap();
+        let gone = entries
+            .iter()
+            .find(|e| e.subject == Subject::Ref("refs/heads/gone".into()))
+            .unwrap();
+        assert!(gone.moved_since && !gone.chosen, "{lane}: {gone:?}");
+    }
+}
+
+/// Review 5: a path holding a carriage return — at its end, or as CRLF inside — reads back from
+/// the manifest exactly.
+#[test]
+fn r5_the_manifest_keeps_carriage_returns() {
+    let oid = Oid::parse(&"e".repeat(40)).unwrap();
+    for path in ["name\r", "a\r\nb", "\r", "x\\r"] {
+        let manifest = Manifest {
+            entries: vec![ManifestEntry {
+                subject: Subject::Path(path.into()),
+                before: Value::Object(oid.clone()),
+            }],
+            moved_by: None,
+        };
+        let message = manifest.message("sopen: x");
+        assert_eq!(Manifest::parse(&message), Some(manifest), "{path:?}");
+    }
+}
+
+/// Review 6: the restore's delete of a path the manifest says was absent names that one path:
+/// redo of an untracked file named `*` removes it and leaves its untracked neighbour alone.
+#[test]
+fn r6_a_path_is_never_a_pattern_in_the_restore() {
+    let Some(fx) = fixture() else { return };
+    for (lane, runner) in fx.lanes() {
+        let dir = fx.repo(&format!("r6-{lane}"));
+        std::fs::write(dir.join("*"), "star\n").unwrap();
+        let mut window = Undo::default();
+        act(
+            &lane,
+            &runner,
+            &dir,
+            &mut window,
+            Action::Clean { folders: true },
+        );
+        undo(&lane, &runner, &dir, &mut window);
+        assert_eq!(bytes(&dir, "*").as_deref(), Some(&b"star\n"[..]));
+        std::fs::write(dir.join("keep.txt"), "a neighbour\n").unwrap();
+        undo(&lane, &runner, &dir, &mut window);
+        assert_eq!(bytes(&dir, "*"), None, "{lane}: redo removes `*`");
+        assert_eq!(
+            bytes(&dir, "keep.txt").as_deref(),
+            Some(&b"a neighbour\n"[..]),
+            "{lane}: the neighbour is left alone"
+        );
+    }
+}
+
+/// Review 7: the work tree's restore checks what `stash apply --index` writes against the
+/// untracked and ignored files first: an ignored file at a path the backup adds (outside the
+/// reset's footprint) refuses it, naming the file, which is left alone.
+#[test]
+fn r7_the_work_tree_restore_never_writes_over_an_ignored_file() {
+    let Some(fx) = fixture() else { return };
+    for (lane, runner) in fx.lanes() {
+        let dir = fx.repo(&format!("r7-{lane}"));
+        std::fs::write(dir.join(".gitignore"), "*.log\n").unwrap();
+        fx.git(&dir, &["add", ".gitignore"]);
+        fx.git(&dir, &["commit", "-q", "-m", "ignore"]);
+        std::fs::write(dir.join("n.log"), "staged\n").unwrap();
+        fx.git(&dir, &["add", "-f", "n.log"]);
+        let (_, outcome) = run(&runner, &dir, &Action::ResetChanges { hard: true });
+        done(&lane, &outcome);
+        let stamp = outcome.backup.clone().unwrap();
+        assert_eq!(bytes(&dir, "n.log"), None);
+        std::fs::write(dir.join("n.log"), "mine, ignored\n").unwrap();
+        let top = dir.to_str().unwrap();
+        let record = backup::group(&runner, &Handle::new(), top, &stamp)
+            .unwrap()
+            .unwrap();
+        let repo = repo_of(&runner, &dir);
+        let entries = backup::entries(&runner, &Handle::new(), top, &record, &repo.head).unwrap();
+        let refused = super::actions::planned(&runner, &dir, &Action::Restore { stamp, entries })
+            .map(|p| p.confirm.map(|c| c.commands))
+            .unwrap_err();
+        assert!(refused.0.contains("n.log"), "{lane}: {}", refused.0);
+        assert_eq!(
+            bytes(&dir, "n.log").as_deref(),
+            Some(&b"mine, ignored\n"[..]),
+            "{lane}"
+        );
+    }
+}
+
+/// Review 8: when the action's steps are done but the group's `after` record cannot be written
+/// (a `reference-transaction` hook refuses it), the outcome says so in its warning.
+#[test]
+fn r8_an_incomplete_backup_is_said() {
+    let Some(fx) = fixture() else { return };
+    for (lane, runner) in fx.lanes() {
+        let dir = fx.repo(&format!("r8-{lane}"));
+        fx.git(&dir, &["branch", "gone"]);
+        super::actions::script(
+            &dir.join(".git/hooks/reference-transaction"),
+            "[ \"$1\" = prepared ] || exit 0\nif grep -q '/after$'; then exit 1; fi\nexit 0",
+        );
+        let (_, outcome) = run(
+            &runner,
+            &dir,
+            &Action::DeleteBranch {
+                branch: "gone".into(),
+                force: true,
+                remotes: vec![],
+            },
+        );
+        done(&lane, &outcome);
+        let stamp = outcome.backup.clone().expect("the group");
+        let warning = outcome.warning().unwrap_or_default();
+        assert!(
+            warning.starts_with(&format!("backup {stamp} incomplete: ")),
+            "{lane}: {warning:?}"
+        );
+        assert!(fx.rev(&dir, "refs/heads/gone").is_none());
+    }
+}
