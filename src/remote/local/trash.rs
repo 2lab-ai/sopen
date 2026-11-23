@@ -11,8 +11,9 @@
 use crate::remote::ops::Trash;
 use crate::remote::suffixed;
 use anyhow::{bail, Context, Result};
-use std::ffi::CString;
+use std::ffi::{CStr, CString};
 use std::io::Write;
+use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
@@ -56,6 +57,14 @@ const MAX_SUFFIX: u32 = 10_000;
 /// that filesystem's top folder. An entry goes under `files/` with the same name as its
 /// `info/<name>.trashinfo` (`Path=`, `DeletionDate=`), the info file created exclusively first,
 /// the entry then moved by an exclusive rename: nothing in the Trash is ever replaced.
+///
+/// The Trash's folders are checked through descriptors held open — each opened without
+/// following a link, this account's own, nobody else's way in (`fchmod` 0700 where group or
+/// others had any) — and the info file and the move go **relative to those descriptors**
+/// (`openat`, `renameat2` / `renameatx_np`, else `linkat` + `unlinkat`): a folder swapped for a
+/// link or another folder after the check is never written into. A top folder that others can
+/// write without the sticky bit is no place for a Trash: there is none there (the delete dialog
+/// then says permanent and asks, 04 §5.5).
 #[cfg_attr(target_os = "macos", allow(dead_code))] // macOS has its own
 pub(crate) struct Freedesktop {
     /// `$XDG_DATA_HOME/Trash` (`~/.local/share/Trash` by default).
@@ -67,6 +76,26 @@ pub(crate) struct Freedesktop {
 
 /// How the top folder of a folder's filesystem is found.
 type TopDir = Box<dyn Fn(&Path) -> Result<PathBuf> + Send + Sync>;
+
+/// The longest name an entry gets in the Trash (bytes): with a `-N` and `.trashinfo` after it, its
+/// info file's name still fits in one component (255 bytes). `Path=` keeps the whole name.
+const TRASH_NAME_MAX: usize = 200;
+
+/// A Trash's folders, held open.
+struct Held {
+    /// The Trash folder itself, for messages and what `put` answers.
+    trash: PathBuf,
+    files: std::fs::File,
+    info: std::fs::File,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Right after the Trash's folders are checked and held, before anything goes in: the
+    /// Trash folder's path.
+    static HELD: std::cell::RefCell<Option<crate::remote::ops::SeamHook>> =
+        const { std::cell::RefCell::new(None) };
+}
 
 #[cfg_attr(target_os = "macos", allow(dead_code))] // macOS has its own
 impl Freedesktop {
@@ -120,8 +149,14 @@ impl Freedesktop {
         let Some(top) = top else {
             return Ok(());
         };
+        let top_dir = open_dir(&top).map_err(|e| format!("cannot open {}: {e}", top.display()))?;
+        safe_top(&top_dir, &top).map_err(|e| format!("{e:#}"))?;
         match std::fs::symlink_metadata(&trash) {
-            Ok(_) => own_folder(&trash, self.uid).map_err(|e| format!("{e:#}")),
+            Ok(m) if m.is_dir() && m.uid() == self.uid => Ok(()),
+            Ok(_) => Err(format!(
+                "{} is not this account's own folder, so there is no Trash there",
+                trash.display()
+            )),
             Err(_) if writable(&top) => Ok(()),
             Err(_) => Err(format!(
                 "{} has no Trash of this account, and one cannot be made there",
@@ -141,7 +176,12 @@ impl Freedesktop {
             _ => Path::new("."),
         };
         let (trash, top) = self.trash_for(dir)?;
-        let (files, info) = self.ready(&trash, top.is_some())?;
+        let held = self.ready(&trash, top.as_deref())?;
+        #[cfg(test)]
+        crate::remote::ops::fire_seam(&HELD, &trash.to_string_lossy());
+        // The entry, through the folder that holds it.
+        let source = open_dir(dir).with_context(|| format!("cannot open {}", dir.display()))?;
+        let source_name = c_name(name)?;
         let original = match &top {
             None => std::path::absolute(path)?,
             Some(top) => {
@@ -154,35 +194,36 @@ impl Freedesktop {
             escaped(original.as_os_str().as_bytes()),
             deletion_date()
         );
+        let base = trash_name(name);
         for n in 0..MAX_SUFFIX {
             let candidate = if n == 0 {
-                name.to_string()
+                base.clone()
             } else {
-                suffixed(name, n)
+                suffixed(&base, n)
             };
-            let note = info.join(format!("{candidate}.trashinfo"));
-            let mut file = match std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .custom_flags(libc::O_NOFOLLOW)
-                .open(&note)
-            {
+            let note = c_name(&format!("{candidate}.trashinfo"))?;
+            let mut file = match create_at(&held.info, &note) {
                 Ok(file) => file,
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
                 Err(e) => {
-                    return Err(e).with_context(|| format!("cannot write {}", note.display()))
+                    return Err(e).with_context(|| {
+                        format!(
+                            "cannot write {}/info/{candidate}.trashinfo",
+                            trash.display()
+                        )
+                    })
                 }
             };
             let wrote = file
                 .write_all(record.as_bytes())
                 .and_then(|()| file.sync_all());
-            let to = files.join(&candidate);
-            let moved = wrote.and_then(|()| rename_excl(path, &to));
+            let to = c_name(&candidate)?;
+            let moved = wrote.and_then(|()| move_excl(&source, &source_name, &held.files, &to));
             match moved {
-                Ok(()) => return Ok(to),
+                Ok(()) => return Ok(held.trash.join("files").join(&candidate)),
                 Err(e) => {
-                    let _ = std::fs::remove_file(&note);
+                    // SAFETY: an open descriptor and a NUL-terminated name.
+                    unsafe { libc::unlinkat(held.info.as_raw_fd(), note.as_ptr(), 0) };
                     if e.kind() == std::io::ErrorKind::AlreadyExists {
                         // A `files/` entry without its info (left by another program).
                         continue;
@@ -197,51 +238,228 @@ impl Freedesktop {
                 }
             }
         }
-        bail!("no free name for {name} in {}", files.display())
+        bail!("no free name for {name} in {}/files", trash.display())
     }
 
-    /// The Trash's `files` and `info`, made where missing (0700). A top folder's Trash must be
-    /// this account's own folder, not a link.
-    fn ready(&self, trash: &Path, on_top: bool) -> Result<(PathBuf, PathBuf)> {
-        if on_top {
-            match std::fs::DirBuilder::new().mode(0o700).create(trash) {
-                Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-                Err(e) => {
-                    return Err(e).with_context(|| format!("cannot make {}", trash.display()))
-                }
+    /// The Trash's folder and its `files` and `info`, made where missing (0700), each opened
+    /// without following a link and checked through its descriptor ([`own_dir_at`]). The home
+    /// Trash's parent is the account's data folder, found by its path; a top folder's must be
+    /// safe for a Trash ([`safe_top`]).
+    fn ready(&self, trash: &Path, top: Option<&Path>) -> Result<Held> {
+        let parent = match top {
+            Some(top) => top.to_path_buf(),
+            None => {
+                let data = trash.parent().context("the home Trash has no folder")?;
+                std::fs::DirBuilder::new()
+                    .recursive(true)
+                    .mode(0o700)
+                    .create(data)
+                    .with_context(|| format!("cannot make {}", data.display()))?;
+                data.to_path_buf()
             }
-            own_folder(trash, self.uid)?;
-        } else {
-            std::fs::DirBuilder::new()
-                .recursive(true)
-                .mode(0o700)
-                .create(trash)
-                .with_context(|| format!("cannot make {}", trash.display()))?;
+        };
+        let parent_dir =
+            open_dir(&parent).with_context(|| format!("cannot open {}", parent.display()))?;
+        if top.is_some() {
+            safe_top(&parent_dir, &parent)?;
         }
-        let (files, info) = (trash.join("files"), trash.join("info"));
-        for sub in [&files, &info] {
-            match std::fs::DirBuilder::new().mode(0o700).create(sub) {
-                Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-                Err(e) => return Err(e).with_context(|| format!("cannot make {}", sub.display())),
-            }
-            own_folder(sub, self.uid)?;
-        }
-        Ok((files, info))
+        let trash_name = trash
+            .file_name()
+            .context("a Trash folder without a name")?
+            .to_str()
+            .context("a Trash folder whose name is not UTF-8")?;
+        let bin = own_dir_at(&parent_dir, trash_name, trash, self.uid)?;
+        let files = own_dir_at(&bin, "files", &trash.join("files"), self.uid)?;
+        let info = own_dir_at(&bin, "info", &trash.join("info"), self.uid)?;
+        Ok(Held {
+            trash: trash.to_path_buf(),
+            files,
+            info,
+        })
     }
 }
 
-/// `path` is a folder (not a link) of the account `uid`.
+/// `name` as a C string.
 #[cfg_attr(target_os = "macos", allow(dead_code))]
-fn own_folder(path: &Path, uid: u32) -> Result<()> {
-    let m = std::fs::symlink_metadata(path)
-        .with_context(|| format!("cannot stat {}", path.display()))?;
-    if !m.is_dir() || m.uid() != uid {
+fn c_name(name: &str) -> Result<CString> {
+    CString::new(name).map_err(|_| anyhow::anyhow!("{name}: a name with a NUL byte"))
+}
+
+/// The name an entry gets in the Trash: its own, or — longer than [`TRASH_NAME_MAX`] — cut there
+/// at a character, its extension kept.
+#[cfg_attr(target_os = "macos", allow(dead_code))]
+fn trash_name(name: &str) -> String {
+    if name.len() <= TRASH_NAME_MAX {
+        return name.to_string();
+    }
+    let ext = match name.rfind('.') {
+        Some(at) if at > 0 && name.len() - at <= 16 => &name[at..],
+        _ => "",
+    };
+    let mut keep = TRASH_NAME_MAX - ext.len();
+    while !name.is_char_boundary(keep) {
+        keep -= 1;
+    }
+    format!("{}{ext}", &name[..keep])
+}
+
+/// The folder `path` opened (following a link: it is found by its path).
+#[cfg_attr(target_os = "macos", allow(dead_code))]
+fn open_dir(path: &Path) -> std::io::Result<std::fs::File> {
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC)
+        .open(path)
+}
+
+/// A top folder its group or others can write without the sticky bit is no place for a Trash:
+/// another account could swap its `.Trash-$uid` (the freedesktop specification's own rule for
+/// `$topdir/.Trash`). A group-writable one counts: its group's members are other accounts.
+#[cfg_attr(target_os = "macos", allow(dead_code))]
+#[allow(clippy::unnecessary_cast)] // `S_ISVTX` is `u16` on macOS, `u32` on Linux
+fn safe_top(top: &std::fs::File, shown: &Path) -> Result<()> {
+    let mode = top.metadata()?.mode();
+    if mode & 0o022 != 0 && mode & libc::S_ISVTX as u32 == 0 {
         bail!(
-            "{} is not this account's own folder, so nothing is put there",
-            path.display()
+            "{} can be written by other accounts and has no sticky bit, so there is no safe \
+             place for a Trash there",
+            shown.display()
         );
+    }
+    Ok(())
+}
+
+/// The folder `name` of the open folder `parent` — made (0700) where missing, opened without
+/// following a link, and checked through that descriptor: a folder of the account `uid`, made
+/// 0700 (`fchmod`) where group or others had any way in.
+#[cfg_attr(target_os = "macos", allow(dead_code))]
+fn own_dir_at(parent: &std::fs::File, name: &str, shown: &Path, uid: u32) -> Result<std::fs::File> {
+    use std::os::fd::FromRawFd;
+    use std::os::unix::fs::PermissionsExt;
+    let c = c_name(name)?;
+    // SAFETY: an open descriptor and a NUL-terminated name.
+    let made = unsafe { libc::mkdirat(parent.as_raw_fd(), c.as_ptr(), 0o700) };
+    if made != 0 {
+        let e = std::io::Error::last_os_error();
+        if e.kind() != std::io::ErrorKind::AlreadyExists {
+            return Err(e).with_context(|| format!("cannot make {}", shown.display()));
+        }
+    }
+    let not_own = || {
+        anyhow::anyhow!(
+            "{} is not this account's own folder, so nothing is put there",
+            shown.display()
+        )
+    };
+    // SAFETY: an open descriptor and a NUL-terminated name.
+    let fd = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            c.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        let e = std::io::Error::last_os_error();
+        if matches!(e.raw_os_error(), Some(libc::ELOOP | libc::ENOTDIR)) {
+            return Err(not_own());
+        }
+        return Err(e).with_context(|| format!("cannot open {}", shown.display()));
+    }
+    // SAFETY: a descriptor just opened, owned by nothing else.
+    let dir = unsafe { std::fs::File::from_raw_fd(fd) };
+    let m = dir.metadata()?;
+    if !m.is_dir() || m.uid() != uid {
+        return Err(not_own());
+    }
+    if m.mode() & 0o077 != 0 {
+        dir.set_permissions(std::fs::Permissions::from_mode(0o700))
+            .with_context(|| format!("cannot make {} private", shown.display()))?;
+    }
+    Ok(dir)
+}
+
+/// The file `name` created in the open folder `dir`: exclusively, not through a link, 0600.
+#[cfg_attr(target_os = "macos", allow(dead_code))]
+fn create_at(dir: &std::fs::File, name: &CStr) -> std::io::Result<std::fs::File> {
+    use std::os::fd::FromRawFd;
+    // SAFETY: an open descriptor and a NUL-terminated name.
+    let fd = unsafe {
+        libc::openat(
+            dir.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0o600 as libc::c_uint,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: a descriptor just opened, owned by nothing else.
+    Ok(unsafe { std::fs::File::from_raw_fd(fd) })
+}
+
+/// The entry `from` of the open folder `from_dir` moved to `to` in the open folder `to_dir`,
+/// never over anything there: the exclusive rename; where the filesystem has none, a hard link
+/// (fails on an existing name) and then the old name's removal — not for a folder, which then
+/// stays where it is.
+#[cfg_attr(target_os = "macos", allow(dead_code))]
+fn move_excl(
+    from_dir: &std::fs::File,
+    from: &CStr,
+    to_dir: &std::fs::File,
+    to: &CStr,
+) -> std::io::Result<()> {
+    let (f, t) = (from_dir.as_raw_fd(), to_dir.as_raw_fd());
+    #[cfg(target_os = "macos")]
+    // SAFETY: open descriptors and NUL-terminated names.
+    let r = unsafe { libc::renameatx_np(f, from.as_ptr(), t, to.as_ptr(), libc::RENAME_EXCL) };
+    #[cfg(target_os = "linux")]
+    // SAFETY: open descriptors and NUL-terminated names.
+    let r = unsafe { libc::renameat2(f, from.as_ptr(), t, to.as_ptr(), libc::RENAME_NOREPLACE) };
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    let r = {
+        let _ = (f, t);
+        -2
+    };
+    if r == 0 {
+        return Ok(());
+    }
+    let e = if r == -2 {
+        std::io::Error::from_raw_os_error(libc::ENOTSUP)
+    } else {
+        std::io::Error::last_os_error()
+    };
+    let unsupported = matches!(
+        e.raw_os_error(),
+        Some(c) if [libc::EINVAL, libc::ENOSYS, libc::ENOTSUP, libc::EOPNOTSUPP].contains(&c)
+    );
+    if !unsupported {
+        return Err(e);
+    }
+    // SAFETY: an all-zero stat is a valid value to be overwritten; an open descriptor, a
+    // NUL-terminated name and a valid place for the result.
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: as above.
+    if unsafe { libc::fstatat(f, from.as_ptr(), &mut st, libc::AT_SYMLINK_NOFOLLOW) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if st.st_mode & libc::S_IFMT == libc::S_IFDIR {
+        return Err(std::io::Error::other(
+            "this filesystem cannot move a folder without the risk of replacing a name",
+        ));
+    }
+    // SAFETY: open descriptors and NUL-terminated names; flags 0 links a link itself.
+    if unsafe { libc::linkat(f, from.as_ptr(), t, to.as_ptr(), 0) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: an open descriptor and a NUL-terminated name.
+    if unsafe { libc::unlinkat(f, from.as_ptr(), 0) } != 0 {
+        let e = std::io::Error::last_os_error();
+        // Both names are one entry: the one just made in the Trash goes again.
+        // SAFETY: as above.
+        unsafe { libc::unlinkat(t, to.as_ptr(), 0) };
+        return Err(e);
     }
     Ok(())
 }
@@ -256,8 +474,8 @@ fn writable(path: &Path) -> bool {
     unsafe { libc::access(c.as_ptr(), libc::W_OK | libc::X_OK) == 0 }
 }
 
-/// [`super::ops::rename_excl`] by paths.
-#[cfg_attr(target_os = "macos", allow(dead_code))]
+/// [`super::ops::rename_excl`] by paths (the tests' stand-in Trash).
+#[cfg(test)]
 fn rename_excl(from: &Path, to: &Path) -> std::io::Result<()> {
     let c = |p: &Path| {
         CString::new(p.as_os_str().as_bytes())
@@ -749,6 +967,145 @@ mod tests {
             0,
             "nothing through the link"
         );
+    }
+
+    /// The Trash's folders are swapped after they were checked and held — the top folder's
+    /// `.Trash-$uid` and the home Trash alike moved away and a link to another folder put in their
+    /// place: the info file and the entry go into the folders that were checked (through their
+    /// descriptors), nothing through the link.
+    #[test]
+    fn a_trash_folder_swapped_after_its_check_is_never_written_through() {
+        for on_top in [true, false] {
+            let (_t, data, items) = bins();
+            let top = items.parent().unwrap().to_path_buf();
+            let elsewhere = top.join("elsewhere");
+            std::fs::create_dir(&elsewhere).unwrap();
+            // SAFETY: geteuid has no preconditions.
+            let uid = unsafe { libc::geteuid() };
+            let at = top.clone();
+            let fd = Freedesktop {
+                home: match on_top {
+                    true => PathBuf::from("/dev/null/sopen-tests-trash"),
+                    false => data.join("Trash"),
+                },
+                uid,
+                topdir: Box::new(move |_| Ok(at.clone())),
+            };
+            let bin = match on_top {
+                true => top.join(format!(".Trash-{uid}")),
+                false => data.join("Trash"),
+            };
+            let moved = top.join("moved-trash");
+            let (from, link_to) = (bin.clone(), elsewhere.clone());
+            let swapped = moved.clone();
+            let _seam = crate::remote::ops::set_seam(&HELD, move |_| {
+                std::fs::rename(&from, &swapped).unwrap();
+                std::os::unix::fs::symlink(&link_to, &from).unwrap();
+            });
+            std::fs::write(items.join("f"), "f").unwrap();
+            fd.put(&items.join("f")).unwrap();
+            assert_eq!(
+                std::fs::read_dir(&elsewhere).unwrap().count(),
+                0,
+                "on_top={on_top}: nothing through the link"
+            );
+            assert_eq!(std::fs::read(moved.join("files/f")).unwrap(), b"f");
+            assert!(info_of(&moved, "f").starts_with("[Trash Info]\n"));
+            assert!(!items.join("f").exists());
+        }
+    }
+
+    /// A top folder that other accounts can write, without the sticky bit, has no Trash: `put`
+    /// and `available` refuse, nothing moved; with the sticky bit it has one.
+    #[test]
+    fn a_top_folder_others_can_write_without_the_sticky_bit_has_no_trash() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_t, _data, items) = bins();
+        let top = items.parent().unwrap().to_path_buf();
+        // SAFETY: geteuid has no preconditions.
+        let uid = unsafe { libc::geteuid() };
+        let at = top.clone();
+        let fd = Freedesktop {
+            home: PathBuf::from("/dev/null/sopen-tests-trash"),
+            uid,
+            topdir: Box::new(move |_| Ok(at.clone())),
+        };
+        let chmod = |mode| std::fs::set_permissions(&top, std::fs::Permissions::from_mode(mode));
+        std::fs::write(items.join("f"), "f").unwrap();
+        chmod(0o777).unwrap();
+        let refused = fd.put(&items.join("f"));
+        let available = fd.available(&items);
+        chmod(0o1777).unwrap();
+        let e = refused.unwrap_err();
+        assert!(format!("{e:#}").contains("sticky"), "{e:#}");
+        assert!(
+            matches!(&available, Err(why) if why.contains("sticky")),
+            "{available:?}"
+        );
+        assert_eq!(std::fs::read(items.join("f")).unwrap(), b"f");
+        assert!(!top.join(format!(".Trash-{uid}")).exists());
+        assert_eq!(fd.available(&items), Ok(()));
+        fd.put(&items.join("f")).unwrap();
+        chmod(0o700).unwrap();
+    }
+
+    /// An existing Trash whose folders others can read or enter is made private (0700, through
+    /// its descriptor) before anything goes in.
+    #[test]
+    fn an_existing_trash_others_can_enter_is_made_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_t, _data, items) = bins();
+        let top = items.parent().unwrap().to_path_buf();
+        // SAFETY: geteuid has no preconditions.
+        let uid = unsafe { libc::geteuid() };
+        let bin = top.join(format!(".Trash-{uid}"));
+        for folder in [&bin, &bin.join("files"), &bin.join("info")] {
+            std::fs::create_dir(folder).unwrap();
+            std::fs::set_permissions(folder, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let at = top.clone();
+        let fd = Freedesktop {
+            home: PathBuf::from("/dev/null/sopen-tests-trash"),
+            uid,
+            topdir: Box::new(move |_| Ok(at.clone())),
+        };
+        std::fs::write(items.join("f"), "f").unwrap();
+        fd.put(&items.join("f")).unwrap();
+        for folder in [&bin, &bin.join("files"), &bin.join("info")] {
+            let mode = std::fs::symlink_metadata(folder).unwrap().mode() & 0o7777;
+            assert_eq!(mode, 0o700, "{}", folder.display());
+        }
+    }
+
+    /// A name of 255 bytes: its info file's name would not fit one component, so it gets a
+    /// shorter name in the Trash, its extension kept; `Path=` keeps the whole name.
+    #[test]
+    fn a_name_of_255_bytes_gets_a_shorter_trash_name() {
+        let (_t, data, items) = bins();
+        // SAFETY: geteuid has no preconditions.
+        let uid = unsafe { libc::geteuid() };
+        let fd = Freedesktop {
+            home: data.join("Trash"),
+            uid,
+            topdir: Box::new(|_| panic!("the home Trash's filesystem")),
+        };
+        let long = format!("{}.txt", "n".repeat(251));
+        assert_eq!(long.len(), 255);
+        std::fs::write(items.join(&long), "long").unwrap();
+        let to = fd.put(&items.join(&long)).unwrap();
+        let short = to.file_name().unwrap().to_str().unwrap().to_string();
+        assert!(
+            short.len() <= TRASH_NAME_MAX && short.ends_with(".txt"),
+            "{short}"
+        );
+        assert_eq!(std::fs::read(&to).unwrap(), b"long");
+        let info = info_of(&data.join("Trash"), &short);
+        assert!(info.contains(&format!("{long}\n")), "{info}");
+        // A second one of the same name gets the next free name, still short enough.
+        std::fs::write(items.join(&long), "again").unwrap();
+        let to2 = fd.put(&items.join(&long)).unwrap();
+        assert_ne!(to2, to);
+        assert_eq!(std::fs::read(&to).unwrap(), b"long");
     }
 
     /// macOS: Foundation, loaded at runtime, says where the Trash for a folder is — only asked

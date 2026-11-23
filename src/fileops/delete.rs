@@ -3,20 +3,19 @@
 //! and links, `RMDIR` for folders once empty. A link is removed as a link, never its target.
 //!
 //! What the Trash refuses is not deleted another way: the dialog said where it goes, and the
-//! item fails with the reason, nothing of it removed. A permanent delete looks at each entry
-//! (`lstat`) right before acting on it, so a link — one to a folder too — is removed as a link
-//! and never entered; what it cannot remove stays, with the folders that hold it, each such
-//! entry named in the report. A name that is not UTF-8 is never acted on (01 §3a): it stays.
+//! item fails with the reason, nothing of it removed. A folder deleted permanently is the file
+//! layer's walk ([`FileOps::remove_tree`]): on this machine through open folder descriptors, so
+//! a folder swapped for a link meanwhile is never gone through; over SFTP by paths, each request
+//! only while the folder it goes through still resolves where it was listed. What it cannot
+//! remove stays, with the folders that hold it, each such entry named in the report. A name
+//! that is not UTF-8 is never acted on (01 §3a): it stays.
 //!
-//! The walk goes by path, as every SFTP request does (SFTP has no handle to act on a folder's
-//! entries through), and locally the same walk keeps the two file layers one engine. The residual:
-//! a folder that another process of the account swaps for a link between its `lstat` and its
-//! listing is listed through the link, and what is listed there is removed; a descriptor-based
-//! local walk (`openat`, `unlinkat`) would close that on this machine, and is not 04 §5.5's.
+//! Esc is looked at again after every look at an entry and right before every request that
+//! removes something (the Trash's move too): once it is set, no removal starts.
 
 use super::{Control, Item, ItemOutcome, Progress, STOPPED};
 use crate::remote::join;
-use crate::remote::ops::FileOps;
+use crate::remote::ops::{FileOps, TreeEnd, TreeWatch};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 /// One item's delete, over the operation's connection.
@@ -31,15 +30,52 @@ pub(super) struct Deleting<'a> {
     pub(super) lines: &'a mut Vec<Item>,
 }
 
-/// How a folder's permanent delete went.
-#[derive(Default)]
-struct Walked {
-    /// Entries removed.
+/// The status row's line for the entry `name` of the item.
+fn progress(ctl: &mut dyn Control, item: usize, items: usize, name: String) {
+    ctl.progress(&Progress {
+        verb: "deleting",
+        item,
+        items,
+        name,
+        done: 0,
+        total: 0,
+    });
+}
+
+/// What a folder's permanent delete hears from the file layer's walk.
+struct Watch<'w> {
+    ctl: &'w mut dyn Control,
+    cancel: &'w AtomicBool,
+    item: usize,
+    items: usize,
+    lines: &'w mut Vec<Item>,
+    /// The item's name: its entries are `name/rel`.
+    name: &'w str,
     removed: usize,
-    /// Entries (folders included) that stay, each with a line.
     kept: usize,
-    /// Esc stopped it.
-    stopped: bool,
+}
+
+impl TreeWatch for Watch<'_> {
+    fn stopped(&mut self) -> bool {
+        self.cancel.load(Ordering::Relaxed)
+    }
+
+    fn at(&mut self, rel: &str) {
+        let shown = format!("{}/{rel}", self.name);
+        progress(&mut *self.ctl, self.item, self.items, shown);
+    }
+
+    fn removed(&mut self, _rel: &str) {
+        self.removed += 1;
+    }
+
+    fn kept(&mut self, rel: &str, why: String) {
+        self.kept += 1;
+        self.lines.push(Item {
+            name: format!("{}/{rel}", self.name),
+            outcome: ItemOutcome::Failed(why),
+        });
+    }
 }
 
 impl Deleting<'_> {
@@ -47,34 +83,20 @@ impl Deleting<'_> {
         self.cancel.load(Ordering::Relaxed)
     }
 
-    fn progress(&mut self, shown: &str) {
-        self.ctl.progress(&Progress {
-            verb: "deleting",
-            item: self.item,
-            items: self.items,
-            name: shown.to_string(),
-            done: 0,
-            total: 0,
-        });
-    }
-
-    fn keep(&mut self, shown: String, why: String, walked: &mut Walked) {
-        walked.kept += 1;
-        self.lines.push(Item {
-            name: shown,
-            outcome: ItemOutcome::Failed(why),
-        });
-    }
-
     /// The item `name` of `dir`, into the Trash (`trash`) or permanently: its outcome, and
     /// whether Esc stopped it.
     pub(super) fn item(&mut self, dir: &str, name: &str, trash: bool) -> (ItemOutcome, bool) {
-        self.progress(name);
+        let nothing = || (stopped("nothing of it was removed"), true);
+        progress(&mut *self.ctl, self.item, self.items, name.to_string());
         if self.stopped() {
-            return (stopped("nothing of it was removed"), true);
+            return nothing();
         }
         let path = join(dir, name);
-        let own = match self.fs.lstat_opt(&path) {
+        let own = self.fs.lstat_opt(&path);
+        if self.stopped() {
+            return nothing();
+        }
+        let own = match own {
             Ok(Some(own)) => own,
             Ok(None) => return (failed(format!("{name}: no such file or folder")), false),
             Err(e) => return (failed(format!("{e:#}")), false),
@@ -88,6 +110,9 @@ impl Deleting<'_> {
                     false,
                 );
             };
+            if self.cancel.load(Ordering::Relaxed) {
+                return nothing();
+            }
             return match bin.put(&path) {
                 Ok(_) => (ItemOutcome::Done, false),
                 Err(e) => (
@@ -100,117 +125,52 @@ impl Deleting<'_> {
         }
         if !own.is_dir || own.is_symlink {
             // A file, a link (as a link), a fifo, a socket or a device: its name goes.
+            if self.stopped() {
+                return nothing();
+            }
             return match self.fs.remove(&path) {
                 Ok(()) => (ItemOutcome::Done, false),
                 Err(e) => (failed(format!("{e:#}")), false),
             };
         }
-        let mut walked = Walked::default();
-        let gone = self.folder(&path, name, &mut walked, true);
-        if walked.stopped {
-            let what = match walked.removed {
-                0 => "nothing of it was removed".to_string(),
-                n => format!(
-                    "{name} is partly deleted: {n} of its entries were removed, the rest stays"
-                ),
-            };
-            return (stopped(&what), true);
-        }
-        match gone {
-            Ok(()) => (ItemOutcome::Done, false),
-            Err(why) if walked.kept == 0 => (failed(why), false),
-            Err(_) => (
+        let Deleting {
+            fs,
+            ctl,
+            cancel,
+            item,
+            items,
+            lines,
+        } = self;
+        let mut watch = Watch {
+            ctl: &mut **ctl,
+            cancel,
+            item: *item,
+            items: *items,
+            lines,
+            name,
+            removed: 0,
+            kept: 0,
+        };
+        let end = fs.remove_tree(&path, &mut watch);
+        let (removed, kept) = (watch.removed, watch.kept);
+        match end {
+            TreeEnd::Removed => (ItemOutcome::Done, false),
+            TreeEnd::Stopped if removed == 0 => nothing(),
+            TreeEnd::Stopped => (
+                stopped(&format!(
+                    "{name} is partly deleted: {removed} of its entries were removed, the rest \
+                     stays"
+                )),
+                true,
+            ),
+            TreeEnd::Kept(why) if kept == 0 => (failed(why), false),
+            TreeEnd::Kept(_) => (
                 failed(format!(
-                    "{name} was not deleted whole: {} of its entries stay (listed below), with \
-                     the folders that hold them",
-                    walked.kept
+                    "{name} was not deleted whole: {kept} of its entries stay (listed below), \
+                     each folder that holds one too"
                 )),
                 false,
             ),
-        }
-    }
-
-    /// The folder `path` (shown as `shown`) and everything inside it, bottom-up. `Err`: it stays
-    /// (why, for the item itself when it is `top`; inside, its own line says it).
-    fn folder(
-        &mut self,
-        path: &str,
-        shown: &str,
-        walked: &mut Walked,
-        top: bool,
-    ) -> Result<(), String> {
-        let entries = match self.fs.list_entries(path) {
-            Ok(entries) => entries,
-            Err(e) => {
-                let why = format!("{e:#}");
-                if !top {
-                    self.keep(shown.to_string(), why.clone(), walked);
-                }
-                return Err(why);
-            }
-        };
-        let mut whole = true;
-        for entry in entries {
-            if self.stopped() {
-                walked.stopped = true;
-                return Err("stopped".into());
-            }
-            let child = join(path, &entry.name);
-            let child_shown = format!("{shown}/{}", entry.name);
-            if entry.lossy {
-                let why = "its name is not UTF-8, and sopen never acts on such a name".to_string();
-                self.keep(child_shown, why, walked);
-                whole = false;
-                continue;
-            }
-            self.progress(&child_shown);
-            // What it is now, by its own name: a link is removed, never entered.
-            let own = match self.fs.lstat_opt(&child) {
-                Ok(Some(own)) => own,
-                // Gone meanwhile: nothing to remove.
-                Ok(None) => continue,
-                Err(e) => {
-                    self.keep(child_shown, format!("{e:#}"), walked);
-                    whole = false;
-                    continue;
-                }
-            };
-            if own.is_dir && !own.is_symlink {
-                if self.folder(&child, &child_shown, walked, false).is_err() {
-                    if walked.stopped {
-                        return Err("stopped".into());
-                    }
-                    whole = false;
-                }
-                continue;
-            }
-            match self.fs.remove(&child) {
-                Ok(()) => walked.removed += 1,
-                Err(e) => {
-                    self.keep(child_shown, format!("{e:#}"), walked);
-                    whole = false;
-                }
-            }
-        }
-        if !whole {
-            return Err(format!("{shown} is not empty"));
-        }
-        if self.stopped() {
-            walked.stopped = true;
-            return Err("stopped".into());
-        }
-        match self.fs.remove_dir(path) {
-            Ok(()) => {
-                walked.removed += 1;
-                Ok(())
-            }
-            Err(e) => {
-                let why = format!("{e:#}");
-                if !top {
-                    self.keep(shown.to_string(), why.clone(), walked);
-                }
-                Err(why)
-            }
         }
     }
 }

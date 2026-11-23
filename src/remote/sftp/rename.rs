@@ -20,7 +20,7 @@
 
 use super::{answered, within, SftpRemote, META_TIMEOUT};
 use crate::remote::ops::{taken, NoRename, Renamed, REMOTE_FOLDER_RENAME};
-use crate::remote::{join, random_hex, unknown, RemoteFs};
+use crate::remote::{join, random_hex, unknown, Created, RemoteFs};
 use anyhow::{anyhow, Result};
 use bytes::Bytes;
 use openssh_sftp_client::error::{Error as SftpErr, SftpErrorKind};
@@ -409,15 +409,14 @@ impl SftpRemote {
                 format!("sopen rename probe, the second: {tag}\n"),
             ),
         ];
+        // Every file the probe may have made, from the moment its create may have happened —
+        // whatever came of its write and its close.
         let mut made = Vec::new();
         let mut found = Ok(());
         for (path, bytes) in &files {
-            match self.probe_file(path, bytes.as_bytes()) {
-                Ok(()) => made.push((path.clone(), bytes.len() as u64)),
-                Err(e) => {
-                    found = Err(format!("{e:#}"));
-                    break;
-                }
+            if let Err(e) = self.probe_file(path, bytes.as_bytes(), &mut made) {
+                found = Err(format!("{e:#}"));
+                break;
             }
         }
         let found = found.and_then(|()| {
@@ -447,13 +446,27 @@ impl SftpRemote {
     }
 
     /// One of the probe's files: created exclusively (`CREAT|EXCL`), `bytes` written, closed.
-    fn probe_file(&mut self, path: &str, bytes: &[u8]) -> Result<()> {
+    /// It goes into `made` as soon as its create may have happened (made, or no answer), apart
+    /// from whether its write and its close then succeed.
+    fn probe_file(&mut self, path: &str, bytes: &[u8], made: &mut Vec<Made>) -> Result<()> {
         let (rt, sftp, _) = self.parts();
         rt.block_on(async {
-            let mut file = super::ops::create_temp(sftp, path)
-                .await
-                .map_err(|e| e.error)?;
+            let mut file = match super::ops::create_temp(sftp, path).await {
+                Ok(file) => file,
+                Err(e) => {
+                    if e.created != Created::No {
+                        made.push(Made::new(path, bytes));
+                    }
+                    return Err(e.error);
+                }
+            };
+            made.push(Made::new(path, bytes));
             let wrote = within(META_TIMEOUT, file.write_all(bytes)).await;
+            if matches!(wrote, Ok(Ok(_))) {
+                if let Some(last) = made.last_mut() {
+                    last.written = true;
+                }
+            }
             let closed = within(META_TIMEOUT, file.close()).await;
             match (wrote, closed) {
                 (Ok(Ok(_)), Ok(Ok(()))) => Ok(()),
@@ -474,13 +487,26 @@ impl SftpRemote {
         }
     }
 
-    /// The probe's files removed — each only while it is still the one made (a regular file of
-    /// the size written) — then its folder; what stays is named, safe to remove (04 §5.1).
-    fn probe_cleanup(&mut self, folder: &str, made: &[(String, u64)]) -> Vec<String> {
+    /// The probe's files removed — each only while it is still the one made: a regular file of
+    /// the size written (or, where the write did not finish, no larger) — then its folder; what
+    /// stays is named, safe to remove (04 §5.1). A file gone is nothing left.
+    fn probe_cleanup(&mut self, folder: &str, made: &[Made]) -> Vec<String> {
         let mut left = Vec::new();
-        for (path, size) in made {
-            let still = matches!(self.lstat_opt(path),
-                Ok(Some(st)) if st.is_file && !st.is_symlink && st.size == *size);
+        for Made {
+            path,
+            size,
+            written,
+        } in made
+        {
+            let still = match self.lstat_opt(path) {
+                Ok(None) => continue,
+                Ok(Some(st)) => {
+                    st.is_file
+                        && !st.is_symlink
+                        && (st.size == *size || (!written && st.size < *size))
+                }
+                Err(_) => false,
+            };
             if !still {
                 left.push(format!(
                     "sopen's rename probe left {path} (it is not the file it made any more)"
@@ -509,11 +535,43 @@ impl SftpRemote {
     }
 }
 
+/// A file the probe may have made (its ledger).
+struct Made {
+    path: String,
+    /// The bytes it is to hold.
+    size: u64,
+    /// They were all written.
+    written: bool,
+}
+
+impl Made {
+    fn new(path: &str, bytes: &[u8]) -> Self {
+        Self {
+            path: path.to_string(),
+            size: bytes.len() as u64,
+            written: false,
+        }
+    }
+}
+
 /// The tests' plain-rename channel: to a new local `sftp-server` over pipes, as
 /// `SftpRemote::local_server_run` starts the session's own.
+/// What the tests' tap does to the plain channel's renames.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Tap {
+    /// No tap: the server itself.
+    Off,
+    /// The server's reply to a rename becomes "done" (status 0), whatever it was.
+    AnswerDone,
+    /// A rename goes to the server as `posix-rename@openssh.com`, which replaces: the server
+    /// really writes over the name, as one whose plain rename replaces would.
+    Replace,
+}
+
 #[cfg(test)]
 impl Plain {
-    fn local_server(args: &[&str], log: Option<&Path>, answer_ok: bool) -> Option<Self> {
+    fn local_server(args: &[&str], log: Option<&Path>, tap: Tap) -> Option<Self> {
         let hidden = std::env::var_os("SOPEN_TEST_HIDE_SFTP_SERVER").is_some();
         let found = super::SFTP_SERVERS
             .iter()
@@ -544,7 +602,7 @@ impl Plain {
             cmd.args(&args);
             cmd.spawn().unwrap()
         };
-        if !answer_ok {
+        if tap == Tap::Off {
             let mut child = {
                 let _on = rt.enter();
                 spawn()
@@ -563,8 +621,8 @@ impl Plain {
                 let mut child = spawn();
                 let (stdin, stdout) = (child.stdin.take().unwrap(), child.stdout.take().unwrap());
                 let renames = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-                let requests = tokio::spawn(tap_requests(from_sopen, stdin, renames.clone()));
-                tap_replies(stdout, to_sopen, renames).await;
+                let requests = tokio::spawn(tap_requests(from_sopen, stdin, renames.clone(), tap));
+                tap_replies(stdout, to_sopen, renames, tap).await;
                 let _ = requests.await;
                 drop(child);
             })
@@ -602,19 +660,32 @@ impl Drop for Tapped {
 #[cfg(test)]
 const RENAME: u8 = 18;
 
-/// Requests to the server, passed on unchanged; the ids of the renames noted.
+/// Requests to the server: the ids of the renames noted; with [`Tap::Replace`] each rename sent
+/// on as `posix-rename@openssh.com` (`SSH_FXP_EXTENDED`: type, id, the extension's name, then
+/// the rename's two paths unchanged).
 #[cfg(test)]
 async fn tap_requests<R, W>(
     mut from: R,
     mut to: W,
     renames: std::sync::Arc<std::sync::Mutex<Vec<u32>>>,
+    tap: Tap,
 ) where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
-    while let Some(body) = super::packet(&mut from).await {
+    const EXTENDED: u8 = 200;
+    while let Some(mut body) = super::packet(&mut from).await {
         if body.first() == Some(&RENAME) {
             renames.lock().unwrap().push(super::be32(&body[1..]));
+            if tap == Tap::Replace {
+                let ext = b"posix-rename@openssh.com";
+                let mut replacing = vec![EXTENDED];
+                replacing.extend(&body[1..5]);
+                replacing.extend((ext.len() as u32).to_be_bytes());
+                replacing.extend(ext);
+                replacing.extend(&body[5..]);
+                body = replacing;
+            }
         }
         if super::send_packet(&mut to, &body).await.is_none() {
             return;
@@ -622,13 +693,14 @@ async fn tap_requests<R, W>(
     }
 }
 
-/// Replies to sopen: the reply to a rename is "done" (status 0), whatever the server said — a
-/// server whose plain rename replaces would answer so.
+/// Replies to sopen: with [`Tap::AnswerDone`] the reply to a rename is "done" (status 0),
+/// whatever the server said — a server whose plain rename replaces would answer so.
 #[cfg(test)]
 async fn tap_replies<R, W>(
     mut from: R,
     mut to: W,
     renames: std::sync::Arc<std::sync::Mutex<Vec<u32>>>,
+    tap: Tap,
 ) where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
@@ -636,7 +708,7 @@ async fn tap_replies<R, W>(
     const VERSION: u8 = 2;
     const STATUS: u8 = 101;
     while let Some(mut body) = super::packet(&mut from).await {
-        if body[0] != VERSION {
+        if body[0] != VERSION && tap == Tap::AnswerDone {
             let id = super::be32(&body[1..]);
             let mut renames = renames.lock().unwrap();
             if let Some(at) = renames.iter().position(|r| *r == id) {
@@ -667,7 +739,21 @@ impl SftpRemote {
         log: Option<&Path>,
         answer_ok: bool,
     ) -> Option<crate::remote::ops::SeamGuard> {
-        let plain = Plain::local_server(args, log, answer_ok)?;
+        let tap = if answer_ok { Tap::AnswerDone } else { Tap::Off };
+        Self::seam_plain_with(Plain::local_server(args, log, tap)?)
+    }
+
+    /// [`SftpRemote::seam_plain`] behind a tap that sends every rename on as
+    /// `posix-rename@openssh.com`: the server really replaces the name, as one whose plain
+    /// rename replaces would.
+    pub(crate) fn seam_plain_replacing(
+        args: &[&str],
+        log: Option<&Path>,
+    ) -> Option<crate::remote::ops::SeamGuard> {
+        Self::seam_plain_with(Plain::local_server(args, log, Tap::Replace)?)
+    }
+
+    fn seam_plain_with(plain: Plain) -> Option<crate::remote::ops::SeamGuard> {
         PLAIN.with(|p| *p.borrow_mut() = Some(plain));
         Some(crate::remote::ops::SeamGuard::new(|| {
             let plain = PLAIN.with(|p| p.borrow_mut().take());
@@ -685,7 +771,7 @@ mod tests {
     /// server answers status 4 and both are left.
     #[test]
     fn the_plain_rename_renames_onto_a_free_name_and_refuses_a_taken_one() {
-        let Some(mut plain) = Plain::local_server(&[], None, false) else {
+        let Some(mut plain) = Plain::local_server(&[], None, Tap::Off) else {
             return;
         };
         let tmp = tempfile::tempdir().unwrap();
@@ -715,19 +801,84 @@ mod tests {
     /// behind the tap that answers a rename as done it finds that it replaces.
     #[test]
     fn the_probe_tells_a_refusing_server_from_a_replacing_one() {
-        for (answer_ok, want) in [(false, Verdict::Refuses), (true, Verdict::Replaces)] {
+        for (tap, want) in [
+            (Tap::Off, Verdict::Refuses),
+            (Tap::AnswerDone, Verdict::Replaces),
+        ] {
             let Some(mut session) = SftpRemote::local_server() else {
                 return;
             };
-            let Some(mut plain) = Plain::local_server(&[], None, answer_ok) else {
+            let Some(mut plain) = Plain::local_server(&[], None, tap) else {
                 return;
             };
             let tmp = tempfile::tempdir().unwrap();
             let dir = tmp.path().to_str().unwrap();
             let (found, left) = session.run_probe(&mut plain, dir);
-            assert_eq!(found, Ok(want), "answer_ok={answer_ok}");
+            assert_eq!(found, Ok(want), "{tap:?}");
             assert_eq!(left, Vec::<String>::new());
             assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 0);
         }
+    }
+
+    /// A server whose rename really replaces (the tap sends it as `posix-rename@openssh.com`):
+    /// the first file is gone and the second holds its bytes. The probe finds that it replaces;
+    /// its cleanup removes nothing that is not as it made it — the second file now holds the
+    /// first's bytes, so it stays, and so does the folder holding it — and names both.
+    #[test]
+    fn the_probe_finds_a_server_that_really_replaces_and_names_what_it_left() {
+        let Some(mut session) = SftpRemote::local_server() else {
+            return;
+        };
+        let Some(mut plain) = Plain::local_server(&[], None, Tap::Replace) else {
+            return;
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_str().unwrap();
+        let (found, left) = session.run_probe(&mut plain, dir);
+        assert_eq!(found, Ok(Verdict::Replaces));
+        let folders: Vec<_> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .collect();
+        let [folder] = &folders[..] else {
+            panic!("{folders:?}")
+        };
+        let inside: Vec<_> = std::fs::read_dir(folder)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        assert_eq!(inside, ["b"]);
+        let b = std::fs::read_to_string(folder.join("b")).unwrap();
+        assert!(b.starts_with("sopen rename probe, first: "), "{b}");
+        assert_eq!(left.len(), 2, "{left:?}");
+        assert!(
+            left[0].contains("/b (it is not the file it made"),
+            "{left:?}"
+        );
+        assert!(left[1].contains("left its folder"), "{left:?}");
+    }
+
+    /// A probe file whose CLOSE fails after its bytes were written stays in the probe's ledger:
+    /// the probe could not run, and its cleanup removes that file and the folder all the same —
+    /// nothing is left.
+    #[test]
+    fn a_probe_file_whose_close_fails_is_still_cleaned_up() {
+        let proxy = super::super::Proxy::default();
+        proxy.rules.lock().unwrap().fail = Some(super::super::Wired::CLOSE);
+        let Some(mut session) = SftpRemote::local_server_with(Some(proxy)) else {
+            return;
+        };
+        let Some(mut plain) = Plain::local_server(&[], None, Tap::Off) else {
+            return;
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_str().unwrap();
+        let (found, left) = session.run_probe(&mut plain, dir);
+        assert!(
+            matches!(&found, Err(why) if why.contains("failed by the test proxy")),
+            "{found:?}"
+        );
+        assert_eq!(left, Vec::<String>::new());
+        assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 0);
     }
 }

@@ -423,6 +423,15 @@ impl FileOps for Faulty {
         (self.renamed)(from, to);
         Ok(done)
     }
+    /// The file layer's own walk (on this machine through folder descriptors): its steps are
+    /// seen through [`crate::remote::ops::seam_tree_looked`], not this layer's hooks.
+    fn remove_tree(
+        &mut self,
+        path: &str,
+        watch: &mut dyn crate::remote::ops::TreeWatch,
+    ) -> crate::remote::ops::TreeEnd {
+        self.inner.remove_tree(path, watch)
+    }
     fn make_folder(&mut self, path: &str) -> anyhow::Result<()> {
         self.inner.make_folder(path)?;
         self.log(format!("mkdir:{path}"));
@@ -4937,6 +4946,9 @@ fn a_trash_that_refuses_removes_nothing() {
 fn shift_f8_deletes_locally_without_the_trash() {
     let (_t, src, dst) = scratch();
     let d = doomed(&src, &dst);
+    let looked = Arc::new(Mutex::new(Vec::<String>::new()));
+    let seen = looked.clone();
+    let _seam = crate::remote::ops::seam_tree_looked(move |p| seen.lock().unwrap().push(p.into()));
     let mut fs = Faulty::new(Box::new(LocalFs::new()));
     let r = run(
         &here(Op::Delete { trash: false }, &src, &["d"]),
@@ -4947,21 +4959,11 @@ fn shift_f8_deletes_locally_without_the_trash() {
     assert_eq!(names(&src), Vec::<String>::new());
     outside_kept(&dst, "local");
     assert_eq!(LocalFs::trashed_by_tests(&s(&d)), None);
-    let trace = fs.trace.lock().unwrap().clone();
-    let at = |e: String| {
-        trace
-            .iter()
-            .position(|t| *t == e)
-            .unwrap_or_else(|| panic!("no {e} in {trace:?}"))
-    };
-    let c = at(format!("remove:{}", s(&d.join("sub/deeper/c"))));
-    let deeper = at(format!("rmdir:{}", s(&d.join("sub/deeper"))));
-    let link = at(format!("remove:{}", s(&d.join("sub/to-dir"))));
-    let sub = at(format!("rmdir:{}", s(&d.join("sub"))));
-    let top = at(format!("rmdir:{}", s(&d)));
+    let looked = looked.lock().unwrap().clone();
+    assert!(looked.contains(&s(&d.join("sub/to-dir"))), "{looked:?}");
     assert!(
-        c < deeper && deeper < sub && link < sub && sub < top,
-        "{trace:?}"
+        !looked.iter().any(|p| p.starts_with(&s(&dst))),
+        "never inside a link: {looked:?}"
     );
 }
 
@@ -4993,12 +4995,14 @@ fn a_delete_keeps_what_it_cannot_remove_and_lists_it() {
             matches!(&r.items[0].outcome, ItemOutcome::Failed(why) if why.contains("stay")),
             "{how}: {r:?}"
         );
-        assert!(
-            r.items
-                .iter()
-                .any(|i| i.name == "d/locked/x" && matches!(i.outcome, ItemOutcome::Failed(_))),
-            "{how}: {r:?}"
-        );
+        for kept in ["d/locked/x", "d/locked"] {
+            assert!(
+                r.items
+                    .iter()
+                    .any(|i| i.name == kept && matches!(i.outcome, ItemOutcome::Failed(_))),
+                "{how}: {kept}: {r:?}"
+            );
+        }
         assert_eq!(names(&d), ["locked"], "{how}: free.txt went");
         assert_eq!(names(&d.join("locked")), ["x"], "{how}");
     });
@@ -5037,17 +5041,20 @@ fn esc_inside_a_folder_leaves_it_partly_deleted() {
     }
     let mut ctl = Script::default();
     let esc = ctl.cancel.clone();
-    let mut fs = Faulty::new(Box::new(LocalFs::new()));
-    // Esc is pressed while the first entry is being removed.
-    fs.fault = Box::new(move |op, _| {
-        if op == "remove" {
-            esc.store(true, Ordering::Relaxed);
+    // Esc is pressed while the second entry is looked at, after the first was removed.
+    let inside = format!("{}/", s(&d));
+    let mut entries = 0;
+    let _seam = crate::remote::ops::seam_tree_looked(move |p| {
+        if p.starts_with(&inside) {
+            entries += 1;
+            if entries == 2 {
+                esc.store(true, Ordering::Relaxed);
+            }
         }
-        None
     });
     let r = run(
         &here(Op::Delete { trash: false }, &src, &["d"]),
-        Hosts::Same(&mut fs),
+        Hosts::Same(&mut LocalFs::new()),
         &mut ctl,
     );
     let why = stop_reason(&r.items[0]);
@@ -5372,4 +5379,219 @@ fn a_probe_that_cannot_run_refuses_the_copy_and_is_tried_again() {
         2,
         "{main}"
     );
+}
+
+// ---- S6-A review round 1: delete races, stop, probe ledger ----
+
+/// A folder to delete holding `sub` (with a file), and a folder outside it with a sentinel.
+fn swap_fixture(src: &Path, dst: &Path) -> (PathBuf, PathBuf) {
+    let d = src.join("d");
+    std::fs::create_dir_all(d.join("sub")).unwrap();
+    std::fs::write(d.join("sub/x"), "x").unwrap();
+    std::fs::write(d.join("a"), "a").unwrap();
+    let keep = dst.join("keep");
+    std::fs::create_dir(&keep).unwrap();
+    std::fs::write(keep.join("sentinel"), "sentinel").unwrap();
+    (d, keep)
+}
+
+/// A folder inside a folder being deleted permanently is swapped for a link to a folder
+/// outside the selection between the walk's look at it and its descent (another process of the
+/// account): nothing outside is removed — on this machine the walk goes through folder
+/// descriptors (`O_NOFOLLOW`); over SFTP each request is made only while the folder it goes
+/// through still resolves where it was listed. The link stays, named, and so does `d`.
+#[test]
+fn a_folder_swapped_for_a_link_mid_delete_is_never_gone_through() {
+    both(|mut fs, how| {
+        let (_t, src, dst) = scratch();
+        let (d, keep) = swap_fixture(&src, &dst);
+        let (sub, away) = (s(&d.join("sub")), src.join("moved-away"));
+        let target = keep.clone();
+        let _seam = crate::remote::ops::seam_tree_looked(move |p| {
+            if p == sub && !Path::new(&sub).is_symlink() {
+                std::fs::rename(&sub, &away).unwrap();
+                std::os::unix::fs::symlink(&target, &sub).unwrap();
+            }
+        });
+        let r = run(
+            &here(Op::Delete { trash: false }, &src, &["d"]),
+            Hosts::Same(fs.as_mut()),
+            &mut Script::default(),
+        );
+        assert_eq!(names(&keep), ["sentinel"], "{how}: {r:?}");
+        assert_eq!(std::fs::read(keep.join("sentinel")).unwrap(), b"sentinel");
+        assert!(d.join("sub").is_symlink(), "{how}: the link stays");
+        assert_eq!(
+            std::fs::read(src.join("moved-away/x")).unwrap(),
+            b"x",
+            "{how}"
+        );
+        assert!(
+            r.items
+                .iter()
+                .any(|i| i.name == "d/sub" && matches!(i.outcome, ItemOutcome::Failed(_))),
+            "{how}: {r:?}"
+        );
+        assert!(
+            matches!(&r.items[0].outcome, ItemOutcome::Failed(why) if why.contains("stay")),
+            "{how}: {r:?}"
+        );
+    });
+}
+
+/// On this machine a folder swapped for another folder between the look and the descent is
+/// not the folder that was looked at (its device and inode): nothing in it is removed.
+#[test]
+fn a_folder_swapped_for_another_folder_mid_delete_keeps_the_newcomer() {
+    let (_t, src, dst) = scratch();
+    let (d, _keep) = swap_fixture(&src, &dst);
+    let (sub, away) = (s(&d.join("sub")), src.join("moved-away"));
+    let _seam = crate::remote::ops::seam_tree_looked(move |p| {
+        if p == sub && !away.exists() {
+            std::fs::rename(&sub, &away).unwrap();
+            std::fs::create_dir(&sub).unwrap();
+            std::fs::write(Path::new(&sub).join("theirs"), "theirs").unwrap();
+        }
+    });
+    let r = run(
+        &here(Op::Delete { trash: false }, &src, &["d"]),
+        Hosts::Same(&mut LocalFs::new()),
+        &mut Script::default(),
+    );
+    assert_eq!(
+        std::fs::read(d.join("sub/theirs")).unwrap(),
+        b"theirs",
+        "{r:?}"
+    );
+    assert!(
+        r.items.iter().any(|i| i.name == "d/sub"
+            && matches!(&i.outcome, ItemOutcome::Failed(why) if why.contains("another folder"))),
+        "{r:?}"
+    );
+}
+
+/// Esc while a delete looks at an entry (its `lstat` under way): no removal starts after it —
+/// not the item's own `REMOVE`, not the Trash's move, not an entry inside a folder.
+#[test]
+fn a_stop_during_a_look_starts_no_removal() {
+    // The item's own look.
+    for trash in [false, true] {
+        let (_t, src, _dst) = scratch();
+        std::fs::write(src.join("a"), "a").unwrap();
+        let mut ctl = Script::default();
+        let esc = ctl.cancel.clone();
+        let a = s(&src.join("a"));
+        let mut fs = Faulty::new(Box::new(LocalFs::new()));
+        fs.fault = Box::new(move |op, p| {
+            if op == "lstat" && p == a {
+                esc.store(true, Ordering::Relaxed);
+            }
+            None
+        });
+        let r = run(
+            &here(Op::Delete { trash }, &src, &["a"]),
+            Hosts::Same(&mut fs),
+            &mut ctl,
+        );
+        assert!(stop_reason(&r.items[0]).contains("nothing"), "{r:?}");
+        assert_eq!(std::fs::read(src.join("a")).unwrap(), b"a", "trash={trash}");
+        assert_eq!(LocalFs::trashed_by_tests(&s(&src.join("a"))), None);
+        let trace = fs.trace.lock().unwrap().clone();
+        assert!(!trace.iter().any(|t| t.starts_with("remove")), "{trace:?}");
+    }
+    // An entry's look inside a folder, on both file layers.
+    both(|mut fs, how| {
+        let (_t, src, _dst) = scratch();
+        let d = src.join("d");
+        std::fs::create_dir(&d).unwrap();
+        std::fs::write(d.join("x"), "x").unwrap();
+        let mut ctl = Script::default();
+        let esc = ctl.cancel.clone();
+        let x = s(&d.join("x"));
+        let _seam = crate::remote::ops::seam_tree_looked(move |p| {
+            if p == x {
+                esc.store(true, Ordering::Relaxed);
+            }
+        });
+        let r = run(
+            &here(Op::Delete { trash: false }, &src, &["d"]),
+            Hosts::Same(fs.as_mut()),
+            &mut ctl,
+        );
+        assert!(stop_reason(&r.items[0]).contains("nothing"), "{how}: {r:?}");
+        assert_eq!(std::fs::read(d.join("x")).unwrap(), b"x", "{how}");
+    });
+}
+
+/// K-C4 against a server whose plain rename really replaces (a tap sends it as
+/// `posix-rename@openssh.com`): the copy is refused with the reason, nothing of it is staged or
+/// written over, and what the probe could not take back — its second file, now holding the
+/// first's bytes, and its folder — is named in the reason.
+#[test]
+fn k_c4_a_server_that_really_replaces_is_refused_and_the_probes_leftovers_named() {
+    let (_t, src, dst) = scratch();
+    let Some(mut fs) = SftpRemote::local_server_args(&["-P", "hardlink"], None) else {
+        return;
+    };
+    let Some(plain) = SftpRemote::seam_plain_replacing(&["-P", "hardlink"], None) else {
+        return;
+    };
+    std::fs::write(src.join("a"), "source a").unwrap();
+    std::fs::write(dst.join("z"), "theirs").unwrap();
+    let r = run(
+        &job(Op::Copy, &src, &["a"], &dst),
+        Hosts::Same(&mut fs),
+        &mut Script::default(),
+    );
+    let why = only_failure(&r);
+    assert!(
+        why.contains("plain rename replaces an existing name"),
+        "{why}"
+    );
+    assert!(why.contains("sopen's rename probe left"), "{why}");
+    let probe: Vec<String> = names(&dst)
+        .into_iter()
+        .filter(|n| n.starts_with(".sopen-probe-"))
+        .collect();
+    assert_eq!(probe.len(), 1, "{:?}", names(&dst));
+    assert_eq!(names(&dst.join(&probe[0])), ["b"]);
+    assert_eq!(std::fs::read(dst.join("z")).unwrap(), b"theirs");
+    assert!(!names(&dst).contains(&"a".to_string()));
+    drop(plain);
+}
+
+/// The selected folder itself is swapped for a link to a folder outside the selection, right
+/// after the walk's look at it: nothing outside is removed — on this machine the folder is
+/// opened without following a link; over SFTP its canonical path is taken before the look, so
+/// the link does not resolve there.
+#[test]
+fn the_selected_folder_swapped_for_a_link_mid_delete_is_never_gone_through() {
+    both(|mut fs, how| {
+        let (_t, src, dst) = scratch();
+        let (d, keep) = swap_fixture(&src, &dst);
+        let (top, away) = (s(&d), src.join("moved-away"));
+        let target = keep.clone();
+        let _seam = crate::remote::ops::seam_tree_looked(move |p| {
+            if p == top && !Path::new(&top).is_symlink() {
+                std::fs::rename(&top, &away).unwrap();
+                std::os::unix::fs::symlink(&target, &top).unwrap();
+            }
+        });
+        let r = run(
+            &here(Op::Delete { trash: false }, &src, &["d"]),
+            Hosts::Same(fs.as_mut()),
+            &mut Script::default(),
+        );
+        assert_eq!(names(&keep), ["sentinel"], "{how}: {r:?}");
+        assert!(d.is_symlink(), "{how}: the link stays");
+        assert_eq!(
+            std::fs::read(src.join("moved-away/sub/x")).unwrap(),
+            b"x",
+            "{how}"
+        );
+        assert!(
+            matches!(&r.items[0].outcome, ItemOutcome::Failed(_)),
+            "{how}: {r:?}"
+        );
+    });
 }
