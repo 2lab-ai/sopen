@@ -150,12 +150,33 @@ pub fn backup_path(cache: &Path, host: &str, abs: &str, at: SystemTime) -> PathB
     path
 }
 
+/// A file whose lock this process took, let go by unlocking when this drops — never only by
+/// closing the descriptor. A lock belongs to the open file description, and a child any thread
+/// forks meanwhile (every child sopen starts: ssh, git, ffmpeg) holds a copy of every
+/// descriptor until its exec (close-on-exec takes it away only then): closed alone, the lock
+/// stays held by that copy, and the next locker finds it held by no one. Unlocking lets it go
+/// for every copy. Whoever unlinks a lock's path does so before this drops, while it is held.
+struct Locked(File);
+
+impl std::ops::Deref for Locked {
+    type Target = File;
+    fn deref(&self) -> &File {
+        &self.0
+    }
+}
+
+impl Drop for Locked {
+    fn drop(&mut self) {
+        let _ = self.0.unlock();
+    }
+}
+
 /// A job's lock (a render in `.edits`, a work folder in `.exports`): `<path>.lock`, held
 /// while the job runs. The lock file is removed when the job ends; one whose lock nobody holds
 /// is a job whose sopen died — [`sweep_stale_jobs`] removes what it left.
 pub struct JobLock {
     path: PathBuf,
-    _file: File,
+    _file: Locked,
 }
 
 impl JobLock {
@@ -174,12 +195,16 @@ impl JobLock {
             .with_context(|| format!("cannot create {}", path.display()))?;
         file.try_lock()
             .map_err(|e| anyhow::anyhow!("cannot lock {}: {e}", path.display()))?;
-        Ok(Self { path, _file: file })
+        Ok(Self {
+            path,
+            _file: Locked(file),
+        })
     }
 }
 
 impl Drop for JobLock {
-    /// Removed while still held, so no sweep can take a lock file that is going away.
+    /// Removed while still held, so no sweep can take a lock file that is going away; then
+    /// let go by unlocking, as the field drops.
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.path);
     }
@@ -246,6 +271,8 @@ fn sweep_with(cache: &Path, between: &mut dyn FnMut(&Path)) -> Vec<PathBuf> {
             if file.try_lock().is_err() {
                 continue; // its job is running
             }
+            // Let go when this iteration ends, after its path is removed.
+            let file = Locked(file);
             // A job that ends removes its lock file before letting it go: a lock got after
             // that is of a file no longer at this path (the job ended — a kept render — or a
             // new one took the name). Only the file still there is a dead job's.
@@ -314,7 +341,7 @@ pub struct Claim {
     /// `local` was created empty by this claim (a session copy): nothing in it to keep.
     fresh: bool,
     /// The shared copy's lock; `None` for a session copy (only its own session uses it).
-    _lock: Option<File>,
+    _lock: Option<Locked>,
 }
 
 /// A copy moved aside before a fetch, and what is known about it.
@@ -381,13 +408,14 @@ const HELD_RETRY_EVERY: std::time::Duration = std::time::Duration::from_millis(5
 /// long or short enough that no clock decides them).
 ///
 /// A lock found held is asked for again, every [`HELD_RETRY_EVERY`] for up to `held_retry`,
-/// before this session takes a copy of its own. The reason is sopen's own children: on Linux
-/// each is started with a `pre_exec` (`PR_SET_PDEATHSIG`, S1-M), so it is forked, and between
-/// its fork and its exec it holds a copy of every descriptor of this process — the lock of a
-/// claim this process has just let go included (close-on-exec only takes it away at the exec).
-/// A claim of the same copy made in that instant would find the lock held by no session at
-/// all, and fall back for nothing. Such a lock is free within milliseconds; another session's
-/// is held for as long as it lives, so that one costs the wait once and then gets its copy.
+/// before this session takes a copy of its own. The reason is children: on Linux each of
+/// sopen's is started with a `pre_exec` (`PR_SET_PDEATHSIG`, S1-M), so it is forked, and between
+/// its fork and its exec it holds a copy of every descriptor of its process — a lock let go only
+/// by closing its descriptor included (close-on-exec only takes it away at the exec). A claim
+/// let go here is unlocked ([`Locked`]), so no child keeps it; one let go elsewhere only by
+/// closing it (an older sopen) would be found held by no session at all, and is free within
+/// milliseconds. Another session's is held for as long as it lives, so that one costs the wait
+/// once and then gets its copy.
 fn claim_with(
     cache: &Path,
     cached: &Path,
@@ -411,13 +439,15 @@ fn claim_with(
     };
     let why = match tried {
         Ok(()) => {
+            // Guarded at once, so an error building the claim still unlocks explicitly.
+            let locked = Locked(file);
             return Ok(Claim {
                 local: cached.to_path_buf(),
                 record: meta_path(cache, "record", cached)?,
                 note: None,
                 fresh: false,
-                _lock: Some(file),
-            })
+                _lock: Some(locked),
+            });
         }
         Err(std::fs::TryLockError::WouldBlock) => {
             format!("another sopen session has {} open", cached.display())
@@ -580,6 +610,12 @@ fn sweep_legacy_previews_at(cache: &Path, now: SystemTime) {
 /// is gone and its lock, and an old free lock without its folder, by [`sweep_legacy_previews`]'s
 /// rule, as of `now`. Whether `root` was a real folder that was looked into.
 fn sweep_windows(root: &Path, now: SystemTime) -> bool {
+    sweep_windows_with(root, now, &mut |_| {})
+}
+
+/// [`sweep_windows`], calling `took` with each lock it took, while it holds it (tests: a child
+/// forked in that instant keeps a copy of the descriptor).
+fn sweep_windows_with(root: &Path, now: SystemTime, took: &mut dyn FnMut(&File)) -> bool {
     if !std::fs::symlink_metadata(root).is_ok_and(|m| m.is_dir()) {
         return false;
     }
@@ -592,11 +628,15 @@ fn sweep_windows(root: &Path, now: SystemTime) -> bool {
         PathBuf::from(lock)
     };
     // `Some(held)` when the window is gone: its lock, taken here and held while its folder
-    // goes (`None` inside for no lock at all); `None` when it lives or cannot be told.
-    let gone = |lock: &Path| match File::open(lock) {
+    // and then its lock file go (`None` inside for no lock at all); `None` when it lives or
+    // cannot be told.
+    let mut gone = |lock: &Path| match File::open(lock) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(None),
         Err(_) => None,
-        Ok(file) => file.try_lock().is_ok().then_some(Some(file)),
+        Ok(file) => file.try_lock().is_ok().then(|| {
+            took(&file);
+            Some(Locked(file))
+        }),
     };
     let window = window_name;
     let mut lone = Vec::new();
@@ -623,8 +663,14 @@ fn sweep_windows(root: &Path, now: SystemTime) -> bool {
         let aged = std::fs::metadata(&lock)
             .and_then(|m| m.modified())
             .is_ok_and(|at| now.duration_since(at).is_ok_and(|age| age >= LONE_LOCK_AGE));
-        if aged && !lock.with_extension("").exists() && gone(&lock).is_some() {
+        if !aged || lock.with_extension("").exists() {
+            continue;
+        }
+        // Unlinked while held, as with a folder's: a creator that made it and paused before
+        // taking it then finds its lock no longer at the path, and makes another.
+        if let Some(held) = gone(&lock) {
             let _ = std::fs::remove_file(&lock);
+            drop(held);
         }
     }
     true
@@ -645,7 +691,8 @@ fn window_name(name: &str) -> bool {
 /// first sweeps the root by the preview root's rule ([`sweep_legacy_previews`]): the folders of
 /// windows that are gone (their lock is free, or missing) and old free locks without a folder,
 /// so a crashed window's files do not stay. Where the lock cannot be taken (a filesystem
-/// without working locks) there is no space: its folder would look like a crashed window's.
+/// without working locks, or one still found held after a few more asks) there is no space:
+/// its folder would look like a crashed window's.
 /// What it removes, it removes only while the path still names what it made: the folder's
 /// device and inode, the lock it holds — never through a link put in their place.
 pub struct RevisionSpace {
@@ -653,7 +700,8 @@ pub struct RevisionSpace {
     /// The folder's device and inode, as made.
     id: (u64, u64),
     lock: PathBuf,
-    _held: File,
+    /// Let go after [`Drop`] has removed what the paths still name ([`Locked`]).
+    _held: Locked,
     next: std::sync::atomic::AtomicU64,
 }
 
@@ -665,6 +713,11 @@ fn dir_id(dir: &Path) -> Option<(u64, u64)> {
         .filter(|m| m.is_dir())
         .map(|m| (m.dev(), m.ino()))
 }
+
+/// How many times a new [`RevisionSpace`] asks again for its own lock found held, and how
+/// often, before it refuses.
+const SPACE_LOCK_RETRIES: u32 = 5;
+const SPACE_LOCK_RETRY_EVERY: std::time::Duration = std::time::Duration::from_millis(20);
 
 impl RevisionSpace {
     pub fn new(cache: &Path) -> Result<Self> {
@@ -681,9 +734,19 @@ impl RevisionSpace {
         let root = revisions_root(cache);
         for _ in 0..TRIES {
             let (lock, held) = Self::new_lock(&root)?;
+            // Found held, it is asked for again a few times: a sweep in another thread or
+            // process that found it old and alone (the pause below) holds it only for a moment.
+            let mut tried = try_lock(&held);
+            for _ in 0..SPACE_LOCK_RETRIES {
+                if !matches!(tried, Err(std::fs::TryLockError::WouldBlock)) {
+                    break;
+                }
+                std::thread::sleep(SPACE_LOCK_RETRY_EVERY);
+                tried = try_lock(&held);
+            }
             // Without its lock held the folder would look like a crashed window's, and the next
             // window's sweep would remove it under this one: no space, then.
-            if let Err(e) = try_lock(&held) {
+            if let Err(e) = tried {
                 let _ = std::fs::remove_file(&lock);
                 let _ = std::fs::remove_dir(&root);
                 let why = match e {
@@ -695,6 +758,8 @@ impl RevisionSpace {
                     lock.display()
                 );
             }
+            // Let go on every way out from here but the space itself ([`Locked`]).
+            let held = Locked(held);
             // A pause between making the lock and taking it, past a lone lock's age, lets a
             // sweep take the free lock for a crashed window's and unlink it: what is locked is
             // then no file at the path, and the folder would be swept as a crashed window's.
@@ -810,9 +875,8 @@ impl Drop for RevisionSpace {
 }
 
 /// Tests: an earlier session's cached copy of `abs` on `host`, left as a session leaves it — its
-/// record says it held `fetched`, and it holds `now` — made without taking its lock (a claim
-/// dropped right before another one was seen still holding its lock while the parallel tests
-/// spawn processes). Returns the copy's path.
+/// record says it held `fetched`, and it holds `now` — made without a claim, so no lock of it
+/// is taken here. Returns the copy's path.
 #[cfg(test)]
 pub(crate) fn seed_copy(
     cache: &Path,
@@ -1065,9 +1129,9 @@ mod job_tests {
 #[cfg(test)]
 mod tests {
     /// A lock found held is asked for again for a moment before the claim takes the copy for
-    /// another session's: one let go within that moment (a child of sopen's, between its fork
-    /// and its exec, holds a copy of a lock this process has just released) gives the shared
-    /// copy, with no session copy made; one held past it is another session's, as before.
+    /// another session's: one let go within that moment (let go elsewhere only by closing it,
+    /// while a child between its fork and its exec still holds a copy) gives the shared copy,
+    /// with no session copy made; one held past it is another session's, as before.
     /// No clock decides either half: the first has a window far longer than the test and lets
     /// the lock go only once the claim has found it held; the second holds it for good.
     #[test]
@@ -1081,7 +1145,7 @@ mod tests {
         let (found_held, told) = std::sync::mpsc::channel::<()>();
         let release = std::thread::spawn(move || {
             told.recv().expect("the claim found the lock held");
-            drop(held);
+            held.unlock().unwrap();
         });
         let mut found = 0;
         let claim = claim_with(tmp.path(), &cached, Duration::from_secs(30), &mut |file| {
@@ -1547,23 +1611,13 @@ mod tests {
             std::fs::read_to_string(root.join(live).join("0.txt")).unwrap(),
             "in use"
         );
+        // Let go by unlocking, not only by closing: a process another test forks in that
+        // instant keeps a copy of the descriptor until its exec ([`Locked`]).
+        held.unlock().unwrap();
         drop(held);
-        // Two minutes on, the fresh lock is old. A lock just let go may still be held for an
-        // instant — a process another test forks has a copy of its descriptor until its exec
-        // (the note on `claim`) — so the sweep is asked again until the window is gone.
-        let later = SystemTime::now() + 2 * LONE_LOCK_AGE;
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        while {
-            sweep_legacy_previews_at(tmp.path(), later);
-            left() != ["foo.lock", "keep"]
-        } {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "the last window stayed: {:?}",
-                left()
-            );
-            std::thread::sleep(Duration::from_millis(5));
-        }
+        // Two minutes on, the fresh lock is old.
+        sweep_legacy_previews_at(tmp.path(), SystemTime::now() + 2 * LONE_LOCK_AGE);
+        assert_eq!(left(), ["foo.lock", "keep"], "the last window went");
         assert_eq!(
             std::fs::read_to_string(root.join("keep/mine.txt")).unwrap(),
             "not sopen's"
@@ -1825,6 +1879,137 @@ mod tests {
         );
         sweep_windows(&root, later);
         assert!(space.dir().exists(), "its folder survives the next sweep");
+    }
+
+    /// The same pause in a full run: a child another test forked while the sweep held the lone
+    /// lock kept a copy of the sweep's descriptor — and the lock with it, until its exec — so the
+    /// creator found the lock it made held, and no space was made. A copy of every lock the
+    /// sweep takes, kept past the sweep, stands in for that child: the sweep lets go by
+    /// unlocking, which frees the lock for every copy, and the creator makes another.
+    #[test]
+    fn a_lock_swept_while_a_child_has_the_sweeps_descriptor_is_made_again() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = revisions_root(tmp.path());
+        let later = SystemTime::now() + 2 * LONE_LOCK_AGE;
+        let mut children = Vec::new();
+        let mut tries = 0;
+        let space = RevisionSpace::new_with(tmp.path(), &mut |file| {
+            tries += 1;
+            if tries == 1 {
+                sweep_windows_with(&root, later, &mut |taken| {
+                    children.push(taken.try_clone().unwrap());
+                });
+            }
+            file.try_lock()
+        })
+        .unwrap();
+        assert_eq!(children.len(), 1, "the sweep took the lone lock");
+        assert_eq!(tries, 2, "made again once");
+        assert!(
+            same_file(&space._held, &space.lock),
+            "the lock path names the lock held"
+        );
+        drop(children);
+    }
+
+    /// A claim let go while a child forked in that instant still has a copy of its descriptor
+    /// (sopen's own children, between fork and exec): the next claim of the copy finds it free
+    /// at once and gets the shared copy, not a session copy made for nothing. A kept copy of
+    /// the claim's descriptor stands in for the child.
+    #[test]
+    fn a_claim_let_go_is_free_while_a_child_has_a_copy_of_its_descriptor() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cached = cache_path(tmp.path(), "box", "/data/a.bin");
+        let first = claim_with(tmp.path(), &cached, Duration::ZERO, &mut |f| f.try_lock()).unwrap();
+        assert_eq!(first.note, None);
+        let child = first._lock.as_ref().unwrap().try_clone().unwrap();
+        drop(first);
+        let next = claim_with(tmp.path(), &cached, Duration::ZERO, &mut |f| f.try_lock()).unwrap();
+        assert_eq!(next.note, None, "the shared copy, not a session copy");
+        assert_eq!(next.local, cached);
+        drop(child);
+    }
+
+    /// A window's revisions and a job hold their lock for as long as they live, and when they
+    /// drop they let it go by unlocking, after its path is gone: one opened before (a sweep that
+    /// opened it and has yet to try it) then finds it free, even while a child forked in that
+    /// instant has a copy of the descriptor.
+    #[test]
+    fn a_space_or_a_job_let_go_is_free_while_a_child_has_a_copy_of_its_descriptor() {
+        let tmp = tempfile::tempdir().unwrap();
+        let space = RevisionSpace::new(tmp.path()).unwrap();
+        let job = JobLock::take(&exports_root(tmp.path()).join("aaaa")).unwrap();
+        let probes = [
+            File::open(&space.lock).unwrap(),
+            File::open(&job.path).unwrap(),
+        ];
+        let children = [
+            space._held.try_clone().unwrap(),
+            job._file.try_clone().unwrap(),
+        ];
+        drop((space, job));
+        for probe in &probes {
+            probe.try_lock().expect("let go");
+            probe.unlock().unwrap();
+        }
+        drop(children);
+    }
+
+    /// A new space whose own lock is found held — for a moment, by a sweep in another thread or
+    /// process — asks again a few times before it refuses: one let go by the second ask makes
+    /// the space; one held past every ask is refused with the reason, and leaves nothing.
+    #[test]
+    fn a_new_space_asks_again_for_its_lock_found_held() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = revisions_root(tmp.path());
+        // The lock just made, opened again and locked: a holder other than the creator.
+        let other = |root: &Path| {
+            let lock = std::fs::read_dir(root)
+                .unwrap()
+                .flatten()
+                .map(|e| e.path())
+                .find(|p| p.extension().is_some_and(|x| x == "lock"))
+                .unwrap();
+            let file = File::open(lock).unwrap();
+            file.try_lock().unwrap();
+            file
+        };
+        let mut holder = None;
+        let mut asks = 0;
+        let space = RevisionSpace::new_with(tmp.path(), &mut |file| {
+            asks += 1;
+            if asks == 1 {
+                holder = Some(other(&root));
+            } else if let Some(holder) = holder.take() {
+                holder.unlock().unwrap();
+            }
+            file.try_lock()
+        })
+        .unwrap();
+        assert_eq!(asks, 2, "asked again once");
+        assert!(same_file(&space._held, &space.lock));
+        drop(space);
+        // Held past every ask.
+        let mut holder = None;
+        let mut asks = 0;
+        let refused = RevisionSpace::new_with(tmp.path(), &mut |file| {
+            asks += 1;
+            if asks == 1 {
+                holder = Some(other(&root));
+            }
+            file.try_lock()
+        });
+        let err = format!("{:#}", refused.err().expect("refused"));
+        assert!(
+            err.contains("cannot be locked (it is held): no files at a revision"),
+            "{err}"
+        );
+        assert_eq!(asks, 1 + SPACE_LOCK_RETRIES, "a bounded number of asks");
+        holder.unwrap().unlock().unwrap();
+        let left: Vec<_> = std::fs::read_dir(&root)
+            .map(|rd| rd.flatten().map(|e| e.file_name()).collect())
+            .unwrap_or_default();
+        assert!(left.is_empty(), "nothing left: {left:?}");
     }
 
     #[test]
