@@ -518,6 +518,9 @@ fn run_open(
     dirs: &Dirs,
     rec: &mut Record,
 ) -> Result<()> {
+    // The windows of this run feed the macOS F-key switch (04 §6.2), its files in the state
+    // folder; nothing is read or started before the first window.
+    gui::fkeys_for_run(dirs.state.clone());
     let target = target::parse(arg).map_err(anyhow::Error::msg)?;
     let (mut place, path) = Place::connect(&target, dirs, rec)?;
     let abs = place.fs().realpath(&path)?;

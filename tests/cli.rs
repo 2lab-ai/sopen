@@ -1918,6 +1918,50 @@ fn default_target_from_config_or_env_and_the_flags_beat_both() {
     assert!(ssh.argv().is_none(), "ssh ran with no target");
 }
 
+/// `sopen config fkeys` as the README and spec §4a show it (04 §6.2, K-F4's file half): it
+/// writes `fkeys = "<word>"`, `sopen config` shows it once it is set, the target stays beside
+/// it, and a word that is neither is refused with the file unchanged.
+#[test]
+fn config_fkeys_is_set_and_shown() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = tmp.path().join("config.toml");
+    let shown = sopen(tmp.path(), &["config"], &[]);
+    assert_eq!(
+        text(&shown.stdout),
+        format!("{}\ntarget is not set\n", config.display()),
+        "no fkeys line while the file does not set it"
+    );
+    let set = sopen(tmp.path(), &["config", "fkeys", "system"], &[]);
+    assert!(set.status.success(), "{}", text(&set.stderr));
+    assert_eq!(
+        text(&set.stdout),
+        format!("fkeys = system ({})\n", config.display())
+    );
+    assert_eq!(
+        std::fs::read_to_string(&config).unwrap(),
+        "fkeys = \"system\"\n"
+    );
+    let shown = sopen(tmp.path(), &["config"], &[]);
+    assert_eq!(
+        text(&shown.stdout),
+        format!("{}\ntarget is not set\nfkeys = system\n", config.display())
+    );
+    let target = sopen(tmp.path(), &["config", "target", HOST], &[]);
+    assert!(target.status.success(), "{}", text(&target.stderr));
+    let set = sopen(tmp.path(), &["config", "fkeys", "function"], &[]);
+    assert!(set.status.success(), "{}", text(&set.stderr));
+    assert_eq!(
+        std::fs::read_to_string(&config).unwrap(),
+        format!("target = \"{HOST}\"\nfkeys = \"function\"\n")
+    );
+    let bad = sopen(tmp.path(), &["config", "fkeys", "media"], &[]);
+    assert_eq!(bad.status.code(), Some(2), "{}", text(&bad.stderr));
+    assert_eq!(
+        std::fs::read_to_string(&config).unwrap(),
+        format!("target = \"{HOST}\"\nfkeys = \"function\"\n")
+    );
+}
+
 #[test]
 fn an_unreadable_sopen_target_only_matters_without_a_flag() {
     use std::os::unix::ffi::OsStrExt;

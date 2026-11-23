@@ -2,7 +2,9 @@
 //! dialog and hex window (spec §6a) and the media window (spec §7). This module is the shared
 //! shell: where the opened file lives ([`Origin`]),
 //! the window runner (wgpu renderer, glow fallback, activation on start, Cmd/Ctrl+Q through the
-//! close prompt), the receipt hooks ([`Hooks`]) and the screenshot driver. Everything that writes
+//! close prompt), the receipt hooks ([`Hooks`]), the screenshot driver and the windows' feed of the
+//! macOS F-key switch (`Feed`: whether a window is in front, acted on by a thread of its own;
+//! `.prd/04-file-keys.md` §6.2). Everything that writes
 //! (Save, Save copy, Export, Save to…) is a plain function over [`Origin`] or a local path,
 //! called by the window's buttons and by the windowless hooks alike.
 
@@ -24,13 +26,16 @@ pub mod text;
 
 pub use select::{fit, Map, Selection};
 
+use crate::config;
+use crate::fnkeys::{self, Fkeys, Switch};
 use crate::remote::{RemoteFs, Stat};
 use anyhow::{anyhow, bail, Context as _, Result};
 use eframe::egui;
 use std::cell::RefCell;
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::{mpsc, Arc, Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant, SystemTime};
 
 /// Opens a fresh connection to the file's host (the session can die while a window is open).
@@ -644,9 +649,11 @@ pub fn hosted(ctx: &egui::Context) -> bool {
 
 /// A window's F-key row at the bottom of `ui` — F1 (its key help, [`help`]), F3 (closes it, as
 /// Cmd/Ctrl+W does) and its own `keys` — and F1 and F3 themselves, without modifiers (04 §3
-/// rule 1). Nothing while it is hosted: the host's row lists the window's keys with its own, and
-/// its F1 and F3 are the host's. Call it before the window's other bottom panels (the row is the
-/// window's last).
+/// rule 1); above the row, while the F-key switch did not take effect, a status row saying so
+/// ([`fkeys_status`], 04 §6.3: the row's slots and Cmd/Ctrl+digits still work). Nothing while
+/// it is hosted: the host's row lists the window's keys with its own, its F1 and F3 are the
+/// host's, and so is its status row. Call it before the window's other bottom panels (the row
+/// is the window's last).
 pub fn own_keys(ui: &mut egui::Ui, keys: &[chrome::FKey]) {
     let ctx = ui.ctx().clone();
     if hosted(&ctx) {
@@ -654,6 +661,10 @@ pub fn own_keys(ui: &mut egui::Ui, keys: &[chrome::FKey]) {
     }
     let row = chrome::merged(&[chrome::HELP_KEY, chrome::EXIT_KEY], keys);
     chrome::key_panel(ui, "sopen-own-keys", &row);
+    if let Some(line) = fkeys_status(&ctx) {
+        chrome::bar_panel(egui::Panel::bottom("sopen-own-fkeys"))
+            .show(ui, |ui| chrome::status_row(ui, &Status::error(line)));
+    }
     // Not while a text field has the keyboard (F-keys are not text, but the field is the
     // owner's).
     if ctx.text_edit_focused() {
@@ -874,6 +885,9 @@ struct Shell<W: Window> {
     raise: Raise,
     /// `help=1`: F1 is pressed once the window is ready.
     press: Press,
+    /// This process's F-key switch, told on every pass whether a window is in front (04 §6.2);
+    /// none in a scripted run, with `fkeys = "system"` or off macOS.
+    fkeys: Option<Arc<Feed>>,
 }
 
 /// The `help=1` receipt: F1 pressed once what the state asked for is on screen, then the
@@ -1003,6 +1017,14 @@ impl<W: Window> eframe::App for Shell<W> {
     /// The skin's window body where nothing is painted (eframe's default is a dark grey).
     fn clear_color(&self, visuals: &egui::Visuals) -> [f32; 4] {
         visuals.panel_fill.to_normalized_gamma_f32()
+    }
+
+    /// Before every `ui` and, while the window is hidden (minimised, covered), instead of it:
+    /// the F-key switch hears whether a window of this process is in front.
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if let Some(feed) = &self.fkeys {
+            feed.pass(ctx);
+        }
     }
 
     fn raw_input_hook(&mut self, _ctx: &egui::Context, raw: &mut egui::RawInput) {
@@ -1171,6 +1193,7 @@ pub fn run_window_sized<W: Window + 'static>(
             }
         });
     }
+    let fkeys = this_runs_fkeys();
     let shell = Shell {
         inner: window,
         scripted: hooks.scripted(),
@@ -1191,6 +1214,7 @@ pub fn run_window_sized<W: Window + 'static>(
         } else {
             Press::Done
         },
+        fkeys: fkeys.clone(),
     };
     // The app moves into whichever renderer starts. A renderer that fails before creating the
     // app leaves it here for the next one.
@@ -1237,6 +1261,13 @@ pub fn run_window_sized<W: Window + 'static>(
             other => other,
         },
     };
+    // The window is gone: the switch is let go now (04 §6.2), not when sopen exits, which can
+    // be much later (the browser waits for its file operations).
+    if let Some(feed) = &fkeys {
+        if !feed.closed(CLOSE_WAIT) {
+            crate::debug!("F-key switch: not let go within {CLOSE_WAIT:?} of the window's end");
+        }
+    }
     run.map_err(|e| anyhow!("cannot open a window: {e}"))?;
     if hooks.screenshot.is_some() {
         match shot_result.lock().unwrap().take() {
@@ -1246,6 +1277,420 @@ pub fn run_window_sized<W: Window + 'static>(
         }
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------------------------
+// The macOS F-key switch, fed by the windows (04 §6.2).
+
+/// The windows' side of this process's F-key switch ([`fnkeys`]): one per process, as the
+/// holder is the process. Every pass of a window ([`Shell`]'s `logic`, which eframe runs while
+/// the window is hidden too) says whether a window of this process is in front ([`in_front`]),
+/// and a thread of the switch's own acts on it ([`serve`]). Building the switch (the start's
+/// clean-up), starting its watchdog, acquiring and releasing can all wait — for the lock a
+/// stopped sopen holds, for the watchdog to say it is ready — so none of it runs on the
+/// window's thread, which only sends (a send never waits) and reads the status line the
+/// switch's thread leaves.
+pub(crate) struct Feed {
+    told: mpsc::Sender<Told>,
+    said: Arc<Mutex<Said>>,
+    /// The last word sent: [`UNSAID`], [`NOT_FRONT`] or [`FRONT`].
+    sent: AtomicU8,
+}
+
+const UNSAID: u8 = 0;
+const NOT_FRONT: u8 = 1;
+const FRONT: u8 = 2;
+
+/// What the windows tell the switch's thread.
+enum Told {
+    /// Whether a window of this process is in front now.
+    Front(bool),
+    /// The window closed: let go now, without [`Timing::hold`], and say when that is done.
+    Closed(mpsc::Sender<()>),
+    /// What the system said about the Mac.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    Mac(Mac),
+}
+
+/// What the system says about the Mac (04 §6.2), in the order it says it: NSWorkspace's
+/// notifications on macOS ([`observe_the_mac`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) enum Mac {
+    /// It is about to sleep (`NSWorkspaceWillSleepNotification`): let go.
+    Sleeps,
+    /// It woke (`NSWorkspaceDidWakeNotification`): taken again if a window is in front.
+    Woke,
+    /// This login session became active (`true`, `NSWorkspaceSessionDidBecomeActiveNotification`:
+    /// taken again if a window is in front) or was switched away from (`false`,
+    /// `NSWorkspaceSessionDidResignActiveNotification`: let go).
+    Session(bool),
+}
+
+/// What the switch's thread leaves for the windows.
+#[derive(Default)]
+struct Said {
+    /// [`Fkeys::status`], as of its last change.
+    status: Option<String>,
+    /// The window to repaint when it changes.
+    ctx: Option<egui::Context>,
+}
+
+/// How the switch's thread paces itself.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Timing {
+    /// How long no window may be in front before the switch is let go: focus moving from one
+    /// window of the process to another can pass through a pass in which neither has it.
+    pub hold: Duration,
+    /// How often the thread wakes while a window is in front, to notice that the Mac slept.
+    pub tick: Duration,
+    /// The wall clock ran this much further than the monotonic one between two looks: the Mac
+    /// slept in between (Rust's `Instant` — `CLOCK_UPTIME_RAW` on macOS, `CLOCK_MONOTONIC` on
+    /// Linux — does not count a sleep; the wall clock does).
+    pub slept: Duration,
+}
+
+impl Timing {
+    pub const DEFAULT: Timing = Timing {
+        hold: Duration::from_millis(250),
+        tick: Duration::from_secs(1),
+        slept: Duration::from_secs(5),
+    };
+}
+
+/// How long a window's end waits for the switch to be let go: past it (a stopped sopen holds
+/// the lock) the thread goes on trying, and once sopen has exited its watchdog restores.
+const CLOSE_WAIT: Duration = Duration::from_secs(2);
+
+impl Feed {
+    /// The feed of a run (04 §6.2): none in a run a hook drives ([`fnkeys::scripted_run`]; `var`
+    /// reads the environment) or with `fkeys = "system"` — then `build` is never called and no
+    /// thread is started — and none when the config cannot be read (the run goes on: only a run
+    /// the config decides stops at it, 01 §4a; the switch is left alone, as the config may say
+    /// "system"). Else `build` makes the switch on the feed's own thread.
+    fn for_run<S: Switch + 'static>(
+        var: impl Fn(&str) -> Option<OsString>,
+        config: Result<config::Config>,
+        build: impl FnOnce(&config::Config) -> Option<Fkeys<S>> + Send + 'static,
+    ) -> Option<Feed> {
+        if fnkeys::scripted_run(var) {
+            return None;
+        }
+        let config = match config {
+            Ok(config) if config.fkeys() == config::Fkeys::System => return None,
+            Ok(config) => config,
+            Err(e) => {
+                crate::debug!("F-key switch: left alone: {e:#}");
+                return None;
+            }
+        };
+        Some(Feed::start(
+            move || build(&config),
+            Timing::DEFAULT,
+            SystemTime::now,
+        ))
+    }
+
+    /// A feed whose thread builds its switch with `build` (none: the thread ends), paced by
+    /// `timing`, reading the wall clock with `wall`.
+    fn start<S: Switch + 'static>(
+        build: impl FnOnce() -> Option<Fkeys<S>> + Send + 'static,
+        timing: Timing,
+        wall: impl FnMut() -> SystemTime + Send + 'static,
+    ) -> Feed {
+        let (told, heard) = mpsc::channel();
+        let said = Arc::new(Mutex::new(Said::default()));
+        let shared = said.clone();
+        let spawned = std::thread::Builder::new()
+            .name("sopen-fkeys".into())
+            .spawn(move || {
+                if let Some(switch) = build() {
+                    serve(switch, &heard, &shared, timing, wall);
+                }
+            });
+        if let Err(e) = spawned {
+            crate::debug!("F-key switch: no thread for it: {e}");
+        }
+        Feed {
+            told,
+            said,
+            sent: AtomicU8::new(UNSAID),
+        }
+    }
+
+    /// A pass of a window: whether a window is in front goes to the switch's thread when that
+    /// changed, and the thread's status line goes where the window's rows read it
+    /// ([`fkeys_status`]).
+    pub(crate) fn pass(&self, ctx: &egui::Context) {
+        let front = ctx.input(|i| in_front(&i.raw));
+        let word = if front { FRONT } else { NOT_FRONT };
+        if self.sent.swap(word, Ordering::SeqCst) != word {
+            let _ = self.told.send(Told::Front(front));
+        }
+        let status = {
+            let mut said = self.said.lock().unwrap_or_else(PoisonError::into_inner);
+            said.ctx = Some(ctx.clone());
+            said.status.clone()
+        };
+        ctx.data_mut(|d| match status {
+            Some(line) => {
+                d.insert_temp(fkeys_line_id(), FkeysLine(line));
+            }
+            None => d.remove::<FkeysLine>(fkeys_line_id()),
+        });
+    }
+
+    /// Where the system's word about the Mac goes: the switch's thread, as the windows' does.
+    /// Calling it never waits (a send). Only macOS has a source (Linux: the tests).
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub(crate) fn mac_events(&self) -> impl Fn(Mac) + Send + Sync + 'static {
+        let told = self.told.clone();
+        move |event| {
+            let _ = told.send(Told::Mac(event));
+        }
+    }
+
+    /// The window closed: the switch is let go now, waiting at most `wait` for it. Whether it
+    /// was, or there is nothing to let go (no switch: its thread has ended).
+    pub(crate) fn closed(&self, wait: Duration) -> bool {
+        self.sent.store(UNSAID, Ordering::SeqCst);
+        let (done, ended) = mpsc::channel();
+        if self.told.send(Told::Closed(done)).is_err() {
+            return true;
+        }
+        match ended.recv_timeout(wait) {
+            Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => true,
+            Err(mpsc::RecvTimeoutError::Timeout) => false,
+        }
+    }
+}
+
+/// Whether a window of this process is in front: focused, and neither minimised nor fully
+/// covered — over every viewport eframe reports (`RawInput::viewports`), one that does not say
+/// whether it is focused taking the pass's own focus (`RawInput::focused`). eframe refreshes
+/// both for `App::logic` while the window is hidden too.
+fn in_front(raw: &egui::RawInput) -> bool {
+    let this = raw.viewport_id;
+    let front = |id: egui::ViewportId, v: &egui::ViewportInfo| {
+        v.focused.unwrap_or(id == this && raw.focused)
+            && v.minimized != Some(true)
+            && v.occluded != Some(true)
+    };
+    raw.viewports.iter().any(|(id, v)| front(*id, v))
+        || (raw.focused && !raw.viewports.contains_key(&this))
+}
+
+/// The switch's thread: acts on what the windows and the system say until the feed is gone,
+/// then drops the switch (which lets go). A window in front acquires at once; none in front
+/// releases once that has lasted [`Timing::hold`], or at once when the window closed. The
+/// system's word ([`Mac`]) is acted on in the order it came: a sleep or a session switched away
+/// lets go, a wake or the session's return takes it again if a window is still in front
+/// (`Fkeys::sleep`, `wake`, `session`). A wake whose notification did not come is seen
+/// afterwards — the wall clock ran ahead of the monotonic one ([`Timing::slept`]), looked at on
+/// every message and every [`Timing::tick`] while a window is in front — and the switch is then
+/// let go and taken again: acquired anew, read back, if a window is still in front. A release
+/// that failed is tried again when it is due ([`Fkeys::next_retry`]), here, without a repaint.
+fn serve<S: Switch>(
+    mut switch: Fkeys<S>,
+    heard: &mpsc::Receiver<Told>,
+    said: &Mutex<Said>,
+    timing: Timing,
+    mut wall: impl FnMut() -> SystemTime,
+) {
+    // The windows' last word, and what the switch was last told.
+    let (mut front, mut held) = (false, false);
+    // What the system said last: the Mac sleeps, the session is switched away.
+    let (mut asleep, mut away_session) = (false, false);
+    // Since when no window has been in front while the switch is still told one is.
+    let mut away: Option<Instant> = None;
+    let mut looked = (wall(), Instant::now());
+    loop {
+        let now = Instant::now();
+        let mut wait: Option<Duration> = None;
+        let mut sooner = |d: Duration| wait = Some(wait.map_or(d, |w| w.min(d)));
+        if held {
+            sooner(timing.tick);
+        }
+        if let Some(since) = away {
+            sooner((since + timing.hold).saturating_duration_since(now));
+        }
+        // A release that failed runs again only while the switch is not wanted (`Fkeys::update`):
+        // while it is, its time passing must not wake the thread.
+        let wanted = held && !asleep && !away_session;
+        if let Some(at) = switch.next_retry().filter(|_| !wanted) {
+            sooner(at.saturating_duration_since(now));
+        }
+        let got = match wait {
+            Some(wait) => heard.recv_timeout(wait),
+            None => heard
+                .recv()
+                .map_err(|_| mpsc::RecvTimeoutError::Disconnected),
+        };
+        let mut closed = Vec::new();
+        let mut hear = |told: Told| match told {
+            Told::Front(is) => front = is,
+            Told::Closed(done) => {
+                front = false;
+                closed.push(done);
+            }
+            // In the order said, each at once (`Fkeys` acts on it with the focus it was last
+            // told), before the focus this turn settles on.
+            Told::Mac(Mac::Sleeps) => {
+                asleep = true;
+                switch.sleep();
+            }
+            Told::Mac(Mac::Woke) => {
+                asleep = false;
+                switch.wake();
+            }
+            Told::Mac(Mac::Session(active)) => {
+                away_session = !active;
+                switch.session(active);
+            }
+        };
+        match got {
+            Ok(told) => {
+                hear(told);
+                while let Ok(more) = heard.try_recv() {
+                    hear(more);
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => return,
+        }
+        let then = std::mem::replace(&mut looked, (wall(), Instant::now()));
+        let walked = looked.0.duration_since(then.0).unwrap_or_default();
+        if walked > looked.1.duration_since(then.1) + timing.slept {
+            switch.sleep();
+            switch.wake();
+            asleep = false;
+        }
+        if front {
+            (held, away) = (true, None);
+        } else if held {
+            let since = *away.get_or_insert_with(Instant::now);
+            if !closed.is_empty() || since.elapsed() >= timing.hold {
+                (held, away) = (false, None);
+            }
+        }
+        // Acts only on a change; while not wanted it also runs a release that is due.
+        switch.focus(held);
+        publish(said, switch.status());
+        for done in closed {
+            let _ = done.send(());
+        }
+    }
+}
+
+/// Leaves `status` for the windows, and repaints the window when it changed.
+fn publish(said: &Mutex<Said>, status: Option<&str>) {
+    let ctx = {
+        let mut said = said.lock().unwrap_or_else(PoisonError::into_inner);
+        if said.status.as_deref() == status {
+            return;
+        }
+        said.status = status.map(str::to_string);
+        said.ctx.clone()
+    };
+    if let Some(ctx) = ctx {
+        ctx.request_repaint();
+    }
+}
+
+/// The switch's status line in a window's context, for its rows ([`fkeys_status`]).
+#[derive(Debug, Clone)]
+struct FkeysLine(String);
+
+fn fkeys_line_id() -> egui::Id {
+    egui::Id::unique("sopen-fkeys-line")
+}
+
+/// The status row's line while the F-key switch did not take effect (04 §6.3,
+/// [`Fkeys::status`]), as this window's shell left it for the pass; `None` when it did, or
+/// there is no switch.
+pub fn fkeys_status(ctx: &egui::Context) -> Option<String> {
+    ctx.data(|d| d.get_temp::<FkeysLine>(fkeys_line_id()))
+        .map(|line| line.0)
+}
+
+/// The state folder of this run's F-key switch, set by the binary before any window
+/// ([`fkeys_for_run`]).
+static FKEYS_DIR: Mutex<Option<PathBuf>> = Mutex::new(None);
+/// This process's feed, made with its first window ([`this_runs_fkeys`]).
+static FKEYS: OnceLock<Option<Arc<Feed>>> = OnceLock::new();
+
+/// This run may open windows: they feed the F-key switch, whose files go in `state_dir` (04
+/// §6.3). Nothing is read or started before the first window.
+pub fn fkeys_for_run(state_dir: PathBuf) {
+    *FKEYS_DIR.lock().unwrap_or_else(PoisonError::into_inner) = Some(state_dir);
+}
+
+/// This process's feed, made at its first window from the environment and the config
+/// ([`Feed::for_run`]), its switch [`fnkeys::for_this_run`]'s; `None` without
+/// [`fkeys_for_run`] (the tests never call it).
+fn this_runs_fkeys() -> Option<Arc<Feed>> {
+    FKEYS
+        .get_or_init(|| {
+            let dir = FKEYS_DIR
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take()?;
+            let config = config::path().and_then(|path| config::load(&path));
+            let feed = Feed::for_run(
+                |name| std::env::var_os(name),
+                config,
+                move |config| fnkeys::for_this_run(config, &dir),
+            )?;
+            // Only with a switch in use (not "system", not a scripted run), once per process.
+            #[cfg(target_os = "macos")]
+            observe_the_mac(feed.mac_events());
+            Some(Arc::new(feed))
+        })
+        .clone()
+}
+
+/// NSWorkspace's notifications of sleep, wake and session switch (04 §6.2), told to `tell` for
+/// the rest of the process: `NSWorkspaceWillSleepNotification`, `…DidWakeNotification`,
+/// `…SessionDidResignActiveNotification`, `…SessionDidBecomeActiveNotification`, observed on
+/// `NSWorkspace.sharedWorkspace.notificationCenter`. Each block only sends ([`Feed::mac_events`]):
+/// it runs on the thread that posts the notification (no queue is given), AppKit's main thread,
+/// which must never wait for the switch's lock.
+#[cfg(target_os = "macos")]
+fn observe_the_mac(tell: impl Fn(Mac) + Send + Sync + 'static) {
+    use objc2_app_kit::{
+        NSWorkspace, NSWorkspaceDidWakeNotification, NSWorkspaceSessionDidBecomeActiveNotification,
+        NSWorkspaceSessionDidResignActiveNotification, NSWorkspaceWillSleepNotification,
+    };
+    use objc2_foundation::NSNotification;
+    use std::ptr::NonNull;
+    let tell = Arc::new(tell);
+    let center = NSWorkspace::sharedWorkspace().notificationCenter();
+    // SAFETY: AppKit's constant notification names, valid for the life of the process.
+    let names = unsafe {
+        [
+            (NSWorkspaceWillSleepNotification, Mac::Sleeps),
+            (NSWorkspaceDidWakeNotification, Mac::Woke),
+            (
+                NSWorkspaceSessionDidResignActiveNotification,
+                Mac::Session(false),
+            ),
+            (
+                NSWorkspaceSessionDidBecomeActiveNotification,
+                Mac::Session(true),
+            ),
+        ]
+    };
+    for (name, event) in names {
+        let tell = tell.clone();
+        let block = block2::RcBlock::new(move |_: NonNull<NSNotification>| tell(event));
+        // SAFETY: no object to match, no queue (the block runs where the notification is
+        // posted), and the block is sendable: it holds only a `Send + Sync` closure.
+        let observer = unsafe {
+            center.addObserverForName_object_queue_usingBlock(Some(name), None, None, &block)
+        };
+        // Observed until the process ends: the token is never handed back.
+        std::mem::forget(observer);
+    }
 }
 
 /// A status line: errors in the error colour, everything else plain.
@@ -2040,5 +2485,630 @@ mod tests {
             keep_path(Path::new("/c/box/README"), "unsaved", at, "1a2b"),
             PathBuf::from("/c/box/README.unsaved-20261111T092436Z-1a2b")
         );
+    }
+
+    // -- The F-key switch fed by the windows (04 §6.2), against a fake switch.
+
+    use crate::fnkeys::{Holder, Machine, Watchdog};
+    use std::sync::atomic::{AtomicU64, AtomicUsize};
+
+    /// The HID value as the switch sees it, shared as processes share the real one. (S7-A's
+    /// fake is private to `fnkeys::tests`.)
+    #[derive(Clone, Default)]
+    struct Hid(Arc<Mutex<HidState>>);
+
+    #[derive(Default)]
+    struct HidState {
+        value: i64,
+        /// Every write, in order, those that failed too.
+        writes: Vec<i64>,
+        /// A set to 1 fails.
+        refuse: bool,
+        /// The next this many writes of 0 fail.
+        fail_zeros: usize,
+    }
+
+    impl Switch for Hid {
+        fn read(&mut self) -> Result<i64> {
+            Ok(self.0.lock().unwrap().value)
+        }
+
+        fn write(&mut self, value: i64) -> Result<()> {
+            let mut hid = self.0.lock().unwrap();
+            hid.writes.push(value);
+            if value == fnkeys::ON && hid.refuse {
+                bail!("refused by the fake");
+            }
+            if value == fnkeys::OFF && hid.fail_zeros > 0 {
+                hid.fail_zeros -= 1;
+                bail!("the fake failed this write");
+            }
+            hid.value = value;
+            Ok(())
+        }
+    }
+
+    impl Hid {
+        fn writes(&self) -> Vec<i64> {
+            self.0.lock().unwrap().writes.clone()
+        }
+
+        fn value(&self) -> i64 {
+            self.0.lock().unwrap().value
+        }
+
+        fn with(&self, change: impl FnOnce(&mut HidState)) {
+            change(&mut self.0.lock().unwrap())
+        }
+    }
+
+    /// The made-up sopen process the tests' switches belong to.
+    const ME: Holder = Holder {
+        pid: 4242,
+        start: 4242,
+    };
+
+    /// This process's switch over `hid`, its files in `dir`, no watchdog; only [`ME`] runs.
+    fn switch(dir: &Path, hid: &Hid) -> Fkeys<Hid> {
+        Fkeys::new(
+            dir.to_path_buf(),
+            hid.clone(),
+            Ok(ME),
+            Machine {
+                runs: Arc::new(|h| *h == ME),
+                boot: None,
+            },
+            Watchdog::off(),
+        )
+    }
+
+    /// No hold: a window not in front lets go at once.
+    const QUICK: Timing = Timing {
+        hold: Duration::ZERO,
+        tick: Duration::from_secs(1),
+        slept: Duration::from_secs(5),
+    };
+
+    /// A feed whose thread builds [`switch`], paced by `timing`.
+    fn feed(dir: &Path, hid: &Hid, timing: Timing) -> Arc<Feed> {
+        let (dir, hid) = (dir.to_path_buf(), hid.clone());
+        Arc::new(Feed::start(
+            move || Some(switch(&dir, &hid)),
+            timing,
+            SystemTime::now,
+        ))
+    }
+
+    struct Blank;
+
+    impl Window for Blank {
+        fn ui(&mut self, _ui: &mut egui::Ui) {}
+
+        fn ready(&self) -> bool {
+            true
+        }
+    }
+
+    /// The shell around a blank window, as [`run_window_sized`] makes it, fed into `feed`.
+    fn shell(feed: &Arc<Feed>) -> Shell<Blank> {
+        Shell {
+            inner: Blank,
+            scripted: false,
+            shot: None,
+            frames: 0,
+            started: Instant::now(),
+            focus_asked: None,
+            raise: Raise::Done,
+            press: Press::Done,
+            fkeys: Some(feed.clone()),
+        }
+    }
+
+    /// A window of the process as eframe reports it, shown.
+    fn win(focused: bool) -> egui::ViewportInfo {
+        egui::ViewportInfo {
+            focused: Some(focused),
+            minimized: Some(false),
+            occluded: Some(false),
+            ..Default::default()
+        }
+    }
+
+    /// One pass of the shell's root viewport as eframe runs it (`epi_integration`): `logic`
+    /// then `ui` while the root is shown, `logic` alone (`run_logic`) while it is hidden. The
+    /// process's windows are `windows`, the root first.
+    fn pass(shell: &mut Shell<Blank>, ctx: &egui::Context, windows: &[egui::ViewportInfo]) {
+        let mut raw = egui::RawInput::default();
+        for (n, info) in windows.iter().enumerate() {
+            let id = match n {
+                0 => egui::ViewportId::ROOT,
+                n => egui::ViewportId::from_hash_of(("another window", n)),
+            };
+            raw.viewports.insert(id, info.clone());
+        }
+        let root = windows.first().cloned().unwrap_or_default();
+        raw.focused = root.focused == Some(true);
+        let mut frame = eframe::Frame::_new_kittest();
+        if root.minimized != Some(true) && root.occluded != Some(true) {
+            let mut out = ctx.run_ui(raw, |ui| {
+                eframe::App::logic(shell, ui.ctx(), &mut frame);
+                eframe::App::ui(shell, ui, &mut frame);
+            });
+            // No renderer: the texture uploads are dropped on purpose.
+            out.textures_delta.clear();
+        } else {
+            let _ = ctx.run_logic(&raw, |ctx| eframe::App::logic(shell, ctx, &mut frame));
+        }
+    }
+
+    /// Waits, at most 10 s, until `what` reads `want`.
+    fn wait_until<T: std::fmt::Debug + PartialEq>(what: impl Fn() -> T, want: T) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let now = what();
+            if now == want {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "{now:?}, not {want:?}, after 10 s"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// 04 §6.2 "When", through the shell as eframe runs it: a window in front acquires (the
+    /// fake reads 0 and is set to 1), none in front releases (0), and again; a window that keeps
+    /// its focus but is fully covered or minimised is not in front — its pass is `logic` alone
+    /// and still says so; a pass says only what changed; the window's end lets go at once.
+    #[test]
+    fn s7b_focus_through_the_shell_reaches_the_switch() {
+        // What the shell sends: only changes.
+        let (told, heard) = mpsc::channel();
+        let quiet = Arc::new(Feed {
+            told,
+            said: Arc::default(),
+            sent: AtomicU8::new(UNSAID),
+        });
+        let (ctx, mut sh) = (egui::Context::default(), shell(&quiet));
+        for front in [true, true, true, false, false, true] {
+            pass(&mut sh, &ctx, &[win(front)]);
+        }
+        let sent: Vec<Option<bool>> = heard
+            .try_iter()
+            .map(|t| match t {
+                Told::Front(front) => Some(front),
+                Told::Closed(_) | Told::Mac(_) => None,
+            })
+            .collect();
+        assert_eq!(sent, [Some(true), Some(false), Some(true)]);
+
+        let tmp = tempfile::tempdir().unwrap();
+        let hid = Hid::default();
+        let feed = feed(tmp.path(), &hid, QUICK);
+        let (ctx, mut sh) = (egui::Context::default(), shell(&feed));
+        pass(&mut sh, &ctx, &[win(true)]);
+        wait_until(|| hid.writes(), vec![1]);
+        assert!(tmp.path().join(fnkeys::STATE).exists());
+        pass(&mut sh, &ctx, &[win(false)]);
+        wait_until(|| hid.writes(), vec![1, 0]);
+        assert!(!tmp.path().join(fnkeys::STATE).exists());
+        pass(&mut sh, &ctx, &[win(true)]);
+        wait_until(|| hid.writes(), vec![1, 0, 1]);
+        let covered = egui::ViewportInfo {
+            occluded: Some(true),
+            ..win(true)
+        };
+        pass(&mut sh, &ctx, &[covered]);
+        wait_until(|| hid.writes(), vec![1, 0, 1, 0]);
+        pass(&mut sh, &ctx, &[win(true)]);
+        wait_until(|| hid.writes(), vec![1, 0, 1, 0, 1]);
+        let minimised = egui::ViewportInfo {
+            minimized: Some(true),
+            ..win(true)
+        };
+        pass(&mut sh, &ctx, &[minimised]);
+        wait_until(|| hid.writes(), vec![1, 0, 1, 0, 1, 0]);
+        pass(&mut sh, &ctx, &[win(true)]);
+        wait_until(|| hid.writes(), vec![1, 0, 1, 0, 1, 0, 1]);
+        assert_eq!(fkeys_status(&ctx), None, "it took effect");
+        // The window ends while in front: let go at once.
+        assert!(feed.closed(Duration::from_secs(10)));
+        assert_eq!(hid.writes(), [1, 0, 1, 0, 1, 0, 1, 0]);
+        assert_eq!(hid.value(), 0);
+        assert!(!tmp.path().join(fnkeys::STATE).exists());
+    }
+
+    /// 04 §6.2: the windows of one process hand focus to each other without a release. Focus
+    /// moving between two in one pass is still a window in front; moving over two passes, with
+    /// a pass in between where neither has it, is held for `hold`, and a window in front within
+    /// it keeps the switch. One write over all of it: the acquisition. Only none in front past
+    /// the hold lets go.
+    #[test]
+    fn s7b_focus_moving_between_two_windows_never_lets_go() {
+        let tmp = tempfile::tempdir().unwrap();
+        let hid = Hid::default();
+        let hold = Duration::from_millis(800);
+        let feed = feed(tmp.path(), &hid, Timing { hold, ..QUICK });
+        let (ctx, mut sh) = (egui::Context::default(), shell(&feed));
+        pass(&mut sh, &ctx, &[win(true), win(false)]);
+        wait_until(|| hid.writes(), vec![1]);
+        // In one pass: the root lets go, the other window takes it.
+        pass(&mut sh, &ctx, &[win(false), win(true)]);
+        // Over two passes, each way.
+        pass(&mut sh, &ctx, &[win(false), win(false)]);
+        pass(&mut sh, &ctx, &[win(true), win(false)]);
+        pass(&mut sh, &ctx, &[win(false), win(false)]);
+        pass(&mut sh, &ctx, &[win(false), win(true)]);
+        std::thread::sleep(hold * 2);
+        assert_eq!(hid.writes(), [1], "let go while focus moved");
+        assert_eq!(hid.value(), 1);
+        pass(&mut sh, &ctx, &[win(false), win(false)]);
+        wait_until(|| hid.writes(), vec![1, 0]);
+        assert!(feed.closed(Duration::from_secs(10)));
+    }
+
+    /// 04 §6.2 "never in a scripted run", and K-F4 at the windows' end: a run any of the five
+    /// hooks drives ([`fnkeys::scripted_run`]), a run with `fkeys = "system"`, and one whose
+    /// config cannot be read get no feed: the switch is never built. An empty hook does not
+    /// count; any other run builds it, once, on the feed's thread.
+    #[test]
+    fn s7b_scripted_runs_never_build_the_switch() {
+        let built = Arc::new(AtomicUsize::new(0));
+        let build = |built: &Arc<AtomicUsize>| {
+            let built = built.clone();
+            move |_: &config::Config| -> Option<Fkeys<Hid>> {
+                built.fetch_add(1, Ordering::SeqCst);
+                None
+            }
+        };
+        let function = || Ok(config::Config::default());
+        for hook in [
+            "SOPEN_SCREENSHOT",
+            "SOPEN_AUTOSAVE",
+            "SOPEN_AUTOEXPORT",
+            "SOPEN_LIST",
+            "SOPEN_KEYS",
+        ] {
+            let var = |name: &str| (name == hook).then(|| OsString::from("1"));
+            assert!(
+                Feed::for_run(var, function(), build(&built)).is_none(),
+                "{hook}"
+            );
+        }
+        let system = config::parse("fkeys = \"system\"\n").unwrap();
+        assert!(Feed::for_run(|_| None, Ok(system), build(&built)).is_none());
+        let broken = Err(anyhow!("config.toml: line 2: unknown field `colour`"));
+        assert!(Feed::for_run(|_| None, broken, build(&built)).is_none());
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(built.load(Ordering::SeqCst), 0, "a switch was built");
+        let empty = |name: &str| (name == "SOPEN_LIST").then(OsString::new);
+        assert!(Feed::for_run(empty, function(), build(&built)).is_some());
+        wait_until(|| built.load(Ordering::SeqCst), 1);
+        let function = config::parse("fkeys = \"function\"\n").unwrap();
+        assert!(Feed::for_run(|_| None, Ok(function), build(&built)).is_some());
+        wait_until(|| built.load(Ordering::SeqCst), 2);
+    }
+
+    /// The window's thread never waits for the switch: with its lock held (a sopen stopped
+    /// while it holds it), passes that change the focus all return at once, and the switch's
+    /// own thread waits instead; once the lock is let go it acts on the last word. Both waits:
+    /// the first acquisition's, and the build's (the start's clean-up of a state a dead holder
+    /// left, which restores 0 first).
+    #[test]
+    fn s7b_a_pass_never_waits_for_the_switchs_lock() {
+        for left in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            let dir = tmp.path().to_path_buf();
+            let hid = Hid::default();
+            if left {
+                let dead = fnkeys::State {
+                    original: fnkeys::OFF,
+                    holders: vec![Holder { pid: 7, start: 7 }],
+                    boot: None,
+                };
+                fnkeys::write_state(&dir, &dead).unwrap();
+            }
+            let open = || {
+                std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create(true)
+                    .truncate(false)
+                    .open(dir.join(fnkeys::LOCK))
+                    .unwrap()
+            };
+            let held = open();
+            held.lock().unwrap();
+            assert!(
+                matches!(open().try_lock(), Err(std::fs::TryLockError::WouldBlock)),
+                "a second open in this process waits for the lock"
+            );
+            let feed = feed(&dir, &hid, QUICK);
+            let (done, finished) = mpsc::channel();
+            let passes = {
+                let feed = feed.clone();
+                std::thread::spawn(move || {
+                    let (ctx, mut sh) = (egui::Context::default(), shell(&feed));
+                    for front in [true, false, true, false, true] {
+                        pass(&mut sh, &ctx, &[win(front)]);
+                    }
+                    let _ = done.send(());
+                })
+            };
+            let returned = finished.recv_timeout(Duration::from_secs(5));
+            std::thread::sleep(Duration::from_millis(100));
+            let under_the_lock = hid.writes();
+            drop(held);
+            passes.join().unwrap();
+            assert!(
+                returned.is_ok(),
+                "left={left}: a pass waited for the switch's lock"
+            );
+            assert!(
+                under_the_lock.is_empty(),
+                "left={left}: the switch acted under the lock: {under_the_lock:?}"
+            );
+            let want = if left { vec![0, 1] } else { vec![1] };
+            wait_until(|| hid.writes(), want);
+            assert!(feed.closed(Duration::from_secs(10)), "left={left}");
+            assert_eq!(hid.value(), 0, "left={left}");
+        }
+    }
+
+    /// 04 §6.2 "acquire again on wake": sopen hears nothing as the Mac sleeps or wakes. While a
+    /// window is in front the switch's thread looks every tick; the wall clock having run far
+    /// ahead of the monotonic one says the Mac slept, and the switch is let go and taken again
+    /// (0, then 1, set and read back anew). Ticks without a sleep do nothing, and with no window
+    /// in front a wake does nothing.
+    #[test]
+    fn s7b_a_wake_lets_go_and_takes_the_switch_again() {
+        let tmp = tempfile::tempdir().unwrap();
+        let hid = Hid::default();
+        let ahead = Arc::new(AtomicU64::new(0));
+        let timing = Timing {
+            tick: Duration::from_millis(20),
+            ..QUICK
+        };
+        let (dir, fake, clock) = (tmp.path().to_path_buf(), hid.clone(), ahead.clone());
+        let feed = Arc::new(Feed::start(
+            move || Some(switch(&dir, &fake)),
+            timing,
+            move || SystemTime::now() + Duration::from_secs(clock.load(Ordering::SeqCst)),
+        ));
+        let (ctx, mut sh) = (egui::Context::default(), shell(&feed));
+        pass(&mut sh, &ctx, &[win(true)]);
+        wait_until(|| hid.writes(), vec![1]);
+        std::thread::sleep(timing.tick * 10);
+        assert_eq!(hid.writes(), [1], "ticks without a sleep");
+        // An hour asleep.
+        ahead.fetch_add(3600, Ordering::SeqCst);
+        wait_until(|| hid.writes(), vec![1, 0, 1]);
+        std::thread::sleep(timing.tick * 10);
+        assert_eq!(hid.writes(), [1, 0, 1], "one wake, taken once again");
+        assert_eq!(hid.value(), 1);
+        pass(&mut sh, &ctx, &[win(false)]);
+        wait_until(|| hid.writes(), vec![1, 0, 1, 0]);
+        ahead.fetch_add(3600, Ordering::SeqCst);
+        // Something for the thread, which waits without a tick now, to hear.
+        feed.told.send(Told::Front(false)).unwrap();
+        std::thread::sleep(timing.tick * 10);
+        assert_eq!(hid.writes(), [1, 0, 1, 0], "no window in front");
+        assert!(feed.closed(Duration::from_secs(10)));
+    }
+
+    /// 04 §6.2 "When": before the Mac sleeps and when the session is switched away the switch is
+    /// let go; on wake and on the session's return it is taken again if a window is still in
+    /// front — and not while either holds, whatever the windows say. The events go through the
+    /// same channel as the windows' word ([`Feed::mac_events`], what the NSWorkspace observers
+    /// call on macOS) and reach the fake in the order they were sent. A real NSWorkspace
+    /// notification cannot be posted from a test: the observers themselves are not run here.
+    #[test]
+    fn s7b_sleep_and_session_events_reach_the_switch_in_order() {
+        let tmp = tempfile::tempdir().unwrap();
+        let hid = Hid::default();
+        let feed = feed(tmp.path(), &hid, QUICK);
+        let mac = feed.mac_events();
+        let (ctx, mut sh) = (egui::Context::default(), shell(&feed));
+        pass(&mut sh, &ctx, &[win(true)]);
+        wait_until(|| hid.writes(), vec![1]);
+        mac(Mac::Sleeps);
+        wait_until(|| hid.writes(), vec![1, 0]);
+        mac(Mac::Woke);
+        wait_until(|| hid.writes(), vec![1, 0, 1]);
+        mac(Mac::Session(false));
+        wait_until(|| hid.writes(), vec![1, 0, 1, 0]);
+        // Away: the windows' word changes nothing.
+        pass(&mut sh, &ctx, &[win(false)]);
+        pass(&mut sh, &ctx, &[win(true)]);
+        mac(Mac::Session(true));
+        wait_until(|| hid.writes(), vec![1, 0, 1, 0, 1]);
+        // A burst, in its order: let go, taken, let go, taken.
+        for event in [
+            Mac::Sleeps,
+            Mac::Woke,
+            Mac::Session(false),
+            Mac::Session(true),
+        ] {
+            mac(event);
+        }
+        wait_until(|| hid.writes(), vec![1, 0, 1, 0, 1, 0, 1, 0, 1]);
+        // Asleep, a window comes to the front: nothing until the wake.
+        pass(&mut sh, &ctx, &[win(false)]);
+        wait_until(|| hid.writes(), vec![1, 0, 1, 0, 1, 0, 1, 0, 1, 0]);
+        mac(Mac::Sleeps);
+        pass(&mut sh, &ctx, &[win(true)]);
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(hid.writes().len(), 10, "taken while the Mac sleeps");
+        mac(Mac::Woke);
+        wait_until(|| hid.writes().len(), 11);
+        assert_eq!(hid.value(), 1);
+        // No window in front: a wake and a session's return take nothing.
+        pass(&mut sh, &ctx, &[win(false)]);
+        wait_until(|| hid.writes().len(), 12);
+        mac(Mac::Woke);
+        mac(Mac::Session(true));
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(hid.writes().len(), 12, "taken with no window in front");
+        assert_eq!(hid.value(), 0);
+        assert!(feed.closed(Duration::from_secs(10)));
+        assert!(!tmp.path().join(fnkeys::STATE).exists());
+    }
+
+    /// The macOS half: the observers [`observe_the_mac`] registers on NSWorkspace's
+    /// notification center turn each of the four notifications into its event, in order. The
+    /// system's own (a real sleep, a real session switch) cannot be made in a test; the same names
+    /// are posted on the same center by the test instead — a center in this process only, heard
+    /// by a recorder, so nothing reaches a switch.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn s7b_the_workspace_observers_tell_each_notification() {
+        use objc2_app_kit::{
+            NSWorkspace, NSWorkspaceDidWakeNotification,
+            NSWorkspaceSessionDidBecomeActiveNotification,
+            NSWorkspaceSessionDidResignActiveNotification, NSWorkspaceWillSleepNotification,
+        };
+        let heard: Arc<Mutex<Vec<Mac>>> = Arc::default();
+        let record = heard.clone();
+        observe_the_mac(move |event| record.lock().unwrap().push(event));
+        let center = NSWorkspace::sharedWorkspace().notificationCenter();
+        // SAFETY: AppKit's constant names; no object.
+        unsafe {
+            for name in [
+                NSWorkspaceWillSleepNotification,
+                NSWorkspaceDidWakeNotification,
+                NSWorkspaceSessionDidResignActiveNotification,
+                NSWorkspaceSessionDidBecomeActiveNotification,
+            ] {
+                center.postNotificationName_object(name, None);
+            }
+        }
+        assert_eq!(
+            *heard.lock().unwrap(),
+            [
+                Mac::Sleeps,
+                Mac::Woke,
+                Mac::Session(false),
+                Mac::Session(true)
+            ]
+        );
+    }
+
+    /// 04 §6.3 "a release that fails … is tried again": the switch's thread runs it when it is
+    /// due ([`Fkeys::next_retry`]) by itself — no window pass comes after the one that let go —
+    /// and, while a window is in front (an acquisition whose undo failed is due only once none
+    /// is), it waits for the next word instead of spinning. Its turns are counted through the
+    /// wall clock it reads once a turn.
+    #[test]
+    fn s7b_a_failed_release_is_retried_by_the_thread_without_spinning() {
+        let tmp = tempfile::tempdir().unwrap();
+        let hid = Hid::default();
+        let turns = Arc::new(AtomicUsize::new(0));
+        let timing = Timing {
+            tick: Duration::from_millis(100),
+            ..QUICK
+        };
+        let (dir, fake, counted) = (tmp.path().to_path_buf(), hid.clone(), turns.clone());
+        let feed = Arc::new(Feed::start(
+            move || Some(switch(&dir, &fake)),
+            timing,
+            move || {
+                counted.fetch_add(1, Ordering::SeqCst);
+                SystemTime::now()
+            },
+        ));
+        let (ctx, mut sh) = (egui::Context::default(), shell(&feed));
+        // Let go, the restore fails once: tried again with no pass after it.
+        pass(&mut sh, &ctx, &[win(true)]);
+        wait_until(|| hid.writes(), vec![1]);
+        hid.with(|h| h.fail_zeros = 1);
+        pass(&mut sh, &ctx, &[win(false)]);
+        wait_until(|| hid.writes(), vec![1, 0, 0]);
+        assert_eq!(hid.value(), 0);
+        assert!(!tmp.path().join(fnkeys::STATE).exists());
+        // In front, the set refused and its undo failed: a release is due, but not while a
+        // window is in front.
+        hid.with(|h| {
+            h.refuse = true;
+            h.fail_zeros = 1;
+        });
+        pass(&mut sh, &ctx, &[win(true)]);
+        wait_until(|| hid.writes(), vec![1, 0, 0, 1, 0]);
+        let before = turns.load(Ordering::SeqCst);
+        std::thread::sleep(Duration::from_millis(300));
+        let spun = turns.load(Ordering::SeqCst) - before;
+        assert!(spun <= 10, "{spun} turns in 300 ms with a window in front");
+        assert_eq!(hid.writes(), [1, 0, 0, 1, 0]);
+        pass(&mut sh, &ctx, &[win(true)]);
+        let said = fkeys_status(&ctx).unwrap_or_default();
+        assert!(said.starts_with(fnkeys::NOT_IN_EFFECT), "{said}");
+        pass(&mut sh, &ctx, &[win(false)]);
+        wait_until(|| hid.writes(), vec![1, 0, 0, 1, 0, 0]);
+        assert_eq!(hid.value(), 0);
+        assert!(!tmp.path().join(fnkeys::STATE).exists());
+        assert!(feed.closed(Duration::from_secs(10)));
+    }
+
+    /// 04 §6.3: an acquisition that did not take effect (the fake refuses the set) is said in
+    /// the status row — the browser's, over its last result and its keys, and a window of its
+    /// own's, above its F-key row — until one does.
+    #[test]
+    fn s7b_the_status_row_says_the_switch_did_not_take_effect() {
+        let tmp = tempfile::tempdir().unwrap();
+        let hid = Hid::default();
+        hid.with(|h| h.refuse = true);
+        let feed = feed(tmp.path(), &hid, QUICK);
+        let (ctx, mut sh) = (egui::Context::default(), shell(&feed));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let line = loop {
+            pass(&mut sh, &ctx, &[win(true)]);
+            if let Some(line) = fkeys_status(&ctx) {
+                break line;
+            }
+            assert!(Instant::now() < deadline, "no status line after 10 s");
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        assert_eq!(
+            line,
+            format!("{}: refused by the fake", fnkeys::NOT_IN_EFFECT)
+        );
+        assert_eq!(hid.writes(), [1, 0], "set, refused, the original set back");
+        assert!(feed.closed(Duration::from_secs(10)));
+
+        let said = |ctx: &egui::Context, line: Option<&str>| {
+            ctx.data_mut(|d| match line {
+                Some(line) => {
+                    d.insert_temp(fkeys_line_id(), FkeysLine(line.to_string()));
+                }
+                None => d.remove::<FkeysLine>(fkeys_line_id()),
+            })
+        };
+        let mut fx = BrowserFx::new();
+        // The list's keys, said when nothing else is.
+        let hint = |fx: &BrowserFx| !fx.drv.texts_starting_with("Enter open").is_empty();
+        assert!(hint(&fx));
+        said(&fx.drv.ctx, Some(&line));
+        fx.drv.idle(&mut fx.b, 1);
+        assert!(fx.drv.find_text(&line).is_some(), "{:?}", fx.drv.texts());
+        assert!(!hint(&fx));
+        said(&fx.drv.ctx, None);
+        fx.drv.idle(&mut fx.b, 1);
+        assert!(fx.drv.find_text(&line).is_none());
+        assert!(hint(&fx));
+
+        let mut drv = testkit::Driver::new(800.0, 400.0);
+        let mut own = Own {
+            f8: 0,
+            typed: String::new(),
+            clicks: 0,
+        };
+        drv.idle(&mut own, 2);
+        assert!(drv.find_text(&line).is_none());
+        said(&drv.ctx, Some(&line));
+        drv.idle(&mut own, 2);
+        assert!(drv.find_text(&line).is_some(), "{:?}", drv.texts());
+        assert!(drv.find_text("Help   ").is_some(), "the row is still there");
+        drv.key(&mut own, egui::Key::F8, egui::Modifiers::NONE);
+        assert_eq!(own.f8, 1, "and its keys work");
     }
 }

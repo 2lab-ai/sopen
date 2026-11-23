@@ -509,6 +509,9 @@ pub(crate) struct Browser {
     /// pass after the grid first took it (its lock filter applies from its second focused pass)
     /// — that Esc is the owner's leaving.
     focused_before: bool,
+    /// The F-key switch did not take effect: the status row's line for it (04 §6.3), as the
+    /// shell left it for this pass ([`super::fkeys_status`]).
+    fkeys_line: Option<String>,
     /// Rows the active panel shows (the last pass's).
     visible: usize,
     painted: bool,
@@ -603,6 +606,7 @@ impl Browser {
             launches: Vec::new(),
             leftover: Rc::default(),
             focused_before: false,
+            fkeys_line: None,
             visible: 1,
             painted: false,
             open_first: None,
@@ -1779,7 +1783,10 @@ impl Browser {
     }
 
     /// The status row: a running fetch with its progress, a listing, a running file operation
-    /// (or a refused rename's reason), else the last result, else the keys.
+    /// (or a refused rename's reason), a listing that failed, else the F-key switch's line while
+    /// it did not take effect (04 §6.3: said until it does, so no last result covers it), else
+    /// the last result, else the keys. Over a viewer: an operation's question, else the switch's
+    /// line, else the viewer's result, else its keys.
     fn status_line(&self) -> Status {
         if let Some(opening) = &self.opening {
             let name = &opening.name;
@@ -1803,12 +1810,13 @@ impl Browser {
         }
         if self.viewer.is_some() {
             // The viewer's row: only a question an operation waits with is said over it.
-            return match self.ops.waiting() {
-                Some(what) => Status::info(format!(
+            return match (self.ops.waiting(), &self.fkeys_line) {
+                (Some(what), _) => Status::info(format!(
                     "{what} waiting for an answer — F3 back to the list"
                 )),
-                None if !self.status.text.is_empty() => self.status.clone(),
-                None => Status::info(VIEWER_HINT),
+                (None, Some(line)) => Status::error(line.clone()),
+                (None, None) if !self.status.text.is_empty() => self.status.clone(),
+                (None, None) => Status::info(VIEWER_HINT),
             };
         }
         if let Some(listing) = self.listing.first() {
@@ -1827,6 +1835,9 @@ impl Browser {
                     .collect();
                 return Status::error(said.join(" · "));
             }
+        }
+        if let Some(line) = &self.fkeys_line {
+            return Status::error(line.clone());
         }
         if !self.status.text.is_empty() {
             return self.status.clone();
@@ -1869,6 +1880,7 @@ impl Window for Browser {
         };
         chrome::title_panel(ui, "sopen-browser-title", &self.title);
         chrome::key_panel(ui, "sopen-browser-keys", &keys);
+        self.fkeys_line = super::fkeys_status(&ctx);
         let status = self.status_line();
         chrome::bar_panel(egui::Panel::bottom("sopen-browser-status"))
             .show(ui, |ui| chrome::status_row(ui, &status));

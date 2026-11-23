@@ -349,18 +349,32 @@ contexts where it acts (list, viewer, git panel, tree, a dialog) and its `Comman
   `hidutil property --get HIDFKeyMode`, `IOHIDEventSystemClientCopyProperty` and
   `com.apple.keyboard.fnState` do not follow this switch (they stayed unset at 0 and at 1): never
   use them as readbacks.
-- **When**: a sopen process **acquires** the switch when one of its windows gains focus, and
-  **releases** it when none of its windows has focus any more, when it quits, before the Mac sleeps
-  and when the session is switched away; it acquires again on wake or session return if one of its
-  windows still has focus. Acquire and release are §6.3's protocol, so several windows and several
-  sopen processes hand focus to each other in any order of events.
+- **When**: a sopen process **acquires** the switch when one of its windows is in front — focused,
+  and neither minimised nor fully covered — and **releases** it when none of its windows has been in
+  front for 250 ms (focus moving from one of its windows to another can pass through a moment with
+  neither), at once when its window closes, when it quits, before the Mac sleeps
+  (`NSWorkspaceWillSleepNotification`) and when the session is switched away
+  (`NSWorkspaceSessionDidResignActiveNotification`); it acquires again on wake
+  (`NSWorkspaceDidWakeNotification`) or session return (`NSWorkspaceSessionDidBecomeActiveNotification`)
+  if one of its windows is still in front, and not while the Mac sleeps or the session is away,
+  whatever its windows say. The four are observed on `NSWorkspace.sharedWorkspace.notificationCenter`,
+  once per process and only when the switch is in use (not with `"system"`, not in a scripted run);
+  eframe and winit pass on none of them. Acquire and release are §6.3's protocol, so several windows
+  and several sopen processes hand focus to each other in any order of events; they run on a thread of
+  their own, which the windows and the notifications only send to, never on a window's or AppKit's
+  main thread (the lock can be held by a stopped sopen). A covered window (a locked screen, a screen
+  saver) is not in front where macOS reports it covered *(estimate: not measured)*. Should a wake
+  come without its notification, it is seen afterwards: the wall clock has run ahead of the monotonic
+  one, which stops while the Mac sleeps; the switch is then let go and acquired again, read back anew,
+  if a window is still in front.
 - **It is global while sopen is in front**: every app sees F-keys then, and brightness and volume
   need fn. Keyboards whose Fn layer is in their own firmware are not affected at all.
 - **Default on.** Config key `fkeys` in sopen's config file (01 §4a): `"function"` (default) or
   `"system"` (sopen never touches the setting). `sopen config fkeys function|system` sets it as
   `sopen config target` sets the target.
 - **Never in a scripted run or a test**: `SOPEN_SCREENSHOT`, `SOPEN_AUTOSAVE`, `SOPEN_AUTOEXPORT`,
-  `SOPEN_LIST` runs and `cargo test` never switch it (tests use a fake behind a trait).
+  `SOPEN_LIST` and `SOPEN_KEYS` runs (any non-empty value) and `cargo test` never switch it (tests
+  use a fake behind a trait).
 - **Half proven on macOS 26.7.1**: E1 (02 §8.2) proved the setter-to-filter half above; Fluor's
   users report mixed results on recent macOS (keys.md §5 items 4–5). The key half — a plain F5
   reaching sopen — is the owner's receipt (§8, K-F3), and it decides: if F5 without fn does not
