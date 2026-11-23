@@ -2,11 +2,11 @@
 //! read 500 records at a time from the same stream, parked while hidden and ended after 30 s
 //! hidden or when its panel is dropped. S2-B writes it.
 //!
-//! Also here, until S2-F plugs S2-A's runner in: [`Git`], the little a read needs from a
-//! runner ("run these words in this folder and give me what it printed, or a stream of its
-//! stdout"); [`argv`], every read's words exactly as 03 writes them, in one place; and the
-//! reads of §4.1 and §6.1 themselves ([`refs`], [`head`], [`stashes`], [`status`],
-//! [`details`], [`files`]).
+//! Also here: [`Git`], the little a read needs from a runner ("run these words in this folder
+//! and give me what it printed, or a stream of its stdout"), and [`RunnerGit`], S2-A's
+//! `GitRunner` behind it (S2-F); [`argv`], every read's words exactly as 03 writes them, in one
+//! place; and the reads of §4.1 and §6.1 themselves ([`refs`], [`head`], [`stashes`],
+//! [`status`], [`details`], [`files`]).
 
 use super::model::*;
 use super::parse::{self, ParseError};
@@ -213,6 +213,258 @@ pub mod argv {
     pub fn empty_tree() -> Vec<String> {
         words(&["hash-object", "-t", "tree", "--stdin"])
     }
+
+    // S2-F: the reads the panel's integration adds, here so the one list stays one.
+
+    /// The repository's remotes, one a line (03 §4.6: a remote branch's remote is the longest
+    /// of them its name starts with).
+    pub fn remotes() -> Vec<String> {
+        words(&["remote"])
+    }
+
+    /// The details pane's `In` (03 §6.1): the branches and tags that contain `c`, one a line.
+    pub fn contains(c: &Oid) -> Vec<String> {
+        let mut w = words(&["for-each-ref", "--format=%(refname)", "--contains"]);
+        w.push(c.as_str().into());
+        w.extend(words(&["refs/heads", "refs/remotes", "refs/tags"]));
+        w
+    }
+
+    /// A comparison with the uncommitted row (03 §6.4): `old`'s tree against the work tree,
+    /// letters (`--name-status`) or line counts (`--numstat`).
+    pub fn worktree_diff(what: &str, old: &Oid) -> Vec<String> {
+        let mut w = words(&["diff", "-z", "--find-renames", what]);
+        w.extend([old.as_str().to_string(), "--".into()]);
+        w
+    }
+
+    /// The uncommitted row's line counts (03 §6.1): staged (`--cached`) or not staged.
+    pub fn uncommitted_numstat(staged: bool) -> Vec<String> {
+        let mut w = words(&["diff", "-z", "--find-renames", "--numstat"]);
+        if staged {
+            w.push("--cached".into());
+        }
+        w.push("--".into());
+        w
+    }
+
+    /// An untracked folder's files (03 §6.1), read when its row is opened.
+    pub fn others(dir: &str) -> Vec<String> {
+        let mut w = words(&["ls-files", "-z", "--others", "--exclude-standard", "--"]);
+        w.push(dir.into());
+        w
+    }
+
+    /// One side of a diff (03 §6.2's endpoints, the working file aside).
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub enum Side {
+        /// A commit, a stash or a tree by id (the empty tree for none).
+        Tree(super::Oid),
+        /// The index.
+        Index,
+        /// The work tree.
+        WorkTree,
+    }
+
+    /// A file row's diff (03 §6.2): `diff --no-color --find-renames` over the two endpoints,
+    /// limited to the row's path(s) — `<old> <new>` trees, `--cached <old>` for the index, `<old>`
+    /// alone for the work tree, nothing for the index against the work tree.
+    pub fn diff_text(old: &Side, new: &Side, paths: &[&str]) -> Vec<String> {
+        let mut w = words(&["diff", "--no-color", "--find-renames"]);
+        match (old, new) {
+            (Side::Tree(a), Side::Tree(b)) => w.extend([a.as_str().into(), b.as_str().into()]),
+            (Side::Tree(a), Side::Index) => w.extend(["--cached".into(), a.as_str().into()]),
+            (Side::Tree(a), Side::WorkTree) => w.push(a.as_str().into()),
+            (Side::Index, Side::WorkTree) => {}
+            // No other pair is a row of 03 §6.2's table: the index against itself, the work
+            // tree first. The plain form (the index against the work tree) stands in.
+            _ => {}
+        }
+        w.push("--".into());
+        let mut seen: Vec<&str> = Vec::new();
+        for p in paths {
+            if !seen.contains(p) {
+                seen.push(p);
+                w.push((*p).into());
+            }
+        }
+        w
+    }
+
+    /// A blob's bytes (03 §6.3): `cat-file blob <rev>:<path>`, `:<path>` for the index.
+    pub fn blob(rev: Option<&super::Oid>, path: &str) -> Vec<String> {
+        let spec = match rev {
+            Some(rev) => format!("{}:{path}", rev.as_str()),
+            None => format!(":{path}"),
+        };
+        let mut w = words(&["cat-file", "blob"]);
+        w.push(spec);
+        w
+    }
+
+    /// The files renamed since `rev` (03 §6.3 "Diff against the working file"): its tree against
+    /// the work tree, renames only.
+    pub fn renames_since(rev: &super::Oid) -> Vec<String> {
+        let mut w = words(&[
+            "diff",
+            "-z",
+            "--name-status",
+            "--find-renames",
+            "--diff-filter=R",
+        ]);
+        w.extend([rev.as_str().to_string(), "--".into()]);
+        w
+    }
+
+    /// History search (03 §4.7): the log's form with the query's options, the panel's revisions
+    /// on stdin. `--grep` is git's regular expression, case-insensitive unless asked; a changed
+    /// path goes after `--`.
+    pub fn search(options: &LogOptions, query: &Query) -> Vec<String> {
+        let mut w = log(options);
+        // `--stdin --` close the log's form: the options go before them.
+        let tail = w.split_off(w.len() - 2);
+        if !query.message.is_empty() {
+            w.push(format!("--grep={}", query.message));
+        }
+        if !query.author.is_empty() {
+            w.push(format!("--author={}", query.author));
+        }
+        if !query.message.is_empty() || !query.author.is_empty() {
+            if !query.case {
+                w.push("-i".into());
+            }
+            if !query.message.is_empty() && !query.author.is_empty() {
+                w.push("--all-match".into());
+            }
+        }
+        if !query.text.is_empty() {
+            w.push(format!("-S{}", query.text));
+        }
+        if !query.since.is_empty() {
+            w.push(format!("--since={}", query.since));
+        }
+        if !query.until.is_empty() {
+            w.push(format!("--until={}", query.until));
+        }
+        w.extend(tail);
+        if !query.path.is_empty() {
+            w.push(query.path.clone());
+        }
+        w
+    }
+
+    /// A history search's fields (03 §4.7), as the dialog gives them.
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct Query {
+        pub message: String,
+        pub author: String,
+        /// Text added or removed (`-S`).
+        pub text: String,
+        pub path: String,
+        pub since: String,
+        pub until: String,
+        /// Case-sensitive.
+        pub case: bool,
+    }
+}
+
+/// The repository's remotes (`git remote`), in git's order.
+pub fn remotes(git: &dyn Git, top: &str) -> Result<Vec<String>, ReadError> {
+    let ran = read(git, top, argv::remotes(), &[])?;
+    Ok(String::from_utf8_lossy(&ran.stdout)
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect())
+}
+
+/// The details pane's `In` (03 §6.1): the short names of the branches and tags containing `c`.
+pub fn contains(git: &dyn Git, top: &str, c: &Oid) -> Result<Vec<String>, ReadError> {
+    let ran = read(git, top, argv::contains(c), &[])?;
+    Ok(String::from_utf8_lossy(&ran.stdout)
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(|l| {
+            ["refs/heads/", "refs/remotes/", "refs/tags/"]
+                .iter()
+                .find_map(|p| l.strip_prefix(p))
+                .unwrap_or(l)
+                .to_string()
+        })
+        .collect())
+}
+
+/// `old`'s tree against the work tree (03 §6.4, the uncommitted row as a comparison's end).
+pub fn worktree_files(git: &dyn Git, top: &str, old: &Oid) -> Result<Vec<ChangedFile>, ReadError> {
+    let letters = read(git, top, argv::worktree_diff("--name-status", old), &[])?;
+    let counts = read(git, top, argv::worktree_diff("--numstat", old), &[])?;
+    Ok(parse::changed_files(&letters.stdout, &counts.stdout)?)
+}
+
+/// The uncommitted row's line counts by path (03 §6.1): staged, or not staged. A binary file
+/// has none.
+pub fn uncommitted_counts(
+    git: &dyn Git,
+    top: &str,
+    staged: bool,
+) -> Result<std::collections::HashMap<String, (u64, u64)>, ReadError> {
+    let ran = read(git, top, argv::uncommitted_numstat(staged), &[])?;
+    let mut counts = std::collections::HashMap::new();
+    // `<adds>\t<dels>\t<path>\0`, a rename `<adds>\t<dels>\t\0<old>\0<new>\0`.
+    let mut fields = ran.stdout.split(|&b| b == 0);
+    while let Some(field) = fields.next() {
+        if field.is_empty() {
+            continue;
+        }
+        let text = String::from_utf8_lossy(field);
+        let mut parts = text.splitn(3, '\t');
+        let (adds, dels, path) = (parts.next(), parts.next(), parts.next());
+        let path = match path {
+            Some("") => {
+                let _old = fields.next();
+                fields
+                    .next()
+                    .map(|p| String::from_utf8_lossy(p).into_owned())
+            }
+            Some(path) => Some(path.to_string()),
+            None => None,
+        };
+        if let (Some(Ok(a)), Some(Ok(d)), Some(path)) = (
+            adds.map(str::parse::<u64>),
+            dels.map(str::parse::<u64>),
+            path,
+        ) {
+            counts.insert(path, (a, d));
+        }
+    }
+    Ok(counts)
+}
+
+/// An untracked folder's files (03 §6.1), from the top level.
+pub fn others(git: &dyn Git, top: &str, dir: &str) -> Result<Vec<String>, ReadError> {
+    let ran = read(git, top, argv::others(dir), &[])?;
+    Ok(ran
+        .stdout
+        .split(|&b| b == 0)
+        .filter(|p| !p.is_empty())
+        .map(|p| String::from_utf8_lossy(p).into_owned())
+        .collect())
+}
+
+/// Where `path then` (at `rev`) is now (03 §6.3 "Diff against the working file"): followed
+/// through the renames between `rev`'s tree and the work tree; itself when it was not renamed.
+pub fn path_now(git: &dyn Git, top: &str, rev: &Oid, then: &str) -> Result<String, ReadError> {
+    let ran = read(git, top, argv::renames_since(rev), &[])?;
+    // `R<score>\0<old>\0<new>\0` records.
+    let fields: Vec<&[u8]> = ran.stdout.split(|&b| b == 0).collect();
+    let mut at = 0;
+    while at + 2 < fields.len() {
+        if fields[at].starts_with(b"R") && fields[at + 1] == then.as_bytes() {
+            return Ok(String::from_utf8_lossy(fields[at + 2]).into_owned());
+        }
+        at += 3;
+    }
+    Ok(then.to_string())
 }
 
 /// Why a read gave no result.
@@ -520,6 +772,19 @@ impl LogStream {
         current: &Generation,
         generation: u64,
     ) -> Result<LogStream, StartError> {
+        Self::start_with(git, top, argv::log(options), roots, current, generation)
+    }
+
+    /// [`LogStream::start`] with the log's words given (`argv::log`'s form and more: a history
+    /// search, 03 §4.7).
+    pub fn start_with(
+        git: &dyn Git,
+        top: &str,
+        args: Vec<String>,
+        roots: &[Oid],
+        current: &Generation,
+        generation: u64,
+    ) -> Result<LogStream, StartError> {
         if !current.is_current(generation) {
             return Err(StartError::Superseded);
         }
@@ -531,9 +796,7 @@ impl LogStream {
             stdin.extend_from_slice(r.as_str().as_bytes());
             stdin.push(b'\n');
         }
-        let pipe = git
-            .spawn(top, &argv::log(options), &stdin)
-            .map_err(StartError::Run)?;
+        let pipe = git.spawn(top, &args, &stdin).map_err(StartError::Run)?;
         Ok(LogStream {
             generation,
             current: current.clone(),
@@ -710,5 +973,718 @@ impl LogStream {
 impl Drop for LogStream {
     fn drop(&mut self) {
         self.stop();
+    }
+}
+
+/// S2-A's runner as S2-B's reads ask for it (S2-F): every command a read ([`Class::Read`]: 30 s
+/// without a byte while sopen waits, 03 §3.4; detection 10 s in all), each given `handle`, so
+/// one stop — Esc, a superseded load — ends every read and stream of it and keeps the next ones
+/// from being sent.
+///
+/// [`Class::Read`]: super::runner::Class::Read
+#[derive(Clone)]
+pub struct RunnerGit {
+    pub runner: super::runner::GitRunner,
+    pub handle: super::runner::Handle,
+}
+
+/// How long detection and `git version` may take in all (03 §2.1).
+pub const DETECTION_LIMIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+impl RunnerGit {
+    pub fn new(runner: super::runner::GitRunner, handle: super::runner::Handle) -> Self {
+        Self { runner, handle }
+    }
+
+    fn command(&self, dir: &str, args: &[String], stdin: &[u8]) -> super::runner::GitCommand {
+        let cmd = super::runner::GitCommand::new(super::runner::Class::Read, dir, args);
+        if stdin.is_empty() {
+            cmd
+        } else {
+            cmd.feed("stdin", stdin.to_vec())
+        }
+    }
+}
+
+/// A command that gave no output to read, in [`RunError`]'s words.
+fn run_error(ending: &super::runner::Ending) -> RunError {
+    use super::runner::{Ending, StopBy};
+    match ending {
+        Ending::NoGit => RunError::NoGit,
+        Ending::Stopped(s) if matches!(s.by, StopBy::Limit(_)) => RunError::TimedOut,
+        other => RunError::Failed(other.to_string()),
+    }
+}
+
+/// A finished command as a [`Ran`]: its exit code (`None`: a signal), or why there is none.
+fn ran(done: super::runner::Done) -> Result<Ran, RunError> {
+    use super::runner::Ending;
+    let code = match &done.ending {
+        Ending::Exit(code) => Some(*code),
+        Ending::Signal(_) => None,
+        other => return Err(run_error(other)),
+    };
+    Ok(Ran {
+        code,
+        stdout: done.stdout,
+        stderr: done.stderr.into_bytes(),
+    })
+}
+
+impl Git for RunnerGit {
+    fn run(&self, dir: &str, args: &[String], stdin: &[u8], bound: Bound) -> Result<Ran, RunError> {
+        let mut cmd = self.command(dir, args, stdin);
+        if bound == Bound::Detection {
+            cmd = cmd.within(DETECTION_LIMIT);
+        }
+        ran(self.runner.run(&cmd, &self.handle))
+    }
+
+    fn spawn(&self, dir: &str, args: &[String], stdin: &[u8]) -> Result<Box<dyn Pipe>, RunError> {
+        let cmd = self.command(dir, args, stdin);
+        match self.runner.start(&cmd, &self.handle) {
+            Ok(running) => Ok(Box::new(RunnerPipe(Some(running)))),
+            Err(done) => Err(match ran(*done) {
+                Ok(r) => RunError::Failed(first_line(&r.stderr)),
+                Err(e) => e,
+            }),
+        }
+    }
+}
+
+/// A started command's stdout as [`Pipe`] reads it: `read` waits as the runner waits (30 s
+/// without a byte, then an error; a stop through the handle makes it return, an error too).
+/// `stop` drops the command: it is stopped and finished on a thread of its own, which reads and
+/// drops what it still writes meanwhile — a remote channel cannot end while the master holds
+/// output nobody reads (E5: a parked stream stopped in 0.59 s read, 5.17 s not) — so it never
+/// blocks the caller, a pass of the window included.
+pub struct RunnerPipe(Option<super::runner::Running>);
+
+impl Pipe for RunnerPipe {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self.0.as_mut() {
+            Some(running) => running.read(buf),
+            None => Ok(0),
+        }
+    }
+
+    fn running(&mut self) -> bool {
+        self.0.as_ref().is_some_and(|r| r.running())
+    }
+
+    fn stop(&mut self) {
+        drop(self.0.take());
+    }
+
+    fn finish(&mut self) -> Ran {
+        let Some(running) = self.0.take() else {
+            return Ran::default();
+        };
+        match ran(running.finish()) {
+            Ok(ran) => ran,
+            Err(e) => Ran {
+                code: None,
+                stdout: Vec::new(),
+                stderr: e.to_string().into_bytes(),
+            },
+        }
+    }
+}
+
+/// Repositories for the tests of this file and the browser's (S2-F): git run with no config of
+/// the machine's, a fixed identity and fixed dates.
+#[cfg(test)]
+pub(crate) mod fixture {
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// This machine's git for a test, or `None` with a note when there is none (a failure
+    /// under `SOPEN_REQUIRE_GIT=1`, as CI sets it).
+    pub fn git() -> Option<PathBuf> {
+        match crate::git::detect::which_git() {
+            Ok(git) if Command::new(&git).arg("version").output().is_ok() => Some(git),
+            _ => {
+                if std::env::var("SOPEN_REQUIRE_GIT").is_ok_and(|v| v == "1") {
+                    panic!("git is required (SOPEN_REQUIRE_GIT=1) and there is none");
+                }
+                eprintln!("skipping: no git on this machine");
+                None
+            }
+        }
+    }
+
+    /// The environment every fixture command and every test runner gets: no system or global
+    /// config, a fixed identity, the C locale, UTC.
+    pub fn env(home: &Path) -> Vec<(String, String)> {
+        let home = home.to_string_lossy().into_owned();
+        [
+            ("GIT_CONFIG_NOSYSTEM", "1"),
+            ("GIT_CONFIG_GLOBAL", "/dev/null"),
+            ("HOME", home.as_str()),
+            ("GIT_AUTHOR_NAME", "Ann"),
+            ("GIT_AUTHOR_EMAIL", "ann@example.com"),
+            ("GIT_COMMITTER_NAME", "Ann"),
+            ("GIT_COMMITTER_EMAIL", "ann@example.com"),
+            ("LC_ALL", "C"),
+            ("TZ", "UTC"),
+        ]
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .into()
+    }
+
+    /// A repository in a temporary folder of its own.
+    pub struct Repo {
+        pub tmp: tempfile::TempDir,
+        /// Its top level, canonical.
+        pub top: PathBuf,
+        pub git: PathBuf,
+        /// The next commit's time (seconds since the epoch), one minute apart.
+        clock: AtomicU64,
+    }
+
+    impl Repo {
+        /// `git init -b main` in `<tmp>/repo`.
+        pub fn new(git: &Path) -> Repo {
+            let tmp = tempfile::tempdir().unwrap();
+            let top = std::fs::canonicalize(tmp.path()).unwrap().join("repo");
+            std::fs::create_dir(&top).unwrap();
+            let repo = Repo {
+                tmp,
+                top,
+                git: git.to_path_buf(),
+                clock: AtomicU64::new(1_767_225_600),
+            };
+            repo.run(&["init", "-q", "-b", "main"]);
+            repo
+        }
+
+        pub fn top(&self) -> &str {
+            self.top.to_str().unwrap()
+        }
+
+        /// The fixture's home (where its global config would be, none is read).
+        pub fn home(&self) -> PathBuf {
+            self.tmp.path().join("home")
+        }
+
+        /// `git <args>` in the top level; its stdout. Panics when it fails.
+        pub fn run(&self, args: &[&str]) -> String {
+            self.run_in(&self.top, args)
+        }
+
+        /// `git <args>` in `dir`; its stdout.
+        pub fn run_in(&self, dir: &Path, args: &[&str]) -> String {
+            let at = self.clock.fetch_add(60, Ordering::SeqCst);
+            let date = format!("{at} +0000");
+            let mut c = Command::new(&self.git);
+            c.current_dir(dir).args(args);
+            for key in crate::git::runner::LOCAL_REPO_ENV {
+                c.env_remove(key);
+            }
+            c.envs(env(&self.home()))
+                .env("GIT_AUTHOR_DATE", &date)
+                .env("GIT_COMMITTER_DATE", &date);
+            let out = c.output().unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).into_owned()
+        }
+
+        /// Writes `path` (relative to the top level) with `bytes`, its folders made.
+        pub fn write(&self, path: &str, bytes: impl AsRef<[u8]>) {
+            let file = self.top.join(path);
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(file, bytes).unwrap();
+        }
+
+        /// `git add -A` and a commit with `message`; its id.
+        pub fn commit(&self, message: &str) -> String {
+            self.run(&["add", "-A"]);
+            self.run(&["commit", "-q", "--allow-empty", "-m", message]);
+            self.rev("HEAD")
+        }
+
+        /// The id `rev` names.
+        pub fn rev(&self, rev: &str) -> String {
+            self.run(&["rev-parse", "--verify", rev]).trim().to_string()
+        }
+
+        /// A runner on this machine's git with the fixture's environment.
+        pub fn runner(&self) -> crate::git::runner::GitRunner {
+            crate::git::runner::GitRunner::local(self.local())
+        }
+
+        /// This machine's git with the fixture's environment.
+        pub fn local(&self) -> crate::git::runner::LocalGit {
+            env(&self.home())
+                .into_iter()
+                .fold(crate::git::runner::LocalGit::new(&self.git), |g, (k, v)| {
+                    g.with_env(k, v)
+                })
+        }
+    }
+
+    /// A history of `total` commits made by `git fast-import` (03 §4.5's generator: a
+    /// two-commit side branch merged into `main` every 50 commits), no files, one second
+    /// apart; `main` checked out at its tip.
+    pub fn big(git: &Path, total: usize) -> Repo {
+        let repo = Repo::new(git);
+        let mut stream = String::with_capacity(total * 120);
+        fn mark(
+            stream: &mut String,
+            made: &mut usize,
+            branch: &str,
+            from: Option<usize>,
+            merge: Option<usize>,
+        ) -> usize {
+            *made += 1;
+            let (n, t) = (*made, 1_700_000_000 + *made);
+            stream.push_str(&format!(
+                "commit refs/heads/{branch}\nmark :{n}\nauthor Ann <ann@example.com> {t} +0000\n\
+                 committer Ann <ann@example.com> {t} +0000\ndata <<END\ncommit {n}\nEND\n"
+            ));
+            if let Some(from) = from {
+                stream.push_str(&format!("from :{from}\n"));
+            }
+            if let Some(merge) = merge {
+                stream.push_str(&format!("merge :{merge}\n"));
+            }
+            stream.push('\n');
+            n
+        }
+        let mut made = 0usize;
+        let mut main: Option<usize> = None;
+        let mut since_merge = 0;
+        while made < total {
+            if since_merge >= 50 && total - made >= 3 {
+                let base = main.unwrap();
+                let one = mark(&mut stream, &mut made, "side", Some(base), None);
+                let two = mark(&mut stream, &mut made, "side", Some(one), None);
+                main = Some(mark(&mut stream, &mut made, "main", Some(base), Some(two)));
+                since_merge = 0;
+            } else {
+                main = Some(mark(&mut stream, &mut made, "main", main, None));
+                since_merge += 1;
+            }
+        }
+        stream.push_str("done\n");
+        let mut c = Command::new(git);
+        c.current_dir(&repo.top)
+            .args(["fast-import", "--done", "--quiet"])
+            .envs(env(&repo.home()))
+            .stdin(std::process::Stdio::piped());
+        for key in crate::git::runner::LOCAL_REPO_ENV {
+            c.env_remove(key);
+        }
+        let mut child = c.spawn().unwrap();
+        {
+            use std::io::Write;
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(stream.as_bytes())
+                .unwrap();
+        }
+        assert!(child.wait().unwrap().success(), "fast-import");
+        repo.run(&["reset", "-q", "--hard", "main"]);
+        repo
+    }
+
+    /// 03 §4.3's wide shape: `lanes` branches committed in turn, `per` commits each a round,
+    /// each merged back into `main` after its round — about `lanes` lanes open at once. No
+    /// files; `main` checked out.
+    pub fn wide(git: &Path, lanes: usize, rounds: usize, per: usize) -> Repo {
+        let repo = Repo::new(git);
+        let mut stream = String::new();
+        let mut made = 0usize;
+        let mut commit = |stream: &mut String, branch: &str, parents: &[usize]| {
+            made += 1;
+            let t = 1_700_000_000 + made;
+            stream.push_str(&format!(
+                "commit refs/heads/{branch}\nmark :{made}\nauthor Ann <ann@example.com> {t} +0000\n\
+                 committer Ann <ann@example.com> {t} +0000\ndata <<END\n{branch} {made}\nEND\n"
+            ));
+            if let Some(first) = parents.first() {
+                stream.push_str(&format!("from :{first}\n"));
+            }
+            for other in parents.iter().skip(1) {
+                stream.push_str(&format!("merge :{other}\n"));
+            }
+            stream.push('\n');
+            made
+        };
+        let mut main = commit(&mut stream, "main", &[]);
+        let mut tips: Vec<usize> = (0..lanes).map(|_| main).collect();
+        for _ in 0..rounds {
+            for (b, tip) in tips.iter_mut().enumerate() {
+                for _ in 0..per {
+                    *tip = commit(&mut stream, &format!("b{b}"), &[*tip]);
+                }
+            }
+            for tip in &tips {
+                main = commit(&mut stream, "main", &[main, *tip]);
+            }
+        }
+        stream.push_str("done\n");
+        let mut c = Command::new(git);
+        c.current_dir(&repo.top)
+            .args(["fast-import", "--done", "--quiet"])
+            .envs(env(&repo.home()))
+            .stdin(std::process::Stdio::piped());
+        for key in crate::git::runner::LOCAL_REPO_ENV {
+            c.env_remove(key);
+        }
+        let mut child = c.spawn().unwrap();
+        {
+            use std::io::Write;
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(stream.as_bytes())
+                .unwrap();
+        }
+        assert!(child.wait().unwrap().success(), "fast-import");
+        repo.run(&["reset", "-q", "--hard", "main"]);
+        repo
+    }
+}
+
+/// [`RunnerGit`] and [`RunnerPipe`] (S2-F): a parked stream's stop (E5), the read limit and the
+/// outside stop a waiting page needs (S2-B's hand-over), locally and through `ShellGit`.
+#[cfg(test)]
+mod runner_tests {
+    use super::fixture::{self, Repo};
+    use super::*;
+    use crate::git::runner::{Ending, GitRunner, Handle, Limits, ShellGit, StopBy};
+    use std::time::{Duration, Instant};
+
+    /// The two lanes: this machine's git, and a remote's words through a local `sh` (03 §3.2).
+    fn lanes(repo: &Repo, limits: Limits) -> Vec<(&'static str, GitRunner)> {
+        let shell = fixture::env(&repo.home())
+            .into_iter()
+            .fold(ShellGit::new("/bin/sh", "box"), |g, (k, v)| {
+                g.with_env(k, v)
+            })
+            .with_env("PATH", std::env::var_os("PATH").unwrap_or_default());
+        vec![
+            ("local", GitRunner::local(repo.local()).with_limits(limits)),
+            ("sh", GitRunner::shell(shell).with_limits(limits)),
+        ]
+    }
+
+    /// Waits up to `limit` for `done`; how long it took.
+    fn within(limit: Duration, done: impl Fn() -> bool) -> Option<Duration> {
+        let t = Instant::now();
+        while t.elapsed() < limit {
+            if done() {
+                return Some(t.elapsed());
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        None
+    }
+
+    /// E5 / 03 §3.5: a 100 000-commit stream parked after its first page and then stopped is
+    /// gone within 1.5 s — its stop reads and drops what git still writes, and finishes on a
+    /// thread of its own (the log has its `stopped` entry, the host's slot is free), without the
+    /// caller waiting.
+    #[test]
+    fn e5_a_parked_streams_stop_is_over_within_1_5_s() {
+        let Some(git) = fixture::git() else {
+            return;
+        };
+        let repo = fixture::big(&git, 100_000);
+        let tip = Oid::parse(&repo.rev("main")).unwrap();
+        for (lane, runner) in lanes(&repo, Limits::default()) {
+            let reads = RunnerGit::new(runner.clone(), Handle::new());
+            let current = Generation::new();
+            let g = current.bump();
+            let options = LogOptions::default();
+            let mut stream = LogStream::start(
+                &reads,
+                repo.top(),
+                &options,
+                std::slice::from_ref(&tip),
+                &current,
+                g,
+            )
+            .unwrap_or_else(|e| panic!("{lane}: {e:?}"));
+            let page = stream.page(PAGE);
+            assert_eq!(
+                (page.rows.len(), &page.end),
+                (PAGE, &PageEnd::More),
+                "{lane}"
+            );
+            std::thread::sleep(Duration::from_millis(200));
+            assert!(stream.running(), "{lane}: parked, not ended");
+            let t = Instant::now();
+            stream.stop();
+            assert!(
+                t.elapsed() < Duration::from_millis(200),
+                "{lane}: stop waited {:?}",
+                t.elapsed()
+            );
+            let over = within(Duration::from_millis(1500), || {
+                runner.in_flight() == 0
+                    && runner.log().last().is_some_and(|e| {
+                        e.line.contains(" log ")
+                            && matches!(&e.ending, Ending::Stopped(s) if s.by == StopBy::Asked)
+                    })
+            });
+            assert!(
+                over.is_some(),
+                "{lane}: not over in 1.5 s: {:?}, {} in flight",
+                runner.log().last().map(|e| e.status_line()),
+                runner.in_flight()
+            );
+            eprintln!("E5 {lane}: a parked stream's stop was over in {over:?}");
+        }
+    }
+
+    /// A command that prints a little and then nothing for 30 s (a git alias, so no file is
+    /// written for it): the stall a waiting page meets.
+    fn stall() -> Vec<String> {
+        ["-c", "alias.stall=!printf ab && sleep 30", "stall"]
+            .map(String::from)
+            .into()
+    }
+
+    /// S2-B's hand-over (a): a page waiting on a silent git ends with an error once the read
+    /// limit (03 §3.4: 30 s, 1 s here) has passed without a byte, and git is stopped.
+    #[test]
+    fn a_silent_pipe_fails_at_the_read_limit() {
+        let Some(git) = fixture::git() else {
+            return;
+        };
+        let repo = Repo::new(&git);
+        let limits = Limits {
+            read_idle: Duration::from_secs(1),
+            ..Limits::default()
+        };
+        for (lane, runner) in lanes(&repo, limits) {
+            let reads = RunnerGit::new(runner.clone(), Handle::new());
+            let mut pipe = reads.spawn(repo.top(), &stall(), b"").unwrap();
+            let mut buf = [0u8; 64];
+            let mut got = Vec::new();
+            let t = Instant::now();
+            let err = loop {
+                match pipe.read(&mut buf) {
+                    Ok(0) => panic!("{lane}: a quiet end, not the limit"),
+                    Ok(n) => got.extend_from_slice(&buf[..n]),
+                    Err(e) => break e,
+                }
+            };
+            let took = t.elapsed();
+            assert_eq!(got, b"ab", "{lane}");
+            assert_eq!(err.kind(), std::io::ErrorKind::TimedOut, "{lane}: {err}");
+            assert!(err.to_string().contains("did not answer"), "{lane}: {err}");
+            assert!(
+                took >= Duration::from_millis(900) && took < Duration::from_secs(8),
+                "{lane}: {took:?}"
+            );
+            // The page's end lets the command go: it was stopped by the limit, not by the drop.
+            pipe.stop();
+            let ended = within(Duration::from_secs(8), || {
+                runner.in_flight() == 0
+                    && runner.log().last().is_some_and(|e| {
+                        matches!(&e.ending, Ending::Stopped(s) if matches!(s.by, StopBy::Limit(_)))
+                    })
+            });
+            assert!(
+                ended.is_some(),
+                "{lane}: {:?}",
+                runner.log().last().map(|e| e.status_line())
+            );
+        }
+    }
+
+    /// S2-B's hand-over (b): Esc, or a load superseded while a page waits, stops the command
+    /// through the handle from another thread, and the waiting read returns with an error at
+    /// once; the next command given the same handle is not sent.
+    #[test]
+    fn a_stop_through_the_handle_ends_a_waiting_read() {
+        let Some(git) = fixture::git() else {
+            return;
+        };
+        let repo = Repo::new(&git);
+        for (lane, runner) in lanes(&repo, Limits::default()) {
+            let handle = Handle::new();
+            let reads = RunnerGit::new(runner.clone(), handle.clone());
+            let mut pipe = reads.spawn(repo.top(), &stall(), b"").unwrap();
+            let mut buf = [0u8; 2];
+            assert_eq!(pipe.read(&mut buf).unwrap(), 2, "{lane}");
+            let stopper = std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(300));
+                handle.stop();
+            });
+            let t = Instant::now();
+            let err = pipe.read(&mut buf).expect_err(lane);
+            assert!(
+                t.elapsed() < Duration::from_secs(7),
+                "{lane}: {:?}",
+                t.elapsed()
+            );
+            assert_eq!(err.to_string(), "stopped", "{lane}");
+            stopper.join().unwrap();
+            let again = reads.run(repo.top(), &["version".into()], b"", Bound::Read);
+            assert!(
+                matches!(&again, Err(RunError::Failed(why)) if why.contains("not sent")),
+                "{lane}: {again:?}"
+            );
+            pipe.stop();
+            assert!(
+                within(Duration::from_secs(8), || runner.in_flight() == 0).is_some(),
+                "{lane}"
+            );
+        }
+    }
+
+    /// Notes 7 and 10 (S2-B's words against S2-A's runner): every read's `argv` reaches a remote
+    /// unchanged — `SshGit::words` carries each word, quoted, after git's own options, and
+    /// adds nothing between them.
+    #[test]
+    fn every_argv_reaches_the_remote_as_written() {
+        use crate::git::runner::{Class, GitCommand, SshGit};
+        let oid = Oid::parse(&"a".repeat(40)).unwrap();
+        let query = argv::Query {
+            message: "fix it".into(),
+            path: "src/x y.rs".into(),
+            ..Default::default()
+        };
+        let all: Vec<Vec<String>> = vec![
+            argv::version(),
+            argv::detection(),
+            argv::refs(),
+            argv::symbolic_head(),
+            argv::verify_head(),
+            argv::stashes(),
+            argv::status(),
+            argv::log(&LogOptions::default()),
+            argv::details(&oid),
+            argv::name_status(&oid, &oid),
+            argv::numstat(&oid, &oid),
+            argv::empty_tree(),
+            argv::remotes(),
+            argv::contains(&oid),
+            argv::worktree_diff("--numstat", &oid),
+            argv::uncommitted_numstat(true),
+            argv::others("dir/"),
+            argv::diff_text(&argv::Side::Tree(oid.clone()), &argv::Side::Index, &["a b"]),
+            argv::blob(Some(&oid), "a'b"),
+            argv::renames_since(&oid),
+            argv::search(&LogOptions::default(), &query),
+        ];
+        for words in all {
+            let cmd = GitCommand::new(Class::Read, "/r", &words);
+            let sent: Vec<String> = SshGit::words(&cmd)
+                .into_iter()
+                .map(|w| w.to_string_lossy().into_owned())
+                .collect();
+            let quoted: Vec<String> = words
+                .iter()
+                .map(|w| String::from_utf8(crate::git::runner::quote(w.as_bytes())).unwrap())
+                .collect();
+            assert!(
+                sent.ends_with(&quoted),
+                "{words:?} not at the end of {sent:?}"
+            );
+            let at = sent.len() - quoted.len();
+            assert_eq!(
+                sent[at - 1],
+                "'--no-pager'",
+                "{words:?}: git's options end before them"
+            );
+        }
+    }
+
+    /// 03 G-P1's wide half (S2-B's hand-over): a history with many lanes open at once — 60
+    /// branches committed in turn and merged back — gives its first page within the same 5 s
+    /// bound, and the layout stores about 2 segments per row however wide it is (no per-lane
+    /// storage).
+    #[test]
+    fn g_p1_a_wide_history_pages_in_time_and_stores_few_segments() {
+        let Some(git) = fixture::git() else {
+            return;
+        };
+        let repo = fixture::wide(&git, 60, 20, 2);
+        let tip = Oid::parse(&repo.rev("main")).unwrap();
+        let reads = RunnerGit::new(repo.runner(), Handle::new());
+        let current = Generation::new();
+        let g = current.bump();
+        let t = std::time::Instant::now();
+        let mut stream = LogStream::start(
+            &reads,
+            repo.top(),
+            &LogOptions::default(),
+            std::slice::from_ref(&tip),
+            &current,
+            g,
+        )
+        .unwrap();
+        let page = stream.page(PAGE);
+        let took = t.elapsed();
+        eprintln!(
+            "G-P1 wide: first page of {} rows in {took:?}",
+            page.rows.len()
+        );
+        assert_eq!(page.rows.len(), PAGE);
+        assert!(took < Duration::from_secs(5), "{took:?}");
+        let mut rows = crate::git::graph::RowStream::new(Some(tip), false, Vec::new(), false);
+        let mut all = rows.page(page.rows);
+        loop {
+            let next = stream.page(PAGE);
+            let end = next.end.clone();
+            all.extend(rows.page(next.rows));
+            if end != PageEnd::More {
+                break;
+            }
+        }
+        let graph = crate::git::graph::layout(&all, false);
+        let per_row = graph.segment_count() as f64 / graph.len() as f64;
+        eprintln!(
+            "G-P1 wide: {} rows, {} lanes, {per_row:.2} stored segments per row",
+            graph.len(),
+            graph.width()
+        );
+        assert!(graph.width() >= 50, "wide: {} lanes", graph.width());
+        assert!(per_row < 2.5, "{per_row:.2} segments per row");
+    }
+
+    /// The adapter's one-shot reads: an exit is the exit, a missing program is `NoGit`, the
+    /// words run as `argv` writes them.
+    #[test]
+    fn a_read_through_the_runner_is_the_reads_own() {
+        let Some(git) = fixture::git() else {
+            return;
+        };
+        let repo = Repo::new(&git);
+        repo.write("a.txt", "a\n");
+        let first = repo.commit("first");
+        for (lane, runner) in lanes(&repo, Limits::default()) {
+            let reads = RunnerGit::new(runner, Handle::new());
+            let head = head(&reads, repo.top()).unwrap();
+            assert_eq!(head.oid().map(Oid::as_str), Some(first.as_str()), "{lane}");
+            let refs = refs(&reads, repo.top()).unwrap();
+            assert_eq!(refs.len(), 1, "{lane}: {refs:?}");
+            let bad = reads.run(
+                repo.top(),
+                &["rev-parse".into(), "nope".into()],
+                b"",
+                Bound::Read,
+            );
+            assert_eq!(bad.as_ref().map(|r| r.code), Ok(Some(128)), "{lane}");
+        }
+        let missing = GitRunner::local(crate::git::runner::LocalGit::new("/nonexistent/git"));
+        let reads = RunnerGit::new(missing, Handle::new());
+        assert_eq!(
+            reads.run(repo.top(), &argv::version(), b"", Bound::Detection),
+            Err(RunError::NoGit)
+        );
     }
 }

@@ -249,6 +249,20 @@ Every git command gets this environment and these options:
   stop would otherwise take the whole 5 s (E5: 0.59 s with the output read, 5.17 s without). When
   the master is gone, or no `sopen-pid` line came back, the result is `stop sent; the command may
   still be running on <host>`, never `stopped`.
+  **Never by its number alone**: a group's number proves only that some group has it. The
+  `sopen-pid` line also carries the leader's identity, its start time (field 22 of
+  `/proc/<pid>/stat` where there is a `/proc`, else `ps -o lstart=`), and every stop session reads
+  it again right before each signal, in the same `sh -c` (`-TERM`, each `-0` asking, `-KILL`):
+  a group whose leader is gone, or whose pid another process has now, is not signalled, and each
+  group's answer is its own. So a command whose channel has already ended (its leader exited) is
+  never signalled, and a child that outlives its leader (one that ignores `SIGTERM`) is left
+  running — `stop sent; the command may still be running`. The residual: the moment between the
+  reading and the `kill` inside that one shell — should the leader end and its number go to a new
+  group leader within it (the pid space wrapping meanwhile), that group would get the signal;
+  sopen holds no ownership across a pid wrap and does not guard it. Two more residuals: a remote
+  child that ignores `SIGTERM` and outlives its leader keeps running, and the stop reports `stop
+  sent` (killing by the number alone could hit an unrelated group); git's own children — remote
+  helpers, `ssh` — normally exit when git's pipes close, so they do not outlive a stopped git.
 - **After any stop** the panel refreshes (§5) and reports the state it finds: a stop is not a rollback.
   A stopped fetch may have updated some refs, objects and `FETCH_HEAD` (git updates refs one by one);
   a stopped write may have finished a step. The log says `stopped` with what the refresh found changed.
@@ -1134,7 +1148,10 @@ under the remote `/tmp/sopen-receipts/`. A window receipt is a screenshot someon
   check out each branch, stage and diff each file → every name comes back byte for byte, each file
   stages only itself, and `SshGit`'s argv for the same commands equals the expected words. The New
   branch dialog refuses `x\y`, `a b`, `a..b`, `-x` and `x.lock` as git's `check-ref-format --branch`
-  does (*verified, git 2.56.1*), before running anything.
+  does (*verified, git 2.56.1*), before running anything. A branch named `@` cannot be checked out
+  by its plain name: git reads `checkout @` as HEAD and `switch refs/heads/@` says a branch is
+  expected (*verified, git 2.56.1*); until S3's Check out spells it another way, the runner's test
+  checks `@` by name (`show-ref --verify refs/heads/@`).
 - G-R2. Fetch from `http://localhost:<port>/x.git` served by the test with `401` and a Basic
   challenge → the fetch fails within 5 s with git's "terminal prompts disabled" message in the log
   entry; no window or terminal prompt appears.

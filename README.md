@@ -11,6 +11,7 @@ sopen myserver:/tmp/a.mp3          # audio → play, cut / copy / paste, mono �
 sopen stems myserver:/tmp/a.mp3    # voice and music → two new files next to it
 sopen myserver:/tmp/a.zip          # anything else → asks: hex editor (default) or save it to a path
 sopen --target <host> myserver:/tmp/a.mp3   # the same, on <host>'s screen instead of this one
+sopen --target <host> http://127.0.0.1:1234/  # this machine's web page in <host>'s browser, tunnelled
 ```
 
 Same syntax as `scp`. Uses your `ssh` and `~/.ssh/config`; the remote needs nothing but sshd.
@@ -31,6 +32,9 @@ brew install 2lab-ai/tap/sopen-preview    # macOS (arm64, x86_64), Linux (x86_64
 ## Requirements
 
 - Media needs `ffmpeg` and `ffprobe` (the formula installs them).
+- The git panel needs git 2.20 or newer where the repository is (`SOPEN_GIT` names this machine's;
+  on macOS `/usr/bin/git` counts only when the developer tools are installed). Without it the
+  folder simply shows its list.
 - `sopen stems` needs its model, which the formula installs too (67 MB), and memory: about
   6.5 GB at its peak, whatever the length of the track.
 - Text (and F4 in the file browser): local files open in VS Code (`code`) when it is installed;
@@ -51,7 +55,8 @@ Only sshd with its SFTP subsystem (the default). sopen installs and runs nothing
 a text file (or press F4 in the file browser), VS Code Remote - SSH or Zed installs its own remote server on first use — that is the editor's behaviour,
 not sopen's. Folders are listed over SFTP. What sopen shows itself — text in the file browser, images,
 video, audio, the hex editor — is read over SFTP a piece at a time and handled on this machine; video
-and audio are decoded here by ffmpeg from that stream. (A `--target` machine is
+and audio are decoded here by ffmpeg from that stream. The git panel runs the remote's own `git`, when
+it has one, over the same ssh connection — nothing is uploaded. (A `--target` machine is
 different: it shows the file, so it needs sopen installed — see below.)
 
 ## Open on another machine's screen: `--target`
@@ -104,6 +109,48 @@ The exit code is `<host>`'s; `could not reach <host>` means ssh did not get ther
 installed on <host>` (exit 127) means it has no sopen, and `sopen on <host> ended with status
 N (signal n?)` means it most likely was interrupted there.
 
+## Web addresses: `sopen URL`
+
+```sh
+sopen http://127.0.0.1:1234/                  # opens in this machine's default browser, and sopen ends
+sopen --target <host> https://example.com/    # opens in <host>'s default browser (Safari, Chrome, Edge…)
+sopen --target <host> http://127.0.0.1:1234/  # a page served here, opened on <host> through an ssh tunnel
+```
+
+An `http://` or `https://` address (the scheme in any case) is never read as `host:path`; it goes to
+the default browser of the machine that shows things — `open` on macOS, `xdg-open` on Linux —
+exactly as written. Without a target that is all: the browser opens, sopen ends.
+
+With a target, an address that would mean `<host>` itself there — `localhost`, `127.x.y.z`, `[::1]`
+(and the other loopback names `--target` treats as this machine) — is served from this machine
+instead: sopen opens an ssh connection of its own to `<host>` (never its shared one) with
+`-R 127.0.0.1:<port>:<address's host>:<port>` (`[::1]` for an IPv6 address), so the port listens on
+`<host>`'s loopback only, and `<host>`'s sopen opens the address in its browser and waits. If
+`<host>`'s sshd has `GatewayPorts yes`, which binds a forward to every interface whatever is asked,
+`<host>`'s sopen sees the port open to the network and refuses before the browser opens. sopen prints
+`<address> is open on <host> through a tunnel — Ctrl-C closes it` and stays; Ctrl-C (or SIGTERM)
+closes the tunnel and exits 0. When sopen ends any other way — killed outright included — its pipe
+to ssh closes: `<host>`'s sopen ends, and so does the ssh under sopen's guard, even while the browser
+still holds a connection, so the page no longer opens. When `<host>`'s sopen ends first (killed
+there), sopen closes the tunnel too and exits 1. When the address's port cannot be forwarded on
+`<host>` — taken there, or forwarding refused (ssh says the same for both), as for a port below 1024
+for a user — sopen tries two random ports from 49152–65535 and says which one it took: the address
+then opens with that port, a different origin; if those fail too, `<host>` refused the tunnel
+(`AllowTcpForwarding`?). Any other address (`https://example.com/`) is handed to `<host>`'s sopen as
+it is, with no tunnel. `--app` and `--hex` open files, so with an address they are a usage error
+(exit 2).
+
+What sopen prints of an address — results, errors, `SOPEN_LOG=debug` lines — never has its password,
+query or fragment: `http://me:***@host:3000/path?…#…`. Only the browser gets it whole. (It is in the
+ssh command line, so `ps` on either machine can show it.) A host a browser reads as another address —
+`127.1`, `0x7f.0.0.1`, `%`-escapes, full-width digits, `[::ffff:127.0.0.1]` — is refused: write it
+plainly.
+
+The tunnel needs only what `ssh -R` needs: `<host>`'s sshd allowing TCP forwarding (the default). A
+`LocalForward` or `RemoteForward` your `~/.ssh/config` sets for `<host>` is requested by this
+connection too and, if it fails, ends it. So far the tunnel is tested against a stand-in `ssh`, not
+yet a real one.
+
 ## Folders: the file browser
 
 ```sh
@@ -117,9 +164,21 @@ folders, then the files (Name · Ext · Size · Date · Time; hidden files dimme
 The window opens in **preview mode**: rest the bar on a file and the other side shows it — text
 (wrapped, highlighted), an image, a video's first frame, a sound's waveform (its first 10
 minutes), or the hex rows of anything else, whatever the file's size. On a folder the other side is
-its own list again. `F9` switches
+its own list again — or, inside a git work tree, the **git panel** (below). `F9` switches
 to two plain lists (**dual mode**) and back. A preview is only looked at: `Enter` makes it the
 viewer.
+
+In a folder inside a git work tree, rest the bar on `..` (or any folder) and the other side shows
+the repository's **git panel**: every commit and branch as a graph — lanes, branch and tag labels
+(`►main↔origin`, `v1.0`, `stash@{0}`), subject, date, author, hash, the uncommitted changes on
+top — read 500 commits at a time, more as you scroll. `Tab` gives it the keyboard; `Enter` on a
+commit opens its details below the graph (summary, message, changed files with `+adds -dels`),
+`Enter` on a file shows its diff and `Shift+F3` the file as it was at that commit, each in its
+viewer and read-only. Mark a commit (`Space`) and `F3` on another to compare them. A typed letter
+finds in the loaded rows, `⌘⇧F` searches the whole history, `⌘K` filters it (branches, remotes,
+tags, stashes, first parent, order), `⌘R` refreshes. `⌘G` pins the panel to its side: it stays
+while you move over files or go elsewhere; `Esc` unpins. It runs the host's own `git` (on a remote
+over the same ssh connection, nothing installed) and changes nothing in the repository yet.
 
 `F10` shows the **directory tree** in place of the list: rooted at your home when the folder is
 under it, else at `/`, the bar on the folder you were in. Folders with few subfolders open by
@@ -149,6 +208,8 @@ keys that work there are labelled), cyan dialogs with a shadow.
 | `F4` | open the folder or file in VS Code / Zed |
 | `F5` / `F6` | copy / move the selection (or the entry) to the other panel's folder — asks first; the target can be any folder, `host:/path` too |
 | `F9` | preview mode ↔ dual mode |
+| `⌘G` | pin the git panel to the other side (again, or `Esc`: unpin) |
+| in the git panel | `Enter` / `F3` details (one marked row: compare) · `Shift+F3` the file at that commit · a letter / `⌘F` find · `⌘⇧F` history search · `⌘K` filters · `⌘R` refresh · `⌘J` to HEAD · `⌘⇧G` over both sides · `Tab` back to the list · `Esc` closes the innermost thing |
 | `F10` (or `Alt+F10`) | the directory tree; in it `→` / `←` open and close a folder, `Space` sizes a row now (`Esc` stops that), `⌘R` reads a row again, `Enter` lists the folder in the panel, `Esc` / `F10` close the tree |
 | `⌘R` · `⌘U` · `⌘←` / `⌘→` | re-read · swap the panels · this folder in the left / right panel |
 | `⌘1`…`⌘0`, or a click on the bottom row | `F1`…`F10` (Ctrl on Linux) |

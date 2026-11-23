@@ -28,6 +28,9 @@ use std::time::{Duration, SystemTime};
 
 use ActionId as A;
 
+/// The slices the panel reads once S3-C has landed slice 3: the landed set and 3.
+const WITH_SLICE_3: keys::Slices = keys::LANDED_SLICES.with(3);
+
 // ---------------------------------------------------------------------------------------------
 // Fixtures.
 
@@ -312,10 +315,12 @@ impl Window for Host {
     fn ui(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         let modal = self.menu.is_some() || self.dialog.is_some() || self.result.is_some();
-        // The git context's rows, as the panel reads them while a list is open (slice 3's rows
-        // included: `UPTO` is still 2 until S3-C lands them).
+        // The git context's rows, as the panel reads them while a list is open: the landed set
+        // and slice 3, as S3-C will land it (until then the panel reads `LANDED_SLICES`).
         if !modal && (self.backups.is_some() || self.log.is_some()) {
-            while let Some(c) = ctx.input_mut(|i| keys::find(&mut i.events, Context::Git, 3u8)) {
+            while let Some(c) =
+                ctx.input_mut(|i| keys::find(&mut i.events, Context::Git, WITH_SLICE_3))
+            {
                 if let Some(v) = &mut self.backups {
                     self.backups_ends.extend(v.run(c));
                 } else if let Some(v) = &mut self.log {
