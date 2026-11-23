@@ -10,7 +10,7 @@ use super::log_view::{self, LogEnd, LogView};
 use super::menu::{self, Menu, MenuEnd, Target};
 use crate::git::actions::{
     Action, ActionId, Confirmation, Outcome, Overwrite, Plan, Proceed, PushOptions, Refused,
-    Remote, RemoteChange, Repo, ResetMode, Step, StepOutcome, StepResult,
+    Remote, RemoteChange, Repo, ResetMode, Seen, Step, StepOutcome, StepResult,
 };
 use crate::git::backup::{self as backup, Manifest, Record, RestoreEntry, RestoreHow, Value};
 use crate::git::model::{
@@ -153,6 +153,7 @@ fn repo() -> Repo {
         },
         in_progress: InProgress::default(),
         remotes: vec!["origin".into()],
+        seen: Seen::default(),
     }
 }
 
