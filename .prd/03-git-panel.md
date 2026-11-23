@@ -489,7 +489,9 @@ A label's menu has "Show only this branch" and "Show all branches" (§7.2). The 
 
 - **Soft**: refs, HEAD, status, stashes and the probe. When refs, HEAD and stashes are unchanged, the
   graph's rows stay and only the uncommitted row, the foot and the banner change; otherwise the log
-  stream restarts (§4.5).
+  stream restarts (§4.5). When the uncommitted row appears or disappears, the lane layout (§4.3) runs
+  again over the rows already loaded — no history is read again; the row takes slot 0 and continues
+  down HEAD's lane, so HEAD's lane can move.
 - The bar sweeping over files and folders therefore costs nothing in git: the side follows O6 only
   after 150 ms of rest (02 §3.1), a stream survives 30 s hidden (§4.5), and a refresh younger than 10 s
   is not repeated.
