@@ -163,6 +163,7 @@ impl TreeFs for Scripted {
             Ask::Scan(a) if a.start.iter().any(|p| s.hang_scans.contains(p)) => Got::NotAnswering,
             Ask::Scan(a) => {
                 let skip: HashSet<String> = a.skip.iter().cloned().collect();
+                let hold: HashSet<String> = a.hold.iter().cloned().collect();
                 let mut seen = a.seen.iter().copied().collect();
                 let mut totals = a.base;
                 let mut queue: VecDeque<String> = a.start.iter().cloned().collect();
@@ -178,7 +179,14 @@ impl TreeFs for Scripted {
                                 complete: true,
                                 cachedir: false,
                             };
-                            queue.extend(scan_step(&dir, &listing, &skip, &mut seen, &mut totals));
+                            queue.extend(scan_step(
+                                &dir,
+                                &listing,
+                                &skip,
+                                &hold,
+                                &mut seen,
+                                &mut totals,
+                            ));
                         }
                         None => totals.unread += 1,
                     }
@@ -816,6 +824,82 @@ fn r1_7_esc_stops_a_space_scan() {
         fake.lists().iter().filter(|l| !l.full).count(),
         at_stop,
         "no scan listing after Esc"
+    );
+    pool.shutdown();
+}
+
+/// Review round 2, item 4: one listing of a Space scan abandoned by the watchdog stops its
+/// siblings too (the scan has ended), instead of losing their stop.
+#[test]
+fn r2_4_an_abandoned_listing_stops_its_siblings() {
+    let (_tmp, h) = temp();
+    mkdirs(&h, &["row/a/x", "row/b/y"]);
+    std::fs::write(h.join("row/readme"), b"x").unwrap();
+    let fake = Fake::new(&h);
+    fake.gate().paths.insert(p(&h.join("row/a")));
+    fake.long.lock().unwrap().insert(p(&h.join("row/b")));
+    let pool = pool(Duration::from_millis(300));
+    // A screen of one row: only Space scans `row`.
+    let mut tree = open(&fake, &pool, &h, Params { n: 5, d: 1, e: 1 });
+    settle(&mut tree);
+    tree.size_now(row(&tree, "row").id);
+    let b = p(&h.join("row/b"));
+    let stopped = |f: &Fake| f.stopped.lock().unwrap().iter().any(|(path, _)| *path == b);
+    assert!(
+        until(&mut tree, Duration::from_secs(2), |_| stopped(&fake)),
+        "the sibling read on: {:?}",
+        fake.stopped.lock().unwrap()
+    );
+    fake.release(1);
+    pool.shutdown();
+}
+
+/// Review round 2, item 5: a fence probe (`statvfs`) that does not answer shows on any row
+/// that needs it, not only on a mount's.
+#[test]
+fn r2_5_a_late_fence_shows_on_an_ordinary_row() {
+    let host = Scripted::new("/Users/u", mac_remote());
+    mac_root(&host);
+    host.state().hold.insert("/usr".into());
+    let mut tree = host.tree("/", Params { n: 5, d: 1, e: 36 });
+    settle(&mut tree);
+    assert_eq!(row(&tree, "usr").info.size, Size::Tag(Tag::NotAnswering));
+    host.release("/usr");
+    settle(&mut tree);
+    assert!(matches!(row(&tree, "usr").info.size, Size::Bytes { .. }));
+}
+
+/// Review round 2, item 6: a scan that leaves out an H3 folder keeps the size a lower bound —
+/// the macOS home holding only a non-empty `Library` is `+` after Space, never an exact zero.
+#[test]
+fn r2_6_an_h3_folder_left_out_keeps_the_size_partial() {
+    let (_tmp, h) = temp();
+    mkdirs(&h, &["Library/x"]);
+    std::fs::write(h.join("Library/x/data"), [0u8; 50]).unwrap();
+    let fake = Fake::with_mounts(
+        &h,
+        Mounts {
+            table: Some(Vec::new()),
+            macos: true,
+            statvfs: true,
+        },
+    );
+    let pool = pool(Duration::from_secs(30));
+    let mut tree = open(&fake, &pool, &h, Params { n: 5, d: 1, e: 36 });
+    settle(&mut tree);
+    tree.size_now(row(&tree, "~").id);
+    settle(&mut tree);
+    let size = row(&tree, "~").info.size;
+    assert!(
+        matches!(
+            size,
+            Size::Bytes {
+                more: true,
+                scanning: false,
+                ..
+            }
+        ),
+        "{size:?}"
     );
     pool.shutdown();
 }

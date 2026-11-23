@@ -11,9 +11,9 @@
 
 use super::{read_at, SftpRemote, META_TIMEOUT};
 use crate::remote::treefs::{
-    guarded, is_cachedir_tag, normalize, scan_step, Ask, Budget, Child, FsStat, Got, Kind, Listing,
-    Mounts, Reply, Resolved, ScanAsk, ScanBudget, ScanEnd, Scanned, Target, Totals, TreeFs,
-    IN_FLIGHT, NOT_ANSWERING,
+    guarded, is_cachedir_tag, scan_step, Ask, Budget, Child, FsStat, Got, Kind, Listing, Mounts,
+    Reply, Resolved, ScanAsk, ScanBudget, ScanEnd, Scanned, Target, Totals, TreeFs, IN_FLIGHT,
+    NOT_ANSWERING,
 };
 use crate::remote::Wake;
 use openssh_sftp_client::fs::Fs;
@@ -37,6 +37,9 @@ pub(crate) struct Timing {
     pub progress: Duration,
     /// How long closing the session may wait for the server.
     pub close: Duration,
+    /// Handles that may have been left open on the server (an open whose answer did not come
+    /// in time: the client crate never closes a late one) before the connection is renewed.
+    pub recycle_after: u32,
 }
 
 impl Default for Timing {
@@ -46,6 +49,7 @@ impl Default for Timing {
             request: META_TIMEOUT,
             progress: Duration::from_millis(100),
             close: Duration::from_secs(5),
+            recycle_after: 32,
         }
     }
 }
@@ -58,7 +62,22 @@ impl SftpRemote {
         self.into_tree_with(Timing::default())
     }
 
-    pub(crate) fn into_tree_with(mut self: Box<Self>, timing: Timing) -> Box<dyn TreeFs> {
+    /// [`SftpRemote::into_tree`], with a way to open a fresh connection (`Connect` again, 02 §6):
+    /// once 32 handles may have been left open on the server, the worker opens a new session
+    /// through `renew` and lets the old one close (the server frees what it held).
+    pub fn into_tree_renewing(self: Box<Self>, renew: Renew) -> Box<dyn TreeFs> {
+        self.into_tree_full(Timing::default(), Some(renew))
+    }
+
+    pub(crate) fn into_tree_with(self: Box<Self>, timing: Timing) -> Box<dyn TreeFs> {
+        self.into_tree_full(timing, None)
+    }
+
+    pub(crate) fn into_tree_full(
+        mut self: Box<Self>,
+        timing: Timing,
+        renew: Option<Renew>,
+    ) -> Box<dyn TreeFs> {
         let (cmds, cmd_rx) = queue::unbounded_channel();
         let (tx, rx) = mpsc::channel();
         let wake: Arc<Mutex<Option<Wake>>> = Arc::default();
@@ -72,15 +91,55 @@ impl SftpRemote {
             .name("sopen-tree-sftp".into())
             .spawn(move || {
                 let out = Out { tx, wake: woken };
-                rt.block_on(async move {
-                    let mut worker = Worker::new(sftp, fs, out, timing);
-                    let mut cmd_rx = cmd_rx;
-                    std::future::poll_fn(|cx| worker.poll(cx, &mut cmd_rx)).await;
+                let mut renew = renew;
+                let mut rt = rt;
+                let mut worker = Worker::new(sftp, fs, out, timing);
+                let mut cmd_rx = cmd_rx;
+                loop {
+                    let renewable = renew.is_some();
+                    let end = rt.block_on(std::future::poll_fn(|cx| {
+                        worker.poll(cx, &mut cmd_rx, renewable)
+                    }));
+                    if end == End::Closed {
+                        break;
+                    }
+                    // Too many handles may be left open on the server: a fresh session, opened
+                    // here (outside the runtime: connecting runs one of its own), takes over;
+                    // what was in flight is asked again on it, and the old one closes — the
+                    // server frees whatever it held.
+                    worker.leaks.set(0);
+                    let Some(mut fresh) = renew.as_mut().and_then(|r| r()) else {
+                        continue;
+                    };
+                    let (Some(new_rt), Some(new_sftp), Some(new_fs)) =
+                        (fresh.rt.take(), fresh.sftp.take(), fresh.fs.take())
+                    else {
+                        continue;
+                    };
+                    drop(fresh);
+                    // The old session's futures and timer go in its own runtime's context.
+                    let old = {
+                        let _in = rt.enter();
+                        worker.requeue();
+                        worker.timer = None;
+                        worker.fs = new_fs;
+                        std::mem::replace(&mut worker.sftp, new_sftp)
+                    };
+                    let _ = rt
+                        .block_on(async { tokio::time::timeout(timing.close, old.close()).await });
+                    rt = new_rt;
+                }
+                let sftp = {
+                    let _in = rt.enter();
                     worker.flights.clear();
+                    worker.draining.clear();
                     worker.scans.clear();
+                    worker.timer = None;
                     let Worker { sftp, .. } = worker;
-                    let _ = tokio::time::timeout(timing.close, sftp.close()).await;
-                });
+                    sftp
+                };
+                let _ =
+                    rt.block_on(async { tokio::time::timeout(timing.close, sftp.close()).await });
             });
         if spawned.is_err() {
             // The worker could not start: every request will go unanswered; the tree says
@@ -95,6 +154,10 @@ impl SftpRemote {
         })
     }
 }
+
+/// Opens a fresh connection for the tree (on the worker's thread, outside its runtime);
+/// `None`: it could not, and the old one goes on.
+pub type Renew = Box<dyn FnMut() -> Option<SftpRemote> + Send>;
 
 enum Cmd {
     Send(u64, u64, Box<Ask>),
@@ -169,6 +232,18 @@ impl Out {
 
 type Fut<T> = Pin<Box<dyn Future<Output = T>>>;
 
+/// Opens whose answer did not come in time: each may have left a handle open on the server
+/// (the client crate drops a late HANDLE without closing it).
+type Leaks = std::rc::Rc<std::cell::Cell<u32>>;
+
+/// Why the worker's loop returned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum End {
+    Closed,
+    /// Time for a fresh connection.
+    Renew,
+}
+
 /// A request's "no longer wanted", which its future reads between its steps.
 type Stop = std::rc::Rc<std::cell::Cell<bool>>;
 
@@ -177,6 +252,10 @@ enum Flight {
     /// An answer to a request.
     Ask {
         id: u64,
+        /// The request, its priority and arrival: asked again on a fresh connection.
+        ask: Box<Ask>,
+        prio: u64,
+        seq: u64,
         since: Instant,
         warned: bool,
         /// It opens a handle (a listing): cancelled, it is drained, not dropped.
@@ -241,6 +320,7 @@ struct RScan {
     /// Each folder's listing stops at this.
     listing: Option<Budget>,
     skip: HashSet<String>,
+    hold: HashSet<String>,
     seen: HashSet<(u64, u64)>,
     fence: Option<Vec<u64>>,
 }
@@ -259,6 +339,7 @@ struct Worker {
     draining: Vec<Fut<()>>,
     scans: HashMap<u64, RScan>,
     timer: Option<Pin<Box<tokio::time::Sleep>>>,
+    leaks: Leaks,
 }
 
 impl Worker {
@@ -274,12 +355,41 @@ impl Worker {
             draining: Vec::new(),
             scans: HashMap::new(),
             timer: None,
+            leaks: Leaks::default(),
         }
     }
 
+    /// Puts what is in flight back to wait (a fresh connection takes over): requests in the
+    /// queue in their order, a scan's folders at the front of its queue. Their futures, and the
+    /// drains, go with the old session.
+    fn requeue(&mut self) {
+        for f in std::mem::take(&mut self.flights) {
+            match f {
+                Flight::Ask {
+                    id, ask, prio, seq, ..
+                } => self.waiting.push((prio, seq, id, *ask)),
+                Flight::Scan { id, dir, .. } => {
+                    if let Some(scan) = self.scans.get_mut(&id) {
+                        scan.flying -= 1;
+                        scan.queue.push_front(dir);
+                    }
+                }
+            }
+        }
+        self.draining.clear();
+    }
+
     /// Drives everything; ready once the tree closed (or went away).
-    fn poll(&mut self, cx: &mut Context<'_>, cmds: &mut queue::UnboundedReceiver<Cmd>) -> Poll<()> {
+    fn poll(
+        &mut self,
+        cx: &mut Context<'_>,
+        cmds: &mut queue::UnboundedReceiver<Cmd>,
+        renewable: bool,
+    ) -> Poll<End> {
         loop {
+            if renewable && self.leaks.get() >= self.timing.recycle_after {
+                return Poll::Ready(End::Renew);
+            }
             loop {
                 match cmds.poll_recv(cx) {
                     Poll::Ready(Some(Cmd::Send(id, prio, ask))) => {
@@ -287,7 +397,9 @@ impl Worker {
                         self.waiting.push((prio, self.seq, id, *ask));
                     }
                     Poll::Ready(Some(Cmd::Cancel(id))) => self.cancel(id),
-                    Poll::Ready(Some(Cmd::Close)) | Poll::Ready(None) => return Poll::Ready(()),
+                    Poll::Ready(Some(Cmd::Close)) | Poll::Ready(None) => {
+                        return Poll::Ready(End::Closed)
+                    }
                     Poll::Pending => break,
                 }
             }
@@ -384,7 +496,9 @@ impl Worker {
         let fs = self.fs.clone();
         let request = self.timing.request;
         let stop = Stop::default();
-        let handle = matches!(ask, Ask::List { .. });
+        let handle = matches!(ask, Ask::List { .. } | Ask::Mounts);
+        let leaks = self.leaks.clone();
+        let kept = Box::new(ask.clone());
         let fut: Fut<Got> = match ask {
             Ask::Resolve(path) => Box::pin(async move {
                 Got::Resolved(realpath(fs, &path, request).await.map(|path| Resolved {
@@ -398,7 +512,9 @@ impl Worker {
             }
             Ask::Mounts => {
                 let (opts, statvfs) = (self.sftp.options(), self.sftp.support_statvfs());
-                Box::pin(async move { Got::Mounts(mounts(fs, opts, statvfs, request).await) })
+                Box::pin(
+                    async move { Got::Mounts(mounts(fs, opts, statvfs, request, &leaks).await) },
+                )
             }
             Ask::List {
                 path,
@@ -411,7 +527,7 @@ impl Worker {
                 };
                 let stop = stop.clone();
                 Box::pin(async move {
-                    Got::Listed(list(fs, Some(row), &path, budget, request, &stop).await)
+                    Got::Listed(list(fs, Some(row), &path, budget, request, &stop, &leaks).await)
                 })
             }
             Ask::Statvfs(path) => {
@@ -425,6 +541,9 @@ impl Worker {
         };
         self.flights.push(Flight::Ask {
             id,
+            ask: kept,
+            prio,
+            seq,
             since: Instant::now(),
             warned: false,
             handle,
@@ -449,6 +568,7 @@ impl Worker {
                 budget: ask.budget,
                 listing: ask.listing,
                 skip: ask.skip.into_iter().collect(),
+                hold: ask.hold.into_iter().collect(),
                 seen: ask.seen.into_iter().collect(),
                 fence,
             },
@@ -470,6 +590,7 @@ impl Worker {
         let path = dir.clone();
         let stop = Stop::default();
         let stopped = stop.clone();
+        let leaks = self.leaks.clone();
         let fut: Fut<Result<Option<Listing>, String>> = Box::pin(async move {
             if let Some(allowed) = fence {
                 // 05 §4.1: a folder on another filesystem is a mount point, not entered — and a
@@ -479,7 +600,7 @@ impl Worker {
                     return Ok(None);
                 }
             }
-            list(fs, None, &path, budget, request, &stopped)
+            list(fs, None, &path, budget, request, &stopped, &leaks)
                 .await
                 .map(Some)
         });
@@ -505,12 +626,13 @@ impl Worker {
                     Ok(Some(listing)) => {
                         let RScan {
                             skip,
+                            hold,
                             seen,
                             totals,
                             queue,
                             ..
                         } = scan;
-                        queue.extend(scan_step(&dir, &listing, skip, seen, totals));
+                        queue.extend(scan_step(&dir, &listing, skip, hold, seen, totals));
                     }
                     Ok(None) => {}
                     Err(_) => scan.totals.unread += 1,
@@ -666,8 +788,13 @@ async fn mounts(
     opts: openssh_sftp_client::file::OpenOptions,
     statvfs: bool,
     request: Duration,
+    leaks: &Leaks,
 ) -> Mounts {
-    if let Ok(bytes) = read_all(opts, "/proc/self/mountinfo", 1 << 20, request, None).await {
+    // Bounded in time as a whole, whatever the server answers.
+    let started = Instant::now();
+    let go = || started.elapsed() < 2 * request;
+    let mountinfo = read_all(opts, "/proc/self/mountinfo", 1 << 20, request, &go, leaks).await;
+    if let Ok(bytes) = mountinfo {
         let table = crate::remote::treefs::parse_mountinfo(&String::from_utf8_lossy(&bytes));
         if !table.is_empty() {
             return Mounts {
@@ -692,23 +819,32 @@ async fn mounts(
 }
 
 /// Up to `max` bytes of `path`, each read at its own offset (a short reply is followed by a
-/// request for the rest; the crate's cursor moves by the length asked).
+/// request for the rest; the crate's cursor moves by the length asked). `go` is asked before
+/// every READ — a stop or a deadline ends it there, and the handle it holds is closed. An open
+/// whose answer did not come in time is counted in `leaks`.
 async fn read_all(
     opts: openssh_sftp_client::file::OpenOptions,
     path: &str,
     max: u64,
     request: Duration,
-    stop: Option<&Stop>,
+    go: &dyn Fn() -> bool,
+    leaks: &Leaks,
 ) -> Result<Vec<u8>, String> {
     let mut opts = opts;
-    let file = within(request, &format!("open {path}"), opts.read(true).open(path)).await?;
-    if stop.is_some_and(|s| s.get()) {
-        let _ = tokio::time::timeout(Duration::from_secs(5), file.close()).await;
-        return Err(format!("read {path}: cancelled"));
-    }
+    let file = match tokio::time::timeout(request, opts.read(true).open(path)).await {
+        Ok(Ok(file)) => file,
+        Ok(Err(e)) => return Err(format!("cannot open {path}: {e}")),
+        Err(_) => {
+            leaks.set(leaks.get() + 1);
+            return Err(format!("open {path}: no reply in {}s", request.as_secs()));
+        }
+    };
     let mut out = Vec::new();
     let result = async {
         while (out.len() as u64) < max {
+            if !go() {
+                return Err(format!("read {path}: stopped"));
+            }
             let want = (max - out.len() as u64).min(32 * 1024) as u32;
             match within(
                 request,
@@ -769,6 +905,7 @@ async fn list(
     budget: Option<Budget>,
     request: Duration,
     stop: &Stop,
+    leaks: &Leaks,
 ) -> Result<Listing, String> {
     let cancelled = || Err::<Listing, _>(format!("list {path}: cancelled"));
     let started = Instant::now();
@@ -776,7 +913,15 @@ async fn list(
     if stop.get() {
         return cancelled();
     }
-    let dir = within(request, &format!("list {path}"), fs.open_dir(path)).await?;
+    let dir = match tokio::time::timeout(request, fs.open_dir(path)).await {
+        Ok(Ok(dir)) => dir,
+        Ok(Err(e)) => return Err(format!("cannot list {path}: {e}")),
+        Err(_) => {
+            // Its HANDLE, if it comes, will never be closed by the client.
+            leaks.set(leaks.get() + 1);
+            return Err(format!("list {path}: no reply in {}s", request.as_secs()));
+        }
+    };
     if stop.get() {
         // Dropping the handle closes it.
         return cancelled();
@@ -856,28 +1001,16 @@ async fn list(
         }
         let full = crate::remote::join(path, &child.name);
         if !row.guard.is_empty() {
-            // Where it points, by its words: a target in a guarded mount is never asked for.
-            let to = within(request, "readlink", fs.read_link(&full)).await;
-            let unread = match to {
-                Ok(to) => {
-                    let to = to.to_string_lossy().into_owned();
-                    let abs = if to.starts_with('/') {
-                        to
-                    } else {
-                        crate::remote::join(path, &to)
-                    };
-                    guarded(&normalize(&abs), &row.guard)
+            // Resolved one component at a time, never looked up at or below a guard.
+            let name = child.name.clone();
+            match follow(&mut fs, path, &name, &row.guard, &go, request).await {
+                Some(t) => listing.children[i].kind = Kind::Link(t),
+                None => {
+                    listing.complete = false;
+                    return Ok(listing);
                 }
-                Err(_) => false,
-            };
-            if unread {
-                listing.children[i].kind = Kind::Link(Target::Unread);
-                continue;
             }
-            if !go() {
-                listing.complete = false;
-                return Ok(listing);
-            }
+            continue;
         }
         listing.children[i].kind = match within(request, "stat", fs.metadata(&full)).await {
             Ok(m) if m.file_type().is_some_and(|t| t.is_dir()) => Kind::Link(Target::Dir),
@@ -895,17 +1028,91 @@ async fn list(
             return Ok(listing);
         }
         let tag = crate::remote::join(path, "CACHEDIR.TAG");
-        listing.cachedir = read_all(row.opts, &tag, 43, request, Some(stop))
+        listing.cachedir = read_all(row.opts, &tag, 43, request, &go, leaks)
             .await
             .is_ok_and(|head| is_cachedir_tag(&head));
+        if !go() {
+            listing.complete = false;
+        }
     }
     Ok(listing)
+}
+
+/// What the link `dir/name` points at, resolved one component at a time over SFTP (`LSTAT`,
+/// and `READLINK` for each link on the way, at most 40), never looking up a path at or below one
+/// of `guard`: one there is [`Target::Unread`], as is anything that cannot be checked (fail
+/// closed). `None`: `go` said stop.
+async fn follow(
+    fs: &mut Fs,
+    dir: &str,
+    name: &str,
+    guard: &[String],
+    go: &dyn Fn() -> bool,
+    request: Duration,
+) -> Option<Target> {
+    // `dir` was listed by its path: it is a folder, and no link is in it.
+    let mut at = dir.to_string();
+    let mut todo: VecDeque<String> = VecDeque::from([name.to_string()]);
+    let mut hops = 0;
+    while let Some(part) = todo.pop_front() {
+        match part.as_str() {
+            "" | "." => continue,
+            ".." => {
+                if at != "/" {
+                    at = crate::remote::split_parent(&at).0.to_string();
+                }
+                continue;
+            }
+            _ => {}
+        }
+        let next = crate::remote::join(&at, &part);
+        if guarded(&next, guard) {
+            return Some(Target::Unread);
+        }
+        if !go() {
+            return None;
+        }
+        let meta = match tokio::time::timeout(request, fs.symlink_metadata(&next)).await {
+            Ok(Ok(meta)) => meta,
+            // Broken: nothing was followed.
+            Ok(Err(e)) if super::is_not_found(&e) => return Some(Target::Other),
+            _ => return Some(Target::Unread),
+        };
+        match meta.file_type() {
+            Some(t) if t.is_symlink() => {
+                hops += 1;
+                if hops > 40 {
+                    return Some(Target::Other);
+                }
+                if !go() {
+                    return None;
+                }
+                let to = match tokio::time::timeout(request, fs.read_link(&next)).await {
+                    Ok(Ok(to)) => to.to_string_lossy().into_owned(),
+                    _ => return Some(Target::Unread),
+                };
+                if to.starts_with('/') {
+                    at = "/".to_string();
+                }
+                for p in to.split('/').rev() {
+                    todo.push_front(p.to_string());
+                }
+            }
+            Some(t) if t.is_dir() => at = next,
+            Some(t) if t.is_file() && todo.iter().all(|p| p.is_empty() || p == ".") => {
+                return Some(Target::File)
+            }
+            Some(_) => return Some(Target::Other),
+            None => return Some(Target::Unread),
+        }
+    }
+    Some(Target::Dir)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::remote::sftp::Proxy;
+    use crate::remote::sftp::{Proxy, Wired};
     use crate::remote::treefs::{ScanAsk, ScanBudget, LIST_BUDGET, REMOTE_SCAN_BUDGET};
     use std::path::Path;
     use std::sync::atomic::Ordering;
@@ -1339,7 +1546,9 @@ mod tests {
         let kind = |n: &str| listing.children.iter().find(|c| c.name == n).unwrap().kind;
         assert_eq!(kind("in"), Kind::Link(Target::Unread));
         assert_eq!(kind("out"), Kind::Link(Target::Dir));
-        assert_eq!(requests(&proxy, STAT), 1, "only the link outside the guard");
+        // With a guard the target is resolved by LSTAT and READLINK, one component at a time
+        // (round 2): no STAT, which would follow the whole chain on the server.
+        assert_eq!(requests(&proxy, STAT), 0, "nothing followed by the server");
         tree.close();
     }
 
@@ -1548,6 +1757,152 @@ mod tests {
         });
         assert_eq!(count("opendir "), 100);
         assert_eq!(count("closedir "), 100, "every late handle was closed");
+        tree.close();
+    }
+
+    /// Round 2, item 1: a chain of links into a guarded mount is never followed (no `STAT`, no
+    /// lookup in it); a `READLINK` that fails leaves the target unread (fail closed).
+    #[test]
+    fn a_link_chain_into_a_guarded_mount_is_never_followed() {
+        if SftpRemote::local_server().is_none() {
+            return;
+        }
+        let (_tmp, dir) = temp();
+        let (_g, guarded) = temp();
+        std::fs::create_dir_all(guarded.join("share/x")).unwrap();
+        std::os::unix::fs::symlink("next", dir.join("direct")).unwrap();
+        std::os::unix::fs::symlink(guarded.join("share/x"), dir.join("next")).unwrap();
+        let (_t2, other) = temp();
+        std::fs::create_dir(other.join("sub")).unwrap();
+        std::os::unix::fs::symlink("sub", other.join("plain")).unwrap();
+        let proxy = Proxy::default();
+        let conn = SftpRemote::local_server_with(Some(proxy.clone())).unwrap();
+        let mut tree = Box::new(conn).into_tree_with(quick());
+        let ask = |path: &Path| Ask::List {
+            path: p(path),
+            budget: None,
+            guard: vec![p(&guarded)],
+        };
+        tree.send(1, 0, ask(&dir));
+        let listing = listed(&wait_for(&mut *tree, 1, Duration::from_secs(10)), 1);
+        let kind = |l: &Listing, n: &str| l.children.iter().find(|c| c.name == n).unwrap().kind;
+        assert_eq!(kind(&listing, "direct"), Kind::Link(Target::Unread));
+        assert_eq!(kind(&listing, "next"), Kind::Link(Target::Unread));
+        assert_eq!(requests(&proxy, STAT), 0, "nothing followed");
+        // SSH_FXP_READLINK answered SSH_FX_FAILURE: the target is not read.
+        proxy.rules.lock().unwrap().fail = Some(READLINK);
+        tree.send(2, 0, ask(&other));
+        let listing = listed(&wait_for(&mut *tree, 2, Duration::from_secs(10)), 2);
+        assert_eq!(kind(&listing, "plain"), Kind::Link(Target::Unread));
+        tree.close();
+    }
+
+    /// Round 2, item 2: the `CACHEDIR.TAG` read stops at its listing's deadline, and on a cancel
+    /// (Esc): no further READ (a server answering every READ with no bytes would go on forever).
+    #[test]
+    fn a_cache_tag_read_stops_at_its_deadline_and_on_esc() {
+        if SftpRemote::local_server().is_none() {
+            return;
+        }
+        let (_tmp, dir) = temp();
+        std::fs::write(
+            dir.join("CACHEDIR.TAG"),
+            "Signature: 8a477f597d28d172789f06886806bc55\n",
+        )
+        .unwrap();
+        let reads = |proxy: &Proxy| requests(proxy, Wired::READ);
+        // Past the deadline.
+        let proxy = Proxy::default();
+        proxy.rules.lock().unwrap().empty = vec![0];
+        let conn = SftpRemote::local_server_with(Some(proxy.clone())).unwrap();
+        let mut tree = Box::new(conn).into_tree_with(quick());
+        tree.send(
+            1,
+            0,
+            Ask::List {
+                path: p(&dir),
+                budget: Some(Budget {
+                    entries: 10_000,
+                    time: Duration::from_millis(300),
+                }),
+                guard: Vec::new(),
+            },
+        );
+        let listing = listed(&wait_for(&mut *tree, 1, Duration::from_secs(5)), 1);
+        assert!(!listing.complete && !listing.cachedir);
+        let at = reads(&proxy);
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(reads(&proxy), at, "no READ after the deadline");
+        tree.close();
+        // On Esc (an owner's whole listing has no deadline).
+        let proxy = Proxy::default();
+        proxy.rules.lock().unwrap().empty = vec![0];
+        let conn = SftpRemote::local_server_with(Some(proxy.clone())).unwrap();
+        let mut tree = Box::new(conn).into_tree_with(quick());
+        tree.send(
+            1,
+            0,
+            Ask::List {
+                path: p(&dir),
+                budget: None,
+                guard: Vec::new(),
+            },
+        );
+        assert!(until(Duration::from_secs(5), || reads(&proxy) >= 3));
+        tree.cancel(1);
+        std::thread::sleep(Duration::from_millis(100));
+        let at = reads(&proxy);
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(reads(&proxy), at, "no READ after Esc");
+        tree.close();
+    }
+
+    /// Round 2, item 3: opens whose answer came too late leave handles on the server (the client
+    /// crate never closes a late one); past `recycle_after` of them the worker opens a fresh
+    /// connection and the tree goes on on it.
+    #[test]
+    fn orphaned_handles_renew_the_connection() {
+        if SftpRemote::local_server().is_none() {
+            return;
+        }
+        let (_tmp, dir) = temp();
+        let proxy = Proxy::default();
+        let conn = SftpRemote::local_server_with(Some(proxy.clone())).unwrap();
+        proxy.hold.store(true, Ordering::Relaxed);
+        let renewed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = renewed.clone();
+        let renew: Renew = Box::new(move || {
+            count.fetch_add(1, Ordering::SeqCst);
+            SftpRemote::local_server()
+        });
+        let timing = Timing {
+            request: Duration::from_millis(300),
+            close: Duration::from_millis(300),
+            recycle_after: 2,
+            ..quick()
+        };
+        let mut tree = Box::new(conn).into_tree_full(timing, Some(renew));
+        let list = || Ask::List {
+            path: p(&dir),
+            budget: None,
+            guard: Vec::new(),
+        };
+        tree.send(1, 0, list());
+        tree.send(2, 0, list());
+        for id in [1, 2] {
+            let got = wait_for(&mut *tree, id, Duration::from_secs(5));
+            assert!(
+                matches!(got.last().map(|r| &r.got), Some(Got::Listed(Err(_)))),
+                "{got:?}"
+            );
+        }
+        assert!(until(Duration::from_secs(5), || renewed
+            .load(Ordering::SeqCst)
+            == 1));
+        tree.send(3, 0, list());
+        listed(&wait_for(&mut *tree, 3, Duration::from_secs(5)), 3);
+        assert_eq!(renewed.load(Ordering::SeqCst), 1);
+        proxy.hold.store(false, Ordering::Relaxed);
         tree.close();
     }
 }

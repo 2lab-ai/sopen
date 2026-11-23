@@ -241,6 +241,7 @@ struct Scan {
     out: Arc<Outbox>,
     stop: Stop,
     skip: HashSet<String>,
+    hold: HashSet<String>,
     budget: Option<crate::remote::treefs::ScanBudget>,
     /// Each folder's listing stops at this.
     listing: Option<Budget>,
@@ -268,6 +269,7 @@ impl Scan {
             out: tree.out.clone(),
             stop: tree.wanted.track(id),
             skip: ask.skip.into_iter().collect(),
+            hold: ask.hold.into_iter().collect(),
             budget: ask.budget,
             listing: ask.listing,
             state: Mutex::new(ScanState {
@@ -347,8 +349,10 @@ impl Scan {
                 Box::new(move || me.listed(&dir, got)) as Then
             }),
             abandoned: Box::new(move || {
-                // One call that does not answer stops the scan: the row says so.
+                // One call that does not answer stops the scan: the row says so, and its other
+                // listings stop with it — the flag first, while they still read it.
                 late.lock().over = true;
+                late.stop.cancelled.store(true, Ordering::SeqCst);
                 late.stop.wanted.done(late.id);
                 late.out.send(late.id, Got::NotAnswering);
             }),
@@ -367,7 +371,7 @@ impl Scan {
                         queue,
                         ..
                     } = &mut *s;
-                    let below = scan_step(dir, &listing, &self.skip, seen, totals);
+                    let below = scan_step(dir, &listing, &self.skip, &self.hold, seen, totals);
                     queue.extend(below);
                 }
                 Err(_) => s.totals.unread += 1,

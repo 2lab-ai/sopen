@@ -9,7 +9,9 @@
 //! takes the answers when it is polled. Per frame: [`Tree::poll`], then [`Tree::rows`].
 //!
 //! - **Open**: [`Tree::open`]`(fs, `[`Open`]`)` — `fs` is [`LocalFs::tree`] for the local disk, or
-//!   [`SftpRemote::into_tree`] on the tree's own connection (`Connect`, 02 §6); `Open` names the
+//!   [`SftpRemote::into_tree_renewing`] on the tree's own connection (`Connect`, 02 §6), given a
+//!   closure that opens a fresh one: the worker renews its connection once 32 handles may have
+//!   been left open on the server ([`SftpRemote::into_tree`] never renews); `Open` names the
 //!   host (the cache key; empty for the local disk), the active panel's folder as the panel names
 //!   it (resolved here, 05 §2), the remote account for `~<user>`, and [`Params`] (`e` = the rows
 //!   the tree shows). [`Tree::set_wake`] gives the worker the window's repaint.
@@ -38,6 +40,7 @@
 //!
 //! [`LocalFs::tree`]: crate::remote::LocalFs::tree
 //! [`SftpRemote::into_tree`]: crate::remote::SftpRemote::into_tree
+//! [`SftpRemote::into_tree_renewing`]: crate::remote::SftpRemote::into_tree_renewing
 
 mod cache;
 mod expand;
@@ -842,7 +845,11 @@ impl Tree {
         if disk {
             info.fs_files = n.fs.map(|f| f.used_files);
         }
-        let fs_late = disk && n.fs_late && n.deep.below.is_none() && n.deep.running.is_none();
+        // A late `statvfs` shows wherever it is needed: an R3 row's figure, or any row's fence
+        // on a remote without a table (05 §4.1).
+        let fences = self.mounts.as_ref().is_some_and(|m| m.fences);
+        let fs_late =
+            (disk || fences) && n.fs_late && n.deep.below.is_none() && n.deep.running.is_none();
         info.size = if n.not_answering || n.deep.not_answering || fs_late {
             Size::Tag(Tag::NotAnswering)
         } else {

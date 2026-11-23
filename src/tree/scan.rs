@@ -362,25 +362,29 @@ impl Tree {
         allowed && (!self.mounts.as_ref().is_some_and(|m| m.fences) || n.fs.is_some())
     }
 
-    /// What a scan of `path` never enters: mounts and the name rules' folders below it, and
-    /// H3's folders on a macOS host (05 §4).
+    /// What a scan of `path` never enters: mounts and the name rules' folders below it
+    /// (another filesystem: not part of the size).
     fn protected_below(&self, path: &str) -> Vec<String> {
-        let mut skip = self
-            .mounts
+        self.mounts
             .as_ref()
             .map(|m| m.below(path))
-            .unwrap_or_default();
-        if let (Some(home), Some(m)) = (&self.home, &self.mounts) {
-            if m.macos {
-                for name in ["Library", ".Trash"] {
-                    let p = crate::remote::join(home, name);
-                    if p != path && super::root::inside(&p, path) {
-                        skip.push(p);
-                    }
-                }
-            }
+            .unwrap_or_default()
+    }
+
+    /// H3's folders below `path` on a macOS host: never entered, but part of the size — met,
+    /// they leave it a lower bound (`+`).
+    fn held_out(&self, path: &str) -> Vec<String> {
+        let (Some(home), Some(m)) = (&self.home, &self.mounts) else {
+            return Vec::new();
+        };
+        if !m.macos {
+            return Vec::new();
         }
-        skip
+        ["Library", ".Trash"]
+            .into_iter()
+            .map(|name| crate::remote::join(home, name))
+            .filter(|p| p != path && super::root::inside(p, path))
+            .collect()
     }
 
     /// Starts the deep scan of `i` (where a stopped remote scan left off, if it did).
@@ -388,10 +392,18 @@ impl Tree {
         let wanted = self.nodes[i].deep.wanted;
         let remote = !self.local;
         let resume = self.nodes[i].deep.frontier.take();
-        let base = match &resume {
+        let mut base: crate::remote::treefs::Totals = match &resume {
             Some(_) => self.nodes[i].deep.below.unwrap_or_default(),
             None => Default::default(),
         };
+        // A subfolder left out that is part of the size (H3) keeps the result a lower bound.
+        if resume.is_none() {
+            base.partial += self.nodes[i]
+                .children
+                .iter()
+                .filter(|&&c| self.private(c))
+                .count() as u64;
+        }
         let start = match resume {
             Some(frontier) => frontier,
             None => self.nodes[i]
@@ -415,6 +427,7 @@ impl Tree {
         let ask = ScanAsk {
             start,
             skip: self.protected_below(&path),
+            hold: self.held_out(&path),
             fence,
             budget: (remote && !wanted).then_some(REMOTE_SCAN_BUDGET),
             // Every automatic listing is bounded, a scan's too (05 §6.3); Space is the owner's

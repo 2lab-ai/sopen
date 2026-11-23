@@ -210,8 +210,11 @@ pub struct ScanAsk {
     /// The folders to list first: a row's subfolders (its own listing is the row's), or where a
     /// stopped scan left off.
     pub start: Vec<String>,
-    /// Mount points: never entered.
+    /// Mount points: never entered (another filesystem: not part of the size).
     pub skip: Vec<String>,
+    /// Folders never entered whose content is part of the size all the same (H3): one met is
+    /// counted as read in part, so the size keeps its `+`.
+    pub hold: Vec<String>,
     /// A remote without a mount table (05 §4.1): one `statvfs` before each folder, which is
     /// entered only when its `f_fsid` is one of these.
     pub fence: Option<Vec<u64>>,
@@ -404,11 +407,13 @@ pub fn is_cachedir_tag(head: &[u8]) -> bool {
 
 /// What a listing adds to a deep scan: its regular files' bytes (an inode with more than one
 /// link once, by `seen`) and entries, and the subfolders to enter — not links, not mount points
-/// (by `skip` and by the listing's own mount status).
+/// (by `skip` and by the listing's own mount status), and not the folders of `hold`, each of
+/// which leaves the size a lower bound (`partial`).
 pub(crate) fn scan_step(
     dir: &str,
     listing: &Listing,
     skip: &std::collections::HashSet<String>,
+    hold: &std::collections::HashSet<String>,
     seen: &mut std::collections::HashSet<(u64, u64)>,
     totals: &mut Totals,
 ) -> Vec<String> {
@@ -434,7 +439,9 @@ pub(crate) fn scan_step(
             }
             Kind::Dir if !child.lossy && child.mnt == Mnt::No => {
                 let path = super::join(dir, &child.name);
-                if !skip.contains(&path) {
+                if hold.contains(&path) {
+                    totals.partial += 1;
+                } else if !skip.contains(&path) {
                     below.push(path);
                 }
             }

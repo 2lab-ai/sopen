@@ -52,6 +52,9 @@ struct Fake {
     /// An automatic listing stops after this many entries, never reaching the named one (a
     /// budget, scaled down).
     cut: Mutex<Option<(usize, String)>>,
+    /// Listings of these read on for 3 s, beating, unless stopped; those stopped are noted.
+    long: Mutex<HashSet<String>>,
+    stopped: Mutex<Vec<(String, Duration)>>,
 }
 
 impl Fake {
@@ -65,6 +68,8 @@ impl Fake {
             moved: Condvar::new(),
             slow: Mutex::default(),
             cut: Mutex::default(),
+            long: Mutex::default(),
+            stopped: Mutex::default(),
         })
     }
 
@@ -144,6 +149,20 @@ impl Disk for Fake {
         if !full {
             let slow = *self.slow.lock().unwrap();
             std::thread::sleep(slow);
+        }
+        if self.long.lock().unwrap().contains(path) {
+            let started = Instant::now();
+            while started.elapsed() < Duration::from_secs(3) {
+                (live.beat)();
+                if (live.stop)() {
+                    self.stopped
+                        .lock()
+                        .unwrap()
+                        .push((path.to_string(), started.elapsed()));
+                    return Err(std::io::Error::other("stopped"));
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
         }
         let mut listing = self.real.list(path, budget, full, guard, live)?;
         if let (Some(_), Some((n, never))) = (budget, self.cut.lock().unwrap().clone()) {
