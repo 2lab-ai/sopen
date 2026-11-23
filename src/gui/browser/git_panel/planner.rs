@@ -753,7 +753,9 @@ enum Note {
     Hint(&'static str),
 }
 
-/// A dialog over the pane; while one is up the pane reads no key.
+/// A dialog over the pane; while one is up the pane reads no key. Each keeps the ids its
+/// buttons had last pass: Enter while one of them has the focus is that button's click, as in
+/// S3-B's dialogs (Enter on a focused Cancel cancels).
 #[derive(Debug)]
 enum Inner {
     /// Enter on a `reword` or `squash` row: its message (a squash row's: its group's).
@@ -761,6 +763,7 @@ enum Inner {
         commit: Oid,
         title: String,
         text: String,
+        cancel: Option<egui::Id>,
     },
     /// `A`: the row's author and dates; `own` the commit's.
     Author {
@@ -768,9 +771,12 @@ enum Inner {
         title: String,
         own: Author,
         form: AuthorForm,
+        /// The Cancel and "The commit's own" buttons.
+        cancel: Option<egui::Id>,
+        own_button: Option<egui::Id>,
     },
-    /// Esc with something changed.
-    Ask,
+    /// Esc with something changed; `keep` the "Keep planning" button.
+    Ask { keep: Option<egui::Id> },
     /// Cmd/Ctrl+Enter: the run's options and confirmation, the model last planned and its plan.
     Run {
         planned: Option<(Model, Result<Plan, Refused>)>,
@@ -948,6 +954,7 @@ impl PlannerView {
                     commit,
                     title,
                     text,
+                    cancel: None,
                 })
             }
             Err(why) => self.note = Some(Note::Refused(why)),
@@ -972,13 +979,15 @@ impl PlannerView {
             title,
             own,
             form,
+            cancel: None,
+            own_button: None,
         });
     }
 
     /// Esc, or Close: closes at once when nothing changed, else asks.
     fn close(&mut self, seams: &Seams) -> Option<PlannerEnd> {
         if (seams.changed)(&self.model) {
-            self.inner = Some(Inner::Ask);
+            self.inner = Some(Inner::Ask { keep: None });
             return None;
         }
         Some(PlannerEnd::Close)
@@ -1062,26 +1071,39 @@ impl PlannerView {
     fn inner_ui(&mut self, ctx: &egui::Context, seams: &Seams) -> Option<PlannerEnd> {
         let inner = self.inner.take()?;
         let take = |key: Key| ctx.input_mut(|i| keys::take(i, key, Mods::None));
+        // Enter, and the button that had the focus when it came (`None`: no button had it).
+        let enter = |ctx: &egui::Context| {
+            let focused = ctx.memory(|m| m.focused());
+            take(Key::Enter).then_some(focused)
+        };
+        let is = |at: Option<Option<egui::Id>>, button: Option<egui::Id>| matches!(at, Some(Some(f)) if Some(f) == button);
         match inner {
             Inner::Message {
                 commit,
                 title,
                 mut text,
+                cancel: cancel_button,
             } => {
                 if take(Key::Escape) {
                     return None;
                 }
                 let id = inner_id("message").with("field");
                 type_into(ctx, id);
-                let mut ok = take(Key::Enter);
-                let mut cancel = false;
+                let at = enter(ctx);
+                if is(at, cancel_button) {
+                    return None;
+                }
+                let mut ok = at.is_some();
+                let (mut cancel, mut cancel_id) = (false, None);
                 let response = chrome::dialog(ctx, inner_id("message"), &title, |ui| {
                     ui.set_width(width(ctx, 72.0));
                     message_field(ui, "Message", &mut text, id);
                     ui.add_space(chrome::CELL.y / 2.0);
                     ui.horizontal(|ui| {
                         ok |= ui.button("OK").clicked();
-                        cancel |= ui.button("Cancel").clicked();
+                        let no = ui.button("Cancel");
+                        cancel |= no.clicked();
+                        cancel_id = Some(no.id);
                     });
                     ui.label(
                         RichText::new("Enter keeps it · Shift+Enter a new line · Esc cancels")
@@ -1105,6 +1127,7 @@ impl PlannerView {
                     commit,
                     title,
                     text,
+                    cancel: cancel_id,
                 });
                 None
             }
@@ -1113,14 +1136,22 @@ impl PlannerView {
                 title,
                 own,
                 mut form,
+                cancel: cancel_button,
+                own_button,
             } => {
                 if take(Key::Escape) {
                     return None;
                 }
                 let id = |n: usize| inner_id("author").with(("field", n));
                 type_into(ctx, id(0));
-                let mut ok = take(Key::Enter);
-                let (mut own_back, mut cancel) = (false, false);
+                let at = enter(ctx);
+                if is(at, cancel_button) {
+                    return None;
+                }
+                let mut own_back = is(at, own_button);
+                let mut ok = at.is_some() && !own_back;
+                let mut cancel = false;
+                let (mut cancel_id, mut own_id) = (None, None);
                 let response = chrome::dialog(ctx, inner_id("author"), &title, |ui| {
                     ui.set_width(width(ctx, 72.0));
                     form.ui(ui, id);
@@ -1133,8 +1164,12 @@ impl PlannerView {
                         ok |= ui
                             .add_enabled(parsed.is_ok(), egui::Button::new("OK"))
                             .clicked();
-                        own_back |= ui.button(OWN_AUTHOR).clicked();
-                        cancel |= ui.button("Cancel").clicked();
+                        let back = ui.button(OWN_AUTHOR);
+                        own_back |= back.clicked();
+                        own_id = Some(back.id);
+                        let no = ui.button("Cancel");
+                        cancel |= no.clicked();
+                        cancel_id = Some(no.id);
                     });
                     ui.label(RichText::new("Enter keeps it · Esc cancels").weak());
                 });
@@ -1163,23 +1198,32 @@ impl PlannerView {
                     title,
                     own,
                     form,
+                    cancel: cancel_id,
+                    own_button: own_id,
                 });
                 None
             }
-            Inner::Ask => {
+            Inner::Ask { keep: keep_button } => {
                 if take(Key::Escape) {
                     return None;
                 }
-                // 03 §9.2: inside a dialog Enter runs — here, the close the question asks about.
-                let mut close = take(Key::Enter);
-                let mut keep = false;
+                // 03 §9.2: inside a dialog Enter runs — here, the close the question asks about;
+                // Enter while "Keep planning" has the focus is its click.
+                let at = enter(ctx);
+                if is(at, keep_button) {
+                    return None;
+                }
+                let mut close = at.is_some();
+                let (mut keep, mut keep_id) = (false, None);
                 let response = chrome::dialog(ctx, inner_id("ask"), "Close the planner", |ui| {
                     ui.set_width(width(ctx, 56.0));
                     ui.add(egui::Label::new(ASK_CLOSE).wrap());
                     ui.add_space(chrome::CELL.y / 2.0);
                     ui.horizontal(|ui| {
                         close |= ui.button("Close").clicked();
-                        keep |= ui.button("Keep planning").clicked();
+                        let stay = ui.button("Keep planning");
+                        keep |= stay.clicked();
+                        keep_id = Some(stay.id);
                     });
                     ui.label(RichText::new("Enter closes · Esc keeps planning").weak());
                 });
@@ -1187,7 +1231,7 @@ impl PlannerView {
                     return Some(PlannerEnd::Close);
                 }
                 if !keep && !response.should_close() {
-                    self.inner = Some(Inner::Ask);
+                    self.inner = Some(Inner::Ask { keep: keep_id });
                 }
                 None
             }

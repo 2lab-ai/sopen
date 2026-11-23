@@ -683,15 +683,36 @@ fn history_key(id: EditId) -> Option<String> {
     }
 }
 
-/// The history row of `commit`'s menu (03 §7.8.1), in its table's order. History edits rewrite
-/// ancestors of HEAD (03 §7.8): `ancestor` says `commit` is one — the graph knows, `Repo` does
-/// not — and without it, or with HEAD unborn, the row is empty. Offered or absent, never greyed
-/// (S3-B's rule): nothing above HEAD to move up past or to plan; nothing below a root commit to
-/// squash or fix up into or to move down past; `fold` only with staged changes. `split` stays on
-/// a root commit, where its plan refuses it with the reason (G-H3).
+/// What the history row needs to know of a commit that `Repo` does not hold: the graph's
+/// answers, which the integration (S4-C) fills from the rows it has read. The default is a
+/// commit with no history edit.
 #[allow(dead_code)] // S4-C removes this when it wires the history row.
-pub fn history_items(commit: &CommitRow, ancestor: bool, repo: &Repo) -> Vec<HistoryItem> {
-    let Some(head) = repo.head.oid().filter(|_| ancestor) else {
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Eligibility {
+    /// The commit is HEAD or an ancestor of HEAD (03 §7.8: history edits rewrite those).
+    pub ancestor: bool,
+    /// No commit from it up to HEAD, itself included, is a merge (more than one parent): the
+    /// range a quick edit rewrites (03 §7.8.2: a range with merges is refused).
+    pub linear: bool,
+    /// The commit below it (its first parent) is a merge: `squash`, `fixup` and `move-down`
+    /// rewrite that one too (their range starts below it, `rebase::Quick::apply`).
+    pub below_merge: bool,
+}
+
+/// The history row of `commit`'s menu (03 §7.8.1), in its table's order, as `eligible` allows.
+/// Offered or absent, never greyed (S3-B's rule):
+/// - nothing off the ancestors of HEAD, nor with HEAD unborn (03 §7.8);
+/// - the quick edits only on a linear range (03 §7.8.2 refuses a range with merges, G-H4), and
+///   `squash`, `fixup` and `move-down` not above a merge, whose range holds it;
+/// - `plan` on any ancestor but HEAD, merges or not: the planner opens on the range and names
+///   its merges as a check that fails (03 §7.8.2), so a base above the newest merge can be
+///   chosen;
+/// - nothing above HEAD to move up past or to plan; nothing below a root commit to squash or fix
+///   up into or to move down past; `fold` only with staged changes. `split` stays on a root
+///   commit, where its plan refuses it with the reason (G-H3).
+#[allow(dead_code)] // S4-C removes this when it wires the history row.
+pub fn history_items(commit: &CommitRow, eligible: Eligibility, repo: &Repo) -> Vec<HistoryItem> {
+    let Some(head) = repo.head.oid().filter(|_| eligible.ancestor) else {
         return Vec::new();
     };
     let is_head = *head == commit.oid;
@@ -700,8 +721,10 @@ pub fn history_items(commit: &CommitRow, ancestor: bool, repo: &Repo) -> Vec<His
     EditId::ALL
         .into_iter()
         .filter(|id| match id {
-            EditId::Squash | EditId::Fixup | EditId::MoveDown => !root,
-            EditId::MoveUp | EditId::Plan => !is_head,
+            EditId::Plan => !is_head,
+            _ if !eligible.linear => false,
+            EditId::Squash | EditId::Fixup | EditId::MoveDown => !root && !eligible.below_merge,
+            EditId::MoveUp => !is_head,
             EditId::Fold => any_staged,
             _ => true,
         })
@@ -741,12 +764,12 @@ pub struct HistoryMenu {
 
 #[allow(dead_code)] // S4-C removes this when it wires the history row.
 impl HistoryMenu {
-    /// `target`'s menu on `repo` with the history row ([`history_items`]; `ancestor`: a commit
-    /// target is an ancestor of HEAD), the bar on its first item.
-    pub fn new(target: Target, ancestor: bool, repo: &Repo) -> HistoryMenu {
+    /// `target`'s menu on `repo` with the history row ([`history_items`]; `eligible`: what the
+    /// graph says of a commit target), the bar on its first item.
+    pub fn new(target: Target, eligible: Eligibility, repo: &Repo) -> HistoryMenu {
         let (commit, history) = match &target {
             Target::Commit { commit, .. } => {
-                let items = history_items(commit, ancestor, repo);
+                let items = history_items(commit, eligible, repo);
                 (Some(commit.clone()), items)
             }
             _ => (None, Vec::new()),

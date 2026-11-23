@@ -6,7 +6,7 @@
 //! plans name the edit they were asked for.
 
 use super::in_progress::{self, BannerView, EditStop, Pressed, StopEnd, StopPressed};
-use super::menu::{self, HistoryMenu, HistoryMenuEnd, MenuEnd, Target};
+use super::menu::{self, Eligibility, HistoryMenu, HistoryMenuEnd, MenuEnd, Target};
 use super::planner::{
     self, EditPlanner, PlannerEnd, PlannerView, QuickDialog, QuickEnd, QuickOpened, Seams,
 };
@@ -569,8 +569,15 @@ fn cmd(key: Key) -> (Key, Modifiers) {
 // ---------------------------------------------------------------------------------------------
 // The commit menu's history row (03 §7.1's last row, §7.8.1).
 
-fn history_ids(c: &CommitRow, ancestor: bool, r: &Repo) -> Vec<EditId> {
-    menu::history_items(c, ancestor, r)
+/// An ancestor of HEAD on a linear range, no merge below it.
+const LINEAR: Eligibility = Eligibility {
+    ancestor: true,
+    linear: true,
+    below_merge: false,
+};
+
+fn history_ids(c: &CommitRow, eligible: Eligibility, r: &Repo) -> Vec<EditId> {
+    menu::history_items(c, eligible, r)
         .iter()
         .map(|i| i.id)
         .collect()
@@ -586,7 +593,7 @@ fn the_history_row_offers_its_ids_where_they_apply() {
     let r = repo();
     let mid = row('c', &['b'], "third");
     assert_eq!(
-        history_ids(&mid, true, &r),
+        history_ids(&mid, LINEAR, &r),
         [
             E::Reword,
             E::Author,
@@ -601,7 +608,7 @@ fn the_history_row_offers_its_ids_where_they_apply() {
         ]
     );
     assert_eq!(
-        history_ids(&mid, true, &staged()),
+        history_ids(&mid, LINEAR, &staged()),
         [
             E::Reword,
             E::Author,
@@ -618,7 +625,7 @@ fn the_history_row_offers_its_ids_where_they_apply() {
     );
     let head = row('e', &['d'], "fifth");
     assert_eq!(
-        history_ids(&head, true, &r),
+        history_ids(&head, LINEAR, &r),
         [
             E::Reword,
             E::Author,
@@ -633,7 +640,7 @@ fn the_history_row_offers_its_ids_where_they_apply() {
     );
     let root = row('a', &[], "first");
     assert_eq!(
-        history_ids(&root, true, &r),
+        history_ids(&root, LINEAR, &r),
         [
             E::Reword,
             E::Author,
@@ -646,11 +653,11 @@ fn the_history_row_offers_its_ids_where_they_apply() {
         "a root commit: nothing below it"
     );
     assert!(
-        history_ids(&mid, false, &r).is_empty(),
+        history_ids(&mid, Eligibility::default(), &r).is_empty(),
         "not an ancestor of HEAD"
     );
     // 03 §7.8.1's words, and the keys of 03 §9.1 and §9.2.
-    let items = menu::history_items(&mid, true, &staged());
+    let items = menu::history_items(&mid, LINEAR, &staged());
     let words: Vec<(&str, Option<&str>)> = items
         .iter()
         .map(|i| (i.label.as_str(), i.key.as_deref()))
@@ -674,6 +681,58 @@ fn the_history_row_offers_its_ids_where_they_apply() {
     );
 }
 
+/// The quick edits rewrite the range from the commit up to HEAD, and a range with a merge is
+/// refused (03 §7.8.2, G-H4): on a merge, and on a commit below one, the history row offers only
+/// the planner, which opens on the range and names the merge; above a merge it offers them, but
+/// squash, fixup and move-down, whose range holds the commit below. The planner is offered in
+/// every case.
+#[test]
+fn quick_edits_are_offered_only_on_a_linear_range() {
+    use EditId as E;
+    let r = repo();
+    let merges = Eligibility {
+        ancestor: true,
+        linear: false,
+        below_merge: false,
+    };
+    let merge = row('c', &['b', 'f'], "merge feature");
+    assert_eq!(history_ids(&merge, merges, &r), [E::Plan], "a merge");
+    let below = row('b', &['a'], "second");
+    assert_eq!(
+        history_ids(&below, merges, &r),
+        [E::Plan],
+        "a linear commit below a merge: its range holds the merge"
+    );
+    let above = row('d', &['c'], "fourth");
+    let over_merge = Eligibility {
+        below_merge: true,
+        ..LINEAR
+    };
+    assert_eq!(
+        history_ids(&above, over_merge, &r),
+        [
+            E::Reword,
+            E::Author,
+            E::MoveUp,
+            E::Drop,
+            E::Edit,
+            E::Split,
+            E::Plan
+        ],
+        "right above a merge: nothing that rewrites the commit below"
+    );
+    assert_eq!(history_ids(&above, LINEAR, &r).len(), 10, "a linear range");
+    assert!(history_ids(&above, LINEAR, &r).contains(&E::Plan));
+    // Drawn: the merge's menu has the planner and no quick edit.
+    let target = Target::Commit {
+        commit: merge,
+        marked: Vec::new(),
+    };
+    let fx = with_menu(HistoryMenu::new(target, merges, &r));
+    fx.assert_shows("Edit history from here…");
+    assert!(!fx.shows("Reword…") && !fx.shows("Drop…"));
+}
+
 /// The commit's menu with its history row: S3-B's items first, then §7.8's, then
 /// `Repository…`; a history item gives its id and commit, S3-B's items give S3-B's `MenuEnd`
 /// unchanged, and `Repository…` leaves the history row behind.
@@ -685,7 +744,7 @@ fn the_commit_menu_draws_its_history_row_and_gives_the_choice() {
         commit: mid.clone(),
         marked: Vec::new(),
     };
-    let mut fx = with_menu(HistoryMenu::new(target.clone(), true, &r));
+    let mut fx = with_menu(HistoryMenu::new(target.clone(), LINEAR, &r));
     assert!(fx.dialog_box(), "the cyan box");
     for text in [
         "Tag…",
@@ -718,7 +777,7 @@ fn the_commit_menu_draws_its_history_row_and_gives_the_choice() {
     );
 
     // Keys: End is Repository…, ↑ the history row's last item.
-    let mut fx = with_menu(HistoryMenu::new(target.clone(), true, &r));
+    let mut fx = with_menu(HistoryMenu::new(target.clone(), LINEAR, &r));
     fx.press(Key::End);
     fx.press(Key::ArrowUp);
     fx.press(Key::Enter);
@@ -729,7 +788,7 @@ fn the_commit_menu_draws_its_history_row_and_gives_the_choice() {
             commit: mid.clone()
         }]
     );
-    let mut fx = with_menu(HistoryMenu::new(target.clone(), true, &r));
+    let mut fx = with_menu(HistoryMenu::new(target.clone(), LINEAR, &r));
     fx.press(Key::Enter);
     assert_eq!(
         fx.host.menu_ends,
@@ -738,11 +797,11 @@ fn the_commit_menu_draws_its_history_row_and_gives_the_choice() {
             target: target.clone()
         })]
     );
-    let mut fx = with_menu(HistoryMenu::new(target.clone(), true, &r));
+    let mut fx = with_menu(HistoryMenu::new(target.clone(), LINEAR, &r));
     fx.press(Key::Escape);
     assert_eq!(fx.host.menu_ends, [HistoryMenuEnd::Menu(MenuEnd::Cancel)]);
 
-    let mut fx = with_menu(HistoryMenu::new(target, true, &r));
+    let mut fx = with_menu(HistoryMenu::new(target, LINEAR, &r));
     fx.click("Repository…");
     fx.idle();
     fx.assert_shows("Add a remote…");
@@ -1268,6 +1327,80 @@ fn esc_closes_and_asks_only_when_something_changed() {
     assert_eq!(fx.host.planner_ends, [PlannerEnd::Close]);
 }
 
+/// Enter is the click of the button that has the focus (Tab moves it), as in S3-B's dialogs: in
+/// the question, a focused "Keep planning" keeps planning and a focused Close closes; in the
+/// message and author dialogs a focused Cancel changes nothing and a focused "The commit's own"
+/// puts the commit's own back.
+#[test]
+fn enter_on_a_focused_button_is_its_click() {
+    let asked = |tabs: usize| {
+        let mut fx = with_planner(model(), &repo());
+        fx.type_text("d");
+        fx.press(Key::Escape);
+        assert!(fx.pane().dialog_up());
+        for _ in 0..tabs {
+            fx.press(Key::Tab);
+        }
+        fx.press(Key::Enter);
+        fx
+    };
+    let fx = asked(2);
+    assert!(
+        fx.host.planner_ends.is_empty(),
+        "Keep planning had the focus"
+    );
+    assert!(!fx.pane().dialog_up(), "the question is gone");
+    let fx = asked(1);
+    assert_eq!(
+        fx.host.planner_ends,
+        [PlannerEnd::Close],
+        "Close had the focus"
+    );
+
+    // The message editor: Tab from the field to OK, then Cancel.
+    let mut fx = with_planner(model(), &repo());
+    fx.type_text("r");
+    fx.press(Key::Enter);
+    let before = ops().len();
+    fx.press(Key::Tab);
+    fx.press(Key::Tab);
+    fx.press(Key::Enter);
+    assert_eq!(ops().len(), before, "Cancel had the focus: no message set");
+    assert!(!fx.pane().dialog_up());
+
+    // The author dialog, from its Email field: Author date, the three committer choices, OK,
+    // the commit's own, Cancel.
+    let author = |tabs: usize| {
+        let mut fx = with_planner(model(), &repo());
+        fx.type_text("a");
+        fx.retype("ada@example.com", "grace@example.com");
+        for _ in 0..tabs {
+            fx.press(Key::Tab);
+        }
+        fx.press(Key::Enter);
+        assert!(!fx.pane().dialog_up());
+        fx
+    };
+    let before = ops().len();
+    author(7);
+    assert_eq!(ops().len(), before, "Cancel had the focus: nothing set");
+    author(6);
+    assert_eq!(
+        ops().last(),
+        Some(&Op::Author {
+            commit: oid('e'),
+            author: None
+        }),
+        "the commit's own had the focus"
+    );
+    author(5);
+    assert!(
+        matches!(ops().last(), Some(Op::Author { author: Some(a), .. }) if a.email == "grace@example.com"),
+        "OK had the focus: {:?}",
+        ops().last()
+    );
+}
+
 /// Cmd/Ctrl+Enter shows the run's confirmation (03 §8.1): the checks that fail, the run's
 /// options, the plan of the model as it is; Enter runs only a plan of exactly the model shown,
 /// never while a check fails or the plan is refused.
@@ -1402,7 +1535,7 @@ fn nothing_panics_on_empty_small_long_or_odd_input() {
         commit: rows[0].row.clone(),
         marked: Vec::new(),
     };
-    let _ = with_menu(HistoryMenu::new(target, true, &repo()));
+    let _ = with_menu(HistoryMenu::new(target, LINEAR, &repo()));
 
     // The pane's Date column at the ends of the range (the graph's local-time text).
     let mut m = model();
