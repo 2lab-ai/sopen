@@ -12,6 +12,7 @@ use std::path::Path;
 mod s1;
 mod s2;
 mod s5;
+mod s6;
 
 const RUST: &str = "// a comment\nfn main() {\n    let answer = 42;\n}\n";
 

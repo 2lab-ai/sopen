@@ -186,3 +186,34 @@ changes. Rows here are snapshots taken when they were moved.
 - S2-0 to S2-E each passed its module gate and review rounds; their hand-overs to S2-F (the production
   `LogStream` pipe, the runner's stop for a waiting page, Cmd/Ctrl+K, `set_remotes`, the read-only flag before a
   window's first pass, the `.revisions` root in 01 §5, `SOPEN_REQUIRE_GIT` in AGENTS.md) are S2-F's row.
+
+## R2 (part) — S5, S7, S6-0 to S6-B, closed 2026-11-23
+
+- merged S5-0 (PR #63), S5-B (#66), S5-A (#71), S5-C (#77), S7-A (#65), S7-B (#74), S6-0 (#73), S6-B (#75),
+  S6-A (#78) ✅ · result: all of S5 (the directory tree) and all of S7 (the macOS F-key switch) on main, S7's
+  owner receipt K-F3 still open; S6's scaffold, engine and dialogs on main, which S6-C wires · closed rows:
+  S5-0, S5-A, S5-B, S5-C, S7-A, S7-B, S6-0, S6-A, S6-B · PRs: S6-C's (this block)
+
+### Closed rows
+
+| ID | Status | Branch | Scope | Owner files (02 §5) | After |
+|---|---|---|---|---|---|
+| S5-0 | ✅ merged: PR #63 (3fb9ca1), 2026-11-23 | `feat/browser-s5-scaffold` | `mod` lines and stubs for S5's files: `src/tree/` (one module per part of 05 §7), the `TreeFs` trait and its SFTP and local impls (no methods yet), `gui::browser::tree` with `TreeOutcome::GoTo`, `gui::chrome::tree`; the F10 and Alt+F10 rows of `keys.rs` checked against 05 §1 and 04 §2 (unchanged); 02 §8.1's schedule | `src/lib.rs`, `src/remote/{mod,sftp,local}.rs`, `src/gui/browser.rs`, `src/gui/chrome.rs` (mod lines), the stubs; `.prd/02-architecture.md`, `.prd/browser/loop*.md` | S1 |
+| S5-A | ✅ merged: PR #71 (fbb8106), 2026-11-23 | `feat/browser-s5-tree-model` | the tree's model: the root (05 §2), rows (§3), R1–R10 and H1–H3 (§4), opening by itself (§5), the info line, the watchdog, phases 1–3 and the per-process cache (§6); `TreeFs` as a worker with channels, local and over SFTP (§6.4, §7); `T-root`, `T-rows`, `T-norules`, `T-auto`, `T-info`, `T-watchdog`, `T-lazy` | `src/tree/*.rs`, `src/remote/treefs.rs`, `src/remote/{sftp,local}/treefs.rs` | S5-0 |
+| S5-B | ✅ merged: PR #66 (926536b), 2026-11-23 | `feat/browser-s5-tree-ui` | the tree as a side's content: its rows, the bar, the tree context's keys, the F-key row `1Help 10Tree` (05 §1); glyphs and colours (§3, §6.1) | `src/gui/browser/tree.rs`, `src/gui/chrome/tree.rs` | S5-0 |
+| S5-C | ✅ merged: PR #77 (3b47c5c), 2026-11-23 | `feat/browser-s5-integration` | `Content::Tree` and O4's `tree_snapshot` (02 §3.1); the tree's own connection; `TreeOutcome::GoTo` into the panel; S5's key rows landed (S5-C adds 5 to `keys.rs`'s `LANDED_SLICES`, the set of landed slices; `LANDED`, the run landed in order from S1, stays 1 for the git panel's own key reading until S2 lands); S5's scenarios (02 §8.1's table: 02 P11, 05 D-1–D-8, 04 K-R1 slot 10, K-R3 Alt+F10), receipts; 01 §3a and §9 as 05 amends them | `src/gui/browser.rs`, `src/gui/browser/{view,tests}.rs`, `src/gui/browser/tests/s5.rs`, `src/gui/browser/tree.rs` (the model's rows mapped), `src/gui/browser/keys.rs` and `src/gui/help.rs` (hand-over), `src/gui/mod.rs` (receipt keys), `src/main.rs`, `src/lib.rs` (the module map), `tests/cli.rs`, `AGENTS.md`, `README.md`, `.prd/01-spec.md` | S5-A, S5-B |
+| S7-A | ✅ merged: PR #65 (7923c53), 2026-11-23 | `feat/browser-s7-fnkeys` | the switch (`HIDFKeyMode` through IOKit, loaded at runtime), its lock, state and watchdog, the `fkeys` config key and `sopen config fkeys`; K-F1, K-F2, K-F4, K-F5, K-F6 against a fake (04 §6) | `src/fnkeys/{mod,macos,tests}.rs`, `src/config.rs`; in `src/main.rs` the hidden watchdog flags and `config fkeys` | E1 |
+| S7-B | ✅ merged: PR #74 (a5bb554), 2026-11-23; the owner's receipt K-F3 (04 §8) still open | `feat/browser-s7-focus` | focus, sleep and session events into the switch, the status row's line when it did not take effect, integration; `fkeys` in AGENTS.md, README and 01 §4a; then the owner's receipt K-F3 | `src/gui/mod.rs`, `src/gui/browser.rs`, `tests/cli.rs`, docs | S7-A |
+| S6-0 | ✅ merged: PR #73 (6b708b0), 2026-11-23 | `feat/browser-s6-scaffold` | `openssh-sftp-client-lowlevel = "=0.7.4"` as a direct dependency (already locked); `mod` lines and empty stubs for S6-A's new files: `remote::sftp::rename`, `remote::local::trash`, `fileops::{make_dir,delete}`; no `keys.rs` row, no behaviour change; E2's result in 02 §8.2 and 04 §5.6 (K-C4, K-N1) | `Cargo.toml`, `Cargo.lock`, `src/remote/{sftp,local}.rs`, `src/fileops/mod.rs` (mod lines), the stubs; `.prd/02-architecture.md`, `.prd/04-file-keys.md`, `.prd/browser/loop*.md` | S1, E2 |
+| S6-A | ✅ merged: PR #78 (6db6ebd), 2026-11-23 | `feat/browser-s6-engine` | F7 and F8 as actions over both file layers (04 §5.4, §5.5): `MKDIR` / `mkdir`; bottom-up `REMOVE` and `RMDIR`, links as links; the local Trash (macOS `trashItemAtURL` loaded at runtime, the freedesktop Trash); the plain-rename channel (route B) for a remote folder's rename and move and for a copy's publish without `hardlink@`, links never through it (04 §5.6); K-K1, K-D1, K-M1 and K-N1 for remote folders, K-C4 without `hardlink@` (its `-P hardlink` test, `src/fileops/tests.rs`, now expects the publish) | `src/fileops/*.rs`, `src/remote/ops.rs`, `src/remote/{sftp,local}/ops.rs`, `src/remote/sftp/rename.rs`, `src/remote/local/trash.rs` | S6-0 |
+| S6-B | ✅ merged: PR #75 (882a5a0), 2026-11-23 | `feat/browser-s6-dialogs` | the make-folder dialog (one line, a name with `/` refused) and the delete dialog (`Delete <name>?` / `Delete N items (F files, D folders)?`, `and everything inside it`, `permanent — no Trash on <host>`, Shift+F8's `permanent` in the error colour) (04 §5.4, §5.5). A new `ops::Job` variant needs an arm in `browser.rs`'s engine match (S6-C's file): declared, or left to S6-C | `src/gui/browser/ops.rs`, `src/gui/browser/panel.rs` | S6-0 |
+
+### Round section
+
+- Merge commits and their dates are main's (+0900; the same day in UTC). S5-B (#66) merged before S5-A (#71),
+  and S6-B (#75) before S6-A (#78): the rows keep their IDs' order.
+- S7-B's code is merged; its last step, the owner's receipt K-F3 (04 §8: a plain F5 opens the Copy dialog on
+  the built-in keyboard, and `kill -9` restores the key mode), is not done, and loop.md's S7 section keeps it
+  open.
+- The rows are as they were in loop.md except their Status. S6-C's row stays there (in progress), and so do
+  S2-F and S3's rows.

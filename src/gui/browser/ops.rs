@@ -1439,8 +1439,8 @@ pub struct Rename {
 
 impl Rename {
     /// On the bar's entry of `panel` (its folder on `host`). `Err` is for the status row: `..`,
-    /// a name that is not UTF-8, or a folder on a remote — SFTP's plain rename, which renaming one
-    /// needs, comes with slice S6; until then F2 says so and does nothing (04 §5.3).
+    /// or a name that is not UTF-8. A folder on a remote is renamed by SFTP's plain rename (S6,
+    /// 04 §5.6); where its channel cannot be opened, the engine's reason is the field's error.
     pub fn open(panel: &Panel, host: Option<&str>) -> Result<Self, String> {
         let Some(entry) = panel.current() else {
             return Err("nothing to rename".to_string());
@@ -1452,12 +1452,6 @@ impl Rename {
             return Err(nothing_to("Rename", panel));
         }
         let folder = entry.kind == EntryKind::Dir && !entry.link;
-        if let (Some(host), true) = (host, folder) {
-            return Err(format!(
-                "{}: sopen cannot rename a folder on {host} yet; nothing changed",
-                entry.name
-            ));
-        }
         Ok(Self {
             dir: OpsTarget {
                 host: host.map(str::to_string),
@@ -1655,7 +1649,6 @@ impl Ops {
 
     /// F7 in `panel` (its folder on `host`): the make-folder dialog. `Some` is for the status
     /// row, as for [`Ops::open_copy`] (a job running).
-    #[cfg_attr(not(test), allow(dead_code))] // S6-C wires F7 to it.
     pub fn open_make_folder(&mut self, panel: &Panel, host: Option<&str>) -> Option<Status> {
         if let Some(busy) = self.busy_line() {
             return Some(busy);
@@ -1668,7 +1661,6 @@ impl Ops {
     /// ([`Removal::Permanent`]) in `panel` (its folder on `host`): the delete dialog, on the
     /// selection or the bar's entry ([`DeleteDialog::open`]; `trash_here`: this machine has a
     /// Trash for the folder). `Some` is for the status row, as for [`Ops::open_copy`].
-    #[cfg_attr(not(test), allow(dead_code))] // S6-C wires F8 and Shift+F8 to it.
     pub fn open_delete(
         &mut self,
         panel: &Panel,
@@ -2429,14 +2421,20 @@ mod tests {
                 to: "MAIN.rs".to_string(),
             }]
         );
-        // `..` has no field; nor (until S6) a folder on a remote — a link to one is a file.
+        // `..` has no field; a folder on a remote has one since S6 (SFTP's plain rename), and so
+        // has a link to one, which is a file.
         h.panel.home();
         let said = h.ops.open_rename(&h.panel, None).expect("refused");
         assert_eq!(h.ops.renaming(), None);
         assert!(said.error && said.text.contains(".."), "{said:?}");
         at(&mut h.panel, "docs");
-        let said = h.ops.open_rename(&h.panel, Some("box")).expect("refused");
-        assert!(said.text.contains("box") && said.text.contains("nothing changed"));
+        assert!(
+            h.ops.open_rename(&h.panel, Some("box")).is_none(),
+            "a remote folder renames"
+        );
+        assert_eq!(h.ops.renaming(), Some("docs"));
+        drv.idle(&mut h, 2);
+        drv.key(&mut h, Key::Escape, Modifiers::NONE);
         assert_eq!(h.ops.renaming(), None);
         h.panel.entries[1].link = true;
         assert!(

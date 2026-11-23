@@ -412,6 +412,9 @@ impl Ranged for SftpRanged {
                 sftp: Some(session.sftp),
                 fs: Some(session.fs),
                 writes: session.writes,
+                // A stream's session given back has no plain-rename channel: it lists and
+                // reads; a file operation has connections of its own (04 §5.1).
+                plain: super::rename::Slot::none(),
                 #[cfg(test)]
                 stats: session.stats,
                 #[cfg(test)]

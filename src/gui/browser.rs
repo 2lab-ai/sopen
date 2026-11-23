@@ -340,24 +340,19 @@ fn engine_seen(connect: OpsConnect, seen: Option<ProgressSeen>) -> ops::Run {
             ops::Job::Rename { dir, from, to } => {
                 (fileops::Op::Rename { to }, dir.clone(), vec![from], dir)
             }
-            // Hand-over to S6-C, which runs F7 and F8 on S6-A's engine: until then, refused
-            // before anything happens.
-            job @ (ops::Job::MakeFolder { .. } | ops::Job::Delete { .. }) => {
-                return Report {
-                    items: job
-                        .names()
-                        .into_iter()
-                        .map(|name| Item {
-                            name,
-                            outcome: ItemOutcome::NotReached,
-                        })
-                        .collect(),
-                    notes: vec![
-                        "sopen cannot make folders or delete yet (comes with S6-C); nothing \
-                         was done"
-                            .to_string(),
-                    ],
-                };
+            // F7 (04 §5.4): one name, in the folder itself.
+            ops::Job::MakeFolder { dir, name } => {
+                (fileops::Op::MakeDir, dir.clone(), vec![name], dir)
+            }
+            // F8 (04 §5.5): what the dialog said is what happens — the Trash only where it
+            // said so; the engine fails an item the Trash refuses, never deleting it instead.
+            ops::Job::Delete {
+                dir,
+                names,
+                removal,
+            } => {
+                let trash = removal == ops::Removal::Trash;
+                (fileops::Op::Delete { trash }, dir.clone(), names, dir)
             }
         };
         let job = fileops::Job {
@@ -757,6 +752,10 @@ pub(crate) struct Browser {
     tree_host: String,
     /// The git panels (03): the host, detection, the panels, the pin.
     git: GitSide,
+    /// Tests: what [`Browser::trash_here`] answers instead of asking this machine (`None`: it
+    /// asks — in a test build, the tests' stand-in Trash, which takes everything).
+    #[cfg(test)]
+    trash_answer: Option<bool>,
 }
 
 impl Drop for Browser {
@@ -871,6 +870,8 @@ impl Browser {
             tree_connect,
             tree_host,
             git,
+            #[cfg(test)]
+            trash_answer: None,
         };
         browser.list(None, start.abs, None, None);
         browser
@@ -1139,6 +1140,14 @@ impl Browser {
             }
             Command::Copy => self.transfer(ops::Transfer::Copy),
             Command::Move => self.transfer(ops::Transfer::Move),
+            Command::MakeFolder => {
+                // The bar goes on the new folder in this panel (04 §5.4), as after a rename.
+                self.rename_panel = active;
+                let refused = self.ops.open_make_folder(panel, self.label.as_deref());
+                self.status = refused.unwrap_or_default();
+            }
+            Command::Delete => self.delete(ops::Removal::Trash),
+            Command::DeleteNow => self.delete(ops::Removal::Permanent),
             Command::Reread => {
                 let (dir, at) = (panel.dir.clone(), panel.highlight);
                 let name = panel.current().map(|e| e.name.clone());
@@ -1202,6 +1211,34 @@ impl Browser {
         let (panel, host) = (&self.panels[self.active], self.label.as_deref());
         let refused = self.ops.open_copy(kind, panel, host, &to);
         self.status = refused.unwrap_or_default();
+    }
+
+    /// F8, Del, ⌘⌫ (`asked` the Trash) or Shift+F8, Shift+Del (permanent): the delete dialog
+    /// for the selection or the bar's entry (04 §5.5). It says where they go before anything is
+    /// removed: on a remote, permanently (SFTP has no Trash); here, to the Trash where this
+    /// machine has one for the folder ([`Browser::trash_here`]), else permanently.
+    fn delete(&mut self, asked: ops::Removal) {
+        let panel = &self.panels[self.active];
+        let trash_here =
+            self.label.is_none() && asked == ops::Removal::Trash && self.trash_here(&panel.dir);
+        let refused = self
+            .ops
+            .open_delete(panel, self.label.as_deref(), asked, trash_here);
+        self.status = refused.unwrap_or_default();
+    }
+
+    /// Whether this machine has a Trash that takes entries of its folder `dir` (S6-A's check,
+    /// [`fileops::trash_here`]). Asked on the window's thread when F8 is pressed: a few `stat`s
+    /// of a folder the panel has just listed (macOS: Foundation's look-up of the Trash for it).
+    fn trash_here(&self, dir: &str) -> bool {
+        #[cfg(test)]
+        if let Some(answer) = self.trash_answer {
+            return answer;
+        }
+        matches!(
+            fileops::trash_here(&LocalFs::new(), dir),
+            fileops::Deletes::Trash
+        )
     }
 
     /// What a feature tells the browser (02 §7).
@@ -2636,7 +2673,9 @@ impl Browser {
                 Some(viewer) => viewer.embedded.window.ready(),
                 None => self.preview.settled(),
             }
-            && (!self.ops.busy() || self.ops.holds_keyboard())
+            // A running operation counts only while it waits at its question — not while a
+            // rename's field shows it pending.
+            && (!self.ops.busy() || self.ops.waiting().is_some())
             && self.tree.as_ref().is_none_or(TreeSide::settled)
             && self.git.settled(
                 &self.panels[self.active].dir,
