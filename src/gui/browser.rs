@@ -218,21 +218,20 @@ fn built_unless_closed<C>(
     Ok(build(conn))
 }
 
-/// How long Enter on a link waits for the browser's connection to be free (a panel's listing
-/// on it): it is taken only when free, never queued for, so the panel's own work never waits
-/// behind a link's resolution.
-const LINK_WAIT: Duration = Duration::from_millis(500);
+/// How often Enter on a link tries the browser's connection while a panel's listing has it:
+/// it is taken only when free, never queued for, so the panel's own work never waits behind a
+/// link's resolution.
+const LINK_POLL: Duration = Duration::from_millis(20);
 
 /// A link's target, `realpath` on the browser's connection (05 §1, Enter on a link). The
-/// connection is tried, never waited on, for at most [`LINK_WAIT`]; `None` — nothing called —
-/// once the tree closed (`closed`), looked at before the connection is taken and again before
-/// `realpath`.
+/// connection is tried every [`LINK_POLL`], never waited on, for as long as the request stands;
+/// `None` — nothing called — once it does not (`closed`: the tree closed, or a newer Enter
+/// replaced it), looked at before each try and again before `realpath`.
 fn resolve_link(
     conn: &Mutex<Box<dyn RemoteFs + Send>>,
     path: &str,
     closed: &AtomicBool,
 ) -> Option<Result<String>> {
-    let deadline = std::time::Instant::now() + LINK_WAIT;
     loop {
         if closed.load(Ordering::Acquire) {
             return None;
@@ -241,12 +240,7 @@ fn resolve_link(
             Ok(fs) => fs,
             Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
             Err(std::sync::TryLockError::WouldBlock) => {
-                if std::time::Instant::now() >= deadline {
-                    return Some(Err(anyhow::anyhow!(
-                        "the connection is busy with the panel; Enter again"
-                    )));
-                }
-                std::thread::sleep(Duration::from_millis(10));
+                std::thread::sleep(LINK_POLL);
                 continue;
             }
         };

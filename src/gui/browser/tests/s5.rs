@@ -1066,8 +1066,8 @@ fn closing_during_a_links_resolution_calls_nothing_and_delays_no_listing() {
     fx.b.relist(Some(0), root, None, None, None);
     gate.release();
     fx.drv.until(&mut fx.b, 10, |b| b.listing.is_empty());
-    // Past the time the resolution would have waited for the connection.
-    std::thread::sleep(LINK_WAIT + MS(200));
+    // Many tries past the connection coming free: the resolution would have taken it by now.
+    std::thread::sleep(LINK_POLL * 15);
     assert_eq!(
         realpaths.load(Ordering::SeqCst),
         0,
@@ -1075,24 +1075,25 @@ fn closing_during_a_links_resolution_calls_nothing_and_delays_no_listing() {
     );
 }
 
-/// A link's target waits a moment at most for the browser's connection, never queued behind
-/// the panel's listing: it gives up without calling `realpath` and says so; once the
-/// connection is free, Enter resolves it and the panel lists the target.
+/// A link's target waits for the browser's connection as long as a panel's listing has it —
+/// longer than a second here — trying it, never queued behind the listing, calling nothing
+/// meanwhile; once the connection is free the one Enter resolves it and the panel lists the
+/// target, no second Enter needed.
 #[test]
-fn a_links_resolution_gives_up_while_the_panel_has_the_connection() {
+fn a_links_resolution_waits_out_the_panels_listing_and_goes_on_one_enter() {
     let (mut fx, _t5, hold, realpaths) = on_a_link();
     let gate = panel_listing_held(&mut fx, &hold);
     fx.key(Key::Enter);
-    fx.drv.until(&mut fx.b, 5, |b| {
-        b.tree.as_ref().is_some_and(|t| t.said.is_some())
-    });
-    let said = fx.b.status_line();
-    assert!(said.error && said.text.contains("busy"), "{said:?}");
-    assert_eq!(realpaths.load(Ordering::SeqCst), 0);
-    assert!(fx.b.tree.is_some(), "the tree stays");
+    let held = Instant::now();
+    while held.elapsed() < Duration::from_millis(1200) {
+        fx.drv.idle(&mut fx.b, 1);
+        std::thread::sleep(MS(20));
+    }
+    assert_eq!(realpaths.load(Ordering::SeqCst), 0, "nothing while held");
+    let t = fx.b.tree.as_ref().expect("the tree stays");
+    assert!(t.target.is_some() && t.said.is_none(), "still waiting");
+    assert!(fx.b.status_line().text.starts_with("resolving "));
     gate.release();
-    fx.drv.until(&mut fx.b, 10, |b| b.listing.is_empty());
-    fx.key(Key::Enter);
     fx.drv.until(&mut fx.b, 10, |b| b.tree.is_none());
     fx.settle();
     assert_eq!(realpaths.load(Ordering::SeqCst), 1);
