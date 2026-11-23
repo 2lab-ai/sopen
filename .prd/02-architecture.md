@@ -458,9 +458,10 @@ slice named here (§8); a file that exists today changes owner only from one sli
 | `src/git/{detect,parse,history}.rs` | detection and its cache; parsers; the log stream | S2-B |
 | `src/git/graph.rs` | the lane layout (pure, deterministic) | S2-C |
 | `src/gui/browser/git_panel/{mod,graph_view,details,find,filters}.rs`, `src/gui/chrome/git.rs` | the read-only git panel and its look | S2-D; then S3-C (`GitAction`, `run`, `fkeys`) |
-| `src/git/{actions,backup}.rs` | every action of 03 §7 as a pure plan (steps, confirmation text, backups); backups, manifests, restores | S3-A |
-| `src/gui/browser/git_panel/{menu,dialogs,backups,log_view,in_progress}.rs` | the action menu, dialogs, the backups list, the command log, the banner | S3-B |
-| `src/git/rebase.rs`, `src/gui/browser/git_panel/planner.rs` | the history planner | S4-A, S4-B |
+| `src/git/{actions,backup}.rs` | every action of 03 §7 as a pure plan (steps, confirmation text, backups); backups, manifests, restores | S3-A; then S4-A (`actions.rs`: `pub(crate)` on the helpers a history rewrite shares, nothing else) |
+| `src/gui/browser/git_panel/{menu,dialogs,backups,log_view,in_progress}.rs` | the action menu, dialogs, the backups list, the command log, the banner | S3-B; then S4-B (`menu.rs`: 03 §7.8's history row; `in_progress.rs`: an edit stop's Amend and Split) |
+| `src/git/rebase.rs` | the history edits of 03 §7.8 as pure plans over `actions`' `Plan`: the quick edits, the planner's model and checks, its todo and run | S4-A |
+| `src/gui/browser/git_panel/planner.rs` | the planner pane and the quick edits' dialogs | S4-B |
 | `src/tree/*.rs`, `src/remote/treefs.rs`, `src/remote/{sftp,local}/treefs.rs` | the tree's model and `TreeFs` (a worker with channels, 05 §7) | S5-A |
 | `src/gui/browser/tree.rs`, `src/gui/chrome/tree.rs` | the tree's side content, keys and look | S5-B |
 | `src/fnkeys/{mod,macos}.rs`, `src/config.rs` | the macOS F-key switch, its lock, state and watchdog, the `fkeys` config key (04 §6) | S7-A |
@@ -525,7 +526,8 @@ slice named here (§8); a file that exists today changes owner only from one sli
 
 ### 6.2 Trace: drop a commit from the graph
 
-1. F8 on a commit row (03 §9.1) → `actions::plan(DropCommit { oid })` → a plan: backup step + planner
+1. F8 on a commit row (03 §9.1) → `rebase::plan(&Edit::Quick(Quick::Drop { commit }), &repo)` → an
+   `actions::Plan`, run by `actions::execute`: backup step + planner
    run (`rebase -i` with the todo on stdin) + refresh; the confirmation text names the commit, the
    branch, the backup ref and the exact command lines.
 2. Run (Enter) → takes the repo's write lock → `backup::write` (`update-ref --stdin`, one transaction)
@@ -594,7 +596,8 @@ then its WUs in parallel on disjoint files, then its **integration** WU, the sli
 - **Schedule: slices run at the same time once their "Needs first" is met.** S2 → S3 → S4 keep that
   order (each needs the one before it), and S7 waits for E1. S3's scaffold and its logic and UI WUs
   (S3-0, S3-A, S3-B) need only S2's merged read model and panel (S2-0–S2-E) and E5; only S3-C waits
-  for S2-F, as two integration WUs never run together. Only work that touches a shared file
+  for S2-F, as two integration WUs never run together. S4-0, S4-A and S4-B need only S3's merged
+  logic and screens (S3-A, S3-B); only S4-C waits for S3-C. Only work that touches a shared file
   runs one at a time: a scaffold step's `mod` lines, the `keys.rs` and `gui/mod.rs` rows, and each
   slice's integration WU in `browser.rs`, `main.rs` and `view.rs` — two integration WUs never run at
   the same time. So the owner sees each part sooner, and a WU on disjoint files cannot collide with
