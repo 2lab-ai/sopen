@@ -4299,3 +4299,74 @@ fn a_reread_keeps_the_sideways_place_of_an_unwrapped_view() {
     drv.until(&mut win, 5, |w| w.ready());
     assert_eq!((win.line, win.left), (Some(0), 0), "the start of the file");
 }
+
+/// 03 §6.2 at the text viewer: a diff written to a revision's folder and shown read-only
+/// (`set_read_only(true)`, as the git panel opens it) is shown highlighted as a diff — the
+/// added line in markup.inserted's colour, the removed one in markup.deleted's. The text viewer
+/// has no save at all: its keys offer none, and no save chord or F-key (Cmd/Ctrl+S,
+/// Shift+Cmd/Ctrl+S, Alt+Cmd/Ctrl+S, F5, F7) writes anything — the folder holds exactly what
+/// it held; closing asks nothing.
+#[test]
+fn a_diff_shown_read_only_is_highlighted_and_writes_nothing() {
+    use crate::gui::testkit::command;
+    use std::str::FromStr as _;
+    let tmp = tempfile::tempdir().unwrap();
+    let diff = "diff --git a/x.rs b/x.rs\n--- a/x.rs\n+++ b/x.rs\n@@ -1 +1 @@\n\
+                -let a = 1;\n+let a = 2;\n";
+    let mut win = viewer(tmp.path(), "x.rs.diff", diff);
+    let listing = || {
+        let mut out: Vec<(std::path::PathBuf, Vec<u8>)> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .flatten()
+            .map(|e| (e.path(), std::fs::read(e.path()).unwrap()))
+            .collect();
+        out.sort();
+        out
+    };
+    let before = listing();
+    crate::gui::Window::set_read_only(&mut win, true);
+    let mut drv = Driver::new(800.0, 500.0);
+    drv.until(&mut win, 5, |w| w.ready());
+    let theme = chrome::syntax_theme();
+    let colour = |scope: &str| {
+        let wanted = syntect::highlighting::ScopeSelectors::from_str(scope).unwrap();
+        let item = theme
+            .scopes
+            .iter()
+            .find(|i| i.scope == wanted)
+            .unwrap_or_else(|| panic!("{scope} in the theme"));
+        let c = item.style.foreground.unwrap();
+        egui::Color32::from_rgb(c.r, c.g, c.b)
+    };
+    let added = drv
+        .colors_of("+let a = 2;")
+        .expect("the added line is shown");
+    let removed = drv
+        .colors_of("-let a = 1;")
+        .expect("the removed line is shown");
+    assert!(
+        added.contains(&colour("markup.raw, markup.inserted")),
+        "{added:?}"
+    );
+    assert!(
+        removed.contains(&colour("markup.deleted, invalid")),
+        "{removed:?}"
+    );
+    let keys = crate::gui::Window::keys(&win);
+    assert!(
+        keys.iter().all(|k| k.n != 5 && k.n != 7),
+        "no Save or Save As: {keys:?}"
+    );
+    for (key, mods) in [
+        (Key::S, command(false)),
+        (Key::S, command(true)),
+        (Key::S, Modifiers::ALT | Modifiers::COMMAND),
+        (Key::F5, Modifiers::NONE),
+        (Key::F7, Modifiers::NONE),
+    ] {
+        drv.key(&mut win, key, mods);
+    }
+    drv.idle(&mut win, 5);
+    assert_eq!(listing(), before, "nothing written");
+    assert!(crate::gui::Window::close_requested(&mut win));
+}

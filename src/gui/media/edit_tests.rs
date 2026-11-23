@@ -1674,3 +1674,197 @@ fn past_a_short_picture_s_end_the_last_frame_comes_within_the_budget() {
         assert_eq!(left, 0, "at {t} s: ffmpeg left reading the file");
     }
 }
+
+/// 03 §6.3's reason, word for word (03:578).
+const NO_PLACE: &str = "a file at a revision has no place to be saved";
+
+/// Every file and folder under `dir`, with each file's bytes: what a window that writes
+/// nothing leaves exactly as it was.
+fn files_under(dir: &Path) -> std::collections::BTreeMap<PathBuf, Option<Vec<u8>>> {
+    let mut out = std::collections::BTreeMap::new();
+    let mut walk = vec![dir.to_path_buf()];
+    while let Some(at) = walk.pop() {
+        for entry in std::fs::read_dir(&at).unwrap().flatten() {
+            let path = entry.path();
+            if entry.file_type().unwrap().is_dir() {
+                walk.push(path.clone());
+                out.insert(path, None);
+            } else {
+                let bytes = std::fs::read(&path).unwrap();
+                out.insert(path, Some(bytes));
+            }
+        }
+    }
+    out
+}
+
+/// Hovers the control labelled `label` until `tip` shows; the pointer is taken away first, so
+/// no earlier tip is up.
+fn hover_says(fx: &mut Fx, label: &str, tip: &str) {
+    let away = fx.at(0.5) - Vec2::new(0.0, 120.0);
+    fx.drv.move_to(&mut fx.win, away);
+    for _ in 0..90 {
+        if fx.drv.find_text(tip).is_none() {
+            break;
+        }
+        fx.drv.idle(&mut fx.win, 1);
+    }
+    assert!(
+        fx.drv.find_text(tip).is_none(),
+        "{tip:?} up before the hover"
+    );
+    let at = fx
+        .drv
+        .find_text(label)
+        .unwrap_or_else(|| panic!("no {label:?} on screen"));
+    fx.drv.move_to(&mut fx.win, at.center());
+    for _ in 0..90 {
+        fx.drv.idle(&mut fx.win, 1);
+        if fx.drv.find_text(tip).is_some() {
+            return;
+        }
+    }
+    let shown: Vec<String> = fx.drv.texts().into_iter().map(|(_, _, t)| t).collect();
+    panic!("{label:?} never said {tip:?} on hover: {shown:?}");
+}
+
+/// G-T2 (03:1161) at the media window: told before its first pass that it shows a file at a
+/// revision (`set_read_only(true)`, 03 §6.3), it shows and plays the sound and selects on the
+/// timeline, but Cut, Delete, Paste and Mono → Stereo edit nothing; Save, Save As and Export
+/// are off with 03:578's reason on hover, and none of their keys (Cmd/Ctrl+S, F5,
+/// Alt+Cmd/Ctrl+S, F7, E) or buttons starts one: each says why. An earlier session's journal
+/// of the same file is neither looked for nor touched; it closes without asking; and gone, it
+/// leaves the folder and the cache exactly as they were — no journal, no backup, no render, no
+/// export beside the file.
+#[test]
+fn a_file_at_a_revision_plays_but_edits_saves_and_exports_nothing() {
+    let Some(mut fx) = audio(false) else { return };
+    // An earlier session left a journal of the file: an edit kept, then a kill.
+    fx.drag(0.25, 0.5);
+    fx.drv.cut(&mut fx.win);
+    fx.drv
+        .until(&mut fx.win, 20, |w| w.schedule.status() == Keep::Kept);
+    let cache = fx.tmp.path().join("cache");
+    assert!(!walk(&cache.join(".edits")).is_empty(), "its journal");
+    let at = LocalFs::new().stat(fx.path.to_str().unwrap()).unwrap();
+    let abs = fx.path.to_str().unwrap().to_string();
+    let origin = Origin::new(Box::new(LocalFs::new()), None, None, abs, at);
+    let mut at_revision = MediaWindow::new(
+        Media::probe(&fx.path).unwrap(),
+        MediaFile::new(origin, &cache),
+        fx.tmp.path().join("work"),
+        Marks::default(),
+        Selection::default(),
+        Vec::new(),
+    );
+    at_revision.sink = Sink::Null;
+    std::mem::replace(&mut fx.win, at_revision).crash();
+    let before = files_under(fx.tmp.path());
+    crate::gui::Window::set_read_only(&mut fx.win, true);
+    fx.drv = Driver::new(900.0, 520.0);
+    fx.settle();
+    fx.drv.until(&mut fx.win, 20, crate::gui::Window::ready);
+    assert!(
+        fx.win.rows.is_empty() && fx.win.recovering.is_none(),
+        "no earlier session's journal is looked for"
+    );
+    assert!(fx.drv.find_text("Restore").is_none());
+    let clips = fx.clips();
+    // It plays, and selects.
+    fx.key(Key::Space, Modifiers::NONE);
+    assert!(fx.win.player.is_some(), "plays");
+    fx.key(Key::Space, Modifiers::NONE);
+    fx.drag(0.25, 0.5);
+    assert!(fx.win.marks.selected());
+    // No edit.
+    fx.drv.cut(&mut fx.win);
+    fx.key(Key::Delete, Modifiers::NONE);
+    fx.click(0.0);
+    fx.paste();
+    fx.key(Key::M, Modifiers::NONE);
+    fx.key(Key::Z, command(false));
+    assert_eq!(fx.clips(), clips, "nothing edited");
+    assert!(!fx.win.timeline.stereo() && !fx.win.unsaved());
+    // No save and no export, whichever key or button; each key says why.
+    fx.drag(0.25, 0.5);
+    for (key, mods) in [
+        (Key::S, command(false)),
+        (Key::F5, Modifiers::NONE),
+        (Key::S, Modifiers::ALT | Modifiers::COMMAND),
+        (Key::F7, Modifiers::NONE),
+        (Key::E, Modifiers::NONE),
+    ] {
+        fx.win.status = Status::default();
+        fx.key(key, mods);
+        assert!(
+            fx.win.save.is_none() && fx.win.save_as.is_none() && fx.win.job.is_none(),
+            "{key:?} {mods:?} started a save or an export"
+        );
+        assert!(
+            fx.win.status.text.ends_with(NO_PLACE),
+            "{key:?} {mods:?}: {}",
+            fx.win.status.text
+        );
+    }
+    for label in ["Save", "Save As…", "Export  E"] {
+        hover_says(&mut fx, label, NO_PLACE);
+    }
+    fx.drv.click_text(&mut fx.win, "Export  E");
+    fx.drv.click_text(&mut fx.win, "Save As…");
+    assert!(fx.win.save.is_none() && fx.win.save_as.is_none() && fx.win.job.is_none());
+    fx.drv.idle(&mut fx.win, 30);
+    assert!(fx.win.journal_dir.is_none(), "nothing kept");
+    assert!(
+        crate::gui::Window::close_requested(&mut fx.win),
+        "nothing to ask"
+    );
+    let Fx { tmp, win, .. } = fx;
+    drop(win);
+    assert_eq!(
+        files_under(tmp.path()),
+        before,
+        "nothing written, nothing removed"
+    );
+}
+
+/// Told late (`set_read_only(true)` after the first pass, review round 1): with a cut kept in
+/// the journal and the Save As modal open on a folder, the flag closes the modal — its Enter
+/// renders and writes nothing — and after it no key, focus loss or close writes anything: no
+/// Save As file, no render, no journal generation, no save or backup. It closes without asking.
+#[test]
+fn told_late_with_save_as_open_nothing_is_written_after_the_flag() {
+    let Some(mut fx) = audio(false) else { return };
+    fx.drag(0.25, 0.5);
+    fx.drv.cut(&mut fx.win);
+    fx.drv
+        .until(&mut fx.win, 20, |w| w.schedule.status() == Keep::Kept);
+    let out = fx.tmp.path().join("out");
+    std::fs::create_dir(&out).unwrap();
+    fx.win.save_as_folder = Some(out.clone());
+    fx.key(Key::F7, Modifiers::NONE);
+    assert!(fx.win.save_as.is_some(), "F7");
+    let before = files_under(fx.tmp.path());
+    crate::gui::Window::set_read_only(&mut fx.win, true);
+    fx.key(Key::Enter, Modifiers::NONE);
+    fx.drv.until(&mut fx.win, 10, |w| w.save_as.is_none());
+    fx.drag(0.0, 0.25);
+    fx.drv.cut(&mut fx.win);
+    fx.key(Key::S, command(false));
+    fx.drv.focused = false;
+    for _ in 0..30 {
+        fx.drv.idle(&mut fx.win, 1);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(
+        walk(&out).is_empty(),
+        "the open Save As wrote after the flag"
+    );
+    assert!(fx.win.save.is_none() && fx.win.save_as.is_none() && fx.win.job.is_none());
+    assert!(
+        crate::gui::Window::close_requested(&mut fx.win),
+        "nothing to ask"
+    );
+    let Fx { tmp, win, .. } = fx;
+    drop(win);
+    assert_eq!(files_under(tmp.path()), before, "written after the flag");
+}

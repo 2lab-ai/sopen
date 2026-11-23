@@ -1050,6 +1050,52 @@ fn a_close_while_a_save_is_queued_waits_for_it() {
     assert_eq!(std::fs::read(&rig.path).unwrap(), want, "saved");
 }
 
+/// Told late (`set_read_only(true)`, review round 1) with a Save in its queue — waiting for the
+/// journal's generation, held — the Save never starts: once the generation is let go, no
+/// request that changes the file's side is sent, the file is as it was and no backup is made;
+/// the status says why.
+#[test]
+fn told_late_a_queued_save_never_starts() {
+    let mut rig = rig(Side::Local).unwrap();
+    let gates = Arc::new(GatedDisk::default());
+    rig.win.keeper = file::Keeper::at(gates.clone(), &rig.win.file.lock().unwrap());
+    rig.crop();
+    gates.write_held.store(true, Ordering::SeqCst);
+    let g = gates.clone();
+    let dog = Watchdog::new(move || g.write_held.store(false, Ordering::SeqCst));
+    rig.win.sel.set([0, 0, 10, 10]);
+    rig.drv.idle(&mut rig.win, 1);
+    rig.key(Key::P, Modifiers::NONE);
+    rig.key(Key::S, command(false));
+    assert!(rig.win.queued.is_some() && rig.win.job.is_none(), "queued");
+    let original = std::fs::read(&rig.path).unwrap();
+    rig.control.taken();
+    crate::gui::Window::set_read_only(&mut rig.win, true);
+    gates.write_held.store(false, Ordering::SeqCst);
+    for _ in 0..40 {
+        rig.drv.idle(&mut rig.win, 1);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(!dog.fired(), "the generation was never let go");
+    drop(dog);
+    assert!(
+        rig.win.job.is_none() && rig.win.queued.is_none(),
+        "never started"
+    );
+    assert!(
+        rig.control.writes().is_empty(),
+        "{:?}",
+        rig.control.writes()
+    );
+    assert_eq!(std::fs::read(&rig.path).unwrap(), original);
+    assert!(!rig.cache.join(".backup").exists(), "a backup was made");
+    assert!(
+        rig.win.status.text.ends_with(super::AT_A_REVISION),
+        "{}",
+        rig.win.status.text
+    );
+}
+
 /// P1 for a Save that landed: a file at its temp's name after the rename (its reply lost) is
 /// another program's, maybe. The next open says the Save landed and asks about that file only —
 /// Remove it, Keep it, Later; no Restore, no Discard — and the journal and its `renaming` record
