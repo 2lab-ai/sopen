@@ -93,7 +93,14 @@ pub enum DialogEnd {
     },
     /// Esc, Cancel or a click outside it.
     Cancel,
+    /// Rebase's "Plan the commits first…" (03 §7.1: "plan the commits first → the planner"):
+    /// nothing runs; the caller opens the planner over the commits a rebase onto this revision
+    /// would move (S4-C).
+    PlanFirst(Rev),
 }
+
+/// What Rebase's dialog offers besides Run (03 §7.1's last option).
+pub const PLAN_FIRST: &str = "Plan the commits first…";
 
 /// The options of one action, as its dialog edits them.
 #[derive(Debug, Clone)]
@@ -644,6 +651,9 @@ pub struct ActionDialog {
     typing: bool,
     /// The Cancel button's id, last pass: Enter while it has the focus cancels.
     cancel: Option<egui::Id>,
+    /// Rebase's "Plan the commits first…" button's id, last pass: Enter while it has the focus
+    /// is its click, never the rebase's Run.
+    plan_first: Option<egui::Id>,
 }
 
 fn dialog_id() -> egui::Id {
@@ -744,6 +754,7 @@ impl ActionDialog {
             repo: repo.clone(),
             typing: false,
             cancel: None,
+            plan_first: None,
         }))
     }
 
@@ -806,9 +817,15 @@ impl ActionDialog {
         }
         let focused = ctx.memory(|m| m.focused());
         let enter = ctx.input_mut(|i| keys::take(i, Key::Enter, Mods::None));
-        // Enter on the focused Cancel cancels, as its click would.
+        // Enter on the focused Cancel cancels, as its click would; on Rebase's focused "Plan the
+        // commits first…" it is that button's click.
         if enter && focused.is_some() && focused == self.cancel {
             return Some(DialogEnd::Cancel);
+        }
+        if enter && focused.is_some() && focused == self.plan_first {
+            if let Action::Rebase { onto, .. } = &self.form.draft {
+                return Some(DialogEnd::PlanFirst(onto.clone()));
+            }
         }
         let mut run = enter;
         let mut cancel = false;
@@ -820,6 +837,7 @@ impl ActionDialog {
         let room = (ctx.content_rect().height() * 0.6).max(8.0 * chrome::CELL.y);
         let mut typing = false;
         let mut cancel_button = None;
+        let (mut plan_first, mut plan_first_button) = (false, None);
         let response = chrome::dialog(ctx, dialog_id(), &title, |ui| {
             ui.set_width(width);
             // 03 §8.1: a destructive or rewriting action's dialog starts with what is lost.
@@ -845,13 +863,23 @@ impl ActionDialog {
                 let no = ui.add(egui::Button::new("Cancel"));
                 cancel_button = Some(no.id);
                 cancel |= no.clicked();
+                // 03 §7.1: Rebase offers the planner, which names the merges it would flatten.
+                if matches!(self.form.draft, Action::Rebase { .. }) {
+                    let plan = ui.add(egui::Button::new(PLAN_FIRST));
+                    plan_first_button = Some(plan.id);
+                    plan_first |= plan.clicked();
+                }
             });
             ui.label(RichText::new("Enter runs · Esc cancels").weak());
         });
         self.typing = typing;
         self.cancel = cancel_button;
+        self.plan_first = plan_first_button;
         if cancel || response.should_close() {
             return Some(DialogEnd::Cancel);
+        }
+        if let (true, Action::Rebase { onto, .. }) = (plan_first, &self.form.draft) {
+            return Some(DialogEnd::PlanFirst(onto.clone()));
         }
         if run && self.ready() {
             let dont_ask_again =
@@ -862,6 +890,12 @@ impl ActionDialog {
             });
         }
         None
+    }
+
+    /// Rebase's "Plan the commits first…" button, as last drawn (tests).
+    #[cfg(test)]
+    pub fn plan_first_button(&self) -> Option<egui::Id> {
+        self.plan_first
     }
 
     /// The draft's plan is in and neither the dialog nor the plan refused it.

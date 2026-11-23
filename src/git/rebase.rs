@@ -51,9 +51,9 @@
 //!   for [`Model::changed`], a [`Read`]) and [`Model::fold`] (`fold`'s target; only
 //!   [`Quick::Fold`] sets it), both set by [`Model::new`]; [`AuthorLine::message`] (a literal of
 //!   `AuthorLine` needs `message: None`). [`Problem`] gained `Busy` and `NothingStaged`.
-//! - **A squash group's message** is [`squash_message`]'s join, the same rule as S4-B's
-//!   `planner::squash_message`, so the pane shows what the todo writes; one of the two can go
-//!   (S4-C).
+//! - **A squash group's message** is [`squash_message`]'s join: the planner pane and the quick
+//!   squash dialog call it too (S4-C dropped S4-B's copy), so the pane shows what the todo
+//!   writes.
 //! - **The run's command** is `git -c core.commentChar=# rebase -i --reschedule-failed-exec
 //!   [--autostash] [--update-refs | --no-update-refs] <base>|--root`, `GIT_SEQUENCE_EDITOR` as an
 //!   `env` word and the todo on stdin: `core.commentChar` (or `core.commentString`) set to a
@@ -865,7 +865,8 @@ impl Model {
 
 /// `squash`'s message (03 §7.8.1): both messages, the older first, a blank line between. Each is
 /// kept whole, byte for byte; the blank line is added after the older one's last line. The
-/// same rule as S4-B's `planner::squash_message`, so the pane shows what the todo writes.
+/// planner pane and the quick squash dialog prefill with it too, so they show what the todo
+/// writes.
 pub fn squash_message(older: &str, newer: &str) -> String {
     let gap = if older.ends_with('\n') { "\n" } else { "\n\n" };
     format!("{older}{gap}{newer}")
@@ -1747,7 +1748,10 @@ fn draft(edit: &Edit, repo: &Repo, reads: &Reads) -> Result<Plan, Refused> {
     match edit {
         Edit::Quick(q) => quick(q, repo, reads),
         Edit::Plan(model) => {
-            let newest = model.rows.first().map(|r| &r.commit.row.oid);
+            // HEAD against the newest commit as the planner read it, not the first row now: the
+            // owner may have moved that one down (S4-C round 2; a moved row is still in the
+            // range, and every row is on the todo).
+            let newest = model.read.order.first();
             if newest.is_none() || newest != repo.head.oid() {
                 return refused(format!(
                     "HEAD is {}, not the plan's newest commit {}: open the planner again",

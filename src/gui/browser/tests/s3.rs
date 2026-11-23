@@ -29,14 +29,14 @@ macro_rules! git_or_skip {
 
 impl Gx {
     /// The panel on the right with its rows and its actions' snapshot, the keyboard in it.
-    fn ready_in_git(&mut self) {
+    pub(super) fn ready_in_git(&mut self) {
         self.wait_for_the_panel();
         self.tab_into_git();
         self.until_quiet("the snapshot");
     }
 
     /// Passes until the panel has its snapshot and nothing of S3 runs or reads, then settles.
-    fn until_quiet(&mut self, what: &str) {
+    pub(super) fn until_quiet(&mut self, what: &str) {
         let top = self.top();
         self.until(what, move |b| {
             let Some(i) = b.git.panel(&top) else {
@@ -48,25 +48,25 @@ impl Gx {
         self.settle();
     }
 
-    fn view(&self) -> &GitView {
+    pub(super) fn view(&self) -> &GitView {
         &self.panel().view
     }
 
     /// The open dialog's action id.
-    fn dialog_id(&self) -> Option<ActionId> {
+    pub(super) fn dialog_id(&self) -> Option<ActionId> {
         self.view().draft().map(Action::id)
     }
 
     /// A click on the control labelled `text` on top (a dialog's): a pass first, since a dialog
     /// whose reads came re-centres on the pass after it grew.
-    fn click(&mut self, text: &str) {
+    pub(super) fn click(&mut self, text: &str) {
         self.idle(2);
         self.fx.drv.click_text_on_top(&mut self.fx.b, text);
         self.idle(2);
     }
 
     /// F10, then a click on the menu's `item`; passes until its dialog's reads are in.
-    fn menu(&mut self, item: &str) {
+    pub(super) fn menu(&mut self, item: &str) {
         self.key(Key::F10);
         self.idle(2);
         assert!(
@@ -79,36 +79,36 @@ impl Gx {
     }
 
     /// Enter on the dialog: it runs on a worker; passes until the run ended and the refresh came.
-    fn run(&mut self) {
+    pub(super) fn run(&mut self) {
         self.key(Key::Enter);
         self.idle(2);
         self.until_quiet("the run and its refresh");
     }
 
-    fn status(&self) -> String {
+    pub(super) fn status(&self) -> String {
         self.fx.b.status_line().text
     }
 
-    fn cmd_shift(&mut self, key: Key) {
+    pub(super) fn cmd_shift(&mut self, key: Key) {
         self.with(key, Modifiers::COMMAND | Modifiers::SHIFT);
         self.idle(2);
     }
 
     /// An F-key, then its dialog's reads.
-    fn f(&mut self, key: Key) {
+    pub(super) fn f(&mut self, key: Key) {
         self.key(key);
         self.idle(2);
         self.until_quiet("the key's dialog");
     }
 
     /// Esc, then a pass.
-    fn esc(&mut self) {
+    pub(super) fn esc(&mut self) {
         self.key(Key::Escape);
         self.idle(2);
     }
 
     /// Every text the last pass drew, whole.
-    fn texts(&self) -> Vec<String> {
+    pub(super) fn texts(&self) -> Vec<String> {
         self.fx
             .drv
             .texts_starting_with("")
@@ -118,12 +118,12 @@ impl Gx {
     }
 
     /// A text drawn that holds `part`.
-    fn shows(&self, part: &str) -> bool {
+    pub(super) fn shows(&self, part: &str) -> bool {
         self.texts().iter().any(|t| t.contains(part))
     }
 
     /// The F-key row the panel shows now, as `(slot, label)`.
-    fn slots(&self) -> Vec<(u8, &'static str)> {
+    pub(super) fn slots(&self) -> Vec<(u8, &'static str)> {
         let i = self.b().git_focused().expect("the keyboard in git");
         self.b().git.panels[i]
             .view
@@ -134,7 +134,7 @@ impl Gx {
     }
 
     /// The label cursor on the bar's row's label `text` (→ from the commit).
-    fn label_to(&mut self, text: &str) {
+    pub(super) fn label_to(&mut self, text: &str) {
         for _ in 0..8 {
             if self.view().bar_label().is_some_and(|l| l.text == text) {
                 return;
@@ -146,7 +146,7 @@ impl Gx {
 
     /// The bar on the uncommitted row, Enter: its details pane with the keyboard, the pane's bar
     /// on `path`.
-    fn pane_on(&mut self, path: &str) {
+    pub(super) fn pane_on(&mut self, path: &str) {
         let first = self.subjects()[0].clone();
         assert!(first.starts_with("Uncommitted changes"), "{first}");
         self.bar_to(&first);
@@ -168,7 +168,7 @@ impl Gx {
     }
 
     /// The backup refs in the repository.
-    fn backups(&self) -> String {
+    pub(super) fn backups(&self) -> String {
         self.repo
             .run(&["for-each-ref", "--format=%(refname)", "refs/sopen-backup/"])
     }
@@ -176,7 +176,7 @@ impl Gx {
 
 /// A repository on `main` — `base`, then `on main` — with a branch `side` whose `c.txt`
 /// conflicts with main's; a clean work tree.
-fn conflicting(git: &Path) -> Repo {
+pub(super) fn conflicting(git: &Path) -> Repo {
     let repo = Repo::new(git);
     repo.write("c.txt", "base\n");
     repo.commit("base");
@@ -190,7 +190,7 @@ fn conflicting(git: &Path) -> Repo {
 }
 
 /// `origin`: a bare clone of `repo` beside it, added as its remote and fetched; its path.
-fn with_origin(repo: &Repo) -> std::path::PathBuf {
+pub(super) fn with_origin(repo: &Repo) -> std::path::PathBuf {
     let origin = repo.tmp.path().join("origin.git");
     let at = origin.to_str().unwrap();
     repo.run(&["clone", "-q", "--bare", repo.top(), at]);
@@ -200,7 +200,7 @@ fn with_origin(repo: &Repo) -> std::path::PathBuf {
 }
 
 /// `path` written as an executable script (a hook, a stand-in).
-fn script(path: &Path, body: &str) {
+pub(super) fn script(path: &Path, body: &str) {
     use std::os::unix::fs::PermissionsExt;
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     std::fs::write(path, format!("#!/bin/sh\n{body}\n")).unwrap();
@@ -817,15 +817,22 @@ fn g_k1_each_slot_acts_on_its_kind_of_row() {
         assert_eq!(g.dialog_id(), Some(id), "{key:?}");
         g.esc();
     }
+    // F2 and F8 on a commit are its reword and drop (S4); `second` is below the merge, so the
+    // history row offers neither there and the status row says why (S4-C's `g_k1_*` in `s4.rs`
+    // has them on a linear commit).
     g.f(Key::F2);
     assert!(
-        g.status().starts_with("Reword of a commit"),
+        g.status().starts_with("Reword: not offered on ") && g.status().contains("a merge"),
         "{}",
         g.status()
     );
     g.f(Key::F8);
-    assert!(g.status().starts_with("Drop of a commit"), "{}", g.status());
-    assert!(g.dialog_id().is_none());
+    assert!(
+        g.status().starts_with("Drop: not offered on "),
+        "{}",
+        g.status()
+    );
+    assert!(g.dialog_id().is_none() && !g.view().dialog_up());
     // A stash row.
     g.bar_to("On main: saved");
     for (key, id) in [
@@ -1237,7 +1244,7 @@ fn g_s4_dialog_opens_every_actions_dialog() {
         g.fx.b.git.script = GitScript {
             select: select.map(String::from),
             label,
-            dialog: Some(id),
+            dialog: Some(crate::gui::DialogId::Action(id)),
             ..GitScript::default()
         };
         g.idle(2);
@@ -1283,7 +1290,10 @@ fn g_s4_dialog_opens_every_actions_dialog() {
         assert!(g.b().git.pin.is_some(), "{what}: still pinned");
     }
     let state = crate::gui::State::parse("git=pin;select=light;dialog=reset").unwrap();
-    assert_eq!(state.dialog, Some(ActionId::Reset));
+    assert_eq!(
+        state.dialog,
+        Some(crate::gui::DialogId::Action(ActionId::Reset))
+    );
     assert!(crate::gui::State::parse("dialog=nonsense").is_err());
 }
 
@@ -1722,6 +1732,9 @@ fn action_keys_do_nothing_while_a_list_shows() {
             (Key::Space, none),
             (Key::R, cmd_shift),
             (Key::C, cmd_shift),
+            // S4: an edit stop's Amend and Split act on the banner too (none here).
+            (Key::M, cmd_shift),
+            (Key::P, cmd_shift),
         ] {
             g.with(key, mods);
             g.idle(2);

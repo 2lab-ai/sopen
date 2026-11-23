@@ -18,7 +18,7 @@ use crate::git::model::{
     Status, StatusEntry, StatusState,
 };
 use crate::git::rebase::{
-    Author, Base, Commit, CommitterDate, Date, Edit, EditId, Model, Op, Quick, Toward, Verb,
+    self, Author, Base, Commit, CommitterDate, Date, Edit, EditId, Model, Op, Quick, Toward, Verb,
 };
 use crate::gui::browser::keys::{self, Command, Context};
 use crate::gui::chrome::git::LOOK;
@@ -1003,11 +1003,11 @@ fn messages_are_kept_byte_for_byte() {
         }))]
     );
 
-    assert_eq!(planner::squash_message("a\n", "b\n"), "a\n\nb\n");
-    assert_eq!(planner::squash_message("a", "b"), "a\n\nb");
-    assert_eq!(planner::squash_message("a\n\n", "b"), "a\n\n\nb");
+    assert_eq!(rebase::squash_message("a\n", "b\n"), "a\n\nb\n");
+    assert_eq!(rebase::squash_message("a", "b"), "a\n\nb");
+    assert_eq!(rebase::squash_message("a\n\n", "b"), "a\n\n\nb");
     let d = quick(open(EditId::Squash, 'c'));
-    let joined = planner::squash_message(&find('b').message, &find('c').message);
+    let joined = rebase::squash_message(&find('b').message, &find('c').message);
     assert_eq!(
         joined,
         "second\n\nbody of second\n\nthird\n\nbody of third\n"
@@ -1242,7 +1242,7 @@ fn enter_edits_the_message_of_a_reword_or_squash_row() {
     fx.type_text("s");
     let count = ops().len();
     fx.press(Key::Enter);
-    let group = planner::squash_message(&find('b').message, &find('c').message);
+    let group = rebase::squash_message(&find('b').message, &find('c').message);
     fx.assert_shows(&group);
     fx.press(Key::Escape);
     assert!(!fx.pane().dialog_up());

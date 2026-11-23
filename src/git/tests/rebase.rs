@@ -2533,6 +2533,73 @@ fn a_plan_is_refused_when_head_moved_since_it_was_read() {
     }
 }
 
+/// A plan that moves or drops the newest row is the owner's plan, not a moved HEAD (S4-C round
+/// 2): the check compares HEAD with the newest row as the planner read it (`Model::read`), so
+/// Cmd/Ctrl+↓ on the top row and `D` on it plan and run, and the history is exactly that.
+#[test]
+fn a_plan_that_moves_or_drops_the_newest_row_runs() {
+    let Some(fx) = fixture() else { return };
+    for (lane, runner) in fx.lanes() {
+        let lane = lane.as_str();
+        let dir = fx.repo(&format!("newest-{lane}"));
+        let base = fx.oid(&dir, "HEAD");
+        fx.commit(&dir, "f1", "1\n", "one");
+        let two = fx.commit(&dir, "f2", "2\n", "two");
+        let (mut repo, model) = opened(&runner, &dir, &Base::Commit(base.clone()));
+        assert_eq!(
+            model.read.order.first(),
+            Some(&two),
+            "{lane}: read as opened"
+        );
+        // Both planned: the newest row moved down one place, and dropped.
+        let mut moved = model.clone();
+        moved
+            .apply(Op::Move {
+                commit: two.clone(),
+                toward: Toward::Down,
+            })
+            .unwrap();
+        let mut dropped = model.clone();
+        dropped
+            .apply(Op::Verb {
+                commit: two.clone(),
+                verb: Verb::Drop,
+            })
+            .unwrap();
+        let (moved, dropped) = (Edit::Plan(moved), Edit::Plan(dropped));
+        ready(&runner, &mut repo, &moved);
+        ready(&runner, &mut repo, &dropped);
+        let plans = [
+            plan(&moved, &repo).map(|_| ()),
+            plan(&dropped, &repo).map(|_| ()),
+        ];
+        assert!(
+            plans.iter().all(Result::is_ok),
+            "{lane}: moved {:?}, dropped {:?}",
+            plans[0],
+            plans[1]
+        );
+        // Run: the moved one, then (opened again) the newest dropped.
+        let (_, outcome) = run_on(&runner, &dir, repo, &moved);
+        done(lane, &outcome);
+        let range = format!("{}..HEAD", base.as_str());
+        assert_eq!(subjects(&fx, &dir, &range), ["two", "one"], "{lane}");
+        // The newest row (now `one`) dropped.
+        let (repo, mut model) = opened(&runner, &dir, &Base::Commit(base.clone()));
+        let newest = model.rows[0].commit.row.oid.clone();
+        model
+            .apply(Op::Verb {
+                commit: newest,
+                verb: Verb::Drop,
+            })
+            .unwrap();
+        let (_, outcome) = run_on(&runner, &dir, repo, &Edit::Plan(model));
+        done(lane, &outcome);
+        assert_eq!(subjects(&fx, &dir, &range), ["two"], "{lane}");
+        assert!(!dir.join("f1").exists(), "{lane}: one's file gone");
+    }
+}
+
 /// The root commit's quick edits run `rebase -i --root` (03 §7.8.2: `<base>|--root`), its
 /// footprint read from the whole history (§8.6); a branch at a dropped root has no kept commit
 /// to move to, and the run is refused rather than leave it pointing nowhere new.

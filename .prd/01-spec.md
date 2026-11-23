@@ -191,7 +191,8 @@ the bottom row lists the F-keys that work there and nothing else (the list, sinc
 of the browser workstream: 1 Help, 2 Rename, 3 View, 4 Edit, 5 Copy, 6 Move, 9 Dual — `Prevw` in
 dual mode — and 10 Tree; the directory tree: 1 Help, 10 Tree; the git panel, since S2: 1 Help, 3 View,
 4 Edit, 9 Dual, and since S3 the slots that act on the object under the bar — 2 Reword (a branch's
-label: rename), 5 Pick, 6 Rebase, 7 Branch (Commit on the uncommitted row), 8 Delete, 10 Menu; a viewer: 1 Help, 3 Exit, 4 Edit and the viewer's own — the text viewer's 2 Unwrap (Wrap once unwrapped),
+label: rename; since S4 a commit's reword), 5 Pick, 6 Rebase, 7 Branch (Commit on the uncommitted
+row), 8 Delete (since S4 a commit's drop), 10 Menu; with the planner open only 1 Help and 9 Dual; a viewer: 1 Help, 3 Exit, 4 Edit and the viewer's own — the text viewer's 2 Unwrap (Wrap once unwrapped),
 an alias of W; the hex window's 5 Save, 6 Goto, 7 SaveAs, 8 Asc/hx, aliases of ⌘S, ⌘G, ⌥⌘S and
 Tab; and the image and media windows' 5 Save and 7 SaveAs; a plain F-key never acts while a text
 field has the typing). The foot shows `N Listed = N bytes` whole inside the frame whatever the width: the
@@ -253,7 +254,7 @@ too, where F3 closes it as ⌘W does.
   link's target, resolved; a link whose target is gone says so) and closes the tree; Esc or F10
   closes it with the panel as it was; Esc first stops an owner's whole listing or Space's scan.
   Remotely the tree has an SFTP connection of its own.
-- **The git panel** (msg 14; [03](03-git-panel.md); read-only in slice S2, its actions since S3) is the other side's
+- **The git panel** (msg 14; [03](03-git-panel.md); read-only in slice S2, its actions since S3, history editing since S4) is the other side's
   content when the bar rests on a folder, `..` or an empty list and the active folder is inside a
   git work tree (detected once per folder with git's own `rev-parse`, locally or over the ssh
   master; a bare repository, the inside of `.git`, a folder git refuses or a host without git
@@ -281,6 +282,16 @@ too, where F3 closes it as ⌘W does.
   git has an operation in progress — whoever started it — the panel's top rows say so (`MERGE of
   feature · 1 conflict`, `BISECT · Reset`), with its Continue, Skip, Abort (Cmd/Ctrl+Shift+C, S,
   A) and bisect's Reset (Cmd/Ctrl+Shift+B), each through its dialog.
+  Since S4 history is free to edit (03 §7.8): a commit's menu — on HEAD and its ancestors, as the
+  loaded graph allows — offers the quick edits (reword, author and date, squash, fix up, move up or
+  down, drop, stop to edit, split, fold the staged changes) and Edit history from here…
+  (Cmd/Ctrl+E), the planner over the commits above it: a row's verb by its letter (P R E S F D), its
+  author (A), its place (Cmd/Ctrl+↑/↓), a reword's or squash group's message (Enter), the run and its
+  options (Cmd/Ctrl+Enter); Esc closes, asking when something changed. Every edit is one run of git's
+  own interactive rebase whose todo sopen writes, confirmed and backed up as every rewrite is, messages
+  kept byte for byte; a range holding a merge is refused, naming it. An edit stop adds Amend and Split
+  (Cmd/Ctrl+Shift+M, P); after a split the window keeps its paths and Continue is refused until every
+  one is committed again. Rebase's dialog offers "Plan the commits first…".
 - **Selection and file operations** (msg 15; [04](04-file-keys.md) §3–§5, S1's and S6's parts). Space or
   Ins selects the bar's entry and steps down; `+` and `-` select and unselect by a pattern, `*`
   inverts, Cmd/Ctrl+A selects all; selected entries are yellow and the foot counts them first.

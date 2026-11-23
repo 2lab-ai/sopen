@@ -1125,13 +1125,35 @@ pub fn parse_probe(stdout: &[u8]) -> InProgress {
     }
 }
 
-/// What a merge merges, from its `MERGE_MSG`'s first line: the first name git quotes in it
-/// (`Merge branch 'feature' into main`, `Merge remote-tracking branch 'origin/x'`, `Merge tag
-/// 'v1'`); `None` for a message of the owner's own.
+/// What a merge merges, from its `MERGE_MSG`'s first line, in git's own forms only (measured,
+/// git 2.56.1): `Merge branch '<b>'`, `Merge remote-tracking branch '<r>/<b>'`, `Merge tag '<t>'`
+/// and `Merge commit '<c>'` (its 8 digits), each maybe followed by ` of <url>` (a pull) or ` into
+/// <b>`. The name runs to the quote that ends the line or comes before ` of ` / ` into `, so a
+/// name holding a quote (`it's`) stays whole. `None` for anything else — a message of the
+/// owner's own (`git merge -m`), git's plural forms — and the banner names the commit instead.
 fn merged_name(msg: &str) -> Option<&str> {
-    let (_, rest) = msg.split_once('\'')?;
-    let (name, _) = rest.split_once('\'')?;
-    (!name.is_empty()).then_some(name)
+    let rest = msg.strip_prefix("Merge ")?;
+    let (commit, rest) = match rest.strip_prefix("commit '") {
+        Some(rest) => (true, rest),
+        None => (
+            false,
+            ["branch '", "remote-tracking branch '", "tag '"]
+                .into_iter()
+                .find_map(|kind| rest.strip_prefix(kind))?,
+        ),
+    };
+    let end = rest.char_indices().find_map(|(at, c)| {
+        let after = &rest[at + c.len_utf8()..];
+        let ends = c == '\''
+            && (after.is_empty() || after.starts_with(" of ") || after.starts_with(" into "));
+        ends.then_some(at)
+    })?;
+    let name = &rest[..end];
+    match (name.is_empty(), commit) {
+        (true, _) => None,
+        (false, true) => Some(shown_id(name)),
+        (false, false) => Some(name),
+    }
 }
 
 /// How one step of a run ended (03 §3.8's list).

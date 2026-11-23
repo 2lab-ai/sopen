@@ -499,6 +499,7 @@ pub struct Menu {
     /// The line under the menu's bar (`items.len()`: `Repository…`).
     bar: usize,
     /// The bar moved by a key: the next pass shows it.
+    #[cfg_attr(not(test), allow(dead_code))] // S3-B's own pass (see `Menu::ui`).
     moved: bool,
 }
 
@@ -538,6 +539,7 @@ impl Menu {
     }
 
     /// Its lines: the items, then `Repository…` unless this is the repository's menu.
+    #[cfg_attr(not(test), allow(dead_code))] // S3-B's own pass (see `Menu::ui`).
     fn lines(&self) -> usize {
         self.items.len() + usize::from(!self.repository.is_empty())
     }
@@ -560,7 +562,10 @@ impl Menu {
         }
     }
 
-    /// One pass: its keys are taken before anything else sees them.
+    /// One pass: its keys are taken before anything else sees them. The panel draws
+    /// [`HistoryMenu`], which holds this menu and draws it with a commit's history row (S4-C);
+    /// S3-B's tests draw it alone.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn ui(&mut self, ctx: &egui::Context) -> Option<MenuEnd> {
         let take = |key: Key| ctx.input_mut(|i| keys::take(i, key, Mods::None));
         if take(Key::Escape) || take(Key::F10) {
@@ -635,11 +640,9 @@ impl Menu {
 // ---------------------------------------------------------------------------------------------
 // The commit menu's history row (03 §7.1's last row, §7.8.1; S4-B). S3-B's items above are
 // unchanged: [`HistoryMenu`] holds S3-B's [`Menu`] and gives its [`MenuEnd`] back as it is, so
-// what matches on `MenuEnd` keeps working. Each item below carries its own `dead_code`
-// allowance, which S4-C removes when it wires the row.
+// what matches on `MenuEnd` keeps working. S4-C wires it (`GitView`'s menu).
 
 /// One line of the commit menu's history row.
-#[allow(dead_code)] // S4-C removes this when it wires the history row.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HistoryItem {
     pub id: EditId,
@@ -650,7 +653,6 @@ pub struct HistoryItem {
 }
 
 /// What 03 §7.8.1 calls a history edit (its Action column).
-#[allow(dead_code)] // S4-C removes this when it wires the history row.
 pub fn history_label(id: EditId) -> &'static str {
     match id {
         EditId::Reword => "Reword…",
@@ -669,7 +671,6 @@ pub fn history_label(id: EditId) -> &'static str {
 
 /// A history edit's key on a commit row: F2 `reword`, F8 `drop` (03 §9.1), Cmd/Ctrl+E the
 /// planner (§9.2).
-#[allow(dead_code)] // S4-C removes this when it wires the history row.
 fn history_key(id: EditId) -> Option<String> {
     match id {
         EditId::Reword => Some("F2".to_string()),
@@ -682,7 +683,6 @@ fn history_key(id: EditId) -> Option<String> {
 /// What the history row needs to know of a commit that `Repo` does not hold: the graph's
 /// answers, which the integration (S4-C) fills from the rows it has read. The default is a
 /// commit with no history edit.
-#[allow(dead_code)] // S4-C removes this when it wires the history row.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Eligibility {
     /// The commit is HEAD or an ancestor of HEAD (03 §7.8: history edits rewrite those).
@@ -706,7 +706,6 @@ pub struct Eligibility {
 /// - nothing above HEAD to move up past or to plan; nothing below a root commit to squash or fix
 ///   up into or to move down past; `fold` only with staged changes. `split` stays on a root
 ///   commit, where its plan refuses it with the reason (G-H3).
-#[allow(dead_code)] // S4-C removes this when it wires the history row.
 pub fn history_items(commit: &CommitRow, eligible: Eligibility, repo: &Repo) -> Vec<HistoryItem> {
     let Some(head) = repo.head.oid().filter(|_| eligible.ancestor) else {
         return Vec::new();
@@ -733,7 +732,6 @@ pub fn history_items(commit: &CommitRow, eligible: Eligibility, repo: &Repo) -> 
 }
 
 /// How the commit menu with its history row ended.
-#[allow(dead_code)] // S4-C removes this when it wires the history row.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HistoryMenuEnd {
     /// S3-B's menu ended (one of its items, `Repository…`'s menu, Esc): its [`MenuEnd`] as it is.
@@ -745,7 +743,6 @@ pub enum HistoryMenuEnd {
 
 /// A menu with the history row: S3-B's [`Menu`] of the target, then, on a commit row, §7.8's
 /// items, then `Repository…` (03 §7.1's last row). Another target's is S3-B's menu as it is.
-#[allow(dead_code)] // S4-C removes this when it wires the history row.
 #[derive(Debug, Clone)]
 pub struct HistoryMenu {
     menu: Menu,
@@ -758,7 +755,6 @@ pub struct HistoryMenu {
     moved: bool,
 }
 
-#[allow(dead_code)] // S4-C removes this when it wires the history row.
 impl HistoryMenu {
     /// `target`'s menu on `repo` with the history row ([`history_items`]; `eligible`: what the
     /// graph says of a commit target), the bar on its first item.

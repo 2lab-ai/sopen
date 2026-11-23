@@ -242,3 +242,30 @@ changes. Rows here are snapshots taken when they were moved.
 - Found while wiring them (S3-C's report): the redo of a hard reset's undo is refused by git (`reset --keep` runs
   before the work-tree item of the undo's own group); S3-B's restore dialog offered "replace" only for a path
   whose value is `occupied`, never for a file of other bytes (S3-C offers it wherever `backup::blocked` says so).
+
+## R2 (part) — S3-C, S4-0, S4-A, S4-B, closed 2026-11-24
+
+- merged S3-C (PR #90), S4-0 (#86), S4-A (#89), S4-B (#88) ✅ · result: all of S3 (the git actions, backups,
+  restore and undo, the banner, the log) on main; S4's scaffold, every history edit as a plan (S4-A) and its
+  screens — the planner pane, the quick edits' dialogs, the commit menu's history row, an edit stop's Amend and
+  Split (S4-B) — on main, which S4-C wires · closed rows: S3-C, S4-0, S4-A, S4-B · PRs: S4-C's (this block)
+
+### Closed rows
+
+| ID | Status | Branch | Scope | Owner files (02 §5) | After |
+|---|---|---|---|---|---|
+| S3-C | ✅ merged: PR #90 | `feat/browser-s3-integration` | wiring S3-A and S3-B: actions on a worker under the repository's write lock (02 §6), the refresh after (03 §5), `GitEvent::WorkTreeChanged`, the window's undo; S3-A's in-progress probe in the load and every refresh (02 §6.1, 03 §5); S3's key rows landed, and the rows 03 §9 needs added or changed — the banner's Cmd/Ctrl+Shift+C, S, A, B (03 §9.2) among them (hand-over); `SOPEN_STATE dialog=` (02 §9); S3's scenarios (02 §8.1's table: G-R5, G-A1–G-A9, G-S1–G-S8, G-K1, G-K2, G-W1 banner, backups, log), receipts; G-R3's live receipt on sopen's own binary against a real ssh host under zsh, bash and fish login shells, the master killed before Esc included (03 §11); AGENTS.md | `src/gui/browser.rs`, `src/gui/browser/{view,tests}.rs`, `src/gui/browser/git_panel/mod.rs` (hand-over), `src/gui/browser/keys.rs` and `src/gui/help.rs` (hand-over), `src/gui/mod.rs` (receipt keys), `src/main.rs`, `tests/cli.rs`, `AGENTS.md`, `README.md` | S3-A, S3-B, S2-F |
+| S4-0 | ✅ merged: PR #86 (931e7cb), 2026-11-23 | `feat/browser-s4-scaffold` | `mod` lines and stubs for S4's files (`git::rebase`, its tests, `git_panel/planner.rs`, `git_panel/tests_s4.rs`); the shared types of `git::rebase` (`EditId`, `Quick`, `Edit`, `Model`, `Row`, `Op`, `Problem`, `Run`, `TodoLine`, `Exec`, `Base`, `BranchMove`, `Split`) over S3's `Plan`, `Refused`, `Repo` and `Need`; `plan`, `needs`, `open` and `open_needs` as `todo!()`; nothing added to `git::actions`; no `keys.rs` row: the rows S4 needs from 03 §9 are listed for S4-C; 02 §5's S4 rows and hand-overs, 02 §8.1's schedule | `src/git/{mod,rebase}.rs`, `src/git/tests/rebase.rs`, `src/gui/browser/git_panel/mod.rs` (mod lines), the stubs; `.prd/02-architecture.md`, `.prd/browser/loop.md` | S3-A, S3-B |
+| S4-A | ✅ merged: PR #89 (601dbeb), 2026-11-23 | `feat/browser-s4-rebase` | every history edit of 03 §7.8 as a pure plan over S3's `Plan`: the quick edits of §7.8.1 (the HEAD forms of `reword` and `author` as amends; `fold`'s commit and its `fixup` line, 03's estimate settled by a test), the planner's model, ops and checks (§7.8.2), its todo with the message and author lines byte for byte, `--update-refs` with the branches it moves or leaves (another worktree's), the backups (§8.2), the files in the way (§8.6), the edit stop's Split and the Continue refused while a recorded path differs (§7.8.1 `split`, §8.5); G-H1–G-H5 through `LocalGit` and `ShellGit` | `src/git/rebase.rs`, `src/git/tests/rebase.rs`; `src/git/actions.rs` (hand-over: `pub(crate)` on the helpers a rewrite shares, such as the §8.6 guard, nothing else) | S4-0 |
+| S4-B | ✅ merged: PR #88 (88f615c), 2026-11-23 | `feat/browser-s4-planner` | the planner pane over the git panel (03 §7.8.2: verb, hash, subject, author, date, the `A` mark; its keys, typed letters setting verbs and never starting Find; Esc asks when something changed); the quick edits' dialogs and their confirmations (§7.8.1, §8.1), in `planner.rs`, since S3-B's `ActionDialog` takes an `Action`; the commit menu's §7.8 history row (`menu.rs`) and an edit stop's Amend and Split on the banner (`in_progress.rs`, §8.5), as new items and return types beside S3-B's, not new variants of `MenuEnd` or `Pressed`, which S3-C's wiring may match on; `Model::apply`, `changed`, `problems` and `rebase::plan` through seams of its own, so its tests run on fakes before S4-A lands; in the PC Shell look | `src/gui/browser/git_panel/{planner,menu,in_progress}.rs`, `src/gui/browser/git_panel/tests_s4.rs` | S4-0 |
+
+### Round section
+
+- Merge commits and their dates are main's (+0900; the same day in UTC). S4-0 (#86) merged first, then S4-A (#89)
+  and S4-B (#88); S3-C (#90) merges after this block was written, so its row names the PR without its commit.
+- The rows are as they were in loop.md except their Status. S4-C's row stays there (in progress); so does S6-C's,
+  merged as #87 (2ab2df2) and not closed by this block.
+- Found while wiring them (S4-C's report): S4-A's planner run refused any plan that moved the newest row
+  (`draft` compared `model.rows.first()` with HEAD, not the order as read), so Cmd/Ctrl+↓ on the top row was
+  refused "HEAD is …, not the plan's newest commit …" — fixed in S4-C's round 2; git 2.56.1 writes `rebase-merge/stopped-sha` and the
+  `done` line with the full id (S4-B's open fact), so an edit stop's Split is offered.

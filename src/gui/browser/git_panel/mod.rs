@@ -21,6 +21,14 @@
 //! `in_progress`): what runs git is a [`GitAction`] again (a dialog's prefill to read, an action
 //! to run, a restore's entries, the Backups list, the log). A view with no snapshot offers no
 //! action: its keys do what S2's do.
+//!
+//! S4-C adds the history edits (03 §7.8) through S4-B's screens: the commit menu's history row
+//! (`menu::HistoryMenu`, offered as the loaded graph says — [`GitView::eligibility`]), F2 and F8
+//! on a commit (`reword`, `drop`), Cmd/Ctrl+E and the planner over the body (`planner`, which
+//! takes its own keys first: while it is open only the window's keys are looked up here), the
+//! quick edits' dialogs, and an edit stop's Amend and Split on the banner (`in_progress`). What
+//! runs git is a [`GitAction`] again: the reads a quick edit's dialog or the planner opens on, a
+//! history edit to run.
 
 mod backups;
 mod details;
@@ -44,7 +52,9 @@ pub use dialogs::Prefill;
 #[allow(unused_imports)]
 pub use filters::{BranchChoice, Filters, Order};
 pub use find::SearchQuery;
-pub use menu::{label as action_label, Target};
+pub use menu::{history_label, label as action_label, Target};
+#[cfg(test)]
+pub use {dialogs::PLAN_FIRST, planner::UPDATE_REFS};
 
 use super::keys::{self, Command, Context, Mods, Step, Trigger};
 use super::view::Mode;
@@ -52,8 +62,10 @@ use crate::git::actions::{self, Action, ActionId, Outcome, Plan, Proceed, Repo};
 use crate::git::backup::{Record, RestoreEntry};
 use crate::git::graph::{Graph, Row};
 use crate::git::model::{BackupRef, CommitRow, ObjectType, Oid, RefKind, RefLabel, StatusEntry};
+use crate::git::rebase::{self, Base, Edit, EditId, Model};
 use crate::git::runner::LogEntry;
 use crate::gui::chrome::{self, FKey};
+use crate::gui::DialogId;
 use crate::gui::Status;
 use eframe::egui::{self, Key, Rect};
 use std::collections::{HashMap, HashSet};
@@ -208,6 +220,22 @@ pub enum GitAction {
     TagDetails(String),
     /// Yes to "Stop git?" (03 §3.4): the write running in this panel is stopped.
     StopWrite,
+    // S4 (03 §7.8; S4-C).
+    /// A quick edit's dialog (03 §7.8.1), once its commit is read: the range above `base` up to
+    /// HEAD (`rebase::open_needs`, `actions::inspect`, `rebase::open`), whose rows hold `commit`
+    /// and, for `squash`, the commit below it; then [`GitView::open_edit`].
+    OpenEdit { id: EditId, commit: Oid, base: Base },
+    /// The planner over the range above `base` up to HEAD (03 §7.8.2), once read; then
+    /// [`GitView::open_planner`].
+    OpenPlanner(Base),
+    /// The Rebase dialog's "plan the commits first" (03 §7.1): the planner over the commits
+    /// `rebase <onto>` moves — above `merge-base HEAD <onto>`, or from the root when they share
+    /// none.
+    PlanBeforeRebase(actions::Rev),
+    /// Run a history edit on a worker under the repository's write lock (02 §6), then refresh
+    /// (03 §5): the plan its confirmation showed is [`GitView::take_edit_plan`]'s, else plan it
+    /// there (a plan that asks for a confirmation then opens it again instead).
+    RunEdit(Edit),
 }
 
 /// A label of a row, as drawn (03 §4.4).
@@ -381,7 +409,8 @@ pub struct GitView {
     undo: Option<String>,
     /// Window state the dialogs start from: "Don't ask again in this window" (03 §7.1).
     unasked: bool,
-    menu: Option<menu::Menu>,
+    /// The menu of the object under the bar, with a commit's history row (S4).
+    menu: Option<menu::HistoryMenu>,
     dialog: Option<Box<dialogs::ActionDialog>>,
     /// The plan the dialog showed for the action it returned: what runs (S3-A: its backup
     /// verifies the values the owner confirmed).
@@ -396,6 +425,20 @@ pub struct GitView {
     log: Option<log_view::LogView>,
     /// Text for the clipboard (the menu's Copy items), handed to egui on the next pass.
     to_copy: Option<String>,
+    // S4 (S4-C): the history edits.
+    /// A quick edit's dialog, or the confirmation of an edit built elsewhere — an edit stop's
+    /// Split, a kept split's Continue, a run whose shown plan was lost (`planner::QuickDialog`).
+    quick: Option<Box<planner::QuickDialog>>,
+    /// The planner over the body (03 §7.8.2): it takes its own keys first.
+    planner: Option<planner::PlannerView>,
+    /// The plan the quick dialog or the planner's run showed for the edit it returned: what runs
+    /// (S3-C's rule: never a plan no confirmation showed).
+    confirmed_edit: Option<(Edit, Plan)>,
+    /// The edit stop the banner shows (03 §8.5): its Amend and Split.
+    stop: Option<in_progress::EditStop>,
+    /// The split this window keeps for this repository (03 §7.8.1 `split`): while kept, the
+    /// banner's Continue is `Edit::ContinueSplit`'s.
+    split: Option<rebase::Split>,
 }
 
 impl RowKey {
@@ -469,6 +512,11 @@ impl GitView {
             backups: None,
             log: None,
             to_copy: None,
+            quick: None,
+            planner: None,
+            confirmed_edit: None,
+            stop: None,
+            split: None,
         }
     }
 
@@ -785,16 +833,29 @@ impl GitView {
         if let Some(said) = self.said.as_ref().or(self.status.as_ref()) {
             return said.clone();
         }
+        // The planner's keys are at its foot; here, what else works while it is open.
+        if self.planner.is_some() {
+            return Status::info(PLANNER_HINT);
+        }
         if self.find.is_some() {
             return Status::info(FIND_HINT);
         }
-        // The banner's keys (03 §8.5: "then its keys"), while it shows.
+        // The banner's keys (03 §8.5: "then its keys"), while it shows: an edit stop's Amend and
+        // Split first, as its buttons read (S4).
         if let Some(banner) = &self.banner {
-            let steps: Vec<String> = banner
-                .offers()
-                .iter()
-                .map(|&p| format!("{} {}", in_progress::key_text(p), in_progress::word(p)))
-                .collect();
+            let stop = self.stop.as_ref().map_or_else(Vec::new, |s| s.offers());
+            let steps: Vec<String> =
+                stop.into_iter()
+                    .map(|s| {
+                        let key = in_progress::stop_key_text(s);
+                        format!("{key} {}", in_progress::stop_word(s))
+                    })
+                    .chain(
+                        banner.offers().iter().map(|&p| {
+                            format!("{} {}", in_progress::key_text(p), in_progress::word(p))
+                        }),
+                    )
+                    .collect();
             return Status::info(format!("{} · {HINT}", steps.join(" · ")));
         }
         Status::info(HINT)
@@ -971,6 +1032,10 @@ impl GitView {
             Command::Reread => return vec![A::Refresh],
             Command::Pin => return vec![A::Pin],
             Command::Wide => return vec![A::Wide],
+            // An edit stop's Amend and Split act on the banner, as its Continue, Skip and Abort
+            // do, whatever shows in the body (the log, the Backups list).
+            Command::Amend => return self.stop_step(in_progress::StopStep::Amend),
+            Command::Split => return self.stop_step(in_progress::StopStep::Split),
             _ => {}
         }
         // The log or the Backups list in the body takes the keyboard (review 1): its own keys,
@@ -1218,12 +1283,19 @@ impl GitView {
     }
 
     /// A dialog is up — the filters', history search's, S3's menu, action dialog, result, "Stop
-    /// git?", the log's whole entry: it has the keyboard (its own Enter and Esc), and Esc is its.
+    /// git?", the log's whole entry, S4's quick edit dialog and the planner's own (its message,
+    /// author, question and run): it has the keyboard (its own Enter and Esc), and Esc is its.
     pub fn dialog_up(&self) -> bool {
+        self.other_dialog_up() || self.planner.as_ref().is_some_and(|p| p.dialog_up())
+    }
+
+    /// A dialog is up that is not the planner's own: the pane then takes no key.
+    fn other_dialog_up(&self) -> bool {
         self.filters_dialog.is_some()
             || self.search_dialog.is_some()
             || self.menu.is_some()
             || self.dialog.is_some()
+            || self.quick.is_some()
             || self.result.is_some()
             || self.stop_question.is_some()
             || self.log.as_ref().is_some_and(|l| l.whole().is_some())
@@ -1261,11 +1333,27 @@ impl GitView {
     /// beyond the refresh are made again after one).
     pub fn set_repo(&mut self, repo: Repo) {
         self.banner = in_progress::BannerView::probe(&repo.in_progress, &repo.status);
+        self.stop = edit_stop(&repo);
+        self.repo = Some(repo);
+        self.repo_generation += 1;
+        self.feed_dialogs();
+    }
+
+    /// The open dialogs plan again against the snapshot as it is now (with its reads): S3's
+    /// action dialog, a quick edit's dialog, the planner (its model, the owner's plan, stays).
+    fn feed_dialogs(&mut self) {
+        let Some(repo) = &self.repo else {
+            return;
+        };
         if let Some(dialog) = &mut self.dialog {
             dialog.set_repo(repo.clone());
         }
-        self.repo = Some(repo);
-        self.repo_generation += 1;
+        if let Some(quick) = &mut self.quick {
+            quick.set_repo(repo.clone());
+        }
+        if let Some(planner) = &mut self.planner {
+            planner.set_repo(repo.clone());
+        }
     }
 
     /// The snapshot the actions plan against, and its generation ([`GitView::seen`]).
@@ -1285,9 +1373,7 @@ impl GitView {
         for (need, stdout) in seen.reads {
             repo.seen.put(need, stdout);
         }
-        if let Some(dialog) = &mut self.dialog {
-            dialog.set_repo(repo.clone());
-        }
+        self.feed_dialogs();
     }
 
     /// The open dialog's draft: what `git::actions::needs` reads for.
@@ -1413,10 +1499,20 @@ impl GitView {
         self.confirm(action)
     }
 
-    /// `SOPEN_STATE dialog=<id>` (02 §9): `id` on the object under the bar, else on the first of
-    /// the repository, the uncommitted row and its changed files whose menu offers it; the
-    /// banner's steps through the banner. An id offered on none of them is said on the status row.
-    pub fn open_by_id(&mut self, id: ActionId) -> Vec<GitAction> {
+    /// `SOPEN_STATE dialog=<id>` (02 §9): an action's id on the object under the bar, else on the
+    /// first of the repository, the uncommitted row and its changed files whose menu offers it;
+    /// the banner's steps through the banner. A history edit's id (03 §7.8.1, S4) on the bar's
+    /// commit, else on HEAD's, where its history row offers it. An id offered on none of them
+    /// is said on the status row.
+    pub fn open_by_id(&mut self, id: DialogId) -> Vec<GitAction> {
+        match id {
+            DialogId::Action(id) => self.open_action_by_id(id),
+            DialogId::Edit(id) => self.open_edit_by_id(id),
+        }
+    }
+
+    /// [`GitView::open_by_id`] of an action of 03 §7.1–§7.7.
+    fn open_action_by_id(&mut self, id: ActionId) -> Vec<GitAction> {
         use ActionId as A;
         self.said = None;
         let step = match id {
@@ -1588,6 +1684,18 @@ impl GitView {
     /// works). Without a snapshot, [`fkeys`]' alone.
     pub fn fkeys(&self, mode: Mode) -> Vec<FKey> {
         let mut row = fkeys(mode);
+        // The planner over the body: only the window's slots work (F1, F9); the graph's object
+        // is not on screen.
+        if self.planner.is_some() {
+            let window: Vec<u8> = window_rows()
+                .filter_map(|r| match r.trigger {
+                    Trigger::Key(key, Mods::None) => chrome::fkey_number(key),
+                    _ => None,
+                })
+                .collect();
+            row.retain(|k| window.contains(&k.n));
+            return row;
+        }
         // The log or the Backups list: what it does (F3 shows; the Backups list's F8 deletes).
         if self.log.is_some() || self.backups.is_some() {
             if self.backups.is_some() {
@@ -1609,7 +1717,10 @@ impl GitView {
             if r.label.is_empty() || !ACTION_SLOTS.contains(&r.command) {
                 continue;
             }
-            if r.command != Command::Menu && self.slot(r.command, &object).is_none() {
+            if r.command != Command::Menu
+                && self.slot(r.command, &object).is_none()
+                && self.edit_slot(r.command, &object).is_none()
+            {
                 continue;
             }
             let label = match (r.command, &object) {
@@ -1747,9 +1858,16 @@ impl GitView {
     }
 
     fn pressed(&mut self, pressed: in_progress::Pressed) -> Vec<GitAction> {
-        match pressed {
-            in_progress::Pressed::Proceed(action) => self.confirm(action),
-            in_progress::Pressed::NotOffered(text) => {
+        use in_progress::Pressed as P;
+        match (pressed, self.split.clone()) {
+            // A kept split (03 §7.8.1 `split`): Continue is refused while a recorded path still
+            // differs from HEAD — `Edit::ContinueSplit`'s plan, through its dialog. The one
+            // place every Continue (key, button, `dialog=continue`) goes through.
+            (P::Proceed(Action::Proceed(Proceed::Continue)), Some(split)) => {
+                self.confirm_edit(Edit::ContinueSplit(split))
+            }
+            (P::Proceed(action), _) => self.confirm(action),
+            (P::NotOffered(text), _) => {
                 self.said = Some(Status::info(text));
                 Vec::new()
             }
@@ -1781,34 +1899,47 @@ impl GitView {
         asked
     }
 
-    /// The F-keys' actions (03 §9.1) on the object under the bar; a slot with nothing there says
-    /// why when it is a commit's history edit (S4).
+    /// The F-keys' actions (03 §9.1) on the object under the bar: on a commit F2 and F8 are its
+    /// history edits `reword` and `drop` (S4), and say why where they are not offered.
     fn fkey(&mut self, command: Command) -> Vec<GitAction> {
         let Some(object) = self.object() else {
             return Vec::new();
         };
+        if let Some((id, commit)) = self.edit_slot(command, &object) {
+            return self.act_edit(id, commit);
+        }
         match self.slot(command, &object) {
             Some((id, target)) => self.act(id, target),
             None => {
-                let later = match (command, &object) {
-                    (Command::Reword, Target::Commit { .. }) => Some("Reword"),
-                    (Command::Remove, Target::Commit { .. }) => Some("Drop"),
+                let refused = match (command, &object) {
+                    (Command::Reword, Target::Commit { commit, .. }) => {
+                        Some((EditId::Reword, commit.clone()))
+                    }
+                    (Command::Remove, Target::Commit { commit, .. }) => {
+                        Some((EditId::Drop, commit.clone()))
+                    }
                     _ => None,
                 };
-                if let Some(what) = later {
-                    self.said = Some(Status::info(format!(
-                        "{what} of a commit comes with the history edits, not in this version"
-                    )));
+                if let Some((id, commit)) = refused {
+                    self.said = Some(Status::info(self.not_offered(id, &commit)));
                 }
                 Vec::new()
             }
         }
     }
 
-    /// The menu of the object under the bar (03 §7, §9: F10, Shift+F10, a right click).
+    /// The menu of the object under the bar (03 §7, §9: F10, Shift+F10, a right click), a
+    /// commit's with its history row (S4) as the loaded graph allows it.
     fn open_menu(&mut self) {
-        if let (Some(repo), Some(target)) = (&self.repo, self.object()) {
-            self.menu = Some(menu::Menu::new(target, repo));
+        let Some(target) = self.object() else {
+            return;
+        };
+        let eligible = match &target {
+            Target::Commit { commit, .. } => self.eligibility(&commit.oid),
+            _ => menu::Eligibility::default(),
+        };
+        if let Some(repo) = &self.repo {
+            self.menu = Some(menu::HistoryMenu::new(target, eligible, repo));
         }
     }
 
@@ -1913,6 +2044,8 @@ impl GitView {
             Command::Skip => self.proceed(Proceed::Skip),
             Command::Abort => self.proceed(Proceed::Abort),
             Command::BisectReset => self.proceed(Proceed::BisectReset),
+            // S4: the planner from the bar's commit.
+            Command::Planner => self.plan_from_bar(),
             _ => return None,
         };
         Some(asked)
@@ -1926,12 +2059,35 @@ impl GitView {
         }
         if let Some(menu) = &mut self.menu {
             return match menu.ui(ctx) {
-                Some(menu::MenuEnd::Chose { id, target }) => {
+                Some(menu::HistoryMenuEnd::Menu(menu::MenuEnd::Chose { id, target })) => {
                     self.menu = None;
                     self.act(id, target)
                 }
-                Some(menu::MenuEnd::Cancel) => {
+                Some(menu::HistoryMenuEnd::Menu(menu::MenuEnd::Cancel)) => {
                     self.menu = None;
+                    Vec::new()
+                }
+                Some(menu::HistoryMenuEnd::Edit { id, commit }) => {
+                    self.menu = None;
+                    self.act_edit(id, commit)
+                }
+                None => Vec::new(),
+            };
+        }
+        if let Some(quick) = &mut self.quick {
+            return match quick.ui(ctx, planner::PLAN) {
+                Some(planner::QuickEnd::Run(edit)) => {
+                    // The plan the dialog showed for exactly this edit is what runs.
+                    let shown = match quick.planned() {
+                        Some(Ok(plan)) if *quick.draft() == edit => Some(plan.clone()),
+                        _ => None,
+                    };
+                    self.quick = None;
+                    self.confirmed_edit = shown.map(|plan| (edit.clone(), plan));
+                    vec![GitAction::RunEdit(edit)]
+                }
+                Some(planner::QuickEnd::Cancel) => {
+                    self.quick = None;
                     Vec::new()
                 }
                 None => Vec::new(),
@@ -1956,6 +2112,11 @@ impl GitView {
                     self.dialog = None;
                     Vec::new()
                 }
+                // Rebase's "plan the commits first" (03 §7.1): the planner instead, nothing run.
+                Some(dialogs::DialogEnd::PlanFirst(onto)) => {
+                    self.dialog = None;
+                    vec![GitAction::PlanBeforeRebase(onto)]
+                }
                 None => Vec::new(),
             };
         }
@@ -1979,6 +2140,368 @@ impl GitView {
             };
         }
         Vec::new()
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// S4: the history edits (03 §7.8; S4-C wires S4-B's screens to S4-A's plans).
+
+/// The edit stop of `repo`'s banner (03 §8.5), its commit in full: the probe's `stopped-sha` or
+/// `done` line when they hold a whole id, else HEAD's — at an edit stop HEAD is the commit it
+/// stopped at (S4-A: `Edit::SplitStop` names HEAD's full id from the refresh).
+fn edit_stop(repo: &Repo) -> Option<in_progress::EditStop> {
+    let stop = in_progress::EditStop::probe(&repo.in_progress, &repo.status)?;
+    if stop.commit().is_some() {
+        return Some(stop);
+    }
+    let banner = actions::Banner::of(&repo.in_progress, &repo.status)?;
+    let short = banner.edit_stop()?;
+    let head = repo
+        .head
+        .oid()
+        .filter(|h| h.as_str().starts_with(short))
+        .cloned();
+    Some(in_progress::EditStop::new(short, head))
+}
+
+impl GitView {
+    /// What the history row may offer on commit `oid` (`menu::Eligibility`), as the loaded
+    /// graph says — false wherever it cannot tell (S4-B: "when in doubt, pass false"):
+    /// - `ancestor`: `oid` is HEAD's commit or reached from it through the loaded rows' parents;
+    /// - `linear`: HEAD's first-parent line reaches `oid` through loaded rows with no commit of
+    ///   more than one parent, `oid` itself included — then `oid^..HEAD` is exactly that line;
+    /// - `below_merge`: `oid`'s first parent has more than one parent, or is not loaded.
+    pub fn eligibility(&self, oid: &Oid) -> menu::Eligibility {
+        let mut eligible = menu::Eligibility::default();
+        let Some(Row::Commit { commit: head, .. }) = self.head_row.and_then(|i| self.rows.get(i))
+        else {
+            return eligible;
+        };
+        let commits: HashMap<&Oid, &CommitRow> = self
+            .rows
+            .iter()
+            .filter_map(|r| match r {
+                Row::Commit { commit, .. } => Some((&commit.oid, commit)),
+                _ => None,
+            })
+            .collect();
+        // HEAD's ancestors among the loaded rows.
+        let mut seen: HashSet<&Oid> = HashSet::new();
+        let mut next = vec![&head.oid];
+        while let Some(at) = next.pop() {
+            if !seen.insert(at) {
+                continue;
+            }
+            if let Some(c) = commits.get(at) {
+                next.extend(c.parents.iter());
+            }
+        }
+        eligible.ancestor = seen.contains(oid) && commits.contains_key(oid);
+        if !eligible.ancestor {
+            return eligible;
+        }
+        // HEAD's first-parent line down to `oid`.
+        let mut at = Some(head);
+        while let Some(c) = at {
+            if c.parents.len() > 1 {
+                break;
+            }
+            if c.oid == *oid {
+                eligible.linear = true;
+                break;
+            }
+            at = c.parents.first().and_then(|p| commits.get(p).copied());
+        }
+        let below = commits[oid].parents.first();
+        eligible.below_merge =
+            below.is_some_and(|p| commits.get(p).is_none_or(|c| c.parents.len() > 1));
+        eligible
+    }
+
+    /// The history row of the commit `commit` as the menu would offer it (03 §7.8.1).
+    fn history_of(&self, commit: &CommitRow) -> Vec<EditId> {
+        let Some(repo) = &self.repo else {
+            return Vec::new();
+        };
+        menu::history_items(commit, self.eligibility(&commit.oid), repo)
+            .into_iter()
+            .map(|i| i.id)
+            .collect()
+    }
+
+    /// F2 and F8 on a commit (03 §9.1): its `reword` and `drop`, where the history row offers
+    /// them; `None` otherwise.
+    fn edit_slot(&self, command: Command, object: &Target) -> Option<(EditId, CommitRow)> {
+        let Target::Commit { commit, .. } = object else {
+            return None;
+        };
+        let id = match command {
+            Command::Reword => EditId::Reword,
+            Command::Remove => EditId::Drop,
+            _ => return None,
+        };
+        self.history_of(commit)
+            .contains(&id)
+            .then(|| (id, commit.clone()))
+    }
+
+    /// Why history edit `id` is not offered on `commit`, for the status row.
+    fn not_offered(&self, id: EditId, commit: &CommitRow) -> String {
+        let what = menu::history_label(id).trim_end_matches('…');
+        let short = commit.oid.short();
+        let eligible = self.eligibility(&commit.oid);
+        let why = if self.repo.as_ref().and_then(|r| r.head.oid()).is_none() {
+            "the branch has no commit yet"
+        } else if !eligible.ancestor {
+            "it is not HEAD or an ancestor of HEAD in the loaded graph"
+        } else if !eligible.linear {
+            "a merge is between it and HEAD (Edit history from here… names it)"
+        } else {
+            "not on this commit"
+        };
+        format!("{what}: not offered on {short} — {why}")
+    }
+
+    /// History edit `id` on `commit` (the menu's history row, F2, F8, Cmd/Ctrl+E): the planner's
+    /// range, or the range a quick edit's dialog reads its commit from — above `commit`'s parent,
+    /// or for `squash` its grandparent (it shows the older message too), or from the root where
+    /// there is none.
+    fn act_edit(&mut self, id: EditId, commit: CommitRow) -> Vec<GitAction> {
+        if id == EditId::Plan {
+            return vec![GitAction::OpenPlanner(Base::Commit(commit.oid))];
+        }
+        let base = match (id, commit.parents.first()) {
+            (EditId::Squash, Some(parent)) => {
+                let parent_row = self.rows.iter().find_map(|r| match r {
+                    Row::Commit { commit, .. } if commit.oid == *parent => Some(commit),
+                    _ => None,
+                });
+                match parent_row {
+                    Some(p) => p.parents.first().cloned().map_or(Base::Root, Base::Commit),
+                    None => {
+                        self.said = Some(Status::info(self.not_offered(id, &commit)));
+                        return Vec::new();
+                    }
+                }
+            }
+            (_, Some(parent)) => Base::Commit(parent.clone()),
+            (_, None) => Base::Root,
+        };
+        vec![GitAction::OpenEdit {
+            id,
+            commit: commit.oid,
+            base,
+        }]
+    }
+
+    /// Cmd/Ctrl+E (03 §9.2): the planner from the bar's commit, where its history row offers it
+    /// (not on HEAD: nothing is above it).
+    fn plan_from_bar(&mut self) -> Vec<GitAction> {
+        let Some(Target::Commit { commit, .. }) = self.object() else {
+            if self.repo.is_some() {
+                self.said = Some(Status::info(
+                    "Edit history from here: the bar is not on a commit",
+                ));
+            }
+            return Vec::new();
+        };
+        if self.history_of(&commit).contains(&EditId::Plan) {
+            return self.act_edit(EditId::Plan, commit);
+        }
+        let said = match self.repo.as_ref().and_then(|r| r.head.oid()) {
+            Some(head) if *head == commit.oid => {
+                "Edit history from here: nothing is above HEAD's commit to plan".to_string()
+            }
+            _ => self.not_offered(EditId::Plan, &commit),
+        };
+        self.said = Some(Status::info(said));
+        Vec::new()
+    }
+
+    /// `SOPEN_STATE dialog=<edit id>`: on the bar's commit, else on HEAD's.
+    fn open_edit_by_id(&mut self, id: EditId) -> Vec<GitAction> {
+        self.said = None;
+        let mut candidates: Vec<CommitRow> = Vec::new();
+        if let Some(Target::Commit { commit, .. }) = self.object() {
+            candidates.push(commit);
+        }
+        if let Some(Row::Commit { commit, .. }) = self.head_row.and_then(|i| self.rows.get(i)) {
+            candidates.push(commit.clone());
+        }
+        match candidates
+            .into_iter()
+            .find(|c| self.history_of(c).contains(&id))
+        {
+            Some(commit) => self.act_edit(id, commit),
+            None => {
+                self.said = Some(Status::error(format!(
+                    "SOPEN_STATE dialog={}: not offered on the row under the bar",
+                    id.as_str()
+                )));
+                Vec::new()
+            }
+        }
+    }
+
+    /// A quick edit's dialog (03 §7.8.1) on `commit`, from `model`, the range its reads opened:
+    /// its row and, for `squash`, the row below it. A commit the range does not hold is said.
+    pub fn open_edit(&mut self, id: EditId, commit: &Oid, model: &Model) -> Vec<GitAction> {
+        let Some(repo) = &self.repo else {
+            return Vec::new();
+        };
+        let at = model.rows.iter().position(|r| r.commit.row.oid == *commit);
+        let Some(at) = at else {
+            let what = menu::history_label(id).trim_end_matches('…');
+            self.said = Some(Status::error(format!(
+                "{what}: {} is not in the range read; refresh (Cmd/Ctrl+R) and try again",
+                commit.short()
+            )));
+            return Vec::new();
+        };
+        let this = &model.rows[at].commit;
+        let below = model.rows.get(at + 1).map(|r| &r.commit);
+        match planner::QuickDialog::open(id, this, below, repo, planner::PLAN) {
+            planner::QuickOpened::Dialog(dialog) => {
+                self.quick = Some(dialog);
+                Vec::new()
+            }
+            planner::QuickOpened::Run(edit) => vec![GitAction::RunEdit(edit)],
+            planner::QuickOpened::Planner(base) => vec![GitAction::OpenPlanner(base)],
+        }
+    }
+
+    /// The planner (03 §7.8.2) on `model`, the range read, over the body; it has the keyboard.
+    pub fn open_planner(&mut self, model: Model) {
+        let Some(repo) = &self.repo else {
+            return;
+        };
+        self.find = None;
+        self.planner = Some(planner::PlannerView::new(model, repo));
+    }
+
+    /// The open action dialog's "Plan the commits first…" button, when it draws one (tests).
+    #[cfg(test)]
+    pub fn plan_first_button(&self) -> Option<egui::Id> {
+        self.dialog.as_ref()?.plan_first_button()
+    }
+
+    /// The planner's model as its keys have made it, while it is open (tests).
+    #[cfg_attr(not(test), allow(dead_code))] // Only the tests use it.
+    pub fn planner_model(&self) -> Option<&Model> {
+        self.planner.as_ref().map(|p| p.model())
+    }
+
+    /// The planner's note (an op's refusal, a key's hint), while it is open (tests).
+    #[cfg_attr(not(test), allow(dead_code))] // Only the tests use it.
+    pub fn planner_note(&self) -> Option<&str> {
+        self.planner.as_ref().and_then(|p| p.note())
+    }
+
+    /// How the planner ended this pass: closed, or run — the plan its run dialog showed is what
+    /// runs, and the pane closes (the history it planned is rewritten).
+    fn planner_end(&mut self, end: Option<planner::PlannerEnd>) -> Vec<GitAction> {
+        match end {
+            None => Vec::new(),
+            Some(planner::PlannerEnd::Close) => {
+                self.planner = None;
+                Vec::new()
+            }
+            Some(planner::PlannerEnd::Run(edit)) => {
+                let shown = self.planner.as_mut().and_then(|p| p.take_shown());
+                self.planner = None;
+                self.confirmed_edit = shown.filter(|(e, _)| *e == edit);
+                vec![GitAction::RunEdit(edit)]
+            }
+        }
+    }
+
+    /// An edit built elsewhere (an edit stop's Split, a kept split's Continue), through its
+    /// confirmation (`QuickDialog::confirm`).
+    fn confirm_edit(&mut self, edit: Edit) -> Vec<GitAction> {
+        let Some(repo) = &self.repo else {
+            return Vec::new();
+        };
+        match planner::QuickDialog::confirm(edit, repo, planner::PLAN) {
+            planner::QuickOpened::Dialog(dialog) => {
+                self.quick = Some(dialog);
+                Vec::new()
+            }
+            planner::QuickOpened::Run(edit) => vec![GitAction::RunEdit(edit)],
+            planner::QuickOpened::Planner(base) => vec![GitAction::OpenPlanner(base)],
+        }
+    }
+
+    /// The Split of the edit stop the banner shows, through its confirmation: what the
+    /// integration opens at the stop a quick `split` leaves (03 §7.8.1: "at the stop sopen
+    /// records the commit's paths and runs `reset --mixed`" — shown first, as every plan is).
+    /// `None` when the banner shows no edit stop with its commit in full.
+    pub fn split_at_the_stop(&mut self) -> Option<Vec<GitAction>> {
+        let commit = self.stop.as_ref().and_then(|s| s.commit()).cloned()?;
+        Some(self.confirm_edit(Edit::SplitStop { commit }))
+    }
+
+    /// A history edit's confirmation again, as a dialog: its run's shown plan was lost and the
+    /// plan made now asks for a confirmation (S3-C's review rule). Never a run from here.
+    pub fn reconfirm_edit(&mut self, edit: Edit) {
+        let Some(repo) = &self.repo else {
+            return;
+        };
+        match planner::QuickDialog::confirm(edit, repo, planner::PLAN) {
+            planner::QuickOpened::Dialog(dialog) => self.quick = Some(dialog),
+            planner::QuickOpened::Run(_) | planner::QuickOpened::Planner(_) => {
+                self.said = Some(Status::info("the history edit: run it again"));
+            }
+        }
+    }
+
+    /// The plan the confirmation showed for `edit` (taken once), when it showed one.
+    pub fn take_edit_plan(&mut self, edit: &Edit) -> Option<Plan> {
+        let (shown, plan) = self.confirmed_edit.take()?;
+        (shown == *edit).then_some(plan)
+    }
+
+    /// The history edit an open dialog plans now, what `rebase::needs` reads for: the quick
+    /// edit's draft, or the planner's model while its run dialog is up (03 §7.8.2: the run's
+    /// reads on Cmd/Ctrl+Enter).
+    pub fn edit_draft(&self) -> Option<Edit> {
+        if let Some(quick) = &self.quick {
+            return Some(quick.draft().clone());
+        }
+        self.planner.as_ref().and_then(|p| p.run_draft())
+    }
+
+    /// The split this window keeps for this repository (03 §7.8.1 `split`), from the refresh.
+    pub fn set_split(&mut self, split: Option<rebase::Split>) {
+        self.split = split;
+    }
+
+    /// Cmd/Ctrl+Shift+M or P (03 §9.2): an edit stop's Amend or Split; with no edit stop they do
+    /// nothing, and the status row says so.
+    fn stop_step(&mut self, step: in_progress::StopStep) -> Vec<GitAction> {
+        let pressed = match &self.banner {
+            Some(banner) => in_progress::stop_step(banner, self.stop.as_ref(), step),
+            None => {
+                if self.repo.is_some() {
+                    let word = in_progress::stop_word(step);
+                    self.said = Some(Status::info(format!("{word}: nothing is in progress")));
+                }
+                return Vec::new();
+            }
+        };
+        self.stop_pressed(pressed)
+    }
+
+    /// An edit stop's Amend (§7.6's `amend` dialog: keep the stopped commit's message or edit
+    /// it, prefilled) or Split (its confirmation).
+    fn stop_pressed(&mut self, pressed: in_progress::StopPressed) -> Vec<GitAction> {
+        match pressed {
+            in_progress::StopPressed::Amend => self.act(ActionId::Amend, Target::Uncommitted),
+            in_progress::StopPressed::Split(edit) => self.confirm_edit(edit),
+            in_progress::StopPressed::NotOffered(text) => {
+                self.said = Some(Status::info(text));
+                Vec::new()
+            }
+        }
     }
 }
 
@@ -2012,12 +2535,34 @@ fn stop_question(ctx: &egui::Context, what: &str) -> Option<bool> {
 /// later slices' rows (actions, the planner) only once they land.
 const UPTO: keys::Slices = keys::LANDED_SLICES;
 
+/// The git context's rows that act while the planner is open: the window's own (F1, F9, Tab,
+/// Cmd/Ctrl+R, G, Shift+G), none of which is one of the pane's keys.
+fn window_rows() -> impl Iterator<Item = &'static keys::Row> {
+    keys::rows(Context::Git, UPTO).filter(|r| {
+        matches!(
+            r.command,
+            Command::Help
+                | Command::SwitchMode
+                | Command::OtherSide
+                | Command::Reread
+                | Command::Pin
+                | Command::Wide
+        )
+    })
+}
+
 /// What the status row says while nothing else is to be said.
 const HINT: &str =
     "Enter details · Space mark · a letter finds · ← → labels · Tab the list · Esc back · F1 the keys";
 
-/// What the status row says while the menu is open: what it is the menu of, and its keys.
-fn menu_hint(menu: &menu::Menu) -> String {
+/// What the status row says while the planner is open (its own keys are at its foot).
+const PLANNER_HINT: &str =
+    "The planner: its keys are at its foot · F1 the panel's keys · Tab the list · Esc closes it";
+
+/// What the status row says while the menu is open: what it is the menu of, and its keys (a
+/// commit's history row counted).
+fn menu_hint(history: &menu::HistoryMenu) -> String {
+    let menu = history.menu();
     let of = match menu.target() {
         Target::Commit { commit, marked } if marked.len() > 1 => {
             format!("{} and {} marked commits", commit.oid.short(), marked.len())
@@ -2032,7 +2577,7 @@ fn menu_hint(menu: &menu::Menu) -> String {
         },
         Target::Repository => "the repository".to_string(),
     };
-    match menu.items().len() {
+    match menu.items().len() + history.history().len() {
         0 => format!("Menu of {of}: nothing to do · Esc closes"),
         n => format!("Menu of {of}: {n} items · ↑ ↓ choose · Enter runs · Esc closes"),
     }
@@ -2048,6 +2593,22 @@ const FIND_HINT: &str = "Enter next · Shift+Enter previous · Esc closes Find";
 pub fn keys(ctx: &egui::Context, view: &mut GitView) -> Vec<GitAction> {
     let mut asked = Vec::new();
     while !view.dialog_up() {
+        if view.planner.is_some() {
+            // The planner takes its keys first (in [`draw`]): here only the window's rows, each
+            // by its exact key — never the git context's lookup, whose rows (↑ ↓, Enter, Esc, a
+            // typed letter starting Find) are the pane's (03 §7.8.2, S4-0 keys §C).
+            let Some(command) = ctx.input_mut(|i| {
+                window_rows().find_map(|r| match r.trigger {
+                    Trigger::Key(key, mods) if keys::take(i, key, mods) => Some(r.command),
+                    _ => None,
+                })
+            }) else {
+                break;
+            };
+            view.said = None;
+            asked.extend(view.run(command));
+            continue;
+        }
         if view.search.is_some() {
             // Find is over the graph's rows: never left open under a history search's results.
             view.find = None;
@@ -2110,8 +2671,9 @@ pub fn draw(ui: &mut egui::Ui, rect: Rect, view: &mut GitView, active: bool) -> 
         egui::pos2(inner.left(), inner.top() + banner_h),
         egui::vec2(inner.width(), row_h),
     );
-    // The log or the Backups list in the body, in place of the graph (03 §3.7, §8.2).
-    let listing = view.log.is_some() || view.backups.is_some();
+    // The log, the Backups list or the planner in the body, in place of the graph (03 §3.7,
+    // §8.2, §7.8.2).
+    let listing = view.log.is_some() || view.backups.is_some() || view.planner.is_some();
     let foot_y = inner.bottom() - row_h;
     let rule_y = (foot_y - row_h).max(head.bottom());
     let body = Rect::from_min_max(
@@ -2144,17 +2706,35 @@ pub fn draw(ui: &mut egui::Ui, rect: Rect, view: &mut GitView, active: bool) -> 
     let list_active = active && !pane_keyboard && !view.dialog_up();
     // Find's field over the graph, in the heads' row; its text changed, the bar jumps.
     let dialog = view.dialog_up();
-    if let Some(pressed) = view
-        .banner
-        .as_ref()
-        .and_then(|b| in_progress::draw(ui, banner, b))
-        .filter(|_| !dialog)
-    {
-        view.said = None;
-        asked.extend(view.pressed(pressed));
+    // The banner; at an edit stop with Amend and Split before its steps (03 §8.5, S4).
+    let ended = match (&view.banner, &view.stop) {
+        (Some(b), Some(stop)) => in_progress::draw_stop(ui, banner, b, stop),
+        (Some(b), None) => in_progress::draw(ui, banner, b).map(in_progress::StopEnd::Banner),
+        (None, _) => None,
+    };
+    match ended.filter(|_| !dialog) {
+        Some(in_progress::StopEnd::Banner(pressed)) => {
+            view.said = None;
+            asked.extend(view.pressed(pressed));
+        }
+        Some(in_progress::StopEnd::Stop(pressed)) => {
+            view.said = None;
+            asked.extend(view.stop_pressed(pressed));
+        }
+        None => {}
     }
     let list_rect = Rect::from_min_max(head.min, egui::pos2(inner.right(), rule_y));
-    if let Some(log) = &mut view.log {
+    if view.planner.is_some() {
+        // The planner over the body (03 §7.8.2): its keys first while it has the keyboard and
+        // no other dialog is up, then the pane, then its own dialog.
+        let pane_active = active && !view.other_dialog_up();
+        let end = view
+            .planner
+            .as_mut()
+            .and_then(|p| planner::draw(ui, list_rect, p, pane_active, &planner::SEAMS));
+        view.geometry = None;
+        asked.extend(view.planner_end(end));
+    } else if let Some(log) = &mut view.log {
         log_view::draw(ui, list_rect, log, active && !dialog);
         view.geometry = None;
     } else if let Some(list) = &mut view.backups {
@@ -2222,6 +2802,11 @@ pub fn draw(ui: &mut egui::Ui, rect: Rect, view: &mut GitView, active: bool) -> 
             if list_area.contains(pos) && view.search.is_none() && g.row_h > 0.0 {
                 let row = g.first + ((pos.y - g.rows_top) / g.row_h).floor().max(0.0) as usize;
                 if row < view.rows.len() {
+                    // The keyboard back to the graph first, as a left click gives it, so the
+                    // menu is the clicked row's, never the pane's file (PR #90 review).
+                    if let Some(pane) = &mut view.pane {
+                        pane.keyboard = false;
+                    }
                     asked.extend(view.move_bar(row));
                     view.open_menu();
                 }

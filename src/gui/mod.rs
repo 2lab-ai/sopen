@@ -342,8 +342,35 @@ pub struct State {
     /// File browser, with `git=pin`: the label cursor on the bar's row's Nth label (`label=N`).
     pub label: Option<usize>,
     /// File browser, with `git=pin`: that action's dialog on the object under the bar, once the
-    /// rest is done (`dialog=ID`, 03 §7's ids, 02 §9) — a confirmation's receipt.
-    pub dialog: Option<crate::git::actions::ActionId>,
+    /// rest is done (`dialog=ID`, 03 §7's ids — §7.8's history edits among them — 02 §9): a
+    /// confirmation's receipt.
+    pub dialog: Option<DialogId>,
+}
+
+/// What `SOPEN_STATE dialog=` names (02 §9): an action of 03 §7.1–§7.7
+/// (`git::actions::ActionId`), or a history edit of §7.8.1 (`git::rebase::EditId`, S4). No
+/// spelling is in both (S4-A's id test), so the action's is tried first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DialogId {
+    Action(crate::git::actions::ActionId),
+    Edit(crate::git::rebase::EditId),
+}
+
+impl DialogId {
+    /// The id spelled `text` as 03 §7 spells it, or `None`.
+    pub fn parse(text: &str) -> Option<DialogId> {
+        crate::git::actions::ActionId::parse(text)
+            .map(DialogId::Action)
+            .or_else(|| crate::git::rebase::EditId::parse(text).map(DialogId::Edit))
+    }
+
+    /// Its spelling.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DialogId::Action(id) => id.as_str(),
+            DialogId::Edit(id) => id.as_str(),
+        }
+    }
 }
 
 impl State {
@@ -443,7 +470,7 @@ impl State {
                     state.label = Some(n);
                 }
                 "dialog" => {
-                    let id = crate::git::actions::ActionId::parse(value).ok_or_else(|| {
+                    let id = DialogId::parse(value).ok_or_else(|| {
                         anyhow!("SOPEN_STATE dialog: '{value}' is not an action id of 03 §7")
                     })?;
                     state.dialog = Some(id);

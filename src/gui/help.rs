@@ -458,12 +458,13 @@ mod tests {
         assert_eq!(page.lines.last(), Some(&aliases()));
     }
 
-    /// F1 in the git panel (03 §9; S2's keys, and S3's since it landed), each on one line: the
-    /// details, a file at a revision, the editor, the mode, the bar, the label cursor, marks and
-    /// staging, Tab back, Esc, Find, history search, refresh, the filters, HEAD, wide, the pin;
-    /// S3's slots (Reword's rename, Pick, Rebase, Branch / Commit, Delete, the menu), Fetch all,
-    /// undo, the Backups list, the command log and the banner's Cmd/Ctrl+Shift+C, S, A, B — and
-    /// not S4's planner (Cmd/Ctrl+E).
+    /// F1 in the git panel (03 §9; S2's keys, S3's and S4's since they landed), each on one
+    /// line: the details, a file at a revision, the editor, the mode, the bar, the label cursor,
+    /// marks and staging, Tab back, Esc, Find, history search, refresh, the filters, HEAD, wide,
+    /// the pin; S3's slots (Pick, Rebase, Branch / Commit, the menu), Fetch all, undo, the
+    /// Backups list, the command log and the banner's Cmd/Ctrl+Shift+C, S, A, B; S4's F2 (a
+    /// commit's reword, a label's rename) and F8 (a commit's drop among the deletes), the
+    /// planner's Cmd/Ctrl+E and an edit stop's Cmd/Ctrl+Shift+M and P (03 §9.2).
     #[test]
     fn the_git_page_lists_the_git_panels_keys() {
         let page = for_context(Context::Git, Mode::Preview, &[]);
@@ -500,21 +501,12 @@ mod tests {
             ),
             (&format!("{cmd}+G"), "Pin this git panel; again: unpin"),
             (&format!("{cmd}+K"), "The filters"),
-            // S3.
-            (
-                "F2",
-                "On a branch's label: rename it (a commit's reword comes with the history edits)",
-            ),
-            (
-                "F5",
-                "Cherry-pick it or the marked ones; a stash: apply it",
-            ),
+            // S3, and S4's F2.
+            ("F2", "A commit: reword it; a branch's label: rename it"),
+            ("F5", "Cherry-pick it or the marked ones; a stash: apply it"),
             ("F6", "Rebase the current branch onto it"),
             ("F7", "A new branch here (uncommitted row: commit)"),
-            (
-                "F8",
-                "Delete or discard what is under the bar (asks; a commit's drop comes with the history edits)",
-            ),
+            ("F8", "Delete, drop or discard what is under the bar (asks)"),
             ("F10, Shift+F10", "The menu of what is under the bar"),
             (&format!("{cmd}+Shift+R"), "Fetch all"),
             (&format!("{cmd}+Z"), "Undo the newest backup group"),
@@ -532,7 +524,17 @@ mod tests {
                 &format!("{cmd}+Shift+A"),
                 "The operation in progress: Abort (asks)",
             ),
-            (&format!("{cmd}+Shift+B"), "Bisect in progress: Reset (asks)"),
+            (
+                &format!("{cmd}+Shift+B"),
+                "Bisect in progress: Reset (asks)",
+            ),
+            // S4.
+            (
+                &format!("{cmd}+E"),
+                "Plan a history edit from the commit under the bar",
+            ),
+            (&format!("{cmd}+Shift+M"), "An edit stop: Amend (asks)"),
+            (&format!("{cmd}+Shift+P"), "An edit stop: Split (asks)"),
         ] {
             assert_eq!(
                 line(&page, keys).map(|l| l.what.as_str()),
@@ -544,12 +546,6 @@ mod tests {
             .unwrap()
             .what
             .starts_with("Switch to dual mode"));
-        let all: Vec<&str> = page.lines.iter().map(|l| l.keys.as_str()).collect();
-        let later = format!("{cmd}+E");
-        assert!(
-            !all.iter().any(|keys| keys.split(", ").any(|k| k == later)),
-            "{later} lands with S4: {all:?}"
-        );
         assert_eq!(page.lines.last(), Some(&aliases()));
     }
 
