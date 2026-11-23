@@ -439,13 +439,15 @@ fn claim_with(
     };
     let why = match tried {
         Ok(()) => {
+            // Guarded at once, so an error building the claim still unlocks explicitly.
+            let locked = Locked(file);
             return Ok(Claim {
                 local: cached.to_path_buf(),
                 record: meta_path(cache, "record", cached)?,
                 note: None,
                 fresh: false,
-                _lock: Some(Locked(file)),
-            })
+                _lock: Some(locked),
+            });
         }
         Err(std::fs::TryLockError::WouldBlock) => {
             format!("another sopen session has {} open", cached.display())
