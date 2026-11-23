@@ -11,6 +11,21 @@
 //! sends [`Event`]s — progress, a name in the way (answered with [`Running::answer`]), and the
 //! [`Report`] at the end. [`Running::stop`] is Esc. [`run`] is the same engine on the caller's
 //! thread, with a [`Control`] of the caller's own.
+//!
+//! F7 and F8 (S6) are jobs of the same engine, over one connection (`Hosts::Same`):
+//! - F7: `Job { op: Op::MakeDir, src_dir: dir, names: vec![name], dst_dir: dir }`. A name the
+//!   dialog may refuse at once is [`valid_name`]'s (a `/` included); the engine refuses it too.
+//!   A name that exists ends as [`ItemOutcome::Failed`] (`<name> exists`), nothing made.
+//! - F8: the dialog asks [`trash_here`] what a delete in its folder does — [`Deletes::Trash`], or
+//!   [`Deletes::Permanent`] with why (a remote: SFTP has no Trash) — and says so; Enter runs
+//!   `Job { op: Op::Delete { trash }, src_dir: dir, names, dst_dir: dir }` with `trash` true only
+//!   for [`Deletes::Trash`] and not Shift. Every item ends Done or Failed (its reason); inside a
+//!   folder deleted permanently, every entry that stays gets a line of its own
+//!   (`folder/sub/name`). Esc stops between entries.
+//! - A remote folder's F2 and F6 are a plain `SSH_FXP_RENAME` where the session has its second
+//!   channel (04 §5.6); a copy to a server without `hardlink@openssh.com` is published the same
+//!   way after the server's rename is probed once per connection. Nothing changes for the
+//!   caller: the same [`Op::Rename`], [`Op::Move`] and [`Op::Copy`].
 
 mod delete;
 mod engine;
@@ -125,7 +140,7 @@ impl Report {
     }
 }
 
-/// What to do (04 §5.2, §5.3).
+/// What to do (04 §5.2–§5.5).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Op {
     Copy,
@@ -135,16 +150,53 @@ pub enum Op {
     Rename {
         to: String,
     },
+    /// F7 (04 §5.4): the one name in `names` is made a folder in `src_dir` — one level (a name
+    /// with `/` is refused before anything happens), the default mode, never over anything: a
+    /// name that exists is an error (no dialog).
+    MakeDir,
+    /// F8, Del, ⌘⌫ and Shift+F8, Shift+Del (04 §5.5): `names` in `src_dir` are deleted, after
+    /// the dialog asked. `trash`: each goes into this machine's Trash whole — an item the Trash
+    /// refuses fails with the reason and nothing of it is removed, and a host without a Trash
+    /// (every remote) refuses the operation before anything happens. Without: permanently,
+    /// bottom-up (`REMOVE` / `unlink` for files and links, `RMDIR` / `rmdir` for folders once
+    /// empty), a link removed as a link, never its target. The dialog sets it — what it said
+    /// is what happens ([`trash_here`]).
+    Delete {
+        trash: bool,
+    },
 }
 
 /// One operation: `names` (entries of `src_dir`, the selection or the bar's entry) to `dst_dir`
-/// (for [`Op::Rename`], `src_dir` itself). Folders are absolute paths on their host.
+/// (for [`Op::Rename`], [`Op::MakeDir`] and [`Op::Delete`], `src_dir` itself). Folders are
+/// absolute paths on their host.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Job {
     pub op: Op,
     pub src_dir: String,
     pub names: Vec<String>,
     pub dst_dir: String,
+}
+
+/// What F8 does in a folder (04 §5.5), for the delete dialog to say before anything happens.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Deletes {
+    /// Into this machine's Trash ([`Op::Delete`] with `trash`).
+    Trash,
+    /// Permanently — no Trash: why (a remote's `permanent — no Trash on <host>`, or this
+    /// machine's `permanent — no Trash here`, with the reason).
+    Permanent(String),
+}
+
+/// What a delete of entries of the folder `dir` on `fs` does without Shift (04 §5.5): into the
+/// Trash where `fs` has one that takes entries of `dir`, else permanently.
+pub fn trash_here(fs: &dyn FileOps, dir: &str) -> Deletes {
+    match fs.trash() {
+        None => Deletes::Permanent("SFTP has no Trash".to_string()),
+        Some(trash) => match trash.available(dir) {
+            Ok(()) => Deletes::Trash,
+            Err(why) => Deletes::Permanent(why),
+        },
+    }
 }
 
 /// The connections an operation runs over, borrowed: one when source and target are on one

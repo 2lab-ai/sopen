@@ -188,8 +188,8 @@ fn meta_of(m: &fs::Metadata) -> FileMeta {
     }
 }
 
-/// `rename(2)` that fails with `EEXIST` instead of replacing.
-fn rename_excl(from: &CString, to: &CString) -> std::io::Result<()> {
+/// `rename(2)` that fails with `EEXIST` instead of replacing (the Trash's move too).
+pub(super) fn rename_excl(from: &CString, to: &CString) -> std::io::Result<()> {
     #[cfg(target_os = "macos")]
     // SAFETY: two NUL-terminated paths.
     let r = unsafe { libc::renamex_np(from.as_ptr(), to.as_ptr(), libc::RENAME_EXCL) };
@@ -800,6 +800,19 @@ impl FileOps for LocalFs {
             Err(e) if e.kind() == ErrorKind::AlreadyExists => Err(taken(path)),
             Err(e) => Err(e).with_context(|| format!("cannot make the folder {path}")),
         }
+    }
+
+    fn make_folder(&mut self, path: &str) -> Result<()> {
+        // `mkdir(path, 0777)`: the umask gives the mode, as the `mkdir` command's.
+        match fs::DirBuilder::new().create(path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == ErrorKind::AlreadyExists => Err(taken(path)),
+            Err(e) => Err(e).with_context(|| format!("cannot make the folder {path}")),
+        }
+    }
+
+    fn trash(&self) -> Option<&dyn crate::remote::ops::Trash> {
+        Some(super::trash::system())
     }
 
     fn remove_dir(&mut self, path: &str) -> Result<()> {

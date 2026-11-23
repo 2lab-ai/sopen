@@ -1,6 +1,8 @@
 //! [`FileOps`] over SFTP (04 §5.6): a file renamed by `hardlink@openssh.com` then `REMOVE`
 //! (never `posix-rename@openssh.com`, which replaces), `MKDIR`, `RMDIR`, `Fs::symlink(target,
 //! link)`, `copy-data` in 8 MiB chunks into a temp created `CREAT|EXCL`, published by a hard link.
+//! A folder's rename, and a publish where the server has no `hardlink@`, are SFTP's plain rename
+//! on the session's second channel (`sftp/rename.rs`).
 //! The `copy-data` loop here is sopen's only one: a hex Save's server copy (07 §4.2 step 5,
 //! `sftp/patch.rs`) runs it too, paced by time instead of in fixed steps ([`Pace`]).
 //!
@@ -13,7 +15,6 @@ use super::{
 };
 use crate::remote::ops::{
     taken, FileMeta, FileOps, NoRename, Opened, Renamed, StageFailure, Staged, COPY_STEP,
-    REMOTE_FOLDER_RENAME,
 };
 use crate::remote::patch::{CopyCtl, CopyEvent, Pace};
 use crate::remote::{split_parent, Cancelled, CreateError, Created, Hashing, RemoteFs};
@@ -306,7 +307,7 @@ impl SftpRemote {
     }
 
     /// The filesystem ids of two paths' folders, where the server offers `statvfs@openssh.com`.
-    fn same_filesystem(&mut self, a: &str, b: &str) -> Option<bool> {
+    pub(super) fn same_filesystem(&mut self, a: &str, b: &str) -> Option<bool> {
         if !self.sftp.as_ref().is_some_and(|s| s.support_statvfs()) {
             return None;
         }
@@ -378,7 +379,17 @@ impl FileOps for SftpRemote {
             .lstat_opt(from)?
             .with_context(|| format!("{from}: no such file or directory"))?;
         if own.is_dir {
-            return Err(anyhow!(NoRename(REMOTE_FOLDER_RENAME.to_string())));
+            // One plain SSH_FXP_RENAME on the session's second channel (`sftp/rename.rs`); a
+            // link — one to a folder too, `lstat` says link — never goes that way.
+            return self.rename_folder(from, to);
+        }
+        if !own.is_symlink && !self.can_link() {
+            // A file is renamed only by a link: without one, a move copies, checks and removes
+            // (its copy published by the probed plain rename), and F2 says why.
+            return Err(anyhow!(NoRename(format!(
+                "this server does not offer hardlink@openssh.com, which sopen needs to rename \
+                 {from} without the risk of replacing {to}; nothing was changed"
+            ))));
         }
         let target = if own.is_symlink {
             // A link is made again at the new name (never a hard link to a link, whose meaning
@@ -443,8 +454,27 @@ impl FileOps for SftpRemote {
         }
     }
 
+    /// Only through the session's plain-rename channel.
     fn can_rename_dir(&self) -> bool {
-        false
+        self.has_plain()
+    }
+
+    fn can_publish(&self) -> bool {
+        self.can_link() || self.has_plain()
+    }
+
+    fn publish_probe(&mut self, dir: &str) -> Result<Vec<String>> {
+        if self.can_link() {
+            return Ok(Vec::new());
+        }
+        self.probe(dir)
+    }
+
+    fn publish_new(&mut self, temp: &str, target: &str) -> Result<Renamed> {
+        if self.can_link() {
+            return self.rename_new(temp, target);
+        }
+        self.publish_plain(temp, target)
     }
 
     /// `statvfs@openssh.com`'s `f_fsid`, where the server offers it.
@@ -465,6 +495,18 @@ impl FileOps for SftpRemote {
             META_TIMEOUT,
             fs.dir_builder().permissions(perms(0o700)).create(path),
         ));
+        match got {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(e)) => Err(self.made_or_taken(&format!("make the folder {path}"), path, e)),
+            Err(()) => changed(&format!("make the folder {path}"), Err(())),
+        }
+    }
+
+    /// `MKDIR` without attributes: the server makes it as `mkdir` would (OpenSSH: 0777 less its
+    /// umask).
+    fn make_folder(&mut self, path: &str) -> Result<()> {
+        let (rt, _, fs) = self.parts();
+        let got = rt.block_on(within(META_TIMEOUT, fs.dir_builder().create(path)));
         match got {
             Ok(Ok(())) => Ok(()),
             Ok(Err(e)) => Err(self.made_or_taken(&format!("make the folder {path}"), path, e)),

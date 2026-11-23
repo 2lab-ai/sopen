@@ -245,6 +245,8 @@ struct Faulty {
     no_pins: bool,
     /// How many sources were pinned.
     pinned: Arc<AtomicUsize>,
+    /// The Trash this layer has instead of its inner one's.
+    trash: Option<Box<dyn crate::remote::ops::Trash + Send>>,
 }
 
 impl Faulty {
@@ -274,6 +276,7 @@ impl Faulty {
             corrupt: false,
             no_pins: false,
             pinned: Arc::default(),
+            trash: None,
         }
     }
 }
@@ -403,6 +406,33 @@ impl FileOps for Faulty {
     }
     fn can_rename_dir(&self) -> bool {
         self.inner.can_rename_dir()
+    }
+    fn can_publish(&self) -> bool {
+        !self.no_link && self.inner.can_publish()
+    }
+    fn publish_probe(&mut self, dir: &str) -> anyhow::Result<Vec<String>> {
+        self.inner.publish_probe(dir)
+    }
+    /// The same hooks and record as [`Faulty::rename_new`]: a publish is a rename to them.
+    fn publish_new(&mut self, from: &str, to: &str) -> anyhow::Result<Renamed> {
+        if let Some(answer) = (self.rename)(from, to) {
+            return answer;
+        }
+        let done = self.inner.publish_new(from, to)?;
+        self.log(format!("rename:{from}->{to}"));
+        (self.renamed)(from, to);
+        Ok(done)
+    }
+    fn make_folder(&mut self, path: &str) -> anyhow::Result<()> {
+        self.inner.make_folder(path)?;
+        self.log(format!("mkdir:{path}"));
+        Ok(())
+    }
+    fn trash(&self) -> Option<&dyn crate::remote::ops::Trash> {
+        match &self.trash {
+            Some(trash) => Some(trash.as_ref()),
+            None => self.inner.trash(),
+        }
     }
     fn publish_mode(&mut self, dir: &str) -> anyhow::Result<(Publish, Vec<String>)> {
         self.inner.publish_mode(dir)
@@ -1907,8 +1937,8 @@ fn a_moved_source_gone_before_its_check_is_no_verified_move() {
 }
 
 /// K-C4 on a real server: `sftp-server -P hardlink` stops advertising `hardlink@openssh.com`
-/// (the "stand-in that hides it"), and copy and move there are refused before anything happens,
-/// with the reason.
+/// (the "stand-in that hides it"), and without the session's plain-rename channel copy and move
+/// there are refused before anything happens, with the reason (with it: the probe, below).
 #[test]
 fn k_c4_a_server_hiding_hardlink_refuses_copy_and_move() {
     let Some(mut fs) = SftpRemote::local_server_args(&["-P", "hardlink"], None) else {
@@ -4670,4 +4700,676 @@ fn a_link_replaced_before_its_mark_keeps_the_source() {
             "{how}"
         );
     });
+}
+
+// ---- S6: F7, F8 and SFTP's plain rename (04 §5.4–§5.6) ----
+
+/// A job on the folder `dir` itself (F7, F8).
+fn here(op: Op, dir: &Path, items: &[&str]) -> Job {
+    job(op, dir, items, dir)
+}
+
+/// The failure reason of a report's only item.
+fn only_failure(r: &Report) -> String {
+    match &r.items[..] {
+        [Item {
+            outcome: ItemOutcome::Failed(why),
+            ..
+        }] => why.clone(),
+        _ => panic!("not one failed item: {r:?}"),
+    }
+}
+
+/// The lines of a request log (`sftp-server -e -l INFO`) that hold every one of `words`.
+fn log_lines(text: &str, words: &[&str]) -> usize {
+    text.lines()
+        .filter(|l| words.iter().all(|w| l.contains(w)))
+        .count()
+}
+
+/// K-K1: F7 `new` makes the folder — with the mode `mkdir` gives, not a copy's 0700 — and F7
+/// `new` again is an error with nothing changed, as is a name a file holds; a name with `/` is
+/// refused before anything happens. On this machine and through `sftp-server`.
+#[test]
+fn k_k1_make_folder_then_the_same_name_again_is_an_error() {
+    both(|mut fs, how| {
+        let (_t, src, _dst) = scratch();
+        let r = run(
+            &here(Op::MakeDir, &src, &["new"]),
+            Hosts::Same(fs.as_mut()),
+            &mut Script::default(),
+        );
+        assert!(r.all_done(), "{how}: {r:?}");
+        assert!(src.join("new").is_dir(), "{how}");
+        std::fs::create_dir(src.join("by-mkdir")).unwrap();
+        assert_eq!(
+            mode(&src.join("new")),
+            mode(&src.join("by-mkdir")),
+            "{how}: the mode mkdir gives"
+        );
+        std::fs::write(src.join("new/inside"), "x").unwrap();
+        let r = run(
+            &here(Op::MakeDir, &src, &["new"]),
+            Hosts::Same(fs.as_mut()),
+            &mut Script::default(),
+        );
+        assert_eq!(only_failure(&r), "new exists", "{how}");
+        assert_eq!(names(&src.join("new")), ["inside"], "{how}");
+        std::fs::write(src.join("f"), "f").unwrap();
+        let r = run(
+            &here(Op::MakeDir, &src, &["f"]),
+            Hosts::Same(fs.as_mut()),
+            &mut Script::default(),
+        );
+        assert_eq!(only_failure(&r), "f exists", "{how}");
+        assert_eq!(std::fs::read(src.join("f")).unwrap(), b"f", "{how}");
+        let r = run(
+            &here(Op::MakeDir, &src, &["a/b"]),
+            Hosts::Same(fs.as_mut()),
+            &mut Script::default(),
+        );
+        assert!(refusal(&r).contains("'/'"), "{how}: {r:?}");
+        assert_eq!(names(&src), ["by-mkdir", "f", "new"], "{how}");
+    });
+}
+
+/// The folder K-D1 deletes: files, a subfolder two deep, a link to a file outside it, a link to
+/// a folder outside it and a dangling link. What lies outside is in `outside`.
+fn doomed(src: &Path, outside: &Path) -> PathBuf {
+    std::fs::write(outside.join("keep.txt"), "keep").unwrap();
+    std::fs::create_dir(outside.join("keepdir")).unwrap();
+    std::fs::write(outside.join("keepdir/k"), "k").unwrap();
+    let d = src.join("d");
+    std::fs::create_dir_all(d.join("sub/deeper")).unwrap();
+    std::fs::write(d.join("a"), "a").unwrap();
+    std::fs::write(d.join("sub/b"), "b").unwrap();
+    std::fs::write(d.join("sub/deeper/c"), "c").unwrap();
+    std::os::unix::fs::symlink(outside.join("keep.txt"), d.join("to-file")).unwrap();
+    std::os::unix::fs::symlink(outside.join("keepdir"), d.join("sub/to-dir")).unwrap();
+    std::os::unix::fs::symlink("nowhere", d.join("dangling")).unwrap();
+    d
+}
+
+/// What lies outside the doomed folder is untouched.
+fn outside_kept(outside: &Path, how: &str) {
+    assert_eq!(
+        std::fs::read(outside.join("keep.txt")).unwrap(),
+        b"keep",
+        "{how}"
+    );
+    assert_eq!(names(&outside.join("keepdir")), ["k"], "{how}");
+}
+
+/// K-D1 on a remote (through `sftp-server`, its request log): SFTP has no Trash, so
+/// [`trash_here`] says permanent, and a delete to the Trash is refused before anything happens;
+/// the permanent delete removes the folder and everything inside it bottom-up — `REMOVE` for
+/// files and links, `RMDIR` for each folder after its contents — a link (to a file, to a folder,
+/// dangling) as a link, its target untouched; a file and a link given as items too.
+#[test]
+fn k_d1_a_remote_folder_is_removed_bottom_up_links_as_links() {
+    let (_t, src, dst) = scratch();
+    let log = src.parent().unwrap().join("server.log");
+    let Some(mut fs) = logged_server(&log, &[]) else {
+        return;
+    };
+    assert!(
+        matches!(trash_here(&fs, &s(&src)), Deletes::Permanent(why) if why.contains("no Trash")),
+        "{:?}",
+        trash_here(&fs, &s(&src))
+    );
+    let d = doomed(&src, &dst);
+    std::fs::write(src.join("f"), "f").unwrap();
+    std::os::unix::fs::symlink(dst.join("keepdir"), src.join("l")).unwrap();
+    let r = run(
+        &here(Op::Delete { trash: true }, &src, &["d"]),
+        Hosts::Same(&mut fs),
+        &mut Script::default(),
+    );
+    assert!(refusal(&r).contains("Trash"), "{r:?}");
+    assert!(d.join("sub/deeper/c").exists());
+    let r = run(
+        &here(Op::Delete { trash: false }, &src, &["d", "f", "l"]),
+        Hosts::Same(&mut fs),
+        &mut Script::default(),
+    );
+    assert!(r.all_done(), "{r:?}");
+    assert_eq!(names(&src), Vec::<String>::new());
+    outside_kept(&dst, "sftp");
+    drop(fs);
+    let text = std::fs::read_to_string(&log).unwrap();
+    let at = |line: &str| {
+        text.find(line)
+            .unwrap_or_else(|| panic!("no {line:?} in\n{text}"))
+    };
+    let deepest = at(&format!("remove name \"{}\"", s(&d.join("sub/deeper/c"))));
+    let deeper = at(&format!("rmdir name \"{}\"", s(&d.join("sub/deeper"))));
+    let link = at(&format!("remove name \"{}\"", s(&d.join("sub/to-dir"))));
+    let sub = at(&format!("rmdir name \"{}\"", s(&d.join("sub"))));
+    let top = at(&format!("rmdir name \"{}\"", s(&d)));
+    assert!(
+        deepest < deeper && deeper < sub && link < sub && sub < top,
+        "{text}"
+    );
+    at(&format!("remove name \"{}\"", s(&src.join("l"))));
+    assert!(!text.contains("keepdir/k"), "never inside a link: {text}");
+    assert!(!text.contains("posix-rename"), "{text}");
+}
+
+/// K-D1 on this machine: F8 puts a file, a folder (whole) and a link (as a link) into the Trash —
+/// in tests a stand-in, never the owner's Trash: each is gone from its folder and there with
+/// what it held; [`trash_here`] says Trash.
+#[test]
+fn k_d1_a_local_file_goes_to_the_trash() {
+    let (_t, src, dst) = scratch();
+    std::fs::write(src.join("a.txt"), "bytes of a").unwrap();
+    let d = doomed(&src, &dst);
+    std::os::unix::fs::symlink("a.txt", src.join("l")).unwrap();
+    let mut fs = LocalFs::new();
+    assert_eq!(trash_here(&fs, &s(&src)), Deletes::Trash);
+    let r = run(
+        &here(Op::Delete { trash: true }, &src, &["a.txt", "d", "l"]),
+        Hosts::Same(&mut fs),
+        &mut Script::default(),
+    );
+    assert!(r.all_done(), "{r:?}");
+    assert_eq!(names(&src), Vec::<String>::new());
+    let trashed = |p: &Path| {
+        PathBuf::from(
+            LocalFs::trashed_by_tests(&s(p)).unwrap_or_else(|| panic!("{p:?} is not in the Trash")),
+        )
+    };
+    assert_eq!(
+        std::fs::read(trashed(&src.join("a.txt"))).unwrap(),
+        b"bytes of a"
+    );
+    let d_at = trashed(&d);
+    assert_eq!(std::fs::read(d_at.join("sub/deeper/c")).unwrap(), b"c");
+    let l_at = trashed(&src.join("l"));
+    assert_eq!(std::fs::read_link(&l_at).unwrap(), PathBuf::from("a.txt"));
+    outside_kept(&dst, "local");
+}
+
+/// A Trash that refuses: F8 then fails that item with the reason and removes nothing of it —
+/// never a permanent delete instead.
+#[test]
+fn a_trash_that_refuses_removes_nothing() {
+    struct Refusing;
+    impl crate::remote::ops::Trash for Refusing {
+        fn available(&self, _dir: &str) -> Result<(), String> {
+            Ok(())
+        }
+        fn put(&self, path: &str) -> anyhow::Result<String> {
+            Err(anyhow::anyhow!("the Trash refused {path} (a test's)"))
+        }
+    }
+    let (_t, src, dst) = scratch();
+    let d = doomed(&src, &dst);
+    std::fs::write(src.join("f"), "f").unwrap();
+    let mut fs = Faulty::new(Box::new(LocalFs::new()));
+    fs.trash = Some(Box::new(Refusing));
+    let r = run(
+        &here(Op::Delete { trash: true }, &src, &["d", "f"]),
+        Hosts::Same(&mut fs),
+        &mut Script::default(),
+    );
+    for (i, name) in ["d", "f"].iter().enumerate() {
+        assert_eq!(r.items[i].name, *name);
+        assert!(
+            matches!(&r.items[i].outcome, ItemOutcome::Failed(why)
+                if why.contains("the Trash refused") && why.contains("nothing")),
+            "{r:?}"
+        );
+    }
+    assert!(d.join("sub/deeper/c").exists());
+    assert_eq!(std::fs::read(src.join("f")).unwrap(), b"f");
+    let trace = fs.trace.lock().unwrap().clone();
+    assert!(
+        !trace
+            .iter()
+            .any(|t| t.starts_with("remove") || t.starts_with("rmdir")),
+        "{trace:?}"
+    );
+}
+
+/// Shift+F8 on this machine: permanent, bottom-up, a link to a file and one to a folder removed
+/// as links — never their targets — and nothing goes to the Trash.
+#[test]
+fn shift_f8_deletes_locally_without_the_trash() {
+    let (_t, src, dst) = scratch();
+    let d = doomed(&src, &dst);
+    let mut fs = Faulty::new(Box::new(LocalFs::new()));
+    let r = run(
+        &here(Op::Delete { trash: false }, &src, &["d"]),
+        Hosts::Same(&mut fs),
+        &mut Script::default(),
+    );
+    assert!(r.all_done(), "{r:?}");
+    assert_eq!(names(&src), Vec::<String>::new());
+    outside_kept(&dst, "local");
+    assert_eq!(LocalFs::trashed_by_tests(&s(&d)), None);
+    let trace = fs.trace.lock().unwrap().clone();
+    let at = |e: String| {
+        trace
+            .iter()
+            .position(|t| *t == e)
+            .unwrap_or_else(|| panic!("no {e} in {trace:?}"))
+    };
+    let c = at(format!("remove:{}", s(&d.join("sub/deeper/c"))));
+    let deeper = at(format!("rmdir:{}", s(&d.join("sub/deeper"))));
+    let link = at(format!("remove:{}", s(&d.join("sub/to-dir"))));
+    let sub = at(format!("rmdir:{}", s(&d.join("sub"))));
+    let top = at(format!("rmdir:{}", s(&d)));
+    assert!(
+        c < deeper && deeper < sub && link < sub && sub < top,
+        "{trace:?}"
+    );
+}
+
+/// A permanent delete that cannot remove everything — a read-only subfolder's entry — removes
+/// what it can and keeps the rest with its folders: the item fails, each entry kept has a line
+/// with the reason. On this machine and through `sftp-server`.
+#[test]
+fn a_delete_keeps_what_it_cannot_remove_and_lists_it() {
+    // SAFETY: geteuid has no preconditions.
+    if unsafe { libc::geteuid() } == 0 {
+        eprintln!("skipping: root ignores a read-only folder");
+        return;
+    }
+    both(|mut fs, how| {
+        let (_t, src, _dst) = scratch();
+        let d = src.join("d");
+        std::fs::create_dir_all(d.join("locked")).unwrap();
+        std::fs::write(d.join("free.txt"), "free").unwrap();
+        std::fs::write(d.join("locked/x"), "x").unwrap();
+        set_mode(&d.join("locked"), 0o500);
+        let r = run(
+            &here(Op::Delete { trash: false }, &src, &["d"]),
+            Hosts::Same(fs.as_mut()),
+            &mut Script::default(),
+        );
+        set_mode(&d.join("locked"), 0o700);
+        assert_eq!(r.items[0].name, "d", "{how}: {r:?}");
+        assert!(
+            matches!(&r.items[0].outcome, ItemOutcome::Failed(why) if why.contains("stay")),
+            "{how}: {r:?}"
+        );
+        assert!(
+            r.items
+                .iter()
+                .any(|i| i.name == "d/locked/x" && matches!(i.outcome, ItemOutcome::Failed(_))),
+            "{how}: {r:?}"
+        );
+        assert_eq!(names(&d), ["locked"], "{how}: free.txt went");
+        assert_eq!(names(&d.join("locked")), ["x"], "{how}");
+    });
+}
+
+/// Esc at a delete's first item: nothing of it is removed, and the items after it are not
+/// reached.
+#[test]
+fn esc_stops_a_delete_between_items() {
+    let (_t, src, _dst) = scratch();
+    std::fs::write(src.join("a"), "a").unwrap();
+    std::fs::write(src.join("b"), "b").unwrap();
+    let mut ctl = Script {
+        stop_when: Some("deleting"),
+        ..Script::default()
+    };
+    let r = run(
+        &here(Op::Delete { trash: false }, &src, &["a", "b"]),
+        Hosts::Same(&mut LocalFs::new()),
+        &mut ctl,
+    );
+    assert!(stop_reason(&r.items[0]).contains("nothing"), "{r:?}");
+    assert_eq!(r.items[1], item("b", ItemOutcome::NotReached));
+    assert_eq!(names(&src), ["a", "b"]);
+}
+
+/// Esc inside a folder being deleted permanently: it stops between entries — what was removed
+/// stays removed, the rest stays with its folder — and the item says it is partly deleted.
+#[test]
+fn esc_inside_a_folder_leaves_it_partly_deleted() {
+    let (_t, src, _dst) = scratch();
+    let d = src.join("d");
+    std::fs::create_dir(&d).unwrap();
+    for name in ["a", "b", "c"] {
+        std::fs::write(d.join(name), name).unwrap();
+    }
+    let mut ctl = Script::default();
+    let esc = ctl.cancel.clone();
+    let mut fs = Faulty::new(Box::new(LocalFs::new()));
+    // Esc is pressed while the first entry is being removed.
+    fs.fault = Box::new(move |op, _| {
+        if op == "remove" {
+            esc.store(true, Ordering::Relaxed);
+        }
+        None
+    });
+    let r = run(
+        &here(Op::Delete { trash: false }, &src, &["d"]),
+        Hosts::Same(&mut fs),
+        &mut ctl,
+    );
+    let why = stop_reason(&r.items[0]);
+    assert!(
+        why.contains("partly deleted") && why.contains("1 of its entries"),
+        "{why}"
+    );
+    assert_eq!(names(&d).len(), 2);
+}
+
+/// K-N1 for a remote folder from S6, through `sftp-server` and the session's plain-rename
+/// channel (both request logs): F2 renames it with one plain `SSH_FXP_RENAME`; onto an existing
+/// name — a folder, a file, a dangling link — an error, both left; F2 of a link onto a name a
+/// dangling link holds: an error, the dangling link kept, and no `SSH_FXP_RENAME` sent for it.
+/// Never `posix-rename@openssh.com`.
+#[test]
+fn k_n1_a_remote_folder_renames_by_one_plain_rename() {
+    let (_t, src, _dst) = scratch();
+    let root = src.parent().unwrap().to_path_buf();
+    let (log, plain_log) = (root.join("server.log"), root.join("plain.log"));
+    let Some(mut sftp) = logged_server(&log, &[]) else {
+        return;
+    };
+    let Some(plain) = SftpRemote::seam_plain(&[], Some(&plain_log), false) else {
+        return;
+    };
+    std::fs::create_dir(src.join("d")).unwrap();
+    std::fs::write(src.join("d/x"), "x").unwrap();
+    std::fs::create_dir(src.join("taken")).unwrap();
+    std::fs::write(src.join("taken/keep"), "keep").unwrap();
+    std::fs::write(src.join("f"), "f").unwrap();
+    std::os::unix::fs::symlink("nowhere", src.join("dl")).unwrap();
+    std::os::unix::fs::symlink("x", src.join("ln")).unwrap();
+    let rename = |from: &str, to: &str| job(Op::Rename { to: to.into() }, &src, &[from], &src);
+    let ino_d = ino(&src.join("d"));
+    let r = run(
+        &rename("d", "e"),
+        Hosts::Same(&mut sftp),
+        &mut Script::default(),
+    );
+    assert!(r.all_done(), "{r:?}");
+    assert_eq!(ino(&src.join("e")), ino_d, "renamed, not copied");
+    assert_eq!(names(&src.join("e")), ["x"]);
+    for onto in ["taken", "f", "dl"] {
+        let r = run(
+            &rename("e", onto),
+            Hosts::Same(&mut sftp),
+            &mut Script::default(),
+        );
+        assert_eq!(only_failure(&r), format!("{onto} exists"));
+    }
+    let r = run(
+        &rename("ln", "dl"),
+        Hosts::Same(&mut sftp),
+        &mut Script::default(),
+    );
+    assert_eq!(only_failure(&r), "dl exists");
+    assert_eq!(names(&src), ["dl", "e", "f", "ln", "taken"]);
+    assert_eq!(names(&src.join("taken")), ["keep"]);
+    assert_eq!(std::fs::read(src.join("f")).unwrap(), b"f");
+    assert_eq!(
+        std::fs::read_link(src.join("dl")).unwrap(),
+        PathBuf::from("nowhere")
+    );
+    assert_eq!(
+        std::fs::read_link(src.join("ln")).unwrap(),
+        PathBuf::from("x")
+    );
+    drop(sftp);
+    drop(plain);
+    let main = std::fs::read_to_string(&log).unwrap();
+    let plain = std::fs::read_to_string(&plain_log).unwrap();
+    eprintln!("main:\n{main}\nplain:\n{plain}");
+    assert_eq!(log_lines(&plain, &["rename old"]), 4, "{plain}");
+    assert_eq!(log_lines(&plain, &["rename old", "/ln\""]), 0, "{plain}");
+    assert!(!main.contains("rename old"), "{main}");
+    assert!(!main.contains("posix-rename") && !plain.contains("posix-rename"));
+}
+
+/// K-M1 for a remote folder from S6: F6 within one filesystem is one plain `SSH_FXP_RENAME` —
+/// the folder keeps its inode, nothing is copied or removed — and a folder name in the way asks
+/// (Skip leaves both); never `posix-rename@openssh.com`.
+#[test]
+fn k_m1_a_remote_folder_moves_by_one_plain_rename() {
+    let (_t, src, dst) = scratch();
+    let root = src.parent().unwrap().to_path_buf();
+    let (log, plain_log) = (root.join("server.log"), root.join("plain.log"));
+    let Some(mut fs) = logged_server(&log, &[]) else {
+        return;
+    };
+    let Some(plain) = SftpRemote::seam_plain(&[], Some(&plain_log), false) else {
+        return;
+    };
+    std::fs::create_dir_all(src.join("d/sub")).unwrap();
+    std::fs::write(src.join("d/sub/c"), "c").unwrap();
+    std::fs::create_dir(src.join("e")).unwrap();
+    std::fs::create_dir(dst.join("e")).unwrap();
+    let before = ino(&src.join("d"));
+    let mut ctl = Script::answers([reply(Answer::Skip)]);
+    let r = run(
+        &job(Op::Move, &src, &["d", "e"], &dst),
+        Hosts::Same(&mut fs),
+        &mut ctl,
+    );
+    assert_eq!(
+        r.items,
+        vec![
+            item("d", ItemOutcome::Done),
+            item("e", ItemOutcome::Skipped)
+        ]
+    );
+    assert_eq!(ino(&dst.join("d")), before);
+    assert_eq!(std::fs::read(dst.join("d/sub/c")).unwrap(), b"c");
+    assert_eq!(names(&src), ["e"]);
+    drop(fs);
+    drop(plain);
+    let main = std::fs::read_to_string(&log).unwrap();
+    let plain = std::fs::read_to_string(&plain_log).unwrap();
+    assert_eq!(log_lines(&plain, &["rename old"]), 1, "{plain}");
+    for word in [
+        "hardlink old",
+        "remove name",
+        "rmdir name",
+        "mkdir name",
+        "rename old",
+    ] {
+        assert!(!main.contains(word), "{word}: {main}");
+    }
+    assert!(!main.contains("posix-rename") && !plain.contains("posix-rename"));
+}
+
+/// K-C4 on a real server without `hardlink@openssh.com` (`sftp-server -P hardlink`), from S6,
+/// with the session's plain-rename channel (to the same server): the server's rename is probed
+/// once per session — `MKDIR` of `.sopen-probe-…`, two exclusive creates, one plain
+/// `SSH_FXP_RENAME` answered with status 4, the read-back, two `REMOVE`, one `RMDIR` — and each
+/// temp is published by one plain `SSH_FXP_RENAME`; a name in the way still asks (before the
+/// copy, and at its publish); no `.sopen-probe-` entry is left; a move in the same session is a
+/// copy, a check and a removal published the same way, without a second probe.
+#[test]
+fn k_c4_without_hardlink_publishes_through_the_probed_plain_rename() {
+    let (_t, src, dst) = scratch();
+    let root = src.parent().unwrap().to_path_buf();
+    let (log, plain_log) = (root.join("server.log"), root.join("plain.log"));
+    let Some(sftp) = logged_server(&log, &["-P", "hardlink"]) else {
+        return;
+    };
+    assert!(!sftp.can_link(), "-P hides the extension");
+    let Some(plain) = SftpRemote::seam_plain(&["-P", "hardlink"], Some(&plain_log), false) else {
+        return;
+    };
+    for name in ["a", "b", "c", "m"] {
+        std::fs::write(src.join(name), format!("source {name}")).unwrap();
+    }
+    std::fs::write(dst.join("c"), "theirs c").unwrap();
+    // `b`'s name is taken at its publish, between its copy and the rename.
+    let mut fs = Faulty::new(Box::new(sftp));
+    let taken_b = s(&dst.join("b"));
+    fs.rename = Box::new(move |_, to| {
+        if to == taken_b && !Path::new(&taken_b).exists() {
+            std::fs::write(&taken_b, "theirs b").unwrap();
+        }
+        None
+    });
+    // `b` is asked about at its publish, `c` before its copy.
+    let mut ctl = Script::answers([
+        reply(Answer::Rename("b-1".into())),
+        reply(Answer::Rename("c-1".into())),
+    ]);
+    let r = run(
+        &job(Op::Copy, &src, &["a", "b", "c"], &dst),
+        Hosts::Same(&mut fs),
+        &mut ctl,
+    );
+    assert_eq!(
+        r.items,
+        vec![
+            item("a", ItemOutcome::Done),
+            item("b", ItemOutcome::Renamed("b-1".into())),
+            item("c", ItemOutcome::Renamed("c-1".into())),
+        ],
+        "{r:?}"
+    );
+    assert_eq!(ctl.asked.len(), 2, "{:?}", ctl.asked);
+    assert_eq!(std::fs::read(dst.join("b")).unwrap(), b"theirs b");
+    assert_eq!(std::fs::read(dst.join("c")).unwrap(), b"theirs c");
+    assert_eq!(std::fs::read(dst.join("b-1")).unwrap(), b"source b");
+    assert_eq!(std::fs::read(dst.join("c-1")).unwrap(), b"source c");
+    let r = run(
+        &job(Op::Move, &src, &["m"], &dst),
+        Hosts::Same(&mut fs),
+        &mut Script::default(),
+    );
+    assert!(r.all_done(), "{r:?}");
+    assert_eq!(std::fs::read(dst.join("m")).unwrap(), b"source m");
+    assert_eq!(names(&src), ["a", "b", "c"]);
+    assert_eq!(temps(&dst), Vec::<String>::new());
+    drop(fs);
+    drop(plain);
+    let main = std::fs::read_to_string(&log).unwrap();
+    let plain = std::fs::read_to_string(&plain_log).unwrap();
+    eprintln!("main:\n{main}\nplain:\n{plain}");
+    let probe = ".sopen-probe-";
+    assert_eq!(log_lines(&main, &["mkdir name", probe]), 1, "{main}");
+    assert_eq!(
+        log_lines(&main, &["open", probe, "CREATE,EXCL"]),
+        2,
+        "{main}"
+    );
+    assert_eq!(log_lines(&main, &["remove name", probe]), 2, "{main}");
+    assert_eq!(log_lines(&main, &["rmdir name", probe]), 1, "{main}");
+    assert_eq!(log_lines(&plain, &["rename old", probe]), 1, "{plain}");
+    let after_probe = plain
+        .lines()
+        .skip_while(|l| !(l.contains("rename old") && l.contains(probe)))
+        .nth(1)
+        .unwrap_or_default();
+    assert!(after_probe.contains("sent status Failure"), "{plain}");
+    // a, b (refused at its publish), b-1, c-1 and m.
+    assert_eq!(log_lines(&plain, &["rename old", ".sopen-"]), 6, "{plain}");
+    assert!(!main.contains("rename old"), "{main}");
+    assert!(!main.contains("posix-rename") && !plain.contains("posix-rename"));
+}
+
+/// K-C4's other half: the same server behind a tap that answers the probe's rename as done, as
+/// a server whose plain rename replaces would: the copy is refused with the reason, nothing
+/// written over and nothing staged, no `.sopen-probe-` entry left — and every later copy of the
+/// session is refused the same, without a second probe.
+#[test]
+fn k_c4_a_server_whose_plain_rename_replaces_is_refused() {
+    let (_t, src, dst) = scratch();
+    let log = src.parent().unwrap().join("server.log");
+    let Some(mut fs) = logged_server(&log, &["-P", "hardlink"]) else {
+        return;
+    };
+    let Some(plain) = SftpRemote::seam_plain(&["-P", "hardlink"], None, true) else {
+        return;
+    };
+    std::fs::write(src.join("a"), "source a").unwrap();
+    std::fs::write(src.join("b"), "source b").unwrap();
+    std::fs::write(dst.join("z"), "theirs").unwrap();
+    for name in ["a", "b"] {
+        let r = run(
+            &job(Op::Copy, &src, &[name], &dst),
+            Hosts::Same(&mut fs),
+            &mut Script::default(),
+        );
+        let why = only_failure(&r);
+        assert!(
+            why.contains("plain rename replaces an existing name"),
+            "{name}: {why}"
+        );
+    }
+    assert_eq!(names(&dst), ["z"]);
+    assert_eq!(std::fs::read(dst.join("z")).unwrap(), b"theirs");
+    assert_eq!(names(&src), ["a", "b"]);
+    drop(fs);
+    drop(plain);
+    let main = std::fs::read_to_string(&log).unwrap();
+    assert_eq!(
+        log_lines(&main, &["mkdir name", ".sopen-probe-"]),
+        1,
+        "{main}"
+    );
+    assert_eq!(
+        log_lines(&main, &["rmdir name", ".sopen-probe-"]),
+        1,
+        "{main}"
+    );
+    assert_eq!(
+        log_lines(&main, &["open", "/.a.sopen-"]),
+        0,
+        "nothing staged: {main}"
+    );
+    assert_eq!(
+        log_lines(&main, &["open", "/.b.sopen-"]),
+        0,
+        "nothing staged: {main}"
+    );
+}
+
+/// A probe that cannot run (here the target folder is read-only, so its `MKDIR` is refused)
+/// refuses that copy with the reason and records nothing: the next copy of the session probes
+/// again, and publishes.
+#[test]
+fn a_probe_that_cannot_run_refuses_the_copy_and_is_tried_again() {
+    // SAFETY: geteuid has no preconditions.
+    if unsafe { libc::geteuid() } == 0 {
+        eprintln!("skipping: root ignores a read-only folder");
+        return;
+    }
+    let (_t, src, dst) = scratch();
+    let log = src.parent().unwrap().join("server.log");
+    let Some(mut fs) = logged_server(&log, &["-P", "hardlink"]) else {
+        return;
+    };
+    let Some(plain) = SftpRemote::seam_plain(&["-P", "hardlink"], None, false) else {
+        return;
+    };
+    std::fs::write(src.join("a"), "source a").unwrap();
+    set_mode(&dst, 0o500);
+    let r = run(
+        &job(Op::Copy, &src, &["a"], &dst),
+        Hosts::Same(&mut fs),
+        &mut Script::default(),
+    );
+    set_mode(&dst, 0o700);
+    let why = only_failure(&r);
+    assert!(why.contains("probe") && why.contains("could not"), "{why}");
+    assert_eq!(names(&dst), Vec::<String>::new());
+    let r = run(
+        &job(Op::Copy, &src, &["a"], &dst),
+        Hosts::Same(&mut fs),
+        &mut Script::default(),
+    );
+    assert!(r.all_done(), "{r:?}");
+    assert_eq!(std::fs::read(dst.join("a")).unwrap(), b"source a");
+    drop(fs);
+    drop(plain);
+    let main = std::fs::read_to_string(&log).unwrap();
+    assert_eq!(
+        log_lines(&main, &["mkdir name", ".sopen-probe-"]),
+        2,
+        "{main}"
+    );
 }

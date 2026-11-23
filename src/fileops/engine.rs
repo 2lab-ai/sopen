@@ -6,7 +6,8 @@
 //! a rename that never replaces ([`FileOps::rename_new`]); or it is not there at all. A folder is
 //! walked as it was when its copy began, so nothing made by the copy is copied again. A move
 //! removes a source only after its whole item is copied and checked, re-checking each file right
-//! before its removal.
+//! before its removal. Make folder and delete ([`Op::MakeDir`], [`Op::Delete`]) are items of
+//! their own (`make_dir.rs`, `delete.rs`).
 
 use super::{Answer, Clash, Control, Hosts, Item, ItemOutcome, Job, Op, Progress, Report, STOPPED};
 use crate::remote::ops::{
@@ -65,10 +66,12 @@ pub(super) fn advance_clock(by: std::time::Duration) {
 /// Highest `-N` suffix tried for a free name.
 const MAX_SUFFIX: u32 = 10_000;
 
-/// Why copy and move refuse a server without `hardlink@openssh.com` (04 §5.6).
+/// Why copy and move refuse a server without `hardlink@openssh.com` where the connection has no
+/// channel for SFTP's plain rename either (04 §5.6).
 const NO_LINK: &str = "this server does not offer hardlink@openssh.com, which sopen needs to put \
-    a copy under its name without the risk of replacing anything there; copy and move to it come \
-    with slice S6";
+    a copy under its name without the risk of replacing anything there, and this connection has \
+    no channel for SFTP's plain rename, which could take its place once the server's rename is \
+    probed";
 
 /// A report for a job refused before anything happened: every item not reached, the reason
 /// its first note.
@@ -512,6 +515,19 @@ impl Engine<'_, '_, '_> {
                     return Err("a rename is of one entry".into());
                 }
             }
+            Op::MakeDir => {
+                if job.names.len() != 1 {
+                    return Err("a new folder is one name".into());
+                }
+            }
+            Op::Delete { trash } => {
+                if *trash && self.ends.src().trash().is_none() {
+                    return Err(
+                        "there is no Trash on this host (SFTP has none); nothing was removed"
+                            .into(),
+                    );
+                }
+            }
             Op::Copy | Op::Move => {
                 let dir = &job.dst_dir;
                 match self.ends.dst().stat_opt(dir) {
@@ -520,7 +536,7 @@ impl Engine<'_, '_, '_> {
                     Ok(None) => return Err(format!("{dir}: no such folder")),
                     Err(e) => return Err(format!("{e:#}")),
                 }
-                if !self.ends.dst().can_link() {
+                if !self.ends.dst().can_publish() {
                     return Err(NO_LINK.into());
                 }
                 if self.ends.same() {
@@ -740,6 +756,37 @@ impl Engine<'_, '_, '_> {
             }
             Op::Copy => self.transfer(name, false),
             Op::Move => self.transfer(name, true),
+            Op::MakeDir => {
+                self.verb = "making";
+                self.progress(name, 0, 0);
+                let dir = self.job.src_dir.clone();
+                (super::make_dir::make(self.ends.src(), &dir, name), Flow::Go)
+            }
+            Op::Delete { trash } => {
+                let trash = *trash;
+                self.verb = "deleting";
+                let Self {
+                    job,
+                    ends,
+                    ctl,
+                    cancel,
+                    lines,
+                    item,
+                    ..
+                } = self;
+                let mut deleting = super::delete::Deleting {
+                    fs: ends.src(),
+                    ctl: &mut **ctl,
+                    cancel: cancel.as_ref(),
+                    item: *item,
+                    items: job.names.len(),
+                    lines,
+                };
+                match deleting.item(&job.src_dir, name, trash) {
+                    (outcome, false) => (outcome, Flow::Go),
+                    (outcome, true) => (outcome, Flow::Stop),
+                }
+            }
         }
     }
 
@@ -1084,6 +1131,12 @@ impl Engine<'_, '_, '_> {
         };
         let pin = self.pin_source(from, id.as_ref());
         let in_place = self.publish_in(dir) == Publish::InPlace;
+        // Over SFTP without `hardlink@`: the server's plain rename is probed (once per session)
+        // before anything is staged, so a server that replaces gets nothing (04 §5.6).
+        match self.ends.dst().publish_probe(dir) {
+            Ok(notes) => self.report.notes.extend(notes),
+            Err(e) => return Placed::Failed(format!("{e:#}; nothing of {shown} was copied")),
+        }
         let nothing = || "nothing of it was copied (what was written went again)".to_string();
         let (temp, staged, read) = loop {
             let temp = if in_place {
@@ -1142,7 +1195,7 @@ impl Engine<'_, '_, '_> {
         } else {
             loop {
                 let target = join(dir, &want);
-                match self.ends.dst().rename_new(&temp, &target) {
+                match self.ends.dst().publish_new(&temp, &target) {
                     Ok(left) => {
                         // The copy's notes (a mode or times not kept) name the file it now is;
                         // the publish's (its temp left as a second name) name the temp.
@@ -1769,6 +1822,14 @@ impl Engine<'_, '_, '_> {
         let mut nodes = Vec::new();
         if let Err(why) = self.walk(from, "", &mut nodes) {
             return (ItemOutcome::Failed(why), Flow::Go);
+        }
+        // A server whose files cannot be published gets no folder either (04 §5.6).
+        match self.ends.dst().publish_probe(dst_dir) {
+            Ok(notes) => self.report.notes.extend(notes),
+            Err(e) => {
+                let why = format!("{e:#}; nothing of {name} was copied");
+                return (ItemOutcome::Failed(why), Flow::Go);
+            }
         }
         loop {
             match self.ends.dst().make_dir(&join(dst_dir, &want)) {

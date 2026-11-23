@@ -4,7 +4,9 @@
 //! `sftp/ops.rs` and for [`LocalFs`](super::LocalFs) in `local/ops.rs` — submodules, which see
 //! their parent's private fields — so [`RemoteFs`] and its write algorithm stay as they are (02
 //! §5). Nothing runs on the remote: no `cp`, `mv` or `rm` over ssh. S1-C writes them; S6-A adds
-//! the plain rename.
+//! F7's folder, the local [`Trash`], and SFTP's plain rename (a remote folder's rename and move,
+//! and a copy's publish where the server has no `hardlink@openssh.com`, after the server's rename
+//! is probed: [`FileOps::publish_probe`], [`FileOps::publish_new`]).
 //!
 //! "Is a name taken?" is the filesystem's answer, never a comparison of strings (04 §5.2): an
 //! exclusive create, a link or an exclusive rename that fails while the name exists is
@@ -274,9 +276,23 @@ pub(crate) fn set_seam(
     SeamGuard::new(move || slot.with(|s| *s.borrow_mut() = None))
 }
 
-/// Why a remote folder is not renamed before slice S6 (04 §5.3, §5.6).
+/// Why a remote folder is not renamed where the session has no plain-rename channel (04 §5.3,
+/// §5.6): before slice S6, and wherever that second channel is not there.
 pub const REMOTE_FOLDER_RENAME: &str = "renaming a folder on a remote needs SFTP's plain \
     rename, which sopen cannot send yet (it comes with slice S6); nothing was changed";
+
+/// The system Trash of this machine (04 §5.5): macOS's through `NSFileManager`, the freedesktop
+/// Trash elsewhere (`remote/local/trash.rs`). A trait, so that tests reach a stand-in and never
+/// the owner's Trash.
+pub trait Trash: Sync {
+    /// Whether an entry of the folder `dir` can go to the Trash; `Err` says why not (the delete
+    /// dialog then says `permanent — no Trash here` before anything is removed).
+    fn available(&self, dir: &str) -> std::result::Result<(), String>;
+
+    /// Moves the entry `path` itself — a link as a link, a folder with everything inside it —
+    /// into the Trash, never over anything there; where it is now. A failure removed nothing.
+    fn put(&self, path: &str) -> Result<String>;
+}
 
 /// The file-operation primitives of one host. [`RemoteFs`] is its supertrait, so one connection
 /// (a `Box<dyn FileOps + Send>`, an operation's own, 04 §5.1) serves both the stats and transfers
@@ -331,11 +347,45 @@ pub trait FileOps: RemoteFs {
         true
     }
 
+    /// Whether a staged copy can get its name here without the risk of replacing anything:
+    /// by a link ([`RemoteFs::can_link`]), or over SFTP without `hardlink@openssh.com` by the
+    /// plain rename once [`FileOps::publish_probe`] has found that it refuses (04 §5.6).
+    fn can_publish(&self) -> bool {
+        self.can_link()
+    }
+
+    /// Before a copy into the folder `dir` is staged (04 §5.6, "copy within one host"): where
+    /// the publish needs SFTP's plain rename, the server's rename is probed once per session —
+    /// `Err` (the reason) when it replaces, which is kept for the session, or when the probe
+    /// could not run, which is not. `Ok` with what the report must hear (a probe entry left).
+    /// Nothing to do where the publish is a link.
+    fn publish_probe(&mut self, _dir: &str) -> Result<Vec<String>> {
+        Ok(Vec::new())
+    }
+
+    /// Gives a staged copy `temp` its final name `target`, never replacing: [`Taken`] when the
+    /// name exists. [`FileOps::rename_new`] (a link, or the exclusive rename) except over SFTP
+    /// without `hardlink@openssh.com`, where it is the plain rename that
+    /// [`FileOps::publish_probe`] proved refuses an existing name.
+    fn publish_new(&mut self, temp: &str, target: &str) -> Result<Renamed> {
+        self.rename_new(temp, target)
+    }
+
     /// Makes the folder `path` (mode 0700 until its contents are in, 04 §5.1): [`Taken`] when
     /// the name exists.
     fn make_dir(&mut self, path: &str) -> Result<()>;
 
-    /// Removes the empty folder `path`.
+    /// F7 (04 §5.4): makes the folder `path` as `mkdir` does — the default mode, 0777 less the
+    /// umask (over SFTP the server's) — never over an existing name: [`Taken`] when it exists.
+    fn make_folder(&mut self, path: &str) -> Result<()>;
+
+    /// The Trash an entry here can go to (F8, 04 §5.5): this machine's; `None` on a remote
+    /// (SFTP has none), where a delete is permanent.
+    fn trash(&self) -> Option<&dyn Trash> {
+        None
+    }
+
+    /// Removes the empty folder `path` (`RMDIR`, `rmdir`).
     fn remove_dir(&mut self, path: &str) -> Result<()>;
 
     /// The target of the symbolic link `path`, as stored.
