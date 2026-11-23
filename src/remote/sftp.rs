@@ -59,6 +59,9 @@ pub struct SftpRemote {
     fs: Option<Fs>,
     /// What the session's request pipe has taken (`sftp/writes.rs`).
     writes: Arc<Writes>,
+    /// The second `sftp` channel of the same master, for SFTP's plain rename (`sftp/rename.rs`,
+    /// 04 §5.6): opened when a folder rename or a publish without `hardlink@` first needs it.
+    plain: rename::Slot,
     /// Stat requests sopen sent (tests: a listing must not stat every name).
     #[cfg(test)]
     stats: u64,
@@ -294,11 +297,14 @@ impl SftpRemote {
             .context("cannot start the async runtime")?;
         // `resume` attaches to our master and never tears it down on drop; closing the session
         // closes only the sftp channel (`Session::from_session` would `-O exit` the shared master).
-        let session = openssh::Session::resume(config.control_path.into_boxed_path(), None);
+        let session = Arc::new(openssh::Session::resume(
+            config.control_path.into_boxed_path(),
+            None,
+        ));
         let writes = Arc::new(Writes::default());
         let started = rt.block_on(within(
             META_TIMEOUT,
-            start_sftp(Arc::new(session), writes.clone()),
+            start_sftp(session.clone(), writes.clone()),
         ));
         let sftp = match started {
             Ok(r) => r.map_err(|e| anyhow!("cannot start sftp on {}: {e:#}", spec.label()))?,
@@ -323,6 +329,7 @@ impl SftpRemote {
             sftp: Some(sftp),
             fs: Some(fs),
             writes,
+            plain: rename::Slot::over(session),
             #[cfg(test)]
             stats: 0,
             #[cfg(test)]
@@ -1390,6 +1397,8 @@ impl SftpRemote {
             sftp: Some(sftp),
             fs: Some(fs),
             writes,
+            // No second channel unless a test gives one (`SftpRemote::with_local_plain`).
+            plain: rename::Slot::none(),
             stats: 0,
             fail_chunk: None,
         })
@@ -1674,6 +1683,7 @@ mod tests {
             sftp: Some(sftp),
             fs: Some(fs),
             writes,
+            plain: rename::Slot::none(),
             stats: 0,
             fail_chunk: None,
         };

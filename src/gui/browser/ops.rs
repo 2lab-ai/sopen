@@ -1249,6 +1249,9 @@ enum Bin {
     Remote(String),
     /// This machine has no Trash for the folder.
     NoTrashHere,
+    /// Whether this machine has a Trash for the folder is still being asked (on a worker, not
+    /// the window's thread): nothing can be deleted until the answer fills the line in.
+    Checking,
 }
 
 impl Bin {
@@ -1259,6 +1262,7 @@ impl Bin {
             Bin::Asked => "permanent".to_string(),
             Bin::Remote(host) => format!("permanent — no Trash on {host}"),
             Bin::NoTrashHere => "permanent — no Trash here".to_string(),
+            Bin::Checking => "checking the Trash…".to_string(),
         }
     }
 
@@ -1316,6 +1320,9 @@ pub struct DeleteDialog {
     bin: Bin,
     /// A link is among them: it goes as a link.
     link: bool,
+    /// While [`Bin::Checking`]: the check's number, which its answer must carry
+    /// ([`Ops::trash_checked`]).
+    check: Option<u64>,
     keyboard: Keyboard,
 }
 
@@ -1354,6 +1361,7 @@ impl DeleteDialog {
             question: delete_question(&entries),
             link: entries.iter().any(|e| e.link),
             bin,
+            check: None,
             keyboard: Keyboard::default(),
         })
     }
@@ -1373,6 +1381,8 @@ impl DeleteDialog {
             let line = self.bin.line();
             if self.bin == Bin::Trash {
                 ui.label(line);
+            } else if self.bin == Bin::Checking {
+                ui.label(RichText::new(line).weak());
             } else {
                 let color = ui.visuals().error_fg_color;
                 crate::gui::disclosures(ui, &[(line, color)]);
@@ -1382,8 +1392,9 @@ impl DeleteDialog {
                 ui.label(RichText::new(rule).weak());
             }
             ui.add_space(chrome::CELL.y / 2.0);
+            let checking = self.bin == Bin::Checking;
             ui.horizontal(|ui| {
-                let ok = ui.button("Delete");
+                let ok = ui.add_enabled(!checking, egui::Button::new("Delete"));
                 let no = ui.button("Cancel");
                 self.keyboard.laid(&ok);
                 self.keyboard.laid(&no);
@@ -1394,7 +1405,7 @@ impl DeleteDialog {
         });
         if cancel || modal.backdrop_response.clicked() {
             Some(CopyEnd::Cancel)
-        } else if go {
+        } else if go && self.bin != Bin::Checking {
             Some(CopyEnd::Start(Job::Delete {
                 dir: self.dir.clone(),
                 names: self.names.clone(),
@@ -1439,8 +1450,8 @@ pub struct Rename {
 
 impl Rename {
     /// On the bar's entry of `panel` (its folder on `host`). `Err` is for the status row: `..`,
-    /// a name that is not UTF-8, or a folder on a remote — SFTP's plain rename, which renaming one
-    /// needs, comes with slice S6; until then F2 says so and does nothing (04 §5.3).
+    /// or a name that is not UTF-8. A folder on a remote is renamed by SFTP's plain rename (S6,
+    /// 04 §5.6); where its channel cannot be opened, the engine's reason is the field's error.
     pub fn open(panel: &Panel, host: Option<&str>) -> Result<Self, String> {
         let Some(entry) = panel.current() else {
             return Err("nothing to rename".to_string());
@@ -1452,12 +1463,6 @@ impl Rename {
             return Err(nothing_to("Rename", panel));
         }
         let folder = entry.kind == EntryKind::Dir && !entry.link;
-        if let (Some(host), true) = (host, folder) {
-            return Err(format!(
-                "{}: sopen cannot rename a folder on {host} yet; nothing changed",
-                entry.name
-            ));
-        }
         Ok(Self {
             dir: OpsTarget {
                 host: host.map(str::to_string),
@@ -1570,6 +1575,8 @@ pub struct Ops {
     copy: Option<CopyDialog>,
     make: Option<MakeFolderDialog>,
     delete: Option<DeleteDialog>,
+    /// The number of the last Trash check a delete dialog was opened with.
+    checks: u64,
     rename: Option<Rename>,
     running: Option<Running>,
     report: Option<ReportView>,
@@ -1583,6 +1590,7 @@ impl Ops {
             copy: None,
             make: None,
             delete: None,
+            checks: 0,
             rename: None,
             running: None,
             report: None,
@@ -1655,7 +1663,6 @@ impl Ops {
 
     /// F7 in `panel` (its folder on `host`): the make-folder dialog. `Some` is for the status
     /// row, as for [`Ops::open_copy`] (a job running).
-    #[cfg_attr(not(test), allow(dead_code))] // S6-C wires F7 to it.
     pub fn open_make_folder(&mut self, panel: &Panel, host: Option<&str>) -> Option<Status> {
         if let Some(busy) = self.busy_line() {
             return Some(busy);
@@ -1668,7 +1675,6 @@ impl Ops {
     /// ([`Removal::Permanent`]) in `panel` (its folder on `host`): the delete dialog, on the
     /// selection or the bar's entry ([`DeleteDialog::open`]; `trash_here`: this machine has a
     /// Trash for the folder). `Some` is for the status row, as for [`Ops::open_copy`].
-    #[cfg_attr(not(test), allow(dead_code))] // S6-C wires F8 and Shift+F8 to it.
     pub fn open_delete(
         &mut self,
         panel: &Panel,
@@ -1686,6 +1692,43 @@ impl Ops {
             }
             Err(why) => Some(Status::error(why)),
         }
+    }
+
+    /// F8, Del, ⌘⌫ in `panel`, a folder on this machine, while whether it has a Trash for the
+    /// folder is still being asked: the delete dialog opens at once on [`Panel::acted_on`] as it is
+    /// now, saying `checking the Trash…`, its Delete off and Enter doing nothing until
+    /// [`Ops::trash_checked`] gives the answer with the number returned here. Esc cancels as
+    /// ever. `Err` is for the status row, as for [`Ops::open_copy`].
+    pub fn open_delete_checking(&mut self, panel: &Panel) -> Result<u64, Status> {
+        if let Some(busy) = self.busy_line() {
+            return Err(busy);
+        }
+        let mut dialog =
+            DeleteDialog::open(panel, None, Removal::Trash, false).map_err(Status::error)?;
+        self.checks += 1;
+        dialog.bin = Bin::Checking;
+        dialog.check = Some(self.checks);
+        self.delete = Some(dialog);
+        Ok(self.checks)
+    }
+
+    /// The answer to the Trash check `check` (`here`: this machine has a Trash for the folder):
+    /// the dialog it was opened for says `to the Trash` or `permanent — no Trash here`, and Delete
+    /// works. An answer for a dialog that closed, or for an earlier one, changes nothing (`false`).
+    pub fn trash_checked(&mut self, check: u64, here: bool) -> bool {
+        match self.delete.as_mut() {
+            Some(dialog) if dialog.check == Some(check) => {
+                dialog.check = None;
+                dialog.bin = if here { Bin::Trash } else { Bin::NoTrashHere };
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// The delete dialog waits for its Trash check.
+    pub fn checking_trash(&self) -> bool {
+        self.delete.as_ref().is_some_and(|d| d.check.is_some())
     }
 
     /// Esc while a job runs.
@@ -2429,14 +2472,20 @@ mod tests {
                 to: "MAIN.rs".to_string(),
             }]
         );
-        // `..` has no field; nor (until S6) a folder on a remote — a link to one is a file.
+        // `..` has no field; a folder on a remote has one since S6 (SFTP's plain rename), and so
+        // has a link to one, which is a file.
         h.panel.home();
         let said = h.ops.open_rename(&h.panel, None).expect("refused");
         assert_eq!(h.ops.renaming(), None);
         assert!(said.error && said.text.contains(".."), "{said:?}");
         at(&mut h.panel, "docs");
-        let said = h.ops.open_rename(&h.panel, Some("box")).expect("refused");
-        assert!(said.text.contains("box") && said.text.contains("nothing changed"));
+        assert!(
+            h.ops.open_rename(&h.panel, Some("box")).is_none(),
+            "a remote folder renames"
+        );
+        assert_eq!(h.ops.renaming(), Some("docs"));
+        drv.idle(&mut h, 2);
+        drv.key(&mut h, Key::Escape, Modifiers::NONE);
         assert_eq!(h.ops.renaming(), None);
         h.panel.entries[1].link = true;
         assert!(

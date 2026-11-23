@@ -208,6 +208,9 @@ keys that work there are labelled), cyan dialogs with a shadow.
 | `F3` | view the file (as Enter) |
 | `F4` | open the folder or file in VS Code / Zed |
 | `F5` / `F6` | copy / move the selection (or the entry) to the other panel's folder — asks first; the target can be any folder, `host:/path` too |
+| `F7` | make a folder here (asks its name); the bar goes on it |
+| `F8` / `Del` / `⌘⌫` (macOS) | delete the selection (or the entry) — asks first, and says where it goes: a local entry to the Trash (macOS's, or the freedesktop Trash on Linux; where there is none, permanently, said before anything is removed), a remote one permanently (SFTP has no Trash) |
+| `Shift+F8` / `Shift+Del` | delete without the Trash (asks first) |
 | `F9` | preview mode ↔ dual mode |
 | `⌘G` | pin the git panel to the other side (again, or `Esc`: unpin) |
 | in the git panel | `Enter` / `F3` details (one marked row: compare) · `Shift+F3` the file at that commit · a letter / `⌘F` find · `⌘⇧F` history search · `⌘K` filters · `⌘R` refresh · `⌘J` to HEAD · `⌘⇧G` over both sides · `Tab` back to the list · `Esc` closes the innermost thing |
@@ -224,10 +227,14 @@ changes asks first, as its own window does. A remote file is not downloaded: it 
 its first part arrives and the rest is read as you move (an image is read whole into memory first,
 with its progress; `Esc` stops that).
 
-Rename, copy and move never replace anything: a name already there asks **Skip**, **Rename** (a
-free name is proposed) or **Cancel**. A copy shows its progress in the status row, `Esc` stops
-it, and a report lists what was done, skipped and not reached. Renaming a folder on a remote,
-making folders and deleting are not there yet.
+Rename, copy, move and make folder never replace anything: a name already there asks **Skip**,
+**Rename** (a free name is proposed) or **Cancel** (a rename or a new folder onto a taken name is
+an error instead). A copy shows its progress in the status row, `Esc` stops it, and a report lists
+what was done, skipped and not reached. On a remote a folder is renamed or moved in one step by
+SFTP's plain rename, which refuses a name that exists; where the server has no
+`hardlink@openssh.com`, sopen first checks once per connection that its rename refuses one, and
+copies there only if it does. Delete removes a folder with everything inside it, and a link as a
+link (never what it points at); `Esc` stops it between entries.
 
 Lines wrap by default: every line is shown whole, in rows as wide as the window, its number on its
 first row. A row is broken by the measured width of its characters (Korean, CJK and emoji are

@@ -26,8 +26,8 @@ use eframe::egui::{self, Event, Key, Modifiers};
 
 /// The set of landed slices (02 §8.1: 1 = S1 … 7 = S7); a slice's integration WU adds its
 /// number. Rows of a slice not in it do nothing yet. A set, not the highest slice: slices land in
-/// any order their "Needs first" allows (02 §8.1 "Schedule"), so S5 landed before S2–S4.
-pub const LANDED_SLICES: Slices = Slices::of(&[1, 2, 5]);
+/// any order their "Needs first" allows (02 §8.1 "Schedule"), so S5 and S6 landed before S3–S4.
+pub const LANDED_SLICES: Slices = Slices::of(&[1, 2, 5, 6]);
 
 /// Every slice, 1 to 7: every row of the table.
 #[cfg_attr(not(test), allow(dead_code))] // Only the tests use it.
@@ -1016,17 +1016,18 @@ mod tests {
         assert!(TABLE.iter().all(|r| ALL_SLICES.has(r.slice)));
     }
 
-    /// The landed slices are a set (02 §8.1 "Schedule"): S1, S2 and S5 have landed, so exactly
-    /// their rows act — F10 opens the tree and Cmd/Ctrl+G pins the git panel, while F7, an S6 row,
-    /// and the git panel's F5, an S3 row, still do nothing.
+    /// The landed slices are a set (02 §8.1 "Schedule"): S1, S2, S5 and S6 have landed, so
+    /// exactly their rows act — F10 opens the tree, Cmd/Ctrl+G pins the git panel, F7 makes a
+    /// folder and Shift+F8 deletes without the Trash, while the git panel's F5, an S3 row, still
+    /// does nothing.
     #[test]
     fn landed_slices_are_a_set() {
-        assert_eq!(LANDED_SLICES, Slices::of(&[1, 2, 5]));
+        assert_eq!(LANDED_SLICES, Slices::of(&[1, 2, 5, 6]));
         assert!(TABLE
             .iter()
-            .all(|r| LANDED_SLICES.has(r.slice) == matches!(r.slice, 1 | 2 | 5)));
+            .all(|r| LANDED_SLICES.has(r.slice) == matches!(r.slice, 1 | 2 | 5 | 6)));
         assert!(!ALL_SLICES.has(0) && !ALL_SLICES.has(8) && !ALL_SLICES.has(u8::MAX));
-        assert_eq!(LANDED_SLICES.with(3), Slices::of(&[1, 2, 3, 5]));
+        assert_eq!(LANDED_SLICES.with(3), Slices::of(&[1, 2, 3, 5, 6]));
         assert_eq!(
             find(&mut vec![press(K::F10, NONE)], List, LANDED_SLICES),
             Some(Command::Tree)
@@ -1036,8 +1037,12 @@ mod tests {
         assert_eq!(find(&mut pin(), Git, LANDED_SLICES), Some(Command::Pin));
         assert_eq!(
             find(&mut vec![press(K::F7, NONE)], List, LANDED_SLICES),
-            None,
-            "S6 has not landed"
+            Some(Command::MakeFolder),
+            "S6 has landed"
+        );
+        assert_eq!(
+            find(&mut vec![press(K::F8, SHIFT)], List, LANDED_SLICES),
+            Some(Command::DeleteNow)
         );
         assert_eq!(
             find(&mut vec![press(K::F5, NONE)], Git, LANDED_SLICES),
@@ -1105,11 +1110,11 @@ mod tests {
         }
     }
 
-    /// 02 §7, 04 §2: the rows of the landed slices, S1, S2 and S5 — the list's slots are `1Help
-    /// 2Rename 3View 4Edit 5Copy 6Move 9Dual 10Tree` (9 names the mode F9 switches to); the
-    /// viewer's `1Help 3Exit 4Edit`; the git panel's `1Help 3View 4Edit 9Dual` (03 §9.1, S2's
-    /// slots); the tree's `1Help 10Tree` (05 §1). The keys of the slices not landed do nothing
-    /// yet.
+    /// 02 §7, 04 §2: the rows of the landed slices, S1, S2, S5 and S6 — the list's slots are
+    /// `1Help 2Rename 3View 4Edit 5Copy 6Move 7MkDir 8Delete 9Dual 10Tree` (9 names the mode F9
+    /// switches to; S6 adds 7 and 8); the viewer's `1Help 3Exit 4Edit`; the git panel's `1Help
+    /// 3View 4Edit 9Dual` (03 §9.1, S2's slots); the tree's `1Help 10Tree` (05 §1). The keys of
+    /// the slices not landed do nothing yet.
     #[test]
     fn the_rows_of_s1() {
         let pairs = |keys: Vec<FKey>| -> Vec<(u8, &str)> {
@@ -1124,11 +1129,13 @@ mod tests {
                 (4, "Edit"),
                 (5, "Copy"),
                 (6, "Move"),
+                (7, "MkDir"),
+                (8, "Delete"),
                 (9, "Dual"),
                 (10, "Tree")
             ]
         );
-        assert_eq!(pairs(row(List, Mode::Dual))[6], (9, "Prevw"));
+        assert_eq!(pairs(row(List, Mode::Dual))[8], (9, "Prevw"));
         assert_eq!(
             pairs(row(Viewer, Mode::Preview)),
             [(1, "Help"), (3, "Exit"), (4, "Edit")]
@@ -1154,11 +1161,12 @@ mod tests {
                 Some(Command::CloseTree)
             );
         }
-        for (key, mods) in [(K::F7, NONE), (K::F8, NONE)] {
+        // S6: F7 makes a folder, F8 deletes.
+        for (key, command) in [(K::F7, Command::MakeFolder), (K::F8, Command::Delete)] {
             assert_eq!(
-                find(&mut vec![press(key, mods)], List, LANDED_SLICES),
-                None,
-                "{key:?} {mods:?} lands later"
+                find(&mut vec![press(key, NONE)], List, LANDED_SLICES),
+                Some(command),
+                "{key:?}"
             );
         }
         assert_eq!(

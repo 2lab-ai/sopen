@@ -267,7 +267,7 @@ too, where F3 closes it as ⌘W does.
   gives it the keyboard and back; **Cmd/Ctrl+G** pins it to that side, so it stays while the bar
   moves over files and while the list goes elsewhere (titled with its repository); Esc unpins.
   It writes nothing to the repository until S3's actions.
-- **Selection and file operations** (msg 15; [04](04-file-keys.md) §3–§5, S1's part). Space or
+- **Selection and file operations** (msg 15; [04](04-file-keys.md) §3–§5, S1's and S6's parts). Space or
   Ins selects the bar's entry and steps down; `+` and `-` select and unselect by a pattern, `*`
   inverts, Cmd/Ctrl+A selects all; selected entries are yellow and the foot counts them first.
   **F2** (or Shift+F6) renames the bar's entry in a field in its row; **F5** copies and **F6**
@@ -280,8 +280,18 @@ too, where F3 closes it as ⌘W does.
   waits (the status row says `copy waiting for an answer — F3 back to the list`) and its end is
   told when the list shows again; Esc stops it also while a folder is still being listed.
   Closing the window waits for a running operation. A panel whose listing failed says so on
-  the status row until that panel lists again. A remote folder cannot be renamed
-  until slice S6 (F2 says so); make folder and delete come with S6.
+  the status row until that panel lists again. **F7** makes a folder in the active panel's folder
+  (a one-line dialog; one level, a name with `/` refused; a name that exists is an error) and puts
+  the bar on it. **F8** (Del, ⌘⌫ on macOS) deletes the selection or the bar's entry after a dialog
+  that says what (`Delete <name>?`, `Delete N items (F files, D folders)?`, a folder's `and
+  everything inside it`) and where: on this machine to the system Trash (macOS's, loaded at
+  runtime; the freedesktop Trash elsewhere), `permanent — no Trash here` where there is none; on a
+  remote `permanent — no Trash on <host>` (SFTP has none), removed bottom-up; **Shift+F8**
+  (Shift+Del) deletes here without the Trash, `permanent` in the error colour. A link goes as a
+  link; Esc stops between entries. A remote folder's F2 and F6 are one SFTP plain rename, on a
+  second `sftp` channel of the same master, which refuses a name that exists; a copy to a server
+  without `hardlink@openssh.com` is published the same way once a probe per connection found that
+  the server's rename refuses (04 §5.6).
 - **Keys** (the list; the one key table, `gui::browser::keys`, matches modifiers exactly, and
   Cmd/Ctrl+1…0 and a click on an F-key slot act as that F-key): F1 lists the keys; Cmd/Ctrl+R
   re-reads the panel, Cmd/Ctrl+U swaps the panels, Cmd/Ctrl+← / → show this folder in the left /
