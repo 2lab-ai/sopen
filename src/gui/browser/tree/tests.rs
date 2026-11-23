@@ -931,3 +931,136 @@ fn the_status_line_says_the_tree_then_the_bar_row() {
     let said = view.status_line();
     assert_eq!((said.text, said.error), (cap.text, true));
 }
+
+/// What [`keys`] asks for over one frame of `events`, before the view was ever drawn — the
+/// calling order allows it (keys first, then the pass draws).
+fn keys_before_any_draw(view: &mut TreeView, events: Vec<Event>) -> Vec<TreeAction> {
+    let ctx = egui::Context::default();
+    let raw = egui::RawInput {
+        events,
+        ..Default::default()
+    };
+    let mut asked = Vec::new();
+    let mut out = ctx.run_ui(raw, |ui| asked = keys(ui.ctx(), view));
+    out.textures_delta.clear();
+    asked
+}
+
+/// Review round 1: a bar (and a first row) the caller put past the end — the fields are
+/// public — is taken as the last row before a key acts, never added to: a letter jumps around
+/// the end from there, Enter names the last row, an empty tree asks nothing; the rows on screen
+/// stay inside the rows.
+#[test]
+fn a_key_with_the_bar_past_the_end_acts_on_the_last_row() {
+    use TreeAction::*;
+    let one = || {
+        vec![row(
+            7,
+            0,
+            "a",
+            RowKind::Folder,
+            Fold::Closed,
+            Info::default(),
+        )]
+    };
+    let mut view = TreeView::new("box:/srv/data", one(), usize::MAX);
+    let typed = |t: &str| vec![Event::Text(t.into())];
+    let enter = || {
+        vec![Event::Key {
+            key: Key::Enter,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers::NONE,
+        }]
+    };
+    assert_eq!(keys_before_any_draw(&mut view, typed("a")), [Jump('a')]);
+    assert_eq!(view.bar, 0);
+    view.bar = usize::MAX;
+    assert_eq!(keys_before_any_draw(&mut view, enter()), [GoTo(7)]);
+    assert_eq!(view.bar, 0);
+    // None at all.
+    let mut empty = TreeView::new("box:/srv/data", Vec::new(), usize::MAX);
+    assert_eq!(keys_before_any_draw(&mut empty, typed("a")), [Jump('a')]);
+    assert_eq!(keys_before_any_draw(&mut empty, enter()), []);
+    assert_eq!(empty.bar, 0);
+    // The first row past the end too: the rows on screen and rows given anew stay in range.
+    let mut fx = Fx::new(1000.0, TreeView::new("box:/", long(200), 0));
+    fx.host.view.top = usize::MAX;
+    let on = fx.host.view.on_screen();
+    assert!(on.start <= on.end && on.end <= 201, "{on:?}");
+    fx.host.view.bar = usize::MAX;
+    fx.host.view.set_rows(long(200));
+    fx.host.view.top = usize::MAX;
+    fx.host.view.set_rows(long(10));
+    fx.idle();
+    assert!(fx.host.view.top <= 10 && fx.host.view.bar <= 10);
+    assert!(fx.drv.find_text(&fx.bar_name()).is_some());
+}
+
+/// Review round 1: rows that shrink under the bar between passes (the caller replaced them
+/// without `set_rows`), then a key before the next draw: it acts on the last row as it is now —
+/// Enter goes to it, ← closes it, a letter jumps from it.
+#[test]
+fn rows_shrinking_under_the_bar_then_a_key() {
+    use TreeAction::*;
+    let mut fx = sample_fx(11);
+    assert_eq!(fx.bar_name(), "new");
+    fx.host.view.rows.truncate(2);
+    assert_eq!(fx.press(Key::Enter), [GoTo(1)]);
+    assert_eq!(fx.bar_name(), "src");
+    fx.host.view.rows = sample();
+    fx.host.view.bar = 11;
+    fx.idle();
+    fx.host.view.rows.truncate(2);
+    assert_eq!(fx.press(Key::ArrowLeft), [Collapse(1)]);
+    fx.host.view.rows = sample();
+    fx.host.view.bar = 11;
+    fx.idle();
+    fx.host.view.rows.truncate(2);
+    assert_eq!(fx.typed("~"), [Jump('~')]);
+    assert_eq!(fx.bar_name(), "~");
+}
+
+/// Review round 1: a row at the greatest depth a `usize` holds is drawn as any too-deep row —
+/// at the deepest indent that keeps its name, inside the frame — never wrapped to the left.
+#[test]
+fn a_row_at_the_greatest_depth_is_drawn_inside_the_frame() {
+    for depth in [isize::MAX as usize, usize::MAX] {
+        let rows = vec![
+            row(0, 0, "~", RowKind::Folder, Fold::Open, Info::default()),
+            row(
+                1,
+                depth,
+                "deepest",
+                RowKind::Folder,
+                Fold::Closed,
+                counted(1, 2, bytes(3_000, false)),
+            ),
+            row(
+                2,
+                depth,
+                "",
+                RowKind::Hidden(3),
+                Fold::Leaf,
+                Info::default(),
+            ),
+        ];
+        let fx = Fx::new(1000.0, TreeView::new("box:/srv/data", rows, 1));
+        let inner = fx.inner();
+        let name = fx.drv.find_text("deepest").expect("the name is drawn");
+        assert!(inner.contains_rect(name), "{depth}: {name:?} in {inner:?}");
+        let glyph = fx.on_row("deepest", "►").expect("its glyph");
+        assert!(inner.contains_rect(glyph) && glyph.right() <= name.left());
+        let root = fx.drv.find_text("~").unwrap();
+        assert!(glyph.left() > root.left(), "{depth}: deeper than the root");
+        // Its glyph and name cells: cut at a glyph boundary, as any name that long.
+        let hidden = fx
+            .drv
+            .text_starting_with("· 3 hidden")
+            .expect("the hidden row");
+        let at = fx.drv.find_text(&hidden).unwrap();
+        assert!(inner.contains_rect(at), "{depth}: {hidden} at {at:?}");
+        assert_eq!(at.left(), glyph.left(), "{depth}: in the glyph's place");
+    }
+}

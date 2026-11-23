@@ -209,7 +209,7 @@ impl TreeView {
         self.rows = rows;
         match was.and_then(|id| self.rows.iter().position(|r| r.id == id)) {
             Some(at) => {
-                self.top = (self.top + at).saturating_sub(self.bar);
+                self.top = self.top.saturating_add(at).saturating_sub(self.bar);
                 self.bar = at;
             }
             None => self.bar = self.bar.min(self.rows.len().saturating_sub(1)),
@@ -227,7 +227,7 @@ impl TreeView {
     /// The rows the last pass drew (empty before the first): what 05 §6.3's phases 2 and 3
     /// read around.
     pub fn on_screen(&self) -> std::ops::Range<usize> {
-        let end = (self.top + self.visible).min(self.rows.len());
+        let end = self.top.saturating_add(self.visible).min(self.rows.len());
         self.top.min(end)..end
     }
 
@@ -257,6 +257,9 @@ impl TreeView {
     /// (05 §3), ← on a row that is not open takes the bar to its parent (05 §1).
     fn run(&mut self, command: Command) -> Option<TreeAction> {
         use TreeAction::*;
+        // A bar the caller left past the end (the fields are public; rows replaced without
+        // `set_rows`) is on the last row before any key acts — not only once a pass draws.
+        self.clamp_bar();
         let page = self.visible.saturating_sub(1).max(1) as isize;
         match command {
             Command::Help => return Some(Help),
@@ -308,10 +311,13 @@ impl TreeView {
     /// Moves the bar to the next row after it whose name starts with `c` (any case), around the
     /// end, as the list's letters do (01 §3a); the hidden folders' row has no name to start.
     fn jump(&mut self, c: char) {
+        self.clamp_bar();
         let n = self.rows.len();
         let wanted: String = c.to_lowercase().collect();
-        for k in 1..=n {
-            let at = (self.bar + k) % n;
+        // After the bar to the end, then from the first row to the bar: `bar < n` here, so
+        // nothing is added past `n`.
+        let bar = self.bar;
+        for at in (bar + 1..n).chain(0..=bar.min(n.saturating_sub(1))).take(n) {
             let row = &self.rows[at];
             if !matches!(row.kind, RowKind::Hidden(_))
                 && row.name.to_lowercase().starts_with(&wanted)
@@ -334,13 +340,18 @@ impl TreeView {
         }
     }
 
+    /// The bar on a row: on the last one when it is past the end, on 0 with no rows.
+    fn clamp_bar(&mut self) {
+        self.bar = self.bar.min(self.rows.len().saturating_sub(1));
+    }
+
     /// Before a pass that has room for `visible` rows: the first pass with rows puts the bar's
     /// row in the middle; later, a bar that moved is scrolled into view; the rows never end
     /// above the bottom while there are more.
     fn settle(&mut self, visible: usize) {
         self.visible = visible;
         let len = self.rows.len();
-        self.bar = self.bar.min(len.saturating_sub(1));
+        self.clamp_bar();
         if self.center && len > 0 {
             self.center = false;
             self.moved = false;
@@ -348,7 +359,7 @@ impl TreeView {
         } else if std::mem::take(&mut self.moved) {
             if self.bar < self.top {
                 self.top = self.bar;
-            } else if self.bar >= self.top + visible {
+            } else if self.bar >= self.top.saturating_add(visible) {
                 self.top = self.bar + 1 - visible;
             }
         }
@@ -571,7 +582,8 @@ pub fn draw(ui: &mut egui::Ui, rect: Rect, view: &mut TreeView, active: bool) ->
         // The glyph and the name, a blank cell before the info line at least; a row deeper
         // than the side has room for sits at the deepest indent that leaves its name its cells.
         let name_end = info_left - 1;
-        let indent = (2 * row.depth as isize).min((name_end - 2 - NAME).max(0));
+        let depth = isize::try_from(row.depth).unwrap_or(isize::MAX);
+        let indent = depth.saturating_mul(2).min((name_end - 2 - NAME).max(0));
         let name_color = if dim { LOOK.hidden } else { LOOK.name };
         let clip = Rect::from_min_max(
             Pos2::new(x(indent).min(x(name_end)), y),
